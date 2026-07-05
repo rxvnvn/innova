@@ -7483,15 +7483,25 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // Ask every node for the collateralnode list straight away
         pfrom->PushMessage("iseg", CTxIn());
 
-        // Ask every eligible network peer for catch-up work. Per-peer
-        // PushGetBlocks throttling keeps reconnect loops from spamming.
+        // Ask every eligible network peer for catch-up work. Send the first request
+        // immediately instead of waiting for the deferred SendMessages() queue.
         if (!pfrom->fClient && !pfrom->fOneShot &&
             (pfrom->nBestKnownHeight < 0 || pfrom->nBestKnownHeight > (nBestHeight - 144)) &&
             (pfrom->nVersion < NOBLKS_VERSION_START ||
              pfrom->nVersion >= NOBLKS_VERSION_END))
         {
-            pfrom->PushGetBlocks(pindexBest, uint256(0));
+            // Send the first catch-up request immediately instead of waiting for the
+            // deferred SendMessages() queue. This keeps initial sync from stalling if
+            // the peer is otherwise quiet right after the version handshake.
+            pfrom->PushMessage("getblocks", CBlockLocator(pindexBest), uint256(0));
             pfrom->PushMessage("getheaders", CBlockLocator(pindexBest), uint256(0));
+        }
+        if (!pfrom->fClient && !pfrom->fOneShot &&
+            (pfrom->nBestKnownHeight < 0 || pfrom->nBestKnownHeight > (nBestHeight - 144)) &&
+            (pfrom->nVersion < NOBLKS_VERSION_START ||
+             pfrom->nVersion >= NOBLKS_VERSION_END))
+        {
+            pfrom->fStartSync = true;
         }
 
         // Relay alerts

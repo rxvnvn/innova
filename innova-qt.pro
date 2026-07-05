@@ -30,6 +30,7 @@ greaterThan(QT_MAJOR_VERSION, 4) {
 
 linux {
     QMAKE_CFLAGS += -std=gnu99
+        BOOST_LIB_PATH = /home/user/innova/build/lib
 }
 
 win32 {
@@ -918,8 +919,8 @@ macx:QMAKE_POST_LINK += codesign --force --deep -s - $${TARGET}.app
 # Set libraries and includes at end, to use platform-defined defaults if not overridden
 INCLUDEPATH += $$BOOST_INCLUDE_PATH $$BDB_INCLUDE_PATH $$OPENSSL_INCLUDE_PATH $$QRENCODE_INCLUDE_PATH $$LIBEVENT_INCLUDE_PATH $$LIBCURL_INCLUDE_PATH
 LIBS += $$join(BOOST_LIB_PATH,,-L,) $$join(BDB_LIB_PATH,,-L,) $$join(OPENSSL_LIB_PATH,,-L,) $$join(QRENCODE_LIB_PATH,,-L,) $$join(LIBEVENT_LIB_PATH,,-L,) $$join(LIBCURL_LIB_PATH,,-L,)
-LIBS += -lcurl -lssl -lcrypto -ldb_cxx$$BDB_LIB_SUFFIX
-LIBS += -lz -levent
+LIBS += /usr/lib/x86_64-linux-gnu/libcurl.so.4.8.0 -lssl -lcrypto -ldb_cxx$$BDB_LIB_SUFFIX
+LIBS += -lz -lzstd -lbrotlidec -lbrotlicommon -levent
 LIBS += -lboost_filesystem$$BOOST_LIB_SUFFIX -lboost_program_options$$BOOST_LIB_SUFFIX -lboost_thread$$BOOST_THREAD_LIB_SUFFIX -lboost_chrono$$BOOST_LIB_SUFFIX
 
 # -lgdi32 has to happen after -lcrypto (see  #681)
