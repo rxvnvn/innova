@@ -38,7 +38,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libtool autotools-dev automake pkg-config \
             libssl-dev libevent-dev bsdmainutils libboost-all-dev libdb++-dev \
-            libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libgmp-dev \
+            libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev \
             libsecp256k1-dev \
             libqt5gui5 libqt5core5a libqt5dbus5 qttools5-dev qttools5-dev-tools \
             libprotobuf-dev protobuf-compiler
@@ -56,6 +56,8 @@ jobs:
       - name: Build Qt wallet
         run: |
           sed -i 's/LIBS += -lcurl -lssl -lcrypto -lcrypt32 -lssh2 -lgcrypt -lidn2 -lgpg-error -lunistring -lwldap32 -ldb_cxx$$BDB_LIB_SUFFIX/LIBS += -lcurl -lssl -lcrypto -ldb_cxx$$BDB_LIB_SUFFIX/' innova-qt.pro
+          make clean || true
+          rm -rf build Makefile .qmake.stash
           sudo strip --remove-section=.note.ABI-tag /usr/lib/x86_64-linux-gnu/libQt5Core.so.5 || true
           qmake USE_UPNP=1 USE_QRCODE=1 USE_NATIVETOR=- innova-qt.pro
           make -j$(nproc)
