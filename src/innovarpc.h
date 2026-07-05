@@ -284,13 +284,6 @@ extern json_spirit::Value getdagorder(const json_spirit::Array& params, bool fHe
 extern json_spirit::Value getepochinfo(const json_spirit::Array& params, bool fHelp);    // in rpcblockchain.cpp
 extern json_spirit::Value getdagconfidence(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
 
-extern json_spirit::Value hyperfileversion(const json_spirit::Array& params, bool fHelp); // in rpchyperfile.cpp Innova Hyperfile
-extern json_spirit::Value hyperfileupload(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value hyperfilepod(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value hyperfileduo(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value hyperfileduopod(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value hyperfilegetblock(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value hyperfilegetstat(const json_spirit::Array& params, bool fHelp);
 
 extern json_spirit::Value name_new(const json_spirit::Array& params, bool fHelp); // in namecoin.cpp Denairus Name commands
 extern json_spirit::Value name_update(const json_spirit::Array& params, bool fHelp);
@@ -348,22 +341,7 @@ extern json_spirit::Value startmixing(const json_spirit::Array& params, bool fHe
 extern json_spirit::Value stopmixing(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getmixingstatus(const json_spirit::Array& params, bool fHelp);
 
-extern json_spirit::Value smsgenable(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsgdisable(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsglocalkeys(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsgoptions(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsgscanchain(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsgscanbuckets(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsgaddkey(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsggetpubkey(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsgsend(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsgsendanon(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsginbox(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsgoutbox(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value smsgbuckets(const json_spirit::Array& params, bool fHelp);
 
-// Nyx Messaging Protocol (rpcnyx.cpp)
-extern json_spirit::Value nyx(const json_spirit::Array& params, bool fHelp);
 
 extern json_spirit::Value z_getnewaddress(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value z_listaddresses(const json_spirit::Array& params, bool fHelp);

@@ -283,7 +283,6 @@ bool Finalise()
 
     LOCK(cs_main);
 
-    SecureMsgShutdown();
     //nTransactionsUpdated++;
     mempool.AddTransactionsUpdated(1);
     bitdb.Flush(false);
@@ -8131,9 +8130,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (fAccepted && pfrom->fPreferHeaders)
             pfrom->PushMessage("getheaders", CBlockLocator(pindexBest), uint256(0));
 
-        if (fSecMsgEnabled)
-            SecureMsgScanBlock(block);
-
         if (IsInitialBlockDownload() && pfrom->nExpectedBatchSize > 0)
         {
             pfrom->nBlocksReceivedInBatch++;
@@ -8496,9 +8492,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
     else
     {
-        if (fSecMsgEnabled)
-            SecureMsgReceiveData(pfrom, strCommand, vRecv);
-
         //ProcessMessageCollateralN(pfrom, strCommand, vRecv);
         ProcessMessageCollateralnode(pfrom, strCommand, vRecv);
         ProcessMessageNullSend(pfrom, strCommand, vRecv);
@@ -8926,8 +8919,6 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
 
         // getdata moved outside cs_main (below) for IBD reliability
 
-        if (fSecMsgEnabled)
-            SecureMsgSendData(pto, fSendTrickle);
     }
 
     //

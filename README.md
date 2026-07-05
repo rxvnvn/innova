@@ -78,16 +78,13 @@ Innova [INN] is an anonymous, untraceable, energy efficient, Proof-of-Work (Trib
 * Stealth addresses
 * Ring Signatures (16 Recommended, deprecated at IIP-0003)
 * Native Optional Tor Onion Node (-nativetor=1)
-* Encrypted Messaging (SecureMsg)
 * Multi-Signature Addresses & TXs
 * Atomic Swaps using UTXOs (BIP65 CLTV)
 * BIP39 Support (Coin Type 116)
-* Proof of Data (Image/Data Timestamping)
 * Fast ~15 Second Block Times
 * Tribus PoW Algorithm comprising of 3 NIST5 algorithms
 * Tribus PoW/PoS Hybrid
 * Full decentralization
-* Hyperfile - IPFS API Implementation with Anonymous Decentralized File Uploads (UI and RPC)
 * Name Value System supporting the IDNS for fully & truly decentralized blockchain domains
 
 ## Privacy & Protocol Innovations (IIPs)

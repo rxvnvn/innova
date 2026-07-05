@@ -426,22 +426,7 @@ static const CRPCCommand vRPCCommands[] =
     { "stopmixing",             &stopmixing,             false,  false},
     { "getmixingstatus",        &getmixingstatus,        true,   false},
 
-    { "smsgenable",             &smsgenable,             false,  false},
-    { "smsgdisable",            &smsgdisable,            false,  false},
-    { "smsglocalkeys",          &smsglocalkeys,          false,  false},
-    { "smsgoptions",            &smsgoptions,            false,  false},
-    { "smsgscanchain",          &smsgscanchain,          false,  false},
-    { "smsgscanbuckets",        &smsgscanbuckets,        false,  false},
-    { "smsgaddkey",             &smsgaddkey,             false,  false},
-    { "smsggetpubkey",          &smsggetpubkey,          false,  false},
-    { "smsgsend",               &smsgsend,               false,  false},
-    { "smsgsendanon",           &smsgsendanon,           false,  false},
-    { "smsginbox",              &smsginbox,              false,  false},
-    { "smsgoutbox",             &smsgoutbox,             false,  false},
-    { "smsgbuckets",            &smsgbuckets,            false,  false},
 
-    /* Nyx Messaging Protocol */
-    { "nyx",                    &nyx,                    false,  false},
 
     { "proofofdata",          &proofofdata,              false,  true  },
 
@@ -502,16 +487,6 @@ static const CRPCCommand vRPCCommands[] =
     { "getepochinfo",           &getepochinfo,           true,   false },
     { "getdagconfidence",       &getdagconfidence,       true,   false },
 
-#ifdef USE_IPFS
-    /* Hyperfile / IPFS commands */
-    { "hyperfileversion",       &hyperfileversion,       true,   false },
-    { "hyperfileupload",        &hyperfileupload,        false,  false },
-    { "hyperfilepod",           &hyperfilepod,           false,  false },
-    { "hyperfileduo",           &hyperfileduo,           false,  false },
-    { "hyperfileduopod",        &hyperfileduopod,        false,  false },
-    { "hyperfilegetblock",      &hyperfilegetblock,      true,   false },
-    { "hyperfilegetstat",       &hyperfilegetstat,       true,   false },
-#endif
 
 };
 

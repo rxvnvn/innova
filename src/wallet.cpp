@@ -373,7 +373,6 @@ bool CWallet::Unlock(const SecureString& strWalletPassphrase)
 
         UnlockStealthAddresses(vMasterKey);
 		    ProcessLockedAnonOutputs(); //Process Locked Anon Outputs when unlocked, I n n o v a - v3.1
-        SecureMsgWalletUnlocked();
         return true;
     }
     return false;
@@ -5611,7 +5610,6 @@ bool CWallet::SetAddressBookName(const CTxDestination& address, const string& st
     if (fOwned)
     {
         const CBitcoinAddress& caddress = address;
-        SecureMsgWalletKeyChanged(caddress.ToString(), strName, nMode);
     }
     NotifyAddressBookChanged(this, address, strName, fOwned, nMode);
 
@@ -5633,7 +5631,6 @@ bool CWallet::DelAddressBookName(const CTxDestination& address)
     if (fOwned)
     {
         const CBitcoinAddress& caddress = address;
-        SecureMsgWalletKeyChanged(caddress.ToString(), sName, CT_DELETED);
     }
     NotifyAddressBookChanged(this, address, "", fOwned, CT_DELETED);
 

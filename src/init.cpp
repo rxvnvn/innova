@@ -152,7 +152,6 @@ void Shutdown(void* parg)
         }
         Finalise();
         /*
-        SecureMsgShutdown();
 
         mempool.AddTransactionsUpdated(1);
 //        CTxDB().Close();
@@ -621,15 +620,10 @@ std::string HelpMessage()
         "\n" + _("Collateralnode options:") + "\n" +
         "  -collateralnode=<n>            " + _("Enable the client to act as a collateralnode (0-1, default: 0)") + "\n" +
         "  -mnconf=<file>             " + _("Specify collateralnode configuration file (default: collateralnode.conf)") + "\n" +
-        "  -cnconflock=<n>            " + _("Lock collateralnodes from collateralnode configuration file (default: 1)") +
+        "  -cnconflock=<n>            " + _("Lock collateralnodes from collateralnode configuration file (default: 1)") + "\n" +
         "  -collateralnodeprivkey=<n>     " + _("Set the collateralnode private key") + "\n" +
         "  -collateralnodeaddr=<n>        " + _("Set external address:port to get to this collateralnode (example: address:port)") + "\n" +
-        "  -collateralnodeminprotocol=<n> " + _("Ignore collateralnodes less than version (example: 70007; default : 0)") + "\n" +
-
-        "\n" + _("Secure messaging options:") + "\n" +
-        "  -nosmsg                                  " + _("Disable secure messaging.") + "\n" +
-        "  -debugsmsg                               " + _("Log extra debug messages.") + "\n" +
-        "  -smsgscanchain                           " + _("Scan the block chain for public key addresses on startup.") + "\n";
+        "  -collateralnodeminprotocol=<n> " + _("Ignore collateralnodes less than version (example: 70007; default : 0)") + "\n";
 
     return strUsage;
 }
@@ -766,20 +760,7 @@ bool AppInit2()
     fCNLock = GetBoolArg("-cnconflock");
     fNativeTor = GetBoolArg("-nativetor");
 
-    // Nyx Messaging defaults (overridable in innova.conf)
-    SoftSetBoolArg("-smsg", true);
-    SoftSetBoolArg("-nyx", true);
-    SoftSetBoolArg("-nyxanon", true);
-    SoftSetBoolArg("-nyxgroups", true);
-    SoftSetBoolArg("-nyxfiles", true);
-    SoftSetArg("-nyxchunksize", "1048576");
-    SoftSetArg("-nyxmaxfilesize", "10995116277760");
-    SoftSetArg("-nyxconcurrency", "8");
 
-    // Default IPFS gateway
-    SoftSetBoolArg("-hyperfilelocal", true);
-    SoftSetArg("-hyperfileip", "ipfs.innova-foundation.com:5001");
-    fHyperfileLocal = GetBoolArg("-hyperfilelocal");
 
     if (mapArgs.count("-bind"))
     {
@@ -887,18 +868,11 @@ bool AppInit2()
         if (!mapArgs.count("-maxorphanblocks"))
             SoftSetArg("-maxorphanblocks", "100");  // Reduce orphan block limit
 
-        // Disable non-essential features for constrained devices
-        if (!mapArgs.count("-nosmsg"))
-            SoftSetBoolArg("-nosmsg", true);        // Disable secure messaging
-        if (!mapArgs.count("-nohyperfile"))
-            SoftSetBoolArg("-nohyperfile", true);   // Disable IPFS/Hyperfile
-
         // Header pruning: keep only recent headers to save memory
         int nMaxHeaders = GetArg("-maxheaders", 50000);
         printf("  Max headers in memory: %d\n", nMaxHeaders);
         printf("  Mempool limit: %s MB\n", GetArg("-maxmempool", "10").c_str());
         printf("  Staking: %s\n", fSPVStakingEnabled ? "enabled" : "disabled");
-        printf("  Secure messaging: disabled (constrained mode)\n");
     }
     else if (fSPVMode)
     {
@@ -1054,10 +1028,6 @@ bool AppInit2()
 
     int64_t nStart;
     int64_t nStart2;
-
-    // SMSG_RELAY Node Enum
-    if (fNoSmsg)
-        nLocalServices &= ~(SMSG_RELAY);
 
     // Anonymous Ring Signatures ~ I n n o v a - v3.0.0.0
     if (initialiseRingSigs() != 0)
@@ -1649,10 +1619,6 @@ bool AppInit2()
     printf("Loaded %i addresses from peers.dat  %" PRId64"ms\n",
            addrman.size(), GetTimeMillis() - nStart);
 
-
-    // ********************************************************* Step 10.1: startup secure messaging
-
-    SecureMsgStart(fNoSmsg, GetBoolArg("-smsgscanchain"));
 
     // ********************************************************* Step 11: start node
 

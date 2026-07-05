@@ -116,7 +116,7 @@ if [[ $BUILD_DAEMON -eq 1 ]]; then
         STATIC=1 \
         LDFLAGS="-static -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va" \
         USE_NATIVETOR=- \
-        USE_IPFS=1 \
+        USE_IPFS=- \
         INNOVA_SPINNER=0 \
         -j"$JOBS"
 
