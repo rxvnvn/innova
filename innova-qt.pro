@@ -476,7 +476,6 @@ HEADERS += src/qt/bitcoingui.h \
     src/qt/stakingpage.h \
     src/qt/privacypage.h \
     src/qt/nullsendpage.h \
-    src/qt/emojipicker.h \
     src/qt/walletworker.h \
     src/qt/multisigaddressentry.h \
     src/qt/multisiginputentry.h \
@@ -630,7 +629,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/qt/stakingpage.cpp \
     src/qt/privacypage.cpp \
     src/qt/nullsendpage.cpp \
-    src/qt/emojipicker.cpp \
     src/qt/walletworker.cpp \
     src/qt/termsofuse.cpp \
     src/qt/bantablemodel.cpp \

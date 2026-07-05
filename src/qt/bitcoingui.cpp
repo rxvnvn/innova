@@ -161,7 +161,6 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     privacyPage = new PrivacyPage(this);
     nullsendPage = new NullSendPage(this);
     manageNamesPage = new ManageNamesPage(this);
-	//chatWindow = new ChatWindow(this);
 
     transactionsPage = new QWidget(this);
     QVBoxLayout *vbox = new QVBoxLayout();
@@ -200,7 +199,6 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     centralWidget->addWidget(stakingPage);
     centralWidget->addWidget(privacyPage);
     centralWidget->addWidget(nullsendPage);
-	//centralWidget->addWidget(chatWindow);
     setCentralWidget(centralWidget);
 
     // Create status bar
@@ -331,11 +329,6 @@ void BitcoinGUI::createActions()
     manageNamesAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_0));
     tabGroup->addAction(manageNamesAction);
 
-	//chatAction = new QAction(QIcon(":/icons/msg"), tr("&Social"), this);
-    //chatAction->setToolTip(tr("View chat"));
-    //chatAction->setCheckable(true);
-    //tabGroup->addAction(chatAction);
-
     sendCoinsAction = new QAction(QIcon(":/icons/send"), tr("&Send coins"), this);
     sendCoinsAction->setToolTip(tr("Send coins to a Innova address"));
     sendCoinsAction->setCheckable(true);
@@ -397,7 +390,6 @@ void BitcoinGUI::createActions()
 	connect(blockAction, SIGNAL(triggered()), this, SLOT(gotoBlockBrowser()));
 	connect(statisticsAction, SIGNAL(triggered()), this, SLOT(gotoStatisticsPage()));
     connect(idagAction, SIGNAL(triggered()), this, SLOT(gotoIDAGPage()));
-	//connect(chatAction, SIGNAL(triggered()), this, SLOT(gotoChatPage()));
     connect(sendCoinsAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(sendCoinsAction, SIGNAL(triggered()), this, SLOT(gotoSendCoinsPage()));
     connect(receiveCoinsAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
@@ -672,7 +664,6 @@ void BitcoinGUI::setWalletModel(WalletModel *walletModel)
         stakingPage->setModel(walletModel);
         privacyPage->setModel(walletModel);
         qobject_cast<NullSendPage*>(nullsendPage)->setModel(walletModel);
-		//chatWindow->setModel(clientModel);
 
         setEncryptionStatus(walletModel->getEncryptionStatus());
         connect(walletModel, SIGNAL(encryptionStatusChanged(int)), this, SLOT(setEncryptionStatus(int)));
@@ -1021,13 +1012,6 @@ void BitcoinGUI::incomingTransaction(const QModelIndex & parent, int start, int 
     }
 }
 
-void BitcoinGUI::incomingMessage(const QModelIndex & parent, int start, int end)
-{
-    Q_UNUSED(parent);
-    Q_UNUSED(start);
-    Q_UNUSED(end);
-}
-
 void BitcoinGUI::showDebugWindow()
 {
     rpcConsole->showNormal();
@@ -1228,17 +1212,6 @@ void BitcoinGUI::gotoSendCoinsPage()
     disconnect(exportAction, SIGNAL(triggered()), 0, 0);
 }
 
-/*
-void BitcoinGUI::gotoChatPage()
-{
-    chatAction->setChecked(true);
-    centralWidget->setCurrentWidget(chatWindow);
-
-	exportAction->setEnabled(true);
-    disconnect(exportAction, SIGNAL(triggered()), 0, 0);
-
-}
-*/
 void BitcoinGUI::gotoSignMessageTab(QString addr)
 {
     // call show() in showTab_SM()

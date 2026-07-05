@@ -72,10 +72,6 @@ public:
         functionality.
     */
     void setWalletModel(WalletModel *walletModel);
-    /** Set the message model.
-        The message model represents encryption message database, and offers access to the list of messages, address book and sending
-        functionality.
-    */
     void checkTOU();
 
 protected:
@@ -220,7 +216,6 @@ private slots:
     void gotoIDAGPage();
 	/** Switch to block explorer*/
     void gotoBlockBrowser();
-	/** Switch to market*/
   /** Switch to manage names page */
     void gotoManageNamesPage();
 	/** Switch to minting page */
@@ -235,7 +230,6 @@ private slots:
     void gotoSendCoinsPage();
 	/** Switch to collateralnode manager page */
 	void gotoCollateralnodeManagerPage();
-	/** Switch to proof of image page */
     /** Switch to Staking page */
     void gotoStakingPage();
     /** Switch to Privacy page */
@@ -277,12 +271,6 @@ private slots:
         The new items are those between start and end inclusive, under the given parent item.
     */
     void incomingTransaction(const QModelIndex & parent, int start, int end);
-
-    /** Show incoming message notification for new messages.
-
-        The new items are those between start and end inclusive, under the given parent item.
-    */
-    void incomingMessage(const QModelIndex & parent, int start, int end);
 
     /** Encrypt the wallet */
     void encryptWallet(bool status);

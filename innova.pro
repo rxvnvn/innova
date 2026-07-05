@@ -178,7 +178,6 @@ HEADERS += build/build.h \
            src/qt/collateralnodemanager.h \
            src/qt/csvmodelwriter.h \
            src/qt/editaddressdialog.h \
-           src/qt/emojipicker.h \
            src/qt/guiconstants.h \
            src/qt/guiutil.h \
            src/qt/initexecutor.h \
@@ -634,7 +633,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/collateralnodemanager.cpp \
            src/qt/csvmodelwriter.cpp \
            src/qt/editaddressdialog.cpp \
-           src/qt/emojipicker.cpp \
            src/qt/guiutil.cpp \
            src/qt/initexecutor.cpp \
            src/qt/intro.cpp \
