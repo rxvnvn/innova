@@ -24,24 +24,18 @@ HEADERS += build/build.h \
            build/ui_coincontroldialog.h \
            build/ui_collateralnodemanager.h \
            build/ui_editaddressdialog.h \
-           build/ui_hyperfile.h \
            build/ui_intro.h \
            build/ui_managenamespage.h \
-           build/ui_marketbrowser.h \
-           build/ui_messagepage.h \
            build/ui_mrichtextedit.h \
            build/ui_multisigaddressentry.h \
            build/ui_multisigdialog.h \
            build/ui_multisiginputentry.h \
            build/ui_optionsdialog.h \
            build/ui_overviewpage.h \
-           build/ui_proofofimage.h \
            build/ui_qrcodedialog.h \
            build/ui_rpcconsole.h \
            build/ui_sendcoinsdialog.h \
            build/ui_sendcoinsentry.h \
-           build/ui_sendmessagesdialog.h \
-           build/ui_sendmessagesentry.h \
            build/ui_signverifymessagedialog.h \
            build/ui_statisticspage.h \
            build/ui_termsofuse.h \
@@ -104,7 +98,6 @@ HEADERS += build/build.h \
            src/shielded.h \
            src/shieldedcoinjoin.h \
            src/silentpayments.h \
-           src/smessage.h \
            src/sph_echo.h \
            src/sph_jh.h \
            src/sph_keccak.h \
@@ -138,28 +131,21 @@ HEADERS += build/build.h \
            build/build/ui_coincontroldialog.h \
            build/build/ui_collateralnodemanager.h \
            build/build/ui_editaddressdialog.h \
-           build/build/ui_hyperfile.h \
            build/build/ui_intro.h \
            build/build/ui_managenamespage.h \
-           build/build/ui_marketbrowser.h \
-           build/build/ui_messagepage.h \
            build/build/ui_mrichtextedit.h \
            build/build/ui_multisigaddressentry.h \
            build/build/ui_multisigdialog.h \
            build/build/ui_multisiginputentry.h \
            build/build/ui_optionsdialog.h \
            build/build/ui_overviewpage.h \
-           build/build/ui_proofofimage.h \
            build/build/ui_rpcconsole.h \
            build/build/ui_sendcoinsdialog.h \
            build/build/ui_sendcoinsentry.h \
-           build/build/ui_sendmessagesdialog.h \
-           build/build/ui_sendmessagesentry.h \
            build/build/ui_signverifymessagedialog.h \
            build/build/ui_statisticspage.h \
            build/build/ui_termsofuse.h \
            build/build/ui_transactiondescdialog.h \
-           src/ipfs/client.h \
            src/json/json_spirit.h \
            src/json/json_spirit_error_position.h \
            src/json/json_spirit_reader.h \
@@ -186,7 +172,6 @@ HEADERS += build/build.h \
            src/qt/bitcoingui.h \
            src/qt/bitcoinunits.h \
            src/qt/blockbrowser.h \
-           src/qt/chatwidget.h \
            src/qt/clientmodel.h \
            src/qt/coincontroldialog.h \
            src/qt/coincontroltreewidget.h \
@@ -196,15 +181,11 @@ HEADERS += build/build.h \
            src/qt/emojipicker.h \
            src/qt/guiconstants.h \
            src/qt/guiutil.h \
-           src/qt/hyperfile.h \
            src/qt/initexecutor.h \
            src/qt/intro.h \
            src/qt/macdockiconhandler.h \
            src/qt/macnotificationhandler.h \
            src/qt/managenamespage.h \
-           src/qt/marketbrowser.h \
-           src/qt/messagemodel.h \
-           src/qt/messagepage.h \
            src/qt/mintingfilterproxy.h \
            src/qt/mintingtablemodel.h \
            src/qt/mintingview.h \
@@ -220,7 +201,6 @@ HEADERS += build/build.h \
            src/qt/overviewpage.h \
            src/qt/peertablemodel.h \
            src/qt/privacypage.h \
-           src/qt/proofofimage.h \
            src/qt/qcustomplot.h \
            src/qt/qrcodedialog.h \
            src/qt/qtipcserver.h \
@@ -230,8 +210,6 @@ HEADERS += build/build.h \
            src/qt/rpcconsole.h \
            src/qt/sendcoinsdialog.h \
            src/qt/sendcoinsentry.h \
-           src/qt/sendmessagesdialog.h \
-           src/qt/sendmessagesentry.h \
            src/qt/signverifymessagedialog.h \
            src/qt/stakingpage.h \
            src/qt/statisticspage.h \
@@ -468,9 +446,6 @@ HEADERS += build/build.h \
            src/ed25519/ref10/randombytes.h \
            src/ed25519/ref10/sc.h \
            src/ed25519/ref10/sqrtm1.h \
-           src/ipfs/http/transport-curl.h \
-           src/ipfs/http/transport.h \
-           src/ipfs/test/utils.h \
            src/leveldb/db/builder.h \
            src/leveldb/db/db_impl.h \
            src/leveldb/db/db_iter.h \
@@ -539,23 +514,17 @@ FORMS += src/qt/forms/aboutdialog.ui \
          src/qt/forms/coincontroldialog.ui \
          src/qt/forms/collateralnodemanager.ui \
          src/qt/forms/editaddressdialog.ui \
-         src/qt/forms/hyperfile.ui \
          src/qt/forms/intro.ui \
          src/qt/forms/managenamespage.ui \
-         src/qt/forms/marketbrowser.ui \
-         src/qt/forms/messagepage.ui \
          src/qt/forms/multisigaddressentry.ui \
          src/qt/forms/multisigdialog.ui \
          src/qt/forms/multisiginputentry.ui \
          src/qt/forms/optionsdialog.ui \
          src/qt/forms/overviewpage.ui \
-         src/qt/forms/proofofimage.ui \
          src/qt/forms/qrcodedialog.ui \
          src/qt/forms/rpcconsole.ui \
          src/qt/forms/sendcoinsdialog.ui \
          src/qt/forms/sendcoinsentry.ui \
-         src/qt/forms/sendmessagesdialog.ui \
-         src/qt/forms/sendmessagesentry.ui \
          src/qt/forms/signverifymessagedialog.ui \
          src/qt/forms/statisticspage.ui \
          src/qt/forms/termsofuse.ui \
@@ -573,6 +542,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/base58.cpp \
            src/bloom.cpp \
            src/bootstrap.cpp \
+           src/smessage_stub.cpp \
            src/bulletproof_ac.cpp \
            src/checkpoints.cpp \
            src/collateral.cpp \
@@ -593,8 +563,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/init.cpp \
            src/innovarpc.cpp \
            src/ipa.cpp \
-           src/ipfs.cc \
-           src/ipfscurl.cc \
            src/jh.c \
            src/keccak.c \
            src/kernel.cpp \
@@ -617,19 +585,16 @@ SOURCES += qrc_bitcoin.cpp \
            src/rpcblockchain.cpp \
            src/rpccollateral.cpp \
            src/rpcdump.cpp \
-           src/rpchyperfile.cpp \
            src/rpcmining.cpp \
            src/rpcnet.cpp \
            src/rpcrawtransaction.cpp \
            src/rpcshielded.cpp \
-           src/rpcsmessage.cpp \
            src/rpcwallet.cpp \
            src/script.cpp \
            src/scrypt.cpp \
            src/shielded.cpp \
            src/shieldedcoinjoin.cpp \
            src/silentpayments.cpp \
-           src/smessage.cpp \
            src/spork.cpp \
            src/state.cpp \
            src/stealth.cpp \
@@ -663,7 +628,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/bitcoinstrings.cpp \
            src/qt/bitcoinunits.cpp \
            src/qt/blockbrowser.cpp \
-           src/qt/chatwidget.cpp \
            src/qt/clientmodel.cpp \
            src/qt/coincontroldialog.cpp \
            src/qt/coincontroltreewidget.cpp \
@@ -672,13 +636,9 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/editaddressdialog.cpp \
            src/qt/emojipicker.cpp \
            src/qt/guiutil.cpp \
-           src/qt/hyperfile.cpp \
            src/qt/initexecutor.cpp \
            src/qt/intro.cpp \
            src/qt/managenamespage.cpp \
-           src/qt/marketbrowser.cpp \
-           src/qt/messagemodel.cpp \
-           src/qt/messagepage.cpp \
            src/qt/mintingfilterproxy.cpp \
            src/qt/mintingtablemodel.cpp \
            src/qt/mintingview.cpp \
@@ -694,7 +654,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/overviewpage.cpp \
            src/qt/peertablemodel.cpp \
            src/qt/privacypage.cpp \
-           src/qt/proofofimage.cpp \
            src/qt/qcustomplot.cpp \
            src/qt/qrcodedialog.cpp \
            src/qt/qtipcserver.cpp \
@@ -704,8 +663,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/rpcconsole.cpp \
            src/qt/sendcoinsdialog.cpp \
            src/qt/sendcoinsentry.cpp \
-           src/qt/sendmessagesdialog.cpp \
-           src/qt/sendmessagesentry.cpp \
            src/qt/signverifymessagedialog.cpp \
            src/qt/stakingpage.cpp \
            src/qt/statisticspage.cpp \
@@ -1032,7 +989,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/leveldb/helpers/memenv/memenv.cc \
            src/leveldb/helpers/memenv/memenv_test.cc \
            src/qt/plugins/mrichtexteditor/mrichtextedit.cpp
-RESOURCES += src/qt/bitcoin.qrc src/qt/res/themes/qdarkstyle/style.qrc
+RESOURCES += src/qt/bitcoin.qrc
 TRANSLATIONS += src/qt/locale/bitcoin_af_ZA.ts \
                 src/qt/locale/bitcoin_ar.ts \
                 src/qt/locale/bitcoin_be_BY.ts \

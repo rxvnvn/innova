@@ -3,7 +3,6 @@
 
 #include <QWidget>
 #include <QTimer>
-#include <QFutureWatcher>
 
 QT_BEGIN_NAMESPACE
 class QModelIndex;
@@ -16,17 +15,6 @@ class WalletModel;
 class TxViewDelegate;
 class TransactionFilterProxy;
 
-struct PriceData {
-    double usd;
-    double btc;
-    double eur;
-    double gbp;
-    double rub;
-    double jpy;
-    QString newsfeed;
-    bool success;
-    PriceData() : usd(0), btc(0), eur(0), gbp(0), rub(0), jpy(0), success(false) {}
-};
 
 /** Overview ("home") page widget */
 class OverviewPage : public QWidget
@@ -42,7 +30,6 @@ public:
 
 public slots:
     void setBalance(qint64 balance, qint64 lockedbalance, qint64 stake, qint64 unconfirmedBalance, qint64 immatureBalance, qint64 watchOnlyBalance, qint64 watchUnconfBalance, qint64 watchImmatureBalance, qint64 shieldedBalance = 0);
-    void PriceRequest();
 
 signals:
     void transactionClicked(const QModelIndex &index);
@@ -67,16 +54,12 @@ private:
     int cachedNumBlocks;
     TxViewDelegate *txdelegate;
     TransactionFilterProxy *filter;
-    QFutureWatcher<PriceData> *priceWatcher;
-    bool priceFetchInProgress;
 
-    static PriceData fetchPricesWorker();
 
 private slots:
     void updateDisplayUnit();
     void handleTransactionClicked(const QModelIndex &index);
     void updateWatchOnlyLabels(bool showWatchOnly);
-    void onPricesFetched();
 };
 
 #endif // OVERVIEWPAGE_H

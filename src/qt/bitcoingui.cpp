@@ -7,14 +7,12 @@
 #include "bitcoingui.h"
 #include "transactiontablemodel.h"
 #include "addressbookpage.h"
-#include "messagepage.h"
 #include "sendcoinsdialog.h"
 #include "signverifymessagedialog.h"
 #include "optionsdialog.h"
 #include "aboutdialog.h"
 #include "clientmodel.h"
 #include "walletmodel.h"
-#include "messagemodel.h"
 #include "editaddressdialog.h"
 #include "optionsmodel.h"
 #include "transactiondescdialog.h"
@@ -24,7 +22,6 @@
 #include "statisticspage.h"
 #include "idagpage.h"
 #include "blockbrowser.h"
-#include "marketbrowser.h"
 #include "collateralnodemanager.h"
 #include "collateral.h"
 #include "mintingview.h"
@@ -37,12 +34,9 @@
 #include "rpcconsole.h"
 #include "wallet.h"
 #include "termsofuse.h"
-#include "proofofimage.h"
-#include "hyperfile.h"
 #include "stakingpage.h"
 #include "privacypage.h"
 #include "nullsendpage.h"
-#include "chatwidget.h"
 #include "managenamespage.h"
 
 #ifdef Q_OS_MAC
@@ -75,7 +69,6 @@
 #include <QUrl>
 #include <QStyle>
 #include <QStyleFactory>
-#include <QTextStream>
 #include <QScreen>
 #include <QTextDocument>
 #include <QGraphicsScene>
@@ -89,38 +82,8 @@ extern CWallet* pwalletMain;
 extern int64_t nLastCoinStakeSearchInterval;
 double GetPoSKernelPS();
 
-#define VERTICAL_TOOBAR_STYLESHEET "QToolBar {\
-border: 1px solid #1c1c28;\
-height:100%;\
-padding-top:20px;\
-text-align: left;\
-}\
-QToolButton {\
-min-width:180px;\
-background-color: #1c1c28;\
-border: 1px solid #1c1c28;\
-border-radius: 3px;\
-margin: 3px;\
-padding-left: 5px;\
-/*padding-right:50px;*/\
-padding-top:5px;\
-width:100%;\
-text-align: left;\
-padding-bottom:5px;\
-}\
-QToolButton:pressed {\
-background-color: #66a0c3;\
-border: 1px solid #01619b;\
-}\
-QToolButton:hover {\
-background-color: #01619b;\
-border: 1px solid #1c1c28;\
-}"
-#define HORIZONTAL_TOOLBAR_STYLESHEET "QToolBar {\
-    border: 1px solid #1c1c28;\
-    background: 1px solid #1c1c28;\
-    font-weight: bold;\
-}"
+#define VERTICAL_TOOBAR_STYLESHEET ""
+#define HORIZONTAL_TOOLBAR_STYLESHEET ""
 
 ActiveLabel::ActiveLabel(const QString & text, QWidget * parent):
     QLabel(parent){}
@@ -176,16 +139,7 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     QApplication::setAttribute(Qt::AA_DontShowIconsInMenus);
 #endif
 
-    // TODO: Theme switching :)
-    QFile f(":qdarkstyle/style.qss");
-    if (f.exists())
-    {
-        f.open(QFile::ReadOnly | QFile::Text);
-        QTextStream ts(&f);
-        qApp->setStyleSheet(ts.readAll());
-    }
-    else
-        QApplication::setStyle(QStyleFactory::create("Fusion"));
+    QApplication::setStyle(QStyleFactory::create("Fusion"));
 
     // Accept D&D of URIs
     setAcceptDrops(true);
@@ -197,21 +151,15 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
 
     fCNLock = GetBoolArg("-cnconflock");
     fNativeTor = GetBoolArg("-nativetor");
-    fHyperfileLocal = GetBoolArg("-hyperfilelocal");
-
     // Create tabs
     overviewPage = new OverviewPage();
 	statisticsPage = new StatisticsPage(this);
     idagPage = new IDAGPage(this);
 	blockBrowser = new BlockBrowser(this);
-    marketBrowser = new MarketBrowser(this);
 	multisigPage = new MultisigDialog(this);
-    proofOfImagePage = new ProofOfImage(this);
-    hyperfilePage = new Hyperfile(this);
     stakingPage = new StakingPage(this);
     privacyPage = new PrivacyPage(this);
     nullsendPage = new NullSendPage(this);
-    chatWidget = new ChatWidget(this);
     manageNamesPage = new ManageNamesPage(this);
 	//chatWindow = new ChatWindow(this);
 
@@ -232,7 +180,6 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     receiveCoinsPage = new AddressBookPage(AddressBookPage::ForEditing, AddressBookPage::ReceivingTab);
 
     sendCoinsPage = new SendCoinsDialog(this);
-    messagePage = new MessagePage(this);
 
     collateralnodeManagerPage = new CollateralnodeManager(this);
 
@@ -246,15 +193,10 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     centralWidget->addWidget(addressBookPage);
     centralWidget->addWidget(receiveCoinsPage);
     centralWidget->addWidget(sendCoinsPage);
-    centralWidget->addWidget(messagePage);
-    centralWidget->addWidget(chatWidget);
     centralWidget->addWidget(statisticsPage);
     centralWidget->addWidget(idagPage);
 	centralWidget->addWidget(blockBrowser);
     centralWidget->addWidget(collateralnodeManagerPage);
-	centralWidget->addWidget(marketBrowser);
-    centralWidget->addWidget(proofOfImagePage);
-    centralWidget->addWidget(hyperfilePage);
     centralWidget->addWidget(stakingPage);
     centralWidget->addWidget(privacyPage);
     centralWidget->addWidget(nullsendPage);
@@ -316,7 +258,7 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     QString curStyle = qApp->style()->metaObject()->className();
     if(curStyle == "QWindowsStyle" || curStyle == "QWindowsXPStyle")
     {
-        progressBar->setStyleSheet("QProgressBar { background-color: #66a0c3; border: 1px solid light-blue; border-radius: 7px; padding: 1px; text-align: center; } QProgressBar::chunk { background: QLinearGradient(x1: 0, y1: 0, x2: 1, y2: 0, stop: 0 #FF8000, stop: 1 orange); border-radius: 7px; margin: 0px; }");
+        progressBar->setStyleSheet("");
     }
 
     statusBar()->addWidget(progressBarLabel);
@@ -376,12 +318,6 @@ void BitcoinGUI::createActions()
     blockAction->setCheckable(true);
     tabGroup->addAction(blockAction);
 
-	marketAction = new QAction(QIcon(":/icons/mark"), tr("&Market"), this);
-    marketAction->setToolTip(tr("Market Data"));
-    marketAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_7));
-	marketAction->setStatusTip(tr("Innova Market Data"));
-    marketAction->setCheckable(true);
-    tabGroup->addAction(marketAction);
 
     nullsendAction = new QAction(QIcon(":/icons/mark"), tr("&NullSend"), this);
     nullsendAction->setToolTip(tr("NullSend multi-party mixing for transaction unlinkability"));
@@ -428,13 +364,6 @@ void BitcoinGUI::createActions()
     addressBookAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_5));
     tabGroup->addAction(addressBookAction);
 
-    messageAction = new QAction(QIcon(":/icons/msg"), tr("&Messages"), this);
-    messageAction->setToolTip(tr("View and Send Encrypted messages"));
-    messageAction->setCheckable(true);
-	messageAction->setStatusTip(tr("Encrypted Messaging"));
-    messageAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_8));
-    tabGroup->addAction(messageAction);
-
 	mintingAction = new QAction(QIcon(":/icons/stake"), tr("Staking &Inputs"), this);
     mintingAction->setToolTip(tr("View staking inputs and estimated earnings"));
     mintingAction->setCheckable(true);
@@ -447,18 +376,6 @@ void BitcoinGUI::createActions()
     collateralnodeManagerAction->setCheckable(true);
 	collateralnodeManagerAction->setStatusTip(tr("Collateral Nodes"));
     tabGroup->addAction(collateralnodeManagerAction);
-
-    proofOfImageAction = new QAction(QIcon(":/icons/data"), tr("&Proof of Data"), this);
-    proofOfImageAction ->setToolTip(tr("Timestamp Files on the Innova blockchain."));
-    proofOfImageAction ->setCheckable(true);
-	proofOfImageAction->setStatusTip(tr("PoD: Timestamp files"));
-    tabGroup->addAction(proofOfImageAction);
-
-    hyperfileAction = new QAction(QIcon(":/icons/hyperfile"), tr("&Hyperfile"), this);
-    hyperfileAction->setToolTip(tr("Decentralize your files, upload to IPFS!"));
-    hyperfileAction->setCheckable(true);
-    hyperfileAction->setStatusTip(tr("Decentralized File Uploads"));
-    tabGroup->addAction(hyperfileAction);
 
     stakingAction = new QAction(QIcon(":/icons/stake"), tr("S&taking"), this);
     stakingAction->setToolTip(tr("Manage staking mode, cold staking, and privacy staking"));
@@ -480,7 +397,6 @@ void BitcoinGUI::createActions()
 	connect(blockAction, SIGNAL(triggered()), this, SLOT(gotoBlockBrowser()));
 	connect(statisticsAction, SIGNAL(triggered()), this, SLOT(gotoStatisticsPage()));
     connect(idagAction, SIGNAL(triggered()), this, SLOT(gotoIDAGPage()));
-	connect(marketAction, SIGNAL(triggered()), this, SLOT(gotoMarketBrowser()));
 	//connect(chatAction, SIGNAL(triggered()), this, SLOT(gotoChatPage()));
     connect(sendCoinsAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(sendCoinsAction, SIGNAL(triggered()), this, SLOT(gotoSendCoinsPage()));
@@ -496,14 +412,8 @@ void BitcoinGUI::createActions()
     connect(historyAction, SIGNAL(triggered()), this, SLOT(gotoHistoryPage()));
     connect(addressBookAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(addressBookAction, SIGNAL(triggered()), this, SLOT(gotoAddressBookPage()));
-    connect(messageAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
-    connect(messageAction, SIGNAL(triggered()), this, SLOT(gotoMessagePage()));
 	connect(multisigAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(multisigAction, SIGNAL(triggered()), this, SLOT(gotoMultisigPage()));
-    connect(proofOfImageAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
-    connect(proofOfImageAction, SIGNAL(triggered()), this, SLOT(gotoProofOfImagePage()));
-    connect(hyperfileAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
-    connect(hyperfileAction, SIGNAL(triggered()), this, SLOT(gotoHyperfilePage()));
     connect(stakingAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(stakingAction, SIGNAL(triggered()), this, SLOT(gotoStakingPage()));
     connect(privacyAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
@@ -653,9 +563,6 @@ void BitcoinGUI::createToolBars()
   mainToolbar->addAction(idagAction);
   mainToolbar->addAction(blockAction);
   mainToolbar->addAction(manageNamesAction);
-  mainToolbar->addAction(hyperfileAction);
-  mainToolbar->addAction(proofOfImageAction);
-  mainToolbar->addAction(messageAction);
 
     secondaryToolbar = addToolBar(tr("Actions toolbar"));
     secondaryToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
@@ -759,7 +666,6 @@ void BitcoinGUI::setWalletModel(WalletModel *walletModel)
         signVerifyMessageDialog->setModel(walletModel);
 		statisticsPage->setModel(clientModel);
 		blockBrowser->setModel(clientModel);
-		marketBrowser->setModel(clientModel);
         collateralnodeManagerPage->setWalletModel(walletModel);
 		multisigPage->setModel(walletModel);
     manageNamesPage->setModel(walletModel);
@@ -777,24 +683,6 @@ void BitcoinGUI::setWalletModel(WalletModel *walletModel)
 
         // Ask for passphrase if needed
         connect(walletModel, SIGNAL(requireUnlock()), this, SLOT(unlockWallet()));
-    }
-}
-
-void BitcoinGUI::setMessageModel(MessageModel *messageModel)
-{
-    this->messageModel = messageModel;
-    if(messageModel)
-    {
-        // Report errors from message thread
-        connect(messageModel, SIGNAL(error(QString,QString,bool)), this, SLOT(error(QString,QString,bool)));
-
-        // Put transaction list in tabs
-        messagePage->setModel(messageModel);
-        chatWidget->setModel(messageModel, walletModel);
-
-        // Balloon pop-up for new message
-        connect(messageModel, SIGNAL(rowsInserted(QModelIndex,int,int)),
-                this, SLOT(incomingMessage(QModelIndex,int,int)));
     }
 }
 
@@ -1135,31 +1023,9 @@ void BitcoinGUI::incomingTransaction(const QModelIndex & parent, int start, int 
 
 void BitcoinGUI::incomingMessage(const QModelIndex & parent, int start, int end)
 {
-    if(!messageModel)
-        return;
-
-    MessageModel *mm = messageModel;
-
-    if (mm->index(start, MessageModel::TypeInt, parent).data().toInt() == MessageTableEntry::Received)
-    {
-        QString sent_datetime = mm->index(start, MessageModel::ReceivedDateTime, parent).data().toString();
-        QString from_address  = mm->index(start, MessageModel::FromAddress,      parent).data().toString();
-        QString to_address    = mm->index(start, MessageModel::ToAddress,        parent).data().toString();
-        QString message       = mm->index(start, MessageModel::Message,          parent).data().toString();
-        QTextDocument html;
-        html.setHtml(message);
-        QString messageText(html.toPlainText());
-        notificator->notify(Notificator::Information,
-                            tr("Incoming Message"),
-                            tr("Date: %1\n"
-                               "From Address: %2\n"
-                               "To Address: %3\n"
-                               "Message: %4\n")
-                              .arg(sent_datetime)
-                              .arg(from_address)
-                              .arg(to_address)
-                              .arg(messageText));
-    };
+    Q_UNUSED(parent);
+    Q_UNUSED(start);
+    Q_UNUSED(end);
 }
 
 void BitcoinGUI::showDebugWindow()
@@ -1234,16 +1100,6 @@ void BitcoinGUI::gotoOverviewPage()
     disconnect(exportAction, SIGNAL(triggered()), 0, 0);
 }
 
-void BitcoinGUI::gotoMarketBrowser()
-{
-    marketAction->setChecked(true);
-    centralWidget->setCurrentWidget(marketBrowser);
-
-    exportAction->setEnabled(false);
-    disconnect(exportAction, SIGNAL(triggered()), 0, 0);
-
-}
-
 void BitcoinGUI::gotoManageNamesPage()
 {
     manageNamesAction->setChecked(true);
@@ -1252,24 +1108,6 @@ void BitcoinGUI::gotoManageNamesPage()
     exportAction->setEnabled(true);
     disconnect(exportAction, SIGNAL(triggered()), 0, 0);
     connect(exportAction, SIGNAL(triggered()), manageNamesPage, SLOT(exportClicked()));
-}
-
-void BitcoinGUI::gotoProofOfImagePage()
-{
-    proofOfImageAction->setChecked(true);
-    centralWidget->setCurrentWidget(proofOfImagePage);
-
-    exportAction->setEnabled(false);
-    disconnect(exportAction, SIGNAL(triggered()), 0, 0);
-}
-
-void BitcoinGUI::gotoHyperfilePage()
-{
-    hyperfileAction->setChecked(true);
-    centralWidget->setCurrentWidget(hyperfilePage);
-
-    exportAction->setEnabled(false);
-    disconnect(exportAction, SIGNAL(triggered()), 0, 0);
 }
 
 void BitcoinGUI::gotoStakingPage()
@@ -1390,14 +1228,6 @@ void BitcoinGUI::gotoSendCoinsPage()
     disconnect(exportAction, SIGNAL(triggered()), 0, 0);
 }
 
-void BitcoinGUI::gotoMessagePage()
-{
-    messageAction->setChecked(true);
-    centralWidget->setCurrentWidget(chatWidget);
-
-    exportAction->setEnabled(false);
-    disconnect(exportAction, SIGNAL(triggered()), 0, 0);
-}
 /*
 void BitcoinGUI::gotoChatPage()
 {
@@ -1479,8 +1309,7 @@ void BitcoinGUI::mainToolbarOrientation(Qt::Orientation orientation)
         mainIcon->setAlignment(Qt::AlignLeft);
         mainIcon->show();
         mainToolbar->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-        mainToolbar->setStyleSheet(HORIZONTAL_TOOLBAR_STYLESHEET);
-        messageAction->setIconText(tr("&Messages"));
+        mainToolbar->setStyleSheet("");
     }
     else
     {
@@ -1488,14 +1317,13 @@ void BitcoinGUI::mainToolbarOrientation(Qt::Orientation orientation)
         mainIcon->setAlignment(Qt::AlignCenter);
         mainIcon->show();
         mainToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-        mainToolbar->setStyleSheet(VERTICAL_TOOBAR_STYLESHEET);
-        messageAction->setIconText(tr("Encrypted &Messages"));
+        mainToolbar->setStyleSheet("");
     }
 }
 
 void BitcoinGUI::secondaryToolbarOrientation(Qt::Orientation orientation)
 {
-    secondaryToolbar->setStyleSheet(orientation == Qt::Horizontal ? HORIZONTAL_TOOLBAR_STYLESHEET : VERTICAL_TOOBAR_STYLESHEET);
+    secondaryToolbar->setStyleSheet("");
 }
 
 void BitcoinGUI::setEncryptionStatus(int status)

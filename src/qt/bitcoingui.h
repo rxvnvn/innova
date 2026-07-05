@@ -9,7 +9,6 @@
 class TransactionTableModel;
 class ClientModel;
 class WalletModel;
-class MessageModel;
 class TransactionView;
 class MintingView;
 class ManageNamesPage;
@@ -17,20 +16,15 @@ class CollateralnodeManager;
 class MultisigDialog;
 class OverviewPage;
 class AddressBookPage;
-class MessagePage;
 class StatisticsPage;
 class IDAGPage;
-class MarketBrowser;
 class BlockBrowser;
 class SendCoinsDialog;
 class SignVerifyMessageDialog;
 class Notificator;
 class RPCConsole;
-class ProofOfImage;
-class Hyperfile;
 class StakingPage;
 class PrivacyPage;
-class ChatWidget;
 
 QT_BEGIN_NAMESPACE
 class QLabel;
@@ -82,7 +76,6 @@ public:
         The message model represents encryption message database, and offers access to the list of messages, address book and sending
         functionality.
     */
-    void setMessageModel(MessageModel *messageModel);
     void checkTOU();
 
 protected:
@@ -94,8 +87,6 @@ protected:
 private:
     ClientModel *clientModel;
     WalletModel *walletModel;
-    MessageModel *messageModel;
-
     QStackedWidget *centralWidget;
 
     OverviewPage *overviewPage;
@@ -103,20 +94,15 @@ private:
     IDAGPage *idagPage;
 	  BlockBrowser *blockBrowser;
     ManageNamesPage *manageNamesPage;
-	  MarketBrowser *marketBrowser;
     QWidget *transactionsPage;
 	  QWidget *mintingPage;
 	  MultisigDialog *multisigPage;
-	  ProofOfImage *proofOfImagePage;
-    Hyperfile *hyperfilePage;
     StakingPage *stakingPage;
     PrivacyPage *privacyPage;
     QWidget *nullsendPage;
 	  CollateralnodeManager *collateralnodeManagerPage;
     AddressBookPage *addressBookPage;
     AddressBookPage *receiveCoinsPage;
-    MessagePage *messagePage;
-    ChatWidget *chatWidget;
     SendCoinsDialog *sendCoinsPage;
     SignVerifyMessageDialog *signVerifyMessageDialog;
 
@@ -137,12 +123,9 @@ private:
 	  QAction *statisticsAction;
     QAction *idagAction;
 	  QAction *blockAction;
-	  QAction *marketAction;
     QAction *historyAction;
 	  QAction *mintingAction;
 	  QAction *multisigAction;
-    QAction *proofOfImageAction;
-    QAction *hyperfileAction;
     QAction *stakingAction;
     QAction *privacyAction;
     QAction *nullsendAction;
@@ -151,7 +134,6 @@ private:
     QAction *quitAction;
     QAction *sendCoinsAction;
     QAction *addressBookAction;
-    QAction *messageAction;
     QAction *signMessageAction;
     QAction *verifyMessageAction;
     QAction *aboutAction;
@@ -239,7 +221,6 @@ private slots:
 	/** Switch to block explorer*/
     void gotoBlockBrowser();
 	/** Switch to market*/
-    void gotoMarketBrowser();
   /** Switch to manage names page */
     void gotoManageNamesPage();
 	/** Switch to minting page */
@@ -252,14 +233,9 @@ private slots:
     void gotoReceiveCoinsPage();
     /** Switch to send coins page */
     void gotoSendCoinsPage();
-    /** Switch to message page */
-    void gotoMessagePage();
 	/** Switch to collateralnode manager page */
 	void gotoCollateralnodeManagerPage();
 	/** Switch to proof of image page */
-	void gotoProofOfImagePage();
-  /** Switch to Hyperfile page */
-   void gotoHyperfilePage();
     /** Switch to Staking page */
     void gotoStakingPage();
     /** Switch to Privacy page */
@@ -268,7 +244,6 @@ private slots:
     void gotoNullSendPage();
 
 
-    //void gotoChatPage();
 
     /** Show Sign/Verify Message dialog and switch to sign message tab */
     void gotoSignMessageTab(QString addr = "");

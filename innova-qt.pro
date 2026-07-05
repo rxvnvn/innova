@@ -1,5 +1,5 @@
 TEMPLATE = app
-TARGET = Innova
+TARGET = innova-qt
 VERSION = 5.0.1
 INCLUDEPATH += src src/json src/qt src/qt/plugins/mrichtexteditor
 DEFINES += QT_GUI BOOST_THREAD_USE_LIB BOOST_SPIRIT_THREADSAFE
@@ -118,24 +118,6 @@ win32:QMAKE_LFLAGS *= -Wl,--dynamicbase -Wl,--nxcompat
 win32:QMAKE_LFLAGS += -static-libgcc -static-libstdc++
 lessThan(QT_MAJOR_VERSION, 5): win32: QMAKE_LFLAGS *= -static
 
-# use: qmake "USE_IPFS=1" ( enabled by default; default)
-#  or: qmake "USE_IPFS=0" (disabled by default)
-#  or: qmake "USE_IPFS=-" (not supported)
-# I n n o v a IPFS - USE_IPFS=- to not compile with the IPFS C Library located in src/ipfs
-contains(USE_IPFS, -) {
-    message(Building without IPFS support)
-} else {
-    message(Building with IPFS support)
-    count(USE_IPFS, 0) {
-        USE_IPFS=1
-    }
-    DEFINES += USE_IPFS=$$USE_IPFS
-    INCLUDEPATH += src/ipfs
-
-	###IPFS C Library native integration sources
-	SOURCES += src/ipfs.cc \
-		src/ipfscurl.cc
-}
 
 INCLUDEPATH += src/minizip
 QMAKE_CFLAGS += -Wno-incompatible-pointer-types
@@ -491,12 +473,9 @@ HEADERS += src/qt/bitcoingui.h \
     src/qt/mintingfilterproxy.h \
     src/qt/mintingtablemodel.h \
     src/qt/mintingview.h \
-    src/qt/proofofimage.h \
-    src/qt/hyperfile.h \
     src/qt/stakingpage.h \
     src/qt/privacypage.h \
     src/qt/nullsendpage.h \
-    src/qt/chatwidget.h \
     src/qt/emojipicker.h \
     src/qt/walletworker.h \
     src/qt/multisigaddressentry.h \
@@ -519,7 +498,6 @@ HEADERS += src/qt/bitcoingui.h \
     src/pbkdf2.h \
     src/serialize.h \
     src/strlcpy.h \
-    src/smessage.h \
     src/main.h \
     src/core.h \
     src/state.h \
@@ -602,7 +580,6 @@ HEADERS += src/qt/bitcoingui.h \
     src/qt/blockbrowser.h \
     src/qt/idagpage.h \
     src/qt/statisticspage.h \
-    src/qt/marketbrowser.h \
     src/qt/qcustomplot.h \
     src/qt/collateralnodemanager.h \
     src/qt/addeditadrenalinenode.h \
@@ -622,10 +599,6 @@ HEADERS += src/qt/bitcoingui.h \
     src/eccryptoverify.h \
     src/qt/nametablemodel.h \
     src/qt/managenamespage.h \
-    src/qt/messagepage.h \
-    src/qt/messagemodel.h \
-    src/qt/sendmessagesdialog.h \
-    src/qt/sendmessagesentry.h \
     src/qt/initexecutor.h \
     src/qt/plugins/mrichtexteditor/mrichtextedit.h \
     src/qt/qvalidatedtextedit.h
@@ -647,7 +620,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/qt/bitcoinaddressvalidator.cpp \
     src/qt/statisticspage.cpp \
     src/qt/blockbrowser.cpp \
-    src/qt/marketbrowser.cpp \
     src/kernelrecord.cpp \
     src/qt/mintingfilterproxy.cpp \
     src/qt/mintingtablemodel.cpp \
@@ -655,15 +627,11 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/qt/multisigaddressentry.cpp \
     src/qt/multisiginputentry.cpp \
     src/qt/multisigdialog.cpp \
-    src/qt/proofofimage.cpp \
-    src/qt/hyperfile.cpp \
     src/qt/stakingpage.cpp \
     src/qt/privacypage.cpp \
     src/qt/nullsendpage.cpp \
-    src/qt/chatwidget.cpp \
     src/qt/emojipicker.cpp \
     src/qt/walletworker.cpp \
-    src/rpchyperfile.cpp \
     src/qt/termsofuse.cpp \
     src/qt/bantablemodel.cpp \
     src/alert.cpp \
@@ -671,7 +639,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/base58.cpp \
     src/version.cpp \
     src/sync.cpp \
-    src/smessage.cpp \
     src/util.cpp \
     src/netbase.cpp \
     src/key.cpp \
@@ -684,6 +651,7 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/miner.cpp \
     src/init.cpp \
     src/bootstrap.cpp \
+    src/smessage_stub.cpp \
     src/net.cpp \
     src/checkpoints.cpp \
     src/addrman.cpp \
@@ -713,8 +681,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/rpccollateral.cpp \
     src/rpcblockchain.cpp \
     src/rpcrawtransaction.cpp \
-    src/rpcsmessage.cpp \
-    src/rpcnyx.cpp \
     src/qt/overviewpage.cpp \
     src/qt/csvmodelwriter.cpp \
     src/crypter.cpp \
@@ -731,11 +697,7 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/qt/idagpage.cpp \
     src/qt/nametablemodel.cpp \
     src/qt/managenamespage.cpp \
-    src/qt/messagepage.cpp \
-    src/qt/messagemodel.cpp \
     src/qt/qcustomplot.cpp \
-    src/qt/sendmessagesdialog.cpp \
-    src/qt/sendmessagesentry.cpp \
     src/qt/qvalidatedtextedit.cpp \
     src/qt/plugins/mrichtexteditor/mrichtextedit.cpp \
     src/qt/collateralnodemanager.cpp \
@@ -777,7 +739,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
 
 RESOURCES += \
     src/qt/bitcoin.qrc \
-    src/qt/res/themes/qdarkstyle/style.qrc
 
 FORMS += \
     src/qt/forms/intro.ui \
@@ -793,12 +754,8 @@ FORMS += \
     src/qt/forms/askpassphrasedialog.ui \
     src/qt/forms/rpcconsole.ui \
     src/qt/forms/optionsdialog.ui \
-    src/qt/forms/messagepage.ui \
     src/qt/forms/statisticspage.ui \
     src/qt/forms/blockbrowser.ui \
-    src/qt/forms/marketbrowser.ui \
-    src/qt/forms/proofofimage.ui \
-    src/qt/forms/hyperfile.ui \
     src/qt/forms/termsofuse.ui \
     src/qt/forms/collateralnodemanager.ui \
     src/qt/forms/addeditadrenalinenode.ui \
@@ -807,8 +764,6 @@ FORMS += \
     src/qt/forms/multisiginputentry.ui \
     src/qt/forms/multisigdialog.ui \
     src/qt/forms/managenamespage.ui \
-    src/qt/forms/sendmessagesentry.ui \
-    src/qt/forms/sendmessagesdialog.ui \
     src/qt/plugins/mrichtexteditor/mrichtextedit.ui
 
 contains(USE_QRCODE, 1) {
@@ -905,7 +860,7 @@ macx:OBJECTIVE_SOURCES += src/qt/macdockiconhandler.mm src/qt/macnotificationhan
 macx:LIBS += -framework Foundation -framework ApplicationServices -framework AppKit -framework IOKit
 macx:DEFINES += MAC_OSX MSG_NOSIGNAL=0
 macx:ICON = src/qt/res/icons/innova.icns
-macx:TARGET = "Innova"
+macx:TARGET = innova-qt
 macx:QMAKE_CFLAGS_THREAD += -pthread
 macx:QMAKE_LFLAGS_THREAD += -pthread
 macx:QMAKE_MACOSX_DEPLOYMENT_TARGET = 12.0
@@ -917,9 +872,10 @@ macx:QMAKE_POST_LINK += codesign --force --deep -s - $${TARGET}.app
 
 
 # Set libraries and includes at end, to use platform-defined defaults if not overridden
-INCLUDEPATH += $$BOOST_INCLUDE_PATH $$BDB_INCLUDE_PATH $$OPENSSL_INCLUDE_PATH $$QRENCODE_INCLUDE_PATH $$LIBEVENT_INCLUDE_PATH $$LIBCURL_INCLUDE_PATH
-LIBS += $$join(BOOST_LIB_PATH,,-L,) $$join(BDB_LIB_PATH,,-L,) $$join(OPENSSL_LIB_PATH,,-L,) $$join(QRENCODE_LIB_PATH,,-L,) $$join(LIBEVENT_LIB_PATH,,-L,) $$join(LIBCURL_LIB_PATH,,-L,)
-LIBS += -lcurl -lssl -lcrypto -ldb_cxx$$BDB_LIB_SUFFIX
+INCLUDEPATH += $$BOOST_INCLUDE_PATH $$BDB_INCLUDE_PATH $$OPENSSL_INCLUDE_PATH $$QRENCODE_INCLUDE_PATH $$LIBEVENT_INCLUDE_PATH
+LIBS += $$join(BOOST_LIB_PATH,,-L,) $$join(BDB_LIB_PATH,,-L,) $$join(OPENSSL_LIB_PATH,,-L,) $$join(QRENCODE_LIB_PATH,,-L,) $$join(LIBEVENT_LIB_PATH,,-L,)
+LIBS += -lssl -lcrypto -ldb_cxx$$BDB_LIB_SUFFIX
+LIBS += -lcurl
 LIBS += -lz -lzstd -lbrotlidec -lbrotlicommon -levent
 LIBS += -lboost_filesystem$$BOOST_LIB_SUFFIX -lboost_program_options$$BOOST_LIB_SUFFIX -lboost_thread$$BOOST_THREAD_LIB_SUFFIX -lboost_chrono$$BOOST_LIB_SUFFIX
 
@@ -927,7 +883,6 @@ LIBS += -lboost_filesystem$$BOOST_LIB_SUFFIX -lboost_program_options$$BOOST_LIB_
 windows:LIBS += -lws2_32 -lshlwapi -lmswsock -lole32 -loleaut32 -luuid -lgdi32
 windows:LIBS += -lboost_chrono$$BOOST_LIB_SUFFIX
 win32:contains(STATIC_LINK, 1) {
-    DEFINES += CURL_STATICLIB
     LIBS += -lssh2 -lbcrypt -lcrypt32 -lwldap32 -lbrotlidec -lbrotlicommon -lzstd
     LIBS += -lnghttp2 -lnghttp3 -lngtcp2_crypto_ossl -lngtcp2 -lpsl -lidn2 -lunistring -liconv -lsecur32
     LIBS += -lssl -lcrypto -lws2_32 -lz -lcrypt32
