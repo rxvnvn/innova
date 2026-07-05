@@ -72,7 +72,7 @@ if [[ $CLEAN -eq 1 ]]; then
     echo ">> Cleaning previous build..."
     cd "$SCRIPT_DIR/src/leveldb" && make clean 2>/dev/null || true
     cd "$SCRIPT_DIR/src" && rm -f innovad.exe obj/*.o obj/*.P obj/*.d obj/minizip/*.o 2>/dev/null || true
-    cd "$SCRIPT_DIR" && rm -rf build/ Makefile Makefile.Release Makefile.Debug .qmake.stash release/Innova.exe 2>/dev/null || true
+    cd "$SCRIPT_DIR" && rm -rf build/ Makefile Makefile.Release Makefile.Debug .qmake.stash release/innova-qt.exe 2>/dev/null || true
     rm -rf "$RELEASE_DIR"
     echo "   Clean done."
 fi
@@ -126,7 +126,7 @@ else
 fi
 
 if [[ $BUILD_WALLET -eq 1 ]]; then
-    echo ">> [5/6] Building Innova Qt wallet (static)..."
+    echo ">> [5/6] Building innova-qt (static)..."
 
     cd "$SCRIPT_DIR"
 
@@ -151,7 +151,7 @@ if [[ $BUILD_WALLET -eq 1 ]]; then
 
     make -j"$JOBS"
 
-    echo "   Innova.exe built."
+    echo "   innova-qt.exe built."
 else
     echo ">> [5/6] Skipping Qt wallet build."
 fi
@@ -166,10 +166,10 @@ if [[ $BUILD_DAEMON -eq 1 && -f "$SCRIPT_DIR/src/innovad.exe" ]]; then
 fi
 
 if [[ $BUILD_WALLET -eq 1 ]]; then
-    if [[ -f "$SCRIPT_DIR/release/Innova.exe" ]]; then
-        cp "$SCRIPT_DIR/release/Innova.exe" "$RELEASE_DIR/"
-    elif [[ -f "$SCRIPT_DIR/Innova.exe" ]]; then
-        cp "$SCRIPT_DIR/Innova.exe" "$RELEASE_DIR/"
+    if [[ -f "$SCRIPT_DIR/release/innova-qt.exe" ]]; then
+        cp "$SCRIPT_DIR/release/innova-qt.exe" "$RELEASE_DIR/"
+    elif [[ -f "$SCRIPT_DIR/innova-qt.exe" ]]; then
+        cp "$SCRIPT_DIR/innova-qt.exe" "$RELEASE_DIR/"
     fi
 fi
 

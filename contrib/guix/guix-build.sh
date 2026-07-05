@@ -98,10 +98,10 @@ build_linux_x86_64() {
         " || echo "WARN: Qt wallet build failed (may need Qt5 in manifest)"
 
     # Copy Qt output if it exists
-    if [ -f "$INNOVA_ROOT/Innova" ]; then
-        cp "$INNOVA_ROOT/Innova" "$OUTPUT_DIR/Innova-linux-x86_64"
-        strip "$OUTPUT_DIR/Innova-linux-x86_64" 2>/dev/null || true
-        echo "Output: $OUTPUT_DIR/Innova-linux-x86_64"
+    if [ -f "$INNOVA_ROOT/innova-qt" ]; then
+        cp "$INNOVA_ROOT/innova-qt" "$OUTPUT_DIR/innova-qt-linux-x86_64"
+        strip "$OUTPUT_DIR/innova-qt-linux-x86_64" 2>/dev/null || true
+        echo "Output: $OUTPUT_DIR/innova-qt-linux-x86_64"
     fi
 }
 

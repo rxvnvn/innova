@@ -72,7 +72,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p innova-${{ needs.get-version.outputs.version }}-ubuntu2204-x86_64
-          cp src/innovad Innova innova-${{ needs.get-version.outputs.version }}-ubuntu2204-x86_64/
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-ubuntu2204-x86_64/
           strip innova-${{ needs.get-version.outputs.version }}-ubuntu2204-x86_64/*
           cd innova-${{ needs.get-version.outputs.version }}-ubuntu2204-x86_64
           sha256sum * > SHA256SUMS.txt
@@ -121,7 +121,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p innova-${{ needs.get-version.outputs.version }}-ubuntu2404-x86_64
-          cp src/innovad Innova innova-${{ needs.get-version.outputs.version }}-ubuntu2404-x86_64/
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-ubuntu2404-x86_64/
           strip innova-${{ needs.get-version.outputs.version }}-ubuntu2404-x86_64/*
           cd innova-${{ needs.get-version.outputs.version }}-ubuntu2404-x86_64
           sha256sum * > SHA256SUMS.txt
@@ -205,7 +205,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p innova-${{ needs.get-version.outputs.version }}-ubuntu2604-x86_64
-          cp src/innovad Innova innova-${{ needs.get-version.outputs.version }}-ubuntu2604-x86_64/
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-ubuntu2604-x86_64/
           strip innova-${{ needs.get-version.outputs.version }}-ubuntu2604-x86_64/*
           cd innova-${{ needs.get-version.outputs.version }}-ubuntu2604-x86_64
           sha256sum * > SHA256SUMS.txt
@@ -257,7 +257,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p innova-${{ needs.get-version.outputs.version }}-debian12-x86_64
-          cp src/innovad Innova innova-${{ needs.get-version.outputs.version }}-debian12-x86_64/
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-debian12-x86_64/
           strip innova-${{ needs.get-version.outputs.version }}-debian12-x86_64/*
           cd innova-${{ needs.get-version.outputs.version }}-debian12-x86_64
           sha256sum * > SHA256SUMS.txt
@@ -324,7 +324,12 @@ jobs:
       - name: Install dependencies
         run: |
           brew install boost openssl@3 berkeley-db@5 miniupnpc libevent qt@5 qrencode \
-            curl gmp secp256k1
+            curl gmp secp256k1 zstd
+          zstd_prefix="$(brew --prefix zstd)"
+          echo "ZSTD_PREFIX=$zstd_prefix" >> "$GITHUB_ENV"
+          echo "LDFLAGS=-L$zstd_prefix/lib" >> "$GITHUB_ENV"
+          echo "CPPFLAGS=-I$zstd_prefix/include" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=$zstd_prefix/lib/pkgconfig" >> "$GITHUB_ENV"
 
       - name: Build daemon
         run: |
@@ -333,7 +338,8 @@ jobs:
 
       - name: Build Qt wallet
         run: |
-          /opt/homebrew/opt/qt@5/bin/qmake USE_UPNP=1 USE_QRCODE=1 innova-qt.pro
+          /opt/homebrew/opt/qt@5/bin/qmake USE_UPNP=1 USE_QRCODE=1 \
+            "INCLUDEPATH+=$ZSTD_PREFIX/include" "LIBS+=-L$ZSTD_PREFIX/lib" innova-qt.pro
           make -j$(sysctl -n hw.ncpu)
 
       - name: Package
@@ -341,13 +347,8 @@ jobs:
           strip src/innovad || true
           mkdir -p dmg_contents
           cp src/innovad dmg_contents/
-          if [ -d "Innova.app" ]; then
-            strip Innova.app/Contents/MacOS/Innova || true
-            cp -R Innova.app dmg_contents/
-          elif [ -f "Innova" ]; then
-            strip Innova || true
-            cp Innova dmg_contents/
-          fi
+          strip innova-qt.app/Contents/MacOS/innova-qt || true
+          cp -R innova-qt.app dmg_contents/
           cd dmg_contents && shasum -a 256 * > SHA256SUMS.txt 2>/dev/null || true && cd ..
           touch dmg_contents/.metadata_never_index
           for attempt in 1 2 3; do
@@ -474,8 +475,8 @@ jobs:
           PKGDIR="innova-${{ needs.get-version.outputs.version }}-win64"
           mkdir -p "$PKGDIR"
           cp src/innovad.exe "$PKGDIR/"
-          cp release/Innova.exe "$PKGDIR/" 2>/dev/null || true
-          [ -f "Innova.exe" ] && cp Innova.exe "$PKGDIR/" || true
+          cp release/innova-qt.exe "$PKGDIR/" 2>/dev/null || true
+          [ -f "innova-qt.exe" ] && cp innova-qt.exe "$PKGDIR/" || true
           strip "$PKGDIR"/*.exe 2>/dev/null || true
           cd "$PKGDIR"
           sha256sum *.exe > SHA256SUMS.txt 2>/dev/null || true
@@ -524,7 +525,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p innova-${{ needs.get-version.outputs.version }}-debian11-x86_64
-          cp src/innovad Innova innova-${{ needs.get-version.outputs.version }}-debian11-x86_64/
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-debian11-x86_64/
           strip innova-${{ needs.get-version.outputs.version }}-debian11-x86_64/*
           cd innova-${{ needs.get-version.outputs.version }}-debian11-x86_64
           sha256sum * > SHA256SUMS.txt
@@ -572,7 +573,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64
-          cp src/innovad Innova innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64/
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64/
           strip innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64/*
           cd innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64
           sha256sum * > SHA256SUMS.txt
@@ -620,7 +621,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p innova-${{ needs.get-version.outputs.version }}-archlinux-x86_64
-          cp src/innovad Innova innova-${{ needs.get-version.outputs.version }}-archlinux-x86_64/
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-archlinux-x86_64/
           strip innova-${{ needs.get-version.outputs.version }}-archlinux-x86_64/*
           cd innova-${{ needs.get-version.outputs.version }}-archlinux-x86_64
           sha256sum * > SHA256SUMS.txt
@@ -668,7 +669,7 @@ jobs:
       - name: Package
         run: |
           mkdir -p innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64
-          cp src/innovad Innova innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64/
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64/
           strip innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64/*
           cd innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64
           sha256sum * > SHA256SUMS.txt
@@ -721,7 +722,7 @@ jobs:
         run: |
           mkdir -p innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt
           cp src/innovad innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt/ 2>/dev/null || true
-          cp Innova innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt/ 2>/dev/null || true
+          cp innova-qt innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt/ 2>/dev/null || true
           cd innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt
           sha256sum * > SHA256SUMS.txt 2>/dev/null || true
           cd ..

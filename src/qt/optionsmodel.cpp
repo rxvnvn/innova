@@ -42,6 +42,11 @@ void OptionsModel::Init()
 
     // These are Qt-only settings:
     nDisplayUnit = settings.value("nDisplayUnit", BitcoinUnits::BTC).toInt();
+    if (!BitcoinUnits::valid(nDisplayUnit))
+    {
+        nDisplayUnit = BitcoinUnits::BTC;
+        settings.setValue("nDisplayUnit", nDisplayUnit);
+    }
     bDisplayAddresses = settings.value("bDisplayAddresses", false).toBool();
     fMinimizeToTray = settings.value("fMinimizeToTray", false).toBool();
     fMinimizeOnClose = settings.value("fMinimizeOnClose", false).toBool();
@@ -208,6 +213,8 @@ bool OptionsModel::setData(const QModelIndex & index, const QVariant & value, in
             break;
         case DisplayUnit:
             nDisplayUnit = value.toInt();
+            if (!BitcoinUnits::valid(nDisplayUnit))
+                return false;
             settings.setValue("nDisplayUnit", nDisplayUnit);
             emit displayUnitChanged(nDisplayUnit);
             break;

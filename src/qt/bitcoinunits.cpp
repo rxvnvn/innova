@@ -12,8 +12,6 @@ QList<BitcoinUnits::Unit> BitcoinUnits::availableUnits()
 {
     QList<BitcoinUnits::Unit> unitlist;
     unitlist.append(BTC);
-    //unitlist.append(dBTC);
-    //unitlist.append(USD);
     unitlist.append(mBTC);
     unitlist.append(uBTC);
     unitlist.append(Innovai);
@@ -25,8 +23,6 @@ bool BitcoinUnits::valid(int unit)
     switch(unit)
     {
     case BTC:
-    case dBTC:
-    case USD:
     case mBTC:
     case uBTC:
     case Innovai:
@@ -41,8 +37,6 @@ QString BitcoinUnits::name(int unit)
     switch(unit)
     {
     case BTC: return QString("INN");
-    case dBTC: return QString("BTC");
-    case USD: return QString("USD");
     case mBTC: return QString("mINN");
     case uBTC: return QString::fromUtf8("μINN");
     case Innovai: return QString("Innovai");
@@ -55,8 +49,6 @@ QString BitcoinUnits::description(int unit)
     switch(unit)
     {
     case BTC: return QString("Innova");
-    case dBTC: return QString("Bitcoin");
-    case USD: return QString("USD");
     case mBTC: return QString("Milli-Innova (1 / 1,000)");
     case uBTC: return QString("Micro-Innova (1 / 1,000,000)");
     case Innovai: return QString("Innovai (1 / 100,000,000");
@@ -69,8 +61,6 @@ qint64 BitcoinUnits::factor(int unit)
     switch(unit)
     {
     case BTC:  return 100000000;
-    case dBTC: return 100000000;
-    case USD:  return 100000000;
     case mBTC: return 100000;
     case uBTC: return 100;
     case Innovai: return 1;
@@ -83,8 +73,6 @@ int BitcoinUnits::amountDigits(int unit)
     switch(unit)
     {
     case BTC: return 8; // 21,000,000 (# digits, without commas)
-    case dBTC: return 8;
-    case USD: return 8;
     case mBTC: return 11; // 21,000,000,000
     case uBTC: return 14; // 21,000,000,000,000
     case Innovai: return 16; // 2,100,000,000,000,000
@@ -97,8 +85,6 @@ int BitcoinUnits::decimals(int unit)
     switch(unit)
     {
     case BTC: return 8;
-    case dBTC: return 8;
-    case USD: return 2;
     case mBTC: return 5;
     case uBTC: return 2;
     case Innovai: return 0;

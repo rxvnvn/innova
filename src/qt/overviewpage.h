@@ -2,7 +2,6 @@
 #define OVERVIEWPAGE_H
 
 #include <QWidget>
-#include <QTimer>
 
 QT_BEGIN_NAMESPACE
 class QModelIndex;
@@ -35,23 +34,16 @@ signals:
     void transactionClicked(const QModelIndex &index);
 
 private:
-    QTimer *timer;
-    QTimer *refreshbtnTimer;
-    QTimer *updateDisplayTimer;
     Ui::OverviewPage *ui;
     WalletModel *model;
     qint64 currentBalance;
     qint64 currentLockedBalance;
-    qint64 currentStake;
     qint64 currentUnconfirmedBalance;
     qint64 currentImmatureBalance;
     qint64 currentWatchOnlyBalance;
     qint64 currentWatchUnconfBalance;
     qint64 currentWatchImmatureBalance;
     qint64 totalBalance;
-    qint64 lastNewBlock;
-
-    int cachedNumBlocks;
     TxViewDelegate *txdelegate;
     TransactionFilterProxy *filter;
 

@@ -12,9 +12,6 @@
 
 #include <QAbstractItemDelegate>
 #include <QPainter>
-#include <QTimer>
-#include <QDebug>
-#include <QScrollArea>
 
 #define DECORATION_SIZE 36
 #define NUM_ITEMS 7
@@ -24,7 +21,7 @@ class TxViewDelegate : public QAbstractItemDelegate
 {
     Q_OBJECT
 public:
-    TxViewDelegate(): QAbstractItemDelegate(), unit(BitcoinUnits::BTC), unitUSD(BitcoinUnits::USD)
+    TxViewDelegate(): QAbstractItemDelegate(), unit(BitcoinUnits::BTC)
     {
 
     }
@@ -90,7 +87,6 @@ public:
     }
 
     int unit;
-	int unitUSD;
 
 };
 #include "overviewpage.moc"
@@ -99,18 +95,12 @@ OverviewPage::OverviewPage(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::OverviewPage),
     currentBalance(-1),
-    currentStake(0),
     currentUnconfirmedBalance(-1),
     currentImmatureBalance(-1),
     txdelegate(new TxViewDelegate()),
     filter(0)
 {
     ui->setupUi(this);
-
-    // Handle refreshing updateDisplayUnit() more often instead of every tx change
-    updateDisplayTimer = new QTimer(this);
-    connect(updateDisplayTimer, SIGNAL(timeout()), this, SLOT(updateDisplayUnit()));
-    updateDisplayTimer->start(120000);
 
     // Recent transactions
     ui->listTransactions->setItemDelegate(txdelegate);
@@ -144,10 +134,8 @@ void OverviewPage::setBalance(qint64 balance, qint64 lockedbalance, qint64 stake
     if (!model || !model->getOptionsModel())
         return;
     int unit = model->getOptionsModel()->getDisplayUnit();
-    int unitdBTC = BitcoinUnits::dBTC;
     currentBalance = balance;
     currentLockedBalance = lockedbalance;
-    currentStake = stake;
     currentUnconfirmedBalance = unconfirmedBalance;
     currentImmatureBalance = immatureBalance;
 
