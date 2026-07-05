@@ -6708,6 +6708,33 @@ FILE* AppendBlockFile(unsigned int& nFileRet)
     }
 }
 
+bool RebuildMainChainForwardLinks()
+{
+    for (PAIRTYPE(const uint256, CBlockIndex*)& item : mapBlockIndex)
+        item.second->pnext = NULL;
+
+    if (pindexBest == NULL)
+        return pindexGenesisBlock == NULL;
+
+    CBlockIndex* pindex = pindexBest;
+    int nLinks = 0;
+    while (pindex->pprev)
+    {
+        if (pindex->pprev->nHeight >= pindex->nHeight)
+            return error("RebuildMainChainForwardLinks() : invalid height link %d -> %d",
+                         pindex->pprev->nHeight, pindex->nHeight);
+        pindex->pprev->pnext = pindex;
+        pindex = pindex->pprev;
+        ++nLinks;
+    }
+
+    if (pindex != pindexGenesisBlock)
+        return error("RebuildMainChainForwardLinks() : best chain does not end at genesis");
+
+    printf("Rebuilt %d main-chain forward links\n", nLinks);
+    return true;
+}
+
 bool LoadBlockIndex(bool fAllowNew)
 {
     LOCK(cs_main);

@@ -20,6 +20,8 @@
 #include "util.h"
 #include "main.h"
 
+extern bool RebuildMainChainForwardLinks();
+
 using namespace std;
 namespace fs = boost::filesystem;
 
@@ -1077,6 +1079,12 @@ bool CTxDB::LoadBlockIndex()
     pindexBest = mapBlockIndex[hashBestChain];
     nBestHeight = pindexBest->nHeight;
     nBestChainTrust = pindexBest->nChainTrust;
+
+    // Legacy releases did not reliably persist hashNext. Rebuild the
+    // authoritative forward chain from pprev and hashBestChain so getblocks
+    // and getheaders work after a restart.
+    if (!RebuildMainChainForwardLinks())
+        return false;
 
     printf("LoadBlockIndex(): hashBestChain=%s  height=%d  trust=%s  date=%s\n",
       hashBestChain.ToString().substr(0,20).c_str(), nBestHeight, CBigNum(nBestChainTrust).ToString().c_str(),
