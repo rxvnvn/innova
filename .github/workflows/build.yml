@@ -294,8 +294,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y build-essential libtool autotools-dev automake pkg-config \
             libssl-dev libevent-dev bsdmainutils libboost-all-dev libdb++-dev \
-                libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libzstd-dev libgmp-dev \
-            libsecp256k1-dev gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+            libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libzstd-dev libgmp-dev \
 
       - name: Build daemon
         run: |
@@ -570,7 +569,7 @@ jobs:
         run: |
           dnf install -y gcc-c++ make libtool automake pkgconfig \
             openssl-devel libevent-devel boost-devel libdb-cxx-devel \
-            miniupnpc-devel qrencode-devel libcurl-devel gmp-devel zlib-devel \
+            miniupnpc-devel qrencode-devel libcurl-devel libbrotli-devel libzstd-devel gmp-devel zlib-devel \
             qt5-qtbase-devel qt5-qttools-devel \
             protobuf-devel protobuf-compiler git
 
@@ -670,7 +669,7 @@ jobs:
         run: |
           dnf install -y gcc-c++ make libtool automake pkgconfig \
             openssl-devel libevent-devel boost-devel libdb-cxx-devel \
-            miniupnpc-devel qrencode-devel libcurl-devel gmp-devel zlib-devel \
+            miniupnpc-devel qrencode-devel libcurl-devel libbrotli-devel libzstd-devel gmp-devel zlib-devel \
             qt5-qtbase-devel qt5-qttools-devel \
             protobuf-devel protobuf-compiler git
 
@@ -727,7 +726,7 @@ jobs:
               apt-get update && \
               apt-get install -y build-essential libtool automake pkg-config \
                 libssl-dev libevent-dev libboost-all-dev libdb++-dev \
-                libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libzstd-dev libgmp-dev \
+                libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev \
                 libqt5gui5 libqt5core5a libqt5dbus5 qttools5-dev qttools5-dev-tools \
                 libprotobuf-dev protobuf-compiler git && \
               cd src && \
@@ -740,6 +739,7 @@ jobs:
               qmake USE_UPNP=1 USE_QRCODE=1 USE_NATIVETOR=- USE_IPFS=- innova-qt.pro && \
               make -j\$(nproc)
             "
+
 
       - name: Package
         run: |
@@ -781,7 +781,7 @@ jobs:
               apt-get update && \
               apt-get install -y build-essential libtool automake pkg-config \
                 libssl-dev libevent-dev libboost-all-dev libdb++-dev \
-                libminiupnpc-dev libcurl4-openssl-dev libgmp-dev git && \
+                libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev git && \
               cd src && \
               make USE_NATIVETOR=- USE_IPFS=- -f makefile.unix -j\$(nproc)
             "
