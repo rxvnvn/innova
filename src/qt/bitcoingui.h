@@ -72,7 +72,6 @@ public:
         functionality.
     */
     void setWalletModel(WalletModel *walletModel);
-    void checkTOU();
 
 protected:
     void changeEvent(QEvent *e);

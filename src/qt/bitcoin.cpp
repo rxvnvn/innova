@@ -281,7 +281,6 @@ int main(int argc, char *argv[])
                 window.activateWindow();
                 app.processEvents();
 
-                window.checkTOU();
 
                 // Place this here as guiref has to be defined if we don't want to lose URIs
                 ipcInit(argc, argv);

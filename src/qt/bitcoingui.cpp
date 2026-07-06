@@ -33,7 +33,6 @@
 #include "guiutil.h"
 #include "rpcconsole.h"
 #include "wallet.h"
-#include "termsofuse.h"
 #include "stakingpage.h"
 #include "privacypage.h"
 #include "nullsendpage.h"
@@ -576,22 +575,6 @@ void BitcoinGUI::createToolBars()
     connect(secondaryToolbar, SIGNAL(orientationChanged(Qt::Orientation)), this, SLOT(secondaryToolbarOrientation(Qt::Orientation)));
     mainToolbarOrientation(mainToolbar->orientation());
     secondaryToolbarOrientation(secondaryToolbar->orientation());
-}
-
-void BitcoinGUI::checkTOU()
-{
-    bool agreed_to_tou = false;
-    boost::filesystem::path pathDebug = GetDataDir() / ".agreed_to_tou";
-    if (FILE *file = fopen(pathDebug.string().c_str(), "r")) {
-        file=file;
-        fclose(file);
-        agreed_to_tou = true;
-    }
-
-    if(!agreed_to_tou){
-        TermsOfUse dlg(this);
-        dlg.exec();
-    }
 }
 
 void BitcoinGUI::setClientModel(ClientModel *clientModel)

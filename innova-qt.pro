@@ -583,7 +583,6 @@ HEADERS += src/qt/bitcoingui.h \
     src/qt/collateralnodemanager.h \
     src/qt/addeditadrenalinenode.h \
     src/qt/adrenalinenodeconfigdialog.h \
-    src/qt/termsofuse.h \
     src/version.h \
     src/bloom.h \
     src/netbase.h \
@@ -630,7 +629,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/qt/privacypage.cpp \
     src/qt/nullsendpage.cpp \
     src/qt/walletworker.cpp \
-    src/qt/termsofuse.cpp \
     src/qt/bantablemodel.cpp \
     src/alert.cpp \
     src/stun.cpp \
@@ -754,7 +752,6 @@ FORMS += \
     src/qt/forms/optionsdialog.ui \
     src/qt/forms/statisticspage.ui \
     src/qt/forms/blockbrowser.ui \
-    src/qt/forms/termsofuse.ui \
     src/qt/forms/collateralnodemanager.ui \
     src/qt/forms/addeditadrenalinenode.ui \
     src/qt/forms/adrenalinenodeconfigdialog.ui \

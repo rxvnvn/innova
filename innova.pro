@@ -38,7 +38,6 @@ HEADERS += build/build.h \
            build/ui_sendcoinsentry.h \
            build/ui_signverifymessagedialog.h \
            build/ui_statisticspage.h \
-           build/ui_termsofuse.h \
            build/ui_transactiondescdialog.h \
            src/activecollateralnode.h \
            src/addrman.h \
@@ -144,7 +143,6 @@ HEADERS += build/build.h \
            build/build/ui_sendcoinsentry.h \
            build/build/ui_signverifymessagedialog.h \
            build/build/ui_statisticspage.h \
-           build/build/ui_termsofuse.h \
            build/build/ui_transactiondescdialog.h \
            src/json/json_spirit.h \
            src/json/json_spirit_error_position.h \
@@ -212,7 +210,6 @@ HEADERS += build/build.h \
            src/qt/signverifymessagedialog.h \
            src/qt/stakingpage.h \
            src/qt/statisticspage.h \
-           src/qt/termsofuse.h \
            src/qt/trafficgraphwidget.h \
            src/qt/transactiondesc.h \
            src/qt/transactiondescdialog.h \
@@ -526,7 +523,6 @@ FORMS += src/qt/forms/aboutdialog.ui \
          src/qt/forms/sendcoinsentry.ui \
          src/qt/forms/signverifymessagedialog.ui \
          src/qt/forms/statisticspage.ui \
-         src/qt/forms/termsofuse.ui \
          src/qt/forms/transactiondescdialog.ui \
          src/qt/plugins/mrichtexteditor/mrichtextedit.ui
 SOURCES += qrc_bitcoin.cpp \
@@ -664,7 +660,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/signverifymessagedialog.cpp \
            src/qt/stakingpage.cpp \
            src/qt/statisticspage.cpp \
-           src/qt/termsofuse.cpp \
            src/qt/trafficgraphwidget.cpp \
            src/qt/transactiondesc.cpp \
            src/qt/transactiondescdialog.cpp \
