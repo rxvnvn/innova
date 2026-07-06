@@ -569,7 +569,7 @@ jobs:
         run: |
           dnf install -y gcc-c++ make libtool automake pkgconfig \
             openssl-devel libevent-devel boost-devel libdb-cxx-devel \
-            miniupnpc-devel qrencode-devel libcurl-devel libbrotli-devel libzstd-devel gmp-devel zlib-devel \
+            miniupnpc-devel qrencode-devel libcurl-devel brotli-devel libzstd-devel gmp-devel zlib-devel \
             qt5-qtbase-devel qt5-qttools-devel \
             protobuf-devel protobuf-compiler git
 
@@ -669,7 +669,7 @@ jobs:
         run: |
           dnf install -y gcc-c++ make libtool automake pkgconfig \
             openssl-devel libevent-devel boost-devel libdb-cxx-devel \
-            miniupnpc-devel qrencode-devel libcurl-devel libbrotli-devel libzstd-devel gmp-devel zlib-devel \
+            miniupnpc-devel qrencode-devel libcurl-devel brotli-devel libzstd-devel gmp-devel zlib-devel \
             qt5-qtbase-devel qt5-qttools-devel \
             protobuf-devel protobuf-compiler git
 
