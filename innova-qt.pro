@@ -832,6 +832,7 @@ macx:MINIUPNPC_LIB_PATH = $$HOMEBREW_PREFIX/opt/miniupnpc/lib
 
 
 windows:DEFINES += WIN32
+win32:DEFINES += CURL_STATICLIB
 windows:RC_FILE = src/qt/res/bitcoin-qt.rc
 
 windows:!contains(MINGW_THREAD_BUGFIX, 0) {
