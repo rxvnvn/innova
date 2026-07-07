@@ -5,6 +5,7 @@
 
 #include "db.h"
 #include "net.h"
+#include "main.h"
 #include "init.h"
 #include "strlcpy.h"
 #include "addrman.h"
@@ -15,6 +16,8 @@
 #include "shielded.h"
 #include <sys/stat.h>
 #include <algorithm>
+#include <sstream>
+#include <cstdio>
 
 #ifdef WIN32
 #include <string.h>
@@ -60,6 +63,249 @@ void ThreadMapPort2(void* parg);
 void ThreadDNSAddressSeed2(void* parg);
 bool OpenNetworkConnection(const CAddress& addrConnect, CSemaphoreGrant *grantOutbound = NULL, const char *strDest = NULL, bool fOneShot = false);
 
+namespace {
+
+struct MessageStat
+{
+    uint64_t count;
+    uint64_t bytes;
+
+    MessageStat() : count(0), bytes(0) {}
+};
+
+struct PeerMessageStats
+{
+    std::map<std::string, MessageStat> incoming;
+    std::map<std::string, MessageStat> outgoing;
+};
+
+struct GetHeadersLocatorState
+{
+    uint64_t sent;
+    uint64_t suppressed;
+    int64_t lastRequestTime;
+    int64_t lastLogTime;
+
+    GetHeadersLocatorState() : sent(0), suppressed(0), lastRequestTime(0), lastLogTime(0) {}
+};
+
+struct GetHeadersPeerStats
+{
+    std::map<std::string, GetHeadersLocatorState> locators;
+    uint64_t totalSent;
+    uint64_t totalSuppressed;
+    uint64_t inFlight;
+
+    GetHeadersPeerStats() : totalSent(0), totalSuppressed(0), inFlight(0) {}
+};
+
+static CCriticalSection cs_p2pMessageStats;
+static std::map<NodeId, PeerMessageStats> mapPeerMessageStats;
+static std::map<std::string, MessageStat> mapGlobalP2PMsgIncoming;
+static std::map<std::string, MessageStat> mapGlobalP2PMsgOutgoing;
+static std::map<NodeId, GetHeadersPeerStats> mapGetHeadersPeerStats;
+static int64_t nLastSyncDiagnosticsLog = 0;
+static uint64_t nLastSyncDiagnosticsBytesRecv = 0;
+static uint64_t nLastSyncDiagnosticsBytesSent = 0;
+
+static void AddMessageStat(std::map<std::string, MessageStat>& stats, const std::string& command, unsigned int bytes)
+{
+    MessageStat& st = stats[command];
+    st.count++;
+    st.bytes += bytes;
+}
+
+static std::string FormatMessageStats(const std::map<std::string, MessageStat>& stats, const std::vector<std::string>& keys)
+{
+    std::ostringstream oss;
+    bool first = true;
+    for (const std::string& key : keys) {
+        std::map<std::string, MessageStat>::const_iterator it = stats.find(key);
+        if (it == stats.end() || (it->second.count == 0 && it->second.bytes == 0))
+            continue;
+        if (!first)
+            oss << ' ';
+        first = false;
+        oss << key << '=' << it->second.count << '/' << it->second.bytes;
+    }
+    if (first)
+        oss << "none";
+    return oss.str();
+}
+
+static void GetProcessMemorySnapshot(uint64_t& nVmRssKb, uint64_t& nVmSizeKb, uint64_t& nVmDataKb, uint64_t& nVmSwapKb, int& nThreads)
+{
+    nVmRssKb = 0;
+    nVmSizeKb = 0;
+    nVmDataKb = 0;
+    nVmSwapKb = 0;
+    nThreads = 0;
+#ifndef WIN32
+    FILE* fp = fopen("/proc/self/status", "r");
+    if (!fp)
+        return;
+
+    char line[256];
+    while (fgets(line, sizeof(line), fp))
+    {
+        unsigned long long nValue = 0;
+        if (sscanf(line, "VmRSS: %llu kB", &nValue) == 1)
+            nVmRssKb = nValue;
+        else if (sscanf(line, "VmSize: %llu kB", &nValue) == 1)
+            nVmSizeKb = nValue;
+        else if (sscanf(line, "VmData: %llu kB", &nValue) == 1)
+            nVmDataKb = nValue;
+        else if (sscanf(line, "VmSwap: %llu kB", &nValue) == 1)
+            nVmSwapKb = nValue;
+        else if (sscanf(line, "Threads: %d", &nThreads) == 1)
+        {
+        }
+    }
+    fclose(fp);
+#endif
+}
+
+static std::string ShortHash(const uint256& hash)
+{
+    return hash.ToString().substr(0, 20);
+}
+
+static std::string LocatorFingerprint(const CBlockLocator& locator, const uint256& hashStop, bool fShort)
+{
+    uint256 hashFirst = 0;
+    uint256 hashLast = 0;
+    std::ostringstream oss;
+    oss << "size=" << locator.Size();
+    if (locator.GetHashes(hashFirst, hashLast)) {
+        oss << " first=" << (fShort ? ShortHash(hashFirst) : hashFirst.ToString())
+            << " last=" << (fShort ? ShortHash(hashLast) : hashLast.ToString());
+    } else {
+        oss << " first=none last=none";
+    }
+    oss << " stop=" << (fShort ? ShortHash(hashStop) : hashStop.ToString());
+    return oss.str();
+}
+
+static std::string DescribePeerForDiagnostics(const CNode* pnode)
+{
+    std::ostringstream oss;
+    oss << '#' << pnode->GetId() << ' ' << pnode->addrName << ' ' << pnode->strSubVer;
+    return oss.str();
+}
+
+static int64_t GetPeerAdvertisedHeight(const CNode* pnode)
+{
+    return std::max(pnode->nBestKnownHeight, pnode->nChainHeight);
+}
+
+static int64_t SyncPeerScore(const CNode* pnode, int64_t nNow, int64_t nMaxPeerHeight)
+{
+    int64_t nPeerHeight = GetPeerAdvertisedHeight(pnode);
+    if (nPeerHeight < 0)
+        nPeerHeight = 0;
+
+    int64_t nScore = nPeerHeight * 1000000;
+
+    if (nMaxPeerHeight > nPeerHeight)
+        nScore -= (nMaxPeerHeight - nPeerHeight) * 10000;
+
+    if (pnode->nLastHeightUpdate > 0 && nNow - pnode->nLastHeightUpdate <= 120)
+        nScore += 250000;
+
+    if (pnode->nLastBlockRecv > 0 && nNow - pnode->nLastBlockRecv <= 300)
+        nScore += 500000;
+
+    if (!pnode->setBlocksInFlight.empty())
+        nScore += 100000;
+
+    if (pnode->nBlocksReceivedInBatch > 0)
+        nScore += 50000;
+
+    if (pnode->nPingUsecTime > 0) {
+        int64_t nPingBonus = 300000 - (pnode->nPingUsecTime / 10);
+        if (nPingBonus > 0)
+            nScore += nPingBonus;
+    }
+
+    if (nNow - pnode->nTimeConnected < 120)
+        nScore += 10000;
+
+    if (pnode->fDisconnect)
+        nScore -= 5000000;
+
+    return nScore;
+}
+
+static bool CompareSyncCandidates(const std::pair<int64_t, CNode*>& a, const std::pair<int64_t, CNode*>& b)
+{
+    if (a.first != b.first)
+        return a.first > b.first;
+    return a.second->GetId() < b.second->GetId();
+}
+
+static std::string FormatPeerDiagnosticsSummary(const CNode* pnode, int64_t nNow)
+{
+    std::ostringstream oss;
+    int64_t nPeerHeight = GetPeerAdvertisedHeight(pnode);
+    int64_t nAgeSinceRecv = pnode->nLastRecv > 0 ? (nNow - pnode->nLastRecv) : -1;
+    int64_t nAgeSinceSend = pnode->nLastSend > 0 ? (nNow - pnode->nLastSend) : -1;
+    uint64_t nGetHeadersSent = 0;
+    uint64_t nGetHeadersSuppressed = 0;
+    uint64_t nGetHeadersInFlight = 0;
+
+    {
+        std::map<NodeId, GetHeadersPeerStats>::const_iterator it = mapGetHeadersPeerStats.find(pnode->GetId());
+        if (it != mapGetHeadersPeerStats.end()) {
+            nGetHeadersSent = it->second.totalSent;
+            nGetHeadersSuppressed = it->second.totalSuppressed;
+            nGetHeadersInFlight = it->second.inFlight;
+        }
+    }
+
+    oss << "id=" << pnode->GetId()
+        << " addr=" << pnode->addrName
+        << " subver=" << pnode->strSubVer
+        << " ver=" << pnode->nVersion
+        << " h=" << pnode->nChainHeight
+        << " best=" << pnode->nBestKnownHeight
+        << " adv=" << nPeerHeight
+        << " inflight=" << pnode->setBlocksInFlight.size()
+        << " askfor=" << pnode->mapAskFor.size()
+        << " getheaders_sent=" << nGetHeadersSent
+        << " getheaders_suppressed=" << nGetHeadersSuppressed
+        << " getheaders_inflight=" << nGetHeadersInFlight
+        << " recv_age=" << nAgeSinceRecv
+        << " send_age=" << nAgeSinceSend
+        << " last_block=" << pnode->nLastBlockRecv
+        << " last_height=" << pnode->nLastHeightUpdate
+        << " ping_us=" << pnode->nPingUsecTime
+        << " inbound=" << (pnode->fInbound ? 1 : 0)
+        << " whitelisted=" << (pnode->fWhitelisted ? 1 : 0)
+        << " connected=" << (pnode->fSuccessfullyConnected ? 1 : 0)
+        << " disconnect=" << (pnode->fDisconnect ? 1 : 0)
+        << " fstartsync=" << (pnode->fStartSync ? 1 : 0)
+        << " queued_getblocks=" << pnode->getBlocksIndex.size();
+    return oss.str();
+}
+
+} // namespace
+
+void RecordP2PMessageStat(const CNode* pnode, const std::string& command, unsigned int bytes, bool incoming)
+{
+    if (command.empty() || pnode == NULL)
+        return;
+
+    LOCK(cs_p2pMessageStats);
+    PeerMessageStats& peerStats = mapPeerMessageStats[pnode->GetId()];
+    if (incoming) {
+        AddMessageStat(peerStats.incoming, command, bytes);
+        AddMessageStat(mapGlobalP2PMsgIncoming, command, bytes);
+    } else {
+        AddMessageStat(peerStats.outgoing, command, bytes);
+        AddMessageStat(mapGlobalP2PMsgOutgoing, command, bytes);
+    }
+}
+
 struct ListenSocket {
     SOCKET socket;
     bool whitelisted;
@@ -81,6 +327,199 @@ static bool vfLimited[NET_MAX] = {};
 static CNode* pnodeLocalHost = NULL;
 static CNode* pnodeSync = NULL;
 static CCriticalSection cs_pnodeSync;  // Protects pnodeSync pointer
+NodeId nLastNodeId = 0;
+CCriticalSection cs_nLastNodeId;
+
+void LogSyncDiagnosticsMaybe()
+{
+    const int64_t nNow = GetTime();
+    const int64_t nInterval = 45;
+    if (nLastSyncDiagnosticsLog != 0 && nNow - nLastSyncDiagnosticsLog < nInterval)
+        return;
+
+    std::vector<CNode*> vNodesCopy;
+    CNode* pnodeSyncCopy = NULL;
+    {
+        LOCK(cs_vNodes);
+        vNodesCopy = vNodes;
+        BOOST_FOREACH(CNode* pnode, vNodesCopy)
+            pnode->AddRef();
+    }
+    {
+        LOCK(cs_pnodeSync);
+        pnodeSyncCopy = pnodeSync;
+    }
+
+    int64_t nMaxPeerHeight = -1;
+    int64_t nTotalBlocksInFlight = 0;
+    int64_t nTotalQueuedGetBlocks = 0;
+    uint64_t nTotalBytesRecv = 0;
+    uint64_t nTotalBytesSent = 0;
+    uint64_t nTotalSendQueueBytes = 0;
+    uint64_t nTotalRecvQueueBytes = 0;
+    uint64_t nTotalAskFor = 0;
+
+    BOOST_FOREACH(CNode* pnode, vNodesCopy) {
+        nTotalBlocksInFlight += pnode->setBlocksInFlight.size();
+        nTotalQueuedGetBlocks += pnode->getBlocksIndex.size();
+        nTotalBytesRecv += pnode->nRecvBytes;
+        nTotalBytesSent += pnode->nSendBytes;
+
+        int64_t nPeerHeight = GetPeerAdvertisedHeight(pnode);
+        if (nPeerHeight > nMaxPeerHeight)
+            nMaxPeerHeight = nPeerHeight;
+    }
+
+    std::vector<std::pair<int64_t, CNode*> > vCandidates;
+    BOOST_FOREACH(CNode* pnode, vNodesCopy) {
+        if (pnode->fDisconnect || !pnode->fSuccessfullyConnected || pnode->fClient || pnode->fOneShot)
+            continue;
+        if (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)
+            continue;
+        vCandidates.push_back(std::make_pair(SyncPeerScore(pnode, nNow, nMaxPeerHeight), pnode));
+    }
+    std::sort(vCandidates.begin(), vCandidates.end(), CompareSyncCandidates);
+
+    uint64_t nDeltaRecv = (nLastSyncDiagnosticsBytesRecv == 0) ? 0 : (nTotalBytesRecv - nLastSyncDiagnosticsBytesRecv);
+    uint64_t nDeltaSent = (nLastSyncDiagnosticsBytesSent == 0) ? 0 : (nTotalBytesSent - nLastSyncDiagnosticsBytesSent);
+    uint64_t nProcessVmRssKb = 0;
+    uint64_t nProcessVmSizeKb = 0;
+    uint64_t nProcessVmDataKb = 0;
+    uint64_t nProcessVmSwapKb = 0;
+    int nProcessThreads = 0;
+    GetProcessMemorySnapshot(nProcessVmRssKb, nProcessVmSizeKb, nProcessVmDataKb, nProcessVmSwapKb, nProcessThreads);
+
+    BOOST_FOREACH(CNode* pnode, vNodesCopy) {
+        size_t nSendQueueBytes = 0;
+        size_t nRecvQueueBytes = 0;
+        size_t nAskForSize = 0;
+        {
+            TRY_LOCK(pnode->cs_vSend, lockSend);
+            if (lockSend)
+                nSendQueueBytes = pnode->nSendSize;
+        }
+        {
+            TRY_LOCK(pnode->cs_vRecvMsg, lockRecv);
+            if (lockRecv)
+                nRecvQueueBytes = pnode->GetTotalRecvSize();
+        }
+        {
+            TRY_LOCK(pnode->cs_mapRequests, lockReq);
+            if (lockReq)
+                nAskForSize = pnode->mapAskFor.size();
+        }
+        nTotalSendQueueBytes += nSendQueueBytes;
+        nTotalRecvQueueBytes += nRecvQueueBytes;
+        nTotalAskFor += nAskForSize;
+    }
+
+    {
+        LOCK(cs_p2pMessageStats);
+        std::vector<std::string> vCommands;
+        vCommands.push_back("version");
+        vCommands.push_back("verack");
+        vCommands.push_back("addr");
+        vCommands.push_back("inv");
+        vCommands.push_back("getdata");
+        vCommands.push_back("block");
+        vCommands.push_back("tx");
+        vCommands.push_back("headers");
+        vCommands.push_back("getheaders");
+        vCommands.push_back("getblocks");
+        vCommands.push_back("ping");
+        vCommands.push_back("pong");
+        vCommands.push_back("reject");
+        vCommands.push_back("notfound");
+        printf("SYNCSTATE: local_height=%d best_header=%lld initialblockdownload=%d connections=%zu sync_peer=%s blocks_in_flight=%lld queued_getblocks=%lld datareceived=%llu delta_recv=%llu delta_sent=%llu\n",
+               nBestHeight,
+               (long long)nMaxPeerHeight,
+               IsInitialBlockDownload() ? 1 : 0,
+               vNodesCopy.size(),
+               pnodeSyncCopy ? DescribePeerForDiagnostics(pnodeSyncCopy).c_str() : "none",
+               (long long)nTotalBlocksInFlight,
+               (long long)nTotalQueuedGetBlocks,
+               (unsigned long long)nTotalBytesRecv,
+               (unsigned long long)nDeltaRecv,
+               (unsigned long long)nDeltaSent);
+        printf("GLOBAL_P2PMSG: incoming %s\n", FormatMessageStats(mapGlobalP2PMsgIncoming, vCommands).c_str());
+        printf("GLOBAL_P2PMSG: outgoing %s\n", FormatMessageStats(mapGlobalP2PMsgOutgoing, vCommands).c_str());
+        printf("MEMSTATE: process_rss_kb=%llu process_vmsize_kb=%llu process_vmdata_kb=%llu process_vmswap_kb=%llu threads=%d connections=%zu total_send_queue_bytes=%llu total_recv_queue_bytes=%llu total_askfor=%llu total_blocks_in_flight=%lld total_queued_getblocks=%lld\n",
+               (unsigned long long)nProcessVmRssKb,
+               (unsigned long long)nProcessVmSizeKb,
+               (unsigned long long)nProcessVmDataKb,
+               (unsigned long long)nProcessVmSwapKb,
+               nProcessThreads,
+               vNodesCopy.size(),
+               (unsigned long long)nTotalSendQueueBytes,
+               (unsigned long long)nTotalRecvQueueBytes,
+               (unsigned long long)nTotalAskFor,
+               (long long)nTotalBlocksInFlight,
+               (long long)nTotalQueuedGetBlocks);
+        if (!vCandidates.empty()) {
+            std::ostringstream oss;
+            oss << "SYNCPEER_CANDIDATES:";
+            size_t nLimit = std::min<size_t>(vCandidates.size(), 4);
+            for (size_t i = 0; i < nLimit; ++i) {
+                oss << ' ' << "[score=" << (long long)vCandidates[i].first << ' ' << DescribePeerForDiagnostics(vCandidates[i].second) << ']';
+            }
+            printf("%s\n", oss.str().c_str());
+        }
+        BOOST_FOREACH(CNode* pnode, vNodesCopy) {
+            PeerMessageStats& stats = mapPeerMessageStats[pnode->GetId()];
+            printf("PEERSTATE: %s in{%s} out{%s}\n",
+                   FormatPeerDiagnosticsSummary(pnode, nNow).c_str(),
+                   FormatMessageStats(stats.incoming, vCommands).c_str(),
+                   FormatMessageStats(stats.outgoing, vCommands).c_str());
+
+            size_t nSendQueueBytes = 0;
+            size_t nSendQueueMsgs = 0;
+            size_t nRecvQueueBytes = 0;
+            size_t nRecvQueueMsgs = 0;
+            size_t nAskForSize = 0;
+            {
+                TRY_LOCK(pnode->cs_vSend, lockSend);
+                if (lockSend)
+                {
+                    nSendQueueBytes = pnode->nSendSize;
+                    nSendQueueMsgs = pnode->vSendMsg.size();
+                }
+            }
+            {
+                TRY_LOCK(pnode->cs_vRecvMsg, lockRecv);
+                if (lockRecv)
+                {
+                    nRecvQueueMsgs = pnode->vRecvMsg.size();
+                    nRecvQueueBytes = pnode->GetTotalRecvSize();
+                }
+            }
+            {
+                TRY_LOCK(pnode->cs_mapRequests, lockReq);
+                if (lockReq)
+                    nAskForSize = pnode->mapAskFor.size();
+            }
+
+            printf("PEERMEM: id=%d addr=%s send_queue_bytes=%zu send_queue_msgs=%zu recv_queue_bytes=%zu recv_queue_msgs=%zu askfor=%zu blocks_in_flight=%zu connected=%d disconnect=%d\n",
+                   pnode->GetId(),
+                   pnode->addrName.c_str(),
+                   nSendQueueBytes,
+                   nSendQueueMsgs,
+                   nRecvQueueBytes,
+                   nRecvQueueMsgs,
+                   nAskForSize,
+                   pnode->setBlocksInFlight.size(),
+                   pnode->fSuccessfullyConnected ? 1 : 0,
+                   pnode->fDisconnect ? 1 : 0);
+        }
+    }
+
+    nLastSyncDiagnosticsLog = nNow;
+    nLastSyncDiagnosticsBytesRecv = nTotalBytesRecv;
+    nLastSyncDiagnosticsBytesSent = nTotalBytesSent;
+
+    BOOST_FOREACH(CNode* pnode, vNodesCopy)
+        pnode->Release();
+}
+
 CAddress addrSeenByPeer(CService("0.0.0.0", 0), nLocalServices);
 uint64_t nLocalHostNonce = 0;
 boost::array<int, THREAD_MAX> vnThreadsRunning;
@@ -141,6 +580,100 @@ void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
 
     //PushMessage("getblocks", CBlockLocator(pindexBegin), hashEnd);
 }
+
+void CNode::PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason)
+{
+    const int64_t nNow = GetTime();
+    const int64_t nCooldown = 5;
+    const std::string strReasonLabel = strReason.empty() ? std::string("unspecified") : strReason;
+    const std::string strLocatorKey = LocatorFingerprint(locator, hashStop, false);
+    const std::string strLocatorShort = LocatorFingerprint(locator, hashStop, true);
+    uint64_t nLocatorCount = 0;
+    uint64_t nPeerSent = 0;
+    uint64_t nPeerSuppressed = 0;
+    uint64_t nPeerInFlight = 0;
+    bool fSuppressed = false;
+    bool fShouldLog = false;
+
+    {
+        LOCK(cs_p2pMessageStats);
+        GetHeadersPeerStats& peerStats = mapGetHeadersPeerStats[GetId()];
+        GetHeadersLocatorState& locatorStats = peerStats.locators[strLocatorKey];
+        if (locatorStats.lastRequestTime != 0 && nNow - locatorStats.lastRequestTime < nCooldown) {
+            locatorStats.suppressed++;
+            peerStats.totalSuppressed++;
+            nLocatorCount = locatorStats.suppressed;
+            nPeerSuppressed = peerStats.totalSuppressed;
+            nPeerSent = peerStats.totalSent;
+            nPeerInFlight = peerStats.inFlight;
+            fSuppressed = true;
+        } else {
+            locatorStats.sent++;
+            locatorStats.lastRequestTime = nNow;
+            peerStats.totalSent++;
+            peerStats.inFlight++;
+            nLocatorCount = locatorStats.sent;
+            nPeerSent = peerStats.totalSent;
+            nPeerSuppressed = peerStats.totalSuppressed;
+            nPeerInFlight = peerStats.inFlight;
+            fShouldLog = (locatorStats.sent <= 5 || (locatorStats.sent % 25 == 0) || (locatorStats.lastLogTime != 0 && nNow - locatorStats.lastLogTime >= 60));
+            if (fShouldLog)
+                locatorStats.lastLogTime = nNow;
+        }
+    }
+
+    if (fDebugNet && (fSuppressed ? (nLocatorCount <= 5 || (nLocatorCount % 25) == 0) : fShouldLog)) {
+        if (fSuppressed) {
+            printf("GETHEADERS_SUPPRESSED: peer=%s local_height=%d best_header=%d peer_bestknownheight=%d peer_startingheight=%d locator{%s} hashStop=%s reason=%s repeat=%llu peer_sent=%llu peer_suppressed=%llu inflight=%llu cooldown=%llds\n",
+                   DescribePeerForDiagnostics(this).c_str(),
+                   nBestHeight,
+                   pindexBest ? pindexBest->nHeight : -1,
+                   nBestKnownHeight,
+                   nChainHeight,
+                   strLocatorShort.c_str(),
+                   hashStop.ToString().c_str(),
+                   strReasonLabel.c_str(),
+                   (unsigned long long)nLocatorCount,
+                   (unsigned long long)nPeerSent,
+                   (unsigned long long)nPeerSuppressed,
+                   (unsigned long long)nPeerInFlight,
+                   (long long)nCooldown);
+        } else {
+            printf("GETHEADERS_SEND: peer=%s local_height=%d best_header=%d peer_bestknownheight=%d peer_startingheight=%d locator{%s} hashStop=%s reason=%s repeat=%llu peer_sent=%llu peer_suppressed=%llu inflight=%llu\n",
+                   DescribePeerForDiagnostics(this).c_str(),
+                   nBestHeight,
+                   pindexBest ? pindexBest->nHeight : -1,
+                   nBestKnownHeight,
+                   nChainHeight,
+                   strLocatorShort.c_str(),
+                   hashStop.ToString().c_str(),
+                   strReasonLabel.c_str(),
+                   (unsigned long long)nLocatorCount,
+                   (unsigned long long)nPeerSent,
+                   (unsigned long long)nPeerSuppressed,
+                   (unsigned long long)nPeerInFlight);
+        }
+    }
+
+    if (fSuppressed)
+        return;
+
+    PushMessage("getheaders", locator, hashStop);
+}
+
+void RecordGetHeadersResponse(const CNode* pnode, size_t nHeaders, unsigned int nBytes)
+{
+    (void)nHeaders;
+    (void)nBytes;
+    if (pnode == NULL)
+        return;
+
+    LOCK(cs_p2pMessageStats);
+    GetHeadersPeerStats& peerStats = mapGetHeadersPeerStats[pnode->GetId()];
+    if (peerStats.inFlight > 0)
+        peerStats.inFlight--;
+}
+
 
 
 // find 'best' local address for a particular peer
@@ -2399,51 +2932,84 @@ bool OpenNetworkConnectionSimple(const CAddress& addrConnect, const char *strDes
 
 
 
-// for now, use a very simple selection metric: the node from which we received
-// most recently
-// patch: use pingtime, e.g. 200ms * -1 = -200, so 10ms *-1 = -10 would win.
-static int64_t NodeSyncScore(const CNode *pnode) {
-    if (pnode->nPingUsecTime > 0)
-        return pnode->nPingUsecTime * -1;
-    return pnode->nLastRecv;
-}
-
 void static StartSync(const vector<CNode*> &vNodes) {
     CNode *pnodeNewSync = NULL;
+    CNode *pnodeOldSync = NULL;
     int64_t nBestScore = 0;
+    int64_t nMaxPeerHeight = -1;
 
     // fImporting and fReindex are accessed out of cs_main here, but only
     // as an optimization - they are checked again in SendMessages.
     if (fImporting || fReindex)
         return;
 
-    // Iterate over all nodes
     BOOST_FOREACH(CNode* pnode, vNodes) {
-        // check preconditions for allowing a sync
-        if (!pnode->fClient && !pnode->fOneShot &&
-            !pnode->fDisconnect && pnode->fSuccessfullyConnected &&
-            (pnode->nChainHeight > (nBestHeight - 144)) &&
-            (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)) {
-            // if ok, compare node's score with the best so far
-            int64_t nScore = NodeSyncScore(pnode);
-            if (pnodeNewSync == NULL || nScore > nBestScore) {
-                pnodeNewSync = pnode;
-                nBestScore = nScore;
-            }
+        if (pnode->fClient || pnode->fOneShot || pnode->fDisconnect || !pnode->fSuccessfullyConnected)
+            continue;
+        if (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)
+            continue;
+        int64_t nPeerHeight = GetPeerAdvertisedHeight(pnode);
+        if (nPeerHeight > nMaxPeerHeight)
+            nMaxPeerHeight = nPeerHeight;
+    }
+
+    std::vector<std::pair<int64_t, CNode*> > vCandidates;
+    BOOST_FOREACH(CNode* pnode, vNodes) {
+        if (pnode->fClient || pnode->fOneShot || pnode->fDisconnect || !pnode->fSuccessfullyConnected)
+            continue;
+        if (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)
+            continue;
+
+        int64_t nScore = SyncPeerScore(pnode, GetTime(), nMaxPeerHeight);
+        vCandidates.push_back(std::make_pair(nScore, pnode));
+        if (pnodeNewSync == NULL || nScore > nBestScore) {
+            pnodeNewSync = pnode;
+            nBestScore = nScore;
         }
     }
-    // if a new sync candidate was found, start sync!
+
+    if (!vCandidates.empty()) {
+        std::sort(vCandidates.begin(), vCandidates.end(), CompareSyncCandidates);
+    }
+
     if (pnodeNewSync) {
-        pnodeNewSync->fStartSync = true;
         {
             LOCK(cs_pnodeSync);
+            pnodeOldSync = pnodeSync;
+            if (pnodeOldSync != pnodeNewSync && pnodeOldSync != NULL)
+                pnodeOldSync->fStartSync = false;
             pnodeSync = pnodeNewSync;
         }
+
+        pnodeNewSync->fStartSync = true;
+
+        if (pnodeOldSync != pnodeNewSync) {
+            std::ostringstream oss;
+            oss << "SYNCPEER_SELECT: old=" << (pnodeOldSync ? DescribePeerForDiagnostics(pnodeOldSync) : std::string("none"))
+                << " new=" << DescribePeerForDiagnostics(pnodeNewSync)
+                << " max_peer_height=" << (long long)nMaxPeerHeight
+                << " score=" << (long long)nBestScore;
+            if (!vCandidates.empty()) {
+                oss << " candidates=";
+                size_t nLimit = std::min<size_t>(vCandidates.size(), 4);
+                for (size_t i = 0; i < nLimit; ++i) {
+                    if (i != 0)
+                        oss << ',';
+                    oss << '[' << (long long)vCandidates[i].first << ':' << DescribePeerForDiagnostics(vCandidates[i].second) << ']';
+                }
+            }
+            printf("%s\n", oss.str().c_str());
+        }
+    } else if (fDebugNet) {
+        std::ostringstream oss;
+        oss << "SYNCPEER_SELECT: old=" << (pnodeSync ? DescribePeerForDiagnostics(pnodeSync) : std::string("none"))
+            << " new=none"
+            << " max_peer_height=" << (long long)nMaxPeerHeight
+            << " eligible_peers=0"
+            << " candidates=" << vCandidates.size();
+        printf("%s\n", oss.str().c_str());
     }
 }
-
-
-
 
 void ThreadMessageHandler(void* parg)
 {
@@ -2547,6 +3113,8 @@ void ThreadMessageHandler2(void* parg)
         vnThreadsRunning[THREAD_MESSAGEHANDLER]--;
         if (fSleep)
             MilliSleep(100);
+        LogSyncDiagnosticsMaybe();
+
         if (fRequestShutdown)
             StartShutdown();
         vnThreadsRunning[THREAD_MESSAGEHANDLER]++;

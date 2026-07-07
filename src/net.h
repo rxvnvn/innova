@@ -24,6 +24,7 @@
 class CRequestTracker;
 class CNode;
 class CBlockIndex;
+class CBlockLocator;
 extern int nBestHeight;
 
 
@@ -53,6 +54,9 @@ void StartTor(void* parg);
 void StartNode(void* parg);
 bool StopNode();
 void SocketSendData(CNode *pnode);
+void RecordP2PMessageStat(const CNode* pnode, const std::string& command, unsigned int bytes, bool incoming);
+void RecordGetHeadersResponse(const CNode* pnode, size_t nHeaders, unsigned int nBytes);
+void LogSyncDiagnosticsMaybe();
 
 // Signals for message handling
 struct CNodeSignals
@@ -352,6 +356,7 @@ public:
     uint64_t nServices;
     SOCKET hSocket;
     CDataStream ssSend;
+    std::string strMessageCommand;
     size_t nSendSize; // total size of all vSendMsg entries
     size_t nSendOffset; // offset inside the first vSendMsg already sent
     std::deque<CSerializeData> vSendMsg;
@@ -493,6 +498,10 @@ public:
         fSuccessfullyConnected = false;
         fDisconnect = false;
         nRefCount = 0;
+        {
+            LOCK(cs_nLastNodeId);
+            id = ++nLastNodeId;
+        }
         nSendSize = 0;
         nSendOffset = 0;
         hashContinue = 0;
@@ -689,6 +698,7 @@ public:
     {
         ENTER_CRITICAL_SECTION(cs_vSend);
         assert(ssSend.size() == 0);
+        strMessageCommand = pszCommand;
         ssSend << CMessageHeader(pszCommand, 0);
         if (fDebugNet)
             printf("net: to %s: %s ", this->addr.ToString().c_str(), pszCommand);
@@ -697,6 +707,7 @@ public:
     void AbortMessage() UNLOCK_FUNCTION(cs_vSend)
     {
         ssSend.clear();
+        strMessageCommand.clear();
 
         LEAVE_CRITICAL_SECTION(cs_vSend);
 
@@ -738,6 +749,9 @@ public:
         // If write queue empty, attempt "optimistic write"
         if (it == vSendMsg.begin())
             SocketSendData(this);
+
+        RecordP2PMessageStat(this, strMessageCommand, nSize, false);
+        strMessageCommand.clear();
 
         LEAVE_CRITICAL_SECTION(cs_vSend);
     }
@@ -935,6 +949,7 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     }
 
     void PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd);
+    void PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason = std::string());
 
     void UpdateBestKnownBlock(int nHeight, const uint256& hashBlock)
     {

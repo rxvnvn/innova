@@ -1872,6 +1872,20 @@ public:
         return vHave.empty();
     }
 
+    size_t Size() const
+    {
+        return vHave.size();
+    }
+
+    bool GetHashes(uint256& hashFirst, uint256& hashLast) const
+    {
+        if (vHave.empty())
+            return false;
+        hashFirst = vHave.front();
+        hashLast = vHave.back();
+        return true;
+    }
+
     void Set(const CBlockIndex* pindex)
     {
         vHave.clear();
