@@ -238,7 +238,6 @@ extern std::string strMiscWarning;
 extern bool fTestNet;
 extern bool fRegTest;
 extern bool fNativeTor;
-extern bool fHyperfileLocal;
 extern bool fCNLock;
 extern bool fNoListen;
 extern bool fLogTimestamps;

@@ -5,7 +5,6 @@
 USE_LEVELDB:=1
 USE_UPNP:=0
 USE_NATIVETOR:=-
-USE_IPFS:=-
 
 LINK:=$(CXX)
 
@@ -53,12 +52,7 @@ ifneq (${USE_NATIVETOR}, -)
     DEFS += $(addprefix -I,$(CURDIR)/tor) -DUSE_NATIVETOR=$(USE_NATIVETOR)
 endif
 
-ifndef USE_IPFS
-    override USE_IPFS = -
-endif
-ifneq (${USE_IPFS}, -)
-    DEFS += $(addprefix -I,$(CURDIR)/ipfs) -DUSE_IPFS=$(USE_IPFS)
-endif
+
 
 LIBS+= \
  -Wl,-B$(LMODE2) \
@@ -156,7 +150,6 @@ OBJS= \
     obj/rpcrawtransaction.o \
     obj/rpcsmessage.o \
     obj/rpcnyx.o \
-    obj/rpchyperfile.o \
     obj/rpcshielded.o \
     obj/nullsend.o \
     obj/shieldedcoinjoin.o \
@@ -202,9 +195,6 @@ OBJS= \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 
-# IPFS objects
-ifeq (${USE_IPFS}, 1)
-OBJS += obj/ipfs.o obj/ipfscurl.o
 endif
 
 # Scrypt assembly - architecture-conditional (FreeBSD uses amd64 not x86_64)
@@ -313,7 +303,6 @@ obj/anonymize.o: tor/anonymize.cpp
 	rm -f $(@:%.o=%.d)
 endif
 
-ifeq (${USE_IPFS}, 1)
 obj/%.o: %.cc
 	$(CXX) -c $(xCXXFLAGS) -MMD -MF $(@:%.o=%.d) -o $@ $<
 	@cp $(@:%.o=%.d) $(@:%.o=%.P); \

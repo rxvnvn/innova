@@ -9,7 +9,6 @@
 USE_LEVELDB:=1
 USE_UPNP:=1
 USE_NATIVETOR:=-
-USE_IPFS:=1
 
 LINK:=$(CXX)
 UNAME_M := $(shell uname -m)
@@ -52,12 +51,7 @@ ifneq (${USE_NATIVETOR}, -)
   DEFS += $(addprefix -I,$(CURDIR)/tor) -DUSE_NATIVETOR=$(USE_NATIVETOR)
 endif
 
-ifndef USE_IPFS
-  override USE_IPFS = -
-endif
-ifneq (${USE_IPFS}, -)
-  DEFS += $(addprefix -I,$(CURDIR)/ipfs) -DUSE_IPFS=$(USE_IPFS)
-endif
+
 
 ifndef USE_UPNP
     override USE_UPNP = -
@@ -308,7 +302,6 @@ OBJS= \
     obj/rpcrawtransaction.o \
     obj/rpcsmessage.o \
     obj/rpcnyx.o \
-    obj/rpchyperfile.o \
     obj/rpcshielded.o \
     obj/nullsend.o \
     obj/shieldedcoinjoin.o \
@@ -385,7 +378,6 @@ OBJS= \
     obj/rpcrawtransaction.o \
     obj/rpcsmessage.o \
     obj/rpcnyx.o \
-    obj/rpchyperfile.o \
     obj/rpcshielded.o \
     obj/nullsend.o \
     obj/shieldedcoinjoin.o \
@@ -433,9 +425,6 @@ OBJS= \
     obj/minizip/unzip.o
 endif
 
-# IPFS objects
-ifeq (${USE_IPFS}, 1)
-OBJS += obj/ipfs.o obj/ipfscurl.o
 endif
 
 .PHONY: all innova-build
@@ -525,7 +514,6 @@ obj/anonymize.o: tor/anonymize.cpp
 	rm -f $(@:%.o=%.d)
 endif
 
-ifeq (${USE_IPFS}, 1)
 obj/%.o: %.cc
 	$(CXX) -c $(xCXXFLAGS) -MMD -MF $(@:%.o=%.d) -o $@ $<
 	@cp $(@:%.o=%.d) $(@:%.o=%.P); \
@@ -545,8 +533,6 @@ clean:
 	-rm -f obj/build.h
 	-rm -f obj/tor/*.o
 	-rm -f obj/tor/*.P
-	-rm -f obj/ipfs/*.o
-	-rm -f obj/ipfs/*.P
 	-rm -rf obj/minizip
 	-cd leveldb && $(MAKE) clean || true
 

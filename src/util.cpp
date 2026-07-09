@@ -96,7 +96,6 @@ string strMiscWarning;
 bool fTestNet = false;
 bool fRegTest = false;
 bool fNativeTor = false;
-bool fHyperfileLocal = false;
 bool fCNLock = false;
 bool fNoListen = false;
 bool fLogTimestamps = false;
@@ -1315,7 +1314,6 @@ void WriteConfigFile(FILE* configFile)
     fputs ("\n", configFile);
     fputs ("# Nyx Messaging Protocol\n", configFile);
     fputs ("\n", configFile);
-    fputs ("hyperfilelocal=1\n", configFile);
     fputs ("\n", configFile);
     fclose(configFile);
     ReadConfigFile(mapArgs, mapMultiArgs);

@@ -65,7 +65,6 @@ build_linux_x86_64() {
             make -f makefile.unix clean 2>/dev/null || true
 
             # Build daemon
-            make USE_NATIVETOR=- USE_IPFS=- -f makefile.unix -j$JOBS
 
             echo 'Daemon build complete.'
         "
@@ -91,7 +90,6 @@ build_linux_x86_64() {
             sed -i 's/LIBS += -lcurl -lssl -lcrypto -lcrypt32 -lssh2 -lgcrypt -lidn2 -lgpg-error -lunistring -lwldap32 -ldb_cxx\$\$BDB_LIB_SUFFIX/LIBS += -lcurl -lssl -lcrypto -ldb_cxx\$\$BDB_LIB_SUFFIX/' innova-qt.pro 2>/dev/null || true
 
             # Build Qt wallet
-            qmake USE_UPNP=1 USE_QRCODE=1 USE_NATIVETOR=- USE_IPFS=- innova-qt.pro
             make -j$JOBS
 
             echo 'Qt wallet build complete.'
