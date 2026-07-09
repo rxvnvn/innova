@@ -11,7 +11,6 @@ class ClientModel;
 class WalletModel;
 class TransactionView;
 class MintingView;
-class ManageNamesPage;
 class CollateralnodeManager;
 class MultisigDialog;
 class OverviewPage;
@@ -88,7 +87,6 @@ private:
 	  StatisticsPage *statisticsPage;
     IDAGPage *idagPage;
 	  BlockBrowser *blockBrowser;
-    ManageNamesPage *manageNamesPage;
     QWidget *transactionsPage;
 	  QWidget *mintingPage;
 	  MultisigDialog *multisigPage;
@@ -124,7 +122,6 @@ private:
     QAction *stakingAction;
     QAction *privacyAction;
     QAction *nullsendAction;
-    QAction *manageNamesAction;
 	  QAction *collateralnodeManagerAction;
     QAction *quitAction;
     QAction *sendCoinsAction;
@@ -215,8 +212,6 @@ private slots:
     void gotoIDAGPage();
 	/** Switch to block explorer*/
     void gotoBlockBrowser();
-  /** Switch to manage names page */
-    void gotoManageNamesPage();
 	/** Switch to minting page */
     void gotoMintingPage();
     /** Switch to history (transactions) page */

@@ -595,8 +595,6 @@ HEADERS += src/qt/bitcoingui.h \
     src/sph_types.h \
     src/threadsafety.h \
     src/eccryptoverify.h \
-    src/qt/nametablemodel.h \
-    src/qt/managenamespage.h \
     src/qt/initexecutor.h \
     src/qt/plugins/mrichtexteditor/mrichtextedit.h \
     src/qt/qvalidatedtextedit.h
@@ -691,8 +689,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/qt/rpcconsole.cpp \
     src/qt/trafficgraphwidget.cpp \
     src/qt/idagpage.cpp \
-    src/qt/nametablemodel.cpp \
-    src/qt/managenamespage.cpp \
     src/qt/qcustomplot.cpp \
     src/qt/qvalidatedtextedit.cpp \
     src/qt/plugins/mrichtexteditor/mrichtextedit.cpp \
@@ -758,7 +754,6 @@ FORMS += \
     src/qt/forms/multisigaddressentry.ui \
     src/qt/forms/multisiginputentry.ui \
     src/qt/forms/multisigdialog.ui \
-    src/qt/forms/managenamespage.ui \
     src/qt/plugins/mrichtexteditor/mrichtextedit.ui
 
 contains(USE_QRCODE, 1) {

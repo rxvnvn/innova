@@ -4,7 +4,6 @@
 #include "addresstablemodel.h"
 #include "mintingtablemodel.h"
 #include "transactiontablemodel.h"
-#include "nametablemodel.h"
 
 #include "ui_interface.h"
 #include "wallet.h"
@@ -50,7 +49,6 @@ WalletModel::WalletModel(CWallet *wallet, OptionsModel *optionsModel, QObject *p
 
     addressTableModel = new AddressTableModel(wallet, this);
     mintingTableModel = new MintingTableModel(wallet, this);
-    nameTableModel = new NameTableModel(wallet, this);
     transactionTableModel = new TransactionTableModel(wallet, this);
 
     // This timer will be fired repeatedly to update the balance
@@ -159,9 +157,6 @@ void WalletModel::pollBalanceChanged()
 
         checkBalanceChanged();
 
-        // Only refresh name table every 10 blocks to reduce DB scan pressure
-        if (nameTableModel && (nBestHeight - prevCachedBlocks >= 10 || prevCachedBlocks == 0))
-            nameTableModel->update();
     }
 
     fForceBalanceCheck = false;
@@ -673,28 +668,6 @@ WalletModel::SendCoinsReturn WalletModel::sendCoins(const QList<SendCoinsRecipie
     return SendCoinsReturn(OK, 0, hex);
 }
 
-NameTxReturn WalletModel::nameNew(const QString &name, const vector<unsigned char> &vchValue, int nRentalDays, QString address)
-{
-    string strName = name.toStdString();
-    vector<unsigned char> vchName(strName.begin(), strName.end());
-    return name_new(vchName, vchValue, nRentalDays, address.toStdString());
-}
-
-NameTxReturn WalletModel::nameUpdate(const QString &name, const vector<unsigned char> &vchValue, int nRentalDays, QString newAddress)
-{
-    string strName = name.toStdString();
-    vector<unsigned char> vchName(strName.begin(), strName.end());
-    return name_update(vchName, vchValue, nRentalDays, newAddress.toStdString());
-}
-
-NameTxReturn WalletModel::nameDelete(const QString &name)
-{
-    string strName = name.toStdString();
-    vector<unsigned char> vchName(strName.begin(), strName.end());
-    return name_delete(vchName);
-}
-
-
 OptionsModel *WalletModel::getOptionsModel()
 {
     return optionsModel;
@@ -703,11 +676,6 @@ OptionsModel *WalletModel::getOptionsModel()
 AddressTableModel *WalletModel::getAddressTableModel()
 {
     return addressTableModel;
-}
-
-NameTableModel *WalletModel::getNameTableModel()
-{
-    return nameTableModel;
 }
 
 MintingTableModel *WalletModel::getMintingTableModel()

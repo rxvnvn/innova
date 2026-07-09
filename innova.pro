@@ -25,7 +25,6 @@ HEADERS += build/build.h \
            build/ui_collateralnodemanager.h \
            build/ui_editaddressdialog.h \
            build/ui_intro.h \
-           build/ui_managenamespage.h \
            build/ui_mrichtextedit.h \
            build/ui_multisigaddressentry.h \
            build/ui_multisigdialog.h \
@@ -131,7 +130,6 @@ HEADERS += build/build.h \
            build/build/ui_collateralnodemanager.h \
            build/build/ui_editaddressdialog.h \
            build/build/ui_intro.h \
-           build/build/ui_managenamespage.h \
            build/build/ui_mrichtextedit.h \
            build/build/ui_multisigaddressentry.h \
            build/build/ui_multisigdialog.h \
@@ -182,7 +180,6 @@ HEADERS += build/build.h \
            src/qt/intro.h \
            src/qt/macdockiconhandler.h \
            src/qt/macnotificationhandler.h \
-           src/qt/managenamespage.h \
            src/qt/mintingfilterproxy.h \
            src/qt/mintingtablemodel.h \
            src/qt/mintingview.h \
@@ -190,7 +187,6 @@ HEADERS += build/build.h \
            src/qt/multisigaddressentry.h \
            src/qt/multisigdialog.h \
            src/qt/multisiginputentry.h \
-           src/qt/nametablemodel.h \
            src/qt/notificator.h \
            src/qt/nullsendpage.h \
            src/qt/optionsdialog.h \
@@ -511,7 +507,6 @@ FORMS += src/qt/forms/aboutdialog.ui \
          src/qt/forms/collateralnodemanager.ui \
          src/qt/forms/editaddressdialog.ui \
          src/qt/forms/intro.ui \
-         src/qt/forms/managenamespage.ui \
          src/qt/forms/multisigaddressentry.ui \
          src/qt/forms/multisigdialog.ui \
          src/qt/forms/multisiginputentry.ui \
@@ -632,7 +627,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/guiutil.cpp \
            src/qt/initexecutor.cpp \
            src/qt/intro.cpp \
-           src/qt/managenamespage.cpp \
            src/qt/mintingfilterproxy.cpp \
            src/qt/mintingtablemodel.cpp \
            src/qt/mintingview.cpp \
@@ -640,7 +634,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/multisigaddressentry.cpp \
            src/qt/multisigdialog.cpp \
            src/qt/multisiginputentry.cpp \
-           src/qt/nametablemodel.cpp \
            src/qt/notificator.cpp \
            src/qt/nullsendpage.cpp \
            src/qt/optionsdialog.cpp \

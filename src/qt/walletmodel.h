@@ -7,13 +7,11 @@
 
 #include "allocators.h" /* for SecureString */
 #include "wallet.h"
-#include "namecoin.h"
 
 class OptionsModel;
 class AddressTableModel;
 class TransactionTableModel;
 class MintingTableModel;
-class NameTableModel;
 class CWallet;
 class WalletThread;
 class WalletWorker;
@@ -72,7 +70,6 @@ public:
     AddressTableModel *getAddressTableModel();
     TransactionTableModel *getTransactionTableModel();
 	MintingTableModel *getMintingTableModel();
-  NameTableModel *getNameTableModel();
 
     qint64 getBalance() const;
     qint64 getLockedBalance() const;
@@ -133,9 +130,6 @@ public:
 
     // Register new name or update it
     // Requires unlocked wallet; can throw exception instead of returning error
-    NameTxReturn nameNew(const QString &name, const std::vector<unsigned char> &vchValue, int days, QString address = "");
-    NameTxReturn nameUpdate(const QString &name, const std::vector<unsigned char> &vchValue, int days, QString newAddress = "");
-    NameTxReturn nameDelete(const QString &name);
 
     // Wallet encryption
     bool setWalletEncrypted(bool encrypted, const SecureString &passphrase);
@@ -187,7 +181,6 @@ private:
     AddressTableModel *addressTableModel;
     TransactionTableModel *transactionTableModel;
     MintingTableModel *mintingTableModel;
-    NameTableModel *nameTableModel;
 
     //Watch Only
     bool fHaveWatchOnly;

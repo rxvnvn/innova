@@ -36,7 +36,6 @@
 #include "stakingpage.h"
 #include "privacypage.h"
 #include "nullsendpage.h"
-#include "managenamespage.h"
 
 #ifdef Q_OS_MAC
 #include "macdockiconhandler.h"
@@ -159,7 +158,6 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     stakingPage = new StakingPage(this);
     privacyPage = new PrivacyPage(this);
     nullsendPage = new NullSendPage(this);
-    manageNamesPage = new ManageNamesPage(this);
 
     transactionsPage = new QWidget(this);
     QVBoxLayout *vbox = new QVBoxLayout();
@@ -187,7 +185,6 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     centralWidget->addWidget(overviewPage);
     centralWidget->addWidget(transactionsPage);
 	centralWidget->addWidget(mintingPage);
-  centralWidget->addWidget(manageNamesPage);
     centralWidget->addWidget(addressBookPage);
     centralWidget->addWidget(receiveCoinsPage);
     centralWidget->addWidget(sendCoinsPage);
@@ -322,12 +319,6 @@ void BitcoinGUI::createActions()
     nullsendAction->setStatusTip(tr("NullSend Mixing"));
     tabGroup->addAction(nullsendAction);
 
-    manageNamesAction = new QAction(QIcon(":/icons/names"), tr("&NVS"), this);
-    manageNamesAction->setToolTip(tr("Manage Innova NVS"));
-    manageNamesAction->setCheckable(true);
-    manageNamesAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_0));
-    tabGroup->addAction(manageNamesAction);
-
     sendCoinsAction = new QAction(QIcon(":/icons/send"), tr("&Send coins"), this);
     sendCoinsAction->setToolTip(tr("Send coins to a Innova address"));
     sendCoinsAction->setCheckable(true);
@@ -393,8 +384,6 @@ void BitcoinGUI::createActions()
     connect(sendCoinsAction, SIGNAL(triggered()), this, SLOT(gotoSendCoinsPage()));
     connect(receiveCoinsAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(receiveCoinsAction, SIGNAL(triggered()), this, SLOT(gotoReceiveCoinsPage()));
-    connect(manageNamesAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
-    connect(manageNamesAction, SIGNAL(triggered()), this, SLOT(gotoManageNamesPage()));
 	connect(mintingAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(mintingAction, SIGNAL(triggered()), this, SLOT(gotoMintingPage()));
     connect(collateralnodeManagerAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
@@ -553,7 +542,6 @@ void BitcoinGUI::createToolBars()
   mainToolbar->addAction(statisticsAction);
   mainToolbar->addAction(idagAction);
   mainToolbar->addAction(blockAction);
-  mainToolbar->addAction(manageNamesAction);
 
     secondaryToolbar = addToolBar(tr("Actions toolbar"));
     secondaryToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
@@ -643,7 +631,6 @@ void BitcoinGUI::setWalletModel(WalletModel *walletModel)
 		blockBrowser->setModel(clientModel);
         collateralnodeManagerPage->setWalletModel(walletModel);
 		multisigPage->setModel(walletModel);
-    manageNamesPage->setModel(walletModel);
         stakingPage->setModel(walletModel);
         privacyPage->setModel(walletModel);
         qobject_cast<NullSendPage*>(nullsendPage)->setModel(walletModel);
@@ -1067,15 +1054,6 @@ void BitcoinGUI::gotoOverviewPage()
     disconnect(exportAction, SIGNAL(triggered()), 0, 0);
 }
 
-void BitcoinGUI::gotoManageNamesPage()
-{
-    manageNamesAction->setChecked(true);
-    centralWidget->setCurrentWidget(manageNamesPage);
-
-    exportAction->setEnabled(true);
-    disconnect(exportAction, SIGNAL(triggered()), 0, 0);
-    connect(exportAction, SIGNAL(triggered()), manageNamesPage, SLOT(exportClicked()));
-}
 
 void BitcoinGUI::gotoStakingPage()
 {
