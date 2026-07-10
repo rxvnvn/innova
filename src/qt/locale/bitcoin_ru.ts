@@ -367,6 +367,14 @@ This product includes software developed by the OpenSSL Project for use in the O
         <translation>Отп&amp;равка монет</translation>
     </message>
     <message>
+        <source>Staking &amp;Inputs</source>
+        <translation>Входы &amp;стейкинга</translation>
+    </message>
+    <message>
+        <source>S&amp;taking</source>
+        <translation>Сте&amp;йкинг</translation>
+    </message>
+    <message>
         <location line="+35"/>
         <source>E&amp;xit</source>
         <translation>В&amp;ыход</translation>
@@ -1365,6 +1373,18 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <location line="+49"/>
         <source>Spendable:</source>
         <translation>Доступно:</translation>
+    </message>
+    <message>
+        <source>Available for Stake:</source>
+        <translation>Доступно для стейкинга:</translation>
+    </message>
+    <message>
+        <source>Shielded (Private):</source>
+        <translation>Приватный баланс:</translation>
+    </message>
+    <message>
+        <source>Out of Sync!</source>
+        <translation>Не синхронизировано!</translation>
     </message>
     <message>
         <location line="+16"/>

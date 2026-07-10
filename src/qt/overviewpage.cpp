@@ -105,20 +105,35 @@ OverviewPage::OverviewPage(QWidget *parent) :
     setWindowOpacity(1.0);
     setStyleSheet(
         "QWidget#OverviewPage { background: #f5f6f7; }"
-        "QFrame#frame, QFrame#frame_2 { background: #ffffff; border: 1px solid #d8dde3; border-radius: 3px; }"
-        "QLabel#label_5, QLabel#label_4 { color: #202124; font-size: 13px; font-weight: 600; }"
+        "QFrame#frame, QFrame#frame_2 { background: #ffffff; border: 1px solid #cfd6df; border-radius: 4px; }"
+        "QLabel#label_5, QLabel#label_4 { color: #202124; font-size: 14px; font-weight: 600; }"
+        "QLabel#label, QLabel#labelStakeText, QLabel#labelShieldedText, QLabel#unconfirmedlabeltxt, QLabel#labelImmatureText, QLabel#labelLockedText { color: #5f6368; }"
+        "QLabel#labelBalance, QLabel#labelLocked, QLabel#labelStake, QLabel#labelShielded, QLabel#labelUnconfirmed, QLabel#labelImmature { color: #202124; font-weight: 600; }"
         "QLabel#labelTotalText { color: #5f6368; font-weight: 600; }"
-        "QLabel#labelTotal { color: #202124; font-size: 22px; font-weight: 500; }"
-        "QLabel#labelWalletStatus, QLabel#labelTransactionsStatus { color: #b00020; font-weight: 500; }"
-        "QListView#listTransactions { background: #ffffff; border: none; padding-top: 4px; }"
+        "QLabel#labelTotal { color: #202124; font-size: 23px; font-weight: 600; }"
+        "QLabel#labelWalletStatus, QLabel#labelTransactionsStatus { color: #b00020; font-weight: 600; }"
+        "QListView#listTransactions { background: #ffffff; border: none; padding-top: 2px; }"
+        "QListView#listTransactions::item { padding: 4px 2px; }"
     );
-    ui->gridLayout_3->setContentsMargins(12, 12, 12, 12);
-    ui->gridLayout_3->setHorizontalSpacing(12);
-    ui->gridLayout_2->setContentsMargins(12, 12, 12, 12);
-    ui->gridLayout_2->setVerticalSpacing(8);
-    ui->gridLayout_4->setContentsMargins(12, 12, 12, 12);
-    ui->gridLayout_4->setVerticalSpacing(8);
-    ui->gridLayout->setVerticalSpacing(5);
+    ui->gridLayout_3->setContentsMargins(14, 14, 14, 14);
+    ui->gridLayout_3->setHorizontalSpacing(14);
+    ui->gridLayout_2->setContentsMargins(14, 14, 14, 14);
+    ui->gridLayout_2->setVerticalSpacing(9);
+    ui->gridLayout_4->setContentsMargins(14, 14, 14, 14);
+    ui->gridLayout_4->setVerticalSpacing(9);
+    ui->gridLayout->setHorizontalSpacing(18);
+    ui->gridLayout->setVerticalSpacing(6);
+    ui->gridLayout->setColumnMinimumWidth(0, 160);
+    ui->frame->setMinimumWidth(380);
+    ui->frame_2->setMinimumWidth(430);
+
+    ui->labelBalance->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelLocked->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelStake->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelShielded->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelUnconfirmed->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelImmature->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelTotal->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
     // Recent transactions
     ui->listTransactions->setItemDelegate(txdelegate);

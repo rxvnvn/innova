@@ -69,6 +69,8 @@
 #include <QScreen>
 #include <QTextDocument>
 #include <QGraphicsScene>
+#include <QPainter>
+#include <QPolygonF>
 
 #include <iostream>
 #include <fstream>
@@ -81,7 +83,138 @@ double GetPoSKernelPS();
 
 #define VERTICAL_TOOBAR_STYLESHEET "QToolBar { background: #f7f8fa; border-right: 1px solid #d8dde3; spacing: 4px; padding: 6px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 8px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolButton:checked { background: #e2edf8; border-color: #aebed0; }"
 #define HORIZONTAL_TOOLBAR_STYLESHEET "QToolBar { background: #f7f8fa; border-bottom: 1px solid #d8dde3; spacing: 4px; padding: 5px 8px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 10px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolButton:checked { background: #e2edf8; border-color: #aebed0; }"
-#define SECONDARY_TOOLBAR_STYLESHEET "QToolBar { background: #f6f7f9; border-top: 1px solid #d8dde3; spacing: 6px; padding: 4px 10px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 4px 8px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolBar::separator { background: #d8dde3; width: 1px; height: 18px; margin: 5px 8px; }"
+#define SECONDARY_TOOLBAR_STYLESHEET "QToolBar { background: #f6f7f9; border-top: 1px solid #d8dde3; spacing: 8px; padding: 6px 12px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 10px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolBar::separator { background: #cfd6df; width: 1px; height: 20px; margin: 5px 10px; }"
+
+namespace {
+enum ToolbarGlyph
+{
+    GlyphOverview,
+    GlyphSend,
+    GlyphReceive,
+    GlyphHistory,
+    GlyphAddressBook,
+    GlyphStake,
+    GlyphNullSend,
+    GlyphCollateralNodes,
+    GlyphBlock,
+    GlyphExport,
+    GlyphLock,
+    GlyphKey
+};
+
+static QPixmap MakeToolbarPixmap(ToolbarGlyph glyph, const QColor& primary, const QColor& accent)
+{
+    QPixmap pixmap(32, 32);
+    pixmap.fill(Qt::transparent);
+
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+
+    QPen pen(primary, 2.6, Qt::SolidLine, Qt::RoundCap, Qt::RoundJoin);
+    painter.setPen(pen);
+    painter.setBrush(Qt::NoBrush);
+
+    switch (glyph)
+    {
+    case GlyphOverview:
+        painter.drawRoundedRect(QRectF(7, 8, 18, 16), 2, 2);
+        painter.drawLine(QPointF(7, 14), QPointF(25, 14));
+        painter.drawLine(QPointF(16, 14), QPointF(16, 24));
+        break;
+    case GlyphSend:
+    {
+        QPolygonF plane;
+        plane << QPointF(6, 16) << QPointF(26, 7) << QPointF(20, 25) << QPointF(15, 18);
+        painter.drawPolygon(plane);
+        painter.drawLine(QPointF(15, 18), QPointF(26, 7));
+        break;
+    }
+    case GlyphReceive:
+        painter.drawLine(QPointF(16, 6), QPointF(16, 20));
+        painter.drawLine(QPointF(10, 14), QPointF(16, 20));
+        painter.drawLine(QPointF(22, 14), QPointF(16, 20));
+        painter.drawLine(QPointF(8, 25), QPointF(24, 25));
+        painter.drawLine(QPointF(8, 21), QPointF(8, 25));
+        painter.drawLine(QPointF(24, 21), QPointF(24, 25));
+        break;
+    case GlyphHistory:
+        painter.drawEllipse(QRectF(7, 7, 18, 18));
+        painter.drawLine(QPointF(16, 16), QPointF(16, 10));
+        painter.drawLine(QPointF(16, 16), QPointF(21, 18));
+        painter.drawLine(QPointF(8, 16), QPointF(5, 16));
+        break;
+    case GlyphAddressBook:
+        painter.drawRoundedRect(QRectF(8, 6, 17, 20), 2, 2);
+        painter.drawLine(QPointF(12, 6), QPointF(12, 26));
+        painter.drawEllipse(QRectF(16, 11, 5, 5));
+        painter.drawArc(QRectF(14, 16, 9, 7), 0, 180 * 16);
+        break;
+    case GlyphStake:
+        painter.drawEllipse(QRectF(9, 7, 15, 19));
+        painter.drawLine(QPointF(16, 25), QPointF(20, 13));
+        painter.drawLine(QPointF(16, 20), QPointF(11, 17));
+        break;
+    case GlyphNullSend:
+    {
+        QPolygonF shield;
+        shield << QPointF(16, 6) << QPointF(25, 10) << QPointF(23, 22) << QPointF(16, 27) << QPointF(9, 22) << QPointF(7, 10);
+        painter.drawPolygon(shield);
+        painter.drawLine(QPointF(11, 16), QPointF(21, 16));
+        painter.drawLine(QPointF(18, 12), QPointF(22, 16));
+        painter.drawLine(QPointF(18, 20), QPointF(22, 16));
+        break;
+    }
+    case GlyphCollateralNodes:
+        painter.drawLine(QPointF(11, 12), QPointF(21, 12));
+        painter.drawLine(QPointF(11, 12), QPointF(16, 23));
+        painter.drawLine(QPointF(21, 12), QPointF(16, 23));
+        painter.setBrush(accent);
+        painter.drawEllipse(QRectF(7, 8, 8, 8));
+        painter.drawEllipse(QRectF(17, 8, 8, 8));
+        painter.drawEllipse(QRectF(12, 20, 8, 8));
+        painter.setBrush(Qt::NoBrush);
+        break;
+    case GlyphBlock:
+        painter.drawRoundedRect(QRectF(8, 8, 16, 16), 2, 2);
+        painter.drawLine(QPointF(12, 8), QPointF(12, 24));
+        painter.drawLine(QPointF(20, 8), QPointF(20, 24));
+        painter.drawLine(QPointF(8, 16), QPointF(24, 16));
+        break;
+    case GlyphExport:
+        painter.drawLine(QPointF(16, 21), QPointF(16, 7));
+        painter.drawLine(QPointF(10, 13), QPointF(16, 7));
+        painter.drawLine(QPointF(22, 13), QPointF(16, 7));
+        painter.drawLine(QPointF(8, 24), QPointF(24, 24));
+        painter.drawLine(QPointF(8, 19), QPointF(8, 24));
+        painter.drawLine(QPointF(24, 19), QPointF(24, 24));
+        break;
+    case GlyphLock:
+        painter.drawArc(QRectF(10, 7, 12, 14), 0, 180 * 16);
+        painter.drawRoundedRect(QRectF(9, 15, 14, 11), 2, 2);
+        painter.drawLine(QPointF(16, 19), QPointF(16, 22));
+        break;
+    case GlyphKey:
+        painter.drawEllipse(QRectF(6, 12, 9, 9));
+        painter.drawLine(QPointF(15, 16.5), QPointF(26, 16.5));
+        painter.drawLine(QPointF(22, 16.5), QPointF(22, 20));
+        painter.drawLine(QPointF(25, 16.5), QPointF(25, 19));
+        break;
+    }
+
+    return pixmap;
+}
+
+static QIcon MakeToolbarIcon(ToolbarGlyph glyph)
+{
+    QIcon icon;
+    icon.addPixmap(MakeToolbarPixmap(glyph, QColor("#26384f"), QColor("#1f5f99")), QIcon::Normal, QIcon::Off);
+    icon.addPixmap(MakeToolbarPixmap(glyph, QColor("#0f4c81"), QColor("#1565c0")), QIcon::Normal, QIcon::On);
+    icon.addPixmap(MakeToolbarPixmap(glyph, QColor("#0f4c81"), QColor("#1565c0")), QIcon::Active, QIcon::Off);
+    icon.addPixmap(MakeToolbarPixmap(glyph, QColor("#0f4c81"), QColor("#1565c0")), QIcon::Selected, QIcon::On);
+    icon.addPixmap(MakeToolbarPixmap(glyph, QColor("#9aa3ad"), QColor("#9aa3ad")), QIcon::Disabled, QIcon::Off);
+    return icon;
+}
+}
 
 ActiveLabel::ActiveLabel(const QString & text, QWidget * parent):
     QLabel(parent){}
@@ -282,68 +415,68 @@ void BitcoinGUI::createActions()
 {
     QActionGroup *tabGroup = new QActionGroup(this);
 
-    overviewAction = new QAction(QIcon(":/icons/overview"), tr("&Overview"), this);
+    overviewAction = new QAction(MakeToolbarIcon(GlyphOverview), tr("&Overview"), this);
     overviewAction->setToolTip(tr("Show general overview of wallet"));
     overviewAction->setCheckable(true);
     overviewAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_1));
 	overviewAction->setStatusTip(tr("Wallet Overview"));
     tabGroup->addAction(overviewAction);
 
-    idagAction = new QAction(QIcon(":/icons/block"), tr("&IDAG"), this);
+    idagAction = new QAction(MakeToolbarIcon(GlyphBlock), tr("&IDAG"), this);
     idagAction->setToolTip(tr("View IDAG consensus status"));
     idagAction->setCheckable(true);
     idagAction->setStatusTip(tr("IDAG Consensus Status"));
     tabGroup->addAction(idagAction);
 
 
-    nullsendAction = new QAction(QIcon(":/icons/mark"), tr("&NullSend"), this);
+    nullsendAction = new QAction(MakeToolbarIcon(GlyphNullSend), tr("&NullSend"), this);
     nullsendAction->setToolTip(tr("NullSend multi-party mixing for transaction unlinkability"));
     nullsendAction->setCheckable(true);
     nullsendAction->setStatusTip(tr("NullSend Mixing"));
     tabGroup->addAction(nullsendAction);
 
-    sendCoinsAction = new QAction(QIcon(":/icons/send"), tr("&Send coins"), this);
+    sendCoinsAction = new QAction(MakeToolbarIcon(GlyphSend), tr("&Send coins"), this);
     sendCoinsAction->setToolTip(tr("Send coins to a Innova address"));
     sendCoinsAction->setCheckable(true);
 	sendCoinsAction->setStatusTip(tr("Send Innova"));
     sendCoinsAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_2));
     tabGroup->addAction(sendCoinsAction);
 
-    receiveCoinsAction = new QAction(QIcon(":/icons/receiving_addresses"), tr("&Receive coins"), this);
+    receiveCoinsAction = new QAction(MakeToolbarIcon(GlyphReceive), tr("&Receive coins"), this);
     receiveCoinsAction->setToolTip(tr("Show the list of addresses for receiving payments"));
     receiveCoinsAction->setCheckable(true);
 	receiveCoinsAction->setStatusTip(tr("Receive Innova"));
     receiveCoinsAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_3));
     tabGroup->addAction(receiveCoinsAction);
 
-    historyAction = new QAction(QIcon(":/icons/history"), tr("&Transactions"), this);
+    historyAction = new QAction(MakeToolbarIcon(GlyphHistory), tr("&Transactions"), this);
     historyAction->setToolTip(tr("Browse transaction history"));
     historyAction->setCheckable(true);
 	historyAction->setStatusTip(tr("Transactions"));
     historyAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_4));
     tabGroup->addAction(historyAction);
 
-    addressBookAction = new QAction(QIcon(":/icons/address-book"), tr("&Address Book"), this);
+    addressBookAction = new QAction(MakeToolbarIcon(GlyphAddressBook), tr("&Address Book"), this);
     addressBookAction->setToolTip(tr("Edit the list of stored addresses and labels"));
     addressBookAction->setCheckable(true);
 	addressBookAction->setStatusTip(tr("Address Book"));
     addressBookAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_5));
     tabGroup->addAction(addressBookAction);
 
-	mintingAction = new QAction(QIcon(":/icons/stake"), tr("Staking &Inputs"), this);
+	mintingAction = new QAction(MakeToolbarIcon(GlyphStake), tr("Staking &Inputs"), this);
     mintingAction->setToolTip(tr("View staking inputs and estimated earnings"));
     mintingAction->setCheckable(true);
 	mintingAction->setStatusTip(tr("Staking Inputs & Estimations"));
     mintingAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_9));
     tabGroup->addAction(mintingAction);
 
-    collateralnodeManagerAction = new QAction(QIcon(":/icons/mn"), tr("&Collateral Nodes"), this);
+    collateralnodeManagerAction = new QAction(MakeToolbarIcon(GlyphCollateralNodes), tr("&Collateral Nodes"), this);
     collateralnodeManagerAction->setToolTip(tr("Show Innova Collateral Nodes status and configure your nodes."));
     collateralnodeManagerAction->setCheckable(true);
 	collateralnodeManagerAction->setStatusTip(tr("Collateral Nodes"));
     tabGroup->addAction(collateralnodeManagerAction);
 
-    stakingAction = new QAction(QIcon(":/icons/stake"), tr("S&taking"), this);
+    stakingAction = new QAction(MakeToolbarIcon(GlyphStake), tr("S&taking"), this);
     stakingAction->setToolTip(tr("Manage staking mode, cold staking, and privacy staking"));
     stakingAction->setCheckable(true);
     stakingAction->setStatusTip(tr("Staking Control Panel"));
@@ -396,13 +529,13 @@ void BitcoinGUI::createActions()
     optionsAction->setToolTip(tr("Modify configuration options for Innova"));
     optionsAction->setMenuRole(QAction::PreferencesRole);
     toggleHideAction = new QAction(QIcon(":/icons/bitcoin"), tr("&Show / Hide"), this);
-    encryptWalletAction = new QAction(QIcon(":/icons/lock_closed"), tr("&Encrypt Wallet..."), this);
+    encryptWalletAction = new QAction(MakeToolbarIcon(GlyphLock), tr("&Encrypt Wallet..."), this);
     encryptWalletAction->setToolTip(tr("Encrypt or decrypt wallet"));
 	encryptWalletAction->setStatusTip(tr("Encrypt wallet"));
     encryptWalletAction->setCheckable(true);
     backupWalletAction = new QAction(QIcon(":/icons/filesave"), tr("&Backup Wallet..."), this);
     backupWalletAction->setToolTip(tr("Backup wallet to another location"));
-    changePassphraseAction = new QAction(QIcon(":/icons/key"), tr("&Change Passphrase..."), this);
+    changePassphraseAction = new QAction(MakeToolbarIcon(GlyphKey), tr("&Change Passphrase..."), this);
     changePassphraseAction->setToolTip(tr("Change the passphrase used for wallet encryption"));
 	changePassphraseAction->setStatusTip(tr("Change your passphrase"));
     unlockWalletAction = new QAction(QIcon(":/icons/lock_open"), tr("&Unlock Wallet..."), this);
@@ -414,7 +547,7 @@ void BitcoinGUI::createActions()
     signMessageAction = new QAction(QIcon(":/icons/edit"), tr("Sign &message..."), this);
     verifyMessageAction = new QAction(QIcon(":/icons/transaction_0"), tr("&Verify message..."), this);
 
-    exportAction = new QAction(QIcon(":/icons/export"), tr("&Export..."), this);
+    exportAction = new QAction(MakeToolbarIcon(GlyphExport), tr("&Export..."), this);
     exportAction->setToolTip(tr("Export the data in the current tab to a file"));
 	exportAction->setStatusTip(tr("Export the data to a file"));
     openRPCConsoleAction = new QAction(QIcon(":/icons/debugwindow"), tr("&Debug window"), this);
@@ -494,8 +627,6 @@ void BitcoinGUI::createMenuBar()
   	tools->addAction(openConfEditorAction);
     tools->addAction(openMNConfEditorAction);
     QMenu *help = appMenuBar->addMenu(tr("&Help"));
-    help->addAction(openRPCConsoleAction);
-    help->addSeparator();
     help->addAction(aboutAction);
     help->addAction(aboutQtAction);
 }
@@ -531,7 +662,7 @@ void BitcoinGUI::createToolBars()
     secondaryToolbar->setObjectName("secondaryToolbar");
     secondaryToolbar->setMovable(false);
     secondaryToolbar->setFloatable(false);
-    secondaryToolbar->setIconSize(QSize(18, 18));
+    secondaryToolbar->setIconSize(QSize(22, 22));
     secondaryToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
     secondaryToolbar->setStyleSheet(SECONDARY_TOOLBAR_STYLESHEET);
 
@@ -540,9 +671,6 @@ void BitcoinGUI::createToolBars()
     secondaryToolbar->addWidget(secondaryLeftSpacer);
 
     secondaryToolbar->addAction(exportAction);
-    secondaryToolbar->addSeparator();
-    secondaryToolbar->addAction(openRPCConsoleAction);
-    secondaryToolbar->addAction(openGraphAction);
     secondaryToolbar->addSeparator();
     secondaryToolbar->addAction(encryptWalletAction);
     secondaryToolbar->addAction(changePassphraseAction);
