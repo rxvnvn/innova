@@ -19,9 +19,7 @@
 #include "addresstablemodel.h"
 #include "transactionview.h"
 #include "overviewpage.h"
-#include "statisticspage.h"
 #include "idagpage.h"
-#include "blockbrowser.h"
 #include "collateralnodemanager.h"
 #include "collateral.h"
 #include "mintingview.h"
@@ -151,9 +149,7 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     fNativeTor = GetBoolArg("-nativetor");
     // Create tabs
     overviewPage = new OverviewPage();
-	statisticsPage = new StatisticsPage(this);
     idagPage = new IDAGPage(this);
-	blockBrowser = new BlockBrowser(this);
 	multisigPage = new MultisigDialog(this);
     stakingPage = new StakingPage(this);
     privacyPage = new PrivacyPage(this);
@@ -188,9 +184,7 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     centralWidget->addWidget(addressBookPage);
     centralWidget->addWidget(receiveCoinsPage);
     centralWidget->addWidget(sendCoinsPage);
-    centralWidget->addWidget(statisticsPage);
     centralWidget->addWidget(idagPage);
-	centralWidget->addWidget(blockBrowser);
     centralWidget->addWidget(collateralnodeManagerPage);
     centralWidget->addWidget(stakingPage);
     centralWidget->addWidget(privacyPage);
@@ -293,24 +287,11 @@ void BitcoinGUI::createActions()
 	overviewAction->setStatusTip(tr("Wallet Overview"));
     tabGroup->addAction(overviewAction);
 
-	statisticsAction = new QAction(QIcon(":/icons/statistics"), tr("&Statistics"), this);
-    statisticsAction->setToolTip(tr("View statistics"));
-    statisticsAction->setCheckable(true);
-	statisticsAction->setStatusTip(tr("Innova Statistics"));
-    tabGroup->addAction(statisticsAction);
-
     idagAction = new QAction(QIcon(":/icons/block"), tr("&IDAG"), this);
     idagAction->setToolTip(tr("View IDAG consensus status"));
     idagAction->setCheckable(true);
     idagAction->setStatusTip(tr("IDAG Consensus Status"));
     tabGroup->addAction(idagAction);
-
-	blockAction = new QAction(QIcon(":/icons/block"), tr("&Block Explorer"), this);
-    blockAction->setToolTip(tr("Explore the Innova Blockchain"));
-    blockAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_6));
-	blockAction->setStatusTip(tr("Block Explorer"));
-    blockAction->setCheckable(true);
-    tabGroup->addAction(blockAction);
 
 
     nullsendAction = new QAction(QIcon(":/icons/mark"), tr("&NullSend"), this);
@@ -377,8 +358,6 @@ void BitcoinGUI::createActions()
 
     connect(overviewAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(overviewAction, SIGNAL(triggered()), this, SLOT(gotoOverviewPage()));
-	connect(blockAction, SIGNAL(triggered()), this, SLOT(gotoBlockBrowser()));
-	connect(statisticsAction, SIGNAL(triggered()), this, SLOT(gotoStatisticsPage()));
     connect(idagAction, SIGNAL(triggered()), this, SLOT(gotoIDAGPage()));
     connect(sendCoinsAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(sendCoinsAction, SIGNAL(triggered()), this, SLOT(gotoSendCoinsPage()));
@@ -539,9 +518,7 @@ void BitcoinGUI::createToolBars()
   mainToolbar->addAction(mintingAction);         // Staking Inputs
   mainToolbar->addAction(nullsendAction);        // NullSend mixing
   mainToolbar->addAction(collateralnodeManagerAction);
-  mainToolbar->addAction(statisticsAction);
   mainToolbar->addAction(idagAction);
-  mainToolbar->addAction(blockAction);
 
     secondaryToolbar = addToolBar(tr("Actions toolbar"));
     secondaryToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
@@ -627,8 +604,6 @@ void BitcoinGUI::setWalletModel(WalletModel *walletModel)
         receiveCoinsPage->setWalletModel(walletModel);
         sendCoinsPage->setModel(walletModel);
         signVerifyMessageDialog->setModel(walletModel);
-		statisticsPage->setModel(clientModel);
-		blockBrowser->setModel(clientModel);
         collateralnodeManagerPage->setWalletModel(walletModel);
 		multisigPage->setModel(walletModel);
         stakingPage->setModel(walletModel);
@@ -1105,24 +1080,6 @@ void BitcoinGUI::gotoMintingPage()
     exportAction->setEnabled(true);
     disconnect(exportAction, SIGNAL(triggered()), 0, 0);
     connect(exportAction, SIGNAL(triggered()), mintingView, SLOT(exportClicked()));
-}
-
-void BitcoinGUI::gotoBlockBrowser()
-{
-    blockAction->setChecked(true);
-    centralWidget->setCurrentWidget(blockBrowser);
-
-    exportAction->setEnabled(false);
-    disconnect(exportAction, SIGNAL(triggered()), 0, 0);
-}
-
-void BitcoinGUI::gotoStatisticsPage()
-{
-    statisticsAction->setChecked(true);
-    centralWidget->setCurrentWidget(statisticsPage);
-
-    exportAction->setEnabled(false);
-    disconnect(exportAction, SIGNAL(triggered()), 0, 0);
 }
 
 void BitcoinGUI::gotoIDAGPage()

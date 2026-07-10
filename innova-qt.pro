@@ -576,9 +576,7 @@ HEADERS += src/qt/bitcoingui.h \
     src/ui_interface.h \
     src/qt/rpcconsole.h \
     src/qt/trafficgraphwidget.h \
-    src/qt/blockbrowser.h \
     src/qt/idagpage.h \
-    src/qt/statisticspage.h \
     src/qt/qcustomplot.h \
     src/qt/collateralnodemanager.h \
     src/qt/addeditadrenalinenode.h \
@@ -614,8 +612,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/qt/aboutdialog.cpp \
     src/qt/editaddressdialog.cpp \
     src/qt/bitcoinaddressvalidator.cpp \
-    src/qt/statisticspage.cpp \
-    src/qt/blockbrowser.cpp \
     src/kernelrecord.cpp \
     src/qt/mintingfilterproxy.cpp \
     src/qt/mintingtablemodel.cpp \
@@ -746,8 +742,6 @@ FORMS += \
     src/qt/forms/askpassphrasedialog.ui \
     src/qt/forms/rpcconsole.ui \
     src/qt/forms/optionsdialog.ui \
-    src/qt/forms/statisticspage.ui \
-    src/qt/forms/blockbrowser.ui \
     src/qt/forms/collateralnodemanager.ui \
     src/qt/forms/addeditadrenalinenode.ui \
     src/qt/forms/adrenalinenodeconfigdialog.ui \

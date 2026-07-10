@@ -20,7 +20,6 @@ HEADERS += build/build.h \
            build/ui_addressbookpage.h \
            build/ui_adrenalinenodeconfigdialog.h \
            build/ui_askpassphrasedialog.h \
-           build/ui_blockbrowser.h \
            build/ui_coincontroldialog.h \
            build/ui_collateralnodemanager.h \
            build/ui_editaddressdialog.h \
@@ -36,7 +35,6 @@ HEADERS += build/build.h \
            build/ui_sendcoinsdialog.h \
            build/ui_sendcoinsentry.h \
            build/ui_signverifymessagedialog.h \
-           build/ui_statisticspage.h \
            build/ui_transactiondescdialog.h \
            src/activecollateralnode.h \
            src/addrman.h \
@@ -125,7 +123,6 @@ HEADERS += build/build.h \
            build/build/ui_addressbookpage.h \
            build/build/ui_adrenalinenodeconfigdialog.h \
            build/build/ui_askpassphrasedialog.h \
-           build/build/ui_blockbrowser.h \
            build/build/ui_coincontroldialog.h \
            build/build/ui_collateralnodemanager.h \
            build/build/ui_editaddressdialog.h \
@@ -140,7 +137,6 @@ HEADERS += build/build.h \
            build/build/ui_sendcoinsdialog.h \
            build/build/ui_sendcoinsentry.h \
            build/build/ui_signverifymessagedialog.h \
-           build/build/ui_statisticspage.h \
            build/build/ui_transactiondescdialog.h \
            src/json/json_spirit.h \
            src/json/json_spirit_error_position.h \
@@ -167,7 +163,6 @@ HEADERS += build/build.h \
            src/qt/bitcoinamountfield.h \
            src/qt/bitcoingui.h \
            src/qt/bitcoinunits.h \
-           src/qt/blockbrowser.h \
            src/qt/clientmodel.h \
            src/qt/coincontroldialog.h \
            src/qt/coincontroltreewidget.h \
@@ -205,7 +200,6 @@ HEADERS += build/build.h \
            src/qt/sendcoinsentry.h \
            src/qt/signverifymessagedialog.h \
            src/qt/stakingpage.h \
-           src/qt/statisticspage.h \
            src/qt/trafficgraphwidget.h \
            src/qt/transactiondesc.h \
            src/qt/transactiondescdialog.h \
@@ -502,7 +496,6 @@ FORMS += src/qt/forms/aboutdialog.ui \
          src/qt/forms/addressbookpage.ui \
          src/qt/forms/adrenalinenodeconfigdialog.ui \
          src/qt/forms/askpassphrasedialog.ui \
-         src/qt/forms/blockbrowser.ui \
          src/qt/forms/coincontroldialog.ui \
          src/qt/forms/collateralnodemanager.ui \
          src/qt/forms/editaddressdialog.ui \
@@ -517,7 +510,6 @@ FORMS += src/qt/forms/aboutdialog.ui \
          src/qt/forms/sendcoinsdialog.ui \
          src/qt/forms/sendcoinsentry.ui \
          src/qt/forms/signverifymessagedialog.ui \
-         src/qt/forms/statisticspage.ui \
          src/qt/forms/transactiondescdialog.ui \
          src/qt/plugins/mrichtexteditor/mrichtextedit.ui
 SOURCES += qrc_bitcoin.cpp \
@@ -617,7 +609,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/bitcoingui.cpp \
            src/qt/bitcoinstrings.cpp \
            src/qt/bitcoinunits.cpp \
-           src/qt/blockbrowser.cpp \
            src/qt/clientmodel.cpp \
            src/qt/coincontroldialog.cpp \
            src/qt/coincontroltreewidget.cpp \
@@ -652,7 +643,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/qt/sendcoinsentry.cpp \
            src/qt/signverifymessagedialog.cpp \
            src/qt/stakingpage.cpp \
-           src/qt/statisticspage.cpp \
            src/qt/trafficgraphwidget.cpp \
            src/qt/transactiondesc.cpp \
            src/qt/transactiondescdialog.cpp \
