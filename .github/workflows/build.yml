@@ -20,7 +20,7 @@ jobs:
   # Version detection
   # ─────────────────────────────────────────────────────────
   get-version:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -142,7 +142,7 @@ jobs:
   # Ubuntu 26.04 x86_64 (daemon + Qt) via Docker container
   # ─────────────────────────────────────────────────────────
   build-ubuntu-2604:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: get-version
     container:
       image: ubuntu:26.04
@@ -225,13 +225,13 @@ jobs:
           path: innova-${{ needs.get-version.outputs.version }}-ubuntu2604-x86_64.tar.gz
 
   # ─────────────────────────────────────────────────────────
-  # Debian 12 x86_64 (daemon + Qt) via Docker container
+  # Debian 13 x86_64 (daemon + Qt) via Docker container
   # ─────────────────────────────────────────────────────────
-  build-debian-12:
-    runs-on: ubuntu-22.04
+  build-debian-13:
+    runs-on: ubuntu-24.04
     needs: get-version
     container:
-      image: debian:12
+      image: debian:13
     steps:
       - uses: actions/checkout@v5
         with:
@@ -264,25 +264,25 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p innova-${{ needs.get-version.outputs.version }}-debian12-x86_64
-          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-debian12-x86_64/
-          strip innova-${{ needs.get-version.outputs.version }}-debian12-x86_64/*
-          cd innova-${{ needs.get-version.outputs.version }}-debian12-x86_64
+          mkdir -p innova-${{ needs.get-version.outputs.version }}-debian13-x86_64
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-debian13-x86_64/
+          strip innova-${{ needs.get-version.outputs.version }}-debian13-x86_64/*
+          cd innova-${{ needs.get-version.outputs.version }}-debian13-x86_64
           sha256sum * > SHA256SUMS.txt
           cd ..
-          tar -czf innova-${{ needs.get-version.outputs.version }}-debian12-x86_64.tar.gz \
-            innova-${{ needs.get-version.outputs.version }}-debian12-x86_64/
+          tar -czf innova-${{ needs.get-version.outputs.version }}-debian13-x86_64.tar.gz \
+            innova-${{ needs.get-version.outputs.version }}-debian13-x86_64/
 
       - uses: actions/upload-artifact@v5
         with:
-          name: innova-debian12-x86_64
-          path: innova-${{ needs.get-version.outputs.version }}-debian12-x86_64.tar.gz
+          name: innova-debian13-x86_64
+          path: innova-${{ needs.get-version.outputs.version }}-debian13-x86_64.tar.gz
 
   # ─────────────────────────────────────────────────────────
   # Linux aarch64 (daemon only)
   # ─────────────────────────────────────────────────────────
   build-linux-arm64:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: get-version
     steps:
       - uses: actions/checkout@v5
@@ -500,65 +500,13 @@ jobs:
           path: innova-${{ needs.get-version.outputs.version }}-win64.zip
 
   # ─────────────────────────────────────────────────────────
-  # Debian 11 (Bullseye) x86_64 (daemon + Qt) via Docker
+  # Fedora 43 x86_64 (daemon + Qt) via Docker
   # ─────────────────────────────────────────────────────────
-  build-debian-11:
-    runs-on: ubuntu-22.04
+  build-fedora-43:
+    runs-on: ubuntu-24.04
     needs: get-version
     container:
-      image: debian:11
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 0
-
-      - name: Install dependencies
-        run: |
-          apt-get update
-          apt-get install -y build-essential libtool autotools-dev automake pkg-config \
-            libssl-dev libevent-dev bsdmainutils libboost-all-dev libdb++-dev \
-            libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev \
-            libqt5gui5 libqt5core5a libqt5dbus5 qttools5-dev qttools5-dev-tools \
-            libprotobuf-dev protobuf-compiler git
-
-      - name: Build daemon
-        run: |
-          cd src
-          make USE_NATIVETOR=- -f makefile.unix -j$(nproc)
-
-      - name: Build Qt wallet
-        run: |
-          sed -i 's/LIBS += -lcurl -lssl -lcrypto -lcrypt32 -lssh2 -lgcrypt -lidn2 -lgpg-error -lunistring -lwldap32 -ldb_cxx$$BDB_LIB_SUFFIX/LIBS += -lcurl -lssl -lcrypto -ldb_cxx$$BDB_LIB_SUFFIX/' innova-qt.pro
-          make clean || true
-          rm -rf build Makefile .qmake.stash
-          strip --remove-section=.note.ABI-tag /usr/lib/x86_64-linux-gnu/libQt5Core.so.5 || true
-          qmake USE_UPNP=1 USE_QRCODE=1 USE_NATIVETOR=- innova-qt.pro
-          make -j$(nproc)
-
-      - name: Package
-        run: |
-          mkdir -p innova-${{ needs.get-version.outputs.version }}-debian11-x86_64
-          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-debian11-x86_64/
-          strip innova-${{ needs.get-version.outputs.version }}-debian11-x86_64/*
-          cd innova-${{ needs.get-version.outputs.version }}-debian11-x86_64
-          sha256sum * > SHA256SUMS.txt
-          cd ..
-          tar -czf innova-${{ needs.get-version.outputs.version }}-debian11-x86_64.tar.gz \
-            innova-${{ needs.get-version.outputs.version }}-debian11-x86_64/
-
-      - uses: actions/upload-artifact@v5
-        with:
-          name: innova-debian11-x86_64
-          path: innova-${{ needs.get-version.outputs.version }}-debian11-x86_64.tar.gz
-
-  # ─────────────────────────────────────────────────────────
-  # Fedora 41 x86_64 (daemon + Qt) via Docker
-  # ─────────────────────────────────────────────────────────
-  build-fedora-41:
-    runs-on: ubuntu-22.04
-    needs: get-version
-    container:
-      image: fedora:41
+      image: fedora:43
     steps:
       - uses: actions/checkout@v5
         with:
@@ -587,25 +535,25 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64
-          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64/
-          strip innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64/*
-          cd innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64
+          mkdir -p innova-${{ needs.get-version.outputs.version }}-fedora43-x86_64
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-fedora43-x86_64/
+          strip innova-${{ needs.get-version.outputs.version }}-fedora43-x86_64/*
+          cd innova-${{ needs.get-version.outputs.version }}-fedora43-x86_64
           sha256sum * > SHA256SUMS.txt
           cd ..
-          tar -czf innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64.tar.gz \
-            innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64/
+          tar -czf innova-${{ needs.get-version.outputs.version }}-fedora43-x86_64.tar.gz \
+            innova-${{ needs.get-version.outputs.version }}-fedora43-x86_64/
 
       - uses: actions/upload-artifact@v5
         with:
-          name: innova-fedora41-x86_64
-          path: innova-${{ needs.get-version.outputs.version }}-fedora41-x86_64.tar.gz
+          name: innova-fedora43-x86_64
+          path: innova-${{ needs.get-version.outputs.version }}-fedora43-x86_64.tar.gz
 
   # ─────────────────────────────────────────────────────────
   # Arch Linux x86_64 (daemon + Qt) via Docker
   # ─────────────────────────────────────────────────────────
   build-archlinux:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: get-version
     container:
       image: archlinux:latest
@@ -652,13 +600,13 @@ jobs:
           path: innova-${{ needs.get-version.outputs.version }}-archlinux-x86_64.tar.gz
 
   # ─────────────────────────────────────────────────────────
-  # Fedora 40 x86_64 (daemon + Qt) via Docker
+  # Fedora 44 x86_64 (daemon + Qt) via Docker
   # ─────────────────────────────────────────────────────────
-  build-fedora-40:
-    runs-on: ubuntu-22.04
+  build-fedora-44:
+    runs-on: ubuntu-24.04
     needs: get-version
     container:
-      image: fedora:40
+      image: fedora:44
     steps:
       - uses: actions/checkout@v5
         with:
@@ -687,25 +635,25 @@ jobs:
 
       - name: Package
         run: |
-          mkdir -p innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64
-          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64/
-          strip innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64/*
-          cd innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64
+          mkdir -p innova-${{ needs.get-version.outputs.version }}-fedora44-x86_64
+          cp src/innovad innova-qt innova-${{ needs.get-version.outputs.version }}-fedora44-x86_64/
+          strip innova-${{ needs.get-version.outputs.version }}-fedora44-x86_64/*
+          cd innova-${{ needs.get-version.outputs.version }}-fedora44-x86_64
           sha256sum * > SHA256SUMS.txt
           cd ..
-          tar -czf innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64.tar.gz \
-            innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64/
+          tar -czf innova-${{ needs.get-version.outputs.version }}-fedora44-x86_64.tar.gz \
+            innova-${{ needs.get-version.outputs.version }}-fedora44-x86_64/
 
       - uses: actions/upload-artifact@v5
         with:
-          name: innova-fedora40-x86_64
-          path: innova-${{ needs.get-version.outputs.version }}-fedora40-x86_64.tar.gz
+          name: innova-fedora44-x86_64
+          path: innova-${{ needs.get-version.outputs.version }}-fedora44-x86_64.tar.gz
 
   # ─────────────────────────────────────────────────────────
   # Linux aarch64 Qt (daemon + Qt) via QEMU emulation
   # ─────────────────────────────────────────────────────────
   build-linux-arm64-qt:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: get-version
     steps:
       - uses: actions/checkout@v5
@@ -719,24 +667,9 @@ jobs:
 
       - name: Build daemon + Qt in ARM64 container
         run: |
-          docker run --rm --platform linux/arm64 \
-            -v ${{ github.workspace }}:/build -w /build \
-            debian:12 bash -c "
-              apt-get update && \
-              apt-get install -y build-essential libtool automake pkg-config \
-                libssl-dev libevent-dev libboost-all-dev libdb++-dev \
-                libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev \
-                libqt5gui5 libqt5core5a libqt5dbus5 qttools5-dev qttools5-dev-tools \
-                libprotobuf-dev protobuf-compiler git && \
-              cd src && \
-              cd .. && \
-              sed -i 's/LIBS += -lcurl -lssl -lcrypto -lcrypt32 -lssh2 -lgcrypt -lidn2 -lgpg-error -lunistring -lwldap32 -ldb_cxx\$\$BDB_LIB_SUFFIX/LIBS += -lcurl -lssl -lcrypto -ldb_cxx\$\$BDB_LIB_SUFFIX/' innova-qt.pro && \
-              make clean || true && \
-              rm -rf build Makefile .qmake.stash && \
-              strip --remove-section=.note.ABI-tag /usr/lib/aarch64-linux-gnu/libQt5Core.so.5 || true && \
-              make -j\$(nproc)
+          docker run --rm --platform linux/arm64             -v ${{ github.workspace }}:/build -w /build             ubuntu:24.04 bash -c "
+              apt-get update &&               apt-get install -y build-essential libtool automake pkg-config                 libssl-dev libevent-dev libboost-all-dev libdb++-dev                 libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev                 libqt5gui5 libqt5core5a libqt5dbus5 qtbase5-dev qtbase5-dev-tools qt5-qmake qttools5-dev qttools5-dev-tools                 libprotobuf-dev protobuf-compiler git &&               cd src &&               make USE_NATIVETOR=- -f makefile.arm -j\$(nproc) &&               cd .. &&               sed -i 's/LIBS += -lcurl -lssl -lcrypto -lcrypt32 -lssh2 -lgcrypt -lidn2 -lgpg-error -lunistring -lwldap32 -ldb_cxx\$\$BDB_LIB_SUFFIX/LIBS += -lcurl -lssl -lcrypto -ldb_cxx\$\$BDB_LIB_SUFFIX/' innova-qt.pro &&               rm -rf build Makefile .qmake.stash &&               strip --remove-section=.note.ABI-tag /usr/lib/aarch64-linux-gnu/libQt5Core.so.5 || true &&               qmake USE_UPNP=1 USE_QRCODE=1 USE_NATIVETOR=- innova-qt.pro &&               make -j\$(nproc)
             "
-
 
       - name: Package
         run: |
@@ -746,8 +679,7 @@ jobs:
           cd innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt
           sha256sum * > SHA256SUMS.txt 2>/dev/null || true
           cd ..
-          tar -czf innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt.tar.gz \
-            innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt/
+          tar -czf innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt.tar.gz             innova-${{ needs.get-version.outputs.version }}-linux-aarch64-qt/
 
       - uses: actions/upload-artifact@v5
         with:
@@ -758,7 +690,7 @@ jobs:
   # Raspberry Pi (armhf/armv7) — daemon only via QEMU emulation
   # ─────────────────────────────────────────────────────────
   build-linux-armhf:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs: get-version
     steps:
       - uses: actions/checkout@v5
@@ -772,14 +704,8 @@ jobs:
 
       - name: Build daemon in ARM container
         run: |
-          docker run --rm --platform linux/arm/v7 \
-            -v ${{ github.workspace }}:/build -w /build \
-            debian:11 bash -c "
-              apt-get update && \
-              apt-get install -y build-essential libtool automake pkg-config \
-                libssl-dev libevent-dev libboost-all-dev libdb++-dev \
-                libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev git && \
-              cd src && \
+          docker run --rm --platform linux/arm/v7             -v ${{ github.workspace }}:/build -w /build             ubuntu:24.04 bash -c "
+              apt-get update &&               apt-get install -y build-essential libtool automake pkg-config                 libssl-dev libevent-dev libboost-all-dev libdb++-dev                 libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev git &&               cd src &&               make USE_NATIVETOR=- -f makefile.arm -j\$(nproc)
             "
 
       - name: Package
@@ -789,8 +715,7 @@ jobs:
           cd innova-${{ needs.get-version.outputs.version }}-linux-armhf
           sha256sum * > SHA256SUMS.txt 2>/dev/null || true
           cd ..
-          tar -czf innova-${{ needs.get-version.outputs.version }}-linux-armhf.tar.gz \
-            innova-${{ needs.get-version.outputs.version }}-linux-armhf/
+          tar -czf innova-${{ needs.get-version.outputs.version }}-linux-armhf.tar.gz             innova-${{ needs.get-version.outputs.version }}-linux-armhf/
 
       - uses: actions/upload-artifact@v5
         with:
@@ -802,16 +727,15 @@ jobs:
   # ─────────────────────────────────────────────────────────
   release:
     if: startsWith(github.ref, 'refs/tags/v') || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     needs:
       - get-version
       - build-ubuntu-2204
       - build-ubuntu-2404
       - build-ubuntu-2604
-      - build-debian-11
-      - build-debian-12
-      - build-fedora-40
-      - build-fedora-41
+      - build-debian-13
+      - build-fedora-44
+      - build-fedora-43
       - build-archlinux
       - build-linux-arm64
       - build-linux-arm64-qt

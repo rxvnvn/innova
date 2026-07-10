@@ -6,17 +6,19 @@ Uploaders: Micah Anderson <micah@debian.org>
 Build-Depends: debhelper,
  devscripts,
  bash-completion,
- libboost-system-dev (>> 1.35) | libboost-system1.35-dev,
+ libboost-system-dev,
  libdb4.8++-dev,
  libssl-dev,
  pkg-config,
- libminiupnpc8-dev,
- libboost-filesystem-dev (>> 1.35) | libboost-filesystem1.35-dev,
- libboost-program-options-dev (>> 1.35) | libboost-program-options1.35-dev,
- libboost-thread-dev (>> 1.35) | libboost-thread1.35-dev,
- libboost-test-dev (>> 1.35) | libboost-test1.35-dev,
- qt4-qmake,
- libqt4-dev,
+ libminiupnpc-dev,
+ libboost-filesystem-dev,
+ libboost-program-options-dev,
+ libboost-thread-dev,
+ libboost-test-dev,
+ qt5-qmake,
+ qtbase5-dev,
+ qttools5-dev,
+ qttools5-dev-tools,
  libqrencode-dev
 Standards-Version: 1.0.7.0
 Homepage: http://www.innova-foundation.com
@@ -38,7 +40,7 @@ Description: peer-to-peer network based digital currency - daemon
  Full transaction history is stored locally at each client.  This
  requires 1+ GB of space, slowly growing.
  .
- This package provides novacoind, a combined daemon and CLI tool to
+ This package provides innovad, a combined daemon and CLI tool to
  interact with the daemon.
 
 Package: innova-qt
@@ -56,4 +58,4 @@ Description: peer-to-peer network based digital currency - Qt GUI
  Full transaction history is stored locally at each client.  This
  requires 1+ GB of space, slowly growing.
  .
- This package provides Innova-Qt, a GUI for Innova based on Qt.
+ This package provides innova-qt, a GUI for Innova based on Qt.
