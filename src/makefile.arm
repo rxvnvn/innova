@@ -425,8 +425,6 @@ OBJS= \
     obj/minizip/unzip.o
 endif
 
-endif
-
 .PHONY: all innova-build
 
 INNOVA_SPINNER ?= 1
@@ -520,7 +518,6 @@ obj/%.o: %.cc
 	sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
 	-e '/^$$/ d' -e 's/$$/ :/' < $(@:%.o=%.d) >> $(@:%.o=%.P); \
 	rm -f $(@:%.o=%.d)
-endif
 
 innovad: $(OBJS:obj/%=obj/%)
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)

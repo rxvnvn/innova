@@ -194,8 +194,6 @@ OBJS= \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 
-endif
-
 # Scrypt assembly - only for x86_64
 ifeq ($(UNAME_M),x86_64)
 OBJS += obj/scrypt-x86_64.o

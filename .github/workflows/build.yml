@@ -241,17 +241,43 @@ jobs:
         run: |
           apt-get update
           apt-get install -y build-essential libtool autotools-dev automake pkg-config \
-            libssl-dev libevent-dev bsdmainutils libboost-all-dev libdb++-dev \
+            libssl-dev libevent-dev bsdmainutils libboost-all-dev libdb5.3++-dev \
             libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev \
             libsecp256k1-dev \
             libqt5gui5 libqt5core5a libqt5dbus5 qttools5-dev qttools5-dev-tools \
             libprotobuf-dev protobuf-compiler \
             git
 
+      - name: Configure Berkeley DB paths
+        run: |
+          set -eu
+          dpkg -L libdb5.3++-dev | grep db_cxx.h
+          bdb_header="$(find /usr/include -name db_cxx.h -print -quit)"
+          bdb_lib="$(find /usr/lib -name libdb_cxx.so -print -quit)"
+          if [ -z "$bdb_lib" ]; then
+            bdb_lib="$(find /usr/lib -name 'libdb_cxx*.so' -print -quit)"
+          fi
+          if [ -z "$bdb_lib" ]; then
+            bdb_lib="$(find /usr/lib -name 'libdb_cxx*.a' -print -quit)"
+          fi
+          if [ -z "$bdb_header" ] || [ -z "$bdb_lib" ]; then
+            echo "Unable to locate Berkeley DB C++ headers/libs"
+            exit 1
+          fi
+
+          bdb_suffix="$(basename "$bdb_lib")"
+          bdb_suffix="${bdb_suffix#libdb_cxx}"
+          bdb_suffix="${bdb_suffix%.so}"
+          bdb_suffix="${bdb_suffix%.a}"
+
+          echo "BDB_INCLUDE_PATH=$(dirname "$bdb_header")" >> "$GITHUB_ENV"
+          echo "BDB_LIB_PATH=$(dirname "$bdb_lib")" >> "$GITHUB_ENV"
+          echo "BDB_LIB_SUFFIX=$bdb_suffix" >> "$GITHUB_ENV"
+
       - name: Build daemon
         run: |
           cd src
-          make USE_NATIVETOR=- -f makefile.unix -j$(nproc)
+          make USE_NATIVETOR=- BDB_INCLUDE_PATH="$BDB_INCLUDE_PATH" BDB_LIB_PATH="$BDB_LIB_PATH" BDB_LIB_SUFFIX="$BDB_LIB_SUFFIX" -f makefile.unix -j$(nproc)
 
       - name: Build Qt wallet
         run: |
@@ -259,7 +285,7 @@ jobs:
           make clean || true
           rm -rf build Makefile .qmake.stash
           strip --remove-section=.note.ABI-tag /usr/lib/x86_64-linux-gnu/libQt5Core.so.5 || true
-          qmake USE_UPNP=1 USE_QRCODE=1 USE_NATIVETOR=- innova-qt.pro
+          qmake USE_UPNP=1 USE_QRCODE=1 USE_NATIVETOR=- BDB_INCLUDE_PATH="$BDB_INCLUDE_PATH" BDB_LIB_PATH="$BDB_LIB_PATH" BDB_LIB_SUFFIX="$BDB_LIB_SUFFIX" innova-qt.pro
           make -j$(nproc)
 
       - name: Package
@@ -667,9 +693,29 @@ jobs:
 
       - name: Build daemon + Qt in ARM64 container
         run: |
-          docker run --rm --platform linux/arm64             -v ${{ github.workspace }}:/build -w /build             ubuntu:24.04 bash -c "
-              apt-get update &&               apt-get install -y build-essential libtool automake pkg-config                 libssl-dev libevent-dev libboost-all-dev libdb++-dev                 libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev                 libqt5gui5 libqt5core5a libqt5dbus5 qtbase5-dev qtbase5-dev-tools qt5-qmake qttools5-dev qttools5-dev-tools                 libprotobuf-dev protobuf-compiler git &&               cd src &&               make USE_NATIVETOR=- -f makefile.arm -j\$(nproc) &&               cd .. &&               sed -i 's/LIBS += -lcurl -lssl -lcrypto -lcrypt32 -lssh2 -lgcrypt -lidn2 -lgpg-error -lunistring -lwldap32 -ldb_cxx\$\$BDB_LIB_SUFFIX/LIBS += -lcurl -lssl -lcrypto -ldb_cxx\$\$BDB_LIB_SUFFIX/' innova-qt.pro &&               rm -rf build Makefile .qmake.stash &&               strip --remove-section=.note.ABI-tag /usr/lib/aarch64-linux-gnu/libQt5Core.so.5 || true &&               qmake USE_UPNP=1 USE_QRCODE=1 USE_NATIVETOR=- innova-qt.pro &&               make -j\$(nproc)
-            "
+          docker run --rm --platform linux/arm64 \
+            -v ${{ github.workspace }}:/build -w /build \
+            ubuntu:24.04 bash -c '
+              set -e
+              apt-get update
+              apt-get install -y \
+                build-essential libtool automake pkg-config \
+                libssl-dev libevent-dev libboost-all-dev libdb++-dev \
+                libminiupnpc-dev libqrencode-dev libcurl4-openssl-dev libbrotli-dev libzstd-dev libgmp-dev \
+                libqt5gui5 libqt5core5a libqt5dbus5 qtbase5-dev qtbase5-dev-tools qt5-qmake qttools5-dev qttools5-dev-tools \
+                libprotobuf-dev protobuf-compiler git
+
+              cd /build/src
+              make USE_NATIVETOR=- -f makefile.arm -j$(nproc)
+
+              cd /build
+              sed -i "s/LIBS += -lcurl -lssl -lcrypto -lcrypt32 -lssh2 -lgcrypt -lidn2 -lgpg-error -lunistring -lwldap32 -ldb_cxx\$\$BDB_LIB_SUFFIX/LIBS += -lcurl -lssl -lcrypto -ldb_cxx\$\$BDB_LIB_SUFFIX/" innova-qt.pro
+              make clean || true
+              rm -rf build Makefile .qmake.stash
+              strip --remove-section=.note.ABI-tag /usr/lib/aarch64-linux-gnu/libQt5Core.so.5 || true
+              qmake USE_UPNP=- USE_QRCODE=1 USE_NATIVETOR=- innova-qt.pro
+              make -j$(nproc)
+            '
 
       - name: Package
         run: |
