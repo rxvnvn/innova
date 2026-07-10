@@ -110,6 +110,12 @@ static const CAmount MIN_TXOUT_AMOUNT = NAME_FEE;
 static const int64_t MIN_TX_FEE_ANON = 10000;
 static const int64_t MIN_RELAY_TX_FEE = MIN_TX_FEE;
 static const int64_t MAX_MONEY = 18000000 * COIN; // 18,000,000 INN Innova Max
+
+// Mainnet maintenance builds intentionally keep the experimental v5/IDAG/finality
+// fork series inert until the network explicitly opts in to a future release.
+#ifndef MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT
+#define MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT 999999999
+#endif
 static const int64_t COIN_YEAR_REWARD = 0.06 * COIN; // 6% per year
 
 static const int64_t MAINNET_POSFIX = 500; // Mainnet Proof of Stake update not enabled until block 500
@@ -154,7 +160,7 @@ inline const uint256& GetGenesisBlockHash()
 inline int GetForkHeightTighterDrift() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 1 : 8000000;
+    return (fRegTest || fTestNet) ? 1 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_TIGHTER_DRIFT (GetForkHeightTighterDrift())
 
@@ -162,7 +168,7 @@ inline int GetForkHeightTighterDrift() {
 inline int GetForkHeightCNPaymentValidation() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 1 : 8000000;
+    return (fRegTest || fTestNet) ? 1 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_CN_PAYMENT_VALIDATION (GetForkHeightCNPaymentValidation())
 
@@ -175,7 +181,7 @@ static const int FORK_MIN_CN_PROTO_VERSION = 43950;
 inline int GetForkHeightColdStaking() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 1 : 8000000;
+    return (fRegTest || fTestNet) ? 1 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_COLD_STAKING (GetForkHeightColdStaking())
 
@@ -184,7 +190,7 @@ inline int GetForkHeightColdStaking() {
 inline int GetForkHeightShielded() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 1 : 8010000;
+    return (fRegTest || fTestNet) ? 1 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_SHIELDED (GetForkHeightShielded())
 
@@ -193,7 +199,7 @@ inline int GetForkHeightShielded() {
 inline int GetForkHeightRingSigDeprecation() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 1 : 8015000;
+    return (fRegTest || fTestNet) ? 1 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_RINGSIG_DEPRECATION (GetForkHeightRingSigDeprecation())
 
@@ -202,7 +208,7 @@ inline int GetForkHeightRingSigDeprecation() {
 inline int GetForkHeightDSP() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 2 : 8015000;
+    return (fRegTest || fTestNet) ? 2 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_DSP (GetForkHeightDSP())
 
@@ -210,7 +216,7 @@ inline int GetForkHeightDSP() {
 inline int GetForkHeightNullSend() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 2 : 8020000;
+    return (fRegTest || fTestNet) ? 2 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_NULLSEND (GetForkHeightNullSend())
 #define FORK_HEIGHT_CJOIN FORK_HEIGHT_NULLSEND
@@ -224,7 +230,7 @@ inline int GetForkHeightNullSend() {
 inline int GetForkHeightNullStake() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 3 : 8025000;
+    return (fRegTest || fTestNet) ? 3 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_NULLSTAKE (GetForkHeightNullStake())
 
@@ -233,7 +239,7 @@ inline int GetForkHeightNullStake() {
 inline int GetForkHeightNullStakeV2() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 5 : 8030000;
+    return (fRegTest || fTestNet) ? 5 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_NULLSTAKE_V2 (GetForkHeightNullStakeV2())
 
@@ -241,7 +247,7 @@ inline int GetForkHeightNullStakeV2() {
 inline int GetForkHeightNullStakeV3() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 7 : 8035000;
+    return (fRegTest || fTestNet) ? 7 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_NULLSTAKE_V3 (GetForkHeightNullStakeV3())
 
@@ -250,7 +256,7 @@ inline int GetForkHeightChaumianCJ()
 {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 8 : 8040000;
+    return (fRegTest || fTestNet) ? 8 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_CHAUMIAN_CJ (GetForkHeightChaumianCJ())
 
@@ -261,7 +267,7 @@ inline int GetForkHeightPoem()
     extern bool fTestNet;
     if (fRegTest) return 9;
     if (fTestNet) return 9;         // clean public IDAG testnet
-    return 8140000;                  // mainnet: 100K blocks after Chaumian CJ
+    return MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;                  // mainnet maintenance build: keep experimental v5 fork gates inert
 }
 #define FORK_HEIGHT_POEM (GetForkHeightPoem())
 
@@ -272,7 +278,7 @@ inline int GetForkHeightFinality()
     extern bool fTestNet;
     if (fRegTest) return 10;
     if (fTestNet) return 10;        // clean public IDAG testnet
-    return 8145000;                  // mainnet: 5,000 blocks after POEM
+    return MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;                  // mainnet maintenance build: keep experimental v5 fork gates inert
 }
 #define FORK_HEIGHT_FINALITY (GetForkHeightFinality())
 
@@ -283,7 +289,7 @@ inline int GetForkHeightDAG()
     extern bool fTestNet;
     if (fRegTest) return 11;
     if (fTestNet) return 11;        // clean public IDAG testnet
-    return 8150000;                  // mainnet: 5,000 blocks after finality
+    return MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;                  // mainnet maintenance build: keep experimental v5 fork gates inert
 }
 #define FORK_HEIGHT_DAG (GetForkHeightDAG())
 
@@ -305,7 +311,7 @@ inline int GetForkHeightDAGKnight()
     extern bool fTestNet;
     if (fRegTest) return 13;
     if (fTestNet) return 13;        // clean public IDAG testnet
-    return 8200000;                  // mainnet: 50,000 blocks after DAG (~14h at 1s post-DAG blocks)
+    return MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;                  // mainnet maintenance build: keep experimental v5 fork gates inert
 }
 #define FORK_HEIGHT_DAGKNIGHT (GetForkHeightDAGKnight())
 

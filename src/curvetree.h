@@ -12,13 +12,18 @@
 #include <vector>
 #include <stdint.h>
 
+// Shared mainnet maintenance sentinel for experimental v5/IDAG/finality gates.
+#ifndef MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT
+#define MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT 999999999
+#endif
+
 static const int CURVE_TREE_ARITY = 256;
 static const int CURVE_TREE_MAX_DEPTH = 8;
 static const size_t FCMP_PROOF_MAX_SIZE = 4096;
 inline int GetForkHeightFCMP() {
     extern bool fRegTest;
     extern bool fTestNet;
-    return (fRegTest || fTestNet) ? 2 : 8020000;
+    return (fRegTest || fTestNet) ? 2 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_FCMP (GetForkHeightFCMP())
 
