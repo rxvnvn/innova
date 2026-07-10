@@ -102,6 +102,24 @@ OverviewPage::OverviewPage(QWidget *parent) :
 {
     ui->setupUi(this);
 
+    setWindowOpacity(1.0);
+    setStyleSheet(
+        "QWidget#OverviewPage { background: #f5f6f7; }"
+        "QFrame#frame, QFrame#frame_2 { background: #ffffff; border: 1px solid #d8dde3; border-radius: 3px; }"
+        "QLabel#label_5, QLabel#label_4 { color: #202124; font-size: 13px; font-weight: 600; }"
+        "QLabel#labelTotalText { color: #5f6368; font-weight: 600; }"
+        "QLabel#labelTotal { color: #202124; font-size: 22px; font-weight: 500; }"
+        "QLabel#labelWalletStatus, QLabel#labelTransactionsStatus { color: #b00020; font-weight: 500; }"
+        "QListView#listTransactions { background: #ffffff; border: none; padding-top: 4px; }"
+    );
+    ui->gridLayout_3->setContentsMargins(12, 12, 12, 12);
+    ui->gridLayout_3->setHorizontalSpacing(12);
+    ui->gridLayout_2->setContentsMargins(12, 12, 12, 12);
+    ui->gridLayout_2->setVerticalSpacing(8);
+    ui->gridLayout_4->setContentsMargins(12, 12, 12, 12);
+    ui->gridLayout_4->setVerticalSpacing(8);
+    ui->gridLayout->setVerticalSpacing(5);
+
     // Recent transactions
     ui->listTransactions->setItemDelegate(txdelegate);
     ui->listTransactions->setIconSize(QSize(DECORATION_SIZE, DECORATION_SIZE));

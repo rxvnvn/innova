@@ -467,6 +467,14 @@ This product includes software developed by the OpenSSL Project for use in the O
         <translation>Открыть консоль отладки и диагностики</translation>
     </message>
     <message>
+        <source>&amp;Network Monitor</source>
+        <translation>&amp;Монитор сети</translation>
+    </message>
+    <message>
+        <source>Show Network Monitor</source>
+        <translation>Показать монитор сети</translation>
+    </message>
+    <message>
         <location line="-5"/>
         <source>&amp;Verify message...</source>
         <translation>&amp;Проверить сообщение...</translation>
@@ -1319,6 +1327,18 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <location filename="../forms/overviewpage.ui" line="+14"/>
         <source>Form</source>
         <translation>Форма</translation>
+    </message>
+    <message>
+        <source>Innova Wallet</source>
+        <translation>Бумажник Innova</translation>
+    </message>
+    <message>
+        <source>Wallet Total:</source>
+        <translation>Всего в бумажнике:</translation>
+    </message>
+    <message>
+        <source>&lt;b&gt;Recent Transactions&lt;/b&gt;</source>
+        <translation>&lt;b&gt;Последние транзакции&lt;/b&gt;</translation>
     </message>
     <message>
         <location line="+33"/>

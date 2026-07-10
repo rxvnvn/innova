@@ -65,6 +65,7 @@
 #include <QUrl>
 #include <QStyle>
 #include <QStyleFactory>
+#include <QSizePolicy>
 #include <QScreen>
 #include <QTextDocument>
 #include <QGraphicsScene>
@@ -78,8 +79,9 @@ extern CWallet* pwalletMain;
 extern int64_t nLastCoinStakeSearchInterval;
 double GetPoSKernelPS();
 
-#define VERTICAL_TOOBAR_STYLESHEET ""
-#define HORIZONTAL_TOOLBAR_STYLESHEET ""
+#define VERTICAL_TOOBAR_STYLESHEET "QToolBar { background: #f7f8fa; border-right: 1px solid #d8dde3; spacing: 4px; padding: 6px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 8px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolButton:checked { background: #e2edf8; border-color: #aebed0; }"
+#define HORIZONTAL_TOOLBAR_STYLESHEET "QToolBar { background: #f7f8fa; border-bottom: 1px solid #d8dde3; spacing: 4px; padding: 5px 8px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 10px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolButton:checked { background: #e2edf8; border-color: #aebed0; }"
+#define SECONDARY_TOOLBAR_STYLESHEET "QToolBar { background: #f6f7f9; border-top: 1px solid #d8dde3; spacing: 6px; padding: 4px 10px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 4px 8px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolBar::separator { background: #d8dde3; width: 1px; height: 18px; margin: 5px 8px; }"
 
 ActiveLabel::ActiveLabel(const QString & text, QWidget * parent):
     QLabel(parent){}
@@ -506,32 +508,49 @@ void BitcoinGUI::createToolBars()
     mainIcon->show();
 
     mainToolbar = addToolBar(tr("Tabs toolbar"));
+    mainToolbar->setObjectName("mainToolbar");
+    mainToolbar->setMovable(false);
+    mainToolbar->setFloatable(false);
+    mainToolbar->setIconSize(QSize(24, 24));
     mainToolbar->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
+    mainToolbar->setStyleSheet(HORIZONTAL_TOOLBAR_STYLESHEET);
     mainToolbar->addWidget(mainIcon);
 
     mainToolbar->addAction(overviewAction);
-  mainToolbar->addAction(sendCoinsAction);
-  mainToolbar->addAction(receiveCoinsAction);
-  mainToolbar->addAction(historyAction);
-  mainToolbar->addAction(addressBookAction);
-  mainToolbar->addAction(stakingAction);        // Staking page
-  mainToolbar->addAction(mintingAction);         // Staking Inputs
-  mainToolbar->addAction(nullsendAction);        // NullSend mixing
-  mainToolbar->addAction(collateralnodeManagerAction);
-  mainToolbar->addAction(idagAction);
+    mainToolbar->addAction(sendCoinsAction);
+    mainToolbar->addAction(receiveCoinsAction);
+    mainToolbar->addAction(historyAction);
+    mainToolbar->addAction(addressBookAction);
+    mainToolbar->addAction(stakingAction);
+    mainToolbar->addAction(mintingAction);
+    mainToolbar->addAction(nullsendAction);
+    mainToolbar->addAction(collateralnodeManagerAction);
+    mainToolbar->addAction(idagAction);
 
     secondaryToolbar = addToolBar(tr("Actions toolbar"));
+    secondaryToolbar->setObjectName("secondaryToolbar");
+    secondaryToolbar->setMovable(false);
+    secondaryToolbar->setFloatable(false);
+    secondaryToolbar->setIconSize(QSize(18, 18));
     secondaryToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    secondaryToolbar->setStyleSheet(SECONDARY_TOOLBAR_STYLESHEET);
+
+    QWidget *secondaryLeftSpacer = new QWidget(secondaryToolbar);
+    secondaryLeftSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    secondaryToolbar->addWidget(secondaryLeftSpacer);
+
     secondaryToolbar->addAction(exportAction);
     secondaryToolbar->addSeparator();
     secondaryToolbar->addAction(openRPCConsoleAction);
     secondaryToolbar->addAction(openGraphAction);
     secondaryToolbar->addSeparator();
-    secondaryToolbar->addAction(lockWalletAction);
-    secondaryToolbar->addAction(unlockWalletAction);
     secondaryToolbar->addAction(encryptWalletAction);
     secondaryToolbar->addAction(changePassphraseAction);
-    secondaryToolbar->addSeparator();
+
+    QWidget *secondaryRightSpacer = new QWidget(secondaryToolbar);
+    secondaryRightSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    secondaryToolbar->addWidget(secondaryRightSpacer);
+
     removeToolBar(secondaryToolbar);
     addToolBar(Qt::BottomToolBarArea, secondaryToolbar);
     secondaryToolbar->show();
@@ -1199,22 +1218,24 @@ void BitcoinGUI::mainToolbarOrientation(Qt::Orientation orientation)
         mainIcon->setPixmap(QPixmap(":images/horizontal"));
         mainIcon->setAlignment(Qt::AlignLeft);
         mainIcon->show();
+        mainToolbar->setIconSize(QSize(24, 24));
         mainToolbar->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-        mainToolbar->setStyleSheet("");
+        mainToolbar->setStyleSheet(HORIZONTAL_TOOLBAR_STYLESHEET);
     }
     else
     {
         mainIcon->setPixmap(QPixmap(":images/vertical"));
         mainIcon->setAlignment(Qt::AlignCenter);
         mainIcon->show();
+        mainToolbar->setIconSize(QSize(22, 22));
         mainToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-        mainToolbar->setStyleSheet("");
+        mainToolbar->setStyleSheet(VERTICAL_TOOBAR_STYLESHEET);
     }
 }
 
 void BitcoinGUI::secondaryToolbarOrientation(Qt::Orientation orientation)
 {
-    secondaryToolbar->setStyleSheet("");
+    secondaryToolbar->setStyleSheet(SECONDARY_TOOLBAR_STYLESHEET);
 }
 
 void BitcoinGUI::setEncryptionStatus(int status)
