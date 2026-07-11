@@ -1376,46 +1376,15 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
 <context>
     <name>OverviewPage</name>
     <message>
-        <location filename="../forms/overviewpage.ui" line="+14"/>
         <source>Form</source>
         <translation>Форма</translation>
     </message>
     <message>
-        <source>Innova Wallet</source>
-        <translation>Бумажник Innova</translation>
+        <source>The displayed information may be out of date. Your wallet automatically synchronizes with the Innova network after a connection is established, but this process has not completed yet.</source>
+        <translation>Отображаемая информация может быть устаревшей. Ваш кошелёк автоматически синхронизируется с сетью Innova после подключения, но этот процесс пока не завершён.</translation>
     </message>
     <message>
-        <source>Wallet Total:</source>
-        <translation>Всего в бумажнике:</translation>
-    </message>
-    <message>
-        <source>&lt;b&gt;Recent Transactions&lt;/b&gt;</source>
-        <translation>&lt;b&gt;Последние транзакции&lt;/b&gt;</translation>
-    </message>
-    <message>
-        <location line="+33"/>
-        <location line="+231"/>
-        <source>The displayed information may be out of date. Your wallet automatically synchronizes with the ShadowCoin network after a connection is established, but this process has not completed yet.</source>
-        <translation>Отображаемая информация может быть устаревшей. Ваш бумажник автоматически синхронизируется с сетью ShadowCoin после подключения, но этот процесс пока не завершён.</translation>
-    </message>
-    <message>
-        <location line="-160"/>
-        <source>Stake:</source>
-        <translation>Доля:</translation>
-    </message>
-    <message>
-        <location line="+29"/>
-        <source>Unconfirmed:</source>
-        <translation>Не подтверждено:</translation>
-    </message>
-    <message>
-        <location line="-107"/>
-        <source>Wallet</source>
-        <translation>Бумажник</translation>
-    </message>
-    <message>
-        <location line="+49"/>
-        <source>Spendable:</source>
+        <source>Available:</source>
         <translation>Доступно:</translation>
     </message>
     <message>
@@ -1423,58 +1392,96 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <translation>Доступно для стейкинга:</translation>
     </message>
     <message>
+        <source>Total of coins that was staked, and do not yet count toward the current balance</source>
+        <translation>Сумма монет для стейкинга, которые пока не учитываются в текущем балансе</translation>
+    </message>
+    <message>
         <source>Shielded (Private):</source>
         <translation>Приватный баланс:</translation>
+    </message>
+    <message>
+        <source>Coins in the shielded (private) pool. Hidden from the public ledger.</source>
+        <translation>Монеты в приватном пуле. Скрыты от публичного реестра.</translation>
+    </message>
+    <message>
+        <source>Unconfirmed:</source>
+        <translation>Неподтверждено:</translation>
+    </message>
+    <message>
+        <source>Total of transactions that have yet to be confirmed, and do not yet count toward the current balance</source>
+        <translation>Сумма транзакций, которые ещё не подтверждены и пока не учитываются в текущем балансе.</translation>
+    </message>
+    <message>
+        <source>Your current spendable balance</source>
+        <translation>Ваш текущий доступный баланс</translation>
+    </message>
+    <message>
+        <source>Immature:</source>
+        <translation>Незрелые:</translation>
+    </message>
+    <message>
+        <source>Balance from new stakes or coins that is not mature enough to be spent</source>
+        <translation>Баланс новых ставок или монет, которые ещё недостаточно зрелые для траты</translation>
+    </message>
+    <message>
+        <source>Current total balance in watch-only addresses</source>
+        <translation>Текущий общий баланс адресов только для наблюдения</translation>
+    </message>
+    <message>
+        <source>Your current balance in watch-only addresses</source>
+        <translation>Ваш текущий баланс адресов только для наблюдения</translation>
+    </message>
+    <message>
+        <source>Pending:</source>
+        <translation>Ожидает:</translation>
+    </message>
+    <message>
+        <source>Mined balance in watch-only addresses that has not yet matured</source>
+        <translation>Добытый баланс адресов только для наблюдения, который ещё не созрел</translation>
+    </message>
+    <message>
+        <source>Watch-only:</source>
+        <translation>Только наблюдение:</translation>
+    </message>
+    <message>
+        <source>Total:</source>
+        <translation>Итого:</translation>
+    </message>
+    <message>
+        <source>Unconfirmed transactions to watch-only addresses</source>
+        <translation>Неподтверждённые транзакции на адреса только для наблюдения</translation>
+    </message>
+    <message>
+        <source>Locked:</source>
+        <translation>Заблокировано:</translation>
+    </message>
+    <message>
+        <source>Balance locked from usage, e.g. masternode collateral</source>
+        <translation>Баланс, заблокированный для использования, например залог мастерноды</translation>
+    </message>
+    <message>
+        <source>Balances</source>
+        <translation>Балансы</translation>
+    </message>
+    <message>
+        <source>Recent transactions</source>
+        <translation>Последние транзакции</translation>
     </message>
     <message>
         <source>Out of Sync!</source>
         <translation>Не синхронизировано!</translation>
     </message>
     <message>
-        <location line="+16"/>
-        <source>Your current spendable balance</source>
-        <translation>Баланс, доступный в настоящее время</translation>
+        <source>Stake balance</source>
+        <translation>Баланс стейкинга</translation>
     </message>
     <message>
-        <location line="+71"/>
-        <source>Immature:</source>
-        <translation>Незрелые:</translation>
+        <source>Shielded (private) balance. Shield coins via the Send page to move funds here.</source>
+        <translation>Приватный баланс. Чтобы переместить сюда средства, экранируйте монеты на странице отправки.</translation>
     </message>
     <message>
-        <location line="+13"/>
-        <source>Mined balance that has not yet matured</source>
-        <translation>Баланс добытых монет, который ещё не созрел</translation>
-    </message>
-    <message>
-        <location line="+20"/>
-        <source>Total:</source>
-        <translation>Итого:</translation>
-    </message>
-    <message>
-        <location line="+16"/>
         <source>Your current total balance</source>
-        <translation>Ваш суммарный баланс</translation>
-    </message>
-    <message>
-        <location line="+46"/>
-        <source>&lt;b&gt;Recent transactions&lt;/b&gt;</source>
-        <translation>&lt;b&gt;Последние транзакции&lt;/b&gt;</translation>
-    </message>
-    <message>
-        <location line="-108"/>
-        <source>Total of transactions that have yet to be confirmed, and do not yet count toward the current balance</source>
-        <translation>Общая сумма всех транзакций, которые до сих пор не подтверждены, и до сих пор не учитываются в текущем балансе</translation>
-    </message>
-    <message>
-        <location line="-29"/>
-        <source>Total of coins that was staked, and do not yet count toward the current balance</source>
-        <translation>Общая сумма всех монет, используемых для Proof-of-Stake, и не учитывающихся на балансе</translation>
-    </message>
-    <message>
-        <location filename="../overviewpage.cpp" line="+113"/>
-        <location line="+1"/>
-        <source>out of sync</source>
-        <translation>не синхронизировано</translation>
+        <translation>Ваш текущий общий баланс</translation>
     </message>
 </context>
 <context>

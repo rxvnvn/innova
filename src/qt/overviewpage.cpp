@@ -11,10 +11,16 @@
 #include "main.h"
 
 #include <QAbstractItemDelegate>
+#include <QFrame>
+#include <QFont>
+#include <QFontMetrics>
+#include <QListView>
 #include <QPainter>
+#include <QPalette>
+#include <QSizePolicy>
 
-#define DECORATION_SIZE 36
-#define NUM_ITEMS 7
+#define DECORATION_SIZE 40
+#define NUM_ITEMS 5
 
 
 class TxViewDelegate : public QAbstractItemDelegate
@@ -32,16 +38,12 @@ public:
         painter->save();
 
         QIcon icon = qvariant_cast<QIcon>(index.data(Qt::DecorationRole));
-        QRect mainRect = option.rect;
-        QRect decorationRect(mainRect.topLeft(), QSize(DECORATION_SIZE, DECORATION_SIZE));
-        int xspace = DECORATION_SIZE + 8;
-        int ypad = 6;
-        int halfheight = (mainRect.height() - 2*ypad)/2;
-        QRect amountRect(mainRect.left() + xspace, mainRect.top()+ypad, mainRect.width() - xspace, halfheight);
-        QRect addressRect(mainRect.left() + xspace, mainRect.top()+ypad+halfheight, mainRect.width() - xspace, halfheight);
+        QRect mainRect = option.rect.adjusted(4, 4, -4, -4);
+        QRect decorationRect(mainRect.left(), mainRect.top() + (mainRect.height() - DECORATION_SIZE) / 2, DECORATION_SIZE, DECORATION_SIZE);
         icon.paint(painter, decorationRect);
 
         QDateTime date = index.data(TransactionTableModel::DateRole).toDateTime();
+        QString dateText = GUIUtil::dateTimeStr(date);
         QString address = index.data(Qt::DisplayRole).toString();
         qint64 amount = index.data(TransactionTableModel::AmountRole).toLongLong();
         bool confirmed = index.data(TransactionTableModel::ConfirmedRole).toBool();
@@ -52,8 +54,37 @@ public:
             foreground = qvariant_cast<QColor>(value);
         }
 
+        QString amountText = BitcoinUnits::formatWithUnit(unit, amount, true);
+        if(!confirmed)
+        {
+            amountText = QString("[") + amountText + QString("]");
+        }
+
+        QFont amountFont = option.font;
+        amountFont.setBold(true);
+        QFontMetrics amountMetrics(amountFont);
+        QFontMetrics textMetrics(option.font);
+        int amountWidth = amountMetrics.width(amountText) + 12;
+        if(amountWidth < 110)
+            amountWidth = 110;
+
+        QRect textRect = mainRect.adjusted(DECORATION_SIZE + 10, 0, 0, 0);
+        int maxAmountWidth = textRect.width() / 2;
+        if(maxAmountWidth > 0 && amountWidth > maxAmountWidth)
+            amountWidth = maxAmountWidth;
+
+        QRect amountRect(textRect.right() - amountWidth + 1, textRect.top(), amountWidth, textRect.height());
+        QRect detailRect = textRect;
+        detailRect.setRight(amountRect.left() - 8);
+        int halfheight = detailRect.height() / 2;
+        QRect dateRect(detailRect.left(), detailRect.top(), detailRect.width(), halfheight);
+        QRect addressRect(detailRect.left(), detailRect.top() + halfheight, detailRect.width(), detailRect.height() - halfheight);
+
+        painter->setPen(option.palette.color(QPalette::Mid));
+        painter->drawText(dateRect, Qt::AlignLeft|Qt::AlignVCenter, textMetrics.elidedText(dateText, Qt::ElideRight, dateRect.width()));
+
         painter->setPen(foreground);
-        painter->drawText(addressRect, Qt::AlignLeft|Qt::AlignVCenter, address);
+        painter->drawText(addressRect, Qt::AlignLeft|Qt::AlignVCenter, textMetrics.elidedText(address, Qt::ElideRight, addressRect.width()));
 
         if(amount < 0)
         {
@@ -68,22 +99,15 @@ public:
             foreground = option.palette.color(QPalette::Text);
         }
         painter->setPen(foreground);
-        QString amountText = BitcoinUnits::formatWithUnit(unit, amount, true);
-        if(!confirmed)
-        {
-            amountText = QString("[") + amountText + QString("]");
-        }
-        painter->drawText(amountRect, Qt::AlignRight|Qt::AlignVCenter, amountText);
-
-        painter->setPen(option.palette.color(QPalette::Text));
-        painter->drawText(amountRect, Qt::AlignLeft|Qt::AlignVCenter, GUIUtil::dateTimeStr(date));
+        painter->setFont(amountFont);
+        painter->drawText(amountRect, Qt::AlignRight|Qt::AlignVCenter, amountMetrics.elidedText(amountText, Qt::ElideLeft, amountRect.width()));
 
         painter->restore();
     }
 
     inline QSize sizeHint(const QStyleOptionViewItem &option, const QModelIndex &index) const
     {
-        return QSize(DECORATION_SIZE, DECORATION_SIZE);
+        return QSize(DECORATION_SIZE + 220, DECORATION_SIZE + 8);
     }
 
     int unit;
@@ -94,38 +118,90 @@ public:
 OverviewPage::OverviewPage(QWidget *parent) :
     QWidget(parent),
     ui(new Ui::OverviewPage),
+    model(0),
     currentBalance(-1),
+    currentLockedBalance(-1),
     currentUnconfirmedBalance(-1),
     currentImmatureBalance(-1),
+    currentWatchOnlyBalance(-1),
+    currentWatchUnconfBalance(-1),
+    currentWatchImmatureBalance(-1),
+    currentShieldedBalance(-1),
+    totalBalance(-1),
     txdelegate(new TxViewDelegate()),
     filter(0)
 {
     ui->setupUi(this);
 
     setWindowOpacity(1.0);
-    setStyleSheet(
-        "QWidget#OverviewPage { background: #f5f6f7; }"
-        "QFrame#frame, QFrame#frame_2 { background: #ffffff; border: 1px solid #cfd6df; border-radius: 4px; }"
-        "QLabel#label_5, QLabel#label_4 { color: #202124; font-size: 14px; font-weight: 600; }"
-        "QLabel#label, QLabel#labelStakeText, QLabel#labelShieldedText, QLabel#unconfirmedlabeltxt, QLabel#labelImmatureText, QLabel#labelLockedText { color: #5f6368; }"
-        "QLabel#labelBalance, QLabel#labelLocked, QLabel#labelStake, QLabel#labelShielded, QLabel#labelUnconfirmed, QLabel#labelImmature { color: #202124; font-weight: 600; }"
-        "QLabel#labelTotalText { color: #5f6368; font-weight: 600; }"
-        "QLabel#labelTotal { color: #202124; font-size: 23px; font-weight: 600; }"
-        "QLabel#labelWalletStatus, QLabel#labelTransactionsStatus { color: #b00020; font-weight: 600; }"
-        "QListView#listTransactions { background: #ffffff; border: none; padding-top: 2px; }"
-        "QListView#listTransactions::item { padding: 4px 2px; }"
-    );
-    ui->gridLayout_3->setContentsMargins(14, 14, 14, 14);
-    ui->gridLayout_3->setHorizontalSpacing(14);
-    ui->gridLayout_2->setContentsMargins(14, 14, 14, 14);
-    ui->gridLayout_2->setVerticalSpacing(9);
-    ui->gridLayout_4->setContentsMargins(14, 14, 14, 14);
-    ui->gridLayout_4->setVerticalSpacing(9);
-    ui->gridLayout->setHorizontalSpacing(18);
-    ui->gridLayout->setVerticalSpacing(6);
-    ui->gridLayout->setColumnMinimumWidth(0, 160);
-    ui->frame->setMinimumWidth(380);
-    ui->frame_2->setMinimumWidth(430);
+    setStyleSheet(QString());
+
+    ui->label_5->setText(tr("Balances"));
+    ui->label_4->setText(tr("Recent transactions"));
+    ui->label->setText(tr("Available:"));
+    ui->labelTotalText->setText(tr("Total:"));
+
+    ui->frame->setFrameShape(QFrame::NoFrame);
+    ui->frame->setFrameShadow(QFrame::Plain);
+    ui->frame->setSizePolicy(QSizePolicy::Preferred, QSizePolicy::Expanding);
+    ui->frame_2->setFrameShape(QFrame::NoFrame);
+    ui->frame_2->setFrameShadow(QFrame::Plain);
+    ui->frame_2->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Expanding);
+
+    ui->line_2->hide();
+    ui->line_3->hide();
+
+    ui->gridLayout_3->setContentsMargins(18, 18, 18, 18);
+    ui->gridLayout_3->setHorizontalSpacing(24);
+    ui->gridLayout_2->setContentsMargins(0, 0, 0, 0);
+    ui->gridLayout_2->setVerticalSpacing(10);
+    ui->gridLayout_4->setContentsMargins(0, 0, 0, 0);
+    ui->gridLayout_4->setVerticalSpacing(10);
+    ui->gridLayout->setHorizontalSpacing(24);
+    ui->gridLayout->setVerticalSpacing(7);
+    ui->gridLayout->setColumnMinimumWidth(0, 150);
+    ui->frame->setMinimumWidth(0);
+    ui->frame_2->setMinimumWidth(0);
+    ui->gridLayout_3->setColumnStretch(0, 1);
+    ui->gridLayout_3->setColumnStretch(1, 1);
+
+    QFont headingFont = font();
+    headingFont.setBold(true);
+    if(headingFont.pointSize() > 0)
+        headingFont.setPointSize(headingFont.pointSize() + 1);
+    ui->label_5->setFont(headingFont);
+    ui->label_4->setFont(headingFont);
+
+    QFont primaryBalanceFont = ui->labelBalance->font();
+    primaryBalanceFont.setBold(true);
+    if(primaryBalanceFont.pointSize() > 0)
+        primaryBalanceFont.setPointSize(primaryBalanceFont.pointSize() + 8);
+    ui->labelBalance->setFont(primaryBalanceFont);
+
+    QFont totalFont = ui->labelTotal->font();
+    totalFont.setBold(true);
+    if(totalFont.pointSize() > 0)
+        totalFont.setPointSize(totalFont.pointSize() - 6);
+    ui->labelTotal->setFont(totalFont);
+
+    QFont valueFont = font();
+    valueFont.setBold(true);
+    ui->labelLocked->setFont(valueFont);
+    ui->labelStake->setFont(valueFont);
+    ui->labelShielded->setFont(valueFont);
+    ui->labelUnconfirmed->setFont(valueFont);
+    ui->labelImmature->setFont(valueFont);
+    ui->labelWatchAvailable->setFont(valueFont);
+    ui->labelWatchPending->setFont(valueFont);
+    ui->labelWatchImmature->setFont(valueFont);
+    ui->labelWatchTotal->setFont(valueFont);
+
+    QFont warningFont = font();
+    warningFont.setBold(true);
+    ui->labelWalletStatus->setFont(warningFont);
+    ui->labelTransactionsStatus->setFont(warningFont);
+    ui->labelWalletStatus->setStyleSheet(QString());
+    ui->labelTransactionsStatus->setStyleSheet(QString());
 
     ui->labelBalance->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     ui->labelLocked->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
@@ -134,12 +210,19 @@ OverviewPage::OverviewPage(QWidget *parent) :
     ui->labelUnconfirmed->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     ui->labelImmature->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
     ui->labelTotal->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelWatchAvailable->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelWatchPending->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelWatchImmature->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    ui->labelWatchTotal->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
 
     // Recent transactions
     ui->listTransactions->setItemDelegate(txdelegate);
     ui->listTransactions->setIconSize(QSize(DECORATION_SIZE, DECORATION_SIZE));
     ui->listTransactions->setMinimumHeight(NUM_ITEMS * (DECORATION_SIZE + 2));
     ui->listTransactions->setAttribute(Qt::WA_MacShowFocusRect, false);
+    ui->listTransactions->setFrameShape(QFrame::NoFrame);
+    ui->listTransactions->setSpacing(2);
+    ui->listTransactions->setUniformItemSizes(true);
 
     connect(ui->listTransactions, SIGNAL(clicked(QModelIndex)), this, SLOT(handleTransactionClicked(QModelIndex)));
 
@@ -171,6 +254,7 @@ void OverviewPage::setBalance(qint64 balance, qint64 lockedbalance, qint64 stake
     currentLockedBalance = lockedbalance;
     currentUnconfirmedBalance = unconfirmedBalance;
     currentImmatureBalance = immatureBalance;
+    currentShieldedBalance = shieldedBalance;
 
     currentWatchOnlyBalance = watchOnlyBalance;
     currentWatchUnconfBalance = watchUnconfBalance;
@@ -183,11 +267,11 @@ void OverviewPage::setBalance(qint64 balance, qint64 lockedbalance, qint64 stake
     ui->labelStake->setText(BitcoinUnits::formatWithUnit(unit, stake));
     ui->labelStake->setToolTip(tr("Stake balance"));
 
-    // Shielded (privacy) balance — always visible so users know it exists
+    // Shielded (privacy) balance is always visible so users know it exists.
     if (ui->labelShielded)
     {
         ui->labelShielded->setText(BitcoinUnits::formatWithUnit(unit, shieldedBalance));
-        ui->labelShielded->setToolTip(tr("Shielded (private) balance — shield coins via the Send page to move funds here"));
+        ui->labelShielded->setToolTip(tr("Shielded (private) balance. Shield coins via the Send page to move funds here."));
     }
 
     // Include shielded in total
@@ -252,7 +336,7 @@ void OverviewPage::setModel(WalletModel *model)
         filter->setDynamicSortFilter(true);
         filter->setSortRole(Qt::EditRole);
         filter->setShowInactive(false);
-        filter->sort(TransactionTableModel::Status, Qt::DescendingOrder);
+        filter->sort(TransactionTableModel::Date, Qt::DescendingOrder);
 
         ui->listTransactions->setModel(filter);
         ui->listTransactions->setModelColumn(TransactionTableModel::ToAddress);
@@ -277,7 +361,7 @@ void OverviewPage::updateDisplayUnit()
     if(model && model->getOptionsModel())
     {
         if(currentBalance != -1)
-            setBalance(currentBalance, currentLockedBalance, model->getStakeAmount(), currentUnconfirmedBalance, currentImmatureBalance, currentWatchOnlyBalance, currentWatchUnconfBalance, currentWatchImmatureBalance);
+            setBalance(currentBalance, currentLockedBalance, model->getStakeAmount(), currentUnconfirmedBalance, currentImmatureBalance, currentWatchOnlyBalance, currentWatchUnconfBalance, currentWatchImmatureBalance, currentShieldedBalance);
 
         // Update txdelegate->unit with the current unit
         txdelegate->unit = model->getOptionsModel()->getDisplayUnit();

@@ -78,7 +78,7 @@
    <string>Form</string>
   </property>
   <property name="windowOpacity">
-   <double>0.200000000000000</double>
+   <double>1.000000000000000</double>
   </property>
   <property name="autoFillBackground">
    <bool>false</bool>
@@ -110,7 +110,7 @@
           <item row="0" column="0">
            <widget class="QLabel" name="label">
             <property name="text">
-             <string>Spendable:</string>
+             <string>Available:</string>
             </property>
            </widget>
           </item>
@@ -162,7 +162,7 @@
              <cursorShape>IBeamCursor</cursorShape>
             </property>
             <property name="toolTip">
-             <string>Coins in the shielded (private) pool — hidden from the public ledger</string>
+             <string>Coins in the shielded (private) pool. Hidden from the public ledger.</string>
             </property>
             <property name="text">
              <string notr="true">0 INN</string>
@@ -488,7 +488,7 @@
              <string notr="true"/>
             </property>
             <property name="text">
-             <string>Innova Wallet</string>
+             <string>Balances</string>
             </property>
            </widget>
           </item>
@@ -551,7 +551,7 @@
            <string notr="true"/>
           </property>
           <property name="text">
-           <string>Wallet Total:</string>
+           <string>Total:</string>
           </property>
          </widget>
         </item>
@@ -598,7 +598,7 @@
            </font>
           </property>
           <property name="text">
-           <string>&lt;b&gt;Recent Transactions&lt;/b&gt;</string>
+           <string>Recent transactions</string>
           </property>
          </widget>
         </item>

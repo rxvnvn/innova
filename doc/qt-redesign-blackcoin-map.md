@@ -54,3 +54,45 @@ The following Blackcoin More parts are intentionally not transferred:
 4. Transactions page: modernize filters/table spacing and export placement while preserving `TransactionFilterProxy` and transaction model semantics.
 5. Debug/window tools: only after the main wallet pages are stable, review RPC console and diagnostic tab navigation.
 6. Wallet lifecycle: separate analysis before any create/open wallet UI; do not use Blackcoin multiwallet lifecycle as a drop-in replacement.
+
+## Second-stage OverviewPage map
+
+| Blackcoin More class/file | Innova class/file | Purpose | Safe adaptation in stage 2? | Innova-specific state preserved | Blackcoin dependencies rejected |
+| --- | --- | --- | --- | --- | --- |
+| `OverviewPage` (`src/qt/overviewpage.*`) | `OverviewPage` (`src/qt/overviewpage.*`, `src/qt/forms/overviewpage.ui`) | Wallet balances, sync warning and recent transactions | Yes, layout, typography, spacing, row density and recent-transaction ordering only | Existing `WalletModel` getters for unlocked, locked, stake, unconfirmed, immature, watch-only and shielded balances | `interfaces::WalletBalances`, `WalletController`, privacy mask option, alerts plumbing, descriptor/private-key-disabled logic |
+| `TxViewDelegate` inside `OverviewPage` | `TxViewDelegate` inside Innova `OverviewPage` | Paint compact recent transaction rows | Yes, elide long date/address/amount text and use a compact two-line row | Innova roles: `Qt::DecorationRole`, `DateRole`, `AmountRole`, `ConfirmedRole`, existing amount formatting | `RawDecorationRole`, watch-only decoration roles, `PlatformStyle::SingleColorIcon`, separator-style overloads unavailable in Innova |
+| `TransactionOverviewWidget` | Innova `QListView listTransactions` | Recent transaction list sizing | No class transfer; only matching compact sizing behavior via existing `QListView` settings | Existing click signal maps through Innova `TransactionFilterProxy` and existing `transactionClicked` signal | New custom widget file and Blackcoin-specific table sizing assumptions |
+| Blackcoin balance layout in `forms/overviewpage.ui` | Innova `forms/overviewpage.ui` | Visual hierarchy of balances and recent list | Yes, calmer headings and plain recent-transactions title | Innova shielded/private, locked, stake and watch-only labels are kept | Donation percentage, watch-only stake field, private-keys-disabled branch |
+| Blackcoin out-of-sync buttons | Innova `labelWalletStatus`, `labelTransactionsStatus` | Warning placement | Placement/style only; visibility condition unchanged | Existing `showOutOfSyncWarning(bool)` calls and label widgets | Clickable warning button, node/client alert forwarding |
+
+### Stage 2 adaptations
+
+- The OverviewPage keeps Innova's existing `WalletModel`, `TransactionTableModel` and `TransactionFilterProxy` wiring.
+- The available balance is made the primary amount, with total and secondary categories kept in the same balance block.
+- Locked, stake, shielded/private, unconfirmed, immature and watch-only balances remain present and continue to use existing Innova values.
+- Recent transactions now use a compact five-row presentation, date sorting, elided address/date/amount text and the existing transaction click path.
+- The out-of-sync warning text remains driven by existing `showOutOfSyncWarning(bool)` logic; only local text/layout presentation is touched.
+- The display-unit refresh now preserves the cached shielded balance when reformatting labels; this is a GUI refresh fix and does not change balance calculation.
+
+### Stage 2 non-transfers
+
+The following Blackcoin More pieces were intentionally not transferred:
+
+- `interfaces::WalletBalances` and cached-balance lifecycle;
+- `WalletController`, multiwallet, descriptor wallet and private-key-disabled branches;
+- privacy masking controls and `OptionsModel::MaskValues`;
+- `TransactionOverviewWidget` as a new class;
+- alert forwarding and clickable out-of-sync warning buttons;
+- donation percentage, watch-only stake and Blackcoin-specific transaction decoration roles;
+- any wallet backend, staking backend, consensus, P2P, RPC, chainparams or validation code.
+
+### Stage 2 limitations
+
+- The current page remains a two-column Qt layout; fully responsive stacking for very narrow windows is left for a later UI pass if required.
+- The page does not add a Blackcoin-style privacy mask because Innova has no matching existing OverviewPage privacy control.
+- No dead Innova-specific balance widgets were removed; uncertain or active categories were preserved.
+- The rest of the wallet pages keep their existing layouts until their dedicated stages.
+
+### Proposed third stage
+
+Modernize `SendCoinsDialog` only: audit Innova send, coin-control, privacy/shielded tabs and unlock flow, then improve spacing, labels, validation presentation and button layout while preserving Innova's existing transaction creation, staking, wallet unlock, address validation and fee logic.

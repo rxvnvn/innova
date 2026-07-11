@@ -43,6 +43,7 @@ private:
     qint64 currentWatchOnlyBalance;
     qint64 currentWatchUnconfBalance;
     qint64 currentWatchImmatureBalance;
+    qint64 currentShieldedBalance;
     qint64 totalBalance;
     TxViewDelegate *txdelegate;
     TransactionFilterProxy *filter;
