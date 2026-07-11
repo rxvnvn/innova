@@ -25,13 +25,20 @@ extern void noui_connect();
 
 struct TestingSetup {
     boost::filesystem::path pathTestData;
+    bool fRegTestSaved;
+    bool fTestNetSaved;
 
-    TestingSetup() {
+    TestingSetup()
+        : fRegTestSaved(fRegTest),
+          fTestNetSaved(fTestNet)
+    {
         pathTestData = boost::filesystem::temp_directory_path() /
             boost::filesystem::unique_path("innova-test-%%%%-%%%%-%%%%");
         boost::filesystem::create_directories(pathTestData);
         mapArgs["-datadir"] = pathTestData.string();
         mapArgs["-regtest"] = "1";
+        fRegTest = true;
+        fTestNet = false;
 
         fPrintToDebugger = true; // don't want to write to debug.log file
         noui_connect();
@@ -49,6 +56,8 @@ struct TestingSetup {
         CTxDB txdb;
         txdb.Close();
         bitdb.Flush(true);
+        fRegTest = fRegTestSaved;
+        fTestNet = fTestNetSaved;
         boost::filesystem::remove_all(pathTestData);
     }
 };
