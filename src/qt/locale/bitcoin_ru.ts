@@ -1692,258 +1692,206 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
 <context>
     <name>SendCoinsDialog</name>
     <message>
-        <location filename="../forms/sendcoinsdialog.ui" line="+14"/>
-        <location filename="../sendcoinsdialog.cpp" line="+182"/>
-        <location line="+5"/>
-        <location line="+5"/>
-        <location line="+5"/>
-        <location line="+6"/>
-        <location line="+5"/>
-        <location line="+5"/>
         <source>Send Coins</source>
         <translation>Отправка</translation>
     </message>
     <message>
-        <location line="+76"/>
         <source>Coin Control Features</source>
         <translation>Выбор входов</translation>
     </message>
     <message>
-        <location line="+20"/>
         <source>Inputs...</source>
         <translation>Входы...</translation>
     </message>
     <message>
-        <location line="+7"/>
         <source>automatically selected</source>
         <translation>автоматический выбор</translation>
     </message>
     <message>
-        <location line="+19"/>
         <source>Insufficient funds!</source>
         <translation>Недостаточно средств!</translation>
     </message>
     <message>
-        <location line="+77"/>
         <source>Quantity:</source>
         <translation>Количество:</translation>
     </message>
     <message>
-        <location line="+22"/>
-        <location line="+35"/>
         <source>0</source>
-        <translation type="unfinished"/>
+        <translation>0</translation>
     </message>
     <message>
-        <location line="-19"/>
         <source>Bytes:</source>
-        <translation type="unfinished"/>
+        <translation>Байты:</translation>
     </message>
     <message>
-        <location line="+51"/>
         <source>Amount:</source>
         <translation>Сумма:</translation>
     </message>
     <message>
-        <location line="+22"/>
-        <location line="+86"/>
-        <location line="+86"/>
-        <location line="+32"/>
-        <source>0.00 SDC</source>
-        <translation type="unfinished"/>
+        <source>0.00 INN</source>
+        <translation>0.00 INN</translation>
     </message>
     <message>
-        <location line="-191"/>
         <source>Priority:</source>
         <translation>Приоритет:</translation>
     </message>
     <message>
-        <location line="+19"/>
         <source>medium</source>
         <translation>средний</translation>
     </message>
     <message>
-        <location line="+32"/>
         <source>Fee:</source>
         <translation>Комиссия:</translation>
     </message>
     <message>
-        <location line="+35"/>
         <source>Low Output:</source>
-        <translation type="unfinished"/>
+        <translation>Низкий выход:</translation>
     </message>
     <message>
-        <location line="+19"/>
         <source>no</source>
         <translation>нет</translation>
     </message>
     <message>
-        <location line="+32"/>
         <source>After Fee:</source>
-        <translation type="unfinished"/>
+        <translation>После комиссии:</translation>
     </message>
     <message>
-        <location line="+35"/>
         <source>Change</source>
-        <translation type="unfinished"/>
+        <translation>Сдача</translation>
     </message>
     <message>
-        <location line="+50"/>
         <source>custom change address</source>
-        <translation>адрес для сдачи</translation>
+        <translation>пользовательский адрес сдачи</translation>
     </message>
     <message>
-        <location line="+106"/>
+        <source>Split UTXO</source>
+        <translation>Разделить UTXO</translation>
+    </message>
+    <message>
+        <source>UTXO Size:</source>
+        <translation>Размер UTXO:</translation>
+    </message>
+    <message>
         <source>Send to multiple recipients at once</source>
         <translation>Отправить нескольким получателям одновременно</translation>
     </message>
     <message>
-        <location line="+3"/>
         <source>Add &amp;Recipient</source>
         <translation>&amp;Добавить получателя</translation>
     </message>
     <message>
-        <location line="+20"/>
         <source>Remove all transaction fields</source>
         <translation>Удалить все поля транзакции</translation>
     </message>
     <message>
-        <location line="+3"/>
         <source>Clear &amp;All</source>
         <translation>Очистить &amp;всё</translation>
     </message>
     <message>
-        <location line="+28"/>
         <source>Balance:</source>
         <translation>Баланс:</translation>
     </message>
     <message>
-        <location line="+16"/>
-        <source>123.456 SDC</source>
-        <translation>123.456 SDC</translation>
+        <source>123.456 INN</source>
+        <translation>123.456 INN</translation>
     </message>
     <message>
-        <location line="+31"/>
         <source>Confirm the send action</source>
         <translation>Подтвердить отправку</translation>
     </message>
     <message>
-        <location line="+3"/>
         <source>S&amp;end</source>
         <translation>&amp;Отправить</translation>
     </message>
     <message>
-        <location filename="../sendcoinsdialog.cpp" line="-173"/>
-        <source>Enter a ShadowCoin address (e.g. SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</source>
-        <translation>Введите ShadowCoin-адрес (например SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</translation>
+        <source>Enter an Innova address (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</source>
+        <translation>Введите адрес Innova (например igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</translation>
     </message>
     <message>
-        <location line="+15"/>
         <source>Copy quantity</source>
         <translation>Копировать количество</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy amount</source>
         <translation>Копировать сумму</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy fee</source>
         <translation>Копировать комиссию</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy after fee</source>
-        <translation type="unfinished"/>
+        <translation>Копировать сумму после комиссии</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy bytes</source>
-        <translation>Копировать количество байтов</translation>
+        <translation>Копировать байты</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy priority</source>
         <translation>Копировать приоритет</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy low output</source>
-        <translation type="unfinished"/>
+        <translation>Копировать низкий выход</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy change</source>
         <translation>Копировать сдачу</translation>
     </message>
     <message>
-        <location line="+86"/>
         <source>&lt;b&gt;%1&lt;/b&gt; to %2 (%3)</source>
         <translation>&lt;b&gt;%1&lt;/b&gt; адресату %2 (%3)</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>Confirm send coins</source>
         <translation>Подтвердите отправку монет</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Are you sure you want to send %1?</source>
         <translation>Вы уверены, что хотите отправить %1?</translation>
     </message>
     <message>
-        <location line="+0"/>
         <source> and </source>
         <translation> и </translation>
     </message>
     <message>
-        <location line="+29"/>
         <source>The recipient address is not valid, please recheck.</source>
         <translation>Адрес получателя неверный, пожалуйста, перепроверьте.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>The amount to pay must be larger than 0.</source>
-        <translation>Количество монет для отправки должно быть больше 0.</translation>
+        <translation>Сумма должна быть больше 0.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>The amount exceeds your balance.</source>
-        <translation>Количество отправляемых монет превышает Ваш баланс</translation>
+        <translation>Сумма превышает ваш баланс.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>The total exceeds your balance when the %1 transaction fee is included.</source>
-        <translation>Сумма превысит Ваш баланс, если комиссия в размере %1 будет добавлена к транзакции</translation>
+        <translation>Итоговая сумма превышает ваш баланс с учётом комиссии %1.</translation>
     </message>
     <message>
-        <location line="+6"/>
         <source>Duplicate address found, can only send to each address once per send operation.</source>
-        <translation>Обнаружен дублирующийся адрес. Отправка на один и тот же адрес возможна только один раз за одну операцию отправки</translation>
+        <translation>Найден повторяющийся адрес. На каждый адрес можно отправить только один раз за одну операцию.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>Error: Transaction creation failed.</source>
         <translation>Ошибка: не удалось создать транзакцию.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>Error: The transaction was rejected. This might happen if some of the coins in your wallet were already spent, such as if you used a copy of wallet.dat and coins were spent in the copy but not marked as spent here.</source>
-        <translation>Ошибка: В транзакции отказано.  Такое может произойти, если некоторые монеты уже были потрачены, например, если Вы используете одну копию файла wallet.dat, а монеты были потрачены из другой копии, но не были отмечены как потраченные в этой.</translation>
+        <translation>Ошибка: транзакция была отклонена. Такое может произойти, если некоторые монеты в вашем бумажнике уже были потрачены, например, если вы использовали копию wallet.dat, а монеты были потрачены в копии, но здесь не отмечены как потраченные.</translation>
     </message>
     <message>
-        <location line="+251"/>
-        <source>WARNING: Invalid ShadowCoin address</source>
-        <translation type="unfinished"/>
+        <source>WARNING: Invalid Innova address</source>
+        <translation>ПРЕДУПРЕЖДЕНИЕ: неверный адрес Innova</translation>
     </message>
     <message>
-        <location line="+13"/>
         <source>(no label)</source>
         <translation>(нет метки)</translation>
     </message>
     <message>
-        <location line="+4"/>
         <source>WARNING: unknown change address</source>
         <translation>ПРЕДУПРЕЖДЕНИЕ: неизвестный адрес для сдачи</translation>
     </message>
@@ -1951,65 +1899,56 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
 <context>
     <name>SendCoinsEntry</name>
     <message>
-        <location filename="../forms/sendcoinsentry.ui" line="+14"/>
         <source>Form</source>
         <translation>Форма</translation>
     </message>
     <message>
-        <location line="+15"/>
         <source>A&amp;mount:</source>
-        <translation>Ко&amp;личество:</translation>
+        <translation>Су&amp;мма:</translation>
     </message>
     <message>
-        <location line="+13"/>
         <source>Pay &amp;To:</source>
         <translation>Полу&amp;чатель:</translation>
     </message>
     <message>
-        <location line="+24"/>
-        <location filename="../sendcoinsentry.cpp" line="+25"/>
         <source>Enter a label for this address to add it to your address book</source>
-        <translation>Введите метку для данного адреса (для добавления в адресную книгу)</translation>
+        <translation>Введите метку для данного адреса, чтобы добавить его в адресную книгу</translation>
     </message>
     <message>
-        <location line="+9"/>
         <source>&amp;Label:</source>
         <translation>&amp;Метка:</translation>
     </message>
     <message>
-        <location line="+18"/>
-        <source>The address to send the payment to  (e.g. SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</source>
-        <translation>Адрес получателя платежа (например SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</translation>
+        <source>The address to send the payment to (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</source>
+        <translation>Адрес получателя платежа (например igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</translation>
     </message>
     <message>
-        <location line="+10"/>
         <source>Choose address from address book</source>
         <translation>Выберите адрес из адресной книги</translation>
     </message>
     <message>
-        <location line="+10"/>
         <source>Alt+A</source>
         <translation>Alt+A</translation>
     </message>
     <message>
-        <location line="+7"/>
         <source>Paste address from clipboard</source>
         <translation>Вставить адрес из буфера обмена</translation>
     </message>
     <message>
-        <location line="+10"/>
         <source>Alt+P</source>
         <translation>Alt+P</translation>
     </message>
     <message>
-        <location line="+7"/>
         <source>Remove this recipient</source>
         <translation>Удалить этого получателя</translation>
     </message>
     <message>
-        <location filename="../sendcoinsentry.cpp" line="+1"/>
-        <source>Enter a ShadowCoin address (e.g. SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</source>
-        <translation>Введите ShadowCoin-адрес (например SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</translation>
+        <source>Enter an Innova address</source>
+        <translation>Введите адрес Innova</translation>
+    </message>
+    <message>
+        <source>Enter an Innova address (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</source>
+        <translation>Введите адрес Innova (например igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</translation>
     </message>
 </context>
 <context>

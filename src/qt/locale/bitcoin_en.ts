@@ -1710,324 +1710,263 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
 <context>
     <name>SendCoinsDialog</name>
     <message>
-        <location filename="../forms/sendcoinsdialog.ui" line="+14"/>
-        <location filename="../sendcoinsdialog.cpp" line="+182"/>
-        <location line="+5"/>
-        <location line="+5"/>
-        <location line="+5"/>
-        <location line="+6"/>
-        <location line="+5"/>
-        <location line="+5"/>
         <source>Send Coins</source>
         <translation>Send Coins</translation>
     </message>
     <message>
-        <location line="+76"/>
         <source>Coin Control Features</source>
-        <translation type="unfinished"></translation>
+        <translation>Coin Control Features</translation>
     </message>
     <message>
-        <location line="+20"/>
         <source>Inputs...</source>
-        <translation type="unfinished"></translation>
+        <translation>Inputs...</translation>
     </message>
     <message>
-        <location line="+7"/>
         <source>automatically selected</source>
-        <translation type="unfinished"></translation>
+        <translation>automatically selected</translation>
     </message>
     <message>
-        <location line="+19"/>
         <source>Insufficient funds!</source>
-        <translation type="unfinished"></translation>
+        <translation>Insufficient funds!</translation>
     </message>
     <message>
-        <location line="+77"/>
         <source>Quantity:</source>
-        <translation type="unfinished"></translation>
+        <translation>Quantity:</translation>
     </message>
     <message>
-        <location line="+22"/>
-        <location line="+35"/>
         <source>0</source>
-        <translation type="unfinished"></translation>
+        <translation>0</translation>
     </message>
     <message>
-        <location line="-19"/>
         <source>Bytes:</source>
-        <translation type="unfinished"></translation>
+        <translation>Bytes:</translation>
     </message>
     <message>
-        <location line="+51"/>
         <source>Amount:</source>
-        <translation type="unfinished">Amount:</translation>
+        <translation>Amount:</translation>
     </message>
     <message>
-        <location line="+22"/>
-        <location line="+86"/>
-        <location line="+86"/>
-        <location line="+32"/>
-        <source>0.00 SDC</source>
-        <translation type="unfinished">123.456 SDC {0.00 ?}</translation>
+        <source>0.00 INN</source>
+        <translation>0.00 INN</translation>
     </message>
     <message>
-        <location line="-191"/>
         <source>Priority:</source>
-        <translation type="unfinished"></translation>
+        <translation>Priority:</translation>
     </message>
     <message>
-        <location line="+19"/>
         <source>medium</source>
-        <translation type="unfinished"></translation>
+        <translation>medium</translation>
     </message>
     <message>
-        <location line="+32"/>
         <source>Fee:</source>
-        <translation type="unfinished"></translation>
+        <translation>Fee:</translation>
     </message>
     <message>
-        <location line="+35"/>
         <source>Low Output:</source>
-        <translation type="unfinished"></translation>
+        <translation>Low Output:</translation>
     </message>
     <message>
-        <location line="+19"/>
         <source>no</source>
-        <translation type="unfinished"></translation>
+        <translation>no</translation>
     </message>
     <message>
-        <location line="+32"/>
         <source>After Fee:</source>
-        <translation type="unfinished"></translation>
+        <translation>After Fee:</translation>
     </message>
     <message>
-        <location line="+35"/>
         <source>Change</source>
-        <translation type="unfinished"></translation>
+        <translation>Change</translation>
     </message>
     <message>
-        <location line="+50"/>
         <source>custom change address</source>
-        <translation type="unfinished"></translation>
+        <translation>custom change address</translation>
     </message>
     <message>
-        <location line="+106"/>
+        <source>Split UTXO</source>
+        <translation>Split UTXO</translation>
+    </message>
+    <message>
+        <source>UTXO Size:</source>
+        <translation>UTXO Size:</translation>
+    </message>
+    <message>
         <source>Send to multiple recipients at once</source>
         <translation>Send to multiple recipients at once</translation>
     </message>
     <message>
-        <location line="+3"/>
         <source>Add &amp;Recipient</source>
-        <translation type="unfinished"></translation>
+        <translation>Add &amp;Recipient</translation>
     </message>
     <message>
-        <location line="+20"/>
         <source>Remove all transaction fields</source>
         <translation>Remove all transaction fields</translation>
     </message>
     <message>
-        <location line="+3"/>
         <source>Clear &amp;All</source>
         <translation>Clear &amp;All</translation>
     </message>
     <message>
-        <location line="+28"/>
         <source>Balance:</source>
         <translation>Balance:</translation>
     </message>
     <message>
-        <location line="+16"/>
-        <source>123.456 SDC</source>
-        <translation>123.456 SDC</translation>
+        <source>123.456 INN</source>
+        <translation>123.456 INN</translation>
     </message>
     <message>
-        <location line="+31"/>
         <source>Confirm the send action</source>
         <translation>Confirm the send action</translation>
     </message>
     <message>
-        <location line="+3"/>
         <source>S&amp;end</source>
-        <translation type="unfinished"></translation>
+        <translation>S&amp;end</translation>
     </message>
     <message>
-        <location filename="../sendcoinsdialog.cpp" line="-173"/>
-        <source>Enter a ShadowCoin address (e.g. SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</source>
-        <translation>Enter a ShadowCoin address (e.g. SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</translation>
+        <source>Enter an Innova address (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</source>
+        <translation>Enter an Innova address (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</translation>
     </message>
     <message>
-        <location line="+15"/>
         <source>Copy quantity</source>
-        <translation></translation>
+        <translation>Copy quantity</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy amount</source>
         <translation>Copy amount</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy fee</source>
-        <translation></translation>
+        <translation>Copy fee</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy after fee</source>
-        <translation></translation>
+        <translation>Copy after fee</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy bytes</source>
-        <translation></translation>
+        <translation>Copy bytes</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy priority</source>
-        <translation></translation>
+        <translation>Copy priority</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy low output</source>
-        <translation></translation>
+        <translation>Copy low output</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Copy change</source>
-        <translation></translation>
+        <translation>Copy change</translation>
     </message>
     <message>
-        <location line="+86"/>
         <source>&lt;b&gt;%1&lt;/b&gt; to %2 (%3)</source>
         <translation>&lt;b&gt;%1&lt;/b&gt; to %2 (%3)</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>Confirm send coins</source>
         <translation>Confirm send coins</translation>
     </message>
     <message>
-        <location line="+1"/>
         <source>Are you sure you want to send %1?</source>
         <translation>Are you sure you want to send %1?</translation>
     </message>
     <message>
-        <location line="+0"/>
         <source> and </source>
         <translation> and </translation>
     </message>
     <message>
-        <location line="+29"/>
         <source>The recipient address is not valid, please recheck.</source>
         <translation>The recipient address is not valid, please recheck.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>The amount to pay must be larger than 0.</source>
         <translation>The amount to pay must be larger than 0.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>The amount exceeds your balance.</source>
         <translation>The amount exceeds your balance.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>The total exceeds your balance when the %1 transaction fee is included.</source>
         <translation>The total exceeds your balance when the %1 transaction fee is included.</translation>
     </message>
     <message>
-        <location line="+6"/>
         <source>Duplicate address found, can only send to each address once per send operation.</source>
         <translation>Duplicate address found, can only send to each address once per send operation.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>Error: Transaction creation failed.</source>
         <translation>Error: Transaction creation failed.</translation>
     </message>
     <message>
-        <location line="+5"/>
         <source>Error: The transaction was rejected. This might happen if some of the coins in your wallet were already spent, such as if you used a copy of wallet.dat and coins were spent in the copy but not marked as spent here.</source>
         <translation>Error: The transaction was rejected. This might happen if some of the coins in your wallet were already spent, such as if you used a copy of wallet.dat and coins were spent in the copy but not marked as spent here.</translation>
     </message>
     <message>
-        <location line="+251"/>
-        <source>WARNING: Invalid ShadowCoin address</source>
-        <translation></translation>
+        <source>WARNING: Invalid Innova address</source>
+        <translation>WARNING: Invalid Innova address</translation>
     </message>
     <message>
-        <location line="+13"/>
         <source>(no label)</source>
-        <translation type="unfinished">(no label)</translation>
+        <translation>(no label)</translation>
     </message>
     <message>
-        <location line="+4"/>
         <source>WARNING: unknown change address</source>
-        <translation></translation>
+        <translation>WARNING: unknown change address</translation>
     </message>
 </context>
 <context>
     <name>SendCoinsEntry</name>
     <message>
-        <location filename="../forms/sendcoinsentry.ui" line="+14"/>
         <source>Form</source>
         <translation>Form</translation>
     </message>
     <message>
-        <location line="+15"/>
         <source>A&amp;mount:</source>
         <translation>A&amp;mount:</translation>
     </message>
     <message>
-        <location line="+13"/>
         <source>Pay &amp;To:</source>
         <translation>Pay &amp;To:</translation>
     </message>
     <message>
-        <location line="+24"/>
-        <location filename="../sendcoinsentry.cpp" line="+25"/>
         <source>Enter a label for this address to add it to your address book</source>
         <translation>Enter a label for this address to add it to your address book</translation>
     </message>
     <message>
-        <location line="+9"/>
         <source>&amp;Label:</source>
         <translation>&amp;Label:</translation>
     </message>
     <message>
-        <location line="+18"/>
-        <source>The address to send the payment to  (e.g. SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</source>
-        <translation></translation>
+        <source>The address to send the payment to (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</source>
+        <translation>The address to send the payment to (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</translation>
     </message>
     <message>
-        <location line="+10"/>
         <source>Choose address from address book</source>
         <translation>Choose address from address book</translation>
     </message>
     <message>
-        <location line="+10"/>
         <source>Alt+A</source>
         <translation>Alt+A</translation>
     </message>
     <message>
-        <location line="+7"/>
         <source>Paste address from clipboard</source>
         <translation>Paste address from clipboard</translation>
     </message>
     <message>
-        <location line="+10"/>
         <source>Alt+P</source>
         <translation>Alt+P</translation>
     </message>
     <message>
-        <location line="+7"/>
         <source>Remove this recipient</source>
         <translation>Remove this recipient</translation>
     </message>
     <message>
-        <location filename="../sendcoinsentry.cpp" line="+1"/>
-        <source>Enter a ShadowCoin address (e.g. SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</source>
-        <translation>Enter a ShadowCoin address (e.g. SXywGBZBowrppUwwNUo1GCRDTibzJi7g2M)</translation>
+        <source>Enter an Innova address</source>
+        <translation>Enter an Innova address</translation>
+    </message>
+    <message>
+        <source>Enter an Innova address (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</source>
+        <translation>Enter an Innova address (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)</translation>
     </message>
 </context>
 <context>

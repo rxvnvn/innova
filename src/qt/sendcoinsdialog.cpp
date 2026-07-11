@@ -108,7 +108,7 @@ SendCoinsDialog::SendCoinsDialog(QWidget *parent) :
 
 #if QT_VERSION >= 0x040700
     /* Do not move this to the XML file, Qt before 4.7 will choke on it */
-    ui->lineEditCoinControlChange->setPlaceholderText(tr("Enter a Innova address (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)"));
+    ui->lineEditCoinControlChange->setPlaceholderText(tr("Enter an Innova address (e.g. igYcNv4Zp7g4ysSpdFUuzn6VaxvzAZAxsd)"));
 #endif
 
     addEntry();
@@ -462,7 +462,8 @@ QWidget *SendCoinsDialog::setupTabChain(QWidget *prev)
         }
     }
     QWidget::setTabOrder(prev, ui->addButton);
-    QWidget::setTabOrder(ui->addButton, ui->sendButton);
+    QWidget::setTabOrder(ui->addButton, ui->clearButton);
+    QWidget::setTabOrder(ui->clearButton, ui->sendButton);
     return ui->sendButton;
 }
 

@@ -96,3 +96,22 @@ The following Blackcoin More pieces were intentionally not transferred:
 ### Proposed third stage
 
 Modernize `SendCoinsDialog` only: audit Innova send, coin-control, privacy/shielded tabs and unlock flow, then improve spacing, labels, validation presentation and button layout while preserving Innova's existing transaction creation, staking, wallet unlock, address validation and fee logic.
+## Stage 3: SendCoinsDialog
+
+| Blackcoin class / area | Innova class / area | Purpose | Safe to transfer | Innova-specific elements kept | Blackcoin dependencies rejected | Risks / constraints |
+| --- | --- | --- | --- | --- | --- | --- |
+| `SendCoinsDialog` | `SendCoinsDialog` | Rework the transparent send page layout and controls | Yes, for structure, spacing, button order, and presentation only | Existing `WalletModel`, `CoinControlDialog`, split UTXO controls, unlock flow, confirmation flow, privacy tabs, and send validation | PSBT, external signer, descriptor wallet, RBF, SegWit/Taproot, multiwallet, and any new fee or coin selection backend | Must not alter transaction creation, fee math, coin control logic, or private send modes |
+| `SendCoinsEntry` | `SendCoinsEntry` | Compact recipient row arrangement | Yes, for layout and keyboard flow only | Address validation, URI parsing, narration semantics, label auto-fill, and existing recipient signals | Blackcoin subtract-fee, use-available-balance, or message/backend flows not present in Innova | Keep all recipient and validation semantics unchanged |
+| `CoinControlDialog` presentation | Existing coin control widgets and labels | Make the send page coin-control section quieter and denser | Yes, for spacing and label presentation only | Current coin-control backend, custom change, and split UTXO handling | Blackcoin coin selection or fee estimator | Must not touch selection logic or fee calculation |
+| Qt resources / translations | Existing Innova Qt resource and locale files | Ensure icons and text stay native and translated | Yes, if only existing assets are used | Existing Innova logo and language support | Blackcoin branding or new binary assets | Keep EN/RU aligned and avoid untranslated send-page strings |
+
+### SendCoinsDialog audit notes
+
+- The transparent send page is backed by the existing Innova wallet model and coin control logic.
+- Privacy tabs remain intact because they call Innova-specific wallet/backend methods and are not safe to replace with Blackcoin flows.
+- The safe transfer surface is limited to layout, spacing, hierarchy, button presentation, tab order, and text polish.
+- Anything that would alter `CreateTransaction`, `CommitTransaction`, fee calculation, address validation, change handling, or unlock behavior is out of scope.
+
+### Stage 4 planning boundary
+
+The next stage should focus on `ReceiveCoinsDialog` and its related entry widgets only after a separate backend audit confirms that no wallet-lifecycle assumptions are required.
