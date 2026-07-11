@@ -353,8 +353,8 @@ This product includes software developed by the OpenSSL Project for use in the O
     </message>
     <message>
         <location line="-13"/>
-        <source>&amp;Receive coins</source>
-        <translation>&amp;Receive coins</translation>
+        <source>&amp;Receive</source>
+        <translation>&amp;Receive</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -363,8 +363,8 @@ This product includes software developed by the OpenSSL Project for use in the O
     </message>
     <message>
         <location line="-7"/>
-        <source>&amp;Send coins</source>
-        <translation>&amp;Send coins</translation>
+        <source>&amp;Send</source>
+        <translation>&amp;Send</translation>
     </message>
     <message>
         <location line="+35"/>
@@ -431,8 +431,8 @@ This product includes software developed by the OpenSSL Project for use in the O
     </message>
     <message>
         <location line="-62"/>
-        <source>Send coins to a ShadowCoin address</source>
-        <translation>Send coins to a ShadowCoin address</translation>
+        <source>Send coins to an Innova address</source>
+        <translation>Send coins to an Innova address</translation>
     </message>
     <message>
         <location line="+45"/>
@@ -752,6 +752,54 @@ Address: %4
         <location filename="../bitcoin.cpp" line="+109"/>
         <source>A fatal error occurred. ShadowCoin can no longer continue safely and will quit.</source>
         <translation>A fatal error occurred. ShadowCoin can no longer continue safely and will quit.</translation>
+    </message>
+    <message>
+        <source>IDA&amp;G</source>
+        <translation>IDA&amp;G</translation>
+    </message>
+    <message>
+        <source>Sta&amp;king</source>
+        <translation>Sta&amp;king</translation>
+    </message>
+    <message>
+        <source>M&amp;ultisig</source>
+        <translation>M&amp;ultisig</translation>
+    </message>
+    <message>
+        <source>Network &amp;Monitor</source>
+        <translation>Network &amp;Monitor</translation>
+    </message>
+    <message>
+        <source>Open &amp;Wallet Configuration File</source>
+        <translation>Open &amp;Wallet Configuration File</translation>
+    </message>
+    <message>
+        <source>Open Collateralnode Configuration &amp;File</source>
+        <translation>Open Collateralnode Configuration &amp;File</translation>
+    </message>
+    <message>
+        <source>&amp;Window</source>
+        <translation>&amp;Window</translation>
+    </message>
+    <message>
+        <source>Node Information</source>
+        <translation>Node Information</translation>
+    </message>
+    <message>
+        <source>&amp;NullSend</source>
+        <translation>&amp;NullSend</translation>
+    </message>
+    <message>
+        <source>Staking &amp;Inputs</source>
+        <translation>Staking &amp;Inputs</translation>
+    </message>
+    <message>
+        <source>&amp;Collateral Nodes</source>
+        <translation>&amp;Collateral Nodes</translation>
+    </message>
+    <message>
+        <source>&amp;Peers</source>
+        <translation>&amp;Peers</translation>
     </message>
 </context>
 <context>

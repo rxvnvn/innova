@@ -64,7 +64,6 @@
 #include <QDragEnterEvent>
 #include <QUrl>
 #include <QStyle>
-#include <QStyleFactory>
 #include <QSizePolicy>
 #include <QScreen>
 #include <QTextDocument>
@@ -81,9 +80,6 @@ extern CWallet* pwalletMain;
 extern int64_t nLastCoinStakeSearchInterval;
 double GetPoSKernelPS();
 
-#define VERTICAL_TOOBAR_STYLESHEET "QToolBar { background: #f7f8fa; border-right: 1px solid #d8dde3; spacing: 4px; padding: 6px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 8px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolButton:checked { background: #e2edf8; border-color: #aebed0; }"
-#define HORIZONTAL_TOOLBAR_STYLESHEET "QToolBar { background: #f7f8fa; border-bottom: 1px solid #d8dde3; spacing: 4px; padding: 5px 8px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 10px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolButton:checked { background: #e2edf8; border-color: #aebed0; }"
-#define SECONDARY_TOOLBAR_STYLESHEET "QToolBar { background: #f6f7f9; border-top: 1px solid #d8dde3; spacing: 8px; padding: 6px 12px; } QToolButton { color: #202124; background: transparent; border: 1px solid transparent; border-radius: 4px; padding: 5px 10px; } QToolButton:hover { background: #eef2f6; border-color: #d5dbe3; } QToolBar::separator { background: #cfd6df; width: 1px; height: 20px; margin: 5px 10px; }"
 
 namespace {
 enum ToolbarGlyph
@@ -270,7 +266,6 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     QApplication::setAttribute(Qt::AA_DontShowIconsInMenus);
 #endif
 
-    QApplication::setStyle(QStyleFactory::create("Fusion"));
 
     // Accept D&D of URIs
     setAcceptDrops(true);
@@ -422,7 +417,7 @@ void BitcoinGUI::createActions()
 	overviewAction->setStatusTip(tr("Wallet Overview"));
     tabGroup->addAction(overviewAction);
 
-    idagAction = new QAction(MakeToolbarIcon(GlyphBlock), tr("&IDAG"), this);
+    idagAction = new QAction(MakeToolbarIcon(GlyphBlock), tr("IDA&G"), this);
     idagAction->setToolTip(tr("View IDAG consensus status"));
     idagAction->setCheckable(true);
     idagAction->setStatusTip(tr("IDAG Consensus Status"));
@@ -435,14 +430,14 @@ void BitcoinGUI::createActions()
     nullsendAction->setStatusTip(tr("NullSend Mixing"));
     tabGroup->addAction(nullsendAction);
 
-    sendCoinsAction = new QAction(MakeToolbarIcon(GlyphSend), tr("&Send coins"), this);
-    sendCoinsAction->setToolTip(tr("Send coins to a Innova address"));
+    sendCoinsAction = new QAction(MakeToolbarIcon(GlyphSend), tr("&Send"), this);
+    sendCoinsAction->setToolTip(tr("Send coins to an Innova address"));
     sendCoinsAction->setCheckable(true);
 	sendCoinsAction->setStatusTip(tr("Send Innova"));
     sendCoinsAction->setShortcut(QKeySequence(Qt::ALT + Qt::Key_2));
     tabGroup->addAction(sendCoinsAction);
 
-    receiveCoinsAction = new QAction(MakeToolbarIcon(GlyphReceive), tr("&Receive coins"), this);
+    receiveCoinsAction = new QAction(MakeToolbarIcon(GlyphReceive), tr("&Receive"), this);
     receiveCoinsAction->setToolTip(tr("Show the list of addresses for receiving payments"));
     receiveCoinsAction->setCheckable(true);
 	receiveCoinsAction->setStatusTip(tr("Receive Innova"));
@@ -476,7 +471,7 @@ void BitcoinGUI::createActions()
 	collateralnodeManagerAction->setStatusTip(tr("Collateral Nodes"));
     tabGroup->addAction(collateralnodeManagerAction);
 
-    stakingAction = new QAction(MakeToolbarIcon(GlyphStake), tr("S&taking"), this);
+    stakingAction = new QAction(MakeToolbarIcon(GlyphStake), tr("Sta&king"), this);
     stakingAction->setToolTip(tr("Manage staking mode, cold staking, and privacy staking"));
     stakingAction->setCheckable(true);
     stakingAction->setStatusTip(tr("Staking Control Panel"));
@@ -487,7 +482,7 @@ void BitcoinGUI::createActions()
     privacyAction->setCheckable(true);
     privacyAction->setVisible(false); // Hidden — not needed as separate page
 
-	multisigAction = new QAction(QIcon(":/icons/multi"), tr("Multisig"), this);
+	multisigAction = new QAction(QIcon(":/icons/multi"), tr("M&ultisig"), this);
     tabGroup->addAction(multisigAction);
 	multisigAction->setStatusTip(tr("Multisig Interface"));
 
@@ -554,15 +549,15 @@ void BitcoinGUI::createActions()
     openRPCConsoleAction->setToolTip(tr("Open debugging and diagnostic console"));
 	openRPCConsoleAction->setStatusTip(tr("Show Debug Console"));
 
-	openInfoAction = new QAction(QApplication::style()->standardIcon(QStyle::SP_MessageBoxInformation), tr("&Information"), this);
+	openInfoAction = new QAction(QApplication::style()->standardIcon(QStyle::SP_MessageBoxInformation), tr("Node Information"), this);
     openInfoAction->setStatusTip(tr("Show diagnostic information"));
-    openGraphAction = new QAction(QIcon(":/icons/connect_4"), tr("&Network Monitor"), this);
+    openGraphAction = new QAction(QIcon(":/icons/connect_4"), tr("Network &Monitor"), this);
     openGraphAction->setStatusTip(tr("Show Network Monitor"));
     openPeerAction = new QAction(QIcon(":/icons/connect_4"), tr("&Peers"), this);
     openPeerAction->setStatusTip(tr("Show Innova network peers"));
-    openConfEditorAction = new QAction(QIcon(":/icons/edit"), tr("Open Wallet &Configuration File"), this);
+    openConfEditorAction = new QAction(QIcon(":/icons/edit"), tr("Open &Wallet Configuration File"), this);
     openConfEditorAction->setStatusTip(tr("Open configuration file"));
-    openMNConfEditorAction = new QAction(QIcon(":/icons/edit"), tr("Open &Collateralnode Configuration File"), this);
+    openMNConfEditorAction = new QAction(QIcon(":/icons/edit"), tr("Open Collateralnode Configuration &File"), this);
     openMNConfEditorAction->setStatusTip(tr("Open Collateralnode configuration file"));
 
     connect(quitAction, SIGNAL(triggered()), qApp, SLOT(quit()));
@@ -602,8 +597,9 @@ void BitcoinGUI::createMenuBar()
 
     // Configure the menus
     QMenu *file = appMenuBar->addMenu(tr("&File"));
+    file->addAction(backupWalletAction);
     file->addAction(exportAction);
-	file->addAction(multisigAction);
+    file->addSeparator();
     file->addAction(signMessageAction);
     file->addAction(verifyMessageAction);
     file->addSeparator();
@@ -611,21 +607,34 @@ void BitcoinGUI::createMenuBar()
 
     QMenu *settings = appMenuBar->addMenu(tr("&Settings"));
     settings->addAction(encryptWalletAction);
-    settings->addAction(backupWalletAction);
     settings->addAction(changePassphraseAction);
     settings->addAction(unlockWalletAction);
     settings->addAction(lockWalletAction);
     settings->addSeparator();
+    settings->addAction(openConfEditorAction);
+    settings->addAction(openMNConfEditorAction);
+    settings->addSeparator();
     settings->addAction(optionsAction);
 
-  	QMenu *tools = appMenuBar->addMenu(tr("&Tools"));
-  	tools->addAction(openInfoAction);
-  	tools->addAction(openRPCConsoleAction);
-  	tools->addAction(openGraphAction);
-    tools->addAction(openPeerAction);
-  	tools->addSeparator();
-  	tools->addAction(openConfEditorAction);
-    tools->addAction(openMNConfEditorAction);
+    QMenu *window = appMenuBar->addMenu(tr("&Window"));
+    window->addAction(overviewAction);
+    window->addAction(sendCoinsAction);
+    window->addAction(receiveCoinsAction);
+    window->addAction(historyAction);
+    window->addSeparator();
+    window->addAction(addressBookAction);
+    window->addAction(stakingAction);
+    window->addAction(mintingAction);
+    window->addAction(collateralnodeManagerAction);
+    window->addAction(idagAction);
+    window->addAction(nullsendAction);
+    window->addAction(multisigAction);
+    window->addSeparator();
+    window->addAction(openInfoAction);
+    window->addAction(openRPCConsoleAction);
+    window->addAction(openGraphAction);
+    window->addAction(openPeerAction);
+
     QMenu *help = appMenuBar->addMenu(tr("&Help"));
     help->addAction(aboutAction);
     help->addAction(aboutQtAction);
@@ -633,60 +642,18 @@ void BitcoinGUI::createMenuBar()
 
 void BitcoinGUI::createToolBars()
 {
-
-    mainIcon = new QLabel (this);
-    mainIcon->setPixmap(QPixmap(":images/vertical"));
-    mainIcon->show();
-
     mainToolbar = addToolBar(tr("Tabs toolbar"));
     mainToolbar->setObjectName("mainToolbar");
     mainToolbar->setMovable(false);
     mainToolbar->setFloatable(false);
     mainToolbar->setIconSize(QSize(24, 24));
-    mainToolbar->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-    mainToolbar->setStyleSheet(HORIZONTAL_TOOLBAR_STYLESHEET);
-    mainToolbar->addWidget(mainIcon);
+    mainToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
 
     mainToolbar->addAction(overviewAction);
     mainToolbar->addAction(sendCoinsAction);
     mainToolbar->addAction(receiveCoinsAction);
     mainToolbar->addAction(historyAction);
-    mainToolbar->addAction(addressBookAction);
-    mainToolbar->addAction(stakingAction);
-    mainToolbar->addAction(mintingAction);
-    mainToolbar->addAction(nullsendAction);
-    mainToolbar->addAction(collateralnodeManagerAction);
-    mainToolbar->addAction(idagAction);
-
-    secondaryToolbar = addToolBar(tr("Actions toolbar"));
-    secondaryToolbar->setObjectName("secondaryToolbar");
-    secondaryToolbar->setMovable(false);
-    secondaryToolbar->setFloatable(false);
-    secondaryToolbar->setIconSize(QSize(22, 22));
-    secondaryToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-    secondaryToolbar->setStyleSheet(SECONDARY_TOOLBAR_STYLESHEET);
-
-    QWidget *secondaryLeftSpacer = new QWidget(secondaryToolbar);
-    secondaryLeftSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    secondaryToolbar->addWidget(secondaryLeftSpacer);
-
-    secondaryToolbar->addAction(exportAction);
-    secondaryToolbar->addSeparator();
-    secondaryToolbar->addAction(encryptWalletAction);
-    secondaryToolbar->addAction(changePassphraseAction);
-
-    QWidget *secondaryRightSpacer = new QWidget(secondaryToolbar);
-    secondaryRightSpacer->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
-    secondaryToolbar->addWidget(secondaryRightSpacer);
-
-    removeToolBar(secondaryToolbar);
-    addToolBar(Qt::BottomToolBarArea, secondaryToolbar);
-    secondaryToolbar->show();
-
-    connect(mainToolbar,      SIGNAL(orientationChanged(Qt::Orientation)), this, SLOT(mainToolbarOrientation(Qt::Orientation)));
-    connect(secondaryToolbar, SIGNAL(orientationChanged(Qt::Orientation)), this, SLOT(secondaryToolbarOrientation(Qt::Orientation)));
-    mainToolbarOrientation(mainToolbar->orientation());
-    secondaryToolbarOrientation(secondaryToolbar->orientation());
+    overviewAction->setChecked(true);
 }
 
 void BitcoinGUI::setClientModel(ClientModel *clientModel)
@@ -1337,34 +1304,6 @@ void BitcoinGUI::handleURI(QString strURI)
 }
 
 
-void BitcoinGUI::mainToolbarOrientation(Qt::Orientation orientation)
-{
-
-
-    if(orientation == Qt::Horizontal)
-    {
-        mainIcon->setPixmap(QPixmap(":images/horizontal"));
-        mainIcon->setAlignment(Qt::AlignLeft);
-        mainIcon->show();
-        mainToolbar->setIconSize(QSize(24, 24));
-        mainToolbar->setToolButtonStyle(Qt::ToolButtonTextUnderIcon);
-        mainToolbar->setStyleSheet(HORIZONTAL_TOOLBAR_STYLESHEET);
-    }
-    else
-    {
-        mainIcon->setPixmap(QPixmap(":images/vertical"));
-        mainIcon->setAlignment(Qt::AlignCenter);
-        mainIcon->show();
-        mainToolbar->setIconSize(QSize(22, 22));
-        mainToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
-        mainToolbar->setStyleSheet(VERTICAL_TOOBAR_STYLESHEET);
-    }
-}
-
-void BitcoinGUI::secondaryToolbarOrientation(Qt::Orientation orientation)
-{
-    secondaryToolbar->setStyleSheet(SECONDARY_TOOLBAR_STYLESHEET);
-}
 
 void BitcoinGUI::setEncryptionStatus(int status)
 {

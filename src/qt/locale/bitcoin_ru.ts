@@ -353,8 +353,8 @@ This product includes software developed by the OpenSSL Project for use in the O
     </message>
     <message>
         <location line="-13"/>
-        <source>&amp;Receive coins</source>
-        <translation>&amp;Получение монет</translation>
+        <source>&amp;Receive</source>
+        <translation>По&amp;лучить</translation>
     </message>
     <message>
         <location line="+1"/>
@@ -363,8 +363,8 @@ This product includes software developed by the OpenSSL Project for use in the O
     </message>
     <message>
         <location line="-7"/>
-        <source>&amp;Send coins</source>
-        <translation>Отп&amp;равка монет</translation>
+        <source>&amp;Send</source>
+        <translation>Отп&amp;равить</translation>
     </message>
     <message>
         <source>Staking &amp;Inputs</source>
@@ -436,8 +436,8 @@ This product includes software developed by the OpenSSL Project for use in the O
     </message>
     <message>
         <location line="-62"/>
-        <source>Send coins to a ShadowCoin address</source>
-        <translation>Отправить монеты на указанный адрес ShadowCoin</translation>
+        <source>Send coins to an Innova address</source>
+        <translation>Отправить монеты на адрес Innova</translation>
     </message>
     <message>
         <location line="+45"/>
@@ -738,6 +738,50 @@ Address: %4
         <location filename="../bitcoin.cpp" line="+109"/>
         <source>A fatal error occurred. ShadowCoin can no longer continue safely and will quit.</source>
         <translation>Произошла неисправимая ошибка. ShadowCoin не может безопасно продолжать работу и будет закрыт.</translation>
+    </message>
+    <message>
+        <source>IDA&amp;G</source>
+        <translation>IDA&amp;G</translation>
+    </message>
+    <message>
+        <source>Sta&amp;king</source>
+        <translation>Сте&amp;йкинг</translation>
+    </message>
+    <message>
+        <source>M&amp;ultisig</source>
+        <translation>Мультиподпись</translation>
+    </message>
+    <message>
+        <source>Network &amp;Monitor</source>
+        <translation>Монитор &amp;сети</translation>
+    </message>
+    <message>
+        <source>Open &amp;Wallet Configuration File</source>
+        <translation>Открыть файл настроек &amp;кошелька</translation>
+    </message>
+    <message>
+        <source>Open Collateralnode Configuration &amp;File</source>
+        <translation>Открыть &amp;файл настроек Collateralnode</translation>
+    </message>
+    <message>
+        <source>&amp;Window</source>
+        <translation>&amp;Окно</translation>
+    </message>
+    <message>
+        <source>Node Information</source>
+        <translation>Информация об узле</translation>
+    </message>
+    <message>
+        <source>&amp;NullSend</source>
+        <translation>&amp;NullSend</translation>
+    </message>
+    <message>
+        <source>&amp;Collateral Nodes</source>
+        <translation>Коллатеральные &amp;узлы</translation>
+    </message>
+    <message>
+        <source>&amp;Peers</source>
+        <translation>&amp;Пиры</translation>
     </message>
 </context>
 <context>
