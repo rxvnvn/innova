@@ -2698,6 +2698,51 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <source>to</source>
         <translation>до</translation>
     </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>&amp;Search:</source>
+        <translation>&amp;Поиск:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>&amp;Date:</source>
+        <translation>&amp;Дата:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>&amp;Type:</source>
+        <translation>&amp;Тип:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>Min &amp;amount:</source>
+        <translation>Мин. &amp;сумма:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>Selected amount:</source>
+        <translation>Выбранная сумма:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>No transactions yet.</source>
+        <translation>Транзакций пока нет.</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>Transactions matching the current filters will appear here.</source>
+        <translation>Транзакции, соответствующие текущим фильтрам, будут показаны здесь.</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>No transactions match the current filters.</source>
+        <translation>Нет транзакций, соответствующих текущим фильтрам.</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>Try clearing or widening the filters above.</source>
+        <translation>Попробуйте очистить или расширить фильтры выше.</translation>
+    </message>
 </context>
 <context>
     <name>WalletModel</name>

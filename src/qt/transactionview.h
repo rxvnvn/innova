@@ -15,6 +15,8 @@ class QMenu;
 class QLabel;
 class QFrame;
 class QDateTimeEdit;
+class QStackedWidget;
+class QPushButton;
 QT_END_NAMESPACE
 
 /** Widget showing the transaction list for a wallet, including a filter row.
@@ -45,6 +47,17 @@ private:
     TransactionFilterProxy *transactionProxyModel;
     QTableView *transactionView;
     QLabel* transactionSum;
+    QLabel *pageTitle;
+    QLabel *searchLabel;
+    QLabel *dateLabel;
+    QLabel *typeLabel;
+    QLabel *amountLabel;
+    QPushButton *exportButton;
+    QStackedWidget *contentStack;
+    QWidget *tablePage;
+    QWidget *emptyPage;
+    QLabel *emptyStateTitle;
+    QLabel *emptyStateText;
 
     QComboBox *dateWidget;
     QComboBox *typeWidget;
@@ -68,6 +81,7 @@ private slots:
     void copyLabel();
     void copyAmount();
     void copyTxID();
+    void updateEmptyState();
 
 signals:
     void doubleClicked(const QModelIndex&);
@@ -84,4 +98,4 @@ public slots:
 
 };
 
-#endif // TRANSACTIONVIEW_H
+#endif

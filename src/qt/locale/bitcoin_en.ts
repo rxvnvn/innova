@@ -2728,6 +2728,51 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <source>to</source>
         <translation>to</translation>
     </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>&amp;Search:</source>
+        <translation>&amp;Search:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>&amp;Date:</source>
+        <translation>&amp;Date:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>&amp;Type:</source>
+        <translation>&amp;Type:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>Min &amp;amount:</source>
+        <translation>Min &amp;amount:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>Selected amount:</source>
+        <translation>Selected amount:</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>No transactions yet.</source>
+        <translation>No transactions yet.</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>Transactions matching the current filters will appear here.</source>
+        <translation>Transactions matching the current filters will appear here.</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>No transactions match the current filters.</source>
+        <translation>No transactions match the current filters.</translation>
+    </message>
+    <message>
+        <location filename="../transactionview.cpp" line="+0"/>
+        <source>Try clearing or widening the filters above.</source>
+        <translation>Try clearing or widening the filters above.</translation>
+    </message>
 </context>
 <context>
     <name>WalletModel</name>
