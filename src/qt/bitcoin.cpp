@@ -13,6 +13,7 @@
 #include "init.h"
 #include "ui_interface.h"
 #include "qtipcserver.h"
+#include "util.h"
 
 #include <QApplication>
 #include <QMessageBox>
@@ -23,6 +24,9 @@
 #include <QLibraryInfo>
 #include <QEventLoop>
 #include <QThread>
+#include <QPainter>
+#include <QPalette>
+#include <QIcon>
 
 #if defined(BITCOIN_NEED_QT_PLUGINS) && !defined(_BITCOIN_QT_PLUGINS_INCLUDED)
 #define _BITCOIN_QT_PLUGINS_INCLUDED
@@ -38,6 +42,67 @@ Q_IMPORT_PLUGIN(qtaccessiblewidgets)
 // Need a global reference for the notifications to find the GUI
 static BitcoinGUI *guiref;
 static QSplashScreen *splashref;
+static QColor splashMessageColor;
+
+static QPixmap CreateSplashPixmap()
+{
+    const QSize logicalSize(560, 320);
+    const qreal devicePixelRatio = qMax<qreal>(1.0, qApp->devicePixelRatio());
+    const QSize pixelSize(qRound(logicalSize.width() * devicePixelRatio),
+                          qRound(logicalSize.height() * devicePixelRatio));
+
+    QPixmap pixmap(pixelSize);
+    pixmap.setDevicePixelRatio(devicePixelRatio);
+
+    const QPalette palette = qApp->palette();
+    const QColor backgroundColor = palette.color(QPalette::Window);
+    const QColor textColor = palette.color(QPalette::WindowText);
+    QColor secondaryTextColor = textColor;
+    secondaryTextColor.setAlpha(170);
+    const QColor borderColor = palette.color(QPalette::Mid);
+    splashMessageColor = textColor;
+
+    pixmap.fill(backgroundColor);
+    QPainter painter(&pixmap);
+    painter.setRenderHint(QPainter::Antialiasing, true);
+    painter.setRenderHint(QPainter::SmoothPixmapTransform, true);
+
+    painter.setPen(borderColor);
+    painter.drawRect(QRect(QPoint(0, 0), logicalSize).adjusted(0, 0, -1, -1));
+
+    QPixmap logo = QIcon(":/icons/innova").pixmap(
+        QSize(qRound(128 * devicePixelRatio), qRound(128 * devicePixelRatio)));
+    logo.setDevicePixelRatio(devicePixelRatio);
+    painter.drawPixmap(QPoint(40, 56), logo);
+
+    QFont titleFont = qApp->font();
+    titleFont.setWeight(QFont::DemiBold);
+    if(titleFont.pointSizeF() > 0)
+        titleFont.setPointSizeF(titleFont.pointSizeF() + 10);
+    painter.setFont(titleFont);
+    painter.setPen(textColor);
+    painter.drawText(QRect(196, 62, 324, 52), Qt::AlignLeft | Qt::AlignVCenter, "Innova");
+
+    QFont detailFont = qApp->font();
+    if(detailFont.pointSizeF() > 0)
+        detailFont.setPointSizeF(detailFont.pointSizeF() + 1);
+    painter.setFont(detailFont);
+    painter.setPen(textColor);
+    painter.drawText(QRect(198, 112, 320, 30), Qt::AlignLeft | Qt::AlignVCenter,
+                     QCoreApplication::translate("SplashScreen", "Version %1")
+                         .arg(QString::fromStdString(FormatFullVersion())));
+
+    painter.setFont(qApp->font());
+    painter.setPen(secondaryTextColor);
+    painter.drawText(QRect(198, 144, 320, 42), Qt::AlignLeft | Qt::AlignTop | Qt::TextWordWrap,
+                     QChar(0x00A9) + QString(" ") +
+                     QCoreApplication::translate("SplashScreen",
+                         "2019-2026 The Innova developers"));
+
+    painter.setPen(borderColor);
+    painter.drawLine(32, 244, logicalSize.width() - 32, 244);
+    return pixmap;
+}
 
 static void ThreadSafeMessageBox(const std::string& message, const std::string& caption, int style)
 {
@@ -90,7 +155,7 @@ static void InitMessage(const std::string &message)
         QMetaObject::invokeMethod(splashref, "showMessage", Qt::QueuedConnection,
                                   Q_ARG(QString, QString::fromStdString(message)),
                                   Q_ARG(int, Qt::AlignBottom|Qt::AlignHCenter),
-                                  Q_ARG(QColor, QColor(255,255,255)));
+                                  Q_ARG(QColor, splashMessageColor));
     }
 }
 
@@ -206,10 +271,12 @@ int main(int argc, char *argv[])
     }
 
     // show a persistent splash screen unless it is disabled from flags
-    QSplashScreen splash(QPixmap(":/images/splash"), 0);
+    QSplashScreen splash(CreateSplashPixmap(), 0);
     if (GetBoolArg("-splash", true) && !GetBoolArg("-min"))
     {
         splash.setEnabled(false);
+        splash.showMessage(QCoreApplication::translate("SplashScreen", "Starting Innova..."),
+                           Qt::AlignBottom | Qt::AlignHCenter, splashMessageColor);
         splash.show();
         splashref = &splash;
     }
@@ -294,7 +361,7 @@ int main(int argc, char *argv[])
             }
 
             // Show a persistent splash screen while shutting down
-            QSplashScreen splash(QPixmap(":/images/splash"), 0);
+            QSplashScreen splash(CreateSplashPixmap(), 0);
             splash.setEnabled(false);
             splash.show();
             splashref = &splash;

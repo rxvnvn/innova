@@ -16,6 +16,7 @@
 #include <QDateTimeEdit>
 #include <QDoubleValidator>
 #include <QFont>
+#include <QFontMetrics>
 #include <QFrame>
 #include <QGridLayout>
 #include <QHBoxLayout>
@@ -25,19 +26,71 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
+#include <QPainter>
+#include <QPaintEvent>
+#include <QPalette>
 #include <QPoint>
 #include <QPushButton>
 #include <QScrollBar>
-#include <QStackedWidget>
 #include <QTableView>
 #include <QVBoxLayout>
+
+namespace {
+class TransactionTableView : public QTableView
+{
+public:
+    explicit TransactionTableView(QWidget *parent = 0) : QTableView(parent) {}
+
+    void setEmptyState(const QString& title, const QString& text)
+    {
+        emptyTitle = title;
+        emptyText = text;
+        viewport()->update();
+    }
+
+protected:
+    void paintEvent(QPaintEvent *event)
+    {
+        QTableView::paintEvent(event);
+        if (emptyTitle.isEmpty() || (model() && model()->rowCount() > 0))
+            return;
+
+        const QRect area = viewport()->rect().adjusted(24, 24, -24, -24);
+        if (!area.isValid())
+            return;
+
+        QPainter painter(viewport());
+        QFont titleFont = font();
+        titleFont.setBold(true);
+        QFontMetrics titleMetrics(titleFont);
+        QFontMetrics bodyMetrics(font());
+        const int spacing = 6;
+        const int bodyHeight = bodyMetrics.height() * 2;
+        const int top = area.center().y() - (titleMetrics.height() + spacing + bodyHeight) / 2;
+
+        painter.setFont(titleFont);
+        painter.setPen(palette().color(QPalette::Text));
+        painter.drawText(QRect(area.left(), top, area.width(), titleMetrics.height()),
+                         Qt::AlignHCenter | Qt::AlignVCenter, emptyTitle);
+
+        painter.setFont(font());
+        painter.setPen(palette().color(QPalette::Mid));
+        painter.drawText(QRect(area.left(), top + titleMetrics.height() + spacing, area.width(), bodyHeight),
+                         Qt::AlignHCenter | Qt::AlignTop | Qt::TextWordWrap, emptyText);
+    }
+
+private:
+    QString emptyTitle;
+    QString emptyText;
+};
+}
 
 TransactionView::TransactionView(QWidget *parent) :
     QWidget(parent), model(0), transactionProxyModel(0),
     transactionView(0), transactionSum(0), pageTitle(0),
     searchLabel(0), dateLabel(0), typeLabel(0), amountLabel(0),
-    exportButton(0), contentStack(0), tablePage(0), emptyPage(0),
-    emptyStateTitle(0), emptyStateText(0), dateWidget(0), typeWidget(0),
+    exportButton(0),
+    dateWidget(0), typeWidget(0),
     addressWidget(0), amountWidget(0), contextMenu(0), dateRangeWidget(0),
     dateFrom(0), dateTo(0)
 {
@@ -53,9 +106,6 @@ TransactionView::TransactionView(QWidget *parent) :
     pageTitle = new QLabel(pageTitleText, this);
     QFont titleFont = pageTitle->font();
     titleFont.setBold(true);
-    if (titleFont.pointSize() > 0) {
-        titleFont.setPointSize(titleFont.pointSize() + 1);
-    }
     pageTitle->setFont(titleFont);
     mainLayout->addWidget(pageTitle);
 
@@ -143,15 +193,7 @@ TransactionView::TransactionView(QWidget *parent) :
 
     mainLayout->addWidget(createDateRangeWidget());
 
-    contentStack = new QStackedWidget(this);
-    contentStack->setContentsMargins(0, 0, 0, 0);
-
-    tablePage = new QWidget(contentStack);
-    QVBoxLayout *tableLayout = new QVBoxLayout(tablePage);
-    tableLayout->setContentsMargins(0, 0, 0, 0);
-    tableLayout->setSpacing(0);
-
-    QTableView *view = new QTableView(tablePage);
+    TransactionTableView *view = new TransactionTableView(this);
     view->setObjectName("transactionView");
     view->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOn);
     view->setTabKeyNavigation(false);
@@ -165,33 +207,7 @@ TransactionView::TransactionView(QWidget *parent) :
     view->setShowGrid(false);
     view->verticalHeader()->hide();
     transactionView = view;
-    tableLayout->addWidget(transactionView);
-
-    emptyPage = new QWidget(contentStack);
-    QVBoxLayout *emptyLayout = new QVBoxLayout(emptyPage);
-    emptyLayout->setContentsMargins(0, 18, 0, 18);
-    emptyLayout->setSpacing(6);
-    emptyLayout->addStretch();
-
-    emptyStateTitle = new QLabel(tr("No transactions yet."), emptyPage);
-    QFont emptyTitleFont = emptyStateTitle->font();
-    emptyTitleFont.setBold(true);
-    if (emptyTitleFont.pointSize() > 0) {
-        emptyTitleFont.setPointSize(emptyTitleFont.pointSize() + 1);
-    }
-    emptyStateTitle->setFont(emptyTitleFont);
-    emptyStateTitle->setAlignment(Qt::AlignHCenter | Qt::AlignVCenter);
-    emptyLayout->addWidget(emptyStateTitle);
-
-    emptyStateText = new QLabel(tr("Transactions matching the current filters will appear here."), emptyPage);
-    emptyStateText->setWordWrap(true);
-    emptyStateText->setAlignment(Qt::AlignHCenter | Qt::AlignVCenter);
-    emptyLayout->addWidget(emptyStateText);
-    emptyLayout->addStretch();
-
-    contentStack->addWidget(tablePage);
-    contentStack->addWidget(emptyPage);
-    mainLayout->addWidget(contentStack, 1);
+    mainLayout->addWidget(transactionView, 1);
 
     QFrame *summaryFrame = new QFrame(this);
     summaryFrame->setFrameShape(QFrame::NoFrame);
@@ -568,7 +584,6 @@ void TransactionView::focusTransaction(const QModelIndex &idx)
 {
     if(!transactionProxyModel)
         return;
-    contentStack->setCurrentWidget(tablePage);
     QModelIndex targetIdx = transactionProxyModel->mapFromSource(idx);
     transactionView->scrollTo(targetIdx);
     transactionView->setCurrentIndex(targetIdx);
@@ -577,42 +592,42 @@ void TransactionView::focusTransaction(const QModelIndex &idx)
 
 void TransactionView::updateEmptyState()
 {
-    if(!contentStack || !tablePage || !emptyPage)
+    if (!transactionView)
         return;
 
-    if(!transactionProxyModel)
+    TransactionTableView *view = static_cast<TransactionTableView *>(transactionView);
+
+    if (!transactionProxyModel)
     {
-        contentStack->setCurrentWidget(emptyPage);
-        emptyStateTitle->setText(tr("No transactions yet."));
-        emptyStateText->setText(tr("Transactions matching the current filters will appear here."));
+        view->setEmptyState(tr("No transactions yet."),
+                            tr("Transactions matching the current filters will appear here."));
         trxAmount(QString());
         return;
     }
 
-    bool filtersActive = (dateWidget && dateWidget->currentData().toInt() != All) ||
-                         (typeWidget && typeWidget->currentData().toInt() != TransactionFilterProxy::ALL_TYPES) ||
-                         (addressWidget && !addressWidget->text().isEmpty()) ||
-                         (amountWidget && !amountWidget->text().isEmpty());
+    const bool filtersActive = (dateWidget && dateWidget->currentData().toInt() != All) ||
+                               (typeWidget && typeWidget->currentData().toInt() != TransactionFilterProxy::ALL_TYPES) ||
+                               (addressWidget && !addressWidget->text().isEmpty()) ||
+                               (amountWidget && !amountWidget->text().isEmpty());
 
-    if(transactionProxyModel->rowCount() == 0)
+    if (transactionProxyModel->rowCount() == 0)
     {
-        contentStack->setCurrentWidget(emptyPage);
         if (filtersActive)
         {
-            emptyStateTitle->setText(tr("No transactions match the current filters."));
-            emptyStateText->setText(tr("Try clearing or widening the filters above."));
+            view->setEmptyState(tr("No transactions match the current filters."),
+                                tr("Try clearing or widening the filters above."));
         }
         else
         {
-            emptyStateTitle->setText(tr("No transactions yet."));
-            emptyStateText->setText(tr("Transactions matching the current filters will appear here."));
+            view->setEmptyState(tr("No transactions yet."),
+                                tr("Transactions matching the current filters will appear here."));
         }
-        if (transactionView && transactionView->selectionModel())
+        if (transactionView->selectionModel())
             transactionView->selectionModel()->clearSelection();
         trxAmount(QString());
     }
     else
     {
-        contentStack->setCurrentWidget(tablePage);
+        view->setEmptyState(QString(), QString());
     }
 }

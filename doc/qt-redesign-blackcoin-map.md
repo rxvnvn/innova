@@ -96,6 +96,7 @@ The following Blackcoin More pieces were intentionally not transferred:
 ### Proposed third stage
 
 Modernize `SendCoinsDialog` only: audit Innova send, coin-control, privacy/shielded tabs and unlock flow, then improve spacing, labels, validation presentation and button layout while preserving Innova's existing transaction creation, staking, wallet unlock, address validation and fee logic.
+
 ## Stage 3: SendCoinsDialog
 
 | Blackcoin class / area | Innova class / area | Purpose | Safe to transfer | Innova-specific elements kept | Blackcoin dependencies rejected | Risks / constraints |
@@ -145,7 +146,7 @@ The next stage should focus on `ReceiveCoinsDialog` and its related entry widget
 ### Transactions flow audit notes
 
 - Innova opens the history page through `BitcoinGUI::gotoHistoryPage()`, which switches the stacked widget to `TransactionView`.
-- The visible table is backed by the existing `TransactionTableModel` and filtered by `TransactionFilterProxy`.
+- The visible table is backed by the existing `TransactionTableModel` and filtered by `TransactionFilterProxy`. Its headers and viewport remain visible when the proxy has no rows; the empty-state text is presentation-only and does not replace the model.
 - The model currently exposes the columns `Status`, `Date`, `Type`, `Address`, `Narration`, and `Amount`, with roles for type, date, long description, address, label, amount, txid, confirmation state, formatted amount, and status.
 - Current transaction types in the UI are the existing Innova/Bitcoin-derived set: `Generated`, `RecvWithAddress`, `RecvFromOther`, `SendToAddress`, `SendToOther`, `SendToSelf`, and `Other`.
 - The current filter surface is date, type, address/label search, and minimum amount; there is no separate watch-only filter in this Innova page.
@@ -177,3 +178,43 @@ The next stage should focus on `ReceiveCoinsDialog` and its related entry widget
 - Safe to transfer: tab titles, splitter-based layout, column sizing, group spacing, console font presentation, and neutral window chrome.
 - Not safe to transfer: node backend abstractions, `interfaces::Node`, richer peer state roles, peer management actions, ban controls, or any traffic/connection accounting logic.
 - The next step after this stage should remain outside the debug window and move to the remaining wallet pages only if the current wallet/backend audit permits it.
+
+
+## Main window geometry and splash screen
+
+| Reference area | Innova implementation | Safe presentation adaptation | Preserved behavior | Rejected dependencies |
+| --- | --- | --- | --- | --- |
+| Blackcoin More `BitcoinGUI` geometry | `BitcoinGUI::BitcoinGUI`, `BitcoinGUI::~BitcoinGUI` | Restore `MainWindowGeometry`; otherwise use a centered, screen-bounded `1280 x 800` default and a target minimum of `1024 x 640` | Existing application identity, page ownership, tray behavior, models, and close semantics | Blackcoin `interfaces::Node`, `WalletFrame`, `WalletController`, and multiwallet startup |
+| Blackcoin More primary toolbar | `BitcoinGUI::createToolBars` | Keep the four existing navigation actions and reduce icon size, margins, and spacing | Existing `QAction` objects, shortcuts, signals, slots, and Window-menu access to other pages | Wallet selector, multiwallet controls, branded styling, and global QSS |
+| Blackcoin More typography density | `OverviewPage` local presentation | Use the system font with `DemiBold` only for the two Overview section headings, and normal weight for every balance value and sync warning | Existing balance labels, values, update signals, and warning visibility logic | Global font overrides, bundled fonts, fixed application-wide point sizes, and model changes |
+| Innova balance-grid alignment | `OverviewPage` / `overviewpage.ui` | Remove the unused third value column so available, staking, shielded, pending, immature, locked, and watch-only amounts share one right edge | Existing balance sources, visibility conditions, and staking updates | Any staking calculation or model change |
+| Innova status indicators | `BitcoinGUI` status labels | Tint the existing alpha masks with `QPalette::WindowText` or `QPalette::Highlight` so icons remain legible on light and dark native themes | Existing connection, Tor, sync, encryption, staking, and collateral-node state logic and tooltips | New states, polling, counters, or status backend changes |
+| Innova Transactions empty state | `TransactionView` local table subclass | Keep headers and the real `QTableView` visible while painting the existing empty-state text in its viewport | Existing `TransactionTableModel`, proxy filters, selections, columns, export, and context actions | New model roles, placeholder rows, or transaction backend changes |
+| Historical Innova secondary toolbar | Removed in stage 1 from `BitcoinGUI::createToolBars` | Confirm that the persistent bottom action strip remains absent | `exportAction`, `encryptWalletAction`, and `changePassphraseAction` remain live and model-driven | Reintroducing a duplicate global wallet-action bar |
+| Blackcoin More `SplashScreen` presentation | Innova splash creation and init callback in `src/qt/bitcoin.cpp` | Compose a compact `560 x 320` HiDPI pixmap from the existing Innova logo, system palette, client version, copyright, and current startup message | Existing `uiInterface.InitMessage` subscription, startup ordering, finish wait, shutdown message, and `-splash` / `-min` behavior | Blackcoin branding, `interfaces::Node`, wallet handlers, shutdown controls, and startup backend |
+| Blackcoin splash dimensions and hierarchy | Innova `bitcoin.qrc` and existing `:/icons/innova` resource | Remove the photographic `488 x 559` splash PNG and its resource entry | Existing Innova logo resource and resource build flow | Blackcoin logo, gold palette, external assets, fonts, and advertising URLs |
+
+### Typography audit
+
+- Blackcoin More does not set a custom global UI family; ordinary widgets inherit `QApplication::font()` from the desktop theme. Innova now follows the same system-font behavior.
+- Blackcoin More separately bundles `RobotoMono-Bold.ttf` and applies `Roboto Mono Bold` to Overview balance values through an option. That font resource and option are intentionally not transferred because Innova balance values are required to remain in the standard system font and this stage must not add bundled fonts or settings.
+- Only the two Overview section headings use the relative `QFont::DemiBold` weight; all balance values and sync warnings retain normal system size and weight.
+
+### Geometry audit
+
+- Before this stage, Innova always calculated a fresh size as 75 percent of screen width capped at 1200 and 80 percent of screen height capped at 900, with an `850 x 600` minimum. No `saveGeometry` or `restoreGeometry` path existed.
+- The new path reads `QSettings::MainWindowGeometry`. A valid saved value is restored and bypasses the centered default; the normal Qt minimum-size constraint still applies. Qt `restoreGeometry` retains the existing protection against off-screen restored windows.
+- The default is `1280 x 800`, bounded to the current primary screen available geometry with a small margin. The target minimum is `1024 x 640` and is itself bounded for screens smaller than that target.
+
+### Wallet action and menu audit
+
+- The old lower strip was the `secondaryToolbar` in pre-stage-1 `BitcoinGUI::createToolBars`, containing Export, Encrypt Wallet, and Change Passphrase. Stage 1 removed that toolbar while retaining the actions.
+- Export remains in File and is rebound by existing page-navigation slots to Transactions, Address Book, receiving addresses, or staking-input export where supported. Transactions also keeps its page-local Export button.
+- Encrypt Wallet and Change Passphrase remain in Settings and continue to receive their existing enabled/checked state updates from `setEncryptionStatus`.
+- The source top-level menu is `&Window`; EN maps it to Window and RU maps it to `&Окно`. No Tools menu or duplicate backend action is introduced.
+
+### Splash transfer boundary
+
+- The splash now uses application/system fonts and palette colors, the existing Innova icon, and `FormatFullVersion()`. No new image or font file is added.
+- Startup and shutdown messages still arrive through the existing callback. Only alignment, color, reserved message space, and static identity text are changed.
+- No startup stage, wallet loading, block loading, synchronization, shutdown, RPC, P2P, consensus, or model code is transferred from Blackcoin More.

@@ -151,14 +151,14 @@ OverviewPage::OverviewPage(QWidget *parent) :
     ui->line_2->hide();
     ui->line_3->hide();
 
-    ui->gridLayout_3->setContentsMargins(18, 18, 18, 18);
-    ui->gridLayout_3->setHorizontalSpacing(24);
+    ui->gridLayout_3->setContentsMargins(14, 14, 14, 14);
+    ui->gridLayout_3->setHorizontalSpacing(18);
     ui->gridLayout_2->setContentsMargins(0, 0, 0, 0);
-    ui->gridLayout_2->setVerticalSpacing(10);
+    ui->gridLayout_2->setVerticalSpacing(8);
     ui->gridLayout_4->setContentsMargins(0, 0, 0, 0);
-    ui->gridLayout_4->setVerticalSpacing(10);
-    ui->gridLayout->setHorizontalSpacing(24);
-    ui->gridLayout->setVerticalSpacing(7);
+    ui->gridLayout_4->setVerticalSpacing(8);
+    ui->gridLayout->setHorizontalSpacing(18);
+    ui->gridLayout->setVerticalSpacing(5);
     ui->gridLayout->setColumnMinimumWidth(0, 150);
     ui->frame->setMinimumWidth(0);
     ui->frame_2->setMinimumWidth(0);
@@ -166,40 +166,28 @@ OverviewPage::OverviewPage(QWidget *parent) :
     ui->gridLayout_3->setColumnStretch(1, 1);
 
     QFont headingFont = font();
-    headingFont.setBold(true);
-    if(headingFont.pointSize() > 0)
-        headingFont.setPointSize(headingFont.pointSize() + 1);
+    headingFont.setWeight(QFont::DemiBold);
     ui->label_5->setFont(headingFont);
     ui->label_4->setFont(headingFont);
 
-    QFont primaryBalanceFont = ui->labelBalance->font();
-    primaryBalanceFont.setBold(true);
-    if(primaryBalanceFont.pointSize() > 0)
-        primaryBalanceFont.setPointSize(primaryBalanceFont.pointSize() + 8);
-    ui->labelBalance->setFont(primaryBalanceFont);
-
-    QFont totalFont = ui->labelTotal->font();
-    totalFont.setBold(true);
-    if(totalFont.pointSize() > 0)
-        totalFont.setPointSize(totalFont.pointSize() - 6);
-    ui->labelTotal->setFont(totalFont);
-
-    QFont valueFont = font();
-    valueFont.setBold(true);
-    ui->labelLocked->setFont(valueFont);
-    ui->labelStake->setFont(valueFont);
-    ui->labelShielded->setFont(valueFont);
-    ui->labelUnconfirmed->setFont(valueFont);
-    ui->labelImmature->setFont(valueFont);
-    ui->labelWatchAvailable->setFont(valueFont);
-    ui->labelWatchPending->setFont(valueFont);
-    ui->labelWatchImmature->setFont(valueFont);
-    ui->labelWatchTotal->setFont(valueFont);
+    QFont balanceFont = font();
+    ui->labelBalance->setFont(balanceFont);
+    ui->labelTotal->setFont(balanceFont);
+    ui->labelLocked->setFont(balanceFont);
+    ui->labelStake->setFont(balanceFont);
+    ui->labelShielded->setFont(balanceFont);
+    ui->labelUnconfirmed->setFont(balanceFont);
+    ui->labelImmature->setFont(balanceFont);
+    ui->labelWatchAvailable->setFont(balanceFont);
+    ui->labelWatchPending->setFont(balanceFont);
+    ui->labelWatchImmature->setFont(balanceFont);
+    ui->labelWatchTotal->setFont(balanceFont);
 
     QFont warningFont = font();
-    warningFont.setBold(true);
     ui->labelWalletStatus->setFont(warningFont);
     ui->labelTransactionsStatus->setFont(warningFont);
+    ui->labelWalletStatus->setContentsMargins(6, 0, 0, 0);
+    ui->labelTransactionsStatus->setContentsMargins(6, 0, 0, 0);
     ui->labelWalletStatus->setStyleSheet(QString());
     ui->labelTransactionsStatus->setStyleSheet(QString());
 

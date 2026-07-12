@@ -3482,4 +3482,19 @@ If the file does not exist, create it with owner-readable-only file permissions.
 Если файл не существует, создайте его и установите права доступа только для владельца.</translation>
     </message>
 </context>
+<context>
+    <name>SplashScreen</name>
+    <message>
+        <source>Version %1</source>
+        <translation>Версия %1</translation>
+    </message>
+    <message>
+        <source>2019-2026 The Innova developers</source>
+        <translation>2019-2026 Разработчики Innova</translation>
+    </message>
+    <message>
+        <source>Starting Innova...</source>
+        <translation>Запуск Innova...</translation>
+    </message>
+</context>
 </TS>

@@ -3510,4 +3510,19 @@ If the file does not exist, create it with owner-readable-only file permissions.
 If the file does not exist, create it with owner-readable-only file permissions.</translation>
     </message>
 </context>
+<context>
+    <name>SplashScreen</name>
+    <message>
+        <source>Version %1</source>
+        <translation>Version %1</translation>
+    </message>
+    <message>
+        <source>2019-2026 The Innova developers</source>
+        <translation>2019-2026 The Innova developers</translation>
+    </message>
+    <message>
+        <source>Starting Innova...</source>
+        <translation>Starting Innova...</translation>
+    </message>
+</context>
 </TS>

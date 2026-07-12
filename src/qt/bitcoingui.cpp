@@ -66,9 +66,12 @@
 #include <QStyle>
 #include <QSizePolicy>
 #include <QScreen>
+#include <QSettings>
+#include <QLayout>
 #include <QTextDocument>
 #include <QGraphicsScene>
 #include <QPainter>
+#include <QPalette>
 #include <QPolygonF>
 
 #include <iostream>
@@ -82,6 +85,10 @@ double GetPoSKernelPS();
 
 
 namespace {
+const QSize DEFAULT_MAIN_WINDOW_SIZE(1280, 800);
+const QSize MINIMUM_MAIN_WINDOW_SIZE(1024, 640);
+const int MAIN_WINDOW_SCREEN_MARGIN = 32;
+
 enum ToolbarGlyph
 {
     GlyphOverview,
@@ -210,6 +217,19 @@ static QIcon MakeToolbarIcon(ToolbarGlyph glyph)
     icon.addPixmap(MakeToolbarPixmap(glyph, QColor("#9aa3ad"), QColor("#9aa3ad")), QIcon::Disabled, QIcon::Off);
     return icon;
 }
+
+static QPixmap MakeStatusIcon(const QString& resource, const QColor& color)
+{
+    QPixmap source = QIcon(resource).pixmap(STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE);
+    QPixmap result(source.size());
+    result.fill(Qt::transparent);
+
+    QPainter painter(&result);
+    painter.drawPixmap(0, 0, source);
+    painter.setCompositionMode(QPainter::CompositionMode_SourceIn);
+    painter.fillRect(result.rect(), color);
+    return result;
+}
 }
 
 ActiveLabel::ActiveLabel(const QString & text, QWidget * parent):
@@ -239,22 +259,19 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     nBlocksInLastPeriod(0),
     nLastBlocks(0)
 {
-    // Dynamic window sizing: adapt to actual screen dimensions
+    QSettings settings;
+    const QByteArray savedGeometry = settings.value("MainWindowGeometry").toByteArray();
     QScreen *screen = QApplication::primaryScreen();
     QRect screenGeom = screen ? screen->availableGeometry() : QRect(0, 0, 1280, 800);
-    int screenW = screenGeom.width();
-    int screenH = screenGeom.height();
-
-    // Use 75% of screen width (max 1200) and 80% of screen height (max 900)
-    int startW = qMin((int)(screenW * 0.75), 1200);
-    int startH = qMin((int)(screenH * 0.80), 900);
-
-    // Minimum usable size — prevents balance/form compression on small screens
-    setMinimumSize(850, 600);
-    resize(startW, startH);
-
-    // Center on screen
-    move(screenGeom.x() + (screenW - startW) / 2, screenGeom.y() + (screenH - startH) / 2);
+    const QSize effectiveMinimumSize = MINIMUM_MAIN_WINDOW_SIZE.boundedTo(screenGeom.size());
+    setMinimumSize(effectiveMinimumSize);
+    if(savedGeometry.isEmpty() || !restoreGeometry(savedGeometry))
+    {
+        const QSize availableSize = screenGeom.size() - QSize(MAIN_WINDOW_SCREEN_MARGIN, MAIN_WINDOW_SCREEN_MARGIN);
+        const QSize startSize = DEFAULT_MAIN_WINDOW_SIZE.boundedTo(availableSize).expandedTo(effectiveMinimumSize);
+        resize(startSize);
+        move(screenGeom.center() - rect().center());
+    }
 
     setWindowTitle(tr("Innova") + " - " + tr("Wallet"));
 
@@ -399,6 +416,9 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
 
 BitcoinGUI::~BitcoinGUI()
 {
+    QSettings settings;
+    settings.setValue("MainWindowGeometry", saveGeometry());
+
     if(trayIcon) // Hide tray icon, as deleting will let it linger until quit (on Ubuntu)
         trayIcon->hide();
 #ifdef Q_OS_MAC
@@ -646,8 +666,10 @@ void BitcoinGUI::createToolBars()
     mainToolbar->setObjectName("mainToolbar");
     mainToolbar->setMovable(false);
     mainToolbar->setFloatable(false);
-    mainToolbar->setIconSize(QSize(24, 24));
+    mainToolbar->setIconSize(QSize(20, 20));
     mainToolbar->setToolButtonStyle(Qt::ToolButtonTextBesideIcon);
+    mainToolbar->setContentsMargins(4, 1, 4, 1);
+    mainToolbar->layout()->setSpacing(2);
 
     mainToolbar->addAction(overviewAction);
     mainToolbar->addAction(sendCoinsAction);
@@ -812,12 +834,12 @@ void BitcoinGUI::setNumConnections(int count)
     case 7: case 8: case 9: icon = ":/icons/connect_3"; break;
     default: icon = ":/icons/connect_4"; break;
     }
-    labelConnectionsIcon->setPixmap(QIcon(icon).pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
+    labelConnectionsIcon->setPixmap(MakeStatusIcon(icon, statusBar()->palette().color(QPalette::WindowText)));
     labelConnectionsIcon->setToolTip(tr("%n active connection(s) to Innova network", "", count));
 
     if(fNativeTor)
     {
-        labelConnectTypeIcon->setPixmap(QIcon(":/icons/tor").pixmap(STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE));
+        labelConnectTypeIcon->setPixmap(MakeStatusIcon(":/icons/tor", statusBar()->palette().color(QPalette::Highlight)));
 
         string automatic_onion;
         fs::path const hostname_path = GetDefaultDataDir() / "onion" / "hostname";
@@ -831,11 +853,11 @@ void BitcoinGUI::setNumConnections(int count)
         onionauto = tr("Connected via the Tor Network - ") + QString::fromStdString(automatic_onion);
         labelConnectTypeIcon->setToolTip(onionauto);
     } else {
-        labelConnectTypeIcon->setPixmap(QIcon(":/icons/toroff").pixmap(STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE));
+        labelConnectTypeIcon->setPixmap(MakeStatusIcon(":/icons/toroff", statusBar()->palette().color(QPalette::WindowText)));
         labelConnectTypeIcon->setToolTip(tr("Not Connected via the Tor Network, Start Innova with the flag nativetor=1"));
     }
     if (fCNLock == true) {
-        labelCNLockIcon->setPixmap(QIcon(":/icons/cn").pixmap(STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE));
+        labelCNLockIcon->setPixmap(MakeStatusIcon(":/icons/cn", statusBar()->palette().color(QPalette::Highlight)));
     }
 }
 
@@ -915,7 +937,7 @@ void BitcoinGUI::setNumBlocks(int count, int nTotalBlocks)
         tooltip = tr("Catching up...") + QString("<br>") + tooltip;
 
         if (GetTimeMicros() > nLastUpdateTime + 27000) { // 27ms per spinner frame = 1 sec per 'spin'
-            labelBlocksIcon->setPixmap(QIcon(QString(":/movies/res/movies/spinner-%1.png").arg(spinnerFrame, 3, 10, QChar('0'))).pixmap(STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE));
+            labelBlocksIcon->setPixmap(MakeStatusIcon(QString(":/movies/res/movies/spinner-%1.png").arg(spinnerFrame, 3, 10, QChar('0')), statusBar()->palette().color(QPalette::Highlight)));
             spinnerFrame = (spinnerFrame + 1) % 36;
             nLastUpdateTime = GetTimeMicros();
         }
@@ -930,7 +952,7 @@ void BitcoinGUI::setNumBlocks(int count, int nTotalBlocks)
             progressBarLabel->setVisible(false);
 
             tooltip = tr("Up to date") + QString(".<br>") + tooltip;
-            labelBlocksIcon->setPixmap(QIcon(":/icons/synced").pixmap(STATUSBAR_ICONSIZE, STATUSBAR_ICONSIZE));
+            labelBlocksIcon->setPixmap(MakeStatusIcon(":/icons/synced", statusBar()->palette().color(QPalette::Highlight)));
             overviewPage->showOutOfSyncWarning(false);
             progressBar->setVisible(false);
             tooltip = tr("Downloaded %1 blocks of transaction history.").arg(count);
@@ -1325,12 +1347,12 @@ void BitcoinGUI::setEncryptionStatus(int status)
 		if (fWalletUnlockStakingOnly)
         {
 			labelEncryptionIcon->show();
-            labelEncryptionIcon->setPixmap(QIcon(":/icons/lock_staking").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
+            labelEncryptionIcon->setPixmap(MakeStatusIcon(":/icons/lock_staking", statusBar()->palette().color(QPalette::Highlight)));
 			labelEncryptionIcon->setToolTip(tr("Wallet is <b>encrypted</b> and currently <b>unlocked for staking only</b>"));
         } else
         {
 			labelEncryptionIcon->show();
-			labelEncryptionIcon->setPixmap(QIcon(":/icons/lock_open").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
+			labelEncryptionIcon->setPixmap(MakeStatusIcon(":/icons/lock_open", statusBar()->palette().color(QPalette::Highlight)));
 			labelEncryptionIcon->setToolTip(tr("Wallet is <b>encrypted</b> and currently <b>unlocked</b>"));
         };
 
@@ -1345,7 +1367,7 @@ void BitcoinGUI::setEncryptionStatus(int status)
         disconnect(labelEncryptionIcon, SIGNAL(clicked()),   lockWalletAction, SLOT(trigger()));
         connect   (labelEncryptionIcon, SIGNAL(clicked()), unlockWalletAction, SLOT(trigger()));
         labelEncryptionIcon->show();
-        labelEncryptionIcon->setPixmap(QIcon(":/icons/lock_closed").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
+        labelEncryptionIcon->setPixmap(MakeStatusIcon(":/icons/lock_closed", statusBar()->palette().color(QPalette::WindowText)));
         labelEncryptionIcon->setToolTip(tr("Wallet is <b>encrypted</b> and currently <b>locked</b>"));
         encryptWalletAction->setChecked(true);
         changePassphraseAction->setEnabled(true);
@@ -1492,12 +1514,12 @@ void BitcoinGUI::updateStakingIcon()
             text = tr("%n day(s)", "", nEstimateTime/(60*60*24));
         }
 
-        labelStakingIcon->setPixmap(QIcon(":/icons/staking_on").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
+        labelStakingIcon->setPixmap(MakeStatusIcon(":/icons/staking_on", statusBar()->palette().color(QPalette::Highlight)));
         labelStakingIcon->setToolTip(tr("Staking.<br>Your weight is %1<br>Network weight is %2<br>Expected time to earn reward is %3").arg(nWeight).arg(nNetworkWeight).arg(text));
     }
     else
     {
-        labelStakingIcon->setPixmap(QIcon(":/icons/staking_off").pixmap(STATUSBAR_ICONSIZE,STATUSBAR_ICONSIZE));
+        labelStakingIcon->setPixmap(MakeStatusIcon(":/icons/staking_off", statusBar()->palette().color(QPalette::WindowText)));
         if (pwalletMain && pwalletMain->IsLocked())
             labelStakingIcon->setToolTip(tr("Not staking because wallet is locked"));
         else if (!fHasPeers)

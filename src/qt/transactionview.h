@@ -15,7 +15,6 @@ class QMenu;
 class QLabel;
 class QFrame;
 class QDateTimeEdit;
-class QStackedWidget;
 class QPushButton;
 QT_END_NAMESPACE
 
@@ -53,11 +52,6 @@ private:
     QLabel *typeLabel;
     QLabel *amountLabel;
     QPushButton *exportButton;
-    QStackedWidget *contentStack;
-    QWidget *tablePage;
-    QWidget *emptyPage;
-    QLabel *emptyStateTitle;
-    QLabel *emptyStateText;
 
     QComboBox *dateWidget;
     QComboBox *typeWidget;
