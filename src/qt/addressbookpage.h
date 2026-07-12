@@ -68,6 +68,7 @@ private slots:
     void on_signMessage_clicked();
     void on_verifyMessage_clicked();
     void selectionChanged();
+    void updateEmptyState();
     void on_showQRCode_clicked();
     void onNewShieldedAddressClicked();
     void onNewSPAddressClicked();

@@ -139,6 +139,85 @@ This product includes software developed by the OpenSSL Project for use in the O
         <source>Could not write to file %1.</source>
         <translation>Невозможно записать в файл %1.</translation>
     </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Receiving addresses</source>
+        <translation>Адреса получения</translation>
+    </message>
+    <message>
+        <source>These are your Innova addresses for receiving payments. Create a new address for each sender to keep payments organized.</source>
+        <translation>Это ваши адреса Innova для получения платежей. Создавайте новый адрес для каждого отправителя, чтобы платежи было проще отслеживать.</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Search by address or label</source>
+        <translation>Искать по адресу или метке</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>No receiving addresses yet. Create a new address to get started.</source>
+        <translation>Пока нет адресов для получения. Создайте новый адрес, чтобы начать.</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>No receiving addresses match your search.</source>
+        <translation>Ни один адрес получения не соответствует поиску.</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Double-click to select address</source>
+        <translation>Дважды щёлкните, чтобы выбрать адрес</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Double-click to edit label</source>
+        <translation>Дважды щёлкните, чтобы изменить метку</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Double-click to edit label or show QR Code</source>
+        <translation>Дважды щёлкните, чтобы изменить метку или показать QR-код</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>New shielde&amp;d address</source>
+        <translation>Новый защи&amp;щённый адрес</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Generate a new shielded address</source>
+        <translation>Создать новый защищённый адрес</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>New silent p&amp;ayment address</source>
+        <translation>Новый адрес S&amp;ilent Payment</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Generate a new Silent Payment address</source>
+        <translation>Создать новый адрес Silent Payment</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>New s&amp;taking address</source>
+        <translation>Новый адрес стейкин&amp;га</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Generate a new staking address for cold staking</source>
+        <translation>Создать новый адрес для холодного стейкинга</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Label for new shielded address (optional):</source>
+        <translation>Метка для нового защищённого адреса (необязательно):</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Label for new silent payment address (optional):</source>
+        <translation>Метка для нового адреса Silent Payment (необязательно):</translation>
+    </message>
 </context>
 <context>
     <name>AddressTableModel</name>

@@ -139,6 +139,85 @@ This product includes software developed by the OpenSSL Project for use in the O
         <source>Could not write to file %1.</source>
         <translation>Could not write to file %1.</translation>
     </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Receiving addresses</source>
+        <translation>Receiving addresses</translation>
+    </message>
+    <message>
+        <source>These are your Innova addresses for receiving payments. Create a new address for each sender to keep payments organized.</source>
+        <translation>These are your Innova addresses for receiving payments. Create a new address for each sender to keep payments organized.</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Search by address or label</source>
+        <translation>Search by address or label</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>No receiving addresses yet. Create a new address to get started.</source>
+        <translation>No receiving addresses yet. Create a new address to get started.</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>No receiving addresses match your search.</source>
+        <translation>No receiving addresses match your search.</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Double-click to select address</source>
+        <translation>Double-click to select address</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Double-click to edit label</source>
+        <translation>Double-click to edit label</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Double-click to edit label or show QR Code</source>
+        <translation>Double-click to edit label or show QR Code</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>New shielde&amp;d address</source>
+        <translation>New shielde&amp;d address</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Generate a new shielded address</source>
+        <translation>Generate a new shielded address</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>New silent p&amp;ayment address</source>
+        <translation>New silent p&amp;ayment address</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Generate a new Silent Payment address</source>
+        <translation>Generate a new Silent Payment address</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>New s&amp;taking address</source>
+        <translation>New s&amp;taking address</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Generate a new staking address for cold staking</source>
+        <translation>Generate a new staking address for cold staking</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Label for new shielded address (optional):</source>
+        <translation>Label for new shielded address (optional):</translation>
+    </message>
+    <message>
+        <location filename="../addressbookpage.cpp" line="+0"/>
+        <source>Label for new silent payment address (optional):</source>
+        <translation>Label for new silent payment address (optional):</translation>
+    </message>
 </context>
 <context>
     <name>AddressTableModel</name>

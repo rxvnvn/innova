@@ -115,3 +115,20 @@ Modernize `SendCoinsDialog` only: audit Innova send, coin-control, privacy/shiel
 ### Stage 4 planning boundary
 
 The next stage should focus on `ReceiveCoinsDialog` and its related entry widgets only after a separate backend audit confirms that no wallet-lifecycle assumptions are required.
+
+## Stage 4: Receive workflow
+
+| Blackcoin class / area | Innova class / area | Purpose | Safe to transfer | Innova backend/models kept | Blackcoin dependencies rejected | Constraints |
+| --- | --- | --- | --- | --- | --- | --- |
+| `WalletView::gotoReceiveCoinsPage`, `ReceiveCoinsDialog` | `BitcoinGUI::gotoReceiveCoinsPage`, `AddressBookPage(AddressBookPage::ForEditing, AddressBookPage::ReceivingTab)` | Document the actual receive path and modernize the existing receiving-address page | Yes, only as UI presentation over the current address-book workflow | `WalletModel`, `AddressTableModel`, `EditAddressDialog`, `GUIUtil::parseBitcoinURI`, `QRCodeDialog` when compiled in, existing unlock path inside `AddressTableModel::addRow` | Blackcoin payment-request lifecycle, `RecentRequestsTableModel`, standalone request dialogs, wallet-controller assumptions, and any new backend storage | Do not invent a payment-request stack or alter address generation semantics |
+| `ReceiveCoinsDialog` / `ReceiveRequestDialog` | Not present in Innova | Separate request creation, QR presentation, and recent requests history | No, not as a direct port | Existing receive-address list and QR dialog are enough for current functionality | `RecentRequestsTableModel`, payment-request persistence, URI/request workflows not present in Innova | Keep the stage scoped to the existing receiving-address list |
+| `AddressBookPage` receiving tab | `AddressBookPage` receiving tab | Present, filter, copy, edit, and create receiving addresses | Yes, for layout, spacing, search/filter presentation, and button hierarchy only | Receiving entries in `AddressTableModel`, label edits, copy address, QR display, and existing `New Address` / shielded / SP / staking address actions | Blackcoin address-book selection flow, export-first receive UI, and its standalone request controls | Preserve all Innova-specific address types and unlock behavior |
+| `QRImageWidget`, `receiverequestdialog.ui` | `QRCodeDialog` / conditional `showQRCode` button | Present an address as QR only when QR support is compiled in | Yes, for presentational flow only | Existing `QRCodeDialog` and `USE_QRCODE` guards | Blackcoin standalone receive request QR export stack | When QR is disabled, no dead buttons may remain |
+
+### Receive workflow audit notes
+
+- The receive action in Innova does not open a separate request dialog. It switches the main stacked view to `AddressBookPage` in `ReceivingTab`.
+- `AddressTableModel::addRow(AddressTableModel::Receive, ...)` is the actual address-creation path and still performs the wallet unlock and key-pool-backed address generation.
+- `AddressBookPage` already exposes QR, copy address, and label editing for receiving entries, and it also carries Innova-specific address-type actions for shielded, silent payment, and staking addresses.
+- Blackcoin More has a richer payment-request stack with `ReceiveCoinsDialog`, `ReceiveRequestDialog`, and `RecentRequestsTableModel`, but that stack is not present in Innova and should not be recreated without a backend lifecycle audit.
+- The safe redesign boundary is limited to the current receiving-address list, its action ordering, its search/filter presentation, its empty state, and neutral Qt styling.
