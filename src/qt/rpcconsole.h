@@ -96,9 +96,9 @@ private:
 
     enum ColumnWidths
     {
-        ADDRESS_COLUMN_WIDTH = 200,
-        SUBVERSION_COLUMN_WIDTH = 100,
-        PING_COLUMN_WIDTH = 80
+        ADDRESS_COLUMN_WIDTH = 240,
+        SUBVERSION_COLUMN_WIDTH = 140,
+        PING_COLUMN_WIDTH = 90
     };
 
     Ui::RPCConsole *ui;

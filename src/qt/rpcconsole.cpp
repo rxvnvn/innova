@@ -10,6 +10,8 @@
 #include <QTimer>
 #include <QThread>
 #include <QTextEdit>
+#include <QFontDatabase>
+#include <QHeaderView>
 #include <QKeyEvent>
 #include <QUrl>
 #include <QScrollBar>
@@ -206,6 +208,31 @@ RPCConsole::RPCConsole(QWidget *parent) :
 {
     ui->setupUi(this);
 
+    ui->tabWidget->setDocumentMode(true);
+    ui->tabWidget->setElideMode(Qt::ElideRight);
+
+    const QFont fixedFont = QFontDatabase::systemFont(QFontDatabase::FixedFont);
+    ui->messagesWidget->setFont(fixedFont);
+    ui->messagesWidget->document()->setDefaultFont(fixedFont);
+    ui->lineEdit->setFont(fixedFont);
+    ui->lineEdit->setPlaceholderText(tr("Enter RPC command"));
+
+    ui->peerWidget->setAlternatingRowColors(true);
+    ui->peerWidget->setTextElideMode(Qt::ElideMiddle);
+    ui->peerWidget->setShowGrid(false);
+
+    ui->gridLayout->setHorizontalSpacing(12);
+    ui->gridLayout->setVerticalSpacing(6);
+    ui->gridLayout->setColumnStretch(1, 1);
+    ui->gridLayout_2->setHorizontalSpacing(12);
+    ui->gridLayout_2->setColumnStretch(0, 3);
+    ui->gridLayout_2->setColumnStretch(1, 2);
+    ui->gridLayout_3->setHorizontalSpacing(12);
+    ui->verticalLayout_3->setContentsMargins(8, 8, 8, 8);
+    ui->horizontalLayout->setSpacing(6);
+    ui->horizontalLayout_2->setSpacing(6);
+    ui->horizontalLayout_3->setSpacing(12);
+
     QGroupBox *dagGroup = new QGroupBox(tr("IDAG"), ui->tab_info);
     QFormLayout *dagLayout = new QFormLayout(dagGroup);
     dagStatus = new QLabel(tr("N/A"), dagGroup);
@@ -309,6 +336,24 @@ void RPCConsole::setClientModel(ClientModel *model)
         ui->peerWidget->setEditTriggers(QAbstractItemView::NoEditTriggers);
         ui->peerWidget->setSelectionBehavior(QAbstractItemView::SelectRows);
         ui->peerWidget->setSelectionMode(QAbstractItemView::SingleSelection);
+        QHeaderView *peerHeader = ui->peerWidget->horizontalHeader();
+        peerHeader->setHighlightSections(false);
+        peerHeader->setStretchLastSection(false);
+#if QT_VERSION >= 0x050000
+        peerHeader->setSectionResizeMode(PeerTableModel::Address, QHeaderView::Stretch);
+        peerHeader->setSectionResizeMode(PeerTableModel::Subversion, QHeaderView::ResizeToContents);
+        peerHeader->setSectionResizeMode(PeerTableModel::BytesSent, QHeaderView::ResizeToContents);
+        peerHeader->setSectionResizeMode(PeerTableModel::BytesRecv, QHeaderView::ResizeToContents);
+        peerHeader->setSectionResizeMode(PeerTableModel::Height, QHeaderView::ResizeToContents);
+        peerHeader->setSectionResizeMode(PeerTableModel::Ping, QHeaderView::ResizeToContents);
+#else
+        peerHeader->setResizeMode(PeerTableModel::Address, QHeaderView::Stretch);
+        peerHeader->setResizeMode(PeerTableModel::Subversion, QHeaderView::ResizeToContents);
+        peerHeader->setResizeMode(PeerTableModel::BytesSent, QHeaderView::ResizeToContents);
+        peerHeader->setResizeMode(PeerTableModel::BytesRecv, QHeaderView::ResizeToContents);
+        peerHeader->setResizeMode(PeerTableModel::Height, QHeaderView::ResizeToContents);
+        peerHeader->setResizeMode(PeerTableModel::Ping, QHeaderView::ResizeToContents);
+#endif
         ui->peerWidget->setColumnWidth(PeerTableModel::Address, ADDRESS_COLUMN_WIDTH);
         ui->peerWidget->setColumnWidth(PeerTableModel::Subversion, SUBVERSION_COLUMN_WIDTH);
         ui->peerWidget->setColumnWidth(PeerTableModel::Ping, PING_COLUMN_WIDTH);

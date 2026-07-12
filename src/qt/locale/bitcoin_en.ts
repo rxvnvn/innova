@@ -1646,7 +1646,7 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <source>Client name</source>
         <translation>Client name</translation>
     </message>
-    <message>
+<message>
         <location line="+10"/>
         <location line="+23"/>
         <location line="+26"/>
@@ -1660,130 +1660,170 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <source>N/A</source>
         <translation>N/A</translation>
     </message>
-    <message>
+<message>
         <location line="-217"/>
         <source>Client version</source>
         <translation>Client version</translation>
     </message>
-    <message>
+<message>
         <location line="-45"/>
         <source>&amp;Information</source>
         <translation>&amp;Information</translation>
     </message>
-    <message>
+<message>
         <location line="+68"/>
         <source>Using OpenSSL version</source>
         <translation>Using OpenSSL version</translation>
     </message>
-    <message>
+<message>
         <location line="+49"/>
         <source>Startup time</source>
         <translation>Startup time</translation>
     </message>
-    <message>
+<message>
         <location line="+29"/>
         <source>Network</source>
         <translation>Network</translation>
     </message>
-    <message>
+<message>
         <location line="+7"/>
         <source>Number of connections</source>
         <translation>Number of connections</translation>
     </message>
-    <message>
+<message>
         <location line="+23"/>
-        <source>On testnet</source>
-        <translation>On testnet</translation>
+        <source>Testnet</source>
+        <translation>Testnet</translation>
     </message>
-    <message>
+<message>
         <location line="+23"/>
-        <source>Block chain</source>
-        <translation>Block chain</translation>
+        <source>Blockchain</source>
+        <translation>Blockchain</translation>
     </message>
-    <message>
+<message>
         <location line="+7"/>
         <source>Current number of blocks</source>
         <translation>Current number of blocks</translation>
     </message>
-    <message>
+<message>
         <location line="+23"/>
         <source>Estimated total blocks</source>
         <translation>Estimated total blocks</translation>
     </message>
-    <message>
+<message>
         <location line="+23"/>
         <source>Last block time</source>
         <translation>Last block time</translation>
     </message>
-    <message>
+<message>
         <location line="+52"/>
         <source>&amp;Open</source>
         <translation>&amp;Open</translation>
     </message>
-    <message>
+<message>
         <location line="+16"/>
         <source>Command-line options</source>
         <translation>Command-line options</translation>
     </message>
-    <message>
+<message>
         <location line="+7"/>
-        <source>Show the ShadowCoin-Qt help message to get a list with possible ShadowCoin command-line options.</source>
-        <translation>Show the ShadowCoin-Qt help message to get a list with possible ShadowCoin command-line options.</translation>
+        <source>Show the Innova-Qt help message to get a list with possible Innova command-line options.</source>
+        <translation>Show the Innova-Qt help message to get a list with possible Innova command-line options.</translation>
     </message>
-    <message>
+<message>
         <location line="+3"/>
         <source>&amp;Show</source>
         <translation>&amp;Show</translation>
     </message>
-    <message>
+<message>
         <location line="+24"/>
         <source>&amp;Console</source>
         <translation>&amp;Console</translation>
     </message>
-    <message>
+<message>
         <location line="-260"/>
         <source>Build date</source>
         <translation>Build date</translation>
     </message>
-    <message>
+<message>
         <location line="-104"/>
-        <source>ShadowCoin - Debug window</source>
-        <translation>ShadowCoin - Debug window</translation>
+        <source>Innova - Node window</source>
+        <translation>Innova - Node window</translation>
     </message>
-    <message>
+<message>
         <location line="+25"/>
-        <source>ShadowCoin Core</source>
-        <translation>ShadowCoin Core</translation>
+        <source>Innova Core</source>
+        <translation>Innova Core</translation>
     </message>
-    <message>
+<message>
         <location line="+279"/>
         <source>Debug log file</source>
         <translation>Debug log file</translation>
     </message>
-    <message>
+<message>
         <location line="+7"/>
-        <source>Open the ShadowCoin debug log file from the current data directory. This can take a few seconds for large log files.</source>
-        <translation>Open the ShadowCoin debug log file from the current data directory. This can take a few seconds for large log files.</translation>
+        <source>Open the Innova debug log file from the current data directory. This can take a few seconds for large log files.</source>
+        <translation>Open the Innova debug log file from the current data directory. This can take a few seconds for large log files.</translation>
     </message>
-    <message>
+<message>
         <location line="+102"/>
         <source>Clear console</source>
         <translation>Clear console</translation>
     </message>
-    <message>
+<message>
         <location filename="../rpcconsole.cpp" line="-33"/>
-        <source>Welcome to the ShadowCoin RPC console.</source>
-        <translation>Welcome to the ShadowCoin RPC console.</translation>
+        <source>Welcome to the Innova RPC console.</source>
+        <translation>Welcome to the Innova RPC console.</translation>
     </message>
-    <message>
+<message>
         <location line="+1"/>
         <source>Use up and down arrows to navigate history, and &lt;b&gt;Ctrl-L&lt;/b&gt; to clear screen.</source>
         <translation>Use up and down arrows to navigate history, and &lt;b&gt;Ctrl-L&lt;/b&gt; to clear screen.</translation>
     </message>
-    <message>
+<message>
         <location line="+1"/>
         <source>Type &lt;b&gt;help&lt;/b&gt; for an overview of available commands.</source>
         <translation>Type &lt;b&gt;help&lt;/b&gt; for an overview of available commands.</translation>
+    </message>
+<message>
+        <location filename="../forms/rpcconsole.ui" line="+0"/>
+        <source>Traffic totals</source>
+        <translation>Traffic totals</translation>
+    </message>
+<message>
+        <location filename="../forms/rpcconsole.ui" line="+0"/>
+        <source>Received</source>
+        <translation>Received</translation>
+    </message>
+<message>
+        <location filename="../forms/rpcconsole.ui" line="+0"/>
+        <source>Sent</source>
+        <translation>Sent</translation>
+    </message>
+<message>
+        <location filename="../forms/rpcconsole.ui" line="+0"/>
+        <source>Native Tor</source>
+        <translation>Native Tor</translation>
+    </message>
+<message>
+        <location filename="../forms/rpcconsole.ui" line="+0"/>
+        <source>Enter RPC command</source>
+        <translation>Enter RPC command</translation>
+    </message>
+<message>
+        <location filename="../forms/rpcconsole.ui" line="+0"/>
+        <source>&amp;Network Traffic</source>
+        <translation>&amp;Network Traffic</translation>
+    </message>
+<message>
+        <location filename="../forms/rpcconsole.ui" line="+0"/>
+        <source>&amp;Peers</source>
+        <translation>&amp;Peers</translation>
+    </message>
+<message>
+        <location filename="../forms/rpcconsole.ui" line="+0"/>
+        <source>&amp;Reset</source>
+        <translation>&amp;Reset</translation>
     </message>
 </context>
 <context>

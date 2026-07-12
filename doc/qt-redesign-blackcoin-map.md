@@ -152,3 +152,28 @@ The next stage should focus on `ReceiveCoinsDialog` and its related entry widget
 - The context menu already supports copy address, copy label, copy amount, copy transaction ID, edit label, and transaction details.
 - CSV export is already wired through the existing model roles and should remain unchanged.
 - Blackcoin More adds extra transaction presentation patterns such as a watch-only filter, raw/full detail copying, third-party explorer actions, and different header polish, but those are not part of this Innova page and should not be added without backend support.
+
+
+## Stage 6: Node / Debug Window
+
+| Blackcoin class / area | Innova class / area | Purpose | Safe to transfer | Innova models / behavior kept | Blackcoin dependencies rejected | Constraints |
+| --- | --- | --- | --- | --- | --- | --- |
+| `RPCConsole` / `debugwindow.ui` | `RPCConsole`, `rpcconsole.ui` | Modernize the node/debug window layout without changing RPC or networking logic | Yes, for tab ordering, spacing, splitters, labels, font presentation, and window title only | Existing `ClientModel`, `PeerTableModel`, `BanTableModel` model access, `TrafficGraphWidget`, console history, RPC executor thread, and node detail labels | `interfaces::Node`, new peer roles, wallet-controller integration, ban/disconnect actions, extra node statistics, and any RPC backend rewrite | Keep RPC execution, peer refresh, traffic counters, and connection logic unchanged |
+| `TrafficGraphWidget` | `TrafficGraphWidget` | Present network traffic more clearly | Yes, for layout, range control, and placement only | Existing sent/received byte counters and graph sampling | Any new traffic sampling, node stats, or color semantics changes | Do not change byte accounting or reset behavior |
+| `PeerTableModel` / peer detail panel | `PeerTableModel`, peer detail widgets in `rpcconsole.ui` | Present connected peers in a more readable table/detail split | Yes, for column sizing, splitter layout, and readable detail grouping | Existing peer columns (`Address:Port`, `User Agent`, `Sent`, `Recv`, `Height`, `Ping`) and detail fields from `CNodeCombinedStats` | Extra peer columns, disconnect/ban/unban actions, and new peer-state roles not present in Innova | Do not add fake values or unsupported peer controls |
+| `BanTableModel` | `ClientModel::getBanTableModel()` only | Ban presentation exists as a backend model, but is not surfaced in the current Innova UI | No, not in this stage | Keep the model available for future use | Any new bans tab, ban actions, or backend behavior changes | Do not invent a bans workflow in the UI |
+
+### Node / Debug window audit notes
+
+- Innova currently exposes a four-tab node/debug dialog: `Information`, `Console`, `Network Traffic`, and `Peers`.
+- The dialog is backed by `RPCConsole`, which remains a `QDialog` and drives a dedicated RPC executor thread in the GUI process.
+- `ClientModel` already provides the node-facing data used by the dialog: connection count, block count, byte totals, last block time, peer model, ban model, startup/build/version strings, and the existing DAG/finality snapshot used on the Information tab.
+- The peer table model in Innova is narrow: it provides only `Address:Port`, `User Agent`, `Sent`, `Recv`, `Height`, and `Ping`, and the detail panel fills from the cached `CNodeCombinedStats` snapshot.
+- The existing UI has no safe hook for the richer Blackcoin/Bitcoin Core peer actions such as disconnect, ban, or unban, so those remain out of scope.
+- Blackcoin More uses a more modern `debugwindow.ui` structure with splitters and denser presentation; that style can be borrowed only as layout guidance because its node and wallet abstractions are not present in Innova.
+
+### Stage 6 transfer boundary
+
+- Safe to transfer: tab titles, splitter-based layout, column sizing, group spacing, console font presentation, and neutral window chrome.
+- Not safe to transfer: node backend abstractions, `interfaces::Node`, richer peer state roles, peer management actions, ban controls, or any traffic/connection accounting logic.
+- The next step after this stage should remain outside the debug window and move to the remaining wallet pages only if the current wallet/backend audit permits it.

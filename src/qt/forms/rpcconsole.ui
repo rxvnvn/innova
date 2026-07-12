@@ -11,13 +11,16 @@
    </rect>
   </property>
   <property name="windowTitle">
-   <string>Innova - Debug window</string>
+   <string>Innova - Node window</string>
   </property>
   <layout class="QVBoxLayout" name="verticalLayout_2">
    <item>
     <widget class="QTabWidget" name="tabWidget">
      <property name="currentIndex">
       <number>0</number>
+     </property>
+     <property name="documentMode">
+      <bool>true</bool>
      </property>
      <widget class="QWidget" name="tab_info">
       <attribute name="title">
@@ -204,7 +207,7 @@
        <item row="8" column="0">
         <widget class="QLabel" name="label_8">
          <property name="text">
-          <string>Testnet On/Off</string>
+          <string>Testnet</string>
          </property>
         </widget>
        </item>
@@ -221,7 +224,7 @@
        <item row="9" column="0">
          <widget class="QLabel" name="label_81">
          <property name="text">
-          <string>Native Tor On/Off</string>
+          <string>Native Tor</string>
          </property>
         </widget>
        </item>
@@ -248,7 +251,7 @@
           </font>
          </property>
          <property name="text">
-          <string>Block chain</string>
+          <string>Blockchain</string>
          </property>
         </widget>
        </item>
@@ -513,7 +516,7 @@
            <item>
             <widget class="QPushButton" name="btnClearTrafficGraph">
              <property name="text">
-              <string>&amp;Clear</string>
+              <string>&amp;Reset</string>
              </property>
             </widget>
            </item>
@@ -526,7 +529,7 @@
          <item>
           <widget class="QGroupBox" name="groupBox">
            <property name="title">
-            <string>Totals</string>
+            <string>Traffic totals</string>
            </property>
            <layout class="QVBoxLayout" name="verticalLayout_5">
             <item>
@@ -590,7 +593,7 @@
               <item>
                <widget class="QLabel" name="label_16">
                 <property name="text">
-                 <string>In:</string>
+                 <string>Received</string>
                 </property>
                </widget>
               </item>
@@ -670,7 +673,7 @@
               <item>
                <widget class="QLabel" name="label_17">
                 <property name="text">
-                 <string>Out:</string>
+                 <string>Sent</string>
                 </property>
                </widget>
               </item>
@@ -753,7 +756,7 @@
           <string>Select a peer to view detailed information.</string>
          </property>
          <property name="alignment">
-          <set>Qt::AlignHCenter|Qt::AlignTop</set>
+          <set>Qt::AlignLeft|Qt::AlignTop</set>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
