@@ -625,8 +625,6 @@ unsigned int GetStakeModifierChecksum(const CBlockIndex* pindex)
     return hashChecksum.Get64();
 }
 
-static const int MAX_CHECKPOINT_DISTANCE = 175000;
-
 // Check stake modifier hard checkpoints
 bool CheckStakeModifierCheckpoints(int nHeight, unsigned int nStakeModifierChecksum)
 {
@@ -634,49 +632,5 @@ bool CheckStakeModifierCheckpoints(int nHeight, unsigned int nStakeModifierCheck
 
     if (checkpoints.count(nHeight))
         return nStakeModifierChecksum == checkpoints[nHeight];
-
-    extern bool fRegTest;
-    if (!fTestNet && !fRegTest && !checkpoints.empty())
-    {
-        int nNearestDist = INT_MAX;
-        int nNearestHeight = 0;
-        int nLowestCheckpoint = INT_MAX;
-        int nHighestCheckpoint = 0;
-
-        for (const auto& cp : checkpoints)
-        {
-            int dist = abs(nHeight - cp.first);
-            if (dist < nNearestDist)
-            {
-                nNearestDist = dist;
-                nNearestHeight = cp.first;
-            }
-            if (cp.first < nLowestCheckpoint)
-                nLowestCheckpoint = cp.first;
-            if (cp.first > nHighestCheckpoint)
-                nHighestCheckpoint = cp.first;
-        }
-
-        if (nHeight >= nLowestCheckpoint && nHeight <= nHighestCheckpoint && nNearestDist > MAX_CHECKPOINT_DISTANCE)
-        {
-            return error("CheckStakeModifierCheckpoints() : block height %d is %d blocks from nearest "
-                         "checkpoint (%d), exceeds max distance %d — potential stake modifier manipulation",
-                         nHeight, nNearestDist, nNearestHeight, MAX_CHECKPOINT_DISTANCE);
-        }
-
-        if (nHeight > nHighestCheckpoint && nNearestDist > MAX_CHECKPOINT_DISTANCE)
-        {
-            static int64_t nLastWarnTime = 0;
-            int64_t nNow = GetTime();
-            if (nNow - nLastWarnTime > 600)
-            {
-                printf("WARNING: Block height %d is %d blocks from nearest stake modifier checkpoint (%d). "
-                       "Consider adding denser checkpoints for security.\n",
-                       nHeight, nNearestDist, nNearestHeight);
-                nLastWarnTime = nNow;
-            }
-        }
-    }
-
     return true;
 }
