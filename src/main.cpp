@@ -84,109 +84,6 @@ static CCriticalSection cs_getHeadersDiag;
 static std::map<NodeId, uint64_t> mapGetHeadersSendDiagCount;
 static std::map<NodeId, uint64_t> mapHeadersRecvDiagCount;
 
-struct GetHeadersRequestLocatorState
-{
-    uint64_t count;
-    uint64_t suppressed;
-    int64_t lastRequestTime;
-    int64_t lastLogTime;
-
-    GetHeadersRequestLocatorState() : count(0), suppressed(0), lastRequestTime(0), lastLogTime(0) {}
-};
-
-struct GetHeadersRequestState
-{
-    std::map<std::string, GetHeadersRequestLocatorState> locators;
-    uint64_t totalReceived;
-    uint64_t totalSuppressed;
-    uint64_t windowCount;
-    int64_t windowStart;
-    int64_t lastRequestTime;
-    int64_t lastLogTime;
-
-    GetHeadersRequestState() : totalReceived(0), totalSuppressed(0), windowCount(0), windowStart(0), lastRequestTime(0), lastLogTime(0) {}
-};
-
-static CCriticalSection cs_getHeadersRequestDiag;
-static std::map<NodeId, GetHeadersRequestState> mapGetHeadersRequestDiag;
-
-static std::string GetHeadersLocatorFingerprint(const CBlockLocator& locator, const uint256& hashStop)
-{
-    uint256 hashFirst = 0;
-    uint256 hashLast = 0;
-    std::ostringstream oss;
-    oss << "size=" << locator.Size();
-    if (locator.GetHashes(hashFirst, hashLast))
-    {
-        oss << " first=" << hashFirst.ToString()
-            << " last=" << hashLast.ToString();
-    }
-    else
-    {
-        oss << " first=none last=none";
-    }
-    oss << " stop=" << hashStop.ToString();
-    return oss.str();
-}
-
-static bool ShouldRateLimitGetHeadersResponse(CNode* pfrom, const std::string& strLocatorKey, std::string& strReason, uint64_t& nLocatorCount, uint64_t& nWindowCount, uint64_t& nSuppressedTotal, size_t& nSendQueueBytes)
-{
-    const int64_t nNow = GetTime();
-    const int64_t nCooldown = 5;
-    const int64_t nWindowSeconds = 30;
-    const uint64_t nWindowLimit = 8;
-    const size_t nSendQueueLimit = SendBufferSize() * 2;
-
-    nSendQueueBytes = pfrom ? pfrom->nSendSize : 0;
-
-    LOCK(cs_getHeadersRequestDiag);
-    GetHeadersRequestState& state = mapGetHeadersRequestDiag[pfrom->GetId()];
-
-    if (state.windowStart == 0 || nNow - state.windowStart >= nWindowSeconds)
-    {
-        state.windowStart = nNow;
-        state.windowCount = 0;
-    }
-    state.windowCount++;
-    state.totalReceived++;
-    state.lastRequestTime = nNow;
-
-    GetHeadersRequestLocatorState& locatorState = state.locators[strLocatorKey];
-    locatorState.count++;
-    nLocatorCount = locatorState.count;
-    nWindowCount = state.windowCount;
-    nSuppressedTotal = state.totalSuppressed;
-
-    bool fRateLimited = false;
-    if (nSendQueueBytes >= nSendQueueLimit)
-    {
-        strReason = "send-queue-high";
-        fRateLimited = true;
-    }
-    else if (locatorState.lastRequestTime != 0 && nNow - locatorState.lastRequestTime < nCooldown)
-    {
-        strReason = "duplicate";
-        fRateLimited = true;
-    }
-    else if (state.windowCount > nWindowLimit)
-    {
-        strReason = "too-frequent";
-        fRateLimited = true;
-    }
-
-    if (fRateLimited)
-    {
-        locatorState.suppressed++;
-        state.totalSuppressed++;
-        nSuppressedTotal = state.totalSuppressed;
-        locatorState.lastRequestTime = nNow;
-        return true;
-    }
-
-    locatorState.lastRequestTime = nNow;
-    return false;
-}
-
 bool CollateralNReorgBlock = true;
 uint256 nBestChainTrust = 0;
 uint256 nBestInvalidTrust = 0;
@@ -2391,9 +2288,7 @@ static void QueueBlockInventory(CNode* pfrom, const uint256& hash, std::set<uint
     if (!setQueued.insert(hash).second)
         return;
 
-    CInv inv(MSG_BLOCK, hash);
-    LOCK(pfrom->cs_inventory);
-    pfrom->vInventoryToSend.push_back(inv);
+    pfrom->PushGetBlocksInventory(CInv(MSG_BLOCK, hash));
 }
 
 static void QueueDAGSideBlockWithAncestors(CNode* pfrom, const uint256& hash, std::set<uint256>& setQueued, std::set<uint256>& setVisiting, int nDepth)
@@ -6539,8 +6434,10 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         // Ask this guy to fill in what we're missing
         if (pfrom)
         {
-            pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
-			//PushGetBlocks(pfrom, pindexBest, GetOrphanRoot(pblock2));
+            // Parallel IBD delivery commonly creates temporary orphans whose
+            // parent is already in the advertised batch.
+            if (!IsInitialBlockDownload())
+                pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
             // ppcoin: getblocks may not obtain the ancestor block rejected
             // earlier by duplicate-stake check so we ask for it again directly
             pfrom->AskFor(CInv(MSG_BLOCK, WantedByOrphan(pblock2)));
@@ -7616,25 +7513,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // Ask every node for the collateralnode list straight away
         pfrom->PushMessage("iseg", CTxIn());
 
-        // Ask every eligible network peer for catch-up work. Send the first request
-        // immediately instead of waiting for the deferred SendMessages() queue.
-        if (!pfrom->fClient && !pfrom->fOneShot &&
+        // Full nodes use the historical getblocks/inv path. Header-first
+        // synchronization is reserved for SPV mode, where headers are indexed.
+        if (!fSPVMode && !pfrom->fClient && !pfrom->fOneShot &&
             (pfrom->nBestKnownHeight < 0 || pfrom->nBestKnownHeight > (nBestHeight - 144)) &&
             (pfrom->nVersion < NOBLKS_VERSION_START ||
              pfrom->nVersion >= NOBLKS_VERSION_END))
         {
-            // Send the first catch-up request immediately instead of waiting for the
-            // deferred SendMessages() queue. This keeps initial sync from stalling if
-            // the peer is otherwise quiet right after the version handshake.
-            pfrom->PushMessage("getblocks", CBlockLocator(pindexBest), uint256(0));
-            pfrom->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "version-handshake");
-        }
-        if (!pfrom->fClient && !pfrom->fOneShot &&
-            (pfrom->nBestKnownHeight < 0 || pfrom->nBestKnownHeight > (nBestHeight - 144)) &&
-            (pfrom->nVersion < NOBLKS_VERSION_START ||
-             pfrom->nVersion >= NOBLKS_VERSION_END))
-        {
-            pfrom->fStartSync = true;
+            pfrom->PushGetBlocks(pindexBest, uint256(0));
         }
 
         // Relay alerts
@@ -7680,10 +7566,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         pfrom->SetRecvVersion(min(pfrom->nVersion, PROTOCOL_VERSION));
         printf("net: received verack from peer version %d (recvVersion: %d) at %s\n", pfrom->nVersion, pfrom->nRecvVersion, pfrom->addr.ToString().c_str());
 
-        pfrom->PushMessage("sendheaders");
-
         if (fSPVMode)
         {
+            pfrom->PushMessage("sendheaders");
             printf("SPV: Requesting headers from peer %s\n", pfrom->addr.ToString().c_str());
             pfrom->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "spv-request");
         }
@@ -7849,16 +7734,25 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (!fAlreadyHave)
                 pfrom->AskFor(inv);
             else if (inv.type == MSG_BLOCK && mapOrphanBlocks.count(inv.hash)) {
-                pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(mapOrphanBlocks[inv.hash]));
-				//PushGetBlocks(pfrom, pindexBest, GetOrphanRoot(mapOrphanBlocks[inv.hash]));
+                CBlock* pblockOrphan = mapOrphanBlocks[inv.hash];
+                if (IsInitialBlockDownload())
+                    pfrom->AskFor(CInv(MSG_BLOCK, WantedByOrphan(pblockOrphan)));
+                else
+                    pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblockOrphan));
             } else if (nInv == nLastBlock) {
                 // In case we are on a very long side-chain, it is possible that we already have
                 // the last block in an inv bundle sent in response to getblocks. Try to detect
-                // this situation and push another getblocks to continue.
-                pfrom->PushGetBlocks(mapBlockIndex[inv.hash], uint256(0));
-				//PushGetBlocks(pfrom, mapBlockIndex[inv.hash], uint256(0));
-                if (fDebugNet)
-                    printf("force request: %s\n", inv.ToString().c_str());
+                // this situation. Do not paginate our main chain from a peer that cannot advance
+                // it, but retain the historical side-chain continuation path.
+                std::map<uint256, CBlockIndex*>::iterator miLast = mapBlockIndex.find(inv.hash);
+                if (miLast != mapBlockIndex.end() &&
+                    pfrom->ShouldContinueKnownBlockInventory(
+                        nBestHeight, miLast->second->IsInMainChain()))
+                {
+                    pfrom->PushGetBlocks(miLast->second, uint256(0));
+                    if (fDebugNet)
+                        printf("force request: %s\n", inv.ToString().c_str());
+                }
             }
 
             // Don't bother if send buffer is too full to respond anyway
@@ -7917,15 +7811,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 // ppcoin: tell downloading node about the latest block if it's
                 // without risk being rejected due to stake connection check
                 if (hashStop != hashBestChain && pindex->GetBlockTime() + nStakeMinAge > pindexBest->GetBlockTime())
-                    pfrom->PushInventory(CInv(MSG_BLOCK, hashBestChain));
+                    pfrom->PushGetBlocksInventory(CInv(MSG_BLOCK, hashBestChain));
                 break;
             }
             QueueDAGMergeParentInventories(pfrom, pindex, setQueuedDAGParents);
-            {
-                CInv inv(MSG_BLOCK, pindex->GetBlockHash());
-                LOCK(pfrom->cs_inventory);
-                pfrom->vInventoryToSend.push_back(inv);
-            }
+            pfrom->PushGetBlocksInventory(CInv(MSG_BLOCK, pindex->GetBlockHash()));
             if (--nLimit <= 0)
             {
                 // When this block is requested, we'll send an inv that'll make them
@@ -7961,7 +7851,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         uint256 hashLocatorLast = 0;
         bool fHasLocatorHashes = locator.GetHashes(hashLocatorFirst, hashLocatorLast);
         size_t nLocatorSize = locator.Size();
-        std::string strLocatorKey = GetHeadersLocatorFingerprint(locator, hashStop);
 
         uint64_t nGetHeadersDiagCount = 0;
         bool fLogGetHeaders = false;
@@ -7971,28 +7860,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             nCount++;
             nGetHeadersDiagCount = nCount;
             fLogGetHeaders = (nCount <= 5 || (nCount % 25) == 0);
-        }
-
-        std::string strRateLimitReason;
-        uint64_t nLocatorCount = 0;
-        uint64_t nWindowCount = 0;
-        uint64_t nSuppressedTotal = 0;
-        size_t nSendQueueBytes = 0;
-        if (ShouldRateLimitGetHeadersResponse(pfrom, strLocatorKey, strRateLimitReason, nLocatorCount, nWindowCount, nSuppressedTotal, nSendQueueBytes))
-        {
-            if (fDebugNet && (fLogGetHeaders || nSuppressedTotal <= 5 || (nSuppressedTotal % 25) == 0))
-            {
-                printf("GETHEADERS_RATE_LIMIT: peer=%s diag=%llu reason=%s locator{%s} send_queue_bytes=%zu repeat=%llu window_count=%llu suppressed=%llu\n",
-                       pfrom->addr.ToString().c_str(),
-                       (unsigned long long)nGetHeadersDiagCount,
-                       strRateLimitReason.c_str(),
-                       strLocatorKey.c_str(),
-                       nSendQueueBytes,
-                       (unsigned long long)nLocatorCount,
-                       (unsigned long long)nWindowCount,
-                       (unsigned long long)nSuppressedTotal);
-            }
-            return true;
         }
 
         LOCK(cs_main);
@@ -8072,9 +7939,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         std::vector<CBlock> vHeaders;
         vRecv >> vHeaders;
 
-        if (vHeaders.empty())
-            return true;
-
         if (vHeaders.size() > 2000)
         {
             pfrom->Misbehaving(20);
@@ -8082,28 +7946,83 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
 
         unsigned int nHeadersBytes = ::GetSerializeSize(vHeaders, SER_NETWORK, PROTOCOL_VERSION);
-        uint256 hashFirstHeader = vHeaders.front().GetHash();
-        uint256 hashLastHeader = vHeaders.back().GetHash();
+        uint256 hashFirstHeader = vHeaders.empty() ? uint256(0) : vHeaders.front().GetHash();
+        uint256 hashLastHeader = vHeaders.empty() ? uint256(0) : vHeaders.back().GetHash();
 
         uint64_t nHeadersDiagCount = 0;
-        bool fLogHeaders = false;
         {
             LOCK(cs_getHeadersDiag);
             uint64_t& nCount = mapHeadersRecvDiagCount[pfrom->GetId()];
             nCount++;
             nHeadersDiagCount = nCount;
-            fLogHeaders = (nCount <= 5 || (nCount % 25) == 0);
         }
 
         LOCK(cs_main);
 
         RecordGetHeadersResponse(pfrom, vHeaders.size(), nHeadersBytes);
 
-        int nKnownHeightBefore = pindexBest ? pindexBest->nHeight : -1;
-        int nKnownHeightAfter = nKnownHeightBefore;
-        int nNewHeadersAccepted = 0;
-        int nDuplicateHeaders = 0;
-        int nUnknownParentHeaders = 0;
+        const int nFullTipBefore = pindexBest ? pindexBest->nHeight : -1;
+        const int nBestHeaderBefore = fSPVMode && pindexBest ? pindexBest->nHeight : -1;
+        int nNewHeaders = 0;
+        int nAlreadyKnownHeaders = 0;
+        int nConnectedHeaders = 0;
+        int nOrphanHeaders = 0;
+        int nFirstHeightKnown = -1;
+        int nLastHeightKnown = -1;
+        bool fContinuousRange = true;
+
+        if (!vHeaders.empty())
+        {
+            std::map<uint256, CBlockIndex*>::const_iterator miFirst = mapBlockIndex.find(hashFirstHeader);
+            if (miFirst != mapBlockIndex.end())
+                nFirstHeightKnown = miFirst->second->nHeight;
+            else
+            {
+                std::map<uint256, CBlockIndex*>::const_iterator miPrev = mapBlockIndex.find(vHeaders.front().hashPrevBlock);
+                if (miPrev != mapBlockIndex.end())
+                    nFirstHeightKnown = miPrev->second->nHeight + 1;
+            }
+
+            uint256 hashPrevious = hashFirstHeader;
+            for (size_t i = 0; i < vHeaders.size(); ++i)
+            {
+                const CBlock& header = vHeaders[i];
+                const uint256 hash = (i == 0) ? hashFirstHeader : header.GetHash();
+                if (i > 0 && header.hashPrevBlock != hashPrevious)
+                    fContinuousRange = false;
+                hashPrevious = hash;
+
+                if (mapBlockIndex.count(hash))
+                    nAlreadyKnownHeaders++;
+                else
+                {
+                    nNewHeaders++;
+                }
+            }
+
+            std::map<uint256, CBlockIndex*>::const_iterator miLast = mapBlockIndex.find(hashLastHeader);
+            if (miLast != mapBlockIndex.end())
+                nLastHeightKnown = miLast->second->nHeight;
+            else if (fContinuousRange && nFirstHeightKnown >= 0)
+                nLastHeightKnown = nFirstHeightKnown + (int)vHeaders.size() - 1;
+        }
+
+        if (vHeaders.empty())
+        {
+            if (fDebugNet)
+            {
+                printf("HEADERS_TRACE: peer=%s peer_id=%lld response_sequence=%llu headers_count=0 headers_bytes=%u first_hash=none first_height_known=-1 last_hash=none last_height_known=-1 new_headers_count=0 already_known_count=0 connected_count=0 orphan_count=0 best_header_before=%d best_header_after=%d full_tip_before=%d full_tip_after=%d range_contiguous=1 next_getheaders_reason=empty-response\n",
+                       pfrom->addrName.c_str(),
+                       (long long)pfrom->GetId(),
+                       (unsigned long long)nHeadersDiagCount,
+                       nHeadersBytes,
+                       nBestHeaderBefore,
+                       nBestHeaderBefore,
+                       nFullTipBefore,
+                       nFullTipBefore);
+            }
+            return true;
+        }
 
         CBlockIndex* pindexLast = NULL;
         std::vector<CInv> vGetData;
@@ -8115,7 +8034,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             {
                 pindexLast = mapBlockIndex[hash];
                 pfrom->UpdateBestKnownBlock(pindexLast->nHeight, hash);
-                nDuplicateHeaders++;
                 continue;
             }
 
@@ -8124,8 +8042,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 if (fDebug) printf("Header %s has unknown parent %s, waiting for in-flight blocks\n",
                        hash.ToString().substr(0,20).c_str(),
                        header.hashPrevBlock.ToString().substr(0,20).c_str());
-                nUnknownParentHeaders++;
-                pfrom->PushGetBlocks(pindexBest, uint256(0));
+                if (!fSPVMode)
+                    pfrom->PushGetBlocks(pindexBest, uint256(0));
                 break;
             }
 
@@ -8143,39 +8061,90 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 }
             }
 
-            nNewHeadersAccepted++;
-            nKnownHeightAfter = pindexPrev->nHeight + 1;
-
-            // Request full block data, skip if already in-flight
-            if (pfrom->IsBlockInFlight(hash))
+            if (header.GetBlockTime() > FutureDrift(GetAdjustedTime()))
             {
-                if (fDebug)
-                    printf("Header block %s already in-flight, skipping\n",
-                           hash.ToString().substr(0,20).c_str());
-                pindexLast = pindexPrev;
-                continue;
+                pfrom->Misbehaving(10);
+                return error("header %s timestamp too far in future", hash.ToString().c_str());
             }
-            if (fDebug)
-                printf("Header announced block %s (parent height %d), requesting full block\n",
-                       hash.ToString().substr(0,20).c_str(), pindexPrev->nHeight);
-            vGetData.push_back(CInv(MSG_BLOCK, hash));
-            pindexLast = pindexPrev;
+
+            nConnectedHeaders++;
+
+            if (fSPVMode)
+            {
+                CBlockIndex* pindexNew = new CBlockIndex();
+                pindexNew->phashBlock = &(mapBlockIndex.insert(make_pair(hash, pindexNew)).first->first);
+                pindexNew->pprev = pindexPrev;
+                pindexNew->nHeight = pindexPrev->nHeight + 1;
+                pindexNew->nVersion = header.nVersion;
+                pindexNew->hashMerkleRoot = header.hashMerkleRoot;
+                pindexNew->nTime = header.nTime;
+                pindexNew->nBits = header.nBits;
+                pindexNew->nNonce = header.nNonce;
+                pindexNew->nFile = 0;
+                pindexNew->nBlockPos = 0;
+                pindexNew->nChainTrust = pindexPrev->nChainTrust + pindexNew->GetBlockTrust();
+
+                if (pindexNew->nChainTrust > nBestChainTrust)
+                {
+                    pindexPrev->pnext = pindexNew;
+                    pindexBest = pindexNew;
+                    hashBestChain = hash;
+                    nBestHeight = pindexNew->nHeight;
+                    nBestChainTrust = pindexNew->nChainTrust;
+                    nTimeBestReceived = GetTime();
+                }
+
+                pindexLast = pindexNew;
+                if (fDebugNet && pindexNew->nHeight % 1000 == 0)
+                    printf("SPV: Processed header at height %d\n", pindexNew->nHeight);
+            }
+            else
+            {
+                // Request full block data, skip if already in-flight
+                if (pfrom->IsBlockInFlight(hash))
+                {
+                    if (fDebug)
+                        printf("Header block %s already in-flight, skipping\n",
+                               hash.ToString().substr(0,20).c_str());
+                    pindexLast = pindexPrev;
+                    continue;
+                }
+                if (fDebug)
+                    printf("Header announced block %s (parent height %d), requesting full block\n",
+                           hash.ToString().substr(0,20).c_str(), pindexPrev->nHeight);
+                vGetData.push_back(CInv(MSG_BLOCK, hash));
+                pindexLast = pindexPrev;
+            }
         }
 
-        if (fDebugNet && fLogHeaders)
+        nOrphanHeaders = std::max(0, nNewHeaders - nConnectedHeaders);
+        const bool fContinueHeaders =
+            fSPVMode && nConnectedHeaders > 0 && pindexLast && vHeaders.size() >= 2000;
+        const int nFullTipAfter = pindexBest ? pindexBest->nHeight : -1;
+        const int nBestHeaderAfter = fSPVMode && pindexBest ? pindexBest->nHeight : -1;
+
+        if (fDebugNet)
         {
-            printf("HEADERS_RECV: peer=%s diag=%llu headers=%zu bytes=%u first_hash=%s last_hash=%s known_height_before=%d known_height_after=%d new=%d duplicate=%d unknown_parent=%d\n",
-                   pfrom->addr.ToString().c_str(),
+            printf("HEADERS_TRACE: peer=%s peer_id=%lld response_sequence=%llu headers_count=%zu headers_bytes=%u first_hash=%s first_height_known=%d last_hash=%s last_height_known=%d new_headers_count=%d already_known_count=%d connected_count=%d orphan_count=%d best_header_before=%d best_header_after=%d full_tip_before=%d full_tip_after=%d range_contiguous=%d next_getheaders_reason=%s\n",
+                   pfrom->addrName.c_str(),
+                   (long long)pfrom->GetId(),
                    (unsigned long long)nHeadersDiagCount,
                    vHeaders.size(),
                    nHeadersBytes,
                    hashFirstHeader.ToString().c_str(),
+                   nFirstHeightKnown,
                    hashLastHeader.ToString().c_str(),
-                   nKnownHeightBefore,
-                   nKnownHeightAfter,
-                   nNewHeadersAccepted,
-                   nDuplicateHeaders,
-                   nUnknownParentHeaders);
+                   nLastHeightKnown,
+                   nNewHeaders,
+                   nAlreadyKnownHeaders,
+                   nConnectedHeaders,
+                   nOrphanHeaders,
+                   nBestHeaderBefore,
+                   nBestHeaderAfter,
+                   nFullTipBefore,
+                   nFullTipAfter,
+                   fContinuousRange ? 1 : 0,
+                   fContinueHeaders ? "full-batch" : "none");
         }
 
         // In full node mode, request full blocks for announced headers
@@ -8190,12 +8159,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pfrom->MarkBlockInFlight(inv.hash);
         }
 
-        // Continue header sync during IBD and steady-state catch-up.
-        if (pindexLast && vHeaders.size() >= 2000)
-        {
-            pfrom->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "headers-continue");
-            pfrom->PushGetBlocks(pindexBest, uint256(0));
-        }
+        // SPV continuation is allowed only after this response advanced the
+        // indexed header tip, so the next locator is necessarily different.
+        if (fContinueHeaders)
+            pfrom->PushGetHeaders(CBlockLocator(pindexLast), uint256(0), "headers-continue");
 
         if (fSPVMode && pindexLast && pindexLast == pindexBest)
         {
@@ -8910,14 +8877,14 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         CBlockIndex* pBest = pindexBest;
         int nHeight = nBestHeight;
         int nPeerHeight = pto->nBestKnownHeight >= 0 ? pto->nBestKnownHeight : pto->nChainHeight;
-        bool fBehind = (pBest != NULL && pBest->GetBlockTime() < nNow - 300) ||
-                       (nPeerHeight > nHeight + 1);
+        bool fPeerCanAdvance = pto->CanAdvanceBlockSync(nHeight);
 
         static std::map<std::string, int64_t> mapLastStallRecovery;
         bool fThrottle = (mapLastStallRecovery.count(pto->addrName) &&
                           nNow - mapLastStallRecovery[pto->addrName] < 15);
 
-        if (!fImporting && !fReindex && fBehind && nTimeSinceBlock > 15 && !fThrottle)
+        if (!fImporting && !fReindex && pBest != NULL && fPeerCanAdvance &&
+            nTimeSinceBlock > 15 && !fThrottle)
         {
             mapLastStallRecovery[pto->addrName] = nNow;
             pto->nLastBlockRecv = nNow;
@@ -8931,8 +8898,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                         ++it;
                 }
             }
-            if (pBest != NULL)
-                pto->PushMessage("getblocks", CBlockLocator(pBest), uint256(0));
+            pto->PushGetBlocks(pBest, uint256(0));
             if (fDebug)
                 printf("Sync stall recovery: peer=%s ch=%d our=%d stall=%ds\n",
                        pto->addrName.c_str(), nPeerHeight, nHeight, (int)nTimeSinceBlock);
@@ -8948,7 +8914,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
     //
     if (pto->fStartSync && !fImporting && !fReindex) {
         pto->fStartSync = false;
-        pto->PushGetBlocks(pindexBest, uint256(0));
+        if (!fSPVMode && pto->CanAdvanceBlockSync(nBestHeight))
+            pto->PushGetBlocks(pindexBest, uint256(0));
     }
 
     {
@@ -8964,6 +8931,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
 
     TRY_LOCK(cs_main, lockMain);
     if (lockMain) {
+
+        if (fSPVMode && pto->getHeadersSync.IsTimedOut(GetTime()))
+            pto->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "timeout-retry");
 
         if (dandelionState.IsEnabled())
         {
@@ -9048,6 +9018,32 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             pto->vAddrToSend.clear();
             if (!vAddr.empty())
                 pto->PushMessage("addr", vAddr);
+        }
+
+        // A getblocks reply is protocol inventory, even when the peer prefers
+        // headers for unsolicited block announcements.
+        vector<CInv> vGetBlocksInv;
+        {
+            LOCK(pto->cs_inventory);
+            vGetBlocksInv.swap(pto->vGetBlocksInventoryToSend);
+            for (const CInv& inv : vGetBlocksInv)
+                pto->setInventoryKnown.insert(inv);
+        }
+        if (!vGetBlocksInv.empty())
+        {
+            vector<CInv> vResponse;
+            vResponse.reserve(std::min((size_t)1000, vGetBlocksInv.size()));
+            for (const CInv& inv : vGetBlocksInv)
+            {
+                vResponse.push_back(inv);
+                if (vResponse.size() >= 1000)
+                {
+                    pto->PushMessage("inv", vResponse);
+                    vResponse.clear();
+                }
+            }
+            if (!vResponse.empty())
+                pto->PushMessage("inv", vResponse);
         }
 
         //

@@ -94,9 +94,9 @@ struct GetHeadersPeerStats
     std::map<std::string, GetHeadersLocatorState> locators;
     uint64_t totalSent;
     uint64_t totalSuppressed;
-    uint64_t inFlight;
+    int64_t lastRequestTime;
 
-    GetHeadersPeerStats() : totalSent(0), totalSuppressed(0), inFlight(0) {}
+    GetHeadersPeerStats() : totalSent(0), totalSuppressed(0), lastRequestTime(0) {}
 };
 
 static CCriticalSection cs_p2pMessageStats;
@@ -165,25 +165,11 @@ static void GetProcessMemorySnapshot(uint64_t& nVmRssKb, uint64_t& nVmSizeKb, ui
 #endif
 }
 
-static std::string ShortHash(const uint256& hash)
+static std::string LocatorFingerprint(const CBlockLocator& locator, const uint256& hashStop)
 {
-    return hash.ToString().substr(0, 20);
-}
-
-static std::string LocatorFingerprint(const CBlockLocator& locator, const uint256& hashStop, bool fShort)
-{
-    uint256 hashFirst = 0;
-    uint256 hashLast = 0;
-    std::ostringstream oss;
-    oss << "size=" << locator.Size();
-    if (locator.GetHashes(hashFirst, hashLast)) {
-        oss << " first=" << (fShort ? ShortHash(hashFirst) : hashFirst.ToString())
-            << " last=" << (fShort ? ShortHash(hashLast) : hashLast.ToString());
-    } else {
-        oss << " first=none last=none";
-    }
-    oss << " stop=" << (fShort ? ShortHash(hashStop) : hashStop.ToString());
-    return oss.str();
+    CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << locator << hashStop;
+    return Hash(ss.begin(), ss.end()).ToString();
 }
 
 static std::string DescribePeerForDiagnostics(const CNode* pnode)
@@ -251,14 +237,13 @@ static std::string FormatPeerDiagnosticsSummary(const CNode* pnode, int64_t nNow
     int64_t nAgeSinceSend = pnode->nLastSend > 0 ? (nNow - pnode->nLastSend) : -1;
     uint64_t nGetHeadersSent = 0;
     uint64_t nGetHeadersSuppressed = 0;
-    uint64_t nGetHeadersInFlight = 0;
+    uint64_t nGetHeadersInFlight = pnode->getHeadersSync.IsInFlight() ? 1 : 0;
 
     {
         std::map<NodeId, GetHeadersPeerStats>::const_iterator it = mapGetHeadersPeerStats.find(pnode->GetId());
         if (it != mapGetHeadersPeerStats.end()) {
             nGetHeadersSent = it->second.totalSent;
             nGetHeadersSuppressed = it->second.totalSuppressed;
-            nGetHeadersInFlight = it->second.inFlight;
         }
     }
 
@@ -289,6 +274,87 @@ static std::string FormatPeerDiagnosticsSummary(const CNode* pnode, int64_t nNow
 }
 
 } // namespace
+
+CGetHeadersSyncState::CGetHeadersSyncState()
+    : fInFlight(false),
+      fHasCompleted(false),
+      fHasLastRequest(false),
+      nActiveSince(0),
+      nLastCompletedTime(0),
+      nLastRequestTime(0),
+      nRequestSequence(0)
+{
+}
+
+CGetHeadersSyncState::StartResult CGetHeadersSyncState::Start(
+    const std::string& strRequestKey, int64_t nNow, int64_t nTimeout)
+{
+    LOCK(cs_state);
+
+    bool fTimedOut = false;
+    if (fInFlight)
+    {
+        const int64_t nAge = nNow >= nActiveSince ? nNow - nActiveSince : 0;
+        if (nAge < nTimeout)
+            return SUPPRESSED_ACTIVE;
+        fInFlight = false;
+        fTimedOut = true;
+    }
+
+    if (!fTimedOut && fHasCompleted && strRequestKey == strLastCompletedRequestKey)
+        return SUPPRESSED_COMPLETED;
+
+    fInFlight = true;
+    strActiveRequestKey = strRequestKey;
+    nActiveSince = nNow;
+    nLastRequestTime = nNow;
+    fHasLastRequest = true;
+    ++nRequestSequence;
+    return fTimedOut ? RETRIED_AFTER_TIMEOUT : STARTED;
+}
+
+bool CGetHeadersSyncState::Complete(int64_t nNow)
+{
+    LOCK(cs_state);
+    if (!fInFlight)
+        return false;
+
+    fInFlight = false;
+    fHasCompleted = true;
+    strLastCompletedRequestKey = strActiveRequestKey;
+    strActiveRequestKey.clear();
+    nLastCompletedTime = nNow;
+    return true;
+}
+
+bool CGetHeadersSyncState::IsInFlight() const
+{
+    LOCK(cs_state);
+    return fInFlight;
+}
+
+bool CGetHeadersSyncState::IsTimedOut(int64_t nNow, int64_t nTimeout) const
+{
+    LOCK(cs_state);
+    if (!fInFlight)
+        return false;
+    const int64_t nAge = nNow >= nActiveSince ? nNow - nActiveSince : 0;
+    return nAge >= nTimeout;
+}
+
+int64_t CGetHeadersSyncState::LastRequestAge(int64_t nNow) const
+{
+    LOCK(cs_state);
+    if (!fHasLastRequest)
+        return -1;
+    return nNow >= nLastRequestTime ? nNow - nLastRequestTime : 0;
+}
+
+uint64_t CGetHeadersSyncState::RequestSequence() const
+{
+    LOCK(cs_state);
+    return nRequestSequence;
+}
 
 void RecordP2PMessageStat(const CNode* pnode, const std::string& command, unsigned int bytes, bool incoming)
 {
@@ -584,75 +650,78 @@ void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
 void CNode::PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason)
 {
     const int64_t nNow = GetTime();
-    const int64_t nCooldown = 5;
     const std::string strReasonLabel = strReason.empty() ? std::string("unspecified") : strReason;
-    const std::string strLocatorKey = LocatorFingerprint(locator, hashStop, false);
-    const std::string strLocatorShort = LocatorFingerprint(locator, hashStop, true);
+    const std::string strLocatorKey = LocatorFingerprint(locator, hashStop);
+    uint256 hashLocatorTip = 0;
+    uint256 hashLocatorTail = 0;
+    const bool fHasLocator = locator.GetHashes(hashLocatorTip, hashLocatorTail);
+    int nLocalHeight = -1;
+    int nBestHeaderHeight = -1;
+    int nPeerBestKnownHeight = -1;
+    int nLocatorTipHeight = -1;
+    {
+        LOCK(cs_main);
+        nLocalHeight = nBestHeight;
+        nBestHeaderHeight = fSPVMode && pindexBest ? pindexBest->nHeight : -1;
+        nPeerBestKnownHeight = nBestKnownHeight;
+        if (fHasLocator) {
+            std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(hashLocatorTip);
+            if (mi != mapBlockIndex.end() && mi->second != NULL)
+                nLocatorTipHeight = mi->second->nHeight;
+        }
+    }
     uint64_t nLocatorCount = 0;
     uint64_t nPeerSent = 0;
     uint64_t nPeerSuppressed = 0;
-    uint64_t nPeerInFlight = 0;
-    bool fSuppressed = false;
-    bool fShouldLog = false;
-
+    const int64_t nPreviousRequestAge = getHeadersSync.LastRequestAge(nNow);
+    const CGetHeadersSyncState::StartResult startResult =
+        getHeadersSync.Start(strLocatorKey, nNow);
+    const bool fSuppressed =
+        startResult == CGetHeadersSyncState::SUPPRESSED_ACTIVE ||
+        startResult == CGetHeadersSyncState::SUPPRESSED_COMPLETED;
+    const char* pszStateReason =
+        startResult == CGetHeadersSyncState::RETRIED_AFTER_TIMEOUT ? "timeout-retry" :
+        startResult == CGetHeadersSyncState::SUPPRESSED_ACTIVE ? "active-request" :
+        startResult == CGetHeadersSyncState::SUPPRESSED_COMPLETED ? "completed-request" :
+        "new-request";
     {
         LOCK(cs_p2pMessageStats);
         GetHeadersPeerStats& peerStats = mapGetHeadersPeerStats[GetId()];
         GetHeadersLocatorState& locatorStats = peerStats.locators[strLocatorKey];
-        if (locatorStats.lastRequestTime != 0 && nNow - locatorStats.lastRequestTime < nCooldown) {
+        if (fSuppressed) {
             locatorStats.suppressed++;
             peerStats.totalSuppressed++;
-            nLocatorCount = locatorStats.suppressed;
-            nPeerSuppressed = peerStats.totalSuppressed;
-            nPeerSent = peerStats.totalSent;
-            nPeerInFlight = peerStats.inFlight;
-            fSuppressed = true;
         } else {
             locatorStats.sent++;
             locatorStats.lastRequestTime = nNow;
             peerStats.totalSent++;
-            peerStats.inFlight++;
-            nLocatorCount = locatorStats.sent;
-            nPeerSent = peerStats.totalSent;
-            nPeerSuppressed = peerStats.totalSuppressed;
-            nPeerInFlight = peerStats.inFlight;
-            fShouldLog = (locatorStats.sent <= 5 || (locatorStats.sent % 25 == 0) || (locatorStats.lastLogTime != 0 && nNow - locatorStats.lastLogTime >= 60));
-            if (fShouldLog)
-                locatorStats.lastLogTime = nNow;
+            peerStats.lastRequestTime = nNow;
         }
+        nLocatorCount = locatorStats.sent + locatorStats.suppressed;
+        nPeerSent = peerStats.totalSent;
+        nPeerSuppressed = peerStats.totalSuppressed;
     }
 
-    if (fDebugNet && (fSuppressed ? (nLocatorCount <= 5 || (nLocatorCount % 25) == 0) : fShouldLog)) {
-        if (fSuppressed) {
-            printf("GETHEADERS_SUPPRESSED: peer=%s local_height=%d best_header=%d peer_bestknownheight=%d peer_startingheight=%d locator{%s} hashStop=%s reason=%s repeat=%llu peer_sent=%llu peer_suppressed=%llu inflight=%llu cooldown=%llds\n",
-                   DescribePeerForDiagnostics(this).c_str(),
-                   nBestHeight,
-                   pindexBest ? pindexBest->nHeight : -1,
-                   nBestKnownHeight,
-                   nChainHeight,
-                   strLocatorShort.c_str(),
-                   hashStop.ToString().c_str(),
-                   strReasonLabel.c_str(),
-                   (unsigned long long)nLocatorCount,
-                   (unsigned long long)nPeerSent,
-                   (unsigned long long)nPeerSuppressed,
-                   (unsigned long long)nPeerInFlight,
-                   (long long)nCooldown);
-        } else {
-            printf("GETHEADERS_SEND: peer=%s local_height=%d best_header=%d peer_bestknownheight=%d peer_startingheight=%d locator{%s} hashStop=%s reason=%s repeat=%llu peer_sent=%llu peer_suppressed=%llu inflight=%llu\n",
-                   DescribePeerForDiagnostics(this).c_str(),
-                   nBestHeight,
-                   pindexBest ? pindexBest->nHeight : -1,
-                   nBestKnownHeight,
-                   nChainHeight,
-                   strLocatorShort.c_str(),
-                   hashStop.ToString().c_str(),
-                   strReasonLabel.c_str(),
-                   (unsigned long long)nLocatorCount,
-                   (unsigned long long)nPeerSent,
-                   (unsigned long long)nPeerSuppressed,
-                   (unsigned long long)nPeerInFlight);
-        }
+    if (fDebugNet) {
+        printf("GETHEADERS_TRACE: peer=%s peer_id=%lld reason=%s action=%s request_state=%s local_height=%d best_header_height=%d peer_best_known_height=%d locator_tip_hash=%s locator_tip_height=%d locator_size=%zu hash_stop=%s previous_request_age=%lld request_sequence=%llu locator_repeat=%llu peer_sent=%llu peer_suppressed=%llu inflight=%d\n",
+               addrName.c_str(),
+               (long long)GetId(),
+               strReasonLabel.c_str(),
+               fSuppressed ? "suppress" : "send",
+               pszStateReason,
+               nLocalHeight,
+               nBestHeaderHeight,
+               nPeerBestKnownHeight,
+               fHasLocator ? hashLocatorTip.ToString().c_str() : "none",
+               nLocatorTipHeight,
+               locator.Size(),
+               hashStop.ToString().c_str(),
+               (long long)nPreviousRequestAge,
+               (unsigned long long)getHeadersSync.RequestSequence(),
+               (unsigned long long)nLocatorCount,
+               (unsigned long long)nPeerSent,
+               (unsigned long long)nPeerSuppressed,
+               getHeadersSync.IsInFlight() ? 1 : 0);
     }
 
     if (fSuppressed)
@@ -661,17 +730,13 @@ void CNode::PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const
     PushMessage("getheaders", locator, hashStop);
 }
 
-void RecordGetHeadersResponse(const CNode* pnode, size_t nHeaders, unsigned int nBytes)
+void RecordGetHeadersResponse(CNode* pnode, size_t nHeaders, unsigned int nBytes)
 {
     (void)nHeaders;
     (void)nBytes;
     if (pnode == NULL)
         return;
-
-    LOCK(cs_p2pMessageStats);
-    GetHeadersPeerStats& peerStats = mapGetHeadersPeerStats[pnode->GetId()];
-    if (peerStats.inFlight > 0)
-        peerStats.inFlight--;
+    pnode->getHeadersSync.Complete(GetTime());
 }
 
 
@@ -2940,13 +3005,21 @@ void static StartSync(const vector<CNode*> &vNodes) {
 
     // fImporting and fReindex are accessed out of cs_main here, but only
     // as an optimization - they are checked again in SendMessages.
-    if (fImporting || fReindex)
+    if (fImporting || fReindex || fSPVMode)
         return;
+
+    int nLocalHeight = -1;
+    {
+        LOCK(cs_main);
+        nLocalHeight = nBestHeight;
+    }
 
     BOOST_FOREACH(CNode* pnode, vNodes) {
         if (pnode->fClient || pnode->fOneShot || pnode->fDisconnect || !pnode->fSuccessfullyConnected)
             continue;
         if (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)
+            continue;
+        if (!pnode->CanAdvanceBlockSync(nLocalHeight))
             continue;
         int64_t nPeerHeight = GetPeerAdvertisedHeight(pnode);
         if (nPeerHeight > nMaxPeerHeight)
@@ -2958,6 +3031,8 @@ void static StartSync(const vector<CNode*> &vNodes) {
         if (pnode->fClient || pnode->fOneShot || pnode->fDisconnect || !pnode->fSuccessfullyConnected)
             continue;
         if (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)
+            continue;
+        if (!pnode->CanAdvanceBlockSync(nLocalHeight))
             continue;
 
         int64_t nScore = SyncPeerScore(pnode, GetTime(), nMaxPeerHeight);

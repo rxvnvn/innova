@@ -55,7 +55,7 @@ void StartNode(void* parg);
 bool StopNode();
 void SocketSendData(CNode *pnode);
 void RecordP2PMessageStat(const CNode* pnode, const std::string& command, unsigned int bytes, bool incoming);
-void RecordGetHeadersResponse(const CNode* pnode, size_t nHeaders, unsigned int nBytes);
+void RecordGetHeadersResponse(CNode* pnode, size_t nHeaders, unsigned int nBytes);
 void LogSyncDiagnosticsMaybe();
 
 // Signals for message handling
@@ -348,6 +348,43 @@ public:
 
 typedef std::map<CSubNet, CBanEntry> banmap_t;
 
+static const int64_t GETHEADERS_REQUEST_TIMEOUT = 60;
+
+class CGetHeadersSyncState
+{
+public:
+    enum StartResult
+    {
+        STARTED,
+        RETRIED_AFTER_TIMEOUT,
+        SUPPRESSED_ACTIVE,
+        SUPPRESSED_COMPLETED
+    };
+
+    CGetHeadersSyncState();
+
+    StartResult Start(const std::string& strRequestKey, int64_t nNow,
+                      int64_t nTimeout = GETHEADERS_REQUEST_TIMEOUT);
+    bool Complete(int64_t nNow);
+    bool IsInFlight() const;
+    bool IsTimedOut(int64_t nNow,
+                    int64_t nTimeout = GETHEADERS_REQUEST_TIMEOUT) const;
+    int64_t LastRequestAge(int64_t nNow) const;
+    uint64_t RequestSequence() const;
+
+private:
+    mutable CCriticalSection cs_state;
+    bool fInFlight;
+    bool fHasCompleted;
+    bool fHasLastRequest;
+    std::string strActiveRequestKey;
+    std::string strLastCompletedRequestKey;
+    int64_t nActiveSince;
+    int64_t nLastCompletedTime;
+    int64_t nLastRequestTime;
+    uint64_t nRequestSequence;
+};
+
 /** Information about a peer */
 class CNode
 {
@@ -440,6 +477,7 @@ public:
     int nExpectedBatchSize;
     bool fPrefetchSent;
     uint256 hashLastBlockInBatch;
+	CGetHeadersSyncState getHeadersSync;
 	int nMisbehavior;
     mutable CCriticalSection cs_nMisbehavior;
 
@@ -453,6 +491,7 @@ public:
     // inventory based relay
     mruset<CInv> setInventoryKnown;
     std::vector<CInv> vInventoryToSend;
+    std::vector<CInv> vGetBlocksInventoryToSend;
     CCriticalSection cs_inventory;
     std::multimap<int64_t, CInv> mapAskFor;
 
@@ -643,6 +682,14 @@ public:
             if (!setInventoryKnown.count(inv) && vInventoryToSend.size() < MAX_INV_TO_SEND)
                 vInventoryToSend.push_back(inv);
         }
+    }
+
+    void PushGetBlocksInventory(const CInv& inv)
+    {
+        LOCK(cs_inventory);
+        static const size_t MAX_INV_TO_SEND = 50000;
+        if (vGetBlocksInventoryToSend.size() < MAX_INV_TO_SEND)
+            vGetBlocksInventoryToSend.push_back(inv);
     }
 
     void AskFor(const CInv& inv)
@@ -950,6 +997,17 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
 
     void PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd);
     void PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason = std::string());
+
+    bool CanAdvanceBlockSync(int nLocalHeight) const
+    {
+        const int nPeerHeight = nBestKnownHeight >= 0 ? nBestKnownHeight : nChainHeight;
+        return nPeerHeight > nLocalHeight;
+    }
+
+    bool ShouldContinueKnownBlockInventory(int nLocalHeight, bool fLastBlockInMainChain) const
+    {
+        return CanAdvanceBlockSync(nLocalHeight) || !fLastBlockInMainChain;
+    }
 
     void UpdateBestKnownBlock(int nHeight, const uint256& hashBlock)
     {
