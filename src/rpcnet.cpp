@@ -20,7 +20,10 @@ Value getconnectioncount(const Array& params, bool fHelp)
             "getconnectioncount\n"
             "Returns the number of connections to other nodes.");
 
+    CSyncLockDiagnostics lockDiagnostics(
+        "getconnectioncount", "cs_vNodes");
     LOCK(cs_vNodes);
+    lockDiagnostics.Acquired();
     return (int)vNodes.size();
 }
 
@@ -28,7 +31,10 @@ static void CopyNodeStats(std::vector<CNodeStats>& vstats)
 {
     vstats.clear();
 
+    CSyncLockDiagnostics lockDiagnostics(
+        "getpeerinfo", "cs_vNodes");
     LOCK(cs_vNodes);
+    lockDiagnostics.Acquired();
     vstats.reserve(vNodes.size());
     for (CNode* pnode : vNodes) {
         CNodeStats stats;

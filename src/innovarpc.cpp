@@ -10,6 +10,7 @@
 #include "base58.h"
 #include "innovarpc.h"
 #include "db.h"
+#include "net.h"
 
 #undef printf
 #include <boost/asio.hpp>
@@ -1196,7 +1197,8 @@ void JSONRequest::parse(const Value& valRequest)
         throw JSONRPCError(RPC_INVALID_REQUEST, "Method must be a string");
     strMethod = valMethod.get_str();
     if (strMethod != "getwork" && strMethod != "getblocktemplate")
-        printf("ThreadRPCServer method=%s\n", strMethod.c_str());
+        printf("ThreadRPCServer time_us=%lld method=%s\n",
+               (long long)GetTimeMicros(), strMethod.c_str());
 
     // Parse params
     Value valParams = find_value(request, "params");
@@ -1419,32 +1421,76 @@ void ThreadRPCServer3(void* parg)
     }
 }
 
-json_spirit::Value CRPCTable::execute(const std::string &strMethod, const json_spirit::Array &params) const
+json_spirit::Value CRPCTable::execute(
+    const std::string &strMethod,
+    const json_spirit::Array &params) const
 {
-    // Find method
-    const CRPCCommand *pcmd = tableRPC[strMethod];
+    const CRPCCommand* pcmd = tableRPC[strMethod];
     if (!pcmd)
-        throw JSONRPCError(RPC_METHOD_NOT_FOUND, "Method not found");
+        throw JSONRPCError(
+            RPC_METHOD_NOT_FOUND, "Method not found");
 
-    // Observe safe mode
     string strWarning = GetWarnings("rpc");
-    if (strWarning != "" && !GetBoolArg("-disablesafemode") &&
+    if (strWarning != "" &&
+        !GetBoolArg("-disablesafemode") &&
         !pcmd->okSafeMode)
-        throw JSONRPCError(RPC_FORBIDDEN_BY_SAFE_MODE, string("Safe mode: ") + strWarning);
+    {
+        throw JSONRPCError(
+            RPC_FORBIDDEN_BY_SAFE_MODE,
+            string("Safe mode: ") + strWarning);
+    }
+
+    const bool fGetInfoProbe = strMethod == "getinfo";
+    const int64_t nRequestStartTime = GetTimeMicros();
+    if (fGetInfoProbe)
+        LogGetInfoSyncProbe(
+            "BEGIN", nRequestStartTime, -1);
 
     try
     {
-        // Execute
-        Value result;
+        try
         {
+            Value result;
             if (pcmd->unlocked)
-                result = pcmd->actor(params, false);
-            else {
-                LOCK2(cs_main, pwalletMain->cs_wallet);
+            {
                 result = pcmd->actor(params, false);
             }
+            else
+            {
+                CSyncLockDiagnostics lockDiagnostics(
+                    fGetInfoProbe
+                        ? "CRPCTable::execute(getinfo)"
+                        : "CRPCTable::execute",
+                    "cs_main+cs_wallet");
+                const int64_t nLockWaitStart =
+                    GetTimeMicros();
+                {
+                    LOCK2(cs_main, pwalletMain->cs_wallet);
+                    lockDiagnostics.Acquired();
+                    if (fGetInfoProbe)
+                    {
+                        LogGetInfoSyncProbe(
+                            "LOCKED", nRequestStartTime,
+                            std::max<int64_t>(
+                                0, GetTimeMicros() -
+                                       nLockWaitStart));
+                    }
+                    result = pcmd->actor(params, false);
+                }
+            }
+
+            if (fGetInfoProbe)
+                LogGetInfoSyncProbe(
+                    "END", nRequestStartTime, -1);
+            return result;
         }
-        return result;
+        catch (...)
+        {
+            if (fGetInfoProbe)
+                LogGetInfoSyncProbe(
+                    "END", nRequestStartTime, -1);
+            throw;
+        }
     }
     catch (std::exception& e)
     {

@@ -397,6 +397,454 @@ static CCriticalSection cs_pnodeSync;  // Protects pnodeSync pointer
 NodeId nLastNodeId = 0;
 CCriticalSection cs_nLastNodeId;
 
+static CCriticalSection cs_stalledSyncRecovery;
+static CStalledSyncRecoveryState stalledSyncRecoveryState;
+static CCriticalSection cs_getInfoProbeSnapshot;
+static std::string strGetInfoProbeSnapshot;
+static int64_t nGetInfoProbeSnapshotTime = 0;
+
+CStalledSyncRecoveryState::CStalledSyncRecoveryState()
+    : nLastObservedHeight(-1),
+      nLastProgressTime(0),
+      nLastRecoveryTime(0),
+      hashRejectedBlock(),
+      nRejectedBlockTime(0),
+      fRejectedRetryScheduled(false),
+      nRecoveryAttempts(0)
+{
+}
+
+bool CStalledSyncRecoveryState::ShouldRecover(
+    int nLocalHeight, int nPeerHeight, bool fPipelineActive,
+    int64_t nNow, int64_t nStallTimeout, int64_t nCooldown)
+{
+    if (nLastObservedHeight != nLocalHeight ||
+        (nLastProgressTime != 0 && nNow < nLastProgressTime))
+    {
+        nLastObservedHeight = nLocalHeight;
+        nLastProgressTime = nNow;
+        nLastRecoveryTime = 0;
+        nRecoveryAttempts = 0;
+        return false;
+    }
+
+    if (nPeerHeight <= nLocalHeight || fPipelineActive)
+        return false;
+
+    const unsigned int nBackoffShift =
+        std::min<unsigned int>(nRecoveryAttempts, 5);
+    const int64_t nEffectiveCooldown =
+        nCooldown * ((int64_t)1 << nBackoffShift);
+    const int64_t nSinceProgress =
+        nLastProgressTime == 0 ? 0 : nNow - nLastProgressTime;
+    const int64_t nSinceRecovery =
+        nLastRecoveryTime == 0
+            ? nEffectiveCooldown
+            : nNow - nLastRecoveryTime;
+    if (nSinceProgress < nStallTimeout ||
+        nSinceRecovery < nEffectiveCooldown)
+    {
+        return false;
+    }
+
+    nLastRecoveryTime = nNow;
+    ++nRecoveryAttempts;
+    return true;
+}
+
+void CStalledSyncRecoveryState::RecordRejectedBlock(
+    const uint256& hashBlock, int64_t nNow)
+{
+    if (hashBlock == 0)
+        return;
+    if (hashRejectedBlock != hashBlock)
+    {
+        fRejectedRetryScheduled = false;
+        nRecoveryAttempts = 0;
+    }
+    hashRejectedBlock = hashBlock;
+    nRejectedBlockTime = nNow;
+}
+
+void CStalledSyncRecoveryState::ClearRejectedBlock(const uint256& hashBlock)
+{
+    if (hashRejectedBlock != hashBlock)
+        return;
+    hashRejectedBlock = 0;
+    nRejectedBlockTime = 0;
+    fRejectedRetryScheduled = false;
+}
+
+bool CStalledSyncRecoveryState::TakeRejectedBlockForRetry(uint256& hashBlock)
+{
+    if (hashRejectedBlock == 0 || fRejectedRetryScheduled)
+        return false;
+    hashBlock = hashRejectedBlock;
+    fRejectedRetryScheduled = true;
+    return true;
+}
+
+void RecordRejectedBlockForSync(const uint256& hashBlock)
+{
+    LOCK(cs_stalledSyncRecovery);
+    stalledSyncRecoveryState.RecordRejectedBlock(hashBlock, GetTime());
+    if (SyncTraceEnabled())
+        printf("SYNC_EVENT time_us=%lld event=REJECT_RETRY_RECORDED hash=%s\n",
+               (long long)GetTimeMicros(), hashBlock.ToString().c_str());
+}
+
+void ClearRejectedBlockForSync(const uint256& hashBlock)
+{
+    LOCK(cs_stalledSyncRecovery);
+    stalledSyncRecoveryState.ClearRejectedBlock(hashBlock);
+}
+
+bool SyncTraceEnabled()
+{
+    return BlockRequestTraceEnabled() ||
+           GetBoolArg("-getinfosyncprobe", false) ||
+           GetBoolArg("-synclockdiagnostics", false);
+}
+CSyncLockDiagnostics::CSyncLockDiagnostics(
+    const char* pszLocationIn, const char* pszLocksIn)
+    : pszLocation(pszLocationIn),
+      pszLocks(pszLocksIn),
+      nWaitStartTime(GetTimeMicros()),
+      nAcquiredTime(0),
+      fEnabled(GetBoolArg("-synclockdiagnostics", false))
+{
+}
+
+void CSyncLockDiagnostics::Acquired()
+{
+    if (fEnabled && nAcquiredTime == 0)
+        nAcquiredTime = GetTimeMicros();
+}
+
+CSyncLockDiagnostics::~CSyncLockDiagnostics()
+{
+    if (!fEnabled || nAcquiredTime == 0)
+        return;
+
+    const int64_t nEndTime = GetTimeMicros();
+    const int64_t nWaitMicros =
+        std::max<int64_t>(0, nAcquiredTime - nWaitStartTime);
+    const int64_t nHoldMicros =
+        std::max<int64_t>(0, nEndTime - nAcquiredTime);
+    const int64_t nThresholdMicros =
+        std::max<int64_t>(
+            1, GetArg("-synclockthresholdms", 250)) * 1000;
+    if (nWaitMicros < nThresholdMicros &&
+        nHoldMicros < nThresholdMicros)
+    {
+        return;
+    }
+
+    std::ostringstream threadName;
+    threadName << boost::this_thread::get_id();
+    printf("SYNCLOCK time_us=%lld thread=%s location=%s locks=%s wait_us=%lld hold_us=%lld threshold_us=%lld\n",
+           (long long)nEndTime, threadName.str().c_str(),
+           pszLocation, pszLocks, (long long)nWaitMicros,
+           (long long)nHoldMicros, (long long)nThresholdMicros);
+}
+
+void LogGetInfoSyncProbe(const char* pszEvent,
+                         int64_t nRequestStartTime,
+                         int64_t nLockWaitMicros)
+{
+    if (!GetBoolArg("-getinfosyncprobe", false))
+        return;
+
+    std::string strSnapshot;
+    int64_t nSnapshotTime = 0;
+    {
+        LOCK(cs_getInfoProbeSnapshot);
+        strSnapshot = strGetInfoProbeSnapshot;
+        nSnapshotTime = nGetInfoProbeSnapshotTime;
+    }
+
+    const int64_t nNow = GetTimeMicros();
+    printf("GETINFO_PROBE_%s time_us=%lld request_start_us=%lld lock_wait_us=%lld snapshot_time_us=%lld snapshot_age_us=%lld %s\n",
+           pszEvent, (long long)nNow,
+           (long long)nRequestStartTime,
+           (long long)nLockWaitMicros,
+           (long long)nSnapshotTime,
+           (long long)(nSnapshotTime == 0
+                           ? -1
+                           : std::max<int64_t>(0, nNow - nSnapshotTime)),
+           strSnapshot.empty() ? "snapshot=unavailable"
+                               : strSnapshot.c_str());
+}
+
+
+CNode* MaybeQueueStalledSyncRecovery(
+    const std::vector<CNode*>& vNodesIn, CBlockIndex* pindexTip,
+    int nLocalHeight, int64_t nNow, int64_t nStallTimeout,
+    int64_t nCooldown, CStalledSyncRecoveryState& state)
+{
+    int64_t nMaxPeerHeight = -1;
+    bool fPipelineActive = false;
+    std::vector<CNode*> vEligiblePeers;
+
+    BOOST_FOREACH(CNode* pnode, vNodesIn)
+    {
+        if (pnode == NULL || pnode->fDisconnect ||
+            !pnode->fSuccessfullyConnected || pnode->fClient ||
+            pnode->fOneShot || !IsBlockSyncPeerVersion(pnode->nVersion))
+        {
+            continue;
+        }
+
+        const int64_t nPeerHeight = GetPeerAdvertisedHeight(pnode);
+        nMaxPeerHeight = std::max(nMaxPeerHeight, nPeerHeight);
+        if (nPeerHeight > nLocalHeight)
+            vEligiblePeers.push_back(pnode);
+
+        if (pnode->fStartSync || !pnode->setBlocksInFlight.empty() ||
+            !pnode->getBlocksIndex.empty())
+        {
+            fPipelineActive = true;
+        }
+        if (!fPipelineActive)
+        {
+            for (std::multimap<int64_t, CInv>::const_iterator it =
+                     pnode->mapAskFor.begin();
+                 it != pnode->mapAskFor.end(); ++it)
+            {
+                if (it->second.type == MSG_BLOCK ||
+                    it->second.type == MSG_FILTERED_BLOCK)
+                {
+                    fPipelineActive = true;
+                    break;
+                }
+            }
+        }
+    }
+    std::vector<std::pair<int64_t, CNode*> > vCandidates;
+    BOOST_FOREACH(CNode* pnode, vEligiblePeers)
+    {
+        vCandidates.push_back(std::make_pair(
+            SyncPeerScore(pnode, nNow, nMaxPeerHeight), pnode));
+    }
+
+    if (pindexTip == NULL || vEligiblePeers.empty() ||
+        !state.ShouldRecover(nLocalHeight, (int)nMaxPeerHeight,
+                             fPipelineActive, nNow,
+                             nStallTimeout, nCooldown))
+    {
+        return NULL;
+    }
+
+    std::sort(vCandidates.begin(), vCandidates.end(), CompareSyncCandidates);
+    const size_t nOwnerIndex =
+        (state.RecoveryAttempts() - 1) % vCandidates.size();
+    CNode* pnodeRecovery = vCandidates[nOwnerIndex].second;
+    pnodeRecovery->PushGetBlocks(pindexTip, uint256(0));
+
+    uint256 hashRejected;
+    if (state.TakeRejectedBlockForRetry(hashRejected))
+    {
+        pnodeRecovery->AskFor(CInv(MSG_BLOCK, hashRejected),
+                              BLOCKREQ_SOURCE_REJECT_RECOVERY);
+        if (SyncTraceEnabled())
+            printf("SYNC_EVENT time_us=%lld event=REJECT_RETRY_SCHEDULED peer=%d hash=%s\n",
+                   (long long)GetTimeMicros(),
+                   pnodeRecovery->GetId(),
+                   hashRejected.ToString().c_str());
+    }
+
+    if (BlockRequestTraceEnabled())
+    {
+        const int64_t nAge = state.LastProgressTime() == 0
+            ? -1 : std::max<int64_t>(0, nNow - state.LastProgressTime());
+        const std::vector<uint256> vNoErasedHashes;
+        BlockRequestTraceStallRecovery(
+            pnodeRecovery, nLocalHeight,
+            (int)GetPeerAdvertisedHeight(pnodeRecovery), nAge,
+            pindexTip->GetBlockHash(), pindexTip->nHeight,
+            uint256(0), vNoErasedHashes);
+    }
+    if (SyncTraceEnabled())
+    {
+        printf("SYNC_EVENT time_us=%lld event=STALL_RECOVERY_OWNER peer=%d local_height=%d peer_height=%lld rejected_retry=%s\n",
+               (long long)GetTimeMicros(), pnodeRecovery->GetId(),
+               nLocalHeight,
+               (long long)GetPeerAdvertisedHeight(pnodeRecovery),
+               hashRejected.ToString().c_str());
+    }
+    return pnodeRecovery;
+}
+
+static void UpdateGetInfoSyncProbeSnapshot(
+    const std::vector<CNode*>& vNodesCopy)
+{
+    if (!GetBoolArg("-getinfosyncprobe", false))
+        return;
+
+    int nLocalHeight = -1;
+    int nBestHeaderHeight = -1;
+    int64_t nLastAcceptedBlockTime = 0;
+    bool fInitialBlockDownload = true;
+    {
+        TRY_LOCK(cs_main, lockMain);
+        if (!lockMain)
+            return;
+        nLocalHeight = nBestHeight;
+        // Full-node mode has no independent header chain in this client.
+        nBestHeaderHeight =
+            fSPVMode && pindexBest ? pindexBest->nHeight : nBestHeight;
+        nLastAcceptedBlockTime = nTimeBestReceived;
+        fInitialBlockDownload = IsInitialBlockDownload();
+    }
+
+    CNode* pnodeSyncCopy = NULL;
+    {
+        LOCK(cs_pnodeSync);
+        if (pnodeSync != NULL &&
+            std::find(vNodesCopy.begin(), vNodesCopy.end(),
+                      pnodeSync) != vNodesCopy.end())
+        {
+            pnodeSyncCopy = pnodeSync;
+        }
+        else
+        {
+            pnodeSync = NULL;
+        }
+    }
+
+    int64_t nMaxPeerHeight = -1;
+    size_t nBlocksInFlight = 0;
+    size_t nQueuedGetBlocks = 0;
+    size_t nTotalAskFor = 0;
+    int64_t nLastBlockReceiveTime = 0;
+    int64_t nLastGetBlocksTime = 0;
+    int64_t nLastGetDataTime = 0;
+    std::ostringstream peerStates;
+    bool fFirstPeer = true;
+    BOOST_FOREACH(CNode* pnode, vNodesCopy)
+    {
+        const int64_t nPeerHeight =
+            GetPeerAdvertisedHeight(pnode);
+        nMaxPeerHeight =
+            std::max(nMaxPeerHeight, nPeerHeight);
+        nBlocksInFlight += pnode->setBlocksInFlight.size();
+        nQueuedGetBlocks += pnode->getBlocksIndex.size();
+        nTotalAskFor += pnode->mapAskFor.size();
+        nLastBlockReceiveTime =
+            std::max(nLastBlockReceiveTime,
+                     pnode->nLastBlockRecv);
+        nLastGetBlocksTime =
+            std::max(nLastGetBlocksTime,
+                     pnode->nLastGetBlocksTime);
+        nLastGetDataTime =
+            std::max(nLastGetDataTime,
+                     pnode->nLastGetDataTime);
+
+        if (!fFirstPeer)
+            peerStates << ';';
+        fFirstPeer = false;
+        peerStates
+            << pnode->GetId() << ':'
+            << nPeerHeight << ':'
+            << (pnode->fStartSync ? 1 : 0) << ':'
+            << pnode->mapAskFor.size() << ':'
+            << pnode->setBlocksInFlight.size() << ':'
+            << pnode->getBlocksIndex.size() << ':'
+            << pnode->nLastBlockRecv << ':'
+            << pnode->nLastGetBlocksTime << ':'
+            << pnode->nLastGetDataTime;
+    }
+
+    size_t nAlreadyAskedFor = 0;
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        nAlreadyAskedFor = mapAlreadyAskedFor.size();
+    }
+
+    int nCollateralListState = 0;
+    size_t nCollateralListCount = 0;
+    unsigned int nCollateralMedianCount = 0;
+    {
+        TRY_LOCK(cs_collateralnodes, lockCollateralnodes);
+        if (lockCollateralnodes)
+        {
+            nCollateralListState = 1;
+            nCollateralListCount = vecCollateralnodes.size();
+            nCollateralMedianCount = mnCount;
+        }
+    }
+
+    uint256 hashRejected;
+    int64_t nRejectedBlockTime = 0;
+    int64_t nRecoveryLastProgress = 0;
+    int64_t nRecoveryLastAttempt = 0;
+    unsigned int nRecoveryAttempts = 0;
+    {
+        LOCK(cs_stalledSyncRecovery);
+        hashRejected = stalledSyncRecoveryState.RejectedBlock();
+        nRejectedBlockTime =
+            stalledSyncRecoveryState.RejectedBlockTime();
+        nRecoveryLastProgress =
+            stalledSyncRecoveryState.LastProgressTime();
+        nRecoveryLastAttempt =
+            stalledSyncRecoveryState.LastRecoveryTime();
+        nRecoveryAttempts =
+            stalledSyncRecoveryState.RecoveryAttempts();
+    }
+
+    std::ostringstream snapshot;
+    snapshot
+        << "local_height=" << nLocalHeight
+        << " best_header=" << nBestHeaderHeight
+        << " max_peer_height=" << nMaxPeerHeight
+        << " initialblockdownload="
+        << (fInitialBlockDownload ? 1 : 0)
+        << " connections=" << vNodesCopy.size()
+        << " sync_peer="
+        << (pnodeSyncCopy ? pnodeSyncCopy->GetId() : -1)
+        << " blocks_in_flight=" << nBlocksInFlight
+        << " queued_getblocks=" << nQueuedGetBlocks
+        << " total_askfor=" << nTotalAskFor
+        << " mapAskFor_size=" << nTotalAskFor
+        << " mapAlreadyAskedFor_size=" << nAlreadyAskedFor
+        << " last_block_receive_time="
+        << nLastBlockReceiveTime
+        << " last_accepted_block_time="
+        << nLastAcceptedBlockTime
+        << " last_getblocks_time=" << nLastGetBlocksTime
+        << " last_getdata_time=" << nLastGetDataTime
+        << " collateralnode_sync_state=unavailable"
+        << " collateralnode_list_height=-1"
+        << " collateralnode_list_state="
+        << nCollateralListState
+        << " collateralnode_list_count="
+        << nCollateralListCount
+        << " collateralnode_median_count="
+        << nCollateralMedianCount
+        << " recovery_last_progress_time="
+        << nRecoveryLastProgress
+        << " recovery_last_attempt_time="
+        << nRecoveryLastAttempt
+        << " recovery_attempts=" << nRecoveryAttempts
+        << " rejected_retry_hash="
+        << hashRejected.ToString()
+        << " rejected_retry_time=" << nRejectedBlockTime
+        << " cs_main_diagnostics="
+        << (GetBoolArg("-synclockdiagnostics", false)
+                ? "threshold"
+                : "disabled")
+        << " peer_state_format=id:height:fStartSync:askfor:inflight:getblocks:last_block:last_getblocks:last_getdata"
+        << " peer_states=" << peerStates.str();
+
+    const int64_t nSnapshotTime = GetTimeMicros();
+    {
+        LOCK(cs_getInfoProbeSnapshot);
+        strGetInfoProbeSnapshot = snapshot.str();
+        nGetInfoProbeSnapshotTime = nSnapshotTime;
+    }
+}
+
+
 void LogSyncDiagnosticsMaybe()
 {
     const int64_t nNow = GetTime();
@@ -414,7 +862,33 @@ void LogSyncDiagnosticsMaybe()
     }
     {
         LOCK(cs_pnodeSync);
-        pnodeSyncCopy = pnodeSync;
+        if (pnodeSync != NULL &&
+            std::find(vNodesCopy.begin(), vNodesCopy.end(),
+                      pnodeSync) != vNodesCopy.end())
+        {
+            pnodeSyncCopy = pnodeSync;
+        }
+        else
+        {
+            pnodeSync = NULL;
+        }
+    }
+
+    int nLocalHeight = -1;
+    int nBestHeaderHeight = -1;
+    bool fInitialBlockDownload = true;
+    {
+        TRY_LOCK(cs_main, lockMain);
+        if (!lockMain)
+        {
+            BOOST_FOREACH(CNode* pnode, vNodesCopy)
+                pnode->Release();
+            return;
+        }
+        nLocalHeight = nBestHeight;
+        nBestHeaderHeight =
+            fSPVMode && pindexBest ? pindexBest->nHeight : nBestHeight;
+        fInitialBlockDownload = IsInitialBlockDownload();
     }
 
     int64_t nMaxPeerHeight = -1;
@@ -441,14 +915,22 @@ void LogSyncDiagnosticsMaybe()
     BOOST_FOREACH(CNode* pnode, vNodesCopy) {
         if (pnode->fDisconnect || !pnode->fSuccessfullyConnected || pnode->fClient || pnode->fOneShot)
             continue;
-        if (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)
+        if (!IsBlockSyncPeerVersion(pnode->nVersion))
             continue;
         vCandidates.push_back(std::make_pair(SyncPeerScore(pnode, nNow, nMaxPeerHeight), pnode));
     }
     std::sort(vCandidates.begin(), vCandidates.end(), CompareSyncCandidates);
 
-    uint64_t nDeltaRecv = (nLastSyncDiagnosticsBytesRecv == 0) ? 0 : (nTotalBytesRecv - nLastSyncDiagnosticsBytesRecv);
-    uint64_t nDeltaSent = (nLastSyncDiagnosticsBytesSent == 0) ? 0 : (nTotalBytesSent - nLastSyncDiagnosticsBytesSent);
+    uint64_t nDeltaRecv =
+        (nLastSyncDiagnosticsBytesRecv == 0 ||
+         nTotalBytesRecv < nLastSyncDiagnosticsBytesRecv)
+            ? 0
+            : nTotalBytesRecv - nLastSyncDiagnosticsBytesRecv;
+    uint64_t nDeltaSent =
+        (nLastSyncDiagnosticsBytesSent == 0 ||
+         nTotalBytesSent < nLastSyncDiagnosticsBytesSent)
+            ? 0
+            : nTotalBytesSent - nLastSyncDiagnosticsBytesSent;
     uint64_t nProcessVmRssKb = 0;
     uint64_t nProcessVmSizeKb = 0;
     uint64_t nProcessVmDataKb = 0;
@@ -470,11 +952,7 @@ void LogSyncDiagnosticsMaybe()
             if (lockRecv)
                 nRecvQueueBytes = pnode->GetTotalRecvSize();
         }
-        {
-            TRY_LOCK(pnode->cs_mapRequests, lockReq);
-            if (lockReq)
-                nAskForSize = pnode->mapAskFor.size();
-        }
+        nAskForSize = pnode->mapAskFor.size();
         nTotalSendQueueBytes += nSendQueueBytes;
         nTotalRecvQueueBytes += nRecvQueueBytes;
         nTotalAskFor += nAskForSize;
@@ -497,10 +975,12 @@ void LogSyncDiagnosticsMaybe()
         vCommands.push_back("pong");
         vCommands.push_back("reject");
         vCommands.push_back("notfound");
-        printf("SYNCSTATE: local_height=%d best_header=%lld initialblockdownload=%d connections=%zu sync_peer=%s blocks_in_flight=%lld queued_getblocks=%lld datareceived=%llu delta_recv=%llu delta_sent=%llu\n",
-               nBestHeight,
+        printf("SYNCSTATE: time_us=%lld local_height=%d best_header=%d max_peer_height=%lld initialblockdownload=%d connections=%zu sync_peer=%s blocks_in_flight=%lld queued_getblocks=%lld datareceived=%llu delta_recv=%llu delta_sent=%llu\n",
+               (long long)GetTimeMicros(),
+               nLocalHeight,
+               nBestHeaderHeight,
                (long long)nMaxPeerHeight,
-               IsInitialBlockDownload() ? 1 : 0,
+               fInitialBlockDownload ? 1 : 0,
                vNodesCopy.size(),
                pnodeSyncCopy ? DescribePeerForDiagnostics(pnodeSyncCopy).c_str() : "none",
                (long long)nTotalBlocksInFlight,
@@ -559,11 +1039,7 @@ void LogSyncDiagnosticsMaybe()
                     nRecvQueueBytes = pnode->GetTotalRecvSize();
                 }
             }
-            {
-                TRY_LOCK(pnode->cs_mapRequests, lockReq);
-                if (lockReq)
-                    nAskForSize = pnode->mapAskFor.size();
-            }
+            nAskForSize = pnode->mapAskFor.size();
 
             printf("PEERMEM: id=%d addr=%s send_queue_bytes=%zu send_queue_msgs=%zu recv_queue_bytes=%zu recv_queue_msgs=%zu askfor=%zu blocks_in_flight=%zu connected=%d disconnect=%d\n",
                    pnode->GetId(),
@@ -760,6 +1236,8 @@ static const char* BlockRequestTraceSourceName(BlockRequestTraceSource source)
         return "orphan";
     case BLOCKREQ_SOURCE_CHECKPOINT:
         return "checkpoint";
+    case BLOCKREQ_SOURCE_REJECT_RECOVERY:
+        return "reject-recovery";
     default:
         return "other";
     }
@@ -2554,7 +3032,6 @@ void CNode::copyStats(CNodeStats &stats)
     stats.hashBestKnownBlock = hashBestKnownBlock.ToString();
     X(nLastBlockRecv);
     X(nLastHeightUpdate);
-    ExpireBlockInFlight();
     stats.nBlocksInFlight = (int)setBlocksInFlight.size();
     stats.nAskForSize = (int)mapAskFor.size();
     X(nMisbehavior);
@@ -4066,91 +4543,133 @@ bool OpenNetworkConnectionSimple(const CAddress& addrConnect, const char *strDes
 
 
 
-void static StartSync(const vector<CNode*> &vNodes) {
-    CNode *pnodeNewSync = NULL;
-    CNode *pnodeOldSync = NULL;
+static bool NodeVectorContains(const vector<CNode*>& vNodesIn,
+                               const CNode* pnodeFind)
+{
+    return pnodeFind != NULL &&
+           std::find(vNodesIn.begin(), vNodesIn.end(), pnodeFind) !=
+               vNodesIn.end();
+}
+
+static CNode* GetValidSyncPeer(const vector<CNode*>& vNodesIn)
+{
+    LOCK(cs_pnodeSync);
+    if (!NodeVectorContains(vNodesIn, pnodeSync))
+        pnodeSync = NULL;
+    return pnodeSync;
+}
+
+static CNode* AssignSyncPeer(const vector<CNode*>& vNodesIn,
+                             CNode* pnodeNewSync,
+                             bool fQueueInitialSync)
+{
+    LOCK(cs_pnodeSync);
+    CNode* pnodeOldSync =
+        NodeVectorContains(vNodesIn, pnodeSync) ? pnodeSync : NULL;
+    if (pnodeOldSync != pnodeNewSync)
+    {
+        if (pnodeOldSync != NULL)
+            pnodeOldSync->fStartSync = false;
+        pnodeSync = pnodeNewSync;
+        if (pnodeNewSync != NULL && fQueueInitialSync)
+            pnodeNewSync->fStartSync = true;
+    }
+    else
+    {
+        pnodeSync = pnodeNewSync;
+    }
+    return pnodeOldSync;
+}
+
+void static StartSync(const vector<CNode*> &vNodesIn)
+{
+    CNode* pnodeNewSync = NULL;
     int64_t nBestScore = 0;
     int64_t nMaxPeerHeight = -1;
 
-    // fImporting and fReindex are accessed out of cs_main here, but only
-    // as an optimization - they are checked again in SendMessages.
+    // fImporting and fReindex are checked again in SendMessages.
     if (fImporting || fReindex || fSPVMode)
         return;
 
     int nLocalHeight = -1;
     {
-        LOCK(cs_main);
+        TRY_LOCK(cs_main, lockMain);
+        if (!lockMain)
+            return;
         nLocalHeight = nBestHeight;
     }
 
-    BOOST_FOREACH(CNode* pnode, vNodes) {
-        if (pnode->fClient || pnode->fOneShot || pnode->fDisconnect || !pnode->fSuccessfullyConnected)
+    BOOST_FOREACH(CNode* pnode, vNodesIn)
+    {
+        if (pnode->fClient || pnode->fOneShot || pnode->fDisconnect ||
+            !pnode->fSuccessfullyConnected ||
+            !IsBlockSyncPeerVersion(pnode->nVersion) ||
+            !pnode->CanAdvanceBlockSync(nLocalHeight))
+        {
             continue;
-        if (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)
-            continue;
-        if (!pnode->CanAdvanceBlockSync(nLocalHeight))
-            continue;
-        int64_t nPeerHeight = GetPeerAdvertisedHeight(pnode);
-        if (nPeerHeight > nMaxPeerHeight)
-            nMaxPeerHeight = nPeerHeight;
+        }
+        nMaxPeerHeight =
+            std::max(nMaxPeerHeight, GetPeerAdvertisedHeight(pnode));
     }
 
     std::vector<std::pair<int64_t, CNode*> > vCandidates;
-    BOOST_FOREACH(CNode* pnode, vNodes) {
-        if (pnode->fClient || pnode->fOneShot || pnode->fDisconnect || !pnode->fSuccessfullyConnected)
+    BOOST_FOREACH(CNode* pnode, vNodesIn)
+    {
+        if (pnode->fClient || pnode->fOneShot || pnode->fDisconnect ||
+            !pnode->fSuccessfullyConnected ||
+            !IsBlockSyncPeerVersion(pnode->nVersion) ||
+            !pnode->CanAdvanceBlockSync(nLocalHeight))
+        {
             continue;
-        if (pnode->nVersion < NOBLKS_VERSION_START || pnode->nVersion >= NOBLKS_VERSION_END)
-            continue;
-        if (!pnode->CanAdvanceBlockSync(nLocalHeight))
-            continue;
+        }
 
-        int64_t nScore = SyncPeerScore(pnode, GetTime(), nMaxPeerHeight);
+        const int64_t nScore =
+            SyncPeerScore(pnode, GetTime(), nMaxPeerHeight);
         vCandidates.push_back(std::make_pair(nScore, pnode));
-        if (pnodeNewSync == NULL || nScore > nBestScore) {
+        if (pnodeNewSync == NULL || nScore > nBestScore ||
+            (nScore == nBestScore &&
+             pnode->GetId() < pnodeNewSync->GetId()))
+        {
             pnodeNewSync = pnode;
             nBestScore = nScore;
         }
     }
+    std::sort(vCandidates.begin(), vCandidates.end(),
+              CompareSyncCandidates);
 
-    if (!vCandidates.empty()) {
-        std::sort(vCandidates.begin(), vCandidates.end(), CompareSyncCandidates);
-    }
+    CNode* pnodeOldSync =
+        AssignSyncPeer(vNodesIn, pnodeNewSync, true);
 
-    if (pnodeNewSync) {
-        {
-            LOCK(cs_pnodeSync);
-            pnodeOldSync = pnodeSync;
-            if (pnodeOldSync != pnodeNewSync && pnodeOldSync != NULL)
-                pnodeOldSync->fStartSync = false;
-            pnodeSync = pnodeNewSync;
-        }
-
-        pnodeNewSync->fStartSync = true;
-
-        if (pnodeOldSync != pnodeNewSync) {
-            std::ostringstream oss;
-            oss << "SYNCPEER_SELECT: old=" << (pnodeOldSync ? DescribePeerForDiagnostics(pnodeOldSync) : std::string("none"))
-                << " new=" << DescribePeerForDiagnostics(pnodeNewSync)
-                << " max_peer_height=" << (long long)nMaxPeerHeight
-                << " score=" << (long long)nBestScore;
-            if (!vCandidates.empty()) {
-                oss << " candidates=";
-                size_t nLimit = std::min<size_t>(vCandidates.size(), 4);
-                for (size_t i = 0; i < nLimit; ++i) {
-                    if (i != 0)
-                        oss << ',';
-                    oss << '[' << (long long)vCandidates[i].first << ':' << DescribePeerForDiagnostics(vCandidates[i].second) << ']';
-                }
-            }
-            printf("%s\n", oss.str().c_str());
-        }
-    } else if (fDebugNet) {
+    if (pnodeOldSync != pnodeNewSync)
+    {
         std::ostringstream oss;
-        oss << "SYNCPEER_SELECT: old=" << (pnodeSync ? DescribePeerForDiagnostics(pnodeSync) : std::string("none"))
-            << " new=none"
+        oss << "SYNCPEER_SELECT: old="
+            << (pnodeOldSync
+                    ? DescribePeerForDiagnostics(pnodeOldSync)
+                    : std::string("none"))
+            << " new="
+            << (pnodeNewSync
+                    ? DescribePeerForDiagnostics(pnodeNewSync)
+                    : std::string("none"))
             << " max_peer_height=" << (long long)nMaxPeerHeight
-            << " eligible_peers=0"
             << " candidates=" << vCandidates.size();
+        if (pnodeNewSync)
+            oss << " score=" << (long long)nBestScore;
+        if (!vCandidates.empty())
+        {
+            oss << " top=";
+            const size_t nLimit =
+                std::min<size_t>(vCandidates.size(), 4);
+            for (size_t i = 0; i < nLimit; ++i)
+            {
+                if (i != 0)
+                    oss << ',';
+                oss << '[' << (long long)vCandidates[i].first << ':'
+                    << DescribePeerForDiagnostics(
+                           vCandidates[i].second)
+                    << ']';
+            }
+        }
         printf("%s\n", oss.str().c_str());
     }
 }
@@ -4182,27 +4701,25 @@ void ThreadMessageHandler2(void* parg)
     SetThreadPriority(THREAD_PRIORITY_BELOW_NORMAL);
     while (!fShutdown)
     {
-		bool fHaveSyncNode = false;
-
+        bool fHaveSyncNode = false;
         vector<CNode*> vNodesCopy;
-        CNode* pnodeSyncCopy = NULL;
-        {
-            LOCK(cs_pnodeSync);
-            pnodeSyncCopy = pnodeSync;
-        }
         {
             LOCK(cs_vNodes);
             vNodesCopy = vNodes;
-			BOOST_FOREACH(CNode* pnode, vNodesCopy) {
+            BOOST_FOREACH(CNode* pnode, vNodesCopy)
                 pnode->AddRef();
-                if (pnode == pnodeSyncCopy && pnode->nLastRecv > GetTime() - 5)
-                    fHaveSyncNode = true;
-            }
         }
 
-		if (!fHaveSyncNode)
-            StartSync(vNodesCopy);
+        CNode* pnodeSyncCopy = GetValidSyncPeer(vNodesCopy);
+        if (pnodeSyncCopy != NULL && !pnodeSyncCopy->fDisconnect &&
+            pnodeSyncCopy->fSuccessfullyConnected &&
+            pnodeSyncCopy->nLastRecv > GetTime() - 5)
+        {
+            fHaveSyncNode = true;
+        }
 
+        if (!fHaveSyncNode)
+            StartSync(vNodesCopy);
         bool fSleep = true;
 
         // Poll the connected nodes for messages
@@ -4244,6 +4761,44 @@ void ThreadMessageHandler2(void* parg)
             if (fShutdown)
                 return;
         }
+
+        if (!fImporting && !fReindex && !fSPVMode)
+        {
+            const int64_t nNow = GetTime();
+            BOOST_FOREACH(CNode* pnode, vNodesCopy)
+                pnode->ExpireBlockInFlight(nNow);
+
+            CBlockIndex* pindexTip = NULL;
+            int nLocalHeight = -1;
+            bool fHaveChainState = false;
+            {
+                TRY_LOCK(cs_main, lockMain);
+                if (lockMain)
+                {
+                    pindexTip = pindexBest;
+                    nLocalHeight = nBestHeight;
+                    fHaveChainState = true;
+                }
+            }
+
+            if (fHaveChainState)
+            {
+                CNode* pnodeRecovery = NULL;
+                {
+                    LOCK(cs_stalledSyncRecovery);
+                    pnodeRecovery = MaybeQueueStalledSyncRecovery(
+                        vNodesCopy, pindexTip, nLocalHeight, nNow,
+                        std::max<int64_t>(
+                            5, GetArg("-syncstalltimeout", 15)),
+                        std::max<int64_t>(
+                            5, GetArg("-syncstallcooldown", 15)),
+                        stalledSyncRecoveryState);
+                }
+                if (pnodeRecovery != NULL)
+                    AssignSyncPeer(vNodesCopy, pnodeRecovery, false);
+            }
+        }
+        UpdateGetInfoSyncProbeSnapshot(vNodesCopy);
 
         {
             LOCK(cs_vNodes);
@@ -5022,6 +5577,7 @@ bool FetchBlockForStaking(const uint256& hashBlock)
 
         std::vector<CInv> vGetData;
         vGetData.push_back(CInv(MSG_BLOCK, hashBlock));
+        pnode->nLastGetDataTime = GetTime();
         pnode->PushMessage("getdata", vGetData);
         nRequested++;
 

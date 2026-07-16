@@ -581,6 +581,11 @@ std::string HelpMessage()
         "  -debugchain            " + _("Output extra blockchain debugging information") + "\n" +
         "  -blockrequesttrace=<n> " + _("Trace anomalous block request lifecycles (default: 0)") + "\n" +
         "  -blockrequesttracehash=<hash> " + _("Limit block request tracing to one block hash (requires -blockrequesttrace)") + "\n" +
+        "  -getinfosyncprobe=<n> " + _("Log cached P2P state before, during, and after getinfo (default: 0)") + "\n" +
+        "  -synclockdiagnostics=<n> " + _("Log long sync-related lock waits and holds (default: 0)") + "\n" +
+        "  -synclockthresholdms=<n> " + _("Lock diagnostic threshold in milliseconds (default: 250)") + "\n" +
+        "  -syncstalltimeout=<n> " + _("Seconds without chain progress before sync recovery (default: 15)") + "\n" +
+        "  -syncstallcooldown=<n> " + _("Initial recovery cooldown in seconds; failures back off exponentially (default: 15)") + "\n" +
         "  -logtimestamps         " + _("Prepend debug output with timestamp") + "\n" +
         "  -shrinkdebugfile       " + _("Shrink debug.log file on client startup (default: 1 when no -debug)") + "\n" +
         "  -printtoconsole        " + _("Send trace/debug info to console instead of debug.log file") + "\n" +
@@ -945,7 +950,8 @@ bool AppInit2()
     fPrintToDebugger = GetBoolArg("-printtodebugger");
     fLogTimestamps = GetBoolArg("-logtimestamps");
     if (!InitBlockRequestTrace(
-            GetBoolArg("-blockrequesttrace", false),
+            GetBoolArg("-blockrequesttrace", false) ||
+                GetBoolArg("-getinfosyncprobe", false),
             GetArg("-blockrequesttracehash", "")))
     {
         return InitError(_(

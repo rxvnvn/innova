@@ -28,6 +28,49 @@ class CBlockIndex;
 class CBlockLocator;
 extern int nBestHeight;
 
+class CStalledSyncRecoveryState
+{
+private:
+    int nLastObservedHeight;
+    int64_t nLastProgressTime;
+    int64_t nLastRecoveryTime;
+    uint256 hashRejectedBlock;
+    int64_t nRejectedBlockTime;
+    bool fRejectedRetryScheduled;
+    unsigned int nRecoveryAttempts;
+
+public:
+    CStalledSyncRecoveryState();
+
+    bool ShouldRecover(int nLocalHeight, int nPeerHeight,
+                       bool fPipelineActive, int64_t nNow,
+                       int64_t nStallTimeout, int64_t nCooldown);
+    void RecordRejectedBlock(const uint256& hashBlock, int64_t nNow);
+    void ClearRejectedBlock(const uint256& hashBlock);
+    bool TakeRejectedBlockForRetry(uint256& hashBlock);
+    const uint256& RejectedBlock() const { return hashRejectedBlock; }
+    int64_t LastProgressTime() const { return nLastProgressTime; }
+    int64_t LastRecoveryTime() const { return nLastRecoveryTime; }
+    int64_t RejectedBlockTime() const { return nRejectedBlockTime; }
+    unsigned int RecoveryAttempts() const { return nRecoveryAttempts; }
+};
+
+class CSyncLockDiagnostics
+{
+private:
+    const char* pszLocation;
+    const char* pszLocks;
+    int64_t nWaitStartTime;
+    int64_t nAcquiredTime;
+    bool fEnabled;
+
+public:
+    CSyncLockDiagnostics(const char* pszLocationIn,
+                         const char* pszLocksIn);
+    ~CSyncLockDiagnostics();
+    void Acquired();
+};
+
 
 /** Time between pings automatically sent out for latency probing and keepalive (in seconds). */
 static const int PING_INTERVAL = 2 * 60;
@@ -58,6 +101,18 @@ void SocketSendData(CNode *pnode);
 void RecordP2PMessageStat(const CNode* pnode, const std::string& command, unsigned int bytes, bool incoming);
 void RecordGetHeadersResponse(CNode* pnode, size_t nHeaders, unsigned int nBytes);
 void LogSyncDiagnosticsMaybe();
+CNode* MaybeQueueStalledSyncRecovery(const std::vector<CNode*>& vNodes,
+                                     CBlockIndex* pindexTip,
+                                     int nLocalHeight,
+                                     int64_t nNow,
+                                     int64_t nStallTimeout,
+                                     int64_t nCooldown,
+                                     CStalledSyncRecoveryState& state);
+void RecordRejectedBlockForSync(const uint256& hashBlock);
+void ClearRejectedBlockForSync(const uint256& hashBlock);
+bool SyncTraceEnabled();
+void LogGetInfoSyncProbe(const char* pszEvent, int64_t nRequestStartTime = 0,
+                         int64_t nLockWaitMicros = -1);
 
 // Signals for message handling
 struct CNodeSignals
@@ -467,6 +522,7 @@ public:
     std::vector<uint256> getBlocksHash;
     uint256 hashLastGetBlocksEnd;
     int64_t nLastGetBlocksTime;
+    int64_t nLastGetDataTime;
     int nChainHeight;
     int nBestKnownHeight;
     uint256 hashBestKnownBlock;
@@ -548,6 +604,7 @@ public:
         pindexLastGetBlocksBegin = 0;
         hashLastGetBlocksEnd = 0;
         nLastGetBlocksTime = 0;
+        nLastGetDataTime = 0;
         nChainHeight = -1;
         nBestKnownHeight = -1;
         hashBestKnownBlock = 0;

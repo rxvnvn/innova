@@ -164,6 +164,15 @@ Value getinfo(const Array& params, bool fHelp)
 	uint64_t nMinWeight = 0, nMaxWeight = 0, nWeight = 0;
     pwalletMain->GetStakeWeight(*pwalletMain, nMinWeight, nMaxWeight, nWeight);
 
+    int nConnections = 0;
+    {
+        CSyncLockDiagnostics lockDiagnostics(
+            "getinfo", "cs_vNodes");
+        LOCK(cs_vNodes);
+        lockDiagnostics.Acquired();
+        nConnections = (int)vNodes.size();
+    }
+
     Object obj, diff;
     obj.push_back(Pair("version",       FormatFullVersion()));
     obj.push_back(Pair("protocolversion",(int)PROTOCOL_VERSION));
@@ -178,7 +187,7 @@ Value getinfo(const Array& params, bool fHelp)
     obj.push_back(Pair("blocks",        (int)nBestHeight));
     obj.push_back(Pair("timeoffset",    (int64_t)GetTimeOffset()));
     obj.push_back(Pair("moneysupply",   ValueFromAmount(pindexBest->nMoneySupply)));
-    obj.push_back(Pair("connections",   (int)vNodes.size()));
+    obj.push_back(Pair("connections",   nConnections));
     obj.push_back(Pair("datareceived",  bytesReadable(CNode::GetTotalBytesRecv())));
     obj.push_back(Pair("datasent",      bytesReadable(CNode::GetTotalBytesSent())));
     obj.push_back(Pair("proxy",         (proxy.first.IsValid() ? proxy.first.ToStringIPPort() : string())));

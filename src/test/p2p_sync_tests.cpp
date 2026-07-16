@@ -3,11 +3,14 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <algorithm>
+#include <map>
 #include <string>
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
 
+#include "checkpoints.h"
+#include "innovarpc.h"
 #include "main.h"
 #include "net.h"
 #include "protocol.h"
@@ -55,6 +58,107 @@ static bool HasCommand(const std::vector<std::string>& commands,
 {
     return std::find(commands.begin(), commands.end(), command) != commands.end();
 }
+
+static void PreparePeerForRecovery(CNode& node, int nVersion, int nPeerHeight)
+{
+    PreparePeerForSendMessages(node, nVersion);
+    node.fSuccessfullyConnected = true;
+    node.fClient = false;
+    node.fOneShot = false;
+    node.fDisconnect = false;
+    node.nChainHeight = nPeerHeight;
+    node.nBestKnownHeight = nPeerHeight;
+    node.nLastHeightUpdate = TEST_TIME;
+}
+
+static size_t QueuedGetBlocksCount(const std::vector<CNode*>& peers)
+{
+    size_t count = 0;
+    for (std::vector<CNode*>::const_iterator it = peers.begin(); it != peers.end(); ++it)
+        count += (*it)->getBlocksIndex.size();
+    return count;
+}
+
+static size_t QueuedBlockAskForCount(const std::vector<CNode*>& peers,
+                                     const uint256& hashBlock)
+{
+    size_t count = 0;
+    for (std::vector<CNode*>::const_iterator itPeer = peers.begin();
+         itPeer != peers.end(); ++itPeer)
+    {
+        for (std::multimap<int64_t, CInv>::const_iterator itAsk = (*itPeer)->mapAskFor.begin();
+             itAsk != (*itPeer)->mapAskFor.end(); ++itAsk)
+        {
+            if (itAsk->second.type == MSG_BLOCK && itAsk->second.hash == hashBlock)
+                ++count;
+        }
+    }
+    return count;
+}
+
+class CScopedAlreadyAskedFor
+{
+private:
+    std::map<CInv, int64_t> saved;
+
+public:
+    CScopedAlreadyAskedFor()
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        saved = mapAlreadyAskedFor;
+        mapAlreadyAskedFor.clear();
+    }
+
+    ~CScopedAlreadyAskedFor()
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        mapAlreadyAskedFor = saved;
+    }
+};
+
+class CScopedInitialBlockDownloadState
+{
+private:
+    bool fRegTestSaved;
+    bool fImportingSaved;
+    bool fReindexSaved;
+    int nBestHeightSaved;
+    std::vector<CNode*> vNodesSaved;
+
+public:
+    explicit CScopedInitialBlockDownloadState(CNode* peer)
+        : fRegTestSaved(fRegTest),
+          fImportingSaved(fImporting),
+          fReindexSaved(fReindex),
+          nBestHeightSaved(nBestHeight)
+    {
+        fRegTest = false;
+        fImporting = false;
+        fReindex = false;
+        nBestHeight = std::max(
+            nBestHeight, Checkpoints::GetTotalBlocksEstimate());
+        peer->nChainHeight = nBestHeight + 100;
+        peer->nBestKnownHeight = nBestHeight + 100;
+        peer->nLastHeightUpdate = GetTime();
+
+        LOCK(cs_vNodes);
+        vNodesSaved = vNodes;
+        vNodes.clear();
+        vNodes.push_back(peer);
+    }
+
+    ~CScopedInitialBlockDownloadState()
+    {
+        {
+            LOCK(cs_vNodes);
+            vNodes = vNodesSaved;
+        }
+        nBestHeight = nBestHeightSaved;
+        fReindex = fReindexSaved;
+        fImporting = fImportingSaved;
+        fRegTest = fRegTestSaved;
+    }
+};
 
 } // namespace
 
@@ -174,7 +278,369 @@ BOOST_AUTO_TEST_CASE(legacy_43950_peer_keeps_getblocks_path)
     fSPVMode = fSPVModeSaved;
 }
 
-BOOST_AUTO_TEST_CASE(stall_recovery_ignores_peer_behind_local_tip)
+BOOST_AUTO_TEST_CASE(block_sync_peer_version_accepts_legacy_and_current_versions)
+{
+    BOOST_CHECK(IsBlockSyncPeerVersion(MIN_PEER_PROTO_VERSION));
+    BOOST_CHECK(IsBlockSyncPeerVersion(PROTOCOL_VERSION));
+
+    BOOST_CHECK(IsBlockSyncPeerVersion(NOBLKS_VERSION_START - 1));
+    BOOST_CHECK(!IsBlockSyncPeerVersion(NOBLKS_VERSION_START));
+    BOOST_CHECK(!IsBlockSyncPeerVersion(NOBLKS_VERSION_END - 1));
+    BOOST_CHECK(IsBlockSyncPeerVersion(NOBLKS_VERSION_END));
+}
+
+BOOST_AUTO_TEST_CASE(peer_stats_query_does_not_expire_stale_block_request)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(20), "stats-query-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    const uint256 hashInFlight(3001);
+    peer.MarkBlockInFlight(hashInFlight);
+    peer.mapBlockInFlightSince[hashInFlight] = GetTime() - 60;
+
+    CNodeStats stats;
+    peer.copyStats(stats);
+
+    BOOST_CHECK_EQUAL(stats.nBlocksInFlight, 1);
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashInFlight), 1U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hashInFlight), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(initial_block_download_query_does_not_expire_stale_request)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21), "ibd-query-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    const uint256 hashInFlight(3002);
+    peer.MarkBlockInFlight(hashInFlight);
+    peer.mapBlockInFlightSince[hashInFlight] = GetTime() - 60;
+
+    {
+        CScopedInitialBlockDownloadState scopedState(&peer);
+        (void)IsInitialBlockDownload();
+    }
+
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashInFlight), 1U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hashInFlight), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(rpc_queries_do_not_mutate_block_download_state)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(22), "rpc-query-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 100);
+
+    const uint256 hashInFlight(3003);
+    const uint256 hashAskFor(3004);
+    const CInv globalRequest(MSG_BLOCK, uint256(3005));
+    peer.MarkBlockInFlight(hashInFlight);
+    peer.mapBlockInFlightSince[hashInFlight] = GetTime() - 60;
+    peer.mapAskFor.insert(std::make_pair(
+        (GetTime() + 60) * 1000000, CInv(MSG_BLOCK, hashAskFor)));
+    peer.getBlocksIndex.push_back(pindexBest);
+    peer.getBlocksHash.push_back(uint256(0));
+    peer.fStartSync = true;
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        mapAlreadyAskedFor[globalRequest] = (GetTime() + 60) * 1000000;
+    }
+
+    const bool fHybridSPVSaved = fHybridSPV;
+    fHybridSPV = false;
+    {
+        CScopedInitialBlockDownloadState scopedState(&peer);
+        const json_spirit::Array params;
+        BOOST_CHECK_NO_THROW(tableRPC.execute("getinfo", params));
+        BOOST_CHECK_NO_THROW(tableRPC.execute("getblockcount", params));
+        BOOST_CHECK_NO_THROW(tableRPC.execute("getbestblockhash", params));
+        BOOST_CHECK_NO_THROW(tableRPC.execute("getpeerinfo", params));
+        BOOST_CHECK_NO_THROW(tableRPC.execute("getblockchaininfo", params));
+    }
+    fHybridSPV = fHybridSPVSaved;
+
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashInFlight), 1U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hashInFlight), 1U);
+    const std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashAskFor), 1U);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+    BOOST_CHECK_EQUAL(peer.getBlocksHash.size(), 1U);
+    BOOST_CHECK(peer.fStartSync);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(globalRequest), 1U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(stalled_sync_recovery_queues_exactly_one_getblocks)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+
+    CNode legacyPeer(INVALID_SOCKET, TestPeerAddress(12), "legacy-recovery-peer", true);
+    CNode currentPeer(INVALID_SOCKET, TestPeerAddress(13), "current-recovery-peer", true);
+    PreparePeerForRecovery(legacyPeer, MIN_PEER_PROTO_VERSION, nBestHeight + 5);
+    PreparePeerForRecovery(currentPeer, PROTOCOL_VERSION, nBestHeight + 10);
+
+    std::vector<CNode*> peers;
+    peers.push_back(&legacyPeer);
+    peers.push_back(&currentPeer);
+    CStalledSyncRecoveryState state;
+
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+
+    CNode* owner = MaybeQueueStalledSyncRecovery(
+        peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
+        STALL_TIMEOUT, RECOVERY_COOLDOWN, state);
+    BOOST_REQUIRE(owner != NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+    BOOST_CHECK_EQUAL(owner->getBlocksIndex.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(stalled_sync_recovery_cooldown_suppresses_repeat)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(14), "cooldown-recovery-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers(1, &peer);
+    CStalledSyncRecoveryState state;
+
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+    const int64_t nRecoveryTime = TEST_TIME + STALL_TIMEOUT + 1;
+    BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
+                      peers, pindexBest, nBestHeight, nRecoveryTime,
+                      STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+
+    peer.getBlocksIndex.clear();
+    peer.getBlocksHash.clear();
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight,
+                    nRecoveryTime + RECOVERY_COOLDOWN - 1,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(stalled_sync_recovery_uses_capped_exponential_cooldown)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 15;
+    static const int64_t EXPECTED_COOLDOWNS[] = {
+        30, 60, 120, 240, 480, 480
+    };
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(18), "backoff-recovery-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers(1, &peer);
+    CStalledSyncRecoveryState state;
+
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+
+    const int64_t nFirstRecoveryTime = TEST_TIME + STALL_TIMEOUT + 1;
+    BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
+                      peers, pindexBest, nBestHeight, nFirstRecoveryTime,
+                      STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+
+    int64_t nPreviousRecoveryTime = nFirstRecoveryTime;
+    for (size_t wave = 0; wave < ARRAYLEN(EXPECTED_COOLDOWNS); ++wave)
+    {
+        peer.getBlocksIndex.clear();
+        peer.getBlocksHash.clear();
+        peer.pindexLastGetBlocksBegin = NULL;
+        peer.hashLastGetBlocksEnd = 0;
+        peer.nLastGetBlocksTime = 0;
+
+        const int64_t nEffectiveCooldown = EXPECTED_COOLDOWNS[wave];
+        BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                        peers, pindexBest, nBestHeight,
+                        nPreviousRecoveryTime + nEffectiveCooldown - 1,
+                        STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+        BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+
+        nPreviousRecoveryTime += nEffectiveCooldown;
+        BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
+                          peers, pindexBest, nBestHeight, nPreviousRecoveryTime,
+                          STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
+        BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+        BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                        peers, pindexBest, nBestHeight, nPreviousRecoveryTime,
+                        STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+        BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(stalled_sync_recovery_active_pipeline_suppresses_request)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+    const uint256 hashPending(1001);
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(15), "active-pipeline-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers(1, &peer);
+
+    CStalledSyncRecoveryState inFlightState;
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, inFlightState) == NULL);
+    peer.setBlocksInFlight.insert(hashPending);
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, inFlightState) == NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+    peer.setBlocksInFlight.clear();
+
+    CStalledSyncRecoveryState askForState;
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, askForState) == NULL);
+    peer.mapAskFor.insert(std::make_pair(
+        (TEST_TIME + 1) * 1000000, CInv(MSG_BLOCK, hashPending)));
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, askForState) == NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+    peer.mapAskFor.clear();
+
+    CStalledSyncRecoveryState getBlocksState;
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, getBlocksState) == NULL);
+    peer.getBlocksIndex.push_back(pindexBest);
+    peer.getBlocksHash.push_back(uint256(0));
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, getBlocksState) == NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(stalled_sync_recovery_respects_cross_peer_ownership)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+    const uint256 hashOwnedByOtherPeer(1002);
+
+    CNode preferredPeer(INVALID_SOCKET, TestPeerAddress(23),
+                        "preferred-recovery-peer", true);
+    CNode ownerPeer(INVALID_SOCKET, TestPeerAddress(24),
+                    "existing-request-owner", true);
+    PreparePeerForRecovery(preferredPeer, PROTOCOL_VERSION,
+                           nBestHeight + 20);
+    PreparePeerForRecovery(ownerPeer, MIN_PEER_PROTO_VERSION,
+                           nBestHeight + 10);
+    std::vector<CNode*> peers;
+    peers.push_back(&preferredPeer);
+    peers.push_back(&ownerPeer);
+    CStalledSyncRecoveryState state;
+
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+    ownerPeer.mapAskFor.insert(std::make_pair(
+        (TEST_TIME + 1) * 1000000,
+        CInv(MSG_BLOCK, hashOwnedByOtherPeer)));
+
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight,
+                    TEST_TIME + STALL_TIMEOUT + 1,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+    BOOST_CHECK_EQUAL(
+        QueuedBlockAskForCount(peers, hashOwnedByOtherPeer), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(rejected_block_recovery_queues_one_cross_peer_askfor)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+    const uint256 hashRejected(2002);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    CNode legacyPeer(INVALID_SOCKET, TestPeerAddress(16), "legacy-reject-peer", true);
+    CNode currentPeer(INVALID_SOCKET, TestPeerAddress(17), "current-reject-peer", true);
+    PreparePeerForRecovery(legacyPeer, MIN_PEER_PROTO_VERSION, nBestHeight + 5);
+    PreparePeerForRecovery(currentPeer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers;
+    peers.push_back(&legacyPeer);
+    peers.push_back(&currentPeer);
+    CStalledSyncRecoveryState state;
+
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+    state.RecordRejectedBlock(hashRejected, TEST_TIME + 1);
+
+    const int64_t nRecoveryTime = TEST_TIME + STALL_TIMEOUT + 1;
+    CNode* owner = MaybeQueueStalledSyncRecovery(
+        peers, pindexBest, nBestHeight, nRecoveryTime,
+        STALL_TIMEOUT, RECOVERY_COOLDOWN, state);
+    BOOST_REQUIRE(owner != NULL);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashRejected), 1U);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+
+    for (std::vector<CNode*>::iterator it = peers.begin(); it != peers.end(); ++it)
+    {
+        (*it)->mapAskFor.clear();
+        (*it)->getBlocksIndex.clear();
+        (*it)->getBlocksHash.clear();
+        (*it)->pindexLastGetBlocksBegin = NULL;
+        (*it)->hashLastGetBlocksEnd = 0;
+        (*it)->nLastGetBlocksTime = 0;
+    }
+    state.RecordRejectedBlock(hashRejected, nRecoveryTime + 1);
+
+    CNode* nextOwner = MaybeQueueStalledSyncRecovery(
+        peers, pindexBest, nBestHeight,
+        nRecoveryTime + 2 * RECOVERY_COOLDOWN,
+        STALL_TIMEOUT, RECOVERY_COOLDOWN, state);
+    BOOST_REQUIRE(nextOwner != NULL);
+    BOOST_CHECK(nextOwner != owner);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashRejected), 0U);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(accepted_rejected_block_is_not_directly_retried)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+    const uint256 hashAccepted(2003);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(19), "accepted-reject-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers(1, &peer);
+    CStalledSyncRecoveryState state;
+
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+    state.RecordRejectedBlock(hashAccepted, TEST_TIME + 1);
+    state.ClearRejectedBlock(hashAccepted);
+
+    BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
+                      peers, pindexBest, nBestHeight,
+                      TEST_TIME + STALL_TIMEOUT + 1,
+                      STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashAccepted), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(send_messages_does_not_own_stall_recovery)
 {
     BOOST_REQUIRE(pindexBest != NULL);
     const bool fSPVModeSaved = fSPVMode;
@@ -199,7 +665,9 @@ BOOST_AUTO_TEST_CASE(stall_recovery_ignores_peer_behind_local_tip)
     BOOST_CHECK(aheadPeer.CanAdvanceBlockSync(nBestHeight));
     BOOST_CHECK(aheadPeer.ShouldContinueKnownBlockInventory(nBestHeight, true));
     BOOST_CHECK(SendMessages(&aheadPeer, true));
-    BOOST_CHECK(HasCommand(SentCommands(aheadPeer), "getblocks"));
+    // Recovery is coordinated once per message-handler tick.  Per-peer
+    // SendMessages must not independently create a second getblocks wave.
+    BOOST_CHECK(!HasCommand(SentCommands(aheadPeer), "getblocks"));
 
     fSPVMode = fSPVModeSaved;
 }

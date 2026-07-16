@@ -2845,7 +2845,6 @@ bool IsInitialBlockDownload()
                 if (!pnode || pnode->fClient)
                     continue;
 
-                pnode->ExpireBlockInFlight(nNow);
 
                 bool fFreshHeight = pnode->nBestKnownHeight > 0 &&
                                     pnode->nLastHeightUpdate > 0 &&
@@ -4838,6 +4837,11 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
                                                 pnode->nLastDseg = GetTime();
                                         }
                                     }
+                            if (SyncTraceEnabled())
+                                printf("SYNC_EVENT time_us=%lld event=CHECKBLOCK_POS_PAYEE_REJECT hash=%s height=%d\n",
+                                       (long long)GetTimeMicros(),
+                                       GetHash().ToString().c_str(),
+                                       pindex ? pindex->nHeight : -1);
                             return error("CheckBlock-POS() : Did not find this payee in the collateralnode list. Requesting list update and rejecting block.");
                         } else {
                             if (fDebug) printf("WARNING: Did not find this payee in the collateralnode list, this block will not be accepted after block %d\n", nCNEnforcementHeight);
@@ -4973,6 +4977,11 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
                                             pnode->nLastDseg = GetTime();
                                     }
                                 }
+                                if (SyncTraceEnabled())
+                                    printf("SYNC_EVENT time_us=%lld event=CHECKBLOCK_POW_PAYEE_REJECT hash=%s height=%d\n",
+                                           (long long)GetTimeMicros(),
+                                           GetHash().ToString().c_str(),
+                                           pindex ? pindex->nHeight : -1);
                                 return error("CheckBlock-POW() : Did not find this payee in the collateralnode list, rejecting block.");
                         } else {
                             if (fDebug) printf("WARNING: Did not find this payee in  the collateralnode list, this block will not be accepted after block %d\n", nCNEnforcementHeight);
@@ -5599,6 +5608,11 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
       CBigNum(nBestChainTrust).ToString().c_str(),
       nBestBlockTrust.Get64(),
       DateTimeStrFormat("%x %H:%M:%S", pindexBest->GetBlockTime()).c_str());
+    if (SyncTraceEnabled())
+        printf("SYNC_EVENT time_us=%lld event=SETBESTCHAIN_COMMIT hash=%s height=%d block_time=%lld\n",
+               (long long)GetTimeMicros(),
+               hashBestChain.ToString().c_str(), nBestHeight,
+               (long long)pindexBest->GetBlockTime());
 
     nTimeBestReceived = GetTime();
 
@@ -6023,6 +6037,10 @@ bool CBlock::AcceptBlock()
 
     // Check for duplicate
     uint256 hash = GetHash();
+    if (SyncTraceEnabled())
+        printf("SYNC_EVENT time_us=%lld event=ACCEPT_BLOCK_BEGIN hash=%s local_height=%d\n",
+               (long long)GetTimeMicros(),
+               hash.ToString().c_str(), nBestHeight);
     if (mapBlockIndex.count(hash))
         return error("AcceptBlock() : block already in mapBlockIndex");
 
@@ -6225,6 +6243,7 @@ bool CBlock::AcceptBlock()
         printf("AcceptBlock: height=%d total=%" PRId64"ms write_disk=%" PRId64"ms add_index=%" PRId64"ms\n",
                nHeight, GetTimeMillis() - nAcceptStart, nWriteDiskMs, nAddIndexMs);
 
+    ClearRejectedBlockForSync(hash);
     return true;
 }
 
@@ -6264,6 +6283,12 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     int64_t nStartTime = GetTimeMillis();
     // Check for duplicate
     uint256 hash = pblock->GetHash();
+    if (SyncTraceEnabled())
+        printf("SYNC_EVENT time_us=%lld event=PROCESS_BLOCK_BEGIN hash=%s peer=%d local_height=%d\n",
+               (long long)GetTimeMicros(),
+               hash.ToString().c_str(),
+               pfrom ? pfrom->GetId() : -1,
+               nBestHeight);
     if (pfrom != NULL && pindexBest != NULL && pindexBest->GetBlockTime() < GetTime() - 300 && fDebug)
         printf("sync: ProcessBlock %s from %s (height %d)\n", hash.ToString().substr(0,20).c_str(), pfrom->addrName.c_str(), nBestHeight);
     if (mapBlockIndex.count(hash))
@@ -7530,9 +7555,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // Full nodes use the historical getblocks/inv path. Header-first
         // synchronization is reserved for SPV mode, where headers are indexed.
         if (!fSPVMode && !pfrom->fClient && !pfrom->fOneShot &&
-            (pfrom->nBestKnownHeight < 0 || pfrom->nBestKnownHeight > (nBestHeight - 144)) &&
-            (pfrom->nVersion < NOBLKS_VERSION_START ||
-             pfrom->nVersion >= NOBLKS_VERSION_END))
+            (pfrom->nBestKnownHeight < 0 ||
+             pfrom->nBestKnownHeight > (nBestHeight - 144)) &&
+            IsBlockSyncPeerVersion(pfrom->nVersion))
         {
             pfrom->PushGetBlocks(pindexBest, uint256(0));
         }
@@ -8176,6 +8201,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                         0, true, false, false, false, -1, -1);
                 }
             }
+            pfrom->nLastGetDataTime = GetTime();
             pfrom->PushMessage("getdata", vGetData);
             for (const CInv& inv : vGetData)
             {
@@ -8298,13 +8324,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
         pfrom->ClearBlockInFlight(hashBlock);
 
+        CSyncLockDiagnostics blockLockDiagnostics(
+            "ProcessMessage(block)", "cs_main");
         LOCK(cs_main);
-        bool fKnownBefore = false;
-        bool fOrphanBefore = false;
+        blockLockDiagnostics.Acquired();
+        bool fKnownBefore = mapBlockIndex.count(hashBlock) != 0;
+        bool fOrphanBefore = mapOrphanBlocks.count(hashBlock) != 0;
         if (fTraceBlockRequest)
         {
-            fKnownBefore = mapBlockIndex.count(hashBlock) != 0;
-            fOrphanBefore = mapOrphanBlocks.count(hashBlock) != 0;
             BlockRequestTraceBlockReceive(
                 pfrom, hashBlock, fKnownBefore,
                 fSenderInFlightBefore, nSenderInFlightAge);
@@ -8315,14 +8342,23 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         bool fAccepted = ProcessBlock(pfrom, &block);
         if (fAccepted)
         {
+            ClearRejectedBlockForSync(hashBlock);
             pfrom->nLastBlockRecv = GetTime();
-            std::map<uint256, CBlockIndex*>::iterator miAccepted = mapBlockIndex.find(hashBlock);
+            std::map<uint256, CBlockIndex*>::iterator miAccepted =
+                mapBlockIndex.find(hashBlock);
             if (miAccepted != mapBlockIndex.end())
-                pfrom->UpdateBestKnownBlock(miAccepted->second->nHeight, hashBlock);
+                pfrom->UpdateBestKnownBlock(
+                    miAccepted->second->nHeight, hashBlock);
             if (pfrom->nBestKnownHeight > pfrom->nChainHeight)
                 pfrom->nChainHeight = pfrom->nBestKnownHeight;
             LOCK(cs_mapAlreadyAskedFor);
             mapAlreadyAskedFor.erase(inv);
+        }
+        else if (!fKnownBefore && !fOrphanBefore && block.nDoS == 0 &&
+                 mapBlockIndex.count(hashBlock) == 0 &&
+                 mapOrphanBlocks.count(hashBlock) == 0)
+        {
+            RecordRejectedBlockForSync(hashBlock);
         }
 
         if (block.nDoS)
@@ -9008,52 +9044,6 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         }
     }
 
-    {
-        int64_t nNow = GetTime();
-        int64_t nTimeSinceBlock = nNow - (pto->nLastBlockRecv > 0 ? pto->nLastBlockRecv : pto->nTimeConnected);
-        CBlockIndex* pBest = pindexBest;
-        int nHeight = nBestHeight;
-        int nPeerHeight = pto->nBestKnownHeight >= 0 ? pto->nBestKnownHeight : pto->nChainHeight;
-        bool fPeerCanAdvance = pto->CanAdvanceBlockSync(nHeight);
-
-        static std::map<std::string, int64_t> mapLastStallRecovery;
-        bool fThrottle = (mapLastStallRecovery.count(pto->addrName) &&
-                          nNow - mapLastStallRecovery[pto->addrName] < 15);
-
-        if (!fImporting && !fReindex && pBest != NULL && fPeerCanAdvance &&
-            nTimeSinceBlock > 15 && !fThrottle)
-        {
-            const bool fTraceBlockRequests = BlockRequestTraceEnabled();
-            std::vector<uint256> vTraceErasedHashes;
-            mapLastStallRecovery[pto->addrName] = nNow;
-            pto->nLastBlockRecv = nNow;
-            {
-                LOCK(cs_mapAlreadyAskedFor);
-                for (auto it = mapAlreadyAskedFor.begin(); it != mapAlreadyAskedFor.end(); )
-                {
-                    if (it->first.type == MSG_BLOCK)
-                    {
-                        if (fTraceBlockRequests)
-                            vTraceErasedHashes.push_back(it->first.hash);
-                        it = mapAlreadyAskedFor.erase(it);
-                    }
-                    else
-                        ++it;
-                }
-            }
-            pto->PushGetBlocks(pBest, uint256(0));
-            if (fTraceBlockRequests)
-            {
-                BlockRequestTraceStallRecovery(
-                    pto, nHeight, nPeerHeight, nTimeSinceBlock,
-                    pBest->GetBlockHash(), pBest->nHeight,
-                    uint256(0), vTraceErasedHashes);
-            }
-            if (fDebug)
-                printf("Sync stall recovery: peer=%s ch=%d our=%d stall=%ds\n",
-                       pto->addrName.c_str(), nPeerHeight, nHeight, (int)nTimeSinceBlock);
-        }
-    }
 
 
     //
@@ -9079,8 +9069,13 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         pto->getBlocksHash.clear();
     }
 
-    TRY_LOCK(cs_main, lockMain);
-    if (lockMain) {
+    {
+        CSyncLockDiagnostics sendLockDiagnostics(
+            "SendMessages", "cs_main");
+        TRY_LOCK(cs_main, lockMain);
+        if (lockMain)
+        {
+            sendLockDiagnostics.Acquired();
 
         if (fSPVMode && pto->getHeadersSync.IsTimedOut(GetTime()))
             pto->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "timeout-retry");
@@ -9272,7 +9267,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         // getdata moved outside cs_main (below) for IBD reliability
 
     }
-
+    }
     //
     // getdata: flush pending requests outside cs_main.
     // Uses its own TRY_LOCK for AlreadyHave; if cs_main is unavailable
@@ -9342,6 +9337,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 }
                 if (vGetData.size() >= 1000)
                 {
+                    pto->nLastGetDataTime = GetTime();
                     pto->PushMessage("getdata", vGetData);
                     vGetData.clear();
                 }
@@ -9379,7 +9375,10 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             pto->mapAskFor.erase(pto->mapAskFor.begin());
         }
         if (!vGetData.empty())
+        {
+            pto->nLastGetDataTime = GetTime();
             pto->PushMessage("getdata", vGetData);
+        }
     }
 
 
