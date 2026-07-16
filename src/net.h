@@ -20,6 +20,7 @@
 #include "protocol.h"
 #include "addrman.h"
 #include "bloom.h"
+#include "blockrequesttrace.h"
 
 class CRequestTracker;
 class CNode;
@@ -579,6 +580,8 @@ public:
 
     ~CNode()
     {
+        if (BlockRequestTraceEnabled())
+            BlockRequestTracePeerClosed(this);
         if (hSocket != INVALID_SOCKET)
         {
             closesocket(hSocket);
@@ -692,7 +695,7 @@ public:
             vGetBlocksInventoryToSend.push_back(inv);
     }
 
-    void AskFor(const CInv& inv)
+    void AskFor(const CInv& inv, BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER)
     {
         LOCK(cs_mapAlreadyAskedFor);
         static const size_t MAX_ASKFOR_SIZE = 50000;
@@ -707,6 +710,7 @@ public:
         // We're using mapAskFor as a priority queue,
         // the key is the earliest time the request can be sent
         int64_t& nRequestTime = mapAlreadyAskedFor[inv];
+        int64_t nPreviousRequestTime = nRequestTime;
         if (fDebugNet)
             printf("askfor %s   %lld (%s)\n", inv.ToString().c_str(), (long long)nRequestTime, DateTimeStrFormat("%H:%M:%S", nRequestTime/1000000).c_str());
 
@@ -737,6 +741,9 @@ public:
             nRequestTime = std::max(nRequestTime + 10 * 1000000, nNow);
         }
         mapAskFor.insert(std::make_pair(nRequestTime, inv));
+        if (BlockRequestTraceEnabled() && inv.type == MSG_BLOCK)
+            BlockRequestTraceAskSchedule(this, inv.hash, source, nRequestTime,
+                                         nPreviousRequestTime, false);
     }
 
 
@@ -1029,6 +1036,8 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         {
             if (nNow - it->second > BLOCK_IN_FLIGHT_TIMEOUT)
             {
+                if (BlockRequestTraceEnabled())
+                    BlockRequestTraceInFlightExpire(this, it->first, nNow - it->second);
                 setBlocksInFlight.erase(it->first);
                 it = mapBlockInFlightSince.erase(it);
             }

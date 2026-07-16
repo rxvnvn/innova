@@ -6381,7 +6381,9 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                 mapOrphanBlocksByNode[hash] = pfrom->GetId();
                 mapOrphanCountByNode[pfrom->GetId()]++;
                 for (const uint256& hashMissing : vMissingDAGParents)
-                    pfrom->AskFor(CInv(MSG_BLOCK, hashMissing));
+                    pfrom->AskFor(
+                        CInv(MSG_BLOCK, hashMissing),
+                        BLOCKREQ_SOURCE_ORPHAN);
             }
             return true;
         }
@@ -6448,7 +6450,9 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                 pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
             // ppcoin: getblocks may not obtain the ancestor block rejected
             // earlier by duplicate-stake check so we ask for it again directly
-            pfrom->AskFor(CInv(MSG_BLOCK, WantedByOrphan(pblock2)));
+            pfrom->AskFor(
+                CInv(MSG_BLOCK, WantedByOrphan(pblock2)),
+                BLOCKREQ_SOURCE_ORPHAN);
         }
         return true;
     }
@@ -6482,7 +6486,9 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                 if (pfrom)
                 {
                     for (const uint256& hashMissing : vMissingDAGParents)
-                        pfrom->AskFor(CInv(MSG_BLOCK, hashMissing));
+                        pfrom->AskFor(
+                            CInv(MSG_BLOCK, hashMissing),
+                            BLOCKREQ_SOURCE_ORPHAN);
                 }
                 continue;
             }
@@ -7740,11 +7746,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 printf("sync inv: %s %s from %s\n", inv.ToString().c_str(), fAlreadyHave ? "HAVE" : "NEW", pfrom->addrName.c_str());
 
             if (!fAlreadyHave)
-                pfrom->AskFor(inv);
+                pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
             else if (inv.type == MSG_BLOCK && mapOrphanBlocks.count(inv.hash)) {
                 CBlock* pblockOrphan = mapOrphanBlocks[inv.hash];
                 if (IsInitialBlockDownload())
-                    pfrom->AskFor(CInv(MSG_BLOCK, WantedByOrphan(pblockOrphan)));
+                    pfrom->AskFor(
+                        CInv(MSG_BLOCK, WantedByOrphan(pblockOrphan)),
+                        BLOCKREQ_SOURCE_ORPHAN);
                 else
                     pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblockOrphan));
             } else if (nInv == nLastBlock) {
@@ -8159,9 +8167,22 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 printf("Requesting %u full blocks from peer %s via getdata\n",
                        (unsigned int)vGetData.size(),
                        pfrom->addr.ToString().c_str());
+            if (BlockRequestTraceEnabled())
+            {
+                for (const CInv& inv : vGetData)
+                {
+                    BlockRequestTraceGetDataSend(
+                        pfrom, inv.hash, BLOCKREQ_SOURCE_HEADERS_DIRECT,
+                        0, true, false, false, false, -1, -1);
+                }
+            }
             pfrom->PushMessage("getdata", vGetData);
             for (const CInv& inv : vGetData)
+            {
                 pfrom->MarkBlockInFlight(inv.hash);
+                if (BlockRequestTraceEnabled())
+                    BlockRequestTraceInFlightMark(pfrom, inv.hash, false);
+            }
         }
 
         // SPV continuation is allowed only after this response advanced the
@@ -8262,9 +8283,35 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         CInv inv(MSG_BLOCK, hashBlock);
         pfrom->AddInventoryKnown(inv);
 
+        const bool fTraceBlockRequest = BlockRequestTraceEnabled();
+        bool fSenderInFlightBefore = false;
+        int64_t nSenderInFlightAge = -1;
+        if (fTraceBlockRequest)
+        {
+            fSenderInFlightBefore =
+                pfrom->setBlocksInFlight.count(hashBlock) != 0;
+            std::map<uint256, int64_t>::const_iterator miInFlight =
+                pfrom->mapBlockInFlightSince.find(hashBlock);
+            if (miInFlight != pfrom->mapBlockInFlightSince.end())
+                nSenderInFlightAge =
+                    std::max<int64_t>(0, GetTime() - miInFlight->second);
+        }
         pfrom->ClearBlockInFlight(hashBlock);
 
         LOCK(cs_main);
+        bool fKnownBefore = false;
+        bool fOrphanBefore = false;
+        if (fTraceBlockRequest)
+        {
+            fKnownBefore = mapBlockIndex.count(hashBlock) != 0;
+            fOrphanBefore = mapOrphanBlocks.count(hashBlock) != 0;
+            BlockRequestTraceBlockReceive(
+                pfrom, hashBlock, fKnownBefore,
+                fSenderInFlightBefore, nSenderInFlightAge);
+            BlockRequestTraceInFlightClear(
+                pfrom, hashBlock, "receive",
+                nSenderInFlightAge, fKnownBefore);
+        }
         bool fAccepted = ProcessBlock(pfrom, &block);
         if (fAccepted)
         {
@@ -8281,6 +8328,41 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (block.nDoS)
             pfrom->Misbehaving(block.nDoS);
 
+        BlockRequestTraceResult traceResult = BLOCKREQ_RESULT_UNKNOWN;
+        if (fTraceBlockRequest)
+        {
+            std::map<uint256, CBlockIndex*>::const_iterator miAfter =
+                mapBlockIndex.find(hashBlock);
+            bool fIndexedAfter = miAfter != mapBlockIndex.end();
+            bool fOrphanAfter = mapOrphanBlocks.count(hashBlock) != 0;
+            bool fActiveChainAfter =
+                fIndexedAfter && miAfter->second->IsInMainChain();
+            bool fBestChainAfter =
+                fIndexedAfter && miAfter->second == pindexBest;
+            int nHeightAfter =
+                fIndexedAfter ? miAfter->second->nHeight : -1;
+
+            if (fKnownBefore)
+                traceResult = BLOCKREQ_RESULT_ALREADY_KNOWN;
+            else if (fOrphanBefore)
+                traceResult = BLOCKREQ_RESULT_ORPHAN_DUPLICATE;
+            else if (fAccepted && fIndexedAfter)
+                traceResult = fActiveChainAfter
+                    ? BLOCKREQ_RESULT_ACCEPTED_ACTIVE
+                    : BLOCKREQ_RESULT_ACCEPTED_INDEXED;
+            else if (fAccepted && fOrphanAfter)
+                traceResult = BLOCKREQ_RESULT_ORPHAN_NEW;
+            else if (fAccepted)
+                traceResult = BLOCKREQ_RESULT_TRUE_UNINDEXED;
+            else
+                traceResult = BLOCKREQ_RESULT_REJECTED;
+
+            BlockRequestTraceBlockResult(
+                pfrom, hashBlock, traceResult, fAccepted,
+                fIndexedAfter, fActiveChainAfter,
+                fBestChainAfter, nHeightAfter);
+        }
+
         // Chain sync continues via headers batch completion and stall recovery.
 
         if (IsInitialBlockDownload() && pfrom->nExpectedBatchSize > 0)
@@ -8294,16 +8376,48 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 if (pfrom->hashLastBlockInBatch != 0 && mapBlockIndex.count(pfrom->hashLastBlockInBatch))
                 {
                     CBlockIndex* pindexLast = mapBlockIndex[pfrom->hashLastBlockInBatch];
+                    size_t nQueuedBefore = pfrom->getBlocksIndex.size();
+                    bool fPrefetchSentBefore = pfrom->fPrefetchSent;
                     pfrom->PushGetBlocks(pindexLast, uint256(0));
                     pfrom->fPrefetchSent = true;
+                    if (BlockRequestTraceEnabled() &&
+                        pfrom->getBlocksIndex.size() > nQueuedBefore)
+                    {
+                        BlockRequestTraceGetBlocksTrigger(
+                            pfrom, "batch75", hashBlock,
+                            pfrom->nBlocksReceivedInBatch,
+                            pfrom->nExpectedBatchSize,
+                            fPrefetchSentBefore,
+                            pfrom->hashLastBlockInBatch,
+                            traceResult,
+                            pindexLast->GetBlockHash(),
+                            pindexLast->nHeight,
+                            uint256(0));
+                    }
                     if (fDebug)
                         printf("Prefetch: Requesting next batch at %d/%d blocks (from height %d)\n",
                                pfrom->nBlocksReceivedInBatch, pfrom->nExpectedBatchSize, pindexLast->nHeight);
                 }
                 else if (pindexBest)
                 {
+                    size_t nQueuedBefore = pfrom->getBlocksIndex.size();
+                    bool fPrefetchSentBefore = pfrom->fPrefetchSent;
                     pfrom->PushGetBlocks(pindexBest, uint256(0));
                     pfrom->fPrefetchSent = true;
+                    if (BlockRequestTraceEnabled() &&
+                        pfrom->getBlocksIndex.size() > nQueuedBefore)
+                    {
+                        BlockRequestTraceGetBlocksTrigger(
+                            pfrom, "batch75", hashBlock,
+                            pfrom->nBlocksReceivedInBatch,
+                            pfrom->nExpectedBatchSize,
+                            fPrefetchSentBefore,
+                            pfrom->hashLastBlockInBatch,
+                            traceResult,
+                            pindexBest->GetBlockHash(),
+                            pindexBest->nHeight,
+                            uint256(0));
+                    }
                     if (fDebug)
                         printf("Prefetch: Requesting next batch at %d/%d blocks (fallback from best height %d)\n",
                                pfrom->nBlocksReceivedInBatch, pfrom->nExpectedBatchSize, pindexBest->nHeight);
@@ -8330,7 +8444,23 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                            (long long)(pfrom->nLastGetBlocksTime == 0 ? -1 : (nNow - pfrom->nLastGetBlocksTime)),
                            pfrom->hashContinue.ToString().c_str());
                 }
+                size_t nQueuedBefore = pfrom->getBlocksIndex.size();
+                bool fPrefetchSentBefore = pfrom->fPrefetchSent;
                 pfrom->PushGetBlocks(pindexBest, uint256(0));
+                if (BlockRequestTraceEnabled() &&
+                    pfrom->getBlocksIndex.size() > nQueuedBefore)
+                {
+                    BlockRequestTraceGetBlocksTrigger(
+                        pfrom, "pipeline-drained", hashBlock,
+                        pfrom->nBlocksReceivedInBatch,
+                        pfrom->nExpectedBatchSize,
+                        fPrefetchSentBefore,
+                        pfrom->hashLastBlockInBatch,
+                        traceResult,
+                        pindexBest->GetBlockHash(),
+                        pindexBest->nHeight,
+                        uint256(0));
+                }
             }
         }
     }
@@ -8699,7 +8829,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 for (const uint256& hashTip : vTips)
                 {
                     if (!mapBlockIndex.count(hashTip))
-                        pfrom->AskFor(CInv(MSG_BLOCK, hashTip));
+                        pfrom->AskFor(
+                            CInv(MSG_BLOCK, hashTip),
+                            BLOCKREQ_SOURCE_OTHER);
                 }
             }
         }
@@ -8891,6 +9023,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         if (!fImporting && !fReindex && pBest != NULL && fPeerCanAdvance &&
             nTimeSinceBlock > 15 && !fThrottle)
         {
+            const bool fTraceBlockRequests = BlockRequestTraceEnabled();
+            std::vector<uint256> vTraceErasedHashes;
             mapLastStallRecovery[pto->addrName] = nNow;
             pto->nLastBlockRecv = nNow;
             {
@@ -8898,12 +9032,23 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 for (auto it = mapAlreadyAskedFor.begin(); it != mapAlreadyAskedFor.end(); )
                 {
                     if (it->first.type == MSG_BLOCK)
+                    {
+                        if (fTraceBlockRequests)
+                            vTraceErasedHashes.push_back(it->first.hash);
                         it = mapAlreadyAskedFor.erase(it);
+                    }
                     else
                         ++it;
                 }
             }
             pto->PushGetBlocks(pBest, uint256(0));
+            if (fTraceBlockRequests)
+            {
+                BlockRequestTraceStallRecovery(
+                    pto, nHeight, nPeerHeight, nTimeSinceBlock,
+                    pBest->GetBlockHash(), pBest->nHeight,
+                    uint256(0), vTraceErasedHashes);
+            }
             if (fDebug)
                 printf("Sync stall recovery: peer=%s ch=%d our=%d stall=%ds\n",
                        pto->addrName.c_str(), nPeerHeight, nHeight, (int)nTimeSinceBlock);
@@ -9143,10 +9288,23 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             CInv inv = (*pto->mapAskFor.begin()).second;
             bool fSkip = false;
             bool fBlockRequest = (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK);
+            const bool fTraceBlockRequest =
+                inv.type == MSG_BLOCK && BlockRequestTraceEnabled();
+            bool fSamePeerInFlight = false;
+            bool fCsMainCheckPerformed = false;
+            bool fCsMainCheckResult = false;
+            int nKnownInBlockIndex = -1;
             if (fBlockRequest)
             {
-                if (pto->IsBlockInFlight(inv.hash))
+                fSamePeerInFlight = pto->IsBlockInFlight(inv.hash);
+                if (fSamePeerInFlight)
                 {
+                    if (fTraceBlockRequest)
+                    {
+                        BlockRequestTraceAskRemoved(
+                            pto, inv.hash,
+                            "same-peer-inflight", -1);
+                    }
                     pto->mapAskFor.erase(pto->mapAskFor.begin());
                     continue;
                 }
@@ -9162,8 +9320,13 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 TRY_LOCK(cs_main, lockMain);
                 if (lockMain)
                 {
+                    fCsMainCheckPerformed = true;
+                    if (fTraceBlockRequest)
+                        nKnownInBlockIndex =
+                            mapBlockIndex.count(inv.hash) != 0 ? 1 : 0;
                     CTxDB txdb("r");
                     fSkip = AlreadyHave(txdb, inv);
+                    fCsMainCheckResult = fSkip;
                 }
             }
             if (!fSkip)
@@ -9172,16 +9335,46 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     printf("sending getdata: %s\n", inv.ToString().c_str());
                 vGetData.push_back(inv);
                 if (fBlockRequest)
+                {
                     pto->MarkBlockInFlight(inv.hash);
+                    if (fTraceBlockRequest)
+                        BlockRequestTraceInFlightMark(pto, inv.hash, true);
+                }
                 if (vGetData.size() >= 1000)
                 {
                     pto->PushMessage("getdata", vGetData);
                     vGetData.clear();
                 }
             }
+            int64_t nPreviousGlobalAskedTime = -1;
             {
                 LOCK(cs_mapAlreadyAskedFor);
+                if (fTraceBlockRequest)
+                {
+                    std::map<CInv, int64_t>::const_iterator miPrevious =
+                        mapAlreadyAskedFor.find(inv);
+                    if (miPrevious != mapAlreadyAskedFor.end())
+                        nPreviousGlobalAskedTime = miPrevious->second;
+                }
                 mapAlreadyAskedFor[inv] = nNow;
+            }
+            if (!fSkip && fTraceBlockRequest)
+            {
+                BlockRequestTraceGetDataSend(
+                    pto, inv.hash, BLOCKREQ_SOURCE_ASKFOR,
+                    nKnownInBlockIndex,
+                    fCsMainCheckPerformed,
+                    fCsMainCheckResult,
+                    fSamePeerInFlight,
+                    true,
+                    nPreviousGlobalAskedTime,
+                    nNow);
+            }
+            else if (fSkip && fTraceBlockRequest)
+            {
+                BlockRequestTraceAskRemoved(
+                    pto, inv.hash, "already-have",
+                    nKnownInBlockIndex);
             }
             pto->mapAskFor.erase(pto->mapAskFor.begin());
         }

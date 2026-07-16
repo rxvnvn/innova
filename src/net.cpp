@@ -16,6 +16,7 @@
 #include "shielded.h"
 #include <sys/stat.h>
 #include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <cstdio>
 
@@ -601,6 +602,1065 @@ map<CInv, int64_t> mapAlreadyAskedFor;
 // mutex for mapAlreadyAskedFor
 CCriticalSection cs_mapAlreadyAskedFor;
 
+namespace {
+
+static const size_t BLOCK_REQUEST_TRACE_MAX_HASHES = 16384;
+static const size_t BLOCK_REQUEST_TRACE_MAX_PEERS_PER_HASH = 16;
+static const int64_t BLOCK_REQUEST_TRACE_NORMAL_RETENTION_US = 60 * 1000000;
+static const int64_t BLOCK_REQUEST_TRACE_ANOMALY_RETENTION_US = 30 * 60 * 1000000;
+static const int64_t BLOCK_REQUEST_TRACE_SUMMARY_INTERVAL_US = 60 * 1000000;
+
+struct BlockRequestTracePeerState
+{
+    uint64_t queuedCount;
+    bool inFlight;
+    int64_t inFlightSince;
+    std::string address;
+
+    BlockRequestTracePeerState()
+        : queuedCount(0), inFlight(false), inFlightSince(0)
+    {
+    }
+};
+
+struct BlockRequestTraceEntry
+{
+    int64_t firstSeenTime;
+    int64_t firstRequestTime;
+    int64_t firstScheduledTime;
+    int64_t lastRequestTime;
+    int64_t lastGlobalAskedTime;
+    int64_t firstSendTime;
+    int64_t previousSendTime;
+    int64_t lastSendTime;
+    int64_t firstReceiveTime;
+    int64_t lastReceiveTime;
+    int64_t lastTouchedTime;
+    NodeId firstRequestPeer;
+    NodeId firstSendPeer;
+    NodeId firstReceivePeer;
+    std::string firstRequestAddress;
+    std::string firstSendAddress;
+    std::string firstReceiveAddress;
+    uint64_t requestCount;
+    uint64_t sendCount;
+    uint64_t receiveCount;
+    uint64_t duplicateOrKnownReceiveCount;
+    uint64_t stallRecoveryCount;
+    uint64_t getBlocksWaveCount;
+    BlockRequestTraceSource lastSource;
+    BlockRequestTraceSource firstRequestSource;
+    BlockRequestTraceSource firstSendSource;
+    BlockRequestTraceResult lastResult;
+    std::string lastRemovalReason;
+    int lastKnownHeight;
+    bool indexed;
+    bool activeChain;
+    bool anomalous;
+    bool completed;
+    std::map<NodeId, BlockRequestTracePeerState> peers;
+
+    explicit BlockRequestTraceEntry(int64_t nNow)
+        : firstSeenTime(nNow),
+          firstRequestTime(0),
+          firstScheduledTime(0),
+          lastRequestTime(0),
+          lastGlobalAskedTime(0),
+          firstSendTime(0),
+          previousSendTime(0),
+          lastSendTime(0),
+          firstReceiveTime(0),
+          lastReceiveTime(0),
+          lastTouchedTime(nNow),
+          firstRequestPeer(-1),
+          firstSendPeer(-1),
+          firstReceivePeer(-1),
+          requestCount(0),
+          sendCount(0),
+          receiveCount(0),
+          duplicateOrKnownReceiveCount(0),
+          stallRecoveryCount(0),
+          getBlocksWaveCount(0),
+          lastSource(BLOCKREQ_SOURCE_OTHER),
+          firstRequestSource(BLOCKREQ_SOURCE_OTHER),
+          firstSendSource(BLOCKREQ_SOURCE_OTHER),
+          lastResult(BLOCKREQ_RESULT_UNKNOWN),
+          lastKnownHeight(-1),
+          indexed(false),
+          activeChain(false),
+          anomalous(false),
+          completed(false)
+    {
+    }
+};
+
+struct BlockRequestTraceCounters
+{
+    uint64_t uniqueHashesScheduled;
+    uint64_t totalSchedules;
+    uint64_t duplicateSchedules;
+    uint64_t totalSends;
+    uint64_t duplicateSends;
+    uint64_t knownSends;
+    uint64_t failedTryLockSends;
+    uint64_t crossPeerOverlapCount;
+    uint64_t totalReceives;
+    uint64_t duplicateOrKnownReceives;
+    uint64_t stallRecoveryCount;
+    uint64_t batch75TriggerCount;
+    uint64_t pipelineTriggerCount;
+    uint64_t maxSimultaneousOwnership;
+    uint64_t registryDrops;
+    uint64_t peerStateDrops;
+
+    BlockRequestTraceCounters()
+        : uniqueHashesScheduled(0),
+          totalSchedules(0),
+          duplicateSchedules(0),
+          totalSends(0),
+          duplicateSends(0),
+          knownSends(0),
+          failedTryLockSends(0),
+          crossPeerOverlapCount(0),
+          totalReceives(0),
+          duplicateOrKnownReceives(0),
+          stallRecoveryCount(0),
+          batch75TriggerCount(0),
+          pipelineTriggerCount(0),
+          maxSimultaneousOwnership(0),
+          registryDrops(0),
+          peerStateDrops(0)
+    {
+    }
+};
+
+// Hooks pass production state as values. Code under this lock never acquires
+// cs_main, cs_vNodes, or a peer lock, so tracing cannot invert their order.
+static CCriticalSection cs_blockRequestTrace;
+// Initialized once in AppInit2 before networking threads start, then immutable.
+static bool fBlockRequestTraceEnabled = false;
+static bool fBlockRequestTraceFilter = false;
+static std::string strBlockRequestTraceFilter;
+static std::map<uint256, BlockRequestTraceEntry> mapBlockRequestTrace;
+static BlockRequestTraceCounters blockRequestTraceCounters;
+static uint64_t nBlockRequestTraceOperations = 0;
+static int64_t nLastBlockRequestTraceSummary = 0;
+
+static const char* BlockRequestTraceSourceName(BlockRequestTraceSource source)
+{
+    switch (source)
+    {
+    case BLOCKREQ_SOURCE_ASKFOR:
+        return "askfor";
+    case BLOCKREQ_SOURCE_INV:
+        return "inv";
+    case BLOCKREQ_SOURCE_HEADERS_DIRECT:
+        return "headers-direct";
+    case BLOCKREQ_SOURCE_ORPHAN:
+        return "orphan";
+    case BLOCKREQ_SOURCE_CHECKPOINT:
+        return "checkpoint";
+    default:
+        return "other";
+    }
+}
+
+static const char* BlockRequestTraceResultName(BlockRequestTraceResult result)
+{
+    switch (result)
+    {
+    case BLOCKREQ_RESULT_ACCEPTED_ACTIVE:
+        return "accepted-active";
+    case BLOCKREQ_RESULT_ACCEPTED_INDEXED:
+        return "accepted-indexed";
+    case BLOCKREQ_RESULT_ORPHAN_NEW:
+        return "orphan-new";
+    case BLOCKREQ_RESULT_ALREADY_KNOWN:
+        return "already-known";
+    case BLOCKREQ_RESULT_ORPHAN_DUPLICATE:
+        return "orphan-duplicate";
+    case BLOCKREQ_RESULT_REJECTED:
+        return "rejected-or-invalid";
+    case BLOCKREQ_RESULT_TRUE_UNINDEXED:
+        return "process-true-unindexed";
+    default:
+        return "unknown";
+    }
+}
+
+static std::string BlockRequestTracePeerAddress(const CNode* pnode)
+{
+    std::string value = pnode->addrName.empty() ? pnode->addr.ToString() : pnode->addrName;
+    for (size_t i = 0; i < value.size(); ++i)
+    {
+        unsigned char ch = static_cast<unsigned char>(value[i]);
+        if (std::isspace(ch) || value[i] == '=')
+            value[i] = '_';
+    }
+    return value.empty() ? "unknown" : value;
+}
+
+static bool BlockRequestTraceMatchesFilter(const uint256& hash)
+{
+    return !fBlockRequestTraceFilter || hash.ToString() == strBlockRequestTraceFilter;
+}
+
+static bool BlockRequestTraceInteresting(const BlockRequestTraceEntry& entry)
+{
+    return fBlockRequestTraceFilter || entry.anomalous ||
+           entry.requestCount >= 2 || entry.sendCount >= 2 || entry.receiveCount >= 2;
+}
+
+static size_t BlockRequestTraceCountQueued(
+    const BlockRequestTraceEntry& entry, NodeId excludePeer)
+{
+    size_t count = 0;
+    for (std::map<NodeId, BlockRequestTracePeerState>::const_iterator it = entry.peers.begin();
+         it != entry.peers.end(); ++it)
+    {
+        if (it->first != excludePeer && it->second.queuedCount != 0)
+            ++count;
+    }
+    return count;
+}
+
+static size_t BlockRequestTraceCountInFlight(
+    const BlockRequestTraceEntry& entry, NodeId excludePeer)
+{
+    size_t count = 0;
+    for (std::map<NodeId, BlockRequestTracePeerState>::const_iterator it = entry.peers.begin();
+         it != entry.peers.end(); ++it)
+    {
+        if (it->first != excludePeer && it->second.inFlight)
+            ++count;
+    }
+    return count;
+}
+
+static size_t BlockRequestTraceOwnershipCount(const BlockRequestTraceEntry& entry)
+{
+    size_t count = 0;
+    for (std::map<NodeId, BlockRequestTracePeerState>::const_iterator it = entry.peers.begin();
+         it != entry.peers.end(); ++it)
+    {
+        if (it->second.queuedCount != 0 || it->second.inFlight)
+            ++count;
+    }
+    return count;
+}
+
+static bool BlockRequestTraceHasOwnership(const BlockRequestTraceEntry& entry)
+{
+    return BlockRequestTraceOwnershipCount(entry) != 0;
+}
+
+static BlockRequestTracePeerState* BlockRequestTracePeerLocked(
+    BlockRequestTraceEntry& entry, CNode* pnode, const uint256& hash)
+{
+    NodeId peer = pnode->GetId();
+    std::map<NodeId, BlockRequestTracePeerState>::iterator it =
+        entry.peers.find(peer);
+    if (it == entry.peers.end())
+    {
+        if (entry.peers.size() >= BLOCK_REQUEST_TRACE_MAX_PEERS_PER_HASH)
+        {
+            for (it = entry.peers.begin(); it != entry.peers.end(); ++it)
+            {
+                if (it->second.queuedCount == 0 && !it->second.inFlight)
+                {
+                    entry.peers.erase(it);
+                    break;
+                }
+            }
+        }
+        if (entry.peers.size() >= BLOCK_REQUEST_TRACE_MAX_PEERS_PER_HASH)
+        {
+            ++blockRequestTraceCounters.peerStateDrops;
+            entry.anomalous = true;
+            printf("BLOCKREQTRACE time_us=%lld event=REGISTRY_DROP hash=%s peer=%d addr=%s reason=per_hash_peer_cap cap=%zu\n",
+                   (long long)GetTimeMicros(), hash.ToString().c_str(), peer,
+                   BlockRequestTracePeerAddress(pnode).c_str(),
+                   BLOCK_REQUEST_TRACE_MAX_PEERS_PER_HASH);
+            return NULL;
+        }
+        it = entry.peers.insert(
+            std::make_pair(peer, BlockRequestTracePeerState())).first;
+    }
+    it->second.address = BlockRequestTracePeerAddress(pnode);
+    return &it->second;
+}
+
+static void BlockRequestTracePruneLocked(int64_t nNow, bool fForce)
+{
+    ++nBlockRequestTraceOperations;
+    if (!fForce && (nBlockRequestTraceOperations % 256) != 0 &&
+        mapBlockRequestTrace.size() < BLOCK_REQUEST_TRACE_MAX_HASHES)
+        return;
+
+    for (std::map<uint256, BlockRequestTraceEntry>::iterator it = mapBlockRequestTrace.begin();
+         it != mapBlockRequestTrace.end(); )
+    {
+        BlockRequestTraceEntry& entry = it->second;
+        int64_t nRetention = entry.anomalous
+            ? BLOCK_REQUEST_TRACE_ANOMALY_RETENTION_US
+            : BLOCK_REQUEST_TRACE_NORMAL_RETENTION_US;
+        if (entry.completed && nNow - entry.lastTouchedTime > nRetention)
+            it = mapBlockRequestTrace.erase(it);
+        else
+            ++it;
+    }
+}
+
+static bool BlockRequestTraceEvictOneLocked()
+{
+    std::map<uint256, BlockRequestTraceEntry>::iterator best = mapBlockRequestTrace.end();
+    for (std::map<uint256, BlockRequestTraceEntry>::iterator it = mapBlockRequestTrace.begin();
+         it != mapBlockRequestTrace.end(); ++it)
+    {
+        if (!it->second.completed)
+            continue;
+        if (best == mapBlockRequestTrace.end() ||
+            (best->second.anomalous && !it->second.anomalous) ||
+            (best->second.anomalous == it->second.anomalous &&
+             it->second.lastTouchedTime < best->second.lastTouchedTime))
+        {
+            best = it;
+        }
+    }
+    if (best == mapBlockRequestTrace.end())
+        return false;
+    mapBlockRequestTrace.erase(best);
+    return true;
+}
+
+static BlockRequestTraceEntry* BlockRequestTraceGetLocked(
+    const uint256& hash, int64_t nNow, bool fCreate)
+{
+    if (!BlockRequestTraceMatchesFilter(hash))
+        return NULL;
+
+    std::map<uint256, BlockRequestTraceEntry>::iterator it = mapBlockRequestTrace.find(hash);
+    if (it != mapBlockRequestTrace.end())
+    {
+        it->second.lastTouchedTime = nNow;
+        return &it->second;
+    }
+    if (!fCreate)
+        return NULL;
+
+    BlockRequestTracePruneLocked(nNow, false);
+    while (mapBlockRequestTrace.size() >= BLOCK_REQUEST_TRACE_MAX_HASHES)
+    {
+        if (!BlockRequestTraceEvictOneLocked())
+        {
+            ++blockRequestTraceCounters.registryDrops;
+            return NULL;
+        }
+    }
+
+    return &mapBlockRequestTrace.insert(
+        std::make_pair(hash, BlockRequestTraceEntry(nNow))).first->second;
+}
+
+static void BlockRequestTraceUpdateMaxOwnershipLocked(const BlockRequestTraceEntry& entry)
+{
+    uint64_t count = BlockRequestTraceOwnershipCount(entry);
+    if (count > blockRequestTraceCounters.maxSimultaneousOwnership)
+        blockRequestTraceCounters.maxSimultaneousOwnership = count;
+}
+
+static void BlockRequestTraceMaybeSummaryLocked(int64_t nNow)
+{
+    if (nLastBlockRequestTraceSummary != 0 &&
+        nNow - nLastBlockRequestTraceSummary < BLOCK_REQUEST_TRACE_SUMMARY_INTERVAL_US)
+        return;
+    nLastBlockRequestTraceSummary = nNow;
+    printf("BLOCKREQTRACE time_us=%lld event=SUMMARY unique_hashes_scheduled=%llu total_schedules=%llu duplicate_schedules=%llu total_getdata_sends=%llu duplicate_getdata_sends=%llu known_getdata_sends=%llu failed_trylock_sends=%llu cross_peer_overlaps=%llu total_receives=%llu duplicate_known_receives=%llu stall_recoveries=%llu batch75_triggers=%llu pipeline_triggers=%llu max_peer_ownership=%llu registry_size=%zu registry_drops=%llu peer_state_drops=%llu\n",
+           (long long)nNow,
+           (unsigned long long)blockRequestTraceCounters.uniqueHashesScheduled,
+           (unsigned long long)blockRequestTraceCounters.totalSchedules,
+           (unsigned long long)blockRequestTraceCounters.duplicateSchedules,
+           (unsigned long long)blockRequestTraceCounters.totalSends,
+           (unsigned long long)blockRequestTraceCounters.duplicateSends,
+           (unsigned long long)blockRequestTraceCounters.knownSends,
+           (unsigned long long)blockRequestTraceCounters.failedTryLockSends,
+           (unsigned long long)blockRequestTraceCounters.crossPeerOverlapCount,
+           (unsigned long long)blockRequestTraceCounters.totalReceives,
+           (unsigned long long)blockRequestTraceCounters.duplicateOrKnownReceives,
+           (unsigned long long)blockRequestTraceCounters.stallRecoveryCount,
+           (unsigned long long)blockRequestTraceCounters.batch75TriggerCount,
+           (unsigned long long)blockRequestTraceCounters.pipelineTriggerCount,
+           (unsigned long long)blockRequestTraceCounters.maxSimultaneousOwnership,
+           mapBlockRequestTrace.size(),
+           (unsigned long long)blockRequestTraceCounters.registryDrops,
+           (unsigned long long)blockRequestTraceCounters.peerStateDrops);
+}
+
+} // namespace
+
+bool InitBlockRequestTrace(bool fEnabled, const std::string& strHashFilter)
+{
+    std::string normalized = strHashFilter;
+    for (size_t i = 0; i < normalized.size(); ++i)
+        normalized[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(normalized[i])));
+
+    if (!normalized.empty())
+    {
+        if (normalized.size() != 64)
+            return false;
+        for (size_t i = 0; i < normalized.size(); ++i)
+            if (!std::isxdigit(static_cast<unsigned char>(normalized[i])))
+                return false;
+    }
+
+    LOCK(cs_blockRequestTrace);
+    fBlockRequestTraceEnabled = fEnabled;
+    fBlockRequestTraceFilter = fEnabled && !normalized.empty();
+    strBlockRequestTraceFilter = normalized;
+    mapBlockRequestTrace.clear();
+    blockRequestTraceCounters = BlockRequestTraceCounters();
+    nBlockRequestTraceOperations = 0;
+    nLastBlockRequestTraceSummary = 0;
+
+    if (fBlockRequestTraceEnabled)
+    {
+        printf("BLOCKREQTRACE time_us=%lld event=START enabled=1 filter=%s hash_cap=%zu peer_cap_per_hash=%zu normal_retention_s=60 anomaly_retention_s=1800\n",
+               (long long)GetTimeMicros(),
+               fBlockRequestTraceFilter ? strBlockRequestTraceFilter.c_str() : "none",
+               BLOCK_REQUEST_TRACE_MAX_HASHES,
+               BLOCK_REQUEST_TRACE_MAX_PEERS_PER_HASH);
+    }
+    return true;
+}
+
+bool BlockRequestTraceEnabled()
+{
+    return fBlockRequestTraceEnabled;
+}
+
+void BlockRequestTraceAskSchedule(CNode* pnode, const uint256& hash,
+                                  BlockRequestTraceSource source,
+                                  int64_t nScheduledTime,
+                                  int64_t nPreviousGlobalTime,
+                                  bool fSamePeerInFlight)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, true);
+    if (!entry)
+        return;
+
+    NodeId peer = pnode->GetId();
+    size_t nOtherQueued = BlockRequestTraceCountQueued(*entry, peer);
+    size_t nOtherInFlight = BlockRequestTraceCountInFlight(*entry, peer);
+    if (entry->requestCount == 0)
+    {
+        entry->firstRequestTime = nNow;
+        entry->firstScheduledTime = nScheduledTime;
+        entry->firstRequestPeer = peer;
+        entry->firstRequestAddress = BlockRequestTracePeerAddress(pnode);
+        entry->firstRequestSource = source;
+        ++blockRequestTraceCounters.uniqueHashesScheduled;
+    }
+    ++entry->requestCount;
+    ++blockRequestTraceCounters.totalSchedules;
+    if (entry->requestCount >= 2)
+    {
+        ++blockRequestTraceCounters.duplicateSchedules;
+        entry->anomalous = true;
+    }
+    if (nOtherQueued != 0 || nOtherInFlight != 0)
+    {
+        ++blockRequestTraceCounters.crossPeerOverlapCount;
+        entry->anomalous = true;
+    }
+
+    entry->lastRequestTime = nNow;
+    entry->lastGlobalAskedTime = nScheduledTime;
+    entry->lastSource = source;
+    entry->completed = false;
+    BlockRequestTracePeerState* peerState =
+        BlockRequestTracePeerLocked(*entry, pnode, hash);
+    if (!peerState)
+    {
+        BlockRequestTraceMaybeSummaryLocked(nNow);
+        return;
+    }
+    uint64_t nSamePeerQueuedBefore = peerState->queuedCount;
+    ++peerState->queuedCount;
+    BlockRequestTraceUpdateMaxOwnershipLocked(*entry);
+
+    if (entry->requestCount >= 2 || nOtherQueued != 0 || nOtherInFlight != 0 ||
+        fBlockRequestTraceFilter)
+    {
+        printf("BLOCKREQTRACE time_us=%lld event=ASK_SCHEDULE hash=%s peer=%d addr=%s source=%s scheduled_us=%lld previous_global_us=%lld request_count=%llu first_seen_us=%lld first_request_us=%lld last_request_us=%lld first_scheduled_us=%lld first_peer=%d first_addr=%s first_source=%s first_send_us=%lld last_send_us=%lld first_send_peer=%d first_send_addr=%s first_send_source=%s first_receive_us=%lld last_receive_us=%lld first_receive_peer=%d first_receive_addr=%s previous_result=%s previous_indexed=%d previous_active=%d previous_height=%d known_index=-1 same_peer_inflight=%d same_peer_queued_before=%llu other_peer_queued=%zu other_peer_inflight=%zu last_removal=%s\n",
+               (long long)nNow, hash.ToString().c_str(), peer,
+               peerState->address.c_str(), BlockRequestTraceSourceName(source),
+               (long long)nScheduledTime, (long long)nPreviousGlobalTime,
+               (unsigned long long)entry->requestCount,
+               (long long)entry->firstSeenTime,
+               (long long)entry->firstRequestTime,
+               (long long)entry->lastRequestTime,
+               (long long)entry->firstScheduledTime,
+               entry->firstRequestPeer,
+               entry->firstRequestAddress.c_str(),
+               BlockRequestTraceSourceName(entry->firstRequestSource),
+               (long long)entry->firstSendTime,
+               (long long)entry->lastSendTime,
+               entry->firstSendPeer,
+               entry->firstSendAddress.empty()
+                   ? "unknown" : entry->firstSendAddress.c_str(),
+               BlockRequestTraceSourceName(entry->firstSendSource),
+               (long long)entry->firstReceiveTime,
+               (long long)entry->lastReceiveTime,
+               entry->firstReceivePeer,
+               entry->firstReceiveAddress.empty()
+                   ? "unknown" : entry->firstReceiveAddress.c_str(),
+               BlockRequestTraceResultName(entry->lastResult),
+               entry->indexed ? 1 : 0,
+               entry->activeChain ? 1 : 0,
+               entry->lastKnownHeight,
+               fSamePeerInFlight ? 1 : 0,
+               (unsigned long long)nSamePeerQueuedBefore,
+               nOtherQueued, nOtherInFlight,
+               entry->lastRemovalReason.empty()
+                   ? "none" : entry->lastRemovalReason.c_str());
+    }
+    BlockRequestTraceMaybeSummaryLocked(nNow);
+}
+
+void BlockRequestTraceAskRemoved(CNode* pnode, const uint256& hash,
+                                 const char* pszReason,
+                                 int nKnownInBlockIndex)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry =
+        BlockRequestTraceGetLocked(hash, nNow, false);
+    if (!entry)
+        return;
+
+    BlockRequestTracePeerState* peerState =
+        BlockRequestTracePeerLocked(*entry, pnode, hash);
+    if (!peerState)
+        return;
+    if (peerState->queuedCount != 0)
+        --peerState->queuedCount;
+    entry->lastRemovalReason = pszReason;
+    size_t nOtherQueued =
+        BlockRequestTraceCountQueued(*entry, pnode->GetId());
+    size_t nOtherInFlight =
+        BlockRequestTraceCountInFlight(*entry, pnode->GetId());
+    entry->completed = !BlockRequestTraceHasOwnership(*entry);
+
+    if (BlockRequestTraceInteresting(*entry))
+    {
+        printf("BLOCKREQTRACE time_us=%lld event=ASK_REMOVE hash=%s peer=%d addr=%s reason=%s same_peer_queued=%llu other_peer_queued=%zu other_peer_inflight=%zu known_index=%d\n",
+               (long long)nNow, hash.ToString().c_str(), pnode->GetId(),
+               peerState->address.c_str(), pszReason,
+               (unsigned long long)peerState->queuedCount,
+               nOtherQueued, nOtherInFlight, nKnownInBlockIndex);
+    }
+}
+
+void BlockRequestTraceGetDataSend(CNode* pnode, const uint256& hash,
+                                  BlockRequestTraceSource path,
+                                  int nKnownInBlockIndex,
+                                  bool fCsMainCheckPerformed,
+                                  bool fCsMainCheckResult,
+                                  bool fSamePeerInFlight,
+                                  bool fMapAskForPresent,
+                                  int64_t nPreviousGlobalAskedTime,
+                                  int64_t nWrittenGlobalAskedTime)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, true);
+    if (!entry)
+        return;
+
+    NodeId peer = pnode->GetId();
+    size_t nOtherInFlight = BlockRequestTraceCountInFlight(*entry, peer);
+    BlockRequestTracePeerState* peerState =
+        BlockRequestTracePeerLocked(*entry, pnode, hash);
+    if (!peerState)
+        return;
+    fMapAskForPresent =
+        fMapAskForPresent || peerState->queuedCount != 0;
+    if (path == BLOCKREQ_SOURCE_HEADERS_DIRECT)
+        entry->lastSource = path;
+
+    entry->previousSendTime = entry->lastSendTime;
+    entry->lastSendTime = nNow;
+    if (entry->firstSendTime == 0)
+    {
+        entry->firstSendTime = nNow;
+        entry->firstSendPeer = peer;
+        entry->firstSendAddress = peerState->address;
+        entry->firstSendSource = entry->lastSource;
+    }
+    if (nWrittenGlobalAskedTime >= 0)
+        entry->lastGlobalAskedTime = nWrittenGlobalAskedTime;
+    else if (nPreviousGlobalAskedTime >= 0)
+        entry->lastGlobalAskedTime = nPreviousGlobalAskedTime;
+    ++entry->sendCount;
+    ++blockRequestTraceCounters.totalSends;
+    if (entry->sendCount >= 2)
+    {
+        ++blockRequestTraceCounters.duplicateSends;
+        entry->anomalous = true;
+    }
+    if (nKnownInBlockIndex > 0)
+    {
+        ++blockRequestTraceCounters.knownSends;
+        entry->anomalous = true;
+    }
+    if (!fCsMainCheckPerformed && path != BLOCKREQ_SOURCE_HEADERS_DIRECT)
+    {
+        ++blockRequestTraceCounters.failedTryLockSends;
+        entry->anomalous = true;
+    }
+    if (nOtherInFlight != 0)
+    {
+        ++blockRequestTraceCounters.crossPeerOverlapCount;
+        entry->anomalous = true;
+    }
+    if (BlockRequestTraceInteresting(*entry) ||
+        nKnownInBlockIndex > 0 || nOtherInFlight != 0 ||
+        !fCsMainCheckPerformed || path == BLOCKREQ_SOURCE_HEADERS_DIRECT ||
+        fBlockRequestTraceFilter)
+    {
+        printf("BLOCKREQTRACE time_us=%lld event=GETDATA_SEND hash=%s peer=%d addr=%s path=%s source=%s request_count=%llu send_count=%llu first_seen_us=%lld first_request_us=%lld last_request_us=%lld first_scheduled_us=%lld first_peer=%d first_addr=%s first_source=%s known_index=%d cs_main_check_performed=%d cs_main_check_result=%d same_peer_inflight=%d same_peer_queued=%llu other_peer_inflight=%zu mapaskfor_present=%d previous_global_asked_us=%lld written_global_asked_us=%lld global_asked_us=%lld first_send_us=%lld last_send_us=%lld first_send_peer=%d first_send_addr=%s first_send_source=%s previous_send_us=%lld first_receive_us=%lld last_receive_us=%lld first_receive_peer=%d first_receive_addr=%s previous_result=%s previous_indexed=%d previous_active=%d previous_height=%d last_removal=%s\n",
+               (long long)nNow, hash.ToString().c_str(), peer,
+               peerState->address.c_str(), BlockRequestTraceSourceName(path),
+               BlockRequestTraceSourceName(entry->lastSource),
+               (unsigned long long)entry->requestCount,
+               (unsigned long long)entry->sendCount,
+               (long long)entry->firstSeenTime,
+               (long long)entry->firstRequestTime,
+               (long long)entry->lastRequestTime,
+               (long long)entry->firstScheduledTime,
+               entry->firstRequestPeer,
+               entry->firstRequestAddress.empty()
+                   ? "unknown" : entry->firstRequestAddress.c_str(),
+               BlockRequestTraceSourceName(entry->firstRequestSource),
+               nKnownInBlockIndex,
+               fCsMainCheckPerformed ? 1 : 0,
+               fCsMainCheckResult ? 1 : 0,
+               fSamePeerInFlight ? 1 : 0,
+               (unsigned long long)peerState->queuedCount,
+               nOtherInFlight,
+               fMapAskForPresent ? 1 : 0,
+               (long long)nPreviousGlobalAskedTime,
+               (long long)nWrittenGlobalAskedTime,
+               (long long)entry->lastGlobalAskedTime,
+               (long long)entry->firstSendTime,
+               (long long)entry->lastSendTime,
+               entry->firstSendPeer,
+               entry->firstSendAddress.c_str(),
+               BlockRequestTraceSourceName(entry->firstSendSource),
+               (long long)entry->previousSendTime,
+               (long long)entry->firstReceiveTime,
+               (long long)entry->lastReceiveTime,
+               entry->firstReceivePeer,
+               entry->firstReceiveAddress.empty()
+                   ? "unknown" : entry->firstReceiveAddress.c_str(),
+               BlockRequestTraceResultName(entry->lastResult),
+               entry->indexed ? 1 : 0,
+               entry->activeChain ? 1 : 0,
+               entry->lastKnownHeight,
+               entry->lastRemovalReason.empty()
+                   ? "none" : entry->lastRemovalReason.c_str());
+    }
+    BlockRequestTraceMaybeSummaryLocked(nNow);
+}
+
+void BlockRequestTraceInFlightMark(CNode* pnode, const uint256& hash,
+                                   bool fConsumesQueuedEntry)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, false);
+    if (!entry)
+        return;
+    BlockRequestTracePeerState* peerState =
+        BlockRequestTracePeerLocked(*entry, pnode, hash);
+    if (!peerState)
+        return;
+    if (fConsumesQueuedEntry && peerState->queuedCount != 0)
+        --peerState->queuedCount;
+    peerState->inFlight = true;
+    peerState->inFlightSince = nNow;
+    entry->completed = false;
+    BlockRequestTraceUpdateMaxOwnershipLocked(*entry);
+}
+
+void BlockRequestTraceBlockReceive(CNode* pnode, const uint256& hash,
+                                   bool fKnownBefore,
+                                   bool fSenderInFlightBefore,
+                                   int64_t nSenderInFlightAge)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, true);
+    if (!entry)
+        return;
+
+    NodeId peer = pnode->GetId();
+    size_t nOtherQueued = BlockRequestTraceCountQueued(*entry, peer);
+    size_t nOtherInFlight = BlockRequestTraceCountInFlight(*entry, peer);
+    BlockRequestTracePeerState* peerState =
+        BlockRequestTracePeerLocked(*entry, pnode, hash);
+    if (!peerState)
+        return;
+    bool fUnexpectedPeer =
+        peerState->queuedCount == 0 && !peerState->inFlight;
+
+    BlockRequestTraceResult previousResult = entry->lastResult;
+    bool fPreviousIndexed = entry->indexed;
+    bool fPreviousActive = entry->activeChain;
+    int nPreviousHeight = entry->lastKnownHeight;
+    if (entry->receiveCount == 0)
+    {
+        entry->firstReceiveTime = nNow;
+        entry->firstReceivePeer = peer;
+        entry->firstReceiveAddress = peerState->address;
+    }
+    ++entry->receiveCount;
+    ++blockRequestTraceCounters.totalReceives;
+    entry->lastReceiveTime = nNow;
+    if (entry->receiveCount >= 2 || fKnownBefore)
+    {
+        ++entry->duplicateOrKnownReceiveCount;
+        ++blockRequestTraceCounters.duplicateOrKnownReceives;
+        entry->anomalous = true;
+    }
+    if (fUnexpectedPeer || nOtherQueued != 0 || nOtherInFlight != 0)
+        entry->anomalous = true;
+
+    int64_t nSinceFirstSend = entry->firstSendTime == 0 ? -1 : nNow - entry->firstSendTime;
+    int64_t nSincePreviousSend = entry->lastSendTime == 0 ? -1 : nNow - entry->lastSendTime;
+    if (BlockRequestTraceInteresting(*entry) ||
+        fKnownBefore || fUnexpectedPeer ||
+        nOtherQueued != 0 || nOtherInFlight != 0 || fBlockRequestTraceFilter)
+    {
+        printf("BLOCKREQTRACE time_us=%lld event=BLOCK_RECEIVE hash=%s peer=%d addr=%s receive_count=%llu first_seen_us=%lld first_request_us=%lld last_request_us=%lld first_send_us=%lld last_send_us=%lld first_receive_us=%lld last_receive_us=%lld first_receive_peer=%d first_receive_addr=%s known_before=%d sender_inflight_before=%d sender_inflight_age_s=%lld unexpected_peer=%d same_peer_queued=%llu other_peer_queued=%zu other_peer_inflight=%zu elapsed_first_send_us=%lld elapsed_previous_send_us=%lld previous_result=%s previous_indexed=%d previous_active=%d previous_height=%d\n",
+               (long long)nNow, hash.ToString().c_str(), peer,
+               peerState->address.c_str(),
+               (unsigned long long)entry->receiveCount,
+               (long long)entry->firstSeenTime,
+               (long long)entry->firstRequestTime,
+               (long long)entry->lastRequestTime,
+               (long long)entry->firstSendTime,
+               (long long)entry->lastSendTime,
+               (long long)entry->firstReceiveTime,
+               (long long)entry->lastReceiveTime,
+               entry->firstReceivePeer,
+               entry->firstReceiveAddress.c_str(),
+               fKnownBefore ? 1 : 0,
+               fSenderInFlightBefore ? 1 : 0,
+               (long long)nSenderInFlightAge,
+               fUnexpectedPeer ? 1 : 0,
+               (unsigned long long)peerState->queuedCount,
+               nOtherQueued, nOtherInFlight,
+               (long long)nSinceFirstSend,
+               (long long)nSincePreviousSend,
+               BlockRequestTraceResultName(previousResult),
+               fPreviousIndexed ? 1 : 0,
+               fPreviousActive ? 1 : 0,
+               nPreviousHeight);
+    }
+    peerState->inFlight = false;
+    peerState->inFlightSince = 0;
+    BlockRequestTraceMaybeSummaryLocked(nNow);
+}
+
+void BlockRequestTraceBlockResult(CNode* pnode, const uint256& hash,
+                                  BlockRequestTraceResult result,
+                                  bool fProcessBlockResult,
+                                  bool fIndexedAfter,
+                                  bool fActiveChainAfter,
+                                  bool fBestChainAfter,
+                                  int nHeightAfter)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, true);
+    if (!entry)
+        return;
+
+    entry->lastResult = result;
+    entry->indexed = fIndexedAfter;
+    entry->activeChain = fActiveChainAfter;
+    entry->lastKnownHeight = nHeightAfter;
+    if (result != BLOCKREQ_RESULT_ACCEPTED_ACTIVE &&
+        result != BLOCKREQ_RESULT_ACCEPTED_INDEXED)
+        entry->anomalous = true;
+    entry->completed = !BlockRequestTraceHasOwnership(*entry);
+
+    if (BlockRequestTraceInteresting(*entry))
+    {
+        printf("BLOCKREQTRACE time_us=%lld event=BLOCK_RESULT hash=%s peer=%d addr=%s result=%s processblock_result=%d indexed_after=%d active_chain_after=%d best_chain_after=%d height=%d setbest_state=%s request_count=%llu send_count=%llu receive_count=%llu first_seen_us=%lld first_request_us=%lld last_request_us=%lld first_send_us=%lld last_send_us=%lld first_receive_us=%lld last_receive_us=%lld\n",
+               (long long)nNow, hash.ToString().c_str(), pnode->GetId(),
+               BlockRequestTracePeerAddress(pnode).c_str(),
+               BlockRequestTraceResultName(result),
+               fProcessBlockResult ? 1 : 0,
+               fIndexedAfter ? 1 : 0,
+               fActiveChainAfter ? 1 : 0,
+               fBestChainAfter ? 1 : 0,
+               nHeightAfter,
+               fActiveChainAfter ? "proven-active-chain" : "not-proven",
+               (unsigned long long)entry->requestCount,
+               (unsigned long long)entry->sendCount,
+               (unsigned long long)entry->receiveCount,
+               (long long)entry->firstSeenTime,
+               (long long)entry->firstRequestTime,
+               (long long)entry->lastRequestTime,
+               (long long)entry->firstSendTime,
+               (long long)entry->lastSendTime,
+               (long long)entry->firstReceiveTime,
+               (long long)entry->lastReceiveTime);
+    }
+    BlockRequestTraceMaybeSummaryLocked(nNow);
+}
+
+void BlockRequestTraceInFlightClear(CNode* pnode, const uint256& hash,
+                                    const char* pszReason,
+                                    int64_t nAge,
+                                    bool fKnownInBlockIndex)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, false);
+    if (!entry)
+        return;
+
+    BlockRequestTracePeerState* peerState =
+        BlockRequestTracePeerLocked(*entry, pnode, hash);
+    if (!peerState)
+        return;
+    peerState->inFlight = false;
+    peerState->inFlightSince = 0;
+    entry->lastRemovalReason = pszReason;
+    entry->indexed = entry->indexed || fKnownInBlockIndex;
+    size_t nOtherQueued = BlockRequestTraceCountQueued(*entry, pnode->GetId());
+    size_t nOtherInFlight = BlockRequestTraceCountInFlight(*entry, pnode->GetId());
+    entry->completed = !BlockRequestTraceHasOwnership(*entry);
+
+    if (BlockRequestTraceInteresting(*entry))
+    {
+        printf("BLOCKREQTRACE time_us=%lld event=INFLIGHT_CLEAR hash=%s peer=%d addr=%s reason=%s age_s=%lld other_peer_queued=%zu other_peer_inflight=%zu known_index=%d\n",
+               (long long)nNow, hash.ToString().c_str(), pnode->GetId(),
+               peerState->address.c_str(), pszReason, (long long)nAge,
+               nOtherQueued, nOtherInFlight, fKnownInBlockIndex ? 1 : 0);
+    }
+}
+
+void BlockRequestTraceInFlightExpire(CNode* pnode, const uint256& hash,
+                                     int64_t nAge)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, false);
+    if (!entry)
+        return;
+
+    BlockRequestTracePeerState* peerState =
+        BlockRequestTracePeerLocked(*entry, pnode, hash);
+    if (!peerState)
+        return;
+    peerState->inFlight = false;
+    peerState->inFlightSince = 0;
+    entry->lastRemovalReason = "timeout";
+    size_t nOtherQueued = BlockRequestTraceCountQueued(*entry, pnode->GetId());
+    size_t nOtherInFlight = BlockRequestTraceCountInFlight(*entry, pnode->GetId());
+    entry->completed = !BlockRequestTraceHasOwnership(*entry);
+    if (BlockRequestTraceInteresting(*entry))
+    {
+        printf("BLOCKREQTRACE time_us=%lld event=INFLIGHT_EXPIRE hash=%s peer=%d addr=%s reason=timeout age_s=%lld other_peer_queued=%zu other_peer_inflight=%zu known_index=%d\n",
+               (long long)nNow, hash.ToString().c_str(), pnode->GetId(),
+               peerState->address.c_str(), (long long)nAge,
+               nOtherQueued, nOtherInFlight, entry->indexed ? 1 : 0);
+    }
+}
+
+void BlockRequestTracePeerClosed(CNode* pnode)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    for (std::map<uint256, BlockRequestTraceEntry>::iterator it = mapBlockRequestTrace.begin();
+         it != mapBlockRequestTrace.end(); ++it)
+    {
+        BlockRequestTraceEntry& entry = it->second;
+        std::map<NodeId, BlockRequestTracePeerState>::iterator peerIt =
+            entry.peers.find(pnode->GetId());
+        if (peerIt == entry.peers.end() ||
+            (peerIt->second.queuedCount == 0 && !peerIt->second.inFlight))
+            continue;
+
+        int64_t nAge = peerIt->second.inFlightSince == 0
+            ? -1 : (nNow - peerIt->second.inFlightSince) / 1000000;
+        peerIt->second.queuedCount = 0;
+        peerIt->second.inFlight = false;
+        peerIt->second.inFlightSince = 0;
+        entry.lastRemovalReason = "peer-destruction";
+        entry.lastTouchedTime = nNow;
+        if (BlockRequestTraceInteresting(entry))
+        {
+            printf("BLOCKREQTRACE time_us=%lld event=INFLIGHT_CLEAR hash=%s peer=%d addr=%s reason=peer-destruction age_s=%lld other_peer_queued=%zu other_peer_inflight=%zu known_index=%d\n",
+                   (long long)nNow, it->first.ToString().c_str(), pnode->GetId(),
+                   BlockRequestTracePeerAddress(pnode).c_str(), (long long)nAge,
+                   BlockRequestTraceCountQueued(entry, pnode->GetId()),
+                   BlockRequestTraceCountInFlight(entry, pnode->GetId()),
+                   entry.indexed ? 1 : 0);
+        }
+        entry.completed = !BlockRequestTraceHasOwnership(entry);
+    }
+    BlockRequestTracePruneLocked(nNow, true);
+    BlockRequestTraceMaybeSummaryLocked(nNow);
+}
+
+void BlockRequestTraceGetBlocksQueued(CNode* pnode,
+                                      const uint256& hashBegin,
+                                      int nBeginHeight,
+                                      const uint256& hashStop)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    if (fBlockRequestTraceFilter &&
+        !BlockRequestTraceMatchesFilter(hashBegin) &&
+        !BlockRequestTraceMatchesFilter(hashStop))
+        return;
+    printf("BLOCKREQTRACE time_us=%lld event=GETBLOCKS_QUEUE peer=%d addr=%s begin_hash=%s begin_height=%d stop_hash=%s\n",
+           (long long)nNow, pnode->GetId(), BlockRequestTracePeerAddress(pnode).c_str(),
+           hashBegin.ToString().c_str(), nBeginHeight, hashStop.ToString().c_str());
+    BlockRequestTraceMaybeSummaryLocked(nNow);
+}
+
+void BlockRequestTraceStallRecovery(CNode* pnode,
+                                    int nLocalHeight,
+                                    int nPeerHeight,
+                                    int64_t nLastBlockAge,
+                                    const uint256& hashBegin,
+                                    int nBeginHeight,
+                                    const uint256& hashStop,
+                                    const std::vector<uint256>& vErasedHashes)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    ++blockRequestTraceCounters.stallRecoveryCount;
+    size_t nAnomalousTouched = 0;
+    for (std::vector<uint256>::const_iterator it = vErasedHashes.begin();
+         it != vErasedHashes.end(); ++it)
+    {
+        BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(*it, nNow, false);
+        if (!entry || !BlockRequestTraceInteresting(*entry))
+            continue;
+        ++nAnomalousTouched;
+        ++entry->stallRecoveryCount;
+        entry->anomalous = true;
+    }
+
+    if (fBlockRequestTraceFilter && nAnomalousTouched == 0 &&
+        !BlockRequestTraceMatchesFilter(hashBegin) &&
+        !BlockRequestTraceMatchesFilter(hashStop))
+    {
+        BlockRequestTraceMaybeSummaryLocked(nNow);
+        return;
+    }
+
+    printf("BLOCKREQTRACE time_us=%lld event=STALL_RECOVERY peer=%d addr=%s local_height=%d peer_height=%d last_block_age_s=%lld begin_hash=%s begin_height=%d stop_hash=%s removed_msg_block=%zu removed_anomalous=%zu\n",
+           (long long)nNow, pnode->GetId(), BlockRequestTracePeerAddress(pnode).c_str(),
+           nLocalHeight, nPeerHeight, (long long)nLastBlockAge,
+           hashBegin.ToString().c_str(), nBeginHeight, hashStop.ToString().c_str(),
+           vErasedHashes.size(), nAnomalousTouched);
+
+    for (std::vector<uint256>::const_iterator it = vErasedHashes.begin();
+         it != vErasedHashes.end(); ++it)
+    {
+        std::map<uint256, BlockRequestTraceEntry>::iterator entryIt =
+            mapBlockRequestTrace.find(*it);
+        if (entryIt == mapBlockRequestTrace.end() ||
+            !BlockRequestTraceInteresting(entryIt->second))
+            continue;
+        printf("BLOCKREQTRACE time_us=%lld event=STALL_TOUCH hash=%s peer=%d addr=%s stall_count=%llu\n",
+               (long long)nNow, it->ToString().c_str(), pnode->GetId(),
+               BlockRequestTracePeerAddress(pnode).c_str(),
+               (unsigned long long)entryIt->second.stallRecoveryCount);
+    }
+    BlockRequestTraceMaybeSummaryLocked(nNow);
+}
+
+void BlockRequestTraceGetBlocksTrigger(CNode* pnode,
+                                       const char* pszTrigger,
+                                       const uint256& hashCause,
+                                       int nReceived,
+                                       int nExpected,
+                                       bool fPrefetchSentBefore,
+                                       const uint256& hashLastBatch,
+                                       BlockRequestTraceResult lastResult,
+                                       const uint256& hashBegin,
+                                       int nBeginHeight,
+                                       const uint256& hashStop)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    if (std::string(pszTrigger) == "batch75")
+        ++blockRequestTraceCounters.batch75TriggerCount;
+    else if (std::string(pszTrigger) == "pipeline-drained")
+        ++blockRequestTraceCounters.pipelineTriggerCount;
+
+    BlockRequestTraceEntry* entry =
+        BlockRequestTraceGetLocked(hashCause, nNow, false);
+    if (entry)
+        ++entry->getBlocksWaveCount;
+
+    if (fBlockRequestTraceFilter &&
+        !BlockRequestTraceMatchesFilter(hashCause) &&
+        !BlockRequestTraceMatchesFilter(hashLastBatch) &&
+        !BlockRequestTraceMatchesFilter(hashBegin) &&
+        !BlockRequestTraceMatchesFilter(hashStop))
+    {
+        BlockRequestTraceMaybeSummaryLocked(nNow);
+        return;
+    }
+
+    printf("BLOCKREQTRACE time_us=%lld event=GETBLOCKS_TRIGGER hash=%s peer=%d addr=%s trigger=%s received=%d expected=%d prefetch_sent_before=%d last_batch_hash=%s previous_block_result=%s begin_hash=%s begin_height=%d stop_hash=%s hash_wave_count=%llu\n",
+           (long long)nNow, hashCause.ToString().c_str(), pnode->GetId(),
+           BlockRequestTracePeerAddress(pnode).c_str(), pszTrigger,
+           nReceived, nExpected, fPrefetchSentBefore ? 1 : 0,
+           hashLastBatch.ToString().c_str(),
+           BlockRequestTraceResultName(lastResult),
+           hashBegin.ToString().c_str(), nBeginHeight,
+           hashStop.ToString().c_str(),
+           (unsigned long long)(entry ? entry->getBlocksWaveCount : 0));
+    BlockRequestTraceMaybeSummaryLocked(nNow);
+}
+
 static deque<string> vOneShots;
 CCriticalSection cs_vOneShots;
 
@@ -643,6 +1703,15 @@ void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
 
     getBlocksIndex.push_back(pindexBegin);
     getBlocksHash.push_back(hashEnd);
+
+    if (BlockRequestTraceEnabled())
+    {
+        BlockRequestTraceGetBlocksQueued(
+            this,
+            pindexBegin ? pindexBegin->GetBlockHash() : uint256(0),
+            pindexBegin ? pindexBegin->nHeight : -1,
+            hashEnd);
+    }
 
     //PushMessage("getblocks", CBlockLocator(pindexBegin), hashEnd);
 }

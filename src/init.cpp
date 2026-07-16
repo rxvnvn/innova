@@ -579,6 +579,8 @@ std::string HelpMessage()
         "  -debug                 " + _("Output extra debugging information. Implies all other -debug* options") + "\n" +
         "  -debugnet              " + _("Output extra network debugging information") + "\n" +
         "  -debugchain            " + _("Output extra blockchain debugging information") + "\n" +
+        "  -blockrequesttrace=<n> " + _("Trace anomalous block request lifecycles (default: 0)") + "\n" +
+        "  -blockrequesttracehash=<hash> " + _("Limit block request tracing to one block hash (requires -blockrequesttrace)") + "\n" +
         "  -logtimestamps         " + _("Prepend debug output with timestamp") + "\n" +
         "  -shrinkdebugfile       " + _("Shrink debug.log file on client startup (default: 1 when no -debug)") + "\n" +
         "  -printtoconsole        " + _("Send trace/debug info to console instead of debug.log file") + "\n" +
@@ -942,6 +944,13 @@ bool AppInit2()
     fPrintToConsole = GetBoolArg("-printtoconsole");
     fPrintToDebugger = GetBoolArg("-printtodebugger");
     fLogTimestamps = GetBoolArg("-logtimestamps");
+    if (!InitBlockRequestTrace(
+            GetBoolArg("-blockrequesttrace", false),
+            GetArg("-blockrequesttracehash", "")))
+    {
+        return InitError(_(
+            "Invalid -blockrequesttracehash (expected 64 hexadecimal characters)"));
+    }
 
     if (mapArgs.count("-timeout"))
     {
