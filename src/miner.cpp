@@ -11,6 +11,10 @@
 #include "dag.h"
 #include "finality.h"
 
+#include <chrono>
+#include <limits>
+#include <memory>
+
 using namespace std;
 
 //////////////////////////////////////////////////////////////////////////////
@@ -134,7 +138,8 @@ public:
 };
 
 // CreateNewBlock: create new block (without proof-of-work/proof-of-stake)
-CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
+CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
+                       CReserveKey* pReserveKey)
 {
     // Create new block
     auto_ptr<CBlock> pblock(new CBlock());
@@ -172,9 +177,10 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
 
     if (!fProofOfStake)
     {
-        CReserveKey reservekey(pwallet);
+        CReserveKey localReserveKey(pwallet);
+        CReserveKey* reservekey = pReserveKey ? pReserveKey : &localReserveKey;
         CPubKey pubkey;
-        if (!reservekey.GetReservedKey(pubkey))
+        if (!reservekey->GetReservedKey(pubkey))
             return NULL;
         txNew.vout[0].scriptPubKey.SetDestination(pubkey.GetID());
     }
@@ -338,16 +344,19 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees)
             CScript payee;
             if(!collateralnodePayments.GetBlockPayee(pindexPrev->nHeight+1, payee)){
                 found = false;
-                if (vecCollateralnodes.size() > 0) {
-                GetCollateralnodeRanks(pindexBest);
-                BOOST_FOREACH(PAIRTYPE(int, CCollateralNode*)& s, vecCollateralnodeScores)
                 {
-                        if (s.second->nBlockLastPaid < pindexBest->nHeight - 10) {
+                    LOCK(cs_collateralnodes);
+                    if (vecCollateralnodes.size() > 0) {
+                        GetCollateralnodeRanks(pindexBest);
+                        BOOST_FOREACH(PAIRTYPE(int, CCollateralNode*)& s, vecCollateralnodeScores)
+                        {
+                            if (s.second->nBlockLastPaid < pindexBest->nHeight - 10) {
                                 payee.SetDestination(s.second->pubkey.GetID());
                                 found = true;
                                 break;
+                            }
                         }
-                }
+                    }
                 }
                 if (found) {
                     if (fDebug && fDebugCN) printf("CreateNewBlock: Found a collateralnode to pay: %s\n",payee.ToString(true).c_str());
@@ -786,6 +795,11 @@ void IncrementExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& 
     }
     ++nExtraNonce;
 
+    SetExtraNonce(pblock, pindexPrev, nExtraNonce);
+}
+
+void SetExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int nExtraNonce)
+{
     unsigned int nHeight = pindexPrev->nHeight+1; // Height first in coinbase required for block.version=2
     pblock->vtx[0].vin[0].scriptSig = (CScript() << nHeight << CBigNum(nExtraNonce)) + COINBASE_FLAGS;
     if (pblock->vtx[0].vin[0].scriptSig.size() > 100)
@@ -864,10 +878,10 @@ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
     {
         LOCK(cs_main);
         if (pblock->hashPrevBlock != hashBestChain)
+        {
+            reservekey.ReturnKey();
             return error("CheckWork() : generated block is stale");
-
-        // Remove key from key pool
-        reservekey.KeepKey();
+        }
 
         // Track how many getdata requests this block gets
         {
@@ -877,7 +891,17 @@ bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey)
 
         // Process this block the same as if we had received it from another node
         if (!ProcessBlock(NULL, pblock))
+        {
+            reservekey.ReturnKey();
             return error("CheckWork() : ProcessBlock, block not accepted");
+        }
+
+        // Consume the reserved coinbase key only after full validation accepts
+        // the block. A rejected submission returns it to the keypool above.
+        {
+            LOCK(wallet.cs_wallet);
+            reservekey.KeepKey();
+        }
     }
 
     return true;
@@ -1108,39 +1132,89 @@ void StakeMiner(CWallet *pwallet)
     }
 }
 
-bool fCPUMining = false;
-int nCPUMinerThreads = 1;
-int nCPUMineTarget = 0;
-
-void CPUMiner(CWallet* pwallet)
+namespace
 {
-    printf("CPUMiner started with %d thread(s)\n", nCPUMinerThreads);
+CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
+{
+    CPUMiningWorkIdentity identity;
+    LOCK(cs_main);
+
+    identity.hashBestChain = hashBestChain;
+    CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
+    if (!pindexParent)
+        pindexParent = pindexBest;
+    if (pindexParent)
+    {
+        identity.hashPrimaryParent = pindexParent->GetBlockHash();
+        identity.nHeight = pindexParent->nHeight + 1;
+    }
+    if (identity.nHeight >= FORK_HEIGHT_DAG)
+    {
+        identity.vDAGTips = g_dagManager.GetDAGTips();
+        std::sort(identity.vDAGTips.begin(), identity.vDAGTips.end());
+    }
+    identity.nTransactionsUpdated = mempool.GetTransactionsUpdated();
+    return identity;
+}
+
+bool IsCPUMiningCollateralStateReady()
+{
+    int nNextHeight = 0;
+    {
+        LOCK2(cs_main, g_dagManager.cs_dag);
+        CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
+        if (!pindexParent)
+            pindexParent = pindexBest;
+        if (!pindexParent)
+            return false;
+        nNextHeight = pindexParent->nHeight + 1;
+    }
+
+    bool fPaymentsRequired = fTestNet
+                                 ? nNextHeight >= BLOCK_START_COLLATERALNODE_PAYMENTS_TESTNET
+                                 : nNextHeight >= BLOCK_START_COLLATERALNODE_PAYMENTS &&
+                                       nNextHeight >= 2085000;
+    int nEnforcementHeight = fTestNet
+                                 ? MN_ENFORCEMENT_ACTIVE_HEIGHT_TESTNET
+                                 : MN_ENFORCEMENT_ACTIVE_HEIGHT;
+    if (!fPaymentsRequired || nNextHeight < nEnforcementHeight)
+        return true;
+
+    LOCK(cs_collateralnodes);
+    return !vecCollateralnodes.empty();
+}
+
+bool IsCPUMiningWorkCurrent(const CPUMiningWorkIdentity& identity, bool fCheckMempool)
+{
+    return CPUMiningWorkIdentityMatches(identity,
+                                        CaptureCurrentCPUMiningWorkIdentity(),
+                                        fCheckMempool);
+}
+
+void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
+                       unsigned int nWorkerId, unsigned int nThreads,
+                       uint64_t nSessionId)
+{
     SetThreadPriority(THREAD_PRIORITY_LOWEST);
     RenameThread("innova-cpuminer");
 
-    unsigned int nExtraNonce = 0;
-    CReserveKey reservekey(pwallet);
-    CBlock* pblock = NULL;
+    uint64_t nExtraNonceStart = nSessionId * CCPUMinerController::MAX_THREADS + nWorkerId + 1;
+    unsigned int nExtraNonce = static_cast<unsigned int>(nExtraNonceStart);
+    if (nExtraNonce == 0)
+        nExtraNonce = nWorkerId + 1;
 
-    while (fCPUMining && !fShutdown)
+    while (!controller.ShouldStop(nSessionId))
     {
-        if (fShutdown)
-            return;
-
-        if (pblock) { delete pblock; pblock = NULL; }
-
+        bool fNoNodes;
         {
-            bool fNoNodes;
-            {
-                LOCK(cs_vNodes);
-                fNoNodes = vNodes.empty();
-            }
-            bool fSkipBootstrap = (nBestHeight <= 10);
-            if (!fSkipBootstrap && (fNoNodes || IsInitialBlockDownload()))
-            {
-                MilliSleep(1000);
-                continue;
-            }
+            LOCK(cs_vNodes);
+            fNoNodes = vNodes.empty();
+        }
+
+        if (!fRegTest && (fNoNodes || IsInitialBlockDownload()))
+        {
+            controller.WaitForStop(nSessionId, 1000);
+            continue;
         }
 
         bool fChainStale = false;
@@ -1151,53 +1225,93 @@ void CPUMiner(CWallet* pwallet)
         }
         if (fChainStale)
         {
-            MilliSleep(5000);
+            controller.WaitForStop(nSessionId, 5000);
             continue;
         }
 
-        int nHeight;
-        uint256 hashTarget;
-
+        if (!IsCPUMiningCollateralStateReady())
         {
-            LOCK(cs_main);
-
-            CBlock* ptmp = CreateNewBlock(pwallet);
-            if (!ptmp)
-            {
-                printf("CPUMiner: CreateNewBlock failed, retrying...\n");
-                MilliSleep(5000);
-                continue;
-            }
-            pblock = new CBlock(*ptmp);
-            delete ptmp;
-
-            std::map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(pblock->hashPrevBlock);
-            CBlockIndex* pindexBlockPrev = (miPrev != mapBlockIndex.end()) ? miPrev->second : pindexBest;
-            if (!pindexBlockPrev)
-            {
-                delete pblock;
-                pblock = NULL;
-                printf("CPUMiner: previous block index missing, retrying...\n");
-                MilliSleep(1000);
-                continue;
-            }
-
-            IncrementExtraNonce(pblock, pindexBlockPrev, nExtraNonce);
-            nHeight = pindexBlockPrev->nHeight + 1;
-
-            CBigNum bnTarget;
-            bnTarget.SetCompact(pblock->nBits);
-            hashTarget = bnTarget.getuint256();
+            if (fDebug)
+                printf("CPUMiner: waiting for Collateral Node state\n");
+            controller.WaitForStop(nSessionId, 5000);
+            continue;
         }
 
-        printf("CPUMiner: Mining block at height %d, target bits=0x%08x\n",
-               nHeight, pblock->nBits);
+        CPUMiningWorkIdentity identityBefore = CaptureCurrentCPUMiningWorkIdentity();
+        CReserveKey reservekey(pwallet);
+        std::unique_ptr<CBlock> pblock(CreateNewBlock(pwallet, false, NULL, &reservekey));
+        if (!pblock.get())
+        {
+            reservekey.ReturnKey();
+            printf("CPUMiner: CreateNewBlock failed, retrying...\n");
+            controller.WaitForStop(nSessionId, 1000);
+            continue;
+        }
+
+        CPUMiningWorkIdentity identityAfter = CaptureCurrentCPUMiningWorkIdentity();
+        if (!CPUMiningWorkIdentityMatches(identityBefore, identityAfter, true) ||
+            !CPUMiningBlockMatchesWorkIdentity(*pblock, identityAfter))
+        {
+            reservekey.ReturnKey();
+            controller.WaitForStop(nSessionId, 50);
+            continue;
+        }
+
+        CPUMiningWorkIdentity workIdentity = identityAfter;
+        uint256 hashTarget;
+        CBlockIndex* pindexBlockPrev = NULL;
+        bool fPrepared = false;
+        {
+            LOCK(cs_main);
+            std::map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(pblock->hashPrevBlock);
+            if (miPrev != mapBlockIndex.end() && miPrev->second)
+            {
+                pindexBlockPrev = miPrev->second;
+                if (pindexBlockPrev->nHeight + 1 == workIdentity.nHeight)
+                {
+                    CBigNum bnTarget;
+                    SetExtraNonce(pblock.get(), pindexBlockPrev, nExtraNonce);
+                    bnTarget.SetCompact(pblock->nBits);
+                    hashTarget = bnTarget.getuint256();
+                    fPrepared = true;
+                }
+            }
+        }
+
+        uint64_t nNextExtraNonce = static_cast<uint64_t>(nExtraNonce) + nThreads;
+        nExtraNonce = nNextExtraNonce > std::numeric_limits<unsigned int>::max()
+                          ? nWorkerId + 1
+                          : static_cast<unsigned int>(nNextExtraNonce);
+
+        if (!fPrepared || !IsCPUMiningWorkCurrent(workIdentity, false))
+        {
+            reservekey.ReturnKey();
+            controller.WaitForStop(nSessionId, 50);
+            continue;
+        }
+
+        if (fDebug)
+        {
+            std::string strDAGTips;
+            for (const uint256& hashTip : workIdentity.vDAGTips)
+            {
+                if (!strDAGTips.empty())
+                    strDAGTips += ",";
+                strDAGTips += hashTip.ToString();
+            }
+            printf("CPUMiner[%u]: Work identity best=%s parent=%s dag-tips=[%s]\n",
+                   nWorkerId, workIdentity.hashBestChain.ToString().c_str(),
+                   workIdentity.hashPrimaryParent.ToString().c_str(),
+                   strDAGTips.c_str());
+        }
+
+        printf("CPUMiner[%u]: Mining block at height %d, target bits=0x%08x\n",
+               nWorkerId, workIdentity.nHeight, pblock->nBits);
 
         int64_t nStart = GetTime();
         uint64_t nHashesDone = 0;
         bool fBlockFound = false;
-
-        while (fCPUMining && !fShutdown)
+        while (!controller.ShouldStop(nSessionId))
         {
             uint256 hash = pblock->GetPoWHash();
             if (hash <= hashTarget)
@@ -1206,9 +1320,8 @@ void CPUMiner(CWallet* pwallet)
                 break;
             }
 
-            nHashesDone++;
+            ++nHashesDone;
             ++pblock->nNonce;
-
             if (pblock->nNonce == 0)
                 ++pblock->nTime;
 
@@ -1216,65 +1329,361 @@ void CPUMiner(CWallet* pwallet)
             {
                 int64_t nElapsed = GetTime() - nStart;
                 if (nElapsed > 0)
-                    printf("CPUMiner: %.0f H/s (height %d, %llu hashes)\n",
-                           (double)nHashesDone / nElapsed, nHeight, (unsigned long long)nHashesDone);
+                    printf("CPUMiner[%u]: %.0f H/s (height %d, %llu hashes)\n",
+                           nWorkerId, (double)nHashesDone / nElapsed,
+                           workIdentity.nHeight, (unsigned long long)nHashesDone);
             }
 
-            if ((nHashesDone % 100000) == 0)
+            if ((nHashesDone % 4096) == 0)
             {
-                if (nBestHeight >= nHeight)
+                // Keep the timestamp current without changing the coinbase or
+                // merkle root. GetNextTargetRequired is timestamp-independent.
+                pblock->UpdateTime(pindexBlockPrev);
+                bool fCheckMempool = GetTime() - nStart >= 5;
+                if (!IsCPUMiningWorkCurrent(workIdentity, fCheckMempool))
                     break;
             }
         }
 
-        if (fBlockFound)
+        bool fAccepted = false;
+        if (fBlockFound && !controller.ShouldStop(nSessionId) &&
+            IsCPUMiningCollateralStateReady())
         {
-            printf("CPUMiner: Found block! height=%d nonce=%u\n",
-                   nHeight, pblock->nNonce);
-
+            uint256 hashBlock = pblock->GetHash();
+            LOCK(cs_main);
+            if (!controller.ShouldStop(nSessionId) &&
+                IsCPUMiningWorkCurrent(workIdentity, false) &&
+                IsCPUMiningCollateralStateReady())
             {
-                LOCK(cs_main);
-                CBlock* psubmit = new CBlock(*pblock);
-                if (!ProcessBlock(NULL, psubmit))
-                    printf("CPUMiner: ProcessBlock failed\n");
-                else
-                    printf("CPUMiner: Block accepted at height %d\n", pindexBest->nHeight);
+                printf("CPUMiner[%u]: Found block at height %d, nonce=%u\n",
+                       nWorkerId, workIdentity.nHeight, pblock->nNonce);
+                fAccepted = ProcessBlock(NULL, pblock.get()) && mapBlockIndex.count(hashBlock) != 0;
             }
-
-            if (nCPUMineTarget > 0)
-            {
-                nCPUMineTarget--;
-                if (nCPUMineTarget <= 0)
-                    fCPUMining = false;
-            }
-
-            MilliSleep(500);
         }
 
-        MilliSleep(100);
+        if (fAccepted)
+        {
+            {
+                LOCK(pwallet->cs_wallet);
+                reservekey.KeepKey();
+            }
+            printf("CPUMiner[%u]: Block accepted at height %d\n",
+                   nWorkerId, workIdentity.nHeight);
+        }
+        else
+        {
+            reservekey.ReturnKey();
+            if (fBlockFound)
+                printf("CPUMiner[%u]: Found block was stale or rejected\n", nWorkerId);
+        }
+
+        controller.WaitForStop(nSessionId, fBlockFound ? 100 : 50);
     }
-
-    if (pblock) delete pblock;
-
-    printf("CPUMiner stopped\n");
 }
 
-void ThreadCPUMiner(void* parg)
+std::thread CreateCPUMinerThread(const std::function<void()>& function)
 {
-    printf("ThreadCPUMiner started\n");
-    CWallet* pwallet = (CWallet*)parg;
+    return std::thread(function);
+}
+}
+
+bool CPUMiningWorkIdentityMatches(const CPUMiningWorkIdentity& a,
+                                  const CPUMiningWorkIdentity& b,
+                                  bool fCheckMempool)
+{
+    if (a.hashBestChain != b.hashBestChain ||
+        a.hashPrimaryParent != b.hashPrimaryParent ||
+        a.vDAGTips != b.vDAGTips)
+        return false;
+    return !fCheckMempool || a.nTransactionsUpdated == b.nTransactionsUpdated;
+}
+
+bool CPUMiningBlockMatchesWorkIdentity(const CBlock& block,
+                                       const CPUMiningWorkIdentity& identity)
+{
+    if (block.hashPrevBlock != identity.hashPrimaryParent)
+        return false;
+    if (identity.nHeight < FORK_HEIGHT_DAG)
+        return true;
+    if (block.vtx.empty())
+        return false;
+
+    std::vector<uint256> vParents;
+    for (const CTxOut& output : block.vtx[0].vout)
+    {
+        vParents = ExtractDAGParents(output.scriptPubKey);
+        if (!vParents.empty())
+            break;
+    }
+    if (vParents.empty() || vParents[0] != identity.hashPrimaryParent)
+        return false;
+
+    for (size_t i = 1; i < vParents.size(); ++i)
+        if (std::find(identity.vDAGTips.begin(), identity.vDAGTips.end(), vParents[i]) ==
+            identity.vDAGTips.end())
+            return false;
+    return true;
+}
+
+const int CCPUMinerController::MAX_THREADS;
+
+CCPUMinerController::CCPUMinerController(const WorkerFunction& worker,
+                                         const ThreadFactory& threadFactory)
+    : m_worker(worker ? worker : WorkerFunction(RunCPUMinerWorker)),
+      m_threadFactory(threadFactory ? threadFactory : ThreadFactory(CreateCPUMinerThread)),
+      m_state(STOPPED),
+      m_stopRequested(true),
+      m_shutdownRequested(false),
+      m_workerFailed(false),
+      m_startReleased(false),
+      m_requestedThreads(0),
+      m_activeThreads(0),
+      m_sessionId(0)
+{
+}
+
+CCPUMinerController::~CCPUMinerController()
+{
+    Shutdown();
+}
+
+void CCPUMinerController::SetState(State state)
+{
+    m_state.store(state, std::memory_order_release);
+    m_stateChanged.notify_all();
+}
+
+bool CCPUMinerController::Start(CWallet* pwallet, int nThreads, std::string& strError)
+{
+    if (!pwallet)
+    {
+        strError = "CPU mining requires a wallet";
+        return false;
+    }
+    if (nThreads < 1 || nThreads > MAX_THREADS)
+    {
+        strError = "CPU mining thread count is out of range";
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+    if (m_shutdownRequested.load(std::memory_order_acquire))
+    {
+        strError = "CPU miner is shutting down";
+        return false;
+    }
+
+    Status status = GetStatus();
+    if (status.running && status.requestedThreads == nThreads &&
+        status.activeThreads == nThreads && m_threads.size() == static_cast<size_t>(nThreads))
+        return true;
+
+    StopAndJoinLocked(STOPPED);
+
+    uint64_t nSessionId;
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_stopRequested.store(false, std::memory_order_release);
+        m_workerFailed.store(false, std::memory_order_release);
+        m_startReleased.store(false, std::memory_order_release);
+        m_requestedThreads.store(nThreads, std::memory_order_release);
+        nSessionId = m_sessionId.fetch_add(1, std::memory_order_acq_rel) + 1;
+    }
+    SetState(STARTING);
+
     try
     {
-        vnThreadsRunning[THREAD_STAKE_MINER]++;  // Reuse stake miner slot for counting
-        CPUMiner(pwallet);
-        vnThreadsRunning[THREAD_STAKE_MINER]--;
+        m_threads.reserve(nThreads);
+        for (int i = 0; i < nThreads; ++i)
+        {
+            std::function<void()> function = std::bind(&CCPUMinerController::WorkerEntry,
+                                                       this, pwallet,
+                                                       static_cast<unsigned int>(i),
+                                                       static_cast<unsigned int>(nThreads),
+                                                       nSessionId);
+            m_threads.push_back(m_threadFactory(function));
+        }
     }
-    catch (std::exception& e) {
-        vnThreadsRunning[THREAD_STAKE_MINER]--;
-        PrintException(&e, "ThreadCPUMiner()");
-    } catch (...) {
-        vnThreadsRunning[THREAD_STAKE_MINER]--;
-        PrintException(NULL, "ThreadCPUMiner()");
+    catch (std::exception& e)
+    {
+        strError = std::string("Failed to create CPU mining thread: ") + e.what();
+        StopAndJoinLocked(STOPPED);
+        return false;
     }
-    printf("ThreadCPUMiner exiting\n");
+    catch (...)
+    {
+        strError = "Failed to create CPU mining thread";
+        StopAndJoinLocked(STOPPED);
+        return false;
+    }
+
+    bool fStartupFailed;
+    {
+        std::unique_lock<std::mutex> stateLock(m_stateMutex);
+        m_stateChanged.wait(stateLock, [this, nThreads]() {
+            return m_activeThreads.load(std::memory_order_acquire) == nThreads ||
+                   m_workerFailed.load(std::memory_order_acquire);
+        });
+        fStartupFailed = m_workerFailed.load(std::memory_order_acquire);
+        if (!fStartupFailed)
+        {
+            m_startReleased.store(true, std::memory_order_release);
+            SetState(RUNNING);
+        }
+    }
+
+    if (fStartupFailed)
+    {
+        strError = "CPU mining worker failed during startup";
+        StopAndJoinLocked(STOPPED);
+        return false;
+    }
+
+    m_stateChanged.notify_all();
+    return true;
+}
+
+void CCPUMinerController::StopAndJoinLocked(State finalState)
+{
+    if (!m_threads.empty() || m_activeThreads.load(std::memory_order_acquire) > 0)
+        SetState(finalState == SHUTTING_DOWN ? SHUTTING_DOWN : STOPPING);
+
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_stopRequested.store(true, std::memory_order_release);
+        m_startReleased.store(true, std::memory_order_release);
+    }
+    m_stopChanged.notify_all();
+    m_stateChanged.notify_all();
+
+    for (std::thread& thread : m_threads)
+    {
+        if (thread.joinable())
+            thread.join();
+    }
+    m_threads.clear();
+
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_activeThreads.store(0, std::memory_order_release);
+        m_requestedThreads.store(0, std::memory_order_release);
+        m_workerFailed.store(false, std::memory_order_release);
+    }
+    SetState(finalState);
+}
+
+void CCPUMinerController::Stop()
+{
+    std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+    StopAndJoinLocked(m_shutdownRequested.load(std::memory_order_acquire)
+                          ? SHUTTING_DOWN : STOPPED);
+}
+
+void CCPUMinerController::Shutdown()
+{
+    std::lock_guard<std::mutex> lifecycleLock(m_lifecycleMutex);
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_shutdownRequested.store(true, std::memory_order_release);
+    }
+    StopAndJoinLocked(SHUTTING_DOWN);
+}
+
+CCPUMinerController::Status CCPUMinerController::GetStatus() const
+{
+    std::lock_guard<std::mutex> stateLock(m_stateMutex);
+    Status status;
+    status.state = static_cast<State>(m_state.load(std::memory_order_acquire));
+    status.activeThreads = m_activeThreads.load(std::memory_order_acquire);
+    status.requestedThreads = m_requestedThreads.load(std::memory_order_acquire);
+    status.shutdown = m_shutdownRequested.load(std::memory_order_acquire);
+    status.stopping = status.state == STOPPING || status.state == SHUTTING_DOWN;
+    status.running = status.state == RUNNING && status.activeThreads > 0 &&
+                     !status.shutdown &&
+                     !m_stopRequested.load(std::memory_order_acquire);
+    status.sessionId = m_sessionId.load(std::memory_order_acquire);
+    return status;
+}
+
+bool CCPUMinerController::ShouldStop(uint64_t nSessionId) const
+{
+    return m_stopRequested.load(std::memory_order_acquire) ||
+           m_shutdownRequested.load(std::memory_order_acquire) ||
+           m_sessionId.load(std::memory_order_acquire) != nSessionId;
+}
+
+bool CCPUMinerController::WaitForStop(uint64_t nSessionId, int nMilliseconds)
+{
+    if (ShouldStop(nSessionId))
+        return true;
+    std::unique_lock<std::mutex> stateLock(m_stateMutex);
+    m_stopChanged.wait_for(stateLock, std::chrono::milliseconds(nMilliseconds),
+                           [this, nSessionId]() { return ShouldStop(nSessionId); });
+    return ShouldStop(nSessionId);
+}
+
+void CCPUMinerController::WorkerEntry(CWallet* pwallet, unsigned int nWorkerId,
+                                      unsigned int nThreads, uint64_t nSessionId)
+{
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_activeThreads.fetch_add(1, std::memory_order_acq_rel);
+    }
+    m_stateChanged.notify_all();
+
+    try
+    {
+        std::unique_lock<std::mutex> stateLock(m_stateMutex);
+        m_stateChanged.wait(stateLock, [this, nSessionId]() {
+            return m_startReleased.load(std::memory_order_acquire) || ShouldStop(nSessionId);
+        });
+        stateLock.unlock();
+
+        if (!ShouldStop(nSessionId))
+            m_worker(*this, pwallet, nWorkerId, nThreads, nSessionId);
+
+        if (!ShouldStop(nSessionId))
+            MarkWorkerFailed();
+    }
+    catch (std::exception& e)
+    {
+        MarkWorkerFailed();
+        PrintException(&e, "CPUMiner worker");
+    }
+    catch (...)
+    {
+        MarkWorkerFailed();
+        PrintException(NULL, "CPUMiner worker");
+    }
+
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_activeThreads.fetch_sub(1, std::memory_order_acq_rel);
+    }
+    m_stopChanged.notify_all();
+    m_stateChanged.notify_all();
+}
+
+void CCPUMinerController::MarkWorkerFailed()
+{
+    {
+        std::lock_guard<std::mutex> stateLock(m_stateMutex);
+        m_workerFailed.store(true, std::memory_order_release);
+        m_stopRequested.store(true, std::memory_order_release);
+        if (!m_shutdownRequested.load(std::memory_order_acquire))
+            m_state.store(STOPPING, std::memory_order_release);
+    }
+    m_stopChanged.notify_all();
+    m_stateChanged.notify_all();
+}
+
+CCPUMinerController& GetCPUMinerController()
+{
+    static CCPUMinerController controller;
+    return controller;
+}
+
+void ShutdownCPUMining()
+{
+    GetCPUMinerController().Shutdown();
 }

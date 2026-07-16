@@ -16,6 +16,7 @@ MAGENTA='\033[0;35m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -96,9 +97,7 @@ rpc_err() {
 
 generate_blocks() {
     local count=$1
-    for i in $(seq 1 $count); do
-        rpc setgenerate true 1 >/dev/null 2>&1 || true
-    done
+    cpu_mine_blocks "$count" rpc || true
     sleep 2
 }
 

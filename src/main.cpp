@@ -4869,9 +4869,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
         }else if(IsProofOfWork() && pindexBest != NULL){
             if(pindexBest->GetBlockHash() == hashPrevBlock){
 
-                // make sure the ranks are updated
-                GetCollateralnodeRanks(pindexBest);
-
                 int64_t collateralnodePaymentAmount = GetCollateralnodePayment(pindex->nHeight, vtx[0].GetValueOut());
 
                 // If we don't already have its previous block, skip collateralnode payment step
@@ -4882,7 +4879,17 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
                     bool paymentOK = true;
                     CScript payee;
 
-                    if(fDebug) { printf("CheckBlock-POW() : Using non-specific collateralnode payments %ld\n", pindex->nHeight); }
+                    {
+                        // Collateral nodes can be added, removed, or updated by the
+                        // networking thread while a block is being connected. Keep
+                        // ranking, payee validation, and payment accounting on one
+                        // stable view of the list.
+                        LOCK(cs_collateralnodes);
+
+                        // make sure the ranks are updated
+                        GetCollateralnodeRanks(pindexBest);
+
+                        if(fDebug) { printf("CheckBlock-POW() : Using non-specific collateralnode payments %ld\n", pindex->nHeight); }
 
                     // Check transaction for payee and if contains collateralnode reward payment
                     if (fDebug) { printf("CheckBlock-POW(): Transaction 0 Size : %i\n", vtx[0].vout.size()); }
@@ -4952,6 +4959,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
                                 }
                             }
                         }
+                    }
                     }
 
                     if (!foundPayee) {

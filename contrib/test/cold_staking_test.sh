@@ -14,6 +14,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -179,7 +180,7 @@ test_delegation_creation() {
     section "Cold Staking Delegation"
 
     log "Mining 150 blocks on owner node..."
-    rpc_owner setgenerate true 150 >/dev/null 2>&1 || true
+    cpu_mine_blocks 150 rpc_owner || true
     sleep 2
 
     local balance=$(rpc_owner getbalance 2>/dev/null | tr -d ' ')
@@ -207,7 +208,7 @@ test_delegation_creation() {
         return 0
     fi
 
-    rpc_owner setgenerate true 2 2>/dev/null || true
+    cpu_mine_blocks 2 rpc_owner || true
     sleep 3
 
     local cold_utxos=$(rpc_owner listcoldutxos 2>/dev/null || echo "[]")
@@ -264,7 +265,7 @@ test_multiple_delegations() {
         warn "Only created $delegated/3 delegations"
     fi
 
-    rpc_owner setgenerate true 2 2>/dev/null || true
+    cpu_mine_blocks 2 rpc_owner || true
     sleep 2
 }
 
@@ -343,13 +344,13 @@ test_revokecoldstaking_rpc() {
         return
     fi
 
-    rpc_owner setgenerate true 2 2>/dev/null || true
+    cpu_mine_blocks 2 rpc_owner || true
     sleep 2
 
     local revoke_result=$(rpc_owner revokecoldstaking "$txid" 1 2>&1 || echo "")
     if echo "$revoke_result" | grep -q '[a-f0-9]\{64\}'; then
         success "revokecoldstaking RPC returned txid"
-        rpc_owner setgenerate true 2 2>/dev/null || true
+        cpu_mine_blocks 2 rpc_owner || true
         sleep 2
     else
         log "revokecoldstaking result: ${revoke_result:0:120}"
@@ -368,7 +369,7 @@ test_large_delegation() {
     section "Large Delegation Amounts"
 
     log "Mining additional blocks for large balance..."
-    rpc_owner setgenerate true 200 >/dev/null 2>&1 || true
+    cpu_mine_blocks 200 rpc_owner || true
     sleep 3
 
     local balance=$(rpc_owner getbalance 2>/dev/null | tr -d ' ')
@@ -402,7 +403,7 @@ test_large_delegation() {
         warn "Minimum delegation response: ${result:0:80}"
     fi
 
-    rpc_owner setgenerate true 2 2>/dev/null || true
+    cpu_mine_blocks 2 rpc_owner || true
     sleep 2
 }
 
@@ -411,7 +412,7 @@ test_cn_payment_cap_large_stake() {
 
     # Use owner PoW mining to advance chain instead of waiting for natural PoS
     log "Mining 5 blocks on owner to advance chain..."
-    rpc_owner setgenerate true 5 2>/dev/null || true
+    cpu_mine_blocks 5 rpc_owner || true
     sleep 3
 
     local cs_info=$(rpc_owner getcoldstakinginfo 2>/dev/null || echo "")

@@ -14,6 +14,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -167,7 +168,7 @@ test_basic_staking_setup() {
     log "Staker staking status: $staking_status"
 
     log "Generating 150 PoW blocks for coinbase maturity..."
-    rpc_staker setgenerate true 150 >/dev/null 2>&1 || true
+    cpu_mine_blocks 150 rpc_staker || true
     sleep 2
 
     local info=$(rpc_staker getinfo 2>/dev/null || echo "{}")
@@ -205,13 +206,13 @@ test_utxo_splitting() {
         fi
         # Mine a block every few sends to confirm change outputs
         if [ $((i % 3)) -eq 0 ]; then
-            rpc_staker setgenerate true 1 >/dev/null 2>&1 || true
+            cpu_mine_blocks 1 rpc_staker || true
             sleep 1
         fi
     done
     log "Sent $sent split transactions"
 
-    rpc_staker setgenerate true 2 >/dev/null 2>&1 || true
+    cpu_mine_blocks 2 rpc_staker || true
     sleep 3
 
     local utxo_list=$(rpc_staker listunspent 2>/dev/null || echo "[]")
@@ -293,7 +294,7 @@ test_concurrent_staking() {
         done
         success "Sent $tx_count transactions while staking"
 
-        rpc_staker setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc_staker || true
         sleep 2
     else
         warn "Could not generate validator address"

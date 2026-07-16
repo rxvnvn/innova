@@ -15,6 +15,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -173,7 +174,7 @@ test_double_spend_prevention() {
         fi
     fi
 
-    rpc1 setgenerate true 1 >/dev/null 2>&1 || true
+    cpu_mine_blocks 1 rpc1 || true
     sleep 1
 
     local result3=$(rpc1_err sendrawtransaction "$hex2" 2>&1 || echo "ERROR")
@@ -419,7 +420,7 @@ test_concurrent_operations() {
         warn "No concurrent sends succeeded (may be UTXO contention)"
     fi
 
-    rpc1 setgenerate true 1 >/dev/null 2>&1 || true
+    cpu_mine_blocks 1 rpc1 || true
     sleep 1
 
     local info_ok=0
@@ -473,7 +474,7 @@ main() {
     start_nodes
 
     log "Generating initial blocks..."
-    rpc1 setgenerate true 150 >/dev/null 2>&1 || true
+    cpu_mine_blocks 150 rpc1 || true
     sleep 2
 
     test_double_spend_prevention

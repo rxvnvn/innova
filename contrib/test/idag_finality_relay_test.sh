@@ -13,6 +13,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -203,21 +204,7 @@ wait_all_height() {
 
 mine_one() {
     local node="$1"
-    local before
-    local after
-    local attempt
-    before="$(height "$node")"
-    is_int "$before" || return 1
-
-    rpc "$node" setgenerate true 1 >/dev/null 2>&1 || return 1
-    for ((attempt=0; attempt<120; attempt++)); do
-        after="$(height "$node")"
-        if is_int "$after" && [ "$after" -gt "$before" ]; then
-            return 0
-        fi
-        sleep 0.25
-    done
-    return 1
+    CPU_MINE_TIMEOUT=30 CPU_MINE_POLL_INTERVAL=0.01 cpu_mine_blocks 1 rpc "$node"
 }
 
 mine_until_height() {

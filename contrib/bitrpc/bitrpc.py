@@ -91,6 +91,12 @@ elif cmd == "getgenerate":
 	except:
 		print "\n---An error occurred---\n"
 
+elif cmd == "getmininginfo":
+	try:
+		print access.getmininginfo()
+	except:
+		print "\n---An error occurred---\n"
+
 elif cmd == "gethashespersec":
 	try:
 		print access.gethashespersec()
@@ -271,12 +277,18 @@ elif cmd == "setaccount":
 
 elif cmd == "setgenerate":
 	try:
-		gen= raw_input("Generate? (true/false): ")
-		cpus = raw_input("Max processors/cores (-1 for unlimited, optional):")
-		try:
-			print access.setgenerate(gen, cpus)
-		except:
-			print access.setgenerate(gen)
+		gen = raw_input("Enable Tribus CPU mining? (true/false): ").strip().lower()
+		if gen not in ("true", "false"):
+			raise ValueError("Expected true or false")
+		generate = (gen == "true")
+		if not generate:
+			print access.setgenerate(False)
+		else:
+			threads = raw_input("CPU threads (optional; default 1, 1..16, or -1 for logical CPUs capped at 16; 0 is invalid): ")
+			if threads == "":
+				print access.setgenerate(True)
+			else:
+				print access.setgenerate(True, int(threads))
 	except:
 		print "\n---An error occurred---\n"
 

@@ -124,7 +124,7 @@ Options: `--nodes N`, `--duration S`, `--tx-rate N`, `--clean`
 - Network RPCs (`getpeerinfo`, `getnettotals`, `getnetworkinfo`)
 - Wallet RPCs (`getbalance`, `getnewaddress`, `validateaddress`, `dumpprivkey`, etc.)
 - Block RPCs (`getblockhash`, `getblock`, `gettxout`)
-- Mining RPCs (`setgenerate`, `getstakinginfo`)
+- Mining RPCs (`setgenerate`, `getgenerate`, `getmininginfo`, `getstakinginfo`)
 - Raw transaction RPCs (`createrawtransaction`, `decoderawtransaction`, `signrawtransaction`)
 - Mempool RPCs (`getrawmempool`)
 - Rapid-fire stress (50 sequential + 60 mixed calls)

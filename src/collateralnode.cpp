@@ -170,37 +170,40 @@ void ProcessMessageCollateralnode(CNode* pfrom, std::string& strCommand, CDataSt
 
         if((fTestNet && addr.GetPort() != 15539) || (!fTestNet && addr.GetPort() != 14539)) return;
 
-        //search existing collateralnode list, this is where we update existing collateralnodes with new isee broadcasts
-        LOCK(cs_collateralnodes);
-        for (CCollateralNode& mn : vecCollateralnodes) {
-            if(mn.vin.prevout == vin.prevout) {
-                // count == -1 when it's a new entry
-                //   e.g. We don't want the entry relayed/time updated when we're syncing the list
-                // mn.pubkey = pubkey, IsVinAssociatedWithPubkey is validated once below,
-                //   after that they just need to match
-                if(count == -1 && mn.pubkey == pubkey && !mn.UpdatedWithin(COLLATERALNODE_MIN_DSEE_SECONDS)){
-					mn.UpdateLastSeen(sigTime); // Updated UpdateLastSeen with sigTime
-                    //mn.UpdateLastSeen(); // update last seen without the sigTime since it's a new entry
+        // Search/update under the CN lock only. Do not retain this lock while
+        // performing UTXO checks that need cs_main (lock order is cs_main -> CN).
+        {
+            LOCK(cs_collateralnodes);
+            for (CCollateralNode& mn : vecCollateralnodes) {
+                if(mn.vin.prevout == vin.prevout) {
+                    // count == -1 when it's a new entry
+                    //   e.g. We don't want the entry relayed/time updated when we're syncing the list
+                    // mn.pubkey = pubkey, IsVinAssociatedWithPubkey is validated once below,
+                    //   after that they just need to match
+                    if(count == -1 && mn.pubkey == pubkey && !mn.UpdatedWithin(COLLATERALNODE_MIN_DSEE_SECONDS)){
+						mn.UpdateLastSeen(sigTime); // Updated UpdateLastSeen with sigTime
+                        //mn.UpdateLastSeen(); // update last seen without the sigTime since it's a new entry
 
-                    if(mn.now < sigTime){ //take the newest entry
-                        if (fDebugCN & fDebugNet) printf("isee - Got updated entry for %s\n", addr.ToString().c_str());
-                        mn.UpdateLastSeen(); // update with current time (i.e. the time we received this 'new' isee
-                        mn.pubkey2 = pubkey2;
-                        mn.now = sigTime;
-                        mn.sig = vchSig;
-                        mn.protocolVersion = protocolVersion;
-                        mn.addr = addr;
+                        if(mn.now < sigTime){ //take the newest entry
+                            if (fDebugCN & fDebugNet) printf("isee - Got updated entry for %s\n", addr.ToString().c_str());
+                            mn.UpdateLastSeen(); // update with current time (i.e. the time we received this 'new' isee
+                            mn.pubkey2 = pubkey2;
+                            mn.now = sigTime;
+                            mn.sig = vchSig;
+                            mn.protocolVersion = protocolVersion;
+                            mn.addr = addr;
 
-                        RelayCollaTeralElectionEntry(vin, addr, vchSig, sigTime, pubkey, pubkey2, count, current, lastUpdated, protocolVersion);
+                            RelayCollaTeralElectionEntry(vin, addr, vchSig, sigTime, pubkey, pubkey2, count, current, lastUpdated, protocolVersion);
+                        }
                     }
+
+                    return;
                 }
-
-                return;
             }
-        }
 
-        sort(vecCollateralnodes.begin(), vecCollateralnodes.end());
-        vecCollateralnodes.erase(unique(vecCollateralnodes.begin(), vecCollateralnodes.end() ), vecCollateralnodes.end());
+            sort(vecCollateralnodes.begin(), vecCollateralnodes.end());
+            vecCollateralnodes.erase(unique(vecCollateralnodes.begin(), vecCollateralnodes.end() ), vecCollateralnodes.end());
+        }
         // printf("Sorted and removed duplicate CN out of the vector!!\n");
 
         if (count > 0) {
@@ -253,7 +256,13 @@ void ProcessMessageCollateralnode(CNode* pfrom, std::string& strCommand, CDataSt
 
             // Re-verify UTXO under cs_main before registration
             {
-                LOCK(cs_main);
+                LOCK2(cs_main, cs_collateralnodes);
+
+                // Another broadcast may have registered this node while the
+                // expensive checks above were running without the CN lock.
+                for (const CCollateralNode& existing : vecCollateralnodes)
+                    if (existing.vin.prevout == vin.prevout)
+                        return;
 
                 std::string finalError;
                 if (!CheckCollateralnodeVin(vin, finalError, pindexBest)) {
@@ -1395,26 +1404,38 @@ uint64_t CCollateralnodePayments::CalculateScore(uint256 blockHash, CTxIn& vin)
 
 bool CCollateralnodePayments::GetBlockPayee(int nBlockHeight, CScript& payee)
 {
-    for (CCollateralnodePaymentWinner& winner : vWinning){
-        if(winner.nBlockHeight == nBlockHeight) {
-            CTransaction tx;
-            uint256 hash;
-            if(GetTransaction(winner.vin.prevout.hash, tx, hash)){
-                for (CTxOut out : tx.vout){
-                    if(out.nValue == GetMNCollateral()*COIN){
-                        payee = out.scriptPubKey;
-                        return true;
-                    }
+    CTxIn winnerVin;
+    bool fFoundWinner = false;
+    {
+        LOCK(cs_collateralnodes);
+        for (const CCollateralnodePaymentWinner& winner : vWinning){
+            if(winner.nBlockHeight == nBlockHeight) {
+                winnerVin = winner.vin;
+                fFoundWinner = true;
+                break;
+            }
+        }
+    }
+
+    if (fFoundWinner) {
+        CTransaction tx;
+        uint256 hash;
+        if(GetTransaction(winnerVin.prevout.hash, tx, hash)){
+            for (const CTxOut& out : tx.vout){
+                if(out.nValue == GetMNCollateral()*COIN){
+                    payee = out.scriptPubKey;
+                    return true;
                 }
             }
-            return false;
         }
+        return false;
     }
     return false;
 }
 
 bool CCollateralnodePayments::GetWinningCollateralnode(int nBlockHeight, CTxIn& vinOut)
 {
+    LOCK(cs_collateralnodes);
     for (CCollateralnodePaymentWinner& winner : vWinning){
         if(winner.nBlockHeight == nBlockHeight) {
             vinOut = winner.vin;
@@ -1434,6 +1455,7 @@ bool CCollateralnodePayments::AddWinningCollateralnode(CCollateralnodePaymentWin
 
     winnerIn.score = CalculateScore(blockHash, winnerIn.vin);
 
+    LOCK(cs_collateralnodes);
     bool foundBlock = false;
     for (CCollateralnodePaymentWinner& winner : vWinning){
         if(winner.nBlockHeight == winnerIn.nBlockHeight) {
@@ -1483,6 +1505,7 @@ int CCollateralnodePayments::LastPayment(CCollateralNode& mn)
 
     int ret = mn.GetCollateralnodeInputAge();
 
+    LOCK(cs_collateralnodes);
     for (CCollateralnodePaymentWinner& winner : vWinning){
         if(winner.vin == mn.vin && pindexBest->nHeight - winner.nBlockHeight < ret)
             ret = pindexBest->nHeight - winner.nBlockHeight;
@@ -1571,9 +1594,15 @@ void CCollateralnodePayments::Relay(CCollateralnodePaymentWinner& winner)
 void CCollateralnodePayments::Sync(CNode* node)
 {
     int a = 0;
-    for (CCollateralnodePaymentWinner& winner : vWinning)
-        if(winner.nBlockHeight >= pindexBest->nHeight-10 && winner.nBlockHeight <= pindexBest->nHeight + 20)
-            node->PushMessage("mnw", winner, a);
+    std::vector<CCollateralnodePaymentWinner> winners;
+    {
+        LOCK(cs_collateralnodes);
+        for (const CCollateralnodePaymentWinner& winner : vWinning)
+            if(winner.nBlockHeight >= pindexBest->nHeight-10 && winner.nBlockHeight <= pindexBest->nHeight + 20)
+                winners.push_back(winner);
+    }
+    for (CCollateralnodePaymentWinner& winner : winners)
+        node->PushMessage("mnw", winner, a);
 }
 
 

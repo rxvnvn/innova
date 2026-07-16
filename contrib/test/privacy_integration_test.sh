@@ -12,6 +12,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -224,7 +225,7 @@ test_phase2_transparent() {
     header "Transparent (BTC-style) Transactions"
 
     log "Mining 20 blocks on Node 1..."
-    rpc1 setgenerate true 20 >/dev/null 2>&1 || true
+    cpu_mine_blocks 20 rpc1 || true
     sleep 8
 
     if wait_for_sync 30; then
@@ -260,7 +261,7 @@ test_phase2_transparent() {
         return 1
     fi
 
-    rpc1 setgenerate true 1 >/dev/null 2>&1 || true
+    cpu_mine_blocks 1 rpc1 || true
     sleep 3
 
     if wait_for_sync 15; then
@@ -311,7 +312,7 @@ test_phase3_shielded() {
     log "Funding transparent address for shielding test..."
     local fund_txid=$(rpc1 sendtoaddress "$taddr1" 100.0 2>/dev/null)
     if [ -n "$fund_txid" ]; then
-        rpc1 setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc1 || true
         sleep 2
         success "Funded shield test address: ${fund_txid:0:16}..."
     else
@@ -336,7 +337,7 @@ test_phase3_shielded() {
         fi
     fi
 
-    rpc1 setgenerate true 1 >/dev/null 2>&1 || true
+    cpu_mine_blocks 1 rpc1 || true
     sleep 3
 
     local ztotal=$(rpc1 z_gettotalbalance 2>/dev/null)
@@ -348,10 +349,7 @@ test_phase3_shielded() {
     fi
 
     log "Mining 10 blocks for spend maturity..."
-    for i in $(seq 1 10); do
-        rpc1 setgenerate true 1 >/dev/null 2>&1 || true
-        sleep 1
-    done
+    cpu_mine_blocks 10 rpc1 || true
     sleep 3
 
     if wait_for_sync 15; then
@@ -363,7 +361,7 @@ test_phase3_shielded() {
     if [ -n "$unshield_txid" ]; then
         success "z_unshield TX created: ${unshield_txid:0:16}..."
 
-        rpc1 setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc1 || true
         sleep 3
 
         local ztotal2=$(rpc1 z_gettotalbalance 2>/dev/null)
@@ -388,13 +386,10 @@ test_phase3_shielded() {
         local cross_txid=$(echo "$cross_result" | grep -o '"txid" *: *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
         success "Cross-node z_shield TX: ${cross_txid:0:16}..."
 
-        rpc1 setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc1 || true
         sleep 3
 
-        for i in $(seq 1 10); do
-            rpc1 setgenerate true 1 >/dev/null 2>&1 || true
-            sleep 1
-        done
+        cpu_mine_blocks 10 rpc1 || true
 
         if wait_for_sync 15; then
             local zbal2=$(rpc2 z_getbalance 2>/dev/null)

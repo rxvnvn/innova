@@ -352,9 +352,8 @@ static const CRPCCommand vRPCCommands[] =
     { "getworkex",              &getworkex,              true,   false },
     { "listaccounts",           &listaccounts,           false,  false },
     { "settxfee",               &settxfee,               false,  false },
-    { "setgenerate",            &setgenerate,            true,   false },
-    { "startmining",            &startmining,            true,   false },
-    { "stopmining",             &stopmining,             true,   false },
+    { "setgenerate",            &setgenerate,            true,   true },
+    { "getgenerate",            &getgenerate,            true,   true },
     { "getblocktemplate",       &getblocktemplate,       true,   false },
     { "submitblock",            &submitblock,            false,  false },
     { "listsinceblock",         &listsinceblock,         false,  false },
@@ -1562,7 +1561,6 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "stop"                   && n > 0) ConvertTo<bool>(params[0]);
     if (strMethod == "setgenerate"            && n > 0) ConvertTo<bool>(params[0]);
     if (strMethod == "setgenerate"            && n > 1) ConvertTo<int64_t>(params[1]);
-    if (strMethod == "startmining"           && n > 0) ConvertTo<int64_t>(params[0]);
     if (strMethod == "delegatestake"          && n > 1) ConvertTo<double>(params[1]);
     if (strMethod == "listcoldutxos"          && n > 0) ConvertTo<bool>(params[0]);
     if (strMethod == "sendtoaddress"          && n > 1) ConvertTo<double>(params[1]);

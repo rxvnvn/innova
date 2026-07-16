@@ -14,6 +14,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -376,7 +377,7 @@ main() {
     start_nodes
 
     log "Generating initial blocks on node1..."
-    rpc1 setgenerate true 200 >/dev/null 2>&1 || true
+    cpu_mine_blocks 200 rpc1 || true
     sleep 3
 
     test_mixing_rpc_availability

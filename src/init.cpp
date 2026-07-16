@@ -7,6 +7,7 @@
 
 #include "init.h"
 #include "main.h"
+#include "miner.h"
 #include "txdb.h"
 #include "walletdb.h"
 #include "innovarpc.h"
@@ -128,6 +129,7 @@ void Shutdown(void* parg)
     if (fFirstThread)
     {
         fShutdown = true;
+        ShutdownCPUMining();
 
         CZKContext::Shutdown();
 

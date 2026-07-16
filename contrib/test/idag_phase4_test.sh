@@ -12,6 +12,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -92,10 +93,7 @@ get_blocks() {
 mine_blocks() {
     local rpc_func=$1
     local count=$2
-    for ((i=0; i<count; i++)); do
-        $rpc_func setgenerate true 1 > /dev/null 2>&1
-        sleep 0.5
-    done
+    cpu_mine_blocks "$count" "$rpc_func"
 }
 
 cleanup() {

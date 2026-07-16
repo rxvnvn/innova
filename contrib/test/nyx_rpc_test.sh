@@ -3,6 +3,7 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Build first
@@ -73,7 +74,7 @@ echo "PASS: nyx peers"
 # Generate blocks for coins
 echo ""
 echo "=== Generating 110 blocks ==="
-RPC setgenerate true 110 > /dev/null
+cpu_mine_blocks 110 RPC
 sleep 2
 
 ADDR=$(RPC getnewaddress)

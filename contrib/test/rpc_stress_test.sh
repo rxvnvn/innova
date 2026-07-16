@@ -14,6 +14,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -232,7 +233,7 @@ test_wallet_rpcs() {
 test_block_rpcs() {
     section "Block RPCs"
 
-    rpc setgenerate true 100 >/dev/null 2>&1 || true
+    cpu_mine_blocks 100 rpc || true
     sleep 2
 
     local hash=$(rpc getblockhash 1 || echo "")
@@ -279,8 +280,7 @@ test_mining_rpcs() {
     section "Mining RPCs"
 
     local before=$(rpc getblockcount || echo "0")
-    rpc setgenerate true 5 >/dev/null 2>&1 || true
-    sleep 2
+    cpu_mine_blocks 5 rpc || true
     local after=$(rpc getblockcount || echo "0")
 
     if [ "$after" -gt "$before" ]; then
@@ -305,7 +305,7 @@ test_mining_rpcs() {
 test_raw_tx_rpcs() {
     section "Raw Transaction RPCs"
 
-    rpc setgenerate true 20 >/dev/null 2>&1 || true
+    cpu_mine_blocks 20 rpc || true
     sleep 1
 
     local utxo_list=$(rpc listunspent 1 9999999 || echo "[]")
@@ -383,7 +383,7 @@ test_mempool_rpcs() {
             log "Verbose mempool data format unclear"
         fi
 
-        rpc setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc || true
         sleep 1
     fi
 }

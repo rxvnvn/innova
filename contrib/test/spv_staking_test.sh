@@ -14,6 +14,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -186,7 +187,7 @@ test_spv_header_sync() {
     section "SPV Header Synchronization"
 
     log "Generating 200 blocks on full node..."
-    rpc_full setgenerate true 200 >/dev/null 2>&1 || true
+    cpu_mine_blocks 200 rpc_full || true
     sleep 2
 
     local full_blocks=$(rpc_full getinfo | grep -o '"blocks" *: *[0-9]*' | grep -o '[0-9]*')
@@ -231,7 +232,7 @@ test_spv_bloom_filter() {
         return
     fi
 
-    rpc_full setgenerate true 2 2>/dev/null || true
+    cpu_mine_blocks 2 rpc_full || true
     sleep 5
 
     local spv_balance=$(rpc_spv getbalance 2>/dev/null | tr -d ' ')
@@ -265,7 +266,7 @@ test_spv_utxo_cache() {
         return
     fi
 
-    rpc_full setgenerate true 2 2>/dev/null || true
+    cpu_mine_blocks 2 rpc_full || true
     sleep 5
 
     local balance=$(rpc_spv getbalance 2>/dev/null | tr -d ' ')

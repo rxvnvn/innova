@@ -9,6 +9,7 @@ YELLOW='\033[1;33m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -136,31 +137,15 @@ mine_until_height() {
         log "Cannot read current height from node $node"
         return 1
     fi
+    [ "$current" -ge "$target" ] && return 0
 
-    while [ "$current" -lt "$target" ]; do
-        local before="$current"
-        rpc "$node" setgenerate true 1 >/dev/null 2>&1 || return 1
-
-        local waited=0
-        local max_ticks=$((max_per_block * 10))
-        while [ "$waited" -lt "$max_ticks" ]; do
-            sleep 0.1
-            current="$(height "$node")"
-            if is_int "$current" && [ "$current" -gt "$before" ]; then
-                break
-            fi
-            waited=$((waited + 1))
-        done
-
-        if ! is_int "$current" || [ "$current" -le "$before" ]; then
-            log "Mining stalled at height $before while targeting $target"
+    local timeout=$(((target - current) * max_per_block))
+    CPU_MINE_TIMEOUT="$timeout" CPU_MINE_POLL_INTERVAL=0.1 \
+        cpu_mine_to_height "$target" rpc "$node" || {
+            log "Mining stalled at height $(height "$node") while targeting $target"
             return 1
-        fi
-
-        if [ $((current % 10)) -eq 0 ] || [ "$current" -eq "$target" ]; then
-            log "  ...height $current/$target"
-        fi
-    done
+        }
+    log "  ...height $(height "$node")/$target"
 }
 
 mine_blocks() {

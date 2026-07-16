@@ -16,6 +16,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -83,25 +84,11 @@ rpc_succeeded() {
 
 mine_blocks() {
     local count=${1:-1}
-    local start_height=$(get_blocks rpc1)
-    start_height=${start_height:-0}
-    local target_height=$((start_height + count))
-
-    rpc1 setgenerate true "$count" > /dev/null 2>&1
-
-    local elapsed=0
-    while [ $elapsed -lt 300 ]; do
-        local current_height=$(get_blocks rpc1)
-        current_height=${current_height:-0}
-        if [ "$current_height" -ge "$target_height" ] 2>/dev/null; then
-            wait_for_sync 30
-            return $?
-        fi
-        sleep 1
-        ((elapsed++))
-    done
-
-    warn "Timed out mining $count block(s): height=$(get_blocks rpc1) target=$target_height"
+    if CPU_MINE_TIMEOUT=300 cpu_mine_blocks "$count" rpc1; then
+        wait_for_sync 30
+        return $?
+    fi
+    warn "Timed out mining $count block(s): height=$(get_blocks rpc1)"
     return 1
 }
 

@@ -15,6 +15,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -89,25 +90,7 @@ wait_for_sync() {
 
 mine_blocks_cpu() {
     local count=${1:-1}
-    local start_h=$(get_blocks rpc1)
-    start_h=${start_h:-0}
-    local target=$((start_h + count))
-
-    rpc1 startmining 1 >/dev/null 2>&1 || true
-
-    local elapsed=0
-    while [ $elapsed -lt 300 ]; do
-        local h=$(get_blocks rpc1)
-        h=${h:-0}
-        if [ "$h" -ge "$target" ] 2>/dev/null; then
-            rpc1 stopmining >/dev/null 2>&1 || true
-            return 0
-        fi
-        sleep 1
-        ((elapsed++))
-    done
-    rpc1 stopmining >/dev/null 2>&1 || true
-    return 1
+    CPU_MINE_TIMEOUT=300 CPU_MINE_POLL_INTERVAL=1 cpu_mine_blocks "$count" rpc1
 }
 
 wait_for_height() {
@@ -291,50 +274,12 @@ test_phase1_connectivity() {
 test_phase2_transparent() {
     header "Transparent (BTC-style) Transactions (TESTNET)"
 
-    log "Starting CPU miner on Node 1..."
-    local mine_result=$(rpc1 startmining 1 2>/dev/null)
-    if [ -n "$mine_result" ]; then
-        success "CPU miner started on Node 1"
-        log "Mining result: $mine_result"
+    log "Mining $MATURITY_BLOCKS blocks with one CPU worker on Node 1..."
+    if mine_blocks_cpu "$MATURITY_BLOCKS"; then
+        success "CPU miner reached the requested testnet height"
     else
-        fail "Failed to start CPU miner"
-        warn "Falling back to setgenerate..."
-        rpc1 setgenerate true $MATURITY_BLOCKS >/dev/null 2>&1 || true
+        fail "CPU miner did not reach the requested testnet height"
     fi
-
-    log "Waiting for $MATURITY_BLOCKS blocks..."
-    local start_height=$(get_blocks rpc1)
-    start_height=${start_height:-0}
-    local target_height=$((start_height + MATURITY_BLOCKS))
-
-    local last_height=$start_height
-    local stall_count=0
-    while true; do
-        local cur_height=$(get_blocks rpc1)
-        cur_height=${cur_height:-0}
-
-        if [ "$cur_height" -ge "$target_height" ] 2>/dev/null; then
-            log "Reached target height $cur_height (target was $target_height)"
-            break
-        fi
-
-        if [ "$cur_height" != "$last_height" ]; then
-            local mined=$((cur_height - start_height))
-            log "  CPU mined: $mined / $MATURITY_BLOCKS blocks (height $cur_height)..."
-            last_height=$cur_height
-            stall_count=0
-        else
-            ((stall_count++)) || true
-            if [ $stall_count -ge 60 ]; then
-                warn "Mining stalled at height $cur_height for 60+ seconds"
-                break
-            fi
-        fi
-
-        sleep 2
-    done
-
-    rpc1 stopmining >/dev/null 2>&1 || true
 
     log "Waiting for all 3 nodes to sync..."
     if wait_for_sync 120; then

@@ -14,6 +14,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -128,7 +129,7 @@ test_basic_transactions() {
         return 0
     fi
 
-    rpc_send setgenerate true 1 >/dev/null 2>&1 || true
+    cpu_mine_blocks 1 rpc_send || true
     sleep 2
 
     local tx_data=$(rpc_send gettransaction "$txid" 2>/dev/null || echo "")
@@ -153,7 +154,7 @@ test_self_send() {
     if [ -n "$txid" ]; then
         success "Self-send transaction created"
 
-        rpc_send setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc_send || true
         sleep 2
 
         local balance_after=$(rpc_send getbalance 2>/dev/null | tr -d ' \n')
@@ -180,7 +181,7 @@ test_dust_transactions() {
     local min_result=$(rpc_send sendtoaddress "$addr" 0.001 2>/dev/null || echo "")
     if [ -n "$min_result" ] && [ ${#min_result} -eq 64 ]; then
         success "Minimum viable transaction accepted"
-        rpc_send setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc_send || true
         sleep 1
     else
         log "Minimum viable tx result: $min_result"
@@ -213,7 +214,7 @@ test_rapid_transactions() {
         fail "No rapid transactions succeeded"
     fi
 
-    rpc_send setgenerate true 2 >/dev/null 2>&1 || true
+    cpu_mine_blocks 2 rpc_send || true
     sleep 2
 
     local mempool=$(rpc_send getrawmempool 2>/dev/null || echo "[]")
@@ -268,7 +269,7 @@ test_raw_transactions() {
         local send_result=$(rpc_send sendrawtransaction "$signed_hex" 2>/dev/null || echo "")
         if [ -n "$send_result" ] && [ ${#send_result} -eq 64 ]; then
             success "Signed raw transaction broadcast: ${send_result:0:16}..."
-            rpc_send setgenerate true 1 >/dev/null 2>&1 || true
+            cpu_mine_blocks 1 rpc_send || true
             sleep 1
         else
             warn "Raw tx broadcast result: $send_result"
@@ -299,7 +300,7 @@ test_fee_estimation() {
         local fee=$(echo "$tx_data" | tr '\n' ' ' | grep -o '"fee" *: *-\?[0-9.]*' | head -1 | grep -o '[0-9.]*$' || echo "0")
         log "Transaction fee: $fee"
         success "Transaction with custom fee created"
-        rpc_send setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc_send || true
         sleep 1
     fi
 
@@ -328,7 +329,7 @@ test_mempool_operations() {
             success "Verbose mempool info available"
         fi
 
-        rpc_send setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc_send || true
         sleep 1
     fi
 }
@@ -336,7 +337,7 @@ test_mempool_operations() {
 test_large_amount_transactions() {
     section "Large Amount Transaction Test"
 
-    rpc_send setgenerate true 50 >/dev/null 2>&1 || true
+    cpu_mine_blocks 50 rpc_send || true
     sleep 2
 
     local balance=$(rpc_send getbalance 2>/dev/null | tr -d ' \n')
@@ -348,7 +349,7 @@ test_large_amount_transactions() {
 
     if [ -n "$txid" ] && [ ${#txid} -eq 64 ]; then
         success "Large transaction ($large_amount INN) created"
-        rpc_send setgenerate true 1 >/dev/null 2>&1 || true
+        cpu_mine_blocks 1 rpc_send || true
         sleep 1
     else
         warn "Large transaction may have failed (insufficient confirmed coins)"
@@ -413,7 +414,7 @@ main() {
     start_nodes
 
     log "Generating initial blocks..."
-    rpc_send setgenerate true 150 >/dev/null 2>&1 || true
+    cpu_mine_blocks 150 rpc_send || true
     sleep 2
 
     test_basic_transactions

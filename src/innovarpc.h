@@ -192,14 +192,13 @@ extern json_spirit::Value sendalert(const json_spirit::Array& params, bool fHelp
 
 extern json_spirit::Value getsubsidy(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getmininginfo(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getgenerate(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value gethashespersec(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getstakinginfo(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getfinalitystakinginfo(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getwork(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getworkex(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value setgenerate(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value startmining(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value stopmining(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getblocktemplate(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value submitblock(const json_spirit::Array& params, bool fHelp);
 

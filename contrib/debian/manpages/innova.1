@@ -1,4 +1,4 @@
-.TH INNOVAD "7" "October 2017" "innovad 3.19" 
+.TH INNOVAD "7" "July 2026" "Innova Core"
 .SH NAME
 innovad \- peer-to-peer network based digital currency
 .SH SYNOPSIS
@@ -14,12 +14,6 @@ Innova can be sent easily through the Internet, without having to trust middleme
 .TP
 \fB\-conf=\fR<file>
 Specify configuration file (default: innova.conf)
-.TP
-\fB\-gen\fR
-Generate coins
-.TP
-\fB\-gen\fR=\fI0\fR
-Don't generate coins
 .TP
 \fB\-min\fR
 Start minimized
@@ -112,13 +106,21 @@ Returns the number of connections to other nodes.
 Returns the proof-of-work difficulty as a multiple of the minimum difficulty.
 .TP
 \fBgetgenerate\fR
-Returns boolean true if server is trying to generate innovas, false otherwise.
+Returns true when built-in Tribus CPU mining workers are running, false otherwise.
 .TP
-\fBsetgenerate 'generate' ['genproclimit']\fR
-Generation is limited to ['genproclimit'] processors, -1 is unlimited.
+\fBsetgenerate 'generate' ['threads']\fR
+Starts or stops built-in Tribus CPU mining. If 'generate' is true, 'threads'
+defaults to 1. A value of -1 uses the number of logical CPUs, capped at 16;
+0, values below -1, and values above 16 are invalid. If 'generate' is false,
+all workers are stopped and joined. Mining is disabled by default.
 .TP
 \fBgethashespersec\fR
-Returns a recent hashes per second performance measurement while generating.
+Returns an estimate of the network proof-of-work hash rate. It is not the local
+CPU miner's hash rate.
+.TP
+\fBgetmininginfo\fR
+Returns mining and chain information, including whether CPU mining workers are
+running and their actual number.
 .TP
 \fBgetinfo\fR
 Returns an object containing server information.

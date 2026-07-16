@@ -11,6 +11,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -84,12 +85,7 @@ get_block_json() {
 mine_blocks() {
     local node="$1"
     local count="$2"
-    local idx
-    for ((idx=0; idx<count; idx++)); do
-        rpc "$node" setgenerate true 1 >/dev/null 2>&1 || return 1
-        sleep 0.15
-    done
-    return 0
+    cpu_mine_blocks "$count" rpc "$node"
 }
 
 wait_for_height() {

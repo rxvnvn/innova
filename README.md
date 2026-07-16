@@ -87,6 +87,12 @@ Innova [INN] is an anonymous, untraceable, energy efficient, Proof-of-Work (Trib
 * Full decentralization
 * Name Value System supporting the IDNS for fully & truly decentralized blockchain domains
 
+## CPU Mining
+
+Innova Core includes optional built-in Tribus CPU mining. It is disabled by
+default and is controlled through RPC. See [CPU mining](doc/cpu-mining.md) for
+commands, thread limits, reward distribution, and safety notes.
+
 ## Privacy & Protocol Innovations (IIPs)
 
 Innova Improvement Proposals (IIPs) formalize all protocol innovations. See [IIP_INDEX.md](IIP_INDEX.md) for full specifications.

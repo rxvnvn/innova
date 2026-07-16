@@ -13,6 +13,7 @@ BLUE='\033[0;34m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -175,13 +176,12 @@ test_block_generation() {
 
     local addr=$(rpc1 getnewaddress)
 
-    if rpc1 setgenerate true 1 >/dev/null 2>&1; then
-        sleep 2
+    if cpu_mine_blocks 1 rpc1; then
         local blocks=$(rpc1 getinfo | grep -o '"blocks" *: *[0-9]*' | grep -o '[0-9]*')
         if [ "$blocks" -ge "1" ]; then
             success "Generated block! Now at height $blocks"
         else
-            warn "setgenerate returned but block count unchanged"
+            warn "CPU mining helper returned but block count unchanged"
         fi
     else
         warn "setgenerate not available - testing getblocktemplate instead"
@@ -198,16 +198,13 @@ test_rapid_blocks() {
 
     local start_blocks=$(rpc1 getinfo | grep -o '"blocks" *: *[0-9]*' | grep -o '[0-9]*')
 
-    for i in {1..5}; do
-        rpc1 setgenerate true 1 2>/dev/null || true
-        sleep 1
-    done
+    cpu_mine_blocks 5 rpc1 || true
 
     local end_blocks=$(rpc1 getinfo | grep -o '"blocks" *: *[0-9]*' | grep -o '[0-9]*')
     local generated=$((end_blocks - start_blocks))
 
     if [ "$generated" -gt "0" ]; then
-        success "Rapid generation: $generated blocks in ~5 seconds"
+        success "Rapid generation: $generated blocks"
     else
         warn "No blocks generated via setgenerate"
     fi

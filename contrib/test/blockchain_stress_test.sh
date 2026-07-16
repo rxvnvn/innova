@@ -14,6 +14,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/mining_helpers.sh"
 INNOVA_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 INNOVAD="$INNOVA_ROOT/src/innovad"
 
@@ -172,7 +173,7 @@ test_block_generation() {
     section "Block Generation and Propagation"
 
     log "Generating 50 blocks on Node A..."
-    rpc_a setgenerate true 50 >/dev/null 2>&1 || true
+    cpu_mine_blocks 50 rpc_a || true
     sleep 2
 
     local blocks_a=$(rpc_a getinfo 2>/dev/null | tr '\n' ' ' | grep -o '"blocks" *: *[0-9]*' | grep -o '[0-9]*$' || echo "0")
@@ -202,11 +203,11 @@ test_chain_fork_and_reorg() {
     section "Chain Fork and Reorganization"
 
     local start_a=$(rpc_a getinfo 2>/dev/null | tr '\n' ' ' | grep -o '"blocks" *: *[0-9]*' | grep -o '[0-9]*$' || echo "0")
-    rpc_a setgenerate true 5 >/dev/null 2>&1 || true
+    cpu_mine_blocks 5 rpc_a || true
     sleep 2
     local end_a=$(rpc_a getinfo 2>/dev/null | tr '\n' ' ' | grep -o '"blocks" *: *[0-9]*' | grep -o '[0-9]*$' || echo "0")
 
-    rpc_b setgenerate true 3 >/dev/null 2>&1 || true
+    cpu_mine_blocks 3 rpc_b || true
     sleep 2
     local end_b=$(rpc_b getinfo 2>/dev/null | tr '\n' ' ' | grep -o '"blocks" *: *[0-9]*' | grep -o '[0-9]*$' || echo "0")
 
@@ -314,7 +315,7 @@ test_difficulty() {
     fi
 
     local diff_before=$pow_diff
-    rpc_a setgenerate true 20 >/dev/null 2>&1 || true
+    cpu_mine_blocks 20 rpc_a || true
     sleep 2
 
     info=$(rpc_a getinfo 2>/dev/null || echo "{}")
@@ -378,7 +379,7 @@ test_three_node_consensus() {
     rpc_c addnode "127.0.0.1:$NODE_A_PORT" onetry >/dev/null 2>&1 || true
     rpc_c addnode "127.0.0.1:$NODE_B_PORT" onetry >/dev/null 2>&1 || true
 
-    rpc_a setgenerate true 5 >/dev/null 2>&1 || true
+    cpu_mine_blocks 5 rpc_a || true
     sleep 8
 
     local blocks_a=$(rpc_a getinfo 2>/dev/null | tr '\n' ' ' | grep -o '"blocks" *: *[0-9]*' | grep -o '[0-9]*$' || echo "0")

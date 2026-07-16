@@ -32,9 +32,19 @@ Value gethashespersec(const Array& params, bool fHelp)
     if (fHelp || params.size() != 0)
         throw runtime_error(
             "gethashespersec\n"
-            "Returns a recent hashes per second performance measurement while generating.");
+            "Returns a legacy estimate of recent network hash rate; this is not local CPU miner speed.");
 
     return GetPoWMHashPS() / 1000;
+}
+
+Value getgenerate(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "getgenerate\n"
+            "Returns true only while CPU mining workers are actually running.");
+
+    return GetCPUMinerController().GetStatus().running;
 }
 
 Value getsubsidy(const Array& params, bool fHelp)
@@ -58,7 +68,10 @@ Value getmininginfo(const Array& params, bool fHelp)
     if (fHelp || params.size() != 0)
         throw runtime_error(
             "getmininginfo\n"
-            "Returns an object containing mining-related information.");
+            "Returns mining-related information.\n"
+            "cpumining is true only while CPU workers are running; cputhreads is the\n"
+            "actual live-worker count and requestedcputhreads is the configured pool size.\n"
+            "Network hash-rate fields are not local CPU miner performance.");
 
     uint64_t nMinWeight = 0, nMaxWeight = 0, nWeight = 0;
     pwalletMain->GetStakeWeight(*pwalletMain, nMinWeight, nMaxWeight, nWeight);
@@ -88,8 +101,10 @@ Value getmininginfo(const Array& params, bool fHelp)
 
     obj.push_back(Pair("stakeinterest",    (uint64_t)COIN_YEAR_REWARD));
     obj.push_back(Pair("testnet",       fTestNet));
-    obj.push_back(Pair("cpumining",     fCPUMining));
-    obj.push_back(Pair("cputhreads",    nCPUMinerThreads));
+    CCPUMinerController::Status cpuMining = GetCPUMinerController().GetStatus();
+    obj.push_back(Pair("cpumining",     cpuMining.running));
+    obj.push_back(Pair("cputhreads",    cpuMining.activeThreads));
+    obj.push_back(Pair("requestedcputhreads", cpuMining.requestedThreads));
     return obj;
 }
 
@@ -537,7 +552,7 @@ Value getwork(const Array& params, bool fHelp)
             nStart = GetTime();
 
             // Create new block
-            pblock = CreateNewBlock(pwalletMain);
+            pblock = CreateNewBlock(pwalletMain, false, NULL, &reservekey);
             if (!pblock)
                 throw JSONRPCError(RPC_OUT_OF_MEMORY, "Out of memory");
             vNewBlock.push_back(pblock);
@@ -603,102 +618,66 @@ Value setgenerate(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() < 1 || params.size() > 2)
         throw runtime_error(
-            "setgenerate <generate> [blocks]\n"
-            "Start or stop background CPU mining (regtest/testnet only).\n"
+            "setgenerate <generate> [threads]\n"
+            "Start or stop background Tribus CPU mining.\n"
             "<generate> true to start mining, false to stop.\n"
-            "[blocks] number of blocks to mine (default: 0 = unlimited).\n"
-            "Returns immediately. Use getblockcount to monitor progress.");
+            "[threads] number of workers (default: 1, -1 = logical CPU count, max: 16).\n"
+            "Zero, values below -1, and values above 16 are invalid.\n"
+            "CPU mining can heavily load and heat the processor. It does not guarantee a block.\n"
+            "When current Collateral Node payment rules apply, 65% of the PoW reward goes\n"
+            "to the Collateral Node and the miner receives 35%.");
 
     bool fGenerate = params[0].get_bool();
 
-    if (!fRegTest && !fTestNet)
-        throw JSONRPCError(RPC_METHOD_NOT_FOUND, "setgenerate is only available in regtest/testnet mode");
-
     if (!fGenerate)
     {
-        fCPUMining = false;
-        nCPUMineTarget = 0;
+        if (params.size() != 1)
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "threads must not be specified when stopping CPU mining");
+        GetCPUMinerController().Stop();
         Object result;
         result.push_back(Pair("mining", false));
+        result.push_back(Pair("threads", 0));
         return result;
     }
 
-    if (fCPUMining)
-    {
-        fCPUMining = false;
-        MilliSleep(600);
-    }
-
-    int nBlocks = 0;
-    if (params.size() > 1)
-        nBlocks = params[1].get_int();
-
-    nCPUMineTarget = nBlocks;
-    nCPUMinerThreads = 1;
-    fCPUMining = true;
-
-    if (!NewThread(ThreadCPUMiner, pwalletMain))
-        throw JSONRPCError(RPC_INTERNAL_ERROR, "Failed to start mining thread");
-
-    Object result;
-    result.push_back(Pair("mining", true));
-    result.push_back(Pair("target_blocks", nBlocks == 0 ? 0 : nBlocks));
-    result.push_back(Pair("height", nBestHeight));
-    return result;
-}
-
-Value startmining(const Array& params, bool fHelp)
-{
-    if (fHelp || params.size() > 1)
-        throw runtime_error(
-            "startmining [threads]\n"
-            "Start background CPU PoW mining (testnet/regtest only).\n"
-            "[threads] Number of mining threads (default: 1).");
-
-    if (!fRegTest && !fTestNet)
-        throw JSONRPCError(RPC_METHOD_NOT_FOUND, "startmining is only available in regtest/testnet mode");
-
-    if (fCPUMining)
-        throw JSONRPCError(RPC_MISC_ERROR, "CPU mining is already running");
-
     int nThreads = 1;
-    if (params.size() > 0)
-        nThreads = params[0].get_int();
-    if (nThreads < 1)
-        nThreads = 1;
-    if (nThreads > 16)
-        nThreads = 16;
+    if (params.size() > 1)
+        nThreads = params[1].get_int();
 
-    nCPUMinerThreads = nThreads;
-    fCPUMining = true;
-
-    for (int i = 0; i < nThreads; i++)
+    if (nThreads == -1)
     {
-        if (!NewThread(ThreadCPUMiner, pwalletMain))
-            printf("Error: NewThread(ThreadCPUMiner) failed for thread %d\n", i);
+        unsigned int nHardwareThreads = std::thread::hardware_concurrency();
+        nThreads = nHardwareThreads == 0 ? 1 :
+                   std::min<int>(nHardwareThreads, CCPUMinerController::MAX_THREADS);
+    }
+
+    if (nThreads == 0)
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "threads=0 is invalid; use setgenerate false to stop");
+    if (nThreads < -1)
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           "threads must be -1 or a positive integer");
+    if (nThreads > CCPUMinerController::MAX_THREADS)
+        throw JSONRPCError(RPC_INVALID_PARAMETER,
+                           strprintf("threads exceeds the maximum of %d",
+                                     CCPUMinerController::MAX_THREADS));
+
+    std::string strError;
+    if (!GetCPUMinerController().Start(pwalletMain, nThreads, strError))
+        throw JSONRPCError(RPC_INTERNAL_ERROR, strError);
+
+    CCPUMinerController::Status status = GetCPUMinerController().GetStatus();
+    int nHeight;
+    {
+        LOCK(cs_main);
+        nHeight = nBestHeight;
     }
 
     Object result;
-    result.push_back(Pair("mining", true));
-    result.push_back(Pair("threads", nThreads));
-    result.push_back(Pair("network", fTestNet ? "testnet" : "regtest"));
-    return result;
-}
-
-Value stopmining(const Array& params, bool fHelp)
-{
-    if (fHelp || params.size() > 0)
-        throw runtime_error(
-            "stopmining\n"
-            "Stop background CPU PoW mining.");
-
-    if (!fCPUMining)
-        throw JSONRPCError(RPC_MISC_ERROR, "CPU mining is not running");
-
-    fCPUMining = false;
-
-    Object result;
-    result.push_back(Pair("mining", false));
+    result.push_back(Pair("mining", status.running));
+    result.push_back(Pair("threads", status.activeThreads));
+    result.push_back(Pair("height", nHeight));
     return result;
 }
 
