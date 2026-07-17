@@ -976,7 +976,7 @@ CNode* MaybeQueueStalledSyncRecovery(
         if (nPeerHeight > nLocalHeight)
             vEligiblePeers.push_back(pnode);
 
-        if (pnode->fStartSync || !pnode->setBlocksInFlight.empty() ||
+        if (!pnode->setBlocksInFlight.empty() ||
             !pnode->getBlocksIndex.empty())
         {
             fPipelineActive = true;

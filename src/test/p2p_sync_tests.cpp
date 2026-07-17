@@ -472,6 +472,33 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_queues_exactly_one_getblocks)
     BOOST_CHECK_EQUAL(owner->getBlocksIndex.size(), 1U);
 }
 
+BOOST_AUTO_TEST_CASE(stalled_sync_recovery_ignores_fstartsync_without_block_requests)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(16), "fstartsync-only-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    peer.fStartSync = true;
+
+    std::vector<CNode*> peers(1, &peer);
+    CStalledSyncRecoveryState state;
+
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+
+    CNode* owner = MaybeQueueStalledSyncRecovery(
+        peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
+        STALL_TIMEOUT, RECOVERY_COOLDOWN, state);
+    BOOST_REQUIRE(owner != NULL);
+    BOOST_CHECK_EQUAL(owner, &peer);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+}
+
 BOOST_AUTO_TEST_CASE(stalled_sync_recovery_cooldown_suppresses_repeat)
 {
     BOOST_REQUIRE(pindexBest != NULL);
