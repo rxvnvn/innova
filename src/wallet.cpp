@@ -390,6 +390,23 @@ void CWallet::UnlockCoin(COutPoint& output)
     setLockedCoins.erase(output);
 }
 
+size_t CWallet::UnlockReservedCoins(CWalletTx& wtx)
+{
+    AssertLockHeld(cs_wallet); // setLockedCoins
+    size_t nUnlocked = 0;
+    for (std::vector<COutPoint>::iterator it = wtx.vReservedCoins.begin();
+         it != wtx.vReservedCoins.end(); ++it)
+    {
+        if (IsLockedCoin(it->hash, it->n))
+        {
+            UnlockCoin(*it);
+            ++nUnlocked;
+        }
+    }
+    wtx.vReservedCoins.clear();
+    return nUnlocked;
+}
+
 void CWallet::UnlockAllCoins()
 {
     AssertLockHeld(cs_wallet); // setLockedCoins
@@ -2918,23 +2935,75 @@ bool CWallet::ConvertList(std::vector<CTxIn> vCoins, std::vector<int64_t>& vecAm
     return true;
 }
 
-bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, int64_t& nFeeRet, int32_t& nChangePos, const CCoinControl* coinControl, const CScript* scriptChangeOverride)
+namespace
 {
+class CWalletTxReservationRollback
+{
+public:
+    CWalletTxReservationRollback(CWallet& walletIn, CWalletTx& wtxIn,
+                                 const std::string& failReasonIn, size_t nLockedBeforeIn)
+        : wallet(walletIn), wtx(wtxIn), failReason(failReasonIn),
+          nLockedBefore(nLockedBeforeIn), fRollback(true)
+    {
+        AssertLockHeld(wallet.cs_wallet);
+    }
+
+    ~CWalletTxReservationRollback()
+    {
+        if (!fRollback)
+            return;
+
+        AssertLockHeld(wallet.cs_wallet);
+        const size_t nLockedByAttempt = wtx.vReservedCoins.size();
+        const size_t nUnlocked = wallet.UnlockReservedCoins(wtx);
+        printf("CreateTransaction: failure=\"%s\" locked_before=%" PRIszu
+               " locked_by_attempt=%" PRIszu " rollback_unlocked=%" PRIszu
+               " locked_after=%" PRIszu "\n",
+               failReason.empty() ? "unknown" : failReason.c_str(), nLockedBefore,
+               nLockedByAttempt, nUnlocked, wallet.setLockedCoins.size());
+    }
+
+    void KeepReservedCoins() { fRollback = false; }
+
+private:
+    CWallet& wallet;
+    CWalletTx& wtx;
+    const std::string& failReason;
+    size_t nLockedBefore;
+    bool fRollback;
+};
+}
+
+bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, CWalletTx& wtxNew, CReserveKey& reservekey, int64_t& nFeeRet, int32_t& nChangePos, const CCoinControl* coinControl, const CScript* scriptChangeOverride, std::string* strFailReasonOut)
+{
+    std::string strLocalFailReason;
+    std::string& strFailReason = strFailReasonOut ? *strFailReasonOut : strLocalFailReason;
+    strFailReason.clear();
     int64_t nValue = 0;
     BOOST_FOREACH (const PAIRTYPE(CScript, int64_t)& s, vecSend)
     {
         if (nValue < 0)
+        {
+            strFailReason = _("Transaction amounts must be positive");
             return false;
+        }
         nValue += s.second;
     }
     if (vecSend.empty() || nValue < 0)
+    {
+        strFailReason = _("Transaction amounts must be positive");
         return false;
+    }
 
     wtxNew.BindWallet(this);
 
     {
         LOCK2(cs_main, cs_wallet);
         // txdb must be opened before the mapWallet lock
+        const size_t nLockedBefore = setLockedCoins.size();
+        printf("CreateTransaction: locked_before=%" PRIszu "\n", nLockedBefore);
+        CWalletTxReservationRollback reservationRollback(*this, wtxNew, strFailReason,
+                                                          nLockedBefore);
         CTxDB txdb("r");
         {
             nFeeRet = nTransactionFee;
@@ -2944,12 +3013,11 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
                 wtxNew.vout.clear();
                 wtxNew.fFromMe = true;
 
-                for (std::vector<COutPoint>::iterator it = wtxNew.vReservedCoins.begin();
-                     it != wtxNew.vReservedCoins.end(); ++it)
-                {
-                    UnlockCoin(*it);
-                }
-                wtxNew.vReservedCoins.clear();
+                const size_t nRetryUnlocked = UnlockReservedCoins(wtxNew);
+                if (nRetryUnlocked > 0)
+                    printf("CreateTransaction: fee retry rollback_unlocked=%" PRIszu
+                           " locked_after=%" PRIszu "\n",
+                           nRetryUnlocked, setLockedCoins.size());
 
                 int64_t nTotalValue = nValue + nFeeRet;
                 double dPriority = 0;
@@ -2989,14 +3057,23 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
                 set<pair<const CWalletTx*,unsigned int> > setCoins;
                 int64_t nValueIn = 0;
                 if (!SelectCoins(nTotalValue, wtxNew.nTime, setCoins, nValueIn, coinControl))
+                {
+                    strFailReason = _("Insufficient funds");
                     return false;
+                }
 
                 BOOST_FOREACH(PAIRTYPE(const CWalletTx*, unsigned int) pcoin, setCoins)
                 {
                     COutPoint outpt(pcoin.first->GetHash(), pcoin.second);
-                    LockCoin(outpt);
-                    wtxNew.vReservedCoins.push_back(outpt);
+                    if (!IsLockedCoin(outpt.hash, outpt.n))
+                    {
+                        LockCoin(outpt);
+                        wtxNew.vReservedCoins.push_back(outpt);
+                    }
                 }
+                printf("CreateTransaction: locked_by_attempt=%" PRIszu
+                       " locked_total=%" PRIszu "\n",
+                       wtxNew.vReservedCoins.size(), setLockedCoins.size());
 
                 BOOST_FOREACH(PAIRTYPE(const CWalletTx*, unsigned int) pcoin, setCoins)
                 {
@@ -3013,7 +3090,10 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
                 }
 
                 if (nValueIn < nValue + nFeeRet)
+                {
+                    strFailReason = _("Insufficient funds for fee");
                     return false;
+                }
                 int64_t nChange = nValueIn - nValue - nFeeRet;
                 // if sub-cent change is required, the fee must be raised to at least MIN_TX_FEE
                 // or until nChange becomes zero
@@ -3049,13 +3129,19 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
                         CPubKey vchPubKey;
                     
                         if (!reservekey.GetReservedKey(vchPubKey))
+                        {
+                            strFailReason = _("Keypool ran out, please call keypoolrefill first");
                             return false;
+                        }
 
                         scriptChange.SetDestination(vchPubKey.GetID());
                     }
 
                     if (wtxNew.vout.empty())
+                    {
+                        strFailReason = _("Transaction has no outputs");
                         return false;
+                    }
 
                     // Insert change txn at random position:
                     vector<CTxOut>::iterator position = wtxNew.vout.begin()+GetRandInt(wtxNew.vout.size() + 1);
@@ -3083,13 +3169,21 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
                 // Sign
                 int nIn = 0;
                 BOOST_FOREACH(const PAIRTYPE(const CWalletTx*,unsigned int)& coin, setCoins)
+                {
                     if (!SignSignature(*this, *coin.first, wtxNew, nIn++))
+                    {
+                        strFailReason = _("Signing transaction failed");
                         return false;
+                    }
+                }
 
                 // Limit size
                 unsigned int nBytes = ::GetSerializeSize(*(CTransaction*)&wtxNew, SER_NETWORK, PROTOCOL_VERSION);
                 if (nBytes >= MAX_BLOCK_SIZE_GEN/5)
+                {
+                    strFailReason = _("Transaction too large");
                     return false;
+                }
                 dPriority /= nBytes;
 
                 // Check that enough fee is included
@@ -3108,6 +3202,10 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
 
                 break;
             }
+            reservationRollback.KeepReservedCoins();
+            printf("CreateTransaction: success locked_by_attempt=%" PRIszu
+                   " locked_total=%" PRIszu "\n",
+                   wtxNew.vReservedCoins.size(), setLockedCoins.size());
         }
     }
     return true;

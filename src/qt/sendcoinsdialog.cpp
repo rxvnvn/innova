@@ -320,10 +320,15 @@ void SendCoinsDialog::on_sendButton_clicked()
             QMessageBox::Ok, QMessageBox::Ok);
         break;
     case WalletModel::TransactionCreationFailed:
+    {
+        QString message = tr("Error: Transaction creation failed.");
+        if (!sendstatus.failureReason.isEmpty())
+            message = tr("Error: Transaction creation failed: %1").arg(sendstatus.failureReason);
         QMessageBox::warning(this, tr("Send Coins"),
-            tr("Error: Transaction creation failed."),
+            message,
             QMessageBox::Ok, QMessageBox::Ok);
         break;
+    }
     case WalletModel::TransactionCommitFailed:
         QMessageBox::warning(this, tr("Send Coins"),
             tr("Error: The transaction was rejected. This might happen if some of the coins in your wallet were already spent, such as if you used a copy of wallet.dat and coins were spent in the copy but not marked as spent here."),

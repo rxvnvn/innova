@@ -118,11 +118,13 @@ public:
     {
         SendCoinsReturn(StatusCode status=Aborted,
                          qint64 fee=0,
-                         QString hex=QString()):
-            status(status), fee(fee), hex(hex) {}
+                         QString hex=QString(),
+                         QString failureReason=QString()):
+            status(status), fee(fee), hex(hex), failureReason(failureReason) {}
         StatusCode status;
         qint64 fee; // is used in case status is "AmountWithFeeExceedsBalance"
         QString hex; // is filled with the transaction hash if status is "OK"
+        QString failureReason; // specific CreateTransaction failure for the UI
     };
 
     // Send coins to a list of recipients

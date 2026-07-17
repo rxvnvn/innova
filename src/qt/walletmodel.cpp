@@ -33,6 +33,43 @@ using boost::placeholders::_5;
 #include <boost/bind.hpp>
 #endif
 
+namespace
+{
+class WalletModelTransactionRollback
+{
+public:
+    WalletModelTransactionRollback(CWallet& walletIn, CWalletTx& wtxIn)
+        : wallet(walletIn), wtx(wtxIn), failureReason("send aborted"), fRollback(true)
+    {
+    }
+
+    ~WalletModelTransactionRollback()
+    {
+        if (!fRollback || wtx.vReservedCoins.empty())
+            return;
+
+        LOCK(wallet.cs_wallet);
+        const size_t nLockedBefore = wallet.setLockedCoins.size();
+        const size_t nLockedByAttempt = wtx.vReservedCoins.size();
+        const size_t nUnlocked = wallet.UnlockReservedCoins(wtx);
+        printf("WalletModel::sendCoins: failure=\"%s\" locked_before=%" PRIszu
+               " locked_by_attempt=%" PRIszu " rollback_unlocked=%" PRIszu
+               " locked_after=%" PRIszu "\n",
+               failureReason.c_str(), nLockedBefore, nLockedByAttempt, nUnlocked,
+               wallet.setLockedCoins.size());
+    }
+
+    void SetFailureReason(const std::string& reason) { failureReason = reason; }
+    void KeepReservedCoins() { fRollback = false; }
+
+private:
+    CWallet& wallet;
+    CWalletTx& wtx;
+    std::string failureReason;
+    bool fRollback;
+};
+}
+
 WalletModel::WalletModel(CWallet *wallet, OptionsModel *optionsModel, QObject *parent) :
     QObject(parent), wallet(wallet), optionsModel(optionsModel), addressTableModel(0),
     transactionTableModel(0),
@@ -600,7 +637,10 @@ WalletModel::SendCoinsReturn WalletModel::sendCoins(const QList<SendCoinsRecipie
         int64_t nFeeRequired = 0;
         int nChangePos = -1;
 
-        bool fCreated = wallet->CreateTransaction(vecSend, wtx, keyChange, nFeeRequired, nChangePos, coinControl);
+        std::string strFailReason;
+        bool fCreated = wallet->CreateTransaction(vecSend, wtx, keyChange, nFeeRequired,
+                                                  nChangePos, coinControl, NULL,
+                                                  &strFailReason);
 
         std::map<int, std::string>::iterator it;
         for (it = mapStealthNarr.begin(); it != mapStealthNarr.end(); ++it)
@@ -625,18 +665,24 @@ WalletModel::SendCoinsReturn WalletModel::sendCoins(const QList<SendCoinsRecipie
             {
                 return SendCoinsReturn(AmountWithFeeExceedsBalance, nFeeRequired);
             }
-            return TransactionCreationFailed;
+            return SendCoinsReturn(TransactionCreationFailed, 0, QString(),
+                                   QString::fromStdString(strFailReason));
         }
+
+        WalletModelTransactionRollback transactionRollback(*wallet, wtx);
         if(!uiInterface.ThreadSafeAskFee(nFeeRequired, tr("Sending...").toStdString()))
         {
+            transactionRollback.SetFailureReason("fee confirmation declined");
             return Aborted;
         }
 
         if(!wallet->CommitTransaction(wtx, keyChange))
         {
+            transactionRollback.SetFailureReason("CommitTransaction failed");
             return TransactionCommitFailed;
         }
 
+        transactionRollback.KeepReservedCoins();
         hex = QString::fromStdString(wtx.GetHash().GetHex());
     }
 
