@@ -2280,18 +2280,25 @@ static std::vector<uint256> GetMissingDAGMergeParents(const CBlock& block)
     return vMissing;
 }
 
-static void QueueBlockInventory(CNode* pfrom, const uint256& hash, std::set<uint256>& setQueued)
+static void QueueBlockInventory(CNode* pfrom, CBlockIndex* pindex,
+                                std::set<uint256>& setQueued,
+                                CGetBlocksResponseInfo& response)
 {
-    if (!pfrom)
+    if (!pfrom || !pindex)
         return;
 
+    const uint256 hash = pindex->GetBlockHash();
     if (!setQueued.insert(hash).second)
         return;
 
-    pfrom->PushGetBlocksInventory(CInv(MSG_BLOCK, hash));
+    if (pfrom->PushGetBlocksInventory(CInv(MSG_BLOCK, hash)))
+        response.Add(hash, pindex->nHeight);
 }
 
-static void QueueDAGSideBlockWithAncestors(CNode* pfrom, const uint256& hash, std::set<uint256>& setQueued, std::set<uint256>& setVisiting, int nDepth)
+static void QueueDAGSideBlockWithAncestors(
+    CNode* pfrom, const uint256& hash, std::set<uint256>& setQueued,
+    std::set<uint256>& setVisiting, int nDepth,
+    CGetBlocksResponseInfo& response)
 {
     if (!pfrom || nDepth > DAG_MERGE_DEPTH)
         return;
@@ -2316,17 +2323,23 @@ static void QueueDAGSideBlockWithAncestors(CNode* pfrom, const uint256& hash, st
 
     std::map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(block.hashPrevBlock);
     if (miPrev != mapBlockIndex.end() && !miPrev->second->IsInMainChain())
-        QueueDAGSideBlockWithAncestors(pfrom, block.hashPrevBlock, setQueued, setVisiting, nDepth + 1);
+        QueueDAGSideBlockWithAncestors(
+            pfrom, block.hashPrevBlock, setQueued, setVisiting, nDepth + 1,
+            response);
 
     std::vector<uint256> vDAGParents = GetDAGParentsFromBlock(block);
     for (unsigned int i = 1; i < vDAGParents.size(); i++)
-        QueueDAGSideBlockWithAncestors(pfrom, vDAGParents[i], setQueued, setVisiting, nDepth + 1);
+        QueueDAGSideBlockWithAncestors(
+            pfrom, vDAGParents[i], setQueued, setVisiting, nDepth + 1,
+            response);
 
-    QueueBlockInventory(pfrom, hash, setQueued);
+    QueueBlockInventory(pfrom, pindex, setQueued, response);
     setVisiting.erase(hash);
 }
 
-static void QueueDAGMergeParentInventories(CNode* pfrom, CBlockIndex* pindex, std::set<uint256>& setQueued)
+static void QueueDAGMergeParentInventories(
+    CNode* pfrom, CBlockIndex* pindex, std::set<uint256>& setQueued,
+    CGetBlocksResponseInfo& response)
 {
     if (!pfrom || !pindex || pindex->nHeight < FORK_HEIGHT_DAG)
         return;
@@ -2338,7 +2351,88 @@ static void QueueDAGMergeParentInventories(CNode* pfrom, CBlockIndex* pindex, st
     std::vector<uint256> vDAGParents = GetDAGParentsFromBlock(block);
     std::set<uint256> setVisiting;
     for (unsigned int i = 1; i < vDAGParents.size(); i++)
-        QueueDAGSideBlockWithAncestors(pfrom, vDAGParents[i], setQueued, setVisiting, 0);
+        QueueDAGSideBlockWithAncestors(
+            pfrom, vDAGParents[i], setQueued, setVisiting, 0, response);
+}
+
+static bool ShouldLogGetBlocksAbuse(uint64_t nCount)
+{
+    return nCount <= 4 ||
+        (nCount != 0 && (nCount & (nCount - 1)) == 0) ||
+        nCount % 128 == 0;
+}
+
+static void LogGetBlocksServerEvent(
+    const char* pszEvent, const CNode* pfrom,
+    const CGetBlocksRequestInfo& request,
+    const CGetBlocksResponseInfo* response,
+    const CGetBlocksServerDecision& decision)
+{
+    const CGetBlocksServerState& state = pfrom->getBlocksServer;
+    const uint256& hashResponseFirst = response
+        ? response->hashFirst
+        : state.hashLastResponseFirst;
+    const uint256& hashResponseLast = response
+        ? response->hashLast
+        : state.hashLastResponseLast;
+    const unsigned int nResponseCount = response
+        ? response->nItemCount
+        : state.nLastResponseCount;
+    const uint64_t nResponseBytes = response
+        ? CGetBlocksServerState::EstimateInvPayloadBytes(response->nItemCount)
+        : state.nLastResponseBytes;
+    const int64_t nCooldownRemaining = std::max<int64_t>(
+        0, state.nRepeatAllowedAfterMillis - request.nRequestTimeMillis);
+
+    printf("%s: request_time_ms=%lld previous_request_time_ms=%lld "
+           "peer_id=%d peer=%s subver=%s version=%d inbound=%d "
+           "locator_tip=%s resolved_height=%d stop_hash=%s stop_height=%d "
+           "predicted_first=%s predicted_last=%s predicted_count=%u "
+           "response_first=%s response_last=%s response_count=%u "
+           "response_bytes=%llu repeat_count=%u same_locator_count=%llu "
+           "identical_requests=%llu same_response_count=%llu "
+           "nonprogressing_count=%u nonprogressing_requests=%llu "
+           "progress_delta=%d useful_getdata=%llu cooldown_ms=%lld "
+           "cooldown_remaining_ms=%lld action=%s requests_received=%llu "
+           "responses_allowed=%llu response_bytes_allowed=%llu "
+           "responses_suppressed=%llu "
+           "rate_limited=%llu estimated_suppressed_bytes=%llu\n",
+           pszEvent,
+           (long long)request.nRequestTimeMillis,
+           (long long)state.nPreviousRequestTimeMillis,
+           pfrom->GetId(),
+           pfrom->addrName.c_str(),
+           pfrom->strSubVer.empty() ? "-" : pfrom->strSubVer.c_str(),
+           pfrom->nVersion,
+           pfrom->fInbound ? 1 : 0,
+           request.hashLocatorTip.ToString().c_str(),
+           request.nResolvedHeight,
+           request.hashStop.ToString().c_str(),
+           request.nStopHeight,
+           request.hashPredictedFirst.ToString().c_str(),
+           request.hashPredictedLast.ToString().c_str(),
+           request.nPredictedResponseCount,
+           hashResponseFirst.ToString().c_str(),
+           hashResponseLast.ToString().c_str(),
+           nResponseCount,
+           (unsigned long long)nResponseBytes,
+           state.nConsecutiveIdenticalRequests,
+           (unsigned long long)state.nSameLocatorRequests,
+           (unsigned long long)state.nIdenticalRequests,
+           (unsigned long long)state.nSameResponseRequests,
+           state.nConsecutiveNonProgressingRequests,
+           (unsigned long long)state.nNonProgressingRequests,
+           state.nLastProgressDelta,
+           (unsigned long long)state.nUsefulGetData,
+           (long long)decision.nCooldownMillis,
+           (long long)nCooldownRemaining,
+           GetBlocksServerActionName(decision.action),
+           (unsigned long long)state.nRequestsReceived,
+           (unsigned long long)state.nResponsesAllowed,
+           (unsigned long long)state.nResponseBytesAllowed,
+           (unsigned long long)state.nResponsesSuppressed,
+           (unsigned long long)state.nRequestsRateLimited,
+           (unsigned long long)state.nEstimatedSuppressedBytes);
 }
 
 static bool CheckFinalityVoteRewardOutputs(const CBlock& block, const std::vector<CFinalityVote>& vVotes, int64_t& nFinalityRewardOut)
@@ -7277,6 +7371,8 @@ void static ProcessGetData(CNode* pfrom)
                 map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(inv.hash);
                 if (mi != mapBlockIndex.end())
                 {
+                    pfrom->getBlocksServer.NoteBlockGetData(
+                        inv.hash, mi->second->nHeight, GetTimeMillis());
                     send = true;
                     CBlock block;
                     block.ReadFromDisk((*mi).second);
@@ -7832,36 +7928,170 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         LOCK(cs_main);
 
-        // Find the last block the caller has in the main chain
-        CBlockIndex* pindex = locator.GetBlockIndex();
+        CBlockIndex* pindexLocator = locator.GetBlockIndex();
+        CBlockIndex* pindexStop = NULL;
+        std::map<uint256, CBlockIndex*>::iterator miStop =
+            mapBlockIndex.find(hashStop);
+        if (miStop != mapBlockIndex.end() && miStop->second->IsInMainChain())
+            pindexStop = miStop->second;
 
-        // Send the rest of the chain
-        if (pindex)
-            pindex = pindex->pnext;
+        CGetBlocksRequestInfo request;
+        uint256 hashLocatorTail;
+        locator.GetHashes(request.hashLocatorTip, hashLocatorTail);
+        request.nResolvedHeight =
+            pindexLocator ? pindexLocator->nHeight : -1;
+        request.hashStop = hashStop;
+        request.nStopHeight = pindexStop ? pindexStop->nHeight : -1;
+        request.hashChainTip = hashBestChain;
+        request.nRequestTimeMillis = GetTimeMillis();
+
+        CBlockIndex* pindexFirst =
+            pindexLocator ? pindexLocator->pnext : NULL;
+        int nPredictedMainItems = pindexFirst && pindexBest
+            ? std::min(1000, std::max(
+                  0, pindexBest->nHeight - request.nResolvedHeight))
+            : 0;
+        bool fPredictedTipInventory = false;
+        if (pindexStop &&
+            pindexStop->nHeight > request.nResolvedHeight &&
+            pindexStop->nHeight - request.nResolvedHeight <= 1000)
+        {
+            nPredictedMainItems = std::max(
+                0, pindexStop->nHeight - request.nResolvedHeight - 1);
+            fPredictedTipInventory =
+                hashStop != hashBestChain && pindexBest &&
+                pindexStop->GetBlockTime() + nStakeMinAge >
+                    pindexBest->GetBlockTime();
+        }
+
+        CBlockIndex* pindexPredictedLast = pindexFirst;
+        for (int i = 1; pindexPredictedLast &&
+             i < nPredictedMainItems; ++i)
+        {
+            pindexPredictedLast = pindexPredictedLast->pnext;
+        }
+        request.nPredictedResponseCount =
+            nPredictedMainItems + (fPredictedTipInventory ? 1 : 0);
+        if (nPredictedMainItems > 0 && pindexFirst)
+        {
+            request.hashPredictedFirst = pindexFirst->GetBlockHash();
+            request.hashPredictedLast =
+                pindexPredictedLast->GetBlockHash();
+        }
+        if (fPredictedTipInventory)
+        {
+            if (nPredictedMainItems == 0)
+                request.hashPredictedFirst = hashBestChain;
+            request.hashPredictedLast = hashBestChain;
+        }
+
+        const bool fStrictInbound =
+            pfrom->fInbound && !pfrom->fWhitelisted;
+        const bool fDiagnostic =
+            GetBoolArg("-getblocksdiag", false);
+        CGetBlocksServerDecision decision =
+            pfrom->getBlocksServer.Evaluate(request, fStrictInbound);
+        const bool fRepeatedRange =
+            !decision.fProgress &&
+            (decision.fIdenticalRequest || decision.fSameResponse);
+        const uint64_t nAbuseCount = std::max<uint64_t>(
+            pfrom->getBlocksServer.nConsecutiveNonProgressingRequests,
+            pfrom->getBlocksServer.nRequestsRateLimited);
+        const bool fLogAbuse =
+            fDiagnostic || ShouldLogGetBlocksAbuse(nAbuseCount);
+
+        if (fDiagnostic)
+            LogGetBlocksServerEvent(
+                "GETBLOCKS_REQUEST", pfrom, request, NULL, decision);
+        if (fRepeatedRange && fLogAbuse)
+            LogGetBlocksServerEvent(
+                "GETBLOCKS_REPEAT", pfrom, request, NULL, decision);
+
+        if (decision.fPenalize)
+            pfrom->Misbehaving(decision.nPenalty);
+
+        if (decision.action != GETBLOCKS_SERVER_ALLOW)
+        {
+            if (decision.action == GETBLOCKS_SERVER_SUPPRESS &&
+                fLogAbuse)
+            {
+                LogGetBlocksServerEvent(
+                    "GETBLOCKS_SUPPRESS", pfrom, request, NULL,
+                    decision);
+            }
+            else if (decision.action == GETBLOCKS_SERVER_RATE_LIMIT &&
+                     fLogAbuse)
+            {
+                LogGetBlocksServerEvent(
+                    "GETBLOCKS_RATE_LIMIT", pfrom, request, NULL,
+                    decision);
+            }
+            else if (decision.action == GETBLOCKS_SERVER_DISCONNECT)
+            {
+                LogGetBlocksServerEvent(
+                    "GETBLOCKS_DISCONNECT", pfrom, request, NULL,
+                    decision);
+                pfrom->fDisconnect = true;
+            }
+            return true;
+        }
+
+        CGetBlocksResponseInfo response;
+        CBlockIndex* pindex = pindexFirst;
         int nLimit = 1000;
         std::set<uint256> setQueuedDAGParents;
-        if (fDebugNet) printf("getblocks %d to %s limit %d\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,20).c_str(), nLimit);
+        if (fDebugNet)
+            printf("getblocks %d to %s limit %d\n",
+                   (pindex ? pindex->nHeight : -1),
+                   hashStop.ToString().substr(0,20).c_str(), nLimit);
         for (; pindex; pindex = pindex->pnext)
         {
-            if (pindex->GetBlockHash() == hashStop)
+            const uint256 hashBlock = pindex->GetBlockHash();
+            if (hashBlock == hashStop)
             {
-                if (fDebugNet) printf("  getblocks stopping at %d %s\n", pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,20).c_str());
+                if (fDebugNet)
+                    printf("  getblocks stopping at %d %s\n",
+                           pindex->nHeight,
+                           hashBlock.ToString().substr(0,20).c_str());
                 // ppcoin: tell downloading node about the latest block if it's
                 // without risk being rejected due to stake connection check
-                if (hashStop != hashBestChain && pindex->GetBlockTime() + nStakeMinAge > pindexBest->GetBlockTime())
-                    pfrom->PushGetBlocksInventory(CInv(MSG_BLOCK, hashBestChain));
+                if (hashStop != hashBestChain &&
+                    pindex->GetBlockTime() + nStakeMinAge >
+                        pindexBest->GetBlockTime() &&
+                    pfrom->PushGetBlocksInventory(
+                        CInv(MSG_BLOCK, hashBestChain)))
+                {
+                    response.Add(hashBestChain, pindexBest->nHeight);
+                }
                 break;
             }
-            QueueDAGMergeParentInventories(pfrom, pindex, setQueuedDAGParents);
-            pfrom->PushGetBlocksInventory(CInv(MSG_BLOCK, pindex->GetBlockHash()));
+
+            QueueDAGMergeParentInventories(
+                pfrom, pindex, setQueuedDAGParents, response);
+            if (pfrom->PushGetBlocksInventory(
+                    CInv(MSG_BLOCK, hashBlock)))
+            {
+                response.Add(hashBlock, pindex->nHeight);
+            }
             if (--nLimit <= 0)
             {
                 // When this block is requested, we'll send an inv that'll make them
                 // getblocks the next batch of inventory.
-                if (fDebugNet) printf("  getblocks stopping at limit %d %s\n", pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,20).c_str());
-                pfrom->hashContinue = pindex->GetBlockHash();
+                if (fDebugNet)
+                    printf("  getblocks stopping at limit %d %s\n",
+                           pindex->nHeight,
+                           hashBlock.ToString().substr(0,20).c_str());
+                pfrom->hashContinue = hashBlock;
                 break;
             }
+        }
+
+        pfrom->getBlocksServer.RecordResponse(request, response);
+        if (fDiagnostic || (fRepeatedRange && fLogAbuse))
+        {
+            LogGetBlocksServerEvent(
+                "GETBLOCKS_RESPONSE", pfrom, request, &response,
+                decision);
         }
     }
     else if (strCommand == "checkpoint")

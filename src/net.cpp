@@ -373,6 +373,382 @@ void RecordP2PMessageStat(const CNode* pnode, const std::string& command, unsign
     }
 }
 
+static const int64_t GETBLOCKS_TOKEN_BUCKET_CAPACITY = 30000;
+static const int64_t GETBLOCKS_TOKEN_REFILL_PER_SECOND = 1000;
+static const unsigned int GETBLOCKS_COST_ITEMS = 250;
+static const int64_t GETBLOCKS_REPEAT_BASE_COOLDOWN_MILLIS = 2000;
+static const unsigned int GETBLOCKS_REPEAT_PENALTY_INTERVAL = 128;
+static const unsigned int GETBLOCKS_REPEAT_DISCONNECT_THRESHOLD = 512;
+
+CGetBlocksRequestInfo::CGetBlocksRequestInfo()
+    : nResolvedHeight(-1),
+      nStopHeight(-1),
+      nPredictedResponseCount(0),
+      nRequestTimeMillis(0)
+{
+}
+
+CGetBlocksResponseInfo::CGetBlocksResponseInfo()
+    : nItemCount(0),
+      nMinHeight(-1),
+      nMaxHeight(-1)
+{
+}
+
+void CGetBlocksResponseInfo::Add(const uint256& hash, int nHeight)
+{
+    if (nItemCount == 0)
+    {
+        hashFirst = hash;
+        nMinHeight = nHeight;
+        nMaxHeight = nHeight;
+    }
+    hashLast = hash;
+    nItemCount++;
+    if (nHeight >= 0)
+    {
+        if (nMinHeight < 0 || nHeight < nMinHeight)
+            nMinHeight = nHeight;
+        if (nMaxHeight < 0 || nHeight > nMaxHeight)
+            nMaxHeight = nHeight;
+    }
+}
+
+CGetBlocksServerDecision::CGetBlocksServerDecision()
+    : action(GETBLOCKS_SERVER_ALLOW),
+      fIdenticalRequest(false),
+      fSameResponse(false),
+      fProgress(false),
+      fPenalize(false),
+      nPenalty(0),
+      nCooldownMillis(0),
+      nEstimatedBytes(0)
+{
+}
+
+CGetBlocksServerState::CGetBlocksServerState()
+    : fHaveLastRequest(false),
+      fHaveLastResponse(false),
+      fTokenBucketInitialized(false),
+      nLastPredictedResponseCount(0),
+      nLastStopHeight(-1),
+      nLastResponseMinHeight(-1),
+      nLastResponseMaxHeight(-1),
+      nTokenBucketLastMillis(0),
+      nTokenBucketMilliTokens(GETBLOCKS_TOKEN_BUCKET_CAPACITY),
+      nPendingRequestCostMilliTokens(0),
+      nUsefulGetDataSinceLastResponse(0),
+      nLastResolvedHeight(-1),
+      nLastResponseCount(0),
+      nLastResponseBytes(0),
+      nLastRequestTimeMillis(0),
+      nResponseBytesAllowed(0),
+      nPreviousRequestTimeMillis(0),
+      nRepeatAllowedAfterMillis(0),
+      nLastProgressDelta(0),
+      nRequestsReceived(0),
+      nResponsesAllowed(0),
+      nResponsesSuppressed(0),
+      nRequestsRateLimited(0),
+      nIdenticalRequests(0),
+      nSameLocatorRequests(0),
+      nSameResponseRequests(0),
+      nNonProgressingRequests(0),
+      nUsefulGetData(0),
+      nEstimatedSuppressedBytes(0),
+      nConsecutiveIdenticalRequests(0),
+      nConsecutiveNonProgressingRequests(0)
+{
+}
+
+void CGetBlocksServerState::RefillTokenBucket(int64_t nNowMillis)
+{
+    if (!fTokenBucketInitialized)
+    {
+        fTokenBucketInitialized = true;
+        nTokenBucketLastMillis = nNowMillis;
+        nTokenBucketMilliTokens = GETBLOCKS_TOKEN_BUCKET_CAPACITY;
+        return;
+    }
+
+    if (nNowMillis <= nTokenBucketLastMillis)
+    {
+        if (nNowMillis < nTokenBucketLastMillis)
+            nTokenBucketLastMillis = nNowMillis;
+        return;
+    }
+
+    const int64_t nElapsedMillis = nNowMillis - nTokenBucketLastMillis;
+    const int64_t nRefill =
+        (nElapsedMillis * GETBLOCKS_TOKEN_REFILL_PER_SECOND) / 1000;
+    nTokenBucketMilliTokens = std::min(
+        GETBLOCKS_TOKEN_BUCKET_CAPACITY,
+        nTokenBucketMilliTokens + nRefill);
+    nTokenBucketLastMillis = nNowMillis;
+}
+
+int64_t CGetBlocksServerState::ResponseCostMilliTokens(
+    unsigned int nItems) const
+{
+    return 1000 +
+        ((nItems + GETBLOCKS_COST_ITEMS - 1) / GETBLOCKS_COST_ITEMS) * 1000;
+}
+
+int64_t CGetBlocksServerState::RepeatCooldownMillis() const
+{
+    unsigned int nLevel = nConsecutiveNonProgressingRequests / 16;
+    nLevel = std::min(nLevel, 4U);
+    return GETBLOCKS_REPEAT_BASE_COOLDOWN_MILLIS << nLevel;
+}
+
+uint64_t CGetBlocksServerState::EstimateInvPayloadBytes(unsigned int nItems)
+{
+    uint64_t nBytes = 0;
+    unsigned int nRemaining = nItems;
+    while (nRemaining > 0)
+    {
+        const unsigned int nChunk = std::min(nRemaining, 1000U);
+        nBytes += nChunk < 253 ? 1 : 3;
+        nBytes += static_cast<uint64_t>(nChunk) * 36;
+        nRemaining -= nChunk;
+    }
+    return nBytes;
+}
+
+CGetBlocksServerDecision CGetBlocksServerState::Evaluate(
+    const CGetBlocksRequestInfo& request, bool fStrictInbound)
+{
+    CGetBlocksServerDecision decision;
+    RefillTokenBucket(request.nRequestTimeMillis);
+
+    const bool fHadLastRequest = fHaveLastRequest;
+    const bool fSameLocator =
+        fHadLastRequest && request.hashLocatorTip == hashLastLocatorTip;
+    const bool fIdenticalRequest =
+        fSameLocator &&
+        request.nResolvedHeight == nLastResolvedHeight &&
+        request.hashStop == hashLastStop;
+    const bool fSamePredictedResponse =
+        fHaveLastResponse &&
+        request.hashChainTip == hashLastResponseChainTip &&
+        request.hashPredictedFirst == hashLastPredictedFirst &&
+        request.hashPredictedLast == hashLastPredictedLast &&
+        request.nPredictedResponseCount == nLastPredictedResponseCount;
+
+    nPreviousRequestTimeMillis = nLastRequestTimeMillis;
+    nLastRequestTimeMillis = request.nRequestTimeMillis;
+    nRequestsReceived++;
+    nLastProgressDelta = fHadLastRequest
+        ? request.nResolvedHeight - nLastResolvedHeight
+        : 0;
+
+    if (fSameLocator)
+        nSameLocatorRequests++;
+    if (fIdenticalRequest)
+        nIdenticalRequests++;
+
+    const bool fLocatorProgress =
+        fHadLastRequest && request.nResolvedHeight > nLastResolvedHeight;
+    const bool fStopProgress =
+        fHadLastRequest &&
+        request.hashStop != hashLastStop &&
+        request.nStopHeight > request.nResolvedHeight &&
+        request.nStopHeight > nLastStopHeight;
+    const bool fNextRange =
+        fHaveLastResponse &&
+        nLastResponseMaxHeight >= 0 &&
+        request.nResolvedHeight >= nLastResponseMaxHeight &&
+        request.nResolvedHeight > nLastResolvedHeight;
+    const bool fUsefulGetData = nUsefulGetDataSinceLastResponse > 0;
+    decision.fProgress =
+        !fHadLastRequest || fLocatorProgress || fStopProgress ||
+        fNextRange || fUsefulGetData;
+    decision.fIdenticalRequest = fIdenticalRequest;
+    decision.fSameResponse = fSamePredictedResponse;
+
+    if (decision.fProgress)
+    {
+        nConsecutiveIdenticalRequests = 0;
+        nConsecutiveNonProgressingRequests = 0;
+        nRepeatAllowedAfterMillis = 0;
+    }
+    else if (fHadLastRequest)
+    {
+        nConsecutiveNonProgressingRequests++;
+        nNonProgressingRequests++;
+        if (fIdenticalRequest)
+            nConsecutiveIdenticalRequests++;
+        else
+            nConsecutiveIdenticalRequests = 0;
+        if (fSamePredictedResponse)
+            nSameResponseRequests++;
+    }
+
+    const bool fRepeatedRange =
+        fHadLastRequest && !decision.fProgress &&
+        (fIdenticalRequest || fSamePredictedResponse);
+    if (fRepeatedRange)
+    {
+        decision.nCooldownMillis = RepeatCooldownMillis();
+        decision.nEstimatedBytes = fHaveLastResponse
+            ? nLastResponseBytes
+            : EstimateInvPayloadBytes(request.nPredictedResponseCount);
+
+        if (fStrictInbound &&
+            nConsecutiveNonProgressingRequests >=
+                GETBLOCKS_REPEAT_PENALTY_INTERVAL &&
+            nConsecutiveNonProgressingRequests %
+                GETBLOCKS_REPEAT_PENALTY_INTERVAL == 0)
+        {
+            decision.fPenalize = true;
+            decision.nPenalty = 5;
+        }
+
+        if (fStrictInbound &&
+            nConsecutiveNonProgressingRequests >=
+                GETBLOCKS_REPEAT_DISCONNECT_THRESHOLD)
+        {
+            decision.action = GETBLOCKS_SERVER_DISCONNECT;
+        }
+        else if (request.nRequestTimeMillis < nRepeatAllowedAfterMillis)
+        {
+            decision.action = GETBLOCKS_SERVER_SUPPRESS;
+        }
+
+        if (decision.action == GETBLOCKS_SERVER_SUPPRESS ||
+            decision.action == GETBLOCKS_SERVER_DISCONNECT)
+        {
+            nResponsesSuppressed++;
+            nEstimatedSuppressedBytes += decision.nEstimatedBytes;
+            nRepeatAllowedAfterMillis = std::max(
+                nRepeatAllowedAfterMillis,
+                request.nRequestTimeMillis + decision.nCooldownMillis);
+        }
+    }
+
+    const int64_t nRequestCost =
+        ResponseCostMilliTokens(request.nPredictedResponseCount);
+    if (decision.action == GETBLOCKS_SERVER_ALLOW)
+    {
+        if (nTokenBucketMilliTokens < nRequestCost)
+        {
+            decision.action = GETBLOCKS_SERVER_RATE_LIMIT;
+            decision.nEstimatedBytes =
+                EstimateInvPayloadBytes(request.nPredictedResponseCount);
+            nRequestsRateLimited++;
+            nEstimatedSuppressedBytes += decision.nEstimatedBytes;
+            nPendingRequestCostMilliTokens = 0;
+        }
+        else
+        {
+            nTokenBucketMilliTokens -= nRequestCost;
+            nPendingRequestCostMilliTokens = nRequestCost;
+        }
+    }
+    else
+    {
+        nPendingRequestCostMilliTokens = 0;
+    }
+
+    hashLastLocatorTip = request.hashLocatorTip;
+    nLastResolvedHeight = request.nResolvedHeight;
+    hashLastStop = request.hashStop;
+    nLastStopHeight = request.nStopHeight;
+    fHaveLastRequest = true;
+
+    return decision;
+}
+
+void CGetBlocksServerState::RecordResponse(
+    const CGetBlocksRequestInfo& request,
+    const CGetBlocksResponseInfo& response)
+{
+    const bool fSameResponse =
+        fHaveLastResponse &&
+        request.hashChainTip == hashLastResponseChainTip &&
+        response.hashFirst == hashLastResponseFirst &&
+        response.hashLast == hashLastResponseLast &&
+        response.nItemCount == nLastResponseCount;
+
+    if (fHaveLastResponse && !fSameResponse)
+    {
+        nConsecutiveIdenticalRequests = 0;
+        nConsecutiveNonProgressingRequests = 0;
+        nRepeatAllowedAfterMillis = 0;
+    }
+
+    const int64_t nActualCost = ResponseCostMilliTokens(response.nItemCount);
+    if (nActualCost > nPendingRequestCostMilliTokens)
+    {
+        const int64_t nAdditionalCost =
+            nActualCost - nPendingRequestCostMilliTokens;
+        nTokenBucketMilliTokens =
+            std::max<int64_t>(0, nTokenBucketMilliTokens - nAdditionalCost);
+    }
+    nPendingRequestCostMilliTokens = 0;
+
+    nResponsesAllowed++;
+    hashLastResponseFirst = response.hashFirst;
+    hashLastResponseLast = response.hashLast;
+    nLastResponseCount = response.nItemCount;
+    nLastResponseBytes = EstimateInvPayloadBytes(response.nItemCount);
+    hashLastResponseChainTip = request.hashChainTip;
+    nResponseBytesAllowed += nLastResponseBytes;
+    hashLastPredictedFirst = request.hashPredictedFirst;
+    hashLastPredictedLast = request.hashPredictedLast;
+    nLastPredictedResponseCount = request.nPredictedResponseCount;
+    nLastResponseMinHeight = response.nMinHeight;
+    nLastResponseMaxHeight = response.nMaxHeight;
+    nUsefulGetDataSinceLastResponse = 0;
+    fHaveLastResponse = true;
+
+    nRepeatAllowedAfterMillis = std::max(
+        nRepeatAllowedAfterMillis,
+        request.nRequestTimeMillis + RepeatCooldownMillis());
+}
+
+bool CGetBlocksServerState::NoteBlockGetData(
+    const uint256& hashBlock, int nHeight, int64_t nNowMillis)
+{
+    (void)nNowMillis;
+    if (!fHaveLastResponse || nLastResponseCount == 0)
+        return false;
+
+    const bool fHashMatch =
+        hashBlock == hashLastResponseFirst || hashBlock == hashLastResponseLast;
+    const bool fHeightMatch =
+        nHeight >= 0 &&
+        nLastResponseMinHeight >= 0 &&
+        nLastResponseMaxHeight >= nLastResponseMinHeight &&
+        nHeight >= nLastResponseMinHeight &&
+        nHeight <= nLastResponseMaxHeight;
+    if (!fHashMatch && !fHeightMatch)
+        return false;
+
+    nUsefulGetData++;
+    nUsefulGetDataSinceLastResponse++;
+    nConsecutiveIdenticalRequests = 0;
+    nConsecutiveNonProgressingRequests = 0;
+    nRepeatAllowedAfterMillis = 0;
+    return true;
+}
+
+const char* GetBlocksServerActionName(GetBlocksServerAction action)
+{
+    switch (action)
+    {
+    case GETBLOCKS_SERVER_ALLOW:
+        return "allow";
+    case GETBLOCKS_SERVER_SUPPRESS:
+        return "suppress";
+    case GETBLOCKS_SERVER_RATE_LIMIT:
+        return "rate-limit";
+    case GETBLOCKS_SERVER_DISCONNECT:
+        return "disconnect";
+    }
+    return "unknown";
+}
+
 struct ListenSocket {
     SOCKET socket;
     bool whitelisted;

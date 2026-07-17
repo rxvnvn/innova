@@ -243,5 +243,67 @@ class AnalyzeInnovaDebugLogTest(unittest.TestCase):
         self.assertEqual(analysis.sessions[f'{address}#19'].getheaders_requests, 1)
 
 
+    def test_getblocks_server_anomaly_and_suppression_metrics(self):
+        abusive = '45.179.221.93:60910'
+        normal = '192.0.2.40:14530'
+        lines = [
+            (
+                f'PEERSTATE: id=42 addr={abusive} subver=/Innovai:5.0.0/ '
+                'ver=50000 h=3526559 best=3526559 adv=3526559 inflight=0 '
+                'in{getdata=1777/1249927 getblocks=31879/23622339} '
+                'out{inv=31898/1090039868 block=34669/16734876}\n'
+            ),
+            (
+                f'PEERSTATE: id=43 addr={normal} subver=/innova:5.0.1/ '
+                'ver=50000 h=3526559 best=3526559 adv=3526559 inflight=0 '
+                'in{getdata=4/200 getblocks=4/3000} '
+                'out{inv=4/144012 block=4/4000000}\n'
+            ),
+            (
+                f'GETBLOCKS_SUPPRESS: request_time_ms=1000 '
+                f'peer_id=42 peer={abusive} subver=/Innovai:5.0.0/ '
+                'version=50000 requests_received=2 identical_requests=1 '
+                'nonprogressing_requests=1 responses_allowed=1 '
+                'response_bytes_allowed=36003 responses_suppressed=1 '
+                'rate_limited=0 estimated_suppressed_bytes=36003 '
+                'useful_getdata=0\n'
+            ),
+            (
+                f'GETBLOCKS_DISCONNECT: request_time_ms=601000 '
+                f'peer_id=42 peer={abusive} subver=/Innovai:5.0.0/ '
+                'version=50000 requests_received=31879 '
+                'identical_requests=31878 nonprogressing_requests=31878 '
+                'responses_allowed=1 response_bytes_allowed=36003 '
+                'responses_suppressed=31878 rate_limited=0 '
+                'estimated_suppressed_bytes=1147714434 useful_getdata=0\n'
+            ),
+        ]
+
+        analysis = ANALYZER.analyze_stream(lines)
+        session = analysis.sessions[f'{abusive}#42']
+        self.assertEqual(session.getblocks_requests, 31879)
+        self.assertEqual(session.identical_getblocks_requests, 31878)
+        self.assertEqual(session.nonprogressing_getblocks_requests, 31878)
+        self.assertEqual(session.peerstate_inv_responses, 31898)
+        self.assertEqual(session.peerstate_inv_bytes, 1090039868)
+        self.assertEqual(session.peerstate_out_block_bytes, 16734876)
+        self.assertGreater(session.inv_to_block_byte_ratio, 65)
+        self.assertEqual(session.suppressed_getblocks_responses, 31878)
+        self.assertEqual(
+            session.estimated_getblocks_bytes_suppressed, 1147714434
+        )
+        self.assertTrue(session.disconnected)
+
+        output = io.StringIO()
+        ANALYZER.render_analysis(analysis, output=output)
+        rendered = output.getvalue()
+        self.assertIn(
+            f'getblocks anomaly: rank=1 peer={abusive}#42', rendered
+        )
+        self.assertIn('getblocks_count: 31879', rendered)
+        self.assertIn('getblocks_rate_per_second: 53.13', rendered)
+        self.assertIn('outgoing_inv_count_bytes: 31898/1090039868', rendered)
+        self.assertIn('estimated_getblocks_bytes_suppressed: 1147714434', rendered)
+
 if __name__ == '__main__':
     unittest.main()

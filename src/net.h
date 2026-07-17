@@ -55,6 +55,116 @@ public:
     unsigned int RecoveryAttempts() const { return nRecoveryAttempts; }
 };
 
+enum GetBlocksServerAction
+{
+    GETBLOCKS_SERVER_ALLOW,
+    GETBLOCKS_SERVER_SUPPRESS,
+    GETBLOCKS_SERVER_RATE_LIMIT,
+    GETBLOCKS_SERVER_DISCONNECT
+};
+
+struct CGetBlocksRequestInfo
+{
+    uint256 hashLocatorTip;
+    int nResolvedHeight;
+    uint256 hashStop;
+    int nStopHeight;
+    uint256 hashChainTip;
+    uint256 hashPredictedFirst;
+    uint256 hashPredictedLast;
+    unsigned int nPredictedResponseCount;
+    int64_t nRequestTimeMillis;
+
+    CGetBlocksRequestInfo();
+};
+
+struct CGetBlocksResponseInfo
+{
+    uint256 hashFirst;
+    uint256 hashLast;
+    unsigned int nItemCount;
+    int nMinHeight;
+    int nMaxHeight;
+
+    CGetBlocksResponseInfo();
+    void Add(const uint256& hash, int nHeight);
+};
+
+struct CGetBlocksServerDecision
+{
+    GetBlocksServerAction action;
+    bool fIdenticalRequest;
+    bool fSameResponse;
+    bool fProgress;
+    bool fPenalize;
+    int nPenalty;
+    int64_t nCooldownMillis;
+    uint64_t nEstimatedBytes;
+
+    CGetBlocksServerDecision();
+};
+
+class CGetBlocksServerState
+{
+private:
+    bool fHaveLastRequest;
+    bool fHaveLastResponse;
+    bool fTokenBucketInitialized;
+    uint256 hashLastPredictedFirst;
+    uint256 hashLastPredictedLast;
+    unsigned int nLastPredictedResponseCount;
+    int nLastStopHeight;
+    uint256 hashLastResponseChainTip;
+    int nLastResponseMinHeight;
+    int nLastResponseMaxHeight;
+    int64_t nTokenBucketLastMillis;
+    int64_t nTokenBucketMilliTokens;
+    int64_t nPendingRequestCostMilliTokens;
+    uint64_t nUsefulGetDataSinceLastResponse;
+
+    void RefillTokenBucket(int64_t nNowMillis);
+    int64_t ResponseCostMilliTokens(unsigned int nItems) const;
+    int64_t RepeatCooldownMillis() const;
+
+public:
+    uint256 hashLastLocatorTip;
+    int nLastResolvedHeight;
+    uint256 hashLastStop;
+    uint256 hashLastResponseFirst;
+    uint256 hashLastResponseLast;
+    unsigned int nLastResponseCount;
+    uint64_t nLastResponseBytes;
+    int64_t nLastRequestTimeMillis;
+    uint64_t nResponseBytesAllowed;
+    int64_t nPreviousRequestTimeMillis;
+    int64_t nRepeatAllowedAfterMillis;
+    int nLastProgressDelta;
+    uint64_t nRequestsReceived;
+    uint64_t nResponsesAllowed;
+    uint64_t nResponsesSuppressed;
+    uint64_t nRequestsRateLimited;
+    uint64_t nIdenticalRequests;
+    uint64_t nSameLocatorRequests;
+    uint64_t nSameResponseRequests;
+    uint64_t nNonProgressingRequests;
+    uint64_t nUsefulGetData;
+    uint64_t nEstimatedSuppressedBytes;
+    unsigned int nConsecutiveIdenticalRequests;
+    unsigned int nConsecutiveNonProgressingRequests;
+
+    CGetBlocksServerState();
+
+    CGetBlocksServerDecision Evaluate(const CGetBlocksRequestInfo& request,
+                                      bool fStrictInbound);
+    void RecordResponse(const CGetBlocksRequestInfo& request,
+                        const CGetBlocksResponseInfo& response);
+    bool NoteBlockGetData(const uint256& hashBlock, int nHeight,
+                          int64_t nNowMillis);
+    static uint64_t EstimateInvPayloadBytes(unsigned int nItems);
+};
+
+const char* GetBlocksServerActionName(GetBlocksServerAction action);
+
 class CSyncLockDiagnostics
 {
 private:
@@ -517,6 +627,7 @@ public:
     std::map<uint256, CRequestTracker> mapRequests;
     CCriticalSection cs_mapRequests;
     uint256 hashContinue;
+    CGetBlocksServerState getBlocksServer;
     CBlockIndex* pindexLastGetBlocksBegin;
     std::vector<CBlockIndex*> getBlocksIndex;
     std::vector<uint256> getBlocksHash;
@@ -744,12 +855,14 @@ public:
         }
     }
 
-    void PushGetBlocksInventory(const CInv& inv)
+    bool PushGetBlocksInventory(const CInv& inv)
     {
         LOCK(cs_inventory);
         static const size_t MAX_INV_TO_SEND = 50000;
-        if (vGetBlocksInventoryToSend.size() < MAX_INV_TO_SEND)
-            vGetBlocksInventoryToSend.push_back(inv);
+        if (vGetBlocksInventoryToSend.size() >= MAX_INV_TO_SEND)
+            return false;
+        vGetBlocksInventoryToSend.push_back(inv);
+        return true;
     }
 
     void AskFor(const CInv& inv, BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER)

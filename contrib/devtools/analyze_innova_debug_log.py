@@ -183,6 +183,23 @@ class PeerSession:
     peerstate_headers_bytes: int = 0
     peerstate_block_responses: int = 0
     peerstate_block_bytes: int = 0
+    peerstate_getblocks_requests: int = 0
+    peerstate_inv_responses: int = 0
+    peerstate_inv_bytes: int = 0
+    peerstate_out_block_responses: int = 0
+    peerstate_out_block_bytes: int = 0
+    trace_getblocks_lines: int = 0
+    trace_getblocks_requests: int = 0
+    trace_getblocks_responses: int = 0
+    trace_getblocks_response_bytes: int = 0
+    identical_getblocks_requests: int = 0
+    nonprogressing_getblocks_requests: int = 0
+    suppressed_getblocks_responses: int = 0
+    rate_limited_getblocks_requests: int = 0
+    estimated_getblocks_bytes_suppressed: int = 0
+    useful_getblocks_getdata: int = 0
+    first_getblocks_request_ms: Optional[int] = None
+    last_getblocks_request_ms: Optional[int] = None
     trace_getheaders_lines: int = 0
     trace_getheaders_sequence: int = 0
     trace_headers_lines: int = 0
@@ -225,6 +242,24 @@ class PeerSession:
     @property
     def headers_bytes(self) -> int:
         return max(self.peerstate_headers_bytes, self.trace_headers_bytes)
+
+    @property
+    def getblocks_requests(self) -> int:
+        return max(
+            self.peerstate_getblocks_requests,
+            self.trace_getblocks_lines,
+            self.trace_getblocks_requests,
+        )
+
+    @property
+    def getblocks_responses(self) -> int:
+        return max(self.peerstate_inv_responses, self.trace_getblocks_responses)
+
+    @property
+    def inv_to_block_byte_ratio(self) -> float:
+        if self.peerstate_out_block_bytes == 0:
+            return float('inf') if self.peerstate_inv_bytes else 0.0
+        return self.peerstate_inv_bytes / self.peerstate_out_block_bytes
 
     @property
     def unique_response_ranges(self) -> int:
@@ -368,6 +403,99 @@ def parse_peerstate(analysis: Analysis, line: str, line_number: int) -> None:
             session.peerstate_block_responses, incoming['block'][0]
         )
         session.peerstate_block_bytes = max(session.peerstate_block_bytes, incoming['block'][1])
+    if 'getblocks' in incoming:
+        session.peerstate_getblocks_requests = max(
+            session.peerstate_getblocks_requests, incoming['getblocks'][0]
+        )
+    if 'inv' in outgoing:
+        session.peerstate_inv_responses = max(
+            session.peerstate_inv_responses, outgoing['inv'][0]
+        )
+        session.peerstate_inv_bytes = max(
+            session.peerstate_inv_bytes, outgoing['inv'][1]
+        )
+    if 'block' in outgoing:
+        session.peerstate_out_block_responses = max(
+            session.peerstate_out_block_responses, outgoing['block'][0]
+        )
+        session.peerstate_out_block_bytes = max(
+            session.peerstate_out_block_bytes, outgoing['block'][1]
+        )
+
+
+def parse_getblocks_trace(analysis: Analysis, line: str, line_number: int) -> None:
+    values = parse_keyvals(line)
+    session = analysis.session_for_trace(values, line_number)
+    session.subver = first_value(values, 'subver') or session.subver
+    version = first_int(values, 'version', 'ver')
+    if version is not None:
+        session.protocol_version = version
+
+    request_time_ms = first_int(values, 'request_time_ms')
+    if request_time_ms is not None:
+        if session.first_getblocks_request_ms is None:
+            session.first_getblocks_request_ms = request_time_ms
+        session.first_getblocks_request_ms = min(
+            session.first_getblocks_request_ms, request_time_ms
+        )
+        session.last_getblocks_request_ms = max(
+            session.last_getblocks_request_ms or request_time_ms,
+            request_time_ms,
+        )
+
+    requests = first_int(values, 'requests_received')
+    if requests is not None:
+        session.trace_getblocks_requests = max(
+            session.trace_getblocks_requests, requests
+        )
+    responses = first_int(values, 'responses_allowed')
+    if responses is not None:
+        session.trace_getblocks_responses = max(
+            session.trace_getblocks_responses, responses
+        )
+    response_bytes = first_int(values, 'response_bytes_allowed')
+    if response_bytes is not None:
+        session.trace_getblocks_response_bytes = max(
+            session.trace_getblocks_response_bytes, response_bytes
+        )
+    identical = first_int(values, 'identical_requests', 'repeat_count')
+    if identical is not None:
+        session.identical_getblocks_requests = max(
+            session.identical_getblocks_requests, identical
+        )
+    nonprogressing = first_int(
+        values, 'nonprogressing_requests', 'nonprogressing_count'
+    )
+    if nonprogressing is not None:
+        session.nonprogressing_getblocks_requests = max(
+            session.nonprogressing_getblocks_requests, nonprogressing
+        )
+    suppressed = first_int(values, 'responses_suppressed')
+    if suppressed is not None:
+        session.suppressed_getblocks_responses = max(
+            session.suppressed_getblocks_responses, suppressed
+        )
+    limited = first_int(values, 'rate_limited')
+    if limited is not None:
+        session.rate_limited_getblocks_requests = max(
+            session.rate_limited_getblocks_requests, limited
+        )
+    saved = first_int(values, 'estimated_suppressed_bytes')
+    if saved is not None:
+        session.estimated_getblocks_bytes_suppressed = max(
+            session.estimated_getblocks_bytes_suppressed, saved
+        )
+    useful = first_int(values, 'useful_getdata')
+    if useful is not None:
+        session.useful_getblocks_getdata = max(
+            session.useful_getblocks_getdata, useful
+        )
+
+    if has_marker(line, 'GETBLOCKS_REQUEST'):
+        session.trace_getblocks_lines += 1
+    if has_marker(line, 'GETBLOCKS_DISCONNECT'):
+        session.disconnected = True
+
 
 
 def parse_getheaders_trace(analysis: Analysis, line: str, line_number: int) -> None:
@@ -477,6 +605,15 @@ def analyze_stream(lines: Iterable[str]) -> Analysis:
             parse_getheaders_trace(analysis, line, line_number)
         if has_marker(line, 'HEADERS_TRACE') or has_marker(line, 'HEADERS_RECV'):
             parse_headers_trace(analysis, line, line_number)
+        if any(
+            has_marker(line, marker)
+            for marker in (
+                'GETBLOCKS_REQUEST', 'GETBLOCKS_RESPONSE', 'GETBLOCKS_REPEAT',
+                'GETBLOCKS_SUPPRESS', 'GETBLOCKS_RATE_LIMIT',
+                'GETBLOCKS_DISCONNECT',
+            )
+        ):
+            parse_getblocks_trace(analysis, line, line_number)
         mark_disconnect(analysis, line)
     return analysis
 
@@ -548,6 +685,25 @@ def render_analysis(
 
     sessions = selected_sessions(analysis, peer_filter)
     print(f'peer sessions: {len(sessions)}', file=output)
+    anomaly_sessions = sorted(
+        (
+            session for session in sessions
+            if session.getblocks_requests or session.peerstate_inv_bytes
+        ),
+        key=lambda session: (
+            session.peerstate_inv_bytes,
+            session.getblocks_requests,
+        ),
+        reverse=True,
+    )
+    for rank, session in enumerate(anomaly_sessions[:10], 1):
+        print(
+            f'getblocks anomaly: rank={rank} peer={session.label} '
+            f'getblocks={session.getblocks_requests} '
+            f'inv_bytes={session.peerstate_inv_bytes}',
+            file=output,
+        )
+
     for session in sessions:
         average_response_bytes = (
             session.headers_bytes / session.headers_responses
@@ -564,10 +720,86 @@ def render_analysis(
             if session.trace_headers_lines
             else 0.0
         )
+        getblocks_duration = 0.0
+        if (
+            session.first_getblocks_request_ms is not None
+            and session.last_getblocks_request_ms is not None
+            and session.last_getblocks_request_ms > session.first_getblocks_request_ms
+        ):
+            getblocks_duration = (
+                session.last_getblocks_request_ms
+                - session.first_getblocks_request_ms
+            ) / 1000.0
+        elif analysis.first_timestamp is not None and analysis.last_timestamp is not None:
+            getblocks_duration = (
+                analysis.last_timestamp - analysis.first_timestamp
+            ).total_seconds()
+        getblocks_rate = (
+            session.getblocks_requests / getblocks_duration
+            if getblocks_duration > 0 else 0.0
+        )
+        inv_block_ratio = session.inv_to_block_byte_ratio
         print(
             f'peer session: {session.label} lines={session.first_line}-{session.last_line} '
             f'subver={session.subver or "unknown"} version={session.protocol_version} '
             f'height={session.max_peer_height} disconnected={int(session.disconnected)}',
+            file=output,
+        )
+        print(f'  getblocks_count: {session.getblocks_requests}', file=output)
+        print(f'  getblocks_rate_per_second: {getblocks_rate:.2f}', file=output)
+        print(
+            f'  identical_getblocks_requests: '
+            f'{session.identical_getblocks_requests}',
+            file=output,
+        )
+        print(
+            f'  nonprogressing_getblocks_requests: '
+            f'{session.nonprogressing_getblocks_requests}',
+            file=output,
+        )
+        print(
+            f'  getblocks_responses_allowed_trace: '
+            f'{session.trace_getblocks_responses}',
+            file=output,
+        )
+        print(
+            f'  getblocks_response_bytes_allowed_trace: '
+            f'{session.trace_getblocks_response_bytes}',
+            file=output,
+        )
+        print(
+            f'  getblocks_responses_suppressed: '
+            f'{session.suppressed_getblocks_responses}',
+            file=output,
+        )
+        print(
+            f'  getblocks_requests_rate_limited: '
+            f'{session.rate_limited_getblocks_requests}',
+            file=output,
+        )
+        print(
+            f'  outgoing_inv_count_bytes: {session.peerstate_inv_responses}/'
+            f'{session.peerstate_inv_bytes}',
+            file=output,
+        )
+        print(
+            f'  outgoing_block_count_bytes: '
+            f'{session.peerstate_out_block_responses}/'
+            f'{session.peerstate_out_block_bytes}',
+            file=output,
+        )
+        print(
+            f'  inv_to_block_byte_ratio: '
+            f'{"inf" if inv_block_ratio == float("inf") else f"{inv_block_ratio:.2f}"}',
+            file=output,
+        )
+        print(
+            f'  estimated_getblocks_bytes_suppressed: '
+            f'{session.estimated_getblocks_bytes_suppressed}',
+            file=output,
+        )
+        print(
+            f'  useful_getblocks_getdata: {session.useful_getblocks_getdata}',
             file=output,
         )
         print(f'  getheaders_requests: {session.getheaders_requests}', file=output)

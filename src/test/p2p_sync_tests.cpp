@@ -160,6 +160,79 @@ public:
     }
 };
 
+static CGetBlocksRequestInfo TestGetBlocksRequest(
+    uint64_t nLocator, int nResolvedHeight, uint64_t nFirst,
+    uint64_t nLast, unsigned int nResponseCount, int64_t nTimeMillis,
+    uint64_t nStop = 0, int nStopHeight = -1,
+    uint64_t nChainTip = 9000000)
+{
+    CGetBlocksRequestInfo request;
+    request.hashLocatorTip = uint256(nLocator);
+    request.nResolvedHeight = nResolvedHeight;
+    request.hashStop = uint256(nStop);
+    request.nStopHeight = nStopHeight;
+    request.hashChainTip = uint256(nChainTip);
+    request.hashPredictedFirst = uint256(nFirst);
+    request.hashPredictedLast = uint256(nLast);
+    request.nPredictedResponseCount = nResponseCount;
+    request.nRequestTimeMillis = nTimeMillis;
+    return request;
+}
+
+static CGetBlocksResponseInfo TestGetBlocksResponse(
+    const CGetBlocksRequestInfo& request)
+{
+    CGetBlocksResponseInfo response;
+    response.hashFirst = request.hashPredictedFirst;
+    response.hashLast = request.hashPredictedLast;
+    response.nItemCount = request.nPredictedResponseCount;
+    if (response.nItemCount > 0)
+    {
+        response.nMinHeight = request.nResolvedHeight + 1;
+        response.nMaxHeight =
+            request.nResolvedHeight + response.nItemCount;
+    }
+    return response;
+}
+
+static void CheckNormalGetBlocksSync(int nVersion, unsigned int nPeer)
+{
+    CNode peer(
+        INVALID_SOCKET, TestPeerAddress(nPeer),
+        nVersion == MIN_PEER_PROTO_VERSION
+            ? "normal-legacy-getblocks"
+            : "normal-current-getblocks",
+        true);
+    peer.nVersion = nVersion;
+
+    for (int nBatch = 0; nBatch < 4; ++nBatch)
+    {
+        const int nResolvedHeight = nBatch * 1000;
+        const CGetBlocksRequestInfo request = TestGetBlocksRequest(
+            100 + nBatch, nResolvedHeight,
+            10000 + nResolvedHeight,
+            10999 + nResolvedHeight,
+            1000, 1000 + nBatch * 5000);
+        const CGetBlocksServerDecision decision =
+            peer.getBlocksServer.Evaluate(request, true);
+        BOOST_CHECK_EQUAL(decision.action, GETBLOCKS_SERVER_ALLOW);
+        BOOST_CHECK(decision.fProgress);
+        BOOST_CHECK(!decision.fPenalize);
+
+        const CGetBlocksResponseInfo response =
+            TestGetBlocksResponse(request);
+        peer.getBlocksServer.RecordResponse(request, response);
+        BOOST_CHECK(peer.getBlocksServer.NoteBlockGetData(
+            response.hashLast, response.nMaxHeight,
+            request.nRequestTimeMillis + 1));
+    }
+
+    BOOST_CHECK_EQUAL(peer.getBlocksServer.nResponsesAllowed, 4U);
+    BOOST_CHECK_EQUAL(peer.getBlocksServer.nResponsesSuppressed, 0U);
+    BOOST_CHECK_EQUAL(peer.getBlocksServer.nRequestsRateLimited, 0U);
+    BOOST_CHECK_EQUAL(peer.nMisbehavior, 0);
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(p2p_sync_tests)
@@ -734,6 +807,238 @@ BOOST_AUTO_TEST_CASE(getblocks_response_is_inv_not_headers)
     BOOST_CHECK(HasCommand(announcementCommands, "headers"));
     BOOST_CHECK(!HasCommand(announcementCommands, "inv"));
     fSPVMode = fSPVModeSaved;
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_normal_legacy_sync)
+{
+    CheckNormalGetBlocksSync(MIN_PEER_PROTO_VERSION, 30);
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_normal_current_sync)
+{
+    CheckNormalGetBlocksSync(PROTOCOL_VERSION, 31);
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_suppresses_identical_repeat)
+{
+    CGetBlocksServerState state;
+    const CGetBlocksRequestInfo request = TestGetBlocksRequest(
+        1, 1000, 1001, 2000, 1000, 1000);
+    CGetBlocksServerDecision decision = state.Evaluate(request, true);
+    BOOST_REQUIRE_EQUAL(decision.action, GETBLOCKS_SERVER_ALLOW);
+    state.RecordResponse(request, TestGetBlocksResponse(request));
+
+    for (int i = 1; i <= 20; ++i)
+    {
+        CGetBlocksRequestInfo repeated = request;
+        repeated.nRequestTimeMillis = 1000 + i * 20;
+        decision = state.Evaluate(repeated, true);
+        BOOST_CHECK_EQUAL(
+            decision.action, GETBLOCKS_SERVER_SUPPRESS);
+        BOOST_CHECK(decision.fIdenticalRequest);
+        BOOST_CHECK(decision.fSameResponse);
+    }
+
+    BOOST_CHECK_EQUAL(state.nResponsesAllowed, 1U);
+    BOOST_CHECK_EQUAL(state.nResponsesSuppressed, 20U);
+    BOOST_CHECK_EQUAL(state.nIdenticalRequests, 20U);
+    BOOST_CHECK_GT(
+        state.nEstimatedSuppressedBytes,
+        CGetBlocksServerState::EstimateInvPayloadBytes(1000) * 19);
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_suppresses_same_range_from_changed_locator)
+{
+    CGetBlocksServerState state;
+    const CGetBlocksRequestInfo first = TestGetBlocksRequest(
+        10, 0, 1, 1000, 1000, 1000);
+    BOOST_REQUIRE_EQUAL(
+        state.Evaluate(first, true).action,
+        GETBLOCKS_SERVER_ALLOW);
+    state.RecordResponse(first, TestGetBlocksResponse(first));
+
+    CGetBlocksRequestInfo cycled = first;
+    cycled.hashLocatorTip = uint256(11);
+    cycled.nRequestTimeMillis = 1100;
+    const CGetBlocksServerDecision decision =
+        state.Evaluate(cycled, true);
+    BOOST_CHECK(!decision.fIdenticalRequest);
+    BOOST_CHECK(decision.fSameResponse);
+    BOOST_CHECK_EQUAL(
+        decision.action, GETBLOCKS_SERVER_SUPPRESS);
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_50_per_second_spam_disconnects)
+{
+    CGetBlocksServerState state;
+    const CGetBlocksRequestInfo request = TestGetBlocksRequest(
+        20, 0, 1, 1000, 1000, 1000);
+    BOOST_REQUIRE_EQUAL(
+        state.Evaluate(request, true).action,
+        GETBLOCKS_SERVER_ALLOW);
+    state.RecordResponse(request, TestGetBlocksResponse(request));
+
+    unsigned int nPenalties = 0;
+    CGetBlocksServerDecision decision;
+    for (int i = 1; i <= 600; ++i)
+    {
+        CGetBlocksRequestInfo repeated = request;
+        repeated.nRequestTimeMillis = 1000 + i * 20;
+        decision = state.Evaluate(repeated, true);
+        if (decision.fPenalize)
+        {
+            BOOST_CHECK_EQUAL(decision.nPenalty, 5);
+            nPenalties++;
+        }
+        if (decision.action == GETBLOCKS_SERVER_DISCONNECT)
+            break;
+        BOOST_CHECK_EQUAL(
+            decision.action, GETBLOCKS_SERVER_SUPPRESS);
+    }
+
+    BOOST_CHECK_EQUAL(
+        decision.action, GETBLOCKS_SERVER_DISCONNECT);
+    BOOST_CHECK_EQUAL(state.nResponsesAllowed, 1U);
+    BOOST_CHECK_EQUAL(state.nResponsesSuppressed, 512U);
+    BOOST_CHECK_EQUAL(nPenalties, 4U);
+    BOOST_CHECK_GE(state.nConsecutiveNonProgressingRequests, 512U);
+    BOOST_CHECK_GE(
+        state.nEstimatedSuppressedBytes,
+        CGetBlocksServerState::EstimateInvPayloadBytes(1000) * 512);
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_cost_rate_limit_bounds_changed_ranges)
+{
+    CGetBlocksServerState state;
+    unsigned int nAllowed = 0;
+    unsigned int nLimited = 0;
+
+    for (int i = 0; i < 50; ++i)
+    {
+        const CGetBlocksRequestInfo request = TestGetBlocksRequest(
+            100 + i, 0, 1000 + i, 2000 + i,
+            1000, 1000 + i * 20, 3000 + i, -1);
+        const CGetBlocksServerDecision decision =
+            state.Evaluate(request, true);
+        if (decision.action == GETBLOCKS_SERVER_ALLOW)
+        {
+            nAllowed++;
+            state.RecordResponse(
+                request, TestGetBlocksResponse(request));
+        }
+        else
+        {
+            BOOST_CHECK_EQUAL(
+                decision.action, GETBLOCKS_SERVER_RATE_LIMIT);
+            nLimited++;
+        }
+    }
+
+    BOOST_CHECK_EQUAL(nAllowed, 6U);
+    BOOST_CHECK_EQUAL(nLimited, 44U);
+    BOOST_CHECK_EQUAL(state.nResponsesAllowed, 6U);
+    BOOST_CHECK_EQUAL(state.nRequestsRateLimited, 44U);
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_timeout_retry_after_cooldown)
+{
+    CGetBlocksServerState state;
+    const CGetBlocksRequestInfo request = TestGetBlocksRequest(
+        30, 0, 1, 1000, 1000, 1000);
+    BOOST_REQUIRE_EQUAL(
+        state.Evaluate(request, true).action,
+        GETBLOCKS_SERVER_ALLOW);
+    state.RecordResponse(request, TestGetBlocksResponse(request));
+
+    CGetBlocksRequestInfo early = request;
+    early.nRequestTimeMillis = 1500;
+    BOOST_CHECK_EQUAL(
+        state.Evaluate(early, true).action,
+        GETBLOCKS_SERVER_SUPPRESS);
+
+    CGetBlocksRequestInfo timeout = request;
+    timeout.nRequestTimeMillis = 4000;
+    const CGetBlocksServerDecision decision =
+        state.Evaluate(timeout, true);
+    BOOST_CHECK(decision.fIdenticalRequest);
+    BOOST_CHECK_EQUAL(decision.action, GETBLOCKS_SERVER_ALLOW);
+    state.RecordResponse(timeout, TestGetBlocksResponse(timeout));
+    BOOST_CHECK_EQUAL(state.nResponsesAllowed, 2U);
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_rapid_locator_progress_uses_burst)
+{
+    CGetBlocksServerState state;
+    for (int i = 0; i < 6; ++i)
+    {
+        const CGetBlocksRequestInfo request = TestGetBlocksRequest(
+            40 + i, i * 1000, 10000 + i * 1000,
+            10999 + i * 1000, 1000, 1000);
+        const CGetBlocksServerDecision decision =
+            state.Evaluate(request, true);
+        BOOST_CHECK(decision.fProgress);
+        BOOST_CHECK_EQUAL(decision.action, GETBLOCKS_SERVER_ALLOW);
+        state.RecordResponse(
+            request, TestGetBlocksResponse(request));
+    }
+
+    BOOST_CHECK_EQUAL(state.nResponsesAllowed, 6U);
+    BOOST_CHECK_EQUAL(state.nResponsesSuppressed, 0U);
+    BOOST_CHECK_EQUAL(state.nRequestsRateLimited, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_getdata_resets_repeat_state)
+{
+    CGetBlocksServerState state;
+    const CGetBlocksRequestInfo request = TestGetBlocksRequest(
+        50, 0, 1, 1000, 1000, 1000);
+    BOOST_REQUIRE_EQUAL(
+        state.Evaluate(request, true).action,
+        GETBLOCKS_SERVER_ALLOW);
+    const CGetBlocksResponseInfo response =
+        TestGetBlocksResponse(request);
+    state.RecordResponse(request, response);
+
+    CGetBlocksRequestInfo early = request;
+    early.nRequestTimeMillis = 1100;
+    BOOST_REQUIRE_EQUAL(
+        state.Evaluate(early, true).action,
+        GETBLOCKS_SERVER_SUPPRESS);
+    BOOST_REQUIRE(state.NoteBlockGetData(
+        response.hashFirst, response.nMinHeight, 1200));
+
+    CGetBlocksRequestInfo afterGetData = request;
+    afterGetData.nRequestTimeMillis = 1300;
+    const CGetBlocksServerDecision decision =
+        state.Evaluate(afterGetData, true);
+    BOOST_CHECK(decision.fProgress);
+    BOOST_CHECK_EQUAL(decision.action, GETBLOCKS_SERVER_ALLOW);
+    BOOST_CHECK_EQUAL(state.nConsecutiveNonProgressingRequests, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_server_state_is_fixed_and_per_peer)
+{
+    BOOST_CHECK_LE(sizeof(CGetBlocksServerState), 1024U);
+
+    CGetBlocksServerState abusiveConnection;
+    CGetBlocksServerState parallelConnection;
+    const CGetBlocksRequestInfo request = TestGetBlocksRequest(
+        60, 0, 1, 1000, 1000, 1000);
+    BOOST_REQUIRE_EQUAL(
+        abusiveConnection.Evaluate(request, true).action,
+        GETBLOCKS_SERVER_ALLOW);
+    abusiveConnection.RecordResponse(
+        request, TestGetBlocksResponse(request));
+
+    CGetBlocksRequestInfo repeated = request;
+    repeated.nRequestTimeMillis = 1100;
+    BOOST_CHECK_EQUAL(
+        abusiveConnection.Evaluate(repeated, true).action,
+        GETBLOCKS_SERVER_SUPPRESS);
+    BOOST_CHECK_EQUAL(
+        parallelConnection.Evaluate(repeated, true).action,
+        GETBLOCKS_SERVER_ALLOW);
+    BOOST_CHECK_EQUAL(parallelConnection.nResponsesSuppressed, 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
