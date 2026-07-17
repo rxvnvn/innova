@@ -15,6 +15,7 @@ namespace Ui {
 }
 class WalletModel;
 class CCoinControl;
+class QTimer;
 
 class CoinControlDialog : public QDialog
 {
@@ -39,6 +40,7 @@ private:
     WalletModel *model;
     int sortColumn;
     Qt::SortOrder sortOrder;
+    QTimer *labelUpdateTimer;
 
     QMenu *contextMenu;
     QTreeWidgetItem *contextMenuItem;
@@ -49,6 +51,8 @@ private:
     QString strPad(QString, int, QString);
     void sortView(int, Qt::SortOrder);
     void updateView();
+    void queueLabelUpdate();
+    void flushLabelUpdate();
 
     enum
     {
