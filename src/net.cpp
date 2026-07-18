@@ -962,6 +962,17 @@ CNode* MaybeQueueStalledSyncRecovery(
     bool fPipelineActive = false;
     std::vector<CNode*> vEligiblePeers;
 
+    CNode* pnodeSyncCopy = NULL;
+    {
+        LOCK(cs_pnodeSync);
+        if (pnodeSync != NULL &&
+            std::find(vNodesIn.begin(), vNodesIn.end(), pnodeSync) !=
+                vNodesIn.end())
+        {
+            pnodeSyncCopy = pnodeSync;
+        }
+    }
+
     BOOST_FOREACH(CNode* pnode, vNodesIn)
     {
         if (pnode == NULL || pnode->fDisconnect ||
@@ -981,20 +992,6 @@ CNode* MaybeQueueStalledSyncRecovery(
         {
             fPipelineActive = true;
         }
-        if (!fPipelineActive)
-        {
-            for (std::multimap<int64_t, CInv>::const_iterator it =
-                     pnode->mapAskFor.begin();
-                 it != pnode->mapAskFor.end(); ++it)
-            {
-                if (it->second.type == MSG_BLOCK ||
-                    it->second.type == MSG_FILTERED_BLOCK)
-                {
-                    fPipelineActive = true;
-                    break;
-                }
-            }
-        }
     }
     std::vector<std::pair<int64_t, CNode*> > vCandidates;
     BOOST_FOREACH(CNode* pnode, vEligiblePeers)
@@ -1003,14 +1000,107 @@ CNode* MaybeQueueStalledSyncRecovery(
             SyncPeerScore(pnode, nNow, nMaxPeerHeight), pnode));
     }
 
-    if (pindexTip == NULL || vEligiblePeers.empty() ||
-        !state.ShouldRecover(nLocalHeight, (int)nMaxPeerHeight,
-                             fPipelineActive, nNow,
-                             nStallTimeout, nCooldown))
+    const int nObservedHeightBefore = state.LastObservedHeight();
+    const int64_t nStallStartBefore = state.LastProgressTime();
+    const int64_t nLastRecoveryBefore = state.LastRecoveryTime();
+    const unsigned int nRecoveryAttemptsBefore = state.RecoveryAttempts();
+    const int64_t nStallAgeBefore = nStallStartBefore == 0
+        ? -1 : std::max<int64_t>(0, nNow - nStallStartBefore);
+    const unsigned int nBackoffShift =
+        std::min<unsigned int>(nRecoveryAttemptsBefore, 5);
+    const int64_t nEffectiveCooldown =
+        nCooldown * ((int64_t)1 << nBackoffShift);
+    const int64_t nSinceRecovery = nLastRecoveryBefore == 0
+        ? nEffectiveCooldown : nNow - nLastRecoveryBefore;
+    const int64_t nCooldownRemaining =
+        std::max<int64_t>(0, nEffectiveCooldown - nSinceRecovery);
+
+    bool fShouldRecover = false;
+    bool fShouldRecoverEvaluated = false;
+    if (pindexTip != NULL && !vEligiblePeers.empty())
+    {
+        fShouldRecoverEvaluated = true;
+        fShouldRecover = state.ShouldRecover(
+            nLocalHeight, (int)nMaxPeerHeight, fPipelineActive, nNow,
+            nStallTimeout, nCooldown);
+    }
+
+    const char* pszFinalSkipReason = "none";
+    if (pindexTip == NULL)
+        pszFinalSkipReason = "missing_tip";
+    else if (vEligiblePeers.empty())
+        pszFinalSkipReason = "no_eligible_peers";
+    else if (!fShouldRecover)
+    {
+        if (nObservedHeightBefore != nLocalHeight)
+            pszFinalSkipReason = "local_height_changed";
+        else if (nStallStartBefore != 0 && nNow < nStallStartBefore)
+            pszFinalSkipReason = "clock_reversal";
+        else if (nMaxPeerHeight <= nLocalHeight)
+            pszFinalSkipReason = "peer_not_ahead";
+        else if (fPipelineActive)
+            pszFinalSkipReason = "pipeline_active";
+        else if (nStallAgeBefore < nStallTimeout)
+            pszFinalSkipReason = "stall_timeout_not_reached";
+        else if (nCooldownRemaining > 0)
+            pszFinalSkipReason = "cooldown_active";
+        else
+            pszFinalSkipReason = "should_recover_false_unclassified";
+    }
+
+    // Deferred block-type inventory requests are diagnostic state, not active
+    // downloads.  Keep reporting them without treating them as pipeline work.
+    size_t nSyncPeerBlockAskFor = 0;
+    if (pnodeSyncCopy != NULL)
+    {
+        for (std::multimap<int64_t, CInv>::const_iterator it =
+                 pnodeSyncCopy->mapAskFor.begin();
+             it != pnodeSyncCopy->mapAskFor.end(); ++it)
+        {
+            if (it->second.type == MSG_BLOCK ||
+                it->second.type == MSG_FILTERED_BLOCK)
+            {
+                ++nSyncPeerBlockAskFor;
+            }
+        }
+    }
+    const int nPeerStartHeight =
+        pnodeSyncCopy == NULL ? -1 : pnodeSyncCopy->nChainHeight;
+    const int nPeerBestKnownHeight =
+        pnodeSyncCopy == NULL ? -1 : pnodeSyncCopy->nBestKnownHeight;
+    const int nEffectivePeerHeight = pnodeSyncCopy == NULL
+        ? -1
+        : (pnodeSyncCopy->nBestKnownHeight >= 0
+               ? pnodeSyncCopy->nBestKnownHeight
+               : pnodeSyncCopy->nChainHeight);
+    const int nCanAdvanceBlockSync = pnodeSyncCopy == NULL
+        ? -1
+        : (pnodeSyncCopy->CanAdvanceBlockSync(nLocalHeight) ? 1 : 0);
+    printf("IBD_RECOVERY_DECISION time=%lld peer=%lld local_height=%d peer_start_height=%d peer_best_known_height=%d effective_peer_height=%d max_peer_height=%lld fStartSync=%d blocks_in_flight=%u askfor_block_requests=%u queued_getblocks=%u pipeline_active=%d stall_start_time=%lld stall_age=%lld stall_timeout=%lld cooldown_remaining=%lld recovery_attempts=%u can_advance_block_sync=%d should_recover=%d final_skip_reason=%s\n",
+           (long long)nNow,
+           (long long)(pnodeSyncCopy == NULL ? -1 : pnodeSyncCopy->GetId()),
+           nLocalHeight, nPeerStartHeight, nPeerBestKnownHeight,
+           nEffectivePeerHeight, (long long)nMaxPeerHeight,
+           pnodeSyncCopy == NULL ? -1 : (pnodeSyncCopy->fStartSync ? 1 : 0),
+           (unsigned int)(pnodeSyncCopy == NULL
+                              ? 0 : pnodeSyncCopy->setBlocksInFlight.size()),
+           (unsigned int)nSyncPeerBlockAskFor,
+           (unsigned int)(pnodeSyncCopy == NULL
+                              ? 0 : pnodeSyncCopy->getBlocksIndex.size()),
+           fPipelineActive ? 1 : 0, (long long)state.LastProgressTime(),
+           (long long)(state.LastProgressTime() == 0
+                           ? -1
+                           : std::max<int64_t>(
+                                 0, nNow - state.LastProgressTime())),
+           (long long)nStallTimeout, (long long)nCooldownRemaining,
+           state.RecoveryAttempts(), nCanAdvanceBlockSync,
+           fShouldRecoverEvaluated ? (fShouldRecover ? 1 : 0) : -1,
+           pszFinalSkipReason);
+
+    if (!fShouldRecover)
     {
         return NULL;
     }
-
     std::sort(vCandidates.begin(), vCandidates.end(), CompareSyncCandidates);
     const size_t nOwnerIndex =
         (state.RecoveryAttempts() - 1) % vCandidates.size();
@@ -4939,20 +5029,44 @@ static CNode* AssignSyncPeer(const vector<CNode*>& vNodesIn,
                              CNode* pnodeNewSync,
                              bool fQueueInitialSync)
 {
-    LOCK(cs_pnodeSync);
-    CNode* pnodeOldSync =
-        NodeVectorContains(vNodesIn, pnodeSync) ? pnodeSync : NULL;
-    if (pnodeOldSync != pnodeNewSync)
+    CNode* pnodeOldSync = NULL;
+    bool fSyncPeerChanged = false;
     {
-        if (pnodeOldSync != NULL)
-            pnodeOldSync->fStartSync = false;
-        pnodeSync = pnodeNewSync;
-        if (pnodeNewSync != NULL && fQueueInitialSync)
-            pnodeNewSync->fStartSync = true;
+        LOCK(cs_pnodeSync);
+        pnodeOldSync =
+            NodeVectorContains(vNodesIn, pnodeSync) ? pnodeSync : NULL;
+        fSyncPeerChanged = pnodeOldSync != pnodeNewSync;
+        if (fSyncPeerChanged)
+        {
+            if (pnodeOldSync != NULL)
+                pnodeOldSync->fStartSync = false;
+            pnodeSync = pnodeNewSync;
+            if (pnodeNewSync != NULL && fQueueInitialSync)
+                pnodeNewSync->fStartSync = true;
+        }
+        else
+        {
+            pnodeSync = pnodeNewSync;
+        }
     }
-    else
+
+    if (fSyncPeerChanged)
     {
-        pnodeSync = pnodeNewSync;
+        int64_t nStallStart = 0;
+        {
+            LOCK(cs_stalledSyncRecovery);
+            nStallStart = stalledSyncRecoveryState.LastProgressTime();
+        }
+        const int64_t nNow = GetTime();
+        const int64_t nStallAge = nStallStart == 0
+            ? -1 : std::max<int64_t>(0, nNow - nStallStart);
+        printf("SYNCPEER_RECOVERY_STATE time=%lld old_peer=%lld new_peer=%lld stall_timer_preserved=1 old_stall_age=%lld new_stall_age=%lld reset_reason=none\n",
+               (long long)nNow,
+               (long long)(pnodeOldSync == NULL
+                               ? -1 : pnodeOldSync->GetId()),
+               (long long)(pnodeNewSync == NULL
+                               ? -1 : pnodeNewSync->GetId()),
+               (long long)nStallAge, (long long)nStallAge);
     }
     return pnodeOldSync;
 }

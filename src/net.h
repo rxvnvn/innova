@@ -49,6 +49,7 @@ public:
     void ClearRejectedBlock(const uint256& hashBlock);
     bool TakeRejectedBlockForRetry(uint256& hashBlock);
     const uint256& RejectedBlock() const { return hashRejectedBlock; }
+    int LastObservedHeight() const { return nLastObservedHeight; }
     int64_t LastProgressTime() const { return nLastProgressTime; }
     int64_t LastRecoveryTime() const { return nLastRecoveryTime; }
     int64_t RejectedBlockTime() const { return nRejectedBlockTime; }
