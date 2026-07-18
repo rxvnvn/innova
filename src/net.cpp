@@ -953,6 +953,82 @@ void LogGetInfoSyncProbe(const char* pszEvent,
 }
 
 
+RecoveryResponseWindowState::RecoveryResponseWindowState() : active(false), recovery_id(0), send_time_us(0), deadline_us(0), inv_message_count(0), total_inv(0), block_inv(0), unknown_blocks(0), known_active_blocks(0), known_nonactive_indexed_blocks(0), known_orphan_blocks(0), first_block_elapsed_us(-1), first_unknown_elapsed_us(-1) {}
+void RecoveryResponseWindowState::Start(uint64_t id, int64_t send_us) { active=true; recovery_id=id; send_time_us=send_us; deadline_us=send_us+RECOVERY_RESPONSE_WINDOW_US; inv_message_count=total_inv=block_inv=unknown_blocks=known_active_blocks=known_nonactive_indexed_blocks=known_orphan_blocks=0; first_block_hash=first_unknown_block_hash=0; first_block_elapsed_us=first_unknown_elapsed_us=-1; }
+bool RecoveryResponseWindowState::Finish(int64_t now, RecoveryResponseOutcome outcome, RecoveryResponseResult& r) { if(!active) return false; r.outcome=outcome; r.recovery_id=recovery_id; r.send_time_us=send_time_us; r.elapsed_us=now-send_time_us; r.inv_message_count=inv_message_count; r.total_inv=total_inv; r.block_inv=block_inv; r.unknown_blocks=unknown_blocks; r.known_active_blocks=known_active_blocks; r.known_nonactive_indexed_blocks=known_nonactive_indexed_blocks; r.known_orphan_blocks=known_orphan_blocks; r.first_block_hash=first_block_hash; r.first_unknown_block_hash=first_unknown_block_hash; r.first_block_elapsed_us=first_block_elapsed_us; r.first_unknown_elapsed_us=first_unknown_elapsed_us; active=false; return true; }
+bool RecoveryResponseWindowState::ObserveInv(int64_t now,const RecoveryResponseObservation& o,RecoveryResponseResult& r) { if(!active) return false; if(now>=deadline_us) { Expire(now,r); return true; } ++inv_message_count; total_inv+=o.total_inv; block_inv+=o.block_inv; unknown_blocks+=o.unknown_blocks; known_active_blocks+=o.known_active_blocks; known_nonactive_indexed_blocks+=o.known_nonactive_indexed_blocks; known_orphan_blocks+=o.known_orphan_blocks; if(block_inv && first_block_hash==0 && o.first_block_hash!=0){first_block_hash=o.first_block_hash; first_block_elapsed_us=now-send_time_us;} if(unknown_blocks && first_unknown_block_hash==0 && o.first_unknown_block_hash!=0){first_unknown_block_hash=o.first_unknown_block_hash; first_unknown_elapsed_us=now-send_time_us;} return false; }
+bool RecoveryResponseWindowState::Expire(int64_t now,RecoveryResponseResult& r) { if(!active || now<deadline_us) return false; return Finish(now, unknown_blocks ? RECOVERY_OUTCOME_USEFUL : (block_inv ? RECOVERY_OUTCOME_KNOWN_ONLY_TIMEOUT : RECOVERY_OUTCOME_EMPTY_TIMEOUT), r); }
+bool RecoveryResponseWindowState::Supersede(int64_t now,RecoveryResponseResult& r) { return Finish(now, RECOVERY_OUTCOME_SUPERSEDED_BY_NEXT_RECOVERY, r); }
+bool RecoveryResponseWindowState::Disconnect(int64_t now,RecoveryResponseResult& r) { return Finish(now, RECOVERY_OUTCOME_DISCONNECTED, r); }
+
+void CNode::StartRecoveryResponseWindow(uint64_t id, int64_t send_us) { recovery_response_window.Start(id, send_us); }
+bool CNode::ObserveRecoveryResponseInv(int64_t now, const RecoveryResponseObservation& o, RecoveryResponseResult& r) { return recovery_response_window.ObserveInv(now, o, r); }
+bool CNode::ExpireRecoveryResponseWindow(int64_t now, RecoveryResponseResult& r) { return recovery_response_window.Expire(now, r); }
+bool CNode::SupersedeRecoveryResponseWindow(int64_t now, RecoveryResponseResult& r) { return recovery_response_window.Supersede(now, r); }
+bool CNode::DisconnectRecoveryResponseWindow(int64_t now, RecoveryResponseResult& r) { return recovery_response_window.Disconnect(now, r); }
+
+const char* RecoveryResponseOutcomeName(RecoveryResponseOutcome outcome)
+{
+    switch (outcome) {
+    case RECOVERY_OUTCOME_USEFUL: return "useful";
+    case RECOVERY_OUTCOME_KNOWN_ONLY_TIMEOUT: return "known_only_timeout";
+    case RECOVERY_OUTCOME_EMPTY_TIMEOUT: return "empty_timeout";
+    case RECOVERY_OUTCOME_DISCONNECTED: return "disconnected";
+    case RECOVERY_OUTCOME_SUPERSEDED_BY_NEXT_RECOVERY: return "superseded_by_next_recovery";
+    }
+    return "unknown";
+}
+
+std::string FormatRecoveryResponseSummary(int64_t peer_id, const RecoveryResponseResult& r)
+{
+    return strprintf("RECOVERY_SUMMARY recovery_id=%llu peer_id=%lld outcome=%s elapsed_us=%lld total_inv=%llu block_inv=%llu unknown_blocks=%llu known_active_blocks=%llu known_nonactive_indexed_blocks=%llu known_orphan_blocks=%llu inv_message_count=%llu first_block_hash=%s first_unknown_block_hash=%s first_block_elapsed_us=%lld first_unknown_elapsed_us=%lld",
+        (unsigned long long)r.recovery_id, (long long)peer_id, RecoveryResponseOutcomeName(r.outcome),
+        (long long)r.elapsed_us, (unsigned long long)r.total_inv, (unsigned long long)r.block_inv,
+        (unsigned long long)r.unknown_blocks, (unsigned long long)r.known_active_blocks,
+        (unsigned long long)r.known_nonactive_indexed_blocks, (unsigned long long)r.known_orphan_blocks,
+        (unsigned long long)r.inv_message_count, r.first_block_hash.ToString().c_str(),
+        r.first_unknown_block_hash.ToString().c_str(), (long long)r.first_block_elapsed_us,
+        (long long)r.first_unknown_elapsed_us);
+}
+
+static uint64_t nNextRecoveryTraceId = 0;
+
+uint64_t RecoveryTraceTrigger(CNode* pnode, int nLocalHeight, int nPeerHeight,
+                              int64_t nStallAge, unsigned int nAttempt)
+{
+    if (!BlockRequestTraceEnabled()) return 0;
+    const uint64_t id = ++nNextRecoveryTraceId;
+    printf("RECOVERY_TRIGGER recovery_id=%llu time_us=%lld peer_id=%d peer_addr=%s peer_version=%d local_height=%d peer_height=%d stall_age=%lld recovery_attempt=%u\n",
+           (unsigned long long)id, (long long)GetTimeMicros(), pnode->GetId(),
+           pnode->addr.ToString().c_str(), pnode->nVersion, nLocalHeight,
+           nPeerHeight, (long long)nStallAge, nAttempt);
+    return id;
+}
+
+void RecoveryTraceQueue(CNode* pnode, uint64_t id, CBlockIndex* pindexBegin,
+                        uint256 hashStop, size_t before, size_t after)
+{
+    if (!id || !BlockRequestTraceEnabled()) return;
+    printf("RECOVERY_GETBLOCKS_QUEUE recovery_id=%llu peer_id=%d locator_tip=%s locator_height=%d stop_hash=%s queue_before=%zu queue_after=%zu\n",
+           (unsigned long long)id, pnode->GetId(),
+           pindexBegin ? pindexBegin->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(),
+           pindexBegin ? pindexBegin->nHeight : -1, hashStop.ToString().c_str(), before, after);
+}
+
+void RecoveryTraceSend(CNode* pnode, uint64_t id, CBlockIndex* pindexBegin,
+                       uint256 hashStop, size_t before)
+{
+    if (!id || !BlockRequestTraceEnabled()) return;
+    printf("RECOVERY_GETBLOCKS_SEND recovery_id=%llu peer_id=%d locator_tip=%s locator_height=%d stop_hash=%s queue_size_before_clear=%zu\n",
+           (unsigned long long)id, pnode->GetId(),
+           pindexBegin ? pindexBegin->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(),
+           pindexBegin ? pindexBegin->nHeight : -1, hashStop.ToString().c_str(), before);
+    RecoveryResponseResult previous;
+    if (pnode->SupersedeRecoveryResponseWindow(GetTimeMicros(), previous))
+        printf("%s\n", FormatRecoveryResponseSummary(pnode->GetId(), previous).c_str());
+    pnode->StartRecoveryResponseWindow(id, GetTimeMicros());
+}
+
 CNode* MaybeQueueStalledSyncRecovery(
     const std::vector<CNode*>& vNodesIn, CBlockIndex* pindexTip,
     int nLocalHeight, int64_t nNow, int64_t nStallTimeout,
@@ -1105,6 +1181,9 @@ CNode* MaybeQueueStalledSyncRecovery(
     const size_t nOwnerIndex =
         (state.RecoveryAttempts() - 1) % vCandidates.size();
     CNode* pnodeRecovery = vCandidates[nOwnerIndex].second;
+    pnodeRecovery->nRecoveryTracePendingId = RecoveryTraceTrigger(
+        pnodeRecovery, nLocalHeight, (int)nMaxPeerHeight, nStallAgeBefore,
+        state.RecoveryAttempts());
     pnodeRecovery->PushGetBlocks(pindexTip, uint256(0));
 
     uint256 hashRejected;
@@ -2645,8 +2724,14 @@ void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
     hashLastGetBlocksEnd = hashEnd;
     nLastGetBlocksTime = nNow;
 
+    const size_t nQueueBefore = getBlocksIndex.size();
     getBlocksIndex.push_back(pindexBegin);
     getBlocksHash.push_back(hashEnd);
+    const uint64_t nRecoveryId = nRecoveryTracePendingId;
+    nRecoveryTracePendingId = 0;
+    getBlocksRecoveryIds.push_back(nRecoveryId);
+    RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
+                       nQueueBefore, getBlocksIndex.size());
 
     if (BlockRequestTraceEnabled())
     {

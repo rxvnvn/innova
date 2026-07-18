@@ -1194,4 +1194,129 @@ BOOST_AUTO_TEST_CASE(getblocks_server_state_is_fixed_and_per_peer)
     BOOST_CHECK_EQUAL(parallelConnection.nResponsesSuppressed, 0U);
 }
 
+
+BOOST_AUTO_TEST_CASE(recovery_response_window_orphan_then_unknown)
+{
+    RecoveryResponseWindowState state;
+    RecoveryResponseResult result;
+    state.Start(1, TEST_TIME);
+    RecoveryResponseObservation orphan;
+    orphan.total_inv = orphan.block_inv = orphan.known_orphan_blocks = 2;
+    orphan.first_block_hash = uint256(1);
+    BOOST_CHECK(!state.ObserveInv(TEST_TIME + 1, orphan, result));
+    RecoveryResponseObservation unknown;
+    unknown.total_inv = unknown.block_inv = unknown.unknown_blocks = 3;
+    unknown.first_block_hash = uint256(2);
+    unknown.first_unknown_block_hash = uint256(3);
+    BOOST_CHECK(!state.ObserveInv(TEST_TIME + 2, unknown, result));
+    BOOST_CHECK(state.Expire(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US, result));
+    BOOST_CHECK_EQUAL(result.outcome, RECOVERY_OUTCOME_USEFUL);
+    BOOST_CHECK_EQUAL(result.inv_message_count, 2U);
+    BOOST_CHECK_EQUAL(result.total_inv, 5U);
+    BOOST_CHECK_EQUAL(result.block_inv, 5U);
+    BOOST_CHECK_EQUAL(result.unknown_blocks + result.known_orphan_blocks, result.block_inv);
+    BOOST_CHECK(result.first_block_hash == uint256(1));
+    BOOST_CHECK(result.first_unknown_block_hash == uint256(3));
+}
+
+BOOST_AUTO_TEST_CASE(recovery_response_window_timeout_and_late_observation)
+{
+    RecoveryResponseWindowState state;
+    RecoveryResponseResult result;
+    state.Start(2, TEST_TIME);
+    RecoveryResponseObservation known;
+    known.total_inv = known.block_inv = 4;
+    known.known_active_blocks = 1;
+    known.known_nonactive_indexed_blocks = 1;
+    known.known_orphan_blocks = 2;
+    BOOST_CHECK(!state.ObserveInv(TEST_TIME + 1, known, result));
+    BOOST_CHECK(!state.Expire(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US - 1, result));
+    BOOST_CHECK(state.Expire(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US, result));
+    BOOST_CHECK_EQUAL(result.outcome, RECOVERY_OUTCOME_KNOWN_ONLY_TIMEOUT);
+    BOOST_CHECK(!state.ObserveInv(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US + 1, known, result));
+    BOOST_CHECK(!state.Expire(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US + 2, result));
+    BOOST_CHECK(!state.Disconnect(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US + 3, result));
+
+    state.Start(3, TEST_TIME);
+    RecoveryResponseObservation tx;
+    tx.total_inv = 4;
+    BOOST_CHECK(!state.ObserveInv(TEST_TIME + 1, tx, result));
+    BOOST_CHECK(state.Expire(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US, result));
+    BOOST_CHECK_EQUAL(result.outcome, RECOVERY_OUTCOME_EMPTY_TIMEOUT);
+    BOOST_CHECK_EQUAL(result.inv_message_count, 1U);
+    BOOST_CHECK_EQUAL(result.total_inv, 4U);
+    BOOST_CHECK_EQUAL(result.block_inv, 0U);
+}
+
+BOOST_AUTO_TEST_CASE(recovery_response_window_supersede_disconnect_and_reset)
+{
+    RecoveryResponseWindowState state;
+    RecoveryResponseResult result;
+    state.Start(10, TEST_TIME);
+    RecoveryResponseObservation mixed;
+    mixed.total_inv = 5; mixed.block_inv = 4; mixed.unknown_blocks = 1;
+    mixed.known_active_blocks = 1; mixed.known_nonactive_indexed_blocks = 1;
+    mixed.known_orphan_blocks = 1;
+    BOOST_CHECK(!state.ObserveInv(TEST_TIME + 1, mixed, result));
+    BOOST_CHECK(state.Supersede(TEST_TIME + 2, result));
+    BOOST_CHECK_EQUAL(result.outcome, RECOVERY_OUTCOME_SUPERSEDED_BY_NEXT_RECOVERY);
+    BOOST_CHECK(!state.Supersede(TEST_TIME + 3, result));
+    state.Start(11, TEST_TIME + 10);
+    BOOST_CHECK(state.IsActive());
+    BOOST_CHECK_EQUAL(state.Disconnect(TEST_TIME + 11, result), true);
+    BOOST_CHECK_EQUAL(result.outcome, RECOVERY_OUTCOME_DISCONNECTED);
+    BOOST_CHECK(!state.Disconnect(TEST_TIME + 12, result));
+    BOOST_CHECK(!state.Expire(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US + 20, result));
+}
+
+
+
+BOOST_AUTO_TEST_CASE(recovery_response_window_deadline_disconnect_and_formatter)
+{
+    RecoveryResponseWindowState state;
+    RecoveryResponseResult result;
+    RecoveryResponseObservation block;
+    block.total_inv = block.block_inv = block.unknown_blocks = 1;
+    block.first_block_hash = uint256(7);
+    block.first_unknown_block_hash = uint256(7);
+
+    state.Start(20, TEST_TIME);
+    BOOST_CHECK(state.ObserveInv(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US,
+                                block, result));
+    BOOST_CHECK(!state.IsActive());
+    BOOST_CHECK_EQUAL(result.recovery_id, 20U);
+    BOOST_CHECK_EQUAL(result.block_inv, 0U);
+    BOOST_CHECK_EQUAL(result.outcome, RECOVERY_OUTCOME_EMPTY_TIMEOUT);
+    BOOST_CHECK(!state.ObserveInv(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US + 1,
+                                  block, result));
+    BOOST_CHECK(!state.Expire(TEST_TIME + RECOVERY_RESPONSE_WINDOW_US + 2,
+                              result));
+
+    state.Start(21, TEST_TIME + 10);
+    BOOST_CHECK(!state.ObserveInv(TEST_TIME + 11, block, result));
+    BOOST_CHECK(state.Disconnect(TEST_TIME + 12, result));
+    BOOST_CHECK_EQUAL(result.outcome, RECOVERY_OUTCOME_DISCONNECTED);
+    BOOST_CHECK_EQUAL(result.block_inv, 1U);
+    BOOST_CHECK_EQUAL(result.unknown_blocks, 1U);
+    BOOST_CHECK(!state.Disconnect(TEST_TIME + 13, result));
+
+    const std::string summary = FormatRecoveryResponseSummary(42, result);
+    BOOST_CHECK(summary.find("peer_id=42") != std::string::npos);
+    BOOST_CHECK(summary.find("outcome=disconnected") != std::string::npos);
+    BOOST_CHECK(summary.find("recovery_id=21") != std::string::npos);
+
+    const RecoveryResponseOutcome outcomes[] = {
+        RECOVERY_OUTCOME_USEFUL,
+        RECOVERY_OUTCOME_KNOWN_ONLY_TIMEOUT,
+        RECOVERY_OUTCOME_EMPTY_TIMEOUT,
+        RECOVERY_OUTCOME_DISCONNECTED,
+        RECOVERY_OUTCOME_SUPERSEDED_BY_NEXT_RECOVERY
+    };
+    const char* names[] = {"useful", "known_only_timeout", "empty_timeout",
+                           "disconnected", "superseded_by_next_recovery"};
+    for (unsigned int i = 0; i < sizeof(outcomes) / sizeof(outcomes[0]); ++i)
+        BOOST_CHECK_EQUAL(std::string(RecoveryResponseOutcomeName(outcomes[i])),
+                          names[i]);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

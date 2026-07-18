@@ -7843,6 +7843,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         LOCK(cs_main);
         CTxDB txdb("r");
+        RecoveryResponseObservation recoveryObservation;
+        const bool fObserveRecovery =
+            pfrom->HasActiveRecoveryResponseWindow();
+        if (fObserveRecovery)
+            recoveryObservation.total_inv = vInv.size();
 
         for (unsigned int nInv = 0; nInv < vInv.size(); nInv++)
         {
@@ -7855,6 +7860,29 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             pfrom->AddInventoryKnown(inv);
 
             bool fAlreadyHave = AlreadyHave(txdb, inv);
+            if (fObserveRecovery && inv.type == MSG_BLOCK)
+            {
+                ++recoveryObservation.block_inv;
+                if (recoveryObservation.first_block_hash == uint256(0))
+                    recoveryObservation.first_block_hash = inv.hash;
+                std::map<uint256, CBlockIndex*>::iterator miRecovery =
+                    mapBlockIndex.find(inv.hash);
+                if (!fAlreadyHave)
+                {
+                    ++recoveryObservation.unknown_blocks;
+                    if (recoveryObservation.first_unknown_block_hash == uint256(0))
+                        recoveryObservation.first_unknown_block_hash = inv.hash;
+                }
+                else if (mapOrphanBlocks.count(inv.hash))
+                    ++recoveryObservation.known_orphan_blocks;
+                else if (miRecovery != mapBlockIndex.end() &&
+                         miRecovery->second->IsInMainChain())
+                    ++recoveryObservation.known_active_blocks;
+                else if (miRecovery != mapBlockIndex.end())
+                    ++recoveryObservation.known_nonactive_indexed_blocks;
+                else
+                    ++recoveryObservation.unknown_blocks;
+            }
             if (inv.type == MSG_BLOCK)
             {
                 std::map<uint256, CBlockIndex*>::iterator miKnown = mapBlockIndex.find(inv.hash);
@@ -7901,6 +7929,18 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             // Track requests for our stuff
             g_signals.Inventory(inv.hash);
         }
+
+        if (fObserveRecovery)
+        {
+            RecoveryResponseResult completed;
+            if (pfrom->ObserveRecoveryResponseInv(
+                    GetTimeMicros(), recoveryObservation, completed))
+            {
+                printf("%s\n", FormatRecoveryResponseSummary(
+                    pfrom->GetId(), completed).c_str());
+            }
+        }
+
     }
 
 
@@ -9248,6 +9288,10 @@ bool ProcessMessages(CNode* pfrom)
 
 bool SendMessages(CNode* pto, bool fSendTrickle)
 {
+    RecoveryResponseResult recoveryResult;
+    if (pto->ExpireRecoveryResponseWindow(GetTimeMicros(), recoveryResult))
+        printf("%s\n", FormatRecoveryResponseSummary(
+            pto->GetId(), recoveryResult).c_str());
     if (pto->nVersion == 0)
         return true;
 
@@ -9293,10 +9337,15 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         for (int i = 0; i < n; i++)
         {
             if (fDebugNet) printf("Pushing getblocks %s to %s\n\n",pto->getBlocksIndex[i]->ToString().c_str(),pto->getBlocksHash[i].ToString().c_str());
+            const uint64_t nRecoveryId = i < (int)pto->getBlocksRecoveryIds.size()
+                ? pto->getBlocksRecoveryIds[i] : 0;
+            RecoveryTraceSend(pto, nRecoveryId, pto->getBlocksIndex[i],
+                              pto->getBlocksHash[i], n);
             pto->PushMessage("getblocks", CBlockLocator(pto->getBlocksIndex[i]), pto->getBlocksHash[i]);
         }
         pto->getBlocksIndex.clear();
         pto->getBlocksHash.clear();
+        pto->getBlocksRecoveryIds.clear();
     }
 
     {

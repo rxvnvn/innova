@@ -222,6 +222,74 @@ CNode* MaybeQueueStalledSyncRecovery(const std::vector<CNode*>& vNodes,
 void RecordRejectedBlockForSync(const uint256& hashBlock);
 void ClearRejectedBlockForSync(const uint256& hashBlock);
 bool SyncTraceEnabled();
+static const int64_t RECOVERY_RESPONSE_WINDOW_US = 2000000;
+
+enum RecoveryResponseOutcome
+{
+    RECOVERY_OUTCOME_USEFUL,
+    RECOVERY_OUTCOME_KNOWN_ONLY_TIMEOUT,
+    RECOVERY_OUTCOME_EMPTY_TIMEOUT,
+    RECOVERY_OUTCOME_DISCONNECTED,
+    RECOVERY_OUTCOME_SUPERSEDED_BY_NEXT_RECOVERY
+};
+
+struct RecoveryResponseObservation
+{
+    uint64_t total_inv;
+    uint64_t block_inv;
+    uint64_t unknown_blocks;
+    uint64_t known_active_blocks;
+    uint64_t known_nonactive_indexed_blocks;
+    uint64_t known_orphan_blocks;
+    uint256 first_block_hash;
+    uint256 first_unknown_block_hash;
+    RecoveryResponseObservation() : total_inv(0), block_inv(0), unknown_blocks(0), known_active_blocks(0), known_nonactive_indexed_blocks(0), known_orphan_blocks(0) {}
+};
+
+struct RecoveryResponseResult
+{
+    RecoveryResponseOutcome outcome;
+    uint64_t recovery_id;
+    int64_t send_time_us;
+    int64_t elapsed_us;
+    uint64_t inv_message_count;
+    uint64_t total_inv;
+    uint64_t block_inv;
+    uint64_t unknown_blocks;
+    uint64_t known_active_blocks;
+    uint64_t known_nonactive_indexed_blocks;
+    uint64_t known_orphan_blocks;
+    uint256 first_block_hash;
+    uint256 first_unknown_block_hash;
+    int64_t first_block_elapsed_us;
+    int64_t first_unknown_elapsed_us;
+};
+
+class RecoveryResponseWindowState
+{
+    bool active;
+    uint64_t recovery_id;
+    int64_t send_time_us;
+    int64_t deadline_us;
+    uint64_t inv_message_count, total_inv, block_inv, unknown_blocks;
+    uint64_t known_active_blocks, known_nonactive_indexed_blocks, known_orphan_blocks;
+    uint256 first_block_hash, first_unknown_block_hash;
+    int64_t first_block_elapsed_us, first_unknown_elapsed_us;
+    bool Finish(int64_t now_us, RecoveryResponseOutcome outcome, RecoveryResponseResult& result);
+public:
+    RecoveryResponseWindowState();
+    void Start(uint64_t id, int64_t send_us);
+    bool ObserveInv(int64_t now_us, const RecoveryResponseObservation& observation, RecoveryResponseResult& completed);
+    bool Expire(int64_t now_us, RecoveryResponseResult& completed);
+    bool Supersede(int64_t now_us, RecoveryResponseResult& completed);
+    bool Disconnect(int64_t now_us, RecoveryResponseResult& completed);
+    bool IsActive() const { return active; }
+};
+uint64_t RecoveryTraceTrigger(CNode* pnode, int nLocalHeight, int nPeerHeight, int64_t nStallAge, unsigned int nAttempt);
+void RecoveryTraceQueue(CNode* pnode, uint64_t nRecoveryId, CBlockIndex* pindexBegin, uint256 hashStop, size_t nQueueBefore, size_t nQueueAfter);
+void RecoveryTraceSend(CNode* pnode, uint64_t nRecoveryId, CBlockIndex* pindexBegin, uint256 hashStop, size_t nQueueBeforeClear);
+const char* RecoveryResponseOutcomeName(RecoveryResponseOutcome outcome);
+std::string FormatRecoveryResponseSummary(int64_t peer_id, const RecoveryResponseResult& result);
 void LogGetInfoSyncProbe(const char* pszEvent, int64_t nRequestStartTime = 0,
                          int64_t nLockWaitMicros = -1);
 
@@ -630,8 +698,11 @@ public:
     uint256 hashContinue;
     CGetBlocksServerState getBlocksServer;
     CBlockIndex* pindexLastGetBlocksBegin;
+    RecoveryResponseWindowState recovery_response_window;
     std::vector<CBlockIndex*> getBlocksIndex;
     std::vector<uint256> getBlocksHash;
+    std::vector<uint64_t> getBlocksRecoveryIds;
+    uint64_t nRecoveryTracePendingId;
     uint256 hashLastGetBlocksEnd;
     int64_t nLastGetBlocksTime;
     int64_t nLastGetDataTime;
@@ -714,6 +785,7 @@ public:
         nSendOffset = 0;
         hashContinue = 0;
         pindexLastGetBlocksBegin = 0;
+        nRecoveryTracePendingId = 0;
         hashLastGetBlocksEnd = 0;
         nLastGetBlocksTime = 0;
         nLastGetDataTime = 0;
@@ -751,6 +823,10 @@ public:
     {
         if (BlockRequestTraceEnabled())
             BlockRequestTracePeerClosed(this);
+        RecoveryResponseResult recoveryResult;
+        if (DisconnectRecoveryResponseWindow(GetTimeMicros(), recoveryResult))
+            printf("%s\n", FormatRecoveryResponseSummary(
+                GetId(), recoveryResult).c_str());
         if (hSocket != INVALID_SOCKET)
         {
             closesocket(hSocket);
@@ -1174,6 +1250,12 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     }
 
     void PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd);
+    void StartRecoveryResponseWindow(uint64_t id, int64_t send_us);
+    bool ObserveRecoveryResponseInv(int64_t now_us, const RecoveryResponseObservation& observation, RecoveryResponseResult& result);
+    bool ExpireRecoveryResponseWindow(int64_t now_us, RecoveryResponseResult& result);
+    bool SupersedeRecoveryResponseWindow(int64_t now_us, RecoveryResponseResult& result);
+    bool DisconnectRecoveryResponseWindow(int64_t now_us, RecoveryResponseResult& result);
+    bool HasActiveRecoveryResponseWindow() const { return recovery_response_window.IsActive(); }
     void PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason = std::string());
 
     bool CanAdvanceBlockSync(int nLocalHeight) const
