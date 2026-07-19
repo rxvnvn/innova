@@ -786,7 +786,8 @@ CStalledSyncRecoveryState::CStalledSyncRecoveryState()
       hashRejectedBlock(),
       nRejectedBlockTime(0),
       fRejectedRetryScheduled(false),
-      nRecoveryAttempts(0)
+      nRecoveryAttempts(0),
+      fSyncRequestSent(false)
 {
 }
 
@@ -794,6 +795,9 @@ bool CStalledSyncRecoveryState::ShouldRecover(
     int nLocalHeight, int nPeerHeight, bool fPipelineActive,
     int64_t nNow, int64_t nStallTimeout, int64_t nCooldown)
 {
+    if (!fSyncRequestSent)
+        return false;
+
     if (nLastObservedHeight != nLocalHeight ||
         (nLastProgressTime != 0 && nNow < nLastProgressTime))
     {
@@ -826,6 +830,22 @@ bool CStalledSyncRecoveryState::ShouldRecover(
     nLastRecoveryTime = nNow;
     ++nRecoveryAttempts;
     return true;
+}
+
+void RecordSyncRequestSent(int64_t nNow)
+{
+    LOCK(cs_stalledSyncRecovery);
+    stalledSyncRecoveryState.MarkSyncRequestSent(nNow);
+}
+
+void CStalledSyncRecoveryState::MarkSyncRequestSent(int64_t nNow)
+{
+    fSyncRequestSent = true;
+    if (nLastProgressTime == 0)
+    {
+        nLastProgressTime = nNow;
+        nLastObservedHeight = nBestHeight;
+    }
 }
 
 void CStalledSyncRecoveryState::RecordRejectedBlock(
@@ -2825,6 +2845,16 @@ unsigned short GetListenPort()
     return (unsigned short)(GetArg("-port", GetDefaultPort()));
 }
 
+
+void CNode::QueueInitialSyncRequest(CBlockIndex* pindexTip)
+{
+    if (fInitialSyncRequestPending || fInitialSyncRequestSent)
+        return;
+    const size_t nQueueBefore = getBlocksIndex.size();
+    PushGetBlocks(pindexTip, uint256(0));
+    if (getBlocksIndex.size() > nQueueBefore)
+        fInitialSyncRequestPending = true;
+}
 
 void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
 {
@@ -5271,6 +5301,12 @@ static CNode* AssignSyncPeer(const vector<CNode*>& vNodesIn,
     return pnodeOldSync;
 }
 
+void ResetSyncPeerForTesting()
+{
+    LOCK(cs_pnodeSync);
+    pnodeSync = NULL;
+}
+
 void static StartSync(const vector<CNode*> &vNodesIn)
 {
     CNode* pnodeNewSync = NULL;
@@ -5362,6 +5398,11 @@ void static StartSync(const vector<CNode*> &vNodesIn)
         }
         printf("%s\n", oss.str().c_str());
     }
+}
+
+void StartSyncForTesting(const vector<CNode*>& vNodesIn)
+{
+    StartSync(vNodesIn);
 }
 
 void ThreadMessageHandler(void* parg)

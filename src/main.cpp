@@ -9342,7 +9342,13 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
     if (pto->fStartSync && !fImporting && !fReindex) {
         pto->fStartSync = false;
         if (!fSPVMode && pto->CanAdvanceBlockSync(nBestHeight))
+        {
+            const size_t nQueueBefore = pto->getBlocksIndex.size();
             pto->PushGetBlocks(pindexBest, uint256(0));
+            if (!pto->fInitialSyncRequestSent &&
+                pto->getBlocksIndex.size() > nQueueBefore)
+                pto->fInitialSyncRequestPending = true;
+        }
     }
 
     {
@@ -9355,6 +9361,12 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             RecoveryTraceSend(pto, nRecoveryId, pto->getBlocksIndex[i],
                               pto->getBlocksHash[i], n);
             pto->PushMessage("getblocks", CBlockLocator(pto->getBlocksIndex[i]), pto->getBlocksHash[i]);
+            if (nRecoveryId == 0 && pto->fInitialSyncRequestPending)
+            {
+                pto->fInitialSyncRequestPending = false;
+                pto->fInitialSyncRequestSent = true;
+                RecordSyncRequestSent(GetTime());
+            }
         }
         pto->getBlocksIndex.clear();
         pto->getBlocksHash.clear();

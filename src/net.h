@@ -27,6 +27,9 @@ class CNode;
 class CBlockIndex;
 class CBlockLocator;
 extern int nBestHeight;
+void RecordSyncRequestSent(int64_t nNow);
+void StartSyncForTesting(const std::vector<CNode*>& vNodesIn);
+void ResetSyncPeerForTesting();
 
 class CStalledSyncRecoveryState
 {
@@ -38,6 +41,7 @@ private:
     int64_t nRejectedBlockTime;
     bool fRejectedRetryScheduled;
     unsigned int nRecoveryAttempts;
+    bool fSyncRequestSent;
 
 public:
     CStalledSyncRecoveryState();
@@ -54,6 +58,8 @@ public:
     int64_t LastRecoveryTime() const { return nLastRecoveryTime; }
     int64_t RejectedBlockTime() const { return nRejectedBlockTime; }
     unsigned int RecoveryAttempts() const { return nRecoveryAttempts; }
+    void MarkSyncRequestSent(int64_t nNow);
+    bool SyncRequestSent() const { return fSyncRequestSent; }
 };
 
 enum GetBlocksServerAction
@@ -718,6 +724,8 @@ public:
     uint256 hashBestKnownBlock;
     int64_t nLastHeightUpdate;
 	bool fStartSync;
+    bool fInitialSyncRequestPending;
+    bool fInitialSyncRequestSent;
     int64_t nLastBlockRecv;
 
     int nBlocksReceivedInBatch;
@@ -1270,6 +1278,8 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     bool DisconnectRecoveryResponseWindow(int64_t now_us, RecoveryResponseResult& result);
     bool HasActiveRecoveryResponseWindow() const { return recovery_response_window.IsActive(); }
     void PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason = std::string());
+
+    void QueueInitialSyncRequest(CBlockIndex* pindexTip);
 
     bool CanAdvanceBlockSync(int nLocalHeight) const
     {
