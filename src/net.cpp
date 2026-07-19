@@ -1649,26 +1649,87 @@ map<CInv, int64_t> mapAlreadyAskedFor;
 // mutex for mapAlreadyAskedFor
 CCriticalSection cs_mapAlreadyAskedFor;
 
+bool IsBlockRequestOwnedByAnyPeer(const uint256& hash, const CNode* extra_peer)
+{
+    LOCK(cs_vNodes);
+    for (std::vector<CNode*>::const_iterator it = vNodes.begin();
+         it != vNodes.end(); ++it)
+    {
+        const CNode* pnode = *it;
+        if (pnode != NULL &&
+            (pnode->setBlocksInFlight.count(hash) != 0 ||
+             std::find_if(pnode->mapAskFor.begin(), pnode->mapAskFor.end(),
+                          [&hash](const std::pair<const int64_t, CInv>& item) {
+                              return item.second.hash == hash &&
+                                     (item.second.type == MSG_BLOCK ||
+                                      item.second.type == MSG_FILTERED_BLOCK);
+                          }) != pnode->mapAskFor.end()))
+            return true;
+    }
+    if (extra_peer != NULL &&
+        (extra_peer->setBlocksInFlight.count(hash) != 0 ||
+         std::find_if(extra_peer->mapAskFor.begin(), extra_peer->mapAskFor.end(),
+                      [&hash](const std::pair<const int64_t, CInv>& item) {
+                          return item.second.hash == hash &&
+                                 (item.second.type == MSG_BLOCK ||
+                                  item.second.type == MSG_FILTERED_BLOCK);
+                      }) != extra_peer->mapAskFor.end()))
+        return true;
+    return false;
+}
+
+bool EraseAlreadyAskedForIfUnowned(const CInv& inv, const CNode* extra_peer)
+{
+    if (inv.type != MSG_BLOCK && inv.type != MSG_FILTERED_BLOCK)
+        return false;
+    if (IsBlockRequestOwnedByAnyPeer(inv.hash, extra_peer))
+        return false;
+    LOCK(cs_mapAlreadyAskedFor);
+    return mapAlreadyAskedFor.erase(inv) != 0;
+}
+
 size_t PruneAlreadyAskedFor(int64_t nNowMicros)
 {
     static int64_t nLastPruneMicros = 0;
     size_t nRemoved = 0;
-    LOCK(cs_mapAlreadyAskedFor);
-    if (nLastPruneMicros != 0 && nNowMicros >= nLastPruneMicros &&
-        nNowMicros - nLastPruneMicros < 1000000)
-        return 0;
-    nLastPruneMicros = nNowMicros;
-    for (std::map<CInv, int64_t>::iterator it = mapAlreadyAskedFor.begin();
-         it != mapAlreadyAskedFor.end();)
+    std::vector<CInv> dueOrphanedBlocks;
     {
-        if (it->second == 0 ||
-            nNowMicros - it->second > ALREADY_ASKED_FOR_RETENTION_US)
+        LOCK(cs_mapAlreadyAskedFor);
+        if (nLastPruneMicros != 0 && nNowMicros >= nLastPruneMicros &&
+            nNowMicros - nLastPruneMicros < 1000000)
+            return 0;
+        nLastPruneMicros = nNowMicros;
+        for (std::map<CInv, int64_t>::const_iterator it =
+                 mapAlreadyAskedFor.begin();
+             it != mapAlreadyAskedFor.end(); ++it)
         {
-            it = mapAlreadyAskedFor.erase(it);
-            ++nRemoved;
+            const bool fBlock = (it->first.type == MSG_BLOCK ||
+                                 it->first.type == MSG_FILTERED_BLOCK);
+            if (it->second == 0)
+                dueOrphanedBlocks.push_back(it->first);
+            else if (fBlock && it->second <= nNowMicros)
+                dueOrphanedBlocks.push_back(it->first);
+            else if (nNowMicros - it->second >
+                     ALREADY_ASKED_FOR_RETENTION_US)
+                dueOrphanedBlocks.push_back(it->first);
         }
-        else
-            ++it;
+    }
+
+    std::vector<CInv> unownedBlocks;
+    for (std::vector<CInv>::const_iterator it = dueOrphanedBlocks.begin();
+         it != dueOrphanedBlocks.end(); ++it)
+    {
+        const bool fBlock = (it->type == MSG_BLOCK ||
+                             it->type == MSG_FILTERED_BLOCK);
+        if (!fBlock || !IsBlockRequestOwnedByAnyPeer(it->hash))
+            unownedBlocks.push_back(*it);
+    }
+
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        for (std::vector<CInv>::const_iterator it = unownedBlocks.begin();
+             it != unownedBlocks.end(); ++it)
+            nRemoved += mapAlreadyAskedFor.erase(*it);
     }
     if (nRemoved != 0 && BlockRequestTraceEnabled())
         printf("BLOCKREQTRACE time_us=%lld event=ALREADY_ASKED_PRUNE removed=%zu remaining=%zu retention_us=%lld\n",

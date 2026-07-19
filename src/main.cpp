@@ -8629,14 +8629,19 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // already-known or orphaned.
         if (fAccepted || fKnownBefore || fOrphanBefore)
         {
-            LOCK(cs_mapAlreadyAskedFor);
-            mapAlreadyAskedFor.erase(inv);
+            EraseAlreadyAskedForIfUnowned(inv, pfrom);
         }
         else if (!fKnownBefore && !fOrphanBefore && block.nDoS == 0 &&
                  mapBlockIndex.count(hashBlock) == 0 &&
                  mapOrphanBlocks.count(hashBlock) == 0)
         {
             RecordRejectedBlockForSync(hashBlock);
+            LOCK(cs_mapAlreadyAskedFor);
+            std::map<CInv, int64_t>::iterator miRejected =
+                mapAlreadyAskedFor.find(inv);
+            if (miRejected != mapAlreadyAskedFor.end())
+                miRejected->second = GetTimeMicros() +
+                    ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US;
         }
 
         if (block.nDoS)
@@ -9588,6 +9593,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                             "same-peer-inflight", -1);
                     }
                     pto->mapAskFor.erase(pto->mapAskFor.begin());
+                    EraseAlreadyAskedForIfUnowned(inv, pto);
                     continue;
                 }
                 if (pto->setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
@@ -9661,6 +9667,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     pto, inv.hash, "already-have",
                     nKnownInBlockIndex);
             }
+            if (fSkip)
+                EraseAlreadyAskedForIfUnowned(inv, pto);
             pto->mapAskFor.erase(pto->mapAskFor.begin());
         }
         if (!vGetData.empty())

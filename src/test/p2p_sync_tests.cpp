@@ -1368,6 +1368,107 @@ BOOST_AUTO_TEST_CASE(already_asked_for_stale_entries_are_pruned_and_refill)
     }
 }
 
+BOOST_AUTO_TEST_CASE(already_asked_for_negative_cooldown_lifecycle)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const CInv rejected(MSG_BLOCK, uint256(600000));
+    const int64_t nStart = GetTimeMicros() + 10000000;
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        mapAlreadyAskedFor[rejected] =
+            nStart + ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US;
+    }
+
+    BOOST_CHECK_EQUAL(PruneAlreadyAskedFor(nStart + 1000000), 0U);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(34), "negative-cooldown", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 1);
+    peer.AskFor(rejected, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(!peer.mapAskFor.empty());
+    BOOST_CHECK(peer.mapAskFor.begin()->first > GetTimeMicros() * 1000000);
+    peer.mapAskFor.clear();
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        mapAlreadyAskedFor[rejected] =
+            nStart + ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US;
+    }
+
+    BOOST_CHECK_EQUAL(PruneAlreadyAskedFor(
+                          nStart + ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US + 1), 1U);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(rejected), 0U);
+    }
+    peer.mapAskFor.clear();
+    peer.AskFor(rejected, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(!peer.mapAskFor.empty());
+}
+
+BOOST_AUTO_TEST_CASE(already_asked_for_future_scheduled_entry_is_not_pruned)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const CInv scheduled(MSG_BLOCK, uint256(600001));
+    const int64_t nScheduled = GetTimeMicros() + 10000000;
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        mapAlreadyAskedFor[scheduled] = nScheduled;
+    }
+
+    BOOST_CHECK_EQUAL(PruneAlreadyAskedFor(nScheduled - 1000000), 0U);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(scheduled), 1U);
+    }
+    BOOST_CHECK_EQUAL(PruneAlreadyAskedFor(nScheduled + 1), 1U);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(scheduled), 0U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(already_asked_for_lifecycle_is_cross_peer_safe)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode owner(INVALID_SOCKET, TestPeerAddress(32), "ownership-owner", true);
+    CNode other(INVALID_SOCKET, TestPeerAddress(33), "ownership-other", true);
+    PreparePeerForRecovery(owner, PROTOCOL_VERSION, nBestHeight + 1);
+    PreparePeerForRecovery(other, PROTOCOL_VERSION, nBestHeight + 1);
+
+    const CInv inv(MSG_BLOCK, uint256(400000));
+    owner.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&owner);
+    }
+    BOOST_CHECK(!EraseAlreadyAskedForIfUnowned(inv, &other));
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(inv), 1U);
+    }
+    owner.mapAskFor.clear();
+    BOOST_CHECK(EraseAlreadyAskedForIfUnowned(inv, &other));
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(inv), 0U);
+    }
+    {
+        LOCK(cs_vNodes);
+        vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), &owner),
+                      vNodes.end());
+    }
+
+    for (unsigned int i = 0; i < MAX_ALREADY_ASKED_FOR_SIZE + 100; ++i)
+    {
+        const CInv sequential(MSG_BLOCK, uint256(500000 + i));
+        {
+            LOCK(cs_mapAlreadyAskedFor);
+            mapAlreadyAskedFor[sequential] = GetTimeMicros();
+        }
+        BOOST_CHECK(EraseAlreadyAskedForIfUnowned(sequential));
+    }
+    LOCK(cs_mapAlreadyAskedFor);
+    BOOST_CHECK(mapAlreadyAskedFor.size() < MAX_ALREADY_ASKED_FOR_SIZE);
+}
+
 BOOST_AUTO_TEST_CASE(already_asked_for_recent_bound_remains_anti_spam)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;

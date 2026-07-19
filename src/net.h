@@ -398,7 +398,11 @@ extern CCriticalSection cs_mapRelay;
 extern std::map<CInv, int64_t> mapAlreadyAskedFor;
 extern CCriticalSection cs_mapAlreadyAskedFor;
 static const size_t MAX_ALREADY_ASKED_FOR_SIZE = 50000;
+
+bool IsBlockRequestOwnedByAnyPeer(const uint256& hash, const CNode* extra_peer = NULL);
+bool EraseAlreadyAskedForIfUnowned(const CInv& inv, const CNode* extra_peer = NULL);
 static const int64_t ALREADY_ASKED_FOR_RETENTION_US = 60LL * 60 * 1000000;
+static const int64_t ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US = 5LL * 1000000;
 size_t PruneAlreadyAskedFor(int64_t nNowMicros);
 
 extern NodeId nLastNodeId;
@@ -1300,8 +1304,11 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
             {
                 if (BlockRequestTraceEnabled())
                     BlockRequestTraceInFlightExpire(this, it->first, nNow - it->second);
+                const uint256 hashExpired = it->first;
                 setBlocksInFlight.erase(it->first);
                 it = mapBlockInFlightSince.erase(it);
+                EraseAlreadyAskedForIfUnowned(
+                    CInv(MSG_BLOCK, hashExpired), this);
             }
             else
             {
