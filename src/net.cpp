@@ -877,15 +877,16 @@ void ClearRejectedBlockForSync(const uint256& hashBlock)
 
 bool SyncTraceEnabled()
 {
-    return BlockRequestTraceEnabled() ||
-           GetBoolArg("-getinfosyncprobe", false) ||
-           GetBoolArg("-synclockdiagnostics", false);
+    // Detailed sync lifecycle events require the explicit block-request trace.
+    // Probe and lock diagnostics must not enable this stream.
+    return BlockRequestTraceEnabled();
 }
 CSyncLockDiagnostics::CSyncLockDiagnostics(
     const char* pszLocationIn, const char* pszLocksIn)
     : pszLocation(pszLocationIn),
       pszLocks(pszLocksIn),
-      nWaitStartTime(GetTimeMicros()),
+      nWaitStartTime(GetBoolArg("-synclockdiagnostics", false)
+                         ? GetTimeMicros() : 0),
       nAcquiredTime(0),
       fEnabled(GetBoolArg("-synclockdiagnostics", false))
 {
@@ -1127,7 +1128,7 @@ CNode* MaybeQueueStalledSyncRecovery(
     // Deferred block-type inventory requests are diagnostic state, not active
     // downloads.  Keep reporting them without treating them as pipeline work.
     size_t nSyncPeerBlockAskFor = 0;
-    if (pnodeSyncCopy != NULL)
+    if (BlockRequestTraceEnabled() && pnodeSyncCopy != NULL)
     {
         for (std::multimap<int64_t, CInv>::const_iterator it =
                  pnodeSyncCopy->mapAskFor.begin();
@@ -1152,26 +1153,29 @@ CNode* MaybeQueueStalledSyncRecovery(
     const int nCanAdvanceBlockSync = pnodeSyncCopy == NULL
         ? -1
         : (pnodeSyncCopy->CanAdvanceBlockSync(nLocalHeight) ? 1 : 0);
-    printf("IBD_RECOVERY_DECISION time=%lld peer=%lld local_height=%d peer_start_height=%d peer_best_known_height=%d effective_peer_height=%d max_peer_height=%lld fStartSync=%d blocks_in_flight=%u askfor_block_requests=%u queued_getblocks=%u pipeline_active=%d stall_start_time=%lld stall_age=%lld stall_timeout=%lld cooldown_remaining=%lld recovery_attempts=%u can_advance_block_sync=%d should_recover=%d final_skip_reason=%s\n",
-           (long long)nNow,
-           (long long)(pnodeSyncCopy == NULL ? -1 : pnodeSyncCopy->GetId()),
-           nLocalHeight, nPeerStartHeight, nPeerBestKnownHeight,
-           nEffectivePeerHeight, (long long)nMaxPeerHeight,
-           pnodeSyncCopy == NULL ? -1 : (pnodeSyncCopy->fStartSync ? 1 : 0),
-           (unsigned int)(pnodeSyncCopy == NULL
-                              ? 0 : pnodeSyncCopy->setBlocksInFlight.size()),
-           (unsigned int)nSyncPeerBlockAskFor,
-           (unsigned int)(pnodeSyncCopy == NULL
-                              ? 0 : pnodeSyncCopy->getBlocksIndex.size()),
-           fPipelineActive ? 1 : 0, (long long)state.LastProgressTime(),
-           (long long)(state.LastProgressTime() == 0
-                           ? -1
-                           : std::max<int64_t>(
-                                 0, nNow - state.LastProgressTime())),
-           (long long)nStallTimeout, (long long)nCooldownRemaining,
-           state.RecoveryAttempts(), nCanAdvanceBlockSync,
-           fShouldRecoverEvaluated ? (fShouldRecover ? 1 : 0) : -1,
-           pszFinalSkipReason);
+    if (BlockRequestTraceEnabled())
+    {
+        printf("IBD_RECOVERY_DECISION time=%lld peer=%lld local_height=%d peer_start_height=%d peer_best_known_height=%d effective_peer_height=%d max_peer_height=%lld fStartSync=%d blocks_in_flight=%u askfor_block_requests=%u queued_getblocks=%u pipeline_active=%d stall_start_time=%lld stall_age=%lld stall_timeout=%lld cooldown_remaining=%lld recovery_attempts=%u can_advance_block_sync=%d should_recover=%d final_skip_reason=%s\n",
+               (long long)nNow,
+               (long long)(pnodeSyncCopy == NULL ? -1 : pnodeSyncCopy->GetId()),
+                   nLocalHeight, nPeerStartHeight, nPeerBestKnownHeight,
+                   nEffectivePeerHeight, (long long)nMaxPeerHeight,
+                   pnodeSyncCopy == NULL ? -1 : (pnodeSyncCopy->fStartSync ? 1 : 0),
+                   (unsigned int)(pnodeSyncCopy == NULL
+                                      ? 0 : pnodeSyncCopy->setBlocksInFlight.size()),
+                   (unsigned int)nSyncPeerBlockAskFor,
+                   (unsigned int)(pnodeSyncCopy == NULL
+                                      ? 0 : pnodeSyncCopy->getBlocksIndex.size()),
+                   fPipelineActive ? 1 : 0, (long long)state.LastProgressTime(),
+                   (long long)(state.LastProgressTime() == 0
+                                   ? -1
+                                   : std::max<int64_t>(
+                                         0, nNow - state.LastProgressTime())),
+                   (long long)nStallTimeout, (long long)nCooldownRemaining,
+                   state.RecoveryAttempts(), nCanAdvanceBlockSync,
+                   fShouldRecoverEvaluated ? (fShouldRecover ? 1 : 0) : -1,
+                   pszFinalSkipReason);
+    }
 
     if (!fShouldRecover)
     {
@@ -1392,6 +1396,9 @@ static void UpdateGetInfoSyncProbeSnapshot(
 
 void LogSyncDiagnosticsMaybe()
 {
+    if (!GetBoolArg("-getinfosyncprobe", false))
+        return;
+
     const int64_t nNow = GetTime();
     const int64_t nInterval = 45;
     if (nLastSyncDiagnosticsLog != 0 && nNow - nLastSyncDiagnosticsLog < nInterval)

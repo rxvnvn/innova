@@ -950,8 +950,7 @@ bool AppInit2()
     fPrintToDebugger = GetBoolArg("-printtodebugger");
     fLogTimestamps = GetBoolArg("-logtimestamps");
     if (!InitBlockRequestTrace(
-            GetBoolArg("-blockrequesttrace", false) ||
-                GetBoolArg("-getinfosyncprobe", false),
+            GetBoolArg("-blockrequesttrace", false),
             GetArg("-blockrequesttracehash", "")))
     {
         return InitError(_(

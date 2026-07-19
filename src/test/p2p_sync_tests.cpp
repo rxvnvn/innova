@@ -1319,4 +1319,17 @@ BOOST_AUTO_TEST_CASE(recovery_response_window_deadline_disconnect_and_formatter)
                           names[i]);
 }
 
+BOOST_AUTO_TEST_CASE(block_request_trace_requires_explicit_enable)
+{
+    const std::string hash = uint256(1).ToString();
+    BOOST_CHECK(InitBlockRequestTrace(false, hash));
+    BOOST_CHECK(!BlockRequestTraceEnabled());
+
+    BOOST_CHECK(InitBlockRequestTrace(true, hash));
+    BOOST_CHECK(BlockRequestTraceEnabled());
+
+    BOOST_CHECK(InitBlockRequestTrace(false, ""));
+    BOOST_CHECK(!BlockRequestTraceEnabled());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

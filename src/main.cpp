@@ -8028,6 +8028,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         const bool fStrictInbound =
             pfrom->fInbound && !pfrom->fWhitelisted;
         const bool fDiagnostic =
+            BlockRequestTraceEnabled() ||
             GetBoolArg("-getblocksdiag", false);
         CGetBlocksServerDecision decision =
             pfrom->getBlocksServer.Evaluate(request, fStrictInbound);
@@ -8038,7 +8039,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             pfrom->getBlocksServer.nConsecutiveNonProgressingRequests,
             pfrom->getBlocksServer.nRequestsRateLimited);
         const bool fLogAbuse =
-            fDiagnostic || ShouldLogGetBlocksAbuse(nAbuseCount);
+            fDiagnostic ||
+            (BlockRequestTraceEnabled() && ShouldLogGetBlocksAbuse(nAbuseCount));
 
         if (fDiagnostic)
             LogGetBlocksServerEvent(
@@ -8191,7 +8193,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pindex = pindexFork->pnext;
         }
 
-        if (fDebugNet && fLogGetHeaders)
+        if (BlockRequestTraceEnabled() && fLogGetHeaders)
         {
             printf("GETHEADERS_RECV: peer=%s diag=%llu locator_size=%zu locator_first=%s locator_last=%s hashStop=%s fork_height=%d start_height=%d local_height=%d best_header=%d peer_bestknownheight=%d peer_startingheight=%d\n",
                    pfrom->addr.ToString().c_str(),
@@ -8224,7 +8226,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
 
         unsigned int nHeadersBytes = ::GetSerializeSize(vHeaders, SER_NETWORK, PROTOCOL_VERSION);
-        if (fDebugNet && fLogGetHeaders)
+        if (BlockRequestTraceEnabled() && fLogGetHeaders)
         {
             printf("GETHEADERS_SEND: peer=%s diag=%llu headers=%zu bytes=%u first_hash=%s first_height=%d last_hash=%s last_height=%d fork_height=%d hashStop=%s\n",
                    pfrom->addr.ToString().c_str(),
@@ -8317,7 +8319,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         if (vHeaders.empty())
         {
-            if (fDebugNet)
+            if (BlockRequestTraceEnabled())
             {
                 printf("HEADERS_TRACE: peer=%s peer_id=%lld response_sequence=%llu headers_count=0 headers_bytes=%u first_hash=none first_height_known=-1 last_hash=none last_height_known=-1 new_headers_count=0 already_known_count=0 connected_count=0 orphan_count=0 best_header_before=%d best_header_after=%d full_tip_before=%d full_tip_after=%d range_contiguous=1 next_getheaders_reason=empty-response\n",
                        pfrom->addrName.c_str(),
@@ -8431,7 +8433,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         const int nFullTipAfter = pindexBest ? pindexBest->nHeight : -1;
         const int nBestHeaderAfter = fSPVMode && pindexBest ? pindexBest->nHeight : -1;
 
-        if (fDebugNet)
+        if (BlockRequestTraceEnabled())
         {
             printf("HEADERS_TRACE: peer=%s peer_id=%lld response_sequence=%llu headers_count=%zu headers_bytes=%u first_hash=%s first_height_known=%d last_hash=%s last_height_known=%d new_headers_count=%d already_known_count=%d connected_count=%d orphan_count=%d best_header_before=%d best_header_after=%d full_tip_before=%d full_tip_after=%d range_contiguous=%d next_getheaders_reason=%s\n",
                    pfrom->addrName.c_str(),
