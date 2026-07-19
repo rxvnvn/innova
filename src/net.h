@@ -397,6 +397,9 @@ extern std::deque<std::pair<int64_t, CInv> > vRelayExpiration;
 extern CCriticalSection cs_mapRelay;
 extern std::map<CInv, int64_t> mapAlreadyAskedFor;
 extern CCriticalSection cs_mapAlreadyAskedFor;
+static const size_t MAX_ALREADY_ASKED_FOR_SIZE = 50000;
+static const int64_t ALREADY_ASKED_FOR_RETENTION_US = 60LL * 60 * 1000000;
+size_t PruneAlreadyAskedFor(int64_t nNowMicros);
 
 extern NodeId nLastNodeId;
 extern CCriticalSection cs_nLastNodeId;
@@ -944,13 +947,19 @@ public:
 
     void AskFor(const CInv& inv, BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER)
     {
+        const int64_t nPruneNow = GetTimeMicros();
+        PruneAlreadyAskedFor(nPruneNow);
         LOCK(cs_mapAlreadyAskedFor);
-        static const size_t MAX_ASKFOR_SIZE = 50000;
-        if (mapAlreadyAskedFor.size() >= MAX_ASKFOR_SIZE)
+        if (mapAlreadyAskedFor.size() >= MAX_ALREADY_ASKED_FOR_SIZE)
         {
             if (fDebugNet)
                 printf("AskFor: mapAlreadyAskedFor full (%u entries), skipping %s\n",
                        (unsigned int)mapAlreadyAskedFor.size(), inv.ToString().c_str());
+            if (BlockRequestTraceEnabled())
+                printf("BLOCKREQTRACE time_us=%lld event=ALREADY_ASKED_CAP_SKIP peer=%d type=%d hash=%s size=%zu cap=%zu\n",
+                       (long long)nPruneNow, GetId(), inv.type,
+                       inv.hash.ToString().c_str(), mapAlreadyAskedFor.size(),
+                       MAX_ALREADY_ASKED_FOR_SIZE);
             return;
         }
 

@@ -1332,4 +1332,61 @@ BOOST_AUTO_TEST_CASE(block_request_trace_requires_explicit_enable)
     BOOST_CHECK(!BlockRequestTraceEnabled());
 }
 
+BOOST_AUTO_TEST_CASE(already_asked_for_stale_entries_are_pruned_and_refill)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const int64_t nNow = TEST_TIME;
+
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        for (size_t i = 0; i < MAX_ALREADY_ASKED_FOR_SIZE; ++i)
+            mapAlreadyAskedFor[CInv(MSG_BLOCK, uint256(i + 1))] =
+                nNow - ALREADY_ASKED_FOR_RETENTION_US - 1;
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.size(),
+                          MAX_ALREADY_ASKED_FOR_SIZE);
+    }
+
+    BOOST_CHECK_EQUAL(PruneAlreadyAskedFor(nNow),
+                      MAX_ALREADY_ASKED_FOR_SIZE);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK(mapAlreadyAskedFor.empty());
+    }
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(30), "already-asked-refill", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 1000);
+    for (unsigned int i = 0; i < 1000; ++i)
+        peer.AskFor(CInv(MSG_BLOCK, uint256(100000 + i)),
+                    BLOCKREQ_SOURCE_INV);
+
+    BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 1000U);
+    BOOST_CHECK(SendMessages(&peer, true));
+    BOOST_CHECK(HasCommand(SentCommands(peer), "getdata"));
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK(mapAlreadyAskedFor.size() <= MAX_ALREADY_ASKED_FOR_SIZE);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(already_asked_for_recent_bound_remains_anti_spam)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        const int64_t nRecent = GetTimeMicros();
+        for (size_t i = 0; i < MAX_ALREADY_ASKED_FOR_SIZE; ++i)
+            mapAlreadyAskedFor[CInv(MSG_BLOCK, uint256(200000 + i))] = nRecent;
+    }
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(31), "already-asked-bound", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 1);
+    peer.AskFor(CInv(MSG_BLOCK, uint256(300000)), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 0U);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.size(),
+                          MAX_ALREADY_ASKED_FOR_SIZE);
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

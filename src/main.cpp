@@ -8623,6 +8623,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     miAccepted->second->nHeight, hashBlock);
             if (pfrom->nBestKnownHeight > pfrom->nChainHeight)
                 pfrom->nChainHeight = pfrom->nBestKnownHeight;
+        }
+        // A delivered block response is no longer an outstanding global
+        // anti-duplicate request, even when validation classified it as
+        // already-known or orphaned.
+        if (fAccepted || fKnownBefore || fOrphanBefore)
+        {
             LOCK(cs_mapAlreadyAskedFor);
             mapAlreadyAskedFor.erase(inv);
         }
@@ -9633,7 +9639,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     if (miPrevious != mapAlreadyAskedFor.end())
                         nPreviousGlobalAskedTime = miPrevious->second;
                 }
-                mapAlreadyAskedFor[inv] = nNow;
+                if (mapAlreadyAskedFor.size() < MAX_ALREADY_ASKED_FOR_SIZE ||
+                    mapAlreadyAskedFor.count(inv) != 0)
+                    mapAlreadyAskedFor[inv] = nNow;
             }
             if (!fSkip && fTraceBlockRequest)
             {

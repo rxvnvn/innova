@@ -1305,9 +1305,24 @@ static void UpdateGetInfoSyncProbeSnapshot(
     }
 
     size_t nAlreadyAskedFor = 0;
+    size_t nAlreadyAskedForBlocks = 0;
+    size_t nAlreadyAskedForTransactions = 0;
+    size_t nAlreadyAskedForOther = 0;
     {
         LOCK(cs_mapAlreadyAskedFor);
         nAlreadyAskedFor = mapAlreadyAskedFor.size();
+        for (std::map<CInv, int64_t>::const_iterator it =
+                 mapAlreadyAskedFor.begin();
+             it != mapAlreadyAskedFor.end(); ++it)
+        {
+            if (it->first.type == MSG_BLOCK ||
+                it->first.type == MSG_FILTERED_BLOCK)
+                ++nAlreadyAskedForBlocks;
+            else if (it->first.type == MSG_TX)
+                ++nAlreadyAskedForTransactions;
+            else
+                ++nAlreadyAskedForOther;
+        }
     }
 
     int nCollateralListState = 0;
@@ -1356,6 +1371,10 @@ static void UpdateGetInfoSyncProbeSnapshot(
         << " total_askfor=" << nTotalAskFor
         << " mapAskFor_size=" << nTotalAskFor
         << " mapAlreadyAskedFor_size=" << nAlreadyAskedFor
+        << " mapAlreadyAskedFor_blocks=" << nAlreadyAskedForBlocks
+        << " mapAlreadyAskedFor_transactions=" << nAlreadyAskedForTransactions
+        << " mapAlreadyAskedFor_other=" << nAlreadyAskedForOther
+        << " mapAlreadyAskedFor_cap=" << MAX_ALREADY_ASKED_FOR_SIZE
         << " last_block_receive_time="
         << nLastBlockReceiveTime
         << " last_accepted_block_time="
@@ -1629,6 +1648,34 @@ CCriticalSection cs_mapRelay;
 map<CInv, int64_t> mapAlreadyAskedFor;
 // mutex for mapAlreadyAskedFor
 CCriticalSection cs_mapAlreadyAskedFor;
+
+size_t PruneAlreadyAskedFor(int64_t nNowMicros)
+{
+    static int64_t nLastPruneMicros = 0;
+    size_t nRemoved = 0;
+    LOCK(cs_mapAlreadyAskedFor);
+    if (nLastPruneMicros != 0 && nNowMicros >= nLastPruneMicros &&
+        nNowMicros - nLastPruneMicros < 1000000)
+        return 0;
+    nLastPruneMicros = nNowMicros;
+    for (std::map<CInv, int64_t>::iterator it = mapAlreadyAskedFor.begin();
+         it != mapAlreadyAskedFor.end();)
+    {
+        if (it->second == 0 ||
+            nNowMicros - it->second > ALREADY_ASKED_FOR_RETENTION_US)
+        {
+            it = mapAlreadyAskedFor.erase(it);
+            ++nRemoved;
+        }
+        else
+            ++it;
+    }
+    if (nRemoved != 0 && BlockRequestTraceEnabled())
+        printf("BLOCKREQTRACE time_us=%lld event=ALREADY_ASKED_PRUNE removed=%zu remaining=%zu retention_us=%lld\n",
+               (long long)nNowMicros, nRemoved, mapAlreadyAskedFor.size(),
+               (long long)ALREADY_ASKED_FOR_RETENTION_US);
+    return nRemoved;
+}
 
 namespace {
 
