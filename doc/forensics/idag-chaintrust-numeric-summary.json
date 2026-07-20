@@ -1,0 +1,21 @@
+{
+  "baseline_rows": 7816068,
+  "nodag_rows": 7816068,
+  "matched_hashes": 7816068,
+  "missing_baseline": 0,
+  "missing_nodag": 0,
+  "block_trust_mismatches": 0,
+  "chaintrust_mismatches": 0,
+  "height_mismatches": 0,
+  "prev_hash_mismatches": 0,
+  "active_flag_mismatches": 0,
+  "fully_matching_rows": 7816068,
+  "status": "complete",
+  "baseline_sha256": "d4b1971dfda8debf90f87193773a4c1715bd34ee29fce8afd091cda77ab8ec69",
+  "nodag_sha256": "d4b1971dfda8debf90f87193773a4c1715bd34ee29fce8afd091cda77ab8ec69",
+  "snapshot_height": 7815016,
+  "snapshot_tip": "00000021233a369416466ba2a0a6d10e5bfeb19b306150404f2f27220cbf5a74",
+  "active_rows": 7815017,
+  "side_rows": 1051,
+  "post_dag_records": 0
+}
