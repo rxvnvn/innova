@@ -425,11 +425,6 @@ bool CTxDB::WriteDAGLinks(const uint256& hash, const CBlockDAGData& data)
     return Write(make_pair(string("daglinks"), hash), data);
 }
 
-bool CTxDB::ReadDAGLinks(const uint256& hash, CBlockDAGData& data)
-{
-    return Read(make_pair(string("daglinks"), hash), data);
-}
-
 bool CTxDB::EraseDAGLinks(const uint256& hash)
 {
     return Erase(make_pair(string("daglinks"), hash));
@@ -439,11 +434,6 @@ bool CTxDB::EraseDAGLinks(const uint256& hash)
 bool CTxDB::WriteEpochState(int nEpoch, const CEpochState& state)
 {
     return Write(make_pair(string("epochstate"), nEpoch), state);
-}
-
-bool CTxDB::ReadEpochState(int nEpoch, CEpochState& state)
-{
-    return Read(make_pair(string("epochstate"), nEpoch), state);
 }
 
 bool CTxDB::IterateEpochStates(std::map<int, CEpochState>& mapOut)

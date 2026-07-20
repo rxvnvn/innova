@@ -274,13 +274,11 @@ public:
 
     // IDAG Phase 2: DAG link persistence
     bool WriteDAGLinks(const uint256& hash, const CBlockDAGData& data);
-    bool ReadDAGLinks(const uint256& hash, CBlockDAGData& data);
     bool EraseDAGLinks(const uint256& hash);
     bool IterateDAGLinks(std::map<uint256, CBlockDAGData>& mapOut);
 
     // IDAG Phase 3: Epoch state persistence
     bool WriteEpochState(int nEpoch, const CEpochState& state);
-    bool ReadEpochState(int nEpoch, CEpochState& state);
     bool IterateEpochStates(std::map<int, CEpochState>& mapOut);
     bool IterateCurveTreeEpochs(std::map<int, CCurveTree>& mapOut);
     bool WriteDAGCleanHeight(int nHeight);
