@@ -1,0 +1,47 @@
+diff --git a/src/main.cpp b/src/main.cpp
+index 26f7678..4964ecb 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -1,3 +1,4 @@
++#define IDAG_STAGE41B_DISABLE_RUNTIME 1
+ // Copyright (c) 2009-2010 Satoshi Nakamoto
+ // Copyright (c) 2009-2012 The Bitcoin developers
+ // Copyright (c) 2017-2021 The Denarius developers
+@@ -5877,6 +5877,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
+     bool fDAGDataInitialized = false;
+     std::vector<uint256> vDAGParents;
+ 
++#ifndef IDAG_STAGE41B_DISABLE_RUNTIME
+     // IDAG Phase 2: Initialize DAG data for post-fork blocks
+     if (pindexNew->nHeight >= FORK_HEIGHT_DAG && pindexNew->IsProofOfWork())
+     {
+@@ -5953,6 +5954,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
+         }
+     }
+ 
++#endif // IDAG_STAGE41B_DISABLE_RUNTIME
+     LOCK(cs_main);
+ 
+     // New best
+diff --git a/src/txdb-leveldb.cpp b/src/txdb-leveldb.cpp
+index 355be31..7094449 100644
+--- a/src/txdb-leveldb.cpp
++++ b/src/txdb-leveldb.cpp
+@@ -1,3 +1,4 @@
++#define IDAG_STAGE41B_DISABLE_RUNTIME 1
+ // Copyright (c) 2009-2010 Satoshi Nakamoto
+ // Copyright (c) 2009-2012 The Bitcoin developers
+ // Distributed under the MIT/X11 software license, see the accompanying
+@@ -1060,9 +1061,12 @@ bool CTxDB::LoadBlockIndex()
+             return error("CTxDB::LoadBlockIndex() : Failed stake modifier checkpoint height=%d, modifier=0x%016" PRIx64, pindex->nHeight, pindex->nStakeModifier);
+     }
+ 
++    // IDAG_STAGE41B experimental: suppress DAG persistent runtime loading.
++#ifndef IDAG_STAGE41B_DISABLE_RUNTIME
+     // IDAG Phase 2+3: Load DAG links (ordering deferred to init.cpp for incremental support)
+     g_dagManager.LoadDAGLinks(*this);
+     g_dagManager.LoadEpochStates(*this);
++#endif
+     g_finalityTracker.LoadVotes(*this);
+     g_finalityTracker.LoadTallyShares(*this);
+     g_finalityTracker.LoadTallyCertificates(*this);
