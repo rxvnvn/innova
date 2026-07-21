@@ -2280,21 +2280,6 @@ static std::vector<uint256> GetMissingDAGMergeParents(const CBlock& block)
     return vMissing;
 }
 
-static void QueueBlockInventory(CNode* pfrom, CBlockIndex* pindex,
-                                std::set<uint256>& setQueued,
-                                CGetBlocksResponseInfo& response)
-{
-    if (!pfrom || !pindex)
-        return;
-
-    const uint256 hash = pindex->GetBlockHash();
-    if (!setQueued.insert(hash).second)
-        return;
-
-    if (pfrom->PushGetBlocksInventory(CInv(MSG_BLOCK, hash)))
-        response.Add(hash, pindex->nHeight);
-}
-
 static bool ShouldLogGetBlocksAbuse(uint64_t nCount)
 {
     return nCount <= 4 ||
@@ -8021,7 +8006,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         CGetBlocksResponseInfo response;
         CBlockIndex* pindex = pindexFirst;
         int nLimit = 1000;
-        std::set<uint256> setQueuedDAGParents;
         if (fDebugNet)
             printf("getblocks %d to %s limit %d\n",
                    (pindex ? pindex->nHeight : -1),
