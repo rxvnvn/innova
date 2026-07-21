@@ -2295,66 +2295,6 @@ static void QueueBlockInventory(CNode* pfrom, CBlockIndex* pindex,
         response.Add(hash, pindex->nHeight);
 }
 
-static void QueueDAGSideBlockWithAncestors(
-    CNode* pfrom, const uint256& hash, std::set<uint256>& setQueued,
-    std::set<uint256>& setVisiting, int nDepth,
-    CGetBlocksResponseInfo& response)
-{
-    if (!pfrom || nDepth > DAG_MERGE_DEPTH)
-        return;
-
-    std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
-    if (mi == mapBlockIndex.end())
-        return;
-
-    CBlockIndex* pindex = mi->second;
-    if (pindex->IsInMainChain())
-        return;
-
-    if (!setVisiting.insert(hash).second)
-        return;
-
-    CBlock block;
-    if (!block.ReadFromDisk(pindex))
-    {
-        setVisiting.erase(hash);
-        return;
-    }
-
-    std::map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(block.hashPrevBlock);
-    if (miPrev != mapBlockIndex.end() && !miPrev->second->IsInMainChain())
-        QueueDAGSideBlockWithAncestors(
-            pfrom, block.hashPrevBlock, setQueued, setVisiting, nDepth + 1,
-            response);
-
-    std::vector<uint256> vDAGParents = GetDAGParentsFromBlock(block);
-    for (unsigned int i = 1; i < vDAGParents.size(); i++)
-        QueueDAGSideBlockWithAncestors(
-            pfrom, vDAGParents[i], setQueued, setVisiting, nDepth + 1,
-            response);
-
-    QueueBlockInventory(pfrom, pindex, setQueued, response);
-    setVisiting.erase(hash);
-}
-
-static void QueueDAGMergeParentInventories(
-    CNode* pfrom, CBlockIndex* pindex, std::set<uint256>& setQueued,
-    CGetBlocksResponseInfo& response)
-{
-    if (!pfrom || !pindex || pindex->nHeight < FORK_HEIGHT_DAG)
-        return;
-
-    CBlock block;
-    if (!block.ReadFromDisk(pindex))
-        return;
-
-    std::vector<uint256> vDAGParents = GetDAGParentsFromBlock(block);
-    std::set<uint256> setVisiting;
-    for (unsigned int i = 1; i < vDAGParents.size(); i++)
-        QueueDAGSideBlockWithAncestors(
-            pfrom, vDAGParents[i], setQueued, setVisiting, 0, response);
-}
-
 static bool ShouldLogGetBlocksAbuse(uint64_t nCount)
 {
     return nCount <= 4 ||
@@ -8108,8 +8048,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 break;
             }
 
-            QueueDAGMergeParentInventories(
-                pfrom, pindex, setQueuedDAGParents, response);
             if (pfrom->PushGetBlocksInventory(
                     CInv(MSG_BLOCK, hashBlock)))
             {
