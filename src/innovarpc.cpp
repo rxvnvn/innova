@@ -481,11 +481,7 @@ static const CRPCCommand vRPCCommands[] =
     { "isblockfinalized",       &isblockfinalized,       true,   false },
 
     /* IDAG: DAG consensus commands (Phase 2-4) */
-    { "getdaginfo",             &getdaginfo,             true,   false },
-    { "getdagtips",             &getdagtips,             true,   false },
-    { "getdagorder",            &getdagorder,            true,   false },
     { "getepochinfo",           &getepochinfo,           true,   false },
-    { "getdagconfidence",       &getdagconfidence,       true,   false },
 
 
 };
