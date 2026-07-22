@@ -260,8 +260,6 @@ private:
     /** DAGKNIGHT: Infer local k from DAG neighborhood. */
     int InferLocalK(const uint256& hashBlock) const;
 
-    /** DAGKNIGHT: Compute supporting mass of A over B (blocks seeing A but not B). */
-    int SupportingMass(const uint256& hashA, const uint256& hashB) const;
 
     /** Internal: get anticone of block X relative to a blue set */
     int AnticoneSize(const uint256& hashBlock, const std::set<uint256>& blueSet) const;
