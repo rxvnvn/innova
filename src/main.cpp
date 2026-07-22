@@ -8941,38 +8941,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         ProcessMessageFinality(pfrom, strCommand, vRecv);
         //ProcessSpork(pfrom, strCommand, vRecv);
 
-        // IDAG Phase 2: DAG tips exchange
-        if (strCommand == "getdagtips")
-        {
-            LOCK(cs_main);
-            if (pindexBest && pindexBest->nHeight >= FORK_HEIGHT_DAG)
-            {
-                std::vector<uint256> vTips = g_dagManager.GetDAGTips();
-                pfrom->PushMessage("dagtips", vTips);
-            }
-        }
-        else if (strCommand == "dagtips")
-        {
-            std::vector<uint256> vTips;
-            vRecv >> vTips;
-
-            if (vTips.size() > (unsigned int)(MAX_DAG_PARENTS * 3))
-            {
-                pfrom->Misbehaving(20);
-            }
-            else
-            {
-                LOCK(cs_main);
-                for (const uint256& hashTip : vTips)
-                {
-                    if (!mapBlockIndex.count(hashTip))
-                        pfrom->AskFor(
-                            CInv(MSG_BLOCK, hashTip),
-                            BLOCKREQ_SOURCE_OTHER);
-                }
-            }
-        }
-
         // Ignore unknown commands for extensibility
     }
 
