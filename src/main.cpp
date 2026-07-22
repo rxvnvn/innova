@@ -2237,48 +2237,6 @@ void static PruneOrphanBlocks()
     }
 }
 
-static std::vector<uint256> GetDAGParentsFromBlock(const CBlock& block)
-{
-    std::vector<uint256> vDAGParents;
-
-    if (block.vtx.empty())
-        return vDAGParents;
-
-    for (unsigned int i = 0; i < block.vtx[0].vout.size(); i++)
-    {
-        vDAGParents = ExtractDAGParents(block.vtx[0].vout[i].scriptPubKey);
-        if (vDAGParents.empty())
-            continue;
-        break;
-    }
-
-    return vDAGParents;
-}
-
-static std::vector<uint256> GetMissingDAGMergeParents(const CBlock& block)
-{
-    std::vector<uint256> vMissing;
-
-    std::map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(block.hashPrevBlock);
-    if (miPrev == mapBlockIndex.end())
-        return vMissing;
-
-    int nHeight = miPrev->second->nHeight + 1;
-    if (nHeight < FORK_HEIGHT_DAG)
-        return vMissing;
-
-    std::vector<uint256> vDAGParents = GetDAGParentsFromBlock(block);
-    for (unsigned int j = 1; j < vDAGParents.size(); j++)
-    {
-        if (mapBlockIndex.count(vDAGParents[j]))
-            continue;
-
-        if (std::find(vMissing.begin(), vMissing.end(), vDAGParents[j]) == vMissing.end())
-            vMissing.push_back(vDAGParents[j]);
-    }
-
-    return vMissing;
-}
 
 static bool ShouldLogGetBlocksAbuse(uint64_t nCount)
 {
