@@ -1709,7 +1709,6 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "setbestblockbyheight"   && n > 0) ConvertTo<int64_t>(params[0]);
 
     // IDAG DAG Commands
-    if (strMethod == "getdagorder"            && n > 0) ConvertTo<int64_t>(params[0]);
     if (strMethod == "getepochinfo"           && n > 0) ConvertTo<int64_t>(params[0]);
 
     //Innova Name Commands
