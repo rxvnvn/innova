@@ -277,11 +277,7 @@ extern json_spirit::Value getfinalityinfo(const json_spirit::Array& params, bool
 extern json_spirit::Value submitfinalitytallyshare(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
 extern json_spirit::Value submitfinalitytallycert(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
 extern json_spirit::Value isblockfinalized(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
-extern json_spirit::Value getdaginfo(const json_spirit::Array& params, bool fHelp);      // in rpcblockchain.cpp
-extern json_spirit::Value getdagtips(const json_spirit::Array& params, bool fHelp);      // in rpcblockchain.cpp
-extern json_spirit::Value getdagorder(const json_spirit::Array& params, bool fHelp);     // in rpcblockchain.cpp
 extern json_spirit::Value getepochinfo(const json_spirit::Array& params, bool fHelp);    // in rpcblockchain.cpp
-extern json_spirit::Value getdagconfidence(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
 
 
 extern json_spirit::Value name_new(const json_spirit::Array& params, bool fHelp); // in namecoin.cpp Denairus Name commands
