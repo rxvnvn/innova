@@ -183,13 +183,6 @@ public:
     /** DAGKNIGHT adaptive coloring for a block (Phase 4). */
     void ColorBlockDAGKnight(CBlockIndex* pindex);
 
-    /** DAGKNIGHT pairwise ordering: -1 if A before B, +1 if B before A, 0 if unordered.
-     *  nConfidence is set to the supporting mass difference. */
-    int CompareBlockOrder(const uint256& hashA, const uint256& hashB, int& nConfidence) const;
-
-    /** DAGKNIGHT: Get confidence level for a block's ordering position. */
-    int GetOrderConfidence(const uint256& hashBlock) const;
-
     /** Write DAG links for a block to LevelDB. */
     bool WriteDAGLinks(CTxDB& txdb, const uint256& hash);
 
@@ -223,8 +216,6 @@ public:
     /** Get the number of in-memory DAG entries. */
     int GetDAGEntryCount() const;
 
-    /** Get the lowest height of pruned data (-1 if no pruning). */
-    int GetPrunedBelowHeight() const;
 
     /** Set pruned below height (used on startup to restore from LevelDB). */
     void SetPrunedBelowHeight(int nHeight);

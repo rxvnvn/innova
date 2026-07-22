@@ -1394,11 +1394,6 @@ int CDAGManager::GetDAGEntryCount() const
     return (int)mapDAGData.size();
 }
 
-int CDAGManager::GetPrunedBelowHeight() const
-{
-    LOCK(cs_dag);
-    return nPrunedBelowHeight;
-}
 
 void CDAGManager::SetPrunedBelowHeight(int nHeight)
 {
@@ -1534,47 +1529,6 @@ int CDAGManager::SupportingMass(const uint256& hashA, const uint256& hashB) cons
     return nSupport;
 }
 
-int CDAGManager::CompareBlockOrder(const uint256& hashA, const uint256& hashB,
-                                    int& nConfidence) const
-{
-    LOCK(cs_dag);
-
-    if (hashA == hashB)
-    {
-        nConfidence = 0;
-        return 0;
-    }
-
-    // Check topological ordering: is A ancestor of B or vice versa?
-    std::set<uint256> pastB = GetPastSet(hashB, DAGKNIGHT_MAX_ANTICONE_WINDOW);
-    if (pastB.count(hashA))
-    {
-        nConfidence = (int)pastB.size();
-        return -1; // A precedes B
-    }
-
-    std::set<uint256> pastA = GetPastSet(hashA, DAGKNIGHT_MAX_ANTICONE_WINDOW);
-    if (pastA.count(hashB))
-    {
-        nConfidence = (int)pastA.size();
-        return 1; // B precedes A
-    }
-
-    // Blocks in each other's anticone — use supporting mass
-    int nSupportAB = SupportingMass(hashA, hashB);
-    int nSupportBA = SupportingMass(hashB, hashA);
-
-    nConfidence = abs(nSupportAB - nSupportBA);
-
-    if (nSupportAB > nSupportBA + DAGKNIGHT_MIN_CONFIDENCE)
-        return -1; // A precedes B
-    if (nSupportBA > nSupportAB + DAGKNIGHT_MIN_CONFIDENCE)
-        return 1;  // B precedes A
-
-    // Tie: deterministic hash comparison
-    nConfidence = 0;
-    return (hashA < hashB) ? -1 : 1;
-}
 
 void CDAGManager::ColorBlockDAGKnight(CBlockIndex* pindex)
 {
@@ -1706,44 +1660,4 @@ void CDAGManager::ColorBlockDAGKnight(CBlockIndex* pindex)
             nScore = nScore + mi->second->GetBlockTrust();
     }
     data.nDAGScore = nScore;
-}
-
-int CDAGManager::GetOrderConfidence(const uint256& hashBlock) const
-{
-    LOCK(cs_dag);
-
-    auto it = mapDAGData.find(hashBlock);
-    if (it == mapDAGData.end())
-        return 0;
-
-    // Count blue descendants as confidence measure
-    int nConfidence = 0;
-    std::set<uint256> visited;
-    std::queue<uint256> queue;
-    queue.push(hashBlock);
-    int nDepth = 0;
-
-    while (!queue.empty() && nDepth < DAGKNIGHT_MAX_ANTICONE_WINDOW)
-    {
-        uint256 h = queue.front();
-        queue.pop();
-        if (!visited.insert(h).second)
-            continue;
-
-        auto dit = mapDAGData.find(h);
-        if (dit == mapDAGData.end())
-            continue;
-
-        if (dit->second.fBlue && h != hashBlock)
-            nConfidence++;
-
-        for (const uint256& hc : dit->second.vDAGChildren)
-        {
-            if (!visited.count(hc))
-                queue.push(hc);
-        }
-        nDepth++;
-    }
-
-    return nConfidence;
 }
