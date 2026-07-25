@@ -582,6 +582,7 @@ std::string HelpMessage()
         "  -blockrequesttrace=<n> " + _("Trace anomalous block request lifecycles (default: 0)") + "\n" +
         "  -blockrequesttracehash=<hash> " + _("Limit block request tracing to one block hash (requires -blockrequesttrace)") + "\n" +
         "  -getinfosyncprobe=<n> " + _("Log cached P2P state before, during, and after getinfo (default: 0)") + "\n" +
+        "  -rpcperftrace=<n>     " + _("Trace getinfo/getmininginfo RPC performance (default: 0)") + "\n" +
         "  -synclockdiagnostics=<n> " + _("Log long sync-related lock waits and holds (default: 0)") + "\n" +
         "  -synclockthresholdms=<n> " + _("Lock diagnostic threshold in milliseconds (default: 250)") + "\n" +
         "  -syncstalltimeout=<n> " + _("Seconds without chain progress before sync recovery (default: 15)") + "\n" +

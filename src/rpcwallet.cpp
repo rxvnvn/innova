@@ -18,10 +18,20 @@
 #include "txdb.h"
 
 #include <openssl/crypto.h>
+#include <chrono>
+
+static int64_t RPCPerfTimeMicros(bool fEnabled)
+{
+    if (!fEnabled)
+        return 0;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+#define RPCPERF_LOG(...) do { try { printf(__VA_ARGS__); } catch (...) {} } while (0)
 
 #include <sstream>
 #include <fstream>
-#include <sys/stat.h>
 
 using namespace json_spirit;
 using namespace std;
@@ -158,20 +168,37 @@ Value getinfo(const Array& params, bool fHelp)
             "getinfo\n"
             "Returns an object containing various state info.");
 
+    const bool fRPCPerfTrace = GetBoolArg("-rpcperftrace", false);
+    const int64_t nRPCStartTime = RPCPerfTimeMicros(fRPCPerfTrace);
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo event=start\n");
+
     proxyType proxy;
     GetProxy(NET_IPV4, proxy);
 
-	uint64_t nMinWeight = 0, nMaxWeight = 0, nWeight = 0;
+    int64_t nMeasuredMicros = 0;
+    int64_t nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    uint64_t nMinWeight = 0, nMaxWeight = 0, nWeight = 0;
     pwalletMain->GetStakeWeight(*pwalletMain, nMinWeight, nMaxWeight, nWeight);
+    int64_t nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=stake_weight duration_us=%lld\n",
+               (long long)nSectionMicros);
 
     int nConnections = 0;
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
     {
-        CSyncLockDiagnostics lockDiagnostics(
-            "getinfo", "cs_vNodes");
+        CSyncLockDiagnostics lockDiagnostics("getinfo", "cs_vNodes");
         LOCK(cs_vNodes);
         lockDiagnostics.Acquired();
         nConnections = (int)vNodes.size();
     }
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=network_snapshot duration_us=%lld peer_count=%d\n",
+               (long long)nSectionMicros, nConnections);
 
     Object obj, diff;
     obj.push_back(Pair("version",       FormatFullVersion()));
@@ -179,13 +206,56 @@ Value getinfo(const Array& params, bool fHelp)
     obj.push_back(Pair("builddirty",     CLIENT_BUILD_DIRTY));
     obj.push_back(Pair("protocolversion",(int)PROTOCOL_VERSION));
     obj.push_back(Pair("walletversion", pwalletMain->GetVersion()));
-    obj.push_back(Pair("balance",       ValueFromAmount(pwalletMain->GetBalance())));
-    obj.push_back(Pair("anonbalance",   ValueFromAmount(pwalletMain->GetAnonBalance())));
-    obj.push_back(Pair("reserve",       ValueFromAmount(nReserveBalance)));
-    obj.push_back(Pair("newmint",       ValueFromAmount(pwalletMain->GetNewMint())));
-    obj.push_back(Pair("stake",         ValueFromAmount(pwalletMain->GetStake())));
-    obj.push_back(Pair("unconfirmed",   ValueFromAmount(pwalletMain->GetUnconfirmedBalance())));
-    obj.push_back(Pair("immature",      ValueFromAmount(pwalletMain->GetImmatureBalance())));
+
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    int64_t nBalance = pwalletMain->GetBalance();
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=balance duration_us=%lld\n", (long long)nSectionMicros);
+    obj.push_back(Pair("balance", ValueFromAmount(nBalance)));
+
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    int64_t nAnonBalance = pwalletMain->GetAnonBalance();
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=anonbalance duration_us=%lld\n", (long long)nSectionMicros);
+    obj.push_back(Pair("anonbalance", ValueFromAmount(nAnonBalance)));
+    obj.push_back(Pair("reserve", ValueFromAmount(nReserveBalance)));
+
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    int64_t nNewMint = pwalletMain->GetNewMint();
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=newmint duration_us=%lld\n", (long long)nSectionMicros);
+    obj.push_back(Pair("newmint", ValueFromAmount(nNewMint)));
+
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    int64_t nStake = pwalletMain->GetStake();
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=stake duration_us=%lld\n", (long long)nSectionMicros);
+    obj.push_back(Pair("stake", ValueFromAmount(nStake)));
+
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    int64_t nUnconfirmed = pwalletMain->GetUnconfirmedBalance();
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=unconfirmed duration_us=%lld\n", (long long)nSectionMicros);
+    obj.push_back(Pair("unconfirmed", ValueFromAmount(nUnconfirmed)));
+
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    int64_t nImmature = pwalletMain->GetImmatureBalance();
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=immature duration_us=%lld\n", (long long)nSectionMicros);
+    obj.push_back(Pair("immature", ValueFromAmount(nImmature)));
+
     obj.push_back(Pair("blocks",        (int)nBestHeight));
     obj.push_back(Pair("timeoffset",    (int64_t)GetTimeOffset()));
     obj.push_back(Pair("moneysupply",   ValueFromAmount(pindexBest->nMoneySupply)));
@@ -197,59 +267,84 @@ Value getinfo(const Array& params, bool fHelp)
     {
         string automatic_onion;
         fs::path const hostname_path = GetDefaultDataDir() / "onion" / "hostname";
-
-        if (!fs::exists(hostname_path)) {
+        if (!fs::exists(hostname_path))
             printf("No external address found.");
-        }
-
         ifstream file(hostname_path.string().c_str());
         file >> automatic_onion;
-        obj.push_back(Pair("ip",       (automatic_onion)));
+        obj.push_back(Pair("ip", automatic_onion));
     }
     if(!fNativeTor)
-        obj.push_back(Pair("ip",            addrSeenByPeer.ToStringIP()));
+        obj.push_back(Pair("ip", addrSeenByPeer.ToStringIP()));
 
-    diff.push_back(Pair("proof-of-work",  GetDifficulty()));
+    diff.push_back(Pair("proof-of-work", GetDifficulty()));
     diff.push_back(Pair("proof-of-stake", GetDifficulty(GetLastBlockIndex(pindexBest, true))));
+    obj.push_back(Pair("difficulty", diff));
 
-    obj.push_back(Pair("difficulty",    diff));
-	obj.push_back(Pair("netmhashps",     GetPoWMHashPS()));
-	obj.push_back(Pair("netstakeweight", GetPoSKernelPS()));
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    double dPoWMHashPS = GetPoWMHashPS();
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=pow_hashrate duration_us=%lld\n", (long long)nSectionMicros);
+    obj.push_back(Pair("netmhashps", dPoWMHashPS));
 
-	obj.push_back(Pair("weight", (uint64_t)nWeight));
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    double dPoSKernelPS = GetPoSKernelPS();
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=pos_kernel_rate duration_us=%lld\n", (long long)nSectionMicros);
+    obj.push_back(Pair("netstakeweight", dPoSKernelPS));
+    obj.push_back(Pair("weight", (uint64_t)nWeight));
 
     obj.push_back(Pair("testnet",       fTestNet));
     obj.push_back(Pair("collateralnode",  fCollateralNode));
     obj.push_back(Pair("cnlock",        fCNLock));
     obj.push_back(Pair("nativetor",     fNativeTor));
-    obj.push_back(Pair("keypoololdest", (int64_t)pwalletMain->GetOldestKeyPoolTime()));
+
+    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    int64_t nKeyPoolOldest = pwalletMain->GetOldestKeyPoolTime();
+    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
+    nMeasuredMicros += nSectionMicros;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=keypool_oldest duration_us=%lld\n", (long long)nSectionMicros);
+    obj.push_back(Pair("keypoololdest", nKeyPoolOldest));
+
     obj.push_back(Pair("keypoolsize",   (int)pwalletMain->GetKeyPoolSize()));
     obj.push_back(Pair("paytxfee",      ValueFromAmount(nTransactionFee)));
     obj.push_back(Pair("mininput",      ValueFromAmount(nMinimumInputValue)));
     obj.push_back(Pair("datadir",       GetDataDir().string()));
-	obj.push_back(Pair("initialblockdownload",  IsInitialBlockDownload()));
+    obj.push_back(Pair("initialblockdownload", IsInitialBlockDownload()));
     if(fDebug)
-	{
-    	obj.push_back(Pair("debug",             fDebug));
+    {
+        obj.push_back(Pair("debug",             fDebug));
         obj.push_back(Pair("debugnet",          fDebugNet));
         obj.push_back(Pair("debugchain",        fDebugChain));
         obj.push_back(Pair("debugringsig",      fDebugRingSig));
-	}
-  //Q0lSQ1VJVEJSRUFLRVI=
-	if (pwalletMain->IsCrypted())
+    }
+    if (pwalletMain->IsCrypted())
     {
         LOCK(cs_nWalletUnlockTime);
         obj.push_back(Pair("unlocked_until", (int64_t)nWalletUnlockTime / 1000));
     }
-	if (!pwalletMain->IsCrypted())
+    if (!pwalletMain->IsCrypted())
         obj.push_back(Pair("wallet_status", "unencrypted"));
-	if (!pwalletMain->IsLocked() && pwalletMain->IsCrypted() && !fWalletUnlockStakingOnly)
-		obj.push_back(Pair("wallet_status", "unlocked"));
-	if (!pwalletMain->IsLocked() && pwalletMain->IsCrypted() && fWalletUnlockStakingOnly)
-		obj.push_back(Pair("wallet_status", "stakingonly"));
-	if (pwalletMain->IsLocked() && pwalletMain->IsCrypted())
-		obj.push_back(Pair("wallet_status", "locked"));
-    obj.push_back(Pair("errors",        GetWarnings("statusbar")));
+    if (!pwalletMain->IsLocked() && pwalletMain->IsCrypted() && !fWalletUnlockStakingOnly)
+        obj.push_back(Pair("wallet_status", "unlocked"));
+    if (!pwalletMain->IsLocked() && pwalletMain->IsCrypted() && fWalletUnlockStakingOnly)
+        obj.push_back(Pair("wallet_status", "stakingonly"));
+    if (pwalletMain->IsLocked() && pwalletMain->IsCrypted())
+        obj.push_back(Pair("wallet_status", "locked"));
+    obj.push_back(Pair("errors", GetWarnings("statusbar")));
+
+    if (fRPCPerfTrace)
+    {
+        const int64_t nTotalMicros = RPCPerfTimeMicros(true) - nRPCStartTime;
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=remaining_handler duration_us=%lld\n",
+                    (long long)std::max<int64_t>(0, nTotalMicros - nMeasuredMicros));
+        RPCPERF_LOG("RPCPERF rpc=getinfo event=end total_us=%lld\n",
+                    (long long)nTotalMicros);
+    }
     return obj;
 }
 

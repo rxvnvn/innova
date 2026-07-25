@@ -13,7 +13,15 @@
 #include "finality.h"
 #include "dag.h"
 #include "base58.h"
+#include <chrono>
 
+static int64_t RPCPerfTimeMicros()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+#define RPCPERF_LOG(...) do { try { printf(__VA_ARGS__); } catch (...) {} } while (0)
 static CCriticalSection cs_getwork;
 
 using namespace json_spirit;
@@ -73,24 +81,61 @@ Value getmininginfo(const Array& params, bool fHelp)
             "actual live-worker count and requestedcputhreads is the configured pool size.\n"
             "Network hash-rate fields are not local CPU miner performance.");
 
+    const bool fRPCPerfTrace = GetBoolArg("-rpcperftrace", false);
+    const int64_t nRPCStartTime = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
+    int64_t nMeasuredMicros = 0;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=getmininginfo event=start\n");
+
     uint64_t nMinWeight = 0, nMaxWeight = 0, nWeight = 0;
+    int64_t nSectionStart = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
     pwalletMain->GetStakeWeight(*pwalletMain, nMinWeight, nMaxWeight, nWeight);
+    if (fRPCPerfTrace)
+    {
+        const int64_t nDuration = RPCPerfTimeMicros() - nSectionStart;
+        nMeasuredMicros += nDuration;
+        RPCPERF_LOG("RPCPERF rpc=getmininginfo section=stake_weight duration_us=%lld\n", (long long)nDuration);
+    }
 
     Object obj, diff, weight;
     obj.push_back(Pair("blocks",        (int)nBestHeight));
     obj.push_back(Pair("currentblocksize",(uint64_t)nLastBlockSize));
     obj.push_back(Pair("currentblocktx",(uint64_t)nLastBlockTx));
 
+    nSectionStart = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
     diff.push_back(Pair("proof-of-work",  GetDifficulty()));
     diff.push_back(Pair("proof-of-stake", GetDifficulty(GetLastBlockIndex(pindexBest, true))));
+    if (fRPCPerfTrace)
+    {
+        const int64_t nDuration = RPCPerfTimeMicros() - nSectionStart;
+        nMeasuredMicros += nDuration;
+        RPCPERF_LOG("RPCPERF rpc=getmininginfo section=difficulty duration_us=%lld\n", (long long)nDuration);
+    }
 
     diff.push_back(Pair("search-interval",      (int)nLastCoinStakeSearchInterval));
     obj.push_back(Pair("difficulty",    diff));
-
     obj.push_back(Pair("blockvalue",    (uint64_t)GetProofOfWorkReward(nBestHeight+1, 0)));
-    obj.push_back(Pair("netmhashps",     GetPoWMHashPS()));
 
-    obj.push_back(Pair("netstakeweight", GetPoSKernelPS()));
+    nSectionStart = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
+    double dPoWMHashPS = GetPoWMHashPS();
+    if (fRPCPerfTrace)
+    {
+        const int64_t nDuration = RPCPerfTimeMicros() - nSectionStart;
+        nMeasuredMicros += nDuration;
+        RPCPERF_LOG("RPCPERF rpc=getmininginfo section=pow_hashrate duration_us=%lld\n", (long long)nDuration);
+    }
+    obj.push_back(Pair("netmhashps", dPoWMHashPS));
+
+    nSectionStart = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
+    double dPoSKernelPS = GetPoSKernelPS();
+    if (fRPCPerfTrace)
+    {
+        const int64_t nDuration = RPCPerfTimeMicros() - nSectionStart;
+        nMeasuredMicros += nDuration;
+        RPCPERF_LOG("RPCPERF rpc=getmininginfo section=pos_kernel_rate duration_us=%lld\n", (long long)nDuration);
+    }
+
+    obj.push_back(Pair("netstakeweight", dPoSKernelPS));
     obj.push_back(Pair("errors",        GetWarnings("statusbar")));
     obj.push_back(Pair("pooledtx",      (uint64_t)mempool.size()));
 
@@ -105,6 +150,13 @@ Value getmininginfo(const Array& params, bool fHelp)
     obj.push_back(Pair("cpumining",     cpuMining.running));
     obj.push_back(Pair("cputhreads",    cpuMining.activeThreads));
     obj.push_back(Pair("requestedcputhreads", cpuMining.requestedThreads));
+
+    if (fRPCPerfTrace)
+    {
+        const int64_t nTotalMicros = RPCPerfTimeMicros() - nRPCStartTime;
+        RPCPERF_LOG("RPCPERF rpc=getmininginfo section=remaining_handler duration_us=%lld\n", (long long)std::max<int64_t>(0, nTotalMicros - nMeasuredMicros));
+        RPCPERF_LOG("RPCPERF rpc=getmininginfo event=end total_us=%lld\n", (long long)nTotalMicros);
+    }
     return obj;
 }
 

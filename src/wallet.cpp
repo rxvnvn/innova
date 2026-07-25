@@ -30,6 +30,17 @@
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/range/algorithm.hpp>
 #include <boost/numeric/ublas/matrix.hpp>
+#include <chrono>
+
+static int64_t RPCPerfTimeMicros(bool fEnabled)
+{
+    if (!fEnabled)
+        return 0;
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+#define RPCPERF_LOG(...) do { try { printf(__VA_ARGS__); } catch (...) {} } while (0)
 
 #if BOOST_VERSION >= 107300
 #include <boost/bind/bind.hpp>
@@ -4252,35 +4263,70 @@ bool CWallet::FindStealthTransactions(const CTransaction& tx, mapValue_t& mapNar
 // NovaCoin: get current stake weight
 bool CWallet::GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, uint64_t& nMaxWeight, uint64_t& nWeight)
 {
+    const bool fRPCPerfTrace = GetBoolArg("-rpcperftrace", false);
+    const int64_t nStartTime = RPCPerfTimeMicros(fRPCPerfTrace);
+    const int64_t nBalanceStartTime = RPCPerfTimeMicros(fRPCPerfTrace);
     // Choose coins to use
     int64_t nBalance = GetBalance();
+    const int64_t nBalanceCheckMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nBalanceStartTime;
 
     if (nBalance <= nReserveBalance)
+    {
+        if (fRPCPerfTrace)
+            RPCPERF_LOG("RPCPERF rpc=GetStakeWeight reason=balance_not_above_reserve balance_check_us=%lld selection_us=0 selected_utxos=0 txindex_reads=0 txindex_read_total_us=0 txindex_read_max_us=0 total_us=%lld\n",
+                        (long long)nBalanceCheckMicros,
+                        (long long)(RPCPerfTimeMicros(true) - nStartTime));
         return false;
+    }
 
     vector<const CWalletTx*> vwtxPrev;
 
     set<pair<const CWalletTx*,unsigned int> > setCoins;
     int64_t nValueIn = 0;
+    const int64_t nSelectionStartTime = RPCPerfTimeMicros(fRPCPerfTrace);
 
     if (fHybridSPV)
     {
         if (!SelectCoinsForStakingSPV(setCoins))
+        {
+            if (fRPCPerfTrace)
+                RPCPERF_LOG("RPCPERF rpc=GetStakeWeight reason=spv_selection_failed balance_check_us=%lld selection_us=%lld selected_utxos=0 txindex_reads=0 txindex_read_total_us=0 txindex_read_max_us=0 total_us=%lld\n",
+                            (long long)nBalanceCheckMicros,
+                            (long long)(RPCPerfTimeMicros(true) - nSelectionStartTime),
+                            (long long)(RPCPerfTimeMicros(true) - nStartTime));
             return false;
+        }
         for (const auto& pcoin : setCoins)
             nValueIn += pcoin.first->vout[pcoin.second].nValue;
     }
     else
     {
         if (!SelectCoinsForStaking(nBalance - nReserveBalance, GetTime(), setCoins, nValueIn))
+        {
+            if (fRPCPerfTrace)
+                RPCPERF_LOG("RPCPERF rpc=GetStakeWeight reason=selection_failed balance_check_us=%lld selection_us=%lld selected_utxos=0 txindex_reads=0 txindex_read_total_us=0 txindex_read_max_us=0 total_us=%lld\n",
+                            (long long)nBalanceCheckMicros,
+                            (long long)(RPCPerfTimeMicros(true) - nSelectionStartTime),
+                            (long long)(RPCPerfTimeMicros(true) - nStartTime));
             return false;
+        }
     }
+    const int64_t nSelectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSelectionStartTime;
 
     if (setCoins.empty())
+    {
+        if (fRPCPerfTrace)
+            RPCPERF_LOG("RPCPERF rpc=GetStakeWeight reason=no_candidates balance_check_us=%lld selection_us=%lld selected_utxos=0 txindex_reads=0 txindex_read_total_us=0 txindex_read_max_us=0 total_us=%lld\n",
+                        (long long)nBalanceCheckMicros,
+                        (long long)nSelectionMicros,
+                        (long long)(RPCPerfTimeMicros(true) - nStartTime));
         return false;
-
+    }
 
     nMinWeight = nMaxWeight = nWeight = 0;
+    uint64_t nTxIndexReads = 0;
+    int64_t nTxIndexReadTotalMicros = 0;
+    int64_t nTxIndexReadMaxMicros = 0;
 
     CTxDB txdb("r");
     BOOST_FOREACH(PAIRTYPE(const CWalletTx*, unsigned int) pcoin, setCoins)
@@ -4288,7 +4334,16 @@ bool CWallet::GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, ui
         CTxIndex txindex;
         {
             LOCK2(cs_main, cs_wallet);
-            if (!txdb.ReadTxIndex(pcoin.first->GetHash(), txindex))
+            const int64_t nReadStartTime = RPCPerfTimeMicros(fRPCPerfTrace);
+            const bool fRead = txdb.ReadTxIndex(pcoin.first->GetHash(), txindex);
+            if (fRPCPerfTrace)
+            {
+                const int64_t nReadMicros = RPCPerfTimeMicros(true) - nReadStartTime;
+                nTxIndexReads++;
+                nTxIndexReadTotalMicros += nReadMicros;
+                nTxIndexReadMaxMicros = std::max(nTxIndexReadMaxMicros, nReadMicros);
+            }
+            if (!fRead)
                 continue;
         }
 
@@ -4316,6 +4371,15 @@ bool CWallet::GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, ui
         }
     }
 
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=GetStakeWeight balance_check_us=%lld selection_us=%lld selected_utxos=%llu txindex_reads=%llu txindex_read_total_us=%lld txindex_read_max_us=%lld total_us=%lld\n",
+                    (long long)nBalanceCheckMicros,
+                    (long long)nSelectionMicros,
+                    (unsigned long long)setCoins.size(),
+                    (unsigned long long)nTxIndexReads,
+                    (long long)nTxIndexReadTotalMicros,
+                    (long long)nTxIndexReadMaxMicros,
+                    (long long)(RPCPerfTimeMicros(true) - nStartTime));
     return true;
 }
 

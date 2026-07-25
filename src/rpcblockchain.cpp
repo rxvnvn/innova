@@ -13,9 +13,17 @@
 #include "base58.h"
 #include "net.h"
 #include <errno.h>
+#include <fstream>
+#include <chrono>
+
+static int64_t RPCPerfTimeMicros()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+#define RPCPERF_LOG(...) do { try { printf(__VA_ARGS__); } catch (...) {} } while (0)
 
 #include <boost/filesystem.hpp>
-#include <fstream>
 
 using namespace json_spirit;
 using namespace std;
@@ -70,6 +78,8 @@ double GetDifficulty(const CBlockIndex* blockindex)
 
 double GetPoWMHashPS()
 {
+    const bool fRPCPerfTrace = GetBoolArg("-rpcperftrace", false);
+    const int64_t nStartTime = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
     int nPoWInterval = 72;
     int nPoWBlocksToCheck = 100000; // Only look at last 100000 blocks max
     int64_t nTargetSpacingWorkMin = 30, nTargetSpacingWork = 30;
@@ -100,14 +110,22 @@ double GetPoWMHashPS()
         nBlocksChecked++;
     }
 
-    return GetDifficulty() * 4294.967296 / nTargetSpacingWork;
+    double dResult = GetDifficulty() * 4294.967296 / nTargetSpacingWork;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=GetPoWMHashPS blocks_examined=%d pow_blocks_found=%d duration_us=%lld result=%.17g\n",
+                    nBlocksChecked, nPoWBlocksFound,
+                    (long long)(RPCPerfTimeMicros() - nStartTime), dResult);
+    return dResult;
 }
 
 double GetPoSKernelPS()
 {
+    const bool fRPCPerfTrace = GetBoolArg("-rpcperftrace", false);
+    const int64_t nStartTime = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
     int nPoSInterval = 72;
     double dStakeKernelsTriedAvg = 0;
     int nStakesHandled = 0, nStakesTime = 0;
+    int nBlocksExamined = 0;
 
     CBlockIndex* pindex = pindexBest;;
     CBlockIndex* pindexPrevStake = NULL;
@@ -123,9 +141,15 @@ double GetPoSKernelPS()
         };
 
         pindex = pindex->pprev;
+        nBlocksExamined++;
     };
 
-    return nStakesTime ? dStakeKernelsTriedAvg / nStakesTime : 0;
+    double dResult = nStakesTime ? dStakeKernelsTriedAvg / nStakesTime : 0;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=GetPoSKernelPS blocks_examined=%d pos_blocks_found=%d duration_us=%lld result=%.17g\n",
+                    nBlocksExamined, nStakesHandled,
+                    (long long)(RPCPerfTimeMicros() - nStartTime), dResult);
+    return dResult;
 }
 
 Object blockHeader2ToJSON(const CBlock& block, const CBlockIndex* blockindex)

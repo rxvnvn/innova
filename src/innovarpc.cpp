@@ -28,7 +28,7 @@
 #include <list>
 #include <deque>
 #include <limits>
-
+#include <chrono>
 #if BOOST_VERSION >= 107300
 #include <boost/bind/bind.hpp>
 using boost::placeholders::_1;
@@ -44,8 +44,16 @@ using namespace boost;
 using namespace boost::asio;
 namespace bfs = boost::filesystem;
 using namespace json_spirit;
-
 void ThreadRPCServer2(void* parg);
+
+void ThreadRPCServer3(void* parg);
+static int64_t RPCPerfTimeMicros()
+{
+    return std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+}
+
+#define RPCPERF_LOG(...) do { try { printf(__VA_ARGS__); } catch (...) {} } while (0)
 
 static std::string strRPCUserColonPass;
 
@@ -1437,10 +1445,15 @@ json_spirit::Value CRPCTable::execute(
     }
 
     const bool fGetInfoProbe = strMethod == "getinfo";
-    const int64_t nRequestStartTime = GetTimeMicros();
+    const bool fRPCPerfTrace =
+        GetBoolArg("-rpcperftrace", false) &&
+        (strMethod == "getinfo" || strMethod == "getmininginfo");
+    const int64_t nRequestStartTime = fGetInfoProbe ? GetTimeMicros() : 0;
+    const int64_t nRPCPerfStartTime = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
+    if (fRPCPerfTrace)
+        RPCPERF_LOG("RPCPERF rpc=%s event=dispatcher_start\n", strMethod.c_str());
     if (fGetInfoProbe)
-        LogGetInfoSyncProbe(
-            "BEGIN", nRequestStartTime, -1);
+        LogGetInfoSyncProbe("BEGIN", nRequestStartTime, -1);
 
     try
     {
@@ -1454,37 +1467,66 @@ json_spirit::Value CRPCTable::execute(
             else
             {
                 CSyncLockDiagnostics lockDiagnostics(
-                    fGetInfoProbe
-                        ? "CRPCTable::execute(getinfo)"
-                        : "CRPCTable::execute",
+                    fGetInfoProbe ? "CRPCTable::execute(getinfo)" : "CRPCTable::execute",
                     "cs_main+cs_wallet");
-                const int64_t nLockWaitStart =
-                    GetTimeMicros();
+                const int64_t nLockWaitStart = fGetInfoProbe ? GetTimeMicros() : 0;
+                const int64_t nRPCPerfLockStart = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
+                int64_t nRPCPerfLockMicros = 0;
+                int64_t nRPCPerfHandlerMicros = 0;
+                bool fRPCPerfHandlerStarted = false;
+                try
                 {
                     LOCK2(cs_main, pwalletMain->cs_wallet);
                     lockDiagnostics.Acquired();
+                    if (fRPCPerfTrace)
+                        nRPCPerfLockMicros = RPCPerfTimeMicros() - nRPCPerfLockStart;
                     if (fGetInfoProbe)
+                        LogGetInfoSyncProbe("LOCKED", nRequestStartTime,
+                            std::max<int64_t>(0, GetTimeMicros() - nLockWaitStart));
+                    const int64_t nHandlerStartTime = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
+                    fRPCPerfHandlerStarted = fRPCPerfTrace;
+                    try
                     {
-                        LogGetInfoSyncProbe(
-                            "LOCKED", nRequestStartTime,
-                            std::max<int64_t>(
-                                0, GetTimeMicros() -
-                                       nLockWaitStart));
+                        result = pcmd->actor(params, false);
                     }
-                    result = pcmd->actor(params, false);
+                    catch (...)
+                    {
+                        if (fRPCPerfTrace)
+                            nRPCPerfHandlerMicros = RPCPerfTimeMicros() - nHandlerStartTime;
+                        throw;
+                    }
+                    if (fRPCPerfTrace)
+                        nRPCPerfHandlerMicros = RPCPerfTimeMicros() - nHandlerStartTime;
+                }
+                catch (...)
+                {
+                    if (fRPCPerfTrace)
+                    {
+                        RPCPERF_LOG("RPCPERF rpc=%s section=dispatcher_lock_wait_total duration_us=%lld\n", strMethod.c_str(), (long long)nRPCPerfLockMicros);
+                        if (fRPCPerfHandlerStarted)
+                            RPCPERF_LOG("RPCPERF rpc=%s section=handler_under_lock duration_us=%lld outcome=exception\n", strMethod.c_str(), (long long)nRPCPerfHandlerMicros);
+                    }
+                    throw;
+                }
+                if (fRPCPerfTrace)
+                {
+                    RPCPERF_LOG("RPCPERF rpc=%s section=dispatcher_lock_wait_total duration_us=%lld\n", strMethod.c_str(), (long long)nRPCPerfLockMicros);
+                    RPCPERF_LOG("RPCPERF rpc=%s section=handler_under_lock duration_us=%lld outcome=success\n", strMethod.c_str(), (long long)nRPCPerfHandlerMicros);
                 }
             }
 
+            if (fRPCPerfTrace)
+                RPCPERF_LOG("RPCPERF rpc=%s event=dispatcher_end total_us=%lld outcome=success\n", strMethod.c_str(), (long long)(RPCPerfTimeMicros() - nRPCPerfStartTime));
             if (fGetInfoProbe)
-                LogGetInfoSyncProbe(
-                    "END", nRequestStartTime, -1);
+                LogGetInfoSyncProbe("END", nRequestStartTime, -1);
             return result;
         }
         catch (...)
         {
+            if (fRPCPerfTrace)
+                RPCPERF_LOG("RPCPERF rpc=%s event=dispatcher_end total_us=%lld outcome=exception\n", strMethod.c_str(), (long long)(RPCPerfTimeMicros() - nRPCPerfStartTime));
             if (fGetInfoProbe)
-                LogGetInfoSyncProbe(
-                    "END", nRequestStartTime, -1);
+                LogGetInfoSyncProbe("END", nRequestStartTime, -1);
             throw;
         }
     }
