@@ -1,7 +1,6 @@
 #ifndef CLIENTMODEL_H
 #define CLIENTMODEL_H
 
-#include <QList>
 #include <QObject>
 #include <QString>
 
@@ -22,55 +21,6 @@ class ClientModel : public QObject
 {
     Q_OBJECT
 public:
-    struct DAGBlockActivity
-    {
-        int height;
-        QString hash;
-        QString blockType;
-        unsigned int sizeBytes;
-        unsigned int txCount;
-        int intervalSeconds;
-        double utilizationPct;
-        int parentCount;
-    };
-
-    struct DAGStatus
-    {
-        bool valid;
-        bool lockBusy;
-        bool active;
-        bool dagKnightActive;
-        int height;
-        int dagForkHeight;
-        int dagKnightForkHeight;
-        int tipCount;
-        int entryCount;
-        QString orderingAlgorithm;
-        int ghostdagK;
-        int inferredK;
-        bool inferredKError;
-        unsigned int adaptiveBlockLimit;
-        unsigned int adaptiveBlockFloor;
-        unsigned int adaptiveBlockCeiling;
-        QString bestDAGTip;
-        QString bestDAGScore;
-        int epoch;
-        int epochInterval;
-        int finalizedHeight;
-        QString finalizedHash;
-        QString finalityTier;
-        int currentEpochVotes;
-        int currentEpochVoters;
-        QString currentEpochWeight;
-        QString latestBlockHash;
-        unsigned int latestBlockSize;
-        unsigned int latestBlockTxCount;
-        double latestBlockUtilizationPct;
-        int latestBlockParentCount;
-        QList<DAGBlockActivity> recentBlocks;
-
-        DAGStatus();
-    };
 
     explicit ClientModel(OptionsModel *optionsModel, QObject *parent = 0);
     ~ClientModel();
@@ -103,8 +53,6 @@ public:
     int getNumBlocksOfPeers() const;
     //! Return warnings to be displayed in status bar
     QString getStatusBarWarnings() const;
-    //! Return non-blocking IDAG state snapshot. recentBlockCount <= 0 skips table rows.
-    DAGStatus getDAGStatus(int recentBlockCount = 0) const;
 
     QString formatFullVersion() const;
     QString formatBuildDate() const;

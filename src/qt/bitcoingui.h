@@ -15,7 +15,6 @@ class CollateralnodeManager;
 class MultisigDialog;
 class OverviewPage;
 class AddressBookPage;
-class IDAGPage;
 class SendCoinsDialog;
 class SignVerifyMessageDialog;
 class Notificator;
@@ -82,7 +81,6 @@ private:
     QStackedWidget *centralWidget;
 
     OverviewPage *overviewPage;
-    IDAGPage *idagPage;
     QWidget *transactionsPage;
 	  QWidget *mintingPage;
 	  MultisigDialog *multisigPage;
@@ -107,7 +105,6 @@ private:
 
     QMenuBar *appMenuBar;
     QAction *overviewAction;
-    QAction *idagAction;
     QAction *historyAction;
 	  QAction *mintingAction;
 	  QAction *multisigAction;
@@ -195,8 +192,6 @@ public slots:
 private slots:
     /** Switch to overview (home) page */
     void gotoOverviewPage();
-    /** Switch to IDAG page */
-    void gotoIDAGPage();
 	/** Switch to minting page */
     void gotoMintingPage();
     /** Switch to history (transactions) page */

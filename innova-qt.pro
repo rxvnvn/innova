@@ -576,7 +576,6 @@ HEADERS += src/qt/bitcoingui.h \
     src/ui_interface.h \
     src/qt/rpcconsole.h \
     src/qt/trafficgraphwidget.h \
-    src/qt/idagpage.h \
     src/qt/qcustomplot.h \
     src/qt/collateralnodemanager.h \
     src/qt/addeditadrenalinenode.h \
@@ -684,7 +683,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/qt/qtipcserver.cpp \
     src/qt/rpcconsole.cpp \
     src/qt/trafficgraphwidget.cpp \
-    src/qt/idagpage.cpp \
     src/qt/qcustomplot.cpp \
     src/qt/qvalidatedtextedit.cpp \
     src/qt/plugins/mrichtexteditor/mrichtextedit.cpp \

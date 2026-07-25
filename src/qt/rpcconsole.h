@@ -100,20 +100,13 @@ private:
         SUBVERSION_COLUMN_WIDTH = 140,
         PING_COLUMN_WIDTH = 90
     };
-
     Ui::RPCConsole *ui;
     ClientModel *clientModel;
     QStringList history;
     int historyPtr;
     QCompleter *autoCompleter;
     NodeId cachedNodeid;
-    QLabel *dagStatus;
-    QLabel *dagTips;
-    QLabel *dagInferredK;
-    QLabel *dagAdaptiveLimit;
-    QLabel *dagFinality;
     void startExecutor();
-    void updateDAGInfo();
 };
 
 #endif // RPCCONSOLE_H
