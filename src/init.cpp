@@ -1727,7 +1727,8 @@ bool AppInit2()
 
     NewThread(ThreadNullSend, NULL);
 
-    if (!GetBoolArg("-nofinalityvoting", false))
+    if (!GetBoolArg("-nofinalityvoting", false) &&
+        FORK_HEIGHT_FINALITY < MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT)
         NewThread(ThreadFinalityVoter, NULL);
 
     // IDAG Phase 2+3: DAG manager initialized via global constructor
