@@ -444,7 +444,26 @@ bool SeedGenesisCommitments(CTxDB& txdb, CIncrementalMerkleTree& shieldedTree, C
 void RegisterWallet(CWallet* pwalletIn);
 void UnregisterWallet(CWallet* pwalletIn);
 void SyncWithWallets(const CTransaction& tx, const CBlock* pblock = NULL, bool fUpdate = false, bool fConnect = true);
-bool ProcessBlock(CNode* pfrom, CBlock* pblock);
+
+enum ProcessBlockResult
+{
+    PBRESULT_UNCLASSIFIED = 0,
+    PBRESULT_ACCEPTED,
+    PBRESULT_ORPHANED,
+    PBRESULT_DUPLICATE_INDEXED,
+    PBRESULT_DUPLICATE_ORPHAN,
+    PBRESULT_DUPLICATE_STAKE,
+    PBRESULT_REJECTED_DAG_FORK,
+    PBRESULT_REJECTED_WEAK,
+    PBRESULT_REJECTED_INVALID,
+    PBRESULT_REJECTED_ORPHAN_LIMIT_IBD,
+    PBRESULT_REJECTED_ORPHAN_LIMIT_NORMAL,
+    PBRESULT_ACCEPT_FAILED
+};
+
+const char* ProcessBlockResultName(ProcessBlockResult result);
+
+bool ProcessBlock(CNode* pfrom, CBlock* pblock, ProcessBlockResult* pResult = NULL);
 bool CheckDiskSpace(uint64_t nAdditionalBytes=0);
 FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode="rb");
 FILE* AppendBlockFile(unsigned int& nFileRet);

@@ -6253,9 +6253,32 @@ bool CBlockIndex::IsSuperMajority(int minVersion, const CBlockIndex* pstart, uns
     return (nFound >= nRequired);
 }
 
-bool ProcessBlock(CNode* pfrom, CBlock* pblock)
+const char* ProcessBlockResultName(ProcessBlockResult result)
+{
+    switch (result)
+    {
+    case PBRESULT_UNCLASSIFIED:               return "UNCLASSIFIED";
+    case PBRESULT_ACCEPTED:                   return "ACCEPTED";
+    case PBRESULT_ORPHANED:                   return "ORPHANED";
+    case PBRESULT_DUPLICATE_INDEXED:          return "DUPLICATE_INDEXED";
+    case PBRESULT_DUPLICATE_ORPHAN:           return "DUPLICATE_ORPHAN";
+    case PBRESULT_DUPLICATE_STAKE:            return "DUPLICATE_STAKE";
+    case PBRESULT_REJECTED_DAG_FORK:          return "REJECTED_DAG_FORK";
+    case PBRESULT_REJECTED_WEAK:              return "REJECTED_WEAK";
+    case PBRESULT_REJECTED_INVALID:           return "REJECTED_INVALID";
+    case PBRESULT_REJECTED_ORPHAN_LIMIT_IBD:  return "REJECTED_ORPHAN_LIMIT_IBD";
+    case PBRESULT_REJECTED_ORPHAN_LIMIT_NORMAL: return "REJECTED_ORPHAN_LIMIT_NORMAL";
+    case PBRESULT_ACCEPT_FAILED:              return "ACCEPT_FAILED";
+    }
+    return "UNKNOWN";
+}
+
+bool ProcessBlock(CNode* pfrom, CBlock* pblock, ProcessBlockResult* pResult)
 {
     AssertLockHeld(cs_main);
+
+    if (pResult)
+        *pResult = PBRESULT_UNCLASSIFIED;
 
     int64_t nStartTime = GetTimeMillis();
     // Check for duplicate
@@ -6268,16 +6291,22 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                nBestHeight);
     if (pfrom != NULL && pindexBest != NULL && pindexBest->GetBlockTime() < GetTime() - 300 && fDebug)
         printf("sync: ProcessBlock %s from %s (height %d)\n", hash.ToString().substr(0,20).c_str(), pfrom->addrName.c_str(), nBestHeight);
-    if (mapBlockIndex.count(hash))
+    if (mapBlockIndex.count(hash)) {
+        if (pResult) *pResult = PBRESULT_DUPLICATE_INDEXED;
         return error("ProcessBlock() : already have block %d %s", mapBlockIndex[hash]->nHeight, hash.ToString().substr(0,20).c_str());
-    if (mapOrphanBlocks.count(hash))
+    }
+    if (mapOrphanBlocks.count(hash)) {
+        if (pResult) *pResult = PBRESULT_DUPLICATE_ORPHAN;
         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,20).c_str());
+    }
 
     // ppcoin: check proof-of-stake
     // Limited duplicity on stake: prevents block flood attack
     // Duplicate stake allowed only when there is orphan child block
-    if (pblock->IsProofOfStake() && setStakeSeen.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
+    if (pblock->IsProofOfStake() && setStakeSeen.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash)) {
+        if (pResult) *pResult = PBRESULT_DUPLICATE_STAKE;
         return error("ProcessBlock() : duplicate proof-of-stake (%s, %d) for block %s", pblock->GetProofOfStake().first.ToString().c_str(), pblock->GetProofOfStake().second, hash.ToString().c_str());
+    }
 
     if (pblock->IsProofOfStake() && mapBlockIndex.count(pblock->hashPrevBlock))
     {
@@ -6286,14 +6315,17 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         {
             if (pfrom)
                 pfrom->Misbehaving(100);
+            if (pResult) *pResult = PBRESULT_REJECTED_DAG_FORK;
             return error("ProcessBlock() : proof-of-stake block after DAG fork");
         }
     }
 
     // Preliminary checks
     int64_t nCheckStart = GetTimeMillis();
-    if (!pblock->CheckBlock())
+    if (!pblock->CheckBlock()) {
+        if (pResult) *pResult = PBRESULT_REJECTED_INVALID;
         return error("ProcessBlock() : CheckBlock FAILED");
+    }
     int64_t nCheckMs = GetTimeMillis() - nCheckStart;
 
     CBlockIndex* pcheckpoint = Checkpoints::GetLastSyncCheckpoint();
@@ -6314,6 +6346,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         {
             if (pfrom)
                 pfrom->Misbehaving(100);
+            if (pResult) *pResult = PBRESULT_REJECTED_WEAK;
             return error("ProcessBlock() : block with too little %s", pblock->IsProofOfStake()? "proof-of-stake" : "proof-of-work");
         }
     }
@@ -6372,9 +6405,11 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                 pfrom->PushGetBlocks(pindexBest, uint256(0));
 
                 if (IsInitialBlockDownload()) {
+                    if (pResult) *pResult = PBRESULT_REJECTED_ORPHAN_LIMIT_IBD;
                     return error("ProcessBlock() : peer %d exceeded orphan limit (IBD, no penalty)", pfrom->GetId());
                 }
                 pfrom->Misbehaving(1);
+                if (pResult) *pResult = PBRESULT_REJECTED_ORPHAN_LIMIT_NORMAL;
                 return error("ProcessBlock() : peer %d exceeded orphan limit", pfrom->GetId());
             }
         }
@@ -6384,8 +6419,10 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         {
             // Limited duplicity on stake: prevents block flood attack
             // Duplicate stake allowed only when there is orphan child block
-            if (setStakeSeenOrphan.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
+            if (setStakeSeenOrphan.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash)) {
+                if (pResult) *pResult = PBRESULT_DUPLICATE_STAKE;
                 return error("ProcessBlock() : duplicate proof-of-stake (%s, %d) for orphan block %s", pblock->GetProofOfStake().first.ToString().c_str(), pblock->GetProofOfStake().second, hash.ToString().c_str());
+            }
             else
                 setStakeSeenOrphan.insert(pblock->GetProofOfStake());
         }
@@ -6411,13 +6448,16 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                 CInv(MSG_BLOCK, WantedByOrphan(pblock2)),
                 BLOCKREQ_SOURCE_ORPHAN);
         }
+        if (pResult) *pResult = PBRESULT_ORPHANED;
         return true;
     }
 
     // Store to disk
     int64_t nAcceptStart = GetTimeMillis();
-    if (!pblock->AcceptBlock())
+    if (!pblock->AcceptBlock()) {
+        if (pResult) *pResult = PBRESULT_ACCEPT_FAILED;
         return error("ProcessBlock() : AcceptBlock FAILED");
+    }
     int64_t nAcceptMs = GetTimeMillis() - nAcceptStart;
 
     // Recursively process any orphan blocks that depended on this one
@@ -6459,6 +6499,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     if (pfrom && !CSyncCheckpoint::strMasterPrivKey.empty())
         Checkpoints::SendSyncCheckpoint(Checkpoints::AutoSelectSyncCheckpoint()->GetBlockHash());
 
+    if (pResult) *pResult = PBRESULT_ACCEPTED;
     return true;
 }
 
@@ -8429,7 +8470,16 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pfrom, hashBlock, "receive",
                 nSenderInFlightAge, fKnownBefore);
         }
-        bool fAccepted = ProcessBlock(pfrom, &block);
+        ProcessBlockResult blockResult = PBRESULT_UNCLASSIFIED;
+        bool fAccepted = ProcessBlock(pfrom, &block, &blockResult);
+        if (SyncTraceEnabled())
+            printf("SYNC_EVENT time_us=%lld event=PROCESS_BLOCK_RESULT hash=%s result=%s accepted=%d peer=%d local_height=%d\n",
+                   (long long)GetTimeMicros(),
+                   hashBlock.ToString().c_str(),
+                   ProcessBlockResultName(blockResult),
+                   fAccepted ? 1 : 0,
+                   pfrom ? pfrom->GetId() : -1,
+                   nBestHeight);
         if (fAccepted)
         {
             ClearRejectedBlockForSync(hashBlock);
