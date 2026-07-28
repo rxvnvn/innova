@@ -412,9 +412,11 @@ enum BlockRequestOwnerState
 };
 
 bool TryAssignBlockRequestOwner(const uint256& hash, NodeId peer,
+                                BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER,
                                 NodeId* existingPeer = NULL,
                                 BlockRequestOwnerState* existingState = NULL);
 bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
+                                      BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER,
                                       NodeId* existingPeer = NULL,
                                       BlockRequestOwnerState* existingState = NULL);
 bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
@@ -1008,7 +1010,7 @@ public:
         mapAskFor.erase(it);
         if (fReleaseOwner &&
             (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK))
-            ReleaseBlockRequestOwner(inv.hash, GetId(), "queue-removed");
+            ReleaseBlockRequestOwner(inv.hash, GetId(), "queue-removal");
     }
 
     void ClearAskFor()
@@ -1018,7 +1020,7 @@ public:
         {
             if (it->second.type == MSG_BLOCK ||
                 it->second.type == MSG_FILTERED_BLOCK)
-                ReleaseBlockRequestOwner(it->second.hash, GetId(), "queue-clear");
+                ReleaseBlockRequestOwner(it->second.hash, GetId(), "clear");
         }
         mapAskFor.clear();
         setAskForBlocks.clear();
@@ -1060,7 +1062,7 @@ public:
         NodeId nOwnerPeer = -1;
         BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
         if (fBlockRequest &&
-            (!TryAssignBlockRequestOwnerLocked(inv.hash, GetId(),
+            (!TryAssignBlockRequestOwnerLocked(inv.hash, GetId(), source,
                                                &nOwnerPeer, &ownerState) ||
              (nOwnerPeer == GetId() &&
               ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)))

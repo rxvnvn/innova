@@ -2200,6 +2200,42 @@ uint256 WantedByOrphan(const CBlock* pblockOrphan)
     return pblockOrphan->hashPrevBlock;
 }
 
+static const char* BlockRequestTraceParentStatusLocked(const uint256& hash)
+{
+    if (hash == uint256(0))
+        return "none";
+    std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(hash);
+    if (mi != mapBlockIndex.end())
+        return mi->second->IsInMainChain() ? "active" : "indexed";
+    if (mapOrphanBlocks.count(hash) != 0)
+        return "orphan";
+    return "missing";
+}
+
+static void BlockRequestTraceUpdateBlockContextLocked(
+    const uint256& hash,
+    const uint256& parentHash,
+    const uint256& orphanChildHash)
+{
+    if (!BlockRequestTraceEnabled())
+        return;
+    int nBlockIndexHeight = -1;
+    bool fBodyKnown = false;
+    std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(hash);
+    if (mi != mapBlockIndex.end())
+    {
+        nBlockIndexHeight = mi->second->nHeight;
+        fBodyKnown = true;
+    }
+    else if (mapOrphanBlocks.count(hash) != 0)
+    {
+        fBodyKnown = true;
+    }
+    BlockRequestTraceSetBlockContext(
+        hash, parentHash, BlockRequestTraceParentStatusLocked(parentHash),
+        nBestHeight, nBlockIndexHeight, fBodyKnown, orphanChildHash);
+}
+
 // Remove a random orphan block (which does not have any dependent orphans).
 void static PruneOrphanBlocks()
 {
@@ -6408,8 +6444,10 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                 pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
             // ppcoin: getblocks may not obtain the ancestor block rejected
             // earlier by duplicate-stake check so we ask for it again directly
+            uint256 hashWanted = WantedByOrphan(pblock2);
+            BlockRequestTraceUpdateBlockContextLocked(hashWanted, hashWanted, hash);
             pfrom->AskFor(
-                CInv(MSG_BLOCK, WantedByOrphan(pblock2)),
+                CInv(MSG_BLOCK, hashWanted),
                 BLOCKREQ_SOURCE_ORPHAN);
         }
         return true;
@@ -7721,9 +7759,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             else if (inv.type == MSG_BLOCK && mapOrphanBlocks.count(inv.hash)) {
                 CBlock* pblockOrphan = mapOrphanBlocks[inv.hash];
                 if (IsInitialBlockDownload())
+                {
+                    uint256 hashWanted = WantedByOrphan(pblockOrphan);
+                    BlockRequestTraceUpdateBlockContextLocked(hashWanted, hashWanted, inv.hash);
                     pfrom->AskFor(
-                        CInv(MSG_BLOCK, WantedByOrphan(pblockOrphan)),
+                        CInv(MSG_BLOCK, hashWanted),
                         BLOCKREQ_SOURCE_ORPHAN);
+                }
                 else
                     pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblockOrphan));
             } else if (nInv == nLastBlock) {
@@ -8290,8 +8332,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                      (nOwnerPeer != pfrom->GetId() ||
                       ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)) ||
                     (!fHasOwner &&
-                     !TryAssignBlockRequestOwner(inv.hash, pfrom->GetId(),
-                                                  &nOwnerPeer, &ownerState)))
+                     !TryAssignBlockRequestOwner(
+                         inv.hash, pfrom->GetId(),
+                         BLOCKREQ_SOURCE_HEADERS_DIRECT,
+                         &nOwnerPeer, &ownerState)))
                 {
                     if (BlockRequestTraceEnabled())
                         BlockRequestTraceGetDataSkip(
@@ -8312,9 +8356,20 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (BlockRequestTraceEnabled())
             {
                 for (const CInv& inv : vGetData)
+                {
+                    std::map<uint256, CBlockIndex*>::const_iterator miTrace =
+                        mapBlockIndex.find(inv.hash);
+                    uint256 hashParent = uint256(0);
+                    if (miTrace != mapBlockIndex.end() && miTrace->second->pprev)
+                        hashParent = miTrace->second->pprev->GetBlockHash();
+                    BlockRequestTraceUpdateBlockContextLocked(
+                        inv.hash, hashParent, uint256(0));
                     BlockRequestTraceGetDataSend(
                         pfrom, inv.hash, BLOCKREQ_SOURCE_HEADERS_DIRECT,
-                        0, true, false, false, false, -1, -1);
+                        miTrace != mapBlockIndex.end() ? 1 : 0,
+                        true, miTrace != mapBlockIndex.end(), false, false,
+                        -1, -1);
+                }
             }
             if (!vGetData.empty())
             {
@@ -8443,8 +8498,23 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         blockLockDiagnostics.Acquired();
         bool fKnownBefore = mapBlockIndex.count(hashBlock) != 0;
         bool fOrphanBefore = mapOrphanBlocks.count(hashBlock) != 0;
+        bool fMissingPrevBefore = mapBlockIndex.count(block.hashPrevBlock) == 0;
+        bool fWouldHitIbdOrphanLimit = false;
+        if (pfrom && fMissingPrevBefore && IsInitialBlockDownload())
+        {
+            std::map<NodeId, int>::const_iterator miOrphanCount =
+                mapOrphanCountByNode.find(pfrom->GetId());
+            int nOrphansFromPeerBefore =
+                miOrphanCount == mapOrphanCountByNode.end()
+                    ? 0 : miOrphanCount->second;
+            fWouldHitIbdOrphanLimit =
+                nOrphansFromPeerBefore >= MAX_ORPHAN_BLOCKS_PER_PEER;
+        }
+
         if (fTraceBlockRequest)
         {
+            BlockRequestTraceUpdateBlockContextLocked(
+                hashBlock, block.hashPrevBlock, uint256(0));
             BlockRequestTraceBlockReceive(
                 pfrom, hashBlock, fKnownBefore,
                 fSenderInFlightBefore, nSenderInFlightAge);
@@ -8516,9 +8586,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 traceResult = BLOCKREQ_RESULT_ORPHAN_NEW;
             else if (fAccepted)
                 traceResult = BLOCKREQ_RESULT_TRUE_UNINDEXED;
+            else if (fWouldHitIbdOrphanLimit)
+                traceResult = BLOCKREQ_RESULT_ORPHAN_LIMIT_IBD;
+            else if (block.nDoS == 0 && !fMissingPrevBefore)
+                traceResult = BLOCKREQ_RESULT_ACCEPT_FAILED;
             else
                 traceResult = BLOCKREQ_RESULT_REJECTED;
-
             BlockRequestTraceBlockResult(
                 pfrom, hashBlock, traceResult, fAccepted,
                 fIndexedAfter, fActiveChainAfter,
@@ -9474,8 +9547,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     continue;
                 }
                 if (!fHasOwner &&
-                    !TryAssignBlockRequestOwner(inv.hash, pto->GetId(),
-                                                &nOwnerPeer, &ownerState))
+                    !TryAssignBlockRequestOwner(
+                        inv.hash, pto->GetId(), BLOCKREQ_SOURCE_ASKFOR,
+                        &nOwnerPeer, &ownerState))
                 {
                     if (fTraceBlockRequest)
                         BlockRequestTraceGetDataSkip(
@@ -9498,8 +9572,18 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 {
                     fCsMainCheckPerformed = true;
                     if (fTraceBlockRequest)
-                        nKnownInBlockIndex =
-                            mapBlockIndex.count(inv.hash) != 0 ? 1 : 0;
+                    {
+                        std::map<uint256, CBlockIndex*>::const_iterator miTrace =
+                            mapBlockIndex.find(inv.hash);
+                        nKnownInBlockIndex = miTrace != mapBlockIndex.end() ? 1 : 0;
+                        uint256 hashParent = uint256(0);
+                        if (miTrace != mapBlockIndex.end() && miTrace->second->pprev)
+                            hashParent = miTrace->second->pprev->GetBlockHash();
+                        else if (mapOrphanBlocks.count(inv.hash) != 0)
+                            hashParent = mapOrphanBlocks[inv.hash]->hashPrevBlock;
+                        BlockRequestTraceUpdateBlockContextLocked(
+                            inv.hash, hashParent, uint256(0));
+                    }
                     CTxDB txdb("r");
                     fSkip = AlreadyHave(txdb, inv);
                     fCsMainCheckResult = fSkip;

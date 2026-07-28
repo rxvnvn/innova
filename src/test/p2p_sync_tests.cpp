@@ -117,6 +117,27 @@ public:
     }
 };
 
+class CScopedOrphanBlocks
+{
+private:
+    std::map<uint256, CBlock*> saved;
+
+public:
+    CScopedOrphanBlocks()
+    {
+        saved = mapOrphanBlocks;
+        mapOrphanBlocks.clear();
+    }
+
+    ~CScopedOrphanBlocks()
+    {
+        for (std::map<uint256, CBlock*>::iterator it = mapOrphanBlocks.begin();
+             it != mapOrphanBlocks.end(); ++it)
+            delete it->second;
+        mapOrphanBlocks = saved;
+    }
+};
+
 class CScopedInitialBlockDownloadState
 {
 private:
@@ -342,6 +363,39 @@ BOOST_AUTO_TEST_CASE(block_askfor_owner_releases_after_receive)
     peer1.ClearAskFor();
     peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_REJECT_RECOVERY);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(orphan_traversal_requests_missing_parent_not_known_child)
+{
+    CScopedOrphanBlocks isolatedOrphans;
+    CBlock* pChild = new CBlock();
+    pChild->nTime = 7001;
+    pChild->hashPrevBlock = uint256(7000);
+    const uint256 hashChild = pChild->GetHash();
+    mapOrphanBlocks[hashChild] = pChild;
+
+    BOOST_CHECK(WantedByOrphan(pChild) == pChild->hashPrevBlock);
+    BOOST_CHECK(WantedByOrphan(pChild) != hashChild);
+}
+
+BOOST_AUTO_TEST_CASE(orphan_chain_requests_root_missing_ancestor)
+{
+    CScopedOrphanBlocks isolatedOrphans;
+    CBlock* pParent = new CBlock();
+    pParent->nTime = 7010;
+    pParent->hashPrevBlock = uint256(7009);
+    const uint256 hashParent = pParent->GetHash();
+    mapOrphanBlocks[hashParent] = pParent;
+
+    CBlock* pChild = new CBlock();
+    pChild->nTime = 7011;
+    pChild->hashPrevBlock = hashParent;
+    const uint256 hashChild = pChild->GetHash();
+    mapOrphanBlocks[hashChild] = pChild;
+
+    BOOST_CHECK(WantedByOrphan(pChild) == pParent->hashPrevBlock);
+    BOOST_CHECK(WantedByOrphan(pChild) != hashChild);
+    BOOST_CHECK(WantedByOrphan(pChild) != hashParent);
 }
 
 

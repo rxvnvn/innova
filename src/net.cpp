@@ -1687,6 +1687,7 @@ const char* BlockRequestOwnerStateName(BlockRequestOwnerState state)
 }
 
 bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
+                                      BlockRequestTraceSource source,
                                       NodeId* existingPeer,
                                       BlockRequestOwnerState* existingState)
 {
@@ -1697,8 +1698,7 @@ bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
         mapBlockRequestOwners.insert(std::make_pair(
             hash, BlockRequestOwner(peer, BLOCK_REQUEST_OWNER_QUEUED)));
         if (BlockRequestTraceEnabled())
-            printf("BLOCKREQTRACE time_us=%lld event=OWNER_ASSIGN hash=%s peer=%d state=queued\n",
-                   (long long)GetTimeMicros(), hash.ToString().c_str(), peer);
+            BlockRequestTraceOwnerAssign(hash, peer, "queued", source);
         return true;
     }
     if (existingPeer)
@@ -1709,11 +1709,12 @@ bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
 }
 
 bool TryAssignBlockRequestOwner(const uint256& hash, NodeId peer,
+                                BlockRequestTraceSource source,
                                 NodeId* existingPeer,
                                 BlockRequestOwnerState* existingState)
 {
     LOCK(cs_mapAlreadyAskedFor);
-    return TryAssignBlockRequestOwnerLocked(hash, peer, existingPeer, existingState);
+    return TryAssignBlockRequestOwnerLocked(hash, peer, source, existingPeer, existingState);
 }
 
 bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
@@ -1757,9 +1758,9 @@ bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
     if (it == mapBlockRequestOwners.end() || it->second.peer != peer)
         return false;
     if (BlockRequestTraceEnabled())
-        printf("BLOCKREQTRACE time_us=%lld event=OWNER_RELEASE hash=%s peer=%d state=%s reason=%s\n",
-               (long long)GetTimeMicros(), hash.ToString().c_str(), peer,
-               BlockRequestOwnerStateName(it->second.state), pszReason);
+        BlockRequestTraceOwnerRelease(hash, peer,
+                                      BlockRequestOwnerStateName(it->second.state),
+                                      pszReason);
     mapBlockRequestOwners.erase(it);
     return true;
 }
@@ -1772,9 +1773,9 @@ bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer)
     if (it == mapBlockRequestOwners.end())
         return false;
     if (BlockRequestTraceEnabled())
-        printf("BLOCKREQTRACE time_us=%lld event=OWNER_RELEASE hash=%s peer=%d state=%s reason=receive\n",
-               (long long)GetTimeMicros(), hash.ToString().c_str(),
-               it->second.peer, BlockRequestOwnerStateName(it->second.state));
+        BlockRequestTraceOwnerRelease(hash, it->second.peer,
+                                      BlockRequestOwnerStateName(it->second.state),
+                                      "receive");
     mapBlockRequestOwners.erase(it);
     return true;
 }
@@ -1792,9 +1793,9 @@ size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason)
             continue;
         }
         if (BlockRequestTraceEnabled())
-            printf("BLOCKREQTRACE time_us=%lld event=OWNER_RELEASE hash=%s peer=%d state=%s reason=%s\n",
-                   (long long)GetTimeMicros(), it->first.ToString().c_str(), peer,
-                   BlockRequestOwnerStateName(it->second.state), pszReason);
+            BlockRequestTraceOwnerRelease(it->first, peer,
+                                          BlockRequestOwnerStateName(it->second.state),
+                                          pszReason);
         it = mapBlockRequestOwners.erase(it);
         ++nReleased;
     }
@@ -1947,6 +1948,16 @@ struct BlockRequestTraceEntry
     BlockRequestTraceSource firstSendSource;
     BlockRequestTraceResult lastResult;
     std::string lastRemovalReason;
+    std::string lastReleaseReason;
+    NodeId lastReleasePeer;
+    std::string lastReleaseState;
+    int64_t lastReleaseTime;
+    uint256 parentHash;
+    std::string parentStatus;
+    uint256 orphanChildHash;
+    int activeHeight;
+    int blockIndexHeight;
+    bool bodyKnown;
     int lastKnownHeight;
     bool indexed;
     bool activeChain;
@@ -1979,6 +1990,12 @@ struct BlockRequestTraceEntry
           firstRequestSource(BLOCKREQ_SOURCE_OTHER),
           firstSendSource(BLOCKREQ_SOURCE_OTHER),
           lastResult(BLOCKREQ_RESULT_UNKNOWN),
+          lastReleasePeer(-1),
+          lastReleaseTime(0),
+          parentStatus("unknown"),
+          activeHeight(-1),
+          blockIndexHeight(-1),
+          bodyKnown(false),
           lastKnownHeight(-1),
           indexed(false),
           activeChain(false),
@@ -2006,6 +2023,23 @@ struct BlockRequestTraceCounters
     uint64_t maxSimultaneousOwnership;
     uint64_t registryDrops;
     uint64_t peerStateDrops;
+    uint64_t releaseReceive;
+    uint64_t releaseTimeout;
+    uint64_t releaseDisconnect;
+    uint64_t releaseQueueRemoval;
+    uint64_t releaseClear;
+    uint64_t resultAccepted;
+    uint64_t resultOrphaned;
+    uint64_t resultDuplicateIndexed;
+    uint64_t resultDuplicateOrphan;
+    uint64_t resultOrphanLimitIbd;
+    uint64_t resultRejectedInvalid;
+    uint64_t resultAcceptFailed;
+    uint64_t sourceInv;
+    uint64_t sourceOrphan;
+    uint64_t sourceRecovery;
+    uint64_t duplicateAssignAfterReceiveRelease;
+    uint64_t duplicateSendAfterReceiveRelease;
 
     BlockRequestTraceCounters()
         : uniqueHashesScheduled(0),
@@ -2023,7 +2057,24 @@ struct BlockRequestTraceCounters
           pipelineTriggerCount(0),
           maxSimultaneousOwnership(0),
           registryDrops(0),
-          peerStateDrops(0)
+          peerStateDrops(0),
+          releaseReceive(0),
+          releaseTimeout(0),
+          releaseDisconnect(0),
+          releaseQueueRemoval(0),
+          releaseClear(0),
+          resultAccepted(0),
+          resultOrphaned(0),
+          resultDuplicateIndexed(0),
+          resultDuplicateOrphan(0),
+          resultOrphanLimitIbd(0),
+          resultRejectedInvalid(0),
+          resultAcceptFailed(0),
+          sourceInv(0),
+          sourceOrphan(0),
+          sourceRecovery(0),
+          duplicateAssignAfterReceiveRelease(0),
+          duplicateSendAfterReceiveRelease(0)
     {
     }
 };
@@ -2077,6 +2128,10 @@ static const char* BlockRequestTraceResultName(BlockRequestTraceResult result)
         return "orphan-duplicate";
     case BLOCKREQ_RESULT_REJECTED:
         return "rejected-or-invalid";
+    case BLOCKREQ_RESULT_ORPHAN_LIMIT_IBD:
+        return "orphan-limit-ibd";
+    case BLOCKREQ_RESULT_ACCEPT_FAILED:
+        return "accept-failed";
     case BLOCKREQ_RESULT_TRUE_UNINDEXED:
         return "process-true-unindexed";
     default:
@@ -2148,6 +2203,63 @@ static size_t BlockRequestTraceOwnershipCount(const BlockRequestTraceEntry& entr
 static bool BlockRequestTraceHasOwnership(const BlockRequestTraceEntry& entry)
 {
     return BlockRequestTraceOwnershipCount(entry) != 0;
+}
+
+static void BlockRequestTraceCountSourceLocked(BlockRequestTraceSource source)
+{
+    if (source == BLOCKREQ_SOURCE_INV)
+        ++blockRequestTraceCounters.sourceInv;
+    else if (source == BLOCKREQ_SOURCE_ORPHAN)
+        ++blockRequestTraceCounters.sourceOrphan;
+    else if (source == BLOCKREQ_SOURCE_REJECT_RECOVERY)
+        ++blockRequestTraceCounters.sourceRecovery;
+}
+
+static void BlockRequestTraceCountReleaseLocked(const char* pszReason)
+{
+    if (!pszReason)
+        return;
+    if (strcmp(pszReason, "receive") == 0)
+        ++blockRequestTraceCounters.releaseReceive;
+    else if (strcmp(pszReason, "timeout") == 0)
+        ++blockRequestTraceCounters.releaseTimeout;
+    else if (strcmp(pszReason, "disconnect") == 0)
+        ++blockRequestTraceCounters.releaseDisconnect;
+    else if (strcmp(pszReason, "queue-removal") == 0)
+        ++blockRequestTraceCounters.releaseQueueRemoval;
+    else if (strcmp(pszReason, "clear") == 0)
+        ++blockRequestTraceCounters.releaseClear;
+}
+
+static void BlockRequestTraceCountResultLocked(BlockRequestTraceResult result)
+{
+    switch (result)
+    {
+    case BLOCKREQ_RESULT_ACCEPTED_ACTIVE:
+    case BLOCKREQ_RESULT_ACCEPTED_INDEXED:
+        ++blockRequestTraceCounters.resultAccepted;
+        break;
+    case BLOCKREQ_RESULT_ORPHAN_NEW:
+        ++blockRequestTraceCounters.resultOrphaned;
+        break;
+    case BLOCKREQ_RESULT_ALREADY_KNOWN:
+        ++blockRequestTraceCounters.resultDuplicateIndexed;
+        break;
+    case BLOCKREQ_RESULT_ORPHAN_DUPLICATE:
+        ++blockRequestTraceCounters.resultDuplicateOrphan;
+        break;
+    case BLOCKREQ_RESULT_ORPHAN_LIMIT_IBD:
+        ++blockRequestTraceCounters.resultOrphanLimitIbd;
+        break;
+    case BLOCKREQ_RESULT_ACCEPT_FAILED:
+        ++blockRequestTraceCounters.resultAcceptFailed;
+        break;
+    case BLOCKREQ_RESULT_REJECTED:
+        ++blockRequestTraceCounters.resultRejectedInvalid;
+        break;
+    default:
+        break;
+    }
 }
 
 static BlockRequestTracePeerState* BlockRequestTracePeerLocked(
@@ -2271,7 +2383,7 @@ static void BlockRequestTraceMaybeSummaryLocked(int64_t nNow)
         nNow - nLastBlockRequestTraceSummary < BLOCK_REQUEST_TRACE_SUMMARY_INTERVAL_US)
         return;
     nLastBlockRequestTraceSummary = nNow;
-    printf("BLOCKREQTRACE time_us=%lld event=SUMMARY unique_hashes_scheduled=%llu total_schedules=%llu duplicate_schedules=%llu total_getdata_sends=%llu duplicate_getdata_sends=%llu known_getdata_sends=%llu failed_trylock_sends=%llu cross_peer_overlaps=%llu total_receives=%llu duplicate_known_receives=%llu stall_recoveries=%llu batch75_triggers=%llu pipeline_triggers=%llu max_peer_ownership=%llu registry_size=%zu registry_drops=%llu peer_state_drops=%llu\n",
+    printf("BLOCKREQTRACE time_us=%lld event=SUMMARY unique_hashes_scheduled=%llu total_schedules=%llu duplicate_schedules=%llu total_getdata_sends=%llu duplicate_getdata_sends=%llu known_getdata_sends=%llu failed_trylock_sends=%llu cross_peer_overlaps=%llu total_receives=%llu duplicate_known_receives=%llu stall_recoveries=%llu batch75_triggers=%llu pipeline_triggers=%llu max_peer_ownership=%llu registry_size=%zu registry_drops=%llu peer_state_drops=%llu release_receive=%llu release_timeout=%llu release_disconnect=%llu release_queue_removal=%llu release_clear=%llu result_accepted=%llu result_orphaned=%llu result_duplicate_indexed=%llu result_duplicate_orphan=%llu result_orphan_limit_ibd=%llu result_rejected_invalid=%llu result_accept_failed=%llu source_inv=%llu source_orphan=%llu source_recovery=%llu duplicate_assign_after_receive_release=%llu duplicate_send_after_receive_release=%llu\n",
            (long long)nNow,
            (unsigned long long)blockRequestTraceCounters.uniqueHashesScheduled,
            (unsigned long long)blockRequestTraceCounters.totalSchedules,
@@ -2289,7 +2401,24 @@ static void BlockRequestTraceMaybeSummaryLocked(int64_t nNow)
            (unsigned long long)blockRequestTraceCounters.maxSimultaneousOwnership,
            mapBlockRequestTrace.size(),
            (unsigned long long)blockRequestTraceCounters.registryDrops,
-           (unsigned long long)blockRequestTraceCounters.peerStateDrops);
+           (unsigned long long)blockRequestTraceCounters.peerStateDrops,
+           (unsigned long long)blockRequestTraceCounters.releaseReceive,
+           (unsigned long long)blockRequestTraceCounters.releaseTimeout,
+           (unsigned long long)blockRequestTraceCounters.releaseDisconnect,
+           (unsigned long long)blockRequestTraceCounters.releaseQueueRemoval,
+           (unsigned long long)blockRequestTraceCounters.releaseClear,
+           (unsigned long long)blockRequestTraceCounters.resultAccepted,
+           (unsigned long long)blockRequestTraceCounters.resultOrphaned,
+           (unsigned long long)blockRequestTraceCounters.resultDuplicateIndexed,
+           (unsigned long long)blockRequestTraceCounters.resultDuplicateOrphan,
+           (unsigned long long)blockRequestTraceCounters.resultOrphanLimitIbd,
+           (unsigned long long)blockRequestTraceCounters.resultRejectedInvalid,
+           (unsigned long long)blockRequestTraceCounters.resultAcceptFailed,
+           (unsigned long long)blockRequestTraceCounters.sourceInv,
+           (unsigned long long)blockRequestTraceCounters.sourceOrphan,
+           (unsigned long long)blockRequestTraceCounters.sourceRecovery,
+           (unsigned long long)blockRequestTraceCounters.duplicateAssignAfterReceiveRelease,
+           (unsigned long long)blockRequestTraceCounters.duplicateSendAfterReceiveRelease);
 }
 
 } // namespace
@@ -2332,6 +2461,95 @@ bool InitBlockRequestTrace(bool fEnabled, const std::string& strHashFilter)
 bool BlockRequestTraceEnabled()
 {
     return fBlockRequestTraceEnabled;
+}
+
+void BlockRequestTraceSetBlockContext(const uint256& hash,
+                                      const uint256& parentHash,
+                                      const char* pszParentStatus,
+                                      int nActiveHeight,
+                                      int nBlockIndexHeight,
+                                      bool fBodyKnown,
+                                      const uint256& orphanChildHash)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, true);
+    if (!entry)
+        return;
+    entry->parentHash = parentHash;
+    entry->parentStatus = pszParentStatus ? pszParentStatus : "unknown";
+    entry->activeHeight = nActiveHeight;
+    entry->blockIndexHeight = nBlockIndexHeight;
+    entry->bodyKnown = fBodyKnown;
+    entry->orphanChildHash = orphanChildHash;
+}
+
+void BlockRequestTraceOwnerAssign(const uint256& hash, int peer,
+                                  const char* pszState,
+                                  BlockRequestTraceSource source)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, true);
+    if (!entry)
+        return;
+    const bool fRepeated = entry->requestCount != 0 || entry->sendCount != 0 ||
+                           entry->receiveCount != 0 || entry->lastReleaseTime != 0 ||
+                           entry->lastResult != BLOCKREQ_RESULT_UNKNOWN;
+    if (fRepeated && entry->lastReleaseReason == "receive")
+        ++blockRequestTraceCounters.duplicateAssignAfterReceiveRelease;
+    BlockRequestTraceCountSourceLocked(source);
+    entry->completed = false;
+    printf("BLOCKREQTRACE time_us=%lld event=OWNER_ASSIGN hash=%s peer=%d state=%s source=%s repeat=%d previous_owner_peer=%d previous_owner_state=%s previous_release_reason=%s previous_result=%s previous_receive_count=%llu previous_send_count=%llu parent_hash=%s parent_status=%s active_height=%d block_index_height=%d elapsed_release_us=%lld elapsed_receive_us=%lld body_known=%d orphan_child_hash=%s\n",
+           (long long)nNow, hash.ToString().c_str(), peer,
+           pszState ? pszState : "unknown",
+           BlockRequestTraceSourceName(source), fRepeated ? 1 : 0,
+           entry->lastReleasePeer,
+           entry->lastReleaseState.empty() ? "none" : entry->lastReleaseState.c_str(),
+           entry->lastReleaseReason.empty() ? "none" : entry->lastReleaseReason.c_str(),
+           BlockRequestTraceResultName(entry->lastResult),
+           (unsigned long long)entry->receiveCount,
+           (unsigned long long)entry->sendCount,
+           entry->parentHash.ToString().c_str(), entry->parentStatus.c_str(),
+           entry->activeHeight, entry->blockIndexHeight,
+           entry->lastReleaseTime == 0 ? -1 : (long long)(nNow - entry->lastReleaseTime),
+           entry->lastReceiveTime == 0 ? -1 : (long long)(nNow - entry->lastReceiveTime),
+           entry->bodyKnown ? 1 : 0,
+           entry->orphanChildHash.ToString().c_str());
+    BlockRequestTraceMaybeSummaryLocked(nNow);
+}
+
+void BlockRequestTraceOwnerRelease(const uint256& hash, int peer,
+                                   const char* pszState,
+                                   const char* pszReason)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    LOCK(cs_blockRequestTrace);
+    BlockRequestTraceEntry* entry = BlockRequestTraceGetLocked(hash, nNow, true);
+    if (!entry)
+        return;
+    entry->lastReleasePeer = peer;
+    entry->lastReleaseState = pszState ? pszState : "unknown";
+    entry->lastReleaseReason = pszReason ? pszReason : "unknown";
+    entry->lastReleaseTime = nNow;
+    entry->lastRemovalReason = entry->lastReleaseReason;
+    BlockRequestTraceCountReleaseLocked(pszReason);
+    printf("BLOCKREQTRACE time_us=%lld event=OWNER_RELEASE hash=%s peer=%d state=%s reason=%s previous_result=%s receive_count=%llu send_count=%llu parent_hash=%s parent_status=%s body_known=%d orphan_child_hash=%s\n",
+           (long long)nNow, hash.ToString().c_str(), peer,
+           entry->lastReleaseState.c_str(), entry->lastReleaseReason.c_str(),
+           BlockRequestTraceResultName(entry->lastResult),
+           (unsigned long long)entry->receiveCount,
+           (unsigned long long)entry->sendCount,
+           entry->parentHash.ToString().c_str(), entry->parentStatus.c_str(),
+           entry->bodyKnown ? 1 : 0,
+           entry->orphanChildHash.ToString().c_str());
+    BlockRequestTraceMaybeSummaryLocked(nNow);
 }
 
 void BlockRequestTraceAskSchedule(CNode* pnode, const uint256& hash,
@@ -2536,6 +2754,8 @@ void BlockRequestTraceGetDataSend(CNode* pnode, const uint256& hash,
     if (entry->sendCount >= 2)
     {
         ++blockRequestTraceCounters.duplicateSends;
+        if (entry->lastReleaseReason == "receive")
+            ++blockRequestTraceCounters.duplicateSendAfterReceiveRelease;
         entry->anomalous = true;
     }
     if (nKnownInBlockIndex > 0)
@@ -2558,7 +2778,7 @@ void BlockRequestTraceGetDataSend(CNode* pnode, const uint256& hash,
         !fCsMainCheckPerformed || path == BLOCKREQ_SOURCE_HEADERS_DIRECT ||
         fBlockRequestTraceFilter)
     {
-        printf("BLOCKREQTRACE time_us=%lld event=GETDATA_SEND hash=%s peer=%d addr=%s path=%s source=%s request_count=%llu send_count=%llu first_seen_us=%lld first_request_us=%lld last_request_us=%lld first_scheduled_us=%lld first_peer=%d first_addr=%s first_source=%s known_index=%d cs_main_check_performed=%d cs_main_check_result=%d same_peer_inflight=%d same_peer_queued=%llu other_peer_inflight=%zu mapaskfor_present=%d previous_global_asked_us=%lld written_global_asked_us=%lld global_asked_us=%lld first_send_us=%lld last_send_us=%lld first_send_peer=%d first_send_addr=%s first_send_source=%s previous_send_us=%lld first_receive_us=%lld last_receive_us=%lld first_receive_peer=%d first_receive_addr=%s previous_result=%s previous_indexed=%d previous_active=%d previous_height=%d last_removal=%s\n",
+        printf("BLOCKREQTRACE time_us=%lld event=GETDATA_SEND hash=%s peer=%d addr=%s path=%s source=%s request_count=%llu send_count=%llu first_seen_us=%lld first_request_us=%lld last_request_us=%lld first_scheduled_us=%lld first_peer=%d first_addr=%s first_source=%s known_index=%d cs_main_check_performed=%d cs_main_check_result=%d same_peer_inflight=%d same_peer_queued=%llu other_peer_inflight=%zu mapaskfor_present=%d previous_global_asked_us=%lld written_global_asked_us=%lld global_asked_us=%lld first_send_us=%lld last_send_us=%lld first_send_peer=%d first_send_addr=%s first_send_source=%s previous_send_us=%lld first_receive_us=%lld last_receive_us=%lld first_receive_peer=%d first_receive_addr=%s previous_owner_peer=%d previous_owner_state=%s previous_release_reason=%s previous_result=%s previous_receive_count=%llu previous_send_count=%llu previous_indexed=%d previous_active=%d previous_height=%d elapsed_release_us=%lld elapsed_receive_us=%lld parent_hash=%s parent_status=%s active_height=%d block_index_height=%d body_known=%d orphan_child_hash=%s last_removal=%s\n",
                (long long)nNow, hash.ToString().c_str(), peer,
                peerState->address.c_str(), BlockRequestTraceSourceName(path),
                BlockRequestTraceSourceName(entry->lastSource),
@@ -2593,10 +2813,21 @@ void BlockRequestTraceGetDataSend(CNode* pnode, const uint256& hash,
                entry->firstReceivePeer,
                entry->firstReceiveAddress.empty()
                    ? "unknown" : entry->firstReceiveAddress.c_str(),
+               entry->lastReleasePeer,
+               entry->lastReleaseState.empty() ? "none" : entry->lastReleaseState.c_str(),
+               entry->lastReleaseReason.empty() ? "none" : entry->lastReleaseReason.c_str(),
                BlockRequestTraceResultName(entry->lastResult),
+               (unsigned long long)entry->receiveCount,
+               (unsigned long long)entry->sendCount,
                entry->indexed ? 1 : 0,
                entry->activeChain ? 1 : 0,
                entry->lastKnownHeight,
+               entry->lastReleaseTime == 0 ? -1 : (long long)(nNow - entry->lastReleaseTime),
+               entry->lastReceiveTime == 0 ? -1 : (long long)(nNow - entry->lastReceiveTime),
+               entry->parentHash.ToString().c_str(), entry->parentStatus.c_str(),
+               entry->activeHeight, entry->blockIndexHeight,
+               entry->bodyKnown ? 1 : 0,
+               entry->orphanChildHash.ToString().c_str(),
                entry->lastRemovalReason.empty()
                    ? "none" : entry->lastRemovalReason.c_str());
     }
@@ -2724,6 +2955,7 @@ void BlockRequestTraceBlockResult(CNode* pnode, const uint256& hash,
         return;
 
     entry->lastResult = result;
+    BlockRequestTraceCountResultLocked(result);
     entry->indexed = fIndexedAfter;
     entry->activeChain = fActiveChainAfter;
     entry->lastKnownHeight = nHeightAfter;

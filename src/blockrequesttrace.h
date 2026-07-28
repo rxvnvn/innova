@@ -33,12 +33,21 @@ enum BlockRequestTraceResult
     BLOCKREQ_RESULT_ALREADY_KNOWN,
     BLOCKREQ_RESULT_ORPHAN_DUPLICATE,
     BLOCKREQ_RESULT_REJECTED,
+    BLOCKREQ_RESULT_ORPHAN_LIMIT_IBD,
+    BLOCKREQ_RESULT_ACCEPT_FAILED,
     BLOCKREQ_RESULT_TRUE_UNINDEXED
 };
 
 bool InitBlockRequestTrace(bool fEnabled, const std::string& strHashFilter);
 bool BlockRequestTraceEnabled();
 
+void BlockRequestTraceSetBlockContext(const uint256& hash,
+                                      const uint256& parentHash,
+                                      const char* pszParentStatus,
+                                      int nActiveHeight,
+                                      int nBlockIndexHeight,
+                                      bool fBodyKnown,
+                                      const uint256& orphanChildHash);
 void BlockRequestTraceAskSchedule(CNode* pnode, const uint256& hash,
                                   BlockRequestTraceSource source,
                                   int64_t nScheduledTime,
@@ -84,6 +93,12 @@ void BlockRequestTraceInFlightClear(CNode* pnode, const uint256& hash,
 void BlockRequestTraceInFlightExpire(CNode* pnode, const uint256& hash,
                                      int64_t nAge);
 void BlockRequestTracePeerClosed(CNode* pnode);
+void BlockRequestTraceOwnerAssign(const uint256& hash, int peer,
+                                  const char* pszState,
+                                  BlockRequestTraceSource source);
+void BlockRequestTraceOwnerRelease(const uint256& hash, int peer,
+                                   const char* pszState,
+                                   const char* pszReason);
 
 void BlockRequestTraceGetBlocksQueued(CNode* pnode,
                                       const uint256& hashBegin,
