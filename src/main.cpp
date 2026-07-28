@@ -7282,6 +7282,11 @@ void static ProcessGetData(CNode* pfrom)
                     pfrom->fDisconnect = true;
                     send = false;
                 }
+                size_t nQueuePos = (it - pfrom->vRecvGetData.begin()) - 1;
+                size_t nRemaining = pfrom->vRecvGetData.end() - it;
+                FirstOrderBreakTraceServeGetData(
+                    pfrom, inv.hash, nQueuePos,
+                    mi != mapBlockIndex.end(), send, nRemaining);
             }
             else if (inv.IsKnownType())
             {
@@ -8373,6 +8378,28 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             }
             if (!vGetData.empty())
             {
+                if (FirstOrderBreakTraceEnabled())
+                {
+                    uint64_t nBatchId = FirstOrderBreakNextBatchId();
+                    uint256 hashPrev;
+                    for (size_t i = 0; i < vGetData.size(); i++)
+                    {
+                        bool fKnownIndex = mapBlockIndex.count(vGetData[i].hash) != 0;
+                        bool fKnownParent = false;
+                        if (fKnownIndex)
+                        {
+                            CBlockIndex* pidx = mapBlockIndex[vGetData[i].hash];
+                            if (pidx->pprev)
+                                fKnownParent = mapBlockIndex.count(pidx->pprev->GetBlockHash()) != 0;
+                        }
+                        FirstOrderBreakTraceGetDataBatch(
+                            pfrom, vGetData[i].hash, nBatchId, i, hashPrev,
+                            BLOCKREQ_SOURCE_HEADERS_DIRECT,
+                            FirstOrderBreakNextRequestSeq(),
+                            fKnownIndex, fKnownParent);
+                        hashPrev = vGetData[i].hash;
+                    }
+                }
                 pfrom->nLastGetDataTime = GetTime();
                 pfrom->PushMessage("getdata", vGetData);
             }
@@ -8596,6 +8623,41 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pfrom, hashBlock, traceResult, fAccepted,
                 fIndexedAfter, fActiveChainAfter,
                 fBestChainAfter, nHeightAfter);
+        }
+
+        if (FirstOrderBreakTraceEnabled())
+        {
+            uint64_t nSrcBatchId = 0;
+            size_t nSrcBatchPos = 0;
+            FirstOrderBreakLookupBatchOrigin(hashBlock, nSrcBatchId, nSrcBatchPos);
+            uint256 hashPrevFromPeer = FirstOrderBreakLastRecvFromPeer(pfrom->GetId());
+            bool fPrevInIndex = mapBlockIndex.count(block.hashPrevBlock) != 0;
+            bool fPrevInOrphans = mapOrphanBlocks.count(block.hashPrevBlock) != 0;
+            bool fPrevQueued = pfrom->setAskForBlocks.count(block.hashPrevBlock) != 0;
+            bool fPrevInFlight = pfrom->setBlocksInFlight.count(block.hashPrevBlock) != 0;
+            bool fPrevSentGetData = false;
+            {
+                LOCK(cs_mapAlreadyAskedFor);
+                fPrevSentGetData = mapAlreadyAskedFor.count(
+                    CInv(MSG_BLOCK, block.hashPrevBlock)) != 0;
+            }
+            std::map<NodeId, int>::const_iterator miOrphBefore =
+                mapOrphanCountByNode.find(pfrom->GetId());
+            int nOrphanBefore = miOrphBefore == mapOrphanCountByNode.end()
+                ? 0 : miOrphBefore->second;
+            std::map<NodeId, int>::const_iterator miOrphAfter =
+                mapOrphanCountByNode.find(pfrom->GetId());
+            int nOrphanAfter = miOrphAfter == mapOrphanCountByNode.end()
+                ? 0 : miOrphAfter->second;
+            FirstOrderBreakTraceBlockReceived(
+                pfrom, hashBlock, block.hashPrevBlock,
+                FirstOrderBreakNextReceiveSeq(),
+                nSrcBatchId, nSrcBatchPos,
+                hashPrevFromPeer,
+                fPrevInIndex, fPrevInOrphans,
+                fPrevQueued, fPrevInFlight, fPrevSentGetData,
+                static_cast<int>(traceResult),
+                nOrphanBefore, nOrphanAfter);
         }
 
         if (IBDEfficiencyTraceEnabled())
@@ -9602,6 +9664,29 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 }
                 if (vGetData.size() >= 1000)
                 {
+                    if (FirstOrderBreakTraceEnabled())
+                    {
+                        uint64_t nBatchId = FirstOrderBreakNextBatchId();
+                        uint256 hashPrev;
+                        TRY_LOCK(cs_main, lockFirstOrder);
+                        for (size_t i = 0; i < vGetData.size(); i++)
+                        {
+                            bool fKnownIndex = lockFirstOrder && mapBlockIndex.count(vGetData[i].hash) != 0;
+                            bool fKnownParent = false;
+                            if (fKnownIndex)
+                            {
+                                CBlockIndex* pidx = mapBlockIndex[vGetData[i].hash];
+                                if (pidx->pprev)
+                                    fKnownParent = mapBlockIndex.count(pidx->pprev->GetBlockHash()) != 0;
+                            }
+                            FirstOrderBreakTraceGetDataBatch(
+                                pto, vGetData[i].hash, nBatchId, i, hashPrev,
+                                BLOCKREQ_SOURCE_ASKFOR,
+                                FirstOrderBreakNextRequestSeq(),
+                                fKnownIndex, fKnownParent);
+                            hashPrev = vGetData[i].hash;
+                        }
+                    }
                     pto->nLastGetDataTime = GetTime();
                     pto->PushMessage("getdata", vGetData);
                     vGetData.clear();
@@ -9651,6 +9736,29 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         }
         if (!vGetData.empty())
         {
+            if (FirstOrderBreakTraceEnabled())
+            {
+                uint64_t nBatchId = FirstOrderBreakNextBatchId();
+                uint256 hashPrev;
+                TRY_LOCK(cs_main, lockFirstOrder);
+                for (size_t i = 0; i < vGetData.size(); i++)
+                {
+                    bool fKnownIndex = lockFirstOrder && mapBlockIndex.count(vGetData[i].hash) != 0;
+                    bool fKnownParent = false;
+                    if (fKnownIndex)
+                    {
+                        CBlockIndex* pidx = mapBlockIndex[vGetData[i].hash];
+                        if (pidx->pprev)
+                            fKnownParent = mapBlockIndex.count(pidx->pprev->GetBlockHash()) != 0;
+                    }
+                    FirstOrderBreakTraceGetDataBatch(
+                        pto, vGetData[i].hash, nBatchId, i, hashPrev,
+                        BLOCKREQ_SOURCE_ASKFOR,
+                        FirstOrderBreakNextRequestSeq(),
+                        fKnownIndex, fKnownParent);
+                    hashPrev = vGetData[i].hash;
+                }
+            }
             pto->nLastGetDataTime = GetTime();
             pto->PushMessage("getdata", vGetData);
         }

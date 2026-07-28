@@ -3215,6 +3215,165 @@ void BlockRequestTraceGetBlocksTrigger(CNode* pnode,
     BlockRequestTraceMaybeSummaryLocked(nNow);
 }
 
+// ---- First-order break trace ----
+static bool fFirstOrderBreakTraceEnabled = false;
+static CCriticalSection cs_firstOrderTrace;
+static uint64_t nFirstOrderRequestSeq = 0;
+static uint64_t nFirstOrderReceiveSeq = 0;
+static uint64_t nFirstOrderBatchId = 0;
+// Hash -> (originating batch_id, batch_position) for matching receives to GETDATA
+static std::map<uint256, std::pair<uint64_t, size_t> > mapFirstOrderBatchOrigin;
+// Per-peer last received block hash
+static std::map<NodeId, uint256> mapFirstOrderLastRecv;
+static const size_t FIRST_ORDER_BATCH_ORIGIN_MAX = 65536;
+
+bool InitFirstOrderBreakTrace()
+{
+    fFirstOrderBreakTraceEnabled = GetBoolArg("-firstorderbreaktrace", false);
+    if (fFirstOrderBreakTraceEnabled)
+        printf("FIRSTORDER: first-order break trace enabled\n");
+    return fFirstOrderBreakTraceEnabled;
+}
+
+bool FirstOrderBreakTraceEnabled()
+{
+    return fFirstOrderBreakTraceEnabled;
+}
+
+void FirstOrderBreakTraceGetDataBatch(CNode* pnode,
+    const uint256& hash,
+    uint64_t nBatchId,
+    size_t nBatchPos,
+    const uint256& hashPrevInBatch,
+    BlockRequestTraceSource source,
+    uint64_t nRequestSeq,
+    bool fKnownIndex,
+    bool fKnownParent)
+{
+    if (!fFirstOrderBreakTraceEnabled)
+        return;
+    {
+        LOCK(cs_firstOrderTrace);
+        mapFirstOrderBatchOrigin[hash] = std::make_pair(nBatchId, nBatchPos);
+        if (mapFirstOrderBatchOrigin.size() > FIRST_ORDER_BATCH_ORIGIN_MAX)
+            mapFirstOrderBatchOrigin.erase(mapFirstOrderBatchOrigin.begin());
+    }
+    printf("FIRSTORDER time_us=%lld event=GETDATA_ITEM peer=%d addr=%s batch_id=%llu batch_pos=%zu hash=%s prev_in_batch=%s source=%s request_seq=%llu known_index=%d known_parent=%d\n",
+           (long long)GetTimeMicros(),
+           pnode->GetId(),
+           pnode->addrName.empty() ? pnode->addr.ToString().c_str() : pnode->addrName.c_str(),
+           (unsigned long long)nBatchId,
+           nBatchPos,
+           hash.ToString().c_str(),
+           hashPrevInBatch.ToString().c_str(),
+           BlockRequestTraceSourceName(source),
+           (unsigned long long)nRequestSeq,
+           fKnownIndex ? 1 : 0,
+           fKnownParent ? 1 : 0);
+}
+
+void FirstOrderBreakTraceBlockReceived(CNode* pnode,
+    const uint256& hash,
+    const uint256& hashPrev,
+    uint64_t nReceiveSeq,
+    uint64_t nSrcBatchId,
+    size_t nSrcBatchPos,
+    const uint256& hashPrevFromPeer,
+    bool fPrevInIndex,
+    bool fPrevInOrphans,
+    bool fPrevQueued,
+    bool fPrevInFlight,
+    bool fPrevSentGetData,
+    int nResultCode,
+    int nOrphanBefore,
+    int nOrphanAfter)
+{
+    if (!fFirstOrderBreakTraceEnabled)
+        return;
+    {
+        LOCK(cs_firstOrderTrace);
+        mapFirstOrderLastRecv[pnode->GetId()] = hash;
+    }
+    printf("FIRSTORDER time_us=%lld event=BLOCK_RECEIVE peer=%d addr=%s hash=%s prev=%s receive_seq=%llu src_batch_id=%llu src_batch_pos=%zu prev_from_peer=%s prev_in_index=%d prev_in_orphans=%d prev_queued=%d prev_inflight=%d prev_sent_getdata=%d result_code=%d orphan_before=%d orphan_after=%d\n",
+           (long long)GetTimeMicros(),
+           pnode->GetId(),
+           pnode->addrName.empty() ? pnode->addr.ToString().c_str() : pnode->addrName.c_str(),
+           hash.ToString().c_str(),
+           hashPrev.ToString().c_str(),
+           (unsigned long long)nReceiveSeq,
+           (unsigned long long)nSrcBatchId,
+           nSrcBatchPos,
+           hashPrevFromPeer.ToString().c_str(),
+           fPrevInIndex ? 1 : 0,
+           fPrevInOrphans ? 1 : 0,
+           fPrevQueued ? 1 : 0,
+           fPrevInFlight ? 1 : 0,
+           fPrevSentGetData ? 1 : 0,
+           nResultCode,
+           nOrphanBefore,
+           nOrphanAfter);
+}
+
+uint64_t FirstOrderBreakNextRequestSeq()
+{
+    LOCK(cs_firstOrderTrace);
+    return ++nFirstOrderRequestSeq;
+}
+
+uint64_t FirstOrderBreakNextReceiveSeq()
+{
+    LOCK(cs_firstOrderTrace);
+    return ++nFirstOrderReceiveSeq;
+}
+
+uint64_t FirstOrderBreakNextBatchId()
+{
+    LOCK(cs_firstOrderTrace);
+    return ++nFirstOrderBatchId;
+}
+
+void FirstOrderBreakLookupBatchOrigin(const uint256& hash,
+    uint64_t& nBatchId, size_t& nBatchPos)
+{
+    LOCK(cs_firstOrderTrace);
+    std::map<uint256, std::pair<uint64_t, size_t> >::const_iterator it =
+        mapFirstOrderBatchOrigin.find(hash);
+    if (it != mapFirstOrderBatchOrigin.end())
+    {
+        nBatchId = it->second.first;
+        nBatchPos = it->second.second;
+    }
+}
+
+uint256 FirstOrderBreakLastRecvFromPeer(int peer)
+{
+    LOCK(cs_firstOrderTrace);
+    std::map<NodeId, uint256>::const_iterator it =
+        mapFirstOrderLastRecv.find(peer);
+    return it != mapFirstOrderLastRecv.end() ? it->second : uint256(0);
+}
+
+void FirstOrderBreakTraceServeGetData(CNode* pnode,
+    const uint256& hash,
+    size_t nQueuePos,
+    bool fFound,
+    bool fSent,
+    size_t nRemainingInQueue)
+{
+    if (!fFirstOrderBreakTraceEnabled)
+        return;
+    printf("FIRSTORDER time_us=%lld event=SERVE_GETDATA peer=%d addr=%s hash=%s queue_pos=%zu found=%d sent=%d remaining=%zu\n",
+           (long long)GetTimeMicros(),
+           pnode->GetId(),
+           pnode->addrName.empty() ? pnode->addr.ToString().c_str() : pnode->addrName.c_str(),
+           hash.ToString().c_str(),
+           nQueuePos,
+           fFound ? 1 : 0,
+           fSent ? 1 : 0,
+           nRemainingInQueue);
+}
+// ---- End first-order break trace ----
+
 static deque<string> vOneShots;
 CCriticalSection cs_vOneShots;
 
