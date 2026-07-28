@@ -96,20 +96,20 @@ void IBDEfficiencyCounters::RecordBlock(uint64_t nBlockSize,
 static void PrintRate(const char* label, uint64_t count, int64_t nElapsedSec)
 {
     if (nElapsedSec > 0)
-        printf("IBDEFFICIENCY %s %" PRIu64 " (%.1f/s)\n",
+        LogPrintf("IBDEFFICIENCY %s %" PRIu64 " (%.1f/s)\n",
                label, count, (double)count / nElapsedSec);
     else
-        printf("IBDEFFICIENCY %s %" PRIu64 "\n", label, count);
+        LogPrintf("IBDEFFICIENCY %s %" PRIu64 "\n", label, count);
 }
 
 static void PrintBytes(const char* label, uint64_t bytes, int64_t nElapsedSec)
 {
     double mb = bytes / (1024.0 * 1024.0);
     if (nElapsedSec > 0)
-        printf("IBDEFFICIENCY %s %.1fMB (%.1fMB/s)\n",
+        LogPrintf("IBDEFFICIENCY %s %.1fMB (%.1fMB/s)\n",
                label, mb, mb / nElapsedSec);
     else
-        printf("IBDEFFICIENCY %s %.1fMB\n", label, mb);
+        LogPrintf("IBDEFFICIENCY %s %.1fMB\n", label, mb);
 }
 
 void IBDEfficiencyCounters::PrintSummary(const char* pszLabel,
@@ -133,38 +133,38 @@ void IBDEfficiencyCounters::PrintSummary(const char* pszLabel,
 
     int nHeightDelta = nHeightEnd - nHeightStart;
 
-    printf("IBDEFFICIENCY %s heights=%d..%d (delta=%d) elapsed=%" PRId64 "s\n",
+    LogPrintf("IBDEFFICIENCY %s heights=%d..%d (delta=%d) elapsed=%" PRId64 "s\n",
            pszLabel, nHeightStart, nHeightEnd, nHeightDelta, nElapsedSec);
 
-    printf("IBDEFFICIENCY --- origin ---\n");
+    LogPrintf("IBDEFFICIENCY --- origin ---\n");
     PrintRate("blocks_requested", nRequested, nElapsedSec);
     PrintRate("blocks_unsolicited", nUnsolicited, nElapsedSec);
-    printf("IBDEFFICIENCY requested_ratio %.1f%%\n",
+    LogPrintf("IBDEFFICIENCY requested_ratio %.1f%%\n",
            nTotal > 0 ? 100.0 * nRequested / nTotal : 0.0);
     PrintBytes("bytes_requested", bytes_requested.load(std::memory_order_relaxed), nElapsedSec);
     PrintBytes("bytes_unsolicited", bytes_unsolicited.load(std::memory_order_relaxed), nElapsedSec);
 
-    printf("IBDEFFICIENCY --- novelty ---\n");
+    LogPrintf("IBDEFFICIENCY --- novelty ---\n");
     PrintRate("blocks_unique", nUnique, nElapsedSec);
     PrintRate("blocks_duplicate_indexed", nDupIdx, nElapsedSec);
     PrintRate("blocks_duplicate_orphan", nDupOrph, nElapsedSec);
-    printf("IBDEFFICIENCY unique_ratio %.1f%%\n",
+    LogPrintf("IBDEFFICIENCY unique_ratio %.1f%%\n",
            nTotal > 0 ? 100.0 * nUnique / nTotal : 0.0);
     PrintBytes("bytes_unique", bytes_unique.load(std::memory_order_relaxed), nElapsedSec);
     PrintBytes("bytes_duplicate", bytes_duplicate.load(std::memory_order_relaxed), nElapsedSec);
 
-    printf("IBDEFFICIENCY --- outcome ---\n");
+    LogPrintf("IBDEFFICIENCY --- outcome ---\n");
     PrintRate("blocks_accepted_active", nAccActive, nElapsedSec);
     PrintRate("blocks_accepted_side", nAccSide, nElapsedSec);
     PrintRate("blocks_orphan_new", nOrphanNew, nElapsedSec);
     PrintRate("blocks_rejected", nRejected, nElapsedSec);
     PrintRate("blocks_retry_recorded", nRetry, nElapsedSec);
     uint64_t nAccepted = nAccActive + nAccSide;
-    printf("IBDEFFICIENCY active_ratio %.1f%% (of accepted)\n",
+    LogPrintf("IBDEFFICIENCY active_ratio %.1f%% (of accepted)\n",
            nAccepted > 0 ? 100.0 * nAccActive / nAccepted : 0.0);
-    printf("IBDEFFICIENCY efficiency %.1f%% (accepted_active / total)\n",
+    LogPrintf("IBDEFFICIENCY efficiency %.1f%% (accepted_active / total)\n",
            nTotal > 0 ? 100.0 * nAccActive / nTotal : 0.0);
-    printf("IBDEFFICIENCY blocks_per_height %.1f\n",
+    LogPrintf("IBDEFFICIENCY blocks_per_height %.1f\n",
            nHeightDelta > 0 ? (double)nTotal / nHeightDelta : 0.0);
 
     PrintBytes("bytes_accepted_active", bytes_accepted_active.load(std::memory_order_relaxed), nElapsedSec);
@@ -202,7 +202,7 @@ bool InitIBDEfficiencyTrace(bool fEnabled)
     {
         nIBDEfficiencyLastSummary = GetTimeMicros();
         nIBDEfficiencyLastHeight = nBestHeight;
-        printf("IBDEFFICIENCY time_us=%lld event=START enabled=1\n",
+        LogPrintf("IBDEFFICIENCY time_us=%lld event=START enabled=1\n",
                (long long)nIBDEfficiencyLastSummary);
     }
     return true;
