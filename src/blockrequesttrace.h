@@ -46,10 +46,15 @@ void BlockRequestTraceAskSchedule(CNode* pnode, const uint256& hash,
                                   bool fSamePeerInFlight);
 void BlockRequestTraceAskSkip(CNode* pnode, const uint256& hash,
                               BlockRequestTraceSource source,
-                              const char* pszReason);
+                              const char* pszReason,
+                              int ownerPeer = -1,
+                              const char* pszOwnerState = "none");
 void BlockRequestTraceAskRemoved(CNode* pnode, const uint256& hash,
                                  const char* pszReason,
                                  int nKnownInBlockIndex);
+void BlockRequestTraceGetDataSkip(CNode* pnode, const uint256& hash,
+                                  int ownerPeer,
+                                  const char* pszOwnerState);
 void BlockRequestTraceGetDataSend(CNode* pnode, const uint256& hash,
                                   BlockRequestTraceSource path,
                                   int nKnownInBlockIndex,

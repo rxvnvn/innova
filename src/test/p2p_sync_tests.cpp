@@ -295,8 +295,7 @@ BOOST_AUTO_TEST_CASE(block_request_trace_reports_same_peer_skip)
     BOOST_CHECK(InitBlockRequestTrace(false, ""));
     fPrintToConsole = fPrintToConsoleSaved;
 }
-
-BOOST_AUTO_TEST_CASE(block_askfor_dedup_is_per_peer_and_not_global)
+BOOST_AUTO_TEST_CASE(block_askfor_has_one_global_active_owner)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
     const uint256 hash(4004);
@@ -304,17 +303,47 @@ BOOST_AUTO_TEST_CASE(block_askfor_dedup_is_per_peer_and_not_global)
     CNode peer2(INVALID_SOCKET, TestPeerAddress(42), "askfor-peer-two", true);
 
     peer1.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
-    peer1.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_ORPHAN);
     peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
-    peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_ORPHAN);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer1, hash), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 0U);
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peer1.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+
+    peer1.EraseAskForEntry(peer1.mapAskFor.begin());
+    peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 1U);
 
     const uint256 hashTx(4005);
     peer1.AskFor(CInv(MSG_TX, hashTx), BLOCKREQ_SOURCE_INV);
     peer1.AskFor(CInv(MSG_TX, hashTx), BLOCKREQ_SOURCE_ORPHAN);
-    BOOST_CHECK_EQUAL(peer1.mapAskFor.size(), 3U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer1, hash), 0U);
+    BOOST_CHECK_EQUAL(peer1.mapAskFor.size(), 2U);
 }
+
+BOOST_AUTO_TEST_CASE(block_askfor_owner_releases_after_receive)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hash(4006);
+    CNode peer1(INVALID_SOCKET, TestPeerAddress(43), "owner-peer-one", true);
+    CNode peer2(INVALID_SOCKET, TestPeerAddress(44), "owner-peer-two", true);
+
+    peer1.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    peer1.MarkBlockInFlight(hash);
+    peer1.EraseAskForEntry(peer1.mapAskFor.begin(), false);
+    peer1.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer1, hash), 0U);
+    peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 0U);
+
+    peer1.ClearBlockInFlight(hash);
+    peer1.ClearAskFor();
+    peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_REJECT_RECOVERY);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 1U);
+}
+
 
 BOOST_AUTO_TEST_CASE(block_askfor_can_retry_after_inflight_expiry)
 {

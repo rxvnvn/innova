@@ -8279,6 +8279,32 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // In full node mode, request full blocks for announced headers
         if (!fSPVMode && !vGetData.empty())
         {
+            vector<CInv> vOwnedGetData;
+            for (const CInv& inv : vGetData)
+            {
+                NodeId nOwnerPeer = -1;
+                BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+                bool fHasOwner = GetBlockRequestOwner(
+                    inv.hash, &nOwnerPeer, &ownerState);
+                if ((fHasOwner &&
+                     (nOwnerPeer != pfrom->GetId() ||
+                      ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)) ||
+                    (!fHasOwner &&
+                     !TryAssignBlockRequestOwner(inv.hash, pfrom->GetId(),
+                                                  &nOwnerPeer, &ownerState)))
+                {
+                    if (BlockRequestTraceEnabled())
+                        BlockRequestTraceGetDataSkip(
+                            pfrom, inv.hash, nOwnerPeer,
+                            BlockRequestOwnerStateName(ownerState));
+                    continue;
+                }
+                vOwnedGetData.push_back(inv);
+                pfrom->MarkBlockInFlight(inv.hash);
+                if (BlockRequestTraceEnabled())
+                    BlockRequestTraceInFlightMark(pfrom, inv.hash, false);
+            }
+            vGetData.swap(vOwnedGetData);
             if (fDebug)
                 printf("Requesting %u full blocks from peer %s via getdata\n",
                        (unsigned int)vGetData.size(),
@@ -8286,19 +8312,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (BlockRequestTraceEnabled())
             {
                 for (const CInv& inv : vGetData)
-                {
                     BlockRequestTraceGetDataSend(
                         pfrom, inv.hash, BLOCKREQ_SOURCE_HEADERS_DIRECT,
                         0, true, false, false, false, -1, -1);
-                }
             }
-            pfrom->nLastGetDataTime = GetTime();
-            pfrom->PushMessage("getdata", vGetData);
-            for (const CInv& inv : vGetData)
+            if (!vGetData.empty())
             {
-                pfrom->MarkBlockInFlight(inv.hash);
-                if (BlockRequestTraceEnabled())
-                    BlockRequestTraceInFlightMark(pfrom, inv.hash, false);
+                pfrom->nLastGetDataTime = GetTime();
+                pfrom->PushMessage("getdata", vGetData);
             }
         }
 
@@ -8414,6 +8435,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     std::max<int64_t>(0, GetTime() - miInFlight->second);
         }
         pfrom->ClearBlockInFlight(hashBlock);
+        ReleaseBlockRequestOwnerOnReceive(hashBlock, pfrom->GetId());
 
         CSyncLockDiagnostics blockLockDiagnostics(
             "ProcessMessage(block)", "cs_main");
@@ -9424,14 +9446,48 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                             pto, inv.hash,
                             "same-peer-inflight", -1);
                     }
-                    pto->EraseAskForEntry(pto->mapAskFor.begin());
+                    pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
                     EraseAlreadyAskedForIfUnowned(inv, pto);
+                    continue;
+                }
+                NodeId nOwnerPeer = -1;
+                BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+                bool fHasOwner = GetBlockRequestOwner(
+                    inv.hash, &nOwnerPeer, &ownerState);
+                if (fHasOwner && nOwnerPeer != pto->GetId())
+                {
+                    if (fTraceBlockRequest)
+                        BlockRequestTraceGetDataSkip(
+                            pto, inv.hash, nOwnerPeer,
+                            BlockRequestOwnerStateName(ownerState));
+                    pto->EraseAskForEntry(pto->mapAskFor.begin());
+                    continue;
+                }
+                if (fHasOwner && nOwnerPeer == pto->GetId() &&
+                    ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)
+                {
+                    if (fTraceBlockRequest)
+                        BlockRequestTraceGetDataSkip(
+                            pto, inv.hash, nOwnerPeer,
+                            BlockRequestOwnerStateName(ownerState));
+                    pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
+                    continue;
+                }
+                if (!fHasOwner &&
+                    !TryAssignBlockRequestOwner(inv.hash, pto->GetId(),
+                                                &nOwnerPeer, &ownerState))
+                {
+                    if (fTraceBlockRequest)
+                        BlockRequestTraceGetDataSkip(
+                            pto, inv.hash, nOwnerPeer,
+                            BlockRequestOwnerStateName(ownerState));
+                    pto->EraseAskForEntry(pto->mapAskFor.begin());
                     continue;
                 }
                 if (pto->setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
                 {
                     int64_t nRetry = nNow + 250000;
-                    pto->EraseAskForEntry(pto->mapAskFor.begin());
+                    pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
                     pto->AddAskForEntry(nRetry, inv);
                     break;
                 }
@@ -9500,8 +9556,14 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     nKnownInBlockIndex);
             }
             if (fSkip)
+            {
+                pto->EraseAskForEntry(pto->mapAskFor.begin());
                 EraseAlreadyAskedForIfUnowned(inv, pto);
-            pto->EraseAskForEntry(pto->mapAskFor.begin());
+            }
+            else
+            {
+                pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
+            }
         }
         if (!vGetData.empty())
         {

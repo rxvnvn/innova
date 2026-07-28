@@ -1669,8 +1669,146 @@ map<CInv, int64_t> mapAlreadyAskedFor;
 // mutex for mapAlreadyAskedFor
 CCriticalSection cs_mapAlreadyAskedFor;
 
+struct BlockRequestOwner
+{
+    NodeId peer;
+    BlockRequestOwnerState state;
+    int64_t assignedUs;
+
+    BlockRequestOwner(NodeId peerIn, BlockRequestOwnerState stateIn)
+        : peer(peerIn), state(stateIn), assignedUs(GetTimeMicros()) {}
+};
+
+static std::map<uint256, BlockRequestOwner> mapBlockRequestOwners;
+
+const char* BlockRequestOwnerStateName(BlockRequestOwnerState state)
+{
+    return state == BLOCK_REQUEST_OWNER_IN_FLIGHT ? "inflight" : "queued";
+}
+
+bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
+                                      NodeId* existingPeer,
+                                      BlockRequestOwnerState* existingState)
+{
+    std::map<uint256, BlockRequestOwner>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+    {
+        mapBlockRequestOwners.insert(std::make_pair(
+            hash, BlockRequestOwner(peer, BLOCK_REQUEST_OWNER_QUEUED)));
+        if (BlockRequestTraceEnabled())
+            printf("BLOCKREQTRACE time_us=%lld event=OWNER_ASSIGN hash=%s peer=%d state=queued\n",
+                   (long long)GetTimeMicros(), hash.ToString().c_str(), peer);
+        return true;
+    }
+    if (existingPeer)
+        *existingPeer = it->second.peer;
+    if (existingState)
+        *existingState = it->second.state;
+    return it->second.peer == peer;
+}
+
+bool TryAssignBlockRequestOwner(const uint256& hash, NodeId peer,
+                                NodeId* existingPeer,
+                                BlockRequestOwnerState* existingState)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    return TryAssignBlockRequestOwnerLocked(hash, peer, existingPeer, existingState);
+}
+
+bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
+                          BlockRequestOwnerState* ownerState)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwner>::const_iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+        return false;
+    if (ownerPeer)
+        *ownerPeer = it->second.peer;
+    if (ownerState)
+        *ownerState = it->second.state;
+    return true;
+}
+
+bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwner>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end() || it->second.peer != peer)
+        return false;
+    if (it->second.state == BLOCK_REQUEST_OWNER_QUEUED)
+    {
+        it->second.state = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+        if (BlockRequestTraceEnabled())
+            printf("BLOCKREQTRACE time_us=%lld event=OWNER_TRANSITION hash=%s peer=%d from=queued to=inflight\n",
+                   (long long)GetTimeMicros(), hash.ToString().c_str(), peer);
+    }
+    return true;
+}
+
+bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
+                              const char* pszReason)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwner>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end() || it->second.peer != peer)
+        return false;
+    if (BlockRequestTraceEnabled())
+        printf("BLOCKREQTRACE time_us=%lld event=OWNER_RELEASE hash=%s peer=%d state=%s reason=%s\n",
+               (long long)GetTimeMicros(), hash.ToString().c_str(), peer,
+               BlockRequestOwnerStateName(it->second.state), pszReason);
+    mapBlockRequestOwners.erase(it);
+    return true;
+}
+
+bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwner>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+        return false;
+    if (BlockRequestTraceEnabled())
+        printf("BLOCKREQTRACE time_us=%lld event=OWNER_RELEASE hash=%s peer=%d state=%s reason=receive\n",
+               (long long)GetTimeMicros(), hash.ToString().c_str(),
+               it->second.peer, BlockRequestOwnerStateName(it->second.state));
+    mapBlockRequestOwners.erase(it);
+    return true;
+}
+
+size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    size_t nReleased = 0;
+    for (std::map<uint256, BlockRequestOwner>::iterator it =
+             mapBlockRequestOwners.begin(); it != mapBlockRequestOwners.end(); )
+    {
+        if (it->second.peer != peer)
+        {
+            ++it;
+            continue;
+        }
+        if (BlockRequestTraceEnabled())
+            printf("BLOCKREQTRACE time_us=%lld event=OWNER_RELEASE hash=%s peer=%d state=%s reason=%s\n",
+                   (long long)GetTimeMicros(), it->first.ToString().c_str(), peer,
+                   BlockRequestOwnerStateName(it->second.state), pszReason);
+        it = mapBlockRequestOwners.erase(it);
+        ++nReleased;
+    }
+    return nReleased;
+}
+
 bool IsBlockRequestOwnedByAnyPeer(const uint256& hash, const CNode* extra_peer)
 {
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        if (mapBlockRequestOwners.count(hash) != 0)
+            return true;
+    }
+
     LOCK(cs_vNodes);
     for (std::vector<CNode*>::const_iterator it = vNodes.begin();
          it != vNodes.end(); ++it)
@@ -2291,13 +2429,28 @@ void BlockRequestTraceAskSchedule(CNode* pnode, const uint256& hash,
 
 void BlockRequestTraceAskSkip(CNode* pnode, const uint256& hash,
                               BlockRequestTraceSource source,
-                              const char* pszReason)
+                              const char* pszReason,
+                              int ownerPeer,
+                              const char* pszOwnerState)
 {
     if (!fBlockRequestTraceEnabled)
         return;
-    printf("BLOCKREQTRACE time_us=%lld event=ASK_SKIP reason=%s hash=%s peer=%d source=%s same_peer_queued=1\n",
+    printf("BLOCKREQTRACE time_us=%lld event=ASK_SKIP reason=%s hash=%s peer=%d source=%s same_peer_queued=%s owner_peer=%d owner_state=%s\n",
            (long long)GetTimeMicros(), pszReason, hash.ToString().c_str(),
-           pnode->GetId(), BlockRequestTraceSourceName(source));
+           pnode->GetId(), BlockRequestTraceSourceName(source),
+           strcmp(pszReason, "same-peer-already-queued") == 0 ? "1" : "0",
+           ownerPeer, pszOwnerState ? pszOwnerState : "none");
+}
+
+void BlockRequestTraceGetDataSkip(CNode* pnode, const uint256& hash,
+                                  int ownerPeer,
+                                  const char* pszOwnerState)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    printf("BLOCKREQTRACE time_us=%lld event=GETDATA_SKIP reason=other-peer-active-owner hash=%s peer=%d owner_peer=%d owner_state=%s\n",
+           (long long)GetTimeMicros(), hash.ToString().c_str(), pnode->GetId(),
+           ownerPeer, pszOwnerState ? pszOwnerState : "none");
 }
 
 void BlockRequestTraceAskRemoved(CNode* pnode, const uint256& hash,

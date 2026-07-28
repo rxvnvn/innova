@@ -405,6 +405,27 @@ extern std::map<CInv, int64_t> mapAlreadyAskedFor;
 extern CCriticalSection cs_mapAlreadyAskedFor;
 static const size_t MAX_ALREADY_ASKED_FOR_SIZE = 50000;
 
+enum BlockRequestOwnerState
+{
+    BLOCK_REQUEST_OWNER_QUEUED = 0,
+    BLOCK_REQUEST_OWNER_IN_FLIGHT
+};
+
+bool TryAssignBlockRequestOwner(const uint256& hash, NodeId peer,
+                                NodeId* existingPeer = NULL,
+                                BlockRequestOwnerState* existingState = NULL);
+bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
+                                      NodeId* existingPeer = NULL,
+                                      BlockRequestOwnerState* existingState = NULL);
+bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
+                          BlockRequestOwnerState* ownerState);
+bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer);
+bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
+                              const char* pszReason);
+bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer);
+size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason);
+const char* BlockRequestOwnerStateName(BlockRequestOwnerState state);
+
 bool IsBlockRequestOwnedByAnyPeer(const uint256& hash, const CNode* extra_peer = NULL);
 bool EraseAlreadyAskedForIfUnowned(const CInv& inv, const CNode* extra_peer = NULL);
 static const int64_t ALREADY_ASKED_FOR_RETENTION_US = 60LL * 60 * 1000000;
@@ -837,6 +858,7 @@ public:
 
     ~CNode()
     {
+        ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect");
         if (BlockRequestTraceEnabled())
             BlockRequestTracePeerClosed(this);
         RecoveryResponseResult recoveryResult;
@@ -975,17 +997,29 @@ public:
         AddAskForEntry(entry.first, entry.second);
     }
 
-    void EraseAskForEntry(std::multimap<int64_t, CInv>::iterator it)
+    void EraseAskForEntry(std::multimap<int64_t, CInv>::iterator it,
+                          bool fReleaseOwner = true)
     {
         if (it == mapAskFor.end())
             return;
-        if (it->second.type == MSG_BLOCK || it->second.type == MSG_FILTERED_BLOCK)
-            setAskForBlocks.erase(it->second.hash);
+        const CInv inv = it->second;
+        if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
+            setAskForBlocks.erase(inv.hash);
         mapAskFor.erase(it);
+        if (fReleaseOwner &&
+            (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK))
+            ReleaseBlockRequestOwner(inv.hash, GetId(), "queue-removed");
     }
 
     void ClearAskFor()
     {
+        for (std::multimap<int64_t, CInv>::const_iterator it = mapAskFor.begin();
+             it != mapAskFor.end(); ++it)
+        {
+            if (it->second.type == MSG_BLOCK ||
+                it->second.type == MSG_FILTERED_BLOCK)
+                ReleaseBlockRequestOwner(it->second.hash, GetId(), "queue-clear");
+        }
         mapAskFor.clear();
         setAskForBlocks.clear();
     }
@@ -1020,6 +1054,24 @@ public:
                        (long long)nPruneNow, GetId(), inv.type,
                        inv.hash.ToString().c_str(), mapAlreadyAskedFor.size(),
                        MAX_ALREADY_ASKED_FOR_SIZE);
+            return;
+        }
+
+        NodeId nOwnerPeer = -1;
+        BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+        if (fBlockRequest &&
+            (!TryAssignBlockRequestOwnerLocked(inv.hash, GetId(),
+                                               &nOwnerPeer, &ownerState) ||
+             (nOwnerPeer == GetId() &&
+              ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)))
+        {
+            if (BlockRequestTraceEnabled())
+                BlockRequestTraceAskSkip(this, inv.hash, source,
+                                         nOwnerPeer == GetId()
+                                             ? "same-peer-inflight"
+                                             : "other-peer-active-owner",
+                                         nOwnerPeer,
+                                         BlockRequestOwnerStateName(ownerState));
             return;
         }
 
@@ -1350,8 +1402,9 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
 
     void ExpireBlockInFlight(int64_t nNow = GetTime())
     {
-        static const int64_t BLOCK_IN_FLIGHT_TIMEOUT = 5;
-        for (std::map<uint256, int64_t>::iterator it = mapBlockInFlightSince.begin(); it != mapBlockInFlightSince.end(); )
+        static const int BLOCK_IN_FLIGHT_TIMEOUT = 5;
+        for (std::map<uint256, int64_t>::iterator it = mapBlockInFlightSince.begin();
+             it != mapBlockInFlightSince.end(); )
         {
             if (nNow - it->second > BLOCK_IN_FLIGHT_TIMEOUT)
             {
@@ -1360,6 +1413,7 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                 const uint256 hashExpired = it->first;
                 setBlocksInFlight.erase(it->first);
                 it = mapBlockInFlightSince.erase(it);
+                ReleaseBlockRequestOwner(hashExpired, GetId(), "timeout");
                 EraseAlreadyAskedForIfUnowned(
                     CInv(MSG_BLOCK, hashExpired), this);
             }
@@ -1381,14 +1435,15 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         ExpireBlockInFlight();
         setBlocksInFlight.insert(hashBlock);
         mapBlockInFlightSince[hashBlock] = GetTime();
+        TransitionBlockRequestOwnerToInFlight(hashBlock, GetId());
     }
 
     void ClearBlockInFlight(const uint256& hashBlock)
     {
         setBlocksInFlight.erase(hashBlock);
         mapBlockInFlightSince.erase(hashBlock);
+        ReleaseBlockRequestOwner(hashBlock, GetId(), "receive");
     }
-
     bool IsSubscribed(unsigned int nChannel);
     void Subscribe(unsigned int nChannel, unsigned int nHops=0);
     void CancelSubscribe(unsigned int nChannel);
