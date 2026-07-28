@@ -14,6 +14,7 @@
 #include "init.h"
 #include "wallet.h"
 #include "ui_interface.h"
+#include "ibdefficiency.h"
 #include "kernel.h"
 #include "collateral.h"
 #include "collateralnode.h"
@@ -8389,6 +8390,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
     else if (strCommand == "block")
     {
+        const uint64_t nBlockPayloadBytes = vRecv.size();
         CBlock block;
         vRecv >> block;
         uint256 hashBlock = block.GetHash();
@@ -8400,12 +8402,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         pfrom->AddInventoryKnown(inv);
 
         const bool fTraceBlockRequest = BlockRequestTraceEnabled();
-        bool fSenderInFlightBefore = false;
+        bool fSenderInFlightBefore =
+            pfrom->setBlocksInFlight.count(hashBlock) != 0;
         int64_t nSenderInFlightAge = -1;
         if (fTraceBlockRequest)
         {
-            fSenderInFlightBefore =
-                pfrom->setBlocksInFlight.count(hashBlock) != 0;
             std::map<uint256, int64_t>::const_iterator miInFlight =
                 pfrom->mapBlockInFlightSince.find(hashBlock);
             if (miInFlight != pfrom->mapBlockInFlightSince.end())
@@ -8430,6 +8431,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 nSenderInFlightAge, fKnownBefore);
         }
         bool fAccepted = ProcessBlock(pfrom, &block);
+        bool fEffRetryRecorded = false;
         if (fAccepted)
         {
             ClearRejectedBlockForSync(hashBlock);
@@ -8454,6 +8456,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                  mapOrphanBlocks.count(hashBlock) == 0)
         {
             RecordRejectedBlockForSync(hashBlock);
+            fEffRetryRecorded = true;
             LOCK(cs_mapAlreadyAskedFor);
             std::map<CInv, int64_t>::iterator miRejected =
                 mapAlreadyAskedFor.find(inv);
@@ -8498,6 +8501,37 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pfrom, hashBlock, traceResult, fAccepted,
                 fIndexedAfter, fActiveChainAfter,
                 fBestChainAfter, nHeightAfter);
+        }
+
+        if (IBDEfficiencyTraceEnabled())
+        {
+            std::map<uint256, CBlockIndex*>::const_iterator miEff =
+                mapBlockIndex.find(hashBlock);
+            bool fIndexedAfter = miEff != mapBlockIndex.end();
+            bool fOrphanAfter = mapOrphanBlocks.count(hashBlock) != 0;
+            bool fActiveChainAfter =
+                fIndexedAfter && miEff->second->IsInMainChain();
+
+            bool fEffAcceptedActive = fAccepted && fActiveChainAfter;
+            bool fEffAcceptedSide = fAccepted && fIndexedAfter && !fActiveChainAfter;
+            bool fEffOrphanNew = fAccepted && fOrphanAfter;
+            bool fEffRejected = !fAccepted;
+
+            bool fEffUnique = !fKnownBefore && !fOrphanBefore;
+            bool fEffDuplicateIndexed = fKnownBefore;
+            bool fEffDuplicateOrphan = fOrphanBefore;
+
+            IBDEfficiencyRecordBlock(nBlockPayloadBytes,
+                                    fSenderInFlightBefore,
+                                    fEffUnique,
+                                    fEffDuplicateIndexed,
+                                    fEffDuplicateOrphan,
+                                    fEffAcceptedActive,
+                                    fEffAcceptedSide,
+                                    fEffOrphanNew,
+                                    fEffRejected,
+                                    fEffRetryRecorded);
+            IBDEfficiencyMaybeSummary(GetTimeMicros());
         }
 
         // Chain sync continues via headers batch completion and stall recovery.

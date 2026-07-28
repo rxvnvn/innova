@@ -16,6 +16,7 @@
 #include "util.h"
 #include "ui_interface.h"
 #include "checkpoints.h"
+#include "ibdefficiency.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -148,6 +149,7 @@ void Shutdown(void* parg)
         }
 
         FlushIBDBatch();
+        IBDEfficiencyShutdownSummary();
 
         if(idns) {
             delete idns;
@@ -581,6 +583,7 @@ std::string HelpMessage()
         "  -debugchain            " + _("Output extra blockchain debugging information") + "\n" +
         "  -blockrequesttrace=<n> " + _("Trace anomalous block request lifecycles (default: 0)") + "\n" +
         "  -blockrequesttracehash=<hash> " + _("Limit block request tracing to one block hash (requires -blockrequesttrace)") + "\n" +
+        "  -ibdefficiencytrace=<0|1> " + _("Trace IBD block efficiency counters (default: 0)") + "\n" +
         "  -getinfosyncprobe=<n> " + _("Log cached P2P state before, during, and after getinfo (default: 0)") + "\n" +
         "  -rpcperftrace=<n>     " + _("Trace getinfo/getmininginfo RPC performance (default: 0)") + "\n" +
         "  -synclockdiagnostics=<n> " + _("Log long sync-related lock waits and holds (default: 0)") + "\n" +
@@ -957,6 +960,7 @@ bool AppInit2()
         return InitError(_(
             "Invalid -blockrequesttracehash (expected 64 hexadecimal characters)"));
     }
+    InitIBDEfficiencyTrace(GetBoolArg("-ibdefficiencytrace", false));
 
     if (mapArgs.count("-timeout"))
     {

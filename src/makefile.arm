@@ -291,6 +291,7 @@ OBJS= \
     obj/miner.o \
     obj/main.o \
     obj/net.o \
+    obj/ibdefficiency.o \
     obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \
@@ -367,6 +368,7 @@ OBJS= \
     obj/miner.o \
     obj/main.o \
     obj/net.o \
+    obj/ibdefficiency.o \
     obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \

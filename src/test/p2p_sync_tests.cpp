@@ -10,6 +10,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include "checkpoints.h"
+#include "ibdefficiency.h"
 #include "innovarpc.h"
 #include "main.h"
 #include "net.h"
@@ -1553,4 +1554,124 @@ BOOST_AUTO_TEST_CASE(initial_sync_lifecycle_starts_legacy_peer)
     fSPVMode = fSPVModeSaved;
 }
 
+BOOST_AUTO_TEST_CASE(ibd_efficiency_counters_origin_mutual_exclusion)
+{
+    IBDEfficiencyCounters c;
+
+    c.RecordBlock(100, true, true, false, false, true, false, false, false, false);
+    c.RecordBlock(200, false, true, false, false, true, false, false, false, false);
+    c.RecordBlock(300, true, true, false, false, true, false, false, false, false);
+
+    BOOST_CHECK_EQUAL(c.received_requested.load(), 2U);
+    BOOST_CHECK_EQUAL(c.received_unsolicited.load(), 1U);
+    BOOST_CHECK_EQUAL(c.bytes_requested.load(), 400U);
+    BOOST_CHECK_EQUAL(c.bytes_unsolicited.load(), 200U);
+
+    uint64_t total_count = c.received_requested.load() + c.received_unsolicited.load();
+    BOOST_CHECK_EQUAL(total_count, 3U);
+}
+
+BOOST_AUTO_TEST_CASE(ibd_efficiency_counters_novelty_mutual_exclusion)
+{
+    IBDEfficiencyCounters c;
+
+    c.RecordBlock(100, true, true, false, false, true, false, false, false, false);
+    c.RecordBlock(100, true, false, true, false, true, false, false, false, false);
+    c.RecordBlock(100, true, false, false, true, true, false, false, false, false);
+
+    BOOST_CHECK_EQUAL(c.received_unique.load(), 1U);
+    BOOST_CHECK_EQUAL(c.received_duplicate_indexed.load(), 1U);
+    BOOST_CHECK_EQUAL(c.received_duplicate_orphan.load(), 1U);
+    BOOST_CHECK_EQUAL(c.bytes_unique.load(), 100U);
+    BOOST_CHECK_EQUAL(c.bytes_duplicate.load(), 200U);
+}
+
+BOOST_AUTO_TEST_CASE(ibd_efficiency_counters_outcome_mutual_exclusion)
+{
+    IBDEfficiencyCounters c;
+
+    c.RecordBlock(100, true, true, false, false, true, false, false, false, false);
+    c.RecordBlock(200, true, true, false, false, false, true, false, false, false);
+    c.RecordBlock(300, true, true, false, false, false, false, true, false, false);
+    c.RecordBlock(400, true, true, false, false, false, false, false, true, false);
+
+    BOOST_CHECK_EQUAL(c.received_accepted_active.load(), 1U);
+    BOOST_CHECK_EQUAL(c.received_accepted_side.load(), 1U);
+    BOOST_CHECK_EQUAL(c.received_orphan_new.load(), 1U);
+    BOOST_CHECK_EQUAL(c.received_rejected.load(), 1U);
+    BOOST_CHECK_EQUAL(c.bytes_accepted_active.load(), 100U);
+    BOOST_CHECK_EQUAL(c.bytes_accepted_side.load(), 200U);
+    BOOST_CHECK_EQUAL(c.bytes_orphan_new.load(), 300U);
+    BOOST_CHECK_EQUAL(c.bytes_rejected.load(), 400U);
+
+    uint64_t total_outcome = c.received_accepted_active.load() +
+                             c.received_accepted_side.load() +
+                             c.received_orphan_new.load() +
+                             c.received_rejected.load();
+    BOOST_CHECK_EQUAL(total_outcome, 4U);
+}
+
+BOOST_AUTO_TEST_CASE(ibd_efficiency_counters_retry_is_subset_of_rejected)
+{
+    IBDEfficiencyCounters c;
+
+    c.RecordBlock(100, true, true, false, false, false, false, false, true, true);
+    c.RecordBlock(200, true, true, false, false, false, false, false, true, false);
+
+    BOOST_CHECK_EQUAL(c.received_rejected.load(), 2U);
+    BOOST_CHECK_EQUAL(c.received_retry_recorded.load(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(ibd_efficiency_counters_reset_delta)
+{
+    IBDEfficiencyCounters c;
+
+    c.RecordBlock(100, true, true, false, false, true, false, false, false, false);
+    c.RecordBlock(200, false, true, false, false, true, false, false, false, false);
+
+    BOOST_CHECK_EQUAL(c.received_requested.load(), 1U);
+    BOOST_CHECK_EQUAL(c.received_unsolicited.load(), 1U);
+
+    c.ResetDelta();
+
+    BOOST_CHECK_EQUAL(c.received_requested.load(), 0U);
+    BOOST_CHECK_EQUAL(c.received_unsolicited.load(), 0U);
+    BOOST_CHECK_EQUAL(c.received_unique.load(), 0U);
+    BOOST_CHECK_EQUAL(c.received_accepted_active.load(), 0U);
+    BOOST_CHECK_EQUAL(c.bytes_requested.load(), 0U);
+    BOOST_CHECK_EQUAL(c.bytes_unsolicited.load(), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(ibd_efficiency_counters_zero_overhead_when_disabled)
+{
+    InitIBDEfficiencyTrace(false);
+    BOOST_CHECK(!IBDEfficiencyTraceEnabled());
+    IBDEfficiencyRecordBlock(1000, true, true, false, false, true, false, false, false, false);
+    IBDEfficiencyMaybeSummary(GetTimeMicros());
+    IBDEfficiencyShutdownSummary();
+}
+
+BOOST_AUTO_TEST_CASE(ibd_efficiency_init_and_enable)
+{
+    BOOST_CHECK(InitIBDEfficiencyTrace(true));
+    BOOST_CHECK(IBDEfficiencyTraceEnabled());
+    InitIBDEfficiencyTrace(false);
+    BOOST_CHECK(!IBDEfficiencyTraceEnabled());
+}
+
+BOOST_AUTO_TEST_CASE(ibd_efficiency_counters_print_summary_no_crash)
+{
+    IBDEfficiencyCounters c;
+    c.RecordBlock(500, true, true, false, false, true, false, false, false, false);
+    c.RecordBlock(300, false, true, false, false, false, false, true, false, false);
+    c.PrintSummary("TEST", 100, 105, 30);
+}
+
+BOOST_AUTO_TEST_CASE(ibd_efficiency_periodic_summary)
+{
+    InitIBDEfficiencyTrace(true);
+    IBDEfficiencyRecordBlock(123, true, true, false, false, true, false, false, false, false);
+    IBDEfficiencyMaybeSummary(GetTimeMicros() + 60000000LL);
+    InitIBDEfficiencyTrace(false);
+}
 BOOST_AUTO_TEST_SUITE_END()

@@ -639,6 +639,7 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/ringsig.cpp \
     src/miner.cpp \
     src/init.cpp \
+    src/ibdefficiency.cpp \
     src/bootstrap.cpp \
     src/smessage_stub.cpp \
     src/net.cpp \
