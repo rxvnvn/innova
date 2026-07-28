@@ -2289,6 +2289,17 @@ void BlockRequestTraceAskSchedule(CNode* pnode, const uint256& hash,
     BlockRequestTraceMaybeSummaryLocked(nNow);
 }
 
+void BlockRequestTraceAskSkip(CNode* pnode, const uint256& hash,
+                              BlockRequestTraceSource source,
+                              const char* pszReason)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    printf("BLOCKREQTRACE time_us=%lld event=ASK_SKIP reason=%s hash=%s peer=%d source=%s same_peer_queued=1\n",
+           (long long)GetTimeMicros(), pszReason, hash.ToString().c_str(),
+           pnode->GetId(), BlockRequestTraceSourceName(source));
+}
+
 void BlockRequestTraceAskRemoved(CNode* pnode, const uint256& hash,
                                  const char* pszReason,
                                  int nKnownInBlockIndex)

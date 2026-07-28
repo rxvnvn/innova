@@ -234,9 +234,101 @@ static void CheckNormalGetBlocksSync(int nVersion, unsigned int nPeer)
     BOOST_CHECK_EQUAL(peer.nMisbehavior, 0);
 }
 
+static size_t QueuedBlockAskForCount(const CNode& peer,
+                                     const uint256& hashBlock)
+{
+    size_t count = 0;
+    for (std::multimap<int64_t, CInv>::const_iterator it = peer.mapAskFor.begin();
+         it != peer.mapAskFor.end(); ++it)
+    {
+        if ((it->second.type == MSG_BLOCK ||
+             it->second.type == MSG_FILTERED_BLOCK) &&
+            it->second.hash == hashBlock)
+            ++count;
+    }
+    return count;
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(p2p_sync_tests)
+BOOST_AUTO_TEST_CASE(same_peer_block_askfor_is_idempotent)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashA(4001);
+    const uint256 hashB(4002);
+    const uint256 hashC(4003);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(40), "askfor-dedup-peer", true);
+
+    peer.AskFor(CInv(MSG_BLOCK, hashA), BLOCKREQ_SOURCE_INV);
+    peer.AskFor(CInv(MSG_BLOCK, hashA), BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashA), 1U);
+    BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 1U);
+
+    for (int i = 0; i < 100; ++i)
+        peer.AskFor(CInv(MSG_BLOCK, hashA), BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashA), 1U);
+    BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 1U);
+
+    peer.AskFor(CInv(MSG_BLOCK, hashB), BLOCKREQ_SOURCE_INV);
+    peer.AskFor(CInv(MSG_BLOCK, hashC), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 3U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashB), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashC), 1U);
+
+    peer.EraseAskForEntry(peer.mapAskFor.begin());
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashA), 0U);
+    peer.AskFor(CInv(MSG_BLOCK, hashA), BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashA), 1U);
+}
+BOOST_AUTO_TEST_CASE(block_request_trace_reports_same_peer_skip)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    BOOST_REQUIRE(InitBlockRequestTrace(true, ""));
+    CNode peer(INVALID_SOCKET, TestPeerAddress(44), "askfor-trace-peer", true);
+    const uint256 hash(4007);
+    peer.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    peer.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hash), 1U);
+    BOOST_CHECK(InitBlockRequestTrace(false, ""));
+    fPrintToConsole = fPrintToConsoleSaved;
+}
+
+BOOST_AUTO_TEST_CASE(block_askfor_dedup_is_per_peer_and_not_global)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hash(4004);
+    CNode peer1(INVALID_SOCKET, TestPeerAddress(41), "askfor-peer-one", true);
+    CNode peer2(INVALID_SOCKET, TestPeerAddress(42), "askfor-peer-two", true);
+
+    peer1.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    peer1.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_ORPHAN);
+    peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer1, hash), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 1U);
+
+    const uint256 hashTx(4005);
+    peer1.AskFor(CInv(MSG_TX, hashTx), BLOCKREQ_SOURCE_INV);
+    peer1.AskFor(CInv(MSG_TX, hashTx), BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(peer1.mapAskFor.size(), 3U);
+}
+
+BOOST_AUTO_TEST_CASE(block_askfor_can_retry_after_inflight_expiry)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hash(4006);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(43), "askfor-expiry-peer", true);
+
+    peer.MarkBlockInFlight(hash);
+    peer.mapBlockInFlightSince[hash] = GetTime() - 60;
+    peer.ExpireBlockInFlight();
+    peer.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_REJECT_RECOVERY);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hash), 1U);
+}
+
 
 BOOST_AUTO_TEST_CASE(new_headers_continue_only_after_response)
 {
@@ -408,7 +500,7 @@ BOOST_AUTO_TEST_CASE(rpc_queries_do_not_mutate_block_download_state)
     const CInv globalRequest(MSG_BLOCK, uint256(3005));
     peer.MarkBlockInFlight(hashInFlight);
     peer.mapBlockInFlightSince[hashInFlight] = GetTime() - 60;
-    peer.mapAskFor.insert(std::make_pair(
+    peer.AddAskForEntry(std::make_pair(
         (GetTime() + 60) * 1000000, CInv(MSG_BLOCK, hashAskFor)));
     peer.getBlocksIndex.push_back(pindexBest);
     peer.getBlocksHash.push_back(uint256(0));
@@ -652,7 +744,7 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_ignores_future_block_askfor)
     BOOST_CHECK(MaybeQueueStalledSyncRecovery(
                     peers, pindexBest, nBestHeight, TEST_TIME,
                     STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
-    peer.mapAskFor.insert(std::make_pair(
+    peer.AddAskForEntry(std::make_pair(
         (TEST_TIME + STALL_TIMEOUT + 60) * 1000000,
         CInv(MSG_BLOCK, hashPending)));
 
@@ -680,7 +772,7 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_ignores_tx_askfor)
     BOOST_CHECK(MaybeQueueStalledSyncRecovery(
                     peers, pindexBest, nBestHeight, TEST_TIME,
                     STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
-    peer.mapAskFor.insert(std::make_pair(
+    peer.AddAskForEntry(std::make_pair(
         (TEST_TIME + STALL_TIMEOUT + 60) * 1000000,
         CInv(MSG_TX, uint256(1004))));
 
@@ -708,7 +800,7 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_mixed_askfor_and_inflight_uses_inflig
     BOOST_CHECK(MaybeQueueStalledSyncRecovery(
                     peers, pindexBest, nBestHeight, TEST_TIME,
                     STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
-    peer.mapAskFor.insert(std::make_pair(
+    peer.AddAskForEntry(std::make_pair(
         (TEST_TIME + STALL_TIMEOUT + 60) * 1000000,
         CInv(MSG_BLOCK, hashPending)));
     peer.setBlocksInFlight.insert(hashPending);
@@ -751,7 +843,7 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_ignores_cross_peer_block_askfor)
     BOOST_CHECK(MaybeQueueStalledSyncRecovery(
                     peers, pindexBest, nBestHeight, TEST_TIME,
                     STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
-    ownerPeer.mapAskFor.insert(std::make_pair(
+    ownerPeer.AddAskForEntry(std::make_pair(
         (TEST_TIME + 1) * 1000000,
         CInv(MSG_BLOCK, hashOwnedByOtherPeer)));
 
@@ -833,7 +925,7 @@ BOOST_AUTO_TEST_CASE(rejected_block_recovery_queues_one_cross_peer_askfor)
 
     for (std::vector<CNode*>::iterator it = peers.begin(); it != peers.end(); ++it)
     {
-        (*it)->mapAskFor.clear();
+        (*it)->ClearAskFor();
         (*it)->getBlocksIndex.clear();
         (*it)->getBlocksHash.clear();
         (*it)->pindexLastGetBlocksBegin = NULL;
@@ -1399,7 +1491,7 @@ BOOST_AUTO_TEST_CASE(already_asked_for_negative_cooldown_lifecycle)
     peer.AskFor(rejected, BLOCKREQ_SOURCE_INV);
     BOOST_CHECK(!peer.mapAskFor.empty());
     BOOST_CHECK(peer.mapAskFor.begin()->first > GetTimeMicros() * 1000000);
-    peer.mapAskFor.clear();
+    peer.ClearAskFor();
     {
         LOCK(cs_mapAlreadyAskedFor);
         mapAlreadyAskedFor[rejected] =
@@ -1412,7 +1504,7 @@ BOOST_AUTO_TEST_CASE(already_asked_for_negative_cooldown_lifecycle)
         LOCK(cs_mapAlreadyAskedFor);
         BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(rejected), 0U);
     }
-    peer.mapAskFor.clear();
+    peer.ClearAskFor();
     peer.AskFor(rejected, BLOCKREQ_SOURCE_INV);
     BOOST_CHECK(!peer.mapAskFor.empty());
 }
@@ -1458,7 +1550,7 @@ BOOST_AUTO_TEST_CASE(already_asked_for_lifecycle_is_cross_peer_safe)
         LOCK(cs_mapAlreadyAskedFor);
         BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(inv), 1U);
     }
-    owner.mapAskFor.clear();
+    owner.ClearAskFor();
     BOOST_CHECK(EraseAlreadyAskedForIfUnowned(inv, &other));
     {
         LOCK(cs_mapAlreadyAskedFor);

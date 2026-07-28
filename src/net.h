@@ -749,6 +749,7 @@ public:
     std::vector<CInv> vGetBlocksInventoryToSend;
     CCriticalSection cs_inventory;
     std::multimap<int64_t, CInv> mapAskFor;
+    std::set<uint256> setAskForBlocks;
 
     std::set<uint256> setBlocksInFlight;
     std::map<uint256, int64_t> mapBlockInFlightSince;
@@ -957,10 +958,57 @@ public:
         return true;
     }
 
+    bool IsBlockAskForQueued(const uint256& hash) const
+    {
+        return setAskForBlocks.count(hash) != 0;
+    }
+
+    void AddAskForEntry(int64_t nRequestTime, const CInv& inv)
+    {
+        mapAskFor.insert(std::make_pair(nRequestTime, inv));
+        if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
+            setAskForBlocks.insert(inv.hash);
+    }
+
+    void AddAskForEntry(const std::pair<int64_t, CInv>& entry)
+    {
+        AddAskForEntry(entry.first, entry.second);
+    }
+
+    void EraseAskForEntry(std::multimap<int64_t, CInv>::iterator it)
+    {
+        if (it == mapAskFor.end())
+            return;
+        if (it->second.type == MSG_BLOCK || it->second.type == MSG_FILTERED_BLOCK)
+            setAskForBlocks.erase(it->second.hash);
+        mapAskFor.erase(it);
+    }
+
+    void ClearAskFor()
+    {
+        mapAskFor.clear();
+        setAskForBlocks.clear();
+    }
+
     void AskFor(const CInv& inv, BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER)
     {
         const int64_t nPruneNow = GetTimeMicros();
         PruneAlreadyAskedFor(nPruneNow);
+        bool fBlockRequest = (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK);
+        if (fBlockRequest)
+        {
+            ExpireBlockInFlight();
+            if (setBlocksInFlight.count(inv.hash))
+                return;
+            if (IsBlockAskForQueued(inv.hash))
+            {
+                if (BlockRequestTraceEnabled())
+                    BlockRequestTraceAskSkip(this, inv.hash, source,
+                                             "same-peer-already-queued");
+                return;
+            }
+        }
+
         LOCK(cs_mapAlreadyAskedFor);
         if (mapAlreadyAskedFor.size() >= MAX_ALREADY_ASKED_FOR_SIZE)
         {
@@ -989,13 +1037,8 @@ public:
         nNow = std::max(nNow, nLastTime);
         nLastTime = nNow;
 
-        bool fBlockRequest = (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK);
         if (fBlockRequest)
         {
-            ExpireBlockInFlight();
-            if (setBlocksInFlight.count(inv.hash))
-                return;
-
             static const int64_t BLOCK_ASK_RETRY_US = 1000000;
             static const int64_t BLOCK_ASK_DEFER_US = 250000;
             static const size_t MAX_BLOCKS_IN_FLIGHT_PER_PEER = 128;
@@ -1008,7 +1051,7 @@ public:
         {
             nRequestTime = std::max(nRequestTime + 10 * 1000000, nNow);
         }
-        mapAskFor.insert(std::make_pair(nRequestTime, inv));
+        AddAskForEntry(nRequestTime, inv);
         if (BlockRequestTraceEnabled() && inv.type == MSG_BLOCK)
             BlockRequestTraceAskSchedule(this, inv.hash, source, nRequestTime,
                                          nPreviousRequestTime, false);

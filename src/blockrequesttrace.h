@@ -44,6 +44,9 @@ void BlockRequestTraceAskSchedule(CNode* pnode, const uint256& hash,
                                   int64_t nScheduledTime,
                                   int64_t nPreviousGlobalTime,
                                   bool fSamePeerInFlight);
+void BlockRequestTraceAskSkip(CNode* pnode, const uint256& hash,
+                              BlockRequestTraceSource source,
+                              const char* pszReason);
 void BlockRequestTraceAskRemoved(CNode* pnode, const uint256& hash,
                                  const char* pszReason,
                                  int nKnownInBlockIndex);

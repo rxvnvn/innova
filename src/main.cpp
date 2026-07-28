@@ -9424,15 +9424,15 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                             pto, inv.hash,
                             "same-peer-inflight", -1);
                     }
-                    pto->mapAskFor.erase(pto->mapAskFor.begin());
+                    pto->EraseAskForEntry(pto->mapAskFor.begin());
                     EraseAlreadyAskedForIfUnowned(inv, pto);
                     continue;
                 }
                 if (pto->setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
                 {
                     int64_t nRetry = nNow + 250000;
-                    pto->mapAskFor.erase(pto->mapAskFor.begin());
-                    pto->mapAskFor.insert(std::make_pair(nRetry, inv));
+                    pto->EraseAskForEntry(pto->mapAskFor.begin());
+                    pto->AddAskForEntry(nRetry, inv);
                     break;
                 }
             }
@@ -9501,7 +9501,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             }
             if (fSkip)
                 EraseAlreadyAskedForIfUnowned(inv, pto);
-            pto->mapAskFor.erase(pto->mapAskFor.begin());
+            pto->EraseAskForEntry(pto->mapAskFor.begin());
         }
         if (!vGetData.empty())
         {
