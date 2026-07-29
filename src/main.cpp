@@ -9622,9 +9622,6 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 }
                 if (pto->setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
                 {
-                    int64_t nRetry = nNow + 250000;
-                    pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
-                    pto->AddAskForEntry(nRetry, inv);
                     break;
                 }
             }

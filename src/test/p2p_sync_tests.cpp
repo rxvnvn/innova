@@ -1849,4 +1849,51 @@ BOOST_AUTO_TEST_CASE(ibd_efficiency_periodic_summary)
     IBDEfficiencyMaybeSummary(GetTimeMicros() + 60000000LL);
     InitIBDEfficiencyTrace(false);
 }
+
+BOOST_AUTO_TEST_CASE(inflight_limit_preserves_askfor_order)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashP(6001);
+    const uint256 hashC(6002);
+    const uint256 hashD(6003);
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(60), "inflight-order", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 100);
+
+    int64_t nBaseKey = (GetTime() - 10) * 1000000;
+    peer.AddAskForEntry(nBaseKey, CInv(MSG_BLOCK, hashP));
+    peer.AddAskForEntry(nBaseKey + 1, CInv(MSG_BLOCK, hashC));
+    peer.AddAskForEntry(nBaseKey + 2, CInv(MSG_BLOCK, hashD));
+    BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 3U);
+
+    for (size_t i = 0; i < 128; ++i)
+        peer.MarkBlockInFlight(uint256(7000 + i));
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 128U);
+
+    std::multimap<int64_t, CInv>::const_iterator it = peer.mapAskFor.begin();
+    BOOST_CHECK(it->second.hash == hashP); ++it;
+    BOOST_CHECK(it->second.hash == hashC); ++it;
+    BOOST_CHECK(it->second.hash == hashD);
+    BOOST_CHECK_EQUAL(peer.mapAskFor.begin()->first, nBaseKey);
+
+    BOOST_CHECK(SendMessages(&peer, true));
+    std::vector<std::string> commands = SentCommands(peer);
+    BOOST_CHECK(!HasCommand(commands, "getdata"));
+    BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 3U);
+    it = peer.mapAskFor.begin();
+    BOOST_CHECK(it->second.hash == hashP); ++it;
+    BOOST_CHECK(it->second.hash == hashC); ++it;
+    BOOST_CHECK(it->second.hash == hashD);
+    BOOST_CHECK_EQUAL(peer.mapAskFor.begin()->first, nBaseKey);
+
+    peer.ClearBlockInFlight(uint256(7000));
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 127U);
+
+    BOOST_CHECK(SendMessages(&peer, true));
+    BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 2U);
+    it = peer.mapAskFor.begin();
+    BOOST_CHECK(it->second.hash == hashC); ++it;
+    BOOST_CHECK(it->second.hash == hashD);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
