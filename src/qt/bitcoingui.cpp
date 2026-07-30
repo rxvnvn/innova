@@ -1389,7 +1389,7 @@ void BitcoinGUI::showNormalIfMinimized(bool fToggleHidden)
     // activateWindow() (sometimes) helps with keyboard focus on Windows
     if (isHidden())
     {
-        show();
+        showNormal();
         activateWindow();
     }
     else if (isMinimized())
