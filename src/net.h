@@ -442,8 +442,8 @@ bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer);
 size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason);
 const char* BlockRequestOwnerStateName(BlockRequestOwnerState state);
 
-bool IsBlockRequestOwnedByAnyPeer(const uint256& hash, const CNode* extra_peer = NULL);
-bool EraseAlreadyAskedForIfUnowned(const CInv& inv, const CNode* extra_peer = NULL);
+bool IsBlockRequestOwnedByAnyPeer(const uint256& hash);
+bool EraseAlreadyAskedForIfUnowned(const CInv& inv);
 static const int64_t ALREADY_ASKED_FOR_RETENTION_US = 60LL * 60 * 1000000;
 static const int64_t ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US = 5LL * 1000000;
 static const int64_t ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US = 2LL * 60 * 1000000;
@@ -877,7 +877,7 @@ public:
 
     ~CNode()
     {
-        ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect");
+        Cleanup();
         if (BlockRequestTraceEnabled())
             BlockRequestTracePeerClosed(this);
         RecoveryResponseResult recoveryResult;
@@ -1492,7 +1492,7 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                 it = mapBlockInFlightSince.erase(it);
                 ReleaseBlockRequestOwner(hashExpired, GetId(), "timeout");
                 EraseAlreadyAskedForIfUnowned(
-                    CInv(MSG_BLOCK, hashExpired), this);
+                    CInv(MSG_BLOCK, hashExpired));
             }
             else
             {

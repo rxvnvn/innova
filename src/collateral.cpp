@@ -1041,27 +1041,33 @@ void ThreadCheckCollaTeralPool(void* parg)
         int mnRefresh = 30;
 
         //try to sync the collateralnode list and payment list every 30 seconds from at least 2 nodes until we have them all
-        if(vNodes.size() > 1 && c % mnRefresh == 0 && (mnCount == 0 || vecCollateralnodes.size() < mnCount)) {
+        if(c % mnRefresh == 0 && (mnCount == 0 || vecCollateralnodes.size() < mnCount)) {
             bool fIsInitialDownload = IsInitialBlockDownload();
             if(!fIsInitialDownload) {
-                LOCK(cs_vNodes);
-                for (CNode* pnode : vNodes)
+                // snapshot with refs under lock, then send outside lock
+                vector<CNode*> vNodesCopy;
+                {
+                    LOCK(cs_vNodes);
+                    if (vNodes.size() <= 1)
+                        continue;
+                    vNodesCopy = vNodes;
+                    BOOST_FOREACH(CNode* pnode, vNodesCopy)
+                        pnode->AddRef();
+                }
+                BOOST_FOREACH(CNode* pnode, vNodesCopy)
                 {
                     if (pnode->nVersion >= colLateralPool.PROTOCOL_VERSION) {
-
-                        // re-request from each node every 120 seconds
                         if(GetTime() - pnode->nLastDseg < 120)
-                        {
                             continue;
-                        } else {
-                            printf("Asking for Collateralnode list from %s\n",pnode->addr.ToStringIPPort().c_str());
-                            pnode->PushMessage("iseg", CTxIn()); //request full mn list
-                            pnode->nLastDseg = GetTime();
-                            pnode->PushMessage("getsporks"); //get current network sporks
-                            RequestedCollateralNodeList++;
-                        }
+                        printf("Asking for Collateralnode list from %s\n",pnode->addr.ToStringIPPort().c_str());
+                        pnode->PushMessage("iseg", CTxIn());
+                        pnode->nLastDseg = GetTime();
+                        pnode->PushMessage("getsporks");
+                        RequestedCollateralNodeList++;
                     }
                 }
+                BOOST_FOREACH(CNode* pnode, vNodesCopy)
+                    pnode->Release();
             }
         }
 

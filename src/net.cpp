@@ -1821,48 +1821,22 @@ size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason)
     return nReleased;
 }
 
-bool IsBlockRequestOwnedByAnyPeer(const uint256& hash, const CNode* extra_peer)
+bool IsBlockRequestOwnedByAnyPeer(const uint256& hash)
 {
-    {
-        LOCK(cs_mapAlreadyAskedFor);
-        if (mapBlockRequestOwners.count(hash) != 0)
-            return true;
-    }
-
-    LOCK(cs_vNodes);
-    for (std::vector<CNode*>::const_iterator it = vNodes.begin();
-         it != vNodes.end(); ++it)
-    {
-        const CNode* pnode = *it;
-        if (pnode != NULL &&
-            (pnode->setBlocksInFlight.count(hash) != 0 ||
-             std::find_if(pnode->mapAskFor.begin(), pnode->mapAskFor.end(),
-                          [&hash](const std::pair<const int64_t, CInv>& item) {
-                              return item.second.hash == hash &&
-                                     (item.second.type == MSG_BLOCK ||
-                                      item.second.type == MSG_FILTERED_BLOCK);
-                          }) != pnode->mapAskFor.end()))
-            return true;
-    }
-    if (extra_peer != NULL &&
-        (extra_peer->setBlocksInFlight.count(hash) != 0 ||
-         std::find_if(extra_peer->mapAskFor.begin(), extra_peer->mapAskFor.end(),
-                      [&hash](const std::pair<const int64_t, CInv>& item) {
-                          return item.second.hash == hash &&
-                                 (item.second.type == MSG_BLOCK ||
-                                  item.second.type == MSG_FILTERED_BLOCK);
-                      }) != extra_peer->mapAskFor.end()))
-        return true;
-    return false;
+    LOCK(cs_mapAlreadyAskedFor);
+    return mapBlockRequestOwners.count(hash) != 0;
 }
 
-bool EraseAlreadyAskedForIfUnowned(const CInv& inv, const CNode* extra_peer)
+bool EraseAlreadyAskedForIfUnowned(const CInv& inv)
 {
     if (inv.type != MSG_BLOCK && inv.type != MSG_FILTERED_BLOCK)
         return false;
-    if (IsBlockRequestOwnedByAnyPeer(inv.hash, extra_peer))
-        return false;
+
     LOCK(cs_mapAlreadyAskedFor);
+
+    if (mapBlockRequestOwners.count(inv.hash) != 0)
+        return false;
+
     return mapAlreadyAskedFor.erase(inv) != 0;
 }
 
@@ -3966,6 +3940,7 @@ void CNode::CloseSocketDisconnect()
 
 void CNode::Cleanup()
 {
+    ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect");
 }
 
 

@@ -8,6 +8,8 @@
 #include <vector>
 
 #include <boost/test/unit_test.hpp>
+#include <boost/thread/barrier.hpp>
+#include <boost/thread/thread.hpp>
 
 #include "checkpoints.h"
 #include "ibdefficiency.h"
@@ -1779,13 +1781,13 @@ BOOST_AUTO_TEST_CASE(already_asked_for_lifecycle_is_cross_peer_safe)
         LOCK(cs_vNodes);
         vNodes.push_back(&owner);
     }
-    BOOST_CHECK(!EraseAlreadyAskedForIfUnowned(inv, &other));
+    BOOST_CHECK(!EraseAlreadyAskedForIfUnowned(inv));
     {
         LOCK(cs_mapAlreadyAskedFor);
         BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(inv), 1U);
     }
     owner.ClearAskFor();
-    BOOST_CHECK(EraseAlreadyAskedForIfUnowned(inv, &other));
+    BOOST_CHECK(EraseAlreadyAskedForIfUnowned(inv));
     {
         LOCK(cs_mapAlreadyAskedFor);
         BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(inv), 0U);
@@ -2631,6 +2633,175 @@ BOOST_AUTO_TEST_CASE(continuation_candidate_is_eventually_reached)
     }
     BOOST_CHECK(!peer.IsBlockInvDeferred(continuation));
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, continuation), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(inflight_expiry_under_cs_vsend_does_not_need_cs_vnodes)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hash(5001);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(80), "inflight-expiry-peer", true);
+
+    peer.MarkBlockInFlight(hash);
+    peer.mapBlockInFlightSince[hash] = GetTime() - 60;
+
+    {
+        LOCK(peer.cs_vSend);
+        peer.ExpireBlockInFlight();
+    }
+
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hash), 0U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hash), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(cross_peer_ownership_blocks_already_asked_erase)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hash(5002);
+    CNode owner(INVALID_SOCKET, TestPeerAddress(81), "cross-owner-one", true);
+    CNode other(INVALID_SOCKET, TestPeerAddress(82), "cross-owner-other", true);
+    PreparePeerForRecovery(owner, PROTOCOL_VERSION, nBestHeight + 1);
+    PreparePeerForRecovery(other, PROTOCOL_VERSION, nBestHeight + 1);
+
+    const CInv inv(MSG_BLOCK, hash);
+    owner.AskFor(inv, BLOCKREQ_SOURCE_INV);
+
+    BOOST_CHECK(!EraseAlreadyAskedForIfUnowned(inv));
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(inv), 1U);
+    }
+
+    owner.ClearAskFor();
+    BOOST_CHECK(EraseAlreadyAskedForIfUnowned(inv));
+}
+
+BOOST_AUTO_TEST_CASE(owner_erase_toctou_race)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hash(5008);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(87), "toctou-peer", true);
+
+    const CInv inv(MSG_BLOCK, hash);
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peer.GetId(), BLOCKREQ_SOURCE_INV));
+
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        mapAlreadyAskedFor[inv] = GetTimeMicros();
+    }
+
+    BOOST_CHECK(!EraseAlreadyAskedForIfUnowned(inv));
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(inv), 1U);
+    }
+
+    ReleaseBlockRequestOwner(hash, peer.GetId(), "test");
+
+    BOOST_CHECK(EraseAlreadyAskedForIfUnowned(inv));
+}
+
+BOOST_AUTO_TEST_CASE(disconnect_cleans_up_block_request_owners)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashA(5003);
+    const uint256 hashB(5004);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(83), "disconnect-owner", true);
+
+    peer.AskFor(CInv(MSG_BLOCK, hashA), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(TryAssignBlockRequestOwner(hashB, peer.GetId(), BLOCKREQ_SOURCE_INV));
+    peer.MarkBlockInFlight(hashB);
+
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    BOOST_CHECK(GetBlockRequestOwner(hashA, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peer.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+
+    ownerPeer = -1;
+    ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(hashB, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peer.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+
+    peer.Cleanup();
+
+    BOOST_CHECK(!GetBlockRequestOwner(hashA, NULL, NULL));
+    BOOST_CHECK(!GetBlockRequestOwner(hashB, NULL, NULL));
+}
+
+BOOST_AUTO_TEST_CASE(ownerless_queued_entry_erase_is_safe)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hash(5005);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(84), "ownerless-askfor", true);
+
+    peer.AddAskForEntry(GetTimeMicros(), CInv(MSG_BLOCK, hash));
+
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hash), 1U);
+
+    const CInv inv(MSG_BLOCK, hash);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        mapAlreadyAskedFor[inv] = GetTimeMicros();
+    }
+
+    BOOST_CHECK(EraseAlreadyAskedForIfUnowned(inv));
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(inv), 0U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(is_block_request_owned_by_any_peer_no_cs_vnodes)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hash(5006);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(85), "ownership-no-vnodes", true);
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peer.GetId(), BLOCKREQ_SOURCE_INV));
+    peer.MarkBlockInFlight(hash);
+
+    {
+        LOCK(peer.cs_vSend);
+        BOOST_CHECK(IsBlockRequestOwnedByAnyPeer(hash));
+    }
+
+    ReleaseBlockRequestOwner(hash, peer.GetId(), "test");
+
+    {
+        LOCK(peer.cs_vSend);
+        BOOST_CHECK(!IsBlockRequestOwnedByAnyPeer(hash));
+    }
+
+    peer.setBlocksInFlight.clear();
+}
+
+BOOST_AUTO_TEST_CASE(concurrent_cs_vnodes_and_cs_vsend_no_deadlock)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(86), "concurrent-peer", true);
+    const uint256 hash(5007);
+    peer.MarkBlockInFlight(hash);
+    peer.mapBlockInFlightSince[hash] = GetTime() - 60;
+
+    boost::barrier barrier(2);
+
+    boost::thread t([&peer, &barrier]() {
+        LOCK(cs_vNodes);
+        barrier.wait();
+        barrier.wait();
+    });
+
+    barrier.wait();
+    {
+        LOCK(peer.cs_vSend);
+        peer.ExpireBlockInFlight();
+    }
+    barrier.wait();
+
+    t.join();
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hash), 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

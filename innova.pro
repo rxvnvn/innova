@@ -675,6 +675,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/test/script_P2SH_tests.cpp \
            src/test/script_tests.cpp \
            src/test/sigopcount_tests.cpp \
+           src/test/p2p_sync_tests.cpp \
            src/test/test_innova.cpp \
            src/test/transaction_tests.cpp \
            src/test/uint160_tests.cpp \

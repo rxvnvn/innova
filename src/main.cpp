@@ -8981,7 +8981,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // already-known or orphaned.
         if (fAccepted || fKnownBefore || fOrphanBefore)
         {
-            EraseAlreadyAskedForIfUnowned(inv, pfrom);
+            EraseAlreadyAskedForIfUnowned(inv);
         }
         else if (!fKnownBefore && !fOrphanBefore && block.nDoS == 0 &&
                  mapBlockIndex.count(hashBlock) == 0 &&
@@ -9968,7 +9968,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                             "same-peer-inflight", -1);
                     }
                     pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
-                    EraseAlreadyAskedForIfUnowned(inv, pto);
+                    EraseAlreadyAskedForIfUnowned(inv);
                     continue;
                 }
                 NodeId nOwnerPeer = -1;
@@ -10087,7 +10087,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             if (fSkip)
             {
                 pto->EraseAskForEntry(pto->mapAskFor.begin());
-                EraseAlreadyAskedForIfUnowned(inv, pto);
+                EraseAlreadyAskedForIfUnowned(inv);
             }
             else
             {
