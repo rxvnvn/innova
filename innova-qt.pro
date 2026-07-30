@@ -9,6 +9,17 @@ CONFIG += static
 CONFIG += c++11
 QT += core gui network widgets concurrent
 
+# Qt test build: qmake CONFIG+=qt_test
+qt_test {
+    QT += testlib
+    DEFINES += BITCOIN_QT_TEST
+    SOURCES += src/qt/test/test_main.cpp \
+               src/qt/test/transactionrecord_tests.cpp \
+               src/qt/test/uritests.cpp
+    HEADERS += src/qt/test/transactionrecord_tests.h \
+               src/qt/test/uritests.h
+}
+
 # macOS: Detect Homebrew prefix early (arm64 uses /opt/homebrew, x86_64 uses /usr/local)
 macx {
     HOMEBREW_PREFIX = /opt/homebrew

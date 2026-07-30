@@ -7,14 +7,15 @@
  */
 bool TransactionRecord::showTransaction(const CWalletTx &wtx)
 {
-    if (wtx.IsCoinBase())
-    {
-        // Ensures we show generated coins / mined transactions at depth 1
-        if (!wtx.IsInMainChain())
-        {
-            return false;
-        }
-    }
+    Q_UNUSED(wtx);
+
+    // Older Bitcoin Core releases suppressed generated coinbase transactions
+    // until the containing block reached the active chain.  Innova notifies
+    // the wallet during ConnectBlock, before pindexBest advances, so
+    // IsInMainChain always fails for the just-connected block.  Removing
+    // this gate avoids a deterministic one-block delay.  Inactive generated
+    // rewards are handled via NotAccepted status and proxy filtering.
+
     return true;
 }
 

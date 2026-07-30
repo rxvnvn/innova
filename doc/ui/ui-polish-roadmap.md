@@ -27,43 +27,6 @@ Innova-Qt contains a functional but visually dated Qt interface inherited from a
 
 ## Current Backlog
 
-### P1 — Transaction list does not always update immediately during mining
-
-**Observed behaviour:**
-
-- While the built-in miner is running, not every newly generated mining or staking transaction appears in the transaction list immediately.
-- Some transactions become visible only after a delay, another model update, page change, or wallet restart.
-- The wallet balance and transaction model may therefore temporarily appear inconsistent.
-
-**Classification:**
-
-- Behavioural issue, not cosmetic.
-
-**Investigation plan:**
-
-- Trace the path from an accepted/generated block to wallet transaction insertion.
-- Inspect wallet notification signals and TransactionTableModel update handling.
-- Check `NotifyTransactionChanged`, `NotifyAddressBookChanged`, `rowsInserted`, `dataChanged`, `modelReset`, and queued signal delivery.
-- Determine whether generated transactions are inserted individually, batched, delayed until confirmation updates, or missed by the Qt model.
-- Check whether mining happens in a non-GUI thread and whether `Qt::AutoConnection` selects the expected queued delivery.
-- Compare RPC wallet transaction visibility with the Qt transaction model at the same moment.
-- Confirm whether the issue affects only mined/staked transactions or ordinary incoming transactions too.
-- Do not solve this with periodic full wallet refresh unless no correct event-driven solution exists.
-
-**Acceptance criteria:**
-
-- Every newly recognized wallet transaction appears without changing pages or restarting the wallet.
-- No duplicate rows appear.
-- No GUI-thread blocking is introduced.
-- Mining and staking remain functional.
-- Transaction confirmations continue updating normally.
-
-**Suggested future commit scope:**
-
-    fix(qt): refresh generated transactions promptly
-
----
-
 ### P2 — Transaction icons have insufficient contrast
 
 **Observed behaviour:**
@@ -293,6 +256,29 @@ Innova-Qt contains a functional but visually dated Qt interface inherited from a
 
 ## Completed Work
 
+### Completed — Newly mined reward transactions appear without one-block delay
+
+**Problem:**
+
+- Generated coinbase transactions were hidden from the Qt source model for one block.
+- During `ConnectBlock`, `SyncWithWallets → AddToWallet` fires `CT_NEW`/`CT_UPDATED` before `pindexBest` advances.
+- `TransactionRecord::showTransaction()` returned `false` for coinbase transactions not yet in the active chain, suppressing the insertion.
+- Recovery relied on `UpdatedTransaction(hashPrevBestCoinBase)` one block later, producing a deterministic delay.
+
+**Resolution:**
+
+- Removed the inherited `IsInMainChain` gate from `TransactionRecord::showTransaction()`.
+- Inactive generated rewards continue to be represented via `NotAccepted` status and filtered by the default `TransactionFilterProxy`.
+
+**Validation:**
+
+- `TransactionRecord::showTransaction()` now returns `true` unconditionally; confirmed by unit test with an unconfirmed coinbase `CWalletTx`.
+- Clean production and test Qt builds pass.
+- Staking/coinstake behaviour was not affected (the gate only checked `IsCoinBase()`).
+- `KernelRecord::showTransaction()` was not modified.
+
+---
+
 ### Completed — Restore the main window from the system tray on X11
 
 **Problem:**
@@ -315,18 +301,35 @@ Innova-Qt contains a functional but visually dated Qt interface inherited from a
 
 ---
 
+## Follow-Up Items (Not Addressed)
+
+The following observations were noted during the P1 investigation but were not caused by the same root cause. They remain open.
+
+### P1 — Staking/minting view may delay or miss generated rewards
+
+`KernelRecord::showTransaction()` contains a separate `!wtx.IsInMainChain()` gate that affects the staking/minting overview page (`MintingView`). This gate is unrelated to the main transaction list fix. Evaluate separately.
+
+### P2 — Possible transaction notification loss under TRY_LOCK failure
+
+`TransactionTableModel::updateWalletTransaction()` acquires `TRY_LOCK(cs_main)`. If the lock fails, the notification is silently dropped. The transaction may still appear on the next `modelReset` or page switch. Evaluate whether this causes visible delays or missed rows.
+
+### P3 — Confirmation refresh timing after block connect
+
+After a new block connects, existing transaction confirmations may lag by one model update cycle. Investigate whether `NotifyTransactionChanged` is being emitted for every affected transaction or only for the newly generated coinbase.
+
+---
+
 ## Suggested Implementation Order
 
-1. **Transaction list update during mining** — behavioural fix, highest user impact.
-2. **Transaction icon contrast** — daily usability, moderate effort.
-3. **Transaction text readability** — daily usability, moderate effort.
-4. **Send page spacing** — layout polish, noticeable at every use.
-5. **Overview page hierarchy and spacing** — layout polish, first-impression page.
-6. **Translation consistency** — i18n fix, affects all locales.
-7. **Toolbar polish** — visual refresh of primary navigation.
-8. **Optional Qt modernization** — no user-facing value, schedule last.
+1. **Transaction icon contrast** — daily usability, moderate effort.
+2. **Transaction text readability** — daily usability, moderate effort.
+3. **Send page spacing** — layout polish, noticeable at every use.
+4. **Overview page hierarchy and spacing** — layout polish, first-impression page.
+5. **Translation consistency** — i18n fix, affects all locales.
+6. **Toolbar polish** — visual refresh of primary navigation.
+7. **Optional Qt modernization** — no user-facing value, schedule last.
 
-Behavioural work comes before cosmetic work. P1 must be investigated and resolved before any P3/P4 items.
+Behavioural work comes before cosmetic work. Resolve remaining P1/P2 items before P3/P4.
 
 ## Validation Matrix
 
@@ -341,8 +344,8 @@ Behavioural work comes before cosmetic work. P1 must be investigated and resolve
 | Close-to-tray (where enabled) | Window hidden on close |
 | Incoming transaction display | Row appears in transaction list |
 | Outgoing transaction display | Row appears in transaction list |
-| Mined transaction display | Row appears promptly during mining |
-| Staked transaction display | Row appears promptly during staking |
+| Mined transaction display | Row appears without one-block delay (fix applied) |
+| Staked transaction display | Row appears promptly during staking (KernelRecord gate not yet evaluated) |
 | Confirmation updates | Confirmations increment correctly |
 | Wallet locked state | Lock icon, send disabled |
 | Wallet unlocked state | Send enabled |
