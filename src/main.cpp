@@ -47,6 +47,7 @@ static bool LoadFCMPValidationRoot(CTxDB& txdb, int nBlockHeight,
                                    CCurveTreeNode& rootOut,
                                    uint256& hashExpectedRootOut,
                                    std::string& strErrorOut);
+static bool AlreadyHave(CTxDB& txdb, const CInv& inv);
 
 //
 // Global state
@@ -118,8 +119,433 @@ map<uint256, CBlock*> mapOrphanBlocks;
 multimap<uint256, CBlock*> mapOrphanBlocksByPrev;
 map<uint256, NodeId> mapOrphanBlocksByNode;
 map<NodeId, int> mapOrphanCountByNode;
-static const int MAX_ORPHAN_BLOCKS_PER_PEER = 750;
 set<pair<COutPoint, unsigned int> > setStakeSeenOrphan;
+
+static int GetPeerOrphanCount(NodeId nodeid)
+{
+    std::map<NodeId, int>::const_iterator it = mapOrphanCountByNode.find(nodeid);
+    return it == mapOrphanCountByNode.end() ? 0 : it->second;
+}
+
+bool ShouldSkipBlockInvForOrphanPressure(CNode* pfrom, const CInv& inv,
+                                          bool fAlreadyHave,
+                                          int* pnOrphanCountPeer,
+                                          int* pnQueuedBlockRequests,
+                                          int* pnSentBlockRequests,
+                                          int* pnProjectedPressure)
+{
+    AssertLockHeld(cs_main);
+    if (pnOrphanCountPeer)
+        *pnOrphanCountPeer = 0;
+    if (pnQueuedBlockRequests)
+        *pnQueuedBlockRequests = 0;
+    if (pnSentBlockRequests)
+        *pnSentBlockRequests = 0;
+    if (pnProjectedPressure)
+        *pnProjectedPressure = 0;
+    if (pfrom == NULL || fAlreadyHave || inv.type != MSG_BLOCK)
+        return false;
+    if (!IsInitialBlockDownload())
+        return false;
+
+    const int nOrphanCountPeer = GetPeerOrphanCount(pfrom->GetId());
+    const int nQueuedBlockRequests = (int)pfrom->setAskForBlocks.size();
+    const int nSentBlockRequests = (int)pfrom->setBlocksInFlight.size();
+    const int nProjectedPressure = nOrphanCountPeer +
+        nQueuedBlockRequests + nSentBlockRequests;
+    if (pnOrphanCountPeer)
+        *pnOrphanCountPeer = nOrphanCountPeer;
+    if (pnQueuedBlockRequests)
+        *pnQueuedBlockRequests = nQueuedBlockRequests;
+    if (pnSentBlockRequests)
+        *pnSentBlockRequests = nSentBlockRequests;
+    if (pnProjectedPressure)
+        *pnProjectedPressure = nProjectedPressure;
+    return nProjectedPressure >= MAX_PROJECTED_ORPHAN_PRESSURE;
+}
+
+static void BlockRequestTraceOrphanPressure(CNode* pfrom, int nOrphanCountPeer,
+                                            int nQueuedBlockRequests,
+                                            int nSentBlockRequests,
+                                            int nProjectedPressure)
+{
+    if (!BlockRequestTraceEnabled() || pfrom == NULL)
+        return;
+
+    static std::map<NodeId, int64_t> mapLastTraceByPeer;
+    const int64_t nNow = GetTimeMicros();
+    int64_t& nLastTrace = mapLastTraceByPeer[pfrom->GetId()];
+    if (nLastTrace != 0 && nNow - nLastTrace < 10 * 1000000)
+        return;
+    nLastTrace = nNow;
+
+    printf("BLOCKREQTRACE time_us=%lld event=ORPHAN_PRESSURE peer=%d addr=%s orphan_count=%d queued_blocks=%d sent_blocks=%d projected_pressure=%d budget=%d hard_limit=%d ask_queue=%u local_height=%d\n",
+           (long long)nNow, pfrom->GetId(), pfrom->addrName.c_str(),
+           nOrphanCountPeer, nQueuedBlockRequests, nSentBlockRequests,
+           nProjectedPressure, MAX_PROJECTED_ORPHAN_PRESSURE,
+           MAX_ORPHAN_BLOCKS_PER_PEER,
+           (unsigned int)pfrom->mapAskFor.size(),
+           nBestHeight);
+}
+
+
+
+static int CountGlobalActiveBlockRequests(CNode* extraPeer)
+{
+    int nGlobalActive = 0;
+    TRY_LOCK(cs_vNodes, lockNodes);
+    if (lockNodes)
+    {
+        for (std::vector<CNode*>::const_iterator it = vNodes.begin();
+             it != vNodes.end(); ++it)
+        {
+            const CNode* pnode = *it;
+            if (pnode == NULL)
+                continue;
+            nGlobalActive += (int)pnode->setAskForBlocks.size();
+            nGlobalActive += (int)pnode->setBlocksInFlight.size();
+        }
+    }
+    if (!lockNodes)
+        return MAX_DEFERRED_INV_ACTIVE_GLOBAL + 1;
+    else if (extraPeer != NULL &&
+             std::find(vNodes.begin(), vNodes.end(), extraPeer) == vNodes.end())
+    {
+        nGlobalActive += (int)extraPeer->setAskForBlocks.size();
+        nGlobalActive += (int)extraPeer->setBlocksInFlight.size();
+    }
+    return nGlobalActive;
+}
+
+int GetDeferredBlockRequestBudget(CNode* pfrom,
+                                  int* pnOrphanCountPeer,
+                                  int* pnQueuedBlockRequests,
+                                  int* pnSentBlockRequests,
+                                  int* pnPeerActivePressure,
+                                  int* pnGlobalActivePressure)
+{
+    AssertLockHeld(cs_main);
+    if (pnOrphanCountPeer)
+        *pnOrphanCountPeer = 0;
+    if (pnQueuedBlockRequests)
+        *pnQueuedBlockRequests = 0;
+    if (pnSentBlockRequests)
+        *pnSentBlockRequests = 0;
+    if (pnPeerActivePressure)
+        *pnPeerActivePressure = 0;
+    if (pnGlobalActivePressure)
+        *pnGlobalActivePressure = 0;
+    if (pfrom == NULL || !IsInitialBlockDownload())
+        return MAX_DEFERRED_INV_ACTIVE_PER_PEER;
+
+    const int nOrphanCountPeer = GetPeerOrphanCount(pfrom->GetId());
+    const int nQueuedBlockRequests = (int)pfrom->setAskForBlocks.size();
+    const int nSentBlockRequests = (int)pfrom->setBlocksInFlight.size();
+    const int nPeerActivePressure = nOrphanCountPeer +
+        nQueuedBlockRequests + nSentBlockRequests;
+    const int nGlobalActivePressure = CountGlobalActiveBlockRequests(pfrom);
+    if (pnOrphanCountPeer)
+        *pnOrphanCountPeer = nOrphanCountPeer;
+    if (pnQueuedBlockRequests)
+        *pnQueuedBlockRequests = nQueuedBlockRequests;
+    if (pnSentBlockRequests)
+        *pnSentBlockRequests = nSentBlockRequests;
+    if (pnPeerActivePressure)
+        *pnPeerActivePressure = nPeerActivePressure;
+    if (pnGlobalActivePressure)
+        *pnGlobalActivePressure = nGlobalActivePressure;
+
+    const int nPeerBudget = MAX_DEFERRED_INV_ACTIVE_PER_PEER - nPeerActivePressure;
+    const int nGlobalBudget = MAX_DEFERRED_INV_ACTIVE_GLOBAL - nGlobalActivePressure;
+    return std::max(0, std::min(nPeerBudget, nGlobalBudget));
+}
+
+static void TraceDeferredWindowState(CNode* pfrom, const char* pszEvent,
+                                     const uint256& hash, const char* pszReason,
+                                     int nBudget, int nAdmitted, int nDropped)
+{
+    if (!BlockRequestTraceEnabled() || pfrom == NULL)
+        return;
+    AssertLockHeld(cs_main);
+    int nOrphanCountPeer = 0;
+    int nQueuedBlockRequests = 0;
+    int nSentBlockRequests = 0;
+    int nPeerActivePressure = 0;
+    int nGlobalActivePressure = 0;
+    GetDeferredBlockRequestBudget(pfrom, &nOrphanCountPeer,
+                                  &nQueuedBlockRequests,
+                                  &nSentBlockRequests,
+                                  &nPeerActivePressure,
+                                  &nGlobalActivePressure);
+    printf("BLOCKREQTRACE time_us=%lld event=%s peer=%d hash=%s deferred_size=%zu peer_queued=%d peer_inflight=%d global_active=%d orphan_count=%d peer_pressure=%d active_budget=%d active_limit=%d global_limit=%d deferred_limit=%zu reason=%s source=inv admitted=%d dropped=%d\n",
+           (long long)GetTimeMicros(), pszEvent, pfrom->GetId(),
+           hash.ToString().c_str(), pfrom->deferredBlockInv.size(),
+           nQueuedBlockRequests, nSentBlockRequests, nGlobalActivePressure,
+           nOrphanCountPeer, nPeerActivePressure, nBudget,
+           MAX_DEFERRED_INV_ACTIVE_PER_PEER,
+           MAX_DEFERRED_INV_ACTIVE_GLOBAL,
+           MAX_DEFERRED_BLOCK_INV_PER_PEER,
+           pszReason ? pszReason : "none", nAdmitted, nDropped);
+}
+
+static bool DeferBlockInv(CNode* pfrom, const uint256& hash,
+                          const char* pszReason)
+{
+    if (pfrom == NULL)
+        return false;
+    if (pfrom->IsBlockAskForQueued(hash) || pfrom->setBlocksInFlight.count(hash) != 0)
+        return false;
+    if (pfrom->IsBlockInvDeferred(hash))
+    {
+        TraceDeferredWindowState(pfrom, "INV_DEFER_DUPLICATE", hash,
+                                 pszReason, 0, 0, 0);
+        return true;
+    }
+    if (!pfrom->DeferBlockInv(hash))
+    {
+        TraceDeferredWindowState(pfrom, "INV_DEFER_OVERFLOW", hash,
+                                 pszReason, 0, 0, 1);
+        return false;
+    }
+    TraceDeferredWindowState(pfrom, "INV_DEFER", hash, pszReason, 0, 0, 0);
+    return true;
+}
+
+static bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv)
+{
+    AssertLockHeld(cs_main);
+    if (pfrom == NULL || inv.type != MSG_BLOCK)
+        return false;
+    if (!IsInitialBlockDownload())
+    {
+        pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+        return true;
+    }
+    int nOrphanCountPeer = 0;
+    int nQueuedBlockRequests = 0;
+    int nSentBlockRequests = 0;
+    int nPeerActivePressure = 0;
+    int nGlobalActivePressure = 0;
+    const int nBudget = GetDeferredBlockRequestBudget(
+        pfrom, &nOrphanCountPeer, &nQueuedBlockRequests,
+        &nSentBlockRequests, &nPeerActivePressure, &nGlobalActivePressure);
+    if (nBudget <= 0)
+    {
+        if (BlockRequestTraceEnabled())
+        {
+            BlockRequestTraceAskSkipOrphanPressure(
+                pfrom, inv.hash, BLOCKREQ_SOURCE_INV,
+                nOrphanCountPeer, nQueuedBlockRequests,
+                nSentBlockRequests, nPeerActivePressure,
+                MAX_DEFERRED_INV_ACTIVE_PER_PEER,
+                MAX_ORPHAN_BLOCKS_PER_PEER);
+            BlockRequestTraceOrphanPressure(
+                pfrom, nOrphanCountPeer, nQueuedBlockRequests,
+                nSentBlockRequests, nPeerActivePressure);
+            TraceDeferredWindowState(pfrom, "DEFERRED_SKIP_NO_BUDGET",
+                                     inv.hash, "active-window-full",
+                                     nBudget, 0, 0);
+        }
+        DeferBlockInv(pfrom, inv.hash, "active-window-full");
+        return false;
+    }
+    pfrom->RemoveDeferredBlockInv(inv.hash);
+    pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+    return true;
+}
+
+size_t RefillDeferredBlockRequests(CNode* pfrom)
+{
+    AssertLockHeld(cs_main);
+    if (pfrom == NULL || pfrom->deferredBlockInv.empty() ||
+        !IsInitialBlockDownload())
+        return 0;
+
+    CTxDB txdb("r");
+    size_t nAdmitted = 0;
+    size_t nDropped = 0;
+    size_t nExamined = 0;
+    const size_t nInitialSize = pfrom->deferredBlockInv.size();
+    int nBudget = GetDeferredBlockRequestBudget(pfrom);
+
+    while (!pfrom->deferredBlockInv.empty() && nBudget > 0 &&
+           nExamined < MAX_DEFERRED_BLOCK_INV_REFILL_WORK &&
+           nExamined < nInitialSize)
+    {
+        const uint256 hash = pfrom->deferredBlockInv.front();
+        const CInv inv(MSG_BLOCK, hash);
+        ++nExamined;
+
+        if (AlreadyHave(txdb, inv))
+        {
+            pfrom->PopFrontDeferredBlockInv();
+            ++nDropped;
+            TraceDeferredWindowState(pfrom, "DEFERRED_SKIP_KNOWN", hash,
+                                     "already-have", nBudget,
+                                     (int)nAdmitted, (int)nDropped);
+            continue;
+        }
+        if (pfrom->IsBlockAskForQueued(hash) ||
+            pfrom->setBlocksInFlight.count(hash) != 0)
+        {
+            pfrom->PopFrontDeferredBlockInv();
+            ++nDropped;
+            TraceDeferredWindowState(pfrom, "DEFERRED_SKIP_ACTIVE_OWNER", hash,
+                                     "same-peer-active", nBudget,
+                                     (int)nAdmitted, (int)nDropped);
+            continue;
+        }
+        NodeId nOwnerPeer = -1;
+        BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+        if (GetBlockRequestOwner(hash, &nOwnerPeer, &ownerState))
+        {
+            pfrom->RotateFrontDeferredBlockInv();
+            TraceDeferredWindowState(pfrom, "DEFERRED_SKIP_ACTIVE_OWNER", hash,
+                                     nOwnerPeer == pfrom->GetId()
+                                         ? "same-peer-owner"
+                                         : "other-peer-owner",
+                                     nBudget, (int)nAdmitted, (int)nDropped);
+            continue;
+        }
+
+        pfrom->PopFrontDeferredBlockInv();
+        pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+        ++nAdmitted;
+        nBudget = GetDeferredBlockRequestBudget(pfrom);
+    }
+
+    TraceDeferredWindowState(pfrom, "DEFERRED_REFILL", uint256(0),
+                             nBudget <= 0 ? "no-budget" : "pump",
+                             nBudget, (int)nAdmitted, (int)nDropped);
+    if (nBudget <= 0 && !pfrom->deferredBlockInv.empty())
+        TraceDeferredWindowState(pfrom, "WINDOW_STATE", pfrom->deferredBlockInv.front(),
+                                 "deferred-remaining", nBudget,
+                                 (int)nAdmitted, (int)nDropped);
+    return nAdmitted;
+}
+
+static bool fProcessBlockRejectTraceEnabled = false;
+static CCriticalSection cs_processBlockRejectTrace;
+static std::map<uint256, std::string> mapProcessBlockRejectTraceLastReason;
+
+bool InitProcessBlockRejectTrace(bool fEnabled)
+{
+    fProcessBlockRejectTraceEnabled = fEnabled;
+    if (fProcessBlockRejectTraceEnabled)
+        printf("PBREJECT: process block reject trace enabled\n");
+    return true;
+}
+
+bool ProcessBlockRejectTraceEnabled()
+{
+    return fProcessBlockRejectTraceEnabled;
+}
+
+const char* ProcessBlockRejectReasonName(ProcessBlockRejectReason reason)
+{
+    switch (reason) {
+    case PBREJECT_DUPLICATE_INDEXED: return "DUPLICATE_INDEXED";
+    case PBREJECT_DUPLICATE_ORPHAN: return "DUPLICATE_ORPHAN";
+    case PBREJECT_DUPLICATE_INDEXED_STAKE: return "DUPLICATE_INDEXED_STAKE";
+    case PBREJECT_POS_AFTER_DAG: return "POS_AFTER_DAG";
+    case PBREJECT_CHECKBLOCK_FALSE: return "CHECKBLOCK_FALSE";
+    case PBREJECT_WEAK_CHECKPOINT: return "WEAK_CHECKPOINT";
+    case PBREJECT_ORPHAN_LIMIT_IBD: return "ORPHAN_LIMIT_IBD";
+    case PBREJECT_ORPHAN_LIMIT_NORMAL: return "ORPHAN_LIMIT_NORMAL";
+    case PBREJECT_DUPLICATE_STAKE_ORPHAN: return "DUPLICATE_STAKE_ORPHAN";
+    case PBREJECT_ACCEPTBLOCK_FALSE: return "ACCEPTBLOCK_FALSE";
+    case PBREJECT_UNKNOWN_FALSE: return "UNKNOWN_FALSE";
+    }
+    return "UNKNOWN_FALSE";
+}
+
+std::string ProcessBlockRejectTraceLastReason(const uint256& hash)
+{
+    LOCK(cs_processBlockRejectTrace);
+    std::map<uint256, std::string>::const_iterator it =
+        mapProcessBlockRejectTraceLastReason.find(hash);
+    return it == mapProcessBlockRejectTraceLastReason.end()
+        ? std::string("none") : it->second;
+}
+
+static void ProcessBlockRejectTraceRemember(const uint256& hash,
+                                            const char* pszReason)
+{
+    if (!fProcessBlockRejectTraceEnabled)
+        return;
+    LOCK(cs_processBlockRejectTrace);
+    mapProcessBlockRejectTraceLastReason[hash] = pszReason;
+    while (mapProcessBlockRejectTraceLastReason.size() > 4096)
+    {
+        std::map<uint256, std::string>::iterator it =
+            mapProcessBlockRejectTraceLastReason.begin();
+        if (it->first == hash)
+            ++it;
+        if (it == mapProcessBlockRejectTraceLastReason.end())
+            break;
+        mapProcessBlockRejectTraceLastReason.erase(it);
+    }
+}
+
+static bool FindStakeKeyInIndex(const std::pair<COutPoint, unsigned int>& stake,
+                                uint256& hashOut)
+{
+    for (std::map<uint256, CBlockIndex*>::const_iterator it = mapBlockIndex.begin();
+         it != mapBlockIndex.end(); ++it) {
+        CBlockIndex* pindex = it->second;
+        if (pindex && pindex->IsProofOfStake() &&
+            pindex->prevoutStake == stake.first &&
+            pindex->nStakeTime == stake.second) {
+            hashOut = it->first;
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool FindStakeKeyInOrphans(const std::pair<COutPoint, unsigned int>& stake,
+                                  uint256& hashOut)
+{
+    for (std::map<uint256, CBlock*>::const_iterator it = mapOrphanBlocks.begin();
+         it != mapOrphanBlocks.end(); ++it) {
+        if (it->second && it->second->IsProofOfStake() &&
+            it->second->GetProofOfStake() == stake) {
+            hashOut = it->first;
+            return true;
+        }
+    }
+    return false;
+}
+
+static void TraceProcessBlockReject(CNode* pfrom, CBlock* pblock,
+                                    ProcessBlockRejectReason reason,
+                                    const char* pszCheckBlockReason = NULL,
+                                    const std::string& extra = std::string())
+{
+    if (!fProcessBlockRejectTraceEnabled || !pblock)
+        return;
+    const uint256 hash = pblock->GetHash();
+    const bool fIsPos = pblock->IsProofOfStake();
+    const std::pair<COutPoint, unsigned int> stake = fIsPos ?
+        pblock->GetProofOfStake() : std::make_pair(COutPoint(), 0U);
+    const bool fStakeSeenIndex = fIsPos && setStakeSeen.count(stake) != 0;
+    const bool fStakeSeenOrphan = fIsPos && setStakeSeenOrphan.count(stake) != 0;
+    int nOrphanCountPeer = -1;
+    if (pfrom) {
+        std::map<NodeId, int>::const_iterator it = mapOrphanCountByNode.find(pfrom->GetId());
+        nOrphanCountPeer = it == mapOrphanCountByNode.end() ? 0 : it->second;
+    }
+    uint256 hashExisting;
+    const char* pszExistingState = "unknown";
+    if (fIsPos && FindStakeKeyInIndex(stake, hashExisting))
+        pszExistingState = "indexed";
+    else if (fIsPos && FindStakeKeyInOrphans(stake, hashExisting))
+        pszExistingState = "orphan";
+    const char* pszReason = ProcessBlockRejectReasonName(reason);
+    ProcessBlockRejectTraceRemember(hash, pszReason);
+    printf("PBREJECT time_us=%lld hash=%s prev=%s peer=%d reason=%s checkblock_reason=%s is_pos=%d dos=%d prev_in_index=%d prev_in_orphans=%d block_in_index=%d block_in_orphans=%d orphan_count_peer=%d stake_seen_index=%d stake_seen_orphan=%d sync_checkpoint=%d local_height=%d proof_of_stake_hash=%s stake_time=%u mapOrphanBlocksByPrev_count=%zu hashPrevBlock=%s existing_block_hash=%s existing_block_state=%s%s%s\n",
+           (long long)GetTimeMicros(), hash.ToString().c_str(), pblock->hashPrevBlock.ToString().c_str(), pfrom ? pfrom->GetId() : -1, pszReason, pszCheckBlockReason ? pszCheckBlockReason : "none", fIsPos ? 1 : 0, pblock->nDoS, mapBlockIndex.count(pblock->hashPrevBlock) ? 1 : 0, mapOrphanBlocks.count(pblock->hashPrevBlock) ? 1 : 0, mapBlockIndex.count(hash) ? 1 : 0, mapOrphanBlocks.count(hash) ? 1 : 0, nOrphanCountPeer, fStakeSeenIndex ? 1 : 0, fStakeSeenOrphan ? 1 : 0, Checkpoints::GetLastSyncCheckpoint() ? 1 : 0, nBestHeight, fIsPos ? stake.first.ToString().c_str() : uint256(0).ToString().c_str(), fIsPos ? stake.second : 0, mapOrphanBlocksByPrev.count(hash), pblock->hashPrevBlock.ToString().c_str(), hashExisting.ToString().c_str(), pszExistingState, extra.empty() ? "" : " ", extra.c_str());
+}
 
 
 map<uint256, CTransaction> mapOrphanTransactions;
@@ -5939,80 +6365,82 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
 
 
 
-bool CBlock::CheckBlock(bool fCheckPOW, bool fCheckMerkleRoot, bool fCheckSig) const
+bool CBlock::CheckBlock(bool fCheckPOW, bool fCheckMerkleRoot, bool fCheckSig, const char** ppszRejectReason) const
 {
+    if (ppszRejectReason)
+        *ppszRejectReason = "CHECKBLOCK_OTHER";
     // These are checks that are independent of context
     // that can be verified before saving an orphan block.
 
     // Size limits (ceiling as sanity check; height-aware limit enforced in AcceptBlock)
     if (vtx.empty() || vtx.size() > ADAPTIVE_BLOCK_CEILING || ::GetSerializeSize(*this, SER_NETWORK, PROTOCOL_VERSION) > ADAPTIVE_BLOCK_CEILING)
-        return DoS(100, error("CheckBlock() : size limits failed"));
+        { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_SIZE"; return DoS(100, error("CheckBlock() : size limits failed")); }
 
     // Check proof of work matches claimed amount
     if (fCheckPOW && IsProofOfWork() && !CheckProofOfWork(GetPoWHash(), nBits))
-        return DoS(50, error("CheckBlock() : proof of work failed"));
+        { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_OTHER"; return DoS(50, error("CheckBlock() : proof of work failed")); }
 
     // Check timestamp
     if (GetBlockTime() > FutureDrift(GetAdjustedTime()))
-        return error("CheckBlock() : block timestamp too far in the future");
+        { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_FUTURE_TIMESTAMP"; return error("CheckBlock() : block timestamp too far in the future"); }
 
     // First transaction must be coinbase, the rest must not be
     if (vtx.empty() || !vtx[0].IsCoinBase())
-        return DoS(100, error("CheckBlock() : first tx is not coinbase"));
+        { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_TX_EMPTY"; return DoS(100, error("CheckBlock() : first tx is not coinbase")); }
     for (unsigned int i = 1; i < vtx.size(); i++)
         if (vtx[i].IsCoinBase())
-            return DoS(100, error("CheckBlock() : more than one coinbase"));
+            { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : more than one coinbase")); }
 
     // Check coinbase timestamp
     if (GetBlockTime() > FutureDrift((int64_t)vtx[0].nTime))
-        return DoS(50, error("CheckBlock() : coinbase timestamp is too early"));
+        { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_FUTURE_TIMESTAMP"; return DoS(50, error("CheckBlock() : coinbase timestamp is too early")); }
 
     if (IsProofOfStake())
     {
         // Coinbase output should be empty if proof-of-stake block
         // Post-DAG: allow additional zero-value OP_RETURN outputs for DAG parent commitment
         if (!vtx[0].vout[0].IsEmpty())
-            return DoS(100, error("CheckBlock() : coinbase vout[0] not empty for proof-of-stake block"));
+            { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : coinbase vout[0] not empty for proof-of-stake block")); }
         // Cap extra outputs (1 empty + up to 2 OP_RETURN for DAG/data)
         if (vtx[0].vout.size() > 3)
-            return DoS(100, error("CheckBlock() : too many coinbase outputs (%d) for proof-of-stake block", (int)vtx[0].vout.size()));
+            { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : too many coinbase outputs (%d) for proof-of-stake block", (int)vtx[0].vout.size())); }
         if (vtx[0].vout.size() > 1)
         {
             for (unsigned int i = 1; i < vtx[0].vout.size(); i++)
             {
                 if (vtx[0].vout[i].nValue != 0)
-                    return DoS(100, error("CheckBlock() : non-zero coinbase output[%d] in proof-of-stake block", i));
+                    { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : non-zero coinbase output[%d] in proof-of-stake block", i)); }
                 // Must be OP_RETURN (DAG commitment or similar data-carrying output)
                 if (vtx[0].vout[i].scriptPubKey.size() < 1 || vtx[0].vout[i].scriptPubKey[0] != OP_RETURN)
-                    return DoS(100, error("CheckBlock() : non-OP_RETURN extra coinbase output[%d] in proof-of-stake block", i));
+                    { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : non-OP_RETURN extra coinbase output[%d] in proof-of-stake block", i)); }
             }
         }
 
         // Second transaction must be coinstake, the rest must not be
         if (vtx.empty() || !vtx[1].IsCoinStake())
-            return DoS(100, error("CheckBlock() : second tx is not coinstake"));
+            { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : second tx is not coinstake")); }
         for (unsigned int i = 2; i < vtx.size(); i++)
             if (vtx[i].IsCoinStake())
-                return DoS(100, error("CheckBlock() : more than one coinstake"));
+                { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : more than one coinstake")); }
 
 		// Check coinstake timestamp
 		if (!CheckCoinStakeTimestamp(GetBlockTime(), (int64_t)vtx[1].nTime))
-			return DoS(50, error("CheckBlock() : coinstake timestamp violation nTimeBlock=%" PRId64" nTimeTx=%u", GetBlockTime(), vtx[1].nTime));
+			{ if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(50, error("CheckBlock() : coinstake timestamp violation nTimeBlock=%" PRId64" nTimeTx=%u", GetBlockTime(), vtx[1].nTime)); }
 
 		// Check proof-of-stake block signature
 		if (fCheckSig && !CheckBlockSignature())
-            return DoS(100, error("CheckBlock() : bad proof-of-stake block signature"));
+            { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_SIGNATURE"; return DoS(100, error("CheckBlock() : bad proof-of-stake block signature")); }
 	}
 
     // Check transactions
     for (const CTransaction& tx : vtx)
     {
         if (!tx.CheckTransaction())
-            return DoS(tx.nDoS, error("CheckBlock() : CheckTransaction failed"));
+            { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_TX_INVALID"; return DoS(tx.nDoS, error("CheckBlock() : CheckTransaction failed")); }
 
         // ppcoin: check transaction timestamp
         if (GetBlockTime() < (int64_t)tx.nTime)
-            return DoS(50, error("CheckBlock() : block timestamp earlier than transaction timestamp"));
+            { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_FUTURE_TIMESTAMP"; return DoS(50, error("CheckBlock() : block timestamp earlier than transaction timestamp")); }
     }
 
     // Check for duplicate txids. This is caught by ConnectInputs(),
@@ -6023,7 +6451,7 @@ bool CBlock::CheckBlock(bool fCheckPOW, bool fCheckMerkleRoot, bool fCheckSig) c
         uniqueTx.insert(tx.GetHash());
     }
     if (uniqueTx.size() != vtx.size())
-        return DoS(100, error("CheckBlock() : duplicate transaction"));
+        { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_TX_INVALID"; return DoS(100, error("CheckBlock() : duplicate transaction")); }
 
     unsigned int nSigOps = 0;
     for (const CTransaction& tx : vtx)
@@ -6031,11 +6459,11 @@ bool CBlock::CheckBlock(bool fCheckPOW, bool fCheckMerkleRoot, bool fCheckSig) c
         nSigOps += tx.GetLegacySigOpCount();
     }
     if (nSigOps > MAX_BLOCK_SIGOPS_ADAPTIVE)
-        return DoS(100, error("CheckBlock() : out-of-bounds SigOpCount"));
+        { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_TX_INVALID"; return DoS(100, error("CheckBlock() : out-of-bounds SigOpCount")); }
 
     // Check merkle root
     if (fCheckMerkleRoot && hashMerkleRoot != BuildMerkleTree())
-        return DoS(100, error("CheckBlock() : hashMerkleRoot mismatch"));
+        { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_MERKLE_ROOT"; return DoS(100, error("CheckBlock() : hashMerkleRoot mismatch")); }
 
 
     return true;
@@ -6305,16 +6733,22 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                nBestHeight);
     if (pfrom != NULL && pindexBest != NULL && pindexBest->GetBlockTime() < GetTime() - 300 && fDebug)
         printf("sync: ProcessBlock %s from %s (height %d)\n", hash.ToString().substr(0,20).c_str(), pfrom->addrName.c_str(), nBestHeight);
-    if (mapBlockIndex.count(hash))
+    if (mapBlockIndex.count(hash)) {
+        TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_INDEXED);
         return error("ProcessBlock() : already have block %d %s", mapBlockIndex[hash]->nHeight, hash.ToString().substr(0,20).c_str());
-    if (mapOrphanBlocks.count(hash))
+    }
+    if (mapOrphanBlocks.count(hash)) {
+        TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_ORPHAN);
         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,20).c_str());
+    }
 
     // ppcoin: check proof-of-stake
     // Limited duplicity on stake: prevents block flood attack
     // Duplicate stake allowed only when there is orphan child block
-    if (pblock->IsProofOfStake() && setStakeSeen.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
+    if (pblock->IsProofOfStake() && setStakeSeen.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash)) {
+        TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_INDEXED_STAKE);
         return error("ProcessBlock() : duplicate proof-of-stake (%s, %d) for block %s", pblock->GetProofOfStake().first.ToString().c_str(), pblock->GetProofOfStake().second, hash.ToString().c_str());
+    }
 
     if (pblock->IsProofOfStake() && mapBlockIndex.count(pblock->hashPrevBlock))
     {
@@ -6323,14 +6757,18 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         {
             if (pfrom)
                 pfrom->Misbehaving(100);
+            TraceProcessBlockReject(pfrom, pblock, PBREJECT_POS_AFTER_DAG);
             return error("ProcessBlock() : proof-of-stake block after DAG fork");
         }
     }
 
     // Preliminary checks
     int64_t nCheckStart = GetTimeMillis();
-    if (!pblock->CheckBlock())
+    const char* pszCheckBlockReason = NULL;
+    if (!pblock->CheckBlock(true, true, true, &pszCheckBlockReason)) {
+        TraceProcessBlockReject(pfrom, pblock, PBREJECT_CHECKBLOCK_FALSE, pszCheckBlockReason);
         return error("ProcessBlock() : CheckBlock FAILED");
+    }
     int64_t nCheckMs = GetTimeMillis() - nCheckStart;
 
     CBlockIndex* pcheckpoint = Checkpoints::GetLastSyncCheckpoint();
@@ -6351,6 +6789,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         {
             if (pfrom)
                 pfrom->Misbehaving(100);
+            std::string strWeakExtra = strprintf("block_trust=%s required_trust=%s checkpoint_height=%d checkpoint_hash=%s local_best_height=%d local_best_hash=%s", bnNewBlock.ToString().c_str(), bnRequired.ToString().c_str(), pcheckpoint ? pcheckpoint->nHeight : -1, pcheckpoint ? pcheckpoint->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(), pindexBest ? pindexBest->nHeight : -1, pindexBest ? pindexBest->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str());
+            TraceProcessBlockReject(pfrom, pblock, PBREJECT_WEAK_CHECKPOINT, NULL, strWeakExtra);
             return error("ProcessBlock() : block with too little %s", pblock->IsProofOfStake()? "proof-of-stake" : "proof-of-work");
         }
     }
@@ -6392,26 +6832,17 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 
         PruneOrphanBlocks();
 
-        if (IsInitialBlockDownload()) {
-            static int64_t nLastOrphanCountClear = 0;
-            int64_t nNow = GetTime();
-            if (nNow - nLastOrphanCountClear > 30) {
-                mapOrphanCountByNode.clear();
-                nLastOrphanCountClear = nNow;
-                if (fDebug)
-                    printf("IBD: Cleared per-peer orphan counts to prevent sync stall\n");
-            }
-        }
-
         if (pfrom) {
             int nOrphansFromPeer = mapOrphanCountByNode[pfrom->GetId()];
             if (nOrphansFromPeer >= MAX_ORPHAN_BLOCKS_PER_PEER) {
                 pfrom->PushGetBlocks(pindexBest, uint256(0));
 
                 if (IsInitialBlockDownload()) {
+                    TraceProcessBlockReject(pfrom, pblock, PBREJECT_ORPHAN_LIMIT_IBD);
                     return error("ProcessBlock() : peer %d exceeded orphan limit (IBD, no penalty)", pfrom->GetId());
                 }
                 pfrom->Misbehaving(1);
+                TraceProcessBlockReject(pfrom, pblock, PBREJECT_ORPHAN_LIMIT_NORMAL);
                 return error("ProcessBlock() : peer %d exceeded orphan limit", pfrom->GetId());
             }
         }
@@ -6421,8 +6852,10 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         {
             // Limited duplicity on stake: prevents block flood attack
             // Duplicate stake allowed only when there is orphan child block
-            if (setStakeSeenOrphan.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
+            if (setStakeSeenOrphan.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash)) {
+                TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_STAKE_ORPHAN);
                 return error("ProcessBlock() : duplicate proof-of-stake (%s, %d) for orphan block %s", pblock->GetProofOfStake().first.ToString().c_str(), pblock->GetProofOfStake().second, hash.ToString().c_str());
+            }
             else
                 setStakeSeenOrphan.insert(pblock->GetProofOfStake());
         }
@@ -6455,8 +6888,10 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 
     // Store to disk
     int64_t nAcceptStart = GetTimeMillis();
-    if (!pblock->AcceptBlock())
+    if (!pblock->AcceptBlock()) {
+        TraceProcessBlockReject(pfrom, pblock, PBREJECT_ACCEPTBLOCK_FALSE);
         return error("ProcessBlock() : AcceptBlock FAILED");
+    }
     int64_t nAcceptMs = GetTimeMillis() - nAcceptStart;
 
     // Recursively process any orphan blocks that depended on this one
@@ -7282,11 +7717,7 @@ void static ProcessGetData(CNode* pfrom)
                     pfrom->fDisconnect = true;
                     send = false;
                 }
-                size_t nQueuePos = (it - pfrom->vRecvGetData.begin()) - 1;
-                size_t nRemaining = pfrom->vRecvGetData.end() - it;
-                FirstOrderBreakTraceServeGetData(
-                    pfrom, inv.hash, nQueuePos,
-                    mi != mapBlockIndex.end(), send, nRemaining);
+
             }
             else if (inv.IsKnownType())
             {
@@ -7759,8 +8190,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (inv.type == MSG_BLOCK && pindexBest != NULL && pindexBest->GetBlockTime() < GetTime() - 300 && fDebug)
                 printf("sync inv: %s %s from %s\n", inv.ToString().c_str(), fAlreadyHave ? "HAVE" : "NEW", pfrom->addrName.c_str());
 
-            if (!fAlreadyHave)
-                pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+            if (!fAlreadyHave) {
+                if (inv.type == MSG_BLOCK)
+                    TryAdmitBlockInvOrDefer(pfrom, inv);
+                else
+                    pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+            }
             else if (inv.type == MSG_BLOCK && mapOrphanBlocks.count(inv.hash)) {
                 CBlock* pblockOrphan = mapOrphanBlocks[inv.hash];
                 if (IsInitialBlockDownload())
@@ -8378,28 +8813,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             }
             if (!vGetData.empty())
             {
-                if (FirstOrderBreakTraceEnabled())
-                {
-                    uint64_t nBatchId = FirstOrderBreakNextBatchId();
-                    uint256 hashPrev;
-                    for (size_t i = 0; i < vGetData.size(); i++)
-                    {
-                        bool fKnownIndex = mapBlockIndex.count(vGetData[i].hash) != 0;
-                        bool fKnownParent = false;
-                        if (fKnownIndex)
-                        {
-                            CBlockIndex* pidx = mapBlockIndex[vGetData[i].hash];
-                            if (pidx->pprev)
-                                fKnownParent = mapBlockIndex.count(pidx->pprev->GetBlockHash()) != 0;
-                        }
-                        FirstOrderBreakTraceGetDataBatch(
-                            pfrom, vGetData[i].hash, nBatchId, i, hashPrev,
-                            BLOCKREQ_SOURCE_HEADERS_DIRECT,
-                            FirstOrderBreakNextRequestSeq(),
-                            fKnownIndex, fKnownParent);
-                        hashPrev = vGetData[i].hash;
-                    }
-                }
                 pfrom->nLastGetDataTime = GetTime();
                 pfrom->PushMessage("getdata", vGetData);
             }
@@ -8574,14 +8987,21 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                  mapBlockIndex.count(hashBlock) == 0 &&
                  mapOrphanBlocks.count(hashBlock) == 0)
         {
-            RecordRejectedBlockForSync(hashBlock);
-            fEffRetryRecorded = true;
+            const bool fOrphanLimitRetrySuppressed =
+                fWouldHitIbdOrphanLimit && IsInitialBlockDownload();
+            RecordRejectedBlockForSync(
+                hashBlock, !fOrphanLimitRetrySuppressed);
+            fEffRetryRecorded = !fOrphanLimitRetrySuppressed;
+            const int64_t nRejectedUntil = GetTimeMicros() +
+                (fOrphanLimitRetrySuppressed
+                    ? ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US
+                    : ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US);
+            if (fOrphanLimitRetrySuppressed)
+                RecordOrphanLimitRejectedBlock(inv, nRejectedUntil);
             LOCK(cs_mapAlreadyAskedFor);
-            std::map<CInv, int64_t>::iterator miRejected =
-                mapAlreadyAskedFor.find(inv);
-            if (miRejected != mapAlreadyAskedFor.end())
-                miRejected->second = GetTimeMicros() +
-                    ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US;
+            int64_t& nRejectedAskTime = mapAlreadyAskedFor[inv];
+            nRejectedAskTime = std::max<int64_t>(
+                nRejectedAskTime, nRejectedUntil);
         }
 
         if (block.nDoS)
@@ -8623,41 +9043,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pfrom, hashBlock, traceResult, fAccepted,
                 fIndexedAfter, fActiveChainAfter,
                 fBestChainAfter, nHeightAfter);
-        }
-
-        if (FirstOrderBreakTraceEnabled())
-        {
-            uint64_t nSrcBatchId = 0;
-            size_t nSrcBatchPos = 0;
-            FirstOrderBreakLookupBatchOrigin(hashBlock, nSrcBatchId, nSrcBatchPos);
-            uint256 hashPrevFromPeer = FirstOrderBreakLastRecvFromPeer(pfrom->GetId());
-            bool fPrevInIndex = mapBlockIndex.count(block.hashPrevBlock) != 0;
-            bool fPrevInOrphans = mapOrphanBlocks.count(block.hashPrevBlock) != 0;
-            bool fPrevQueued = pfrom->setAskForBlocks.count(block.hashPrevBlock) != 0;
-            bool fPrevInFlight = pfrom->setBlocksInFlight.count(block.hashPrevBlock) != 0;
-            bool fPrevSentGetData = false;
-            {
-                LOCK(cs_mapAlreadyAskedFor);
-                fPrevSentGetData = mapAlreadyAskedFor.count(
-                    CInv(MSG_BLOCK, block.hashPrevBlock)) != 0;
-            }
-            std::map<NodeId, int>::const_iterator miOrphBefore =
-                mapOrphanCountByNode.find(pfrom->GetId());
-            int nOrphanBefore = miOrphBefore == mapOrphanCountByNode.end()
-                ? 0 : miOrphBefore->second;
-            std::map<NodeId, int>::const_iterator miOrphAfter =
-                mapOrphanCountByNode.find(pfrom->GetId());
-            int nOrphanAfter = miOrphAfter == mapOrphanCountByNode.end()
-                ? 0 : miOrphAfter->second;
-            FirstOrderBreakTraceBlockReceived(
-                pfrom, hashBlock, block.hashPrevBlock,
-                FirstOrderBreakNextReceiveSeq(),
-                nSrcBatchId, nSrcBatchPos,
-                hashPrevFromPeer,
-                fPrevInIndex, fPrevInOrphans,
-                fPrevQueued, fPrevInFlight, fPrevSentGetData,
-                static_cast<int>(traceResult),
-                nOrphanBefore, nOrphanAfter);
         }
 
         if (IBDEfficiencyTraceEnabled())
@@ -9357,6 +9742,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         if (lockMain)
         {
             sendLockDiagnostics.Acquired();
+            RefillDeferredBlockRequests(pto);
 
         if (fSPVMode && pto->getHeadersSync.IsTimedOut(GetTime()))
             pto->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "timeout-retry");
@@ -9661,29 +10047,6 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 }
                 if (vGetData.size() >= 1000)
                 {
-                    if (FirstOrderBreakTraceEnabled())
-                    {
-                        uint64_t nBatchId = FirstOrderBreakNextBatchId();
-                        uint256 hashPrev;
-                        TRY_LOCK(cs_main, lockFirstOrder);
-                        for (size_t i = 0; i < vGetData.size(); i++)
-                        {
-                            bool fKnownIndex = lockFirstOrder && mapBlockIndex.count(vGetData[i].hash) != 0;
-                            bool fKnownParent = false;
-                            if (fKnownIndex)
-                            {
-                                CBlockIndex* pidx = mapBlockIndex[vGetData[i].hash];
-                                if (pidx->pprev)
-                                    fKnownParent = mapBlockIndex.count(pidx->pprev->GetBlockHash()) != 0;
-                            }
-                            FirstOrderBreakTraceGetDataBatch(
-                                pto, vGetData[i].hash, nBatchId, i, hashPrev,
-                                BLOCKREQ_SOURCE_ASKFOR,
-                                FirstOrderBreakNextRequestSeq(),
-                                fKnownIndex, fKnownParent);
-                            hashPrev = vGetData[i].hash;
-                        }
-                    }
                     pto->nLastGetDataTime = GetTime();
                     pto->PushMessage("getdata", vGetData);
                     vGetData.clear();
@@ -9733,35 +10096,16 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         }
         if (!vGetData.empty())
         {
-            if (FirstOrderBreakTraceEnabled())
-            {
-                uint64_t nBatchId = FirstOrderBreakNextBatchId();
-                uint256 hashPrev;
-                TRY_LOCK(cs_main, lockFirstOrder);
-                for (size_t i = 0; i < vGetData.size(); i++)
-                {
-                    bool fKnownIndex = lockFirstOrder && mapBlockIndex.count(vGetData[i].hash) != 0;
-                    bool fKnownParent = false;
-                    if (fKnownIndex)
-                    {
-                        CBlockIndex* pidx = mapBlockIndex[vGetData[i].hash];
-                        if (pidx->pprev)
-                            fKnownParent = mapBlockIndex.count(pidx->pprev->GetBlockHash()) != 0;
-                    }
-                    FirstOrderBreakTraceGetDataBatch(
-                        pto, vGetData[i].hash, nBatchId, i, hashPrev,
-                        BLOCKREQ_SOURCE_ASKFOR,
-                        FirstOrderBreakNextRequestSeq(),
-                        fKnownIndex, fKnownParent);
-                    hashPrev = vGetData[i].hash;
-                }
-            }
             pto->nLastGetDataTime = GetTime();
             pto->PushMessage("getdata", vGetData);
         }
     }
 
-
+    {
+        TRY_LOCK(cs_main, lockDeferredRefill);
+        if (lockDeferredRefill)
+            RefillDeferredBlockRequests(pto);
+    }
 
     return true;
 }

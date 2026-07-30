@@ -138,6 +138,27 @@ public:
     }
 };
 
+
+class CScopedOrphanCountByNode
+{
+private:
+    std::map<NodeId, int> saved;
+
+public:
+    CScopedOrphanCountByNode()
+    {
+        LOCK(cs_main);
+        saved = mapOrphanCountByNode;
+        mapOrphanCountByNode.clear();
+    }
+
+    ~CScopedOrphanCountByNode()
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode = saved;
+    }
+};
+
 class CScopedInitialBlockDownloadState
 {
 private:
@@ -313,6 +334,7 @@ BOOST_AUTO_TEST_CASE(block_request_trace_reports_same_peer_skip)
     peer.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
     peer.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_ORPHAN);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hash), 1U);
+    peer.ClearAskFor();
     BOOST_CHECK(InitBlockRequestTrace(false, ""));
     fPrintToConsole = fPrintToConsoleSaved;
 }
@@ -1055,6 +1077,103 @@ BOOST_AUTO_TEST_CASE(accepted_rejected_block_is_not_directly_retried)
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashAccepted), 0U);
 }
 
+BOOST_AUTO_TEST_CASE(orphan_limit_reject_does_not_retry_every_five_seconds)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+    const uint256 hashRejectedAtLimit(2004);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(45), "orphan-limit-retry-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers(1, &peer);
+    CStalledSyncRecoveryState state;
+    state.MarkSyncRequestSent(TEST_TIME);
+    state.RecordRejectedBlock(hashRejectedAtLimit, TEST_TIME + 1, false);
+
+    BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
+                      peers, pindexBest, nBestHeight,
+                      TEST_TIME + STALL_TIMEOUT + 1,
+                      STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashRejectedAtLimit), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(orphan_capacity_release_allows_deferred_block_retry)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+    const uint256 hashDeferred(2005);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(46), "orphan-capacity-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers(1, &peer);
+    CStalledSyncRecoveryState state;
+    state.MarkSyncRequestSent(TEST_TIME);
+    state.RecordRejectedBlock(hashDeferred, TEST_TIME + 1, false);
+
+    BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
+                      peers, pindexBest, nBestHeight,
+                      TEST_TIME + STALL_TIMEOUT + 1,
+                      STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashDeferred), 0U);
+
+    peer.ClearAskFor();
+    peer.getBlocksIndex.clear();
+    peer.getBlocksHash.clear();
+    peer.pindexLastGetBlocksBegin = NULL;
+    peer.hashLastGetBlocksEnd = 0;
+    peer.nLastGetBlocksTime = 0;
+    const int64_t nDeferredRetryTime =
+        TEST_TIME + STALL_TIMEOUT + 2 * RECOVERY_COOLDOWN + 1;
+    state.RecordRejectedBlock(hashDeferred, nDeferredRetryTime, true);
+
+    BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
+                      peers, pindexBest, nBestHeight,
+                      nDeferredRetryTime,
+                      STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashDeferred), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(orphan_limit_cooldown_blocks_new_cross_peer_admission)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashRejectedAtLimit(2006);
+    const CInv inv(MSG_BLOCK, hashRejectedAtLimit);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(48), "orphan-limit-peer-b", true);
+
+    RecordOrphanLimitRejectedBlock(
+        inv, GetTimeMicros() + ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US);
+
+    peerB.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerB, hashRejectedAtLimit), 0U);
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    BOOST_CHECK(!GetBlockRequestOwner(hashRejectedAtLimit, &ownerPeer, &ownerState));
+}
+
+BOOST_AUTO_TEST_CASE(preexisting_sent_request_may_complete_after_suppression)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashRejectedAtLimit(2007);
+    const CInv inv(MSG_BLOCK, hashRejectedAtLimit);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(49), "preexisting-send-peer", true);
+
+    peer.MarkBlockInFlight(hashRejectedAtLimit);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        mapAlreadyAskedFor[inv] = GetTimeMicros() +
+            ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US;
+    }
+
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashRejectedAtLimit), 1U);
+    peer.ClearBlockInFlight(hashRejectedAtLimit);
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashRejectedAtLimit), 0U);
+}
+
 BOOST_AUTO_TEST_CASE(send_messages_does_not_own_stall_recovery)
 {
     BOOST_REQUIRE(pindexBest != NULL);
@@ -1521,6 +1640,38 @@ BOOST_AUTO_TEST_CASE(block_request_trace_requires_explicit_enable)
     BOOST_CHECK(!BlockRequestTraceEnabled());
 }
 
+BOOST_AUTO_TEST_CASE(processblock_false_paths_emit_specific_reason)
+{
+    BOOST_CHECK(InitProcessBlockRejectTrace(false));
+    BOOST_CHECK(!ProcessBlockRejectTraceEnabled());
+    BOOST_CHECK(InitProcessBlockRejectTrace(true));
+    BOOST_CHECK(ProcessBlockRejectTraceEnabled());
+
+    BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_DUPLICATE_INDEXED),
+                      std::string("DUPLICATE_INDEXED"));
+    BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_DUPLICATE_ORPHAN),
+                      std::string("DUPLICATE_ORPHAN"));
+    BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_POS_AFTER_DAG),
+                      std::string("POS_AFTER_DAG"));
+    BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_CHECKBLOCK_FALSE),
+                      std::string("CHECKBLOCK_FALSE"));
+    BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_ORPHAN_LIMIT_IBD),
+                      std::string("ORPHAN_LIMIT_IBD"));
+    BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_DUPLICATE_STAKE_ORPHAN),
+                      std::string("DUPLICATE_STAKE_ORPHAN"));
+
+    CBlock invalidBlock;
+    const char* pszCheckBlockReason = NULL;
+    BOOST_CHECK(!invalidBlock.CheckBlock(true, true, true,
+                                         &pszCheckBlockReason));
+    BOOST_REQUIRE(pszCheckBlockReason != NULL);
+    BOOST_CHECK_EQUAL(std::string(pszCheckBlockReason),
+                      std::string("CHECKBLOCK_SIZE"));
+
+    BOOST_CHECK(InitProcessBlockRejectTrace(false));
+    BOOST_CHECK(!ProcessBlockRejectTraceEnabled());
+}
+
 BOOST_AUTO_TEST_CASE(already_asked_for_stale_entries_are_pruned_and_refill)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
@@ -1679,6 +1830,259 @@ BOOST_AUTO_TEST_CASE(already_asked_for_recent_bound_remains_anti_spam)
     }
 }
 
+
+
+static void AddQueuedBlockRequests(CNode& peer, int nCount, int nBase)
+{
+    const int64_t nBaseTime = GetTimeMicros();
+    for (int i = 0; i < nCount; ++i)
+        peer.AddAskForEntry(nBaseTime + i, CInv(MSG_BLOCK, uint256(nBase + i)));
+}
+
+static void AddSentBlockRequests(CNode& peer, int nCount, int nBase)
+{
+    for (int i = 0; i < nCount; ++i)
+        peer.MarkBlockInFlight(uint256(nBase + i));
+}
+
+static void ClearSentBlockRequests(CNode& peer, int nCount, int nBase)
+{
+    for (int i = 0; i < nCount; ++i)
+        peer.ClearBlockInFlight(uint256(nBase + i));
+}
+
+BOOST_AUTO_TEST_CASE(pipeline_pressure_blocks_before_physical_limit)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(45), "pipeline-pressure", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const CInv inv(MSG_BLOCK, uint256(800001));
+    int nOrphanCountPeer = 0;
+    int nQueuedBlockRequests = 0;
+    int nSentBlockRequests = 0;
+    int nProjectedPressure = 0;
+
+    AddQueuedBlockRequests(peer, 300, 810000);
+    AddSentBlockRequests(peer, 100, 820000);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = 100;
+        BOOST_CHECK(ShouldSkipBlockInvForOrphanPressure(
+            &peer, inv, false, &nOrphanCountPeer,
+            &nQueuedBlockRequests, &nSentBlockRequests,
+            &nProjectedPressure));
+    }
+    BOOST_CHECK_EQUAL(nOrphanCountPeer, 100);
+    BOOST_CHECK_EQUAL(nQueuedBlockRequests, 300);
+    BOOST_CHECK_EQUAL(nSentBlockRequests, 100);
+    BOOST_CHECK_EQUAL(nProjectedPressure, MAX_PROJECTED_ORPHAN_PRESSURE);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, inv.hash), 0U);
+    BOOST_CHECK(!GetBlockRequestOwner(inv.hash, NULL, NULL));
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(inv), 0U);
+    }
+    peer.ClearAskFor();
+    ClearSentBlockRequests(peer, 100, 820000);
+}
+
+BOOST_AUTO_TEST_CASE(low_physical_count_large_pipeline_is_blocked)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(46), "low-physical-pipeline", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const CInv inv(MSG_BLOCK, uint256(800002));
+    int nProjectedPressure = 0;
+
+    AddQueuedBlockRequests(peer, MAX_PROJECTED_ORPHAN_PRESSURE - 10, 830000);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = 10;
+        BOOST_CHECK(ShouldSkipBlockInvForOrphanPressure(
+            &peer, inv, false, NULL, NULL, NULL, &nProjectedPressure));
+    }
+    BOOST_CHECK_EQUAL(nProjectedPressure, MAX_PROJECTED_ORPHAN_PRESSURE);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, inv.hash), 0U);
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(pipeline_drain_resumes_inv)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(47), "pipeline-drain", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const CInv blocked(MSG_BLOCK, uint256(800003));
+    const CInv admitted(MSG_BLOCK, uint256(800004));
+    int nProjectedPressure = 0;
+
+    AddQueuedBlockRequests(peer, 300, 840000);
+    AddSentBlockRequests(peer, 100, 850000);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = 100;
+        BOOST_CHECK(ShouldSkipBlockInvForOrphanPressure(
+            &peer, blocked, false, NULL, NULL, NULL, &nProjectedPressure));
+    }
+    BOOST_CHECK_EQUAL(nProjectedPressure, MAX_PROJECTED_ORPHAN_PRESSURE);
+    peer.ClearAskFor();
+    ClearSentBlockRequests(peer, 100, 850000);
+    AddQueuedBlockRequests(peer, 100, 860000);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = 100;
+        BOOST_CHECK(!ShouldSkipBlockInvForOrphanPressure(
+            &peer, admitted, false, NULL, NULL, NULL, &nProjectedPressure));
+    }
+    BOOST_CHECK_EQUAL(nProjectedPressure, 200);
+    peer.AskFor(admitted, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, admitted.hash), 1U);
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(orphan_recovery_exempt_under_projected_pressure)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(48), "projected-pressure-parent", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const CInv parent(MSG_BLOCK, uint256(800005));
+
+    AddQueuedBlockRequests(peer, MAX_PROJECTED_ORPHAN_PRESSURE, 870000);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = MAX_PROJECTED_ORPHAN_PRESSURE;
+    }
+    peer.AskFor(parent, BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, parent.hash), 1U);
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    BOOST_CHECK(GetBlockRequestOwner(parent.hash, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peer.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(no_double_count_between_queued_and_sent)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(49), "pipeline-transition", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const CInv candidate(MSG_BLOCK, uint256(800006));
+    const uint256 hashRequest(880000);
+    int nProjectedQueued = 0;
+    int nProjectedSent = 0;
+
+    peer.AddAskForEntry(GetTimeMicros(), CInv(MSG_BLOCK, hashRequest));
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = 100;
+        BOOST_CHECK(!ShouldSkipBlockInvForOrphanPressure(
+            &peer, candidate, false, NULL, NULL, NULL, &nProjectedQueued));
+    }
+    peer.EraseAskForEntry(peer.mapAskFor.begin(), false);
+    peer.MarkBlockInFlight(hashRequest);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!ShouldSkipBlockInvForOrphanPressure(
+            &peer, candidate, false, NULL, NULL, NULL, &nProjectedSent));
+    }
+    BOOST_CHECK_EQUAL(nProjectedQueued, 101);
+    BOOST_CHECK_EQUAL(nProjectedSent, 101);
+    peer.ClearBlockInFlight(hashRequest);
+}
+
+BOOST_AUTO_TEST_CASE(existing_pipeline_not_cancelled)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(50), "pipeline-existing", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const CInv inv(MSG_BLOCK, uint256(800007));
+    const uint256 hashQueued(890000);
+    const uint256 hashSent(890001);
+
+    peer.AddAskForEntry(GetTimeMicros(), CInv(MSG_BLOCK, hashQueued));
+    peer.MarkBlockInFlight(hashSent);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = MAX_PROJECTED_ORPHAN_PRESSURE;
+        BOOST_CHECK(ShouldSkipBlockInvForOrphanPressure(&peer, inv, false));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashQueued), 1U);
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashSent), 1U);
+    peer.ClearAskFor();
+    peer.ClearBlockInFlight(hashSent);
+}
+
+BOOST_AUTO_TEST_CASE(per_peer_pipeline_pressure)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(51), "pipeline-peer-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(52), "pipeline-peer-b", true);
+    CScopedInitialBlockDownloadState ibdState(&peerB);
+    const CInv invA(MSG_BLOCK, uint256(800008));
+    const CInv invB(MSG_BLOCK, uint256(800009));
+
+    AddQueuedBlockRequests(peerA, MAX_PROJECTED_ORPHAN_PRESSURE, 900000);
+    AddQueuedBlockRequests(peerB, MAX_PROJECTED_ORPHAN_PRESSURE - 1, 901000);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(ShouldSkipBlockInvForOrphanPressure(&peerA, invA, false));
+        BOOST_CHECK(!ShouldSkipBlockInvForOrphanPressure(&peerB, invB, false));
+    }
+    peerB.AskFor(invB, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, invA.hash), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerB, invB.hash), 1U);
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(cross_peer_parent_ownership_preserved)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode owner(INVALID_SOCKET, TestPeerAddress(53), "parent-owner", true);
+    CNode other(INVALID_SOCKET, TestPeerAddress(54), "parent-other", true);
+    CScopedInitialBlockDownloadState ibdState(&owner);
+    const CInv parent(MSG_BLOCK, uint256(800010));
+
+    owner.AskFor(parent, BLOCKREQ_SOURCE_ORPHAN);
+    other.AskFor(parent, BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(owner, parent.hash), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(other, parent.hash), 0U);
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    BOOST_CHECK(GetBlockRequestOwner(parent.hash, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, owner.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    owner.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(non_ibd_unaffected)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    const bool fRegTestSaved = fRegTest;
+    fRegTest = true;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(55), "non-ibd-pressure", true);
+    const CInv inv(MSG_BLOCK, uint256(800011));
+
+    AddQueuedBlockRequests(peer, MAX_PROJECTED_ORPHAN_PRESSURE, 902000);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = MAX_PROJECTED_ORPHAN_PRESSURE;
+        BOOST_CHECK(!ShouldSkipBlockInvForOrphanPressure(&peer, inv, false));
+    }
+    peer.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, inv.hash), 1U);
+    peer.ClearAskFor();
+    fRegTest = fRegTestSaved;
+}
 
 BOOST_AUTO_TEST_CASE(stalled_recovery_is_inactive_before_initial_send)
 {
@@ -1894,6 +2298,339 @@ BOOST_AUTO_TEST_CASE(inflight_limit_preserves_askfor_order)
     it = peer.mapAskFor.begin();
     BOOST_CHECK(it->second.hash == hashC); ++it;
     BOOST_CHECK(it->second.hash == hashD);
+}
+
+
+static void FillPeerActiveWindow(CNode& peer, int nBase)
+{
+    for (int i = 0; i < MAX_DEFERRED_INV_ACTIVE_PER_PEER; ++i)
+        peer.AskFor(CInv(MSG_BLOCK, uint256(nBase + i)), BLOCKREQ_SOURCE_INV);
+}
+
+BOOST_AUTO_TEST_CASE(large_inv_does_not_create_unbounded_active_queue)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(61), "deferred-active-bound", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    FillPeerActiveWindow(peer, 910000);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(),
+                      (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peer), 0);
+        BOOST_CHECK(peer.DeferBlockInv(uint256(920000)));
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&peer), 0U);
+    }
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(),
+                      (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+    BOOST_CHECK_EQUAL(peer.deferredBlockInv.size(), 1U);
+    peer.ClearAskFor();
+}
+
+
+BOOST_AUTO_TEST_CASE(global_active_window_sum_is_bounded)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(79), "global-window-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(80), "global-window-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(81), "global-window-c", true);
+    CNode peerD(INVALID_SOCKET, TestPeerAddress(82), "global-window-d", true);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+
+    FillPeerActiveWindow(peerA, 970000);
+    FillPeerActiveWindow(peerB, 971000);
+    FillPeerActiveWindow(peerC, 972000);
+    FillPeerActiveWindow(peerD, 973000);
+
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerA);
+        vNodes.push_back(&peerB);
+        vNodes.push_back(&peerC);
+        vNodes.push_back(&peerD);
+    }
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peerA), 0);
+    }
+
+    size_t nGlobalActive = peerA.setAskForBlocks.size() +
+        peerA.setBlocksInFlight.size() +
+        peerB.setAskForBlocks.size() +
+        peerB.setBlocksInFlight.size() +
+        peerC.setAskForBlocks.size() +
+        peerC.setBlocksInFlight.size() +
+        peerD.setAskForBlocks.size() +
+        peerD.setBlocksInFlight.size();
+    BOOST_CHECK(nGlobalActive <=
+                (size_t)MAX_DEFERRED_INV_ACTIVE_GLOBAL);
+
+    {
+        LOCK(cs_vNodes);
+        vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), &peerA),
+                     vNodes.end());
+        vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), &peerB),
+                     vNodes.end());
+        vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), &peerC),
+                     vNodes.end());
+        vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), &peerD),
+                     vNodes.end());
+    }
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    peerC.ClearAskFor();
+    peerD.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(excess_inv_is_deferred_not_lost)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(62), "deferred-not-lost", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const uint256 deferred(920001);
+
+    FillPeerActiveWindow(peer, 921000);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(peer.DeferBlockInv(deferred));
+        BOOST_CHECK(peer.IsBlockInvDeferred(deferred));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, deferred), 0U);
+    BOOST_CHECK(!GetBlockRequestOwner(deferred, NULL, NULL));
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(deferred_inv_is_eventually_admitted_after_window_drain)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(63), "deferred-drain", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const uint256 deferred(920002);
+
+    FillPeerActiveWindow(peer, 922000);
+    BOOST_REQUIRE(peer.DeferBlockInv(deferred));
+    peer.EraseAskForEntry(peer.mapAskFor.begin());
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&peer), 1U);
+    }
+    BOOST_CHECK_EQUAL(peer.deferredBlockInv.size(), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, deferred), 1U);
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    BOOST_CHECK(GetBlockRequestOwner(deferred, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peer.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(duplicate_inv_does_not_duplicate_deferred_entry)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(64), "deferred-duplicate", true);
+    const uint256 hash(920003);
+    BOOST_CHECK(peer.DeferBlockInv(hash));
+    BOOST_CHECK(!peer.DeferBlockInv(hash));
+    BOOST_CHECK_EQUAL(peer.deferredBlockInv.size(), 1U);
+    BOOST_CHECK_EQUAL(peer.deferredBlockInvIndex.size(), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(deferred_hash_has_no_owner_before_admission)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(65), "deferred-no-owner", true);
+    const uint256 hash(920004);
+    BOOST_REQUIRE(peer.DeferBlockInv(hash));
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+    LOCK(cs_mapAlreadyAskedFor);
+    BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(CInv(MSG_BLOCK, hash)), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(ownership_is_assigned_on_admission_only)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(66), "deferred-owner-admit", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const uint256 hash(920005);
+
+    BOOST_REQUIRE(peer.DeferBlockInv(hash));
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&peer), 1U);
+    }
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peer.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(already_known_hash_is_removed_during_refill)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    BOOST_REQUIRE(pindexBest != NULL);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(67), "deferred-known", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const uint256 known = pindexBest->GetBlockHash();
+
+    BOOST_REQUIRE(peer.DeferBlockInv(known));
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&peer), 0U);
+    }
+    BOOST_CHECK(!peer.IsBlockInvDeferred(known));
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, known), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(active_owned_hash_is_not_duplicate_admitted)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode owner(INVALID_SOCKET, TestPeerAddress(68), "deferred-owner", true);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(69), "deferred-other", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const uint256 owned(920006);
+    const uint256 available(920007);
+
+    owner.AskFor(CInv(MSG_BLOCK, owned), BLOCKREQ_SOURCE_INV);
+    BOOST_REQUIRE(peer.DeferBlockInv(owned));
+    BOOST_REQUIRE(peer.DeferBlockInv(available));
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&peer), 1U);
+    }
+    BOOST_CHECK(peer.IsBlockInvDeferred(owned));
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, owned), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, available), 1U);
+    owner.ClearAskFor();
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(peer_disconnect_clears_deferred_backlog)
+{
+    CNode* peer = new CNode(INVALID_SOCKET, TestPeerAddress(70),
+                            "deferred-disconnect", true);
+    BOOST_REQUIRE(peer->DeferBlockInv(uint256(920008)));
+    BOOST_CHECK_EQUAL(peer->deferredBlockInv.size(), 1U);
+    delete peer;
+}
+
+BOOST_AUTO_TEST_CASE(deferred_backlog_is_bounded)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(71), "deferred-bound", true);
+    for (size_t i = 0; i < MAX_DEFERRED_BLOCK_INV_PER_PEER; ++i)
+        BOOST_REQUIRE(peer.DeferBlockInv(uint256(930000 + i)));
+    BOOST_CHECK(!peer.DeferBlockInv(uint256(940000)));
+    BOOST_CHECK_EQUAL(peer.deferredBlockInv.size(),
+                      MAX_DEFERRED_BLOCK_INV_PER_PEER);
+}
+
+BOOST_AUTO_TEST_CASE(overflow_does_not_touch_mapAlreadyAskedFor)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(72), "deferred-overflow", true);
+    for (size_t i = 0; i < MAX_DEFERRED_BLOCK_INV_PER_PEER; ++i)
+        BOOST_REQUIRE(peer.DeferBlockInv(uint256(941000 + i)));
+    const uint256 overflow(950000);
+    BOOST_CHECK(!peer.DeferBlockInv(overflow));
+    LOCK(cs_mapAlreadyAskedFor);
+    BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(CInv(MSG_BLOCK, overflow)), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(single_blocked_hash_does_not_stall_sliding_window)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode owner(INVALID_SOCKET, TestPeerAddress(73), "sliding-owner", true);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(74), "sliding-peer", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const uint256 blocked(950001);
+    const uint256 nextA(950002);
+    const uint256 nextB(950003);
+
+    owner.AskFor(CInv(MSG_BLOCK, blocked), BLOCKREQ_SOURCE_INV);
+    BOOST_REQUIRE(peer.DeferBlockInv(blocked));
+    BOOST_REQUIRE(peer.DeferBlockInv(nextA));
+    BOOST_REQUIRE(peer.DeferBlockInv(nextB));
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&peer), 2U);
+    }
+    BOOST_CHECK(peer.IsBlockInvDeferred(blocked));
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, nextA), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, nextB), 1U);
+    owner.ClearAskFor();
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(orphan_recovery_has_priority_over_normal_deferred_inv)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(75), "orphan-priority", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const uint256 deferred(950004);
+    const uint256 parent(950005);
+
+    FillPeerActiveWindow(peer, 951000);
+    BOOST_REQUIRE(peer.DeferBlockInv(deferred));
+    peer.AskFor(CInv(MSG_BLOCK, parent), BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, parent), 1U);
+    BOOST_CHECK(peer.IsBlockInvDeferred(deferred));
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(cross_peer_ownership_remains_correct)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode owner(INVALID_SOCKET, TestPeerAddress(76), "cross-owner", true);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(77), "cross-deferred", true);
+    const uint256 hash(950006);
+
+    owner.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    BOOST_REQUIRE(peer.DeferBlockInv(hash));
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, owner.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hash), 0U);
+    owner.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(continuation_candidate_is_eventually_reached)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(78), "continuation-deferred", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    const uint256 continuation(960999);
+
+    FillPeerActiveWindow(peer, 960000);
+    for (int i = 0; i < 999; ++i)
+        BOOST_REQUIRE(peer.DeferBlockInv(uint256(961000 + i)));
+    BOOST_REQUIRE(peer.DeferBlockInv(continuation));
+    peer.ClearAskFor();
+    {
+        LOCK(cs_main);
+        size_t admitted = 0;
+        for (int i = 0; i < 8 && peer.IsBlockInvDeferred(continuation); ++i)
+        {
+            admitted += RefillDeferredBlockRequests(&peer);
+            peer.ClearAskFor();
+        }
+        BOOST_CHECK(admitted >= 1000U);
+    }
+    BOOST_CHECK(!peer.IsBlockInvDeferred(continuation));
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, continuation), 0U);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -49,7 +49,9 @@ public:
     bool ShouldRecover(int nLocalHeight, int nPeerHeight,
                        bool fPipelineActive, int64_t nNow,
                        int64_t nStallTimeout, int64_t nCooldown);
-    void RecordRejectedBlock(const uint256& hashBlock, int64_t nNow);
+    void RecordRejectedBlock(
+        const uint256& hashBlock, int64_t nNow,
+        bool fRetryEligible = true);
     void ClearRejectedBlock(const uint256& hashBlock);
     bool TakeRejectedBlockForRetry(uint256& hashBlock);
     const uint256& RejectedBlock() const { return hashRejectedBlock; }
@@ -225,8 +227,12 @@ CNode* MaybeQueueStalledSyncRecovery(const std::vector<CNode*>& vNodes,
                                      int64_t nStallTimeout,
                                      int64_t nCooldown,
                                      CStalledSyncRecoveryState& state);
-void RecordRejectedBlockForSync(const uint256& hashBlock);
+void RecordRejectedBlockForSync(
+    const uint256& hashBlock, bool fRetryEligible = true);
 void ClearRejectedBlockForSync(const uint256& hashBlock);
+void RecordOrphanLimitRejectedBlock(const CInv& inv, int64_t nUntilMicros);
+bool IsOrphanLimitRejectedBlockInCooldown(const CInv& inv, int64_t nNowMicros,
+                                          int64_t* nUntilMicros = NULL);
 bool SyncTraceEnabled();
 static const int64_t RECOVERY_RESPONSE_WINDOW_US = 2000000;
 
@@ -404,6 +410,14 @@ extern CCriticalSection cs_mapRelay;
 extern std::map<CInv, int64_t> mapAlreadyAskedFor;
 extern CCriticalSection cs_mapAlreadyAskedFor;
 static const size_t MAX_ALREADY_ASKED_FOR_SIZE = 50000;
+/** Normal INV active scheduler window per peer during IBD. */
+static const int MAX_DEFERRED_INV_ACTIVE_PER_PEER = 128;
+/** Normal INV active scheduler window across all peers during IBD. */
+static const int MAX_DEFERRED_INV_ACTIVE_GLOBAL = 512;
+/** Maximum retained ordered legacy block INV candidates per peer. */
+static const size_t MAX_DEFERRED_BLOCK_INV_PER_PEER = 1000;
+/** Maximum deferred candidates examined in one refill pump. */
+static const size_t MAX_DEFERRED_BLOCK_INV_REFILL_WORK = 256;
 
 enum BlockRequestOwnerState
 {
@@ -432,6 +446,7 @@ bool IsBlockRequestOwnedByAnyPeer(const uint256& hash, const CNode* extra_peer =
 bool EraseAlreadyAskedForIfUnowned(const CInv& inv, const CNode* extra_peer = NULL);
 static const int64_t ALREADY_ASKED_FOR_RETENTION_US = 60LL * 60 * 1000000;
 static const int64_t ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US = 5LL * 1000000;
+static const int64_t ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US = 2LL * 60 * 1000000;
 size_t PruneAlreadyAskedFor(int64_t nNowMicros);
 
 extern NodeId nLastNodeId;
@@ -773,6 +788,8 @@ public:
     CCriticalSection cs_inventory;
     std::multimap<int64_t, CInv> mapAskFor;
     std::set<uint256> setAskForBlocks;
+    std::deque<uint256> deferredBlockInv;
+    std::set<uint256> deferredBlockInvIndex;
 
     std::set<uint256> setBlocksInFlight;
     std::map<uint256, int64_t> mapBlockInFlightSince;
@@ -987,6 +1004,55 @@ public:
         return setAskForBlocks.count(hash) != 0;
     }
 
+    bool IsBlockInvDeferred(const uint256& hash) const
+    {
+        return deferredBlockInvIndex.count(hash) != 0;
+    }
+
+    bool DeferBlockInv(const uint256& hash)
+    {
+        if (deferredBlockInvIndex.count(hash) != 0)
+            return false;
+        if (deferredBlockInv.size() >= MAX_DEFERRED_BLOCK_INV_PER_PEER)
+            return false;
+        deferredBlockInv.push_back(hash);
+        deferredBlockInvIndex.insert(hash);
+        return true;
+    }
+
+    bool RemoveDeferredBlockInv(const uint256& hash)
+    {
+        if (deferredBlockInvIndex.erase(hash) == 0)
+            return false;
+        for (std::deque<uint256>::iterator it = deferredBlockInv.begin();
+             it != deferredBlockInv.end(); ++it)
+        {
+            if (*it == hash)
+            {
+                deferredBlockInv.erase(it);
+                break;
+            }
+        }
+        return true;
+    }
+
+    void PopFrontDeferredBlockInv()
+    {
+        if (deferredBlockInv.empty())
+            return;
+        deferredBlockInvIndex.erase(deferredBlockInv.front());
+        deferredBlockInv.pop_front();
+    }
+
+    void RotateFrontDeferredBlockInv()
+    {
+        if (deferredBlockInv.size() <= 1)
+            return;
+        const uint256 hash = deferredBlockInv.front();
+        deferredBlockInv.pop_front();
+        deferredBlockInv.push_back(hash);
+    }
+
     void AddAskForEntry(int64_t nRequestTime, const CInv& inv)
     {
         mapAskFor.insert(std::make_pair(nRequestTime, inv));
@@ -1043,6 +1109,15 @@ public:
                                              "same-peer-already-queued");
                 return;
             }
+        }
+
+        if (fBlockRequest &&
+            IsOrphanLimitRejectedBlockInCooldown(inv, nPruneNow))
+        {
+            if (BlockRequestTraceEnabled())
+                BlockRequestTraceAskSkip(this, inv.hash, source,
+                                         "orphan-limit-cooldown");
+            return;
         }
 
         LOCK(cs_mapAlreadyAskedFor);

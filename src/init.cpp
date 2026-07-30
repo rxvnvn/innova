@@ -961,6 +961,7 @@ bool AppInit2()
             "Invalid -blockrequesttracehash (expected 64 hexadecimal characters)"));
     }
     InitIBDEfficiencyTrace(GetBoolArg("-ibdefficiencytrace", false));
+    InitProcessBlockRejectTrace(GetBoolArg("-processblockrejecttrace", false));
 
     if (mapArgs.count("-timeout"))
     {

@@ -849,10 +849,15 @@ void CStalledSyncRecoveryState::MarkSyncRequestSent(int64_t nNow)
 }
 
 void CStalledSyncRecoveryState::RecordRejectedBlock(
-    const uint256& hashBlock, int64_t nNow)
+    const uint256& hashBlock, int64_t nNow, bool fRetryEligible)
 {
     if (hashBlock == 0)
         return;
+    if (!fRetryEligible)
+    {
+        ClearRejectedBlock(hashBlock);
+        return;
+    }
     if (hashRejectedBlock != hashBlock)
     {
         fRejectedRetryScheduled = false;
@@ -880,13 +885,26 @@ bool CStalledSyncRecoveryState::TakeRejectedBlockForRetry(uint256& hashBlock)
     return true;
 }
 
-void RecordRejectedBlockForSync(const uint256& hashBlock)
+void RecordRejectedBlockForSync(const uint256& hashBlock, bool fRetryEligible)
 {
     LOCK(cs_stalledSyncRecovery);
-    stalledSyncRecoveryState.RecordRejectedBlock(hashBlock, GetTime());
+    stalledSyncRecoveryState.RecordRejectedBlock(
+        hashBlock, GetTime(), fRetryEligible);
     if (SyncTraceEnabled())
-        printf("SYNC_EVENT time_us=%lld event=REJECT_RETRY_RECORDED hash=%s\n",
-               (long long)GetTimeMicros(), hashBlock.ToString().c_str());
+    {
+        const char* pszEvent = fRetryEligible
+            ? "REJECT_RETRY_RECORDED"
+            : "REJECT_RETRY_SUPPRESSED";
+        if (ProcessBlockRejectTraceEnabled())
+            printf("SYNC_EVENT time_us=%lld event=%s hash=%s pb_reason=%s\n",
+                   (long long)GetTimeMicros(), pszEvent,
+                   hashBlock.ToString().c_str(),
+                   ProcessBlockRejectTraceLastReason(hashBlock).c_str());
+        else
+            printf("SYNC_EVENT time_us=%lld event=%s hash=%s\n",
+                   (long long)GetTimeMicros(), pszEvent,
+                   hashBlock.ToString().c_str());
+    }
 }
 
 void ClearRejectedBlockForSync(const uint256& hashBlock)
@@ -1666,8 +1684,9 @@ map<CInv, CDataStream> mapRelay;
 deque<pair<int64_t, CInv> > vRelayExpiration;
 CCriticalSection cs_mapRelay;
 map<CInv, int64_t> mapAlreadyAskedFor;
-// mutex for mapAlreadyAskedFor
+// mutex for mapAlreadyAskedFor and orphan-limit reject cooldown state
 CCriticalSection cs_mapAlreadyAskedFor;
+static map<CInv, int64_t> mapOrphanLimitRejectedBlocks;
 
 struct BlockRequestOwner
 {
@@ -1847,6 +1866,34 @@ bool EraseAlreadyAskedForIfUnowned(const CInv& inv, const CNode* extra_peer)
     return mapAlreadyAskedFor.erase(inv) != 0;
 }
 
+void RecordOrphanLimitRejectedBlock(const CInv& inv, int64_t nUntilMicros)
+{
+    if (inv.type != MSG_BLOCK && inv.type != MSG_FILTERED_BLOCK)
+        return;
+    LOCK(cs_mapAlreadyAskedFor);
+    int64_t& nCurrentUntil = mapOrphanLimitRejectedBlocks[inv];
+    nCurrentUntil = std::max(nCurrentUntil, nUntilMicros);
+}
+
+bool IsOrphanLimitRejectedBlockInCooldown(const CInv& inv, int64_t nNowMicros,
+                                          int64_t* nUntilMicros)
+{
+    if (inv.type != MSG_BLOCK && inv.type != MSG_FILTERED_BLOCK)
+        return false;
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<CInv, int64_t>::iterator it = mapOrphanLimitRejectedBlocks.find(inv);
+    if (it == mapOrphanLimitRejectedBlocks.end())
+        return false;
+    if (it->second <= nNowMicros)
+    {
+        mapOrphanLimitRejectedBlocks.erase(it);
+        return false;
+    }
+    if (nUntilMicros != NULL)
+        *nUntilMicros = it->second;
+    return true;
+}
+
 size_t PruneAlreadyAskedFor(int64_t nNowMicros)
 {
     static int64_t nLastPruneMicros = 0;
@@ -1858,6 +1905,15 @@ size_t PruneAlreadyAskedFor(int64_t nNowMicros)
             nNowMicros - nLastPruneMicros < 1000000)
             return 0;
         nLastPruneMicros = nNowMicros;
+        for (std::map<CInv, int64_t>::iterator it =
+                 mapOrphanLimitRejectedBlocks.begin();
+             it != mapOrphanLimitRejectedBlocks.end(); )
+        {
+            if (it->second <= nNowMicros)
+                it = mapOrphanLimitRejectedBlocks.erase(it);
+            else
+                ++it;
+        }
         for (std::map<CInv, int64_t>::const_iterator it =
                  mapAlreadyAskedFor.begin();
              it != mapAlreadyAskedFor.end(); ++it)
@@ -2660,6 +2716,27 @@ void BlockRequestTraceAskSkip(CNode* pnode, const uint256& hash,
            ownerPeer, pszOwnerState ? pszOwnerState : "none");
 }
 
+void BlockRequestTraceAskSkipOrphanPressure(CNode* pnode, const uint256& hash,
+                                            BlockRequestTraceSource source,
+                                            int nOrphanCountPeer,
+                                            int nQueuedBlockRequests,
+                                            int nSentBlockRequests,
+                                            int nProjectedPressure,
+                                            int nPressureBudget,
+                                            int nHardLimit,
+                                            int ownerPeer,
+                                            const char* pszOwnerState)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    printf("BLOCKREQTRACE time_us=%lld event=ASK_SKIP reason=orphan-pressure hash=%s peer=%d source=%s orphan_count_peer=%d queued_block_requests=%d sent_block_requests=%d projected_pressure=%d pressure_budget=%d hard_limit=%d owner_peer=%d owner_state=%s\n",
+           (long long)GetTimeMicros(), hash.ToString().c_str(),
+           pnode->GetId(), BlockRequestTraceSourceName(source),
+           nOrphanCountPeer, nQueuedBlockRequests, nSentBlockRequests,
+           nProjectedPressure, nPressureBudget, nHardLimit,
+           ownerPeer, pszOwnerState ? pszOwnerState : "none");
+}
+
 void BlockRequestTraceGetDataSkip(CNode* pnode, const uint256& hash,
                                   int ownerPeer,
                                   const char* pszOwnerState)
@@ -3215,164 +3292,7 @@ void BlockRequestTraceGetBlocksTrigger(CNode* pnode,
     BlockRequestTraceMaybeSummaryLocked(nNow);
 }
 
-// ---- First-order break trace ----
-static bool fFirstOrderBreakTraceEnabled = false;
-static CCriticalSection cs_firstOrderTrace;
-static uint64_t nFirstOrderRequestSeq = 0;
-static uint64_t nFirstOrderReceiveSeq = 0;
-static uint64_t nFirstOrderBatchId = 0;
-// Hash -> (originating batch_id, batch_position) for matching receives to GETDATA
-static std::map<uint256, std::pair<uint64_t, size_t> > mapFirstOrderBatchOrigin;
-// Per-peer last received block hash
-static std::map<NodeId, uint256> mapFirstOrderLastRecv;
-static const size_t FIRST_ORDER_BATCH_ORIGIN_MAX = 65536;
 
-bool InitFirstOrderBreakTrace()
-{
-    fFirstOrderBreakTraceEnabled = GetBoolArg("-firstorderbreaktrace", false);
-    if (fFirstOrderBreakTraceEnabled)
-        printf("FIRSTORDER: first-order break trace enabled\n");
-    return fFirstOrderBreakTraceEnabled;
-}
-
-bool FirstOrderBreakTraceEnabled()
-{
-    return fFirstOrderBreakTraceEnabled;
-}
-
-void FirstOrderBreakTraceGetDataBatch(CNode* pnode,
-    const uint256& hash,
-    uint64_t nBatchId,
-    size_t nBatchPos,
-    const uint256& hashPrevInBatch,
-    BlockRequestTraceSource source,
-    uint64_t nRequestSeq,
-    bool fKnownIndex,
-    bool fKnownParent)
-{
-    if (!fFirstOrderBreakTraceEnabled)
-        return;
-    {
-        LOCK(cs_firstOrderTrace);
-        mapFirstOrderBatchOrigin[hash] = std::make_pair(nBatchId, nBatchPos);
-        if (mapFirstOrderBatchOrigin.size() > FIRST_ORDER_BATCH_ORIGIN_MAX)
-            mapFirstOrderBatchOrigin.erase(mapFirstOrderBatchOrigin.begin());
-    }
-    printf("FIRSTORDER time_us=%lld event=GETDATA_ITEM peer=%d addr=%s batch_id=%llu batch_pos=%zu hash=%s prev_in_batch=%s source=%s request_seq=%llu known_index=%d known_parent=%d\n",
-           (long long)GetTimeMicros(),
-           pnode->GetId(),
-           pnode->addrName.empty() ? pnode->addr.ToString().c_str() : pnode->addrName.c_str(),
-           (unsigned long long)nBatchId,
-           nBatchPos,
-           hash.ToString().c_str(),
-           hashPrevInBatch.ToString().c_str(),
-           BlockRequestTraceSourceName(source),
-           (unsigned long long)nRequestSeq,
-           fKnownIndex ? 1 : 0,
-           fKnownParent ? 1 : 0);
-}
-
-void FirstOrderBreakTraceBlockReceived(CNode* pnode,
-    const uint256& hash,
-    const uint256& hashPrev,
-    uint64_t nReceiveSeq,
-    uint64_t nSrcBatchId,
-    size_t nSrcBatchPos,
-    const uint256& hashPrevFromPeer,
-    bool fPrevInIndex,
-    bool fPrevInOrphans,
-    bool fPrevQueued,
-    bool fPrevInFlight,
-    bool fPrevSentGetData,
-    int nResultCode,
-    int nOrphanBefore,
-    int nOrphanAfter)
-{
-    if (!fFirstOrderBreakTraceEnabled)
-        return;
-    {
-        LOCK(cs_firstOrderTrace);
-        mapFirstOrderLastRecv[pnode->GetId()] = hash;
-    }
-    printf("FIRSTORDER time_us=%lld event=BLOCK_RECEIVE peer=%d addr=%s hash=%s prev=%s receive_seq=%llu src_batch_id=%llu src_batch_pos=%zu prev_from_peer=%s prev_in_index=%d prev_in_orphans=%d prev_queued=%d prev_inflight=%d prev_sent_getdata=%d result_code=%d orphan_before=%d orphan_after=%d\n",
-           (long long)GetTimeMicros(),
-           pnode->GetId(),
-           pnode->addrName.empty() ? pnode->addr.ToString().c_str() : pnode->addrName.c_str(),
-           hash.ToString().c_str(),
-           hashPrev.ToString().c_str(),
-           (unsigned long long)nReceiveSeq,
-           (unsigned long long)nSrcBatchId,
-           nSrcBatchPos,
-           hashPrevFromPeer.ToString().c_str(),
-           fPrevInIndex ? 1 : 0,
-           fPrevInOrphans ? 1 : 0,
-           fPrevQueued ? 1 : 0,
-           fPrevInFlight ? 1 : 0,
-           fPrevSentGetData ? 1 : 0,
-           nResultCode,
-           nOrphanBefore,
-           nOrphanAfter);
-}
-
-uint64_t FirstOrderBreakNextRequestSeq()
-{
-    LOCK(cs_firstOrderTrace);
-    return ++nFirstOrderRequestSeq;
-}
-
-uint64_t FirstOrderBreakNextReceiveSeq()
-{
-    LOCK(cs_firstOrderTrace);
-    return ++nFirstOrderReceiveSeq;
-}
-
-uint64_t FirstOrderBreakNextBatchId()
-{
-    LOCK(cs_firstOrderTrace);
-    return ++nFirstOrderBatchId;
-}
-
-void FirstOrderBreakLookupBatchOrigin(const uint256& hash,
-    uint64_t& nBatchId, size_t& nBatchPos)
-{
-    LOCK(cs_firstOrderTrace);
-    std::map<uint256, std::pair<uint64_t, size_t> >::const_iterator it =
-        mapFirstOrderBatchOrigin.find(hash);
-    if (it != mapFirstOrderBatchOrigin.end())
-    {
-        nBatchId = it->second.first;
-        nBatchPos = it->second.second;
-    }
-}
-
-uint256 FirstOrderBreakLastRecvFromPeer(int peer)
-{
-    LOCK(cs_firstOrderTrace);
-    std::map<NodeId, uint256>::const_iterator it =
-        mapFirstOrderLastRecv.find(peer);
-    return it != mapFirstOrderLastRecv.end() ? it->second : uint256(0);
-}
-
-void FirstOrderBreakTraceServeGetData(CNode* pnode,
-    const uint256& hash,
-    size_t nQueuePos,
-    bool fFound,
-    bool fSent,
-    size_t nRemainingInQueue)
-{
-    if (!fFirstOrderBreakTraceEnabled)
-        return;
-    printf("FIRSTORDER time_us=%lld event=SERVE_GETDATA peer=%d addr=%s hash=%s queue_pos=%zu found=%d sent=%d remaining=%zu\n",
-           (long long)GetTimeMicros(),
-           pnode->GetId(),
-           pnode->addrName.empty() ? pnode->addr.ToString().c_str() : pnode->addrName.c_str(),
-           hash.ToString().c_str(),
-           nQueuePos,
-           fFound ? 1 : 0,
-           fSent ? 1 : 0,
-           nRemainingInQueue);
-}
-// ---- End first-order break trace ----
 
 static deque<string> vOneShots;
 CCriticalSection cs_vOneShots;

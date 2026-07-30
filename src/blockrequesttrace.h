@@ -58,6 +58,16 @@ void BlockRequestTraceAskSkip(CNode* pnode, const uint256& hash,
                               const char* pszReason,
                               int ownerPeer = -1,
                               const char* pszOwnerState = "none");
+void BlockRequestTraceAskSkipOrphanPressure(CNode* pnode, const uint256& hash,
+                                            BlockRequestTraceSource source,
+                                            int nOrphanCountPeer,
+                                            int nQueuedBlockRequests,
+                                            int nSentBlockRequests,
+                                            int nProjectedPressure,
+                                            int nPressureBudget,
+                                            int nHardLimit,
+                                            int ownerPeer = -1,
+                                            const char* pszOwnerState = "none");
 void BlockRequestTraceAskRemoved(CNode* pnode, const uint256& hash,
                                  const char* pszReason,
                                  int nKnownInBlockIndex);
@@ -123,5 +133,25 @@ void BlockRequestTraceGetBlocksTrigger(CNode* pnode,
                                        const uint256& hashBegin,
                                        int nBeginHeight,
                                        const uint256& hashStop);
+
+enum ProcessBlockRejectReason
+{
+    PBREJECT_DUPLICATE_INDEXED = 0,
+    PBREJECT_DUPLICATE_ORPHAN,
+    PBREJECT_DUPLICATE_INDEXED_STAKE,
+    PBREJECT_POS_AFTER_DAG,
+    PBREJECT_CHECKBLOCK_FALSE,
+    PBREJECT_WEAK_CHECKPOINT,
+    PBREJECT_ORPHAN_LIMIT_IBD,
+    PBREJECT_ORPHAN_LIMIT_NORMAL,
+    PBREJECT_DUPLICATE_STAKE_ORPHAN,
+    PBREJECT_ACCEPTBLOCK_FALSE,
+    PBREJECT_UNKNOWN_FALSE
+};
+
+bool InitProcessBlockRejectTrace(bool fEnabled);
+bool ProcessBlockRejectTraceEnabled();
+const char* ProcessBlockRejectReasonName(ProcessBlockRejectReason reason);
+std::string ProcessBlockRejectTraceLastReason(const uint256& hash);
 
 #endif // INNOVA_BLOCKREQUESTTRACE_H

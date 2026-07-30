@@ -98,6 +98,10 @@ static const unsigned int MAX_TX_SIGOPS = MAX_BLOCK_SIGOPS/5;
 static const unsigned int DEFAULT_MAX_ORPHAN_TRANSACTIONS = 100; // Was 10k
 /** Default for -maxorphanblocks, maximum number of orphan blocks kept in memory */
 static const unsigned int DEFAULT_MAX_ORPHAN_BLOCKS = 2500; // Increased for faster parallel sync
+/** Maximum orphan blocks accounted to one peer during IBD block processing. */
+static const int MAX_ORPHAN_BLOCKS_PER_PEER = 750;
+/** Maximum stored-orphan plus committed block-request pressure per peer. */
+static const int MAX_PROJECTED_ORPHAN_PRESSURE = 500;
 /** Default for -maxmempool, maximum mempool size in MB */
 static const unsigned int DEFAULT_MAX_MEMPOOL_SIZE = 300; // 300MB default
 static const unsigned int MAX_INV_SZ = 50000;
@@ -386,6 +390,20 @@ extern std::map<uint256, CBlock*> mapOrphanBlocks;
 extern std::map<uint256, NodeId> mapOrphanBlocksByNode;
 extern std::map<NodeId, int> mapOrphanCountByNode;
 extern std::map<int64_t, CAnonOutputCount> mapAnonOutputStats;
+
+bool ShouldSkipBlockInvForOrphanPressure(CNode* pfrom, const CInv& inv,
+                                          bool fAlreadyHave,
+                                          int* pnOrphanCountPeer = NULL,
+                                          int* pnQueuedBlockRequests = NULL,
+                                          int* pnSentBlockRequests = NULL,
+                                          int* pnProjectedPressure = NULL);
+int GetDeferredBlockRequestBudget(CNode* pfrom,
+                                  int* pnOrphanCountPeer = NULL,
+                                  int* pnQueuedBlockRequests = NULL,
+                                  int* pnSentBlockRequests = NULL,
+                                  int* pnPeerActivePressure = NULL,
+                                  int* pnGlobalActivePressure = NULL);
+size_t RefillDeferredBlockRequests(CNode* pfrom);
 
 extern int nLastFinalizedHeight;
 extern uint256 hashLastFinalized;
@@ -1455,7 +1473,7 @@ public:
     bool ReadFromDisk(const CBlockIndex* pindex, bool fReadTransactions=true);
     bool SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew);
     bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const uint256& hashProof);
-    bool CheckBlock(bool fCheckPOW=true, bool fCheckMerkleRoot=true, bool fCheckSig=true) const;
+    bool CheckBlock(bool fCheckPOW=true, bool fCheckMerkleRoot=true, bool fCheckSig=true, const char** ppszRejectReason=NULL) const;
     bool AcceptBlock();
     bool GetCoinAge(uint64_t& nCoinAge) const; // ppcoin: calculate total coin age spent in block
     bool SignBlock(CWallet& keystore, int64_t nFees);
