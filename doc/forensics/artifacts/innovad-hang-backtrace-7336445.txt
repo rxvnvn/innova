@@ -1,0 +1,629 @@
+Attaching to process 4967
+[New LWP 12371]
+[New LWP 12357]
+[New LWP 12337]
+[New LWP 12214]
+[New LWP 12208]
+[New LWP 11871]
+[New LWP 11547]
+[New LWP 11539]
+[New LWP 11107]
+[New LWP 10582]
+[New LWP 10578]
+[New LWP 10129]
+[New LWP 9755]
+[New LWP 9750]
+[New LWP 9539]
+[New LWP 9393]
+[New LWP 9378]
+[New LWP 9249]
+[New LWP 9229]
+[New LWP 9143]
+[New LWP 9109]
+[New LWP 9107]
+[New LWP 9101]
+[New LWP 9014]
+[New LWP 5078]
+[New LWP 5077]
+[New LWP 5076]
+[New LWP 5075]
+[New LWP 5074]
+[New LWP 5073]
+[New LWP 5071]
+[New LWP 5069]
+[New LWP 5068]
+[New LWP 5067]
+[New LWP 4989]
+[Thread debugging using libthread_db enabled]
+Using host libthread_db library "/usr/lib/x86_64-linux-gnu/libthread_db.so.1".
+0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  Id   Target Id                                          Frame 
+* 1    Thread 0x7fa3e4e26e40 (LWP 4967) "innovad"         0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  2    Thread 0x7fa2a77f66c0 (LWP 12371) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  3    Thread 0x7fa2a7ff76c0 (LWP 12357) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  4    Thread 0x7fa2a87f86c0 (LWP 12337) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  5    Thread 0x7fa2a8ff96c0 (LWP 12214) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  6    Thread 0x7fa2a97fa6c0 (LWP 12208) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  7    Thread 0x7fa2a9ffb6c0 (LWP 11871) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  8    Thread 0x7fa2aa7fc6c0 (LWP 11547) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  9    Thread 0x7fa2aaffd6c0 (LWP 11539) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  10   Thread 0x7fa2ab7fe6c0 (LWP 11107) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  11   Thread 0x7fa2abfff6c0 (LWP 10582) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  12   Thread 0x7fa2b8ffd6c0 (LWP 10578) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  13   Thread 0x7fa2b97fe6c0 (LWP 10129) "innova-rpchand" 0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  14   Thread 0x7fa2b9fff6c0 (LWP 9755) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  15   Thread 0x7fa2babff6c0 (LWP 9750) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  16   Thread 0x7fa31b7fe6c0 (LWP 9539) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  17   Thread 0x7fa332fff6c0 (LWP 9393) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  18   Thread 0x7fa333fff6c0 (LWP 9378) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  19   Thread 0x7fa3367ff6c0 (LWP 9249) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  20   Thread 0x7fa33abfe6c0 (LWP 9229) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  21   Thread 0x7fa33b3ff6c0 (LWP 9143) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  22   Thread 0x7fa33cbff6c0 (LWP 9109) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  23   Thread 0x7fa31bfff6c0 (LWP 9107) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  24   Thread 0x7fa2f73fe6c0 (LWP 9101) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  25   Thread 0x7fa2f63fc6c0 (LWP 9014) "innova-rpchand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  26   Thread 0x7fa2eeffd6c0 (LWP 5078) "innova-adrdump"  0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  27   Thread 0x7fa2ef7fe6c0 (LWP 5077) "innova-msghand"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  28   Thread 0x7fa2effff6c0 (LWP 5076) "innova-opencon"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  29   Thread 0x7fa2f4bf96c0 (LWP 5075) "innova-opencon"  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  30   Thread 0x7fa2f53fa6c0 (LWP 5074) "innova-net"      0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  31   Thread 0x7fa2f5bfb6c0 (LWP 5073) "innova-UPnP"     0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  32   Thread 0x7fa2f6bfd6c0 (LWP 5071) "innova-rpclist"  0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  33   Thread 0x7fa2f7bff6c0 (LWP 5069) "innovad"         0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  34   Thread 0x7fa3147ff6c0 (LWP 5068) "innova-mn"       0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  35   Thread 0x7fa3167ff6c0 (LWP 5067) "innova-wallet"   0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+  36   Thread 0x7fa39ddff6c0 (LWP 4989) "innovad"         0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 36 (Thread 0x7fa39ddff6c0 (LWP 4989) "innovad"):
+#0  0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca058c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007fa3e4ca0967 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007fa3e4ca3347 in pthread_cond_wait () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#4  0x000064272b894cf3 in leveldb::(anonymous namespace)::PosixEnv::BGThreadWrapper(void*) ()
+#5  0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#6  0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 35 (Thread 0x7fa3167ff6c0 (LWP 5067) "innova-wallet"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b769ba8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa3167feb20, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b76ab43 in ThreadFlushWalletDB (parg=0x6427d7670d38) at walletdb.cpp:795
+#9  0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#10 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#11 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 34 (Thread 0x7fa3147ff6c0 (LWP 5068) "innova-mn"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b410d78 in boost::posix::pthread_mutex_lock (m=0x7fa2e022c5b8) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=0x7fa2e022c5b8) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=0x7fa2e022c5b8) at /home/user/innova/src/sync.h:66
+#5  CNode::BeginMessage (this=0x7fa2e022c500, pszCommand=0x64272b89d498 "iseg") at /home/user/innova/src/net.h:1193
+#6  0x000064272b7e5d4e in CNode::PushMessage<CTxIn> (a1=..., pszCommand=0x64272b89d498 "iseg", this=0x7fa2e022c500) at /home/user/innova/src/net.h:1271
+#7  ThreadCheckCollaTeralPool (parg=<optimized out>) at collateral.cpp:1058
+#8  0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#9  0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#10 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 33 (Thread 0x7fa2f7bff6c0 (LWP 5069) "innovad"):
+#0  0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca058c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007fa3e4ca0967 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007fa3e4ca3602 in pthread_cond_timedwait () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#4  0x000064272b4419ae in boost::posix::pthread_cond_timedwait (t=0x7fa2f7bfe9f0, m=0x7fa2f7bfeaa0, c=0x7fa2f7bfeac8) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:123
+#5  boost::condition_variable::do_wait_until (timeout=..., m=..., this=0x7fa2f7bfeaa0) at /usr/include/boost/thread/pthread/condition_variable.hpp:122
+#6  boost::condition_variable::wait_until<boost::chrono::duration<long, boost::ratio<1l, 1000000000l> >, bool (*)()> (t=..., pred=<optimized out>, lock=..., this=0x7fa2f7bfeaa0) at /usr/include/boost/thread/pthread/condition_variable_fwd.hpp:288
+#7  boost::condition_variable::wait_for<long, boost::ratio<1l, 1000l>, bool (*)()> (pred=<optimized out>, d=..., lock=..., this=0x7fa2f7bfeaa0) at /usr/include/boost/thread/pthread/condition_variable_fwd.hpp:321
+#8  boost::this_thread::sleep_for<long, boost::ratio<1l, 1000l> > (d=...) at /usr/include/boost/thread/pthread/thread_data.hpp:300
+#9  0x000064272b64a2f0 in MilliSleep (n=1000) at /home/user/innova/src/util.h:131
+#10 ThreadNullSend (parg=<optimized out>) at nullsend.cpp:1571
+#11 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#12 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#13 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 32 (Thread 0x7fa2f6bfd6c0 (LWP 5071) "innova-rpclist"):
+#0  0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca061c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007fa3e4d37a15 in epoll_wait () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x000064272b55fa1a in boost::asio::detail::epoll_reactor::run (this=0x7fa2f00298f0, usec=<optimized out>, ops=...) at /usr/include/boost/asio/detail/impl/epoll_reactor.ipp:510
+#4  0x000064272b566a9d in boost::asio::detail::scheduler::do_run_one (this=this@entry=0x7fa2f0000c50, lock=..., this_thread=..., ec=...) at /usr/include/boost/asio/detail/impl/scheduler.ipp:477
+#5  0x000064272b555a8b in boost::asio::detail::scheduler::run_one (ec=..., this=0x7fa2f0000c50) at /usr/include/boost/asio/detail/impl/scheduler.ipp:231
+#6  boost::asio::io_context::run_one (this=0x7fa2f6bfc570) at /usr/include/boost/asio/impl/io_context.ipp:79
+#7  ThreadRPCServer2 (parg=parg@entry=0x0) at innovarpc.cpp:1170
+#8  0x000064272b556937 in ThreadRPCServer (parg=0x0) at innovarpc.cpp:917
+#9  0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#10 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#11 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 31 (Thread 0x7fa2f5bfb6c0 (LWP 5073) "innova-UPnP"):
+#0  0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca058c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007fa3e4ca0967 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007fa3e4ca3602 in pthread_cond_timedwait () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#4  0x000064272b4419ae in boost::posix::pthread_cond_timedwait (t=0x7fa2f5bf9d00, m=0x7fa2f5bf9db0, c=0x7fa2f5bf9dd8) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:123
+#5  boost::condition_variable::do_wait_until (timeout=..., m=..., this=0x7fa2f5bf9db0) at /usr/include/boost/thread/pthread/condition_variable.hpp:122
+#6  boost::condition_variable::wait_until<boost::chrono::duration<long, boost::ratio<1l, 1000000000l> >, bool (*)()> (t=..., pred=<optimized out>, lock=..., this=0x7fa2f5bf9db0) at /usr/include/boost/thread/pthread/condition_variable_fwd.hpp:288
+#7  boost::condition_variable::wait_for<long, boost::ratio<1l, 1000l>, bool (*)()> (pred=<optimized out>, d=..., lock=..., this=0x7fa2f5bf9db0) at /usr/include/boost/thread/pthread/condition_variable_fwd.hpp:321
+#8  boost::this_thread::sleep_for<long, boost::ratio<1l, 1000l> > (d=...) at /usr/include/boost/thread/pthread/thread_data.hpp:300
+#9  0x000064272b527a63 in MilliSleep (n=2000) at /home/user/innova/src/util.h:131
+#10 ThreadMapPort2 (parg=parg@entry=0x0) at net.cpp:5265
+#11 0x000064272b527b47 in ThreadMapPort (parg=0x0) at net.cpp:5140
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 30 (Thread 0x7fa2f53fa6c0 (LWP 5074) "innova-net"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b519fa8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2f53e9810, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b536b03 in ThreadSocketHandler2 (parg=parg@entry=0x0) at net.cpp:4828
+#9  0x000064272b538ab7 in ThreadSocketHandler (parg=0x0) at net.cpp:4803
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 29 (Thread 0x7fa2f4bf96c0 (LWP 5075) "innova-opencon"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b519fa8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2f4bf8a90, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b532a08 in ThreadOpenAddedConnections2 (parg=parg@entry=0x0) at net.cpp:5793
+#9  0x000064272b533d97 in ThreadOpenAddedConnections (parg=0x0) at net.cpp:5723
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 28 (Thread 0x7fa2effff6c0 (LWP 5076) "innova-opencon"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b519fa8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2efffea70, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b531718 in ThreadOpenConnections2 (parg=parg@entry=0x0) at net.cpp:5628
+#9  0x000064272b532457 in ThreadOpenConnections (parg=0x0) at net.cpp:5503
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 27 (Thread 0x7fa2ef7fe6c0 (LWP 5077) "innova-msghand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b519fa8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2ef7fcbb0, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b523562 in IsBlockRequestOwnedByAnyPeer (hash=..., extra_peer=0x7fa2e022c500) at net.cpp:1832
+#9  0x000064272b52540c in EraseAlreadyAskedForIfUnowned (inv=..., extra_peer=extra_peer@entry=0x7fa2e022c500) at net.cpp:1863
+#10 0x000064272b425a22 in CNode::ExpireBlockInFlight (this=0x7fa2e022c500, nNow=1785417701) at /home/user/innova/src/net.h:1494
+#11 0x000064272b4b8375 in SendMessages (pto=pto@entry=0x7fa2e022c500, fSendTrickle=fSendTrickle@entry=false) at main.cpp:10013
+#12 0x000064272b52d895 in ThreadMessageHandler2 (parg=<optimized out>) at net.cpp:6122
+#13 0x000064272b52eb47 in ThreadMessageHandler (parg=0x0) at net.cpp:6048
+#14 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#15 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#16 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 26 (Thread 0x7fa2eeffd6c0 (LWP 5078) "innova-adrdump"):
+#0  0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca058c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007fa3e4ca0967 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007fa3e4ca3602 in pthread_cond_timedwait () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#4  0x000064272b4419ae in boost::posix::pthread_cond_timedwait (t=0x7fa2eeffc9e0, m=0x7fa2eeffca90, c=0x7fa2eeffcab8) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:123
+#5  boost::condition_variable::do_wait_until (timeout=..., m=..., this=0x7fa2eeffca90) at /usr/include/boost/thread/pthread/condition_variable.hpp:122
+#6  boost::condition_variable::wait_until<boost::chrono::duration<long, boost::ratio<1l, 1000000000l> >, bool (*)()> (t=..., pred=<optimized out>, lock=..., this=0x7fa2eeffca90) at /usr/include/boost/thread/pthread/condition_variable_fwd.hpp:288
+#7  boost::condition_variable::wait_for<long, boost::ratio<1l, 1000l>, bool (*)()> (pred=<optimized out>, d=..., lock=..., this=0x7fa2eeffca90) at /usr/include/boost/thread/pthread/condition_variable_fwd.hpp:321
+#8  boost::this_thread::sleep_for<long, boost::ratio<1l, 1000l> > (d=...) at /usr/include/boost/thread/pthread/thread_data.hpp:300
+#9  0x000064272b52a775 in MilliSleep (n=600000) at /home/user/innova/src/util.h:131
+#10 ThreadDumpAddress2 (parg=parg@entry=0x0) at net.cpp:5474
+#11 0x000064272b52a860 in ThreadDumpAddress (parg=0x0) at net.cpp:5487
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 25 (Thread 0x7fa2f63fc6c0 (LWP 9014) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b5945c8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2f63fb4b0, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b599335 in CopyNodeStats (vstats=std::vector of length 0, capacity 0) at rpcnet.cpp:36
+#9  getpeerinfo (params=..., fHelp=<optimized out>) at rpcnet.cpp:72
+#10 0x000064272b552477 in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getpeerinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1465
+#11 0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f0040940) at innovarpc.cpp:1396
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 24 (Thread 0x7fa2f73fe6c0 (LWP 9101) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b5b1288 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2f73fd310, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b5b8ca1 in getinfo (params=..., fHelp=<optimized out>) at rpcwallet.cpp:193
+#9  0x000064272b55277f in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1490
+#10 0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f0040170) at innovarpc.cpp:1396
+#11 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#12 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#13 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 23 (Thread 0x7fa31bfff6c0 (LWP 9107) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b5945c8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa31bffe4b0, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b599335 in CopyNodeStats (vstats=std::vector of length 0, capacity 0) at rpcnet.cpp:36
+#9  getpeerinfo (params=..., fHelp=<optimized out>) at rpcnet.cpp:72
+#10 0x000064272b552477 in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getpeerinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1465
+#11 0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f003fbc0) at innovarpc.cpp:1396
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 22 (Thread 0x7fa33cbff6c0 (LWP 9109) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa33cbfe710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getblockchaininfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f0058f00) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 21 (Thread 0x7fa33b3ff6c0 (LWP 9143) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa33b3fe710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getblockchaininfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f0087d20) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 20 (Thread 0x7fa33abfe6c0 (LWP 9229) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa33abfd710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getblockchaininfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f009f630) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 19 (Thread 0x7fa3367ff6c0 (LWP 9249) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b5945c8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa3367fe4b0, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b599335 in CopyNodeStats (vstats=std::vector of length 0, capacity 0) at rpcnet.cpp:36
+#9  getpeerinfo (params=..., fHelp=<optimized out>) at rpcnet.cpp:72
+#10 0x000064272b552477 in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getpeerinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1465
+#11 0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f00b6f40) at innovarpc.cpp:1396
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 18 (Thread 0x7fa333fff6c0 (LWP 9378) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa333ffe710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f00ce850) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 17 (Thread 0x7fa332fff6c0 (LWP 9393) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa332ffe710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getblockchaininfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f00e6160) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 16 (Thread 0x7fa31b7fe6c0 (LWP 9539) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b5945c8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa31b7fd4b0, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b599335 in CopyNodeStats (vstats=std::vector of length 0, capacity 0) at rpcnet.cpp:36
+#9  getpeerinfo (params=..., fHelp=<optimized out>) at rpcnet.cpp:72
+#10 0x000064272b552477 in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getpeerinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1465
+#11 0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f00fda70) at innovarpc.cpp:1396
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 15 (Thread 0x7fa2babff6c0 (LWP 9750) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2babfe710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f0115380) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 14 (Thread 0x7fa2b9fff6c0 (LWP 9755) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2b9ffe710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getblockchaininfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f012cc90) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 13 (Thread 0x7fa2b97fe6c0 (LWP 10129) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b5945c8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2b97fd4b0, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b599335 in CopyNodeStats (vstats=std::vector of length 0, capacity 0) at rpcnet.cpp:36
+#9  getpeerinfo (params=..., fHelp=<optimized out>) at rpcnet.cpp:72
+#10 0x000064272b552477 in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getpeerinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1465
+#11 0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f01445a0) at innovarpc.cpp:1396
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 12 (Thread 0x7fa2b8ffd6c0 (LWP 10578) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2b8ffc710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f015beb0) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 11 (Thread 0x7fa2abfff6c0 (LWP 10582) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2abffe710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getblockchaininfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f01737c0) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 10 (Thread 0x7fa2ab7fe6c0 (LWP 11107) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b5945c8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2ab7fd4b0, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b599335 in CopyNodeStats (vstats=std::vector of length 0, capacity 0) at rpcnet.cpp:36
+#9  getpeerinfo (params=..., fHelp=<optimized out>) at rpcnet.cpp:72
+#10 0x000064272b552477 in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getpeerinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1465
+#11 0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f018b0d0) at innovarpc.cpp:1396
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 9 (Thread 0x7fa2aaffd6c0 (LWP 11539) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2aaffc710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f01a29e0) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 8 (Thread 0x7fa2aa7fc6c0 (LWP 11547) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2aa7fb710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getblockchaininfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f01ba2f0) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 7 (Thread 0x7fa2a9ffb6c0 (LWP 11871) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b5945c8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2a9ffa4b0, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b599335 in CopyNodeStats (vstats=std::vector of length 0, capacity 0) at rpcnet.cpp:36
+#9  getpeerinfo (params=..., fHelp=<optimized out>) at rpcnet.cpp:72
+#10 0x000064272b552477 in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getpeerinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1465
+#11 0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f01d1c00) at innovarpc.cpp:1396
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 6 (Thread 0x7fa2a97fa6c0 (LWP 12208) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2a97f9710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f01e9510) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 5 (Thread 0x7fa2a8ff96c0 (LWP 12214) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2a8ff8710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getblockchaininfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f0200e20) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 4 (Thread 0x7fa2a87f86c0 (LWP 12337) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2a87f7710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f02196b0) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 3 (Thread 0x7fa2a7ff76c0 (LWP 12357) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b54e818 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2a7ff6710, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b55272d in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getblockchaininfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1479
+#9  0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f0230fc0) at innovarpc.cpp:1396
+#10 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#11 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#12 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 2 (Thread 0x7fa2a77f66c0 (LWP 12371) "innova-rpchand"):
+#0  0x00007fa3e4ca0ba0 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca7a49 in pthread_mutex_lock () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x000064272b5945c8 in boost::posix::pthread_mutex_lock (m=<optimized out>) at /usr/include/boost/thread/pthread/pthread_helpers.hpp:79
+#3  boost::recursive_mutex::lock (this=<optimized out>) at /usr/include/boost/thread/pthread/recursive_mutex.hpp:108
+#4  AnnotatedMixin<boost::recursive_mutex>::lock (this=<optimized out>) at /home/user/innova/src/sync.h:66
+#5  boost::unique_lock<AnnotatedMixin<boost::recursive_mutex> >::lock (this=<optimized out>) at /usr/include/boost/thread/lock_types.hpp:346
+#6  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::Enter (nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>, this=<optimized out>) at /home/user/innova/src/sync.h:118
+#7  CMutexLock<AnnotatedMixin<boost::recursive_mutex> >::CMutexLock (this=this@entry=0x7fa2a77f54b0, mutexIn=..., fTry=fTry@entry=false, nLine=<optimized out>, pszFile=<optimized out>, pszName=<optimized out>) at /home/user/innova/src/sync.h:139
+#8  0x000064272b599335 in CopyNodeStats (vstats=std::vector of length 0, capacity 0) at rpcnet.cpp:36
+#9  getpeerinfo (params=..., fHelp=<optimized out>) at rpcnet.cpp:72
+#10 0x000064272b552477 in CRPCTable::execute (this=this@entry=0x64272ba51a60 <tableRPC>, strMethod="getpeerinfo", params=std::vector of length 0, capacity 0) at innovarpc.cpp:1465
+#11 0x000064272b55b03c in ThreadRPCServer3 (parg=0x7fa2f02488d0) at innovarpc.cpp:1396
+#12 0x00007fa3e5e5b00b in ?? () from /usr/lib/x86_64-linux-gnu/libboost_thread.so.1.83.0
+#13 0x00007fa3e4ca407a in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#14 0x00007fa3e4d3772c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+
+Thread 1 (Thread 0x7fa3e4e26e40 (LWP 4967) "innovad"):
+#0  0x00007fa3e4caca82 in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#1  0x00007fa3e4ca058c in ?? () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#2  0x00007fa3e4cf5d72 in clock_nanosleep () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#3  0x00007fa3e4d03987 in nanosleep () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#4  0x00007fa3e4d1b13e in sleep () from /usr/lib/x86_64-linux-gnu/libc.so.6
+#5  0x000064272b4556f9 in AppInit2 () at init.cpp:1884
+#6  0x000064272b457585 in AppInit (argc=argc@entry=1, argv=argv@entry=0x7ffd81186558) at init.cpp:446
+#7  0x000064272b3e60ce in main (argc=1, argv=0x7ffd81186558) at init.cpp:470
+Detaching from program: /usr/local/bin/innovad, process 4967
+[Inferior 1 (process 4967) detached]
