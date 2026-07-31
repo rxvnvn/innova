@@ -983,7 +983,15 @@ void BitcoinGUI::changeEvent(QEvent *e)
             QWindowStateChangeEvent *wsevt = static_cast<QWindowStateChangeEvent*>(e);
             if(!(wsevt->oldState() & Qt::WindowMinimized) && isMinimized())
             {
-                QTimer::singleShot(0, this, SLOT(hide()));
+                qDebug()
+                    << "QT_TRAY_TRACE"
+                    << "QUEUE_HIDE"
+                    << "oldState=" << wsevt->oldState()
+                    << "windowState=" << windowState()
+                    << "isHidden=" << isHidden()
+                    << "isVisible=" << isVisible()
+                    << "isMinimized=" << isMinimized();
+                QTimer::singleShot(0, this, SLOT(hideToTrayForTrace()));
                 e->ignore();
             }
         }
@@ -1408,6 +1416,19 @@ void BitcoinGUI::showNormalIfMinimized(bool fToggleHidden)
     }
     else if(fToggleHidden)
         hide();
+}
+
+void BitcoinGUI::hideToTrayForTrace()
+{
+    qDebug()
+        << "QT_TRAY_TRACE"
+        << "HIDE_EXECUTED"
+        << "windowState=" << windowState()
+        << "isHidden=" << isHidden()
+        << "isVisible=" << isVisible()
+        << "isMinimized=" << isMinimized();
+
+    hide();
 }
 
 void BitcoinGUI::toggleHidden()

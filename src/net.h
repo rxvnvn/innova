@@ -26,8 +26,23 @@ class CRequestTracker;
 class CNode;
 class CBlockIndex;
 class CBlockLocator;
+class CStalledSyncRecoveryState;
 extern int nBestHeight;
-void RecordSyncRequestSent(int64_t nNow);
+
+// Armed exactly once when an ordinary (non-recovery) block-sync getblocks has
+// been committed for transmission to a peer that can advance local block sync.
+// Recovery-tagged getblocks and getblocks to peers that cannot advance block
+// sync never touch the state.  The state-ref overload is the testable core;
+// the global overload arms the process-wide recovery state.
+void RecordOrdinaryGetBlocksCommitted(CStalledSyncRecoveryState& state,
+                                      int64_t nNow, uint64_t nRecoveryId,
+                                      bool fPeerCanAdvanceBlockSync);
+void RecordOrdinaryGetBlocksCommitted(int64_t nNow, uint64_t nRecoveryId,
+                                      bool fPeerCanAdvanceBlockSync);
+
+// Test hooks for the process-wide stalled-sync recovery state.
+CStalledSyncRecoveryState& GetStalledSyncRecoveryStateForTesting();
+void ResetStalledSyncRecoveryStateForTesting();
 void StartSyncForTesting(const std::vector<CNode*>& vNodesIn);
 void ResetSyncPeerForTesting();
 
@@ -226,7 +241,8 @@ CNode* MaybeQueueStalledSyncRecovery(const std::vector<CNode*>& vNodes,
                                      int64_t nNow,
                                      int64_t nStallTimeout,
                                      int64_t nCooldown,
-                                     CStalledSyncRecoveryState& state);
+                                     CStalledSyncRecoveryState& state,
+                                     std::string* pstrSkipReason = NULL);
 void RecordRejectedBlockForSync(
     const uint256& hashBlock, bool fRetryEligible = true);
 void ClearRejectedBlockForSync(const uint256& hashBlock);
@@ -448,6 +464,35 @@ static const int64_t ALREADY_ASKED_FOR_RETENTION_US = 60LL * 60 * 1000000;
 static const int64_t ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US = 5LL * 1000000;
 static const int64_t ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US = 2LL * 60 * 1000000;
 size_t PruneAlreadyAskedFor(int64_t nNowMicros);
+
+// Single-slot IBD frontier admission exemption.
+//
+// During IBD the deferred block-request budget (see
+// GetDeferredBlockRequestBudget) can reach zero because a peer's unresolved
+// orphan count saturates the per-peer active window.  Every block inv from
+// that peer is then deferred and, once the deferred queue is full, dropped --
+// including the first block after the active tip that would reconnect the
+// orphan forest to the chain.  The frontier exemption lets exactly one such
+// announced block enter AskFor while the budget is zero so the connectable
+// frontier block can be requested and orphan pressure drained.
+//
+// The exemption is offered only to the first unknown block inv of a getblocks
+// response that was requested with the current active-tip locator, and only
+// while the active tip still matches that locator context.  At most one
+// frontier candidate can be outstanding at any time, which bounds the DoS
+// surface of admitting a block past a zero budget.
+//
+// The marker is cleared when the block is received, when the owning peer
+// releases the request (queue removal, timeout, disconnect), or when a new
+// active tip invalidates the locator context.
+static const int64_t FRONTIER_ADMISSION_EXPIRE_US = 30LL * 1000000;
+
+bool FrontierCandidateCanAdmit(int64_t nNow, NodeId peer, const uint256& hash,
+                               int nTipHeight, int nLocatorHeight);
+void ClearFrontierCandidateForBlock(const uint256& hash);
+void ClearFrontierCandidateForPeer(NodeId peer);
+void ClearFrontierCandidate();
+void InvalidateFrontierOnTipChange();
 
 extern NodeId nLastNodeId;
 extern CCriticalSection cs_nLastNodeId;
@@ -756,6 +801,14 @@ public:
     uint64_t nRecoveryTracePendingId;
     uint256 hashLastGetBlocksEnd;
     int64_t nLastGetBlocksTime;
+    // Set while a getblocks carrying the current active-tip locator has been
+    // flushed and its inv response has not yet been consumed.  The first
+    // unknown block inv of that response is eligible for the single-slot IBD
+    // frontier admission exemption.
+    bool fFrontierResponsePending;
+    // Active-tip height at the moment the frontier getblocks was flushed; the
+    // exemption is refused if the tip advances before the response arrives.
+    int nFrontierLocatorHeight;
     int64_t nLastGetDataTime;
     int nChainHeight;
     int nBestKnownHeight;
@@ -844,6 +897,8 @@ public:
         nRecoveryTracePendingId = 0;
         hashLastGetBlocksEnd = 0;
         nLastGetBlocksTime = 0;
+        fFrontierResponsePending = false;
+        nFrontierLocatorHeight = -1;
         nLastGetDataTime = 0;
         nChainHeight = -1;
         nBestKnownHeight = -1;
@@ -1017,6 +1072,9 @@ public:
             return false;
         deferredBlockInv.push_back(hash);
         deferredBlockInvIndex.insert(hash);
+        if (BlockRequestTraceEnabled())
+            BlockRequestTraceDeferredWatermark(
+                GetId(), (int)deferredBlockInv.size(), "add");
         return true;
     }
 
@@ -1033,6 +1091,9 @@ public:
                 break;
             }
         }
+        if (BlockRequestTraceEnabled())
+            BlockRequestTraceDeferredWatermark(
+                GetId(), (int)deferredBlockInv.size(), "remove");
         return true;
     }
 
@@ -1042,6 +1103,9 @@ public:
             return;
         deferredBlockInvIndex.erase(deferredBlockInv.front());
         deferredBlockInv.pop_front();
+        if (BlockRequestTraceEnabled())
+            BlockRequestTraceDeferredWatermark(
+                GetId(), (int)deferredBlockInv.size(), "remove");
     }
 
     void RotateFrontDeferredBlockInv()
@@ -1137,16 +1201,12 @@ public:
         NodeId nOwnerPeer = -1;
         BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
         if (fBlockRequest &&
-            (!TryAssignBlockRequestOwnerLocked(inv.hash, GetId(), source,
-                                               &nOwnerPeer, &ownerState) ||
-             (nOwnerPeer == GetId() &&
-              ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)))
+            GetBlockRequestOwner(inv.hash, &nOwnerPeer, &ownerState) &&
+            nOwnerPeer != GetId())
         {
             if (BlockRequestTraceEnabled())
                 BlockRequestTraceAskSkip(this, inv.hash, source,
-                                         nOwnerPeer == GetId()
-                                             ? "same-peer-inflight"
-                                             : "other-peer-active-owner",
+                                         "other-peer-active-owner",
                                          nOwnerPeer,
                                          BlockRequestOwnerStateName(ownerState));
             return;

@@ -134,6 +134,86 @@ void BlockRequestTraceGetBlocksTrigger(CNode* pnode,
                                        int nBeginHeight,
                                        const uint256& hashStop);
 
+// Continuity / divergence diagnosis instrumentation. All events below are
+// emitted on the SYNC_EVENT stream, which is enabled whenever
+// blockrequesttrace=1 is active. Event state is passed as values so tracing
+// never acquires cs_main, cs_vNodes, or a peer lock in reverse order.
+
+// Enrich the per-tip-advance SETBESTCHAIN_COMMIT event with the previous tip,
+// the source peer, whether the block was requested, and its first request/send
+// pipeline origin. Called on every active-chain tip change.
+void BlockRequestTraceSetBestChainCommit(int peer,
+                                         const uint256& hashOldTip,
+                                         int nOldHeight,
+                                         const uint256& hashNewTip,
+                                         int nNewHeight,
+                                         bool fReorg,
+                                         int64_t nBlockTime);
+
+// Emit a REORG event describing an active-chain switch: fork point,
+// disconnected/connected branches, chain-trust comparison, and the peer that
+// supplied the winning candidate.
+void BlockRequestTraceReorg(int peer,
+                            const uint256& hashFork, int nForkHeight,
+                            const uint256& hashOldBest, int nOldHeight,
+                            const uint256& hashNewBest, int nNewHeight,
+                            const std::vector<uint256>& vDisconnect,
+                            const std::vector<uint256>& vConnect,
+                            const std::string& strOldTrust,
+                            const std::string& strNewTrust);
+
+// Emit the one-shot FIRST_CONTINUITY_BREAK event. Fires only once per process
+// at the earliest block receive whose parent is absent locally while no block
+// has connected for the configured interval. Returns true when emitted now.
+bool BlockRequestTraceContinuityBreak(CNode* pnode,
+                                      const uint256& hashBlock,
+                                      const uint256& hashPrev,
+                                      int nLocalHeight,
+                                      const uint256& hashLocalTip,
+                                      int64_t nLastAcceptedAgeSeconds,
+                                      int nPeerBestHeight,
+                                      const uint256& hashPeerBest,
+                                      bool fPrevInOrphans,
+                                      bool fPrevInFlight,
+                                      bool fPrevQueued,
+                                      bool fPrevOwnerClaimed,
+                                      int nPrevOwnerPeer,
+                                      const char* pszPrevOwnerState,
+                                      int nOrphanCountPeer,
+                                      size_t nOrphanCountGlobal,
+                                      int nTipAncestorOfPeerBest);
+
+// Reset the one-shot continuity-break gate. Called when the trace is (re)enabled.
+void BlockRequestTraceContinuityBreakReset();
+
+// Emit a MISSING_PARENT_REQUEST at orphan-insertion time: the orphan block,
+// the selected missing ancestor, whether AskFor admitted it, and whether this
+// peer claimed ownership. The wanted hash is tracked so that its eventual
+// arrival can be reported by BlockRequestTraceMissingParentResolved.
+void BlockRequestTraceMissingParentRequest(CNode* pnode,
+                                           const uint256& orphanHash,
+                                           const uint256& orphanPrev,
+                                           const uint256& hashWanted,
+                                           bool fAdmitted,
+                                           bool fOwnerClaimed,
+                                           int nOrphanCountPeer,
+                                           size_t nOrphanCountGlobal);
+
+// Emit a MISSING_PARENT_RESOLVED when a previously-wanted missing parent
+// arrives and is processed. Includes whether a getdata was sent and the final
+// ProcessBlock outcome (read from the trace registry). Returns true when the
+// block matched a pending missing-parent request.
+bool BlockRequestTraceMissingParentResolved(CNode* pnode,
+                                            const uint256& hashBlock,
+                                            bool fAccepted,
+                                            int nHeightAfter);
+
+// Per-peer watermark events when orphan or deferred block-inv counts cross
+// 64/128/256/512/700/750. pszAction is "add" or "remove". Returns true when a
+// watermark event was emitted for this transition.
+bool BlockRequestTraceOrphanWatermark(int peer, int nCount, const char* pszAction);
+bool BlockRequestTraceDeferredWatermark(int peer, int nCount, const char* pszAction);
+
 enum ProcessBlockRejectReason
 {
     PBREJECT_DUPLICATE_INDEXED = 0,

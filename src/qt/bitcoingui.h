@@ -264,6 +264,7 @@ private slots:
 
     void updateWeight();
     void updateStakingIcon();
+    void hideToTrayForTrace();
 };
 
 #endif

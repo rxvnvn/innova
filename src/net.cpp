@@ -832,10 +832,36 @@ bool CStalledSyncRecoveryState::ShouldRecover(
     return true;
 }
 
-void RecordSyncRequestSent(int64_t nNow)
+void RecordOrdinaryGetBlocksCommitted(CStalledSyncRecoveryState& state,
+                                      int64_t nNow, uint64_t nRecoveryId,
+                                      bool fPeerCanAdvanceBlockSync)
+{
+    // Only an ordinary (non-recovery) block-sync getblocks committed for
+    // transmission to a peer that can advance local block sync arms the
+    // stalled-sync recovery state.  Recovery-tagged getblocks must never
+    // touch the state, and a bare empty pipeline must never self-arm.
+    if (nRecoveryId != 0 || !fPeerCanAdvanceBlockSync)
+        return;
+    state.MarkSyncRequestSent(nNow);
+}
+
+void RecordOrdinaryGetBlocksCommitted(int64_t nNow, uint64_t nRecoveryId,
+                                      bool fPeerCanAdvanceBlockSync)
 {
     LOCK(cs_stalledSyncRecovery);
-    stalledSyncRecoveryState.MarkSyncRequestSent(nNow);
+    RecordOrdinaryGetBlocksCommitted(stalledSyncRecoveryState, nNow,
+                                     nRecoveryId, fPeerCanAdvanceBlockSync);
+}
+
+CStalledSyncRecoveryState& GetStalledSyncRecoveryStateForTesting()
+{
+    return stalledSyncRecoveryState;
+}
+
+void ResetStalledSyncRecoveryStateForTesting()
+{
+    LOCK(cs_stalledSyncRecovery);
+    stalledSyncRecoveryState = CStalledSyncRecoveryState();
 }
 
 void CStalledSyncRecoveryState::MarkSyncRequestSent(int64_t nNow)
@@ -1071,7 +1097,8 @@ void RecoveryTraceSend(CNode* pnode, uint64_t id, CBlockIndex* pindexBegin,
 CNode* MaybeQueueStalledSyncRecovery(
     const std::vector<CNode*>& vNodesIn, CBlockIndex* pindexTip,
     int nLocalHeight, int64_t nNow, int64_t nStallTimeout,
-    int64_t nCooldown, CStalledSyncRecoveryState& state)
+    int64_t nCooldown, CStalledSyncRecoveryState& state,
+    std::string* pstrSkipReason)
 {
     int64_t nMaxPeerHeight = -1;
     bool fPipelineActive = false;
@@ -1147,7 +1174,13 @@ CNode* MaybeQueueStalledSyncRecovery(
         pszFinalSkipReason = "no_eligible_peers";
     else if (!fShouldRecover)
     {
-        if (nObservedHeightBefore != nLocalHeight)
+        // The stalled-sync recovery state is only ever armed by an actual
+        // ordinary block-sync request being committed for transmission.  An
+        // unarmed state must be reported truthfully: it is NOT a height
+        // change, and no amount of elapsed time can drive it to recovery.
+        if (!state.SyncRequestSent())
+            pszFinalSkipReason = "sync_request_not_sent";
+        else if (nObservedHeightBefore != nLocalHeight)
             pszFinalSkipReason = "local_height_changed";
         else if (nStallStartBefore != 0 && nNow < nStallStartBefore)
             pszFinalSkipReason = "clock_reversal";
@@ -1214,6 +1247,9 @@ CNode* MaybeQueueStalledSyncRecovery(
                    fShouldRecoverEvaluated ? (fShouldRecover ? 1 : 0) : -1,
                    pszFinalSkipReason);
     }
+
+    if (pstrSkipReason)
+        *pstrSkipReason = pszFinalSkipReason ? pszFinalSkipReason : "none";
 
     if (!fShouldRecover)
     {
@@ -1768,6 +1804,37 @@ bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer)
     return true;
 }
 
+// ----------------------------------------------------------------------------
+// Single-slot IBD frontier admission exemption.
+//
+// Global state guarded by cs_mapAlreadyAskedFor.  The slot is claimed by
+// FrontierCandidateCanAdmit and cleared by ClearFrontierCandidate* /
+// InvalidateFrontierOnTipChange and, transitively, by the ownership release
+// hooks in the block-request-owner API below.
+// ----------------------------------------------------------------------------
+namespace
+{
+    uint256 g_frontierHash;
+    NodeId  g_frontierPeer = -1;
+    int     g_frontierLocatorHeight = -1;
+    bool    g_frontierAdmitted = false;
+    int64_t g_frontierExpireAt = 0;
+
+    void FrontierTraceClearLocked(const char* pszReason)
+    {
+        if (BlockRequestTraceEnabled())
+            printf("BLOCKREQTRACE time_us=%lld event=FRONTIER_CLEAR hash=%s peer=%d reason=%s\n",
+                   (long long)GetTimeMicros(),
+                   g_frontierHash.ToString().c_str(), (int)g_frontierPeer,
+                   pszReason ? pszReason : "?");
+        g_frontierHash = uint256(0);
+        g_frontierPeer = -1;
+        g_frontierLocatorHeight = -1;
+        g_frontierAdmitted = false;
+        g_frontierExpireAt = 0;
+    }
+}
+
 bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
                               const char* pszReason)
 {
@@ -1781,6 +1848,8 @@ bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
                                       BlockRequestOwnerStateName(it->second.state),
                                       pszReason);
     mapBlockRequestOwners.erase(it);
+    if (g_frontierHash == hash && g_frontierPeer == peer)
+        FrontierTraceClearLocked("release");
     return true;
 }
 
@@ -1796,6 +1865,8 @@ bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer)
                                       BlockRequestOwnerStateName(it->second.state),
                                       "receive");
     mapBlockRequestOwners.erase(it);
+    if (g_frontierHash == hash)
+        FrontierTraceClearLocked("receive");
     return true;
 }
 
@@ -1818,6 +1889,8 @@ size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason)
         it = mapBlockRequestOwners.erase(it);
         ++nReleased;
     }
+    if (g_frontierPeer == peer)
+        FrontierTraceClearLocked("disconnect");
     return nReleased;
 }
 
@@ -1838,6 +1911,103 @@ bool EraseAlreadyAskedForIfUnowned(const CInv& inv)
         return false;
 
     return mapAlreadyAskedFor.erase(inv) != 0;
+}
+
+// ----------------------------------------------------------------------------
+// Single-slot IBD frontier admission exemption.
+//
+// Public entry points; the slot state itself lives in the anonymous namespace
+// declared above the block-request-owner API so the release hooks can clear it.
+// ----------------------------------------------------------------------------
+
+bool FrontierCandidateCanAdmit(int64_t nNow, NodeId peer, const uint256& hash,
+                               int nTipHeight, int nLocatorHeight)
+{
+    if (peer < 0 || hash == 0)
+        return false;
+    LOCK(cs_mapAlreadyAskedFor);
+    if (nTipHeight != nLocatorHeight)
+    {
+        if (BlockRequestTraceEnabled())
+            printf("BLOCKREQTRACE time_us=%lld event=FRONTIER_DENY reason=locator-stale hash=%s peer=%d tip_height=%d locator_height=%d\n",
+                   (long long)GetTimeMicros(), hash.ToString().c_str(), (int)peer,
+                   nTipHeight, nLocatorHeight);
+        return false;
+    }
+    if (g_frontierHash != 0)
+    {
+        if (g_frontierExpireAt != 0 && nNow > g_frontierExpireAt)
+        {
+            FrontierTraceClearLocked("expired");
+        }
+        else if (g_frontierHash == hash && g_frontierPeer == peer &&
+                 g_frontierLocatorHeight == nTipHeight)
+        {
+            if (!g_frontierAdmitted)
+            {
+                // The same candidate re-announced while the slot is still
+                // unclaimed (previous attempt deferred before AskFor).  Allow
+                // exactly one admission.
+                g_frontierAdmitted = true;
+                return true;
+            }
+            if (BlockRequestTraceEnabled())
+                printf("BLOCKREQTRACE time_us=%lld event=FRONTIER_DENY reason=already-admitted hash=%s peer=%d\n",
+                       (long long)GetTimeMicros(), hash.ToString().c_str(), (int)peer);
+            return false;
+        }
+        else
+        {
+            if (BlockRequestTraceEnabled())
+                printf("BLOCKREQTRACE time_us=%lld event=FRONTIER_DENY reason=slot-busy hash=%s peer=%d busy_hash=%s busy_peer=%d\n",
+                       (long long)GetTimeMicros(), hash.ToString().c_str(), (int)peer,
+                       g_frontierHash.ToString().c_str(), (int)g_frontierPeer);
+            return false;
+        }
+    }
+    g_frontierHash = hash;
+    g_frontierPeer = peer;
+    g_frontierLocatorHeight = nTipHeight;
+    g_frontierAdmitted = true;
+    g_frontierExpireAt = nNow + FRONTIER_ADMISSION_EXPIRE_US;
+    if (BlockRequestTraceEnabled())
+        printf("BLOCKREQTRACE time_us=%lld event=FRONTIER_ADMIT hash=%s peer=%d locator_height=%d expire_us=%lld\n",
+               (long long)GetTimeMicros(), hash.ToString().c_str(), (int)peer,
+               nTipHeight, (long long)g_frontierExpireAt);
+    return true;
+}
+
+void ClearFrontierCandidateForBlock(const uint256& hash)
+{
+    if (hash == 0)
+        return;
+    LOCK(cs_mapAlreadyAskedFor);
+    if (g_frontierHash != hash)
+        return;
+    FrontierTraceClearLocked("receive");
+}
+
+void ClearFrontierCandidateForPeer(NodeId peer)
+{
+    if (peer < 0)
+        return;
+    LOCK(cs_mapAlreadyAskedFor);
+    if (g_frontierPeer != peer)
+        return;
+    FrontierTraceClearLocked("disconnect");
+}
+
+void ClearFrontierCandidate()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    if (g_frontierHash == 0)
+        return;
+    FrontierTraceClearLocked("clear");
+}
+
+void InvalidateFrontierOnTipChange()
+{
+    ClearFrontierCandidate();
 }
 
 void RecordOrphanLimitRejectedBlock(const CInv& inv, int64_t nUntilMicros)
@@ -2120,6 +2290,8 @@ static std::map<uint256, BlockRequestTraceEntry> mapBlockRequestTrace;
 static BlockRequestTraceCounters blockRequestTraceCounters;
 static uint64_t nBlockRequestTraceOperations = 0;
 static int64_t nLastBlockRequestTraceSummary = 0;
+static bool fContinuityBreakEmitted = false;
+static std::set<uint256> setMissingParentWanted;
 
 static const char* BlockRequestTraceSourceName(BlockRequestTraceSource source)
 {
@@ -2476,6 +2648,8 @@ bool InitBlockRequestTrace(bool fEnabled, const std::string& strHashFilter)
     blockRequestTraceCounters = BlockRequestTraceCounters();
     nBlockRequestTraceOperations = 0;
     nLastBlockRequestTraceSummary = 0;
+    fContinuityBreakEmitted = false;
+    setMissingParentWanted.clear();
 
     if (fBlockRequestTraceEnabled)
     {
@@ -3267,6 +3441,319 @@ void BlockRequestTraceGetBlocksTrigger(CNode* pnode,
 }
 
 
+
+// Continuity / divergence diagnosis instrumentation.
+// All events below are emitted only while blockrequesttrace=1 is active and
+// only carry state passed as values (plus the net-local trace registry), so
+// they never acquire cs_main, cs_vNodes, or a peer lock in reverse order.
+
+static const int nContinuityWatermarkThresholds[] = { 64, 128, 256, 512, 700, 750 };
+static const size_t nContinuityWatermarkThresholdCount =
+    sizeof(nContinuityWatermarkThresholds) / sizeof(nContinuityWatermarkThresholds[0]);
+
+static int ContinuityWatermarkForCount(int nCount)
+{
+    int nWatermark = 0;
+    for (size_t i = 0; i < nContinuityWatermarkThresholdCount; ++i)
+    {
+        if (nCount >= nContinuityWatermarkThresholds[i])
+            nWatermark = nContinuityWatermarkThresholds[i];
+    }
+    return nWatermark;
+}
+
+void BlockRequestTraceSetBestChainCommit(int peer,
+                                         const uint256& hashOldTip,
+                                         int nOldHeight,
+                                         const uint256& hashNewTip,
+                                         int nNewHeight,
+                                         bool fReorg,
+                                         int64_t nBlockTime)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    int64_t nNow = GetTimeMicros();
+    bool fRequested = false;
+    uint64_t nRequestCount = 0;
+    uint64_t nSendCount = 0;
+    uint64_t nReceiveCount = 0;
+    const char* pszFirstRequestSource = "none";
+    const char* pszFirstSendSource = "none";
+    {
+        LOCK(cs_blockRequestTrace);
+        BlockRequestTraceEntry* entry =
+            BlockRequestTraceGetLocked(hashNewTip, nNow, false);
+        if (entry)
+        {
+            fRequested = entry->requestCount != 0 || entry->sendCount != 0;
+            nRequestCount = entry->requestCount;
+            nSendCount = entry->sendCount;
+            nReceiveCount = entry->receiveCount;
+            if (entry->firstRequestSource != BLOCKREQ_SOURCE_OTHER)
+                pszFirstRequestSource =
+                    BlockRequestTraceSourceName(entry->firstRequestSource);
+            if (entry->firstSendSource != BLOCKREQ_SOURCE_OTHER)
+                pszFirstSendSource =
+                    BlockRequestTraceSourceName(entry->firstSendSource);
+        }
+    }
+    printf("SYNC_EVENT time_us=%lld event=SETBESTCHAIN_COMMIT hash=%s height=%d block_time=%lld old_height=%d old_tip=%s peer=%d reorg=%d requested=%d request_count=%llu send_count=%llu first_request_source=%s first_send_source=%s receive_count=%llu\n",
+           (long long)nNow, hashNewTip.ToString().c_str(), nNewHeight,
+           (long long)nBlockTime, nOldHeight, hashOldTip.ToString().c_str(),
+           peer, fReorg ? 1 : 0, fRequested ? 1 : 0,
+           (unsigned long long)nRequestCount,
+           (unsigned long long)nSendCount,
+           pszFirstRequestSource, pszFirstSendSource,
+           (unsigned long long)nReceiveCount);
+}
+
+void BlockRequestTraceReorg(int peer,
+                            const uint256& hashFork, int nForkHeight,
+                            const uint256& hashOldBest, int nOldHeight,
+                            const uint256& hashNewBest, int nNewHeight,
+                            const std::vector<uint256>& vDisconnect,
+                            const std::vector<uint256>& vConnect,
+                            const std::string& strOldTrust,
+                            const std::string& strNewTrust)
+{
+    if (!fBlockRequestTraceEnabled)
+        return;
+    const uint256 hashDisconnectFirst = vDisconnect.empty() ? uint256(0) : vDisconnect.front();
+    const uint256 hashDisconnectLast = vDisconnect.empty() ? uint256(0) : vDisconnect.back();
+    const uint256 hashConnectFirst = vConnect.empty() ? uint256(0) : vConnect.front();
+    const uint256 hashConnectLast = vConnect.empty() ? uint256(0) : vConnect.back();
+    printf("SYNC_EVENT time_us=%lld event=REORG peer=%d fork_hash=%s fork_height=%d old_best_hash=%s old_height=%d old_trust=%s new_best_hash=%s new_height=%d new_trust=%s disconnect_count=%zu disconnect_first=%s disconnect_last=%s connect_count=%zu connect_first=%s connect_last=%s\n",
+           (long long)GetTimeMicros(), peer,
+           hashFork.ToString().c_str(), nForkHeight,
+           hashOldBest.ToString().c_str(), nOldHeight,
+           strOldTrust.c_str(),
+           hashNewBest.ToString().c_str(), nNewHeight,
+           strNewTrust.c_str(),
+           vDisconnect.size(),
+           hashDisconnectFirst.ToString().c_str(),
+           hashDisconnectLast.ToString().c_str(),
+           vConnect.size(),
+           hashConnectFirst.ToString().c_str(),
+           hashConnectLast.ToString().c_str());
+}
+
+void BlockRequestTraceContinuityBreakReset()
+{
+    LOCK(cs_blockRequestTrace);
+    fContinuityBreakEmitted = false;
+}
+
+bool BlockRequestTraceContinuityBreak(CNode* pnode,
+                                      const uint256& hashBlock,
+                                      const uint256& hashPrev,
+                                      int nLocalHeight,
+                                      const uint256& hashLocalTip,
+                                      int64_t nLastAcceptedAgeSeconds,
+                                      int nPeerBestHeight,
+                                      const uint256& hashPeerBest,
+                                      bool fPrevInOrphans,
+                                      bool fPrevInFlight,
+                                      bool fPrevQueued,
+                                      bool fPrevOwnerClaimed,
+                                      int nPrevOwnerPeer,
+                                      const char* pszPrevOwnerState,
+                                      int nOrphanCountPeer,
+                                      size_t nOrphanCountGlobal,
+                                      int nTipAncestorOfPeerBest)
+{
+    if (!fBlockRequestTraceEnabled || pnode == NULL)
+        return false;
+    {
+        LOCK(cs_blockRequestTrace);
+        if (fContinuityBreakEmitted)
+            return false;
+    }
+    const int64_t nIntervalMs = GetArg("-continuitybreakms", 60000);
+    // -1 means no block has connected in this process yet; that is the normal
+    // startup transient (first blocks are still being bootstrapped), not a
+    // continuity break, so it never fires the event.
+    if (nLastAcceptedAgeSeconds < 0)
+        return false;
+    if (nLastAcceptedAgeSeconds * 1000 < nIntervalMs)
+        return false;
+
+    uint64_t nRequestCount = 0;
+    uint64_t nSendCount = 0;
+    uint64_t nReceiveCount = 0;
+    const char* pszFirstRequestSource = "none";
+    {
+        LOCK(cs_blockRequestTrace);
+        fContinuityBreakEmitted = true;
+        BlockRequestTraceEntry* entry =
+            BlockRequestTraceGetLocked(hashBlock, GetTimeMicros(), false);
+        if (entry)
+        {
+            nRequestCount = entry->requestCount;
+            nSendCount = entry->sendCount;
+            nReceiveCount = entry->receiveCount;
+            if (entry->firstRequestSource != BLOCKREQ_SOURCE_OTHER)
+                pszFirstRequestSource =
+                    BlockRequestTraceSourceName(entry->firstRequestSource);
+        }
+    }
+
+    uint256 hashRejected;
+    int64_t nLastProgressAge = -1;
+    unsigned int nRecoveryAttempts = 0;
+    {
+        LOCK(cs_stalledSyncRecovery);
+        hashRejected = stalledSyncRecoveryState.RejectedBlock();
+        nRecoveryAttempts = stalledSyncRecoveryState.RecoveryAttempts();
+        if (stalledSyncRecoveryState.LastProgressTime() != 0)
+            nLastProgressAge = std::max<int64_t>(0, GetTime() - stalledSyncRecoveryState.LastProgressTime());
+    }
+
+    printf("SYNC_EVENT time_us=%lld event=FIRST_CONTINUITY_BREAK peer=%d addr=%s block_hash=%s block_prev=%s local_tip=%s local_height=%d last_accepted_age_s=%lld block_requested=%d request_count=%llu send_count=%llu receive_count=%llu first_request_source=%s peer_best_height=%d peer_best_hash=%s prev_in_orphans=%d prev_in_flight=%d prev_queued=%d prev_owner_claimed=%d prev_owner_peer=%d prev_owner_state=%s orphan_count_peer=%d orphan_count_global=%zu askfor_peer=%u deferred_peer=%u inflight_peer=%u getblocks_queued=%u hash_continue=%s last_getblocks_age_s=%lld batch_received=%d batch_expected=%d prefetch_sent=%d tip_ancestor_of_peer_best=%d rejected_retry_hash=%s recovery_attempts=%u recovery_last_progress_age_s=%lld\n",
+           (long long)GetTimeMicros(), pnode->GetId(),
+           BlockRequestTracePeerAddress(pnode).c_str(),
+           hashBlock.ToString().c_str(), hashPrev.ToString().c_str(),
+           hashLocalTip.ToString().c_str(), nLocalHeight,
+           (long long)nLastAcceptedAgeSeconds,
+           (nRequestCount != 0 || nSendCount != 0) ? 1 : 0,
+           (unsigned long long)nRequestCount,
+           (unsigned long long)nSendCount,
+           (unsigned long long)nReceiveCount,
+           pszFirstRequestSource,
+           nPeerBestHeight, hashPeerBest.ToString().c_str(),
+           fPrevInOrphans ? 1 : 0,
+           fPrevInFlight ? 1 : 0,
+           fPrevQueued ? 1 : 0,
+           fPrevOwnerClaimed ? 1 : 0,
+           nPrevOwnerPeer,
+           pszPrevOwnerState ? pszPrevOwnerState : "none",
+           nOrphanCountPeer, nOrphanCountGlobal,
+           (unsigned int)pnode->setAskForBlocks.size(),
+           (unsigned int)pnode->deferredBlockInv.size(),
+           (unsigned int)pnode->setBlocksInFlight.size(),
+           (unsigned int)pnode->getBlocksIndex.size(),
+           pnode->hashContinue.ToString().c_str(),
+           (long long)(pnode->nLastGetBlocksTime == 0
+                           ? -1 : std::max<int64_t>(0, GetTime() - pnode->nLastGetBlocksTime)),
+           pnode->nBlocksReceivedInBatch, pnode->nExpectedBatchSize,
+           pnode->fPrefetchSent ? 1 : 0,
+           nTipAncestorOfPeerBest,
+           hashRejected.ToString().c_str(),
+           nRecoveryAttempts,
+           (long long)nLastProgressAge);
+    return true;
+}
+
+// Hashes whose parent was requested via the orphan missing-parent path and is
+// still awaited. Protected by cs_blockRequestTrace. Declared early so
+// InitBlockRequestTrace can clear it.
+
+void BlockRequestTraceMissingParentRequest(CNode* pnode,
+                                           const uint256& orphanHash,
+                                           const uint256& orphanPrev,
+                                           const uint256& hashWanted,
+                                           bool fAdmitted,
+                                           bool fOwnerClaimed,
+                                           int nOrphanCountPeer,
+                                           size_t nOrphanCountGlobal)
+{
+    if (!fBlockRequestTraceEnabled || pnode == NULL)
+        return;
+    {
+        LOCK(cs_blockRequestTrace);
+        if (setMissingParentWanted.size() >= 65536)
+            setMissingParentWanted.clear();
+        setMissingParentWanted.insert(hashWanted);
+    }
+    printf("SYNC_EVENT time_us=%lld event=MISSING_PARENT_REQUEST peer=%d addr=%s orphan_hash=%s orphan_prev=%s wanted=%s admitted=%d owner_claimed=%d orphan_count_peer=%d orphan_count_global=%zu local_height=%d\n",
+           (long long)GetTimeMicros(), pnode->GetId(),
+           BlockRequestTracePeerAddress(pnode).c_str(),
+           orphanHash.ToString().c_str(), orphanPrev.ToString().c_str(),
+           hashWanted.ToString().c_str(),
+           fAdmitted ? 1 : 0, fOwnerClaimed ? 1 : 0,
+           nOrphanCountPeer, nOrphanCountGlobal,
+           nBestHeight);
+}
+
+bool BlockRequestTraceMissingParentResolved(CNode* pnode,
+                                            const uint256& hashBlock,
+                                            bool fAccepted,
+                                            int nHeightAfter)
+{
+    if (!fBlockRequestTraceEnabled || pnode == NULL)
+        return false;
+    uint64_t nSendCount = 0;
+    const char* pszResult = "unknown";
+    {
+        LOCK(cs_blockRequestTrace);
+        if (setMissingParentWanted.erase(hashBlock) == 0)
+            return false;
+        BlockRequestTraceEntry* entry =
+            BlockRequestTraceGetLocked(hashBlock, GetTimeMicros(), false);
+        if (entry)
+        {
+            nSendCount = entry->sendCount;
+            pszResult = BlockRequestTraceResultName(entry->lastResult);
+        }
+    }
+    printf("SYNC_EVENT time_us=%lld event=MISSING_PARENT_RESOLVED peer=%d addr=%s hash=%s result=%s accepted=%d height=%d getdata_sent=%d\n",
+           (long long)GetTimeMicros(), pnode->GetId(),
+           BlockRequestTracePeerAddress(pnode).c_str(),
+           hashBlock.ToString().c_str(),
+           pszResult ? pszResult : "unknown",
+           fAccepted ? 1 : 0, nHeightAfter,
+           nSendCount != 0 ? 1 : 0);
+    return true;
+}
+
+bool BlockRequestTraceOrphanWatermark(int peer, int nCount, const char* pszAction)
+{
+    if (!fBlockRequestTraceEnabled || peer < 0)
+        return false;
+    static std::map<int, int> mapLastOrphanWatermark;
+    int nWatermark;
+    int nLastWatermark;
+    {
+        LOCK(cs_blockRequestTrace);
+        nWatermark = ContinuityWatermarkForCount(nCount);
+        std::map<int, int>::iterator it = mapLastOrphanWatermark.find(peer);
+        nLastWatermark = it == mapLastOrphanWatermark.end() ? 0 : it->second;
+        if (nWatermark == nLastWatermark)
+            return false;
+        if (nWatermark == 0 && nCount < nLastWatermark / 2)
+            it->second = 0;
+        else
+            mapLastOrphanWatermark[peer] = std::max(nLastWatermark, nWatermark);
+        nLastWatermark = std::max(nLastWatermark, nWatermark);
+    }
+    printf("BLOCKREQTRACE time_us=%lld event=ORPHAN_WATERMARK peer=%d action=%s count=%d watermark=%d\n",
+           (long long)GetTimeMicros(), peer, pszAction ? pszAction : "?", nCount, nLastWatermark);
+    return true;
+}
+
+bool BlockRequestTraceDeferredWatermark(int peer, int nCount, const char* pszAction)
+{
+    if (!fBlockRequestTraceEnabled || peer < 0)
+        return false;
+    static std::map<int, int> mapLastDeferredWatermark;
+    int nWatermark;
+    int nLastWatermark;
+    {
+        LOCK(cs_blockRequestTrace);
+        nWatermark = ContinuityWatermarkForCount(nCount);
+        std::map<int, int>::iterator it = mapLastDeferredWatermark.find(peer);
+        nLastWatermark = it == mapLastDeferredWatermark.end() ? 0 : it->second;
+        if (nWatermark == nLastWatermark)
+            return false;
+        if (nWatermark == 0 && nCount < nLastWatermark / 2)
+            it->second = 0;
+        else
+            mapLastDeferredWatermark[peer] = std::max(nLastWatermark, nWatermark);
+        nLastWatermark = std::max(nLastWatermark, nWatermark);
+    }
+    printf("BLOCKREQTRACE time_us=%lld event=DEFERRED_WATERMARK peer=%d action=%s count=%d watermark=%d\n",
+           (long long)GetTimeMicros(), peer, pszAction ? pszAction : "?", nCount, nLastWatermark);
+    return true;
+}
 
 static deque<string> vOneShots;
 CCriticalSection cs_vOneShots;

@@ -405,6 +405,15 @@ int GetDeferredBlockRequestBudget(CNode* pfrom,
                                   int* pnGlobalActivePressure = NULL);
 size_t RefillDeferredBlockRequests(CNode* pfrom);
 
+// Admit a block INV into the request pipeline now (budget permitting), or
+// defer it for a later refill pump.  When fFrontierCandidate is true and the
+// budget is zero solely because of orphan pressure, exactly one such INV --
+// the first unknown block of a frontier getblocks response -- may bypass the
+// budget through the single-slot frontier admission exemption.  Returns true
+// if the INV was admitted (or asked for outright outside IBD).
+bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
+                             bool fFrontierCandidate = false);
+
 extern int nLastFinalizedHeight;
 extern uint256 hashLastFinalized;
 extern CCriticalSection cs_finality;

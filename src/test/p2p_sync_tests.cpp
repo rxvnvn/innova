@@ -7,6 +7,11 @@
 #include <string>
 #include <vector>
 
+#ifndef WIN32
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <boost/test/unit_test.hpp>
 #include <boost/thread/barrier.hpp>
 #include <boost/thread/thread.hpp>
@@ -30,6 +35,37 @@ static CAddress TestPeerAddress(unsigned int nPeer)
     addr.s_addr = 0x0100007f + (nPeer << 24);
     return CAddress(CService(addr, GetDefaultPort()));
 }
+
+// SendMessages' optimistic-write path (SocketSendData) performs a real send()
+// on the peer socket, which fails and disconnects the peer when the socket is
+// INVALID_SOCKET.  Install a live socket pair so such peers remain connected
+// long enough to be eligible for stalled-sync recovery.
+class ScopedPeerSocket
+{
+public:
+    explicit ScopedPeerSocket(CNode& node) : nPeerSide(-1)
+    {
+#ifndef WIN32
+        int sv[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0)
+        {
+            node.hSocket = sv[0];
+            nPeerSide = sv[1];
+        }
+#endif
+    }
+
+    ~ScopedPeerSocket()
+    {
+#ifndef WIN32
+        if (nPeerSide >= 0)
+            close(nPeerSide);
+#endif
+    }
+
+private:
+    int nPeerSide;
+};
 
 static void PreparePeerForSendMessages(CNode& node, int nVersion)
 {
@@ -350,22 +386,29 @@ BOOST_AUTO_TEST_CASE(block_askfor_has_one_global_active_owner)
     peer1.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
     peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer1, hash), 1U);
-    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 1U);
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peer1.GetId(), BLOCKREQ_SOURCE_INV));
+    peer1.MarkBlockInFlight(hash);
     NodeId ownerPeer = -1;
     BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
     BOOST_CHECK(GetBlockRequestOwner(hash, &ownerPeer, &ownerState));
     BOOST_CHECK_EQUAL(ownerPeer, peer1.GetId());
-    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
 
-    peer1.EraseAskForEntry(peer1.mapAskFor.begin());
+    peer1.EraseAskForEntry(peer1.mapAskFor.begin(), false);
+    peer2.ClearAskFor();
     peer2.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
-    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer2, hash), 0U);
 
     const uint256 hashTx(4005);
     peer1.AskFor(CInv(MSG_TX, hashTx), BLOCKREQ_SOURCE_INV);
     peer1.AskFor(CInv(MSG_TX, hashTx), BLOCKREQ_SOURCE_ORPHAN);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer1, hash), 0U);
     BOOST_CHECK_EQUAL(peer1.mapAskFor.size(), 2U);
+    peer1.ClearAskFor();
+    peer2.ClearAskFor();
 }
 
 BOOST_AUTO_TEST_CASE(block_askfor_owner_releases_after_receive)
@@ -376,6 +419,7 @@ BOOST_AUTO_TEST_CASE(block_askfor_owner_releases_after_receive)
     CNode peer2(INVALID_SOCKET, TestPeerAddress(44), "owner-peer-two", true);
 
     peer1.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peer1.GetId(), BLOCKREQ_SOURCE_INV));
     peer1.MarkBlockInFlight(hash);
     peer1.EraseAskForEntry(peer1.mapAskFor.begin(), false);
     peer1.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_ORPHAN);
@@ -1102,6 +1146,199 @@ BOOST_AUTO_TEST_CASE(orphan_limit_reject_does_not_retry_every_five_seconds)
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashRejectedAtLimit), 0U);
 }
 
+BOOST_AUTO_TEST_CASE(ordinary_getblocks_initial_sync_arms_recovery)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+    const bool fSPVModeSaved = fSPVMode;
+    fSPVMode = false;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(60), "arm-initial-sync", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    ScopedPeerSocket peerSocket(peer);
+    std::vector<CNode*> peers(1, &peer);
+
+    ResetSyncPeerForTesting();
+    ResetStalledSyncRecoveryStateForTesting();
+    StartSyncForTesting(peers);
+    BOOST_CHECK(peer.fStartSync);
+    BOOST_CHECK(SendMessages(&peer, true));
+    BOOST_CHECK(SendMessages(&peer, true));
+
+    CStalledSyncRecoveryState& state =
+        GetStalledSyncRecoveryStateForTesting();
+    BOOST_CHECK(state.SyncRequestSent());
+    BOOST_CHECK_EQUAL(state.LastObservedHeight(), nBestHeight);
+    BOOST_CHECK(state.LastProgressTime() != 0);
+
+    // Armed with a static height and an empty pipeline, recovery must fire
+    // once the stall timeout elapses.  The recovery getblocks is the same
+    // locator sent during SendMessages, so clear the peer's real-clock dedup
+    // window (a genuine stall is always >= stall-timeout seconds old).
+    peer.nLastGetBlocksTime = 0;
+    std::string reason;
+    CNode* owner = MaybeQueueStalledSyncRecovery(
+        peers, pindexBest, nBestHeight, GetTime() + STALL_TIMEOUT + 1,
+        STALL_TIMEOUT, RECOVERY_COOLDOWN, state, &reason);
+    BOOST_REQUIRE(owner != NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+
+    ResetSyncPeerForTesting();
+    fSPVMode = fSPVModeSaved;
+}
+
+BOOST_AUTO_TEST_CASE(ordinary_getblocks_non_initial_arms_recovery)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    const bool fSPVModeSaved = fSPVMode;
+    fSPVMode = false;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(61), "arm-non-initial", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    ScopedPeerSocket peerSocket(peer);
+    std::vector<CNode*> peers(1, &peer);
+
+    ResetStalledSyncRecoveryStateForTesting();
+    // A non-initial, INV/orphan-continuation style getblocks: pushed directly,
+    // never gated on the peer's initial-sync lifecycle flags.
+    peer.PushGetBlocks(pindexBest, uint256(0));
+    BOOST_CHECK(!peer.fInitialSyncRequestPending);
+    BOOST_CHECK(SendMessages(&peer, true));
+
+    CStalledSyncRecoveryState& state =
+        GetStalledSyncRecoveryStateForTesting();
+    BOOST_CHECK(state.SyncRequestSent());
+    BOOST_CHECK_EQUAL(state.LastObservedHeight(), nBestHeight);
+    BOOST_CHECK(state.LastProgressTime() != 0);
+
+    // A getblocks committed to a peer that cannot advance block sync must NOT
+    // arm the recovery state: arming is tied to an ahead peer.
+    ResetStalledSyncRecoveryStateForTesting();
+    CNode behindPeer(INVALID_SOCKET, TestPeerAddress(62), "arm-behind", true);
+    PreparePeerForRecovery(behindPeer, PROTOCOL_VERSION, nBestHeight - 1);
+    behindPeer.PushGetBlocks(pindexBest, uint256(0));
+    BOOST_CHECK(SendMessages(&behindPeer, true));
+    BOOST_CHECK(!GetStalledSyncRecoveryStateForTesting().SyncRequestSent());
+
+    fSPVMode = fSPVModeSaved;
+}
+
+BOOST_AUTO_TEST_CASE(recovery_tagged_getblocks_preserves_state)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    const bool fSPVModeSaved = fSPVMode;
+    fSPVMode = false;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(63), "arm-recovery-tagged", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    ScopedPeerSocket peerSocket(peer);
+    std::vector<CNode*> peers(1, &peer);
+
+    ResetStalledSyncRecoveryStateForTesting();
+    CStalledSyncRecoveryState& state =
+        GetStalledSyncRecoveryStateForTesting();
+    state.MarkSyncRequestSent(TEST_TIME);
+
+    // A recovery-tagged getblocks must neither re-arm nor reset the timer.
+    peer.nRecoveryTracePendingId = 4242;
+    peer.PushGetBlocks(pindexBest, uint256(0));
+    BOOST_CHECK(SendMessages(&peer, true));
+
+    BOOST_CHECK(state.SyncRequestSent());
+    BOOST_CHECK_EQUAL(state.LastProgressTime(), TEST_TIME);
+    BOOST_CHECK_EQUAL(state.LastObservedHeight(), nBestHeight);
+    BOOST_CHECK_EQUAL(state.RecoveryAttempts(), 0U);
+
+    fSPVMode = fSPVModeSaved;
+}
+
+BOOST_AUTO_TEST_CASE(unarmed_state_reports_sync_request_not_sent)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(64), "unarmed-recovery-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers(1, &peer);
+    CStalledSyncRecoveryState state; // never armed
+
+    std::string reason;
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME + 100,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state, &reason) == NULL);
+    BOOST_CHECK_EQUAL(reason, "sync_request_not_sent");
+
+    // A differing height must NOT masquerade as the cause while unarmed.
+    reason.clear();
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight + 7, TEST_TIME + 100,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state, &reason) == NULL);
+    BOOST_CHECK_EQUAL(reason, "sync_request_not_sent");
+}
+
+BOOST_AUTO_TEST_CASE(armed_state_reaches_recovery_on_empty_pipeline)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(65), "armed-empty-pipeline", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers(1, &peer);
+    CStalledSyncRecoveryState state;
+    state.MarkSyncRequestSent(TEST_TIME);
+
+    std::string reason;
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, TEST_TIME,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state, &reason) == NULL);
+    BOOST_CHECK_EQUAL(reason, "stall_timeout_not_reached");
+
+    CNode* owner = MaybeQueueStalledSyncRecovery(
+        peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
+        STALL_TIMEOUT, RECOVERY_COOLDOWN, state);
+    BOOST_REQUIRE(owner != NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(height_advance_resets_stall_timer)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(66), "height-advance-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers(1, &peer);
+    CStalledSyncRecoveryState state;
+    state.MarkSyncRequestSent(TEST_TIME);
+
+    // A real height advance resets the stall timer: recovery is suppressed
+    // even though the pre-advance stall window has long since elapsed.
+    const int64_t nAdvanceTime = TEST_TIME + 40;
+    std::string reason;
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight + 1, nAdvanceTime,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state, &reason) == NULL);
+    BOOST_CHECK_EQUAL(reason, "local_height_changed");
+    BOOST_CHECK_EQUAL(state.LastObservedHeight(), nBestHeight + 1);
+    BOOST_CHECK_EQUAL(state.LastProgressTime(), nAdvanceTime);
+
+    // Nothing fires until a full fresh timeout window from the reset.
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight + 1,
+                    nAdvanceTime + STALL_TIMEOUT - 1,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+
+    CNode* owner = MaybeQueueStalledSyncRecovery(
+        peers, pindexBest, nBestHeight + 1, nAdvanceTime + STALL_TIMEOUT + 1,
+        STALL_TIMEOUT, RECOVERY_COOLDOWN, state);
+    BOOST_REQUIRE(owner != NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+}
+
 BOOST_AUTO_TEST_CASE(orphan_capacity_release_allows_deferred_block_retry)
 {
     BOOST_REQUIRE(pindexBest != NULL);
@@ -1777,6 +2014,7 @@ BOOST_AUTO_TEST_CASE(already_asked_for_lifecycle_is_cross_peer_safe)
 
     const CInv inv(MSG_BLOCK, uint256(400000));
     owner.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(TryAssignBlockRequestOwner(inv.hash, owner.GetId(), BLOCKREQ_SOURCE_INV));
     {
         LOCK(cs_vNodes);
         vNodes.push_back(&owner);
@@ -1959,12 +2197,15 @@ BOOST_AUTO_TEST_CASE(orphan_recovery_exempt_under_projected_pressure)
     }
     peer.AskFor(parent, BLOCKREQ_SOURCE_ORPHAN);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, parent.hash), 1U);
+    BOOST_CHECK(TryAssignBlockRequestOwner(parent.hash, peer.GetId(), BLOCKREQ_SOURCE_ORPHAN));
+    peer.MarkBlockInFlight(parent.hash);
     NodeId ownerPeer = -1;
     BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
     BOOST_CHECK(GetBlockRequestOwner(parent.hash, &ownerPeer, &ownerState));
     BOOST_CHECK_EQUAL(ownerPeer, peer.GetId());
-    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
     peer.ClearAskFor();
+    peer.ClearBlockInFlight(parent.hash);
 }
 
 BOOST_AUTO_TEST_CASE(no_double_count_between_queued_and_sent)
@@ -2054,6 +2295,8 @@ BOOST_AUTO_TEST_CASE(cross_peer_parent_ownership_preserved)
     const CInv parent(MSG_BLOCK, uint256(800010));
 
     owner.AskFor(parent, BLOCKREQ_SOURCE_ORPHAN);
+    BOOST_CHECK(TryAssignBlockRequestOwner(parent.hash, owner.GetId(), BLOCKREQ_SOURCE_ORPHAN));
+    owner.MarkBlockInFlight(parent.hash);
     other.AskFor(parent, BLOCKREQ_SOURCE_ORPHAN);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(owner, parent.hash), 1U);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(other, parent.hash), 0U);
@@ -2061,7 +2304,7 @@ BOOST_AUTO_TEST_CASE(cross_peer_parent_ownership_preserved)
     BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
     BOOST_CHECK(GetBlockRequestOwner(parent.hash, &ownerPeer, &ownerState));
     BOOST_CHECK_EQUAL(ownerPeer, owner.GetId());
-    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
     owner.ClearAskFor();
 }
 
@@ -2291,6 +2534,7 @@ BOOST_AUTO_TEST_CASE(inflight_limit_preserves_askfor_order)
     BOOST_CHECK(it->second.hash == hashC); ++it;
     BOOST_CHECK(it->second.hash == hashD);
     BOOST_CHECK_EQUAL(peer.mapAskFor.begin()->first, nBaseKey);
+    BOOST_CHECK(!GetBlockRequestOwner(hashP, NULL, NULL));
 
     peer.ClearBlockInFlight(uint256(7000));
     BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 127U);
@@ -2300,6 +2544,14 @@ BOOST_AUTO_TEST_CASE(inflight_limit_preserves_askfor_order)
     it = peer.mapAskFor.begin();
     BOOST_CHECK(it->second.hash == hashC); ++it;
     BOOST_CHECK(it->second.hash == hashD);
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(hashP, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peer.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    BOOST_CHECK(!GetBlockRequestOwner(hashC, NULL, NULL));
+    peer.ClearAskFor();
+    peer.ClearBlockInFlight(hashP);
 }
 
 
@@ -2423,11 +2675,7 @@ BOOST_AUTO_TEST_CASE(deferred_inv_is_eventually_admitted_after_window_drain)
     }
     BOOST_CHECK_EQUAL(peer.deferredBlockInv.size(), 0U);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, deferred), 1U);
-    NodeId ownerPeer = -1;
-    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
-    BOOST_CHECK(GetBlockRequestOwner(deferred, &ownerPeer, &ownerState));
-    BOOST_CHECK_EQUAL(ownerPeer, peer.GetId());
-    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    BOOST_CHECK(!GetBlockRequestOwner(deferred, NULL, NULL));
     peer.ClearAskFor();
 }
 
@@ -2452,11 +2700,12 @@ BOOST_AUTO_TEST_CASE(deferred_hash_has_no_owner_before_admission)
     BOOST_CHECK_EQUAL(mapAlreadyAskedFor.count(CInv(MSG_BLOCK, hash)), 0U);
 }
 
-BOOST_AUTO_TEST_CASE(ownership_is_assigned_on_admission_only)
+BOOST_AUTO_TEST_CASE(ownership_is_claimed_on_getdata_send_only)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
     CScopedOrphanCountByNode isolatedOrphanCounts;
     CNode peer(INVALID_SOCKET, TestPeerAddress(66), "deferred-owner-admit", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 100);
     CScopedInitialBlockDownloadState ibdState(&peer);
     const uint256 hash(920005);
 
@@ -2466,12 +2715,18 @@ BOOST_AUTO_TEST_CASE(ownership_is_assigned_on_admission_only)
         LOCK(cs_main);
         BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&peer), 1U);
     }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hash), 1U);
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+
+    BOOST_CHECK(SendMessages(&peer, true));
+    BOOST_CHECK(HasCommand(SentCommands(peer), "getdata"));
     NodeId ownerPeer = -1;
-    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
     BOOST_CHECK(GetBlockRequestOwner(hash, &ownerPeer, &ownerState));
     BOOST_CHECK_EQUAL(ownerPeer, peer.GetId());
-    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
     peer.ClearAskFor();
+    peer.ClearBlockInFlight(hash);
 }
 
 BOOST_AUTO_TEST_CASE(already_known_hash_is_removed_during_refill)
@@ -2502,7 +2757,8 @@ BOOST_AUTO_TEST_CASE(active_owned_hash_is_not_duplicate_admitted)
     const uint256 owned(920006);
     const uint256 available(920007);
 
-    owner.AskFor(CInv(MSG_BLOCK, owned), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(TryAssignBlockRequestOwner(owned, owner.GetId(), BLOCKREQ_SOURCE_INV));
+    owner.MarkBlockInFlight(owned);
     BOOST_REQUIRE(peer.DeferBlockInv(owned));
     BOOST_REQUIRE(peer.DeferBlockInv(available));
     {
@@ -2558,7 +2814,8 @@ BOOST_AUTO_TEST_CASE(single_blocked_hash_does_not_stall_sliding_window)
     const uint256 nextA(950002);
     const uint256 nextB(950003);
 
-    owner.AskFor(CInv(MSG_BLOCK, blocked), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(TryAssignBlockRequestOwner(blocked, owner.GetId(), BLOCKREQ_SOURCE_INV));
+    owner.MarkBlockInFlight(blocked);
     BOOST_REQUIRE(peer.DeferBlockInv(blocked));
     BOOST_REQUIRE(peer.DeferBlockInv(nextA));
     BOOST_REQUIRE(peer.DeferBlockInv(nextB));
@@ -2597,13 +2854,14 @@ BOOST_AUTO_TEST_CASE(cross_peer_ownership_remains_correct)
     CNode peer(INVALID_SOCKET, TestPeerAddress(77), "cross-deferred", true);
     const uint256 hash(950006);
 
-    owner.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, owner.GetId(), BLOCKREQ_SOURCE_INV));
+    owner.MarkBlockInFlight(hash);
     BOOST_REQUIRE(peer.DeferBlockInv(hash));
     NodeId ownerPeer = -1;
     BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
     BOOST_CHECK(GetBlockRequestOwner(hash, &ownerPeer, &ownerState));
     BOOST_CHECK_EQUAL(ownerPeer, owner.GetId());
-    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_QUEUED);
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hash), 0U);
     owner.ClearAskFor();
 }
@@ -2664,6 +2922,8 @@ BOOST_AUTO_TEST_CASE(cross_peer_ownership_blocks_already_asked_erase)
 
     const CInv inv(MSG_BLOCK, hash);
     owner.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, owner.GetId(), BLOCKREQ_SOURCE_INV));
+    owner.MarkBlockInFlight(hash);
 
     BOOST_CHECK(!EraseAlreadyAskedForIfUnowned(inv));
     {
@@ -2708,7 +2968,7 @@ BOOST_AUTO_TEST_CASE(disconnect_cleans_up_block_request_owners)
     const uint256 hashB(5004);
     CNode peer(INVALID_SOCKET, TestPeerAddress(83), "disconnect-owner", true);
 
-    peer.AskFor(CInv(MSG_BLOCK, hashA), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK(TryAssignBlockRequestOwner(hashA, peer.GetId(), BLOCKREQ_SOURCE_INV));
     BOOST_CHECK(TryAssignBlockRequestOwner(hashB, peer.GetId(), BLOCKREQ_SOURCE_INV));
     peer.MarkBlockInFlight(hashB);
 
@@ -2802,6 +3062,341 @@ BOOST_AUTO_TEST_CASE(concurrent_cs_vnodes_and_cs_vsend_no_deadlock)
 
     t.join();
     BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hash), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(continuity_break_is_one_shot_and_interval_gated)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    BOOST_REQUIRE(InitBlockRequestTrace(true, ""));
+
+    const std::map<std::string, std::string> mapArgsSaved = mapArgs;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(91), "continuity-peer", true);
+    const uint256 hash(910001);
+    const uint256 prev(910002);
+    const uint256 tip(910003);
+    const uint256 peerBest(910004);
+
+    // Default interval (60s): a recent acceptance suppresses the event.
+    mapArgs["-continuitybreakms"] = "60000";
+    BOOST_CHECK(!BlockRequestTraceContinuityBreak(
+        &peer, hash, prev, 100, tip, 10, 200, peerBest,
+        false, false, false, false, -1, "none", 0, 0, 1));
+
+    // No block ever connected (-1): startup transient, always suppressed.
+    mapArgs["-continuitybreakms"] = "0";
+    BOOST_CHECK(!BlockRequestTraceContinuityBreak(
+        &peer, hash, prev, 100, tip, -1, 200, peerBest,
+        false, false, false, false, -1, "none", 0, 0, 1));
+
+    // Once the gap exceeds the interval the event fires exactly once.
+    mapArgs["-continuitybreakms"] = "0";
+    BOOST_CHECK(BlockRequestTraceContinuityBreak(
+        &peer, hash, prev, 100, tip, 120, 200, peerBest,
+        true, false, true, true, 7, "queued", 3, 5, 0));
+    BOOST_CHECK(!BlockRequestTraceContinuityBreak(
+        &peer, hash, prev, 100, tip, 120, 200, peerBest,
+        true, false, true, true, 7, "queued", 3, 5, 0));
+
+    // Re-enabling the trace resets the one-shot gate.
+    BOOST_CHECK(InitBlockRequestTrace(false, ""));
+    BOOST_CHECK(InitBlockRequestTrace(true, ""));
+    BOOST_CHECK(BlockRequestTraceContinuityBreak(
+        &peer, hash, prev, 100, tip, 120, 200, peerBest,
+        false, false, false, false, -1, "none", 0, 0, 1));
+
+    // Disabled trace: never fires.
+    BOOST_CHECK(InitBlockRequestTrace(false, ""));
+    BOOST_CHECK(!BlockRequestTraceContinuityBreak(
+        &peer, hash, prev, 100, tip, 120, 200, peerBest,
+        false, false, false, false, -1, "none", 0, 0, 1));
+
+    mapArgs = mapArgsSaved;
+    fPrintToConsole = fPrintToConsoleSaved;
+}
+
+BOOST_AUTO_TEST_CASE(missing_parent_request_resolution_lifecycle)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    BOOST_REQUIRE(InitBlockRequestTrace(true, ""));
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(92), "missing-parent-peer", true);
+    const uint256 orphan(920001);
+    const uint256 orphanPrev(920002);
+    const uint256 wanted(920003);
+
+    // Nothing pending yet -> no resolution reported.
+    BOOST_CHECK(!BlockRequestTraceMissingParentResolved(&peer, wanted, true, 101));
+
+    BlockRequestTraceMissingParentRequest(&peer, orphan, orphanPrev, wanted,
+                                          true, true, 2, 3);
+
+    // Arrival of the wanted hash resolves the pending request.
+    BOOST_CHECK(BlockRequestTraceMissingParentResolved(&peer, wanted, true, 101));
+    // A second delivery of the same hash is not a pending request anymore.
+    BOOST_CHECK(!BlockRequestTraceMissingParentResolved(&peer, wanted, true, 101));
+
+    BOOST_CHECK(InitBlockRequestTrace(false, ""));
+    fPrintToConsole = fPrintToConsoleSaved;
+}
+
+BOOST_AUTO_TEST_CASE(watermark_events_fire_at_thresholds)
+{
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    BOOST_REQUIRE(InitBlockRequestTrace(true, ""));
+
+    const int peer = 901;
+    BOOST_CHECK(!BlockRequestTraceOrphanWatermark(peer, 10, "add"));
+    BOOST_CHECK(BlockRequestTraceOrphanWatermark(peer, 64, "add"));
+    BOOST_CHECK(!BlockRequestTraceOrphanWatermark(peer, 65, "add"));
+    BOOST_CHECK(BlockRequestTraceOrphanWatermark(peer, 128, "add"));
+    BOOST_CHECK(BlockRequestTraceOrphanWatermark(peer, 256, "add"));
+    BOOST_CHECK(BlockRequestTraceOrphanWatermark(peer, 512, "add"));
+    BOOST_CHECK(BlockRequestTraceOrphanWatermark(peer, 700, "add"));
+    BOOST_CHECK(BlockRequestTraceOrphanWatermark(peer, 750, "add"));
+
+    BOOST_CHECK(!BlockRequestTraceDeferredWatermark(peer, 63, "add"));
+    BOOST_CHECK(BlockRequestTraceDeferredWatermark(peer, 64, "add"));
+
+    BOOST_CHECK(InitBlockRequestTrace(false, ""));
+    fPrintToConsole = fPrintToConsoleSaved;
+}
+
+// --- Frontier admission exemption -----------------------------------------
+//
+// Reproduces the runtime fixed point proven in doc/forensics: during IBD the
+// active tip H is present; the getblocks response announced H+1 as its first
+// unknown block inv; the announcing peer's orphan count makes the deferred
+// budget zero; ordinary admission is denied and the INV would otherwise be
+// deferred (and eventually dropped).  The frontier exemption admits exactly
+// one such candidate so the connectable block is requested, and clears the
+// slot when the block is received, after which drained pressure resumes
+// ordinary deferred admission.
+
+class CScopedFrontierState
+{
+public:
+    CScopedFrontierState()
+    {
+        ClearFrontierCandidate();
+    }
+
+    ~CScopedFrontierState()
+    {
+        ClearFrontierCandidate();
+    }
+};
+
+BOOST_AUTO_TEST_CASE(frontier_admission_breaks_orphan_pressure_fixed_point)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFrontierState isolatedFrontier;
+
+    const uint256 hashFrontier(910001);
+    const uint256 hashUnrelated(910002);
+    const CInv invFrontier(MSG_BLOCK, hashFrontier);
+    const CInv invUnrelated(MSG_BLOCK, hashUnrelated);
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(60), "frontier-fixed-point", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = 200;
+    }
+    peer.fFrontierResponsePending = true;
+    peer.nFrontierLocatorHeight = nBestHeight;
+
+    // Ordinary admission is denied: orphan pressure zeroes the budget.
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!TryAdmitBlockInvOrDefer(&peer, invUnrelated, false));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashUnrelated), 0U);
+    BOOST_CHECK(peer.IsBlockInvDeferred(hashUnrelated));
+
+    // The frontier candidate (first unknown block inv of the active-tip-locator
+    // getblocks response) bypasses the zero budget and is queued for getdata.
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(TryAdmitBlockInvOrDefer(&peer, invFrontier, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashFrontier), 1U);
+    BOOST_CHECK(!peer.IsBlockInvDeferred(hashFrontier));
+
+    // Simulate the full receive path: ownership assigned on getdata send,
+    // then the block arrives and releases the request.  The receive clears
+    // the frontier slot (ClearBlockInFlight -> ReleaseBlockRequestOwner, and
+    // ProcessMessage's ReleaseBlockRequestOwnerOnReceive).
+    BOOST_CHECK(TryAssignBlockRequestOwner(hashFrontier, peer.GetId(),
+                                           BLOCKREQ_SOURCE_ASKFOR));
+    peer.MarkBlockInFlight(hashFrontier);
+    peer.ClearBlockInFlight(hashFrontier);
+    ReleaseBlockRequestOwnerOnReceive(hashFrontier, peer.GetId());
+
+    // Pressure drained: ordinary deferred admission resumes.
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = 10;
+        BOOST_CHECK(TryAdmitBlockInvOrDefer(&peer, invUnrelated, false));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashUnrelated), 1U);
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(frontier_exemption_holds_single_slot_across_peers)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFrontierState isolatedFrontier;
+
+    const uint256 hashFrontier(910011);
+    const uint256 hashSecond(910012);
+    const CInv invFrontier(MSG_BLOCK, hashFrontier);
+    const CInv invSecond(MSG_BLOCK, hashSecond);
+
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(62), "frontier-slot-a", true);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(63), "frontier-slot-b", true);
+    peerA.fFrontierResponsePending = true;
+    peerA.nFrontierLocatorHeight = nBestHeight;
+    peerB.fFrontierResponsePending = true;
+    peerB.nFrontierLocatorHeight = nBestHeight;
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peerA.GetId()] = 200;
+        mapOrphanCountByNode[peerB.GetId()] = 200;
+    }
+
+    // Exactly one exemption outstanding: A claims it for H+1...
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(TryAdmitBlockInvOrDefer(&peerA, invFrontier, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, hashFrontier), 1U);
+
+    // ...so a different frontier candidate from another peer is refused while
+    // the slot is busy, despite an identical zero-budget situation.
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!TryAdmitBlockInvOrDefer(&peerB, invSecond, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerB, hashSecond), 0U);
+    BOOST_CHECK(peerB.IsBlockInvDeferred(hashSecond));
+
+    // The same candidate re-offered by a different peer cannot duplicate the
+    // owned request.
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!TryAdmitBlockInvOrDefer(&peerB, invFrontier, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, hashFrontier), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerB, hashFrontier), 0U);
+
+    // Disconnect of the slot-holding peer releases the frontier state; a
+    // fresh candidate can then be admitted.
+    ReleaseBlockRequestOwnersForPeer(peerA.GetId(), "disconnect");
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(TryAdmitBlockInvOrDefer(&peerB, invSecond, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerB, hashSecond), 1U);
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(frontier_admission_refused_when_locator_is_stale)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFrontierState isolatedFrontier;
+
+    const uint256 hashFrontier(910021);
+    const CInv invFrontier(MSG_BLOCK, hashFrontier);
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(64), "frontier-stale-locator", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = 200;
+    }
+    peer.fFrontierResponsePending = true;
+    // The response was requested against a locator built from an earlier tip.
+    peer.nFrontierLocatorHeight = nBestHeight - 1;
+
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!TryAdmitBlockInvOrDefer(&peer, invFrontier, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashFrontier), 0U);
+    BOOST_CHECK(peer.IsBlockInvDeferred(hashFrontier));
+
+    // The old locator context is invalidated; a fresh frontier response with
+    // the current tip context is admitted.
+    peer.nFrontierLocatorHeight = nBestHeight;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(TryAdmitBlockInvOrDefer(&peer, invFrontier, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashFrontier), 1U);
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(frontier_admission_cannot_be_replayed_to_bypass_bound)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFrontierState isolatedFrontier;
+
+    const uint256 hashFrontier(910031);
+    const uint256 hashUnrelated(910032);
+    const CInv invFrontier(MSG_BLOCK, hashFrontier);
+    const CInv invUnrelated(MSG_BLOCK, hashUnrelated);
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(65), "frontier-replay-peer", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = 200;
+    }
+    peer.fFrontierResponsePending = true;
+    peer.nFrontierLocatorHeight = nBestHeight;
+
+    // First announcement claims the single slot and is admitted.
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(TryAdmitBlockInvOrDefer(&peer, invFrontier, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashFrontier), 1U);
+
+    // A malicious peer re-sends the same response (frontier flag re-armed) and
+    // the same candidate: the slot is already admitted, so no second grant.
+    peer.fFrontierResponsePending = true;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!TryAdmitBlockInvOrDefer(&peer, invFrontier, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashFrontier), 1U);
+
+    // Only the first unknown block inv of a response is offered the slot; a
+    // subsequent unrelated inv in the same response remains blocked.
+    peer.fFrontierResponsePending = true;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!TryAdmitBlockInvOrDefer(&peer, invUnrelated, true));
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashUnrelated), 0U);
+    BOOST_CHECK(peer.IsBlockInvDeferred(hashUnrelated));
+
+    peer.ClearAskFor();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

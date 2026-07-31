@@ -294,6 +294,7 @@ int main(int argc, char *argv[])
         BitcoinGUI window;
         guiref = &window;
         bool fStartMin = GetBoolArg("-min");
+#ifdef Q_OS_MAC
         window.setEnabled(false);
         // Prevent the window from appearing during initialization.
         // On macOS the constructor's calls to setUnifiedTitleAndToolBarOnMac,
@@ -302,6 +303,7 @@ int main(int argc, char *argv[])
         window.setAttribute(Qt::WA_DontShowOnScreen, true);
         window.hide();
         app.processEvents();
+#endif
 
         InitExecutor executor;
         QThread initThread;
@@ -338,7 +340,9 @@ int main(int argc, char *argv[])
                 window.setClientModel(&clientModel);
                 window.setWalletModel(&walletModel);
 
+#ifdef Q_OS_MAC
                 window.setAttribute(Qt::WA_DontShowOnScreen, false);
+#endif
                 window.setEnabled(true);
                 if (fStartMin)
                     window.showMinimized();

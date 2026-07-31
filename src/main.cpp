@@ -90,6 +90,11 @@ bool CollateralNReorgBlock = true;
 uint256 nBestChainTrust = 0;
 uint256 nBestInvalidTrust = 0;
 
+// Peer that delivered the block currently being processed on this thread.
+// Populated by ProcessBlock so trace hooks inside SetBestChain/Reorganize can
+// attribute tip advances and reorgs to the supplying peer.
+static NodeId g_nBlockTraceSourcePeer = -1;
+
 uint256 hashBestChain = 0;
 CBlockIndex* pindexBest = NULL;
 int64_t nTimeBestReceived = 0;
@@ -125,6 +130,30 @@ static int GetPeerOrphanCount(NodeId nodeid)
 {
     std::map<NodeId, int>::const_iterator it = mapOrphanCountByNode.find(nodeid);
     return it == mapOrphanCountByNode.end() ? 0 : it->second;
+}
+
+// Returns 1 when the local active-chain tip is an ancestor of the peer's
+// advertised best-known block, 0 when the peer is on a competing branch, and
+// -1 when the peer's best-known block is unknown or too deep to check.
+static int TipAncestorOfPeerBestKnown(const uint256& hashPeerBest)
+{
+    if (hashPeerBest == 0)
+        return -1;
+    std::map<uint256, CBlockIndex*>::const_iterator mi =
+        mapBlockIndex.find(hashPeerBest);
+    if (mi == mapBlockIndex.end())
+        return -1;
+    const CBlockIndex* pindex = mi->second;
+    if (pindex->nHeight < nBestHeight)
+        return 0;
+    for (int i = 0; pindex != NULL && i < 8000000; ++i, pindex = pindex->pprev)
+    {
+        if (pindex->nHeight == nBestHeight)
+            return (pindex->GetBlockHash() == hashBestChain) ? 1 : 0;
+        if (pindex->nHeight < nBestHeight)
+            return 0;
+    }
+    return -1;
 }
 
 bool ShouldSkipBlockInvForOrphanPressure(CNode* pfrom, const CInv& inv,
@@ -311,7 +340,8 @@ static bool DeferBlockInv(CNode* pfrom, const uint256& hash,
     return true;
 }
 
-static bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv)
+bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
+                             bool fFrontierCandidate)
 {
     AssertLockHeld(cs_main);
     if (pfrom == NULL || inv.type != MSG_BLOCK)
@@ -331,6 +361,30 @@ static bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv)
         &nSentBlockRequests, &nPeerActivePressure, &nGlobalActivePressure);
     if (nBudget <= 0)
     {
+        // Frontier admission exemption: permit exactly one block past a zero
+        // budget caused by orphan pressure.  The candidate is the first
+        // unknown block inv of a getblocks response that was requested with
+        // the current active-tip locator; see FrontierCandidateCanAdmit for
+        // the outstanding-count and locator-staleness bounds.  All other
+        // request invariants (AlreadyHave handled by the caller, block-request
+        // ownership, duplicate askfor state, orphan-limit cooldown, inflight
+        // cap, normal validation) are enforced by AskFor.
+        if (fFrontierCandidate &&
+            nOrphanCountPeer > 0 &&
+            nGlobalActivePressure < MAX_DEFERRED_INV_ACTIVE_GLOBAL &&
+            FrontierCandidateCanAdmit(GetTimeMicros(), pfrom->GetId(),
+                                      inv.hash, nBestHeight,
+                                      pfrom->nFrontierLocatorHeight))
+        {
+            if (BlockRequestTraceEnabled())
+                printf("BLOCKREQTRACE time_us=%lld event=FRONTIER_GRANT hash=%s peer=%d orphan_count_peer=%d global_active=%d budget=%d\n",
+                       (long long)GetTimeMicros(), inv.hash.ToString().c_str(),
+                       pfrom->GetId(), nOrphanCountPeer,
+                       nGlobalActivePressure, nBudget);
+            pfrom->RemoveDeferredBlockInv(inv.hash);
+            pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+            return true;
+        }
         if (BlockRequestTraceEnabled())
         {
             BlockRequestTraceAskSkipOrphanPressure(
@@ -5767,6 +5821,25 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     printf("REORGANIZE: Disconnect %" PRIszu" blocks; %s..%s\n", vDisconnect.size(), pfork->GetBlockHash().ToString().substr(0,20).c_str(), pindexBest->GetBlockHash().ToString().substr(0,20).c_str());
     printf("REORGANIZE: Connect %" PRIszu" blocks; %s..%s\n", vConnect.size(), pfork->GetBlockHash().ToString().substr(0,20).c_str(), pindexNew->GetBlockHash().ToString().substr(0,20).c_str());
 
+    if (SyncTraceEnabled())
+    {
+        std::vector<uint256> vDisconnectHashes;
+        vDisconnectHashes.reserve(vDisconnect.size());
+        for (CBlockIndex* pindex : vDisconnect)
+            vDisconnectHashes.push_back(pindex->GetBlockHash());
+        std::vector<uint256> vConnectHashes;
+        vConnectHashes.reserve(vConnect.size());
+        for (CBlockIndex* pindex : vConnect)
+            vConnectHashes.push_back(pindex->GetBlockHash());
+        BlockRequestTraceReorg(
+            g_nBlockTraceSourcePeer,
+            pfork->GetBlockHash(), pfork->nHeight,
+            pindexBest->GetBlockHash(), pindexBest->nHeight,
+            pindexNew->GetBlockHash(), pindexNew->nHeight,
+            vDisconnectHashes, vConnectHashes,
+            CBigNum(pindexBest->nChainTrust).ToString(),
+            CBigNum(pindexNew->nChainTrust).ToString());
+    }
 
 
     // Disconnect shorter branch
@@ -5933,6 +6006,9 @@ bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
 bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
 {
     uint256 hash = GetHash();
+    const uint256 hashOldBest = hashBestChain;
+    const int nOldBestHeight = nBestHeight;
+    const bool fReorgPath = (hashPrevBlock != hashOldBest);
     if (!txdb.TxnBegin())
         return error("SetBestChain() : TxnBegin failed");
 
@@ -6040,6 +6116,10 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     nBestChainTrust = pindexNew->nChainTrust;
     nTimeBestReceived = GetTime();
     mempool.AddTransactionsUpdated(1);
+    // A new active tip invalidates the locator context of any pending
+    // frontier getblocks response; refuse the exemption rather than admit a
+    // block whose connection point has moved.
+    InvalidateFrontierOnTipChange();
 
     uint256 nBestBlockTrust = (pindexBest->nHeight != 0 && pindexBest->pprev != NULL) ? (pindexBest->nChainTrust - pindexBest->pprev->nChainTrust) : pindexBest->nChainTrust;
 
@@ -6049,10 +6129,10 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
       nBestBlockTrust.Get64(),
       DateTimeStrFormat("%x %H:%M:%S", pindexBest->GetBlockTime()).c_str());
     if (SyncTraceEnabled())
-        printf("SYNC_EVENT time_us=%lld event=SETBESTCHAIN_COMMIT hash=%s height=%d block_time=%lld\n",
-               (long long)GetTimeMicros(),
-               hashBestChain.ToString().c_str(), nBestHeight,
-               (long long)pindexBest->GetBlockTime());
+        BlockRequestTraceSetBestChainCommit(
+            g_nBlockTraceSourcePeer, hashOldBest, nOldBestHeight,
+            hashBestChain, nBestHeight, fReorgPath,
+            (int64_t)pindexBest->GetBlockTime());
 
     nTimeBestReceived = GetTime();
 
@@ -6722,6 +6802,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 {
     AssertLockHeld(cs_main);
 
+    g_nBlockTraceSourcePeer = pfrom ? pfrom->GetId() : -1;
     int64_t nStartTime = GetTimeMillis();
     // Check for duplicate
     uint256 hash = pblock->GetHash();
@@ -6866,6 +6947,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         if (pfrom) {
             mapOrphanBlocksByNode[hash] = pfrom->GetId();
             mapOrphanCountByNode[pfrom->GetId()]++;
+            BlockRequestTraceOrphanWatermark(
+                pfrom->GetId(), mapOrphanCountByNode[pfrom->GetId()], "add");
         }
 
         // Ask this guy to fill in what we're missing
@@ -6882,6 +6965,20 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             pfrom->AskFor(
                 CInv(MSG_BLOCK, hashWanted),
                 BLOCKREQ_SOURCE_ORPHAN);
+            if (SyncTraceEnabled())
+            {
+                const bool fAdmitted = pfrom->IsBlockAskForQueued(hashWanted);
+                NodeId nOwnerPeer = -1;
+                BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+                const bool fOwnerClaimed =
+                    GetBlockRequestOwner(hashWanted, &nOwnerPeer, &ownerState) &&
+                    nOwnerPeer == pfrom->GetId();
+                BlockRequestTraceMissingParentRequest(
+                    pfrom, hash, pblock->hashPrevBlock, hashWanted,
+                    fAdmitted, fOwnerClaimed,
+                    GetPeerOrphanCount(pfrom->GetId()),
+                    mapOrphanBlocks.size());
+            }
         }
         return true;
     }
@@ -6914,6 +7011,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             map<uint256, NodeId>::iterator nodeIt = mapOrphanBlocksByNode.find(orphanHash);
             if (nodeIt != mapOrphanBlocksByNode.end()) {
                 mapOrphanCountByNode[nodeIt->second]--;
+                BlockRequestTraceOrphanWatermark(
+                    nodeIt->second, mapOrphanCountByNode[nodeIt->second], "remove");
                 mapOrphanBlocksByNode.erase(nodeIt);
             }
 
@@ -8145,6 +8244,15 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (fObserveRecovery)
             recoveryObservation.total_inv = vInv.size();
 
+        // Consume the pending frontier getblocks expectation.  If this inv
+        // message is a response to a getblocks that was requested with the
+        // current active-tip locator, its first unknown block inv is the IBD
+        // frontier candidate and is offered the single-slot admission
+        // exemption (see FrontierCandidateCanAdmit).
+        const bool fFrontierResponse = pfrom->fFrontierResponsePending;
+        pfrom->fFrontierResponsePending = false;
+        bool fFrontierSlotOffered = false;
+
         for (unsigned int nInv = 0; nInv < vInv.size(); nInv++)
         {
             const CInv &inv = vInv[nInv];
@@ -8192,7 +8300,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
             if (!fAlreadyHave) {
                 if (inv.type == MSG_BLOCK)
-                    TryAdmitBlockInvOrDefer(pfrom, inv);
+                {
+                    const bool fFrontierCandidate =
+                        fFrontierResponse && !fFrontierSlotOffered;
+                    fFrontierSlotOffered =
+                        fFrontierSlotOffered || fFrontierCandidate;
+                    TryAdmitBlockInvOrDefer(pfrom, inv, fFrontierCandidate);
+                }
                 else
                     pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
             }
@@ -8961,6 +9075,34 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             BlockRequestTraceInFlightClear(
                 pfrom, hashBlock, "receive",
                 nSenderInFlightAge, fKnownBefore);
+            if (fMissingPrevBefore)
+            {
+                const int64_t nLastAcceptedAge =
+                    nTimeBestReceived > 0
+                        ? std::max<int64_t>(0, GetTime() - nTimeBestReceived)
+                        : -1;
+                NodeId nPrevOwnerPeer = -1;
+                BlockRequestOwnerState prevOwnerState =
+                    BLOCK_REQUEST_OWNER_QUEUED;
+                const bool fPrevOwnerKnown =
+                    GetBlockRequestOwner(block.hashPrevBlock,
+                                         &nPrevOwnerPeer, &prevOwnerState);
+                BlockRequestTraceContinuityBreak(
+                    pfrom, hashBlock, block.hashPrevBlock,
+                    nBestHeight, hashBestChain,
+                    nLastAcceptedAge,
+                    pfrom->nBestKnownHeight,
+                    pfrom->hashBestKnownBlock,
+                    mapOrphanBlocks.count(block.hashPrevBlock) != 0,
+                    pfrom->setBlocksInFlight.count(block.hashPrevBlock) != 0,
+                    pfrom->IsBlockAskForQueued(block.hashPrevBlock),
+                    fPrevOwnerKnown && nPrevOwnerPeer == pfrom->GetId(),
+                    nPrevOwnerPeer,
+                    BlockRequestOwnerStateName(prevOwnerState),
+                    GetPeerOrphanCount(pfrom->GetId()),
+                    mapOrphanBlocks.size(),
+                    TipAncestorOfPeerBestKnown(pfrom->hashBestKnownBlock));
+            }
         }
         bool fAccepted = ProcessBlock(pfrom, &block);
         bool fEffRetryRecorded = false;
@@ -9043,6 +9185,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pfrom, hashBlock, traceResult, fAccepted,
                 fIndexedAfter, fActiveChainAfter,
                 fBestChainAfter, nHeightAfter);
+            BlockRequestTraceMissingParentResolved(
+                pfrom, hashBlock, fAccepted, nHeightAfter);
         }
 
         if (IBDEfficiencyTraceEnabled())
@@ -9723,12 +9867,32 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             RecoveryTraceSend(pto, nRecoveryId, pto->getBlocksIndex[i],
                               pto->getBlocksHash[i], n);
             pto->PushMessage("getblocks", CBlockLocator(pto->getBlocksIndex[i]), pto->getBlocksHash[i]);
+            // Arm the frontier response expectation when the flushed request
+            // used the current active-tip locator (index == best and no stop
+            // hash).  Its first unknown block inv may be admitted past a zero
+            // deferred budget so the connectable frontier block can be
+            // requested; the exemption is invalidated if the tip advances.
+            if (pto->getBlocksIndex[i] == pindexBest &&
+                pto->getBlocksHash[i] == uint256(0))
+            {
+                pto->fFrontierResponsePending = true;
+                pto->nFrontierLocatorHeight =
+                    pindexBest ? pindexBest->nHeight : -1;
+            }
             if (nRecoveryId == 0 && pto->fInitialSyncRequestPending)
             {
                 pto->fInitialSyncRequestPending = false;
                 pto->fInitialSyncRequestSent = true;
-                RecordSyncRequestSent(GetTime());
             }
+            // This is the narrowest common point at which ANY block-sync
+            // getblocks has actually been committed for transmission: every
+            // source (initial sync, INV/orphan continuation, checkpoints,
+            // wallet rescan) funnels through PushGetBlocks and is flushed
+            // here.  Arm stalled-sync recovery exactly once per ordinary
+            // (non-recovery) request to a peer that can advance block sync.
+            RecordOrdinaryGetBlocksCommitted(
+                GetTime(), nRecoveryId,
+                pto->CanAdvanceBlockSync(nBestHeight));
         }
         pto->getBlocksIndex.clear();
         pto->getBlocksHash.clear();
@@ -9994,18 +10158,6 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
                     continue;
                 }
-                if (!fHasOwner &&
-                    !TryAssignBlockRequestOwner(
-                        inv.hash, pto->GetId(), BLOCKREQ_SOURCE_ASKFOR,
-                        &nOwnerPeer, &ownerState))
-                {
-                    if (fTraceBlockRequest)
-                        BlockRequestTraceGetDataSkip(
-                            pto, inv.hash, nOwnerPeer,
-                            BlockRequestOwnerStateName(ownerState));
-                    pto->EraseAskForEntry(pto->mapAskFor.begin());
-                    continue;
-                }
                 if (pto->setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
                 {
                     break;
@@ -10036,6 +10188,23 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             }
             if (!fSkip)
             {
+                if (fBlockRequest)
+                {
+                    NodeId nOwnerPeer = -1;
+                    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+                    if (!TryAssignBlockRequestOwner(
+                            inv.hash, pto->GetId(), BLOCKREQ_SOURCE_ASKFOR,
+                            &nOwnerPeer, &ownerState))
+                    {
+                        if (fTraceBlockRequest)
+                            BlockRequestTraceGetDataSkip(
+                                pto, inv.hash, nOwnerPeer,
+                                BlockRequestOwnerStateName(ownerState));
+                        pto->EraseAskForEntry(pto->mapAskFor.begin());
+                        EraseAlreadyAskedForIfUnowned(inv);
+                        continue;
+                    }
+                }
                 if (fDebugNet)
                     printf("sending getdata: %s\n", inv.ToString().c_str());
                 vGetData.push_back(inv);
@@ -10099,12 +10268,6 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             pto->nLastGetDataTime = GetTime();
             pto->PushMessage("getdata", vGetData);
         }
-    }
-
-    {
-        TRY_LOCK(cs_main, lockDeferredRefill);
-        if (lockDeferredRefill)
-            RefillDeferredBlockRequests(pto);
     }
 
     return true;
