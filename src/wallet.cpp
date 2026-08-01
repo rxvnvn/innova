@@ -2059,7 +2059,7 @@ void CWallet::RequestSPVTransactions(CNode* pnode, int nStartHeight)
 
         if (pindex)
         {
-            pnode->PushGetBlocks(pindex, uint256(0));
+            pnode->PushGetBlocks(pindex, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_WALLET_RESCAN);
             printf("SPV: Requested filtered blocks from height %d\n", pindex->nHeight);
         }
 

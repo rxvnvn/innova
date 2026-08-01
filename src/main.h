@@ -397,6 +397,13 @@ bool ShouldSkipBlockInvForOrphanPressure(CNode* pfrom, const CInv& inv,
                                           int* pnQueuedBlockRequests = NULL,
                                           int* pnSentBlockRequests = NULL,
                                           int* pnProjectedPressure = NULL);
+// Hard per-peer orphan storage cap check.  True once a peer's stored orphan
+// count reaches MAX_ORPHAN_BLOCKS_PER_PEER; the peer is then refused further
+// orphan storage until the count drops.  This is the sole enforcement point
+// for the storage cap now that the request scheduler budget ignores orphan
+// pressure.
+bool PeerOrphanStorageLimitExceeded(NodeId peer,
+                                    int* pnOrphanCountPeer = NULL);
 int GetDeferredBlockRequestBudget(CNode* pfrom,
                                   int* pnOrphanCountPeer = NULL,
                                   int* pnQueuedBlockRequests = NULL,
@@ -406,11 +413,14 @@ int GetDeferredBlockRequestBudget(CNode* pfrom,
 size_t RefillDeferredBlockRequests(CNode* pfrom);
 
 // Admit a block INV into the request pipeline now (budget permitting), or
-// defer it for a later refill pump.  When fFrontierCandidate is true and the
-// budget is zero solely because of orphan pressure, exactly one such INV --
-// the first unknown block of a frontier getblocks response -- may bypass the
-// budget through the single-slot frontier admission exemption.  Returns true
-// if the INV was admitted (or asked for outright outside IBD).
+// defer it for a later refill pump.  The budget reflects request pressure
+// only (queued + in-flight), never orphan storage pressure; orphan storage is
+// bounded separately by the hard storage caps on the receive path.  When
+// fFrontierCandidate is true and the budget is zero because the request
+// window is full, exactly one such INV -- the first unknown block of a
+// frontier getblocks response -- may bypass the budget through the
+// single-slot frontier admission exemption.  Returns true if the INV was
+// admitted (or asked for outright outside IBD).
 bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
                              bool fFrontierCandidate = false);
 

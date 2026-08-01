@@ -6,6 +6,7 @@
 #include "db.h"
 #include "net.h"
 #include "main.h"
+#include "ibdmetrics.h"
 #include "init.h"
 #include "strlcpy.h"
 #include "addrman.h"
@@ -53,6 +54,11 @@ static CCriticalSection cs_connectionRateLimit;
 static std::map<CNetAddr, std::vector<int64_t> > mapConnectionAttempts;
 
 static const int MAX_INBOUND_PER_NETGROUP = 4;           // Max inbound connections per /16 subnet
+
+std::atomic<uint64_t> g_pipeline_wake_requested_generation(0);
+std::atomic<uint64_t> g_pipeline_wake_handled_generation(0);
+std::atomic<uint32_t> g_pipeline_wake_cause_bits(0);
+std::atomic<int64_t> g_pipeline_wake_last_getblocks_time(0);
 
 void ThreadMessageHandler2(void* parg);
 void ThreadSocketHandler2(void* parg);
@@ -228,6 +234,121 @@ static bool CompareSyncCandidates(const std::pair<int64_t, CNode*>& a, const std
     if (a.first != b.first)
         return a.first > b.first;
     return a.second->GetId() < b.second->GetId();
+}
+
+static const int64_t PIPELINE_WAKE_GETBLOCKS_COOLDOWN = 1;
+
+struct PipelineWakeCandidate
+{
+    int64_t nScore;
+    CNode* pnode;
+
+    PipelineWakeCandidate(int64_t nScoreIn, CNode* pnodeIn)
+        : nScore(nScoreIn), pnode(pnodeIn) {}
+};
+
+struct PipelineWakeSnapshot
+{
+    size_t nQueuedBlocks;
+    size_t nInflightBlocks;
+    size_t nQueuedGetBlocks;
+    size_t nOutstandingGetBlocks;
+    size_t nDeferredInv;
+    CBlockIndex* pindexTip;
+    int nLocalHeight;
+    std::vector<CNode*> vDeferredPeers;
+    std::vector<PipelineWakeCandidate> vCandidates;
+
+    PipelineWakeSnapshot()
+        : nQueuedBlocks(0), nInflightBlocks(0), nQueuedGetBlocks(0),
+          nOutstandingGetBlocks(0), nDeferredInv(0), pindexTip(NULL),
+          nLocalHeight(-1) {}
+};
+
+static void RecordPipelineWakeOutcome(PipelineWakeOutcome outcome)
+{
+    ibdmetrics::Counters& c = ibdmetrics::Get();
+    switch (outcome)
+    {
+    case PIPELINE_WAKE_TRANSIENT_CS_MAIN_TRYLOCK_FAILED:
+        c.pipeline_wake_transient_cs_main_trylock_failed.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TRANSIENT_CS_VNODES_TRYLOCK_FAILED:
+        c.pipeline_wake_transient_cs_vnodes_trylock_failed.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TRANSIENT_COOLDOWN_ACTIVE:
+        c.pipeline_wake_transient_cooldown_active.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TRANSIENT_DEDUP_ALL:
+        c.pipeline_wake_transient_dedup_all.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TRANSIENT_INCOMPLETE_PEER_SCAN:
+        c.pipeline_wake_transient_incomplete_peer_scan.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TRANSIENT_SHUTDOWN:
+        c.pipeline_wake_transient_shutdown.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TERMINAL_NOT_IBD:
+        c.pipeline_wake_terminal_not_ibd.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TERMINAL_PIPELINE_NOT_EMPTY:
+        c.pipeline_wake_terminal_pipeline_not_empty.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TERMINAL_DEFERRED_REFILL_CREATED_WORK:
+        c.pipeline_wake_terminal_deferred_refill_created_work.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED:
+        c.pipeline_wake_terminal_getblocks_queued.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TERMINAL_NO_ELIGIBLE_AHEAD_PEER:
+        c.pipeline_wake_terminal_no_eligible_ahead_peer.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TERMINAL_EXISTING_QUEUED_GETBLOCKS:
+        c.pipeline_wake_terminal_existing_queued_getblocks.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_TERMINAL_OUTSTANDING_GETBLOCKS_PRESENT:
+        c.pipeline_wake_terminal_outstanding_getblocks_present.fetch_add(1, std::memory_order_relaxed);
+        break;
+    case PIPELINE_WAKE_OUTCOME_NONE:
+        break;
+    }
+}
+
+static bool IsPipelineWakeTerminal(PipelineWakeOutcome outcome)
+{
+    return outcome == PIPELINE_WAKE_TERMINAL_NOT_IBD ||
+           outcome == PIPELINE_WAKE_TERMINAL_PIPELINE_NOT_EMPTY ||
+           outcome == PIPELINE_WAKE_TERMINAL_DEFERRED_REFILL_CREATED_WORK ||
+           outcome == PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED ||
+           outcome == PIPELINE_WAKE_TERMINAL_NO_ELIGIBLE_AHEAD_PEER ||
+           outcome == PIPELINE_WAKE_TERMINAL_EXISTING_QUEUED_GETBLOCKS ||
+           outcome == PIPELINE_WAKE_TERMINAL_OUTSTANDING_GETBLOCKS_PRESENT;
+}
+
+static bool PipelineWakeOutcomeExpectsActiveRestoration(
+    PipelineWakeOutcome outcome)
+{
+    return outcome == PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED ||
+           outcome == PIPELINE_WAKE_TERMINAL_DEFERRED_REFILL_CREATED_WORK;
+}
+
+static bool ComparePipelineWakeCandidates(const PipelineWakeCandidate& a,
+                                          const PipelineWakeCandidate& b)
+{
+    if (a.nScore != b.nScore)
+        return a.nScore > b.nScore;
+    return a.pnode->GetId() < b.pnode->GetId();
+}
+
+static bool IsPipelineWakeDedupBlocked(const CNode* pnode,
+                                       CBlockIndex* pindexBegin,
+                                       const uint256& hashEnd,
+                                       int64_t nNow)
+{
+    return pnode->pindexLastGetBlocksBegin == pindexBegin &&
+           pnode->hashLastGetBlocksEnd == hashEnd &&
+           pnode->nLastGetBlocksTime != 0 &&
+           nNow - pnode->nLastGetBlocksTime < 5;
 }
 
 static std::string FormatPeerDiagnosticsSummary(const CNode* pnode, int64_t nNow)
@@ -829,6 +950,8 @@ bool CStalledSyncRecoveryState::ShouldRecover(
 
     nLastRecoveryTime = nNow;
     ++nRecoveryAttempts;
+    ibdmetrics::Get().stalled_recovery_attempts.fetch_add(
+        1, std::memory_order_relaxed);
     return true;
 }
 
@@ -1020,7 +1143,46 @@ void LogGetInfoSyncProbe(const char* pszEvent,
 
 RecoveryResponseWindowState::RecoveryResponseWindowState() : active(false), recovery_id(0), send_time_us(0), deadline_us(0), inv_message_count(0), total_inv(0), block_inv(0), unknown_blocks(0), known_active_blocks(0), known_nonactive_indexed_blocks(0), known_orphan_blocks(0), first_block_elapsed_us(-1), first_unknown_elapsed_us(-1) {}
 void RecoveryResponseWindowState::Start(uint64_t id, int64_t send_us) { active=true; recovery_id=id; send_time_us=send_us; deadline_us=send_us+RECOVERY_RESPONSE_WINDOW_US; inv_message_count=total_inv=block_inv=unknown_blocks=known_active_blocks=known_nonactive_indexed_blocks=known_orphan_blocks=0; first_block_hash=first_unknown_block_hash=0; first_block_elapsed_us=first_unknown_elapsed_us=-1; }
-bool RecoveryResponseWindowState::Finish(int64_t now, RecoveryResponseOutcome outcome, RecoveryResponseResult& r) { if(!active) return false; r.outcome=outcome; r.recovery_id=recovery_id; r.send_time_us=send_time_us; r.elapsed_us=now-send_time_us; r.inv_message_count=inv_message_count; r.total_inv=total_inv; r.block_inv=block_inv; r.unknown_blocks=unknown_blocks; r.known_active_blocks=known_active_blocks; r.known_nonactive_indexed_blocks=known_nonactive_indexed_blocks; r.known_orphan_blocks=known_orphan_blocks; r.first_block_hash=first_block_hash; r.first_unknown_block_hash=first_unknown_block_hash; r.first_block_elapsed_us=first_block_elapsed_us; r.first_unknown_elapsed_us=first_unknown_elapsed_us; active=false; return true; }
+bool RecoveryResponseWindowState::Finish(int64_t now, RecoveryResponseOutcome outcome, RecoveryResponseResult& r)
+{
+    if (!active)
+        return false;
+    r.outcome = outcome;
+    r.recovery_id = recovery_id;
+    r.send_time_us = send_time_us;
+    r.elapsed_us = now - send_time_us;
+    r.inv_message_count = inv_message_count;
+    r.total_inv = total_inv;
+    r.block_inv = block_inv;
+    r.unknown_blocks = unknown_blocks;
+    r.known_active_blocks = known_active_blocks;
+    r.known_nonactive_indexed_blocks = known_nonactive_indexed_blocks;
+    r.known_orphan_blocks = known_orphan_blocks;
+    r.first_block_hash = first_block_hash;
+    r.first_unknown_block_hash = first_unknown_block_hash;
+    r.first_block_elapsed_us = first_block_elapsed_us;
+    r.first_unknown_elapsed_us = first_unknown_elapsed_us;
+    switch (outcome)
+    {
+    case RECOVERY_OUTCOME_USEFUL:
+        ibdmetrics::Get().recovery_outcome_useful.fetch_add(
+            1, std::memory_order_relaxed);
+        break;
+    case RECOVERY_OUTCOME_KNOWN_ONLY_TIMEOUT:
+        ibdmetrics::Get().recovery_outcome_known_only.fetch_add(
+            1, std::memory_order_relaxed);
+        break;
+    case RECOVERY_OUTCOME_EMPTY_TIMEOUT:
+        ibdmetrics::Get().recovery_outcome_no_response.fetch_add(
+            1, std::memory_order_relaxed);
+        break;
+    case RECOVERY_OUTCOME_DISCONNECTED:
+    case RECOVERY_OUTCOME_SUPERSEDED_BY_NEXT_RECOVERY:
+        break;
+    }
+    active = false;
+    return true;
+}
 bool RecoveryResponseWindowState::ObserveInv(int64_t now,const RecoveryResponseObservation& o,RecoveryResponseResult& r) { if(!active) return false; if(now>=deadline_us) { Expire(now,r); return true; } ++inv_message_count; total_inv+=o.total_inv; block_inv+=o.block_inv; unknown_blocks+=o.unknown_blocks; known_active_blocks+=o.known_active_blocks; known_nonactive_indexed_blocks+=o.known_nonactive_indexed_blocks; known_orphan_blocks+=o.known_orphan_blocks; if(block_inv && first_block_hash==0 && o.first_block_hash!=0){first_block_hash=o.first_block_hash; first_block_elapsed_us=now-send_time_us;} if(unknown_blocks && first_unknown_block_hash==0 && o.first_unknown_block_hash!=0){first_unknown_block_hash=o.first_unknown_block_hash; first_unknown_elapsed_us=now-send_time_us;} return false; }
 bool RecoveryResponseWindowState::Expire(int64_t now,RecoveryResponseResult& r) { if(!active || now<deadline_us) return false; return Finish(now, unknown_blocks ? RECOVERY_OUTCOME_USEFUL : (block_inv ? RECOVERY_OUTCOME_KNOWN_ONLY_TIMEOUT : RECOVERY_OUTCOME_EMPTY_TIMEOUT), r); }
 bool RecoveryResponseWindowState::Supersede(int64_t now,RecoveryResponseResult& r) { return Finish(now, RECOVERY_OUTCOME_SUPERSEDED_BY_NEXT_RECOVERY, r); }
@@ -1061,12 +1223,12 @@ static uint64_t nNextRecoveryTraceId = 0;
 uint64_t RecoveryTraceTrigger(CNode* pnode, int nLocalHeight, int nPeerHeight,
                               int64_t nStallAge, unsigned int nAttempt)
 {
-    if (!BlockRequestTraceEnabled()) return 0;
     const uint64_t id = ++nNextRecoveryTraceId;
-    printf("RECOVERY_TRIGGER recovery_id=%llu time_us=%lld peer_id=%d peer_addr=%s peer_version=%d local_height=%d peer_height=%d stall_age=%lld recovery_attempt=%u\n",
-           (unsigned long long)id, (long long)GetTimeMicros(), pnode->GetId(),
-           pnode->addr.ToString().c_str(), pnode->nVersion, nLocalHeight,
-           nPeerHeight, (long long)nStallAge, nAttempt);
+    if (BlockRequestTraceEnabled())
+        printf("RECOVERY_TRIGGER recovery_id=%llu time_us=%lld peer_id=%d peer_addr=%s peer_version=%d local_height=%d peer_height=%d stall_age=%lld recovery_attempt=%u\n",
+               (unsigned long long)id, (long long)GetTimeMicros(), pnode->GetId(),
+               pnode->addr.ToString().c_str(), pnode->nVersion, nLocalHeight,
+               nPeerHeight, (long long)nStallAge, nAttempt);
     return id;
 }
 
@@ -1083,15 +1245,19 @@ void RecoveryTraceQueue(CNode* pnode, uint64_t id, CBlockIndex* pindexBegin,
 void RecoveryTraceSend(CNode* pnode, uint64_t id, CBlockIndex* pindexBegin,
                        uint256 hashStop, size_t before)
 {
-    if (!id || !BlockRequestTraceEnabled()) return;
-    printf("RECOVERY_GETBLOCKS_SEND recovery_id=%llu peer_id=%d locator_tip=%s locator_height=%d stop_hash=%s queue_size_before_clear=%zu\n",
-           (unsigned long long)id, pnode->GetId(),
-           pindexBegin ? pindexBegin->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(),
-           pindexBegin ? pindexBegin->nHeight : -1, hashStop.ToString().c_str(), before);
+    if (!id)
+        return;
+    const int64_t nNow = GetTimeMicros();
+    if (BlockRequestTraceEnabled())
+        printf("RECOVERY_GETBLOCKS_SEND recovery_id=%llu peer_id=%d locator_tip=%s locator_height=%d stop_hash=%s queue_size_before_clear=%zu\n",
+               (unsigned long long)id, pnode->GetId(),
+               pindexBegin ? pindexBegin->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(),
+               pindexBegin ? pindexBegin->nHeight : -1, hashStop.ToString().c_str(), before);
     RecoveryResponseResult previous;
-    if (pnode->SupersedeRecoveryResponseWindow(GetTimeMicros(), previous))
+    const bool fHadPrevious = pnode->SupersedeRecoveryResponseWindow(nNow, previous);
+    if (fHadPrevious && BlockRequestTraceEnabled())
         printf("%s\n", FormatRecoveryResponseSummary(pnode->GetId(), previous).c_str());
-    pnode->StartRecoveryResponseWindow(id, GetTimeMicros());
+    pnode->StartRecoveryResponseWindow(id, nNow);
 }
 
 CNode* MaybeQueueStalledSyncRecovery(
@@ -1135,6 +1301,8 @@ CNode* MaybeQueueStalledSyncRecovery(
             fPipelineActive = true;
         }
     }
+    ibdmetrics::SetEligibleAheadPeers((int64_t)vEligiblePeers.size());
+
     std::vector<std::pair<int64_t, CNode*> > vCandidates;
     BOOST_FOREACH(CNode* pnode, vEligiblePeers)
     {
@@ -1262,7 +1430,8 @@ CNode* MaybeQueueStalledSyncRecovery(
     pnodeRecovery->nRecoveryTracePendingId = RecoveryTraceTrigger(
         pnodeRecovery, nLocalHeight, (int)nMaxPeerHeight, nStallAgeBefore,
         state.RecoveryAttempts());
-    pnodeRecovery->PushGetBlocks(pindexTip, uint256(0));
+    pnodeRecovery->PushGetBlocks(
+        pindexTip, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_RECOVERY);
 
     uint256 hashRejected;
     if (state.TakeRejectedBlockForRetry(hashRejected))
@@ -1924,10 +2093,16 @@ bool FrontierCandidateCanAdmit(int64_t nNow, NodeId peer, const uint256& hash,
                                int nTipHeight, int nLocatorHeight)
 {
     if (peer < 0 || hash == 0)
+    {
+        ibdmetrics::Get().frontier_reject_other.fetch_add(
+            1, std::memory_order_relaxed);
         return false;
+    }
     LOCK(cs_mapAlreadyAskedFor);
     if (nTipHeight != nLocatorHeight)
     {
+        ibdmetrics::Get().frontier_reject_locator_stale.fetch_add(
+            1, std::memory_order_relaxed);
         if (BlockRequestTraceEnabled())
             printf("BLOCKREQTRACE time_us=%lld event=FRONTIER_DENY reason=locator-stale hash=%s peer=%d tip_height=%d locator_height=%d\n",
                    (long long)GetTimeMicros(), hash.ToString().c_str(), (int)peer,
@@ -1951,6 +2126,8 @@ bool FrontierCandidateCanAdmit(int64_t nNow, NodeId peer, const uint256& hash,
                 g_frontierAdmitted = true;
                 return true;
             }
+            ibdmetrics::Get().frontier_reject_already_admitted.fetch_add(
+                1, std::memory_order_relaxed);
             if (BlockRequestTraceEnabled())
                 printf("BLOCKREQTRACE time_us=%lld event=FRONTIER_DENY reason=already-admitted hash=%s peer=%d\n",
                        (long long)GetTimeMicros(), hash.ToString().c_str(), (int)peer);
@@ -1958,6 +2135,8 @@ bool FrontierCandidateCanAdmit(int64_t nNow, NodeId peer, const uint256& hash,
         }
         else
         {
+            ibdmetrics::Get().frontier_reject_slot_busy.fetch_add(
+                1, std::memory_order_relaxed);
             if (BlockRequestTraceEnabled())
                 printf("BLOCKREQTRACE time_us=%lld event=FRONTIER_DENY reason=slot-busy hash=%s peer=%d busy_hash=%s busy_peer=%d\n",
                        (long long)GetTimeMicros(), hash.ToString().c_str(), (int)peer,
@@ -2095,6 +2274,291 @@ size_t PruneAlreadyAskedFor(int64_t nNowMicros)
                (long long)nNowMicros, nRemoved, mapAlreadyAskedFor.size(),
                (long long)ALREADY_ASKED_FOR_RETENTION_US);
     return nRemoved;
+}
+
+void RequestBlockPipelineWake(uint32_t nCause)
+{
+    ibdmetrics::Counters& c = ibdmetrics::Get();
+    c.pipeline_wake_signals.fetch_add(1, std::memory_order_relaxed);
+
+    if (nCause & WAKE_CAUSE_CLEAR_INFLIGHT)
+        c.pipeline_wake_signal_clear_inflight.fetch_add(1, std::memory_order_relaxed);
+    if (nCause & WAKE_CAUSE_INFLIGHT_TIMEOUT)
+        c.pipeline_wake_signal_inflight_timeout.fetch_add(1, std::memory_order_relaxed);
+    if (nCause & WAKE_CAUSE_ASKFOR_ALREADY_HAVE)
+        c.pipeline_wake_signal_askfor_already_have.fetch_add(1, std::memory_order_relaxed);
+    if (nCause & WAKE_CAUSE_ASKFOR_OWNER_CONFLICT)
+        c.pipeline_wake_signal_askfor_owner_conflict.fetch_add(1, std::memory_order_relaxed);
+    if (nCause & WAKE_CAUSE_QUEUE_REMOVAL)
+        c.pipeline_wake_signal_queue_removal.fetch_add(1, std::memory_order_relaxed);
+    if (nCause & WAKE_CAUSE_CLEAR_ASKFOR)
+        c.pipeline_wake_signal_clear_askfor.fetch_add(1, std::memory_order_relaxed);
+    if (nCause & WAKE_CAUSE_DISCONNECT_CLEANUP)
+        c.pipeline_wake_signal_disconnect_cleanup.fetch_add(1, std::memory_order_relaxed);
+    if (nCause & WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED)
+        c.pipeline_wake_signal_getblocks_outstanding_cleared.fetch_add(1, std::memory_order_relaxed);
+    if (nCause & WAKE_CAUSE_OTHER)
+        c.pipeline_wake_signal_other.fetch_add(1, std::memory_order_relaxed);
+
+    const uint64_t nHandled = g_pipeline_wake_handled_generation.load(std::memory_order_relaxed);
+    const uint64_t nRequested = g_pipeline_wake_requested_generation.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (nRequested > nHandled + 1)
+        c.pipeline_wake_coalesced.fetch_add(1, std::memory_order_relaxed);
+    g_pipeline_wake_cause_bits.fetch_or(nCause, std::memory_order_relaxed);
+    int64_t nNoWakeStart = 0;
+    c.pipeline_wake_signal_start_ms.compare_exchange_strong(
+        nNoWakeStart, GetTimeMillis(), std::memory_order_relaxed);
+}
+
+// Test-only accessors for the pipeline-wake state machine globals.  These are
+// used exclusively by p2p_sync_tests to set up and tear down the latched wake
+// generation, cause bits, and getblocks cooldown timestamp deterministically.
+// Production call sites never touch them.
+void ResetPipelineWakeStateForTesting()
+{
+    g_pipeline_wake_requested_generation.store(0, std::memory_order_relaxed);
+    g_pipeline_wake_handled_generation.store(0, std::memory_order_relaxed);
+    g_pipeline_wake_cause_bits.store(0, std::memory_order_relaxed);
+    g_pipeline_wake_last_getblocks_time.store(0, std::memory_order_relaxed);
+}
+
+void GetPipelineWakeStateForTesting(uint64_t* pnRequestedGeneration,
+                                    uint64_t* pnHandledGeneration,
+                                    uint32_t* pnCauseBits,
+                                    int64_t* pnLastGetBlocksTime)
+{
+    if (pnRequestedGeneration)
+        *pnRequestedGeneration = g_pipeline_wake_requested_generation.load(
+            std::memory_order_relaxed);
+    if (pnHandledGeneration)
+        *pnHandledGeneration = g_pipeline_wake_handled_generation.load(
+            std::memory_order_relaxed);
+    if (pnCauseBits)
+        *pnCauseBits = g_pipeline_wake_cause_bits.load(
+            std::memory_order_relaxed);
+    if (pnLastGetBlocksTime)
+        *pnLastGetBlocksTime = g_pipeline_wake_last_getblocks_time.load(
+            std::memory_order_relaxed);
+}
+
+void SetPipelineWakeLastGetBlocksTimeForTesting(int64_t nTime)
+{
+    g_pipeline_wake_last_getblocks_time.store(nTime, std::memory_order_relaxed);
+}
+
+void SetPipelineWakeRequestedForTesting(uint64_t nRequestedGeneration,
+                                        uint64_t nHandledGeneration,
+                                        uint32_t nCauseBits)
+{
+    g_pipeline_wake_requested_generation.store(
+        nRequestedGeneration, std::memory_order_relaxed);
+    g_pipeline_wake_handled_generation.store(
+        nHandledGeneration, std::memory_order_relaxed);
+    g_pipeline_wake_cause_bits.store(nCauseBits, std::memory_order_relaxed);
+}
+
+PipelineWakeOutcome MaybeProcessPipelineWake(
+    const std::vector<CNode*>& vNodesCopy,
+    bool forceMainLockFailureForTest)
+{
+    const uint64_t nRequested =
+        g_pipeline_wake_requested_generation.load(std::memory_order_relaxed);
+    const uint64_t nHandled =
+        g_pipeline_wake_handled_generation.load(std::memory_order_relaxed);
+    if (nRequested <= nHandled)
+        return PIPELINE_WAKE_OUTCOME_NONE;
+
+    ibdmetrics::Get().pipeline_wake_handler_runs.fetch_add(
+        1, std::memory_order_relaxed);
+
+    if (fShutdown)
+    {
+        const PipelineWakeOutcome outcome = PIPELINE_WAKE_TRANSIENT_SHUTDOWN;
+        RecordPipelineWakeOutcome(outcome);
+        return outcome;
+    }
+
+    if (forceMainLockFailureForTest)
+    {
+        const PipelineWakeOutcome outcome =
+            PIPELINE_WAKE_TRANSIENT_CS_MAIN_TRYLOCK_FAILED;
+        RecordPipelineWakeOutcome(outcome);
+        return outcome;
+    }
+
+    PipelineWakeOutcome outcome = PIPELINE_WAKE_OUTCOME_NONE;
+    PipelineWakeSnapshot snapshot;
+
+    TRY_LOCK(cs_main, lockMain);
+    if (!lockMain)
+    {
+        outcome = PIPELINE_WAKE_TRANSIENT_CS_MAIN_TRYLOCK_FAILED;
+        RecordPipelineWakeOutcome(outcome);
+        return outcome;
+    }
+
+    {
+        TRY_LOCK(cs_vNodes, lockNodes);
+        if (!lockNodes)
+        {
+            outcome = PIPELINE_WAKE_TRANSIENT_CS_VNODES_TRYLOCK_FAILED;
+            RecordPipelineWakeOutcome(outcome);
+            return outcome;
+        }
+
+        if (!IsInitialBlockDownload() || fImporting || fReindex || fSPVMode ||
+            pindexBest == NULL)
+        {
+            outcome = PIPELINE_WAKE_TERMINAL_NOT_IBD;
+        }
+        else
+        {
+            snapshot.pindexTip = pindexBest;
+            snapshot.nLocalHeight = nBestHeight;
+            int64_t nMaxPeerHeight = -1;
+            const int64_t nNow = GetTime();
+            BOOST_FOREACH(CNode* pnode, vNodesCopy)
+            {
+                snapshot.nQueuedBlocks += pnode->setAskForBlocks.size();
+                snapshot.nInflightBlocks += pnode->setBlocksInFlight.size();
+                snapshot.nQueuedGetBlocks += pnode->getBlocksIndex.size();
+                snapshot.nOutstandingGetBlocks +=
+                    pnode->getBlocksOutstandingSources.size();
+                snapshot.nDeferredInv += pnode->deferredBlockInv.size();
+                if (!pnode->fDisconnect && pnode->fSuccessfullyConnected &&
+                    IsBlockSyncPeerVersion(pnode->nVersion) &&
+                    !pnode->fClient && !pnode->fOneShot &&
+                    pnode->CanAdvanceBlockSync(snapshot.nLocalHeight))
+                    nMaxPeerHeight = std::max(nMaxPeerHeight,
+                                               GetPeerAdvertisedHeight(pnode));
+            }
+
+            BOOST_FOREACH(CNode* pnode, vNodesCopy)
+            {
+                if (!pnode->fDisconnect && !pnode->deferredBlockInv.empty())
+                    snapshot.vDeferredPeers.push_back(pnode);
+
+                if (pnode->fDisconnect || !pnode->fSuccessfullyConnected ||
+                    !IsBlockSyncPeerVersion(pnode->nVersion) ||
+                    pnode->fClient || pnode->fOneShot ||
+                    !pnode->CanAdvanceBlockSync(snapshot.nLocalHeight) ||
+                    !pnode->getBlocksIndex.empty() ||
+                    !pnode->getBlocksOutstandingSources.empty())
+                    continue;
+
+                snapshot.vCandidates.push_back(PipelineWakeCandidate(
+                    SyncPeerScore(pnode, nNow, nMaxPeerHeight), pnode));
+            }
+        }
+    }
+
+    if (outcome == PIPELINE_WAKE_OUTCOME_NONE)
+    {
+        if (snapshot.nQueuedBlocks != 0 || snapshot.nInflightBlocks != 0)
+            outcome = PIPELINE_WAKE_TERMINAL_PIPELINE_NOT_EMPTY;
+        else if (snapshot.nQueuedGetBlocks != 0)
+            outcome = PIPELINE_WAKE_TERMINAL_EXISTING_QUEUED_GETBLOCKS;
+        else if (snapshot.nOutstandingGetBlocks != 0)
+            outcome = PIPELINE_WAKE_TERMINAL_OUTSTANDING_GETBLOCKS_PRESENT;
+    }
+
+    if (outcome == PIPELINE_WAKE_OUTCOME_NONE && snapshot.nDeferredInv != 0)
+    {
+        ibdmetrics::Get().pipeline_wake_refill_attempts.fetch_add(
+            1, std::memory_order_relaxed);
+        BOOST_FOREACH(CNode* pnode, snapshot.vDeferredPeers)
+        {
+            if (pnode->fDisconnect)
+                continue;
+            const size_t nAdmitted = RefillDeferredBlockRequests(pnode);
+            if (nAdmitted != 0)
+            {
+                ibdmetrics::Get().pipeline_wake_refill_admitted.fetch_add(
+                    nAdmitted, std::memory_order_relaxed);
+                outcome = PIPELINE_WAKE_TERMINAL_DEFERRED_REFILL_CREATED_WORK;
+                break;
+            }
+        }
+    }
+
+    if (outcome == PIPELINE_WAKE_OUTCOME_NONE)
+    {
+        const int64_t nNow = GetTime();
+        const int64_t nLastWakeGetBlocks =
+            g_pipeline_wake_last_getblocks_time.load(std::memory_order_relaxed);
+        if (nLastWakeGetBlocks != 0 &&
+            nNow - nLastWakeGetBlocks < PIPELINE_WAKE_GETBLOCKS_COOLDOWN)
+        {
+            outcome = PIPELINE_WAKE_TRANSIENT_COOLDOWN_ACTIVE;
+        }
+        else if (snapshot.vCandidates.empty())
+        {
+            outcome = PIPELINE_WAKE_TERMINAL_NO_ELIGIBLE_AHEAD_PEER;
+        }
+        else
+        {
+            std::sort(snapshot.vCandidates.begin(), snapshot.vCandidates.end(),
+                      ComparePipelineWakeCandidates);
+            const size_t nOffset =
+                (size_t)(nRequested % snapshot.vCandidates.size());
+            bool fAttemptedNonDedup = false;
+            for (size_t i = 0; i < snapshot.vCandidates.size(); ++i)
+            {
+                CNode* pnode =
+                    snapshot.vCandidates[(i + nOffset) %
+                                         snapshot.vCandidates.size()].pnode;
+                if (pnode->fDisconnect)
+                    continue;
+                if (IsPipelineWakeDedupBlocked(
+                        pnode, snapshot.pindexTip, uint256(0), nNow))
+                {
+                    ibdmetrics::Get().pipeline_wake_getblocks_dedup.fetch_add(
+                        1, std::memory_order_relaxed);
+                    continue;
+                }
+
+                fAttemptedNonDedup = true;
+                ibdmetrics::Get().pipeline_wake_getblocks_attempted.fetch_add(
+                    1, std::memory_order_relaxed);
+                const size_t nQueueBefore = pnode->getBlocksIndex.size();
+                pnode->PushGetBlocks(
+                    snapshot.pindexTip, uint256(0),
+                    ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
+                if (pnode->getBlocksIndex.size() > nQueueBefore)
+                {
+                    ibdmetrics::Get().pipeline_wake_getblocks_queued.fetch_add(
+                        1, std::memory_order_relaxed);
+                    g_pipeline_wake_last_getblocks_time.store(
+                        nNow, std::memory_order_relaxed);
+                    outcome = PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED;
+                    break;
+                }
+
+                ibdmetrics::Get().pipeline_wake_getblocks_dedup.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            if (outcome == PIPELINE_WAKE_OUTCOME_NONE)
+                outcome = fAttemptedNonDedup
+                    ? PIPELINE_WAKE_TRANSIENT_INCOMPLETE_PEER_SCAN
+                    : PIPELINE_WAKE_TRANSIENT_DEDUP_ALL;
+        }
+    }
+
+    RecordPipelineWakeOutcome(outcome);
+    if (IsPipelineWakeTerminal(outcome))
+    {
+        if (!PipelineWakeOutcomeExpectsActiveRestoration(outcome))
+        {
+            ibdmetrics::Get().pipeline_wake_signal_start_ms.store(
+                0, std::memory_order_relaxed);
+        }
+        g_pipeline_wake_handled_generation.store(
+            nRequested, std::memory_order_relaxed);
+        if (g_pipeline_wake_requested_generation.load(std::memory_order_relaxed)
+            <= nRequested)
+            g_pipeline_wake_cause_bits.store(0, std::memory_order_relaxed);
+    }
+    return outcome;
 }
 
 namespace {
@@ -3787,18 +4251,28 @@ void CNode::QueueInitialSyncRequest(CBlockIndex* pindexTip)
     if (fInitialSyncRequestPending || fInitialSyncRequestSent)
         return;
     const size_t nQueueBefore = getBlocksIndex.size();
-    PushGetBlocks(pindexTip, uint256(0));
+    PushGetBlocks(pindexTip, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
     if (getBlocksIndex.size() > nQueueBefore)
         fInitialSyncRequestPending = true;
 }
 
-void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
+void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
+                         ibdmetrics::GetBlocksSource source)
 {
     int64_t nNow = GetTime();
+    ibdmetrics::RecordGetBlocksDecision(source);
 
     if (pindexBegin == pindexLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd) {
+        ibdmetrics::Get().getblocks_identical_to_last_sent.fetch_add(
+            1, std::memory_order_relaxed);
         if (nNow - nLastGetBlocksTime < 5)
+        {
+            ibdmetrics::Get().pushgetblocks_dedup_5s_skips.fetch_add(
+                1, std::memory_order_relaxed);
+            ibdmetrics::Get().getblocks_dedup_skips.fetch_add(
+                1, std::memory_order_relaxed);
             return;
+        }
     }
 
     pindexLastGetBlocksBegin = pindexBegin;
@@ -3808,6 +4282,9 @@ void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
     const size_t nQueueBefore = getBlocksIndex.size();
     getBlocksIndex.push_back(pindexBegin);
     getBlocksHash.push_back(hashEnd);
+    getBlocksSources.push_back(source);
+    ibdmetrics::GetBlocksQueuedAdd(1, nQueueBefore == 0);
+    ibdmetrics::RecordGetBlocksQueueSuccess(source);
     const uint64_t nRecoveryId = nRecoveryTracePendingId;
     nRecoveryTracePendingId = 0;
     getBlocksRecoveryIds.push_back(nRecoveryId);
@@ -4425,9 +4902,84 @@ void CNode::CloseSocketDisconnect()
     }
 }
 
+bool CNode::ConsumeGetBlocksResponseFront()
+{
+    if (getBlocksOutstandingSources.empty())
+        return false;
+
+    getBlocksOutstandingSources.pop_front();
+    ibdmetrics::GetBlocksOutstandingAdd(-1);
+    if (getBlocksOutstandingSources.empty())
+        RequestBlockPipelineWake(WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED);
+    return true;
+}
+
+void CNode::ClearGetBlocksOutstandingForCleanup()
+{
+    if (getBlocksOutstandingSources.empty())
+        return;
+
+    const size_t nOutstanding = getBlocksOutstandingSources.size();
+    getBlocksOutstandingSources.clear();
+    ibdmetrics::GetBlocksOutstandingAdd(-(int64_t)nOutstanding);
+    ibdmetrics::Get().getblocks_no_response_disconnect_cleanup.fetch_add(
+        nOutstanding, std::memory_order_relaxed);
+    RequestBlockPipelineWake(
+        WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED |
+        WAKE_CAUSE_DISCONNECT_CLEANUP);
+}
+
 void CNode::Cleanup()
 {
     ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect");
+    if (!fIbdMetricsCleanupAccounted)
+    {
+        const bool fHadQueuedGetBlocks = !getBlocksIndex.empty();
+        const bool fHadActiveBlockWork =
+            !setAskForBlocks.empty() ||
+            !setBlocksInFlight.empty();
+        const bool fHadOutstandingGetBlocks =
+            !getBlocksOutstandingSources.empty();
+        fIbdMetricsCleanupAccounted = true;
+        if (!setAskForBlocks.empty())
+        {
+            ibdmetrics::QueuedAdd(-(int64_t)setAskForBlocks.size());
+            ibdmetrics::GlobalActiveAdd(
+                -(int64_t)setAskForBlocks.size(),
+                ibdmetrics::ACTIVE_DECREMENT_DISCONNECT_CLEANUP);
+        }
+        if (!setBlocksInFlight.empty())
+        {
+            ibdmetrics::InflightAdd(-(int64_t)setBlocksInFlight.size());
+            ibdmetrics::GlobalActiveAdd(
+                -(int64_t)setBlocksInFlight.size(),
+                ibdmetrics::ACTIVE_DECREMENT_DISCONNECT_CLEANUP);
+        }
+        if (!deferredBlockInv.empty())
+            ibdmetrics::DeferredAdd(-(int64_t)deferredBlockInv.size());
+        setAskForBlocks.clear();
+        setBlocksInFlight.clear();
+        if (fHadQueuedGetBlocks)
+        {
+            ibdmetrics::GetBlocksQueuedAdd(
+                -(int64_t)getBlocksIndex.size(), true);
+            ibdmetrics::Get().getblocks_queued_unsent_cleanup.fetch_add(
+                getBlocksIndex.size(), std::memory_order_relaxed);
+            getBlocksIndex.clear();
+            getBlocksHash.clear();
+            getBlocksSources.clear();
+            getBlocksRecoveryIds.clear();
+        }
+        ClearGetBlocksOutstandingForCleanup();
+        if ((fHadActiveBlockWork || fHadQueuedGetBlocks) &&
+            !fHadOutstandingGetBlocks)
+            RequestBlockPipelineWake(WAKE_CAUSE_DISCONNECT_CLEANUP);
+        if (fFrontierResponsePending)
+            ibdmetrics::FrontierResponsePendingAdd(-1);
+    }
+    const int nOldZero =
+        nDeferredBudgetZero.exchange(0, std::memory_order_relaxed);
+    ibdmetrics::PeerZeroStateChange(nOldZero, 0);
 }
 
 
@@ -6210,6 +6762,10 @@ static CNode* AssignSyncPeer(const vector<CNode*>& vNodesIn,
             pnodeSync = pnodeNewSync;
             if (pnodeNewSync != NULL && fQueueInitialSync)
                 pnodeNewSync->fStartSync = true;
+            if (ibdmetrics::Get().global_active_current.load(
+                    std::memory_order_relaxed) == 0)
+                ibdmetrics::Get().sync_peer_change_while_pipeline_empty.fetch_add(
+                    1, std::memory_order_relaxed);
         }
         else
         {
@@ -6419,6 +6975,14 @@ void ThreadMessageHandler2(void* parg)
 
             if (fShutdown)
                 return;
+        }
+
+        MaybeProcessPipelineWake(vNodesCopy);
+
+        BOOST_FOREACH(CNode* pnode, vNodesCopy)
+        {
+            if (pnode->fDisconnect)
+                continue;
 
             // Send messages
             {

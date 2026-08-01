@@ -21,6 +21,7 @@
 #include "addrman.h"
 #include "bloom.h"
 #include "blockrequesttrace.h"
+#include "ibdmetrics.h"
 
 class CRequestTracker;
 class CNode;
@@ -45,6 +46,21 @@ CStalledSyncRecoveryState& GetStalledSyncRecoveryStateForTesting();
 void ResetStalledSyncRecoveryStateForTesting();
 void StartSyncForTesting(const std::vector<CNode*>& vNodesIn);
 void ResetSyncPeerForTesting();
+
+// Test-only accessors for the pipeline-wake state machine.  Declared here
+// following the ResetStalledSyncRecoveryStateForTesting convention so the
+// p2p_sync_tests suite can set up and tear down the latched requested/handled
+// generation, cause bits, and getblocks cooldown timestamp deterministically.
+// No production call site uses them.
+void ResetPipelineWakeStateForTesting();
+void GetPipelineWakeStateForTesting(uint64_t* pnRequestedGeneration,
+                                    uint64_t* pnHandledGeneration,
+                                    uint32_t* pnCauseBits,
+                                    int64_t* pnLastGetBlocksTime);
+void SetPipelineWakeLastGetBlocksTimeForTesting(int64_t nTime);
+void SetPipelineWakeRequestedForTesting(uint64_t nRequestedGeneration,
+                                        uint64_t nHandledGeneration,
+                                        uint32_t nCauseBits);
 
 class CStalledSyncRecoveryState
 {
@@ -233,6 +249,42 @@ void StartNode(void* parg);
 bool StopNode();
 void SocketSendData(CNode *pnode);
 void RecordP2PMessageStat(const CNode* pnode, const std::string& command, unsigned int bytes, bool incoming);
+
+enum PipelineWakeCause
+{
+    WAKE_CAUSE_CLEAR_INFLIGHT = 1U << 0,
+    WAKE_CAUSE_INFLIGHT_TIMEOUT = 1U << 1,
+    WAKE_CAUSE_ASKFOR_ALREADY_HAVE = 1U << 2,
+    WAKE_CAUSE_ASKFOR_OWNER_CONFLICT = 1U << 3,
+    WAKE_CAUSE_QUEUE_REMOVAL = 1U << 4,
+    WAKE_CAUSE_CLEAR_ASKFOR = 1U << 5,
+    WAKE_CAUSE_DISCONNECT_CLEANUP = 1U << 6,
+    WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED = 1U << 7,
+    WAKE_CAUSE_OTHER = 1U << 8
+};
+
+enum PipelineWakeOutcome
+{
+    PIPELINE_WAKE_OUTCOME_NONE = 0,
+    PIPELINE_WAKE_TRANSIENT_CS_MAIN_TRYLOCK_FAILED,
+    PIPELINE_WAKE_TRANSIENT_CS_VNODES_TRYLOCK_FAILED,
+    PIPELINE_WAKE_TRANSIENT_COOLDOWN_ACTIVE,
+    PIPELINE_WAKE_TRANSIENT_DEDUP_ALL,
+    PIPELINE_WAKE_TRANSIENT_INCOMPLETE_PEER_SCAN,
+    PIPELINE_WAKE_TRANSIENT_SHUTDOWN,
+    PIPELINE_WAKE_TERMINAL_NOT_IBD,
+    PIPELINE_WAKE_TERMINAL_PIPELINE_NOT_EMPTY,
+    PIPELINE_WAKE_TERMINAL_DEFERRED_REFILL_CREATED_WORK,
+    PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED,
+    PIPELINE_WAKE_TERMINAL_NO_ELIGIBLE_AHEAD_PEER,
+    PIPELINE_WAKE_TERMINAL_EXISTING_QUEUED_GETBLOCKS,
+    PIPELINE_WAKE_TERMINAL_OUTSTANDING_GETBLOCKS_PRESENT
+};
+
+void RequestBlockPipelineWake(uint32_t nCause);
+PipelineWakeOutcome MaybeProcessPipelineWake(
+    const std::vector<CNode*>& vNodesCopy,
+    bool forceMainLockFailureForTest = false);
 void RecordGetHeadersResponse(CNode* pnode, size_t nHeaders, unsigned int nBytes);
 void LogSyncDiagnosticsMaybe();
 CNode* MaybeQueueStalledSyncRecovery(const std::vector<CNode*>& vNodes,
@@ -798,6 +850,8 @@ public:
     std::vector<CBlockIndex*> getBlocksIndex;
     std::vector<uint256> getBlocksHash;
     std::vector<uint64_t> getBlocksRecoveryIds;
+    std::vector<ibdmetrics::GetBlocksSource> getBlocksSources;
+    std::deque<ibdmetrics::GetBlocksSource> getBlocksOutstandingSources;
     uint64_t nRecoveryTracePendingId;
     uint256 hashLastGetBlocksEnd;
     int64_t nLastGetBlocksTime;
@@ -809,6 +863,11 @@ public:
     // Active-tip height at the moment the frontier getblocks was flushed; the
     // exemption is refused if the tip advances before the response arrives.
     int nFrontierLocatorHeight;
+    // Diagnostics: 1 while the deferred block-request budget is zero for this
+    // peer (see IBDMetricsPeerZeroStateChange); maintained as a relaxed atomic
+    // transition mirror, not used for scheduling.
+    std::atomic<int> nDeferredBudgetZero;
+    bool fIbdMetricsCleanupAccounted;
     int64_t nLastGetDataTime;
     int nChainHeight;
     int nBestKnownHeight;
@@ -899,6 +958,8 @@ public:
         nLastGetBlocksTime = 0;
         fFrontierResponsePending = false;
         nFrontierLocatorHeight = -1;
+        nDeferredBudgetZero = 0;
+        fIbdMetricsCleanupAccounted = false;
         nLastGetDataTime = 0;
         nChainHeight = -1;
         nBestKnownHeight = -1;
@@ -936,7 +997,8 @@ public:
         if (BlockRequestTraceEnabled())
             BlockRequestTracePeerClosed(this);
         RecoveryResponseResult recoveryResult;
-        if (DisconnectRecoveryResponseWindow(GetTimeMicros(), recoveryResult))
+        if (DisconnectRecoveryResponseWindow(GetTimeMicros(), recoveryResult) &&
+            BlockRequestTraceEnabled())
             printf("%s\n", FormatRecoveryResponseSummary(
                 GetId(), recoveryResult).c_str());
         if (hSocket != INVALID_SOCKET)
@@ -1072,6 +1134,7 @@ public:
             return false;
         deferredBlockInv.push_back(hash);
         deferredBlockInvIndex.insert(hash);
+        ibdmetrics::DeferredAdd(1);
         if (BlockRequestTraceEnabled())
             BlockRequestTraceDeferredWatermark(
                 GetId(), (int)deferredBlockInv.size(), "add");
@@ -1088,6 +1151,7 @@ public:
             if (*it == hash)
             {
                 deferredBlockInv.erase(it);
+                ibdmetrics::DeferredAdd(-1);
                 break;
             }
         }
@@ -1103,6 +1167,7 @@ public:
             return;
         deferredBlockInvIndex.erase(deferredBlockInv.front());
         deferredBlockInv.pop_front();
+        ibdmetrics::DeferredAdd(-1);
         if (BlockRequestTraceEnabled())
             BlockRequestTraceDeferredWatermark(
                 GetId(), (int)deferredBlockInv.size(), "remove");
@@ -1121,7 +1186,13 @@ public:
     {
         mapAskFor.insert(std::make_pair(nRequestTime, inv));
         if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
-            setAskForBlocks.insert(inv.hash);
+        {
+            if (setAskForBlocks.insert(inv.hash).second)
+            {
+                ibdmetrics::QueuedAdd(1);
+                ibdmetrics::GlobalActiveAdd(1);
+            }
+        }
     }
 
     void AddAskForEntry(const std::pair<int64_t, CInv>& entry)
@@ -1130,13 +1201,36 @@ public:
     }
 
     void EraseAskForEntry(std::multimap<int64_t, CInv>::iterator it,
-                          bool fReleaseOwner = true)
+                          bool fReleaseOwner = true,
+                          ibdmetrics::ActiveDecrementCause cause =
+                              ibdmetrics::ACTIVE_DECREMENT_OTHER)
     {
         if (it == mapAskFor.end())
             return;
         const CInv inv = it->second;
         if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
-            setAskForBlocks.erase(inv.hash);
+        {
+            if (setAskForBlocks.erase(inv.hash))
+            {
+                ibdmetrics::QueuedAdd(-1);
+                ibdmetrics::GlobalActiveAdd(-1, cause);
+                if (cause != ibdmetrics::ACTIVE_DECREMENT_ASKFOR_SENT_TRANSITION)
+                {
+                    uint32_t nWakeCause = WAKE_CAUSE_QUEUE_REMOVAL;
+                    if (cause == ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_ALREADY_HAVE)
+                        nWakeCause = WAKE_CAUSE_ASKFOR_ALREADY_HAVE;
+                    else if (cause == ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT)
+                        nWakeCause = WAKE_CAUSE_ASKFOR_OWNER_CONFLICT;
+                    else if (cause == ibdmetrics::ACTIVE_DECREMENT_CLEAR_ASKFOR)
+                        nWakeCause = WAKE_CAUSE_CLEAR_ASKFOR;
+                    else if (cause == ibdmetrics::ACTIVE_DECREMENT_DISCONNECT_CLEANUP)
+                        nWakeCause = WAKE_CAUSE_DISCONNECT_CLEANUP;
+                    else if (cause == ibdmetrics::ACTIVE_DECREMENT_OTHER)
+                        nWakeCause = WAKE_CAUSE_OTHER;
+                    RequestBlockPipelineWake(nWakeCause);
+                }
+            }
+        }
         mapAskFor.erase(it);
         if (fReleaseOwner &&
             (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK))
@@ -1152,6 +1246,14 @@ public:
                 it->second.type == MSG_FILTERED_BLOCK)
                 ReleaseBlockRequestOwner(it->second.hash, GetId(), "clear");
         }
+        if (!setAskForBlocks.empty())
+        {
+            ibdmetrics::QueuedAdd(-(int64_t)setAskForBlocks.size());
+            ibdmetrics::GlobalActiveAdd(
+                -(int64_t)setAskForBlocks.size(),
+                ibdmetrics::ACTIVE_DECREMENT_CLEAR_ASKFOR);
+            RequestBlockPipelineWake(WAKE_CAUSE_CLEAR_ASKFOR);
+        }
         mapAskFor.clear();
         setAskForBlocks.clear();
     }
@@ -1165,12 +1267,18 @@ public:
         {
             ExpireBlockInFlight();
             if (setBlocksInFlight.count(inv.hash))
+            {
+                ibdmetrics::Get().askfor_skip_inflight.fetch_add(
+                    1, std::memory_order_relaxed);
                 return;
+            }
             if (IsBlockAskForQueued(inv.hash))
             {
                 if (BlockRequestTraceEnabled())
                     BlockRequestTraceAskSkip(this, inv.hash, source,
                                              "same-peer-already-queued");
+                ibdmetrics::Get().askfor_skip_already_queued.fetch_add(
+                    1, std::memory_order_relaxed);
                 return;
             }
         }
@@ -1181,6 +1289,8 @@ public:
             if (BlockRequestTraceEnabled())
                 BlockRequestTraceAskSkip(this, inv.hash, source,
                                          "orphan-limit-cooldown");
+            ibdmetrics::Get().askfor_skip_orphan_limit_cooldown.fetch_add(
+                1, std::memory_order_relaxed);
             return;
         }
 
@@ -1195,6 +1305,8 @@ public:
                        (long long)nPruneNow, GetId(), inv.type,
                        inv.hash.ToString().c_str(), mapAlreadyAskedFor.size(),
                        MAX_ALREADY_ASKED_FOR_SIZE);
+            ibdmetrics::Get().askfor_skip_mapalreadyasked_cap.fetch_add(
+                1, std::memory_order_relaxed);
             return;
         }
 
@@ -1209,6 +1321,8 @@ public:
                                          "other-peer-active-owner",
                                          nOwnerPeer,
                                          BlockRequestOwnerStateName(ownerState));
+            ibdmetrics::Get().askfor_skip_other_peer_owner.fetch_add(
+                1, std::memory_order_relaxed);
             return;
         }
 
@@ -1241,6 +1355,8 @@ public:
             nRequestTime = std::max(nRequestTime + 10 * 1000000, nNow);
         }
         AddAskForEntry(nRequestTime, inv);
+        if (fBlockRequest)
+            ibdmetrics::RecordZeroLatency(ibdmetrics::ZERO_LATENCY_ASKFOR);
         if (BlockRequestTraceEnabled() && inv.type == MSG_BLOCK)
             BlockRequestTraceAskSchedule(this, inv.hash, source, nRequestTime,
                                          nPreviousRequestTime, false);
@@ -1502,7 +1618,11 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         vecRequestsFulfilled.push_back(strRequest);
     }
 
-    void PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd);
+    void PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
+                       ibdmetrics::GetBlocksSource source =
+                           ibdmetrics::GETBLOCKS_SOURCE_OTHER);
+    bool ConsumeGetBlocksResponseFront();
+    void ClearGetBlocksOutstandingForCleanup();
     void StartRecoveryResponseWindow(uint64_t id, int64_t send_us);
     bool ObserveRecoveryResponseInv(int64_t now_us, const RecoveryResponseObservation& observation, RecoveryResponseResult& result);
     bool ExpireRecoveryResponseWindow(int64_t now_us, RecoveryResponseResult& result);
@@ -1549,6 +1669,10 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                     BlockRequestTraceInFlightExpire(this, it->first, nNow - it->second);
                 const uint256 hashExpired = it->first;
                 setBlocksInFlight.erase(it->first);
+                ibdmetrics::InflightAdd(-1);
+                ibdmetrics::GlobalActiveAdd(
+                    -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
+                RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
                 it = mapBlockInFlightSince.erase(it);
                 ReleaseBlockRequestOwner(hashExpired, GetId(), "timeout");
                 EraseAlreadyAskedForIfUnowned(
@@ -1570,14 +1694,24 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     void MarkBlockInFlight(const uint256& hashBlock)
     {
         ExpireBlockInFlight();
-        setBlocksInFlight.insert(hashBlock);
+        if (setBlocksInFlight.insert(hashBlock).second)
+        {
+            ibdmetrics::InflightAdd(1);
+            ibdmetrics::GlobalActiveAdd(1);
+        }
         mapBlockInFlightSince[hashBlock] = GetTime();
         TransitionBlockRequestOwnerToInFlight(hashBlock, GetId());
     }
 
     void ClearBlockInFlight(const uint256& hashBlock)
     {
-        setBlocksInFlight.erase(hashBlock);
+        if (setBlocksInFlight.erase(hashBlock))
+        {
+            ibdmetrics::InflightAdd(-1);
+            ibdmetrics::GlobalActiveAdd(
+                -1, ibdmetrics::ACTIVE_DECREMENT_RECEIVE_CLEAR_INFLIGHT);
+            RequestBlockPipelineWake(WAKE_CAUSE_CLEAR_INFLIGHT);
+        }
         mapBlockInFlightSince.erase(hashBlock);
         ReleaseBlockRequestOwner(hashBlock, GetId(), "receive");
     }

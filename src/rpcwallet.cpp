@@ -11,6 +11,7 @@
 #include "init.h"
 #include "base58.h"
 #include "main.h"
+#include "ibdmetrics.h"
 #include "stealth.h"
 #include "smessage.h"
 #include "collateral.h"
@@ -336,6 +337,217 @@ Value getinfo(const Array& params, bool fHelp)
     if (pwalletMain->IsLocked() && pwalletMain->IsCrypted())
         obj.push_back(Pair("wallet_status", "locked"));
     obj.push_back(Pair("errors", GetWarnings("statusbar")));
+
+    {
+        IBDMetricsSnapshot metrics;
+        ibdmetrics::SnapshotAll(metrics);
+        Object ibd;
+        ibd.push_back(Pair("start_time_unix", metrics.start_time_unix));
+        ibd.push_back(Pair("now_unix", metrics.now_unix));
+        ibd.push_back(Pair("uptime_seconds", metrics.uptime_seconds));
+        ibd.push_back(Pair("height", (int)nBestHeight));
+
+        ibd.push_back(Pair("deferred_budget_calls", metrics.deferred_budget_calls));
+        ibd.push_back(Pair("deferred_budget_positive", metrics.deferred_budget_positive));
+        ibd.push_back(Pair("deferred_budget_zero", metrics.deferred_budget_zero));
+        ibd.push_back(Pair("deferred_budget_zero_peer_pressure", metrics.deferred_budget_zero_peer_pressure));
+        ibd.push_back(Pair("deferred_budget_zero_global_pressure", metrics.deferred_budget_zero_global_pressure));
+        ibd.push_back(Pair("deferred_budget_zero_vnodes_lock_failed", metrics.deferred_budget_zero_vnodes_lock_failed));
+
+        ibd.push_back(Pair("block_inv_unknown_total", metrics.block_inv_unknown_total));
+        ibd.push_back(Pair("block_inv_admitted", metrics.block_inv_admitted));
+        ibd.push_back(Pair("block_inv_deferred", metrics.block_inv_deferred));
+        ibd.push_back(Pair("block_inv_deferred_no_budget", metrics.block_inv_deferred_no_budget));
+        ibd.push_back(Pair("block_inv_deferred_overflow", metrics.block_inv_deferred_overflow));
+        ibd.push_back(Pair("frontier_exemption_admitted", metrics.frontier_exemption_admitted));
+
+        ibd.push_back(Pair("global_active_current", metrics.global_active_current));
+        ibd.push_back(Pair("global_active_max", metrics.global_active_max));
+        ibd.push_back(Pair("peer_pressure_max", metrics.peer_pressure_max));
+        ibd.push_back(Pair("orphan_pressure_max", metrics.orphan_pressure_max));
+        ibd.push_back(Pair("peers_at_zero_budget_current", metrics.peers_at_zero_budget_current));
+        ibd.push_back(Pair("peers_at_zero_budget_max", metrics.peers_at_zero_budget_max));
+
+        ibd.push_back(Pair("refill_calls", metrics.refill_calls));
+        ibd.push_back(Pair("refill_calls_zero_budget", metrics.refill_calls_zero_budget));
+        ibd.push_back(Pair("refill_items_examined", metrics.refill_items_examined));
+        ibd.push_back(Pair("refill_items_admitted", metrics.refill_items_admitted));
+        ibd.push_back(Pair("refill_items_already_have", metrics.refill_items_already_have));
+        ibd.push_back(Pair("refill_items_active_owner", metrics.refill_items_active_owner));
+        ibd.push_back(Pair("refill_work_limit_hit", metrics.refill_work_limit_hit));
+        ibd.push_back(Pair("refill_txdb_opens", metrics.refill_txdb_opens));
+        ibd.push_back(Pair("refill_alreadyhave_checks", metrics.refill_alreadyhave_checks));
+
+        ibd.push_back(Pair("block_receive_total", metrics.block_receive_total));
+        ibd.push_back(Pair("block_result_accepted_active", metrics.block_result_accepted_active));
+        ibd.push_back(Pair("block_result_orphan_new", metrics.block_result_orphan_new));
+        ibd.push_back(Pair("setbestchain_commits", metrics.setbestchain_commits));
+        ibd.push_back(Pair("stalled_recovery_attempts", metrics.stalled_recovery_attempts));
+
+        ibd.push_back(Pair("active_decrement_receive_clear_inflight", metrics.active_decrement_receive_clear_inflight));
+        ibd.push_back(Pair("active_decrement_inflight_timeout", metrics.active_decrement_inflight_timeout));
+        ibd.push_back(Pair("active_decrement_askfor_sent_transition", metrics.active_decrement_askfor_sent_transition));
+        ibd.push_back(Pair("active_decrement_askfor_removed_already_have", metrics.active_decrement_askfor_removed_already_have));
+        ibd.push_back(Pair("active_decrement_askfor_removed_owner_conflict", metrics.active_decrement_askfor_removed_owner_conflict));
+        ibd.push_back(Pair("active_decrement_clear_askfor", metrics.active_decrement_clear_askfor));
+        ibd.push_back(Pair("active_decrement_disconnect_cleanup", metrics.active_decrement_disconnect_cleanup));
+        ibd.push_back(Pair("active_decrement_other", metrics.active_decrement_other));
+
+        ibd.push_back(Pair("global_active_zero_transitions", metrics.global_active_zero_transitions));
+        ibd.push_back(Pair("zero_with_total_deferred_nonempty", metrics.zero_with_total_deferred_nonempty));
+        ibd.push_back(Pair("zero_with_total_deferred_empty", metrics.zero_with_total_deferred_empty));
+        ibd.push_back(Pair("zero_with_eligible_ahead_peer", metrics.zero_with_eligible_ahead_peer));
+        ibd.push_back(Pair("zero_without_eligible_ahead_peer", metrics.zero_without_eligible_ahead_peer));
+        ibd.push_back(Pair("zero_duration_total_ms", metrics.zero_duration_total_ms));
+        ibd.push_back(Pair("zero_duration_max_ms", metrics.zero_duration_max_ms));
+        ibd.push_back(Pair("zero_duration_current_ms", metrics.zero_duration_current_ms));
+
+        ibd.push_back(Pair("refill_opportunity_slot_freed", metrics.refill_opportunity_slot_freed));
+        ibd.push_back(Pair("refill_sendmessages_passes", metrics.refill_sendmessages_passes));
+        ibd.push_back(Pair("refill_skipped_cs_main_trylock_failed", metrics.refill_skipped_cs_main_trylock_failed));
+        ibd.push_back(Pair("refill_called_deferred_empty", metrics.refill_called_deferred_empty));
+        ibd.push_back(Pair("refill_called_positive_budget_nonempty", metrics.refill_called_positive_budget_nonempty));
+        ibd.push_back(Pair("refill_positive_budget_admitted_zero", metrics.refill_positive_budget_admitted_zero));
+        ibd.push_back(Pair("refill_positive_budget_admitted_count", metrics.refill_positive_budget_admitted_count));
+
+        ibd.push_back(Pair("pipeline_drained_checks", metrics.pipeline_drained_checks));
+        ibd.push_back(Pair("pipeline_drained_getblocks_queued", metrics.pipeline_drained_getblocks_queued));
+        ibd.push_back(Pair("pipeline_drained_skip_not_ahead", metrics.pipeline_drained_skip_not_ahead));
+        ibd.push_back(Pair("pipeline_drained_skip_getblocks_10s_cooldown", metrics.pipeline_drained_skip_getblocks_10s_cooldown));
+        ibd.push_back(Pair("pipeline_drained_skip_other_condition", metrics.pipeline_drained_skip_other_condition));
+        ibd.push_back(Pair("pushgetblocks_dedup_5s_skips", metrics.pushgetblocks_dedup_5s_skips));
+
+        ibd.push_back(Pair("getblocks_decision_attempts_other", metrics.getblocks_decision_attempts_other));
+        ibd.push_back(Pair("getblocks_decision_attempts_initial", metrics.getblocks_decision_attempts_initial));
+        ibd.push_back(Pair("getblocks_decision_attempts_continuation", metrics.getblocks_decision_attempts_continuation));
+        ibd.push_back(Pair("getblocks_decision_attempts_recovery", metrics.getblocks_decision_attempts_recovery));
+        ibd.push_back(Pair("getblocks_decision_attempts_prefetch", metrics.getblocks_decision_attempts_prefetch));
+        ibd.push_back(Pair("getblocks_decision_attempts_inv_continuation", metrics.getblocks_decision_attempts_inv_continuation));
+        ibd.push_back(Pair("getblocks_decision_attempts_version", metrics.getblocks_decision_attempts_version));
+        ibd.push_back(Pair("getblocks_decision_attempts_headers", metrics.getblocks_decision_attempts_headers));
+        ibd.push_back(Pair("getblocks_decision_attempts_checkpoint", metrics.getblocks_decision_attempts_checkpoint));
+        ibd.push_back(Pair("getblocks_decision_attempts_wallet_rescan", metrics.getblocks_decision_attempts_wallet_rescan));
+        ibd.push_back(Pair("getblocks_decision_attempts_orphan_limit", metrics.getblocks_decision_attempts_orphan_limit));
+        ibd.push_back(Pair("getblocks_decision_attempts_empty_pipeline_wake", metrics.getblocks_decision_attempts_empty_pipeline_wake));
+        ibd.push_back(Pair("getblocks_queue_success_other", metrics.getblocks_queue_success_other));
+        ibd.push_back(Pair("getblocks_queue_success_initial", metrics.getblocks_queue_success_initial));
+        ibd.push_back(Pair("getblocks_queue_success_continuation", metrics.getblocks_queue_success_continuation));
+        ibd.push_back(Pair("getblocks_queue_success_recovery", metrics.getblocks_queue_success_recovery));
+        ibd.push_back(Pair("getblocks_queue_success_prefetch", metrics.getblocks_queue_success_prefetch));
+        ibd.push_back(Pair("getblocks_queue_success_inv_continuation", metrics.getblocks_queue_success_inv_continuation));
+        ibd.push_back(Pair("getblocks_queue_success_version", metrics.getblocks_queue_success_version));
+        ibd.push_back(Pair("getblocks_queue_success_headers", metrics.getblocks_queue_success_headers));
+        ibd.push_back(Pair("getblocks_queue_success_checkpoint", metrics.getblocks_queue_success_checkpoint));
+        ibd.push_back(Pair("getblocks_queue_success_wallet_rescan", metrics.getblocks_queue_success_wallet_rescan));
+        ibd.push_back(Pair("getblocks_queue_success_orphan_limit", metrics.getblocks_queue_success_orphan_limit));
+        ibd.push_back(Pair("getblocks_queue_success_empty_pipeline_wake", metrics.getblocks_queue_success_empty_pipeline_wake));
+        ibd.push_back(Pair("getblocks_wire_sent_other", metrics.getblocks_wire_sent_other));
+        ibd.push_back(Pair("getblocks_wire_sent_initial", metrics.getblocks_wire_sent_initial));
+        ibd.push_back(Pair("getblocks_wire_sent_continuation", metrics.getblocks_wire_sent_continuation));
+        ibd.push_back(Pair("getblocks_wire_sent_recovery", metrics.getblocks_wire_sent_recovery));
+        ibd.push_back(Pair("getblocks_wire_sent_prefetch", metrics.getblocks_wire_sent_prefetch));
+        ibd.push_back(Pair("getblocks_wire_sent_inv_continuation", metrics.getblocks_wire_sent_inv_continuation));
+        ibd.push_back(Pair("getblocks_wire_sent_version", metrics.getblocks_wire_sent_version));
+        ibd.push_back(Pair("getblocks_wire_sent_headers", metrics.getblocks_wire_sent_headers));
+        ibd.push_back(Pair("getblocks_wire_sent_checkpoint", metrics.getblocks_wire_sent_checkpoint));
+        ibd.push_back(Pair("getblocks_wire_sent_wallet_rescan", metrics.getblocks_wire_sent_wallet_rescan));
+        ibd.push_back(Pair("getblocks_wire_sent_orphan_limit", metrics.getblocks_wire_sent_orphan_limit));
+        ibd.push_back(Pair("getblocks_wire_sent_empty_pipeline_wake", metrics.getblocks_wire_sent_empty_pipeline_wake));
+        ibd.push_back(Pair("getblocks_dedup_skips", metrics.getblocks_dedup_skips));
+        ibd.push_back(Pair("getblocks_identical_to_last_sent", metrics.getblocks_identical_to_last_sent));
+        ibd.push_back(Pair("getblocks_response_inv_messages", metrics.getblocks_response_inv_messages));
+        ibd.push_back(Pair("getblocks_response_block_inv_count", metrics.getblocks_response_block_inv_count));
+        ibd.push_back(Pair("getblocks_response_unknown_count", metrics.getblocks_response_unknown_count));
+        ibd.push_back(Pair("getblocks_response_zero_unknown", metrics.getblocks_response_zero_unknown));
+        ibd.push_back(Pair("getblocks_response_inv_zero_unknown", metrics.getblocks_response_inv_zero_unknown));
+        ibd.push_back(Pair("recovery_outcome_useful", metrics.recovery_outcome_useful));
+        ibd.push_back(Pair("recovery_outcome_known_only", metrics.recovery_outcome_known_only));
+        ibd.push_back(Pair("recovery_outcome_no_response", metrics.recovery_outcome_no_response));
+        ibd.push_back(Pair("zero_to_first_getblocks_wire_send_ms_total", metrics.zero_to_first_getblocks_wire_send_ms_total));
+        ibd.push_back(Pair("zero_to_first_getblocks_wire_send_ms_max", metrics.zero_to_first_getblocks_wire_send_ms_max));
+        ibd.push_back(Pair("zero_to_first_inv_ms_total", metrics.zero_to_first_inv_ms_total));
+        ibd.push_back(Pair("zero_to_first_inv_ms_max", metrics.zero_to_first_inv_ms_max));
+        ibd.push_back(Pair("zero_to_first_unknown_inv_ms_total", metrics.zero_to_first_unknown_inv_ms_total));
+        ibd.push_back(Pair("zero_to_first_unknown_inv_ms_max", metrics.zero_to_first_unknown_inv_ms_max));
+        ibd.push_back(Pair("zero_to_first_askfor_ms_total", metrics.zero_to_first_askfor_ms_total));
+        ibd.push_back(Pair("zero_to_first_askfor_ms_max", metrics.zero_to_first_askfor_ms_max));
+        ibd.push_back(Pair("zero_to_active_nonzero_ms_total", metrics.zero_to_active_nonzero_ms_total));
+        ibd.push_back(Pair("zero_to_active_nonzero_ms_max", metrics.zero_to_active_nonzero_ms_max));
+        ibd.push_back(Pair("inv_unknown_during_zero_global", metrics.inv_unknown_during_zero_global));
+        ibd.push_back(Pair("sync_peer_change_while_pipeline_empty", metrics.sync_peer_change_while_pipeline_empty));
+        ibd.push_back(Pair("getblocks_outstanding_current", metrics.getblocks_outstanding_current));
+        ibd.push_back(Pair("getblocks_outstanding_max", metrics.getblocks_outstanding_max));
+        ibd.push_back(Pair("getblocks_no_response_disconnect_cleanup", metrics.getblocks_no_response_disconnect_cleanup));
+        ibd.push_back(Pair("getblocks_queued_unsent_cleanup", metrics.getblocks_queued_unsent_cleanup));
+        ibd.push_back(Pair("peers_with_queued_getblocks_current", metrics.peers_with_queued_getblocks_current));
+        ibd.push_back(Pair("peers_with_queued_getblocks_max", metrics.peers_with_queued_getblocks_max));
+        ibd.push_back(Pair("total_getblocks_queued_requests_current", metrics.total_getblocks_queued_requests_current));
+        ibd.push_back(Pair("total_getblocks_queued_requests_max", metrics.total_getblocks_queued_requests_max));
+        ibd.push_back(Pair("pipeline_active_due_to_getblocks_current", metrics.pipeline_active_due_to_getblocks_current));
+        ibd.push_back(Pair("pipeline_active_due_to_getblocks_max", metrics.pipeline_active_due_to_getblocks_max));
+        ibd.push_back(Pair("frontier_response_armed", metrics.frontier_response_armed));
+        ibd.push_back(Pair("frontier_response_consumed", metrics.frontier_response_consumed));
+        ibd.push_back(Pair("frontier_response_pending_current", metrics.frontier_response_pending_current));
+        ibd.push_back(Pair("frontier_response_pending_max", metrics.frontier_response_pending_max));
+        ibd.push_back(Pair("frontier_reject_locator_stale", metrics.frontier_reject_locator_stale));
+        ibd.push_back(Pair("frontier_reject_slot_busy", metrics.frontier_reject_slot_busy));
+        ibd.push_back(Pair("frontier_reject_already_admitted", metrics.frontier_reject_already_admitted));
+        ibd.push_back(Pair("frontier_reject_other", metrics.frontier_reject_other));
+        ibd.push_back(Pair("ibd_state_current", metrics.ibd_state_current));
+        ibd.push_back(Pair("ibd_state_transitions", metrics.ibd_state_transitions));
+
+        Object pipeline_wake;
+        pipeline_wake.push_back(Pair("signals", metrics.pipeline_wake_signals));
+        pipeline_wake.push_back(Pair("signal_clear_inflight", metrics.pipeline_wake_signal_clear_inflight));
+        pipeline_wake.push_back(Pair("signal_inflight_timeout", metrics.pipeline_wake_signal_inflight_timeout));
+        pipeline_wake.push_back(Pair("signal_askfor_already_have", metrics.pipeline_wake_signal_askfor_already_have));
+        pipeline_wake.push_back(Pair("signal_askfor_owner_conflict", metrics.pipeline_wake_signal_askfor_owner_conflict));
+        pipeline_wake.push_back(Pair("signal_queue_removal", metrics.pipeline_wake_signal_queue_removal));
+        pipeline_wake.push_back(Pair("signal_clear_askfor", metrics.pipeline_wake_signal_clear_askfor));
+        pipeline_wake.push_back(Pair("signal_disconnect_cleanup", metrics.pipeline_wake_signal_disconnect_cleanup));
+        pipeline_wake.push_back(Pair("signal_getblocks_outstanding_cleared", metrics.pipeline_wake_signal_getblocks_outstanding_cleared));
+        pipeline_wake.push_back(Pair("signal_other", metrics.pipeline_wake_signal_other));
+        pipeline_wake.push_back(Pair("coalesced", metrics.pipeline_wake_coalesced));
+        pipeline_wake.push_back(Pair("handler_runs", metrics.pipeline_wake_handler_runs));
+        pipeline_wake.push_back(Pair("transient_cs_main_trylock_failed", metrics.pipeline_wake_transient_cs_main_trylock_failed));
+        pipeline_wake.push_back(Pair("transient_cs_vnodes_trylock_failed", metrics.pipeline_wake_transient_cs_vnodes_trylock_failed));
+        pipeline_wake.push_back(Pair("transient_cooldown_active", metrics.pipeline_wake_transient_cooldown_active));
+        pipeline_wake.push_back(Pair("transient_dedup_all", metrics.pipeline_wake_transient_dedup_all));
+        pipeline_wake.push_back(Pair("transient_incomplete_peer_scan", metrics.pipeline_wake_transient_incomplete_peer_scan));
+        pipeline_wake.push_back(Pair("transient_shutdown", metrics.pipeline_wake_transient_shutdown));
+        pipeline_wake.push_back(Pair("terminal_not_ibd", metrics.pipeline_wake_terminal_not_ibd));
+        pipeline_wake.push_back(Pair("terminal_pipeline_not_empty", metrics.pipeline_wake_terminal_pipeline_not_empty));
+        pipeline_wake.push_back(Pair("terminal_deferred_refill_created_work", metrics.pipeline_wake_terminal_deferred_refill_created_work));
+        pipeline_wake.push_back(Pair("terminal_getblocks_queued", metrics.pipeline_wake_terminal_getblocks_queued));
+        pipeline_wake.push_back(Pair("terminal_no_eligible_ahead_peer", metrics.pipeline_wake_terminal_no_eligible_ahead_peer));
+        pipeline_wake.push_back(Pair("terminal_existing_queued_getblocks", metrics.pipeline_wake_terminal_existing_queued_getblocks));
+        pipeline_wake.push_back(Pair("terminal_outstanding_getblocks_present", metrics.pipeline_wake_terminal_outstanding_getblocks_present));
+        pipeline_wake.push_back(Pair("refill_attempts", metrics.pipeline_wake_refill_attempts));
+        pipeline_wake.push_back(Pair("refill_admitted", metrics.pipeline_wake_refill_admitted));
+        pipeline_wake.push_back(Pair("getblocks_attempted", metrics.pipeline_wake_getblocks_attempted));
+        pipeline_wake.push_back(Pair("getblocks_queued", metrics.pipeline_wake_getblocks_queued));
+        pipeline_wake.push_back(Pair("getblocks_dedup", metrics.pipeline_wake_getblocks_dedup));
+        pipeline_wake.push_back(Pair("active_restored", metrics.pipeline_wake_active_restored));
+        pipeline_wake.push_back(Pair("signal_to_active_ms_total", metrics.pipeline_wake_signal_to_active_ms_total));
+        pipeline_wake.push_back(Pair("signal_to_active_ms_max", metrics.pipeline_wake_signal_to_active_ms_max));
+        ibd.push_back(Pair("pipeline_wake", pipeline_wake));
+
+        ibd.push_back(Pair("askfor_skip_orphan_limit_cooldown", metrics.askfor_skip_orphan_limit_cooldown));
+        ibd.push_back(Pair("askfor_skip_mapalreadyasked_cap", metrics.askfor_skip_mapalreadyasked_cap));
+        ibd.push_back(Pair("askfor_skip_other_peer_owner", metrics.askfor_skip_other_peer_owner));
+        ibd.push_back(Pair("askfor_skip_already_queued", metrics.askfor_skip_already_queued));
+        ibd.push_back(Pair("askfor_skip_inflight", metrics.askfor_skip_inflight));
+
+        ibd.push_back(Pair("total_deferred_current", metrics.total_deferred_current));
+        ibd.push_back(Pair("total_deferred_max", metrics.total_deferred_max));
+        ibd.push_back(Pair("total_queued_current", metrics.total_queued_current));
+        ibd.push_back(Pair("total_queued_max", metrics.total_queued_max));
+        ibd.push_back(Pair("total_inflight_current", metrics.total_inflight_current));
+        ibd.push_back(Pair("total_inflight_max", metrics.total_inflight_max));
+        ibd.push_back(Pair("eligible_ahead_peers_current", metrics.eligible_ahead_peers_current));
+        ibd.push_back(Pair("eligible_ahead_peers_max", metrics.eligible_ahead_peers_max));
+        obj.push_back(Pair("ibdmetrics", ibd));
+    }
 
     if (fRPCPerfTrace)
     {

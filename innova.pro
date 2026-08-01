@@ -544,6 +544,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/idns.cpp \
            src/init.cpp \
     src/ibdefficiency.cpp \
+           src/ibdmetrics.cpp \
            src/innovarpc.cpp \
            src/ipa.cpp \
            src/jh.c \

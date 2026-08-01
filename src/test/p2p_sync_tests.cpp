@@ -331,6 +331,163 @@ static size_t QueuedBlockAskForCount(const CNode& peer,
 
 } // namespace
 
+namespace {
+
+// ---- Pipeline-wake regression helpers -------------------------------------
+
+static const int64_t WAKE_TEST_TIME = 1000000;
+
+static int64_t MetricGet(const std::atomic<int64_t>& counter)
+{
+    return counter.load(std::memory_order_relaxed);
+}
+
+// Deterministic wake-candidate peer: fixed advertised height (score tiebreak
+// is the node id), no block-recency/ping bonuses, empty request containers.
+static void PrepareWakeEligiblePeer(CNode& peer, int nPeerHeight, int64_t nNow)
+{
+    peer.nVersion = PROTOCOL_VERSION;
+    peer.fSuccessfullyConnected = true;
+    peer.fClient = false;
+    peer.fOneShot = false;
+    peer.fDisconnect = false;
+    peer.nChainHeight = nPeerHeight;
+    peer.nBestKnownHeight = nPeerHeight;
+    peer.nLastHeightUpdate = nNow;
+    peer.nLastBlockRecv = 0;
+    peer.nBlocksReceivedInBatch = 0;
+    peer.nPingUsecTime = 0;
+}
+
+static void MarkPeerWakeDedupBlocked(CNode& peer, CBlockIndex* pindexTip,
+                                     int64_t nLastGetBlocksTime)
+{
+    peer.pindexLastGetBlocksBegin = pindexTip;
+    peer.hashLastGetBlocksEnd = uint256(0);
+    peer.nLastGetBlocksTime = nLastGetBlocksTime;
+}
+
+static void ResetPeerWakeDedupState(CNode& peer)
+{
+    peer.pindexLastGetBlocksBegin = NULL;
+    peer.hashLastGetBlocksEnd = uint256(0);
+    peer.nLastGetBlocksTime = 0;
+}
+
+static size_t TotalQueuedGetBlocks(const std::vector<CNode*>& peers)
+{
+    size_t nQueued = 0;
+    for (std::vector<CNode*>::const_iterator it = peers.begin();
+         it != peers.end(); ++it)
+        nQueued += (*it)->getBlocksIndex.size();
+    return nQueued;
+}
+
+static size_t TotalQueuedAskFor(const std::vector<CNode*>& peers)
+{
+    size_t nQueued = 0;
+    for (std::vector<CNode*>::const_iterator it = peers.begin();
+         it != peers.end(); ++it)
+        nQueued += (*it)->setAskForBlocks.size();
+    return nQueued;
+}
+
+static size_t TotalInflight(const std::vector<CNode*>& peers)
+{
+    size_t nInflight = 0;
+    for (std::vector<CNode*>::const_iterator it = peers.begin();
+         it != peers.end(); ++it)
+        nInflight += (*it)->setBlocksInFlight.size();
+    return nInflight;
+}
+
+static size_t TotalOutstandingGetBlocks(const std::vector<CNode*>& peers)
+{
+    size_t nOutstanding = 0;
+    for (std::vector<CNode*>::const_iterator it = peers.begin();
+         it != peers.end(); ++it)
+        nOutstanding += (*it)->getBlocksOutstandingSources.size();
+    return nOutstanding;
+}
+
+static size_t TotalDeferredInv(const std::vector<CNode*>& peers)
+{
+    size_t nDeferred = 0;
+    for (std::vector<CNode*>::const_iterator it = peers.begin();
+         it != peers.end(); ++it)
+        nDeferred += (*it)->deferredBlockInv.size();
+    return nDeferred;
+}
+
+// Mirrors the SendMessages getblocks flush: drains the queued locators and
+// restores the aggregate gauges to match the now-empty containers.
+static void ClearQueuedGetBlocks(CNode& peer)
+{
+    const int64_t nQueued = (int64_t)peer.getBlocksIndex.size();
+    if (nQueued == 0)
+        return;
+    peer.getBlocksIndex.clear();
+    peer.getBlocksHash.clear();
+    peer.getBlocksSources.clear();
+    peer.getBlocksRecoveryIds.clear();
+    ibdmetrics::GetBlocksQueuedAdd(-nQueued, true);
+}
+
+struct PipelineWakeGauges
+{
+    int64_t global_active_current;
+    int64_t total_queued_current;
+    int64_t total_inflight_current;
+    int64_t getblocks_outstanding_current;
+    int64_t total_getblocks_queued_requests_current;
+    int64_t peers_with_queued_getblocks_current;
+    int64_t total_deferred_current;
+};
+
+static PipelineWakeGauges SnapshotWakeGauges()
+{
+    PipelineWakeGauges g;
+    g.global_active_current =
+        MetricGet(ibdmetrics::Get().global_active_current);
+    g.total_queued_current = MetricGet(ibdmetrics::Get().total_queued_current);
+    g.total_inflight_current =
+        MetricGet(ibdmetrics::Get().total_inflight_current);
+    g.getblocks_outstanding_current =
+        MetricGet(ibdmetrics::Get().getblocks_outstanding_current);
+    g.total_getblocks_queued_requests_current =
+        MetricGet(ibdmetrics::Get().total_getblocks_queued_requests_current);
+    g.peers_with_queued_getblocks_current =
+        MetricGet(ibdmetrics::Get().peers_with_queued_getblocks_current);
+    g.total_deferred_current =
+        MetricGet(ibdmetrics::Get().total_deferred_current);
+    return g;
+}
+
+// The aggregate gauges must always equal the sum of the real peer containers,
+// never go negative, and never count a peer twice.
+static void CheckWakeGaugeBalance(const std::vector<CNode*>& peers)
+{
+    const PipelineWakeGauges g = SnapshotWakeGauges();
+    BOOST_CHECK_EQUAL(g.global_active_current,
+                      (int64_t)(TotalQueuedAskFor(peers) + TotalInflight(peers)));
+    BOOST_CHECK_EQUAL(g.total_queued_current, (int64_t)TotalQueuedAskFor(peers));
+    BOOST_CHECK_EQUAL(g.total_inflight_current, (int64_t)TotalInflight(peers));
+    BOOST_CHECK_EQUAL(g.getblocks_outstanding_current,
+                      (int64_t)TotalOutstandingGetBlocks(peers));
+    BOOST_CHECK_EQUAL(g.total_getblocks_queued_requests_current,
+                      (int64_t)TotalQueuedGetBlocks(peers));
+    BOOST_CHECK_EQUAL(g.total_deferred_current, (int64_t)TotalDeferredInv(peers));
+    BOOST_CHECK(g.global_active_current >= 0);
+    BOOST_CHECK(g.total_queued_current >= 0);
+    BOOST_CHECK(g.total_inflight_current >= 0);
+    BOOST_CHECK(g.getblocks_outstanding_current >= 0);
+    BOOST_CHECK(g.total_getblocks_queued_requests_current >= 0);
+    BOOST_CHECK(g.peers_with_queued_getblocks_current >= 0);
+    BOOST_CHECK(g.total_deferred_current >= 0);
+}
+
+} // namespace
+
 BOOST_AUTO_TEST_SUITE(p2p_sync_tests)
 BOOST_AUTO_TEST_CASE(same_peer_block_askfor_is_idempotent)
 {
@@ -2990,6 +3147,1241 @@ BOOST_AUTO_TEST_CASE(disconnect_cleans_up_block_request_owners)
     BOOST_CHECK(!GetBlockRequestOwner(hashB, NULL, NULL));
 }
 
+BOOST_AUTO_TEST_CASE(disconnect_cleanup_last_active_work_signals_wake)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(850), "disconnect-wake", true);
+    const uint256 hash(5850);
+    const std::vector<CNode*> noPeers;
+    const PipelineWakeOutcome initialWakeOutcome =
+        MaybeProcessPipelineWake(noPeers);
+    BOOST_CHECK(initialWakeOutcome == PIPELINE_WAKE_OUTCOME_NONE ||
+                initialWakeOutcome == PIPELINE_WAKE_TERMINAL_NOT_IBD);
+    BOOST_CHECK_EQUAL(
+        MaybeProcessPipelineWake(noPeers),
+        PIPELINE_WAKE_OUTCOME_NONE);
+    const uint64_t nWakeBefore =
+        ibdmetrics::Get().pipeline_wake_signals.load(std::memory_order_relaxed);
+    const int64_t nDisconnectWakeBefore =
+        ibdmetrics::Get().pipeline_wake_signal_disconnect_cleanup.load(
+            std::memory_order_relaxed);
+    const int64_t nActiveBefore =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+
+    peer.AddAskForEntry(GetTimeMicros(), CInv(MSG_BLOCK, hash));
+    BOOST_REQUIRE_EQUAL(peer.setAskForBlocks.size(), 1U);
+    BOOST_REQUIRE_EQUAL(peer.setBlocksInFlight.size(), 0U);
+    BOOST_REQUIRE_EQUAL(peer.getBlocksOutstandingSources.size(), 0U);
+    BOOST_REQUIRE_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed),
+        nActiveBefore + 1);
+
+    peer.Cleanup();
+
+    BOOST_CHECK(peer.setAskForBlocks.empty());
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed),
+        nActiveBefore);
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().pipeline_wake_signal_disconnect_cleanup.load(
+            std::memory_order_relaxed),
+        nDisconnectWakeBefore + 1);
+
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().pipeline_wake_signals.load(std::memory_order_relaxed),
+        nWakeBefore + 1);
+
+    BOOST_CHECK_EQUAL(
+        MaybeProcessPipelineWake(noPeers),
+        PIPELINE_WAKE_TERMINAL_NOT_IBD);
+
+    const int64_t nActiveAfter =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+    const uint64_t nWakeAfter =
+        ibdmetrics::Get().pipeline_wake_signals.load(std::memory_order_relaxed);
+    peer.Cleanup();
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed),
+        nActiveAfter);
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().pipeline_wake_signals.load(std::memory_order_relaxed),
+        nWakeAfter);
+}
+
+BOOST_AUTO_TEST_CASE(disconnect_cleanup_queued_unsent_getblocks_signals_wake)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(851), "disconnect-queued-gb", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+    std::vector<CNode*> peers(1, &peer);
+
+    peer.getBlocksIndex.push_back(pindexBest);
+    peer.getBlocksHash.push_back(uint256(0));
+    peer.getBlocksSources.push_back(
+        ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
+    peer.getBlocksRecoveryIds.push_back(0);
+    peer.getBlocksIndex.push_back(pindexBest);
+    peer.getBlocksHash.push_back(uint256(0));
+    peer.getBlocksSources.push_back(
+        ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
+    peer.getBlocksRecoveryIds.push_back(0);
+    ibdmetrics::GetBlocksQueuedAdd(2, true);
+
+    const int64_t nWakeSignalsBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_signals);
+    const int64_t nDisconnectWakeBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_disconnect_cleanup);
+    uint64_t nRequestedBefore = 0, nHandledBefore = 0;
+    GetPipelineWakeStateForTesting(&nRequestedBefore, &nHandledBefore, NULL,
+                                   NULL);
+
+    BOOST_REQUIRE_EQUAL(peer.getBlocksIndex.size(), 2U);
+    BOOST_REQUIRE_EQUAL(peer.getBlocksHash.size(), 2U);
+    BOOST_REQUIRE_EQUAL(peer.getBlocksSources.size(), 2U);
+    BOOST_REQUIRE_EQUAL(peer.getBlocksRecoveryIds.size(), 2U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.getBlocksOutstandingSources.size(), 0U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_getblocks_queued_requests_current),
+        2);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peers_with_queued_getblocks_current), 1);
+    CheckWakeGaugeBalance(peers);
+
+    peer.Cleanup();
+
+    BOOST_CHECK(peer.getBlocksIndex.empty());
+    BOOST_CHECK(peer.getBlocksHash.empty());
+    BOOST_CHECK(peer.getBlocksSources.empty());
+    BOOST_CHECK(peer.getBlocksRecoveryIds.empty());
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_getblocks_queued_requests_current),
+        0);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peers_with_queued_getblocks_current), 0);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().pipeline_wake_signals),
+                      nWakeSignalsBefore + 1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_disconnect_cleanup),
+        nDisconnectWakeBefore + 1);
+
+    uint64_t nRequested = 0, nHandled = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nRequested, nRequestedBefore + 1);
+    BOOST_CHECK_EQUAL(nHandled, nHandledBefore);
+    CheckWakeGaugeBalance(peers);
+
+    // Repeated Cleanup must not re-decrement gauges or re-signal the wake.
+    const int64_t nWakeAfter =
+        MetricGet(ibdmetrics::Get().pipeline_wake_signals);
+    peer.Cleanup();
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().pipeline_wake_signals),
+                      nWakeAfter);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_getblocks_queued_requests_current),
+        0);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peers_with_queued_getblocks_current), 0);
+
+    // The latched disconnect wake is still processable by the handler.
+    const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequested);
+    CheckWakeGaugeBalance(peers);
+
+    ClearQueuedGetBlocks(peer);
+    ResetPeerWakeDedupState(peer);
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+// --- Pipeline-wake regression matrix ----------------------------------------
+
+BOOST_AUTO_TEST_CASE(cooldown_active_keeps_wake_latched)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(900), "wake-cooldown", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+    std::vector<CNode*> peers(1, &peer);
+
+    // Pending wake plus an active 1-second getblocks cooldown.
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    SetPipelineWakeLastGetBlocksTimeForTesting(nNow);
+
+    const PipelineWakeOutcome firstOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(firstOutcome, PIPELINE_WAKE_TRANSIENT_COOLDOWN_ACTIVE);
+
+    uint64_t nRequested = 0, nHandled = 0;
+    uint32_t nCauseBits = 0;
+    int64_t nLastGetBlocks = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, &nCauseBits,
+                                   &nLastGetBlocks);
+    BOOST_CHECK_EQUAL(nRequested, 1U);
+    BOOST_CHECK_EQUAL(nHandled, 0U);
+    BOOST_CHECK_EQUAL(nLastGetBlocks, nNow);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 0U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_getblocks_queued_requests_current),
+        0);
+    CheckWakeGaugeBalance(peers);
+
+    // Advance past the cooldown; the same latched wake must still be served.
+    SetMockTime(nNow + 2);
+    const PipelineWakeOutcome secondOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(secondOutcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+    BOOST_REQUIRE_EQUAL(peer.getBlocksSources.size(), 1U);
+    BOOST_CHECK_EQUAL((int)peer.getBlocksSources[0],
+                      (int)ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_getblocks_queued_requests_current),
+        1);
+    CheckWakeGaugeBalance(peers);
+
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, &nCauseBits,
+                                   &nLastGetBlocks);
+    BOOST_CHECK_EQUAL(nHandled, 1U);
+    BOOST_CHECK_EQUAL(nLastGetBlocks, nNow + 2);
+
+    ClearQueuedGetBlocks(peer);
+    ResetPeerWakeDedupState(peer);
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(dedup_all_keeps_wake_latched)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(910), "wake-dedup-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(911), "wake-dedup-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(912), "wake-dedup-c", true);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    PrepareWakeEligiblePeer(peerA, nBestHeight + 100, nNow);
+    PrepareWakeEligiblePeer(peerB, nBestHeight + 200, nNow);
+    PrepareWakeEligiblePeer(peerC, nBestHeight + 300, nNow);
+
+    // Every eligible peer holds the identical locator state inside the
+    // 5-second dedup window.
+    const int64_t nDedupTime = nNow - 1;
+    MarkPeerWakeDedupBlocked(peerA, pindexBest, nDedupTime);
+    MarkPeerWakeDedupBlocked(peerB, pindexBest, nDedupTime);
+    MarkPeerWakeDedupBlocked(peerC, pindexBest, nDedupTime);
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    peers.push_back(&peerC);
+
+    const int64_t nDedupBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_dedup);
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+
+    const PipelineWakeOutcome firstOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(firstOutcome, PIPELINE_WAKE_TRANSIENT_DEDUP_ALL);
+
+    uint64_t nRequested = 0, nHandled = 0;
+    uint32_t nCauseBits = 0;
+    int64_t nLastGetBlocks = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, &nCauseBits,
+                                   &nLastGetBlocks);
+    BOOST_CHECK_EQUAL(nHandled, 0U);
+    BOOST_CHECK_EQUAL(nLastGetBlocks, 0);
+    BOOST_CHECK_EQUAL(TotalQueuedGetBlocks(peers), 0U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_dedup),
+        nDedupBefore + 3);
+    CheckWakeGaugeBalance(peers);
+
+    // Advance past the 5-second dedup window; same latched wake serves one
+    // wake getblocks to exactly one peer.
+    SetMockTime(nNow + 6);
+    const PipelineWakeOutcome secondOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(secondOutcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+    BOOST_CHECK_EQUAL(TotalQueuedGetBlocks(peers), 1U);
+    size_t nWakeQueued = 0;
+    for (std::vector<CNode*>::const_iterator it = peers.begin();
+         it != peers.end(); ++it)
+    {
+        if ((*it)->getBlocksIndex.size() == 1U)
+        {
+            ++nWakeQueued;
+            BOOST_REQUIRE_EQUAL((*it)->getBlocksSources.size(), 1U);
+            BOOST_CHECK_EQUAL(
+                (int)(*it)->getBlocksSources[0],
+                (int)ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
+        }
+    }
+    BOOST_CHECK_EQUAL(nWakeQueued, 1U);
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, &nCauseBits,
+                                   &nLastGetBlocks);
+    BOOST_CHECK_EQUAL(nHandled, 1U);
+    CheckWakeGaugeBalance(peers);
+
+    for (std::vector<CNode*>::const_iterator it = peers.begin();
+         it != peers.end(); ++it)
+    {
+        ClearQueuedGetBlocks(**it);
+        ResetPeerWakeDedupState(**it);
+    }
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(forced_cs_main_failure_keeps_generation_pending)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(920), "wake-csmain-fail", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+    std::vector<CNode*> peers(1, &peer);
+
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    uint64_t nRequestedBefore = 0, nHandledBefore = 0;
+    int64_t nLastGetBlocksBefore = 0;
+    GetPipelineWakeStateForTesting(&nRequestedBefore, &nHandledBefore, NULL,
+                                   &nLastGetBlocksBefore);
+
+    const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers, true);
+    BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TRANSIENT_CS_MAIN_TRYLOCK_FAILED);
+
+    uint64_t nRequested = 0, nHandled = 0;
+    uint32_t nCauseBits = 0;
+    int64_t nLastGetBlocks = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, &nCauseBits,
+                                   &nLastGetBlocks);
+    BOOST_CHECK_EQUAL(nRequested, nRequestedBefore);
+    BOOST_CHECK_EQUAL(nHandled, nHandledBefore);
+    BOOST_CHECK_EQUAL(nLastGetBlocks, nLastGetBlocksBefore);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.getBlocksOutstandingSources.size(), 0U);
+    BOOST_CHECK(peer.pindexLastGetBlocksBegin == NULL);
+    CheckWakeGaugeBalance(peers);
+
+    // The same pending generation is served by a normal call.
+    const PipelineWakeOutcome secondOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(secondOutcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequestedBefore);
+    BOOST_CHECK(nHandled >= nHandledBefore);
+    CheckWakeGaugeBalance(peers);
+
+    ClearQueuedGetBlocks(peer);
+    ResetPeerWakeDedupState(peer);
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(cs_vnodes_trylock_failure_keeps_generation_pending)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(930), "wake-vnodes-fail", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+    std::vector<CNode*> peers(1, &peer);
+
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    uint64_t nRequestedBefore = 0, nHandledBefore = 0;
+    int64_t nLastGetBlocksBefore = 0;
+    GetPipelineWakeStateForTesting(&nRequestedBefore, &nHandledBefore, NULL,
+                                   &nLastGetBlocksBefore);
+    const PipelineWakeGauges gBefore = SnapshotWakeGauges();
+
+    // A helper thread deterministically holds cs_vNodes so the handler's
+    // second TRY_LOCK fails.  No production state is changed.
+    boost::barrier barrier(2);
+    boost::thread t([&barrier]() {
+        LOCK(cs_vNodes);
+        barrier.wait();
+        barrier.wait();
+    });
+    barrier.wait();
+
+    const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TRANSIENT_CS_VNODES_TRYLOCK_FAILED);
+
+    barrier.wait();
+    t.join();
+
+    uint64_t nRequested = 0, nHandled = 0;
+    uint32_t nCauseBits = 0;
+    int64_t nLastGetBlocks = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, &nCauseBits,
+                                   &nLastGetBlocks);
+    BOOST_CHECK_EQUAL(nRequested, nRequestedBefore);
+    BOOST_CHECK_EQUAL(nHandled, nHandledBefore);
+    BOOST_CHECK_EQUAL(nLastGetBlocks, nLastGetBlocksBefore);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.getBlocksOutstandingSources.size(), 0U);
+    BOOST_CHECK_EQUAL(SnapshotWakeGauges().global_active_current,
+                      gBefore.global_active_current);
+    CheckWakeGaugeBalance(peers);
+
+    // The same pending generation is served by a normal call.
+    const PipelineWakeOutcome secondOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(secondOutcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequestedBefore);
+    CheckWakeGaugeBalance(peers);
+
+    ClearQueuedGetBlocks(peer);
+    ResetPeerWakeDedupState(peer);
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(outstanding_response_clear_signals_wake)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(940), "wake-outstanding", true);
+
+    peer.getBlocksOutstandingSources.push_back(
+        ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+    ibdmetrics::GetBlocksOutstandingAdd(1);
+    const int64_t nGaugeBefore =
+        MetricGet(ibdmetrics::Get().getblocks_outstanding_current);
+    BOOST_REQUIRE_EQUAL(nGaugeBefore, 1);
+
+    uint64_t nRequestedBefore = 0, nHandledBefore = 0;
+    GetPipelineWakeStateForTesting(&nRequestedBefore, &nHandledBefore, NULL,
+                                   NULL);
+
+    BOOST_CHECK(peer.ConsumeGetBlocksResponseFront());
+    BOOST_CHECK(peer.getBlocksOutstandingSources.empty());
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().getblocks_outstanding_current),
+        nGaugeBefore - 1);
+
+    uint32_t nCauseBits = 0;
+    uint64_t nRequested = 0, nHandled = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, &nCauseBits, NULL);
+    BOOST_CHECK(nCauseBits & WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED);
+    BOOST_CHECK_EQUAL(nRequested, nRequestedBefore + 1);
+    BOOST_CHECK_EQUAL(nHandled, nHandledBefore);
+
+    // A repeated call on the empty deque is a pure no-op.
+    const uint64_t nRequestedBeforeRepeat = nRequested;
+    BOOST_CHECK(!peer.ConsumeGetBlocksResponseFront());
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nRequested, nRequestedBeforeRepeat);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().getblocks_outstanding_current),
+        nGaugeBefore - 1);
+
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(cleanup_outstanding_clear_signals_once)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(950), "wake-cleanup", true);
+
+    const size_t kOutstanding = 3;
+    for (size_t i = 0; i < kOutstanding; ++i)
+        peer.getBlocksOutstandingSources.push_back(
+            ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+    ibdmetrics::GetBlocksOutstandingAdd((int64_t)kOutstanding);
+    const int64_t nGaugeBefore =
+        MetricGet(ibdmetrics::Get().getblocks_outstanding_current);
+    BOOST_REQUIRE_EQUAL(nGaugeBefore, (int64_t)kOutstanding);
+    const uint64_t nWakeBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_signals);
+    const int64_t nNoResponseBefore =
+        MetricGet(ibdmetrics::Get().getblocks_no_response_disconnect_cleanup);
+
+    // No active work, only outstanding getblocks: the wake must be caused by
+    // the outstanding-cleared + disconnect-cleanup pair alone.
+    BOOST_REQUIRE(peer.setAskForBlocks.empty());
+    BOOST_REQUIRE(peer.setBlocksInFlight.empty());
+    peer.Cleanup();
+
+    BOOST_CHECK(peer.getBlocksOutstandingSources.empty());
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().getblocks_outstanding_current),
+        nGaugeBefore - (int64_t)kOutstanding);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().getblocks_no_response_disconnect_cleanup),
+        nNoResponseBefore + (int64_t)kOutstanding);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().pipeline_wake_signals),
+                      nWakeBefore + 1);
+
+    uint32_t nCauseBits = 0;
+    GetPipelineWakeStateForTesting(NULL, NULL, &nCauseBits, NULL);
+    BOOST_CHECK(nCauseBits & WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED);
+    BOOST_CHECK(nCauseBits & WAKE_CAUSE_DISCONNECT_CLEANUP);
+
+    // A repeated Cleanup must not re-account or re-signal.
+    const int64_t nGaugeAfter =
+        MetricGet(ibdmetrics::Get().getblocks_outstanding_current);
+    const uint64_t nWakeAfter = MetricGet(ibdmetrics::Get().pipeline_wake_signals);
+    peer.Cleanup();
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().getblocks_outstanding_current), nGaugeAfter);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().pipeline_wake_signals),
+                      nWakeAfter);
+
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(deferred_refill_precedes_wake_getblocks)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(960), "wake-refill", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+
+    const uint256 deferred(930000);
+    BOOST_REQUIRE(peer.DeferBlockInv(deferred));
+    std::vector<CNode*> peers(1, &peer);
+
+    const PipelineWakeGauges gBefore = SnapshotWakeGauges();
+    BOOST_CHECK_EQUAL(gBefore.total_deferred_current, 1);
+
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TERMINAL_DEFERRED_REFILL_CREATED_WORK);
+
+    // The deferred block was admitted into the queued AskFor set...
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, deferred), 1U);
+    BOOST_CHECK(!peer.IsBlockInvDeferred(deferred));
+    // ... and no wake getblocks was queued.
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 0U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_getblocks_queued_requests_current),
+        0);
+
+    uint64_t nRequested = 0, nHandled = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequested);
+
+    const PipelineWakeGauges gAfter = SnapshotWakeGauges();
+    BOOST_CHECK_EQUAL(gAfter.global_active_current,
+                      gBefore.global_active_current + 1);
+    BOOST_CHECK_EQUAL(gAfter.total_queued_current,
+                      gBefore.total_queued_current + 1);
+    BOOST_CHECK_EQUAL(gAfter.total_deferred_current,
+                      gBefore.total_deferred_current - 1);
+    CheckWakeGaugeBalance(peers);
+
+    peer.ClearAskFor();
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(refill_zero_then_continuation)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode ownerPeer(INVALID_SOCKET, TestPeerAddress(972), "wake-owner", true);
+    CNode peer(INVALID_SOCKET, TestPeerAddress(971), "wake-refill-zero", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+
+    // All deferred entries are unusable: already-have and two other-peer-owned
+    // blocks.  The wake handler only runs the refill on an empty pipeline, so
+    // a same-peer queued blocker is deliberately not used here (it would trip
+    // PIPELINE_WAKE_TERMINAL_PIPELINE_NOT_EMPTY before the refill pass).
+    const uint256 alreadyHave = pindexBest->GetBlockHash();
+    const uint256 ownedA(930100);
+    const uint256 ownedB(930200);
+    BOOST_CHECK(TryAssignBlockRequestOwner(ownedA, ownerPeer.GetId(),
+                                           BLOCKREQ_SOURCE_INV));
+    BOOST_CHECK(TryAssignBlockRequestOwner(ownedB, ownerPeer.GetId(),
+                                           BLOCKREQ_SOURCE_INV));
+    BOOST_REQUIRE(peer.DeferBlockInv(alreadyHave));
+    BOOST_REQUIRE(peer.DeferBlockInv(ownedA));
+    BOOST_REQUIRE(peer.DeferBlockInv(ownedB));
+
+    std::vector<CNode*> peers(1, &peer);
+    const int64_t nRefillAttemptsBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_refill_attempts);
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+
+    const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+
+    // Refill was attempted first and admitted nothing.
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().pipeline_wake_refill_attempts),
+                      nRefillAttemptsBefore + 1);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().pipeline_wake_refill_admitted),
+                      0);
+    // The already-have entry was dropped; the rotated other-peer-owned entries
+    // are still deferred and still owned.
+    BOOST_CHECK(!peer.IsBlockInvDeferred(alreadyHave));
+    BOOST_CHECK(peer.IsBlockInvDeferred(ownedA));
+    BOOST_CHECK(peer.IsBlockInvDeferred(ownedB));
+    NodeId nOwnerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(ownedA, &nOwnerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(nOwnerPeer, ownerPeer.GetId());
+    BOOST_CHECK(GetBlockRequestOwner(ownedB, &nOwnerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(nOwnerPeer, ownerPeer.GetId());
+    // Nothing new was admitted into the AskFor set.
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, ownedA), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, ownedB), 0U);
+    // The continuation queued exactly one wake getblocks.
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+    BOOST_REQUIRE_EQUAL(peer.getBlocksSources.size(), 1U);
+    BOOST_CHECK_EQUAL((int)peer.getBlocksSources[0],
+                      (int)ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
+
+    uint64_t nRequested = 0, nHandled = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequested);
+    CheckWakeGaugeBalance(peers);
+
+    peer.ClearAskFor();
+    ClearQueuedGetBlocks(peer);
+    peer.PopFrontDeferredBlockInv();
+    peer.PopFrontDeferredBlockInv();
+    ReleaseBlockRequestOwner(ownedA, ownerPeer.GetId(), "test");
+    ReleaseBlockRequestOwner(ownedB, ownerPeer.GetId(), "test");
+    ResetPeerWakeDedupState(peer);
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(multiple_eligible_peers_queue_exactly_one)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(981), "wake-multi-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(982), "wake-multi-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(983), "wake-multi-c", true);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    PrepareWakeEligiblePeer(peerA, nBestHeight + 100, nNow);
+    PrepareWakeEligiblePeer(peerB, nBestHeight + 200, nNow);
+    PrepareWakeEligiblePeer(peerC, nBestHeight + 300, nNow);
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    peers.push_back(&peerC);
+
+    const int64_t nAttemptedBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_attempted);
+    const int64_t nQueuedBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_queued);
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+
+    const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+
+    BOOST_CHECK_EQUAL(TotalQueuedGetBlocks(peers), 1U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_attempted),
+        nAttemptedBefore + 1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_queued),
+        nQueuedBefore + 1);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_dedup),
+                      0);
+
+    // The global cooldown is set exactly once, by the single queue.
+    int64_t nLastGetBlocks = 0;
+    GetPipelineWakeStateForTesting(NULL, NULL, NULL, &nLastGetBlocks);
+    BOOST_CHECK_EQUAL(nLastGetBlocks, nNow);
+
+    // Exactly one peer carries the wake getblocks, sourced as a wake.
+    size_t nWakeQueued = 0;
+    for (std::vector<CNode*>::const_iterator it = peers.begin();
+         it != peers.end(); ++it)
+    {
+        if ((*it)->getBlocksIndex.size() == 1U)
+        {
+            ++nWakeQueued;
+            BOOST_REQUIRE_EQUAL((*it)->getBlocksSources.size(), 1U);
+            BOOST_CHECK_EQUAL(
+                (int)(*it)->getBlocksSources[0],
+                (int)ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
+        }
+    }
+    BOOST_CHECK_EQUAL(nWakeQueued, 1U);
+
+    uint64_t nRequested = 0, nHandled = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequested);
+    CheckWakeGaugeBalance(peers);
+
+    for (std::vector<CNode*>::const_iterator it = peers.begin();
+         it != peers.end(); ++it)
+    {
+        ClearQueuedGetBlocks(**it);
+        ResetPeerWakeDedupState(**it);
+    }
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(top_peer_dedup_rotates_to_next)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerTop(INVALID_SOCKET, TestPeerAddress(985), "wake-top", true);
+    CNode peerSecond(INVALID_SOCKET, TestPeerAddress(986), "wake-second", true);
+    CScopedInitialBlockDownloadState ibdState(&peerTop);
+    PrepareWakeEligiblePeer(peerTop, nBestHeight + 300, nNow);
+    PrepareWakeEligiblePeer(peerSecond, nBestHeight + 200, nNow);
+
+    // Top-scoring peer is dedup-blocked; the second peer is clean.
+    MarkPeerWakeDedupBlocked(peerTop, pindexBest, nNow - 1);
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerTop);
+    peers.push_back(&peerSecond);
+
+    // requested=2 so the candidate rotation starts at the top-scoring peer.
+    SetPipelineWakeRequestedForTesting(2, 0, WAKE_CAUSE_OTHER);
+    const int64_t nDedupBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_dedup);
+    const int64_t nQueuedBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_queued);
+
+    const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+
+    BOOST_CHECK_EQUAL(peerTop.getBlocksIndex.size(), 0U);
+    BOOST_CHECK_EQUAL(peerSecond.getBlocksIndex.size(), 1U);
+    BOOST_REQUIRE_EQUAL(peerSecond.getBlocksSources.size(), 1U);
+    BOOST_CHECK_EQUAL((int)peerSecond.getBlocksSources[0],
+                      (int)ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_dedup),
+        nDedupBefore + 1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_queued),
+        nQueuedBefore + 1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_getblocks_attempted),
+        1);
+
+    // The global cooldown is consumed only once, after the second peer queue.
+    int64_t nLastGetBlocks = 0;
+    GetPipelineWakeStateForTesting(NULL, NULL, NULL, &nLastGetBlocks);
+    BOOST_CHECK_EQUAL(nLastGetBlocks, nNow);
+
+    uint64_t nRequested = 0, nHandled = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequested);
+    CheckWakeGaugeBalance(peers);
+
+    ClearQueuedGetBlocks(peerTop);
+    ClearQueuedGetBlocks(peerSecond);
+    ResetPeerWakeDedupState(peerTop);
+    ResetPeerWakeDedupState(peerSecond);
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(queued_and_outstanding_suppress_wake)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    // Subcase A: a pre-existing queued getblocks suppresses the wake.
+    CNode peerQueued(INVALID_SOCKET, TestPeerAddress(987), "wake-queued", true);
+    CScopedInitialBlockDownloadState ibdState(&peerQueued);
+    PrepareWakeEligiblePeer(peerQueued, nBestHeight + 100, nNow);
+    peerQueued.PushGetBlocks(pindexBest, uint256(0),
+                             ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+    std::vector<CNode*> peersQueued(1, &peerQueued);
+
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    const PipelineWakeOutcome outcomeA = MaybeProcessPipelineWake(peersQueued);
+    BOOST_CHECK_EQUAL(outcomeA, PIPELINE_WAKE_TERMINAL_EXISTING_QUEUED_GETBLOCKS);
+    BOOST_CHECK_EQUAL(peerQueued.getBlocksIndex.size(), 1U);
+    BOOST_REQUIRE_EQUAL(peerQueued.getBlocksSources.size(), 1U);
+    BOOST_CHECK_EQUAL((int)peerQueued.getBlocksSources[0],
+                      (int)ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+    uint64_t nRequested = 0, nHandled = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequested);
+    CheckWakeGaugeBalance(peersQueued);
+    ClearQueuedGetBlocks(peerQueued);
+    ResetPeerWakeDedupState(peerQueued);
+
+    // Subcase B: a pre-existing outstanding getblocks suppresses the wake and
+    // clearing it raises a fresh wake signal.
+    CNode peerOutstanding(INVALID_SOCKET, TestPeerAddress(988),
+                          "wake-outstanding-suppress", true);
+    CScopedInitialBlockDownloadState ibdStateB(&peerOutstanding);
+    PrepareWakeEligiblePeer(peerOutstanding, nBestHeight + 100, nNow);
+    peerOutstanding.getBlocksOutstandingSources.push_back(
+        ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+    ibdmetrics::GetBlocksOutstandingAdd(1);
+    std::vector<CNode*> peersOutstanding(1, &peerOutstanding);
+
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    const PipelineWakeOutcome outcomeB =
+        MaybeProcessPipelineWake(peersOutstanding);
+    BOOST_CHECK_EQUAL(outcomeB,
+                      PIPELINE_WAKE_TERMINAL_OUTSTANDING_GETBLOCKS_PRESENT);
+    BOOST_CHECK_EQUAL(peerOutstanding.getBlocksIndex.size(), 0U);
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequested);
+    CheckWakeGaugeBalance(peersOutstanding);
+
+    uint64_t nRequestedBeforePop = 0, nHandledBeforePop = 0;
+    uint32_t nCauseBitsBeforePop = 0;
+    GetPipelineWakeStateForTesting(&nRequestedBeforePop, &nHandledBeforePop,
+                                   &nCauseBitsBeforePop, NULL);
+    BOOST_CHECK(peerOutstanding.ConsumeGetBlocksResponseFront());
+    uint64_t nRequestedAfter = 0;
+    uint32_t nCauseBitsAfter = 0;
+    GetPipelineWakeStateForTesting(&nRequestedAfter, NULL, &nCauseBitsAfter,
+                                   NULL);
+    BOOST_CHECK_EQUAL(nRequestedAfter, nRequestedBeforePop + 1);
+    BOOST_CHECK(nCauseBitsAfter & WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED);
+    CheckWakeGaugeBalance(peersOutstanding);
+
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(recovery_remains_fallback_with_outstanding_wake)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    const int64_t STALL_TIMEOUT = 15;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ResetStalledSyncRecoveryStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(989), "wake-recovery", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    ScopedPeerSocket socketScope(peer);
+    std::vector<CNode*> peers(1, &peer);
+
+    CStalledSyncRecoveryState& recoveryState =
+        GetStalledSyncRecoveryStateForTesting();
+    recoveryState.MarkSyncRequestSent(nNow);
+
+    // Wake getblocks really queued and flushed over the wire.
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    const PipelineWakeOutcome wakeOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(wakeOutcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+    BOOST_CHECK(SendMessages(&peer, false));
+    BOOST_CHECK(peer.getBlocksIndex.empty());
+    BOOST_CHECK_EQUAL(peer.getBlocksOutstandingSources.size(), 1U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().getblocks_outstanding_current), 1);
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK(peer.setAskForBlocks.empty());
+
+    // Advance past the stall timeout with the outstanding wake getblocks still
+    // unanswered.  The outstanding request is NOT pipeline-active work, so the
+    // stalled-sync recovery still fires.
+    SetMockTime(nNow + STALL_TIMEOUT + 1);
+    CNode* pnodeRecovery = MaybeQueueStalledSyncRecovery(
+        peers, pindexBest, nBestHeight, nNow + STALL_TIMEOUT + 1,
+        STALL_TIMEOUT, STALL_TIMEOUT, recoveryState);
+    BOOST_REQUIRE(pnodeRecovery == &peer);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+    BOOST_REQUIRE_EQUAL(peer.getBlocksSources.size(), 1U);
+    BOOST_CHECK_EQUAL((int)peer.getBlocksSources[0],
+                      (int)ibdmetrics::GETBLOCKS_SOURCE_RECOVERY);
+    BOOST_CHECK_EQUAL(recoveryState.RecoveryAttempts(), 1U);
+    BOOST_CHECK_EQUAL(recoveryState.LastRecoveryTime(), nNow + STALL_TIMEOUT + 1);
+
+    // A subsequent wake execution does not reset the recovery backoff.
+    ClearQueuedGetBlocks(peer);
+    ResetPeerWakeDedupState(peer);
+    // Drain the outstanding wake getblocks (flushed over the wire earlier) so
+    // the peer is an eligible wake candidate again.
+    peer.getBlocksOutstandingSources.clear();
+    ibdmetrics::GetBlocksOutstandingAdd(-1);
+    SetPipelineWakeRequestedForTesting(1, 0, WAKE_CAUSE_OTHER);
+    const PipelineWakeOutcome wakeOutcome2 = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(wakeOutcome2, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+    BOOST_CHECK_EQUAL(recoveryState.RecoveryAttempts(), 1U);
+    BOOST_CHECK_EQUAL(recoveryState.LastRecoveryTime(), nNow + STALL_TIMEOUT + 1);
+    CheckWakeGaugeBalance(peers);
+
+    ClearQueuedGetBlocks(peer);
+    ResetPeerWakeDedupState(peer);
+    peer.getBlocksOutstandingSources.clear();
+    ResetStalledSyncRecoveryStateForTesting();
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(repeated_drain_refill_preserves_invariants)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(991), "wake-drain-loop", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+    std::vector<CNode*> peers(1, &peer);
+
+    for (int cycle = 0; cycle < 100; ++cycle)
+    {
+        const uint256 hash(1000000 + cycle);
+        const uint256 deferredHash(2000000 + cycle);
+
+        // 1. Active request (queued) plus an owner, drained through the wake
+        //    machinery every cycle.
+        peer.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+        BOOST_CHECK(TryAssignBlockRequestOwner(hash, peer.GetId(),
+                                               BLOCKREQ_SOURCE_INV));
+        NodeId nOwnerPeer = -1;
+        BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+        BOOST_CHECK(GetBlockRequestOwner(hash, &nOwnerPeer, &ownerState));
+        BOOST_CHECK_EQUAL(nOwnerPeer, peer.GetId());
+
+        // Owner uniqueness: a second peer can never claim the same hash.
+        NodeId nExisting = -1;
+        BlockRequestOwnerState nExistingState = BLOCK_REQUEST_OWNER_QUEUED;
+        BOOST_CHECK(!TryAssignBlockRequestOwner(
+            hash, peer.GetId() + 1, BLOCKREQ_SOURCE_INV, &nExisting,
+            &nExistingState));
+        BOOST_CHECK_EQUAL(nExisting, peer.GetId());
+
+        // 2. Drain.
+        peer.ClearAskFor();
+
+        // 3. Fresh wake.
+        ResetPipelineWakeStateForTesting();
+        RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+
+        // 4. Refill or continuation.
+        if (cycle % 2 == 0)
+        {
+            BOOST_REQUIRE(peer.DeferBlockInv(deferredHash));
+            const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+            BOOST_CHECK_EQUAL(outcome,
+                              PIPELINE_WAKE_TERMINAL_DEFERRED_REFILL_CREATED_WORK);
+            BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, deferredHash), 1U);
+        }
+        else
+        {
+            const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+            BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+            BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+        }
+        // No duplicate getblocks per wake execution.
+        BOOST_CHECK(TotalQueuedGetBlocks(peers) <= 1U);
+
+        // 5. Clear/reset.
+        peer.ClearAskFor();
+        ClearQueuedGetBlocks(peer);
+        ResetPeerWakeDedupState(peer);
+        peer.pindexLastGetBlocksBegin = NULL;
+        peer.hashLastGetBlocksEnd = 0;
+        peer.nLastGetBlocksTime = 0;
+
+        uint64_t nRequested = 0, nHandled = 0;
+        GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+        BOOST_CHECK(nHandled <= nRequested);
+
+        // Invariants: gauges balance, ownership released by drain.
+        CheckWakeGaugeBalance(peers);
+        BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+    }
+
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(send_pass_skips_disconnected_peer)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode disc(INVALID_SOCKET, TestPeerAddress(995), "sendpass-disc", true);
+    CNode connA(INVALID_SOCKET, TestPeerAddress(996), "sendpass-conn-a", true);
+    CNode connB(INVALID_SOCKET, TestPeerAddress(997), "sendpass-conn-b", true);
+
+    PreparePeerForSendMessages(disc, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(connA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(connB, PROTOCOL_VERSION);
+    disc.PushGetBlocks(pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+    connA.PushGetBlocks(pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+    connB.PushGetBlocks(pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+    disc.fDisconnect = true;
+
+    // Live sockets for the peers that must flush.  `disc` keeps INVALID_SOCKET
+    // so that a send pass which fails to skip it would attempt a real send on
+    // a dead socket and disconnect it, failing the assertions below.
+    ScopedPeerSocket socketA(connA);
+    ScopedPeerSocket socketB(connB);
+
+    std::vector<CNode*> vNodesCopy;
+    vNodesCopy.push_back(&disc);
+    vNodesCopy.push_back(&connA);
+    vNodesCopy.push_back(&connB);
+
+    // Mirror of the production send pass: skip fDisconnect peers, then send.
+    BOOST_FOREACH(CNode* pnode, vNodesCopy)
+    {
+        if (pnode->fDisconnect)
+            continue;
+        TRY_LOCK(pnode->cs_vSend, lockSend);
+        if (lockSend)
+            SendMessages(pnode, false);
+    }
+
+    // The disconnected peer's getblocks was never flushed (no real send path).
+    BOOST_CHECK_EQUAL(disc.getBlocksIndex.size(), 1U);
+    BOOST_CHECK_EQUAL(disc.getBlocksOutstandingSources.size(), 0U);
+    BOOST_CHECK_EQUAL(disc.vSendMsg.size(), 0U);
+    // The connected peers after it were still processed.
+    BOOST_CHECK_EQUAL(connA.getBlocksIndex.size(), 0U);
+    BOOST_CHECK_EQUAL(connA.getBlocksOutstandingSources.size(), 1U);
+    BOOST_CHECK_EQUAL(connB.getBlocksIndex.size(), 0U);
+    BOOST_CHECK_EQUAL(connB.getBlocksOutstandingSources.size(), 1U);
+
+    ClearQueuedGetBlocks(disc);
+    ResetPeerWakeDedupState(disc);
+    ResetPipelineWakeStateForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(shutdown_with_pending_wake_is_safe)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(998), "wake-shutdown", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+    std::vector<CNode*> peers(1, &peer);
+
+    const bool fShutdownSaved = fShutdown;
+    fShutdown = true;
+
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    uint64_t nRequestedBefore = 0, nHandledBefore = 0;
+    GetPipelineWakeStateForTesting(&nRequestedBefore, &nHandledBefore, NULL,
+                                   NULL);
+
+    const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TRANSIENT_SHUTDOWN);
+
+    uint64_t nRequested = 0, nHandled = 0;
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nRequested, nRequestedBefore);
+    BOOST_CHECK_EQUAL(nHandled, nHandledBefore);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 0U);
+    BOOST_CHECK_EQUAL(peer.getBlocksOutstandingSources.size(), 0U);
+    // No lock leak: both locks are immediately re-acquirable.
+    {
+        LOCK(cs_main);
+    }
+    {
+        LOCK(cs_vNodes);
+    }
+    CheckWakeGaugeBalance(peers);
+
+    fShutdown = fShutdownSaved;
+
+    // The still-pending generation processes safely once shutdown clears.
+    const PipelineWakeOutcome secondOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(secondOutcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+    BOOST_CHECK_EQUAL(peer.getBlocksIndex.size(), 1U);
+    GetPipelineWakeStateForTesting(&nRequested, &nHandled, NULL, NULL);
+    BOOST_CHECK_EQUAL(nHandled, nRequested);
+    CheckWakeGaugeBalance(peers);
+
+    ClearQueuedGetBlocks(peer);
+    ResetPeerWakeDedupState(peer);
+    ResetPipelineWakeStateForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(terminal_pipeline_not_empty_ends_latency_window)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(901), "wake-latency-nonempty",
+               true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+    std::vector<CNode*> peers(1, &peer);
+
+    const uint256 hash(5901);
+    peer.MarkBlockInFlight(hash);
+    BOOST_REQUIRE_EQUAL(peer.setBlocksInFlight.size(), 1U);
+
+    // A latched latency window from an earlier pending wake.
+    ibdmetrics::Get().pipeline_wake_signal_start_ms.store(
+        5555, std::memory_order_relaxed);
+
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    const PipelineWakeOutcome outcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(outcome, PIPELINE_WAKE_TERMINAL_PIPELINE_NOT_EMPTY);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_start_ms), 0);
+
+    peer.ClearBlockInFlight(hash);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(transient_cooldown_keeps_latency_window)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(902), "wake-latency-cooldown",
+               true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+    std::vector<CNode*> peers(1, &peer);
+
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    SetPipelineWakeLastGetBlocksTimeForTesting(nNow);
+    const int64_t nWindowStart =
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_start_ms);
+    BOOST_CHECK(nWindowStart != 0);
+
+    const PipelineWakeOutcome firstOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(firstOutcome, PIPELINE_WAKE_TRANSIENT_COOLDOWN_ACTIVE);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_start_ms),
+        nWindowStart);
+
+    // The same wake later queues a getblocks; the window stays open because
+    // restoration is now attributable to it.
+    SetMockTime(nNow + 2);
+    const PipelineWakeOutcome secondOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(secondOutcome, PIPELINE_WAKE_TERMINAL_GETBLOCKS_QUEUED);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_start_ms),
+        nWindowStart);
+
+    ClearQueuedGetBlocks(peer);
+    ResetPeerWakeDedupState(peer);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+    SetMockTime(0);
+}
+
+BOOST_AUTO_TEST_CASE(new_wake_after_terminal_starts_fresh_latency_window)
+{
+    const int64_t nNow = WAKE_TEST_TIME;
+    SetMockTime(nNow);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(903), "wake-latency-fresh",
+               true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
+    std::vector<CNode*> peers(1, &peer);
+
+    const uint256 hash(5903);
+    peer.MarkBlockInFlight(hash);
+    BOOST_REQUIRE_EQUAL(peer.setBlocksInFlight.size(), 1U);
+
+    // A terminal outcome that creates no work must close the stale window so
+    // the next wake opens a fresh one.
+    ibdmetrics::Get().pipeline_wake_signal_start_ms.store(
+        9999, std::memory_order_relaxed);
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    const PipelineWakeOutcome firstOutcome = MaybeProcessPipelineWake(peers);
+    BOOST_CHECK_EQUAL(firstOutcome, PIPELINE_WAKE_TERMINAL_PIPELINE_NOT_EMPTY);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_start_ms), 0);
+
+    // A brand-new wake opens a fresh window instead of inheriting the old start.
+    RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+    const int64_t nNewWindow =
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_start_ms);
+    BOOST_CHECK(nNewWindow != 0);
+    BOOST_CHECK(nNewWindow != 9999);
+
+    peer.ClearBlockInFlight(hash);
+    ResetPipelineWakeStateForTesting();
+    ibdmetrics::ResetPipelineWakeMetricsForTesting();
+    SetMockTime(0);
+}
+
 BOOST_AUTO_TEST_CASE(ownerless_queued_entry_erase_is_safe)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
@@ -3168,14 +4560,17 @@ BOOST_AUTO_TEST_CASE(watermark_events_fire_at_thresholds)
 
 // --- Frontier admission exemption -----------------------------------------
 //
-// Reproduces the runtime fixed point proven in doc/forensics: during IBD the
-// active tip H is present; the getblocks response announced H+1 as its first
-// unknown block inv; the announcing peer's orphan count makes the deferred
-// budget zero; ordinary admission is denied and the INV would otherwise be
-// deferred (and eventually dropped).  The frontier exemption admits exactly
-// one such candidate so the connectable block is requested, and clears the
-// slot when the block is received, after which drained pressure resumes
-// ordinary deferred admission.
+// During IBD the active tip H is present; the getblocks response announced
+// H+1 as its first unknown block inv.  When the peer's request window is full
+// (queued + in-flight at the per-peer cap) the deferred budget is zero,
+// ordinary admission is denied and the INV would otherwise be deferred (and
+// eventually dropped).  The frontier exemption admits exactly one such
+// candidate so the connectable block is requested, and clears the slot when
+// the block is received, after which drained pressure resumes ordinary
+// deferred admission.  Note the budget is zero because the request window is
+// full -- orphan storage pressure no longer counts toward the budget (see
+// request_budget_ignores_orphan_storage_pressure), but a non-zero orphan
+// count is still required for the exemption to apply as a stall backup.
 
 class CScopedFrontierState
 {
@@ -3191,7 +4586,7 @@ public:
     }
 };
 
-BOOST_AUTO_TEST_CASE(frontier_admission_breaks_orphan_pressure_fixed_point)
+BOOST_AUTO_TEST_CASE(frontier_admission_breaks_full_request_window_stall)
 {
     BOOST_REQUIRE(pindexBest != NULL);
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
@@ -3211,8 +4606,13 @@ BOOST_AUTO_TEST_CASE(frontier_admission_breaks_orphan_pressure_fixed_point)
     }
     peer.fFrontierResponsePending = true;
     peer.nFrontierLocatorHeight = nBestHeight;
+    // The request window is full (queued at the per-peer cap).  Ordinary
+    // admission is denied even though the peer holds 200 orphans: orphan
+    // storage pressure no longer zeroes the request budget -- a full request
+    // window does.
+    FillPeerActiveWindow(peer, 913000);
 
-    // Ordinary admission is denied: orphan pressure zeroes the budget.
+    // Ordinary admission is denied: the request window is full.
     {
         LOCK(cs_main);
         BOOST_CHECK(!TryAdmitBlockInvOrDefer(&peer, invUnrelated, false));
@@ -3239,7 +4639,8 @@ BOOST_AUTO_TEST_CASE(frontier_admission_breaks_orphan_pressure_fixed_point)
     peer.ClearBlockInFlight(hashFrontier);
     ReleaseBlockRequestOwnerOnReceive(hashFrontier, peer.GetId());
 
-    // Pressure drained: ordinary deferred admission resumes.
+    // Window drained: ordinary deferred admission resumes.
+    peer.ClearAskFor();
     {
         LOCK(cs_main);
         mapOrphanCountByNode[peer.GetId()] = 10;
@@ -3273,6 +4674,9 @@ BOOST_AUTO_TEST_CASE(frontier_exemption_holds_single_slot_across_peers)
         mapOrphanCountByNode[peerA.GetId()] = 200;
         mapOrphanCountByNode[peerB.GetId()] = 200;
     }
+    // Both peers have full request windows, so both are at a zero budget.
+    FillPeerActiveWindow(peerA, 914000);
+    FillPeerActiveWindow(peerB, 914500);
 
     // Exactly one exemption outstanding: A claims it for H+1...
     {
@@ -3330,6 +4734,8 @@ BOOST_AUTO_TEST_CASE(frontier_admission_refused_when_locator_is_stale)
     peer.fFrontierResponsePending = true;
     // The response was requested against a locator built from an earlier tip.
     peer.nFrontierLocatorHeight = nBestHeight - 1;
+    // A full request window puts the peer at a zero budget.
+    FillPeerActiveWindow(peer, 915000);
 
     {
         LOCK(cs_main);
@@ -3369,6 +4775,8 @@ BOOST_AUTO_TEST_CASE(frontier_admission_cannot_be_replayed_to_bypass_bound)
     }
     peer.fFrontierResponsePending = true;
     peer.nFrontierLocatorHeight = nBestHeight;
+    // A full request window puts the peer at a zero budget.
+    FillPeerActiveWindow(peer, 916000);
 
     // First announcement claims the single slot and is admitted.
     {
@@ -3396,6 +4804,248 @@ BOOST_AUTO_TEST_CASE(frontier_admission_cannot_be_replayed_to_bypass_bound)
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashUnrelated), 0U);
     BOOST_CHECK(peer.IsBlockInvDeferred(hashUnrelated));
 
+    peer.ClearAskFor();
+}
+
+// --- Request budget semantics: orphan pressure decoupled -------------------
+//
+// The deferred request budget reflects request pressure only (queued +
+// in-flight), never orphan storage pressure.  A peer that holds many orphans
+// must still be able to request and download the missing chain.  Orphan
+// storage is bounded separately by the hard storage caps on the receive path
+// (PeerOrphanStorageLimitExceeded / MAX_ORPHAN_BLOCKS_PER_PEER).
+
+BOOST_AUTO_TEST_CASE(request_budget_ignores_orphan_storage_pressure)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(70), "budget-no-orphan-pressure", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    // 750 stored orphans and zero queued/in-flight requests: the full request
+    // budget remains available.  Orphan storage pressure is reported
+    // separately but does not eat into the transport budget.
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
+        int nOrphan = 0, nPeer = -1, nGlobal = -1;
+        BOOST_CHECK_EQUAL(
+            GetDeferredBlockRequestBudget(&peer, &nOrphan, NULL, NULL,
+                                          &nPeer, &nGlobal),
+            (int)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+        BOOST_CHECK_EQUAL(nOrphan, (int)MAX_ORPHAN_BLOCKS_PER_PEER);
+        BOOST_CHECK_EQUAL(nPeer, 0);
+        BOOST_CHECK_EQUAL(nGlobal, 0);
+    }
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(request_budget_zero_at_full_peer_request_window_regardless_of_orphans)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(71), "budget-full-request-window", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    FillPeerActiveWindow(peer, 920000);
+
+    // Queued + in-flight at the per-peer cap (128): budget is zero no matter
+    // how many orphans the peer holds.
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peer), 0);
+        BOOST_CHECK_EQUAL(peer.setAskForBlocks.size() + peer.setBlocksInFlight.size(),
+                          (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+    }
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(request_budget_zero_at_global_request_cap)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(82), "global-cap-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(83), "global-cap-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(84), "global-cap-c", true);
+    CNode peerD(INVALID_SOCKET, TestPeerAddress(85), "global-cap-d", true);
+    CNode peerE(INVALID_SOCKET, TestPeerAddress(86), "global-cap-e", true);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    FillPeerActiveWindow(peerA, 920100);
+    FillPeerActiveWindow(peerB, 920200);
+    FillPeerActiveWindow(peerC, 920300);
+    FillPeerActiveWindow(peerD, 920400);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+        vNodes.push_back(&peerC);
+        vNodes.push_back(&peerD);
+    }
+    {
+        LOCK(cs_main);
+        // Four full peers (including the fixture-registered peerA) reach the
+        // 512 global request cap; a peer with none of its own requests still
+        // gets a zero global budget.
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peerE), 0);
+        int nPeer = -1, nGlobal = -1;
+        GetDeferredBlockRequestBudget(&peerE, NULL, NULL, NULL,
+                                      &nPeer, &nGlobal);
+        BOOST_CHECK_EQUAL(nPeer, 0);
+        BOOST_CHECK_EQUAL(nGlobal, (int)MAX_DEFERRED_INV_ACTIVE_GLOBAL);
+    }
+    {
+        LOCK(cs_vNodes);
+        vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), &peerB),
+                     vNodes.end());
+        vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), &peerC),
+                     vNodes.end());
+        vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), &peerD),
+                     vNodes.end());
+    }
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    peerC.ClearAskFor();
+    peerD.ClearAskFor();
+    peerE.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(orphan_storage_cap_remains_enforced_independently_of_request_budget)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(72), "orphan-storage-cap", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    {
+        LOCK(cs_main);
+        // The hard per-peer storage cap is still enforced: a peer may store
+        // orphans up to MAX_ORPHAN_BLOCKS_PER_PEER but not past it.
+        mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER - 1;
+        int nCount = -1;
+        BOOST_CHECK(!PeerOrphanStorageLimitExceeded(peer.GetId(), &nCount));
+        BOOST_CHECK_EQUAL(nCount, (int)MAX_ORPHAN_BLOCKS_PER_PEER - 1);
+
+        mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
+        BOOST_CHECK(PeerOrphanStorageLimitExceeded(peer.GetId(), &nCount));
+        BOOST_CHECK_EQUAL(nCount, (int)MAX_ORPHAN_BLOCKS_PER_PEER);
+
+        mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER + 1;
+        BOOST_CHECK(PeerOrphanStorageLimitExceeded(peer.GetId(), &nCount));
+        BOOST_CHECK_EQUAL(nCount, (int)MAX_ORPHAN_BLOCKS_PER_PEER + 1);
+        mapOrphanCountByNode.erase(peer.GetId());
+
+        // Decoupling does not weaken the storage cap: at the storage cap the
+        // request budget stays fully positive (storage and transport pressure
+        // are independent dimensions).
+        mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
+        BOOST_CHECK(PeerOrphanStorageLimitExceeded(peer.GetId(), NULL));
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peer),
+                          (int)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+    }
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(getblocks_continuation_keeps_bounded_pipeline_under_orphan_pressure)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(73), "bounded-pipeline-orphans", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
+    }
+
+    // A deferred backlog under heavy orphan pressure.  The getblocks
+    // continuation (the chain-front candidate) sits at position 128, inside
+    // the first full-window refill.
+    for (size_t i = 0; i < MAX_DEFERRED_INV_ACTIVE_PER_PEER - 1; ++i)
+        BOOST_REQUIRE(peer.DeferBlockInv(uint256(930000 + i)));
+    const uint256 continuation(930200);
+    BOOST_REQUIRE(peer.DeferBlockInv(continuation));
+    const uint256 tail(930300);
+    BOOST_REQUIRE(peer.DeferBlockInv(tail));
+
+    {
+        LOCK(cs_main);
+        // Refill admits up to the full per-peer request window despite the
+        // orphan pressure -- but never beyond it.
+        size_t nAdmitted = RefillDeferredBlockRequests(&peer);
+        BOOST_CHECK_EQUAL(nAdmitted,
+                          (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+        BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(),
+                          (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+        // The continuation (chain front) was admitted within the bounded
+        // pipeline; the tail stays deferred for a later pump.
+        BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, continuation), 1U);
+        BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, tail), 0U);
+        BOOST_CHECK(peer.IsBlockInvDeferred(tail));
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peer), 0);
+    }
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(malicious_unrelated_inv_traffic_cannot_exceed_active_request_caps)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(74), "unrelated-inv-cap", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    FillPeerActiveWindow(peer, 931000);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
+    }
+
+    // A flood of unrelated announcements at a full request window is deferred,
+    // never admitted: the active queued + in-flight set cannot exceed the
+    // per-peer cap even for a peer at the orphan storage limit.
+    size_t nAdmitted = 0;
+    for (int i = 0; i < 256; ++i)
+    {
+        const CInv inv(MSG_BLOCK, uint256(932000 + i));
+        {
+            LOCK(cs_main);
+            if (TryAdmitBlockInvOrDefer(&peer, inv, false))
+                ++nAdmitted;
+        }
+    }
+    BOOST_CHECK_EQUAL(nAdmitted, 0U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size() + peer.setBlocksInFlight.size(),
+                      (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+    BOOST_CHECK(peer.deferredBlockInv.size() <=
+                (size_t)MAX_DEFERRED_BLOCK_INV_PER_PEER);
+    peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(terminal_stall_remains_fixed_after_request_window_drain)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(75), "terminal-stall-regress", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    FillPeerActiveWindow(peer, 933000);
+    {
+        LOCK(cs_main);
+        mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
+    }
+    const uint256 deferred(934000);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(peer.DeferBlockInv(deferred));
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peer), 0);
+    }
+
+    // The window drains by one slot: the budget goes positive and the deferred
+    // item is admitted, so IBD progress resumes -- no permanent stall even
+    // while the peer remains at the orphan storage cap.
+    peer.EraseAskForEntry(peer.mapAskFor.begin());
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peer), 1);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&peer), 1U);
+    }
+    BOOST_CHECK_EQUAL(peer.deferredBlockInv.size(), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, deferred), 1U);
     peer.ClearAskFor();
 }
 

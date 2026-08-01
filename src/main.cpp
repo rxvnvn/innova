@@ -15,6 +15,7 @@
 #include "wallet.h"
 #include "ui_interface.h"
 #include "ibdefficiency.h"
+#include "ibdmetrics.h"
 #include "kernel.h"
 #include "collateral.h"
 #include "collateralnode.h"
@@ -132,6 +133,19 @@ static int GetPeerOrphanCount(NodeId nodeid)
     return it == mapOrphanCountByNode.end() ? 0 : it->second;
 }
 
+// Hard per-peer orphan storage cap.  The deferred request scheduler no longer
+// subtracts orphan storage pressure from the active request budget, so this
+// predicate is the sole enforcement point that keeps one peer's orphan
+// storage bounded at MAX_ORPHAN_BLOCKS_PER_PEER.  Kept behavior-identical to
+// the inline checks it replaces; extracted so the cap is unit-testable.
+bool PeerOrphanStorageLimitExceeded(NodeId peer, int* pnOrphanCountPeer)
+{
+    const int nOrphanCountPeer = GetPeerOrphanCount(peer);
+    if (pnOrphanCountPeer)
+        *pnOrphanCountPeer = nOrphanCountPeer;
+    return nOrphanCountPeer >= MAX_ORPHAN_BLOCKS_PER_PEER;
+}
+
 // Returns 1 when the local active-chain tip is an ancestor of the peer's
 // advertised best-known block, 0 when the peer is on a competing branch, and
 // -1 when the peer's best-known block is unknown or too deep to check.
@@ -219,10 +233,13 @@ static void BlockRequestTraceOrphanPressure(CNode* pfrom, int nOrphanCountPeer,
 
 
 
-static int CountGlobalActiveBlockRequests(CNode* extraPeer)
+static int CountGlobalActiveBlockRequests(CNode* extraPeer,
+                                          bool* pfVNodesLockFailed = NULL)
 {
     int nGlobalActive = 0;
     TRY_LOCK(cs_vNodes, lockNodes);
+    if (pfVNodesLockFailed)
+        *pfVNodesLockFailed = !lockNodes;
     if (lockNodes)
     {
         for (std::vector<CNode*>::const_iterator it = vNodes.begin();
@@ -265,14 +282,29 @@ int GetDeferredBlockRequestBudget(CNode* pfrom,
     if (pnGlobalActivePressure)
         *pnGlobalActivePressure = 0;
     if (pfrom == NULL || !IsInitialBlockDownload())
+    {
+        if (pfrom != NULL)
+        {
+            const int nOldZero = pfrom->nDeferredBudgetZero.exchange(
+                0, std::memory_order_relaxed);
+            ibdmetrics::PeerZeroStateChange(nOldZero, 0);
+        }
         return MAX_DEFERRED_INV_ACTIVE_PER_PEER;
+    }
 
     const int nOrphanCountPeer = GetPeerOrphanCount(pfrom->GetId());
     const int nQueuedBlockRequests = (int)pfrom->setAskForBlocks.size();
     const int nSentBlockRequests = (int)pfrom->setBlocksInFlight.size();
-    const int nPeerActivePressure = nOrphanCountPeer +
-        nQueuedBlockRequests + nSentBlockRequests;
-    const int nGlobalActivePressure = CountGlobalActiveBlockRequests(pfrom);
+    // Request pressure only: queued + in-flight block requests.  Orphan
+    // storage pressure is deliberately NOT subtracted from the active
+    // transport budget -- a peer that holds many orphans must still be able
+    // to request and download the missing chain.  Orphan storage is bounded
+    // separately by the hard storage caps (MAX_ORPHAN_BLOCKS_PER_PEER /
+    // DEFAULT_MAX_ORPHAN_BLOCKS) enforced on the receive path.
+    const int nPeerActivePressure = nQueuedBlockRequests + nSentBlockRequests;
+    bool fVNodesLockFailed = false;
+    const int nGlobalActivePressure =
+        CountGlobalActiveBlockRequests(pfrom, &fVNodesLockFailed);
     if (pnOrphanCountPeer)
         *pnOrphanCountPeer = nOrphanCountPeer;
     if (pnQueuedBlockRequests)
@@ -286,7 +318,37 @@ int GetDeferredBlockRequestBudget(CNode* pfrom,
 
     const int nPeerBudget = MAX_DEFERRED_INV_ACTIVE_PER_PEER - nPeerActivePressure;
     const int nGlobalBudget = MAX_DEFERRED_INV_ACTIVE_GLOBAL - nGlobalActivePressure;
-    return std::max(0, std::min(nPeerBudget, nGlobalBudget));
+    const int nBudget = std::max(0, std::min(nPeerBudget, nGlobalBudget));
+
+    {
+        ibdmetrics::Counters& metrics = ibdmetrics::Get();
+        metrics.deferred_budget_calls.fetch_add(1, std::memory_order_relaxed);
+        if (nBudget > 0)
+            metrics.deferred_budget_positive.fetch_add(
+                1, std::memory_order_relaxed);
+        else
+        {
+            metrics.deferred_budget_zero.fetch_add(1, std::memory_order_relaxed);
+            if (nPeerBudget <= 0)
+                metrics.deferred_budget_zero_peer_pressure.fetch_add(
+                    1, std::memory_order_relaxed);
+            if (nGlobalBudget <= 0)
+                metrics.deferred_budget_zero_global_pressure.fetch_add(
+                    1, std::memory_order_relaxed);
+            if (fVNodesLockFailed)
+                metrics.deferred_budget_zero_vnodes_lock_failed.fetch_add(
+                    1, std::memory_order_relaxed);
+        }
+        ibdmetrics::AtomicMax(metrics.peer_pressure_max, nPeerActivePressure);
+        ibdmetrics::AtomicMax(metrics.orphan_pressure_max, nOrphanCountPeer);
+    }
+
+    const int nZero = nBudget == 0 ? 1 : 0;
+    const int nOldZero = pfrom->nDeferredBudgetZero.exchange(
+        nZero, std::memory_order_relaxed);
+    ibdmetrics::PeerZeroStateChange(nOldZero, nZero);
+
+    return nBudget;
 }
 
 static void TraceDeferredWindowState(CNode* pfrom, const char* pszEvent,
@@ -346,6 +408,8 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
     AssertLockHeld(cs_main);
     if (pfrom == NULL || inv.type != MSG_BLOCK)
         return false;
+    ibdmetrics::Get().block_inv_unknown_total.fetch_add(
+        1, std::memory_order_relaxed);
     if (!IsInitialBlockDownload())
     {
         pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
@@ -361,8 +425,10 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
         &nSentBlockRequests, &nPeerActivePressure, &nGlobalActivePressure);
     if (nBudget <= 0)
     {
+        ibdmetrics::Get().block_inv_deferred_no_budget.fetch_add(
+            1, std::memory_order_relaxed);
         // Frontier admission exemption: permit exactly one block past a zero
-        // budget caused by orphan pressure.  The candidate is the first
+        // budget caused by a full request window.  The candidate is the first
         // unknown block inv of a getblocks response that was requested with
         // the current active-tip locator; see FrontierCandidateCanAdmit for
         // the outstanding-count and locator-staleness bounds.  All other
@@ -383,8 +449,15 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
                        nGlobalActivePressure, nBudget);
             pfrom->RemoveDeferredBlockInv(inv.hash);
             pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+            ibdmetrics::Get().block_inv_admitted.fetch_add(
+                1, std::memory_order_relaxed);
+            ibdmetrics::Get().frontier_exemption_admitted.fetch_add(
+                1, std::memory_order_relaxed);
             return true;
         }
+        if (fFrontierCandidate)
+            ibdmetrics::Get().frontier_reject_other.fetch_add(
+                1, std::memory_order_relaxed);
         if (BlockRequestTraceEnabled())
         {
             BlockRequestTraceAskSkipOrphanPressure(
@@ -400,27 +473,47 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
                                      inv.hash, "active-window-full",
                                      nBudget, 0, 0);
         }
-        DeferBlockInv(pfrom, inv.hash, "active-window-full");
+        if (DeferBlockInv(pfrom, inv.hash, "active-window-full"))
+            ibdmetrics::Get().block_inv_deferred.fetch_add(
+                1, std::memory_order_relaxed);
+        else
+            ibdmetrics::Get().block_inv_deferred_overflow.fetch_add(
+                1, std::memory_order_relaxed);
         return false;
     }
     pfrom->RemoveDeferredBlockInv(inv.hash);
     pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+    ibdmetrics::Get().block_inv_admitted.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
 
 size_t RefillDeferredBlockRequests(CNode* pfrom)
 {
     AssertLockHeld(cs_main);
-    if (pfrom == NULL || pfrom->deferredBlockInv.empty() ||
-        !IsInitialBlockDownload())
+    if (pfrom == NULL || !IsInitialBlockDownload())
         return 0;
+    if (pfrom->deferredBlockInv.empty())
+    {
+        ibdmetrics::Get().refill_called_deferred_empty.fetch_add(
+            1, std::memory_order_relaxed);
+        return 0;
+    }
 
     CTxDB txdb("r");
+    ibdmetrics::Get().refill_txdb_opens.fetch_add(1, std::memory_order_relaxed);
     size_t nAdmitted = 0;
     size_t nDropped = 0;
     size_t nExamined = 0;
     const size_t nInitialSize = pfrom->deferredBlockInv.size();
     int nBudget = GetDeferredBlockRequestBudget(pfrom);
+    const bool fPositiveBudgetNonempty = nBudget > 0;
+    ibdmetrics::Get().refill_calls.fetch_add(1, std::memory_order_relaxed);
+    if (nBudget <= 0)
+        ibdmetrics::Get().refill_calls_zero_budget.fetch_add(
+            1, std::memory_order_relaxed);
+    else
+        ibdmetrics::Get().refill_called_positive_budget_nonempty.fetch_add(
+            1, std::memory_order_relaxed);
 
     while (!pfrom->deferredBlockInv.empty() && nBudget > 0 &&
            nExamined < MAX_DEFERRED_BLOCK_INV_REFILL_WORK &&
@@ -429,9 +522,13 @@ size_t RefillDeferredBlockRequests(CNode* pfrom)
         const uint256 hash = pfrom->deferredBlockInv.front();
         const CInv inv(MSG_BLOCK, hash);
         ++nExamined;
+        ibdmetrics::Get().refill_alreadyhave_checks.fetch_add(
+            1, std::memory_order_relaxed);
 
         if (AlreadyHave(txdb, inv))
         {
+            ibdmetrics::Get().refill_items_already_have.fetch_add(
+                1, std::memory_order_relaxed);
             pfrom->PopFrontDeferredBlockInv();
             ++nDropped;
             TraceDeferredWindowState(pfrom, "DEFERRED_SKIP_KNOWN", hash,
@@ -442,6 +539,8 @@ size_t RefillDeferredBlockRequests(CNode* pfrom)
         if (pfrom->IsBlockAskForQueued(hash) ||
             pfrom->setBlocksInFlight.count(hash) != 0)
         {
+            ibdmetrics::Get().refill_items_active_owner.fetch_add(
+                1, std::memory_order_relaxed);
             pfrom->PopFrontDeferredBlockInv();
             ++nDropped;
             TraceDeferredWindowState(pfrom, "DEFERRED_SKIP_ACTIVE_OWNER", hash,
@@ -453,6 +552,8 @@ size_t RefillDeferredBlockRequests(CNode* pfrom)
         BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
         if (GetBlockRequestOwner(hash, &nOwnerPeer, &ownerState))
         {
+            ibdmetrics::Get().refill_items_active_owner.fetch_add(
+                1, std::memory_order_relaxed);
             pfrom->RotateFrontDeferredBlockInv();
             TraceDeferredWindowState(pfrom, "DEFERRED_SKIP_ACTIVE_OWNER", hash,
                                      nOwnerPeer == pfrom->GetId()
@@ -465,8 +566,17 @@ size_t RefillDeferredBlockRequests(CNode* pfrom)
         pfrom->PopFrontDeferredBlockInv();
         pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
         ++nAdmitted;
+        ibdmetrics::Get().refill_items_admitted.fetch_add(
+            1, std::memory_order_relaxed);
         nBudget = GetDeferredBlockRequestBudget(pfrom);
     }
+
+    ibdmetrics::Get().refill_items_examined.fetch_add(
+        nExamined, std::memory_order_relaxed);
+    if (nBudget > 0 && !pfrom->deferredBlockInv.empty() &&
+        nExamined >= MAX_DEFERRED_BLOCK_INV_REFILL_WORK)
+        ibdmetrics::Get().refill_work_limit_hit.fetch_add(
+            1, std::memory_order_relaxed);
 
     TraceDeferredWindowState(pfrom, "DEFERRED_REFILL", uint256(0),
                              nBudget <= 0 ? "no-budget" : "pump",
@@ -475,6 +585,15 @@ size_t RefillDeferredBlockRequests(CNode* pfrom)
         TraceDeferredWindowState(pfrom, "WINDOW_STATE", pfrom->deferredBlockInv.front(),
                                  "deferred-remaining", nBudget,
                                  (int)nAdmitted, (int)nDropped);
+    if (fPositiveBudgetNonempty)
+    {
+        if (nAdmitted == 0)
+            ibdmetrics::Get().refill_positive_budget_admitted_zero.fetch_add(
+                1, std::memory_order_relaxed);
+        else
+            ibdmetrics::Get().refill_positive_budget_admitted_count.fetch_add(
+                nAdmitted, std::memory_order_relaxed);
+    }
     return nAdmitted;
 }
 
@@ -3318,13 +3437,17 @@ bool IsSynchronized() {
 
 bool IsInitialBlockDownload()
 {
+    const auto RecordAndReturn = [](bool fInitialBlockDownload) -> bool {
+        ibdmetrics::RecordIBDState(fInitialBlockDownload);
+        return fInitialBlockDownload;
+    };
     if (fRegTest && pindexBest != NULL)
-        return false;
+        return RecordAndReturn(false);
     if (fImporting || fReindex || pindexBest == NULL)
-        return true;
+        return RecordAndReturn(true);
 
     if (nBestHeight < Checkpoints::GetTotalBlocksEstimate())
-        return true;
+        return RecordAndReturn(true);
 
     int64_t nNow = GetTime();
     int nFreshPeerHeight = -1;
@@ -3359,19 +3482,19 @@ bool IsInitialBlockDownload()
     unsigned int nTargetSpacing = GetTargetSpacingForHeight(nBestHeight + 1);
     int nLagTolerance = (nTargetSpacing <= 1) ? (int)GetArg("-ibdheightlag", 8) : nCoinbaseMaturity * 2;
     if (nFreshPeerHeight > nBestHeight + nLagTolerance)
-        return true;
+        return RecordAndReturn(true);
 
     if (fActiveCatchup)
-        return true;
+        return RecordAndReturn(true);
 
     int64_t nLocalLastBlockRecv = nTimeBestReceived > 0 ? nTimeBestReceived : pindexBest->GetBlockTime();
     int64_t nStaleSeconds = (nTargetSpacing <= 1) ? GetArg("-ibdstaleseconds", 30) : 300;
     if (nFreshPeerHeight > nBestHeight &&
         nFreshPeerLastBlockRecv > nLocalLastBlockRecv + 2 &&
         nNow - nLocalLastBlockRecv > nStaleSeconds)
-        return true;
+        return RecordAndReturn(true);
 
-    return false;
+    return RecordAndReturn(false);
 
 }
 
@@ -6120,6 +6243,7 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     // frontier getblocks response; refuse the exemption rather than admit a
     // block whose connection point has moved.
     InvalidateFrontierOnTipChange();
+    ibdmetrics::Get().setbestchain_commits.fetch_add(1, std::memory_order_relaxed);
 
     uint256 nBestBlockTrust = (pindexBest->nHeight != 0 && pindexBest->pprev != NULL) ? (pindexBest->nChainTrust - pindexBest->pprev->nChainTrust) : pindexBest->nChainTrust;
 
@@ -6914,9 +7038,12 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         PruneOrphanBlocks();
 
         if (pfrom) {
-            int nOrphansFromPeer = mapOrphanCountByNode[pfrom->GetId()];
-            if (nOrphansFromPeer >= MAX_ORPHAN_BLOCKS_PER_PEER) {
-                pfrom->PushGetBlocks(pindexBest, uint256(0));
+            int nOrphansFromPeer = 0;
+            if (PeerOrphanStorageLimitExceeded(pfrom->GetId(),
+                                               &nOrphansFromPeer)) {
+                pfrom->PushGetBlocks(
+                    pindexBest, uint256(0),
+                    ibdmetrics::GETBLOCKS_SOURCE_ORPHAN_LIMIT);
 
                 if (IsInitialBlockDownload()) {
                     TraceProcessBlockReject(pfrom, pblock, PBREJECT_ORPHAN_LIMIT_IBD);
@@ -6957,7 +7084,9 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             // Parallel IBD delivery commonly creates temporary orphans whose
             // parent is already in the advertised batch.
             if (!IsInitialBlockDownload())
-                pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblock2));
+                pfrom->PushGetBlocks(
+                    pindexBest, GetOrphanRoot(pblock2),
+                    ibdmetrics::GETBLOCKS_SOURCE_INV_CONTINUATION);
             // ppcoin: getblocks may not obtain the ancestor block rejected
             // earlier by duplicate-stake check so we ask for it again directly
             uint256 hashWanted = WantedByOrphan(pblock2);
@@ -8050,7 +8179,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
              pfrom->nBestKnownHeight > (nBestHeight - 144)) &&
             IsBlockSyncPeerVersion(pfrom->nVersion))
         {
-            pfrom->PushGetBlocks(pindexBest, uint256(0));
+            pfrom->PushGetBlocks(
+                pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_VERSION);
         }
 
         // Relay alerts
@@ -8243,6 +8373,16 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             pfrom->HasActiveRecoveryResponseWindow();
         if (fObserveRecovery)
             recoveryObservation.total_inv = vInv.size();
+        const bool fGetBlocksResponse =
+            !pfrom->getBlocksOutstandingSources.empty();
+        int64_t nGetBlocksResponseBlockInv = 0;
+        int64_t nGetBlocksResponseUnknown = 0;
+        if (fGetBlocksResponse)
+        {
+            ibdmetrics::Get().getblocks_response_inv_messages.fetch_add(
+                1, std::memory_order_relaxed);
+            ibdmetrics::RecordZeroLatency(ibdmetrics::ZERO_LATENCY_INV);
+        }
 
         // Consume the pending frontier getblocks expectation.  If this inv
         // message is a response to a getblocks that was requested with the
@@ -8250,6 +8390,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // frontier candidate and is offered the single-slot admission
         // exemption (see FrontierCandidateCanAdmit).
         const bool fFrontierResponse = pfrom->fFrontierResponsePending;
+        if (fFrontierResponse)
+        {
+            ibdmetrics::Get().frontier_response_consumed.fetch_add(
+                1, std::memory_order_relaxed);
+            ibdmetrics::FrontierResponsePendingAdd(-1);
+        }
         pfrom->fFrontierResponsePending = false;
         bool fFrontierSlotOffered = false;
 
@@ -8264,6 +8410,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             pfrom->AddInventoryKnown(inv);
 
             bool fAlreadyHave = AlreadyHave(txdb, inv);
+            if (fGetBlocksResponse && inv.type == MSG_BLOCK)
+                ++nGetBlocksResponseBlockInv;
             if (fObserveRecovery && inv.type == MSG_BLOCK)
             {
                 ++recoveryObservation.block_inv;
@@ -8301,6 +8449,16 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (!fAlreadyHave) {
                 if (inv.type == MSG_BLOCK)
                 {
+                    if (fGetBlocksResponse)
+                    {
+                        ++nGetBlocksResponseUnknown;
+                        ibdmetrics::RecordZeroLatency(
+                            ibdmetrics::ZERO_LATENCY_UNKNOWN_INV);
+                        if (ibdmetrics::Get().global_active_current.load(
+                                std::memory_order_relaxed) == 0)
+                            ibdmetrics::Get().inv_unknown_during_zero_global.fetch_add(
+                                1, std::memory_order_relaxed);
+                    }
                     const bool fFrontierCandidate =
                         fFrontierResponse && !fFrontierSlotOffered;
                     fFrontierSlotOffered =
@@ -8321,7 +8479,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                         BLOCKREQ_SOURCE_ORPHAN);
                 }
                 else
-                    pfrom->PushGetBlocks(pindexBest, GetOrphanRoot(pblockOrphan));
+                    pfrom->PushGetBlocks(
+                        pindexBest, GetOrphanRoot(pblockOrphan),
+                        ibdmetrics::GETBLOCKS_SOURCE_INV_CONTINUATION);
             } else if (nInv == nLastBlock) {
                 // In case we are on a very long side-chain, it is possible that we already have
                 // the last block in an inv bundle sent in response to getblocks. Try to detect
@@ -8332,7 +8492,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     pfrom->ShouldContinueKnownBlockInventory(
                         nBestHeight, miLast->second->IsInMainChain()))
                 {
-                    pfrom->PushGetBlocks(miLast->second, uint256(0));
+                    pfrom->PushGetBlocks(
+                        miLast->second, uint256(0),
+                        ibdmetrics::GETBLOCKS_SOURCE_INV_CONTINUATION);
                     if (fDebugNet)
                         printf("force request: %s\n", inv.ToString().c_str());
                 }
@@ -8348,11 +8510,28 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             g_signals.Inventory(inv.hash);
         }
 
+        if (fGetBlocksResponse)
+        {
+            ibdmetrics::Get().getblocks_response_block_inv_count.fetch_add(
+                nGetBlocksResponseBlockInv, std::memory_order_relaxed);
+            ibdmetrics::Get().getblocks_response_unknown_count.fetch_add(
+                nGetBlocksResponseUnknown, std::memory_order_relaxed);
+            if (nGetBlocksResponseUnknown == 0)
+            {
+                ibdmetrics::Get().getblocks_response_zero_unknown.fetch_add(
+                    1, std::memory_order_relaxed);
+                ibdmetrics::Get().getblocks_response_inv_zero_unknown.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+            pfrom->ConsumeGetBlocksResponseFront();
+        }
+
         if (fObserveRecovery)
         {
             RecoveryResponseResult completed;
             if (pfrom->ObserveRecoveryResponseInv(
-                    GetTimeMicros(), recoveryObservation, completed))
+                    GetTimeMicros(), recoveryObservation, completed) &&
+                BlockRequestTraceEnabled())
             {
                 printf("%s\n", FormatRecoveryResponseSummary(
                     pfrom->GetId(), completed).c_str());
@@ -8768,7 +8947,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                        hash.ToString().substr(0,20).c_str(),
                        header.hashPrevBlock.ToString().substr(0,20).c_str());
                 if (!fSPVMode)
-                    pfrom->PushGetBlocks(pindexBest, uint256(0));
+                    pfrom->PushGetBlocks(
+                        pindexBest, uint256(0),
+                        ibdmetrics::GETBLOCKS_SOURCE_HEADERS);
                 break;
             }
 
@@ -9056,13 +9237,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         bool fWouldHitIbdOrphanLimit = false;
         if (pfrom && fMissingPrevBefore && IsInitialBlockDownload())
         {
-            std::map<NodeId, int>::const_iterator miOrphanCount =
-                mapOrphanCountByNode.find(pfrom->GetId());
-            int nOrphansFromPeerBefore =
-                miOrphanCount == mapOrphanCountByNode.end()
-                    ? 0 : miOrphanCount->second;
-            fWouldHitIbdOrphanLimit =
-                nOrphansFromPeerBefore >= MAX_ORPHAN_BLOCKS_PER_PEER;
+            int nOrphansFromPeerBefore = 0;
+            fWouldHitIbdOrphanLimit = PeerOrphanStorageLimitExceeded(
+                pfrom->GetId(), &nOrphansFromPeerBefore);
         }
 
         if (fTraceBlockRequest)
@@ -9104,6 +9281,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     TipAncestorOfPeerBestKnown(pfrom->hashBestKnownBlock));
             }
         }
+        ibdmetrics::Get().block_receive_total.fetch_add(
+            1, std::memory_order_relaxed);
         bool fAccepted = ProcessBlock(pfrom, &block);
         bool fEffRetryRecorded = false;
         if (fAccepted)
@@ -9113,8 +9292,16 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             std::map<uint256, CBlockIndex*>::iterator miAccepted =
                 mapBlockIndex.find(hashBlock);
             if (miAccepted != mapBlockIndex.end())
+            {
                 pfrom->UpdateBestKnownBlock(
                     miAccepted->second->nHeight, hashBlock);
+                if (miAccepted->second->IsInMainChain())
+                    ibdmetrics::Get().block_result_accepted_active.fetch_add(
+                        1, std::memory_order_relaxed);
+                else if (mapOrphanBlocks.count(hashBlock) != 0)
+                    ibdmetrics::Get().block_result_orphan_new.fetch_add(
+                        1, std::memory_order_relaxed);
+            }
             if (pfrom->nBestKnownHeight > pfrom->nChainHeight)
                 pfrom->nChainHeight = pfrom->nBestKnownHeight;
         }
@@ -9235,7 +9422,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     CBlockIndex* pindexLast = mapBlockIndex[pfrom->hashLastBlockInBatch];
                     size_t nQueuedBefore = pfrom->getBlocksIndex.size();
                     bool fPrefetchSentBefore = pfrom->fPrefetchSent;
-                    pfrom->PushGetBlocks(pindexLast, uint256(0));
+                    pfrom->PushGetBlocks(
+                        pindexLast, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_PREFETCH);
                     pfrom->fPrefetchSent = true;
                     if (BlockRequestTraceEnabled() &&
                         pfrom->getBlocksIndex.size() > nQueuedBefore)
@@ -9259,7 +9447,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 {
                     size_t nQueuedBefore = pfrom->getBlocksIndex.size();
                     bool fPrefetchSentBefore = pfrom->fPrefetchSent;
-                    pfrom->PushGetBlocks(pindexBest, uint256(0));
+                    pfrom->PushGetBlocks(
+                        pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_PREFETCH);
                     pfrom->fPrefetchSent = true;
                     if (BlockRequestTraceEnabled() &&
                         pfrom->getBlocksIndex.size() > nQueuedBefore)
@@ -9288,6 +9477,17 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             const bool fPeerAhead = (pfrom->nBestKnownHeight > nBestHeight);
             const bool fPipelineDrained = (pfrom->setBlocksInFlight.size() <= 1 && pfrom->getBlocksIndex.empty());
             const bool fCooldownExpired = (pfrom->nLastGetBlocksTime == 0 || (nNow - pfrom->nLastGetBlocksTime) >= 10);
+            ibdmetrics::Get().pipeline_drained_checks.fetch_add(
+                1, std::memory_order_relaxed);
+            if (!fPeerAhead)
+                ibdmetrics::Get().pipeline_drained_skip_not_ahead.fetch_add(
+                    1, std::memory_order_relaxed);
+            else if (!fCooldownExpired)
+                ibdmetrics::Get().pipeline_drained_skip_getblocks_10s_cooldown.fetch_add(
+                    1, std::memory_order_relaxed);
+            else if (!fPipelineDrained)
+                ibdmetrics::Get().pipeline_drained_skip_other_condition.fetch_add(
+                    1, std::memory_order_relaxed);
             if (fPeerAhead && fPipelineDrained && fCooldownExpired)
             {
                 if (fDebugNet)
@@ -9303,7 +9503,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 }
                 size_t nQueuedBefore = pfrom->getBlocksIndex.size();
                 bool fPrefetchSentBefore = pfrom->fPrefetchSent;
-                pfrom->PushGetBlocks(pindexBest, uint256(0));
+                pfrom->PushGetBlocks(
+                    pindexBest, uint256(0),
+                    ibdmetrics::GETBLOCKS_SOURCE_CONTINUATION);
+                if (pfrom->getBlocksIndex.size() > nQueuedBefore)
+                    ibdmetrics::Get().pipeline_drained_getblocks_queued.fetch_add(
+                        1, std::memory_order_relaxed);
                 if (BlockRequestTraceEnabled() &&
                     pfrom->getBlocksIndex.size() > nQueuedBefore)
                 {
@@ -9808,7 +10013,8 @@ bool ProcessMessages(CNode* pfrom)
 bool SendMessages(CNode* pto, bool fSendTrickle)
 {
     RecoveryResponseResult recoveryResult;
-    if (pto->ExpireRecoveryResponseWindow(GetTimeMicros(), recoveryResult))
+    if (pto->ExpireRecoveryResponseWindow(GetTimeMicros(), recoveryResult) &&
+        BlockRequestTraceEnabled())
         printf("%s\n", FormatRecoveryResponseSummary(
             pto->GetId(), recoveryResult).c_str());
     if (pto->nVersion == 0)
@@ -9850,7 +10056,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         if (!fSPVMode && pto->CanAdvanceBlockSync(nBestHeight))
         {
             const size_t nQueueBefore = pto->getBlocksIndex.size();
-            pto->PushGetBlocks(pindexBest, uint256(0));
+            pto->PushGetBlocks(
+                pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
             if (!pto->fInitialSyncRequestSent &&
                 pto->getBlocksIndex.size() > nQueueBefore)
                 pto->fInitialSyncRequestPending = true;
@@ -9864,9 +10071,16 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             if (fDebugNet) printf("Pushing getblocks %s to %s\n\n",pto->getBlocksIndex[i]->ToString().c_str(),pto->getBlocksHash[i].ToString().c_str());
             const uint64_t nRecoveryId = i < (int)pto->getBlocksRecoveryIds.size()
                 ? pto->getBlocksRecoveryIds[i] : 0;
+            const ibdmetrics::GetBlocksSource getBlocksSource =
+                i < (int)pto->getBlocksSources.size()
+                    ? pto->getBlocksSources[i]
+                    : ibdmetrics::GETBLOCKS_SOURCE_OTHER;
             RecoveryTraceSend(pto, nRecoveryId, pto->getBlocksIndex[i],
                               pto->getBlocksHash[i], n);
             pto->PushMessage("getblocks", CBlockLocator(pto->getBlocksIndex[i]), pto->getBlocksHash[i]);
+            ibdmetrics::RecordGetBlocksWireSent(getBlocksSource);
+            pto->getBlocksOutstandingSources.push_back(getBlocksSource);
+            ibdmetrics::GetBlocksOutstandingAdd(1);
             // Arm the frontier response expectation when the flushed request
             // used the current active-tip locator (index == best and no stop
             // hash).  Its first unknown block inv may be admitted past a zero
@@ -9875,7 +10089,11 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             if (pto->getBlocksIndex[i] == pindexBest &&
                 pto->getBlocksHash[i] == uint256(0))
             {
+                if (!pto->fFrontierResponsePending)
+                    ibdmetrics::FrontierResponsePendingAdd(1);
                 pto->fFrontierResponsePending = true;
+                ibdmetrics::Get().frontier_response_armed.fetch_add(
+                    1, std::memory_order_relaxed);
                 pto->nFrontierLocatorHeight =
                     pindexBest ? pindexBest->nHeight : -1;
             }
@@ -9894,14 +10112,19 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 GetTime(), nRecoveryId,
                 pto->CanAdvanceBlockSync(nBestHeight));
         }
+        if (n > 0)
+            ibdmetrics::GetBlocksQueuedAdd(-n, true);
         pto->getBlocksIndex.clear();
         pto->getBlocksHash.clear();
         pto->getBlocksRecoveryIds.clear();
+        pto->getBlocksSources.clear();
     }
 
     {
         CSyncLockDiagnostics sendLockDiagnostics(
             "SendMessages", "cs_main");
+        ibdmetrics::Get().refill_sendmessages_passes.fetch_add(
+            1, std::memory_order_relaxed);
         TRY_LOCK(cs_main, lockMain);
         if (lockMain)
         {
@@ -10098,6 +10321,11 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         // getdata moved outside cs_main (below) for IBD reliability
 
     }
+        else
+        {
+            ibdmetrics::Get().refill_skipped_cs_main_trylock_failed.fetch_add(
+                1, std::memory_order_relaxed);
+        }
     }
     //
     // getdata: flush pending requests outside cs_main.
@@ -10131,7 +10359,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                             pto, inv.hash,
                             "same-peer-inflight", -1);
                     }
-                    pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
+                    pto->EraseAskForEntry(
+                        pto->mapAskFor.begin(), false,
+                        ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);
                     EraseAlreadyAskedForIfUnowned(inv);
                     continue;
                 }
@@ -10145,7 +10375,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                         BlockRequestTraceGetDataSkip(
                             pto, inv.hash, nOwnerPeer,
                             BlockRequestOwnerStateName(ownerState));
-                    pto->EraseAskForEntry(pto->mapAskFor.begin());
+                    pto->EraseAskForEntry(
+                        pto->mapAskFor.begin(), true,
+                        ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);
                     continue;
                 }
                 if (fHasOwner && nOwnerPeer == pto->GetId() &&
@@ -10155,7 +10387,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                         BlockRequestTraceGetDataSkip(
                             pto, inv.hash, nOwnerPeer,
                             BlockRequestOwnerStateName(ownerState));
-                    pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
+                    pto->EraseAskForEntry(
+                        pto->mapAskFor.begin(), false,
+                        ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);
                     continue;
                 }
                 if (pto->setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
@@ -10200,7 +10434,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                             BlockRequestTraceGetDataSkip(
                                 pto, inv.hash, nOwnerPeer,
                                 BlockRequestOwnerStateName(ownerState));
-                        pto->EraseAskForEntry(pto->mapAskFor.begin());
+                        pto->EraseAskForEntry(
+                            pto->mapAskFor.begin(), true,
+                            ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);
                         EraseAlreadyAskedForIfUnowned(inv);
                         continue;
                     }
@@ -10255,12 +10491,16 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             }
             if (fSkip)
             {
-                pto->EraseAskForEntry(pto->mapAskFor.begin());
+                pto->EraseAskForEntry(
+                    pto->mapAskFor.begin(), true,
+                    ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_ALREADY_HAVE);
                 EraseAlreadyAskedForIfUnowned(inv);
             }
             else
             {
-                pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
+                pto->EraseAskForEntry(
+                    pto->mapAskFor.begin(), false,
+                    ibdmetrics::ACTIVE_DECREMENT_ASKFOR_SENT_TRANSITION);
             }
         }
         if (!vGetData.empty())
