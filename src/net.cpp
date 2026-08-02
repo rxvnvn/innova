@@ -989,6 +989,53 @@ void ResetStalledSyncRecoveryStateForTesting()
     stalledSyncRecoveryState = CStalledSyncRecoveryState();
 }
 
+namespace {
+
+// Cached -ibdmaxactiveperpeer value.  Loaded lazily on first
+// GetMaxActiveBlockRequestsPerPeer() call so that the argument is read exactly
+// once; unit tests reload it through
+// ResetMaxActiveBlockRequestsPerPeerConfigForTesting().
+int g_nIBDMaxActivePerPeerConfigured = MAX_DEFERRED_INV_ACTIVE_PER_PEER;
+bool g_nIBDMaxActivePerPeerLoaded = false;
+
+int LoadIBDMaxActivePerPeerConfig()
+{
+    const int64_t nDefault = MAX_DEFERRED_INV_ACTIVE_PER_PEER;
+    int64_t nRaw = nDefault;
+    if (mapArgs.count("-ibdmaxactiveperpeer") &&
+        !ParseInt64(mapArgs["-ibdmaxactiveperpeer"], &nRaw))
+    {
+        nRaw = nDefault;
+    }
+    // Zero, negative, and non-numeric values are rejected and fall back to the
+    // default; values above the global cap are clamped (mirrors the clamp
+    // pattern used for other init-time parameters in AppInit2).
+    if (nRaw < 1)
+        nRaw = nDefault;
+    if (nRaw > MAX_DEFERRED_INV_ACTIVE_GLOBAL)
+        nRaw = MAX_DEFERRED_INV_ACTIVE_GLOBAL;
+    return (int)nRaw;
+}
+
+} // namespace
+
+int GetMaxActiveBlockRequestsPerPeer()
+{
+    if (!g_nIBDMaxActivePerPeerLoaded)
+    {
+        g_nIBDMaxActivePerPeerConfigured = LoadIBDMaxActivePerPeerConfig();
+        g_nIBDMaxActivePerPeerLoaded = true;
+    }
+    if (!IsInitialBlockDownload())
+        return MAX_DEFERRED_INV_ACTIVE_PER_PEER;
+    return g_nIBDMaxActivePerPeerConfigured;
+}
+
+void ResetMaxActiveBlockRequestsPerPeerConfigForTesting()
+{
+    g_nIBDMaxActivePerPeerLoaded = false;
+}
+
 void CStalledSyncRecoveryState::MarkSyncRequestSent(int64_t nNow)
 {
     fSyncRequestSent = true;

@@ -22,6 +22,7 @@
 #include "bloom.h"
 #include "blockrequesttrace.h"
 #include "ibdmetrics.h"
+#include "ibdactivepath.h"
 
 class CRequestTracker;
 class CNode;
@@ -502,6 +503,18 @@ static const int MAX_DEFERRED_INV_ACTIVE_GLOBAL = 512;
 static const size_t MAX_DEFERRED_BLOCK_INV_PER_PEER = 1000;
 /** Maximum deferred candidates examined in one refill pump. */
 static const size_t MAX_DEFERRED_BLOCK_INV_REFILL_WORK = 256;
+
+// Effective per-peer active block request window during IBD.  Returns
+// MAX_DEFERRED_INV_ACTIVE_PER_PEER (128) when not in IBD.  The experimental
+// -ibdmaxactiveperpeer=<n> runtime window is clamped to
+// [1, MAX_DEFERRED_INV_ACTIVE_GLOBAL]; zero, negative, and non-numeric values
+// are rejected and fall back to the default.  The configured value is read
+// once and cached at first use; hot paths must not re-read the argument.
+int GetMaxActiveBlockRequestsPerPeer();
+
+// Test hook: force the cached -ibdmaxactiveperpeer value to reload from
+// mapArgs on the next GetMaxActiveBlockRequestsPerPeer() call.
+void ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
 
 enum BlockRequestOwnerState
 {
@@ -1393,8 +1406,7 @@ public:
         {
             static const int64_t BLOCK_ASK_RETRY_US = 1000000;
             static const int64_t BLOCK_ASK_DEFER_US = 250000;
-            static const size_t MAX_BLOCKS_IN_FLIGHT_PER_PEER = 128;
-            if (setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
+            if (setBlocksInFlight.size() >= (size_t)GetMaxActiveBlockRequestsPerPeer())
                 nRequestTime = std::max(nRequestTime + BLOCK_ASK_RETRY_US, nNow + BLOCK_ASK_DEFER_US);
             else
                 nRequestTime = std::max(nRequestTime + BLOCK_ASK_RETRY_US, nNow);
@@ -1404,6 +1416,8 @@ public:
             nRequestTime = std::max(nRequestTime + 10 * 1000000, nNow);
         }
         AddAskForEntry(nRequestTime, inv);
+        if (fBlockRequest)
+            ibdactivepath::RecordBlockRequestEnqueued(inv.hash);
         if (fBlockRequest)
             ibdmetrics::RecordZeroLatency(ibdmetrics::ZERO_LATENCY_ASKFOR);
         if (BlockRequestTraceEnabled() && inv.type == MSG_BLOCK)

@@ -17,6 +17,7 @@
 #include <boost/thread/thread.hpp>
 
 #include "checkpoints.h"
+#include "ibdactivepath.h"
 #include "ibdefficiency.h"
 #include "innovarpc.h"
 #include "main.h"
@@ -5400,6 +5401,314 @@ BOOST_AUTO_TEST_CASE(terminal_stall_remains_fixed_after_request_window_drain)
     BOOST_CHECK_EQUAL(peer.deferredBlockInv.size(), 0U);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, deferred), 1U);
     peer.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(ibd_per_peer_cap_default_128)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    mapArgs.erase("-ibdmaxactiveperpeer");
+    CNode peer(INVALID_SOCKET, TestPeerAddress(70), "per-peer-cap-default", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    // No argument: the effective per-peer IBD window is the default 128.
+    BOOST_CHECK_EQUAL(GetMaxActiveBlockRequestsPerPeer(),
+                      MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+
+    // 128 queued block requests fill the default window exactly: the deferred
+    // admission budget is zero until the window drains.
+    for (int i = 0; i < MAX_DEFERRED_INV_ACTIVE_PER_PEER; ++i)
+        peer.AskFor(CInv(MSG_BLOCK, uint256(70000 + i)), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(),
+                      (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peer), 0);
+    }
+    peer.ClearAskFor();
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(ibd_per_peer_cap_256)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    mapArgs["-ibdmaxactiveperpeer"] = "256";
+    CNode peer(INVALID_SOCKET, TestPeerAddress(71), "per-peer-cap-256", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 100);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+    BOOST_CHECK_EQUAL(GetMaxActiveBlockRequestsPerPeer(), 256);
+
+    // 128 inflight does not block a 129th request when the window is 256.
+    for (size_t i = 0; i < 128; ++i)
+        peer.MarkBlockInFlight(uint256(71000 + i));
+    const uint256 hashAllowed(71256);
+    peer.AddAskForEntry((GetTime() - 10) * 1000000,
+                        CInv(MSG_BLOCK, hashAllowed));
+    BOOST_CHECK(SendMessages(&peer, true));
+    BOOST_CHECK(HasCommand(SentCommands(peer), "getdata"));
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashAllowed), 0U);
+
+    // 256 inflight blocks the 257th request (hashAllowed is now in flight,
+    // so 127 more marks bring the total to exactly 256).
+    for (size_t i = 128; i < 255; ++i)
+        peer.MarkBlockInFlight(uint256(71000 + i));
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 256U);
+    const uint256 hashBlocked(71257);
+    peer.AddAskForEntry((GetTime() - 10) * 1000000,
+                        CInv(MSG_BLOCK, hashBlocked));
+    BOOST_CHECK(SendMessages(&peer, true));
+    // SentCommands is cumulative, so assert on the request staying queued:
+    // a blocked 257th request is never moved out of mapAskFor.
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashBlocked), 1U);
+
+    peer.ClearAskFor();
+    for (size_t i = 0; i < 255; ++i)
+        peer.ClearBlockInFlight(uint256(71000 + i));
+    mapArgs.erase("-ibdmaxactiveperpeer");
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(ibd_per_peer_cap_respects_global_512)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    mapArgs["-ibdmaxactiveperpeer"] = "256";
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(80), "global-512-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(81), "global-512-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(82), "global-512-c", true);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+        vNodes.push_back(&peerC);
+    }
+
+    // Peer A: 200 active.  Per-peer cap 256 binds: 56 slots free.
+    for (int i = 0; i < 200; ++i)
+        peerA.AskFor(CInv(MSG_BLOCK, uint256(80000 + i)), BLOCKREQ_SOURCE_INV);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peerA), 56);
+    }
+
+    // Peer B: global pressure 400, still below the 512 global cap.
+    for (int i = 0; i < 200; ++i)
+        peerB.AskFor(CInv(MSG_BLOCK, uint256(81000 + i)), BLOCKREQ_SOURCE_INV);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peerB), 56);
+    }
+
+    // Peer C: total pressure reaches 600 > 512, so the global cap binds and
+    // the budget is zero even though the per-peer cap alone would permit 56.
+    for (int i = 0; i < 200; ++i)
+        peerC.AskFor(CInv(MSG_BLOCK, uint256(82000 + i)), BLOCKREQ_SOURCE_INV);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peerC), 0);
+        BOOST_CHECK(GetMaxActiveBlockRequestsPerPeer() <=
+                    MAX_DEFERRED_INV_ACTIVE_GLOBAL);
+    }
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    peerC.ClearAskFor();
+    mapArgs.erase("-ibdmaxactiveperpeer");
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(ibd_per_peer_cap_not_used_outside_ibd)
+{
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    mapArgs["-ibdmaxactiveperpeer"] = "256";
+
+    // Outside IBD the window is fixed at 128 even with -ibdmaxactiveperpeer=256.
+    BOOST_CHECK_EQUAL(GetMaxActiveBlockRequestsPerPeer(),
+                      MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+
+    // The getdata gate reverts to 128 outside IBD: 128 inflight blocks the
+    // 129th request despite the configured 256.
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(72), "outside-ibd-128", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    for (size_t i = 0; i < MAX_DEFERRED_INV_ACTIVE_PER_PEER; ++i)
+        peer.MarkBlockInFlight(uint256(72000 + i));
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(),
+                      (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+    const uint256 hashAsk(72129);
+    peer.AddAskForEntry((GetTime() - 10) * 1000000, CInv(MSG_BLOCK, hashAsk));
+    BOOST_CHECK(SendMessages(&peer, true));
+    BOOST_CHECK(!HasCommand(SentCommands(peer), "getdata"));
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashAsk), 1U);
+
+    peer.ClearAskFor();
+    for (size_t i = 0; i < MAX_DEFERRED_INV_ACTIVE_PER_PEER; ++i)
+        peer.ClearBlockInFlight(uint256(72000 + i));
+    mapArgs.erase("-ibdmaxactiveperpeer");
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(ibd_per_peer_cap_invalid_values)
+{
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    CNode peer(INVALID_SOCKET, TestPeerAddress(73), "invalid-values", true);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    mapArgs["-ibdmaxactiveperpeer"] = "abc";
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    BOOST_CHECK_EQUAL(GetMaxActiveBlockRequestsPerPeer(),
+                      MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+
+    mapArgs["-ibdmaxactiveperpeer"] = "0";
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    BOOST_CHECK_EQUAL(GetMaxActiveBlockRequestsPerPeer(),
+                      MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+
+    mapArgs["-ibdmaxactiveperpeer"] = "-5";
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    BOOST_CHECK_EQUAL(GetMaxActiveBlockRequestsPerPeer(),
+                      MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+
+    mapArgs["-ibdmaxactiveperpeer"] = "600";
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    BOOST_CHECK_EQUAL(GetMaxActiveBlockRequestsPerPeer(),
+                      MAX_DEFERRED_INV_ACTIVE_GLOBAL);
+
+    mapArgs["-ibdmaxactiveperpeer"] = "1";
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    BOOST_CHECK_EQUAL(GetMaxActiveBlockRequestsPerPeer(), 1);
+
+    mapArgs.erase("-ibdmaxactiveperpeer");
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(inflight_distribution_metrics)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    mapArgs.erase("-ibdmaxactiveperpeer");
+    ibdactivepath::InitIBDActivePathTrace(true);
+
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(90), "dist-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(91), "dist-b", true);
+    PreparePeerForRecovery(peerA, PROTOCOL_VERSION, nBestHeight + 10);
+    PreparePeerForRecovery(peerB, PROTOCOL_VERSION, nBestHeight + 10);
+
+    // Peer A: 100 inflight + 20 queued.  Peer B: 20 inflight, 0 queued.
+    for (size_t i = 0; i < 100; ++i)
+        peerA.MarkBlockInFlight(uint256(90000 + i));
+    for (size_t i = 0; i < 20; ++i)
+        peerB.MarkBlockInFlight(uint256(91000 + i));
+    for (size_t i = 0; i < 20; ++i)
+        peerA.AddAskForEntry((GetTime() - 10) * 1000000 + i,
+                             CInv(MSG_BLOCK, uint256(90200 + i)));
+
+    std::vector<CNode*> vPeers;
+    vPeers.push_back(&peerA);
+    vPeers.push_back(&peerB);
+    ibdactivepath::EmitIBDActive1s(vPeers);
+
+    ibdactivepath::ActivePathCounters& c = ibdactivepath::GetCounters();
+    BOOST_CHECK_EQUAL(
+        c.peers_inflight_gt0.load(std::memory_order_relaxed), 2);
+    BOOST_CHECK_EQUAL(
+        c.peers_queued_gt0.load(std::memory_order_relaxed), 1);
+    BOOST_CHECK_EQUAL(
+        c.inflight_peer_max.load(std::memory_order_relaxed), 100);
+    BOOST_CHECK_EQUAL(
+        c.queued_peer_max.load(std::memory_order_relaxed), 20);
+    // Dominant share = 100 / (100+20) = 83%.
+    BOOST_CHECK_EQUAL(
+        c.dominant_peer_inflight_share_pct.load(std::memory_order_relaxed), 83);
+    // Global free slots stay within [0, 512].
+    BOOST_CHECK(c.global_free_active_slots.load(std::memory_order_relaxed) >= 0);
+    BOOST_CHECK(c.global_free_active_slots.load(std::memory_order_relaxed) <=
+                MAX_DEFERRED_INV_ACTIVE_GLOBAL);
+
+    peerA.ClearAskFor();
+    ibdactivepath::InitIBDActivePathTrace(false);
+    for (size_t i = 0; i < 100; ++i)
+        peerA.ClearBlockInFlight(uint256(90000 + i));
+    for (size_t i = 0; i < 20; ++i)
+        peerB.ClearBlockInFlight(uint256(91000 + i));
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(single_peer_dominance_sample)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    ibdactivepath::InitIBDActivePathTrace(true);
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(92), "dominance", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    for (size_t i = 0; i < 100; ++i)
+        peer.MarkBlockInFlight(uint256(92000 + i));
+    std::vector<CNode*> vPeers;
+    vPeers.push_back(&peer);
+
+    ibdactivepath::ActivePathCounters& c = ibdactivepath::GetCounters();
+    const int64_t nBefore =
+        c.samples_single_peer_over_75pct.load(std::memory_order_relaxed);
+
+    // A single peer holding all inflight requests: share = 100%, sampled once.
+    ibdactivepath::EmitIBDActive1s(vPeers);
+    BOOST_CHECK_EQUAL(
+        c.dominant_peer_inflight_share_pct.load(std::memory_order_relaxed), 100);
+    BOOST_CHECK_EQUAL(
+        c.samples_single_peer_over_75pct.load(std::memory_order_relaxed),
+        nBefore + 1);
+
+    // A second emission within the same second is suppressed by the 1s gate:
+    // the sample counter increments at most once per emission.
+    ibdactivepath::EmitIBDActive1s(vPeers);
+    BOOST_CHECK_EQUAL(
+        c.samples_single_peer_over_75pct.load(std::memory_order_relaxed),
+        nBefore + 1);
+
+    ibdactivepath::InitIBDActivePathTrace(false);
+    for (size_t i = 0; i < 100; ++i)
+        peer.ClearBlockInFlight(uint256(92000 + i));
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(block_request_wire_latency_monotonic)
+{
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+    ibdactivepath::InitIBDActivePathTrace(true);
+
+    ibdactivepath::ActivePathCounters& c = ibdactivepath::GetCounters();
+    const int64_t nCountBefore =
+        c.block_request_wire_latency_count.load(std::memory_order_relaxed);
+    const int64_t nMaxBefore =
+        c.block_request_wire_latency_us_max.load(std::memory_order_relaxed);
+
+    const uint256 hashLat(93001);
+    ibdactivepath::RecordBlockRequestEnqueued(hashLat);
+    ibdactivepath::RecordBlockRequestSent(hashLat);
+
+    BOOST_CHECK_EQUAL(
+        c.block_request_wire_latency_count.load(std::memory_order_relaxed),
+        nCountBefore + 1);
+    BOOST_CHECK(c.block_request_wire_latency_us_max.load(
+                    std::memory_order_relaxed) >= nMaxBefore);
+
+    // Sending a hash that was never enqueued is a no-op.
+    const int64_t nCountMid =
+        c.block_request_wire_latency_count.load(std::memory_order_relaxed);
+    ibdactivepath::RecordBlockRequestSent(uint256(93002));
+    BOOST_CHECK_EQUAL(
+        c.block_request_wire_latency_count.load(std::memory_order_relaxed),
+        nCountMid);
+
+    ibdactivepath::InitIBDActivePathTrace(false);
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

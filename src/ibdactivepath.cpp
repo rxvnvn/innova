@@ -8,10 +8,13 @@
 #include "ibdmetrics.h"
 #include "main.h"
 #include "net.h"
+#include "sync.h"
 #include "util.h"
 
 #include <inttypes.h>
 #include <stdio.h>
+
+#include <map>
 
 #ifndef WIN32
 #include <time.h>
@@ -37,6 +40,13 @@ int g_nLastStateTraceReason = -1;
 // End of the last getblocks response that contained at least one unknown
 // block inv (monotonic).  Zero = none yet.
 std::atomic<int64_t> g_last_useful_response_end_us(0);
+
+// Monotonic AskFor-enqueue → getdata-export tracking.  Keyed by block hash
+// (ownership is first-wins, so at most one peer holds a block request at a
+// time).  The map is instrumentation-only: a leaf lock that is never held
+// while another lock is acquired, and bounded by age pruning at insert time.
+CCriticalSection cs_askForWire;
+std::map<uint256, int64_t> g_askForWireEnqueuedMonotonic;
 
 // Previous-interval totals for per-second rate deltas.  Owned exclusively by
 // the message-handler thread (the only thread that emits).
@@ -89,6 +99,8 @@ bool InitIBDActivePathTrace(bool fEnabled)
     if (fEnabled)
     {
         g_nTraceEpochMicros = MonotonicMicros();
+        // Re-arming forces a fresh 1-second emission cadence.
+        g_nLastEmitMicros.store(0, std::memory_order_relaxed);
         printf("IBD_ACTIVE_1S time_us=%lld event=START enabled=1\n",
                (long long)g_nTraceEpochMicros);
     }
@@ -168,7 +180,19 @@ ActivePathCounters::ActivePathCounters()
       dag_epoch_commit_count(0),
       wallet_callback_us_total(0),
       wallet_callback_us_max(0),
-      wallet_callback_count(0)
+      wallet_callback_count(0),
+      peers_inflight_gt0(0),
+      peers_queued_gt0(0),
+      inflight_peer_max(0),
+      queued_peer_max(0),
+      dominant_peer_inflight_share_pct(0),
+      global_free_active_slots(0),
+      global_free_slots_with_deferred(-1),
+      samples_single_peer_over_75pct(0),
+      samples_global_below_half_with_deferred(0),
+      block_request_wire_latency_us_total(0),
+      block_request_wire_latency_us_max(0),
+      block_request_wire_latency_count(0)
 {
 }
 
@@ -297,6 +321,50 @@ void RecordAskForToGetData(int64_t nWaitUs)
     c.askfor_to_getdata_us_total.fetch_add(nWaitUs, std::memory_order_relaxed);
     AtomicMax(c.askfor_to_getdata_us_max, nWaitUs);
     c.askfor_to_getdata_count.fetch_add(1, std::memory_order_relaxed);
+}
+
+void RecordBlockRequestEnqueued(const uint256& hash)
+{
+    if (!g_IBDActivePathEnabled)
+        return;
+    LOCK(cs_askForWire);
+    const int64_t nNow = MonotonicMicros();
+    if (g_askForWireEnqueuedMonotonic.size() >= 8192)
+    {
+        // Bound the instrumentation map: purge any record older than 60s.
+        const int64_t nCutoff = nNow - 60 * 1000000;
+        for (std::map<uint256, int64_t>::iterator it =
+                 g_askForWireEnqueuedMonotonic.begin();
+             it != g_askForWireEnqueuedMonotonic.end();)
+        {
+            if (it->second < nCutoff)
+                it = g_askForWireEnqueuedMonotonic.erase(it);
+            else
+                ++it;
+        }
+    }
+    g_askForWireEnqueuedMonotonic[hash] = nNow;
+}
+
+void RecordBlockRequestSent(const uint256& hash)
+{
+    if (!g_IBDActivePathEnabled)
+        return;
+    int64_t nWaitUs = -1;
+    {
+        LOCK(cs_askForWire);
+        std::map<uint256, int64_t>::iterator it =
+            g_askForWireEnqueuedMonotonic.find(hash);
+        if (it == g_askForWireEnqueuedMonotonic.end())
+            return;
+        nWaitUs = std::max<int64_t>(0, MonotonicMicros() - it->second);
+        g_askForWireEnqueuedMonotonic.erase(it);
+    }
+    ActivePathCounters& c = GetCounters();
+    c.block_request_wire_latency_us_total.fetch_add(
+        nWaitUs, std::memory_order_relaxed);
+    AtomicMax(c.block_request_wire_latency_us_max, nWaitUs);
+    c.block_request_wire_latency_count.fetch_add(1, std::memory_order_relaxed);
 }
 
 void RecordMessageHandlerPassInterval(int64_t nUs)
@@ -429,7 +497,12 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
     int64_t nGetBlocksQueuedPeer = 0;
     int64_t nGetBlocksOutstandingPeer = 0;
     int64_t nPeers = 0;
+    int64_t nPeersInflightGT0 = 0;
+    int64_t nPeersQueuedGT0 = 0;
+    int64_t nInflightPeerMax = 0;
+    int64_t nQueuedPeerMax = 0;
     const int64_t nNowKey = GetTime() * 1000000;
+    const int64_t nCap = GetMaxActiveBlockRequestsPerPeer();
     for (const CNode* pnode : vNodesCopy)
     {
         if (!pnode || pnode->fDisconnect || pnode->nVersion == 0)
@@ -437,13 +510,20 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
         ++nPeers;
         nAskForDepth += (int64_t)pnode->mapAskFor.size();
         nDeferredPeer += (int64_t)pnode->deferredBlockInv.size();
-        nInflightPeer += (int64_t)pnode->setBlocksInFlight.size();
+        const int64_t nInflightThis = (int64_t)pnode->setBlocksInFlight.size();
+        const int64_t nQueuedThis = (int64_t)pnode->setAskForBlocks.size();
+        nInflightPeer += nInflightThis;
+        if (nInflightThis > 0)
+            ++nPeersInflightGT0;
+        if (nQueuedThis > 0)
+            ++nPeersQueuedGT0;
+        nInflightPeerMax = std::max(nInflightPeerMax, nInflightThis);
+        nQueuedPeerMax = std::max(nQueuedPeerMax, nQueuedThis);
         nGetBlocksQueuedPeer += (int64_t)pnode->getBlocksIndex.size();
         nGetBlocksOutstandingPeer +=
             (int64_t)pnode->getBlocksOutstandingSources.size();
-        const int64_t nCap = 128;
         nFreeCapacityPeer += std::max<int64_t>(
-            0, nCap - (int64_t)pnode->setBlocksInFlight.size());
+            0, nCap - nInflightThis);
         for (std::multimap<int64_t, CInv>::const_iterator it =
                  pnode->mapAskFor.begin();
              it != pnode->mapAskFor.end() && it->first <= nNowKey; ++it)
@@ -451,6 +531,44 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
             ++nAskForDue;
         }
     }
+
+    // IBD active-window distribution gauges.  Dominant share is the largest
+    // single-peer inflight as a percentage of total peer inflight.  Global
+    // free slots are 512 - global active (queued+inflight), clamped to
+    // [0, 512].  Sample counters increment at most once per 1s emission.
+    ibdmetrics::Counters& mc = ibdmetrics::Get();
+    const int64_t nGlobalActiveCurrent =
+        mc.total_queued_current.load(std::memory_order_relaxed) +
+        mc.total_inflight_current.load(std::memory_order_relaxed);
+    const int64_t nGlobalFreeActiveSlots = std::max<int64_t>(
+        0, (int64_t)MAX_DEFERRED_INV_ACTIVE_GLOBAL - nGlobalActiveCurrent);
+    const int64_t nTotalDeferredCurrent =
+        mc.total_deferred_current.load(std::memory_order_relaxed);
+    int64_t nDominantSharePct = 0;
+    if (nInflightPeer > 0)
+        nDominantSharePct = (100 * nInflightPeerMax) / nInflightPeer;
+    if (nInflightPeer > 0 &&
+        100 * nInflightPeerMax >= 75 * nInflightPeer)
+    {
+        c.samples_single_peer_over_75pct.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (nTotalDeferredCurrent > 0 &&
+        nGlobalFreeActiveSlots > MAX_DEFERRED_INV_ACTIVE_GLOBAL / 2)
+    {
+        c.samples_global_below_half_with_deferred.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    c.peers_inflight_gt0.store(nPeersInflightGT0, std::memory_order_relaxed);
+    c.peers_queued_gt0.store(nPeersQueuedGT0, std::memory_order_relaxed);
+    c.inflight_peer_max.store(nInflightPeerMax, std::memory_order_relaxed);
+    c.queued_peer_max.store(nQueuedPeerMax, std::memory_order_relaxed);
+    c.dominant_peer_inflight_share_pct.store(
+        nDominantSharePct, std::memory_order_relaxed);
+    c.global_free_active_slots.store(
+        nGlobalFreeActiveSlots, std::memory_order_relaxed);
+    c.global_free_slots_with_deferred.store(
+        nTotalDeferredCurrent > 0 ? nGlobalFreeActiveSlots : -1,
+        std::memory_order_relaxed);
 
     // Per-second rates from totals delta.
     const int64_t nBlocksAccepted = c.acceptblock_count.load(std::memory_order_relaxed);
@@ -478,7 +596,11 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
            "pass_interval_avg_us=%lld pass_interval_max_us=%lld sleep_us=%lld "
            "dispatch_delay_avg_us=%lld dispatch_delay_max_us=%lld cs_main_wait_avg_us=%lld cs_main_wait_max_us=%lld "
            "processblock_avg_us=%lld acceptblock_avg_us=%lld addtoblockindex_avg_us=%lld setbestchain_avg_us=%lld connectblock_avg_us=%lld "
-           "raw_write_avg_us=%lld filecommit_avg_us=%lld blockindex_commit_avg_us=%lld chainstate_commit_avg_us=%lld dag_commit_avg_us=%lld wallet_cb_avg_us=%lld\n",
+           "raw_write_avg_us=%lld filecommit_avg_us=%lld blockindex_commit_avg_us=%lld chainstate_commit_avg_us=%lld dag_commit_avg_us=%lld wallet_cb_avg_us=%lld "
+           "peers_inflight_gt0=%lld peers_queued_gt0=%lld inflight_peer_max=%lld queued_peer_max=%lld "
+           "dominant_peer_inflight_share_pct=%lld global_free_active_slots=%lld global_free_slots_with_deferred=%lld "
+           "samples_single_peer_over_75pct=%lld samples_global_below_half_with_deferred=%lld "
+           "wire_latency_avg_us=%lld wire_latency_max_us=%lld\n",
            (long long)nNow,
            (long long)((nNow - g_nTraceEpochMicros) / 1000000),
            nBestHeight, (long long)nPeers,
@@ -523,10 +645,22 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
                           c.blockindex_commit_count.load(std::memory_order_relaxed)),
            (long long)Avg(c.chainstate_commit_us_total.load(std::memory_order_relaxed),
                           c.chainstate_commit_count.load(std::memory_order_relaxed)),
-           (long long)Avg(c.dag_epoch_commit_us_total.load(std::memory_order_relaxed),
-                          c.dag_epoch_commit_count.load(std::memory_order_relaxed)),
-           (long long)Avg(c.wallet_callback_us_total.load(std::memory_order_relaxed),
-                          c.wallet_callback_count.load(std::memory_order_relaxed)));
+            (long long)Avg(c.dag_epoch_commit_us_total.load(std::memory_order_relaxed),
+                           c.dag_epoch_commit_count.load(std::memory_order_relaxed)),
+            (long long)Avg(c.wallet_callback_us_total.load(std::memory_order_relaxed),
+                           c.wallet_callback_count.load(std::memory_order_relaxed)),
+            (long long)c.peers_inflight_gt0.load(std::memory_order_relaxed),
+            (long long)c.peers_queued_gt0.load(std::memory_order_relaxed),
+            (long long)c.inflight_peer_max.load(std::memory_order_relaxed),
+            (long long)c.queued_peer_max.load(std::memory_order_relaxed),
+            (long long)c.dominant_peer_inflight_share_pct.load(std::memory_order_relaxed),
+            (long long)c.global_free_active_slots.load(std::memory_order_relaxed),
+            (long long)c.global_free_slots_with_deferred.load(std::memory_order_relaxed),
+            (long long)c.samples_single_peer_over_75pct.load(std::memory_order_relaxed),
+            (long long)c.samples_global_below_half_with_deferred.load(std::memory_order_relaxed),
+            (long long)Avg(c.block_request_wire_latency_us_total.load(std::memory_order_relaxed),
+                           c.block_request_wire_latency_count.load(std::memory_order_relaxed)),
+            (long long)c.block_request_wire_latency_us_max.load(std::memory_order_relaxed));
 }
 
 } // namespace ibdactivepath

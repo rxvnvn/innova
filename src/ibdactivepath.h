@@ -10,6 +10,8 @@
 #include <atomic>
 #include <vector>
 
+#include "uint256.h"
+
 class CNode;
 
 // Runtime-only IBD active-path throughput instrumentation.
@@ -129,6 +131,21 @@ struct ActivePathCounters
     std::atomic<int64_t> wallet_callback_us_max;
     std::atomic<int64_t> wallet_callback_count;
 
+    // 5. IBD active-window distribution (per-second sampled gauges, updated
+    // once per IBD_ACTIVE_1S emission) and monotonic wire latency.
+    std::atomic<int64_t> peers_inflight_gt0;
+    std::atomic<int64_t> peers_queued_gt0;
+    std::atomic<int64_t> inflight_peer_max;
+    std::atomic<int64_t> queued_peer_max;
+    std::atomic<int64_t> dominant_peer_inflight_share_pct;
+    std::atomic<int64_t> global_free_active_slots;
+    std::atomic<int64_t> global_free_slots_with_deferred;
+    std::atomic<int64_t> samples_single_peer_over_75pct;
+    std::atomic<int64_t> samples_global_below_half_with_deferred;
+    std::atomic<int64_t> block_request_wire_latency_us_total;
+    std::atomic<int64_t> block_request_wire_latency_us_max;
+    std::atomic<int64_t> block_request_wire_latency_count;
+
     ActivePathCounters();
 };
 
@@ -162,6 +179,13 @@ void RecordUsefulResponseEnd();
 void RecordGetDataPass(int64_t nSent, bool fDueRequests,
                        bool fFreeCapacity, int nStopReason);
 void RecordAskForToGetData(int64_t nWaitUs);
+
+// Monotonic AskFor-enqueue → getdata-export wire latency (bounded, lock
+// guarded, no-op when trace disabled).  RecordBlockRequestSent() consumes the
+// enqueue record and folds the wait into
+// block_request_wire_latency_{total,max,count}.
+void RecordBlockRequestEnqueued(const uint256& hash);
+void RecordBlockRequestSent(const uint256& hash);
 void RecordMessageHandlerPassInterval(int64_t nUs);
 void RecordMessageHandlerSleep(int64_t nUs);
 void RecordBlockDispatchDelay(int64_t nUs, int64_t nCompleteWaiting);

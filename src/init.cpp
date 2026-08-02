@@ -588,6 +588,7 @@ std::string HelpMessage()
         "  -ibdefficiencytrace=<0|1> " + _("Trace IBD block efficiency counters (default: 0)") + "\n" +
         "  -ibdactivepathtrace=<0|1> " + _("Trace IBD active-path throughput (IBD_ACTIVE_1S, IBD_SLOW_BLOCK, IBD_STATE_TRACE; default: 0)") + "\n" +
         "  -ibdactiveslowthresholdms=<n> " + _("Slow-phase threshold for IBD_SLOW_BLOCK events in milliseconds (default: 50)") + "\n" +
+        "  -ibdmaxactiveperpeer=<n> " + _("Experimental IBD per-peer active request window; clamped to [1,512], zero/negative/non-numeric falls back to default (default: 128)") + "\n" +
         "  -getinfosyncprobe=<n> " + _("Log cached P2P state before, during, and after getinfo (default: 0)") + "\n" +
         "  -rpcperftrace=<n>     " + _("Trace getinfo/getmininginfo RPC performance (default: 0)") + "\n" +
         "  -synclockdiagnostics=<n> " + _("Log long sync-related lock waits and holds (default: 0)") + "\n" +

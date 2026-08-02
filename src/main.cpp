@@ -290,7 +290,7 @@ int GetDeferredBlockRequestBudget(CNode* pfrom,
                 0, std::memory_order_relaxed);
             ibdmetrics::PeerZeroStateChange(nOldZero, 0);
         }
-        return MAX_DEFERRED_INV_ACTIVE_PER_PEER;
+        return GetMaxActiveBlockRequestsPerPeer();
     }
 
     const int nOrphanCountPeer = GetPeerOrphanCount(pfrom->GetId());
@@ -317,7 +317,7 @@ int GetDeferredBlockRequestBudget(CNode* pfrom,
     if (pnGlobalActivePressure)
         *pnGlobalActivePressure = nGlobalActivePressure;
 
-    const int nPeerBudget = MAX_DEFERRED_INV_ACTIVE_PER_PEER - nPeerActivePressure;
+    const int nPeerBudget = GetMaxActiveBlockRequestsPerPeer() - nPeerActivePressure;
     const int nGlobalBudget = MAX_DEFERRED_INV_ACTIVE_GLOBAL - nGlobalActivePressure;
     const int nBudget = std::max(0, std::min(nPeerBudget, nGlobalBudget));
 
@@ -374,7 +374,7 @@ static void TraceDeferredWindowState(CNode* pfrom, const char* pszEvent,
            hash.ToString().c_str(), pfrom->deferredBlockInv.size(),
            nQueuedBlockRequests, nSentBlockRequests, nGlobalActivePressure,
            nOrphanCountPeer, nPeerActivePressure, nBudget,
-           MAX_DEFERRED_INV_ACTIVE_PER_PEER,
+           GetMaxActiveBlockRequestsPerPeer(),
            MAX_DEFERRED_INV_ACTIVE_GLOBAL,
            MAX_DEFERRED_BLOCK_INV_PER_PEER,
            pszReason ? pszReason : "none", nAdmitted, nDropped);
@@ -465,7 +465,7 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
                 pfrom, inv.hash, BLOCKREQ_SOURCE_INV,
                 nOrphanCountPeer, nQueuedBlockRequests,
                 nSentBlockRequests, nPeerActivePressure,
-                MAX_DEFERRED_INV_ACTIVE_PER_PEER,
+                GetMaxActiveBlockRequestsPerPeer(),
                 MAX_ORPHAN_BLOCKS_PER_PEER);
             BlockRequestTraceOrphanPressure(
                 pfrom, nOrphanCountPeer, nQueuedBlockRequests,
@@ -10436,13 +10436,14 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
     {
         vector<CInv> vGetData;
         int64_t nNow = GetTime() * 1000000;
-        static const size_t MAX_BLOCKS_IN_FLIGHT_PER_PEER = 128;
+        const size_t nMaxBlocksInFlightPerPeer =
+            (size_t)GetMaxActiveBlockRequestsPerPeer();
         pto->ExpireBlockInFlight();
         const bool fIBDPassHadDue =
             !pto->mapAskFor.empty() &&
             (*pto->mapAskFor.begin()).first <= nNow;
         const bool fIBDPassHadFreeCapacity =
-            pto->setBlocksInFlight.size() < MAX_BLOCKS_IN_FLIGHT_PER_PEER;
+            pto->setBlocksInFlight.size() < nMaxBlocksInFlightPerPeer;
         int64_t nIBDPassSent = 0;
         while (!pto->mapAskFor.empty() && (*pto->mapAskFor.begin()).first <= nNow)
         {
@@ -10499,7 +10500,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                         ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);
                     continue;
                 }
-                if (pto->setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
+                if (pto->setBlocksInFlight.size() >= nMaxBlocksInFlightPerPeer)
                 {
                     break;
                 }
@@ -10557,6 +10558,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                         std::max<int64_t>(0, nNow - (*pto->mapAskFor.begin()).first));
                     ++nIBDPassSent;
                     pto->MarkBlockInFlight(inv.hash);
+                    ibdactivepath::RecordBlockRequestSent(inv.hash);
                     if (fTraceBlockRequest)
                         BlockRequestTraceInFlightMark(pto, inv.hash, true);
                 }
