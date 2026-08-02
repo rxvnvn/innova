@@ -281,6 +281,8 @@ enum PipelineWakeOutcome
     PIPELINE_WAKE_TERMINAL_OUTSTANDING_GETBLOCKS_PRESENT
 };
 
+typedef int NodeId;
+
 void RequestBlockPipelineWake(uint32_t nCause);
 PipelineWakeOutcome MaybeProcessPipelineWake(
     const std::vector<CNode*>& vNodesCopy,
@@ -298,9 +300,25 @@ CNode* MaybeQueueStalledSyncRecovery(const std::vector<CNode*>& vNodes,
 void RecordRejectedBlockForSync(
     const uint256& hashBlock, bool fRetryEligible = true);
 void ClearRejectedBlockForSync(const uint256& hashBlock);
-void RecordOrphanLimitRejectedBlock(const CInv& inv, int64_t nUntilMicros);
-bool IsOrphanLimitRejectedBlockInCooldown(const CInv& inv, int64_t nNowMicros,
+void RecordOrphanLimitRejectedBlock(NodeId peer, const CInv& inv,
+                                    int64_t nUntilMicros,
+                                    const uint256& hashParent);
+bool IsOrphanLimitRejectedBlockInCooldown(NodeId peer, const CInv& inv,
+                                          int64_t nNowMicros,
                                           int64_t* nUntilMicros = NULL);
+bool IsOrphanLimitRejectedByOtherPeer(NodeId peer, const CInv& inv,
+                                      int64_t nNowMicros);
+void ReleaseOrphanLimitRejectedForPeer(NodeId peer);
+void RetryOrphanLimitRejectedOnParentConnect(const uint256& hashParent,
+                                             CNode* pfrom);
+// Writes the short, peer-agnostic negative cooldown for a rejected block to
+// mapAlreadyAskedFor.  The long (120s) orphan-limit suppression is stored only
+// in the peer-local cooldown map by RecordOrphanLimitRejectedBlock; the global
+// map never carries an orphan-limit blocker that would delay a different peer.
+void RecordRejectedBlockGlobalNegativeCooldown(const CInv& inv);
+// Bounded-map inspection used by diagnostics and tests.
+size_t GetOrphanLimitRejectedEntryCount();
+size_t GetOrphanLimitRejectedEntryCountForPeer(NodeId peer);
 bool SyncTraceEnabled();
 static const int64_t RECOVERY_RESPONSE_WINDOW_US = 2000000;
 
@@ -381,8 +399,6 @@ struct CNodeSignals
 };
 
 CNodeSignals& GetNodeSignals();
-
-typedef int NodeId;
 
 enum
 {
@@ -493,6 +509,21 @@ enum BlockRequestOwnerState
     BLOCK_REQUEST_OWNER_IN_FLIGHT
 };
 
+// Result of one CNode::AskFor admission attempt.  The retry path for
+// orphan-limit rejected blocks (RetryOrphanLimitRejectedOnParentConnect) uses
+// this typed result to decide whether a cooldown entry may be permanently
+// erased: the entry is only removed when the result proves the request was
+// retained (queued, already queued, in flight, or owned by another peer).
+enum AskForResult
+{
+    ASKFOR_QUEUED = 0,
+    ASKFOR_ALREADY_QUEUED,
+    ASKFOR_INFLIGHT,
+    ASKFOR_OWNED_BY_OTHER,
+    ASKFOR_COOLDOWN,
+    ASKFOR_CAP_FULL
+};
+
 bool TryAssignBlockRequestOwner(const uint256& hash, NodeId peer,
                                 BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER,
                                 NodeId* existingPeer = NULL,
@@ -515,6 +546,14 @@ bool EraseAlreadyAskedForIfUnowned(const CInv& inv);
 static const int64_t ALREADY_ASKED_FOR_RETENTION_US = 60LL * 60 * 1000000;
 static const int64_t ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US = 5LL * 1000000;
 static const int64_t ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US = 2LL * 60 * 1000000;
+// Strict memory bounds for the peer-local orphan-limit reject cooldown map
+// (mapOrphanLimitRejectedBlocks in net.cpp).  Per-peer mirrors
+// MAX_ORPHAN_BLOCKS_PER_PEER so one saturating peer cannot hoard entries;
+// process-global mirrors MAX_ALREADY_ASKED_FOR_SIZE so many peers together
+// cannot.  When a bound is exceeded the earliest-expiry entry (least
+// remaining protective time) is evicted deterministically.
+static const size_t MAX_ORPHAN_LIMIT_REJECTED_PER_PEER = 750;
+static const size_t MAX_ORPHAN_LIMIT_REJECTED_GLOBAL = 50000;
 size_t PruneAlreadyAskedFor(int64_t nNowMicros);
 
 // Single-slot IBD frontier admission exemption.
@@ -1258,7 +1297,7 @@ public:
         setAskForBlocks.clear();
     }
 
-    void AskFor(const CInv& inv, BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER)
+    AskForResult AskFor(const CInv& inv, BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER)
     {
         const int64_t nPruneNow = GetTimeMicros();
         PruneAlreadyAskedFor(nPruneNow);
@@ -1270,7 +1309,7 @@ public:
             {
                 ibdmetrics::Get().askfor_skip_inflight.fetch_add(
                     1, std::memory_order_relaxed);
-                return;
+                return ASKFOR_INFLIGHT;
             }
             if (IsBlockAskForQueued(inv.hash))
             {
@@ -1279,19 +1318,29 @@ public:
                                              "same-peer-already-queued");
                 ibdmetrics::Get().askfor_skip_already_queued.fetch_add(
                     1, std::memory_order_relaxed);
-                return;
+                return ASKFOR_ALREADY_QUEUED;
             }
         }
 
         if (fBlockRequest &&
-            IsOrphanLimitRejectedBlockInCooldown(inv, nPruneNow))
+            source != BLOCKREQ_SOURCE_ORPHAN_LIMIT_RETRY &&
+            IsOrphanLimitRejectedBlockInCooldown(GetId(), inv, nPruneNow))
         {
             if (BlockRequestTraceEnabled())
                 BlockRequestTraceAskSkip(this, inv.hash, source,
                                          "orphan-limit-cooldown");
             ibdmetrics::Get().askfor_skip_orphan_limit_cooldown.fetch_add(
                 1, std::memory_order_relaxed);
-            return;
+            return ASKFOR_COOLDOWN;
+        }
+        if (fBlockRequest &&
+            IsOrphanLimitRejectedByOtherPeer(GetId(), inv, nPruneNow))
+        {
+            // This peer is not the one that saturated its orphan window for
+            // this hash; the peer-local cooldown belongs to another peer, so
+            // the request is admitted and counted as cross-peer recovery.
+            ibdmetrics::Get().orphan_limit_cross_peer_admitted.fetch_add(
+                1, std::memory_order_relaxed);
         }
 
         LOCK(cs_mapAlreadyAskedFor);
@@ -1307,7 +1356,7 @@ public:
                        MAX_ALREADY_ASKED_FOR_SIZE);
             ibdmetrics::Get().askfor_skip_mapalreadyasked_cap.fetch_add(
                 1, std::memory_order_relaxed);
-            return;
+            return ASKFOR_CAP_FULL;
         }
 
         NodeId nOwnerPeer = -1;
@@ -1323,7 +1372,7 @@ public:
                                          BlockRequestOwnerStateName(ownerState));
             ibdmetrics::Get().askfor_skip_other_peer_owner.fetch_add(
                 1, std::memory_order_relaxed);
-            return;
+            return ASKFOR_OWNED_BY_OTHER;
         }
 
         // We're using mapAskFor as a priority queue,
@@ -1360,6 +1409,7 @@ public:
         if (BlockRequestTraceEnabled() && inv.type == MSG_BLOCK)
             BlockRequestTraceAskSchedule(this, inv.hash, source, nRequestTime,
                                          nPreviousRequestTime, false);
+        return ASKFOR_QUEUED;
     }
 
 

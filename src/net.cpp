@@ -7,6 +7,7 @@
 #include "net.h"
 #include "main.h"
 #include "ibdmetrics.h"
+#include "ibdactivepath.h"
 #include "init.h"
 #include "strlcpy.h"
 #include "addrman.h"
@@ -18,6 +19,7 @@
 #include <sys/stat.h>
 #include <algorithm>
 #include <cctype>
+#include <limits>
 #include <sstream>
 #include <cstdio>
 
@@ -1891,7 +1893,119 @@ CCriticalSection cs_mapRelay;
 map<CInv, int64_t> mapAlreadyAskedFor;
 // mutex for mapAlreadyAskedFor and orphan-limit reject cooldown state
 CCriticalSection cs_mapAlreadyAskedFor;
-static map<CInv, int64_t> mapOrphanLimitRejectedBlocks;
+struct OrphanLimitRejectedEntry
+{
+    int64_t nUntilMicros;
+    uint256 hashParent;
+};
+// Peer-local orphan-limit reject cooldown: keyed by (inv, peer) so a rejection
+// caused by one peer's orphan saturation suppresses re-request from that peer
+// only and never blocks the same hash from other peers.  hashParent lets the
+// node deterministically retry a rejected child once its parent is indexed.
+// All access is guarded by cs_mapAlreadyAskedFor.
+//
+// The map is strictly bounded (MAX_ORPHAN_LIMIT_REJECTED_PER_PEER entries per
+// peer, MAX_ORPHAN_LIMIT_REJECTED_GLOBAL entries process-wide).  The two
+// secondary indexes keep cap enforcement and expiry pruning O(log n) so a
+// hostile flood at the bound cannot degrade to a per-insert full scan:
+//   mapOrphanLimitRejectedByPeerExpiry  orders (peer, nUntilMicros) so the
+//       earliest-expiry entry of a peer is its first index entry;
+//   mapOrphanLimitRejectedCountByPeer   gives the per-peer entry count.
+static std::map<std::pair<CInv, NodeId>, OrphanLimitRejectedEntry>
+    mapOrphanLimitRejectedBlocks;
+static std::multimap<std::pair<NodeId, int64_t>, std::pair<CInv, NodeId>>
+    mapOrphanLimitRejectedByPeerExpiry;
+static std::map<NodeId, size_t> mapOrphanLimitRejectedCountByPeer;
+
+// Requires LOCK(cs_mapAlreadyAskedFor).
+static void OrphanLimitEraseLocked(const std::pair<CInv, NodeId>& key,
+                                   int64_t nUntilMicros)
+{
+    mapOrphanLimitRejectedBlocks.erase(key);
+    typedef std::multimap<std::pair<NodeId, int64_t>,
+                          std::pair<CInv, NodeId> > ExpiryIndex;
+    std::pair<ExpiryIndex::iterator, ExpiryIndex::iterator> range =
+        mapOrphanLimitRejectedByPeerExpiry.equal_range(
+            std::make_pair(key.second, nUntilMicros));
+    for (ExpiryIndex::iterator it = range.first; it != range.second; ++it)
+    {
+        if (it->second.first.type == key.first.type &&
+            it->second.first.hash == key.first.hash &&
+            it->second.second == key.second)
+        {
+            mapOrphanLimitRejectedByPeerExpiry.erase(it);
+            break;
+        }
+    }
+    std::map<NodeId, size_t>::iterator itCount =
+        mapOrphanLimitRejectedCountByPeer.find(key.second);
+    if (itCount != mapOrphanLimitRejectedCountByPeer.end())
+    {
+        if (itCount->second > 1)
+            --itCount->second;
+        else
+            mapOrphanLimitRejectedCountByPeer.erase(itCount);
+    }
+}
+
+// Requires LOCK(cs_mapAlreadyAskedFor).
+static void OrphanLimitInsertLocked(const std::pair<CInv, NodeId>& key,
+                                    int64_t nUntilMicros,
+                                    const uint256& hashParent)
+{
+    OrphanLimitRejectedEntry entry;
+    entry.nUntilMicros = nUntilMicros;
+    entry.hashParent = hashParent;
+    mapOrphanLimitRejectedBlocks[key] = entry;
+    mapOrphanLimitRejectedByPeerExpiry.insert(
+        std::make_pair(std::make_pair(key.second, nUntilMicros), key));
+    ++mapOrphanLimitRejectedCountByPeer[key.second];
+}
+
+// Requires LOCK(cs_mapAlreadyAskedFor).  Evicts the entry of `peer` with the
+// earliest expiry (least remaining protective time).
+static void OrphanLimitEvictPeerEarliestLocked(NodeId peer)
+{
+    typedef std::multimap<std::pair<NodeId, int64_t>,
+                          std::pair<CInv, NodeId> > ExpiryIndex;
+    ExpiryIndex::iterator itIndex =
+        mapOrphanLimitRejectedByPeerExpiry.lower_bound(
+            std::make_pair(peer, std::numeric_limits<int64_t>::min()));
+    if (itIndex == mapOrphanLimitRejectedByPeerExpiry.end())
+        return;
+    OrphanLimitEraseLocked(itIndex->second, itIndex->first.second);
+}
+
+// Requires LOCK(cs_mapAlreadyAskedFor).  Evicts the process-wide entry with
+// the earliest expiry.  The global minimum is the minimum over peers of each
+// peer's first (earliest-expiry) index entry.
+static void OrphanLimitEvictGlobalEarliestLocked()
+{
+    int64_t nBestUntil = std::numeric_limits<int64_t>::max();
+    std::pair<CInv, NodeId> bestKey;
+    bool fFound = false;
+    typedef std::multimap<std::pair<NodeId, int64_t>,
+                          std::pair<CInv, NodeId> > ExpiryIndex;
+    for (std::map<NodeId, size_t>::const_iterator itPeer =
+             mapOrphanLimitRejectedCountByPeer.begin();
+         itPeer != mapOrphanLimitRejectedCountByPeer.end(); ++itPeer)
+    {
+        ExpiryIndex::const_iterator itIndex =
+            mapOrphanLimitRejectedByPeerExpiry.lower_bound(
+                std::make_pair(itPeer->first,
+                               std::numeric_limits<int64_t>::min()));
+        if (itIndex == mapOrphanLimitRejectedByPeerExpiry.end())
+            continue;
+        if (itIndex->first.second < nBestUntil)
+        {
+            nBestUntil = itIndex->first.second;
+            bestKey = itIndex->second;
+            fFound = true;
+        }
+    }
+    if (fFound)
+        OrphanLimitEraseLocked(bestKey, nBestUntil);
+}
 
 struct BlockRequestOwner
 {
@@ -2189,32 +2303,234 @@ void InvalidateFrontierOnTipChange()
     ClearFrontierCandidate();
 }
 
-void RecordOrphanLimitRejectedBlock(const CInv& inv, int64_t nUntilMicros)
+void RecordOrphanLimitRejectedBlock(NodeId peer, const CInv& inv,
+                                    int64_t nUntilMicros,
+                                    const uint256& hashParent)
 {
+    if (peer < 0)
+        return;
     if (inv.type != MSG_BLOCK && inv.type != MSG_FILTERED_BLOCK)
         return;
     LOCK(cs_mapAlreadyAskedFor);
-    int64_t& nCurrentUntil = mapOrphanLimitRejectedBlocks[inv];
-    nCurrentUntil = std::max(nCurrentUntil, nUntilMicros);
+    std::pair<CInv, NodeId> key(inv, peer);
+    std::map<std::pair<CInv, NodeId>, OrphanLimitRejectedEntry>::iterator it =
+        mapOrphanLimitRejectedBlocks.find(key);
+    if (it != mapOrphanLimitRejectedBlocks.end())
+    {
+        if (nUntilMicros > it->second.nUntilMicros)
+        {
+            OrphanLimitEraseLocked(key, it->second.nUntilMicros);
+            OrphanLimitInsertLocked(key, nUntilMicros, hashParent);
+        }
+        ibdmetrics::Get().orphan_limit_cooldown_recorded.fetch_add(
+            1, std::memory_order_relaxed);
+        return;
+    }
+    // Enforce the strict per-peer bound by evicting this peer's
+    // earliest-expiry entry, then the process-global bound by evicting the
+    // global earliest-expiry entry.  Both bounds are documented on the
+    // MAX_ORPHAN_LIMIT_REJECTED_* constants in net.h.
+    std::map<NodeId, size_t>::const_iterator itCount =
+        mapOrphanLimitRejectedCountByPeer.find(peer);
+    if (itCount != mapOrphanLimitRejectedCountByPeer.end() &&
+        itCount->second >= MAX_ORPHAN_LIMIT_REJECTED_PER_PEER)
+        OrphanLimitEvictPeerEarliestLocked(peer);
+    if (mapOrphanLimitRejectedBlocks.size() >= MAX_ORPHAN_LIMIT_REJECTED_GLOBAL)
+        OrphanLimitEvictGlobalEarliestLocked();
+    OrphanLimitInsertLocked(key, nUntilMicros, hashParent);
+    ibdmetrics::Get().orphan_limit_cooldown_recorded.fetch_add(
+        1, std::memory_order_relaxed);
 }
 
-bool IsOrphanLimitRejectedBlockInCooldown(const CInv& inv, int64_t nNowMicros,
+void RecordRejectedBlockGlobalNegativeCooldown(const CInv& inv)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    int64_t& nRejectedAskTime = mapAlreadyAskedFor[inv];
+    // The 120s orphan-limit protection is peer-local only (see
+    // RecordOrphanLimitRejectedBlock).  The peer-agnostic map never carries an
+    // orphan-limit blocker, so a different peer is never delayed by the
+    // saturating peer's cooldown; it carries only the ordinary short negative
+    // cooldown for re-request anti-storm.
+    nRejectedAskTime = std::max<int64_t>(
+        nRejectedAskTime,
+        GetTimeMicros() + ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US);
+}
+
+size_t GetOrphanLimitRejectedEntryCount()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    return mapOrphanLimitRejectedBlocks.size();
+}
+
+size_t GetOrphanLimitRejectedEntryCountForPeer(NodeId peer)
+{
+    if (peer < 0)
+        return 0;
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<NodeId, size_t>::const_iterator itCount =
+        mapOrphanLimitRejectedCountByPeer.find(peer);
+    return itCount == mapOrphanLimitRejectedCountByPeer.end() ? 0
+                                                              : itCount->second;
+}
+
+bool IsOrphanLimitRejectedBlockInCooldown(NodeId peer, const CInv& inv,
+                                          int64_t nNowMicros,
                                           int64_t* nUntilMicros)
 {
     if (inv.type != MSG_BLOCK && inv.type != MSG_FILTERED_BLOCK)
         return false;
     LOCK(cs_mapAlreadyAskedFor);
-    std::map<CInv, int64_t>::iterator it = mapOrphanLimitRejectedBlocks.find(inv);
+    std::map<std::pair<CInv, NodeId>, OrphanLimitRejectedEntry>::iterator it =
+        mapOrphanLimitRejectedBlocks.find(std::make_pair(inv, peer));
     if (it == mapOrphanLimitRejectedBlocks.end())
         return false;
-    if (it->second <= nNowMicros)
+    if (it->second.nUntilMicros <= nNowMicros)
     {
-        mapOrphanLimitRejectedBlocks.erase(it);
+        OrphanLimitEraseLocked(it->first, it->second.nUntilMicros);
         return false;
     }
     if (nUntilMicros != NULL)
-        *nUntilMicros = it->second;
+        *nUntilMicros = it->second.nUntilMicros;
     return true;
+}
+
+bool IsOrphanLimitRejectedByOtherPeer(NodeId peer, const CInv& inv,
+                                      int64_t nNowMicros)
+{
+    if (inv.type != MSG_BLOCK && inv.type != MSG_FILTERED_BLOCK)
+        return false;
+    LOCK(cs_mapAlreadyAskedFor);
+    for (std::map<std::pair<CInv, NodeId>, OrphanLimitRejectedEntry>::
+             const_iterator it =
+                 mapOrphanLimitRejectedBlocks.lower_bound(std::make_pair(
+                     inv, std::numeric_limits<NodeId>::min()));
+         it != mapOrphanLimitRejectedBlocks.end() &&
+             it->first.first.type == inv.type && it->first.first.hash == inv.hash;
+         ++it)
+    {
+        if (it->first.second == peer)
+            continue;
+        if (it->second.nUntilMicros <= nNowMicros)
+            continue;
+        return true;
+    }
+    return false;
+}
+
+void ReleaseOrphanLimitRejectedForPeer(NodeId peer)
+{
+    if (peer < 0)
+        return;
+    LOCK(cs_mapAlreadyAskedFor);
+    for (std::map<std::pair<CInv, NodeId>, OrphanLimitRejectedEntry>::iterator
+             it = mapOrphanLimitRejectedBlocks.begin();
+         it != mapOrphanLimitRejectedBlocks.end(); )
+    {
+        if (it->first.second == peer)
+        {
+            int64_t nUntil = it->second.nUntilMicros;
+            std::pair<CInv, NodeId> key = it->first;
+            ++it;
+            OrphanLimitEraseLocked(key, nUntil);
+        }
+        else
+            ++it;
+    }
+}
+
+void RetryOrphanLimitRejectedOnParentConnect(const uint256& hashParent,
+                                             CNode* pfrom)
+{
+    if (hashParent == 0 || pfrom == NULL)
+        return;
+    const int64_t nNow = GetTimeMicros();
+    std::vector<CInv> vRetry;
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        for (std::map<std::pair<CInv, NodeId>, OrphanLimitRejectedEntry>::
+                 iterator it = mapOrphanLimitRejectedBlocks.begin();
+             it != mapOrphanLimitRejectedBlocks.end(); ++it)
+        {
+            if (it->second.hashParent != hashParent ||
+                it->second.nUntilMicros <= nNow)
+                continue;
+            const CInv& inv = it->first.first;
+            bool fDuplicate = false;
+            for (size_t i = 0; i < vRetry.size(); ++i)
+            {
+                if (vRetry[i].type == inv.type && vRetry[i].hash == inv.hash)
+                {
+                    fDuplicate = true;
+                    break;
+                }
+            }
+            if (fDuplicate)
+                continue;
+            vRetry.push_back(inv);
+        }
+        if (vRetry.empty())
+            return;
+        // Clear the peer-agnostic negative-cache blocker for unowned children
+        // so the retry is scheduled immediately instead of at the stale
+        // negative timestamp.  The cooldown entries themselves are
+        // intentionally NOT erased here: each is removed only after AskFor
+        // proves the request was retained (queued/inflight/owned).  On a
+        // cap-full or other non-retaining rejection the entries stay, keeping
+        // the child in a bounded retry state instead of losing it.
+        for (size_t i = 0; i < vRetry.size(); ++i)
+        {
+            const CInv& inv = vRetry[i];
+            if (mapBlockRequestOwners.count(inv.hash) != 0)
+                continue;
+            std::map<CInv, int64_t>::iterator itAlready =
+                mapAlreadyAskedFor.find(inv);
+            if (itAlready != mapAlreadyAskedFor.end())
+                mapAlreadyAskedFor.erase(itAlready);
+        }
+    }
+    for (size_t i = 0; i < vRetry.size(); ++i)
+    {
+        const CInv& inv = vRetry[i];
+        const AskForResult result = pfrom->AskFor(
+            inv, BLOCKREQ_SOURCE_ORPHAN_LIMIT_RETRY);
+        const bool fRetained =
+            result == ASKFOR_QUEUED ||
+            result == ASKFOR_ALREADY_QUEUED ||
+            result == ASKFOR_INFLIGHT ||
+            result == ASKFOR_OWNED_BY_OTHER;
+        if (fRetained)
+        {
+            // The request is proven retained (queued, already queued, in
+            // flight, or owned by another peer): the cooldown record for this
+            // child is obsolete and can be released.
+            LOCK(cs_mapAlreadyAskedFor);
+            for (std::map<std::pair<CInv, NodeId>, OrphanLimitRejectedEntry>::
+                     iterator it = mapOrphanLimitRejectedBlocks.begin();
+                 it != mapOrphanLimitRejectedBlocks.end(); )
+            {
+                if (it->first.first.type == inv.type &&
+                    it->first.first.hash == inv.hash)
+                {
+                    int64_t nUntil = it->second.nUntilMicros;
+                    std::pair<CInv, NodeId> key = it->first;
+                    ++it;
+                    OrphanLimitEraseLocked(key, nUntil);
+                }
+                else
+                    ++it;
+            }
+            ibdmetrics::Get().orphan_limit_frontier_retry_queued.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        else
+        {
+            // Not retained (cap-full or a temporary rejection): the cooldown
+            // entry remains a bounded retry state; the child is re-requested
+            // cross-peer via inv/headers while this peer stays suppressed.
+            ibdmetrics::Get().orphan_limit_frontier_retry_pending.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
 }
 
 size_t PruneAlreadyAskedFor(int64_t nNowMicros)
@@ -2228,12 +2544,17 @@ size_t PruneAlreadyAskedFor(int64_t nNowMicros)
             nNowMicros - nLastPruneMicros < 1000000)
             return 0;
         nLastPruneMicros = nNowMicros;
-        for (std::map<CInv, int64_t>::iterator it =
-                 mapOrphanLimitRejectedBlocks.begin();
+        for (std::map<std::pair<CInv, NodeId>, OrphanLimitRejectedEntry>::
+                 iterator it = mapOrphanLimitRejectedBlocks.begin();
              it != mapOrphanLimitRejectedBlocks.end(); )
         {
-            if (it->second <= nNowMicros)
-                it = mapOrphanLimitRejectedBlocks.erase(it);
+            if (it->second.nUntilMicros <= nNowMicros)
+            {
+                int64_t nUntil = it->second.nUntilMicros;
+                std::pair<CInv, NodeId> key = it->first;
+                ++it;
+                OrphanLimitEraseLocked(key, nUntil);
+            }
             else
                 ++it;
         }
@@ -2773,6 +3094,8 @@ static const char* BlockRequestTraceSourceName(BlockRequestTraceSource source)
         return "checkpoint";
     case BLOCKREQ_SOURCE_REJECT_RECOVERY:
         return "reject-recovery";
+    case BLOCKREQ_SOURCE_ORPHAN_LIMIT_RETRY:
+        return "orphan-limit-retry";
     default:
         return "other";
     }
@@ -4932,6 +5255,7 @@ void CNode::ClearGetBlocksOutstandingForCleanup()
 void CNode::Cleanup()
 {
     ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect");
+    ReleaseOrphanLimitRejectedForPeer(GetId());
     if (!fIbdMetricsCleanupAccounted)
     {
         const bool fHadQueuedGetBlocks = !getBlocksIndex.empty();
@@ -6925,6 +7249,9 @@ void ThreadMessageHandler2(void* parg)
     SetThreadPriority(THREAD_PRIORITY_BELOW_NORMAL);
     while (!fShutdown)
     {
+        const int64_t nIBDPassStart =
+            ibdactivepath::IBDActivePathTraceEnabled()
+                ? ibdactivepath::MonotonicMicros() : 0;
         bool fHaveSyncNode = false;
         vector<CNode*> vNodesCopy;
         {
@@ -7032,6 +7359,8 @@ void ThreadMessageHandler2(void* parg)
         }
         UpdateGetInfoSyncProbeSnapshot(vNodesCopy);
 
+        ibdactivepath::EmitIBDActive1s(vNodesCopy);
+
         {
             LOCK(cs_vNodes);
             BOOST_FOREACH(CNode* pnode, vNodesCopy)
@@ -7042,8 +7371,22 @@ void ThreadMessageHandler2(void* parg)
         // Reduce vnThreadsRunning so StopNode has permission to exit while
         // we're sleeping, but we must always check fShutdown after doing this.
         vnThreadsRunning[THREAD_MESSAGEHANDLER]--;
+        int64_t nIBDSleepUs = 0;
         if (fSleep)
+        {
+            const int64_t nIBDSleepStart =
+                ibdactivepath::IBDActivePathTraceEnabled()
+                    ? ibdactivepath::MonotonicMicros() : 0;
             MilliSleep(100);
+            if (nIBDSleepStart)
+                nIBDSleepUs = ibdactivepath::MonotonicMicros() - nIBDSleepStart;
+        }
+        if (nIBDPassStart)
+        {
+            ibdactivepath::RecordMessageHandlerPassInterval(
+                ibdactivepath::MonotonicMicros() - nIBDPassStart);
+            ibdactivepath::RecordMessageHandlerSleep(nIBDSleepUs);
+        }
         LogSyncDiagnosticsMaybe();
 
         if (fRequestShutdown)

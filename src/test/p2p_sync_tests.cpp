@@ -1534,21 +1534,374 @@ BOOST_AUTO_TEST_CASE(orphan_capacity_release_allows_deferred_block_retry)
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashDeferred), 1U);
 }
 
-BOOST_AUTO_TEST_CASE(orphan_limit_cooldown_blocks_new_cross_peer_admission)
+BOOST_AUTO_TEST_CASE(orphan_limit_cooldown_is_peer_local)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
     const uint256 hashRejectedAtLimit(2006);
+    const uint256 hashParent(2006 - 1);
     const CInv inv(MSG_BLOCK, hashRejectedAtLimit);
-    CNode peerB(INVALID_SOCKET, TestPeerAddress(48), "orphan-limit-peer-b", true);
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(48), "orphan-limit-peer-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(49), "orphan-limit-peer-b", true);
 
     RecordOrphanLimitRejectedBlock(
-        inv, GetTimeMicros() + ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US);
+        peerA.GetId(), inv,
+        GetTimeMicros() + ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US,
+        hashParent);
 
-    peerB.AskFor(inv, BLOCKREQ_SOURCE_INV);
-    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerB, hashRejectedAtLimit), 0U);
+    // The peer that saturated its orphan window remains suppressed.
+    peerA.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, hashRejectedAtLimit), 0U);
     NodeId ownerPeer = -1;
     BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_IN_FLIGHT;
     BOOST_CHECK(!GetBlockRequestOwner(hashRejectedAtLimit, &ownerPeer, &ownerState));
+
+    // A different peer is admitted: the cooldown is peer-local, so the hash is
+    // not globally unrequestable and retained pipeline work can exist.
+    peerB.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerB, hashRejectedAtLimit), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(orphan_limit_cooldown_frontier_retry_on_parent_connect)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashParent(2100);
+    const uint256 hashRejectedAtLimit(2101);
+    const CInv inv(MSG_BLOCK, hashRejectedAtLimit);
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(50), "orphan-limit-retry-peer-a", true);
+    CNode peerConnect(INVALID_SOCKET, TestPeerAddress(51), "orphan-limit-retry-peer-c", true);
+
+    // Child rejected at the orphan limit while its parent is missing.
+    RecordOrphanLimitRejectedBlock(
+        peerA.GetId(), inv,
+        GetTimeMicros() + ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US,
+        hashParent);
+
+    // Suppressed on the rejecting peer: no request, no spontaneous retry.
+    peerA.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, hashRejectedAtLimit), 0U);
+
+    // The parent connects: the rejected child is deterministically re-requested
+    // from the connecting peer without waiting out the 120s cooldown and without
+    // relying on a spontaneous re-announcement.
+    RetryOrphanLimitRejectedOnParentConnect(hashParent, &peerConnect);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerConnect, hashRejectedAtLimit), 1U);
+
+    // The cooldown entry is gone after the retry, so the originally rejecting
+    // peer is no longer suppressed either: the block is now useful (its parent
+    // is indexed), so re-requesting it is legitimate.
+    peerA.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, hashRejectedAtLimit), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(orphan_limit_cooldown_no_request_storm)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashParent(2200);
+    const uint256 hashRejectedAtLimit(2201);
+    const CInv inv(MSG_BLOCK, hashRejectedAtLimit);
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(52), "orphan-limit-storm-peer-a", true);
+
+    RecordOrphanLimitRejectedBlock(
+        peerA.GetId(), inv,
+        GetTimeMicros() + ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US,
+        hashParent);
+
+    // Repeated announcements of the same missing-parent block from the
+    // rejecting peer never translate into repeated queued requests during the
+    // cooldown window.
+    for (int i = 0; i < 10; ++i)
+        peerA.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, hashRejectedAtLimit), 0U);
+
+    // The parent-connect retry queues exactly one bounded request...
+    RetryOrphanLimitRejectedOnParentConnect(hashParent, &peerA);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, hashRejectedAtLimit), 1U);
+
+    // ...and a second parent-connect event does not fire a second retry.
+    RetryOrphanLimitRejectedOnParentConnect(hashParent, &peerA);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, hashRejectedAtLimit), 1U);
+}
+
+BOOST_AUTO_TEST_CASE(orphan_limit_cooldown_pipeline_retains_work)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashParent(2300);
+    const uint256 hashRejectedAtLimit(2301);
+    const CInv inv(MSG_BLOCK, hashRejectedAtLimit);
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(53), "orphan-limit-pipe-peer-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(54), "orphan-limit-pipe-peer-b", true);
+
+    const PipelineWakeGauges before = SnapshotWakeGauges();
+
+    RecordOrphanLimitRejectedBlock(
+        peerA.GetId(), inv,
+        GetTimeMicros() + ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US,
+        hashParent);
+
+    // Empty-pipeline condition on the rejecting peer: nothing queued.
+    peerA.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerA, hashRejectedAtLimit), 0U);
+
+    // The eligible alternate peer provides retained pipeline work: the hash is
+    // admitted and globally counted despite the rejecting peer's cooldown, so
+    // an empty-pipeline wake finds new work instead of stalling.
+    peerB.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerB, hashRejectedAtLimit), 1U);
+
+    const PipelineWakeGauges after = SnapshotWakeGauges();
+    BOOST_CHECK_EQUAL(after.total_queued_current,
+                      before.total_queued_current + 1);
+    BOOST_CHECK_EQUAL(after.global_active_current,
+                      before.global_active_current + 1);
+}
+
+BOOST_AUTO_TEST_CASE(frontier_retry_survives_mapalreadyasked_cap)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashParent(2400);
+    const uint256 hashChild(2401);
+    const CInv inv(MSG_BLOCK, hashChild);
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(60), "frontier-cap-peer-a", true);
+    CNode peerConnect(INVALID_SOCKET, TestPeerAddress(61), "frontier-cap-peer-c", true);
+
+    RecordOrphanLimitRejectedBlock(
+        peerA.GetId(), inv,
+        GetTimeMicros() + ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US,
+        hashParent);
+
+    // Saturate the peer-agnostic map so the retry's AskFor hits the hard cap.
+    // MSG_TX entries with a fresh timestamp survive PruneAlreadyAskedFor.
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        const int64_t nNow = GetTimeMicros();
+        for (size_t i = 0; i < MAX_ALREADY_ASKED_FOR_SIZE; ++i)
+            mapAlreadyAskedFor[CInv(MSG_TX, uint256(2402 + i))] = nNow;
+        BOOST_CHECK_EQUAL(mapAlreadyAskedFor.size(),
+                          MAX_ALREADY_ASKED_FOR_SIZE);
+    }
+
+    const int64_t nQueuedBefore =
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_queued);
+    const int64_t nPendingBefore =
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_pending);
+
+    // The cap-full retry cannot queue the child, but must not lose it: the
+    // cooldown entry stays as a bounded retry state.
+    RetryOrphanLimitRejectedOnParentConnect(hashParent, &peerConnect);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerConnect, hashChild), 0U);
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCountForPeer(peerA.GetId()),
+                      1U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_queued) -
+            nQueuedBefore,
+        0);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_pending) -
+            nPendingBefore,
+        1);
+
+    // Once the cap is freed the very next retry deterministically creates a
+    // retained request and releases the cooldown entry.
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        mapAlreadyAskedFor.clear();
+    }
+    RetryOrphanLimitRejectedOnParentConnect(hashParent, &peerConnect);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerConnect, hashChild), 1U);
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCountForPeer(peerA.GetId()),
+                      0U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_queued) -
+            nQueuedBefore,
+        1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_pending) -
+            nPendingBefore,
+        1);
+}
+
+BOOST_AUTO_TEST_CASE(frontier_retry_counter_means_retained)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashParent(2410);
+    const uint256 hashChild1(2411);
+    const uint256 hashChild2(2412);
+    const CInv inv1(MSG_BLOCK, hashChild1);
+    const CInv inv2(MSG_BLOCK, hashChild2);
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(62), "frontier-count-peer-a", true);
+    CNode peerConnect(INVALID_SOCKET, TestPeerAddress(63), "frontier-count-peer-c", true);
+
+    RecordOrphanLimitRejectedBlock(
+        peerA.GetId(), inv1,
+        GetTimeMicros() + ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US,
+        hashParent);
+
+    const int64_t nQueuedBefore =
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_queued);
+    const int64_t nPendingBefore =
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_pending);
+
+    // A plain AskFor admission attempt (suppressed here) never drives the
+    // frontier-retry counters: they count only parent-connect retries.
+    peerA.AskFor(inv1, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_queued) -
+            nQueuedBefore,
+        0);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_pending) -
+            nPendingBefore,
+        0);
+
+    // A retained retry (queued) counts as frontier-retry-queued work.
+    RetryOrphanLimitRejectedOnParentConnect(hashParent, &peerConnect);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerConnect, hashChild1), 1U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_queued) -
+            nQueuedBefore,
+        1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_pending) -
+            nPendingBefore,
+        0);
+
+    // A non-retaining retry (cap full) counts as pending, not queued.
+    RecordOrphanLimitRejectedBlock(
+        peerA.GetId(), inv2,
+        GetTimeMicros() + ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US,
+        hashParent);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        const int64_t nNow = GetTimeMicros();
+        for (size_t i = 0; i < MAX_ALREADY_ASKED_FOR_SIZE; ++i)
+            mapAlreadyAskedFor[CInv(MSG_TX, uint256(2413 + i))] = nNow;
+    }
+    RetryOrphanLimitRejectedOnParentConnect(hashParent, &peerConnect);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerConnect, hashChild2), 0U);
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCountForPeer(peerA.GetId()),
+                      1U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_queued) -
+            nQueuedBefore,
+        1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().orphan_limit_frontier_retry_pending) -
+            nPendingBefore,
+        1);
+}
+
+BOOST_AUTO_TEST_CASE(cooldown_map_per_peer_cap)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(64), "cooldown-per-peer-a", true);
+    const int64_t nBase = GetTimeMicros();
+    for (size_t i = 0;
+         i < MAX_ORPHAN_LIMIT_REJECTED_PER_PEER + 100; ++i)
+    {
+        RecordOrphanLimitRejectedBlock(
+            peerA.GetId(),
+            CInv(MSG_BLOCK, uint256(3000 + i)),
+            nBase + static_cast<int64_t>(i) * 1000,
+            uint256(3999));
+    }
+
+    // The strict per-peer bound holds: a hostile flood from one peer keeps
+    // exactly MAX_ORPHAN_LIMIT_REJECTED_PER_PEER entries.
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCountForPeer(peerA.GetId()),
+                      MAX_ORPHAN_LIMIT_REJECTED_PER_PEER);
+    BOOST_CHECK(GetOrphanLimitRejectedEntryCount() <=
+                MAX_ORPHAN_LIMIT_REJECTED_GLOBAL);
+
+    // Deterministic earliest-expiry eviction: the oldest entry is gone while
+    // the newest (largest expiry) entry survives.
+    BOOST_CHECK(!IsOrphanLimitRejectedBlockInCooldown(
+        peerA.GetId(), CInv(MSG_BLOCK, uint256(3000)), nBase, NULL));
+    const size_t nLastIndex =
+        MAX_ORPHAN_LIMIT_REJECTED_PER_PEER + 100 - 1;
+    BOOST_CHECK(IsOrphanLimitRejectedBlockInCooldown(
+        peerA.GetId(), CInv(MSG_BLOCK, uint256(3000 + nLastIndex)),
+        nBase, NULL));
+}
+
+BOOST_AUTO_TEST_CASE(cooldown_map_global_cap)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    std::vector<CNode*> peers;
+    const int64_t nBase = GetTimeMicros();
+    for (size_t p = 0; p < 70; ++p)
+        peers.push_back(new CNode(INVALID_SOCKET,
+                                  TestPeerAddress(100 + p),
+                                  "cooldown-global-peer", true));
+
+    // 70 peers * 750 entries each far exceeds the process-global bound.
+    for (size_t p = 0; p < peers.size(); ++p)
+    {
+        for (size_t i = 0; i < MAX_ORPHAN_LIMIT_REJECTED_PER_PEER; ++i)
+        {
+            RecordOrphanLimitRejectedBlock(
+                peers[p]->GetId(),
+                CInv(MSG_BLOCK, uint256(4000 + p * 1000 + i)),
+                nBase + static_cast<int64_t>(p * 1000 + i) * 1000,
+                uint256(4999));
+        }
+    }
+
+    // The process-global bound holds even though every peer individually
+    // saturates its per-peer bound.
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCount(),
+                      MAX_ORPHAN_LIMIT_REJECTED_GLOBAL);
+    for (size_t p = 0; p < peers.size(); ++p)
+        BOOST_CHECK(GetOrphanLimitRejectedEntryCountForPeer(peers[p]->GetId()) <=
+                    MAX_ORPHAN_LIMIT_REJECTED_PER_PEER);
+
+    for (size_t p = 0; p < peers.size(); ++p)
+        delete peers[p];
+}
+
+BOOST_AUTO_TEST_CASE(cap_does_not_restore_cross_peer_suppression)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    const uint256 hashParent(2700);
+    const uint256 hashChild(2701);
+    const CInv inv(MSG_BLOCK, hashChild);
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(65), "cap-cross-peer-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(66), "cap-cross-peer-b", true);
+
+    // Saturate peer A's cooldown map: the child is recorded last with the
+    // largest expiry so it survives the per-peer evictions.
+    const int64_t nBase = GetTimeMicros();
+    for (size_t i = 0;
+         i < MAX_ORPHAN_LIMIT_REJECTED_PER_PEER - 1; ++i)
+    {
+        RecordOrphanLimitRejectedBlock(
+            peerA.GetId(),
+            CInv(MSG_BLOCK, uint256(2800 + i)),
+            nBase + static_cast<int64_t>(i) * 1000,
+            uint256(2799));
+    }
+    RecordOrphanLimitRejectedBlock(
+        peerA.GetId(), inv,
+        nBase + static_cast<int64_t>(MAX_ORPHAN_LIMIT_REJECTED_PER_PEER) * 1000,
+        hashParent);
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCountForPeer(peerA.GetId()),
+                      MAX_ORPHAN_LIMIT_REJECTED_PER_PEER);
+
+    // The rejection path writes only the short negative cooldown into the
+    // peer-agnostic map - never the 120s peer-local blocker.
+    RecordRejectedBlockGlobalNegativeCooldown(inv);
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        BOOST_CHECK(mapAlreadyAskedFor[inv] <=
+                    GetTimeMicros() + ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US);
+    }
+
+    // Another peer's cooldown is active for this hash, but peer B is still
+    // admitted: the cap and the peer-local cooldown do not restore the old
+    // cross-peer 120s suppression.
+    BOOST_CHECK(IsOrphanLimitRejectedByOtherPeer(
+        peerB.GetId(), inv, GetTimeMicros()));
+    peerB.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peerB, hashChild), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(preexisting_sent_request_may_complete_after_suppression)

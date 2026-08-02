@@ -533,6 +533,10 @@ Value getinfo(const Array& params, bool fHelp)
         ibd.push_back(Pair("pipeline_wake", pipeline_wake));
 
         ibd.push_back(Pair("askfor_skip_orphan_limit_cooldown", metrics.askfor_skip_orphan_limit_cooldown));
+        ibd.push_back(Pair("orphan_limit_cooldown_recorded", metrics.orphan_limit_cooldown_recorded));
+        ibd.push_back(Pair("orphan_limit_cross_peer_admitted", metrics.orphan_limit_cross_peer_admitted));
+        ibd.push_back(Pair("orphan_limit_frontier_retry_queued", metrics.orphan_limit_frontier_retry_queued));
+        ibd.push_back(Pair("orphan_limit_frontier_retry_pending", metrics.orphan_limit_frontier_retry_pending));
         ibd.push_back(Pair("askfor_skip_mapalreadyasked_cap", metrics.askfor_skip_mapalreadyasked_cap));
         ibd.push_back(Pair("askfor_skip_other_peer_owner", metrics.askfor_skip_other_peer_owner));
         ibd.push_back(Pair("askfor_skip_already_queued", metrics.askfor_skip_already_queued));

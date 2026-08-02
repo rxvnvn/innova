@@ -9,6 +9,7 @@
 #include "version.h"
 #include "state.h"
 #include "main.h"
+#include "ibdactivepath.h"
 #include "ui_interface.h"
 #include "tinyformat.h"
 #include <boost/algorithm/string/join.hpp>
@@ -1446,6 +1447,11 @@ bool RenameOver(boost::filesystem::path src, boost::filesystem::path dest)
 
 void FileCommit(FILE *fileout)
 {
+    ibdactivepath::ActivePathTimer ibdFileCommitTimer(
+        ibdactivepath::GetCounters().filecommit_us_total,
+        ibdactivepath::GetCounters().filecommit_us_max,
+        ibdactivepath::GetCounters().filecommit_count,
+        "filecommit", nBestHeight);
     fflush(fileout);                // harmless if redundantly called
 #ifdef WIN32
     _commit(_fileno(fileout));

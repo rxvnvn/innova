@@ -105,6 +105,10 @@ struct IBDMetricsSnapshot
     int64_t pushgetblocks_dedup_5s_skips;
 
     int64_t askfor_skip_orphan_limit_cooldown;
+    int64_t orphan_limit_cooldown_recorded;
+    int64_t orphan_limit_cross_peer_admitted;
+    int64_t orphan_limit_frontier_retry_queued;
+    int64_t orphan_limit_frontier_retry_pending;
     int64_t askfor_skip_mapalreadyasked_cap;
     int64_t askfor_skip_other_peer_owner;
     int64_t askfor_skip_already_queued;
@@ -350,6 +354,10 @@ struct Counters
     std::atomic<int64_t> pushgetblocks_dedup_5s_skips;
 
     std::atomic<int64_t> askfor_skip_orphan_limit_cooldown;
+    std::atomic<int64_t> orphan_limit_cooldown_recorded;
+    std::atomic<int64_t> orphan_limit_cross_peer_admitted;
+    std::atomic<int64_t> orphan_limit_frontier_retry_queued;
+    std::atomic<int64_t> orphan_limit_frontier_retry_pending;
     std::atomic<int64_t> askfor_skip_mapalreadyasked_cap;
     std::atomic<int64_t> askfor_skip_other_peer_owner;
     std::atomic<int64_t> askfor_skip_already_queued;

@@ -82,6 +82,10 @@ Counters::Counters()
       pipeline_drained_skip_other_condition(0),
       pushgetblocks_dedup_5s_skips(0),
       askfor_skip_orphan_limit_cooldown(0),
+      orphan_limit_cooldown_recorded(0),
+      orphan_limit_cross_peer_admitted(0),
+      orphan_limit_frontier_retry_queued(0),
+      orphan_limit_frontier_retry_pending(0),
       askfor_skip_mapalreadyasked_cap(0),
       askfor_skip_other_peer_owner(0),
       askfor_skip_already_queued(0),
@@ -671,6 +675,14 @@ void SnapshotAll(IBDMetricsSnapshot& out)
 
     out.askfor_skip_orphan_limit_cooldown =
         c.askfor_skip_orphan_limit_cooldown.load(std::memory_order_relaxed);
+    out.orphan_limit_cooldown_recorded =
+        c.orphan_limit_cooldown_recorded.load(std::memory_order_relaxed);
+    out.orphan_limit_cross_peer_admitted =
+        c.orphan_limit_cross_peer_admitted.load(std::memory_order_relaxed);
+    out.orphan_limit_frontier_retry_queued =
+        c.orphan_limit_frontier_retry_queued.load(std::memory_order_relaxed);
+    out.orphan_limit_frontier_retry_pending =
+        c.orphan_limit_frontier_retry_pending.load(std::memory_order_relaxed);
     out.askfor_skip_mapalreadyasked_cap =
         c.askfor_skip_mapalreadyasked_cap.load(std::memory_order_relaxed);
     out.askfor_skip_other_peer_owner =

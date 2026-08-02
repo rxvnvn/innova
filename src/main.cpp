@@ -16,6 +16,7 @@
 #include "ui_interface.h"
 #include "ibdefficiency.h"
 #include "ibdmetrics.h"
+#include "ibdactivepath.h"
 #include "kernel.h"
 #include "collateral.h"
 #include "collateralnode.h"
@@ -3437,21 +3438,29 @@ bool IsSynchronized() {
 
 bool IsInitialBlockDownload()
 {
-    const auto RecordAndReturn = [](bool fInitialBlockDownload) -> bool {
+    int nFreshPeerHeight = -1;
+    int64_t nFreshPeerLastBlockRecv = 0;
+    int64_t nLocalLastBlockRecv = 0;
+    const auto RecordAndReturn = [&](bool fInitialBlockDownload,
+                                     int nIBDReason) -> bool {
         ibdmetrics::RecordIBDState(fInitialBlockDownload);
+        ibdactivepath::RecordIBDStateTrace(
+            fInitialBlockDownload, nIBDReason, nBestHeight,
+            nFreshPeerHeight, GetTime(),
+            nFreshPeerLastBlockRecv, nLocalLastBlockRecv);
         return fInitialBlockDownload;
     };
     if (fRegTest && pindexBest != NULL)
-        return RecordAndReturn(false);
+        return RecordAndReturn(false, ibdactivepath::IBD_REASON_REGTEST);
     if (fImporting || fReindex || pindexBest == NULL)
-        return RecordAndReturn(true);
+        return RecordAndReturn(true,
+                                ibdactivepath::IBD_REASON_IMPORT_REINDEX_NULL);
 
     if (nBestHeight < Checkpoints::GetTotalBlocksEstimate())
-        return RecordAndReturn(true);
+        return RecordAndReturn(true,
+                                ibdactivepath::IBD_REASON_BELOW_ESTIMATE);
 
     int64_t nNow = GetTime();
-    int nFreshPeerHeight = -1;
-    int64_t nFreshPeerLastBlockRecv = 0;
     bool fActiveCatchup = false;
     {
         TRY_LOCK(cs_vNodes, lockNodes);
@@ -3482,19 +3491,19 @@ bool IsInitialBlockDownload()
     unsigned int nTargetSpacing = GetTargetSpacingForHeight(nBestHeight + 1);
     int nLagTolerance = (nTargetSpacing <= 1) ? (int)GetArg("-ibdheightlag", 8) : nCoinbaseMaturity * 2;
     if (nFreshPeerHeight > nBestHeight + nLagTolerance)
-        return RecordAndReturn(true);
+        return RecordAndReturn(true, ibdactivepath::IBD_REASON_PEER_AHEAD_LAG);
 
     if (fActiveCatchup)
-        return RecordAndReturn(true);
+        return RecordAndReturn(true, ibdactivepath::IBD_REASON_ACTIVE_CATCHUP);
 
-    int64_t nLocalLastBlockRecv = nTimeBestReceived > 0 ? nTimeBestReceived : pindexBest->GetBlockTime();
+    nLocalLastBlockRecv = nTimeBestReceived > 0 ? nTimeBestReceived : pindexBest->GetBlockTime();
     int64_t nStaleSeconds = (nTargetSpacing <= 1) ? GetArg("-ibdstaleseconds", 30) : 300;
     if (nFreshPeerHeight > nBestHeight &&
         nFreshPeerLastBlockRecv > nLocalLastBlockRecv + 2 &&
         nNow - nLocalLastBlockRecv > nStaleSeconds)
-        return RecordAndReturn(true);
+        return RecordAndReturn(true, ibdactivepath::IBD_REASON_STALE_RECV);
 
-    return RecordAndReturn(false);
+    return RecordAndReturn(false, ibdactivepath::IBD_REASON_NOT_IBD);
 
 }
 
@@ -4539,6 +4548,11 @@ bool SeedGenesisCommitments(CTxDB& txdb, CIncrementalMerkleTree& shieldedTree, C
 
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, bool fWriteNames)
 {
+    ibdactivepath::ActivePathTimer ibdConnectTimer(
+        ibdactivepath::GetCounters().connectblock_us_total,
+        ibdactivepath::GetCounters().connectblock_us_max,
+        ibdactivepath::GetCounters().connectblock_count,
+        "connectblock", pindex->nHeight);
     int64_t nConnectBlockStart = GetTimeMillis();
     int64_t nConnectCheckStart = GetTimeMillis();
 
@@ -6105,8 +6119,15 @@ bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
         InvalidChainFound(pindexNew);
         return false;
     }
-    if (!txdb.TxnCommit())
-        return error("SetBestChain() : TxnCommit failed");
+    {
+        ibdactivepath::ActivePathTimer ibdChainStateCommitTimer(
+            ibdactivepath::GetCounters().chainstate_commit_us_total,
+            ibdactivepath::GetCounters().chainstate_commit_us_max,
+            ibdactivepath::GetCounters().chainstate_commit_count,
+            "chainstate_commit", pindexNew->nHeight);
+        if (!txdb.TxnCommit())
+            return error("SetBestChain() : TxnCommit failed");
+    }
 
     if (pindexNew->pprev)
         pindexNew->pprev->pnext = pindexNew;
@@ -6128,6 +6149,11 @@ bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
 
 bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
 {
+    ibdactivepath::ActivePathTimer ibdSetBestChainTimer(
+        ibdactivepath::GetCounters().setbestchain_us_total,
+        ibdactivepath::GetCounters().setbestchain_us_max,
+        ibdactivepath::GetCounters().setbestchain_count,
+        "setbestchain", pindexNew->nHeight);
     uint256 hash = GetHash();
     const uint256 hashOldBest = hashBestChain;
     const int nOldBestHeight = nBestHeight;
@@ -6228,6 +6254,11 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     if (!fIsInitialDownload)
     {
         const CBlockLocator locator(pindexNew);
+        ibdactivepath::ActivePathTimer ibdWalletCallbackTimer(
+            ibdactivepath::GetCounters().wallet_callback_us_total,
+            ibdactivepath::GetCounters().wallet_callback_us_max,
+            ibdactivepath::GetCounters().wallet_callback_count,
+            "wallet_callback", pindexNew->nHeight);
         ::SetBestChain(locator);
     }
 
@@ -6363,6 +6394,11 @@ bool CBlock::GetCoinAge(uint64_t& nCoinAge) const
 
 bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const uint256& hashProof)
 {
+    ibdactivepath::ActivePathTimer ibdAddToBlockIndexTimer(
+        ibdactivepath::GetCounters().addtoblockindex_us_total,
+        ibdactivepath::GetCounters().addtoblockindex_us_max,
+        ibdactivepath::GetCounters().addtoblockindex_count,
+        "addtoblockindex", nBestHeight + 1);
     int64_t nAddStart = GetTimeMillis();
     int64_t nDAGInitMs = 0;
     int64_t nDAGColorMs = 0;
@@ -6421,8 +6457,15 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     if (!txdb.TxnBegin())
         return false;
     txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
-    if (!txdb.TxnCommit())
-        return false;
+    {
+        ibdactivepath::ActivePathTimer ibdBlockIndexCommitTimer(
+            ibdactivepath::GetCounters().blockindex_commit_us_total,
+            ibdactivepath::GetCounters().blockindex_commit_us_max,
+            ibdactivepath::GetCounters().blockindex_commit_count,
+            "blockindex_commit", pindexNew->nHeight);
+        if (!txdb.TxnCommit())
+            return false;
+    }
 
     bool fDAGDataInitialized = false;
     std::vector<uint256> vDAGParents;
@@ -6461,7 +6504,14 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 // Also update parent entries (new child link)
                 for (const uint256& hashParent : vDAGParents)
                     g_dagManager.WriteDAGLinks(txdbDAG, hashParent);
-                txdbDAG.TxnCommit();
+                {
+                    ibdactivepath::ActivePathTimer ibdDAGCommitTimer(
+                        ibdactivepath::GetCounters().dag_epoch_commit_us_total,
+                        ibdactivepath::GetCounters().dag_epoch_commit_us_max,
+                        ibdactivepath::GetCounters().dag_epoch_commit_count,
+                        "dag_commit", pindexNew->nHeight);
+                    txdbDAG.TxnCommit();
+                }
             }
             nDAGWriteMs = GetTimeMillis() - nDAGTimer;
 
@@ -6492,7 +6542,14 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                     if (txdbEpoch.TxnBegin())
                     {
                         g_dagManager.WriteEpochState(txdbEpoch, nCompletedEpoch);
-                        txdbEpoch.TxnCommit();
+                        {
+                            ibdactivepath::ActivePathTimer ibdEpochCommitTimer(
+                                ibdactivepath::GetCounters().dag_epoch_commit_us_total,
+                                ibdactivepath::GetCounters().dag_epoch_commit_us_max,
+                                ibdactivepath::GetCounters().dag_epoch_commit_count,
+                                "epoch_commit", pindexNew->nHeight);
+                            txdbEpoch.TxnCommit();
+                        }
                     }
 
                     // Prune old DAG data periodically
@@ -6676,6 +6733,11 @@ bool CBlock::CheckBlock(bool fCheckPOW, bool fCheckMerkleRoot, bool fCheckSig, c
 bool CBlock::AcceptBlock()
 {
     AssertLockHeld(cs_main);
+    ibdactivepath::ActivePathTimer ibdAcceptBlockTimer(
+        ibdactivepath::GetCounters().acceptblock_us_total,
+        ibdactivepath::GetCounters().acceptblock_us_max,
+        ibdactivepath::GetCounters().acceptblock_count,
+        "acceptblock", nBestHeight + 1);
     int64_t nAcceptStart = GetTimeMillis();
 
     if (nVersion > CURRENT_VERSION)
@@ -6861,6 +6923,11 @@ bool CBlock::AcceptBlock()
     unsigned int nFile = -1;
     unsigned int nBlockPos = 0;
     int64_t nWriteDiskStart = GetTimeMillis();
+    ibdactivepath::ActivePathTimer ibdRawBlockWriteTimer(
+        ibdactivepath::GetCounters().raw_block_write_us_total,
+        ibdactivepath::GetCounters().raw_block_write_us_max,
+        ibdactivepath::GetCounters().raw_block_write_count,
+        "raw_block_write", nBestHeight + 1);
     if (!WriteToDisk(nFile, nBlockPos))
         return error("AcceptBlock() : WriteToDisk failed");
     int64_t nWriteDiskMs = GetTimeMillis() - nWriteDiskStart;
@@ -6926,6 +6993,11 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 {
     AssertLockHeld(cs_main);
 
+    ibdactivepath::ActivePathTimer ibdProcessBlockTimer(
+        ibdactivepath::GetCounters().processblock_us_total,
+        ibdactivepath::GetCounters().processblock_us_max,
+        ibdactivepath::GetCounters().processblock_count,
+        "processblock", nBestHeight);
     g_nBlockTraceSourcePeer = pfrom ? pfrom->GetId() : -1;
     int64_t nStartTime = GetTimeMillis();
     // Check for duplicate
@@ -7133,7 +7205,10 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             CBlock* pblockOrphan = (*mi).second;
             uint256 orphanHash = pblockOrphan->GetHash();
             if (pblockOrphan->AcceptBlock())
+            {
                 vWorkQueue.push_back(orphanHash);
+                RetryOrphanLimitRejectedOnParentConnect(orphanHash, pfrom);
+            }
             mapOrphanBlocks.erase(orphanHash);
             setStakeSeenOrphan.erase(pblockOrphan->GetProofOfStake());
 
@@ -8516,6 +8591,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 nGetBlocksResponseBlockInv, std::memory_order_relaxed);
             ibdmetrics::Get().getblocks_response_unknown_count.fetch_add(
                 nGetBlocksResponseUnknown, std::memory_order_relaxed);
+            ibdactivepath::RecordGetBlocksResponse(
+                nGetBlocksResponseBlockInv, nGetBlocksResponseUnknown);
+            if (nGetBlocksResponseUnknown > 0)
+                ibdactivepath::RecordUsefulResponseEnd();
             if (nGetBlocksResponseUnknown == 0)
             {
                 ibdmetrics::Get().getblocks_response_zero_unknown.fetch_add(
@@ -9229,7 +9308,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         CSyncLockDiagnostics blockLockDiagnostics(
             "ProcessMessage(block)", "cs_main");
+        int64_t nIBDCsMainWaitStart =
+            ibdactivepath::IBDActivePathTraceEnabled()
+                ? ibdactivepath::MonotonicMicros() : 0;
         LOCK(cs_main);
+        if (nIBDCsMainWaitStart)
+            ibdactivepath::RecordCSMainWait(
+                ibdactivepath::MonotonicMicros() - nIBDCsMainWaitStart);
         blockLockDiagnostics.Acquired();
         bool fKnownBefore = mapBlockIndex.count(hashBlock) != 0;
         bool fOrphanBefore = mapOrphanBlocks.count(hashBlock) != 0;
@@ -9288,6 +9373,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (fAccepted)
         {
             ClearRejectedBlockForSync(hashBlock);
+            RetryOrphanLimitRejectedOnParentConnect(hashBlock, pfrom);
             pfrom->nLastBlockRecv = GetTime();
             std::map<uint256, CBlockIndex*>::iterator miAccepted =
                 mapBlockIndex.find(hashBlock);
@@ -9326,11 +9412,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     ? ORPHAN_LIMIT_REJECT_RETRY_COOLDOWN_US
                     : ALREADY_ASKED_FOR_NEGATIVE_COOLDOWN_US);
             if (fOrphanLimitRetrySuppressed)
-                RecordOrphanLimitRejectedBlock(inv, nRejectedUntil);
-            LOCK(cs_mapAlreadyAskedFor);
-            int64_t& nRejectedAskTime = mapAlreadyAskedFor[inv];
-            nRejectedAskTime = std::max<int64_t>(
-                nRejectedAskTime, nRejectedUntil);
+                RecordOrphanLimitRejectedBlock(
+                    pfrom->GetId(), inv, nRejectedUntil, block.hashPrevBlock);
+            // The 120s orphan-limit protection is peer-local only (see
+            // RecordOrphanLimitRejectedBlock).  The peer-agnostic map carries
+            // only the ordinary short negative cooldown so a different peer is
+            // never delayed by the saturating peer's cooldown.
+            RecordRejectedBlockGlobalNegativeCooldown(inv);
         }
 
         if (block.nDoS)
@@ -9959,6 +10047,18 @@ bool ProcessMessages(CNode* pfrom)
         bool fRet = false;
         try
         {
+            if (ibdactivepath::IBDActivePathTraceEnabled() &&
+                strCommand == "block")
+            {
+                int64_t nCompleteWaiting = 0;
+                for (std::deque<CNetMessage>::const_iterator itWait = it;
+                     itWait != pfrom->vRecvMsg.end(); ++itWait)
+                    if (itWait->complete())
+                        ++nCompleteWaiting;
+                ibdactivepath::RecordBlockDispatchDelay(
+                    std::max<int64_t>(0, GetTimeMicros() - msg.nTime),
+                    nCompleteWaiting);
+            }
             fRet = ProcessMessage(pfrom, strCommand, vRecv, msg.nTime);
             boost::this_thread::interruption_point();
         }
@@ -10079,6 +10179,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                               pto->getBlocksHash[i], n);
             pto->PushMessage("getblocks", CBlockLocator(pto->getBlocksIndex[i]), pto->getBlocksHash[i]);
             ibdmetrics::RecordGetBlocksWireSent(getBlocksSource);
+            ibdactivepath::RecordGetBlocksWireSent();
             pto->getBlocksOutstandingSources.push_back(getBlocksSource);
             ibdmetrics::GetBlocksOutstandingAdd(1);
             // Arm the frontier response expectation when the flushed request
@@ -10337,6 +10438,12 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         int64_t nNow = GetTime() * 1000000;
         static const size_t MAX_BLOCKS_IN_FLIGHT_PER_PEER = 128;
         pto->ExpireBlockInFlight();
+        const bool fIBDPassHadDue =
+            !pto->mapAskFor.empty() &&
+            (*pto->mapAskFor.begin()).first <= nNow;
+        const bool fIBDPassHadFreeCapacity =
+            pto->setBlocksInFlight.size() < MAX_BLOCKS_IN_FLIGHT_PER_PEER;
+        int64_t nIBDPassSent = 0;
         while (!pto->mapAskFor.empty() && (*pto->mapAskFor.begin()).first <= nNow)
         {
             CInv inv = (*pto->mapAskFor.begin()).second;
@@ -10446,6 +10553,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 vGetData.push_back(inv);
                 if (fBlockRequest)
                 {
+                    ibdactivepath::RecordAskForToGetData(
+                        std::max<int64_t>(0, nNow - (*pto->mapAskFor.begin()).first));
+                    ++nIBDPassSent;
                     pto->MarkBlockInFlight(inv.hash);
                     if (fTraceBlockRequest)
                         BlockRequestTraceInFlightMark(pto, inv.hash, true);
@@ -10502,6 +10612,18 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     pto->mapAskFor.begin(), false,
                     ibdmetrics::ACTIVE_DECREMENT_ASKFOR_SENT_TRANSITION);
             }
+        }
+        {
+            int nStopReason = ibdactivepath::GETDATA_STOP_OTHER;
+            if (pto->mapAskFor.empty())
+                nStopReason = ibdactivepath::GETDATA_STOP_EMPTY;
+            else if ((*pto->mapAskFor.begin()).first > nNow)
+                nStopReason = ibdactivepath::GETDATA_STOP_NO_DUE;
+            else
+                nStopReason = ibdactivepath::GETDATA_STOP_INFLIGHT_CAP;
+            ibdactivepath::RecordGetDataPass(
+                nIBDPassSent, fIBDPassHadDue, fIBDPassHadFreeCapacity,
+                nStopReason);
         }
         if (!vGetData.empty())
         {

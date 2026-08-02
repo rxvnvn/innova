@@ -17,6 +17,7 @@
 #include "ui_interface.h"
 #include "checkpoints.h"
 #include "ibdefficiency.h"
+#include "ibdactivepath.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -585,6 +586,8 @@ std::string HelpMessage()
         "  -blockrequesttracehash=<hash> " + _("Limit block request tracing to one block hash (requires -blockrequesttrace)") + "\n" +
         "  -continuitybreakms=<n> " + _("Min no-connect gap (ms) before the one-shot FIRST_CONTINUITY_BREAK event fires (requires -blockrequesttrace, default: 60000)") + "\n" +
         "  -ibdefficiencytrace=<0|1> " + _("Trace IBD block efficiency counters (default: 0)") + "\n" +
+        "  -ibdactivepathtrace=<0|1> " + _("Trace IBD active-path throughput (IBD_ACTIVE_1S, IBD_SLOW_BLOCK, IBD_STATE_TRACE; default: 0)") + "\n" +
+        "  -ibdactiveslowthresholdms=<n> " + _("Slow-phase threshold for IBD_SLOW_BLOCK events in milliseconds (default: 50)") + "\n" +
         "  -getinfosyncprobe=<n> " + _("Log cached P2P state before, during, and after getinfo (default: 0)") + "\n" +
         "  -rpcperftrace=<n>     " + _("Trace getinfo/getmininginfo RPC performance (default: 0)") + "\n" +
         "  -synclockdiagnostics=<n> " + _("Log long sync-related lock waits and holds (default: 0)") + "\n" +
@@ -963,6 +966,8 @@ bool AppInit2()
     }
     InitIBDEfficiencyTrace(GetBoolArg("-ibdefficiencytrace", false));
     InitProcessBlockRejectTrace(GetBoolArg("-processblockrejecttrace", false));
+    ibdactivepath::InitIBDActivePathTrace(
+        GetBoolArg("-ibdactivepathtrace", false));
 
     if (mapArgs.count("-timeout"))
     {

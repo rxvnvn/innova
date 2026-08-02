@@ -330,6 +330,7 @@ OBJS= \
     obj/net.o \
     obj/ibdefficiency.o \
     obj/ibdmetrics.o \
+    obj/ibdactivepath.o \
     obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \
@@ -407,6 +408,7 @@ OBJS= \
     obj/net.o \
     obj/ibdefficiency.o \
     obj/ibdmetrics.o \
+    obj/ibdactivepath.o \
     obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \
