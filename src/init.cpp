@@ -18,6 +18,7 @@
 #include "checkpoints.h"
 #include "ibdefficiency.h"
 #include "ibdactivepath.h"
+#include "ibdforensic.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -151,6 +152,7 @@ void Shutdown(void* parg)
 
         FlushIBDBatch();
         IBDEfficiencyShutdownSummary();
+        ibdforensic::Dump();
 
         if(idns) {
             delete idns;
@@ -587,6 +589,8 @@ std::string HelpMessage()
         "  -continuitybreakms=<n> " + _("Min no-connect gap (ms) before the one-shot FIRST_CONTINUITY_BREAK event fires (requires -blockrequesttrace, default: 60000)") + "\n" +
         "  -ibdefficiencytrace=<0|1> " + _("Trace IBD block efficiency counters (default: 0)") + "\n" +
         "  -ibdactivepathtrace=<0|1> " + _("Trace IBD active-path throughput (IBD_ACTIVE_1S, IBD_SLOW_BLOCK, IBD_STATE_TRACE; default: 0)") + "\n" +
+        "  -ibdforensic=<0|1> " + _("Record per-getdata-batch block-request instrumentation (batch id, seq, mark/receive/timeout times, hashContinue, re-requests; default: 0)") + "\n" +
+        "  -ibdforensicpath=<file> " + _("Write the ibdforensic per-hash CSV dump and summary to this file at shutdown (default: empty = summary only)") + "\n" +
         "  -ibdactiveslowthresholdms=<n> " + _("Slow-phase threshold for IBD_SLOW_BLOCK events in milliseconds (default: 50)") + "\n" +
         "  -ibdmaxactiveperpeer=<n> " + _("Experimental IBD per-peer active request window; clamped to [1,512], zero/negative/non-numeric falls back to default (default: 128)") + "\n" +
         "  -getinfosyncprobe=<n> " + _("Log cached P2P state before, during, and after getinfo (default: 0)") + "\n" +
@@ -969,6 +973,9 @@ bool AppInit2()
     InitProcessBlockRejectTrace(GetBoolArg("-processblockrejecttrace", false));
     ibdactivepath::InitIBDActivePathTrace(
         GetBoolArg("-ibdactivepathtrace", false));
+    ibdforensic::SetEnabled(
+        GetBoolArg("-ibdforensic", false),
+        GetArg("-ibdforensicpath", ""));
 
     if (mapArgs.count("-timeout"))
     {

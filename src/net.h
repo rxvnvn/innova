@@ -23,6 +23,7 @@
 #include "blockrequesttrace.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "ibdforensic.h"
 
 class CRequestTracker;
 class CNode;
@@ -1737,6 +1738,8 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                 ibdmetrics::GlobalActiveAdd(
                     -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
                 RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
+                ibdforensic::RecordExpired(
+                    GetId(), hashExpired, GetTimeMicros());
                 it = mapBlockInFlightSince.erase(it);
                 ReleaseBlockRequestOwner(hashExpired, GetId(), "timeout");
                 EraseAlreadyAskedForIfUnowned(

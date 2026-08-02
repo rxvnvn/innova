@@ -8,6 +8,7 @@
 #include "main.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "ibdforensic.h"
 #include "init.h"
 #include "strlcpy.h"
 #include "addrman.h"
@@ -2857,6 +2858,7 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
         if (nLastWakeGetBlocks != 0 &&
             nNow - nLastWakeGetBlocks < PIPELINE_WAKE_GETBLOCKS_COOLDOWN)
         {
+            ibdforensic::CountGetBlocksRateLimitOutboundWakeCooldown();
             outcome = PIPELINE_WAKE_TRANSIENT_COOLDOWN_ACTIVE;
         }
         else if (snapshot.vCandidates.empty())
@@ -4641,6 +4643,7 @@ void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
                 1, std::memory_order_relaxed);
             ibdmetrics::Get().getblocks_dedup_skips.fetch_add(
                 1, std::memory_order_relaxed);
+            ibdforensic::CountGetBlocksRateLimitOutboundDedup();
             return;
         }
     }
@@ -5292,6 +5295,7 @@ void CNode::ClearGetBlocksOutstandingForCleanup()
     const size_t nOutstanding = getBlocksOutstandingSources.size();
     getBlocksOutstandingSources.clear();
     ibdmetrics::GetBlocksOutstandingAdd(-(int64_t)nOutstanding);
+    ibdforensic::CountGetBlocksOutstandingNoResponse(nOutstanding);
     ibdmetrics::Get().getblocks_no_response_disconnect_cleanup.fetch_add(
         nOutstanding, std::memory_order_relaxed);
     RequestBlockPipelineWake(

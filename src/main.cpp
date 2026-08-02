@@ -17,6 +17,7 @@
 #include "ibdefficiency.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "ibdforensic.h"
 #include "kernel.h"
 #include "collateral.h"
 #include "collateralnode.h"
@@ -751,6 +752,23 @@ CHooks* hooks; // This adds Innova Name DB hooks which allow splicing of code in
 // These functions dispatch to one or all registered wallets
 
 namespace {
+
+// The block-request hashes of a pending getdata message, in wire order.
+// Used only to feed the passive ibdforensic recorder; the non-block invs
+// (e.g. transactions) that share the getdata message are filtered out here.
+std::vector<uint256> BlockHashesOfGetData(
+    const std::vector<CInv>& vGetData)
+{
+    std::vector<uint256> vHashes;
+    for (size_t i = 0; i < vGetData.size(); ++i)
+    {
+        if (vGetData[i].type == MSG_BLOCK ||
+            vGetData[i].type == MSG_FILTERED_BLOCK)
+            vHashes.push_back(vGetData[i].hash);
+    }
+    return vHashes;
+}
+
 struct CMainSignals {
     // Notifies listeners of updated transaction data (passing hash, transaction, and optionally the block it is found in.
     boost::signals2::signal<void (const CTransaction &, const CBlock *, bool)> SyncTransaction;
@@ -8730,6 +8748,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         if (decision.action != GETBLOCKS_SERVER_ALLOW)
         {
+            if (decision.action == GETBLOCKS_SERVER_RATE_LIMIT)
+                ibdforensic::CountGetBlocksRateLimitInbound();
             if (decision.action == GETBLOCKS_SERVER_SUPPRESS &&
                 fLogAbuse)
             {
@@ -9187,6 +9207,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             }
             if (!vGetData.empty())
             {
+                ibdforensic::RecordGetDataBatch(
+                    pfrom->GetId(), BlockHashesOfGetData(vGetData),
+                    GetTimeMicros(), pfrom->nSendSize,
+                    pfrom->hashLastBlockInBatch, pfrom->nExpectedBatchSize);
                 pfrom->nLastGetDataTime = GetTime();
                 pfrom->PushMessage("getdata", vGetData);
             }
@@ -9304,6 +9328,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     std::max<int64_t>(0, GetTime() - miInFlight->second);
         }
         pfrom->ClearBlockInFlight(hashBlock);
+        ibdforensic::RecordReceived(pfrom->GetId(), hashBlock, GetTimeMicros());
         ReleaseBlockRequestOwnerOnReceive(hashBlock, pfrom->GetId());
 
         CSyncLockDiagnostics blockLockDiagnostics(
@@ -10564,6 +10589,10 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 }
                 if (vGetData.size() >= 1000)
                 {
+                    ibdforensic::RecordGetDataBatch(
+                        pto->GetId(), BlockHashesOfGetData(vGetData),
+                        GetTimeMicros(), pto->nSendSize,
+                        pto->hashLastBlockInBatch, pto->nExpectedBatchSize);
                     pto->nLastGetDataTime = GetTime();
                     pto->PushMessage("getdata", vGetData);
                     vGetData.clear();
@@ -10629,6 +10658,10 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         }
         if (!vGetData.empty())
         {
+            ibdforensic::RecordGetDataBatch(
+                pto->GetId(), BlockHashesOfGetData(vGetData),
+                GetTimeMicros(), pto->nSendSize,
+                pto->hashLastBlockInBatch, pto->nExpectedBatchSize);
             pto->nLastGetDataTime = GetTime();
             pto->PushMessage("getdata", vGetData);
         }
