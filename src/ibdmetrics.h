@@ -238,6 +238,14 @@ struct IBDMetricsSnapshot
     int64_t pipeline_wake_active_restored;
     int64_t pipeline_wake_signal_to_active_ms_total;
     int64_t pipeline_wake_signal_to_active_ms_max;
+
+    // Experiment A (future-supply diversification) counters.
+    int64_t diversify_candidates;
+    int64_t diversify_picked_other_lane;
+    int64_t diversify_picked_announcer;
+    int64_t diversify_snapshot_skip_lock;
+    int64_t diversify_no_other_lane;
+    int64_t diversify_other_lane_timeout;
 };
 
 namespace ibdmetrics {
@@ -489,6 +497,14 @@ struct Counters
     std::atomic<int64_t> pipeline_wake_signal_start_ms;
     std::atomic<int64_t> pipeline_wake_signal_to_active_ms_total;
     std::atomic<int64_t> pipeline_wake_signal_to_active_ms_max;
+
+    // Experiment A (future-supply diversification) counters.
+    std::atomic<int64_t> diversify_candidates;
+    std::atomic<int64_t> diversify_picked_other_lane;
+    std::atomic<int64_t> diversify_picked_announcer;
+    std::atomic<int64_t> diversify_snapshot_skip_lock;
+    std::atomic<int64_t> diversify_no_other_lane;
+    std::atomic<int64_t> diversify_other_lane_timeout;
 
     Counters();
 };

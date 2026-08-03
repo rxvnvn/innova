@@ -532,6 +532,13 @@ Value getinfo(const Array& params, bool fHelp)
         pipeline_wake.push_back(Pair("signal_to_active_ms_max", metrics.pipeline_wake_signal_to_active_ms_max));
         ibd.push_back(Pair("pipeline_wake", pipeline_wake));
 
+        ibd.push_back(Pair("diversify_candidates", metrics.diversify_candidates));
+        ibd.push_back(Pair("diversify_picked_other_lane", metrics.diversify_picked_other_lane));
+        ibd.push_back(Pair("diversify_picked_announcer", metrics.diversify_picked_announcer));
+        ibd.push_back(Pair("diversify_snapshot_skip_lock", metrics.diversify_snapshot_skip_lock));
+        ibd.push_back(Pair("diversify_no_other_lane", metrics.diversify_no_other_lane));
+        ibd.push_back(Pair("diversify_other_lane_timeout", metrics.diversify_other_lane_timeout));
+
         ibd.push_back(Pair("askfor_skip_orphan_limit_cooldown", metrics.askfor_skip_orphan_limit_cooldown));
         ibd.push_back(Pair("orphan_limit_cooldown_recorded", metrics.orphan_limit_cooldown_recorded));
         ibd.push_back(Pair("orphan_limit_cross_peer_admitted", metrics.orphan_limit_cross_peer_admitted));

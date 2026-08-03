@@ -20,6 +20,7 @@
 #include <sys/stat.h>
 #include <algorithm>
 #include <cctype>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <cstdio>
@@ -1035,6 +1036,212 @@ int GetMaxActiveBlockRequestsPerPeer()
 void ResetMaxActiveBlockRequestsPerPeerConfigForTesting()
 {
     g_nIBDMaxActivePerPeerLoaded = false;
+}
+
+namespace {
+
+// Cached -ibddivfuture / -ibddivfrac values.  Loaded lazily on first use so
+// that the arguments are read exactly once; unit tests reload them through
+// ResetFutureSupplyDiversificationConfigForTesting().
+bool g_fIBDDiversifyFutureConfigured = false;
+bool g_fIBDDiversifyFutureLoaded = false;
+int g_nIBDDiversifyFractionPermilleConfigured = 150;
+bool g_nIBDDiversifyFractionPermilleLoaded = false;
+
+bool LoadFutureSupplyDiversificationEnabled()
+{
+    return GetBoolArg("-ibddivfuture", false);
+}
+
+int LoadFutureSupplyDiversificationFractionPermille()
+{
+    // No ParseDouble helper exists in util.h; parse manually.  Non-numeric,
+    // trailing-garbage, and out-of-range values fall back to the 0.15 default.
+    int nPermille = 150;
+    if (mapArgs.count("-ibddivfrac"))
+    {
+        const std::string& s = mapArgs["-ibddivfrac"];
+        char* pEnd = NULL;
+        const double d = strtod(s.c_str(), &pEnd);
+        if (pEnd != s.c_str() && *pEnd == '\0' && d >= 0.0 && d <= 1.0)
+            nPermille = (int)(d * 1000.0 + 0.5);
+    }
+    return nPermille;
+}
+
+// Diversification attribution ledger: hash -> announcing peer of a dispatch
+// that left the announcer lane.  Guarded by cs_mapAlreadyAskedFor (the same
+// lock taken by AskFor).  Entries are created at diversified dispatch and
+// consumed on receive (ClearBlockInFlight), timeout (ExpireBlockInFlight),
+// or pre-dispatch removal (EraseAskForEntry / ClearAskFor / Cleanup), so the
+// ledger only ever holds a small number of in-flight diversified hashes.
+std::map<uint256, NodeId> mapDiversifyAnnounce;
+
+} // namespace
+
+bool IsFutureSupplyDiversificationEnabled()
+{
+    if (!g_fIBDDiversifyFutureLoaded)
+    {
+        g_fIBDDiversifyFutureConfigured = LoadFutureSupplyDiversificationEnabled();
+        g_fIBDDiversifyFutureLoaded = true;
+    }
+    return g_fIBDDiversifyFutureConfigured;
+}
+
+int GetFutureSupplyDiversificationFractionPermille()
+{
+    if (!g_nIBDDiversifyFractionPermilleLoaded)
+    {
+        g_nIBDDiversifyFractionPermilleConfigured =
+            LoadFutureSupplyDiversificationFractionPermille();
+        g_nIBDDiversifyFractionPermilleLoaded = true;
+    }
+    return g_nIBDDiversifyFractionPermilleConfigured;
+}
+
+void ResetFutureSupplyDiversificationConfigForTesting()
+{
+    g_fIBDDiversifyFutureLoaded = false;
+    g_nIBDDiversifyFractionPermilleLoaded = false;
+}
+
+void RecordDiversifyDispatch(const uint256& hash, NodeId announcePeer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    mapDiversifyAnnounce[hash] = announcePeer;
+}
+
+bool GetDiversifyAnnounce(const uint256& hash, NodeId* pAnnouncePeer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, NodeId>::const_iterator it =
+        mapDiversifyAnnounce.find(hash);
+    if (it == mapDiversifyAnnounce.end())
+        return false;
+    if (pAnnouncePeer)
+        *pAnnouncePeer = it->second;
+    return true;
+}
+
+bool TakeDiversifyAnnounce(const uint256& hash, NodeId* pAnnouncePeer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, NodeId>::iterator it =
+        mapDiversifyAnnounce.find(hash);
+    if (it == mapDiversifyAnnounce.end())
+        return false;
+    if (pAnnouncePeer)
+        *pAnnouncePeer = it->second;
+    mapDiversifyAnnounce.erase(it);
+    return true;
+}
+
+void ClearDiversifyDispatch(const uint256& hash)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    mapDiversifyAnnounce.erase(hash);
+}
+
+void ClearDiversifyDispatchForPeer(NodeId peer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    for (std::map<uint256, NodeId>::iterator it = mapDiversifyAnnounce.begin();
+         it != mapDiversifyAnnounce.end(); )
+    {
+        if (it->second == peer)
+            mapDiversifyAnnounce.erase(it++);
+        else
+            ++it;
+    }
+}
+
+void ResetDiversifyDispatchLedgerForTesting()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    mapDiversifyAnnounce.clear();
+}
+
+std::vector<FutureSupplyLane> CollectEligibleFutureSupplyLanes(
+    const std::vector<CNode*>& vNodesCopy, int nBestHeight)
+{
+    std::vector<FutureSupplyLane> lanes;
+    if (vNodesCopy.empty())
+        return lanes;
+    const int32_t nWindow =
+        (int32_t)GetMaxActiveBlockRequestsPerPeer();
+    BOOST_FOREACH(CNode* pnode, vNodesCopy)
+    {
+        if (pnode == NULL || pnode->fDisconnect ||
+            !pnode->fSuccessfullyConnected ||
+            !IsBlockSyncPeerVersion(pnode->nVersion) ||
+            pnode->fClient || pnode->fOneShot ||
+            !pnode->CanAdvanceBlockSync(nBestHeight))
+            continue;
+        const int32_t nPressure =
+            pnode->peerLiveActivePressure.load(std::memory_order_relaxed);
+        if (nPressure >= nWindow)
+            continue;
+        lanes.push_back(FutureSupplyLane(pnode, nPressure));
+    }
+    return lanes;
+}
+
+CNode* ChooseDeferredDispatchLane(CNode* pfrom, const uint256& hash,
+                                  const std::vector<CNode*>& vNodesCopy)
+{
+    if (pfrom == NULL)
+        return NULL;
+    if (!IsFutureSupplyDiversificationEnabled())
+        return pfrom;
+    if (vNodesCopy.empty())
+    {
+        ibdmetrics::Get().diversify_snapshot_skip_lock.fetch_add(
+            1, std::memory_order_relaxed);
+        return pfrom;
+    }
+
+    const int32_t nWindow =
+        (int32_t)GetMaxActiveBlockRequestsPerPeer();
+    const int32_t nFromPressure =
+        pfrom->peerLiveActivePressure.load(std::memory_order_relaxed);
+    const bool fFromSaturated = nFromPressure >= nWindow;
+
+    std::vector<FutureSupplyLane> lanes =
+        CollectEligibleFutureSupplyLanes(vNodesCopy, nBestHeight);
+
+    // Choose the lowest-pressure eligible lane, tie-break by the round-robin
+    // seq tick (lower seq first).
+    FutureSupplyLane* pBest = NULL;
+    for (size_t i = 0; i < lanes.size(); ++i)
+    {
+        if (lanes[i].node == pfrom)
+            continue;
+        if (pBest == NULL ||
+            lanes[i].peerLiveActivePressure < pBest->peerLiveActivePressure ||
+            (lanes[i].peerLiveActivePressure == pBest->peerLiveActivePressure &&
+             lanes[i].node->peerDiversifySeq < pBest->node->peerDiversifySeq))
+            pBest = &lanes[i];
+    }
+
+    if (pBest == NULL)
+    {
+        ibdmetrics::Get().diversify_no_other_lane.fetch_add(
+            1, std::memory_order_relaxed);
+        return pfrom;
+    }
+
+    // pfrom saturated -> always diversify.  Otherwise diversify with
+    // probability -ibddivfrac (bounded; the announcer remains the majority).
+    const bool fDiversify =
+        fFromSaturated ||
+        (int)GetRand(1000) < GetFutureSupplyDiversificationFractionPermille();
+    if (!fDiversify)
+        return pfrom;
+
+    CNode* pChosen = pBest->node;
+    pChosen->peerDiversifySeq += 1;
+    return pChosen;
 }
 
 void CStalledSyncRecoveryState::MarkSyncRequestSent(int64_t nNow)
@@ -2843,7 +3050,8 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
         {
             if (pnode->fDisconnect)
                 continue;
-            const size_t nAdmitted = RefillDeferredBlockRequests(pnode);
+            const size_t nAdmitted =
+                RefillDeferredBlockRequests(pnode, vNodesCopy);
             if (nAdmitted != 0)
             {
                 ibdmetrics::Get().pipeline_wake_refill_admitted.fetch_add(
@@ -5338,6 +5546,9 @@ void CNode::Cleanup()
             ibdmetrics::DeferredAdd(-(int64_t)deferredBlockInv.size());
         setAskForBlocks.clear();
         setBlocksInFlight.clear();
+        peerLiveActivePressure = 0;
+        nFrontierDeferredHash = 0;
+        ClearDiversifyDispatchForPeer(GetId());
         if (fHadQueuedGetBlocks)
         {
             ibdmetrics::GetBlocksQueuedAdd(
@@ -7392,7 +7603,7 @@ void ThreadMessageHandler2(void* parg)
             {
                 TRY_LOCK(pnode->cs_vSend, lockSend);
                 if (lockSend)
-                    SendMessages(pnode, pnode == pnodeTrickle);
+                    SendMessages(pnode, pnode == pnodeTrickle, vNodesCopy);
             }
             if (fShutdown)
                 return;

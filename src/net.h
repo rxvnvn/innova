@@ -286,6 +286,62 @@ enum PipelineWakeOutcome
 typedef int NodeId;
 
 void RequestBlockPipelineWake(uint32_t nCause);
+
+// Experiment A (future-supply diversification): cached -ibddivfuture /
+// -ibddivfrac configuration.  Loaded lazily on first use so the arguments are
+// read exactly once; unit tests reload them through
+// ResetFutureSupplyDiversificationConfigForTesting().
+bool IsFutureSupplyDiversificationEnabled();
+// -ibddivfrac clamped to [0,1] and expressed in permille (0..1000).
+int GetFutureSupplyDiversificationFractionPermille();
+void ResetFutureSupplyDiversificationConfigForTesting();
+
+// Experiment A attribution.  When a deferred future candidate is dispatched to
+// a non-announcer lane (a diversified dispatch), the announcer's peer id is
+// recorded per hash so the in-flight-mark and timeout paths can attribute the
+// request.  Guarded by cs_mapAlreadyAskedFor (the same lock taken by AskFor).
+void RecordDiversifyDispatch(const uint256& hash, NodeId announcePeer);
+// Find-only probe: sets *pAnnouncePeer and returns true when the hash was
+// dispatched to a non-announcer lane.
+bool GetDiversifyAnnounce(const uint256& hash, NodeId* pAnnouncePeer);
+// Find-and-erase probe: like GetDiversifyAnnounce but consumes the record
+// (used when the dispatch finishes: receive, timeout, or pre-dispatch removal).
+bool TakeDiversifyAnnounce(const uint256& hash, NodeId* pAnnouncePeer);
+// Erase any record whose value is peer (no-op probe variant).
+void ClearDiversifyDispatch(const uint256& hash);
+void ClearDiversifyDispatchForPeer(NodeId peer);
+// Test-only: clear the diversification attribution ledger.
+void ResetDiversifyDispatchLedgerForTesting();
+
+// Experiment A lane selection.
+struct FutureSupplyLane
+{
+    CNode* node;
+    int32_t peerLiveActivePressure;
+    FutureSupplyLane(CNode* p, int32_t n)
+        : node(p), peerLiveActivePressure(n)
+    {
+    }
+};
+
+// Collect the eligible non-announcer future-supply lanes from vNodesCopy
+// (already AddRef'd by the caller for the whole message-handler pass, so the
+// returned CNode* pointers are valid for the caller's scope).  A peer is
+// eligible iff it is a connected full node, not disconnecting, able to advance
+// block sync beyond nBestHeight, and has a free window slot.  pfrom is NOT
+// included; it is handled separately by ChooseDeferredDispatchLane.
+std::vector<FutureSupplyLane> CollectEligibleFutureSupplyLanes(
+    const std::vector<CNode*>& vNodesCopy, int nBestHeight);
+
+// Decide which lane should re-request the deferred future candidate hash that
+// was announced by pfrom.  Returns pfrom (the announcer) when diversification
+// is disabled, when no snapshot (vNodesCopy) is available, when the candidate
+// is pfrom's single deferred frontier candidate, or when no other eligible
+// lane exists.  Otherwise returns the eligible lane with the lowest
+// peer-active-pressure (tie-break peerDiversifySeq), picking pfrom instead
+// with probability (1 - -ibddivfrac) while pfrom still has capacity.
+CNode* ChooseDeferredDispatchLane(CNode* pfrom, const uint256& hash,
+                                  const std::vector<CNode*>& vNodesCopy);
 PipelineWakeOutcome MaybeProcessPipelineWake(
     const std::vector<CNode*>& vNodesCopy,
     bool forceMainLockFailureForTest = false);
@@ -950,6 +1006,18 @@ public:
     bool fInitialSyncRequestSent;
     int64_t nLastBlockRecv;
 
+    // Experiment A (future-supply diversification) state.  peerLiveActivePressure
+    // mirrors setAskForBlocks.size() + setBlocksInFlight.size(), updated at the
+    // same six loci that maintain the counted metrics; a relaxed atomic written
+    // only by the message-handler thread.  peerDiversifySeq is the round-robin
+    // tie-break tick for lane selection among equal-pressure eligible peers.
+    // nFrontierDeferredHash is the hash of the single frontier candidate
+    // deferred into this peer's deferred pool (0 = none); it is exempt from
+    // diversification and always re-requested from the announcer.
+    std::atomic<int32_t> peerLiveActivePressure;
+    uint64_t peerDiversifySeq;
+    uint256 nFrontierDeferredHash;
+
     int nBlocksReceivedInBatch;
     int nExpectedBatchSize;
     bool fPrefetchSent;
@@ -1032,6 +1100,9 @@ public:
         nFrontierLocatorHeight = -1;
         nDeferredBudgetZero = 0;
         fIbdMetricsCleanupAccounted = false;
+        peerLiveActivePressure = 0;
+        peerDiversifySeq = 0;
+        nFrontierDeferredHash = 0;
         nLastGetDataTime = 0;
         nChainHeight = -1;
         nBestKnownHeight = -1;
@@ -1217,6 +1288,8 @@ public:
     {
         if (deferredBlockInvIndex.erase(hash) == 0)
             return false;
+        if (nFrontierDeferredHash == hash)
+            nFrontierDeferredHash = 0;
         for (std::deque<uint256>::iterator it = deferredBlockInv.begin();
              it != deferredBlockInv.end(); ++it)
         {
@@ -1237,7 +1310,10 @@ public:
     {
         if (deferredBlockInv.empty())
             return;
-        deferredBlockInvIndex.erase(deferredBlockInv.front());
+        const uint256 hash = deferredBlockInv.front();
+        if (nFrontierDeferredHash == hash)
+            nFrontierDeferredHash = 0;
+        deferredBlockInvIndex.erase(hash);
         deferredBlockInv.pop_front();
         ibdmetrics::DeferredAdd(-1);
         if (BlockRequestTraceEnabled())
@@ -1261,6 +1337,8 @@ public:
         {
             if (setAskForBlocks.insert(inv.hash).second)
             {
+                peerLiveActivePressure.fetch_add(
+                    1, std::memory_order_relaxed);
                 ibdmetrics::QueuedAdd(1);
                 ibdmetrics::GlobalActiveAdd(1);
             }
@@ -1284,6 +1362,10 @@ public:
         {
             if (setAskForBlocks.erase(inv.hash))
             {
+                peerLiveActivePressure.fetch_sub(
+                    1, std::memory_order_relaxed);
+                if (cause != ibdmetrics::ACTIVE_DECREMENT_ASKFOR_SENT_TRANSITION)
+                    ClearDiversifyDispatch(inv.hash);
                 ibdmetrics::QueuedAdd(-1);
                 ibdmetrics::GlobalActiveAdd(-1, cause);
                 if (cause != ibdmetrics::ACTIVE_DECREMENT_ASKFOR_SENT_TRANSITION)
@@ -1320,6 +1402,14 @@ public:
         }
         if (!setAskForBlocks.empty())
         {
+            peerLiveActivePressure = 0;
+            if (IsFutureSupplyDiversificationEnabled())
+            {
+                for (std::set<uint256>::const_iterator si =
+                         setAskForBlocks.begin();
+                     si != setAskForBlocks.end(); ++si)
+                    ClearDiversifyDispatch(*si);
+            }
             ibdmetrics::QueuedAdd(-(int64_t)setAskForBlocks.size());
             ibdmetrics::GlobalActiveAdd(
                 -(int64_t)setAskForBlocks.size(),
@@ -1755,10 +1845,16 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                     BlockRequestTraceInFlightExpire(this, it->first, nNow - it->second);
                 const uint256 hashExpired = it->first;
                 setBlocksInFlight.erase(it->first);
+                peerLiveActivePressure.fetch_sub(
+                    1, std::memory_order_relaxed);
                 ibdmetrics::InflightAdd(-1);
                 ibdmetrics::GlobalActiveAdd(
                     -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
                 RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
+                NodeId nDiversifyAnnounce = -1;
+                if (TakeDiversifyAnnounce(hashExpired, &nDiversifyAnnounce))
+                    ibdmetrics::Get().diversify_other_lane_timeout.fetch_add(
+                        1, std::memory_order_relaxed);
                 // Head age = age of the oldest in-flight hash at the moment
                 // this hash expires (the expiring hash is still in the set).
                 // O(n) per expiry and only computed when forensic is enabled.
@@ -1800,8 +1896,14 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         ExpireBlockInFlight();
         if (setBlocksInFlight.insert(hashBlock).second)
         {
+            peerLiveActivePressure.fetch_add(
+                1, std::memory_order_relaxed);
+            NodeId nAnnouncePeer = -1;
+            const bool fDiversified =
+                GetDiversifyAnnounce(hashBlock, &nAnnouncePeer);
             ibdforensic::RecordGenerationStart(
-                GetId(), hashBlock, GetTimeMicros());
+                GetId(), hashBlock, GetTimeMicros(),
+                fDiversified ? nAnnouncePeer : GetId(), fDiversified);
             ibdmetrics::InflightAdd(1);
             ibdmetrics::GlobalActiveAdd(1);
         }
@@ -1813,12 +1915,15 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     {
         if (setBlocksInFlight.erase(hashBlock))
         {
+            peerLiveActivePressure.fetch_sub(
+                1, std::memory_order_relaxed);
             ibdmetrics::InflightAdd(-1);
             ibdmetrics::GlobalActiveAdd(
                 -1, ibdmetrics::ACTIVE_DECREMENT_RECEIVE_CLEAR_INFLIGHT);
             RequestBlockPipelineWake(WAKE_CAUSE_CLEAR_INFLIGHT);
         }
         mapBlockInFlightSince.erase(hashBlock);
+        TakeDiversifyAnnounce(hashBlock, NULL);
         ReleaseBlockRequestOwner(hashBlock, GetId(), "receive");
     }
     bool IsSubscribed(unsigned int nChannel);

@@ -475,6 +475,8 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
                                      inv.hash, "active-window-full",
                                      nBudget, 0, 0);
         }
+        if (fFrontierCandidate)
+            pfrom->nFrontierDeferredHash = inv.hash;
         if (DeferBlockInv(pfrom, inv.hash, "active-window-full"))
             ibdmetrics::Get().block_inv_deferred.fetch_add(
                 1, std::memory_order_relaxed);
@@ -489,7 +491,8 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
     return true;
 }
 
-size_t RefillDeferredBlockRequests(CNode* pfrom)
+size_t RefillDeferredBlockRequests(
+    CNode* pfrom, const std::vector<CNode*>& vNodesCopy)
 {
     AssertLockHeld(cs_main);
     if (pfrom == NULL || !IsInitialBlockDownload())
@@ -565,8 +568,39 @@ size_t RefillDeferredBlockRequests(CNode* pfrom)
             continue;
         }
 
+        const bool fFrontierDeferred =
+            (pfrom->nFrontierDeferredHash == hash);
         pfrom->PopFrontDeferredBlockInv();
-        pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+        CNode* pDispatch = pfrom;
+        const bool fDiversificationEnabled =
+            IsFutureSupplyDiversificationEnabled();
+        if (fDiversificationEnabled)
+        {
+            ibdmetrics::Get().diversify_candidates.fetch_add(
+                1, std::memory_order_relaxed);
+            // The single deferred frontier candidate keeps the announcer path
+            // verbatim (frontier-exemption semantics preserved unchanged;
+            // orphan-source retries never pass through the deferred refill,
+            // so the orphan lane is inherently untouched).
+            if (!fFrontierDeferred)
+                pDispatch =
+                    ChooseDeferredDispatchLane(pfrom, hash, vNodesCopy);
+        }
+        pDispatch->AskFor(inv, BLOCKREQ_SOURCE_INV);
+        if (fDiversificationEnabled)
+        {
+            if (pDispatch != pfrom)
+            {
+                ibdmetrics::Get().diversify_picked_other_lane.fetch_add(
+                    1, std::memory_order_relaxed);
+                RecordDiversifyDispatch(hash, pfrom->GetId());
+            }
+            else
+            {
+                ibdmetrics::Get().diversify_picked_announcer.fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
         ++nAdmitted;
         ibdmetrics::Get().refill_items_admitted.fetch_add(
             1, std::memory_order_relaxed);
@@ -10137,7 +10171,8 @@ bool ProcessMessages(CNode* pfrom)
 }
 
 
-bool SendMessages(CNode* pto, bool fSendTrickle)
+bool SendMessages(CNode* pto, bool fSendTrickle,
+                  const std::vector<CNode*>& vNodesCopy)
 {
     RecoveryResponseResult recoveryResult;
     if (pto->ExpireRecoveryResponseWindow(GetTimeMicros(), recoveryResult) &&
@@ -10257,7 +10292,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
         if (lockMain)
         {
             sendLockDiagnostics.Acquired();
-            RefillDeferredBlockRequests(pto);
+            RefillDeferredBlockRequests(pto, vNodesCopy);
 
         if (fSPVMode && pto->getHeadersSync.IsTimedOut(GetTime()))
             pto->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "timeout-retry");

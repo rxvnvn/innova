@@ -410,7 +410,9 @@ int GetDeferredBlockRequestBudget(CNode* pfrom,
                                   int* pnSentBlockRequests = NULL,
                                   int* pnPeerActivePressure = NULL,
                                   int* pnGlobalActivePressure = NULL);
-size_t RefillDeferredBlockRequests(CNode* pfrom);
+size_t RefillDeferredBlockRequests(
+    CNode* pfrom,
+    const std::vector<CNode*>& vNodesCopy = std::vector<CNode*>());
 
 // Admit a block INV into the request pipeline now (budget permitting), or
 // defer it for a later refill pump.  The budget reflects request pressure
@@ -489,7 +491,8 @@ bool LoadBlockIndex(bool fAllowNew=true);
 void PrintBlockTree();
 CBlockIndex* FindBlockByHeight(int nHeight);
 bool ProcessMessages(CNode* pfrom);
-bool SendMessages(CNode* pto, bool fSendTrickle);
+bool SendMessages(CNode* pto, bool fSendTrickle,
+                  const std::vector<CNode*>& vNodesCopy = std::vector<CNode*>());
 bool LoadExternalBlockFile(FILE* fileIn);
 
 //void PushGetBlocks(CNode* pnode, CBlockIndex* pindexBegin, uint256 hashEnd);

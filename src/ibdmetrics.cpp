@@ -210,7 +210,13 @@ Counters::Counters()
       pipeline_wake_active_restored(0),
       pipeline_wake_signal_start_ms(0),
       pipeline_wake_signal_to_active_ms_total(0),
-      pipeline_wake_signal_to_active_ms_max(0)
+      pipeline_wake_signal_to_active_ms_max(0),
+      diversify_candidates(0),
+      diversify_picked_other_lane(0),
+      diversify_picked_announcer(0),
+      diversify_snapshot_skip_lock(0),
+      diversify_no_other_lane(0),
+      diversify_other_lane_timeout(0)
 {
 }
 
@@ -932,6 +938,19 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.pipeline_wake_signal_to_active_ms_total.load(std::memory_order_relaxed);
     out.pipeline_wake_signal_to_active_ms_max =
         c.pipeline_wake_signal_to_active_ms_max.load(std::memory_order_relaxed);
+
+    out.diversify_candidates =
+        c.diversify_candidates.load(std::memory_order_relaxed);
+    out.diversify_picked_other_lane =
+        c.diversify_picked_other_lane.load(std::memory_order_relaxed);
+    out.diversify_picked_announcer =
+        c.diversify_picked_announcer.load(std::memory_order_relaxed);
+    out.diversify_snapshot_skip_lock =
+        c.diversify_snapshot_skip_lock.load(std::memory_order_relaxed);
+    out.diversify_no_other_lane =
+        c.diversify_no_other_lane.load(std::memory_order_relaxed);
+    out.diversify_other_lane_timeout =
+        c.diversify_other_lane_timeout.load(std::memory_order_relaxed);
 }
 
 void ResetPipelineWakeMetricsForTesting()

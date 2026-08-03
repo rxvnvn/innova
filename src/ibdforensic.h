@@ -65,9 +65,16 @@ struct GenerationRecord
     int64_t markUs;         // generation start (MarkBlockInFlight)
     int64_t releaseUs;      // generation end (0 = still active)
     std::string reason;     // receive|timeout|queue-removal|clear|disconnect
+    // Experiment A attribution: the peer that announced the hash when the
+    // generation was opened by a diversified (non-announcer) lane.  Equal to
+    // peer when the dispatch stayed on the announcer; announcePeer < 0 with
+    // diversified = false when attribution is unavailable.
+    int announcePeer;
+    bool diversified;
 
     GenerationRecord()
-        : genId(0), peer(-1), markUs(0), releaseUs(0)
+        : genId(0), peer(-1), markUs(0), releaseUs(0),
+          announcePeer(-1), diversified(false)
     {
     }
 };
@@ -179,8 +186,11 @@ void RecordReceived(int peer, const uint256& hash, int64_t nDispatchUs,
 // A block request generation started: the hash was admitted to in-flight for
 // this peer (called from CNode::MarkBlockInFlight).  Idempotent per hash: a new
 // generation is opened only when no generation is still active, which mirrors
-// the in-flight admission gate.
-void RecordGenerationStart(int peer, const uint256& hash, int64_t nNowUs);
+// the in-flight admission gate.  When the dispatch left the announcing lane
+// (Experiment A diversification), announcePeer is the announcing peer and
+// diversified is true; otherwise the generation is attributed to peer.
+void RecordGenerationStart(int peer, const uint256& hash, int64_t nNowUs,
+                           int announcePeer = -1, bool diversified = false);
 
 // A block request generation ended: ownership of the hash was released for the
 // reason given (receive|timeout|queue-removal|clear|disconnect).  Called from

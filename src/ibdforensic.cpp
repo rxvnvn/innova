@@ -13,6 +13,7 @@
 
 #include "sync.h"
 #include "util.h"
+#include "net.h"
 
 // See ibdforensic.h for the contract.  Implementation notes:
 //   - g_mutex guards every piece of shared state below.  It is a leaf lock:
@@ -323,7 +324,8 @@ void RecordReceived(int peer, const uint256& hash, int64_t nDispatchUs,
     g_peerLastReceiveUs[peer] = nFramingCompleteUs;
 }
 
-void RecordGenerationStart(int peer, const uint256& hash, int64_t nNowUs)
+void RecordGenerationStart(int peer, const uint256& hash, int64_t nNowUs,
+                           int announcePeer, bool diversified)
 {
     if (!g_enabled)
         return;
@@ -339,6 +341,8 @@ void RecordGenerationStart(int peer, const uint256& hash, int64_t nNowUs)
     g.peer = peer;
     g.markUs = nNowUs;
     g.releaseUs = 0;
+    g.announcePeer = announcePeer;
+    g.diversified = diversified;
     gens.push_back(g);
 }
 
@@ -796,8 +800,16 @@ bool Dump()
     }
 
     fprintf(f, "#generations\n");
-    fprintf(f,
-            "# generation_id,batch_id,hash,peer,mark_us,release_us,reason\n");
+    const bool fDiversificationAttribution =
+        IsFutureSupplyDiversificationEnabled();
+    if (fDiversificationAttribution)
+        fprintf(f,
+                "# generation_id,batch_id,hash,peer,mark_us,release_us,"
+                "reason,announce_peer,diversified\n");
+    else
+        fprintf(f,
+                "# generation_id,batch_id,hash,peer,mark_us,release_us,"
+                "reason\n");
     {
         LOCK(g_mutex);
         for (std::map<uint256, HashGenerations>::const_iterator gi =
@@ -812,12 +824,25 @@ bool Dump()
             for (size_t i = 0; i < gens.size(); ++i)
             {
                 const GenerationRecord& g = gens[i];
-                fprintf(f, "%llu,%llu,%s,%d,%lld,%lld,%s\n",
-                        (unsigned long long)g.genId,
-                        (unsigned long long)nBatchId,
-                        gi->first.ToString().c_str(), g.peer,
-                        (long long)g.markUs, (long long)g.releaseUs,
-                        g.reason.c_str());
+                if (fDiversificationAttribution)
+                {
+                    fprintf(f, "%llu,%llu,%s,%d,%lld,%lld,%s,%d,%d\n",
+                            (unsigned long long)g.genId,
+                            (unsigned long long)nBatchId,
+                            gi->first.ToString().c_str(), g.peer,
+                            (long long)g.markUs, (long long)g.releaseUs,
+                            g.reason.c_str(), g.announcePeer,
+                            g.diversified ? 1 : 0);
+                }
+                else
+                {
+                    fprintf(f, "%llu,%llu,%s,%d,%lld,%lld,%s\n",
+                            (unsigned long long)g.genId,
+                            (unsigned long long)nBatchId,
+                            gi->first.ToString().c_str(), g.peer,
+                            (long long)g.markUs, (long long)g.releaseUs,
+                            g.reason.c_str());
+                }
             }
         }
     }

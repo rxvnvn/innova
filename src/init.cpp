@@ -593,6 +593,8 @@ std::string HelpMessage()
         "  -ibdforensicpath=<file> " + _("Write the ibdforensic per-hash CSV dump and summary to this file at shutdown (default: empty = summary only)") + "\n" +
         "  -ibdactiveslowthresholdms=<n> " + _("Slow-phase threshold for IBD_SLOW_BLOCK events in milliseconds (default: 50)") + "\n" +
         "  -ibdmaxactiveperpeer=<n> " + _("Experimental IBD per-peer active request window; clamped to [1,512], zero/negative/non-numeric falls back to default (default: 128)") + "\n" +
+        "  -ibddivfuture=<0|1> " + _("Experimental IBD future-supply diversification: route a bounded fraction of deferred future candidates to other eligible peers instead of always re-requesting the announcer (default: 0)") + "\n" +
+        "  -ibddivfrac=<d> " + _("Max fraction of deferred future candidates that may leave the announcer lane when the announcer still has window capacity; clamped to [0,1] (default: 0.15)") + "\n" +
         "  -getinfosyncprobe=<n> " + _("Log cached P2P state before, during, and after getinfo (default: 0)") + "\n" +
         "  -rpcperftrace=<n>     " + _("Trace getinfo/getmininginfo RPC performance (default: 0)") + "\n" +
         "  -synclockdiagnostics=<n> " + _("Log long sync-related lock waits and holds (default: 0)") + "\n" +
