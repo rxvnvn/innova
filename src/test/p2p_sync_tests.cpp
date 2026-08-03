@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <algorithm>
+#include <cstring>
 #include <map>
 #include <string>
 #include <vector>
@@ -239,6 +240,49 @@ public:
         fReindex = fReindexSaved;
         fImporting = fImportingSaved;
         fRegTest = fRegTestSaved;
+    }
+};
+
+// Scoped -ibddivfuture / -ibddivfrac configuration.  Reloads the lazy config
+// cache and clears the diversification attribution ledger on both entry and
+// exit so unit tests never leak state between cases.
+class CScopedFutureSupplyDiversificationConfig
+{
+private:
+    bool fEnabled;
+    std::string strFracSaved;
+
+public:
+    explicit CScopedFutureSupplyDiversificationConfig(
+        bool fOn, const std::string& strFraction = "")
+        : fEnabled(fOn)
+    {
+        ResetFutureSupplyDiversificationConfigForTesting();
+        ResetDiversifyDispatchLedgerForTesting();
+        strFracSaved = "";
+        if (mapArgs.count("-ibddivfrac"))
+            strFracSaved = mapArgs["-ibddivfrac"];
+        if (fEnabled)
+            mapArgs["-ibddivfuture"] = "1";
+        else
+            mapArgs.erase("-ibddivfuture");
+        if (strFraction.empty())
+            mapArgs.erase("-ibddivfrac");
+        else
+            mapArgs["-ibddivfrac"] = strFraction;
+        ResetFutureSupplyDiversificationConfigForTesting();
+        BOOST_CHECK_EQUAL(IsFutureSupplyDiversificationEnabled(), fEnabled);
+    }
+
+    ~CScopedFutureSupplyDiversificationConfig()
+    {
+        mapArgs.erase("-ibddivfuture");
+        if (strFracSaved.empty())
+            mapArgs.erase("-ibddivfrac");
+        else
+            mapArgs["-ibddivfrac"] = strFracSaved;
+        ResetFutureSupplyDiversificationConfigForTesting();
+        ResetDiversifyDispatchLedgerForTesting();
     }
 };
 
@@ -5709,6 +5753,464 @@ BOOST_AUTO_TEST_CASE(block_request_wire_latency_monotonic)
 
     ibdactivepath::InitIBDActivePathTrace(false);
     ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+}
+
+static int64_t DiversifyMetric(const char* pszName)
+{
+    IBDMetricsSnapshot metrics;
+    ibdmetrics::SnapshotAll(metrics);
+    if (strcmp(pszName, "candidates") == 0)
+        return metrics.diversify_candidates;
+    if (strcmp(pszName, "other_lane") == 0)
+        return metrics.diversify_picked_other_lane;
+    if (strcmp(pszName, "announcer") == 0)
+        return metrics.diversify_picked_announcer;
+    if (strcmp(pszName, "snapshot_skip") == 0)
+        return metrics.diversify_snapshot_skip_lock;
+    if (strcmp(pszName, "no_other_lane") == 0)
+        return metrics.diversify_no_other_lane;
+    if (strcmp(pszName, "other_lane_timeout") == 0)
+        return metrics.diversify_other_lane_timeout;
+    return -1;
+}
+
+static void PrepareDiversifyLane(CNode& node, int nBase)
+{
+    PreparePeerForRecovery(node, PROTOCOL_VERSION, nBestHeight + 100);
+    for (int i = 0; i < nBase; ++i)
+        node.AddAskForEntry(
+            (GetTime() - 100) * 1000000, CInv(MSG_BLOCK, uint256(70000 + i)));
+}
+
+BOOST_AUTO_TEST_CASE(diversify_config_parse_and_clamp)
+{
+    CScopedFutureSupplyDiversificationConfig cfg(true, "0.5");
+    BOOST_CHECK_EQUAL(GetFutureSupplyDiversificationFractionPermille(), 500);
+
+    // Non-numeric, negative, and above-1 fractions fall back to the 0.15
+    // default (150 permille).
+    mapArgs["-ibddivfrac"] = "abc";
+    ResetFutureSupplyDiversificationConfigForTesting();
+    BOOST_CHECK_EQUAL(GetFutureSupplyDiversificationFractionPermille(), 150);
+    mapArgs["-ibddivfrac"] = "-0.2";
+    ResetFutureSupplyDiversificationConfigForTesting();
+    BOOST_CHECK_EQUAL(GetFutureSupplyDiversificationFractionPermille(), 150);
+    mapArgs["-ibddivfrac"] = "2.0";
+    ResetFutureSupplyDiversificationConfigForTesting();
+    BOOST_CHECK_EQUAL(GetFutureSupplyDiversificationFractionPermille(), 150);
+
+    mapArgs["-ibddivfrac"] = "0";
+    ResetFutureSupplyDiversificationConfigForTesting();
+    BOOST_CHECK_EQUAL(GetFutureSupplyDiversificationFractionPermille(), 0);
+    mapArgs["-ibddivfrac"] = "1";
+    ResetFutureSupplyDiversificationConfigForTesting();
+    BOOST_CHECK_EQUAL(GetFutureSupplyDiversificationFractionPermille(), 1000);
+}
+
+BOOST_AUTO_TEST_CASE(atomic_live_pressure_mirror_tracks_all_six_loci)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(301), "mirror-loci", true);
+
+    // Locus 1: AddAskForEntry insert +1.
+    peer.AskFor(CInv(MSG_BLOCK, uint256(900000)), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 1);
+    // Locus 2: EraseAskForEntry erase -1.
+    peer.EraseAskForEntry(peer.mapAskFor.begin());
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+    // Queued + in-flight.
+    peer.AskFor(CInv(MSG_BLOCK, uint256(900001)), BLOCKREQ_SOURCE_INV);
+    peer.MarkBlockInFlight(uint256(900002));
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 2);
+    // Locus 5a: ClearBlockInFlight erase -1.
+    peer.ClearBlockInFlight(uint256(900002));
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 1);
+    // Locus 3: ClearAskFor resets to zero.
+    peer.ClearAskFor();
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+    // Locus 4: MarkBlockInFlight insert +1.
+    peer.MarkBlockInFlight(uint256(900003));
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 1);
+    // Locus 5b: ExpireBlockInFlight erase -1.
+    peer.mapBlockInFlightSince[uint256(900003)] = GetTime() - 10;
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(diversify_routes_future_to_other_peer_with_capacity)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFutureSupplyDiversificationConfig cfg(true, "1.0");
+    CNode pfrom(INVALID_SOCKET, TestPeerAddress(310), "div-announcer", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(311), "div-lane", true);
+    CScopedInitialBlockDownloadState ibdState(&pfrom);
+    PreparePeerForRecovery(pfrom, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(lane, PROTOCOL_VERSION, nBestHeight + 100);
+    pfrom.nLastHeightUpdate = GetTime();
+    const uint256 hash(930000);
+
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(pfrom.DeferBlockInv(hash));
+    }
+    std::vector<CNode*> vNodesCopy;
+    vNodesCopy.push_back(&pfrom);
+    vNodesCopy.push_back(&lane);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&pfrom, vNodesCopy), 1U);
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(pfrom, hash), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(lane, hash), 1U);
+    // No ownership is assigned at queue time.
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+    lane.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(diversify_keeps_announcer_when_no_other_capacity)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFutureSupplyDiversificationConfig cfg(true, "1.0");
+    CNode pfrom(INVALID_SOCKET, TestPeerAddress(312), "div-announcer-full-other", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(313), "div-lane-full", true);
+    CScopedInitialBlockDownloadState ibdState(&pfrom);
+    PreparePeerForRecovery(pfrom, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(lane, PROTOCOL_VERSION, nBestHeight + 100);
+    pfrom.nLastHeightUpdate = GetTime();
+    FillPeerActiveWindow(lane, 931000);
+    BOOST_CHECK_EQUAL(lane.peerLiveActivePressure.load(),
+                      (int32_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+    const uint256 hash(930001);
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(pfrom.DeferBlockInv(hash));
+    }
+    const int64_t nNoOtherBefore = DiversifyMetric("no_other_lane");
+    std::vector<CNode*> vNodesCopy;
+    vNodesCopy.push_back(&pfrom);
+    vNodesCopy.push_back(&lane);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&pfrom, vNodesCopy), 1U);
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(pfrom, hash), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(lane, hash), 0U);
+    BOOST_CHECK_EQUAL(DiversifyMetric("no_other_lane") - nNoOtherBefore, 1);
+    lane.ClearAskFor();
+    pfrom.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(diversify_falls_back_to_announcer_without_snapshot)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFutureSupplyDiversificationConfig cfg(true, "1.0");
+    CNode pfrom(INVALID_SOCKET, TestPeerAddress(314), "div-no-snapshot", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(315), "div-lane-no-snapshot", true);
+    CScopedInitialBlockDownloadState ibdState(&pfrom);
+    PreparePeerForRecovery(pfrom, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(lane, PROTOCOL_VERSION, nBestHeight + 100);
+    pfrom.nLastHeightUpdate = GetTime();
+    const uint256 hash(930002);
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(pfrom.DeferBlockInv(hash));
+    }
+    const int64_t nSkipBefore = DiversifyMetric("snapshot_skip");
+    std::vector<CNode*> vNodesEmpty;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(
+            RefillDeferredBlockRequests(&pfrom, vNodesEmpty), 1U);
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(pfrom, hash), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(lane, hash), 0U);
+    BOOST_CHECK_EQUAL(DiversifyMetric("snapshot_skip") - nSkipBefore, 1);
+    lane.ClearAskFor();
+    pfrom.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(diversify_bounded_by_frac_keeps_announcer_majority)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFutureSupplyDiversificationConfig cfg(true, "0");
+    CNode pfrom(INVALID_SOCKET, TestPeerAddress(316), "div-frac-announcer", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(317), "div-frac-lane", true);
+    CScopedInitialBlockDownloadState ibdState(&pfrom);
+    PreparePeerForRecovery(pfrom, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(lane, PROTOCOL_VERSION, nBestHeight + 100);
+    pfrom.nLastHeightUpdate = GetTime();
+    std::vector<CNode*> vNodesCopy;
+    vNodesCopy.push_back(&pfrom);
+    vNodesCopy.push_back(&lane);
+
+    // frac = 0: never leave the announcer, even with an eligible other lane.
+    std::vector<uint256> vHashes;
+    for (int i = 0; i < 4; ++i)
+        vHashes.push_back(uint256(930100 + i));
+    {
+        LOCK(cs_main);
+        for (size_t i = 0; i < vHashes.size(); ++i)
+            BOOST_REQUIRE(pfrom.DeferBlockInv(vHashes[i]));
+        BOOST_CHECK_EQUAL(
+            RefillDeferredBlockRequests(&pfrom, vNodesCopy),
+            vHashes.size());
+    }
+    for (size_t i = 0; i < vHashes.size(); ++i)
+    {
+        BOOST_CHECK_EQUAL(QueuedBlockAskForCount(pfrom, vHashes[i]), 1U);
+        BOOST_CHECK_EQUAL(QueuedBlockAskForCount(lane, vHashes[i]), 0U);
+    }
+    pfrom.ClearAskFor();
+    lane.ClearAskFor();
+
+    // frac = 1.0: with capacity on the announcer, every candidate leaves.
+    CScopedFutureSupplyDiversificationConfig cfgFull(true, "1.0");
+    const uint256 hashFull(930200);
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(pfrom.DeferBlockInv(hashFull));
+        BOOST_CHECK_EQUAL(
+            RefillDeferredBlockRequests(&pfrom, vNodesCopy), 1U);
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(pfrom, hashFull), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(lane, hashFull), 1U);
+    lane.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(diversify_frontier_deferred_lane_unchanged)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFutureSupplyDiversificationConfig cfg(true, "1.0");
+    CNode pfrom(INVALID_SOCKET, TestPeerAddress(318), "div-frontier", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(319), "div-frontier-lane", true);
+    CScopedInitialBlockDownloadState ibdState(&pfrom);
+    PreparePeerForRecovery(pfrom, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(lane, PROTOCOL_VERSION, nBestHeight + 100);
+    pfrom.nLastHeightUpdate = GetTime();
+    const uint256 hash(930300);
+    pfrom.nFrontierDeferredHash = hash;
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(pfrom.DeferBlockInv(hash));
+    }
+    std::vector<CNode*> vNodesCopy;
+    vNodesCopy.push_back(&pfrom);
+    vNodesCopy.push_back(&lane);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&pfrom, vNodesCopy), 1U);
+    }
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(pfrom, hash), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(lane, hash), 0U);
+    BOOST_CHECK(pfrom.nFrontierDeferredHash == uint256(0));
+    lane.ClearAskFor();
+    pfrom.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(diversify_never_steals_inflight_owner)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFutureSupplyDiversificationConfig cfg(true, "1.0");
+    CNode pfrom(INVALID_SOCKET, TestPeerAddress(320), "div-no-steal", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(321), "div-no-steal-lane", true);
+    CScopedInitialBlockDownloadState ibdState(&pfrom);
+    PreparePeerForRecovery(pfrom, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(lane, PROTOCOL_VERSION, nBestHeight + 100);
+    const uint256 hash(930400);
+
+    // The hash is in-flight-owned by pfrom. A diversified AskFor on the lane
+    // is rejected at queue time, so no getdata can ever be sent for it and the
+    // owner is untouched.
+    BOOST_REQUIRE(
+        TryAssignBlockRequestOwner(hash, pfrom.GetId(), BLOCKREQ_SOURCE_INV));
+    pfrom.MarkBlockInFlight(hash);
+    BOOST_CHECK_EQUAL(lane.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV),
+                      ASKFOR_OWNED_BY_OTHER);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(lane, hash), 0U);
+    BOOST_CHECK(SendMessages(&lane, true));
+    BOOST_CHECK(!HasCommand(SentCommands(lane), "getdata"));
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, pfrom.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+
+    // The refill path likewise refuses to re-dispatch an owned hash: pfrom
+    // already holds it in-flight, so the redundant deferred entry is dropped
+    // without any lane being asked.
+    pfrom.nLastHeightUpdate = GetTime();
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(pfrom.DeferBlockInv(hash));
+        std::vector<CNode*> vNodesCopy;
+        vNodesCopy.push_back(&pfrom);
+        vNodesCopy.push_back(&lane);
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&pfrom, vNodesCopy), 0U);
+    }
+    BOOST_CHECK(!pfrom.IsBlockInvDeferred(hash));
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(lane, hash), 0U);
+    BOOST_CHECK(GetBlockRequestOwner(hash, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, pfrom.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    lane.ClearAskFor();
+    pfrom.ClearBlockInFlight(hash);
+}
+
+BOOST_AUTO_TEST_CASE(diversify_attribution_lifecycle_and_timeout)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedFutureSupplyDiversificationConfig cfg(true, "1.0");
+    CNode lane(INVALID_SOCKET, TestPeerAddress(322), "div-attr", true);
+    const uint256 hash(930500);
+
+    // No record -> not attributed.
+    NodeId nAnnounce = -1;
+    BOOST_CHECK(!GetDiversifyAnnounce(hash, &nAnnounce));
+    // Record -> attributed to the announcing peer.
+    RecordDiversifyDispatch(hash, 77);
+    BOOST_CHECK(GetDiversifyAnnounce(hash, &nAnnounce));
+    BOOST_CHECK_EQUAL(nAnnounce, 77);
+    // Consume -> record gone.
+    BOOST_CHECK(TakeDiversifyAnnounce(hash, &nAnnounce));
+    BOOST_CHECK_EQUAL(nAnnounce, 77);
+    BOOST_CHECK(!TakeDiversifyAnnounce(hash, &nAnnounce));
+
+    // A diversified in-flight request that expires is counted.
+    RecordDiversifyDispatch(hash, 78);
+    lane.MarkBlockInFlight(hash);
+    lane.mapBlockInFlightSince[hash] = GetTime() - 10;
+    const int64_t nTimeoutBefore = DiversifyMetric("other_lane_timeout");
+    lane.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(DiversifyMetric("other_lane_timeout") - nTimeoutBefore, 1);
+    // Consumption on expiry prevents the re-request from being mis-attributed.
+    BOOST_CHECK(!GetDiversifyAnnounce(hash, &nAnnounce));
+}
+
+BOOST_AUTO_TEST_CASE(diversify_disconnected_ineligible_peer_not_chosen)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFutureSupplyDiversificationConfig cfg(true, "1.0");
+    CNode pfrom(INVALID_SOCKET, TestPeerAddress(323), "div-ineligible", true);
+    CNode disc(INVALID_SOCKET, TestPeerAddress(324), "div-disconnected", true);
+    CNode client(INVALID_SOCKET, TestPeerAddress(325), "div-client", true);
+    CNode behind(INVALID_SOCKET, TestPeerAddress(326), "div-behind", true);
+    CScopedInitialBlockDownloadState ibdState(&pfrom);
+    PreparePeerForRecovery(pfrom, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(disc, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(client, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(behind, PROTOCOL_VERSION, nBestHeight - 10);
+    pfrom.nLastHeightUpdate = GetTime();
+    disc.fDisconnect = true;
+    client.fClient = true;
+
+    std::vector<CNode*> vNodesCopy;
+    vNodesCopy.push_back(&pfrom);
+    vNodesCopy.push_back(&disc);
+    vNodesCopy.push_back(&client);
+    vNodesCopy.push_back(&behind);
+
+    const uint256 hash(930600);
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(pfrom.DeferBlockInv(hash));
+        BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&pfrom, vNodesCopy), 1U);
+    }
+    // None of the ineligible peers may be asked; the announcer keeps it.
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(pfrom, hash), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(disc, hash), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(client, hash), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(behind, hash), 0U);
+    pfrom.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(diversify_tie_break_lowest_pressure_and_round_robin)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedFutureSupplyDiversificationConfig cfg(true, "1.0");
+    CNode pfrom(INVALID_SOCKET, TestPeerAddress(327), "div-tie-announcer", true);
+    CNode laneA(INVALID_SOCKET, TestPeerAddress(328), "div-tie-a", true);
+    CNode laneB(INVALID_SOCKET, TestPeerAddress(329), "div-tie-b", true);
+    PreparePeerForRecovery(pfrom, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(laneA, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(laneB, PROTOCOL_VERSION, nBestHeight + 100);
+    std::vector<CNode*> vNodesCopy;
+    vNodesCopy.push_back(&pfrom);
+    vNodesCopy.push_back(&laneA);
+    vNodesCopy.push_back(&laneB);
+
+    // laneB has lower pressure -> chosen.
+    PrepareDiversifyLane(laneA, 5);
+    PrepareDiversifyLane(laneB, 3);
+    BOOST_CHECK_EQUAL(
+        ChooseDeferredDispatchLane(&pfrom, uint256(930700), vNodesCopy),
+        &laneB);
+    // Equal pressure, equal seq -> first lane, then round-robin alternation.
+    laneA.ClearAskFor();
+    laneB.ClearAskFor();
+    laneA.peerDiversifySeq = 0;
+    laneB.peerDiversifySeq = 0;
+    BOOST_CHECK_EQUAL(
+        ChooseDeferredDispatchLane(&pfrom, uint256(930701), vNodesCopy),
+        &laneA);
+    BOOST_CHECK_EQUAL(laneA.peerDiversifySeq, 1);
+    BOOST_CHECK_EQUAL(
+        ChooseDeferredDispatchLane(&pfrom, uint256(930702), vNodesCopy),
+        &laneB);
+    BOOST_CHECK_EQUAL(laneB.peerDiversifySeq, 1);
+    BOOST_CHECK_EQUAL(
+        ChooseDeferredDispatchLane(&pfrom, uint256(930703), vNodesCopy),
+        &laneA);
+    laneA.ClearAskFor();
+    laneB.ClearAskFor();
+}
+
+BOOST_AUTO_TEST_CASE(flags_off_preserves_baseline_behavior)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    CScopedFutureSupplyDiversificationConfig cfg(false);
+    CNode pfrom(INVALID_SOCKET, TestPeerAddress(330), "div-off-announcer", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(331), "div-off-lane", true);
+    CScopedInitialBlockDownloadState ibdState(&pfrom);
+    PreparePeerForRecovery(pfrom, PROTOCOL_VERSION, nBestHeight + 100);
+    PreparePeerForRecovery(lane, PROTOCOL_VERSION, nBestHeight + 100);
+    pfrom.nLastHeightUpdate = GetTime();
+    std::vector<CNode*> vNodesCopy;
+    vNodesCopy.push_back(&pfrom);
+    vNodesCopy.push_back(&lane);
+
+    const int64_t nCandidatesBefore = DiversifyMetric("candidates");
+    const int64_t nOtherBefore = DiversifyMetric("other_lane");
+    const int64_t nAnnouncerBefore = DiversifyMetric("announcer");
+    std::vector<uint256> vHashes;
+    for (int i = 0; i < 3; ++i)
+        vHashes.push_back(uint256(930800 + i));
+    {
+        LOCK(cs_main);
+        for (size_t i = 0; i < vHashes.size(); ++i)
+            BOOST_REQUIRE(pfrom.DeferBlockInv(vHashes[i]));
+        BOOST_CHECK_EQUAL(
+            RefillDeferredBlockRequests(&pfrom, vNodesCopy),
+            vHashes.size());
+    }
+    for (size_t i = 0; i < vHashes.size(); ++i)
+    {
+        BOOST_CHECK_EQUAL(QueuedBlockAskForCount(pfrom, vHashes[i]), 1U);
+        BOOST_CHECK_EQUAL(QueuedBlockAskForCount(lane, vHashes[i]), 0U);
+    }
+    // No diversification decisions were made at all.
+    BOOST_CHECK_EQUAL(DiversifyMetric("candidates") - nCandidatesBefore, 0);
+    BOOST_CHECK_EQUAL(DiversifyMetric("other_lane") - nOtherBefore, 0);
+    BOOST_CHECK_EQUAL(DiversifyMetric("announcer") - nAnnouncerBefore, 0);
+    pfrom.ClearAskFor();
+    lane.ClearAskFor();
 }
 
 BOOST_AUTO_TEST_SUITE_END()
