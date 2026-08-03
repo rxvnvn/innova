@@ -9328,7 +9328,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     std::max<int64_t>(0, GetTime() - miInFlight->second);
         }
         pfrom->ClearBlockInFlight(hashBlock);
-        ibdforensic::RecordReceived(pfrom->GetId(), hashBlock, GetTimeMicros());
+        ibdforensic::RecordReceived(
+            pfrom->GetId(), hashBlock, GetTimeMicros(),
+            nTimeReceived);
         ReleaseBlockRequestOwnerOnReceive(hashBlock, pfrom->GetId());
 
         CSyncLockDiagnostics blockLockDiagnostics(

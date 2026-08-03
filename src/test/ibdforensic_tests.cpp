@@ -168,7 +168,7 @@ BOOST_AUTO_TEST_CASE(records_receipt_before_and_after_timeout)
     ibdforensic::RecordGetDataBatch(1, vGetData, 5000000, 0, uint256(0), 1000);
 
     // Clean arrival: received before any timeout.
-    ibdforensic::RecordReceived(1, hOk, 5100000);
+    ibdforensic::RecordReceived(1, hOk, 5100000, 0);
     const ibdforensic::BatchEntry& eOk =
         ibdforensic::EntriesForTesting().at(hOk);
     BOOST_CHECK_EQUAL(eOk.recvTimeUs, (int64_t)5100000);
@@ -176,8 +176,8 @@ BOOST_AUTO_TEST_CASE(records_receipt_before_and_after_timeout)
     BOOST_CHECK_EQUAL(eOk.timeoutTimeUs, (int64_t)0);
 
     // Expiry fires, then the (already in transit) block arrives late.
-    ibdforensic::RecordExpired(1, hLate, 6000000);
-    ibdforensic::RecordReceived(1, hLate, 6100000);
+    ibdforensic::RecordExpired(1, hLate, 6000000, 0);
+    ibdforensic::RecordReceived(1, hLate, 6100000, 0);
     const ibdforensic::BatchEntry& eLate =
         ibdforensic::EntriesForTesting().at(hLate);
     BOOST_CHECK_EQUAL(eLate.timeoutTimeUs, (int64_t)6000000);
@@ -185,7 +185,7 @@ BOOST_AUTO_TEST_CASE(records_receipt_before_and_after_timeout)
     BOOST_CHECK(eLate.receivedAfterTimeout);
 
     // Expiry with no receipt.
-    ibdforensic::RecordExpired(1, hNever, 6000000);
+    ibdforensic::RecordExpired(1, hNever, 6000000, 0);
     const ibdforensic::BatchEntry& eNever =
         ibdforensic::EntriesForTesting().at(hNever);
     BOOST_CHECK_EQUAL(eNever.timeoutTimeUs, (int64_t)6000000);
@@ -193,12 +193,12 @@ BOOST_AUTO_TEST_CASE(records_receipt_before_and_after_timeout)
     BOOST_CHECK(!eNever.receivedAfterTimeout);
 
     // Duplicate expiry does not overwrite the first timeout time.
-    ibdforensic::RecordExpired(1, hLate, 7000000);
+    ibdforensic::RecordExpired(1, hLate, 7000000, 0);
     BOOST_CHECK_EQUAL(ibdforensic::EntriesForTesting().at(hLate).timeoutTimeUs,
                       (int64_t)6000000);
 
     // Blocks never requested are counted as unsolicited, not recorded.
-    ibdforensic::RecordReceived(1, TestHash(23), 6200000);
+    ibdforensic::RecordReceived(1, TestHash(23), 6200000, 0);
     BOOST_CHECK_EQUAL(ibdforensic::UnsolicitedReceiptCount(), (size_t)1);
     BOOST_CHECK_EQUAL(ibdforensic::EntryCount(), (size_t)3);
 }
@@ -214,7 +214,7 @@ BOOST_AUTO_TEST_CASE(records_cross_peer_and_same_peer_rerequest)
     // First request from peer 1; it times out.
     ibdforensic::RecordGetDataBatch(
         1, Hashes(std::vector<uint256>({hx})), 8000000, 0, uint256(0), 1000);
-    ibdforensic::RecordExpired(1, hx, 13000000);
+    ibdforensic::RecordExpired(1, hx, 13000000, 0);
 
     // Re-request from a different peer.
     ibdforensic::RecordGetDataBatch(
@@ -239,7 +239,7 @@ BOOST_AUTO_TEST_CASE(records_cross_peer_and_same_peer_rerequest)
     // another peer.
     ibdforensic::RecordGetDataBatch(
         1, Hashes(std::vector<uint256>({hy})), 16000000, 0, uint256(0), 1000);
-    ibdforensic::RecordExpired(1, hy, 21000000);
+    ibdforensic::RecordExpired(1, hy, 21000000, 0);
     ibdforensic::RecordGetDataBatch(
         1, Hashes(std::vector<uint256>({hy})), 22000000, 0, uint256(0), 1000);
     const ibdforensic::BatchEntry& eSame =
@@ -298,16 +298,16 @@ BOOST_AUTO_TEST_CASE(summary_reports_position_latency_tail_and_hashcontinue)
         5, vGetData, mark, 2048, h3, 1000); // truncated batch, continuation = h3
 
     // Clean arrivals with growing latency toward the tail.
-    ibdforensic::RecordReceived(5, h0, mark + 10000);
-    ibdforensic::RecordReceived(5, h1, mark + 20000);
-    ibdforensic::RecordReceived(5, h2, mark + 30000);
+    ibdforensic::RecordReceived(5, h0, mark + 10000, 0);
+    ibdforensic::RecordReceived(5, h1, mark + 20000, 0);
+    ibdforensic::RecordReceived(5, h2, mark + 30000, 0);
 
     // Tail block times out, is re-requested to another peer, then the
     // already-in-transit original arrives after the timeout.
-    ibdforensic::RecordExpired(5, h3, mark + 60000);
+    ibdforensic::RecordExpired(5, h3, mark + 60000, 0);
     ibdforensic::RecordGetDataBatch(
         6, Hashes(std::vector<uint256>({h3})), mark + 61000, 0, uint256(0), 1000);
-    ibdforensic::RecordReceived(5, h3, mark + 65000);
+    ibdforensic::RecordReceived(5, h3, mark + 65000, 0);
 
     const std::string s = ibdforensic::FormatSummary();
     BOOST_CHECK(s.find("batches=2") != std::string::npos);

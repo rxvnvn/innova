@@ -54,6 +54,24 @@
 
 namespace ibdforensic {
 
+// One request/ownership lifecycle of a single block hash: from MarkBlockInFlight
+// (generation start) to ownership release (generation end).  A hash may have
+// several generations when it is released (e.g. by a timeout) and requested
+// again.  The sequence is stored per hash in open order.
+struct GenerationRecord
+{
+    uint64_t genId;         // unique within the process, increasing
+    int peer;               // requesting peer that opened the generation
+    int64_t markUs;         // generation start (MarkBlockInFlight)
+    int64_t releaseUs;      // generation end (0 = still active)
+    std::string reason;     // receive|timeout|queue-removal|clear|disconnect
+
+    GenerationRecord()
+        : genId(0), peer(-1), markUs(0), releaseUs(0)
+    {
+    }
+};
+
 struct BatchEntry
 {
     uint256 hash;
@@ -61,7 +79,9 @@ struct BatchEntry
     uint32_t seq;              // block-relative ordinal inside that batch
     bool wasHashContinue;      // hash == peer continuation marker at send time
     int64_t markTimeUs;        // getdata push time (when in flight marked)
-    int64_t recvTimeUs;        // block message received (0 = never)
+    int64_t recvTimeUs;        // block dispatch time (0 = never)
+    int64_t recvFramingCompleteUs; // wall-clock when the block message finished
+                                  // framing (ReceiveMsgBytes complete; 0 = never)
     int64_t timeoutTimeUs;     // in-flight request expired (0 = never)
     bool receivedAfterTimeout; // receipt happened after the timeout fired
     bool reRequested;          // hash marked in flight again after release
@@ -69,12 +89,20 @@ struct BatchEntry
     int reRequestPeer;         // peer of the first re-request (-1 = none)
     int64_t reRequestTimeUs;   // time of the first re-request (0 = none)
     int requestPeer;           // peer this batch was requested from
+    int64_t progressLastUs;    // requesting peer's last genuine receive at the
+                               // moment this entry's generation was released
+                               // (0 = peer never delivered before release)
+    int64_t headAgeAtExpiryUs; // age of the oldest in-flight hash of the peer at
+                               // the moment this entry expired (0 = never expired)
+    uint64_t genIdAtReceipt;   // generation that delivered the receipt (0 = none)
 
     BatchEntry()
         : batchId(0), seq(0), wasHashContinue(false), markTimeUs(0),
-          recvTimeUs(0), timeoutTimeUs(0), receivedAfterTimeout(false),
-          reRequested(false), reRequestedOtherPeer(false), reRequestPeer(-1),
-          reRequestTimeUs(0), requestPeer(-1)
+          recvTimeUs(0), recvFramingCompleteUs(0), timeoutTimeUs(0),
+          receivedAfterTimeout(false), reRequested(false),
+          reRequestedOtherPeer(false), reRequestPeer(-1), reRequestTimeUs(0),
+          requestPeer(-1), progressLastUs(0), headAgeAtExpiryUs(0),
+          genIdAtReceipt(0)
     {
     }
 };
@@ -83,13 +111,16 @@ struct BatchRecord
 {
     int peer;
     uint64_t batchId;
-    int64_t sendTimeUs;        // getdata push time
+    int64_t sendTimeUs;        // getdata push time (enqueue)
     size_t sendBufferBytes;    // peer send buffer size at push time
     uint32_t nHashes;          // number of block hashes in the getdata message
     std::vector<uint256> hashes; // block hashes in wire order
+    int64_t firstSocketSendUs; // first successful send() of the getdata (0 = n/a)
+    size_t nsendFirstSend;     // peer nSendSize at that first send (0 = n/a)
 
     BatchRecord()
-        : peer(-1), batchId(0), sendTimeUs(0), sendBufferBytes(0), nHashes(0)
+        : peer(-1), batchId(0), sendTimeUs(0), sendBufferBytes(0), nHashes(0),
+          firstSocketSendUs(0), nsendFirstSend(0)
     {
     }
 };
@@ -133,11 +164,45 @@ void RecordGetDataBatch(int peer, const std::vector<uint256>& vBlockHashes,
                         const uint256& hashLastBlockInBatch,
                         int nExpectedBatchSize);
 
-// A block message arrived (called on the block receive path).
-void RecordReceived(int peer, const uint256& hash, int64_t nNowUs);
+// A block message arrived (called on the block receive path).  nDispatchUs is
+// the wall-clock time the message handler processed the block
+// (GetTimeMicros()); nFramingCompleteUs is the wall-clock time the message
+// finished framing inside ReceiveMsgBytes (the peer's CNetMessage::nTime).  The
+// delta is the message-handler dispatch backlog.  A receipt also closes the
+// active generation for the hash as "receive" (falling back to the generation
+// whose [mark, release] window contains the dispatch time, then to the most
+// recent closed generation) and records genuine delivery progress for the
+// peer.
+void RecordReceived(int peer, const uint256& hash, int64_t nDispatchUs,
+                    int64_t nFramingCompleteUs);
 
-// An in-flight request expired (called from ExpireBlockInFlight).
-void RecordExpired(int peer, const uint256& hash, int64_t nNowUs);
+// A block request generation started: the hash was admitted to in-flight for
+// this peer (called from CNode::MarkBlockInFlight).  Idempotent per hash: a new
+// generation is opened only when no generation is still active, which mirrors
+// the in-flight admission gate.
+void RecordGenerationStart(int peer, const uint256& hash, int64_t nNowUs);
+
+// A block request generation ended: ownership of the hash was released for the
+// reason given (receive|timeout|queue-removal|clear|disconnect).  Called from
+// the release chokepoints (ReleaseBlockRequestOwner,
+// ReleaseBlockRequestOwnerOnReceive, ReleaseBlockRequestOwnersForPeer).  Closes
+// the active generation for the hash; a no-op when none is active.
+void RecordGenerationEnd(const uint256& hash, int64_t nNowUs,
+                         const char* pszReason);
+
+// A getdata (or other) message made its first successful send() call.
+// RecordSocketSend stamps the oldest not-yet-stamped getdata batch: batches are
+// recorded and their getdata messages enqueued in the same FIFO order, so the
+// first "getdata" first-send corresponds to the oldest un-stamped batch.
+// Non-getdata commands are ignored by the batch stamping but may be recorded by
+// a second, server-side instrumented node.
+void RecordSocketSend(const char* pszCommand, int64_t nNowUs,
+                      size_t nSendSizeAtFirstSend);
+
+// An in-flight request expired (called from ExpireBlockInFlight).  nHeadAgeUs
+// is the age of the oldest in-flight hash of the peer at the moment of expiry.
+void RecordExpired(int peer, const uint256& hash, int64_t nNowUs,
+                   int64_t nHeadAgeUs);
 
 // getblocks RATE_LIMIT / no-response events.
 void CountGetBlocksRateLimitInbound();
@@ -160,6 +225,7 @@ bool Dump();
 size_t BatchCount();
 size_t EntryCount();
 size_t UnsolicitedReceiptCount();
+size_t GenerationCount();
 GetBlocksRateCounters RateCounters();
 const std::vector<BatchRecord>& BatchesForTesting();
 const std::map<uint256, BatchEntry>& EntriesForTesting();

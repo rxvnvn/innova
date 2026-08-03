@@ -821,6 +821,24 @@ private:
     uint64_t nRequestSequence;
 };
 
+// Parallel metadata for one entry of CNode::vSendMsg.  The two deques are
+// pushed together in EndMessage (under cs_vSend) and erased together in
+// SocketSendData, so they stay exactly aligned: vSendMeta[i] describes
+// vSendMsg[i].  This exists only for observation (getdata first-send
+// attribution); it never changes what or when bytes are written.
+struct SendMessageMeta
+{
+    std::string command;         // p2p command of the message
+    int64_t firstSendUs;         // wall-clock of the first successful send() (0 = pending)
+    size_t nSendSizeAtFirstSend; // peer nSendSize at that first send (0 = pending)
+    bool fStampPending;          // true until the first byte of this message is written
+
+    SendMessageMeta()
+        : firstSendUs(0), nSendSizeAtFirstSend(0), fStampPending(true)
+    {
+    }
+};
+
 /** Information about a peer */
 class CNode
 {
@@ -833,6 +851,7 @@ public:
     size_t nSendSize; // total size of all vSendMsg entries
     size_t nSendOffset; // offset inside the first vSendMsg already sent
     std::deque<CSerializeData> vSendMsg;
+    std::deque<SendMessageMeta> vSendMeta; // parallel to vSendMsg (cs_vSend)
     CCriticalSection cs_vSend;
     CCriticalSection cs_vRecv;
 	std::deque<CInv> vRecvGetData;
@@ -1480,6 +1499,8 @@ public:
         std::deque<CSerializeData>::iterator it = vSendMsg.insert(vSendMsg.end(), CSerializeData());
         ssSend.GetAndClear(*it);
         nSendSize += (*it).size();
+        vSendMeta.push_back(SendMessageMeta());
+        vSendMeta.back().command = strMessageCommand;
 
         // If write queue empty, attempt "optimistic write"
         if (it == vSendMsg.begin())
@@ -1738,8 +1759,24 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                 ibdmetrics::GlobalActiveAdd(
                     -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
                 RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
+                // Head age = age of the oldest in-flight hash at the moment
+                // this hash expires (the expiring hash is still in the set).
+                // O(n) per expiry and only computed when forensic is enabled.
+                int64_t nHeadAgeUs = 0;
+                if (ibdforensic::IsEnabled())
+                {
+                    int64_t nEarliestMark = INT64_MAX;
+                    for (std::map<uint256, int64_t>::const_iterator mi =
+                             mapBlockInFlightSince.begin();
+                         mi != mapBlockInFlightSince.end(); ++mi)
+                        if (mi->second < nEarliestMark)
+                            nEarliestMark = mi->second;
+                    if (nEarliestMark != INT64_MAX)
+                        nHeadAgeUs =
+                            (nNow - nEarliestMark) * 1000000LL;
+                }
                 ibdforensic::RecordExpired(
-                    GetId(), hashExpired, GetTimeMicros());
+                    GetId(), hashExpired, GetTimeMicros(), nHeadAgeUs);
                 it = mapBlockInFlightSince.erase(it);
                 ReleaseBlockRequestOwner(hashExpired, GetId(), "timeout");
                 EraseAlreadyAskedForIfUnowned(
@@ -1763,6 +1800,8 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         ExpireBlockInFlight();
         if (setBlocksInFlight.insert(hashBlock).second)
         {
+            ibdforensic::RecordGenerationStart(
+                GetId(), hashBlock, GetTimeMicros());
             ibdmetrics::InflightAdd(1);
             ibdmetrics::GlobalActiveAdd(1);
         }

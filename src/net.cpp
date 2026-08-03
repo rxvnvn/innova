@@ -2179,6 +2179,7 @@ bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
                                       BlockRequestOwnerStateName(it->second.state),
                                       pszReason);
     mapBlockRequestOwners.erase(it);
+    ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), pszReason);
     if (g_frontierHash == hash && g_frontierPeer == peer)
         FrontierTraceClearLocked("release");
     return true;
@@ -2196,6 +2197,7 @@ bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer)
                                       BlockRequestOwnerStateName(it->second.state),
                                       "receive");
     mapBlockRequestOwners.erase(it);
+    ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), "receive");
     if (g_frontierHash == hash)
         FrontierTraceClearLocked("receive");
     return true;
@@ -2213,11 +2215,13 @@ size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason)
             ++it;
             continue;
         }
+        const uint256 hash = it->first;
         if (BlockRequestTraceEnabled())
-            BlockRequestTraceOwnerRelease(it->first, peer,
+            BlockRequestTraceOwnerRelease(hash, peer,
                                           BlockRequestOwnerStateName(it->second.state),
                                           pszReason);
         it = mapBlockRequestOwners.erase(it);
+        ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), pszReason);
         ++nReleased;
     }
     if (g_frontierPeer == peer)
@@ -5827,6 +5831,7 @@ int CNetMessage::readData(const char *pch, unsigned int nBytes)
 void SocketSendData(CNode *pnode)
 {
     std::deque<CSerializeData>::iterator it = pnode->vSendMsg.begin();
+    std::deque<SendMessageMeta>::iterator mit = pnode->vSendMeta.begin();
 
     while (it != pnode->vSendMsg.end()) {
         const CSerializeData &data = *it;
@@ -5841,6 +5846,17 @@ void SocketSendData(CNode *pnode)
         if (nBytes > 0) {
             pnode->nLastSend = GetTime();
             pnode->nSendOffset += nBytes;
+            // Observation only: stamp the first byte actually written for this
+            // message.  The meta deque is parallel to vSendMsg, so the iterator
+            // stays in lockstep with `it`; stamps happen exactly once per
+            // message because fStampPending flips on the first write.
+            if (mit != pnode->vSendMeta.end() && mit->fStampPending) {
+                mit->fStampPending = false;
+                mit->firstSendUs = GetTimeMicros();
+                mit->nSendSizeAtFirstSend = pnode->nSendSize;
+                ibdforensic::RecordSocketSend(
+                    mit->command.c_str(), GetTimeMicros(), pnode->nSendSize);
+            }
 
             pnode->nSendBytes += nBytes;
             pnode->RecordBytesSent(nBytes);
@@ -5849,6 +5865,8 @@ void SocketSendData(CNode *pnode)
                 pnode->nSendOffset = 0;
                 pnode->nSendSize -= data.size();
                 it++;
+                if (mit != pnode->vSendMeta.end())
+                    ++mit;
             } else {
                 // could not send full message; stop sending more
                 break;
@@ -5889,6 +5907,14 @@ void SocketSendData(CNode *pnode)
         }
     }
     pnode->vSendMsg.erase(pnode->vSendMsg.begin(), it);
+    // Keep the parallel meta deque exactly aligned with vSendMsg: when every
+    // message was sent (it == end) drop all meta, otherwise drop the same
+    // prefix that vSendMsg just dropped.
+    if (mit == pnode->vSendMeta.end()) {
+        pnode->vSendMeta.clear();
+    } else if (!pnode->vSendMeta.empty()) {
+        pnode->vSendMeta.erase(pnode->vSendMeta.begin(), mit);
+    }
 }
 
 static list<CNode*> vNodesDisconnected;

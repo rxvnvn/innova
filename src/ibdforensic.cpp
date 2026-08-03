@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <deque>
 
 #include "sync.h"
 #include "util.h"
@@ -35,8 +36,31 @@ CCriticalSection g_mutex;
 std::vector<BatchRecord> g_batches;
 std::map<uint256, BatchEntry> g_entries;
 uint64_t g_nextBatchId = 0;
+uint64_t g_nextGenId = 0;
 uint64_t g_unsolicitedReceipts = 0;
 GetBlocksRateCounters g_rate;
+
+// Per-hash generation ledger.  Kept separate from g_entries because a
+// generation opens in MarkBlockInFlight, which for the trailing getdata batch
+// (and the headers-direct path) runs before RecordGetDataBatch creates the
+// canonical BatchEntry.  A hash may have several generations in open order.
+struct HashGenerations
+{
+    std::vector<GenerationRecord> gens;
+};
+
+std::map<uint256, HashGenerations> g_generations;
+
+// Per-peer genuine delivery progress: peer -> wall-clock framing-complete time
+// of its most recent requested block receipt.  Read-only observation state; the
+// scheduler does not consult it (it becomes the input to experiment A later).
+std::map<int, int64_t> g_peerLastReceiveUs;
+
+// Batch ids recorded by RecordGetDataBatch but not yet stamped with a first
+// socket send.  Both this queue and the peer's getdata send queue are FIFO and
+// were produced in the same order, so the oldest un-stamped batch corresponds
+// to the first "getdata" message that actually starts sending.
+std::deque<uint64_t> g_unstampedBatches;
 
 int SeqBucket(uint32_t nHashes, uint32_t seq)
 {
@@ -55,6 +79,82 @@ int SeqBucket(uint32_t nHashes, uint32_t seq)
 bool HasContinuationMarker(int nExpectedBatchSize)
 {
     return nExpectedBatchSize >= 1000;
+}
+
+// All helpers below require g_mutex.  g_generations maps hash -> generations;
+// an entry is always looked up via the map's operator[] so a generation can be
+// opened before the canonical BatchEntry exists.
+
+// Close the active generation for *hash* as *pszReason* and return its gen id
+// (0 when none is active).
+uint64_t CloseActiveGenerationLocked(const uint256& hash, int64_t nNowUs,
+                                     const char* pszReason)
+{
+    std::vector<GenerationRecord>& gens = g_generations[hash].gens;
+    if (gens.empty())
+        return 0;
+    GenerationRecord& last = gens.back();
+    if (last.releaseUs != 0)
+        return 0;
+    last.releaseUs = nNowUs;
+    last.reason = pszReason;
+    return last.genId;
+}
+
+// The generation that delivered a receipt at *nDispatchUs*: the closed
+// generation whose [mark, release] window contains the dispatch time, else the
+// most recent generation.  Deterministic: iterated newest-to-oldest so the
+// window closest to the receipt wins; an always-active ledger falls back to the
+// most recent generation.
+uint64_t GenerationAtOrAfterLocked(const std::vector<GenerationRecord>& gens,
+                                   int64_t nDispatchUs)
+{
+    if (gens.empty())
+        return 0;
+    for (size_t i = gens.size(); i-- > 0;)
+    {
+        const GenerationRecord& g = gens[i];
+        if (g.releaseUs != 0 && g.markUs <= nDispatchUs &&
+            nDispatchUs <= g.releaseUs)
+            return g.genId;
+    }
+    return gens.back().genId;
+}
+
+// The mark time of the generation that delivered the receipt (see
+// genIdAtReceipt), falling back to the canonical mark when no generation is
+// attributed (legacy dumps / hashes recorded before the ledger existed).
+int64_t DeliveringMarkUsLocked(const BatchEntry& e)
+{
+    if (e.genIdAtReceipt == 0)
+        return e.markTimeUs;
+    std::map<uint256, HashGenerations>::const_iterator gi =
+        g_generations.find(e.hash);
+    if (gi == g_generations.end())
+        return e.markTimeUs;
+    const std::vector<GenerationRecord>& gens = gi->second.gens;
+    for (size_t i = 0; i < gens.size(); ++i)
+        if (gens[i].genId == e.genIdAtReceipt)
+            return gens[i].markUs;
+    return e.markTimeUs;
+}
+
+// The generation shown on a legacy per-hash row: the delivering generation when
+// known, else the most recent generation for the hash.
+const GenerationRecord* LegacyRowGenerationLocked(const BatchEntry& e)
+{
+    std::map<uint256, HashGenerations>::const_iterator gi =
+        g_generations.find(e.hash);
+    if (gi == g_generations.end() || gi->second.gens.empty())
+        return NULL;
+    const std::vector<GenerationRecord>& gens = gi->second.gens;
+    if (e.genIdAtReceipt != 0)
+    {
+        for (size_t i = 0; i < gens.size(); ++i)
+            if (gens[i].genId == e.genIdAtReceipt)
+                return &gens[i];
+    }
+    return &gens.back();
 }
 
 } // namespace
@@ -101,6 +201,9 @@ void ResetForTesting()
     g_unsolicitedReceipts = 0;
     g_rate = GetBlocksRateCounters();
     g_nextBatchId = 0;
+    g_nextGenId = 0;
+    g_peerLastReceiveUs.clear();
+    g_unstampedBatches.clear();
     g_path.clear();
     g_enabled = true;
 }
@@ -125,6 +228,13 @@ void RecordGetDataBatch(int peer, const std::vector<uint256>& vBlockHashes,
     rec.sendBufferBytes = nSendBufferBytes;
     rec.nHashes = (uint32_t)vBlockHashes.size();
     rec.hashes = vBlockHashes;
+    rec.firstSocketSendUs = 0;
+    rec.nsendFirstSend = 0;
+
+    // The getdata message that carries this batch is enqueued right after this
+    // call (PushMessage), in the same FIFO order as every other batch.  The
+    // first "getdata" first-send stamps the oldest un-stamped batch.
+    g_unstampedBatches.push_back(rec.batchId);
 
     for (uint32_t seq = 0; seq < rec.nHashes; ++seq)
     {
@@ -163,7 +273,8 @@ void RecordGetDataBatch(int peer, const std::vector<uint256>& vBlockHashes,
     g_batches.push_back(rec);
 }
 
-void RecordReceived(int peer, const uint256& hash, int64_t nNowUs)
+void RecordReceived(int peer, const uint256& hash, int64_t nDispatchUs,
+                    int64_t nFramingCompleteUs)
 {
     if (!g_enabled)
         return;
@@ -177,12 +288,111 @@ void RecordReceived(int peer, const uint256& hash, int64_t nNowUs)
     BatchEntry& e = it->second;
     if (e.recvTimeUs != 0)
         return;
-    e.recvTimeUs = nNowUs;
-    if (e.timeoutTimeUs != 0 && nNowUs >= e.timeoutTimeUs)
+    e.recvTimeUs = nDispatchUs;
+    e.recvFramingCompleteUs = nFramingCompleteUs;
+    if (e.timeoutTimeUs != 0 && nDispatchUs >= e.timeoutTimeUs)
         e.receivedAfterTimeout = true;
+
+    // Delivery progress for the peer, measured before this receipt so it stays
+    // "last genuine receive strictly before this release".
+    std::map<int, int64_t>::const_iterator pi =
+        g_peerLastReceiveUs.find(peer);
+    const int64_t nProgressBefore =
+        pi != g_peerLastReceiveUs.end() ? pi->second : 0;
+
+    // Receipt attribution: close the active generation as "receive"; otherwise
+    // use the generation whose [mark, release] window contains the dispatch
+    // time, else the most recent generation.
+    const uint64_t genId = CloseActiveGenerationLocked(hash, nDispatchUs,
+                                                       "receive");
+    if (genId != 0)
+    {
+        e.genIdAtReceipt = genId;
+        e.progressLastUs = nProgressBefore;
+    }
+    else
+    {
+        std::map<uint256, HashGenerations>::const_iterator gi =
+            g_generations.find(hash);
+        if (gi != g_generations.end())
+            e.genIdAtReceipt =
+                GenerationAtOrAfterLocked(gi->second.gens, nDispatchUs);
+    }
+
+    g_peerLastReceiveUs[peer] = nFramingCompleteUs;
 }
 
-void RecordExpired(int peer, const uint256& hash, int64_t nNowUs)
+void RecordGenerationStart(int peer, const uint256& hash, int64_t nNowUs)
+{
+    if (!g_enabled)
+        return;
+    LOCK(g_mutex);
+    std::vector<GenerationRecord>& gens = g_generations[hash].gens;
+    // The in-flight admission gate already prevents a second MarkBlockInFlight
+    // while the hash is in flight; this guard keeps the ledger consistent even
+    // if a caller bypasses it.
+    if (!gens.empty() && gens.back().releaseUs == 0)
+        return;
+    GenerationRecord g;
+    g.genId = ++g_nextGenId;
+    g.peer = peer;
+    g.markUs = nNowUs;
+    g.releaseUs = 0;
+    gens.push_back(g);
+}
+
+void RecordGenerationEnd(const uint256& hash, int64_t nNowUs,
+                         const char* pszReason)
+{
+    if (!g_enabled)
+        return;
+    LOCK(g_mutex);
+    std::map<uint256, HashGenerations>::iterator gi = g_generations.find(hash);
+    if (gi == g_generations.end())
+        return;
+    std::vector<GenerationRecord>& gens = gi->second.gens;
+    if (gens.empty())
+        return;
+    GenerationRecord& last = gens.back();
+    if (last.releaseUs != 0)
+        return; // idempotent: a hash can be released by more than one path
+    last.releaseUs = nNowUs;
+    last.reason = pszReason;
+
+    // Snapshot the requesting peer's genuine progress at release (excludes any
+    // receipt that closes this same generation, which is recorded afterwards on
+    // the receive path).
+    std::map<int, int64_t>::const_iterator pi =
+        g_peerLastReceiveUs.find(last.peer);
+    if (pi != g_peerLastReceiveUs.end())
+    {
+        std::map<uint256, BatchEntry>::iterator ei = g_entries.find(hash);
+        if (ei != g_entries.end())
+            ei->second.progressLastUs = pi->second;
+    }
+}
+
+void RecordSocketSend(const char* pszCommand, int64_t nNowUs,
+                      size_t nSendSizeAtFirstSend)
+{
+    if (!g_enabled)
+        return;
+    if (pszCommand == NULL || strcmp(pszCommand, "getdata") != 0)
+        return;
+    LOCK(g_mutex);
+    if (g_unstampedBatches.empty())
+        return;
+    const uint64_t batchId = g_unstampedBatches.front();
+    g_unstampedBatches.pop_front();
+    if (batchId >= g_batches.size())
+        return; // FIFO invariant violated; leave the batch unstamped
+    BatchRecord& b = g_batches[batchId];
+    b.firstSocketSendUs = nNowUs;
+    b.nsendFirstSend = nSendSizeAtFirstSend;
+}
+
+void RecordExpired(int peer, const uint256& hash, int64_t nNowUs,
+                   int64_t nHeadAgeUs)
 {
     if (!g_enabled)
         return;
@@ -192,7 +402,10 @@ void RecordExpired(int peer, const uint256& hash, int64_t nNowUs)
         return;
     BatchEntry& e = it->second;
     if (e.timeoutTimeUs == 0)
+    {
         e.timeoutTimeUs = nNowUs;
+        e.headAgeAtExpiryUs = nHeadAgeUs;
+    }
 }
 
 void CountGetBlocksRateLimitInbound()
@@ -259,6 +472,11 @@ std::string FormatSummary()
     uint64_t nBatchesWithHashContinue = 0;
     uint64_t nBatchesWithHashContinueTimedOut = 0;
 
+    uint64_t nGenerationsTotal = 0;
+    uint64_t nGenerationsActive = 0;
+    uint64_t nGenReasons[5] = {0, 0, 0, 0, 0};
+    // index: 0 receive, 1 timeout, 2 queue-removal, 3 clear, 4 disconnect
+
     {
         LOCK(g_mutex);
 
@@ -283,8 +501,11 @@ std::string FormatSummary()
             if (e.recvTimeUs != 0 && e.timeoutTimeUs == 0)
             {
                 // Clean arrival: no timeout involved, useful for latency-by-
-                // position analysis.
-                const int64_t lat = e.recvTimeUs - e.markTimeUs;
+                // position analysis.  Latency is measured against the mark of
+                // the generation that delivered the block (so a re-requested
+                // hash is charged to its delivering request, not the first).
+                const int64_t lat =
+                    e.recvTimeUs - DeliveringMarkUsLocked(e);
                 ++nClean;
                 ++buckets[idx].count;
                 buckets[idx].sumUs += lat;
@@ -338,6 +559,33 @@ std::string FormatSummary()
                 }
             }
         }
+
+        for (std::map<uint256, HashGenerations>::const_iterator gi =
+                 g_generations.begin();
+             gi != g_generations.end(); ++gi)
+        {
+            const std::vector<GenerationRecord>& gens = gi->second.gens;
+            nGenerationsTotal += (uint64_t)gens.size();
+            for (size_t i = 0; i < gens.size(); ++i)
+            {
+                const GenerationRecord& g = gens[i];
+                if (g.releaseUs == 0)
+                {
+                    ++nGenerationsActive;
+                    continue;
+                }
+                if (g.reason == "receive")
+                    ++nGenReasons[0];
+                else if (g.reason == "timeout")
+                    ++nGenReasons[1];
+                else if (g.reason == "queue-removal")
+                    ++nGenReasons[2];
+                else if (g.reason == "clear")
+                    ++nGenReasons[3];
+                else if (g.reason == "disconnect")
+                    ++nGenReasons[4];
+            }
+        }
     }
 
     // Real least-squares slope (computed over clean arrivals only, using
@@ -356,7 +604,7 @@ std::string FormatSummary()
             {
                 const long double x = (long double)e.seq;
                 const long double y =
-                    (long double)(e.recvTimeUs - e.markTimeUs);
+                    (long double)(e.recvTimeUs - DeliveringMarkUsLocked(e));
                 sx += x;
                 sy += y;
                 sxx += x * x;
@@ -418,6 +666,20 @@ std::string FormatSummary()
              "timeouts_total=%llu never_received_total=%llu\n",
              (unsigned long long)nTimeouts,
              (unsigned long long)nNeverReceived);
+    out += buf;
+
+    snprintf(buf, sizeof(buf),
+             "generations_total=%llu generations_active=%llu "
+             "closed_receive=%llu closed_timeout=%llu "
+             "closed_queue_removal=%llu closed_clear=%llu "
+             "closed_disconnect=%llu\n",
+             (unsigned long long)nGenerationsTotal,
+             (unsigned long long)nGenerationsActive,
+             (unsigned long long)nGenReasons[0],
+             (unsigned long long)nGenReasons[1],
+             (unsigned long long)nGenReasons[2],
+             (unsigned long long)nGenReasons[3],
+             (unsigned long long)nGenReasons[4]);
     out += buf;
 
     snprintf(buf, sizeof(buf),
@@ -489,7 +751,11 @@ bool Dump()
             "mark_time_us,recv_time_us,timeout_time_us,"
             "received_after_timeout,rerequested,"
             "rerequested_other_peer,rerequest_peer,"
-            "rerequest_time_us,send_buffer_bytes\n");
+            "rerequest_time_us,send_buffer_bytes,generation_id,"
+            "generation_mark_us,generation_release_us,"
+            "generation_release_reason,enqueue_time_us,"
+            "first_socket_send_us,nsend_first_send,progress_last_us,"
+            "head_age_at_expiry_us,recv_framing_complete_us\n");
     {
         LOCK(g_mutex);
         for (std::map<uint256, BatchEntry>::const_iterator it =
@@ -497,21 +763,61 @@ bool Dump()
              it != g_entries.end(); ++it)
         {
             const BatchEntry& e = it->second;
+            const GenerationRecord* pg = LegacyRowGenerationLocked(e);
+            const uint64_t nGenId = pg != NULL ? pg->genId : 0;
+            const int64_t nGenMark = pg != NULL ? pg->markUs : 0;
+            const int64_t nGenRelease = pg != NULL ? pg->releaseUs : 0;
+            const char* pszGenReason = pg != NULL ? pg->reason.c_str() : "";
+            const BatchRecord* pb = e.batchId < g_batches.size()
+                                        ? &g_batches[e.batchId]
+                                        : NULL;
             fprintf(f, "%d,%llu,%u,%u,%s,%d,%lld,%lld,%lld,%d,%d,%d,%d,"
-                       "%lld,%zu\n",
+                       "%lld,%zu,%llu,%lld,%lld,%s,%lld,%lld,%zu,%lld,%lld,"
+                       "%lld\n",
                     e.requestPeer, (unsigned long long)e.batchId, e.seq,
-                    e.batchId < g_batches.size()
-                        ? g_batches[e.batchId].nHashes
-                        : 0,
+                    pb != NULL ? pb->nHashes : 0,
                     e.hash.ToString().c_str(), e.wasHashContinue ? 1 : 0,
                     (long long)e.markTimeUs, (long long)e.recvTimeUs,
                     (long long)e.timeoutTimeUs,
                     e.receivedAfterTimeout ? 1 : 0, e.reRequested ? 1 : 0,
                     e.reRequestedOtherPeer ? 1 : 0, e.reRequestPeer,
                     (long long)e.reRequestTimeUs,
-                    e.batchId < g_batches.size()
-                        ? g_batches[e.batchId].sendBufferBytes
-                        : (size_t)0);
+                    pb != NULL ? pb->sendBufferBytes : (size_t)0,
+                    (unsigned long long)nGenId, (long long)nGenMark,
+                    (long long)nGenRelease, pszGenReason,
+                    pb != NULL ? (long long)pb->sendTimeUs : (long long)0,
+                    pb != NULL ? (long long)pb->firstSocketSendUs : (long long)0,
+                    pb != NULL ? pb->nsendFirstSend : (size_t)0,
+                    (long long)e.progressLastUs,
+                    (long long)e.headAgeAtExpiryUs,
+                    (long long)e.recvFramingCompleteUs);
+        }
+    }
+
+    fprintf(f, "#generations\n");
+    fprintf(f,
+            "# generation_id,batch_id,hash,peer,mark_us,release_us,reason\n");
+    {
+        LOCK(g_mutex);
+        for (std::map<uint256, HashGenerations>::const_iterator gi =
+                 g_generations.begin();
+             gi != g_generations.end(); ++gi)
+        {
+            const std::vector<GenerationRecord>& gens = gi->second.gens;
+            std::map<uint256, BatchEntry>::const_iterator ei =
+                g_entries.find(gi->first);
+            const uint64_t nBatchId =
+                ei != g_entries.end() ? ei->second.batchId : 0;
+            for (size_t i = 0; i < gens.size(); ++i)
+            {
+                const GenerationRecord& g = gens[i];
+                fprintf(f, "%llu,%llu,%s,%d,%lld,%lld,%s\n",
+                        (unsigned long long)g.genId,
+                        (unsigned long long)nBatchId,
+                        gi->first.ToString().c_str(), g.peer,
+                        (long long)g.markUs, (long long)g.releaseUs,
+                        g.reason.c_str());
+            }
         }
     }
 
@@ -536,6 +842,17 @@ size_t BatchCount()
 {
     LOCK(g_mutex);
     return g_batches.size();
+}
+
+size_t GenerationCount()
+{
+    LOCK(g_mutex);
+    size_t n = 0;
+    for (std::map<uint256, HashGenerations>::const_iterator gi =
+             g_generations.begin();
+         gi != g_generations.end(); ++gi)
+        n += gi->second.gens.size();
+    return n;
 }
 
 size_t EntryCount()
