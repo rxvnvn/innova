@@ -229,6 +229,9 @@ size_t GenerationCount();
 GetBlocksRateCounters RateCounters();
 const std::vector<BatchRecord>& BatchesForTesting();
 const std::map<uint256, BatchEntry>& EntriesForTesting();
+// Flattened copy of the generation ledger: hash -> generations in open order
+// (snapshot semantics; safe to hold after the call returns).
+std::map<uint256, std::vector<GenerationRecord> > GenerationsForTesting();
 
 } // namespace ibdforensic
 

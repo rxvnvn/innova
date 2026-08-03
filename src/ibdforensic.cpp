@@ -204,6 +204,7 @@ void ResetForTesting()
     g_nextGenId = 0;
     g_peerLastReceiveUs.clear();
     g_unstampedBatches.clear();
+    g_generations.clear();
     g_path.clear();
     g_enabled = true;
 }
@@ -883,6 +884,20 @@ const std::map<uint256, BatchEntry>& EntriesForTesting()
 {
     LOCK(g_mutex);
     return g_entries;
+}
+
+// Flattened copy of the generation ledger for tests: hash -> generations in
+// open order.  A snapshot, not a reference, so it stays valid after the lock
+// is released.
+std::map<uint256, std::vector<GenerationRecord> > GenerationsForTesting()
+{
+    LOCK(g_mutex);
+    std::map<uint256, std::vector<GenerationRecord> > out;
+    for (std::map<uint256, HashGenerations>::const_iterator gi =
+             g_generations.begin();
+         gi != g_generations.end(); ++gi)
+        out[gi->first] = gi->second.gens;
+    return out;
 }
 
 } // namespace ibdforensic

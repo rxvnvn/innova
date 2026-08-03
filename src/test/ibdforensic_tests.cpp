@@ -839,7 +839,80 @@ BOOST_AUTO_TEST_CASE(disabled_forensic_accumulates_nothing)
     BOOST_CHECK_EQUAL(ibdforensic::BatchCount(), (size_t)0);
     BOOST_CHECK_EQUAL(ibdforensic::EntryCount(), (size_t)0);
     BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)0);
+    BOOST_CHECK(ibdforensic::GenerationsForTesting().empty());
     BOOST_CHECK_EQUAL(ibdforensic::UnsolicitedReceiptCount(), (size_t)0);
+
+    ibdforensic::ResetForTesting();
+}
+
+// Test isolation: ResetForTesting must clear the generation ledger along with
+// every other container, so each case starts from zero no matter what state a
+// previous case left behind (this is what makes the whole suite order-
+// independent).  The ledger snapshot is printed before the reset so a failure
+// shows exactly which generation leaked.
+BOOST_AUTO_TEST_CASE(reset_for_testing_clears_generation_ledger)
+{
+    ibdforensic::ResetForTesting();
+
+    const uint256 ha = TestHash(120);
+    const uint256 hb = TestHash(121);
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({ha, hb})), 1000000, 0, uint256(0), 1000);
+    ibdforensic::RecordGenerationStart(1, ha, 1000000);
+    ibdforensic::RecordGenerationEnd(ha, 2000000, "timeout");
+    ibdforensic::RecordGenerationStart(2, ha, 3000000); // left active
+    ibdforensic::RecordGenerationStart(1, hb, 4000000);
+    ibdforensic::RecordGenerationEnd(hb, 5000000, "receive");
+    ibdforensic::RecordReceived(1, ha, 9000000, 8900000);
+    ibdforensic::RecordExpired(1, hb, 6000000, 2000000);
+    ibdforensic::CountGetBlocksRateLimitInbound();
+
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)3);
+    BOOST_CHECK_EQUAL(ibdforensic::BatchCount(), (size_t)1);
+    BOOST_CHECK_EQUAL(ibdforensic::EntryCount(), (size_t)2);
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationsForTesting().size(), (size_t)2);
+
+    BOOST_TEST_MESSAGE("ledger before ResetForTesting:");
+    const std::map<uint256, std::vector<ibdforensic::GenerationRecord> > gens =
+        ibdforensic::GenerationsForTesting();
+    for (std::map<uint256, std::vector<ibdforensic::GenerationRecord> >::const_iterator
+             gi = gens.begin();
+         gi != gens.end(); ++gi)
+        for (size_t i = 0; i < gi->second.size(); ++i)
+            BOOST_TEST_MESSAGE(
+                "  hash=" << gi->first.ToString()
+                << " gen_id=" << gi->second[i].genId
+                << " peer=" << gi->second[i].peer
+                << (gi->second[i].releaseUs == 0 ? " active" : " closed")
+                << " mark_us=" << gi->second[i].markUs
+                << " release_us=" << gi->second[i].releaseUs
+                << " reason=" << gi->second[i].reason);
+
+    ibdforensic::ResetForTesting();
+
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)0);
+    BOOST_CHECK(ibdforensic::GenerationsForTesting().empty());
+    BOOST_CHECK_EQUAL(ibdforensic::BatchCount(), (size_t)0);
+    BOOST_CHECK_EQUAL(ibdforensic::EntryCount(), (size_t)0);
+    BOOST_CHECK_EQUAL(ibdforensic::UnsolicitedReceiptCount(), (size_t)0);
+    BOOST_CHECK_EQUAL(ibdforensic::RateCounters().inboundRateLimited,
+                      (uint64_t)0);
+
+    // A disabled operation sequence immediately after the reset creates
+    // nothing (no batches, no entries, no generations, no send stamps).
+    ibdforensic::SetEnabled(false, "");
+    const uint256 hc = TestHash(122);
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({hc})), 1000000, 0, uint256(0), 1000);
+    ibdforensic::RecordGenerationStart(1, hc, 1000000);
+    ibdforensic::RecordGenerationEnd(hc, 2000000, "receive");
+    ibdforensic::RecordSocketSend("getdata", 3000000, 4096);
+    ibdforensic::RecordExpired(1, hc, 4000000, 3000000);
+    ibdforensic::RecordReceived(1, hc, 5000000, 4900000);
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)0);
+    BOOST_CHECK(ibdforensic::GenerationsForTesting().empty());
+    BOOST_CHECK_EQUAL(ibdforensic::BatchCount(), (size_t)0);
+    BOOST_CHECK_EQUAL(ibdforensic::EntryCount(), (size_t)0);
 
     ibdforensic::ResetForTesting();
 }
