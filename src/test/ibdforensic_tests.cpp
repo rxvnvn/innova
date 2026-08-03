@@ -21,7 +21,12 @@
 #include <string>
 #include <vector>
 
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+
 #include "../ibdforensic.h"
+#include "../net.h"
 #include "../uint256.h"
 #include "../util.h"
 
@@ -459,6 +464,382 @@ BOOST_AUTO_TEST_CASE(unwritable_dump_path_is_reported_and_data_survives)
         uint256(0), 1000);
     BOOST_CHECK_EQUAL(ibdforensic::BatchCount(), (size_t)1);
     BOOST_CHECK_EQUAL(ibdforensic::EntryCount(), (size_t)1);
+
+    ibdforensic::ResetForTesting();
+}
+
+// A generation opens in MarkBlockInFlight (RecordGenerationStart), is closed
+// by an ownership release (RecordGenerationEnd) with its reason, and is
+// idempotent on both ends.  The summary histogram reflects the reasons.
+BOOST_AUTO_TEST_CASE(generation_lifecycle_open_close_and_idempotency)
+{
+    ibdforensic::ResetForTesting();
+
+    const uint256 h = TestHash(50);
+    ibdforensic::RecordGenerationStart(3, h, 1000000);
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)1);
+
+    // Double start while a generation is active must not open a second one
+    // (mirrors the in-flight admission gate).
+    ibdforensic::RecordGenerationStart(3, h, 1000100);
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)1);
+
+    ibdforensic::RecordGenerationEnd(h, 2000000, "timeout");
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)1);
+
+    // Double close (multiple release chokepoints can fire) keeps the first.
+    ibdforensic::RecordGenerationEnd(h, 2100000, "timeout");
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)1);
+
+    // A release is the precondition for a new generation (re-request).
+    ibdforensic::RecordGenerationStart(7, h, 2200000);
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)2);
+
+    const std::string s = ibdforensic::FormatSummary();
+    BOOST_CHECK(s.find("generations_total=2") != std::string::npos);
+    BOOST_CHECK(s.find("generations_active=1") != std::string::npos);
+    BOOST_CHECK(s.find("closed_timeout=1") != std::string::npos);
+    BOOST_CHECK(s.find("closed_receive=0") != std::string::npos);
+    BOOST_CHECK(s.find("closed_disconnect=0") != std::string::npos);
+}
+
+// RecordExpired stores the oldest-in-flight head age at expiry; the first
+// expiry wins and equal head ages (equal in-flight marks) are recorded
+// identically.
+BOOST_AUTO_TEST_CASE(record_expired_stores_head_age_and_keeps_first)
+{
+    ibdforensic::ResetForTesting();
+
+    const uint256 ha = TestHash(60);
+    const uint256 hb = TestHash(61);
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({ha, hb})), 5000000, 0, uint256(0), 1000);
+
+    ibdforensic::RecordExpired(1, ha, 13000000, 3000000);
+    const ibdforensic::BatchEntry& ea =
+        ibdforensic::EntriesForTesting().at(ha);
+    BOOST_CHECK_EQUAL(ea.timeoutTimeUs, (int64_t)13000000);
+    BOOST_CHECK_EQUAL(ea.headAgeAtExpiryUs, (int64_t)3000000);
+
+    // Duplicate expiry does not overwrite the head age (first expiry wins).
+    ibdforensic::RecordExpired(1, ha, 14000000, 9000000);
+    BOOST_CHECK_EQUAL(ibdforensic::EntriesForTesting().at(ha).headAgeAtExpiryUs,
+                      (int64_t)3000000);
+
+    // Equal marks (the tie ExpireBlockInFlight breaks by sorted hash order,
+    // which is deterministic by construction) yield identical head ages.
+    ibdforensic::RecordExpired(1, hb, 13000000, 3000000);
+    BOOST_CHECK_EQUAL(ibdforensic::EntriesForTesting().at(hb).headAgeAtExpiryUs,
+                      (int64_t)3000000);
+}
+
+// Receipt attribution picks the generation that delivered the block: the
+// active generation when the receipt closes one, else the closed generation
+// whose [mark, release] window contains the dispatch time, else the most
+// recent generation.
+BOOST_AUTO_TEST_CASE(receipt_attribution_delivering_generation)
+{
+    ibdforensic::ResetForTesting();
+
+    const uint256 hActive = TestHash(70);
+    const uint256 hWindow = TestHash(71);
+    const uint256 hRecent = TestHash(72);
+
+    // (a) Active generation is closed as "receive" and attributed.
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({hActive})), 900000, 0, uint256(0), 1000);
+    ibdforensic::RecordGenerationStart(1, hActive, 1000000);
+    ibdforensic::RecordReceived(1, hActive, 1500000, 1400000);
+    const ibdforensic::BatchEntry& eA =
+        ibdforensic::EntriesForTesting().at(hActive);
+    BOOST_CHECK_EQUAL(eA.recvTimeUs, (int64_t)1500000);
+    BOOST_CHECK_EQUAL(eA.recvFramingCompleteUs, (int64_t)1400000);
+    BOOST_CHECK_EQUAL(eA.genIdAtReceipt, (uint64_t)1);
+
+    // (b) Closed generation whose window contains the dispatch time wins.
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({hWindow})), 900000, 0, uint256(0), 1000);
+    ibdforensic::RecordGenerationStart(1, hWindow, 1000000);
+    ibdforensic::RecordGenerationEnd(hWindow, 2000000, "timeout");
+    ibdforensic::RecordReceived(1, hWindow, 1500000, 1400000);
+    BOOST_CHECK_EQUAL(
+        ibdforensic::EntriesForTesting().at(hWindow).genIdAtReceipt,
+        (uint64_t)2);
+
+    // (c) Dispatch outside every window falls back to the most recent gen.
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({hRecent})), 900000, 0, uint256(0), 1000);
+    ibdforensic::RecordGenerationStart(1, hRecent, 1000000);
+    ibdforensic::RecordGenerationEnd(hRecent, 2000000, "timeout");
+    ibdforensic::RecordReceived(1, hRecent, 3000000, 2900000);
+    BOOST_CHECK_EQUAL(
+        ibdforensic::EntriesForTesting().at(hRecent).genIdAtReceipt,
+        (uint64_t)3);
+}
+
+// The delayed-first-block scenario: the original peer's block arrives after a
+// cross-peer re-request already took over ownership.  The active (re-request)
+// generation is what the receive releases, so the ledger closes it as
+// "receive" deterministically; delivery progress stays keyed to the actual
+// sender (the original peer).
+BOOST_AUTO_TEST_CASE(late_original_peer_receipt_after_cross_peer_rerequest)
+{
+    ibdforensic::ResetForTesting();
+
+    const uint256 h = TestHash(80);
+    ibdforensic::RecordGetDataBatch(
+        5, Hashes(std::vector<uint256>({h})), 1000000, 0, uint256(0), 1000);
+    ibdforensic::RecordGenerationStart(5, h, 1000000);
+
+    // Original request times out; ownership released.
+    ibdforensic::RecordExpired(5, h, 6000000, 5000000);
+    ibdforensic::RecordGenerationEnd(h, 6000000, "timeout");
+
+    // Re-request to another peer opens a new (active) generation.
+    ibdforensic::RecordGetDataBatch(
+        7, Hashes(std::vector<uint256>({h})), 6100000, 0, uint256(0), 1000);
+    ibdforensic::RecordGenerationStart(7, h, 6100000);
+
+    // The already-in-transit original block arrives late from peer 5.
+    ibdforensic::RecordReceived(5, h, 6500000, 6400000);
+
+    const ibdforensic::BatchEntry& e =
+        ibdforensic::EntriesForTesting().at(h);
+    BOOST_CHECK(e.receivedAfterTimeout);
+    BOOST_CHECK_EQUAL(e.genIdAtReceipt, (uint64_t)2); // the re-request gen
+    BOOST_CHECK_EQUAL(e.reRequested, true);
+    BOOST_CHECK(e.reRequestedOtherPeer);
+    BOOST_CHECK_EQUAL(e.progressLastUs, (int64_t)0); // peer 5 never delivered before
+
+    const std::string s = ibdforensic::FormatSummary();
+    BOOST_CHECK(s.find("generations_total=2") != std::string::npos);
+    BOOST_CHECK(s.find("closed_timeout=1") != std::string::npos);
+    BOOST_CHECK(s.find("closed_receive=1") != std::string::npos);
+    BOOST_CHECK(s.find("generations_active=0") != std::string::npos);
+}
+
+// RecordSocketSend stamps the oldest un-stamped getdata batch (FIFO), ignores
+// non-getdata commands, and is a no-op when nothing is pending.
+BOOST_AUTO_TEST_CASE(record_socket_send_fifo_stamps_oldest_unstamped_batch)
+{
+    ibdforensic::ResetForTesting();
+
+    const uint256 h1 = TestHash(90);
+    const uint256 h2 = TestHash(91);
+    const uint256 h3 = TestHash(92);
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({h1})), 1000000, 512, uint256(0), 1000);
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({h2})), 2000000, 512, uint256(0), 1000);
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({h3})), 3000000, 512, uint256(0), 1000);
+
+    // First "getdata" first-send stamps the oldest batch.
+    ibdforensic::RecordSocketSend("getdata", 1100000, 4096);
+    BOOST_CHECK_EQUAL(ibdforensic::BatchesForTesting()[0].firstSocketSendUs,
+                      (int64_t)1100000);
+    BOOST_CHECK_EQUAL(ibdforensic::BatchesForTesting()[0].nsendFirstSend,
+                      (size_t)4096);
+
+    // A non-getdata first-send must not consume the queue.
+    ibdforensic::RecordSocketSend("version", 1200000, 8192);
+    BOOST_CHECK_EQUAL(ibdforensic::BatchesForTesting()[1].firstSocketSendUs,
+                      (int64_t)0);
+
+    // Next getdata first-send stamps the next batch.
+    ibdforensic::RecordSocketSend("getdata", 2100000, 1000);
+    BOOST_CHECK_EQUAL(ibdforensic::BatchesForTesting()[1].firstSocketSendUs,
+                      (int64_t)2100000);
+    ibdforensic::RecordSocketSend("getdata", 3100000, 2000);
+    BOOST_CHECK_EQUAL(ibdforensic::BatchesForTesting()[2].firstSocketSendUs,
+                      (int64_t)3100000);
+
+    // Queue exhausted: further first-sends are a no-op (no crash, no stamp).
+    ibdforensic::RecordSocketSend("getdata", 3200000, 3000);
+    BOOST_CHECK_EQUAL(ibdforensic::BatchesForTesting()[2].firstSocketSendUs,
+                      (int64_t)3100000);
+}
+
+// EndMessage pushes the parallel vSendMeta entry; the failure path (a send()
+// that errors immediately) must leave the two deques aligned and un-stamped.
+BOOST_AUTO_TEST_CASE(send_meta_alignment_on_failure_path)
+{
+    ibdforensic::ResetForTesting();
+
+    CAddress addr;
+    CNode n(INVALID_SOCKET, addr, "", true);
+
+    // Optimistic send fails (EBADF): the node is marked for disconnect but the
+    // message stays queued, so later pushes keep the deques in lockstep.
+    n.PushMessage("ping");
+    BOOST_CHECK(n.fDisconnect);
+    n.PushMessage("pong");
+    n.PushMessage("verack");
+
+    BOOST_CHECK_EQUAL(n.vSendMsg.size(), (size_t)3);
+    BOOST_CHECK_EQUAL(n.vSendMeta.size(), (size_t)3);
+    BOOST_CHECK_EQUAL(n.vSendMeta[0].command, "ping");
+    BOOST_CHECK_EQUAL(n.vSendMeta[1].command, "pong");
+    BOOST_CHECK_EQUAL(n.vSendMeta[2].command, "verack");
+    // No byte was ever written: every meta stays pending.
+    BOOST_CHECK(n.vSendMeta[0].fStampPending);
+    BOOST_CHECK(n.vSendMeta[1].fStampPending);
+    BOOST_CHECK(n.vSendMeta[2].fStampPending);
+    BOOST_CHECK(n.nSendSize > 0);
+
+    ibdforensic::ResetForTesting();
+}
+
+// Small messages are written entirely by the optimistic send in EndMessage:
+// both deques are erased together and nSendSize returns to zero.  A getdata
+// message first-sent this way stamps its recorded batch (FIFO end-to-end).
+BOOST_AUTO_TEST_CASE(send_meta_alignment_full_send_empties_both_and_stamps)
+{
+    ibdforensic::ResetForTesting();
+
+    int sv[2];
+    BOOST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    CAddress addr;
+    CNode n(INVALID_SOCKET, addr, "", true);
+    n.hSocket = sv[0];
+
+    // Three fully-sendable messages; each optimistic write completes, so the
+    // queue (and the parallel meta deque) is empty again each time.
+    n.PushMessage("ping");
+    BOOST_CHECK(n.vSendMsg.empty());
+    BOOST_CHECK(n.vSendMeta.empty());
+    n.PushMessage("pong");
+    BOOST_CHECK(n.vSendMsg.empty());
+    BOOST_CHECK(n.vSendMeta.empty());
+    BOOST_CHECK_EQUAL(n.nSendSize, (size_t)0);
+
+    // End-to-end getdata: a recorded batch is stamped by the getdata message's
+    // first successful send, even when that send completes immediately.
+    const uint256 h = TestHash(95);
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({h})), 1000000, 0, uint256(0), 1000);
+    std::vector<CInv> vInv;
+    vInv.push_back(CInv(MSG_BLOCK, h));
+    n.PushMessage("getdata", vInv);
+    BOOST_CHECK(n.vSendMsg.empty());
+    BOOST_CHECK(n.vSendMeta.empty());
+    BOOST_CHECK(ibdforensic::BatchesForTesting()[0].firstSocketSendUs > 0);
+    BOOST_CHECK(ibdforensic::BatchesForTesting()[0].nsendFirstSend > 0);
+
+    close(sv[1]);
+    ibdforensic::ResetForTesting();
+}
+
+// A message larger than the peer's receive buffer is only partially written:
+// the first send stamps its meta, the queue stays aligned, an EWOULDBLOCK
+// send leaves it aligned, and a mid-queue connection drop keeps it aligned.
+BOOST_AUTO_TEST_CASE(send_meta_alignment_partial_send_ewouldblock_and_disconnect)
+{
+    ibdforensic::ResetForTesting();
+
+    int sv[2];
+    BOOST_REQUIRE(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    // Fix a small receive buffer on the peer end so a 4 MiB message cannot
+    // complete in one send (disables autotuning; ~2x the requested value).
+    int nRcvBuf = 8192;
+    BOOST_REQUIRE(setsockopt(sv[1], SOL_SOCKET, SO_RCVBUF, &nRcvBuf,
+                             sizeof(nRcvBuf)) == 0);
+    CAddress addr;
+    CNode n(INVALID_SOCKET, addr, "", true);
+    n.hSocket = sv[0];
+
+    std::vector<unsigned char> big(4 * 1024 * 1024, 0xaa);
+    n.PushMessage("block", big);
+
+    // The optimistic write could only partially send: one message queued, its
+    // meta stamped on the first successful write.
+    BOOST_CHECK_EQUAL(n.vSendMsg.size(), (size_t)1);
+    BOOST_CHECK_EQUAL(n.vSendMeta.size(), (size_t)1);
+    BOOST_CHECK(!n.vSendMeta[0].fStampPending);
+    BOOST_CHECK(n.vSendMeta[0].firstSendUs > 0);
+    BOOST_CHECK(n.nSendOffset > 0);
+
+    // More messages queue without touching the send buffer (queue non-empty).
+    n.PushMessage("tx");
+    n.PushMessage("addr");
+    BOOST_CHECK_EQUAL(n.vSendMsg.size(), (size_t)3);
+    BOOST_CHECK_EQUAL(n.vSendMeta.size(), (size_t)3);
+    BOOST_CHECK(n.vSendMeta[1].fStampPending);
+    BOOST_CHECK(n.vSendMeta[2].fStampPending);
+
+    // The buffer is full: EWOULDBLOCK must not advance or misalign anything.
+    {
+        LOCK(n.cs_vSend);
+        SocketSendData(&n);
+    }
+    BOOST_CHECK_EQUAL(n.vSendMsg.size(), (size_t)3);
+    BOOST_CHECK_EQUAL(n.vSendMeta.size(), (size_t)3);
+    BOOST_CHECK(!n.fDisconnect);
+
+    // Close the peer: the next send fails (EPIPE) -> disconnect, and the two
+    // deques remain exactly aligned.
+    close(sv[1]);
+    {
+        LOCK(n.cs_vSend);
+        SocketSendData(&n);
+    }
+    BOOST_CHECK(n.fDisconnect);
+    BOOST_CHECK_EQUAL(n.vSendMsg.size(), (size_t)3);
+    BOOST_CHECK_EQUAL(n.vSendMeta.size(), (size_t)3);
+
+    ibdforensic::ResetForTesting();
+}
+
+// A generation-aware dump writes the additive legacy columns and the separate
+// #generations section, so both the legacy and the new-schema analyzers can
+// consume it.
+BOOST_AUTO_TEST_CASE(dump_contains_generation_section)
+{
+    ibdforensic::ResetForTesting();
+
+    const boost::filesystem::path p = TmpForensicPath("gens");
+    ibdforensic::SetEnabled(true, p.string());
+
+    const uint256 h = TestHash(100);
+    ibdforensic::RecordGetDataBatch(
+        1, Hashes(std::vector<uint256>({h})), 1000000, 0, uint256(0), 1000);
+    ibdforensic::RecordGenerationStart(1, h, 1000000);
+    ibdforensic::RecordExpired(1, h, 6000000, 5000000);
+    ibdforensic::RecordGenerationEnd(h, 6000000, "timeout");
+
+    BOOST_CHECK(ibdforensic::Dump());
+    const std::string contents = ReadFile(p);
+    BOOST_CHECK(contents.find("generation_id") != std::string::npos);
+    BOOST_CHECK(contents.find("head_age_at_expiry_us") != std::string::npos);
+    BOOST_CHECK(contents.find("recv_framing_complete_us") != std::string::npos);
+    BOOST_CHECK(contents.find("#generations") != std::string::npos);
+    BOOST_CHECK(contents.find("1,0,") != std::string::npos);
+    BOOST_CHECK(contents.find("timeout") != std::string::npos);
+
+    boost::filesystem::remove(p);
+    ibdforensic::ResetForTesting();
+}
+
+// Disabled recording is a hot-path no-op: every record function returns before
+// touching state, so nothing accumulates even when called.
+BOOST_AUTO_TEST_CASE(disabled_forensic_accumulates_nothing)
+{
+    ibdforensic::ResetForTesting();
+    ibdforensic::SetEnabled(false, "");
+
+    const uint256 h = TestHash(110);
+    std::vector<uint256> v = Hashes(std::vector<uint256>({h}));
+    ibdforensic::RecordGetDataBatch(1, v, 1000000, 0, uint256(0), 1000);
+    ibdforensic::RecordGenerationStart(1, h, 1000000);
+    ibdforensic::RecordGenerationEnd(h, 2000000, "receive");
+    ibdforensic::RecordSocketSend("getdata", 3000000, 4096);
+    ibdforensic::RecordExpired(1, h, 4000000, 3000000);
+    ibdforensic::RecordReceived(1, h, 5000000, 4900000);
+
+    BOOST_CHECK_EQUAL(ibdforensic::BatchCount(), (size_t)0);
+    BOOST_CHECK_EQUAL(ibdforensic::EntryCount(), (size_t)0);
+    BOOST_CHECK_EQUAL(ibdforensic::GenerationCount(), (size_t)0);
+    BOOST_CHECK_EQUAL(ibdforensic::UnsolicitedReceiptCount(), (size_t)0);
 
     ibdforensic::ResetForTesting();
 }
