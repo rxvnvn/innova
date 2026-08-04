@@ -168,20 +168,21 @@ BOOST_AUTO_TEST_CASE(incomplete_record_never_emits)
     ibdblocklatency::RecordGetDataSent(hash, 5);
     ibdblocklatency::RecordBlockReceived(hash, 6, 1024, /*nTimeReceivedUs=*/0, 0);
 
-    // No connect -> no sample and no fate row until a terminal is recorded.
-BOOST_CHECK_EQUAL(ibdblocklatency::SampleCountForTesting(), (size_t)0);
-    BOOST_CHECK_EQUAL(ibdblocklatency::FateSampleCountForTesting(), (size_t)0);
+    // No connect -> no sample, no outcome, no leak in the in-flight map.
+    BOOST_CHECK_EQUAL(ibdblocklatency::SampleCountForTesting(), (size_t)0);
     BOOST_CHECK_EQUAL(ibdblocklatency::ConnectedForTesting(), 0);
+    BOOST_CHECK_EQUAL(ibdblocklatency::OutcomeCountForTesting(ibdblocklatency::OUTCOME_INCOMPLETE_EVICTED), 0);
 
     ibdblocklatency::SetEnabled(false, "");
 }
 
-// A rejected request (T0..T3 reached, no connect) terminal as a fate row
-// with outcome=rejected and a TOTAL interval built from the terminal time.
-BOOST_AUTO_TEST_CASE(rejected_terminal_emits_fate_row)
+// A rejected request (T0..T3 reached, no connect) streams a fate row with
+// outcome=rejected and a TOTAL interval built from the terminal time.
+BOOST_AUTO_TEST_CASE(rejected_terminal_streams_fate_row)
 {
     ibdblocklatency::ResetForTesting();
-    ibdblocklatency::SetEnabled(true, "");
+    const boost::filesystem::path p = TmpCsvPath("reject");
+    ibdblocklatency::SetEnabled(true, p.string());
 
     const uint256 hash = TestHash(6);
     ibdblocklatency::RecordAskForEnqueue(hash, 9, 2);
@@ -191,21 +192,19 @@ BOOST_AUTO_TEST_CASE(rejected_terminal_emits_fate_row)
     ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
 
     BOOST_CHECK_EQUAL(ibdblocklatency::SampleCountForTesting(), (size_t)0);
-    BOOST_CHECK_EQUAL(ibdblocklatency::FateSampleCountForTesting(), (size_t)1);
     BOOST_CHECK_EQUAL(ibdblocklatency::OutcomeCountForTesting(ibdblocklatency::OUTCOME_REJECTED), 1);
 
-    const std::vector<ibdblocklatency::BlockLatencySample>& fate =
-        ibdblocklatency::FateSamplesForTesting();
-    BOOST_REQUIRE(fate.size() == 1);
-    BOOST_CHECK_EQUAL(fate[0].outcome, ibdblocklatency::OUTCOME_REJECTED);
-    BOOST_CHECK_EQUAL(fate[0].fOrphaned, 0);
-    BOOST_CHECK_EQUAL(fate[0].requestPeer, 9);
-    // T4..T7 never reached -> those intervals are unavailable.
-    BOOST_CHECK_EQUAL(fate[0].intervalUs[ibdblocklatency::BLOCKLAT_INTERVAL_PROCESS_TO_ACCEPT], (int64_t)-1);
-    // TOTAL reflects the terminal moment (T0 present).
-    BOOST_CHECK(fate[0].intervalUs[ibdblocklatency::BLOCKLAT_INTERVAL_TOTAL] >= 0);
+    // Row is streamed immediately: after flushing the stdio buffer the file
+    // contains the rejected fate row (requestPeer=9, receivePeer=9, height=-1,
+    // size 2048, 3000us -> 3ms ping).
+    ibdblocklatency::FlushCsvForTesting();
+    const std::string csv = ReadFile(p);
+    BOOST_CHECK(csv.find("9,9,-1,2048,3,") != std::string::npos);
+    BOOST_CHECK(csv.find(",rejected,0,") != std::string::npos);
+    BOOST_CHECK(csv.find("connected_active,") == std::string::npos);
 
     ibdblocklatency::SetEnabled(false, "");
+    boost::filesystem::remove(p);
 }
 
 // An orphaned block is not terminal: the record survives, is flagged, and a
@@ -225,7 +224,6 @@ BOOST_AUTO_TEST_CASE(orphaned_then_connected_is_flagged)
 
     // No terminal yet; the orphan stage is reflected as a counter.
     BOOST_CHECK_EQUAL(ibdblocklatency::OrphanedForTesting(), 1);
-    BOOST_CHECK_EQUAL(ibdblocklatency::FateSampleCountForTesting(), (size_t)0);
 
     // Parent arrives; the orphan is accepted and becomes the active tip.
     ibdblocklatency::RecordAcceptBlockBegin(hash);
@@ -245,12 +243,13 @@ BOOST_AUTO_TEST_CASE(orphaned_then_connected_is_flagged)
     ibdblocklatency::SetEnabled(false, "");
 }
 
-// An accepted-but-side-chain block terminates as accepted_side with its index
+// An accepted-but-side-chain block streams an accepted_side row with its index
 // height, never reaching the connected ring.
 BOOST_AUTO_TEST_CASE(accepted_side_terminal)
 {
     ibdblocklatency::ResetForTesting();
-    ibdblocklatency::SetEnabled(true, "");
+    const boost::filesystem::path p = TmpCsvPath("side");
+    ibdblocklatency::SetEnabled(true, p.string());
 
     const uint256 hash = TestHash(8);
     ibdblocklatency::RecordAskForEnqueue(hash, 17, 1);
@@ -262,44 +261,42 @@ BOOST_AUTO_TEST_CASE(accepted_side_terminal)
     ibdblocklatency::RecordBlockAcceptedSide(hash, 333);
 
     BOOST_CHECK_EQUAL(ibdblocklatency::SampleCountForTesting(), (size_t)0);
-    BOOST_CHECK_EQUAL(ibdblocklatency::FateSampleCountForTesting(), (size_t)1);
     BOOST_CHECK_EQUAL(ibdblocklatency::OutcomeCountForTesting(ibdblocklatency::OUTCOME_ACCEPTED_SIDE), 1);
-    const std::vector<ibdblocklatency::BlockLatencySample>& fate =
-        ibdblocklatency::FateSamplesForTesting();
-    BOOST_REQUIRE(fate.size() == 1);
-    BOOST_CHECK_EQUAL(fate[0].height, (int64_t)333);
-    BOOST_CHECK_EQUAL(fate[0].intervalUs[ibdblocklatency::BLOCKLAT_INTERVAL_INDEX_TO_BEST], (int64_t)-1);
+
+    ibdblocklatency::FlushCsvForTesting();
+    const std::string csv = ReadFile(p);
+    BOOST_CHECK(csv.find("17,17,333,256,1,") != std::string::npos);
+    BOOST_CHECK(csv.find(",accepted_side,0,") != std::string::npos);
 
     ibdblocklatency::SetEnabled(false, "");
+    boost::filesystem::remove(p);
 }
 
 // A timeout terminal for a request that was never delivered (only T0/T1 set)
-// produces a fate row with a TOTAL interval and -1 for everything after T1.
+// streams a row with a TOTAL interval and -1 for everything after T1.
 BOOST_AUTO_TEST_CASE(timeout_never_delivered)
 {
     ibdblocklatency::ResetForTesting();
-    ibdblocklatency::SetEnabled(true, "");
+    const boost::filesystem::path p = TmpCsvPath("timeout");
+    ibdblocklatency::SetEnabled(true, p.string());
 
     const uint256 hash = TestHash(9);
     ibdblocklatency::RecordAskForEnqueue(hash, 23, 4);
     ibdblocklatency::RecordGetDataSent(hash, 23);
     ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_TIMEOUT);
 
-    BOOST_CHECK_EQUAL(ibdblocklatency::FateSampleCountForTesting(), (size_t)1);
     BOOST_CHECK_EQUAL(ibdblocklatency::OutcomeCountForTesting(ibdblocklatency::OUTCOME_TIMEOUT), 1);
-    const std::vector<ibdblocklatency::BlockLatencySample>& fate =
-        ibdblocklatency::FateSamplesForTesting();
-    BOOST_REQUIRE(fate.size() == 1);
-    BOOST_CHECK_EQUAL(fate[0].receivePeer, -1);
-    BOOST_CHECK_EQUAL(fate[0].intervalUs[ibdblocklatency::BLOCKLAT_INTERVAL_GETDATA_TO_RECEIVE], (int64_t)-1);
-    BOOST_CHECK_EQUAL(fate[0].intervalUs[ibdblocklatency::BLOCKLAT_INTERVAL_RECEIVE_TO_PROCESS], (int64_t)-1);
-    BOOST_CHECK(fate[0].intervalUs[ibdblocklatency::BLOCKLAT_INTERVAL_TOTAL] >= 0);
 
+    ibdblocklatency::FlushCsvForTesting();
+    const std::string csv = ReadFile(p);
+    BOOST_CHECK(csv.find("23,-1,-1,0,-1,") != std::string::npos);
+    BOOST_CHECK(csv.find(",timeout,0,") != std::string::npos);
     ibdblocklatency::SetEnabled(false, "");
+    boost::filesystem::remove(p);
 }
 
-// The CSV dump writes a header and one row per completed sample, and the
-// summary always prints even with an empty CSV path.
+// The CSV streams rows as outcomes are recorded (header on open, connected
+// row on terminal) and the summary always prints even with an empty CSV path.
 BOOST_AUTO_TEST_CASE(csv_dump_contains_samples)
 {
     ibdblocklatency::ResetForTesting();

@@ -22,22 +22,25 @@ std::string g_csvPath;
 // Last IBD_BLOCKLAT_1S emission time (wall microseconds).
 int64_t g_lastEmitUs = 0;
 
-// Bounded rings of completed lifecycles plus lifetime cumulative totals.
-// g_samples holds connected-active samples only (the latency decomposition
-// source); g_fateSamples holds every other terminal outcome so the CSV can
-// distinguish the fate of requests that never reached T7.  Lifetime outcome
-// counters are exact and never bounded.
+// Streaming CSV: opened once in SetEnabled (AppInit2) with fully buffered
+// stdio, one row written per terminal outcome, no per-row fflush, closed at
+// Shutdown (Dump).  NULL when disabled or when no path was configured.  Only
+// ever accessed under cs.
+FILE* g_csvFile = NULL;
+static const size_t CSV_BUFFER_BYTES = 1 << 20;  // 1 MiB stdio buffer
+
+// Bounded in-memory state.  g_samples is the connected-active aggregation
+// window (fixed size, feeds IBD_BLOCKLAT_1S and the shutdown summary); it is
+// NOT the CSV source, so it imposes no row-count limit.  g_records holds only
+// incomplete (non-terminal) lifecycles.  Lifetime outcome counters and
+// interval totals are exact and never bounded.
 static const size_t SAMPLE_CAPACITY = 16384;
-static const size_t FATE_CAPACITY = 16384;
 static const size_t RECORD_CAPACITY = 16384;
 static const int64_t RECORD_STALE_US = 300 * 1000000;
 
 std::vector<BlockLatencySample> g_samples;   // reserve(SAMPLE_CAPACITY)
 size_t g_samplesUsed = 0;
 size_t g_samplesNext = 0;
-std::vector<BlockLatencySample> g_fateSamples;  // reserve(FATE_CAPACITY)
-size_t g_fateUsed = 0;
-size_t g_fateNext = 0;
 int64_t g_totalUs[BLOCKLAT_NUM_INTERVALS] = {0};
 int64_t g_totalCount[BLOCKLAT_NUM_INTERVALS] = {0};
 
@@ -148,6 +151,44 @@ BlockLatencySample SampleFromRecordLocked(const uint256& hash,
     return s;
 }
 
+// Stream one completed lifecycle to the buffered CSV.  Fully buffered stdio:
+// no fflush here, data lands on disk only when the 1 MiB buffer fills or the
+// file is closed at Shutdown.
+void WriteSampleRowLocked(FILE* f, const BlockLatencySample& s)
+{
+    fprintf(f, "%d,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%s,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%s\n",
+            s.requestPeer, s.receivePeer, (long long)s.height,
+            (long long)s.blockSize, (long long)s.pingMs,
+            (long long)s.requestPeerPressure,
+            (long long)s.globalInflight, (long long)s.globalQueued,
+            (long long)s.globalDeferred,
+            OutcomeName(s.outcome), s.fOrphaned,
+            (long long)s.intervalUs[0], (long long)s.intervalUs[1],
+            (long long)s.intervalUs[2], (long long)s.intervalUs[3],
+            (long long)s.intervalUs[4], (long long)s.intervalUs[5],
+            (long long)s.intervalUs[6], (long long)s.intervalUs[7],
+            s.hash.ToString().c_str());
+}
+
+void WriteRowLocked(const BlockLatencySample& s)
+{
+    if (g_csvFile == NULL)
+        return;
+    WriteSampleRowLocked(g_csvFile, s);
+}
+
+// Write the CSV header once, immediately after opening.
+void WriteCsvHeaderLocked(FILE* f)
+{
+    fprintf(f,
+            "#ibdblocklatency: per-block GETDATA->CONNECT decomposition\n"
+            "# request_peer,receive_peer,height,size,ping_ms,req_peer_pressure,"
+            "global_inflight,global_queued,global_deferred,outcome,orphaned,"
+            "askfor_to_getdata_us,getdata_to_recv_us,recv_to_process_us,"
+            "process_to_accept_us,accept_to_index_us,index_to_best_us,"
+            "best_to_connect_us,total_us,hash\n");
+}
+
 void PruneStaleLocked(int64_t nNow)
 {
     const int64_t nCutoff = nNow - RECORD_STALE_US;
@@ -162,8 +203,7 @@ void PruneStaleLocked(int64_t nNow)
             it = g_records.erase(it);
             const BlockLatencySample s = SampleFromRecordLocked(
                 hash, r, OUTCOME_INCOMPLETE_EVICTED, -1, nNow);
-            PushSampleLocked(g_fateSamples, g_fateUsed, g_fateNext,
-                             FATE_CAPACITY, s);
+            WriteRowLocked(s);
         }
         else
         {
@@ -216,11 +256,30 @@ IntervalAgg AggregateLocked(int nInterval)
 void SetEnabled(bool fEnabled, const std::string& strCsvPath)
 {
     LOCK(cs);
+    if (g_csvFile != NULL)
+    {
+        fclose(g_csvFile);
+        g_csvFile = NULL;
+    }
     g_enabled = fEnabled;
     g_csvPath = strCsvPath;
     if (fEnabled)
     {
         g_samples.reserve(SAMPLE_CAPACITY);
+        if (!strCsvPath.empty())
+        {
+            g_csvFile = fopen(strCsvPath.c_str(), "w");
+            if (g_csvFile == NULL)
+            {
+                fprintf(stderr, "ibdblocklatency: cannot open CSV '%s'\n",
+                        strCsvPath.c_str());
+            }
+            else
+            {
+                setvbuf(g_csvFile, NULL, _IOFBF, CSV_BUFFER_BYTES);
+                WriteCsvHeaderLocked(g_csvFile);
+            }
+        }
         g_lastEmitUs = 0;
     }
 }
@@ -233,13 +292,15 @@ bool Enabled()
 void ResetForTesting()
 {
     LOCK(cs);
+    if (g_csvFile != NULL)
+    {
+        fclose(g_csvFile);
+        g_csvFile = NULL;
+    }
     g_records.clear();
     g_samples.clear();
     g_samplesUsed = 0;
     g_samplesNext = 0;
-    g_fateSamples.clear();
-    g_fateUsed = 0;
-    g_fateNext = 0;
     for (int i = 0; i < BLOCKLAT_NUM_INTERVALS; ++i)
     {
         g_totalUs[i] = 0;
@@ -268,16 +329,11 @@ const std::vector<BlockLatencySample>& SamplesForTesting()
     return g_samples;
 }
 
-size_t FateSampleCountForTesting()
+void FlushCsvForTesting()
 {
     LOCK(cs);
-    return g_fateUsed;
-}
-
-const std::vector<BlockLatencySample>& FateSamplesForTesting()
-{
-    LOCK(cs);
-    return g_fateSamples;
+    if (g_csvFile != NULL)
+        fflush(g_csvFile);
 }
 
 int64_t ReceivedForTesting()
@@ -449,11 +505,11 @@ void RecordBlockConnected(const uint256& hash, int64_t nConnectedHeight)
     const BlockLatencySample s = SampleFromRecordLocked(
         hash, r, OUTCOME_CONNECTED_ACTIVE, nConnectedHeight, nNow);
     ++g_acceptedTotal;
+    WriteRowLocked(s);
     PushSampleLocked(g_samples, g_samplesUsed, g_samplesNext,
                      SAMPLE_CAPACITY, s);
     g_records.erase(it);
 }
-
 void RecordBlockOrphaned(const uint256& hash)
 {
     if (!g_enabled)
@@ -481,8 +537,7 @@ void RecordBlockAcceptedSide(const uint256& hash, int64_t nBlockHeight)
     g_records.erase(it);
     const BlockLatencySample s = SampleFromRecordLocked(
         hash, r, OUTCOME_ACCEPTED_SIDE, nBlockHeight, nNow);
-    PushSampleLocked(g_fateSamples, g_fateUsed, g_fateNext,
-                     FATE_CAPACITY, s);
+    WriteRowLocked(s);
 }
 
 void RecordBlockTerminal(const uint256& hash, int outcome, int64_t nHeight)
@@ -500,8 +555,7 @@ void RecordBlockTerminal(const uint256& hash, int outcome, int64_t nHeight)
     g_records.erase(it);
     const BlockLatencySample s = SampleFromRecordLocked(
         hash, r, outcome, nHeight, nNow);
-    PushSampleLocked(g_fateSamples, g_fateUsed, g_fateNext,
-                     FATE_CAPACITY, s);
+    WriteRowLocked(s);
 }
 
 const char* OutcomeName(int outcome)
@@ -590,20 +644,21 @@ void EmitIBDBlockLatency1s()
     PrintAggregateLineLocked();
 }
 
-static void WriteSampleRowLocked(FILE* f, const BlockLatencySample& s)
+static void WriteCsvFooterLocked(FILE* f)
 {
-    fprintf(f, "%d,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%s,%d,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%lld,%s\n",
-            s.requestPeer, s.receivePeer, (long long)s.height,
-            (long long)s.blockSize, (long long)s.pingMs,
-            (long long)s.requestPeerPressure,
-            (long long)s.globalInflight, (long long)s.globalQueued,
-            (long long)s.globalDeferred,
-            OutcomeName(s.outcome), s.fOrphaned,
-            (long long)s.intervalUs[0], (long long)s.intervalUs[1],
-            (long long)s.intervalUs[2], (long long)s.intervalUs[3],
-            (long long)s.intervalUs[4], (long long)s.intervalUs[5],
-            (long long)s.intervalUs[6], (long long)s.intervalUs[7],
-            s.hash.ToString().c_str());
+    fprintf(f, "# OUTCOME_SUMMARY connected_active=%lld accepted_side=%lld "
+               "already_have_duplicate=%lld orphaned=%lld rejected=%lld "
+               "timeout=%lld disconnect=%lld incomplete_evicted=%lld "
+               "unsolicited=%lld\n",
+            (long long)g_outcomeCount[OUTCOME_CONNECTED_ACTIVE],
+            (long long)g_outcomeCount[OUTCOME_ACCEPTED_SIDE],
+            (long long)g_outcomeCount[OUTCOME_ALREADY_HAVE],
+            (long long)g_orphanedTotal,
+            (long long)g_outcomeCount[OUTCOME_REJECTED],
+            (long long)g_outcomeCount[OUTCOME_TIMEOUT],
+            (long long)g_outcomeCount[OUTCOME_DISCONNECT],
+            (long long)g_outcomeCount[OUTCOME_INCOMPLETE_EVICTED],
+            (long long)g_receivedUnsolicited);
 }
 
 void Dump()
@@ -613,7 +668,9 @@ void Dump()
     LOCK(cs);
 
     // Reclaim any still-open records as incomplete_evicted so the CSV and
-    // summary account for every tracked lifecycle at shutdown.
+    // summary account for every tracked lifecycle at shutdown.  Rows stream
+    // to the open file; the footer is appended and the file closed (flushing
+    // the 1 MiB stdio buffer) below.
     const int64_t nNow = GetTimeMicros();
     for (std::map<uint256, LatencyRecord>::iterator it = g_records.begin();
          it != g_records.end();)
@@ -624,44 +681,15 @@ void Dump()
         it = g_records.erase(it);
         const BlockLatencySample s = SampleFromRecordLocked(
             hash, r, OUTCOME_INCOMPLETE_EVICTED, -1, nNow);
-        PushSampleLocked(g_fateSamples, g_fateUsed, g_fateNext,
-                         FATE_CAPACITY, s);
+        WriteRowLocked(s);
     }
 
-    if (!g_csvPath.empty())
+    if (g_csvFile != NULL)
     {
-        FILE* f = fopen(g_csvPath.c_str(), "w");
-        if (f != NULL)
-        {
-            fprintf(f,
-                    "#ibdblocklatency: per-block GETDATA->CONNECT decomposition\n"
-                    "# request_peer,receive_peer,height,size,ping_ms,req_peer_pressure,"
-                    "global_inflight,global_queued,global_deferred,outcome,orphaned,"
-                    "askfor_to_getdata_us,getdata_to_recv_us,recv_to_process_us,"
-                    "process_to_accept_us,accept_to_index_us,index_to_best_us,"
-                    "best_to_connect_us,total_us,hash\n");
-            for (size_t i = 0; i < g_samplesUsed; ++i)
-                WriteSampleRowLocked(f, g_samples[i]);
-            for (size_t i = 0; i < g_fateUsed; ++i)
-                WriteSampleRowLocked(f, g_fateSamples[i]);
-            fprintf(f, "# OUTCOME_SUMMARY connected_active=%lld accepted_side=%lld "
-                       "already_have_duplicate=%lld orphaned=%lld rejected=%lld "
-                       "timeout=%lld disconnect=%lld incomplete_evicted=%lld "
-                       "unsolicited=%lld\n",
-                    (long long)g_outcomeCount[OUTCOME_CONNECTED_ACTIVE],
-                    (long long)g_outcomeCount[OUTCOME_ACCEPTED_SIDE],
-                    (long long)g_outcomeCount[OUTCOME_ALREADY_HAVE],
-                    (long long)g_orphanedTotal,
-                    (long long)g_outcomeCount[OUTCOME_REJECTED],
-                    (long long)g_outcomeCount[OUTCOME_TIMEOUT],
-                    (long long)g_outcomeCount[OUTCOME_DISCONNECT],
-                    (long long)g_outcomeCount[OUTCOME_INCOMPLETE_EVICTED],
-                    (long long)g_receivedUnsolicited);
-            fclose(f);
-            printf("IBD_BLOCKLAT_DUMP wrote=%s connected_rows=%lld fate_rows=%lld\n",
-                   g_csvPath.c_str(), (long long)g_samplesUsed,
-                   (long long)g_fateUsed);
-        }
+        WriteCsvFooterLocked(g_csvFile);
+        fclose(g_csvFile);
+        g_csvFile = NULL;
+        printf("IBD_BLOCKLAT_DUMP wrote=%s\n", g_csvPath.c_str());
     }
 
     // Summary with lifetime outcome tallies, lifetime means and ring

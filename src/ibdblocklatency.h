@@ -30,17 +30,21 @@
 //   T7 block connected
 //
 // Intervals emitted: T1-T0, T2-T1, T3-T2, T4-T3, T5-T4, T6-T5, T7-T6, TOTAL.
-// Aggregated as mean/median/p95/max over a bounded ring of completed
-// samples, printed once per second (IBD_BLOCKLAT_1S) and optionally written
-// as a per-block CSV at shutdown (-ibdblocklatencycsv=<path>).
+// Aggregated as mean/median/p95/max over a bounded ring of connected-active
+// samples, printed once per second (IBD_BLOCKLAT_1S).  With
+// -ibdblocklatencycsv=<path> the CSV is opened once at Init with fully
+// buffered stdio (setvbuf, no per-row fflush) and each terminal row is
+// streamed immediately as its outcome is recorded, so no rows are ever
+// dropped; the file is flushed and closed at Shutdown.
 //
 // This module is instrumentation only: it changes no scheduling, ownership,
 // diversification, limits, sleeps, timeouts, or IBD behavior.  All hooks are
 // no-ops when disabled.
 //
-// Threading: every hook is called from the message-handler thread.  The
-// record map and ring are guarded by a leaf lock that is never held while any
-// other lock is acquired.
+// Threading: every hook is called from the message-handler thread (plus the
+// socket-handler thread for the timeout/disconnect terminal hooks).  The
+// record map and aggregation ring are guarded by a leaf lock that is never
+// held while any other lock is acquired.
 
 namespace ibdblocklatency {
 
@@ -101,8 +105,7 @@ bool Enabled();
 void ResetForTesting();
 size_t SampleCountForTesting();
 const std::vector<BlockLatencySample>& SamplesForTesting();
-size_t FateSampleCountForTesting();
-const std::vector<BlockLatencySample>& FateSamplesForTesting();
+void FlushCsvForTesting();
 int64_t ReceivedForTesting();
 int64_t UnsolicitedForTesting();
 int64_t ProcessedForTesting();
