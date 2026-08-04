@@ -488,7 +488,8 @@ TEST_OBJS= \
     obj/test/finality_tally_tests.o \
     obj/test/coincontrol_lock_tests.o \
     obj/test/fcmp_root_tests.o \
-    obj/test/ibdforensic_tests.o
+    obj/test/ibdforensic_tests.o \
+    obj/test/ibdblocklatency_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic release-check
 
@@ -515,6 +516,9 @@ check-fcmp: test_innova
 
 check-ibdforensic: test_innova
 	./test_innova --run_test=ibdforensic_tests
+
+check-ibdblocklatency: test_innova
+	./test_innova --run_test=ibdblocklatency_tests
 
 release-check: innova-build check-bpac check-finality-tally check-fcmp
 
