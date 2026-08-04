@@ -1868,6 +1868,54 @@ BOOST_AUTO_TEST_CASE(cooldown_map_per_peer_cap)
         nBase, NULL));
 }
 
+BOOST_AUTO_TEST_CASE(cooldown_expired_lookup_erases_without_alias_uaf)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(66), "cooldown-expired-lookup-a", true);
+    const CInv inv(MSG_BLOCK, uint256(3200));
+    const int64_t nBase = GetTimeMicros();
+    const int64_t nUntil = nBase + 5000;
+    const int64_t nLookup = nUntil + 1;
+
+    // A live, unexpired cooldown entry for this key.
+    RecordOrphanLimitRejectedBlock(peerA.GetId(), inv, nUntil, uint256(3199));
+    BOOST_CHECK(IsOrphanLimitRejectedBlockInCooldown(
+        peerA.GetId(), inv, nUntil - 1, NULL));
+
+    // Expired lookup must return false and erase every index for the key,
+    // without reading the freed block-map node (alias-before-erase UAF).
+    BOOST_CHECK(!IsOrphanLimitRejectedBlockInCooldown(
+        peerA.GetId(), inv, nLookup, NULL));
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCount(), 0U);
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCountForPeer(peerA.GetId()), 0U);
+
+    // Repeating the expired lookup stays stable: no leftover index entry and
+    // no corruption on re-entry.
+    BOOST_CHECK(!IsOrphanLimitRejectedBlockInCooldown(
+        peerA.GetId(), inv, nLookup, NULL));
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCount(), 0U);
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCountForPeer(peerA.GetId()), 0U);
+
+    // The expiry index must remain consistent: the same key can be recorded
+    // and looked up again afterwards.
+    const int64_t nFreshUntil = GetTimeMicros() + 60000;
+    RecordOrphanLimitRejectedBlock(peerA.GetId(), inv, nFreshUntil, uint256(3199));
+    BOOST_CHECK(IsOrphanLimitRejectedBlockInCooldown(
+        peerA.GetId(), inv, GetTimeMicros(), NULL));
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCountForPeer(peerA.GetId()), 1U);
+
+    // Flood up to the per-peer cap: exercises the expiry-index lower_bound
+    // eviction path, so a stale index node would desynchronise the counts.
+    for (size_t i = 0; i < MAX_ORPHAN_LIMIT_REJECTED_PER_PEER + 5; ++i)
+        RecordOrphanLimitRejectedBlock(
+            peerA.GetId(),
+            CInv(MSG_BLOCK, uint256(3300 + i)),
+            GetTimeMicros() + static_cast<int64_t>(i) * 1000,
+            uint256(3199));
+    BOOST_CHECK_EQUAL(GetOrphanLimitRejectedEntryCountForPeer(peerA.GetId()),
+                      MAX_ORPHAN_LIMIT_REJECTED_PER_PEER);
+}
+
 BOOST_AUTO_TEST_CASE(cooldown_map_global_cap)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;

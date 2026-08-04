@@ -2229,7 +2229,12 @@ static void OrphanLimitEvictPeerEarliestLocked(NodeId peer)
             std::make_pair(peer, std::numeric_limits<int64_t>::min()));
     if (itIndex == mapOrphanLimitRejectedByPeerExpiry.end())
         return;
-    OrphanLimitEraseLocked(itIndex->second, itIndex->first.second);
+    // OrphanLimitEraseLocked erases the expiry-index entry it is given, so
+    // the key must be copied before the call: itIndex->second aliases a node
+    // of mapOrphanLimitRejectedByPeerExpiry that is freed by that erase.
+    const std::pair<CInv, NodeId> key = itIndex->second;
+    const int64_t nUntil = itIndex->first.second;
+    OrphanLimitEraseLocked(key, nUntil);
 }
 
 // Requires LOCK(cs_mapAlreadyAskedFor).  Evicts the process-wide entry with
@@ -2661,7 +2666,11 @@ bool IsOrphanLimitRejectedBlockInCooldown(NodeId peer, const CInv& inv,
         return false;
     if (it->second.nUntilMicros <= nNowMicros)
     {
-        OrphanLimitEraseLocked(it->first, it->second.nUntilMicros);
+        // Copy before erase: it->first aliases the mapOrphanLimitRejectedBlocks
+        // node that OrphanLimitEraseLocked frees (see its first erase()).
+        const std::pair<CInv, NodeId> key = it->first;
+        const int64_t nUntil = it->second.nUntilMicros;
+        OrphanLimitEraseLocked(key, nUntil);
         return false;
     }
     if (nUntilMicros != NULL)
