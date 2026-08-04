@@ -20,6 +20,7 @@
 #include "ibdactivepath.h"
 #include "ibdblocklatency.h"
 #include "ibdforensic.h"
+#include "pinglifecycletrace.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -594,6 +595,7 @@ std::string HelpMessage()
         "  -ibdblocklatency=<0|1> " + _("Per-block GETDATA-to-CONNECT latency decomposition (IBD_BLOCKLAT_1S; default: 0)") + "\n" +
         "  -ibdblocklatencycsv=<file> " + _("Write the per-block IBD block-latency CSV dump at shutdown (default: empty = no CSV, summary only)") + "\n" +
         "  -ibdforensic=<0|1> " + _("Record per-getdata-batch block-request instrumentation (batch id, seq, mark/receive/timeout times, hashContinue, re-requests; default: 0)") + "\n" +
+        "  -pinglifecycletrace=<0|1> " + _("Trace ping/pong lifecycle (PING_LIFECYCLE, PING_LIFECYCLE_1S) to attribute pingtime/pingwait gaps; observation only, default: 0)") + "\n" +
         "  -ibdforensicpath=<file> " + _("Write the ibdforensic per-hash CSV dump and summary to this file at shutdown (default: empty = summary only)") + "\n" +
         "  -ibdactiveslowthresholdms=<n> " + _("Slow-phase threshold for IBD_SLOW_BLOCK events in milliseconds (default: 50)") + "\n" +
         "  -ibdmaxactiveperpeer=<n> " + _("Experimental IBD per-peer active request window; clamped to [1,512], zero/negative/non-numeric falls back to default (default: 128)") + "\n" +
@@ -985,6 +987,7 @@ bool AppInit2()
     ibdforensic::SetEnabled(
         GetBoolArg("-ibdforensic", false),
         GetArg("-ibdforensicpath", ""));
+    InitPingLifecycleTrace(GetBoolArg("-pinglifecycletrace", false));
 
     if (mapArgs.count("-timeout"))
     {

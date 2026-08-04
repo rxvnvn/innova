@@ -333,6 +333,7 @@ OBJS= \
     obj/ibdactivepath.o \
     obj/ibdblocklatency.o \
     obj/ibdforensic.o \
+    obj/pinglifecycletrace.o \
     obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \
@@ -413,6 +414,7 @@ OBJS= \
     obj/ibdactivepath.o \
     obj/ibdblocklatency.o \
     obj/ibdforensic.o \
+    obj/pinglifecycletrace.o \
     obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \
@@ -489,9 +491,10 @@ TEST_OBJS= \
     obj/test/coincontrol_lock_tests.o \
     obj/test/fcmp_root_tests.o \
     obj/test/ibdforensic_tests.o \
-    obj/test/ibdblocklatency_tests.o
+    obj/test/ibdblocklatency_tests.o \
+    obj/test/pinglifecycle_tests.o
 
-.PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic release-check
+.PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-pinglifecycle release-check
 
 INNOVA_SPINNER ?= 1
 INNOVA_SPINNER_SCRIPT ?= ../contrib/innova_build_spinner.sh
@@ -520,6 +523,9 @@ check-ibdforensic: test_innova
 check-ibdblocklatency: test_innova
 	./test_innova --run_test=ibdblocklatency_tests
 
+check-pinglifecycle: test_innova
+	./test_innova --run_test=pinglifecycle_tests
+
 release-check: innova-build check-bpac check-finality-tally check-fcmp
 
 #
@@ -540,6 +546,7 @@ endif
 
 # auto-generated dependencies:
 -include obj/*.P
+-include obj/test/*.P
 
 obj/build.h: FORCE
 	/bin/sh ../share/genbuild.sh obj/build.h

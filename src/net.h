@@ -21,6 +21,7 @@
 #include "addrman.h"
 #include "bloom.h"
 #include "blockrequesttrace.h"
+#include "pinglifecycletrace.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
 #include "ibdblocklatency.h"
@@ -1058,6 +1059,10 @@ public:
     int64_t nPingUsecTime;
     // Whether a ping is requested.
     bool fPingQueued;
+    // Observation only: time (usec) the current ping message was appended to
+    // vSendMsg (0 = none pending).  Used only by -pinglifecycletrace; it never
+    // affects scheduling, the timeout, or peer selection.
+    int64_t nPingQueuedUsec;
 
     uint64_t nInvCount;        // Count of inv items in current window
     int64_t nInvWindowStart;   // Start time of current rate limit window (seconds)
@@ -1123,6 +1128,7 @@ public:
         nPingUsecStart = 0;
         nPingUsecTime = 0;
         fPingQueued = false;
+        nPingQueuedUsec = 0;
         nInvCount = 0;
         nInvWindowStart = GetTime();
         fColLateralMaster = false;
@@ -1140,6 +1146,8 @@ public:
         Cleanup();
         if (BlockRequestTraceEnabled())
             BlockRequestTracePeerClosed(this);
+        if (PingLifecycleTraceEnabled())
+            PingLifecycleTracePeerClosed(this);
         RecoveryResponseResult recoveryResult;
         if (DisconnectRecoveryResponseWindow(GetTimeMicros(), recoveryResult) &&
             BlockRequestTraceEnabled())

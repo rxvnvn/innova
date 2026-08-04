@@ -18,6 +18,7 @@
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
 #include "ibdblocklatency.h"
+#include "pinglifecycletrace.h"
 #include "ibdforensic.h"
 #include "kernel.h"
 #include "collateral.h"
@@ -9805,6 +9806,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         size_t nAvail = vRecv.in_avail();
         bool bPingFinished = false;
         std::string sProblem;
+        int nPongResult = PONG_RESULT_UNSOLICITED;
 
         if (nAvail >= sizeof(nonce)) {
             vRecv >> nonce;
@@ -9814,6 +9816,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 if (nonce == pfrom->nPingNonceSent) {
                     // Matching pong received, this ping is no longer outstanding
                     bPingFinished = true;
+                    nPongResult = PONG_RESULT_MATCHED;
                     int64_t pingUsecTime = pingUsecEnd - pfrom->nPingUsecStart;
                     if (pingUsecTime > 0) {
                         // Successful ping time measurement, replace previous
@@ -9826,10 +9829,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 } else {
                     // Nonce mismatches are normal when pings are overlapping
                     sProblem = "Nonce mismatch";
+                    nPongResult = PONG_RESULT_WRONG_NONCE;
                     if (nonce == 0) {
                         // This is most likely a bug in another implementation somewhere, cancel this ping
                         bPingFinished = true;
                         sProblem = "Nonce zero";
+                        nPongResult = PONG_RESULT_NONCE_ZERO;
                     }
                 }
             } else {
@@ -9839,6 +9844,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             // This is most likely a bug in another implementation somewhere, cancel this ping
             bPingFinished = true;
             sProblem = "Short payload";
+            nPongResult = PONG_RESULT_SHORT_PAYLOAD;
         }
 
         if (!(sProblem.empty())) {
@@ -9850,6 +9856,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 , nonce
                 , nAvail);
         }
+        if (PingLifecycleTraceEnabled())
+            PingLifecycleTracePongResult(pfrom, nonce, nPongResult);
         if (bPingFinished) {
             pfrom->nPingNonceSent = 0;
         }
@@ -10144,6 +10152,8 @@ bool ProcessMessages(CNode* pfrom)
                     std::max<int64_t>(0, GetTimeMicros() - msg.nTime),
                     nCompleteWaiting);
             }
+            if (PingLifecycleTraceEnabled() && strCommand == "pong")
+                PingLifecycleTracePongProcessBegin(pfrom, msg.nTime);
             fRet = ProcessMessage(pfrom, strCommand, vRecv, msg.nTime);
             boost::this_thread::interruption_point();
         }
@@ -10218,8 +10228,14 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
         while (nonce == 0) {
             RAND_bytes((unsigned char*)&nonce, sizeof(nonce));
         }
+        if (PingLifecycleTraceEnabled()) {
+            if (pto->nPingNonceSent != 0)
+                PingLifecycleTraceReplaced(pto, pto->nPingNonceSent);
+            PingLifecycleTraceScheduled(pto, nonce);
+        }
         pto->fPingQueued = false;
         pto->nPingUsecStart = GetTimeMicros();
+        pto->nPingQueuedUsec = GetTimeMicros();
         if (pto->nVersion > BIP0031_VERSION) {
             pto->nPingNonceSent = nonce;
             pto->PushMessage("ping", nonce);
@@ -10227,6 +10243,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
             pto->nPingNonceSent = 0;
             pto->PushMessage("ping");
         }
+        if (PingLifecycleTraceEnabled())
+            PingLifecycleTraceQueuedSend(pto, nonce);
     }
 
 

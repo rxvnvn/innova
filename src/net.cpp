@@ -8,6 +8,7 @@
 #include "main.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "pinglifecycletrace.h"
 #include "ibdblocklatency.h"
 #include "ibdforensic.h"
 #include "init.h"
@@ -6002,8 +6003,11 @@ bool CNode::ReceiveMsgBytes(const char *pch, unsigned int nBytes)
         pch += handled;
         nBytes -= handled;
 
-        if (msg.complete())
+        if (msg.complete()) {
             msg.nTime = GetTimeMicros();
+            if (PingLifecycleTraceEnabled() && msg.hdr.GetCommand() == "pong")
+                PingLifecycleTracePongFrameComplete(this);
+        }
     }
 
     return true;
@@ -6092,12 +6096,17 @@ void SocketSendData(CNode *pnode)
                 mit->nSendSizeAtFirstSend = pnode->nSendSize;
                 ibdforensic::RecordSocketSend(
                     mit->command.c_str(), GetTimeMicros(), pnode->nSendSize);
+                if (PingLifecycleTraceEnabled() && mit->command == "ping")
+                    PingLifecycleTraceSocketWriteBegin(pnode);
             }
 
             pnode->nSendBytes += nBytes;
             pnode->RecordBytesSent(nBytes);
 
             if (pnode->nSendOffset == data.size()) {
+                if (PingLifecycleTraceEnabled() &&
+                    mit != pnode->vSendMeta.end() && mit->command == "ping")
+                    PingLifecycleTraceSocketWriteComplete(pnode);
                 pnode->nSendOffset = 0;
                 pnode->nSendSize -= data.size();
                 it++;
@@ -7674,6 +7683,7 @@ void ThreadMessageHandler2(void* parg)
 
         ibdactivepath::EmitIBDActive1s(vNodesCopy);
         ibdblocklatency::EmitIBDBlockLatency1s();
+        PingLifecycleTraceEmit1s(vNodesCopy);
 
         {
             LOCK(cs_vNodes);
