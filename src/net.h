@@ -23,6 +23,7 @@
 #include "blockrequesttrace.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "ibdblocklatency.h"
 #include "ibdforensic.h"
 
 class CRequestTracker;
@@ -1528,6 +1529,10 @@ public:
         AddAskForEntry(nRequestTime, inv);
         if (fBlockRequest)
             ibdactivepath::RecordBlockRequestEnqueued(inv.hash);
+        if (fBlockRequest)
+            ibdblocklatency::RecordAskForEnqueue(
+                inv.hash, GetId(),
+                peerLiveActivePressure.load(std::memory_order_relaxed));
         if (fBlockRequest)
             ibdmetrics::RecordZeroLatency(ibdmetrics::ZERO_LATENCY_ASKFOR);
         if (BlockRequestTraceEnabled() && inv.type == MSG_BLOCK)

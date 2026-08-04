@@ -17,6 +17,7 @@
 #include "ibdefficiency.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "ibdblocklatency.h"
 #include "ibdforensic.h"
 #include "kernel.h"
 #include "collateral.h"
@@ -6207,6 +6208,7 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
         ibdactivepath::GetCounters().setbestchain_count,
         "setbestchain", pindexNew->nHeight);
     uint256 hash = GetHash();
+    ibdblocklatency::RecordSetBestChainBegin(hash);
     const uint256 hashOldBest = hashBestChain;
     const int nOldBestHeight = nBestHeight;
     const bool fReorgPath = (hashPrevBlock != hashOldBest);
@@ -6369,6 +6371,8 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
         boost::thread t(runCommand, strCmd); // thread runs free
     }
 
+    ibdblocklatency::RecordBlockConnected(GetHash(), nBestHeight);
+
     return true;
 }
 
@@ -6458,6 +6462,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
 
     // Check for duplicate
     uint256 hash = GetHash();
+    ibdblocklatency::RecordAddToBlockIndexBegin(hash);
     if (mapBlockIndex.count(hash))
         return error("AddToBlockIndex() : %s already exists", hash.ToString().substr(0,20).c_str());
 
@@ -6641,8 +6646,11 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             if (pindexNew->IsProofOfStake())
                 setStakeSeen.erase(make_pair(pindexNew->prevoutStake, pindexNew->nStakeTime));
             delete pindexNew;
+            ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
             return false;
         }
+    else
+        ibdblocklatency::RecordBlockAcceptedSide(hash, pindexNew->nHeight);
 
     if (pindexNew == pindexBest)
     {
@@ -6801,6 +6809,7 @@ bool CBlock::AcceptBlock()
         printf("SYNC_EVENT time_us=%lld event=ACCEPT_BLOCK_BEGIN hash=%s local_height=%d\n",
                (long long)GetTimeMicros(),
                hash.ToString().c_str(), nBestHeight);
+    ibdblocklatency::RecordAcceptBlockBegin(hash);
     if (mapBlockIndex.count(hash))
         return error("AcceptBlock() : block already in mapBlockIndex");
 
@@ -7060,14 +7069,17 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                hash.ToString().c_str(),
                pfrom ? pfrom->GetId() : -1,
                nBestHeight);
+    ibdblocklatency::RecordProcessBlockBegin(hash);
     if (pfrom != NULL && pindexBest != NULL && pindexBest->GetBlockTime() < GetTime() - 300 && fDebug)
         printf("sync: ProcessBlock %s from %s (height %d)\n", hash.ToString().substr(0,20).c_str(), pfrom->addrName.c_str(), nBestHeight);
     if (mapBlockIndex.count(hash)) {
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_INDEXED);
+        ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_ALREADY_HAVE);
         return error("ProcessBlock() : already have block %d %s", mapBlockIndex[hash]->nHeight, hash.ToString().substr(0,20).c_str());
     }
     if (mapOrphanBlocks.count(hash)) {
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_ORPHAN);
+        ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_ALREADY_HAVE);
         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,20).c_str());
     }
 
@@ -7076,6 +7088,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     // Duplicate stake allowed only when there is orphan child block
     if (pblock->IsProofOfStake() && setStakeSeen.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash)) {
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_INDEXED_STAKE);
+        ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
         return error("ProcessBlock() : duplicate proof-of-stake (%s, %d) for block %s", pblock->GetProofOfStake().first.ToString().c_str(), pblock->GetProofOfStake().second, hash.ToString().c_str());
     }
 
@@ -7087,6 +7100,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             if (pfrom)
                 pfrom->Misbehaving(100);
             TraceProcessBlockReject(pfrom, pblock, PBREJECT_POS_AFTER_DAG);
+            ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
             return error("ProcessBlock() : proof-of-stake block after DAG fork");
         }
     }
@@ -7096,6 +7110,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     const char* pszCheckBlockReason = NULL;
     if (!pblock->CheckBlock(true, true, true, &pszCheckBlockReason)) {
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_CHECKBLOCK_FALSE, pszCheckBlockReason);
+        ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
         return error("ProcessBlock() : CheckBlock FAILED");
     }
     int64_t nCheckMs = GetTimeMillis() - nCheckStart;
@@ -7120,6 +7135,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                 pfrom->Misbehaving(100);
             std::string strWeakExtra = strprintf("block_trust=%s required_trust=%s checkpoint_height=%d checkpoint_hash=%s local_best_height=%d local_best_hash=%s", bnNewBlock.ToString().c_str(), bnRequired.ToString().c_str(), pcheckpoint ? pcheckpoint->nHeight : -1, pcheckpoint ? pcheckpoint->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(), pindexBest ? pindexBest->nHeight : -1, pindexBest ? pindexBest->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str());
             TraceProcessBlockReject(pfrom, pblock, PBREJECT_WEAK_CHECKPOINT, NULL, strWeakExtra);
+            ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
             return error("ProcessBlock() : block with too little %s", pblock->IsProofOfStake()? "proof-of-stake" : "proof-of-work");
         }
     }
@@ -7171,10 +7187,12 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 
                 if (IsInitialBlockDownload()) {
                     TraceProcessBlockReject(pfrom, pblock, PBREJECT_ORPHAN_LIMIT_IBD);
+                    ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
                     return error("ProcessBlock() : peer %d exceeded orphan limit (IBD, no penalty)", pfrom->GetId());
                 }
                 pfrom->Misbehaving(1);
                 TraceProcessBlockReject(pfrom, pblock, PBREJECT_ORPHAN_LIMIT_NORMAL);
+                ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
                 return error("ProcessBlock() : peer %d exceeded orphan limit", pfrom->GetId());
             }
         }
@@ -7186,6 +7204,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             // Duplicate stake allowed only when there is orphan child block
             if (setStakeSeenOrphan.count(pblock->GetProofOfStake()) && !mapOrphanBlocksByPrev.count(hash) && !Checkpoints::WantedByPendingSyncCheckpoint(hash)) {
                 TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_STAKE_ORPHAN);
+                ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
                 return error("ProcessBlock() : duplicate proof-of-stake (%s, %d) for orphan block %s", pblock->GetProofOfStake().first.ToString().c_str(), pblock->GetProofOfStake().second, hash.ToString().c_str());
             }
             else
@@ -7194,6 +7213,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         CBlock* pblock2 = new CBlock(*pblock);
         mapOrphanBlocks.insert(make_pair(hash, pblock2));
         mapOrphanBlocksByPrev.insert(make_pair(pblock2->hashPrevBlock, pblock2));
+        ibdblocklatency::RecordBlockOrphaned(hash);
 
         if (pfrom) {
             mapOrphanBlocksByNode[hash] = pfrom->GetId();
@@ -7240,6 +7260,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     int64_t nAcceptStart = GetTimeMillis();
     if (!pblock->AcceptBlock()) {
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_ACCEPTBLOCK_FALSE);
+        ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
         return error("ProcessBlock() : AcceptBlock FAILED");
     }
     int64_t nAcceptMs = GetTimeMillis() - nAcceptStart;
@@ -9366,6 +9387,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             pfrom->GetId(), hashBlock, GetTimeMicros(),
             nTimeReceived);
         ReleaseBlockRequestOwnerOnReceive(hashBlock, pfrom->GetId());
+        ibdblocklatency::RecordBlockReceived(
+            hashBlock, pfrom->GetId(), (int64_t)nBlockPayloadBytes,
+            nTimeReceived, pfrom->nPingUsecTime);
 
         CSyncLockDiagnostics blockLockDiagnostics(
             "ProcessMessage(block)", "cs_main");
@@ -10621,6 +10645,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                     ++nIBDPassSent;
                     pto->MarkBlockInFlight(inv.hash);
                     ibdactivepath::RecordBlockRequestSent(inv.hash);
+                    ibdblocklatency::RecordGetDataSent(inv.hash, pto->GetId());
                     if (fTraceBlockRequest)
                         BlockRequestTraceInFlightMark(pto, inv.hash, true);
                 }

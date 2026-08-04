@@ -18,6 +18,7 @@
 #include "checkpoints.h"
 #include "ibdefficiency.h"
 #include "ibdactivepath.h"
+#include "ibdblocklatency.h"
 #include "ibdforensic.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
@@ -152,6 +153,7 @@ void Shutdown(void* parg)
 
         FlushIBDBatch();
         IBDEfficiencyShutdownSummary();
+        ibdblocklatency::Dump();
         ibdforensic::Dump();
 
         if(idns) {
@@ -589,6 +591,8 @@ std::string HelpMessage()
         "  -continuitybreakms=<n> " + _("Min no-connect gap (ms) before the one-shot FIRST_CONTINUITY_BREAK event fires (requires -blockrequesttrace, default: 60000)") + "\n" +
         "  -ibdefficiencytrace=<0|1> " + _("Trace IBD block efficiency counters (default: 0)") + "\n" +
         "  -ibdactivepathtrace=<0|1> " + _("Trace IBD active-path throughput (IBD_ACTIVE_1S, IBD_SLOW_BLOCK, IBD_STATE_TRACE; default: 0)") + "\n" +
+        "  -ibdblocklatency=<0|1> " + _("Per-block GETDATA-to-CONNECT latency decomposition (IBD_BLOCKLAT_1S; default: 0)") + "\n" +
+        "  -ibdblocklatencycsv=<file> " + _("Write the per-block IBD block-latency CSV dump at shutdown (default: empty = no CSV, summary only)") + "\n" +
         "  -ibdforensic=<0|1> " + _("Record per-getdata-batch block-request instrumentation (batch id, seq, mark/receive/timeout times, hashContinue, re-requests; default: 0)") + "\n" +
         "  -ibdforensicpath=<file> " + _("Write the ibdforensic per-hash CSV dump and summary to this file at shutdown (default: empty = summary only)") + "\n" +
         "  -ibdactiveslowthresholdms=<n> " + _("Slow-phase threshold for IBD_SLOW_BLOCK events in milliseconds (default: 50)") + "\n" +
@@ -975,6 +979,9 @@ bool AppInit2()
     InitProcessBlockRejectTrace(GetBoolArg("-processblockrejecttrace", false));
     ibdactivepath::InitIBDActivePathTrace(
         GetBoolArg("-ibdactivepathtrace", false));
+    ibdblocklatency::SetEnabled(
+        GetBoolArg("-ibdblocklatency", false),
+        GetArg("-ibdblocklatencycsv", ""));
     ibdforensic::SetEnabled(
         GetBoolArg("-ibdforensic", false),
         GetArg("-ibdforensicpath", ""));

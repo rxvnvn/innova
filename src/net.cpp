@@ -8,6 +8,7 @@
 #include "main.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "ibdblocklatency.h"
 #include "ibdforensic.h"
 #include "init.h"
 #include "strlcpy.h"
@@ -2389,6 +2390,15 @@ bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
     ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), pszReason);
     if (g_frontierHash == hash && g_frontierPeer == peer)
         FrontierTraceClearLocked("release");
+    // A non-"receive" release means the request died before delivery: the
+    // latency record (if any) terminates here.  "receive" is handled by the
+    // T2 hook in ProcessMessage(block), so the lifecycle continues.
+    if (strcmp(pszReason, "receive") != 0)
+        ibdblocklatency::RecordBlockTerminal(
+            hash,
+            strcmp(pszReason, "timeout") == 0
+                ? ibdblocklatency::OUTCOME_TIMEOUT
+                : ibdblocklatency::OUTCOME_INCOMPLETE_EVICTED);
     return true;
 }
 
@@ -2429,6 +2439,12 @@ size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason)
                                           pszReason);
         it = mapBlockRequestOwners.erase(it);
         ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), pszReason);
+        if (strcmp(pszReason, "receive") != 0)
+            ibdblocklatency::RecordBlockTerminal(
+                hash,
+                strcmp(pszReason, "timeout") == 0
+                    ? ibdblocklatency::OUTCOME_TIMEOUT
+                    : ibdblocklatency::OUTCOME_DISCONNECT);
         ++nReleased;
     }
     if (g_frontierPeer == peer)
@@ -7648,6 +7664,7 @@ void ThreadMessageHandler2(void* parg)
         UpdateGetInfoSyncProbeSnapshot(vNodesCopy);
 
         ibdactivepath::EmitIBDActive1s(vNodesCopy);
+        ibdblocklatency::EmitIBDBlockLatency1s();
 
         {
             LOCK(cs_vNodes);
