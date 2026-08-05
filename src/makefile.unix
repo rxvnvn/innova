@@ -494,6 +494,7 @@ TEST_OBJS= \
     obj/test/fcmp_root_tests.o \
     obj/test/ibdforensic_tests.o \
     obj/test/ibdblocklatency_tests.o \
+    obj/test/ibdsemantic_tests.o \
     obj/test/pinglifecycle_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-pinglifecycle release-check
