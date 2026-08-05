@@ -331,6 +331,7 @@ OBJS= \
     obj/ibdefficiency.o \
     obj/ibdmetrics.o \
     obj/ibdactivepath.o \
+    obj/ibdsemantic.o \
     obj/ibdblocklatency.o \
     obj/ibdforensic.o \
     obj/pinglifecycletrace.o \
@@ -412,6 +413,7 @@ OBJS= \
     obj/ibdefficiency.o \
     obj/ibdmetrics.o \
     obj/ibdactivepath.o \
+    obj/ibdsemantic.o \
     obj/ibdblocklatency.o \
     obj/ibdforensic.o \
     obj/pinglifecycletrace.o \

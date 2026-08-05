@@ -50,6 +50,8 @@ Counters::Counters()
       block_receive_total(0),
       block_result_accepted_active(0),
       block_result_orphan_new(0),
+      block_result_orphan_limit_rejected(0),
+      block_result_rejected_total(0),
       setbestchain_commits(0),
       stalled_recovery_attempts(0),
       active_decrement_receive_clear_inflight(0),
@@ -610,6 +612,10 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.block_result_accepted_active.load(std::memory_order_relaxed);
     out.block_result_orphan_new =
         c.block_result_orphan_new.load(std::memory_order_relaxed);
+    out.block_result_orphan_limit_rejected =
+        c.block_result_orphan_limit_rejected.load(std::memory_order_relaxed);
+    out.block_result_rejected_total =
+        c.block_result_rejected_total.load(std::memory_order_relaxed);
     out.setbestchain_commits =
         c.setbestchain_commits.load(std::memory_order_relaxed);
     out.stalled_recovery_attempts =

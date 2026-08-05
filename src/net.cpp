@@ -8,6 +8,7 @@
 #include "main.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "ibdsemantic.h"
 #include "pinglifecycletrace.h"
 #include "ibdblocklatency.h"
 #include "ibdforensic.h"
@@ -922,12 +923,22 @@ bool CStalledSyncRecoveryState::ShouldRecover(
     int nLocalHeight, int nPeerHeight, bool fPipelineActive,
     int64_t nNow, int64_t nStallTimeout, int64_t nCooldown)
 {
+    // Observation-only instrumentation: counts every evaluation and updates
+    // gauges without changing the decision or any side effect below.
+    ibdsemantic::RecordRecoveryCheck(
+        nLocalHeight, nPeerHeight, fPipelineActive, fSyncRequestSent,
+        nLastObservedHeight, nLastProgressTime, nNow);
+
     if (!fSyncRequestSent)
+    {
+        ibdsemantic::RecordRecoverySkipNotArmed();
         return false;
+    }
 
     if (nLastObservedHeight != nLocalHeight ||
         (nLastProgressTime != 0 && nNow < nLastProgressTime))
     {
+        ibdsemantic::RecordRecoverySkipHeightChanged();
         nLastObservedHeight = nLocalHeight;
         nLastProgressTime = nNow;
         nLastRecoveryTime = 0;
@@ -936,7 +947,22 @@ bool CStalledSyncRecoveryState::ShouldRecover(
     }
 
     if (nPeerHeight <= nLocalHeight || fPipelineActive)
+    {
+        if (nPeerHeight <= nLocalHeight)
+        {
+            ibdsemantic::RecordRecoverySkipPeerNotAhead();
+        }
+        else
+        {
+            const int64_t nStallAgeHere = nLastProgressTime == 0
+                ? 0 : nNow - nLastProgressTime;
+            if (nStallAgeHere >= nStallTimeout)
+                ibdsemantic::RecordRecoverySkipPipelineActiveAfterTimeout();
+            else
+                ibdsemantic::RecordRecoverySkipPipelineActive();
+        }
         return false;
+    }
 
     const unsigned int nBackoffShift =
         std::min<unsigned int>(nRecoveryAttempts, 5);
@@ -951,6 +977,10 @@ bool CStalledSyncRecoveryState::ShouldRecover(
     if (nSinceProgress < nStallTimeout ||
         nSinceRecovery < nEffectiveCooldown)
     {
+        if (nSinceProgress < nStallTimeout)
+            ibdsemantic::RecordRecoverySkipTimeoutNotReached();
+        else
+            ibdsemantic::RecordRecoverySkipCooldown();
         return false;
     }
 
@@ -958,6 +988,7 @@ bool CStalledSyncRecoveryState::ShouldRecover(
     ++nRecoveryAttempts;
     ibdmetrics::Get().stalled_recovery_attempts.fetch_add(
         1, std::memory_order_relaxed);
+    ibdsemantic::RecordRecoveryTriggered();
     return true;
 }
 
@@ -7682,6 +7713,7 @@ void ThreadMessageHandler2(void* parg)
         UpdateGetInfoSyncProbeSnapshot(vNodesCopy);
 
         ibdactivepath::EmitIBDActive1s(vNodesCopy);
+        ibdsemantic::EmitIBDSemanticHealth1s(vNodesCopy);
         ibdblocklatency::EmitIBDBlockLatency1s();
         PingLifecycleTraceEmit1s(vNodesCopy);
 

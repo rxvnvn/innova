@@ -12,6 +12,7 @@
 #include "base58.h"
 #include "main.h"
 #include "ibdmetrics.h"
+#include "ibdsemantic.h"
 #include "stealth.h"
 #include "smessage.h"
 #include "collateral.h"
@@ -381,6 +382,8 @@ Value getinfo(const Array& params, bool fHelp)
         ibd.push_back(Pair("block_receive_total", metrics.block_receive_total));
         ibd.push_back(Pair("block_result_accepted_active", metrics.block_result_accepted_active));
         ibd.push_back(Pair("block_result_orphan_new", metrics.block_result_orphan_new));
+        ibd.push_back(Pair("block_result_orphan_limit_rejected", metrics.block_result_orphan_limit_rejected));
+        ibd.push_back(Pair("block_result_rejected_total", metrics.block_result_rejected_total));
         ibd.push_back(Pair("setbestchain_commits", metrics.setbestchain_commits));
         ibd.push_back(Pair("stalled_recovery_attempts", metrics.stalled_recovery_attempts));
 
@@ -557,6 +560,77 @@ Value getinfo(const Array& params, bool fHelp)
         ibd.push_back(Pair("total_inflight_max", metrics.total_inflight_max));
         ibd.push_back(Pair("eligible_ahead_peers_current", metrics.eligible_ahead_peers_current));
         ibd.push_back(Pair("eligible_ahead_peers_max", metrics.eligible_ahead_peers_max));
+
+        ibdsemantic::IBDSemanticSnapshot sem;
+        ibdsemantic::SnapshotAll(sem);
+        Object semantic_health;
+        semantic_health.push_back(Pair("enabled", sem.nEnabled));
+        semantic_health.push_back(Pair("sample_count", sem.nSampleCount));
+        semantic_health.push_back(Pair("window_ready", sem.fWindowReady));
+        semantic_health.push_back(Pair("local_height", sem.nLocalHeight));
+        semantic_health.push_back(Pair("tip_delta_1m", sem.tip_delta_1m));
+        semantic_health.push_back(Pair("tip_delta_5m", sem.tip_delta_5m));
+        semantic_health.push_back(Pair("progress_rate_1m", sem.progress_rate_1m));
+        semantic_health.push_back(Pair("progress_rate_5m", sem.progress_rate_5m));
+        semantic_health.push_back(Pair("progress_median_5m", sem.progress_median_5m));
+        semantic_health.push_back(Pair("receive_active", sem.fReceiveActive));
+        semantic_health.push_back(Pair("received_1m", sem.received_1m));
+        semantic_health.push_back(Pair("orphan_pressure_1m", sem.orphan_pressure_1m));
+        semantic_health.push_back(Pair("reject_futility_1m", sem.reject_futility_1m));
+        semantic_health.push_back(Pair("pipeline_events_1m", sem.pipeline_events_1m));
+        semantic_health.push_back(Pair("eligible_ahead_peers", sem.eligible_ahead_peers));
+        semantic_health.push_back(Pair("peer_height_max", sem.peer_height_max));
+        semantic_health.push_back(Pair("peer_height_confirmed", sem.peer_height_confirmed));
+        semantic_health.push_back(Pair("confirmed_gap_available", sem.fConfirmedGapAvailable));
+        semantic_health.push_back(Pair("peer_gap_max", sem.peer_gap_max));
+        semantic_health.push_back(Pair("peer_gap_confirmed", sem.peer_gap_confirmed));
+        semantic_health.push_back(Pair("peer_gap_change_1m", sem.peer_gap_change_1m));
+        semantic_health.push_back(Pair("peer_gap_change_5m", sem.peer_gap_change_5m));
+        semantic_health.push_back(Pair("oldest_live_inflight_age_ms", sem.oldest_live_inflight_age_ms));
+        semantic_health.push_back(Pair("inflight_gt1s", sem.inflight_gt1s));
+        semantic_health.push_back(Pair("inflight_gt4s", sem.inflight_gt4s));
+        semantic_health.push_back(Pair("a1_low_progress", sem.a1_low_progress));
+        semantic_health.push_back(Pair("a2_receiving", sem.a2_receiving));
+        semantic_health.push_back(Pair("a3_orphan_dominant", sem.a3_orphan_dominant));
+        semantic_health.push_back(Pair("a3b_not_futile", sem.a3b_not_futile));
+        semantic_health.push_back(Pair("a4_pipeline_busy", sem.a4_pipeline_busy));
+        semantic_health.push_back(Pair("a5_large_confirmed_gap", sem.a5_large_confirmed_gap));
+        semantic_health.push_back(Pair("a6_multiple_ahead_peers", sem.a6_multiple_ahead_peers));
+        semantic_health.push_back(Pair("arm_candidate", sem.arm_candidate));
+        semantic_health.push_back(Pair("checks_total", sem.semantic_checks_total));
+        semantic_health.push_back(Pair("arm_candidate_total", sem.semantic_arm_candidate_total));
+        semantic_health.push_back(Pair("a1_true_total", sem.semantic_a1_true_total));
+        semantic_health.push_back(Pair("a2_true_total", sem.semantic_a2_true_total));
+        semantic_health.push_back(Pair("a3_true_total", sem.semantic_a3_true_total));
+        semantic_health.push_back(Pair("a3b_true_total", sem.semantic_a3b_true_total));
+        semantic_health.push_back(Pair("a4_true_total", sem.semantic_a4_true_total));
+        semantic_health.push_back(Pair("a5_true_total", sem.semantic_a5_true_total));
+        semantic_health.push_back(Pair("a6_true_total", sem.semantic_a6_true_total));
+        semantic_health.push_back(Pair("all_but_a1_total", sem.semantic_all_but_a1_total));
+        semantic_health.push_back(Pair("all_but_a2_total", sem.semantic_all_but_a2_total));
+        semantic_health.push_back(Pair("all_but_a3_total", sem.semantic_all_but_a3_total));
+        semantic_health.push_back(Pair("all_but_a3b_total", sem.semantic_all_but_a3b_total));
+        semantic_health.push_back(Pair("all_but_a4_total", sem.semantic_all_but_a4_total));
+        semantic_health.push_back(Pair("all_but_a5_total", sem.semantic_all_but_a5_total));
+        semantic_health.push_back(Pair("all_but_a6_total", sem.semantic_all_but_a6_total));
+        semantic_health.push_back(Pair("recovery_checks_total", sem.recovery_checks_total));
+        semantic_health.push_back(Pair("recovery_skip_not_armed", sem.recovery_skip_not_armed));
+        semantic_health.push_back(Pair("recovery_skip_height_changed", sem.recovery_skip_height_changed));
+        semantic_health.push_back(Pair("recovery_skip_peer_not_ahead", sem.recovery_skip_peer_not_ahead));
+        semantic_health.push_back(Pair("recovery_skip_pipeline_active", sem.recovery_skip_pipeline_active));
+        semantic_health.push_back(Pair("recovery_skip_pipeline_active_after_timeout", sem.recovery_skip_pipeline_active_after_timeout));
+        semantic_health.push_back(Pair("recovery_skip_timeout_not_reached", sem.recovery_skip_timeout_not_reached));
+        semantic_health.push_back(Pair("recovery_skip_cooldown", sem.recovery_skip_cooldown));
+        semantic_health.push_back(Pair("recovery_triggered", sem.recovery_triggered));
+        semantic_health.push_back(Pair("recovery_armed", sem.recovery_armed));
+        semantic_health.push_back(Pair("recovery_last_observed_height", sem.recovery_last_observed_height));
+        semantic_health.push_back(Pair("recovery_stall_age_seconds", sem.recovery_stall_age_seconds));
+        semantic_health.push_back(Pair("recovery_longest_stall_seconds", sem.recovery_longest_stall_seconds));
+        semantic_health.push_back(Pair("recovery_max_peer_height", sem.recovery_max_peer_height));
+        semantic_health.push_back(Pair("recovery_peer_gap", sem.recovery_peer_gap));
+        semantic_health.push_back(Pair("recovery_pipeline_active", sem.recovery_pipeline_active));
+        ibd.push_back(Pair("semantic_health", semantic_health));
+
         obj.push_back(Pair("ibdmetrics", ibd));
     }
 

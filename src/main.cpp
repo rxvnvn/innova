@@ -728,11 +728,40 @@ static bool FindStakeKeyInOrphans(const std::pair<COutPoint, unsigned int>& stak
     return false;
 }
 
+// Central exactly-once accounting for terminal ProcessBlock reject outcomes.
+// Every terminal reject site calls TraceProcessBlockReject() exactly once
+// and returns immediately afterwards, so classifying here -- rather than at
+// each reject site -- is exactly-once with no double counting.  Orphan-limit
+// rejects (missing parent, no validation failure) are attributed to their own
+// dedicated counter and are deliberately excluded from the general
+// validation-reject total.
+static void RecordBlockResultReject(ProcessBlockRejectReason reason)
+{
+    ibdmetrics::Counters& c = ibdmetrics::Get();
+    switch (reason)
+    {
+    case PBREJECT_ORPHAN_LIMIT_IBD:
+    case PBREJECT_ORPHAN_LIMIT_NORMAL:
+        c.block_result_orphan_limit_rejected.fetch_add(
+            1, std::memory_order_relaxed);
+        break;
+    case PBREJECT_DUPLICATE_INDEXED:
+    case PBREJECT_DUPLICATE_ORPHAN:
+        // Already-have/duplicate deliveries are not validation rejects.
+        break;
+    default:
+        c.block_result_rejected_total.fetch_add(
+            1, std::memory_order_relaxed);
+        break;
+    }
+}
+
 static void TraceProcessBlockReject(CNode* pfrom, CBlock* pblock,
                                     ProcessBlockRejectReason reason,
                                     const char* pszCheckBlockReason = NULL,
                                     const std::string& extra = std::string())
 {
+    RecordBlockResultReject(reason);
     if (!fProcessBlockRejectTraceEnabled || !pblock)
         return;
     const uint256 hash = pblock->GetHash();

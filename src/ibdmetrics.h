@@ -66,6 +66,8 @@ struct IBDMetricsSnapshot
     int64_t block_receive_total;
     int64_t block_result_accepted_active;
     int64_t block_result_orphan_new;
+    int64_t block_result_orphan_limit_rejected;
+    int64_t block_result_rejected_total;
     int64_t setbestchain_commits;
     int64_t stalled_recovery_attempts;
 
@@ -323,6 +325,8 @@ struct Counters
     std::atomic<int64_t> block_receive_total;
     std::atomic<int64_t> block_result_accepted_active;
     std::atomic<int64_t> block_result_orphan_new;
+    std::atomic<int64_t> block_result_orphan_limit_rejected;
+    std::atomic<int64_t> block_result_rejected_total;
     std::atomic<int64_t> setbestchain_commits;
     std::atomic<int64_t> stalled_recovery_attempts;
 

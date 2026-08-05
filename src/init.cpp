@@ -19,6 +19,7 @@
 #include "ibdefficiency.h"
 #include "ibdactivepath.h"
 #include "ibdblocklatency.h"
+#include "ibdsemantic.h"
 #include "ibdforensic.h"
 #include "pinglifecycletrace.h"
 #include "activecollateralnode.h"
@@ -607,6 +608,11 @@ std::string HelpMessage()
         "  -synclockthresholdms=<n> " + _("Lock diagnostic threshold in milliseconds (default: 250)") + "\n" +
         "  -syncstalltimeout=<n> " + _("Seconds without chain progress before sync recovery (default: 15)") + "\n" +
         "  -syncstallcooldown=<n> " + _("Initial recovery cooldown in seconds; failures back off exponentially (default: 15)") + "\n" +
+        "  -ibdsemrecover=<0|1> " + _("Enable semantic IBD health diagnostics only; does not change recovery behavior (default: 0)") + "\n" +
+        "  -ibdminprogressrate=<d> " + _("Semantic arm threshold: minimum mean per-second tip progress rate (requires -ibdsemrecover, default: 0.2)") + "\n" +
+        "  -ibdorphandom=<d> " + _("Semantic arm threshold: orphan-dominance fraction of received blocks (requires -ibdsemrecover, default: 0.5)") + "\n" +
+        "  -ibdfutilereject=<d> " + _("Semantic arm threshold: max reject-futility fraction of received blocks (requires -ibdsemrecover, default: 0.2)") + "\n" +
+        "  -ibdgapmin=<n> " + _("Semantic arm threshold: minimum confirmed peer height gap (requires -ibdsemrecover, default: 5000)") + "\n" +
         "  -logtimestamps         " + _("Prepend debug output with timestamp") + "\n" +
         "  -shrinkdebugfile       " + _("Shrink debug.log file on client startup (default: 1 when no -debug)") + "\n" +
         "  -printtoconsole        " + _("Send trace/debug info to console instead of debug.log file") + "\n" +
@@ -988,6 +994,20 @@ bool AppInit2()
         GetBoolArg("-ibdforensic", false),
         GetArg("-ibdforensicpath", ""));
     InitPingLifecycleTrace(GetBoolArg("-pinglifecycletrace", false));
+
+    {
+        const int64_t nSemRecover = GetArg("-ibdsemrecover", 0);
+        if (nSemRecover != 0 && nSemRecover != 1)
+        {
+            return InitError(_(
+                "Invalid -ibdsemrecover (expected 0 or 1)"));
+        }
+        if (!ibdsemantic::SetEnabled((int)nSemRecover))
+        {
+            return InitError(_(
+                "Invalid -ibdsemrecover (expected 0 or 1)"));
+        }
+    }
 
     if (mapArgs.count("-timeout"))
     {
