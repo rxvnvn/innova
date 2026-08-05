@@ -13,6 +13,7 @@
 #include "ibdblocklatency.h"
 #include "ibdforensic.h"
 #include "init.h"
+#include "innovarpc.h"
 #include "strlcpy.h"
 #include "addrman.h"
 #include "ui_interface.h"
@@ -7011,7 +7012,10 @@ void ThreadDumpAddress2(void* parg)
     {
         DumpData();
         vnThreadsRunning[THREAD_DUMPADDRESS]--;
-        MilliSleep(600000);
+        // Chunked sleep so the thread observes shutdown promptly; otherwise a
+        // join during StopNode would wait out the full ten-minute interval.
+        for (int i = 0; i < 150 && !fShutdown; i++)
+            MilliSleep(4000);
         vnThreadsRunning[THREAD_DUMPADDRESS]++;
     }
     vnThreadsRunning[THREAD_DUMPADDRESS]--;
@@ -7297,7 +7301,8 @@ void ThreadOpenAddedConnections2(void* parg)
 			if (fShutdown)
                 return;
             vnThreadsRunning[THREAD_ADDEDCONNECTIONS]--;
-            MilliSleep(120000); // Retry every 2 minutes
+            for (int i = 0; i < 60 && !fShutdown; i++) // Retry every 2 minutes
+                MilliSleep(2000);
 			vnThreadsRunning[THREAD_ADDEDCONNECTIONS]++;
             if (fShutdown)
                 return;
@@ -7350,7 +7355,8 @@ void ThreadOpenAddedConnections2(void* parg)
                 return;
         }
 		vnThreadsRunning[THREAD_ADDEDCONNECTIONS]--;
-        MilliSleep(120000); // Retry every 2 minutes
+        for (int i = 0; i < 60 && !fShutdown; i++) // Retry every 2 minutes
+            MilliSleep(2000);
         vnThreadsRunning[THREAD_ADDEDCONNECTIONS]++;
         if (fShutdown)
             return;
@@ -8106,27 +8112,31 @@ bool StopNode()
     printf("StopNode()\n");
     fShutdown = true;
     mempool.AddTransactionsUpdated(1);
-    int64_t nStart = GetTime();
     if (semOutbound)
         for (int i=0; i<MAX_OUTBOUND_CONNECTIONS; i++)
             semOutbound->post();
+
+    // Wake the RPC listener: closing its acceptors lets the pending
+    // async_accept complete so the io_service loop observes fShutdown and the
+    // listener thread can be joined deterministically below.
+    RPCServerShutdown();
 
     if (fAddressesInitialized) {
         DumpData();
         fAddressesInitialized = false;
     }
 
-    do
-    {
-        int nThreadsRunning = 0;
-        for (int n = 0; n < THREAD_MAX; n++)
-            nThreadsRunning += vnThreadsRunning[n];
-        if (nThreadsRunning == 0)
-            break;
-        if (GetTime() - nStart > 20)
-            break;
-        MilliSleep(20);
-    } while(true);
+    // Physically join every tracked worker thread instead of trusting the
+    // vnThreadsRunning counters, which only approximate exit (a thread can
+    // still run code after it last decremented its counter).  All network
+    // threads have bounded wakeups and observe fShutdown, so joins return
+    // promptly.  Stuck threads (e.g. blocked in a DNS lookup) are detached and
+    // abandoned after their per-thread budget; the process exits right after.
+    const size_t nAbandoned = JoinTrackedThreads();
+    if (nAbandoned > 0)
+        printf("StopNode: abandoned %" PRIszu" threads that did not exit\n",
+               nAbandoned);
+
     if (vnThreadsRunning[THREAD_SOCKETHANDLER] > 0) printf("ThreadSocketHandler still running\n");
     if (vnThreadsRunning[THREAD_OPENCONNECTIONS] > 0) printf("ThreadOpenConnections still running\n");
     if (vnThreadsRunning[THREAD_MESSAGEHANDLER] > 0) printf("ThreadMessageHandler still running\n");
@@ -8139,21 +8149,68 @@ bool StopNode()
     if (vnThreadsRunning[THREAD_ADDEDCONNECTIONS] > 0) printf("ThreadOpenAddedConnections still running\n");
     if (vnThreadsRunning[THREAD_DUMPADDRESS] > 0) printf("ThreadDumpAddresses still running\n");
     if (vnThreadsRunning[THREAD_STAKE_MINER] > 0) printf("ThreadStakeMiner still running\n");
-    while (vnThreadsRunning[THREAD_MESSAGEHANDLER] > 0 || vnThreadsRunning[THREAD_RPCHANDLER] > 0)
-        MilliSleep(20);
-    MilliSleep(50);
+
+    // Every network thread has exited; release all network runtime state
+    // explicitly while its global mutexes and containers are still alive, so
+    // static destruction (CNetCleanup) has nothing meaningful left to do.
+    CleanupNetworkState();
 
     return true;
 }
 
-// Set true by CNetCleanup::~CNetCleanup before any CNode is destroyed during
-// exit() static destruction.  CNode::~CNode reads it via InFinalNodeTeardown()
-// to pick the terminal cleanup mode (no forensic callbacks).
+// Set true before any CNode is destroyed during shutdown teardown (either the
+// explicit CleanupNetworkState() path or the exit() static-destruction fallback
+// in CNetCleanup).  CNode::~CNode reads it via InFinalNodeTeardown() to pick
+// the terminal cleanup mode (no forensic callbacks).
 static bool g_fFinalNodeTeardown = false;
 
 bool InFinalNodeTeardown()
 {
     return g_fFinalNodeTeardown;
+}
+
+static bool g_fNetworkStateCleaned = false;
+
+void CleanupNetworkState()
+{
+    if (g_fNetworkStateCleaned)
+        return;
+    g_fNetworkStateCleaned = true;
+
+    // Terminal teardown: from here on every CNode::~CNode picks
+    // NODE_CLEANUP_FINAL_TEARDOWN, which frees scheduler state (ownership,
+    // outstanding getblocks) without invoking forensic (or other observation)
+    // callbacks.  Their static mutexes and containers may already be destroyed
+    // by the time static destruction reaches this point, so no
+    // application-level lock may be taken from here.
+    g_fFinalNodeTeardown = true;
+
+    // Close sockets
+    for (CNode* pnode : vNodes)
+        if (pnode->hSocket != INVALID_SOCKET)
+            CloseSocket(pnode->hSocket);
+    for (ListenSocket& hListenSocket : vhListenSocket)
+        if (hListenSocket.socket != INVALID_SOCKET)
+            if (!CloseSocket(hListenSocket.socket))
+                printf("CloseSocket(hListenSocket) failed with error %d\n", WSAGetLastError());
+
+    // Clean up for helping leak detection
+    for (CNode* pnode : vNodes)
+        delete pnode;
+    for (CNode* pnode : vNodesDisconnected)
+        delete pnode;
+    vNodes.clear();
+    vNodesDisconnected.clear();
+    vhListenSocket.clear();
+    delete semOutbound;
+    semOutbound = NULL;
+    delete pnodeLocalHost;
+    pnodeLocalHost = NULL;
+
+#ifdef WIN32
+    // Shutdown Windows Sockets
+    WSACleanup();
+#endif
 }
 
 class CNetCleanup
@@ -8164,40 +8221,12 @@ public:
     }
     ~CNetCleanup()
     {
-        // Terminal teardown: from here on every CNode::~CNode picks
-        // NODE_CLEANUP_FINAL_TEARDOWN, which frees scheduler state (ownership,
-        // outstanding getblocks) without invoking forensic (or other
-        // observation) callbacks.  Their static mutexes and containers may
-        // already be destroyed by the time this static destructor runs, so no
-        // application-level lock may be taken from here.
+        // All meaningful network teardown happens explicitly in StopNode()
+        // before process exit.  This destructor is a trivial safety net for
+        // paths that exit without StopNode; CleanupNetworkState() is idempotent
+        // and does nothing when already performed.
         g_fFinalNodeTeardown = true;
-
-        // Close sockets
-        for (CNode* pnode : vNodes)
-            if (pnode->hSocket != INVALID_SOCKET)
-                CloseSocket(pnode->hSocket);
-        for (ListenSocket& hListenSocket : vhListenSocket)
-            if (hListenSocket.socket != INVALID_SOCKET)
-                if (!CloseSocket(hListenSocket.socket))
-                    printf("CloseSocket(hListenSocket) failed with error %d\n", WSAGetLastError());
-
-        // Clean up for helping leak detection
-        for (CNode* pnode : vNodes)
-            delete pnode;
-        for (CNode* pnode : vNodesDisconnected)
-            delete pnode;
-        vNodes.clear();
-        vNodesDisconnected.clear();
-        vhListenSocket.clear();
-        delete semOutbound;
-        semOutbound = NULL;
-        delete pnodeLocalHost;
-        pnodeLocalHost = NULL;
-
-#ifdef WIN32
-        // Shutdown Windows Sockets
-        WSACleanup();
-#endif
+        CleanupNetworkState();
     }
 } instance_of_cnetcleanup;
 

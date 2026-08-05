@@ -30,6 +30,7 @@ namespace boost {
 #include <boost/filesystem/fstream.hpp>
 #include <boost/foreach.hpp>
 #include <boost/thread.hpp>
+#include <algorithm>
 #include <openssl/crypto.h>
 #include <openssl/rand.h>
 #include <stdarg.h>
@@ -1724,11 +1725,132 @@ void RenameThread(const char* name)
 #endif
 }
 
+namespace
+{
+CCriticalSection cs_trackedThreads;
+std::vector<boost::thread*> vTrackedThreads;
+bool fThreadsJoined = false;
+}
+
+// Ownership registry for every thread started through NewThread.  Threads stay
+// joinable (never detached) so shutdown can deterministically join them instead
+// of trusting vnThreadsRunning counters, which only approximate physical exit.
+bool TrackThreadHandle(boost::thread* pth)
+{
+    if (pth == NULL)
+        return false;
+    LOCK(cs_trackedThreads);
+    if (fThreadsJoined)
+    {
+        // No more joining will happen; keep the handle alive for the process
+        // lifetime (a joinable boost::thread must not be destroyed while its
+        // thread runs on some boost versions).
+        vTrackedThreads.push_back(pth);
+        return true;
+    }
+    // Opportunistically reap threads that have already finished so the registry
+    // stays bounded (e.g. per-connection RPC handler threads).  Never join the
+    // current thread: it is itself tracked and joining it throws.
+    const boost::thread::id idSelf = boost::this_thread::get_id();
+    for (size_t i = 0; i < vTrackedThreads.size(); )
+    {
+        boost::thread* t = vTrackedThreads[i];
+        bool fDone = false;
+        try
+        {
+            fDone = t != pth && t->joinable() && t->get_id() != idSelf &&
+                    t->timed_join(boost::posix_time::milliseconds(0));
+        }
+        catch (boost::thread_resource_error&)
+        {
+            fDone = false;
+        }
+        if (fDone)
+        {
+            delete t;
+            vTrackedThreads.erase(vTrackedThreads.begin() + i);
+            continue;
+        }
+        ++i;
+    }
+    vTrackedThreads.push_back(pth);
+    return true;
+}
+
+size_t TrackedThreadCount()
+{
+    LOCK(cs_trackedThreads);
+    return vTrackedThreads.size();
+}
+
+size_t JoinTrackedThreads()
+{
+    std::vector<boost::thread*> vCopy;
+    {
+        LOCK(cs_trackedThreads);
+        if (fThreadsJoined)
+            return 0;
+        fThreadsJoined = true;
+        vCopy.swap(vTrackedThreads);
+    }
+
+    const int nPerThreadBudget = GetArg("-shutdownthreadjoinwait", 8);
+    const int nTotalBudget = GetArg("-shutdownthreadjointotal", 60);
+    const boost::thread::id idSelf = boost::this_thread::get_id();
+    const int64_t nStart = GetTime();
+    size_t nAbandoned = 0;
+
+    for (boost::thread* pth : vCopy)
+    {
+        if (pth == NULL)
+            continue;
+        if (pth->get_id() == idSelf)
+        {
+            // The shutdown thread cannot join itself.  Detach so the handle can
+            // be freed safely regardless of the boost thread destructor policy.
+            if (pth->joinable())
+                pth->detach();
+            delete pth;
+            continue;
+        }
+        if (!pth->joinable())
+        {
+            delete pth;
+            continue;
+        }
+
+        int64_t nRemaining = nTotalBudget - (GetTime() - nStart);
+        int nBudget = std::min<int>(nPerThreadBudget,
+                                    (int)std::max<int64_t>(0, nRemaining));
+        if (nBudget <= 0 || !pth->timed_join(boost::posix_time::seconds(nBudget)))
+        {
+            printf("JoinTrackedThreads: abandoning thread that did not exit "
+                   "within its join budget\n");
+            if (pth->joinable())
+                pth->detach();
+            delete pth;
+            ++nAbandoned;
+            continue;
+        }
+        delete pth;
+    }
+    vCopy.clear();
+    return nAbandoned;
+}
+
+void ResetTrackedThreadJoinState()
+{
+    LOCK(cs_trackedThreads);
+    fThreadsJoined = false;
+}
+
 bool NewThread(void(*pfn)(void*), void* parg)
 {
     try
     {
-        boost::thread(pfn, parg); // thread detaches when out of scope
+        // Keep ownership so shutdown can join instead of detaching.
+        boost::thread* pth = new boost::thread(pfn, parg);
+        TrackThreadHandle(pth);
     } catch(boost::thread_resource_error &e) {
         printf("Error creating thread: %s\n", e.what());
         return false;

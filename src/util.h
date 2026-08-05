@@ -741,6 +741,25 @@ public:
 
 bool NewThread(void(*pfn)(void*), void* parg);
 
+// Take ownership of a boost::thread so shutdown can deterministically join it.
+// Threads are tracked until JoinTrackedThreads() reaps them (or the process
+// exits).  Returns false if the handle could not be recorded.
+bool TrackThreadHandle(boost::thread* pth);
+
+// Bounded physical join of every tracked thread.  Skips the calling thread
+// (the shutdown thread itself is tracked).  Threads that do not finish within
+// the per-thread join budget are detached and abandoned; the process exits
+// shortly after, killing them.  Returns the number of threads abandoned.
+size_t JoinTrackedThreads();
+
+// Re-arm the registry after a completed JoinTrackedThreads() so a later cycle
+// (e.g. a re-initialised test fixture) can join its threads again.  Any handles
+// recorded after the previous join are still joined on the next call.
+void ResetTrackedThreadJoinState();
+
+// Number of live tracked thread handles (diagnostics / tests).
+size_t TrackedThreadCount();
+
 #ifdef WIN32
 inline void SetThreadPriority(int nPriority)
 {

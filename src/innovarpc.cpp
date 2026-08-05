@@ -57,6 +57,13 @@ static int64_t RPCPerfTimeMicros()
 
 static std::string strRPCUserColonPass;
 
+// Closed to stop accepting RPC connections during shutdown.  Emitted by
+// RPCServerShutdown() from the shutdown path so the listener thread's
+// io_service loop (blocked in run_one on a pending async_accept) unblocks and
+// can be joined deterministically.  Connections to live acceptors auto-remove
+// when ThreadRPCServer2 exits.
+static boost::signals2::signal<void ()> StopRequests;
+
 const Object emptyobj;
 
 void ThreadRPCServer3(void* parg);
@@ -1104,8 +1111,6 @@ void ThreadRPCServer2(void* parg)
     boost::system::error_code v6_only_error;
     boost::shared_ptr<ip::tcp::acceptor> acceptor(new ip::tcp::acceptor(io_service));
 
-    boost::signals2::signal<void ()> StopRequests;
-
     bool fListening = false;
     std::string strerr;
     try
@@ -1169,6 +1174,13 @@ void ThreadRPCServer2(void* parg)
     while (!fShutdown)
         io_service.run_one();
     vnThreadsRunning[THREAD_RPCLISTENER]++;
+    StopRequests();
+}
+
+void RPCServerShutdown()
+{
+    // Close the acceptors so the listener thread unblocks from run_one() and
+    // returns once fShutdown is set.  Idempotent.
     StopRequests();
 }
 

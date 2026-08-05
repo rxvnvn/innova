@@ -251,6 +251,11 @@ bool BindListenPort(const CService &bindAddr, std::string& strError=REF(std::str
 void StartTor(void* parg);
 void StartNode(void* parg);
 bool StopNode();
+/** Explicit, idempotent release of all network runtime state: closes sockets,
+ *  deletes CNode objects and clears global containers.  Called from StopNode
+ *  after every network thread has been joined, before process exit, so that
+ *  static destruction (CNetCleanup) has no meaningful work left to do. */
+void CleanupNetworkState();
 void SocketSendData(CNode *pnode);
 void RecordP2PMessageStat(const CNode* pnode, const std::string& command, unsigned int bytes, bool incoming);
 

@@ -88,6 +88,11 @@ json_spirit::Object JSONRPCError(int code, const std::string& message);
 void ThreadRPCServer(void* parg);
 int CommandLineRPC(int argc, char *argv[]);
 
+/** Close the RPC acceptor(s) so the listener thread observes shutdown and can
+ *  be joined deterministically.  Safe to call from the shutdown path; does
+ *  nothing when the RPC server was never started. */
+void RPCServerShutdown();
+
 /** Convert parameter values for RPC call from strings to command-specific JSON objects. */
 json_spirit::Array RPCConvertValues(const std::string &strMethod, const std::vector<std::string> &strParams);
 
