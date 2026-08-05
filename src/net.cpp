@@ -2457,7 +2457,8 @@ bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer)
     return true;
 }
 
-size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason)
+size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason,
+                                        bool fRecordForensics)
 {
     LOCK(cs_mapAlreadyAskedFor);
     size_t nReleased = 0;
@@ -2475,13 +2476,16 @@ size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason)
                                           BlockRequestOwnerStateName(it->second.state),
                                           pszReason);
         it = mapBlockRequestOwners.erase(it);
-        ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), pszReason);
-        if (strcmp(pszReason, "receive") != 0)
-            ibdblocklatency::RecordBlockTerminal(
-                hash,
-                strcmp(pszReason, "timeout") == 0
-                    ? ibdblocklatency::OUTCOME_TIMEOUT
-                    : ibdblocklatency::OUTCOME_DISCONNECT);
+        if (fRecordForensics)
+        {
+            ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), pszReason);
+            if (strcmp(pszReason, "receive") != 0)
+                ibdblocklatency::RecordBlockTerminal(
+                    hash,
+                    strcmp(pszReason, "timeout") == 0
+                        ? ibdblocklatency::OUTCOME_TIMEOUT
+                        : ibdblocklatency::OUTCOME_DISCONNECT);
+        }
         ++nReleased;
     }
     if (g_frontierPeer == peer)
@@ -5556,7 +5560,7 @@ bool CNode::ConsumeGetBlocksResponseFront()
     return true;
 }
 
-void CNode::ClearGetBlocksOutstandingForCleanup()
+void CNode::ClearGetBlocksOutstandingForCleanup(bool fRecordForensics)
 {
     if (getBlocksOutstandingSources.empty())
         return;
@@ -5564,7 +5568,8 @@ void CNode::ClearGetBlocksOutstandingForCleanup()
     const size_t nOutstanding = getBlocksOutstandingSources.size();
     getBlocksOutstandingSources.clear();
     ibdmetrics::GetBlocksOutstandingAdd(-(int64_t)nOutstanding);
-    ibdforensic::CountGetBlocksOutstandingNoResponse(nOutstanding);
+    if (fRecordForensics)
+        ibdforensic::CountGetBlocksOutstandingNoResponse(nOutstanding);
     ibdmetrics::Get().getblocks_no_response_disconnect_cleanup.fetch_add(
         nOutstanding, std::memory_order_relaxed);
     RequestBlockPipelineWake(
@@ -5572,9 +5577,10 @@ void CNode::ClearGetBlocksOutstandingForCleanup()
         WAKE_CAUSE_DISCONNECT_CLEANUP);
 }
 
-void CNode::Cleanup()
+void CNode::Cleanup(NodeCleanupMode mode)
 {
-    ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect");
+    const bool fRecordForensics = (mode == NODE_CLEANUP_RUNTIME);
+    ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect", fRecordForensics);
     ReleaseOrphanLimitRejectedForPeer(GetId());
     if (!fIbdMetricsCleanupAccounted)
     {
@@ -5617,7 +5623,7 @@ void CNode::Cleanup()
             getBlocksSources.clear();
             getBlocksRecoveryIds.clear();
         }
-        ClearGetBlocksOutstandingForCleanup();
+        ClearGetBlocksOutstandingForCleanup(fRecordForensics);
         if ((fHadActiveBlockWork || fHadQueuedGetBlocks) &&
             !fHadOutstandingGetBlocks)
             RequestBlockPipelineWake(WAKE_CAUSE_DISCONNECT_CLEANUP);
@@ -6379,7 +6385,7 @@ void ThreadSocketHandler2(void* parg)
 
                     // close socket and cleanup
                     pnode->CloseSocketDisconnect();
-                    pnode->Cleanup();
+                    pnode->Cleanup(NODE_CLEANUP_RUNTIME);
 
                     // hold in disconnected pool until all refs are released
                     if (pnode->fNetworkNode || pnode->fInbound)
@@ -8140,6 +8146,16 @@ bool StopNode()
     return true;
 }
 
+// Set true by CNetCleanup::~CNetCleanup before any CNode is destroyed during
+// exit() static destruction.  CNode::~CNode reads it via InFinalNodeTeardown()
+// to pick the terminal cleanup mode (no forensic callbacks).
+static bool g_fFinalNodeTeardown = false;
+
+bool InFinalNodeTeardown()
+{
+    return g_fFinalNodeTeardown;
+}
+
 class CNetCleanup
 {
 public:
@@ -8148,6 +8164,14 @@ public:
     }
     ~CNetCleanup()
     {
+        // Terminal teardown: from here on every CNode::~CNode picks
+        // NODE_CLEANUP_FINAL_TEARDOWN, which frees scheduler state (ownership,
+        // outstanding getblocks) without invoking forensic (or other
+        // observation) callbacks.  Their static mutexes and containers may
+        // already be destroyed by the time this static destructor runs, so no
+        // application-level lock may be taken from here.
+        g_fFinalNodeTeardown = true;
+
         // Close sockets
         for (CNode* pnode : vNodes)
             if (pnode->hSocket != INVALID_SOCKET)

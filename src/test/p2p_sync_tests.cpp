@@ -13,6 +13,7 @@
 #include <unistd.h>
 #endif
 
+#include <boost/filesystem.hpp>
 #include <boost/test/unit_test.hpp>
 #include <boost/thread/barrier.hpp>
 #include <boost/thread/thread.hpp>
@@ -20,6 +21,7 @@
 #include "checkpoints.h"
 #include "ibdactivepath.h"
 #include "ibdefficiency.h"
+#include "ibdforensic.h"
 #include "innovarpc.h"
 #include "main.h"
 #include "net.h"
@@ -3591,6 +3593,94 @@ BOOST_AUTO_TEST_CASE(disconnect_cleans_up_block_request_owners)
 
     BOOST_CHECK(!GetBlockRequestOwner(hashA, NULL, NULL));
     BOOST_CHECK(!GetBlockRequestOwner(hashB, NULL, NULL));
+}
+
+// NODE_CLEANUP_FINAL_TEARDOWN (the CNetCleanup::~CNetCleanup static-destructor
+// path) must still free scheduler state (ownership, outstanding getblocks) but
+// must NOT invoke any forensic recorder: their static mutexes and containers
+// may already be destroyed by the time the terminal destructor runs during
+// exit().
+BOOST_AUTO_TEST_CASE(terminal_cleanup_frees_state_without_forensic_records)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    const boost::filesystem::path forensicsPath =
+        boost::filesystem::temp_directory_path() /
+        "p2p_terminal_cleanup_forensics.log";
+    ibdforensic::SetEnabled(true, forensicsPath.string());
+    ibdforensic::ResetForTesting();
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(951), "terminal-cleanup", true);
+    const uint256 hashA(9510);
+    const uint256 hashB(9511);
+    BOOST_CHECK(TryAssignBlockRequestOwner(hashA, peer.GetId(), BLOCKREQ_SOURCE_INV));
+    BOOST_CHECK(TryAssignBlockRequestOwner(hashB, peer.GetId(), BLOCKREQ_SOURCE_INV));
+    peer.MarkBlockInFlight(hashB);
+    peer.getBlocksOutstandingSources.push_back(ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+
+    peer.Cleanup(NODE_CLEANUP_FINAL_TEARDOWN);
+
+    // Ownership released and outstanding getblocks cleared.
+    BOOST_CHECK(!GetBlockRequestOwner(hashA, NULL, NULL));
+    BOOST_CHECK(!GetBlockRequestOwner(hashB, NULL, NULL));
+    BOOST_CHECK(peer.getBlocksOutstandingSources.empty());
+
+    // The generation opened by MarkBlockInFlight stays OPEN: terminal cleanup
+    // must not call RecordGenerationEnd.
+    const std::map<uint256, std::vector<ibdforensic::GenerationRecord> > gens =
+        ibdforensic::GenerationsForTesting();
+    const std::map<uint256, std::vector<ibdforensic::GenerationRecord> >::const_iterator gi =
+        gens.find(hashB);
+    BOOST_REQUIRE(gi != gens.end());
+    BOOST_REQUIRE(!gi->second.empty());
+    BOOST_CHECK_EQUAL(gi->second[0].releaseUs, (int64_t)0);
+
+    // Outstanding getblocks were cleared without feeding the forensic counter.
+    const ibdforensic::GetBlocksRateCounters rate =
+        ibdforensic::RateCounters();
+    BOOST_CHECK_EQUAL(rate.outstandingNoResponse, (uint64_t)0);
+
+    ibdforensic::SetEnabled(false, "");
+}
+
+// NODE_CLEANUP_RUNTIME (the normal disconnect path) keeps recording forensics:
+// it closes the generation and counts dropped outstanding getblocks.
+BOOST_AUTO_TEST_CASE(runtime_cleanup_still_records_forensics)
+{
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    const boost::filesystem::path forensicsPath =
+        boost::filesystem::temp_directory_path() /
+        "p2p_runtime_cleanup_forensics.log";
+    ibdforensic::SetEnabled(true, forensicsPath.string());
+    ibdforensic::ResetForTesting();
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(952), "runtime-cleanup", true);
+    const uint256 hash(9520);
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peer.GetId(), BLOCKREQ_SOURCE_INV));
+    peer.MarkBlockInFlight(hash);
+    peer.getBlocksOutstandingSources.push_back(ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
+
+    peer.Cleanup(NODE_CLEANUP_RUNTIME);
+
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+    BOOST_CHECK(peer.getBlocksOutstandingSources.empty());
+
+    // Runtime cleanup closes the generation (RecordGenerationEnd runs).
+    const std::map<uint256, std::vector<ibdforensic::GenerationRecord> > gens =
+        ibdforensic::GenerationsForTesting();
+    const std::map<uint256, std::vector<ibdforensic::GenerationRecord> >::const_iterator gi =
+        gens.find(hash);
+    BOOST_REQUIRE(gi != gens.end());
+    BOOST_REQUIRE(!gi->second.empty());
+    BOOST_CHECK(gi->second[0].releaseUs != 0);
+
+    // Outstanding getblocks were counted as no-response.
+    const ibdforensic::GetBlocksRateCounters rate =
+        ibdforensic::RateCounters();
+    BOOST_CHECK_EQUAL(rate.outstandingNoResponse, (uint64_t)1);
+
+    ibdforensic::SetEnabled(false, "");
 }
 
 BOOST_AUTO_TEST_CASE(disconnect_cleanup_last_active_work_signals_wake)

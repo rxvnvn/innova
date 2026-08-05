@@ -231,6 +231,15 @@ std::string FormatSummary();
 // could not be opened or written; the recorded data is kept regardless.
 bool Dump();
 
+// Called exactly once during shutdown, before any static object is destroyed
+// and before any CNode is deleted in terminal teardown.  Disables recording,
+// performs the final Dump() while g_mutex and all recorded state are still
+// guaranteed alive, and frees the recorded containers so the static teardown
+// has nothing left to free while a still-live thread could touch it.  Safe to
+// call even when forensic was never enabled (the dump still reflects whatever
+// was collected, matching Dump()).
+void ShutdownAndDump();
+
 // Test accessors.
 size_t BatchCount();
 size_t EntryCount();

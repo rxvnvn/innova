@@ -610,7 +610,8 @@ bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer);
 bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
                               const char* pszReason);
 bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer);
-size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason);
+size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason,
+                                        bool fRecordForensics = true);
 const char* BlockRequestOwnerStateName(BlockRequestOwnerState state);
 
 bool IsBlockRequestOwnedByAnyPeer(const uint256& hash);
@@ -897,6 +898,28 @@ struct SendMessageMeta
     }
 };
 
+// How a CNode's state is being torn down.
+//
+// NODE_CLEANUP_RUNTIME is the normal disconnect path (scheduler still running):
+// ownership release records forensic/observation callbacks as usual.
+//
+// NODE_CLEANUP_FINAL_TEARDOWN runs from CNetCleanup::~CNetCleanup during exit()
+// static destruction.  It still frees scheduler state (ownership, outstanding
+// getblocks) but skips forensic and other observation callbacks, whose static
+// mutexes and containers may already be destroyed by the time the terminal
+// destructor runs.
+enum NodeCleanupMode
+{
+    NODE_CLEANUP_RUNTIME = 0,
+    NODE_CLEANUP_FINAL_TEARDOWN
+};
+
+// True only while CNetCleanup::~CNetCleanup is running during exit() static
+// destruction.  CNode::~CNode consults this to pick the cleanup mode so that
+// terminal deletes free scheduler state without invoking forensic (or other
+// observation) callbacks, whose static state may already be destroyed.
+bool InFinalNodeTeardown();
+
 /** Information about a peer */
 class CNode
 {
@@ -1143,7 +1166,8 @@ public:
 
     ~CNode()
     {
-        Cleanup();
+        Cleanup(InFinalNodeTeardown() ? NODE_CLEANUP_FINAL_TEARDOWN
+                                      : NODE_CLEANUP_RUNTIME);
         if (BlockRequestTraceEnabled())
             BlockRequestTracePeerClosed(this);
         if (PingLifecycleTraceEnabled())
@@ -1811,7 +1835,7 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                        ibdmetrics::GetBlocksSource source =
                            ibdmetrics::GETBLOCKS_SOURCE_OTHER);
     bool ConsumeGetBlocksResponseFront();
-    void ClearGetBlocksOutstandingForCleanup();
+    void ClearGetBlocksOutstandingForCleanup(bool fRecordForensics = true);
     void StartRecoveryResponseWindow(uint64_t id, int64_t send_us);
     bool ObserveRecoveryResponseInv(int64_t now_us, const RecoveryResponseObservation& observation, RecoveryResponseResult& result);
     bool ExpireRecoveryResponseWindow(int64_t now_us, RecoveryResponseResult& result);
@@ -1943,7 +1967,7 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     void Subscribe(unsigned int nChannel, unsigned int nHops=0);
     void CancelSubscribe(unsigned int nChannel);
     void CloseSocketDisconnect();
-	void Cleanup();
+	void Cleanup(NodeCleanupMode mode = NODE_CLEANUP_RUNTIME);
 
     // Denial-of-service detection/prevention
     // The idea is to detect peers that are behaving

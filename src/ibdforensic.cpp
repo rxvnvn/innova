@@ -8,6 +8,7 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <deque>
 
@@ -30,7 +31,7 @@ namespace ibdforensic {
 
 namespace {
 
-volatile bool g_enabled = false;
+std::atomic<bool> g_enabled(false);
 std::string g_path;
 CCriticalSection g_mutex;
 
@@ -163,7 +164,7 @@ const GenerationRecord* LegacyRowGenerationLocked(const BatchEntry& e)
 void SetEnabled(bool fEnabled, const std::string& strPath)
 {
     LOCK(g_mutex);
-    g_enabled = fEnabled;
+    g_enabled.store(fEnabled, std::memory_order_release);
     g_path = strPath;
 
     if (!fEnabled || strPath.empty())
@@ -191,7 +192,7 @@ void SetEnabled(bool fEnabled, const std::string& strPath)
 
 bool IsEnabled()
 {
-    return g_enabled;
+    return g_enabled.load(std::memory_order_acquire);
 }
 
 void ResetForTesting()
@@ -207,7 +208,7 @@ void ResetForTesting()
     g_unstampedBatches.clear();
     g_generations.clear();
     g_path.clear();
-    g_enabled = true;
+    g_enabled.store(true, std::memory_order_release);
 }
 
 void RecordGetDataBatch(int peer, const std::vector<uint256>& vBlockHashes,
@@ -215,7 +216,7 @@ void RecordGetDataBatch(int peer, const std::vector<uint256>& vBlockHashes,
                         const uint256& hashLastBlockInBatch,
                         int nExpectedBatchSize)
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     if (vBlockHashes.empty())
         return;
@@ -278,7 +279,7 @@ void RecordGetDataBatch(int peer, const std::vector<uint256>& vBlockHashes,
 void RecordReceived(int peer, const uint256& hash, int64_t nDispatchUs,
                     int64_t nFramingCompleteUs)
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     LOCK(g_mutex);
     std::map<uint256, BatchEntry>::iterator it = g_entries.find(hash);
@@ -327,7 +328,7 @@ void RecordReceived(int peer, const uint256& hash, int64_t nDispatchUs,
 void RecordGenerationStart(int peer, const uint256& hash, int64_t nNowUs,
                            int announcePeer, bool diversified)
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     LOCK(g_mutex);
     std::vector<GenerationRecord>& gens = g_generations[hash].gens;
@@ -349,7 +350,7 @@ void RecordGenerationStart(int peer, const uint256& hash, int64_t nNowUs,
 void RecordGenerationEnd(const uint256& hash, int64_t nNowUs,
                          const char* pszReason)
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     LOCK(g_mutex);
     std::map<uint256, HashGenerations>::iterator gi = g_generations.find(hash);
@@ -380,7 +381,7 @@ void RecordGenerationEnd(const uint256& hash, int64_t nNowUs,
 void RecordSocketSend(const char* pszCommand, int64_t nNowUs,
                       size_t nSendSizeAtFirstSend)
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     if (pszCommand == NULL || strcmp(pszCommand, "getdata") != 0)
         return;
@@ -399,7 +400,7 @@ void RecordSocketSend(const char* pszCommand, int64_t nNowUs,
 void RecordExpired(int peer, const uint256& hash, int64_t nNowUs,
                    int64_t nHeadAgeUs)
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     LOCK(g_mutex);
     std::map<uint256, BatchEntry>::iterator it = g_entries.find(hash);
@@ -415,7 +416,7 @@ void RecordExpired(int peer, const uint256& hash, int64_t nNowUs,
 
 void CountGetBlocksRateLimitInbound()
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     LOCK(g_mutex);
     ++g_rate.inboundRateLimited;
@@ -423,7 +424,7 @@ void CountGetBlocksRateLimitInbound()
 
 void CountGetBlocksRateLimitOutboundDedup()
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     LOCK(g_mutex);
     ++g_rate.outboundDedupSkipped;
@@ -431,7 +432,7 @@ void CountGetBlocksRateLimitOutboundDedup()
 
 void CountGetBlocksRateLimitOutboundWakeCooldown()
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     LOCK(g_mutex);
     ++g_rate.outboundWakeCooldown;
@@ -439,7 +440,7 @@ void CountGetBlocksRateLimitOutboundWakeCooldown()
 
 void CountGetBlocksOutstandingNoResponse(uint64_t nOutstanding)
 {
-    if (!g_enabled)
+    if (!g_enabled.load(std::memory_order_acquire))
         return;
     LOCK(g_mutex);
     g_rate.outstandingNoResponse += nOutstanding;
@@ -862,6 +863,18 @@ bool Dump()
               g_path.c_str(), (unsigned)g_batches.size(),
               (unsigned long long)g_entries.size());
     return true;
+}
+
+void ShutdownAndDump()
+{
+    LOCK(g_mutex);
+    g_enabled.store(false, std::memory_order_release);
+    Dump();
+    g_batches.clear();
+    g_entries.clear();
+    g_generations.clear();
+    g_peerLastReceiveUs.clear();
+    g_unstampedBatches.clear();
 }
 
 size_t BatchCount()

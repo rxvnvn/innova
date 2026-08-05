@@ -156,7 +156,7 @@ void Shutdown(void* parg)
         FlushIBDBatch();
         IBDEfficiencyShutdownSummary();
         ibdblocklatency::Dump();
-        ibdforensic::Dump();
+        ibdforensic::ShutdownAndDump();
 
         if(idns) {
             delete idns;
