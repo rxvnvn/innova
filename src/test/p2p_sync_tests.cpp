@@ -201,6 +201,153 @@ public:
     }
 };
 
+// Full orphan-storage snapshot: block table, by-prev index, per-peer bookkeeping
+// and the proof-of-stake kernel marker set, restored on scope exit.
+class CScopedOrphanStorage
+{
+private:
+    std::map<uint256, CBlock*> savedBlocks;
+    std::multimap<uint256, CBlock*> savedByPrev;
+    std::map<uint256, NodeId> savedByNode;
+    std::map<NodeId, int> savedCount;
+    std::set<std::pair<COutPoint, unsigned int> > savedStakeSeen;
+
+public:
+    CScopedOrphanStorage()
+    {
+        LOCK(cs_main);
+        savedBlocks = mapOrphanBlocks;
+        savedByPrev = mapOrphanBlocksByPrev;
+        savedByNode = mapOrphanBlocksByNode;
+        savedCount = mapOrphanCountByNode;
+        savedStakeSeen = setStakeSeenOrphan;
+        mapOrphanBlocks.clear();
+        mapOrphanBlocksByPrev.clear();
+        mapOrphanBlocksByNode.clear();
+        mapOrphanCountByNode.clear();
+        setStakeSeenOrphan.clear();
+    }
+
+    ~CScopedOrphanStorage()
+    {
+        LOCK(cs_main);
+        for (std::map<uint256, CBlock*>::iterator it = mapOrphanBlocks.begin();
+             it != mapOrphanBlocks.end(); ++it)
+            delete it->second;
+        mapOrphanBlocks = savedBlocks;
+        mapOrphanBlocksByPrev = savedByPrev;
+        mapOrphanBlocksByNode = savedByNode;
+        mapOrphanCountByNode = savedCount;
+        setStakeSeenOrphan = savedStakeSeen;
+    }
+};
+
+// Overrides -maxorphanblocks for the duration of the scope so PruneOrphanBlocks
+// can be exercised with a tiny table.
+class CScopedMaxOrphanBlocks
+{
+private:
+    std::string strSaved;
+    bool fHad;
+
+public:
+    explicit CScopedMaxOrphanBlocks(const std::string& strValue)
+    {
+        fHad = mapArgs.count("-maxorphanblocks") != 0;
+        if (fHad)
+            strSaved = mapArgs["-maxorphanblocks"];
+        mapArgs["-maxorphanblocks"] = strValue;
+    }
+
+    ~CScopedMaxOrphanBlocks()
+    {
+        if (fHad)
+            mapArgs["-maxorphanblocks"] = strSaved;
+        else
+            mapArgs.erase("-maxorphanblocks");
+    }
+};
+
+// Builds a proof-of-stake block whose kernel identity is exactly (prevout,
+// nTime), with a distinct block hash per seed.
+static CBlock* MakePosOrphanBlock(
+    const std::pair<COutPoint, unsigned int>& stake, unsigned int nSeed)
+{
+    CBlock* pblock = new CBlock();
+    pblock->nTime = 1000 + nSeed;
+    pblock->hashPrevBlock = uint256(nSeed);
+
+    CTransaction coinstake;
+    coinstake.nTime = stake.second;
+    CTxIn in(stake.first);
+    coinstake.vin.push_back(in);
+    CTxOut emptyOut;
+    emptyOut.SetEmpty();
+    coinstake.vout.push_back(emptyOut);
+    CTxOut valueOut;
+    valueOut.nValue = 1;
+    coinstake.vout.push_back(valueOut);
+
+    pblock->vtx.push_back(CTransaction());
+    pblock->vtx.push_back(coinstake);
+    return pblock;
+}
+
+// Mirrors the orphan-store bookkeeping on the receive path (mapOrphanBlocks,
+// mapOrphanBlocksByPrev, setStakeSeenOrphan, and optional per-peer counts).
+static void RegisterPosOrphan(CBlock* pblock, NodeId peer = -1)
+{
+    const uint256 hash = pblock->GetHash();
+    mapOrphanBlocks[hash] = pblock;
+    mapOrphanBlocksByPrev.insert(std::make_pair(pblock->hashPrevBlock, pblock));
+    if (pblock->IsProofOfStake())
+        setStakeSeenOrphan.insert(pblock->GetProofOfStake());
+    if (peer >= 0)
+    {
+        mapOrphanBlocksByNode[hash] = peer;
+        mapOrphanCountByNode[peer]++;
+    }
+}
+
+// Mirrors the duplicate-stake-orphan reject gate on the receive path
+// (main.cpp, the setStakeSeenOrphan guard).
+static bool WouldRejectDuplicateStakeOrphan(const CBlock* pblock)
+{
+    return pblock->IsProofOfStake() &&
+           setStakeSeenOrphan.count(pblock->GetProofOfStake()) != 0 &&
+           mapOrphanBlocksByPrev.count(pblock->GetHash()) == 0 &&
+           !Checkpoints::WantedByPendingSyncCheckpoint(pblock->GetHash());
+}
+
+// Every stored orphan kernel must be marked and every marked kernel must be
+// referenced by at least one stored orphan.
+static void CheckOrphanStakeInvariant()
+{
+    for (std::map<uint256, CBlock*>::const_iterator it = mapOrphanBlocks.begin();
+         it != mapOrphanBlocks.end(); ++it)
+    {
+        if (it->second->IsProofOfStake())
+            BOOST_CHECK_EQUAL(setStakeSeenOrphan.count(it->second->GetProofOfStake()), 1U);
+    }
+    for (std::set<std::pair<COutPoint, unsigned int> >::const_iterator it =
+             setStakeSeenOrphan.begin();
+         it != setStakeSeenOrphan.end(); ++it)
+    {
+        bool fReferenced = false;
+        for (std::map<uint256, CBlock*>::const_iterator mo = mapOrphanBlocks.begin();
+             mo != mapOrphanBlocks.end(); ++mo)
+        {
+            if (mo->second->IsProofOfStake() &&
+                mo->second->GetProofOfStake() == *it)
+            {
+                fReferenced = true;
+                break;
+            }
+        }
+        BOOST_CHECK_MESSAGE(fReferenced, "stale stake kernel with no orphan");
+    }
+}
+
 class CScopedInitialBlockDownloadState
 {
 private:
@@ -658,7 +805,6 @@ BOOST_AUTO_TEST_CASE(orphan_chain_requests_root_missing_ancestor)
     pParent->hashPrevBlock = uint256(7009);
     const uint256 hashParent = pParent->GetHash();
     mapOrphanBlocks[hashParent] = pParent;
-
     CBlock* pChild = new CBlock();
     pChild->nTime = 7011;
     pChild->hashPrevBlock = hashParent;
@@ -670,6 +816,175 @@ BOOST_AUTO_TEST_CASE(orphan_chain_requests_root_missing_ancestor)
     BOOST_CHECK(WantedByOrphan(pChild) != hashParent);
 }
 
+BOOST_AUTO_TEST_CASE(orphan_prune_releases_stale_stake_kernel)
+{
+    CScopedOrphanStorage isolated;
+    CScopedMaxOrphanBlocks scopedMax("1");
+
+    const std::pair<COutPoint, unsigned int> stakeA(
+        COutPoint(uint256(9001), 0), 1001);
+    const std::pair<COutPoint, unsigned int> stakeB(
+        COutPoint(uint256(9002), 0), 1002);
+    CBlock* pA = MakePosOrphanBlock(stakeA, 1);
+    CBlock* pB = MakePosOrphanBlock(stakeB, 2);
+    RegisterPosOrphan(pA, 10);
+    RegisterPosOrphan(pB, 10);
+    BOOST_REQUIRE_EQUAL(mapOrphanBlocks.size(), 2U);
+    BOOST_REQUIRE_EQUAL(setStakeSeenOrphan.size(), 2U);
+
+    PruneOrphanBlocks();
+
+    BOOST_CHECK_EQUAL(mapOrphanBlocks.size(), 1U);
+    BOOST_CHECK_EQUAL(setStakeSeenOrphan.size(), 1U);
+    CheckOrphanStakeInvariant();
+}
+
+BOOST_AUTO_TEST_CASE(orphan_prune_decrements_per_peer_count)
+{
+    CScopedOrphanStorage isolated;
+    CScopedMaxOrphanBlocks scopedMax("1");
+
+    const std::pair<COutPoint, unsigned int> stakeA(
+        COutPoint(uint256(9101), 0), 1101);
+    const std::pair<COutPoint, unsigned int> stakeB(
+        COutPoint(uint256(9102), 0), 1102);
+    CBlock* pA = MakePosOrphanBlock(stakeA, 11);
+    CBlock* pB = MakePosOrphanBlock(stakeB, 12);
+    RegisterPosOrphan(pA, 100);
+    RegisterPosOrphan(pB, 200);
+    BOOST_REQUIRE_EQUAL(mapOrphanCountByNode[100], 1);
+    BOOST_REQUIRE_EQUAL(mapOrphanCountByNode[200], 1);
+
+    PruneOrphanBlocks();
+
+    BOOST_CHECK_EQUAL(mapOrphanBlocks.size(), 1U);
+    for (std::map<NodeId, int>::const_iterator it = mapOrphanCountByNode.begin();
+         it != mapOrphanCountByNode.end(); ++it)
+    {
+        int nOwned = 0;
+        for (std::map<uint256, CBlock*>::const_iterator mo = mapOrphanBlocks.begin();
+             mo != mapOrphanBlocks.end(); ++mo)
+        {
+            std::map<uint256, NodeId>::const_iterator ni =
+                mapOrphanBlocksByNode.find(mo->first);
+            if (ni != mapOrphanBlocksByNode.end() && ni->second == it->first)
+                ++nOwned;
+        }
+        BOOST_CHECK_EQUAL(it->second, nOwned);
+    }
+    CheckOrphanStakeInvariant();
+}
+
+BOOST_AUTO_TEST_CASE(orphan_connection_releases_stake_kernel)
+{
+    CScopedOrphanStorage isolated;
+
+    const std::pair<COutPoint, unsigned int> stake(
+        COutPoint(uint256(9201), 0), 1201);
+    CBlock* pblock = MakePosOrphanBlock(stake, 21);
+    RegisterPosOrphan(pblock);
+    BOOST_REQUIRE_EQUAL(setStakeSeenOrphan.count(stake), 1U);
+
+    // Parent connected: the orphan leaves the table and the parent-connect
+    // loop releases the kernel through the shared cleanup helper.
+    mapOrphanBlocks.erase(pblock->GetHash());
+    EraseStakeSeenOrphanIfUnreferenced(stake);
+    BOOST_CHECK_EQUAL(setStakeSeenOrphan.count(stake), 0U);
+    BOOST_CHECK(setStakeSeenOrphan.empty());
+
+    // A re-delivery of the same block no longer trips the
+    // duplicate-stake-orphan reject gate.
+    BOOST_CHECK(!WouldRejectDuplicateStakeOrphan(pblock));
+    delete pblock;
+}
+
+BOOST_AUTO_TEST_CASE(pruned_orphan_redelivery_is_not_stale_kernel_rejected)
+{
+    CScopedOrphanStorage isolated;
+    CScopedMaxOrphanBlocks scopedMax("1");
+
+    const std::pair<COutPoint, unsigned int> stakeA(
+        COutPoint(uint256(9301), 0), 1301);
+    const std::pair<COutPoint, unsigned int> stakeB(
+        COutPoint(uint256(9302), 0), 1302);
+    CBlock* pA = MakePosOrphanBlock(stakeA, 31);
+    CBlock* pB = MakePosOrphanBlock(stakeB, 32);
+    const uint256 hashA = pA->GetHash();
+    const uint256 hashB = pB->GetHash();
+    RegisterPosOrphan(pA, 300);
+    RegisterPosOrphan(pB, 300);
+
+    PruneOrphanBlocks();
+    BOOST_REQUIRE_EQUAL(mapOrphanBlocks.size(), 1U);
+
+    // Identify which orphan survived and which was evicted.
+    uint256 survivor = mapOrphanBlocks.begin()->first;
+    const uint256 evictedHash = (survivor == hashA) ? hashB : hashA;
+    const std::pair<COutPoint, unsigned int> evictedStake =
+        (survivor == hashA) ? stakeB : stakeA;
+
+    // The evicted orphan's kernel marker must be gone, so its re-delivery is
+    // accepted again instead of being terminally rejected as a duplicate stake.
+    BOOST_CHECK_EQUAL(setStakeSeenOrphan.count(evictedStake), 0U);
+    const bool fWouldReject =
+        setStakeSeenOrphan.count(evictedStake) != 0 &&
+        mapOrphanBlocksByPrev.count(evictedHash) == 0 &&
+        !Checkpoints::WantedByPendingSyncCheckpoint(evictedHash);
+    BOOST_CHECK(!fWouldReject);
+    CheckOrphanStakeInvariant();
+}
+
+BOOST_AUTO_TEST_CASE(shared_stake_kernel_survives_single_orphan_removal)
+{
+    CScopedOrphanStorage isolated;
+
+    // Two distinct blocks sharing one stake identity (duplicate stake allowed
+    // on the orphan path while an orphan child depends on the block).
+    const std::pair<COutPoint, unsigned int> stake(
+        COutPoint(uint256(9501), 0), 1501);
+    CBlock* pOne = MakePosOrphanBlock(stake, 41);
+    CBlock* pTwo = MakePosOrphanBlock(stake, 42);
+    BOOST_REQUIRE(pOne->GetHash() != pTwo->GetHash());
+    RegisterPosOrphan(pOne);
+    RegisterPosOrphan(pTwo);
+    BOOST_REQUIRE_EQUAL(setStakeSeenOrphan.size(), 1U);
+
+    // Removing one orphan must not drop the kernel while the other still holds it.
+    mapOrphanBlocks.erase(pOne->GetHash());
+    EraseStakeSeenOrphanIfUnreferenced(stake);
+    BOOST_CHECK_EQUAL(setStakeSeenOrphan.count(stake), 1U);
+
+    // Removing the last reference drops the kernel.
+    mapOrphanBlocks.erase(pTwo->GetHash());
+    EraseStakeSeenOrphanIfUnreferenced(stake);
+    BOOST_CHECK_EQUAL(setStakeSeenOrphan.count(stake), 0U);
+    BOOST_CHECK(setStakeSeenOrphan.empty());
+
+    delete pOne;
+    delete pTwo;
+}
+
+BOOST_AUTO_TEST_CASE(orphan_prune_keeps_kernel_shared_by_survivor)
+{
+    CScopedOrphanStorage isolated;
+    CScopedMaxOrphanBlocks scopedMax("1");
+
+    const std::pair<COutPoint, unsigned int> stakeK(
+        COutPoint(uint256(9601), 0), 1601);
+    const std::pair<COutPoint, unsigned int> stakeU(
+        COutPoint(uint256(9602), 0), 1602);
+    CBlock* pK1 = MakePosOrphanBlock(stakeK, 51);
+    CBlock* pK2 = MakePosOrphanBlock(stakeK, 52);
+    CBlock* pU = MakePosOrphanBlock(stakeU, 53);
+    RegisterPosOrphan(pK1);
+    RegisterPosOrphan(pK2);
+    RegisterPosOrphan(pU);
+    BOOST_REQUIRE_EQUAL(setStakeSeenOrphan.size(), 2U);
+
+    PruneOrphanBlocks();
+    BOOST_CHECK_EQUAL(mapOrphanBlocks.size(), 2U);
+    CheckOrphanStakeInvariant();
+}
 
 BOOST_AUTO_TEST_CASE(block_askfor_can_retry_after_inflight_expiry)
 {

@@ -392,8 +392,22 @@ extern CCriticalSection cs_setpwalletRegistered;
 extern std::set<CWallet*> setpwalletRegistered;
 extern unsigned char pchMessageStart[4];
 extern std::map<uint256, CBlock*> mapOrphanBlocks;
+extern std::multimap<uint256, CBlock*> mapOrphanBlocksByPrev;
 extern std::map<uint256, NodeId> mapOrphanBlocksByNode;
 extern std::map<NodeId, int> mapOrphanCountByNode;
+extern std::set<std::pair<COutPoint, unsigned int> > setStakeSeenOrphan;
+
+// Release an orphan proof-of-stake kernel marker only when no stored orphan
+// still references it.  Keeps setStakeSeenOrphan in sync with the orphan table
+// on every orphan-removal path (prune and parent-connect), so an evicted
+// orphan cannot leave a stale marker that terminally rejects re-deliveries of
+// the same block (PBREJECT_DUPLICATE_STAKE_ORPHAN), and a kernel shared by a
+// duplicate orphan is not dropped while that orphan is still stored.
+void EraseStakeSeenOrphanIfUnreferenced(const std::pair<COutPoint, unsigned int>& stake);
+
+// Randomly evict one orphan (plus any selected descendants) once the orphan
+// table exceeds -maxorphanblocks.
+void PruneOrphanBlocks();
 extern std::map<int64_t, CAnonOutputCount> mapAnonOutputStats;
 
 bool ShouldSkipBlockInvForOrphanPressure(CNode* pfrom, const CInv& inv,
