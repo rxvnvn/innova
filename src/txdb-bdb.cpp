@@ -122,6 +122,18 @@ bool CTxDB::WriteBestInvalidTrust(CBigNum bnBestInvalidTrust)
     return Write(string("bnBestInvalidTrust"), bnBestInvalidTrust);
 }
 
+bool CTxDB::ReadInvalidBlockSet(std::set<uint256>& setInvalidBlockHash)
+{
+    setInvalidBlockHash.clear();
+    // Missing key means the operator has not invalidated anything yet.
+    return Read(string("setInvalidBlockHash"), setInvalidBlockHash);
+}
+
+bool CTxDB::WriteInvalidBlockSet(const std::set<uint256>& setInvalidBlockHash)
+{
+    return Write(string("setInvalidBlockHash"), setInvalidBlockHash);
+}
+
 bool CTxDB::ReadSyncCheckpoint(uint256& hashCheckpoint)
 {
     return Read(string("hashSyncCheckpoint"), hashCheckpoint);
@@ -199,6 +211,11 @@ bool CTxDB::LoadBlockIndex()
             return error("CTxDB::LoadBlockIndex() : Failed stake modifier checkpoint height=%d, modifier=0x%016" PRIx64, pindex->nHeight, pindex->nStakeModifier);
     }
 
+    // Load operator-invalidated block hashes BEFORE best-chain reconstruction so
+    // a stored best chain that descends from an invalidated block is healed
+    // below and never accepted as the active chain.
+    ReadInvalidBlockSet(setInvalidBlockHash);
+
     // Load hashBestChain pointer to end of best chain
     if (!ReadHashBestChain(hashBestChain))
     {
@@ -211,6 +228,13 @@ bool CTxDB::LoadBlockIndex()
     pindexBest = mapBlockIndex[hashBestChain];
     nBestHeight = pindexBest->nHeight;
     nBestChainTrust = pindexBest->nChainTrust;
+
+    // Crash-window healing: a crash between persisting an operator-invalidated
+    // hash and rolling back the active chain leaves hashBestChain descending
+    // from that hash. Roll back to the highest valid ancestor before the node
+    // starts operating.
+    if (!RecoverFromInvalidatedBestChain())
+        return error("CTxDB::LoadBlockIndex() : failed to recover from invalidated best chain");
 
     // Legacy releases did not reliably persist hashNext. Rebuild the
     // authoritative forward chain from pprev and hashBestChain so getblocks

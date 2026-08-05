@@ -791,6 +791,42 @@ Value setbestblockbyheight(const Array& params, bool fHelp)
     return result;
 }
 
+Value invalidateblock(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "invalidateblock <hash>\n"
+            "Permanently marks a block as invalid, as if it failed validation.\n"
+            "Note: this applies to the block and all its descendants. The active\n"
+            "chain is rolled back to the block's parent and the best eligible\n"
+            "alternative chain is re-activated. The invalidation persists across\n"
+            "restarts; use 'reconsiderblock' to undo it.\n"
+            "This is an operator action, not a consensus failure - it never\n"
+            "punishes peers. Cannot invalidate the genesis block or a block below\n"
+            "the finalized height.");
+
+    std::string strError;
+    if (!InvalidateBlock(ParseHashV(params[0], "hash"), strError))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strError);
+    return Value::null;
+}
+
+Value reconsiderblock(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "reconsiderblock <hash>\n"
+            "Removes the invalidity caused by 'invalidateblock' for the given\n"
+            "block (and, transitively, for its descendants that are not otherwise\n"
+            "explicitly invalidated). The best eligible chain is then re-activated,\n"
+            "which may re-connect the reconsidered branch.");
+
+    std::string strError;
+    if (!ReconsiderBlock(ParseHashV(params[0], "hash"), strError))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, strError);
+    return Value::null;
+}
+
 // ppcoin: get information of sync-checkpoint
 Value getcheckpoint(const Array& params, bool fHelp)
 {

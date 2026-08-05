@@ -375,6 +375,11 @@ extern int nCoinbaseMaturity;
 extern int nBestHeight;
 extern uint256 nBestChainTrust;
 extern uint256 nBestInvalidTrust;
+// Block hashes explicitly invalidated by the node operator via the
+// invalidateblock RPC.  Descendants of an entry are treated as implicitly
+// invalid (see IsBlockOperatorInvalid).  Persisted in the txdb so the
+// invalidation survives restart.
+extern std::set<uint256> setInvalidBlockHash;
 extern uint256 hashBestChain;
 extern CBlockIndex* pindexBest;
 //extern unsigned int nTransactionsUpdated;
@@ -490,6 +495,22 @@ FILE* AppendBlockFile(unsigned int& nFileRet);
 bool LoadBlockIndex(bool fAllowNew=true);
 void PrintBlockTree();
 CBlockIndex* FindBlockByHeight(int nHeight);
+// True when the block itself or any ancestor is in setInvalidBlockHash (i.e.
+// the operator invalidated it).  Must be consulted on every path that can
+// activate a chain; enforcement is done in one place for all call sites.
+bool IsBlockOperatorInvalid(const CBlockIndex* pindex);
+// Mark hash and its active-chain descendants invalid, rolling the active chain
+// back to the block's parent (and activating the best eligible alternative).
+// Returns false with *pszError set on prevalidation failure (no state change).
+bool InvalidateBlock(const uint256& hash, std::string& strError);
+// Clear the operator-invalidation of exactly hash, then activate the best
+// eligible chain (which may re-connect the reconsidered branch).  Returns false
+// with *pszError set on prevalidation failure (no state change).
+bool ReconsiderBlock(const uint256& hash, std::string& strError);
+// Called from CTxDB::LoadBlockIndex (both backends) after setInvalidBlockHash is
+// loaded and the naive pindexBest reconstructed: rolls the best chain back to
+// the highest valid ancestor if it descends from an operator-invalidated block.
+bool RecoverFromInvalidatedBestChain();
 bool ProcessMessages(CNode* pfrom);
 bool SendMessages(CNode* pto, bool fSendTrickle,
                   const std::vector<CNode*>& vNodesCopy = std::vector<CNode*>());

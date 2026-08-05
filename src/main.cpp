@@ -94,6 +94,7 @@ static std::map<NodeId, uint64_t> mapHeadersRecvDiagCount;
 bool CollateralNReorgBlock = true;
 uint256 nBestChainTrust = 0;
 uint256 nBestInvalidTrust = 0;
+std::set<uint256> setInvalidBlockHash;
 
 // Peer that delivered the block currently being processed on this thread.
 // Populated by ProcessBlock so trace hooks inside SetBestChain/Reorganize can
@@ -664,6 +665,7 @@ const char* ProcessBlockRejectReasonName(ProcessBlockRejectReason reason)
     case PBREJECT_ORPHAN_LIMIT_IBD: return "ORPHAN_LIMIT_IBD";
     case PBREJECT_ORPHAN_LIMIT_NORMAL: return "ORPHAN_LIMIT_NORMAL";
     case PBREJECT_DUPLICATE_STAKE_ORPHAN: return "DUPLICATE_STAKE_ORPHAN";
+    case PBREJECT_OPERATOR_INVALIDATED: return "OPERATOR_INVALIDATED";
     case PBREJECT_ACCEPTBLOCK_FALSE: return "ACCEPTBLOCK_FALSE";
     case PBREJECT_UNKNOWN_FALSE: return "UNKNOWN_FALSE";
     }
@@ -5990,6 +5992,12 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 {
     printf("REORGANIZE\n");
 
+    // Operator-invalidation gate (defense in depth; SetBestChain precedes every
+    // Reorganize call, but guard here too for direct callers).
+    if (IsBlockOperatorInvalid(pindexNew))
+        return error("Reorganize() : block %s (or an ancestor) is invalidated by the operator",
+                     pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+
     {
         int nFinalHeight = g_finalityTracker.GetFinalizedHeight();
         if (nFinalHeight > 0 && pindexBest && pindexBest->nHeight >= FORK_HEIGHT_FINALITY)
@@ -6195,6 +6203,12 @@ bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
 {
     uint256 hash = GetHash();
 
+    // Operator-invalidation gate (defense in depth; the primary gate is in
+    // SetBestChain, which precedes every SetBestChainInner call).
+    if (IsBlockOperatorInvalid(pindexNew))
+        return error("SetBestChainInner() : block %s (or an ancestor) is invalidated by the operator",
+                     pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+
     // Adding to current best branch
     if (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash))
     {
@@ -6237,6 +6251,11 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
         ibdactivepath::GetCounters().setbestchain_us_max,
         ibdactivepath::GetCounters().setbestchain_count,
         "setbestchain", pindexNew->nHeight);
+    // Operator-invalidation gate: never activate a chain that descends from an
+    // operator-invalidated block, regardless of how it reached SetBestChain.
+    if (IsBlockOperatorInvalid(pindexNew))
+        return error("SetBestChain() : block %s (or an ancestor) is invalidated by the operator",
+                     pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
     uint256 hash = GetHash();
     ibdblocklatency::RecordSetBestChainBegin(hash);
     const uint256 hashOldBest = hashBestChain;
@@ -6850,6 +6869,16 @@ bool CBlock::AcceptBlock()
     CBlockIndex* pindexPrev = (*mi).second;
     int nHeight = pindexPrev->nHeight+1;
 
+    // Operator-invalidation gate: reject the block (and any descendant of an
+    // operator-invalidated block) without peer punishment. This is not a
+    // consensus failure, so DoS()/InvalidChainFound are deliberately avoided.
+    if (setInvalidBlockHash.count(hash))
+        return error("AcceptBlock() : block %s is invalidated by the operator",
+                     hash.ToString().substr(0, 20).c_str());
+    if (IsBlockOperatorInvalid(pindexPrev))
+        return error("AcceptBlock() : previous block %s (or an ancestor) is invalidated by the operator",
+                     hashPrevBlock.ToString().substr(0, 20).c_str());
+
     if (nHeight >= FORK_HEIGHT_DAG && IsProofOfStake())
         return DoS(100, error("AcceptBlock() : proof-of-stake blocks are not allowed after DAG fork height %d", FORK_HEIGHT_DAG));
 
@@ -7080,6 +7109,278 @@ bool CBlockIndex::IsSuperMajority(int minVersion, const CBlockIndex* pstart, uns
     return (nFound >= nRequired);
 }
 
+// -----------------------------------------------------------------------------
+// Operator block invalidation (invalidateblock / reconsiderblock).
+//
+// Semantics:
+//  * setInvalidBlockHash holds ONLY explicitly invalidated hashes. A block is
+//    treated as invalid if it or any ancestor is in the set, so descendants of
+//    an entry are implicitly invalid.
+//  * The set is persisted (txdb, both backends) BEFORE any active-chain
+//    rollback. If a crash separates the two, startup re-runs the rollback (see
+//    RecoverFromInvalidatedBestChain) so the database never settles with an
+//    active tip descending from an operator-invalidated block.
+//  * Operator invalidation is not a consensus failure: it never raises
+//    nBestInvalidTrust and never triggers peer punishment.
+// -----------------------------------------------------------------------------
+
+bool IsBlockOperatorInvalid(const CBlockIndex* pindex)
+{
+    if (pindex == NULL || setInvalidBlockHash.empty())
+        return false;
+    for (const CBlockIndex* p = pindex; p != NULL; p = p->pprev)
+        if (setInvalidBlockHash.count(*p->phashBlock))
+            return true;
+    return false;
+}
+
+static bool PersistInvalidBlockSet()
+{
+    CTxDB txdb;
+    if (!txdb.TxnBegin())
+        return false;
+    txdb.WriteInvalidBlockSet(setInvalidBlockHash);
+    return txdb.TxnCommit();
+}
+
+static bool IsAncestorOfBest(const CBlockIndex* pindex)
+{
+    for (const CBlockIndex* p = pindexBest; p != NULL; p = p->pprev)
+        if (p == pindex)
+            return true;
+    return false;
+}
+
+// Roll the active chain back so its tip becomes pindexTarget (an ancestor of
+// the current best). Reuses SetBestChain/Reorganize, so finality, DAG and
+// stake-seen cleanup are handled by the existing machinery. The wallet and
+// collateral callbacks inside that machinery are safe with no wallet /
+// collateral nodes registered (startup healing).
+static bool RollbackActiveChainTo(CBlockIndex* pindexTarget)
+{
+    AssertLockHeld(cs_main);
+    if (pindexBest == NULL)
+        return false;
+    if (pindexTarget == NULL || pindexTarget == pindexBest)
+        return true;
+
+    CBlock block;
+    if (!block.ReadFromDisk(pindexTarget))
+        return error("RollbackActiveChainTo() : ReadFromDisk failed");
+    CTxDB txdb;
+    if (!block.SetBestChain(txdb, pindexTarget))
+        return error("RollbackActiveChainTo() : SetBestChain failed");
+    return true;
+}
+
+// Activate the best eligible chain tip (the ActivateBestChain equivalent in
+// this trust-based client). Only leaf tips are considered so an internal
+// ancestor can never suppress a better descendant. Candidates must not be
+// operator-invalid, must have block data on disk, and must have a fork point at
+// or above the finalized height.
+static bool ActivateBestEligibleChain()
+{
+    AssertLockHeld(cs_main);
+    if (pindexBest == NULL || mapBlockIndex.empty())
+        return true;
+
+    std::set<uint256> setReferenced;
+    for (const PAIRTYPE(const uint256, CBlockIndex*)& item : mapBlockIndex)
+        if (item.second->pprev != NULL)
+            setReferenced.insert(*item.second->pprev->phashBlock);
+
+    const int nFinalHeight = g_finalityTracker.GetFinalizedHeight();
+    CBlockIndex* pindexCandidate = NULL;
+    for (const PAIRTYPE(const uint256, CBlockIndex*)& item : mapBlockIndex)
+    {
+        CBlockIndex* pindex = item.second;
+        if (setReferenced.count(*pindex->phashBlock))
+            continue; // not a tip
+        if (IsBlockOperatorInvalid(pindex))
+            continue;
+        if (pindex->nChainTrust <= nBestChainTrust)
+            continue;
+        CBlock block;
+        if (!block.ReadFromDisk(pindex))
+            continue; // incomplete / header-only index entry
+        if (nFinalHeight > 0 && pindexBest->nHeight >= FORK_HEIGHT_FINALITY)
+        {
+            CBlockIndex* pFork = pindex;
+            CBlockIndex* pOther = pindexBest;
+            while (pFork != pOther)
+            {
+                while (pFork != NULL && pFork->nHeight > pOther->nHeight)
+                    pFork = pFork->pprev;
+                if (pFork == pOther)
+                    break;
+                if (pOther != NULL)
+                    pOther = pOther->pprev;
+            }
+            if (pFork == NULL || pFork->nHeight < nFinalHeight)
+                continue; // would be rejected by SetBestChain anyway
+        }
+        if (pindexCandidate == NULL ||
+            pindex->nChainTrust > pindexCandidate->nChainTrust)
+            pindexCandidate = pindex;
+    }
+
+    if (pindexCandidate == NULL)
+        return true;
+
+    CBlock block;
+    if (!block.ReadFromDisk(pindexCandidate))
+        return true;
+    CTxDB txdb;
+    if (!block.SetBestChain(txdb, pindexCandidate))
+        return error("ActivateBestEligibleChain() : SetBestChain failed");
+    return true;
+}
+
+bool InvalidateBlock(const uint256& hash, std::string& strError)
+{
+    LOCK(cs_main);
+
+    std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
+    if (mi == mapBlockIndex.end())
+    {
+        strError = "Block not found";
+        return false;
+    }
+    CBlockIndex* pindex = mi->second;
+    if (pindex->nHeight == 0)
+    {
+        strError = "The genesis block cannot be invalidated";
+        return false;
+    }
+    if (fImporting || fReindex)
+    {
+        strError = "Cannot invalidate while importing or reindexing";
+        return false;
+    }
+    if (setInvalidBlockHash.count(hash))
+        return true; // idempotent: already explicitly invalidated
+
+    const bool fOnBest = IsAncestorOfBest(pindex);
+
+    // Prevalidate finality before any persistent mutation so the operator gets
+    // a deterministic error and the chain state is untouched.
+    if (fOnBest)
+    {
+        CBlockIndex* pTarget = pindex->pprev;
+        const int nFinalHeight = g_finalityTracker.GetFinalizedHeight();
+        if (nFinalHeight > 0 && pTarget != NULL && pTarget->nHeight < nFinalHeight)
+        {
+            strError = strprintf(
+                "Cannot invalidate block at height %d: its parent height %d is "
+                "below the finalized height %d",
+                pindex->nHeight, pTarget->nHeight, nFinalHeight);
+            return false;
+        }
+    }
+
+    // Persist FIRST. A crash here leaves the set written and the best chain
+    // un-rolled-back; startup healing completes the rollback.
+    setInvalidBlockHash.insert(hash);
+    if (!PersistInvalidBlockSet())
+    {
+        setInvalidBlockHash.erase(hash);
+        strError = "Failed to persist block invalidation";
+        return false;
+    }
+
+    if (fOnBest)
+    {
+        CBlockIndex* pTarget = pindex->pprev;
+        if (!RollbackActiveChainTo(pTarget))
+            printf("InvalidateBlock: rollback for %s failed; restart will heal the chain\n",
+                   hash.ToString().substr(0, 20).c_str());
+    }
+    ActivateBestEligibleChain();
+
+    if (pindexBest)
+        uiInterface.NotifyBlocksChanged(pindexBest->nHeight, GetNumBlocksOfPeers());
+
+    printf("InvalidateBlock: invalidated %s (height %d)\n",
+           hash.ToString().substr(0, 20).c_str(), pindex->nHeight);
+    return true;
+}
+
+bool ReconsiderBlock(const uint256& hash, std::string& strError)
+{
+    LOCK(cs_main);
+
+    std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
+    if (mi == mapBlockIndex.end())
+    {
+        strError = "Block not found";
+        return false;
+    }
+    if (fImporting || fReindex)
+    {
+        strError = "Cannot reconsider while importing or reindexing";
+        return false;
+    }
+    if (!setInvalidBlockHash.count(hash))
+        return true; // idempotent: not explicitly invalidated
+
+    // Remove exactly this hash. Other explicit invalidations (ancestors or
+    // descendants) are untouched.
+    setInvalidBlockHash.erase(hash);
+    if (!PersistInvalidBlockSet())
+    {
+        setInvalidBlockHash.insert(hash);
+        strError = "Failed to persist block reconsideration";
+        return false;
+    }
+
+    ActivateBestEligibleChain();
+
+    if (pindexBest)
+        uiInterface.NotifyBlocksChanged(pindexBest->nHeight, GetNumBlocksOfPeers());
+
+    printf("ReconsiderBlock: reconsidered %s\n", hash.ToString().substr(0, 20).c_str());
+    return true;
+}
+
+// Startup healing: if the stored hashBestChain descends from an
+// operator-invalidated block (a crash between persisting the invalid set and
+// rolling back the active chain), roll the chain back to the highest valid
+// ancestor before the node starts operating. Called from CTxDB::LoadBlockIndex
+// in both backends, after setInvalidBlockHash is loaded and after the naive
+// pindexBest reconstruction.
+bool RecoverFromInvalidatedBestChain()
+{
+    // cs_main is recursive; this may be called from inside or outside an
+    // existing cs_main hold (the -loadblockindextest diagnostic path calls
+    // CTxDB::LoadBlockIndex without holding it).
+    LOCK(cs_main);
+    if (setInvalidBlockHash.empty() || pindexBest == NULL)
+        return true;
+
+    // Find the highest valid ancestor of the best chain: every block above it
+    // is operator-invalid (invalidity is inherited, so the whole descendant
+    // region of an entry must be disconnected).
+    CBlockIndex* pHeal = NULL;
+    for (CBlockIndex* p = pindexBest; p != NULL; p = p->pprev)
+    {
+        if (!IsBlockOperatorInvalid(p))
+        {
+            pHeal = p;
+            break;
+        }
+    }
+    if (pHeal == NULL)
+        return error("RecoverFromInvalidatedBestChain() : no valid ancestor");
+    if (pHeal == pindexBest)
+        return true; // best chain has no operator-invalidated block
+
+    printf("RecoverFromInvalidatedBestChain: rolling best chain back from %s (height %d) to %s (height %d)\n",
+           pindexBest->GetBlockHash().ToString().substr(0, 20).c_str(), pindexBest->nHeight,
+           pHeal->GetBlockHash().ToString().substr(0, 20).c_str(), pHeal->nHeight);
+
+    return RollbackActiveChainTo(pHeal);
+}
+
 bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 {
     AssertLockHeld(cs_main);
@@ -7111,6 +7412,16 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_ORPHAN);
         ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_ALREADY_HAVE);
         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,20).c_str());
+    }
+
+    // Operator-invalidation gate: reject before any orphan admission or
+    // consensus work. This is not a consensus failure - no peer punishment and
+    // no InvalidChainFound (nBestInvalidTrust) update.
+    if (setInvalidBlockHash.count(hash)) {
+        TraceProcessBlockReject(pfrom, pblock, PBREJECT_OPERATOR_INVALIDATED);
+        ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
+        return error("ProcessBlock() : block %s is invalidated by the operator",
+                     hash.ToString().substr(0,20).c_str());
     }
 
     // ppcoin: check proof-of-stake
