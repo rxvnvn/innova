@@ -5724,6 +5724,7 @@ void CNode::Cleanup(NodeCleanupMode mode)
             ibdmetrics::DeferredAdd(-(int64_t)deferredBlockInv.size());
         setAskForBlocks.clear();
         setBlocksInFlight.clear();
+        mapBlockInFlightSince.clear();
         peerLiveActivePressure = 0;
         nFrontierDeferredHash = 0;
         ClearDiversifyDispatchForPeer(GetId());

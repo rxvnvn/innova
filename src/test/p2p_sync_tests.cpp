@@ -7076,4 +7076,117 @@ BOOST_AUTO_TEST_CASE(outstanding_gauge_tracks_single_flight_across_peers)
     SetMockTime(0);
 }
 
+// --- In-flight accounting reconciliation on peer cleanup ---------------------
+
+// Mark -> Cleanup -> Expire: the expiry pass on the stale peer must not
+// decrement the in-flight gauge a second time.  Cleanup clears the live set
+// (accounted once) and the timestamp container, so a later Expire is a no-op.
+BOOST_AUTO_TEST_CASE(cleanup_then_expire_does_not_double_decrement)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(1400), "cleanup-then-expire", true);
+    const uint256 hash(1400001);
+    const int64_t nGaugeBefore =
+        MetricGet(ibdmetrics::Get().total_inflight_current);
+
+    peer.MarkBlockInFlight(hash);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore + 1);
+    peer.mapBlockInFlightSince[hash] = GetTime() - 60;
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 1);
+
+    peer.Cleanup();
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK(peer.mapBlockInFlightSince.empty());
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore);
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore);
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+    BOOST_CHECK(peer.mapBlockInFlightSince.empty());
+}
+
+// A stale timestamp entry (present in mapBlockInFlightSince but absent from
+// the live in-flight set) is dropped by ExpireBlockInFlight without touching
+// the gauge or peer pressure.
+BOOST_AUTO_TEST_CASE(stale_map_entry_is_noop)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(1401), "stale-map-entry", true);
+    const int64_t nGaugeBefore =
+        MetricGet(ibdmetrics::Get().total_inflight_current);
+
+    peer.mapBlockInFlightSince[uint256(1400002)] = GetTime() - 60;
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK(peer.mapBlockInFlightSince.empty());
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore);
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+}
+
+// ExpireBlockInFlight is idempotent: a second pass on an already-expired
+// request changes no gauge and no peer pressure.
+BOOST_AUTO_TEST_CASE(repeated_expire_is_idempotent)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(1402), "repeated-expire", true);
+    const uint256 hash(1400003);
+    const int64_t nGaugeBefore =
+        MetricGet(ibdmetrics::Get().total_inflight_current);
+
+    peer.MarkBlockInFlight(hash);
+    peer.mapBlockInFlightSince[hash] = GetTime() - 60;
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 1);
+
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore);
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK(peer.mapBlockInFlightSince.empty());
+
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore);
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK(peer.mapBlockInFlightSince.empty());
+}
+
+// Cleanup reconciles every in-flight container: the live set, the timestamp
+// container, and the gauges all return to their pre-request values together.
+BOOST_AUTO_TEST_CASE(cleanup_preserves_invariants)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(1403), "cleanup-invariants", true);
+    const int64_t nGaugeBefore =
+        MetricGet(ibdmetrics::Get().total_inflight_current);
+
+    peer.MarkBlockInFlight(uint256(1400031));
+    peer.MarkBlockInFlight(uint256(1400032));
+    peer.AskFor(CInv(MSG_BLOCK, uint256(1400033)), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 2U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.size(), 2U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 1U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore + 2);
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 3);
+
+    peer.Cleanup();
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK(peer.mapBlockInFlightSince.empty());
+    BOOST_CHECK(peer.setAskForBlocks.empty());
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore);
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+
+    // A subsequent expiry pass (as a stale snapshot would drive) stays a no-op.
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore);
+    BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

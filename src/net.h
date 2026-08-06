@@ -1968,39 +1968,46 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                 if (BlockRequestTraceEnabled())
                     BlockRequestTraceInFlightExpire(this, it->first, nNow - it->second);
                 const uint256 hashExpired = it->first;
-                setBlocksInFlight.erase(it->first);
-                peerLiveActivePressure.fetch_sub(
-                    1, std::memory_order_relaxed);
-                ibdmetrics::InflightAdd(-1);
-                ibdmetrics::GlobalActiveAdd(
-                    -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
-                RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
-                NodeId nDiversifyAnnounce = -1;
-                if (TakeDiversifyAnnounce(hashExpired, &nDiversifyAnnounce))
-                    ibdmetrics::Get().diversify_other_lane_timeout.fetch_add(
-                        1, std::memory_order_relaxed);
-                // Head age = age of the oldest in-flight hash at the moment
-                // this hash expires (the expiring hash is still in the set).
-                // O(n) per expiry and only computed when forensic is enabled.
-                int64_t nHeadAgeUs = 0;
-                if (ibdforensic::IsEnabled())
+                // Only account the timeout when the hash is still in the live
+                // in-flight set.  A stale timestamp entry (e.g. left behind by
+                // a peer that was cleaned up while a stale CNode snapshot still
+                // iterates it) must not release peer pressure / IBD gauges a
+                // second time -- cleanup already accounted for the request.
+                if (setBlocksInFlight.erase(hashExpired))
                 {
-                    int64_t nEarliestMark = INT64_MAX;
-                    for (std::map<uint256, int64_t>::const_iterator mi =
-                             mapBlockInFlightSince.begin();
-                         mi != mapBlockInFlightSince.end(); ++mi)
-                        if (mi->second < nEarliestMark)
-                            nEarliestMark = mi->second;
-                    if (nEarliestMark != INT64_MAX)
-                        nHeadAgeUs =
-                            (nNow - nEarliestMark) * 1000000LL;
+                    peerLiveActivePressure.fetch_sub(
+                        1, std::memory_order_relaxed);
+                    ibdmetrics::InflightAdd(-1);
+                    ibdmetrics::GlobalActiveAdd(
+                        -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
+                    RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
+                    NodeId nDiversifyAnnounce = -1;
+                    if (TakeDiversifyAnnounce(hashExpired, &nDiversifyAnnounce))
+                        ibdmetrics::Get().diversify_other_lane_timeout.fetch_add(
+                            1, std::memory_order_relaxed);
+                    // Head age = age of the oldest in-flight hash at the moment
+                    // this hash expires (the expiring hash is still in the set).
+                    // O(n) per expiry and only computed when forensic is enabled.
+                    int64_t nHeadAgeUs = 0;
+                    if (ibdforensic::IsEnabled())
+                    {
+                        int64_t nEarliestMark = INT64_MAX;
+                        for (std::map<uint256, int64_t>::const_iterator mi =
+                                 mapBlockInFlightSince.begin();
+                             mi != mapBlockInFlightSince.end(); ++mi)
+                            if (mi->second < nEarliestMark)
+                                nEarliestMark = mi->second;
+                        if (nEarliestMark != INT64_MAX)
+                            nHeadAgeUs =
+                                (nNow - nEarliestMark) * 1000000LL;
+                    }
+                    ibdforensic::RecordExpired(
+                        GetId(), hashExpired, GetTimeMicros(), nHeadAgeUs);
+                    ReleaseBlockRequestOwner(hashExpired, GetId(), "timeout");
+                    EraseAlreadyAskedForIfUnowned(
+                        CInv(MSG_BLOCK, hashExpired));
                 }
-                ibdforensic::RecordExpired(
-                    GetId(), hashExpired, GetTimeMicros(), nHeadAgeUs);
                 it = mapBlockInFlightSince.erase(it);
-                ReleaseBlockRequestOwner(hashExpired, GetId(), "timeout");
-                EraseAlreadyAskedForIfUnowned(
-                    CInv(MSG_BLOCK, hashExpired));
             }
             else
             {
