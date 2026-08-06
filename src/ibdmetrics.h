@@ -188,7 +188,15 @@ struct IBDMetricsSnapshot
     int64_t sync_peer_change_while_pipeline_empty;
     int64_t getblocks_outstanding_current;
     int64_t getblocks_outstanding_max;
+    int64_t getblocks_outstanding_timeout;
     int64_t getblocks_no_response_disconnect_cleanup;
+    // Pending queue coalescing outcomes (PushGetBlocks bound of one pending).
+    int64_t getblocks_pending_coalesce;
+    int64_t getblocks_pending_replaced;
+    int64_t getblocks_pending_drop;
+    // Reconciliation: nonzero when the global outstanding gauge diverges from
+    // the sum of per-peer active single-flight cycles.
+    int64_t outstanding_gauge_mismatch;
     int64_t getblocks_queued_unsent_cleanup;
     int64_t peers_with_queued_getblocks_current;
     int64_t peers_with_queued_getblocks_max;
@@ -216,6 +224,7 @@ struct IBDMetricsSnapshot
     int64_t pipeline_wake_signal_clear_askfor;
     int64_t pipeline_wake_signal_disconnect_cleanup;
     int64_t pipeline_wake_signal_getblocks_outstanding_cleared;
+    int64_t pipeline_wake_signal_getblocks_outstanding_timeout;
     int64_t pipeline_wake_signal_other;
     int64_t pipeline_wake_coalesced;
     int64_t pipeline_wake_handler_runs;
@@ -448,7 +457,12 @@ struct Counters
     std::atomic<int64_t> sync_peer_change_while_pipeline_empty;
     std::atomic<int64_t> getblocks_outstanding_current;
     std::atomic<int64_t> getblocks_outstanding_max;
+    std::atomic<int64_t> getblocks_outstanding_timeout;
     std::atomic<int64_t> getblocks_no_response_disconnect_cleanup;
+    std::atomic<int64_t> getblocks_pending_coalesce;
+    std::atomic<int64_t> getblocks_pending_replaced;
+    std::atomic<int64_t> getblocks_pending_drop;
+    std::atomic<int64_t> outstanding_gauge_mismatch;
     std::atomic<int64_t> getblocks_queued_unsent_cleanup;
     std::atomic<int64_t> peers_with_queued_getblocks_current;
     std::atomic<int64_t> peers_with_queued_getblocks_max;
@@ -476,6 +490,7 @@ struct Counters
     std::atomic<int64_t> pipeline_wake_signal_clear_askfor;
     std::atomic<int64_t> pipeline_wake_signal_disconnect_cleanup;
     std::atomic<int64_t> pipeline_wake_signal_getblocks_outstanding_cleared;
+    std::atomic<int64_t> pipeline_wake_signal_getblocks_outstanding_timeout;
     std::atomic<int64_t> pipeline_wake_signal_other;
     std::atomic<int64_t> pipeline_wake_coalesced;
     std::atomic<int64_t> pipeline_wake_handler_runs;

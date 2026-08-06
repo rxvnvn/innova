@@ -480,7 +480,12 @@ Value getinfo(const Array& params, bool fHelp)
         ibd.push_back(Pair("sync_peer_change_while_pipeline_empty", metrics.sync_peer_change_while_pipeline_empty));
         ibd.push_back(Pair("getblocks_outstanding_current", metrics.getblocks_outstanding_current));
         ibd.push_back(Pair("getblocks_outstanding_max", metrics.getblocks_outstanding_max));
+        ibd.push_back(Pair("getblocks_outstanding_timeout", metrics.getblocks_outstanding_timeout));
         ibd.push_back(Pair("getblocks_no_response_disconnect_cleanup", metrics.getblocks_no_response_disconnect_cleanup));
+        ibd.push_back(Pair("getblocks_pending_coalesce", metrics.getblocks_pending_coalesce));
+        ibd.push_back(Pair("getblocks_pending_replaced", metrics.getblocks_pending_replaced));
+        ibd.push_back(Pair("getblocks_pending_drop", metrics.getblocks_pending_drop));
+        ibd.push_back(Pair("outstanding_gauge_mismatch", metrics.outstanding_gauge_mismatch));
         ibd.push_back(Pair("getblocks_queued_unsent_cleanup", metrics.getblocks_queued_unsent_cleanup));
         ibd.push_back(Pair("peers_with_queued_getblocks_current", metrics.peers_with_queued_getblocks_current));
         ibd.push_back(Pair("peers_with_queued_getblocks_max", metrics.peers_with_queued_getblocks_max));
@@ -509,6 +514,7 @@ Value getinfo(const Array& params, bool fHelp)
         pipeline_wake.push_back(Pair("signal_clear_askfor", metrics.pipeline_wake_signal_clear_askfor));
         pipeline_wake.push_back(Pair("signal_disconnect_cleanup", metrics.pipeline_wake_signal_disconnect_cleanup));
         pipeline_wake.push_back(Pair("signal_getblocks_outstanding_cleared", metrics.pipeline_wake_signal_getblocks_outstanding_cleared));
+        pipeline_wake.push_back(Pair("signal_getblocks_outstanding_timeout", metrics.pipeline_wake_signal_getblocks_outstanding_timeout));
         pipeline_wake.push_back(Pair("signal_other", metrics.pipeline_wake_signal_other));
         pipeline_wake.push_back(Pair("coalesced", metrics.pipeline_wake_coalesced));
         pipeline_wake.push_back(Pair("handler_runs", metrics.pipeline_wake_handler_runs));

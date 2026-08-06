@@ -8891,7 +8891,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         if (fObserveRecovery)
             recoveryObservation.total_inv = vInv.size();
         const bool fGetBlocksResponse =
-            !pfrom->getBlocksOutstandingSources.empty();
+            pfrom->HasOutstandingGetBlocks();
         int64_t nGetBlocksResponseBlockInv = 0;
         int64_t nGetBlocksResponseUnknown = 0;
         if (fGetBlocksResponse)
@@ -8900,6 +8900,17 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 1, std::memory_order_relaxed);
             ibdmetrics::RecordZeroLatency(ibdmetrics::ZERO_LATENCY_INV);
         }
+
+        // Any inv message closes the active single-flight cycle.  The cycle is
+        // consumed BEFORE the per-inv work so a continuation getblocks pushed
+        // inside the loop below queues behind the freed slot instead of
+        // joining a backlog behind an already-closed outstanding request.
+        // The response counts (nGetBlocksResponseBlockInv/Unknown) below are
+        // attributed to this message as "inv while a cycle was active" — the
+        // wire protocol carries no request id, so the correlation is
+        // heuristic, not exact.
+        if (fGetBlocksResponse)
+            pfrom->ConsumeGetBlocksResponse();
 
         // Consume the pending frontier getblocks expectation.  If this inv
         // message is a response to a getblocks that was requested with the
@@ -9044,7 +9055,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 ibdmetrics::Get().getblocks_response_inv_zero_unknown.fetch_add(
                     1, std::memory_order_relaxed);
             }
-            pfrom->ConsumeGetBlocksResponseFront();
         }
 
         if (fObserveRecovery)
@@ -9962,13 +9972,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 if (pfrom->hashLastBlockInBatch != 0 && mapBlockIndex.count(pfrom->hashLastBlockInBatch))
                 {
                     CBlockIndex* pindexLast = mapBlockIndex[pfrom->hashLastBlockInBatch];
-                    size_t nQueuedBefore = pfrom->getBlocksIndex.size();
                     bool fPrefetchSentBefore = pfrom->fPrefetchSent;
-                    pfrom->PushGetBlocks(
+                    const bool fQueued = pfrom->PushGetBlocks(
                         pindexLast, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_PREFETCH);
                     pfrom->fPrefetchSent = true;
-                    if (BlockRequestTraceEnabled() &&
-                        pfrom->getBlocksIndex.size() > nQueuedBefore)
+                    if (BlockRequestTraceEnabled() && fQueued)
                     {
                         BlockRequestTraceGetBlocksTrigger(
                             pfrom, "batch75", hashBlock,
@@ -9987,13 +9995,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 }
                 else if (pindexBest)
                 {
-                    size_t nQueuedBefore = pfrom->getBlocksIndex.size();
                     bool fPrefetchSentBefore = pfrom->fPrefetchSent;
-                    pfrom->PushGetBlocks(
+                    const bool fQueued = pfrom->PushGetBlocks(
                         pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_PREFETCH);
                     pfrom->fPrefetchSent = true;
-                    if (BlockRequestTraceEnabled() &&
-                        pfrom->getBlocksIndex.size() > nQueuedBefore)
+                    if (BlockRequestTraceEnabled() && fQueued)
                     {
                         BlockRequestTraceGetBlocksTrigger(
                             pfrom, "batch75", hashBlock,
@@ -10043,16 +10049,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                            (long long)(pfrom->nLastGetBlocksTime == 0 ? -1 : (nNow - pfrom->nLastGetBlocksTime)),
                            pfrom->hashContinue.ToString().c_str());
                 }
-                size_t nQueuedBefore = pfrom->getBlocksIndex.size();
                 bool fPrefetchSentBefore = pfrom->fPrefetchSent;
-                pfrom->PushGetBlocks(
+                const bool fQueued = pfrom->PushGetBlocks(
                     pindexBest, uint256(0),
                     ibdmetrics::GETBLOCKS_SOURCE_CONTINUATION);
-                if (pfrom->getBlocksIndex.size() > nQueuedBefore)
+                if (fQueued)
                     ibdmetrics::Get().pipeline_drained_getblocks_queued.fetch_add(
                         1, std::memory_order_relaxed);
-                if (BlockRequestTraceEnabled() &&
-                    pfrom->getBlocksIndex.size() > nQueuedBefore)
+                if (BlockRequestTraceEnabled() && fQueued)
                 {
                     BlockRequestTraceGetBlocksTrigger(
                         pfrom, "pipeline-drained", hashBlock,
@@ -10581,6 +10585,9 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
         BlockRequestTraceEnabled())
         printf("%s\n", FormatRecoveryResponseSummary(
             pto->GetId(), recoveryResult).c_str());
+    if (pto->ExpireGetBlocksOutstanding() && BlockRequestTraceEnabled())
+        printf("BLOCKREQTRACE time_us=%lld event=GETBLOCKS_OUTSTANDING_TIMEOUT peer=%d\n",
+               (long long)GetTimeMicros(), pto->GetId());
     if (pto->nVersion == 0)
         return true;
 
@@ -10627,40 +10634,50 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
         pto->fStartSync = false;
         if (!fSPVMode && pto->CanAdvanceBlockSync(nBestHeight))
         {
-            const size_t nQueueBefore = pto->getBlocksIndex.size();
-            pto->PushGetBlocks(
-                pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
             if (!pto->fInitialSyncRequestSent &&
-                pto->getBlocksIndex.size() > nQueueBefore)
+                pto->PushGetBlocks(
+                    pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_INITIAL))
                 pto->fInitialSyncRequestPending = true;
         }
     }
 
     {
-        int n = pto->getBlocksIndex.size();
-        for (int i = 0; i < n; i++)
+        // Single-flight getblocks flush: send at most one request per peer per
+        // SendMessages pass, and only when no outstanding cycle is active.
+        // The single-flight gate lives here (not in PushGetBlocks) so an
+        // inv-continuation or recovery intent is never silently dropped while
+        // a cycle is active — it coalesces into the bounded pending slot and
+        // flushes once the outstanding cycle closes or expires.
+        if (!pto->HasOutstandingGetBlocks() &&
+            !pto->getBlocksIndex.empty())
         {
-            if (fDebugNet) printf("Pushing getblocks %s to %s\n\n",pto->getBlocksIndex[i]->ToString().c_str(),pto->getBlocksHash[i].ToString().c_str());
-            const uint64_t nRecoveryId = i < (int)pto->getBlocksRecoveryIds.size()
-                ? pto->getBlocksRecoveryIds[i] : 0;
+            CBlockIndex* pindexBegin = pto->getBlocksIndex[0];
+            const uint256 hashStop = pto->getBlocksHash[0];
+            const uint64_t nRecoveryId =
+                pto->getBlocksRecoveryIds.size() > 0
+                    ? pto->getBlocksRecoveryIds[0] : 0;
             const ibdmetrics::GetBlocksSource getBlocksSource =
-                i < (int)pto->getBlocksSources.size()
-                    ? pto->getBlocksSources[i]
+                pto->getBlocksSources.size() > 0
+                    ? pto->getBlocksSources[0]
                     : ibdmetrics::GETBLOCKS_SOURCE_OTHER;
-            RecoveryTraceSend(pto, nRecoveryId, pto->getBlocksIndex[i],
-                              pto->getBlocksHash[i], n);
-            pto->PushMessage("getblocks", CBlockLocator(pto->getBlocksIndex[i]), pto->getBlocksHash[i]);
+            if (fDebugNet)
+                printf("Pushing getblocks %s to %s\n\n",
+                       pindexBegin->ToString().c_str(),
+                       hashStop.ToString().c_str());
+            RecoveryTraceSend(pto, nRecoveryId, pindexBegin, hashStop, 1);
+            pto->PushMessage("getblocks",
+                             CBlockLocator(pindexBegin), hashStop);
             ibdmetrics::RecordGetBlocksWireSent(getBlocksSource);
             ibdactivepath::RecordGetBlocksWireSent();
-            pto->getBlocksOutstandingSources.push_back(getBlocksSource);
+            pto->SetOutstandingGetBlocks(getBlocksSource,
+                                         pindexBegin, hashStop);
             ibdmetrics::GetBlocksOutstandingAdd(1);
             // Arm the frontier response expectation when the flushed request
             // used the current active-tip locator (index == best and no stop
             // hash).  Its first unknown block inv may be admitted past a zero
             // deferred budget so the connectable frontier block can be
             // requested; the exemption is invalidated if the tip advances.
-            if (pto->getBlocksIndex[i] == pindexBest &&
-                pto->getBlocksHash[i] == uint256(0))
+            if (pindexBegin == pindexBest && hashStop == uint256(0))
             {
                 if (!pto->fFrontierResponsePending)
                     ibdmetrics::FrontierResponsePendingAdd(1);
@@ -10684,13 +10701,13 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
             RecordOrdinaryGetBlocksCommitted(
                 GetTime(), nRecoveryId,
                 pto->CanAdvanceBlockSync(nBestHeight));
+
+            ibdmetrics::GetBlocksQueuedAdd(-1, true);
+            pto->getBlocksIndex.clear();
+            pto->getBlocksHash.clear();
+            pto->getBlocksRecoveryIds.clear();
+            pto->getBlocksSources.clear();
         }
-        if (n > 0)
-            ibdmetrics::GetBlocksQueuedAdd(-n, true);
-        pto->getBlocksIndex.clear();
-        pto->getBlocksHash.clear();
-        pto->getBlocksRecoveryIds.clear();
-        pto->getBlocksSources.clear();
     }
 
     {

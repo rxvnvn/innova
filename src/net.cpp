@@ -2939,6 +2939,8 @@ void RequestBlockPipelineWake(uint32_t nCause)
         c.pipeline_wake_signal_disconnect_cleanup.fetch_add(1, std::memory_order_relaxed);
     if (nCause & WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED)
         c.pipeline_wake_signal_getblocks_outstanding_cleared.fetch_add(1, std::memory_order_relaxed);
+    if (nCause & WAKE_CAUSE_GETBLOCKS_OUTSTANDING_TIMEOUT)
+        c.pipeline_wake_signal_getblocks_outstanding_timeout.fetch_add(1, std::memory_order_relaxed);
     if (nCause & WAKE_CAUSE_OTHER)
         c.pipeline_wake_signal_other.fetch_add(1, std::memory_order_relaxed);
 
@@ -3065,7 +3067,7 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
                 snapshot.nInflightBlocks += pnode->setBlocksInFlight.size();
                 snapshot.nQueuedGetBlocks += pnode->getBlocksIndex.size();
                 snapshot.nOutstandingGetBlocks +=
-                    pnode->getBlocksOutstandingSources.size();
+                    pnode->HasOutstandingGetBlocks() ? 1 : 0;
                 snapshot.nDeferredInv += pnode->deferredBlockInv.size();
                 if (!pnode->fDisconnect && pnode->fSuccessfullyConnected &&
                     IsBlockSyncPeerVersion(pnode->nVersion) &&
@@ -3085,7 +3087,7 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
                     pnode->fClient || pnode->fOneShot ||
                     !pnode->CanAdvanceBlockSync(snapshot.nLocalHeight) ||
                     !pnode->getBlocksIndex.empty() ||
-                    !pnode->getBlocksOutstandingSources.empty())
+                    pnode->HasOutstandingGetBlocks())
                     continue;
 
                 snapshot.vCandidates.push_back(PipelineWakeCandidate(
@@ -3164,11 +3166,9 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
                 fAttemptedNonDedup = true;
                 ibdmetrics::Get().pipeline_wake_getblocks_attempted.fetch_add(
                     1, std::memory_order_relaxed);
-                const size_t nQueueBefore = pnode->getBlocksIndex.size();
-                pnode->PushGetBlocks(
-                    snapshot.pindexTip, uint256(0),
-                    ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
-                if (pnode->getBlocksIndex.size() > nQueueBefore)
+                if (pnode->PushGetBlocks(
+                        snapshot.pindexTip, uint256(0),
+                        ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE))
                 {
                     ibdmetrics::Get().pipeline_wake_getblocks_queued.fetch_add(
                         1, std::memory_order_relaxed);
@@ -4896,13 +4896,36 @@ void CNode::QueueInitialSyncRequest(CBlockIndex* pindexTip)
 {
     if (fInitialSyncRequestPending || fInitialSyncRequestSent)
         return;
-    const size_t nQueueBefore = getBlocksIndex.size();
-    PushGetBlocks(pindexTip, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_INITIAL);
-    if (getBlocksIndex.size() > nQueueBefore)
+    if (PushGetBlocks(pindexTip, uint256(0),
+                      ibdmetrics::GETBLOCKS_SOURCE_INITIAL))
         fInitialSyncRequestPending = true;
 }
 
-void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
+// Relative urgency of a getblocks request source, used to coalesce the single
+// pending request.  A request that serves a stalled/critical path (recovery,
+// orphan-limit, checkpoints, wallet rescan) supersedes routine continuation
+// and prefetch intent; prefetch is the most expendable.
+static int GetBlocksSourcePriority(ibdmetrics::GetBlocksSource source)
+{
+    switch (source)
+    {
+    case ibdmetrics::GETBLOCKS_SOURCE_RECOVERY: return 100;
+    case ibdmetrics::GETBLOCKS_SOURCE_ORPHAN_LIMIT: return 90;
+    case ibdmetrics::GETBLOCKS_SOURCE_CHECKPOINT: return 80;
+    case ibdmetrics::GETBLOCKS_SOURCE_WALLET_RESCAN: return 70;
+    case ibdmetrics::GETBLOCKS_SOURCE_INITIAL: return 60;
+    case ibdmetrics::GETBLOCKS_SOURCE_VERSION: return 55;
+    case ibdmetrics::GETBLOCKS_SOURCE_HEADERS: return 50;
+    case ibdmetrics::GETBLOCKS_SOURCE_INV_CONTINUATION: return 45;
+    case ibdmetrics::GETBLOCKS_SOURCE_CONTINUATION: return 40;
+    case ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE: return 30;
+    case ibdmetrics::GETBLOCKS_SOURCE_PREFETCH: return 20;
+    case ibdmetrics::GETBLOCKS_SOURCE_OTHER: return 10;
+    }
+    return 0;
+}
+
+bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
                          ibdmetrics::GetBlocksSource source)
 {
     int64_t nNow = GetTime();
@@ -4918,7 +4941,7 @@ void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
             ibdmetrics::Get().getblocks_dedup_skips.fetch_add(
                 1, std::memory_order_relaxed);
             ibdforensic::CountGetBlocksRateLimitOutboundDedup();
-            return;
+            return false;
         }
     }
 
@@ -4926,17 +4949,61 @@ void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
     hashLastGetBlocksEnd = hashEnd;
     nLastGetBlocksTime = nNow;
 
-    const size_t nQueueBefore = getBlocksIndex.size();
-    getBlocksIndex.push_back(pindexBegin);
-    getBlocksHash.push_back(hashEnd);
-    getBlocksSources.push_back(source);
-    ibdmetrics::GetBlocksQueuedAdd(1, nQueueBefore == 0);
-    ibdmetrics::RecordGetBlocksQueueSuccess(source);
     const uint64_t nRecoveryId = nRecoveryTracePendingId;
     nRecoveryTracePendingId = 0;
-    getBlocksRecoveryIds.push_back(nRecoveryId);
-    RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
-                       nQueueBefore, getBlocksIndex.size());
+
+    if (getBlocksIndex.empty())
+    {
+        getBlocksIndex.push_back(pindexBegin);
+        getBlocksHash.push_back(hashEnd);
+        getBlocksSources.push_back(source);
+        getBlocksRecoveryIds.push_back(nRecoveryId);
+        ibdmetrics::GetBlocksQueuedAdd(1, true);
+        ibdmetrics::RecordGetBlocksQueueSuccess(source);
+        RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
+                           0, getBlocksIndex.size());
+    }
+    else
+    {
+        // A pending request already occupies the single pending slot.  The
+        // queue is coalesced to at most one meaningful request so a backlog
+        // of stale locators can never accumulate behind a single-flight
+        // cycle: an equivalent request coalesces in place, a more meaningful
+        // request supersedes the stale one, and a less meaningful request is
+        // dropped.  Recovery intent is never superseded by a lower-priority
+        // source (the stalled sync it serves is more urgent than whatever
+        // could be pending).
+        const ibdmetrics::GetBlocksSource existingSource = getBlocksSources[0];
+        if (getBlocksIndex[0] == pindexBegin && getBlocksHash[0] == hashEnd)
+        {
+            ibdmetrics::Get().getblocks_pending_coalesce.fetch_add(
+                1, std::memory_order_relaxed);
+            RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
+                               getBlocksIndex.size(), getBlocksIndex.size());
+            return true;
+        }
+        if (GetBlocksSourcePriority(source) >
+            GetBlocksSourcePriority(existingSource))
+        {
+            getBlocksIndex[0] = pindexBegin;
+            getBlocksHash[0] = hashEnd;
+            getBlocksSources[0] = source;
+            getBlocksRecoveryIds[0] = nRecoveryId;
+            ibdmetrics::Get().getblocks_pending_replaced.fetch_add(
+                1, std::memory_order_relaxed);
+            RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
+                               getBlocksIndex.size() - 1,
+                               getBlocksIndex.size());
+        }
+        else
+        {
+            ibdmetrics::Get().getblocks_pending_drop.fetch_add(
+                1, std::memory_order_relaxed);
+            RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
+                               getBlocksIndex.size(), getBlocksIndex.size());
+            return false;
+        }
+    }
 
     if (BlockRequestTraceEnabled())
     {
@@ -4946,6 +5013,8 @@ void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
             pindexBegin ? pindexBegin->nHeight : -1,
             hashEnd);
     }
+
+    return true;
 
     //PushMessage("getblocks", CBlockLocator(pindexBegin), hashEnd);
 }
@@ -5549,33 +5618,78 @@ void CNode::CloseSocketDisconnect()
     }
 }
 
-bool CNode::ConsumeGetBlocksResponseFront()
+bool CNode::ConsumeGetBlocksResponse()
 {
-    if (getBlocksOutstandingSources.empty())
+    if (!getBlocksOutstanding.active)
         return false;
 
-    getBlocksOutstandingSources.pop_front();
+    getBlocksOutstanding.Reset();
     ibdmetrics::GetBlocksOutstandingAdd(-1);
-    if (getBlocksOutstandingSources.empty())
-        RequestBlockPipelineWake(WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED);
+    // The frontier response expectation is consumed separately by the inv
+    // handler (it needs to drive the per-message frontier admission offer),
+    // so it is deliberately left untouched here.
+    RequestBlockPipelineWake(WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED);
     return true;
 }
 
 void CNode::ClearGetBlocksOutstandingForCleanup(bool fRecordForensics)
 {
-    if (getBlocksOutstandingSources.empty())
+    if (!getBlocksOutstanding.active)
         return;
 
-    const size_t nOutstanding = getBlocksOutstandingSources.size();
-    getBlocksOutstandingSources.clear();
-    ibdmetrics::GetBlocksOutstandingAdd(-(int64_t)nOutstanding);
+    getBlocksOutstanding.Reset();
+    ibdmetrics::GetBlocksOutstandingAdd(-1);
     if (fRecordForensics)
-        ibdforensic::CountGetBlocksOutstandingNoResponse(nOutstanding);
+        ibdforensic::CountGetBlocksOutstandingNoResponse(1);
     ibdmetrics::Get().getblocks_no_response_disconnect_cleanup.fetch_add(
-        nOutstanding, std::memory_order_relaxed);
+        1, std::memory_order_relaxed);
+    if (fFrontierResponsePending)
+    {
+        ibdmetrics::FrontierResponsePendingAdd(-1);
+        fFrontierResponsePending = false;
+    }
     RequestBlockPipelineWake(
         WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED |
         WAKE_CAUSE_DISCONNECT_CLEANUP);
+}
+
+bool CNode::ExpireGetBlocksOutstanding(int64_t now_us)
+{
+    if (!getBlocksOutstanding.active)
+        return false;
+
+    if (now_us - getBlocksOutstanding.sent_time_us <
+        GETBLOCKS_RESPONSE_TIMEOUT * 1000000)
+        return false;
+
+    getBlocksOutstanding.Reset();
+    ibdmetrics::GetBlocksOutstandingAdd(-1);
+    ibdmetrics::Get().getblocks_outstanding_timeout.fetch_add(
+        1, std::memory_order_relaxed);
+    ibdforensic::CountGetBlocksOutstandingNoResponse(1);
+    if (fFrontierResponsePending)
+    {
+        ibdmetrics::FrontierResponsePendingAdd(-1);
+        fFrontierResponsePending = false;
+    }
+    // Invalidate the per-peer dedup identity associated with the expired
+    // request so the same locator can be retried without the 5 s identical-
+    // locator dedup (PushGetBlocks / IsPipelineWakeDedupBlocked) or the 10 s
+    // continuation cooldown (nLastGetBlocksTime == 0) blocking the retry.
+    pindexLastGetBlocksBegin = NULL;
+    hashLastGetBlocksEnd = 0;
+    nLastGetBlocksTime = 0;
+    // One-shot wake/cooldown bypass: the expired cycle must be retried
+    // promptly, so the global 1 s pipeline-wake getblocks cooldown is cleared
+    // for the single next wake pass.  This only ever happens on an actual
+    // timeout (rare, and the peer's own retry path is already unblocked
+    // above); peers with an intact per-peer dedup identity are still
+    // dedup-blocked, so the next wake remains gated on genuine eligibility.
+    g_pipeline_wake_last_getblocks_time.store(0, std::memory_order_relaxed);
+    RequestBlockPipelineWake(
+        WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED |
+        WAKE_CAUSE_GETBLOCKS_OUTSTANDING_TIMEOUT);
+    return true;
 }
 
 void CNode::Cleanup(NodeCleanupMode mode)
@@ -5590,7 +5704,7 @@ void CNode::Cleanup(NodeCleanupMode mode)
             !setAskForBlocks.empty() ||
             !setBlocksInFlight.empty();
         const bool fHadOutstandingGetBlocks =
-            !getBlocksOutstandingSources.empty();
+            HasOutstandingGetBlocks();
         fIbdMetricsCleanupAccounted = true;
         if (!setAskForBlocks.empty())
         {

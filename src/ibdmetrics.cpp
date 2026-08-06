@@ -161,7 +161,12 @@ Counters::Counters()
       sync_peer_change_while_pipeline_empty(0),
       getblocks_outstanding_current(0),
       getblocks_outstanding_max(0),
+      getblocks_outstanding_timeout(0),
       getblocks_no_response_disconnect_cleanup(0),
+      getblocks_pending_coalesce(0),
+      getblocks_pending_replaced(0),
+      getblocks_pending_drop(0),
+      outstanding_gauge_mismatch(0),
       getblocks_queued_unsent_cleanup(0),
       peers_with_queued_getblocks_current(0),
       peers_with_queued_getblocks_max(0),
@@ -188,6 +193,7 @@ Counters::Counters()
       pipeline_wake_signal_clear_askfor(0),
       pipeline_wake_signal_disconnect_cleanup(0),
       pipeline_wake_signal_getblocks_outstanding_cleared(0),
+      pipeline_wake_signal_getblocks_outstanding_timeout(0),
       pipeline_wake_signal_other(0),
       pipeline_wake_coalesced(0),
       pipeline_wake_handler_runs(0),
@@ -841,8 +847,18 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.getblocks_outstanding_current.load(std::memory_order_relaxed);
     out.getblocks_outstanding_max =
         c.getblocks_outstanding_max.load(std::memory_order_relaxed);
+    out.getblocks_outstanding_timeout =
+        c.getblocks_outstanding_timeout.load(std::memory_order_relaxed);
     out.getblocks_no_response_disconnect_cleanup =
         c.getblocks_no_response_disconnect_cleanup.load(std::memory_order_relaxed);
+    out.getblocks_pending_coalesce =
+        c.getblocks_pending_coalesce.load(std::memory_order_relaxed);
+    out.getblocks_pending_replaced =
+        c.getblocks_pending_replaced.load(std::memory_order_relaxed);
+    out.getblocks_pending_drop =
+        c.getblocks_pending_drop.load(std::memory_order_relaxed);
+    out.outstanding_gauge_mismatch =
+        c.outstanding_gauge_mismatch.load(std::memory_order_relaxed);
     out.getblocks_queued_unsent_cleanup =
         c.getblocks_queued_unsent_cleanup.load(std::memory_order_relaxed);
     out.peers_with_queued_getblocks_current =
@@ -896,6 +912,8 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.pipeline_wake_signal_disconnect_cleanup.load(std::memory_order_relaxed);
     out.pipeline_wake_signal_getblocks_outstanding_cleared =
         c.pipeline_wake_signal_getblocks_outstanding_cleared.load(std::memory_order_relaxed);
+    out.pipeline_wake_signal_getblocks_outstanding_timeout =
+        c.pipeline_wake_signal_getblocks_outstanding_timeout.load(std::memory_order_relaxed);
     out.pipeline_wake_signal_other =
         c.pipeline_wake_signal_other.load(std::memory_order_relaxed);
     out.pipeline_wake_coalesced =
@@ -980,6 +998,7 @@ void ResetPipelineWakeMetricsForTesting()
         &c.pipeline_wake_signal_clear_askfor,
         &c.pipeline_wake_signal_disconnect_cleanup,
         &c.pipeline_wake_signal_getblocks_outstanding_cleared,
+        &c.pipeline_wake_signal_getblocks_outstanding_timeout,
         &c.pipeline_wake_signal_other,
         &c.pipeline_wake_coalesced,
         &c.pipeline_wake_handler_runs,

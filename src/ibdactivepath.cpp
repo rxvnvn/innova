@@ -521,7 +521,7 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
         nQueuedPeerMax = std::max(nQueuedPeerMax, nQueuedThis);
         nGetBlocksQueuedPeer += (int64_t)pnode->getBlocksIndex.size();
         nGetBlocksOutstandingPeer +=
-            (int64_t)pnode->getBlocksOutstandingSources.size();
+            pnode->HasOutstandingGetBlocks() ? 1 : 0;
         nFreeCapacityPeer += std::max<int64_t>(
             0, nCap - nInflightThis);
         for (std::multimap<int64_t, CInv>::const_iterator it =

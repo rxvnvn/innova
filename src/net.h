@@ -269,7 +269,8 @@ enum PipelineWakeCause
     WAKE_CAUSE_CLEAR_ASKFOR = 1U << 5,
     WAKE_CAUSE_DISCONNECT_CLEANUP = 1U << 6,
     WAKE_CAUSE_GETBLOCKS_OUTSTANDING_CLEARED = 1U << 7,
-    WAKE_CAUSE_OTHER = 1U << 8
+    WAKE_CAUSE_OTHER = 1U << 8,
+    WAKE_CAUSE_GETBLOCKS_OUTSTANDING_TIMEOUT = 1U << 9
 };
 
 enum PipelineWakeOutcome
@@ -850,6 +851,16 @@ typedef std::map<CSubNet, CBanEntry> banmap_t;
 
 static const int64_t GETHEADERS_REQUEST_TIMEOUT = 60;
 
+// Seconds a flushed single-flight getblocks request may remain unanswered
+// before its slot is released.  15 s is conservative: comfortably above the
+// expected getblocks->inv round trip on a slow link yet at or below the
+// default stalled-sync timeout (-syncstalltimeout, default 15 s) so the slot
+// re-arms before/around the moment recovery would also be triggered.  The
+// timeout is intentionally not refreshed by pings/tx traffic: it tracks the
+// specific outstanding getblocks cycle, matching the failure class of a peer
+// that is TCP-alive but never answers an inv.
+static const int64_t GETBLOCKS_RESPONSE_TIMEOUT = 15;
+
 class CGetHeadersSyncState
 {
 public:
@@ -1009,7 +1020,37 @@ public:
     std::vector<uint256> getBlocksHash;
     std::vector<uint64_t> getBlocksRecoveryIds;
     std::vector<ibdmetrics::GetBlocksSource> getBlocksSources;
-    std::deque<ibdmetrics::GetBlocksSource> getBlocksOutstandingSources;
+    // Single-flight getblocks lifecycle: at most one flushed outstanding
+    // request per peer.  The pending queue (getBlocksIndex/... above) is
+    // coalesced by PushGetBlocks to at most one meaningful request.
+    // The response is heuristic — the next inv message from this peer closes
+    // the cycle — because the wire protocol carries no request id.  A finite
+    // timeout (ExpireGetBlocksOutstanding) releases the slot when no inv
+    // arrives, so a silent-but-alive peer can never wedge the peer forever.
+    struct GetBlocksOutstandingState
+    {
+        bool active;
+        ibdmetrics::GetBlocksSource source;
+        int64_t sent_time_us;
+        CBlockIndex* locator_begin;
+        uint256 hash_stop;
+
+        GetBlocksOutstandingState()
+            : active(false), source(ibdmetrics::GETBLOCKS_SOURCE_OTHER),
+              sent_time_us(0), locator_begin(NULL), hash_stop(0)
+        {
+        }
+
+        void Reset()
+        {
+            active = false;
+            source = ibdmetrics::GETBLOCKS_SOURCE_OTHER;
+            sent_time_us = 0;
+            locator_begin = NULL;
+            hash_stop = 0;
+        }
+    };
+    GetBlocksOutstandingState getBlocksOutstanding;
     uint64_t nRecoveryTracePendingId;
     uint256 hashLastGetBlocksEnd;
     int64_t nLastGetBlocksTime;
@@ -1130,6 +1171,9 @@ public:
         nRecoveryTracePendingId = 0;
         hashLastGetBlocksEnd = 0;
         nLastGetBlocksTime = 0;
+        getBlocksOutstanding.Reset();
+        fInitialSyncRequestPending = false;
+        fInitialSyncRequestSent = false;
         fFrontierResponsePending = false;
         nFrontierLocatorHeight = -1;
         nDeferredBudgetZero = 0;
@@ -1836,11 +1880,49 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         vecRequestsFulfilled.push_back(strRequest);
     }
 
-    void PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
+    // Enqueue (or coalesce into) the single pending getblocks request for this
+    // peer.  Returns true when the request was meaningfully admitted: newly
+    // queued, or coalesced into an equivalent pending entry.  Returns false
+    // when it was dedup-skipped or superseded by a more meaningful pending
+    // request (the callers must not treat a dropped request as queued).
+    bool PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
                        ibdmetrics::GetBlocksSource source =
                            ibdmetrics::GETBLOCKS_SOURCE_OTHER);
-    bool ConsumeGetBlocksResponseFront();
+    // Marks a flushed pending request as the active single-flight cycle.
+    // Called from the SendMessages flush loop immediately after the getblocks
+    // message is committed to the wire.  Assumes the caller already checked
+    // HasOutstandingGetBlocks() == false.
+    void SetOutstandingGetBlocks(ibdmetrics::GetBlocksSource source,
+                                 CBlockIndex* pindexBegin, uint256 hashStop)
+    {
+        getBlocksOutstanding.active = true;
+        getBlocksOutstanding.source = source;
+        getBlocksOutstanding.sent_time_us = GetTimeMicros();
+        getBlocksOutstanding.locator_begin = pindexBegin;
+        getBlocksOutstanding.hash_stop = hashStop;
+    }
+    // True while a single-flight getblocks cycle is active for this peer
+    // (a request was flushed to the wire and no inv has closed it yet).
+    bool HasOutstandingGetBlocks() const
+    {
+        return getBlocksOutstanding.active;
+    }
+    ibdmetrics::GetBlocksSource GetOutstandingGetBlocksSource() const
+    {
+        return getBlocksOutstanding.source;
+    }
+    // The next inv message from this peer closes the active cycle.  This is a
+    // heuristic response match (no request id on the wire), not exact
+    // protocol correlation.  Returns true when a cycle was closed.
+    bool ConsumeGetBlocksResponse();
+    // Disconnect/shutdown cleanup of the active cycle.  Records the dropped
+    // no-response cycle for forensic accounting when fRecordForensics is set.
     void ClearGetBlocksOutstandingForCleanup(bool fRecordForensics = true);
+    // Finite outstanding timeout: releases the slot, decrements the global
+    // gauge once, records a no-response timeout, invalidates the per-peer
+    // dedup identity, and re-arms pipeline wake.  Returns true when a cycle
+    // was expired.  Called from the network loop and SendMessages.
+    bool ExpireGetBlocksOutstanding(int64_t now_us = GetTimeMicros());
     void StartRecoveryResponseWindow(uint64_t id, int64_t send_us);
     bool ObserveRecoveryResponseInv(int64_t now_us, const RecoveryResponseObservation& observation, RecoveryResponseResult& result);
     bool ExpireRecoveryResponseWindow(int64_t now_us, RecoveryResponseResult& result);
