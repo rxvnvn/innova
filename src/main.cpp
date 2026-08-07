@@ -431,7 +431,8 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
         1, std::memory_order_relaxed);
     if (!IsInitialBlockDownload())
     {
-        pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+        AskForBlockInvWithQualityRedirection(pfrom, inv, BLOCKREQ_SOURCE_INV,
+                                             false);
         return true;
     }
     int nOrphanCountPeer = 0;
@@ -467,7 +468,10 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
                        pfrom->GetId(), nOrphanCountPeer,
                        nGlobalActivePressure, nBudget);
             pfrom->RemoveDeferredBlockInv(inv.hash);
-            pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+            // Frontier admission is exempt from quality redirection so the
+            // single-slot exemption keeps the announcer verbatim.
+            AskForBlockInvWithQualityRedirection(pfrom, inv, BLOCKREQ_SOURCE_INV,
+                                                 true);
             ibdmetrics::Get().block_inv_admitted.fetch_add(
                 1, std::memory_order_relaxed);
             ibdmetrics::Get().frontier_exemption_admitted.fetch_add(
@@ -503,7 +507,8 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
         return false;
     }
     pfrom->RemoveDeferredBlockInv(inv.hash);
-    pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
+    AskForBlockInvWithQualityRedirection(pfrom, inv, BLOCKREQ_SOURCE_INV,
+                                         fFrontierCandidate);
     ibdmetrics::Get().block_inv_admitted.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -603,7 +608,11 @@ size_t RefillDeferredBlockRequests(
                 pDispatch =
                     ChooseDeferredDispatchLane(pfrom, hash, vNodesCopy);
         }
-        pDispatch->AskFor(inv, BLOCKREQ_SOURCE_INV);
+        // The single deferred frontier candidate keeps the announcer path
+        // verbatim (fFrontierDeferred), so quality redirection is exempted for
+        // it just like the admission-path frontier exemption.
+        AskForBlockInvWithQualityRedirection(pDispatch, inv, BLOCKREQ_SOURCE_INV,
+                                             fFrontierDeferred);
         if (fDiversificationEnabled)
         {
             if (pDispatch != pfrom)
@@ -10972,6 +10981,10 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                         BlockRequestTraceGetDataSkip(
                             pto, inv.hash, nOwnerPeer,
                             BlockRequestOwnerStateName(ownerState));
+                    // The peer queued a request for this hash but another peer
+                    // won ownership: it announced the block, so record it as an
+                    // alternate for a later timeout reassignment.
+                    RecordAlternateBlockAnnouncer(inv.hash, pto->GetId());
                     pto->EraseAskForEntry(
                         pto->mapAskFor.begin(), true,
                         ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);

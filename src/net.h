@@ -635,6 +635,201 @@ static const size_t MAX_ORPHAN_LIMIT_REJECTED_PER_PEER = 750;
 static const size_t MAX_ORPHAN_LIMIT_REJECTED_GLOBAL = 50000;
 size_t PruneAlreadyAskedFor(int64_t nNowMicros);
 
+// ----------------------------------------------------------------------------
+// Timeout-aware IBD peer quality ranking.
+//
+// Every block request lifecycle observable on a peer (queued / in-flight mark,
+// delivery receive, timeout expiry) feeds a small per-peer quality record used
+// only to *prefer* better suppliers when a block request is admitted or when a
+// timed-out hash is re-requested.  The ranking is best-effort scheduling
+// preference only: it never bans, disconnects, or Misbehaves a peer, ownership
+// stays exclusive (one active owner per hash, no hedged requests), and a
+// degraded-but-sole supplier always keeps working (frontier-safe fallback).
+// A fresh peer is UNKNOWN (neutral): it is never treated as better than a
+// proven-good peer, but it can serve as an alternative to a degraded one.
+// Reputation recovers without a restart because the scores decay with every
+// completed outcome (rolling window in event space).
+// ----------------------------------------------------------------------------
+
+enum IbdPeerQualityTier
+{
+    IBD_PEER_QUALITY_GOOD = 0,
+    IBD_PEER_QUALITY_UNKNOWN,
+    IBD_PEER_QUALITY_DEGRADED
+};
+
+// Completed-outcome events that feed the per-peer quality record.  Used to
+// route a block-request admission to a better supplier.
+enum IbdAskForRedirectReason
+{
+    IBD_REDIRECT_NONE = 0,      // keep the announcer (fast path)
+    IBD_REDIRECT_HASH_TIMEOUT,  // announcer timed out this exact hash before
+    IBD_REDIRECT_QUALITY,       // announcer is degraded
+    IBD_REDIRECT_CONCENTRATION  // announcer dominates the global active window
+};
+
+// Fixed-point scale for the decayed scores.  Scores are kept at 16x resolution
+// so the per-event decay (multiply by 15/16) is well-defined for small counts:
+// an unscaled integer score below 16 would never decay, pinning a peer's tier
+// forever.  A single outcome contributes 1*SCALE and the steady state of a
+// pure event stream is SCALE << DECAY_SHIFT = 256.
+static const int64_t IBD_PEER_QUALITY_SCALE = 16;
+// Decay applied to a score on every completed outcome:
+// score = score - (score >> SHIFT), i.e. multiply by 15/16 per event.  With
+// per-event decay of 1/16, influence of an event halves after ~11 events, so
+// the scores behave like a rolling window in event space.
+static const int64_t IBD_PEER_QUALITY_DECAY_SHIFT = 4;
+// Decayed-score baseline (in scaled units) for trusting a quality tier.  A
+// steady receive stream holds the combined score near 256, so the threshold of
+// 8*SCALE = 128 means roughly the last ~10-11 completed outcomes.
+static const int64_t IBD_PEER_QUALITY_MIN_SCORE = 8;
+// A peer whose decayed timeout share exceeds 250 permille (25%) of its decayed
+// completed outcomes is ranked DEGRADED.  Both scores decay on every completed
+// outcome (see CNode::RecordIbdBlockDelivery / RecordIbdBlockTimeout), so the
+// timeout share is a rolling window in event space and a recovering peer is
+// re-promoted to GOOD without a restart.
+static const int64_t IBD_PEER_QUALITY_DEGRADED_RATE_PERMILLE = 250;
+// Delivery-latency EWMA smoothing factor: new_sample = (7*old + 1*new) / 8.
+static const int64_t IBD_PEER_LATENCY_EWMA_SHIFT = 3;
+
+// Alternate-announcer ledger bounds.  The ledger records, per block hash,
+// peers that announced the hash while another peer owned it (a strong signal
+// the peer can serve it) so a timed-out request can be reassigned away from
+// the failed owner.  Entries are bounded per hash and globally, and expire by
+// TTL so stale announcers never pin a hash forever.
+static const size_t IBD_ALTERNATE_ANNOUNCERS_PER_HASH = 4;
+static const size_t IBD_ALTERNATE_ANNOUNCER_MAX_HASHES = 2048;
+static const int64_t IBD_ALTERNATE_ANNOUNCER_TTL_US = 60LL * 1000000;
+
+// Last-timeout-owner ledger bounds.  This ledger is on the hottest path (every
+// admitted block INV reads it), so lookups must stay O(log N): only the
+// requested entry is TTL-checked, and the full map is pruned at most once per
+// lazy cadence or when the hard global bound is exceeded (see
+// LAST_TIMEOUT_OWNER_PRUNE_INTERVAL_US in net.cpp).
+static const int64_t IBD_LAST_TIMEOUT_OWNER_TTL_US = 60LL * 1000000;
+static const size_t IBD_LAST_TIMEOUT_OWNER_MAX_HASHES = 2048;
+
+// Late-delivery expectation ledger bounds.  When a request for a hash times
+// out, a short-lived expectation is recorded so a later arrival of the block
+// (via any peer) can be attributed as a late outcome to the peer that actually
+// requested it.  Bounded and TTL-expired like the other quality ledgers; never
+// stored in the live in-flight containers.
+static const int64_t IBD_LATE_DELIVERY_TTL_US = 60LL * 1000000;
+static const size_t IBD_LATE_DELIVERY_MAX_HASHES = 2048;
+
+// Concentration guard: once a single peer holds >= 40% of the global active
+// request window (queued + in-flight) and the window sample is large enough,
+// fresh admissions are biased toward other eligible lanes.  There is no hard
+// global ban: the guard never refuses a request to a dominant peer when no
+// other lane exists.
+static const int64_t IBD_CONCENTRATION_THRESHOLD_PERMILLE = 400;
+static const int64_t IBD_CONCENTRATION_SAMPLE_MIN = 32;
+
+// Per-peer delivery-quality record.  All fields are relaxed atomics: the
+// message-handler thread and the network-loop thread both touch them (timeout
+// expiry runs from the network loop), and the values are only ever used for
+// best-effort scheduling preference, so torn reads are acceptable.
+struct IbdPeerDeliveryQuality
+{
+    std::atomic<uint64_t> requests_issued;       // block requests queued / marked
+    std::atomic<uint64_t> releases_by_receive;   // completed deliveries
+    std::atomic<uint64_t> releases_by_timeout;   // expirations
+    std::atomic<uint64_t> received_after_timeout;// deliveries that arrived late
+    std::atomic<uint64_t> latency_sum_us;        // delivery-latency sum
+    std::atomic<uint64_t> latency_samples;       // count for latency_sum_us
+    std::atomic<int64_t>  latency_ewma_us;       // smoothed delivery latency
+    std::atomic<int64_t>  last_delivery_time_us; // last receive (us)
+    std::atomic<int64_t>  last_timeout_time_us;  // last timeout (us)
+    std::atomic<int64_t>  timeout_score;         // decayed timeout count
+    std::atomic<int64_t>  receive_score;         // decayed receive count
+    std::atomic<int64_t>  late_delivery_score;   // decayed late-delivery count
+
+    IbdPeerDeliveryQuality();
+};
+
+struct IbdPeerQualitySnapshot
+{
+    IbdPeerQualityTier tier;
+    int64_t latency_ewma_us;
+    // Whether at least one latency sample was observed.  Consumers must not
+    // treat latency_ewma_us == 0 as "measured zero latency"; it means "no
+    // sample yet" unless has_latency_sample is true.
+    bool has_latency_sample;
+    int64_t last_timeout_time_us;
+    int64_t last_delivery_time_us;
+};
+
+// Record a peer in the alternate-announcer ledger for a hash.  Guarded by
+// cs_mapAlreadyAskedFor.  Returns true when a new entry was recorded.
+bool RecordAlternateBlockAnnouncer(const uint256& hash, NodeId peer);
+// Populate out with the current (non-expired) alternate announcers for a hash.
+void GetBlockAlternateAnnouncers(const uint256& hash, std::vector<NodeId>& out);
+// Remove all quality-ledger entries that reference a peer (disconnect cleanup):
+// the alternate-announcer ledger, the last-timeout-owner ledger, and the
+// late-delivery expectation ledger.
+size_t RemoveBlockAlternateAnnouncersForPeer(NodeId peer);
+// Number of hashes currently holding at least one alternate-announcer entry.
+size_t CountBlockAlternateAnnouncerHashes();
+// Test hook: clear the whole ledger.
+void ResetBlockAlternateAnnouncersForTesting();
+// Test hook: force-expire entries older than nNowUs.
+void ExpireBlockAlternateAnnouncersForTesting(int64_t nNowUs);
+
+// Record which peer most recently timed out a request for a hash.  Used by the
+// exact-hash tier-1 ranking rule (never prefer the peer that failed this hash
+// before when an alternative exists).  Guarded by cs_mapAlreadyAskedFor.  The
+// map is hard-bounded and lazily pruned (see net.cpp).
+void RecordBlockLastTimeoutOwner(const uint256& hash, NodeId peer);
+bool GetBlockLastTimeoutOwner(const uint256& hash, NodeId* peer);
+// True when the peer was the last owner that timed out a request for the hash.
+bool WasBlockLastTimedOutByPeer(const uint256& hash, NodeId peer);
+// Number of hashes currently in the last-timeout-owner ledger.
+size_t CountBlockLastTimeoutOwnerHashes();
+// Test hook: clear the last-timeout-owner ledger.
+void ResetBlockLastTimeoutOwnerForTesting();
+
+// Record that a request for a hash timed out on a peer, so a later arrival of
+// the block can be attributed as a late outcome.  Guarded by cs_mapAlreadyAskedFor.
+void RecordBlockLateDeliveryExpectation(const uint256& hash, NodeId peer,
+                                        int64_t markUs, int64_t timeoutUs);
+// Consume (and erase) the late-delivery expectation for a hash.  Returns false
+// when no expectation is outstanding.
+bool TakeBlockLateDeliveryExpectation(const uint256& hash, NodeId* peer,
+                                      int64_t* markUs);
+// Number of hashes currently in the late-delivery expectation ledger.
+size_t CountBlockLateDeliveryExpectationHashes();
+// Attribute a late delivery to the peer that originally requested the hash.
+// Looks the peer up in vNodes; no-op when the peer is already gone.
+void RecordLateDeliveryOutcome(NodeId peer, int64_t latencyUs);
+// Test hook: clear the late-delivery expectation ledger.
+void ResetLateDeliveryExpectationForTesting();
+
+// Pick the peer that should be asked for a block hash.  Returns NULL to keep
+// the announcer (no redirect).  The caller (TryAdmitBlockInvOrDefer and the
+// deferred refill) must already hold cs_main.  fExemptFromRedirect reserves
+// the frontier semantics (frontier candidate / deferred frontier hash): such
+// admissions always keep the announcer verbatim.
+CNode* ChooseIbdBlockRequestTarget(CNode* pfrom, const uint256& hash,
+                                   bool fExemptFromRedirect,
+                                   IbdAskForRedirectReason* pReasonOut,
+                                   bool* pNoAlternativeOut);
+// Ask for a block inv applying the timeout-aware quality redirection.  Counts
+// the redirect / reissue / no-alternative metrics and records the announcer as
+// an alternate when the ask is redirected away from it.
+AskForResult AskForBlockInvWithQualityRedirection(CNode* pfrom, const CInv& inv,
+                                                  BlockRequestTraceSource source,
+                                                  bool fExemptFromRedirect);
+
+// Test hook: clear global gauges used by the ranking path.
+void ResetIbdQualityStateForTesting();
+
+// Test hook: override the wall-clock used by the quality timestamps so unit
+// tests can exercise the decay and TTL paths deterministically.
+void SetIbdQualityClockForTesting(int64_t nNowUs);
+
+// Test hook: restore the real clock.
+void UnsetIbdQualityClockForTesting();
+
 // Single-slot IBD frontier admission exemption.
 //
 // During IBD the deferred block-request budget (see
@@ -1116,6 +1311,12 @@ public:
 
     std::set<uint256> setBlocksInFlight;
     std::map<uint256, int64_t> mapBlockInFlightSince;
+    // Parallel to mapBlockInFlightSince with microsecond precision for the
+    // delivery-latency EWMA; maintained on the same loci.
+    std::map<uint256, int64_t> mapBlockInFlightMarkUs;
+    // Per-peer delivery quality used by the timeout-aware IBD ranking.  See
+    // the IbdPeerDeliveryQuality / IbdPeerQualityTier documentation above.
+    IbdPeerDeliveryQuality ibdQuality;
 
     SecMsgNode smsgData;
 
@@ -1577,6 +1778,10 @@ public:
                                          BlockRequestOwnerStateName(ownerState));
             ibdmetrics::Get().askfor_skip_other_peer_owner.fetch_add(
                 1, std::memory_order_relaxed);
+            // This peer announced a hash that another peer owns: strong
+            // evidence it can serve the block, so remember it as an
+            // alternative for a later timeout reassignment.
+            RecordAlternateBlockAnnouncer(inv.hash, GetId());
             return ASKFOR_OWNED_BY_OTHER;
         }
 
@@ -1981,6 +2186,20 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                     ibdmetrics::GlobalActiveAdd(
                         -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
                     RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
+                    RecordIbdBlockTimeout();
+                    // Capture the mark time before erasing so a later arrival
+                    // of the block can be measured as a late delivery.
+                    int64_t nExpiredMarkUs = 0;
+                    std::map<uint256, int64_t>::iterator miExpiredUs =
+                        mapBlockInFlightMarkUs.find(hashExpired);
+                    if (miExpiredUs != mapBlockInFlightMarkUs.end())
+                    {
+                        nExpiredMarkUs = miExpiredUs->second;
+                        mapBlockInFlightMarkUs.erase(miExpiredUs);
+                    }
+                    RecordBlockLastTimeoutOwner(hashExpired, GetId());
+                    RecordBlockLateDeliveryExpectation(
+                        hashExpired, GetId(), nExpiredMarkUs, QualityNowUs());
                     NodeId nDiversifyAnnounce = -1;
                     if (TakeDiversifyAnnounce(hashExpired, &nDiversifyAnnounce))
                         ibdmetrics::Get().diversify_other_lane_timeout.fetch_add(
@@ -2037,8 +2256,10 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                 fDiversified ? nAnnouncePeer : GetId(), fDiversified);
             ibdmetrics::InflightAdd(1);
             ibdmetrics::GlobalActiveAdd(1);
+            RecordIbdBlockIssued();
         }
         mapBlockInFlightSince[hashBlock] = GetTime();
+        mapBlockInFlightMarkUs[hashBlock] = QualityNowUs();
         TransitionBlockRequestOwnerToInFlight(hashBlock, GetId());
     }
 
@@ -2054,9 +2275,156 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
             RequestBlockPipelineWake(WAKE_CAUSE_CLEAR_INFLIGHT);
         }
         mapBlockInFlightSince.erase(hashBlock);
+        std::map<uint256, int64_t>::iterator miUs =
+            mapBlockInFlightMarkUs.find(hashBlock);
+        if (miUs != mapBlockInFlightMarkUs.end())
+        {
+            const int64_t nLatencyUs = std::max<int64_t>(
+                0, QualityNowUs() - miUs->second);
+            mapBlockInFlightMarkUs.erase(miUs);
+            RecordIbdBlockDelivery(nLatencyUs,
+                                   WasBlockLastTimedOutByPeer(hashBlock, GetId()));
+        }
+        else
+        {
+            // No live mark: the request already timed out (ExpireBlockInFlight
+            // consumed the mark and left a late-delivery expectation).  This is
+            // a late arrival -- attribute the outcome to the peer that actually
+            // requested the block, without a second lifecycle decrement.
+            NodeId nTimeoutPeer = -1;
+            int64_t nMarkUs = 0;
+            if (TakeBlockLateDeliveryExpectation(
+                    hashBlock, &nTimeoutPeer, &nMarkUs))
+            {
+                const int64_t nLatencyUs = std::max<int64_t>(
+                    0, QualityNowUs() - nMarkUs);
+                RecordLateDeliveryOutcome(nTimeoutPeer, nLatencyUs);
+            }
+        }
         TakeDiversifyAnnounce(hashBlock, NULL);
         ReleaseBlockRequestOwner(hashBlock, GetId(), "receive");
     }
+
+    // ------------------------------------------------------------------
+    // IBD peer-quality observation hooks.  All are relaxed-atomic updates;
+    // they never change scheduling behavior directly, only the ranking
+    // signals consumed by ChooseIbdBlockRequestTarget.
+    // ------------------------------------------------------------------
+    // A block request was queued for / marked in flight on this peer.
+    void RecordIbdBlockIssued()
+    {
+        ibdQuality.requests_issued.fetch_add(1, std::memory_order_relaxed);
+        ibdmetrics::Get().peer_quality_requests_observed.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    // A request was released because the block was received (possibly late).
+    // Every completed outcome decays both decayed scores, so a peer's timeout
+    // history fades as its receive stream continues (rolling-window recovery
+    // without a restart).
+    void RecordIbdBlockDelivery(int64_t latencyUs, bool receivedAfterTimeout)
+    {
+        const int64_t nNowUs = QualityNowUs();
+        ibdQuality.releases_by_receive.fetch_add(1, std::memory_order_relaxed);
+        ibdQuality.timeout_score = DecayIbdScore(
+            ibdQuality.timeout_score.load(std::memory_order_relaxed));
+        ibdQuality.receive_score = DecayIbdScore(
+            ibdQuality.receive_score.load(std::memory_order_relaxed));
+        ibdQuality.receive_score.fetch_add(
+            IBD_PEER_QUALITY_SCALE, std::memory_order_relaxed);
+        {
+            // The EWMA initializes from the sample count, never from a sentinel
+            // latency value: a first sample of exactly 0 must still seed the
+            // EWMA so the second sample blends in instead of replacing it.
+            const int64_t nSample = std::max<int64_t>(0, latencyUs);
+            ibdQuality.latency_sum_us.fetch_add(nSample, std::memory_order_relaxed);
+            const uint64_t nSamplesBefore =
+                ibdQuality.latency_samples.fetch_add(1, std::memory_order_relaxed);
+            const int64_t nEwma =
+                ibdQuality.latency_ewma_us.load(std::memory_order_relaxed);
+            const int64_t nNext =
+                nSamplesBefore == 0
+                    ? nSample
+                    : nEwma -
+                      (nEwma >> IBD_PEER_LATENCY_EWMA_SHIFT) +
+                      (nSample >> IBD_PEER_LATENCY_EWMA_SHIFT);
+            ibdQuality.latency_ewma_us.store(nNext, std::memory_order_relaxed);
+        }
+        ibdQuality.last_delivery_time_us.store(nNowUs, std::memory_order_relaxed);
+        if (receivedAfterTimeout)
+        {
+            ibdQuality.received_after_timeout.fetch_add(
+                1, std::memory_order_relaxed);
+            ibdQuality.late_delivery_score = DecayIbdScore(
+                ibdQuality.late_delivery_score.load(std::memory_order_relaxed));
+            ibdQuality.late_delivery_score.fetch_add(
+                IBD_PEER_QUALITY_SCALE, std::memory_order_relaxed);
+            ibdmetrics::Get().peer_quality_late_outcomes.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        ibdmetrics::Get().peer_quality_receive_outcomes.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    // A request was released because it expired.  Also decays the receive
+    // score so a burst of timeouts cannot be re-triggered by stale history.
+    void RecordIbdBlockTimeout()
+    {
+        const int64_t nNowUs = QualityNowUs();
+        ibdQuality.releases_by_timeout.fetch_add(1, std::memory_order_relaxed);
+        ibdQuality.receive_score = DecayIbdScore(
+            ibdQuality.receive_score.load(std::memory_order_relaxed));
+        ibdQuality.timeout_score = DecayIbdScore(
+            ibdQuality.timeout_score.load(std::memory_order_relaxed));
+        ibdQuality.timeout_score.fetch_add(
+            IBD_PEER_QUALITY_SCALE, std::memory_order_relaxed);
+        ibdQuality.last_timeout_time_us.store(nNowUs, std::memory_order_relaxed);
+        ibdmetrics::Get().peer_quality_timeout_outcomes.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    // Snapshot of the current quality for ranking.  Relaxed loads only.
+    IbdPeerQualitySnapshot GetIbdQualitySnapshot() const
+    {
+        IbdPeerQualitySnapshot snap;
+        const int64_t nReceiveScore =
+            ibdQuality.receive_score.load(std::memory_order_relaxed);
+        const int64_t nTimeoutScore =
+            ibdQuality.timeout_score.load(std::memory_order_relaxed);
+        snap.tier = TierFromScores(nReceiveScore, nTimeoutScore);
+        snap.latency_ewma_us =
+            ibdQuality.latency_ewma_us.load(std::memory_order_relaxed);
+        snap.has_latency_sample =
+            ibdQuality.latency_samples.load(std::memory_order_relaxed) > 0;
+        snap.last_timeout_time_us =
+            ibdQuality.last_timeout_time_us.load(std::memory_order_relaxed);
+        snap.last_delivery_time_us =
+            ibdQuality.last_delivery_time_us.load(std::memory_order_relaxed);
+        return snap;
+    }
+    // Deterministic decayed-score step: each completed outcome halves the
+    // influence of every earlier outcome roughly every ~11 events, giving a
+    // rolling window (and therefore reputation recovery without a restart).
+    static int64_t DecayIbdScore(int64_t score)
+    {
+        return score - (score >> IBD_PEER_QUALITY_DECAY_SHIFT);
+    }
+    // Tier from decayed (fixed-point scaled) outcome scores.  UNKNOWN until
+    // enough completed outcomes are observed (cold-start neutrality).
+    static IbdPeerQualityTier TierFromScores(int64_t receiveScore,
+                                             int64_t timeoutScore)
+    {
+        if (receiveScore < 0)
+            receiveScore = 0;
+        if (timeoutScore < 0)
+            timeoutScore = 0;
+        if (receiveScore + timeoutScore <
+            IBD_PEER_QUALITY_MIN_SCORE * IBD_PEER_QUALITY_SCALE)
+            return IBD_PEER_QUALITY_UNKNOWN;
+        const int64_t nPermille =
+            (1000LL * timeoutScore) / (receiveScore + timeoutScore);
+        return nPermille >= IBD_PEER_QUALITY_DEGRADED_RATE_PERMILLE
+            ? IBD_PEER_QUALITY_DEGRADED : IBD_PEER_QUALITY_GOOD;
+    }
+    // Wall clock for quality timestamps (override for tests).
+    static int64_t QualityNowUs();
     bool IsSubscribed(unsigned int nChannel);
     void Subscribe(unsigned int nChannel, unsigned int nHops=0);
     void CancelSubscribe(unsigned int nChannel);

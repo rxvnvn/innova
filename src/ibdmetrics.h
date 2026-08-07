@@ -257,6 +257,32 @@ struct IBDMetricsSnapshot
     int64_t diversify_snapshot_skip_lock;
     int64_t diversify_no_other_lane;
     int64_t diversify_other_lane_timeout;
+
+    // Timeout-aware IBD peer-quality ranking counters.
+    int64_t peer_quality_requests_observed;
+    int64_t peer_quality_receive_outcomes;
+    int64_t peer_quality_timeout_outcomes;
+    int64_t peer_quality_late_outcomes;
+    int64_t peer_quality_redirects;
+    int64_t peer_concentration_redirects;
+    int64_t peer_quality_no_alternative;
+    int64_t peer_concentration_no_alternative;
+    int64_t same_peer_reissue_after_timeout;
+    int64_t cross_peer_reissue_after_timeout;
+    int64_t timeout_reissue_no_alternative;
+    int64_t quality_unknown_selected;
+    int64_t quality_good_selected;
+    int64_t quality_degraded_selected;
+    int64_t alternate_announcer_recorded;
+    int64_t alternate_announcer_duplicate;
+    int64_t alternate_announcer_evicted;
+    int64_t alternate_announcer_expired;
+    int64_t alternate_announcer_cleanup;
+    int64_t dominant_peer_active_share_current_pct;
+    int64_t dominant_peer_active_share_max_pct;
+    int64_t degraded_peers_current;
+    int64_t alternate_hashes_current;
+    int64_t alternate_hashes_max;
 };
 
 namespace ibdmetrics {
@@ -524,6 +550,41 @@ struct Counters
     std::atomic<int64_t> diversify_snapshot_skip_lock;
     std::atomic<int64_t> diversify_no_other_lane;
     std::atomic<int64_t> diversify_other_lane_timeout;
+
+    // Timeout-aware IBD peer-quality ranking (peer-quality feedback).
+    // Per-peer outcome observations feed the ranking signals.
+    std::atomic<int64_t> peer_quality_requests_observed;
+    std::atomic<int64_t> peer_quality_receive_outcomes;
+    std::atomic<int64_t> peer_quality_timeout_outcomes;
+    std::atomic<int64_t> peer_quality_late_outcomes;
+    // Redirect outcomes: a block request was admitted to a different peer
+    // than the announcer (quality-driven vs concentration-driven), or no
+    // alternative existed so the announcer was kept.
+    std::atomic<int64_t> peer_quality_redirects;
+    std::atomic<int64_t> peer_concentration_redirects;
+    std::atomic<int64_t> peer_quality_no_alternative;
+    std::atomic<int64_t> peer_concentration_no_alternative;
+    // Re-request attribution of a hash whose previous request timed out.
+    std::atomic<int64_t> same_peer_reissue_after_timeout;
+    std::atomic<int64_t> cross_peer_reissue_after_timeout;
+    std::atomic<int64_t> timeout_reissue_no_alternative;
+    // Tier of the peer that was actually asked.
+    std::atomic<int64_t> quality_unknown_selected;
+    std::atomic<int64_t> quality_good_selected;
+    std::atomic<int64_t> quality_degraded_selected;
+    // Alternate-announcer ledger bookkeeping.
+    std::atomic<int64_t> alternate_announcer_recorded;
+    std::atomic<int64_t> alternate_announcer_duplicate;
+    std::atomic<int64_t> alternate_announcer_evicted;
+    std::atomic<int64_t> alternate_announcer_expired;
+    std::atomic<int64_t> alternate_announcer_cleanup;
+    // Concentration / state gauges (updated from the ranking slow path and the
+    // alternate-announcer ledger transitions).
+    std::atomic<int64_t> dominant_peer_active_share_current_pct;
+    std::atomic<int64_t> dominant_peer_active_share_max_pct;
+    std::atomic<int64_t> degraded_peers_current;
+    std::atomic<int64_t> alternate_hashes_current;
+    std::atomic<int64_t> alternate_hashes_max;
 
     Counters();
 };

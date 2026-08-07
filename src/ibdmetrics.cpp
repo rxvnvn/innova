@@ -224,7 +224,31 @@ Counters::Counters()
       diversify_picked_announcer(0),
       diversify_snapshot_skip_lock(0),
       diversify_no_other_lane(0),
-      diversify_other_lane_timeout(0)
+      diversify_other_lane_timeout(0),
+      peer_quality_requests_observed(0),
+      peer_quality_receive_outcomes(0),
+      peer_quality_timeout_outcomes(0),
+      peer_quality_late_outcomes(0),
+      peer_quality_redirects(0),
+      peer_concentration_redirects(0),
+      peer_quality_no_alternative(0),
+      peer_concentration_no_alternative(0),
+      same_peer_reissue_after_timeout(0),
+      cross_peer_reissue_after_timeout(0),
+      timeout_reissue_no_alternative(0),
+      quality_unknown_selected(0),
+      quality_good_selected(0),
+      quality_degraded_selected(0),
+      alternate_announcer_recorded(0),
+      alternate_announcer_duplicate(0),
+      alternate_announcer_evicted(0),
+      alternate_announcer_expired(0),
+      alternate_announcer_cleanup(0),
+      dominant_peer_active_share_current_pct(0),
+      dominant_peer_active_share_max_pct(0),
+      degraded_peers_current(0),
+      alternate_hashes_current(0),
+      alternate_hashes_max(0)
 {
 }
 
@@ -975,6 +999,55 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.diversify_no_other_lane.load(std::memory_order_relaxed);
     out.diversify_other_lane_timeout =
         c.diversify_other_lane_timeout.load(std::memory_order_relaxed);
+
+    out.peer_quality_requests_observed =
+        c.peer_quality_requests_observed.load(std::memory_order_relaxed);
+    out.peer_quality_receive_outcomes =
+        c.peer_quality_receive_outcomes.load(std::memory_order_relaxed);
+    out.peer_quality_timeout_outcomes =
+        c.peer_quality_timeout_outcomes.load(std::memory_order_relaxed);
+    out.peer_quality_late_outcomes =
+        c.peer_quality_late_outcomes.load(std::memory_order_relaxed);
+    out.peer_quality_redirects =
+        c.peer_quality_redirects.load(std::memory_order_relaxed);
+    out.peer_concentration_redirects =
+        c.peer_concentration_redirects.load(std::memory_order_relaxed);
+    out.peer_quality_no_alternative =
+        c.peer_quality_no_alternative.load(std::memory_order_relaxed);
+    out.peer_concentration_no_alternative =
+        c.peer_concentration_no_alternative.load(std::memory_order_relaxed);
+    out.same_peer_reissue_after_timeout =
+        c.same_peer_reissue_after_timeout.load(std::memory_order_relaxed);
+    out.cross_peer_reissue_after_timeout =
+        c.cross_peer_reissue_after_timeout.load(std::memory_order_relaxed);
+    out.timeout_reissue_no_alternative =
+        c.timeout_reissue_no_alternative.load(std::memory_order_relaxed);
+    out.quality_unknown_selected =
+        c.quality_unknown_selected.load(std::memory_order_relaxed);
+    out.quality_good_selected =
+        c.quality_good_selected.load(std::memory_order_relaxed);
+    out.quality_degraded_selected =
+        c.quality_degraded_selected.load(std::memory_order_relaxed);
+    out.alternate_announcer_recorded =
+        c.alternate_announcer_recorded.load(std::memory_order_relaxed);
+    out.alternate_announcer_duplicate =
+        c.alternate_announcer_duplicate.load(std::memory_order_relaxed);
+    out.alternate_announcer_evicted =
+        c.alternate_announcer_evicted.load(std::memory_order_relaxed);
+    out.alternate_announcer_expired =
+        c.alternate_announcer_expired.load(std::memory_order_relaxed);
+    out.alternate_announcer_cleanup =
+        c.alternate_announcer_cleanup.load(std::memory_order_relaxed);
+    out.dominant_peer_active_share_current_pct =
+        c.dominant_peer_active_share_current_pct.load(std::memory_order_relaxed);
+    out.dominant_peer_active_share_max_pct =
+        c.dominant_peer_active_share_max_pct.load(std::memory_order_relaxed);
+    out.degraded_peers_current =
+        c.degraded_peers_current.load(std::memory_order_relaxed);
+    out.alternate_hashes_current =
+        c.alternate_hashes_current.load(std::memory_order_relaxed);
+    out.alternate_hashes_max =
+        c.alternate_hashes_max.load(std::memory_order_relaxed);
 }
 
 void ResetPipelineWakeMetricsForTesting()

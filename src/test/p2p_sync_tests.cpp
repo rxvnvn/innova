@@ -690,6 +690,63 @@ static void CheckWakeGaugeBalance(const std::vector<CNode*>& peers)
     BOOST_CHECK(g.total_deferred_current >= 0);
 }
 
+// ---- IBD peer-quality ranking helpers -------------------------------------
+
+// Isolate the global quality ledgers (mapBlockAlternateAnnouncers and
+// mapBlockLastTimeoutOwner) between test cases.
+class CScopedIbdQualityState
+{
+public:
+    CScopedIbdQualityState() { ResetIbdQualityStateForTesting(); }
+    ~CScopedIbdQualityState() { ResetIbdQualityStateForTesting(); }
+};
+
+// Scoped membership of peers in vNodes so ChooseIbdBlockRequestTarget can find
+// redirect candidates.  Saves/restores the pre-existing membership.
+class CScopedVNodes
+{
+private:
+    std::vector<CNode*> saved;
+
+public:
+    CScopedVNodes()
+    {
+        LOCK(cs_vNodes);
+        saved = vNodes;
+        vNodes.clear();
+    }
+    ~CScopedVNodes()
+    {
+        LOCK(cs_vNodes);
+        vNodes = saved;
+    }
+    void Add(CNode* pnode)
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(pnode);
+    }
+};
+
+// Deterministic eligible redirect lane.
+static void PrepareIbdRedirectLane(CNode& peer)
+{
+    peer.nVersion = PROTOCOL_VERSION;
+    peer.fSuccessfullyConnected = true;
+    peer.fClient = false;
+    peer.fOneShot = false;
+    peer.fDisconnect = false;
+}
+
+static void SetIbdPeerPressure(CNode& peer, int64_t nPressure)
+{
+    peer.peerLiveActivePressure.store(nPressure, std::memory_order_relaxed);
+}
+
+// Number of completed outcomes needed to cross the scaled
+// IBD_PEER_QUALITY_MIN_SCORE confidence threshold (8*16 = 128 scaled units;
+// ~11-16 events with decay, comfortably above the threshold).
+static const int QUALITY_EVENT_COUNT = 16;
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(p2p_sync_tests)
@@ -7187,6 +7244,999 @@ BOOST_AUTO_TEST_CASE(cleanup_preserves_invariants)
     BOOST_CHECK_EQUAL(
         MetricGet(ibdmetrics::Get().total_inflight_current), nGaugeBefore);
     BOOST_CHECK_EQUAL(peer.peerLiveActivePressure.load(), 0);
+}
+
+// ---- Timeout-aware IBD peer-quality ranking --------------------------------
+
+// Cold-start neutrality: a fresh peer is UNKNOWN, not GOOD or DEGRADED.
+BOOST_AUTO_TEST_CASE(ibd_quality_cold_start_is_unknown)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21101), "quality-cold", true);
+    const IbdPeerQualitySnapshot snap = peer.GetIbdQualitySnapshot();
+    BOOST_CHECK_EQUAL((int)snap.tier, (int)IBD_PEER_QUALITY_UNKNOWN);
+    BOOST_CHECK_EQUAL(snap.latency_ewma_us, 0);
+    BOOST_CHECK_EQUAL(peer.ibdQuality.requests_issued.load(), 0u);
+    // UNKNOWN must rank worse than GOOD so cold-start peers never displace a
+    // proven-good supplier.
+    BOOST_CHECK(IBD_PEER_QUALITY_GOOD < IBD_PEER_QUALITY_UNKNOWN);
+}
+
+// The EWMA seeds from the sample count, never from a sentinel latency value: a
+// first sample of exactly 0 must still mark the peer as latency-measured and
+// the second sample must blend in (not wholesale-replace the EWMA).
+BOOST_AUTO_TEST_CASE(ibd_quality_ewma_zero_first_sample_seeds)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21481), "ewma-zero", true);
+    IbdPeerQualitySnapshot snap = peer.GetIbdQualitySnapshot();
+    BOOST_CHECK(!snap.has_latency_sample);
+    BOOST_CHECK_EQUAL(snap.latency_ewma_us, 0);
+
+    peer.RecordIbdBlockDelivery(0, false);
+    snap = peer.GetIbdQualitySnapshot();
+    BOOST_CHECK(snap.has_latency_sample);
+    BOOST_CHECK_EQUAL(snap.latency_ewma_us, 0);
+
+    // Second sample blends: 0 - (0 >> 3) + (8000 >> 3) == 1000.  The old
+    // sentinel behaviour would have replaced the EWMA with 8000 instead.
+    peer.RecordIbdBlockDelivery(8000, false);
+    snap = peer.GetIbdQualitySnapshot();
+    BOOST_CHECK(snap.has_latency_sample);
+    BOOST_CHECK_EQUAL(snap.latency_ewma_us, 1000);
+}
+
+// A steady receive stream promotes a peer to GOOD and fills the latency EWMA.
+BOOST_AUTO_TEST_CASE(ibd_quality_receive_stream_promotes_to_good)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21102), "quality-good", true);
+    const int64_t nBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_receive_outcomes);
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        peer.RecordIbdBlockDelivery(1000, false);
+    const IbdPeerQualitySnapshot snap = peer.GetIbdQualitySnapshot();
+    BOOST_CHECK_EQUAL((int)snap.tier, (int)IBD_PEER_QUALITY_GOOD);
+    BOOST_CHECK_EQUAL(snap.latency_ewma_us, 1000);
+    BOOST_CHECK_EQUAL(peer.ibdQuality.releases_by_receive.load(),
+                      (uint64_t)QUALITY_EVENT_COUNT);
+    BOOST_CHECK_EQUAL(peer.ibdQuality.releases_by_timeout.load(), 0u);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_receive_outcomes),
+        nBefore + QUALITY_EVENT_COUNT);
+}
+
+// A burst of timeouts degrades a peer.
+BOOST_AUTO_TEST_CASE(ibd_quality_timeout_burst_degrades_peer)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21103), "quality-degraded", true);
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        peer.RecordIbdBlockTimeout();
+    BOOST_CHECK_EQUAL((int)peer.GetIbdQualitySnapshot().tier,
+                      (int)IBD_PEER_QUALITY_DEGRADED);
+    BOOST_CHECK_EQUAL(peer.ibdQuality.releases_by_timeout.load(),
+                      (uint64_t)QUALITY_EVENT_COUNT);
+}
+
+// Reputation recovers without a restart: a long enough receive stream fades
+// the timeout history (both decayed scores decay on every outcome).
+BOOST_AUTO_TEST_CASE(ibd_quality_recovers_without_restart)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21104), "quality-recover", true);
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        peer.RecordIbdBlockTimeout();
+    BOOST_CHECK_EQUAL((int)peer.GetIbdQualitySnapshot().tier,
+                      (int)IBD_PEER_QUALITY_DEGRADED);
+    for (int i = 0; i < 4 * QUALITY_EVENT_COUNT; ++i)
+        peer.RecordIbdBlockDelivery(1000, false);
+    BOOST_CHECK_EQUAL((int)peer.GetIbdQualitySnapshot().tier,
+                      (int)IBD_PEER_QUALITY_GOOD);
+}
+
+// The tier is a rate over the rolling window, not a raw count: a peer with a
+// large majority of successes stays GOOD even with one timeout.
+BOOST_AUTO_TEST_CASE(ibd_quality_mixed_outcomes_rate_behavior)
+{
+    // A timeout share above the 250 permille threshold degrades the peer even
+    // though the raw receive count is higher.
+    CNode mixed(INVALID_SOCKET, TestPeerAddress(21105), "quality-mixed-a", true);
+    for (int i = 0; i < 15; ++i)
+        mixed.RecordIbdBlockDelivery(1000, false);
+    for (int i = 0; i < 5; ++i)
+        mixed.RecordIbdBlockTimeout();
+    BOOST_CHECK_EQUAL((int)mixed.GetIbdQualitySnapshot().tier,
+                      (int)IBD_PEER_QUALITY_DEGRADED);
+
+    // A peer with a large majority of successes stays GOOD despite a single
+    // timeout.
+    CNode good(INVALID_SOCKET, TestPeerAddress(21106), "quality-mixed-b", true);
+    for (int i = 0; i < 40; ++i)
+        good.RecordIbdBlockDelivery(1000, false);
+    good.RecordIbdBlockTimeout();
+    BOOST_CHECK_EQUAL((int)good.GetIbdQualitySnapshot().tier,
+                      (int)IBD_PEER_QUALITY_GOOD);
+}
+
+// Alternate-announcer ledger: record / duplicate / read / gauge bookkeeping.
+BOOST_AUTO_TEST_CASE(ibd_alternate_announcer_ledger_semantics)
+{
+    CScopedIbdQualityState scope;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21201), "alt-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21202), "alt-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(21203), "alt-c", true);
+    const uint256 hashA(212001);
+    const uint256 hashB(212002);
+
+    const int64_t nRecordedBefore =
+        MetricGet(ibdmetrics::Get().alternate_announcer_recorded);
+    BOOST_CHECK(RecordAlternateBlockAnnouncer(hashA, peerA.GetId()));
+    BOOST_CHECK_EQUAL(CountBlockAlternateAnnouncerHashes(), 1U);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().alternate_hashes_current), 1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().alternate_announcer_recorded),
+        nRecordedBefore + 1);
+
+    // Duplicate refresh does not grow the list.
+    const int64_t nDupBefore =
+        MetricGet(ibdmetrics::Get().alternate_announcer_duplicate);
+    BOOST_CHECK(!RecordAlternateBlockAnnouncer(hashA, peerA.GetId()));
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().alternate_announcer_duplicate),
+        nDupBefore + 1);
+    BOOST_CHECK_EQUAL(CountBlockAlternateAnnouncerHashes(), 1U);
+
+    // A second peer for the same hash is returned in read order.
+    RecordAlternateBlockAnnouncer(hashA, peerB.GetId());
+    std::vector<NodeId> announcers;
+    GetBlockAlternateAnnouncers(hashA, announcers);
+    BOOST_CHECK_EQUAL(announcers.size(), 2U);
+    BOOST_CHECK(std::find(announcers.begin(), announcers.end(),
+                          peerA.GetId()) != announcers.end());
+    BOOST_CHECK(std::find(announcers.begin(), announcers.end(),
+                          peerB.GetId()) != announcers.end());
+
+    // A second hash grows the hash gauge.
+    RecordAlternateBlockAnnouncer(hashB, peerC.GetId());
+    BOOST_CHECK_EQUAL(CountBlockAlternateAnnouncerHashes(), 2U);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().alternate_hashes_current), 2);
+}
+
+// The per-hash slot bound evicts the oldest entry deterministically.
+BOOST_AUTO_TEST_CASE(ibd_alternate_announcer_per_hash_bound)
+{
+    CScopedIbdQualityState scope;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21211), "alt-bnd-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21212), "alt-bnd-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(21213), "alt-bnd-c", true);
+    CNode peerD(INVALID_SOCKET, TestPeerAddress(21214), "alt-bnd-d", true);
+    CNode peerE(INVALID_SOCKET, TestPeerAddress(21215), "alt-bnd-e", true);
+    CNode peerF(INVALID_SOCKET, TestPeerAddress(21216), "alt-bnd-f", true);
+    CNode* peers[6] = {&peerA, &peerB, &peerC, &peerD, &peerE, &peerF};
+    const uint256 hash(212101);
+    const int64_t nEvictedBefore =
+        MetricGet(ibdmetrics::Get().alternate_announcer_evicted);
+
+    for (int i = 0; i < 4; ++i)
+        RecordAlternateBlockAnnouncer(hash, peers[i]->GetId());
+    std::vector<NodeId> announcers;
+    GetBlockAlternateAnnouncers(hash, announcers);
+    BOOST_CHECK_EQUAL(announcers.size(),
+                      (size_t)IBD_ALTERNATE_ANNOUNCERS_PER_HASH);
+
+    // A fifth distinct announcer evicts the oldest (peerA).
+    RecordAlternateBlockAnnouncer(hash, peerE.GetId());
+    GetBlockAlternateAnnouncers(hash, announcers);
+    BOOST_CHECK_EQUAL(announcers.size(),
+                      (size_t)IBD_ALTERNATE_ANNOUNCERS_PER_HASH);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().alternate_announcer_evicted),
+        nEvictedBefore + 1);
+    BOOST_CHECK(std::find(announcers.begin(), announcers.end(),
+                          peerA.GetId()) == announcers.end());
+    BOOST_CHECK(std::find(announcers.begin(), announcers.end(),
+                          peerE.GetId()) != announcers.end());
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().alternate_hashes_current), 1);
+}
+
+// The global hash bound keeps the ledger bounded across many hashes.
+BOOST_AUTO_TEST_CASE(ibd_alternate_announcer_global_bound)
+{
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21217), "alt-global", true);
+    // Exceed IBD_ALTERNATE_ANNOUNCER_MAX_HASHES by a little.
+    const size_t nExtra = 16;
+    for (size_t i = 0; i < IBD_ALTERNATE_ANNOUNCER_MAX_HASHES + nExtra; ++i)
+        RecordAlternateBlockAnnouncer(uint256(220000 + i), peer.GetId());
+    BOOST_CHECK_LE(CountBlockAlternateAnnouncerHashes(),
+                   (size_t)IBD_ALTERNATE_ANNOUNCER_MAX_HASHES);
+    BOOST_CHECK_LE(MetricGet(ibdmetrics::Get().alternate_hashes_current),
+                   (int64_t)IBD_ALTERNATE_ANNOUNCER_MAX_HASHES);
+}
+
+// TTL expiry frees hashes and restores the gauge.
+BOOST_AUTO_TEST_CASE(ibd_alternate_announcer_ttl_expiry)
+{
+    CScopedIbdQualityState scope;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21221), "alt-ttl-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21222), "alt-ttl-b", true);
+    const uint256 hashA(212201);
+    const uint256 hashB(212202);
+
+    SetIbdQualityClockForTesting(1000000);
+    RecordAlternateBlockAnnouncer(hashA, peerA.GetId());
+    RecordAlternateBlockAnnouncer(hashB, peerB.GetId());
+    BOOST_CHECK_EQUAL(CountBlockAlternateAnnouncerHashes(), 2U);
+    const int64_t nExpiredBefore =
+        MetricGet(ibdmetrics::Get().alternate_announcer_expired);
+
+    const int64_t nAfter =
+        1000000 + IBD_ALTERNATE_ANNOUNCER_TTL_US + 1;
+    SetIbdQualityClockForTesting(nAfter);
+    ExpireBlockAlternateAnnouncersForTesting(nAfter);
+    BOOST_CHECK_EQUAL(CountBlockAlternateAnnouncerHashes(), 0U);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().alternate_hashes_current), 0);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().alternate_announcer_expired),
+        nExpiredBefore + 2);
+    UnsetIbdQualityClockForTesting();
+}
+
+// Last-timeout-owner ledger: record / overwrite / query.
+BOOST_AUTO_TEST_CASE(ibd_last_timeout_owner_ledger)
+{
+    CScopedIbdQualityState scope;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21231), "timeout-owner-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21232), "timeout-owner-b", true);
+    const uint256 hashA(212301);
+    const uint256 hashB(212302);
+
+    RecordBlockLastTimeoutOwner(hashA, peerA.GetId());
+    NodeId nOwner = -1;
+    BOOST_CHECK(GetBlockLastTimeoutOwner(hashA, &nOwner));
+    BOOST_CHECK_EQUAL(nOwner, peerA.GetId());
+    BOOST_CHECK(WasBlockLastTimedOutByPeer(hashA, peerA.GetId()));
+    BOOST_CHECK(!WasBlockLastTimedOutByPeer(hashA, peerB.GetId()));
+    BOOST_CHECK(!GetBlockLastTimeoutOwner(hashB, &nOwner));
+
+    // A newer timeout overwrites the owner for the same hash.
+    RecordBlockLastTimeoutOwner(hashA, peerB.GetId());
+    BOOST_CHECK(WasBlockLastTimedOutByPeer(hashA, peerB.GetId()));
+    BOOST_CHECK(!WasBlockLastTimedOutByPeer(hashA, peerA.GetId()));
+
+    ResetBlockLastTimeoutOwnerForTesting();
+    BOOST_CHECK(!GetBlockLastTimeoutOwner(hashA, &nOwner));
+}
+
+// Disconnect cleanup removes a peer from both quality ledgers.
+BOOST_AUTO_TEST_CASE(ibd_disconnect_cleans_up_quality_ledgers)
+{
+    CScopedIbdQualityState scope;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21241), "cleanup-alt-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21242), "cleanup-alt-b", true);
+    const uint256 hashA(212401);
+    const uint256 hashB(212402);
+
+    RecordAlternateBlockAnnouncer(hashA, peerA.GetId());
+    RecordAlternateBlockAnnouncer(hashB, peerA.GetId());
+    RecordAlternateBlockAnnouncer(hashB, peerB.GetId());
+    RecordBlockLastTimeoutOwner(hashA, peerA.GetId());
+    BOOST_CHECK_EQUAL(CountBlockAlternateAnnouncerHashes(), 2U);
+
+    const int64_t nCleanupBefore =
+        MetricGet(ibdmetrics::Get().alternate_announcer_cleanup);
+    peerA.Cleanup();
+    BOOST_CHECK_EQUAL(CountBlockAlternateAnnouncerHashes(), 1U);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().alternate_hashes_current), 1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().alternate_announcer_cleanup),
+        nCleanupBefore + 2);
+
+    std::vector<NodeId> announcers;
+    GetBlockAlternateAnnouncers(hashB, announcers);
+    BOOST_CHECK_EQUAL(announcers.size(), 1U);
+    BOOST_CHECK_EQUAL(announcers[0], peerB.GetId());
+
+    NodeId nOwner = -1;
+    BOOST_CHECK(!GetBlockLastTimeoutOwner(hashA, &nOwner));
+}
+
+// Fast path: a healthy announcer with no exact-hash timeout keeps the request.
+BOOST_AUTO_TEST_CASE(ibd_redirect_keeps_healthy_announcer)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21301), "redirect-fast", true);
+    CNode alt(INVALID_SOCKET, TestPeerAddress(21302), "redirect-fast-alt", true);
+    PrepareIbdRedirectLane(alt);
+    CScopedVNodes vnodes;
+    vnodes.Add(&alt);
+    const uint256 hash(213001);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockDelivery(1000, false);
+    RecordAlternateBlockAnnouncer(hash, alt.GetId());
+
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = true;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    BOOST_CHECK(target == NULL);
+    BOOST_CHECK_EQUAL((int)reason, (int)IBD_REDIRECT_NONE);
+    BOOST_CHECK(!noAlt);
+}
+
+// Exact-hash rule: the announcer that timed out a hash is bypassed for a
+// recorded alternate.
+BOOST_AUTO_TEST_CASE(ibd_redirect_on_exact_hash_timeout)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21311), "redirect-exact", true);
+    CNode altA(INVALID_SOCKET, TestPeerAddress(21312), "redirect-exact-a", true);
+    CNode altB(INVALID_SOCKET, TestPeerAddress(21313), "redirect-exact-b", true);
+    PrepareIbdRedirectLane(altA);
+    PrepareIbdRedirectLane(altB);
+    CScopedVNodes vnodes;
+    vnodes.Add(&altA);
+    vnodes.Add(&altB);
+    const uint256 hash(213101);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockDelivery(1000, false);
+    RecordAlternateBlockAnnouncer(hash, altA.GetId());
+    RecordAlternateBlockAnnouncer(hash, altB.GetId());
+    RecordBlockLastTimeoutOwner(hash, announcer.GetId());
+
+    const int64_t nCrossBefore =
+        MetricGet(ibdmetrics::Get().cross_peer_reissue_after_timeout);
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    BOOST_CHECK(target != NULL);
+    BOOST_CHECK_EQUAL((int)reason, (int)IBD_REDIRECT_HASH_TIMEOUT);
+    BOOST_CHECK(!noAlt);
+    BOOST_CHECK(target == &altA || target == &altB);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().cross_peer_reissue_after_timeout),
+        nCrossBefore + 1);
+}
+
+// No alternative to the failed owner: the announcer keeps the request
+// (frontier-safe fallback) and the reissue is attributed.
+BOOST_AUTO_TEST_CASE(ibd_redirect_no_alternative_reissues_same_peer)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21321), "redirect-noalt", true);
+    const uint256 hash(213201);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockDelivery(1000, false);
+    RecordBlockLastTimeoutOwner(hash, announcer.GetId());
+
+    const int64_t nSameBefore =
+        MetricGet(ibdmetrics::Get().same_peer_reissue_after_timeout);
+    const int64_t nNoAltBefore =
+        MetricGet(ibdmetrics::Get().timeout_reissue_no_alternative);
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    BOOST_CHECK(target == NULL);
+    BOOST_CHECK_EQUAL((int)reason, (int)IBD_REDIRECT_NONE);
+    BOOST_CHECK(noAlt);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().same_peer_reissue_after_timeout),
+        nSameBefore + 1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().timeout_reissue_no_alternative),
+        nNoAltBefore + 1);
+}
+
+// Quality rule: a degraded announcer is bypassed for a good alternate.
+BOOST_AUTO_TEST_CASE(ibd_redirect_on_degraded_announcer)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21331), "redirect-degraded", true);
+    CNode alt(INVALID_SOCKET, TestPeerAddress(21332), "redirect-degraded-alt", true);
+    PrepareIbdRedirectLane(alt);
+    CScopedVNodes vnodes;
+    vnodes.Add(&alt);
+    const uint256 hash(213301);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockTimeout();
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        alt.RecordIbdBlockDelivery(1000, false);
+    RecordAlternateBlockAnnouncer(hash, alt.GetId());
+
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    BOOST_CHECK(target == &alt);
+    BOOST_CHECK_EQUAL((int)reason, (int)IBD_REDIRECT_QUALITY);
+    BOOST_CHECK(!noAlt);
+}
+
+// Quality rule with no alternate: the degraded announcer still serves
+// (frontier-safe fallback, never a hard drop).
+BOOST_AUTO_TEST_CASE(ibd_redirect_degraded_no_alternative_keeps_announcer)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21341), "redirect-deg-noalt", true);
+    const uint256 hash(213401);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockTimeout();
+
+    const int64_t nNoAltBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_no_alternative);
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    BOOST_CHECK(target == NULL);
+    BOOST_CHECK(noAlt);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_no_alternative),
+        nNoAltBefore + 1);
+}
+
+// Frontier exemption: the frontier candidate / deferred frontier hash always
+// keeps the announcer verbatim, even when the peer is degraded.
+BOOST_AUTO_TEST_CASE(ibd_redirect_frontier_exempt_keeps_announcer)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21351), "redirect-frontier", true);
+    CNode alt(INVALID_SOCKET, TestPeerAddress(21352), "redirect-frontier-alt", true);
+    PrepareIbdRedirectLane(alt);
+    CScopedVNodes vnodes;
+    vnodes.Add(&alt);
+    const uint256 hash(213501);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockTimeout();
+    RecordAlternateBlockAnnouncer(hash, alt.GetId());
+    RecordBlockLastTimeoutOwner(hash, announcer.GetId());
+
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, true, &reason, &noAlt);
+    BOOST_CHECK(target == NULL);
+    BOOST_CHECK_EQUAL((int)reason, (int)IBD_REDIRECT_NONE);
+    BOOST_CHECK(!noAlt);
+}
+
+// Concentration rule: a dominant peer is bypassed for a fresh admission when
+// another eligible lane exists.
+BOOST_AUTO_TEST_CASE(ibd_redirect_on_concentration)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21361), "redirect-conc", true);
+    CNode alt(INVALID_SOCKET, TestPeerAddress(21362), "redirect-conc-alt", true);
+    PrepareIbdRedirectLane(announcer);
+    PrepareIbdRedirectLane(alt);
+    CScopedVNodes vnodes;
+    vnodes.Add(&announcer);
+    vnodes.Add(&alt);
+    const uint256 hash(213601);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockDelivery(1000, false);
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        alt.RecordIbdBlockDelivery(1000, false);
+    // The redirect target must be a provable holder of the hash: only a
+    // recorded alternate announcer is ever eligible.
+    RecordAlternateBlockAnnouncer(hash, alt.GetId());
+
+    const int64_t nGaugeSaved =
+        MetricGet(ibdmetrics::Get().global_active_current);
+    // Dominant share: the announcer holds 60 of 100 global active requests.
+    ibdmetrics::Get().global_active_current.store(100, std::memory_order_relaxed);
+    SetIbdPeerPressure(announcer, 60);
+    SetIbdPeerPressure(alt, 40);
+
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    BOOST_CHECK(target == &alt);
+    BOOST_CHECK_EQUAL((int)reason, (int)IBD_REDIRECT_CONCENTRATION);
+    BOOST_CHECK(!noAlt);
+
+    ibdmetrics::Get().global_active_current.store(
+        nGaugeSaved, std::memory_order_relaxed);
+}
+
+// Concentration rule with no other lane: there is no hard global ban; the
+// dominant peer keeps the request.
+BOOST_AUTO_TEST_CASE(ibd_redirect_concentration_no_alternative_keeps_announcer)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21371), "redirect-conc-noalt", true);
+    PrepareIbdRedirectLane(announcer);
+    CScopedVNodes vnodes;
+    vnodes.Add(&announcer);
+    const uint256 hash(213701);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockDelivery(1000, false);
+
+    const int64_t nGaugeSaved =
+        MetricGet(ibdmetrics::Get().global_active_current);
+    ibdmetrics::Get().global_active_current.store(100, std::memory_order_relaxed);
+    SetIbdPeerPressure(announcer, 90);
+
+    const int64_t nNoAltBefore =
+        MetricGet(ibdmetrics::Get().peer_concentration_no_alternative);
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    BOOST_CHECK(target == NULL);
+    BOOST_CHECK(noAlt);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_concentration_no_alternative),
+        nNoAltBefore + 1);
+
+    ibdmetrics::Get().global_active_current.store(
+        nGaugeSaved, std::memory_order_relaxed);
+}
+
+// AskForBlockInvWithQualityRedirection: the ask lands on the redirected target,
+// the announcer is recorded as an alternate for future reassignment, and the
+// redirect / selected-tier counters increment.
+BOOST_AUTO_TEST_CASE(ibd_askfor_wiring_redirects_and_records_alternate)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21381), "wiring-announcer", true);
+    CNode alt(INVALID_SOCKET, TestPeerAddress(21382), "wiring-alt", true);
+    PrepareIbdRedirectLane(alt);
+    CScopedVNodes vnodes;
+    vnodes.Add(&alt);
+    const uint256 hash(213801);
+    const CInv inv(MSG_BLOCK, hash);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockTimeout();
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        alt.RecordIbdBlockDelivery(1000, false);
+    RecordAlternateBlockAnnouncer(hash, alt.GetId());
+
+    const int64_t nRedirectBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_redirects);
+    const int64_t nGoodSelectedBefore =
+        MetricGet(ibdmetrics::Get().quality_good_selected);
+    AskForResult res = AskForBlockInvWithQualityRedirection(
+        &announcer, inv, BLOCKREQ_SOURCE_INV, false);
+    BOOST_CHECK_EQUAL((int)res, (int)ASKFOR_QUEUED);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_redirects),
+        nRedirectBefore + 1);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().quality_good_selected),
+        nGoodSelectedBefore + 1);
+
+    // The ask landed on the alternate, not the announcer.
+    BOOST_CHECK(alt.setAskForBlocks.count(hash));
+    BOOST_CHECK(!announcer.setAskForBlocks.count(hash));
+
+    // The announcer was recorded as an alternate for future reassignment.
+    std::vector<NodeId> announcers;
+    GetBlockAlternateAnnouncers(hash, announcers);
+    BOOST_CHECK(std::find(announcers.begin(), announcers.end(),
+                          announcer.GetId()) != announcers.end());
+
+    alt.ClearAskFor();
+}
+
+// The OWNED_BY_OTHER branch of AskFor records the announcer as an alternate.
+BOOST_AUTO_TEST_CASE(ibd_askfor_owned_by_other_records_alternate)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode owner(INVALID_SOCKET, TestPeerAddress(21391), "ownedby-owner", true);
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21392), "ownedby-announcer", true);
+    const uint256 hash(213901);
+    const CInv inv(MSG_BLOCK, hash);
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, owner.GetId()));
+    AskForResult res = announcer.AskFor(inv, BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL((int)res, (int)ASKFOR_OWNED_BY_OTHER);
+    BOOST_CHECK_EQUAL(announcer.setAskForBlocks.size(), 0U);
+
+    std::vector<NodeId> announcers;
+    GetBlockAlternateAnnouncers(hash, announcers);
+    BOOST_CHECK_EQUAL(announcers.size(), 1U);
+    BOOST_CHECK_EQUAL(announcers[0], announcer.GetId());
+
+    ReleaseBlockRequestOwnersForPeer(owner.GetId(), "disconnect");
+    ResetBlockAlternateAnnouncersForTesting();
+}
+
+// In-flight lifecycle: an expired request feeds the quality record, the last
+// timeout-owner ledger, and the timeout metric.
+BOOST_AUTO_TEST_CASE(ibd_inflight_lifecycle_feeds_quality_and_ledgers)
+{
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21401), "lifecycle", true);
+    const uint256 hash(214001);
+
+    const int64_t nTimeoutBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes);
+    peer.MarkBlockInFlight(hash);
+    // Backdate the timestamps so the block expires on the next pass.
+    peer.mapBlockInFlightSince[hash] = GetTime() - 60;
+    peer.mapBlockInFlightMarkUs[hash] = 1;
+    peer.ExpireBlockInFlight();
+
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK_EQUAL(peer.ibdQuality.releases_by_timeout.load(), 1u);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes),
+        nTimeoutBefore + 1);
+    BOOST_CHECK(WasBlockLastTimedOutByPeer(hash, peer.GetId()));
+
+    // A delivery that is reported after the timeout is counted as late.
+    const int64_t nLateBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_late_outcomes);
+    peer.RecordIbdBlockDelivery(5000, true);
+    BOOST_CHECK_EQUAL(peer.ibdQuality.received_after_timeout.load(), 1u);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_late_outcomes),
+        nLateBefore + 1);
+    BOOST_CHECK_GT(peer.ibdQuality.late_delivery_score.load(), 0);
+}
+
+// Concentration invariant: a dominant announcer with NO recorded alternate is
+// never redirected -- even when a plain eligible lane exists in vNodes.  A
+// redirect requires proof the target holds the hash.
+BOOST_AUTO_TEST_CASE(concentrated_unique_announcer_is_not_redirected)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21411), "conc-unique-a", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(21412), "conc-unique-lane", true);
+    PrepareIbdRedirectLane(announcer);
+    PrepareIbdRedirectLane(lane);
+    CScopedVNodes vnodes;
+    vnodes.Add(&announcer);
+    vnodes.Add(&lane);
+    const uint256 hash(214101);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockDelivery(1000, false);
+
+    const int64_t nGaugeSaved =
+        MetricGet(ibdmetrics::Get().global_active_current);
+    ibdmetrics::Get().global_active_current.store(100, std::memory_order_relaxed);
+    SetIbdPeerPressure(announcer, 90);
+    SetIbdPeerPressure(lane, 10);
+
+    const int64_t nNoAltBefore =
+        MetricGet(ibdmetrics::Get().peer_concentration_no_alternative);
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    // The eligible-but-unproven lane must not be chosen.
+    BOOST_CHECK(target == NULL);
+    BOOST_CHECK(noAlt);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_concentration_no_alternative),
+        nNoAltBefore + 1);
+
+    ibdmetrics::Get().global_active_current.store(
+        nGaugeSaved, std::memory_order_relaxed);
+}
+
+// Concentration invariant: when both a recorded alternate and an unproven lane
+// exist, the redirect goes only to the recorded alternate -- the unproven lane
+// is never a candidate.
+BOOST_AUTO_TEST_CASE(concentrated_announcer_redirects_only_to_known_alternative)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21421), "conc-known-a", true);
+    CNode alt(INVALID_SOCKET, TestPeerAddress(21422), "conc-known-alt", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(21423), "conc-known-lane", true);
+    PrepareIbdRedirectLane(announcer);
+    PrepareIbdRedirectLane(alt);
+    PrepareIbdRedirectLane(lane);
+    CScopedVNodes vnodes;
+    vnodes.Add(&announcer);
+    vnodes.Add(&alt);
+    vnodes.Add(&lane);
+    const uint256 hash(214201);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockDelivery(1000, false);
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        alt.RecordIbdBlockDelivery(1000, false);
+    RecordAlternateBlockAnnouncer(hash, alt.GetId());
+
+    const int64_t nGaugeSaved =
+        MetricGet(ibdmetrics::Get().global_active_current);
+    ibdmetrics::Get().global_active_current.store(100, std::memory_order_relaxed);
+    SetIbdPeerPressure(announcer, 70);
+    SetIbdPeerPressure(alt, 20);
+    SetIbdPeerPressure(lane, 10);
+
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    BOOST_CHECK(target == &alt);
+    BOOST_CHECK_EQUAL((int)reason, (int)IBD_REDIRECT_CONCENTRATION);
+    BOOST_CHECK(!noAlt);
+
+    ibdmetrics::Get().global_active_current.store(
+        nGaugeSaved, std::memory_order_relaxed);
+}
+
+// Concentration invariant: a recorded alternate that is not redirect-eligible
+// (disconnected) cannot be used; the dominant announcer keeps the request
+// rather than falling back to an unproven lane.
+BOOST_AUTO_TEST_CASE(ineligible_known_alternative_falls_back_to_original_announcer)
+{
+    CScopedIbdQualityState scope;
+    CNode announcer(INVALID_SOCKET, TestPeerAddress(21431), "conc-inel-a", true);
+    CNode alt(INVALID_SOCKET, TestPeerAddress(21432), "conc-inel-alt", true);
+    CNode lane(INVALID_SOCKET, TestPeerAddress(21433), "conc-inel-lane", true);
+    PrepareIbdRedirectLane(announcer);
+    PrepareIbdRedirectLane(lane);
+    // alt is recorded as holding the hash but is NOT an eligible lane.
+    CScopedVNodes vnodes;
+    vnodes.Add(&announcer);
+    vnodes.Add(&alt);
+    vnodes.Add(&lane);
+    const uint256 hash(214301);
+
+    for (int i = 0; i < QUALITY_EVENT_COUNT; ++i)
+        announcer.RecordIbdBlockDelivery(1000, false);
+    RecordAlternateBlockAnnouncer(hash, alt.GetId());
+
+    const int64_t nGaugeSaved =
+        MetricGet(ibdmetrics::Get().global_active_current);
+    ibdmetrics::Get().global_active_current.store(100, std::memory_order_relaxed);
+    SetIbdPeerPressure(announcer, 80);
+    SetIbdPeerPressure(lane, 20);
+
+    const int64_t nNoAltBefore =
+        MetricGet(ibdmetrics::Get().peer_concentration_no_alternative);
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool noAlt = false;
+    CNode* target =
+        ChooseIbdBlockRequestTarget(&announcer, hash, false, &reason, &noAlt);
+    BOOST_CHECK(target == NULL);
+    BOOST_CHECK(noAlt);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_concentration_no_alternative),
+        nNoAltBefore + 1);
+
+    ibdmetrics::Get().global_active_current.store(
+        nGaugeSaved, std::memory_order_relaxed);
+}
+
+// Timeout-owner ledger: the hard global bound keeps the map bounded even when
+// far more hashes than the cap are recorded.
+BOOST_AUTO_TEST_CASE(last_timeout_owner_global_bound)
+{
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21441), "timeout-bound", true);
+    const size_t nExtra = 32;
+    for (size_t i = 0; i < IBD_LAST_TIMEOUT_OWNER_MAX_HASHES + nExtra; ++i)
+        RecordBlockLastTimeoutOwner(uint256(214401 + i), peer.GetId());
+    BOOST_CHECK_LE(CountBlockLastTimeoutOwnerHashes(),
+                   (size_t)IBD_LAST_TIMEOUT_OWNER_MAX_HASHES);
+}
+
+// Timeout-owner ledger: the bound is enforced after every insert -- the ledger
+// never exceeds the cap at any intermediate step (no off-by-one).
+BOOST_AUTO_TEST_CASE(last_timeout_owner_bound_does_not_exceed_limit)
+{
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21442), "timeout-bound-exact", true);
+    for (size_t i = 0; i < IBD_LAST_TIMEOUT_OWNER_MAX_HASHES + 64; ++i)
+    {
+        RecordBlockLastTimeoutOwner(uint256(214601 + i), peer.GetId());
+        BOOST_CHECK_LE(CountBlockLastTimeoutOwnerHashes(),
+                       (size_t)IBD_LAST_TIMEOUT_OWNER_MAX_HASHES);
+    }
+}
+
+// Timeout-owner ledger: the per-request lookup TTL-checks only the found entry
+// and erases it on expiry (O(log N) cost, no full-map scan).
+BOOST_AUTO_TEST_CASE(last_timeout_owner_lookup_expires_single_entry)
+{
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21443), "timeout-lookup", true);
+    const uint256 hashA(214701);
+    const uint256 hashB(214702);
+
+    const int64_t nT0 = 200000000;
+    SetIbdQualityClockForTesting(nT0);
+    RecordBlockLastTimeoutOwner(hashA, peer.GetId());
+    BOOST_CHECK_EQUAL(CountBlockLastTimeoutOwnerHashes(), 1U);
+
+    const int64_t nAfter = nT0 + IBD_LAST_TIMEOUT_OWNER_TTL_US + 1;
+    SetIbdQualityClockForTesting(nAfter);
+    NodeId nOwner = -1;
+    BOOST_CHECK(!GetBlockLastTimeoutOwner(hashA, &nOwner));
+    // The found entry was expired and erased by the per-entry check.
+    BOOST_CHECK_EQUAL(CountBlockLastTimeoutOwnerHashes(), 0U);
+    UnsetIbdQualityClockForTesting();
+}
+
+// Timeout-owner ledger: the full-map prune is cadence-limited.  Within the
+// lazy cadence window an access does not run a full scan; once the cadence
+// elapses and entries are TTL-expired, the full prune reclaims them.
+BOOST_AUTO_TEST_CASE(last_timeout_owner_prune_is_cadence_limited)
+{
+    CScopedIbdQualityState scope;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21444), "timeout-cadence-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21445), "timeout-cadence-b", true);
+    const uint256 hashA(214801);
+    const uint256 hashB(214802);
+    const uint256 hashMissing(214899);
+
+    const int64_t nT0 = 300000000;
+    SetIbdQualityClockForTesting(nT0);
+    // First insert anchors the cadence timer (the initial 0 runs the prune).
+    RecordBlockLastTimeoutOwner(hashA, peerA.GetId());
+    // Within the cadence window the full-map prune does not re-run.
+    SetIbdQualityClockForTesting(nT0 + 3000000);
+    RecordBlockLastTimeoutOwner(hashB, peerB.GetId());
+    NodeId nOwner = -1;
+    BOOST_CHECK(!GetBlockLastTimeoutOwner(hashMissing, &nOwner));
+    BOOST_CHECK_EQUAL(CountBlockLastTimeoutOwnerHashes(), 2U);
+
+    // After the cadence elapses and the TTL passes, an access runs the full
+    // prune and reclaims the expired entries.
+    SetIbdQualityClockForTesting(nT0 + IBD_LAST_TIMEOUT_OWNER_TTL_US + 6000000);
+    BOOST_CHECK(!GetBlockLastTimeoutOwner(hashMissing, &nOwner));
+    BOOST_CHECK_EQUAL(CountBlockLastTimeoutOwnerHashes(), 0U);
+    UnsetIbdQualityClockForTesting();
+}
+
+// Late-delivery ledger: an early receive (live mark present) does not touch the
+// late-delivery expectation; it survives until consumed or TTL-expired.
+BOOST_AUTO_TEST_CASE(late_delivery_early_receive_does_not_touch_expectation)
+{
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21451), "late-early", true);
+    const uint256 hash(214501);
+
+    SetIbdQualityClockForTesting(500000000);
+    peer.MarkBlockInFlight(hash);
+    RecordBlockLateDeliveryExpectation(hash, peer.GetId(), 1000, 506000000);
+    // Early receive with a live mark: the expectation must remain untouched.
+    peer.ClearBlockInFlight(hash);
+    NodeId nPeer = -1;
+    int64_t nMarkUs = 0;
+    BOOST_CHECK(TakeBlockLateDeliveryExpectation(hash, &nPeer, &nMarkUs));
+    BOOST_CHECK_EQUAL(nPeer, peer.GetId());
+    BOOST_CHECK_EQUAL(nMarkUs, 1000);
+    // Consumed by the take: nothing left.
+    BOOST_CHECK(!TakeBlockLateDeliveryExpectation(hash, &nPeer, &nMarkUs));
+    UnsetIbdQualityClockForTesting();
+}
+
+// Late-delivery ledger: a delivery after the request timed out is attributed to
+// the peer that requested the hash as a late outcome, with the original mark
+// latency, and the expectation is consumed (erased).
+BOOST_AUTO_TEST_CASE(late_delivery_after_timeout_fixes_late_outcome)
+{
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21452), "late-outcome", true);
+    CScopedVNodes vnodes;
+    vnodes.Add(&peer);
+    const uint256 hash(214502);
+
+    const int64_t nMarkUs = 1000000;
+    SetIbdQualityClockForTesting(nMarkUs);
+    peer.MarkBlockInFlight(hash);
+    peer.mapBlockInFlightSince[hash] = GetTime() - 60;
+    // Force expiry at a known time so the late latency is deterministic.
+    SetIbdQualityClockForTesting(nMarkUs + 9000000);
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK(WasBlockLastTimedOutByPeer(hash, peer.GetId()));
+    BOOST_CHECK_EQUAL(peer.ibdQuality.received_after_timeout.load(), 0u);
+
+    // Late arrival: ClearBlockInFlight consumes the expectation and records a
+    // late outcome for the requesting peer (without a second lifecycle release).
+    SetIbdQualityClockForTesting(nMarkUs + 15000000);
+    peer.ClearBlockInFlight(hash);
+    BOOST_CHECK_EQUAL(peer.ibdQuality.received_after_timeout.load(), 1u);
+    BOOST_CHECK_EQUAL(peer.ibdQuality.releases_by_receive.load(), 1u);
+    // The late latency (16s mark -> 16s delivery = 15s) blended into the EWMA.
+    BOOST_CHECK_EQUAL(peer.ibdQuality.latency_ewma_us.load(), 15000000);
+    // Expectation consumed.
+    NodeId nPeer = -1;
+    int64_t nMarkUs2 = 0;
+    BOOST_CHECK(!TakeBlockLateDeliveryExpectation(hash, &nPeer, &nMarkUs2));
+    UnsetIbdQualityClockForTesting();
+}
+
+// Late-delivery ledger: expectations are TTL-expired and globally bounded.
+BOOST_AUTO_TEST_CASE(late_delivery_expectation_ttl_and_bound)
+{
+    CScopedIbdQualityState scope;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21453), "late-ttl-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21454), "late-ttl-b", true);
+    const uint256 hashA(214551);
+    const uint256 hashB(214552);
+
+    const int64_t nT0 = 400000000;
+    SetIbdQualityClockForTesting(nT0);
+    RecordBlockLateDeliveryExpectation(hashA, peerA.GetId(), 1000, nT0);
+    RecordBlockLateDeliveryExpectation(hashB, peerB.GetId(), 1000, nT0);
+
+    // TTL expiry removes both expectations via the prune hook.
+    const int64_t nAfter = nT0 + IBD_LATE_DELIVERY_TTL_US + 1;
+    SetIbdQualityClockForTesting(nAfter);
+    ExpireBlockAlternateAnnouncersForTesting(nAfter);
+    NodeId nPeer = -1;
+    int64_t nMarkUs = 0;
+    BOOST_CHECK(!TakeBlockLateDeliveryExpectation(hashA, &nPeer, &nMarkUs));
+    BOOST_CHECK(!TakeBlockLateDeliveryExpectation(hashB, &nPeer, &nMarkUs));
+    UnsetIbdQualityClockForTesting();
+
+    // Global bound: recording beyond the cap keeps the ledger bounded.
+    for (size_t i = 0; i < IBD_LATE_DELIVERY_MAX_HASHES + 16; ++i)
+        RecordBlockLateDeliveryExpectation(
+            uint256(214701 + i), peerA.GetId(), 1, 1);
+    BOOST_CHECK_LE(CountBlockLateDeliveryExpectationHashes(),
+                   (size_t)IBD_LATE_DELIVERY_MAX_HASHES);
+}
+
+// requests_issued is a wire-send signal: enqueueing an ask-for does not count;
+// marking the block in flight (the getdata wire transition) does.
+BOOST_AUTO_TEST_CASE(requests_issued_counts_wire_send_not_enqueue)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21461), "req-issued", true);
+    const uint256 hash(214601);
+    const CInv inv(MSG_BLOCK, hash);
+
+    const uint64_t nBefore = peer.ibdQuality.requests_issued.load();
+    // Enqueue path: no wire request happened yet.
+    peer.AddAskForEntry(GetTimeMicros() + 1000000, inv);
+    BOOST_CHECK_EQUAL(peer.ibdQuality.requests_issued.load(), nBefore);
+    BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 1U);
+    peer.EraseAskForEntry(peer.mapAskFor.begin());
+
+    // Wire-send transition: MarkBlockInFlight counts the issued request.
+    peer.MarkBlockInFlight(hash);
+    BOOST_CHECK_EQUAL(peer.ibdQuality.requests_issued.load(), nBefore + 1);
+    peer.ClearBlockInFlight(hash);
+}
+
+// The late-delivery outcome is attributed to the requesting peer even when the
+// block arrives via a different node (the timeout peer stays the ledger owner).
+BOOST_AUTO_TEST_CASE(late_delivery_attributed_to_requesting_peer)
+{
+    CScopedIbdQualityState scope;
+    CNode requester(INVALID_SOCKET, TestPeerAddress(21471), "late-req", true);
+    CNode deliverer(INVALID_SOCKET, TestPeerAddress(21472), "late-deliver", true);
+    PrepareIbdRedirectLane(requester);
+    PrepareIbdRedirectLane(deliverer);
+    CScopedVNodes vnodes;
+    vnodes.Add(&requester);
+    vnodes.Add(&deliverer);
+    const uint256 hash(214701);
+
+    const int64_t nMarkUs = 1000000;
+    SetIbdQualityClockForTesting(nMarkUs);
+    requester.MarkBlockInFlight(hash);
+    requester.mapBlockInFlightSince[hash] = GetTime() - 60;
+    SetIbdQualityClockForTesting(nMarkUs + 9000000);
+    requester.ExpireBlockInFlight();
+
+    // The block finally arrives on a different peer; the late outcome still
+    // lands on the peer that requested it.
+    SetIbdQualityClockForTesting(nMarkUs + 20000000);
+    deliverer.ClearBlockInFlight(hash);
+    BOOST_CHECK_EQUAL(requester.ibdQuality.received_after_timeout.load(), 1u);
+    BOOST_CHECK_EQUAL(deliverer.ibdQuality.received_after_timeout.load(), 0u);
+    UnsetIbdQualityClockForTesting();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

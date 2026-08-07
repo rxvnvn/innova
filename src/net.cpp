@@ -1278,6 +1278,830 @@ CNode* ChooseDeferredDispatchLane(CNode* pfrom, const uint256& hash,
     return pChosen;
 }
 
+// ----------------------------------------------------------------------------
+// Timeout-aware IBD peer-quality ranking.
+//
+// Per-peer quality (IbdPeerDeliveryQuality in CNode) is fed by the block
+// request lifecycle hooks and read by ChooseIbdBlockRequestTarget, which is
+// called from TryAdmitBlockInvOrDefer and the deferred refill (both hold
+// cs_main).  Two global ledgers live under cs_mapAlreadyAskedFor and are
+// bounded / TTL-expired so stale announcers never pin a hash forever:
+//   * mapBlockAlternateAnnouncers  - peers that announced a hash while it was
+//     owned by another peer (strong evidence they can serve it).
+//   * mapBlockLastTimeoutOwner     - the peer whose request for a hash most
+//     recently timed out (exact-hash tier-1 ranking rule).
+//
+// Lock ordering: the message-handler thread calls this while holding cs_main
+// and (inside AskFor) cs_mapAlreadyAskedFor.  The cleanup path on the socket
+// thread holds cs_vNodes and then cs_mapAlreadyAskedFor (via
+// ReleaseBlockRequestOwnersForPeer), so this code MUST NOT take cs_vNodes
+// while holding cs_mapAlreadyAskedFor.  The redirect slow path therefore reads
+// the ledgers under cs_mapAlreadyAskedFor, releases it, and only then scans
+// vNodes under cs_vNodes.
+// ----------------------------------------------------------------------------
+
+IbdPeerDeliveryQuality::IbdPeerDeliveryQuality()
+    : requests_issued(0),
+      releases_by_receive(0),
+      releases_by_timeout(0),
+      received_after_timeout(0),
+      latency_sum_us(0),
+      latency_samples(0),
+      latency_ewma_us(0),
+      last_delivery_time_us(0),
+      last_timeout_time_us(0),
+      timeout_score(0),
+      receive_score(0),
+      late_delivery_score(0)
+{
+}
+
+namespace {
+
+// Test override for the quality clock.  Zero (default) = real clock.
+std::atomic<int64_t> g_qualityClockOverrideUs(0);
+
+struct AlternateAnnouncerEntry
+{
+    NodeId peer;
+    int64_t recordedUs;
+};
+
+// hash -> bounded list of alternate announcers.  Guarded by cs_mapAlreadyAskedFor.
+std::map<uint256, std::vector<AlternateAnnouncerEntry> > mapBlockAlternateAnnouncers;
+// hash -> (peer, timeoutUs) most recent request timeout.  Guarded by cs_mapAlreadyAskedFor.
+std::map<uint256, std::pair<NodeId, int64_t> > mapBlockLastTimeoutOwner;
+// Late-delivery expectations: hash -> (peer that timed out, markUs, timeoutUs).
+// Guarded by cs_mapAlreadyAskedFor.  Never stored in the live in-flight maps.
+std::map<uint256, std::pair<NodeId, std::pair<int64_t, int64_t> > >
+    mapBlockLateDeliveryExpectation;
+// Lazy full-ledger prune cadence: a full scan only runs at most this often.
+const int64_t ALTERNATE_ANNOUNCER_PRUNE_INTERVAL_US = 5LL * 1000000;
+int64_t g_lastAlternateAnnouncerPruneUs = 0;
+// Last-timeout-owner ledger shares the lazy prune cadence so the per-request
+// lookup stays O(log N) with no full-map scan.
+int64_t g_lastTimeoutOwnerPruneUs = 0;
+// Ranking-gauge refresh cadence: the slow-path admission does not scan vNodes
+// more often than this, so gauges are best-effort observability, not a
+// per-request cost.
+const int64_t RANKING_GAUGES_UPDATE_INTERVAL_US = 5LL * 1000000;
+int64_t g_lastRankingGaugesUpdateUs = 0;
+
+void AlternateHashGaugeAdjust(int64_t delta)
+{
+    ibdmetrics::Counters& c = ibdmetrics::Get();
+    const int64_t nNew = c.alternate_hashes_current.fetch_add(
+                             delta, std::memory_order_relaxed) + delta;
+    if (nNew > 0)
+        ibdmetrics::AtomicMax(c.alternate_hashes_max, nNew);
+}
+
+// Prune expired entries and enforce the global hash bound.  Caller holds
+// cs_mapAlreadyAskedFor.
+void PruneAlternateAnnouncersLocked(int64_t nNowUs)
+{
+    ibdmetrics::Counters& c = ibdmetrics::Get();
+    for (std::map<uint256, std::vector<AlternateAnnouncerEntry> >::iterator it =
+             mapBlockAlternateAnnouncers.begin();
+         it != mapBlockAlternateAnnouncers.end(); )
+    {
+        std::vector<AlternateAnnouncerEntry>& entries = it->second;
+        for (std::vector<AlternateAnnouncerEntry>::iterator vi = entries.begin();
+             vi != entries.end(); )
+        {
+            if (nNowUs - vi->recordedUs > IBD_ALTERNATE_ANNOUNCER_TTL_US)
+            {
+                c.alternate_announcer_expired.fetch_add(
+                    1, std::memory_order_relaxed);
+                vi = entries.erase(vi);
+            }
+            else
+            {
+                ++vi;
+            }
+        }
+        if (entries.empty())
+        {
+            AlternateHashGaugeAdjust(-1);
+            mapBlockAlternateAnnouncers.erase(it++);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    while (mapBlockAlternateAnnouncers.size() > IBD_ALTERNATE_ANNOUNCER_MAX_HASHES)
+    {
+        // Evict the hash with the oldest leading entry (deterministic).
+        std::map<uint256, std::vector<AlternateAnnouncerEntry> >::iterator best =
+            mapBlockAlternateAnnouncers.begin();
+        for (std::map<uint256, std::vector<AlternateAnnouncerEntry> >::iterator it =
+                 mapBlockAlternateAnnouncers.begin();
+             it != mapBlockAlternateAnnouncers.end(); ++it)
+        {
+            if (it->second.empty())
+                continue;
+            if (best->second.empty() ||
+                it->second[0].recordedUs < best->second[0].recordedUs)
+                best = it;
+        }
+        if (best->second.empty())
+            break;
+        AlternateHashGaugeAdjust(-1);
+        mapBlockAlternateAnnouncers.erase(best);
+    }
+}
+
+// Prune expired last-timeout-owner entries.  Caller holds cs_mapAlreadyAskedFor.
+// Runs at most once per lazy cadence from the per-request lookup path, plus
+// whenever the hard global bound is exceeded, so the hot-path lookup stays
+// O(log N).
+void PruneBlockLastTimeoutOwnersLocked(int64_t nNowUs)
+{
+    for (std::map<uint256, std::pair<NodeId, int64_t> >::iterator it =
+             mapBlockLastTimeoutOwner.begin();
+         it != mapBlockLastTimeoutOwner.end(); )
+    {
+        if (nNowUs - it->second.second > IBD_LAST_TIMEOUT_OWNER_TTL_US)
+            mapBlockLastTimeoutOwner.erase(it++);
+        else
+            ++it;
+    }
+}
+
+// Maybe run the cadence-limited / bound-enforcing prune for the timeout-owner
+// ledger.  Caller holds cs_mapAlreadyAskedFor.  The per-request lookup only
+// calls this when the lazy cadence elapsed or the hard bound is exceeded.
+void MaybePruneBlockLastTimeoutOwnersLocked(int64_t nNowUs)
+{
+    if (nNowUs - g_lastTimeoutOwnerPruneUs >=
+            ALTERNATE_ANNOUNCER_PRUNE_INTERVAL_US ||
+        mapBlockLastTimeoutOwner.size() > IBD_LAST_TIMEOUT_OWNER_MAX_HASHES)
+    {
+        PruneBlockLastTimeoutOwnersLocked(nNowUs);
+        g_lastTimeoutOwnerPruneUs = nNowUs;
+    }
+}
+
+// Prune expired late-delivery expectations.  Caller holds cs_mapAlreadyAskedFor.
+// Same cadence/bound discipline as the timeout-owner ledger.
+void PruneLateDeliveryExpectationsLocked(int64_t nNowUs)
+{
+    for (std::map<uint256, std::pair<NodeId, std::pair<int64_t, int64_t> > >::iterator
+             it = mapBlockLateDeliveryExpectation.begin();
+         it != mapBlockLateDeliveryExpectation.end(); )
+    {
+        if (nNowUs - it->second.second.second > IBD_LATE_DELIVERY_TTL_US)
+            mapBlockLateDeliveryExpectation.erase(it++);
+        else
+            ++it;
+    }
+    while (mapBlockLateDeliveryExpectation.size() >
+           IBD_LATE_DELIVERY_MAX_HASHES)
+    {
+        mapBlockLateDeliveryExpectation.erase(
+            mapBlockLateDeliveryExpectation.begin());
+    }
+}
+
+void MaybePruneLateDeliveryExpectationsLocked(int64_t nNowUs)
+{
+    if (nNowUs - g_lastTimeoutOwnerPruneUs >=
+            ALTERNATE_ANNOUNCER_PRUNE_INTERVAL_US ||
+        mapBlockLateDeliveryExpectation.size() > IBD_LATE_DELIVERY_MAX_HASHES)
+    {
+        PruneLateDeliveryExpectationsLocked(nNowUs);
+        g_lastTimeoutOwnerPruneUs = nNowUs;
+    }
+}
+
+// Lexicographic ranking key for redirect-target selection.  Lower wins: exact
+// hash-timeout penalty first, then quality tier, then concentration tier, then
+// live pressure, then smoothed latency, then a deterministic NodeId tie-break.
+// The comparison is structural (field-by-field), never numeric packing.
+struct IbdPeerRank
+{
+    int exact_hash_penalty;   // 1 = this peer is the last timeout owner for hash
+    int quality_tier;         // IbdPeerQualityTier ordering
+    int concentration_tier;   // 1 = dominant share of the active window
+    int pressure;             // peerLiveActivePressure
+    int latency_sample_present; // 0 = measured latency, 1 = no sample (worse)
+    int64_t latency_us;       // EWMA latency (meaningful only with a sample)
+    NodeId tie_break;         // deterministic final tie-break
+};
+
+bool operator<(const IbdPeerRank& a, const IbdPeerRank& b)
+{
+    if (a.exact_hash_penalty != b.exact_hash_penalty)
+        return a.exact_hash_penalty < b.exact_hash_penalty;
+    if (a.quality_tier != b.quality_tier)
+        return a.quality_tier < b.quality_tier;
+    if (a.concentration_tier != b.concentration_tier)
+        return a.concentration_tier < b.concentration_tier;
+    if (a.pressure != b.pressure)
+        return a.pressure < b.pressure;
+    if (a.latency_sample_present != b.latency_sample_present)
+        return a.latency_sample_present < b.latency_sample_present;
+    if (a.latency_us != b.latency_us)
+        return a.latency_us < b.latency_us;
+    return a.tie_break < b.tie_break;
+}
+
+// Build the ranking key for a peer.  Caller holds cs_vNodes.
+IbdPeerRank RankPeer(CNode* pnode, const uint256& hash)
+{
+    const IbdPeerQualitySnapshot snap = pnode->GetIbdQualitySnapshot();
+    const int64_t nGlobal =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+    const int64_t nSharePermille = nGlobal > 0
+        ? (1000LL * (int64_t)pnode->peerLiveActivePressure.load(std::memory_order_relaxed)) / nGlobal
+        : 0;
+    IbdPeerRank r;
+    r.exact_hash_penalty = WasBlockLastTimedOutByPeer(hash, pnode->GetId()) ? 1 : 0;
+    r.quality_tier = (int)snap.tier;
+    r.concentration_tier =
+        (nGlobal >= IBD_CONCENTRATION_SAMPLE_MIN &&
+         nSharePermille >= IBD_CONCENTRATION_THRESHOLD_PERMILLE) ? 1 : 0;
+    r.pressure = (int)pnode->peerLiveActivePressure.load(
+        std::memory_order_relaxed);
+    r.latency_sample_present = snap.has_latency_sample ? 0 : 1;
+    r.latency_us = snap.has_latency_sample ? snap.latency_ewma_us : 0;
+    r.tie_break = pnode->GetId();
+    return r;
+}
+
+} // namespace
+
+int64_t CNode::QualityNowUs()
+{
+    const int64_t nOverride =
+        g_qualityClockOverrideUs.load(std::memory_order_relaxed);
+    return nOverride > 0 ? nOverride : GetTimeMicros();
+}
+
+bool RecordAlternateBlockAnnouncer(const uint256& hash, NodeId peer)
+{
+    if (peer < 0 || hash == 0)
+        return false;
+    LOCK(cs_mapAlreadyAskedFor);
+    const int64_t nNowUs = CNode::QualityNowUs();
+    std::vector<AlternateAnnouncerEntry>& entries =
+        mapBlockAlternateAnnouncers[hash];
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        if (entries[i].peer == peer)
+        {
+            entries[i].recordedUs = nNowUs;
+            ibdmetrics::Get().alternate_announcer_duplicate.fetch_add(
+                1, std::memory_order_relaxed);
+            return false;
+        }
+    }
+    if (entries.size() >= IBD_ALTERNATE_ANNOUNCERS_PER_HASH)
+    {
+        // Evict the oldest entry deterministically.
+        size_t nOldest = 0;
+        for (size_t i = 1; i < entries.size(); ++i)
+            if (entries[i].recordedUs < entries[nOldest].recordedUs)
+                nOldest = i;
+        entries.erase(entries.begin() + nOldest);
+        ibdmetrics::Get().alternate_announcer_evicted.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    if (entries.empty())
+        AlternateHashGaugeAdjust(1);
+    AlternateAnnouncerEntry entry;
+    entry.peer = peer;
+    entry.recordedUs = nNowUs;
+    entries.push_back(entry);
+    ibdmetrics::Get().alternate_announcer_recorded.fetch_add(
+        1, std::memory_order_relaxed);
+    // Lazy full-ledger prune: bounded cost on the hot path.  The global hash
+    // bound is checked after the new entry is inserted so it can never be
+    // exceeded (the rare prune only runs when the ledger actually grew past
+    // the cap, or when the periodic TTL sweep is due).
+    if (nNowUs - g_lastAlternateAnnouncerPruneUs >=
+            ALTERNATE_ANNOUNCER_PRUNE_INTERVAL_US ||
+        mapBlockAlternateAnnouncers.size() > IBD_ALTERNATE_ANNOUNCER_MAX_HASHES)
+    {
+        PruneAlternateAnnouncersLocked(nNowUs);
+        g_lastAlternateAnnouncerPruneUs = nNowUs;
+    }
+    return true;
+}
+
+void GetBlockAlternateAnnouncers(const uint256& hash, std::vector<NodeId>& out)
+{
+    out.clear();
+    LOCK(cs_mapAlreadyAskedFor);
+    const int64_t nNowUs = CNode::QualityNowUs();
+    std::map<uint256, std::vector<AlternateAnnouncerEntry> >::iterator it =
+        mapBlockAlternateAnnouncers.find(hash);
+    if (it == mapBlockAlternateAnnouncers.end())
+        return;
+    std::vector<AlternateAnnouncerEntry>& entries = it->second;
+    for (std::vector<AlternateAnnouncerEntry>::iterator vi = entries.begin();
+         vi != entries.end(); )
+    {
+        if (nNowUs - vi->recordedUs > IBD_ALTERNATE_ANNOUNCER_TTL_US)
+        {
+            ibdmetrics::Get().alternate_announcer_expired.fetch_add(
+                1, std::memory_order_relaxed);
+            vi = entries.erase(vi);
+        }
+        else
+        {
+            out.push_back(vi->peer);
+            ++vi;
+        }
+    }
+    if (entries.empty())
+    {
+        AlternateHashGaugeAdjust(-1);
+        mapBlockAlternateAnnouncers.erase(it);
+    }
+}
+
+size_t RemoveBlockAlternateAnnouncersForPeer(NodeId peer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    size_t nRemoved = 0;
+    for (std::map<uint256, std::vector<AlternateAnnouncerEntry> >::iterator it =
+             mapBlockAlternateAnnouncers.begin();
+         it != mapBlockAlternateAnnouncers.end(); )
+    {
+        std::vector<AlternateAnnouncerEntry>& entries = it->second;
+        for (std::vector<AlternateAnnouncerEntry>::iterator vi = entries.begin();
+             vi != entries.end(); )
+        {
+            if (vi->peer == peer)
+            {
+                vi = entries.erase(vi);
+                ++nRemoved;
+            }
+            else
+            {
+                ++vi;
+            }
+        }
+        if (entries.empty())
+        {
+            AlternateHashGaugeAdjust(-1);
+            mapBlockAlternateAnnouncers.erase(it++);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+    for (std::map<uint256, std::pair<NodeId, int64_t> >::iterator it =
+             mapBlockLastTimeoutOwner.begin();
+         it != mapBlockLastTimeoutOwner.end(); )
+    {
+        if (it->second.first == peer)
+            mapBlockLastTimeoutOwner.erase(it++);
+        else
+            ++it;
+    }
+    if (nRemoved > 0)
+        ibdmetrics::Get().alternate_announcer_cleanup.fetch_add(
+            nRemoved, std::memory_order_relaxed);
+    return nRemoved;
+}
+
+size_t CountBlockAlternateAnnouncerHashes()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    return mapBlockAlternateAnnouncers.size();
+}
+
+void ResetBlockAlternateAnnouncersForTesting()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    for (std::map<uint256, std::vector<AlternateAnnouncerEntry> >::iterator it =
+             mapBlockAlternateAnnouncers.begin();
+         it != mapBlockAlternateAnnouncers.end(); ++it)
+        if (!it->second.empty())
+            AlternateHashGaugeAdjust(-1);
+    mapBlockAlternateAnnouncers.clear();
+    mapBlockLastTimeoutOwner.clear();
+    mapBlockLateDeliveryExpectation.clear();
+    g_lastAlternateAnnouncerPruneUs = 0;
+    g_lastTimeoutOwnerPruneUs = 0;
+}
+
+void ExpireBlockAlternateAnnouncersForTesting(int64_t nNowUs)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    PruneAlternateAnnouncersLocked(nNowUs);
+    PruneBlockLastTimeoutOwnersLocked(nNowUs);
+    PruneLateDeliveryExpectationsLocked(nNowUs);
+}
+
+void RecordBlockLastTimeoutOwner(const uint256& hash, NodeId peer)
+{
+    if (peer < 0 || hash == 0)
+        return;
+    LOCK(cs_mapAlreadyAskedFor);
+    const int64_t nNowUs = CNode::QualityNowUs();
+    // Bounded hot-path write: only the cadence/bound prune runs here, and the
+    // hard global bound is enforced after the insert so it can never be
+    // exceeded (deterministic oldest-first eviction).
+    MaybePruneBlockLastTimeoutOwnersLocked(nNowUs);
+    mapBlockLastTimeoutOwner[hash] = std::make_pair(peer, nNowUs);
+    if (mapBlockLastTimeoutOwner.size() > IBD_LAST_TIMEOUT_OWNER_MAX_HASHES)
+    {
+        // Hard global bound: evict the oldest entry deterministically.  This
+        // path is rare (the lazy cadence prune reclaims most expired entries),
+        // so the linear scan is acceptable here, never on the hot path.
+        PruneBlockLastTimeoutOwnersLocked(nNowUs);
+        g_lastTimeoutOwnerPruneUs = nNowUs;
+        while (mapBlockLastTimeoutOwner.size() >
+               IBD_LAST_TIMEOUT_OWNER_MAX_HASHES)
+        {
+            std::map<uint256, std::pair<NodeId, int64_t> >::iterator oldest =
+                mapBlockLastTimeoutOwner.begin();
+            for (std::map<uint256, std::pair<NodeId, int64_t> >::iterator it =
+                     mapBlockLastTimeoutOwner.begin();
+                 it != mapBlockLastTimeoutOwner.end(); ++it)
+                if (it->second.second < oldest->second.second)
+                    oldest = it;
+            mapBlockLastTimeoutOwner.erase(oldest);
+        }
+    }
+}
+
+bool GetBlockLastTimeoutOwner(const uint256& hash, NodeId* peer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    const int64_t nNowUs = CNode::QualityNowUs();
+    MaybePruneBlockLastTimeoutOwnersLocked(nNowUs);
+    std::map<uint256, std::pair<NodeId, int64_t> >::const_iterator it =
+        mapBlockLastTimeoutOwner.find(hash);
+    if (it == mapBlockLastTimeoutOwner.end())
+        return false;
+    // Per-entry TTL check: the lookup cost stays O(log N) -- only the found
+    // entry is expired here.
+    if (nNowUs - it->second.second > IBD_LAST_TIMEOUT_OWNER_TTL_US)
+    {
+        mapBlockLastTimeoutOwner.erase(it);
+        return false;
+    }
+    if (peer)
+        *peer = it->second.first;
+    return true;
+}
+
+void RecordBlockLateDeliveryExpectation(const uint256& hash, NodeId peer,
+                                        int64_t markUs, int64_t timeoutUs)
+{
+    if (peer < 0 || hash == 0)
+        return;
+    LOCK(cs_mapAlreadyAskedFor);
+    const int64_t nNowUs = CNode::QualityNowUs();
+    MaybePruneLateDeliveryExpectationsLocked(nNowUs);
+    mapBlockLateDeliveryExpectation[hash] =
+        std::make_pair(peer, std::make_pair(markUs, timeoutUs));
+    if (mapBlockLateDeliveryExpectation.size() > IBD_LATE_DELIVERY_MAX_HASHES)
+    {
+        PruneLateDeliveryExpectationsLocked(nNowUs);
+        g_lastTimeoutOwnerPruneUs = nNowUs;
+    }
+}
+
+bool TakeBlockLateDeliveryExpectation(const uint256& hash, NodeId* peer,
+                                      int64_t* markUs)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    const int64_t nNowUs = CNode::QualityNowUs();
+    MaybePruneLateDeliveryExpectationsLocked(nNowUs);
+    std::map<uint256, std::pair<NodeId, std::pair<int64_t, int64_t> > >::iterator
+        it = mapBlockLateDeliveryExpectation.find(hash);
+    if (it == mapBlockLateDeliveryExpectation.end())
+        return false;
+    // Per-entry TTL check, then consume (erase) the expectation.
+    if (nNowUs - it->second.second.second > IBD_LATE_DELIVERY_TTL_US)
+    {
+        mapBlockLateDeliveryExpectation.erase(it);
+        return false;
+    }
+    if (peer)
+        *peer = it->second.first;
+    if (markUs)
+        *markUs = it->second.second.first;
+    mapBlockLateDeliveryExpectation.erase(it);
+    return true;
+}
+
+size_t CountBlockLateDeliveryExpectationHashes()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    return mapBlockLateDeliveryExpectation.size();
+}
+
+void ResetLateDeliveryExpectationForTesting()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    mapBlockLateDeliveryExpectation.clear();
+    g_lastTimeoutOwnerPruneUs = 0;
+}
+
+void RecordLateDeliveryOutcome(NodeId peer, int64_t latencyUs)
+{
+    if (peer < 0)
+        return;
+    CNode* pnode = NULL;
+    {
+        LOCK(cs_vNodes);
+        for (size_t i = 0; i < vNodes.size(); ++i)
+        {
+            if (vNodes[i] && vNodes[i]->GetId() == peer)
+            {
+                pnode = vNodes[i];
+                break;
+            }
+        }
+    }
+    if (pnode == NULL)
+        return;
+    // The expectation only exists because the request timed out, so this is
+    // a late (received-after-timeout) outcome for the peer that requested it.
+    pnode->RecordIbdBlockDelivery(latencyUs, true);
+}
+
+bool WasBlockLastTimedOutByPeer(const uint256& hash, NodeId peer)
+{
+    NodeId nTimeoutOwner = -1;
+    return GetBlockLastTimeoutOwner(hash, &nTimeoutOwner) &&
+           nTimeoutOwner == peer;
+}
+
+size_t CountBlockLastTimeoutOwnerHashes()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    return mapBlockLastTimeoutOwner.size();
+}
+
+void ResetBlockLastTimeoutOwnerForTesting()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    mapBlockLastTimeoutOwner.clear();
+    g_lastTimeoutOwnerPruneUs = 0;
+}
+
+void SetIbdQualityClockForTesting(int64_t nNowUs)
+{
+    g_qualityClockOverrideUs.store(nNowUs, std::memory_order_relaxed);
+}
+
+void UnsetIbdQualityClockForTesting()
+{
+    g_qualityClockOverrideUs.store(0, std::memory_order_relaxed);
+}
+
+void ResetIbdQualityStateForTesting()
+{
+    ResetBlockAlternateAnnouncersForTesting();
+    ResetBlockLastTimeoutOwnerForTesting();
+    ResetLateDeliveryExpectationForTesting();
+    g_lastRankingGaugesUpdateUs = 0;
+}
+
+// Refresh the concentration / degradation gauges exposed via getinfo.  The slow
+// path does not scan vNodes on every admission; this only runs at a lazy
+// cadence so the gauges are best-effort observability, not a per-request cost.
+// Safe to call without any lock held.
+static void UpdateIbdRankingGauges()
+{
+    const int64_t nNowUs = CNode::QualityNowUs();
+    if (nNowUs - g_lastRankingGaugesUpdateUs < RANKING_GAUGES_UPDATE_INTERVAL_US)
+        return;
+    ibdmetrics::Counters& c = ibdmetrics::Get();
+    const int64_t nGlobal =
+        c.global_active_current.load(std::memory_order_relaxed);
+    int64_t nMaxSharePermille = 0;
+    int64_t nDegraded = 0;
+    {
+        LOCK(cs_vNodes);
+        for (size_t i = 0; i < vNodes.size(); ++i)
+        {
+            CNode* pnode = vNodes[i];
+            if (!pnode || pnode->fDisconnect || pnode->nVersion == 0)
+                continue;
+            const int64_t nPressure =
+                pnode->peerLiveActivePressure.load(std::memory_order_relaxed);
+            if (nGlobal > 0)
+                nMaxSharePermille = std::max(
+                    nMaxSharePermille, (int64_t)((1000LL * nPressure) / nGlobal));
+            if (pnode->GetIbdQualitySnapshot().tier ==
+                IBD_PEER_QUALITY_DEGRADED)
+                ++nDegraded;
+        }
+    }
+    const int64_t nSharePct = nMaxSharePermille / 10;
+    c.dominant_peer_active_share_current_pct.store(
+        nSharePct, std::memory_order_relaxed);
+    ibdmetrics::AtomicMax(c.dominant_peer_active_share_max_pct, nSharePct);
+    c.degraded_peers_current.store(nDegraded, std::memory_order_relaxed);
+    g_lastRankingGaugesUpdateUs = nNowUs;
+}
+
+// True when the peer can be a redirect target (block-sync capable).
+static bool IsIbdRedirectEligible(CNode* pnode)
+{
+    if (!pnode || pnode->fDisconnect || pnode->nVersion == 0)
+        return false;
+    if (!pnode->fSuccessfullyConnected || pnode->fClient || pnode->fOneShot)
+        return false;
+    if (pnode->setBlocksInFlight.size() >=
+        (size_t)GetMaxActiveBlockRequestsPerPeer())
+        return false;
+    return true;
+}
+
+// Pick the best redirect target from a set of known alternate announcer ids.
+// Returns NULL when none of the alternates is both connected and eligible, or
+// when every known alternate is the announcer itself.  Caller holds no lock.
+// The candidate pool is restricted to peers that provably announced the hash
+// (the alternate-announcer ledger), so a redirect can never target a peer that
+// has not been observed to hold the block.
+static CNode* PickBestAlternateTarget(const std::vector<NodeId>& alternateIds,
+                                      NodeId nExcludeId, const uint256& hash)
+{
+    CNode* pBest = NULL;
+    IbdPeerRank bestRank;
+    {
+        LOCK(cs_vNodes);
+        for (size_t i = 0; i < alternateIds.size(); ++i)
+        {
+            if (alternateIds[i] == nExcludeId || alternateIds[i] < 0)
+                continue;
+            CNode* pnode = NULL;
+            for (size_t j = 0; j < vNodes.size(); ++j)
+            {
+                if (vNodes[j] && vNodes[j]->GetId() == alternateIds[i])
+                {
+                    pnode = vNodes[j];
+                    break;
+                }
+            }
+            if (pnode == NULL || !IsIbdRedirectEligible(pnode))
+                continue;
+            const IbdPeerRank r = RankPeer(pnode, hash);
+            if (pBest == NULL || r < bestRank)
+            {
+                pBest = pnode;
+                bestRank = r;
+            }
+        }
+    }
+    return pBest;
+}
+
+CNode* ChooseIbdBlockRequestTarget(CNode* pfrom, const uint256& hash,
+                                   bool fExemptFromRedirect,
+                                   IbdAskForRedirectReason* pReasonOut,
+                                   bool* pNoAlternativeOut)
+{
+    if (pReasonOut)
+        *pReasonOut = IBD_REDIRECT_NONE;
+    if (pNoAlternativeOut)
+        *pNoAlternativeOut = false;
+    if (pfrom == NULL || hash == 0 || fExemptFromRedirect)
+        return NULL;
+    // Fast path: a healthy announcer with no exact-hash timeout keeps the
+    // request verbatim -- unless it dominates the global active window
+    // (concentration guard), which is cheap to test with two relaxed loads.
+    const IbdPeerQualitySnapshot snap = pfrom->GetIbdQualitySnapshot();
+    NodeId nLastTimeoutOwner = -1;
+    const bool fHadTimeout = GetBlockLastTimeoutOwner(hash, &nLastTimeoutOwner);
+    const int64_t nGlobal =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+    const int64_t nSharePermille = nGlobal > 0
+        ? (1000LL * (int64_t)pfrom->peerLiveActivePressure.load(std::memory_order_relaxed)) / nGlobal
+        : 0;
+    const bool fDominant =
+        nGlobal >= IBD_CONCENTRATION_SAMPLE_MIN &&
+        nSharePermille >= IBD_CONCENTRATION_THRESHOLD_PERMILLE;
+    if (snap.tier != IBD_PEER_QUALITY_DEGRADED && !fHadTimeout && !fDominant)
+        return NULL;
+
+    // Slow path: decide whether to redirect, and to whom.  Every redirect
+    // target must come from the alternate-announcer ledger for this hash; the
+    // original announcer is always a fallback when no such alternate exists.
+    UpdateIbdRankingGauges();
+    std::vector<NodeId> alternateIds;
+    GetBlockAlternateAnnouncers(hash, alternateIds);
+    const bool fAnnouncerIsTimeoutOwner =
+        fHadTimeout && nLastTimeoutOwner == pfrom->GetId();
+
+    // Exact-hash rule (tier-1): the announcer timed out this hash before.  A
+    // redirect away from the failed owner is only possible to a known
+    // alternate; otherwise the announcer keeps the request (frontier-safe
+    // fallback).
+    if (fAnnouncerIsTimeoutOwner)
+    {
+        CNode* pTarget = PickBestAlternateTarget(alternateIds, pfrom->GetId(),
+                                                 hash);
+        if (pTarget == NULL)
+        {
+            ibdmetrics::Get().timeout_reissue_no_alternative.fetch_add(
+                1, std::memory_order_relaxed);
+            ibdmetrics::Get().same_peer_reissue_after_timeout.fetch_add(
+                1, std::memory_order_relaxed);
+            if (pNoAlternativeOut)
+                *pNoAlternativeOut = true;
+            return NULL;
+        }
+        ibdmetrics::Get().cross_peer_reissue_after_timeout.fetch_add(
+            1, std::memory_order_relaxed);
+        if (pReasonOut)
+            *pReasonOut = IBD_REDIRECT_HASH_TIMEOUT;
+        return pTarget;
+    }
+
+    // Quality rule: a degraded announcer is avoided when a known alternate
+    // exists.
+    const bool fDegraded = snap.tier == IBD_PEER_QUALITY_DEGRADED;
+    if (fDegraded)
+    {
+        CNode* pTarget = PickBestAlternateTarget(alternateIds, pfrom->GetId(),
+                                                 hash);
+        if (pTarget == NULL)
+        {
+            ibdmetrics::Get().peer_quality_no_alternative.fetch_add(
+                1, std::memory_order_relaxed);
+            if (pNoAlternativeOut)
+                *pNoAlternativeOut = true;
+            return NULL;
+        }
+        if (pReasonOut)
+            *pReasonOut = IBD_REDIRECT_QUALITY;
+        return pTarget;
+    }
+
+    // Concentration rule: a peer that dominates the global active window is
+    // avoided for fresh admissions when a known alternate exists.  The
+    // dominance was already computed on the fast path (fDominant), so this is
+    // reached only for the dominant announcer.
+    if (fDominant)
+    {
+        CNode* pBest = PickBestAlternateTarget(alternateIds, pfrom->GetId(),
+                                               hash);
+        if (pBest == NULL)
+        {
+            ibdmetrics::Get().peer_concentration_no_alternative.fetch_add(
+                1, std::memory_order_relaxed);
+            if (pNoAlternativeOut)
+                *pNoAlternativeOut = true;
+            return NULL;
+        }
+        if (pReasonOut)
+            *pReasonOut = IBD_REDIRECT_CONCENTRATION;
+        return pBest;
+    }
+    return NULL;
+}
+
+AskForResult AskForBlockInvWithQualityRedirection(CNode* pfrom, const CInv& inv,
+                                                  BlockRequestTraceSource source,
+                                                  bool fExemptFromRedirect)
+{
+    if (pfrom == NULL || inv.type != MSG_BLOCK)
+        return pfrom ? pfrom->AskFor(inv, source) : ASKFOR_CAP_FULL;
+    IbdAskForRedirectReason reason = IBD_REDIRECT_NONE;
+    bool fNoAlternative = false;
+    CNode* pTarget = ChooseIbdBlockRequestTarget(
+        pfrom, inv.hash, fExemptFromRedirect, &reason, &fNoAlternative);
+    CNode* pAsk = pTarget != NULL ? pTarget : pfrom;
+    if (pTarget != NULL)
+    {
+        // The announcer still holds the block; record it as an alternate so a
+        // later timeout of this hash can be reassigned back to it.
+        RecordAlternateBlockAnnouncer(inv.hash, pfrom->GetId());
+        if (reason == IBD_REDIRECT_CONCENTRATION)
+            ibdmetrics::Get().peer_concentration_redirects.fetch_add(
+                1, std::memory_order_relaxed);
+        else
+            ibdmetrics::Get().peer_quality_redirects.fetch_add(
+                1, std::memory_order_relaxed);
+    }
+    // When fNoAlternative, the no-alternative counters were already incremented
+    // inside ChooseIbdBlockRequestTarget and the announcer keeps the request
+    // (frontier-safe fallback).
+    const IbdPeerQualitySnapshot askSnap = pAsk->GetIbdQualitySnapshot();
+    if (askSnap.tier == IBD_PEER_QUALITY_GOOD)
+        ibdmetrics::Get().quality_good_selected.fetch_add(
+            1, std::memory_order_relaxed);
+    else if (askSnap.tier == IBD_PEER_QUALITY_DEGRADED)
+        ibdmetrics::Get().quality_degraded_selected.fetch_add(
+            1, std::memory_order_relaxed);
+    else
+        ibdmetrics::Get().quality_unknown_selected.fetch_add(
+            1, std::memory_order_relaxed);
+    return pAsk->AskFor(inv, source);
+}
+
 void CStalledSyncRecoveryState::MarkSyncRequestSent(int64_t nNow)
 {
     fSyncRequestSent = true;
@@ -5697,6 +6521,7 @@ void CNode::Cleanup(NodeCleanupMode mode)
     const bool fRecordForensics = (mode == NODE_CLEANUP_RUNTIME);
     ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect", fRecordForensics);
     ReleaseOrphanLimitRejectedForPeer(GetId());
+    RemoveBlockAlternateAnnouncersForPeer(GetId());
     if (!fIbdMetricsCleanupAccounted)
     {
         const bool fHadQueuedGetBlocks = !getBlocksIndex.empty();
@@ -5725,6 +6550,7 @@ void CNode::Cleanup(NodeCleanupMode mode)
         setAskForBlocks.clear();
         setBlocksInFlight.clear();
         mapBlockInFlightSince.clear();
+        mapBlockInFlightMarkUs.clear();
         peerLiveActivePressure = 0;
         nFrontierDeferredHash = 0;
         ClearDiversifyDispatchForPeer(GetId());

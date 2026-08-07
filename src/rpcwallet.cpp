@@ -548,6 +548,31 @@ Value getinfo(const Array& params, bool fHelp)
         ibd.push_back(Pair("diversify_no_other_lane", metrics.diversify_no_other_lane));
         ibd.push_back(Pair("diversify_other_lane_timeout", metrics.diversify_other_lane_timeout));
 
+        ibd.push_back(Pair("peer_quality_requests_observed", metrics.peer_quality_requests_observed));
+        ibd.push_back(Pair("peer_quality_receive_outcomes", metrics.peer_quality_receive_outcomes));
+        ibd.push_back(Pair("peer_quality_timeout_outcomes", metrics.peer_quality_timeout_outcomes));
+        ibd.push_back(Pair("peer_quality_late_outcomes", metrics.peer_quality_late_outcomes));
+        ibd.push_back(Pair("peer_quality_redirects", metrics.peer_quality_redirects));
+        ibd.push_back(Pair("peer_concentration_redirects", metrics.peer_concentration_redirects));
+        ibd.push_back(Pair("peer_quality_no_alternative", metrics.peer_quality_no_alternative));
+        ibd.push_back(Pair("peer_concentration_no_alternative", metrics.peer_concentration_no_alternative));
+        ibd.push_back(Pair("same_peer_reissue_after_timeout", metrics.same_peer_reissue_after_timeout));
+        ibd.push_back(Pair("cross_peer_reissue_after_timeout", metrics.cross_peer_reissue_after_timeout));
+        ibd.push_back(Pair("timeout_reissue_no_alternative", metrics.timeout_reissue_no_alternative));
+        ibd.push_back(Pair("quality_unknown_selected", metrics.quality_unknown_selected));
+        ibd.push_back(Pair("quality_good_selected", metrics.quality_good_selected));
+        ibd.push_back(Pair("quality_degraded_selected", metrics.quality_degraded_selected));
+        ibd.push_back(Pair("alternate_announcer_recorded", metrics.alternate_announcer_recorded));
+        ibd.push_back(Pair("alternate_announcer_duplicate", metrics.alternate_announcer_duplicate));
+        ibd.push_back(Pair("alternate_announcer_evicted", metrics.alternate_announcer_evicted));
+        ibd.push_back(Pair("alternate_announcer_expired", metrics.alternate_announcer_expired));
+        ibd.push_back(Pair("alternate_announcer_cleanup", metrics.alternate_announcer_cleanup));
+        ibd.push_back(Pair("dominant_peer_active_share_current_pct", metrics.dominant_peer_active_share_current_pct));
+        ibd.push_back(Pair("dominant_peer_active_share_max_pct", metrics.dominant_peer_active_share_max_pct));
+        ibd.push_back(Pair("degraded_peers_current", metrics.degraded_peers_current));
+        ibd.push_back(Pair("alternate_hashes_current", metrics.alternate_hashes_current));
+        ibd.push_back(Pair("alternate_hashes_max", metrics.alternate_hashes_max));
+
         ibd.push_back(Pair("askfor_skip_orphan_limit_cooldown", metrics.askfor_skip_orphan_limit_cooldown));
         ibd.push_back(Pair("orphan_limit_cooldown_recorded", metrics.orphan_limit_cooldown_recorded));
         ibd.push_back(Pair("orphan_limit_cross_peer_admitted", metrics.orphan_limit_cross_peer_admitted));
