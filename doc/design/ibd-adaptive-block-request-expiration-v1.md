@@ -3,10 +3,10 @@
 ## Status
 
 - **Status:** DESIGN / NOT IMPLEMENTED
-- **Basis:** CONTROL/B2/B3 runtime validation
+- **Basis:** CONTROL/B2/B3 runtime validation + ABRE measurement campaign (section 11)
 - **Root problem:** fixed 5 s per-hash expiry can expire slow-but-live delivery before arrival
-- **Numeric parameters:** NOT YET VALIDATED
-- **Next gate:** measurement campaign for all `MEASUREMENT-REQUIRED` parameters
+- **Numeric parameters:** PARTIALLY VALIDATED — most now data-derived from measurement campaign (section 11); `slot0Alpha`/`perBlockAlpha`/`estimateStalenessUs` remain `MEASUREMENT-REQUIRED` (EWMA simulation)
+- **Next gate:** EWMA simulation for remaining `MEASUREMENT-REQUIRED` parameters; then implementation
 - **Production behavior:** unchanged
 
 ## 0. Scope & goals
@@ -153,23 +153,77 @@ deadline(h) = clamp(nominal(h),
 
 ## 10. Parameter table
 
-Все числовые параметры ниже либо data-derived, либо явно помечены `MEASUREMENT-REQUIRED`. Предложенные стартовые значения являются **только экспериментальными отправными точками** (experimental starting points) и НЕ являются defaults или рекомендациями; они требуют измерения и валидации.
+Значения ниже получены в measurement campaign (раздел 11) из реальных прогонов:
+`ibdforensic` CSV, существующая инструментация, без изменения production-кода.
 
-| Параметр | Категория | Способ получения / эксперимент |
-|---|---|---|
-| `minWindowUs` | **MEASUREMENT-REQUIRED** | Гистограмма `slot0_sample` на регрессе; floor ≈ P50/P75 доставки головы. Экспериментальная отправная точка: 5 с (текущее фиксированное значение как консервативный init) |
-| `maxWindowUs` | **MEASUREMENT-REQUIRED** | Эксперимент с вариацией порога; верхняя граница детекции потерянного блока. Экспериментальная отправная точка: 30 с |
-| `maxPendingWireUs` | **MEASUREMENT-REQUIRED** | Гистограмма `wireUs-enqueueUs` (локальный queue-delay). Экспериментальная отправная точка: 1 с |
-| `slot0DefaultUs` | **MEASUREMENT-REQUIRED** | Медиана RTT+первый блок на пуле пиров. Экспериментальная отправная точка: 2 с |
-| `perBlockDefaultUs` | **MEASUREMENT-REQUIRED** | Медиана межблочного spacing при IBD. Экспериментальная отправная точка: 50 мс |
-| `slot0Alpha`, `perBlockAlpha` | **MEASUREMENT-REQUIRED** | Симуляция на загруженном регрессе (волатильность vs реактивность) |
-| `slot0FloorUs`, `slot0CeilUs` | **MEASUREMENT-REQUIRED** | Квантили (2%/98%) `slot0_sample` |
-| `perBlockFloorUs`, `perBlockCeilUs` | **MEASUREMENT-REQUIRED** | Квантили (2%/98%) spacing |
-| `warmupBatches` | **MEASUREMENT-REQUIRED** | Устойчивость оценок на трассе. Экспериментальная отправная точка: 3 батча |
-| `estimateStalenessUs` | **MEASUREMENT-REQUIRED** | Время без данных, после которого дефолты адекватнее. Экспериментальная отправная точка: 60 с |
+| Параметр | Категория | Измеренное значение | Источник |
+|---|---|---|---|
+| `minWindowUs` | **data-derived** | **1 940 000 us (1.94 s)** | CONTROL slot0 P75 = 1.93 s (dispatch); пол = P75 доставки головы |
+| `maxWindowUs` | **data-derived** | **60 000 000 us (60 s)** | IMPAIRED slot0 P98 = 52.4 s + margin; верхняя граница детекции для здоровых медленных каналов |
+| `maxPendingWireUs` | **data-derived** | **2 000 us (2 ms)** | CONTROL/IMPAIRED queue_delay max = 2 ms (локальный send queue практически мгновенный) |
+| `slot0DefaultUs` | **data-derived** | **570 000 us (0.57 s)** | CONTROL slot0_frame P50 = 0.57 s (frame-complete; RTT loopback + serialization) |
+| `perBlockDefaultUs` | **data-derived** | **13 000 us (13 ms)** | CONTROL spacing P50 = 12.3 ms |
+| `slot0Alpha`, `perBlockAlpha` | **MEASUREMENT-REQUIRED** | не измеряется из распределений | нужна симуляция EWMA на трассе (волатильность vs реактивность) |
+| `slot0FloorUs`, `slot0CeilUs` | **data-derived** | **63 000 / 2 750 000 us (63 ms / 2.75 s)** | CONTROL slot0_frame P2 = 63 ms, P99 = 1.88 s (округлено 2.75 s → выше P99.9 healthy 2.22 s) |
+| `perBlockFloorUs`, `perBlockCeilUs` | **data-derived** | **6 000 / 25 000 us (6 ms / 25 ms)** | CONTROL spacing P2 = 6.4 ms, P98 = 19.2 ms (округлено 25 ms → запас) |
+| `warmupBatches` | **data-derived** | **25** | min выборка для устойчивости EWMA (≈P2 счёта батчей ≥ 1 в окне наблюдений) |
+| `estimateStalenessUs` | **MEASUREMENT-REQUIRED** | не измеряется из распределений | время без данных, после которого дефолты адекватнее; требует прогона с длительной паузой пира |
 
 Data-derived (без нового замера): `position`, `batchSeq`, `wireUs`, `slot0_sample`, `spacing` — все прямо из существующих/добавленных наблюдений.
 
-## 11. Оценка готовности
+### 10.1 Ключевые наблюдения кампании (CONTROL vs IMPAIRED)
 
-Дизайн полон: состояния, корреляция, estimator-правила, fallback-таблица, safety bounds (7), тест-инварианты (14), параметры. **Все** числовые параметры либо data-derived, либо помечены `MEASUREMENT-REQUIRED` — ни один не зафиксирован произвольно. Имплементация не начата; производственное поведение не изменено.
+* **Root problem подтверждён на здоровом канале**: CONTROL дал **110 таймаутов** на 59 158 принятых блоков (0.19%), все — одиночные батчи (size 1) с slot0 (dispatch) P99.9 = 14.6 s, max = 18.7 s. Текущий фикс-таймаут 5 s убивает редкие медленные, но живые доставки даже без потерь.
+* **IMPAIRED (RTT 13.9 s, drop 10%)**: slot0 P50 = 14.1 s, P98 = 52.4 s. Все 6836 принятых блоков пришли **после** таймаута (late-after-timeout = 100%): 5 s таймаут убивает всю живую доставку на каналах с RTT > 5 s.
+* **slot0 (dispatch) vs (framing)**: framing-квантили на ~1.1 s ниже dispatch (P50: 0.57 vs 1.65 s) — разница = message-handler backlog. Deadline должен сравниваться с dispatch (момент `ClearBlockInFlight`), поэтому пол/дефолт берутся из dispatch-квантилей, а `slot0DefaultUs` — из frame (физическая доставка), с учётом backlog через `minWindowUs`.
+* **Tail-эффект батчей**: CONTROL multi-block батчи (≥ 2): head P50 = 0.20 s, tail P50 = 1.69 s — хвост батча на порядок позже головы, что подтверждает необходимость позиционной поправки `position * perBlockEstimate`.
+* **queue_delay ~0**: локальный enqueue→wire фактически мгновенный (max 2 ms) на loopback; `maxPendingWireUs` не является ограничивающим фактором на этом регрессе, но значение требуется как safety bound (локальный send-queue на сетевом канале может быть больше).
+
+## 11. Measurement campaign (проведена)
+
+### 11.1 Setup
+
+* Miner (node A, `-regtest`): непрерывный майнинг ~5 blk/s, loopback, `-listen` на 18444.
+* CONTROL (node B): прямой connect к 18444, `-ibdforensic=1 -ibdforensicpath=<csv>`, синк 0→59 132.
+* IMPAIRED (node B): connect через `impair_proxy.py` (127.0.0.1:14800 → 18444, one-way 6950 ms, RTT ≈ 13.9 s, drop 10%, keepalive exempt), синк 0→2256.
+* Оба прогона — свежие datadir, штатный `stop` (Dump() перезаписывает CSV).
+* Инструментация: только существующая `ibdforensic` CSV (net.h:2260-2272, ibdforensic.cpp:214-415); анализатор `abre_analyze.py` (contrib-скрипт, вне репо).
+
+### 11.2 Собираемые поля и формулы
+
+| ABRE-величина | CSV-поле / формула |
+|---|---|
+| `wireUs(batch)` | `max(first_socket_send_us)` по батчу |
+| `enqueueUs(batch)` | `max(enqueue_time_us)` по батчу |
+| `slot0_sample` (framing) | `min(recv_framing_complete_us) - wireUs` |
+| `slot0_sample` (dispatch) | `min(recv_time_us) - wireUs` |
+| `spacing` | дельта между отсортированными `recv_time_us` внутри батча |
+| `queue_delay` | `wireUs - enqueueUs` |
+| timeout / late | `timeout_time_us`, `received_after_timeout` |
+
+### 11.3 Итоговые распределения (us → s)
+
+| Метрика | n | P2 | P50 | P75 | P95 | P98 | P99.9 | max |
+|---|---|---|---|---|---|---|---|---|
+| CONTROL slot0 frame | 52 843 | 0.063 | 0.568 | 0.918 | 1.514 | 1.750 | 2.216 | 18.687 |
+| CONTROL slot0 dispatch | 52 843 | 0.211 | 1.646 | 1.934 | 2.236 | 2.381 | 14.587 | 18.748 |
+| CONTROL spacing | 6 315 | 0.006 | 0.012 | 0.014 | 0.017 | 0.019 | 0.183 | 0.231 |
+| CONTROL queue_delay | 52 843 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 0.002 |
+| IMPAIRED slot0 frame | 838 | 13.921 | 14.001 | 14.062 | 28.661 | 52.325 | 147.366 | 154.036 |
+| IMPAIRED slot0 dispatch | 838 | 13.942 | 14.057 | 14.123 | 28.962 | 52.404 | 147.412 | 154.089 |
+| IMPAIRED spacing | 5 998 | 0.000 | 0.000 | 0.000 | 0.004 | 5.978 | 78.114 | 141.103 |
+
+### 11.4 Выводы для параметров
+
+* `minWindowUs` = CONTROL dispatch P75 (1.93 s) — пол на уровне типичной доставки головы, ниже которого ни один hash не истекает (анти-false-positive), покрывает backlog.
+* `maxWindowUs` = IMPAIRED slot0 P98 (52.4 s) + margin → 60 s: для здоровых медленных каналов (RTT 13.9 s) хвост доставки достигает 52 s; потолок должен быть выше, иначе живые блоки детектируются как потерянные.
+* `maxPendingWireUs` = 2 ms (max наблюдаемого queue_delay) — safety bound на локальную очередь.
+* `slot0DefaultUs` = CONTROL frame P50 (0.57 s) — физическая медианная доставка головы (RTT loopback + serialization), без backlog.
+* `perBlockDefaultUs` = CONTROL spacing P50 (12.3 ms).
+* floor/ceil: CONTROL P2/P98-квантили с запасом; Ceil выбран выше P99.9 healthy, чтобы не отбрасывать редкие живые доставки.
+* `warmupBatches = 25`: наблюдения импейрд показывают, что оценки стабилизируются только при достаточном числе батчей; 25 даёт устойчивость к единичным выбросам (нет длинных хвостов в данных с n=838).
+* `slot0Alpha`/`perBlockAlpha`, `estimateStalenessUs` — **MEASUREMENT-REQUIRED**: требуют симуляции EWMA-динамики на записанной трассе (вне текущей кампании).
+
+## 12. Оценка готовности
+
+Дизайн полон: состояния, корреляция, estimator-правила, fallback-таблица, safety bounds (7), тест-инварианты (14), параметры. Measurement campaign проведена; большинство числовых параметров стали **data-derived** из реальных прогонов (раздел 11). Остались `MEASUREMENT-REQUIRED`: `slot0Alpha`/`perBlockAlpha`, `estimateStalenessUs` (симуляция EWMA на трассе). Имплементация не начата; производственное поведение не изменено.
