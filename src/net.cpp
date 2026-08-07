@@ -5767,6 +5767,18 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
     int64_t nNow = GetTime();
     ibdmetrics::RecordGetBlocksDecision(source);
 
+    // Diagnostic-only: capture the client-side getblocks decision.
+    if (ibdexptrace::Enabled())
+    {
+        const int nPeerH = nBestKnownHeight >= 0 ? nBestKnownHeight : nChainHeight;
+        const int nLocH = pindexBegin ? pindexBegin->nHeight : -1;
+        ibdexptrace::NoteGetBlocks(
+            GetId(), nLocH, nPeerH,
+            (nLocH >= 0 && nPeerH >= nLocH) ? (nPeerH - nLocH) : -1,
+            ibdexptrace::GetBlocksSourceName((int)source),
+            false, hashEnd);
+    }
+
     if (pindexBegin == pindexLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd) {
         ibdmetrics::Get().getblocks_identical_to_last_sent.fetch_add(
             1, std::memory_order_relaxed);
@@ -5777,6 +5789,8 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
             ibdmetrics::Get().getblocks_dedup_skips.fetch_add(
                 1, std::memory_order_relaxed);
             ibdforensic::CountGetBlocksRateLimitOutboundDedup();
+            if (ibdexptrace::Enabled())
+                ibdexptrace::Get().gblocks_dedup.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
     }

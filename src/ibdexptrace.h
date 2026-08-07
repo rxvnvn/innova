@@ -61,6 +61,26 @@ inline const char* OriginName(int o)
     }
 }
 
+// GetBlocksSource name helper (mirrors the ibdmetrics enum, diagnostic only).
+inline const char* GetBlocksSourceName(int s)
+{
+    switch (s)
+    {
+    case 1: return "INITIAL";
+    case 2: return "CONTINUATION";
+    case 3: return "RECOVERY";
+    case 4: return "PREFETCH";
+    case 5: return "INV_CONTINUATION";
+    case 6: return "VERSION";
+    case 7: return "HEADERS";
+    case 8: return "CHECKPOINT";
+    case 9: return "WALLET_RESCAN";
+    case 10: return "ORPHAN_LIMIT";
+    case 11: return "EMPTY_PIPELINE_WAKE";
+    default: return "OTHER";
+    }
+}
+
 // INV-batch origin (coarse, per the audit's Section 10 classification).
 enum ExpInvOrigin
 {
