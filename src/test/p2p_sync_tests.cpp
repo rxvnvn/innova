@@ -8239,4 +8239,287 @@ BOOST_AUTO_TEST_CASE(late_delivery_attributed_to_requesting_peer)
     UnsetIbdQualityClockForTesting();
 }
 
+// A late block response from the previous owner must not erase ownership that
+// was reassigned after the timeout.  This is the primary regression: it fails
+// on pre-fix code, where ReleaseBlockRequestOwnerOnReceive cleared the current
+// owner without verifying the delivering peer still owned the request.
+BOOST_AUTO_TEST_CASE(late_receive_does_not_release_reassigned_owner)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21501), "late-owner-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21502), "late-owner-b", true);
+    const uint256 hash(215001);
+
+    // A obtains ownership of H and marks it in flight.
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerA.GetId(), BLOCKREQ_SOURCE_INV));
+    peerA.MarkBlockInFlight(hash);
+    NodeId owner = -1;
+    BlockRequestOwnerState state = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK_EQUAL(owner, peerA.GetId());
+
+    // A times out through the real lifecycle path, releasing ownership.
+    peerA.mapBlockInFlightSince[hash] = GetTime() - 60;
+    peerA.ExpireBlockInFlight();
+    BOOST_CHECK(!GetBlockRequestOwner(hash, &owner, &state));
+
+    // H is reassigned to B.
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerB.GetId(), BLOCKREQ_SOURCE_INV));
+    peerB.MarkBlockInFlight(hash);
+    BOOST_CHECK(GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK_EQUAL(owner, peerB.GetId());
+
+    // The old response from A arrives late: run the receive-side cleanup for A.
+    peerA.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId());
+
+    // Ownership must remain with B.
+    BOOST_CHECK(GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK_EQUAL(owner, peerB.GetId());
+
+    peerB.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnerOnReceive(hash, peerB.GetId());
+    BOOST_CHECK(!GetBlockRequestOwner(hash, &owner, &state));
+}
+
+// A normal on-time receive from the current owner releases ownership exactly
+// once; a second cleanup is an idempotent no-op.
+BOOST_AUTO_TEST_CASE(current_owner_receive_releases_owner)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21503), "owner-recv-b", true);
+    const uint256 hash(215002);
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerB.GetId(), BLOCKREQ_SOURCE_INV));
+    peerB.MarkBlockInFlight(hash);
+    NodeId owner = -1;
+    BlockRequestOwnerState state = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK_EQUAL(owner, peerB.GetId());
+
+    BOOST_CHECK(ReleaseBlockRequestOwnerOnReceive(hash, peerB.GetId()));
+    BOOST_CHECK(!GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK(!ReleaseBlockRequestOwnerOnReceive(hash, peerB.GetId()));
+    BOOST_CHECK(!GetBlockRequestOwner(hash, &owner, &state));
+
+    peerB.ClearBlockInFlight(hash);
+}
+
+// Receive-side ownership cleanup with no owner is an idempotent no-op.
+BOOST_AUTO_TEST_CASE(unowned_receive_is_idempotent)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21504), "unowned-a", true);
+    const uint256 hash(215003);
+
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+    BOOST_CHECK(!ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId()));
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+    BOOST_CHECK(!ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId()));
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+}
+
+// A receive from a peer that never owned the hash must not clear the current
+// owner, and must be observable via the mismatch-preserved counter.
+BOOST_AUTO_TEST_CASE(foreign_receive_does_not_release_current_owner)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21505), "foreign-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(21506), "foreign-c", true);
+    const uint256 hash(215004);
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerB.GetId(), BLOCKREQ_SOURCE_INV));
+    peerB.MarkBlockInFlight(hash);
+
+    const int64_t nMismatchBefore =
+        MetricGet(ibdmetrics::Get().block_owner_receive_mismatch_preserved);
+    BOOST_CHECK(!ReleaseBlockRequestOwnerOnReceive(hash, peerC.GetId()));
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().block_owner_receive_mismatch_preserved),
+        nMismatchBefore + 1);
+
+    NodeId owner = -1;
+    BlockRequestOwnerState state = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK_EQUAL(owner, peerB.GetId());
+
+    peerB.ClearBlockInFlight(hash);
+}
+
+// Full lifecycle convergence: late old-owner receive preserves B, then B's
+// normal receive clears ownership.
+BOOST_AUTO_TEST_CASE(late_old_owner_then_new_owner_receive)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21507), "conv-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21508), "conv-b", true);
+    const uint256 hash(215005);
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerA.GetId(), BLOCKREQ_SOURCE_INV));
+    peerA.MarkBlockInFlight(hash);
+    peerA.mapBlockInFlightSince[hash] = GetTime() - 60;
+    peerA.ExpireBlockInFlight();
+    BOOST_CHECK(!GetBlockRequestOwner(hash, NULL, NULL));
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerB.GetId(), BLOCKREQ_SOURCE_INV));
+    peerB.MarkBlockInFlight(hash);
+    NodeId owner = -1;
+    BlockRequestOwnerState state = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK_EQUAL(owner, peerB.GetId());
+
+    // Late receive from A must not disturb B.
+    peerA.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId());
+    BOOST_CHECK(GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK_EQUAL(owner, peerB.GetId());
+
+    // Normal receive from B converges to empty.
+    peerB.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnerOnReceive(hash, peerB.GetId());
+    BOOST_CHECK(!GetBlockRequestOwner(hash, &owner, &state));
+}
+
+// After A timeout -> B reassignment -> late A receive, the hash cannot be
+// reopened for a third parallel owner while B still owns it.
+BOOST_AUTO_TEST_CASE(late_receive_does_not_enable_duplicate_parallel_owner)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21509), "dup-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21510), "dup-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(21511), "dup-c", true);
+    const uint256 hash(215006);
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerA.GetId(), BLOCKREQ_SOURCE_INV));
+    peerA.MarkBlockInFlight(hash);
+    peerA.mapBlockInFlightSince[hash] = GetTime() - 60;
+    peerA.ExpireBlockInFlight();
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerB.GetId(), BLOCKREQ_SOURCE_INV));
+    peerB.MarkBlockInFlight(hash);
+
+    // Late receive from A.
+    peerA.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId());
+
+    // C cannot claim ownership while B owns it (ownership conflict).
+    NodeId existingPeer = -1;
+    BlockRequestOwnerState existingState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(!TryAssignBlockRequestOwner(
+        hash, peerC.GetId(), BLOCKREQ_SOURCE_INV, &existingPeer, &existingState));
+    BOOST_CHECK_EQUAL(existingPeer, peerB.GetId());
+
+    // C's AskFor is also refused with an ownership conflict.
+    AskForResult res = peerC.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL((int)res, (int)ASKFOR_OWNED_BY_OTHER);
+
+    NodeId owner = -1;
+    BlockRequestOwnerState state = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK_EQUAL(owner, peerB.GetId());
+
+    peerB.ClearBlockInFlight(hash);
+}
+
+// The late-owner mismatch path must not double-decrement the inflight / global
+// active gauges, must not change peer pressure, and must not emit an
+// in-flight-clear wake: the timeout already accounted the old owner exactly once.
+BOOST_AUTO_TEST_CASE(ownership_gauge_and_active_state_remain_consistent)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21512), "gauge-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21513), "gauge-b", true);
+    const uint256 hash(215007);
+
+    const int64_t nGlobal0 =
+        MetricGet(ibdmetrics::Get().global_active_current);
+    const int64_t nInflight0 =
+        MetricGet(ibdmetrics::Get().total_inflight_current);
+
+    // A owns and times out; the timeout accounts A exactly once.
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerA.GetId(), BLOCKREQ_SOURCE_INV));
+    peerA.MarkBlockInFlight(hash);
+    BOOST_CHECK_EQUAL(peerA.peerLiveActivePressure.load(), 1);
+    peerA.mapBlockInFlightSince[hash] = GetTime() - 60;
+    peerA.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(peerA.peerLiveActivePressure.load(), 0);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().total_inflight_current), nInflight0);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().global_active_current), nGlobal0);
+
+    // B owns: one live request is added.
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerB.GetId(), BLOCKREQ_SOURCE_INV));
+    peerB.MarkBlockInFlight(hash);
+    const int64_t nGlobalB = MetricGet(ibdmetrics::Get().global_active_current);
+    const int64_t nInflightB = MetricGet(ibdmetrics::Get().total_inflight_current);
+    BOOST_CHECK_EQUAL(nGlobalB, nGlobal0 + 1);
+    BOOST_CHECK_EQUAL(nInflightB, nInflight0 + 1);
+    BOOST_CHECK_EQUAL(peerB.peerLiveActivePressure.load(), 1);
+
+    // Late receive from A must not touch any of the live gauges or B's pressure,
+    // and must not emit an in-flight-clear wake (A's set is already empty).
+    const int64_t nWakeBefore =
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_clear_inflight);
+    peerA.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId());
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().total_inflight_current), nInflightB);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().global_active_current), nGlobalB);
+    BOOST_CHECK_EQUAL(peerB.peerLiveActivePressure.load(), 1);
+    BOOST_CHECK_EQUAL(peerA.peerLiveActivePressure.load(), 0);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().pipeline_wake_signal_clear_inflight),
+        nWakeBefore);
+
+    // Convergence: B's normal receive returns to the baseline.
+    peerB.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnerOnReceive(hash, peerB.GetId());
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().total_inflight_current), nInflight0);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().global_active_current), nGlobal0);
+}
+
+// End-to-end lifecycle with real production helpers: mark A -> timeout A ->
+// mark B -> late block receive from A -> B ownership survives -> B completes ->
+// every ownership/inflight structure converges to empty.
+BOOST_AUTO_TEST_CASE(late_receive_preserves_reassigned_owner_full_lifecycle)
+{
+    CScopedIbdQualityState scope;
+    CScopedAlreadyAskedFor already;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(21514), "e2e-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(21515), "e2e-b", true);
+    const uint256 hash(215008);
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerA.GetId(), BLOCKREQ_SOURCE_INV));
+    peerA.MarkBlockInFlight(hash);
+    peerA.mapBlockInFlightSince[hash] = GetTime() - 60;
+    peerA.ExpireBlockInFlight();
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peerB.GetId(), BLOCKREQ_SOURCE_INV));
+    peerB.MarkBlockInFlight(hash);
+
+    // Late block receive from A.
+    peerA.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId());
+
+    // B ownership survives the late receive.
+    NodeId owner = -1;
+    BlockRequestOwnerState state = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK_EQUAL(owner, peerB.GetId());
+    BOOST_CHECK_EQUAL(peerB.setBlocksInFlight.count(hash), 1U);
+
+    // B completes normally; all structures converge to empty.
+    peerB.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnerOnReceive(hash, peerB.GetId());
+    BOOST_CHECK(!GetBlockRequestOwner(hash, &owner, &state));
+    BOOST_CHECK(peerA.setBlocksInFlight.empty());
+    BOOST_CHECK(peerB.setBlocksInFlight.empty());
+    BOOST_CHECK_EQUAL(peerA.mapBlockInFlightSince.count(hash), 0U);
+    BOOST_CHECK_EQUAL(peerB.mapBlockInFlightSince.count(hash), 0U);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

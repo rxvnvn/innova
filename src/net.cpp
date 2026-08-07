@@ -3271,6 +3271,18 @@ bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer)
         mapBlockRequestOwners.find(hash);
     if (it == mapBlockRequestOwners.end())
         return false;
+    // A received block may release ownership only when the delivering peer is
+    // the current owner.  A late response from the previous owner (after the
+    // hash timed out and was reassigned) or an unsolicited/foreign delivery
+    // must not erase the current owner's live assignment.  This mirrors the
+    // checked release in ReleaseBlockRequestOwner: the owner-identity check and
+    // the erase happen under the same cs_mapAlreadyAskedFor critical section.
+    if (it->second.peer != peer)
+    {
+        ibdmetrics::Get().block_owner_receive_mismatch_preserved.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
     if (BlockRequestTraceEnabled())
         BlockRequestTraceOwnerRelease(hash, it->second.peer,
                                       BlockRequestOwnerStateName(it->second.state),

@@ -115,6 +115,7 @@ struct IBDMetricsSnapshot
     int64_t askfor_skip_other_peer_owner;
     int64_t askfor_skip_already_queued;
     int64_t askfor_skip_inflight;
+    int64_t block_owner_receive_mismatch_preserved;
 
     int64_t total_deferred_current;
     int64_t total_deferred_max;
@@ -409,6 +410,7 @@ struct Counters
     std::atomic<int64_t> askfor_skip_other_peer_owner;
     std::atomic<int64_t> askfor_skip_already_queued;
     std::atomic<int64_t> askfor_skip_inflight;
+    std::atomic<int64_t> block_owner_receive_mismatch_preserved;
 
     std::atomic<int64_t> total_deferred_current;
     std::atomic<int64_t> total_deferred_max;

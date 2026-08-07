@@ -92,6 +92,7 @@ Counters::Counters()
       askfor_skip_other_peer_owner(0),
       askfor_skip_already_queued(0),
       askfor_skip_inflight(0),
+      block_owner_receive_mismatch_preserved(0),
       total_deferred_current(0),
       total_deferred_max(0),
       total_queued_current(0),
@@ -733,6 +734,8 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.askfor_skip_already_queued.load(std::memory_order_relaxed);
     out.askfor_skip_inflight =
         c.askfor_skip_inflight.load(std::memory_order_relaxed);
+    out.block_owner_receive_mismatch_preserved =
+        c.block_owner_receive_mismatch_preserved.load(std::memory_order_relaxed);
 
     out.total_deferred_current =
         c.total_deferred_current.load(std::memory_order_relaxed);

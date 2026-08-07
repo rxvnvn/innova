@@ -582,6 +582,7 @@ Value getinfo(const Array& params, bool fHelp)
         ibd.push_back(Pair("askfor_skip_other_peer_owner", metrics.askfor_skip_other_peer_owner));
         ibd.push_back(Pair("askfor_skip_already_queued", metrics.askfor_skip_already_queued));
         ibd.push_back(Pair("askfor_skip_inflight", metrics.askfor_skip_inflight));
+        ibd.push_back(Pair("block_owner_receive_mismatch_preserved", metrics.block_owner_receive_mismatch_preserved));
 
         ibd.push_back(Pair("total_deferred_current", metrics.total_deferred_current));
         ibd.push_back(Pair("total_deferred_max", metrics.total_deferred_max));
