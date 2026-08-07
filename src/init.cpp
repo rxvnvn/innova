@@ -21,6 +21,7 @@
 #include "ibdblocklatency.h"
 #include "ibdsemantic.h"
 #include "ibdforensic.h"
+#include "ibdexptrace.h"
 #include "pinglifecycletrace.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
@@ -157,6 +158,7 @@ void Shutdown(void* parg)
         IBDEfficiencyShutdownSummary();
         ibdblocklatency::Dump();
         ibdforensic::ShutdownAndDump();
+        ibdexptrace::EmitSummary(GetTimeMicros());
 
         if(idns) {
             delete idns;
@@ -994,6 +996,7 @@ bool AppInit2()
         GetBoolArg("-ibdforensic", false),
         GetArg("-ibdforensicpath", ""));
     InitPingLifecycleTrace(GetBoolArg("-pinglifecycletrace", false));
+    ibdexptrace::SetEnabled(GetBoolArg("-ibdexptrace", false));
 
     {
         const int64_t nSemRecover = GetArg("-ibdsemrecover", 0);

@@ -6556,6 +6556,12 @@ void CNode::Cleanup(NodeCleanupMode mode)
             ibdmetrics::GlobalActiveAdd(
                 -(int64_t)setBlocksInFlight.size(),
                 ibdmetrics::ACTIVE_DECREMENT_DISCONNECT_CLEANUP);
+            // EXPTRACE HOOK: all in-flight requests against a disconnecting
+            // peer are counted as lost (never received).
+            for (std::set<uint256>::const_iterator it =
+                     setBlocksInFlight.begin();
+                 it != setBlocksInFlight.end(); ++it)
+                ibdexptrace::NoteRequestTimeout(*it);
         }
         if (!deferredBlockInv.empty())
             ibdmetrics::DeferredAdd(-(int64_t)deferredBlockInv.size());
@@ -8681,6 +8687,20 @@ void ThreadMessageHandler2(void* parg)
         ibdsemantic::EmitIBDSemanticHealth1s(vNodesCopy);
         ibdblocklatency::EmitIBDBlockLatency1s();
         PingLifecycleTraceEmit1s(vNodesCopy);
+        {
+            int nLocalHeight = 0;
+            int nOrphanGlobal = 0;
+            {
+                TRY_LOCK(cs_main, lockMain);
+                if (lockMain && pindexBest)
+                {
+                    nLocalHeight = nBestHeight;
+                    nOrphanGlobal = (int)mapOrphanBlocks.size();
+                }
+            }
+            ibdexptrace::Emit1s(
+                GetTimeMicros(), nLocalHeight, nOrphanGlobal);
+        }
 
         {
             LOCK(cs_vNodes);

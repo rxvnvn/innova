@@ -7560,10 +7560,19 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                     ibdmetrics::GETBLOCKS_SOURCE_ORPHAN_LIMIT);
 
                 if (IsInitialBlockDownload()) {
+                    // EXPTRACE HOOK: IBD orphan-limit rejection (parent
+                    // unknown by definition on this path).
+                    ibdexptrace::NoteOrphanLimitReject(
+                        pfrom->GetId(), nOrphansFromPeer,
+                        (int)mapOrphanBlocks.size(), false);
                     TraceProcessBlockReject(pfrom, pblock, PBREJECT_ORPHAN_LIMIT_IBD);
                     ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
                     return error("ProcessBlock() : peer %d exceeded orphan limit (IBD, no penalty)", pfrom->GetId());
                 }
+                // EXPTRACE HOOK: non-IBD orphan-limit rejection.
+                ibdexptrace::NoteOrphanLimitReject(
+                    pfrom->GetId(), nOrphansFromPeer,
+                    (int)mapOrphanBlocks.size(), false);
                 pfrom->Misbehaving(1);
                 TraceProcessBlockReject(pfrom, pblock, PBREJECT_ORPHAN_LIMIT_NORMAL);
                 ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
@@ -7594,6 +7603,10 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             mapOrphanCountByNode[pfrom->GetId()]++;
             BlockRequestTraceOrphanWatermark(
                 pfrom->GetId(), mapOrphanCountByNode[pfrom->GetId()], "add");
+            // EXPTRACE HOOK: orphan added to the per-peer holding area.
+            ibdexptrace::NoteOrphanAdd(
+                pfrom->GetId(), mapOrphanCountByNode[pfrom->GetId()],
+                (int)mapOrphanBlocks.size());
         }
 
         // Ask this guy to fill in what we're missing
@@ -8936,6 +8949,19 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         pfrom->fFrontierResponsePending = false;
         bool fFrontierSlotOffered = false;
 
+        // EXPTRACE HOOK: classify the full inv message before per-inv work.
+        {
+            std::vector<uint256> vBlockHashes;
+            vBlockHashes.reserve(nBlockCount);
+            for (unsigned int nInv = 0; nInv < vInv.size(); nInv++)
+                if (vInv[nInv].type == MSG_BLOCK)
+                    vBlockHashes.push_back(vInv[nInv].hash);
+            ibdexptrace::NoteInv(
+                pfrom->GetId(), nBlockCount, fGetBlocksResponse,
+                fFrontierResponse, nBestHeight, pfrom->nBestKnownHeight,
+                vBlockHashes, pfrom->hashLastBlockInBatch);
+        }
+
         for (unsigned int nInv = 0; nInv < vInv.size(); nInv++)
         {
             const CInv &inv = vInv[nInv];
@@ -9855,14 +9881,25 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pfrom->UpdateBestKnownBlock(
                     miAccepted->second->nHeight, hashBlock);
                 if (miAccepted->second->IsInMainChain())
+                {
                     ibdmetrics::Get().block_result_accepted_active.fetch_add(
                         1, std::memory_order_relaxed);
+                    // EXPTRACE HOOK: block connected to the active chain.
+                    ibdexptrace::NoteBlockConnected(hashBlock);
+                }
                 else if (mapOrphanBlocks.count(hashBlock) != 0)
                     ibdmetrics::Get().block_result_orphan_new.fetch_add(
                         1, std::memory_order_relaxed);
             }
             if (pfrom->nBestKnownHeight > pfrom->nChainHeight)
                 pfrom->nChainHeight = pfrom->nBestKnownHeight;
+        }
+        else
+        {
+            // EXPTRACE HOOK: block received but not accepted (rejected,
+            // duplicate, orphan-limit).  Non-main-chain acceptance is the
+            // caller's choice; only hard non-acceptance is counted here.
+            ibdexptrace::NoteBlockNotConnected(hashBlock);
         }
         // A delivered block response is no longer an outstanding global
         // anti-duplicate request, even when validation classified it as

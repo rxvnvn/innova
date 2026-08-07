@@ -599,6 +599,7 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
            "raw_write_avg_us=%lld filecommit_avg_us=%lld blockindex_commit_avg_us=%lld chainstate_commit_avg_us=%lld dag_commit_avg_us=%lld wallet_cb_avg_us=%lld "
            "peers_inflight_gt0=%lld peers_queued_gt0=%lld inflight_peer_max=%lld queued_peer_max=%lld "
            "dominant_peer_inflight_share_pct=%lld global_free_active_slots=%lld global_free_slots_with_deferred=%lld "
+           "global_active_current=%lld global_inflight_current=%lld global_queued_current=%lld global_deferred_current=%lld "
            "samples_single_peer_over_75pct=%lld samples_global_below_half_with_deferred=%lld "
            "wire_latency_avg_us=%lld wire_latency_max_us=%lld\n",
            (long long)nNow,
@@ -656,6 +657,10 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
             (long long)c.dominant_peer_inflight_share_pct.load(std::memory_order_relaxed),
             (long long)c.global_free_active_slots.load(std::memory_order_relaxed),
             (long long)c.global_free_slots_with_deferred.load(std::memory_order_relaxed),
+            (long long)nGlobalActiveCurrent,
+            (long long)mc.total_inflight_current.load(std::memory_order_relaxed),
+            (long long)mc.total_queued_current.load(std::memory_order_relaxed),
+            (long long)nTotalDeferredCurrent,
             (long long)c.samples_single_peer_over_75pct.load(std::memory_order_relaxed),
             (long long)c.samples_global_below_half_with_deferred.load(std::memory_order_relaxed),
             (long long)Avg(c.block_request_wire_latency_us_total.load(std::memory_order_relaxed),

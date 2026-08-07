@@ -26,6 +26,7 @@
 #include "ibdactivepath.h"
 #include "ibdblocklatency.h"
 #include "ibdforensic.h"
+#include "ibdexptrace.h"
 
 class CRequestTracker;
 class CNode;
@@ -1710,6 +1711,9 @@ public:
         bool fBlockRequest = (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK);
         if (fBlockRequest)
         {
+            // EXPTRACE HOOK: explicit orphan-parent walk-back ask.
+            if (source == BLOCKREQ_SOURCE_ORPHAN)
+                ibdexptrace::NoteOrphanParentAsk(inv.hash);
             ExpireBlockInFlight();
             if (setBlocksInFlight.count(inv.hash))
             {
@@ -2187,6 +2191,8 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                         -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
                     RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
                     RecordIbdBlockTimeout();
+                    // EXPTRACE HOOK: in-flight request released by timeout.
+                    ibdexptrace::NoteRequestTimeout(hashExpired);
                     // Capture the mark time before erasing so a later arrival
                     // of the block can be measured as a late delivery.
                     int64_t nExpiredMarkUs = 0;
@@ -2257,6 +2263,8 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
             ibdmetrics::InflightAdd(1);
             ibdmetrics::GlobalActiveAdd(1);
             RecordIbdBlockIssued();
+            // EXPTRACE HOOK: request actually sent to a peer.
+            ibdexptrace::NoteRequestSent(hashBlock);
         }
         mapBlockInFlightSince[hashBlock] = GetTime();
         mapBlockInFlightMarkUs[hashBlock] = QualityNowUs();
@@ -2303,6 +2311,8 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         }
         TakeDiversifyAnnounce(hashBlock, NULL);
         ReleaseBlockRequestOwner(hashBlock, GetId(), "receive");
+        // EXPTRACE HOOK: request received (in-flight slot cleared by receive).
+        ibdexptrace::NoteRequestReceived(hashBlock);
     }
 
     // ------------------------------------------------------------------
