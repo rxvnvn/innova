@@ -127,6 +127,7 @@ namespace Checkpoints
 
     bool CheckHardened(int nHeight, const uint256& hash)
     {
+        if (fRegTest) return true; // Regtest has no checkpoints
         MapCheckpoints& checkpoints = (fTestNet ? mapCheckpointsTestnet : mapCheckpoints);
 
         MapCheckpoints::const_iterator i = checkpoints.find(nHeight);
@@ -297,7 +298,7 @@ namespace Checkpoints
     // Check the chain this block is going to attach to is valid past maturity
     bool CheckSync(const uint256& hashBlock, const CBlockIndex* pindexPrev)
     {
-        if (fTestNet) return true; // Testnet has no checkpoints
+        if (fTestNet || fRegTest) return true; // Testnet/Regtest have no checkpoints
         int nHeight = pindexPrev->nHeight + 1;
         if (IsInitialBlockDownload()) { // Do a basic check if we are catching up
             const CBlockIndex* pindexSync = AutoSelectSyncCheckpoint();

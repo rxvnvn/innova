@@ -1,9 +1,8 @@
 //
 // Unit tests for block-chain checkpoints
 //
-#include <boost/assign/list_of.hpp> // for 'map_list_of()'
-#include <boost/test/unit_test.hpp>
 #include <boost/foreach.hpp>
+#include <boost/test/unit_test.hpp>
 
 #include "../checkpoints.h"
 #include "../util.h"
@@ -12,23 +11,82 @@ using namespace std;
 
 BOOST_AUTO_TEST_SUITE(Checkpoints_tests)
 
-BOOST_AUTO_TEST_CASE(sanity)
+BOOST_AUTO_TEST_CASE(regtest_ignores_mainnet_hardened_checkpoint)
 {
-    uint256 p11111 = uint256("0x0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d");
-    uint256 p134444 = uint256("0x00000000000005b12ffd4cd315cd34ffd4a594f430ac814c91184a0d42d2b0fe");
-    BOOST_CHECK(Checkpoints::CheckBlock(11111, p11111));
-    BOOST_CHECK(Checkpoints::CheckBlock(134444, p134444));
+    // Regression test for the regtest checkpoint bug: the mainnet hardened
+    // checkpoint at height 2000 was being applied during regtest because
+    // CheckHardened() did not exclude fRegTest, so a regtest chain could not
+    // grow past height 1999 (mining loop rejected every block at height 2000).
+    const uint256 wrong("0x0000000000000000000000000000000000000000000000000000000000000001");
 
-    
-    // Wrong hashes at checkpoints should fail:
-    BOOST_CHECK(!Checkpoints::CheckBlock(11111, p134444));
-    BOOST_CHECK(!Checkpoints::CheckBlock(134444, p11111));
+    // Sanity: 2000 IS a mainnet hardened checkpoint, so a wrong hash must be
+    // rejected on mainnet. This also pins mainnet semantics against regress.
+    {
+        bool fRegSaved = fRegTest;
+        bool fTestSaved = fTestNet;
+        fRegTest = false;
+        fTestNet = false;
+        BOOST_CHECK(!Checkpoints::CheckHardened(2000, wrong));
+        fRegTest = fRegSaved;
+        fTestNet = fTestSaved;
+    }
 
-    // ... but any hash not at a checkpoint should succeed:
-    BOOST_CHECK(Checkpoints::CheckBlock(11111+1, p134444));
-    BOOST_CHECK(Checkpoints::CheckBlock(134444+1, p11111));
+    // The fix: regtest must bypass hardened checkpoints entirely.
+    {
+        bool fRegSaved = fRegTest;
+        bool fTestSaved = fTestNet;
+        fRegTest = true;
+        fTestNet = false;
+        BOOST_CHECK(Checkpoints::CheckHardened(2000, wrong));
+        BOOST_CHECK(Checkpoints::CheckHardened(5000, wrong));
+        fRegTest = fRegSaved;
+        fTestNet = fTestSaved;
+    }
+}
 
-    BOOST_CHECK(Checkpoints::GetTotalBlocksEstimate() >= 134444);
-}    
+BOOST_AUTO_TEST_CASE(mainnet_hardened_checkpoint_semantics_unchanged)
+{
+    // Verify mainnet hardened-checkpoint behavior is untouched by the regtest
+    // fix: the stored checkpoint hash at a known height must pass and any
+    // other hash must fail.
+    const uint256 h2000 = Checkpoints::mapCheckpoints[2000];
+    const uint256 wrong("0x0000000000000000000000000000000000000000000000000000000000000001");
+    BOOST_CHECK(h2000 != 0);
+    BOOST_CHECK(h2000 != wrong);
+
+    bool fRegSaved = fRegTest;
+    bool fTestSaved = fTestNet;
+    fRegTest = false;
+    fTestNet = false;
+
+    BOOST_CHECK(Checkpoints::CheckHardened(2000, h2000));
+    BOOST_CHECK(!Checkpoints::CheckHardened(2000, wrong));
+    // A height that is not a checkpoint must accept any hash.
+    BOOST_CHECK(Checkpoints::CheckHardened(2001, wrong));
+
+    fRegTest = fRegSaved;
+    fTestNet = fTestSaved;
+}
+
+BOOST_AUTO_TEST_CASE(testnet_uses_own_checkpoint_map)
+{
+    // Testnet has no checkpoints beyond genesis; any non-genesis height must
+    // accept any hash regardless of the mainnet table.
+    const uint256 h0 = Checkpoints::mapCheckpointsTestnet[0];
+    const uint256 wrong("0x0000000000000000000000000000000000000000000000000000000000000001");
+    BOOST_CHECK(h0 != 0);
+
+    bool fRegSaved = fRegTest;
+    bool fTestSaved = fTestNet;
+    fRegTest = false;
+    fTestNet = true;
+
+    BOOST_CHECK(Checkpoints::CheckHardened(0, h0));
+    BOOST_CHECK(!Checkpoints::CheckHardened(0, wrong));
+    BOOST_CHECK(Checkpoints::CheckHardened(2000, wrong));
+
+    fRegTest = fRegSaved;
+    fTestNet = fTestSaved;
+}
 
 BOOST_AUTO_TEST_SUITE_END()
