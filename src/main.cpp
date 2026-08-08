@@ -112,11 +112,136 @@ bool fAddrIndex = false;
 
 bool fSPVMode = false;
 bool fIbdHeadersObserve = false;
+bool fIbdHeaderScheduler = false;
+bool fRegTestIbd = false;
 static CIbdHeadersObserver g_ibdHeadersObserver(512); // OBSERVATION WINDOW, not policy
+static const std::size_t IBD_HEADERS_SCHEDULER_WINDOW = 512; // EXPERIMENTAL A/B WINDOW
+
+bool IbdHeadersControlPlaneEnabled()
+{
+    return fIbdHeadersObserve || fIbdHeaderScheduler;
+}
+
+static bool IbdHeaderSchedulerSelectActive()
+{
+    return fIbdHeaderScheduler && !fSPVMode && IsInitialBlockDownload();
+}
+
+namespace
+{
+struct IbdHeaderSchedulerState
+{
+    std::map<uint256, std::set<NodeId> > invAvailability;
+    uint64_t refillCalls;
+    uint64_t refillAdmissions;
+    uint64_t fallbackCount;
+    uint64_t invInsideWindow;
+    uint64_t invBeforeWindow;
+    uint64_t invAfterWindow;
+    uint64_t invOffBranch;
+    uint64_t invUnknown;
+    uint64_t invPrevented;
+
+    IbdHeaderSchedulerState()
+        : refillCalls(0), refillAdmissions(0), fallbackCount(0),
+          invInsideWindow(0), invBeforeWindow(0), invAfterWindow(0),
+          invOffBranch(0), invUnknown(0), invPrevented(0)
+    {
+    }
+
+    void Clear()
+    {
+        invAvailability.clear();
+        refillCalls = 0;
+        refillAdmissions = 0;
+        fallbackCount = 0;
+        invInsideWindow = 0;
+        invBeforeWindow = 0;
+        invAfterWindow = 0;
+        invOffBranch = 0;
+        invUnknown = 0;
+        invPrevented = 0;
+    }
+
+    void RemovePeer(NodeId peer)
+    {
+        for (std::map<uint256, std::set<NodeId> >::iterator it =
+                 invAvailability.begin(); it != invAvailability.end();)
+        {
+            it->second.erase(peer);
+            if (it->second.empty())
+                invAvailability.erase(it++);
+            else
+                ++it;
+        }
+    }
+};
+
+static IbdHeaderSchedulerState g_ibdHeaderSchedulerState;
+static CBlockIndex g_ibdHeaderSchedulerTestTip;
+static uint256 g_ibdHeaderSchedulerTestHash;
+static CBlockIndex* g_ibdHeaderSchedulerSavedPindexBest = NULL;
+static uint256 g_ibdHeaderSchedulerSavedHashBestChain;
+static int g_ibdHeaderSchedulerSavedBestHeight = -1;
+static bool g_ibdHeaderSchedulerTestAnchorActive = false;
+}
+
+void ResetIbdHeaderSchedulerStateForTesting()
+{
+    g_ibdHeaderSchedulerState.Clear();
+    g_ibdHeadersObserver.SetEnabled(false);
+    if (g_ibdHeaderSchedulerTestAnchorActive)
+    {
+        pindexBest = g_ibdHeaderSchedulerSavedPindexBest;
+        hashBestChain = g_ibdHeaderSchedulerSavedHashBestChain;
+        nBestHeight = g_ibdHeaderSchedulerSavedBestHeight;
+        g_ibdHeaderSchedulerSavedPindexBest = NULL;
+        g_ibdHeaderSchedulerSavedHashBestChain = 0;
+        g_ibdHeaderSchedulerSavedBestHeight = -1;
+        g_ibdHeaderSchedulerTestAnchorActive = false;
+    }
+    g_ibdHeaderSchedulerTestHash = 0;
+    g_ibdHeaderSchedulerTestTip = CBlockIndex();
+}
+
+bool SeedIbdHeaderSchedulerAnchorForTesting(const uint256& hash, int height)
+{
+    if (!g_ibdHeaderSchedulerTestAnchorActive)
+    {
+        g_ibdHeaderSchedulerSavedPindexBest = pindexBest;
+        g_ibdHeaderSchedulerSavedHashBestChain = hashBestChain;
+        g_ibdHeaderSchedulerSavedBestHeight = nBestHeight;
+        g_ibdHeaderSchedulerTestAnchorActive = true;
+    }
+    g_ibdHeaderSchedulerTestHash = hash;
+    g_ibdHeaderSchedulerTestTip = CBlockIndex();
+    g_ibdHeaderSchedulerTestTip.phashBlock = &g_ibdHeaderSchedulerTestHash;
+    g_ibdHeaderSchedulerTestTip.nHeight = height;
+    pindexBest = &g_ibdHeaderSchedulerTestTip;
+    hashBestChain = hash;
+    nBestHeight = height;
+    g_ibdHeadersObserver.SetEnabled(true);
+    return g_ibdHeadersObserver.UpdateAnchor(hash, height);
+}
+
+bool SeedIbdHeaderSchedulerHeadersForTesting(NodeId peer,
+    const std::vector<std::pair<uint256, uint256> >& headers)
+{
+    g_ibdHeadersObserver.SetEnabled(true);
+    g_ibdHeadersObserver.ObserveHeaders(peer, headers, 0);
+    return headers.empty() ||
+           g_ibdHeadersObserver.Graph().Lookup(headers.back().first) != NULL;
+}
+
+void SeedIbdHeaderSchedulerInvAvailabilityForTesting(NodeId peer,
+    const uint256& hash)
+{
+    g_ibdHeaderSchedulerState.invAvailability[hash].insert(peer);
+}
 
 static bool PrepareIbdHeadersObserverRequest(CNode* pnode, CBlockLocator& locatorOut)
 {
-    if (!fIbdHeadersObserve || fSPVMode || !pnode || pnode->fClient ||
+    if (!IbdHeadersControlPlaneEnabled() || fSPVMode || !pnode || pnode->fClient ||
         pnode->fOneShot || !IsInitialBlockDownload() || !pindexBest)
         return false;
     g_ibdHeadersObserver.SetEnabled(true);
@@ -137,7 +262,7 @@ static bool PrepareIbdHeadersObserverRequest(CNode* pnode, CBlockLocator& locato
 static void TraceIbdHeadersObserverEvent(const char* event, CNode* pnode,
     const uint256& hash, int knownHeight)
 {
-    if (!fIbdHeadersObserve || !IsInitialBlockDownload()) return;
+    if (!IbdHeadersControlPlaneEnabled() || !IsInitialBlockDownload()) return;
     LOCK(cs_main);
     if (!g_ibdHeadersObserver.Enabled()) return;
     CIbdHeadersObserver::Classification c =
@@ -159,9 +284,13 @@ static void TraceIbdHeadersObserverEvent(const char* event, CNode* pnode,
 
 void IbdHeadersObserverPeerDisconnected(NodeId peer)
 {
-    if (!fIbdHeadersObserve) return;
+    if (!IbdHeadersControlPlaneEnabled()) return;
     TRY_LOCK(cs_main, lockMain);
-    if (lockMain) g_ibdHeadersObserver.RemovePeer(peer);
+    if (lockMain)
+    {
+        g_ibdHeadersObserver.RemovePeer(peer);
+        g_ibdHeaderSchedulerState.RemovePeer(peer);
+    }
 }
 bool fSPVHeadersOnly = false;
 int nSPVStartHeight = 0;
@@ -421,6 +550,267 @@ int GetDeferredBlockRequestBudget(CNode* pfrom,
     ibdmetrics::PeerZeroStateChange(nOldZero, nZero);
 
     return nBudget;
+}
+
+static void RecordIbdHeaderSchedulerInvAvailability(CNode* pfrom,
+                                                    const uint256& hash)
+{
+    if (pfrom == NULL || hash == 0)
+        return;
+    g_ibdHeaderSchedulerState.invAvailability[hash].insert(pfrom->GetId());
+}
+
+static std::vector<CNode*> IbdHeaderSchedulerCandidatePeers(
+    const uint256& hash, const std::vector<CNode*>& vNodesCopy)
+{
+    std::set<NodeId> peerIds;
+    const std::vector<int64_t> headerPeers =
+        g_ibdHeadersObserver.HeaderSources(hash);
+    peerIds.insert(headerPeers.begin(), headerPeers.end());
+    std::map<uint256, std::set<NodeId> >::const_iterator itAvail =
+        g_ibdHeaderSchedulerState.invAvailability.find(hash);
+    if (itAvail != g_ibdHeaderSchedulerState.invAvailability.end())
+        peerIds.insert(itAvail->second.begin(), itAvail->second.end());
+
+    std::vector<CNode*> out;
+    for (std::vector<CNode*>::const_iterator it = vNodesCopy.begin();
+         it != vNodesCopy.end(); ++it)
+    {
+        CNode* pnode = *it;
+        if (pnode == NULL || pnode->fDisconnect || pnode->fClient ||
+            pnode->fOneShot || pnode->nVersion == 0)
+            continue;
+        if (peerIds.count(pnode->GetId()) == 0)
+            continue;
+        out.push_back(pnode);
+    }
+    return out;
+}
+
+static int64_t IbdHeaderSchedulerPeerScore(const CNode* pnode,
+                                          int64_t nNow,
+                                          int64_t nMaxPeerHeight)
+{
+    int64_t nPeerHeight = std::max((int64_t)pnode->nBestKnownHeight,
+                                   (int64_t)pnode->nChainHeight);
+    if (nPeerHeight < 0)
+        nPeerHeight = 0;
+
+    int64_t nScore = nPeerHeight * 1000000;
+    if (nMaxPeerHeight > nPeerHeight)
+        nScore -= (nMaxPeerHeight - nPeerHeight) * 10000;
+    if (pnode->nLastHeightUpdate > 0 && nNow - pnode->nLastHeightUpdate <= 120)
+        nScore += 250000;
+    if (pnode->nLastBlockRecv > 0 && nNow - pnode->nLastBlockRecv <= 300)
+        nScore += 500000;
+    if (!pnode->setBlocksInFlight.empty())
+        nScore += 100000;
+    if (pnode->nBlocksReceivedInBatch > 0)
+        nScore += 50000;
+    if (pnode->nPingUsecTime > 0)
+    {
+        const int64_t nPingBonus = 300000 - (pnode->nPingUsecTime / 10);
+        if (nPingBonus > 0)
+            nScore += nPingBonus;
+    }
+    if (nNow - pnode->nTimeConnected < 120)
+        nScore += 10000;
+    if (pnode->fDisconnect)
+        nScore -= 5000000;
+    return nScore;
+}
+
+static CNode* IbdHeaderSchedulerBestPeerForHash(
+    const uint256& hash,
+    const std::vector<CNode*>& candidates)
+{
+    if (candidates.empty())
+        return NULL;
+
+    std::vector<CNode*> preferred;
+    std::map<uint256, std::set<NodeId> >::const_iterator itPreferred =
+        g_ibdHeaderSchedulerState.invAvailability.find(hash);
+    if (itPreferred != g_ibdHeaderSchedulerState.invAvailability.end())
+    {
+        for (std::vector<CNode*>::const_iterator it = candidates.begin();
+             it != candidates.end(); ++it)
+        {
+            CNode* pnode = *it;
+            if (itPreferred->second.count(pnode->GetId()) != 0)
+                preferred.push_back(pnode);
+        }
+    }
+
+    const std::vector<CNode*>& selectionPool =
+        preferred.empty() ? candidates : preferred;
+    int64_t nMaxPeerHeight = nBestHeight;
+    for (std::vector<CNode*>::const_iterator it = selectionPool.begin();
+         it != selectionPool.end(); ++it)
+    {
+        const CNode* pnode = *it;
+        const int64_t nPeerHeight = std::max(
+            (int64_t)pnode->nBestKnownHeight, (int64_t)pnode->nChainHeight);
+        nMaxPeerHeight = std::max(nMaxPeerHeight, nPeerHeight);
+    }
+
+    CNode* pBest = NULL;
+    int64_t nBestScore = std::numeric_limits<int64_t>::min();
+    int32_t nBestPressure = 0;
+    for (std::vector<CNode*>::const_iterator it = selectionPool.begin();
+         it != selectionPool.end(); ++it)
+    {
+        CNode* pnode = *it;
+        const int64_t nScore =
+            IbdHeaderSchedulerPeerScore(pnode, GetTime(), nMaxPeerHeight);
+        const int32_t nPressure =
+            pnode->peerLiveActivePressure.load(std::memory_order_relaxed);
+        if (pBest == NULL || nScore > nBestScore ||
+            (nScore == nBestScore && nPressure < nBestPressure) ||
+            (nScore == nBestScore && nPressure == nBestPressure &&
+             pnode->GetId() < pBest->GetId()))
+        {
+            pBest = pnode;
+            nBestScore = nScore;
+            nBestPressure = nPressure;
+        }
+    }
+    return pBest;
+}
+
+static size_t RefillOrderedHeaderBlockRequests(
+    CNode* pto, const std::vector<CNode*>& vNodesCopy)
+{
+    AssertLockHeld(cs_main);
+    if (!IbdHeaderSchedulerSelectActive() || pto == NULL || pindexBest == NULL ||
+        pto->fDisconnect || pto->fClient || pto->fOneShot ||
+        !IbdHeadersControlPlaneEnabled())
+        return 0;
+
+    g_ibdHeadersObserver.SetEnabled(true);
+    if (!g_ibdHeadersObserver.UpdateAnchor(pindexBest->GetBlockHash(),
+                                           pindexBest->nHeight))
+        return 0;
+
+    ++g_ibdHeaderSchedulerState.refillCalls;
+    const uint256 hashFrontier = pindexBest->GetBlockHash();
+    const std::vector<uint256> window =
+        g_ibdHeadersObserver.Graph().GetActiveWindow(
+            hashFrontier, IBD_HEADERS_SCHEDULER_WINDOW);
+    const CIbdHeaderNode* graphTip = g_ibdHeadersObserver.Graph().ActiveTip();
+    const int nLookahead = graphTip ? graphTip->height - pindexBest->nHeight : -1;
+    if (window.empty())
+    {
+        ++g_ibdHeaderSchedulerState.fallbackCount;
+        CBlockLocator locator;
+        if (!pto->getHeadersSync.IsInFlight() &&
+            PrepareIbdHeadersObserverRequest(pto, locator))
+            pto->PushGetHeaders(locator, uint256(0), "ibd-select-refill");
+        printf("IBD_HEADERS_SCHED event=fallback peer=%d reason=window-empty frontier_height=%d graph_tip_height=%d lookahead=%d\n",
+               pto->GetId(), pindexBest->nHeight,
+               graphTip ? graphTip->height : -1, nLookahead);
+        return 0;
+    }
+
+    int nBudget = GetDeferredBlockRequestBudget(pto);
+    size_t nHave = 0;
+    size_t nOwned = 0;
+    size_t nQueued = 0;
+    size_t nInflight = 0;
+    size_t nRequestable = 0;
+    size_t nUnknownAvailability = 0;
+    size_t nAdmitted = 0;
+    uint256 frontHash = uint256(0);
+    int frontHeight = -1;
+    NodeId frontOwner = -1;
+    BlockRequestOwnerState frontOwnerState = BLOCK_REQUEST_OWNER_QUEUED;
+    int64_t frontAssignedUs = 0;
+    size_t frontAlternatives = 0;
+    CTxDB txdb("r");
+    for (std::vector<uint256>::const_iterator it = window.begin();
+         it != window.end(); ++it)
+    {
+        const uint256& hash = *it;
+        const CIbdHeaderNode* node = g_ibdHeadersObserver.Graph().Lookup(hash);
+        const int nHeight = node ? node->height : -1;
+        if (AlreadyHave(txdb, CInv(MSG_BLOCK, hash)))
+        {
+            ++nHave;
+            continue;
+        }
+
+        const std::vector<CNode*> candidates =
+            IbdHeaderSchedulerCandidatePeers(hash, vNodesCopy);
+        if (frontHash == 0)
+        {
+            frontHash = hash;
+            frontHeight = nHeight;
+            frontAlternatives = candidates.size();
+        }
+
+        NodeId ownerPeer = -1;
+        BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+        int64_t assignedUs = 0;
+        if (GetBlockRequestOwnerDetails(hash, &ownerPeer, &ownerState,
+                                        &assignedUs))
+        {
+            if (frontHash == hash)
+            {
+                frontOwner = ownerPeer;
+                frontOwnerState = ownerState;
+                frontAssignedUs = assignedUs;
+            }
+            ++nOwned;
+            if (ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)
+                ++nInflight;
+            else
+                ++nQueued;
+            continue;
+        }
+
+        if (candidates.empty())
+        {
+            ++nUnknownAvailability;
+            continue;
+        }
+
+        ++nRequestable;
+        if (nBudget <= 0)
+            continue;
+        CNode* pBest = IbdHeaderSchedulerBestPeerForHash(hash, candidates);
+        if (pBest != pto)
+            continue;
+
+        if (pto->AskFor(CInv(MSG_BLOCK, hash),
+                        BLOCKREQ_SOURCE_HEADERS_SCHEDULER) == ASKFOR_QUEUED)
+        {
+            ++nAdmitted;
+            --nBudget;
+            ++g_ibdHeaderSchedulerState.refillAdmissions;
+        }
+    }
+
+    printf("IBD_HEADERS_SCHED event=refill peer=%d frontier_height=%d graph_tip_height=%d lookahead=%d window_size=%zu front_hash=%s front_height=%d front_owner=%d front_owner_state=%s front_age_us=%lld front_alternatives=%zu have=%zu owned=%zu queued=%zu inflight=%zu requestable=%zu unknown_availability=%zu admitted=%zu peer_pressure=%d\n",
+           pto->GetId(), pindexBest->nHeight,
+           graphTip ? graphTip->height : -1, nLookahead, window.size(),
+           frontHash == 0 ? "none" : frontHash.ToString().c_str(),
+           frontHeight, frontOwner,
+           frontHash == 0 ? "none" : BlockRequestOwnerStateName(frontOwnerState),
+           frontAssignedUs > 0 ? (long long)(GetTimeMicros() - frontAssignedUs) : -1LL,
+           frontAlternatives, nHave, nOwned, nQueued, nInflight,
+           nRequestable, nUnknownAvailability, nAdmitted,
+           (int)pto->peerLiveActivePressure.load(std::memory_order_relaxed));
+    return nAdmitted;
+}
+
+size_t RefillOrderedHeaderBlockRequestsForTesting(
+    const std::vector<CNode*>& vNodesCopy)
+{
+    LOCK(cs_main);
+    size_t nTotal = 0;
+    for (std::vector<CNode*>::const_iterator it = vNodesCopy.begin();
+         it != vNodesCopy.end(); ++it)
+        nTotal += RefillOrderedHeaderBlockRequests(*it, vNodesCopy);
+    return nTotal;
 }
 
 static void TraceDeferredWindowState(CNode* pfrom, const char* pszEvent,
@@ -3621,7 +4011,7 @@ bool IsInitialBlockDownload()
             nFreshPeerLastBlockRecv, nLocalLastBlockRecv);
         return fInitialBlockDownload;
     };
-    if (fRegTest && pindexBest != NULL)
+    if (fRegTest && !fRegTestIbd && pindexBest != NULL)
         return RecordAndReturn(false, ibdactivepath::IBD_REASON_REGTEST);
     if (fImporting || fReindex || pindexBest == NULL)
         return RecordAndReturn(true,
@@ -6451,7 +6841,7 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
         ::SetBestChain(locator);
     }
 
-    if (fIbdHeadersObserve)
+    if (IbdHeadersControlPlaneEnabled())
         TraceIbdHeadersObserverEvent("connect", NULL, hash, pindexNew->nHeight);
     // New best block
     hashBestChain = hash;
@@ -6460,7 +6850,7 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     nBestHeight = pindexBest->nHeight;
     nBestChainTrust = pindexNew->nChainTrust;
     nTimeBestReceived = GetTime();
-    if (fIbdHeadersObserve)
+    if (IbdHeadersControlPlaneEnabled())
         g_ibdHeadersObserver.UpdateAnchor(hashBestChain, nBestHeight);
     mempool.AddTransactionsUpdated(1);
     // A new active tip invalidates the locator context of any pending
@@ -7612,9 +8002,10 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             int nOrphansFromPeer = 0;
             if (PeerOrphanStorageLimitExceeded(pfrom->GetId(),
                                                &nOrphansFromPeer)) {
-                pfrom->PushGetBlocks(
-                    pindexBest, uint256(0),
-                    ibdmetrics::GETBLOCKS_SOURCE_ORPHAN_LIMIT);
+                if (!IbdHeaderSchedulerSelectActive())
+                    pfrom->PushGetBlocks(
+                        pindexBest, uint256(0),
+                        ibdmetrics::GETBLOCKS_SOURCE_ORPHAN_LIMIT);
 
                 if (IsInitialBlockDownload()) {
                     // EXPTRACE HOOK: IBD orphan-limit rejection (parent
@@ -8770,7 +9161,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         // Full nodes use the historical getblocks/inv path. Header-first
         // synchronization is reserved for SPV mode, where headers are indexed.
-        if (!fSPVMode && !pfrom->fClient && !pfrom->fOneShot &&
+        if (!fSPVMode && !IbdHeaderSchedulerSelectActive() &&
+            !pfrom->fClient && !pfrom->fOneShot &&
             (pfrom->nBestKnownHeight < 0 ||
              pfrom->nBestKnownHeight > (nBestHeight - 144)) &&
             IsBlockSyncPeerVersion(pfrom->nVersion))
@@ -8828,7 +9220,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             printf("SPV: Requesting headers from peer %s\n", pfrom->addr.ToString().c_str());
             pfrom->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "spv-request");
         }
-        else if (fIbdHeadersObserve)
+        else if (IbdHeadersControlPlaneEnabled())
         {
             CBlockLocator observerLocator;
             bool requestObserver = false;
@@ -9091,7 +9483,38 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                         fFrontierResponse && !fFrontierSlotOffered;
                     fFrontierSlotOffered =
                         fFrontierSlotOffered || fFrontierCandidate;
-                    TryAdmitBlockInvOrDefer(pfrom, inv, fFrontierCandidate);
+                    if (IbdHeaderSchedulerSelectActive())
+                    {
+                        RecordIbdHeaderSchedulerInvAvailability(pfrom, inv.hash);
+                        const CIbdHeadersObserver::Classification c =
+                            g_ibdHeadersObserver.Classify(inv.hash, -1);
+                        if (c == CIbdHeadersObserver::IN_PREDICTED_WINDOW)
+                            ++g_ibdHeaderSchedulerState.invInsideWindow;
+                        else if (c == CIbdHeadersObserver::BEFORE_WINDOW)
+                            ++g_ibdHeaderSchedulerState.invBeforeWindow;
+                        else if (c == CIbdHeadersObserver::AFTER_WINDOW)
+                            ++g_ibdHeaderSchedulerState.invAfterWindow;
+                        else if (c == CIbdHeadersObserver::OFF_ACTIVE_BRANCH)
+                            ++g_ibdHeaderSchedulerState.invOffBranch;
+                        else
+                            ++g_ibdHeaderSchedulerState.invUnknown;
+                        ++g_ibdHeaderSchedulerState.invPrevented;
+                        printf("IBD_HEADERS_SCHED event=inv peer=%d hash=%s class=%s active_admission=prevented frontier_candidate=%d\n",
+                               pfrom->GetId(), inv.hash.ToString().c_str(),
+                               CIbdHeadersObserver::ClassificationName(c),
+                               fFrontierCandidate ? 1 : 0);
+                        if (c == CIbdHeadersObserver::UNKNOWN_TO_GRAPH &&
+                            !pfrom->getHeadersSync.IsInFlight())
+                        {
+                            CBlockLocator observerLocator;
+                            if (PrepareIbdHeadersObserverRequest(pfrom, observerLocator))
+                                pfrom->PushGetHeaders(observerLocator, uint256(0),
+                                                      "ibd-select-inv");
+                        }
+                        RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
+                    }
+                    else
+                        TryAdmitBlockInvOrDefer(pfrom, inv, fFrontierCandidate);
                 }
                 else
                     pfrom->AskFor(inv, BLOCKREQ_SOURCE_INV);
@@ -9106,7 +9529,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                         CInv(MSG_BLOCK, hashWanted),
                         BLOCKREQ_SOURCE_ORPHAN);
                 }
-                else
+                else if (!IbdHeaderSchedulerSelectActive())
                     pfrom->PushGetBlocks(
                         pindexBest, GetOrphanRoot(pblockOrphan),
                         ibdmetrics::GETBLOCKS_SOURCE_INV_CONTINUATION);
@@ -9116,7 +9539,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 // this situation. Do not paginate our main chain from a peer that cannot advance
                 // it, but retain the historical side-chain continuation path.
                 std::map<uint256, CBlockIndex*>::iterator miLast = mapBlockIndex.find(inv.hash);
-                if (miLast != mapBlockIndex.end() &&
+                if (!IbdHeaderSchedulerSelectActive() &&
+                    miLast != mapBlockIndex.end() &&
                     pfrom->ShouldContinueKnownBlockInventory(
                         nBestHeight, miLast->second->IsInMainChain()))
                 {
@@ -9501,7 +9925,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         const int64_t nHeadersCsMainWaitBegin = GetTimeMicros();
         LOCK(cs_main);
         const int64_t nHeadersCsMainAcquired = GetTimeMicros();
-        if (fIbdHeadersObserve)
+        if (IbdHeadersControlPlaneEnabled())
             printf("IBD_HEADER_DISPATCH event=cs_main_acquired peer=%lld wait_begin_us=%lld acquired_us=%lld wait_us=%lld\n",
                (long long)pfrom->GetId(),
                (long long)nHeadersCsMainWaitBegin,
@@ -9511,7 +9935,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         RecordGetHeadersResponse(pfrom, vHeaders.size(), nHeadersBytes);
 
         CIbdHeadersObserver::HeaderResult observerResult;
-        if (fIbdHeadersObserve && !fSPVMode && IsInitialBlockDownload() && pindexBest)
+        if (IbdHeadersControlPlaneEnabled() && !fSPVMode && IsInitialBlockDownload() && pindexBest)
         {
             g_ibdHeadersObserver.SetEnabled(true);
             g_ibdHeadersObserver.UpdateAnchor(pindexBest->GetBlockHash(), pindexBest->nHeight);
@@ -9635,7 +10059,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 if (fDebug) printf("Header %s has unknown parent %s, waiting for in-flight blocks\n",
                        hash.ToString().substr(0,20).c_str(),
                        header.hashPrevBlock.ToString().substr(0,20).c_str());
-                if (!fSPVMode)
+                if (!fSPVMode && !IbdHeaderSchedulerSelectActive())
                     pfrom->PushGetBlocks(
                         pindexBest, uint256(0),
                         ibdmetrics::GETBLOCKS_SOURCE_HEADERS);
@@ -9743,7 +10167,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
 
         // In full node mode, request full blocks for announced headers
-        if (!fSPVMode && !vGetData.empty())
+        if (!fSPVMode && !IbdHeaderSchedulerSelectActive() && !vGetData.empty())
         {
             vector<CInv> vOwnedGetData;
             for (const CInv& inv : vGetData)
@@ -9773,7 +10197,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     BlockRequestTraceInFlightMark(pfrom, inv.hash, false);
             }
             vGetData.swap(vOwnedGetData);
-            if (fIbdHeadersObserve)
+            if (IbdHeadersControlPlaneEnabled())
                 for (const CInv& inv : vGetData)
                     TraceIbdHeadersObserverEvent("request", pfrom, inv.hash, -1);
             if (fDebug)
@@ -9940,7 +10364,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 ibdactivepath::MonotonicMicros() - nIBDCsMainWaitStart);
         blockLockDiagnostics.Acquired();
         bool fKnownBefore = mapBlockIndex.count(hashBlock) != 0;
-        if (fIbdHeadersObserve)
+        if (IbdHeadersControlPlaneEnabled())
         {
             int observedHeight = -1;
             std::map<uint256, CBlockIndex*>::const_iterator observedIndex =
@@ -10146,7 +10570,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
             int nPrefetchThreshold = (pfrom->nExpectedBatchSize * 3) / 4;
 
-            if (!pfrom->fPrefetchSent && pfrom->nBlocksReceivedInBatch >= nPrefetchThreshold)
+            if (!IbdHeaderSchedulerSelectActive() &&
+                !pfrom->fPrefetchSent && pfrom->nBlocksReceivedInBatch >= nPrefetchThreshold)
             {
                 if (pfrom->hashLastBlockInBatch != 0 && mapBlockIndex.count(pfrom->hashLastBlockInBatch))
                 {
@@ -10215,7 +10640,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             else if (!fPipelineDrained)
                 ibdmetrics::Get().pipeline_drained_skip_other_condition.fetch_add(
                     1, std::memory_order_relaxed);
-            if (fPeerAhead && fPipelineDrained && fCooldownExpired)
+            if (!IbdHeaderSchedulerSelectActive() &&
+                fPeerAhead && fPipelineDrained && fCooldownExpired)
             {
                 if (fDebugNet)
                 {
@@ -10632,7 +11058,7 @@ bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
     size_t nPriorityIndex = std::numeric_limits<size_t>::max();
     size_t nPriorityScannedBytes = 0;
     size_t nPriorityScannedMessages = 0;
-    if (fIbdHeadersObserve && !fSPVMode &&
+    if (IbdHeadersControlPlaneEnabled() && !fSPVMode &&
         pfrom->getHeadersSync.IsInFlight())
     {
         const size_t nMaxMessages = 256;
@@ -10763,7 +11189,7 @@ bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
             }
             if (PingLifecycleTraceEnabled() && strCommand == "pong")
                 PingLifecycleTracePongProcessBegin(pfrom, msg.nTime);
-            if (fIbdHeadersObserve && strCommand == "headers")
+            if (IbdHeadersControlPlaneEnabled() && strCommand == "headers")
                 printf("IBD_HEADER_DISPATCH event=dispatch_begin peer=%lld frame_us=%lld dispatch_us=%lld priority=%d\n",
                        (long long)pfrom->GetId(), (long long)msg.nTime,
                        (long long)GetTimeMicros(), fPrioritySelected ? 1 : 0);
@@ -10869,7 +11295,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
     //
     if (pto->fStartSync && !fImporting && !fReindex) {
         pto->fStartSync = false;
-        if (!fSPVMode && pto->CanAdvanceBlockSync(nBestHeight))
+        if (!fSPVMode && !IbdHeaderSchedulerSelectActive() &&
+            pto->CanAdvanceBlockSync(nBestHeight))
         {
             if (!pto->fInitialSyncRequestSent &&
                 pto->PushGetBlocks(
@@ -10956,12 +11383,15 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
         if (lockMain)
         {
             sendLockDiagnostics.Acquired();
-            RefillDeferredBlockRequests(pto, vNodesCopy);
+            if (IbdHeaderSchedulerSelectActive())
+                RefillOrderedHeaderBlockRequests(pto, vNodesCopy);
+            else
+                RefillDeferredBlockRequests(pto, vNodesCopy);
 
         if (fSPVMode && pto->getHeadersSync.IsTimedOut(GetTime()))
             pto->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "timeout-retry");
 
-        if (fIbdHeadersObserve && !fSPVMode &&
+        if (IbdHeadersControlPlaneEnabled() && !fSPVMode &&
             pto->getHeadersSync.IsTimedOut(GetTime()))
         {
             CBlockLocator observerLocator;
@@ -11298,7 +11728,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                     pto->MarkBlockInFlight(inv.hash);
                     ibdactivepath::RecordBlockRequestSent(inv.hash);
                     ibdblocklatency::RecordGetDataSent(inv.hash, pto->GetId());
-                    if (fIbdHeadersObserve)
+                    if (IbdHeadersControlPlaneEnabled())
                         TraceIbdHeadersObserverEvent("request", pto, inv.hash, -1);
                     if (fTraceBlockRequest)
                         BlockRequestTraceInFlightMark(pto, inv.hash, true);

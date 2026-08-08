@@ -470,7 +470,19 @@ extern bool fMinimizeCoinAge;
 
 extern bool fSPVMode;
 extern bool fIbdHeadersObserve;
+extern bool fIbdHeaderScheduler;
+extern bool fRegTestIbd;
+bool IbdHeadersControlPlaneEnabled();
 void IbdHeadersObserverPeerDisconnected(NodeId peer);
+
+void ResetIbdHeaderSchedulerStateForTesting();
+bool SeedIbdHeaderSchedulerAnchorForTesting(const uint256& hash, int height);
+bool SeedIbdHeaderSchedulerHeadersForTesting(NodeId peer,
+    const std::vector<std::pair<uint256, uint256> >& headers);
+void SeedIbdHeaderSchedulerInvAvailabilityForTesting(NodeId peer,
+    const uint256& hash);
+size_t RefillOrderedHeaderBlockRequestsForTesting(
+    const std::vector<CNode*>& vNodesCopy);
 extern bool fSPVHeadersOnly;
 extern int nSPVStartHeight;
 

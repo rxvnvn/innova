@@ -237,6 +237,12 @@ static int64_t SyncPeerScore(const CNode* pnode, int64_t nNow, int64_t nMaxPeerH
     return nScore;
 }
 
+int64_t GetIbdSyncPeerScore(const CNode* pnode, int64_t nNow,
+                              int64_t nMaxPeerHeight)
+{
+    return SyncPeerScore(pnode, nNow, nMaxPeerHeight);
+}
+
 static bool CompareSyncCandidates(const std::pair<int64_t, CNode*>& a, const std::pair<int64_t, CNode*>& b)
 {
     if (a.first != b.first)
@@ -3188,6 +3194,24 @@ bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
     return true;
 }
 
+bool GetBlockRequestOwnerDetails(const uint256& hash, NodeId* ownerPeer,
+                                 BlockRequestOwnerState* ownerState,
+                                 int64_t* assignedUs)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwner>::const_iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+        return false;
+    if (ownerPeer)
+        *ownerPeer = it->second.peer;
+    if (ownerState)
+        *ownerState = it->second.state;
+    if (assignedUs)
+        *assignedUs = it->second.assignedUs;
+    return true;
+}
+
 bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer)
 {
     LOCK(cs_mapAlreadyAskedFor);
@@ -4245,6 +4269,8 @@ static const char* BlockRequestTraceSourceName(BlockRequestTraceSource source)
         return "askfor";
     case BLOCKREQ_SOURCE_INV:
         return "inv";
+    case BLOCKREQ_SOURCE_HEADERS_SCHEDULER:
+        return "headers-scheduler";
     case BLOCKREQ_SOURCE_HEADERS_DIRECT:
         return "headers-direct";
     case BLOCKREQ_SOURCE_ORPHAN:
@@ -7021,7 +7047,7 @@ bool CNode::ReceiveMsgBytes(const char *pch, unsigned int nBytes)
 
         if (msg.complete()) {
             msg.nTime = GetTimeMicros();
-            if (fIbdHeadersObserve && msg.hdr.GetCommand() == "headers")
+            if (IbdHeadersControlPlaneEnabled() && msg.hdr.GetCommand() == "headers")
                 printf("IBD_HEADER_DISPATCH event=frame_complete peer=%lld frame_us=%lld bytes=%u queue_messages=%zu\n",
                        (long long)GetId(), (long long)msg.nTime,
                        msg.hdr.nMessageSize, vRecvMsg.size());

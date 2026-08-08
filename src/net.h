@@ -577,6 +577,8 @@ static const size_t MAX_DEFERRED_BLOCK_INV_REFILL_WORK = 256;
 // are rejected and fall back to the default.  The configured value is read
 // once and cached at first use; hot paths must not re-read the argument.
 int GetMaxActiveBlockRequestsPerPeer();
+int64_t GetIbdSyncPeerScore(const CNode* pnode, int64_t nNow,
+                              int64_t nMaxPeerHeight);
 
 // Test hook: force the cached -ibdmaxactiveperpeer value to reload from
 // mapArgs on the next GetMaxActiveBlockRequestsPerPeer() call.
@@ -613,6 +615,9 @@ bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
                                       BlockRequestOwnerState* existingState = NULL);
 bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
                           BlockRequestOwnerState* ownerState);
+bool GetBlockRequestOwnerDetails(const uint256& hash, NodeId* ownerPeer,
+                                 BlockRequestOwnerState* ownerState,
+                                 int64_t* assignedUs);
 bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer);
 bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
                               const char* pszReason);

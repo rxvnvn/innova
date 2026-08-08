@@ -557,6 +557,8 @@ std::string HelpMessage()
         "  -hybridspv             " + _("Run in hybrid SPV mode (optimized for constrained devices like Pi)") + "\n" +
         "  -maxheaders=<n>       " + _("Maximum block headers to keep in memory in SPV mode (default: 50000)") + "\n" +
         "  -ibdheadersobserve    " + _("Observe an ordered IBD header frontier without changing block requests") + "\n" +
+        "  -ibdheaderscheduler  " + _("Select IBD block requests from the ordered header window (experimental)") + "\n" +
+        "  -regtestibd          " + _("Enable experimental normal IBD evaluation on regtest") + "\n" +
         "  -spvutxocachesize=<n> " + _("Maximum SPV UTXO cache entries (default: 10000, Pi: 1000)") + "\n" +
         "  -cnsyncslots=<n>      " + _("Collateral node slots reserved for sync during IBD (default: 4)") + "\n" +
         "  -mixingpoolsize=<n>   " + _("NullSend mixing pool size (2-16, default: 5)") + "\n" +
@@ -885,6 +887,8 @@ bool AppInit2()
 
     fSPVMode = GetBoolArg("-spv", false);
     fIbdHeadersObserve = GetBoolArg("-ibdheadersobserve", false);
+    fIbdHeaderScheduler = GetBoolArg("-ibdheaderscheduler", false);
+    fRegTestIbd = GetBoolArg("-regtestibd", false);
     nSPVStartHeight = GetArg("-spvstartheight", 0);
     fHybridSPV = GetBoolArg("-hybridspv", false);
 

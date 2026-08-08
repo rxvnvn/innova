@@ -1253,6 +1253,184 @@ BOOST_AUTO_TEST_CASE(peer_stats_query_does_not_expire_stale_block_request)
     BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hashInFlight), 1U);
 }
 
+BOOST_AUTO_TEST_CASE(regtest_ibd_override_is_explicit_and_normal)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    const bool regSaved = fRegTest;
+    const bool regIbdSaved = fRegTestIbd;
+    const bool importingSaved = fImporting;
+    const bool reindexSaved = fReindex;
+    const int heightSaved = nBestHeight;
+    std::vector<CNode*> nodesSaved;
+    {
+        LOCK(cs_vNodes);
+        nodesSaved = vNodes;
+        vNodes.clear();
+    }
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(56), "regtest-ibd-override", true);
+    fRegTest = true;
+    fImporting = false;
+    fReindex = false;
+    fRegTestIbd = false;
+    nBestHeight = Checkpoints::GetTotalBlocksEstimate();
+    peer.fClient = false;
+    peer.nBestKnownHeight = nBestHeight + 100;
+    peer.nChainHeight = nBestHeight + 100;
+    peer.nLastHeightUpdate = GetTime();
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peer);
+    }
+
+    BOOST_CHECK(!IsInitialBlockDownload());
+
+    fRegTestIbd = true;
+    BOOST_CHECK(IsInitialBlockDownload());
+
+    peer.nBestKnownHeight = nBestHeight;
+    peer.nChainHeight = nBestHeight;
+    peer.nLastHeightUpdate = GetTime();
+    peer.setBlocksInFlight.clear();
+    peer.mapBlockInFlightSince.clear();
+    BOOST_CHECK(!IsInitialBlockDownload());
+
+    {
+        LOCK(cs_vNodes);
+        vNodes = nodesSaved;
+    }
+    nBestHeight = heightSaved;
+    fReindex = reindexSaved;
+    fImporting = importingSaved;
+    fRegTestIbd = regIbdSaved;
+    fRegTest = regSaved;
+}
+
+
+BOOST_AUTO_TEST_CASE(regtest_ibd_override_does_not_change_mainnet_or_testnet)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    const bool regSaved = fRegTest;
+    const bool testnetSaved = fTestNet;
+    const bool regIbdSaved = fRegTestIbd;
+    const bool importingSaved = fImporting;
+    const bool reindexSaved = fReindex;
+    const int heightSaved = nBestHeight;
+    std::vector<CNode*> nodesSaved;
+    {
+        LOCK(cs_vNodes);
+        nodesSaved = vNodes;
+        vNodes.clear();
+    }
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(57), "non-regtest-ibd-override", true);
+    fImporting = false;
+    fReindex = false;
+    nBestHeight = Checkpoints::GetTotalBlocksEstimate();
+    peer.fClient = false;
+    peer.nBestKnownHeight = nBestHeight + 100;
+    peer.nChainHeight = nBestHeight + 100;
+    peer.nLastHeightUpdate = GetTime();
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peer);
+    }
+
+    fRegTest = false;
+    fTestNet = false;
+    fRegTestIbd = false;
+    const bool mainnetWithoutOverride = IsInitialBlockDownload();
+    fRegTestIbd = true;
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), mainnetWithoutOverride);
+
+    fRegTest = false;
+    fTestNet = true;
+    fRegTestIbd = false;
+    const bool testnetWithoutOverride = IsInitialBlockDownload();
+    fRegTestIbd = true;
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), testnetWithoutOverride);
+
+    {
+        LOCK(cs_vNodes);
+        vNodes = nodesSaved;
+    }
+    nBestHeight = heightSaved;
+    fReindex = reindexSaved;
+    fImporting = importingSaved;
+    fRegTestIbd = regIbdSaved;
+    fTestNet = testnetSaved;
+    fRegTest = regSaved;
+}
+
+BOOST_AUTO_TEST_CASE(regtest_ibd_override_is_independent_from_headers_scheduler_flag)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    const bool regSaved = fRegTest;
+    const bool regIbdSaved = fRegTestIbd;
+    const bool schedulerSaved = fIbdHeaderScheduler;
+    const bool observeSaved = fIbdHeadersObserve;
+    const bool importingSaved = fImporting;
+    const bool reindexSaved = fReindex;
+    const bool spvSaved = fSPVMode;
+    const int heightSaved = nBestHeight;
+    std::vector<CNode*> nodesSaved;
+    {
+        LOCK(cs_vNodes);
+        nodesSaved = vNodes;
+        vNodes.clear();
+    }
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(58), "regtest-scheduler-independence", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    fRegTest = true;
+    fRegTestIbd = false;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fImporting = false;
+    fReindex = false;
+    fSPVMode = false;
+    nBestHeight = Checkpoints::GetTotalBlocksEstimate();
+    peer.fClient = false;
+    peer.fOneShot = false;
+    peer.fDisconnect = false;
+    peer.nBestKnownHeight = nBestHeight + 100;
+    peer.nChainHeight = nBestHeight + 100;
+    peer.nLastHeightUpdate = GetTime();
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peer);
+    }
+
+    BOOST_CHECK(!IsInitialBlockDownload());
+    ResetIbdHeaderSchedulerStateForTesting();
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(600), 1500));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.push_back(std::make_pair(uint256(601), uint256(600)));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(), uint256(601));
+
+    std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK(peer.setAskForBlocks.empty());
+    BOOST_CHECK(!HasCommand(SentCommands(peer), "getheaders"));
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    {
+        LOCK(cs_vNodes);
+        vNodes = nodesSaved;
+    }
+    nBestHeight = heightSaved;
+    fSPVMode = spvSaved;
+    fReindex = reindexSaved;
+    fImporting = importingSaved;
+    fIbdHeadersObserve = observeSaved;
+    fIbdHeaderScheduler = schedulerSaved;
+    fRegTestIbd = regIbdSaved;
+    fRegTest = regSaved;
+}
+
 BOOST_AUTO_TEST_CASE(initial_block_download_query_does_not_expire_stale_request)
 {
     CNode peer(INVALID_SOCKET, TestPeerAddress(21), "ibd-query-peer", true);
@@ -8902,6 +9080,216 @@ BOOST_AUTO_TEST_CASE(disconnect_before_extraction_preserves_queued_frame)
         BOOST_REQUIRE(ProcessMessages(&peer, criticalblock));
         BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 1U);
     }
+}
+
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_refill_selects_only_active_window_hashes)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(83), "sched-window", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(100), 500));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.push_back(std::make_pair(uint256(101), uint256(100)));
+    headers.push_back(std::make_pair(uint256(102), uint256(101)));
+    headers.push_back(std::make_pair(uint256(103), uint256(102)));
+    headers.push_back(std::make_pair(uint256(104), uint256(103)));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    for (int i = 101; i <= 104; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(), uint256(i));
+
+    std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 4U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(101)));
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(102)));
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(103)));
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(104)));
+    BOOST_CHECK(!peer.IsBlockAskForQueued(uint256(105)));
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_refill_distributes_by_candidate_peer)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(84), "sched-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(85), "sched-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+    }
+
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(200), 700));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.push_back(std::make_pair(uint256(201), uint256(200)));
+    headers.push_back(std::make_pair(uint256(202), uint256(201)));
+    headers.push_back(std::make_pair(uint256(203), uint256(202)));
+    headers.push_back(std::make_pair(uint256(204), uint256(203)));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headers));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerA.GetId(), uint256(201));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB.GetId(), uint256(202));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerA.GetId(), uint256(203));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB.GetId(), uint256(204));
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 4U);
+    BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(201)));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(uint256(201)));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(uint256(202)));
+    BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(203)));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(uint256(204)));
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_owned_hash_blocks_duplicate_assignment)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(86), "sched-owner-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(87), "sched-owner-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+    }
+
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(300), 900));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.push_back(std::make_pair(uint256(301), uint256(300)));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headers));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerA.GetId(), uint256(301));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB.GetId(), uint256(301));
+    BOOST_REQUIRE_EQUAL(peerA.AskFor(CInv(MSG_BLOCK, uint256(301)), BLOCKREQ_SOURCE_INV), ASKFOR_QUEUED);
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(301)));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(uint256(301)));
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_disconnect_release_makes_hash_requestable_again)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(88), "sched-rel-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(89), "sched-rel-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+    }
+
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(400), 1000));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.push_back(std::make_pair(uint256(401), uint256(400)));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headers));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerA.GetId(), uint256(401));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB.GetId(), uint256(401));
+    BOOST_REQUIRE_EQUAL(peerA.AskFor(CInv(MSG_BLOCK, uint256(401)), BLOCKREQ_SOURCE_INV), ASKFOR_QUEUED);
+    peerA.ClearAskFor();
+    BOOST_CHECK_EQUAL(ReleaseBlockRequestOwnersForPeer(peerA.GetId(), "disconnect"), 0U);
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
+    BOOST_CHECK(peerB.IsBlockAskForQueued(uint256(401)) || peerA.IsBlockAskForQueued(uint256(401)));
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_empty_window_requests_headers_not_blocks)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(90), "sched-empty", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(500), 1200));
+    std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK(peer.setAskForBlocks.empty());
+    BOOST_CHECK(peer.getBlocksIndex.empty());
+    BOOST_CHECK(HasCommand(SentCommands(peer), "getheaders"));
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

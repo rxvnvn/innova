@@ -544,6 +544,13 @@ std::vector<uint256> CIbdHeadersObserver::PredictedWindow() const
     return m_graph.GetActiveWindow(m_graph.AnchorHash(), m_window_size);
 }
 
+std::vector<uint256> CIbdHeadersObserver::PredictedWindowFromFrontier(
+    const uint256& frontier) const
+{
+    if (!m_enabled || !m_graph.HasAnchor()) return std::vector<uint256>();
+    return m_graph.GetActiveWindow(frontier, m_window_size);
+}
+
 CIbdHeadersObserver::Classification CIbdHeadersObserver::Classify(
     const uint256& hash, int authoritativeHeight) const
 {
@@ -573,6 +580,16 @@ std::size_t CIbdHeadersObserver::PeerSupport(const uint256& hash) const
 {
     std::map<uint256, std::set<int64_t> >::const_iterator it = m_sources.find(hash);
     return it == m_sources.end() ? 0 : it->second.size();
+}
+
+std::vector<int64_t> CIbdHeadersObserver::HeaderSources(const uint256& hash) const
+{
+    std::vector<int64_t> out;
+    std::map<uint256, std::set<int64_t> >::const_iterator it = m_sources.find(hash);
+    if (it == m_sources.end())
+        return out;
+    out.assign(it->second.begin(), it->second.end());
+    return out;
 }
 
 const char* CIbdHeadersObserver::ClassificationName(Classification c)

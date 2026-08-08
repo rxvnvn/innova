@@ -174,7 +174,9 @@ public:
     Classification Classify(const uint256& hash, int authoritativeHeight = -1) const;
     void RecordClassification(unsigned int eventKind, Classification classification);
     std::vector<uint256> PredictedWindow() const;
+    std::vector<uint256> PredictedWindowFromFrontier(const uint256& frontier) const;
     std::size_t PeerSupport(const uint256& hash) const;
+    std::vector<int64_t> HeaderSources(const uint256& hash) const;
     const CIbdHeaderGraph& Graph() const { return m_graph; }
     const Counters& Stats() const { return m_counters; }
     std::size_t WindowSize() const { return m_window_size; }
