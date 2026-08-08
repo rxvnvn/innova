@@ -1,0 +1,130 @@
+// Copyright (c) 2026 The Innova developers
+// Distributed under the MIT/X11 software license, see the accompanying
+// file COPYING or http://www.opensource.org/licenses/mit-license.php.
+
+#ifndef INNOVA_IBDHEADERSCHEDULER_H
+#define INNOVA_IBDHEADERSCHEDULER_H
+
+#include "uint256.h"
+
+#include <cstddef>
+#include <map>
+#include <set>
+#include <vector>
+
+/**
+ * Scheduler-only structural knowledge about one header hash.
+ *
+ * This type carries no proof or consensus-validity claim.  In particular it
+ * is deliberately independent of CBlockIndex and mapBlockIndex.
+ */
+struct CIbdHeaderNode
+{
+    enum State
+    {
+        AUTHORITATIVE_ANCHOR,
+        ACTIVE,
+        ELIGIBLE,
+        QUARANTINED
+    };
+
+    uint256 hash;
+    uint256 prev;
+    int height;
+    State state;
+    bool permanently_quarantined;
+    std::set<uint256> children;
+
+    CIbdHeaderNode();
+    CIbdHeaderNode(const uint256& hashIn, const uint256& prevIn);
+
+    bool IsAnchored() const { return height >= 0; }
+    bool IsUsable() const
+    {
+        return IsAnchored() && !permanently_quarantined &&
+               state != QUARANTINED;
+    }
+};
+
+/**
+ * Isolated provisional header graph for future IBD scheduling.
+ *
+ * Locking: none.  The owning scheduler must serialize every call (the Stage 1
+ * design requires cs_main).  Tests use it single-threaded.
+ *
+ * Lifetime: nodes are owned by value in m_nodes and refer to relatives only by
+ * hash.  No pointer into authoritative block-index state is retained.
+ */
+class CIbdHeaderGraph
+{
+public:
+    enum InsertResult
+    {
+        INSERTED_ACTIVE,
+        INSERTED_ELIGIBLE,
+        INSERTED_QUARANTINED,
+        DUPLICATE,
+        CONFLICT
+    };
+
+    CIbdHeaderGraph();
+
+    void Clear();
+    bool Empty() const { return m_nodes.empty(); }
+    std::size_t Size() const { return m_nodes.size(); }
+
+    /** Reset the graph around one immutable authoritative hash/height anchor. */
+    bool SetAuthoritativeAnchor(const uint256& hash, int height);
+    bool HasAnchor() const { return m_has_anchor; }
+    const uint256& AnchorHash() const { return m_anchor_hash; }
+    int AnchorHeight() const { return m_anchor_height; }
+
+    /** Insert structural identity.  Height is always derived from ancestry. */
+    InsertResult Insert(const uint256& hash, const uint256& prev);
+
+    const CIbdHeaderNode* Lookup(const uint256& hash) const;
+
+    /** Return hash's ancestor at targetHeight; self is allowed. */
+    bool GetAncestor(const uint256& hash, int targetHeight,
+                     uint256& ancestorOut) const;
+    bool IsDescendantOf(const uint256& hash,
+                        const uint256& ancestor) const;
+
+    /**
+     * Select an already anchored, non-quarantined branch as the active
+     * scheduler path.  This is explicit scheduler eligibility, not fork choice.
+     */
+    bool ActivateBranch(const uint256& tip);
+
+    /** Permanently quarantine hash and all known descendants. */
+    bool QuarantineBranch(const uint256& hash);
+
+    const CIbdHeaderNode* ActiveTip() const;
+    const CIbdHeaderNode* BestKnownEligibleTip() const;
+
+    /**
+     * Enumerate the active path strictly after frontier, capped at windowSize.
+     * Returns empty if frontier is not on the active path.
+     */
+    std::vector<uint256> GetActiveWindow(const uint256& frontier,
+                                         std::size_t windowSize) const;
+
+    /** Expensive consistency check intended for deterministic tests. */
+    bool CheckInvariants() const;
+
+private:
+    typedef std::map<uint256, CIbdHeaderNode> NodeMap;
+
+    NodeMap m_nodes;
+    bool m_has_anchor;
+    uint256 m_anchor_hash;
+    int m_anchor_height;
+    uint256 m_active_tip;
+
+    void ConnectDescendants(const uint256& parentHash);
+    void ExtendActiveTipIfUnambiguous();
+    void MarkActivePath(const uint256& tip);
+    void QuarantineDescendants(const uint256& hash);
+};
+
+#endif // INNOVA_IBDHEADERSCHEDULER_H
