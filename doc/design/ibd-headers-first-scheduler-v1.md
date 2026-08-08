@@ -446,6 +446,28 @@ the model, request/continue headers, and record predicted selections. Modify
 must issue no block request and alter no admission decision. Compare predicted
 next set with blocks that actually connect under the control scheduler.
 
+Implemented Stage-1 ownership and isolation facts:
+
+- `-ibdheadersobserve` is a startup boolean and defaults off. The process-owned
+  `CIbdHeadersObserver` and `CIbdHeaderGraph` are mutated only under `cs_main`;
+  neither has an internal mutex or retains a `CBlockIndex*`.
+- Suitable full peers are actively queried during IBD. Continuation uses the
+  tested newest-provisional-to-oldest locator with the connected anchor last;
+  a 2000-header response immediately advances that locator.
+- Responses to observer-originated `getheaders` are consumed only by the
+  observer. They deliberately bypass the legacy full-node `headers` block-fetch
+  loop, because allowing that loop to create `getdata` would make observation
+  alter request selection. Unsolicited legacy `headers` retain their old path.
+- Connected-tip advancement re-anchors the graph. An advance along the active
+  provisional path retains its suffix; a reorg or unknown new anchor resets
+  stale provisional state. The authoritative chain remains `pindexBest`.
+- The observation window is 512 solely for capture comparison, not a production
+  scheduler parameter. Existing request, receive, and active-connect events are
+  classified against it without feeding the result back into networking.
+- SPV request, indexing, and continuation branches remain separate and
+  unchanged. Header failure, silence, divergence, or disconnect cannot block
+  the existing INV/getblocks scheduler.
+
 ### Stage 2 — experimental selection
 
 Under `select && IsInitialBlockDownload()`:

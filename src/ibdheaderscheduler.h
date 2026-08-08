@@ -10,6 +10,8 @@
 #include <cstddef>
 #include <map>
 #include <set>
+#include <string>
+#include <utility>
 #include <vector>
 
 /**
@@ -75,6 +77,8 @@ public:
 
     /** Reset the graph around one immutable authoritative hash/height anchor. */
     bool SetAuthoritativeAnchor(const uint256& hash, int height);
+    /** Move the authoritative anchor, retaining only its active descendants. */
+    bool Reanchor(const uint256& hash, int height);
     bool HasAnchor() const { return m_has_anchor; }
     const uint256& AnchorHash() const { return m_anchor_hash; }
     int AnchorHeight() const { return m_anchor_height; }
@@ -129,6 +133,57 @@ private:
     void ExtendActiveTipIfUnambiguous();
     void MarkActivePath(const uint256& tip);
     void QuarantineDescendants(const uint256& hash);
+};
+
+
+/** Stage-1 observation state. It never selects, requests, or owns blocks.
+ * Locking: none. Runtime callers hold cs_main; tests are single-threaded. */
+class CIbdHeadersObserver
+{
+public:
+    enum Classification { IN_PREDICTED_WINDOW, BEFORE_WINDOW, AFTER_WINDOW,
+                          OFF_ACTIVE_BRANCH, UNKNOWN_TO_GRAPH };
+    struct Counters
+    {
+        uint64_t headerRequests, headerResponses, accepted, duplicates;
+        uint64_t disconnected, quarantined, activeBranchSwitches, anchorUpdates;
+        uint64_t classified[3][5];
+        Counters();
+    };
+    struct HeaderResult
+    {
+        bool expectedResponse, continueHeaders;
+        std::vector<uint256> continuationLocator;
+        HeaderResult() : expectedResponse(false), continueHeaders(false) {}
+    };
+
+    explicit CIbdHeadersObserver(std::size_t windowSize = 512);
+    void SetEnabled(bool enabled);
+    bool Enabled() const { return m_enabled; }
+    void Clear();
+    bool UpdateAnchor(const uint256& hash, int height);
+    void MarkHeaderRequest(int64_t peer);
+    bool IsHeaderResponseExpected(int64_t peer) const;
+    void RemovePeer(int64_t peer);
+    HeaderResult ObserveHeaders(int64_t peer,
+        const std::vector<std::pair<uint256, uint256> >& headers,
+        std::size_t continuationBatchSize = 2000);
+    Classification Classify(const uint256& hash, int authoritativeHeight = -1) const;
+    void RecordClassification(unsigned int eventKind, Classification classification);
+    std::vector<uint256> PredictedWindow() const;
+    std::size_t PeerSupport(const uint256& hash) const;
+    const CIbdHeaderGraph& Graph() const { return m_graph; }
+    const Counters& Stats() const { return m_counters; }
+    std::size_t WindowSize() const { return m_window_size; }
+    static const char* ClassificationName(Classification classification);
+
+private:
+    bool m_enabled;
+    std::size_t m_window_size;
+    CIbdHeaderGraph m_graph;
+    std::set<int64_t> m_outstanding_peers;
+    std::map<uint256, std::set<int64_t> > m_sources;
+    Counters m_counters;
 };
 
 #endif // INNOVA_IBDHEADERSCHEDULER_H

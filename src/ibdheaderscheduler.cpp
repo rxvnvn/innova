@@ -48,6 +48,25 @@ bool CIbdHeaderGraph::SetAuthoritativeAnchor(const uint256& hash, int height)
     return true;
 }
 
+bool CIbdHeaderGraph::Reanchor(const uint256& hash, int height)
+{
+    if (!m_has_anchor || hash == 0 || height < 0)
+        return false;
+    if (hash == m_anchor_hash && height == m_anchor_height)
+        return true;
+    std::vector<uint256> suffix;
+    if (IsDescendantOf(m_active_tip, hash))
+        suffix = GetActiveWindow(hash, m_nodes.size());
+    SetAuthoritativeAnchor(hash, height);
+    for (std::vector<uint256>::const_iterator it = suffix.begin();
+         it != suffix.end(); ++it)
+    {
+        const uint256 prev = it == suffix.begin() ? hash : *(it - 1);
+        Insert(*it, prev);
+    }
+    return true;
+}
+
 CIbdHeaderGraph::InsertResult CIbdHeaderGraph::Insert(
     const uint256& hash, const uint256& prev)
 {
@@ -369,4 +388,141 @@ void CIbdHeaderGraph::QuarantineDescendants(const uint256& hash)
     for (std::set<uint256>::const_iterator it = node->second.children.begin();
          it != node->second.children.end(); ++it)
         QuarantineDescendants(*it);
+}
+
+CIbdHeadersObserver::Counters::Counters()
+    : headerRequests(0), headerResponses(0), accepted(0), duplicates(0),
+      disconnected(0), quarantined(0), activeBranchSwitches(0), anchorUpdates(0)
+{
+    std::fill(&classified[0][0], &classified[0][0] + 15, 0);
+}
+
+CIbdHeadersObserver::CIbdHeadersObserver(std::size_t windowSize)
+    : m_enabled(false), m_window_size(windowSize)
+{
+}
+
+void CIbdHeadersObserver::SetEnabled(bool enabled)
+{
+    if (m_enabled == enabled) return;
+    Clear();
+    m_enabled = enabled;
+}
+
+void CIbdHeadersObserver::Clear()
+{
+    m_graph.Clear();
+    m_outstanding_peers.clear();
+    m_sources.clear();
+    m_counters = Counters();
+}
+
+bool CIbdHeadersObserver::UpdateAnchor(const uint256& hash, int height)
+{
+    if (!m_enabled || hash == 0 || height < 0) return false;
+    if (m_graph.HasAnchor() && m_graph.AnchorHash() == hash &&
+        m_graph.AnchorHeight() == height) return true;
+    bool ok = m_graph.HasAnchor() ? m_graph.Reanchor(hash, height) :
+                                   m_graph.SetAuthoritativeAnchor(hash, height);
+    if (ok) { ++m_counters.anchorUpdates;
+        for (std::map<uint256, std::set<int64_t> >::iterator it = m_sources.begin();
+             it != m_sources.end();)
+            if (!m_graph.Lookup(it->first)) m_sources.erase(it++); else ++it;
+    }
+    return ok;
+}
+
+void CIbdHeadersObserver::MarkHeaderRequest(int64_t peer)
+{
+    if (!m_enabled) return;
+    m_outstanding_peers.insert(peer); ++m_counters.headerRequests;
+}
+
+bool CIbdHeadersObserver::IsHeaderResponseExpected(int64_t peer) const
+{ return m_enabled && m_outstanding_peers.count(peer) != 0; }
+
+void CIbdHeadersObserver::RemovePeer(int64_t peer)
+{
+    m_outstanding_peers.erase(peer);
+    for (std::map<uint256, std::set<int64_t> >::iterator it = m_sources.begin();
+         it != m_sources.end(); ++it)
+        it->second.erase(peer);
+}
+
+CIbdHeadersObserver::HeaderResult CIbdHeadersObserver::ObserveHeaders(
+    int64_t peer, const std::vector<std::pair<uint256, uint256> >& headers,
+    std::size_t continuationBatchSize)
+{
+    HeaderResult result;
+    if (!m_enabled || !m_graph.HasAnchor()) return result;
+    result.expectedResponse = m_outstanding_peers.erase(peer) != 0;
+    ++m_counters.headerResponses;
+    const uint256 oldTip = m_graph.ActiveTip() ? m_graph.ActiveTip()->hash : uint256(0);
+    for (std::vector<std::pair<uint256, uint256> >::const_iterator it = headers.begin();
+         it != headers.end(); ++it)
+    {
+        CIbdHeaderGraph::InsertResult inserted = m_graph.Insert(it->first, it->second);
+        m_sources[it->first].insert(peer);
+        if (inserted == CIbdHeaderGraph::DUPLICATE) ++m_counters.duplicates;
+        else if (inserted == CIbdHeaderGraph::INSERTED_ACTIVE ||
+                 inserted == CIbdHeaderGraph::INSERTED_ELIGIBLE) ++m_counters.accepted;
+        else { ++m_counters.disconnected; ++m_counters.quarantined; }
+    }
+    const uint256 newTip = m_graph.ActiveTip() ? m_graph.ActiveTip()->hash : uint256(0);
+    if (oldTip != newTip && oldTip != m_graph.AnchorHash() &&
+        !m_graph.IsDescendantOf(newTip, oldTip))
+        ++m_counters.activeBranchSwitches;
+    result.continueHeaders = result.expectedResponse && oldTip != newTip &&
+                             continuationBatchSize > 0 &&
+                             headers.size() >= continuationBatchSize;
+    if (result.continueHeaders) result.continuationLocator = m_graph.BuildContinuationLocator();
+    return result;
+}
+
+std::vector<uint256> CIbdHeadersObserver::PredictedWindow() const
+{
+    if (!m_enabled || !m_graph.HasAnchor()) return std::vector<uint256>();
+    return m_graph.GetActiveWindow(m_graph.AnchorHash(), m_window_size);
+}
+
+CIbdHeadersObserver::Classification CIbdHeadersObserver::Classify(
+    const uint256& hash, int authoritativeHeight) const
+{
+    if (!m_enabled || !m_graph.HasAnchor()) return UNKNOWN_TO_GRAPH;
+    if (authoritativeHeight >= 0 && authoritativeHeight <= m_graph.AnchorHeight())
+        return BEFORE_WINDOW;
+    const CIbdHeaderNode* node = m_graph.Lookup(hash);
+    if (!node) return UNKNOWN_TO_GRAPH;
+    if (node->hash == m_graph.AnchorHash()) return BEFORE_WINDOW;
+    if (node->state != CIbdHeaderNode::ACTIVE || !node->IsUsable())
+        return OFF_ACTIVE_BRANCH;
+    if (node->height <= m_graph.AnchorHeight())
+        return BEFORE_WINDOW;
+    if ((std::size_t)(node->height - m_graph.AnchorHeight()) > m_window_size)
+        return AFTER_WINDOW;
+    return IN_PREDICTED_WINDOW;
+}
+
+void CIbdHeadersObserver::RecordClassification(
+    unsigned int eventKind, Classification classification)
+{
+    if (m_enabled && eventKind < 3 && classification <= UNKNOWN_TO_GRAPH)
+        ++m_counters.classified[eventKind][classification];
+}
+
+std::size_t CIbdHeadersObserver::PeerSupport(const uint256& hash) const
+{
+    std::map<uint256, std::set<int64_t> >::const_iterator it = m_sources.find(hash);
+    return it == m_sources.end() ? 0 : it->second.size();
+}
+
+const char* CIbdHeadersObserver::ClassificationName(Classification c)
+{
+    switch (c) {
+    case IN_PREDICTED_WINDOW: return "IN_PREDICTED_WINDOW";
+    case BEFORE_WINDOW: return "BEFORE_WINDOW";
+    case AFTER_WINDOW: return "AFTER_WINDOW";
+    case OFF_ACTIVE_BRANCH: return "OFF_ACTIVE_BRANCH";
+    default: return "UNKNOWN_TO_GRAPH";
+    }
 }

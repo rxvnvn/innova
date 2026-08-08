@@ -20,6 +20,7 @@
 #include "ibdblocklatency.h"
 #include "pinglifecycletrace.h"
 #include "ibdforensic.h"
+#include "ibdheaderscheduler.h"
 #include "kernel.h"
 #include "collateral.h"
 #include "collateralnode.h"
@@ -110,6 +111,58 @@ bool fReindex = false;
 bool fAddrIndex = false;
 
 bool fSPVMode = false;
+bool fIbdHeadersObserve = false;
+static CIbdHeadersObserver g_ibdHeadersObserver(512); // OBSERVATION WINDOW, not policy
+
+static bool PrepareIbdHeadersObserverRequest(CNode* pnode, CBlockLocator& locatorOut)
+{
+    if (!fIbdHeadersObserve || fSPVMode || !pnode || pnode->fClient ||
+        pnode->fOneShot || !IsInitialBlockDownload() || !pindexBest)
+        return false;
+    g_ibdHeadersObserver.SetEnabled(true);
+    if (!g_ibdHeadersObserver.UpdateAnchor(pindexBest->GetBlockHash(),
+                                           pindexBest->nHeight))
+        return false;
+    const std::vector<uint256> hashes =
+        g_ibdHeadersObserver.Graph().BuildContinuationLocator();
+    if (hashes.empty()) return false;
+    g_ibdHeadersObserver.MarkHeaderRequest(pnode->GetId());
+    locatorOut = CBlockLocator(hashes);
+    printf("IBD_HEADERS_OBSERVE event=getheaders_intent peer=%lld locator_size=%zu locator_first=%s locator_last=%s anchor_height=%d\n",
+           (long long)pnode->GetId(), hashes.size(), hashes.front().ToString().c_str(),
+           hashes.back().ToString().c_str(), g_ibdHeadersObserver.Graph().AnchorHeight());
+    return true;
+}
+
+static void TraceIbdHeadersObserverEvent(const char* event, CNode* pnode,
+    const uint256& hash, int knownHeight)
+{
+    if (!fIbdHeadersObserve || !IsInitialBlockDownload()) return;
+    LOCK(cs_main);
+    if (!g_ibdHeadersObserver.Enabled()) return;
+    CIbdHeadersObserver::Classification c =
+        g_ibdHeadersObserver.Classify(hash, knownHeight);
+    unsigned int kind = strcmp(event, "request") == 0 ? 0 :
+                        strcmp(event, "receive") == 0 ? 1 : 2;
+    g_ibdHeadersObserver.RecordClassification(kind, c);
+    const CIbdHeaderNode* tip = g_ibdHeadersObserver.Graph().ActiveTip();
+    printf("IBD_HEADERS_OBSERVE event=%s peer=%lld hash=%s class=%s anchor_height=%d graph_tip_height=%d graph_ahead=%d\n",
+           event, pnode ? (long long)pnode->GetId() : -1LL,
+           hash.ToString().c_str(),
+           CIbdHeadersObserver::ClassificationName(c),
+           g_ibdHeadersObserver.Graph().HasAnchor() ?
+               g_ibdHeadersObserver.Graph().AnchorHeight() : -1,
+           tip ? tip->height : -1,
+           tip && g_ibdHeadersObserver.Graph().HasAnchor() ?
+               tip->height - g_ibdHeadersObserver.Graph().AnchorHeight() : -1);
+}
+
+void IbdHeadersObserverPeerDisconnected(NodeId peer)
+{
+    if (!fIbdHeadersObserve) return;
+    TRY_LOCK(cs_main, lockMain);
+    if (lockMain) g_ibdHeadersObserver.RemovePeer(peer);
+}
 bool fSPVHeadersOnly = false;
 int nSPVStartHeight = 0;
 
@@ -6398,6 +6451,8 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
         ::SetBestChain(locator);
     }
 
+    if (fIbdHeadersObserve)
+        TraceIbdHeadersObserverEvent("connect", NULL, hash, pindexNew->nHeight);
     // New best block
     hashBestChain = hash;
     pindexBest = pindexNew;
@@ -6405,6 +6460,8 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     nBestHeight = pindexBest->nHeight;
     nBestChainTrust = pindexNew->nChainTrust;
     nTimeBestReceived = GetTime();
+    if (fIbdHeadersObserve)
+        g_ibdHeadersObserver.UpdateAnchor(hashBestChain, nBestHeight);
     mempool.AddTransactionsUpdated(1);
     // A new active tip invalidates the locator context of any pending
     // frontier getblocks response; refuse the exemption rather than admit a
@@ -8771,6 +8828,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             printf("SPV: Requesting headers from peer %s\n", pfrom->addr.ToString().c_str());
             pfrom->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "spv-request");
         }
+        else if (fIbdHeadersObserve)
+        {
+            CBlockLocator observerLocator;
+            bool requestObserver = false;
+            { LOCK(cs_main); requestObserver = PrepareIbdHeadersObserverRequest(pfrom, observerLocator); }
+            if (requestObserver)
+                pfrom->PushGetHeaders(observerLocator, uint256(0), "ibd-observe-initial");
+        }
     }
 
 
@@ -9433,6 +9498,47 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         RecordGetHeadersResponse(pfrom, vHeaders.size(), nHeadersBytes);
 
+        CIbdHeadersObserver::HeaderResult observerResult;
+        if (fIbdHeadersObserve && !fSPVMode && IsInitialBlockDownload() && pindexBest)
+        {
+            g_ibdHeadersObserver.SetEnabled(true);
+            g_ibdHeadersObserver.UpdateAnchor(pindexBest->GetBlockHash(), pindexBest->nHeight);
+            std::vector<std::pair<uint256, uint256> > observedHeaders;
+            observedHeaders.reserve(vHeaders.size());
+            for (std::vector<CBlock>::const_iterator it = vHeaders.begin();
+                 it != vHeaders.end(); ++it)
+                observedHeaders.push_back(std::make_pair(it->GetHash(), it->hashPrevBlock));
+            observerResult = g_ibdHeadersObserver.ObserveHeaders(
+                pfrom->GetId(), observedHeaders);
+            const CIbdHeaderNode* graphTip = g_ibdHeadersObserver.Graph().ActiveTip();
+            const std::vector<uint256> predicted = g_ibdHeadersObserver.PredictedWindow();
+            printf("IBD_HEADERS_OBSERVE event=headers peer=%lld expected=%d count=%zu accepted=%llu duplicates=%llu disconnected=%llu quarantined=%llu window_size=%zu first=%s last=%s graph_tip_height=%d graph_ahead=%d continue=%d\n",
+                   (long long)pfrom->GetId(), observerResult.expectedResponse ? 1 : 0,
+                   vHeaders.size(),
+                   (unsigned long long)g_ibdHeadersObserver.Stats().accepted,
+                   (unsigned long long)g_ibdHeadersObserver.Stats().duplicates,
+                   (unsigned long long)g_ibdHeadersObserver.Stats().disconnected,
+                   (unsigned long long)g_ibdHeadersObserver.Stats().quarantined,
+                   predicted.size(),
+                   predicted.empty() ? "none" : predicted.front().ToString().c_str(),
+                   predicted.empty() ? "none" : predicted.back().ToString().c_str(),
+                   graphTip ? graphTip->height : -1,
+                   graphTip ? graphTip->height - g_ibdHeadersObserver.Graph().AnchorHeight() : -1,
+                   observerResult.continueHeaders ? 1 : 0);
+            if (observerResult.expectedResponse)
+            {
+                if (observerResult.continueHeaders &&
+                    !observerResult.continuationLocator.empty())
+                {
+                    g_ibdHeadersObserver.MarkHeaderRequest(pfrom->GetId());
+                    pfrom->PushGetHeaders(
+                        CBlockLocator(observerResult.continuationLocator),
+                        uint256(0), "ibd-observe-continue");
+                }
+                return true;
+            }
+        }
+
         const int nFullTipBefore = pindexBest ? pindexBest->nHeight : -1;
         const int nBestHeaderBefore = fSPVMode && pindexBest ? pindexBest->nHeight : -1;
         int nNewHeaders = 0;
@@ -9652,6 +9758,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     BlockRequestTraceInFlightMark(pfrom, inv.hash, false);
             }
             vGetData.swap(vOwnedGetData);
+            if (fIbdHeadersObserve)
+                for (const CInv& inv : vGetData)
+                    TraceIbdHeadersObserverEvent("request", pfrom, inv.hash, -1);
             if (fDebug)
                 printf("Requesting %u full blocks from peer %s via getdata\n",
                        (unsigned int)vGetData.size(),
@@ -9816,6 +9925,15 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 ibdactivepath::MonotonicMicros() - nIBDCsMainWaitStart);
         blockLockDiagnostics.Acquired();
         bool fKnownBefore = mapBlockIndex.count(hashBlock) != 0;
+        if (fIbdHeadersObserve)
+        {
+            int observedHeight = -1;
+            std::map<uint256, CBlockIndex*>::const_iterator observedIndex =
+                mapBlockIndex.find(hashBlock);
+            if (observedIndex != mapBlockIndex.end())
+                observedHeight = observedIndex->second->nHeight;
+            TraceIbdHeadersObserverEvent("receive", pfrom, hashBlock, observedHeight);
+        }
         bool fOrphanBefore = mapOrphanBlocks.count(hashBlock) != 0;
         bool fMissingPrevBefore = mapBlockIndex.count(block.hashPrevBlock) == 0;
         bool fWouldHitIbdOrphanLimit = false;
@@ -10770,6 +10888,14 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
         if (fSPVMode && pto->getHeadersSync.IsTimedOut(GetTime()))
             pto->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "timeout-retry");
 
+        if (fIbdHeadersObserve && !fSPVMode &&
+            pto->getHeadersSync.IsTimedOut(GetTime()))
+        {
+            CBlockLocator observerLocator;
+            if (PrepareIbdHeadersObserverRequest(pto, observerLocator))
+                pto->PushGetHeaders(observerLocator, uint256(0), "ibd-observe-timeout");
+        }
+
         if (dandelionState.IsEnabled())
         {
             std::vector<int> vPeerIds;
@@ -11099,6 +11225,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                     pto->MarkBlockInFlight(inv.hash);
                     ibdactivepath::RecordBlockRequestSent(inv.hash);
                     ibdblocklatency::RecordGetDataSent(inv.hash, pto->GetId());
+                    if (fIbdHeadersObserve)
+                        TraceIbdHeadersObserverEvent("request", pto, inv.hash, -1);
                     if (fTraceBlockRequest)
                         BlockRequestTraceInFlightMark(pto, inv.hash, true);
                 }

@@ -6544,6 +6544,7 @@ bool CNode::ExpireGetBlocksOutstanding(int64_t now_us)
 
 void CNode::Cleanup(NodeCleanupMode mode)
 {
+    IbdHeadersObserverPeerDisconnected(GetId());
     const bool fRecordForensics = (mode == NODE_CLEANUP_RUNTIME);
     ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect", fRecordForensics);
     ReleaseOrphanLimitRejectedForPeer(GetId());

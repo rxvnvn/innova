@@ -469,6 +469,8 @@ extern bool fEnforceCanonical;
 extern bool fMinimizeCoinAge;
 
 extern bool fSPVMode;
+extern bool fIbdHeadersObserve;
+void IbdHeadersObserverPeerDisconnected(NodeId peer);
 extern bool fSPVHeadersOnly;
 extern int nSPVStartHeight;
 

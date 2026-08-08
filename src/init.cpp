@@ -556,6 +556,7 @@ std::string HelpMessage()
         "  -spvstartheight=<n>    " + _("Start SPV mode from block height <n> (default: 0)") + "\n" +
         "  -hybridspv             " + _("Run in hybrid SPV mode (optimized for constrained devices like Pi)") + "\n" +
         "  -maxheaders=<n>       " + _("Maximum block headers to keep in memory in SPV mode (default: 50000)") + "\n" +
+        "  -ibdheadersobserve    " + _("Observe an ordered IBD header frontier without changing block requests") + "\n" +
         "  -spvutxocachesize=<n> " + _("Maximum SPV UTXO cache entries (default: 10000, Pi: 1000)") + "\n" +
         "  -cnsyncslots=<n>      " + _("Collateral node slots reserved for sync during IBD (default: 4)") + "\n" +
         "  -mixingpoolsize=<n>   " + _("NullSend mixing pool size (2-16, default: 5)") + "\n" +
@@ -883,6 +884,7 @@ bool AppInit2()
     fDisableStealth = GetBoolArg("-disablestealth"); // force-disable stealth transaction scanning
 
     fSPVMode = GetBoolArg("-spv", false);
+    fIbdHeadersObserve = GetBoolArg("-ibdheadersobserve", false);
     nSPVStartHeight = GetArg("-spvstartheight", 0);
     fHybridSPV = GetBoolArg("-hybridspv", false);
 

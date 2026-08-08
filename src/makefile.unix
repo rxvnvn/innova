@@ -500,6 +500,7 @@ TEST_OBJS= \
     obj/test/ibdsemantic_tests.o \
     obj/test/ibdheaderscheduler_tests.o \
     obj/test/ibdheaderlocator_tests.o \
+    obj/test/ibdheadersobserver_tests.o \
     obj/test/pinglifecycle_tests.o \
     obj/test/invalidate_reconsider_tests.o
 
