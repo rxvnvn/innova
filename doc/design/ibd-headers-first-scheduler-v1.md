@@ -631,3 +631,10 @@ because the single handler cannot preempt an already-running `ProcessBlock` or
 header insertion. Thus the control-plane wall-clock invariant is not yet met
 and Stage 2 remains blocked. See
 `doc/forensics/ibd-header-dispatch-starvation-audit.md`.
+
+
+## Stage 1c profiling result (2026-08-08)
+
+The former per-header graph insertion path performed full-graph child scans and active-path rebuilding. `CIbdHeaderGraph::InsertBatch` now links and propagates a response in forward order and updates the active path once. The deterministic 100–6400 header benchmark is approximately linear (0.235 ms to 21.213 ms); semantics, quarantine, and re-anchor behavior are preserved. The Stage 1b multi-second graph insertion was therefore an intrinsic algorithmic cost and is corrected.
+
+The remaining long `ProcessBlock` calls were observed with negligible `cs_main` wait and belong to the legacy INV-driven data path; Stage 2 must measure orphan-cascade and connection components directly. No second consensus or control thread is introduced. The required control-plane invariant is lookahead safety: the ordered graph must remain sufficiently ahead of the active download window, rather than meeting an unconditional millisecond dispatch deadline. See `doc/forensics/ibd-header-graph-performance-stage1c.md`.

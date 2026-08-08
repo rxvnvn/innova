@@ -85,6 +85,9 @@ public:
 
     /** Insert structural identity.  Height is always derived from ancestry. */
     InsertResult Insert(const uint256& hash, const uint256& prev);
+    /** Insert one structurally contiguous response in one graph pass. */
+    std::vector<InsertResult> InsertBatch(
+        const std::vector<std::pair<uint256, uint256> >& headers);
 
     const CIbdHeaderNode* Lookup(const uint256& hash) const;
 

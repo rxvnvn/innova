@@ -4,6 +4,7 @@
 
 #include <boost/test/unit_test.hpp>
 
+#include <ctime>
 #include "ibdheaderscheduler.h"
 
 namespace {
@@ -253,6 +254,58 @@ BOOST_AUTO_TEST_CASE(clear_resets_all_state)
     BOOST_CHECK(!graph.HasAnchor());
     BOOST_CHECK(graph.ActiveTip() == NULL);
     BOOST_CHECK(graph.CheckInvariants());
+}
+
+BOOST_AUTO_TEST_CASE(batch_insert_matches_single_insert_and_scales)
+{
+    for (std::size_t n = 100; n <= 8000; n *= 2)
+    {
+        std::vector<std::pair<uint256, uint256> > headers;
+        headers.reserve(n);
+        uint64_t prev = 1000;
+        for (std::size_t i = 0; i < n; ++i)
+        {
+            const uint64_t hash = prev + 1;
+            headers.push_back(std::make_pair(H(hash), H(prev)));
+            prev = hash;
+        }
+        CIbdHeaderGraph batch;
+        CIbdHeaderGraph single;
+        BOOST_REQUIRE(batch.SetAuthoritativeAnchor(H(1000), 0));
+        BOOST_REQUIRE(single.SetAuthoritativeAnchor(H(1000), 0));
+        const std::clock_t begin = std::clock();
+        const std::vector<CIbdHeaderGraph::InsertResult> result =
+            batch.InsertBatch(headers);
+        const double elapsedMs = 1000.0 * (std::clock() - begin) / CLOCKS_PER_SEC;
+        BOOST_REQUIRE_EQUAL(result.size(), n);
+        BOOST_CHECK(batch.Size() == n + 1);
+        BOOST_CHECK(batch.ActiveTip()->hash == H(1000 + n));
+        BOOST_CHECK(batch.CheckInvariants());
+        for (std::size_t i = 0; i < n; ++i)
+            BOOST_REQUIRE(single.Insert(headers[i].first, headers[i].second) ==
+                          CIbdHeaderGraph::INSERTED_ACTIVE);
+        BOOST_CHECK(single.ActiveTip()->hash == batch.ActiveTip()->hash);
+        BOOST_CHECK(single.GetActiveWindow(H(1000), n).size() ==
+                    batch.GetActiveWindow(H(1000), n).size());
+        std::printf("IBD_HEADER_GRAPH_BENCH n=%zu batch_ms=%.3f\n", n, elapsedMs);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(batch_insert_preserves_quarantine_and_reanchor)
+{
+    CIbdHeaderGraph graph;
+    BOOST_REQUIRE(graph.SetAuthoritativeAnchor(H(100), 10));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.push_back(std::make_pair(H(101), H(100)));
+    headers.push_back(std::make_pair(H(102), H(101)));
+    headers.push_back(std::make_pair(H(500), H(499)));
+    const std::vector<CIbdHeaderGraph::InsertResult> result = graph.InsertBatch(headers);
+    BOOST_CHECK(result[0] == CIbdHeaderGraph::INSERTED_ACTIVE);
+    BOOST_CHECK(result[1] == CIbdHeaderGraph::INSERTED_ACTIVE);
+    BOOST_CHECK(result[2] == CIbdHeaderGraph::INSERTED_QUARANTINED);
+    BOOST_REQUIRE(graph.Reanchor(H(101), 11));
+    BOOST_CHECK(graph.CheckInvariants());
+    BOOST_CHECK(graph.ActiveTip()->hash == H(102));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -118,6 +118,65 @@ CIbdHeaderGraph::InsertResult CIbdHeaderGraph::Insert(
     return INSERTED_QUARANTINED;
 }
 
+std::vector<CIbdHeaderGraph::InsertResult> CIbdHeaderGraph::InsertBatch(
+    const std::vector<std::pair<uint256, uint256> >& headers)
+{
+    std::vector<InsertResult> results(headers.size(), INSERTED_QUARANTINED);
+    if (headers.empty()) return results;
+    std::vector<uint256> inserted;
+    inserted.reserve(headers.size());
+    for (std::size_t i = 0; i < headers.size(); ++i) {
+        const uint256& hash = headers[i].first;
+        const uint256& prev = headers[i].second;
+        if (hash == 0 || hash == prev) { results[i] = CONFLICT; continue; }
+        NodeMap::iterator existing = m_nodes.find(hash);
+        if (existing != m_nodes.end()) {
+            results[i] = existing->second.prev == prev ? DUPLICATE : CONFLICT;
+            continue;
+        }
+        m_nodes.insert(std::make_pair(hash, CIbdHeaderNode(hash, prev)));
+        inserted.push_back(hash);
+    }
+    // Link only new nodes; do not scan the complete graph for each header.
+    for (std::vector<uint256>::const_iterator it = inserted.begin();
+         it != inserted.end(); ++it) {
+        NodeMap::iterator node = m_nodes.find(*it);
+        NodeMap::iterator parent = m_nodes.find(node->second.prev);
+        if (parent != m_nodes.end()) parent->second.children.insert(node->first);
+    }
+    // Ordered responses permit one forward height propagation pass.
+    for (std::size_t i = 0; i < headers.size(); ++i) {
+        NodeMap::iterator node = m_nodes.find(headers[i].first);
+        if (node == m_nodes.end() || node->second.height >= 0) continue;
+        NodeMap::iterator parent = m_nodes.find(node->second.prev);
+        if (parent != m_nodes.end() && parent->second.IsAnchored() &&
+            !parent->second.permanently_quarantined) {
+            node->second.height = parent->second.height + 1;
+            node->second.state = CIbdHeaderNode::ELIGIBLE;
+        }
+    }
+    uint256 candidateTip = m_active_tip;
+    for (std::vector<uint256>::const_iterator it = inserted.begin();
+         it != inserted.end(); ++it) {
+        NodeMap::const_iterator node = m_nodes.find(*it);
+        if (node != m_nodes.end() && node->second.IsUsable() &&
+            IsDescendantOf(node->first, candidateTip)) candidateTip = node->first;
+    }
+    if (candidateTip != m_active_tip) {
+        MarkActivePath(candidateTip);
+        ExtendActiveTipIfUnambiguous();
+    }
+    for (std::size_t i = 0; i < headers.size(); ++i) {
+        NodeMap::const_iterator node = m_nodes.find(headers[i].first);
+        if (results[i] == DUPLICATE || results[i] == CONFLICT) continue;
+        if (node != m_nodes.end() && node->second.state == CIbdHeaderNode::ACTIVE)
+            results[i] = INSERTED_ACTIVE;
+        else if (node != m_nodes.end() && node->second.IsUsable())
+            results[i] = INSERTED_ELIGIBLE;
+    }
+    return results;
+}
+
 const CIbdHeaderNode* CIbdHeaderGraph::Lookup(const uint256& hash) const
 {
     NodeMap::const_iterator it = m_nodes.find(hash);
@@ -458,14 +517,14 @@ CIbdHeadersObserver::HeaderResult CIbdHeadersObserver::ObserveHeaders(
     result.expectedResponse = m_outstanding_peers.erase(peer) != 0;
     ++m_counters.headerResponses;
     const uint256 oldTip = m_graph.ActiveTip() ? m_graph.ActiveTip()->hash : uint256(0);
-    for (std::vector<std::pair<uint256, uint256> >::const_iterator it = headers.begin();
-         it != headers.end(); ++it)
+    const std::vector<CIbdHeaderGraph::InsertResult> inserted =
+        m_graph.InsertBatch(headers);
+    for (std::size_t i = 0; i < headers.size(); ++i)
     {
-        CIbdHeaderGraph::InsertResult inserted = m_graph.Insert(it->first, it->second);
-        m_sources[it->first].insert(peer);
-        if (inserted == CIbdHeaderGraph::DUPLICATE) ++m_counters.duplicates;
-        else if (inserted == CIbdHeaderGraph::INSERTED_ACTIVE ||
-                 inserted == CIbdHeaderGraph::INSERTED_ELIGIBLE) ++m_counters.accepted;
+        m_sources[headers[i].first].insert(peer);
+        if (inserted[i] == CIbdHeaderGraph::DUPLICATE) ++m_counters.duplicates;
+        else if (inserted[i] == CIbdHeaderGraph::INSERTED_ACTIVE ||
+                 inserted[i] == CIbdHeaderGraph::INSERTED_ELIGIBLE) ++m_counters.accepted;
         else { ++m_counters.disconnected; ++m_counters.quarantined; }
     }
     const uint256 newTip = m_graph.ActiveTip() ? m_graph.ActiveTip()->hash : uint256(0);
