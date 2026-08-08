@@ -6583,6 +6583,10 @@ void CNode::Cleanup(NodeCleanupMode mode)
         setBlocksInFlight.clear();
         mapBlockInFlightSince.clear();
         mapBlockInFlightMarkUs.clear();
+        {
+            LOCK(cs_vBlockInFlightWire);
+            mapBlockInFlightWireUs.clear();
+        }
         peerLiveActivePressure = 0;
         nFrontierDeferredHash = 0;
         ClearDiversifyDispatchForPeer(GetId());
@@ -7109,6 +7113,24 @@ void SocketSendData(CNode *pnode)
                     mit->command.c_str(), GetTimeMicros(), pnode->nSendSize);
                 if (PingLifecycleTraceEnabled() && mit->command == "ping")
                     PingLifecycleTraceSocketWriteBegin(pnode);
+                // Wire-origin clock for block requests (see
+                // doc/design/ibd-conservative-block-request-expiration.md §5):
+                // when the first byte of a getdata batch is written, stamp the
+                // wire time of every block hash it carries that still has a
+                // pending-wire entry on this peer.  Gated on the wire map itself
+                // so hashes that are not (or no longer) in flight are never
+                // created here.
+                if (mit->command == "getdata" && !mit->vBlockHashes.empty())
+                {
+                    LOCK(pnode->cs_vBlockInFlightWire);
+                    for (size_t i = 0; i < mit->vBlockHashes.size(); ++i)
+                    {
+                        const uint256& hash = mit->vBlockHashes[i];
+                        if (pnode->mapBlockInFlightWireUs.count(hash))
+                            pnode->mapBlockInFlightWireUs[hash] =
+                                mit->firstSendUs;
+                    }
+                }
             }
 
             pnode->nSendBytes += nBytes;
@@ -8662,8 +8684,9 @@ void ThreadMessageHandler2(void* parg)
         if (!fImporting && !fReindex && !fSPVMode)
         {
             const int64_t nNow = GetTime();
+            const int64_t nNowUs = GetTimeMicros();
             BOOST_FOREACH(CNode* pnode, vNodesCopy)
-                pnode->ExpireBlockInFlight(nNow);
+                pnode->ExpireBlockInFlight(nNowUs);
 
             CBlockIndex* pindexTip = NULL;
             int nLocalHeight = -1;

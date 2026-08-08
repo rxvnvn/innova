@@ -9681,7 +9681,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     GetTimeMicros(), pfrom->nSendSize,
                     pfrom->hashLastBlockInBatch, pfrom->nExpectedBatchSize);
                 pfrom->nLastGetDataTime = GetTime();
-                pfrom->PushMessage("getdata", vGetData);
+                pfrom->PushBlockGetData(vGetData);
             }
         }
 
@@ -11109,7 +11109,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                         GetTimeMicros(), pto->nSendSize,
                         pto->hashLastBlockInBatch, pto->nExpectedBatchSize);
                     pto->nLastGetDataTime = GetTime();
-                    pto->PushMessage("getdata", vGetData);
+                    pto->PushBlockGetData(vGetData);
                     vGetData.clear();
                 }
             }
@@ -11178,7 +11178,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                 GetTimeMicros(), pto->nSendSize,
                 pto->hashLastBlockInBatch, pto->nExpectedBatchSize);
             pto->nLastGetDataTime = GetTime();
-            pto->PushMessage("getdata", vGetData);
+            pto->PushBlockGetData(vGetData);
         }
     }
 

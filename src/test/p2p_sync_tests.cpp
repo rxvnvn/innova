@@ -6596,6 +6596,13 @@ BOOST_AUTO_TEST_CASE(diversify_attribution_lifecycle_and_timeout)
     RecordDiversifyDispatch(hash, 78);
     lane.MarkBlockInFlight(hash);
     lane.mapBlockInFlightSince[hash] = GetTime() - 10;
+    // Wire-origin clock (see ibd-conservative-block-request-expiration): the
+    // getdata was sent 61 s ago, so the 60 s wire-origin deadline has passed
+    // and this expires as a genuine timeout, not a pending-wire release.
+    {
+        LOCK(lane.cs_vBlockInFlightWire);
+        lane.mapBlockInFlightWireUs[hash] = GetTimeMicros() - 61000000;
+    }
     const int64_t nTimeoutBefore = DiversifyMetric("other_lane_timeout");
     lane.ExpireBlockInFlight();
     BOOST_CHECK_EQUAL(DiversifyMetric("other_lane_timeout") - nTimeoutBefore, 1);
@@ -7863,9 +7870,15 @@ BOOST_AUTO_TEST_CASE(ibd_inflight_lifecycle_feeds_quality_and_ledgers)
     const int64_t nTimeoutBefore =
         MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes);
     peer.MarkBlockInFlight(hash);
-    // Backdate the timestamps so the block expires on the next pass.
+    // Backdate the timestamps so the block expires on the next pass.  The wire
+    // stamp is 61 s old so the 60 s wire-origin deadline has passed and this
+    // records a genuine timeout (not a pending-wire release).
     peer.mapBlockInFlightSince[hash] = GetTime() - 60;
     peer.mapBlockInFlightMarkUs[hash] = 1;
+    {
+        LOCK(peer.cs_vBlockInFlightWire);
+        peer.mapBlockInFlightWireUs[hash] = GetTimeMicros() - 61000000;
+    }
     peer.ExpireBlockInFlight();
 
     BOOST_CHECK(peer.setBlocksInFlight.empty());
@@ -7884,6 +7897,86 @@ BOOST_AUTO_TEST_CASE(ibd_inflight_lifecycle_feeds_quality_and_ledgers)
         MetricGet(ibdmetrics::Get().peer_quality_late_outcomes),
         nLateBefore + 1);
     BOOST_CHECK_GT(peer.ibdQuality.late_delivery_score.load(), 0);
+}
+
+// Wire-origin clock (ibd-conservative-block-request-expiration §10.1): a
+// request expires from its getdata batch's first socket send + 60 s, not from
+// enqueue.  Deferring the wire by N s must defer the deadline by N s even when
+// the enqueue timestamp alone would already have expired the request.
+BOOST_AUTO_TEST_CASE(expiry_clock_is_wire_origin)
+{
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21431), "wire-clock", true);
+    const uint256 hash(214301);
+
+    peer.MarkBlockInFlight(hash);
+    // Enqueued 40 s ago (would have expired long ago under the old 5 s
+    // enqueue-bound), but the getdata only reached the wire 20 s ago.
+    peer.mapBlockInFlightSince[hash] = GetTime() - 40;
+    {
+        LOCK(peer.cs_vBlockInFlightWire);
+        peer.mapBlockInFlightWireUs[hash] = GetTimeMicros() - 20000000;
+    }
+    // Deadline = wire + 60 s = 40 s from now: nothing expires yet.
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hash), 1U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hash), 1U);
+    BOOST_CHECK(!WasBlockLastTimedOutByPeer(hash, peer.GetId()));
+
+    // Advance the wire stamp past the deadline: now it expires as a timeout.
+    {
+        LOCK(peer.cs_vBlockInFlightWire);
+        peer.mapBlockInFlightWireUs[hash] = GetTimeMicros() - 61000000;
+    }
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hash), 0U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hash), 0U);
+    BOOST_CHECK(WasBlockLastTimedOutByPeer(hash, peer.GetId()));
+}
+
+// Pending-wire safety net (ibd-conservative-block-request-expiration §10.2): a
+// request whose getdata never reaches the socket still expires from enqueue
+// after the pending-wire bound, releasing ownership and gauges exactly once,
+// with no peer timeout/quality penalty and no late-delivery expectation.
+BOOST_AUTO_TEST_CASE(pending_wire_expiry_releases_without_penalty)
+{
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(21432), "pending-wire", true);
+    const uint256 hash(214302);
+
+    const int64_t nInflightBefore =
+        MetricGet(ibdmetrics::Get().global_active_current);
+    const int64_t nTimeoutOutcomesBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes);
+
+    BOOST_CHECK(TryAssignBlockRequestOwner(hash, peer.GetId(), BLOCKREQ_SOURCE_INV));
+    peer.MarkBlockInFlight(hash);
+    BOOST_CHECK(IsBlockRequestOwnedByAnyPeer(hash));
+    // Never send the getdata: the wire stamp stays at the pending sentinel 0.
+    // Enqueue was 2 s ago, past the 1 s pending-wire bound.
+    peer.mapBlockInFlightSince[hash] = GetTime() - 2;
+    peer.ExpireBlockInFlight();
+
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hash), 0U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hash), 0U);
+    // Ownership and gauges released exactly once.
+    BOOST_CHECK(!IsBlockRequestOwnedByAnyPeer(hash));
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().global_active_current), nInflightBefore);
+    // No peer timeout/quality penalty and no late-delivery expectation.
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes),
+        nTimeoutOutcomesBefore);
+    BOOST_CHECK(!WasBlockLastTimedOutByPeer(hash, peer.GetId()));
+    NodeId nPeer = -1;
+    int64_t nMarkUs = 0;
+    BOOST_CHECK(!TakeBlockLateDeliveryExpectation(hash, &nPeer, &nMarkUs));
+
+    // A second pass must not double-release anything.
+    peer.ExpireBlockInFlight();
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().global_active_current), nInflightBefore);
+    BOOST_CHECK(!IsBlockRequestOwnedByAnyPeer(hash));
 }
 
 // Concentration invariant: a dominant announcer with NO recorded alternate is
@@ -8133,6 +8226,12 @@ BOOST_AUTO_TEST_CASE(late_delivery_after_timeout_fixes_late_outcome)
     SetIbdQualityClockForTesting(nMarkUs);
     peer.MarkBlockInFlight(hash);
     peer.mapBlockInFlightSince[hash] = GetTime() - 60;
+    // Wire-origin clock: the getdata went out 61 s ago, so the 60 s deadline
+    // has passed and expiry records a genuine timeout.
+    {
+        LOCK(peer.cs_vBlockInFlightWire);
+        peer.mapBlockInFlightWireUs[hash] = GetTimeMicros() - 61000000;
+    }
     // Force expiry at a known time so the late latency is deterministic.
     SetIbdQualityClockForTesting(nMarkUs + 9000000);
     peer.ExpireBlockInFlight();
@@ -8227,6 +8326,10 @@ BOOST_AUTO_TEST_CASE(late_delivery_attributed_to_requesting_peer)
     SetIbdQualityClockForTesting(nMarkUs);
     requester.MarkBlockInFlight(hash);
     requester.mapBlockInFlightSince[hash] = GetTime() - 60;
+    {
+        LOCK(requester.cs_vBlockInFlightWire);
+        requester.mapBlockInFlightWireUs[hash] = GetTimeMicros() - 61000000;
+    }
     SetIbdQualityClockForTesting(nMarkUs + 9000000);
     requester.ExpireBlockInFlight();
 

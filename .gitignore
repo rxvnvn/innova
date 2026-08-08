@@ -43,3 +43,7 @@ dist
 *.dmg
 .idea
 .vscode
+
+# python caches
+__pycache__/
+*.py[cod]

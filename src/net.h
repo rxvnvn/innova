@@ -1103,6 +1103,10 @@ struct SendMessageMeta
     int64_t firstSendUs;         // wall-clock of the first successful send() (0 = pending)
     size_t nSendSizeAtFirstSend; // peer nSendSize at that first send (0 = pending)
     bool fStampPending;          // true until the first byte of this message is written
+    // For a getdata message: the block hashes it carries, in wire order,
+    // associated so the socket-send path can stamp each in-flight hash's
+    // wire-origin time.  Empty for every other message type.
+    std::vector<uint256> vBlockHashes;
 
     SendMessageMeta()
         : firstSendUs(0), nSendSizeAtFirstSend(0), fStampPending(true)
@@ -1315,6 +1319,19 @@ public:
     // Parallel to mapBlockInFlightSince with microsecond precision for the
     // delivery-latency EWMA; maintained on the same loci.
     std::map<uint256, int64_t> mapBlockInFlightMarkUs;
+    // Wire-origin clock for the conservative block-request expiry (see
+    // doc/design/ibd-conservative-block-request-expiration.md): for a hash in
+    // flight, the wall-clock microseconds at which its getdata batch was first
+    // written to the socket (0 = pending wire).  Written by the socket handler
+    // (SocketSendData) and by the message handler (Mark/Clear/Expire), so it is
+    // guarded by cs_vBlockInFlightWire; unlike the maps above, this one is not
+    // single-thread.
+    std::map<uint256, int64_t> mapBlockInFlightWireUs;
+    CCriticalSection cs_vBlockInFlightWire;
+    // Staging for the block hashes of the getdata message currently being
+    // serialized; moved into SendMessageMeta::vBlockHashes by EndMessage.
+    // Guarded by cs_vSend.
+    std::vector<uint256> vPendingGetDataHashes;
     // Per-peer delivery quality used by the timeout-aware IBD ranking.  See
     // the IbdPeerDeliveryQuality / IbdPeerQualityTier documentation above.
     IbdPeerDeliveryQuality ibdQuality;
@@ -1847,6 +1864,7 @@ public:
     {
         ssSend.clear();
         strMessageCommand.clear();
+        vPendingGetDataHashes.clear();
 
         LEAVE_CRITICAL_SECTION(cs_vSend);
 
@@ -1886,6 +1904,15 @@ public:
         nSendSize += (*it).size();
         vSendMeta.push_back(SendMessageMeta());
         vSendMeta.back().command = strMessageCommand;
+        // Associate the block hashes carried by this getdata message so the
+        // socket-send path can stamp each in-flight hash's wire-origin time.
+        // The staging vector is only non-empty while PushBlockGetData is
+        // serializing a batch; it is swapped (emptied) here, so a getdata built
+        // through plain PushMessage carries no hash association.
+        if (strMessageCommand == "getdata" && !vPendingGetDataHashes.empty())
+            vSendMeta.back().vBlockHashes.swap(vPendingGetDataHashes);
+        else
+            vPendingGetDataHashes.clear();
 
         // If write queue empty, attempt "optimistic write"
         if (it == vSendMsg.begin())
@@ -1899,6 +1926,33 @@ public:
 
     void PushVersion();
 
+
+    // Send a getdata batch, recording the block hashes it carries so the
+    // socket-send path can stamp each in-flight hash's wire-origin time.  Same
+    // serialization path as PushMessage("getdata", vGetData); the extra
+    // association is observation only and never changes what or when bytes are
+    // written.
+    void PushBlockGetData(const std::vector<CInv>& vGetData)
+    {
+        try
+        {
+            BeginMessage("getdata");
+            vPendingGetDataHashes.clear();
+            for (size_t i = 0; i < vGetData.size(); ++i)
+            {
+                if (vGetData[i].type == MSG_BLOCK ||
+                    vGetData[i].type == MSG_FILTERED_BLOCK)
+                    vPendingGetDataHashes.push_back(vGetData[i].hash);
+            }
+            ssSend << vGetData;
+            EndMessage();
+        }
+        catch (...)
+        {
+            AbortMessage();
+            throw;
+        }
+    }
 
     void PushMessage(const char* pszCommand)
     {
@@ -2166,16 +2220,45 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         }
     }
 
-    void ExpireBlockInFlight(int64_t nNow = GetTime())
+    void ExpireBlockInFlight(int64_t nNowUs = GetTimeMicros())
     {
-        static const int BLOCK_IN_FLIGHT_TIMEOUT = 5;
+        // Wire-origin deadline (data-derived knee, see
+        // doc/design/ibd-conservative-block-request-expiration.md §2-3): a
+        // block request expires at its getdata batch's first socket send + 60 s.
+        static const int64_t BLOCK_IN_FLIGHT_TIMEOUT_US = 60LL * 1000000;
+        // Pending-wire safety bound (same design §5): a request whose getdata
+        // never reached the socket expires from enqueue after this bound.
+        // 1 s is a conservative engineering safety bound, not a data-derived
+        // network parameter: it sits well above the ~10 ms socket-drain cadence
+        // (so a queued-but-legit getdata is never falsely expired) and far
+        // below the 60 s wire-origin deadline.
+        static const int64_t MAX_PENDING_WIRE_US = 1000000;
+        const int64_t nNowSec = nNowUs / 1000000;
         for (std::map<uint256, int64_t>::iterator it = mapBlockInFlightSince.begin();
              it != mapBlockInFlightSince.end(); )
         {
-            if (nNow - it->second > BLOCK_IN_FLIGHT_TIMEOUT)
+            bool fPendingWire = false;
+            int64_t nDeadlineUs;
+            {
+                LOCK(cs_vBlockInFlightWire);
+                std::map<uint256, int64_t>::const_iterator wi =
+                    mapBlockInFlightWireUs.find(it->first);
+                if (wi != mapBlockInFlightWireUs.end() && wi->second > 0)
+                    nDeadlineUs = wi->second + BLOCK_IN_FLIGHT_TIMEOUT_US;
+                else
+                {
+                    // The getdata never reached the wire: local send-path
+                    // failure/backlog, bounded from enqueue.
+                    fPendingWire = true;
+                    nDeadlineUs =
+                        it->second * 1000000LL + MAX_PENDING_WIRE_US;
+                }
+            }
+            if (nNowUs > nDeadlineUs)
             {
                 if (BlockRequestTraceEnabled())
-                    BlockRequestTraceInFlightExpire(this, it->first, nNow - it->second);
+                    BlockRequestTraceInFlightExpire(
+                        this, it->first, nNowSec - it->second);
                 const uint256 hashExpired = it->first;
                 // Only account the timeout when the hash is still in the live
                 // in-flight set.  A stale timestamp entry (e.g. left behind by
@@ -2187,12 +2270,28 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                     peerLiveActivePressure.fetch_sub(
                         1, std::memory_order_relaxed);
                     ibdmetrics::InflightAdd(-1);
-                    ibdmetrics::GlobalActiveAdd(
-                        -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
-                    RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
-                    RecordIbdBlockTimeout();
-                    // EXPTRACE HOOK: in-flight request released by timeout.
-                    ibdexptrace::NoteRequestTimeout(hashExpired);
+                    if (fPendingWire)
+                    {
+                        // Local send-path failure/backlog, not a peer outcome:
+                        // release the request so the block can be retried, but
+                        // with no peer timeout/quality penalty and no
+                        // late-delivery expectation against the peer.
+                        ibdmetrics::GlobalActiveAdd(
+                            -1, ibdmetrics::ACTIVE_DECREMENT_OTHER);
+                        RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
+                        // EXPTRACE HOOK: request released without reaching the
+                        // wire (pending-wire bound), not a timeout.
+                        ibdexptrace::NoteRequestPendingWireRelease(hashExpired);
+                    }
+                    else
+                    {
+                        ibdmetrics::GlobalActiveAdd(
+                            -1, ibdmetrics::ACTIVE_DECREMENT_INFLIGHT_TIMEOUT);
+                        RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
+                        RecordIbdBlockTimeout();
+                        // EXPTRACE HOOK: in-flight request released by timeout.
+                        ibdexptrace::NoteRequestTimeout(hashExpired);
+                    }
                     // Capture the mark time before erasing so a later arrival
                     // of the block can be measured as a late delivery.
                     int64_t nExpiredMarkUs = 0;
@@ -2203,11 +2302,16 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                         nExpiredMarkUs = miExpiredUs->second;
                         mapBlockInFlightMarkUs.erase(miExpiredUs);
                     }
-                    RecordBlockLastTimeoutOwner(hashExpired, GetId());
-                    RecordBlockLateDeliveryExpectation(
-                        hashExpired, GetId(), nExpiredMarkUs, QualityNowUs());
+                    if (!fPendingWire)
+                    {
+                        RecordBlockLastTimeoutOwner(hashExpired, GetId());
+                        RecordBlockLateDeliveryExpectation(
+                            hashExpired, GetId(), nExpiredMarkUs,
+                            QualityNowUs());
+                    }
                     NodeId nDiversifyAnnounce = -1;
-                    if (TakeDiversifyAnnounce(hashExpired, &nDiversifyAnnounce))
+                    if (!fPendingWire &&
+                        TakeDiversifyAnnounce(hashExpired, &nDiversifyAnnounce))
                         ibdmetrics::Get().diversify_other_lane_timeout.fetch_add(
                             1, std::memory_order_relaxed);
                     // Head age = age of the oldest in-flight hash at the moment
@@ -2224,13 +2328,19 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                                 nEarliestMark = mi->second;
                         if (nEarliestMark != INT64_MAX)
                             nHeadAgeUs =
-                                (nNow - nEarliestMark) * 1000000LL;
+                                (nNowSec - nEarliestMark) * 1000000LL;
                     }
                     ibdforensic::RecordExpired(
                         GetId(), hashExpired, GetTimeMicros(), nHeadAgeUs);
-                    ReleaseBlockRequestOwner(hashExpired, GetId(), "timeout");
+                    ReleaseBlockRequestOwner(
+                        hashExpired, GetId(),
+                        fPendingWire ? "local-fail" : "timeout");
                     EraseAlreadyAskedForIfUnowned(
                         CInv(MSG_BLOCK, hashExpired));
+                }
+                {
+                    LOCK(cs_vBlockInFlightWire);
+                    mapBlockInFlightWireUs.erase(hashExpired);
                 }
                 it = mapBlockInFlightSince.erase(it);
             }
@@ -2268,6 +2378,16 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         }
         mapBlockInFlightSince[hashBlock] = GetTime();
         mapBlockInFlightMarkUs[hashBlock] = QualityNowUs();
+        {
+            // Pending-wire sentinel: the wire-origin clock starts at 0 until
+            // the getdata batch carrying this hash is first written to the
+            // socket.  A pre-existing >0 stamp (hash re-marked while its batch
+            // is already queued/sending) is preserved.
+            LOCK(cs_vBlockInFlightWire);
+            if (mapBlockInFlightWireUs.find(hashBlock) ==
+                mapBlockInFlightWireUs.end())
+                mapBlockInFlightWireUs[hashBlock] = 0;
+        }
         TransitionBlockRequestOwnerToInFlight(hashBlock, GetId());
     }
 
@@ -2283,6 +2403,10 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
             RequestBlockPipelineWake(WAKE_CAUSE_CLEAR_INFLIGHT);
         }
         mapBlockInFlightSince.erase(hashBlock);
+        {
+            LOCK(cs_vBlockInFlightWire);
+            mapBlockInFlightWireUs.erase(hashBlock);
+        }
         std::map<uint256, int64_t>::iterator miUs =
             mapBlockInFlightMarkUs.find(hashBlock);
         if (miUs != mapBlockInFlightMarkUs.end())

@@ -292,6 +292,29 @@ inline void NoteRequestTimeout(const uint256& hash)
     Get().active[o].fetch_sub(1, std::memory_order_relaxed);
 }
 
+// Called from CNode::ExpireBlockInFlight: the in-flight request for `hash` was
+// released because its getdata batch never reached the socket (pending-wire
+// bound, local send-path failure/backlog).  Unlike a timeout this is not a peer
+// outcome: it does not create a late-delivery expectation and must never be
+// counted as late_received, so it only consumes the origin tag and decrements
+// the active counter.
+inline void NoteRequestPendingWireRelease(const uint256& hash)
+{
+    if (!Enabled())
+        return;
+    int o = EXP_ORIGIN_OTHER;
+    {
+        LOCK(Tag().cs);
+        std::map<uint256, int>::iterator it = Tag().hashOrigin.find(hash);
+        if (it != Tag().hashOrigin.end())
+        {
+            o = it->second;
+            Tag().hashOrigin.erase(it);
+        }
+    }
+    Get().active[o].fetch_sub(1, std::memory_order_relaxed);
+}
+
 // Called when a received block becomes part of the active chain.
 inline void NoteBlockConnected(const uint256& hash)
 {

@@ -2,12 +2,19 @@
 
 ## Status
 
-- **Status:** DESIGN / NOT IMPLEMENTED
-- **Basis:** CONTROL/B2/B3 runtime validation + ABRE measurement campaign (section 11)
+- **Status:** SUPERSEDED / HISTORICAL RECORD (kept as the measurement-campaign and
+  adaptive-design evidence base; the expiry policy is decided in
+  `ibd-conservative-block-request-expiration.md`)
+- **Basis:** CONTROL/B2/B3 runtime validation + ABRE measurement campaign (section 11) + economic & Occam offline replay (sections 13–14)
 - **Root problem:** fixed 5 s per-hash expiry can expire slow-but-live delivery before arrival
+- **Economic verdict (section 13):** fast per-hash retry saves ≈ no useful frontier (`saved_by_retry≈0`, `would_arrive_anyway`=58%, duplicates=52%, never-head frontier blockers=141); conservative expiration is architecturally preferred
+- **Occam verdict (section 14):** adaptive models give no economically significant gain over a simple wire-origin conservative timeout (~60 s ceiling); simplest data-supported semantics preferred
 - **Numeric parameters:** PARTIALLY VALIDATED — most now data-derived from measurement campaign (section 11); `slot0Alpha`/`perBlockAlpha`/`estimateStalenessUs` remain `MEASUREMENT-REQUIRED` (EWMA simulation)
-- **Next gate:** EWMA simulation for remaining `MEASUREMENT-REQUIRED` parameters; then implementation
+- **Next gate:** decision on conservative wire-origin timeout vs adaptive (sections 13–14); no production change
 - **Production behavior:** unchanged
+- **Final decision:** wire-origin conservative timeout T=60 s (data-derived knee, see
+  closing doc §2–3); adaptive estimators/position-correction/batch-correlation are
+  rejected. ABRE v1's 60 s ceiling value is confirmed by the closing sensitivity replay.
 
 ## 0. Scope & goals
 
@@ -227,3 +234,81 @@ Data-derived (без нового замера): `position`, `batchSeq`, `wireUs
 ## 12. Оценка готовности
 
 Дизайн полон: состояния, корреляция, estimator-правила, fallback-таблица, safety bounds (7), тест-инварианты (14), параметры. Measurement campaign проведена; большинство числовых параметров стали **data-derived** из реальных прогонов (раздел 11). Остались `MEASUREMENT-REQUIRED`: `slot0Alpha`/`perBlockAlpha`, `estimateStalenessUs` (симуляция EWMA на трассе). Имплементация не начата; производственное поведение не изменено.
+
+## 13. Economic verdict (offline replay, обе трассы)
+
+Проведён экономический replay текущей 5 s-policy против tolerant-политики (без быстрого per-hash expiry). Цель — определить реальную стоимость false-expiry и реальную пользу ранней loss detection, разделив `saved_by_retry`, `would_arrive_anyway`, `never_delivered`, `duplicate_work`.
+
+### 13.1 IMPAIRED (5% loss / RTT 13.9 s; 7 966 запросов, ~880 s IBD)
+
+| Категория | Кол-во | % | Тайминг доставки |
+|---|---|---|---|
+| `timed_out` (5 s сработал) | 7 933 | 99.6% | — |
+| `never_delivered` (реальная потеря) | **1 130** | 14.2% | никогда |
+| пришли после таймаута | 6 836 | 85.8% | — |
+| → `would_arrive_anyway` (без rerequest) | **4 640** | 58% | recv−mark p50 = 14.1 s (приходят сами, +8.1 s после таймаута) |
+| → rerequest до приёма (потенц. `saved_by_retry`) | 1 037 | 13% | recv−mark p50 = 54.5 s; приходят на **+14.1 s позже rerequest** |
+| → rerequest после приёма (`duplicate_work`) | **1 159** | 14.5% | rerequest на 29 s позже приёма |
+| rerequest traffic всего | 2 209 | — | **52.5% чистые дубли** |
+
+### 13.2 CONTROL (здоровый; 59 159 запросов, ~901 s IBD)
+
+- 110 таймаутов (0.19%): все 110 пришли сами (`would_arrive_anyway`, +0–1.2 s после таймаута), **0 спасено retry**, 1 блок потерян навсегда.
+- 3 652 записи с `rerequested` — это cross-peer перезапросы (peer 2), не timeout-driven (`timeout_time_us = 0`, `late = 0`); к экономике per-hash expiry не относятся.
+
+### 13.3 Ключевые выводы
+
+1. **`saved_by_retry` ≈ 0.** Из 2 209 rerequest в IMPAIRED только 1 037 отправлены до приёма, и те приходят на 14.1 s позже rerequest (p50) — retry не ускоряет доставку; пир шлёт по своему расписанию. Блоков, пришедших быстро *благодаря* retry, в данных нет.
+2. **`would_arrive_anyway` = 4 640 (58%)**: истёкшие по 5 s-политике блоки пришли бы сами за 14.1 s. Быстрый retry их не ускорил.
+3. **`never_delivered` = 1 130 (14.2%)** — безвозвратные потери, но только **141 — head (seq 0)** батча; из них лишь **14 батчей** имеют никогда-head при доставленных tails (реально блокирующие frontier).
+4. **`duplicate_work` = 1 159** перезапросов чисто впустую (52.5% rerequest traffic) + 110 таймаутов в CONTROL, где не спаслось ничего.
+5. Полезная скорость: CONTROL 65.6 blk/s, IMPAIRED 7.8 blk/s. Просадка — следствие деградации канала, а не политики retry.
+
+### 13.4 Вердикт
+
+**Быстрый per-hash retry почти не спасает полезного frontier.** 58% «потерянных» приходят сами; спасённые retry блоки всё равно приходят на 14 s позже (не быстрее); 52% перезапросов — дубли. Реальных никогда-не-пришедших head-блоков, блокирующих frontier, всего 141 (14 батчей). Цена false-expiry (лишние таймауты + rerequest traffic + дубли) перевешивает пользу быстрой детекции, которой в данных нет.
+
+**Architectural conclusion:** при данных трассах корректнее conservative expiration и приём loss-detection на шкале десятков секунд. Оснований для отдельного head/hole loss detector на текущих данных нет; решение требует либо экономики frontier-blocking (сколько % времени IBD реально стоит за потерянным head), либо данных с реальным (не loopback) сетевым каналом, где re-request через другого пира даёт фактическое ускорение.
+
+## 14. Occam comparison (offline, wire-origin conservative vs adaptive)
+
+Проведено сравнение простых wire-origin conservative таймаутов (фиксированные пороги из измеренных квантилей раздела 11) против адаптивных моделей: ABRE-D (linear), progress-aware/hybrid, delivery-frontier/hole. Критерий — не минимальный timeout, а полезная экономика: false expiry живых блоков, duplicate rerequest traffic, ускорение доставки/connected frontier, время детекции никогда-не-приходящих запросов, блокирующие frontier losses.
+
+### 14.1 Модели и метрики
+
+- **Wire-origin fixed T** (Occam-базовые): `deadline = wireUs + T` для каждого hash, `T ∈ {1.94 s (P75), 5 s (status quo), 15 s (P95), 30 s (P99), 60 s (max)}` — все из уже измеренных квантилей.
+- **ABRE-D**: `deadline = wireUs + slot0_EWMA + pos * perBlock_EWMA` с clamp `[1.94 s, 60 s]` (spec разделы 3–4).
+- **Progress-aware hybrid**: `deadline = max(linear, last_progress(peer) + grace)`.
+- **Delivery-frontier/hole**: hash защищён, пока позиция ≥ frontier батча; после прохождения frontier — bounded hole-grace.
+
+| Модель | CONTROL false-expiry | IMPAIRED false-expiry | IMPAIRED loss detection | IMPAIRED pending losses | Примечание |
+|---|---|---|---|---|---|
+| fixed 1.94 s | 12 956 (21.9%) | 6 836 (100%) | 1.94 s | 0 | пол слишком агрессивен |
+| **fixed 5 s (status quo)** | 110 (0.19%) | 6 836 (100%) | 5 s | 0 | «детекция» = убить все живые блоки |
+| fixed 15 s | 51 (0.09%) | 929 (13.6%) | 15 s | 0 | не покрывает IMPAIRED P50–P98 |
+| fixed 30 s | 0 (0.00%) | 889 (13.0%) | 30 s | 0 | |
+| **fixed 60 s** | 0 (0.00%) | 242 (3.5%) | 60 s | 0 | простейший, детектирует все 1 130 потерь |
+| ABRE-D | 7 692 (13.0%) | 6 836 (100%) | 2.9 s p50 | 0 | фальсифицирован (раздел 4, секция 13) |
+| progress-aware hybrid | 6 (0.01%) | 251 (3.7%) | 60 s (cap) | 857 | детекция раздута до maxWindow, потери остаются pending |
+| delivery-frontier/hole | 3 (0.005%) | 353 (5.2%) | 19 s p50 | 725 | дыры заполняются за десятки секунд; tails недетектируемы |
+
+### 14.2 Вывод Occam
+
+Строгая проверка порогов по квантилям (фактические цифры, offline replay):
+
+| T (s) | CONTROL живые убиты | IMPAIRED живые убиты | Покрытие обеих трасс |
+|---|---|---|---|
+| 1.94 | 12 956 (21.9%) | 6 836 (100%) | нет |
+| 5 | 110 (0.19%) | 6 836 (100%) | нет |
+| 15 | 51 (0.09%) | 929 (13.6%) | нет |
+| 30 | 0 | 889 (13.0%) | нет |
+| 60 | 0 | 242 (3.5%) | почти (max 154 s) |
+
+Адаптивные модели не дают практически значимого выигрыша против простого **wire-origin fixed 60 s**:
+- **false-expiry:** hybrid (3.7%) и frontier (5.2%) на IMPAIRED сопоставимы с fixed 60 s (3.5%), а на CONTROL все трое ≈ 0. ABRE-D (13%/100%) — значительно хуже даже fixed 15 s.
+- **loss detection:** fixed 60 s детектирует **все 1 130** никогда-не-пришедших за 60 s; hybrid оставляет 857 pending, frontier — 725 pending. Простейший порог строго лучше по полноте детекции.
+- **сложность:** fixed порог не требует ни per-batch correlation (раздел 2), ни estimator (раздел 3), ни clamps/fallback (разделы 6–7), ни 14 тест-инвариантов (раздел 9). Экономический выигрыш адаптивности в данных не наблюдается.
+
+### 14.3 Окончательный вердикт Occam
+
+Ни один фиксированный wire-origin порог не покрывает обе трассы одновременно (CONTROL живые до 18.7 s, IMPAIRED до 154 s), но **адаптивные модели при этом не решают дилемму** — их false-expiry сопоставим с fixed 60 s, а полнота детекции хуже (pending losses). Простейшая семантика, поддержанная данными: **wire-origin conservative timeout с потолком на уровне max-квантиля доставки живых блоков (≈ 60 s)** при отказе от быстрого per-hash retry (экономика раздела 13). Замена фиксированного `BLOCK_IN_FLIGHT_TIMEOUT = 5` на wire-origin отсчёт — единственный элемент ABRE-спека, дающий измеримую пользу без роста сложности (исключает локальный queue-delay из окна). Производственный код не изменён.
