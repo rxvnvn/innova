@@ -7021,6 +7021,10 @@ bool CNode::ReceiveMsgBytes(const char *pch, unsigned int nBytes)
 
         if (msg.complete()) {
             msg.nTime = GetTimeMicros();
+            if (fIbdHeadersObserve && msg.hdr.GetCommand() == "headers")
+                printf("IBD_HEADER_DISPATCH event=frame_complete peer=%lld frame_us=%lld bytes=%u queue_messages=%zu\n",
+                       (long long)GetId(), (long long)msg.nTime,
+                       msg.hdr.nMessageSize, vRecvMsg.size());
             if (PingLifecycleTraceEnabled() && msg.hdr.GetCommand() == "pong")
                 PingLifecycleTracePongFrameComplete(this);
         }
@@ -7112,6 +7116,12 @@ void SocketSendData(CNode *pnode)
                 mit->nSendSizeAtFirstSend = pnode->nSendSize;
                 ibdforensic::RecordSocketSend(
                     mit->command.c_str(), GetTimeMicros(), pnode->nSendSize);
+                if (mit->fPriorityHeaders)
+                    printf("IBD_HEADER_DISPATCH event=socket_first_byte peer=%lld enqueue_us=%lld first_send_us=%lld queue_delay_us=%lld queue_bytes=%zu\n",
+                           (long long)pnode->GetId(), (long long)mit->enqueueUs,
+                           (long long)mit->firstSendUs,
+                           (long long)(mit->firstSendUs - mit->enqueueUs),
+                           pnode->nSendSize);
                 if (PingLifecycleTraceEnabled() && mit->command == "ping")
                     PingLifecycleTraceSocketWriteBegin(pnode);
                 // Wire-origin clock for block requests (see
@@ -7138,6 +7148,11 @@ void SocketSendData(CNode *pnode)
             pnode->RecordBytesSent(nBytes);
 
             if (pnode->nSendOffset == data.size()) {
+                if (mit != pnode->vSendMeta.end() && mit->fPriorityHeaders)
+                    printf("IBD_HEADER_DISPATCH event=socket_last_byte peer=%lld enqueue_us=%lld first_send_us=%lld complete_us=%lld bytes=%zu\n",
+                           (long long)pnode->GetId(), (long long)mit->enqueueUs,
+                           (long long)mit->firstSendUs, (long long)GetTimeMicros(),
+                           data.size());
                 if (PingLifecycleTraceEnabled() &&
                     mit != pnode->vSendMeta.end() && mit->command == "ping")
                     PingLifecycleTraceSocketWriteComplete(pnode);
@@ -8648,13 +8663,15 @@ void ThreadMessageHandler2(void* parg)
                 TRY_LOCK(pnode->cs_vRecvMsg, lockRecv);
                 if (lockRecv)
                 {
-                    if (!ProcessMessages(pnode))
+                    if (!ProcessMessages(pnode, lockRecv))
                         pnode->CloseSocketDisconnect();
 
                     if (pnode->nSendSize < SendBufferSize()) {
-                        if (!pnode->vRecvGetData.empty() || (!pnode->vRecvMsg.empty() && pnode->vRecvMsg[0].complete())) {
+                        TRY_LOCK(pnode->cs_vRecvMsg, lockRecvAgain);
+                        if (lockRecvAgain &&
+                            (!pnode->vRecvGetData.empty() ||
+                             (!pnode->vRecvMsg.empty() && pnode->vRecvMsg[0].complete())))
                             fSleep = false; // no sleep for the weak
-                        }
                     }
                 }
             }

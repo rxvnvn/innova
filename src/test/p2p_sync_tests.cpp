@@ -102,6 +102,51 @@ static bool HasCommand(const std::vector<std::string>& commands,
     return std::find(commands.begin(), commands.end(), command) != commands.end();
 }
 
+static CSerializeData FramedMessage(const std::string& command, size_t payloadBytes = 0)
+{
+    CDataStream stream(SER_NETWORK, INIT_PROTO_VERSION);
+    stream << CMessageHeader(command.c_str(), 0);
+    if (payloadBytes)
+    {
+        std::vector<unsigned char> payload(payloadBytes, 0);
+        stream.write((const char*)&payload[0], payload.size());
+    }
+    unsigned int size = stream.size() - CMessageHeader::HEADER_SIZE;
+    memcpy((char*)&stream[CMessageHeader::MESSAGE_SIZE_OFFSET], &size, sizeof(size));
+    uint256 hash = Hash(stream.begin() + CMessageHeader::HEADER_SIZE, stream.end());
+    unsigned int checksum = 0;
+    memcpy(&checksum, &hash, sizeof(checksum));
+    memcpy((char*)&stream[CMessageHeader::CHECKSUM_OFFSET], &checksum, sizeof(checksum));
+    CSerializeData out;
+    stream.GetAndClear(out);
+    return out;
+}
+
+static void DeliverFramed(CNode& node, const std::string& command, size_t payloadBytes = 0)
+{
+    CSerializeData bytes = FramedMessage(command, payloadBytes);
+    LOCK(node.cs_vRecvMsg);
+    BOOST_REQUIRE(node.ReceiveMsgBytes((const char*)&bytes[0], bytes.size()));
+}
+
+static void DeliverEmptyHeaders(CNode& node)
+{
+    CDataStream payload(SER_NETWORK, INIT_PROTO_VERSION);
+    std::vector<CBlock> headers;
+    payload << headers;
+    CDataStream wire(SER_NETWORK, INIT_PROTO_VERSION);
+    wire << CMessageHeader("headers", 0);
+    wire.write((const char*)&payload[0], payload.size());
+    unsigned int size = payload.size();
+    memcpy((char*)&wire[CMessageHeader::MESSAGE_SIZE_OFFSET], &size, sizeof(size));
+    uint256 hash = Hash(payload.begin(), payload.end());
+    unsigned int checksum = 0;
+    memcpy(&checksum, &hash, sizeof(checksum));
+    memcpy((char*)&wire[CMessageHeader::CHECKSUM_OFFSET], &checksum, sizeof(checksum));
+    LOCK(node.cs_vRecvMsg);
+    BOOST_REQUIRE(node.ReceiveMsgBytes((const char*)&wire[0], wire.size()));
+}
+
 static void PreparePeerForRecovery(CNode& node, int nVersion, int nPeerHeight)
 {
     PreparePeerForSendMessages(node, nVersion);
@@ -8623,6 +8668,240 @@ BOOST_AUTO_TEST_CASE(late_receive_preserves_reassigned_owner_full_lifecycle)
     BOOST_CHECK(peerB.setBlocksInFlight.empty());
     BOOST_CHECK_EQUAL(peerA.mapBlockInFlightSince.count(hash), 0U);
     BOOST_CHECK_EQUAL(peerB.mapBlockInFlightSince.count(hash), 0U);
+}
+
+BOOST_AUTO_TEST_CASE(priority_headers_outbound_bypasses_unsent_bulk)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(70), "priority-out", true);
+    peer.vSendMsg.push_back(FramedMessage("block", 32));
+    peer.vSendMeta.push_back(SendMessageMeta());
+    peer.vSendMeta.back().command = "block";
+    peer.nSendSize = peer.vSendMsg.front().size();
+    peer.fNextHeadersResponsePriority = true;
+    std::vector<CBlock> headers;
+    peer.PushMessage("headers", headers);
+    const std::vector<std::string> commands = SentCommands(peer);
+    BOOST_REQUIRE_EQUAL(commands.size(), 2U);
+    BOOST_CHECK_EQUAL(commands[0], "headers");
+    BOOST_CHECK_EQUAL(commands[1], "block");
+}
+
+BOOST_AUTO_TEST_CASE(priority_headers_never_interrupts_partial_send)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(71), "priority-partial", true);
+    peer.vSendMsg.push_back(FramedMessage("block", 32));
+    peer.vSendMeta.push_back(SendMessageMeta());
+    peer.vSendMeta.back().command = "block";
+    peer.nSendSize = peer.vSendMsg.front().size();
+    peer.nSendOffset = 1;
+    peer.fNextHeadersResponsePriority = true;
+    std::vector<CBlock> headers;
+    peer.PushMessage("headers", headers);
+    const std::vector<std::string> commands = SentCommands(peer);
+    BOOST_REQUIRE_EQUAL(commands.size(), 2U);
+    BOOST_CHECK_EQUAL(commands[0], "block");
+    BOOST_CHECK_EQUAL(commands[1], "headers");
+}
+
+BOOST_AUTO_TEST_CASE(ordinary_headers_outbound_remains_fifo)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(72), "ordinary-out", true);
+    peer.vSendMsg.push_back(FramedMessage("block", 32));
+    peer.vSendMeta.push_back(SendMessageMeta());
+    peer.vSendMeta.back().command = "block";
+    peer.nSendSize = peer.vSendMsg.front().size();
+    std::vector<CBlock> headers;
+    peer.PushMessage("headers", headers);
+    const std::vector<std::string> commands = SentCommands(peer);
+    BOOST_REQUIRE_EQUAL(commands.size(), 2U);
+    BOOST_CHECK_EQUAL(commands[0], "block");
+    BOOST_CHECK_EQUAL(commands[1], "headers");
+}
+
+BOOST_AUTO_TEST_CASE(solicited_headers_inbound_bypasses_complete_blocks)
+{
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeadersObserve = true; fSPVMode = false;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(73), "priority-in", true);
+    BOOST_REQUIRE_EQUAL(peer.getHeadersSync.Start("priority", TEST_TIME),
+                        CGetHeadersSyncState::STARTED);
+    DeliverFramed(peer, "block", 8);
+    DeliverEmptyHeaders(peer);
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 1U);
+    BOOST_CHECK_EQUAL(peer.vRecvMsg.front().hdr.GetCommand(), "block");
+    BOOST_CHECK(peer.mapAskFor.empty());
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK_EQUAL(peer.deferredBlockInv.size(), 0U);
+    fSPVMode = savedSpv; fIbdHeadersObserve = savedObserve;
+}
+
+BOOST_AUTO_TEST_CASE(priority_inbound_obeys_message_scan_bound)
+{
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeadersObserve = true; fSPVMode = false;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(74), "priority-count", true);
+    peer.getHeadersSync.Start("count", TEST_TIME);
+    for (size_t i = 0; i < 256; ++i) DeliverFramed(peer, "block", 1);
+    DeliverEmptyHeaders(peer);
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 256U);
+    BOOST_CHECK_EQUAL(peer.vRecvMsg.front().hdr.GetCommand(), "block");
+    BOOST_CHECK_EQUAL(peer.vRecvMsg.back().hdr.GetCommand(), "headers");
+    fSPVMode = savedSpv; fIbdHeadersObserve = savedObserve;
+}
+
+BOOST_AUTO_TEST_CASE(priority_inbound_obeys_byte_scan_bound)
+{
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeadersObserve = true; fSPVMode = false;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(75), "priority-bytes", true);
+    peer.getHeadersSync.Start("bytes", TEST_TIME);
+    DeliverFramed(peer, "block", 16 * 1024 * 1024);
+    DeliverEmptyHeaders(peer);
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 1U);
+    BOOST_CHECK_EQUAL(peer.vRecvMsg.front().hdr.GetCommand(), "headers");
+    fSPVMode = savedSpv; fIbdHeadersObserve = savedObserve;
+}
+
+BOOST_AUTO_TEST_CASE(priority_inbound_dispatches_at_most_one_per_pass)
+{
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeadersObserve = true; fSPVMode = false;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(76), "priority-one", true);
+    peer.getHeadersSync.Start("one", TEST_TIME);
+    DeliverFramed(peer, "block", 1);
+    DeliverEmptyHeaders(peer);
+    DeliverEmptyHeaders(peer);
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 2U);
+    BOOST_CHECK_EQUAL(peer.vRecvMsg.front().hdr.GetCommand(), "block");
+    BOOST_CHECK_EQUAL(peer.vRecvMsg.back().hdr.GetCommand(), "headers");
+    fSPVMode = savedSpv; fIbdHeadersObserve = savedObserve;
+}
+
+BOOST_AUTO_TEST_CASE(priority_disabled_and_spv_preserve_fifo)
+{
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(77), "priority-disabled", true);
+    peer.getHeadersSync.Start("disabled", TEST_TIME);
+    fIbdHeadersObserve = false; fSPVMode = false;
+    DeliverFramed(peer, "block", 1); DeliverEmptyHeaders(peer);
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    BOOST_CHECK_EQUAL(peer.vRecvMsg.front().hdr.GetCommand(), "headers");
+    CNode spvPeer(INVALID_SOCKET, TestPeerAddress(78), "priority-spv", true);
+    spvPeer.getHeadersSync.Start("spv", TEST_TIME);
+    fIbdHeadersObserve = true; fSPVMode = true;
+    DeliverFramed(spvPeer, "block", 1); DeliverEmptyHeaders(spvPeer);
+    { LOCK(spvPeer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&spvPeer, criticalblock)); }
+    BOOST_CHECK_EQUAL(spvPeer.vRecvMsg.front().hdr.GetCommand(), "headers");
+    fSPVMode = savedSpv; fIbdHeadersObserve = savedObserve;
+}
+
+namespace {
+boost::mutex g_extract_hook_mutex;
+boost::condition_variable g_extract_hook_cv;
+bool g_extract_hook_entered = false;
+bool g_extract_hook_release = false;
+
+void WaitAfterExtractHook()
+{
+    boost::unique_lock<boost::mutex> lock(g_extract_hook_mutex);
+    g_extract_hook_entered = true;
+    g_extract_hook_cv.notify_all();
+    while (!g_extract_hook_release)
+        g_extract_hook_cv.wait(lock);
+}
+
+void ProcessOneQueuedMessage(CNode* peer)
+{
+    LOCK(peer->cs_vRecvMsg);
+    ProcessMessages(peer, criticalblock);
+}
+}
+
+BOOST_AUTO_TEST_CASE(extracted_message_releases_queue_lock_and_survives_mutation)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(79), "extract-lock", true);
+    DeliverFramed(peer, "unknown-one", 1024);
+    g_extract_hook_entered = false;
+    g_extract_hook_release = false;
+    g_processMessagesPostExtractHook = &WaitAfterExtractHook;
+
+    boost::thread handler(boost::bind(&ProcessOneQueuedMessage, &peer));
+    {
+        boost::unique_lock<boost::mutex> lock(g_extract_hook_mutex);
+        while (!g_extract_hook_entered)
+            g_extract_hook_cv.wait(lock);
+    }
+
+    // The handler is paused after extraction but before dispatch. This is the
+    // same lock/socket mutation performed by ReceiveMsgBytes.
+    DeliverFramed(peer, "unknown-two", 8);
+    {
+        LOCK(peer.cs_vRecvMsg);
+        BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 1U);
+        BOOST_CHECK_EQUAL(peer.vRecvMsg.front().hdr.GetCommand(), "unknown-two");
+    }
+    {
+        boost::unique_lock<boost::mutex> lock(g_extract_hook_mutex);
+        g_extract_hook_release = true;
+        g_extract_hook_cv.notify_all();
+    }
+    handler.join();
+    g_processMessagesPostExtractHook = NULL;
+
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    LOCK(peer.cs_vRecvMsg);
+    BOOST_CHECK(peer.vRecvMsg.empty());
+}
+
+BOOST_AUTO_TEST_CASE(extraction_is_exactly_once_without_loss_or_duplication)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(80), "extract-once", true);
+    DeliverFramed(peer, "unknown-a", 1);
+    DeliverFramed(peer, "unknown-b", 1);
+    DeliverFramed(peer, "unknown-c", 1);
+    for (size_t expected = 2; ; --expected)
+    {
+        { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+        LOCK(peer.cs_vRecvMsg);
+        BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), expected);
+        if (expected == 0) break;
+        const std::string wanted = expected == 2 ? "unknown-b" : "unknown-c";
+        BOOST_CHECK_EQUAL(peer.vRecvMsg.front().hdr.GetCommand(), wanted);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(incomplete_frame_is_not_extracted)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(81), "extract-incomplete", true);
+    CSerializeData bytes = FramedMessage("unknown-partial", 8);
+    {
+        LOCK(peer.cs_vRecvMsg);
+        BOOST_REQUIRE(peer.ReceiveMsgBytes((const char*)&bytes[0], 12));
+        BOOST_REQUIRE(ProcessMessages(&peer, criticalblock));
+        BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 1U);
+        BOOST_CHECK(!peer.vRecvMsg.front().complete());
+    }
+}
+
+BOOST_AUTO_TEST_CASE(disconnect_before_extraction_preserves_queued_frame)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(82), "extract-disconnect", true);
+    DeliverFramed(peer, "unknown-disconnect", 1);
+    peer.fDisconnect = true;
+    {
+        LOCK(peer.cs_vRecvMsg);
+        BOOST_REQUIRE(ProcessMessages(&peer, criticalblock));
+        BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 1U);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

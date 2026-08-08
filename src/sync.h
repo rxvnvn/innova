@@ -145,6 +145,15 @@ public:
             LeaveCritical();
     }
 
+    void Unlock()
+    {
+        if (lock.owns_lock())
+        {
+            lock.unlock();
+            LeaveCritical();
+        }
+    }
+
     operator bool()
     {
         return lock.owns_lock();

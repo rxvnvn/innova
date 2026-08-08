@@ -212,6 +212,38 @@ Changing the flag at runtime is not required in v1; startup selection avoids
 unsafe mid-flight scheduler handoff. Existing requests drain or are cleaned by
 normal ownership rules.
 
+### 5.1 Control-plane progress invariant
+
+Stage-1 runtime evidence exposed a prerequisite not represented by the original
+state table:
+
+> During IBD, saturation of either outbound or inbound block-data queues must
+> not indefinitely delay a bounded, solicited ordered-chain control-plane
+> response. Control priority is bounded in turn and cannot indefinitely delay
+> block-data progress.
+
+The control plane is the `getheaders` request lifecycle, expected `headers`
+ingestion, provisional graph/branch updates, authoritative anchor, continuation
+locator, and scheduler frontier metadata. The data plane is block payload
+receive, ownership, `ProcessBlock`, orphan handling, database work, and active
+chain connection.
+
+Current `vSendMsg` and per-peer `vRecvMsg` are strict FIFO queues shared by both
+planes. `ProcessMessages()` selects one complete ordinary message per peer
+visit. The Stage-1 capture measured complete-block-frame-to-dispatch delay up to
+146.4 seconds while `cs_main` acquisition wait peaked at only 15 microseconds.
+Also, `net: to ... headers` records serialization into `vSendMsg`, not a socket
+write, so the retained capture cannot split source send-queue delay from
+receiver receive-queue delay.
+
+Before Stage 2, implement and validate bounded `PRIORITY DISPATCH` as specified
+in `doc/forensics/ibd-header-dispatch-starvation-audit.md`: one solicited IBD
+headers response per peer/pass may bypass not-yet-started bulk block messages at
+both message-boundary FIFOs. Complete framing/checksum, the 2,000-header limit,
+one outstanding request per peer, bounded scans, SPV behavior, and graph
+mutation under `cs_main` remain unchanged. No separate thread or consensus path
+is introduced.
+
 ## 6. Headers-first and legacy dual capability
 
 ### Preferred path
@@ -470,6 +502,10 @@ Implemented Stage-1 ownership and isolation facts:
 
 ### Stage 2 — experimental selection
 
+Stage 2 is blocked until Stage 1b priority dispatch passes focused tests and an
+observation-only saturated-pipeline capture proves bounded header
+frame-to-dispatch latency across repeated continuation rounds.
+
 Under `select && IsInitialBlockDownload()`:
 
 - bypass `TryAdmitBlockInvOrDefer`, deferred refill, frontier exemption,
@@ -583,3 +619,15 @@ graph/selector state and tests, leaving wire behavior unchanged. The first
 coding step is to add `CIbdHeaderGraph` with contiguous anchored insertion,
 ancestor lookup, branch quarantine, and deterministic ordered-window tests;
 peer assignment and runtime hooks follow only after that state model passes.
+
+
+## Stage 1b runtime result (2026-08-08)
+
+Bounded priority at both FIFO boundaries plus extraction-before-dispatch was
+implemented without changing request selection. The graph advanced past the
+old 4,000-header failure to 16,000 with correct anchor movement and no graph
+integrity errors. However, complete-frame-to-dispatch latency grew to 31.616 s
+because the single handler cannot preempt an already-running `ProcessBlock` or
+header insertion. Thus the control-plane wall-clock invariant is not yet met
+and Stage 2 remains blocked. See
+`doc/forensics/ibd-header-dispatch-starvation-audit.md`.

@@ -63,7 +63,7 @@ void DrainMessages(CNode& node)
         BOOST_CHECK_MESSAGE(!node.fDisconnect, "peer unexpectedly disconnected");
         BOOST_CHECK_MESSAGE(node.nSendSize < SendBufferSize(), "send buffer full");
     }
-    BOOST_REQUIRE(ProcessMessages(&node));
+    { LOCK(node.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&node, criticalblock)); }
 }
 
 // Put the peer in the "ping outstanding" state used by the scheduler/accounting.

@@ -9468,6 +9468,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                    hashStop.ToString().c_str());
         }
 
+        // A direct getheaders response is solicited. The wire protocol does not
+        // expose whether the requester is in IBD, so bounded responder priority
+        // safely applies to every direct response (including SPV requesters).
+        pfrom->fNextHeadersResponsePriority = true;
         pfrom->PushMessage("headers", vHeaders);
     }
 
@@ -9494,7 +9498,15 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             nHeadersDiagCount = nCount;
         }
 
+        const int64_t nHeadersCsMainWaitBegin = GetTimeMicros();
         LOCK(cs_main);
+        const int64_t nHeadersCsMainAcquired = GetTimeMicros();
+        if (fIbdHeadersObserve)
+            printf("IBD_HEADER_DISPATCH event=cs_main_acquired peer=%lld wait_begin_us=%lld acquired_us=%lld wait_us=%lld\n",
+               (long long)pfrom->GetId(),
+               (long long)nHeadersCsMainWaitBegin,
+               (long long)nHeadersCsMainAcquired,
+               (long long)(nHeadersCsMainAcquired - nHeadersCsMainWaitBegin));
 
         RecordGetHeadersResponse(pfrom, vHeaders.size(), nHeadersBytes);
 
@@ -9525,6 +9537,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                    graphTip ? graphTip->height : -1,
                    graphTip ? graphTip->height - g_ibdHeadersObserver.Graph().AnchorHeight() : -1,
                    observerResult.continueHeaders ? 1 : 0);
+            printf("IBD_HEADER_DISPATCH event=graph_insert_complete peer=%lld complete_us=%lld count=%zu graph_tip_height=%d\n",
+                   (long long)pfrom->GetId(), (long long)GetTimeMicros(),
+                   vHeaders.size(), graphTip ? graphTip->height : -1);
             if (observerResult.expectedResponse)
             {
                 if (observerResult.continueHeaders &&
@@ -10596,8 +10611,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     return true;
 }
 
+void (*g_processMessagesPostExtractHook)() = NULL;
+
 // requires LOCK(cs_vRecvMsg)
-bool ProcessMessages(CNode* pfrom)
+bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
 {
     //if (fDebug)
     //    printf("ProcessMessages(%zu messages)\n", pfrom->vRecvMsg.size());
@@ -10612,32 +10629,93 @@ bool ProcessMessages(CNode* pfrom)
     //
     bool fOk = true;
 
-    if (!pfrom->vRecvGetData.empty())
+    size_t nPriorityIndex = std::numeric_limits<size_t>::max();
+    size_t nPriorityScannedBytes = 0;
+    size_t nPriorityScannedMessages = 0;
+    if (fIbdHeadersObserve && !fSPVMode &&
+        pfrom->getHeadersSync.IsInFlight())
+    {
+        const size_t nMaxMessages = 256;
+        const size_t nMaxBytes = 16 * 1024 * 1024;
+        for (size_t i = 0; i < pfrom->vRecvMsg.size(); ++i)
+        {
+            CNetMessage& candidate = pfrom->vRecvMsg[i];
+            if (!candidate.complete())
+                break;
+            if (nPriorityScannedMessages >= nMaxMessages ||
+                candidate.hdr.nMessageSize > nMaxBytes - nPriorityScannedBytes)
+            {
+                printf("IBD_HEADER_DISPATCH event=scan_exhausted peer=%lld messages=%zu bytes=%zu queue_messages=%zu\n",
+                       (long long)pfrom->GetId(), nPriorityScannedMessages,
+                       nPriorityScannedBytes, pfrom->vRecvMsg.size());
+                break;
+            }
+            ++nPriorityScannedMessages;
+            nPriorityScannedBytes += candidate.hdr.nMessageSize;
+            if (candidate.hdr.IsValid() &&
+                candidate.hdr.GetCommand() == "headers")
+            {
+                uint256 candidateHash = Hash(
+                    candidate.vRecv.begin(),
+                    candidate.vRecv.begin() + candidate.hdr.nMessageSize);
+                unsigned int candidateChecksum = 0;
+                memcpy(&candidateChecksum, &candidateHash, sizeof(candidateChecksum));
+                if (candidateChecksum == candidate.hdr.nChecksum)
+                {
+                    nPriorityIndex = i;
+                    printf("IBD_HEADER_DISPATCH event=priority_selected peer=%lld frame_us=%lld selected_us=%lld queue_delay_us=%lld bypass_count=%zu scanned_messages=%zu scanned_bytes=%zu\n",
+                           (long long)pfrom->GetId(),
+                           (long long)candidate.nTime, (long long)GetTimeMicros(),
+                           (long long)std::max<int64_t>(0, GetTimeMicros() - candidate.nTime),
+                           i, nPriorityScannedMessages, nPriorityScannedBytes);
+                }
+                break;
+            }
+        }
+    }
+    const bool fPrioritySelected =
+        nPriorityIndex != std::numeric_limits<size_t>::max();
+
+    if (!fPrioritySelected && !pfrom->vRecvGetData.empty())
         ProcessGetData(pfrom);
 
     // this maintains the order of responses
-    if (!pfrom->vRecvGetData.empty()) return fOk;
+    if (!fPrioritySelected && !pfrom->vRecvGetData.empty()) return fOk;
 
+    std::unique_ptr<CNetMessage> pExtracted;
+    int64_t nCompleteWaiting = 0;
     std::deque<CNetMessage>::iterator it = pfrom->vRecvMsg.begin();
+    if (fPrioritySelected)
+        it += nPriorityIndex;
     while (!pfrom->fDisconnect && it != pfrom->vRecvMsg.end()) {
         // Don't bother if send buffer is too full to respond anyway
         if (pfrom->nSendSize >= SendBufferSize())
             break;
 
         // get next message
-        CNetMessage& msg = *it;
+        CNetMessage& queuedMsg = *it;
 
         //if (fDebug)
         //    printf("ProcessMessages(message %u msgsz, %zu bytes, complete:%s)\n",
-        //            msg.hdr.nMessageSize, msg.vRecv.size(),
-        //            msg.complete() ? "Y" : "N");
+        //            queuedMsg.hdr.nMessageSize, queuedMsg.vRecv.size(),
+        //            queuedMsg.complete() ? "Y" : "N");
 
         // end, if an incomplete message is found
-        if (!msg.complete())
+        if (!queuedMsg.complete())
             break;
 
-        // at this point, any failure means we can delete the current message
-        it++;
+        // Move and erase exactly one complete frame while the receive-queue
+        // lock is held. No queue reference survives recvLock.Unlock().
+        for (std::deque<CNetMessage>::const_iterator itWait = it + 1;
+             itWait != pfrom->vRecvMsg.end(); ++itWait)
+            if (itWait->complete())
+                ++nCompleteWaiting;
+        pExtracted.reset(new CNetMessage(std::move(queuedMsg)));
+        pfrom->vRecvMsg.erase(it);
+        recvLock.Unlock();
+        if (g_processMessagesPostExtractHook)
+            g_processMessagesPostExtractHook();
+        CNetMessage& msg = *pExtracted;
 
         // Scan for message start
         if (memcmp(msg.hdr.pchMessageStart, pchMessageStart, sizeof(pchMessageStart)) != 0) {
@@ -10651,7 +10729,7 @@ bool ProcessMessages(CNode* pfrom)
         if (!hdr.IsValid())
         {
             printf("\n\nPROCESSMESSAGE: ERRORS IN HEADER %s\n\n\n", hdr.GetCommand().c_str());
-            continue;
+            break;
         }
         string strCommand = hdr.GetCommand();
 
@@ -10667,7 +10745,7 @@ bool ProcessMessages(CNode* pfrom)
         {
             printf("ProcessMessages(%s, %u bytes) : CHECKSUM ERROR nChecksum=%08x hdr.nChecksum=%08x\n",
                strCommand.c_str(), nMessageSize, nChecksum, hdr.nChecksum);
-            continue;
+            break;
         }
 
         RecordP2PMessageStat(pfrom, strCommand, nMessageSize, true);
@@ -10679,17 +10757,16 @@ bool ProcessMessages(CNode* pfrom)
             if (ibdactivepath::IBDActivePathTraceEnabled() &&
                 strCommand == "block")
             {
-                int64_t nCompleteWaiting = 0;
-                for (std::deque<CNetMessage>::const_iterator itWait = it;
-                     itWait != pfrom->vRecvMsg.end(); ++itWait)
-                    if (itWait->complete())
-                        ++nCompleteWaiting;
                 ibdactivepath::RecordBlockDispatchDelay(
                     std::max<int64_t>(0, GetTimeMicros() - msg.nTime),
                     nCompleteWaiting);
             }
             if (PingLifecycleTraceEnabled() && strCommand == "pong")
                 PingLifecycleTracePongProcessBegin(pfrom, msg.nTime);
+            if (fIbdHeadersObserve && strCommand == "headers")
+                printf("IBD_HEADER_DISPATCH event=dispatch_begin peer=%lld frame_us=%lld dispatch_us=%lld priority=%d\n",
+                       (long long)pfrom->GetId(), (long long)msg.nTime,
+                       (long long)GetTimeMicros(), fPrioritySelected ? 1 : 0);
             fRet = ProcessMessage(pfrom, strCommand, vRecv, msg.nTime);
             boost::this_thread::interruption_point();
         }
@@ -10732,10 +10809,6 @@ bool ProcessMessages(CNode* pfrom)
 
         break;
     }
-
-    // In case the connection got shut down, its receive buffer was wiped
-    if (!pfrom->fDisconnect)
-        pfrom->vRecvMsg.erase(pfrom->vRecvMsg.begin(), it);
 
     return fOk;
 }

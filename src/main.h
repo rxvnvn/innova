@@ -527,7 +527,9 @@ bool ReconsiderBlock(const uint256& hash, std::string& strError);
 // loaded and the naive pindexBest reconstructed: rolls the best chain back to
 // the highest valid ancestor if it descends from an operator-invalidated block.
 bool RecoverFromInvalidatedBestChain();
-bool ProcessMessages(CNode* pfrom);
+// Test-only synchronization seam, NULL in production. Runs after frame extraction and cs_vRecvMsg release.
+extern void (*g_processMessagesPostExtractHook)();
+bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock);
 bool SendMessages(CNode* pto, bool fSendTrickle,
                   const std::vector<CNode*>& vNodesCopy = std::vector<CNode*>());
 bool LoadExternalBlockFile(FILE* fileIn);

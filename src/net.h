@@ -1103,13 +1103,16 @@ struct SendMessageMeta
     int64_t firstSendUs;         // wall-clock of the first successful send() (0 = pending)
     size_t nSendSizeAtFirstSend; // peer nSendSize at that first send (0 = pending)
     bool fStampPending;          // true until the first byte of this message is written
+    bool fPriorityHeaders;       // solicited getheaders response; may bypass unsent bulk
+    int64_t enqueueUs;           // append time for control-plane latency telemetry
     // For a getdata message: the block hashes it carries, in wire order,
     // associated so the socket-send path can stamp each in-flight hash's
     // wire-origin time.  Empty for every other message type.
     std::vector<uint256> vBlockHashes;
 
     SendMessageMeta()
-        : firstSendUs(0), nSendSizeAtFirstSend(0), fStampPending(true)
+        : firstSendUs(0), nSendSizeAtFirstSend(0), fStampPending(true),
+          fPriorityHeaders(false), enqueueUs(0)
     {
     }
 };
@@ -1149,6 +1152,7 @@ public:
     size_t nSendOffset; // offset inside the first vSendMsg already sent
     std::deque<CSerializeData> vSendMsg;
     std::deque<SendMessageMeta> vSendMeta; // parallel to vSendMsg (cs_vSend)
+    bool fNextHeadersResponsePriority; // consumed by EndMessage under cs_vSend
     CCriticalSection cs_vSend;
     CCriticalSection cs_vRecv;
 	std::deque<CInv> vRecvGetData;
@@ -1385,6 +1389,7 @@ public:
         }
         nSendSize = 0;
         nSendOffset = 0;
+        fNextHeadersResponsePriority = false;
         hashContinue = 0;
         pindexLastGetBlocksBegin = 0;
         nRecoveryTracePendingId = 0;
@@ -1899,22 +1904,46 @@ public:
             printf("(%d bytes)\n", nSize);
         }
 
-        std::deque<CSerializeData>::iterator it = vSendMsg.insert(vSendMsg.end(), CSerializeData());
-        ssSend.GetAndClear(*it);
-        nSendSize += (*it).size();
-        vSendMeta.push_back(SendMessageMeta());
-        vSendMeta.back().command = strMessageCommand;
+        CSerializeData messageData;
+        ssSend.GetAndClear(messageData);
+        SendMessageMeta messageMeta;
+        messageMeta.command = strMessageCommand;
+        messageMeta.enqueueUs = GetTimeMicros();
+        messageMeta.fPriorityHeaders =
+            strMessageCommand == "headers" && fNextHeadersResponsePriority;
+        if (strMessageCommand == "headers")
+            fNextHeadersResponsePriority = false;
+
+        size_t nInsertPos = vSendMsg.size();
+        size_t nBypassed = 0;
+        if (messageMeta.fPriorityHeaders)
+        {
+            nInsertPos = nSendOffset > 0 ? 1 : 0;
+            while (nInsertPos < vSendMeta.size() &&
+                   vSendMeta[nInsertPos].fPriorityHeaders)
+                ++nInsertPos;
+            nBypassed = vSendMsg.size() - nInsertPos;
+        }
+        std::deque<CSerializeData>::iterator it =
+            vSendMsg.insert(vSendMsg.begin() + nInsertPos, messageData);
+        vSendMeta.insert(vSendMeta.begin() + nInsertPos, messageMeta);
+        nSendSize += messageData.size();
         // Associate the block hashes carried by this getdata message so the
         // socket-send path can stamp each in-flight hash's wire-origin time.
         // The staging vector is only non-empty while PushBlockGetData is
         // serializing a batch; it is swapped (emptied) here, so a getdata built
         // through plain PushMessage carries no hash association.
         if (strMessageCommand == "getdata" && !vPendingGetDataHashes.empty())
-            vSendMeta.back().vBlockHashes.swap(vPendingGetDataHashes);
+            vSendMeta[nInsertPos].vBlockHashes.swap(vPendingGetDataHashes);
         else
             vPendingGetDataHashes.clear();
 
-        // If write queue empty, attempt "optimistic write"
+        if (messageMeta.fPriorityHeaders)
+            printf("IBD_HEADER_DISPATCH event=response_queued peer=%lld sequence=0 enqueue_us=%lld bytes=%zu bypass_count=%zu queue_messages=%zu\n",
+                   (long long)GetId(), (long long)messageMeta.enqueueUs,
+                   messageData.size(), nBypassed, vSendMsg.size());
+
+        // If inserted at the writable head, attempt an optimistic write.
         if (it == vSendMsg.begin())
             SocketSendData(this);
 
