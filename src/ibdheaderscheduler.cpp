@@ -3,6 +3,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "ibdheaderscheduler.h"
+#include "util.h"
 
 #include <algorithm>
 
@@ -18,7 +19,8 @@ CIbdHeaderNode::CIbdHeaderNode(const uint256& hashIn, const uint256& prevIn)
 }
 
 CIbdHeaderGraph::CIbdHeaderGraph()
-    : m_has_anchor(false), m_anchor_height(-1)
+    : m_has_anchor(false), m_anchor_height(-1),
+      m_fast_anchor_advances(0), m_full_reanchors(0)
 {
 }
 
@@ -54,6 +56,25 @@ bool CIbdHeaderGraph::Reanchor(const uint256& hash, int height)
         return false;
     if (hash == m_anchor_hash && height == m_anchor_height)
         return true;
+
+    NodeMap::iterator oldAnchor = m_nodes.find(m_anchor_hash);
+    NodeMap::iterator nextAnchor = m_nodes.find(hash);
+    if (oldAnchor != m_nodes.end() && nextAnchor != m_nodes.end() &&
+        height == m_anchor_height + 1 &&
+        nextAnchor->second.prev == m_anchor_hash &&
+        nextAnchor->second.height == height &&
+        nextAnchor->second.state == CIbdHeaderNode::ACTIVE &&
+        !nextAnchor->second.permanently_quarantined)
+    {
+        oldAnchor->second.state = CIbdHeaderNode::ELIGIBLE;
+        nextAnchor->second.state = CIbdHeaderNode::AUTHORITATIVE_ANCHOR;
+        m_anchor_hash = hash;
+        m_anchor_height = height;
+        ++m_fast_anchor_advances;
+        return true;
+    }
+
+    ++m_full_reanchors;
     std::vector<uint256> suffix;
     if (IsDescendantOf(m_active_tip, hash))
         suffix = GetActiveWindow(hash, m_nodes.size());
@@ -347,8 +368,8 @@ bool CIbdHeaderGraph::CheckInvariants() const
         const CIbdHeaderNode* parent = Lookup(node.prev);
         if (node.IsAnchored())
         {
-            if (!parent || !parent->IsAnchored() ||
-                node.height != parent->height + 1)
+            if (node.height >= m_anchor_height && ( !parent || !parent->IsAnchored() ||
+                node.height != parent->height + 1))
                 return false;
         }
         if (node.state == CIbdHeaderNode::ACTIVE &&
@@ -475,18 +496,26 @@ void CIbdHeadersObserver::Clear()
     m_sources.clear();
     m_counters = Counters();
 }
-
 bool CIbdHeadersObserver::UpdateAnchor(const uint256& hash, int height)
 {
     if (!m_enabled || hash == 0 || height < 0) return false;
     if (m_graph.HasAnchor() && m_graph.AnchorHash() == hash &&
         m_graph.AnchorHeight() == height) return true;
+    const int oldHeight = m_graph.AnchorHeight();
+    const uint64_t fastBefore = m_graph.FastAnchorAdvanceCount();
+    const uint64_t fullBefore = m_graph.FullReanchorCount();
+    const int64_t startUs = GetTimeMicros();
     bool ok = m_graph.HasAnchor() ? m_graph.Reanchor(hash, height) :
                                    m_graph.SetAuthoritativeAnchor(hash, height);
-    if (ok) { ++m_counters.anchorUpdates;
+    if (ok) {
+        ++m_counters.anchorUpdates;
         for (std::map<uint256, std::set<int64_t> >::iterator it = m_sources.begin();
              it != m_sources.end();)
             if (!m_graph.Lookup(it->first)) m_sources.erase(it++); else ++it;
+        printf("IBD_HEADER_ANCHOR event=update old_height=%d new_height=%d duration_us=%lld fast=%llu full=%llu\n",
+               oldHeight, height, (long long)(GetTimeMicros() - startUs),
+               (unsigned long long)(m_graph.FastAnchorAdvanceCount() - fastBefore),
+               (unsigned long long)(m_graph.FullReanchorCount() - fullBefore));
     }
     return ok;
 }

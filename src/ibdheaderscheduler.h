@@ -74,6 +74,8 @@ public:
     void Clear();
     bool Empty() const { return m_nodes.empty(); }
     std::size_t Size() const { return m_nodes.size(); }
+    uint64_t FastAnchorAdvanceCount() const { return m_fast_anchor_advances; }
+    uint64_t FullReanchorCount() const { return m_full_reanchors; }
 
     /** Reset the graph around one immutable authoritative hash/height anchor. */
     bool SetAuthoritativeAnchor(const uint256& hash, int height);
@@ -131,6 +133,8 @@ private:
     uint256 m_anchor_hash;
     int m_anchor_height;
     uint256 m_active_tip;
+    uint64_t m_fast_anchor_advances;
+    uint64_t m_full_reanchors;
 
     void ConnectDescendants(const uint256& parentHash);
     void ExtendActiveTipIfUnambiguous();

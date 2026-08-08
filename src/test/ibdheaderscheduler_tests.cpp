@@ -308,4 +308,75 @@ BOOST_AUTO_TEST_CASE(batch_insert_preserves_quarantine_and_reanchor)
     BOOST_CHECK(graph.ActiveTip()->hash == H(102));
 }
 
+BOOST_AUTO_TEST_CASE(sequential_anchor_fast_path_benchmark_and_invariants)
+{
+    CIbdHeaderGraph graph;
+    BOOST_REQUIRE(graph.SetAuthoritativeAnchor(H(1000), 0));
+    const std::size_t count = 10000;
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.reserve(count);
+    for (std::size_t i = 1; i <= count; ++i)
+        headers.push_back(std::make_pair(H(1000 + i), H(999 + i)));
+    const std::vector<CIbdHeaderGraph::InsertResult> inserted =
+        graph.InsertBatch(headers);
+    BOOST_REQUIRE_EQUAL(inserted.size(), count);
+    const std::clock_t start = std::clock();
+    for (std::size_t i = 1; i <= count; ++i)
+    {
+        BOOST_REQUIRE(graph.Reanchor(H(1000 + i), (int)i));
+        BOOST_CHECK(graph.ActiveTip()->hash == H(1000 + count));
+        BOOST_CHECK(graph.AnchorHash() == H(1000 + i));
+        BOOST_CHECK(graph.AnchorHeight() == (int)i);
+        if (i < count) BOOST_CHECK(graph.Lookup(H(1001 + i))->state == CIbdHeaderNode::ACTIVE);
+        if (i == 1 || i % 100 == 0 || i == count) {
+            const std::vector<uint256> window = graph.GetActiveWindow(H(1000 + i), 5);
+            const std::size_t expected = std::min<std::size_t>(5, count - i);
+            BOOST_CHECK(window.size() == expected);
+            if (!window.empty()) BOOST_CHECK(window.front() == H(1001 + i));
+            BOOST_CHECK(graph.BuildContinuationLocator(4).back() == H(1000 + i));
+        }
+        if (i == 1 || i % 1000 == 0 || i == count)
+            BOOST_CHECK(graph.CheckInvariants());
+    }
+    const double elapsedMs = 1000.0 * (std::clock() - start) / CLOCKS_PER_SEC;
+    std::printf("IBD_HEADER_ANCHOR_BENCH advances=%zu elapsed_ms=%.3f fast=%llu full=%llu\n",
+                count, elapsedMs,
+                (unsigned long long)graph.FastAnchorAdvanceCount(),
+                (unsigned long long)graph.FullReanchorCount());
+    BOOST_CHECK_EQUAL(graph.FastAnchorAdvanceCount(), (uint64_t)count);
+    BOOST_CHECK_EQUAL(graph.FullReanchorCount(), (uint64_t)0);
+}
+
+BOOST_AUTO_TEST_CASE(anchor_fast_path_preserves_sources_quarantine_and_reorg_fallback)
+{
+    CIbdHeadersObserver observer(8);
+    observer.SetEnabled(true);
+    BOOST_REQUIRE(observer.UpdateAnchor(H(1), 0));
+    observer.MarkHeaderRequest(7);
+    std::vector<std::pair<uint256, uint256> > observerHeaders;
+    for (uint64_t i = 2; i <= 6; ++i)
+        observerHeaders.push_back(std::make_pair(H(i), H(i - 1)));
+    observer.ObserveHeaders(7, observerHeaders);
+    BOOST_REQUIRE(observer.UpdateAnchor(H(2), 1));
+    BOOST_CHECK(observer.HeaderSources(H(4)).size() == 1U);
+    BOOST_CHECK(observer.Graph().Lookup(H(2))->state ==
+                CIbdHeaderNode::AUTHORITATIVE_ANCHOR);
+    BOOST_CHECK(observer.Graph().Lookup(H(3))->state ==
+                CIbdHeaderNode::ACTIVE);
+
+    CIbdHeaderGraph graph;
+    BOOST_REQUIRE(graph.SetAuthoritativeAnchor(H(1), 0));
+    BOOST_REQUIRE(graph.Insert(H(2), H(1)) == CIbdHeaderGraph::INSERTED_ACTIVE);
+    BOOST_REQUIRE(graph.Insert(H(3), H(2)) == CIbdHeaderGraph::INSERTED_ACTIVE);
+    BOOST_REQUIRE(graph.Insert(H(20), H(2)) == CIbdHeaderGraph::INSERTED_ELIGIBLE);
+    BOOST_REQUIRE(graph.QuarantineBranch(H(20)));
+    BOOST_REQUIRE(graph.Reanchor(H(2), 1));
+    BOOST_CHECK(graph.Lookup(H(20))->permanently_quarantined);
+    BOOST_CHECK_EQUAL(graph.FastAnchorAdvanceCount(), (uint64_t)1);
+    BOOST_REQUIRE(graph.Reanchor(H(99), 99));
+    BOOST_CHECK_EQUAL(graph.FullReanchorCount(), (uint64_t)1);
+    BOOST_CHECK(graph.Lookup(H(3)) == NULL);
+    BOOST_CHECK(graph.CheckInvariants());
+}
+
 BOOST_AUTO_TEST_SUITE_END()
