@@ -8960,8 +8960,56 @@ BOOST_AUTO_TEST_CASE(priority_inbound_dispatches_at_most_one_per_pass)
     BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 2U);
     BOOST_CHECK_EQUAL(peer.vRecvMsg.front().hdr.GetCommand(), "block");
     BOOST_CHECK_EQUAL(peer.vRecvMsg.back().hdr.GetCommand(), "headers");
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    BOOST_REQUIRE_EQUAL(peer.vRecvMsg.size(), 1U);
+    BOOST_CHECK_EQUAL(peer.vRecvMsg.front().hdr.GetCommand(), "headers");
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    BOOST_CHECK(peer.vRecvMsg.empty());
     fSPVMode = savedSpv; fIbdHeadersObserve = savedObserve;
 }
+BOOST_AUTO_TEST_CASE(priority_inbound_fairly_alternates_headers_and_blocks)
+{
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeadersObserve = true; fSPVMode = false;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(91), "priority-fair", true);
+    peer.getHeadersSync.Start("fair", TEST_TIME);
+    for (size_t i = 0; i < 128; ++i) DeliverFramed(peer, "block", 1);
+    for (size_t i = 0; i < 128; ++i) DeliverEmptyHeaders(peer);
+
+    for (size_t i = 0; i < 128; ++i)
+    {
+        LOCK(peer.cs_vRecvMsg);
+        BOOST_REQUIRE(ProcessMessages(&peer, criticalblock));
+    }
+
+    size_t remainingBlocks = 0;
+    size_t remainingHeaders = 0;
+    {
+        LOCK(peer.cs_vRecvMsg);
+        for (std::deque<CNetMessage>::const_iterator it = peer.vRecvMsg.begin();
+             it != peer.vRecvMsg.end(); ++it)
+        {
+            if (it->hdr.GetCommand() == "block") ++remainingBlocks;
+            if (it->hdr.GetCommand() == "headers") ++remainingHeaders;
+        }
+    }
+    BOOST_CHECK_EQUAL(remainingBlocks, 64U);
+    BOOST_CHECK_EQUAL(remainingHeaders, 64U);
+
+    for (size_t i = 0; i < 128; ++i)
+    {
+        LOCK(peer.cs_vRecvMsg);
+        BOOST_REQUIRE(ProcessMessages(&peer, criticalblock));
+    }
+    {
+        LOCK(peer.cs_vRecvMsg);
+        BOOST_CHECK(peer.vRecvMsg.empty());
+    }
+    fSPVMode = savedSpv; fIbdHeadersObserve = savedObserve;
+}
+
+
 
 BOOST_AUTO_TEST_CASE(priority_disabled_and_spv_preserve_fifo)
 {

@@ -11059,6 +11059,7 @@ bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
     size_t nPriorityScannedBytes = 0;
     size_t nPriorityScannedMessages = 0;
     if (IbdHeadersControlPlaneEnabled() && !fSPVMode &&
+        !pfrom->fIbdHeaderPriorityNeedsFifo &&
         pfrom->getHeadersSync.IsInFlight())
     {
         const size_t nMaxMessages = 256;
@@ -11101,6 +11102,8 @@ bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
     }
     const bool fPrioritySelected =
         nPriorityIndex != std::numeric_limits<size_t>::max();
+    if (fPrioritySelected)
+        pfrom->fIbdHeaderPriorityNeedsFifo = true;
 
     if (!fPrioritySelected && !pfrom->vRecvGetData.empty())
         ProcessGetData(pfrom);
@@ -11130,6 +11133,8 @@ bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
         if (!queuedMsg.complete())
             break;
 
+        if (!fPrioritySelected && pfrom->fIbdHeaderPriorityNeedsFifo)
+            pfrom->fIbdHeaderPriorityNeedsFifo = false;
         // Move and erase exactly one complete frame while the receive-queue
         // lock is held. No queue reference survives recvLock.Unlock().
         for (std::deque<CNetMessage>::const_iterator itWait = it + 1;

@@ -1158,6 +1158,7 @@ public:
     std::deque<CSerializeData> vSendMsg;
     std::deque<SendMessageMeta> vSendMeta; // parallel to vSendMsg (cs_vSend)
     bool fNextHeadersResponsePriority; // consumed by EndMessage under cs_vSend
+    bool fIbdHeaderPriorityNeedsFifo;
     CCriticalSection cs_vSend;
     CCriticalSection cs_vRecv;
 	std::deque<CInv> vRecvGetData;
@@ -1394,6 +1395,7 @@ public:
         }
         nSendSize = 0;
         nSendOffset = 0;
+        fIbdHeaderPriorityNeedsFifo = false;
         fNextHeadersResponsePriority = false;
         hashContinue = 0;
         pindexLastGetBlocksBegin = 0;
