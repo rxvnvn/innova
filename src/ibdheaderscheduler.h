@@ -109,6 +109,10 @@ public:
     std::vector<uint256> GetActiveWindow(const uint256& frontier,
                                          std::size_t windowSize) const;
 
+    /** Newest provisional hashes first; authoritative anchor last. */
+    std::vector<uint256> BuildContinuationLocator(
+        std::size_t maxEntries = 32) const;
+
     /** Expensive consistency check intended for deterministic tests. */
     bool CheckInvariants() const;
 

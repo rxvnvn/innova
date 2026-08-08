@@ -209,6 +209,39 @@ std::vector<uint256> CIbdHeaderGraph::GetActiveWindow(
     return reversePath;
 }
 
+std::vector<uint256> CIbdHeaderGraph::BuildContinuationLocator(
+    std::size_t maxEntries) const
+{
+    std::vector<uint256> locator;
+    if (!m_has_anchor || maxEntries == 0)
+        return locator;
+    if (maxEntries == 1 || m_active_tip == m_anchor_hash)
+    {
+        locator.push_back(m_anchor_hash);
+        return locator;
+    }
+    const CIbdHeaderNode* cursor = ActiveTip();
+    int step = 1;
+    while (cursor && cursor->hash != m_anchor_hash &&
+           locator.size() < maxEntries - 1)
+    {
+        if (cursor->state != CIbdHeaderNode::ACTIVE || !cursor->IsUsable())
+            break;
+        locator.push_back(cursor->hash);
+        const int target = cursor->height - step;
+        if (target <= m_anchor_height)
+            break;
+        uint256 ancestor;
+        if (!GetAncestor(cursor->hash, target, ancestor))
+            break;
+        cursor = Lookup(ancestor);
+        if (locator.size() > 10)
+            step *= 2;
+    }
+    locator.push_back(m_anchor_hash);
+    return locator;
+}
+
 bool CIbdHeaderGraph::CheckInvariants() const
 {
     if (!m_has_anchor)
