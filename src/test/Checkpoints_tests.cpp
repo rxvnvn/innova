@@ -5,6 +5,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include "../checkpoints.h"
+#include "../kernel.h"
 #include "../util.h"
 
 using namespace std;
@@ -84,6 +85,24 @@ BOOST_AUTO_TEST_CASE(testnet_uses_own_checkpoint_map)
     BOOST_CHECK(Checkpoints::CheckHardened(0, h0));
     BOOST_CHECK(!Checkpoints::CheckHardened(0, wrong));
     BOOST_CHECK(Checkpoints::CheckHardened(2000, wrong));
+
+    fRegTest = fRegSaved;
+    fTestNet = fTestSaved;
+}
+
+BOOST_AUTO_TEST_CASE(regtest_ignores_stake_modifier_checkpoint)
+{
+    const unsigned int wrong = 0x12345678;
+    bool fRegSaved = fRegTest;
+    bool fTestSaved = fTestNet;
+
+    fRegTest = false;
+    fTestNet = false;
+    BOOST_CHECK(!CheckStakeModifierCheckpoints(100000, wrong));
+
+    fRegTest = true;
+    fTestNet = false;
+    BOOST_CHECK(CheckStakeModifierCheckpoints(100000, wrong));
 
     fRegTest = fRegSaved;
     fTestNet = fTestSaved;
