@@ -5,6 +5,6 @@ listen=1
 port=18444
 rpcport=18445
 rpcuser=b3v2
-rpcpassword=b3v2
+rpcpassword=b3v2pass
 rpcallowip=127.0.0.1
 staking=0
