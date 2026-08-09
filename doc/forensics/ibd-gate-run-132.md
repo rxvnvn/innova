@@ -1,6 +1,9 @@
 # Gate run §13.2 — reproducible re-measurement on clean 59d03e4
 
-Status: **runbook / measurement plan**. No production code changes. Everything
+Status: **historical runbook / not bit-reproducible**. No production code changes. The
+original B3 executable harness is lost; this document preserves its evidentiary
+contract and is not a recipe that can be claimed to reproduce the exact run.
+Everything
 here uses artifacts that already exist: the built `innovad`, the impairment
 proxy, the campaign configs, and the in-repo analyzer. The purpose is to close
 the single open measurement from `ibd-scheduler-architecture-decision.md` §13.2
@@ -27,6 +30,14 @@ expiry in place — and to make the run reproducible.
   `ibd-conservative-block-request-expiration.md` §13).
 
 ## 2. Artifact inventory (all pre-existing)
+
+**Reproducibility status.** Original B3 is **HISTORICAL / NOT BIT-REPRODUCIBLE**.
+The original `/tmp/opencode/impair_proxy.py`, `/tmp/opencode/launch_proxy.sh`,
+exact source/client configuration files, and proxy statistics/logs are no
+longer available. The historical result remains valid evidence of the observed
+failure class, but a replacement relay must not be called the original B3. The
+tracked replacement is B3-v2 under `contrib/forensics/b3v2/` and has a separate
+calibration gate.
 
 | Artifact | Path | Role |
 |---|---|---|

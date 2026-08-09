@@ -18,6 +18,8 @@
 - **Production behavior:** unchanged. This document is a decision record and a
   prescription; it implements nothing.
 
+**B3 reproducibility status:** Original B3 is **HISTORICAL / NOT BIT-REPRODUCIBLE**. Its moving-tip, 6950 ms one-way, 10% drop evidence remains valid historical evidence; the original impairment proxy, launcher, exact configs, and proxy logs/statistics are missing. The tracked `contrib/forensics/b3v2/` harness is a new stress test and is not a replacement claim for the original run.
+
 ## Final current verdict (after the pre-registered gate)
 
 **REPLACE IBD SCHEDULER.** The controlled B3 gate on clean `59d03e4` failed both clauses that the provisional decision made dispositive: the connected tip was flat for 241 s and later 304 s while the pipeline remained full and the gap widened (§12(b)), and the orphan pool pinned at 750 with 1847 `limit_reject=parent_unknown` outcomes (§12(c)). The conservative wire-origin expiry itself behaved correctly; it removed the aggressive 5 s mechanism but did not repair the full-but-useless pipeline. Therefore the escalation rule written in §13.3 before the run has fired. The decisive runtime record is `doc/forensics/ibd-gate-b3-head-result.md`.

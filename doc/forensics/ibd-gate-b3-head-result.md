@@ -1,11 +1,19 @@
 # Gate §13.2, Run 2 (B3 impaired) — result at clean `59d03e4`
 
-Status: **measurement result**. Executes the runbook `ibd-gate-run-132.md`
+Status: **historical measurement result; original B3 is HISTORICAL / NOT
+BIT-REPRODUCIBLE**. Executes the runbook `ibd-gate-run-132.md`
 §6 (Run 2) on clean HEAD `59d03e4` with the 60 s wire-origin expiry in place
 (`BLOCK_IN_FLIGHT_TIMEOUT_US`, `src/net.h:2228`, 1 s pending-wire bound
 `src/net.h:2235`). No source changes, no scheduler patch, no new
 instrumentation. The single open measurement from
 `ibd-scheduler-architecture-decision.md` §13.2 is now closed.
+
+The historical evidence is retained unchanged. The exact executable harness is
+lost: the original `impair_proxy.py`, launcher, exact source/client configs,
+and proxy statistics/logs are unavailable. Later reconstructed relays and
+lifecycles are not bit-equivalent B3 runs. Use the tracked
+`contrib/forensics/b3v2/` harness as a new stress test with its own validity and
+calibration gates.
 
 Run date 2026-08-08, ~11:06:35Z → ~11:17:30Z. B ran for 613 s of
 `IBD_ACTIVE_1S` sampling (606 samples) before a clean shutdown so the

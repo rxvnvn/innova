@@ -4,6 +4,18 @@ Status: **falsification/refinement**. No production fixes were applied as a resu
 report. P1 is refuted as a universal claim and refined to a phase-dependent one; P2–P5 are
 supported.
 
+**Historical reproducibility note.** The original B3 contract recorded here is
+**HISTORICAL / NOT BIT-REPRODUCIBLE**. Its evidentiary profile was a moving-tip
+regtest source (approximately 9 blocks/s), 6950 ms one-way delay, approximately
+13.9 s RTT, 10% whole-message drop with seed 1337, and
+`version`/`verack`/`ping`/`pong`/`addr` exemptions, with 128 per-peer active,
+512 global active, and a 750 per-peer IBD orphan cap. The original
+`impair_proxy.py`, launcher, exact source/client configs, and proxy
+statistics/logs are missing. The historical signature remains: flat frontier,
+full pipeline, orphan cap pressure, `ORPHAN_LIMIT` rejects,
+received/connected divergence, and a widening gap. The tracked B3-v2 harness
+under `contrib/forensics/b3v2/` is a new test and must be calibrated separately.
+
 ## 0. Setup recap
 
 * Regtest Innova, node A = constant miner (post checkpoint-fix, moving tip at ~9 blk/s).
