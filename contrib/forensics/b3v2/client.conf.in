@@ -1,0 +1,17 @@
+regtest=1
+server=1
+daemon=1
+listen=0
+port=18458
+rpcport=18459
+rpcuser=b3v2
+rpcpassword=b3v2
+rpcallowip=127.0.0.1
+staking=0
+regtestibd=1
+ibdexptrace=1
+ibdactivepathtrace=1
+ibdefficiencytrace=1
+ibdforensic=1
+ibdblocklatency=1
+blockrequesttrace=1
