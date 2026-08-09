@@ -3280,6 +3280,8 @@ bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
     // latency record (if any) terminates here.  "receive" is handled by the
     // T2 hook in ProcessMessage(block), so the lifecycle continues.
     if (strcmp(pszReason, "receive") != 0)
+        InvalidateIbdHeaderSchedulerRefillCursor();
+    if (strcmp(pszReason, "receive") != 0)
         ibdblocklatency::RecordBlockTerminal(
             hash,
             strcmp(pszReason, "timeout") == 0
@@ -3321,6 +3323,7 @@ bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer)
 size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason,
                                         bool fRecordForensics)
 {
+    InvalidateIbdHeaderSchedulerRefillCursor();
     LOCK(cs_mapAlreadyAskedFor);
     size_t nReleased = 0;
     for (std::map<uint256, BlockRequestOwner>::iterator it =

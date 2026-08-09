@@ -269,6 +269,29 @@ const CIbdHeaderNode* CIbdHeaderGraph::ActiveTip() const
     return Lookup(m_active_tip);
 }
 
+bool CIbdHeaderGraph::GetActiveSuccessor(const uint256& hash,
+                                          uint256& successorOut) const
+{
+    const CIbdHeaderNode* node = Lookup(hash);
+    if (!node) return false;
+    uint256 candidate;
+    int usable = 0;
+    for (std::set<uint256>::const_iterator it = node->children.begin();
+         it != node->children.end(); ++it)
+    {
+        const CIbdHeaderNode* child = Lookup(*it);
+        if (child && child->state == CIbdHeaderNode::ACTIVE &&
+            child->IsUsable())
+        {
+            candidate = child->hash;
+            ++usable;
+        }
+    }
+    if (usable != 1) return false;
+    successorOut = candidate;
+    return true;
+}
+
 const CIbdHeaderNode* CIbdHeaderGraph::BestKnownEligibleTip() const
 {
     const CIbdHeaderNode* best = NULL;

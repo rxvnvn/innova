@@ -118,6 +118,8 @@ public:
     std::vector<uint256> GetActiveWindow(const uint256& frontier,
                                          std::size_t windowSize) const;
 
+    bool GetActiveSuccessor(const uint256& hash, uint256& successorOut) const;
+
     /** Newest provisional hashes first; authoritative anchor last. */
     std::vector<uint256> BuildContinuationLocator(
         std::size_t maxEntries = 32) const;

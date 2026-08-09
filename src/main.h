@@ -474,6 +474,7 @@ extern bool fIbdHeaderScheduler;
 extern bool fRegTestIbd;
 bool IbdHeadersControlPlaneEnabled();
 void IbdHeadersObserverPeerDisconnected(NodeId peer);
+void InvalidateIbdHeaderSchedulerRefillCursor();
 
 void ResetIbdHeaderSchedulerStateForTesting();
 bool SeedIbdHeaderSchedulerAnchorForTesting(const uint256& hash, int height);
@@ -483,6 +484,16 @@ void SeedIbdHeaderSchedulerInvAvailabilityForTesting(NodeId peer,
     const uint256& hash);
 size_t RefillOrderedHeaderBlockRequestsForTesting(
     const std::vector<CNode*>& vNodesCopy);
+struct IbdHeaderSchedulerRefillStats
+{
+    uint64_t incrementalRefillCalls, fullRefillCalls;
+    uint64_t incrementalEntriesExamined, fullEntriesExamined;
+    uint64_t incrementalAdmitted, incrementalRefillUs, fullRefillUs;
+    bool cursorValid, cursorInvalidated;
+    size_t cursorNextIndex, cursorPendingSlots;
+};
+IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting();
+std::vector<uint256> GetIbdHeaderSchedulerWindowForTesting(const uint256& frontier);
 extern bool fSPVHeadersOnly;
 extern int nSPVStartHeight;
 

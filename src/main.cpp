@@ -134,6 +134,24 @@ struct IbdHeaderSchedulerState
     std::map<uint256, std::set<NodeId> > invAvailability;
     uint64_t refillCalls;
     uint64_t refillAdmissions;
+    uint64_t incrementalRefillCalls;
+    uint64_t fullRefillCalls;
+    uint64_t incrementalEntriesExamined;
+    uint64_t fullEntriesExamined;
+    uint64_t incrementalAdmitted;
+    uint64_t incrementalRefillUs;
+    uint64_t fullRefillUs;
+    std::vector<uint256> cursorWindow;
+    std::vector<NodeId> cursorPeers;
+    uint256 cursorFrontier;
+    uint256 cursorTip;
+    int cursorHeight;
+    uint64_t availabilityEpoch;
+    uint64_t cursorAvailabilityEpoch;
+    bool cursorValid;
+    bool cursorInvalidated;
+    size_t cursorNextIndex;
+    size_t cursorPendingSlots;
     uint64_t fallbackCount;
     uint64_t invInsideWindow;
     uint64_t invBeforeWindow;
@@ -143,7 +161,10 @@ struct IbdHeaderSchedulerState
     uint64_t invPrevented;
 
     IbdHeaderSchedulerState()
-        : refillCalls(0), refillAdmissions(0), fallbackCount(0),
+        : refillCalls(0), refillAdmissions(0), incrementalRefillCalls(0),
+          fullRefillCalls(0), incrementalEntriesExamined(0),
+          fullEntriesExamined(0), incrementalAdmitted(0),
+          incrementalRefillUs(0), fullRefillUs(0), fallbackCount(0),
           invInsideWindow(0), invBeforeWindow(0), invAfterWindow(0),
           invOffBranch(0), invUnknown(0), invPrevented(0)
     {
@@ -154,6 +175,24 @@ struct IbdHeaderSchedulerState
         invAvailability.clear();
         refillCalls = 0;
         refillAdmissions = 0;
+        incrementalRefillCalls = 0;
+        fullRefillCalls = 0;
+        incrementalEntriesExamined = 0;
+        fullEntriesExamined = 0;
+        incrementalAdmitted = 0;
+        incrementalRefillUs = 0;
+        fullRefillUs = 0;
+        cursorWindow.clear();
+        cursorPeers.clear();
+        cursorFrontier = 0;
+        cursorTip = 0;
+        cursorHeight = -1;
+        availabilityEpoch = 0;
+        cursorAvailabilityEpoch = 0;
+        cursorValid = false;
+        cursorInvalidated = false;
+        cursorNextIndex = 0;
+        cursorPendingSlots = 0;
         fallbackCount = 0;
         invInsideWindow = 0;
         invBeforeWindow = 0;
@@ -165,6 +204,7 @@ struct IbdHeaderSchedulerState
 
     void RemovePeer(NodeId peer)
     {
+        ++availabilityEpoch;
         for (std::map<uint256, std::set<NodeId> >::iterator it =
                  invAvailability.begin(); it != invAvailability.end();)
         {
@@ -236,7 +276,8 @@ bool SeedIbdHeaderSchedulerHeadersForTesting(NodeId peer,
 void SeedIbdHeaderSchedulerInvAvailabilityForTesting(NodeId peer,
     const uint256& hash)
 {
-    g_ibdHeaderSchedulerState.invAvailability[hash].insert(peer);
+    if (g_ibdHeaderSchedulerState.invAvailability[hash].insert(peer).second)
+        ++g_ibdHeaderSchedulerState.availabilityEpoch;
 }
 
 static bool PrepareIbdHeadersObserverRequest(CNode* pnode, CBlockLocator& locatorOut)
@@ -280,6 +321,11 @@ static void TraceIbdHeadersObserverEvent(const char* event, CNode* pnode,
            tip ? tip->height : -1,
            tip && g_ibdHeadersObserver.Graph().HasAnchor() ?
                tip->height - g_ibdHeadersObserver.Graph().AnchorHeight() : -1);
+}
+
+void InvalidateIbdHeaderSchedulerRefillCursor()
+{
+    g_ibdHeaderSchedulerState.cursorInvalidated = true;
 }
 
 void IbdHeadersObserverPeerDisconnected(NodeId peer)
@@ -557,7 +603,8 @@ static void RecordIbdHeaderSchedulerInvAvailability(CNode* pfrom,
 {
     if (pfrom == NULL || hash == 0)
         return;
-    g_ibdHeaderSchedulerState.invAvailability[hash].insert(pfrom->GetId());
+    if (g_ibdHeaderSchedulerState.invAvailability[hash].insert(pfrom->GetId()).second)
+        ++g_ibdHeaderSchedulerState.availabilityEpoch;
 }
 
 static std::vector<CNode*> IbdHeaderSchedulerCandidatePeers(
@@ -681,6 +728,7 @@ static size_t RefillOrderedHeaderBlockRequests(
     CNode* pto, const std::vector<CNode*>& vNodesCopy)
 {
     AssertLockHeld(cs_main);
+    const int64_t refillStartUs = GetTimeMicros();
     if (!IbdHeaderSchedulerSelectActive() || pto == NULL || pindexBest == NULL ||
         pto->fDisconnect || pto->fClient || pto->fOneShot ||
         !IbdHeadersControlPlaneEnabled())
@@ -693,13 +741,123 @@ static size_t RefillOrderedHeaderBlockRequests(
 
     ++g_ibdHeaderSchedulerState.refillCalls;
     const uint256 hashFrontier = pindexBest->GetBlockHash();
-    const std::vector<uint256> window =
-        g_ibdHeadersObserver.Graph().GetActiveWindow(
-            hashFrontier, IBD_HEADERS_SCHEDULER_WINDOW);
-    const CIbdHeaderNode* graphTip = g_ibdHeadersObserver.Graph().ActiveTip();
+    const CIbdHeaderGraph& graph = g_ibdHeadersObserver.Graph();
+    const CIbdHeaderNode* graphTip = graph.ActiveTip();
     const int nLookahead = graphTip ? graphTip->height - pindexBest->nHeight : -1;
-    if (window.empty())
+    std::vector<NodeId> peerIds;
+    for (std::vector<CNode*>::const_iterator pit = vNodesCopy.begin();
+         pit != vNodesCopy.end(); ++pit)
+        if (*pit) peerIds.push_back((*pit)->GetId());
+    std::sort(peerIds.begin(), peerIds.end());
+
+    std::vector<uint256> window;
+    std::vector<uint256> incrementalEntries;
+    bool incremental = false;
+    size_t frontierDelta = 0;
+    if (g_ibdHeaderSchedulerState.cursorValid &&
+        !g_ibdHeaderSchedulerState.cursorInvalidated &&
+        g_ibdHeaderSchedulerState.cursorAvailabilityEpoch ==
+            g_ibdHeaderSchedulerState.availabilityEpoch &&
+        g_ibdHeaderSchedulerState.cursorPeers == peerIds && peerIds.size() == 1 && graphTip &&
+        (g_ibdHeaderSchedulerState.cursorTip == graphTip->hash ||
+         graph.IsDescendantOf(graphTip->hash,
+                              g_ibdHeaderSchedulerState.cursorTip)))
     {
+        if (pindexBest->nHeight == g_ibdHeaderSchedulerState.cursorHeight &&
+            g_ibdHeaderSchedulerState.cursorPendingSlots > 0 &&
+            g_ibdHeaderSchedulerState.cursorNextIndex <
+                g_ibdHeaderSchedulerState.cursorWindow.size())
+        {
+            incrementalEntries.push_back(
+                g_ibdHeaderSchedulerState.cursorWindow[
+                    g_ibdHeaderSchedulerState.cursorNextIndex]);
+            incremental = true;
+        }
+        if (pindexBest->nHeight == g_ibdHeaderSchedulerState.cursorHeight &&
+            g_ibdHeaderSchedulerState.cursorPendingSlots > 0 &&
+            g_ibdHeaderSchedulerState.cursorNextIndex >=
+                g_ibdHeaderSchedulerState.cursorWindow.size() &&
+            g_ibdHeaderSchedulerState.cursorTip == graphTip->hash)
+        {
+            ++g_ibdHeaderSchedulerState.incrementalRefillCalls;
+            g_ibdHeaderSchedulerState.incrementalRefillUs +=
+                GetTimeMicros() - refillStartUs;
+            return 0;
+        }
+        if (pindexBest->nHeight == g_ibdHeaderSchedulerState.cursorHeight &&
+            g_ibdHeaderSchedulerState.cursorPendingSlots == 0)
+        {
+            ++g_ibdHeaderSchedulerState.incrementalRefillCalls;
+            g_ibdHeaderSchedulerState.incrementalRefillUs +=
+                GetTimeMicros() - refillStartUs;
+            return 0;
+        }
+        if (pindexBest->nHeight > g_ibdHeaderSchedulerState.cursorHeight)
+        {
+            frontierDelta = (size_t)(pindexBest->nHeight -
+                                     g_ibdHeaderSchedulerState.cursorHeight);
+            const std::vector<uint256>& oldWindow =
+                g_ibdHeaderSchedulerState.cursorWindow;
+            if (frontierDelta <= oldWindow.size() &&
+                oldWindow[frontierDelta - 1] == hashFrontier)
+            {
+                std::vector<uint256> shifted(oldWindow.begin() + frontierDelta,
+                                             oldWindow.end());
+                bool consistent = true;
+                for (size_t i = 0; i < frontierDelta; ++i)
+                {
+                    uint256 successor;
+                    if (!graph.GetActiveSuccessor(shifted.empty() ?
+                                                      oldWindow.back() :
+                                                      shifted.back(),
+                                                  successor))
+                    {
+                        const uint256& tail = shifted.empty() ?
+                            oldWindow.back() : shifted.back();
+                        if (graphTip->hash != tail)
+                            consistent = false;
+                        break;
+                    }
+                    shifted.push_back(successor);
+                }
+                if (consistent)
+                {
+                    g_ibdHeaderSchedulerState.cursorWindow.swap(shifted);
+                    g_ibdHeaderSchedulerState.cursorNextIndex =
+                        g_ibdHeaderSchedulerState.cursorNextIndex > frontierDelta
+                            ? g_ibdHeaderSchedulerState.cursorNextIndex - frontierDelta
+                            : 0;
+                    g_ibdHeaderSchedulerState.cursorPendingSlots += frontierDelta;
+                    incremental = true;
+                    if (g_ibdHeaderSchedulerState.cursorPendingSlots > 0 &&
+                        g_ibdHeaderSchedulerState.cursorNextIndex <
+                            g_ibdHeaderSchedulerState.cursorWindow.size())
+                        incrementalEntries.push_back(
+                            g_ibdHeaderSchedulerState.cursorWindow[
+                                g_ibdHeaderSchedulerState.cursorNextIndex]);
+                }
+            }
+        }
+    }
+
+    if (incremental)
+        window = incrementalEntries;
+    if (!incremental)
+    {
+        window = graph.GetActiveWindow(hashFrontier,
+                                       IBD_HEADERS_SCHEDULER_WINDOW);
+        ++g_ibdHeaderSchedulerState.fullRefillCalls;
+        g_ibdHeaderSchedulerState.fullEntriesExamined += window.size();
+    }
+    else
+    {
+        ++g_ibdHeaderSchedulerState.incrementalRefillCalls;
+        g_ibdHeaderSchedulerState.incrementalEntriesExamined +=
+            incrementalEntries.size();
+    }
+    if (window.empty() && !incremental)
+    {
+        g_ibdHeaderSchedulerState.cursorValid = false;
         ++g_ibdHeaderSchedulerState.fallbackCount;
         CBlockLocator locator;
         if (!pto->getHeadersSync.IsInFlight() &&
@@ -712,6 +870,8 @@ static size_t RefillOrderedHeaderBlockRequests(
     }
 
     int nBudget = GetDeferredBlockRequestBudget(pto);
+    if (incremental)
+        nBudget = std::min(nBudget, (int)g_ibdHeaderSchedulerState.cursorPendingSlots);
     size_t nHave = 0;
     size_t nOwned = 0;
     size_t nQueued = 0;
@@ -719,6 +879,8 @@ static size_t RefillOrderedHeaderBlockRequests(
     size_t nRequestable = 0;
     size_t nUnknownAvailability = 0;
     size_t nAdmitted = 0;
+    size_t fullNextIndex = window.size();
+    bool fullNextIndexSet = false;
     uint256 frontHash = uint256(0);
     int frontHeight = -1;
     NodeId frontOwner = -1;
@@ -775,7 +937,14 @@ static size_t RefillOrderedHeaderBlockRequests(
 
         ++nRequestable;
         if (nBudget <= 0)
+        {
+            if (!incremental && !fullNextIndexSet)
+            {
+                fullNextIndex = (size_t)(it - window.begin());
+                fullNextIndexSet = true;
+            }
             continue;
+        }
         CNode* pBest = IbdHeaderSchedulerBestPeerForHash(hash, candidates);
         if (pBest != pto)
             continue;
@@ -789,7 +958,36 @@ static size_t RefillOrderedHeaderBlockRequests(
         }
     }
 
-    printf("IBD_HEADERS_SCHED event=refill peer=%d frontier_height=%d graph_tip_height=%d lookahead=%d window_size=%zu front_hash=%s front_height=%d front_owner=%d front_owner_state=%s front_age_us=%lld front_alternatives=%zu have=%zu owned=%zu queued=%zu inflight=%zu requestable=%zu unknown_availability=%zu admitted=%zu peer_pressure=%d\n",
+    g_ibdHeaderSchedulerState.cursorFrontier = hashFrontier;
+    g_ibdHeaderSchedulerState.cursorHeight = pindexBest->nHeight;
+    g_ibdHeaderSchedulerState.cursorTip = graphTip ? graphTip->hash : uint256(0);
+    g_ibdHeaderSchedulerState.cursorPeers = peerIds;
+    g_ibdHeaderSchedulerState.cursorAvailabilityEpoch =
+        g_ibdHeaderSchedulerState.availabilityEpoch;
+    if (!incremental)
+    {
+        g_ibdHeaderSchedulerState.cursorWindow = window;
+        g_ibdHeaderSchedulerState.cursorNextIndex = fullNextIndex;
+        g_ibdHeaderSchedulerState.cursorPendingSlots = 0;
+    }
+    else if (!incrementalEntries.empty())
+    {
+        ++g_ibdHeaderSchedulerState.cursorNextIndex;
+        if (nAdmitted > 0 && g_ibdHeaderSchedulerState.cursorPendingSlots > 0)
+            --g_ibdHeaderSchedulerState.cursorPendingSlots;
+    }
+    g_ibdHeaderSchedulerState.cursorValid = incremental || !window.empty();
+    g_ibdHeaderSchedulerState.cursorInvalidated = false;
+    if (incremental)
+    {
+        g_ibdHeaderSchedulerState.incrementalAdmitted += nAdmitted;
+        g_ibdHeaderSchedulerState.incrementalRefillUs +=
+            GetTimeMicros() - refillStartUs;
+    }
+    else
+        g_ibdHeaderSchedulerState.fullRefillUs +=
+            GetTimeMicros() - refillStartUs;
+    printf("IBD_HEADERS_SCHED event=refill peer=%d frontier_height=%d graph_tip_height=%d lookahead=%d window_size=%zu front_hash=%s front_height=%d front_owner=%d front_owner_state=%s front_age_us=%lld front_alternatives=%zu have=%zu owned=%zu queued=%zu inflight=%zu requestable=%zu unknown_availability=%zu admitted=%zu peer_pressure=%d mode=%s duration_us=%lld incremental_calls=%llu full_calls=%llu incremental_examined=%llu full_examined=%llu incremental_admitted=%llu\n",
            pto->GetId(), pindexBest->nHeight,
            graphTip ? graphTip->height : -1, nLookahead, window.size(),
            frontHash == 0 ? "none" : frontHash.ToString().c_str(),
@@ -798,7 +996,14 @@ static size_t RefillOrderedHeaderBlockRequests(
            frontAssignedUs > 0 ? (long long)(GetTimeMicros() - frontAssignedUs) : -1LL,
            frontAlternatives, nHave, nOwned, nQueued, nInflight,
            nRequestable, nUnknownAvailability, nAdmitted,
-           (int)pto->peerLiveActivePressure.load(std::memory_order_relaxed));
+           (int)pto->peerLiveActivePressure.load(std::memory_order_relaxed),
+           incremental ? "incremental" : "full",
+           (long long)(GetTimeMicros() - refillStartUs),
+           (unsigned long long)g_ibdHeaderSchedulerState.incrementalRefillCalls,
+           (unsigned long long)g_ibdHeaderSchedulerState.fullRefillCalls,
+           (unsigned long long)g_ibdHeaderSchedulerState.incrementalEntriesExamined,
+           (unsigned long long)g_ibdHeaderSchedulerState.fullEntriesExamined,
+           (unsigned long long)g_ibdHeaderSchedulerState.incrementalAdmitted);
     return nAdmitted;
 }
 
@@ -811,6 +1016,29 @@ size_t RefillOrderedHeaderBlockRequestsForTesting(
          it != vNodesCopy.end(); ++it)
         nTotal += RefillOrderedHeaderBlockRequests(*it, vNodesCopy);
     return nTotal;
+}
+
+IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting()
+{
+    IbdHeaderSchedulerRefillStats out;
+    out.incrementalRefillCalls = g_ibdHeaderSchedulerState.incrementalRefillCalls;
+    out.fullRefillCalls = g_ibdHeaderSchedulerState.fullRefillCalls;
+    out.incrementalEntriesExamined = g_ibdHeaderSchedulerState.incrementalEntriesExamined;
+    out.fullEntriesExamined = g_ibdHeaderSchedulerState.fullEntriesExamined;
+    out.incrementalAdmitted = g_ibdHeaderSchedulerState.incrementalAdmitted;
+    out.incrementalRefillUs = g_ibdHeaderSchedulerState.incrementalRefillUs;
+    out.fullRefillUs = g_ibdHeaderSchedulerState.fullRefillUs;
+    out.cursorValid = g_ibdHeaderSchedulerState.cursorValid;
+    out.cursorInvalidated = g_ibdHeaderSchedulerState.cursorInvalidated;
+    out.cursorNextIndex = g_ibdHeaderSchedulerState.cursorNextIndex;
+    out.cursorPendingSlots = g_ibdHeaderSchedulerState.cursorPendingSlots;
+    return out;
+}
+
+std::vector<uint256> GetIbdHeaderSchedulerWindowForTesting(
+    const uint256& frontier)
+{
+    return g_ibdHeadersObserver.PredictedWindowFromFrontier(frontier);
 }
 
 static void TraceDeferredWindowState(CNode* pfrom, const char* pszEvent,

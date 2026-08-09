@@ -9340,4 +9340,72 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_empty_window_requests_headers_not_blocks)
     fIbdHeaderScheduler = savedScheduler;
 }
 
+BOOST_AUTO_TEST_CASE(headers_scheduler_sequential_refill_uses_incremental_cursor)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(91), "sched-incremental", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    const uint256 anchor(1000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.reserve(10001);
+    uint256 previous = anchor;
+    for (int i = 1; i <= 10001; ++i)
+    {
+        const uint256 hash(1000000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+
+    std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 128U);
+
+    for (int height = 1; height <= 10000; ++height)
+    {
+        const uint256 frontier(1000000 + height);
+        BOOST_REQUIRE_MESSAGE(peer.IsBlockAskForQueued(frontier), "missing frontier " << height);
+        for (std::multimap<int64_t, CInv>::iterator it = peer.mapAskFor.begin();
+             it != peer.mapAskFor.end(); ++it)
+        {
+            if (it->second.hash == frontier)
+            {
+                peer.EraseAskForEntry(it, false);
+                break;
+            }
+        }
+        BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(frontier, height));
+        RefillOrderedHeaderBlockRequestsForTesting(peers);
+        const std::vector<uint256> window =
+            GetIbdHeaderSchedulerWindowForTesting(frontier);
+        BOOST_REQUIRE(!window.empty());
+        BOOST_CHECK(window.front() == uint256(1000000 + height + 1));
+    }
+
+    const IbdHeaderSchedulerRefillStats stats =
+        GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 1U);
+    BOOST_CHECK_EQUAL(stats.fullEntriesExamined, 512U);
+    BOOST_CHECK_EQUAL(stats.incrementalRefillCalls, 10000U);
+    BOOST_CHECK_EQUAL(stats.incrementalEntriesExamined, 9873U);
+    BOOST_CHECK_EQUAL(stats.incrementalAdmitted, 9873U);
+    BOOST_CHECK(stats.incrementalRefillUs / stats.incrementalRefillCalls < stats.fullRefillUs);
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
 BOOST_AUTO_TEST_SUITE_END()
