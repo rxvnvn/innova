@@ -1,0 +1,3 @@
+1 READY supplier=B listen=127.0.0.1:14801 target=127.0.0.1:18444 delay_ms=0 drop_pct=0 seed=7331 targeted_drop_first_block=0
+2 SEND supplier=B direction=c2s command=getdata plane=data hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+3 SEND supplier=B direction=s2c command=block plane=data hash=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa

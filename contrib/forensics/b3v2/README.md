@@ -68,3 +68,44 @@ bash -n contrib/forensics/b3v2/run_b3v2.sh
 The smoke test proves frame extraction and policy classification without
 starting a daemon. A live contract check requires the fresh source/client
 runner and is intentionally separate from this harness-definition task.
+
+## Gate separation
+
+The default `control` and `experiment` modes are the single-peer B3-v2
+resilience baseline. They intentionally provide one impaired supplier and prove
+that ordered frontier retry cannot create an alternate path.
+
+`multi-peer-experiment` is a separate semantic source-failover gate. It starts
+one canonical regtest source behind two independent relay endpoints and connects
+the fresh Stage-2 client to both logical suppliers:
+
+* Supplier A uses the frozen `1000 ms`, `10%`, seed `1337` profile and
+  deterministically drops its first block response.
+* Supplier B uses the same source chain through a zero-delay, zero-drop relay
+  with an independent seed.
+
+The profile is recorded in `profile.txt`; relay logs are
+`relay-a.log` and `relay-b.log`. This mode only proves that the harness can
+observe an A failure and a healthy B opportunity. It does not implement or
+claim production frontier failover.
+
+```bash
+contrib/forensics/b3v2/run_b3v2.sh \
+  --mode multi-peer-experiment \
+  --innovad /home/user/innova/src/innovad \
+  --run-dir /tmp/b3v2-multi-peer-smoke \
+  --duration 60
+```
+
+Analyze a captured client log with both supplier relay logs:
+
+```bash
+python3 contrib/forensics/b3v2/analyze_multi_peer.py \
+  /tmp/b3v2-multi-peer-smoke/client/regtest/debug.log \
+  --relay-log /tmp/b3v2-multi-peer-smoke/relay-a.log --supplier A \
+  --relay-log /tmp/b3v2-multi-peer-smoke/relay-b.log --supplier B
+```
+
+The tracked deterministic fixture validates owner transitions, targeted A
+impairment, late-foreign delivery attribution, and the duplicate-owner
+invariant without running a daemon.
