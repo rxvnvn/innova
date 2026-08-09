@@ -11,7 +11,7 @@ The initial profile is derived from the historical B3 evidence:
 | --- | --- |
 | Source | fresh moving-tip regtest node |
 | Topology | one client peer through one loopback relay |
-| One-way delay | 6950 ms |
+| One-way delay | 1000 ms |
 | Data drop | 10% whole-message probability |
 | Seed | 1337, independently seeded per direction |
 | Liveness exemptions | `version`, `verack`, `ping`, `pong`, `addr` |

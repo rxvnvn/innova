@@ -140,7 +140,7 @@ def main():
     parser.add_argument("--listen-host", default="127.0.0.1")
     parser.add_argument("--listen-port", type=int, required=True)
     parser.add_argument("--target", required=True)
-    parser.add_argument("--delay-ms", type=float, default=6950.0)
+    parser.add_argument("--delay-ms", type=float, default=1000.0)
     parser.add_argument("--drop-pct", type=float, default=10.0)
     parser.add_argument("--seed", type=int, default=1337)
     parser.add_argument("--log", required=True)
