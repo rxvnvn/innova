@@ -186,6 +186,16 @@ public:
     const CIbdHeaderGraph& Graph() const { return m_graph; }
     const Counters& Stats() const { return m_counters; }
     std::size_t WindowSize() const { return m_window_size; }
+
+    /**
+     * Number of m_sources entries examined during the most recent
+     * UpdateAnchor call.  Exposed for deterministic regression tests: normal
+     * fast anchor advancement must not examine any source record, regardless
+     * of the accumulated header-graph size.
+     */
+    std::size_t LastAnchorSourceSweepExamined() const
+    { return m_lastAnchorSourceSweepExamined; }
+
     static const char* ClassificationName(Classification classification);
 
 private:
@@ -195,6 +205,7 @@ private:
     std::set<int64_t> m_outstanding_peers;
     std::map<uint256, std::set<int64_t> > m_sources;
     Counters m_counters;
+    std::size_t m_lastAnchorSourceSweepExamined;
 };
 
 #endif // INNOVA_IBDHEADERSCHEDULER_H

@@ -110,4 +110,157 @@ BOOST_AUTO_TEST_CASE(classification_and_observation_only_counters)
     // The observer exposes no AskFor, ownership, getdata, or admission API.
 }
 
+// The fast anchor path must never sweep source records: it moves the anchor
+// along an already-present active path and removes no graph node, so every
+// m_sources key stays valid.  This test advances the anchor dozens of times
+// and asserts zero source entries examined on every fast update.
+BOOST_AUTO_TEST_CASE(fast_anchor_advance_examines_no_source_records)
+{
+    CIbdHeadersObserver o(512); o.SetEnabled(true);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(1), 0));
+    o.MarkHeaderRequest(7);
+    o.ObserveHeaders(7, Batch(2, 200));
+    BOOST_CHECK(o.PeerSupport(OH(200)) == 1U);
+
+    for (uint64_t i = 2; i <= 100; ++i)
+    {
+        BOOST_REQUIRE(o.UpdateAnchor(OH(i), (int)(i - 1)));
+        BOOST_CHECK_EQUAL(o.LastAnchorSourceSweepExamined(), 0U);
+    }
+    BOOST_CHECK(o.Graph().AnchorHash() == OH(100));
+    BOOST_CHECK(o.Graph().AnchorHeight() == 99);
+}
+
+// Deterministic complexity regression: the number of source records examined
+// during a single fast anchor update must be independent of the accumulated
+// header-graph / m_sources size.  A 50000-entry source map is constructed and
+// a fast advance must still examine zero records.
+BOOST_AUTO_TEST_CASE(fast_anchor_advance_is_independent_of_source_map_size)
+{
+    CIbdHeadersObserver o(512); o.SetEnabled(true);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(1), 0));
+    o.MarkHeaderRequest(7);
+    o.ObserveHeaders(7, Batch(2, 50001));
+    BOOST_CHECK(o.PeerSupport(OH(50001)) == 1U);
+    BOOST_CHECK(o.Graph().Size() > 1000U);
+
+    BOOST_REQUIRE(o.UpdateAnchor(OH(2), 1));
+    BOOST_CHECK_EQUAL(o.LastAnchorSourceSweepExamined(), 0U);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(3), 2));
+    BOOST_CHECK_EQUAL(o.LastAnchorSourceSweepExamined(), 0U);
+    BOOST_CHECK(o.Graph().AnchorHash() == OH(3));
+    BOOST_CHECK(o.PeerSupport(OH(50001)) == 1U);
+}
+
+// Source metadata must survive many fast anchor advances and remain the
+// scheduler peer/candidate input: HeaderSources / PeerSupport for both
+// near-anchor and deep window hashes stay correct after a long fast run.
+BOOST_AUTO_TEST_CASE(fast_anchor_preserves_source_metadata_for_candidates)
+{
+    CIbdHeadersObserver o(512); o.SetEnabled(true);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(1), 0));
+    o.MarkHeaderRequest(7);
+    o.ObserveHeaders(7, Batch(2, 2000));
+    o.MarkHeaderRequest(9);
+    o.ObserveHeaders(9, Batch(2, 2000));
+
+    for (uint64_t i = 2; i <= 500; ++i)
+    {
+        BOOST_REQUIRE(o.UpdateAnchor(OH(i), (int)(i - 1)));
+        BOOST_CHECK_EQUAL(o.LastAnchorSourceSweepExamined(), 0U);
+    }
+
+    BOOST_CHECK(o.PeerSupport(OH(2000)) == 2U);
+    BOOST_CHECK(o.PeerSupport(OH(501)) == 2U);
+    std::vector<int64_t> sources = o.HeaderSources(OH(1500));
+    BOOST_REQUIRE(sources.size() == 2U);
+    BOOST_CHECK(sources[0] == 7 || sources[1] == 7);
+    BOOST_CHECK(sources[0] == 9 || sources[1] == 9);
+    // Anchored entries still resolve in the graph and are classified as part
+    // of the predicted window immediately after the new anchor.
+    BOOST_CHECK(o.Graph().Lookup(OH(501)) != NULL);
+}
+
+// Full re-anchor resets and rebuilds the graph, removing every non-suffix
+// node.  Stale source records for wiped nodes must be pruned exactly there,
+// while sources for the retained suffix survive; the sweep must account the
+// exact number of entries examined.
+BOOST_AUTO_TEST_CASE(full_reanchor_prunes_stale_sources_and_retains_suffix)
+{
+    CIbdHeadersObserver o(8); o.SetEnabled(true);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(1), 10));
+    o.MarkHeaderRequest(7);
+    o.ObserveHeaders(7, Batch(2, 6));
+
+    // Jump to an unrelated branch: full re-anchor wipes every graph node.
+    BOOST_REQUIRE(o.UpdateAnchor(OH(90), 11));
+    BOOST_CHECK(o.Graph().Lookup(OH(3)) == NULL);
+    BOOST_CHECK_EQUAL(o.LastAnchorSourceSweepExamined(), 5U);
+    BOOST_CHECK(o.PeerSupport(OH(3)) == 0U);
+    BOOST_CHECK(o.HeaderSources(OH(3)).empty());
+
+    // Re-establish a chain above the new anchor, then full re-anchor to a
+    // descendant.  The suffix (new anchor .. active tip) is retained by the
+    // rebuild; sources below the new anchor are stale and must be pruned.
+    o.MarkHeaderRequest(7);
+    o.ObserveHeaders(7, Batch(91, 95));
+    BOOST_REQUIRE(o.UpdateAnchor(OH(92), 13));
+    BOOST_CHECK_EQUAL(o.LastAnchorSourceSweepExamined(), 5U);
+    BOOST_CHECK(o.Graph().Lookup(OH(91)) == NULL);
+    BOOST_CHECK(o.Graph().Lookup(OH(93)) != NULL);
+    BOOST_CHECK(o.PeerSupport(OH(91)) == 0U);
+    BOOST_CHECK(o.HeaderSources(OH(91)).empty());
+    BOOST_CHECK(o.PeerSupport(OH(93)) == 1U);
+    BOOST_CHECK(o.PeerSupport(OH(95)) == 1U);
+    BOOST_REQUIRE(o.HeaderSources(OH(95)).size() == 1U);
+    BOOST_CHECK(o.HeaderSources(OH(95)).front() == 7);
+}
+
+// Clear (SetEnabled transition) must remove every source record together with
+// the graph, keeping keys(m_sources) <= nodes(m_graph) after the reset, and a
+// fresh anchor population must rebuild both consistently.
+BOOST_AUTO_TEST_CASE(clear_resets_sources_with_graph)
+{
+    CIbdHeadersObserver o(8); o.SetEnabled(true);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(1), 0));
+    o.MarkHeaderRequest(7);
+    o.ObserveHeaders(7, Batch(2, 5));
+    BOOST_CHECK(o.PeerSupport(OH(4)) == 1U);
+
+    o.SetEnabled(false);
+    BOOST_CHECK(o.Graph().Empty());
+    BOOST_CHECK(o.PeerSupport(OH(4)) == 0U);
+    BOOST_CHECK(o.HeaderSources(OH(4)).empty());
+
+    o.SetEnabled(true);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(1), 0));
+    o.MarkHeaderRequest(7);
+    o.ObserveHeaders(7, Batch(2, 5));
+    BOOST_CHECK(o.PeerSupport(OH(4)) == 1U);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(2), 1));
+    BOOST_CHECK_EQUAL(o.LastAnchorSourceSweepExamined(), 0U);
+}
+
+// Peer removal only drops the peer from each source set; it must not remove
+// valid keys, and fast anchor advancement afterwards must not disturb the
+// remaining peer associations.
+BOOST_AUTO_TEST_CASE(remove_peer_keeps_fast_anchor_sources_consistent)
+{
+    CIbdHeadersObserver o(8); o.SetEnabled(true);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(1), 0));
+    o.MarkHeaderRequest(7);
+    o.ObserveHeaders(7, Batch(2, 6));
+    o.MarkHeaderRequest(9);
+    o.ObserveHeaders(9, Batch(2, 6));
+    BOOST_CHECK(o.PeerSupport(OH(5)) == 2U);
+
+    o.RemovePeer(9);
+    BOOST_CHECK(o.PeerSupport(OH(5)) == 1U);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(2), 1));
+    BOOST_CHECK_EQUAL(o.LastAnchorSourceSweepExamined(), 0U);
+    BOOST_CHECK(o.PeerSupport(OH(6)) == 1U);
+    BOOST_REQUIRE(o.HeaderSources(OH(6)).size() == 1U);
+    BOOST_CHECK(o.HeaderSources(OH(6)).front() == 7);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

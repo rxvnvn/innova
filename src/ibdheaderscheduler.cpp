@@ -501,7 +501,8 @@ CIbdHeadersObserver::Counters::Counters()
 }
 
 CIbdHeadersObserver::CIbdHeadersObserver(std::size_t windowSize)
-    : m_enabled(false), m_window_size(windowSize)
+    : m_enabled(false), m_window_size(windowSize),
+      m_lastAnchorSourceSweepExamined(0)
 {
 }
 
@@ -532,13 +533,27 @@ bool CIbdHeadersObserver::UpdateAnchor(const uint256& hash, int height)
                                    m_graph.SetAuthoritativeAnchor(hash, height);
     if (ok) {
         ++m_counters.anchorUpdates;
-        for (std::map<uint256, std::set<int64_t> >::iterator it = m_sources.begin();
-             it != m_sources.end();)
-            if (!m_graph.Lookup(it->first)) m_sources.erase(it++); else ++it;
+        const uint64_t fullReanchors = m_graph.FullReanchorCount() - fullBefore;
+        // Fast anchor advancement moves the authoritative anchor along an
+        // existing active path and never removes graph nodes, so every
+        // m_sources key remains valid and no sweep is required there.  A full
+        // re-anchor, however, resets the graph (SetAuthoritativeAnchor clears
+        // every node) and re-inserts only the retained active suffix; entries
+        // for the wiped nodes are stale by construction.  Prune them here, at
+        // the only graph-node-removal lifecycle event, instead of sweeping all
+        // source records on every connected block.
+        if (fullReanchors > 0) {
+            m_lastAnchorSourceSweepExamined = m_sources.size();
+            for (std::map<uint256, std::set<int64_t> >::iterator it = m_sources.begin();
+                 it != m_sources.end();)
+                if (!m_graph.Lookup(it->first)) m_sources.erase(it++); else ++it;
+        } else {
+            m_lastAnchorSourceSweepExamined = 0;
+        }
         printf("IBD_HEADER_ANCHOR event=update old_height=%d new_height=%d duration_us=%lld fast=%llu full=%llu\n",
                oldHeight, height, (long long)(GetTimeMicros() - startUs),
                (unsigned long long)(m_graph.FastAnchorAdvanceCount() - fastBefore),
-               (unsigned long long)(m_graph.FullReanchorCount() - fullBefore));
+               (unsigned long long)fullReanchors);
     }
     return ok;
 }
