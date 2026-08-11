@@ -27,6 +27,7 @@
 #include "ibdblocklatency.h"
 #include "ibdforensic.h"
 #include "ibdexptrace.h"
+#include "sync.h"
 
 class CRequestTracker;
 class CNode;
@@ -34,6 +35,20 @@ class CBlockIndex;
 class CBlockLocator;
 class CStalledSyncRecoveryState;
 extern int nBestHeight;
+
+// Progress-aware ordered-IBD expiration (Phase 2): decision shared between
+// CNode::ExpireBlockInFlight (net.h) and the ordered scheduler (main.cpp).
+// cs_main is declared here as well as in main.h so the inline expiry path can
+// take a brief TRY_LOCK; both declarations name the same CCriticalSection.
+extern CCriticalSection cs_main;
+enum IbdOrderedExpiryOutcome
+{
+    IBD_ORDERED_EXPIRY_NOT_ORDERED = 0,  // legacy request: fixed deadline
+    IBD_ORDERED_EXPIRY_DEFER,            // ordered descendant, frontier moving
+    IBD_ORDERED_EXPIRY_EXPIRE            // ordered descendant, genuine expiry
+};
+IbdOrderedExpiryOutcome IbdHeaderSchedulerOrderedExpiryDecide(
+    const uint256& hash, int64_t nNowUs, int64_t nWireUs);
 
 // Armed exactly once when an ordinary (non-recovery) block-sync getblocks has
 // been committed for transmission to a peer that can advance local block sync.
@@ -786,7 +801,8 @@ void ExpireBlockAlternateAnnouncersForTesting(int64_t nNowUs);
 // before when an alternative exists).  Guarded by cs_mapAlreadyAskedFor.  The
 // map is hard-bounded and lazily pruned (see net.cpp).
 void RecordBlockLastTimeoutOwner(const uint256& hash, NodeId peer);
-bool GetBlockLastTimeoutOwner(const uint256& hash, NodeId* peer);
+bool GetBlockLastTimeoutOwner(const uint256& hash, NodeId* peer,
+                              int64_t* nTimeUs = NULL);
 // True when the peer was the last owner that timed out a request for the hash.
 bool WasBlockLastTimedOutByPeer(const uint256& hash, NodeId peer);
 // Number of hashes currently in the last-timeout-owner ledger.
@@ -2275,12 +2291,16 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         {
             bool fPendingWire = false;
             int64_t nDeadlineUs;
+            int64_t nWireUs = 0;
             {
                 LOCK(cs_vBlockInFlightWire);
                 std::map<uint256, int64_t>::const_iterator wi =
                     mapBlockInFlightWireUs.find(it->first);
                 if (wi != mapBlockInFlightWireUs.end() && wi->second > 0)
+                {
+                    nWireUs = wi->second;
                     nDeadlineUs = wi->second + BLOCK_IN_FLIGHT_TIMEOUT_US;
+                }
                 else
                 {
                     // The getdata never reached the wire: local send-path
@@ -2292,6 +2312,29 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
             }
             if (nNowUs > nDeadlineUs)
             {
+                // PROGRESS-AWARE EXPIRY (Phase 2): a request whose fixed
+                // wire-origin deadline passed is deferred, not expired, while
+                // the ordered scheduler is actively approaching it -- the hash
+                // is still an in-window descendant ahead of a frontier that has
+                // advanced since admission, and the hard safety ceiling has not
+                // been reached.  Legacy requests and pending-wire requests keep
+                // the fixed deadline unchanged.  If cs_main is unavailable the
+                // request falls back to the fixed deadline (conservative).
+                bool fDeferred = false;
+                if (!fPendingWire && nWireUs > 0)
+                {
+                    TRY_LOCK(cs_main, lockMain);
+                    if (lockMain &&
+                        IbdHeaderSchedulerOrderedExpiryDecide(
+                            it->first, nNowUs, nWireUs) ==
+                            IBD_ORDERED_EXPIRY_DEFER)
+                        fDeferred = true;
+                }
+                if (fDeferred)
+                {
+                    ++it;
+                    continue;
+                }
                 if (BlockRequestTraceEnabled())
                     BlockRequestTraceInFlightExpire(
                         this, it->first, nNowSec - it->second);

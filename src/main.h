@@ -475,7 +475,9 @@ extern bool fRegTestIbd;
 bool IbdHeadersControlPlaneEnabled();
 void IbdHeadersObserverPeerDisconnected(NodeId peer);
 void InvalidateIbdHeaderSchedulerRefillCursor();
+void MarkIbdHeaderSchedulerRecoveryNeeded();
 
+void AdvanceIbdHeaderSchedulerRound();
 void ResetIbdHeaderSchedulerStateForTesting();
 bool SeedIbdHeaderSchedulerAnchorForTesting(const uint256& hash, int height);
 bool SeedIbdHeaderSchedulerHeadersForTesting(NodeId peer,
@@ -489,8 +491,9 @@ struct IbdHeaderSchedulerRefillStats
     uint64_t incrementalRefillCalls, fullRefillCalls;
     uint64_t incrementalEntriesExamined, fullEntriesExamined;
     uint64_t incrementalAdmitted, incrementalRefillUs, fullRefillUs;
-    bool cursorValid, cursorInvalidated;
+    bool cursorValid, cursorInvalidated, cursorRecoveryNeeded;
     size_t cursorNextIndex, cursorPendingSlots;
+    uint64_t orderedExpiryDeferredDueProgress, orderedExpiryActual;
 };
 IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting();
 std::vector<uint256> GetIbdHeaderSchedulerWindowForTesting(const uint256& frontier);

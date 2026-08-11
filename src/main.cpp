@@ -150,8 +150,11 @@ struct IbdHeaderSchedulerState
     uint64_t cursorAvailabilityEpoch;
     bool cursorValid;
     bool cursorInvalidated;
+    bool cursorRecoveryNeeded;
     size_t cursorNextIndex;
     size_t cursorPendingSlots;
+    uint64_t refillRound;
+    uint64_t cursorRound;
     uint64_t fallbackCount;
     uint64_t invInsideWindow;
     uint64_t invBeforeWindow;
@@ -159,14 +162,25 @@ struct IbdHeaderSchedulerState
     uint64_t invOffBranch;
     uint64_t invUnknown;
     uint64_t invPrevented;
+    // Progress-aware expiration state (Phase 2).  Each hash admitted to the
+    // ordered pipeline records the connected frontier height at admission; the
+    // expiry path compares it against the live frontier to decide whether a
+    // request whose fixed wire-origin deadline passed is being legitimately
+    // approached (defer) or truly abandoned (expire).  Entries are pruned to
+    // ~one window in the refill so the map stays bounded.
+    std::map<uint256, int> orderedRequestFrontierBaseline;
+    uint64_t orderedExpiryDeferredDueProgress;
+    uint64_t orderedExpiryActual;
 
     IbdHeaderSchedulerState()
         : refillCalls(0), refillAdmissions(0), incrementalRefillCalls(0),
           fullRefillCalls(0), incrementalEntriesExamined(0),
           fullEntriesExamined(0), incrementalAdmitted(0),
-          incrementalRefillUs(0), fullRefillUs(0), fallbackCount(0),
+          incrementalRefillUs(0), fullRefillUs(0), refillRound(0),
+          cursorRound(0), fallbackCount(0),
           invInsideWindow(0), invBeforeWindow(0), invAfterWindow(0),
-          invOffBranch(0), invUnknown(0), invPrevented(0)
+          invOffBranch(0), invUnknown(0), invPrevented(0),
+          orderedExpiryDeferredDueProgress(0), orderedExpiryActual(0)
     {
     }
 
@@ -191,8 +205,11 @@ struct IbdHeaderSchedulerState
         cursorAvailabilityEpoch = 0;
         cursorValid = false;
         cursorInvalidated = false;
+        cursorRecoveryNeeded = false;
         cursorNextIndex = 0;
         cursorPendingSlots = 0;
+        refillRound = 0;
+        cursorRound = 0;
         fallbackCount = 0;
         invInsideWindow = 0;
         invBeforeWindow = 0;
@@ -200,6 +217,9 @@ struct IbdHeaderSchedulerState
         invOffBranch = 0;
         invUnknown = 0;
         invPrevented = 0;
+        orderedRequestFrontierBaseline.clear();
+        orderedExpiryDeferredDueProgress = 0;
+        orderedExpiryActual = 0;
     }
 
     void RemovePeer(NodeId peer)
@@ -224,6 +244,11 @@ static CBlockIndex* g_ibdHeaderSchedulerSavedPindexBest = NULL;
 static uint256 g_ibdHeaderSchedulerSavedHashBestChain;
 static int g_ibdHeaderSchedulerSavedBestHeight = -1;
 static bool g_ibdHeaderSchedulerTestAnchorActive = false;
+}
+
+void AdvanceIbdHeaderSchedulerRound()
+{
+    ++g_ibdHeaderSchedulerState.refillRound;
 }
 
 void ResetIbdHeaderSchedulerStateForTesting()
@@ -326,6 +351,11 @@ static void TraceIbdHeadersObserverEvent(const char* event, CNode* pnode,
 void InvalidateIbdHeaderSchedulerRefillCursor()
 {
     g_ibdHeaderSchedulerState.cursorInvalidated = true;
+}
+
+void MarkIbdHeaderSchedulerRecoveryNeeded()
+{
+    g_ibdHeaderSchedulerState.cursorRecoveryNeeded = true;
 }
 
 void IbdHeadersObserverPeerDisconnected(NodeId peer)
@@ -610,6 +640,11 @@ static void RecordIbdHeaderSchedulerInvAvailability(CNode* pfrom,
 static std::vector<CNode*> IbdHeaderSchedulerCandidatePeers(
     const uint256& hash, const std::vector<CNode*>& vNodesCopy)
 {
+    // Any peer that announced the header is a valid getdata source; block
+    // scheduling must not depend on fresh inv.  Inv availability only
+    // contributes to candidate selection here and (via
+    // IbdHeaderSchedulerBestPeerForHash) to peer ranking, never as an
+    // admission gate.
     std::set<NodeId> peerIds;
     const std::vector<int64_t> headerPeers =
         g_ibdHeadersObserver.HeaderSources(hash);
@@ -669,7 +704,8 @@ static int64_t IbdHeaderSchedulerPeerScore(const CNode* pnode,
 
 static CNode* IbdHeaderSchedulerBestPeerForHash(
     const uint256& hash,
-    const std::vector<CNode*>& candidates)
+    const std::vector<CNode*>& candidates,
+    std::map<CNode*, int>* pBudgetByPeer = NULL)
 {
     if (candidates.empty())
         return NULL;
@@ -700,9 +736,20 @@ static CNode* IbdHeaderSchedulerBestPeerForHash(
         nMaxPeerHeight = std::max(nMaxPeerHeight, nPeerHeight);
     }
 
+    // Budget-aware ranking (Finding 1): a candidate that has no spare request
+    // budget cannot admit this hash, so it must not block admission while an
+    // admissible candidate exists.  Saturated candidates are skipped unless
+    // every candidate is saturated, in which case the score-best peer is
+    // returned so the caller parks the cursor and retries later (budget
+    // self-heals once the saturated peer's in-flight requests drain).  When no
+    // budget cache is supplied (recovery path) every candidate is admissible
+    // and this reduces to the original score ranking.
     CNode* pBest = NULL;
     int64_t nBestScore = std::numeric_limits<int64_t>::min();
     int32_t nBestPressure = 0;
+    CNode* pFallback = NULL;
+    int64_t nFallbackScore = std::numeric_limits<int64_t>::min();
+    int32_t nFallbackPressure = 0;
     for (std::vector<CNode*>::const_iterator it = selectionPool.begin();
          it != selectionPool.end(); ++it)
     {
@@ -711,6 +758,24 @@ static CNode* IbdHeaderSchedulerBestPeerForHash(
             IbdHeaderSchedulerPeerScore(pnode, GetTime(), nMaxPeerHeight);
         const int32_t nPressure =
             pnode->peerLiveActivePressure.load(std::memory_order_relaxed);
+        if (pFallback == NULL || nScore > nFallbackScore ||
+            (nScore == nFallbackScore && nPressure < nFallbackPressure) ||
+            (nScore == nFallbackScore && nPressure == nFallbackPressure &&
+             pnode->GetId() < pFallback->GetId()))
+        {
+            pFallback = pnode;
+            nFallbackScore = nScore;
+            nFallbackPressure = nPressure;
+        }
+        if (pBudgetByPeer != NULL)
+        {
+            std::map<CNode*, int>::iterator itB = pBudgetByPeer->find(pnode);
+            if (itB == pBudgetByPeer->end())
+                itB = pBudgetByPeer->insert(std::make_pair(
+                    pnode, GetDeferredBlockRequestBudget(pnode))).first;
+            if (itB->second <= 0)
+                continue;
+        }
         if (pBest == NULL || nScore > nBestScore ||
             (nScore == nBestScore && nPressure < nBestPressure) ||
             (nScore == nBestScore && nPressure == nBestPressure &&
@@ -721,7 +786,87 @@ static CNode* IbdHeaderSchedulerBestPeerForHash(
             nBestPressure = nPressure;
         }
     }
+    if (pBest == NULL)
+        pBest = pFallback;
     return pBest;
+}
+
+static bool IbdHeaderSchedulerHashIsQueuedOnAnyPeer(
+    const uint256& hash, const std::vector<CNode*>& vNodesCopy)
+{
+    for (std::vector<CNode*>::const_iterator pit = vNodesCopy.begin();
+         pit != vNodesCopy.end(); ++pit)
+        if (*pit && (*pit)->IsBlockAskForQueued(hash))
+            return true;
+    return false;
+}
+
+static size_t RecoverOrderedReleasedBlocks(
+    CNode* pto, const std::vector<CNode*>& vNodesCopy)
+{
+    AssertLockHeld(cs_main);
+    const int64_t recoveryStartUs = GetTimeMicros();
+    if (!IbdHeaderSchedulerSelectActive() || pto == NULL || pindexBest == NULL ||
+        pto->fDisconnect || pto->fClient || pto->fOneShot ||
+        !IbdHeadersControlPlaneEnabled())
+        return 0;
+
+    const std::vector<uint256>& window =
+        g_ibdHeaderSchedulerState.cursorWindow;
+    const size_t nBound = std::min(
+        g_ibdHeaderSchedulerState.cursorNextIndex, window.size());
+    if (nBound == 0)
+    {
+        g_ibdHeaderSchedulerState.cursorRecoveryNeeded = false;
+        return 0;
+    }
+
+    int nBudget = GetDeferredBlockRequestBudget(pto);
+    size_t nAdmitted = 0;
+    bool fUnresolved = false;
+    CTxDB txdb("r");
+    for (size_t i = 0; i < nBound; ++i)
+    {
+        const uint256& hash = window[i];
+        if (GetBlockRequestOwnerDetails(hash, NULL, NULL, NULL))
+            continue;
+        if (IbdHeaderSchedulerHashIsQueuedOnAnyPeer(hash, vNodesCopy))
+            continue;
+        if (AlreadyHave(txdb, CInv(MSG_BLOCK, hash)))
+            continue;
+        if (nBudget <= 0)
+        {
+            fUnresolved = true;
+            break;
+        }
+        const std::vector<CNode*> candidates =
+            IbdHeaderSchedulerCandidatePeers(hash, vNodesCopy);
+        if (candidates.empty())
+        {
+            fUnresolved = true;
+            break;
+        }
+        CNode* pBest = IbdHeaderSchedulerBestPeerForHash(hash, candidates);
+        if (pBest != pto)
+            continue;
+        if (pto->AskFor(CInv(MSG_BLOCK, hash),
+                        BLOCKREQ_SOURCE_HEADERS_SCHEDULER) != ASKFOR_QUEUED)
+        {
+            fUnresolved = true;
+            break;
+        }
+        ++nAdmitted;
+        --nBudget;
+        ++g_ibdHeaderSchedulerState.refillAdmissions;
+        // Phase 2: frontier baseline for progress-aware expiration.  A
+        // recovered hash is re-admitted at the current frontier.
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline[hash] =
+            pindexBest->nHeight;
+    }
+    g_ibdHeaderSchedulerState.cursorRecoveryNeeded = fUnresolved;
+    g_ibdHeaderSchedulerState.incrementalRefillUs +=
+        GetTimeMicros() - recoveryStartUs;
+    return nAdmitted;
 }
 
 static size_t RefillOrderedHeaderBlockRequests(
@@ -754,14 +899,79 @@ static size_t RefillOrderedHeaderBlockRequests(
     std::vector<uint256> incrementalEntries;
     bool incremental = false;
     size_t frontierDelta = 0;
-    if (g_ibdHeaderSchedulerState.cursorValid &&
+    const bool fCursorUsable =
+        g_ibdHeaderSchedulerState.cursorValid &&
         !g_ibdHeaderSchedulerState.cursorInvalidated &&
         g_ibdHeaderSchedulerState.cursorAvailabilityEpoch ==
             g_ibdHeaderSchedulerState.availabilityEpoch &&
-        g_ibdHeaderSchedulerState.cursorPeers == peerIds && peerIds.size() == 1 && graphTip &&
+        g_ibdHeaderSchedulerState.cursorPeers == peerIds && graphTip &&
         (g_ibdHeaderSchedulerState.cursorTip == graphTip->hash ||
          graph.IsDescendantOf(graphTip->hash,
-                              g_ibdHeaderSchedulerState.cursorTip)))
+                              g_ibdHeaderSchedulerState.cursorTip));
+
+    // Released-work recovery is bounded per peer and never mutates the
+    // ordered cursor, so every peer's refill pass may recover its own
+    // released hashes in the same round.  Recovery must also run while an
+    // incremental backlog exists (cursorPendingSlots > 0): a released hole
+    // sits in the already-claimed prefix [0, cursorNextIndex), ahead of the
+    // backlog, so it must be re-admitted before the incremental cursor can
+    // advance past it.  The recovery scan and the incremental path are
+    // independent, so deferring recovery until the backlog drains would
+    // stall the pipeline on the hole.
+    //
+    // Livelock fix: recovery runs and then FALLS THROUGH to the round-gated
+    // refill below.  Previously this branch returned immediately whenever
+    // cursorRecoveryNeeded was set, so an unresolved released prefix hole (no
+    // candidate peer, exhausted budget, or AskFor refusal) made every pass of
+    // every round re-run recovery and exit before the round gate: the ordered
+    // cursor was never advanced, no new work was admitted, and the scheduler
+    // stalled forever at a stable chain height.  Recovery is bounded, does not
+    // clear cursorRecoveryNeeded merely to force progress (it stays true while
+    // the hole is unresolved), and never mutates the cursor; the round gate
+    // below still allows exactly one cursor-mutating refill pass per round.
+    // The returned admission count always includes recovered hashes so a pass
+    // whose refill is gated out still reports the work its recovery admitted.
+    size_t nRecoveryAdmitted = 0;
+    if (fCursorUsable &&
+        pindexBest->nHeight == g_ibdHeaderSchedulerState.cursorHeight &&
+        g_ibdHeaderSchedulerState.cursorRecoveryNeeded)
+    {
+        nRecoveryAdmitted = RecoverOrderedReleasedBlocks(pto, vNodesCopy);
+        ++g_ibdHeaderSchedulerState.incrementalRefillCalls;
+    }
+
+    // Exactly one refill pass per scheduling round owns the ordered cursor.
+    // The pass that first observes the current round walks the window and
+    // advances the cursor once; every other pass in the same round is a
+    // no-op.  This makes cursor mutation global/round-scoped instead of
+    // per-peer, which is the prerequisite for incremental refill with any
+    // number of peers.
+    if (g_ibdHeaderSchedulerState.refillRound ==
+        g_ibdHeaderSchedulerState.cursorRound)
+        return nRecoveryAdmitted;
+    g_ibdHeaderSchedulerState.cursorRound =
+        g_ibdHeaderSchedulerState.refillRound;
+
+    // Phase 2 bounded housekeeping: a progress baseline whose hash is no
+    // longer an in-window, still-ahead ordered descendant is dead weight.
+    // Pruning here (once per round, on the cursor-owning pass) keeps the map
+    // bounded to ~one window of live entries.
+    for (std::map<uint256, int>::iterator itB =
+             g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.begin();
+         itB != g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.end();)
+    {
+        const CIbdHeaderNode* nB = graph.Lookup(itB->first);
+        if (nB == NULL || !nB->IsAnchored() ||
+            nB->height <= pindexBest->nHeight ||
+            (size_t)(nB->height - pindexBest->nHeight) >
+                IBD_HEADERS_SCHEDULER_WINDOW)
+            g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.erase(
+                itB++);
+        else
+            ++itB;
+    }
+
+    if (fCursorUsable)
     {
         if (pindexBest->nHeight == g_ibdHeaderSchedulerState.cursorHeight &&
             g_ibdHeaderSchedulerState.cursorPendingSlots > 0 &&
@@ -782,15 +992,7 @@ static size_t RefillOrderedHeaderBlockRequests(
             ++g_ibdHeaderSchedulerState.incrementalRefillCalls;
             g_ibdHeaderSchedulerState.incrementalRefillUs +=
                 GetTimeMicros() - refillStartUs;
-            return 0;
-        }
-        if (pindexBest->nHeight == g_ibdHeaderSchedulerState.cursorHeight &&
-            g_ibdHeaderSchedulerState.cursorPendingSlots == 0)
-        {
-            ++g_ibdHeaderSchedulerState.incrementalRefillCalls;
-            g_ibdHeaderSchedulerState.incrementalRefillUs +=
-                GetTimeMicros() - refillStartUs;
-            return 0;
+            return nRecoveryAdmitted;
         }
         if (pindexBest->nHeight > g_ibdHeaderSchedulerState.cursorHeight)
         {
@@ -866,12 +1068,14 @@ static size_t RefillOrderedHeaderBlockRequests(
         printf("IBD_HEADERS_SCHED event=fallback peer=%d reason=window-empty frontier_height=%d graph_tip_height=%d lookahead=%d\n",
                pto->GetId(), pindexBest->nHeight,
                graphTip ? graphTip->height : -1, nLookahead);
-        return 0;
+        return nRecoveryAdmitted;
     }
 
-    int nBudget = GetDeferredBlockRequestBudget(pto);
-    if (incremental)
-        nBudget = std::min(nBudget, (int)g_ibdHeaderSchedulerState.cursorPendingSlots);
+    // Per-peer admission budgets: the round owner walks the ordered window
+    // once and assigns each requestable hash to its best candidate peer, so
+    // work spreads across all eligible peers instead of collapsing onto the
+    // peer whose SendMessages pass triggered the walk.
+    std::map<CNode*, int> budgetByPeer;
     size_t nHave = 0;
     size_t nOwned = 0;
     size_t nQueued = 0;
@@ -881,6 +1085,30 @@ static size_t RefillOrderedHeaderBlockRequests(
     size_t nAdmitted = 0;
     size_t fullNextIndex = window.size();
     bool fullNextIndexSet = false;
+    bool fPrefixCovered = true;
+    // Finding 2: in incremental mode the walk examines exactly one entry (the
+    // cursor head).  It is "resolved" when it was admitted or is already
+    // covered (AlreadyHave / owned / queued); only a resolved head may be
+    // advanced past.  A requestable head that could not be admitted keeps the
+    // cursor parked on it so the released/missing work stays discoverable.
+    bool fIncrementalHeadResolved = false;
+    // In full mode the ordered cursor must never advance through a truly
+    // uncovered prefix: record the first position whose request cannot be
+    // made (no candidate peer, no best peer, exhausted budget, or AskFor
+    // refusal).  Admission beyond a budget-saturated entry is still allowed
+    // (multi-peer refill must not stop at one saturated peer), but the cursor
+    // itself stops there so the release/recovery machinery keeps re-examining
+    // it; the same guard applies to genuine holes so the cursor does not
+    // silently skip past missing ordered work.
+    const auto setFullNextIndexAt =
+        [&](size_t index)
+        {
+            if (!incremental && !fullNextIndexSet)
+            {
+                fullNextIndex = index;
+                fullNextIndexSet = true;
+            }
+        };
     uint256 frontHash = uint256(0);
     int frontHeight = -1;
     NodeId frontOwner = -1;
@@ -897,6 +1125,7 @@ static size_t RefillOrderedHeaderBlockRequests(
         if (AlreadyHave(txdb, CInv(MSG_BLOCK, hash)))
         {
             ++nHave;
+            fIncrementalHeadResolved = true;
             continue;
         }
 
@@ -926,35 +1155,61 @@ static size_t RefillOrderedHeaderBlockRequests(
                 ++nInflight;
             else
                 ++nQueued;
+            fIncrementalHeadResolved = true;
+            continue;
+        }
+
+        if (IbdHeaderSchedulerHashIsQueuedOnAnyPeer(hash, vNodesCopy))
+        {
+            ++nQueued;
+            fIncrementalHeadResolved = true;
             continue;
         }
 
         if (candidates.empty())
         {
             ++nUnknownAvailability;
+            setFullNextIndexAt((size_t)(it - window.begin()));
+            fPrefixCovered = false;
             continue;
         }
 
         ++nRequestable;
-        if (nBudget <= 0)
+        CNode* pBest =
+            IbdHeaderSchedulerBestPeerForHash(hash, candidates, &budgetByPeer);
+        if (pBest == NULL)
         {
-            if (!incremental && !fullNextIndexSet)
-            {
-                fullNextIndex = (size_t)(it - window.begin());
-                fullNextIndexSet = true;
-            }
+            setFullNextIndexAt((size_t)(it - window.begin()));
+            fPrefixCovered = false;
             continue;
         }
-        CNode* pBest = IbdHeaderSchedulerBestPeerForHash(hash, candidates);
-        if (pBest != pto)
+        std::map<CNode*, int>::iterator itBudget = budgetByPeer.find(pBest);
+        if (itBudget == budgetByPeer.end())
+            itBudget = budgetByPeer.insert(std::make_pair(
+                pBest, GetDeferredBlockRequestBudget(pBest))).first;
+        if (itBudget->second <= 0)
+        {
+            setFullNextIndexAt((size_t)(it - window.begin()));
+            continue;
+        }
+        if (!fPrefixCovered)
             continue;
 
-        if (pto->AskFor(CInv(MSG_BLOCK, hash),
-                        BLOCKREQ_SOURCE_HEADERS_SCHEDULER) == ASKFOR_QUEUED)
+        if (pBest->AskFor(CInv(MSG_BLOCK, hash),
+                          BLOCKREQ_SOURCE_HEADERS_SCHEDULER) == ASKFOR_QUEUED)
         {
             ++nAdmitted;
-            --nBudget;
+            fIncrementalHeadResolved = true;
+            --itBudget->second;
             ++g_ibdHeaderSchedulerState.refillAdmissions;
+            // Phase 2: frontier baseline for progress-aware expiration.
+            g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline[hash] =
+                pindexBest->nHeight;
+        }
+        else
+        {
+            setFullNextIndexAt((size_t)(it - window.begin()));
+            fPrefixCovered = false;
         }
     }
 
@@ -972,9 +1227,25 @@ static size_t RefillOrderedHeaderBlockRequests(
     }
     else if (!incrementalEntries.empty())
     {
-        ++g_ibdHeaderSchedulerState.cursorNextIndex;
-        if (nAdmitted > 0 && g_ibdHeaderSchedulerState.cursorPendingSlots > 0)
-            --g_ibdHeaderSchedulerState.cursorPendingSlots;
+        // Finding 2 fix: the incremental cursor advances only past a head
+        // entry that was actually resolved (admitted, or already covered as
+        // AlreadyHave/owned/queued).  A requestable head that could not be
+        // admitted (no candidate, saturated best peer, or AskFor refusal)
+        // leaves the cursor on the current hash and flags recovery, so the
+        // released/missing work stays discoverable and is re-examined on
+        // every round until it resolves -- the same park-and-retry semantics
+        // full mode uses for an uncovered prefix.  This preserves the
+        // recovery fall-through (recovery never returns early).
+        if (fIncrementalHeadResolved)
+        {
+            ++g_ibdHeaderSchedulerState.cursorNextIndex;
+            if (g_ibdHeaderSchedulerState.cursorPendingSlots > 0)
+                --g_ibdHeaderSchedulerState.cursorPendingSlots;
+        }
+        else
+        {
+            g_ibdHeaderSchedulerState.cursorRecoveryNeeded = true;
+        }
     }
     g_ibdHeaderSchedulerState.cursorValid = incremental || !window.empty();
     g_ibdHeaderSchedulerState.cursorInvalidated = false;
@@ -1003,14 +1274,17 @@ static size_t RefillOrderedHeaderBlockRequests(
            (unsigned long long)g_ibdHeaderSchedulerState.fullRefillCalls,
            (unsigned long long)g_ibdHeaderSchedulerState.incrementalEntriesExamined,
            (unsigned long long)g_ibdHeaderSchedulerState.fullEntriesExamined,
-           (unsigned long long)g_ibdHeaderSchedulerState.incrementalAdmitted);
-    return nAdmitted;
+            (unsigned long long)g_ibdHeaderSchedulerState.incrementalAdmitted);
+    return nAdmitted + nRecoveryAdmitted;
 }
 
 size_t RefillOrderedHeaderBlockRequestsForTesting(
     const std::vector<CNode*>& vNodesCopy)
 {
     LOCK(cs_main);
+    // Each test invocation models one scheduling round: exactly one refill
+    // pass owns the cursor, matching the production round boundary.
+    AdvanceIbdHeaderSchedulerRound();
     size_t nTotal = 0;
     for (std::vector<CNode*>::const_iterator it = vNodesCopy.begin();
          it != vNodesCopy.end(); ++it)
@@ -1030,8 +1304,12 @@ IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting()
     out.fullRefillUs = g_ibdHeaderSchedulerState.fullRefillUs;
     out.cursorValid = g_ibdHeaderSchedulerState.cursorValid;
     out.cursorInvalidated = g_ibdHeaderSchedulerState.cursorInvalidated;
+    out.cursorRecoveryNeeded = g_ibdHeaderSchedulerState.cursorRecoveryNeeded;
     out.cursorNextIndex = g_ibdHeaderSchedulerState.cursorNextIndex;
     out.cursorPendingSlots = g_ibdHeaderSchedulerState.cursorPendingSlots;
+    out.orderedExpiryDeferredDueProgress =
+        g_ibdHeaderSchedulerState.orderedExpiryDeferredDueProgress;
+    out.orderedExpiryActual = g_ibdHeaderSchedulerState.orderedExpiryActual;
     return out;
 }
 
@@ -1039,6 +1317,54 @@ std::vector<uint256> GetIbdHeaderSchedulerWindowForTesting(
     const uint256& frontier)
 {
     return g_ibdHeadersObserver.PredictedWindowFromFrontier(frontier);
+}
+
+// Progress-aware ordered-expiry policy (Phase 2).  The fixed wire-origin
+// deadline (60 s, ibd-conservative-block-request-expiration.md) is correct for
+// legacy requests but misclassifies deep-but-legitimate ordered descendants: a
+// healthy multi-peer pipeline can legitimately hold work hundreds of blocks
+// ahead of a frontier that is still advancing (mainnet runtime: ~250 ahead at
+// 1-2 block/s), so tail requests age past 60 s before the queue reaches them.
+//
+// A descendant request is deferred while ALL of the following hold:
+//   * it was admitted by the ordered scheduler (baseline recorded), not a
+//     legacy request;
+//   * it is still strictly ahead of the connected frontier, inside the bounded
+//     ordered window (the request has not fallen out of the pipeline);
+//   * the frontier has advanced since admission (progress, not stall);
+//   * its wire age is below the hard safety ceiling (no infinite protection).
+// Otherwise the request is a genuine expiry candidate.  Pending-wire requests
+// (getdata never reached the socket) are never deferred: they are a local
+// send-path failure, not a frontier-progress question.
+//
+// Called from CNode::ExpireBlockInFlight under TRY_LOCK(cs_main); must be
+// invoked with cs_main held.
+static const int64_t IBD_ORDERED_MAX_WIRE_AGE_US = 300LL * 1000000;
+
+IbdOrderedExpiryOutcome IbdHeaderSchedulerOrderedExpiryDecide(
+    const uint256& hash, int64_t nNowUs, int64_t nWireUs)
+{
+    AssertLockHeld(cs_main);
+    if (!IbdHeaderSchedulerSelectActive() || pindexBest == NULL)
+        return IBD_ORDERED_EXPIRY_NOT_ORDERED;
+    std::map<uint256, int>::const_iterator itBaseline =
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.find(hash);
+    if (itBaseline ==
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.end())
+        return IBD_ORDERED_EXPIRY_NOT_ORDERED;
+    const CIbdHeaderNode* node = g_ibdHeadersObserver.Graph().Lookup(hash);
+    const int nGap = (node != NULL && node->IsAnchored())
+                         ? (node->height - pindexBest->nHeight)
+                         : 0;
+    if (nGap > 0 && (size_t)nGap <= IBD_HEADERS_SCHEDULER_WINDOW &&
+        pindexBest->nHeight > itBaseline->second && nWireUs > 0 &&
+        nNowUs - nWireUs < IBD_ORDERED_MAX_WIRE_AGE_US)
+    {
+        ++g_ibdHeaderSchedulerState.orderedExpiryDeferredDueProgress;
+        return IBD_ORDERED_EXPIRY_DEFER;
+    }
+    ++g_ibdHeaderSchedulerState.orderedExpiryActual;
+    return IBD_ORDERED_EXPIRY_EXPIRE;
 }
 
 static void TraceDeferredWindowState(CNode* pfrom, const char* pszEvent,

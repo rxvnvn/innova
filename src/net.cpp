@@ -1737,7 +1737,8 @@ void RecordBlockLastTimeoutOwner(const uint256& hash, NodeId peer)
     }
 }
 
-bool GetBlockLastTimeoutOwner(const uint256& hash, NodeId* peer)
+bool GetBlockLastTimeoutOwner(const uint256& hash, NodeId* peer,
+                              int64_t* nTimeUs)
 {
     LOCK(cs_mapAlreadyAskedFor);
     const int64_t nNowUs = CNode::QualityNowUs();
@@ -1755,6 +1756,8 @@ bool GetBlockLastTimeoutOwner(const uint256& hash, NodeId* peer)
     }
     if (peer)
         *peer = it->second.first;
+    if (nTimeUs)
+        *nTimeUs = it->second.second;
     return true;
 }
 
@@ -3279,8 +3282,14 @@ bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
     // A non-"receive" release means the request died before delivery: the
     // latency record (if any) terminates here.  "receive" is handled by the
     // T2 hook in ProcessMessage(block), so the lifecycle continues.
+    // A descendant timeout/release is now a local event: it must not reset
+    // the ordered-scheduler refill cursor (that would turn one timeout into a
+    // full 512-window reconsideration).  Instead it arms the bounded recovery
+    // scan, which re-admits only the released contiguous prefix.  Structural
+    // changes (peer disconnect) still invalidate the cursor via
+    // ReleaseBlockRequestOwnersForPeer.
     if (strcmp(pszReason, "receive") != 0)
-        InvalidateIbdHeaderSchedulerRefillCursor();
+        MarkIbdHeaderSchedulerRecoveryNeeded();
     if (strcmp(pszReason, "receive") != 0)
         ibdblocklatency::RecordBlockTerminal(
             hash,
@@ -8712,6 +8721,11 @@ void ThreadMessageHandler2(void* parg)
         }
 
         MaybeProcessPipelineWake(vNodesCopy);
+
+        // One scheduling round boundary for the ordered IBD header block
+        // scheduler: exactly one refill pass per round may mutate the
+        // ordered refill cursor.
+        AdvanceIbdHeaderSchedulerRound();
 
         BOOST_FOREACH(CNode* pnode, vNodesCopy)
         {

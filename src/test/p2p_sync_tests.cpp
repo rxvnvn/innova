@@ -9408,4 +9408,1192 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_sequential_refill_uses_incremental_cursor
     fIbdHeaderScheduler = savedScheduler;
 }
 
+BOOST_AUTO_TEST_CASE(headers_scheduler_contiguous_admission_keeps_wide_pipeline)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(93), "sched-wide", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    const uint256 anchor(2000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.reserve(600);
+    uint256 previous = anchor;
+    for (int i = 1; i <= 600; ++i)
+    {
+        const uint256 hash(2000000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    for (int i = 1; i <= 600; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(), uint256(2000000 + i));
+
+    std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 128U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 128U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(2000001)));
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(2000128)));
+    BOOST_CHECK(!peer.IsBlockAskForQueued(uint256(2000129)));
+
+    const IbdHeaderSchedulerRefillStats stats =
+        GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 1U);
+    BOOST_CHECK_EQUAL(stats.incrementalAdmitted, 0U);
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_hole_blocks_admission_beyond)
+{
+    // A hole is defined by the request lifecycle, not by inv: block b is a
+    // hole iff !AlreadyHave(b) && !globallyQueued(b) && !globallyOwned(b) &&
+    // CandidatePeers(b).empty().  Here block 5 has no source at all: it was
+    // announced only by peer B (A announced headers 1-4, C announced headers
+    // 6-10), and after B disconnects its header source is gone.  No inv is
+    // involved anywhere, so this also pins the invariant that ordered IBD
+    // schedules purely from the header graph without fresh inv.
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(94), "sched-hole-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(97), "sched-hole-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(98), "sched-hole-c", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerC, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+
+    const uint256 anchor(3000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+
+    std::vector<std::pair<uint256, uint256> > headersA;
+    headersA.reserve(4);
+    uint256 previous = anchor;
+    for (int i = 1; i <= 4; ++i)
+    {
+        const uint256 hash(3000000 + i);
+        headersA.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headersA));
+
+    std::vector<std::pair<uint256, uint256> > headersB;
+    headersB.reserve(10);
+    previous = anchor;
+    for (int i = 1; i <= 10; ++i)
+    {
+        const uint256 hash(3000000 + i);
+        headersB.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), headersB));
+
+    std::vector<std::pair<uint256, uint256> > headersC;
+    headersC.reserve(5);
+    previous = uint256(3000005);
+    for (int i = 6; i <= 10; ++i)
+    {
+        const uint256 hash(3000000 + i);
+        headersC.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerC.GetId(), headersC));
+
+    // B was the only source of block 5.  Disconnecting B removes that last
+    // source; 1-4 keep A and 6-10 keep C, all from headers only.
+    IbdHeadersObserverPeerDisconnected(peerB.GetId());
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerC);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 4U);
+    for (int i = 1; i <= 4; ++i)
+        BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(3000000 + i)));
+    for (int i = 5; i <= 10; ++i)
+        BOOST_CHECK(!peerA.IsBlockAskForQueued(uint256(3000000 + i)));
+    for (int i = 6; i <= 10; ++i)
+        BOOST_CHECK(!peerC.IsBlockAskForQueued(uint256(3000000 + i)));
+
+    const uint256 inflight(3000002);
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(inflight, peerA.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+    peerA.MarkBlockInFlight(inflight);
+    for (std::multimap<int64_t, CInv>::iterator it = peerA.mapAskFor.begin();
+         it != peerA.mapAskFor.end(); ++it)
+    {
+        if (it->second.hash == inflight)
+        {
+            peerA.EraseAskForEntry(it, false);
+            break;
+        }
+    }
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(inflight, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peerA.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK(GetBlockRequestOwner(inflight, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peerA.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    for (int i = 5; i <= 10; ++i)
+        BOOST_CHECK(!peerA.IsBlockAskForQueued(uint256(3000000 + i)));
+    for (int i = 6; i <= 10; ++i)
+        BOOST_CHECK(!peerC.IsBlockAskForQueued(uint256(3000000 + i)));
+    for (int i = 1; i <= 4; ++i)
+    {
+        if (i != 2)
+            BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(3000000 + i)));
+    }
+
+    peerA.ClearAskFor();
+    peerC.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_descendant_timeout_recovery_without_full_refill)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(95), "sched-timeout", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    const uint256 anchor(4000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.reserve(600);
+    uint256 previous = anchor;
+    for (int i = 1; i <= 600; ++i)
+    {
+        const uint256 hash(4000000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    for (int i = 1; i <= 600; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(), uint256(4000000 + i));
+
+    std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 128U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 128U);
+
+    const uint256 timedOut(4000002);
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(timedOut, peer.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+    for (std::multimap<int64_t, CInv>::iterator it = peer.mapAskFor.begin();
+         it != peer.mapAskFor.end(); ++it)
+    {
+        if (it->second.hash == timedOut)
+        {
+            peer.EraseAskForEntry(it, false);
+            break;
+        }
+    }
+    BOOST_REQUIRE(ReleaseBlockRequestOwner(timedOut, peer.GetId(), "timeout"));
+    RecordBlockLastTimeoutOwner(timedOut, peer.GetId());
+    BOOST_CHECK(!GetIbdHeaderSchedulerRefillStatsForTesting().cursorInvalidated);
+    BOOST_CHECK(GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 127U);
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(timedOut));
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 128U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(4000001)));
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(4000003)));
+
+    const IbdHeaderSchedulerRefillStats stats =
+        GetIbdHeaderSchedulerRefillStatsForTesting();
+    // The recovery round no longer returns before the round gate: recovery
+    // re-admits the released hash and then FALLS THROUGH to the round-gated
+    // full refill (which finds every prefix entry covered and admits 0).  So
+    // the full refill has run twice: once for the initial admission, once for
+    // the recovery round.
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 2U);
+    BOOST_CHECK(!stats.cursorInvalidated);
+    BOOST_CHECK(!stats.cursorRecoveryNeeded);
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 128U);
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_recovery_allowed_with_incremental_backlog)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(97), "sched-recv-backlog", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    const uint256 anchor(6000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    // Keep the window small (6 descendants) so the peer's request budget is
+    // never exhausted: the recovery scan must be able to re-admit released
+    // hashes even while an incremental backlog is pending.
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.reserve(6);
+    uint256 previous = anchor;
+    for (int i = 1; i <= 6; ++i)
+    {
+        const uint256 hash(6000000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    for (int i = 1; i <= 6; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(), uint256(6000000 + i));
+
+    std::vector<CNode*> peers(1, &peer);
+    // Full refill admits the whole 6-hash window (positions 0..5).
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 6U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 6U);
+
+    // Simulate send + timeout for two prefix hashes: the front "hole"
+    // (position 3, height 4) and a second one (position 4, height 5).
+    const uint256 hole(6000004);
+    const uint256 secondHole(6000005);
+    for (int i = 0; i < 2; ++i)
+    {
+        const uint256 hash = i == 0 ? hole : secondHole;
+        BOOST_REQUIRE(TryAssignBlockRequestOwner(hash, peer.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+        for (std::multimap<int64_t, CInv>::iterator it = peer.mapAskFor.begin();
+             it != peer.mapAskFor.end(); ++it)
+        {
+            if (it->second.hash == hash)
+            {
+                peer.EraseAskForEntry(it, false);
+                break;
+            }
+        }
+        BOOST_REQUIRE(ReleaseBlockRequestOwner(hash, peer.GetId(), "timeout"));
+    }
+    BOOST_CHECK(GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 4U);
+
+    // Advance the frontier by 2 (height 0 -> 2).  The cursor shift creates a
+    // pending incremental backlog: the window shrinks to the graph tip, the
+    // incremental entry is past the end (cursorNextIndex 4 == window size 4),
+    // so no slot is admitted and cursorPendingSlots stays at 2, while both
+    // released holes remain in the claimed prefix [0, cursorNextIndex).
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(6000002), 2));
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK(!peer.IsBlockAskForQueued(hole));
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 4U);
+    IbdHeaderSchedulerRefillStats stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK_EQUAL(stats.cursorPendingSlots, 2U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 4U);
+    BOOST_CHECK(stats.cursorRecoveryNeeded);
+
+    // The next round must run the bounded recovery scan even though a pending
+    // incremental backlog exists, re-admitting both released hashes without
+    // touching the cursor.  (Pre-fix, the recovery gate required
+    // cursorPendingSlots == 0 and the pipeline stalled on the holes forever.)
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 2U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(hole));
+    BOOST_CHECK(peer.IsBlockAskForQueued(secondHole));
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 6U);
+    stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK_EQUAL(stats.cursorPendingSlots, 2U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 4U);
+    BOOST_CHECK(!stats.cursorRecoveryNeeded);
+    BOOST_CHECK(!stats.cursorInvalidated);
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_unresolved_prefix_hole_no_candidate_keeps_rounds_running)
+{
+    // Regression: an unresolved released prefix hole (its only source peer
+    // disconnected -> no candidate) must not livelock the ordered scheduler.
+    // Round after round the recovery scan re-runs over the hole without being
+    // able to re-admit it; the fixed control flow still FALLS THROUGH to the
+    // round-gated full refill every round (fullRefillCalls keeps advancing)
+    // and parks the cursor at the first uncovered prefix position.  When a
+    // source appears the next round's refill re-covers the prefix and the
+    // cursor resumes.
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(110), "sched-nocand-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(111), "sched-nocand-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+
+    const uint256 anchor(7000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headersA;
+    uint256 previous = anchor;
+    for (int i = 1; i <= 64; ++i)
+    {
+        const uint256 hash(7000000 + i);
+        headersA.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headersA));
+    // B announces only 5..64: blocks 1..4 keep A as their only header source.
+    // No inv availability anywhere, so candidates come from the graph alone.
+    std::vector<std::pair<uint256, uint256> > headersB;
+    previous = uint256(7000004);
+    for (int i = 5; i <= 64; ++i)
+    {
+        const uint256 hash(7000000 + i);
+        headersB.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), headersB));
+
+    std::vector<CNode*> peers(1, &peerA);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 64U);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 64U);
+    IbdHeaderSchedulerRefillStats stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 1U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 64U);
+    BOOST_CHECK(!stats.cursorRecoveryNeeded);
+
+    // A was the only source of the 4-block front prefix; drop it from the
+    // header observer so the prefix becomes a structural hole with no
+    // candidate peer, then release A's claimed hashes.
+    IbdHeadersObserverPeerDisconnected(peerA.GetId());
+    for (int i = 1; i <= 4; ++i)
+    {
+        const uint256 hash(7000000 + i);
+        BOOST_REQUIRE(TryAssignBlockRequestOwner(hash, peerA.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+        for (std::multimap<int64_t, CInv>::iterator it = peerA.mapAskFor.begin();
+             it != peerA.mapAskFor.end(); ++it)
+        {
+            if (it->second.hash == hash)
+            {
+                peerA.EraseAskForEntry(it, false);
+                break;
+            }
+        }
+        BOOST_REQUIRE(ReleaseBlockRequestOwner(hash, peerA.GetId(), "timeout"));
+    }
+    BOOST_CHECK(GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 60U);
+
+    // The hole has no candidate, so recovery cannot re-admit it and the flag
+    // must stay true (recovery does not clear it merely to force progress).
+    // The fix: the recovery pass then falls through to the round gate, so the
+    // round-gated full refill still runs (fullRefillCalls 1 -> 2) and the
+    // cursor retreats to the first uncovered prefix position (0) instead of
+    // parking at a stale 64.  Pre-fix this round returned before the round
+    // gate: fullRefillCalls stayed 1 and the cursor stayed at 64.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK(stats.cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 2U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 0U);
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(uint256(7000001)));
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 60U);
+
+    // Rounds keep running while the hole is unresolved: the full refill runs
+    // again this round.  Pre-fix, this round returned at the recovery gate
+    // (fullRefillCalls stayed 2).
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 3U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 0U);
+
+    // A source appears (inv availability on B).  The next round's refill
+    // re-covers the whole prefix and the cursor resumes; the old code would
+    // only reach this refill after the hole had already resolved.
+    for (int i = 1; i <= 4; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB.GetId(), uint256(7000000 + i));
+    std::vector<CNode*> peersAB;
+    peersAB.push_back(&peerA);
+    peersAB.push_back(&peerB);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peersAB), 4U);
+    stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK(!stats.cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 4U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 64U);
+    for (int i = 1; i <= 4; ++i)
+        BOOST_CHECK(peerB.IsBlockAskForQueued(uint256(7000000 + i)));
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_unresolved_prefix_hole_budget_exhausted_keeps_rounds_running)
+{
+    // Regression: an unresolved released prefix hole whose peer's request
+    // budget is exhausted must not livelock the ordered scheduler.  Recovery
+    // cannot re-admit the hash (budget == 0) so cursorRecoveryNeeded stays
+    // true, but the fixed control flow still falls through to the round-gated
+    // full refill which retreats the cursor to the hole; once the budget
+    // returns the refill re-admits the hole and the cursor resumes.
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(112), "sched-nobudget", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    const uint256 anchor(7500000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    uint256 previous = anchor;
+    for (int i = 1; i <= 600; ++i)
+    {
+        const uint256 hash(7500000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    for (int i = 1; i <= 600; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(), uint256(7500000 + i));
+
+    std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 128U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 128U);
+
+    // Release the front hash and saturate the peer's request budget with an
+    // unrelated in-flight hash so recovery cannot re-admit it.
+    const uint256 hole(7500001);
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(hole, peer.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+    for (std::multimap<int64_t, CInv>::iterator it = peer.mapAskFor.begin();
+         it != peer.mapAskFor.end(); ++it)
+    {
+        if (it->second.hash == hole)
+        {
+            peer.EraseAskForEntry(it, false);
+            break;
+        }
+    }
+    BOOST_REQUIRE(ReleaseBlockRequestOwner(hole, peer.GetId(), "timeout"));
+    const uint256 inflight(9500000);
+    peer.MarkBlockInFlight(inflight);
+    BOOST_CHECK(GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 127U);
+
+    // Recovery hits budget == 0, keeps cursorRecoveryNeeded true, and the
+    // fall-through full refill still runs (fullRefillCalls 1 -> 2) and parks
+    // the cursor at the hole.  Pre-fix this round returned at the recovery
+    // gate: fullRefillCalls stayed 1 and the cursor stayed at 128.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    IbdHeaderSchedulerRefillStats stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK(stats.cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 2U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 0U);
+    BOOST_CHECK(!peer.IsBlockAskForQueued(hole));
+
+    // Budget returns (in-flight cleared): recovery has nothing left to scan
+    // (cursorNextIndex 0), falls through to the full refill which re-admits
+    // the hole and advances the cursor to the covered prefix.
+    peer.ClearBlockInFlight(inflight);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
+    stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK(!stats.cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 3U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 128U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(hole));
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_unresolved_prefix_hole_askfor_refusal_keeps_rounds_running)
+{
+    // Regression: an unresolved released prefix hole whose re-admission is
+    // refused by AskFor (hash still marked in flight) must not livelock the
+    // ordered scheduler.  Same shape as the budget-exhausted case: recovery
+    // keeps the flag true, the fall-through full refill keeps running and
+    // parks the cursor at the hole, and progress resumes once the refusal
+    // clears.
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(113), "sched-refused", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    const uint256 anchor(8000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    uint256 previous = anchor;
+    for (int i = 1; i <= 600; ++i)
+    {
+        const uint256 hash(8000000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    for (int i = 1; i <= 600; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(), uint256(8000000 + i));
+
+    std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 128U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 128U);
+
+    // Release two prefix hashes and mark the front one in flight: recovery
+    // has budget (127 pressure) but AskFor refuses the front hash.
+    const uint256 hole(8000001);
+    const uint256 secondHole(8000002);
+    for (int i = 0; i < 2; ++i)
+    {
+        const uint256 hash = i == 0 ? hole : secondHole;
+        BOOST_REQUIRE(TryAssignBlockRequestOwner(hash, peer.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+        for (std::multimap<int64_t, CInv>::iterator it = peer.mapAskFor.begin();
+             it != peer.mapAskFor.end(); ++it)
+        {
+            if (it->second.hash == hash)
+            {
+                peer.EraseAskForEntry(it, false);
+                break;
+            }
+        }
+        BOOST_REQUIRE(ReleaseBlockRequestOwner(hash, peer.GetId(), "timeout"));
+    }
+    peer.MarkBlockInFlight(hole);
+    BOOST_CHECK(GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 126U);
+
+    // Recovery budget is 1 but AskFor returns ASKFOR_INFLIGHT for the front
+    // hole: cursorRecoveryNeeded stays true and the fall-through full refill
+    // still runs (fullRefillCalls 1 -> 2), parking the cursor at the hole.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    IbdHeaderSchedulerRefillStats stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK(stats.cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 2U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 0U);
+    BOOST_CHECK(!peer.IsBlockAskForQueued(hole));
+
+    // The refusal clears: recovery (nothing to scan, cursor at 0) falls
+    // through to the full refill which re-admits both released hashes.
+    peer.ClearBlockInFlight(hole);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 2U);
+    stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK(!stats.cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 3U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 128U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(hole));
+    BOOST_CHECK(peer.IsBlockAskForQueued(secondHole));
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_cursor_stops_at_first_uncovered_prefix_position)
+{
+    // Pins the cursor-advance rule in full refill: the ordered cursor stops
+    // at the FIRST prefix position whose request cannot be made, while tail
+    // work beyond a budget-saturated peer may still be admitted to other
+    // peers.  Block 1 can only be served by P1 (inv preference) whose request
+    // budget is saturated, so the cursor must park at position 0 even though
+    // 128 later hashes flow to P2.  Pre-fix the cursor advanced to
+    // window.size() (512) and skipped straight past the uncovered prefix.
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(114), "sched-prefix-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(115), "sched-prefix-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+
+    const uint256 anchor(8500000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    uint256 previous = anchor;
+    for (int i = 1; i <= 600; ++i)
+    {
+        const uint256 hash(8500000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headers));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), headers));
+    // Block 1 is best served by A only; blocks 2+ by B only.
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerA.GetId(), uint256(8500001));
+    for (int i = 2; i <= 600; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB.GetId(), uint256(8500000 + i));
+
+    // Saturate A's request budget with unrelated in-flight hashes.
+    for (int i = 0; i < 128; ++i)
+        peerA.MarkBlockInFlight(uint256(95000000 + i));
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 128U);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 0U);
+    BOOST_CHECK_EQUAL(peerB.setAskForBlocks.size(), 128U);
+    IbdHeaderSchedulerRefillStats stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 0U);
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(uint256(8500001)));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(uint256(8500002)));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(uint256(8500129)));
+
+    // A's budget returns: the refill admits block 1 to A and the cursor
+    // advances to the now-covered prefix.
+    for (int i = 0; i < 128; ++i)
+        peerA.ClearBlockInFlight(uint256(95000000 + i));
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
+    stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 129U);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 1U);
+    BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(8500001)));
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_multipeer_single_cursor_recovery_and_refill_per_round)
+{
+    // Pins the round ownership invariant across recovery: with two peers both
+    // needing recovery in the same round, recovery runs once per peer (each
+    // re-admits its own released hash) but the cursor-mutating full refill
+    // still runs exactly once per round (the first pass that observes the
+    // round).  Pre-fix the recovery branch returned before the round gate, so
+    // the first pass never ran the full refill and fullRefillCalls stayed 1.
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(116), "sched-multi-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(117), "sched-multi-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+
+    const uint256 anchor(9000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    uint256 previous = anchor;
+    for (int i = 1; i <= 600; ++i)
+    {
+        const uint256 hash(9000000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headers));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), headers));
+    // Block 1 is best served by A only; blocks 2+ by B only.
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerA.GetId(), uint256(9000001));
+    for (int i = 2; i <= 600; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB.GetId(), uint256(9000000 + i));
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 129U);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 1U);
+    BOOST_CHECK_EQUAL(peerB.setAskForBlocks.size(), 128U);
+    IbdHeaderSchedulerRefillStats stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 1U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 129U);
+
+    // Release each peer's front hash.
+    const uint256 holeA(9000001);
+    const uint256 holeB(9000002);
+    for (int i = 0; i < 2; ++i)
+    {
+        CNode& owner = i == 0 ? peerA : peerB;
+        const uint256 hash = i == 0 ? holeA : holeB;
+        BOOST_REQUIRE(TryAssignBlockRequestOwner(hash, owner.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+        for (std::multimap<int64_t, CInv>::iterator it = owner.mapAskFor.begin();
+             it != owner.mapAskFor.end(); ++it)
+        {
+            if (it->second.hash == hash)
+            {
+                owner.EraseAskForEntry(it, false);
+                break;
+            }
+        }
+        BOOST_REQUIRE(ReleaseBlockRequestOwner(hash, owner.GetId(), "timeout"));
+    }
+    BOOST_CHECK(GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+
+    // Round with two peers: A's pass recovers holeA (its own) and then owns
+    // the round; its fall-through full refill re-admits holeB to B.  A's
+    // recovery re-examined the whole prefix (holeB is best served by B, so it
+    // is skipped, not flagged unresolved) and cleared the flag, so B's pass
+    // runs no recovery and is gated out of the refill.  The cursor-mutating
+    // full refill therefore runs exactly once per round (fullRefillCalls
+    // 1 -> 2) while the recovery scan ran once.  Pre-fix the recovery branch
+    // returned before the round gate, so A's pass never ran the full refill:
+    // holeB stayed released, fullRefillCalls stayed 1, and this round
+    // admitted only 1 hash instead of 2.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 2U);
+    stats = GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK(!stats.cursorRecoveryNeeded);
+    BOOST_CHECK_EQUAL(stats.fullRefillCalls, 2U);
+    BOOST_CHECK_EQUAL(stats.incrementalRefillCalls, 1U);
+    BOOST_CHECK_EQUAL(stats.cursorNextIndex, 129U);
+    BOOST_CHECK(peerA.IsBlockAskForQueued(holeA));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(holeB));
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_structural_disconnect_still_invalidates_cursor)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(96), "sched-disconnect", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    const uint256 anchor(5000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.push_back(std::make_pair(uint256(5000001), anchor));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(), uint256(5000001));
+
+    std::vector<CNode*> peers(1, &peer);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
+
+    peer.ClearAskFor();
+    BOOST_CHECK_EQUAL(ReleaseBlockRequestOwnersForPeer(peer.GetId(), "disconnect"), 0U);
+    BOOST_CHECK(GetIbdHeaderSchedulerRefillStatsForTesting().cursorInvalidated);
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
+    BOOST_CHECK_EQUAL(GetIbdHeaderSchedulerRefillStatsForTesting().fullRefillCalls, 2U);
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2: progress-aware ordered-IBD expiration.
+// ---------------------------------------------------------------------------
+
+// Build an ordered pipeline: anchor 100 @ height 1000, contiguous headers
+// 101..200 (heights 1001..1100) with INV availability on `peer`, and run one
+// full refill round so the ordered scheduler admits the window prefix and
+// records the Phase 2 frontier baseline for each admitted hash.
+static void SetupOrderedPipelineForExpiryTest(CNode& peer,
+                                              std::vector<CNode*>& peers)
+{
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(100), 1000));
+    std::vector<std::pair<uint256, uint256> > headers;
+    for (int i = 101; i <= 200; ++i)
+        headers.push_back(std::make_pair(uint256(i), uint256(i - 1)));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    for (int i = 101; i <= 200; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(), uint256(i));
+    peers.clear();
+    peers.push_back(&peer);
+    RefillOrderedHeaderBlockRequestsForTesting(peers);
+    // Hash 160 (height 1060) is the 60th window entry and was admitted.
+    BOOST_REQUIRE(peer.IsBlockAskForQueued(uint256(160)));
+}
+
+// 1. A deep ordered descendant whose wire age passed the fixed 60 s deadline
+//    is protected while the frontier keeps advancing toward it (but has not
+//    reached it).  Owner/inflight survive and no timeout is accounted.
+BOOST_AUTO_TEST_CASE(ordered_expiry_moving_frontier_protects_old_descendant)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(3001), "expiry-progress", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    std::vector<CNode*> peers;
+    SetupOrderedPipelineForExpiryTest(peer, peers);
+
+    const uint256 hashDescendant(160);  // height 1060, admitted at frontier 1000
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(
+        hashDescendant, peer.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+    peer.MarkBlockInFlight(hashDescendant);
+    {
+        LOCK(peer.cs_vBlockInFlightWire);
+        peer.mapBlockInFlightWireUs[hashDescendant] =
+            GetTimeMicros() - 61000000;  // fixed 60 s wire deadline passed
+    }
+
+    const int64_t nTimeoutBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes);
+    const uint64_t nDeferredBefore =
+        GetIbdHeaderSchedulerRefillStatsForTesting()
+            .orderedExpiryDeferredDueProgress;
+
+    // Frontier advances 40 blocks to 1040 without yet reaching 1060.
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(140), 1040));
+    peer.ExpireBlockInFlight();
+
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashDescendant), 1U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hashDescendant), 1U);
+    BOOST_CHECK(IsBlockRequestOwnedByAnyPeer(hashDescendant));
+    BOOST_CHECK(!WasBlockLastTimedOutByPeer(hashDescendant, peer.GetId()));
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes),
+        nTimeoutBefore);
+    BOOST_CHECK_EQUAL(
+        GetIbdHeaderSchedulerRefillStatsForTesting()
+            .orderedExpiryDeferredDueProgress,
+        nDeferredBefore + 1);
+
+    peer.ClearAskFor();
+    ReleaseBlockRequestOwnersForPeer(peer.GetId(), "disconnect");
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// 2. The same old descendant expires when the frontier has not advanced since
+//    admission: owner is released, the timeout is accounted honestly, and the
+//    ordered expiry diagnostics classify it as a genuine expiry.
+BOOST_AUTO_TEST_CASE(ordered_expiry_stalled_frontier_expires)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(3002), "expiry-stall", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    std::vector<CNode*> peers;
+    SetupOrderedPipelineForExpiryTest(peer, peers);
+
+    const uint256 hashDescendant(160);
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(
+        hashDescendant, peer.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+    peer.MarkBlockInFlight(hashDescendant);
+    {
+        LOCK(peer.cs_vBlockInFlightWire);
+        peer.mapBlockInFlightWireUs[hashDescendant] =
+            GetTimeMicros() - 61000000;
+    }
+
+    const int64_t nTimeoutBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes);
+    const uint64_t nActualBefore =
+        GetIbdHeaderSchedulerRefillStatsForTesting().orderedExpiryActual;
+
+    // Frontier never advances: the fixed deadline has passed, so it expires.
+    peer.ExpireBlockInFlight();
+
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashDescendant), 0U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hashDescendant), 0U);
+    BOOST_CHECK(!IsBlockRequestOwnedByAnyPeer(hashDescendant));
+    BOOST_CHECK(WasBlockLastTimedOutByPeer(hashDescendant, peer.GetId()));
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes),
+        nTimeoutBefore + 1);
+    BOOST_CHECK_EQUAL(
+        GetIbdHeaderSchedulerRefillStatsForTesting().orderedExpiryActual,
+        nActualBefore + 1);
+
+    peer.ClearAskFor();
+    ReleaseBlockRequestOwnersForPeer(peer.GetId(), "disconnect");
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// 3. No infinite protection: even with a live advancing frontier, a request
+//    whose wire age crosses the hard safety ceiling must still expire.
+BOOST_AUTO_TEST_CASE(ordered_expiry_no_infinite_protection)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(3003), "expiry-ceiling", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    std::vector<CNode*> peers;
+    SetupOrderedPipelineForExpiryTest(peer, peers);
+
+    const uint256 hashDescendant(160);
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(
+        hashDescendant, peer.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+    peer.MarkBlockInFlight(hashDescendant);
+    {
+        LOCK(peer.cs_vBlockInFlightWire);
+        peer.mapBlockInFlightWireUs[hashDescendant] =
+            GetTimeMicros() - 310000000;  // 310 s >= 300 s ceiling
+    }
+
+    const int64_t nTimeoutBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes);
+    const uint64_t nDeferredBefore =
+        GetIbdHeaderSchedulerRefillStatsForTesting()
+            .orderedExpiryDeferredDueProgress;
+
+    // Frontier advances, but the ceiling bounds the protection.
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(140), 1040));
+    peer.ExpireBlockInFlight();
+
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashDescendant), 0U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hashDescendant), 0U);
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes),
+        nTimeoutBefore + 1);
+    BOOST_CHECK_EQUAL(
+        GetIbdHeaderSchedulerRefillStatsForTesting()
+            .orderedExpiryDeferredDueProgress,
+        nDeferredBefore);
+
+    peer.ClearAskFor();
+    ReleaseBlockRequestOwnersForPeer(peer.GetId(), "disconnect");
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// 4. A genuine old frontier (front-of-pipeline) request with no progress still
+//    expires, and the Phase 1 bounded recovery re-admits it in the next round
+//    without a full-window refill.
+BOOST_AUTO_TEST_CASE(ordered_expiry_frontier_request_recoverable)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(3004), "expiry-front", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    std::vector<CNode*> peers;
+    SetupOrderedPipelineForExpiryTest(peer, peers);
+
+    // The front of the ordered pipeline: window[0], height 1001.
+    const uint256 hashFrontier(101);
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(
+        hashFrontier, peer.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+    peer.MarkBlockInFlight(hashFrontier);
+    // Model the live send path: the askfor entry is consumed when the getdata
+    // goes out, so a later timeout leaves the hash released with no queued
+    // retry -- exactly the case the bounded recovery scan must re-admit.
+    for (std::multimap<int64_t, CInv>::iterator itAsk = peer.mapAskFor.begin();
+         itAsk != peer.mapAskFor.end(); ++itAsk)
+    {
+        if (itAsk->second.hash == hashFrontier)
+        {
+            peer.EraseAskForEntry(itAsk, false);
+            break;
+        }
+    }
+    {
+        LOCK(peer.cs_vBlockInFlightWire);
+        peer.mapBlockInFlightWireUs[hashFrontier] =
+            GetTimeMicros() - 61000000;
+    }
+
+    peer.ExpireBlockInFlight();  // stalled frontier: expires and releases
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashFrontier), 0U);
+    BOOST_CHECK(!IsBlockRequestOwnedByAnyPeer(hashFrontier));
+    BOOST_CHECK(WasBlockLastTimedOutByPeer(hashFrontier, peer.GetId()));
+
+    // Phase 1 bounded recovery re-admits it in the next round.  The recovery
+    // round FALLS THROUGH to the round-gated refill (livelock fix: an
+    // unresolved hole must not suppress the normal refill), so exactly one
+    // additional full refill runs and finds the window covered.
+    const uint64_t nFullBefore =
+        GetIbdHeaderSchedulerRefillStatsForTesting().fullRefillCalls;
+    BOOST_CHECK_GE(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(hashFrontier));
+    BOOST_CHECK_EQUAL(
+        GetIbdHeaderSchedulerRefillStatsForTesting().fullRefillCalls,
+        nFullBefore + 1);
+
+    peer.ClearAskFor();
+    ReleaseBlockRequestOwnersForPeer(peer.GetId(), "disconnect");
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// 5. Legacy behavior unchanged: a request that is not an ordered-scheduler
+//    descendant keeps the fixed wire-origin deadline, and the new ordered
+//    diagnostics never touch it.
+BOOST_AUTO_TEST_CASE(ordered_expiry_legacy_unchanged)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedIbdQualityState scope;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(3005), "expiry-legacy", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    // Scheduler active with a seeded graph, but the legacy hash is not an
+    // ordered descendant and carries no scheduler baseline.
+    std::vector<CNode*> peers;
+    SetupOrderedPipelineForExpiryTest(peer, peers);
+
+    const uint256 hashLegacy(990001);
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(
+        hashLegacy, peer.GetId(), BLOCKREQ_SOURCE_INV));
+    peer.MarkBlockInFlight(hashLegacy);
+    {
+        LOCK(peer.cs_vBlockInFlightWire);
+        peer.mapBlockInFlightWireUs[hashLegacy] =
+            GetTimeMicros() - 61000000;
+    }
+
+    const int64_t nTimeoutBefore =
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes);
+    peer.ExpireBlockInFlight();
+
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.count(hashLegacy), 0U);
+    BOOST_CHECK_EQUAL(peer.mapBlockInFlightSince.count(hashLegacy), 0U);
+    BOOST_CHECK(WasBlockLastTimedOutByPeer(hashLegacy, peer.GetId()));
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().peer_quality_timeout_outcomes),
+        nTimeoutBefore + 1);
+    BOOST_CHECK_EQUAL(
+        GetIbdHeaderSchedulerRefillStatsForTesting()
+            .orderedExpiryDeferredDueProgress,
+        0U);
+    BOOST_CHECK_EQUAL(
+        GetIbdHeaderSchedulerRefillStatsForTesting().orderedExpiryActual,
+        0U);
+
+    peer.ClearAskFor();
+    ReleaseBlockRequestOwnersForPeer(peer.GetId(), "disconnect");
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
 BOOST_AUTO_TEST_SUITE_END()
