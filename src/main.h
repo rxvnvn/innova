@@ -482,6 +482,7 @@ void ResetIbdHeaderSchedulerStateForTesting();
 bool SeedIbdHeaderSchedulerAnchorForTesting(const uint256& hash, int height);
 bool SeedIbdHeaderSchedulerHeadersForTesting(NodeId peer,
     const std::vector<std::pair<uint256, uint256> >& headers);
+bool ActivateIbdHeaderSchedulerBranchForTesting(const uint256& tip);
 void SeedIbdHeaderSchedulerInvAvailabilityForTesting(NodeId peer,
     const uint256& hash);
 size_t RefillOrderedHeaderBlockRequestsForTesting(

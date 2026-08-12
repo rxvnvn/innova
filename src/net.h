@@ -1688,7 +1688,8 @@ public:
     void EraseAskForEntry(std::multimap<int64_t, CInv>::iterator it,
                           bool fReleaseOwner = true,
                           ibdmetrics::ActiveDecrementCause cause =
-                              ibdmetrics::ACTIVE_DECREMENT_OTHER)
+                              ibdmetrics::ACTIVE_DECREMENT_OTHER,
+                          const char* pszOwnerReleaseReason = "queue-removal")
     {
         if (it == mapAskFor.end())
             return;
@@ -1723,7 +1724,8 @@ public:
         mapAskFor.erase(it);
         if (fReleaseOwner &&
             (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK))
-            ReleaseBlockRequestOwner(inv.hash, GetId(), "queue-removal");
+            ReleaseBlockRequestOwner(inv.hash, GetId(),
+                                     pszOwnerReleaseReason);
     }
 
     void ClearAskFor()

@@ -3288,7 +3288,8 @@ bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
     // scan, which re-admits only the released contiguous prefix.  Structural
     // changes (peer disconnect) still invalidate the cursor via
     // ReleaseBlockRequestOwnersForPeer.
-    if (strcmp(pszReason, "receive") != 0)
+    if (strcmp(pszReason, "receive") != 0 &&
+        strcmp(pszReason, "branch-switch") != 0)
         MarkIbdHeaderSchedulerRecoveryNeeded();
     if (strcmp(pszReason, "receive") != 0)
         ibdblocklatency::RecordBlockTerminal(

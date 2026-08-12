@@ -298,6 +298,14 @@ bool SeedIbdHeaderSchedulerHeadersForTesting(NodeId peer,
            g_ibdHeadersObserver.Graph().Lookup(headers.back().first) != NULL;
 }
 
+bool ActivateIbdHeaderSchedulerBranchForTesting(const uint256& tip)
+{
+    g_ibdHeadersObserver.SetEnabled(true);
+    CIbdHeaderGraph& graph = const_cast<CIbdHeaderGraph&>(
+        g_ibdHeadersObserver.Graph());
+    return graph.ActivateBranch(tip);
+}
+
 void SeedIbdHeaderSchedulerInvAvailabilityForTesting(NodeId peer,
     const uint256& hash)
 {
@@ -957,6 +965,64 @@ static size_t RecoverOrderedReleasedBlocks(
     return nAdmitted;
 }
 
+// A branch switch invalidates only the queued portion of the old ordered
+// suffix. Already-sent requests remain in flight so the new path cannot
+// immediately create duplicate wire requests. Both paths are bounded ordered
+// windows; this does not scan the header graph or block history.
+static size_t PurgeObsoleteOrderedQueuedWork(
+    const std::vector<uint256>& oldWindow,
+    const std::vector<uint256>& newWindow,
+    const std::vector<CNode*>& vNodesCopy)
+{
+    std::set<uint256> newPath(newWindow.begin(), newWindow.end());
+    std::set<uint256> obsolete;
+    for (std::vector<uint256>::const_iterator it = oldWindow.begin();
+         it != oldWindow.end(); ++it)
+        if (newPath.count(*it) == 0)
+            obsolete.insert(*it);
+
+    size_t nPurged = 0;
+    for (std::vector<CNode*>::const_iterator pit = vNodesCopy.begin();
+         pit != vNodesCopy.end(); ++pit)
+    {
+        CNode* pnode = *pit;
+        if (pnode == NULL || obsolete.empty())
+            continue;
+        for (std::multimap<int64_t, CInv>::iterator it = pnode->mapAskFor.begin();
+             it != pnode->mapAskFor.end();)
+        {
+            const CInv inv = it->second;
+            if ((inv.type != MSG_BLOCK && inv.type != MSG_FILTERED_BLOCK) ||
+                obsolete.count(inv.hash) == 0)
+            {
+                ++it;
+                continue;
+            }
+
+            NodeId ownerPeer = -1;
+            BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+            const bool fHasOwner = GetBlockRequestOwner(
+                inv.hash, &ownerPeer, &ownerState);
+            // Never remove a different peer's live owner, and never touch an
+            // already in-flight request during a branch handoff.
+            if ((fHasOwner && ownerPeer != pnode->GetId()) ||
+                (fHasOwner && ownerState != BLOCK_REQUEST_OWNER_QUEUED))
+            {
+                ++it;
+                continue;
+            }
+
+            std::multimap<int64_t, CInv>::iterator eraseIt = it++;
+            pnode->EraseAskForEntry(
+                eraseIt, true,
+                ibdmetrics::ACTIVE_DECREMENT_OTHER,
+                "branch-switch");
+            ++nPurged;
+        }
+    }
+    return nPurged;
+}
+
 static size_t RefillOrderedHeaderBlockRequests(
     CNode* pto, const std::vector<CNode*>& vNodesCopy)
 {
@@ -997,6 +1063,29 @@ static size_t RefillOrderedHeaderBlockRequests(
          graph.IsDescendantOf(graphTip->hash,
                               g_ibdHeaderSchedulerState.cursorTip));
 
+    // A graph-tip move to an incompatible active path is a generation
+    // handoff, not an ordinary cursor invalidation. Purge obsolete queued
+    // work before the new full-window refill can admit anything. In-flight
+    // old-path requests are deliberately left for normal receive/timeout
+    // cleanup and are not reissued here.
+    const bool fBranchSwitch =
+        g_ibdHeaderSchedulerState.cursorValid &&
+        !g_ibdHeaderSchedulerState.cursorWindow.empty() && graphTip &&
+        g_ibdHeaderSchedulerState.cursorTip != uint256(0) &&
+        !graph.IsDescendantOf(graphTip->hash,
+                              g_ibdHeaderSchedulerState.cursorTip);
+    if (fBranchSwitch)
+    {
+        const std::vector<uint256> newBranchWindow =
+            graph.GetActiveWindow(hashFrontier,
+                                  IBD_HEADERS_SCHEDULER_WINDOW);
+        PurgeObsoleteOrderedQueuedWork(
+            g_ibdHeaderSchedulerState.cursorWindow,
+            newBranchWindow, vNodesCopy);
+        g_ibdHeaderSchedulerState.cursorInvalidated = true;
+        g_ibdHeaderSchedulerState.cursorRecoveryNeeded = false;
+    }
+
     // Released-work recovery is bounded per peer and never mutates the
     // ordered cursor, so every peer's refill pass may recover its own
     // released hashes in the same round.  Recovery must also run while an
@@ -1034,7 +1123,7 @@ static size_t RefillOrderedHeaderBlockRequests(
     // no-op.  This makes cursor mutation global/round-scoped instead of
     // per-peer, which is the prerequisite for incremental refill with any
     // number of peers.
-    if (g_ibdHeaderSchedulerState.refillRound ==
+    if (!fBranchSwitch && g_ibdHeaderSchedulerState.refillRound ==
         g_ibdHeaderSchedulerState.cursorRound)
         return nRecoveryAdmitted;
     g_ibdHeaderSchedulerState.cursorRound =

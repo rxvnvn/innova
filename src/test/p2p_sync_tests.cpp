@@ -9723,6 +9723,453 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_active_ancestor_closes_exact_source_hole)
     fIbdHeaderScheduler = savedScheduler;
 }
 
+BOOST_AUTO_TEST_CASE(headers_scheduler_branch_switch_barrier_purges_only_obsolete_queue)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(120), "branch-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(121), "branch-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+    }
+
+    const uint256 anchor(6000000);
+    const uint256 a1(6000001), a2(6000002), a3(6000003), a4(6000004);
+    const uint256 b2(6000012), b3(6000013), b4(6000014);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+
+    std::vector<std::pair<uint256, uint256> > oldHeaders;
+    oldHeaders.push_back(std::make_pair(a1, anchor));
+    oldHeaders.push_back(std::make_pair(a2, a1));
+    oldHeaders.push_back(std::make_pair(a3, a2));
+    oldHeaders.push_back(std::make_pair(a4, a3));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), oldHeaders));
+    for (int i = 1; i <= 4; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(
+            peerA.GetId(), uint256(6000000 + i));
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 4U);
+
+    NodeId oldOwner = -1;
+    BlockRequestOwnerState oldState = BLOCK_REQUEST_OWNER_QUEUED;
+    CNode* oldOwnerNode = NULL;
+    for (std::vector<CNode*>::const_iterator pit = peers.begin();
+         pit != peers.end() && oldOwnerNode == NULL; ++pit)
+    {
+        for (std::multimap<int64_t, CInv>::const_iterator qi =
+                 (*pit)->mapAskFor.begin(); qi != (*pit)->mapAskFor.end(); ++qi)
+            if (qi->second.hash == a2)
+            {
+                oldOwnerNode = *pit;
+                break;
+            }
+    }
+    BOOST_REQUIRE(oldOwnerNode != NULL);
+    for (std::multimap<int64_t, CInv>::iterator it = oldOwnerNode->mapAskFor.begin();
+         it != oldOwnerNode->mapAskFor.end(); ++it)
+    {
+        if (it->second.hash == a2)
+        {
+            oldOwnerNode->EraseAskForEntry(it, false);
+            break;
+        }
+    }
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(
+        a2, oldOwnerNode->GetId(), BLOCKREQ_SOURCE_HEADERS_SCHEDULER));
+    oldOwnerNode->MarkBlockInFlight(a2);
+
+    // Add an alternate active branch sharing only the connected prefix a1.
+    std::vector<std::pair<uint256, uint256> > newHeaders;
+    newHeaders.push_back(std::make_pair(a1, anchor));
+    newHeaders.push_back(std::make_pair(b2, a1));
+    newHeaders.push_back(std::make_pair(b3, b2));
+    newHeaders.push_back(std::make_pair(b4, b3));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), newHeaders));
+    for (int i = 2; i <= 4; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(
+            peerB.GetId(), uint256(6000000 + 10 + i));
+    BOOST_REQUIRE(ActivateIbdHeaderSchedulerBranchForTesting(b4));
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 3U);
+    BOOST_CHECK(peerA.IsBlockAskForQueued(a1) ||
+                peerB.IsBlockAskForQueued(a1));
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a3));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a3));
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a4));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a4));
+    BOOST_CHECK(GetBlockRequestOwner(a2, &oldOwner, &oldState));
+    BOOST_CHECK_EQUAL(oldState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a2));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a2));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(b2));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(b3));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(b4));
+
+    // Repeating the same branch decision is idempotent and does not reissue
+    // the stale in-flight hash or duplicate the new-path queue.
+    const size_t queuedBefore = peerA.setAskForBlocks.size() +
+                                peerB.setAskForBlocks.size();
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size() +
+                      peerB.setAskForBlocks.size(), queuedBefore);
+    BOOST_CHECK(GetBlockRequestOwner(a2, &oldOwner, &oldState));
+    BOOST_CHECK_EQUAL(oldState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    oldOwnerNode->ClearBlockInFlight(a2);
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// Production discriminator: the real branch handoff is a full re-anchor of the
+// connected chain, NOT ActivateBranchForTesting().  SeedIbdHeaderSchedulerAnchorForTesting
+// drives the production entry point g_ibdHeadersObserver.UpdateAnchor(pindexBest)
+// -> CIbdHeaderGraph::Reanchor: because the new best tip is not the old anchor's
+// ACTIVE child, Reanchor performs a FULL re-anchor that wipes the graph and
+// reseeds it around the new authoritative hash (graphTip == new best, empty
+// window until headers repopulate it).  The barrier must still fire exactly
+// once on the first refill after the re-anchor (while cursorValid is still true),
+// purge every obsolete queued old-path hash, preserve the stale in-flight
+// request exactly once, and then admit the new generation after the header
+// graph is repopulated.  Repeated same-branch refill must be idempotent.
+BOOST_AUTO_TEST_CASE(headers_scheduler_production_reanchor_reorg_barrier)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(128), "reanchor-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(129), "reanchor-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    ScopedPeerSocket socketA(peerA);
+    ScopedPeerSocket socketB(peerB);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+    }
+
+    const int64_t activeBefore =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+
+    const uint256 anchor(6005000);
+    const uint256 a1(6005001), a2(6005002), a3(6005003), a4(6005004);
+    const uint256 c0(6005020);
+    const uint256 c1(6005021), c2(6005022), c3(6005023);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+
+    std::vector<std::pair<uint256, uint256> > oldHeaders;
+    oldHeaders.push_back(std::make_pair(a1, anchor));
+    oldHeaders.push_back(std::make_pair(a2, a1));
+    oldHeaders.push_back(std::make_pair(a3, a2));
+    oldHeaders.push_back(std::make_pair(a4, a3));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), oldHeaders));
+    for (int i = 1; i <= 4; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(
+            peerA.GetId(), uint256(6005000 + i));
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 4U);
+
+    CNode* oldOwnerNode = NULL;
+    for (std::vector<CNode*>::const_iterator pit = peers.begin();
+         pit != peers.end() && oldOwnerNode == NULL; ++pit)
+        for (std::multimap<int64_t, CInv>::const_iterator qi =
+                 (*pit)->mapAskFor.begin(); qi != (*pit)->mapAskFor.end(); ++qi)
+            if (qi->second.hash == a2)
+            {
+                oldOwnerNode = *pit;
+                break;
+            }
+    BOOST_REQUIRE(oldOwnerNode != NULL);
+    for (std::multimap<int64_t, CInv>::iterator it = oldOwnerNode->mapAskFor.begin();
+         it != oldOwnerNode->mapAskFor.end(); ++it)
+        if (it->second.hash == a2)
+        {
+            oldOwnerNode->EraseAskForEntry(it, false);
+            break;
+        }
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(
+        a2, oldOwnerNode->GetId(), BLOCKREQ_SOURCE_HEADERS_SCHEDULER));
+    oldOwnerNode->MarkBlockInFlight(a2);
+
+    // Real production competing-branch replacement: pindexBest moves to a tip
+    // that is not on the active scheduler path.  UpdateAnchor -> Reanchor does
+    // a full re-anchor (graph wipe + reseed around c0), so graphTip == c0 ==
+    // the new frontier and the new-branch window is empty until headers arrive.
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(c0, 0));
+
+    // Barrier refill (exactly one chance, before the empty-window fallback
+    // invalidates the cursor): obsolete queued a1/a3/a4 are purged; the stale
+    // in-flight a2 is preserved exactly once.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a1));
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a3));
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a4));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a1));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a3));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a4));
+    NodeId oldOwner = -1;
+    BlockRequestOwnerState oldState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(a2, &oldOwner, &oldState));
+    BOOST_CHECK_EQUAL(oldState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a2));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a2));
+
+    // Header graph repopulation along the new branch (getheaders/headers).
+    std::vector<std::pair<uint256, uint256> > newHeaders;
+    newHeaders.push_back(std::make_pair(c1, c0));
+    newHeaders.push_back(std::make_pair(c2, c1));
+    newHeaders.push_back(std::make_pair(c3, c2));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), newHeaders));
+    for (int i = 1; i <= 3; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(
+            peerB.GetId(), uint256(6005020 + i));
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 3U);
+    BOOST_CHECK(peerB.IsBlockAskForQueued(c1));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(c2));
+    BOOST_CHECK(peerB.IsBlockAskForQueued(c3));
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a1));
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a3));
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a4));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a1));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a3));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a4));
+    BOOST_CHECK(GetBlockRequestOwner(a2, &oldOwner, &oldState));
+    BOOST_CHECK_EQUAL(oldState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    BOOST_CHECK(!peerA.IsBlockAskForQueued(a2));
+    BOOST_CHECK(!peerB.IsBlockAskForQueued(a2));
+
+    // Repeated same-branch refill is idempotent and never reissues the stale
+    // in-flight hash or duplicates the new-path queue.
+    const size_t queuedBefore = peerA.setAskForBlocks.size() +
+                                peerB.setAskForBlocks.size();
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size() +
+                      peerB.setAskForBlocks.size(), queuedBefore);
+    BOOST_CHECK(GetBlockRequestOwner(a2, &oldOwner, &oldState));
+    BOOST_CHECK_EQUAL(oldState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    oldOwnerNode->ClearBlockInFlight(a2);
+    const int64_t activeAfter =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+    BOOST_CHECK_EQUAL(activeAfter - activeBefore, 0LL);
+
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// Saturation discriminator: 512 old-generation requests are IN_FLIGHT within
+// the real global cap (512), the connected chain performs the production
+// full-re-anchor handoff to a disjoint branch, and the new generation initially
+// receives zero admission budget.  The stale old-path requests are then expired
+// through the REAL expiry decision (ExpireBlockInFlight + the ordered scheduler
+// decision).  On the production re-anchor path the old nodes are no longer
+// graph-resident, so they cannot receive the 300 s progress defer: they expire
+// at their ordinary 60 s wire-origin deadline, freeing the budget so the new
+// generation resumes.  This distinguishes a correctness failure from a bounded
+// liveness delay.
+BOOST_AUTO_TEST_CASE(headers_scheduler_saturation_handoff_bounded_liveness)
+{
+    // Force the effective per-peer IBD request window to the 512-slot global
+    // cap so a single peer can hold 512 in-flight requests within real caps.
+    const bool fHadPerPeerArg = mapArgs.count("-ibdmaxactiveperpeer") != 0;
+    const std::string strPerPeerArgSaved = mapArgs["-ibdmaxactiveperpeer"];
+    mapArgs["-ibdmaxactiveperpeer"] = "512";
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(130), "saturate-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(131), "saturate-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    ScopedPeerSocket socketA(peerA);
+    ScopedPeerSocket socketB(peerB);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+    }
+
+    const uint256 anchor(7000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.reserve(1600);
+    uint256 previous = anchor;
+    for (int i = 1; i <= 1600; ++i)
+    {
+        const uint256 hash(7000000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headers));
+    for (int i = 1; i <= 512; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(
+            peerA.GetId(), uint256(7000000 + i));
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    const int64_t activeBefore =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+
+    // Saturate: 512 queued ordered requests on branch A.
+    BOOST_REQUIRE_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 512U);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 512U);
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
+            activeBefore, 512LL);
+
+    // Send-transition every queued old-generation hash to IN_FLIGHT exactly as
+    // the getdata send loop does: assign owner, mark in flight, then remove the
+    // askfor entry from the queue accounting (SENT_TRANSITION, no owner release).
+    while (!peerA.mapAskFor.empty())
+    {
+        const uint256 hash = peerA.mapAskFor.begin()->second.hash;
+        BOOST_REQUIRE(TryAssignBlockRequestOwner(
+            hash, peerA.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+        peerA.MarkBlockInFlight(hash);
+        peerA.EraseAskForEntry(
+            peerA.mapAskFor.begin(), false,
+            ibdmetrics::ACTIVE_DECREMENT_ASKFOR_SENT_TRANSITION);
+    }
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 0U);
+    BOOST_CHECK_EQUAL(peerA.setBlocksInFlight.size(), 512U);
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
+            activeBefore, 512LL);
+
+    // Production full-re-anchor handoff to a disjoint branch (disjoint hash
+    // space: 8000000 is not a branch-A header, so Reanchor fully wipes the
+    // graph instead of retaining the old active suffix).
+    const uint256 c0(8000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(c0, 0));
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK_EQUAL(peerA.setBlocksInFlight.size(), 512U);
+
+    // New branch headers are observed; the new generation initially receives
+    // zero admission budget because all 512 slots are held by stale old-path
+    // in-flight requests.
+    std::vector<std::pair<uint256, uint256> > newHeaders;
+    previous = c0;
+    for (int i = 1; i <= 16; ++i)
+    {
+        const uint256 hash(8000000 + i);
+        newHeaders.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), newHeaders));
+    for (int i = 1; i <= 16; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(
+            peerB.GetId(), uint256(8000000 + i));
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK_EQUAL(peerB.setAskForBlocks.size(), 0U);
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
+            activeBefore, 512LL);
+
+    // Expire the stale old-path in-flight work through the REAL expiry decision
+    // at a simulated 61 s wire age (> 60 s wire-origin deadline).  After the
+    // full re-anchor the old hashes are no longer graph-resident and their
+    // progress baselines were pruned, so the ordered decision must NOT defer
+    // them to the 300 s ceiling: they expire immediately.
+    const int64_t nNowUs = GetTimeMicros();
+    {
+        LOCK(peerA.cs_vBlockInFlightWire);
+        for (std::set<uint256>::const_iterator si = peerA.setBlocksInFlight.begin();
+             si != peerA.setBlocksInFlight.end(); ++si)
+            peerA.mapBlockInFlightWireUs[*si] = nNowUs - 61LL * 1000000;
+    }
+    const IbdHeaderSchedulerRefillStats statsBefore =
+        GetIbdHeaderSchedulerRefillStatsForTesting();
+    peerA.ExpireBlockInFlight(nNowUs);
+    const IbdHeaderSchedulerRefillStats statsAfter =
+        GetIbdHeaderSchedulerRefillStatsForTesting();
+    // The stale old-path requests must NOT receive the 300 s progress defer:
+    // after the full re-anchor they are not graph-resident ordered descendants,
+    // so the ordered expiry decision never defers them (no defer counter move).
+    BOOST_CHECK_EQUAL(
+        statsAfter.orderedExpiryDeferredDueProgress -
+            statsBefore.orderedExpiryDeferredDueProgress, 0U);
+    BOOST_CHECK_EQUAL(peerA.setBlocksInFlight.size(), 0U);
+    BOOST_CHECK_EQUAL(peerA.mapBlockInFlightSince.size(), 0U);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 0U);
+    {
+        BOOST_CHECK(!GetBlockRequestOwner(uint256(7000001), NULL, NULL));
+        BOOST_CHECK(!GetBlockRequestOwner(uint256(7000512), NULL, NULL));
+    }
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
+            activeBefore, 0LL);
+
+    // The budget is now free: the new generation is admitted.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 16U);
+    BOOST_CHECK_EQUAL(peerB.setAskForBlocks.size(), 16U);
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
+            activeBefore, 16LL);
+
+    // Repeated same-branch refill is idempotent.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK_EQUAL(peerB.setAskForBlocks.size(), 16U);
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    const int64_t activeAfter =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+    BOOST_CHECK_EQUAL(activeAfter - activeBefore, 0LL);
+
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+
+    // Restore the effective per-peer window so later tests see the default.
+    if (fHadPerPeerArg)
+        mapArgs["-ibdmaxactiveperpeer"] = strPerPeerArgSaved;
+    else
+        mapArgs.erase("-ibdmaxactiveperpeer");
+    ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+}
+
 BOOST_AUTO_TEST_CASE(headers_scheduler_descendant_timeout_recovery_without_full_refill)
 {
     const bool savedScheduler = fIbdHeaderScheduler;
