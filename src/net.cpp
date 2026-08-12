@@ -5990,12 +5990,34 @@ void CNode::PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const
     PushMessage("getheaders", locator, hashStop);
 }
 
+bool CNode::PushHeadersContinuation(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason)
+{
+    if (fIbdHeadersContinuationPending || getHeadersSync.IsInFlight())
+        return false;
+    fIbdHeadersContinuationPending = true;
+    PushGetHeaders(locator, hashStop, strReason);
+    if (!getHeadersSync.IsInFlight())
+        fIbdHeadersContinuationPending = false;
+    return fIbdHeadersContinuationPending;
+}
+
+void CNode::MarkHeadersResponseReceived()
+{
+    fIbdHeadersContinuationPending = false;
+}
+
+void CNode::ClearHeadersContinuationState()
+{
+    fIbdHeadersContinuationPending = false;
+}
+
 void RecordGetHeadersResponse(CNode* pnode, size_t nHeaders, unsigned int nBytes)
 {
     (void)nHeaders;
     (void)nBytes;
     if (pnode == NULL)
         return;
+    pnode->MarkHeadersResponseReceived();
     pnode->getHeadersSync.Complete(GetTime());
 }
 
@@ -6583,6 +6605,7 @@ bool CNode::ExpireGetBlocksOutstanding(int64_t now_us)
 void CNode::Cleanup(NodeCleanupMode mode)
 {
     IbdHeadersObserverPeerDisconnected(GetId());
+    ClearHeadersContinuationState();
     const bool fRecordForensics = (mode == NODE_CLEANUP_RUNTIME);
     ReleaseBlockRequestOwnersForPeer(GetId(), "disconnect", fRecordForensics);
     ReleaseOrphanLimitRejectedForPeer(GetId());

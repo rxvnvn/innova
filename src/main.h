@@ -555,7 +555,8 @@ bool ReconsiderBlock(const uint256& hash, std::string& strError);
 bool RecoverFromInvalidatedBestChain();
 // Test-only synchronization seam, NULL in production. Runs after frame extraction and cs_vRecvMsg release.
 extern void (*g_processMessagesPostExtractHook)();
-bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock);
+bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock,
+                     unsigned int nBlockBurstDepth = 0);
 bool SendMessages(CNode* pto, bool fSendTrickle,
                   const std::vector<CNode*>& vNodesCopy = std::vector<CNode*>());
 bool LoadExternalBlockFile(FILE* fileIn);

@@ -183,6 +183,7 @@ public:
     std::vector<uint256> PredictedWindowFromFrontier(const uint256& frontier) const;
     std::size_t PeerSupport(const uint256& hash) const;
     std::vector<int64_t> HeaderSources(const uint256& hash) const;
+    std::map<int64_t, int> ActiveHeaderSourceClaims() const;
     const CIbdHeaderGraph& Graph() const { return m_graph; }
     const Counters& Stats() const { return m_counters; }
     std::size_t WindowSize() const { return m_window_size; }
@@ -204,6 +205,7 @@ private:
     CIbdHeaderGraph m_graph;
     std::set<int64_t> m_outstanding_peers;
     std::map<uint256, std::set<int64_t> > m_sources;
+    std::map<int64_t, uint256> m_active_source_claims;
     Counters m_counters;
     std::size_t m_lastAnchorSourceSweepExamined;
 };

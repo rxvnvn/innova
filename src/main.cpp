@@ -637,18 +637,48 @@ static void RecordIbdHeaderSchedulerInvAvailability(CNode* pfrom,
         ++g_ibdHeaderSchedulerState.availabilityEpoch;
 }
 
-static std::vector<CNode*> IbdHeaderSchedulerCandidatePeers(
-    const uint256& hash, const std::vector<CNode*>& vNodesCopy)
+struct IbdHeaderSchedulerActiveAncestorEvidence
 {
-    // Any peer that announced the header is a valid getdata source; block
-    // scheduling must not depend on fresh inv.  Inv availability only
-    // contributes to candidate selection here and (via
-    // IbdHeaderSchedulerBestPeerForHash) to peer ranking, never as an
-    // admission gate.
+    std::vector<std::set<NodeId> > exactSources;
+    std::map<int64_t, int> deepestActiveHeight;
+};
+
+static IbdHeaderSchedulerActiveAncestorEvidence
+IbdHeaderSchedulerBuildActiveAncestorEvidence(
+    const std::vector<uint256>& activeWindow)
+{
+    IbdHeaderSchedulerActiveAncestorEvidence evidence;
+    evidence.exactSources.resize(activeWindow.size());
+    evidence.deepestActiveHeight =
+        g_ibdHeadersObserver.ActiveHeaderSourceClaims();
+    for (size_t i = 0; i < activeWindow.size(); ++i)
+    {
+        const std::vector<int64_t> sources =
+            g_ibdHeadersObserver.HeaderSources(activeWindow[i]);
+        evidence.exactSources[i].insert(sources.begin(), sources.end());
+    }
+    return evidence;
+}
+
+
+static std::vector<CNode*> IbdHeaderSchedulerCandidatePeers(
+    const uint256& hash, size_t activeIndex, int activeHeight,
+    const IbdHeaderSchedulerActiveAncestorEvidence& evidence,
+    const std::vector<CNode*>& vNodesCopy)
+{
+    // BlockCandidateSources(H) = ExactSources(H) union InvAvailability(H)
+    // union InferredActiveAncestorSources(H).  The inferred set contains a
+    // peer only when its deepest exact claim is STRICTLY above H in this
+    // current active-window snapshot.  Reported heights are never evidence.
     std::set<NodeId> peerIds;
-    const std::vector<int64_t> headerPeers =
-        g_ibdHeadersObserver.HeaderSources(hash);
-    peerIds.insert(headerPeers.begin(), headerPeers.end());
+    if (activeIndex < evidence.exactSources.size())
+        peerIds.insert(evidence.exactSources[activeIndex].begin(),
+                       evidence.exactSources[activeIndex].end());
+    for (std::map<int64_t, int>::const_iterator it =
+             evidence.deepestActiveHeight.begin();
+         it != evidence.deepestActiveHeight.end(); ++it)
+        if (it->second > activeHeight)
+            peerIds.insert(it->first);
     std::map<uint256, std::set<NodeId> >::const_iterator itAvail =
         g_ibdHeaderSchedulerState.invAvailability.find(hash);
     if (itAvail != g_ibdHeaderSchedulerState.invAvailability.end())
@@ -710,13 +740,61 @@ static CNode* IbdHeaderSchedulerBestPeerForHash(
     if (candidates.empty())
         return NULL;
 
+    // A timed-out hash should escape its last owner when another proven
+    // candidate can admit it now.  Keep the old owner as the liveness
+    // fallback when every alternative is saturated or unavailable.
+    NodeId nLastTimeoutOwner = -1;
+    const bool fHasLastTimeoutOwner =
+        GetBlockLastTimeoutOwner(hash, &nLastTimeoutOwner);
+    bool fHasUsableAlternative = false;
+    if (fHasLastTimeoutOwner)
+    {
+        for (std::vector<CNode*>::const_iterator it = candidates.begin();
+             it != candidates.end(); ++it)
+        {
+            CNode* pnode = *it;
+            if (pnode == NULL || pnode->GetId() == nLastTimeoutOwner)
+                continue;
+            int nBudget = 0;
+            if (pBudgetByPeer != NULL)
+            {
+                std::map<CNode*, int>::iterator itB =
+                    pBudgetByPeer->find(pnode);
+                if (itB == pBudgetByPeer->end())
+                    itB = pBudgetByPeer->insert(std::make_pair(
+                        pnode, GetDeferredBlockRequestBudget(pnode))).first;
+                nBudget = itB->second;
+            }
+            else
+            {
+                nBudget = GetDeferredBlockRequestBudget(pnode);
+            }
+            if (nBudget > 0)
+            {
+                fHasUsableAlternative = true;
+                break;
+            }
+        }
+    }
+
+    std::vector<CNode*> eligibleCandidates;
+    for (std::vector<CNode*>::const_iterator it = candidates.begin();
+         it != candidates.end(); ++it)
+    {
+        CNode* pnode = *it;
+        if (fHasUsableAlternative && pnode != NULL &&
+            pnode->GetId() == nLastTimeoutOwner)
+            continue;
+        eligibleCandidates.push_back(pnode);
+    }
+
     std::vector<CNode*> preferred;
     std::map<uint256, std::set<NodeId> >::const_iterator itPreferred =
         g_ibdHeaderSchedulerState.invAvailability.find(hash);
     if (itPreferred != g_ibdHeaderSchedulerState.invAvailability.end())
     {
-        for (std::vector<CNode*>::const_iterator it = candidates.begin();
-             it != candidates.end(); ++it)
+        for (std::vector<CNode*>::const_iterator it = eligibleCandidates.begin();
+             it != eligibleCandidates.end(); ++it)
         {
             CNode* pnode = *it;
             if (itPreferred->second.count(pnode->GetId()) != 0)
@@ -725,7 +803,7 @@ static CNode* IbdHeaderSchedulerBestPeerForHash(
     }
 
     const std::vector<CNode*>& selectionPool =
-        preferred.empty() ? candidates : preferred;
+        preferred.empty() ? eligibleCandidates : preferred;
     int64_t nMaxPeerHeight = nBestHeight;
     for (std::vector<CNode*>::const_iterator it = selectionPool.begin();
          it != selectionPool.end(); ++it)
@@ -824,6 +902,9 @@ static size_t RecoverOrderedReleasedBlocks(
     int nBudget = GetDeferredBlockRequestBudget(pto);
     size_t nAdmitted = 0;
     bool fUnresolved = false;
+    const IbdHeaderSchedulerActiveAncestorEvidence evidence =
+        IbdHeaderSchedulerBuildActiveAncestorEvidence(window);
+
     CTxDB txdb("r");
     for (size_t i = 0; i < nBound; ++i)
     {
@@ -839,8 +920,15 @@ static size_t RecoverOrderedReleasedBlocks(
             fUnresolved = true;
             break;
         }
+        const CIbdHeaderNode* node = g_ibdHeadersObserver.Graph().Lookup(hash);
+        if (node == NULL || node->state != CIbdHeaderNode::ACTIVE)
+        {
+            fUnresolved = true;
+            break;
+        }
         const std::vector<CNode*> candidates =
-            IbdHeaderSchedulerCandidatePeers(hash, vNodesCopy);
+            IbdHeaderSchedulerCandidatePeers(hash, i, node->height,
+                                             evidence, vNodesCopy);
         if (candidates.empty())
         {
             fUnresolved = true;
@@ -1064,7 +1152,7 @@ static size_t RefillOrderedHeaderBlockRequests(
         CBlockLocator locator;
         if (!pto->getHeadersSync.IsInFlight() &&
             PrepareIbdHeadersObserverRequest(pto, locator))
-            pto->PushGetHeaders(locator, uint256(0), "ibd-select-refill");
+            pto->PushHeadersContinuation(locator, uint256(0), "ibd-select-refill");
         printf("IBD_HEADERS_SCHED event=fallback peer=%d reason=window-empty frontier_height=%d graph_tip_height=%d lookahead=%d\n",
                pto->GetId(), pindexBest->nHeight,
                graphTip ? graphTip->height : -1, nLookahead);
@@ -1116,6 +1204,13 @@ static size_t RefillOrderedHeaderBlockRequests(
     int64_t frontAssignedUs = 0;
     size_t frontAlternatives = 0;
     CTxDB txdb("r");
+    const std::vector<uint256>& evidenceWindow = incremental ?
+        g_ibdHeaderSchedulerState.cursorWindow : window;
+    const IbdHeaderSchedulerActiveAncestorEvidence evidence =
+        IbdHeaderSchedulerBuildActiveAncestorEvidence(evidenceWindow);
+    const size_t evidenceOffset = incremental ?
+        g_ibdHeaderSchedulerState.cursorNextIndex : 0;
+
     for (std::vector<uint256>::const_iterator it = window.begin();
          it != window.end(); ++it)
     {
@@ -1129,8 +1224,11 @@ static size_t RefillOrderedHeaderBlockRequests(
             continue;
         }
 
+        const size_t activeIndex = evidenceOffset +
+            (size_t)(it - window.begin());
         const std::vector<CNode*> candidates =
-            IbdHeaderSchedulerCandidatePeers(hash, vNodesCopy);
+            IbdHeaderSchedulerCandidatePeers(hash, activeIndex, nHeight, evidence,
+                                             vNodesCopy);
         if (frontHash == 0)
         {
             frontHash = hash;
@@ -1329,7 +1427,7 @@ std::vector<uint256> GetIbdHeaderSchedulerWindowForTesting(
 // A descendant request is deferred while ALL of the following hold:
 //   * it was admitted by the ordered scheduler (baseline recorded), not a
 //     legacy request;
-//   * it is still strictly ahead of the connected frontier, inside the bounded
+//   * it remains deeper than the current ordered head, inside the bounded
 //     ordered window (the request has not fallen out of the pipeline);
 //   * the frontier has advanced since admission (progress, not stall);
 //   * its wire age is below the hard safety ceiling (no infinite protection).
@@ -1356,7 +1454,10 @@ IbdOrderedExpiryOutcome IbdHeaderSchedulerOrderedExpiryDecide(
     const int nGap = (node != NULL && node->IsAnchored())
                          ? (node->height - pindexBest->nHeight)
                          : 0;
-    if (nGap > 0 && (size_t)nGap <= IBD_HEADERS_SCHEDULER_WINDOW &&
+    // nGap == 1 is the current contiguous-prefix blocker.  It keeps the
+    // ordinary wire deadline: historical progress since admission must not
+    // protect a descendant after it becomes the ordered head.
+    if (nGap > 1 && (size_t)nGap <= IBD_HEADERS_SCHEDULER_WINDOW &&
         pindexBest->nHeight > itBaseline->second && nWireUs > 0 &&
         nNowUs - nWireUs < IBD_ORDERED_MAX_WIRE_AGE_US)
     {
@@ -10062,7 +10163,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                         {
                             CBlockLocator observerLocator;
                             if (PrepareIbdHeadersObserverRequest(pfrom, observerLocator))
-                                pfrom->PushGetHeaders(observerLocator, uint256(0),
+                                pfrom->PushHeadersContinuation(observerLocator, uint256(0),
                                                       "ibd-select-inv");
                         }
                         RequestBlockPipelineWake(WAKE_CAUSE_OTHER);
@@ -10524,7 +10625,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     !observerResult.continuationLocator.empty())
                 {
                     g_ibdHeadersObserver.MarkHeaderRequest(pfrom->GetId());
-                    pfrom->PushGetHeaders(
+                    pfrom->PushHeadersContinuation(
                         CBlockLocator(observerResult.continuationLocator),
                         uint256(0), "ibd-observe-continue");
                 }
@@ -10790,7 +10891,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // SPV continuation is allowed only after this response advanced the
         // indexed header tip, so the next locator is necessarily different.
         if (fContinueHeaders)
-            pfrom->PushGetHeaders(CBlockLocator(pindexLast), uint256(0), "headers-continue");
+            pfrom->PushHeadersContinuation(CBlockLocator(pindexLast), uint256(0), "headers-continue");
 
         if (fSPVMode && pindexLast && pindexLast == pindexBest)
         {
@@ -11593,8 +11694,61 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
 void (*g_processMessagesPostExtractHook)() = NULL;
 
+static const unsigned int IBD_REQUESTED_BLOCK_BURST_LIMIT = 32;
+
+static bool IsRequestedBlockMessage(CNode* pfrom, const CNetMessage& message)
+{
+    if (pfrom == NULL || !message.complete() || !message.hdr.IsValid() ||
+        message.hdr.GetCommand() != "block")
+        return false;
+
+    try
+    {
+        CDataStream blockStream(message.vRecv.begin(),
+                                message.vRecv.begin() + message.hdr.nMessageSize,
+                                SER_NETWORK, pfrom->nRecvVersion);
+        CBlock block;
+        blockStream >> block;
+        NodeId ownerPeer = -1;
+        BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+        if (!GetBlockRequestOwnerDetails(block.GetHash(), &ownerPeer,
+                                         &ownerState, NULL) ||
+            ownerPeer != pfrom->GetId())
+            return false;
+        return ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT ||
+               pfrom->setBlocksInFlight.count(block.GetHash()) != 0;
+    }
+    catch (const std::exception&)
+    {
+        return false;
+    }
+}
+
+static size_t FindRequestedBlockMessage(CNode* pfrom, size_t nStart,
+                                        size_t nMaxMessages)
+{
+    if (pfrom == NULL || pfrom->vRecvMsg.empty())
+        return std::numeric_limits<size_t>::max();
+
+    const size_t nQueueSize = pfrom->vRecvMsg.size();
+    if (nStart >= nQueueSize)
+        nStart = 0;
+    const size_t nCount = std::min(nMaxMessages, nQueueSize - nStart);
+    for (size_t j = 0; j < nCount; ++j)
+    {
+        const size_t i = nStart + j;
+        const CNetMessage& candidate = pfrom->vRecvMsg[i];
+        if (!candidate.complete())
+            break;
+        if (IsRequestedBlockMessage(pfrom, candidate))
+            return i;
+    }
+    return std::numeric_limits<size_t>::max();
+}
+
 // requires LOCK(cs_vRecvMsg)
-bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
+bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock,
+                     unsigned int nBlockBurstDepth)
 {
     //if (fDebug)
     //    printf("ProcessMessages(%zu messages)\n", pfrom->vRecvMsg.size());
@@ -11612,52 +11766,60 @@ bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
     size_t nPriorityIndex = std::numeric_limits<size_t>::max();
     size_t nPriorityScannedBytes = 0;
     size_t nPriorityScannedMessages = 0;
+    size_t nRequestedBlockIndex = std::numeric_limits<size_t>::max();
+    uint8_t nPriorityClass = 0;
     if (IbdHeadersControlPlaneEnabled() && !fSPVMode &&
-        !pfrom->fIbdHeaderPriorityNeedsFifo &&
-        pfrom->getHeadersSync.IsInFlight())
+        (nBlockBurstDepth > 0 || !pfrom->fIbdHeaderPriorityNeedsFifo) &&
+        !pfrom->vRecvMsg.empty())
     {
         const size_t nMaxMessages = 256;
         const size_t nMaxBytes = 16 * 1024 * 1024;
-        for (size_t i = 0; i < pfrom->vRecvMsg.size(); ++i)
+        const size_t nQueueSize = pfrom->vRecvMsg.size();
+        const size_t nStart = pfrom->nIbdPriorityScanOffset < nQueueSize ? pfrom->nIbdPriorityScanOffset : 0;
+        size_t nHeaderIndex = std::numeric_limits<size_t>::max();
+        size_t nBlockIndex = std::numeric_limits<size_t>::max();
+        const size_t nScanCount = std::min(nMaxMessages, nQueueSize - nStart);
+        for (size_t j = 0; j < nScanCount; ++j)
         {
+            const size_t i = nStart + j;
             CNetMessage& candidate = pfrom->vRecvMsg[i];
-            if (!candidate.complete())
-                break;
-            if (nPriorityScannedMessages >= nMaxMessages ||
-                candidate.hdr.nMessageSize > nMaxBytes - nPriorityScannedBytes)
-            {
-                printf("IBD_HEADER_DISPATCH event=scan_exhausted peer=%lld messages=%zu bytes=%zu queue_messages=%zu\n",
-                       (long long)pfrom->GetId(), nPriorityScannedMessages,
-                       nPriorityScannedBytes, pfrom->vRecvMsg.size());
-                break;
-            }
+            if (!candidate.complete()) break;
+            if (candidate.hdr.nMessageSize > nMaxBytes - nPriorityScannedBytes) break;
             ++nPriorityScannedMessages;
             nPriorityScannedBytes += candidate.hdr.nMessageSize;
-            if (candidate.hdr.IsValid() &&
-                candidate.hdr.GetCommand() == "headers")
+            if (!candidate.hdr.IsValid()) continue;
+            uint256 candidateHash = Hash(candidate.vRecv.begin(), candidate.vRecv.begin() + candidate.hdr.nMessageSize);
+            unsigned int candidateChecksum = 0;
+            memcpy(&candidateChecksum, &candidateHash, sizeof(candidateChecksum));
+            if (candidateChecksum != candidate.hdr.nChecksum) continue;
+            const std::string command = candidate.hdr.GetCommand();
+            if (command == "headers" && nHeaderIndex == std::numeric_limits<size_t>::max()) nHeaderIndex = i;
+            else if (command == "block")
             {
-                uint256 candidateHash = Hash(
-                    candidate.vRecv.begin(),
-                    candidate.vRecv.begin() + candidate.hdr.nMessageSize);
-                unsigned int candidateChecksum = 0;
-                memcpy(&candidateChecksum, &candidateHash, sizeof(candidateChecksum));
-                if (candidateChecksum == candidate.hdr.nChecksum)
-                {
-                    nPriorityIndex = i;
-                    printf("IBD_HEADER_DISPATCH event=priority_selected peer=%lld frame_us=%lld selected_us=%lld queue_delay_us=%lld bypass_count=%zu scanned_messages=%zu scanned_bytes=%zu\n",
-                           (long long)pfrom->GetId(),
-                           (long long)candidate.nTime, (long long)GetTimeMicros(),
-                           (long long)std::max<int64_t>(0, GetTimeMicros() - candidate.nTime),
-                           i, nPriorityScannedMessages, nPriorityScannedBytes);
-                }
-                break;
+                if (nBlockIndex == std::numeric_limits<size_t>::max()) nBlockIndex = i;
+                if (IsRequestedBlockMessage(pfrom, candidate) && nRequestedBlockIndex == std::numeric_limits<size_t>::max()) nRequestedBlockIndex = i;
             }
         }
+        const size_t nPreferredBlock = nRequestedBlockIndex;
+        if (nBlockBurstDepth > 0 && nPreferredBlock != std::numeric_limits<size_t>::max())
+        { nPriorityIndex = nPreferredBlock; nPriorityClass = 1; }
+        else if (nPreferredBlock != std::numeric_limits<size_t>::max() && (nHeaderIndex == std::numeric_limits<size_t>::max() || pfrom->nIbdPriorityLastClass != 1))
+        { nPriorityIndex = nPreferredBlock; nPriorityClass = 1; }
+        else if (nHeaderIndex != std::numeric_limits<size_t>::max())
+        { nPriorityIndex = nHeaderIndex; nPriorityClass = 2; }
+        else if (nBlockIndex != std::numeric_limits<size_t>::max())
+        { nPriorityIndex = nBlockIndex; nPriorityClass = 1; }
+        if (nPriorityScannedMessages != 0) pfrom->nIbdPriorityScanOffset = (nStart + nPriorityScannedMessages) % nQueueSize;
     }
     const bool fPrioritySelected =
         nPriorityIndex != std::numeric_limits<size_t>::max();
-    if (fPrioritySelected)
+    const bool fSelectedRequestedBlock =
+        fPrioritySelected && nPriorityClass == 1 &&
+        nPriorityIndex == nRequestedBlockIndex;
+    if (fPrioritySelected) {
         pfrom->fIbdHeaderPriorityNeedsFifo = true;
+        pfrom->nIbdPriorityLastClass = nPriorityClass;
+    }
 
     if (!fPrioritySelected && !pfrom->vRecvGetData.empty())
         ProcessGetData(pfrom);
@@ -11697,6 +11859,10 @@ bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
                 ++nCompleteWaiting;
         pExtracted.reset(new CNetMessage(std::move(queuedMsg)));
         pfrom->vRecvMsg.erase(it);
+        if (nPriorityIndex != std::numeric_limits<size_t>::max() && pfrom->nIbdPriorityScanOffset > nPriorityIndex)
+            --pfrom->nIbdPriorityScanOffset;
+        if (pfrom->nIbdPriorityScanOffset >= pfrom->vRecvMsg.size())
+            pfrom->nIbdPriorityScanOffset = 0;
         recvLock.Unlock();
         if (g_processMessagesPostExtractHook)
             g_processMessagesPostExtractHook();
@@ -11792,6 +11958,21 @@ bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock)
         if (!fRet)
             printf("ProcessMessage(%s, %u bytes) FAILED\n", strCommand.c_str(), nMessageSize);
 
+        if (strCommand == "block" &&
+            (fSelectedRequestedBlock ||
+             IsRequestedBlockMessage(pfrom, msg)) &&
+            nBlockBurstDepth + 1 < IBD_REQUESTED_BLOCK_BURST_LIMIT)
+        {
+            TRY_LOCK(pfrom->cs_vRecvMsg, burstLock);
+            if (burstLock)
+            {
+                const size_t nNext = FindRequestedBlockMessage(
+                    pfrom, pfrom->nIbdPriorityScanOffset, 256);
+                if (nNext != std::numeric_limits<size_t>::max())
+                    return ProcessMessages(pfrom, burstLock,
+                                           nBlockBurstDepth + 1);
+            }
+        }
         break;
     }
 

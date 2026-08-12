@@ -1175,6 +1175,8 @@ public:
     std::deque<SendMessageMeta> vSendMeta; // parallel to vSendMsg (cs_vSend)
     bool fNextHeadersResponsePriority; // consumed by EndMessage under cs_vSend
     bool fIbdHeaderPriorityNeedsFifo;
+    uint8_t nIbdPriorityLastClass; // 1=block, 2=headers
+    size_t nIbdPriorityScanOffset;
     CCriticalSection cs_vSend;
     CCriticalSection cs_vRecv;
 	std::deque<CInv> vRecvGetData;
@@ -1320,6 +1322,7 @@ public:
     bool fPrefetchSent;
     uint256 hashLastBlockInBatch;
 	CGetHeadersSyncState getHeadersSync;
+    bool fIbdHeadersContinuationPending;
 	int nMisbehavior;
     mutable CCriticalSection cs_nMisbehavior;
 
@@ -1412,6 +1415,9 @@ public:
         nSendSize = 0;
         nSendOffset = 0;
         fIbdHeaderPriorityNeedsFifo = false;
+        fIbdHeadersContinuationPending = false;
+        nIbdPriorityLastClass = 0;
+        nIbdPriorityScanOffset = 0;
         fNextHeadersResponsePriority = false;
         hashContinue = 0;
         pindexLastGetBlocksBegin = 0;
@@ -2245,6 +2251,10 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     bool DisconnectRecoveryResponseWindow(int64_t now_us, RecoveryResponseResult& result);
     bool HasActiveRecoveryResponseWindow() const { return recovery_response_window.IsActive(); }
     void PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason = std::string());
+    bool PushHeadersContinuation(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason);
+    void MarkHeadersResponseReceived();
+    void ClearHeadersContinuationState();
+    bool HeadersContinuationPending() const { return fIbdHeadersContinuationPending; }
 
     void QueueInitialSyncRequest(CBlockIndex* pindexTip);
 

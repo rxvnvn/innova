@@ -518,6 +518,7 @@ void CIbdHeadersObserver::Clear()
     m_graph.Clear();
     m_outstanding_peers.clear();
     m_sources.clear();
+    m_active_source_claims.clear();
     m_counters = Counters();
 }
 bool CIbdHeadersObserver::UpdateAnchor(const uint256& hash, int height)
@@ -570,6 +571,7 @@ bool CIbdHeadersObserver::IsHeaderResponseExpected(int64_t peer) const
 void CIbdHeadersObserver::RemovePeer(int64_t peer)
 {
     m_outstanding_peers.erase(peer);
+    m_active_source_claims.erase(peer);
     for (std::map<uint256, std::set<int64_t> >::iterator it = m_sources.begin();
          it != m_sources.end(); ++it)
         it->second.erase(peer);
@@ -594,6 +596,38 @@ CIbdHeadersObserver::HeaderResult CIbdHeadersObserver::ObserveHeaders(
                  inserted[i] == CIbdHeaderGraph::INSERTED_ELIGIBLE) ++m_counters.accepted;
         else { ++m_counters.disconnected; ++m_counters.quarantined; }
     }
+    // Maintain a per-peer deepest header claim without changing m_sources:
+    // m_sources remains exact delivery evidence, while this derived index is
+    // only a shortcut to the deepest header this peer really sent that is on
+    // the CURRENT active path.
+    uint256 deepest;
+    int deepestHeight = -1;
+    std::map<int64_t, uint256>::const_iterator oldClaim =
+        m_active_source_claims.find(peer);
+    if (oldClaim != m_active_source_claims.end())
+    {
+        const CIbdHeaderNode* oldNode = m_graph.Lookup(oldClaim->second);
+        if (oldNode != NULL && oldNode->state == CIbdHeaderNode::ACTIVE &&
+            oldNode->IsUsable())
+        {
+            deepest = oldNode->hash;
+            deepestHeight = oldNode->height;
+        }
+    }
+    for (std::size_t i = 0; i < headers.size(); ++i)
+    {
+        const CIbdHeaderNode* node = m_graph.Lookup(headers[i].first);
+        if (node != NULL && node->state == CIbdHeaderNode::ACTIVE &&
+            node->IsUsable() && node->height > deepestHeight)
+        {
+            deepest = node->hash;
+            deepestHeight = node->height;
+        }
+    }
+    if (deepestHeight >= 0)
+        m_active_source_claims[peer] = deepest;
+    else
+        m_active_source_claims.erase(peer);
     const uint256 newTip = m_graph.ActiveTip() ? m_graph.ActiveTip()->hash : uint256(0);
     if (oldTip != newTip && oldTip != m_graph.AnchorHash() &&
         !m_graph.IsDescendantOf(newTip, oldTip))
@@ -656,6 +690,21 @@ std::vector<int64_t> CIbdHeadersObserver::HeaderSources(const uint256& hash) con
     if (it == m_sources.end())
         return out;
     out.assign(it->second.begin(), it->second.end());
+    return out;
+}
+
+std::map<int64_t, int> CIbdHeadersObserver::ActiveHeaderSourceClaims() const
+{
+    std::map<int64_t, int> out;
+    for (std::map<int64_t, uint256>::const_iterator it =
+             m_active_source_claims.begin();
+         it != m_active_source_claims.end(); ++it)
+    {
+        const CIbdHeaderNode* node = m_graph.Lookup(it->second);
+        if (node != NULL && node->state == CIbdHeaderNode::ACTIVE &&
+            node->IsUsable())
+            out[it->first] = node->height;
+    }
     return out;
 }
 
