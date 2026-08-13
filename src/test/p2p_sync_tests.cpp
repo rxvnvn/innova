@@ -1438,6 +1438,43 @@ BOOST_AUTO_TEST_CASE(ibd_peer_snapshot_unavailable_is_conservative)
     fRegTest = regSaved;
 }
 
+BOOST_AUTO_TEST_CASE(ibd_stale_height_with_continuing_blocks_is_conservative)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    const bool regSaved = fRegTest;
+    const bool testnetSaved = fTestNet;
+    const bool importingSaved = fImporting;
+    const bool reindexSaved = fReindex;
+    const int heightSaved = nBestHeight;
+    std::vector<CNode*> nodesSaved;
+    { LOCK(cs_vNodes); nodesSaved = vNodes; vNodes.clear(); }
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(60), "ibd-stale-height", true);
+    fRegTest = false;
+    fTestNet = false;
+    fImporting = false;
+    fReindex = false;
+    nBestHeight = Checkpoints::GetTotalBlocksEstimate();
+    peer.fClient = false;
+    peer.nBestKnownHeight = nBestHeight + 1000;
+    peer.nChainHeight = peer.nBestKnownHeight;
+    peer.nLastHeightUpdate = GetTime() - 121;
+    peer.nLastBlockRecv = GetTime();
+    { LOCK(cs_vNodes); vNodes.push_back(&peer); }
+
+    BOOST_CHECK(IsInitialBlockDownload());
+
+    nBestHeight = peer.nBestKnownHeight;
+    BOOST_CHECK(!IsInitialBlockDownload());
+
+    { LOCK(cs_vNodes); vNodes = nodesSaved; }
+    nBestHeight = heightSaved;
+    fReindex = reindexSaved;
+    fImporting = importingSaved;
+    fTestNet = testnetSaved;
+    fRegTest = regSaved;
+}
+
 
 
 BOOST_AUTO_TEST_CASE(regtest_ibd_override_does_not_change_mainnet_or_testnet)

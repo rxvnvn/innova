@@ -4872,6 +4872,7 @@ bool g_forceIbdPeerSnapshotUnavailableForTesting = false;
 bool IsInitialBlockDownload()
 {
     int nFreshPeerHeight = -1;
+    int nKnownPeerHeight = -1;
     int64_t nFreshPeerLastBlockRecv = 0;
     int64_t nLocalLastBlockRecv = 0;
     const auto RecordAndReturn = [&](bool fInitialBlockDownload,
@@ -4906,7 +4907,9 @@ bool IsInitialBlockDownload()
                 if (!pnode || pnode->fClient)
                     continue;
 
-
+                nKnownPeerHeight = std::max(
+                    nKnownPeerHeight,
+                    std::max(pnode->nBestKnownHeight, pnode->nChainHeight));
                 bool fFreshHeight = pnode->nBestKnownHeight > 0 &&
                                     pnode->nLastHeightUpdate > 0 &&
                                     nNow - pnode->nLastHeightUpdate <= 120;
@@ -4929,7 +4932,8 @@ bool IsInitialBlockDownload()
 
     unsigned int nTargetSpacing = GetTargetSpacingForHeight(nBestHeight + 1);
     int nLagTolerance = (nTargetSpacing <= 1) ? (int)GetArg("-ibdheightlag", 8) : nCoinbaseMaturity * 2;
-    if (nFreshPeerHeight > nBestHeight + nLagTolerance)
+    if (std::max(nFreshPeerHeight, nKnownPeerHeight) >
+        nBestHeight + nLagTolerance)
         return RecordAndReturn(true, ibdactivepath::IBD_REASON_PEER_AHEAD_LAG);
 
     if (fActiveCatchup)
