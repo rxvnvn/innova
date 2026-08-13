@@ -654,6 +654,10 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/ibdmetrics.cpp \
     src/ibdactivepath.cpp \
     src/ibdforensic.cpp \
+    src/ibdsemantic.cpp \
+    src/ibdheaderscheduler.cpp \
+    src/ibdblocklatency.cpp \
+    src/pinglifecycletrace.cpp \
     src/bootstrap.cpp \
     src/smessage_stub.cpp \
     src/net.cpp \
