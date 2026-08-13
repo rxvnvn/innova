@@ -300,11 +300,18 @@ namespace Checkpoints
     {
         if (fTestNet || fRegTest) return true; // Testnet/Regtest have no checkpoints
         int nHeight = pindexPrev->nHeight + 1;
-        if (IsInitialBlockDownload()) { // Do a basic check if we are catching up
-            const CBlockIndex* pindexSync = AutoSelectSyncCheckpoint();
-            if (nHeight <= pindexSync->nHeight){
-                return false; // lower height than auto checkpoint
-            }
+        if (IsInitialBlockDownload()) {
+            // Innova: no height-based rejection while catching up. The former
+            // IBD branch rejected any block with height <= the auto-selected
+            // boundary (AutoSelectSyncCheckpoint(), derived from the active
+            // branch = active tip - nCheckpointSpan). That boundary followed
+            // the active branch: once a competing branch became active, the
+            // true higher-trust chain below the boundary was permanently
+            // rejected (fork trap), because rejected blocks never enter the
+            // block index and never accumulate nChainTrust. Chain selection by
+            // nChainTrust already guarantees the strongest chain wins; the
+            // consensus-critical hardened checkpoints remain enforced via
+            // CheckHardened(). Synced protection below stays intact.
             return true;
         } else { // do a more thorough check when we are already synced
             LOCK(cs_hashSyncCheckpoint);
