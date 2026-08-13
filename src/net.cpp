@@ -1061,6 +1061,31 @@ int LoadIBDMaxActivePerPeerConfig()
 
 } // namespace
 
+// Cached -ibdpreemptwireage (us).  Loaded lazily on first use so that the
+// argument is read exactly once; unit tests reload it through
+// ResetIbdOrderedPreemptWireAgeConfigForTesting().
+int64_t g_nIbdOrderedPreemptWireAgeUsConfigured =
+    IBD_ORDERED_PREEMPT_DEFAULT_WIRE_AGE_US;
+bool g_nIbdOrderedPreemptWireAgeLoaded = false;
+
+int64_t LoadIbdOrderedPreemptWireAgeConfig()
+{
+    int64_t nRaw = IBD_ORDERED_PREEMPT_DEFAULT_WIRE_AGE_US;
+    if (mapArgs.count("-ibdpreemptwireage") &&
+        !ParseInt64(mapArgs["-ibdpreemptwireage"], &nRaw))
+    {
+        nRaw = IBD_ORDERED_PREEMPT_DEFAULT_WIRE_AGE_US;
+    }
+    // Below 1 s a preempt degenerates into an immediate re-route on the first
+    // refill pass; at/above 59 s it overlaps the ordinary 60 s wire-origin
+    // expiry deadline and would fight the timeout path.
+    if (nRaw < 1LL * 1000000)
+        nRaw = IBD_ORDERED_PREEMPT_DEFAULT_WIRE_AGE_US;
+    if (nRaw > 59LL * 1000000)
+        nRaw = 59LL * 1000000;
+    return nRaw;
+}
+
 int GetMaxActiveBlockRequestsPerPeer()
 {
     if (!g_nIBDMaxActivePerPeerLoaded)
@@ -1076,6 +1101,22 @@ int GetMaxActiveBlockRequestsPerPeer()
 void ResetMaxActiveBlockRequestsPerPeerConfigForTesting()
 {
     g_nIBDMaxActivePerPeerLoaded = false;
+}
+
+int64_t GetIbdOrderedPreemptWireAgeUs()
+{
+    if (!g_nIbdOrderedPreemptWireAgeLoaded)
+    {
+        g_nIbdOrderedPreemptWireAgeUsConfigured =
+            LoadIbdOrderedPreemptWireAgeConfig();
+        g_nIbdOrderedPreemptWireAgeLoaded = true;
+    }
+    return g_nIbdOrderedPreemptWireAgeUsConfigured;
+}
+
+void ResetIbdOrderedPreemptWireAgeConfigForTesting()
+{
+    g_nIbdOrderedPreemptWireAgeLoaded = false;
 }
 
 namespace {
@@ -1813,6 +1854,112 @@ void ResetLateDeliveryExpectationForTesting()
     LOCK(cs_mapAlreadyAskedFor);
     mapBlockLateDeliveryExpectation.clear();
     g_lastTimeoutOwnerPruneUs = 0;
+}
+
+// ----------------------------------------------------------------------------
+// FRONT_PREEMPT preempt late-delivery expectations.
+//
+// When the ordered head's in-flight slot is migrated from an old owner to a
+// proven alternative (PreemptBlockRequestToPeer), the old owner keeps no live
+// in-flight mark: a later arrival from it would fall into ClearBlockInFlight's
+// else branch and be attributed as a *timeout* late delivery, which is wrong.
+// The preempt expectation records the migration so that such a delayed arrival
+// is attributed as a preempt late delivery instead, without a second lifecycle
+// decrement.  Guarded by cs_mapAlreadyAskedFor; the ledger is hard-bounded and
+// lazily pruned exactly like the timeout expectations (same TTL).
+// ----------------------------------------------------------------------------
+static std::map<uint256, std::pair<NodeId, int64_t> > mapBlockPreemptExpectation;
+
+void RecordBlockPreemptExpectation(const uint256& hash, NodeId peer,
+                                   int64_t wireUs)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    RecordBlockPreemptExpectationLocked(hash, peer, wireUs);
+}
+
+void RecordBlockPreemptExpectationLocked(const uint256& hash, NodeId peer,
+                                         int64_t wireUs)
+{
+    if (peer < 0 || hash == 0)
+        return;
+    const int64_t nNowUs = CNode::QualityNowUs();
+    for (std::map<uint256, std::pair<NodeId, int64_t> >::iterator it =
+             mapBlockPreemptExpectation.begin();
+         it != mapBlockPreemptExpectation.end(); )
+    {
+        if (nNowUs - it->second.second > IBD_LATE_DELIVERY_TTL_US)
+            mapBlockPreemptExpectation.erase(it++);
+        else
+            ++it;
+    }
+    mapBlockPreemptExpectation[hash] = std::make_pair(peer, wireUs);
+    if (mapBlockPreemptExpectation.size() > IBD_LATE_DELIVERY_MAX_HASHES)
+    {
+        while (mapBlockPreemptExpectation.size() >
+               IBD_LATE_DELIVERY_MAX_HASHES)
+            mapBlockPreemptExpectation.erase(
+                mapBlockPreemptExpectation.begin());
+    }
+}
+
+bool TakeBlockPreemptExpectation(const uint256& hash, NodeId* peer,
+                                 int64_t* wireUs)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    const int64_t nNowUs = CNode::QualityNowUs();
+    std::map<uint256, std::pair<NodeId, int64_t> >::iterator it =
+        mapBlockPreemptExpectation.find(hash);
+    if (it == mapBlockPreemptExpectation.end())
+        return false;
+    // Per-entry TTL check, then consume (erase) the expectation.
+    if (nNowUs - it->second.second > IBD_LATE_DELIVERY_TTL_US)
+    {
+        mapBlockPreemptExpectation.erase(it);
+        return false;
+    }
+    if (peer)
+        *peer = it->second.first;
+    if (wireUs)
+        *wireUs = it->second.second;
+    mapBlockPreemptExpectation.erase(it);
+    return true;
+}
+
+size_t CountBlockPreemptExpectationHashes()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    return mapBlockPreemptExpectation.size();
+}
+
+void ResetBlockPreemptExpectationsForTesting()
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    mapBlockPreemptExpectation.clear();
+}
+
+void RecordBlockPreemptLateDelivery(NodeId peer, int64_t latencyUs)
+{
+    if (peer < 0)
+        return;
+    ibdmetrics::Get().preempt_late_delivery.fetch_add(
+        1, std::memory_order_relaxed);
+    CNode* pnode = NULL;
+    {
+        LOCK(cs_vNodes);
+        for (size_t i = 0; i < vNodes.size(); ++i)
+        {
+            if (vNodes[i] != NULL && vNodes[i]->GetId() == peer)
+            {
+                pnode = vNodes[i];
+                break;
+            }
+        }
+    }
+    if (pnode == NULL)
+        return;
+    // The expectation only exists because the slot was migrated away, so this
+    // is a late (preempted) outcome for the peer that originally carried it.
+    pnode->RecordIbdBlockDelivery(latencyUs, true);
 }
 
 void RecordLateDeliveryOutcome(NodeId peer, int64_t latencyUs)
@@ -3263,10 +3410,15 @@ namespace
     }
 }
 
-bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
-                              const char* pszReason)
+// Requires LOCK(cs_mapAlreadyAskedFor).  fArmRecovery controls whether the
+// ordered-scheduler recovery scan is armed: ordinary releases do (the request
+// died before delivery); the preempt migration deliberately does not, because
+// the hash is re-assigned atomically to a new owner and the ordered frontier
+// keeps exactly one active owner (forward-progress invariant preserved).
+static bool ReleaseBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
+                                           const char* pszReason,
+                                           bool fArmRecovery)
 {
-    LOCK(cs_mapAlreadyAskedFor);
     std::map<uint256, BlockRequestOwner>::iterator it =
         mapBlockRequestOwners.find(hash);
     if (it == mapBlockRequestOwners.end() || it->second.peer != peer)
@@ -3290,13 +3442,127 @@ bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
     // ReleaseBlockRequestOwnersForPeer.
     if (strcmp(pszReason, "receive") != 0 &&
         strcmp(pszReason, "branch-switch") != 0)
-        MarkIbdHeaderSchedulerRecoveryNeeded();
+    {
+        if (fArmRecovery)
+            MarkIbdHeaderSchedulerRecoveryNeeded();
+    }
     if (strcmp(pszReason, "receive") != 0)
         ibdblocklatency::RecordBlockTerminal(
             hash,
             strcmp(pszReason, "timeout") == 0
                 ? ibdblocklatency::OUTCOME_TIMEOUT
                 : ibdblocklatency::OUTCOME_INCOMPLETE_EVICTED);
+    return true;
+}
+
+bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
+                              const char* pszReason)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    return ReleaseBlockRequestOwnerLocked(hash, peer, pszReason, true);
+}
+
+// Atomic FRONT_PREEMPT slot migration (v1).  Retires the in-flight slot for
+// `hash` on pOldOwner and re-queues it on pNewOwner.  The active-request
+// gauge is decremented by 1 (old owner, inflight) and incremented by 1 (new
+// owner, queued): pipeline occupancy is preserved, only the supplier changes,
+// so the ordered frontier keeps exactly one active owner.  The new owner's
+// askfor is scheduled through the ordinary send path, which delivers the
+// getdata and re-marks the hash in flight with its own wire-origin stamp.
+// Called from the cursor-owning refill pass (cs_main held).
+bool PreemptBlockRequestToPeer(const uint256& hash, CNode* pOldOwner,
+                               CNode* pNewOwner)
+{
+    if (pOldOwner == NULL || pNewOwner == NULL ||
+        pOldOwner == pNewOwner)
+        return false;
+    // Validate, then commit, under cs_mapAlreadyAskedFor.  cs_vBlockInFlightWire
+    // is never taken while cs_mapAlreadyAskedFor is held (the send path
+    // acquires them in the opposite order), so the old owner's wire-origin
+    // stamp is destroyed only after the commit, on the success path.  Every
+    // return-false path therefore leaves the old owner's request exactly as it
+    // was: owner A valid, the hash still in A's in-flight set, A's wire
+    // timestamp intact, and gauges / preempt expectations untouched.
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwner>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end() ||
+        it->second.peer != pOldOwner->GetId() ||
+        it->second.state != BLOCK_REQUEST_OWNER_IN_FLIGHT)
+        return false;
+    // The new owner must not already carry the hash.  Read setBlocksInFlight
+    // directly (IsBlockInFlight would run ExpireBlockInFlight, which takes
+    // cs_mapAlreadyAskedFor again -- deadlock under our held lock).
+    if (pNewOwner->IsBlockAskForQueued(hash) ||
+        pNewOwner->setBlocksInFlight.count(hash) != 0)
+        return false;
+    if (pOldOwner->setBlocksInFlight.count(hash) == 0)
+        return false;
+
+    // 1. Retire the old owner's in-flight slot.
+    if (pOldOwner->setBlocksInFlight.erase(hash))
+    {
+        pOldOwner->peerLiveActivePressure.fetch_sub(
+            1, std::memory_order_relaxed);
+        ibdmetrics::InflightAdd(-1);
+        ibdmetrics::GlobalActiveAdd(
+            -1, ibdmetrics::ACTIVE_DECREMENT_FRONT_PREEMPT);
+    }
+    pOldOwner->mapBlockInFlightSince.erase(hash);
+    pOldOwner->mapBlockInFlightMarkUs.erase(hash);
+    ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), "preempt");
+    if (BlockRequestTraceEnabled())
+        BlockRequestTraceOwnerRelease(hash, pOldOwner->GetId(), "inflight",
+                                      "preempt");
+    if (g_frontierHash == hash && g_frontierPeer == pOldOwner->GetId())
+        FrontierTraceClearLocked("preempt");
+    ibdblocklatency::RecordBlockTerminal(
+        hash, ibdblocklatency::OUTCOME_INCOMPLETE_EVICTED);
+    mapBlockRequestOwners.erase(it);
+
+    // 2. Re-queue on the new owner as a QUEUED owner assignment.  No
+    //    MarkIbdHeaderSchedulerRecoveryNeeded(): the hash stays owned, so the
+    //    refill cursor is not disturbed (frontier-forward progress preserved).
+    mapBlockRequestOwners.insert(std::make_pair(
+        hash, BlockRequestOwner(pNewOwner->GetId(),
+                                BLOCK_REQUEST_OWNER_QUEUED)));
+    if (BlockRequestTraceEnabled())
+        BlockRequestTraceOwnerAssign(hash, pNewOwner->GetId(), "queued",
+                                     BLOCKREQ_SOURCE_PREEMPT);
+    const CInv inv(MSG_BLOCK, hash);
+    int64_t& nRequestTime = mapAlreadyAskedFor[inv];
+    int64_t nNow = (GetTime() - 1) * 1000000;
+    static int64_t nLastTimePreempt;
+    ++nLastTimePreempt;
+    nNow = std::max(nNow, nLastTimePreempt);
+    nLastTimePreempt = nNow;
+    static const int64_t BLOCK_ASK_RETRY_US = 1000000;
+    static const int64_t BLOCK_ASK_DEFER_US = 250000;
+    if (pNewOwner->setBlocksInFlight.size() >=
+        (size_t)GetMaxActiveBlockRequestsPerPeer())
+        nRequestTime = std::max(nRequestTime + BLOCK_ASK_RETRY_US,
+                                nNow + BLOCK_ASK_DEFER_US);
+    else
+        nRequestTime = std::max(nRequestTime + BLOCK_ASK_RETRY_US, nNow);
+    pNewOwner->AddAskForEntry(nRequestTime, inv);
+    ibdactivepath::RecordBlockRequestEnqueued(hash);
+
+    // 3. Preempt late-delivery expectation for the old owner: a later arrival
+    //    from the preempted peer is attributed as a preempt late delivery by
+    //    ClearBlockInFlight's else branch (net.h).
+    RecordBlockPreemptExpectationLocked(hash, pOldOwner->GetId(),
+                                        CNode::QualityNowUs());
+    }   // cs_mapAlreadyAskedFor released: the commit is complete.
+    // Commit-point cleanup: destroy the old owner's wire-origin stamp.  It runs
+    // only on the success path, after the commit, so no abort path can leave
+    // the old owner in flight without its wire timestamp.  The stamp cannot be
+    // re-created: A no longer owns the hash and no longer carries it in its
+    // in-flight set.
+    {
+        LOCK(pOldOwner->cs_vBlockInFlightWire);
+        pOldOwner->mapBlockInFlightWireUs.erase(hash);
+    }
     return true;
 }
 
@@ -4294,6 +4560,8 @@ static const char* BlockRequestTraceSourceName(BlockRequestTraceSource source)
         return "reject-recovery";
     case BLOCKREQ_SOURCE_ORPHAN_LIMIT_RETRY:
         return "orphan-limit-retry";
+    case BLOCKREQ_SOURCE_PREEMPT:
+        return "preempt";
     default:
         return "other";
     }

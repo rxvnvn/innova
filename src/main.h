@@ -495,6 +495,7 @@ struct IbdHeaderSchedulerRefillStats
     bool cursorValid, cursorInvalidated, cursorRecoveryNeeded;
     size_t cursorNextIndex, cursorPendingSlots;
     uint64_t orderedExpiryDeferredDueProgress, orderedExpiryActual;
+    uint64_t frontPreemptAttempts, frontPreemptTransfers;
 };
 IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting();
 std::vector<uint256> GetIbdHeaderSchedulerWindowForTesting(const uint256& frontier);

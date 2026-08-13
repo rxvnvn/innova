@@ -9463,6 +9463,168 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_disconnect_release_makes_hash_requestable
     fIbdHeaderScheduler = savedScheduler;
 }
 
+BOOST_AUTO_TEST_CASE(front_preempt_migrates_stale_head_to_proven_alternative)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+    ResetBlockPreemptExpectationsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(91), "preempt-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(92), "preempt-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+    }
+
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(uint256(700), 700));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.push_back(std::make_pair(uint256(701), uint256(700)));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headers));
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), headers));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerA.GetId(), uint256(701));
+    SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB.GetId(), uint256(701));
+
+    // Owner A has the ordered head 701 in flight and has exceeded the
+    // preempt wire-age threshold.
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(uint256(701), peerA.GetId(),
+                                             BLOCKREQ_SOURCE_HEADERS_SCHEDULER));
+    peerA.MarkBlockInFlight(uint256(701));
+    {
+        LOCK(peerA.cs_vBlockInFlightWire);
+        peerA.mapBlockInFlightWireUs[uint256(701)] =
+            CNode::QualityNowUs() - GetIbdOrderedPreemptWireAgeUs() - 1000000;
+    }
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_REQUIRE(GetBlockRequestOwnerDetails(uint256(701), &ownerPeer, &ownerState, NULL));
+    BOOST_CHECK(ownerPeer == peerA.GetId());
+    BOOST_CHECK(ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT);
+
+    const int64_t nActiveBefore =
+        MetricGet(ibdmetrics::Get().global_active_current);
+    const int64_t nTransfersBefore =
+        MetricGet(ibdmetrics::Get().front_preempt_transfers);
+    const int64_t nAttemptsBefore =
+        MetricGet(ibdmetrics::Get().front_preempt_attempts);
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerB);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+
+    // The head slot migrated from A (in-flight) to B (queued).
+    BOOST_REQUIRE(GetBlockRequestOwnerDetails(uint256(701), &ownerPeer, &ownerState, NULL));
+    BOOST_CHECK(ownerPeer == peerB.GetId());
+    BOOST_CHECK(ownerState == BLOCK_REQUEST_OWNER_QUEUED);
+    BOOST_CHECK(!peerA.setBlocksInFlight.count(uint256(701)));
+    // A's wire-origin stamp is destroyed at the commit phase, on the success
+    // path.
+    {
+        LOCK(peerA.cs_vBlockInFlightWire);
+        BOOST_CHECK(peerA.mapBlockInFlightWireUs.count(uint256(701)) == 0);
+    }
+    BOOST_CHECK(peerB.IsBlockAskForQueued(uint256(701)));
+    // The request count is unchanged: -1 in-flight (A) offset by +1 queued (B).
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().global_active_current),
+                      nActiveBefore);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().front_preempt_transfers),
+                      nTransfersBefore + 1);
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().front_preempt_attempts),
+                      nAttemptsBefore + 1);
+    BOOST_CHECK_EQUAL(CountBlockPreemptExpectationHashes(), 1U);
+
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    ResetBlockPreemptExpectationsForTesting();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(front_preempt_abort_preserves_old_owner_wire_stamp)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+    ResetBlockPreemptExpectationsForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(93), "preempt-abort-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(94), "preempt-abort-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+
+    // Owner A holds the hash in flight with a live wire-origin stamp.
+    const uint256 hash = uint256(702);
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(hash, peerA.GetId(),
+                                             BLOCKREQ_SOURCE_HEADERS_SCHEDULER));
+    peerA.MarkBlockInFlight(hash);
+    const int64_t nWireUs = CNode::QualityNowUs() - 1000000;
+    {
+        LOCK(peerA.cs_vBlockInFlightWire);
+        peerA.mapBlockInFlightWireUs[hash] = nWireUs;
+    }
+
+    const int64_t nActiveBefore =
+        MetricGet(ibdmetrics::Get().global_active_current);
+
+    // Force the abort: the prospective new owner already carries the hash, so
+    // PreemptBlockRequestToPeer must fail its validation and leave A's request
+    // exactly as it was.
+    peerB.setBlocksInFlight.insert(hash);
+    BOOST_CHECK(!PreemptBlockRequestToPeer(hash, &peerA, &peerB));
+
+    // Abort-path invariant: ownership and the in-flight slot are untouched...
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_REQUIRE(GetBlockRequestOwnerDetails(hash, &ownerPeer, &ownerState, NULL));
+    BOOST_CHECK(ownerPeer == peerA.GetId());
+    BOOST_CHECK(ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    BOOST_CHECK(peerA.setBlocksInFlight.count(hash) == 1);
+    // ...A's wire-origin timestamp is intact...
+    {
+        LOCK(peerA.cs_vBlockInFlightWire);
+        std::map<uint256, int64_t>::const_iterator it =
+            peerA.mapBlockInFlightWireUs.find(hash);
+        BOOST_REQUIRE(it != peerA.mapBlockInFlightWireUs.end());
+        BOOST_CHECK(it->second == nWireUs);
+    }
+    // ...so normal expiry semantics hold: the request keeps its wire-origin
+    // deadline and is not misclassified as pending-wire (which would expire it
+    // on the 1 s bound).
+    peerA.ExpireBlockInFlight();
+    BOOST_CHECK(peerA.setBlocksInFlight.count(hash) == 1);
+    // No gauge movement and no preempt expectation were recorded.
+    BOOST_CHECK_EQUAL(MetricGet(ibdmetrics::Get().global_active_current),
+                      nActiveBefore);
+    BOOST_CHECK_EQUAL(CountBlockPreemptExpectationHashes(), 0U);
+
+    peerB.setBlocksInFlight.erase(hash);
+    peerA.ClearBlockInFlight(hash);
+    peerA.ClearAskFor();
+    peerB.ClearAskFor();
+    ResetBlockPreemptExpectationsForTesting();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
 BOOST_AUTO_TEST_CASE(headers_scheduler_empty_window_requests_headers_not_blocks)
 {
     const bool savedScheduler = fIbdHeaderScheduler;

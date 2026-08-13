@@ -297,6 +297,7 @@ enum ActiveDecrementCause
     ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT,
     ACTIVE_DECREMENT_CLEAR_ASKFOR,
     ACTIVE_DECREMENT_DISCONNECT_CLEANUP,
+    ACTIVE_DECREMENT_FRONT_PREEMPT,
     ACTIVE_DECREMENT_OTHER
 };
 
@@ -374,6 +375,14 @@ struct Counters
     std::atomic<int64_t> active_decrement_clear_askfor;
     std::atomic<int64_t> active_decrement_disconnect_cleanup;
     std::atomic<int64_t> active_decrement_other;
+    std::atomic<int64_t> active_decrement_front_preempt;
+    // FRONT_PREEMPT (ordered head slot migration) counters.
+    std::atomic<int64_t> front_preempt_attempts;
+    std::atomic<int64_t> front_preempt_transfers;
+    std::atomic<int64_t> front_preempt_abort_wire_young;
+    std::atomic<int64_t> front_preempt_abort_no_target;
+    std::atomic<int64_t> front_preempt_abort_transfer_failed;
+    std::atomic<int64_t> preempt_late_delivery;
 
     std::atomic<int64_t> global_active_zero_transitions;
     std::atomic<int64_t> zero_with_total_deferred_nonempty;

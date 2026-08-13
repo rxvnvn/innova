@@ -171,6 +171,9 @@ struct IbdHeaderSchedulerState
     std::map<uint256, int> orderedRequestFrontierBaseline;
     uint64_t orderedExpiryDeferredDueProgress;
     uint64_t orderedExpiryActual;
+    // FRONT_PREEMPT (v1): decision counters for ordered-head slot migration.
+    uint64_t frontPreemptAttempts;
+    uint64_t frontPreemptTransfers;
 
     IbdHeaderSchedulerState()
         : refillCalls(0), refillAdmissions(0), incrementalRefillCalls(0),
@@ -180,7 +183,8 @@ struct IbdHeaderSchedulerState
           cursorRound(0), fallbackCount(0),
           invInsideWindow(0), invBeforeWindow(0), invAfterWindow(0),
           invOffBranch(0), invUnknown(0), invPrevented(0),
-          orderedExpiryDeferredDueProgress(0), orderedExpiryActual(0)
+          orderedExpiryDeferredDueProgress(0), orderedExpiryActual(0),
+          frontPreemptAttempts(0), frontPreemptTransfers(0)
     {
     }
 
@@ -220,6 +224,8 @@ struct IbdHeaderSchedulerState
         orderedRequestFrontierBaseline.clear();
         orderedExpiryDeferredDueProgress = 0;
         orderedExpiryActual = 0;
+        frontPreemptAttempts = 0;
+        frontPreemptTransfers = 0;
     }
 
     void RemovePeer(NodeId peer)
@@ -1023,6 +1029,98 @@ static size_t PurgeObsoleteOrderedQueuedWork(
     return nPurged;
 }
 
+// FRONT_PREEMPT (v1): migrate the ordered head's in-flight slot to a proven
+// alternative peer.  Runs inside the cursor-owning refill walk only, when the
+// walk reaches the head (nGap == 1) entry and finds it owned IN_FLIGHT.  The
+// decision requires the head to have been in flight on the wire past the
+// preempt threshold (GetIbdOrderedPreemptWireAgeUs()); the migration itself is
+// atomic and gauge-neutral (net.cpp PreemptBlockRequestToPeer), so the ordered
+// frontier keeps exactly one active owner and forward progress is preserved.
+static bool MaybePreemptOrderedHeadSlot(
+    const uint256& hash, NodeId ownerPeer,
+    const std::vector<CNode*>& candidates,
+    const std::vector<CNode*>& vNodesCopy)
+{
+    AssertLockHeld(cs_main);
+    if (ownerPeer < 0)
+        return false;
+    CNode* pOwner = NULL;
+    for (size_t i = 0; i < vNodesCopy.size(); ++i)
+    {
+        if (vNodesCopy[i] != NULL && vNodesCopy[i]->GetId() == ownerPeer)
+        {
+            pOwner = vNodesCopy[i];
+            break;
+        }
+    }
+    if (pOwner == NULL || pOwner->fDisconnect)
+    {
+        ibdmetrics::Get().front_preempt_abort_no_target.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+    // Wire age: the head must have been in flight on the wire past the preempt
+    // threshold.  A pending-wire stamp (0) means the getdata never reached the
+    // socket -- a local send-path failure handled by ordinary expiry, not a
+    // supplier-quality question.
+    int64_t nWireUs = 0;
+    {
+        LOCK(pOwner->cs_vBlockInFlightWire);
+        std::map<uint256, int64_t>::const_iterator itWire =
+            pOwner->mapBlockInFlightWireUs.find(hash);
+        if (itWire != pOwner->mapBlockInFlightWireUs.end())
+            nWireUs = itWire->second;
+    }
+    const int64_t nNowUs = CNode::QualityNowUs();
+    if (nWireUs <= 0 || nNowUs - nWireUs < GetIbdOrderedPreemptWireAgeUs())
+    {
+        ibdmetrics::Get().front_preempt_abort_wire_young.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+    // Pick the best proven alternative: highest scheduler score among
+    // candidates that are not the current owner, do not already carry the hash,
+    // and have deferred budget to admit it.  The ranking mirrors the admission
+    // path (best-by-score with no sign floor): a candidate that announced the
+    // exact frontier header is a proven supplier even when its reported height
+    // is stale, and a negative score only orders candidates, it does not
+    // disqualify them.
+    CNode* pTarget = NULL;
+    int64_t nTargetScore = std::numeric_limits<int64_t>::min();
+    const int64_t nNow = GetTime();
+    for (size_t i = 0; i < candidates.size(); ++i)
+    {
+        CNode* pnode = candidates[i];
+        if (pnode == NULL || pnode->GetId() == ownerPeer || pnode->fDisconnect ||
+            pnode->fClient || pnode->fOneShot || pnode->nVersion == 0)
+            continue;
+        if (pnode->IsBlockAskForQueued(hash) || pnode->IsBlockInFlight(hash))
+            continue;
+        if (GetDeferredBlockRequestBudget(pnode) <= 0)
+            continue;
+        const int64_t nScore = IbdHeaderSchedulerPeerScore(
+            pnode, nNow, pindexBest != NULL ? pindexBest->nHeight : 0);
+        if (pTarget == NULL || nScore > nTargetScore)
+        {
+            nTargetScore = nScore;
+            pTarget = pnode;
+        }
+    }
+    if (pTarget == NULL)
+    {
+        ibdmetrics::Get().front_preempt_abort_no_target.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+    if (!PreemptBlockRequestToPeer(hash, pOwner, pTarget))
+    {
+        ibdmetrics::Get().front_preempt_abort_transfer_failed.fetch_add(
+            1, std::memory_order_relaxed);
+        return false;
+    }
+    return true;
+}
+
 static size_t RefillOrderedHeaderBlockRequests(
     CNode* pto, const std::vector<CNode*>& vNodesCopy)
 {
@@ -1339,7 +1437,31 @@ static size_t RefillOrderedHeaderBlockRequests(
             }
             ++nOwned;
             if (ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)
+            {
+                // FRONT_PREEMPT (v1): the ordered head (nGap == 1) may migrate
+                // its active slot to a proven alternative once it has been in
+                // flight past the wire-age threshold.  The migration is atomic
+                // and gauge-neutral (net.cpp PreemptBlockRequestToPeer), so the
+                // ordered frontier keeps exactly one active owner.
+                if (frontHash == hash && node != NULL && node->IsAnchored() &&
+                    node->height == pindexBest->nHeight + 1)
+                {
+                    ++g_ibdHeaderSchedulerState.frontPreemptAttempts;
+                    ibdmetrics::Get().front_preempt_attempts.fetch_add(
+                        1, std::memory_order_relaxed);
+                    if (MaybePreemptOrderedHeadSlot(
+                            hash, ownerPeer, candidates, vNodesCopy))
+                    {
+                        ++g_ibdHeaderSchedulerState.frontPreemptTransfers;
+                        ibdmetrics::Get().front_preempt_transfers.fetch_add(
+                            1, std::memory_order_relaxed);
+                        ++nQueued;  // slot now owned-queued on the alternative
+                        fIncrementalHeadResolved = true;
+                        continue;
+                    }
+                }
                 ++nInflight;
+            }
             else
                 ++nQueued;
             fIncrementalHeadResolved = true;
@@ -1497,6 +1619,10 @@ IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting()
     out.orderedExpiryDeferredDueProgress =
         g_ibdHeaderSchedulerState.orderedExpiryDeferredDueProgress;
     out.orderedExpiryActual = g_ibdHeaderSchedulerState.orderedExpiryActual;
+    out.frontPreemptAttempts =
+        g_ibdHeaderSchedulerState.frontPreemptAttempts;
+    out.frontPreemptTransfers =
+        g_ibdHeaderSchedulerState.frontPreemptTransfers;
     return out;
 }
 

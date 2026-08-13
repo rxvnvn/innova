@@ -62,6 +62,13 @@ Counters::Counters()
       active_decrement_clear_askfor(0),
       active_decrement_disconnect_cleanup(0),
       active_decrement_other(0),
+      active_decrement_front_preempt(0),
+      front_preempt_attempts(0),
+      front_preempt_transfers(0),
+      front_preempt_abort_wire_young(0),
+      front_preempt_abort_no_target(0),
+      front_preempt_abort_transfer_failed(0),
+      preempt_late_delivery(0),
       global_active_zero_transitions(0),
       zero_with_total_deferred_nonempty(0),
       zero_with_total_deferred_empty(0),
@@ -283,6 +290,9 @@ static void IncrementDecrementCause(Counters& c, ActiveDecrementCause cause,
         break;
     case ACTIVE_DECREMENT_DISCONNECT_CLEANUP:
         c.active_decrement_disconnect_cleanup.fetch_add(units, std::memory_order_relaxed);
+        break;
+    case ACTIVE_DECREMENT_FRONT_PREEMPT:
+        c.active_decrement_front_preempt.fetch_add(units, std::memory_order_relaxed);
         break;
     case ACTIVE_DECREMENT_OTHER:
         c.active_decrement_other.fetch_add(units, std::memory_order_relaxed);

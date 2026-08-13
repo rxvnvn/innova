@@ -599,6 +599,19 @@ int64_t GetIbdSyncPeerScore(const CNode* pnode, int64_t nNow,
 // mapArgs on the next GetMaxActiveBlockRequestsPerPeer() call.
 void ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
 
+// FRONT_PREEMPT (ordered IBD block scheduler, v1): the minimum wire age
+// (microseconds) that the ordered head request (nGap == 1) must reach on its
+// owner before the scheduler may atomically migrate the active slot to a
+// proven alternative peer.  30 s sits above the healthy CONTROL
+// head-delivery maximum (18.7 s) and strictly below the 60 s wire-origin
+// expiry ceiling, so a preempt is strictly earlier than the ordinary
+// expire-and-recover path.  Overridable via -ibdpreemptwireage (us).
+static const int64_t IBD_ORDERED_PREEMPT_DEFAULT_WIRE_AGE_US = 30LL * 1000000;
+int64_t GetIbdOrderedPreemptWireAgeUs();
+// Test hook: force the cached -ibdpreemptwireage value to reload from mapArgs
+// on the next GetIbdOrderedPreemptWireAgeUs() call.
+void ResetIbdOrderedPreemptWireAgeConfigForTesting();
+
 enum BlockRequestOwnerState
 {
     BLOCK_REQUEST_OWNER_QUEUED = 0,
@@ -825,6 +838,35 @@ size_t CountBlockLateDeliveryExpectationHashes();
 void RecordLateDeliveryOutcome(NodeId peer, int64_t latencyUs);
 // Test hook: clear the late-delivery expectation ledger.
 void ResetLateDeliveryExpectationForTesting();
+
+// FRONT_PREEMPT (ordered IBD block scheduler, v1): record that the in-flight
+// slot for `hash` was migrated away from `peer` at wall-clock `wireUs`, so a
+// later arrival from the preempted peer is attributed as a preempt late
+// delivery (distinct from a timeout late delivery).  Guarded by
+// cs_mapAlreadyAskedFor; callers already holding it use the Locked variant.
+void RecordBlockPreemptExpectation(const uint256& hash, NodeId peer,
+                                   int64_t wireUs);
+void RecordBlockPreemptExpectationLocked(const uint256& hash, NodeId peer,
+                                         int64_t wireUs);
+// Consume (and erase) the preempt expectation for a hash.  Returns false when
+// no expectation is outstanding.
+bool TakeBlockPreemptExpectation(const uint256& hash, NodeId* peer,
+                                 int64_t* wireUs);
+// Number of hashes currently in the preempt expectation ledger.
+size_t CountBlockPreemptExpectationHashes();
+// Attribute a preempt late delivery to the peer that was preempted away from.
+void RecordBlockPreemptLateDelivery(NodeId peer, int64_t latencyUs);
+// Test hook: clear the preempt expectation ledger.
+void ResetBlockPreemptExpectationsForTesting();
+
+// Atomic FRONT_PREEMPT slot migration (msghand-confined; call with cs_main
+// held).  Retires the in-flight slot for `hash` on pOldOwner and re-queues it
+// on pNewOwner with net-zero active-request accounting and a preempt
+// late-delivery expectation recorded for pOldOwner.  Returns false (no-op)
+// when the transfer is not legal: `hash` is not owned IN_FLIGHT by pOldOwner,
+// or pNewOwner already carries the hash (queued or in flight).
+bool PreemptBlockRequestToPeer(const uint256& hash, CNode* pOldOwner,
+                               CNode* pNewOwner);
 
 // Pick the peer that should be asked for a block hash.  Returns NULL to keep
 // the announcer (no redirect).  The caller (TryAdmitBlockInvOrDefer and the
@@ -2522,6 +2564,20 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                 const int64_t nLatencyUs = std::max<int64_t>(
                     0, QualityNowUs() - nMarkUs);
                 RecordLateDeliveryOutcome(nTimeoutPeer, nLatencyUs);
+            }
+            // FRONT_PREEMPT (v1): a hash whose in-flight slot was migrated to
+            // another peer is also a late-arrival candidate -- the preempted
+            // peer's delayed delivery is attributed as a preempt late delivery
+            // (distinct from a timeout late delivery), without a second
+            // lifecycle decrement.
+            NodeId nPreemptPeer = -1;
+            int64_t nPreemptMarkUs = 0;
+            if (TakeBlockPreemptExpectation(
+                    hashBlock, &nPreemptPeer, &nPreemptMarkUs))
+            {
+                const int64_t nPreemptLatencyUs = std::max<int64_t>(
+                    0, QualityNowUs() - nPreemptMarkUs);
+                RecordBlockPreemptLateDelivery(nPreemptPeer, nPreemptLatencyUs);
             }
         }
         TakeDiversifyAnnounce(hashBlock, NULL);
