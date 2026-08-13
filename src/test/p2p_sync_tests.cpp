@@ -1390,6 +1390,54 @@ BOOST_AUTO_TEST_CASE(regtest_ibd_override_is_explicit_and_normal)
     fRegTestIbd = regIbdSaved;
     fRegTest = regSaved;
 }
+BOOST_AUTO_TEST_CASE(ibd_peer_snapshot_unavailable_is_conservative)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    const bool regSaved = fRegTest;
+    const bool testnetSaved = fTestNet;
+    const bool importingSaved = fImporting;
+    const bool reindexSaved = fReindex;
+    const int heightSaved = nBestHeight;
+    std::vector<CNode*> nodesSaved;
+    { LOCK(cs_vNodes); nodesSaved = vNodes; vNodes.clear(); }
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(59), "ibd-snapshot-unavailable", true);
+    fRegTest = false;
+    fTestNet = false;
+    fImporting = false;
+    fReindex = false;
+    nBestHeight = Checkpoints::GetTotalBlocksEstimate();
+    peer.fClient = false;
+    peer.nBestKnownHeight = nBestHeight + 1000;
+    peer.nChainHeight = peer.nBestKnownHeight;
+    peer.nLastHeightUpdate = GetTime();
+    { LOCK(cs_vNodes); vNodes.push_back(&peer); }
+
+    g_forceIbdPeerSnapshotUnavailableForTesting = false;
+    BOOST_CHECK(IsInitialBlockDownload());
+    g_forceIbdPeerSnapshotUnavailableForTesting = true;
+    BOOST_CHECK(IsInitialBlockDownload());
+    BOOST_CHECK(IsInitialBlockDownload());
+    g_forceIbdPeerSnapshotUnavailableForTesting = false;
+    BOOST_CHECK(IsInitialBlockDownload());
+
+    peer.nBestKnownHeight = nBestHeight;
+    peer.nChainHeight = nBestHeight;
+    peer.nLastHeightUpdate = GetTime();
+    BOOST_CHECK(!IsInitialBlockDownload());
+    g_forceIbdPeerSnapshotUnavailableForTesting = true;
+    BOOST_CHECK(IsInitialBlockDownload());
+    g_forceIbdPeerSnapshotUnavailableForTesting = false;
+    BOOST_CHECK(!IsInitialBlockDownload());
+
+    { LOCK(cs_vNodes); vNodes = nodesSaved; }
+    nBestHeight = heightSaved;
+    fReindex = reindexSaved;
+    fImporting = importingSaved;
+    fTestNet = testnetSaved;
+    fRegTest = regSaved;
+}
+
 
 
 BOOST_AUTO_TEST_CASE(regtest_ibd_override_does_not_change_mainnet_or_testnet)

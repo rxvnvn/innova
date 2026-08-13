@@ -4867,6 +4867,8 @@ bool IsSynchronized() {
   return rc;
 }
 
+bool g_forceIbdPeerSnapshotUnavailableForTesting = false;
+
 bool IsInitialBlockDownload()
 {
     int nFreshPeerHeight = -1;
@@ -4893,9 +4895,11 @@ bool IsInitialBlockDownload()
 
     int64_t nNow = GetTime();
     bool fActiveCatchup = false;
+    bool fPeerSnapshotAvailable = false;
     {
         TRY_LOCK(cs_vNodes, lockNodes);
-        if (lockNodes)
+        fPeerSnapshotAvailable = lockNodes && !g_forceIbdPeerSnapshotUnavailableForTesting;
+        if (fPeerSnapshotAvailable)
         {
             for (CNode* pnode : vNodes)
             {
@@ -4918,6 +4922,10 @@ bool IsInitialBlockDownload()
             }
         }
     }
+    if (!fPeerSnapshotAvailable)
+        return RecordAndReturn(true,
+            ibdactivepath::IBD_REASON_PEER_SNAPSHOT_UNAVAILABLE);
+
 
     unsigned int nTargetSpacing = GetTargetSpacingForHeight(nBestHeight + 1);
     int nLagTolerance = (nTargetSpacing <= 1) ? (int)GetArg("-ibdheightlag", 8) : nCoinbaseMaturity * 2;
