@@ -33,6 +33,20 @@ namespace {
 
 static const int64_t TEST_TIME = 100000;
 
+class CInspectableBlockLocator : public CBlockLocator
+{
+public:
+    explicit CInspectableBlockLocator(const CBlockIndex* pindex)
+        : CBlockLocator(pindex)
+    {
+    }
+
+    bool Contains(const uint256& hash) const
+    {
+        return std::find(vHave.begin(), vHave.end(), hash) != vHave.end();
+    }
+};
+
 static CAddress TestPeerAddress(unsigned int nPeer)
 {
     struct in_addr addr;
@@ -11806,6 +11820,36 @@ BOOST_AUTO_TEST_CASE(ordered_window_late_sources_enable_multipeer_distribution)
     fSPVMode = savedSpv;
     fIbdHeadersObserve = savedObserve;
     fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(block_locator_reaches_common_ancestor_beyond_2729_block_fork)
+{
+    const int nTipHeight = 8000;
+    const int nForkDepth = 2729;
+    const int nCommonHeight = nTipHeight - nForkDepth;
+    std::vector<CBlockIndex> index(nTipHeight + 1);
+    std::vector<uint256> hashes(nTipHeight + 1);
+
+    for (int height = 0; height <= nTipHeight; ++height)
+    {
+        hashes[height] = uint256(8000000 + height);
+        index[height].phashBlock = &hashes[height];
+        index[height].nHeight = height;
+        index[height].pprev = height == 0 ? NULL : &index[height - 1];
+    }
+
+    const CInspectableBlockLocator locator(&index[nTipHeight]);
+    bool fContainsSharedNonGenesisAncestor = false;
+    for (int height = 1; height <= nCommonHeight; ++height)
+    {
+        if (locator.Contains(hashes[height]))
+        {
+            fContainsSharedNonGenesisAncestor = true;
+            break;
+        }
+    }
+
+    BOOST_CHECK(fContainsSharedNonGenesisAncestor);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
