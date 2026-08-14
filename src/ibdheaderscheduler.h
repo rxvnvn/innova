@@ -77,6 +77,15 @@ public:
     uint64_t FastAnchorAdvanceCount() const { return m_fast_anchor_advances; }
     uint64_t FullReanchorCount() const { return m_full_reanchors; }
 
+    /**
+     * Number of successor probes performed by the most recent GetActiveWindow
+     * call.  Exposed for deterministic tests: it must be bounded by
+     * windowSize (independent of header-graph lookahead), and identical for
+     * graphs that differ only in lookahead depth.
+     */
+    std::size_t LastGetActiveWindowSteps() const
+    { return m_last_get_active_window_steps; }
+
     /** Reset the graph around one immutable authoritative hash/height anchor. */
     bool SetAuthoritativeAnchor(const uint256& hash, int height);
     /** Move the authoritative anchor, retaining only its active descendants. */
@@ -114,6 +123,10 @@ public:
     /**
      * Enumerate the active path strictly after frontier, capped at windowSize.
      * Returns empty if frontier is not on the active path.
+     *
+     * Cost is O(windowSize): the walk advances forward from frontier via the
+     * unique ACTIVE successor (GetActiveSuccessor) and never traverses the
+     * header-graph lookahead between frontier and the active tip.
      */
     std::vector<uint256> GetActiveWindow(const uint256& frontier,
                                          std::size_t windowSize) const;
@@ -137,6 +150,7 @@ private:
     uint256 m_active_tip;
     uint64_t m_fast_anchor_advances;
     uint64_t m_full_reanchors;
+    mutable std::size_t m_last_get_active_window_steps;
 
     void ConnectDescendants(const uint256& parentHash);
     void ExtendActiveTipIfUnambiguous();

@@ -20,7 +20,8 @@ CIbdHeaderNode::CIbdHeaderNode(const uint256& hashIn, const uint256& prevIn)
 
 CIbdHeaderGraph::CIbdHeaderGraph()
     : m_has_anchor(false), m_anchor_height(-1),
-      m_fast_anchor_advances(0), m_full_reanchors(0)
+      m_fast_anchor_advances(0), m_full_reanchors(0),
+      m_last_get_active_window_steps(0)
 {
 }
 
@@ -310,25 +311,36 @@ const CIbdHeaderNode* CIbdHeaderGraph::BestKnownEligibleTip() const
 std::vector<uint256> CIbdHeaderGraph::GetActiveWindow(
     const uint256& frontier, std::size_t windowSize) const
 {
-    std::vector<uint256> reversePath;
-    if (windowSize == 0 || !IsDescendantOf(m_active_tip, frontier))
-        return reversePath;
+    std::vector<uint256> window;
+    m_last_get_active_window_steps = 0;
+    if (windowSize == 0)
+        return window;
 
-    const CIbdHeaderNode* node = ActiveTip();
-    while (node && node->hash != frontier)
+    const CIbdHeaderNode* node = Lookup(frontier);
+    if (!node || !node->IsAnchored())
+        return window;
+
+    // A node is on the active path exactly when its state is ACTIVE or
+    // AUTHORITATIVE_ANCHOR (MarkActivePath keeps only the anchor and its
+    // active descendants in those states).  This single O(1) state check
+    // replaces the previous O(lookahead) IsDescendantOf(active_tip, frontier)
+    // walk, and does not touch the header-graph lookahead.
+    if (node->state != CIbdHeaderNode::ACTIVE &&
+        node->state != CIbdHeaderNode::AUTHORITATIVE_ANCHOR)
+        return window;
+
+    window.reserve(windowSize);
+    uint256 cursor = frontier;
+    for (std::size_t i = 0; i < windowSize; ++i)
     {
-        if (node->state != CIbdHeaderNode::ACTIVE || !node->IsUsable())
-            return std::vector<uint256>();
-        reversePath.push_back(node->hash);
-        node = Lookup(node->prev);
+        uint256 successor;
+        if (!GetActiveSuccessor(cursor, successor))
+            break;
+        window.push_back(successor);
+        cursor = successor;
+        ++m_last_get_active_window_steps;
     }
-    if (!node)
-        return std::vector<uint256>();
-
-    std::reverse(reversePath.begin(), reversePath.end());
-    if (reversePath.size() > windowSize)
-        reversePath.resize(windowSize);
-    return reversePath;
+    return window;
 }
 
 std::vector<uint256> CIbdHeaderGraph::BuildContinuationLocator(
