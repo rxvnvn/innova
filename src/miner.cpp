@@ -922,7 +922,7 @@ bool CheckStake(CBlock* pblock, CWallet& wallet)
 
    // verify hash target and signature of coinstake tx -
     //if (!CheckProofOfStake(mapBlockIndex[pblock->hashPrevBlock], pblock->vtx[1], pblock->nBits, proofHash, hashTarget))
-	if (!CheckProofOfStake(pblock->vtx[1], pblock->nBits, proofHash, hashTarget))
+	if (!CheckProofOfStake(mapBlockIndex[pblock->hashPrevBlock], pblock->vtx[1], pblock->nBits, proofHash, hashTarget))
         return error("CheckStake() : proof-of-stake checking failed");
 
     //// debug print

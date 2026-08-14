@@ -360,6 +360,57 @@ bool GetKernelStakeModifier(uint256 hashBlockFrom, uint64_t& nStakeModifier, int
     return true;
 };
 
+bool GetKernelStakeModifier(uint256 hashBlockFrom, const CBlockIndex* pindexPrev,
+    uint64_t& nStakeModifier, int& nStakeModifierHeight,
+    int64_t& nStakeModifierTime, bool fPrintProofOfStake)
+{
+    std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashBlockFrom);
+    if (mi == mapBlockIndex.end())
+        return error("GetKernelStakeModifier() : block not indexed");
+    const CBlockIndex* pindexFrom = mi->second;
+    std::vector<const CBlockIndex*> path;
+    for (const CBlockIndex* pindex = pindexPrev; pindex; pindex = pindex->pprev)
+    {
+        path.push_back(pindex);
+        if (pindex == pindexFrom)
+            break;
+    }
+    if (path.empty() || path.back() != pindexFrom)
+        return error("GetKernelStakeModifier() : stake source is not an ancestor of candidate branch");
+    std::reverse(path.begin(), path.end());
+
+    nStakeModifier = pindexFrom->nStakeModifier;
+    nStakeModifierHeight = pindexFrom->nHeight;
+    nStakeModifierTime = pindexFrom->GetBlockTime();
+    const int64_t nTargetTime = pindexFrom->GetBlockTime() +
+        GetStakeModifierSelectionInterval();
+    for (size_t i = 1; i < path.size(); ++i)
+    {
+        const CBlockIndex* pindex = path[i];
+        if (pindex->GeneratedStakeModifier())
+        {
+            nStakeModifierHeight = pindex->nHeight;
+            nStakeModifierTime = pindex->GetBlockTime();
+        }
+        if (nStakeModifierTime >= nTargetTime)
+        {
+            nStakeModifier = pindex->nStakeModifier;
+            return true;
+        }
+    }
+    const CBlockIndex* pindexTip = path.back();
+    if (pindexTip->GetBlockTime() >= nTargetTime)
+    {
+        nStakeModifier = pindexTip->nStakeModifier;
+        nStakeModifierHeight = pindexTip->nHeight;
+        nStakeModifierTime = pindexTip->GetBlockTime();
+        return true;
+    }
+    if (fPrintProofOfStake)
+        return error("GetKernelStakeModifier() : candidate branch ends before selection interval");
+    return false;
+}
+
 // Innova kernel protocol
 // coinstake must meet hash target according to the protocol:
 // kernel (input 0) must meet the formula
@@ -381,7 +432,7 @@ bool GetKernelStakeModifier(uint256 hashBlockFrom, uint64_t& nStakeModifier, int
 //   quantities so as to generate blocks faster, degrading the system back into
 //   a proof-of-work situation.
 //
-bool CheckStakeKernelHash(unsigned int nBits, const CBlock& blockFrom, unsigned int nTxPrevOffset, const CTransaction& txPrev, const COutPoint& prevout, unsigned int nTimeTx, uint256& hashProofOfStake, uint256& targetProofOfStake, bool fPrintProofOfStake)
+bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, const CBlock& blockFrom, unsigned int nTxPrevOffset, const CTransaction& txPrev, const COutPoint& prevout, unsigned int nTimeTx, uint256& hashProofOfStake, uint256& targetProofOfStake, bool fPrintProofOfStake)
 {
     if (nTimeTx < txPrev.nTime)  // Transaction timestamp violation
         return error("CheckStakeKernelHash() : nTime violation");
@@ -417,7 +468,7 @@ bool CheckStakeKernelHash(unsigned int nBits, const CBlock& blockFrom, unsigned 
     int nStakeModifierHeight = 0;
     int64_t nStakeModifierTime = 0;
 
-    if (!GetKernelStakeModifier(hashBlockFrom, nStakeModifier, nStakeModifierHeight, nStakeModifierTime, fPrintProofOfStake))
+    if (!GetKernelStakeModifier(hashBlockFrom, pindexPrev, nStakeModifier, nStakeModifierHeight, nStakeModifierTime, fPrintProofOfStake))
         return false;
 
     ss << nStakeModifier;
@@ -468,8 +519,97 @@ bool CheckStakeKernelHash(unsigned int nBits, const CBlock& blockFrom, unsigned 
     return true;
 }
 
+static bool IsBlockInCandidateAncestry(const CBlockIndex* pindexBlock,
+    const CBlockIndex* pindexPrev)
+{
+    if (!pindexBlock)
+        return false;
+    for (const CBlockIndex* pindex = pindexPrev; pindex; pindex = pindex->pprev)
+        if (pindex == pindexBlock)
+            return true;
+    return false;
+}
+
+static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
+    const COutPoint& prevout, CTransaction& txPrev, CTxIndex& txindex,
+    CBlock& blockFrom, const std::map<uint256, CBlock>* candidateBlocksForTesting)
+{
+    CTxDB txdb("r");
+    if (txPrev.ReadFromDisk(txdb, prevout, txindex) &&
+        blockFrom.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+    {
+        std::map<uint256, CBlockIndex*>::const_iterator mi =
+            mapBlockIndex.find(blockFrom.GetHash());
+        if (mi != mapBlockIndex.end() &&
+            IsBlockInCandidateAncestry(mi->second, pindexPrev))
+            return true;
+    }
+
+    // Transactions from an unconnected side branch are deliberately absent
+    // from the connected-chain tx index. Search only the candidate suffix.
+    for (const CBlockIndex* pindex = pindexPrev;
+         pindex && !pindex->IsInMainChain(); pindex = pindex->pprev)
+    {
+        CBlock block;
+        bool fReadBlock = false;
+        if (candidateBlocksForTesting)
+        {
+            std::map<uint256, CBlock>::const_iterator miBlock =
+                candidateBlocksForTesting->find(pindex->GetBlockHash());
+            if (miBlock != candidateBlocksForTesting->end())
+            {
+                block = miBlock->second;
+                fReadBlock = true;
+            }
+        }
+        else
+        {
+            fReadBlock = block.ReadFromDisk(pindex);
+        }
+        if (!fReadBlock)
+            return false;
+
+        unsigned int nTxPos = pindex->nBlockPos +
+            ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+            (2 * GetSizeOfCompactSize(0)) +
+            GetSizeOfCompactSize(block.vtx.size());
+        for (std::vector<CTransaction>::const_iterator it = block.vtx.begin();
+             it != block.vtx.end(); ++it)
+
+        {
+            if (it->GetHash() == prevout.hash)
+            {
+                txPrev = *it;
+                txindex = CTxIndex(
+                    CDiskTxPos(pindex->nFile, pindex->nBlockPos, nTxPos),
+                    txPrev.vout.size());
+                blockFrom = block;
+                return true;
+            }
+            nTxPos += ::GetSerializeSize(*it, SER_DISK, CLIENT_VERSION);
+        }
+    }
+    return false;
+}
+bool ReadStakeSourceTransaction(const CBlockIndex* pindexPrev,
+    const COutPoint& prevout, CTransaction& txPrev, CTxIndex& txindex,
+    CBlock& blockFrom)
+{
+    return ReadStakeSourceTransactionInternal(
+        pindexPrev, prevout, txPrev, txindex, blockFrom, NULL);
+}
+
+bool ReadStakeSourceTransactionForTesting(const CBlockIndex* pindexPrev,
+    const COutPoint& prevout, CTransaction& txPrev, CTxIndex& txindex,
+    CBlock& blockFrom, const std::map<uint256, CBlock>& candidateBlocks)
+{
+    return ReadStakeSourceTransactionInternal(
+        pindexPrev, prevout, txPrev, txindex, blockFrom, &candidateBlocks);
+}
+
+
 // Check kernel hash target and coinstake signature
-bool CheckProofOfStake(const CTransaction& tx, unsigned int nBits, uint256& hashProofOfStake, uint256& targetProofOfStake)
+bool CheckProofOfStake(const CBlockIndex* pindexPrev, const CTransaction& tx, unsigned int nBits, uint256& hashProofOfStake, uint256& targetProofOfStake)
 {
     if (!tx.IsCoinStake())
         return error("CheckProofOfStake() : called on non-coinstake %s", tx.GetHash().ToString().c_str());
@@ -533,11 +673,12 @@ bool CheckProofOfStake(const CTransaction& tx, unsigned int nBits, uint256& hash
         return error("CheckProofOfStake() : no inputs for transparent coinstake %s", tx.GetHash().ToString().c_str());
     const CTxIn& txin = tx.vin[0];
 
-    // First try finding the previous transaction in database
-    CTxDB txdb("r");
+    // First try the connected-chain tx index, then the candidate side branch.
     CTransaction txPrev;
     CTxIndex txindex;
-    if (!txPrev.ReadFromDisk(txdb, txin.prevout, txindex))
+    CBlock block;
+    if (!ReadStakeSourceTransaction(
+            pindexPrev, txin.prevout, txPrev, txindex, block))
     {
         if (fHybridSPV && pwalletMain)
         {
@@ -575,7 +716,7 @@ bool CheckProofOfStake(const CTransaction& tx, unsigned int nBits, uint256& hash
                             if (!VerifySignature(txPrev, tx, 0, SCRIPT_VERIFY_NONE, 0))
                                 return tx.DoS(100, error("CheckProofOfStake() : SPV VerifySignature failed on coinstake %s", tx.GetHash().ToString().c_str()));
 
-                            if (!CheckStakeKernelHash(nBits, block, nTxPos, txPrev, txin.prevout, tx.nTime, hashProofOfStake, targetProofOfStake, fDebug))
+                            if (!CheckStakeKernelHash(pindexPrev, nBits, block, nTxPos, txPrev, txin.prevout, tx.nTime, hashProofOfStake, targetProofOfStake, fDebug))
                                 return tx.DoS(1, error("CheckProofOfStake() : SPV check kernel failed on coinstake %s", tx.GetHash().ToString().c_str()));
 
                             return true;
@@ -591,12 +732,7 @@ bool CheckProofOfStake(const CTransaction& tx, unsigned int nBits, uint256& hash
     if (!VerifySignature(txPrev, tx, 0, SCRIPT_VERIFY_NONE, 0))
         return tx.DoS(100, error("CheckProofOfStake() : VerifySignature failed on coinstake %s", tx.GetHash().ToString().c_str()));
 
-    // Read block header
-    CBlock block;
-    if (!block.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
-        return fDebug? error("CheckProofOfStake() : read block failed") : false; // unable to read block of previous transaction
-
-    if (!CheckStakeKernelHash(nBits, block, txindex.pos.nTxPos - txindex.pos.nBlockPos, txPrev, txin.prevout, tx.nTime, hashProofOfStake, targetProofOfStake, fDebug))
+    if (!CheckStakeKernelHash(pindexPrev, nBits, block, txindex.pos.nTxPos - txindex.pos.nBlockPos, txPrev, txin.prevout, tx.nTime, hashProofOfStake, targetProofOfStake, fDebug))
         return tx.DoS(1, error("CheckProofOfStake() : INFO: check kernel failed on coinstake %s, hashProof=%s", tx.GetHash().ToString().c_str(), hashProofOfStake.ToString().c_str())); // may occur during initial download or if behind on block chain sync
 
     return true;

@@ -23,9 +23,11 @@
 #include "ibdefficiency.h"
 #include "ibdforensic.h"
 #include "innovarpc.h"
+#include "kernel.h"
 #include "main.h"
 #include "net.h"
 #include "protocol.h"
+#include "txdb.h"
 #include "util.h"
 #include "version.h"
 
@@ -11850,6 +11852,123 @@ BOOST_AUTO_TEST_CASE(block_locator_reaches_common_ancestor_beyond_2729_block_for
     }
 
     BOOST_CHECK(fContainsSharedNonGenesisAncestor);
+}
+
+BOOST_AUTO_TEST_CASE(pos_kernel_modifier_uses_candidate_branch_ancestry)
+{
+    const uint256 hashSource(8100000);
+    const uint256 hashFork(8100001);
+    const uint256 hashMain(8100002);
+    CBlockIndex source;
+    CBlockIndex forkTip;
+    CBlockIndex mainTip;
+    source.phashBlock = &hashSource;
+    source.nHeight = 100;
+    source.nTime = 1000;
+    source.pnext = &forkTip;
+    forkTip.phashBlock = &hashFork;
+    forkTip.pprev = &source;
+    forkTip.nHeight = 101;
+    forkTip.nTime = 1000000;
+    forkTip.nStakeModifier = 0xf0f0;
+    forkTip.nFlags |= CBlockIndex::BLOCK_STAKE_MODIFIER;
+    mainTip.phashBlock = &hashMain;
+    mainTip.pprev = &source;
+    mainTip.nHeight = 101;
+    mainTip.nTime = 1000000;
+    mainTip.nStakeModifier = 0x0f0f;
+    mainTip.nFlags |= CBlockIndex::BLOCK_STAKE_MODIFIER;
+
+    const std::pair<std::map<uint256, CBlockIndex*>::iterator, bool> inserted =
+        mapBlockIndex.insert(std::make_pair(hashSource, &source));
+    BOOST_REQUIRE(inserted.second);
+
+    uint64_t modifier = 0;
+    int modifierHeight = 0;
+    int64_t modifierTime = 0;
+    BOOST_REQUIRE(GetKernelStakeModifier(
+        hashSource, &mainTip, modifier, modifierHeight, modifierTime, false));
+    BOOST_CHECK_EQUAL(modifier, mainTip.nStakeModifier);
+    BOOST_CHECK_NE(modifier, forkTip.nStakeModifier);
+
+    CBlockIndex unrelated;
+    const uint256 hashUnrelated(8100003);
+    unrelated.phashBlock = &hashUnrelated;
+    unrelated.nHeight = 101;
+    unrelated.nTime = 1000000;
+    BOOST_CHECK(!GetKernelStakeModifier(
+        hashSource, &unrelated, modifier, modifierHeight, modifierTime, false));
+
+    mapBlockIndex.erase(inserted.first);
+}
+
+BOOST_AUTO_TEST_CASE(pos_stake_source_resolves_only_from_candidate_side_branch)
+{
+    CTransaction txMain;
+    txMain.nTime = 1700000100;
+    txMain.vout.push_back(CTxOut(COIN, CScript() << OP_TRUE));
+    CTransaction txFork;
+    txFork.nTime = 1700000101;
+    txFork.vout.push_back(CTxOut(2 * COIN, CScript() << OP_TRUE));
+
+    CBlock blockMain;
+    blockMain.nTime = 1700000200;
+    blockMain.vtx.push_back(txMain);
+    blockMain.hashMerkleRoot = blockMain.BuildMerkleTree();
+    CBlock blockFork;
+    blockFork.nTime = 1700000201;
+    blockFork.vtx.push_back(txFork);
+    blockFork.hashMerkleRoot = blockFork.BuildMerkleTree();
+
+
+    const uint256 hashCommon(8200000);
+    const uint256 hashMain = blockMain.GetHash();
+    const uint256 hashFork = blockFork.GetHash();
+    CBlockIndex common;
+    CBlockIndex mainTip(1, 100, blockMain);
+    CBlockIndex forkTip(1, 200, blockFork);
+    common.phashBlock = &hashCommon;
+    common.nHeight = 100;
+    common.pnext = &forkTip;
+    mainTip.phashBlock = &hashMain;
+    mainTip.pprev = &common;
+    mainTip.nHeight = 101;
+    forkTip.phashBlock = &hashFork;
+    forkTip.pprev = &common;
+    forkTip.nHeight = 101;
+
+    CBlockIndex* savedBest = pindexBest;
+    pindexBest = &forkTip;
+    CTransaction foundTx;
+    CTxIndex foundIndex;
+    CBlock foundBlock;
+    std::map<uint256, CBlock> candidateBlocks;
+    candidateBlocks[hashMain] = blockMain;
+    candidateBlocks[hashFork] = blockFork;
+    CTxDB txdb("r");
+    CTransaction globallyIndexedTx;
+    CTxIndex globallyIndexedTxIndex;
+    const bool absentFromGlobalIndex = !globallyIndexedTx.ReadFromDisk(
+        txdb, COutPoint(txMain.GetHash(), 0), globallyIndexedTxIndex);
+    const bool foundOnMain = ReadStakeSourceTransactionForTesting(
+        &mainTip, COutPoint(txMain.GetHash(), 0), foundTx, foundIndex,
+        foundBlock, candidateBlocks);
+    const uint256 foundTxHash = foundTx.GetHash();
+    const uint256 foundBlockHash = foundBlock.GetHash();
+    const bool mainRejectedOnFork = !ReadStakeSourceTransactionForTesting(
+        &forkTip, COutPoint(txMain.GetHash(), 0), foundTx, foundIndex,
+        foundBlock, candidateBlocks);
+    const bool forkRejectedOnMain = !ReadStakeSourceTransactionForTesting(
+        &mainTip, COutPoint(txFork.GetHash(), 0), foundTx, foundIndex,
+        foundBlock, candidateBlocks);
+    pindexBest = savedBest;
+
+    BOOST_CHECK(absentFromGlobalIndex);
+    BOOST_CHECK(foundOnMain);
+    BOOST_CHECK(foundTxHash == txMain.GetHash());
+    BOOST_CHECK(foundBlockHash == blockMain.GetHash());
+    BOOST_CHECK(mainRejectedOnFork);
+    BOOST_CHECK(forkRejectedOnMain);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

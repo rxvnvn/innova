@@ -6552,7 +6552,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
                 uint64_t nExpectedStakeModifier = 0;
                 int nStakeModifierHeight = 0;
                 int64_t nStakeModifierTime = 0;
-                if (!GetKernelStakeModifier(pBlockFrom->GetBlockHash(), nExpectedStakeModifier,
+                if (!GetKernelStakeModifier(pBlockFrom->GetBlockHash(), pindex->pprev, nExpectedStakeModifier,
                                             nStakeModifierHeight, nStakeModifierTime, false))
                     return DoS(100, error("ConnectBlock() : Failed to get stake modifier for NullStake proof"));
 
@@ -8288,7 +8288,7 @@ bool CBlock::AcceptBlock()
     {
         uint256 targetProofOfStake;
         //if (!CheckProofOfStake(pindexPrev, vtx[1], nBits, hashProof, targetProofOfStake))
-		if (!CheckProofOfStake(vtx[1], nBits, hashProof, targetProofOfStake))
+		if (!CheckProofOfStake(pindexPrev, vtx[1], nBits, hashProof, targetProofOfStake))
         {
             // Only penalize outside IBD (PoS verification needs UTXOs)
             if (!IsInitialBlockDownload())
