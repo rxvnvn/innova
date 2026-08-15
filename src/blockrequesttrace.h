@@ -238,4 +238,41 @@ bool ProcessBlockRejectTraceEnabled();
 const char* ProcessBlockRejectReasonName(ProcessBlockRejectReason reason);
 std::string ProcessBlockRejectTraceLastReason(const uint256& hash);
 
+// Opt-in per-failure-exit attribution for CBlock::AcceptBlock.  Off by
+// default: when disabled there is no additional logging and negligible
+// overhead (a single bool test per failure exit).  When enabled, every
+// failure exit of CBlock::AcceptBlock emits one line:
+//
+//     ACCEPTBLOCK_REJECT hash=... height=... prev=... reason=... stage=...
+//
+// This never changes validation semantics or any return condition; it is
+// diagnostic attribution only.
+enum AcceptBlockRejectReason
+{
+    ABREJECT_UNKNOWN_BLOCK_VERSION = 0,
+    ABREJECT_DUPLICATE,
+    ABREJECT_PREV_NOT_FOUND,
+    ABREJECT_OPERATOR_INVALIDATED,
+    ABREJECT_PREV_OPERATOR_INVALIDATED,
+    ABREJECT_POS_AFTER_DAG,
+    ABREJECT_BLOCK_SIZE,
+    ABREJECT_INCORRECT_BITS,
+    ABREJECT_TIMESTAMP_TOO_EARLY,
+    ABREJECT_NON_FINAL_TX,
+    ABREJECT_HARDENED_CHECKPOINT,
+    ABREJECT_CHECK_POS_FAILED,
+    ABREJECT_RINGSIG_DEPRECATION,
+    ABREJECT_SYNC_CHECKPOINT,
+    ABREJECT_COINBASE_HEIGHT,
+    ABREJECT_DAG_PARENT,
+    ABREJECT_DISK_SPACE,
+    ABREJECT_WRITE_TO_DISK,
+    ABREJECT_ADD_TO_BLOCK_INDEX
+};
+
+bool InitAcceptBlockRejectTrace(bool fEnabled);
+bool AcceptBlockRejectTraceEnabled();
+const char* AcceptBlockRejectReasonName(AcceptBlockRejectReason reason);
+const char* AcceptBlockRejectStageName(AcceptBlockRejectReason reason);
+
 #endif // INNOVA_BLOCKREQUESTTRACE_H

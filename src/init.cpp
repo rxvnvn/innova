@@ -993,6 +993,7 @@ bool AppInit2()
     }
     InitIBDEfficiencyTrace(GetBoolArg("-ibdefficiencytrace", false));
     InitProcessBlockRejectTrace(GetBoolArg("-processblockrejecttrace", false));
+    InitAcceptBlockRejectTrace(GetBoolArg("-acceptblockrejecttrace", false));
     ibdactivepath::InitIBDActivePathTrace(
         GetBoolArg("-ibdactivepathtrace", false));
     ibdblocklatency::SetEnabled(

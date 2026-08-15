@@ -2036,6 +2036,86 @@ static void ProcessBlockRejectTraceRemember(const uint256& hash,
     }
 }
 
+static bool fAcceptBlockRejectTraceEnabled = false;
+
+bool InitAcceptBlockRejectTrace(bool fEnabled)
+{
+    fAcceptBlockRejectTraceEnabled = fEnabled;
+    if (fAcceptBlockRejectTraceEnabled)
+        printf("ACCEPTBLOCK_REJECT: accept block reject trace enabled\n");
+    return true;
+}
+
+bool AcceptBlockRejectTraceEnabled()
+{
+    return fAcceptBlockRejectTraceEnabled;
+}
+
+const char* AcceptBlockRejectReasonName(AcceptBlockRejectReason reason)
+{
+    switch (reason) {
+    case ABREJECT_UNKNOWN_BLOCK_VERSION: return "unknown-block-version";
+    case ABREJECT_DUPLICATE: return "duplicate";
+    case ABREJECT_PREV_NOT_FOUND: return "prev-not-found";
+    case ABREJECT_OPERATOR_INVALIDATED: return "operator-invalidated";
+    case ABREJECT_PREV_OPERATOR_INVALIDATED: return "prev-operator-invalidated";
+    case ABREJECT_POS_AFTER_DAG: return "pos-after-dag";
+    case ABREJECT_BLOCK_SIZE: return "block-size";
+    case ABREJECT_INCORRECT_BITS: return "incorrect-bits";
+    case ABREJECT_TIMESTAMP_TOO_EARLY: return "timestamp-too-early";
+    case ABREJECT_NON_FINAL_TX: return "non-final-tx";
+    case ABREJECT_HARDENED_CHECKPOINT: return "hardened-checkpoint";
+    case ABREJECT_CHECK_POS_FAILED: return "check-pos-failed";
+    case ABREJECT_RINGSIG_DEPRECATION: return "ringsig-deprecation";
+    case ABREJECT_SYNC_CHECKPOINT: return "sync-checkpoint";
+    case ABREJECT_COINBASE_HEIGHT: return "coinbase-height";
+    case ABREJECT_DAG_PARENT: return "dag-parent";
+    case ABREJECT_DISK_SPACE: return "disk-space";
+    case ABREJECT_WRITE_TO_DISK: return "write-to-disk";
+    case ABREJECT_ADD_TO_BLOCK_INDEX: return "add-to-block-index";
+    }
+    return "unknown";
+}
+
+const char* AcceptBlockRejectStageName(AcceptBlockRejectReason reason)
+{
+    switch (reason) {
+    case ABREJECT_UNKNOWN_BLOCK_VERSION: return "version";
+    case ABREJECT_DUPLICATE: return "duplicate";
+    case ABREJECT_PREV_NOT_FOUND: return "prev";
+    case ABREJECT_OPERATOR_INVALIDATED:
+    case ABREJECT_PREV_OPERATOR_INVALIDATED: return "operator";
+    case ABREJECT_POS_AFTER_DAG:
+    case ABREJECT_BLOCK_SIZE:
+    case ABREJECT_INCORRECT_BITS: return "consensus";
+    case ABREJECT_TIMESTAMP_TOO_EARLY: return "timestamp";
+    case ABREJECT_NON_FINAL_TX: return "txfinal";
+    case ABREJECT_HARDENED_CHECKPOINT:
+    case ABREJECT_SYNC_CHECKPOINT: return "checkpoint";
+    case ABREJECT_CHECK_POS_FAILED: return "pos";
+    case ABREJECT_RINGSIG_DEPRECATION: return "ringsig";
+    case ABREJECT_COINBASE_HEIGHT: return "coinbase";
+    case ABREJECT_DAG_PARENT: return "dag";
+    case ABREJECT_DISK_SPACE:
+    case ABREJECT_WRITE_TO_DISK: return "disk";
+    case ABREJECT_ADD_TO_BLOCK_INDEX: return "index";
+    }
+    return "unknown";
+}
+
+static void TraceAcceptBlockReject(const CBlock& block, int nHeight,
+                                   AcceptBlockRejectReason reason)
+{
+    if (!fAcceptBlockRejectTraceEnabled)
+        return;
+    printf("ACCEPTBLOCK_REJECT hash=%s height=%d prev=%s reason=%s stage=%s\n",
+           block.GetHash().ToString().c_str(),
+           nHeight,
+           block.hashPrevBlock.ToString().c_str(),
+           AcceptBlockRejectReasonName(reason),
+           AcceptBlockRejectStageName(reason));
+}
+
 static bool FindStakeKeyInIndex(const std::pair<COutPoint, unsigned int>& stake,
                                 uint256& hashOut)
 {
@@ -4219,6 +4299,64 @@ uint256 WantedByOrphan(const CBlock* pblockOrphan)
     while (mapOrphanBlocks.count(pblockOrphan->hashPrevBlock))
         pblockOrphan = mapOrphanBlocks[pblockOrphan->hashPrevBlock];
     return pblockOrphan->hashPrevBlock;
+}
+
+// Diagnostic-only: decode the serialized block height from the coinbase
+// scriptSig (CScript() << nHeight == push_int64).  Returns -1 when it cannot
+// be decoded.  Used only by opt-in orphan tracing (fDebug); never affects
+// validation, admission, or any return condition.
+static int DecodeCoinbaseHeightForTrace(const CBlock& block)
+{
+    if (block.vtx.empty() || block.vtx[0].vin.empty())
+        return -1;
+    const std::vector<unsigned char>& scriptSig = block.vtx[0].vin[0].scriptSig;
+    if (scriptSig.empty())
+        return -1;
+
+    const unsigned int nOp = scriptSig[0];
+    unsigned int nSize = 0;
+    unsigned int nOffset = 1;
+    if (nOp <= OP_PUSHDATA4)
+    {
+        if (nOp < OP_PUSHDATA1)
+        {
+            nSize = nOp;
+        }
+        else if (nOp == OP_PUSHDATA1)
+        {
+            if (scriptSig.size() < 2) return -1;
+            nSize = scriptSig[1];
+            nOffset = 2;
+        }
+        else if (nOp == OP_PUSHDATA2)
+        {
+            if (scriptSig.size() < 3) return -1;
+            nSize = scriptSig[1] | (scriptSig[2] << 8);
+            nOffset = 3;
+        }
+        else
+        {
+            if (scriptSig.size() < 5) return -1;
+            nSize = scriptSig[1] | (scriptSig[2] << 8) |
+                    (scriptSig[3] << 16) | (scriptSig[4] << 24);
+            nOffset = 5;
+        }
+    }
+    else if (nOp >= OP_1 && nOp <= OP_16)
+    {
+        return (int)(nOp - OP_1 + 1);
+    }
+    else
+    {
+        return -1;
+    }
+
+    if (nOffset + nSize > scriptSig.size())
+        return -1;
+    std::vector<unsigned char> vch(scriptSig.begin() + nOffset,
+                                   scriptSig.begin() + nOffset + nSize);
+    CScriptNum sn(vch, false);
+    return sn.getint();
 }
 
 static const char* BlockRequestTraceParentStatusLocked(const uint256& hash)
@@ -8220,7 +8358,11 @@ bool CBlock::AcceptBlock()
     int64_t nAcceptStart = GetTimeMillis();
 
     if (nVersion > CURRENT_VERSION)
+    {
+        TraceAcceptBlockReject(*this, nBestHeight + 1,
+                               ABREJECT_UNKNOWN_BLOCK_VERSION);
         return DoS(100, error("AcceptBlock() : reject unknown block version %d", nVersion));
+    }
 
     // Check for duplicate
     uint256 hash = GetHash();
@@ -8230,12 +8372,18 @@ bool CBlock::AcceptBlock()
                hash.ToString().c_str(), nBestHeight);
     ibdblocklatency::RecordAcceptBlockBegin(hash);
     if (mapBlockIndex.count(hash))
+    {
+        TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_DUPLICATE);
         return error("AcceptBlock() : block already in mapBlockIndex");
+    }
 
     // Get prev block index
     map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashPrevBlock);
     if (mi == mapBlockIndex.end())
+    {
+        TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
         return DoS(10, error("AcceptBlock() : prev block not found"));
+    }
     CBlockIndex* pindexPrev = (*mi).second;
     int nHeight = pindexPrev->nHeight+1;
 
@@ -8243,14 +8391,24 @@ bool CBlock::AcceptBlock()
     // operator-invalidated block) without peer punishment. This is not a
     // consensus failure, so DoS()/InvalidChainFound are deliberately avoided.
     if (setInvalidBlockHash.count(hash))
+    {
+        TraceAcceptBlockReject(*this, nHeight, ABREJECT_OPERATOR_INVALIDATED);
         return error("AcceptBlock() : block %s is invalidated by the operator",
                      hash.ToString().substr(0, 20).c_str());
+    }
     if (IsBlockOperatorInvalid(pindexPrev))
+    {
+        TraceAcceptBlockReject(*this, nHeight,
+                               ABREJECT_PREV_OPERATOR_INVALIDATED);
         return error("AcceptBlock() : previous block %s (or an ancestor) is invalidated by the operator",
                      hashPrevBlock.ToString().substr(0, 20).c_str());
+    }
 
     if (nHeight >= FORK_HEIGHT_DAG && IsProofOfStake())
+    {
+        TraceAcceptBlockReject(*this, nHeight, ABREJECT_POS_AFTER_DAG);
         return DoS(100, error("AcceptBlock() : proof-of-stake blocks are not allowed after DAG fork height %d", FORK_HEIGHT_DAG));
+    }
 
     // Block size enforcement (height-aware)
     {
@@ -8259,36 +8417,54 @@ bool CBlock::AcceptBlock()
         {
             // Pre-fork: strict 1MB limit (matches old wallet consensus)
             if (nBlockBytes > MAX_BLOCK_SIZE_LEGACY)
+            {
+                TraceAcceptBlockReject(*this, nHeight, ABREJECT_BLOCK_SIZE);
                 return DoS(100, error("AcceptBlock() : block size %u exceeds legacy limit %u at height %d",
                                       nBlockBytes, MAX_BLOCK_SIZE_LEGACY, nHeight));
+            }
         }
         else
         {
             // Post-fork: adaptive limit
             unsigned int nAdaptiveLimit = GetAdaptiveBlockSizeLimit(pindexPrev);
             if (nBlockBytes > nAdaptiveLimit)
+            {
+                TraceAcceptBlockReject(*this, nHeight, ABREJECT_BLOCK_SIZE);
                 return DoS(50, error("AcceptBlock() : block size %u exceeds adaptive limit %u at height %d",
                                       nBlockBytes, nAdaptiveLimit, nHeight));
+            }
         }
     }
 
     // Check proof-of-work or proof-of-stake
     unsigned int nComputedBits = GetNextTargetRequired(pindexPrev, IsProofOfStake());
     if (nBits != nComputedBits)
+    {
+        TraceAcceptBlockReject(*this, nHeight, ABREJECT_INCORRECT_BITS);
         return DoS(100, error("AcceptBlock() : incorrect %s", IsProofOfWork() ? "proof-of-work" : "proof-of-stake"));
+    }
 
     if (GetBlockTime() <= pindexPrev->GetPastTimeLimit() || FutureDrift(GetBlockTime(), nHeight) < pindexPrev->GetBlockTime())
+    {
+        TraceAcceptBlockReject(*this, nHeight, ABREJECT_TIMESTAMP_TOO_EARLY);
         return error("AcceptBlock() : block's timestamp is too early");
+    }
 
     // Check that all transactions are finalized
     for (const CTransaction& tx : vtx)
         //if (!tx.IsFinal(nHeight, GetBlockTime()))
 		  if (!tx.IsFinal(nHeight, GetBlockTime()))
+        {
+            TraceAcceptBlockReject(*this, nHeight, ABREJECT_NON_FINAL_TX);
             return DoS(10, error("AcceptBlock() : contains a non-final transaction"));
+        }
 
     // Check that the block chain matches the known block chain up to a checkpoint
     if (!Checkpoints::CheckHardened(nHeight, hash))
+    {
+        TraceAcceptBlockReject(*this, nHeight, ABREJECT_HARDENED_CHECKPOINT);
         return DoS(100, error("AcceptBlock() : rejected by hardened checkpoint lock-in at %d", nHeight));
+    }
 
     uint256 hashProof;
     // Verify hash target and signature of coinstake tx
@@ -8302,10 +8478,12 @@ bool CBlock::AcceptBlock()
             // Only penalize outside IBD (PoS verification needs UTXOs)
             if (!IsInitialBlockDownload())
             {
+                TraceAcceptBlockReject(*this, nHeight, ABREJECT_CHECK_POS_FAILED);
                 return DoS(50, error("AcceptBlock() : check proof-of-stake failed for block %s (peer penalized)",
                                      hash.ToString().c_str()));
             }
 			printf("WARNING: AcceptBlock(): check proof-of-stake failed for block %s (IBD - no penalty)\n", hash.ToString().c_str());
+            TraceAcceptBlockReject(*this, nHeight, ABREJECT_CHECK_POS_FAILED);
 			return false;
         }
     }
@@ -8322,8 +8500,12 @@ bool CBlock::AcceptBlock()
         for (unsigned int i = 0; i < vtx.size(); i++)
         {
             if (vtx[i].nVersion == ANON_TXN_VERSION)
+            {
+                TraceAcceptBlockReject(*this, nHeight,
+                                       ABREJECT_RINGSIG_DEPRECATION);
                 return DoS(100, error("AcceptBlock() : ring signature transaction (ANON_TXN_VERSION) in block at height %d after deprecation height %d",
                                        nHeight, FORK_HEIGHT_RINGSIG_DEPRECATION));
+            }
         }
     }
 
@@ -8331,7 +8513,10 @@ bool CBlock::AcceptBlock()
 
     // Check that the block satisfies synchronized checkpoint
     if (CheckpointsMode == Checkpoints::STRICT && !cpSatisfies)
+    {
+        TraceAcceptBlockReject(*this, nHeight, ABREJECT_SYNC_CHECKPOINT);
         return error("AcceptBlock() : rejected by synchronized checkpoint");
+    }
 
     if (CheckpointsMode == Checkpoints::ADVISORY && !cpSatisfies)
         strMiscWarning = _("WARNING: syncronized checkpoint violation detected, but skipped!");
@@ -8340,7 +8525,10 @@ bool CBlock::AcceptBlock()
     CScript expect = CScript() << nHeight;
     if (vtx[0].vin[0].scriptSig.size() < expect.size() ||
         !std::equal(expect.begin(), expect.end(), vtx[0].vin[0].scriptSig.begin()))
+    {
+        TraceAcceptBlockReject(*this, nHeight, ABREJECT_COINBASE_HEIGHT);
         return DoS(100, error("AcceptBlock() : block height mismatch in coinbase"));
+    }
 
     // IDAG Phase 2: Validate DAG parent commitment in coinbase OP_RETURN
     if (nHeight >= FORK_HEIGHT_DAG)
@@ -8355,23 +8543,35 @@ bool CBlock::AcceptBlock()
         }
 
         if (vDAGParents.empty())
+        {
+            TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
             return DoS(100, error("AcceptBlock() : post-DAG-fork block missing DAG parent commitment"));
+        }
 
         if (vDAGParents.size() > (unsigned int)MAX_DAG_PARENTS)
+        {
+            TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
             return DoS(100, error("AcceptBlock() : too many DAG parents (%d > %d)", (int)vDAGParents.size(), MAX_DAG_PARENTS));
+        }
 
         // Primary parent (index 0) must match hashPrevBlock
         if (vDAGParents[0] != hashPrevBlock)
+        {
+            TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
             return DoS(100, error("AcceptBlock() : DAG primary parent %s != hashPrevBlock %s",
                                    vDAGParents[0].ToString().substr(0, 20).c_str(),
                                    hashPrevBlock.ToString().substr(0, 20).c_str()));
+        }
 
         // Validate merge parents
         for (unsigned int i = 1; i < vDAGParents.size(); i++)
         {
             // No self-reference
             if (vDAGParents[i] == hash)
+            {
+                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
                 return DoS(100, error("AcceptBlock() : DAG parent[%d] is self-reference", i));
+            }
 
             // Must exist in block index
             if (!mapBlockIndex.count(vDAGParents[i]))
@@ -8383,6 +8583,7 @@ bool CBlock::AcceptBlock()
                                i, vDAGParents[i].ToString().substr(0, 20).c_str());
                     continue;
                 }
+                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
                 return DoS(10, error("AcceptBlock() : DAG merge parent[%d] %s not found",
                                       i, vDAGParents[i].ToString().substr(0, 20).c_str()));
             }
@@ -8390,28 +8591,43 @@ bool CBlock::AcceptBlock()
             // Merge parent must have lower height
             CBlockIndex* pMergeParent = mapBlockIndex[vDAGParents[i]];
             if (pMergeParent->nHeight >= nHeight)
+            {
+                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
                 return DoS(100, error("AcceptBlock() : DAG merge parent[%d] height %d >= block height %d",
                                        i, pMergeParent->nHeight, nHeight));
+            }
             if (pMergeParent->nHeight >= FORK_HEIGHT_DAG && pMergeParent->IsProofOfStake())
+            {
+                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
                 return DoS(100, error("AcceptBlock() : DAG merge parent[%d] is proof-of-stake", i));
+            }
 
             // Merge parent within DAG_MERGE_DEPTH of primary parent
             if (pindexPrev->nHeight - pMergeParent->nHeight > DAG_MERGE_DEPTH)
+            {
+                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
                 return DoS(50, error("AcceptBlock() : DAG merge parent[%d] too deep (%d below primary)",
                                       i, pindexPrev->nHeight - pMergeParent->nHeight));
+            }
 
             // No duplicate parents
             for (unsigned int j = 0; j < i; j++)
             {
                 if (vDAGParents[j] == vDAGParents[i])
+                {
+                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
                     return DoS(100, error("AcceptBlock() : duplicate DAG parent at index %d and %d", j, i));
+                }
             }
         }
     }
 
     // Write block to history file
     if (!CheckDiskSpace(::GetSerializeSize(*this, SER_DISK, CLIENT_VERSION)))
+    {
+        TraceAcceptBlockReject(*this, nHeight, ABREJECT_DISK_SPACE);
         return error("AcceptBlock() : out of disk space");
+    }
     unsigned int nFile = -1;
     unsigned int nBlockPos = 0;
     int64_t nWriteDiskStart = GetTimeMillis();
@@ -8424,6 +8640,7 @@ bool CBlock::AcceptBlock()
         CSyncLockPhase phase("ProcessMessage(block)", "write_to_disk");
         if (!WriteToDisk(nFile, nBlockPos))
         {
+            TraceAcceptBlockReject(*this, nHeight, ABREJECT_WRITE_TO_DISK);
             return error("AcceptBlock() : WriteToDisk failed");
         }
     }
@@ -8433,6 +8650,7 @@ bool CBlock::AcceptBlock()
         CSyncLockPhase phase("ProcessMessage(block)", "add_to_block_index");
         if (!AddToBlockIndex(nFile, nBlockPos, hashProof))
         {
+            TraceAcceptBlockReject(*this, nHeight, ABREJECT_ADD_TO_BLOCK_INDEX);
             return error("AcceptBlock() : AddToBlockIndex failed");
         }
     }
@@ -8898,7 +9116,12 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     if (!mapBlockIndex.count(pblock->hashPrevBlock)) //pblock->hashPrevBlock != 0 &&
     {
         if (fDebug)
-            printf("ProcessBlock: ORPHAN BLOCK, prev=%s\n", pblock->hashPrevBlock.ToString().substr(0,20).c_str());
+            printf("ProcessBlock: ORPHAN BLOCK hash=%s prev=%s coinbase_height=%d peer_orphans=%d global_orphans=%zu\n",
+                   hash.ToString().c_str(),
+                   pblock->hashPrevBlock.ToString().c_str(),
+                   DecodeCoinbaseHeightForTrace(*pblock),
+                   pfrom ? GetPeerOrphanCount(pfrom->GetId()) : -1,
+                   mapOrphanBlocks.size());
             //LogPrintf("ProcessBlock: ORPHAN BLOCK %lu, prev=%s\n", (unsigned long)mapOrphanBlocks.size(), pblock->hashPrevBlock.ToString());
 
         PruneOrphanBlocks();
@@ -10377,7 +10600,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (fDebugNet)
                 printf("  got inventory: %s  %s\n", inv.ToString().c_str(), fAlreadyHave ? "have" : "new");
             if (inv.type == MSG_BLOCK && pindexBest != NULL && pindexBest->GetBlockTime() < GetTime() - 300 && fDebug)
-                printf("sync inv: %s %s from %s\n", inv.ToString().c_str(), fAlreadyHave ? "HAVE" : "NEW", pfrom->addrName.c_str());
+                printf("sync inv: %s %s from %s solicited=%d\n", inv.ToString().c_str(), fAlreadyHave ? "HAVE" : "NEW", pfrom->addrName.c_str(), fGetBlocksResponse ? 1 : 0);
 
             if (!fAlreadyHave) {
                 if (inv.type == MSG_BLOCK)
@@ -12330,6 +12553,14 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                 printf("Pushing getblocks %s to %s\n\n",
                        pindexBegin->ToString().c_str(),
                        hashStop.ToString().c_str());
+            if (fDebug)
+                printf("GETBLOCKS_SEND peer=%d locator_height=%d locator_hash=%s stop=%s source=%s local_best_height=%d\n",
+                       pto->GetId(),
+                       pindexBegin ? pindexBegin->nHeight : -1,
+                       pindexBegin ? pindexBegin->GetBlockHash().ToString().c_str() : "null",
+                       hashStop.ToString().c_str(),
+                       ibdexptrace::GetBlocksSourceName((int)getBlocksSource),
+                       nBestHeight);
             RecoveryTraceSend(pto, nRecoveryId, pindexBegin, hashStop, 1);
             pto->PushMessage("getblocks",
                              CBlockLocator(pindexBegin), hashStop);

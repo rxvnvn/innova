@@ -3307,6 +3307,81 @@ BOOST_AUTO_TEST_CASE(processblock_false_paths_emit_specific_reason)
     BOOST_CHECK(!ProcessBlockRejectTraceEnabled());
 }
 
+BOOST_AUTO_TEST_CASE(acceptblock_reject_trace_enable_and_reason_mapping)
+{
+    BOOST_CHECK(InitAcceptBlockRejectTrace(false));
+    BOOST_CHECK(!AcceptBlockRejectTraceEnabled());
+    BOOST_CHECK(InitAcceptBlockRejectTrace(true));
+    BOOST_CHECK(AcceptBlockRejectTraceEnabled());
+
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_UNKNOWN_BLOCK_VERSION),
+                      std::string("unknown-block-version"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_DUPLICATE),
+                      std::string("duplicate"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_PREV_NOT_FOUND),
+                      std::string("prev-not-found"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_OPERATOR_INVALIDATED),
+                      std::string("operator-invalidated"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_PREV_OPERATOR_INVALIDATED),
+                      std::string("prev-operator-invalidated"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_POS_AFTER_DAG),
+                      std::string("pos-after-dag"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_BLOCK_SIZE),
+                      std::string("block-size"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_INCORRECT_BITS),
+                      std::string("incorrect-bits"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_TIMESTAMP_TOO_EARLY),
+                      std::string("timestamp-too-early"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_NON_FINAL_TX),
+                      std::string("non-final-tx"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_HARDENED_CHECKPOINT),
+                      std::string("hardened-checkpoint"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_CHECK_POS_FAILED),
+                      std::string("check-pos-failed"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_RINGSIG_DEPRECATION),
+                      std::string("ringsig-deprecation"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_SYNC_CHECKPOINT),
+                      std::string("sync-checkpoint"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_COINBASE_HEIGHT),
+                      std::string("coinbase-height"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_DAG_PARENT),
+                      std::string("dag-parent"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_DISK_SPACE),
+                      std::string("disk-space"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_WRITE_TO_DISK),
+                      std::string("write-to-disk"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_ADD_TO_BLOCK_INDEX),
+                      std::string("add-to-block-index"));
+
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_UNKNOWN_BLOCK_VERSION),
+                      std::string("version"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_DUPLICATE),
+                      std::string("duplicate"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_PREV_NOT_FOUND),
+                      std::string("prev"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_OPERATOR_INVALIDATED),
+                      std::string("operator"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_INCORRECT_BITS),
+                      std::string("consensus"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_TIMESTAMP_TOO_EARLY),
+                      std::string("timestamp"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_CHECK_POS_FAILED),
+                      std::string("pos"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_SYNC_CHECKPOINT),
+                      std::string("checkpoint"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_COINBASE_HEIGHT),
+                      std::string("coinbase"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_DAG_PARENT),
+                      std::string("dag"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_WRITE_TO_DISK),
+                      std::string("disk"));
+    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_ADD_TO_BLOCK_INDEX),
+                      std::string("index"));
+
+    BOOST_CHECK(InitAcceptBlockRejectTrace(false));
+    BOOST_CHECK(!AcceptBlockRejectTraceEnabled());
+}
+
 BOOST_AUTO_TEST_CASE(already_asked_for_stale_entries_are_pruned_and_refill)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;

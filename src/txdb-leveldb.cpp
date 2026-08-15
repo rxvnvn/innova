@@ -1073,6 +1073,18 @@ bool CTxDB::LoadBlockIndex()
     // a stored best chain that descends from an invalidated block is healed
     // below and never accepted as the active chain.
     ReadInvalidBlockSet(setInvalidBlockHash);
+    if (fDebug && !setInvalidBlockHash.empty())
+    {
+        for (std::set<uint256>::const_iterator it = setInvalidBlockHash.begin();
+             it != setInvalidBlockHash.end(); ++it)
+        {
+            std::map<uint256, CBlockIndex*>::const_iterator mi =
+                mapBlockIndex.find(*it);
+            printf("INVALIDBLOCKSET hash=%s height=%d\n",
+                   it->ToString().c_str(),
+                   mi != mapBlockIndex.end() ? mi->second->nHeight : -1);
+        }
+    }
 
     // Load hashBestChain pointer to end of best chain
     if (!ReadHashBestChain(hashBestChain))
