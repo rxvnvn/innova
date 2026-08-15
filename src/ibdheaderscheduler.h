@@ -78,6 +78,26 @@ public:
     uint64_t FullReanchorCount() const { return m_full_reanchors; }
 
     /**
+     * Number of MarkActivePath invocations and of graph nodes whose state was
+     * rewritten by the most recent (and cumulative) invocation.  Exposed for
+     * deterministic tests and IBD diagnostics: forward extension must touch
+     * only the inserted delta, never the accumulated header-graph size.
+     */
+    uint64_t MarkActivePathCalls() const { return m_mark_active_path_calls; }
+    uint64_t MarkActivePathTouchedTotal() const
+    { return m_mark_active_path_touched_total; }
+    uint64_t LastMarkActivePathTouched() const
+    { return m_last_mark_active_path_touched; }
+
+    /**
+     * Test-only switch routing MarkActivePath through the pre-optimization
+     * full-graph implementation, so differential tests can prove the delta
+     * implementation preserves observable state exactly.
+     */
+    void SetUseLegacyMarkActivePathForTesting(bool useLegacy)
+    { m_use_legacy_mark_active_path = useLegacy; }
+
+    /**
      * Number of successor probes performed by the most recent GetActiveWindow
      * call.  Exposed for deterministic tests: it must be bounded by
      * windowSize (independent of header-graph lookahead), and identical for
@@ -151,10 +171,15 @@ private:
     uint64_t m_fast_anchor_advances;
     uint64_t m_full_reanchors;
     mutable std::size_t m_last_get_active_window_steps;
+    bool m_use_legacy_mark_active_path;
+    uint64_t m_mark_active_path_calls;
+    uint64_t m_mark_active_path_touched_total;
+    uint64_t m_last_mark_active_path_touched;
 
     void ConnectDescendants(const uint256& parentHash);
     void ExtendActiveTipIfUnambiguous();
     void MarkActivePath(const uint256& tip);
+    void MarkActivePathLegacy(const uint256& tip);
     void QuarantineDescendants(const uint256& hash);
 };
 

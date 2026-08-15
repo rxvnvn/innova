@@ -78,6 +78,72 @@ static CIbdHeaderGraph BuildLinearLookahead(std::size_t lookahead)
     return graph;
 }
 
+// Compare every observable aspect of two graphs that received identical op
+// sequences.  `hashes` must contain every hash ever inserted into either graph.
+// On divergence, details are written to stderr and false is returned.
+static bool RequireEquivalentState(const CIbdHeaderGraph& a, const CIbdHeaderGraph& b,
+                                   const std::vector<uint64_t>& hashes, int iter)
+{
+    if (a.HasAnchor() != b.HasAnchor() || a.Size() != b.Size() ||
+        !(a.AnchorHash() == b.AnchorHash()) ||
+        a.AnchorHeight() != b.AnchorHeight())
+    {
+        std::fprintf(stderr, "CHECK_FAIL iter=%d anchor: hasAnchor %d/%d size %llu/%llu hash %s/%s height %d/%d\n",
+                     iter, a.HasAnchor() ? 1 : 0, b.HasAnchor() ? 1 : 0,
+                     (unsigned long long)a.Size(), (unsigned long long)b.Size(),
+                     a.AnchorHash().ToString().c_str(), b.AnchorHash().ToString().c_str(),
+                     a.AnchorHeight(), b.AnchorHeight());
+        return false;
+    }
+    const CIbdHeaderNode* aTip = a.ActiveTip();
+    const CIbdHeaderNode* bTip = b.ActiveTip();
+    const uint256 aTipHash = aTip ? aTip->hash : uint256(0);
+    const uint256 bTipHash = bTip ? bTip->hash : uint256(0);
+    if (!(aTipHash == bTipHash))
+    {
+        std::fprintf(stderr, "CHECK_FAIL iter=%d tip: %s / %s\n", iter,
+                     aTipHash.ToString().c_str(), bTipHash.ToString().c_str());
+        return false;
+    }
+    for (std::vector<uint64_t>::const_iterator it = hashes.begin();
+         it != hashes.end(); ++it)
+    {
+        const uint256 h = H(*it);
+        const CIbdHeaderNode* an = a.Lookup(h);
+        const CIbdHeaderNode* bn = b.Lookup(h);
+        if ((an != NULL) != (bn != NULL))
+        {
+            std::fprintf(stderr, "CHECK_FAIL iter=%d node %s presence %d/%d\n", iter,
+                         h.ToString().c_str(), an != NULL ? 1 : 0, bn != NULL ? 1 : 0);
+            return false;
+        }
+        if (!an)
+            continue;
+        if (an->height != bn->height || an->state != bn->state ||
+            !(an->prev == bn->prev) ||
+            an->permanently_quarantined != bn->permanently_quarantined)
+        {
+            std::fprintf(stderr, "CHECK_FAIL iter=%d node %s height %d/%d state %d/%d\n",
+                         iter, h.ToString().c_str(), an->height, bn->height,
+                         (int)an->state, (int)bn->state);
+            return false;
+        }
+    }
+    if (a.CheckInvariants() != b.CheckInvariants())
+    {
+        std::fprintf(stderr, "CHECK_FAIL iter=%d invariants %d/%d\n", iter,
+                     a.CheckInvariants() ? 1 : 0, b.CheckInvariants() ? 1 : 0);
+        return false;
+    }
+    if (!(a.GetActiveWindow(a.AnchorHash(), 64) == b.GetActiveWindow(b.AnchorHash(), 64)) ||
+        !(a.BuildContinuationLocator() == b.BuildContinuationLocator()))
+    {
+        std::fprintf(stderr, "CHECK_FAIL iter=%d window/locator\n", iter);
+        return false;
+    }
+    return true;
+}
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(ibdheaderscheduler_tests)
@@ -529,6 +595,206 @@ BOOST_AUTO_TEST_CASE(get_active_window_branch_switch)
     BOOST_CHECK(side[0] == H(1001));
     BOOST_CHECK(side[1] == H(1002));
     BOOST_CHECK(side[2] == H(1003));
+}
+
+BOOST_AUTO_TEST_CASE(mark_active_path_forward_extension_touches_only_delta)
+{
+    const std::size_t chunkSize = 2000;
+    const std::size_t totals[] = { 10000, 100000, 1000000 };
+    for (std::size_t ti = 0; ti < sizeof(totals) / sizeof(totals[0]); ++ti)
+    {
+        const std::size_t total = totals[ti];
+        CIbdHeaderGraph graph;
+        BOOST_REQUIRE(graph.SetAuthoritativeAnchor(H(1000), 0));
+        uint64_t prev = 1000;
+        std::size_t inserted = 0;
+        std::size_t batches = 0;
+        while (inserted < total)
+        {
+            const std::size_t n = std::min(chunkSize, total - inserted);
+            std::vector<std::pair<uint256, uint256> > headers;
+            headers.reserve(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                const uint64_t hash = prev + 1;
+                headers.push_back(std::make_pair(H(hash), H(prev)));
+                prev = hash;
+            }
+            const std::vector<CIbdHeaderGraph::InsertResult> results =
+                graph.InsertBatch(headers);
+            BOOST_REQUIRE_EQUAL(results.size(), n);
+            // Forward extension must rewrite only the newly inserted suffix,
+            // independent of the accumulated graph size.
+            BOOST_CHECK_EQUAL(graph.LastMarkActivePathTouched(), (uint64_t)n);
+            // CheckInvariants is O(active_path^2), so exercise it only on the
+            // small graph; the differential test covers invariant consistency.
+            if (total <= 10000)
+                BOOST_CHECK(graph.CheckInvariants());
+            inserted += n;
+            ++batches;
+        }
+        BOOST_REQUIRE(graph.ActiveTip() != NULL);
+        BOOST_CHECK(graph.ActiveTip()->hash == H(1000 + total));
+        BOOST_CHECK_EQUAL(graph.MarkActivePathCalls(), (uint64_t)batches);
+        BOOST_CHECK_EQUAL(graph.MarkActivePathTouchedTotal(), (uint64_t)total);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(mark_active_path_branch_switch_touches_suffix_delta)
+{
+    CIbdHeaderGraph graph;
+    BOOST_REQUIRE(graph.SetAuthoritativeAnchor(H(1), 0));
+    std::vector<std::pair<uint256, uint256> > main;
+    for (uint64_t i = 2; i <= 11; ++i)
+        main.push_back(std::make_pair(H(i), H(i - 1)));
+    const std::vector<CIbdHeaderGraph::InsertResult> mainRes = graph.InsertBatch(main);
+    BOOST_REQUIRE_EQUAL(mainRes.size(), 10U);
+    BOOST_REQUIRE(graph.ActiveTip() != NULL);
+    BOOST_CHECK(graph.ActiveTip()->hash == H(11));
+
+    // Side branch H(1001) -> H(1002) -> H(1003) forking at H(5).
+    BOOST_REQUIRE(graph.Insert(H(1001), H(5)) == CIbdHeaderGraph::INSERTED_ELIGIBLE);
+    BOOST_REQUIRE(graph.Insert(H(1002), H(1001)) == CIbdHeaderGraph::INSERTED_ELIGIBLE);
+    BOOST_REQUIRE(graph.Insert(H(1003), H(1002)) == CIbdHeaderGraph::INSERTED_ELIGIBLE);
+
+    // Activate the side branch: demote old suffix H(6)..H(11) (6 nodes),
+    // promote new suffix H(1001)..H(1003) (3 nodes); fork H(5) is shared and
+    // must remain ACTIVE untouched.
+    BOOST_REQUIRE(graph.ActivateBranch(H(1003)));
+    BOOST_CHECK_EQUAL(graph.LastMarkActivePathTouched(), (uint64_t)9);
+    BOOST_CHECK(graph.ActiveTip()->hash == H(1003));
+    RequireNode(graph, 5, 4, CIbdHeaderNode::ACTIVE);
+    RequireNode(graph, 4, 3, CIbdHeaderNode::ACTIVE);
+    RequireNode(graph, 6, 5, CIbdHeaderNode::ELIGIBLE);
+    RequireNode(graph, 11, 10, CIbdHeaderNode::ELIGIBLE);
+    RequireNode(graph, 1001, 5, CIbdHeaderNode::ACTIVE);
+    RequireNode(graph, 1003, 7, CIbdHeaderNode::ACTIVE);
+    const std::vector<uint256> window = graph.GetActiveWindow(H(1), 64);
+    BOOST_REQUIRE_EQUAL(window.size(), 7U);
+    BOOST_CHECK(window[0] == H(2));
+    BOOST_CHECK(window[4] == H(1001));
+    BOOST_CHECK(window[5] == H(1002));
+    BOOST_CHECK(window[6] == H(1003));
+    BOOST_CHECK(graph.CheckInvariants());
+
+    // Switch back to the main branch: identical delta in reverse.
+    BOOST_REQUIRE(graph.ActivateBranch(H(11)));
+    BOOST_CHECK_EQUAL(graph.LastMarkActivePathTouched(), (uint64_t)9);
+    BOOST_CHECK(graph.ActiveTip()->hash == H(11));
+    RequireNode(graph, 1001, 5, CIbdHeaderNode::ELIGIBLE);
+    RequireNode(graph, 1003, 7, CIbdHeaderNode::ELIGIBLE);
+    RequireNode(graph, 6, 5, CIbdHeaderNode::ACTIVE);
+    RequireNode(graph, 11, 10, CIbdHeaderNode::ACTIVE);
+    BOOST_CHECK(graph.CheckInvariants());
+
+    // Forward extension from the re-activated tip touches only the delta.
+    const std::vector<CIbdHeaderGraph::InsertResult> ext =
+        graph.InsertBatch(std::vector<std::pair<uint256, uint256> >(
+            1, std::make_pair(H(12), H(11))));
+    BOOST_CHECK_EQUAL(ext.size(), 1U);
+    BOOST_CHECK_EQUAL(graph.LastMarkActivePathTouched(), (uint64_t)1);
+    BOOST_CHECK(graph.ActiveTip()->hash == H(12));
+
+    // Re-activating the current tip is a no-op: zero nodes touched.
+    BOOST_REQUIRE(graph.ActivateBranch(H(12)));
+    BOOST_CHECK_EQUAL(graph.LastMarkActivePathTouched(), (uint64_t)0);
+    BOOST_CHECK(graph.CheckInvariants());
+}
+
+BOOST_AUTO_TEST_CASE(mark_active_path_differential_matches_legacy)
+{
+    CIbdHeaderGraph fastGraph;
+    CIbdHeaderGraph legacyGraph;
+    legacyGraph.SetUseLegacyMarkActivePathForTesting(true);
+    BOOST_REQUIRE(fastGraph.SetAuthoritativeAnchor(H(1), 0));
+    BOOST_REQUIRE(legacyGraph.SetAuthoritativeAnchor(H(1), 0));
+    std::vector<uint64_t> known;
+    known.push_back(1);
+
+    // Deterministic PRNG so failures reproduce exactly.
+    uint64_t state = 0x123456789abcdefULL;
+    for (int iter = 0; iter < 500; ++iter)
+    {
+        state = state * 6364136223846793005ULL + 1442695040888963407ULL;
+        const int kind = (int)(state % 10);
+        if (kind < 3)
+        {
+            const uint64_t prev = known[(std::size_t)(state >> 32) % known.size()];
+            uint64_t hash = 1000000 + (state & 0xFFFFF);
+            while (fastGraph.Lookup(H(hash)))
+                hash = 1000000 + ((hash + 1) % 900000);
+            const CIbdHeaderGraph::InsertResult rf =
+                fastGraph.Insert(H(hash), H(prev));
+            const CIbdHeaderGraph::InsertResult rl =
+                legacyGraph.Insert(H(hash), H(prev));
+            BOOST_CHECK_EQUAL((int)rf, (int)rl);
+            known.push_back(hash);
+        }
+        else if (kind < 5)
+        {
+            uint64_t prev = known[(std::size_t)(state >> 32) % known.size()];
+            const std::size_t n = 1 + (std::size_t)((state >> 16) % 8);
+            std::vector<std::pair<uint256, uint256> > headers;
+            headers.reserve(n);
+            for (std::size_t i = 0; i < n; ++i)
+            {
+                uint64_t hash = 2000000 + (state + i) % 1000000;
+                while (fastGraph.Lookup(H(hash)))
+                    hash = 2000000 + ((hash + 1) % 1000000);
+                headers.push_back(std::make_pair(H(hash), H(prev)));
+                known.push_back(hash);
+                prev = hash;
+            }
+            const std::vector<CIbdHeaderGraph::InsertResult> rf =
+                fastGraph.InsertBatch(headers);
+            const std::vector<CIbdHeaderGraph::InsertResult> rl =
+                legacyGraph.InsertBatch(headers);
+            BOOST_CHECK(rf == rl);
+        }
+        else if (kind < 7)
+        {
+            const uint64_t h = known[(std::size_t)(state >> 32) % known.size()];
+            const bool rf = fastGraph.ActivateBranch(H(h));
+            const bool rl = legacyGraph.ActivateBranch(H(h));
+            BOOST_CHECK_EQUAL(rf, rl);
+        }
+        else if (kind < 8)
+        {
+            const uint64_t h = known[(std::size_t)(state >> 32) % known.size()];
+            const bool rf = fastGraph.QuarantineBranch(H(h));
+            const bool rl = legacyGraph.QuarantineBranch(H(h));
+            BOOST_CHECK_EQUAL(rf, rl);
+        }
+        else if (kind < 9)
+        {
+            uint256 successor;
+            if (fastGraph.GetActiveSuccessor(fastGraph.AnchorHash(), successor))
+            {
+                const CIbdHeaderNode* node = fastGraph.Lookup(successor);
+                BOOST_REQUIRE(node != NULL);
+                const int targetHeight = node->height;
+                const bool rf = fastGraph.Reanchor(successor, targetHeight);
+                const bool rl = legacyGraph.Reanchor(successor, targetHeight);
+                BOOST_CHECK_EQUAL(rf, rl);
+            }
+        }
+        else
+        {
+            const uint64_t h = known[(std::size_t)(state >> 32) % known.size()];
+            const CIbdHeaderNode* node = fastGraph.Lookup(H(h));
+            if (node && node->IsAnchored())
+            {
+                // Capture before the first call: fastGraph.Reanchor may
+                // rebuild the node map (full path), invalidating `node`.
+                const int targetHeight = node->height;
+                const bool rf = fastGraph.Reanchor(H(h), targetHeight);
+                const bool rl = legacyGraph.Reanchor(H(h), targetHeight);
+                BOOST_CHECK_EQUAL(rf, rl);
+            }
+        }
+        BOOST_REQUIRE_MESSAGE(RequireEquivalentState(fastGraph, legacyGraph, known, iter),
+                              "differential state divergence at iter " << iter);
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

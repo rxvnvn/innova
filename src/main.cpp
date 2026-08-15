@@ -11097,9 +11097,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                    graphTip ? graphTip->height : -1,
                    graphTip ? graphTip->height - g_ibdHeadersObserver.Graph().AnchorHeight() : -1,
                    observerResult.continueHeaders ? 1 : 0);
-            printf("IBD_HEADER_DISPATCH event=graph_insert_complete peer=%lld complete_us=%lld count=%zu graph_tip_height=%d\n",
+            printf("IBD_HEADER_DISPATCH event=graph_insert_complete peer=%lld complete_us=%lld count=%zu graph_tip_height=%d mark_active_calls=%llu mark_active_touched=%llu mark_active_touched_total=%llu\n",
                    (long long)pfrom->GetId(), (long long)GetTimeMicros(),
-                   vHeaders.size(), graphTip ? graphTip->height : -1);
+                   vHeaders.size(), graphTip ? graphTip->height : -1,
+                   (unsigned long long)g_ibdHeadersObserver.Graph().MarkActivePathCalls(),
+                   (unsigned long long)g_ibdHeadersObserver.Graph().LastMarkActivePathTouched(),
+                   (unsigned long long)g_ibdHeadersObserver.Graph().MarkActivePathTouchedTotal());
             if (observerResult.expectedResponse)
             {
                 if (observerResult.continueHeaders &&

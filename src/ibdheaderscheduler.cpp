@@ -21,7 +21,10 @@ CIbdHeaderNode::CIbdHeaderNode(const uint256& hashIn, const uint256& prevIn)
 CIbdHeaderGraph::CIbdHeaderGraph()
     : m_has_anchor(false), m_anchor_height(-1),
       m_fast_anchor_advances(0), m_full_reanchors(0),
-      m_last_get_active_window_steps(0)
+      m_last_get_active_window_steps(0),
+      m_use_legacy_mark_active_path(false),
+      m_mark_active_path_calls(0), m_mark_active_path_touched_total(0),
+      m_last_mark_active_path_touched(0)
 {
 }
 
@@ -475,10 +478,103 @@ void CIbdHeaderGraph::ExtendActiveTipIfUnambiguous()
 
 void CIbdHeaderGraph::MarkActivePath(const uint256& tip)
 {
+    ++m_mark_active_path_calls;
+    if (m_use_legacy_mark_active_path)
+    {
+        MarkActivePathLegacy(tip);
+        return;
+    }
+
+    // Delta fast path.  Preserve the legacy observable state (a single ACTIVE
+    // chain from m_active_tip down to the anchor, plus the new suffix) while
+    // rewriting only the suffix nodes that actually change state.  Any
+    // structural surprise falls back to the legacy full-graph implementation,
+    // so both paths converge to identical final state.
+    if (tip == m_active_tip)
+    {
+        m_last_mark_active_path_touched = 0;
+        return;
+    }
+
+    // Collect the new suffix strictly above the fork, where the fork is the
+    // first already-ACTIVE node encountered walking up from tip (the common
+    // ancestor with the old active path), or the anchor when there is none.
+    std::vector<uint256> newSuffix;
+    uint256 fork = m_anchor_hash;
+    uint256 cursor = tip;
+    while (cursor != m_anchor_hash)
+    {
+        NodeMap::iterator it = m_nodes.find(cursor);
+        if (it == m_nodes.end() || !it->second.IsUsable())
+        {
+            MarkActivePathLegacy(tip);
+            return;
+        }
+        if (it->second.state == CIbdHeaderNode::ACTIVE)
+        {
+            fork = cursor;
+            break;
+        }
+        newSuffix.push_back(cursor);
+        cursor = it->second.prev;
+        // Cycle guard: a well-formed prev chain cannot exceed the node count.
+        if (newSuffix.size() > m_nodes.size())
+        {
+            MarkActivePathLegacy(tip);
+            return;
+        }
+    }
+
+    // Demote the old active suffix strictly above the fork.  When the old
+    // active path is exactly the anchor there is nothing to demote.
+    std::size_t touched = 0;
+    if (m_active_tip != m_anchor_hash)
+    {
+        cursor = m_active_tip;
+        while (cursor != fork)
+        {
+            NodeMap::iterator it = m_nodes.find(cursor);
+            if (it == m_nodes.end() ||
+                it->second.state != CIbdHeaderNode::ACTIVE)
+            {
+                MarkActivePathLegacy(tip);
+                return;
+            }
+            it->second.state = CIbdHeaderNode::ELIGIBLE;
+            ++touched;
+            cursor = it->second.prev;
+        }
+    }
+
+    // Promote the new suffix.
+    for (std::vector<uint256>::const_iterator it = newSuffix.begin();
+         it != newSuffix.end(); ++it)
+    {
+        NodeMap::iterator node = m_nodes.find(*it);
+        if (node == m_nodes.end())
+        {
+            MarkActivePathLegacy(tip);
+            return;
+        }
+        node->second.state = CIbdHeaderNode::ACTIVE;
+        ++touched;
+    }
+
+    m_active_tip = tip;
+    m_mark_active_path_touched_total += touched;
+    m_last_mark_active_path_touched = touched;
+}
+
+void CIbdHeaderGraph::MarkActivePathLegacy(const uint256& tip)
+{
+    std::size_t touched = 0;
     for (NodeMap::iterator it = m_nodes.begin(); it != m_nodes.end(); ++it)
     {
         if (it->second.state == CIbdHeaderNode::ACTIVE)
+        {
             it->second.state = CIbdHeaderNode::ELIGIBLE;
+            ++touched;
+        }
     }
 
     uint256 cursor = tip;
@@ -486,11 +582,18 @@ void CIbdHeaderGraph::MarkActivePath(const uint256& tip)
     {
         NodeMap::iterator it = m_nodes.find(cursor);
         if (it == m_nodes.end() || !it->second.IsUsable())
+        {
+            m_mark_active_path_touched_total += touched;
+            m_last_mark_active_path_touched = touched;
             return;
+        }
         it->second.state = CIbdHeaderNode::ACTIVE;
+        ++touched;
         cursor = it->second.prev;
     }
     m_active_tip = tip;
+    m_mark_active_path_touched_total += touched;
+    m_last_mark_active_path_touched = touched;
 }
 
 void CIbdHeaderGraph::QuarantineDescendants(const uint256& hash)
