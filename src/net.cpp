@@ -28,6 +28,9 @@
 #include <limits>
 #include <sstream>
 #include <cstdio>
+#ifdef __linux__
+#include <sys/prctl.h>
+#endif
 
 #ifdef WIN32
 #include <string.h>
@@ -2333,6 +2336,16 @@ void ClearRejectedBlockForSync(const uint256& hashBlock)
     stalledSyncRecoveryState.ClearRejectedBlock(hashBlock);
 }
 
+static std::string SyncLockCurrentThreadName()
+{
+#ifdef __linux__
+    char name[16] = {0};
+    if (prctl(PR_GET_NAME, name, 0, 0, 0) == 0 && name[0])
+        return std::string(name);
+#endif
+    return std::string("<unknown>");
+}
+
 bool SyncTraceEnabled()
 {
     // Detailed sync lifecycle events require the explicit block-request trace.
@@ -2343,6 +2356,7 @@ CSyncLockDiagnostics::CSyncLockDiagnostics(
     const char* pszLocationIn, const char* pszLocksIn)
     : pszLocation(pszLocationIn),
       pszLocks(pszLocksIn),
+      vOwnerAtWait(SyncLockOwnerSnapshots(pszLocksIn)),
       nWaitStartTime(GetBoolArg("-synclockdiagnostics", false)
                          ? GetTimeMicros() : 0),
       nAcquiredTime(0),
@@ -2377,10 +2391,24 @@ CSyncLockDiagnostics::~CSyncLockDiagnostics()
 
     std::ostringstream threadName;
     threadName << boost::this_thread::get_id();
-    printf("SYNCLOCK time_us=%lld thread=%s location=%s locks=%s wait_us=%lld hold_us=%lld threshold_us=%lld\n",
-           (long long)nEndTime, threadName.str().c_str(),
+    const std::string waiterName = SyncLockCurrentThreadName();
+    printf("SYNCLOCK time_us=%lld thread=%s waiter_name=%s location=%s locks=%s wait_us=%lld hold_us=%lld threshold_us=%lld\n",
+           (long long)nEndTime, threadName.str().c_str(), waiterName.c_str(),
            pszLocation, pszLocks, (long long)nWaitMicros,
            (long long)nHoldMicros, (long long)nThresholdMicros);
+    for (size_t i = 0; i < vOwnerAtWait.size(); ++i)
+    {
+        const CSyncLockOwnerSnapshot& owner = vOwnerAtWait[i];
+        const int64_t ownerHoldMicros = owner.known
+            ? std::max<int64_t>(0, nEndTime - owner.ownerStartTimeMicros) : 0;
+        printf("SYNCLOCK_OWNER lock=%s known=%d thread=%s name=%s source=%s:%d hold_us=%lld depth=%d\n",
+               owner.lockName.c_str(), owner.known ? 1 : 0,
+               owner.ownerThreadId.empty() ? "<unknown>" : owner.ownerThreadId.c_str(),
+               owner.ownerThreadName.empty() ? "<unknown>" : owner.ownerThreadName.c_str(),
+               owner.sourceFile.empty() ? "<unknown>" : owner.sourceFile.c_str(),
+               owner.sourceLine, (long long)ownerHoldMicros,
+               owner.recursionDepth);
+    }
 }
 
 void LogGetInfoSyncProbe(const char* pszEvent,

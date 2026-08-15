@@ -7924,8 +7924,12 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     CTxDB txdb;
     if (!txdb.TxnBegin())
         return false;
-    txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
     {
+        CSyncLockPhase phase("ProcessMessage(block)", "blockindex_db");
+        txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
+    }
+    {
+        CSyncLockPhase phase("ProcessMessage(block)", "blockindex_db_commit");
         ibdactivepath::ActivePathTimer ibdBlockIndexCommitTimer(
             ibdactivepath::GetCounters().blockindex_commit_us_total,
             ibdactivepath::GetCounters().blockindex_commit_us_max,
@@ -8032,6 +8036,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
 
     // New best
     if (pindexNew->nChainTrust > nBestChainTrust)
+    {
+        CSyncLockPhase phase("ProcessMessage(block)", "set_best_chain");
         if (!SetBestChain(txdb, pindexNew))
         {
             if (fDAGDataInitialized)
@@ -8060,6 +8066,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
             return false;
         }
+    }
     else
         ibdblocklatency::RecordBlockAcceptedSide(hash, pindexNew->nHeight);
 
@@ -8081,6 +8088,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                        || (nHeight - nLastNotifyHeight >= 500); // or every 500 blocks
         if (fNotify)
         {
+            CSyncLockPhase phase("ProcessMessage(block)", "wallet_ui_notification");
             uiInterface.NotifyBlocksChanged(nHeight, GetNumBlocksOfPeers());
             nLastNotifyTime = nNow;
             nLastNotifyHeight = nHeight;
@@ -8286,6 +8294,7 @@ bool CBlock::AcceptBlock()
     // Verify hash target and signature of coinstake tx
     if (IsProofOfStake())
     {
+        CSyncLockPhase phase("ProcessMessage(block)", "pos_validation");
         uint256 targetProofOfStake;
         //if (!CheckProofOfStake(pindexPrev, vtx[1], nBits, hashProof, targetProofOfStake))
 		if (!CheckProofOfStake(pindexPrev, vtx[1], nBits, hashProof, targetProofOfStake))
@@ -8303,6 +8312,7 @@ bool CBlock::AcceptBlock()
     // PoW is checked in CheckBlock()
     if (IsProofOfWork())
     {
+        CSyncLockPhase phase("ProcessMessage(block)", "pow_validation");
         hashProof = GetPoWHash();
     }
 
@@ -8410,12 +8420,22 @@ bool CBlock::AcceptBlock()
         ibdactivepath::GetCounters().raw_block_write_us_max,
         ibdactivepath::GetCounters().raw_block_write_count,
         "raw_block_write", nBestHeight + 1);
-    if (!WriteToDisk(nFile, nBlockPos))
-        return error("AcceptBlock() : WriteToDisk failed");
+    {
+        CSyncLockPhase phase("ProcessMessage(block)", "write_to_disk");
+        if (!WriteToDisk(nFile, nBlockPos))
+        {
+            return error("AcceptBlock() : WriteToDisk failed");
+        }
+    }
     int64_t nWriteDiskMs = GetTimeMillis() - nWriteDiskStart;
     int64_t nAddIndexStart = GetTimeMillis();
-    if (!AddToBlockIndex(nFile, nBlockPos, hashProof))
-        return error("AcceptBlock() : AddToBlockIndex failed");
+    {
+        CSyncLockPhase phase("ProcessMessage(block)", "add_to_block_index");
+        if (!AddToBlockIndex(nFile, nBlockPos, hashProof))
+        {
+            return error("AcceptBlock() : AddToBlockIndex failed");
+        }
+    }
     int64_t nAddIndexMs = GetTimeMillis() - nAddIndexStart;
 
     // Relay inventory, but don't relay old inventory during initial block download
@@ -8811,10 +8831,13 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     // Preliminary checks
     int64_t nCheckStart = GetTimeMillis();
     const char* pszCheckBlockReason = NULL;
-    if (!pblock->CheckBlock(true, true, true, &pszCheckBlockReason)) {
+    {
+        CSyncLockPhase phase("ProcessMessage(block)", "block_precheck");
+        if (!pblock->CheckBlock(true, true, true, &pszCheckBlockReason)) {
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_CHECKBLOCK_FALSE, pszCheckBlockReason);
         ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
-        return error("ProcessBlock() : CheckBlock FAILED");
+            return error("ProcessBlock() : CheckBlock FAILED");
+        }
     }
     int64_t nCheckMs = GetTimeMillis() - nCheckStart;
 
@@ -8975,7 +8998,12 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 
     // Store to disk
     int64_t nAcceptStart = GetTimeMillis();
-    if (!pblock->AcceptBlock()) {
+    bool fAcceptBlock = false;
+    {
+        CSyncLockPhase phase("ProcessMessage(block)", "acceptblock");
+        fAcceptBlock = pblock->AcceptBlock();
+    }
+    if (!fAcceptBlock) {
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_ACCEPTBLOCK_FALSE);
         ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
         return error("ProcessBlock() : AcceptBlock FAILED");
@@ -8983,6 +9011,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     int64_t nAcceptMs = GetTimeMillis() - nAcceptStart;
 
     // Recursively process any orphan blocks that depended on this one
+    {
+    CSyncLockPhase orphanPhase("ProcessMessage(block)", "orphan_processing");
     vector<uint256> vWorkQueue;
     vWorkQueue.push_back(hash);
     for (unsigned int i = 0; i < vWorkQueue.size(); i++)
@@ -9017,6 +9047,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             delete pblockOrphan;
         }
         mapOrphanBlocksByPrev.erase(hashPrev);
+    }
     }
 
     if (fDebug && GetBoolArg("-showtimers", false)) {
@@ -11205,8 +11236,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     {
         const uint64_t nBlockPayloadBytes = vRecv.size();
         CBlock block;
-        vRecv >> block;
-        uint256 hashBlock = block.GetHash();
+        uint256 hashBlock;
+        {
+            CSyncLockPhase phase("ProcessMessage(block)", "deserialize");
+            vRecv >> block;
+            hashBlock = block.GetHash();
+        }
 
         if (fDebugNet) printf("received block %s\n", hashBlock.ToString().substr(0,20).c_str());
         // block.print();
@@ -12350,10 +12385,13 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
         if (lockMain)
         {
             sendLockDiagnostics.Acquired();
-            if (IbdHeaderSchedulerSelectActive())
-                RefillOrderedHeaderBlockRequests(pto, vNodesCopy);
-            else
-                RefillDeferredBlockRequests(pto, vNodesCopy);
+            {
+                CSyncLockPhase phase("SendMessages", "ibd_refill_scheduler");
+                if (IbdHeaderSchedulerSelectActive())
+                    RefillOrderedHeaderBlockRequests(pto, vNodesCopy);
+                else
+                    RefillDeferredBlockRequests(pto, vNodesCopy);
+            }
 
         if (fSPVMode && pto->getHeadersSync.IsTimedOut(GetTime()))
             pto->PushGetHeaders(CBlockLocator(pindexBest), uint256(0), "timeout-retry");
@@ -12366,6 +12404,8 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                 pto->PushGetHeaders(observerLocator, uint256(0), "ibd-observe-timeout");
         }
 
+        {
+            CSyncLockPhase phase("SendMessages", "dandelion");
         if (dandelionState.IsEnabled())
         {
             std::vector<int> vPeerIds;
@@ -12390,16 +12430,20 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
             }
         }
 
+        }
         // Resend wallet transactions that haven't gotten in a block yet
         // Except during reindex, importing and IBD, when old wallet
         // transactions become unconfirmed and spams other nodes.
         if (!fReindex && !IsInitialBlockDownload())
         {
+            CSyncLockPhase phase("SendMessages", "wallet_resend");
             ResendWalletTransactions();
         }
 
         // Address refresh broadcast
-        static int64_t nLastRebroadcast;
+        {
+            CSyncLockPhase phase("SendMessages", "address_refresh");
+            static int64_t nLastRebroadcast;
         if (!IsInitialBlockDownload() && (GetTime() - nLastRebroadcast > 24 * 60 * 60))
         {
             {
@@ -12424,10 +12468,13 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                 }
             }
         }
+        }
 
         //
         // Message: addr
         //
+        {
+            CSyncLockPhase phase("SendMessages", "addr_message");
         if (fSendTrickle)
         {
             vector<CAddress> vAddr;
@@ -12450,9 +12497,12 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
             if (!vAddr.empty())
                 pto->PushMessage("addr", vAddr);
         }
+        }
 
         // A getblocks reply is protocol inventory, even when the peer prefers
         // headers for unsolicited block announcements.
+        {
+            CSyncLockPhase phase("SendMessages", "getblocks_inventory");
         vector<CInv> vGetBlocksInv;
         {
             LOCK(pto->cs_inventory);
@@ -12476,10 +12526,13 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
             if (!vResponse.empty())
                 pto->PushMessage("inv", vResponse);
         }
+        }
 
         //
         // Message: inventory
         //
+        {
+            CSyncLockPhase phase("SendMessages", "inventory_construction");
         vector<CInv> vInv;
         vector<CInv> vInvWait;
         vector<CBlock> vBlockHeaders;
@@ -12548,7 +12601,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
             pto->PushMessage("inv", vInv);
         if (!vBlockHeaders.empty())
             pto->PushMessage("headers", vBlockHeaders);
-
+        }
 
         // getdata moved outside cs_main (below) for IBD reliability
 
@@ -12641,6 +12694,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                 }
             }
             {
+                CSyncLockPhase phase("SendMessages", "alreadyhave_txdb");
                 TRY_LOCK(cs_main, lockMain);
                 if (lockMain)
                 {

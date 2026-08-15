@@ -27,6 +27,7 @@
 
 #include "../ibdforensic.h"
 #include "../net.h"
+#include "../sync.h"
 #include "../uint256.h"
 #include "../util.h"
 
@@ -915,6 +916,25 @@ BOOST_AUTO_TEST_CASE(reset_for_testing_clears_generation_ledger)
     BOOST_CHECK_EQUAL(ibdforensic::EntryCount(), (size_t)0);
 
     ibdforensic::ResetForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(phase_diagnostics_emission_and_threshold)
+{
+    ArgsRestore restore;
+    SyncLockOwnerTrackingEnabled();
+    mapArgs["-synclockphasethresholdms"] = "1";
+
+    mapArgs["-synclockdiagnostics"] = "0";
+    SyncLockPhaseResetForTesting();
+    BOOST_CHECK(!SyncLockPhaseLog("test", "phase", GetTimeMicros() - 5000));
+
+    mapArgs["-synclockdiagnostics"] = "1";
+    SyncLockPhaseResetForTesting();
+    BOOST_CHECK(SyncLockPhaseLog("test", "phase", GetTimeMicros() - 5000));
+
+    mapArgs["-synclockphasethresholdms"] = "100000";
+    SyncLockPhaseResetForTesting();
+    BOOST_CHECK(!SyncLockPhaseLog("test", "phase", GetTimeMicros() - 5000));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

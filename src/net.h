@@ -230,6 +230,7 @@ class CSyncLockDiagnostics
 private:
     const char* pszLocation;
     const char* pszLocks;
+    std::vector<CSyncLockOwnerSnapshot> vOwnerAtWait;
     int64_t nWaitStartTime;
     int64_t nAcquiredTime;
     bool fEnabled;

@@ -12,6 +12,9 @@
 #include <boost/thread/locks.hpp>
 #include <boost/thread/mutex.hpp>
 #include <boost/thread/recursive_mutex.hpp>
+#include <stdint.h>
+#include <string>
+#include <vector>
 
 
 ////////////////////////////////////////////////
@@ -83,6 +86,38 @@ typedef AnnotatedMixin<boost::recursive_mutex> CCriticalSection;
 
 /** Wrapped boost mutex: supports waiting but not recursive locking */
 typedef AnnotatedMixin<boost::mutex> CWaitableCriticalSection;
+struct CSyncLockOwnerSnapshot
+{
+    std::string lockName;
+    std::string ownerThreadId;
+    std::string ownerThreadName;
+    std::string sourceFile;
+    bool known;
+    int sourceLine;
+    int recursionDepth;
+    int64_t ownerStartTimeMicros;
+
+    CSyncLockOwnerSnapshot()
+        : known(false), sourceLine(0), recursionDepth(0), ownerStartTimeMicros(0) {}
+};
+
+bool SyncLockOwnerTrackingEnabled();
+bool SyncLockPhaseDiagnosticsEnabled();
+uint64_t SyncLockOwnerAcquired(void*, const char*, const char*, int);
+void SyncLockOwnerReleased(void*, uint64_t);
+std::vector<CSyncLockOwnerSnapshot> SyncLockOwnerSnapshots(const char*);
+bool SyncLockPhaseLog(const char*, const char*, int64_t);
+void SyncLockPhaseResetForTesting();
+
+class CSyncLockPhase
+{
+    const char* scope;
+    const char* phase;
+    int64_t startMicros;
+public:
+    CSyncLockPhase(const char* scopeIn, const char* phaseIn);
+    ~CSyncLockPhase();
+};
 
 #ifdef DEBUG_LOCKORDER
 void EnterCritical(const char* pszName, const char* pszFile, int nLine, void* cs, bool fTry = false);
@@ -106,6 +141,7 @@ class CMutexLock
 {
 private:
     boost::unique_lock<Mutex> lock;
+    uint64_t nOwnerToken;
 
     void Enter(const char* pszName, const char* pszFile, int nLine)
     {
@@ -116,6 +152,7 @@ private:
             PrintLockContention(pszName, pszFile, nLine);
 #endif
         lock.lock();
+        nOwnerToken = SyncLockOwnerAcquired((void*)lock.mutex(), pszName, pszFile, nLine);
 #ifdef DEBUG_LOCKCONTENTION
         }
 #endif
@@ -125,13 +162,16 @@ private:
     {
         EnterCritical(pszName, pszFile, nLine, (void*)(lock.mutex()), true);
         lock.try_lock();
+        if (lock.owns_lock())
+            nOwnerToken = SyncLockOwnerAcquired((void*)lock.mutex(), pszName, pszFile, nLine);
         if (!lock.owns_lock())
             LeaveCritical();
         return lock.owns_lock();
     }
 
 public:
-    CMutexLock(Mutex& mutexIn, const char* pszName, const char* pszFile, int nLine, bool fTry = false) : lock(mutexIn, boost::defer_lock)
+    CMutexLock(Mutex& mutexIn, const char* pszName, const char* pszFile, int nLine, bool fTry = false)
+        : lock(mutexIn, boost::defer_lock), nOwnerToken(0)
     {
         if (fTry)
             TryEnter(pszName, pszFile, nLine);
@@ -142,7 +182,10 @@ public:
     ~CMutexLock()
     {
         if (lock.owns_lock())
+        {
+            SyncLockOwnerReleased((void*)lock.mutex(), nOwnerToken);
             LeaveCritical();
+        }
     }
 
     void Unlock()
@@ -150,6 +193,7 @@ public:
         if (lock.owns_lock())
         {
             lock.unlock();
+            SyncLockOwnerReleased((void*)lock.mutex(), nOwnerToken);
             LeaveCritical();
         }
     }
