@@ -482,6 +482,9 @@ void MarkIbdHeaderSchedulerRecoveryNeeded();
 std::size_t GetIbdBlockWindow();
 void ResetIbdBlockWindowConfigForTesting();
 
+// Stage 5 selective redundancy prefix height: HR = min(256, max(32, W/32)).
+int GetIbdHeaderRedundancyPrefixHeight();
+
 void AdvanceIbdHeaderSchedulerRound();
 void ResetIbdHeaderSchedulerStateForTesting();
 bool SeedIbdHeaderSchedulerAnchorForTesting(const uint256& hash, int height);

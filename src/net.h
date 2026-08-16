@@ -581,18 +581,35 @@ static const size_t MAX_ALREADY_ASKED_FOR_SIZE = 50000;
 static const int MAX_DEFERRED_INV_ACTIVE_PER_PEER = 128;
 /** Normal INV active scheduler window across all peers during IBD. */
 static const int MAX_DEFERRED_INV_ACTIVE_GLOBAL = 512;
+/**
+ * Hard ceiling for the per-peer IBD active block request budget.  Stage 2 of
+ * the wide-window ordered-IBD work: with W = -ibdblockwindow (up to 16384),
+ * the per-peer budget scales to ceil(W/min(N,4)) so a handful of serving
+ * peers can saturate the ordered window, but is capped here so a single peer
+ * never holds an unbounded share of the pipeline.
+ */
+static const int MAX_IBD_ACTIVE_BUDGET_CAP = 2048;
 /** Maximum retained ordered legacy block INV candidates per peer. */
 static const size_t MAX_DEFERRED_BLOCK_INV_PER_PEER = 1000;
 /** Maximum deferred candidates examined in one refill pump. */
 static const size_t MAX_DEFERRED_BLOCK_INV_REFILL_WORK = 256;
 
 // Effective per-peer active block request window during IBD.  Returns
-// MAX_DEFERRED_INV_ACTIVE_PER_PEER (128) when not in IBD.  The experimental
-// -ibdmaxactiveperpeer=<n> runtime window is clamped to
-// [1, MAX_DEFERRED_INV_ACTIVE_GLOBAL]; zero, negative, and non-numeric values
-// are rejected and fall back to the default.  The configured value is read
-// once and cached at first use; hot paths must not re-read the argument.
+// MAX_DEFERRED_INV_ACTIVE_PER_PEER (128) when not in IBD.  During IBD the
+// budget is max(config, ceil(W/min(N,4))) capped at MAX_IBD_ACTIVE_BUDGET_CAP,
+// where N is the number of serving connected peers and W = -ibdblockwindow;
+// this lets the ordered window fill with a few serving peers while leaving
+// the per-peer transport pressure bounded.  The experimental
+// -ibdmaxactiveperpeer=<n> runtime override remains the explicit floor and is
+// clamped to [1, MAX_IBD_ACTIVE_BUDGET_CAP]; zero, negative, and non-numeric
+// values are rejected and fall back to the default.  The configured value is
+// read once and cached at first use; hot paths must not re-read the argument.
 int GetMaxActiveBlockRequestsPerPeer();
+// Effective global ceiling for active block requests across all peers during
+// IBD: max(MAX_DEFERRED_INV_ACTIVE_GLOBAL, W).  Dynamic so the ordered window
+// (logical requests; copies multiply only when redundancy is enabled) can
+// actually fill; scales with -ibdblockwindow.
+int GetMaxActiveBlockRequestsGlobal();
 int64_t GetIbdSyncPeerScore(const CNode* pnode, int64_t nNow,
                               int64_t nMaxPeerHeight);
 

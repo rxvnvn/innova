@@ -593,7 +593,7 @@ static int CountGlobalActiveBlockRequests(CNode* extraPeer,
         }
     }
     if (!lockNodes)
-        return MAX_DEFERRED_INV_ACTIVE_GLOBAL + 1;
+        return GetMaxActiveBlockRequestsGlobal() + 1;
     else if (extraPeer != NULL &&
              std::find(vNodes.begin(), vNodes.end(), extraPeer) == vNodes.end())
     {
@@ -657,11 +657,15 @@ int GetDeferredBlockRequestBudget(CNode* pfrom,
         *pnGlobalActivePressure = nGlobalActivePressure;
 
     const int nPeerBudget = GetMaxActiveBlockRequestsPerPeer() - nPeerActivePressure;
-    const int nGlobalBudget = MAX_DEFERRED_INV_ACTIVE_GLOBAL - nGlobalActivePressure;
+    const int nGlobalBudget = GetMaxActiveBlockRequestsGlobal() - nGlobalActivePressure;
     const int nBudget = std::max(0, std::min(nPeerBudget, nGlobalBudget));
 
     {
         ibdmetrics::Counters& metrics = ibdmetrics::Get();
+        metrics.scheduler_budget_per_peer.store(
+            GetMaxActiveBlockRequestsPerPeer(), std::memory_order_relaxed);
+        metrics.scheduler_budget_global.store(
+            GetMaxActiveBlockRequestsGlobal(), std::memory_order_relaxed);
         metrics.deferred_budget_calls.fetch_add(1, std::memory_order_relaxed);
         if (nBudget > 0)
             metrics.deferred_budget_positive.fetch_add(
@@ -725,6 +729,13 @@ IbdHeaderSchedulerBuildActiveAncestorEvidence(
 
 
 static std::vector<CNode*> IbdHeaderSchedulerCandidatePeers(
+
+int GetIbdHeaderRedundancyPrefixHeight()
+{
+    const std::size_t W = GetIbdBlockWindow();
+    return (int)std::min<std::size_t>(256, std::max<std::size_t>(32, W / 32));
+}
+
     const uint256& hash, size_t activeIndex, int activeHeight,
     const IbdHeaderSchedulerActiveAncestorEvidence& evidence,
     const std::vector<CNode*>& vNodesCopy)
@@ -1755,7 +1766,7 @@ static void TraceDeferredWindowState(CNode* pfrom, const char* pszEvent,
            nQueuedBlockRequests, nSentBlockRequests, nGlobalActivePressure,
            nOrphanCountPeer, nPeerActivePressure, nBudget,
            GetMaxActiveBlockRequestsPerPeer(),
-           MAX_DEFERRED_INV_ACTIVE_GLOBAL,
+           GetMaxActiveBlockRequestsGlobal(),
            MAX_DEFERRED_BLOCK_INV_PER_PEER,
            pszReason ? pszReason : "none", nAdmitted, nDropped);
 }
@@ -1819,7 +1830,7 @@ bool TryAdmitBlockInvOrDefer(CNode* pfrom, const CInv& inv,
         // cap, normal validation) are enforced by AskFor.
         if (fFrontierCandidate &&
             nOrphanCountPeer > 0 &&
-            nGlobalActivePressure < MAX_DEFERRED_INV_ACTIVE_GLOBAL &&
+            nGlobalActivePressure < GetMaxActiveBlockRequestsGlobal() &&
             FrontierCandidateCanAdmit(GetTimeMicros(), pfrom->GetId(),
                                       inv.hash, nBestHeight,
                                       pfrom->nFrontierLocatorHeight))

@@ -48,6 +48,8 @@ Counters::Counters()
       refill_txdb_opens(0),
       refill_alreadyhave_checks(0),
       scheduler_block_window(0),
+      scheduler_budget_per_peer(0),
+      scheduler_budget_global(0),
       block_receive_total(0),
       block_result_accepted_active(0),
       block_result_orphan_new(0),

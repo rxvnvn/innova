@@ -1053,13 +1053,39 @@ int LoadIBDMaxActivePerPeerConfig()
         nRaw = nDefault;
     }
     // Zero, negative, and non-numeric values are rejected and fall back to the
-    // default; values above the global cap are clamped (mirrors the clamp
+    // default; values above the per-peer cap are clamped (mirrors the clamp
     // pattern used for other init-time parameters in AppInit2).
     if (nRaw < 1)
         nRaw = nDefault;
-    if (nRaw > MAX_DEFERRED_INV_ACTIVE_GLOBAL)
-        nRaw = MAX_DEFERRED_INV_ACTIVE_GLOBAL;
+    if (nRaw > MAX_IBD_ACTIVE_BUDGET_CAP)
+        nRaw = MAX_IBD_ACTIVE_BUDGET_CAP;
     return (int)nRaw;
+}
+
+// Number of serving connected peers: the denominator of the per-peer budget
+// share ceil(W/min(N,4)).  Mirrors the connection-level eligibility filter of
+// the ordered-scheduler candidate walk (main.cpp): a peer that could serve an
+// ordered block request counts toward N.  On a cs_vNodes lock failure a
+// mid-range 4 is assumed so the share never over-debits a transiently
+// unobservable set.
+static int GetIbdServingPeerCount()
+{
+    int n = 0;
+    {
+        TRY_LOCK(cs_vNodes, lockNodes);
+        if (!lockNodes)
+            return 4;
+        for (std::vector<CNode*>::const_iterator it = vNodes.begin();
+             it != vNodes.end(); ++it)
+        {
+            const CNode* pnode = *it;
+            if (pnode == NULL || pnode->fDisconnect || pnode->fClient ||
+                pnode->fOneShot || pnode->nVersion == 0)
+                continue;
+            ++n;
+        }
+    }
+    return std::max(n, 1);
 }
 
 } // namespace
@@ -1098,7 +1124,32 @@ int GetMaxActiveBlockRequestsPerPeer()
     }
     if (!IsInitialBlockDownload())
         return MAX_DEFERRED_INV_ACTIVE_PER_PEER;
-    return g_nIBDMaxActivePerPeerConfigured;
+    // Stage 2: scale the per-peer budget to the ordered window so a few
+    // serving peers can fill W.  Each peer's share is ceil(W/min(N,4)), never
+    // below the configured floor (-ibdmaxactiveperpeer or the 128 default),
+    // and capped at MAX_IBD_ACTIVE_BUDGET_CAP (2048).  With N >= 4 the share
+    // is exactly W/4, i.e. W = 8192 needs >= 4 serving peers at 2048 each;
+    // with more peers the global ceiling (max(512, W)) binds first.
+    const int64_t nWindow = (int64_t)GetIbdBlockWindow();
+    const int nDenom = std::max(1, std::min(GetIbdServingPeerCount(), 4));
+    const int64_t nShare = (nWindow + nDenom - 1) / nDenom;
+    const int64_t nBudget = std::max((int64_t)g_nIBDMaxActivePerPeerConfigured,
+                                     nShare);
+    return (int)std::min(nBudget, (int64_t)MAX_IBD_ACTIVE_BUDGET_CAP);
+}
+
+int GetMaxActiveBlockRequestsGlobal()
+{
+    // Ordered-window fill: the global in-flight ceiling must be >= W so the
+    // full ordered window (logical requests) can be admitted, plus the
+    // selective head-prefix redundancy margin HR so the redundant physical
+    // copies do not immediately saturate the global budget.  The legacy 512
+    // floor is retained below the configured window minimum.
+    const int64_t nWindow = (int64_t)GetIbdBlockWindow();
+    const int64_t nRedundancyPrefix =
+        (int64_t)GetIbdHeaderRedundancyPrefixHeight();
+    return (int)std::max((int64_t)MAX_DEFERRED_INV_ACTIVE_GLOBAL,
+                         nWindow + nRedundancyPrefix);
 }
 
 void ResetMaxActiveBlockRequestsPerPeerConfigForTesting()

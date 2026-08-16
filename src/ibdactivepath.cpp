@@ -535,14 +535,15 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
 
     // IBD active-window distribution gauges.  Dominant share is the largest
     // single-peer inflight as a percentage of total peer inflight.  Global
-    // free slots are 512 - global active (queued+inflight), clamped to
-    // [0, 512].  Sample counters increment at most once per 1s emission.
+    // free slots are (global budget) - global active (queued+inflight),
+    // clamped to [0, global budget].
     ibdmetrics::Counters& mc = ibdmetrics::Get();
+    const int64_t nGlobalBudget = (int64_t)GetMaxActiveBlockRequestsGlobal();
     const int64_t nGlobalActiveCurrent =
         mc.total_queued_current.load(std::memory_order_relaxed) +
         mc.total_inflight_current.load(std::memory_order_relaxed);
     const int64_t nGlobalFreeActiveSlots = std::max<int64_t>(
-        0, (int64_t)MAX_DEFERRED_INV_ACTIVE_GLOBAL - nGlobalActiveCurrent);
+        0, nGlobalBudget - nGlobalActiveCurrent);
     const int64_t nTotalDeferredCurrent =
         mc.total_deferred_current.load(std::memory_order_relaxed);
     int64_t nDominantSharePct = 0;
@@ -554,7 +555,7 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
         c.samples_single_peer_over_75pct.fetch_add(1, std::memory_order_relaxed);
     }
     if (nTotalDeferredCurrent > 0 &&
-        nGlobalFreeActiveSlots > MAX_DEFERRED_INV_ACTIVE_GLOBAL / 2)
+        nGlobalFreeActiveSlots > nGlobalBudget / 2)
     {
         c.samples_global_below_half_with_deferred.fetch_add(
             1, std::memory_order_relaxed);

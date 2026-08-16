@@ -363,6 +363,12 @@ struct Counters
     // process; set from -ibdblockwindow on first scheduler window read.
     std::atomic<int64_t> scheduler_block_window;
 
+    // Effective IBD active-request budgets in effect (Stage 2 budget scaling):
+    // per-peer = max(config, ceil(W/min(N,4))) capped 2048; global =
+    // max(512, W).  Set on each deferred-budget computation.
+    std::atomic<int64_t> scheduler_budget_per_peer;
+    std::atomic<int64_t> scheduler_budget_global;
+
     std::atomic<int64_t> block_receive_total;
     std::atomic<int64_t> block_result_accepted_active;
     std::atomic<int64_t> block_result_orphan_new;
