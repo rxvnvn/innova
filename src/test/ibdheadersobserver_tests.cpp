@@ -35,12 +35,64 @@ BOOST_AUTO_TEST_CASE(anchor_population_and_continuation_rounds)
     BOOST_REQUIRE(!r.continuationLocator.empty());
     BOOST_CHECK(r.continuationLocator.front() == OH(2001));
     BOOST_CHECK(r.continuationLocator.back() == OH(1));
-    o.MarkHeaderRequest(7);
-    r = o.ObserveHeaders(7, Batch(2002, 4001));
+    // Two full continuation rounds under the bounded lookahead cap (large
+    // window: cap 6000, graph ahead 4000).
+    CIbdHeadersObserver oWide(4000); oWide.SetEnabled(true);
+    BOOST_REQUIRE(oWide.UpdateAnchor(OH(1), 0));
+    oWide.MarkHeaderRequest(7);
+    r = oWide.ObserveHeaders(7, Batch(2, 2001));
+    BOOST_CHECK(r.continueHeaders);
+    oWide.MarkHeaderRequest(7);
+    r = oWide.ObserveHeaders(7, Batch(2002, 4001));
     BOOST_CHECK(r.continueHeaders);
     BOOST_CHECK(r.continuationLocator.front() == OH(4001));
+    // The 512-window observer (cap 2512) stops once the graph is ahead of the
+    // cap: the lookahead 4000 has reached it, so no further continuation.
+    o.MarkHeaderRequest(7);
+    r = o.ObserveHeaders(7, Batch(2002, 4001));
+    BOOST_CHECK(!r.continueHeaders);
+    BOOST_CHECK(r.continuationLocator.empty());
     BOOST_REQUIRE(o.Graph().ActiveTip());
     BOOST_CHECK(o.Graph().ActiveTip()->height == 4000);
+}
+
+BOOST_AUTO_TEST_CASE(bounded_lookahead_defaults_and_explicit_cap)
+{
+    // Stage 3: cap = window + CAP_MARGIN, resume = window + RESUME_MARGIN.
+    CIbdHeadersObserver o(512);
+    BOOST_CHECK_EQUAL(o.LookaheadCap(),
+                      (std::size_t)(512 + IBD_HEADER_LOOKAHEAD_CAP_MARGIN));
+    BOOST_CHECK_EQUAL(o.LookaheadResume(),
+                      (std::size_t)(512 + IBD_HEADER_LOOKAHEAD_RESUME_MARGIN));
+    o.SetLookaheadCap(3000, 2000);
+    BOOST_CHECK_EQUAL(o.LookaheadCap(), 3000U);
+    BOOST_CHECK_EQUAL(o.LookaheadResume(), 2000U);
+}
+
+BOOST_AUTO_TEST_CASE(bounded_lookahead_gate_stops_at_cap_and_resumes_after_anchor)
+{
+    CIbdHeadersObserver o(512); o.SetEnabled(true);
+    o.SetLookaheadCap(3000, 2000);
+    BOOST_REQUIRE(o.UpdateAnchor(OH(1), 0));
+    o.MarkHeaderRequest(7);
+    CIbdHeadersObserver::HeaderResult r = o.ObserveHeaders(7, Batch(2, 2001));
+    BOOST_CHECK(r.continueHeaders);
+    BOOST_REQUIRE(!r.continuationLocator.empty());
+    // Exactly at the cap the continuation stops.
+    o.MarkHeaderRequest(7);
+    r = o.ObserveHeaders(7, Batch(2002, 3001));
+    BOOST_CHECK(!r.continueHeaders);
+    BOOST_CHECK(r.continuationLocator.empty());
+    BOOST_REQUIRE(o.Graph().ActiveTip());
+    BOOST_CHECK(o.Graph().ActiveTip()->height == 3000);
+    // The frontier advances (blocks consumed), the lookahead decays back under
+    // the cap, and continuation re-enables (hysteresis resume).
+    BOOST_REQUIRE(o.UpdateAnchor(OH(1001), 1000));
+    o.MarkHeaderRequest(7);
+    r = o.ObserveHeaders(7, Batch(3002, 3501), 500);
+    BOOST_CHECK(r.continueHeaders);
+    BOOST_REQUIRE(!r.continuationLocator.empty());
+    BOOST_CHECK(r.continuationLocator.front() == OH(3501));
 }
 
 BOOST_AUTO_TEST_CASE(mixed_peer_support_duplicates_and_divergence)

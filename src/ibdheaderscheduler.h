@@ -15,6 +15,18 @@
 #include <vector>
 
 /**
+ * Bounded header lookahead (Stage 3): the header graph may run at most
+ * (window + CAP_MARGIN) ahead of the anchor (connected frontier).  Header
+ * continuation stops once that cap is reached; fetching resumes when the
+ * lookahead decays to (window + RESUME_MARGIN), keeping a delivery margin so
+ * the ordered block pipeline window stays full.  The cap bounds both graph
+ * memory and BuildContinuationLocator cost (O(lookahead) per continuation).
+ * Synced from the configurable block window W (-ibdblockwindow) at runtime.
+ */
+static const std::size_t IBD_HEADER_LOOKAHEAD_CAP_MARGIN = 2000;
+static const std::size_t IBD_HEADER_LOOKAHEAD_RESUME_MARGIN = 1000;
+
+/**
  * Scheduler-only structural knowledge about one header hash.
  *
  * This type carries no proof or consensus-validity claim.  In particular it
@@ -228,6 +240,18 @@ public:
     std::size_t WindowSize() const { return m_window_size; }
 
     /**
+     * Stage 3 bounded lookahead: cap is the maximum lookahead (graph tip
+     * height - anchor height) at which header continuation stops; resume is
+     * the lookahead at which the runtime re-fetches headers.  Synced from the
+     * configurable block window W: cap = W + CAP_MARGIN, resume = W +
+     * RESUME_MARGIN.
+     */
+    void SetLookaheadCap(std::size_t cap, std::size_t resume)
+    { m_lookahead_cap = cap; m_lookahead_resume = resume; }
+    std::size_t LookaheadCap() const { return m_lookahead_cap; }
+    std::size_t LookaheadResume() const { return m_lookahead_resume; }
+
+    /**
      * Number of m_sources entries examined during the most recent
      * UpdateAnchor call.  Exposed for deterministic regression tests: normal
      * fast anchor advancement must not examine any source record, regardless
@@ -241,6 +265,8 @@ public:
 private:
     bool m_enabled;
     std::size_t m_window_size;
+    std::size_t m_lookahead_cap;
+    std::size_t m_lookahead_resume;
     CIbdHeaderGraph m_graph;
     std::set<int64_t> m_outstanding_peers;
     std::map<uint256, std::set<int64_t> > m_sources;

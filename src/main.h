@@ -495,6 +495,10 @@ void SeedIbdHeaderSchedulerInvAvailabilityForTesting(NodeId peer,
     const uint256& hash);
 size_t RefillOrderedHeaderBlockRequestsForTesting(
     const std::vector<CNode*>& vNodesCopy);
+// Stage 3 bounded lookahead: expose the request prelude so tests can verify
+// that header requests are refused once the graph is at the lookahead cap.
+bool PrepareIbdHeadersObserverRequestForTesting(CNode* pnode,
+    CBlockLocator& locatorOut);
 struct IbdHeaderSchedulerRefillStats
 {
     uint64_t incrementalRefillCalls, fullRefillCalls;

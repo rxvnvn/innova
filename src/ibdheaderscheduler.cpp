@@ -617,6 +617,8 @@ CIbdHeadersObserver::Counters::Counters()
 
 CIbdHeadersObserver::CIbdHeadersObserver(std::size_t windowSize)
     : m_enabled(false), m_window_size(windowSize),
+      m_lookahead_cap(windowSize + IBD_HEADER_LOOKAHEAD_CAP_MARGIN),
+      m_lookahead_resume(windowSize + IBD_HEADER_LOOKAHEAD_RESUME_MARGIN),
       m_lastAnchorSourceSweepExamined(0)
 {
 }
@@ -749,7 +751,15 @@ CIbdHeadersObserver::HeaderResult CIbdHeadersObserver::ObserveHeaders(
         ++m_counters.activeBranchSwitches;
     result.continueHeaders = result.expectedResponse && oldTip != newTip &&
                              continuationBatchSize > 0 &&
-                             headers.size() >= continuationBatchSize;
+                             headers.size() >= continuationBatchSize &&
+                             // Stage 3 bounded lookahead: continuation stops
+                             // once the graph tip reaches the cap, so the
+                             // graph never races an unbounded distance ahead
+                             // of the connected frontier.  oldTip != newTip
+                             // guarantees ActiveTip() is non-null here.
+                             (std::size_t)(m_graph.ActiveTip()->height -
+                                           m_graph.AnchorHeight()) <
+                                 m_lookahead_cap;
     if (result.continueHeaders) result.continuationLocator = m_graph.BuildContinuationLocator();
     return result;
 }

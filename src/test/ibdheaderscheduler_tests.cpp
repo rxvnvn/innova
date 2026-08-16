@@ -78,6 +78,22 @@ static CIbdHeaderGraph BuildLinearLookahead(std::size_t lookahead)
     return graph;
 }
 
+// Extend the active chain of `graph` by `count` headers on top of the current
+// tip (height `tipHeight`), keeping the chain linear.
+static void ExtendChain(CIbdHeaderGraph& graph, uint64_t& tipHeight,
+                        std::size_t count)
+{
+    std::vector<std::pair<uint256, uint256> > batch;
+    batch.reserve(count);
+    for (std::size_t i = 0; i < count; ++i)
+        batch.push_back(std::make_pair(H(1 + tipHeight + 1 + i),
+                                       H(1 + tipHeight + i)));
+    const std::vector<CIbdHeaderGraph::InsertResult> results =
+        graph.InsertBatch(batch);
+    BOOST_REQUIRE_EQUAL(results.size(), count);
+    tipHeight += count;
+}
+
 // Compare every observable aspect of two graphs that received identical op
 // sequences.  `hashes` must contain every hash ever inserted into either graph.
 // On divergence, details are written to stderr and false is returned.
@@ -794,6 +810,166 @@ BOOST_AUTO_TEST_CASE(mark_active_path_differential_matches_legacy)
         }
         BOOST_REQUIRE_MESSAGE(RequireEquivalentState(fastGraph, legacyGraph, known, iter),
                               "differential state divergence at iter " << iter);
+    }
+}
+
+// Synthetic discriminator for bounded header lookahead, calibrated on run-132:
+// IBD_HEADERS_SCHEDULER_WINDOW=512 and continuationBatchSize=2000 in
+// production; block consumption up to ~68 blocks/s with peer RTT up to ~10.5s
+// give a minimal lookahead W + r*tau ~ 1.3k.  The operating band
+// [lookaheadLow=2048, lookaheadHigh=4096] below keeps the ordered block
+// pipeline window permanently full while the active lookahead never grows
+// beyond the cap.
+BOOST_AUTO_TEST_CASE(capped_lookahead_keeps_block_window_full)
+{
+    const std::size_t windowSize = 512;
+    const std::size_t batchSize = 2000;
+    const uint64_t lookaheadLow = 2048;
+    const uint64_t lookaheadHigh = 4096;
+    const uint64_t chainBlocks = 100000;
+
+    CIbdHeaderGraph graph;
+    BOOST_REQUIRE(graph.SetAuthoritativeAnchor(H(1), 0));
+
+    uint64_t tipHeight = 0;
+    uint64_t frontier = 0;
+    while (frontier < chainBlocks)
+    {
+        // Resume header fetching once the active lookahead drops to the low
+        // threshold (analogous to the continuation gate in ObserveHeaders).
+        if (tipHeight - frontier <= lookaheadLow)
+        {
+            ExtendChain(graph, tipHeight, batchSize);
+            // Replenishment of one batch must not overshoot the cap.
+            BOOST_CHECK(tipHeight - frontier <= lookaheadHigh);
+        }
+        ++frontier;
+        if (frontier > chainBlocks)
+            break;
+        // Ordered block pipeline: the window served from the validated tip
+        // must stay completely full at every frontier.
+        const std::vector<uint256> window =
+            graph.GetActiveWindow(H(1 + frontier), windowSize);
+        BOOST_REQUIRE_MESSAGE(window.size() == windowSize,
+                              "pipeline window starved at frontier "
+                              << frontier << " lookahead "
+                              << (tipHeight - frontier));
+        // The validated tip becomes the new anchor; with a bounded graph the
+        // anchor must keep up on the sequential fast path alone.
+        BOOST_REQUIRE(graph.Reanchor(H(1 + frontier), (int)frontier));
+    }
+
+    BOOST_CHECK_EQUAL(graph.AnchorHeight(), (int)chainBlocks);
+    BOOST_CHECK_EQUAL(graph.FullReanchorCount(), (uint64_t)0);
+    BOOST_REQUIRE(graph.ActiveTip() != NULL);
+    BOOST_CHECK(graph.ActiveTip()->height == (int)tipHeight);
+    // The bounded lookahead tail never leaves the operating band.
+    BOOST_CHECK(tipHeight - chainBlocks >= windowSize);
+    BOOST_CHECK(tipHeight - chainBlocks <= lookaheadHigh);
+    BOOST_CHECK_EQUAL(graph.Size(), 1 + tipHeight);
+}
+
+// Margin semantics: the window is full exactly when lookahead >= windowSize,
+// and maintenance may be deferred for up to (lookaheadLow - windowSize)
+// consumed blocks (the r*tau delivery margin) without starving the pipeline.
+BOOST_AUTO_TEST_CASE(capped_lookahead_margin_and_stall)
+{
+    const std::size_t windowSize = 512;
+    const std::size_t batchSize = 2000;
+    const uint64_t lookaheadLow = 2048;
+    const uint64_t lookaheadHigh = 4096;
+    const uint64_t margin = lookaheadLow - windowSize;
+
+    // Boundary: the window is full exactly at lookahead == windowSize, and
+    // truncates one node short of it.
+    {
+        CIbdHeaderGraph g = BuildLinearLookahead(windowSize);
+        BOOST_CHECK_EQUAL(g.GetActiveWindow(H(1), windowSize).size(),
+                          windowSize);
+        CIbdHeaderGraph gShort = BuildLinearLookahead(windowSize - 1);
+        BOOST_CHECK_EQUAL(gShort.GetActiveWindow(H(1), windowSize).size(),
+                          windowSize - 1);
+    }
+
+    // Stall stress: with maintenance deferred for the full margin the window
+    // must remain full; a single batch then restores the operating band.
+    {
+        CIbdHeaderGraph graph;
+        BOOST_REQUIRE(graph.SetAuthoritativeAnchor(H(1), 0));
+        uint64_t tipHeight = 0;
+        uint64_t frontier = 0;
+        // Top the graph up into the operating band first.
+        while (tipHeight < lookaheadLow + windowSize)
+            ExtendChain(graph, tipHeight, batchSize);
+        // Drop to exactly the resume threshold.
+        while (tipHeight - frontier > lookaheadLow)
+            ++frontier;
+        for (uint64_t burst = 0; burst < 2; ++burst)
+        {
+            // No maintenance for the full margin: window must stay full.
+            for (uint64_t k = 0; k < margin; ++k)
+            {
+                ++frontier;
+                const std::vector<uint256> window =
+                    graph.GetActiveWindow(H(1 + frontier), windowSize);
+                BOOST_REQUIRE_MESSAGE(window.size() == windowSize,
+                                      "margin stall starved at frontier "
+                                      << frontier << " lookahead "
+                                      << (tipHeight - frontier));
+            }
+            // One batch refills the band without overshooting the cap.
+            ExtendChain(graph, tipHeight, batchSize);
+            BOOST_CHECK(tipHeight - frontier <= lookaheadHigh);
+        }
+    }
+}
+
+// Differential: a capped graph must serve the block pipeline the same ordered
+// window as a graph holding the entire unbounded chain, at every frontier.
+BOOST_AUTO_TEST_CASE(capped_lookahead_window_matches_unbounded)
+{
+    const std::size_t windowSize = 512;
+    const std::size_t batchSize = 2000;
+    const uint64_t lookaheadLow = 2048;
+    const uint64_t lookaheadHigh = 4096;
+    const uint64_t chainBlocks = 20000;
+
+    CIbdHeaderGraph capped;
+    CIbdHeaderGraph unbounded;
+    BOOST_REQUIRE(capped.SetAuthoritativeAnchor(H(1), 0));
+    BOOST_REQUIRE(unbounded.SetAuthoritativeAnchor(H(1), 0));
+
+    std::vector<std::pair<uint256, uint256> > all;
+    all.reserve(chainBlocks);
+    for (uint64_t i = 0; i < chainBlocks; ++i)
+        all.push_back(std::make_pair(H(1 + i + 1), H(1 + i)));
+    BOOST_REQUIRE_EQUAL(unbounded.InsertBatch(all).size(), chainBlocks);
+
+    uint64_t tipHeight = 0;
+    for (uint64_t frontier = 1; frontier <= chainBlocks; ++frontier)
+    {
+        // Resume fetching only while the chain end has not been reached; near
+        // the tip the graph stops advancing and the window truncates naturally
+        // (sync completion, not starvation).
+        if (tipHeight - (frontier - 1) <= lookaheadLow && tipHeight < chainBlocks)
+        {
+            const std::size_t count = (std::size_t)std::min(
+                (uint64_t)batchSize, chainBlocks - tipHeight);
+            ExtendChain(capped, tipHeight, count);
+        }
+        BOOST_CHECK(tipHeight - (frontier - 1) <= lookaheadHigh);
+        const std::vector<uint256> cw =
+            capped.GetActiveWindow(H(1 + frontier), windowSize);
+        const std::vector<uint256> uw =
+            unbounded.GetActiveWindow(H(1 + frontier), windowSize);
+        BOOST_REQUIRE_MESSAGE(cw == uw,
+                              "window divergence at frontier " << frontier);
+        // Full window ahead of the frontier, exactly while blocks remain.
+        if (frontier + windowSize <= chainBlocks)
+            BOOST_REQUIRE_EQUAL(cw.size(), windowSize);
+        else
+            BOOST_REQUIRE_EQUAL(cw.size(),
+                                (std::size_t)(chainBlocks - frontier));
     }
 }
 

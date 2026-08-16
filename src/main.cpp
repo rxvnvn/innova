@@ -374,8 +374,20 @@ static bool PrepareIbdHeadersObserverRequest(CNode* pnode, CBlockLocator& locato
         pnode->fOneShot || !IsInitialBlockDownload() || !pindexBest)
         return false;
     g_ibdHeadersObserver.SetEnabled(true);
+    g_ibdHeadersObserver.SetLookaheadCap(
+        GetIbdBlockWindow() + IBD_HEADER_LOOKAHEAD_CAP_MARGIN,
+        GetIbdBlockWindow() + IBD_HEADER_LOOKAHEAD_RESUME_MARGIN);
     if (!g_ibdHeadersObserver.UpdateAnchor(pindexBest->GetBlockHash(),
                                            pindexBest->nHeight))
+        return false;
+    // Stage 3 bounded lookahead: never issue a header request when the graph
+    // already holds at least the cap ahead of the frontier.  The graph tip
+    // cannot be pushed beyond the cap by a new batch, BuildContinuationLocator
+    // cost stays bounded, and this also guards the timeout/retry paths from
+    // re-requesting headers that are already in hand.
+    const CIbdHeaderNode* graphTip = g_ibdHeadersObserver.Graph().ActiveTip();
+    if (graphTip && graphTip->height - pindexBest->nHeight >=
+            (int)(GetIbdBlockWindow() + IBD_HEADER_LOOKAHEAD_CAP_MARGIN))
         return false;
     const std::vector<uint256> hashes =
         g_ibdHeadersObserver.Graph().BuildContinuationLocator();
@@ -1192,6 +1204,9 @@ static size_t RefillOrderedHeaderBlockRequests(
         return 0;
 
     g_ibdHeadersObserver.SetEnabled(true);
+    g_ibdHeadersObserver.SetLookaheadCap(
+        GetIbdBlockWindow() + IBD_HEADER_LOOKAHEAD_CAP_MARGIN,
+        GetIbdBlockWindow() + IBD_HEADER_LOOKAHEAD_RESUME_MARGIN);
     if (!g_ibdHeadersObserver.UpdateAnchor(pindexBest->GetBlockHash(),
                                            pindexBest->nHeight))
         return 0;
@@ -1404,6 +1419,23 @@ static size_t RefillOrderedHeaderBlockRequests(
                pto->GetId(), pindexBest->nHeight,
                graphTip ? graphTip->height : -1, nLookahead);
         return nRecoveryAdmitted;
+    }
+    // Stage 3 proactive resume: the header lookahead has decayed into the
+    // resume band [W, W+RESUME_MARGIN].  At this point the block window is
+    // still full, but the delivery margin is low; top the header graph back
+    // up without stalling the block admission walk.  Guarded by the per-peer
+    // continuation-in-flight state; in incremental mode the cursor window is
+    // already captured, so topping up headers is deferred to the next full
+    // refill pass.
+    if (!incremental && nLookahead >= 0 &&
+        (uint64_t)nLookahead >= GetIbdBlockWindow() &&
+        (uint64_t)nLookahead <=
+            GetIbdBlockWindow() + IBD_HEADER_LOOKAHEAD_RESUME_MARGIN)
+    {
+        CBlockLocator locator;
+        if (!pto->getHeadersSync.IsInFlight() &&
+            PrepareIbdHeadersObserverRequest(pto, locator))
+            pto->PushHeadersContinuation(locator, uint256(0), "ibd-select-topup");
     }
 
     // Per-peer admission budgets: the round owner walks the ordered window
@@ -1659,6 +1691,13 @@ size_t RefillOrderedHeaderBlockRequestsForTesting(
          it != vNodesCopy.end(); ++it)
         nTotal += RefillOrderedHeaderBlockRequests(*it, vNodesCopy);
     return nTotal;
+}
+
+bool PrepareIbdHeadersObserverRequestForTesting(CNode* pnode,
+    CBlockLocator& locatorOut)
+{
+    LOCK(cs_main);
+    return PrepareIbdHeadersObserverRequest(pnode, locatorOut);
 }
 
 IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting()
