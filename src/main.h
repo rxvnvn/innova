@@ -477,6 +477,11 @@ void IbdHeadersObserverPeerDisconnected(NodeId peer);
 void InvalidateIbdHeaderSchedulerRefillCursor();
 void MarkIbdHeaderSchedulerRecoveryNeeded();
 
+// Effective ordered-IBD block request window (W); see -ibdblockwindow.
+// Test hook: force the cached value to reload from mapArgs on the next call.
+std::size_t GetIbdBlockWindow();
+void ResetIbdBlockWindowConfigForTesting();
+
 void AdvanceIbdHeaderSchedulerRound();
 void ResetIbdHeaderSchedulerStateForTesting();
 bool SeedIbdHeaderSchedulerAnchorForTesting(const uint256& hash, int height);

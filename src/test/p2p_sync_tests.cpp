@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -22,6 +23,7 @@
 #include "ibdactivepath.h"
 #include "ibdefficiency.h"
 #include "ibdforensic.h"
+#include "ibdheaderscheduler.h"
 #include "innovarpc.h"
 #include "kernel.h"
 #include "main.h"
@@ -4049,7 +4051,7 @@ BOOST_AUTO_TEST_CASE(large_inv_does_not_create_unbounded_active_queue)
         BOOST_CHECK_EQUAL(RefillDeferredBlockRequests(&peer), 0U);
     }
     BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(),
-                      (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+                      GetMaxActiveBlockRequestsPerPeer());
     BOOST_CHECK_EQUAL(peer.deferredBlockInv.size(), 1U);
     peer.ClearAskFor();
 }
@@ -4091,7 +4093,7 @@ BOOST_AUTO_TEST_CASE(global_active_window_sum_is_bounded)
         peerD.setAskForBlocks.size() +
         peerD.setBlocksInFlight.size();
     BOOST_CHECK(nGlobalActive <=
-                (size_t)MAX_DEFERRED_INV_ACTIVE_GLOBAL);
+                GetMaxActiveBlockRequestsGlobal());
 
     {
         LOCK(cs_vNodes);
@@ -6248,7 +6250,7 @@ BOOST_AUTO_TEST_CASE(request_budget_zero_at_full_peer_request_window_regardless_
         mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
         BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peer), 0);
         BOOST_CHECK_EQUAL(peer.setAskForBlocks.size() + peer.setBlocksInFlight.size(),
-                          (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+                          GetMaxActiveBlockRequestsPerPeer());
     }
     peer.ClearAskFor();
 }
@@ -6332,7 +6334,7 @@ BOOST_AUTO_TEST_CASE(orphan_storage_cap_remains_enforced_independently_of_reques
         mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
         BOOST_CHECK(PeerOrphanStorageLimitExceeded(peer.GetId(), NULL));
         BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peer),
-                          (int)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+                          (int)GetMaxActiveBlockRequestsPerPeer());
     }
     peer.ClearAskFor();
 }
@@ -6404,7 +6406,7 @@ BOOST_AUTO_TEST_CASE(malicious_unrelated_inv_traffic_cannot_exceed_active_reques
     }
     BOOST_CHECK_EQUAL(nAdmitted, 0U);
     BOOST_CHECK_EQUAL(peer.setAskForBlocks.size() + peer.setBlocksInFlight.size(),
-                      (size_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+                      GetMaxActiveBlockRequestsPerPeer());
     BOOST_CHECK(peer.deferredBlockInv.size() <=
                 (size_t)MAX_DEFERRED_BLOCK_INV_PER_PEER);
     peer.ClearAskFor();
@@ -6421,7 +6423,7 @@ BOOST_AUTO_TEST_CASE(terminal_stall_remains_fixed_after_request_window_drain)
         LOCK(cs_main);
         mapOrphanCountByNode[peer.GetId()] = MAX_ORPHAN_BLOCKS_PER_PEER;
     }
-    const uint256 deferred(934000);
+    const uint256 deferred(940000);
     {
         LOCK(cs_main);
         BOOST_CHECK(peer.DeferBlockInv(deferred));
@@ -6442,7 +6444,7 @@ BOOST_AUTO_TEST_CASE(terminal_stall_remains_fixed_after_request_window_drain)
     peer.ClearAskFor();
 }
 
-BOOST_AUTO_TEST_CASE(ibd_per_peer_cap_default_128)
+BOOST_AUTO_TEST_CASE(ibd_per_peer_cap_default_scaled_with_window)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
     CScopedOrphanCountByNode isolatedOrphanCounts;
@@ -6550,7 +6552,7 @@ BOOST_AUTO_TEST_CASE(ibd_per_peer_cap_respects_global_512)
         LOCK(cs_main);
         BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peerC), 0);
         BOOST_CHECK(GetMaxActiveBlockRequestsPerPeer() <=
-                    MAX_DEFERRED_INV_ACTIVE_GLOBAL);
+                    GetMaxActiveBlockRequestsGlobal());
     }
 
     peerA.ClearAskFor();
@@ -6876,7 +6878,7 @@ BOOST_AUTO_TEST_CASE(diversify_keeps_announcer_when_no_other_capacity)
     pfrom.nLastHeightUpdate = GetTime();
     FillPeerActiveWindow(lane, 931000);
     BOOST_CHECK_EQUAL(lane.peerLiveActivePressure.load(),
-                      (int32_t)MAX_DEFERRED_INV_ACTIVE_PER_PEER);
+                      (int32_t)GetMaxActiveBlockRequestsPerPeer());
     const uint256 hash(930001);
     {
         LOCK(cs_main);
@@ -10089,6 +10091,169 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_branch_switch_barrier_purges_only_obsolet
 
     std::vector<std::pair<uint256, uint256> > oldHeaders;
     oldHeaders.push_back(std::make_pair(a1, anchor));
+// Stage 1 discriminator: -ibdblockwindow parsing and clamping.
+BOOST_AUTO_TEST_CASE(ibd_block_window_config_clamping)
+{
+    const std::map<std::string, std::string> mapArgsSaved = mapArgs;
+
+    ResetIbdBlockWindowConfigForTesting();
+    mapArgs.erase("-ibdblockwindow");
+    BOOST_CHECK_EQUAL(GetIbdBlockWindow(), (std::size_t)8192);
+
+    const std::size_t cases[][2] = {
+        {100, 512},      // below min clamps to min
+        {512, 512},      // min accepted
+        {1024, 1024},    // valid mid
+        {8192, 8192},    // default-size valid
+        {16384, 16384},  // max accepted
+        {20000, 16384},  // above max clamps to max
+    };
+    for (std::size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i)
+    {
+        ResetIbdBlockWindowConfigForTesting();
+        mapArgs["-ibdblockwindow"] = itostr((int)cases[i][0]);
+        BOOST_CHECK_EQUAL(GetIbdBlockWindow(), cases[i][1]);
+    }
+
+    // Non-numeric falls back to the default.
+    ResetIbdBlockWindowConfigForTesting();
+    mapArgs["-ibdblockwindow"] = "abc";
+    BOOST_CHECK_EQUAL(GetIbdBlockWindow(), (std::size_t)8192);
+
+    mapArgs = mapArgsSaved;
+    ResetIbdBlockWindowConfigForTesting();
+}
+
+// Stage 1 discriminator: with the configured window at the old default 512,
+// Stage 1 discriminator: the examined refill window scales with the
+// configured W (512) and, once the budget scales (Stage 2), the refill fills
+// the whole window.  fullEntriesExamined equals the examined ordered window.
+BOOST_AUTO_TEST_CASE(headers_scheduler_refill_window_scales_with_config_small)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    const std::map<std::string, std::string> mapArgsSaved = mapArgs;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(94), "sched-window-small", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    ResetIbdBlockWindowConfigForTesting();
+    mapArgs["-ibdblockwindow"] = "512";
+
+    const uint256 anchor(3000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.reserve(9000);
+    uint256 previous = anchor;
+    for (int i = 1; i <= 9000; ++i)
+    {
+        const uint256 hash(3000000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    for (int i = 1; i <= 9000; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(),
+                                                        uint256(3000000 + i));
+
+    std::vector<CNode*> peers(1, &peer);
+    // W=512, one serving peer -> scaled per-peer budget 512, so the refill is
+    // window-limited and fills the whole examined window contiguously.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 512U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 512U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(3000001)));
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(3000512)));
+    BOOST_CHECK(!peer.IsBlockAskForQueued(uint256(3000513)));
+    {
+        const IbdHeaderSchedulerRefillStats stats =
+            GetIbdHeaderSchedulerRefillStatsForTesting();
+        BOOST_CHECK_EQUAL(stats.fullRefillCalls, 1U);
+        BOOST_CHECK_EQUAL(stats.fullEntriesExamined, 512U);
+    }
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    mapArgs = mapArgsSaved;
+    ResetIbdBlockWindowConfigForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// Stage 1 discriminator: the examined refill window scales with the
+// configured W (8192) while admission stays budget-limited (scaled per-peer
+// budget 2048 with one serving peer).  fullEntriesExamined equals the
+// examined ordered window.
+BOOST_AUTO_TEST_CASE(headers_scheduler_refill_window_scales_with_config_wide)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    const std::map<std::string, std::string> mapArgsSaved = mapArgs;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(95), "sched-window-wide", true);
+    PreparePeerForSendMessages(peer, PROTOCOL_VERSION);
+    // Stage 3 proactive resume may push getheaders during the refill; install
+    // a live socket so the optimistic write (EndMessage -> SocketSendData)
+    // does not disconnect this INVALID_SOCKET peer before admission.
+    ScopedPeerSocket peerSocket(peer);
+    CScopedInitialBlockDownloadState ibdState(&peer);
+
+    ResetIbdBlockWindowConfigForTesting();
+    mapArgs["-ibdblockwindow"] = "8192";
+
+    const uint256 anchor(4000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.reserve(9000);
+    uint256 previous = anchor;
+    for (int i = 1; i <= 9000; ++i)
+    {
+        const uint256 hash(4000000 + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peer.GetId(), headers));
+    for (int i = 1; i <= 9000; ++i)
+        SeedIbdHeaderSchedulerInvAvailabilityForTesting(peer.GetId(),
+                                                        uint256(4000000 + i));
+
+    std::vector<CNode*> peers(1, &peer);
+    // W=8192, one serving peer -> scaled per-peer budget capped at 2048, so
+    // admission stays budget-limited while the examined window is the full W.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 2048U);
+    BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 2048U);
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(4000001)));
+    BOOST_CHECK(peer.IsBlockAskForQueued(uint256(4002048)));
+    BOOST_CHECK(!peer.IsBlockAskForQueued(uint256(4002049)));
+    {
+        const IbdHeaderSchedulerRefillStats stats =
+            GetIbdHeaderSchedulerRefillStatsForTesting();
+        BOOST_CHECK_EQUAL(stats.fullRefillCalls, 1U);
+        BOOST_CHECK_EQUAL(stats.fullEntriesExamined, 8192U);
+    }
+
+    peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    mapArgs = mapArgsSaved;
+    ResetIbdBlockWindowConfigForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
     oldHeaders.push_back(std::make_pair(a2, a1));
     oldHeaders.push_back(std::make_pair(a3, a2));
     oldHeaders.push_back(std::make_pair(a4, a3));

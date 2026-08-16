@@ -115,7 +115,56 @@ bool fIbdHeadersObserve = false;
 bool fIbdHeaderScheduler = false;
 bool fRegTestIbd = false;
 static CIbdHeadersObserver g_ibdHeadersObserver(512); // OBSERVATION WINDOW, not policy
-static const std::size_t IBD_HEADERS_SCHEDULER_WINDOW = 512; // EXPERIMENTAL A/B WINDOW
+
+namespace
+{
+
+// Default effective ordered-IBD block request window.
+static const std::size_t IBD_HEADERS_SCHEDULER_WINDOW_DEFAULT = 8192;
+
+// Effective ordered-IBD block request window (W): how many heights ahead of
+// the frontier the scheduler may hold as candidate work.  Loaded lazily from
+// -ibdblockwindow on first use so the argument is read exactly once; unit
+// tests reload it through ResetIbdBlockWindowConfigForTesting().
+std::size_t g_nIbdBlockWindowConfigured = IBD_HEADERS_SCHEDULER_WINDOW_DEFAULT;
+bool g_nIbdBlockWindowLoaded = false;
+
+std::size_t LoadIbdBlockWindowConfig()
+{
+    const std::size_t nMin = 512;
+    const std::size_t nMax = 16384;
+    std::size_t nRaw = IBD_HEADERS_SCHEDULER_WINDOW_DEFAULT;
+    if (mapArgs.count("-ibdblockwindow"))
+    {
+        int64_t nParse = 0;
+        if (ParseInt64(mapArgs["-ibdblockwindow"], &nParse) && nParse >= 1)
+            nRaw = (std::size_t)nParse;
+    }
+    if (nRaw < nMin)
+        nRaw = nMin;
+    if (nRaw > nMax)
+        nRaw = nMax;
+    return nRaw;
+}
+
+} // namespace
+
+std::size_t GetIbdBlockWindow()
+{
+    if (!g_nIbdBlockWindowLoaded)
+    {
+        g_nIbdBlockWindowConfigured = LoadIbdBlockWindowConfig();
+        g_nIbdBlockWindowLoaded = true;
+        ibdmetrics::Get().scheduler_block_window.store(
+            (int64_t)g_nIbdBlockWindowConfigured, std::memory_order_relaxed);
+    }
+    return g_nIbdBlockWindowConfigured;
+}
+
+void ResetIbdBlockWindowConfigForTesting()
+{
+    g_nIbdBlockWindowLoaded = false;
+}
 
 bool IbdHeadersControlPlaneEnabled()
 {
@@ -1176,7 +1225,7 @@ static size_t RefillOrderedHeaderBlockRequests(
     {
         const std::vector<uint256> newBranchWindow =
             graph.GetActiveWindow(hashFrontier,
-                                  IBD_HEADERS_SCHEDULER_WINDOW);
+                                  GetIbdBlockWindow());
         PurgeObsoleteOrderedQueuedWork(
             g_ibdHeaderSchedulerState.cursorWindow,
             newBranchWindow, vNodesCopy);
@@ -1239,7 +1288,7 @@ static size_t RefillOrderedHeaderBlockRequests(
         if (nB == NULL || !nB->IsAnchored() ||
             nB->height <= pindexBest->nHeight ||
             (size_t)(nB->height - pindexBest->nHeight) >
-                IBD_HEADERS_SCHEDULER_WINDOW)
+                GetIbdBlockWindow())
             g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.erase(
                 itB++);
         else
@@ -1322,7 +1371,7 @@ static size_t RefillOrderedHeaderBlockRequests(
     if (!incremental)
     {
         window = graph.GetActiveWindow(hashFrontier,
-                                       IBD_HEADERS_SCHEDULER_WINDOW);
+                                       GetIbdBlockWindow());
         ++g_ibdHeaderSchedulerState.fullRefillCalls;
         g_ibdHeaderSchedulerState.fullEntriesExamined += window.size();
     }
@@ -1672,7 +1721,7 @@ IbdOrderedExpiryOutcome IbdHeaderSchedulerOrderedExpiryDecide(
     // nGap == 1 is the current contiguous-prefix blocker.  It keeps the
     // ordinary wire deadline: historical progress since admission must not
     // protect a descendant after it becomes the ordered head.
-    if (nGap > 1 && (size_t)nGap <= IBD_HEADERS_SCHEDULER_WINDOW &&
+    if (nGap > 1 && (size_t)nGap <= GetIbdBlockWindow() &&
         pindexBest->nHeight > itBaseline->second && nWireUs > 0 &&
         nNowUs - nWireUs < IBD_ORDERED_MAX_WIRE_AGE_US)
     {

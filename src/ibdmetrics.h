@@ -359,6 +359,10 @@ struct Counters
     std::atomic<int64_t> refill_txdb_opens;
     std::atomic<int64_t> refill_alreadyhave_checks;
 
+    // Effective ordered-IBD block request window (W) in effect for this
+    // process; set from -ibdblockwindow on first scheduler window read.
+    std::atomic<int64_t> scheduler_block_window;
+
     std::atomic<int64_t> block_receive_total;
     std::atomic<int64_t> block_result_accepted_active;
     std::atomic<int64_t> block_result_orphan_new;
