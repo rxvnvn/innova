@@ -6280,15 +6280,19 @@ BOOST_AUTO_TEST_CASE(request_budget_zero_at_global_request_cap)
     }
     {
         LOCK(cs_main);
-        // Four full peers (including the fixture-registered peerA) reach the
-        // 512 global request cap; a peer with none of its own requests still
-        // gets a zero global budget.
-        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peerE), 0);
-        int nPeer = -1, nGlobal = -1;
+        // With the default wide window the global cap is W + HR.  Four peers
+        // each fill their per-peer share, leaving exactly the head-prefix
+        // redundancy margin HR unused; a peer with none of its own requests
+        // can only claim that remaining headroom.
+        const int nExpectedRemaining = GetIbdHeaderRedundancyPrefixHeight();
+        BOOST_CHECK_EQUAL(GetDeferredBlockRequestBudget(&peerE),
+                          nExpectedRemaining);
+        int nPeer = -1, nGlobalPressure = -1;
         GetDeferredBlockRequestBudget(&peerE, NULL, NULL, NULL,
-                                      &nPeer, &nGlobal);
+                                      &nPeer, &nGlobalPressure);
         BOOST_CHECK_EQUAL(nPeer, 0);
-        BOOST_CHECK_EQUAL(nGlobal, (int)MAX_DEFERRED_INV_ACTIVE_GLOBAL);
+        BOOST_CHECK_EQUAL(nGlobalPressure,
+            (int)GetMaxActiveBlockRequestsGlobal() - nExpectedRemaining);
     }
     {
         LOCK(cs_vNodes);
@@ -10311,6 +10315,599 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_quality_gate_timeout_cooldown_excludes_pe
     fIbdHeadersObserve = savedObserve;
     fIbdHeaderScheduler = savedScheduler;
 }
+
+// ---------------------------------------------------------------------------
+// Stage 5: selective head-prefix redundancy (logical request / multi-owner).
+//
+// Spec (evidence/ibd-high-bandwidth/production_design.md 1.5 / 1.5A):
+//   - HR = min(256, max(32, W/32)) heights (F, F+HR] get a backup owner on a
+//     DISTINCT qualified peer (physical copies; logical request stays single).
+//   - FIRST ARRIVAL WINS: the first delivered copy completes the logical
+//     request; every other copy becomes a dedup'd duplicate and is never
+//     reprocessed or admitted as an orphan.
+//   - A backup release/expiry does not change the logical request's state;
+//     no reissue while >= 1 copy is healthy.  L is re-issued only when ALL
+//     copies are lost.
+//   - Backup peers must pass the Stage 4 hard quality gate (correlated-slow
+//     peer defense).
+// ---------------------------------------------------------------------------
+struct RedundancyTwoPeerFixture
+{
+    std::unique_ptr<CNode> peerA;
+    std::unique_ptr<CNode> peerB;
+    std::unique_ptr<ScopedPeerSocket> socketA;
+    std::unique_ptr<ScopedPeerSocket> socketB;
+    std::unique_ptr<CScopedInitialBlockDownloadState> ibdState;
+    bool fHadWindowArg;
+    std::string strWindowArgSaved;
+    bool fHadPerPeerArg;
+    std::string strPerPeerArgSaved;
+    // W=512 -> HR = min(256, max(32, 512/32=16)) = 32; HP = 64.
+    static const uint64_t base = 9600000;
+    static const int nHR = 32;
+
+    RedundancyTwoPeerFixture()
+    {
+        fHadWindowArg = mapArgs.count("-ibdblockwindow") != 0;
+        strWindowArgSaved = mapArgs["-ibdblockwindow"];
+        mapArgs["-ibdblockwindow"] = "512";
+        ResetIbdBlockWindowConfigForTesting();
+        // Per-peer budget 512 (explicit override floor) so the 32 redundancy
+        // prefix backups fit on the backup peer without displacing primaries:
+        // physical capacity 2*512 = 1024 >= W + HR = 544.
+        fHadPerPeerArg = mapArgs.count("-ibdmaxactiveperpeer") != 0;
+        strPerPeerArgSaved = mapArgs["-ibdmaxactiveperpeer"];
+        mapArgs["-ibdmaxactiveperpeer"] = "512";
+        ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+
+        peerA.reset(new CNode(INVALID_SOCKET, TestPeerAddress(140),
+                              "redundancy-a", true));
+        peerB.reset(new CNode(INVALID_SOCKET, TestPeerAddress(141),
+                              "redundancy-b", true));
+        PreparePeerForSendMessages(*peerA, PROTOCOL_VERSION);
+        PreparePeerForSendMessages(*peerB, PROTOCOL_VERSION);
+        // A is seeded one window higher, so A wins every primary selection;
+        // B is the backup supplier.
+        socketA.reset(new ScopedPeerSocket(*peerA));
+        socketB.reset(new ScopedPeerSocket(*peerB));
+
+        ibdState.reset(new CScopedInitialBlockDownloadState(peerA.get()));
+        {
+            LOCK(cs_vNodes);
+            vNodes.push_back(peerB.get());
+        }
+
+        const uint256 anchor(base);
+        BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+        const std::vector<std::pair<uint256, uint256> > headers =
+            BuildLinearHeaders(anchor, base, 600);
+        BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA->GetId(),
+                                                              headers));
+        BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB->GetId(),
+                                                              headers));
+        for (int i = 1; i <= 600; ++i)
+        {
+            SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerA->GetId(),
+                                                            uint256(base + i));
+            SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB->GetId(),
+                                                            uint256(base + i));
+        }
+        // Both peers pass the Stage 4 quality gate (>=2 deliveries, no
+        // cooldown, latency <= 1.5x median) so the prefix backups are legal.
+        peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+        peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+        peerB->RecordIbdBlockDelivery(1 * 1000000, false);
+        peerB->RecordIbdBlockDelivery(1 * 1000000, false);
+    }
+
+    ~RedundancyTwoPeerFixture()
+    {
+        peerA->ClearAskFor();
+        peerB->ClearAskFor();
+        ReleaseBlockRequestOwnersForPeer(peerA->GetId(), "disconnect");
+        ReleaseBlockRequestOwnersForPeer(peerB->GetId(), "disconnect");
+        ResetIbdHeaderSchedulerStateForTesting();
+        if (fHadPerPeerArg)
+            mapArgs["-ibdmaxactiveperpeer"] = strPerPeerArgSaved;
+        else
+            mapArgs.erase("-ibdmaxactiveperpeer");
+        ResetMaxActiveBlockRequestsPerPeerConfigForTesting();
+        if (fHadWindowArg)
+            mapArgs["-ibdblockwindow"] = strWindowArgSaved;
+        else
+            mapArgs.erase("-ibdblockwindow");
+        ResetIbdBlockWindowConfigForTesting();
+    }
+};
+
+// Stage 5: full refill admits one logical request per hash (512) plus the
+// redundancy-prefix backup copies (32): every height in (F, F+HR] ends up
+// owned by two DISTINCT peers, every height outside the prefix by exactly one.
+BOOST_AUTO_TEST_CASE(stage5_refill_backup_owner_boundary_inside_redundancy_prefix)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+    CScopedIbdQualityState qualityScope;
+    SetIbdQualityClockForTesting(100 * 1000000);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    RedundancyTwoPeerFixture fixture;
+    std::vector<CNode*> peers;
+    peers.push_back(fixture.peerA.get());
+    peers.push_back(fixture.peerB.get());
+
+    const int64_t activeBefore =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+    // 512 primaries + 32 redundancy-prefix backups.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 544U);
+
+    const uint64_t base = RedundancyTwoPeerFixture::base;
+    for (int h = 1; h <= RedundancyTwoPeerFixture::nHR; ++h)
+    {
+        const uint256 hash(base + h);
+        BOOST_CHECK_MESSAGE(GetBlockRequestOwnerCount(hash) == 2,
+                            "missing backup owner at height " << h);
+        BOOST_CHECK_EQUAL(GetBlockRequestOwnerMaxCopies(hash), 2);
+        std::set<NodeId> owners;
+        GetBlockRequestOwnerPeers(hash, owners);
+        BOOST_CHECK_EQUAL(owners.size(), 2U);
+    }
+    for (int h = RedundancyTwoPeerFixture::nHR + 1; h <= 512; ++h)
+    {
+        const uint256 hash(base + h);
+        BOOST_CHECK_MESSAGE(GetBlockRequestOwnerCount(hash) == 1,
+                            "unexpected backup owner at height " << h);
+        BOOST_CHECK_EQUAL(GetBlockRequestOwnerMaxCopies(hash), 1);
+    }
+
+    // Physical copies: A = 512 primaries, B = 32 backups.
+    BOOST_CHECK_EQUAL(fixture.peerA->setAskForBlocks.size(), 512U);
+    BOOST_CHECK_EQUAL(fixture.peerB->setAskForBlocks.size(), 32U);
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
+            activeBefore, 544LL);
+
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// Stage 5: a backup copy requires a DISTINCT qualified peer.  With a single
+// serving peer no second owner exists; the logical request still records the
+// intended copy count but stays at one slot.
+BOOST_AUTO_TEST_CASE(stage5_refill_single_peer_has_no_backup_copy)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+    CScopedIbdQualityState qualityScope;
+    SetIbdQualityClockForTesting(100 * 1000000);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    RedundancyTwoPeerFixture fixture;
+    std::vector<CNode*> peers(1, fixture.peerA.get());
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 512U);
+
+    const uint64_t base = RedundancyTwoPeerFixture::base;
+    for (int h = 1; h <= RedundancyTwoPeerFixture::nHR; ++h)
+    {
+        const uint256 hash(base + h);
+        // The logical request intends 2 copies, but no distinct peer exists.
+        BOOST_CHECK_EQUAL(GetBlockRequestOwnerMaxCopies(hash), 2);
+        BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 1);
+        std::set<NodeId> owners;
+        GetBlockRequestOwnerPeers(hash, owners);
+        BOOST_CHECK_EQUAL(owners.size(), 1U);
+    }
+    BOOST_CHECK_EQUAL(fixture.peerA->setAskForBlocks.size(), 512U);
+    BOOST_CHECK_EQUAL(fixture.peerB->setAskForBlocks.size(), 0U);
+
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// Stage 5: the redundancy-prefix backup is drawn only from peers that pass
+// the Stage 4 hard quality gate.  A slow peer (40s EWMA) is excluded from the
+// whole head-prefix, so prefix heights keep a SINGLE owner (the fast peer) and
+// the slow peer never receives a redundant copy inside (F, F+HR].
+BOOST_AUTO_TEST_CASE(stage5_refill_backup_restricted_to_qualified_peers)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+    CScopedIbdQualityState qualityScope;
+    SetIbdQualityClockForTesting(100 * 1000000);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    RedundancyTwoPeerFixture fixture;
+    // Redo the quality samples: A fast, B slow (40s EWMA).  The fixture's
+    // constructor already recorded 2x 1ms deliveries on both; overwrite B with
+    // a slow history so only A qualifies for the head-prefix.
+    fixture.peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+    fixture.peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+    fixture.peerB->RecordIbdBlockDelivery(40 * 1000000, false);
+    fixture.peerB->RecordIbdBlockDelivery(40 * 1000000, false);
+
+    std::vector<CNode*> peers;
+    peers.push_back(fixture.peerA.get());
+    peers.push_back(fixture.peerB.get());
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 512U);
+
+    const uint64_t base = RedundancyTwoPeerFixture::base;
+    // Inside the redundancy prefix B must be absent and each hash must have a
+    // single owner (A).  No backup is created on an unqualified peer.
+    for (int h = 1; h <= RedundancyTwoPeerFixture::nHR; ++h)
+    {
+        const uint256 hash(base + h);
+        BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 1);
+        BOOST_CHECK(!fixture.peerB->IsBlockAskForQueued(hash));
+        BOOST_CHECK(fixture.peerA->IsBlockAskForQueued(hash));
+    }
+    BOOST_CHECK_EQUAL(fixture.peerB->setAskForBlocks.size(), 0U);
+
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// Stage 5: FIRST ARRIVAL WINS -- the primary copy arrives first.  The receive
+// releases only the delivering peer's slot; a later duplicate from the backup
+// is dedup'd (mismatch-preserved) and never clears a live logical request.
+static void AssignTwoOwnersAndInflight(const uint256& hash, CNode& peerA,
+                                       CNode& peerB)
+{
+    BOOST_CHECK(TryAssignBlockRequestOwner(
+        hash, peerA.GetId(), BLOCKREQ_SOURCE_HEADERS_SCHEDULER,
+        NULL, NULL, 2));
+    BOOST_CHECK(TryAssignBlockRequestOwner(
+        hash, peerB.GetId(), BLOCKREQ_SOURCE_HEADERS_SCHEDULER,
+        NULL, NULL, 2));
+    peerA.MarkBlockInFlight(hash);
+    peerB.MarkBlockInFlight(hash);
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 2U);
+}
+
+BOOST_AUTO_TEST_CASE(stage5_first_arrival_wins_primary_copy_satisfies_logical_request)
+{
+    CScopedIbdQualityState qualityScope;
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(142), "s5-arrive-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(143), "s5-arrive-b", true);
+    const uint256 hash(9601001);
+    AssignTwoOwnersAndInflight(hash, peerA, peerB);
+
+    // Primary arrives first: its receive releases only A's slot.
+    BOOST_CHECK(ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId()));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 1U);
+    BOOST_CHECK(IsBlockRequestOwnedByPeer(hash, peerB.GetId()));
+    // The logical request is completed once the block is validated.
+    BOOST_CHECK(SatisfyBlockLogicalRequest(hash));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 0U);
+    BOOST_CHECK(!GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+
+    // A late duplicate from the backup: the logical entry is already erased,
+    // so the receive is a no-op -- the duplicate is dedup'd (already-known)
+    // and can never reopen a logical request.
+    BOOST_CHECK(!ReleaseBlockRequestOwnerOnReceive(hash, peerB.GetId()));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 0U);
+    BOOST_CHECK(!IsBlockRequestOwnedByAnyPeer(hash));
+
+    peerA.ClearBlockInFlight(hash);
+    peerB.ClearBlockInFlight(hash);
+}
+
+BOOST_AUTO_TEST_CASE(stage5_first_arrival_wins_backup_copy_satisfies_logical_request)
+{
+    CScopedIbdQualityState qualityScope;
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(144), "s5-arrive-backup-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(145), "s5-arrive-backup-b", true);
+    const uint256 hash(9601002);
+    AssignTwoOwnersAndInflight(hash, peerA, peerB);
+
+    // The BACKUP copy arrives first.  FIRST ARRIVAL WINS: the backup's receive
+    // releases only B's slot; the primary copy stays in flight and the logical
+    // request is NOT re-issued while the primary is healthy.
+    BOOST_CHECK(ReleaseBlockRequestOwnerOnReceive(hash, peerB.GetId()));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 1U);
+    BOOST_CHECK(IsBlockRequestOwnedByPeer(hash, peerA.GetId()));
+    BlockRequestOwnerState state = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwnerForPeer(hash, peerA.GetId(), &state));
+    BOOST_CHECK_EQUAL(state, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    BOOST_CHECK(!GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+
+    // Validation completes the logical request; the remaining primary slot is
+    // cleared as a satisfied backup (no recovery armed, no terminal accounting).
+    BOOST_CHECK(SatisfyBlockLogicalRequest(hash));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 0U);
+    BOOST_CHECK(!GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+
+    // A late primary duplicate: the logical entry is already erased, so the
+    // receive is a no-op -- the duplicate is dedup'd (already-known) and can
+    // never reopen a logical request.
+    BOOST_CHECK(!ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId()));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 0U);
+    BOOST_CHECK(!IsBlockRequestOwnedByAnyPeer(hash));
+
+    peerA.ClearBlockInFlight(hash);
+    peerB.ClearBlockInFlight(hash);
+}
+
+// Stage 5: an INVALID first copy must not kill a healthy backup.  The receive
+// hook releases only the delivering peer's slot; the remaining copy stays in
+// flight so a later valid delivery completes the logical request.
+BOOST_AUTO_TEST_CASE(stage5_invalid_first_copy_preserves_healthy_backup)
+{
+    CScopedIbdQualityState qualityScope;
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(146), "s5-invalid-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(147), "s5-invalid-b", true);
+    const uint256 hash(9601003);
+    AssignTwoOwnersAndInflight(hash, peerA, peerB);
+
+    // Invalid delivery from the primary: the receive releases only A's slot
+    // and SatisfyBlockLogicalRequest is NOT reached for a rejected block.
+    BOOST_CHECK(ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId()));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 1U);
+    BOOST_CHECK(IsBlockRequestOwnedByPeer(hash, peerB.GetId()));
+    BlockRequestOwnerState state = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwnerForPeer(hash, peerB.GetId(), &state));
+    BOOST_CHECK_EQUAL(state, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    BOOST_CHECK(!GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+
+    // The healthy backup later delivers a VALID copy: it completes the logical
+    // request, and the (already released) primary slot stays gone.
+    BOOST_CHECK(ReleaseBlockRequestOwnerOnReceive(hash, peerB.GetId()));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 0U);
+    BOOST_CHECK(!GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+
+    peerA.ClearBlockInFlight(hash);
+    peerB.ClearBlockInFlight(hash);
+}
+
+// Stage 5: one copy timing out while another is healthy must NOT trigger a
+// reissue.  The backup's timeout releases only B's slot; the logical request
+// stays in flight on A and recovery is not armed.
+BOOST_AUTO_TEST_CASE(stage5_backup_timeout_no_reissue_while_primary_healthy)
+{
+    CScopedIbdQualityState qualityScope;
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(148), "s5-timeout-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(149), "s5-timeout-b", true);
+    const uint256 hash(9601004);
+    AssignTwoOwnersAndInflight(hash, peerA, peerB);
+
+    BOOST_CHECK(ReleaseBlockRequestOwner(hash, peerB.GetId(), "timeout"));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 1U);
+    BOOST_CHECK(IsBlockRequestOwnedByPeer(hash, peerA.GetId()));
+    BlockRequestOwnerState state = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwnerForPeer(hash, peerA.GetId(), &state));
+    BOOST_CHECK_EQUAL(state, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    // All-copies-lost is NOT reached: recovery stays unarmed (no reissue).
+    BOOST_CHECK(!GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+
+    // The primary later delivers and completes the logical request.
+    BOOST_CHECK(ReleaseBlockRequestOwnerOnReceive(hash, peerA.GetId()));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 0U);
+
+    peerA.ClearBlockInFlight(hash);
+    peerB.ClearBlockInFlight(hash);
+}
+
+// Stage 5: the logical request is re-issued only when ALL copies are lost.
+// Releasing both slots arms recovery exactly once; the next refill round
+// re-admits the single logical request (primary + rebuilt backup).
+BOOST_AUTO_TEST_CASE(stage5_all_copies_lost_expiry_reissues_once)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+    CScopedIbdQualityState qualityScope;
+    SetIbdQualityClockForTesting(100 * 1000000);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    RedundancyTwoPeerFixture fixture;
+    std::vector<CNode*> peers;
+    peers.push_back(fixture.peerA.get());
+    peers.push_back(fixture.peerB.get());
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 544U);
+
+    const uint256 hash(RedundancyTwoPeerFixture::base + 1);
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 2U);
+
+    // Simulate the sent + no-delivery state for both copies: consume the askfor
+    // entries (getdata went out) and mark both owners in flight.
+    for (int k = 0; k < 2; ++k)
+    {
+        CNode& owner = k == 0 ? *fixture.peerA : *fixture.peerB;
+        BOOST_REQUIRE(TryAssignBlockRequestOwner(
+            hash, owner.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+        for (std::multimap<int64_t, CInv>::iterator it = owner.mapAskFor.begin();
+             it != owner.mapAskFor.end(); ++it)
+        {
+            if (it->second.hash == hash)
+            {
+                owner.EraseAskForEntry(it, false);
+                break;
+            }
+        }
+        owner.MarkBlockInFlight(hash);
+    }
+    BOOST_REQUIRE(GetBlockRequestOwnerCount(hash) == 2U);
+
+    // Backup times out: primary still healthy, no recovery.  The timeout uses
+    // the production expiry path: ExpireBlockInFlight clears the peer's
+    // in-flight set (so recovery can later re-admit via AskFor) and releases
+    // only that peer's slot with reason "timeout".
+    CNode& ownerB = *fixture.peerB;
+    {
+        LOCK(ownerB.cs_vBlockInFlightWire);
+        ownerB.mapBlockInFlightWireUs[hash] = GetTimeMicros() - 61000000;
+    }
+    ownerB.ExpireBlockInFlight();
+    BOOST_REQUIRE(ownerB.setBlocksInFlight.count(hash) == 0);
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 1U);
+    BOOST_CHECK(!GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+
+    // Primary times out too: ALL copies lost -> exactly one recovery arming.
+    CNode& ownerA = *fixture.peerA;
+    {
+        LOCK(ownerA.cs_vBlockInFlightWire);
+        ownerA.mapBlockInFlightWireUs[hash] = GetTimeMicros() - 61000000;
+    }
+    ownerA.ExpireBlockInFlight();
+    BOOST_REQUIRE(ownerA.setBlocksInFlight.count(hash) == 0);
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 0U);
+    BOOST_CHECK(!IsBlockRequestOwnedByAnyPeer(hash));
+    BOOST_CHECK(GetIbdHeaderSchedulerRefillStatsForTesting().cursorRecoveryNeeded);
+
+    // Next round re-issues the single logical request exactly once.
+    BOOST_CHECK_GE(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
+    BOOST_CHECK(IsBlockRequestOwnedByAnyPeer(hash));
+    const size_t nCopies = QueuedBlockAskForCount(peers, hash);
+    BOOST_CHECK_GE(nCopies, 1U);
+    BOOST_CHECK_LE(nCopies, 2U);
+    BOOST_CHECK(GetBlockRequestOwnerCount(hash) >= 1U);
+
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// Stage 5: a hash has ONE logical request regardless of the number of owner
+// slots.  Window occupancy counts logical requests; deferred-inv / global
+// budget count physical copies.  The third peer cannot open a second copy.
+BOOST_AUTO_TEST_CASE(stage5_logical_request_occupancy_single_per_hash)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+    CScopedIbdQualityState qualityScope;
+    SetIbdQualityClockForTesting(100 * 1000000);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    RedundancyTwoPeerFixture fixture;
+    std::vector<CNode*> peers;
+    peers.push_back(fixture.peerA.get());
+    peers.push_back(fixture.peerB.get());
+    const int64_t activeBefore =
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed);
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 544U);
+    // Ordered window occupancy is LOGICAL: all 512 heights covered despite 544
+    // physical copies.
+    BOOST_CHECK_EQUAL(
+        GetIbdHeaderSchedulerRefillStatsForTesting().cursorNextIndex, 512U);
+    // Physical copies are counted separately (deferred-inv / global budget).
+    BOOST_CHECK_EQUAL(fixture.peerA->setAskForBlocks.size() +
+                          fixture.peerB->setAskForBlocks.size(),
+                      544U);
+    BOOST_CHECK_EQUAL(
+        ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
+            activeBefore, 544LL);
+
+    // Single logical request per hash: a third peer cannot add a third copy.
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(150), "s5-occupancy-c", true);
+    const uint256 hash(RedundancyTwoPeerFixture::base + 1);
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 2U);
+    BOOST_CHECK_EQUAL((int)peerC.AskFor(CInv(MSG_BLOCK, hash),
+                                        BLOCKREQ_SOURCE_HEADERS_SCHEDULER, 2),
+                      (int)ASKFOR_OWNED_BY_OTHER);
+    NodeId existingPeer = -1;
+    BlockRequestOwnerState existingState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(!TryAssignBlockRequestOwner(
+        hash, peerC.GetId(), BLOCKREQ_SOURCE_HEADERS_SCHEDULER,
+        &existingPeer, &existingState, 2));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 2U);
+
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// Stage 5: the getdata send path claims an owner slot for a queued backup copy
+// with the logical request's desired copy count, and a further peer's queue is
+// skipped (and its askfor consumed) when the copy set is already full.
+BOOST_AUTO_TEST_CASE(stage5_getdata_send_claims_queued_backup_owner_slot)
+{
+    CScopedIbdQualityState qualityScope;
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(151), "s5-send-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(152), "s5-send-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(153), "s5-send-c", true);
+    const uint256 hash(9601005);
+
+    // Primary owner already claims the logical request (copy count 2).
+    BOOST_CHECK(TryAssignBlockRequestOwner(
+        hash, peerA.GetId(), BLOCKREQ_SOURCE_HEADERS_SCHEDULER, NULL, NULL, 2));
+    peerA.MarkBlockInFlight(hash);
+
+    // B and C both queue a backup copy; AskFor admits B (count 1 < 2) and C
+    // (count 1 < 2) because AskFor does not itself claim ownership.
+    BOOST_CHECK_EQUAL((int)peerB.AskFor(CInv(MSG_BLOCK, hash),
+                                        BLOCKREQ_SOURCE_HEADERS_SCHEDULER, 2),
+                      (int)ASKFOR_QUEUED);
+    BOOST_CHECK_EQUAL((int)peerC.AskFor(CInv(MSG_BLOCK, hash),
+                                        BLOCKREQ_SOURCE_HEADERS_SCHEDULER, 2),
+                      (int)ASKFOR_QUEUED);
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 1U);
+
+    // B's getdata send claims the second slot (the send path mirrors the
+    // getdata loop's TryAssign with the logical request's desired copies).
+    BOOST_CHECK(TryAssignBlockRequestOwner(
+        hash, peerB.GetId(), BLOCKREQ_SOURCE_ASKFOR, NULL, NULL, 2));
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 2U);
+    BOOST_CHECK(IsBlockRequestOwnedByPeer(hash, peerB.GetId()));
+
+    // C's getdata send finds the copy set full: the slot is refused, the
+    // queued entry is dropped, and ownership is unchanged.  The refused-copy
+    // diagnostic reports the first (lowest-NodeId) slot holder, i.e. the
+    // primary owner A.
+    NodeId existingPeer = -1;
+    BlockRequestOwnerState existingState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(!TryAssignBlockRequestOwner(
+        hash, peerC.GetId(), BLOCKREQ_SOURCE_ASKFOR,
+        &existingPeer, &existingState, 2));
+    BOOST_CHECK_EQUAL(existingPeer, peerA.GetId());
+    BOOST_CHECK_EQUAL(GetBlockRequestOwnerCount(hash), 2U);
+    BOOST_CHECK(!IsBlockRequestOwnedByPeer(hash, peerC.GetId()));
+    // A later duplicate receive from C is dedup'd, never reprocessed.
+    const int64_t nMismatchBefore =
+        MetricGet(ibdmetrics::Get().block_owner_receive_mismatch_preserved);
+    BOOST_CHECK(!ReleaseBlockRequestOwnerOnReceive(hash, peerC.GetId()));
+    BOOST_CHECK_EQUAL(
+        MetricGet(ibdmetrics::Get().block_owner_receive_mismatch_preserved),
+        nMismatchBefore + 1);
+
+    peerA.ClearBlockInFlight(hash);
+    ReleaseBlockRequestOwnersForPeer(peerA.GetId(), "disconnect");
+    ReleaseBlockRequestOwnersForPeer(peerB.GetId(), "disconnect");
+    ReleaseBlockRequestOwnersForPeer(peerC.GetId(), "disconnect");
+}
+
 BOOST_AUTO_TEST_CASE(headers_scheduler_sequential_refill_uses_incremental_cursor)
 {
     const bool savedScheduler = fIbdHeaderScheduler;
@@ -11264,8 +11861,9 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_saturation_handoff_bounded_liveness)
     BOOST_CHECK_EQUAL(peerA.setBlocksInFlight.size(), 512U);
 
     // New branch headers are observed; the new generation initially receives
-    // zero admission budget because all 512 slots are held by stale old-path
-    // in-flight requests.
+    // only the redundancy headroom HR (=32 for W=512) because 512 slots are
+    // still held by stale old-path in-flight requests.  The 16 new-branch
+    // requests fit entirely inside that headroom, so they are admitted now.
     std::vector<std::pair<uint256, uint256> > newHeaders;
     previous = c0;
     for (int i = 1; i <= 16; ++i)
@@ -11278,11 +11876,11 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_saturation_handoff_bounded_liveness)
     for (int i = 1; i <= 16; ++i)
         SeedIbdHeaderSchedulerInvAvailabilityForTesting(
             peerB.GetId(), uint256(8000000 + i));
-    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
-    BOOST_CHECK_EQUAL(peerB.setAskForBlocks.size(), 0U);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 16U);
+    BOOST_CHECK_EQUAL(peerB.setAskForBlocks.size(), 16U);
     BOOST_CHECK_EQUAL(
         ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
-            activeBefore, 512LL);
+            activeBefore, 512LL + 16LL);
 
     // Expire the stale old-path in-flight work through the REAL expiry decision
     // at a simulated 61 s wire age (> 60 s wire-origin deadline).  After the
@@ -11316,10 +11914,11 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_saturation_handoff_bounded_liveness)
     }
     BOOST_CHECK_EQUAL(
         ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
-            activeBefore, 0LL);
+            activeBefore, 16LL);
 
-    // The budget is now free: the new generation is admitted.
-    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 16U);
+    // The budget is now free; the new generation was already admitted inside
+    // the redundancy headroom, so the refill is a no-op and the queue stays.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
     BOOST_CHECK_EQUAL(peerB.setAskForBlocks.size(), 16U);
     BOOST_CHECK_EQUAL(
         ibdmetrics::Get().global_active_current.load(std::memory_order_relaxed) -
@@ -11927,13 +12526,17 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_cursor_stops_at_first_uncovered_prefix_po
 
     // A's budget returns: the refill admits block 1 to A and the cursor
     // advances to the now-covered prefix (257 covered: block 1 + B's 2..257).
+    // Stage 5 also adds a backup copy of the redundancy prefix (2..32) on A
+    // because A now passes the quality gate, so A gets 32 total asks.
     for (int i = 0; i < 256; ++i)
         peerA.ClearBlockInFlight(uint256(95000000 + i));
-    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 32U);
     stats = GetIbdHeaderSchedulerRefillStatsForTesting();
-    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 1U);
     BOOST_CHECK_EQUAL(stats.cursorNextIndex, 257U);
+    BOOST_CHECK_EQUAL(peerA.setAskForBlocks.size(), 32U);
     BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(8500001)));
+    BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(8500002)));
+    BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(8500032)));
 
     peerA.ClearAskFor();
     peerB.ClearAskFor();
@@ -12073,10 +12676,12 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_structural_disconnect_still_invalidates_c
     std::vector<CNode*> peers(1, &peer);
     BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
 
-    peer.ClearAskFor();
-    BOOST_CHECK_EQUAL(ReleaseBlockRequestOwnersForPeer(peer.GetId(), "disconnect"), 0U);
+    // Structural disconnect must invalidate the cursor even though the askfor
+    // queue is still populated; clear the queue only after verifying it.
+    BOOST_CHECK_EQUAL(ReleaseBlockRequestOwnersForPeer(peer.GetId(), "disconnect"), 1U);
     BOOST_CHECK(GetIbdHeaderSchedulerRefillStatsForTesting().cursorInvalidated);
 
+    peer.ClearAskFor();
     BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 1U);
     BOOST_CHECK_EQUAL(GetIbdHeaderSchedulerRefillStatsForTesting().fullRefillCalls, 2U);
 

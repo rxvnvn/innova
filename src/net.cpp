@@ -3370,7 +3370,21 @@ struct BlockRequestOwner
         : peer(peerIn), state(stateIn), assignedUs(GetTimeMicros()) {}
 };
 
-static std::map<uint256, BlockRequestOwner> mapBlockRequestOwners;
+// Multi-owner transport state for ordered IBD redundant requests.
+// A logical block request maps to one or more physical owner slots (one per
+// peer).  maxOwners records the desired redundancy level for this hash; it is
+// set when the first slot is admitted and may only grow (Stage 5 selective
+// head-prefix redundancy uses maxOwners = 2 inside the redundancy prefix).
+struct BlockRequestOwners
+{
+    int maxOwners;
+    std::map<NodeId, BlockRequestOwner> slots;
+
+    BlockRequestOwners() : maxOwners(1) {}
+    explicit BlockRequestOwners(int maxOwnersIn) : maxOwners(maxOwnersIn) {}
+};
+
+static std::map<uint256, BlockRequestOwners> mapBlockRequestOwners;
 
 const char* BlockRequestOwnerStateName(BlockRequestOwnerState state)
 {
@@ -3380,46 +3394,92 @@ const char* BlockRequestOwnerStateName(BlockRequestOwnerState state)
 bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
                                       BlockRequestTraceSource source,
                                       NodeId* existingPeer,
-                                      BlockRequestOwnerState* existingState)
+                                      BlockRequestOwnerState* existingState,
+                                      int nMaxOwners)
 {
-    std::map<uint256, BlockRequestOwner>::iterator it =
+    std::map<uint256, BlockRequestOwners>::iterator it =
         mapBlockRequestOwners.find(hash);
     if (it == mapBlockRequestOwners.end())
     {
         mapBlockRequestOwners.insert(std::make_pair(
-            hash, BlockRequestOwner(peer, BLOCK_REQUEST_OWNER_QUEUED)));
+            hash, BlockRequestOwners(nMaxOwners)));
+        BlockRequestOwners& owners = mapBlockRequestOwners[hash];
+        owners.slots.insert(std::make_pair(
+            peer, BlockRequestOwner(peer, BLOCK_REQUEST_OWNER_QUEUED)));
         if (BlockRequestTraceEnabled())
             BlockRequestTraceOwnerAssign(hash, peer, "queued", source);
         return true;
     }
-    if (existingPeer)
-        *existingPeer = it->second.peer;
-    if (existingState)
-        *existingState = it->second.state;
-    return it->second.peer == peer;
+    BlockRequestOwners& owners = it->second;
+    if (nMaxOwners > owners.maxOwners)
+        owners.maxOwners = nMaxOwners;
+    std::map<NodeId, BlockRequestOwner>::iterator sit = owners.slots.find(peer);
+    if (sit != owners.slots.end())
+    {
+        if (existingPeer)
+            *existingPeer = sit->second.peer;
+        if (existingState)
+            *existingState = sit->second.state;
+        return true;
+    }
+    if ((int)owners.slots.size() < owners.maxOwners)
+    {
+        owners.slots.insert(std::make_pair(
+            peer, BlockRequestOwner(peer, BLOCK_REQUEST_OWNER_QUEUED)));
+        if (BlockRequestTraceEnabled())
+            BlockRequestTraceOwnerAssign(hash, peer, "queued", source);
+        return true;
+    }
+    if (existingPeer && !owners.slots.empty())
+        *existingPeer = owners.slots.begin()->second.peer;
+    if (existingState && !owners.slots.empty())
+        *existingState = owners.slots.begin()->second.state;
+    return false;
 }
 
 bool TryAssignBlockRequestOwner(const uint256& hash, NodeId peer,
                                 BlockRequestTraceSource source,
                                 NodeId* existingPeer,
-                                BlockRequestOwnerState* existingState)
+                                BlockRequestOwnerState* existingState,
+                                int nMaxOwners)
 {
     LOCK(cs_mapAlreadyAskedFor);
-    return TryAssignBlockRequestOwnerLocked(hash, peer, source, existingPeer, existingState);
+    return TryAssignBlockRequestOwnerLocked(hash, peer, source, existingPeer,
+                                            existingState, nMaxOwners);
 }
 
 bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
                           BlockRequestOwnerState* ownerState)
 {
     LOCK(cs_mapAlreadyAskedFor);
-    std::map<uint256, BlockRequestOwner>::const_iterator it =
+    std::map<uint256, BlockRequestOwners>::const_iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end() || it->second.slots.empty())
+        return false;
+    if (ownerPeer)
+        *ownerPeer = it->second.slots.begin()->second.peer;
+    if (ownerState)
+        *ownerState = it->second.slots.begin()->second.state;
+    return true;
+}
+
+bool GetBlockRequestOwnerForPeer(const uint256& hash, NodeId peer,
+                                 BlockRequestOwnerState* ownerState,
+                                 int64_t* assignedUs)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwners>::const_iterator it =
         mapBlockRequestOwners.find(hash);
     if (it == mapBlockRequestOwners.end())
         return false;
-    if (ownerPeer)
-        *ownerPeer = it->second.peer;
+    std::map<NodeId, BlockRequestOwner>::const_iterator sit =
+        it->second.slots.find(peer);
+    if (sit == it->second.slots.end())
+        return false;
     if (ownerState)
-        *ownerState = it->second.state;
+        *ownerState = sit->second.state;
+    if (assignedUs)
+        *assignedUs = sit->second.assignedUs;
     return true;
 }
 
@@ -3428,29 +3488,76 @@ bool GetBlockRequestOwnerDetails(const uint256& hash, NodeId* ownerPeer,
                                  int64_t* assignedUs)
 {
     LOCK(cs_mapAlreadyAskedFor);
-    std::map<uint256, BlockRequestOwner>::const_iterator it =
+    std::map<uint256, BlockRequestOwners>::const_iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end() || it->second.slots.empty())
+        return false;
+    if (ownerPeer)
+        *ownerPeer = it->second.slots.begin()->second.peer;
+    if (ownerState)
+        *ownerState = it->second.slots.begin()->second.state;
+    if (assignedUs)
+        *assignedUs = it->second.slots.begin()->second.assignedUs;
+    return true;
+}
+
+size_t GetBlockRequestOwnerCount(const uint256& hash)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwners>::const_iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+        return 0;
+    return it->second.slots.size();
+}
+
+int GetBlockRequestOwnerMaxCopies(const uint256& hash)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwners>::const_iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+        return 0;
+    return it->second.maxOwners;
+}
+
+bool IsBlockRequestOwnedByPeer(const uint256& hash, NodeId peer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwners>::const_iterator it =
         mapBlockRequestOwners.find(hash);
     if (it == mapBlockRequestOwners.end())
         return false;
-    if (ownerPeer)
-        *ownerPeer = it->second.peer;
-    if (ownerState)
-        *ownerState = it->second.state;
-    if (assignedUs)
-        *assignedUs = it->second.assignedUs;
-    return true;
+    return it->second.slots.count(peer) != 0;
+}
+
+void GetBlockRequestOwnerPeers(const uint256& hash, std::set<NodeId>& peers)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwners>::const_iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+        return;
+    for (std::map<NodeId, BlockRequestOwner>::const_iterator sit =
+             it->second.slots.begin();
+         sit != it->second.slots.end(); ++sit)
+        peers.insert(sit->first);
 }
 
 bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer)
 {
     LOCK(cs_mapAlreadyAskedFor);
-    std::map<uint256, BlockRequestOwner>::iterator it =
+    std::map<uint256, BlockRequestOwners>::iterator it =
         mapBlockRequestOwners.find(hash);
-    if (it == mapBlockRequestOwners.end() || it->second.peer != peer)
+    if (it == mapBlockRequestOwners.end())
         return false;
-    if (it->second.state == BLOCK_REQUEST_OWNER_QUEUED)
+    std::map<NodeId, BlockRequestOwner>::iterator sit =
+        it->second.slots.find(peer);
+    if (sit == it->second.slots.end())
+        return false;
+    if (sit->second.state == BLOCK_REQUEST_OWNER_QUEUED)
     {
-        it->second.state = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+        sit->second.state = BLOCK_REQUEST_OWNER_IN_FLIGHT;
         if (BlockRequestTraceEnabled())
             printf("BLOCKREQTRACE time_us=%lld event=OWNER_TRANSITION hash=%s peer=%d from=queued to=inflight\n",
                    (long long)GetTimeMicros(), hash.ToString().c_str(), peer);
@@ -3498,39 +3605,50 @@ static bool ReleaseBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
                                            const char* pszReason,
                                            bool fArmRecovery)
 {
-    std::map<uint256, BlockRequestOwner>::iterator it =
+    std::map<uint256, BlockRequestOwners>::iterator it =
         mapBlockRequestOwners.find(hash);
-    if (it == mapBlockRequestOwners.end() || it->second.peer != peer)
+    if (it == mapBlockRequestOwners.end())
         return false;
+    std::map<NodeId, BlockRequestOwner>::iterator sit =
+        it->second.slots.find(peer);
+    if (sit == it->second.slots.end())
+        return false;
+    BlockRequestOwnerState state = sit->second.state;
     if (BlockRequestTraceEnabled())
         BlockRequestTraceOwnerRelease(hash, peer,
-                                      BlockRequestOwnerStateName(it->second.state),
+                                      BlockRequestOwnerStateName(state),
                                       pszReason);
-    mapBlockRequestOwners.erase(it);
-    ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), pszReason);
-    if (g_frontierHash == hash && g_frontierPeer == peer)
-        FrontierTraceClearLocked("release");
-    // A non-"receive" release means the request died before delivery: the
-    // latency record (if any) terminates here.  "receive" is handled by the
-    // T2 hook in ProcessMessage(block), so the lifecycle continues.
-    // A descendant timeout/release is now a local event: it must not reset
-    // the ordered-scheduler refill cursor (that would turn one timeout into a
-    // full 512-window reconsideration).  Instead it arms the bounded recovery
-    // scan, which re-admits only the released contiguous prefix.  Structural
-    // changes (peer disconnect) still invalidate the cursor via
-    // ReleaseBlockRequestOwnersForPeer.
-    if (strcmp(pszReason, "receive") != 0 &&
-        strcmp(pszReason, "branch-switch") != 0)
+    it->second.slots.erase(sit);
+    const bool fLastSlot = it->second.slots.empty();
+    if (fLastSlot)
     {
-        if (fArmRecovery)
-            MarkIbdHeaderSchedulerRecoveryNeeded();
+        mapBlockRequestOwners.erase(it);
+        ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), pszReason);
+        if (g_frontierHash == hash && g_frontierPeer == peer)
+            FrontierTraceClearLocked("release");
+        // A non-"receive" release means the request died before delivery: the
+        // latency record (if any) terminates here.  "receive" is handled by the
+        // T2 hook in ProcessMessage(block), so the lifecycle continues.
+        // "redundant-satisfied" marks backup slots cleared after a successful
+        // logical delivery and must not arm recovery or terminal accounting.
+        if (strcmp(pszReason, "receive") != 0 &&
+            strcmp(pszReason, "branch-switch") != 0 &&
+            strcmp(pszReason, "redundant-satisfied") != 0)
+        {
+            if (fArmRecovery)
+                MarkIbdHeaderSchedulerRecoveryNeeded();
+        }
+        if (strcmp(pszReason, "receive") != 0 &&
+            strcmp(pszReason, "branch-switch") != 0 &&
+            strcmp(pszReason, "redundant-satisfied") != 0)
+        {
+            ibdblocklatency::RecordBlockTerminal(
+                hash,
+                strcmp(pszReason, "timeout") == 0
+                    ? ibdblocklatency::OUTCOME_TIMEOUT
+                    : ibdblocklatency::OUTCOME_INCOMPLETE_EVICTED);
+        }
     }
-    if (strcmp(pszReason, "receive") != 0)
-        ibdblocklatency::RecordBlockTerminal(
-            hash,
-            strcmp(pszReason, "timeout") == 0
-                ? ibdblocklatency::OUTCOME_TIMEOUT
-                : ibdblocklatency::OUTCOME_INCOMPLETE_EVICTED);
     return true;
 }
 
@@ -3564,11 +3682,14 @@ bool PreemptBlockRequestToPeer(const uint256& hash, CNode* pOldOwner,
     // timestamp intact, and gauges / preempt expectations untouched.
     {
         LOCK(cs_mapAlreadyAskedFor);
-    std::map<uint256, BlockRequestOwner>::iterator it =
+    std::map<uint256, BlockRequestOwners>::iterator it =
         mapBlockRequestOwners.find(hash);
-    if (it == mapBlockRequestOwners.end() ||
-        it->second.peer != pOldOwner->GetId() ||
-        it->second.state != BLOCK_REQUEST_OWNER_IN_FLIGHT)
+    if (it == mapBlockRequestOwners.end())
+        return false;
+    std::map<NodeId, BlockRequestOwner>::iterator sit =
+        it->second.slots.find(pOldOwner->GetId());
+    if (sit == it->second.slots.end() ||
+        sit->second.state != BLOCK_REQUEST_OWNER_IN_FLIGHT)
         return false;
     // The new owner must not already carry the hash.  Read setBlocksInFlight
     // directly (IsBlockInFlight would run ExpireBlockInFlight, which takes
@@ -3578,6 +3699,9 @@ bool PreemptBlockRequestToPeer(const uint256& hash, CNode* pOldOwner,
         return false;
     if (pOldOwner->setBlocksInFlight.count(hash) == 0)
         return false;
+
+    // Preserve desired redundancy for the logical request.
+    const int nMaxOwners = it->second.maxOwners;
 
     // 1. Retire the old owner's in-flight slot.
     if (pOldOwner->setBlocksInFlight.erase(hash))
@@ -3598,14 +3722,15 @@ bool PreemptBlockRequestToPeer(const uint256& hash, CNode* pOldOwner,
         FrontierTraceClearLocked("preempt");
     ibdblocklatency::RecordBlockTerminal(
         hash, ibdblocklatency::OUTCOME_INCOMPLETE_EVICTED);
-    mapBlockRequestOwners.erase(it);
+    it->second.slots.erase(sit);
 
     // 2. Re-queue on the new owner as a QUEUED owner assignment.  No
     //    MarkIbdHeaderSchedulerRecoveryNeeded(): the hash stays owned, so the
     //    refill cursor is not disturbed (frontier-forward progress preserved).
-    mapBlockRequestOwners.insert(std::make_pair(
-        hash, BlockRequestOwner(pNewOwner->GetId(),
-                                BLOCK_REQUEST_OWNER_QUEUED)));
+    it->second.slots.insert(std::make_pair(
+        pNewOwner->GetId(),
+        BlockRequestOwner(pNewOwner->GetId(), BLOCK_REQUEST_OWNER_QUEUED)));
+    it->second.maxOwners = std::max(it->second.maxOwners, nMaxOwners);
     if (BlockRequestTraceEnabled())
         BlockRequestTraceOwnerAssign(hash, pNewOwner->GetId(), "queued",
                                      BLOCKREQ_SOURCE_PREEMPT);
@@ -3648,67 +3773,98 @@ bool PreemptBlockRequestToPeer(const uint256& hash, CNode* pOldOwner,
 bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer)
 {
     LOCK(cs_mapAlreadyAskedFor);
-    std::map<uint256, BlockRequestOwner>::iterator it =
+    // With multi-owner transport, a received block releases only the delivering
+    // peer's slot.  Remaining slots are cleared after the block is validated
+    // (SatisfyBlockLogicalRequest) so an invalid first copy does not kill a
+    // healthy backup.  A late/foreign delivery from a non-owner is ignored and
+    // counted so the mismatch-preserved metric remains observable.
+    std::map<uint256, BlockRequestOwners>::iterator it =
         mapBlockRequestOwners.find(hash);
-    if (it == mapBlockRequestOwners.end())
-        return false;
-    // A received block may release ownership only when the delivering peer is
-    // the current owner.  A late response from the previous owner (after the
-    // hash timed out and was reassigned) or an unsolicited/foreign delivery
-    // must not erase the current owner's live assignment.  This mirrors the
-    // checked release in ReleaseBlockRequestOwner: the owner-identity check and
-    // the erase happen under the same cs_mapAlreadyAskedFor critical section.
-    if (it->second.peer != peer)
+    if (it != mapBlockRequestOwners.end() &&
+        it->second.slots.find(peer) == it->second.slots.end())
     {
         ibdmetrics::Get().block_owner_receive_mismatch_preserved.fetch_add(
             1, std::memory_order_relaxed);
         return false;
     }
-    if (BlockRequestTraceEnabled())
-        BlockRequestTraceOwnerRelease(hash, it->second.peer,
-                                      BlockRequestOwnerStateName(it->second.state),
-                                      "receive");
-    mapBlockRequestOwners.erase(it);
-    ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), "receive");
-    if (g_frontierHash == hash)
-        FrontierTraceClearLocked("receive");
+    return ReleaseBlockRequestOwnerLocked(hash, peer, "receive", false);
+}
+
+bool SatisfyBlockLogicalRequest(const uint256& hash)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwners>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+        return false;
+    // Remove every remaining owner slot for this hash as a satisfied backup.
+    // Copy the peer ids first because ReleaseBlockRequestOwnerLocked mutates
+    // the slot map and may erase the outer entry.
+    std::vector<NodeId> remaining;
+    remaining.reserve(it->second.slots.size());
+    for (std::map<NodeId, BlockRequestOwner>::const_iterator sit =
+             it->second.slots.begin();
+         sit != it->second.slots.end(); ++sit)
+        remaining.push_back(sit->first);
+    for (size_t i = 0; i < remaining.size(); ++i)
+        ReleaseBlockRequestOwnerLocked(
+            hash, remaining[i], "redundant-satisfied", false);
     return true;
 }
 
 size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason,
                                         bool fRecordForensics)
 {
-    InvalidateIbdHeaderSchedulerRefillCursor();
-    LOCK(cs_mapAlreadyAskedFor);
+    bool fInvalidateCursor = false;
     size_t nReleased = 0;
-    for (std::map<uint256, BlockRequestOwner>::iterator it =
-             mapBlockRequestOwners.begin(); it != mapBlockRequestOwners.end(); )
     {
-        if (it->second.peer != peer)
+        LOCK(cs_mapAlreadyAskedFor);
+        for (std::map<uint256, BlockRequestOwners>::iterator it =
+                 mapBlockRequestOwners.begin();
+             it != mapBlockRequestOwners.end(); )
         {
-            ++it;
-            continue;
+            std::map<NodeId, BlockRequestOwner>::iterator sit =
+                it->second.slots.find(peer);
+            if (sit == it->second.slots.end())
+            {
+                ++it;
+                continue;
+            }
+            const uint256 hash = it->first;
+            BlockRequestOwnerState state = sit->second.state;
+            if (BlockRequestTraceEnabled())
+                BlockRequestTraceOwnerRelease(hash, peer,
+                                              BlockRequestOwnerStateName(state),
+                                              pszReason);
+            it->second.slots.erase(sit);
+            const bool fLastSlot = it->second.slots.empty();
+            if (fLastSlot)
+            {
+                mapBlockRequestOwners.erase(it++);
+                if (fRecordForensics)
+                {
+                    ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(),
+                                                     pszReason);
+                    if (strcmp(pszReason, "receive") != 0)
+                        ibdblocklatency::RecordBlockTerminal(
+                            hash,
+                            strcmp(pszReason, "timeout") == 0
+                                ? ibdblocklatency::OUTCOME_TIMEOUT
+                                : ibdblocklatency::OUTCOME_DISCONNECT);
+                }
+                fInvalidateCursor = true;
+            }
+            else
+            {
+                ++it;
+            }
+            ++nReleased;
         }
-        const uint256 hash = it->first;
-        if (BlockRequestTraceEnabled())
-            BlockRequestTraceOwnerRelease(hash, peer,
-                                          BlockRequestOwnerStateName(it->second.state),
-                                          pszReason);
-        it = mapBlockRequestOwners.erase(it);
-        if (fRecordForensics)
-        {
-            ibdforensic::RecordGenerationEnd(hash, GetTimeMicros(), pszReason);
-            if (strcmp(pszReason, "receive") != 0)
-                ibdblocklatency::RecordBlockTerminal(
-                    hash,
-                    strcmp(pszReason, "timeout") == 0
-                        ? ibdblocklatency::OUTCOME_TIMEOUT
-                        : ibdblocklatency::OUTCOME_DISCONNECT);
-        }
-        ++nReleased;
+        if (g_frontierPeer == peer)
+            FrontierTraceClearLocked("disconnect");
     }
-    if (g_frontierPeer == peer)
-        FrontierTraceClearLocked("disconnect");
+    if (fInvalidateCursor)
+        InvalidateIbdHeaderSchedulerRefillCursor();
     return nReleased;
 }
 

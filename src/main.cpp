@@ -752,6 +752,15 @@ int GetIbdHeaderRedundancyPrefixHeight()
     return (int)std::min<std::size_t>(256, std::max<std::size_t>(32, W / 32));
 }
 
+static bool IbdHeaderSchedulerHashNeedsRedundancy(int nHeight,
+                                                  int nFrontierHeight)
+{
+    if (nHeight <= nFrontierHeight)
+        return false;
+    const int nRedundancyPrefix = GetIbdHeaderRedundancyPrefixHeight();
+    return nHeight <= nFrontierHeight + nRedundancyPrefix;
+}
+
 // Stage 4 hard quality gate: for head-prefix positions, a candidate peer must
 // have (1) at least 2 confirmed recent block deliveries, (2) an EWMA delivery
 // latency no more than 1.5x the median across active peers with samples, and
@@ -1043,6 +1052,26 @@ static CNode* IbdHeaderSchedulerBestPeerForHash(
     if (pBest == NULL)
         pBest = pFallback;
     return pBest;
+}
+
+static CNode* IbdHeaderSchedulerBestPeerForHashExcluding(
+    const uint256& hash,
+    const std::vector<CNode*>& candidates,
+    const std::set<NodeId>& excluded,
+    std::map<CNode*, int>* pBudgetByPeer = NULL)
+{
+    std::vector<CNode*> filtered;
+    filtered.reserve(candidates.size());
+    for (std::vector<CNode*>::const_iterator it = candidates.begin();
+         it != candidates.end(); ++it)
+    {
+        CNode* pnode = *it;
+        if (pnode != NULL && excluded.count(pnode->GetId()) == 0)
+            filtered.push_back(pnode);
+    }
+    if (filtered.empty())
+        return NULL;
+    return IbdHeaderSchedulerBestPeerForHash(hash, filtered, pBudgetByPeer);
 }
 
 static bool IbdHeaderSchedulerHashIsQueuedOnAnyPeer(
@@ -1607,12 +1636,17 @@ static size_t RefillOrderedHeaderBlockRequests(
             frontAlternatives = candidates.all.size();
         }
 
-        NodeId ownerPeer = -1;
-        BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
-        int64_t assignedUs = 0;
-        if (GetBlockRequestOwnerDetails(hash, &ownerPeer, &ownerState,
-                                        &assignedUs))
+        const int nDesiredOwners =
+            IbdHeaderSchedulerHashNeedsRedundancy(nHeight, pindexBest->nHeight)
+                ? 2 : 1;
+        const size_t nOwnerCount = GetBlockRequestOwnerCount(hash);
+        if (nOwnerCount >= 1)
         {
+            NodeId ownerPeer = -1;
+            BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+            int64_t assignedUs = 0;
+            GetBlockRequestOwnerDetails(hash, &ownerPeer, &ownerState,
+                                        &assignedUs);
             if (frontHash == hash)
             {
                 frontOwner = ownerPeer;
@@ -1622,12 +1656,11 @@ static size_t RefillOrderedHeaderBlockRequests(
             ++nOwned;
             if (ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)
             {
-                // FRONT_PREEMPT (v1): the ordered head (nGap == 1) may migrate
-                // its active slot to a proven alternative once it has been in
-                // flight past the wire-age threshold.  The migration is atomic
-                // and gauge-neutral (net.cpp PreemptBlockRequestToPeer), so the
-                // ordered frontier keeps exactly one active owner.
-                if (frontHash == hash && node != NULL && node->IsAnchored() &&
+                // FRONT_PREEMPT (v1): only attempt when the head has a single
+                // active owner.  Stage 5 keeps redundant head slots; adaptive
+                // preempt/reassign is Stage 6.
+                if (nOwnerCount == 1 && frontHash == hash && node != NULL &&
+                    node->IsAnchored() &&
                     node->height == pindexBest->nHeight + 1)
                 {
                     ++g_ibdHeaderSchedulerState.frontPreemptAttempts;
@@ -1639,7 +1672,7 @@ static size_t RefillOrderedHeaderBlockRequests(
                         ++g_ibdHeaderSchedulerState.frontPreemptTransfers;
                         ibdmetrics::Get().front_preempt_transfers.fetch_add(
                             1, std::memory_order_relaxed);
-                        ++nQueued;  // slot now owned-queued on the alternative
+                        ++nQueued;
                         fIncrementalHeadResolved = true;
                         continue;
                     }
@@ -1649,15 +1682,57 @@ static size_t RefillOrderedHeaderBlockRequests(
             else
                 ++nQueued;
             fIncrementalHeadResolved = true;
-            continue;
-        }
 
-        if (IbdHeaderSchedulerHashIsQueuedOnAnyPeer(hash, vNodesCopy))
-        {
-            ++nQueued;
-            fIncrementalHeadResolved = true;
-            continue;
+            // Opportunistically top up a missing backup copy inside the
+            // redundancy prefix.  Backup failure must not block the logical
+            // cursor, so it is never reflected in fullNextIndex.
+            if (nOwnerCount < (size_t)nDesiredOwners &&
+                !candidates.qualified.empty())
+            {
+                std::set<NodeId> owners;
+                GetBlockRequestOwnerPeers(hash, owners);
+                CNode* pBackup = IbdHeaderSchedulerBestPeerForHashExcluding(
+                    hash, candidates.qualified, owners, &budgetByPeer);
+                if (pBackup != NULL)
+                {
+                    std::map<CNode*, int>::iterator itBBudget =
+                        budgetByPeer.find(pBackup);
+                    if (itBBudget == budgetByPeer.end())
+                        itBBudget = budgetByPeer.insert(std::make_pair(
+                            pBackup,
+                            GetDeferredBlockRequestBudget(pBackup))).first;
+                    if (itBBudget->second > 0 && fPrefixCovered)
+                    {
+                    if (pBackup->AskFor(
+                            CInv(MSG_BLOCK, hash),
+                            BLOCKREQ_SOURCE_HEADERS_SCHEDULER,
+                            nDesiredOwners) == ASKFOR_QUEUED)
+                    {
+                        ++nAdmitted;
+                        --itBBudget->second;
+                        ++g_ibdHeaderSchedulerState.refillAdmissions;
+                        TryAssignBlockRequestOwner(
+                            hash, pBackup->GetId(),
+                            BLOCKREQ_SOURCE_HEADERS_SCHEDULER,
+                            NULL, NULL, nDesiredOwners);
+                    }
+                }
+            }
         }
+        continue;
+    }
+
+    // A hash already queued on some peer (e.g. re-admitted by the released-
+    // work recovery path, which does not claim ownership) is covered work: the
+    // getdata send path will claim ownership when it transmits the request.
+    // Re-running the no-owner path here would fail AskFor with
+    // ASKFOR_ALREADY_QUEUED and incorrectly park the cursor on it.
+    if (IbdHeaderSchedulerHashIsQueuedOnAnyPeer(hash, vNodesCopy))
+    {
+        ++nQueued;
+        fIncrementalHeadResolved = true;
+        continue;
+    }
 
     // No owner yet: must admit at least the primary copy.
     if (candidates.all.empty())
@@ -1690,20 +1765,57 @@ static size_t RefillOrderedHeaderBlockRequests(
             continue;
 
         if (pBest->AskFor(CInv(MSG_BLOCK, hash),
-                          BLOCKREQ_SOURCE_HEADERS_SCHEDULER) == ASKFOR_QUEUED)
-        {
-            ++nAdmitted;
-            fIncrementalHeadResolved = true;
-            --itBudget->second;
-            ++g_ibdHeaderSchedulerState.refillAdmissions;
-            // Phase 2: frontier baseline for progress-aware expiration.
-            g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline[hash] =
-                pindexBest->nHeight;
-        }
-        else
+                          BLOCKREQ_SOURCE_HEADERS_SCHEDULER,
+                          nDesiredOwners) != ASKFOR_QUEUED)
         {
             setFullNextIndexAt((size_t)(it - window.begin()));
             fPrefixCovered = false;
+            continue;
+        }
+
+        ++nAdmitted;
+        fIncrementalHeadResolved = true;
+        --itBudget->second;
+        ++g_ibdHeaderSchedulerState.refillAdmissions;
+        TryAssignBlockRequestOwner(
+            hash, pBest->GetId(), BLOCKREQ_SOURCE_HEADERS_SCHEDULER,
+            NULL, NULL, nDesiredOwners);
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline[hash] =
+            pindexBest->nHeight;
+
+        // Inside the redundancy prefix, try to add a backup copy on a
+        // different qualified peer.  Backup absence must not block the cursor.
+        if (nDesiredOwners > 1 && !candidates.qualified.empty())
+        {
+            std::set<NodeId> selected;
+            selected.insert(pBest->GetId());
+            CNode* pBackup = IbdHeaderSchedulerBestPeerForHashExcluding(
+                hash, candidates.qualified, selected, &budgetByPeer);
+            if (pBackup != NULL)
+            {
+                std::map<CNode*, int>::iterator itBBudget =
+                    budgetByPeer.find(pBackup);
+                if (itBBudget == budgetByPeer.end())
+                    itBBudget = budgetByPeer.insert(std::make_pair(
+                        pBackup,
+                        GetDeferredBlockRequestBudget(pBackup))).first;
+                if (itBBudget->second > 0 && fPrefixCovered)
+                {
+                    if (pBackup->AskFor(
+                            CInv(MSG_BLOCK, hash),
+                            BLOCKREQ_SOURCE_HEADERS_SCHEDULER,
+                            nDesiredOwners) == ASKFOR_QUEUED)
+                    {
+                        ++nAdmitted;
+                        --itBBudget->second;
+                        ++g_ibdHeaderSchedulerState.refillAdmissions;
+                        TryAssignBlockRequestOwner(
+                            hash, pBackup->GetId(),
+                            BLOCKREQ_SOURCE_HEADERS_SCHEDULER,
+                            NULL, NULL, nDesiredOwners);
+                    }
+                }
+            }
         }
     }
 
@@ -11683,7 +11795,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         ibdforensic::RecordReceived(
             pfrom->GetId(), hashBlock, GetTimeMicros(),
             nTimeReceived);
-        ReleaseBlockRequestOwnerOnReceive(hashBlock, pfrom->GetId());
+        // ClearBlockInFlight already releases this peer's owner slot.
+        // The remaining owner slots (if any) are cleared only after the block
+        // passes validation, so an invalid first copy does not kill a healthy
+        // backup (Stage 5 multi-owner transport).
         ibdblocklatency::RecordBlockReceived(
             hashBlock, pfrom->GetId(), (int64_t)nBlockPayloadBytes,
             nTimeReceived, pfrom->nPingUsecTime);
@@ -11798,6 +11913,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // already-known or orphaned.
         if (fAccepted || fKnownBefore || fOrphanBefore)
         {
+            // Logical request satisfied: clear any remaining backup owner slots
+            // without arming recovery.  This also lets EraseAlreadyAskedFor
+            // remove the global anti-duplicate entry.
+            SatisfyBlockLogicalRequest(hashBlock);
             EraseAlreadyAskedForIfUnowned(inv);
         }
         else if (!fKnownBefore && !fOrphanBefore && block.nDoS == 0 &&
@@ -13083,40 +13202,59 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                     EraseAlreadyAskedForIfUnowned(inv);
                     continue;
                 }
+                if (pto->setBlocksInFlight.size() >= nMaxBlocksInFlightPerPeer)
+                {
+                    break;
+                }
                 NodeId nOwnerPeer = -1;
                 BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
-                bool fHasOwner = GetBlockRequestOwner(
-                    inv.hash, &nOwnerPeer, &ownerState);
-                if (fHasOwner && nOwnerPeer != pto->GetId())
+                const bool fIsOwner = GetBlockRequestOwnerForPeer(
+                    inv.hash, pto->GetId(), &ownerState);
+                if (!fIsOwner)
                 {
-                    if (fTraceBlockRequest)
-                        BlockRequestTraceGetDataSkip(
-                            pto, inv.hash, nOwnerPeer,
-                            BlockRequestOwnerStateName(ownerState));
-                    // The peer queued a request for this hash but another peer
-                    // won ownership: it announced the block, so record it as an
-                    // alternate for a later timeout reassignment.
-                    RecordAlternateBlockAnnouncer(inv.hash, pto->GetId());
-                    pto->EraseAskForEntry(
-                        pto->mapAskFor.begin(), true,
-                        ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);
-                    continue;
+                    const size_t nOwnerCount = GetBlockRequestOwnerCount(inv.hash);
+                    if (nOwnerCount == 0)
+                    {
+                        // Legacy / manually queued entries may not have an
+                        // owner slot yet; claim one atomically before sending.
+                        if (!TryAssignBlockRequestOwner(
+                                inv.hash, pto->GetId(), BLOCKREQ_SOURCE_ASKFOR,
+                                &nOwnerPeer, &ownerState))
+                        {
+                            if (fTraceBlockRequest)
+                                BlockRequestTraceGetDataSkip(
+                                    pto, inv.hash, nOwnerPeer,
+                                    BlockRequestOwnerStateName(ownerState));
+                            pto->EraseAskForEntry(
+                                pto->mapAskFor.begin(), true,
+                                ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);
+                            continue;
+                        }
+                    }
+                    else
+                    {
+                        GetBlockRequestOwner(inv.hash, &nOwnerPeer, NULL);
+                        if (fTraceBlockRequest)
+                            BlockRequestTraceGetDataSkip(
+                                pto, inv.hash, nOwnerPeer,
+                                BlockRequestOwnerStateName(ownerState));
+                        RecordAlternateBlockAnnouncer(inv.hash, pto->GetId());
+                        pto->EraseAskForEntry(
+                            pto->mapAskFor.begin(), true,
+                            ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);
+                        continue;
+                    }
                 }
-                if (fHasOwner && nOwnerPeer == pto->GetId() &&
-                    ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)
+                else if (ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)
                 {
                     if (fTraceBlockRequest)
                         BlockRequestTraceGetDataSkip(
-                            pto, inv.hash, nOwnerPeer,
+                            pto, inv.hash, pto->GetId(),
                             BlockRequestOwnerStateName(ownerState));
                     pto->EraseAskForEntry(
                         pto->mapAskFor.begin(), false,
                         ibdmetrics::ACTIVE_DECREMENT_ASKFOR_REMOVED_OWNER_CONFLICT);
                     continue;
-                }
-                if (pto->setBlocksInFlight.size() >= nMaxBlocksInFlightPerPeer)
-                {
-                    break;
                 }
             }
             {
@@ -13149,9 +13287,11 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                 {
                     NodeId nOwnerPeer = -1;
                     BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+                    const int nDesiredCopies =
+                        std::max(1, GetBlockRequestOwnerMaxCopies(inv.hash));
                     if (!TryAssignBlockRequestOwner(
                             inv.hash, pto->GetId(), BLOCKREQ_SOURCE_ASKFOR,
-                            &nOwnerPeer, &ownerState))
+                            &nOwnerPeer, &ownerState, nDesiredCopies))
                     {
                         if (fTraceBlockRequest)
                             BlockRequestTraceGetDataSkip(

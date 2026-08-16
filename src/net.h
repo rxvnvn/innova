@@ -654,20 +654,30 @@ enum AskForResult
 bool TryAssignBlockRequestOwner(const uint256& hash, NodeId peer,
                                 BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER,
                                 NodeId* existingPeer = NULL,
-                                BlockRequestOwnerState* existingState = NULL);
+                                BlockRequestOwnerState* existingState = NULL,
+                                int nMaxOwners = 1);
 bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
                                       BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER,
                                       NodeId* existingPeer = NULL,
-                                      BlockRequestOwnerState* existingState = NULL);
+                                      BlockRequestOwnerState* existingState = NULL,
+                                      int nMaxOwners = 1);
 bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
                           BlockRequestOwnerState* ownerState);
+bool GetBlockRequestOwnerForPeer(const uint256& hash, NodeId peer,
+                                 BlockRequestOwnerState* ownerState = NULL,
+                                 int64_t* assignedUs = NULL);
 bool GetBlockRequestOwnerDetails(const uint256& hash, NodeId* ownerPeer,
                                  BlockRequestOwnerState* ownerState,
                                  int64_t* assignedUs);
+size_t GetBlockRequestOwnerCount(const uint256& hash);
+int GetBlockRequestOwnerMaxCopies(const uint256& hash);
+bool IsBlockRequestOwnedByPeer(const uint256& hash, NodeId peer);
+void GetBlockRequestOwnerPeers(const uint256& hash, std::set<NodeId>& peers);
 bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer);
 bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
                               const char* pszReason);
 bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer);
+bool SatisfyBlockLogicalRequest(const uint256& hash);
 size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason,
                                         bool fRecordForensics = true);
 const char* BlockRequestOwnerStateName(BlockRequestOwnerState state);
@@ -1824,7 +1834,8 @@ public:
         setAskForBlocks.clear();
     }
 
-    AskForResult AskFor(const CInv& inv, BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER)
+    AskForResult AskFor(const CInv& inv, BlockRequestTraceSource source = BLOCKREQ_SOURCE_OTHER,
+                        int nMaxOwners = 1)
     {
         const int64_t nPruneNow = GetTimeMicros();
         PruneAlreadyAskedFor(nPruneNow);
@@ -1891,22 +1902,28 @@ public:
 
         NodeId nOwnerPeer = -1;
         BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
-        if (fBlockRequest &&
-            GetBlockRequestOwner(inv.hash, &nOwnerPeer, &ownerState) &&
-            nOwnerPeer != GetId())
+        if (fBlockRequest)
         {
-            if (BlockRequestTraceEnabled())
-                BlockRequestTraceAskSkip(this, inv.hash, source,
-                                         "other-peer-active-owner",
-                                         nOwnerPeer,
-                                         BlockRequestOwnerStateName(ownerState));
-            ibdmetrics::Get().askfor_skip_other_peer_owner.fetch_add(
-                1, std::memory_order_relaxed);
-            // This peer announced a hash that another peer owns: strong
-            // evidence it can serve the block, so remember it as an
-            // alternative for a later timeout reassignment.
-            RecordAlternateBlockAnnouncer(inv.hash, GetId());
-            return ASKFOR_OWNED_BY_OTHER;
+            const size_t nOwnerCount = GetBlockRequestOwnerCount(inv.hash);
+            if (nOwnerCount > 0)
+            {
+                GetBlockRequestOwner(inv.hash, &nOwnerPeer, &ownerState);
+                if ((int)nOwnerCount >= nMaxOwners)
+                {
+                    if (BlockRequestTraceEnabled())
+                        BlockRequestTraceAskSkip(this, inv.hash, source,
+                                                 "other-peer-active-owner",
+                                                 nOwnerPeer,
+                                                 BlockRequestOwnerStateName(ownerState));
+                    ibdmetrics::Get().askfor_skip_other_peer_owner.fetch_add(
+                        1, std::memory_order_relaxed);
+                    // This peer announced a hash that another peer owns: strong
+                    // evidence it can serve the block, so remember it as an
+                    // alternative for a later timeout reassignment.
+                    RecordAlternateBlockAnnouncer(inv.hash, GetId());
+                    return ASKFOR_OWNED_BY_OTHER;
+                }
+            }
         }
 
         // We're using mapAskFor as a priority queue,
