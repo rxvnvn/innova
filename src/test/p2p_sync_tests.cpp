@@ -10052,12 +10052,98 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_request_prelude_refuses_beyond_lookahead_
     fIbdHeaderScheduler = savedScheduler;
 }
 
-BOOST_AUTO_TEST_CASE(headers_scheduler_active_ancestor_closes_exact_source_hole)
+// ---- Stage 4 hard quality gate discriminators ------------------------------
+
+// Helper: build a linear chain of `count` headers above `anchor`.
+static std::vector<std::pair<uint256, uint256> > BuildLinearHeaders(
+    const uint256& anchor, uint64_t base, int count)
 {
-    // Peer C never sent header 5, but it sent active-path descendants 6-10.
-    // That strictly-above exact evidence makes C a normal candidate for 5,
-    // closing the old exact-source metadata hole without inv availability.
-    // Disconnecting B removes B exact evidence but must not recreate the hole.
+    std::vector<std::pair<uint256, uint256> > headers;
+    headers.reserve(count);
+    uint256 previous = anchor;
+    for (int i = 1; i <= count; ++i)
+    {
+        const uint256 hash(base + i);
+        headers.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    return headers;
+}
+
+// Common fixture for Stage 4 quality-gate discriminators:
+// W=512 (HP=64), two peers, 600 seeded headers (lookahead in resume band),
+// full 512-entry window, budget 256 per peer / 512 global.
+struct QualityGateTwoPeerFixture
+{
+    std::unique_ptr<CNode> peerA;
+    std::unique_ptr<CNode> peerB;
+    std::unique_ptr<ScopedPeerSocket> socketA;
+    std::unique_ptr<ScopedPeerSocket> socketB;
+    std::unique_ptr<CScopedInitialBlockDownloadState> ibdState;
+    bool fHadWindowArg;
+    std::string strWindowArgSaved;
+    static const uint64_t base = 9000000;
+
+    QualityGateTwoPeerFixture()
+    {
+        fHadWindowArg = mapArgs.count("-ibdblockwindow") != 0;
+        strWindowArgSaved = mapArgs["-ibdblockwindow"];
+        mapArgs["-ibdblockwindow"] = "512";
+        ResetIbdBlockWindowConfigForTesting();
+
+        peerA.reset(new CNode(INVALID_SOCKET, TestPeerAddress(120),
+                              "quality-a", true));
+        peerB.reset(new CNode(INVALID_SOCKET, TestPeerAddress(121),
+                              "quality-b", true));
+        PreparePeerForSendMessages(*peerA, PROTOCOL_VERSION);
+        PreparePeerForSendMessages(*peerB, PROTOCOL_VERSION);
+        // Give B a better tail score so it wins hashes outside the head-prefix.
+        peerB->nPingUsecTime = 1000;
+        socketA.reset(new ScopedPeerSocket(*peerA));
+        socketB.reset(new ScopedPeerSocket(*peerB));
+
+        ibdState.reset(new CScopedInitialBlockDownloadState(peerA.get()));
+        {
+            LOCK(cs_vNodes);
+            vNodes.push_back(peerB.get());
+        }
+
+        const uint256 anchor(base);
+        BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+        const std::vector<std::pair<uint256, uint256> > headers =
+            BuildLinearHeaders(anchor, base, 600);
+        BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA->GetId(),
+                                                              headers));
+        BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB->GetId(),
+                                                              headers));
+        for (int i = 1; i <= 600; ++i)
+        {
+            SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerA->GetId(),
+                                                            uint256(base + i));
+            SeedIbdHeaderSchedulerInvAvailabilityForTesting(peerB->GetId(),
+                                                            uint256(base + i));
+        }
+    }
+
+    ~QualityGateTwoPeerFixture()
+    {
+        peerA->ClearAskFor();
+        peerB->ClearAskFor();
+        ResetIbdHeaderSchedulerStateForTesting();
+        UnsetIbdQualityClockForTesting();
+        if (fHadWindowArg)
+            mapArgs["-ibdblockwindow"] = strWindowArgSaved;
+        else
+            mapArgs.erase("-ibdblockwindow");
+        ResetIbdBlockWindowConfigForTesting();
+    }
+};
+
+// Stage 4: a slow peer (40s delivery EWMA) is hard-excluded from the
+// head-prefix, but remains admissible outside the head-prefix where the gate
+// does not apply.
+BOOST_AUTO_TEST_CASE(headers_scheduler_quality_gate_excludes_slow_peer_from_head_prefix)
+{
     const bool savedScheduler = fIbdHeaderScheduler;
     const bool savedObserve = fIbdHeadersObserve;
     const bool savedSpv = fSPVMode;
@@ -10065,108 +10151,49 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_active_ancestor_closes_exact_source_hole)
     fIbdHeadersObserve = false;
     fSPVMode = false;
     ResetIbdHeaderSchedulerStateForTesting();
-
+    CScopedIbdQualityState qualityScope;
+    SetIbdQualityClockForTesting(100 * 1000000);
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
-    CNode peerA(INVALID_SOCKET, TestPeerAddress(94), "sched-hole-a", true);
-    CNode peerB(INVALID_SOCKET, TestPeerAddress(97), "sched-hole-b", true);
-    CNode peerC(INVALID_SOCKET, TestPeerAddress(98), "sched-hole-c", true);
-    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
-    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
-    PreparePeerForSendMessages(peerC, PROTOCOL_VERSION);
-    CScopedInitialBlockDownloadState ibdState(&peerA);
 
-    const uint256 anchor(3000000);
-    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
-
-    std::vector<std::pair<uint256, uint256> > headersA;
-    headersA.reserve(4);
-    uint256 previous = anchor;
-    for (int i = 1; i <= 4; ++i)
-    {
-        const uint256 hash(3000000 + i);
-        headersA.push_back(std::make_pair(hash, previous));
-        previous = hash;
-    }
-    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headersA));
-
-    std::vector<std::pair<uint256, uint256> > headersB;
-    headersB.reserve(10);
-    previous = anchor;
-    for (int i = 1; i <= 10; ++i)
-    {
-        const uint256 hash(3000000 + i);
-        headersB.push_back(std::make_pair(hash, previous));
-        previous = hash;
-    }
-    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), headersB));
-
-    std::vector<std::pair<uint256, uint256> > headersC;
-    headersC.reserve(5);
-    previous = uint256(3000005);
-    for (int i = 6; i <= 10; ++i)
-    {
-        const uint256 hash(3000000 + i);
-        headersC.push_back(std::make_pair(hash, previous));
-        previous = hash;
-    }
-    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerC.GetId(), headersC));
-
-    // B was the only exact source of block 5.  Disconnecting B removes that
-    // exact source; C remains inferred-eligible through active descendants.
-    IbdHeadersObserverPeerDisconnected(peerB.GetId());
-
+    QualityGateTwoPeerFixture fixture;
     std::vector<CNode*> peers;
-    peers.push_back(&peerA);
-    peers.push_back(&peerC);
-    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 10U);
-    for (int i = 1; i <= 4; ++i)
-        BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(3000000 + i)));
-    for (int i = 5; i <= 10; ++i)
-        BOOST_CHECK(!peerA.IsBlockAskForQueued(uint256(3000000 + i)));
-    for (int i = 6; i <= 10; ++i)
-        BOOST_CHECK(peerC.IsBlockAskForQueued(uint256(3000000 + i)));
+    peers.push_back(fixture.peerA.get());
+    peers.push_back(fixture.peerB.get());
 
-    const uint256 inflight(3000002);
-    BOOST_REQUIRE(TryAssignBlockRequestOwner(inflight, peerA.GetId(), BLOCKREQ_SOURCE_ASKFOR));
-    peerA.MarkBlockInFlight(inflight);
-    for (std::multimap<int64_t, CInv>::iterator it = peerA.mapAskFor.begin();
-         it != peerA.mapAskFor.end(); ++it)
+    // Fast peer ~1s EWMA; slow peer 40s EWMA.  Both have >=2 deliveries.
+    fixture.peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+    fixture.peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+    fixture.peerB->RecordIbdBlockDelivery(40 * 1000000, false);
+    fixture.peerB->RecordIbdBlockDelivery(40 * 1000000, false);
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 512U);
+
+    const uint64_t base = QualityGateTwoPeerFixture::base;
+    // Head-prefix heights 1..64 (W=512 -> HP=64).  Slow peer must be excluded.
+    for (int h = 1; h <= 64; ++h)
     {
-        if (it->second.hash == inflight)
-        {
-            peerA.EraseAskForEntry(it, false);
-            break;
-        }
+        const uint256 hash(base + h);
+        BOOST_CHECK_MESSAGE(!fixture.peerB->IsBlockAskForQueued(hash),
+                            "slow peer admitted to head-prefix height " << h);
     }
-    NodeId ownerPeer = -1;
-    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
-    BOOST_CHECK(GetBlockRequestOwner(inflight, &ownerPeer, &ownerState));
-    BOOST_CHECK_EQUAL(ownerPeer, peerA.GetId());
-    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
-
-    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
-    BOOST_CHECK(GetBlockRequestOwner(inflight, &ownerPeer, &ownerState));
-    BOOST_CHECK_EQUAL(ownerPeer, peerA.GetId());
-    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
-    for (int i = 5; i <= 10; ++i)
-        BOOST_CHECK(!peerA.IsBlockAskForQueued(uint256(3000000 + i)));
-    for (int i = 6; i <= 10; ++i)
-        BOOST_CHECK(peerC.IsBlockAskForQueued(uint256(3000000 + i)));
-    for (int i = 1; i <= 4; ++i)
+    BOOST_CHECK(fixture.peerA->IsBlockAskForQueued(uint256(base + 1)));
+    // Outside the head-prefix the same slow peer must still receive work.
+    bool fPeerBOutsideHeadPrefix = false;
+    for (int h = 65; h <= 600 && !fPeerBOutsideHeadPrefix; ++h)
     {
-        if (i != 2)
-            BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(3000000 + i)));
+        if (fixture.peerB->IsBlockAskForQueued(uint256(base + h)))
+            fPeerBOutsideHeadPrefix = true;
     }
+    BOOST_CHECK(fPeerBOutsideHeadPrefix);
 
-    peerA.ClearAskFor();
-    peerC.ClearAskFor();
-    ResetIbdHeaderSchedulerStateForTesting();
     fSPVMode = savedSpv;
     fIbdHeadersObserve = savedObserve;
     fIbdHeaderScheduler = savedScheduler;
 }
 
-BOOST_AUTO_TEST_CASE(headers_scheduler_branch_switch_barrier_purges_only_obsolete_queue)
+// Stage 4: when no peer has enough delivery history the gate is bypassed,
+// so the pipeline is not drained.
+BOOST_AUTO_TEST_CASE(headers_scheduler_quality_gate_bypassed_when_history_insufficient)
 {
     const bool savedScheduler = fIbdHeaderScheduler;
     const bool savedObserve = fIbdHeadersObserve;
@@ -10175,25 +10202,115 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_branch_switch_barrier_purges_only_obsolet
     fIbdHeadersObserve = false;
     fSPVMode = false;
     ResetIbdHeaderSchedulerStateForTesting();
-
+    CScopedIbdQualityState qualityScope;
+    SetIbdQualityClockForTesting(100 * 1000000);
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
-    CNode peerA(INVALID_SOCKET, TestPeerAddress(120), "branch-a", true);
-    CNode peerB(INVALID_SOCKET, TestPeerAddress(121), "branch-b", true);
-    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
-    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
-    CScopedInitialBlockDownloadState ibdState(&peerA);
+
+    QualityGateTwoPeerFixture fixture;
+    std::vector<CNode*> peers;
+    peers.push_back(fixture.peerA.get());
+    peers.push_back(fixture.peerB.get());
+
+    // No delivery history at all -> gate bypassed.
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 512U);
+
+    const uint64_t base = QualityGateTwoPeerFixture::base;
+    BOOST_CHECK(fixture.peerA->IsBlockAskForQueued(uint256(base + 1)) ||
+                fixture.peerB->IsBlockAskForQueued(uint256(base + 1)));
+
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+// Stage 4: even if only one peer qualifies for the head-prefix, the head-prefix
+// still advances (pipeline not stalled).
+BOOST_AUTO_TEST_CASE(headers_scheduler_quality_gate_single_qualified_advances_head_prefix)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+    CScopedIbdQualityState qualityScope;
+    SetIbdQualityClockForTesting(100 * 1000000);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    QualityGateTwoPeerFixture fixture;
+    std::vector<CNode*> peers;
+    peers.push_back(fixture.peerA.get());
+    peers.push_back(fixture.peerB.get());
+
+    // Only peerA qualifies (>=2 deliveries); peerB has no history.
+    fixture.peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+    fixture.peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 512U);
+
+    const uint64_t base = QualityGateTwoPeerFixture::base;
+    BOOST_CHECK(fixture.peerA->IsBlockAskForQueued(uint256(base + 1)));
+    BOOST_CHECK(!fixture.peerB->IsBlockAskForQueued(uint256(base + 1)));
+    // peerB still serves tail hashes outside the head-prefix.
+    bool fPeerBOutsideHeadPrefix = false;
+    for (int h = 65; h <= 600 && !fPeerBOutsideHeadPrefix; ++h)
     {
-        LOCK(cs_vNodes);
-        vNodes.push_back(&peerB);
+        if (fixture.peerB->IsBlockAskForQueued(uint256(base + h)))
+            fPeerBOutsideHeadPrefix = true;
     }
+    BOOST_CHECK(fPeerBOutsideHeadPrefix);
 
-    const uint256 anchor(6000000);
-    const uint256 a1(6000001), a2(6000002), a3(6000003), a4(6000004);
-    const uint256 b2(6000012), b3(6000013), b4(6000014);
-    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
 
-    std::vector<std::pair<uint256, uint256> > oldHeaders;
-    oldHeaders.push_back(std::make_pair(a1, anchor));
+// Stage 4: a peer with a recent timeout is in cooldown and is excluded from the
+// head-prefix even if its latency is acceptable.
+BOOST_AUTO_TEST_CASE(headers_scheduler_quality_gate_timeout_cooldown_excludes_peer)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+    CScopedIbdQualityState qualityScope;
+    SetIbdQualityClockForTesting(100 * 1000000);
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+
+    QualityGateTwoPeerFixture fixture;
+    std::vector<CNode*> peers;
+    peers.push_back(fixture.peerA.get());
+    peers.push_back(fixture.peerB.get());
+
+    // Both peers have acceptable latency, but peerB has a very recent timeout.
+    fixture.peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+    fixture.peerA->RecordIbdBlockDelivery(1 * 1000000, false);
+    fixture.peerB->RecordIbdBlockDelivery(1 * 1000000, false);
+    fixture.peerB->RecordIbdBlockDelivery(1 * 1000000, false);
+    fixture.peerB->RecordIbdBlockTimeout();
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 512U);
+
+    const uint64_t base = QualityGateTwoPeerFixture::base;
+    BOOST_CHECK(fixture.peerA->IsBlockAskForQueued(uint256(base + 1)));
+    BOOST_CHECK(!fixture.peerB->IsBlockAskForQueued(uint256(base + 1)));
+    // peerB is still admissible outside the head-prefix.
+    bool fPeerBOutsideHeadPrefix = false;
+    for (int h = 65; h <= 600 && !fPeerBOutsideHeadPrefix; ++h)
+    {
+        if (fixture.peerB->IsBlockAskForQueued(uint256(base + h)))
+            fPeerBOutsideHeadPrefix = true;
+    }
+    BOOST_CHECK(fPeerBOutsideHeadPrefix);
+
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
 BOOST_AUTO_TEST_CASE(headers_scheduler_sequential_refill_uses_incremental_cursor)
 {
     const bool savedScheduler = fIbdHeaderScheduler;
@@ -10664,6 +10781,148 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_refill_fills_wide_window_with_scaled_budg
     fIbdHeaderScheduler = savedScheduler;
 }
 
+BOOST_AUTO_TEST_CASE(headers_scheduler_active_ancestor_closes_exact_source_hole)
+{
+    // Peer C never sent header 5, but it sent active-path descendants 6-10.
+    // That strictly-above exact evidence makes C a normal candidate for 5,
+    // closing the old exact-source metadata hole without inv availability.
+    // Disconnecting B removes B exact evidence but must not recreate the hole.
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(94), "sched-hole-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(97), "sched-hole-b", true);
+    CNode peerC(INVALID_SOCKET, TestPeerAddress(98), "sched-hole-c", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerC, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+
+    const uint256 anchor(3000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+
+    std::vector<std::pair<uint256, uint256> > headersA;
+    headersA.reserve(4);
+    uint256 previous = anchor;
+    for (int i = 1; i <= 4; ++i)
+    {
+        const uint256 hash(3000000 + i);
+        headersA.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerA.GetId(), headersA));
+
+    std::vector<std::pair<uint256, uint256> > headersB;
+    headersB.reserve(10);
+    previous = anchor;
+    for (int i = 1; i <= 10; ++i)
+    {
+        const uint256 hash(3000000 + i);
+        headersB.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerB.GetId(), headersB));
+
+    std::vector<std::pair<uint256, uint256> > headersC;
+    headersC.reserve(5);
+    previous = uint256(3000005);
+    for (int i = 6; i <= 10; ++i)
+    {
+        const uint256 hash(3000000 + i);
+        headersC.push_back(std::make_pair(hash, previous));
+        previous = hash;
+    }
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerHeadersForTesting(peerC.GetId(), headersC));
+
+    // B was the only exact source of block 5.  Disconnecting B removes that
+    // exact source; C remains inferred-eligible through active descendants.
+    IbdHeadersObserverPeerDisconnected(peerB.GetId());
+
+    std::vector<CNode*> peers;
+    peers.push_back(&peerA);
+    peers.push_back(&peerC);
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 10U);
+    for (int i = 1; i <= 4; ++i)
+        BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(3000000 + i)));
+    for (int i = 5; i <= 10; ++i)
+        BOOST_CHECK(!peerA.IsBlockAskForQueued(uint256(3000000 + i)));
+    for (int i = 6; i <= 10; ++i)
+        BOOST_CHECK(peerC.IsBlockAskForQueued(uint256(3000000 + i)));
+
+    const uint256 inflight(3000002);
+    BOOST_REQUIRE(TryAssignBlockRequestOwner(inflight, peerA.GetId(), BLOCKREQ_SOURCE_ASKFOR));
+    peerA.MarkBlockInFlight(inflight);
+    for (std::multimap<int64_t, CInv>::iterator it = peerA.mapAskFor.begin();
+         it != peerA.mapAskFor.end(); ++it)
+    {
+        if (it->second.hash == inflight)
+        {
+            peerA.EraseAskForEntry(it, false);
+            break;
+        }
+    }
+    NodeId ownerPeer = -1;
+    BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+    BOOST_CHECK(GetBlockRequestOwner(inflight, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peerA.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+
+    BOOST_CHECK_EQUAL(RefillOrderedHeaderBlockRequestsForTesting(peers), 0U);
+    BOOST_CHECK(GetBlockRequestOwner(inflight, &ownerPeer, &ownerState));
+    BOOST_CHECK_EQUAL(ownerPeer, peerA.GetId());
+    BOOST_CHECK_EQUAL(ownerState, BLOCK_REQUEST_OWNER_IN_FLIGHT);
+    for (int i = 5; i <= 10; ++i)
+        BOOST_CHECK(!peerA.IsBlockAskForQueued(uint256(3000000 + i)));
+    for (int i = 6; i <= 10; ++i)
+        BOOST_CHECK(peerC.IsBlockAskForQueued(uint256(3000000 + i)));
+    for (int i = 1; i <= 4; ++i)
+    {
+        if (i != 2)
+            BOOST_CHECK(peerA.IsBlockAskForQueued(uint256(3000000 + i)));
+    }
+
+    peerA.ClearAskFor();
+    peerC.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_branch_switch_barrier_purges_only_obsolete_queue)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CNode peerA(INVALID_SOCKET, TestPeerAddress(120), "branch-a", true);
+    CNode peerB(INVALID_SOCKET, TestPeerAddress(121), "branch-b", true);
+    PreparePeerForSendMessages(peerA, PROTOCOL_VERSION);
+    PreparePeerForSendMessages(peerB, PROTOCOL_VERSION);
+    CScopedInitialBlockDownloadState ibdState(&peerA);
+    {
+        LOCK(cs_vNodes);
+        vNodes.push_back(&peerB);
+    }
+
+    const uint256 anchor(6000000);
+    const uint256 a1(6000001), a2(6000002), a3(6000003), a4(6000004);
+    const uint256 b2(6000012), b3(6000013), b4(6000014);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+
+    std::vector<std::pair<uint256, uint256> > oldHeaders;
+    oldHeaders.push_back(std::make_pair(a1, anchor));
     oldHeaders.push_back(std::make_pair(a2, a1));
     oldHeaders.push_back(std::make_pair(a3, a2));
     oldHeaders.push_back(std::make_pair(a4, a3));

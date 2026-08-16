@@ -741,6 +741,9 @@ static const int64_t IBD_PEER_QUALITY_MIN_SCORE = 8;
 // timeout share is a rolling window in event space and a recovering peer is
 // re-promoted to GOOD without a restart.
 static const int64_t IBD_PEER_QUALITY_DEGRADED_RATE_PERMILLE = 250;
+// Stage 4 hard quality gate: a peer that recently timed out a block request is
+// excluded from head-prefix candidates for this cooldown period.
+static const int64_t IBD_PEER_QUALITY_TIMEOUT_COOLDOWN_US = 60 * 1000000;
 // Delivery-latency EWMA smoothing factor: new_sample = (7*old + 1*new) / 8.
 static const int64_t IBD_PEER_LATENCY_EWMA_SHIFT = 3;
 
@@ -809,6 +812,10 @@ struct IbdPeerQualitySnapshot
     bool has_latency_sample;
     int64_t last_timeout_time_us;
     int64_t last_delivery_time_us;
+    // Stage 4 hard quality gate: number of completed block deliveries from
+    // this peer.  Used to enforce the "at least 2 confirmed recent deliveries"
+    // head-prefix criterion.
+    uint64_t releases_by_receive;
 };
 
 // Record a peer in the alternate-announcer ledger for a hash.  Guarded by
@@ -2696,6 +2703,8 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
             ibdQuality.last_timeout_time_us.load(std::memory_order_relaxed);
         snap.last_delivery_time_us =
             ibdQuality.last_delivery_time_us.load(std::memory_order_relaxed);
+        snap.releases_by_receive =
+            ibdQuality.releases_by_receive.load(std::memory_order_relaxed);
         return snap;
     }
     // Deterministic decayed-score step: each completed outcome halves the

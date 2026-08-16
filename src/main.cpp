@@ -740,7 +740,11 @@ IbdHeaderSchedulerBuildActiveAncestorEvidence(
 }
 
 
-static std::vector<CNode*> IbdHeaderSchedulerCandidatePeers(
+int GetIbdHeaderHeadPrefixHeight()
+{
+    const std::size_t W = GetIbdBlockWindow();
+    return (int)std::min<std::size_t>(512, std::max<std::size_t>(64, W / 8));
+}
 
 int GetIbdHeaderRedundancyPrefixHeight()
 {
@@ -748,10 +752,49 @@ int GetIbdHeaderRedundancyPrefixHeight()
     return (int)std::min<std::size_t>(256, std::max<std::size_t>(32, W / 32));
 }
 
+// Stage 4 hard quality gate: for head-prefix positions, a candidate peer must
+// have (1) at least 2 confirmed recent block deliveries, (2) an EWMA delivery
+// latency no more than 1.5x the median across active peers with samples, and
+// (3) no timeout in the last IBD_PEER_QUALITY_TIMEOUT_COOLDOWN_US.  To avoid
+// draining the pipeline when history is insufficient or every peer fails the
+// criteria, the gate is bypassed when the filtered set would be empty.
+static bool IbdPeerQualifiesForHeadPrefix(CNode* pnode,
+    int64_t nMedianLatencyUs, bool fHaveEnoughHistory)
+{
+    if (pnode == NULL) return false;
+    const IbdPeerQualitySnapshot snap = pnode->GetIbdQualitySnapshot();
+    // Criterion 1: at least 2 confirmed recent block deliveries.
+    if (snap.releases_by_receive < 2)
+        return false;
+    // Criterion 3: not in timeout cooldown.
+    if (snap.last_timeout_time_us > 0)
+    {
+        const int64_t nNowUs = CNode::QualityNowUs();
+        if (nNowUs - snap.last_timeout_time_us <
+            IBD_PEER_QUALITY_TIMEOUT_COOLDOWN_US)
+            return false;
+    }
+    // Criterion 2: latency <= 1.5 * median (only if enough history exists).
+    if (fHaveEnoughHistory && snap.has_latency_sample &&
+        snap.latency_ewma_us > nMedianLatencyUs + nMedianLatencyUs / 2)
+        return false;
+    return true;
+}
+
+struct IbdHeaderSchedulerCandidateSet
+{
+    std::vector<CNode*> qualified;
+    std::vector<CNode*> all;
+};
+
+static IbdHeaderSchedulerCandidateSet IbdHeaderSchedulerCandidatePeers(
     const uint256& hash, size_t activeIndex, int activeHeight,
     const IbdHeaderSchedulerActiveAncestorEvidence& evidence,
-    const std::vector<CNode*>& vNodesCopy)
+    const std::vector<CNode*>& vNodesCopy,
+    int nFrontierHeight)
 {
+    IbdHeaderSchedulerCandidateSet result;
+
     // BlockCandidateSources(H) = ExactSources(H) union InvAvailability(H)
     // union InferredActiveAncestorSources(H).  The inferred set contains a
     // peer only when its deepest exact claim is STRICTLY above H in this
@@ -770,7 +813,7 @@ int GetIbdHeaderRedundancyPrefixHeight()
     if (itAvail != g_ibdHeaderSchedulerState.invAvailability.end())
         peerIds.insert(itAvail->second.begin(), itAvail->second.end());
 
-    std::vector<CNode*> out;
+    std::vector<CNode*> all;
     for (std::vector<CNode*>::const_iterator it = vNodesCopy.begin();
          it != vNodesCopy.end(); ++it)
     {
@@ -780,9 +823,56 @@ int GetIbdHeaderRedundancyPrefixHeight()
             continue;
         if (peerIds.count(pnode->GetId()) == 0)
             continue;
-        out.push_back(pnode);
+        all.push_back(pnode);
     }
-    return out;
+
+    // Stage 4 hard quality gate: only for the head-prefix region
+    // (frontier, frontier + HP].  Outside the head-prefix the existing
+    // candidate rules are unchanged.
+    std::vector<CNode*> qualified;
+    const std::size_t nHeadPrefix = GetIbdHeaderHeadPrefixHeight();
+    if (activeHeight > nFrontierHeight &&
+        (std::size_t)(activeHeight - nFrontierHeight) <= nHeadPrefix)
+    {
+        // Collect EWMA latencies from all active peers that have samples, so
+        // the median is computed over the peer population, not only over peers
+        // that happen to be candidates for this hash.
+        std::vector<int64_t> vLatencies;
+        for (std::vector<CNode*>::const_iterator it = vNodesCopy.begin();
+             it != vNodesCopy.end(); ++it)
+        {
+            CNode* pnode = *it;
+            if (pnode == NULL || pnode->fDisconnect || pnode->fClient ||
+                pnode->fOneShot || pnode->nVersion == 0)
+                continue;
+            const IbdPeerQualitySnapshot snap = pnode->GetIbdQualitySnapshot();
+            if (snap.has_latency_sample)
+                vLatencies.push_back(snap.latency_ewma_us);
+        }
+        const bool fHaveEnoughHistory = vLatencies.size() >= 2;
+        int64_t nMedianLatencyUs = 0;
+        if (fHaveEnoughHistory)
+        {
+            std::sort(vLatencies.begin(), vLatencies.end());
+            const size_t n = vLatencies.size();
+            nMedianLatencyUs = (vLatencies[(n - 1) / 2] + vLatencies[n / 2]) / 2;
+        }
+
+        for (std::vector<CNode*>::const_iterator it = all.begin();
+             it != all.end(); ++it)
+        {
+            if (IbdPeerQualifiesForHeadPrefix(*it, nMedianLatencyUs,
+                                              fHaveEnoughHistory))
+                qualified.push_back(*it);
+        }
+    }
+
+    // Primary selection uses the qualified set when non-empty, otherwise falls
+    // back to all candidates.  Backup selection always uses the qualified set
+    // (empty outside the head-prefix or when no peer passes the gate).
+    result.qualified = qualified;
+    result.all = qualified.empty() ? all : qualified;
+    return result;
 }
 
 static int64_t IbdHeaderSchedulerPeerScore(const CNode* pnode,
@@ -1012,15 +1102,16 @@ static size_t RecoverOrderedReleasedBlocks(
             fUnresolved = true;
             break;
         }
-        const std::vector<CNode*> candidates =
+        const IbdHeaderSchedulerCandidateSet candidates =
             IbdHeaderSchedulerCandidatePeers(hash, i, node->height,
-                                             evidence, vNodesCopy);
-        if (candidates.empty())
+                                             evidence, vNodesCopy,
+                                             pindexBest->nHeight);
+        if (candidates.all.empty())
         {
             fUnresolved = true;
             break;
         }
-        CNode* pBest = IbdHeaderSchedulerBestPeerForHash(hash, candidates);
+        CNode* pBest = IbdHeaderSchedulerBestPeerForHash(hash, candidates.all);
         if (pBest != pto)
             continue;
         if (pto->AskFor(CInv(MSG_BLOCK, hash),
@@ -1505,14 +1596,15 @@ static size_t RefillOrderedHeaderBlockRequests(
 
         const size_t activeIndex = evidenceOffset +
             (size_t)(it - window.begin());
-        const std::vector<CNode*> candidates =
-            IbdHeaderSchedulerCandidatePeers(hash, activeIndex, nHeight, evidence,
-                                             vNodesCopy);
+        const IbdHeaderSchedulerCandidateSet candidates =
+            IbdHeaderSchedulerCandidatePeers(hash, activeIndex, nHeight,
+                                             evidence, vNodesCopy,
+                                             pindexBest->nHeight);
         if (frontHash == 0)
         {
             frontHash = hash;
             frontHeight = nHeight;
-            frontAlternatives = candidates.size();
+            frontAlternatives = candidates.all.size();
         }
 
         NodeId ownerPeer = -1;
@@ -1542,7 +1634,7 @@ static size_t RefillOrderedHeaderBlockRequests(
                     ibdmetrics::Get().front_preempt_attempts.fetch_add(
                         1, std::memory_order_relaxed);
                     if (MaybePreemptOrderedHeadSlot(
-                            hash, ownerPeer, candidates, vNodesCopy))
+                            hash, ownerPeer, candidates.all, vNodesCopy))
                     {
                         ++g_ibdHeaderSchedulerState.frontPreemptTransfers;
                         ibdmetrics::Get().front_preempt_transfers.fetch_add(
@@ -1567,17 +1659,18 @@ static size_t RefillOrderedHeaderBlockRequests(
             continue;
         }
 
-        if (candidates.empty())
-        {
-            ++nUnknownAvailability;
-            setFullNextIndexAt((size_t)(it - window.begin()));
-            fPrefixCovered = false;
-            continue;
-        }
+    // No owner yet: must admit at least the primary copy.
+    if (candidates.all.empty())
+    {
+        ++nUnknownAvailability;
+        setFullNextIndexAt((size_t)(it - window.begin()));
+        fPrefixCovered = false;
+        continue;
+    }
 
         ++nRequestable;
         CNode* pBest =
-            IbdHeaderSchedulerBestPeerForHash(hash, candidates, &budgetByPeer);
+            IbdHeaderSchedulerBestPeerForHash(hash, candidates.all, &budgetByPeer);
         if (pBest == NULL)
         {
             setFullNextIndexAt((size_t)(it - window.begin()));
