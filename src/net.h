@@ -1317,6 +1317,25 @@ protected:
 public:
     std::map<uint256, CRequestTracker> mapRequests;
     CCriticalSection cs_mapRequests;
+    // Serving-side getheaders dedup bookkeeping (only used while
+    // -headersserveddedup is enabled).  Keyed by a fingerprint of the full
+    // (locator, hashStop, active-tip) request; one entry per distinct request
+    // served within the TTL.  Auto-freed with the CNode (per-peer by
+    // construction).
+    struct CHeadersServedDedupEntry
+    {
+        int64_t nServedUs; // last serve time, microseconds
+        uint32_t nRepeat; // cumulative count of serves for this fingerprint
+        uint32_t nHeadersCount; // vHeaders.size() of the last serve
+        uint64_t nBytes; // serialized headers payload bytes of the last serve
+
+        CHeadersServedDedupEntry()
+            : nServedUs(0), nRepeat(0), nHeadersCount(0), nBytes(0)
+        {
+        }
+    };
+    std::map<uint256, CHeadersServedDedupEntry> mapHeadersServedDedup;
+    CCriticalSection cs_mapHeadersServedDedup;
     uint256 hashContinue;
     CGetBlocksServerState getBlocksServer;
     CBlockIndex* pindexLastGetBlocksBegin;

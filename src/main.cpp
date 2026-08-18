@@ -21,6 +21,7 @@
 #include "pinglifecycletrace.h"
 #include "ibdforensic.h"
 #include "ibdheaderscheduler.h"
+#include "headersservededup.h"
 #include "kernel.h"
 #include "collateral.h"
 #include "collateralnode.h"
@@ -10460,6 +10461,70 @@ void static ProcessGetData(CNode* pfrom)
 // a large 4-byte int at any alignment.
 unsigned char pchMessageStart[4] = { 0xfa, 0xf4, 0x3f, 0xb7 };
 
+// Serving-side getheaders dedup toggle.  Initialized once in AppInit2 before
+// networking threads start, then immutable.
+static bool fHeadersServedDedupEnabled = false;
+
+void InitHeadersServedDedup(bool fEnabled)
+{
+    fHeadersServedDedupEnabled = fEnabled;
+}
+
+bool HeadersServedDedupEnabled()
+{
+    return fHeadersServedDedupEnabled;
+}
+
+uint256 HeaderServedDedupFingerprint(const CBlockLocator& locator,
+                                     const uint256& hashStop,
+                                     const uint256& tipHash)
+{
+    CHashWriter ss(SER_NETWORK, PROTOCOL_VERSION);
+    ss << locator;
+    ss << hashStop;
+    ss << tipHash;
+    return ss.GetHash();
+}
+
+bool HeaderServedDedupEntryFresh(const CNode::CHeadersServedDedupEntry& entry,
+                                 int64_t nNowUs)
+{
+    int64_t nAgeUs = nNowUs - entry.nServedUs;
+    return nAgeUs >= 0 && nAgeUs < HEADER_SERVED_DEDUP_TTL * 1000000;
+}
+
+void HeaderServedDedupUpsert(std::map<uint256, CNode::CHeadersServedDedupEntry>& map,
+                             const uint256& fp, int64_t nNowUs,
+                             uint32_t nHeadersCount, uint64_t nBytes)
+{
+    // Purge expired entries.
+    for (std::map<uint256, CNode::CHeadersServedDedupEntry>::iterator it = map.begin();
+         it != map.end();)
+    {
+        if (nNowUs - it->second.nServedUs >= HEADER_SERVED_DEDUP_TTL * 1000000)
+            map.erase(it++);
+        else
+            ++it;
+    }
+    // Enforce the hard cap: evict the oldest entry when full and fp is new.
+    if (map.count(fp) == 0 && map.size() >= HEADER_SERVED_DEDUP_CAP)
+    {
+        std::map<uint256, CNode::CHeadersServedDedupEntry>::iterator itOldest = map.begin();
+        for (std::map<uint256, CNode::CHeadersServedDedupEntry>::iterator it = map.begin();
+             it != map.end(); ++it)
+        {
+            if (it->second.nServedUs < itOldest->second.nServedUs)
+                itOldest = it;
+        }
+        map.erase(itOldest);
+    }
+    CNode::CHeadersServedDedupEntry& entry = map[fp];
+    entry.nServedUs = nNowUs;
+    entry.nRepeat += 1;
+    entry.nHeadersCount = nHeadersCount;
+    entry.nBytes = nBytes;
+}
+
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, int64_t nTimeReceived)
 {
     static map<CService, CPubKey> mapReuseKey;
@@ -11265,6 +11330,18 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         LOCK(cs_main);
 
+        // Serving-side dedup (only when -headersservededup is enabled):
+        // fingerprint the FULL (locator, hashStop) request PLUS the active
+        // chain tip hash, so that identical requests under an unchanged tip
+        // collapse while any tip change (advance or reorg) forces a fresh
+        // serve.  Computed under cs_main: pindexBest is only valid here.
+        const bool fHeadersDedupActive = HeadersServedDedupEnabled();
+        uint256 headersDedupFp;
+        if (fHeadersDedupActive)
+            headersDedupFp = HeaderServedDedupFingerprint(
+                locator, hashStop,
+                pindexBest ? pindexBest->GetBlockHash() : uint256(0));
+
         CBlockIndex* pindexFork = NULL;
         CBlockIndex* pindex = NULL;
         if (locator.IsNull())
@@ -11301,6 +11378,45 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                    pfrom->nChainHeight);
         }
 
+        // Suppress a re-ask of the identical request within the TTL.  Nothing
+        // is written to the socket and parsing/peer state stays intact.
+        if (fHeadersDedupActive)
+        {
+            uint32_t nPrevRepeat = 0;
+            uint32_t nPrevCount = 0;
+            uint64_t nPrevBytes = 0;
+            int64_t nPrevUs = 0;
+            bool fSuppress = false;
+            {
+                LOCK(pfrom->cs_mapHeadersServedDedup);
+                std::map<uint256, CNode::CHeadersServedDedupEntry>::const_iterator itDedup =
+                    pfrom->mapHeadersServedDedup.find(headersDedupFp);
+                if (itDedup != pfrom->mapHeadersServedDedup.end() &&
+                    HeaderServedDedupEntryFresh(itDedup->second, GetTimeMicros()))
+                {
+                    fSuppress = true;
+                    nPrevRepeat = itDedup->second.nRepeat;
+                    nPrevCount = itDedup->second.nHeadersCount;
+                    nPrevBytes = itDedup->second.nBytes;
+                    nPrevUs = itDedup->second.nServedUs;
+                }
+            }
+            if (fSuppress)
+            {
+                if (BlockRequestTraceEnabled() && fLogGetHeaders)
+                {
+                    printf("GETHEADERS_DEDUP: peer=%s fp=%s repeat=%u age=%lld suppressed_count=%u suppressed_bytes=%llu\n",
+                           pfrom->addr.ToString().c_str(),
+                           headersDedupFp.ToString().substr(0, 16).c_str(),
+                           (unsigned int)(nPrevRepeat + 1),
+                           (long long)((GetTimeMicros() - nPrevUs) / 1000),
+                           nPrevCount,
+                           (unsigned long long)nPrevBytes);
+                }
+                return true;
+            }
+        }
+
         std::vector<CBlock> vHeaders;
         int nLimit = 2000;
         CBlockIndex* pindexFirstSent = NULL;
@@ -11317,6 +11433,13 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
 
         unsigned int nHeadersBytes = ::GetSerializeSize(vHeaders, SER_NETWORK, PROTOCOL_VERSION);
+        if (fHeadersDedupActive)
+        {
+            LOCK(pfrom->cs_mapHeadersServedDedup);
+            HeaderServedDedupUpsert(pfrom->mapHeadersServedDedup, headersDedupFp,
+                                    GetTimeMicros(), (uint32_t)vHeaders.size(),
+                                    nHeadersBytes);
+        }
         if (BlockRequestTraceEnabled() && fLogGetHeaders)
         {
             printf("GETHEADERS_SEND: peer=%s diag=%llu headers=%zu bytes=%u first_hash=%s first_height=%d last_hash=%s last_height=%d fork_height=%d hashStop=%s\n",

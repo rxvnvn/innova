@@ -23,6 +23,7 @@
 #include "ibdforensic.h"
 #include "ibdexptrace.h"
 #include "pinglifecycletrace.h"
+#include "headersservededup.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -594,6 +595,7 @@ std::string HelpMessage()
         "  -debugnet              " + _("Output extra network debugging information") + "\n" +
         "  -debugchain            " + _("Output extra blockchain debugging information") + "\n" +
         "  -blockrequesttrace=<n> " + _("Trace anomalous block request lifecycles (default: 0)") + "\n" +
+        "  -headersserveddedup=<0|1> " + _("Suppress duplicate getheaders responses per peer within an 8s window (default: 0)") + "\n" +
         "  -blockrequesttracehash=<hash> " + _("Limit block request tracing to one block hash (requires -blockrequesttrace)") + "\n" +
         "  -continuitybreakms=<n> " + _("Min no-connect gap (ms) before the one-shot FIRST_CONTINUITY_BREAK event fires (requires -blockrequesttrace, default: 60000)") + "\n" +
         "  -ibdefficiencytrace=<0|1> " + _("Trace IBD block efficiency counters (default: 0)") + "\n" +
@@ -994,6 +996,7 @@ bool AppInit2()
     }
     InitIBDEfficiencyTrace(GetBoolArg("-ibdefficiencytrace", false));
     InitProcessBlockRejectTrace(GetBoolArg("-processblockrejecttrace", false));
+    InitHeadersServedDedup(GetBoolArg("-headersserveddedup", false));
     InitAcceptBlockRejectTrace(GetBoolArg("-acceptblockrejecttrace", false));
     ibdactivepath::InitIBDActivePathTrace(
         GetBoolArg("-ibdactivepathtrace", false));
