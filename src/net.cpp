@@ -18,6 +18,7 @@
 #include "addrman.h"
 #include "ui_interface.h"
 #include "collateral.h"
+#include "getblocksservedinvzero.h"
 #include "collateralnode.h"
 #include "dandelion.h"
 #include "shielded.h"
@@ -561,6 +562,25 @@ CGetBlocksServerDecision::CGetBlocksServerDecision()
       nPenalty(0),
       nCooldownMillis(0),
       nEstimatedBytes(0)
+{
+}
+
+CNode::CGetBlocksServedInvWindow::CGetBlocksServedInvWindow()
+    : nMinHeight(-1),
+      nMaxHeight(-1),
+      nServedUs(0)
+{
+}
+
+CNode::CGetBlocksServedInvState::CGetBlocksServedInvState()
+    : nGbServedInvWindowStartUs(0),
+      nGbServedInvItems(0),
+      nGbServedInvBytes(0),
+      nGbGetDataMatches(0),
+      nGbZeroConsumeStreak(0),
+      fGbSuppressInv(false),
+      fGbPriorZeroConsume(false),
+      fGbHaveWindow(false)
 {
 }
 
@@ -7999,6 +8019,12 @@ void ThreadSocketHandler2(void* parg)
                     if (fDelete)
                     {
                         vNodesDisconnected.remove(pnode);
+                        // Reconnect-persistent zero-consumption debt: carry the
+                        // peer's zero-consumption evidence across a reconnect
+                        // (bounded, IP-keyed, short TTL).  Skipped during final
+                        // teardown where no application lock may be taken.
+                        if (!InFinalNodeTeardown())
+                            GetBlocksServedInvReconnectWrite(pnode, GetTimeMicros());
                         delete pnode;
                     }
                 }

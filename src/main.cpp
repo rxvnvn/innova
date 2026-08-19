@@ -22,6 +22,7 @@
 #include "ibdforensic.h"
 #include "ibdheaderscheduler.h"
 #include "headersservededup.h"
+#include "getblocksservedinvzero.h"
 #include "kernel.h"
 #include "collateral.h"
 #include "collateralnode.h"
@@ -10324,6 +10325,15 @@ void static ProcessGetData(CNode* pfrom)
                 {
                     pfrom->getBlocksServer.NoteBlockGetData(
                         inv.hash, mi->second->nHeight, GetTimeMillis());
+                    GetBlocksServedInvNoteGetData(
+                        pfrom->getBlocksServedInv, inv.hash,
+                        mi->second->nHeight, GetTimeMicros());
+                    // Real consumption immediately defeats any IP-keyed
+                    // reconnect debt: a consuming peer must not leak
+                    // zero-consumption debt into future reconnects.
+                    GetBlocksServedInvReconnectClearedByConsumption(
+                        static_cast<const CNetAddr&>(pfrom->addr),
+                        GetTimeMicros());
                     send = true;
                     CBlock block;
                     block.ReadFromDisk((*mi).second);
@@ -10523,6 +10533,456 @@ void HeaderServedDedupUpsert(std::map<uint256, CNode::CHeadersServedDedupEntry>&
     entry.nRepeat += 1;
     entry.nHeadersCount = nHeadersCount;
     entry.nBytes = nBytes;
+}
+
+// ---------------------------------------------------------------------------
+// Serving-side getblocks -> inv ZERO-CONSUMPTION suppression.
+//
+// Mechanism (separate from policy): per-peer served-inv window accounting.
+// Each served getblocks inv reply accumulates items/bytes into the current
+// window and its (firstHash, lastHash, min/max height) footprint into a
+// bounded recent-served set.  A getdata whose block matches a recently served
+// window counts as consumption.  A strict-inbound, non-whitelisted peer that
+// repeats an overlapping range at an unchanged chain tip with zero consumption
+// is, once the streak threshold is met, no longer served that inv: the reply
+// is dropped without writing anything.  All state is guarded by cs_main, which
+// both the getblocks handler and the getdata-serving path hold.
+// ---------------------------------------------------------------------------
+static bool fGetBlocksServedInvZeroEnabled = false;
+static GetBlocksServedInvZeroConfig gGetBlocksServedInvZeroConfig;
+
+GetBlocksServedInvZeroConfig::GetBlocksServedInvZeroConfig()
+    : nGraceS(GETBLOCKS_SERVED_INV_GRACE_S),
+      nMinItems(GETBLOCKS_SERVED_INV_MIN_ITEMS),
+      nInitialStreak(GETBLOCKS_SERVED_INV_INITIAL_STREAK),
+      nReentryStreak(GETBLOCKS_SERVED_INV_REENTRY_STREAK),
+      nRecentWindowCap(GETBLOCKS_SERVED_INV_RECENT_WINDOW_CAP),
+      nWindowExpiryS(GETBLOCKS_SERVED_INV_WINDOW_EXPIRY_S)
+{
+}
+
+void InitGetBlocksServedInvZero(bool fEnabled)
+{
+    fGetBlocksServedInvZeroEnabled = fEnabled;
+    GetBlocksServedInvZeroConfig cfg;
+    cfg.nGraceS = std::max<int64_t>(
+        1, GetArg("-getblocksservedinvgrace",
+                  (int64_t)GETBLOCKS_SERVED_INV_GRACE_S));
+    cfg.nMinItems = (uint64_t)std::max<int64_t>(
+        0, GetArg("-getblocksservedinvminitems",
+                  (int64_t)GETBLOCKS_SERVED_INV_MIN_ITEMS));
+    cfg.nInitialStreak = (unsigned int)std::max<int64_t>(
+        1, GetArg("-getblocksservedinvstreak",
+                  (int64_t)GETBLOCKS_SERVED_INV_INITIAL_STREAK));
+    cfg.nReentryStreak = (unsigned int)std::max<int64_t>(
+        1, GetArg("-getblocksservedinvreentry",
+                  (int64_t)GETBLOCKS_SERVED_INV_REENTRY_STREAK));
+    cfg.nRecentWindowCap = (size_t)std::max<int64_t>(
+        1, GetArg("-getblocksservedinvwindow",
+                  (int64_t)GETBLOCKS_SERVED_INV_RECENT_WINDOW_CAP));
+    cfg.nWindowExpiryS = std::max<int64_t>(
+        1, GetArg("-getblocksservedinvexpiry",
+                  (int64_t)GETBLOCKS_SERVED_INV_WINDOW_EXPIRY_S));
+    SetGetBlocksServedInvZeroConfig(cfg);
+}
+
+bool GetBlocksServedInvZeroEnabled()
+{
+    return fGetBlocksServedInvZeroEnabled;
+}
+
+const GetBlocksServedInvZeroConfig& GetBlocksServedInvConfig()
+{
+    return gGetBlocksServedInvZeroConfig;
+}
+
+void SetGetBlocksServedInvZeroConfig(const GetBlocksServedInvZeroConfig& cfg)
+{
+    gGetBlocksServedInvZeroConfig = cfg;
+}
+
+GetBlocksServedInvDecision::GetBlocksServedInvDecision()
+    : fSuppress(false),
+      fQualify(false),
+      fDisarm(false),
+      nItemsAvoided(0),
+      nBytesAvoided(0)
+{
+}
+
+static bool GbServedInvRangesOverlap(int nAMin, int nAMax,
+                                     int nBMin, int nBMax)
+{
+    if (nAMin < 0 || nAMax < 0 || nAMin > nAMax ||
+        nBMin < 0 || nBMax < 0 || nBMin > nBMax)
+        return false;
+    return nAMin <= nBMax && nBMin <= nAMax;
+}
+
+bool GetBlocksServedInvWindowOverlaps(
+    const CNode::CGetBlocksServedInvState& state,
+    const CGetBlocksRequestInfo& request,
+    int64_t nNowUs)
+{
+    if (!state.fGbHaveWindow || request.nPredictedResponseCount == 0)
+        return false;
+    const int nPredMin = request.nResolvedHeight + 1;
+    const int nPredMax = request.nResolvedHeight +
+        static_cast<int>(request.nPredictedResponseCount);
+    const int64_t nExpiryUs =
+        GetBlocksServedInvConfig().nWindowExpiryS * 1000000;
+    for (size_t i = 0; i < state.vGbServedWindows.size(); ++i)
+    {
+        const CNode::CGetBlocksServedInvWindow& entry =
+            state.vGbServedWindows[i];
+        if (entry.nServedUs == 0 || nNowUs - entry.nServedUs >= nExpiryUs)
+            continue;
+        if (GbServedInvRangesOverlap(nPredMin, nPredMax,
+                                     entry.nMinHeight, entry.nMaxHeight))
+            return true;
+    }
+    return false;
+}
+
+static void GetBlocksServedInvResetWindow(
+    CNode::CGetBlocksServedInvState& state, int64_t nNowUs)
+{
+    state.nGbServedInvWindowStartUs = nNowUs;
+    state.nGbServedInvItems = 0;
+    state.nGbServedInvBytes = 0;
+    state.nGbGetDataMatches = 0;
+}
+
+GetBlocksServedInvDecision GetBlocksServedInvEvaluate(
+    CNode::CGetBlocksServedInvState& state,
+    const CGetBlocksRequestInfo& request,
+    bool fStrictInbound,
+    int64_t nNowUs,
+    uint64_t nPredictedItems)
+{
+    GetBlocksServedInvDecision decision;
+    decision.nItemsAvoided = nPredictedItems;
+    decision.nBytesAvoided = nPredictedItems * 36;
+
+    if (!GetBlocksServedInvZeroEnabled() || !fStrictInbound)
+        return decision;
+    if (!state.fGbHaveWindow)
+        return decision;
+
+    const GetBlocksServedInvZeroConfig& cfg = GetBlocksServedInvConfig();
+
+    // Disarm: the response legitimately changed (tip advance or reorg/fork).
+    if (request.hashChainTip != state.hashGbLastResponseChainTip)
+    {
+        GetBlocksServedInvResetWindow(state, nNowUs);
+        state.nGbZeroConsumeStreak = 0;
+        state.fGbSuppressInv = false;
+        state.vGbServedWindows.clear();
+        decision.fDisarm = true;
+        return decision;
+    }
+
+    // Disarm: a genuinely-new (non-overlapping) range the peer is exploring
+    // is still served.  No suppression until re-evidenced on this range.
+    if (!GetBlocksServedInvWindowOverlaps(state, request, nNowUs))
+    {
+        GetBlocksServedInvResetWindow(state, nNowUs);
+        state.nGbZeroConsumeStreak = 0;
+        state.fGbSuppressInv = false;
+        decision.fDisarm = true;
+        return decision;
+    }
+
+    if (nNowUs - state.nGbServedInvWindowStartUs < cfg.nGraceS * 1000000)
+        return decision;
+    if (state.nGbServedInvItems < cfg.nMinItems)
+        return decision;
+
+    // Zero consumption is the load-bearing conservative signal: a
+    // low-but-nonzero consumer (e.g. 0.75% of the window) is NEVER suppressed
+    // by this first policy.
+    if (state.nGbGetDataMatches > 0)
+    {
+        ibdmetrics::Get().getblocks_low_nonzero_windows.fetch_add(
+            1, std::memory_order_relaxed);
+        return decision;
+    }
+
+    decision.fQualify = true;
+    ibdmetrics::Get().getblocks_zero_consume_windows.fetch_add(
+        1, std::memory_order_relaxed);
+    const unsigned int nRequiredStreak = state.fGbPriorZeroConsume
+        ? cfg.nReentryStreak
+        : cfg.nInitialStreak;
+    if (state.nGbZeroConsumeStreak + 1 >= nRequiredStreak)
+    {
+        decision.fSuppress = true;
+        if (state.fGbPriorZeroConsume)
+        {
+            ibdmetrics::Get().getblocks_reentry_ae.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+    }
+    return decision;
+}
+
+void GetBlocksServedInvRecordItem(CNode::CGetBlocksServedInvState& state,
+                                  int64_t nNowUs)
+{
+    if (!GetBlocksServedInvZeroEnabled())
+        return;
+    if (state.nGbServedInvWindowStartUs == 0)
+        state.nGbServedInvWindowStartUs = nNowUs;
+    state.nGbServedInvItems++;
+    state.nGbServedInvBytes += 36;
+    ibdmetrics::Get().getblocks_served_inv_items.fetch_add(
+        1, std::memory_order_relaxed);
+    ibdmetrics::Get().getblocks_served_inv_bytes.fetch_add(
+        36, std::memory_order_relaxed);
+}
+
+void GetBlocksServedInvRecordResponse(
+    CNode::CGetBlocksServedInvState& state,
+    const CGetBlocksResponseInfo& response,
+    const uint256& hashChainTip,
+    int64_t nNowUs)
+{
+    if (!GetBlocksServedInvZeroEnabled())
+        return;
+    state.fGbHaveWindow = true;
+    state.hashGbLastResponseChainTip = hashChainTip;
+
+    const GetBlocksServedInvZeroConfig& cfg = GetBlocksServedInvConfig();
+    const int64_t nExpiryUs = cfg.nWindowExpiryS * 1000000;
+
+    // Purge expired windows.
+    for (std::vector<CNode::CGetBlocksServedInvWindow>::iterator it =
+             state.vGbServedWindows.begin();
+         it != state.vGbServedWindows.end();)
+    {
+        if (it->nServedUs == 0 || nNowUs - it->nServedUs >= nExpiryUs)
+            it = state.vGbServedWindows.erase(it);
+        else
+            ++it;
+    }
+
+    CNode::CGetBlocksServedInvWindow entry;
+    entry.hashFirst = response.hashFirst;
+    entry.hashLast = response.hashLast;
+    entry.nMinHeight = response.nMinHeight;
+    entry.nMaxHeight = response.nMaxHeight;
+    entry.nServedUs = nNowUs;
+    state.vGbServedWindows.push_back(entry);
+    while (state.vGbServedWindows.size() > cfg.nRecentWindowCap)
+        state.vGbServedWindows.erase(state.vGbServedWindows.begin());
+}
+
+bool GetBlocksServedInvNoteGetData(
+    CNode::CGetBlocksServedInvState& state,
+    const uint256& hashBlock, int nHeight, int64_t nNowUs)
+{
+    if (!GetBlocksServedInvZeroEnabled() || !state.fGbHaveWindow)
+        return false;
+
+    const int64_t nExpiryUs =
+        GetBlocksServedInvConfig().nWindowExpiryS * 1000000;
+
+    bool fMatch = false;
+    for (size_t i = 0; i < state.vGbServedWindows.size(); ++i)
+    {
+        const CNode::CGetBlocksServedInvWindow& entry =
+            state.vGbServedWindows[i];
+        if (entry.nServedUs == 0 || nNowUs - entry.nServedUs >= nExpiryUs)
+            continue;
+        const bool fHashMatch =
+            hashBlock == entry.hashFirst || hashBlock == entry.hashLast;
+        const bool fHeightMatch =
+            nHeight >= 0 &&
+            entry.nMinHeight >= 0 &&
+            entry.nMaxHeight >= entry.nMinHeight &&
+            nHeight >= entry.nMinHeight &&
+            nHeight <= entry.nMaxHeight;
+        if (fHashMatch || fHeightMatch)
+        {
+            fMatch = true;
+            break;
+        }
+    }
+    if (!fMatch)
+        return false;
+
+    state.nGbGetDataMatches++;
+    ibdmetrics::Get().getblocks_consumption_getdata_matches.fetch_add(
+        1, std::memory_order_relaxed);
+    if (state.fGbSuppressInv)
+    {
+        state.fGbSuppressInv = false;
+        ibdmetrics::Get().getblocks_release_latch_events.fetch_add(
+            1, std::memory_order_relaxed);
+        return true;
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Reconnect-persistent zero-consumption debt.
+//
+// A bounded, short-TTL, CNetAddr-keyed map that carries a tiny "debt" from a
+// zero-consumption peer's previous connection into a reconnecting one, so a
+// same-peer reconnect does not trivially reset all evidence.  Only real
+// ZERO-consumption evidence is ever written; a peer that consumes (any
+// matches>0) is never written and its existing debt is cleared by consumption.
+// Bootstrap-safety invariant: priming a new connection never starts it
+// suppressed (fSuppressInv stays false) and re-stamps a FRESH window, so the
+// GRACE window always grants a genuine serving opportunity before any
+// suppression could fire.  This map is a leaf (its mutex is never acquired
+// while holding cs_main/cs_vNodes or any served-dedup lock).
+// ---------------------------------------------------------------------------
+namespace
+{
+struct CGetBlocksServedInvReconnectStore
+{
+    std::map<CNetAddr, CGetBlocksServedInvReconnectDebtEntry> m;
+    CCriticalSection mtx; // leaf lock (matches LOCK()/CCriticalBlock)
+};
+CGetBlocksServedInvReconnectStore g_reconnectDebt;
+} // namespace
+
+void GetBlocksServedInvReconnectWrite(const CNode* pnode, int64_t nNowUs)
+{
+    if (!pnode || !GetBlocksServedInvZeroEnabled())
+        return;
+    GetBlocksServedInvReconnectWriteState(
+        pnode->getBlocksServedInv,
+        static_cast<const CNetAddr&>(pnode->addr), nNowUs);
+}
+
+void GetBlocksServedInvReconnectWriteState(
+    const CNode::CGetBlocksServedInvState& s, const CNetAddr& addr,
+    int64_t nNowUs)
+{
+    if (!GetBlocksServedInvZeroEnabled())
+        return;
+    const GetBlocksServedInvZeroConfig& cfg = GetBlocksServedInvConfig();
+    // Write debt only on real zero-consumption evidence.
+    bool fZero = s.fGbSuppressInv ||
+                 (s.fGbHaveWindow && s.nGbGetDataMatches == 0 &&
+                  s.nGbServedInvItems >= cfg.nMinItems &&
+                  s.fGbPriorZeroConsume);
+    if (!fZero)
+        return;
+    uint64_t nDebtItems = s.nGbServedInvItems;
+    uint64_t nCap = std::max<uint64_t>(cfg.nMinItems, (uint64_t)4096);
+    if (nDebtItems > nCap)
+        nDebtItems = nCap;
+    unsigned int nStreak = s.nGbZeroConsumeStreak;
+    if (nStreak < 1)
+        nStreak = 1;
+    LOCK(g_reconnectDebt.mtx);
+    {
+        for (auto it = g_reconnectDebt.m.begin();
+             it != g_reconnectDebt.m.end();)
+        {
+            if (nNowUs - it->second.nLastSeenUs >
+                GETBLOCKS_SERVED_INV_RECONNECT_DEBT_TTL_US)
+                it = g_reconnectDebt.m.erase(it);
+            else
+                ++it;
+        }
+    }
+    if (g_reconnectDebt.m.find(addr) == g_reconnectDebt.m.end() &&
+        g_reconnectDebt.m.size() >= GETBLOCKS_SERVED_INV_RECONNECT_DEBT_CAP)
+    {
+        auto oldest = g_reconnectDebt.m.begin();
+        for (auto it = g_reconnectDebt.m.begin();
+             it != g_reconnectDebt.m.end(); ++it)
+            if (it->second.nLastSeenUs < oldest->second.nLastSeenUs)
+                oldest = it;
+        g_reconnectDebt.m.erase(oldest);
+        ibdmetrics::Get().getblocks_reconnect_debt_evicted.fetch_add(
+            1, std::memory_order_relaxed);
+    }
+    CGetBlocksServedInvReconnectDebtEntry& e = g_reconnectDebt.m[addr];
+    e.nDebtItems = nDebtItems;
+    e.nDebtStreak = nStreak;
+    e.nLastSeenUs = nNowUs;
+    ibdmetrics::Get().getblocks_reconnect_debt_entries.store(
+        (int64_t)g_reconnectDebt.m.size(), std::memory_order_relaxed);
+}
+
+void GetBlocksServedInvReconnectPrime(
+    CNode::CGetBlocksServedInvState& state, const CNetAddr& addr,
+    int64_t nNowUs, bool& fPrimed)
+{
+    fPrimed = false;
+    if (!GetBlocksServedInvZeroEnabled())
+        return;
+    const GetBlocksServedInvZeroConfig& cfg = GetBlocksServedInvConfig();
+    LOCK(g_reconnectDebt.mtx);
+    {
+        for (auto it = g_reconnectDebt.m.begin();
+             it != g_reconnectDebt.m.end();)
+        {
+            if (nNowUs - it->second.nLastSeenUs >
+                GETBLOCKS_SERVED_INV_RECONNECT_DEBT_TTL_US)
+                it = g_reconnectDebt.m.erase(it);
+            else
+                ++it;
+        }
+    }
+    auto it = g_reconnectDebt.m.find(addr);
+    if (it == g_reconnectDebt.m.end())
+    {
+        ibdmetrics::Get().getblocks_reconnect_debt_entries.store(
+            (int64_t)g_reconnectDebt.m.size(), std::memory_order_relaxed);
+        return;
+    }
+    // Bootstrap safety: never start suppressed.  Prime items toward MIN_ITEMS
+    // and set the re-entry history marker so re-qualification is FASTER, but
+    // stamp a FRESH window: GRACE must elapse (and, on this connection, the
+    // peer must re-demonstrate zero consumption) before suppression can fire,
+    // so the first INV -> getdata -> block round trip is always granted.
+    state.nGbServedInvWindowStartUs = nNowUs;
+    state.nGbServedInvItems =
+        std::min<uint64_t>(it->second.nDebtItems, cfg.nMinItems);
+    state.fGbPriorZeroConsume = true;
+    state.fGbSuppressInv = false;
+    state.nGbGetDataMatches = 0;
+    state.nGbZeroConsumeStreak = 0;
+    fPrimed = true;
+    ibdmetrics::Get().getblocks_reconnect_debt_transferred.fetch_add(
+        1, std::memory_order_relaxed);
+}
+
+void GetBlocksServedInvReconnectClearedByConsumption(const CNetAddr& addr,
+                                                     int64_t nNowUs)
+{
+    (void)nNowUs;
+    if (!GetBlocksServedInvZeroEnabled())
+        return;
+    LOCK(g_reconnectDebt.mtx);
+    auto it = g_reconnectDebt.m.find(addr);
+    if (it == g_reconnectDebt.m.end())
+        return;
+    g_reconnectDebt.m.erase(it);
+    ibdmetrics::Get().getblocks_reconnect_debt_entries.store(
+        (int64_t)g_reconnectDebt.m.size(), std::memory_order_relaxed);
+    ibdmetrics::Get().getblocks_reconnect_debt_cleared_by_consumption
+        .fetch_add(1, std::memory_order_relaxed);
+}
+
+size_t GetBlocksServedInvReconnectSize()
+{
+    LOCK(g_reconnectDebt.mtx);
+    return g_reconnectDebt.m.size();
+}
+
+void GetBlocksServedInvReconnectClearAll()
+{
+    LOCK(g_reconnectDebt.mtx);
+    g_reconnectDebt.m.clear();
+    ibdmetrics::Get().getblocks_reconnect_debt_entries.store(
+        0, std::memory_order_relaxed);
 }
 
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, int64_t nTimeReceived)
@@ -11237,6 +11697,64 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             return true;
         }
 
+        // Zero-consumption served-inv suppression (only when
+        // -getblocksservedinvzero is enabled): a strict-inbound peer that
+        // repeats an overlapping range at an unchanged chain tip with zero
+        // consumption (no getdata matching the served inv) stops being served
+        // that inv.  Consumption via getdata is the binding signal; this never
+        // affects getdata -> block serving, never penalizes, never disconnects.
+        if (GetBlocksServedInvZeroEnabled())
+        {
+            // Reconnect-persistent zero-consumption debt: prime a NEW
+            // connection's per-CNode state from the bounded, short-TTL, IP-keyed
+            // debt (if any) so a reconnecting zero-consumption peer re-qualifies
+            // faster.  Never starts suppressed (bootstrap safety: GRACE still
+            // grants a serving opportunity before any suppression can fire).
+            if (!pfrom->getBlocksServedInv.fGbHaveWindow)
+            {
+                bool fPrimed = false;
+                GetBlocksServedInvReconnectPrime(
+                    pfrom->getBlocksServedInv,
+                    static_cast<const CNetAddr&>(pfrom->addr),
+                    GetTimeMicros(), fPrimed);
+            }
+            GetBlocksServedInvDecision servedInvDecision =
+                GetBlocksServedInvEvaluate(
+                    pfrom->getBlocksServedInv, request, fStrictInbound,
+                    GetTimeMicros(), request.nPredictedResponseCount);
+            if (servedInvDecision.fSuppress)
+            {
+                CNode::CGetBlocksServedInvState& servedInv =
+                    pfrom->getBlocksServedInv;
+                servedInv.nGbZeroConsumeStreak++;
+                servedInv.fGbSuppressInv = true;
+                servedInv.fGbPriorZeroConsume = true;
+                ibdmetrics::Get().getblocks_suppressed_inv_replies.fetch_add(
+                    1, std::memory_order_relaxed);
+                ibdmetrics::Get().getblocks_suppressed_inv_items.fetch_add(
+                    servedInvDecision.nItemsAvoided, std::memory_order_relaxed);
+                ibdmetrics::Get().getblocks_suppressed_inv_bytes_avoided.fetch_add(
+                    servedInvDecision.nBytesAvoided,
+                    std::memory_order_relaxed);
+                if (BlockRequestTraceEnabled())
+                {
+                    printf("GETBLOCKS_SERVED_INV_SUPPRESS: peer=%s tip=%s streak=%u window_items=%llu window_matches=%llu window_age_ms=%lld items_avoided=%llu bytes_avoided=%llu\n",
+                           pfrom->addr.ToString().c_str(),
+                           request.hashChainTip.ToString().substr(0, 16).c_str(),
+                           (unsigned int)servedInv.nGbZeroConsumeStreak,
+                           (unsigned long long)servedInv.nGbServedInvItems,
+                           (unsigned long long)servedInv.nGbGetDataMatches,
+                           (long long)((GetTimeMicros() -
+                                        servedInv.nGbServedInvWindowStartUs) / 1000),
+                           (unsigned long long)servedInvDecision.nItemsAvoided,
+                           (unsigned long long)servedInvDecision.nBytesAvoided);
+                }
+                return true;
+            }
+            if (servedInvDecision.fQualify)
+                pfrom->getBlocksServedInv.nGbZeroConsumeStreak++;
+        }
+
         CGetBlocksResponseInfo response;
         CBlockIndex* pindex = pindexFirst;
         int nLimit = 1000;
@@ -11262,6 +11780,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                         CInv(MSG_BLOCK, hashBestChain)))
                 {
                     response.Add(hashBestChain, pindexBest->nHeight);
+                    GetBlocksServedInvRecordItem(pfrom->getBlocksServedInv,
+                                                 GetTimeMicros());
                 }
                 break;
             }
@@ -11270,6 +11790,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     CInv(MSG_BLOCK, hashBlock)))
             {
                 response.Add(hashBlock, pindex->nHeight);
+                GetBlocksServedInvRecordItem(pfrom->getBlocksServedInv,
+                                             GetTimeMicros());
             }
             if (--nLimit <= 0)
             {
@@ -11285,6 +11807,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
 
         pfrom->getBlocksServer.RecordResponse(request, response);
+        GetBlocksServedInvRecordResponse(
+            pfrom->getBlocksServedInv, response, request.hashChainTip,
+            GetTimeMicros());
         if (fDiagnostic || (fRepeatedRange && fLogAbuse))
         {
             LogGetBlocksServerEvent(

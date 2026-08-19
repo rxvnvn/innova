@@ -1338,6 +1338,37 @@ public:
     CCriticalSection cs_mapHeadersServedDedup;
     uint256 hashContinue;
     CGetBlocksServerState getBlocksServer;
+    // Serving-side getblocks -> inv zero-consumption suppression bookkeeping
+    // (only used while -getblocksservedinvzero is enabled).  Per-peer value
+    // members: auto-freed with the CNode and reset on reconnect.  All access
+    // happens while cs_main is held (the getblocks handler and the
+    // getdata-serving path both hold it), so no new lock is introduced.
+    struct CGetBlocksServedInvWindow
+    {
+        uint256 hashFirst;
+        uint256 hashLast;
+        int nMinHeight;
+        int nMaxHeight;
+        int64_t nServedUs; // served time, microseconds
+
+        CGetBlocksServedInvWindow();
+    };
+    struct CGetBlocksServedInvState
+    {
+        int64_t nGbServedInvWindowStartUs; // current window start, microseconds
+        uint64_t nGbServedInvItems; // inv items pushed to this peer this window
+        uint64_t nGbServedInvBytes; // inv payload bytes pushed this window
+        uint64_t nGbGetDataMatches; // getdata matching a recently served window
+        unsigned int nGbZeroConsumeStreak; // consecutive zero-consumption repeats
+        bool fGbSuppressInv; // currently suppressing zero-consumption repeats
+        bool fGbPriorZeroConsume; // persistent history marker (never erased by one consumption)
+        uint256 hashGbLastResponseChainTip; // chain tip of the last served reply
+        bool fGbHaveWindow; // a window has been served to this peer
+        std::vector<CGetBlocksServedInvWindow> vGbServedWindows; // bounded recent set
+
+        CGetBlocksServedInvState();
+    };
+    CGetBlocksServedInvState getBlocksServedInv;
     CBlockIndex* pindexLastGetBlocksBegin;
     RecoveryResponseWindowState recovery_response_window;
     std::vector<CBlockIndex*> getBlocksIndex;

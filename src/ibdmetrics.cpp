@@ -154,6 +154,20 @@ Counters::Counters()
       getblocks_response_unknown_count(0),
       getblocks_response_zero_unknown(0),
       getblocks_response_inv_zero_unknown(0),
+      getblocks_served_inv_items(0),
+      getblocks_served_inv_bytes(0),
+      getblocks_consumption_getdata_matches(0),
+      getblocks_suppressed_inv_replies(0),
+      getblocks_suppressed_inv_items(0),
+      getblocks_suppressed_inv_bytes_avoided(0),
+      getblocks_zero_consume_windows(0),
+      getblocks_low_nonzero_windows(0),
+      getblocks_release_latch_events(0),
+      getblocks_reentry_ae(0),
+      getblocks_reconnect_debt_entries(0),
+      getblocks_reconnect_debt_transferred(0),
+      getblocks_reconnect_debt_evicted(0),
+      getblocks_reconnect_debt_cleared_by_consumption(0),
       recovery_outcome_useful(0),
       recovery_outcome_known_only(0),
       recovery_outcome_no_response(0),
@@ -853,6 +867,34 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.getblocks_response_zero_unknown.load(std::memory_order_relaxed);
     out.getblocks_response_inv_zero_unknown =
         c.getblocks_response_inv_zero_unknown.load(std::memory_order_relaxed);
+    out.getblocks_served_inv_items =
+        c.getblocks_served_inv_items.load(std::memory_order_relaxed);
+    out.getblocks_served_inv_bytes =
+        c.getblocks_served_inv_bytes.load(std::memory_order_relaxed);
+    out.getblocks_consumption_getdata_matches =
+        c.getblocks_consumption_getdata_matches.load(std::memory_order_relaxed);
+    out.getblocks_suppressed_inv_replies =
+        c.getblocks_suppressed_inv_replies.load(std::memory_order_relaxed);
+    out.getblocks_suppressed_inv_items =
+        c.getblocks_suppressed_inv_items.load(std::memory_order_relaxed);
+    out.getblocks_suppressed_inv_bytes_avoided =
+        c.getblocks_suppressed_inv_bytes_avoided.load(std::memory_order_relaxed);
+    out.getblocks_zero_consume_windows =
+        c.getblocks_zero_consume_windows.load(std::memory_order_relaxed);
+    out.getblocks_low_nonzero_windows =
+        c.getblocks_low_nonzero_windows.load(std::memory_order_relaxed);
+    out.getblocks_release_latch_events =
+        c.getblocks_release_latch_events.load(std::memory_order_relaxed);
+    out.getblocks_reentry_ae =
+        c.getblocks_reentry_ae.load(std::memory_order_relaxed);
+    out.getblocks_reconnect_debt_entries =
+        c.getblocks_reconnect_debt_entries.load(std::memory_order_relaxed);
+    out.getblocks_reconnect_debt_transferred =
+        c.getblocks_reconnect_debt_transferred.load(std::memory_order_relaxed);
+    out.getblocks_reconnect_debt_evicted =
+        c.getblocks_reconnect_debt_evicted.load(std::memory_order_relaxed);
+    out.getblocks_reconnect_debt_cleared_by_consumption =
+        c.getblocks_reconnect_debt_cleared_by_consumption.load(std::memory_order_relaxed);
     out.recovery_outcome_useful =
         c.recovery_outcome_useful.load(std::memory_order_relaxed);
     out.recovery_outcome_known_only =

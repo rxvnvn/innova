@@ -172,6 +172,30 @@ struct IBDMetricsSnapshot
     // is the precise interpretation exposed for new dashboards.
     int64_t getblocks_response_zero_unknown;
     int64_t getblocks_response_inv_zero_unknown;
+    // Serving-side getblocks -> inv zero-consumption suppression
+    // (-getblocksservedinvzero).  Items/bytes actually pushed in getblocks
+    // inv replies; getdata consumption matching a recently served window;
+    // suppressed replies plus the inv items/bytes avoided; window outcomes
+    // (zero-consume vs low-nonzero windows); safety-release latch events;
+    // and reentry (prior-history) suppressions.
+    int64_t getblocks_served_inv_items;
+    int64_t getblocks_served_inv_bytes;
+    int64_t getblocks_consumption_getdata_matches;
+    int64_t getblocks_suppressed_inv_replies;
+    int64_t getblocks_suppressed_inv_items;
+    int64_t getblocks_suppressed_inv_bytes_avoided;
+    int64_t getblocks_zero_consume_windows;
+    int64_t getblocks_low_nonzero_windows;
+    int64_t getblocks_release_latch_events;
+    int64_t getblocks_reentry_ae;
+    // Reconnect-persistent zero-consumption debt (see getblocksservedinvzero.h).
+    // entries is a GAUGE (current map size); the other three are CUMULATIVE
+    // (transferred = prime applied on a reconnect; evicted = LRU/TTL eviction;
+    // cleared_by_consumption = debt removed when a peer consumed).
+    int64_t getblocks_reconnect_debt_entries;
+    int64_t getblocks_reconnect_debt_transferred;
+    int64_t getblocks_reconnect_debt_evicted;
+    int64_t getblocks_reconnect_debt_cleared_by_consumption;
     int64_t recovery_outcome_useful;
     int64_t recovery_outcome_known_only;
     int64_t recovery_outcome_no_response;
@@ -486,6 +510,22 @@ struct Counters
     // is the precise interpretation exposed for new dashboards.
     std::atomic<int64_t> getblocks_response_zero_unknown;
     std::atomic<int64_t> getblocks_response_inv_zero_unknown;
+    // Serving-side getblocks -> inv zero-consumption suppression
+    // (-getblocksservedinvzero).  See the snapshot struct comment.
+    std::atomic<int64_t> getblocks_served_inv_items;
+    std::atomic<int64_t> getblocks_served_inv_bytes;
+    std::atomic<int64_t> getblocks_consumption_getdata_matches;
+    std::atomic<int64_t> getblocks_suppressed_inv_replies;
+    std::atomic<int64_t> getblocks_suppressed_inv_items;
+    std::atomic<int64_t> getblocks_suppressed_inv_bytes_avoided;
+    std::atomic<int64_t> getblocks_zero_consume_windows;
+    std::atomic<int64_t> getblocks_low_nonzero_windows;
+    std::atomic<int64_t> getblocks_release_latch_events;
+    std::atomic<int64_t> getblocks_reentry_ae;
+    std::atomic<int64_t> getblocks_reconnect_debt_entries;
+    std::atomic<int64_t> getblocks_reconnect_debt_transferred;
+    std::atomic<int64_t> getblocks_reconnect_debt_evicted;
+    std::atomic<int64_t> getblocks_reconnect_debt_cleared_by_consumption;
     std::atomic<int64_t> recovery_outcome_useful;
     std::atomic<int64_t> recovery_outcome_known_only;
     std::atomic<int64_t> recovery_outcome_no_response;

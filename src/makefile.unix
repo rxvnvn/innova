@@ -503,6 +503,7 @@ TEST_OBJS= \
     obj/test/ibdheadersobserver_tests.o \
     obj/test/pinglifecycle_tests.o \
     obj/test/headersservededup_tests.o \
+    obj/test/getblocksservedinvzero_tests.o \
     obj/test/invalidate_reconsider_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle release-check

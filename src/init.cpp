@@ -24,6 +24,7 @@
 #include "ibdexptrace.h"
 #include "pinglifecycletrace.h"
 #include "headersservededup.h"
+#include "getblocksservedinvzero.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -437,7 +438,14 @@ bool AppInit(int argc, char* argv[])
         if (pid > 0)
         {
             CreatePidFile(GetPidFile(), pid);
-            return true;
+            // POSIX daemonize: the parent's only job is to record the child's
+            // pid, then terminate IMMEDIATELY without running C++ static/global
+            // destructors.  Returning to main() here would let the parent run
+            // static destructors; at the instant of fork() a global recursive
+            // mutex may have been held by another thread, so destroying a
+            // (still-locked) mutex fires the boost recursive_mutex assertion /
+            // glibc teardown noise.  _exit() skips static destruction entirely.
+            _exit(0);
         }
 
 #if OPENSSL_VERSION_NUMBER >= 0x30000000L
@@ -596,6 +604,13 @@ std::string HelpMessage()
         "  -debugchain            " + _("Output extra blockchain debugging information") + "\n" +
         "  -blockrequesttrace=<n> " + _("Trace anomalous block request lifecycles (default: 0)") + "\n" +
         "  -headersserveddedup=<0|1> " + _("Suppress duplicate getheaders responses per peer within an 8s window (default: 0)") + "\n" +
+        "  -getblocksservedinvzero=<0|1> " + _("Suppress repeated zero-consumption getblocks->inv replies per strict-inbound peer (default: 0)") + "\n" +
+        "  -getblocksservedinvgrace=<n> " + _("Min served-window age (seconds) before zero-consumption suppression may fire (default: 60)") + "\n" +
+        "  -getblocksservedinvminitems=<n> " + _("Min cumulative served inv items before zero-consumption suppression may fire (default: 2000)") + "\n" +
+        "  -getblocksservedinvstreak=<n> " + _("Consecutive zero-consumption getblocks required for a peer with no such history (default: 3)") + "\n" +
+        "  -getblocksservedinvreentry=<n> " + _("Required zero-consumption streak for a peer with prior history (default: 1)") + "\n" +
+        "  -getblocksservedinvwindow=<n> " + _("Max recently-served windows retained per peer (default: 8)") + "\n" +
+        "  -getblocksservedinvexpiry=<n> " + _("Recently-served window expiry in seconds (default: 120)") + "\n" +
         "  -blockrequesttracehash=<hash> " + _("Limit block request tracing to one block hash (requires -blockrequesttrace)") + "\n" +
         "  -continuitybreakms=<n> " + _("Min no-connect gap (ms) before the one-shot FIRST_CONTINUITY_BREAK event fires (requires -blockrequesttrace, default: 60000)") + "\n" +
         "  -ibdefficiencytrace=<0|1> " + _("Trace IBD block efficiency counters (default: 0)") + "\n" +
@@ -997,6 +1012,7 @@ bool AppInit2()
     InitIBDEfficiencyTrace(GetBoolArg("-ibdefficiencytrace", false));
     InitProcessBlockRejectTrace(GetBoolArg("-processblockrejecttrace", false));
     InitHeadersServedDedup(GetBoolArg("-headersserveddedup", false));
+    InitGetBlocksServedInvZero(GetBoolArg("-getblocksservedinvzero", false));
     InitAcceptBlockRejectTrace(GetBoolArg("-acceptblockrejecttrace", false));
     ibdactivepath::InitIBDActivePathTrace(
         GetBoolArg("-ibdactivepathtrace", false));
