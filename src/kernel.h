@@ -18,6 +18,9 @@ static const int MODIFIER_INTERVAL_RATIO = 3;
 
 // Compute the hash modifier for proof-of-stake
 bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeModifier, bool& fGeneratedStakeModifier);
+// READ-ONLY mainnet differential verify (HARD GATE #1): walks the loaded block
+// index (production loader) comparing legacy vs optimized ComputeNextStakeModifier.
+extern void VerifyStakeModifierDifferential();
 
 // Check whether stake kernel meets hash target
 // Sets hashProofOfStake on success return

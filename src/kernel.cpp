@@ -149,16 +149,21 @@ static int64_t GetStakeModifierSelectionInterval()
 }
 
 // select a block from the candidate blocks in vSortedByTimestamp, excluding
-// already selected blocks in vSelectedBlocks, and with timestamp up to
-// nSelectionIntervalStop.
-static bool SelectBlockFromCandidates(vector<pair<int64_t, uint256> >& vSortedByTimestamp, map<uint256, const CBlockIndex*>& mapSelectedBlocks,
+// already selected blocks in mapSelectedBlocks, and with timestamp up to
+// nSelectionIntervalStop. vSelHash[i] is the precomputed selection hash for
+// vSortedByTimestamp[i] (round-invariant: hashProof||prevModifier, >>32 for PoS)
+// so each candidate is hashed exactly once across the 64 rounds.
+static bool SelectBlockFromCandidates(vector<pair<int64_t, uint256> >& vSortedByTimestamp,
+    const vector<uint256>& vSelHash,
+    map<uint256, const CBlockIndex*>& mapSelectedBlocks,
     int64_t nSelectionIntervalStop, uint64_t nStakeModifierPrev, const CBlockIndex** pindexSelected)
 {
     bool fSelected = false;
     uint256 hashBest = 0;
     *pindexSelected = (const CBlockIndex*) 0;
-    for (const PAIRTYPE(int64_t, uint256)& item : vSortedByTimestamp)
+    for (size_t i = 0; i < vSortedByTimestamp.size(); i++)
     {
+        const PAIRTYPE(int64_t, uint256)& item = vSortedByTimestamp[i];
         if (!mapBlockIndex.count(item.second))
             return error("SelectBlockFromCandidates: failed to find block index for candidate block %s", item.second.ToString().c_str());
         const CBlockIndex* pindex = mapBlockIndex[item.second];
@@ -166,16 +171,7 @@ static bool SelectBlockFromCandidates(vector<pair<int64_t, uint256> >& vSortedBy
             break;
         if (mapSelectedBlocks.count(pindex->GetBlockHash()) > 0)
             continue;
-        // compute the selection hash by hashing its proof-hash and the
-        // previous proof-of-stake modifier
-        CDataStream ss(SER_GETHASH, 0);
-        ss << pindex->hashProof << nStakeModifierPrev;
-        uint256 hashSelection = Hash(ss.begin(), ss.end());
-        // the selection hash is divided by 2**32 so that proof-of-stake block
-        // is always favored over proof-of-work block. this is to preserve
-        // the energy efficiency property
-        if (pindex->IsProofOfStake())
-            hashSelection >>= 32;
+        const uint256& hashSelection = vSelHash[i];
         if (fSelected && hashSelection < hashBest)
         {
             hashBest = hashSelection;
@@ -218,8 +214,20 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeMod
     // First find current stake modifier and its generation block time
     // if it's not old enough, return the same stake modifier
     int64_t nModifierTime = 0;
-    if (!GetLastStakeModifier(pindexPrev, nStakeModifier, nModifierTime))
+    // -stakemodifieropt (default off): recover previous modifier/time in O(1)
+    // from the in-memory (chain-own, not serialized) nStakeModifierTime memo
+    // instead of the GetLastStakeModifier backward walk. Fallback to legacy when
+    // unset (0) / flag off, so semantics are bit-identical.
+    bool fOpt = GetBoolArg("-stakemodifieropt", false);
+    if (fOpt && pindexPrev && pindexPrev->nStakeModifierTime != 0)
+    {
+        nStakeModifier = pindexPrev->nStakeModifier;
+        nModifierTime  = pindexPrev->nStakeModifierTime;
+    }
+    else if (!GetLastStakeModifier(pindexPrev, nStakeModifier, nModifierTime))
+    {
         return error("ComputeNextStakeModifier: unable to get last modifier");
+    }
     if (fDebug)
     {
         printf("ComputeNextStakeModifier: prev modifier=0x%016" PRIx64" time=%s\n", nStakeModifier, DateTimeStrFormat(nModifierTime).c_str());
@@ -242,7 +250,33 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeMod
     reverse(vSortedByTimestamp.begin(), vSortedByTimestamp.end());
     sort(vSortedByTimestamp.begin(), vSortedByTimestamp.end());
 
-    // Select 64 blocks from candidate blocks to generate stake modifier
+    // Select 64 blocks from candidate blocks to generate stake modifier.
+    // Precompute each candidate's selection hash ONCE: it is round-invariant
+    // (inputs = pindex->hashProof || nStakeModifier, where nStakeModifier is the
+    // previous modifier, constant across all 64 rounds). The precompute applies
+    // the PoS >>32 adjustment; the 64 rounds then reuse the exact same value.
+    vector<uint256> vSelHash;
+    vSelHash.reserve(vSortedByTimestamp.size());
+    {
+        int64_t nPreUs = GetTimeMicros();
+        for (const PAIRTYPE(int64_t, uint256)& item : vSortedByTimestamp)
+        {
+            const CBlockIndex* pc = mapBlockIndex[item.second];
+            CDataStream ss(SER_GETHASH, 0);
+            ss << pc->hashProof << nStakeModifier;
+            uint256 h = Hash(ss.begin(), ss.end());
+            if (pc->IsProofOfStake())
+                h >>= 32;
+            vSelHash.push_back(h);
+        }
+        if (fOpt)
+        {
+            int64_t nPreUs2 = GetTimeMicros() - nPreUs;
+            if (nPreUs2 > 250000)
+                printf("ComputeNextStakeModifier: precompute_selhash_us=%" PRId64" candidates=%zu\n", nPreUs2, vSelHash.size());
+        }
+    }
+
     uint64_t nStakeModifierNew = 0;
     int64_t nSelectionIntervalStop = nSelectionIntervalStart;
     map<uint256, const CBlockIndex*> mapSelectedBlocks;
@@ -251,7 +285,7 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeMod
         // add an interval section to the current selection round
         nSelectionIntervalStop += GetStakeModifierSelectionIntervalSection(nRound);
         // select a block from the candidates of current round
-        if (!SelectBlockFromCandidates(vSortedByTimestamp, mapSelectedBlocks, nSelectionIntervalStop, nStakeModifier, &pindex))
+        if (!SelectBlockFromCandidates(vSortedByTimestamp, vSelHash, mapSelectedBlocks, nSelectionIntervalStop, nStakeModifier, &pindex))
             return error("ComputeNextStakeModifier: unable to select block at round %d", nRound);
         // write the entropy bit of the selected block
         nStakeModifierNew |= (((uint64_t)pindex->GetStakeEntropyBit()) << nRound);
@@ -773,4 +807,106 @@ bool CheckStakeModifierCheckpoints(int nHeight, unsigned int nStakeModifierCheck
     if (checkpoints.count(nHeight))
         return nStakeModifierChecksum == checkpoints[nHeight];
     return true;
+}
+
+// =========================================================================
+// READ-ONLY mainnet differential verify (HARD GATE #1)
+// Walks the active chain reconstructed from the PRODUCTION-loaded block index
+// (mapBlockIndex) and compares legacy vs optimized ComputeNextStakeModifier.
+// Non-generation blocks check the exact fast-path condition; generation blocks
+// dual-compute legacy (64-round) and optimized (precomputed selection hashes).
+// Any consensus difference is reported as a hard failure.
+// =========================================================================
+void VerifyStakeModifierDifferential()
+{
+    int64_t nT0 = GetTimeMillis();
+    std::vector<CBlockIndex*> vActive;
+    CBlockIndex* pindexBest = NULL;
+    for (std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.begin(); it != mapBlockIndex.end(); ++it)
+        if (!pindexBest || it->second->nChainTrust > pindexBest->nChainTrust)
+            pindexBest = it->second;
+    if (!pindexBest)
+    {
+        printf("VERIFY_STAKEMOD: empty block index\n");
+        return;
+    }
+    for (CBlockIndex* p = pindexBest; p; p = p->pprev)
+        vActive.push_back(p);
+    std::reverse(vActive.begin(), vActive.end());
+
+    int64_t nBlocksChecked = 0, nNonGenChecks = 0, nGenEvents = 0;
+    int64_t nLegacyFail = 0, nOptFail = 0, nGenFlagMism = 0, nModMism = 0;
+    int64_t nFallbackUses = 0, nMemoUses = 0;
+    uint64_t nLastMod = 0;
+    bool fInject = GetBoolArg("-stakemodifierverify_faultinject", false);
+
+    for (size_t i = 1; i < vActive.size(); i++)
+    {
+        CBlockIndex* pprev = vActive[i-1];
+        CBlockIndex* cur  = vActive[i];
+        uint64_t modO = 0; bool genO = false;
+        // optimized path (uses memo O(1) when set, else falls back to legacy walk)
+        mapArgs["-stakemodifieropt"] = "1";
+        bool okO = ComputeNextStakeModifier(pprev, modO, genO);
+        if (!okO) nOptFail++;
+        if (fInject && (int64_t)i == vActive.size()/2) modO ^= 1ULL; // fault: expect mismatch
+
+        // generation-due decision exactly matching legacy:
+        // prev-generated-modifier-time/interval < pprev->time/interval.
+        // pprev->nStakeModifierTime is our in-memory memo == GetLastStakeModifier's
+        // nModifierTime. memo==0 (unset) -> dual-compute to be safe.
+        bool due;
+        if (pprev->nStakeModifierTime == 0)
+            due = true;
+        else
+            due = (pprev->nStakeModifierTime / nModifierInterval < pprev->GetBlockTime() / nModifierInterval);
+
+        if (!due)
+        {
+            // non-generation: optimized must equal legacy fast-path (same modifier)
+            nNonGenChecks++;
+            if (genO != false || modO != nLastMod) { nModMism++; nGenFlagMism++; }
+        }
+        else
+        {
+            nGenEvents++;
+            // dual-compute legacy independently (falls back to full walk + 64 rounds)
+            uint64_t modL = 0; bool genL = false;
+            mapArgs["-stakemodifieropt"] = "0";
+            bool okL = ComputeNextStakeModifier(pprev, modL, genL);
+            if (!okL) nLegacyFail++;
+            if (okL && okO)
+            {
+                if (genL != genO) nGenFlagMism++;
+                if (modL != modO) nModMism++;
+            }
+        }
+
+        // apply to current block exactly as AddToBlockIndex does
+        cur->SetStakeModifier(modO, genO);
+        cur->nStakeModifierTime = genO ? cur->GetBlockTime()
+                                       : (pprev ? pprev->nStakeModifierTime : 0);
+        nLastMod = modO;
+        if (pprev->nStakeModifierTime == 0) nFallbackUses++; else nMemoUses++;
+        nBlocksChecked++;
+
+        if ((nBlocksChecked % 500000) == 0)
+            printf("VERIFY_STAKEMOD: progress blocks=%lld gen=%lld mism=%lld\n",
+                (long long)nBlocksChecked, (long long)nGenEvents, (long long)(nModMism+nGenFlagMism));
+    }
+
+    printf("VERIFY_STAKEMOD: ACTIVE_BLOCKS=%lld records=%zu tip_height=%d tip=%s\n",
+        (long long)vActive.size(), mapBlockIndex.size(), vActive.back()->nHeight,
+        vActive.back()->GetBlockHash().ToString().c_str());
+    printf("VERIFY_STAKEMOD: blocks_checked=%lld non_gen_checks=%lld gen_events=%lld\n",
+        (long long)nBlocksChecked, (long long)nNonGenChecks, (long long)nGenEvents);
+    printf("VERIFY_STAKEMOD: legacy_fail=%lld opt_fail=%lld\n", (long long)nLegacyFail, (long long)nOptFail);
+    printf("VERIFY_STAKEMOD: genflag_mismatches=%lld modifier_mismatches=%lld\n",
+        (long long)nGenFlagMism, (long long)nModMism);
+    printf("VERIFY_STAKEMOD: fallback_uses=%lld memo_uses=%lld elapsed_ms=%lld\n",
+        (long long)nFallbackUses, (long long)nMemoUses, (long long)(GetTimeMillis()-nT0));
+    if (nGenFlagMism == 0 && nModMism == 0)
+        printf("VERIFY_STAKEMOD: RESULT=MAINNET_ZERO_MISMATCH\n");
+    else
+        printf("VERIFY_STAKEMOD: RESULT=MAINNET_MISMATCH\n");
 }

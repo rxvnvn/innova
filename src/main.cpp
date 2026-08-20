@@ -8354,6 +8354,11 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     if (!ComputeNextStakeModifier(pindexNew->pprev, nStakeModifier, fGeneratedStakeModifier))
         return error("AddToBlockIndex() : ComputeNextStakeModifier() failed");
     pindexNew->SetStakeModifier(nStakeModifier, fGeneratedStakeModifier);
+    // in-memory chain-own memo: block time of the last generated modifier active
+    // at this index (for O(1) next-block recovery under -stakemodifieropt).
+    pindexNew->nStakeModifierTime = fGeneratedStakeModifier
+        ? pindexNew->GetBlockTime()
+        : (pindexNew->pprev ? pindexNew->pprev->nStakeModifierTime : 0);
     pindexNew->nStakeModifierChecksum = GetStakeModifierChecksum(pindexNew);
     if (!CheckStakeModifierCheckpoints(pindexNew->nHeight, pindexNew->nStakeModifierChecksum))
         return error("AddToBlockIndex() : Rejected by stake modifier checkpoint height=%d, modifier=0x%016" PRIx64, pindexNew->nHeight, nStakeModifier);

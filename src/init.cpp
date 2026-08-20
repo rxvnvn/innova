@@ -7,6 +7,7 @@
 
 #include "init.h"
 #include "main.h"
+#include "kernel.h"
 #include "miner.h"
 #include "txdb.h"
 #include "walletdb.h"
@@ -1443,6 +1444,16 @@ bool AppInit2()
         CTxDB txdb("r");
         txdb.LoadBlockIndex();
         PrintBlockTree();
+        return false;
+    };
+
+    // HARD GATE #1: READ-ONLY mainnet differential verify, reusing the
+    // production CTxDB::LoadBlockIndex (read-only "r" open). Exits cleanly.
+    if (GetBoolArg("-stakemodifierverify", false))
+    {
+        CTxDB txdb("r");
+        txdb.LoadBlockIndex();
+        VerifyStakeModifierDifferential();
         return false;
     };
 

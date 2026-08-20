@@ -1633,6 +1633,11 @@ public:
 
     uint64_t nStakeModifier; // hash modifier for proof-of-stake
     unsigned int nStakeModifierChecksum; // checksum of index; in-memeory only
+    // in-memory only (NOT serialized): block time of the last generated stake
+    // modifier active at this index on its own branch. Enables O(1) recovery
+    // of the previous modifier/time (ComputeNextStakeModifier) without the
+    // GetLastStakeModifier backward walk. 0 = unset (legacy walk fallback).
+    int64_t nStakeModifierTime;
 
     // proof-of-stake specific fields
     COutPoint prevoutStake;
@@ -1662,6 +1667,7 @@ public:
         nFlags = 0;
         nStakeModifier = 0;
         nStakeModifierChecksum = 0;
+        nStakeModifierTime = 0;
         hashProof = 0;
         prevoutStake.SetNull();
         nStakeTime = 0;
@@ -1688,6 +1694,7 @@ public:
         nFlags = 0;
         nStakeModifier = 0;
         nStakeModifierChecksum = 0;
+        nStakeModifierTime = 0;
         hashProof = 0;
         if (block.IsProofOfStake())
         {
