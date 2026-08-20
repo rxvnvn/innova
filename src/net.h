@@ -50,6 +50,30 @@ enum IbdOrderedExpiryOutcome
 IbdOrderedExpiryOutcome IbdHeaderSchedulerOrderedExpiryDecide(
     const uint256& hash, int64_t nNowUs, int64_t nWireUs);
 
+// Bounded getdata block-serve budget (default 1 == legacy single-block cap).
+// Configured immutably in AppInit2 from -getdatablockbudget=<N> (clamped to
+// [1,64]).  A value >1 lets one ProcessGetData invocation serve up to N
+// MSG_BLOCK requests, draining a multi-block burst across fewer msghand passes
+// while preserving send-buffer protection and bounded cs_main hold.  When the
+// budget is 1 behavior is byte-for-byte the legacy one-block-per-call path.
+void InitGetDataBlockBudget(int n);
+int GetDataBlockBudget();
+
+// Lightweight diagnostic counters for evaluating the block-serve budget.
+struct DataBlockBudgetCounters {
+    uint64_t calls;
+    uint64_t blockServed;
+    uint64_t budgetHit;
+    uint64_t sendBufferBreak;
+    uint64_t queueRemaining;
+    uint64_t maxServedPerCall;
+};
+DataBlockBudgetCounters GetDataBlockBudgetCounters();
+void ResetDataBlockBudgetCountersForTesting();
+
+// Test hook only: calls the file-local ProcessGetData.
+void ProcessGetDataForTesting(CNode* pfrom);
+
 // Armed exactly once when an ordinary (non-recovery) block-sync getblocks has
 // been committed for transmission to a peer that can advance local block sync.
 // Recovery-tagged getblocks and getblocks to peers that cannot advance block

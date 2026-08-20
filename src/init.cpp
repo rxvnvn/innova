@@ -615,6 +615,7 @@ std::string HelpMessage()
         "  -blockrequesttracehash=<hash> " + _("Limit block request tracing to one block hash (requires -blockrequesttrace)") + "\n" +
         "  -continuitybreakms=<n> " + _("Min no-connect gap (ms) before the one-shot FIRST_CONTINUITY_BREAK event fires (requires -blockrequesttrace, default: 60000)") + "\n" +
         "  -ibdefficiencytrace=<0|1> " + _("Trace IBD block efficiency counters (default: 0)") + "\n" +
+        "  -getdatablockbudget=<n> " + _("Max MSG_BLOCK requests served per ProcessGetData invocation (clamped to 1..64; default: 1 = legacy one-block-per-call)") + "\n" +
         "  -ibdactivepathtrace=<0|1> " + _("Trace IBD active-path throughput (IBD_ACTIVE_1S, IBD_SLOW_BLOCK, IBD_STATE_TRACE; default: 0)") + "\n" +
         "  -ibdblocklatency=<0|1> " + _("Per-block GETDATA-to-CONNECT latency decomposition (IBD_BLOCKLAT_1S; default: 0)") + "\n" +
         "  -ibdblocklatencycsv=<file> " + _("Write the per-block IBD block-latency CSV dump at shutdown (default: empty = no CSV, summary only)") + "\n" +
@@ -1012,6 +1013,7 @@ bool AppInit2()
     }
     InitIBDEfficiencyTrace(GetBoolArg("-ibdefficiencytrace", false));
     InitProcessBlockRejectTrace(GetBoolArg("-processblockrejecttrace", false));
+    InitGetDataBlockBudget(GetArg("-getdatablockbudget", 1));
     InitHeadersServedDedup(GetBoolArg("-headersserveddedup", false));
     InitGetBlocksServedInvZero(GetBoolArg("-getblocksservedinvzero", false));
     InitAcceptBlockRejectTrace(GetBoolArg("-acceptblockrejecttrace", false));

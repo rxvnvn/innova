@@ -10297,6 +10297,42 @@ bool static AlreadyHave(CTxDB& txdb, const CInv& inv)
     return true;
 }
 
+// --- Bounded getdata block-serve budget ---
+// Defaults to 1, which reproduces exact legacy behavior (at most one MSG_BLOCK
+// served per ProcessGetData invocation).  A larger value drains a multi-block
+// getdata burst across fewer msghand passes while keeping cs_main hold and the
+// per-peer send buffer bounded.  Configured once in AppInit2, then immutable.
+static int nGetDataBlockBudget = 1;
+static const int GETDATA_BLOCK_BUDGET_MAX = 64;
+
+void InitGetDataBlockBudget(int n)
+{
+    nGetDataBlockBudget = (n < 1) ? 1 : (n > GETDATA_BLOCK_BUDGET_MAX ? GETDATA_BLOCK_BUDGET_MAX : n);
+}
+int GetDataBlockBudget() { return nGetDataBlockBudget; }
+
+// Lightweight diagnostic counters (single-writer: msghand thread only).
+// DataBlockBudgetCounters struct is declared in net.h.
+static uint64_t gDbCalls = 0, gDbBlockServed = 0, gDbBudgetHit = 0;
+static uint64_t gDbSendBufferBreak = 0, gDbQueueRemaining = 0, gDbMaxServedPerCall = 0;
+
+DataBlockBudgetCounters GetDataBlockBudgetCounters()
+{
+    DataBlockBudgetCounters c;
+    c.calls = gDbCalls;
+    c.blockServed = gDbBlockServed;
+    c.budgetHit = gDbBudgetHit;
+    c.sendBufferBreak = gDbSendBufferBreak;
+    c.queueRemaining = gDbQueueRemaining;
+    c.maxServedPerCall = gDbMaxServedPerCall;
+    return c;
+}
+void ResetDataBlockBudgetCountersForTesting()
+{
+    gDbCalls = 0; gDbBlockServed = 0; gDbBudgetHit = 0;
+    gDbSendBufferBreak = 0; gDbQueueRemaining = 0; gDbMaxServedPerCall = 0;
+}
+
 void static ProcessGetData(CNode* pfrom)
 {
     if (fDebugNet)
@@ -10308,10 +10344,17 @@ void static ProcessGetData(CNode* pfrom)
 
     LOCK(cs_main);
 
+    ++gDbCalls;
+    int nBlocksThisCall = 0;
+    bool fSendBufferBreakThisCall = false;
+
     while (it != pfrom->vRecvGetData.end()) {
         // Don't bother if send buffer is too full to respond anyway
         if (pfrom->nSendSize >= SendBufferSize())
+        {
+            fSendBufferBreakThisCall = true;
             break;
+        }
 
         if (fShutdown)
             return;
@@ -10342,7 +10385,6 @@ void static ProcessGetData(CNode* pfrom)
                     send = true;
                     CBlock block;
                     block.ReadFromDisk((*mi).second);
-
                     if (inv.type == MSG_FILTERED_BLOCK)
                     {
                         LOCK(pfrom->cs_filter);
@@ -10359,6 +10401,7 @@ void static ProcessGetData(CNode* pfrom)
                     else
                     {
                         pfrom->PushMessage("block", block);
+                        ++gDbBlockServed;
                     }
 
                     // Trigger them to send a getblocks request for the next batch of inventory
@@ -10452,12 +10495,29 @@ void static ProcessGetData(CNode* pfrom)
             // Track requests for our stuff.
             g_signals.Inventory(inv.hash);
 
+            // Bounded multi-block budget: MSG_BLOCK advances the per-pass counter
+            // exactly where legacy advanced the single-block cap.  Legacy
+            // (budget==1) breaks on the first MSG_BLOCK; a larger budget serves up
+            // to nGetDataBlockBudget blocks per invocation.
             if (inv.type == MSG_BLOCK /* || inv.type == MSG_FILTERED_BLOCK */)
-                break;
+            {
+                ++nBlocksThisCall;
+                if (nBlocksThisCall >= nGetDataBlockBudget)
+                {
+                    ++gDbBudgetHit;
+                    break;
+                }
+            }
         }
     }
 
     pfrom->vRecvGetData.erase(pfrom->vRecvGetData.begin(), it);
+
+    gDbQueueRemaining = (uint64_t)pfrom->vRecvGetData.size();
+    if ((uint64_t)nBlocksThisCall > gDbMaxServedPerCall)
+        gDbMaxServedPerCall = (uint64_t)nBlocksThisCall;
+    if (fSendBufferBreakThisCall)
+        ++gDbSendBufferBreak;
 
     if (!vNotFound.empty()) {
         // Let the peer know that we didn't find what it asked for, so it doesn't
@@ -10470,6 +10530,10 @@ void static ProcessGetData(CNode* pfrom)
         pfrom->PushMessage("notfound", vNotFound);
     }
 }
+
+// Test hook: expose the file-local ProcessGetData to the unit-test harness
+// (mirrors the ibdforensic::*ForTesting pattern; no production callers).
+void ProcessGetDataForTesting(CNode* pfrom) { ProcessGetData(pfrom); }
 
 // The message start string is designed to be unlikely to occur in normal data.
 // The characters are rarely used upper ASCII, not valid as UTF-8, and produce
