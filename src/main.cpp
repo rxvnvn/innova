@@ -6433,6 +6433,90 @@ bool SeedGenesisCommitments(CTxDB& txdb, CIncrementalMerkleTree& shieldedTree, C
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Collateralnode payee/rank enforcement guard.
+//
+// Restores the !IsInitialBlockDownload() clause of the ORIGINAL upstream CN
+// payment guard that was dropped during "Rebrand Phase Two" (commit c66803e).
+// The pre-rebrand parent (ca0809a, main.cpp:2712) guarded the whole CN payment
+// block with "... && (pindex->nHeight < pindexBest->nHeight+5) &&
+// !IsInitialBlockDownload() && <name>Payments == true".
+//
+// Why this matters: the payee validation depends on the node's in-memory
+// collateralnode list (vecCollateralnodes), which is only populated/synced via
+// peer "iseg"/dseg messages and is NON-authoritative during initial block
+// download. When the payee is not found in the (unsynced/empty) list, the code
+// falls back to FindCNPayment(), an unbounded genesis-ward scan of every block
+// and vout looking for the CN collateral. During IBD the local chain is also
+// incomplete, so that scan is both pathologically slow (~200s of cs_main) and
+// unreliable (it never finds the collateral -> false DoS-rejection of an
+// otherwise-valid block). This wedges the node and starves every RPC.
+//
+// We therefore DEFER CN payee enforcement until the CN state is authoritative.
+// "Authoritative" means BOTH (1) not in initial block download AND (2) the local
+// in-memory collateralnode list is at least as complete as the network-announced
+// median count (mnCount) -- i.e. it can reliably contain the block's payee. A
+// marginal list (non-empty but partial) still triggers the expensive FindCNPayment
+// fallback, so IBD alone is insufficient. All other consensus checks -- including
+// the deterministic coinbase reward / CN-amount cap in ConnectBlock -- still run.
+// Once CN state is authoritative, the EXACT existing validation runs unchanged.
+// ---------------------------------------------------------------------------
+static std::atomic<int64_t> nCNPaymentsDeferred{0};
+
+bool ShouldValidateCollateralnodePayments(CBlockIndex* pindex, bool fJustCheck,
+                                         bool fCollateralnodePaymentsEnabled)
+{
+    if (fJustCheck)
+        return false;
+    if (!fCollateralnodePaymentsEnabled)
+        return false;
+    if (!(pindex->GetBlockTime() > GetTime() - 20 * nCoinbaseMaturity))
+        return false;
+    if (IsInitialBlockDownload())
+    {
+        nCNPaymentsDeferred.fetch_add(1, std::memory_order_relaxed);
+        if (fDebug)
+            printf("CNPAY_DEFERRED height=%d reason=IBD\n", pindex->nHeight);
+        return false;
+    }
+    // Being past IBD alone is NOT sufficient: a partially-synced collateralnode
+    // list can still miss a block's real payee. When the payee is not in the
+    // local list, the code falls back to FindCNPayment(), an unbounded
+    // genesis-ward scan of every block/vout (~200s of cs_main) which then
+    // false-DoS-rejects an otherwise-valid block. So the list is authoritative
+    // for enforcement only once it is at least as complete as the network-
+    // announced median collateralnode count (mnCount) -- i.e. once it can
+    // reliably contain the block's payee. If we cannot confirm that (unknown
+    // median, stale/thin list, or the lock is busy), we defer.
+    unsigned int nNetMedian = 0;
+    size_t nLocalCount = 0;
+    {
+        TRY_LOCK(cs_collateralnodes, lockCN);
+        if (lockCN)
+        {
+            nNetMedian = mnCount;
+            nLocalCount = vecCollateralnodes.size();
+        }
+        // If the lock could not be taken, treat as non-authoritative (defer).
+    }
+    if (nNetMedian > 0 && nLocalCount >= (size_t)nNetMedian)
+        return true; // authoritative: run exact existing validation unchanged
+    nCNPaymentsDeferred.fetch_add(1, std::memory_order_relaxed);
+    if (fDebug)
+        printf("CNPAY_DEFERRED height=%d reason=list-not-authoritative local=%u median=%u\n",
+               pindex->nHeight, (unsigned)nLocalCount, nNetMedian);
+    return false;
+}
+
+int64_t GetCNPaymentsDeferredCount()
+{
+    return nCNPaymentsDeferred.load(std::memory_order_relaxed);
+}
+void ResetCNPaymentsDeferredCountForTesting()
+{
+    nCNPaymentsDeferred.store(0, std::memory_order_relaxed);
+}
+
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, bool fWriteNames)
 {
     ibdactivepath::ActivePathTimer ibdConnectTimer(
@@ -7228,7 +7312,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
         }
     }
 
-    if(!fJustCheck && pindex->GetBlockTime() > GetTime() - 20*nCoinbaseMaturity && CollateralnodePayments == true)
+    if(ShouldValidateCollateralnodePayments(pindex, fJustCheck, CollateralnodePayments == true))
     {
         LOCK2(cs_main, mempool.cs);
 

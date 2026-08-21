@@ -588,6 +588,10 @@ unsigned int ComputeMinStake(unsigned int nBase, int64_t nTime, unsigned int nBl
 int GetNumBlocksOfPeers();
 bool IsSynchronized();
 bool IsInitialBlockDownload();
+// Collateralnode payee-enforcement defer counter (see ShouldValidateCollateralnodePayments).
+int64_t GetCNPaymentsDeferredCount();
+void ResetCNPaymentsDeferredCountForTesting();
+bool ShouldValidateCollateralnodePayments(CBlockIndex* pindex, bool fJustCheck, bool fCollateralnodePaymentsEnabled);
 extern bool g_forceIbdPeerSnapshotUnavailableForTesting;
 std::string GetWarnings(std::string strFor);
 bool GetTransaction(const uint256 &hash, CTransaction &tx, uint256 &hashBlock, bool s=false);

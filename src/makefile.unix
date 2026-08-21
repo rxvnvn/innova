@@ -506,9 +506,10 @@ TEST_OBJS= \
     obj/test/getblocksservedinvzero_tests.o \
     obj/test/stakemodifieropt_tests.o \
     obj/test/getdatablockbudget_tests.o \
+    obj/test/cnpayment_guard_tests.o \
     obj/test/invalidate_reconsider_tests.o
 
-.PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle release-check
+.PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle check-cnpayment-guard release-check
 
 INNOVA_SPINNER ?= 1
 INNOVA_SPINNER_SCRIPT ?= ../contrib/innova_build_spinner.sh
@@ -654,3 +655,6 @@ clean:
 	-cd leveldb && $(MAKE) clean || true
 
 FORCE:
+
+check-cnpayment-guard: test_innova
+	./test_innova --run_test=cnpayment_guard_tests
