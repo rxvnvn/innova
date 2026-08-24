@@ -460,6 +460,7 @@ OBJS= \
     obj/activecollateralnode.o \
     obj/collateralnodeconfig.o \
     obj/collateralnode.o \
+    obj/hreg_registration.o \
     obj/rpccollateral.o \
     obj/spork.o \
     obj/collateral.o \
@@ -507,6 +508,7 @@ TEST_OBJS= \
     obj/test/stakemodifieropt_tests.o \
     obj/test/getdatablockbudget_tests.o \
     obj/test/cnpayment_guard_tests.o \
+    obj/test/hreg_registration_tests.o \
     obj/test/invalidate_reconsider_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle check-cnpayment-guard release-check

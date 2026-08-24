@@ -35,6 +35,7 @@
 #include "curvetree.h"
 #include "finality.h"
 #include "dag.h"
+#include "hreg_registration.h"
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -6176,10 +6177,26 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
 
 bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fWriteNames)
 {
-    // Disconnect in reverse order
+    // Disconnect in reverse order. HREG reverse-state replay must happen
+    // immediately after each tx's inputs are disconnected, while earlier same-
+    // block parent tx indices still exist in txdb.
     for (int i = vtx.size()-1; i >= 0; i--)
+    {
         if (!vtx[i].DisconnectInputs(txdb))
             return false;
+        if (hreg::IsHRegRecognitionActive(pindex->nHeight))
+        {
+            CTransaction tx = vtx[i];
+            bool fInvalid = false;
+            MapPrevTx mapInputs;
+            std::map<uint256, CTxIndex> mapEmpty;
+            if (!tx.FetchInputs(txdb, mapEmpty, true, false, mapInputs, fInvalid))
+                return error("DisconnectBlock() : HREG FetchInputs failed");
+            std::string strHRegError;
+            if (!hreg::DisconnectHRegTx(tx, mapInputs, pindex->nHeight, strHRegError))
+                return error("DisconnectBlock() : HREG disconnect invalid: %s", strHRegError.c_str());
+        }
+    }
 
     if (pindex->nHeight >= FORK_HEIGHT_DAG)
     {
@@ -6679,6 +6696,11 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
     unsigned int nPrivateStakeValidateCount = 0;
     unsigned int nAnonValidateCount = 0;
 
+    const bool fHRegActive = hreg::IsHRegRecognitionActive(pindex->nHeight);
+    hreg::RegistryState hregShadowState;
+    if (fHRegActive)
+        hregShadowState = hreg::g_registry;
+
     for (CTransaction& tx : vtx)
     {
         //const CTransaction &tx = vtx[i];
@@ -6824,6 +6846,13 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
 
             if (!tx.ConnectInputs(txdb, mapInputs, mapQueuedChanges, posThisTx, pindex, true, false, flags, true, fFCMPBatchVerified))
                 return false;
+
+            if (fHRegActive)
+            {
+                std::string strHRegError;
+                if (!hregShadowState.ApplyConnectedTx(tx, mapInputs, pindex->nHeight, strHRegError))
+                    return DoS(100, error("ConnectBlock() : HREG registration invalid: %s", strHRegError.c_str()));
+            }
 
             int64_t nTxValidateMicros = GetTimeMicros() - nTxValidateStart;
             if (tx.IsCoinStake() && (tx.nVersion == SHIELDED_TX_VERSION_NULLSTAKE ||
@@ -7855,6 +7884,9 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
         // add names to innovanamesindex.dat
         hooks->ConnectBlock(txdb, pindex);
     }
+
+    if (fHRegActive)
+        hreg::g_registry = hregShadowState;
 
     // Watch for transactions paying to me
     for (CTransaction& tx : vtx)
@@ -10147,6 +10179,10 @@ bool LoadBlockIndex(bool fAllowNew)
         if ((!fTestNet) && (!fRegTest) && !Checkpoints::ResetSyncCheckpoint())
             return error("LoadBlockIndex() : failed to reset sync-checkpoint");
     }
+
+    std::string strHRegRebuildError;
+    if (!hreg::RebuildHRegStateFromActiveChain(strHRegRebuildError))
+        return error("LoadBlockIndex() : HREG rebuild failed: %s", strHRegRebuildError.c_str());
 
     return true;
 }
