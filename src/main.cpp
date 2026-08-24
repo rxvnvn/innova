@@ -221,6 +221,10 @@ struct IbdHeaderSchedulerState
     // approached (defer) or truly abandoned (expire).  Entries are pruned to
     // ~one window in the refill so the map stays bounded.
     std::map<uint256, int> orderedRequestFrontierBaseline;
+    uint256 orderedRequestFrontierBaselinePruneCursor;
+    bool orderedRequestFrontierBaselinePruneCursorValid;
+    uint64_t baselinePruneEntriesExamined;
+    uint64_t baselinePruneEntriesErased;
     uint64_t orderedExpiryDeferredDueProgress;
     uint64_t orderedExpiryActual;
     // FRONT_PREEMPT (v1): decision counters for ordered-head slot migration.
@@ -235,6 +239,8 @@ struct IbdHeaderSchedulerState
           cursorRound(0), fallbackCount(0),
           invInsideWindow(0), invBeforeWindow(0), invAfterWindow(0),
           invOffBranch(0), invUnknown(0), invPrevented(0),
+          orderedRequestFrontierBaselinePruneCursorValid(false),
+          baselinePruneEntriesExamined(0), baselinePruneEntriesErased(0),
           orderedExpiryDeferredDueProgress(0), orderedExpiryActual(0),
           frontPreemptAttempts(0), frontPreemptTransfers(0)
     {
@@ -274,6 +280,10 @@ struct IbdHeaderSchedulerState
         invUnknown = 0;
         invPrevented = 0;
         orderedRequestFrontierBaseline.clear();
+        orderedRequestFrontierBaselinePruneCursor = 0;
+        orderedRequestFrontierBaselinePruneCursorValid = false;
+        baselinePruneEntriesExamined = 0;
+        baselinePruneEntriesErased = 0;
         orderedExpiryDeferredDueProgress = 0;
         orderedExpiryActual = 0;
         frontPreemptAttempts = 0;
@@ -302,6 +312,60 @@ static CBlockIndex* g_ibdHeaderSchedulerSavedPindexBest = NULL;
 static uint256 g_ibdHeaderSchedulerSavedHashBestChain;
 static int g_ibdHeaderSchedulerSavedBestHeight = -1;
 static bool g_ibdHeaderSchedulerTestAnchorActive = false;
+}
+
+static const size_t ORDERED_BASELINE_PRUNE_BUDGET = 64;
+
+static void PruneOrderedRequestFrontierBaselineBounded(
+    const CIbdHeaderGraph& graph, int nFrontierHeight)
+{
+    std::map<uint256, int>& baseline =
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline;
+    if (baseline.empty())
+    {
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursor = 0;
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursorValid = false;
+        return;
+    }
+
+    size_t nBudget = std::min<size_t>(ORDERED_BASELINE_PRUNE_BUDGET,
+                                      baseline.size());
+    std::map<uint256, int>::iterator it =
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursorValid
+            ? baseline.lower_bound(
+                  g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursor)
+            : baseline.begin();
+    if (it == baseline.end())
+        it = baseline.begin();
+
+    for (size_t i = 0; i < nBudget && !baseline.empty(); ++i)
+    {
+        if (it == baseline.end())
+            it = baseline.begin();
+        std::map<uint256, int>::iterator current = it++;
+        ++g_ibdHeaderSchedulerState.baselinePruneEntriesExamined;
+        const CIbdHeaderNode* nB = graph.Lookup(current->first);
+        if (nB == NULL || !nB->IsAnchored() ||
+            nB->height <= nFrontierHeight ||
+            (size_t)(nB->height - nFrontierHeight) > GetIbdBlockWindow())
+        {
+            baseline.erase(current);
+            ++g_ibdHeaderSchedulerState.baselinePruneEntriesErased;
+        }
+    }
+
+    if (baseline.empty())
+    {
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursor = 0;
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursorValid = false;
+    }
+    else
+    {
+        if (it == baseline.end())
+            it = baseline.begin();
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursor = it->first;
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursorValid = true;
+    }
 }
 
 void AdvanceIbdHeaderSchedulerRound()
@@ -1182,6 +1246,15 @@ static size_t PurgeObsoleteOrderedQueuedWork(
         if (newPath.count(*it) == 0)
             obsolete.insert(*it);
 
+    for (std::set<uint256>::const_iterator it = obsolete.begin();
+         it != obsolete.end(); ++it)
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.erase(*it);
+    if (g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.empty())
+    {
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursor = 0;
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursorValid = false;
+    }
+
     size_t nPurged = 0;
     for (std::vector<CNode*>::const_iterator pit = vNodesCopy.begin();
          pit != vNodesCopy.end(); ++pit)
@@ -1425,24 +1498,9 @@ static size_t RefillOrderedHeaderBlockRequests(
     g_ibdHeaderSchedulerState.cursorRound =
         g_ibdHeaderSchedulerState.refillRound;
 
-    // Phase 2 bounded housekeeping: a progress baseline whose hash is no
-    // longer an in-window, still-ahead ordered descendant is dead weight.
-    // Pruning here (once per round, on the cursor-owning pass) keeps the map
-    // bounded to ~one window of live entries.
-    for (std::map<uint256, int>::iterator itB =
-             g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.begin();
-         itB != g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.end();)
-    {
-        const CIbdHeaderNode* nB = graph.Lookup(itB->first);
-        if (nB == NULL || !nB->IsAnchored() ||
-            nB->height <= pindexBest->nHeight ||
-            (size_t)(nB->height - pindexBest->nHeight) >
-                GetIbdBlockWindow())
-            g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.erase(
-                itB++);
-        else
-            ++itB;
-    }
+    // Phase 2 bounded housekeeping: prune a fixed budget of obsolete baseline
+    // entries per refill round instead of rescanning the full map each pass.
+    PruneOrderedRequestFrontierBaselineBounded(graph, pindexBest->nHeight);
 
     if (fCursorUsable)
     {
@@ -1497,6 +1555,14 @@ static size_t RefillOrderedHeaderBlockRequests(
                 }
                 if (consistent)
                 {
+                    for (size_t i = 0; i < frontierDelta; ++i)
+                        g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.erase(
+                            oldWindow[i]);
+                    if (g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.empty())
+                    {
+                        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursor = 0;
+                        g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursorValid = false;
+                    }
                     g_ibdHeaderSchedulerState.cursorWindow.swap(shifted);
                     g_ibdHeaderSchedulerState.cursorNextIndex =
                         g_ibdHeaderSchedulerState.cursorNextIndex > frontierDelta
@@ -1915,6 +1981,8 @@ IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting()
     out.fullRefillCalls = g_ibdHeaderSchedulerState.fullRefillCalls;
     out.incrementalEntriesExamined = g_ibdHeaderSchedulerState.incrementalEntriesExamined;
     out.fullEntriesExamined = g_ibdHeaderSchedulerState.fullEntriesExamined;
+    out.baselinePruneEntriesExamined = g_ibdHeaderSchedulerState.baselinePruneEntriesExamined;
+    out.baselinePruneEntriesErased = g_ibdHeaderSchedulerState.baselinePruneEntriesErased;
     out.incrementalAdmitted = g_ibdHeaderSchedulerState.incrementalAdmitted;
     out.incrementalRefillUs = g_ibdHeaderSchedulerState.incrementalRefillUs;
     out.fullRefillUs = g_ibdHeaderSchedulerState.fullRefillUs;
@@ -1931,6 +1999,46 @@ IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting()
     out.frontPreemptTransfers =
         g_ibdHeaderSchedulerState.frontPreemptTransfers;
     return out;
+}
+
+void SeedIbdHeaderSchedulerBaselineForTesting(
+    const std::vector<std::pair<uint256, int> >& entries)
+{
+    LOCK(cs_main);
+    g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.clear();
+    for (size_t i = 0; i < entries.size(); ++i)
+        g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline[entries[i].first] = entries[i].second;
+    g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursor = 0;
+    g_ibdHeaderSchedulerState.orderedRequestFrontierBaselinePruneCursorValid = false;
+    g_ibdHeaderSchedulerState.baselinePruneEntriesExamined = 0;
+    g_ibdHeaderSchedulerState.baselinePruneEntriesErased = 0;
+}
+
+size_t GetIbdHeaderSchedulerBaselineSizeForTesting()
+{
+    LOCK(cs_main);
+    return g_ibdHeaderSchedulerState.orderedRequestFrontierBaseline.size();
+}
+
+size_t IbdHeaderSchedulerBaselinePruneBudgetForTesting()
+{
+    return ORDERED_BASELINE_PRUNE_BUDGET;
+}
+
+void RunIbdHeaderSchedulerBaselinePruneForTesting()
+{
+    LOCK(cs_main);
+    if (!pindexBest)
+        return;
+    g_ibdHeadersObserver.SetEnabled(true);
+    g_ibdHeadersObserver.SetLookaheadCap(
+        GetIbdBlockWindow() + IBD_HEADER_LOOKAHEAD_CAP_MARGIN,
+        GetIbdBlockWindow() + IBD_HEADER_LOOKAHEAD_RESUME_MARGIN);
+    if (!g_ibdHeadersObserver.UpdateAnchor(pindexBest->GetBlockHash(),
+                                           pindexBest->nHeight))
+        return;
+    PruneOrderedRequestFrontierBaselineBounded(
+        g_ibdHeadersObserver.Graph(), pindexBest->nHeight);
 }
 
 std::vector<uint256> GetIbdHeaderSchedulerWindowForTesting(

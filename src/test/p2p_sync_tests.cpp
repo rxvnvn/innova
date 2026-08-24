@@ -10971,6 +10971,8 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_sequential_refill_uses_incremental_cursor
     BOOST_CHECK_EQUAL(stats.incrementalRefillCalls, 10000U);
     BOOST_CHECK_EQUAL(stats.incrementalEntriesExamined, 10001U - nBudget);
     BOOST_CHECK_EQUAL(stats.incrementalAdmitted, 10001U - nBudget);
+    BOOST_CHECK(GetIbdHeaderSchedulerBaselineSizeForTesting() <=
+                GetIbdBlockWindow());
     BOOST_CHECK(stats.incrementalRefillUs / stats.incrementalRefillCalls < stats.fullRefillUs);
 
     peer.ClearAskFor();
@@ -11025,6 +11027,46 @@ BOOST_AUTO_TEST_CASE(headers_scheduler_contiguous_admission_keeps_wide_pipeline)
     BOOST_CHECK_EQUAL(stats.incrementalAdmitted, 0U);
 
     peer.ClearAskFor();
+    ResetIbdHeaderSchedulerStateForTesting();
+    fSPVMode = savedSpv;
+    fIbdHeadersObserve = savedObserve;
+    fIbdHeaderScheduler = savedScheduler;
+}
+
+BOOST_AUTO_TEST_CASE(headers_scheduler_baseline_prune_is_bounded)
+{
+    const bool savedScheduler = fIbdHeaderScheduler;
+    const bool savedObserve = fIbdHeadersObserve;
+    const bool savedSpv = fSPVMode;
+    fIbdHeaderScheduler = true;
+    fIbdHeadersObserve = false;
+    fSPVMode = false;
+    ResetIbdHeaderSchedulerStateForTesting();
+
+    const uint256 anchor(7000000);
+    BOOST_REQUIRE(SeedIbdHeaderSchedulerAnchorForTesting(anchor, 0));
+
+    std::vector<std::pair<uint256, int> > staleBaseline;
+    staleBaseline.reserve(10000);
+    for (int i = 1; i <= 10000; ++i)
+        staleBaseline.push_back(std::make_pair(uint256(7000000 + i), 0));
+    SeedIbdHeaderSchedulerBaselineForTesting(staleBaseline);
+
+    RunIbdHeaderSchedulerBaselinePruneForTesting();
+    IbdHeaderSchedulerRefillStats stats =
+        GetIbdHeaderSchedulerRefillStatsForTesting();
+    BOOST_CHECK(stats.baselinePruneEntriesExamined <=
+                IbdHeaderSchedulerBaselinePruneBudgetForTesting());
+    BOOST_CHECK(GetIbdHeaderSchedulerBaselineSizeForTesting() <
+                staleBaseline.size());
+
+    const size_t nRounds =
+        (staleBaseline.size() + IbdHeaderSchedulerBaselinePruneBudgetForTesting() - 1) /
+        IbdHeaderSchedulerBaselinePruneBudgetForTesting();
+    for (size_t i = 1; i < nRounds; ++i)
+        RunIbdHeaderSchedulerBaselinePruneForTesting();
+    BOOST_CHECK_EQUAL(GetIbdHeaderSchedulerBaselineSizeForTesting(), 0U);
+
     ResetIbdHeaderSchedulerStateForTesting();
     fSPVMode = savedSpv;
     fIbdHeadersObserve = savedObserve;

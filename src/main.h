@@ -505,6 +505,7 @@ struct IbdHeaderSchedulerRefillStats
 {
     uint64_t incrementalRefillCalls, fullRefillCalls;
     uint64_t incrementalEntriesExamined, fullEntriesExamined;
+    uint64_t baselinePruneEntriesExamined, baselinePruneEntriesErased;
     uint64_t incrementalAdmitted, incrementalRefillUs, fullRefillUs;
     bool cursorValid, cursorInvalidated, cursorRecoveryNeeded;
     size_t cursorNextIndex, cursorPendingSlots;
@@ -513,6 +514,10 @@ struct IbdHeaderSchedulerRefillStats
 };
 IbdHeaderSchedulerRefillStats GetIbdHeaderSchedulerRefillStatsForTesting();
 std::vector<uint256> GetIbdHeaderSchedulerWindowForTesting(const uint256& frontier);
+void SeedIbdHeaderSchedulerBaselineForTesting(const std::vector<std::pair<uint256, int> >& entries);
+size_t GetIbdHeaderSchedulerBaselineSizeForTesting();
+size_t IbdHeaderSchedulerBaselinePruneBudgetForTesting();
+void RunIbdHeaderSchedulerBaselinePruneForTesting();
 extern bool fSPVHeadersOnly;
 extern int nSPVStartHeight;
 
