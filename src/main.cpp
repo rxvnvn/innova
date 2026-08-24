@@ -4668,6 +4668,88 @@ bool TxnHashInSystem(CTxDB* ptxdb, uint256& txnHash)
 // }
 
 static CBlockIndex* pblockindexFBBHLast;
+
+namespace {
+
+uint64_t gBlockIndexSkipStatCalls = 0;
+uint64_t gBlockIndexSkipStatEdges = 0;
+
+static int InvertLowestOne(int n)
+{
+    return n & (n - 1);
+}
+
+static int GetSkipHeight(int height)
+{
+    if (height < 2)
+        return 0;
+    return (height & 1)
+        ? InvertLowestOne(InvertLowestOne(height - 1)) + 1
+        : InvertLowestOne(height);
+}
+
+} // namespace
+
+void ResetBlockIndexSkipStats()
+{
+    gBlockIndexSkipStatCalls = 0;
+    gBlockIndexSkipStatEdges = 0;
+}
+
+uint64_t GetBlockIndexSkipStatsCalls()
+{
+    return gBlockIndexSkipStatCalls;
+}
+
+uint64_t GetBlockIndexSkipStatsEdges()
+{
+    return gBlockIndexSkipStatEdges;
+}
+
+void CBlockIndex::BuildSkip()
+{
+    if (pprev)
+        pskip = pprev->GetAncestor(GetSkipHeight(nHeight));
+    else
+        pskip = NULL;
+}
+
+const CBlockIndex* CBlockIndex::GetAncestor(int nHeightTarget) const
+{
+    ++gBlockIndexSkipStatCalls;
+    if (nHeightTarget > nHeight || nHeightTarget < 0)
+        return NULL;
+
+    const CBlockIndex* pindexWalk = this;
+    int nHeightWalk = nHeight;
+    while (nHeightWalk > nHeightTarget)
+    {
+        const int nHeightSkip = GetSkipHeight(nHeightWalk);
+        const int nHeightSkipPrev = GetSkipHeight(nHeightWalk - 1);
+        if (pindexWalk->pskip &&
+            (nHeightSkip == nHeightTarget ||
+             (nHeightSkip > nHeightTarget &&
+              !(nHeightSkipPrev < nHeightSkip - 2 &&
+                nHeightSkipPrev >= nHeightTarget))))
+        {
+            pindexWalk = pindexWalk->pskip;
+            nHeightWalk = nHeightSkip;
+        }
+        else
+        {
+            pindexWalk = pindexWalk->pprev;
+            --nHeightWalk;
+        }
+        ++gBlockIndexSkipStatEdges;
+    }
+    return pindexWalk;
+}
+
+CBlockIndex* CBlockIndex::GetAncestor(int nHeightTarget)
+{
+    return const_cast<CBlockIndex*>(static_cast<const CBlockIndex*>(this)->GetAncestor(nHeightTarget));
+}
+
 CBlockIndex* FindBlockByHeight(int nHeight)
 {
     CBlockIndex *pblockindex;
@@ -8592,6 +8674,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     if (pindexNew->IsProofOfStake())
         setStakeSeen.insert(make_pair(pindexNew->prevoutStake, pindexNew->nStakeTime));
     pindexNew->phashBlock = &((*mi).first);
+    pindexNew->BuildSkip();
 
     // Write to disk block index
     CTxDB txdb;

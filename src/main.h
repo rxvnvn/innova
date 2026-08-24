@@ -558,6 +558,9 @@ FILE* AppendBlockFile(unsigned int& nFileRet);
 bool LoadBlockIndex(bool fAllowNew=true);
 void PrintBlockTree();
 CBlockIndex* FindBlockByHeight(int nHeight);
+void ResetBlockIndexSkipStats();
+uint64_t GetBlockIndexSkipStatsCalls();
+uint64_t GetBlockIndexSkipStatsEdges();
 // True when the block itself or any ancestor is in setInvalidBlockHash (i.e.
 // the operator invalidated it).  Must be consulted on every path that can
 // activate a chain; enforcement is done in one place for all call sites.
@@ -1617,6 +1620,7 @@ public:
     const uint256* phashBlock;
     CBlockIndex* pprev;
     CBlockIndex* pnext;
+    CBlockIndex* pskip;
     unsigned int nFile;
     unsigned int nBlockPos;
     uint256 nChainTrust; // ppcoin: trust score of block chain
@@ -1667,6 +1671,7 @@ public:
         phashBlock = NULL;
         pprev = NULL;
         pnext = NULL;
+        pskip = NULL;
         nFile = 0;
         nBlockPos = 0;
         nHeight = 0;
@@ -1771,6 +1776,10 @@ public:
     {
         return (pnext || this == pindexBest);
     }
+
+    void BuildSkip();
+    CBlockIndex* GetAncestor(int nHeightTarget);
+    const CBlockIndex* GetAncestor(int nHeightTarget) const;
 
     bool CheckIndex() const
     {
@@ -2034,14 +2043,24 @@ public:
     void Set(const CBlockIndex* pindex)
     {
         vHave.clear();
-        int nStep = 1;
-        while (pindex)
+        if (!pindex)
         {
-            vHave.push_back(pindex->GetBlockHash());
+            vHave.push_back(GetGenesisBlockHash());
+            return;
+        }
 
-            // Exponentially larger steps back
-            for (int i = 0; pindex && i < nStep; i++)
-                pindex = pindex->pprev;
+        const CBlockIndex* pindexStart = pindex;
+        int nStep = 1;
+        int nHeight = pindex->nHeight;
+        while (nHeight >= 0)
+        {
+            const CBlockIndex* pindexAtHeight = (nHeight == pindexStart->nHeight)
+                ? pindexStart
+                : pindexStart->GetAncestor(nHeight);
+            if (!pindexAtHeight)
+                break;
+            vHave.push_back(pindexAtHeight->GetBlockHash());
+            nHeight -= nStep;
             if (vHave.size() > 10)
                 nStep *= 2;
         }
