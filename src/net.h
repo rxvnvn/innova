@@ -31,6 +31,8 @@ extern int nBestHeight;
 static const int PING_INTERVAL = 2 * 60;
 /** Time after which to disconnect, after waiting for a ping response (or inactivity). */
 static const int TIMEOUT_INTERVAL = 20 * 60;
+/** Time after which an unanswered getblocks request is considered stale. */
+static const int GETBLOCKS_RESPONSE_TIMEOUT = 15;
 
 inline unsigned int ReceiveFloodSize() { return 1000*GetArg("-maxreceivebuffer", 50*1000); }
 inline unsigned int SendBufferSize() { return 1000*GetArg("-maxsendbuffer", 10*1000); }
@@ -438,11 +440,15 @@ public:
     std::vector<uint256> getBlocksHash;
     uint256 hashLastGetBlocksEnd;
     int64_t nLastGetBlocksTime;
+    bool fGetBlocksRequestOutstanding;
+    int64_t nGetBlocksRequestTime;
     int nChainHeight;
     int nBestKnownHeight;
     uint256 hashBestKnownBlock;
     int64_t nLastHeightUpdate;
     bool fStartSync;
+    bool fInitialSyncRequestPending;
+    bool fInitialSyncRequestSent;
     int64_t nLastBlockRecv;
     int64_t nLastBlockCatchupTime;
     int64_t nRecvFloodHardStart;
@@ -517,11 +523,15 @@ public:
         pindexLastGetBlocksBegin = 0;
         hashLastGetBlocksEnd = 0;
         nLastGetBlocksTime = 0;
+        fGetBlocksRequestOutstanding = false;
+        nGetBlocksRequestTime = 0;
         nChainHeight = -1;
         nBestKnownHeight = -1;
         hashBestKnownBlock = 0;
         nLastHeightUpdate = 0;
         fStartSync = false;
+        fInitialSyncRequestPending = false;
+        fInitialSyncRequestSent = false;
         nLastBlockRecv = 0;
         nLastBlockCatchupTime = 0;
         nRecvFloodHardStart = 0;
@@ -966,7 +976,42 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         vecRequestsFulfilled.push_back(strRequest);
     }
 
-    void PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd);
+    bool PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd);
+
+    bool HasOutstandingGetBlocks() const
+    {
+        return fGetBlocksRequestOutstanding;
+    }
+
+    void SetOutstandingGetBlocks(int64_t nNow = GetTime())
+    {
+        fGetBlocksRequestOutstanding = true;
+        nGetBlocksRequestTime = nNow;
+    }
+
+    bool ConsumeGetBlocksResponse()
+    {
+        if (!fGetBlocksRequestOutstanding)
+            return false;
+        fGetBlocksRequestOutstanding = false;
+        nGetBlocksRequestTime = 0;
+        return true;
+    }
+
+    bool ExpireGetBlocksOutstanding(int64_t nNow = GetTime())
+    {
+        if (!fGetBlocksRequestOutstanding)
+            return false;
+        if (nGetBlocksRequestTime == 0 ||
+            nNow - nGetBlocksRequestTime <= GETBLOCKS_RESPONSE_TIMEOUT)
+            return false;
+        fGetBlocksRequestOutstanding = false;
+        nGetBlocksRequestTime = 0;
+        pindexLastGetBlocksBegin = 0;
+        hashLastGetBlocksEnd = 0;
+        nLastGetBlocksTime = 0;
+        return true;
+    }
 
     void UpdateBestKnownBlock(int nHeight, const uint256& hashBlock)
     {

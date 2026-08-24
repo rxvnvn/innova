@@ -123,23 +123,32 @@ unsigned short GetListenPort()
 }
 
 
-void CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
+bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd)
 {
     int64_t nNow = GetTime();
 
     if (pindexBegin == pindexLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd) {
         if (nNow - nLastGetBlocksTime < 5)
-            return;
+            return false;
     }
 
     pindexLastGetBlocksBegin = pindexBegin;
     hashLastGetBlocksEnd = hashEnd;
     nLastGetBlocksTime = nNow;
 
-    getBlocksIndex.push_back(pindexBegin);
-    getBlocksHash.push_back(hashEnd);
+    if (getBlocksIndex.empty())
+    {
+        getBlocksIndex.push_back(pindexBegin);
+        getBlocksHash.push_back(hashEnd);
+    }
+    else
+    {
+        getBlocksIndex[0] = pindexBegin;
+        getBlocksHash[0] = hashEnd;
+    }
 
     //PushMessage("getblocks", CBlockLocator(pindexBegin), hashEnd);
+    return true;
 }
 
 
@@ -659,6 +668,18 @@ void CNode::CloseSocketDisconnect(const char* pszReason)
 
 void CNode::Cleanup()
 {
+    getBlocksIndex.clear();
+    getBlocksHash.clear();
+    fGetBlocksRequestOutstanding = false;
+    nGetBlocksRequestTime = 0;
+    fStartSync = false;
+    fInitialSyncRequestPending = false;
+    nBlocksReceivedInBatch = 0;
+    nExpectedBatchSize = 0;
+    fPrefetchSent = false;
+    hashLastBlockInBatch = 0;
+    setBlocksInFlight.clear();
+    mapBlockInFlightSince.clear();
 }
 
 

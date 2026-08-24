@@ -307,11 +307,10 @@ namespace Checkpoints
     {
         if (fTestNet) return true; // Testnet has no checkpoints
         int nHeight = pindexPrev->nHeight + 1;
-        if (IsInitialBlockDownload()) { // Do a basic check if we are catching up
-            const CBlockIndex* pindexSync = AutoSelectSyncCheckpoint();
-            if (nHeight <= pindexSync->nHeight){
-                return false; // lower height than auto checkpoint
-            }
+        if (IsInitialBlockDownload()) {
+            // During IBD, do not reject competing branches solely because they
+            // lie below the moving auto-selected sync checkpoint.  The stronger
+            // chain must be able to accumulate trust and become selectable.
             return true;
         } else { // do a more thorough check when we are already synced
             LOCK(cs_hashSyncCheckpoint);

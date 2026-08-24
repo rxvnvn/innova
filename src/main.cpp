@@ -3186,38 +3186,41 @@ bool IsInitialBlockDownload()
 
     int64_t nNow = GetTime();
     int nFreshPeerHeight = -1;
+    int nKnownPeerHeight = -1;
     int64_t nFreshPeerLastBlockRecv = 0;
     bool fActiveCatchup = false;
     {
         TRY_LOCK(cs_vNodes, lockNodes);
-        if (lockNodes)
+        if (!lockNodes)
+            return true;
+        for (CNode* pnode : vNodes)
         {
-            for (CNode* pnode : vNodes)
-            {
-                if (!pnode || pnode->fClient)
-                    continue;
+            if (!pnode || pnode->fClient)
+                continue;
 
-                pnode->ExpireBlockInFlight(nNow);
+            nKnownPeerHeight = std::max(
+                nKnownPeerHeight,
+                std::max(pnode->nBestKnownHeight, pnode->nChainHeight));
 
-                bool fFreshHeight = pnode->nBestKnownHeight > 0 &&
-                                    pnode->nLastHeightUpdate > 0 &&
-                                    nNow - pnode->nLastHeightUpdate <= 120;
-                if (fFreshHeight)
-                    nFreshPeerHeight = std::max(nFreshPeerHeight, pnode->nBestKnownHeight);
+            bool fFreshHeight = pnode->nBestKnownHeight > 0 &&
+                                pnode->nLastHeightUpdate > 0 &&
+                                nNow - pnode->nLastHeightUpdate <= 120;
+            if (fFreshHeight)
+                nFreshPeerHeight = std::max(nFreshPeerHeight, pnode->nBestKnownHeight);
 
-                if (pnode->nLastBlockRecv > nFreshPeerLastBlockRecv)
-                    nFreshPeerLastBlockRecv = pnode->nLastBlockRecv;
+            if (pnode->nLastBlockRecv > nFreshPeerLastBlockRecv)
+                nFreshPeerLastBlockRecv = pnode->nLastBlockRecv;
 
-                bool fPeerHasWork = fFreshHeight && pnode->nBestKnownHeight > nBestHeight + 2;
-                if (fPeerHasWork && (!pnode->setBlocksInFlight.empty() || !pnode->mapAskFor.empty()))
-                    fActiveCatchup = true;
-            }
+            bool fPeerHasWork = std::max(pnode->nBestKnownHeight, pnode->nChainHeight) >
+                                nBestHeight + 2;
+            if (fPeerHasWork && (!pnode->setBlocksInFlight.empty() || !pnode->mapAskFor.empty()))
+                fActiveCatchup = true;
         }
     }
 
     unsigned int nTargetSpacing = GetTargetSpacingForHeight(nBestHeight + 1);
     int nLagTolerance = (nTargetSpacing <= 1) ? (int)GetArg("-ibdheightlag", 8) : nCoinbaseMaturity * 2;
-    if (nFreshPeerHeight > nBestHeight + nLagTolerance)
+    if (std::max(nFreshPeerHeight, nKnownPeerHeight) > nBestHeight + nLagTolerance)
         return true;
 
     if (fActiveCatchup)
@@ -8625,6 +8628,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                        pfrom->hashLastBlockInBatch.ToString().substr(0,20).c_str());
         }
 
+        pfrom->ConsumeGetBlocksResponse();
+
         LOCK(cs_main);
         CTxDB txdb("r");
 
@@ -9672,6 +9677,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
     }
 
     {
+        pto->ExpireGetBlocksOutstanding();
         int64_t nNow = GetTime();
         int64_t nTimeSinceBlock = nNow - (pto->nLastBlockRecv > 0 ? pto->nLastBlockRecv : pto->nTimeConnected);
         CBlockIndex* pBest = pindexBest;
@@ -9711,6 +9717,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                           nNow - mapLastStallRecovery[pto->addrName] < 15);
 
         if (!fImporting && !fReindex && (fPeerAhead || fWeAhead || fStaleBlockInFlight) &&
+            pto->fInitialSyncRequestSent && !pto->HasOutstandingGetBlocks() &&
             nTimeSinceBlock > 15 && !fThrottle)
         {
             mapLastStallRecovery[pto->addrName] = nNow;
@@ -9749,18 +9756,23 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
     //
     if (pto->fStartSync && !fImporting && !fReindex) {
         pto->fStartSync = false;
-        pto->PushGetBlocks(pindexBest, uint256(0));
+        if (pto->PushGetBlocks(pindexBest, uint256(0)) &&
+            !pto->fInitialSyncRequestSent)
+            pto->fInitialSyncRequestPending = true;
     }
 
+    if (!pto->HasOutstandingGetBlocks() && !pto->getBlocksIndex.empty())
     {
-        int n = pto->getBlocksIndex.size();
-        for (int i = 0; i < n; i++)
+        if (fDebugNet) printf("Pushing getblocks %s to %s\n\n",pto->getBlocksIndex[0]->ToString().c_str(),pto->getBlocksHash[0].ToString().c_str());
+        pto->PushMessage("getblocks", CBlockLocator(pto->getBlocksIndex[0]), pto->getBlocksHash[0]);
+        pto->SetOutstandingGetBlocks();
+        if (pto->fInitialSyncRequestPending && !pto->fInitialSyncRequestSent)
         {
-            if (fDebugNet) printf("Pushing getblocks %s to %s\n\n",pto->getBlocksIndex[i]->ToString().c_str(),pto->getBlocksHash[i].ToString().c_str());
-            pto->PushMessage("getblocks", CBlockLocator(pto->getBlocksIndex[i]), pto->getBlocksHash[i]);
+            pto->fInitialSyncRequestPending = false;
+            pto->fInitialSyncRequestSent = true;
         }
-        pto->getBlocksIndex.clear();
-        pto->getBlocksHash.clear();
+        pto->getBlocksIndex.erase(pto->getBlocksIndex.begin());
+        pto->getBlocksHash.erase(pto->getBlocksHash.begin());
     }
 
     TRY_LOCK(cs_main, lockMain);
