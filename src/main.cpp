@@ -8717,9 +8717,23 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         // Send the rest of the chain
         if (pindex)
             pindex = pindex->pnext;
+        const bool fHadServeRange = (pindex != NULL);
+        const uint256 nServedStart = (pindex ? pindex->GetBlockHash() : uint256(0));
         int nLimit = 1000;
         std::set<uint256> setQueuedDAGParents;
         if (fDebugNet) printf("getblocks %d to %s limit %d\n", (pindex ? pindex->nHeight : -1), hashStop.ToString().substr(0,20).c_str(), nLimit);
+        // Minimal server-side served-getblocks suppression: for one peer and one
+        // unchanged active-chain state, an identical already-served getblocks
+        // request must not re-traverse the chain / regenerate inventory that
+        // setInventoryKnown would filter anyway.  The response is a pure function
+        // of (resolved start hash, stop hash, active TIP hash).  A same-height
+        // reorg or any tip change invalidates because the active tip is hashed
+        // (not a height).  Disconnect resets it via CNode lifetime.
+        if (pfrom->GetBlocksServedFingerprintMatch(nServedStart, hashStop, hashBestChain))
+        {
+            if (fDebugNet) printf("getblocks served-repeat suppressed peer=%d\n", pfrom->GetId());
+            return true;
+        }
         for (; pindex; pindex = pindex->pnext)
         {
             if (pindex->GetBlockHash() == hashStop)
@@ -8746,6 +8760,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 break;
             }
         }
+        if (fHadServeRange)
+            pfrom->RecordServedGetBlocks(nServedStart, hashStop, hashBestChain);
     }
     else if (strCommand == "checkpoint")
     {

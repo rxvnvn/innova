@@ -433,6 +433,15 @@ public:
     std::map<uint256, CRequestTracker> mapRequests;
     CCriticalSection cs_mapRequests;
     uint256 hashContinue;
+    // Server-side served-getblocks fingerprint: the last getblocks request this
+    // peer had served, keyed by (resolved start hash, stop hash, active-tip hash).
+    // An identical repeat on an unchanged active tip is suppressed so the node
+    // does not re-traverse / requeue inventory that setInventoryKnown would
+    // filter anyway.  Reset implicitly per-CNode lifetime (disconnect).
+    bool fServedGetBlocks;
+    uint256 nServedGetBlocksStart;
+    uint256 nServedGetBlocksStop;
+    uint256 nServedGetBlocksTip;
     CBlockIndex* pindexLastGetBlocksBegin;
     std::vector<CBlockIndex*> getBlocksIndex;
     std::vector<uint256> getBlocksHash;
@@ -514,6 +523,7 @@ public:
         nSendSize = 0;
         nSendOffset = 0;
         hashContinue = 0;
+        fServedGetBlocks = false;
         pindexLastGetBlocksBegin = 0;
         hashLastGetBlocksEnd = 0;
         nLastGetBlocksTime = 0;
@@ -666,6 +676,28 @@ public:
             if (vInventoryToSend.size() < MAX_INV_TO_SEND)
                 vInventoryToSend.push_back(inv);
         }
+    }
+
+    // Returns true when (start, stop, active-tip) is exactly the last getblocks
+    // request served to this peer (an identical repeat on an unchanged active
+    // chain), meaning regenerating inventory would be redundant (setInventoryKnown
+    // would filter it anyway).  Active-tip is the block HASH, so a same-height
+    // reorg invalidates the fingerprint.
+    bool GetBlocksServedFingerprintMatch(uint256 nStart, uint256 nStop, uint256 nTip) const
+    {
+        return fServedGetBlocks
+            && nStart == nServedGetBlocksStart
+            && nStop == nServedGetBlocksStop
+            && nTip == nServedGetBlocksTip;
+    }
+
+    // Records a served getblocks fingerprint (call only after actually serving).
+    void RecordServedGetBlocks(uint256 nStart, uint256 nStop, uint256 nTip)
+    {
+        fServedGetBlocks = true;
+        nServedGetBlocksStart = nStart;
+        nServedGetBlocksStop = nStop;
+        nServedGetBlocksTip = nTip;
     }
 
     void AskFor(const CInv& inv)
