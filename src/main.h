@@ -624,6 +624,7 @@ FILE* AppendBlockFile(unsigned int& nFileRet);
 bool LoadBlockIndex(bool fAllowNew=true);
 void PrintBlockTree();
 CBlockIndex* FindBlockByHeight(int nHeight);
+bool RebuildMainChainForwardLinks();
 // invalidateblock / reconsiderblock RPC support (defined in main.cpp; assume cs_main held).
 bool InvalidateBlock(CTxDB& txdb, CBlockIndex* pindex, std::string& strError);
 bool ReconsiderBlock(CTxDB& txdb, CBlockIndex* pindex, std::string& strError);
@@ -1716,6 +1717,7 @@ public:
     const uint256* phashBlock;
     CBlockIndex* pprev;
     CBlockIndex* pnext;
+    CBlockIndex* pskip;
     unsigned int nFile;
     unsigned int nBlockPos;
     uint256 nChainTrust; // ppcoin: trust score of block chain
@@ -1771,6 +1773,7 @@ public:
         phashBlock = NULL;
         pprev = NULL;
         pnext = NULL;
+        pskip = NULL;
         nFile = 0;
         nBlockPos = 0;
         nHeight = 0;
@@ -1798,6 +1801,7 @@ public:
         phashBlock = NULL;
         pprev = NULL;
         pnext = NULL;
+        pskip = NULL;
         nFile = nFileIn;
         nBlockPos = nBlockPosIn;
         nHeight = 0;
@@ -1875,6 +1879,10 @@ public:
     {
         return (pnext || this == pindexBest);
     }
+
+    void BuildSkip();
+    CBlockIndex* GetAncestor(int nHeightTarget);
+    const CBlockIndex* GetAncestor(int nHeightTarget) const;
 
     bool CheckIndex() const
     {
@@ -2133,18 +2141,26 @@ public:
     void Set(const CBlockIndex* pindex)
     {
         vHave.clear();
-        int nStep = 1;
-        while (pindex)
+        if (!pindex)
         {
-            vHave.push_back(pindex->GetBlockHash());
+            vHave.push_back(GetGenesisBlockHash());
+            return;
+        }
 
-            // Exponentially larger steps back
-            for (int i = 0; pindex && i < nStep; i++)
-                pindex = pindex->pprev;
+        const CBlockIndex* pindexStart = pindex;
+        int nStep = 1;
+        int nHeight = pindex->nHeight;
+        while (nHeight >= 0)
+        {
+            const CBlockIndex* pindexAtHeight = (nHeight == pindexStart->nHeight)
+                ? pindexStart
+                : pindexStart->GetAncestor(nHeight);
+            if (!pindexAtHeight)
+                break;
+            vHave.push_back(pindexAtHeight->GetBlockHash());
+            nHeight -= nStep;
             if (vHave.size() > 10)
                 nStep *= 2;
-            // build a shorter locator to save cpu time on large chains: LNK CR B82REZ 2G4
-            if (nStep > 1024) break;
         }
         vHave.push_back(GetGenesisBlockHash());
     }
