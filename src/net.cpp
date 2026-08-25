@@ -96,6 +96,169 @@ map<CInv, int64_t> mapAlreadyAskedFor;
 // mutex for mapAlreadyAskedFor
 CCriticalSection cs_mapAlreadyAskedFor;
 
+struct BlockRequestOwner
+{
+    NodeId peer;
+    BlockRequestOwnerState state;
+    int64_t assignedUs;
+
+    BlockRequestOwner(NodeId peerIn, BlockRequestOwnerState stateIn)
+        : peer(peerIn), state(stateIn), assignedUs(GetTimeMicros()) {}
+};
+
+static std::map<uint256, BlockRequestOwner> mapBlockRequestOwners;
+
+const char* BlockRequestOwnerStateName(BlockRequestOwnerState state)
+{
+    return state == BLOCK_REQUEST_OWNER_IN_FLIGHT ? "inflight" : "queued";
+}
+
+bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
+                                      NodeId* existingPeer,
+                                      BlockRequestOwnerState* existingState)
+{
+    std::map<uint256, BlockRequestOwner>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+    {
+        mapBlockRequestOwners.insert(std::make_pair(
+            hash, BlockRequestOwner(peer, BLOCK_REQUEST_OWNER_QUEUED)));
+        return true;
+    }
+    if (existingPeer)
+        *existingPeer = it->second.peer;
+    if (existingState)
+        *existingState = it->second.state;
+    return it->second.peer == peer;
+}
+
+bool TryAssignBlockRequestOwner(const uint256& hash, NodeId peer,
+                                NodeId* existingPeer,
+                                BlockRequestOwnerState* existingState)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    return TryAssignBlockRequestOwnerLocked(hash, peer, existingPeer, existingState);
+}
+
+bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
+                          BlockRequestOwnerState* ownerState)
+{
+    std::map<uint256, BlockRequestOwner>::const_iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+        return false;
+    if (ownerPeer)
+        *ownerPeer = it->second.peer;
+    if (ownerState)
+        *ownerState = it->second.state;
+    return true;
+}
+
+bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwner>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end() || it->second.peer != peer)
+        return false;
+    it->second.state = BLOCK_REQUEST_OWNER_IN_FLIGHT;
+    return true;
+}
+
+bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
+                              const char* pszReason)
+{
+    (void)pszReason;
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwner>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end() || it->second.peer != peer)
+        return false;
+    mapBlockRequestOwners.erase(it);
+    return true;
+}
+
+bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer,
+                                       bool fRequestSatisfiedGlobally)
+{
+    LOCK(cs_mapAlreadyAskedFor);
+    std::map<uint256, BlockRequestOwner>::iterator it =
+        mapBlockRequestOwners.find(hash);
+    if (it == mapBlockRequestOwners.end())
+        return false;
+    if (it->second.peer == peer || fRequestSatisfiedGlobally)
+    {
+        mapBlockRequestOwners.erase(it);
+        return true;
+    }
+    return false;
+}
+
+size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason)
+{
+    (void)pszReason;
+    LOCK(cs_mapAlreadyAskedFor);
+    size_t nReleased = 0;
+    for (std::map<uint256, BlockRequestOwner>::iterator it =
+             mapBlockRequestOwners.begin(); it != mapBlockRequestOwners.end();)
+    {
+        if (it->second.peer != peer)
+        {
+            ++it;
+            continue;
+        }
+        it = mapBlockRequestOwners.erase(it);
+        ++nReleased;
+    }
+    return nReleased;
+}
+
+bool IsBlockRequestOwnedByAnyPeer(const uint256& hash, const CNode* extra_peer)
+{
+    (void)extra_peer;
+    LOCK(cs_mapAlreadyAskedFor);
+    return mapBlockRequestOwners.count(hash) != 0;
+}
+
+bool EraseAlreadyAskedForIfUnowned(const CInv& inv, const CNode* extra_peer)
+{
+    (void)extra_peer;
+    if (inv.type != MSG_BLOCK && inv.type != MSG_FILTERED_BLOCK)
+        return false;
+    LOCK(cs_mapAlreadyAskedFor);
+    if (mapBlockRequestOwners.count(inv.hash) != 0)
+        return false;
+    return mapAlreadyAskedFor.erase(inv) != 0;
+}
+
+size_t PruneAlreadyAskedFor(int64_t nNowMicros)
+{
+    static int64_t nLastPruneMicros = 0;
+    size_t nRemoved = 0;
+    LOCK(cs_mapAlreadyAskedFor);
+    if (nLastPruneMicros != 0 && nNowMicros >= nLastPruneMicros &&
+        nNowMicros - nLastPruneMicros < 1000000)
+        return 0;
+    nLastPruneMicros = nNowMicros;
+    for (std::map<CInv, int64_t>::iterator it = mapAlreadyAskedFor.begin();
+         it != mapAlreadyAskedFor.end();)
+    {
+        const bool fBlock = (it->first.type == MSG_BLOCK ||
+                             it->first.type == MSG_FILTERED_BLOCK);
+        if (it->second == 0 ||
+            (!fBlock && nNowMicros - it->second > ALREADY_ASKED_FOR_RETENTION_US) ||
+            (fBlock && mapBlockRequestOwners.count(it->first.hash) == 0 &&
+             nNowMicros - it->second > ALREADY_ASKED_FOR_RETENTION_US))
+        {
+            it = mapAlreadyAskedFor.erase(it);
+            ++nRemoved;
+        }
+        else
+            ++it;
+    }
+    return nRemoved;
+}
+
 static deque<string> vOneShots;
 CCriticalSection cs_vOneShots;
 
@@ -659,6 +822,19 @@ void CNode::CloseSocketDisconnect(const char* pszReason)
 
 void CNode::Cleanup()
 {
+    std::vector<uint256> vInFlight;
+    for (std::set<uint256>::const_iterator it = setBlocksInFlight.begin();
+         it != setBlocksInFlight.end(); ++it)
+        vInFlight.push_back(*it);
+    ClearAskFor(true);
+    for (std::vector<uint256>::const_iterator it = vInFlight.begin();
+         it != vInFlight.end(); ++it)
+    {
+        ReleaseBlockRequestOwner(*it, GetId(), "disconnect");
+        EraseAlreadyAskedForIfUnowned(CInv(MSG_BLOCK, *it), this);
+    }
+    setBlocksInFlight.clear();
+    mapBlockInFlightSince.clear();
 }
 
 

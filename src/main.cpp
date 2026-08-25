@@ -9075,6 +9075,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         LOCK(cs_main);
         bool fAccepted = ProcessBlock(pfrom, &block);
+        ReleaseBlockRequestOwnerOnReceive(hashBlock, pfrom->GetId(), fAccepted);
         if (fAccepted)
         {
             pfrom->nLastBlockRecv = GetTime();
@@ -9083,9 +9084,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pfrom->UpdateBestKnownBlock(miAccepted->second->nHeight, hashBlock);
             if (pfrom->nBestKnownHeight > pfrom->nChainHeight)
                 pfrom->nChainHeight = pfrom->nBestKnownHeight;
-            LOCK(cs_mapAlreadyAskedFor);
-            mapAlreadyAskedFor.erase(inv);
         }
+        EraseAlreadyAskedForIfUnowned(inv, pfrom);
 
         if (block.nDoS)
             pfrom->Misbehaving(block.nDoS, "block validation DoS score");
@@ -9959,14 +9959,33 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             {
                 if (pto->IsBlockInFlight(inv.hash))
                 {
-                    pto->mapAskFor.erase(pto->mapAskFor.begin());
+                    pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
+                    continue;
+                }
+                NodeId nOwnerPeer = -1;
+                BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+                bool fHasOwner = GetBlockRequestOwner(inv.hash, &nOwnerPeer, &ownerState);
+                if (fHasOwner && nOwnerPeer != pto->GetId())
+                {
+                    pto->EraseAskForEntry(pto->mapAskFor.begin());
+                    continue;
+                }
+                if (fHasOwner && nOwnerPeer == pto->GetId() && ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)
+                {
+                    pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
+                    continue;
+                }
+                if (!fHasOwner &&
+                    !TryAssignBlockRequestOwner(inv.hash, pto->GetId(), &nOwnerPeer, &ownerState))
+                {
+                    pto->EraseAskForEntry(pto->mapAskFor.begin());
                     continue;
                 }
                 if (pto->setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
                 {
                     int64_t nRetry = nNow + 250000;
-                    pto->mapAskFor.erase(pto->mapAskFor.begin());
-                    pto->mapAskFor.insert(std::make_pair(nRetry, inv));
+                    pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
+                    pto->AddAskForEntry(nRetry, inv);
                     break;
                 }
             }
@@ -9984,7 +10003,10 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     printf("sending getdata: %s\n", inv.ToString().c_str());
                 vGetData.push_back(inv);
                 if (fBlockRequest)
+                {
+                    TransitionBlockRequestOwnerToInFlight(inv.hash, pto->GetId());
                     pto->MarkBlockInFlight(inv.hash);
+                }
                 if (vGetData.size() >= 1000)
                 {
                     pto->PushMessage("getdata", vGetData);
@@ -9995,7 +10017,10 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 LOCK(cs_mapAlreadyAskedFor);
                 mapAlreadyAskedFor[inv] = nNow;
             }
-            pto->mapAskFor.erase(pto->mapAskFor.begin());
+            if (fBlockRequest && !fSkip)
+                pto->EraseAskForEntry(pto->mapAskFor.begin(), false);
+            else
+                pto->EraseAskForEntry(pto->mapAskFor.begin());
         }
         if (!vGetData.empty())
             pto->PushMessage("getdata", vGetData);

@@ -172,6 +172,33 @@ extern std::deque<std::pair<int64_t, CInv> > vRelayExpiration;
 extern CCriticalSection cs_mapRelay;
 extern std::map<CInv, int64_t> mapAlreadyAskedFor;
 extern CCriticalSection cs_mapAlreadyAskedFor;
+static const size_t MAX_ALREADY_ASKED_FOR_SIZE = 50000;
+static const int64_t ALREADY_ASKED_FOR_RETENTION_US = 60LL * 60 * 1000000;
+
+enum BlockRequestOwnerState
+{
+    BLOCK_REQUEST_OWNER_QUEUED = 0,
+    BLOCK_REQUEST_OWNER_IN_FLIGHT
+};
+
+bool TryAssignBlockRequestOwner(const uint256& hash, NodeId peer,
+                                NodeId* existingPeer = NULL,
+                                BlockRequestOwnerState* existingState = NULL);
+bool TryAssignBlockRequestOwnerLocked(const uint256& hash, NodeId peer,
+                                      NodeId* existingPeer = NULL,
+                                      BlockRequestOwnerState* existingState = NULL);
+bool GetBlockRequestOwner(const uint256& hash, NodeId* ownerPeer,
+                          BlockRequestOwnerState* ownerState = NULL);
+bool TransitionBlockRequestOwnerToInFlight(const uint256& hash, NodeId peer);
+bool ReleaseBlockRequestOwner(const uint256& hash, NodeId peer,
+                              const char* pszReason);
+bool ReleaseBlockRequestOwnerOnReceive(const uint256& hash, NodeId peer,
+                                       bool fRequestSatisfiedGlobally = false);
+size_t ReleaseBlockRequestOwnersForPeer(NodeId peer, const char* pszReason);
+const char* BlockRequestOwnerStateName(BlockRequestOwnerState state);
+bool IsBlockRequestOwnedByAnyPeer(const uint256& hash, const CNode* extra_peer = NULL);
+bool EraseAlreadyAskedForIfUnowned(const CInv& inv, const CNode* extra_peer = NULL);
+size_t PruneAlreadyAskedFor(int64_t nNowMicros);
 
 extern NodeId nLastNodeId;
 extern CCriticalSection cs_nLastNodeId;
@@ -468,6 +495,7 @@ public:
     std::set<CInv> setInventoryForce;
     CCriticalSection cs_inventory;
     std::multimap<int64_t, CInv> mapAskFor;
+    std::set<uint256> setAskForBlocks;
 
     std::set<uint256> setBlocksInFlight;
     std::map<uint256, int64_t> mapBlockInFlightSince;
@@ -668,11 +696,64 @@ public:
         }
     }
 
+    bool IsBlockAskForQueued(const uint256& hash) const
+    {
+        return setAskForBlocks.count(hash) != 0;
+    }
+
+    void AddAskForEntry(int64_t nRequestTime, const CInv& inv)
+    {
+        mapAskFor.insert(std::make_pair(nRequestTime, inv));
+        if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
+            setAskForBlocks.insert(inv.hash);
+    }
+
+    void AddAskForEntry(const std::pair<int64_t, CInv>& entry)
+    {
+        AddAskForEntry(entry.first, entry.second);
+    }
+
+    void EraseAskForEntry(std::multimap<int64_t, CInv>::iterator it,
+                          bool fReleaseOwner = true)
+    {
+        if (it == mapAskFor.end())
+            return;
+        CInv inv = it->second;
+        if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
+            setAskForBlocks.erase(inv.hash);
+        mapAskFor.erase(it);
+        if (fReleaseOwner && (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK))
+        {
+            ReleaseBlockRequestOwner(inv.hash, GetId(), "queue-remove");
+            EraseAlreadyAskedForIfUnowned(inv, this);
+        }
+    }
+
+    void ClearAskFor(bool fReleaseOwners = true)
+    {
+        while (!mapAskFor.empty())
+            EraseAskForEntry(mapAskFor.begin(), fReleaseOwners);
+        setAskForBlocks.clear();
+    }
+
     void AskFor(const CInv& inv)
     {
+        const int64_t nPruneNow = GetTimeMicros();
+        PruneAlreadyAskedFor(nPruneNow);
+
+        bool fBlockRequest = (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK);
+        if (fBlockRequest)
+        {
+            ExpireBlockInFlight();
+            if (setBlocksInFlight.count(inv.hash))
+                return;
+            if (IsBlockAskForQueued(inv.hash))
+                return;
+        }
+
         LOCK(cs_mapAlreadyAskedFor);
-        static const size_t MAX_ASKFOR_SIZE = 50000;
-        if (mapAlreadyAskedFor.size() >= MAX_ASKFOR_SIZE)
+        if (mapAlreadyAskedFor.size() >= MAX_ALREADY_ASKED_FOR_SIZE &&
+            mapAlreadyAskedFor.count(inv) == 0)
         {
             if (fDebugNet)
                 printf("AskFor: mapAlreadyAskedFor full (%u entries), skipping %s\n",
@@ -680,24 +761,27 @@ public:
             return;
         }
 
-        // We're using mapAskFor as a priority queue,
-        // the key is the earliest time the request can be sent
         int64_t& nRequestTime = mapAlreadyAskedFor[inv];
         if (fDebugNet)
             printf("askfor %s   %lld (%s)\n", inv.ToString().c_str(), (long long)nRequestTime, DateTimeStrFormat("%H:%M:%S", nRequestTime/1000000).c_str());
 
-        // Make sure not to reuse time indexes to keep things in the same order
         int64_t nNow = (GetTime() - 1) * 1000000;
         static int64_t nLastTime;
         ++nLastTime;
         nNow = std::max(nNow, nLastTime);
         nLastTime = nNow;
 
-        bool fBlockRequest = (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK);
         if (fBlockRequest)
         {
-            ExpireBlockInFlight();
-            if (setBlocksInFlight.count(inv.hash))
+            NodeId nOwnerPeer = -1;
+            BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
+            bool fHasOwner = GetBlockRequestOwner(inv.hash, &nOwnerPeer, &ownerState);
+            if (fHasOwner && nOwnerPeer != GetId())
+                return;
+            if (fHasOwner && nOwnerPeer == GetId() && ownerState == BLOCK_REQUEST_OWNER_IN_FLIGHT)
+                return;
+            if (!fHasOwner &&
+                !TryAssignBlockRequestOwnerLocked(inv.hash, GetId(), &nOwnerPeer, &ownerState))
                 return;
 
             static const int64_t BLOCK_ASK_RETRY_US = 1000000;
@@ -712,7 +796,7 @@ public:
         {
             nRequestTime = std::max(nRequestTime + 10 * 1000000, nNow);
         }
-        mapAskFor.insert(std::make_pair(nRequestTime, inv));
+        AddAskForEntry(nRequestTime, inv);
     }
 
 
@@ -992,8 +1076,11 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         {
             if (nNow - it->second > nTimeout)
             {
-                setBlocksInFlight.erase(it->first);
+                const uint256 hashExpired = it->first;
+                setBlocksInFlight.erase(hashExpired);
                 it = mapBlockInFlightSince.erase(it);
+                ReleaseBlockRequestOwner(hashExpired, GetId(), "timeout");
+                EraseAlreadyAskedForIfUnowned(CInv(MSG_BLOCK, hashExpired), this);
             }
             else
             {
