@@ -9964,9 +9964,10 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                 }
                 if (pto->setBlocksInFlight.size() >= MAX_BLOCKS_IN_FLIGHT_PER_PEER)
                 {
-                    int64_t nRetry = nNow + 250000;
-                    pto->mapAskFor.erase(pto->mapAskFor.begin());
-                    pto->mapAskFor.insert(std::make_pair(nRetry, inv));
+                    // Preserve queued request order at the inflight cap.
+                    // Do not erase/re-add the front request with a postponed
+                    // timestamp: it must remain the next eligible request once
+                    // an inflight slot frees.
                     break;
                 }
             }
