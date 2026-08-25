@@ -659,6 +659,13 @@ void CNode::CloseSocketDisconnect(const char* pszReason)
 
 void CNode::Cleanup()
 {
+    // Release this peer's per-peer block-request state (including the
+    // wire-origin timing records) so a disconnect leaves no stale timing
+    // entries behind.
+    setBlocksInFlight.clear();
+    mapBlockInFlightSince.clear();
+    LOCK(cs_vBlockInFlightWire);
+    mapBlockInFlightWireUs.clear();
 }
 
 
@@ -1150,6 +1157,21 @@ void SocketSendData(CNode *pnode)
         }
         int nBytes = send(pnode->hSocket, &data[pnode->nSendOffset], data.size() - pnode->nSendOffset, MSG_NOSIGNAL | MSG_DONTWAIT);
         if (nBytes > 0) {
+            // Wire-origin clock for block requests: on the first actual socket
+            // write of a getdata message, stamp every in-flight block hash it
+            // carries.  Only a pending-wire hash is stamped, and only the first
+            // write of the message is used, so timing stays attributable to the
+            // specific requested hash.
+            size_t nMetaIdx = (size_t)(it - pnode->vSendMsg.begin());
+            if (nMetaIdx < pnode->vSendMsgMeta.size())
+            {
+                CNode::SendMessageMeta& meta = pnode->vSendMsgMeta[nMetaIdx];
+                if (meta.fPending)
+                {
+                    meta.fPending = false;
+                    pnode->StampBlockInFlightWireTimes(meta.vBlockHashes, GetTime());
+                }
+            }
             pnode->nLastSend = GetTime();
             pnode->nSendOffset += nBytes;
 
@@ -1199,6 +1221,9 @@ void SocketSendData(CNode *pnode)
             pnode->nSendSize = 0;
         }
     }
+    size_t nSent = (size_t)(it - pnode->vSendMsg.begin());
+    if (nSent > 0)
+        pnode->vSendMsgMeta.erase(pnode->vSendMsgMeta.begin(), pnode->vSendMsgMeta.begin() + nSent);
     pnode->vSendMsg.erase(pnode->vSendMsg.begin(), it);
 }
 
@@ -3409,7 +3434,7 @@ bool FetchBlockForStaking(const uint256& hashBlock)
 
         std::vector<CInv> vGetData;
         vGetData.push_back(CInv(MSG_BLOCK, hashBlock));
-        pnode->PushMessage("getdata", vGetData);
+        pnode->PushBlockGetData(vGetData);
         nRequested++;
 
         if (fDebug)

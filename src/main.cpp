@@ -8944,7 +8944,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (fDebug)
                 printf("Requesting %u full blocks from peer %s via getdata\n",
                        (unsigned int)vGetData.size(), pfrom->addr.ToString().c_str());
-            pfrom->PushMessage("getdata", vGetData);
+            pfrom->PushBlockGetData(vGetData);
             for (const CInv& inv : vGetData)
                 pfrom->MarkBlockInFlight(inv.hash);
         }
@@ -9987,7 +9987,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
                     pto->MarkBlockInFlight(inv.hash);
                 if (vGetData.size() >= 1000)
                 {
-                    pto->PushMessage("getdata", vGetData);
+                    pto->PushBlockGetData(vGetData);
                     vGetData.clear();
                 }
             }
@@ -9998,7 +9998,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle)
             pto->mapAskFor.erase(pto->mapAskFor.begin());
         }
         if (!vGetData.empty())
-            pto->PushMessage("getdata", vGetData);
+            pto->PushBlockGetData(vGetData);
     }
 
 

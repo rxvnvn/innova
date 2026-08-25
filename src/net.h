@@ -369,6 +369,20 @@ public:
     size_t nSendSize; // total size of all vSendMsg entries
     size_t nSendOffset; // offset inside the first vSendMsg already sent
     std::deque<CSerializeData> vSendMsg;
+    // Parallel per-message metadata, aligned with vSendMsg: the i-th
+    // vSendMsgMeta entry describes the i-th vSendMsg entry.  A getdata message
+    // records the block hashes it carries so the socket-send path can stamp each
+    // in-flight hash's wire-origin time at the first actual byte written.
+    struct SendMessageMeta
+    {
+        bool fPending;                 // true until the first byte is written
+        std::vector<uint256> vBlockHashes; // carried block hashes (getdata only)
+        SendMessageMeta() : fPending(true) {}
+    };
+    std::deque<SendMessageMeta> vSendMsgMeta;
+    // Staging for the block hashes of the getdata batch being serialized; moved
+    // into vSendMsgMeta by EndMessage.  Guarded by cs_vSend.
+    std::vector<uint256> vPendingGetDataHashes;
     CCriticalSection cs_vSend;
     CCriticalSection cs_vRecv;
 	std::deque<CInv> vRecvGetData;
@@ -471,6 +485,12 @@ public:
 
     std::set<uint256> setBlocksInFlight;
     std::map<uint256, int64_t> mapBlockInFlightSince;
+    // Wire-origin clock for conservative block-request expiry: seconds at the
+    // first socket write of the getdata carrying this in-flight hash (0 = still
+    // pending wire).  Guarded by cs_vBlockInFlightWire (touched by both the
+    // message handler and the socket handler).
+    std::map<uint256, int64_t> mapBlockInFlightWireUs;
+    CCriticalSection cs_vBlockInFlightWire;
 
     SecMsgNode smsgData;
 
@@ -721,6 +741,7 @@ public:
     {
         ENTER_CRITICAL_SECTION(cs_vSend);
         assert(ssSend.size() == 0);
+        vPendingGetDataHashes.clear();
         ssSend << CMessageHeader(pszCommand, 0);
         if (fDebugNet)
             printf("net: to %s: %s ", this->addr.ToString().c_str(), pszCommand);
@@ -729,6 +750,7 @@ public:
     void AbortMessage() UNLOCK_FUNCTION(cs_vSend)
     {
         ssSend.clear();
+        vPendingGetDataHashes.clear();
 
         LEAVE_CRITICAL_SECTION(cs_vSend);
 
@@ -767,6 +789,14 @@ public:
         ssSend.GetAndClear(*it);
         nSendSize += (*it).size();
 
+        // Attach the block-hash association for a getdata batch so the
+        // socket-send path can stamp each in-flight hash's wire-origin time.
+        vSendMsgMeta.push_back(SendMessageMeta());
+        if (!vPendingGetDataHashes.empty())
+            vSendMsgMeta.back().vBlockHashes.swap(vPendingGetDataHashes);
+        else
+            vPendingGetDataHashes.clear();
+
         // If write queue empty, attempt "optimistic write"
         if (it == vSendMsg.begin())
             SocketSendData(this);
@@ -775,6 +805,31 @@ public:
     }
 
     void PushVersion();
+
+    // Send a getdata batch, recording the block hashes it carries so the
+    // socket-send path can stamp each in-flight hash's wire-origin time.  Same
+    // serialization path as PushMessage("getdata", vGetData); the association is
+    // observation only and never changes what or when bytes are written.
+    void PushBlockGetData(const std::vector<CInv>& vGetData)
+    {
+        try
+        {
+            BeginMessage("getdata");
+            vPendingGetDataHashes.clear();
+            for (size_t i = 0; i < vGetData.size(); ++i)
+            {
+                if (vGetData[i].type == MSG_BLOCK || vGetData[i].type == MSG_FILTERED_BLOCK)
+                    vPendingGetDataHashes.push_back(vGetData[i].hash);
+            }
+            ssSend << vGetData;
+            EndMessage();
+        }
+        catch (...)
+        {
+            AbortMessage();
+            throw;
+        }
+    }
 
 
     void PushMessage(const char* pszCommand)
@@ -983,16 +1038,32 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
 
     void ExpireBlockInFlight(int64_t nNow = GetTime())
     {
-        int64_t nTimeout = GetArg("-blockinflighttimeout", 30);
-        if (nTimeout < 5)
-            nTimeout = 5;
-        if (nTimeout > 600)
-            nTimeout = 600;
+        // Conservative wire-origin expiry.  A block request's real delivery
+        // window starts when its getdata batch's first byte reaches the socket
+        // (wire-origin).  Until that happens the request is pending-wire and is
+        // only bounded by a short safety bound so it cannot remain immortal;
+        // merely being constructed/queued must not consume the delivery window.
+        static const int64_t BLOCK_REQUEST_WIRE_DEADLINE_SEC = 60;
+        static const int64_t BLOCK_REQUEST_PENDING_WIRE_SEC = 1;
         for (std::map<uint256, int64_t>::iterator it = mapBlockInFlightSince.begin(); it != mapBlockInFlightSince.end(); )
         {
-            if (nNow - it->second > nTimeout)
+            int64_t nWireSec = 0;
+            {
+                LOCK(cs_vBlockInFlightWire);
+                std::map<uint256, int64_t>::const_iterator wi = mapBlockInFlightWireUs.find(it->first);
+                if (wi != mapBlockInFlightWireUs.end())
+                    nWireSec = wi->second;
+            }
+            int64_t nDeadline = (nWireSec > 0)
+                ? (nWireSec + BLOCK_REQUEST_WIRE_DEADLINE_SEC)
+                : (it->second + BLOCK_REQUEST_PENDING_WIRE_SEC);
+            if (nNow > nDeadline)
             {
                 setBlocksInFlight.erase(it->first);
+                {
+                    LOCK(cs_vBlockInFlightWire);
+                    mapBlockInFlightWireUs.erase(it->first);
+                }
                 it = mapBlockInFlightSince.erase(it);
             }
             else
@@ -1013,12 +1084,36 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         ExpireBlockInFlight();
         setBlocksInFlight.insert(hashBlock);
         mapBlockInFlightSince[hashBlock] = GetTime();
+        {
+            LOCK(cs_vBlockInFlightWire);
+            if (mapBlockInFlightWireUs.count(hashBlock) == 0)
+                mapBlockInFlightWireUs[hashBlock] = 0; // pending wire
+        }
     }
 
     void ClearBlockInFlight(const uint256& hashBlock)
     {
         setBlocksInFlight.erase(hashBlock);
         mapBlockInFlightSince.erase(hashBlock);
+        {
+            LOCK(cs_vBlockInFlightWire);
+            mapBlockInFlightWireUs.erase(hashBlock);
+        }
+    }
+
+    // Record the wire-origin time (seconds) for every in-flight block hash
+    // carried by a getdata message that has just reached the socket.  Only
+    // hashes with an existing pending-wire entry are stamped, so a hash whose
+    // request was already cleaned up is never re-created here.
+    void StampBlockInFlightWireTimes(const std::vector<uint256>& vBlockHashes, int64_t nWireSec)
+    {
+        LOCK(cs_vBlockInFlightWire);
+        for (size_t i = 0; i < vBlockHashes.size(); ++i)
+        {
+            std::map<uint256, int64_t>::iterator it = mapBlockInFlightWireUs.find(vBlockHashes[i]);
+            if (it != mapBlockInFlightWireUs.end())
+                it->second = nWireSec;
+        }
     }
 
     bool ShouldRequestBlockCatchup(int64_t nMinInterval = 5)
