@@ -227,6 +227,20 @@ map<NodeId, int> mapOrphanCountByNode;
 static const int MAX_ORPHAN_BLOCKS_PER_PEER = 750;
 set<pair<COutPoint, unsigned int> > setStakeSeenOrphan;
 
+void EraseStakeSeenOrphanIfUnreferenced(const std::pair<COutPoint, unsigned int>& stake)
+{
+    if (!setStakeSeenOrphan.count(stake))
+        return;
+    for (std::map<uint256, CBlock*>::const_iterator mi = mapOrphanBlocks.begin();
+         mi != mapOrphanBlocks.end(); ++mi)
+    {
+        if (mi->second->IsProofOfStake() &&
+            mi->second->GetProofOfStake() == stake)
+            return;
+    }
+    setStakeSeenOrphan.erase(stake);
+}
+
 
 map<uint256, CTransaction> mapOrphanTransactions;
 map<uint256, set<uint256> > mapOrphanTransactionsByPrev;
@@ -2354,7 +2368,7 @@ uint256 WantedByOrphan(const CBlock* pblockOrphan)
 }
 
 // Remove a random orphan block (which does not have any dependent orphans).
-void static PruneOrphanBlocks()
+void PruneOrphanBlocks()
 {
     if (mapOrphanBlocksByPrev.size() <= (size_t)std::max((int64_t)0, GetArg("-maxorphanblocks", DEFAULT_MAX_ORPHAN_BLOCKS)))
         return;
@@ -2380,6 +2394,8 @@ void static PruneOrphanBlocks()
     } while(1);
 
     uint256 hash = it->second->GetHash();
+    const bool fIsProofOfStake = it->second->IsProofOfStake();
+    const std::pair<COutPoint, unsigned int> stake = it->second->GetProofOfStake();
     delete it->second;
     mapOrphanBlocksByPrev.erase(it);
     mapOrphanBlocks.erase(hash);
@@ -2389,6 +2405,13 @@ void static PruneOrphanBlocks()
         mapOrphanCountByNode[nodeIt->second]--;
         mapOrphanBlocksByNode.erase(nodeIt);
     }
+
+    // A pruned orphan must release its stake marker, otherwise later
+    // re-deliveries of the same block are rejected as duplicate proof-of-stake
+    // orphan even though no stored orphan still references it.  Only release
+    // the kernel when no other stored orphan still references it.
+    if (fIsProofOfStake)
+        EraseStakeSeenOrphanIfUnreferenced(stake);
 }
 
 static std::vector<uint256> GetDAGParentsFromBlock(const CBlock& block)
@@ -7363,7 +7386,11 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
             if (pblockOrphan->AcceptBlock())
                 vWorkQueue.push_back(orphanHash);
             mapOrphanBlocks.erase(orphanHash);
-            setStakeSeenOrphan.erase(pblockOrphan->GetProofOfStake());
+            // Release the stake marker only when no other stored orphan still
+            // references the kernel (duplicate stakes are allowed on the
+            // orphan path while an orphan child depends on the block).
+            if (pblockOrphan->IsProofOfStake())
+                EraseStakeSeenOrphanIfUnreferenced(pblockOrphan->GetProofOfStake());
 
             map<uint256, NodeId>::iterator nodeIt = mapOrphanBlocksByNode.find(orphanHash);
             if (nodeIt != mapOrphanBlocksByNode.end()) {
