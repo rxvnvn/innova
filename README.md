@@ -110,6 +110,20 @@ Innova Improvement Proposals (IIPs) formalize all protocol innovations. See [IIP
 | [IIP-0009](IIP_INDEX.md#iip-0009-nullstake-v1) | NullStake V1 (ZK Private Staking) | Active | 9,500,000 |
 | [IIP-0010](IIP_INDEX.md#iip-0010-nullstake-v2) | NullStake V2 (Poseidon2 + Bulletproof AC) | Proposed | 10,000,000 |
 
+## Collateral Nodes
+
+Innova supports two Collateral Node deployment models, both fully
+supported:
+
+* **Remote / controller** (legacy) — collateral wallet off the VPS, driven
+  by `collateralnode.conf` + `start-alias`/`start-many`.
+* **Self-contained local** — one node, exact
+  `collateralnodeoutpoint=<txid>-<vout>`, no `collateralnode.conf` required.
+
+See the operator guide for setup, verification, and troubleshooting:
+
+* [Collateral Nodes operator guide](doc/collateralnode.md)
+
 ## Links
 
 * Official Website(https://innova-foundation.com/)
