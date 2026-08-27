@@ -684,6 +684,7 @@ std::string HelpMessage()
         "  -cnconflock=<n>            " + _("Lock collateralnodes from collateralnode configuration file (default: 1)") + "\n" +
         "  -collateralnodeprivkey=<n>     " + _("Set the collateralnode private key") + "\n" +
         "  -collateralnodeaddr=<n>        " + _("Set external address:port to get to this collateralnode (example: address:port)") + "\n" +
+        "  -collateralnodeoutpoint=<n>    " + _("Self-contained local CN: set the exact collateral outpoint (txid-vout); this outpoint is never locked/unlocked by the CN lifecycle") + "\n" +
         "  -collateralnodeminprotocol=<n> " + _("Ignore collateralnodes less than version (example: 70007; default : 0)") + "\n";
 
     return strUsage;
@@ -1758,6 +1759,22 @@ bool AppInit2()
 
         if(strCollateralNodePrivKey.empty()){
             return InitError(_("You must specify a collateralnodeprivkey in the configuration. Please see documentation for help."));
+        }
+
+        // Self-contained local collateralnode: explicit exact collateral outpoint.
+        // Configured as -collateralnodeoutpoint=<64-hex-txid>-<vout>. While this is
+        // set the CN lifecycle selects ONLY this outpoint and never LockCoin/UnlockCoin it.
+        std::string strOutpointArg = GetArg("-collateralnodeoutpoint", "");
+        if (!strOutpointArg.empty()) {
+            std::string err, txid;
+            unsigned int vout;
+            if (!ParseCollateralNodeOutpoint(strOutpointArg, txid, vout, err))
+                return InitError("Invalid -collateralnodeoutpoint: " + err);
+            fSelfContainedCollateralNode = true;
+            strCollateralNodeOutpointTxid = txid;
+            nCollateralNodeOutpointVout = vout;
+            printf("Self-contained collateralnode enabled: exact outpoint %s-%u (never locked)\n",
+                   txid.c_str(), vout);
         }
     }
 

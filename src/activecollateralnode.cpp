@@ -73,7 +73,20 @@ void CActiveCollateralnode::ManageStatus()
         CPubKey pubKeyCollateralAddress;
         CKey keyCollateralAddress;
 
-        if(GetCollateralNodeVin(vin, pubKeyCollateralAddress, keyCollateralAddress)) {
+        // Self-contained local CN: select ONLY the configured exact outpoint via
+        // the unlocked-inclusive 6-arg path (never temp-unlocks); otherwise keep the
+        // original auto-select-first-candidate behavior.
+        bool fGotVin;
+        std::string vinError;
+        if (fSelfContainedCollateralNode)
+            fGotVin = GetCollateralNodeVin(vin, pubKeyCollateralAddress, keyCollateralAddress,
+                                           strCollateralNodeOutpointTxid,
+                                           std::to_string(nCollateralNodeOutpointVout),
+                                           vinError);
+        else
+            fGotVin = GetCollateralNodeVin(vin, pubKeyCollateralAddress, keyCollateralAddress);
+
+        if (fGotVin) {
 
             //if(GetInputAge(vin, pindexBest) < (nBestHeight > BLOCK_START_COLLATERALNODE_DELAYPAY ? COLLATERALNODE_MIN_CONFIRMATIONS_NOPAY : COLLATERALNODE_MIN_CONFIRMATIONS)){
             //    printf("CActiveCollateralnode::ManageStatus() - Input must have least %d confirmations - %d confirmations\n", (nBestHeight > BLOCK_START_COLLATERALNODE_DELAYPAY ? COLLATERALNODE_MIN_CONFIRMATIONS_NOPAY : COLLATERALNODE_MIN_CONFIRMATIONS), GetInputAge(vin, pindexBest));
@@ -86,7 +99,11 @@ void CActiveCollateralnode::ManageStatus()
             status = COLLATERALNODE_IS_CAPABLE;
             notCapableReason = "";
 
-            pwalletMain->LockCoin(vin.prevout);
+            // Legacy local CN locks the collateral to keep it off the spend path. The
+            // self-contained mode does NOT lock its configured outpoint (the exact
+            // outpoint is fixed by config, so it never needs to be spend-protected).
+            if (!fSelfContainedCollateralNode)
+                pwalletMain->LockCoin(vin.prevout);
 
             // send to all nodes
             CPubKey pubKeyCollateralnode;
@@ -104,7 +121,12 @@ void CActiveCollateralnode::ManageStatus()
 
             return;
         } else {
-            printf("CActiveCollateralnode::ManageStatus() - Could not find suitable coins!\n");
+            if (fSelfContainedCollateralNode) {
+                notCapableReason = vinError;
+                printf("CActiveCollateralnode::ManageStatus() - self-contained outpoint unusable: %s\n", vinError.c_str());
+            } else {
+                printf("CActiveCollateralnode::ManageStatus() - Could not find suitable coins!\n");
+            }
         }
     }
 

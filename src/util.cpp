@@ -66,6 +66,12 @@ using namespace std;
 bool fCollateralNode = false;
 string strCollateralNodePrivKey = "";
 string strCollateralNodeAddr = "";
+// Self-contained local collateralnode: explicit exact collateral outpoint,
+// configured via -collateralnodeoutpoint=<64-hex-txid>-<vout>. In this mode the
+// CN lifecycle selects ONLY that outpoint and never LockCoin/UnlockCoin it.
+bool fSelfContainedCollateralNode = false;
+string strCollateralNodeOutpointTxid = "";
+unsigned int nCollateralNodeOutpointVout = 0;
 int nCollateralNRounds = 2;
 
 int nMinStakeInterval = 30;         // in seconds, min time between successful stakes

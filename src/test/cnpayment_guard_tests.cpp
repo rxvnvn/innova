@@ -31,6 +31,7 @@
 
 #include "../checkpoints.h"
 #include "../collateralnode.h"
+#include "../collateral.h"
 #include "../main.h"
 #include "../net.h"
 #include "../util.h"
@@ -217,3 +218,61 @@ BOOST_AUTO_TEST_CASE(justcheck_disabled_old_never_validate)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+BOOST_AUTO_TEST_CASE(parse_collateralnode_outpoint_valid)
+{
+    const std::string goodTx = "92da2832505942f0f86d23c0a1ccafe3ac02f5b7344a70e18eea673008eebf2c";
+    std::string txid, err;
+    unsigned int vout = 999;
+    BOOST_CHECK(ParseCollateralNodeOutpoint(goodTx + "-0", txid, vout, err));
+    BOOST_CHECK_EQUAL(txid, goodTx);
+    BOOST_CHECK_EQUAL(vout, 0u);
+    BOOST_CHECK(err.empty());
+
+    BOOST_CHECK(ParseCollateralNodeOutpoint(goodTx + "-7", txid, vout, err));
+    BOOST_CHECK_EQUAL(vout, 7u);
+
+    // vout at the signed-int max boundary is valid (consumer uses lexical_cast<int>).
+    BOOST_CHECK(ParseCollateralNodeOutpoint(goodTx + "-2147483647", txid, vout, err));
+    BOOST_CHECK_EQUAL(vout, 2147483647u);
+}
+
+BOOST_AUTO_TEST_CASE(parse_collateralnode_outpoint_malformed)
+{
+    const std::string goodTx = "92da2832505942f0f86d23c0a1ccafe3ac02f5b7344a70e18eea673008eebf2c";
+    std::string txid, err;
+    unsigned int vout = 0;
+
+    // No separator.
+    BOOST_CHECK(!ParseCollateralNodeOutpoint(goodTx, txid, vout, err));
+    BOOST_CHECK(!err.empty());
+
+    // Wrong txid length.
+    BOOST_CHECK(!ParseCollateralNodeOutpoint("abcd-0", txid, vout, err));
+    BOOST_CHECK(err.find("txid") != std::string::npos);
+
+    // Non-hex txid (correct length).
+    std::string notHex(64, 'g');
+    BOOST_CHECK(!ParseCollateralNodeOutpoint(notHex + "-0", txid, vout, err));
+    BOOST_CHECK(err.find("txid") != std::string::npos);
+
+    // Non-integer vout.
+    BOOST_CHECK(!ParseCollateralNodeOutpoint(goodTx + "-abc", txid, vout, err));
+    BOOST_CHECK(err.find("vout") != std::string::npos);
+
+    // Negative vout cannot be cleanly expressed in "<txid>-<vout>" because a second
+    // dash makes the txid segment longer than 64 characters; such input must still
+    // be rejected. (Real vout range/format errors are covered by the cases below.)
+    BOOST_CHECK(!ParseCollateralNodeOutpoint(goodTx + "--1", txid, vout, err));
+
+    // Empty vout.
+    BOOST_CHECK(!ParseCollateralNodeOutpoint(goodTx + "-", txid, vout, err));
+
+    // vout above the signed-int range (lexical_cast<int> consumer would throw).
+    BOOST_CHECK(!ParseCollateralNodeOutpoint(goodTx + "-4294967296", txid, vout, err));
+    BOOST_CHECK(!ParseCollateralNodeOutpoint(goodTx + "-2147483648", txid, vout, err));
+    BOOST_CHECK(err.find("vout") != std::string::npos);
+
+    // A second dash makes the txid segment invalid (must be exactly 64 hex).
+    BOOST_CHECK(!ParseCollateralNodeOutpoint(goodTx + "-1-2", txid, vout, err));
+}

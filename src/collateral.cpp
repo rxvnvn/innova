@@ -20,9 +20,39 @@
 
 #include <algorithm>
 #include <boost/assign/list_of.hpp>
+#include <limits>
 
 using namespace std;
 using namespace boost;
+
+// Parse "<64-hex-txid>-<vout>" into its components (declared in collateral.h).
+// Pure and unit-testable. Returns false with a precise errOut on malformed input.
+bool ParseCollateralNodeOutpoint(const std::string& s, std::string& txidOut,
+                                 unsigned int& voutOut, std::string& errOut)
+{
+    std::string::size_type dash = s.rfind('-');
+    if (dash == std::string::npos) {
+        errOut = "expected <64-hex-txid>-<vout>";
+        return false;
+    }
+    std::string strTx = s.substr(0, dash);
+    std::string strVout = s.substr(dash + 1);
+    if (strTx.size() != 64 || !IsHex(strTx)) {
+        errOut = "invalid txid; must be exactly 64 hexadecimal characters";
+        return false;
+    }
+    int64_t nV = 0;
+    // Consumer path uses boost::lexical_cast<int> (activecollateralnode.cpp),
+    // so vout must fit in a signed int to avoid a bad_lexical_cast crash.
+    if (!ParseInt64(strVout, &nV) || nV < 0 || nV > (int64_t)std::numeric_limits<int>::max()) {
+        errOut = "invalid vout; must be a non-negative integer in [0, 2147483647]";
+        return false;
+    }
+    txidOut = strTx;
+    voutOut = (unsigned int)nV;
+    errOut.clear();
+    return true;
+}
 
 static uint32_t SecureRand(uint32_t max) {
     if (max <= 1) return 0;

@@ -60,6 +60,19 @@ extern std::string strCollateralNodePrivKey;
 extern map<uint256, CCollateralNBroadcastTx> mapCollateralNBroadcastTxes;
 extern CActiveCollateralnode activeCollateralnode;
 
+// Self-contained local collateralnode (collateral wallet on the same host):
+// explicit exact collateral outpoint configured via -collateralnodeoutpoint.
+// While enabled the CN lifecycle must select ONLY this outpoint and never
+// call LockCoin/UnlockCoin on it.
+extern bool fSelfContainedCollateralNode;
+extern std::string strCollateralNodeOutpointTxid;
+extern unsigned int nCollateralNodeOutpointVout;
+
+// Parse "<64-hex-txid>-<vout>" into its components. Returns false (with a
+// precise errOut) on any malformed input. Pure/unit-testable.
+bool ParseCollateralNodeOutpoint(const std::string& s, std::string& txidOut,
+                                 unsigned int& voutOut, std::string& errOut);
+
 //specific messages for the CollateralN protocol
 void ProcessMessageCollateralN(CNode* pfrom, std::string& strCommand, CDataStream& vRecv);
 
