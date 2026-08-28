@@ -389,6 +389,7 @@ OBJS= \
 	obj/utiltime.o \
     obj/stun.o \
     obj/bootstrap.o \
+    obj/blockindex_accessor.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 else
@@ -473,6 +474,7 @@ OBJS= \
 	obj/utiltime.o \
     obj/stun.o \
     obj/bootstrap.o \
+    obj/blockindex_accessor.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 endif
@@ -510,7 +512,8 @@ TEST_OBJS= \
     obj/test/cnpayment_guard_tests.o \
     obj/test/hreg_registration_tests.o \
     obj/test/cblocklocator_tests.o \
-    obj/test/invalidate_reconsider_tests.o
+    obj/test/invalidate_reconsider_tests.o \
+    obj/test/blockindex_accessor_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle check-cnpayment-guard release-check
 
