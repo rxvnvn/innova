@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "main.h"
+#include "blockindex_accessor.h"
 #include "db.h"
 #include "txdb.h"
 #include "init.h"
@@ -33,6 +34,18 @@ static std::string MiningFinalityTierName(FinalityTier tier)
     if (tier == FINALITY_SOFT) return "soft";
     if (tier == FINALITY_TENTATIVE) return "tentative";
     return "none";
+}
+
+int64_t GetFinalityStakingEpochBlockTimeForTesting(int nHeight)
+{
+    LOCK(cs_main);
+    if (!pindexBest)
+        return 0;
+    const int nEpoch = GetEpochForHeight(nHeight);
+    const int nEpochBoundary = GetEpochBoundaryHeight(nEpoch, nHeight);
+    LegacyBlockIndexAccessor accessor;
+    BlockIndexSnapshot snap = accessor.GetActiveByHeight(nEpochBoundary);
+    return snap.found ? (int64_t)snap.nTime : pindexBest->GetBlockTime();
 }
 
 Value gethashespersec(const Array& params, bool fHelp)
@@ -228,8 +241,9 @@ Value getfinalitystakinginfo(const Array& params, bool fHelp)
             nEpoch = GetEpochForHeight(nHeight);
             nEpochBoundary = GetEpochBoundaryHeight(nEpoch, nHeight);
             nEpochProgress = nHeight - nEpochBoundary;
-            CBlockIndex* pEpochBlock = FindBlockByHeight(nEpochBoundary);
-            nEpochBlockTime = pEpochBlock ? pEpochBlock->GetBlockTime() : pindexBest->GetBlockTime();
+            LegacyBlockIndexAccessor accessor;
+            BlockIndexSnapshot epochBoundary = accessor.GetActiveByHeight(nEpochBoundary);
+            nEpochBlockTime = epochBoundary.found ? (int64_t)epochBoundary.nTime : pindexBest->GetBlockTime();
         }
     }
 

@@ -496,6 +496,7 @@ HEADERS += src/qt/bitcoingui.h \
     src/addrman.h \
     src/base58.h \
     src/bignum.h \
+    src/blockindex_accessor.h \
     src/checkpoints.h \
     src/compat.h \
     src/coincontrol.h \
@@ -659,6 +660,7 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/ibdblocklatency.cpp \
     src/pinglifecycletrace.cpp \
     src/bootstrap.cpp \
+    src/blockindex_accessor.cpp \
     src/smessage_stub.cpp \
     src/net.cpp \
     src/checkpoints.cpp \

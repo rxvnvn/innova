@@ -43,6 +43,7 @@ HEADERS += build/build.h \
            src/base58.h \
            src/bignum.h \
            src/bloom.h \
+           src/blockindex_accessor.h \
            src/bootstrap.h \
            src/bulletproof_ac.h \
            src/checkpoints.h \
@@ -523,6 +524,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/alert.cpp \
            src/base58.cpp \
            src/bloom.cpp \
+           src/blockindex_accessor.cpp \
            src/bootstrap.cpp \
            src/smessage_stub.cpp \
            src/bulletproof_ac.cpp \
@@ -675,6 +677,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/test/netbase_tests.cpp \
            src/test/ringsig_tests.cpp \
            src/test/rpc_tests.cpp \
+           src/test/blockindex_accessor_tests.cpp \
            src/test/script_P2SH_tests.cpp \
            src/test/script_tests.cpp \
            src/test/sigopcount_tests.cpp \

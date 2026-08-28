@@ -4,6 +4,9 @@
 #include "innovarpc.h"
 #include "miner.h"
 #include "dag.h"
+#include "main.h"
+#include "finality.h"
+#include "txdb.h"
 
 #include <atomic>
 #include <chrono>
@@ -12,6 +15,7 @@
 #include <thread>
 
 extern CWallet* pwalletMain;
+extern int64_t GetFinalityStakingEpochBlockTimeForTesting(int nHeight);
 
 namespace
 {
@@ -264,6 +268,79 @@ BOOST_AUTO_TEST_CASE(rpc_reports_actual_stopped_state)
     BOOST_CHECK(!find_value(info, "cpumining").get_bool());
     BOOST_CHECK_EQUAL(find_value(info, "cputhreads").get_int(), 0);
     BOOST_CHECK_EQUAL(find_value(info, "requestedcputhreads").get_int(), 0);
+}
+
+BOOST_AUTO_TEST_CASE(finality_staking_epoch_anchor_time_matches_direct_legacy)
+{
+    int nHeight = 0;
+    int nEpoch = 0;
+    int nEpochBoundary = 0;
+    int64_t nExpectedBlockTime = 0;
+    int64_t nExpectedEligibleWeight = 0;
+    int nExpectedEligibleUtxos = 0;
+    std::set<CKeyID> expectedVoterKeys;
+    {
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        BOOST_REQUIRE(pindexBest != NULL);
+        nHeight = pindexBest->nHeight;
+        nEpoch = GetEpochForHeight(nHeight);
+        nEpochBoundary = GetEpochBoundaryHeight(nEpoch, nHeight);
+        CBlockIndex* pEpochBlock = FindBlockByHeight(nEpochBoundary);
+        nExpectedBlockTime = pEpochBlock ? pEpochBlock->GetBlockTime() : pindexBest->GetBlockTime();
+
+        std::vector<COutput> vCoins;
+        pwalletMain->AvailableCoins(vCoins);
+        CTxDB txdb("r");
+        for (const COutput& out : vCoins)
+        {
+            if (!out.tx || out.i < 0 || (unsigned int)out.i >= out.tx->vout.size())
+                continue;
+            const CTxOut& txout = out.tx->vout[out.i];
+            if (txout.nValue <= 0 || !MoneyRange(txout.nValue))
+                continue;
+
+            CTxDestination dest;
+            if (!ExtractDestination(txout.scriptPubKey, dest))
+                continue;
+            CKeyID keyID;
+            if (!CBitcoinAddress(dest).GetKeyID(keyID))
+                continue;
+            CKey key;
+            if (!pwalletMain->GetKey(keyID, key))
+                continue;
+
+            CTxIndex txindex;
+            if (!txdb.ReadTxIndex(out.tx->GetHash(), txindex))
+                continue;
+            if ((unsigned int)out.i >= txindex.vSpent.size() || !txindex.vSpent[out.i].IsNull())
+                continue;
+
+            CBlock blockFrom;
+            if (!blockFrom.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+                continue;
+            if (blockFrom.GetBlockTime() + nStakeMinAge > nExpectedBlockTime)
+                continue;
+
+            nExpectedEligibleUtxos++;
+            expectedVoterKeys.insert(keyID);
+            if (nExpectedEligibleWeight <= MAX_MONEY - txout.nValue)
+                nExpectedEligibleWeight += txout.nValue;
+            else
+                nExpectedEligibleWeight = MAX_MONEY;
+        }
+    }
+
+    BOOST_CHECK_EQUAL(GetFinalityStakingEpochBlockTimeForTesting(nHeight), nExpectedBlockTime);
+
+    json_spirit::Array params;
+    json_spirit::Object info = getfinalitystakinginfo(params, false).get_obj();
+    BOOST_CHECK_EQUAL(find_value(info, "height").get_int(), nHeight);
+    BOOST_CHECK_EQUAL(find_value(info, "epoch").get_int(), nEpoch);
+    BOOST_CHECK_EQUAL(find_value(info, "epoch_boundary_height").get_int(), nEpochBoundary);
+    BOOST_CHECK_EQUAL(find_value(info, "epoch_progress").get_int(), nHeight - nEpochBoundary);
+    BOOST_CHECK_EQUAL(find_value(info, "eligible_utxos").get_int(), nExpectedEligibleUtxos);
+    BOOST_CHECK_EQUAL(find_value(info, "eligible_keys").get_int(), (int)expectedVoterKeys.size());
+    BOOST_CHECK_EQUAL(find_value(info, "eligible_weight").get_str(), FormatMoney(nExpectedEligibleWeight));
 }
 
 BOOST_AUTO_TEST_CASE(pow_hash_path_is_tribus_and_cn_split_remains_65_percent)
