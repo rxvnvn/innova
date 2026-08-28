@@ -1621,21 +1621,27 @@ public:
     CBlockIndex* pprev;
     CBlockIndex* pnext;
     CBlockIndex* pskip;
-    unsigned int nFile;
-    unsigned int nBlockPos;
-    uint256 nChainTrust; // ppcoin: trust score of block chain
-    int nHeight;
 
     int64_t nMint;
     int64_t nMoneySupply;
 
-    // Number of transactions in this block.
-    // Note: in a potential headers-first mode, this number cannot be relied upon
-    unsigned int nTx;
+    uint64_t nStakeModifier; // hash modifier for proof-of-stake
+    // in-memory only (NOT serialized): block time of the last generated stake
+    // modifier active at this index on its own branch. Enables O(1) recovery
+    // of the previous modifier/time (ComputeNextStakeModifier) without the
+    // GetLastStakeModifier backward walk. 0 = unset (legacy walk fallback).
+    int64_t nStakeModifierTime;
 
-    // (memory only) Number of transactions in the chain up to and including this block
-    unsigned int nChainTx; // change to 64-bit type when necessary; won't happen before 2030
+    uint256 nChainTrust; // ppcoin: trust score of block chain
+    uint256 hashProof;
+    uint256 hashMerkleRoot;
 
+    // proof-of-stake specific fields
+    COutPoint prevoutStake;
+
+    int nHeight;
+    unsigned int nFile;
+    unsigned int nBlockPos;
     unsigned int nFlags;  // ppcoin: block index flags
     enum
     {
@@ -1643,24 +1649,11 @@ public:
         BLOCK_STAKE_ENTROPY  = (1 << 1), // entropy bit for stake modifier
         BLOCK_STAKE_MODIFIER = (1 << 2), // regenerated stake modifier
     };
-
-    uint64_t nStakeModifier; // hash modifier for proof-of-stake
     unsigned int nStakeModifierChecksum; // checksum of index; in-memeory only
-    // in-memory only (NOT serialized): block time of the last generated stake
-    // modifier active at this index on its own branch. Enables O(1) recovery
-    // of the previous modifier/time (ComputeNextStakeModifier) without the
-    // GetLastStakeModifier backward walk. 0 = unset (legacy walk fallback).
-    int64_t nStakeModifierTime;
 
-    // proof-of-stake specific fields
-    COutPoint prevoutStake;
     unsigned int nStakeTime;
-
-    uint256 hashProof;
-
     // block header
     int nVersion;
-    uint256 hashMerkleRoot;
     unsigned int nTime;
     unsigned int nBits;
     unsigned int nNonce;
