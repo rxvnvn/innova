@@ -362,6 +362,7 @@ OBJS= \
     obj/dandelion.o \
     obj/finality.o \
     obj/dag.o \
+    obj/candidate_frontier.o \
     obj/rpcsmessage.o \
     obj/rpcnyx.o \
     obj/script.o \
@@ -457,6 +458,7 @@ OBJS= \
     obj/dandelion.o \
     obj/finality.o \
     obj/dag.o \
+    obj/candidate_frontier.o \
     obj/script.o \
     obj/sync.o \
     obj/util.o \

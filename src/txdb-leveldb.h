@@ -268,6 +268,8 @@ public:
     bool WriteBestInvalidTrust(CBigNum bnBestInvalidTrust);
     bool ReadInvalidBlockSet(std::set<uint256>& setInvalidBlockHash);
     bool WriteInvalidBlockSet(const std::set<uint256>& setInvalidBlockHash);
+    bool ReadCandidateTips(std::map<uint256, CandidateTipRecord>& tips);
+    bool WriteCandidateTips(const std::map<uint256, CandidateTipRecord>& tips);
     bool ReadSyncCheckpoint(uint256& hashCheckpoint);
     bool WriteSyncCheckpoint(uint256 hashCheckpoint);
     bool ReadCheckpointPubKey(std::string& strPubKey);

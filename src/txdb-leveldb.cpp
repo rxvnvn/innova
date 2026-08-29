@@ -929,6 +929,16 @@ bool CTxDB::WriteInvalidBlockSet(const std::set<uint256>& setInvalidBlockHash)
     return Write(string("setInvalidBlockHash"), setInvalidBlockHash);
 }
 
+bool CTxDB::ReadCandidateTips(std::map<uint256, CandidateTipRecord>& tips)
+{
+    return Read(string("candidateTips"), tips);
+}
+
+bool CTxDB::WriteCandidateTips(const std::map<uint256, CandidateTipRecord>& tips)
+{
+    return Write(string("candidateTips"), tips);
+}
+
 bool CTxDB::ReadSyncCheckpoint(uint256& hashCheckpoint)
 {
     return Read(string("hashSyncCheckpoint"), hashCheckpoint);

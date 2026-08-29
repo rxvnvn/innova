@@ -599,6 +599,13 @@ bool IsInitialBlockDownload();
 // Collateralnode payee-enforcement defer counter (see ShouldValidateCollateralnodePayments).
 int64_t GetCNPaymentsDeferredCount();
 void ResetCNPaymentsDeferredCountForTesting();
+int64_t GetCNValidationGuardPassedCount();
+int64_t GetCNValidationPayeeFoundCount();
+int64_t GetCNValidationPayeeMissingCount();
+int64_t GetCNValidationFindCNPaymentEnteredCount();
+int GetCNValidationLastGuardReason();
+int64_t GetCNValidationLastGuardHeight();
+void ResetCNValidationCountersForTesting();
 bool ShouldValidateCollateralnodePayments(CBlockIndex* pindex, bool fJustCheck, bool fCollateralnodePaymentsEnabled);
 extern bool g_forceIbdPeerSnapshotUnavailableForTesting;
 std::string GetWarnings(std::string strFor);
@@ -2294,8 +2301,77 @@ public:
 
 extern CTxMemPool mempool;
 
-/** (try to) add transaction to memory pool **/
+// ---------------------------------------------------------------------------
+// Candidate tip state — persisted subset of all-known-tips for bounded
+// candidate frontier reconstruction on restart.  Updated incrementally
+// during SetBestChain and reorg; rebuilt from full mapBlockIndex scan as
+// fallback.  ~106 bytes per tip, max ~7 KB for 64 tips.
+// ---------------------------------------------------------------------------
 
+struct CandidateTipRecord
+{
+    uint256 hashTip;
+    uint256 nChainTrust;
+    uint256 hashForkPoint;
+    int     nForkHeight;
+    uint8_t fHasData;          // bool, stored as uint8_t for serialization
+    uint8_t fValidAncestors;   // bool, stored as uint8_t for serialization
+    uint64_t nGeneration;
+
+    IMPLEMENT_SERIALIZE
+    (
+        READWRITE(hashTip);
+        READWRITE(nChainTrust);
+        READWRITE(hashForkPoint);
+        READWRITE(nForkHeight);
+        READWRITE(fHasData);
+        READWRITE(fValidAncestors);
+        READWRITE(nGeneration);
+    )
+
+    CandidateTipRecord() : nForkHeight(-1), fHasData(0),
+        fValidAncestors(0), nGeneration(0) {}
+
+    CandidateTipRecord(const uint256& hash, const uint256& trust,
+                       const uint256& forkHash, int forkHt,
+                       uint8_t data, uint8_t valid, uint64_t gen)
+        : hashTip(hash), nChainTrust(trust), hashForkPoint(forkHash),
+          nForkHeight(forkHt), fHasData(data), fValidAncestors(valid),
+          nGeneration(gen) {}
+};
+
+/** Persistent index of current candidate leaf/tip blocks.
+ *  Used by the bounded candidate frontier to avoid O(N) all-history scan. */
+extern std::map<uint256, CandidateTipRecord> mapCandidateTips;
+extern uint64_t nCandidateTipGeneration;
+
+/** Rebuild the candidate tips set from a full mapBlockIndex scan.
+ *  Called on startup if no persisted tips exist or generation is stale. */
+bool RebuildCandidateTips();
+
+/** Update candidate tips incrementally after a best-chain change.
+ *  Called from SetBestChain / Reorganize. */
+void UpdateCandidateTips(CBlockIndex* pindexOldTip, CBlockIndex* pindexNewTip);
+
+/** Persist current candidate tip set to txdb. */
+bool WriteCandidateTips(CTxDB& txdb);
+
+/** Load candidate tip set from txdb. Returns false if not found. */
+bool ReadCandidateTips(CTxDB& txdb);
+
+/** Evaluate the bounded candidate frontier and return the best eligible tip
+ *  using the EXACT same predicate as ActivateBestEligibleChain but operating
+ *  on the bounded candidate tips instead of scanning all mapBlockIndex. */
+CBlockIndex* EvaluateCandidateFrontier();
+
+/** Shadow comparator: runs bounded frontier alongside legacy full scan and
+ *  reports any mismatch.  When fShadowActive is true, legacy scan remains
+ *  authoritative and the frontier result is only logged. */
+void ShadowCompareCandidateSelection();
+
+extern bool fCandidateFrontierShadowActive;
+
+/** (try to) add transaction to memory pool **/
 bool AcceptableInputs(CTxMemPool& pool, const CTransaction &txo, bool fLimitFree,
                         bool* pfMissingInputs);
 

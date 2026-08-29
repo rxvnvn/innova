@@ -40,6 +40,7 @@
 #include "dandelion.h"
 #include "finality.h"
 #include "dag.h"
+#include "candidate_frontier.h"
 
 #ifdef USE_NATIVETOR
 #include "tor/anonymize.h" //Tor native optional integration (Flag -nativetor=1)
@@ -1912,6 +1913,10 @@ bool AppInit2()
             printf("IDAG: GHOSTDAG ordering active (k=%d), DAGKNIGHT activates at height %d\n",
                    GHOSTDAG_K, FORK_HEIGHT_DAGKNIGHT);
     }
+
+    // Candidate tip frontier: rebuild bounded tips index from full block index.
+    // If no DAG blocks exist, the tips set is still valid for candidate selection.
+    RebuildCandidateTips();
 
     RandAddSeedPerfmon();
 

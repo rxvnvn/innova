@@ -100,6 +100,11 @@ uint256 nBestChainTrust = 0;
 uint256 nBestInvalidTrust = 0;
 std::set<uint256> setInvalidBlockHash;
 
+// Candidate tip frontier — persisted subset of all-known-tips.
+std::map<uint256, CandidateTipRecord> mapCandidateTips;
+uint64_t nCandidateTipGeneration = 0;
+bool fCandidateFrontierShadowActive = true;  // Shadow-only by default
+
 // Peer that delivered the block currently being processed on this thread.
 // Populated by ProcessBlock so trace hooks inside SetBestChain/Reorganize can
 // attribute tip advances and reorgs to the supplying peer.
@@ -6669,19 +6674,39 @@ bool SeedGenesisCommitments(CTxDB& txdb, CIncrementalMerkleTree& shieldedTree, C
 // Once CN state is authoritative, the EXACT existing validation runs unchanged.
 // ---------------------------------------------------------------------------
 static std::atomic<int64_t> nCNPaymentsDeferred{0};
+// Diagnostic-only CN guard outcome telemetry (NO consensus/lock/validation change).
+static std::atomic<int64_t> nCNValidationGuardPassed{0};
+static std::atomic<int64_t> nCNValidationPayeeFound{0};
+static std::atomic<int64_t> nCNValidationPayeeMissing{0};
+static std::atomic<int64_t> nCNValidationFindCNPaymentEntered{0};
+static std::atomic<int> nCNLastGuardReason{0};     // 0=none 1=justcheck 2=disabled 3=old 4=ibd 5=thin 6=passed
+static std::atomic<int64_t> nCNLastGuardHeight{0};
 
 bool ShouldValidateCollateralnodePayments(CBlockIndex* pindex, bool fJustCheck,
                                          bool fCollateralnodePaymentsEnabled)
 {
+    if (pindex)
+        nCNLastGuardHeight.store(pindex->nHeight, std::memory_order_relaxed);
+    nCNLastGuardReason.store(0, std::memory_order_relaxed);
     if (fJustCheck)
+    {
+        nCNLastGuardReason.store(1, std::memory_order_relaxed);
         return false;
+    }
     if (!fCollateralnodePaymentsEnabled)
+    {
+        nCNLastGuardReason.store(2, std::memory_order_relaxed);
         return false;
+    }
     if (!(pindex->GetBlockTime() > GetTime() - 20 * nCoinbaseMaturity))
+    {
+        nCNLastGuardReason.store(3, std::memory_order_relaxed);
         return false;
+    }
     if (IsInitialBlockDownload())
     {
         nCNPaymentsDeferred.fetch_add(1, std::memory_order_relaxed);
+        nCNLastGuardReason.store(4, std::memory_order_relaxed);
         if (fDebug)
             printf("CNPAY_DEFERRED height=%d reason=IBD\n", pindex->nHeight);
         return false;
@@ -6707,8 +6732,13 @@ bool ShouldValidateCollateralnodePayments(CBlockIndex* pindex, bool fJustCheck,
         // If the lock could not be taken, treat as non-authoritative (defer).
     }
     if (nNetMedian > 0 && nLocalCount >= (size_t)nNetMedian)
+    {
+        nCNValidationGuardPassed.fetch_add(1, std::memory_order_relaxed);
+        nCNLastGuardReason.store(6, std::memory_order_relaxed);
         return true; // authoritative: run exact existing validation unchanged
+    }
     nCNPaymentsDeferred.fetch_add(1, std::memory_order_relaxed);
+    nCNLastGuardReason.store(5, std::memory_order_relaxed);
     if (fDebug)
         printf("CNPAY_DEFERRED height=%d reason=list-not-authoritative local=%u median=%u\n",
                pindex->nHeight, (unsigned)nLocalCount, nNetMedian);
@@ -6722,6 +6752,39 @@ int64_t GetCNPaymentsDeferredCount()
 void ResetCNPaymentsDeferredCountForTesting()
 {
     nCNPaymentsDeferred.store(0, std::memory_order_relaxed);
+}
+int64_t GetCNValidationGuardPassedCount()
+{
+    return nCNValidationGuardPassed.load(std::memory_order_relaxed);
+}
+int64_t GetCNValidationPayeeFoundCount()
+{
+    return nCNValidationPayeeFound.load(std::memory_order_relaxed);
+}
+int64_t GetCNValidationPayeeMissingCount()
+{
+    return nCNValidationPayeeMissing.load(std::memory_order_relaxed);
+}
+int64_t GetCNValidationFindCNPaymentEnteredCount()
+{
+    return nCNValidationFindCNPaymentEntered.load(std::memory_order_relaxed);
+}
+int GetCNValidationLastGuardReason()
+{
+    return nCNLastGuardReason.load(std::memory_order_relaxed);
+}
+int64_t GetCNValidationLastGuardHeight()
+{
+    return nCNLastGuardHeight.load(std::memory_order_relaxed);
+}
+void ResetCNValidationCountersForTesting()
+{
+    nCNValidationGuardPassed.store(0, std::memory_order_relaxed);
+    nCNValidationPayeeFound.store(0, std::memory_order_relaxed);
+    nCNValidationPayeeMissing.store(0, std::memory_order_relaxed);
+    nCNValidationFindCNPaymentEntered.store(0, std::memory_order_relaxed);
+    nCNLastGuardReason.store(0, std::memory_order_relaxed);
+    nCNLastGuardHeight.store(0, std::memory_order_relaxed);
 }
 
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, bool fWriteNames)
@@ -7629,6 +7692,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
                                         data.hash = pindex->GetBlockHash();
                                         mn.payData.push_back(data);
                                         mn.SetPayRate(pindex->nHeight);
+                                        nCNValidationPayeeFound.fetch_add(1, std::memory_order_relaxed);
                                         foundPayee = true;
                                         paymentOK = true;
                                         break;
@@ -7636,8 +7700,11 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
                                 }
                                 // if payee not found in mn list, check if the pubkey holds a 5K transaction
                                 if (!foundPayee) {
+                                    nCNValidationPayeeMissing.fetch_add(1, std::memory_order_relaxed);
+                                    nCNValidationFindCNPaymentEntered.fetch_add(1, std::memory_order_relaxed);
                                     if (FindCNPayment(payee, pindex)) {
                                         if (fDebug) printf("CheckBlock-POS() : WARNING: Payee was not found in MN list, but confirmed to hold collateral.\n");
+                                        nCNValidationPayeeFound.fetch_add(1, std::memory_order_relaxed);
                                         foundPayee = true;
                                     }
                                 }
@@ -7767,19 +7834,24 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
                                     data.hash = pindex->GetBlockHash();
                                     mn.payData.push_back(data);
                                     mn.SetPayRate(pindex->nHeight);
+                                    nCNValidationPayeeFound.fetch_add(1, std::memory_order_relaxed);
                                     foundPayee = true;
                                     paymentOK = true;
                                     break;
                                 } else if (payee == burnPayee) {
                                     printf("CheckBlock-POW() : Found collateralnode payment: %s INN to burn address.\n", FormatMoney(vtx[0].vout[i].nValue).c_str());
+                                    nCNValidationPayeeFound.fetch_add(1, std::memory_order_relaxed);
                                     foundPayee = true;
                                 }
                             }
 
                             // if payee not found in mn list, check if the pubkey holds a 5K transaction
                             if (!foundPayee) {
+                                nCNValidationPayeeMissing.fetch_add(1, std::memory_order_relaxed);
+                                nCNValidationFindCNPaymentEntered.fetch_add(1, std::memory_order_relaxed);
                                 if (FindCNPayment(payee, pindex)) {
                                     if (fDebug) printf("CheckBlock-POW() : WARNING: Payee was not found in MN list, but confirmed to hold collateral.\n");
+                                    nCNValidationPayeeFound.fetch_add(1, std::memory_order_relaxed);
                                     foundPayee = true;
                                 }
                             }
@@ -11945,7 +12017,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     {
         vector<CInv> vInv;
         vRecv >> vInv;
-        printf("received getdata (%" PRIszu" invsz)\n", vInv.size());
         if (vInv.size() > MAX_INV_SZ)
         {
             pfrom->Misbehaving(20);
