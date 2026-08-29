@@ -46,6 +46,7 @@ HEADERS += build/build.h \
            src/blockindex_accessor.h \
            src/blockindex_hashindex.h \
            src/fixed_blockindex_store.h \
+           src/blockindex_activeindex.h \
            src/bootstrap.h \
            src/bulletproof_ac.h \
            src/checkpoints.h \
@@ -529,6 +530,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/blockindex_accessor.cpp \
            src/blockindex_hashindex.cpp \
            src/fixed_blockindex_store.cpp \
+           src/blockindex_activeindex.cpp \
            src/bootstrap.cpp \
            src/smessage_stub.cpp \
            src/bulletproof_ac.cpp \
@@ -684,6 +686,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/test/blockindex_accessor_tests.cpp \
            src/test/fixed_blockindex_store_tests.cpp \
            src/test/blockindex_hashindex_tests.cpp \
+           src/test/blockindex_activeindex_tests.cpp \
            src/test/script_P2SH_tests.cpp \
            src/test/script_tests.cpp \
            src/test/sigopcount_tests.cpp \

@@ -392,6 +392,7 @@ OBJS= \
     obj/blockindex_accessor.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
+    obj/blockindex_activeindex.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 else
@@ -479,6 +480,7 @@ OBJS= \
     obj/blockindex_accessor.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
+    obj/blockindex_activeindex.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 endif
@@ -519,7 +521,8 @@ TEST_OBJS= \
     obj/test/invalidate_reconsider_tests.o \
     obj/test/blockindex_accessor_tests.o \
     obj/test/fixed_blockindex_store_tests.o \
-    obj/test/blockindex_hashindex_tests.o
+    obj/test/blockindex_hashindex_tests.o \
+    obj/test/blockindex_activeindex_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle check-cnpayment-guard release-check
 
