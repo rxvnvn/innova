@@ -4675,6 +4675,11 @@ bool TxnHashInSystem(CTxDB* ptxdb, uint256& txnHash)
 
 static CBlockIndex* pblockindexFBBHLast;
 
+void ClearFindBlockByHeightCache()
+{
+    pblockindexFBBHLast = NULL;
+}
+
 namespace {
 
 uint64_t gBlockIndexSkipStatCalls = 0;

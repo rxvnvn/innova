@@ -89,6 +89,8 @@ BlockIndexSnapshot LegacyBlockIndexAccessor::SnapshotFromIndex(const CBlockIndex
     out.nMint = pindex->nMint;
     out.nMoneySupply = pindex->nMoneySupply;
     out.nStakeModifier = pindex->nStakeModifier;
+    out.nStakeModifierTime = pindex->nStakeModifierTime;
+    out.nStakeModifierChecksum = pindex->nStakeModifierChecksum;
     out.prevoutStake = pindex->prevoutStake;
     out.nStakeTime = pindex->nStakeTime;
     out.hashProof = pindex->hashProof;
@@ -143,6 +145,15 @@ BlockIndexSnapshot LegacyBlockIndexAccessor::GetActiveByHeight(int height) const
     return SnapshotFromIndex(pindex);
 }
 
+BlockIndexSnapshot LegacyBlockIndexAccessor::GetNextActive(BlockIndexId id) const
+{
+    AssertLockHeld(cs_main);
+    const CBlockIndex* pindex = ResolveIdLocked(id);
+    if (pindex == NULL || pindex->pnext == NULL)
+        return BlockIndexSnapshot();
+    return SnapshotFromIndex(pindex->pnext);
+}
+
 BlockIndexSnapshot LegacyBlockIndexAccessor::GetTip() const
 {
     AssertLockHeld(cs_main);
@@ -174,4 +185,12 @@ BlockIndexSnapshot LegacyBlockIndexAccessor::FindFork(BlockIndexId a, BlockIndex
     const CBlockIndex* pa = ResolveIdLocked(a);
     const CBlockIndex* pb = ResolveIdLocked(b);
     return SnapshotFromIndex(FindForkLocked(pa, pb));
+}
+
+void ClearBlockIndexAccessorState()
+{
+    BlockIndexAccessorIdByHash().clear();
+    BlockIndexAccessorIndexById().clear();
+    BlockIndexAccessorIndexById().push_back(NULL);
+    BlockIndexAccessorNextId() = 1;
 }

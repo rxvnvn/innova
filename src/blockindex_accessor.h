@@ -44,6 +44,8 @@ struct BlockIndexSnapshot
     uint256 nChainTrust;
     bool fProofOfStake;
     bool fInMainChain;
+    uint64_t nStakeModifierTime;    // 0 = unset; O(1) modifier time cache
+    unsigned int nStakeModifierChecksum;
 
     BlockIndexSnapshot()
         : found(false),
@@ -69,7 +71,9 @@ struct BlockIndexSnapshot
           hashProof(0),
           nChainTrust(0),
           fProofOfStake(false),
-          fInMainChain(false)
+          fInMainChain(false),
+          nStakeModifierTime(0),
+          nStakeModifierChecksum(0)
     {
     }
 };
@@ -85,6 +89,7 @@ public:
     virtual BlockIndexSnapshot GetParent(BlockIndexId id) const = 0;
     virtual BlockIndexSnapshot GetAncestor(BlockIndexId id, int targetHeight) const = 0;
     virtual BlockIndexSnapshot GetActiveByHeight(int height) const = 0;
+    virtual BlockIndexSnapshot GetNextActive(BlockIndexId id) const = 0;
     virtual BlockIndexSnapshot GetTip() const = 0;
     virtual BlockIndexSnapshot FindFork(BlockIndexId a, BlockIndexId b) const = 0;
 };
@@ -100,6 +105,7 @@ public:
     virtual BlockIndexSnapshot GetParent(BlockIndexId id) const;
     virtual BlockIndexSnapshot GetAncestor(BlockIndexId id, int targetHeight) const;
     virtual BlockIndexSnapshot GetActiveByHeight(int height) const;
+    virtual BlockIndexSnapshot GetNextActive(BlockIndexId id) const;
     virtual BlockIndexSnapshot GetTip() const;
     virtual BlockIndexSnapshot FindFork(BlockIndexId a, BlockIndexId b) const;
 

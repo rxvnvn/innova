@@ -74,6 +74,20 @@ BlockIndexV2ReadStatus BlockIndexV2Reader::GetActiveByHeight(int h, BlockIndexSn
     if (h < manifest.committedTipHeight) { BlockIndexId nextId=BLOCK_INDEX_ID_INVALID; BlockIndexSnapshot next; if (!active.ReadEntry(h+1,&nextId,error) || nextId==0 || nextId>manifest.recordCount || GetRecordById(nextId,&next,error)!=BLOCK_INDEX_V2_READ_FOUND || next.height!=h+1 || next.hashPrev!=out->hash) { Fail(error,"active successor linkage mismatch"); return BLOCK_INDEX_V2_READ_CORRUPT; } }
     out->fInMainChain=true; Clear(error); return BLOCK_INDEX_V2_READ_FOUND;
 }
+
+BlockIndexV2ReadStatus BlockIndexV2Reader::GetNextActive(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const
+{
+    BlockIndexSnapshot s;
+    BlockIndexV2ReadStatus r = GetRecordById(id, &s, error);
+    if (r != BLOCK_INDEX_V2_READ_FOUND)
+        return r;
+    if (!s.fInMainChain || s.height >= manifest.committedTipHeight)
+    {
+        *out = BlockIndexSnapshot();
+        return BLOCK_INDEX_V2_READ_NOT_FOUND;
+    }
+    return GetActiveByHeight(s.height + 1, out, error);
+}
 BlockIndexV2ReadStatus BlockIndexV2Reader::GetParent(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const { BlockIndexSnapshot child; BlockIndexV2ReadStatus r=GetRecordById(id,&child,error); if(r!=BLOCK_INDEX_V2_READ_FOUND||!child.hasParent){if(r==BLOCK_INDEX_V2_READ_FOUND)*out=BlockIndexSnapshot();return r==BLOCK_INDEX_V2_READ_FOUND?BLOCK_INDEX_V2_READ_NOT_FOUND:r;} r=LookupByHash(child.hashPrev,out,error); if(r==BLOCK_INDEX_V2_READ_FOUND && out->hash!=child.hashPrev){Fail(error,"parent hash mismatch");return BLOCK_INDEX_V2_READ_CORRUPT;} return r; }
 BlockIndexV2ReadStatus BlockIndexV2Reader::GetAncestor(BlockIndexId id,int target,BlockIndexSnapshot*out,std::string*error)const { BlockIndexSnapshot s; BlockIndexV2ReadStatus r=GetRecordById(id,&s,error); if(r!=BLOCK_INDEX_V2_READ_FOUND||target>s.height){if(r==BLOCK_INDEX_V2_READ_FOUND)*out=BlockIndexSnapshot();return BLOCK_INDEX_V2_READ_NOT_FOUND;} BlockIndexId activeId=BLOCK_INDEX_ID_INVALID; if(active.ReadEntry(s.height,&activeId,error) && activeId==id) return GetActiveByHeight(target,out,error); while(s.height>target){r=GetParent(s.id,&s,error);if(r!=BLOCK_INDEX_V2_READ_FOUND)return r;}*out=s;return r; }
 BlockIndexV2ReadStatus BlockIndexV2Reader::FindFork(BlockIndexId a,BlockIndexId b,BlockIndexSnapshot*out,std::string*error)const { BlockIndexSnapshot x,y; BlockIndexV2ReadStatus r=GetRecordById(a,&x,error);if(r!=1)return r;r=GetRecordById(b,&y,error);if(r!=1)return r;while(x.height>y.height){r=GetParent(x.id,&x,error);if(r!=1)return r;}while(y.height>x.height){r=GetParent(y.id,&y,error);if(r!=1)return r;}while(x.hash!=y.hash){r=GetParent(x.id,&x,error);if(r!=1)return r;r=GetParent(y.id,&y,error);if(r!=1)return r;}*out=x;return BLOCK_INDEX_V2_READ_FOUND; }

@@ -54,6 +54,7 @@ public:
     BlockIndexV2ReadStatus GetRecordById(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus LookupByHash(const uint256& hash, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetActiveByHeight(int height, BlockIndexSnapshot* out, std::string* error) const;
+    BlockIndexV2ReadStatus GetNextActive(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetParent(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetAncestor(BlockIndexId id, int targetHeight, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus FindFork(BlockIndexId a, BlockIndexId b, BlockIndexSnapshot* out, std::string* error) const;

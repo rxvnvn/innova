@@ -579,6 +579,12 @@ bool ReconsiderBlock(const uint256& hash, std::string& strError);
 bool RecoverFromInvalidatedBestChain();
 // Test-only synchronization seam, NULL in production. Runs after frame extraction and cs_vRecvMsg release.
 extern void (*g_processMessagesPostExtractHook)();
+
+/** Clear the FindBlockByHeight internal cache (test helpers). */
+void ClearFindBlockByHeightCache();
+
+/** Clear LegacyBlockIndexAccessor static ID maps (test helpers). */
+void ClearBlockIndexAccessorState();
 bool ProcessMessages(CNode* pfrom, CCriticalBlock& recvLock,
                      unsigned int nBlockBurstDepth = 0);
 bool SendMessages(CNode* pto, bool fSendTrickle,
