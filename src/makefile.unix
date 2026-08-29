@@ -541,7 +541,8 @@ TEST_OBJS= \
     obj/test/blockindex_generation_lifecycle_tests.o \
     obj/test/blockindex_shadow_startup_tests.o \
     obj/test/blockindex_v2_reader_tests.o \
-    obj/test/dag_trust_restart_tests.o
+    obj/test/dag_trust_restart_tests.o \
+    obj/test/candidate_frontier_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle check-cnpayment-guard release-check innova-blockindex-builder
 

@@ -35,6 +35,7 @@
 #include "curvetree.h"
 #include "finality.h"
 #include "dag.h"
+#include "candidate_frontier.h"
 #include "hreg_registration.h"
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
@@ -9523,6 +9524,8 @@ static bool ActivateBestEligibleChain()
     CTxDB txdb;
     if (!block.SetBestChain(txdb, pindexCandidate))
         return error("ActivateBestEligibleChain() : SetBestChain failed");
+
+    ShadowCompareCandidateSelection();
     return true;
 }
 

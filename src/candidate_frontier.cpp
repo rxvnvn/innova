@@ -155,7 +155,25 @@ CBlockIndex* EvaluateCandidateFrontier()
             pindexCandidate = pindex;
     }
 
+    if (pindexCandidate == NULL)
+        return pindexBest;
     return pindexCandidate;
+}
+
+
+// ---------------------------------------------------------------------------
+// Update candidate tips — currently a full rebuild; incremental maintenance
+// can be added when performance profiling justifies it.
+// ---------------------------------------------------------------------------
+
+void UpdateCandidateTips(CBlockIndex* /*pindexOldTip*/,
+                         CBlockIndex* /*pindexNewTip*/)
+{
+    // Deterministic rebuild-on-evaluation: ShadowCompareCandidateSelection
+    // calls RebuildCandidateTips() before each comparison, so incremental
+    // mutation of mapCandidateTips is not required for correctness.
+    // When the frontier becomes authoritative (non-shadow), this function
+    // should incrementally update the tip set to avoid the O(N) rebuild.
 }
 
 
@@ -169,6 +187,10 @@ void ShadowCompareCandidateSelection()
         return;
 
     LOCK(cs_main);
+
+    // Rebuild candidate tips from current mapBlockIndex so the frontier
+    // is up-to-date with any recent chain changes.
+    RebuildCandidateTips();
 
     // --- Legacy full scan (inline) ---
     CBlockIndex* pindexLegacy = NULL;
