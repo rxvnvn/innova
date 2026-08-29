@@ -10,6 +10,7 @@
 // With the optional 4th arg "verify-only", the build is skipped and only the
 // massive differential + reopen against the existing <out_generation_dir> is run.
 #include "blockindex_generation_builder.h"
+#include "blockindex_generation_lifecycle.h"
 #include "main.h"
 #include "ui_interface.h"
 #include "checkpoints.h"
@@ -68,6 +69,72 @@ static void PrintDifferential(const BlockIndexDifferentialResult& r)
 
 int main(int argc, char** argv)
 {
+    // Lifecycle subcommands (see blockindex_generation_lifecycle.h).
+    //   validate <root> <generation>
+    //   publish  <root> <generation>
+    //   select   <root> <generation>
+    //   open     <root>          (OpenCurrent: resolve + validate selected)
+    //   current  <root>          (ReadCurrent only)
+    if (argc >= 2 && std::string(argv[1]) == "open")
+    {
+        if (argc < 3)
+        {
+            fprintf(stderr, "usage: %s open <root>\n", argv[0]);
+            return 2;
+        }
+        const std::string root = argv[2];
+        std::string err;
+        uint64_t sel = 0;
+        BlockIndexLifecycleStatus st = BlockIndexGenerationManager::OpenCurrent(root, &sel, &err);
+        fprintf(stdout, "[open] status=%d generation=%llu\n", (int)st, (unsigned long long)sel);
+        fflush(stdout);
+        return st == BLOCK_INDEX_LIFECYCLE_OK ? 0 : 1;
+    }
+    if (argc >= 2 && (std::string(argv[1]) == "validate" ||
+                      std::string(argv[1]) == "publish" ||
+                      std::string(argv[1]) == "select"))
+    {
+        if (argc < 4)
+        {
+            fprintf(stderr, "usage: %s %s <root> <generation>\n", argv[0], argv[1]);
+            return 2;
+        }
+        const std::string root = argv[2];
+        const uint64_t gen = (uint64_t)atoll(argv[3]);
+        std::string err;
+        BlockIndexLifecycleStatus st = BLOCK_INDEX_LIFECYCLE_ERROR;
+        if (std::string(argv[1]) == "validate")
+            st = BlockIndexGenerationManager::ValidateGeneration(root, gen, &err);
+        else if (std::string(argv[1]) == "publish")
+            st = BlockIndexGenerationManager::PublishGeneration(root, gen, &err);
+        else
+            st = BlockIndexGenerationManager::SelectGeneration(root, gen, &err);
+        fprintf(stdout, "[%s] generation=%llu status=%d %s\n", argv[1], (unsigned long long)gen,
+                (int)st, st == BLOCK_INDEX_LIFECYCLE_OK ? "OK" : err.c_str());
+        fflush(stdout);
+        return st == BLOCK_INDEX_LIFECYCLE_OK ? 0 : 1;
+    }
+    if (argc >= 2 && std::string(argv[1]) == "current")
+    {
+        if (argc < 3)
+        {
+            fprintf(stderr, "usage: %s current <root>\n", argv[0]);
+            return 2;
+        }
+        const std::string root = argv[2];
+        std::string err;
+        BlockIndexCurrentRecord cur;
+        BlockIndexLifecycleStatus st = BlockIndexGenerationManager::ReadCurrent(root, &cur, &err);
+        fprintf(stdout, "[current] status=%d", (int)st);
+        if (st == BLOCK_INDEX_LIFECYCLE_OK)
+            fprintf(stdout, " generation=%llu", (unsigned long long)cur.generation);
+        if (st != BLOCK_INDEX_LIFECYCLE_OK && !err.empty())
+            fprintf(stdout, " %s", err.c_str());
+        fprintf(stdout, "\n");
+        fflush(stdout);
+        return st == BLOCK_INDEX_LIFECYCLE_OK ? 0 : 1;
+    }
+
     if (argc < 4)
     {
         fprintf(stderr, "usage: %s <snapshot_leveldb_dir> <out_generation_dir> <generation_id> [verify-only]\n", argv[0]);
