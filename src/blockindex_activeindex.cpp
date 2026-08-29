@@ -377,6 +377,56 @@ bool BlockIndexActiveIndex::Append(BlockIndexId id, int32_t height, std::string*
     return true;
 }
 
+bool BlockIndexActiveIndex::AppendBatch(const std::vector<BlockIndexId>& ids, std::string* error)
+{
+    if (!open || !writable)
+        return SetError(error, "active index is not writable");
+    if (ids.empty())
+        return SetError(error, "empty batch active append");
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        if (ids[i] == BLOCK_INDEX_ID_INVALID)
+            return SetError(error, "active entry RecordId 0 is invalid");
+    }
+    if (physicalHeight == std::numeric_limits<int32_t>::max() - 1)
+        return SetError(error, "active height space exhausted");
+    if (ids.size() > (size_t)(std::numeric_limits<int32_t>::max() - physicalHeight))
+        return SetError(error, "active height range overflow");
+
+    const int32_t startHeight = (int32_t)(physicalHeight + 1);
+    uint64_t startOffset = 0;
+    if (!CheckedHeightToOffset(startHeight, &startOffset))
+        return SetError(error, "active append height overflow");
+
+    std::vector<unsigned char> bytes;
+    bytes.reserve(ids.size() * BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
+    for (size_t i = 0; i < ids.size(); ++i)
+    {
+        const BlockIndexId id = ids[i];
+        for (int b = 0; b < 8; ++b)
+            bytes.push_back((char)((id >> (8 * b)) & 0xff));
+    }
+
+    FILE* file = fopen(activePath.string().c_str(), "rb+");
+    if (!file)
+        return SetError(error, "append open failed: " + activePath.string());
+    if (fseeko(file, (off_t)startOffset, SEEK_SET) != 0)
+    {
+        fclose(file);
+        return SetError(error, "seek failed for active batch append");
+    }
+    if (fwrite(&bytes[0], 1, bytes.size(), file) != bytes.size())
+    {
+        fclose(file);
+        return SetError(error, "batch append write failed: " + activePath.string());
+    }
+    FileCommit(file); // single fsync
+    fclose(file);
+    physicalHeight = startHeight + (int32_t)ids.size() - 1;
+    ClearError(error);
+    return true;
+}
+
 bool BlockIndexActiveIndex::TruncateTo(int32_t height, std::string* error)
 {
     if (!open || !writable)

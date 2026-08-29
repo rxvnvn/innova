@@ -45,6 +45,10 @@ public:
     // Append requires the next height to be exactly physicalHeight + 1
     // (dense, no sparse mappings). id must be a non-zero RecordId.
     bool Append(BlockIndexId id, int32_t height, std::string* error);
+    // Batch dense append: appends entries for heights physicalHeight+1 ..
+    // physicalHeight+ids.size() with a SINGLE open + single fsync. Byte-identical
+    // to sequential Append calls.
+    bool AppendBatch(const std::vector<BlockIndexId>& ids, std::string* error);
     // TruncateTo keeps a dense prefix entries[0..height] (height >= -1) and
     // discards every entry above it. Used to isolate a reorg to the affected
     // active tail only.

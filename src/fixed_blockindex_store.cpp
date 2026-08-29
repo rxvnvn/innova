@@ -608,6 +608,53 @@ bool FixedBlockIndexStore::Append(const BlockIndexRecord& record, BlockIndexId* 
     return true;
 }
 
+bool FixedBlockIndexStore::AppendBatch(const std::vector<BlockIndexRecord>& records,
+                                       std::vector<BlockIndexId>* outIds,
+                                       std::string* error)
+{
+    if (!open || !writable)
+        return SetError(error, "store is not writable");
+    if (records.empty())
+        return SetError(error, "empty batch append");
+    if (physicalRecordCount == std::numeric_limits<uint64_t>::max())
+        return SetError(error, "record id space exhausted");
+    if (records.size() > std::numeric_limits<uint64_t>::max() - physicalRecordCount)
+        return SetError(error, "record id space exhausted by batch");
+
+    // Encode all records first (validates each), collecting the exact bytes.
+    std::vector<unsigned char> bytes;
+    bytes.reserve(records.size() * BLOCK_INDEX_RECORD_SIZE_V1);
+    for (size_t i = 0; i < records.size(); ++i)
+    {
+        std::vector<unsigned char> encoded;
+        if (!EncodeBlockIndexRecordV1(records[i], &encoded, error))
+            return false;
+        bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+    }
+
+    FILE* file = fopen(recordsPath.string().c_str(), "ab");
+    if (!file)
+        return SetError(error, "append open failed: " + recordsPath.string());
+    if (!bytes.empty() && fwrite(&bytes[0], 1, bytes.size(), file) != bytes.size())
+    {
+        fclose(file);
+        return SetError(error, "append write failed: " + recordsPath.string());
+    }
+    FileCommit(file); // single fsync for the whole batch
+    fclose(file);
+
+    if (outIds)
+        outIds->clear();
+    for (size_t i = 0; i < records.size(); ++i)
+    {
+        ++physicalRecordCount;
+        if (outIds)
+            outIds->push_back(physicalRecordCount);
+    }
+    ClearError(error);
+    return true;
+}
+
 bool FixedBlockIndexStore::Read(BlockIndexId id, BlockIndexRecord* out, std::string* error) const
 {
     if (!open)

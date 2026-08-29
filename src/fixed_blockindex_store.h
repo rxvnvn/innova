@@ -116,6 +116,13 @@ public:
     static bool OpenReadOnly(const std::string& dir, const FixedBlockIndexOpenOptions& options, FixedBlockIndexStore* out, std::string* error);
 
     bool Append(const BlockIndexRecord& record, BlockIndexId* outId, std::string* error);
+    // Batch append: appends many records with a SINGLE file open + single
+    // fsync, producing byte-identical records.dat bytes to N sequential Append
+    // calls (same codec). Records must be non-empty. outIds is sized == records
+    // and receives the assigned RecordId per input in order.
+    bool AppendBatch(const std::vector<BlockIndexRecord>& records,
+                     std::vector<BlockIndexId>* outIds,
+                     std::string* error);
     bool Read(BlockIndexId id, BlockIndexRecord* out, std::string* error) const;
     bool WriteManifest(const FixedBlockIndexManifest& manifest, std::string* error);
 

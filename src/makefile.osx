@@ -196,6 +196,7 @@ OBJS= \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
     obj/blockindex_activeindex.o \
+    obj/blockindex_generation_builder.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 
@@ -214,7 +215,8 @@ TEST_OBJS= \
     obj/test/blockindex_accessor_tests.o \
     obj/test/fixed_blockindex_store_tests.o \
     obj/test/blockindex_hashindex_tests.o \
-    obj/test/blockindex_activeindex_tests.o
+    obj/test/blockindex_activeindex_tests.o \
+    obj/test/blockindex_generation_builder_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp release-check
 
