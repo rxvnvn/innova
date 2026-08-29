@@ -64,6 +64,8 @@ public:
     bool IsLogicalReadOnly() const;
 
 private:
+    struct ReadHandle;
+    boost::shared_ptr<ReadHandle> readHandle;
     boost::filesystem::path dirPath;
     boost::filesystem::path activePath;
     uint64_t generation;

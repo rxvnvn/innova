@@ -12,6 +12,7 @@
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
 #include "blockindex_shadow_runtime.h"
+#include "blockindex_v2_reader.h"
 #include "main.h"
 #include "ui_interface.h"
 #include "checkpoints.h"
@@ -23,6 +24,7 @@
 
 #include <algorithm>
 #include <map>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -142,6 +144,81 @@ int main(int argc, char** argv)
         BlockIndexV2ShadowRuntime rt;
         std::string e;
         const BlockIndexV2ShadowState& st = rt.OpenShadow(cfg, &oracle, &e);
+
+        // A.8 real-scale differential: production pointer-free reader vs the
+        // static A.5 legacy source. This is offline; no live datadir is read.
+        uint64_t readerHash = 0, readerHeight = 0, readerParent = 0, readerAncestor = 0, readerSide = 0, readerMismatch = 0;
+        BlockIndexV2Reader reader;
+        BlockIndexV2ReaderOptions ro;
+        std::string readerError;
+        if (!reader.Open(root, ro, &readerError))
+        {
+            fprintf(stderr, "ERROR reader open: %s\n", readerError.c_str());
+            return 5;
+        }
+        const auto same = [](const BlockIndexSnapshot& a, const BlockIndexRecord& b) {
+            return a.found && a.hash == b.hash && a.hashPrev == b.hashPrev && a.height == b.height &&
+                   a.nFile == b.nFile && a.nBlockPos == b.nBlockPos && a.nFlags == b.nFlags &&
+                   a.nVersion == b.nVersion && a.nTime == b.nTime && a.nBits == b.nBits &&
+                   a.nNonce == b.nNonce && a.nMint == b.nMint && a.nMoneySupply == b.nMoneySupply &&
+                   a.nStakeModifier == b.nStakeModifier && a.prevoutStake == b.prevoutStake &&
+                   a.nStakeTime == b.nStakeTime && a.hashProof == b.hashProof;
+        };
+        uint64_t rng = 0xA8D1FF5EEDULL;
+        const auto next = [&rng]() { rng = rng * 6364136223846793005ULL + 1442695040888963407ULL; return rng; };
+        for (uint64_t i = 0; i < 10000; ++i)
+        {
+            const BlockIndexGenerationSourceRecord& src = source.records[(size_t)(next() % source.records.size())];
+            BlockIndexSnapshot got; readerError.clear();
+            if (reader.LookupByHash(src.hash, &got, &readerError) != BLOCK_INDEX_V2_READ_FOUND || !same(got, src.record)) ++readerMismatch;
+            ++readerHash;
+        }
+        for (uint64_t i = 0; i < 10000; ++i)
+        {
+            const int h = (int)(next() % oracle.active.size());
+            const BlockIndexRecord& src = oracle.active[h]->record;
+            BlockIndexSnapshot got; readerError.clear();
+            if (reader.GetActiveByHeight(h, &got, &readerError) != BLOCK_INDEX_V2_READ_FOUND || !same(got, src)) ++readerMismatch;
+            ++readerHeight;
+        }
+        for (uint64_t i = 0; i < 10000; ++i)
+        {
+            const BlockIndexGenerationSourceRecord& src = source.records[(size_t)(next() % source.records.size())];
+            if (src.record.hashPrev == uint256(0)) continue;
+            BlockIndexSnapshot child, parent; readerError.clear();
+            if (reader.LookupByHash(src.hash, &child, &readerError) != BLOCK_INDEX_V2_READ_FOUND ||
+                reader.GetParent(child.id, &parent, &readerError) != BLOCK_INDEX_V2_READ_FOUND || parent.hash != src.record.hashPrev) ++readerMismatch;
+            ++readerParent;
+        }
+        const int distances[] = {1,10,100,1000,10000,100000};
+        for (uint64_t i = 0; i < 10000; ++i)
+        {
+            const int h = (int)(next() % oracle.active.size());
+            const int distance = distances[i % 6];
+            const int target = h > distance ? h - distance : 0;
+            const BlockIndexRecord& expected = oracle.active[target]->record;
+            BlockIndexSnapshot tip, ancestor; readerError.clear();
+            if (reader.GetActiveByHeight(h, &tip, &readerError) != BLOCK_INDEX_V2_READ_FOUND ||
+                reader.GetAncestor(tip.id, target, &ancestor, &readerError) != BLOCK_INDEX_V2_READ_FOUND || !same(ancestor, expected)) ++readerMismatch;
+            ++readerAncestor;
+        }
+        std::set<uint256> activeHashes; for (size_t i=0;i<oracle.active.size();++i) activeHashes.insert(oracle.active[i]->hash);
+        for (size_t i = 0; i < source.records.size() && readerSide < 10000; ++i)
+        {
+            const BlockIndexGenerationSourceRecord& src = source.records[i];
+            if (activeHashes.count(src.hash)) continue;
+            BlockIndexSnapshot side, parent; readerError.clear();
+            if (reader.LookupByHash(src.hash, &side, &readerError) != BLOCK_INDEX_V2_READ_FOUND || !same(side, src.record)) ++readerMismatch;
+            else if (src.record.hashPrev != uint256(0) &&
+                     (reader.GetParent(side.id, &parent, &readerError) != BLOCK_INDEX_V2_READ_FOUND || parent.hash != src.record.hashPrev)) ++readerMismatch;
+            ++readerSide;
+        }
+        fprintf(stdout, "[reader] generation=%llu hashes=%llu heights=%llu parents=%llu ancestors=%llu side=%llu mismatches=%llu cache_entries=%llu cache_bytes=%llu\n",
+                (unsigned long long)reader.Generation(), (unsigned long long)readerHash, (unsigned long long)readerHeight,
+                (unsigned long long)readerParent, (unsigned long long)readerAncestor, (unsigned long long)readerSide,
+                (unsigned long long)readerMismatch, (unsigned long long)reader.CacheStats().entries,
+                (unsigned long long)reader.CacheStats().bytesEstimated);
+        if (readerMismatch != 0) return 6;
         fprintf(stdout, "[shadow] enabled=%d status=%d generation=%llu\n",
                 st.enabled, st.status, (unsigned long long)st.generation);
         fprintf(stdout, "[shadow] compatibility=%d tip_height=%d legacy_tip=%d lag=%d\n",

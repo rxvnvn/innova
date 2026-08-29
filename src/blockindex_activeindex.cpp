@@ -206,6 +206,14 @@ bool DecodeBlockIndexActiveEntry(const char* data, size_t size, BlockIndexId* ou
     return true;
 }
 
+struct BlockIndexActiveIndex::ReadHandle
+{
+    FILE* file;
+    CCriticalSection cs;
+    explicit ReadHandle(FILE* f) : file(f) {}
+    ~ReadHandle() { if (file) fclose(file); }
+};
+
 BlockIndexActiveIndex::BlockIndexActiveIndex()
     : generation(0),
       physicalHeight(-1),
@@ -302,6 +310,13 @@ bool BlockIndexActiveIndex::OpenExisting(uint64_t expectedGeneration, bool makeW
     uint64_t fileSize = 0;
     if (!LoadHeader(&fileSize, error))
         return false;
+    if (!makeWritable)
+    {
+        FILE* readFile = fopen(activePath.string().c_str(), "rb");
+        if (!readFile)
+            return SetError(error, "persistent active read open failed: " + activePath.string());
+        readHandle.reset(new ReadHandle(readFile));
+    }
     ClearError(error);
     return true;
 }
@@ -472,17 +487,24 @@ bool BlockIndexActiveIndex::ReadEntry(int32_t height, BlockIndexId* outId, std::
     uint64_t offset = 0;
     if (!CheckedHeightToOffset(height, &offset))
         return SetError(error, "active entry offset overflow");
-    FILE* file = fopen(activePath.string().c_str(), "rb");
-    if (!file)
-        return SetError(error, "read open failed: " + activePath.string());
-    if (fseeko(file, (off_t)offset, SEEK_SET) != 0)
+    if (!readHandle)
     {
+        // Writable builders/reorg editors deliberately do not retain a read fd;
+        // preserve their legacy per-call read behavior.
+        FILE* file = fopen(activePath.string().c_str(), "rb");
+        if (!file) return SetError(error, "read open failed: " + activePath.string());
+        if (fseeko(file, (off_t)offset, SEEK_SET) != 0) { fclose(file); return SetError(error, "seek failed for active entry read"); }
+        std::string bytes(BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, '\0');
+        const size_t n = fread(&bytes[0], 1, bytes.size(), file);
         fclose(file);
-        return SetError(error, "seek failed for active entry read");
+        if (n != bytes.size()) return SetError(error, "short active entry read");
+        return DecodeBlockIndexActiveEntry(bytes.data(), bytes.size(), outId, error);
     }
+    LOCK(readHandle->cs);
+    if (fseeko(readHandle->file, (off_t)offset, SEEK_SET) != 0)
+        return SetError(error, "seek failed for active entry read");
     std::string bytes(BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, '\0');
-    const size_t n = fread(&bytes[0], 1, bytes.size(), file);
-    fclose(file);
+    const size_t n = fread(&bytes[0], 1, bytes.size(), readHandle->file);
     if (n != bytes.size())
         return SetError(error, "short active entry read");
     return DecodeBlockIndexActiveEntry(bytes.data(), bytes.size(), outId, error);

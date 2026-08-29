@@ -504,6 +504,7 @@ HEADERS += src/qt/bitcoingui.h \
     src/blockindex_generation_lifecycle.h \
     src/blockindex_shadow_runtime.h \
     src/blockindex_shadow_startup.h \
+    src/blockindex_v2_reader.h \
     src/checkpoints.h \
     src/compat.h \
     src/coincontrol.h \
@@ -675,6 +676,7 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/blockindex_generation_lifecycle.cpp \
     src/blockindex_shadow_runtime.cpp \
     src/blockindex_shadow_startup.cpp \
+    src/blockindex_v2_reader.cpp \
     src/smessage_stub.cpp \
     src/net.cpp \
     src/checkpoints.cpp \

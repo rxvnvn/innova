@@ -51,6 +51,7 @@ HEADERS += build/build.h \
            src/blockindex_generation_lifecycle.h \
            src/blockindex_shadow_runtime.h \
            src/blockindex_shadow_startup.h \
+           src/blockindex_v2_reader.h \
            src/bootstrap.h \
            src/bulletproof_ac.h \
            src/checkpoints.h \
@@ -539,6 +540,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/blockindex_generation_lifecycle.cpp \
            src/blockindex_shadow_runtime.cpp \
            src/blockindex_shadow_startup.cpp \
+           src/blockindex_v2_reader.cpp \
            src/bootstrap.cpp \
            src/smessage_stub.cpp \
            src/bulletproof_ac.cpp \
@@ -699,6 +701,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/test/blockindex_generation_builder_tests.cpp \
            src/test/blockindex_generation_lifecycle_tests.cpp \
            src/test/blockindex_shadow_startup_tests.cpp \
+           src/test/blockindex_v2_reader_tests.cpp \
            src/test/script_P2SH_tests.cpp \
            src/test/script_tests.cpp \
            src/test/sigopcount_tests.cpp \

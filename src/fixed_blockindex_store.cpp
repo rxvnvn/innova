@@ -394,6 +394,15 @@ bool DecodeBlockIndexRecordV1(const unsigned char* data, size_t size, BlockIndex
     return true;
 }
 
+struct FixedBlockIndexStore::ReadHandle
+{
+    FILE* file;
+    uint64_t fileSize;
+    CCriticalSection cs;
+    ReadHandle(FILE* f, uint64_t size) : file(f), fileSize(size) {}
+    ~ReadHandle() { if (file) fclose(file); }
+};
+
 FixedBlockIndexStore::FixedBlockIndexStore()
     : generation(0),
       physicalRecordCount(0),
@@ -572,6 +581,10 @@ bool FixedBlockIndexStore::OpenReadOnly(const std::string& dir, const FixedBlock
         return SetError(error, "MANIFEST is not COMPLETE");
     if (!store.ValidateCommittedRegion(fileSize, error))
         return false;
+    FILE* readFile = fopen(store.recordsPath.string().c_str(), "rb");
+    if (!readFile)
+        return SetError(error, "persistent read open failed: " + store.recordsPath.string());
+    store.readHandle.reset(new ReadHandle(readFile, fileSize));
     *out = store;
     ClearError(error);
     return true;
@@ -669,24 +682,19 @@ bool FixedBlockIndexStore::Read(BlockIndexId id, BlockIndexRecord* out, std::str
     uint64_t offset = 0;
     if (!CheckedAddMul(BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, id - 1, BLOCK_INDEX_RECORD_SIZE_V1, &offset))
         return SetError(error, "record offset overflow");
-    const uint64_t fileSize = boost::filesystem::file_size(recordsPath);
     uint64_t recordEnd = 0;
     if (!CheckedAddMul(offset, 1, BLOCK_INDEX_RECORD_SIZE_V1, &recordEnd))
         return SetError(error, "record end overflow");
-    if (fileSize < recordEnd)
+    if (!readHandle)
+        return SetError(error, "persistent read handle missing");
+    if (readHandle->fileSize < recordEnd)
         return SetError(error, "truncated record bytes");
 
-    FILE* file = fopen(recordsPath.string().c_str(), "rb");
-    if (!file)
-        return SetError(error, "read open failed: " + recordsPath.string());
-    if (fseeko(file, (off_t)offset, SEEK_SET) != 0)
-    {
-        fclose(file);
+    LOCK(readHandle->cs);
+    if (fseeko(readHandle->file, (off_t)offset, SEEK_SET) != 0)
         return SetError(error, "seek failed for record read");
-    }
     std::vector<unsigned char> bytes(BLOCK_INDEX_RECORD_SIZE_V1, 0);
-    const size_t n = fread(&bytes[0], 1, bytes.size(), file);
-    fclose(file);
+    const size_t n = fread(&bytes[0], 1, bytes.size(), readHandle->file);
     if (n != bytes.size())
         return SetError(error, "short record read");
     return DecodeBlockIndexRecordV1(&bytes[0], bytes.size(), out, error);

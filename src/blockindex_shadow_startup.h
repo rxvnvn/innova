@@ -2,6 +2,7 @@
 #define INNOVA_BLOCKINDEX_SHADOW_STARTUP_H
 
 #include "blockindex_shadow_runtime.h"
+#include "blockindex_v2_reader.h"
 
 #include <string>
 
@@ -35,5 +36,24 @@ BlockIndexV2ShadowState GetBlockIndexV2ShadowState();
 // Cheap read-only revalidation: returns whether the shadow tip is still on the
 // current legacy active chain.
 bool RevalidateBlockIndexV2ShadowTip();
+
+// A.8 retained-reader integration. After a READY open, the startup layer retains
+// exactly one read-only BlockIndexV2Reader bound to the validated generation, so
+// the diagnostic RPC does NOT reopen the store per call. The reader is never
+// authoritative (authoritative stays false) and never consumes cs_main.
+//
+// Retain the single shadow reader at <root> (opens the CURRENT-selected
+// generation). Replaces any previously retained reader. Returns true and a
+// usable reader on success; false and unchanged on failure.
+bool RetainBlockIndexV2ShadowReader(const std::string& root, std::string* error);
+
+// Accessor for the single retained reader, or NULL when not retained (disabled /
+// not READY). The returned object is bound to the generation it opened and does
+// not auto-switch if CURRENT changes.
+const BlockIndexV2Reader* GetBlockIndexV2ShadowReader();
+
+// Cache statistics of the retained reader (zeroed when none retained). Used by
+// the diagnostic RPC to report bounded cache state without reopening.
+BlockIndexV2ReaderCacheStats GetBlockIndexV2ShadowReaderCacheStats();
 
 #endif

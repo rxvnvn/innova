@@ -1,12 +1,14 @@
 #include "blockindex_shadow_startup.h"
 
 #include "blockindex_shadow_runtime.h"
+#include "blockindex_v2_reader.h"
 #include "main.h"
 #include "sync.h"
 #include "util.h"
 
 #include <stdio.h>
 #include <string>
+#include <memory>
 
 namespace {
 
@@ -14,6 +16,11 @@ CCriticalSection cs_shadowState;
 BlockIndexV2ShadowState g_shadowState;      // final/known shadow state
 BlockIndexV2ShadowRuntime g_shadowRuntime;  // holds the last open result
 bool g_shadowOpened = false;
+
+// A.8: exactly one retained read-only reader bound to the READY generation.
+// The reader is not movable/copyable (it owns CCriticalSection + handles), so it
+// is heap-allocated once. NULL until a READY generation is retained.
+std::unique_ptr<BlockIndexV2Reader> g_shadowReader;
 
 } // namespace
 
@@ -122,13 +129,33 @@ const BlockIndexV2ShadowState& TryOpenBlockIndexV2Shadow()
     printf("BLOCKINDEX_V2_SHADOW authoritative=NO\n");
     printf("BLOCKINDEX_V2_SHADOW status=%d\n", g_shadowState.status);
 
-    if (g_shadowState.structuralValidationOk &&
+    const bool ready = g_shadowState.structuralValidationOk &&
         (g_shadowState.compatibility == BLOCK_INDEX_SHADOW_COMPAT_EXACT ||
          g_shadowState.compatibility == BLOCK_INDEX_SHADOW_COMPAT_ANCESTOR) &&
-        g_shadowState.sampleMismatches == 0)
+        g_shadowState.sampleMismatches == 0;
+
+    if (ready)
         printf("BLOCKINDEX_V2_SHADOW status=READY\n");
     else
         printf("BLOCKINDEX_V2_SHADOW status=ERROR last_error=%s\n", g_shadowState.lastError.c_str());
+
+    if (ready)
+    {
+        // A.8: retain exactly one reader on the validated, CURRENT-selected
+        // generation so the diagnostic RPC never reopens the store per call.
+        // Reader is read-only, authoritative=false, consumes no cs_main.
+        std::string readerErr;
+        bool retained = RetainBlockIndexV2ShadowReader(root, &readerErr);
+        if (retained)
+            printf("BLOCKINDEX_V2_SHADOW reader_retained=1 generation=%llu\n",
+                   (unsigned long long)g_shadowReader->Generation());
+        else
+            printf("BLOCKINDEX_V2_SHADOW reader_retain_failed error=%s\n", readerErr.c_str());
+    }
+    else
+    {
+        g_shadowReader.reset();
+    }
 
     g_shadowOpened = true;
 
@@ -151,4 +178,36 @@ bool RevalidateBlockIndexV2ShadowTip()
         return false;
     LegacyBlockIndexShadowOracle legacy;
     return g_shadowRuntime.RevalidateTipOnActiveChain(&legacy);
+}
+
+bool RetainBlockIndexV2ShadowReader(const std::string& root, std::string* error)
+{
+    if (error) error->clear();
+    LOCK(cs_shadowState);
+    std::unique_ptr<BlockIndexV2Reader> reader(new BlockIndexV2Reader());
+    BlockIndexV2ReaderOptions options;   // single shared 64 MiB bounded LRU default
+    std::string readerErr;
+    if (!reader->Open(root, options, &readerErr))
+    {
+        if (error) *error = readerErr;
+        return false;
+    }
+    // Replace any prior retained reader: exactly one is retained at a time.
+    g_shadowReader.swap(reader);
+    return true;
+}
+
+const BlockIndexV2Reader* GetBlockIndexV2ShadowReader()
+{
+    LOCK(cs_shadowState);
+    return g_shadowReader.get();
+}
+
+BlockIndexV2ReaderCacheStats GetBlockIndexV2ShadowReaderCacheStats()
+{
+    LOCK(cs_shadowState);
+    BlockIndexV2ReaderCacheStats stats;
+    if (g_shadowReader && g_shadowReader->IsOpen())
+        stats = g_shadowReader->CacheStats();
+    return stats;
 }

@@ -40,6 +40,25 @@ json_spirit::Value getblockindexv2info(const json_spirit::Array& params, bool fH
     obj.push_back(json_spirit::Pair("validation_ms", st.validationDurationMs));
     if (!st.lastError.empty())
         obj.push_back(json_spirit::Pair("last_error", st.lastError));
+
+    // A.8: if exactly one read-only reader is retained (READY), report its
+    // bounded cache statistics. Narrow: omitted entirely when no reader is
+    // retained, so disabled / non-READY output is unchanged.
+    const BlockIndexV2Reader* reader = GetBlockIndexV2ShadowReader();
+    obj.push_back(json_spirit::Pair("reader_retained", reader != NULL));
+    if (reader)
+    {
+        const BlockIndexV2ReaderCacheStats cache = GetBlockIndexV2ShadowReaderCacheStats();
+        obj.push_back(json_spirit::Pair("reader_generation", (boost::uint64_t)reader->Generation()));
+        obj.push_back(json_spirit::Pair("reader_cache_capacity_bytes", (boost::uint64_t)cache.capacityBytes));
+        obj.push_back(json_spirit::Pair("reader_cache_entries", (boost::uint64_t)cache.entries));
+        obj.push_back(json_spirit::Pair("reader_cache_hits", (boost::uint64_t)cache.hits));
+        obj.push_back(json_spirit::Pair("reader_cache_misses", (boost::uint64_t)cache.misses));
+        obj.push_back(json_spirit::Pair("reader_cache_evictions", (boost::uint64_t)cache.evictions));
+        obj.push_back(json_spirit::Pair("reader_cache_bytes_estimated", (boost::uint64_t)cache.bytesEstimated));
+        obj.push_back(json_spirit::Pair("reader_current_selection_changed",
+                                        reader->CurrentSelectionChanged(NULL)));
+    }
     return obj;
 }
 

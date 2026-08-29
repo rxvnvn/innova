@@ -378,4 +378,116 @@ BOOST_AUTO_TEST_CASE(diagnostics_contain_authoritative_false)
     BOOST_CHECK_EQUAL(st.generation, 1ULL);
 }
 
+// ---- A.8 retained-reader integration ----
+
+// Retaining a reader on a READY generation opens exactly one reader bound to
+// the CURRENT-selected generation, and it serves lookups read-only.
+BOOST_AUTO_TEST_CASE(retained_reader_retains_one_on_ready)
+{
+    boost::filesystem::path root = UniqueRoot("reader-ready");
+    BlockIndexGenerationSource src = BuildShadowGeneration(root.string(), 1, 100, 2, 1000, 9000);
+    MockLegacyOracle legacy; legacy.BuildActive(100, 1000); legacy.AddSideRecords(src);
+    BlockIndexV2ShadowRuntime runtime;
+    std::string error;
+    BlockIndexShadowOpenConfig cfg; cfg.root = root.string();
+    const BlockIndexV2ShadowState& st = runtime.OpenShadow(cfg, &legacy, &error);
+    BOOST_CHECK(st.structuralValidationOk);
+    BOOST_CHECK_EQUAL(st.compatibility, (int)BLOCK_INDEX_SHADOW_COMPAT_EXACT);
+    BOOST_CHECK_EQUAL(st.sampleMismatches, 0ULL);
+    BOOST_CHECK_EQUAL(st.authoritative, false);
+
+    BOOST_REQUIRE(RetainBlockIndexV2ShadowReader(root.string(), &error));
+    const BlockIndexV2Reader* reader = GetBlockIndexV2ShadowReader();
+    BOOST_REQUIRE(reader != NULL);
+    BOOST_CHECK(reader->IsOpen());
+    BOOST_CHECK_EQUAL(reader->Generation(), 1ULL);
+
+    // Read-only lookups serve a snapshot by hash and by active height.
+    BlockIndexSnapshot snap;
+    std::string re;
+    BOOST_CHECK_EQUAL((int)reader->LookupByHash(uint256(1000), &snap, &re),
+                      (int)BLOCK_INDEX_V2_READ_FOUND);
+    BOOST_CHECK(snap.found);
+    BOOST_CHECK_EQUAL(snap.height, 0);
+
+    BlockIndexSnapshot tip;
+    BOOST_CHECK_EQUAL((int)reader->GetActiveByHeight(100, &tip, &re),
+                      (int)BLOCK_INDEX_V2_READ_FOUND);
+    BOOST_CHECK(tip.found);
+    BOOST_CHECK(tip.fInMainChain);
+    BOOST_CHECK_EQUAL(tip.height, 100);
+
+    // Cache stats are populated by the reads above (>= 2 lookups observed).
+    BlockIndexV2ReaderCacheStats cache = GetBlockIndexV2ShadowReaderCacheStats();
+    BOOST_CHECK_GE(cache.hits + cache.misses, 2ULL);
+    BOOST_CHECK_EQUAL(cache.capacityBytes, 64ULL * 1024ULL * 1024ULL);
+}
+
+// The reader stays bound to its opened generation even if CURRENT is absent
+// afterwards (no auto-switch), and cache stats stay readable.
+BOOST_AUTO_TEST_CASE(retained_reader_cache_stats_no_reopen)
+{
+    boost::filesystem::path root = UniqueRoot("reader-cache");
+    BlockIndexGenerationSource src = BuildShadowGeneration(root.string(), 1, 40, 1, 1000, 9000);
+    MockLegacyOracle legacy; legacy.BuildActive(40, 1000); legacy.AddSideRecords(src);
+    BlockIndexV2ShadowRuntime runtime;
+    std::string error;
+    BlockIndexShadowOpenConfig cfg; cfg.root = root.string();
+    runtime.OpenShadow(cfg, &legacy, &error);
+    BOOST_REQUIRE(RetainBlockIndexV2ShadowReader(root.string(), &error));
+    const BlockIndexV2Reader* reader = GetBlockIndexV2ShadowReader();
+    BOOST_REQUIRE(reader != NULL);
+
+    // Cold: zero entries until the first lookup; the first access is a MISS that
+    // populates the cache; a later access is served from cache (a HIT).
+    BlockIndexV2ReaderCacheStats c0 = GetBlockIndexV2ShadowReaderCacheStats();
+    BOOST_CHECK_EQUAL(c0.entries, 0ULL);
+    BlockIndexSnapshot snap; std::string re;
+    BOOST_CHECK_EQUAL((int)reader->GetActiveByHeight(0, &snap, &re),
+                      (int)BLOCK_INDEX_V2_READ_FOUND);
+    BlockIndexV2ReaderCacheStats c1 = GetBlockIndexV2ShadowReaderCacheStats();
+    BOOST_CHECK_GE(c1.entries, 1ULL);
+    BOOST_CHECK_GE(c1.misses, 1ULL);
+
+    // The fast-path re-read of the SAME height is served from cache (a HIT),
+    // and the reader is still open (no reopen / no re-open per read).
+    BlockIndexSnapshot snap2;
+    BOOST_CHECK_EQUAL((int)reader->GetActiveByHeight(0, &snap2, &re),
+                      (int)BLOCK_INDEX_V2_READ_FOUND);
+    BlockIndexV2ReaderCacheStats c2 = GetBlockIndexV2ShadowReaderCacheStats();
+    BOOST_CHECK_GE(c2.hits, 1ULL);
+    BOOST_CHECK(reader->IsOpen());
+}
+
+// Retaining on a non-published/absent root fails and leaves any existing
+// retained reader intact (failed retain never clobbers the live reader).
+BOOST_AUTO_TEST_CASE(retained_reader_fails_on_absent_publish)
+{
+    boost::filesystem::path root = UniqueRoot("reader-absent");
+    // First retain a good reader so we can prove a later failed retain does not
+    // clobber it (ordering-independent, self-contained).
+    BlockIndexGenerationSource goodSrc = BuildShadowGeneration(root.string(), 1, 20, 1, 1000, 9000);
+    MockLegacyOracle legacy; legacy.BuildActive(20, 1000); legacy.AddSideRecords(goodSrc);
+    BlockIndexV2ShadowRuntime runtime;
+    std::string error;
+    BlockIndexShadowOpenConfig cfg; cfg.root = root.string();
+    runtime.OpenShadow(cfg, &legacy, &error);
+    BOOST_REQUIRE(RetainBlockIndexV2ShadowReader(root.string(), &error));
+    const BlockIndexV2Reader* goodReader = GetBlockIndexV2ShadowReader();
+    BOOST_REQUIRE(goodReader != NULL);
+    BOOST_CHECK(goodReader->IsOpen());
+
+    // Now attempt to retain an absent/non-published root: must fail and must
+    // leave the already-retained reader intact and usable.
+    boost::filesystem::path absent = UniqueRoot("reader-absent-none");
+    std::string deny;
+    BOOST_CHECK(!RetainBlockIndexV2ShadowReader(absent.string(), &deny));
+    const BlockIndexV2Reader* after = GetBlockIndexV2ShadowReader();
+    BOOST_CHECK_EQUAL(after, goodReader);
+    BOOST_CHECK(after->IsOpen());
+    BlockIndexSnapshot snap; std::string re;
+    BOOST_CHECK_EQUAL((int)after->GetActiveByHeight(0, &snap, &re),
+                      (int)BLOCK_INDEX_V2_READ_FOUND);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

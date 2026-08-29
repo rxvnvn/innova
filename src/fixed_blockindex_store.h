@@ -4,6 +4,8 @@
 #include "blockindex_accessor.h"
 
 #include <boost/filesystem/path.hpp>
+#include <boost/shared_ptr.hpp>
+#include "sync.h"
 #include <stdint.h>
 #include <string>
 #include <vector>
@@ -131,6 +133,8 @@ public:
     const FixedBlockIndexManifest& GetManifest() const;
 
 private:
+    struct ReadHandle;
+    boost::shared_ptr<ReadHandle> readHandle;
     boost::filesystem::path dirPath;
     boost::filesystem::path recordsPath;
     boost::filesystem::path manifestPath;
