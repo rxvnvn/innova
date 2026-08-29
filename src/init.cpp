@@ -26,6 +26,7 @@
 #include "pinglifecycletrace.h"
 #include "headersservededup.h"
 #include "getblocksservedinvzero.h"
+#include "blockindex_shadow_startup.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -1478,6 +1479,25 @@ bool AppInit2()
         return false;
     };
     printf(" block index %15" PRId64"ms\n", GetTimeMillis() - nStart);
+
+    // ---- Phase A.7: optional read-only Block Index V2 shadow open ----
+    // Runs only after the authoritative legacy block index is loaded (so legacy
+    // tip/height/hash lookups are available). SHADOW ONLY — never influences
+    // chain selection/validation/consensus. Non-strict by default.
+    {
+        const BlockIndexV2ShadowState& v2 = TryOpenBlockIndexV2Shadow();
+        // In strict mode (-blockindexv2shadowstrict=1), a failed/absent-but-required
+        // shadow fails startup. Default (non-strict) never fails legacy startup.
+        const bool shadowRequired = GetBoolArg("-blockindexv2shadowstrict", false);
+        if (shadowRequired && !v2.enabled)
+            return InitError(_("Block Index V2 shadow required (-blockindexv2shadowstrict) but not configured"));
+        if (shadowRequired &&
+            !(v2.structuralValidationOk &&
+              (v2.compatibility == BLOCK_INDEX_SHADOW_COMPAT_EXACT ||
+               v2.compatibility == BLOCK_INDEX_SHADOW_COMPAT_ANCESTOR) &&
+              v2.sampleMismatches == 0))
+            return InitError(_("Block Index V2 shadow failed structural/compatibility validation (strict mode)"));
+    }
 
     //Create Innova Name index - this must happen before ReacceptWalletTransactions()
     uiInterface.InitMessage(_("Loading name index..."));

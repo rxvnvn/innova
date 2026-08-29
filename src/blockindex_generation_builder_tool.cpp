@@ -11,6 +11,7 @@
 // massive differential + reopen against the existing <out_generation_dir> is run.
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
+#include "blockindex_shadow_runtime.h"
 #include "main.h"
 #include "ui_interface.h"
 #include "checkpoints.h"
@@ -19,6 +20,11 @@
 
 #include <boost/filesystem.hpp>
 #include <stdio.h>
+
+#include <algorithm>
+#include <map>
+#include <string>
+#include <vector>
 
 // Globals required to link the shared engine OBJS (mirrors test_innova.cpp).
 CWallet* pwalletMain;
@@ -75,6 +81,80 @@ int main(int argc, char** argv)
     //   select   <root> <generation>
     //   open     <root>          (OpenCurrent: resolve + validate selected)
     //   current  <root>          (ReadCurrent only)
+    //   shadow   <snapshot_leveldb_dir> <lifecycle_root>
+    //            (real-scale A.7 shadow open: legacy truth from the source
+    //             snapshot, shadow from the CURRENT-selected generation)
+    if (argc >= 3 && std::string(argv[1]) == "shadow")
+    {
+        const std::string snapshotDir = argv[2];
+        const std::string root = argv[3];
+        // Read the legacy truth.
+        BlockIndexGenerationSource source;
+        std::string err;
+        if (!ReadLegacyBlockIndexSource(snapshotDir, &source, &err))
+        {
+            fprintf(stderr, "ERROR reading snapshot: %s\n", err.c_str());
+            return 4;
+        }
+        // Legacy oracle seeded from the source (active chain by hashBestChain +
+        // hashPrev, all records indexed by hash).
+        struct SourceOracle : BlockIndexShadowLegacyOracle
+        {
+            BlockIndexGenerationSource src;
+            std::vector<const BlockIndexGenerationSourceRecord*> active;
+            std::map<uint256, const BlockIndexGenerationSourceRecord*> byHash;
+            virtual int GetLegacyTipHeight() { return active.empty() ? -1 : active.back()->record.height; }
+            virtual bool GetLegacyActiveRecord(int height, BlockIndexRecord* out)
+            {
+                if (height < 0 || height >= (int)active.size()) return false;
+                *out = active[height]->record;
+                return true;
+            }
+            virtual bool GetLegacyRecordByHash(const uint256& hash, BlockIndexRecord* out)
+            {
+                std::map<uint256, const BlockIndexGenerationSourceRecord*>::iterator it = byHash.find(hash);
+                if (it == byHash.end()) return false;
+                *out = it->second->record;
+                return true;
+            }
+        } oracle;
+        oracle.src = source;
+        for (size_t i = 0; i < source.records.size(); ++i)
+            oracle.byHash[source.records[i].hash] = &source.records[i];
+        {
+            std::vector<const BlockIndexGenerationSourceRecord*> byH;
+            uint256 cur = source.hashBestChain;
+            while (true)
+            {
+                std::map<uint256, const BlockIndexGenerationSourceRecord*>::iterator it = oracle.byHash.find(cur);
+                if (it == oracle.byHash.end()) { fprintf(stderr, "ERROR: best-chain record missing\n"); return 4; }
+                byH.push_back(it->second);
+                if (it->second->record.hashPrev == 0) break;
+                cur = it->second->record.hashPrev;
+            }
+            std::sort(byH.begin(), byH.end(),
+                      [](const BlockIndexGenerationSourceRecord* a, const BlockIndexGenerationSourceRecord* b) {
+                          return a->record.height < b->record.height;
+                      });
+            oracle.active = byH;
+        }
+        BlockIndexShadowOpenConfig cfg; cfg.root = root;
+        BlockIndexV2ShadowRuntime rt;
+        std::string e;
+        const BlockIndexV2ShadowState& st = rt.OpenShadow(cfg, &oracle, &e);
+        fprintf(stdout, "[shadow] enabled=%d status=%d generation=%llu\n",
+                st.enabled, st.status, (unsigned long long)st.generation);
+        fprintf(stdout, "[shadow] compatibility=%d tip_height=%d legacy_tip=%d lag=%d\n",
+                st.compatibility, st.shadowTipHeight, st.legacyTipHeightAtValidation, st.heightLag);
+        fprintf(stdout, "[shadow] structural=%d tip_on_active=%d hash_checks=%llu height_checks=%llu mismatches=%llu\n",
+                st.structuralValidationOk ? 1 : 0, st.tipOnLegacyActiveChain ? 1 : 0,
+                (unsigned long long)st.sampleHashChecks,
+                (unsigned long long)st.sampleHeightChecks,
+                (unsigned long long)st.sampleMismatches);
+        fprintf(stdout, "[shadow] authoritative=%d\n", st.authoritative ? 1 : 0);
+        fflush(stdout);
+        return st.structuralValidationOk && st.tipOnLegacyActiveChain && st.sampleMismatches == 0 ? 0 : 1;
+    }
     if (argc >= 2 && std::string(argv[1]) == "open")
     {
         if (argc < 3)

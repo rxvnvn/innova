@@ -49,6 +49,8 @@ HEADERS += build/build.h \
            src/blockindex_activeindex.h \
            src/blockindex_generation_builder.h \
            src/blockindex_generation_lifecycle.h \
+           src/blockindex_shadow_runtime.h \
+           src/blockindex_shadow_startup.h \
            src/bootstrap.h \
            src/bulletproof_ac.h \
            src/checkpoints.h \
@@ -535,6 +537,8 @@ SOURCES += qrc_bitcoin.cpp \
            src/blockindex_activeindex.cpp \
            src/blockindex_generation_builder.cpp \
            src/blockindex_generation_lifecycle.cpp \
+           src/blockindex_shadow_runtime.cpp \
+           src/blockindex_shadow_startup.cpp \
            src/bootstrap.cpp \
            src/smessage_stub.cpp \
            src/bulletproof_ac.cpp \
@@ -581,6 +585,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/protocol.cpp \
            src/ringsig.cpp \
            src/rpcblockchain.cpp \
+           src/rpcblockindexshadow.cpp \
            src/rpccollateral.cpp \
            src/rpcdump.cpp \
            src/rpcmining.cpp \
@@ -693,6 +698,7 @@ SOURCES += qrc_bitcoin.cpp \
            src/test/blockindex_activeindex_tests.cpp \
            src/test/blockindex_generation_builder_tests.cpp \
            src/test/blockindex_generation_lifecycle_tests.cpp \
+           src/test/blockindex_shadow_startup_tests.cpp \
            src/test/script_P2SH_tests.cpp \
            src/test/script_tests.cpp \
            src/test/sigopcount_tests.cpp \

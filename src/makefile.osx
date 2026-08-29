@@ -147,6 +147,7 @@ OBJS= \
     obj/rpcmining.o \
     obj/rpcwallet.o \
     obj/rpcblockchain.o \
+    obj/rpcblockindexshadow.o \
     obj/rpcrawtransaction.o \
     obj/rpcsmessage.o \
     obj/rpcnyx.o \
@@ -198,6 +199,7 @@ OBJS= \
     obj/blockindex_activeindex.o \
     obj/blockindex_generation_builder.o \
     obj/blockindex_generation_lifecycle.o \
+    obj/blockindex_shadow_runtime.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 
@@ -218,7 +220,8 @@ TEST_OBJS= \
     obj/test/blockindex_hashindex_tests.o \
     obj/test/blockindex_activeindex_tests.o \
     obj/test/blockindex_generation_builder_tests.o \
-    obj/test/blockindex_generation_lifecycle_tests.o
+    obj/test/blockindex_generation_lifecycle_tests.o \
+    obj/test/blockindex_shadow_startup_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp release-check
 

@@ -502,6 +502,8 @@ HEADERS += src/qt/bitcoingui.h \
     src/blockindex_activeindex.h \
     src/blockindex_generation_builder.h \
     src/blockindex_generation_lifecycle.h \
+    src/blockindex_shadow_runtime.h \
+    src/blockindex_shadow_startup.h \
     src/checkpoints.h \
     src/compat.h \
     src/coincontrol.h \
@@ -671,6 +673,8 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/blockindex_activeindex.cpp \
     src/blockindex_generation_builder.cpp \
     src/blockindex_generation_lifecycle.cpp \
+    src/blockindex_shadow_runtime.cpp \
+    src/blockindex_shadow_startup.cpp \
     src/smessage_stub.cpp \
     src/net.cpp \
     src/checkpoints.cpp \
@@ -700,6 +704,7 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/rpcwallet.cpp \
     src/rpccollateral.cpp \
     src/rpcblockchain.cpp \
+    src/rpcblockindexshadow.cpp \
     src/rpcrawtransaction.cpp \
     src/qt/overviewpage.cpp \
     src/qt/csvmodelwriter.cpp \

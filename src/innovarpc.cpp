@@ -304,6 +304,7 @@ static const CRPCCommand vRPCCommands[] =
     { "getbestblockhash",       &getbestblockhash,       true,   true },
     { "getblockchaininfo",      &getblockchaininfo,      true,   false },
     { "getblockcount",          &getblockcount,          true,   true },
+    { "getblockindexv2info",         &getblockindexv2info,         true,   true },
     { "getconnectioncount",     &getconnectioncount,     true,   true },
     { "getpeerinfo",            &getpeerinfo,            true,   true },
     { "getaddednodeinfo",       &getaddednodeinfo,       true,   true },
