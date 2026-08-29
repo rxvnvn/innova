@@ -497,6 +497,7 @@ HEADERS += src/qt/bitcoingui.h \
     src/base58.h \
     src/bignum.h \
     src/blockindex_accessor.h \
+    src/blockindex_hashindex.h \
     src/fixed_blockindex_store.h \
     src/checkpoints.h \
     src/compat.h \
@@ -662,6 +663,7 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/pinglifecycletrace.cpp \
     src/bootstrap.cpp \
     src/blockindex_accessor.cpp \
+    src/blockindex_hashindex.cpp \
     src/fixed_blockindex_store.cpp \
     src/smessage_stub.cpp \
     src/net.cpp \
