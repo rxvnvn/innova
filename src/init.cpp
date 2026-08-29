@@ -1888,6 +1888,19 @@ bool AppInit2()
             g_dagManager.RebuildDAGOrder();
         }
 
+        // Canonical DAG trust replay: fold mapDAGData[hash].nDAGScore
+        // into CBlockIndex::nChainTrust for post-DAG PoW blocks, mirroring
+        // the live overwrite at main.cpp:8813-8815.  This closes the
+        // restart-trust divergence: on restart, nChainTrust was left at the
+        // linear-prefix value while live used the DAG score for best-chain
+        // comparison.  Safe for pre-DAG, post-DAG PoS, and blocks without
+        // DAG metadata — those are left unchanged.
+        g_dagManager.RestoreDAGTrustIntoChainTrust();
+        // Restore nBestChainTrust from the canonical tip — it may have
+        // been updated by the replay above.
+        if (pindexBest)
+            nBestChainTrust = pindexBest->nChainTrust;
+
         std::vector<uint256> vTips = g_dagManager.GetDAGTips();
         printf("IDAG: DAG active at height %d, %d tips, %d entries\n",
                pindexBest->nHeight, (int)vTips.size(), g_dagManager.GetDAGEntryCount());

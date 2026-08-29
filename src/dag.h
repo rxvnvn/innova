@@ -198,6 +198,23 @@ public:
     /** Rebuild DAG ordering incrementally (only blocks above nCleanHeight). */
     void RebuildDAGOrderIncremental(int nCleanHeight);
 
+    /**
+     * After RebuildDAGOrder / RebuildDAGOrderIncremental, fold the
+     * recomputed canonical mapDAGData[hash].nDAGScore back into
+     * CBlockIndex::nChainTrust for every post-DAG proof-of-work block.
+     *
+     * During live acceptance (main.cpp:8813-8815) the same overwrite is
+     * applied so that DAG score drives best-chain comparison.  Restart
+     * rebuilds the score inside mapDAGData but currently leaves the
+     * block-index nChainTrust at its linear prefix-sum value.  This gap
+     * is the restart-trust divergence.
+     *
+     * The method is idempotent and safe to call on any loaded block
+     * index: pre-DAG blocks, post-DAG PoS blocks (rejected at fork
+     * height), and blocks without DAG metadata are left untouched.
+     */
+    void RestoreDAGTrustIntoChainTrust();
+
     /** Prune DAG data below nHeight - DAG_PRUNE_DEPTH, preserving epoch boundaries. */
     bool PruneDAGData(CTxDB& txdb, int nHeight);
 
@@ -225,6 +242,12 @@ public:
 
     /** Get DAG data for a block (returns false if not found). */
     bool GetDAGData(const uint256& hash, CBlockDAGData& dataOut) const;
+
+    /** Test helper: directly insert DAG data into mapDAGData. */
+    void SetDAGDataForTest(const uint256& hash, const CBlockDAGData& data);
+
+    /** Test helper: clear all DAG data (for test cleanup). */
+    void ClearDAGDataForTest();
 
     /** Get the set of blocks that are DAG siblings of a given block
      *  (blocks at similar height that share some parents). */

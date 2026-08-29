@@ -828,6 +828,20 @@ bool CDAGManager::GetDAGData(const uint256& hash, CBlockDAGData& dataOut) const
 }
 
 
+void CDAGManager::SetDAGDataForTest(const uint256& hash, const CBlockDAGData& data)
+{
+    LOCK(cs_dag);
+    mapDAGData[hash] = data;
+}
+
+
+void CDAGManager::ClearDAGDataForTest()
+{
+    LOCK(cs_dag);
+    mapDAGData.clear();
+}
+
+
 void CDAGManager::RemoveBlockDAGData(const uint256& hashBlock)
 {
     LOCK(cs_dag);
@@ -934,6 +948,37 @@ bool CDAGManager::LoadEpochStates(CTxDB& txdb)
                (int)mapEpochState.size(), (int)mapEpochCurveTrees.size());
 
     return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// CDAGManager: Restore canonical DAG score into CBlockIndex::nChainTrust
+// ---------------------------------------------------------------------------
+
+void CDAGManager::RestoreDAGTrustIntoChainTrust()
+{
+    LOCK(cs_dag);
+
+    int nCount = 0;
+    for (const auto& mi : mapBlockIndex)
+    {
+        CBlockIndex* pindex = mi.second;
+        if (!pindex || pindex->nHeight < FORK_HEIGHT_DAG)
+            continue;
+        if (!pindex->IsProofOfWork())
+            continue;
+
+        auto it = mapDAGData.find(mi.first);
+        if (it == mapDAGData.end() || it->second.nDAGScore == 0)
+            continue;
+
+        // Mirror the live overwrite at main.cpp:8813-8815
+        pindex->nChainTrust = it->second.nDAGScore;
+        nCount++;
+    }
+
+    if (nCount > 0)
+        printf("RestoreDAGTrustIntoChainTrust: restored DAG score into nChainTrust for %d blocks\n", nCount);
 }
 
 
