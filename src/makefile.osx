@@ -193,6 +193,7 @@ OBJS= \
     obj/stun.o \
     obj/bootstrap.o \
     obj/blockindex_accessor.o \
+    obj/fixed_blockindex_store.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 
@@ -208,7 +209,8 @@ TEST_OBJS= \
     obj/test/finality_tally_tests.o \
     obj/test/coincontrol_lock_tests.o \
     obj/test/fcmp_root_tests.o \
-    obj/test/blockindex_accessor_tests.o
+    obj/test/blockindex_accessor_tests.o \
+    obj/test/fixed_blockindex_store_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp release-check
 
