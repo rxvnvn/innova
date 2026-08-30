@@ -1,7 +1,7 @@
 #ifndef INNOVA_BLOCKINDEX_V2_READER_H
 #define INNOVA_BLOCKINDEX_V2_READER_H
 
-#include "blockindex_accessor.h"
+#include "blockindex_navigation.h"
 #include "blockindex_activeindex.h"
 #include "blockindex_hashindex.h"
 #include "blockindex_generation_lifecycle.h"
@@ -57,6 +57,9 @@ public:
     BlockIndexV2ReadStatus GetNextActive(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetParent(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetAncestor(BlockIndexId id, int targetHeight, BlockIndexSnapshot* out, std::string* error) const;
+    BlockIndexV2ReadStatus GetStakeModifierTime(BlockIndexId id, int64_t* out, std::string* error) const;
+    BlockIndexV2ReadStatus GetStakeModifierChecksum(BlockIndexId id, unsigned int* out, std::string* error) const;
+    BlockIndexV2ReadStatus GetStakingMetadata(BlockIndexId id, BlockIndexStakingMetadata* out, std::string* error) const;
     BlockIndexV2ReadStatus FindFork(BlockIndexId a, BlockIndexId b, BlockIndexSnapshot* out, std::string* error) const;
 
 private:

@@ -5,71 +5,95 @@
 #ifndef INNOVA_COLD_HOT_SEAM_H
 #define INNOVA_COLD_HOT_SEAM_H
 
-#include "blockindex_accessor.h"
+#include "blockindex_navigation.h"
 #include "blockindex_v2_reader.h"
-#include "main.h"
+
+/** A resolved value snapshot and its unambiguous navigation reference. */
+struct ColdHotSeamSnapshot
+{
+    BlockIndexNavigationRef ref;
+    BlockIndexSnapshot snapshot;
+
+    bool IsValid() const { return ref.IsValid() && snapshot.found && snapshot.hash == ref.logical.GetHash(); }
+};
 
 /**
- * Cold/hot seam navigator — bridges pointer-free cold historical
- * BlockIndexV2Reader with hot live BlockIndexAccessor for forward
- * active-chain traversal.
+ * A fail-closed, read-only bridge between a pinned immutable V2 generation and
+ * the live legacy active chain. Callers must hold cs_main for every method:
+ * the hot resolver is the LegacyBlockIndexAccessor.
  *
- * Cold domain = heights ≤ reader committedTipHeight (frozen generation).
- * Hot domain  = heights > reader tip, using live LegacyBlockIndexAccessor.
- *
- * Invariants:
- * 1. Seam check: cold at seam height == hot at same height.
- * 2. Extension-only assumption: cold prefix is an ancestor of the live chain.
- * 3. Stale generation: detected via CurrentSelectionChanged() + hash check.
- * 4. Reorg through/below seam: detected via hash mismatch at seam height.
+ * It deliberately exposes BlockIndexNavigationRef, never a raw BlockIndexId.
+ * This makes a process-local legacy ID unable to be used as a V2 RecordId.
  */
+/** Test seam: a by-value hot oracle. Production uses the legacy adapter below;
+ *  tests may inject an offline source oracle without CBlockIndex materialization. */
+class ColdHotHotResolver
+{
+public:
+    virtual ~ColdHotHotResolver() {}
+    virtual BlockIndexSnapshot LookupByHash(const uint256& hash) const = 0;
+    virtual BlockIndexSnapshot GetActiveByHeight(int height) const = 0;
+    virtual BlockIndexSnapshot GetParentByHash(const uint256& hash) const = 0;
+    virtual BlockIndexSnapshot GetNextActiveByHash(const uint256& hash) const = 0;
+    virtual BlockIndexSnapshot GetTip() const = 0;
+};
+
 class ColdHotSeamNavigator
 {
 public:
     ColdHotSeamNavigator();
 
-    /** Open the cold side with a V2 reader.  Hot side uses the global
-     *  LegacyBlockIndexAccessor.  Returns false if cold reader fails. */
     bool Open(const std::string& v2Root, const BlockIndexV2ReaderOptions& options,
               std::string* error);
-
-    /** Close cold reader. */
     void Close();
-
-    /** Check if the cold generation is still valid relative to the live chain.
-     *  Returns false if the generation is stale or the seam hash mismatches. */
-    bool VerifySeam(std::string* error) const;
-
-    /** Get the next active block after the given BlockIndexId.
-     *  If the block is in the cold domain and below the seam, returns the
-     *  cold successor.  If at the seam, verifies the seam and returns the
-     *  hot successor.  If in the hot domain, returns the hot successor. */
-    BlockIndexSnapshot GetNextActive(BlockIndexId id) const;
-
-    /** Get a BlockIndexSnapshot by hash, checking cold first then hot. */
-    BlockIndexSnapshot LookupByHash(const uint256& hash) const;
-
-    /** Get parent of a block (cold reader first, then hot). */
-    BlockIndexSnapshot GetParent(BlockIndexId id) const;
-
-    /** Get ancestor at a target height. */
-    BlockIndexSnapshot GetAncestor(BlockIndexId id, int targetHeight) const;
-
-    /** Get the current cold generation tip. */
-    BlockIndexSnapshot GetColdTip() const;
-
-    /** Get the current hot tip. */
-    BlockIndexSnapshot GetHotTip() const;
-
-    /** Is the given height in the cold domain? */
-    bool IsColdDomain(int height) const;
-
-    /** Is the navigator open and valid? */
     bool IsOpen() const;
 
+    // Test-only: oracle lifetime remains caller-owned; NULL restores production
+    // LegacyBlockIndexAccessor behavior. Never called by production startup.
+    void SetTestHotResolver(const ColdHotHotResolver* resolver);
+
+    /** Require the pinned V2 generation to match CURRENT and the live active
+     * chain at the generation tip. Does not auto-rebase. */
+    bool VerifySeam(std::string* error) const;
+
+    bool LookupCold(const BlockIndexLogicalId& logical, ColdHotSeamSnapshot* out,
+                    std::string* error) const;
+    bool LookupHot(const BlockIndexLogicalId& logical, ColdHotSeamSnapshot* out,
+                   std::string* error) const;
+    bool Resolve(const BlockIndexNavigationRef& ref, ColdHotSeamSnapshot* out,
+                 std::string* error) const;
+
+    bool GetParent(const BlockIndexNavigationRef& ref, ColdHotSeamSnapshot* out,
+                   std::string* error) const;
+    bool GetAncestor(const BlockIndexNavigationRef& ref, int targetHeight,
+                     ColdHotSeamSnapshot* out, std::string* error) const;
+    bool GetNextActive(const BlockIndexNavigationRef& ref, ColdHotSeamSnapshot* out,
+                       std::string* error) const;
+    bool GetStakingMetadata(const BlockIndexNavigationRef& ref,
+                            BlockIndexStakingMetadata* out, std::string* error) const;
+
+    /** Bounded modifier-time derivation only (no O(depth) checksum walk). */
+    bool GetStakeModifierTime(const BlockIndexNavigationRef& ref,
+                              int64_t* out, std::string* error) const;
+
+    /** O(depth) checksum derivation (checkpoint validation; call sparingly). */
+    bool GetStakeModifierChecksum(const BlockIndexNavigationRef& ref,
+                                  unsigned int* out, std::string* error) const;
+
+    BlockIndexSnapshot GetColdTip() const;
+    BlockIndexSnapshot GetHotTip() const;
+    uint64_t ColdGeneration() const;
+
 private:
+    bool MakeCold(const BlockIndexSnapshot& snapshot, ColdHotSeamSnapshot* out,
+                  std::string* error) const;
+    bool MakeHot(const BlockIndexSnapshot& snapshot, ColdHotSeamSnapshot* out,
+                 std::string* error) const;
+    bool IsAtColdTip(const BlockIndexSnapshot& snapshot) const;
+
     BlockIndexV2Reader coldReader;
     LegacyBlockIndexAccessor hotAccessor;
+    const ColdHotHotResolver* testHotResolver;
     bool open;
 };
 

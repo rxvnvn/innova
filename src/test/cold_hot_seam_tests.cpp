@@ -33,27 +33,50 @@ struct SeamTestFixture
 {
     LegacyBlockIndexAccessor accessor;
     std::map<uint256, CBlockIndex*> savedMap;
+    CBlockIndex* savedBest;
+    CBlockIndex* savedGenesis;
+    uint256 savedBestChain;
+    uint256 savedBestTrust;
+    int savedBestHeight;
 
-    SeamTestFixture()
+    SeamTestFixture() : savedBest(pindexBest), savedGenesis(pindexGenesisBlock),
+                        savedBestChain(hashBestChain), savedBestTrust(nBestChainTrust),
+                        savedBestHeight(nBestHeight)
     {
         ClearBlockIndexAccessorState();
         ClearFindBlockByHeightCache();
         savedMap.swap(mapBlockIndex);
+        pindexBest = NULL;
+        pindexGenesisBlock = NULL;
+        hashBestChain = 0;
+        nBestChainTrust = 0;
+        nBestHeight = -1;
     }
 
     ~SeamTestFixture()
     {
+        ClearFindBlockByHeightCache();
+        pindexBest = savedBest;
+        pindexGenesisBlock = savedGenesis;
+        hashBestChain = savedBestChain;
+        nBestChainTrust = savedBestTrust;
+        nBestHeight = savedBestHeight;
         for (auto& pair : mapBlockIndex) {
             delete pair.second->phashBlock;
             delete pair.second;
         }
         mapBlockIndex.clear();
         savedMap.swap(mapBlockIndex);
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
     }
 
     void set_best(CBlockIndex* p)
     {
         pindexBest = p;
+        pindexGenesisBlock = p;
+        while (pindexGenesisBlock->pprev)
+            pindexGenesisBlock = pindexGenesisBlock->pprev;
         hashBestChain = *p->phashBlock;
         nBestChainTrust = p->nChainTrust;
         nBestHeight = p->nHeight;
@@ -64,9 +87,7 @@ BOOST_FIXTURE_TEST_CASE(seam_navigation, SeamTestFixture)
 {
     std::vector<CBlockIndex*> blocks;
     for (int i = 0; i < 10; i++) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "seam-nav-%d", i);
-        uint256 h = uint256(std::string(buf));
+        const uint256 h(uint64_t(i + 1));
         CBlockIndex* p = make_block(h, i, i > 0 ? blocks.back() : NULL, uint64_t(2 + i * 2));
         if (i > 0) blocks.back()->pnext = p;
         blocks.push_back(p);

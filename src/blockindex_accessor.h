@@ -44,8 +44,10 @@ struct BlockIndexSnapshot
     uint256 nChainTrust;
     bool fProofOfStake;
     bool fInMainChain;
-    uint64_t nStakeModifierTime;    // 0 = unset; O(1) modifier time cache
-    unsigned int nStakeModifierChecksum;
+    uint64_t nStakeModifierTime;    // value is consumable only when hasStakeModifierTime
+    unsigned int nStakeModifierChecksum; // value is consumable only when hasStakeModifierChecksum
+    bool hasStakeModifierTime;
+    bool hasStakeModifierChecksum;
 
     BlockIndexSnapshot()
         : found(false),
@@ -73,7 +75,9 @@ struct BlockIndexSnapshot
           fProofOfStake(false),
           fInMainChain(false),
           nStakeModifierTime(0),
-          nStakeModifierChecksum(0)
+          nStakeModifierChecksum(0),
+          hasStakeModifierTime(false),
+          hasStakeModifierChecksum(false)
     {
     }
 };

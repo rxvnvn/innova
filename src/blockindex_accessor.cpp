@@ -91,6 +91,8 @@ BlockIndexSnapshot LegacyBlockIndexAccessor::SnapshotFromIndex(const CBlockIndex
     out.nStakeModifier = pindex->nStakeModifier;
     out.nStakeModifierTime = pindex->nStakeModifierTime;
     out.nStakeModifierChecksum = pindex->nStakeModifierChecksum;
+    out.hasStakeModifierTime = true;
+    out.hasStakeModifierChecksum = true;
     out.prevoutStake = pindex->prevoutStake;
     out.nStakeTime = pindex->nStakeTime;
     out.hashProof = pindex->hashProof;
