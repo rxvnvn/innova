@@ -7,6 +7,8 @@
 #include <boost/assign/list_of.hpp>
 
 #include "kernel.h"
+#include "cold_hot_seam.h"
+#include "blockindex_shadow_startup.h"
 #include "txdb.h"
 #include "main.h"
 #include "wallet.h"
@@ -334,11 +336,78 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeMod
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// A.9a.3c: production staking-navigation integration for the two-argument path.
+//
+// When a production ColdHotSeamNavigator has been retained (V2 shadow READY),
+// this path resolves the historical source and walks the forward active chain
+// by-value, so an arbitrarily old source requires no resident CBlockIndex /
+// mapBlockIndex / pnext residency. Authority failures are typed and fail closed
+// (they never silently fall back to legacy historical residency). HybridSPV
+// cache semantics are preserved exactly at this adapter boundary.
+//
+// Returns non-null when this adapter actually delegated to the navigator; the
+// caller then relies on *result / error and does not fall through to legacy.
+// ---------------------------------------------------------------------------
+static bool GetKernelStakeModifierNavigated2(uint256 hashBlockFrom,
+    uint64_t& nStakeModifier, int& nStakeModifierHeight, int64_t& nStakeModifierTime,
+    bool fPrintProofOfStake, ColdHotSeamResult* resultOut)
+{
+    if (resultOut)
+        *resultOut = COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    if (!nav)
+        return false; // no production navigator retained -> callers use legacy
+
+    AssertLockHeld(cs_main);
+    const BlockIndexLogicalId logical(hashBlockFrom);
+    std::string err;
+
+    // HybridSPV early cache lookup is a CALLER-BOUNDARY policy, reproduced
+    // exactly as legacy (kernel.cpp GetKernelStakeModifier 2-arg). We need the
+    // source height for the target-height cache key; resolve it first.
+    if (fHybridSPV)
+    {
+        ColdHotSeamSnapshot src;
+        if (nav->ResolveLogicalR(logical, &src, &err) != COLD_HOT_SEAM_OK)
+        {
+            if (resultOut)
+                *resultOut = COLD_HOT_SEAM_AUTHORITY_FAILURE;
+            return true; // fail closed; caller returns false
+        }
+        const int nTargetHeight = src.snapshot.height + (int)(GetStakeModifierSelectionInterval() / 180); // ~3 min blocks
+        if (GetCachedStakeModifier(nTargetHeight, nStakeModifier))
+        {
+            if (resultOut)
+                *resultOut = COLD_HOT_SEAM_OK;
+            return true; // early cache hit, same semantics
+        }
+    }
+
+    int finalWalkHeight = -1;
+    const ColdHotSeamResult r = nav->GetKernelStakeModifierR(
+        logical, &nStakeModifier, &nStakeModifierHeight, &nStakeModifierTime,
+        fPrintProofOfStake, &err, &finalWalkHeight);
+    if (resultOut)
+        *resultOut = r;
+    if (r == COLD_HOT_SEAM_OK && fHybridSPV && finalWalkHeight >= 0)
+        CacheStakeModifier(finalWalkHeight, nStakeModifier);
+    return true; // production navigator path owns the outcome (OK or typed fail)
+}
+
 // The stake modifier used to hash for a stake kernel is chosen as the stake
 // modifier about a selection interval later than the coin generating the kernel
 bool GetKernelStakeModifier(uint256 hashBlockFrom, uint64_t& nStakeModifier, int& nStakeModifierHeight, int64_t& nStakeModifierTime, bool fPrintProofOfStake)
 {
     nStakeModifier = 0;
+    ColdHotSeamResult navResult;
+    if (GetKernelStakeModifierNavigated2(hashBlockFrom, nStakeModifier,
+        nStakeModifierHeight, nStakeModifierTime, fPrintProofOfStake, &navResult))
+    {
+        // Navigated outcome is authoritative: OK succeeds, authority failure
+        // and genuine NOT_FOUND both fail (never a legacy fallback).
+        return navResult == COLD_HOT_SEAM_OK;
+    }
     std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashBlockFrom);
     if (mi == mapBlockIndex.end())
         return error("GetKernelStakeModifier() : block not indexed");
@@ -401,10 +470,46 @@ bool GetKernelStakeModifier(uint256 hashBlockFrom, uint64_t& nStakeModifier, int
     return true;
 };
 
+bool GetKernelStakeModifier(uint256 hashBlockFrom,
+    uint64_t& nStakeModifier, int& nStakeModifierHeight,
+    int64_t& nStakeModifierTime, bool fPrintProofOfStake);
+
+// ---------------------------------------------------------------------------
+// A.9a.3c: three-argument production path. When a production navigator is
+// retained, the branch-tip->source ancestry walk and the modifier selection are
+// done by-value (O(1) transient memory, no arbitrary CBlockIndex residency),
+// with typed fail-closed authority. APX_STREAM exactness is preserved by the
+// O(1)-memory streaming derivation in cold_hot_seam.cpp.
+// ---------------------------------------------------------------------------
+static bool GetKernelStakeModifierNavigated3(uint256 hashBlockFrom,
+    const CBlockIndex* pindexPrev, uint64_t& nStakeModifier, int& nStakeModifierHeight,
+    int64_t& nStakeModifierTime, bool fPrintProofOfStake, ColdHotSeamResult* resultOut)
+{
+    if (resultOut)
+        *resultOut = COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    if (!nav || !pindexPrev)
+        return false; // no production navigator retained -> legacy
+    AssertLockHeld(cs_main);
+    const BlockIndexLogicalId source(hashBlockFrom);
+    const BlockIndexLogicalId tip(pindexPrev->GetBlockHash());
+    std::string err;
+    const ColdHotSeamResult r = nav->GetKernelStakeModifierR(
+        source, tip, &nStakeModifier, &nStakeModifierHeight, &nStakeModifierTime,
+        fPrintProofOfStake, &err);
+    if (resultOut)
+        *resultOut = r;
+    return true; // navigated outcome owns the result (OK or typed fail)
+}
+
 bool GetKernelStakeModifier(uint256 hashBlockFrom, const CBlockIndex* pindexPrev,
     uint64_t& nStakeModifier, int& nStakeModifierHeight,
     int64_t& nStakeModifierTime, bool fPrintProofOfStake)
 {
+    ColdHotSeamResult navResult;
+    if (GetKernelStakeModifierNavigated3(hashBlockFrom, pindexPrev, nStakeModifier,
+        nStakeModifierHeight, nStakeModifierTime, fPrintProofOfStake, &navResult))
+        return navResult == COLD_HOT_SEAM_OK;
     std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashBlockFrom);
     if (mi == mapBlockIndex.end())
         return error("GetKernelStakeModifier() : block not indexed");
@@ -571,6 +676,78 @@ static bool IsBlockInCandidateAncestry(const CBlockIndex* pindexBlock,
     return false;
 }
 
+// A.9a.3c: navigator-backed candidate-ancestry check. Given a candidate branch
+// tip and a source block hash, resolves whether the source block is an ancestor
+// of the candidate branch entirely by-value (stable logical identity + parent
+// navigation), so an arbitrarily old source requires NO resident CBlockIndex /
+// continuous pprev topology. Returns:
+//   1  -> source confirmed an ancestor of the branch (by-value).
+//   0  -> source is NOT an ancestor.
+//  -1  -> navigator unavailable or an authority failure occurred (caller must
+//         fall back to the legacy pointer check; never mis-validate).
+static int IsBlockInCandidateAncestryNavigated(const uint256& sourceHash,
+    const CBlockIndex* pindexPrev)
+{
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    if (!nav || !pindexPrev || sourceHash == uint256(0))
+        return -1;
+    AssertLockHeld(cs_main);
+
+    std::string err;
+    const BlockIndexLogicalId sourceLogical(sourceHash);
+    ColdHotSeamSnapshot source;
+    if (nav->ResolveLogicalR(sourceLogical, &source, &err) != COLD_HOT_SEAM_OK)
+    {
+        // Not resolvable in either domain => not an ancestor (legacy: a block
+        // absent from the index is not in the candidate ancestry).
+        return 0;
+    }
+
+    // Walk the candidate branch tip backward by-value until we reach the source
+    // or drop to a height at/below the source (a valid chain only extends
+    // upward, so once we pass the source height without a match the source is
+    // not on this branch).
+    const BlockIndexLogicalId tipLogical(pindexPrev->GetBlockHash());
+    ColdHotSeamSnapshot cur;
+    if (nav->ResolveLogicalR(tipLogical, &cur, &err) != COLD_HOT_SEAM_OK)
+        return -1;
+    for (;;)
+    {
+        if (cur.snapshot.hash == sourceHash && cur.snapshot.height == source.snapshot.height)
+            return 1;
+        if (!cur.snapshot.hasParent || cur.snapshot.height <= source.snapshot.height)
+            return 0;
+        const ColdHotSeamResult pr = nav->GetParentR(cur.ref, &cur, &err);
+        if (pr != COLD_HOT_SEAM_OK)
+            return -1;
+    }
+}
+
+bool GetStakingAncestorSnapshot(const CBlockIndex* pindexPrev, int targetHeight,
+    uint256* hashOut, unsigned int* nTimeOut, unsigned int* nFlagsOut)
+{
+    if (hashOut) *hashOut = uint256(0);
+    if (nTimeOut) *nTimeOut = 0;
+    if (nFlagsOut) *nFlagsOut = 0;
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    if (!nav || !pindexPrev || targetHeight < 0 || targetHeight > pindexPrev->nHeight)
+        return false; // no navigator / out-of-range -> caller uses legacy
+
+    const BlockIndexLogicalId tipLogical(pindexPrev->GetBlockHash());
+    std::string err;
+    ColdHotSeamSnapshot res;
+    const ColdHotSeamResult r = nav->GetAncestorR(BlockIndexNavigationRef::Hot(tipLogical),
+                                                  targetHeight, &res, &err);
+    if (r != COLD_HOT_SEAM_OK)
+        return false; // authority failure -> caller must NOT mis-validate; legacy fallback
+    if (!res.snapshot.found || res.snapshot.height != targetHeight)
+        return false;
+    if (hashOut) *hashOut = res.snapshot.hash;
+    if (nTimeOut) *nTimeOut = res.snapshot.nTime;
+    if (nFlagsOut) *nFlagsOut = res.snapshot.nFlags;
+    return true;
+}
+
 static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
     const COutPoint& prevout, CTransaction& txPrev, CTxIndex& txindex,
     CBlock& blockFrom, const std::map<uint256, CBlock>* candidateBlocksForTesting)
@@ -579,6 +756,20 @@ static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
     if (txPrev.ReadFromDisk(txdb, prevout, txindex) &&
         blockFrom.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
     {
+        // A.9a.3c: when a production navigator is retained, the source-ancestry
+        // authority is resolved by-value (no resident mapBlockIndex/CBlockIndex* /
+        // continuous pprev topology). A navigator authority failure FAILS CLOSED
+        // (never a residency fallback, never a mis-validation). Only when NO
+        // production navigator exists (pre-A.10, everything materialized) do we
+        // use the legacy pointer check.
+        const ColdHotSeamNavigator* pNav = GetBlockIndexStakingNavigator();
+        if (pNav)
+        {
+            const int navAncestry = IsBlockInCandidateAncestryNavigated(blockFrom.GetHash(), pindexPrev);
+            if (navAncestry < 0)
+                return false; // authority failure -> fail closed
+            return navAncestry == 1;
+        }
         std::map<uint256, CBlockIndex*>::const_iterator mi =
             mapBlockIndex.find(blockFrom.GetHash());
         if (mi != mapBlockIndex.end() &&

@@ -18,6 +18,31 @@ struct ColdHotSeamSnapshot
 };
 
 /**
+ * Typed result of a navigation/staking operation. Authority failures are
+ * distinguished from legitimate absent/end-of-chain outcomes so a caller can
+ * fail closed instead of silently falling back to legacy historical residency.
+ *
+ *   OK                  — operation produced a valid result.
+ *   NOT_FOUND           — genuine, domain-appropriate absence (a block not
+ *                         present that may legitimately be in another domain).
+ *   END_OF_ACTIVE_CHAIN — a genuine no-successor condition (legacy pnext==NULL
+ *                         / reached-tip). May reproduce legacy tip semantics.
+ *   AUTHORITY_FAILURE   — stale generation, changed CURRENT, corrupt record/hash
+ *                         index, hash mismatch, divergent seam, or failed cold->hot
+ *                         crossing. MUST fail closed (never a legacy fallback).
+ */
+enum ColdHotSeamResult
+{
+    COLD_HOT_SEAM_OK = 0,
+    COLD_HOT_SEAM_NOT_FOUND,
+    COLD_HOT_SEAM_END_OF_ACTIVE_CHAIN,
+    COLD_HOT_SEAM_AUTHORITY_FAILURE,
+};
+
+// Helper: map a V2 reader status onto the seam result model.
+extern ColdHotSeamResult ColdHotSeamResultFromReadStatus(int readStatus);
+
+/**
  * A fail-closed, read-only bridge between a pinned immutable V2 generation and
  * the live legacy active chain. Callers must hold cs_main for every method:
  * the hot resolver is the LegacyBlockIndexAccessor.
@@ -62,6 +87,43 @@ public:
                    std::string* error) const;
     bool Resolve(const BlockIndexNavigationRef& ref, ColdHotSeamSnapshot* out,
                  std::string* error) const;
+    ColdHotSeamResult ResolveR(const BlockIndexNavigationRef& ref,
+                               ColdHotSeamSnapshot* out, std::string* error) const;
+
+    // ------------------------------------------------------------------
+    // Typed result variants (A.9a.3c fail-closed authority). These return a
+    // ColdHotSeamResult so callers can distinguish a genuine NOT_FOUND /
+    // END_OF_ACTIVE_CHAIN from an AUTHORITY_FAILURE, which must never fall back
+    // to legacy historical residency. The bool wrappers below these classify
+    // OK as success and every other outcome as failure (for the offline
+    // differential tool / legacy-equality tests).
+    // ------------------------------------------------------------------
+    ColdHotSeamResult ResolveLogicalR(const BlockIndexLogicalId& logical,
+                                      ColdHotSeamSnapshot* out,
+                                      std::string* error) const;
+    ColdHotSeamResult GetParentR(const BlockIndexNavigationRef& ref,
+                                 ColdHotSeamSnapshot* out, std::string* error) const;
+    ColdHotSeamResult GetAncestorR(const BlockIndexNavigationRef& ref, int targetHeight,
+                                   ColdHotSeamSnapshot* out, std::string* error) const;
+    ColdHotSeamResult GetNextActiveR(const BlockIndexNavigationRef& ref,
+                                     ColdHotSeamSnapshot* out, std::string* error) const;
+    ColdHotSeamResult GetLastStakeModifierR(const BlockIndexLogicalId& start,
+                                            uint64_t* nStakeModifier, int64_t* nModifierTime,
+                                            std::string* error) const;
+    ColdHotSeamResult GetKernelStakeModifierR(const BlockIndexLogicalId& source,
+                                              uint64_t* nStakeModifier,
+                                              int* nStakeModifierHeight,
+                                              int64_t* nStakeModifierTime,
+                                              bool fPrintProofOfStake,
+                                              std::string* error,
+                                              int* outFinalWalkHeight = NULL) const;
+    ColdHotSeamResult GetKernelStakeModifierR(const BlockIndexLogicalId& source,
+                                              const BlockIndexLogicalId& branchTip,
+                                              uint64_t* nStakeModifier,
+                                              int* nStakeModifierHeight,
+                                              int64_t* nStakeModifierTime,
+                                              bool fPrintProofOfStake,
+                                              std::string* error) const;
 
     bool GetParent(const BlockIndexNavigationRef& ref, ColdHotSeamSnapshot* out,
                    std::string* error) const;

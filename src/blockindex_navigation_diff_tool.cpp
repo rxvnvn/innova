@@ -403,15 +403,28 @@ int main(int argc, char** argv)
     uint64_t stakingLastSamples = 0, stakingLastMismatch = 0;
     uint64_t staking3Samples = 0, staking3OkDisagree = 0, staking3ModMismatch = 0,
              staking3TimeMismatch = 0, staking3HeightMismatch = 0;
-    // Deterministic source set: genesis/old, near-seam, at-seam, hot-tail, tip.
+    // Deterministic source set: genesis/very-old, deep-cold fractions, near-seam,
+    // at-seam, hot-tail, recent hot, tip. This is the deep-old mainnet-relevant
+    // 3-arg coverage (NO false 90-day / max-age bound; mainnet nStakeMaxAge is
+    // effectively unlimited).
     std::vector<int> sources;
-    sources.push_back(0);
-    for (int k = 1; k <= 8; ++k) sources.push_back((int)((uint64_t)hotTip.height * k / 8));
-    sources.push_back(coldTipHeight > 0 ? coldTipHeight - 1 : 0);
-    sources.push_back(coldTipHeight);
-    sources.push_back(coldTipHeight + 1);
-    sources.push_back(hotTip.height);
-    for (int h = 0; h < sources.size(); ++h)
+    sources.push_back(0); // near genesis / very old
+    for (int fracDenom = 8; fracDenom <= 2; ) break; // (reserved)
+    // explicit deep fraction categories
+    for (int k : {6, 5, 4, 3, 2, 1})            // ~tip*k/6
+        sources.push_back((int)((uint64_t)hotTip.height * k / 6));
+    sources.push_back((int)((uint64_t)hotTip.height * 4 / 16)); // ~0.25M..1M zone
+    sources.push_back((int)((uint64_t)hotTip.height / 16));     // ~0.5M
+    sources.push_back((int)((uint64_t)hotTip.height / 8));      // ~1M
+    sources.push_back(coldTipHeight > 0 ? coldTipHeight - 1 : 0); // seam-1
+    sources.push_back(coldTipHeight);                             // seam
+    sources.push_back(coldTipHeight + 1);                         // seam+1
+    sources.push_back(hotTip.height - 100000);                    // recent hot
+    sources.push_back(hotTip.height);                             // tip
+    // modifier-boundary-relevant: every 1000th checkpoint height near tip
+    for (int h = hotTip.height; h >= hotTip.height - 4000; h -= 1000)
+        sources.push_back(h);
+    for (int h = 0; h < (int)sources.size(); ++h)
     {
         if (sources[h] < 0 || sources[h] > hotTip.height) continue;
         const BlockIndexSnapshot src = hot.GetActiveByHeight(sources[h]);
@@ -492,59 +505,53 @@ int main(int argc, char** argv)
         }
 
         // --- legacy reference GetKernelStakeModifier (3-arg, branch ancestry) ---
-        // The candidate branch tip is the live hot tip. The 3-arg is used during
-        // block validation where the stake source is consensus-bounded (~90-day
-        // max age); so a representative source is within the recent max-age window
-        // (not an arbitrarily old source). The old sources above already exercise
-        // the arbitrary-old 2-arg path; the 3-arg is the hot-validation path.
+        // The candidate branch tip is the live hot tip. NO 90-day / max-age gate:
+        // mainnet nStakeMaxAge is effectively unlimited, so arbitrarily old
+        // transparent sources are eligible. For an active source the legacy
+        // forward-scan (source->tip) is computed over the OFFLINE record active
+        // chain via hot.GetNextActiveByHash (independent of the navigator) and is
+        // bounded by the selection interval, so deep-old samples are feasible.
         {
             const BlockIndexSnapshot tip = hot.GetTip();
             const BlockIndexLogicalId tipLogical(tip.hash);
-            const int maxAgeWindow = 600000; // ~90 days of 15s blocks (nStakeMaxAge margin)
-            if (sources[h] >= hotTip.height - maxAgeWindow)
+            if (src.height <= tip.height && src.fInMainChain && tip.fInMainChain)
             {
-                BlockIndexSnapshot cur = tip;
-                bool srcOnBranch = false;
-                while (cur.found)
+                // legacy reference: forward scan source->tip over offline records.
+                uint64_t refMod = src.nStakeModifier;
+                int refH = src.height; int64_t refTime = src.nTime;
+                const int64_t refTarget = (int64_t)src.nTime + nSelInterval;
+                bool refOk = false;
+                BlockIndexSnapshot p = src;
+                while (refTime < refTarget)
                 {
-                    if (cur.hash == src.hash && cur.height == src.height) { srcOnBranch = true; break; }
-                    if (!cur.hasParent) break;
-                    cur = hot.GetParentByHash(cur.hash);
+                    BlockIndexSnapshot next = hot.GetNextActiveByHash(p.hash);
+                    if (!next.found || next.height > tip.height)
+                        break; // reached branch end (tip) before interval
+                    p = next;
+                    if (p.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
+                    { refH = p.height; refTime = (int64_t)p.nTime; }
+                    if (refTime >= refTarget) { refMod = p.nStakeModifier; refOk = true; break; }
                 }
-                if (srcOnBranch)
-                {
-                    // legacy reference: walk ancestry from tip down to src
-                    uint64_t refMod = src.nStakeModifier;
-                    int refH = src.height; int64_t refTime = src.nTime;
-                    int64_t refTarget = (int64_t)src.nTime + nSelInterval;
-                    std::vector<BlockIndexSnapshot> branch;
-                    cur = tip;
-                    branch.push_back(cur);
-                    while (cur.found && !(cur.hash == src.hash && cur.height == src.height) && cur.hasParent)
-                    { cur = hot.GetParentByHash(cur.hash); branch.push_back(cur); }
-                    std::reverse(branch.begin(), branch.end());
-                    bool refSettled = false;
-                    for (size_t i = 1; i < branch.size(); ++i)
-                    {
-                        if (branch[i].nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
-                        { refH = branch[i].height; refTime = (int64_t)branch[i].nTime; }
-                        if (refTime >= refTarget) { refMod = branch[i].nStakeModifier; refSettled = true; break; }
-                    }
-                    if (!refSettled && (int64_t)tip.nTime >= refTarget)
-                    { refMod = tip.nStakeModifier; refH = tip.height; refTime = (int64_t)tip.nTime; refSettled = true; }
+                if (!refOk && (int64_t)tip.nTime >= refTarget)
+                { refMod = tip.nStakeModifier; refH = tip.height; refTime = (int64_t)tip.nTime; refOk = true; }
 
-                    uint64_t navMod = 0; int navH = 0; int64_t navTime = 0;
-                    std::string e3;
-                    const bool navOk = seam.GetKernelStakeModifier(srcLogical, tipLogical, &navMod, &navH, &navTime, false, &e3);
-                    ++staking3Samples;
-                    if (navOk != refSettled) ++staking3OkDisagree;
-                    if (navOk == refSettled && navOk)
-                    {
-                        if (navMod != refMod) ++staking3ModMismatch;
-                        if (navTime != refTime) ++staking3TimeMismatch;
-                        if (navH != refH) ++staking3HeightMismatch;
-                    }
+                uint64_t navMod = 0; int navH = 0; int64_t navTime = 0;
+                std::string e3;
+                const bool navOk = seam.GetKernelStakeModifier(srcLogical, tipLogical, &navMod, &navH, &navTime, false, &e3);
+                ++staking3Samples;
+                if (navOk != refOk) ++staking3OkDisagree;
+                bool modMismatch = false, timeMismatch = false, heightMismatch = false;
+                if (navOk == refOk && navOk)
+                {
+                    if (navMod != refMod) { ++staking3ModMismatch; modMismatch = true; }
+                    if (navTime != refTime) { ++staking3TimeMismatch; timeMismatch = true; }
+                    if (navH != refH) { ++staking3HeightMismatch; heightMismatch = true; }
                 }
+                if (navOk != refOk || modMismatch || timeMismatch || heightMismatch)
+                    printf("[STAKING3-SAMPLE] src_h=%d tip_h=%d depth=%d src=%s navOk=%d refOk=%d navMod=%" PRIu64" refMod=%" PRIu64" navH=%d refH=%d navT=%" PRId64" refT=%" PRId64" modMM=%d timeMM=%d heightMM=%d\n",
+                           src.height, tip.height, tip.height - src.height, src.hash.ToString().c_str(),
+                           navOk, refOk, navMod, refMod, navH, refH, navTime, refTime,
+                           (int)modMismatch, (int)timeMismatch, (int)heightMismatch);
             }
         }
     }

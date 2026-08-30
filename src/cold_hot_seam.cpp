@@ -16,6 +16,21 @@ static void SeamClear(std::string* error)
 }
 }
 
+ColdHotSeamResult ColdHotSeamResultFromReadStatus(int readStatus)
+{
+    switch (readStatus)
+    {
+    case BLOCK_INDEX_V2_READ_FOUND:
+        return COLD_HOT_SEAM_OK;
+    case BLOCK_INDEX_V2_READ_NOT_FOUND:
+        return COLD_HOT_SEAM_NOT_FOUND;
+    default:
+        // CORRUPT / IO_ERROR / NOT_OPEN are all authority failures: they never
+        // justify a silent fall back to legacy historical residency.
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    }
+}
+
 ColdHotSeamNavigator::ColdHotSeamNavigator() : testHotResolver(NULL), open(false)
 {
 }
@@ -149,23 +164,39 @@ bool ColdHotSeamNavigator::Resolve(const BlockIndexNavigationRef& ref,
                                    ColdHotSeamSnapshot* out,
                                    std::string* error) const
 {
+    return ResolveR(ref, out, error) == COLD_HOT_SEAM_OK;
+}
+
+ColdHotSeamResult ColdHotSeamNavigator::ResolveR(const BlockIndexNavigationRef& ref,
+                                                 ColdHotSeamSnapshot* out,
+                                                 std::string* error) const
+{
     AssertLockHeld(cs_main);
     if (!ref.IsValid())
-        return SeamFail(error, "invalid navigation reference");
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
     if (ref.IsHot())
-        return LookupHot(ref.logical, out, error);
+        return LookupHot(ref.logical, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
 
     if (!ref.MatchesGeneration(coldReader.Generation()))
-        return SeamFail(error, "cold reference generation mismatch");
-    if (!VerifySeam(error))
-        return false;
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    if (!coldReader.IsOpen())
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    // A CURRENT replacement invalidates references bound to the pinned
+    // generation: fail closed rather than resolve stale refs. (Verified per
+    // resolution; the original A.9a.3b navigator did the same at 120k scale.)
+    if (coldReader.CurrentSelectionChanged(error))
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
 
+    // The cold reader is pinned to the generation it was opened on; it does not
+    // auto-switch. Resolve by record id (reader cache/LRU friendly) rather than
+    // a cold hash-index lookup.
     BlockIndexSnapshot snapshot;
-    if (coldReader.GetRecordById(ref.recordId, &snapshot, error) != BLOCK_INDEX_V2_READ_FOUND)
-        return false;
-    if (snapshot.hash != ref.logical.GetHash())
-        return SeamFail(error, "cold record/logical identity mismatch");
-    return MakeCold(snapshot, out, error);
+    const BlockIndexV2ReadStatus st = coldReader.GetRecordById(ref.recordId, &snapshot, error);
+    if (st != BLOCK_INDEX_V2_READ_FOUND)
+        return ColdHotSeamResultFromReadStatus(st);
+    if (snapshot.found && snapshot.hash != ref.logical.GetHash())
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    return MakeCold(snapshot, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
 }
 
 bool ColdHotSeamNavigator::IsAtColdTip(const BlockIndexSnapshot& snapshot) const
@@ -175,25 +206,36 @@ bool ColdHotSeamNavigator::IsAtColdTip(const BlockIndexSnapshot& snapshot) const
            snapshot.id == tip.id && snapshot.height == tip.height;
 }
 
-bool ColdHotSeamNavigator::GetParent(const BlockIndexNavigationRef& ref,
-                                     ColdHotSeamSnapshot* out,
-                                     std::string* error) const
+ColdHotSeamResult ColdHotSeamNavigator::GetParentR(const BlockIndexNavigationRef& ref,
+                                                   ColdHotSeamSnapshot* out,
+                                                   std::string* error) const
 {
     ColdHotSeamSnapshot current;
-    if (!Resolve(ref, &current, error) || !current.snapshot.hasParent)
-        return false;
+    {
+        const ColdHotSeamResult r = ResolveR(ref, &current, error);
+        if (r != COLD_HOT_SEAM_OK)
+            return r;
+    }
+    if (!current.snapshot.hasParent)
+    {
+        if (out)
+            *out = ColdHotSeamSnapshot();
+        SeamClear(error);
+        return COLD_HOT_SEAM_NOT_FOUND;
+    }
 
     if (current.ref.IsCold())
     {
         BlockIndexSnapshot parent;
-        if (coldReader.GetParent(current.snapshot.id, &parent, error) != BLOCK_INDEX_V2_READ_FOUND)
-            return false;
-        return MakeCold(parent, out, error);
+        const BlockIndexV2ReadStatus st = coldReader.GetParent(current.snapshot.id, &parent, error);
+        if (st != BLOCK_INDEX_V2_READ_FOUND)
+            return ColdHotSeamResultFromReadStatus(st);
+        return MakeCold(parent, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
     }
 
     const BlockIndexSnapshot parent = testHotResolver ? testHotResolver->GetParentByHash(current.snapshot.hash) : hotAccessor.GetParent(current.snapshot.id);
     if (!parent.found)
-        return SeamFail(error, "hot parent not found");
+        return SeamFail(error, "hot parent not found") ? COLD_HOT_SEAM_NOT_FOUND : COLD_HOT_SEAM_NOT_FOUND;
 
     // A hot active block whose parent lies in a valid frozen prefix crosses to
     // cold only after hash-based validation. Side branches remain hot.
@@ -201,11 +243,119 @@ bool ColdHotSeamNavigator::GetParent(const BlockIndexNavigationRef& ref,
     if (parent.fInMainChain && parent.height <= coldTip.height)
     {
         ColdHotSeamSnapshot coldParent;
-        if (!LookupCold(BlockIndexLogicalId(parent.hash), &coldParent, error))
-            return false;
-        return MakeCold(coldParent.snapshot, out, error);
+        ColdHotSeamSnapshot dummy;
+        const ColdHotSeamResult cr = ResolveLogicalR(BlockIndexLogicalId(parent.hash), &coldParent, error);
+        if (cr != COLD_HOT_SEAM_OK)
+            return cr;
+        return MakeCold(coldParent.snapshot, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
     }
-    return MakeHot(parent, out, error);
+    return MakeHot(parent, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+}
+
+ColdHotSeamResult ColdHotSeamNavigator::GetAncestorR(const BlockIndexNavigationRef& ref,
+                                                     int targetHeight,
+                                                     ColdHotSeamSnapshot* out,
+                                                     std::string* error) const
+{
+    ColdHotSeamSnapshot current;
+    {
+        const ColdHotSeamResult r = ResolveR(ref, &current, error);
+        if (r != COLD_HOT_SEAM_OK)
+            return r;
+    }
+    if (targetHeight < 0 || targetHeight > current.snapshot.height)
+        return SeamFail(error, "invalid ancestor target height") ? COLD_HOT_SEAM_NOT_FOUND : COLD_HOT_SEAM_NOT_FOUND;
+
+    // Cold active blocks resolve ancestor in O(1) via active.dat (the reader's
+    // own fast path), never an O(depth) parent walk.
+    if (current.ref.IsCold())
+    {
+        BlockIndexSnapshot ancestor;
+        const BlockIndexV2ReadStatus st = coldReader.GetAncestor(current.snapshot.id, targetHeight, &ancestor, error);
+        if (st != BLOCK_INDEX_V2_READ_FOUND)
+            return ColdHotSeamResultFromReadStatus(st);
+        return MakeCold(ancestor, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    }
+
+    const BlockIndexSnapshot coldTip = coldReader.GetTip();
+    if (current.snapshot.fInMainChain && targetHeight > coldTip.height)
+    {
+        const BlockIndexSnapshot ancestor = testHotResolver ? testHotResolver->GetActiveByHeight(targetHeight) : hotAccessor.GetActiveByHeight(targetHeight);
+        if (!ancestor.found)
+            return SeamFail(error, "hot ancestor not found") ? COLD_HOT_SEAM_NOT_FOUND : COLD_HOT_SEAM_NOT_FOUND;
+        return MakeHot(ancestor, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    }
+    while (current.snapshot.height > targetHeight)
+    {
+        const ColdHotSeamResult r = GetParentR(current.ref, &current, error);
+        if (r != COLD_HOT_SEAM_OK)
+            return r;
+    }
+    if (out)
+        *out = current;
+    SeamClear(error);
+    return COLD_HOT_SEAM_OK;
+}
+
+ColdHotSeamResult ColdHotSeamNavigator::GetNextActiveR(const BlockIndexNavigationRef& ref,
+                                                       ColdHotSeamSnapshot* out,
+                                                       std::string* error) const
+{
+    ColdHotSeamSnapshot current;
+    {
+        const ColdHotSeamResult r = ResolveR(ref, &current, error);
+        if (r != COLD_HOT_SEAM_OK)
+            return r;
+    }
+
+    if (current.ref.IsCold())
+    {
+        if (!current.snapshot.fInMainChain)
+        {
+            // Side cold block: no active successor (legacy pnext==NULL).
+            SeamClear(error);
+            return COLD_HOT_SEAM_END_OF_ACTIVE_CHAIN;
+        }
+        if (!IsAtColdTip(current.snapshot))
+        {
+            BlockIndexSnapshot next;
+            const BlockIndexV2ReadStatus st = coldReader.GetNextActive(current.snapshot.id, &next, error);
+            if (st == BLOCK_INDEX_V2_READ_NOT_FOUND)
+                return COLD_HOT_SEAM_END_OF_ACTIVE_CHAIN; // cold tip / no successor
+            if (st != BLOCK_INDEX_V2_READ_FOUND)
+                return ColdHotSeamResultFromReadStatus(st); // corrupt -> fail closed
+            return MakeCold(next, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+        }
+        if (!VerifySeam(error))
+            return COLD_HOT_SEAM_AUTHORITY_FAILURE; // seam failure -> fail closed
+        const BlockIndexSnapshot next = testHotResolver ? testHotResolver->GetActiveByHeight(current.snapshot.height + 1) : hotAccessor.GetActiveByHeight(current.snapshot.height + 1);
+        if (!next.found)
+            return COLD_HOT_SEAM_END_OF_ACTIVE_CHAIN; // cold seam is current live tip
+        if (next.hashPrev != current.snapshot.hash)
+            return SeamFail(error, "hot successor does not extend cold seam") ? COLD_HOT_SEAM_AUTHORITY_FAILURE : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+        return MakeHot(next, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    }
+
+    const BlockIndexSnapshot next = testHotResolver ? testHotResolver->GetNextActiveByHash(current.snapshot.hash) : hotAccessor.GetNextActive(current.snapshot.id);
+    if (!next.found)
+        return COLD_HOT_SEAM_END_OF_ACTIVE_CHAIN; // genuine successor absence
+    const BlockIndexSnapshot coldTip = coldReader.GetTip();
+    if (next.fInMainChain && next.height <= coldTip.height)
+    {
+        ColdHotSeamSnapshot coldNext;
+        const ColdHotSeamResult cr = ResolveLogicalR(BlockIndexLogicalId(next.hash), &coldNext, error);
+        if (cr != COLD_HOT_SEAM_OK)
+            return cr;
+        return MakeCold(coldNext.snapshot, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    }
+    return MakeHot(next, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+}
+
+bool ColdHotSeamNavigator::GetParent(const BlockIndexNavigationRef& ref,
+                                     ColdHotSeamSnapshot* out,
+                                     std::string* error) const
+{
+    return GetParentR(ref, out, error) == COLD_HOT_SEAM_OK;
 }
 
 bool ColdHotSeamNavigator::GetAncestor(const BlockIndexNavigationRef& ref,
@@ -213,85 +363,14 @@ bool ColdHotSeamNavigator::GetAncestor(const BlockIndexNavigationRef& ref,
                                        ColdHotSeamSnapshot* out,
                                        std::string* error) const
 {
-    ColdHotSeamSnapshot current;
-    if (!Resolve(ref, &current, error))
-        return false;
-    if (targetHeight < 0 || targetHeight > current.snapshot.height)
-        return SeamFail(error, "invalid ancestor target height");
-
-    // Cold active blocks resolve ancestor in O(1) via active.dat (the reader's
-    // own fast path), never an O(depth) parent walk.
-    if (current.ref.IsCold())
-    {
-        BlockIndexSnapshot ancestor;
-        if (coldReader.GetAncestor(current.snapshot.id, targetHeight, &ancestor, error) != BLOCK_INDEX_V2_READ_FOUND)
-            return false;
-        return MakeCold(ancestor, out, error);
-    }
-
-    // Hot block: if the whole ancestor path stays above the seam and the block
-    // is active, resolve by height in O(1); otherwise fall back to a bounded
-    // parent walk that crosses to cold at the seam.
-    const BlockIndexSnapshot coldTip = coldReader.GetTip();
-    if (current.snapshot.fInMainChain && targetHeight > coldTip.height)
-    {
-        const BlockIndexSnapshot ancestor = testHotResolver ? testHotResolver->GetActiveByHeight(targetHeight) : hotAccessor.GetActiveByHeight(targetHeight);
-        if (!ancestor.found)
-            return SeamFail(error, "hot ancestor not found");
-        return MakeHot(ancestor, out, error);
-    }
-    while (current.snapshot.height > targetHeight)
-    {
-        if (!GetParent(current.ref, &current, error))
-            return false;
-    }
-    if (out)
-        *out = current;
-    SeamClear(error);
-    return true;
+    return GetAncestorR(ref, targetHeight, out, error) == COLD_HOT_SEAM_OK;
 }
 
 bool ColdHotSeamNavigator::GetNextActive(const BlockIndexNavigationRef& ref,
                                          ColdHotSeamSnapshot* out,
                                          std::string* error) const
 {
-    ColdHotSeamSnapshot current;
-    if (!Resolve(ref, &current, error))
-        return false;
-
-    if (current.ref.IsCold())
-    {
-        if (!current.snapshot.fInMainChain)
-            return SeamFail(error, "side block has no active successor");
-        if (!IsAtColdTip(current.snapshot))
-        {
-            BlockIndexSnapshot next;
-            if (coldReader.GetNextActive(current.snapshot.id, &next, error) != BLOCK_INDEX_V2_READ_FOUND)
-                return false;
-            return MakeCold(next, out, error);
-        }
-        if (!VerifySeam(error))
-            return false;
-        const BlockIndexSnapshot next = testHotResolver ? testHotResolver->GetActiveByHeight(current.snapshot.height + 1) : hotAccessor.GetActiveByHeight(current.snapshot.height + 1);
-        if (!next.found)
-            return SeamFail(error, "cold seam is current live tip");
-        if (next.hashPrev != current.snapshot.hash)
-            return SeamFail(error, "hot successor does not extend cold seam");
-        return MakeHot(next, out, error);
-    }
-
-    const BlockIndexSnapshot next = testHotResolver ? testHotResolver->GetNextActiveByHash(current.snapshot.hash) : hotAccessor.GetNextActive(current.snapshot.id);
-    if (!next.found)
-        return SeamFail(error, "hot block has no active successor");
-    const BlockIndexSnapshot coldTip = coldReader.GetTip();
-    if (next.fInMainChain && next.height <= coldTip.height)
-    {
-        ColdHotSeamSnapshot coldNext;
-        if (!LookupCold(BlockIndexLogicalId(next.hash), &coldNext, error))
-            return false;
-        return MakeCold(coldNext.snapshot, out, error);
-    }
-    return MakeHot(next, out, error);
+    return GetNextActiveR(ref, out, error) == COLD_HOT_SEAM_OK;
 }
 
 bool ColdHotSeamNavigator::GetStakingMetadata(const BlockIndexNavigationRef& ref,
@@ -301,7 +380,7 @@ bool ColdHotSeamNavigator::GetStakingMetadata(const BlockIndexNavigationRef& ref
     if (!out)
         return SeamFail(error, "null staking metadata output");
     ColdHotSeamSnapshot current;
-    if (!Resolve(ref, &current, error))
+    if (ResolveLogicalR(ref.logical, &current, error) != COLD_HOT_SEAM_OK)
         return false;
     if (current.ref.IsHot())
     {
@@ -328,7 +407,7 @@ bool ColdHotSeamNavigator::GetStakeModifierTime(const BlockIndexNavigationRef& r
     if (!out)
         return SeamFail(error, "null modifier time output");
     ColdHotSeamSnapshot current;
-    if (!Resolve(ref, &current, error))
+    if (ResolveLogicalR(ref.logical, &current, error) != COLD_HOT_SEAM_OK)
         return false;
     if (current.ref.IsHot())
     {
@@ -350,7 +429,7 @@ bool ColdHotSeamNavigator::GetStakeModifierChecksum(const BlockIndexNavigationRe
     if (!out)
         return SeamFail(error, "null modifier checksum output");
     ColdHotSeamSnapshot current;
-    if (!Resolve(ref, &current, error))
+    if (ResolveLogicalR(ref.logical, &current, error) != COLD_HOT_SEAM_OK)
         return false;
     if (current.ref.IsHot())
     {
@@ -365,35 +444,70 @@ bool ColdHotSeamNavigator::GetStakeModifierChecksum(const BlockIndexNavigationRe
     return true;
 }
 
-bool ColdHotSeamNavigator::ResolveLogical(const BlockIndexLogicalId& logical,
-                                          ColdHotSeamSnapshot* out,
-                                          std::string* error) const
+// ---------------------------------------------------------------------------
+// Typed, fail-closed logical resolution (A.9a.3c).
+//
+// A cold lookup that FOUND a block is authoritative for the frozen prefix. A
+// GENUINE cold NOT_FOUND (the block is simply not present in the cold domain —
+// e.g. a hot tail block above the seam, or a non-recorded side block) is the
+// ONLY outcome eligible for a hot lookup. A cold AUTHORITY_FAILURE (stale
+// generation, changed CURRENT, corrupt record/hash index, divergent seam, or
+// failed cold->hot crossing) FAILS CLOSED and never falls back to legacy
+// historical mapBlockIndex residency.
+// ---------------------------------------------------------------------------
+ColdHotSeamResult ColdHotSeamNavigator::ResolveLogicalR(const BlockIndexLogicalId& logical,
+                                                        ColdHotSeamSnapshot* out,
+                                                        std::string* error) const
 {
     if (!logical.IsValid())
-        return SeamFail(error, "invalid logical block identity");
-    // Cold first; a cold block is authoritative for the frozen prefix.
-    if (LookupCold(logical, out, error))
-        return true;
-    // A cold-side miss is an empty/"not found" (Snapshot not found), not an
-    // authoritative failure; a hash check / unresolvable cold means not cold.
-    if (LookupHot(logical, out, error))
-        return true;
-    // Distinguish "present but unusable" from "absent": both fail; the caller
-    // sees a not-found (out left untouched/found=false) or an explicit error.
-    return false;
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    AssertLockHeld(cs_main);
+
+    // Cold-first, but ONLY when the cold layer is actually open and its seam
+    // verifies (so an authority failure cannot be masked by hot resolution).
+    if (IsOpen())
+    {
+        if (coldReader.CurrentSelectionChanged(error))
+            return COLD_HOT_SEAM_AUTHORITY_FAILURE; // stale CURRENT -> fail closed
+        BlockIndexSnapshot cold;
+        const BlockIndexV2ReadStatus st = coldReader.LookupByHash(logical.GetHash(), &cold, error);
+        if (st == BLOCK_INDEX_V2_READ_FOUND)
+        {
+            if (cold.hash != logical.GetHash())
+                return COLD_HOT_SEAM_AUTHORITY_FAILURE; // hash mismatch -> fail closed
+            if (!MakeCold(cold, out, error))
+                return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+            SeamClear(error);
+            return COLD_HOT_SEAM_OK;
+        }
+        if (st != BLOCK_INDEX_V2_READ_NOT_FOUND)
+            return COLD_HOT_SEAM_AUTHORITY_FAILURE; // corrupt/io/not-open -> fail closed
+        // Genuine cold NOT_FOUND: eligible for hot lookup.
+    }
+
+    const BlockIndexSnapshot hot = testHotResolver ? testHotResolver->LookupByHash(logical.GetHash()) : hotAccessor.LookupByHash(logical.GetHash());
+    if (!hot.found)
+        return COLD_HOT_SEAM_NOT_FOUND;
+    if (hot.hash != logical.GetHash())
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    if (!MakeHot(hot, out, error))
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    SeamClear(error);
+    return COLD_HOT_SEAM_OK;
 }
 
-bool ColdHotSeamNavigator::GetLastStakeModifier(const BlockIndexLogicalId& start,
-                                                uint64_t* nStakeModifier,
-                                                int64_t* nModifierTime,
-                                                std::string* error) const
+ColdHotSeamResult ColdHotSeamNavigator::GetLastStakeModifierR(const BlockIndexLogicalId& start,
+                                                              uint64_t* nStakeModifier,
+                                                              int64_t* nModifierTime,
+                                                              std::string* error) const
 {
     if (!nStakeModifier || !nModifierTime)
-        return SeamFail(error, "null GetLastStakeModifier output");
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
     AssertLockHeld(cs_main);
     ColdHotSeamSnapshot cur;
-    if (!ResolveLogical(start, &cur, error))
-        return SeamFail(error, "GetLastStakeModifier: block not resolvable");
+    const ColdHotSeamResult r0 = ResolveLogicalR(start, &cur, error);
+    if (r0 != COLD_HOT_SEAM_OK)
+        return r0;
 
     // Walk parents until a generated-modifier block. Mirrors kernel.cpp
     // GetLastStakeModifier exactly: advance while pprev exists and the current
@@ -402,32 +516,45 @@ bool ColdHotSeamNavigator::GetLastStakeModifier(const BlockIndexLogicalId& start
            !(cur.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER))
     {
         ColdHotSeamSnapshot parent;
-        if (!GetParent(cur.ref, &parent, error))
-            return false;
+        const ColdHotSeamResult pr = GetParentR(cur.ref, &parent, error);
+        if (pr != COLD_HOT_SEAM_OK)
+            return pr;
         cur = parent;
     }
     if (!(cur.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER))
-        return SeamFail(error, "GetLastStakeModifier: no generation at genesis block");
+        return COLD_HOT_SEAM_NOT_FOUND;
     *nStakeModifier = cur.snapshot.nStakeModifier;
     *nModifierTime = (int64_t)cur.snapshot.nTime;
     SeamClear(error);
-    return true;
+    return COLD_HOT_SEAM_OK;
 }
 
-bool ColdHotSeamNavigator::GetKernelStakeModifier(const BlockIndexLogicalId& source,
-                                                  uint64_t* nStakeModifier,
-                                                  int* nStakeModifierHeight,
-                                                  int64_t* nStakeModifierTime,
-                                                  bool fPrintProofOfStake,
-                                                  std::string* error) const
+bool ColdHotSeamNavigator::GetLastStakeModifier(const BlockIndexLogicalId& start,
+                                                uint64_t* nStakeModifier,
+                                                int64_t* nModifierTime,
+                                                std::string* error) const
+{
+    return GetLastStakeModifierR(start, nStakeModifier, nModifierTime, error) == COLD_HOT_SEAM_OK;
+}
+
+ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndexLogicalId& source,
+                                                                uint64_t* nStakeModifier,
+                                                                int* nStakeModifierHeight,
+                                                                int64_t* nStakeModifierTime,
+                                                                bool fPrintProofOfStake,
+                                                                std::string* error,
+                                                                int* outFinalWalkHeight) const
 {
     if (!nStakeModifier || !nStakeModifierHeight || !nStakeModifierTime)
-        return SeamFail(error, "null GetKernelStakeModifier output");
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    if (outFinalWalkHeight)
+        *outFinalWalkHeight = -1;
     AssertLockHeld(cs_main);
     *nStakeModifier = 0;
     ColdHotSeamSnapshot from;
-    if (!ResolveLogical(source, &from, error))
-        return SeamFail(error, "GetKernelStakeModifier() : block not indexed");
+    const ColdHotSeamResult r0 = ResolveLogicalR(source, &from, error);
+    if (r0 != COLD_HOT_SEAM_OK)
+        return r0;
 
     *nStakeModifierHeight = from.snapshot.height;
     *nStakeModifierTime = (int64_t)from.snapshot.nTime;
@@ -435,28 +562,35 @@ bool ColdHotSeamNavigator::GetKernelStakeModifier(const BlockIndexLogicalId& sou
 
     // Forward active-chain walk from the source until the modifier is selected
     // a selection-interval later. Mirrors kernel.cpp GetKernelStakeModifier
-    // (2-arg) exactly; GetNextActive handles cold->cold and cold->hot seam.
+    // (2-arg) exactly. A GENUINE no-successor (END_OF_ACTIVE_CHAIN) may
+    // reproduce legacy reached-tip semantics; any navigation AUTHORITY_FAILURE
+    // fails closed and never becomes "reached tip".
     ColdHotSeamSnapshot pindex = from;
     while (*nStakeModifierTime < (int64_t)from.snapshot.nTime + nStakeModifierSelectionInterval)
     {
         ColdHotSeamSnapshot next;
-        if (!GetNextActive(pindex.ref, &next, error))
+        const ColdHotSeamResult nr = GetNextActiveR(pindex.ref, &next, error);
+        if (nr == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+            return COLD_HOT_SEAM_AUTHORITY_FAILURE; // never tip success
+        if (nr != COLD_HOT_SEAM_OK)
         {
-            // Reached the active tip / no successor. Mirrors legacy "reached
-            // best block" branch.
+            // END_OF_ACTIVE_CHAIN: reached the active tip / no successor.
+            // Mirrors legacy "reached best block" branch (pnext == NULL).
             if ((int64_t)pindex.snapshot.nTime >= (int64_t)from.snapshot.nTime + nStakeModifierSelectionInterval)
             {
                 *nStakeModifier = pindex.snapshot.nStakeModifier;
                 *nStakeModifierHeight = pindex.snapshot.height;
                 *nStakeModifierTime = (int64_t)pindex.snapshot.nTime;
+                if (outFinalWalkHeight)
+                    *outFinalWalkHeight = pindex.snapshot.height;
                 SeamClear(error);
-                return true;
+                return COLD_HOT_SEAM_OK;
             }
             if (fPrintProofOfStake ||
                 ((int64_t)pindex.snapshot.nTime + (int64_t)nStakeMinAge - nStakeModifierSelectionInterval > GetAdjustedTime()))
                 return SeamFail(error, strprintf("GetKernelStakeModifier() : reached best block from block %s",
-                                source.GetHash().ToString().c_str()));
-            return false;
+                                source.GetHash().ToString().c_str())) ? COLD_HOT_SEAM_AUTHORITY_FAILURE : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+            return COLD_HOT_SEAM_NOT_FOUND;
         }
         pindex = next;
         if (pindex.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
@@ -467,8 +601,187 @@ bool ColdHotSeamNavigator::GetKernelStakeModifier(const BlockIndexLogicalId& sou
     }
 
     *nStakeModifier = pindex.snapshot.nStakeModifier;
+    if (outFinalWalkHeight)
+        *outFinalWalkHeight = pindex.snapshot.height;
     SeamClear(error);
-    return true;
+    return COLD_HOT_SEAM_OK;
+}
+
+bool ColdHotSeamNavigator::GetKernelStakeModifier(const BlockIndexLogicalId& source,
+                                                  uint64_t* nStakeModifier,
+                                                  int* nStakeModifierHeight,
+                                                  int64_t* nStakeModifierTime,
+                                                  bool fPrintProofOfStake,
+                                                  std::string* error) const
+{
+    return GetKernelStakeModifierR(source, nStakeModifier, nStakeModifierHeight, nStakeModifierTime, fPrintProofOfStake, error) == COLD_HOT_SEAM_OK;
+}
+
+// ---------------------------------------------------------------------------
+// Three-argument GetKernelStakeModifier — bounded, no O(depth) memory or work
+// for the active-chain mainnet case.
+//
+// Legacy semantic problem: given source S and candidate branch tip T, the
+// modifier is selected along the forward (S->T) branch-local path, and S must
+// be proved an ancestor of T.
+//
+// The naive implementation walks T->S collecting one snapshot per ancestor and
+// reverses it (O(depth) RAM and O(depth) CPU). That history-scaled transient
+// vector is the A.10 blocker this phase removes.
+//
+// Exact derivation, split by branch context:
+//
+//   1. Resolve S and T by stable logical identity.
+//
+//   2a. ACTIVE-CHAIN case (S and T both fInMainChain, S.height <= T.height): on
+//       a single deterministic active chain, "S is an ancestor of T" is implied
+//       by heights (both are on the same chain). Verify in O(1) — no walk, no
+//       residency. Then walk FORWARD from S via GetNextActive until the running
+//       modifier time reaches the target; this walk is bounded by the selection
+//       interval in SECONDS (the number of blocks is ~interval/nTargetSpacing,
+//       independent of S's depth). Return the first generated-modifier block
+//       whose time >= target, exactly as legacy stops.
+//
+//   2b. SIDE-BRANCH case (candidate branch not on the active chain): the branch
+//       is inherently bounded (validation candidate branches are short/hot); a
+//       backward tip->S parent walk proves ancestry and finds the selection
+//       point with O(branch-depth) CPU and O(1) state.
+//
+// This preserves exact branch-local semantics while NEVER materializing an
+// O(depth) snapshot vector and NEVER requiring arbitrary historical CBlockIndex
+// residency for an active-chain source.
+// ---------------------------------------------------------------------------
+ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndexLogicalId& source,
+                                                                const BlockIndexLogicalId& branchTip,
+                                                                uint64_t* nStakeModifier,
+                                                                int* nStakeModifierHeight,
+                                                                int64_t* nStakeModifierTime,
+                                                                bool fPrintProofOfStake,
+                                                                std::string* error) const
+{
+    if (!nStakeModifier || !nStakeModifierHeight || !nStakeModifierTime)
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    AssertLockHeld(cs_main);
+
+    ColdHotSeamSnapshot from, tip;
+    const ColdHotSeamResult rs = ResolveLogicalR(source, &from, error);
+    if (rs != COLD_HOT_SEAM_OK)
+        return rs;
+    const ColdHotSeamResult rt = ResolveLogicalR(branchTip, &tip, error);
+    if (rt != COLD_HOT_SEAM_OK)
+        return rt;
+
+    const int64_t nTargetTime = (int64_t)from.snapshot.nTime + GetStakeModifierSelectionInterval();
+
+    // --- ACTIVE-CHAIN fast path -------------------------------------------
+    // Both source and tip are on the single active chain with source not above
+    // tip: S is an ancestor of T (same chain). No depth-scaled ancestry walk.
+    if (from.snapshot.fInMainChain && tip.snapshot.fInMainChain &&
+        from.snapshot.height <= tip.snapshot.height)
+    {
+        int runHeight = from.snapshot.height;
+        int64_t runTime = (int64_t)from.snapshot.nTime;
+        ColdHotSeamSnapshot cur = from;
+        while (runTime < nTargetTime)
+        {
+            // Advance one active step, but never past the branch tip (legacy
+            // path is S..T inclusive).
+            if (cur.snapshot.height >= tip.snapshot.height)
+                break;
+            ColdHotSeamSnapshot next;
+            const ColdHotSeamResult nr = GetNextActiveR(cur.ref, &next, error);
+            if (nr == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+                return COLD_HOT_SEAM_AUTHORITY_FAILURE; // fail closed
+            if (nr != COLD_HOT_SEAM_OK)
+                break; // end of active chain before target
+            cur = next;
+            // Mirror legacy: update running modifier time/height only at a
+            // generated-modifier block, then test against the target. This
+            // examines the tip block exactly as legacy's forward loop does.
+            if (cur.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
+            {
+                runHeight = cur.snapshot.height;
+                runTime = (int64_t)cur.snapshot.nTime;
+            }
+            if (runTime >= nTargetTime)
+            {
+                *nStakeModifier = cur.snapshot.nStakeModifier;
+                *nStakeModifierHeight = runHeight;
+                *nStakeModifierTime = runTime;
+                SeamClear(error);
+                return COLD_HOT_SEAM_OK;
+            }
+            if (cur.snapshot.height >= tip.snapshot.height)
+                break;
+        }
+        // Legacy tip fallback: tip's own time already reached the target.
+        if ((int64_t)tip.snapshot.nTime >= nTargetTime)
+        {
+            *nStakeModifier = tip.snapshot.nStakeModifier;
+            *nStakeModifierHeight = tip.snapshot.height;
+            *nStakeModifierTime = (int64_t)tip.snapshot.nTime;
+            SeamClear(error);
+            return COLD_HOT_SEAM_OK;
+        }
+        if (fPrintProofOfStake)
+            return SeamFail(error, "GetKernelStakeModifier() : candidate branch ends before selection interval") ? COLD_HOT_SEAM_NOT_FOUND : COLD_HOT_SEAM_NOT_FOUND;
+        return COLD_HOT_SEAM_NOT_FOUND;
+    }
+
+    // --- SIDE-BRANCH path --------------------------------------------------
+    // Candidate branch context: prove S in the branch by a bounded backward walk
+    // and find the selection point with O(1) state (O(branch-depth) CPU only).
+    ColdHotSeamSnapshot cur = tip;
+    ColdHotSeamSnapshot best;         // lowest-height generated modifier ancestor reaching target
+    bool hasBest = false;
+    bool foundSource = (cur.snapshot.hash == source.GetHash() &&
+                        cur.snapshot.height == from.snapshot.height);
+    while (!foundSource && cur.snapshot.hasParent)
+    {
+        // cur is not the source here (foundSource false) and is on the branch.
+        if ((cur.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER) &&
+            (int64_t)cur.snapshot.nTime >= nTargetTime)
+        {
+            best = cur;
+            hasBest = true;
+        }
+        ColdHotSeamSnapshot parent;
+        const ColdHotSeamResult pr = GetParentR(cur.ref, &parent, error);
+        if (pr != COLD_HOT_SEAM_OK)
+            return pr; // authority/parent failure -> fail closed
+        cur = parent;
+        if (cur.snapshot.hash == source.GetHash() &&
+            cur.snapshot.height == from.snapshot.height)
+        {
+            foundSource = true;
+            break;
+        }
+    }
+    if (!foundSource)
+        return SeamFail(error, "GetKernelStakeModifier() : stake source is not an ancestor of candidate branch") ? COLD_HOT_SEAM_NOT_FOUND : COLD_HOT_SEAM_NOT_FOUND;
+
+    if (hasBest)
+    {
+        *nStakeModifier = best.snapshot.nStakeModifier;
+        *nStakeModifierHeight = best.snapshot.height;
+        *nStakeModifierTime = (int64_t)best.snapshot.nTime;
+        SeamClear(error);
+        return COLD_HOT_SEAM_OK;
+    }
+
+    // Legacy tip fallback: if the candidate branch tip's own time has already
+    // reached the target, its inherited modifier is authoritative.
+    if ((int64_t)tip.snapshot.nTime >= nTargetTime)
+    {
+        *nStakeModifier = tip.snapshot.nStakeModifier;
+        *nStakeModifierHeight = tip.snapshot.height;
+        *nStakeModifierTime = (int64_t)tip.snapshot.nTime;
+        SeamClear(error);
+        return COLD_HOT_SEAM_OK;
+    }
+    if (fPrintProofOfStake)
+        return SeamFail(error, "GetKernelStakeModifier() : candidate branch ends before selection interval") ? COLD_HOT_SEAM_NOT_FOUND : COLD_HOT_SEAM_NOT_FOUND;
+    return COLD_HOT_SEAM_NOT_FOUND;
 }
 
 bool ColdHotSeamNavigator::GetKernelStakeModifier(const BlockIndexLogicalId& source,
@@ -479,71 +792,5 @@ bool ColdHotSeamNavigator::GetKernelStakeModifier(const BlockIndexLogicalId& sou
                                                   bool fPrintProofOfStake,
                                                   std::string* error) const
 {
-    if (!nStakeModifier || !nStakeModifierHeight || !nStakeModifierTime)
-        return SeamFail(error, "null GetKernelStakeModifier output");
-    AssertLockHeld(cs_main);
-
-    // Resolve source and candidate-branch tip (the hot block being validated).
-    ColdHotSeamSnapshot from, tip;
-    if (!ResolveLogical(source, &from, error))
-        return SeamFail(error, "GetKernelStakeModifier() : block not indexed");
-    if (!ResolveLogical(branchTip, &tip, error))
-        return SeamFail(error, "GetKernelStakeModifier() : candidate prev not indexed");
-
-    // Backward ancestor path from branch tip down to the source. Mirrors
-    // kernel.cpp 3-arg walk (pindexPrev->pprev until source). Both are
-    // by-value parent steps (cold reader or hot resolver), so no arbitrary
-    // historical CBlockIndex residency is required.
-    std::vector<ColdHotSeamSnapshot> path;
-    path.push_back(tip);
-    ColdHotSeamSnapshot cur = tip;
-    bool found = (tip.snapshot.hash == source.GetHash() &&
-                  tip.snapshot.height == from.snapshot.height);
-    while (!found && cur.snapshot.hasParent)
-    {
-        ColdHotSeamSnapshot parent;
-        if (!GetParent(cur.ref, &parent, error))
-            return false;
-        cur = parent;
-        path.push_back(cur);
-        if (cur.snapshot.hash == source.GetHash() && cur.snapshot.height == from.snapshot.height)
-            found = true;
-    }
-    if (!found || path.empty() || path.back().snapshot.hash != source.GetHash())
-        return SeamFail(error, "GetKernelStakeModifier() : stake source is not an ancestor of candidate branch");
-    std::reverse(path.begin(), path.end());
-
-    *nStakeModifier = from.snapshot.nStakeModifier;
-    *nStakeModifierHeight = from.snapshot.height;
-    *nStakeModifierTime = (int64_t)from.snapshot.nTime;
-    const int64_t nTargetTime = (int64_t)from.snapshot.nTime + GetStakeModifierSelectionInterval();
-
-    for (size_t i = 1; i < path.size(); ++i)
-    {
-        const ColdHotSeamSnapshot& pindex = path[i];
-        if (pindex.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
-        {
-            *nStakeModifierHeight = pindex.snapshot.height;
-            *nStakeModifierTime = (int64_t)pindex.snapshot.nTime;
-        }
-        if (*nStakeModifierTime >= nTargetTime)
-        {
-            *nStakeModifier = pindex.snapshot.nStakeModifier;
-            SeamClear(error);
-            return true;
-        }
-    }
-    const ColdHotSeamSnapshot& pindexTip = path.back();
-    if (pindexTip.snapshot.hash == tip.snapshot.hash &&
-        (int64_t)pindexTip.snapshot.nTime >= nTargetTime)
-    {
-        *nStakeModifier = pindexTip.snapshot.nStakeModifier;
-        *nStakeModifierHeight = pindexTip.snapshot.height;
-        *nStakeModifierTime = (int64_t)pindexTip.snapshot.nTime;
-        SeamClear(error);
-        return true;
-    }
-    if (fPrintProofOfStake)
-        return SeamFail(error, "GetKernelStakeModifier() : candidate branch ends before selection interval");
-    return false;
+    return GetKernelStakeModifierR(source, branchTip, nStakeModifier, nStakeModifierHeight, nStakeModifierTime, fPrintProofOfStake, error) == COLD_HOT_SEAM_OK;
 }

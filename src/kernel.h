@@ -57,6 +57,17 @@ bool CheckStakeModifierCheckpoints(int nHeight, unsigned int nStakeModifierCheck
 bool GetKernelStakeModifier(uint256 hashBlockFrom, uint64_t& nStakeModifier, int& nStakeModifierHeight, int64_t& nStakeModifierTime, bool fPrintProofOfStake);
 bool GetKernelStakeModifier(uint256 hashBlockFrom, const CBlockIndex* pindexPrev, uint64_t& nStakeModifier, int& nStakeModifierHeight, int64_t& nStakeModifierTime, bool fPrintProofOfStake);
 
+// A.9a.3c: production by-value resolution of an active-chain ancestor block's
+// identity/metadata, used by wallet source discovery so an arbitrarily old note
+// block no longer requires a resident CBlockIndex* / continuous pprev walk.
+// When a production navigator is retained this returns true and fills
+// *hashOut/*nTimeOut/*nFlagsOut from stable cold/hot navigation (O(1)-ish,
+// no arbitrary-depth pprev topology). When no navigator is retained it returns
+// false and the caller uses its legacy fallback. Returns true-with-*found=false
+// for a correctly-resolved but absent block.
+bool GetStakingAncestorSnapshot(const CBlockIndex* pindexPrev, int targetHeight,
+    uint256* hashOut, unsigned int* nTimeOut, unsigned int* nFlagsOut);
+
 // Get time weight using supplied timestamps
 int64_t GetWeight(int64_t nIntervalBeginning, int64_t nIntervalEnd);
 

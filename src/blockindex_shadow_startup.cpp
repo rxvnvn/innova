@@ -22,6 +22,11 @@ bool g_shadowOpened = false;
 // is heap-allocated once. NULL until a READY generation is retained.
 std::unique_ptr<BlockIndexV2Reader> g_shadowReader;
 
+// A.9a.3c: exactly one retained ColdHotSeamNavigator for production staking
+// navigation. Owns its own read-only V2 reader on the validated generation plus
+// the LegacyBlockIndexAccessor hot side. NULL until retained.
+std::unique_ptr<ColdHotSeamNavigator> g_stakingNavigator;
+
 } // namespace
 
 BlockIndexRecord BlockIndexRecordFromIndex(const CBlockIndex* pindex)
@@ -151,10 +156,22 @@ const BlockIndexV2ShadowState& TryOpenBlockIndexV2Shadow()
                    (unsigned long long)g_shadowReader->Generation());
         else
             printf("BLOCKINDEX_V2_SHADOW reader_retain_failed error=%s\n", readerErr.c_str());
+
+        // A.9a.3c: retain the production staking navigator on the same validated
+        // generation. Non-strict: if this fails, staking falls back to legacy
+        // (which remains authoritative until A.10); the shadow state is unchanged.
+        std::string navErr;
+        bool navRetained = RetainBlockIndexStakingNavigator(root, &navErr);
+        if (navRetained)
+            printf("BLOCKINDEX_V2_SHADOW staking_navigator_retained=1 generation=%llu\n",
+                   (unsigned long long)g_stakingNavigator->ColdGeneration());
+        else
+            printf("BLOCKINDEX_V2_SHADOW staking_navigator_retain_failed error=%s\n", navErr.c_str());
     }
     else
     {
         g_shadowReader.reset();
+        g_stakingNavigator.reset();
     }
 
     g_shadowOpened = true;
@@ -201,6 +218,36 @@ const BlockIndexV2Reader* GetBlockIndexV2ShadowReader()
 {
     LOCK(cs_shadowState);
     return g_shadowReader.get();
+}
+
+bool RetainBlockIndexStakingNavigator(const std::string& root, std::string* error)
+{
+    if (error)
+        error->clear();
+    LOCK(cs_shadowState);
+    std::unique_ptr<ColdHotSeamNavigator> nav(new ColdHotSeamNavigator());
+    BlockIndexV2ReaderOptions options;   // single shared 64 MiB bounded LRU default
+    std::string navErr;
+    if (!nav->Open(root, options, &navErr))
+    {
+        if (error)
+            *error = navErr;
+        return false;
+    }
+    g_stakingNavigator.swap(nav);
+    return true;
+}
+
+const ColdHotSeamNavigator* GetBlockIndexStakingNavigator()
+{
+    LOCK(cs_shadowState);
+    return g_stakingNavigator.get();
+}
+
+void ClearBlockIndexStakingNavigator()
+{
+    LOCK(cs_shadowState);
+    g_stakingNavigator.reset();
 }
 
 BlockIndexV2ReaderCacheStats GetBlockIndexV2ShadowReaderCacheStats()

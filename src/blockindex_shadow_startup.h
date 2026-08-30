@@ -3,6 +3,7 @@
 
 #include "blockindex_shadow_runtime.h"
 #include "blockindex_v2_reader.h"
+#include "cold_hot_seam.h"
 
 #include <string>
 
@@ -51,6 +52,19 @@ bool RetainBlockIndexV2ShadowReader(const std::string& root, std::string* error)
 // not READY). The returned object is bound to the generation it opened and does
 // not auto-switch if CURRENT changes.
 const BlockIndexV2Reader* GetBlockIndexV2ShadowReader();
+
+// A.9a.3c: production staking-navigation authority. When the V2 shadow is READY
+// we retain exactly one ColdHotSeamNavigator (cold V2 reader + LegacyBlockIndexAccessor)
+// so real wallet/validation staking callers can resolve historical blocks by-value
+// (no arbitrary CBlockIndex residency) with typed, fail-closed authority. The
+// navigator is authoritative ONLY for the re-pointed staking navigation paths it
+// is asked to serve; it does not influence chain selection or other consensus.
+bool RetainBlockIndexStakingNavigator(const std::string& v2Root, std::string* error);
+// NULL when not retained (no V2 root / not READY / open failed).
+const ColdHotSeamNavigator* GetBlockIndexStakingNavigator();
+// Replaces exactly the navigator opened on the retained/validated generation
+// (used by A.9a.3c code and tests; production startup calls the Retain path).
+void ClearBlockIndexStakingNavigator();
 
 // Cache statistics of the retained reader (zeroed when none retained). Used by
 // the diagnostic RPC to report bounded cache state without reopening.

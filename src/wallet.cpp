@@ -4678,20 +4678,40 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
 
                 std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(wnote.txhash);
                 CBlockIndex* pNoteBlock = NULL;
+                unsigned int nNoteBlockTime = 0;
+                uint256 noteBlockHash(0);
                 {
-                    CBlockIndex* pTest = pindexPrev;
-                    while (pTest && pTest->nHeight > wnote.nHeight)
-                        pTest = pTest->pprev;
-                    if (pTest && pTest->nHeight == wnote.nHeight)
-                        pNoteBlock = pTest;
+                    // A.9a.3c: prefer by-value stable navigation so an old note
+                    // block needs no resident CBlockIndex* / continuous pprev
+                    // topology. Falls back to the legacy pprev walk only when no
+                    // production navigator is retained.
+                    if (GetStakingAncestorSnapshot(pindexPrev, wnote.nHeight,
+                                                   &noteBlockHash, &nNoteBlockTime, NULL))
+                    {
+                        // resolved by-value; hash/time authoritative
+                    }
+                    else
+                    {
+                        CBlockIndex* pTest = pindexPrev;
+                        while (pTest && pTest->nHeight > wnote.nHeight)
+                            pTest = pTest->pprev;
+                        if (pTest && pTest->nHeight == wnote.nHeight)
+                        {
+                            pNoteBlock = pTest;
+                            noteBlockHash = pTest->GetBlockHash();
+                            nNoteBlockTime = pTest->nTime;
+                        }
+                    }
                 }
-                if (!pNoteBlock)
+                if (!pNoteBlock && noteBlockHash == uint256(0))
                 {
                     if (fDebug) printf("CreateCoinStake() : NullStake pNoteBlock not found for height %d\n", wnote.nHeight);
                     continue;
                 }
 
-                unsigned int nBlockTimeFrom = pNoteBlock->GetBlockTime();
+                unsigned int nBlockTimeFrom = nNoteBlockTime;
+                if (noteBlockHash == uint256(0))
+                    nBlockTimeFrom = pNoteBlock->GetBlockTime();
                 if (nBlockTimeFrom + nStakeMinAge > txNew.nTime)
                 {
                     if (fDebug) printf("CreateCoinStake() : NullStake note too young blockTime=%u minAge=%u txTime=%u\n", nBlockTimeFrom, nStakeMinAge, txNew.nTime);
@@ -4702,7 +4722,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
                 {
                     int nStakeModifierHeight = 0;
                     int64_t nStakeModifierTime = 0;
-                    uint256 hashBlock = pNoteBlock->GetBlockHash();
+                    uint256 hashBlock = noteBlockHash != uint256(0) ? noteBlockHash : pNoteBlock->GetBlockHash();
                     if (!GetKernelStakeModifier(hashBlock, nStakeModifier, nStakeModifierHeight, nStakeModifierTime, false))
                     {
                         if (fRegTest && pindexPrev)
@@ -4739,14 +4759,14 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
                     {
                         fKernelOk = CheckShieldedStakeKernelHashV2(nBits, nStakeModifier,
                                                                      nBlockTimeFrom, nTxPrevOffset,
-                                                                     pNoteBlock->nTime, nVoutN,
+                                                                     noteBlockHash != uint256(0) ? nNoteBlockTime : pNoteBlock->nTime, nVoutN,
                                                                      nTimeTx, wnote.note.nValue, nWeight);
                     }
                     else
                     {
                         fKernelOk = CheckShieldedStakeKernelHash(nBits, nStakeModifier,
                                                                    nBlockTimeFrom, nTxPrevOffset,
-                                                                   pNoteBlock->nTime, nVoutN,
+                                                                   noteBlockHash != uint256(0) ? nNoteBlockTime : pNoteBlock->nTime, nVoutN,
                                                                    nTimeTx, wnote.note.nValue, nWeight);
                     }
 
@@ -5073,17 +5093,37 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
                         continue;
 
                     CBlockIndex* pNoteBlock = NULL;
+                    unsigned int nNoteBlockTime = 0;
+                    uint256 noteBlockHash(0);
                     {
-                        CBlockIndex* pTest = pindexPrev;
-                        while (pTest && pTest->nHeight > wnote.nHeight)
-                            pTest = pTest->pprev;
-                        if (pTest && pTest->nHeight == wnote.nHeight)
-                            pNoteBlock = pTest;
+                        // A.9a.3c: prefer by-value stable navigation so an old
+                        // note block needs no resident CBlockIndex* / continuous
+                        // pprev topology. Falls back to the legacy pprev walk only
+                        // when no production navigator is retained.
+                        if (GetStakingAncestorSnapshot(pindexPrev, wnote.nHeight,
+                                                       &noteBlockHash, &nNoteBlockTime, NULL))
+                        {
+                            // resolved by-value; hash/time authoritative
+                        }
+                        else
+                        {
+                            CBlockIndex* pTest = pindexPrev;
+                            while (pTest && pTest->nHeight > wnote.nHeight)
+                                pTest = pTest->pprev;
+                            if (pTest && pTest->nHeight == wnote.nHeight)
+                            {
+                                pNoteBlock = pTest;
+                                noteBlockHash = pTest->GetBlockHash();
+                                nNoteBlockTime = pTest->nTime;
+                            }
+                        }
                     }
-                    if (!pNoteBlock)
+                    if (!pNoteBlock && noteBlockHash == uint256(0))
                         continue;
 
-                    unsigned int nBlockTimeFrom = pNoteBlock->GetBlockTime();
+                    unsigned int nBlockTimeFrom = nNoteBlockTime;
+                    if (noteBlockHash == uint256(0))
+                        nBlockTimeFrom = pNoteBlock->GetBlockTime();
                     if (nBlockTimeFrom + nStakeMinAge > txNew.nTime)
                         continue;
 
@@ -5091,7 +5131,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
                     {
                         int nStakeModifierHeight = 0;
                         int64_t nStakeModifierTime = 0;
-                        uint256 hashBlock = pNoteBlock->GetBlockHash();
+                        uint256 hashBlock = noteBlockHash != uint256(0) ? noteBlockHash : pNoteBlock->GetBlockHash();
                         if (!GetKernelStakeModifier(hashBlock, nStakeModifier, nStakeModifierHeight, nStakeModifierTime, false))
                         {
                             if (fRegTest && pindexPrev)
@@ -5112,7 +5152,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
 
                         bool fKernelOk = CheckShieldedStakeKernelHashV3(nBits, nStakeModifier,
                                                                          nBlockTimeFrom, nTxPrevOffset,
-                                                                         pNoteBlock->nTime, nVoutN,
+                                                                         noteBlockHash != uint256(0) ? nNoteBlockTime : pNoteBlock->nTime, nVoutN,
                                                                          nTimeTx, wnote.note.nValue, nWeight);
                         if (fKernelOk)
                         {
