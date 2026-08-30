@@ -140,12 +140,19 @@ static int64_t GetStakeModifierSelectionIntervalSection(int nSection)
 }
 
 // Get stake modifier selection interval (in seconds)
-static int64_t GetStakeModifierSelectionInterval()
+static int64_t GetStakeModifierSelectionIntervalInternal()
 {
     int64_t nSelectionInterval = 0;
     for (int nSection=0; nSection<64; nSection++)
         nSelectionInterval += GetStakeModifierSelectionIntervalSection(nSection);
     return nSelectionInterval;
+}
+
+// Exported non-static wrapper so by-value navigation (cold_hot_seam.cpp) can
+// reuse the exact legacy selection-interval arithmetic.
+int64_t GetStakeModifierSelectionInterval()
+{
+    return GetStakeModifierSelectionIntervalInternal();
 }
 
 // select a block from the candidate blocks in vSortedByTimestamp, excluding

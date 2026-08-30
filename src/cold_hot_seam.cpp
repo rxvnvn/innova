@@ -1,4 +1,5 @@
 #include "cold_hot_seam.h"
+#include "kernel.h" // GetStakeModifierSelectionInterval, nModifierInterval
 
 namespace {
 static bool SeamFail(std::string* error, const std::string& text)
@@ -362,4 +363,187 @@ bool ColdHotSeamNavigator::GetStakeModifierChecksum(const BlockIndexNavigationRe
     if (coldReader.GetStakeModifierChecksum(current.snapshot.id, out, error) != BLOCK_INDEX_V2_READ_FOUND)
         return false;
     return true;
+}
+
+bool ColdHotSeamNavigator::ResolveLogical(const BlockIndexLogicalId& logical,
+                                          ColdHotSeamSnapshot* out,
+                                          std::string* error) const
+{
+    if (!logical.IsValid())
+        return SeamFail(error, "invalid logical block identity");
+    // Cold first; a cold block is authoritative for the frozen prefix.
+    if (LookupCold(logical, out, error))
+        return true;
+    // A cold-side miss is an empty/"not found" (Snapshot not found), not an
+    // authoritative failure; a hash check / unresolvable cold means not cold.
+    if (LookupHot(logical, out, error))
+        return true;
+    // Distinguish "present but unusable" from "absent": both fail; the caller
+    // sees a not-found (out left untouched/found=false) or an explicit error.
+    return false;
+}
+
+bool ColdHotSeamNavigator::GetLastStakeModifier(const BlockIndexLogicalId& start,
+                                                uint64_t* nStakeModifier,
+                                                int64_t* nModifierTime,
+                                                std::string* error) const
+{
+    if (!nStakeModifier || !nModifierTime)
+        return SeamFail(error, "null GetLastStakeModifier output");
+    AssertLockHeld(cs_main);
+    ColdHotSeamSnapshot cur;
+    if (!ResolveLogical(start, &cur, error))
+        return SeamFail(error, "GetLastStakeModifier: block not resolvable");
+
+    // Walk parents until a generated-modifier block. Mirrors kernel.cpp
+    // GetLastStakeModifier exactly: advance while pprev exists and the current
+    // block has not generated a modifier.
+    while (cur.snapshot.hasParent &&
+           !(cur.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER))
+    {
+        ColdHotSeamSnapshot parent;
+        if (!GetParent(cur.ref, &parent, error))
+            return false;
+        cur = parent;
+    }
+    if (!(cur.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER))
+        return SeamFail(error, "GetLastStakeModifier: no generation at genesis block");
+    *nStakeModifier = cur.snapshot.nStakeModifier;
+    *nModifierTime = (int64_t)cur.snapshot.nTime;
+    SeamClear(error);
+    return true;
+}
+
+bool ColdHotSeamNavigator::GetKernelStakeModifier(const BlockIndexLogicalId& source,
+                                                  uint64_t* nStakeModifier,
+                                                  int* nStakeModifierHeight,
+                                                  int64_t* nStakeModifierTime,
+                                                  bool fPrintProofOfStake,
+                                                  std::string* error) const
+{
+    if (!nStakeModifier || !nStakeModifierHeight || !nStakeModifierTime)
+        return SeamFail(error, "null GetKernelStakeModifier output");
+    AssertLockHeld(cs_main);
+    *nStakeModifier = 0;
+    ColdHotSeamSnapshot from;
+    if (!ResolveLogical(source, &from, error))
+        return SeamFail(error, "GetKernelStakeModifier() : block not indexed");
+
+    *nStakeModifierHeight = from.snapshot.height;
+    *nStakeModifierTime = (int64_t)from.snapshot.nTime;
+    const int64_t nStakeModifierSelectionInterval = GetStakeModifierSelectionInterval();
+
+    // Forward active-chain walk from the source until the modifier is selected
+    // a selection-interval later. Mirrors kernel.cpp GetKernelStakeModifier
+    // (2-arg) exactly; GetNextActive handles cold->cold and cold->hot seam.
+    ColdHotSeamSnapshot pindex = from;
+    while (*nStakeModifierTime < (int64_t)from.snapshot.nTime + nStakeModifierSelectionInterval)
+    {
+        ColdHotSeamSnapshot next;
+        if (!GetNextActive(pindex.ref, &next, error))
+        {
+            // Reached the active tip / no successor. Mirrors legacy "reached
+            // best block" branch.
+            if ((int64_t)pindex.snapshot.nTime >= (int64_t)from.snapshot.nTime + nStakeModifierSelectionInterval)
+            {
+                *nStakeModifier = pindex.snapshot.nStakeModifier;
+                *nStakeModifierHeight = pindex.snapshot.height;
+                *nStakeModifierTime = (int64_t)pindex.snapshot.nTime;
+                SeamClear(error);
+                return true;
+            }
+            if (fPrintProofOfStake ||
+                ((int64_t)pindex.snapshot.nTime + (int64_t)nStakeMinAge - nStakeModifierSelectionInterval > GetAdjustedTime()))
+                return SeamFail(error, strprintf("GetKernelStakeModifier() : reached best block from block %s",
+                                source.GetHash().ToString().c_str()));
+            return false;
+        }
+        pindex = next;
+        if (pindex.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
+        {
+            *nStakeModifierHeight = pindex.snapshot.height;
+            *nStakeModifierTime = (int64_t)pindex.snapshot.nTime;
+        }
+    }
+
+    *nStakeModifier = pindex.snapshot.nStakeModifier;
+    SeamClear(error);
+    return true;
+}
+
+bool ColdHotSeamNavigator::GetKernelStakeModifier(const BlockIndexLogicalId& source,
+                                                  const BlockIndexLogicalId& branchTip,
+                                                  uint64_t* nStakeModifier,
+                                                  int* nStakeModifierHeight,
+                                                  int64_t* nStakeModifierTime,
+                                                  bool fPrintProofOfStake,
+                                                  std::string* error) const
+{
+    if (!nStakeModifier || !nStakeModifierHeight || !nStakeModifierTime)
+        return SeamFail(error, "null GetKernelStakeModifier output");
+    AssertLockHeld(cs_main);
+
+    // Resolve source and candidate-branch tip (the hot block being validated).
+    ColdHotSeamSnapshot from, tip;
+    if (!ResolveLogical(source, &from, error))
+        return SeamFail(error, "GetKernelStakeModifier() : block not indexed");
+    if (!ResolveLogical(branchTip, &tip, error))
+        return SeamFail(error, "GetKernelStakeModifier() : candidate prev not indexed");
+
+    // Backward ancestor path from branch tip down to the source. Mirrors
+    // kernel.cpp 3-arg walk (pindexPrev->pprev until source). Both are
+    // by-value parent steps (cold reader or hot resolver), so no arbitrary
+    // historical CBlockIndex residency is required.
+    std::vector<ColdHotSeamSnapshot> path;
+    path.push_back(tip);
+    ColdHotSeamSnapshot cur = tip;
+    bool found = (tip.snapshot.hash == source.GetHash() &&
+                  tip.snapshot.height == from.snapshot.height);
+    while (!found && cur.snapshot.hasParent)
+    {
+        ColdHotSeamSnapshot parent;
+        if (!GetParent(cur.ref, &parent, error))
+            return false;
+        cur = parent;
+        path.push_back(cur);
+        if (cur.snapshot.hash == source.GetHash() && cur.snapshot.height == from.snapshot.height)
+            found = true;
+    }
+    if (!found || path.empty() || path.back().snapshot.hash != source.GetHash())
+        return SeamFail(error, "GetKernelStakeModifier() : stake source is not an ancestor of candidate branch");
+    std::reverse(path.begin(), path.end());
+
+    *nStakeModifier = from.snapshot.nStakeModifier;
+    *nStakeModifierHeight = from.snapshot.height;
+    *nStakeModifierTime = (int64_t)from.snapshot.nTime;
+    const int64_t nTargetTime = (int64_t)from.snapshot.nTime + GetStakeModifierSelectionInterval();
+
+    for (size_t i = 1; i < path.size(); ++i)
+    {
+        const ColdHotSeamSnapshot& pindex = path[i];
+        if (pindex.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
+        {
+            *nStakeModifierHeight = pindex.snapshot.height;
+            *nStakeModifierTime = (int64_t)pindex.snapshot.nTime;
+        }
+        if (*nStakeModifierTime >= nTargetTime)
+        {
+            *nStakeModifier = pindex.snapshot.nStakeModifier;
+            SeamClear(error);
+            return true;
+        }
+    }
+    const ColdHotSeamSnapshot& pindexTip = path.back();
+    if (pindexTip.snapshot.hash == tip.snapshot.hash &&
+        (int64_t)pindexTip.snapshot.nTime >= nTargetTime)
+    {
+        *nStakeModifier = pindexTip.snapshot.nStakeModifier;
+        *nStakeModifierHeight = pindexTip.snapshot.height;
+        *nStakeModifierTime = (int64_t)pindexTip.snapshot.nTime;
+        SeamClear(error);
+        return true;
+    }
+    if (fPrintProofOfStake)
+        return SeamFail(error, "GetKernelStakeModifier() : candidate branch ends before selection interval");
+    return false;
 }

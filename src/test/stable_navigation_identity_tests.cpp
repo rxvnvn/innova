@@ -3,6 +3,7 @@
 #include "../cold_hot_seam.h"
 #include "../blockindex_generation_builder.h"
 #include "../blockindex_generation_lifecycle.h"
+#include "../kernel.h"
 #include "../main.h"
 #include <boost/filesystem.hpp>
 
@@ -227,6 +228,194 @@ BOOST_FIXTURE_TEST_CASE(reorg_above_seam_is_hot_authoritative, HotFixture)
     // Crossing the seam resolves the (reorganized) hot successor by height.
     BOOST_REQUIRE(seam.GetNextActive(coldTip.ref, &crossing, &error));
     BOOST_CHECK(crossing.ref.IsHot());
+}
+
+// ---------------------------------------------------------------------------
+// A.9a.3 by-value staking navigation. Build a >seam chain where modifier
+// generation flags vary, then compare the navigator's by-value
+// GetLastStakeModifier / GetKernelStakeModifier against the legacy kernel.cpp
+// pointer functions on the same logical blocks.
+// ---------------------------------------------------------------------------
+namespace {
+static CBlockIndex* MakeHotFlagged(uint64_t hashValue, int height, bool fGenerated,
+                                   CBlockIndex* prev)
+{
+    CBlockIndex* p = new CBlockIndex();
+    p->phashBlock = new uint256(hashValue);
+    p->nHeight = height;
+    p->pprev = prev;
+    p->nTime = 1000 + height * 50;          // 50s per block -> reaches selection interval
+    p->nFlags = (fGenerated ? CBlockIndex::BLOCK_STAKE_MODIFIER : 0);
+    p->nStakeModifier = 100 + height;       // distinct per block for exact equality checks
+    p->hashProof = uint256(hashValue + 1000);
+    if (prev) prev->pnext = p;
+    return p;
+}
+
+static BlockIndexRecord RecordFlagged(uint64_t hashValue, int height, bool fGenerated,
+                                      const uint256& prev)
+{
+    BlockIndexRecord r;
+    r.hash = uint256(hashValue);
+    r.hashPrev = prev;
+    r.height = height;
+    r.nVersion = 1;
+    r.nTime = 1000 + height * 50;
+    r.nBits = 0x1d00ffff;
+    r.nFlags = (fGenerated ? CBlockIndex::BLOCK_STAKE_MODIFIER : 0);
+    r.nStakeModifier = 100 + height;
+    r.hashProof = uint256(hashValue + 1000);
+    return r;
+}
+
+// Builds both a hot resident graph (mapBlockIndex + pindexBest/genesis) and
+// a cold prefix generation from the same logical chain, for a chain of N blocks
+// where block `i` generates a modifier iff flags[i].
+struct StakingChainFixture : HotFixture
+{
+    static const int N = 8;
+    std::vector<bool> flags;
+    boost::filesystem::path root;
+    ColdHotSeamNavigator seam;
+    bool opened;
+
+    StakingChainFixture() : opened(false)
+    {
+        for (int i = 0; i < N; ++i)
+            flags.push_back((i == 0 || i == 3 || i == 6)); // genesis, some mid, some top
+        // hot resident chain 0..N-1
+        CBlockIndex* prev = NULL;
+        for (int h = 0; h < N; ++h)
+        {
+            CBlockIndex* p = MakeHotFlagged(100 + h, h, flags[h], prev);
+            created.push_back(p);
+            mapBlockIndex[p->GetBlockHash()] = p;
+            prev = p;
+        }
+        pindexGenesisBlock = created[0];
+        pindexBest = created[N - 1];
+        hashBestChain = pindexBest->GetBlockHash();
+        nBestHeight = N - 1;
+        nBestChainTrust = pindexBest->nChainTrust;
+
+        // cold prefix generation from heights 0..4 (seam at 4, hot tail 5..7)
+        BlockIndexGenerationSource prefix;
+        uint256 pprev(0);
+        for (int h = 0; h < 5; ++h)
+        {
+            BlockIndexRecord r = RecordFlagged(100 + h, h, flags[h], pprev);
+            BlockIndexGenerationSourceRecord q; q.hash = r.hash; q.record = r;
+            prefix.records.push_back(q);
+            pprev = r.hash;
+        }
+        prefix.hashBestChain = uint256(104);
+        prefix.foundBestChain = true;
+
+        root = UniqueRoot();
+        BlockIndexGenerationBuilder builder;
+        BlockIndexGenerationStats stats;
+        std::string cerr;
+        BOOST_REQUIRE_MESSAGE(builder.Build(prefix, (root / BlockIndexGenerationManager::GenerationName(1)).string(),
+                                            1, &stats, &cerr), cerr);
+        builder.Close();
+        BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &cerr) == BLOCK_INDEX_LIFECYCLE_OK, cerr);
+
+        BlockIndexV2ReaderOptions options;
+        BOOST_REQUIRE_MESSAGE(seam.Open(root.string(), options, &cerr), cerr);
+        opened = true;
+    }
+    uint256 Hash(int h) const { return uint256(100 + h); }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(staking_navigation_by_value_matches_legacy)
+{
+    // Shrink the modifier interval so a forward selection-interval walk is
+    // reachable within this short synthetic chain (mirrors stakemodifieropt_tests).
+    unsigned int saveInterval = nModifierInterval;
+    unsigned int saveSpacing = nTargetSpacing;
+    nModifierInterval = 60;      // 60s interval
+    nTargetSpacing = 5;          // ~12 candidate blocks per interval
+
+    try
+    {
+        StakingChainFixture fx;
+        LOCK(cs_main);
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(fx.seam.VerifySeam(&error), error);
+
+        // GetLastStakeModifier: from each block, last generated-modifier ancestor.
+        for (int h = 0; h < StakingChainFixture::N; ++h)
+        {
+            // expected: walk back to the nearest generated flag at-or-below h
+            int gen = h;
+            while (gen > 0 && !fx.flags[gen]) --gen;
+            BOOST_REQUIRE(fx.flags[gen]);
+
+            uint64_t mod = 0; int64_t t = 0;
+            std::string e;
+            BOOST_REQUIRE_MESSAGE(fx.seam.GetLastStakeModifier(BlockIndexLogicalId(fx.Hash(h)), &mod, &t, &e), e);
+            BOOST_CHECK_EQUAL(mod, (uint64_t)(100 + gen));
+            BOOST_CHECK_EQUAL(t, (int64_t)(1000 + gen * 50));
+        }
+
+        // GetKernelStakeModifier (forward selection-interval walk). Compare against
+        // the legacy pointer function on the SAME resident hot graph for sources
+        // both cold (below seam) and hot (above seam). Sources where the walk
+        // reaches the tip and the interval is unsatisfied hit the "reached best
+        // block" branch in BOTH implementations; the comparison still asserts
+        // identical success/failure and identical selected modifier.
+        for (int h = 0; h < StakingChainFixture::N; ++h)
+        {
+            uint64_t legacyMod = 0; int legacyH = 0; int64_t legacyT = 0;
+            uint64_t newMod = 0;   int newH = 0;     int64_t newT = 0;
+            const bool legacyOk = GetKernelStakeModifier(fx.Hash(h), legacyMod, legacyH, legacyT, false);
+            std::string e;
+            const bool newOk = fx.seam.GetKernelStakeModifier(BlockIndexLogicalId(fx.Hash(h)), &newMod, &newH, &newT, false, &e);
+            BOOST_CHECK_MESSAGE(newOk == legacyOk, "source h=" << h << " legacy=" << legacyOk << " new=" << newOk << " err=" << e);
+            if (newOk && legacyOk)
+            {
+                BOOST_CHECK_MESSAGE(newMod == legacyMod, "mod h=" << h << " legacy=" << legacyMod << " new=" << newMod);
+                BOOST_CHECK_EQUAL(newH, legacyH);
+                BOOST_CHECK_EQUAL(newT, legacyT);
+            }
+        }
+
+        // GetKernelStakeModifier (3-arg, backward branch-ancestry). Every source
+        // is an ancestor of the candidate tip (height N-1), so the legacy 3-arg
+        // must succeed; the by-value 3-arg must match it exactly.
+        {
+            const int tipH = StakingChainFixture::N - 1;
+            for (int h = 0; h <= tipH; ++h)
+            {
+                uint64_t legacyMod = 0; int legacyH = 0; int64_t legacyT = 0;
+                uint64_t newMod = 0;   int newH = 0;     int64_t newT = 0;
+                CBlockIndex* pTip = pindexBest;
+                const bool legacyOk = GetKernelStakeModifier(fx.Hash(h),
+                                                            pTip /* candidate prev */,
+                                                            legacyMod, legacyH, legacyT, false);
+                std::string e;
+                const bool newOk = fx.seam.GetKernelStakeModifier(
+                    BlockIndexLogicalId(fx.Hash(h)), BlockIndexLogicalId(fx.Hash(tipH)),
+                    &newMod, &newH, &newT, false, &e);
+                BOOST_CHECK_MESSAGE(newOk == legacyOk, "3arg source h=" << h << " legacy=" << legacyOk << " new=" << newOk << " err=" << e);
+                if (newOk && legacyOk)
+                {
+                    BOOST_CHECK_MESSAGE(newMod == legacyMod, "3arg mod h=" << h << " legacy=" << legacyMod << " new=" << newMod);
+                    BOOST_CHECK_EQUAL(newH, legacyH);
+                    BOOST_CHECK_EQUAL(newT, legacyT);
+                }
+            }
+        }
+    }
+    catch (...)
+    {
+        nModifierInterval = saveInterval;
+        nTargetSpacing = saveSpacing;
+        throw;
+    }
+    nModifierInterval = saveInterval;
+    nTargetSpacing = saveSpacing;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

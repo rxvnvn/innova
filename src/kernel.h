@@ -45,6 +45,12 @@ bool CheckCoinStakeTimestamp(int64_t nTimeBlock, int64_t nTimeTx);
 // Get stake modifier checksum
 unsigned int GetStakeModifierChecksum(const CBlockIndex* pindex);
 
+// Get stake modifier selection interval (seconds). Pure function of
+// nModifierInterval and MODIFIER_INTERVAL_RATIO; exported so by-value
+// navigation can mirror legacy GetKernelStakeModifier without kernel-local
+// traversal.
+int64_t GetStakeModifierSelectionInterval();
+
 // Check stake modifier hard checkpoints
 bool CheckStakeModifierCheckpoints(int nHeight, unsigned int nStakeModifierChecksum);
 

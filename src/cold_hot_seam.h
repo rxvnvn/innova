@@ -80,6 +80,39 @@ public:
     bool GetStakeModifierChecksum(const BlockIndexNavigationRef& ref,
                                   unsigned int* out, std::string* error) const;
 
+    // ------------------------------------------------------------------
+    // By-value staking-navigation migration (A.9a.3). These mirror the legacy
+    // kernel.cpp traversals exactly but resolve/logical-address rather than
+    // via raw mapBlockIndex + CBlockIndex* pprev/pnext. Hot-tail pointer callers
+    // may still seed a walk from a resident ref, but every historical step is
+    // by-value (reader/active.dat), so no arbitrary cold block requires
+    // process-lifetime CBlockIndex residency.
+    // ------------------------------------------------------------------
+
+    /** Backward walk to the last generated-modifier ancestor; mirrors
+     *  kernel.cpp GetLastStakeModifier. */
+    bool GetLastStakeModifier(const BlockIndexLogicalId& start,
+                              uint64_t* nStakeModifier, int64_t* nModifierTime,
+                              std::string* error) const;
+
+    /** Forward active-chain walk from an arbitrarily-old source block until
+     *  the modifier is selected a selection-interval later; mirrors
+     *  kernel.cpp GetKernelStakeModifier(hashBlockFrom, ...) (2-arg). */
+    bool GetKernelStakeModifier(const BlockIndexLogicalId& source,
+                                uint64_t* nStakeModifier, int* nStakeModifierHeight,
+                                int64_t* nStakeModifierTime, bool fPrintProofOfStake,
+                                std::string* error) const;
+
+    /** Backward branch-ancestry walk from a hot candidate prev down to the
+     *  source; mirrors kernel.cpp GetKernelStakeModifier(hashBlockFrom,
+     *  pindexPrev, ...) (3-arg). Requires source to be an ancestor of the
+     *  candidate branch. */
+    bool GetKernelStakeModifier(const BlockIndexLogicalId& source,
+                                const BlockIndexLogicalId& branchTip,
+                                uint64_t* nStakeModifier, int* nStakeModifierHeight,
+                                int64_t* nStakeModifierTime, bool fPrintProofOfStake,
+                                std::string* error) const;
+
     BlockIndexSnapshot GetColdTip() const;
     BlockIndexSnapshot GetHotTip() const;
     uint64_t ColdGeneration() const;
@@ -90,6 +123,9 @@ private:
     bool MakeHot(const BlockIndexSnapshot& snapshot, ColdHotSeamSnapshot* out,
                  std::string* error) const;
     bool IsAtColdTip(const BlockIndexSnapshot& snapshot) const;
+    // Resolve a logical id cold-first, then hot (used by by-value staking nav).
+    bool ResolveLogical(const BlockIndexLogicalId& logical, ColdHotSeamSnapshot* out,
+                        std::string* error) const;
 
     BlockIndexV2Reader coldReader;
     LegacyBlockIndexAccessor hotAccessor;
