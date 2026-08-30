@@ -24,6 +24,7 @@
 #include "../blockindex_shadow_startup.h"
 #include "../kernel.h"
 #include "../main.h"
+#include "../script.h"
 #include "util.h"
 #include <boost/filesystem.hpp>
 
@@ -348,6 +349,297 @@ BOOST_FIXTURE_TEST_CASE(end_of_active_chain_vs_authority_failure_distinct, ProdF
         // The tip is our block index tip, so the interval is unsatisfied; legacy
         // returns false here. The navigated path must behave the same.
         BOOST_CHECK(!okTip);
+    }
+    catch (...)
+    {
+        nModifierInterval = saveInterval; nTargetSpacing = saveSpacing; throw;
+    }
+    nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+}
+
+namespace {
+
+// A ColdHotHotResolver that serves the fixture's synthetic hot chain (hashes
+// uint256(1000+h)) but makes the block at SEAM+1's parent a DIVERGENT block at
+// height SEAM whose hash (0000...D0D0D) is ABSENT from the frozen cold
+// generation. The divergent snapshot carries a process-local legacy-style id
+// (9001) so the old domain-confusion defect (rebinding that id as a cold
+// generation RecordId) is directly observable.
+class DivergeHotResolver : public ColdHotHotResolver
+{
+public:
+    DivergeHotResolver(int seam, int n) : seam(seam), n(n) {}
+    uint256 H(int h) const { return uint256(1000 + h); }
+    uint256 DivHash() const { return uint256(0xD0D0D); }
+
+    BlockIndexSnapshot Snap(const uint256& hash, int h, bool inMain, BlockIndexId id) const
+    {
+        BlockIndexSnapshot s;
+        s.found = true; s.id = id;
+        s.hash = hash; s.hashPrev = (h == 0) ? uint256(0) : H(h - 1);
+        s.hashNext = uint256(0);
+        s.height = h; s.nFile = 1; s.nBlockPos = 100 + h; s.nFlags = 0;
+        s.nVersion = 1; s.nTime = 1000 + h * 600; s.nBits = 0x1d00ffff; s.nNonce = 0;
+        s.nMint = 0; s.nMoneySupply = 0; s.nStakeModifier = 100 + h;
+        s.prevoutStake = COutPoint(); s.nStakeTime = 0; s.hashProof = uint256(h + 1000);
+        s.nChainTrust = 0; s.fProofOfStake = false; s.fInMainChain = inMain;
+        s.hasParent = (h != 0);
+        s.hasStakeModifierTime = false; s.hasStakeModifierChecksum = false;
+        s.nStakeModifierTime = 0; s.nStakeModifierChecksum = 0;
+        return s;
+    }
+
+    virtual BlockIndexSnapshot LookupByHash(const uint256& hash) const
+    {
+        for (int h = 0; h < n; ++h)
+            if (H(h) == hash) return Snap(hash, h, true, (BlockIndexId)(1000 + h));
+        if (hash == DivHash()) return Snap(hash, seam, true, (BlockIndexId)9001);
+        return BlockIndexSnapshot();
+    }
+    virtual BlockIndexSnapshot GetActiveByHeight(int height) const
+    {
+        if (height < 0 || height >= n) return BlockIndexSnapshot();
+        return Snap(H(height), height, true, (BlockIndexId)(1000 + height));
+    }
+    virtual BlockIndexSnapshot GetParentByHash(const uint256& hash) const
+    {
+        // The hot main-chain block at SEAM+1 has the DIVERGENT parent: on the
+        // live (resolver) main chain at height SEAM, absent from the cold gen.
+        if (hash == H(seam + 1)) return LookupByHash(DivHash());
+        for (int h = 1; h < n; ++h)
+            if (H(h) == hash) return LookupByHash(H(h - 1));
+        return BlockIndexSnapshot();
+    }
+    virtual BlockIndexSnapshot GetNextActiveByHash(const uint256& hash) const
+    {
+        for (int h = 0; h < n - 1; ++h)
+            if (H(h) == hash) return GetActiveByHeight(h + 1);
+        return BlockIndexSnapshot();
+    }
+    virtual BlockIndexSnapshot GetTip() const { return GetActiveByHeight(n - 1); }
+
+private:
+    int seam, n;
+};
+
+} // namespace
+
+// Blocker 1 (CRITICAL) RED/GREEN: a hot->cold parent crossing must FAIL CLOSED
+// rather than rebind a HOT process-local id as a COLD generation RecordId.
+// Old code: ResolveLogicalR fell back to HOT on a cold miss and passed that HOT
+// snapshot to MakeCold, returning COLD_HOT_SEAM_OK with a cold ref whose
+// recordId was the hot legacy id (9001). Fixed code requires PROVEN-COLD
+// provenance at the crossing and returns COLD_HOT_SEAM_AUTHORITY_FAILURE.
+BOOST_FIXTURE_TEST_CASE(hot_to_cold_parent_crossing_divergence_fails_closed, ProdFixture)
+{
+    Setup();
+    DivergeHotResolver hot(SEAM, N);
+    ColdHotSeamNavigator nav;
+    BlockIndexV2ReaderOptions options;
+    std::string e;
+    BOOST_REQUIRE_MESSAGE(nav.Open(root.string(), options, &e), e);
+    nav.SetTestHotResolver(&hot);
+    LOCK(cs_main);
+    ColdHotSeamSnapshot out;
+    const BlockIndexNavigationRef ref = BlockIndexNavigationRef::Hot(BlockIndexLogicalId(hot.H(SEAM + 1)));
+    const ColdHotSeamResult r = nav.GetParentR(ref, &out, &e);
+    // The parent is on the live main chain at/below the frozen seam but is NOT
+    // in the cold generation -> divergent seam -> must fail closed.
+    BOOST_CHECK_EQUAL((int)r, (int)COLD_HOT_SEAM_AUTHORITY_FAILURE);
+    // Under no circumstances may a HOT process-local id become a COLD RecordId.
+    if (r == COLD_HOT_SEAM_OK)
+        BOOST_CHECK_MESSAGE(!out.ref.IsCold() || out.ref.recordId != 9001,
+            "A hot process-local id must never be rebound as a cold RecordId");
+}
+
+// Blocker 2: the wallet ancestor adapter must be TYPED so a genuine FOUND,
+// NOT_FOUND, NO_NAVIGATOR and AUTHORITY_FAILURE are distinct, and an authority
+// failure (stale generation here) can NEVER re-enable the arbitrary-depth pprev
+// fallback — even when the requested ancestor IS resident in mapBlockIndex.
+BOOST_FIXTURE_TEST_CASE(wallet_ancestor_snapshot_found_and_authority_failure_typed, ProdFixture)
+{
+    unsigned int saveInterval = nModifierInterval;
+    unsigned int saveSpacing = nTargetSpacing;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+        // 1) Normal deep-old by-value resolution (source absent from mapBlockIndex).
+        uint256 hOut; unsigned int tOut = 0, fOut = 0;
+        const StakingAncestorStatus ok = GetStakingAncestorSnapshot(pindexBest, 2, &hOut, &tOut, &fOut);
+        BOOST_CHECK_EQUAL((int)ok, (int)STAKING_ANCESTOR_OK);
+        BOOST_CHECK(hOut == Hash(2));
+        BOOST_CHECK_EQUAL(tOut, (unsigned int)(1000 + 2 * 600));
+
+        // 2) Authority failure (stale CURRENT replaced after retention) is typed
+        // AUTHORITY_FAILURE even though the requested ancestor (height 10, >=
+        // RESIDENT_FLOOR) IS resident here — a legacy pprev walk WOULD succeed,
+        // but the typed authority failure must force fail-closed (no fallback).
+        BlockIndexGenerationSource alt;
+        uint256 pprev(0);
+        BlockIndexRecord r0 = ProdRecord(42, 0, true, pprev);
+        BlockIndexGenerationSourceRecord q0; q0.hash = r0.hash; q0.record = r0; alt.records.push_back(q0);
+        alt.records[0].record.hashPrev = uint256(0);
+        alt.hashBestChain = r0.hash; alt.foundBestChain = true;
+        BlockIndexGenerationBuilder b2; BlockIndexGenerationStats st2; std::string e2;
+        if (b2.Build(alt, (root / BlockIndexGenerationManager::GenerationName(2)).string(), 2, &st2, &e2))
+        {
+            b2.Close();
+            if (BlockIndexGenerationManager::SelectGeneration(root.string(), 2, &e2) == BLOCK_INDEX_LIFECYCLE_OK)
+            {
+                BOOST_CHECK(mapBlockIndex.count(Hash(10)) == 1U); // resident
+                uint256 h2; unsigned int t2 = 0, f2 = 0;
+                const StakingAncestorStatus st = GetStakingAncestorSnapshot(pindexBest, 10, &h2, &t2, &f2);
+                BOOST_CHECK_EQUAL((int)st, (int)STAKING_ANCESTOR_AUTHORITY_FAILURE);
+            }
+        }
+    }
+    catch (...)
+    {
+        nModifierInterval = saveInterval; nTargetSpacing = saveSpacing; throw;
+    }
+    nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+}
+
+// Blocker 5: a HybridSPV cache hit must return the EXACT cached modifier plus
+// the legacy source height/time outputs (height = source height, time = source
+// time, NOT advanced), and miss->lookup->write side effects stay exact. Drives
+// the REAL global 2-arg adapter and the real HybridSPV cache.
+BOOST_FIXTURE_TEST_CASE(hybridspv_cache_hit_height_time_exact, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    unsigned int saveInterval = nModifierInterval;
+    unsigned int saveSpacing = nTargetSpacing;
+    fHybridSPV = true;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+        const int srcH = 2;
+        // First call: cache MISS -> forward walk must succeed and populate cache.
+        uint64_t modMiss = 0; int hMiss = 0; int64_t tMiss = 0;
+        BOOST_CHECK_MESSAGE(GetKernelStakeModifier(Hash(srcH), modMiss, hMiss, tMiss, false),
+            "first (miss) global 2-arg must succeed and populate the HybridSPV cache");
+        // Second call: cache HIT -> cached modifier + EXACT legacy source
+        // height/time (nStakeModifierHeight=src height, nStakeModifierTime=src time).
+        uint64_t modHit = 0; int hHit = -1; int64_t tHit = -1;
+        BOOST_CHECK_MESSAGE(GetKernelStakeModifier(Hash(srcH), modHit, hHit, tHit, false),
+            "second (hit) global 2-arg must succeed via cached modifier");
+        BOOST_CHECK_EQUAL(modHit, modMiss);                       // D11 modifier exact
+        BOOST_CHECK_EQUAL(hHit, srcH);                            // D12 height exact
+        BOOST_CHECK_EQUAL((int64_t)tHit, (int64_t)(1000 + srcH * 600)); // D13 time exact
+    }
+    catch (...)
+    {
+        fHybridSPV = saveSPV; nModifierInterval = saveInterval; nTargetSpacing = saveSpacing; throw;
+    }
+    fHybridSPV = saveSPV; nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+}
+
+// Blocker 3a: transparent candidate-side source recovery works BY-VALUE with a
+// retained navigator, searching a hot side-suffix (non-main-chain branch block)
+// and reading it by snapshot position (candidate map) — no arbitrary historical
+// pointer topology / main-chain residency required for the frozen portion.
+BOOST_FIXTURE_TEST_CASE(candidate_side_suffix_source_recovery_byvalue, ProdFixture)
+{
+    Setup();
+    RetainNavigator();
+    LOCK(cs_main);
+    // A previous transaction placed in a hot side-block below the seam.
+    CTransaction txPrevRef;
+    txPrevRef.nVersion = 1;
+    CTxOut out; out.nValue = 1000; out.scriptPubKey = CScript() << OP_TRUE;
+    txPrevRef.vout.push_back(out);
+    const uint256 txHash = txPrevRef.GetHash();
+
+    CBlock sideBlock;
+    sideBlock.nVersion = 1;
+    sideBlock.hashPrevBlock = Hash(SEAM); // parent = main-chain block at the seam (cold)
+    sideBlock.nTime = 1000 + (SEAM + 1) * 600;
+    sideBlock.vtx.push_back(txPrevRef);
+    const uint256 sideHash = sideBlock.GetHash();
+
+    // Hot side-branch tip (not in the main chain), registered in mapBlockIndex.
+    CBlockIndex* pTip = new CBlockIndex();
+    pTip->phashBlock = new uint256(sideHash);
+    pTip->nHeight = SEAM + 1;
+    pTip->pprev = created[SEAM]; // parent = main-chain seam block (frozen/cold)
+    pTip->nTime = 1000 + (SEAM + 1) * 600;
+    pTip->nFlags = 0; pTip->nStakeModifier = 100 + SEAM + 1;
+    created.push_back(pTip); // fixture-owned
+    mapBlockIndex[sideHash] = pTip;
+
+    std::map<uint256, CBlock> candidateBlocks;
+    candidateBlocks[sideHash] = sideBlock;
+
+    CTransaction foundTx; CTxIndex foundIndex; CBlock foundBlock;
+    const bool found = ReadStakeSourceTransactionForTesting(
+        pTip, COutPoint(txHash, 0), foundTx, foundIndex, foundBlock, candidateBlocks);
+    BOOST_CHECK_MESSAGE(found, "by-value candidate side-suffix must recover the source transaction");
+    if (found)
+    {
+        BOOST_CHECK(foundTx.GetHash() == txHash);
+        BOOST_CHECK(foundBlock.GetHash() == sideHash);
+    }
+}
+
+// Blocker 3b: HybridSPV historical source-block recovery is by-value (resolved
+// via the retained navigator to a cold ref with a persisted disk position), so
+// it does NOT require an arbitrary historical CBlockIndex resident in mapBlockIndex.
+BOOST_FIXTURE_TEST_CASE(hybridspv_source_block_position_byvalue, ProdFixture)
+{
+    Setup();
+    RetainNavigator();
+    LOCK(cs_main);
+    BOOST_CHECK(mapBlockIndex.count(Hash(2)) == 0); // cold-only, non-resident
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    std::string e;
+    ColdHotSeamSnapshot src;
+    BOOST_REQUIRE_MESSAGE(nav->ResolveLogicalR(BlockIndexLogicalId(Hash(2)), &src, &e) == COLD_HOT_SEAM_OK, e);
+    // The by-value source is a COLD ref (generation-bound RecordId) — the same
+    // resolution CheckProofOfStake's HybridSPV source-block read now uses to get
+    // nFile/nBlockPos without mapBlockIndex residency.
+    BOOST_CHECK(src.ref.IsCold());
+    BOOST_CHECK(src.snapshot.found);
+}
+
+// Blocker 4: debug/diagnostic source-height lookup must be OBSERVATIONAL: it
+// must not require a resident cold CBlockIndex, must not insert a NULL entry via
+// mapBlockIndex::operator[], and must not change the consensus result. The
+// diagnostic height now comes from the by-value navigator. Verify a cold-only
+// source resolves with diagnostics on, mapBlockIndex stays unmutated, and the
+// result (modifier/height/time) is identical with and without the diagnostic flag.
+BOOST_FIXTURE_TEST_CASE(debug_cold_source_height_is_observational, ProdFixture)
+{
+    unsigned int saveInterval = nModifierInterval;
+    unsigned int saveSpacing = nTargetSpacing;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+        const int srcH = 2;
+        BOOST_CHECK(mapBlockIndex.count(Hash(srcH)) == 0); // cold-only, non-resident
+        uint64_t m1 = 0; int h1 = 0; int64_t t1 = 0;
+        const bool r1 = GetKernelStakeModifier(Hash(srcH), m1, h1, t1, /*fPrintProofOfStake=*/true);
+        BOOST_CHECK_MESSAGE(r1, "diagnostic-flag-on modifier must still succeed ");
+        // The cold-only source must remain absent (no operator[] insertion).
+        BOOST_CHECK(mapBlockIndex.count(Hash(srcH)) == 0);
+        // Same consensus result with the diagnostic flag off.
+        uint64_t m2 = 0; int h2 = 0; int64_t t2 = 0;
+        const bool r2 = GetKernelStakeModifier(Hash(srcH), m2, h2, t2, false);
+        BOOST_CHECK_EQUAL((int)r1, (int)r2);
+        if (r1 && r2)
+        {
+            BOOST_CHECK_EQUAL(m1, m2);
+            BOOST_CHECK_EQUAL(h1, h2);
+            BOOST_CHECK_EQUAL(t1, t2);
+        }
     }
     catch (...)
     {

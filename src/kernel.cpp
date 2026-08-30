@@ -378,6 +378,13 @@ static bool GetKernelStakeModifierNavigated2(uint256 hashBlockFrom,
         const int nTargetHeight = src.snapshot.height + (int)(GetStakeModifierSelectionInterval() / 180); // ~3 min blocks
         if (GetCachedStakeModifier(nTargetHeight, nStakeModifier))
         {
+            // A.9a.3d: reproduce legacy cache-hit semantics EXACTLY. Legacy
+            // (kernel.cpp GetKernelStakeModifier 2-arg) sets nStakeModifierHeight
+            // and nStakeModifierTime from the SOURCE block before the cache
+            // lookup and does NOT advance them on a hit. The navigated adapter
+            // must return the cached modifier plus the same height/time.
+            nStakeModifierHeight = src.snapshot.height;
+            nStakeModifierTime = (int64_t)src.snapshot.nTime;
             if (resultOut)
                 *resultOut = COLD_HOT_SEAM_OK;
             return true; // early cache hit, same semantics
@@ -578,6 +585,28 @@ bool GetKernelStakeModifier(uint256 hashBlockFrom, const CBlockIndex* pindexPrev
 //   quantities so as to generate blocks faster, degrading the system back into
 //   a proof-of-work situation.
 //
+// A.9a.3d: debug-only source-height lookup that never requires an arbitrary
+// cold CBlockIndex to be resident and never inserts a NULL entry through
+// mapBlockIndex::operator[]. Prefers the retained navigator by-value (works
+// for cold-only sources absent from the resident map); falls back to a safe
+// non-inserting find().
+static int GetStakeSourceHeightForDebug(const uint256& hashBlockFrom)
+{
+    AssertLockHeld(cs_main);
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    if (nav)
+    {
+        std::string err;
+        ColdHotSeamSnapshot snap;
+        if (nav->ResolveLogicalR(BlockIndexLogicalId(hashBlockFrom), &snap, &err) == COLD_HOT_SEAM_OK)
+            return snap.snapshot.height;
+    }
+    std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(hashBlockFrom);
+    if (mi != mapBlockIndex.end())
+        return mi->second->nHeight;
+    return 0;
+}
+
 bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, const CBlock& blockFrom, unsigned int nTxPrevOffset, const CTransaction& txPrev, const COutPoint& prevout, unsigned int nTimeTx, uint256& hashProofOfStake, uint256& targetProofOfStake, bool fPrintProofOfStake)
 {
     if (nTimeTx < txPrev.nTime)  // Transaction timestamp violation
@@ -625,7 +654,7 @@ bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, con
     if (fPrintProofOfStake)
     {
         int nHeight = 0;
-        nHeight = mapBlockIndex[hashBlockFrom]->nHeight;
+        nHeight = GetStakeSourceHeightForDebug(hashBlockFrom);
         printf("CheckStakeKernelHash() : using modifier 0x%016" PRIx64" at height=%d timestamp=%s for block from height=%d timestamp=%s\n",
             nStakeModifier, nStakeModifierHeight,
             DateTimeStrFormat(nStakeModifierTime).c_str(),
@@ -651,7 +680,7 @@ bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, con
     if (fDebug && !fPrintProofOfStake)
     {
         int nHeight = 0;
-        nHeight = mapBlockIndex[hashBlockFrom]->nHeight;
+        nHeight = GetStakeSourceHeightForDebug(hashBlockFrom);
         printf("CheckStakeKernelHash() : using modifier 0x%016" PRIx64" at height=%d timestamp=%s for block from height=%d timestamp=%s\n",
             nStakeModifier, nStakeModifierHeight,
             DateTimeStrFormat(nStakeModifierTime).c_str(),
@@ -696,10 +725,13 @@ static int IsBlockInCandidateAncestryNavigated(const uint256& sourceHash,
     std::string err;
     const BlockIndexLogicalId sourceLogical(sourceHash);
     ColdHotSeamSnapshot source;
-    if (nav->ResolveLogicalR(sourceLogical, &source, &err) != COLD_HOT_SEAM_OK)
+    const ColdHotSeamResult srcR = nav->ResolveLogicalR(sourceLogical, &source, &err);
+    if (srcR == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+        return -1; // stale/corrupt/divergent authority -> FAIL CLOSED
+    if (srcR != COLD_HOT_SEAM_OK)
     {
-        // Not resolvable in either domain => not an ancestor (legacy: a block
-        // absent from the index is not in the candidate ancestry).
+        // Genuine NOT_FOUND in both domains => not an ancestor (legacy: a
+        // block absent from the index is not in the candidate ancestry).
         return 0;
     }
 
@@ -723,7 +755,7 @@ static int IsBlockInCandidateAncestryNavigated(const uint256& sourceHash,
     }
 }
 
-bool GetStakingAncestorSnapshot(const CBlockIndex* pindexPrev, int targetHeight,
+StakingAncestorStatus GetStakingAncestorSnapshot(const CBlockIndex* pindexPrev, int targetHeight,
     uint256* hashOut, unsigned int* nTimeOut, unsigned int* nFlagsOut)
 {
     if (hashOut) *hashOut = uint256(0);
@@ -731,21 +763,102 @@ bool GetStakingAncestorSnapshot(const CBlockIndex* pindexPrev, int targetHeight,
     if (nFlagsOut) *nFlagsOut = 0;
     const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
     if (!nav || !pindexPrev || targetHeight < 0 || targetHeight > pindexPrev->nHeight)
-        return false; // no navigator / out-of-range -> caller uses legacy
+        return STAKING_ANCESTOR_NO_NAVIGATOR; // pre-A.10 fully-materialized: legacy fallback valid
 
     const BlockIndexLogicalId tipLogical(pindexPrev->GetBlockHash());
     std::string err;
     ColdHotSeamSnapshot res;
     const ColdHotSeamResult r = nav->GetAncestorR(BlockIndexNavigationRef::Hot(tipLogical),
                                                   targetHeight, &res, &err);
+    if (r == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+        return STAKING_ANCESTOR_AUTHORITY_FAILURE; // NEVER legacy fallback
+    if (r == COLD_HOT_SEAM_NOT_FOUND || r == COLD_HOT_SEAM_END_OF_ACTIVE_CHAIN)
+        return STAKING_ANCESTOR_NOT_FOUND; // genuine absence; note is not an ancestor
     if (r != COLD_HOT_SEAM_OK)
-        return false; // authority failure -> caller must NOT mis-validate; legacy fallback
+        return STAKING_ANCESTOR_AUTHORITY_FAILURE; // any other non-OK -> fail closed
     if (!res.snapshot.found || res.snapshot.height != targetHeight)
-        return false;
+        return STAKING_ANCESTOR_NOT_FOUND;
     if (hashOut) *hashOut = res.snapshot.hash;
     if (nTimeOut) *nTimeOut = res.snapshot.nTime;
     if (nFlagsOut) *nFlagsOut = res.snapshot.nFlags;
-    return true;
+    return STAKING_ANCESTOR_OK;
+}
+
+// A.9a.3d: by-value candidate-branch (side-suffix) source-transaction search.
+// A resident, forward-walkable chain is never a precondition: branch blocks are
+// resolved by stable logical identity + parent navigation (cold records or hot
+// tail) and each block is read from disk by its persisted nFile/nBlockPos. This
+// removes the arbitrary historical CBlockIndex* / pprev topology requirement.
+// Returns false on any authority failure (fail closed; never a pprev fallback)
+// or genuine absence of the previous transaction on the branch.
+static bool SearchCandidateSuffixNavigated(const ColdHotSeamNavigator* nav,
+    const CBlockIndex* pindexPrev, const COutPoint& prevout,
+    CTransaction& txPrev, CTxIndex& txindex, CBlock& blockFrom,
+    const std::map<uint256, CBlock>* candidateBlocksForTesting)
+{
+    if (!nav || !pindexPrev)
+        return false;
+    AssertLockHeld(cs_main);
+    ColdHotSeamSnapshot cur;
+    {
+        std::string err;
+        const ColdHotSeamResult r = nav->ResolveLogicalR(
+            BlockIndexLogicalId(pindexPrev->GetBlockHash()), &cur, &err);
+        if (r != COLD_HOT_SEAM_OK)
+            return false; // branch tip not resolvable in either domain -> not an ancestor
+    }
+    for (;;)
+    {
+        if (cur.snapshot.fInMainChain)
+            break; // reached the connected chain; candidate suffix ends
+        CBlock block;
+        bool fReadBlock = false;
+        if (candidateBlocksForTesting)
+        {
+            std::map<uint256, CBlock>::const_iterator miBlock =
+                candidateBlocksForTesting->find(cur.snapshot.hash);
+            if (miBlock != candidateBlocksForTesting->end())
+            {
+                block = miBlock->second;
+                fReadBlock = true;
+            }
+        }
+        else
+        {
+            fReadBlock = block.ReadFromDisk(cur.snapshot.nFile, cur.snapshot.nBlockPos, true);
+        }
+        if (!fReadBlock)
+            return false;
+        unsigned int nTxPos = cur.snapshot.nBlockPos +
+            ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+            (2 * GetSizeOfCompactSize(0)) +
+            GetSizeOfCompactSize(block.vtx.size());
+        for (std::vector<CTransaction>::const_iterator it = block.vtx.begin();
+             it != block.vtx.end(); ++it)
+        {
+            if (it->GetHash() == prevout.hash)
+            {
+                txPrev = *it;
+                txindex = CTxIndex(
+                    CDiskTxPos(cur.snapshot.nFile, cur.snapshot.nBlockPos, nTxPos),
+                    txPrev.vout.size());
+                blockFrom = block;
+                return true;
+            }
+            nTxPos += ::GetSerializeSize(*it, SER_DISK, CLIENT_VERSION);
+        }
+        if (!cur.snapshot.hasParent)
+            break;
+        ColdHotSeamSnapshot parent;
+        {
+            std::string err;
+            const ColdHotSeamResult pr = nav->GetParentR(cur.ref, &parent, &err);
+            if (pr != COLD_HOT_SEAM_OK)
+                return false; // authority failure -> fail closed (never pprev fallback)
+        }
+        cur = parent;
+    }
+    return false;
 }
 
 static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
@@ -779,6 +892,14 @@ static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
 
     // Transactions from an unconnected side branch are deliberately absent
     // from the connected-chain tx index. Search only the candidate suffix.
+    // A.9a.3d: when a production navigator is retained, walk the candidate
+    // side-branch by-value (no resident CBlockIndex* / arbitrary historical
+    // pprev topology required); an authority failure fails closed.
+    const ColdHotSeamNavigator* sideNav = GetBlockIndexStakingNavigator();
+    if (sideNav)
+        return SearchCandidateSuffixNavigated(sideNav, pindexPrev, prevout,
+                                              txPrev, txindex, blockFrom,
+                                              candidateBlocksForTesting);
     for (const CBlockIndex* pindex = pindexPrev;
          pindex && !pindex->IsInMainChain(); pindex = pindex->pprev)
     {
@@ -922,11 +1043,31 @@ bool CheckProofOfStake(const CBlockIndex* pindexPrev, const CTransaction& tx, un
                 if (wtx.GetDepthInMainChain() < nCoinbaseMaturity)
                     return tx.DoS(10, error("CheckProofOfStake() : SPV stake input needs %d confirmations, has %d",
                                             nCoinbaseMaturity, wtx.GetDepthInMainChain()));
-                if (wtx.hashBlock != 0 && mapBlockIndex.count(wtx.hashBlock))
+                if (wtx.hashBlock != uint256(0))
                 {
-                    CBlockIndex* pindex = mapBlockIndex[wtx.hashBlock];
+                    // A.9a.3d: resolve the historical source block's disk
+                    // position by-value (retained navigator) so HybridSPV source
+                    // recovery does not require an arbitrary historical
+                    // CBlockIndex to be resident in mapBlockIndex. operator[] is
+                    // never used for inspection. Safe non-inserting find() only
+                    // when no navigator is retained (pre-A.10 fully materialized).
                     CBlock block;
-                    if (block.ReadFromDisk(pindex, true))
+                    bool fHaveBlock = false;
+                    const ColdHotSeamNavigator* spvNav = GetBlockIndexStakingNavigator();
+                    if (spvNav)
+                    {
+                        std::string err;
+                        ColdHotSeamSnapshot src;
+                        if (spvNav->ResolveLogicalR(BlockIndexLogicalId(wtx.hashBlock), &src, &err) == COLD_HOT_SEAM_OK)
+                            fHaveBlock = block.ReadFromDisk(src.snapshot.nFile, src.snapshot.nBlockPos, true);
+                    }
+                    else
+                    {
+                        std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(wtx.hashBlock);
+                        if (mi != mapBlockIndex.end())
+                            fHaveBlock = block.ReadFromDisk(mi->second, true);
+                    }
+                    if (fHaveBlock)
                     {
                         unsigned int nTxPos = ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION)
                                             - (2 * GetSizeOfCompactSize(0))

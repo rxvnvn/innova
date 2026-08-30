@@ -28,6 +28,7 @@
 #include <stdio.h>
 
 #include <algorithm>
+#include <chrono>
 #include <map>
 #include <set>
 #include <string>
@@ -424,6 +425,13 @@ int main(int argc, char** argv)
     // modifier-boundary-relevant: every 1000th checkpoint height near tip
     for (int h = hotTip.height; h >= hotTip.height - 4000; h -= 1000)
         sources.push_back(h);
+    // A.9a.3d: persist EVERY STAKING3 sample (not only mismatches) with source
+    // height, tip height, depth, cold/hot classification, legacy vs navigated
+    // outcome, modifier/height/time, and navigated runtime, so the coverage is
+    // fully audit-able from the artifact rather than inferred from aggregates.
+    FILE* s3rep = fopen((root / "A9A3D_STAKING3_SAMPLES.txt").string().c_str(), "w");
+    if (s3rep)
+        fprintf(s3rep, "src_h tip_h depth domain navOk refOk navMod refMod navH refH navT refT modMM timeMM heightMM runtime_ms\n");
     for (int h = 0; h < (int)sources.size(); ++h)
     {
         if (sources[h] < 0 || sources[h] > hotTip.height) continue;
@@ -537,7 +545,10 @@ int main(int argc, char** argv)
 
                 uint64_t navMod = 0; int navH = 0; int64_t navTime = 0;
                 std::string e3;
+                const auto t3a = std::chrono::steady_clock::now();
                 const bool navOk = seam.GetKernelStakeModifier(srcLogical, tipLogical, &navMod, &navH, &navTime, false, &e3);
+                const auto t3b = std::chrono::steady_clock::now();
+                const int64_t nNavMs = std::chrono::duration_cast<std::chrono::milliseconds>(t3b - t3a).count();
                 ++staking3Samples;
                 if (navOk != refOk) ++staking3OkDisagree;
                 bool modMismatch = false, timeMismatch = false, heightMismatch = false;
@@ -552,8 +563,25 @@ int main(int argc, char** argv)
                            src.height, tip.height, tip.height - src.height, src.hash.ToString().c_str(),
                            navOk, refOk, navMod, refMod, navH, refH, navTime, refTime,
                            (int)modMismatch, (int)timeMismatch, (int)heightMismatch);
+                // A.9a.3d: persist EVERY STAKING3 sample (not only mismatches).
+                if (s3rep)
+                {
+                    fprintf(s3rep, "src_h=%d tip_h=%d depth=%d domain=%s navOk=%d refOk=%d navMod=%llu refMod=%llu navH=%d refH=%d navT=%lld refT=%lld modMM=%d timeMM=%d heightMM=%d runtime_ms=%lld\n",
+                            src.height, tip.height, tip.height - src.height,
+                            (src.height <= coldTipHeight) ? "cold" : "hot",
+                            (int)navOk, (int)refOk,
+                            (unsigned long long)navMod, (unsigned long long)refMod,
+                            navH, refH, (long long)navTime, (long long)refTime,
+                            (int)modMismatch, (int)timeMismatch, (int)heightMismatch, (long long)nNavMs);
+                    fflush(s3rep);
+                }
             }
         }
+    }
+    if (s3rep)
+    {
+        fclose(s3rep);
+        s3rep = NULL;
     }
 
     fprintf(stdout, "[NAVDIFF] nav=%llu cold=%llu hot=%llu seam=%llu seam_boundary=%llu side=%llu parent=%llu ancestor=%llu next=%llu meta_time=%llu meta_checksum=%llu mismatches=%llu\n",

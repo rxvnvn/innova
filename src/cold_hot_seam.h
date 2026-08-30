@@ -188,6 +188,14 @@ private:
     // Resolve a logical id cold-first, then hot (used by by-value staking nav).
     bool ResolveLogical(const BlockIndexLogicalId& logical, ColdHotSeamSnapshot* out,
                         std::string* error) const;
+    // Cold-ONLY logical resolution. Unlike ResolveLogicalR it NEVER falls back
+    // to the hot domain: MakeCold must only ever receive a snapshot whose
+    // provenance is PROVEN COLD (bound to this V2 generation). Returns
+    // COLD_HOT_SEAM_NOT_FOUND on a genuine cold miss; callers performing a
+    // hot->cold crossing treat that miss as a seam divergence and fail closed.
+    ColdHotSeamResult ResolveColdLogicalR(const BlockIndexLogicalId& logical,
+                                          ColdHotSeamSnapshot* out,
+                                          std::string* error) const;
 
     BlockIndexV2Reader coldReader;
     LegacyBlockIndexAccessor hotAccessor;

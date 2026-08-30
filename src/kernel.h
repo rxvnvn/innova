@@ -60,12 +60,19 @@ bool GetKernelStakeModifier(uint256 hashBlockFrom, const CBlockIndex* pindexPrev
 // A.9a.3c: production by-value resolution of an active-chain ancestor block's
 // identity/metadata, used by wallet source discovery so an arbitrarily old note
 // block no longer requires a resident CBlockIndex* / continuous pprev walk.
-// When a production navigator is retained this returns true and fills
-// *hashOut/*nTimeOut/*nFlagsOut from stable cold/hot navigation (O(1)-ish,
-// no arbitrary-depth pprev topology). When no navigator is retained it returns
-// false and the caller uses its legacy fallback. Returns true-with-*found=false
-// for a correctly-resolved but absent block.
-bool GetStakingAncestorSnapshot(const CBlockIndex* pindexPrev, int targetHeight,
+// A.9a.3d: the result is TYPED so a wallet caller can distinguish a genuine
+// absent/not-applicable outcome (legacy fallback is safe pre-A.10) from an
+// AUTHORITY_FAILURE (stale generation, corrupt cold record, or divergent seam)
+// which MUST never fall back to an arbitrary-depth pprev walk.
+enum StakingAncestorStatus
+{
+    STAKING_ANCESTOR_OK = 0,          // by-value result filled; hash/time authoritative
+    STAKING_ANCESTOR_NO_NAVIGATOR,    // no production navigator retained (pre-A.10
+                                      // fully-materialized) -> legacy pprev fallback is valid
+    STAKING_ANCESTOR_NOT_FOUND,       // genuine absence / out-of-range; note not an ancestor
+    STAKING_ANCESTOR_AUTHORITY_FAILURE // stale/corrupt/divergent authority -> NEVER pprev fallback
+};
+StakingAncestorStatus GetStakingAncestorSnapshot(const CBlockIndex* pindexPrev, int targetHeight,
     uint256* hashOut, unsigned int* nTimeOut, unsigned int* nFlagsOut);
 
 // Get time weight using supplied timestamps

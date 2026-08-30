@@ -4683,14 +4683,17 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
                 {
                     // A.9a.3c: prefer by-value stable navigation so an old note
                     // block needs no resident CBlockIndex* / continuous pprev
-                    // topology. Falls back to the legacy pprev walk only when no
-                    // production navigator is retained.
-                    if (GetStakingAncestorSnapshot(pindexPrev, wnote.nHeight,
-                                                   &noteBlockHash, &nNoteBlockTime, NULL))
+                    // topology. The legacy pprev walk is used ONLY when no
+                    // production navigator is retained (pre-A.10 fully
+                    // materialized case). A.9a.3d: an AUTHORITY_FAILURE can
+                    // NEVER trigger a pprev fallback (fail closed -> skip note).
+                    const StakingAncestorStatus st = GetStakingAncestorSnapshot(
+                        pindexPrev, wnote.nHeight, &noteBlockHash, &nNoteBlockTime, NULL);
+                    if (st == STAKING_ANCESTOR_OK)
                     {
                         // resolved by-value; hash/time authoritative
                     }
-                    else
+                    else if (st == STAKING_ANCESTOR_NO_NAVIGATOR)
                     {
                         CBlockIndex* pTest = pindexPrev;
                         while (pTest && pTest->nHeight > wnote.nHeight)
@@ -4701,6 +4704,13 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
                             noteBlockHash = pTest->GetBlockHash();
                             nNoteBlockTime = pTest->nTime;
                         }
+                    }
+                    else
+                    {
+                        // NOT_FOUND (note not an ancestor) or AUTHORITY_FAILURE
+                        // (stale/corrupt/divergent cold authority): never walk
+                        // pprev; fail closed by skipping this note.
+                        continue;
                     }
                 }
                 if (!pNoteBlock && noteBlockHash == uint256(0))
@@ -5098,14 +5108,17 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
                     {
                         // A.9a.3c: prefer by-value stable navigation so an old
                         // note block needs no resident CBlockIndex* / continuous
-                        // pprev topology. Falls back to the legacy pprev walk only
-                        // when no production navigator is retained.
-                        if (GetStakingAncestorSnapshot(pindexPrev, wnote.nHeight,
-                                                       &noteBlockHash, &nNoteBlockTime, NULL))
+                        // pprev topology. The legacy pprev walk is used ONLY when
+                        // no production navigator is retained (pre-A.10 fully
+                        // materialized case). A.9a.3d: an AUTHORITY_FAILURE can
+                        // NEVER trigger a pprev fallback (fail closed -> skip note).
+                        const StakingAncestorStatus st = GetStakingAncestorSnapshot(
+                            pindexPrev, wnote.nHeight, &noteBlockHash, &nNoteBlockTime, NULL);
+                        if (st == STAKING_ANCESTOR_OK)
                         {
                             // resolved by-value; hash/time authoritative
                         }
-                        else
+                        else if (st == STAKING_ANCESTOR_NO_NAVIGATOR)
                         {
                             CBlockIndex* pTest = pindexPrev;
                             while (pTest && pTest->nHeight > wnote.nHeight)
@@ -5116,6 +5129,13 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
                                 noteBlockHash = pTest->GetBlockHash();
                                 nNoteBlockTime = pTest->nTime;
                             }
+                        }
+                        else
+                        {
+                            // NOT_FOUND (note not an ancestor) or AUTHORITY_FAILURE
+                            // (stale/corrupt/divergent cold authority): never walk
+                            // pprev; fail closed by skipping this note.
+                            continue;
                         }
                     }
                     if (!pNoteBlock && noteBlockHash == uint256(0))

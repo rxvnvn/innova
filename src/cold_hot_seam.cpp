@@ -239,14 +239,18 @@ ColdHotSeamResult ColdHotSeamNavigator::GetParentR(const BlockIndexNavigationRef
 
     // A hot active block whose parent lies in a valid frozen prefix crosses to
     // cold only after hash-based validation. Side branches remain hot.
+    // DOMAIN SAFETY: the parent MUST be PROVEN COLD before MakeCold. A cold
+    // miss here (the parent is on the live main chain at/below the frozen
+    // seam but is absent from the generation) is a seam divergence and FAILS
+    // CLOSED; the hot fallback snapshot must never be rebound as a cold
+    // generation RecordId.
     const BlockIndexSnapshot coldTip = coldReader.GetTip();
     if (parent.fInMainChain && parent.height <= coldTip.height)
     {
         ColdHotSeamSnapshot coldParent;
-        ColdHotSeamSnapshot dummy;
-        const ColdHotSeamResult cr = ResolveLogicalR(BlockIndexLogicalId(parent.hash), &coldParent, error);
+        const ColdHotSeamResult cr = ResolveColdLogicalR(BlockIndexLogicalId(parent.hash), &coldParent, error);
         if (cr != COLD_HOT_SEAM_OK)
-            return cr;
+            return COLD_HOT_SEAM_AUTHORITY_FAILURE; // cold miss/divergence -> fail closed
         return MakeCold(coldParent.snapshot, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
     }
     return MakeHot(parent, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
@@ -342,10 +346,13 @@ ColdHotSeamResult ColdHotSeamNavigator::GetNextActiveR(const BlockIndexNavigatio
     const BlockIndexSnapshot coldTip = coldReader.GetTip();
     if (next.fInMainChain && next.height <= coldTip.height)
     {
+        // DOMAIN SAFETY: the successor MUST be PROVEN COLD before MakeCold; a
+        // cold miss here is a seam divergence and fails closed (never rebind a
+        // hot snapshot's process-local id as a cold generation RecordId).
         ColdHotSeamSnapshot coldNext;
-        const ColdHotSeamResult cr = ResolveLogicalR(BlockIndexLogicalId(next.hash), &coldNext, error);
+        const ColdHotSeamResult cr = ResolveColdLogicalR(BlockIndexLogicalId(next.hash), &coldNext, error);
         if (cr != COLD_HOT_SEAM_OK)
-            return cr;
+            return COLD_HOT_SEAM_AUTHORITY_FAILURE; // cold miss/divergence -> fail closed
         return MakeCold(coldNext.snapshot, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
     }
     return MakeHot(next, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
@@ -494,6 +501,39 @@ ColdHotSeamResult ColdHotSeamNavigator::ResolveLogicalR(const BlockIndexLogicalI
         return COLD_HOT_SEAM_AUTHORITY_FAILURE;
     SeamClear(error);
     return COLD_HOT_SEAM_OK;
+}
+
+ColdHotSeamResult ColdHotSeamNavigator::ResolveColdLogicalR(const BlockIndexLogicalId& logical,
+                                                            ColdHotSeamSnapshot* out,
+                                                            std::string* error) const
+{
+    if (!logical.IsValid())
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    AssertLockHeld(cs_main);
+    if (!IsOpen())
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    if (coldReader.CurrentSelectionChanged(error))
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE; // stale CURRENT -> fail closed
+
+    BlockIndexSnapshot cold;
+    const BlockIndexV2ReadStatus st = coldReader.LookupByHash(logical.GetHash(), &cold, error);
+    if (st == BLOCK_INDEX_V2_READ_FOUND)
+    {
+        if (cold.hash != logical.GetHash())
+            return COLD_HOT_SEAM_AUTHORITY_FAILURE; // hash mismatch -> fail closed
+        // MakeCold is reached only from a PROVEN-COLD reader result here.
+        if (!MakeCold(cold, out, error))
+            return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+        SeamClear(error);
+        return COLD_HOT_SEAM_OK;
+    }
+    if (st != BLOCK_INDEX_V2_READ_NOT_FOUND)
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE; // corrupt/io/not-open -> fail closed
+    // Genuine cold miss. The caller is responsible for not treating a hot
+    // fallback as a PROVEN-COLD result at a crossing.
+    if (error && error->empty())
+        *error = "cold logical resolution: block not present in frozen generation";
+    return COLD_HOT_SEAM_NOT_FOUND;
 }
 
 ColdHotSeamResult ColdHotSeamNavigator::GetLastStakeModifierR(const BlockIndexLogicalId& start,
