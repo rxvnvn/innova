@@ -26,6 +26,7 @@ struct BlockIndexSnapshot
     uint256 hash;
     uint256 hashPrev;
     uint256 hashNext;
+    uint256 hashMerkleRoot;
 
     int height;
     unsigned int nFile;
@@ -57,6 +58,7 @@ struct BlockIndexSnapshot
           hash(0),
           hashPrev(0),
           hashNext(0),
+          hashMerkleRoot(0),
           height(0),
           nFile(0),
           nBlockPos(0),

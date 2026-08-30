@@ -44,7 +44,7 @@ uint64_t BlockIndexV2Reader::RecordCount() const { LOCK(cs); return open ? manif
 BlockIndexV2ReaderCacheStats BlockIndexV2Reader::CacheStats() const { LOCK(cs); return stats; }
 
 BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const BlockIndexRecord& r, bool inActive) const {
-    BlockIndexSnapshot s; s.found=true; s.id=id; s.hash=r.hash; s.hashPrev=r.hashPrev; s.height=r.height; s.nFile=r.nFile; s.nBlockPos=r.nBlockPos; s.nFlags=r.nFlags; s.nVersion=r.nVersion; s.nTime=r.nTime; s.nBits=r.nBits; s.nNonce=r.nNonce; s.nMint=r.nMint; s.nMoneySupply=r.nMoneySupply; s.nStakeModifier=r.nStakeModifier; s.prevoutStake=r.prevoutStake; s.nStakeTime=r.nStakeTime; s.hashProof=r.hashProof; s.fProofOfStake=(r.prevoutStake.hash != uint256(0)); s.fInMainChain=inActive; s.hasParent=(r.hashPrev != uint256(0)); return s;
+    BlockIndexSnapshot s; s.found=true; s.id=id; s.hash=r.hash; s.hashPrev=r.hashPrev; s.hashMerkleRoot=r.hashMerkleRoot; s.height=r.height; s.nFile=r.nFile; s.nBlockPos=r.nBlockPos; s.nFlags=r.nFlags; s.nVersion=r.nVersion; s.nTime=r.nTime; s.nBits=r.nBits; s.nNonce=r.nNonce; s.nMint=r.nMint; s.nMoneySupply=r.nMoneySupply; s.nStakeModifier=r.nStakeModifier; s.prevoutStake=r.prevoutStake; s.nStakeTime=r.nStakeTime; s.hashProof=r.hashProof; s.fProofOfStake=(r.prevoutStake.hash != uint256(0)); s.fInMainChain=inActive; s.hasParent=(r.hashPrev != uint256(0)); return s;
 }
 void BlockIndexV2Reader::CachePut(const BlockIndexSnapshot& s) const {
     if (cacheCapacity == 0) return;

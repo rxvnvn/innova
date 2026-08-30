@@ -77,6 +77,7 @@ BlockIndexSnapshot LegacyBlockIndexAccessor::SnapshotFromIndex(const CBlockIndex
     out.hash = pindex->GetBlockHash();
     out.hashPrev = pindex->pprev ? pindex->pprev->GetBlockHash() : uint256(0);
     out.hashNext = pindex->pnext ? pindex->pnext->GetBlockHash() : uint256(0);
+    out.hashMerkleRoot = pindex->hashMerkleRoot;
 
     out.height = pindex->nHeight;
     out.nFile = pindex->nFile;

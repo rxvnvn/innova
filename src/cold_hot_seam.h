@@ -107,6 +107,32 @@ public:
                                    ColdHotSeamSnapshot* out, std::string* error) const;
     ColdHotSeamResult GetNextActiveR(const BlockIndexNavigationRef& ref,
                                      ColdHotSeamSnapshot* out, std::string* error) const;
+    /** By-value HybridSPV maturity/active-chain/merkle authority. Replaces the
+     *  block-index portion of legacy CMerkleTx::GetDepthInMainChain() with an
+     *  equivalent proof that NEVER requires the historical source CBlockIndex
+     *  to be resident in mapBlockIndex (A.9a.3e / NEW-N6). Fail-closed.
+     *
+     *  Semantics (exactly mirror legacy GetDepthInMainChainINTERNAL):
+     *    OK           - source block is ACTIVE and the wallet merkle branch
+     *                   verifies against the block's merkle root; *outDepth =
+     *                   activeTipHeight - sourceHeight + 1.
+     *    NOT_FOUND    - sentinel (sourceBlock invalid or nIndex<0), source
+     *                   genuinely absent, source known but NOT ACTIVE
+     *                   (side/reorged/stale), or merkle mismatch. Caller must
+     *                   reject (legacy returns depth 0/-1 here).
+     *    AUTHORITY_FAILURE - stale CURRENT/generation, corrupt record/hash, or
+     *                   divergent seam. MUST fail closed, never fall back to
+     *                   arbitrary historical residency.
+     *  Merkle proof is required to be in THIS active block; active block
+     *  membership alone is insufficient.
+     */
+    ColdHotSeamResult GetHybridSvmMaturityAuthorityR(
+        const BlockIndexLogicalId& sourceBlock,
+        const uint256& txHash,
+        const std::vector<uint256>& vMerkleBranch,
+        int nIndex,
+        int* outDepth,
+        std::string* error) const;
     ColdHotSeamResult GetLastStakeModifierR(const BlockIndexLogicalId& start,
                                             uint64_t* nStakeModifier, int64_t* nModifierTime,
                                             std::string* error) const;

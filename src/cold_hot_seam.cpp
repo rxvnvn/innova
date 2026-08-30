@@ -380,6 +380,93 @@ bool ColdHotSeamNavigator::GetNextActive(const BlockIndexNavigationRef& ref,
     return GetNextActiveR(ref, out, error) == COLD_HOT_SEAM_OK;
 }
 
+ColdHotSeamResult ColdHotSeamNavigator::GetHybridSvmMaturityAuthorityR(
+    const BlockIndexLogicalId& sourceBlock,
+    const uint256& txHash,
+    const std::vector<uint256>& vMerkleBranch,
+    int nIndex,
+    int* outDepth,
+    std::string* error) const
+{
+    if (!outDepth)
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    AssertLockHeld(cs_main);
+
+    // Legacy GetDepthInMainChainINTERNAL sentinel: hashBlock==0 or nIndex==-1
+    // returns depth 0 (the caller rejects: 0 < maturity). Preserve exactly.
+    if (!sourceBlock.IsValid() || nIndex < 0)
+    {
+        *outDepth = 0;
+        SeamClear(error);
+        return COLD_HOT_SEAM_NOT_FOUND;
+    }
+
+    // Resolve the historical source block BY-VALUE (stable logical hash) so a
+    // deep-cold source needs no resident CBlockIndex. Typed fail-closed result;
+    // an AUTHORITY_FAILURE is never converted into a NOT_FOUND, and a logical
+    // presence is never conflated with active-chain membership.
+    ColdHotSeamSnapshot snap;
+    const ColdHotSeamResult r = ResolveLogicalR(sourceBlock, &snap, error);
+    if (r != COLD_HOT_SEAM_OK)
+    {
+        *outDepth = 0;
+        // Genuine NOT_FOUND / END_OF_ACTIVE_CHAIN -> legacy depth 0 (reject).
+        // AUTHORITY_FAILURE propagates so the caller fails closed.
+        if (r != COLD_HOT_SEAM_AUTHORITY_FAILURE)
+            SeamClear(error);
+        return (r == COLD_HOT_SEAM_AUTHORITY_FAILURE) ? COLD_HOT_SEAM_AUTHORITY_FAILURE
+                                                      : COLD_HOT_SEAM_NOT_FOUND;
+    }
+    if (!snap.IsValid() || !snap.snapshot.found)
+    {
+        *outDepth = 0;
+        SeamFail(error, "HybridSPV maturity: resolved but invalid source snapshot");
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    }
+
+    // ACTIVE-chain authority: a V2 record existing by hash is NOT proof that
+    // the block is currently active. Require authoritative active membership
+    // (cold = O(1) active.dat; hot = pindex->IsInMainChain()). A side branch /
+    // known-but-not-active block must NEVER receive positive active depth.
+    if (!snap.snapshot.fInMainChain)
+    {
+        *outDepth = 0;
+        SeamClear(error);
+        return COLD_HOT_SEAM_NOT_FOUND; // known, not active -> legacy depth 0
+    }
+
+    // MERKLE authority: prove the wallet transaction is IN THIS ACTIVE BLOCK,
+    // not merely that "the block is active". Exact CheckMerkleBranch root match
+    // (identical to legacy GetDepthInMainChainINTERNAL).
+    {
+        const uint256 computedRoot = CBlock::CheckMerkleBranch(txHash, vMerkleBranch, nIndex);
+        if (computedRoot != snap.snapshot.hashMerkleRoot)
+        {
+            *outDepth = 0;
+            SeamClear(error);
+            return COLD_HOT_SEAM_NOT_FOUND; // merkle mismatch -> legacy depth 0
+        }
+    }
+
+    // Authoritative current active tip (live; matches legacy pindexBest).
+    const BlockIndexSnapshot tip = GetHotTip();
+    if (!tip.found || !tip.fInMainChain)
+    {
+        SeamFail(error, "HybridSPV maturity: no authoritative active tip");
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    }
+    if (snap.snapshot.height > tip.height)
+    {
+        SeamFail(error, "HybridSPV maturity: active source height above active tip");
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    }
+
+    // EXACT legacy depth arithmetic: bestHeight - blockHeight + 1.
+    *outDepth = tip.height - snap.snapshot.height + 1;
+    SeamClear(error);
+    return COLD_HOT_SEAM_OK;
+}
+
 bool ColdHotSeamNavigator::GetStakingMetadata(const BlockIndexNavigationRef& ref,
                                                BlockIndexStakingMetadata* out,
                                                std::string* error) const

@@ -961,6 +961,14 @@ bool ReadStakeSourceTransactionForTesting(const CBlockIndex* pindexPrev,
 }
 
 
+// A.9a.3e (NEW-N6): observation hook backing SetHybridSvmRecoveryProbe. Off by
+// default; production never sets it. Fires after the by-value maturity gate.
+static HybridSvmRecoveryProbeFn g_hybridsvmRecoveryProbe = NULL;
+void SetHybridSvmRecoveryProbe(HybridSvmRecoveryProbeFn fn)
+{
+    g_hybridsvmRecoveryProbe = fn;
+}
+
 // Check kernel hash target and coinstake signature
 bool CheckProofOfStake(const CBlockIndex* pindexPrev, const CTransaction& tx, unsigned int nBits, uint256& hashProofOfStake, uint256& targetProofOfStake)
 {
@@ -1040,9 +1048,42 @@ bool CheckProofOfStake(const CBlockIndex* pindexPrev, const CTransaction& tx, un
             if (wit != pwalletMain->mapWallet.end())
             {
                 const CWalletTx& wtx = wit->second;
-                if (wtx.GetDepthInMainChain() < nCoinbaseMaturity)
+                // A.9a.3e (NEW-N6): establish the wallet transaction's
+                // maturity / active-chain / merkle authority BY-VALUE so a
+                // deep-old HybridSPV source whose historical CBlockIndex is
+                // absent from mapBlockIndex still passes the exact legacy
+                // maturity gate and reaches the by-value source-block recovery
+                // below. With a retained navigator NO arbitrary historical
+                // CBlockIndex residency is required. The pre-A.10 no-navigator
+                // fallback keeps the exact legacy GetDepthInMainChain()
+                // semantics while all history is still materialized.
+                bool fAuthorityMature = false;
+                int nAuthorityDepth = 0;
+                const ColdHotSeamNavigator* spvNav = GetBlockIndexStakingNavigator();
+                if (spvNav)
+                {
+                    std::string err;
+                    const ColdHotSeamResult mr = spvNav->GetHybridSvmMaturityAuthorityR(
+                        BlockIndexLogicalId(wtx.hashBlock), wtx.GetHash(),
+                        wtx.vMerkleBranch, wtx.nIndex, &nAuthorityDepth, &err);
+                    if (mr == COLD_HOT_SEAM_OK)
+                        fAuthorityMature = (nAuthorityDepth >= nCoinbaseMaturity);
+                    // NOT_FOUND / AUTHORITY_FAILURE leave fAuthorityMature
+                    // false -> reject exactly as legacy depth < maturity.
+                }
+                else
+                {
+                    nAuthorityDepth = wtx.GetDepthInMainChain();
+                    if (nAuthorityDepth >= nCoinbaseMaturity)
+                        fAuthorityMature = true;
+                }
+                if (!fAuthorityMature)
                     return tx.DoS(10, error("CheckProofOfStake() : SPV stake input needs %d confirmations, has %d",
-                                            nCoinbaseMaturity, wtx.GetDepthInMainChain()));
+                                            nCoinbaseMaturity, nAuthorityDepth));
+                // Maturity/authority satisfied by-value: report that the code
+                // is about to enter by-value source recovery (test observation).
+                if (g_hybridsvmRecoveryProbe)
+                    g_hybridsvmRecoveryProbe(nAuthorityDepth);
                 if (wtx.hashBlock != uint256(0))
                 {
                     // A.9a.3d: resolve the historical source block's disk
@@ -1053,12 +1094,12 @@ bool CheckProofOfStake(const CBlockIndex* pindexPrev, const CTransaction& tx, un
                     // when no navigator is retained (pre-A.10 fully materialized).
                     CBlock block;
                     bool fHaveBlock = false;
-                    const ColdHotSeamNavigator* spvNav = GetBlockIndexStakingNavigator();
-                    if (spvNav)
+                    const ColdHotSeamNavigator* spvNavR = GetBlockIndexStakingNavigator();
+                    if (spvNavR)
                     {
                         std::string err;
                         ColdHotSeamSnapshot src;
-                        if (spvNav->ResolveLogicalR(BlockIndexLogicalId(wtx.hashBlock), &src, &err) == COLD_HOT_SEAM_OK)
+                        if (spvNavR->ResolveLogicalR(BlockIndexLogicalId(wtx.hashBlock), &src, &err) == COLD_HOT_SEAM_OK)
                             fHaveBlock = block.ReadFromDisk(src.snapshot.nFile, src.snapshot.nBlockPos, true);
                     }
                     else
