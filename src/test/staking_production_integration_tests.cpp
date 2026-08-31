@@ -29,6 +29,7 @@
 #include "../init.h"
 #include "util.h"
 #include <boost/filesystem.hpp>
+#include <boost/thread/barrier.hpp>
 
 BOOST_AUTO_TEST_SUITE(staking_production_integration_tests)
 
@@ -84,6 +85,8 @@ struct ProdFixture
     std::map<uint256, CBlockIndex*> savedMap;
     WalletTxMap savedWallet;
     std::map<COutPoint, SPVUtxo> savedSpvUtxos;
+    std::map<uint256, StakingMaterializationInfo> savedMaterializations;
+    uint64_t savedMaterializationSequence;
     CBlockIndex* savedBest; CBlockIndex* savedGenesis;
     uint256 savedHashBest; uint256 savedTrust; int savedHeight;
     std::vector<CBlockIndex*> created;
@@ -102,7 +105,8 @@ struct ProdFixture
     uint256 srcOverriddenHash;
     int srcOverrideHeight;
 
-    ProdFixture() : savedBest(pindexBest), savedGenesis(pindexGenesisBlock),
+    ProdFixture() : savedMaterializationSequence(0),
+        savedBest(pindexBest), savedGenesis(pindexGenesisBlock),
         savedHashBest(hashBestChain), savedTrust(nBestChainTrust), savedHeight(nBestHeight),
         genSelected(false), srcOverriddenHash(uint256(0)), srcOverrideHeight(2)
     {
@@ -116,6 +120,9 @@ struct ProdFixture
         {
             LOCK(pwalletMain->cs_spvutxos);
             savedSpvUtxos.swap(pwalletMain->mapSPVUtxos);
+            savedMaterializations.swap(pwalletMain->mapStakingMaterializations);
+            savedMaterializationSequence = pwalletMain->nStakingMaterializationSequence;
+            pwalletMain->nStakingMaterializationSequence = 0;
         }
         pindexBest = NULL; pindexGenesisBlock = NULL; hashBestChain = 0; nBestChainTrust = 0; nBestHeight = -1;
     }
@@ -138,6 +145,9 @@ struct ProdFixture
             LOCK(pwalletMain->cs_spvutxos);
             pwalletMain->mapSPVUtxos.clear();
             savedSpvUtxos.swap(pwalletMain->mapSPVUtxos);
+            pwalletMain->mapStakingMaterializations.clear();
+            savedMaterializations.swap(pwalletMain->mapStakingMaterializations);
+            pwalletMain->nStakingMaterializationSequence = savedMaterializationSequence;
         }
         if (genSelected)
             boost::filesystem::remove_all(BlockIndexGenerationManager::GenerationPath(root.string(), 1));
@@ -1797,6 +1807,29 @@ static void PrepareMerkleBlockColdSource(ProdFixture& fx, MerkleBlockSourceFixtu
     fx.nTimeOverride[height] = out->block.nTime;
 }
 
+// Same cold source shape, but with a structurally valid coinbase first so the
+// real ProcessMessage("block") arrival path can validate and store it.
+static void PrepareRecoveryColdSource(ProdFixture& fx, MerkleBlockSourceFixture* out,
+    const CPubKey& pub, int height)
+{
+    PrepareMerkleBlockColdSource(fx, out, pub, height, 500000 * COIN);
+    CTransaction coinbase;
+    coinbase.nTime = out->srcTx.nTime;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript() << OP_0 << OP_1;
+    coinbase.vout.push_back(CTxOut(0, CScript() << OP_TRUE));
+    out->block.vtx.insert(out->block.vtx.begin(), coinbase);
+    out->block.hashMerkleRoot = out->block.BuildMerkleTree();
+    while (!CheckProofOfWork(out->block.GetPoWHash(), out->block.nBits))
+        out->block.nNonce++;
+    out->sourceBlockHash = out->block.GetHash();
+    fx.srcOverriddenHash = out->sourceBlockHash;
+    fx.merkleRootOverride[height] = out->block.hashMerkleRoot;
+    fx.nBitsOverride[height] = out->block.nBits;
+    fx.nTimeOverride[height] = out->block.nTime;
+}
+
 // Build the exact merkleblock a peer sends for the single-tx source block:
 // header copy + single-leaf partial tree (root == tx hash, nTxIndex == 0).
 static CMerkleBlock BuildMerkleBlockFor(const MerkleBlockSourceFixture& src)
@@ -1831,13 +1864,44 @@ static void DeliverMerkleBlock(CNode& node, const CMerkleBlock& mb)
     { LOCK(node.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&node, criticalblock)); }
 }
 
+static void DeliverFullBlock(CNode& node, const CBlock& block)
+{
+    node.fSuccessfullyConnected = true;
+    node.fClient = false;
+    node.fOneShot = false;
+    node.fDisconnect = false;
+    node.nVersion = PROTOCOL_VERSION;
+    CDataStream payload(SER_NETWORK, INIT_PROTO_VERSION);
+    payload << block;
+    CSerializeData payloadBytes;
+    payload.GetAndClear(payloadBytes);
+    DeliverStakeFrame(node, "block", payloadBytes);
+    { LOCK(node.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&node, criticalblock)); }
+}
+
+static void AddStakingPeer(CNode* node)
+{
+    LOCK(cs_vNodes);
+    vNodes.push_back(node);
+}
+
+static void RemoveStakingPeer(CNode* node)
+{
+    LOCK(cs_vNodes);
+    vNodes.erase(std::remove(vNodes.begin(), vNodes.end(), node), vNodes.end());
+}
+
 static bool RunSpvAuthorityNegative(ProdFixture& fx, bool mapWalletBranch,
                                     bool divergentSeam, bool staleGeneration)
 {
     const CPubKey pub = SeedSpendableKey();
     MerkleBlockSourceFixture src;
     PrepareMerkleBlockColdSource(fx, &src, pub, 2, 500000 * COIN);
-    fx.nFileOverride[2] = 1;
+    BOOST_REQUIRE(src.nFile > 0);
+    CBlock verifySource;
+    BOOST_REQUIRE(verifySource.ReadFromDisk(src.nFile, src.nBlockPos, true));
+    BOOST_REQUIRE(verifySource.GetHash() == src.sourceBlockHash);
+    fx.nFileOverride[2] = src.nFile;
     fx.nBlockPosOverride[2] = src.nBlockPos;
     fx.Setup();
     fx.RetainNavigator();
@@ -1876,9 +1940,14 @@ static bool RunSpvAuthorityNegative(ProdFixture& fx, bool mapWalletBranch,
         LOCK(pwalletMain->cs_spvutxos);
         pwalletMain->mapSPVUtxos[COutPoint(src.srcTxHash, 0)] = u;
     }
+    // Make wrong authority acceptance observable: materialization is real and
+    // usable, so only the typed authority gate can keep this source out.
+    pwalletMain->PublishStakingMaterialization(
+        src.sourceBlockHash, src.nFile, src.nBlockPos);
     uint64_t nMin = 0, nMax = 0, nWeight = 0;
-    return !pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight) &&
-           (!mapWalletBranch || pwalletMain->mapWallet.count(src.srcTxHash) == 1);
+    const bool rejected = !pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight);
+    const size_t walletCount = pwalletMain->mapWallet.count(src.srcTxHash);
+    return rejected && (mapWalletBranch ? walletCount == 1 : walletCount == 0);
 }
 
 // NEW-N13 positive: a valid OLD ACTIVE merkleblock whose historical CBlockIndex
@@ -2204,6 +2273,8 @@ BOOST_FIXTURE_TEST_CASE(selectcoinsspv_mapwallet_inactive_side_not_selected, Pro
         u.nHeight = 2; u.hashBlock = src.sourceBlockHash; u.nTime = src.srcTx.nTime;
         u.fHaveBlock = true; u.fVerified = true; u.scriptPubKey = src.srcTx.vout[0].scriptPubKey;
         pwalletMain->mapSPVUtxos[COutPoint(src.srcTxHash, 0)] = u;
+        pwalletMain->PublishStakingMaterialization(
+            src.sourceBlockHash, src.nFile, src.nBlockPos);
         uint64_t nMin = 0, nMax = 0, nWeight = 0;
         BOOST_CHECK(!pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight));
     }
@@ -2240,6 +2311,8 @@ BOOST_FIXTURE_TEST_CASE(selectcoinsspv_cache_inactive_side_not_materialized, Pro
             LOCK(pwalletMain->cs_spvutxos);
             pwalletMain->mapSPVUtxos[COutPoint(src.srcTxHash, 0)] = u;
         }
+        pwalletMain->PublishStakingMaterialization(
+            src.sourceBlockHash, src.nFile, src.nBlockPos);
         uint64_t nMin = 0, nMax = 0, nWeight = 0;
         BOOST_CHECK(!pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight));
         BOOST_CHECK(pwalletMain->mapWallet.count(src.srcTxHash) == 0);
@@ -2285,6 +2358,309 @@ BOOST_FIXTURE_TEST_CASE(selectcoinsspv_cache_stale_generation_not_materialized, 
     fHybridSPV = true; nStakeMinAge = 0; nReserveBalance = 0;
     BOOST_CHECK(RunSpvAuthorityNegative(*this, false, false, true));
     fHybridSPV = saveSPV; nStakeMinAge = saveAge; nReserveBalance = saveReserve;
+}
+
+// A.9a.3h T1: deterministic two-thread lock-order regression. Both the
+// publication side and staking/cache side acquire main -> wallet -> spv; a
+// barrier starts them together and both production operations must complete.
+BOOST_FIXTURE_TEST_CASE(a9a3h_main_wallet_spv_lock_order_completes, ProdFixture)
+{
+    Setup(); RetainNavigator();
+    const COutPoint outpoint(uint256(0xA9A301), 0);
+    SPVUtxo incoming;
+    incoming.txhash = outpoint.hash; incoming.n = 0; incoming.nValue = COIN;
+    incoming.nHeight = 2; incoming.hashBlock = Hash(2); incoming.nTime = 1000;
+    incoming.fHaveBlock = true; incoming.fVerified = true;
+    incoming.scriptPubKey << OP_TRUE;
+
+    boost::barrier start(3);
+    bool publicationDone = false;
+    bool stakingDone = false;
+    boost::thread publication([&]() {
+        start.wait();
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        publicationDone = pwalletMain->UpdateSPVUtxo(outpoint, incoming);
+    });
+    boost::thread staking([&]() {
+        start.wait();
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        std::vector<COutPoint> coins;
+        pwalletMain->AvailableCoinsForStakingSPV(coins);
+        stakingDone = true;
+    });
+    start.wait();
+    publication.join();
+    staking.join();
+    BOOST_CHECK(publicationDone);
+    BOOST_CHECK(stakingDone);
+}
+
+// A.9a.3h T3/T4/T6/T7: an active cold source starts with no
+// coordinates and a both-false cache entry. Production selection requests once,
+// real block arrival publishes bounded materialization, and the next selection
+// materializes the exact tx while historical mapBlockIndex remains absent.
+BOOST_FIXTURE_TEST_CASE(a9a3h_cold_nfile0_request_arrival_then_selects, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const unsigned int saveAge = nStakeMinAge;
+    const int64_t saveReserve = nReserveBalance;
+    CNode peer(INVALID_SOCKET, StakePeerAddress(8701), "staking-materialization", true);
+    bool peerAdded = false;
+    try
+    {
+        fHybridSPV = true; nStakeMinAge = 0; nReserveBalance = 0;
+        const CPubKey pub = SeedSpendableKey();
+        MerkleBlockSourceFixture src;
+        PrepareRecoveryColdSource(*this, &src, pub, 2);
+        nFileOverride[2] = 0;
+        nBlockPosOverride[2] = 0;
+        Setup(); RetainNavigator();
+        BOOST_REQUIRE(mapBlockIndex.count(src.sourceBlockHash) == 0);
+
+        SPVUtxo u;
+        u.txhash = src.srcTxHash; u.n = 0; u.nValue = src.srcTx.vout[0].nValue;
+        u.nHeight = 2; u.hashBlock = src.sourceBlockHash;
+        u.nTime = src.srcTx.nTime; u.fHaveBlock = false; u.fVerified = false;
+        u.scriptPubKey = src.srcTx.vout[0].scriptPubKey;
+        {
+            LOCK(pwalletMain->cs_spvutxos);
+            pwalletMain->mapSPVUtxos[COutPoint(src.srcTxHash, 0)] = u;
+        }
+
+        peer.fSuccessfullyConnected = true;
+        peer.nVersion = PROTOCOL_VERSION;
+        AddStakingPeer(&peer); peerAdded = true;
+        uint64_t nMin = 0, nMax = 0, nWeight = 0;
+        BOOST_CHECK(!pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight));
+        BOOST_CHECK(pwalletMain->mapWallet.count(src.srcTxHash) == 0);
+        StakingMaterializationInfo pending;
+        BOOST_REQUIRE(pwalletMain->GetStakingMaterialization(src.sourceBlockHash, &pending));
+        BOOST_CHECK(pending.pending);
+        BOOST_CHECK_EQUAL(pending.nRequestCount, 1U);
+        size_t queuedAfterFirst = 0;
+        {
+            LOCK(peer.cs_vSend);
+            queuedAfterFirst = peer.vSendMsg.size();
+        }
+        BOOST_CHECK_GT(queuedAfterFirst, 0U);
+
+        // Repeated selection is deduplicated by the bounded stable-hash state.
+        BOOST_CHECK(!pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight));
+        StakingMaterializationInfo repeated;
+        BOOST_REQUIRE(pwalletMain->GetStakingMaterialization(src.sourceBlockHash, &repeated));
+        BOOST_CHECK_EQUAL(repeated.nRequestCount, 1U);
+        {
+            LOCK(peer.cs_vSend);
+            BOOST_CHECK_EQUAL(peer.vSendMsg.size(), queuedAfterFirst);
+        }
+
+        RemoveStakingPeer(&peer); peerAdded = false;
+        DeliverFullBlock(peer, src.block);
+        StakingMaterializationInfo arrived;
+        BOOST_REQUIRE(pwalletMain->GetStakingMaterialization(src.sourceBlockHash, &arrived));
+        BOOST_CHECK(arrived.available);
+        BOOST_CHECK(!arrived.pending);
+        BOOST_CHECK(arrived.nFile > 0);
+        BOOST_CHECK(mapBlockIndex.count(src.sourceBlockHash) == 0);
+
+        BOOST_CHECK(pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight));
+        BOOST_CHECK(pwalletMain->mapWallet.count(src.srcTxHash) == 1);
+        BOOST_CHECK(mapBlockIndex.count(src.sourceBlockHash) == 0);
+    }
+    catch (...)
+    {
+        if (peerAdded) RemoveStakingPeer(&peer);
+        fHybridSPV = saveSPV; nStakeMinAge = saveAge; nReserveBalance = saveReserve;
+        throw;
+    }
+    if (peerAdded) RemoveStakingPeer(&peer);
+    fHybridSPV = saveSPV; nStakeMinAge = saveAge; nReserveBalance = saveReserve;
+}
+
+// A.9a.3h T5: stale materialization coordinates that read the wrong block are
+// invalidated, enter bounded recovery, and become selectable after real arrival.
+BOOST_FIXTURE_TEST_CASE(a9a3h_stale_coordinate_recovers_after_real_arrival, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const unsigned int saveAge = nStakeMinAge;
+    const int64_t saveReserve = nReserveBalance;
+    CNode peer(INVALID_SOCKET, StakePeerAddress(8702), "staking-stale-position", true);
+    bool peerAdded = false;
+    try
+    {
+        fHybridSPV = true; nStakeMinAge = 0; nReserveBalance = 0;
+        const CPubKey pub = SeedSpendableKey();
+        MerkleBlockSourceFixture src;
+        PrepareRecoveryColdSource(*this, &src, pub, 2);
+        // These coordinates contain the pre-recovery block written by the
+        // helper, whose hash differs from the final active source block.
+        nFileOverride[2] = src.nFile;
+        nBlockPosOverride[2] = src.nBlockPos;
+        Setup(); RetainNavigator();
+        BOOST_REQUIRE(mapBlockIndex.count(src.sourceBlockHash) == 0);
+
+        SPVUtxo u;
+        u.txhash = src.srcTxHash; u.n = 0; u.nValue = src.srcTx.vout[0].nValue;
+        u.nHeight = 2; u.hashBlock = src.sourceBlockHash; u.nTime = src.srcTx.nTime;
+        u.fHaveBlock = true; u.fVerified = true;
+        u.scriptPubKey = src.srcTx.vout[0].scriptPubKey;
+        { LOCK(pwalletMain->cs_spvutxos); pwalletMain->mapSPVUtxos[COutPoint(src.srcTxHash, 0)] = u; }
+
+        peer.fSuccessfullyConnected = true; peer.nVersion = PROTOCOL_VERSION;
+        AddStakingPeer(&peer); peerAdded = true;
+        uint64_t nMin = 0, nMax = 0, nWeight = 0;
+        BOOST_CHECK(!pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight));
+        BOOST_CHECK(pwalletMain->mapWallet.count(src.srcTxHash) == 0);
+        StakingMaterializationInfo pending;
+        BOOST_REQUIRE(pwalletMain->GetStakingMaterialization(src.sourceBlockHash, &pending));
+        BOOST_CHECK(pending.pending);
+        BOOST_CHECK_EQUAL(pending.nRequestCount, 1U);
+
+        RemoveStakingPeer(&peer); peerAdded = false;
+        DeliverFullBlock(peer, src.block);
+        BOOST_CHECK(pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight));
+        BOOST_CHECK(pwalletMain->mapWallet.count(src.srcTxHash) == 1);
+        BOOST_CHECK(mapBlockIndex.count(src.sourceBlockHash) == 0);
+    }
+    catch (...)
+    {
+        if (peerAdded) RemoveStakingPeer(&peer);
+        fHybridSPV = saveSPV; nStakeMinAge = saveAge; nReserveBalance = saveReserve;
+        throw;
+    }
+    if (peerAdded) RemoveStakingPeer(&peer);
+    fHybridSPV = saveSPV; nStakeMinAge = saveAge; nReserveBalance = saveReserve;
+}
+
+// A.9a.3h T2: publication-time authority failure is mutation-closed.  The
+// existing valid entry must survive byte/field-semantically unchanged.
+BOOST_FIXTURE_TEST_CASE(a9a3h_failed_authority_publication_preserves_existing_cache, ProdFixture)
+{
+    Setup();
+    RetainNavigator();
+    const COutPoint outpoint(uint256(0xA9A3), 1);
+    SPVUtxo oldEntry;
+    oldEntry.txhash = outpoint.hash; oldEntry.n = outpoint.n;
+    oldEntry.nValue = 77 * COIN; oldEntry.nHeight = 2;
+    oldEntry.hashBlock = Hash(2); oldEntry.hashMerkleRoot = uint256(0x1111);
+    oldEntry.nTxIndex = 3; oldEntry.fHaveBlock = true;
+    oldEntry.fSpent = false; oldEntry.fVerified = true;
+    oldEntry.nTime = 1234; oldEntry.scriptPubKey << OP_TRUE;
+    {
+        LOCK(pwalletMain->cs_spvutxos);
+        pwalletMain->mapSPVUtxos[outpoint] = oldEntry;
+    }
+
+    SPVUtxo incoming = oldEntry;
+    incoming.nValue = 1;
+    incoming.nHeight = 999;
+    incoming.hashBlock = Hash(2);
+    incoming.fVerified = true;
+
+    // Invalid merkle proof is independently mutation-closed and does not rely
+    // on authority failure behavior.
+    SPVUtxo invalidProof = incoming;
+    invalidProof.vMerkleBranch.push_back(uint256(0xBAD));
+    invalidProof.hashMerkleRoot = uint256(0xBAD2);
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!pwalletMain->UpdateSPVUtxo(outpoint, invalidProof));
+    }
+    {
+        LOCK(pwalletMain->cs_spvutxos);
+        BOOST_CHECK_EQUAL(pwalletMain->mapSPVUtxos[outpoint].nValue, oldEntry.nValue);
+        BOOST_CHECK(pwalletMain->mapSPVUtxos[outpoint].hashBlock == oldEntry.hashBlock);
+    }
+
+    CBlockIndex* side = new CBlockIndex();
+    side->phashBlock = new uint256(0xDEADBEEF);
+    side->nHeight = 2; side->pprev = created[1]; side->nFile = 9;
+    created.push_back(side); mapBlockIndex[side->GetBlockHash()] = side;
+    SPVUtxo inactive = incoming;
+    inactive.hashBlock = side->GetBlockHash();
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(!pwalletMain->UpdateSPVUtxo(outpoint, inactive));
+    }
+    {
+        LOCK(pwalletMain->cs_spvutxos);
+        BOOST_CHECK_EQUAL(pwalletMain->mapSPVUtxos[outpoint].nValue, oldEntry.nValue);
+        BOOST_CHECK(pwalletMain->mapSPVUtxos[outpoint].hashBlock == oldEntry.hashBlock);
+    }
+
+    // Outer admission is initially valid.
+    {
+        LOCK(cs_main);
+        ColdHotSeamSnapshot authority;
+        std::string error;
+        BOOST_REQUIRE(GetStakingSourceAuthority(
+            incoming.hashBlock, &authority, &error) == COLD_HOT_SEAM_OK);
+    }
+
+    // Replace CURRENT before the production publication point. The retained
+    // navigator must report AUTHORITY_FAILURE and Update must publish nothing.
+    BlockIndexGenerationSource alt;
+    BlockIndexRecord record = ProdRecord(0x4242, 0, true, uint256(0));
+    BlockIndexGenerationSourceRecord sourceRecord;
+    sourceRecord.hash = record.hash; sourceRecord.record = record;
+    alt.records.push_back(sourceRecord);
+    alt.hashBestChain = record.hash; alt.foundBestChain = true;
+    BlockIndexGenerationBuilder builder;
+    BlockIndexGenerationStats stats;
+    std::string lifecycleError;
+    BOOST_REQUIRE(builder.Build(alt,
+        (root / BlockIndexGenerationManager::GenerationName(2)).string(),
+        2, &stats, &lifecycleError));
+    builder.Close();
+    BOOST_REQUIRE(BlockIndexGenerationManager::SelectGeneration(
+        root.string(), 2, &lifecycleError) == BLOCK_INDEX_LIFECYCLE_OK);
+
+    bool published = true;
+    {
+        LOCK(cs_main);
+        published = pwalletMain->UpdateSPVUtxo(outpoint, incoming);
+    }
+    BOOST_CHECK(!published);
+    {
+        LOCK(pwalletMain->cs_spvutxos);
+        BOOST_REQUIRE(pwalletMain->mapSPVUtxos.count(outpoint) == 1);
+        const SPVUtxo& after = pwalletMain->mapSPVUtxos[outpoint];
+        BOOST_CHECK(after.txhash == oldEntry.txhash);
+        BOOST_CHECK_EQUAL(after.n, oldEntry.n);
+        BOOST_CHECK_EQUAL(after.nValue, oldEntry.nValue);
+        BOOST_CHECK_EQUAL(after.nHeight, oldEntry.nHeight);
+        BOOST_CHECK(after.hashBlock == oldEntry.hashBlock);
+        BOOST_CHECK(after.hashMerkleRoot == oldEntry.hashMerkleRoot);
+        BOOST_CHECK_EQUAL(after.nTxIndex, oldEntry.nTxIndex);
+        BOOST_CHECK_EQUAL(after.fHaveBlock, oldEntry.fHaveBlock);
+        BOOST_CHECK_EQUAL(after.fSpent, oldEntry.fSpent);
+        BOOST_CHECK_EQUAL(after.fVerified, oldEntry.fVerified);
+        BOOST_CHECK_EQUAL(after.nTime, oldEntry.nTime);
+        BOOST_CHECK(after.scriptPubKey == oldEntry.scriptPubKey);
+    }
+}
+
+// A.9a.3h H13-H16/H34-H36: materialization state is stable-hash keyed,
+// bounded by the configured SPV working set, and carries no chain authority.
+BOOST_FIXTURE_TEST_CASE(a9a3h_materialization_overlay_is_bounded, ProdFixture)
+{
+    const bool hadLimit = mapArgs.count("-spvutxocachesize") != 0;
+    const std::string oldLimit = hadLimit ? mapArgs["-spvutxocachesize"] : std::string();
+    mapArgs["-spvutxocachesize"] = "3";
+    pwalletMain->ClearStakingMaterializations();
+    for (unsigned int i = 1; i <= 5; ++i)
+        pwalletMain->PublishStakingMaterialization(uint256(0xC000 + i), i, i * 100);
+    BOOST_CHECK_LE(pwalletMain->GetStakingMaterializationCount(), 3U);
+    StakingMaterializationInfo info;
+    BOOST_CHECK(pwalletMain->GetStakingMaterialization(uint256(0xC005), &info));
+    BOOST_CHECK(info.available);
+    BOOST_CHECK_EQUAL(info.nFile, 5U);
+    BOOST_CHECK_EQUAL(info.nBlockPos, 500U);
+    pwalletMain->ClearStakingMaterializations();
+    if (hadLimit)
+        mapArgs["-spvutxocachesize"] = oldLimit;
+    else
+        mapArgs.erase("-spvutxocachesize");
 }
 
 } // namespace (A.9a.3g helpers)

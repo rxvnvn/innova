@@ -148,42 +148,98 @@ static bool GetTransparentStakingBalance(const CWallet& wallet,
     return true;
 }
 
-static bool GetStakingSourceDiskPosition(const uint256& hashBlock,
-    unsigned int* nFileOut, unsigned int* nBlockPosOut)
+static ColdHotSeamResult GetStakingSourceDiskPositionR(const CWallet& wallet,
+    const uint256& hashBlock, unsigned int* nFileOut,
+    unsigned int* nBlockPosOut, bool* availableOut)
 {
     if (nFileOut)
         *nFileOut = 0;
     if (nBlockPosOut)
         *nBlockPosOut = 0;
+    if (availableOut)
+        *availableOut = false;
     AssertLockHeld(cs_main);
     if (hashBlock == uint256(0))
-        return false;
+        return COLD_HOT_SEAM_NOT_FOUND;
 
-    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
-    if (nav)
+    ColdHotSeamSnapshot snap;
+    std::string err;
+    const ColdHotSeamResult authority =
+        GetStakingSourceAuthority(hashBlock, &snap, &err);
+    if (authority != COLD_HOT_SEAM_OK)
+        return authority;
+
+    // Materialization is an ephemeral stable-hash overlay only.  It is
+    // consulted after authority and cannot make an inactive source acceptable.
+    StakingMaterializationInfo materialization;
+    const bool overlayKnown =
+        wallet.GetStakingMaterialization(hashBlock, &materialization);
+    if (overlayKnown)
     {
-        std::string err;
-        ColdHotSeamSnapshot snap;
-        const ColdHotSeamResult r = GetStakingSourceAuthority(hashBlock, &snap, &err);
-        if (r != COLD_HOT_SEAM_OK)
-            return false;
-        if (snap.snapshot.nFile <= 0)
-            return false;
+        if (materialization.available && materialization.nFile > 0)
+        {
+            if (nFileOut)
+                *nFileOut = materialization.nFile;
+            if (nBlockPosOut)
+                *nBlockPosOut = materialization.nBlockPos;
+            if (availableOut)
+                *availableOut = true;
+        }
+        // A pending/invalidated overlay entry intentionally suppresses stale
+        // frozen coordinates until a new arrival publishes usable bytes.
+        return COLD_HOT_SEAM_OK;
+    }
+
+    if (snap.snapshot.nFile > 0)
+    {
         if (nFileOut)
             *nFileOut = snap.snapshot.nFile;
         if (nBlockPosOut)
             *nBlockPosOut = snap.snapshot.nBlockPos;
-        return true;
+        if (availableOut)
+            *availableOut = true;
     }
+    return COLD_HOT_SEAM_OK;
+}
 
-    std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(hashBlock);
-    if (mi == mapBlockIndex.end() || !mi->second || mi->second->nFile <= 0)
+static bool GetStakingTxIndex(const CWallet& wallet, CTxDB& txdb,
+    const CWalletTx& wtx, CTxIndex* txindexOut)
+{
+    if (!txindexOut)
         return false;
-    if (nFileOut)
-        *nFileOut = mi->second->nFile;
-    if (nBlockPosOut)
-        *nBlockPosOut = mi->second->nBlockPos;
-    return true;
+    AssertLockHeld(cs_main);
+    if (txdb.ReadTxIndex(wtx.GetHash(), *txindexOut))
+        return true;
+    if (!fHybridSPV || wtx.hashBlock == uint256(0))
+        return false;
+
+    unsigned int nFile = 0, nBlockPos = 0;
+    bool available = false;
+    if (GetStakingSourceDiskPositionR(wallet, wtx.hashBlock,
+            &nFile, &nBlockPos, &available) != COLD_HOT_SEAM_OK || !available)
+        return false;
+
+    CBlock block;
+    if (!block.ReadFromDisk(nFile, nBlockPos, true) ||
+        block.GetHash() != wtx.hashBlock)
+        return false;
+
+    unsigned int nTxPos = nBlockPos +
+        ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+        (2 * GetSizeOfCompactSize(0)) +
+        GetSizeOfCompactSize(block.vtx.size());
+    for (std::vector<CTransaction>::const_iterator it = block.vtx.begin();
+         it != block.vtx.end(); ++it)
+    {
+        if (it->GetHash() == wtx.GetHash())
+        {
+            *txindexOut = CTxIndex(CDiskTxPos(nFile, nBlockPos, nTxPos),
+                                   it->vout.size());
+            return true;
+        }
+        nTxPos += ::GetSerializeSize(*it, SER_DISK, CLIENT_VERSION);
+    }
+    return false;
 }
 
 } // namespace
@@ -4536,7 +4592,8 @@ bool CWallet::GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, ui
         {
             LOCK2(cs_main, cs_wallet);
             const int64_t nReadStartTime = RPCPerfTimeMicros(fRPCPerfTrace);
-            const bool fRead = txdb.ReadTxIndex(pcoin.first->GetHash(), txindex);
+            const bool fRead = GetStakingTxIndex(
+                *this, txdb, *pcoin.first, &txindex);
             if (fRPCPerfTrace)
             {
                 const int64_t nReadMicros = RPCPerfTimeMicros(true) - nReadStartTime;
@@ -4695,7 +4752,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         CTxIndex txindex;
         {
             LOCK2(cs_main, cs_wallet);
-            if (!txdb.ReadTxIndex(pcoin.first->GetHash(), txindex))
+            if (!GetStakingTxIndex(*this, txdb, *pcoin.first, &txindex))
                 continue;
         }
 
@@ -9492,13 +9549,32 @@ std::vector<CWallet::CShieldedWalletNote> CWallet::SelectShieldedNotesForColdSta
 
 
 static const int64_t SPV_BLOCK_REQUEST_INTERVAL = 30;
+static const size_t SPV_BLOCK_REQUESTS_PER_SELECTION = 3;
 static size_t GetSPVUtxoCacheMaxSize()
 {
     return (size_t)GetArg("-spvutxocachesize", 10000);
 }
 
-void CWallet::UpdateSPVUtxo(const COutPoint& outpoint, const SPVUtxo& utxo)
+static void PruneStakingMaterializationsLocked(CWallet& wallet)
 {
+    AssertLockHeld(wallet.cs_spvutxos);
+    const size_t limit = GetSPVUtxoCacheMaxSize();
+    while (wallet.mapStakingMaterializations.size() > limit)
+    {
+        std::map<uint256, StakingMaterializationInfo>::iterator victim =
+            wallet.mapStakingMaterializations.begin();
+        for (std::map<uint256, StakingMaterializationInfo>::iterator it =
+                 wallet.mapStakingMaterializations.begin();
+             it != wallet.mapStakingMaterializations.end(); ++it)
+            if (it->second.nAccessSequence < victim->second.nAccessSequence)
+                victim = it;
+        wallet.mapStakingMaterializations.erase(victim);
+    }
+}
+
+bool CWallet::UpdateSPVUtxo(const COutPoint& outpoint, const SPVUtxo& utxo)
+{
+    AssertLockHeld(cs_main);
     SPVUtxo verifiedUtxo = utxo;
 
     if (!utxo.vMerkleBranch.empty())
@@ -9508,19 +9584,21 @@ void CWallet::UpdateSPVUtxo(const COutPoint& outpoint, const SPVUtxo& utxo)
         {
             printf("SPV: Rejected UTXO %s:%d - merkle proof verification failed\n",
                    outpoint.hash.ToString().c_str(), outpoint.n);
-            return;
+            return false;
         }
     }
-    else if (utxo.fVerified)
+
+    if (verifiedUtxo.fVerified)
     {
-        LOCK(cs_main);
         ColdHotSeamSnapshot source;
         std::string error;
-        if (GetStakingSourceAuthority(utxo.hashBlock, &source, &error) != COLD_HOT_SEAM_OK)
+        const ColdHotSeamResult authority =
+            GetStakingSourceAuthority(utxo.hashBlock, &source, &error);
+        if (authority != COLD_HOT_SEAM_OK)
         {
-            printf("SPV: Rejected UTXO %s:%d - source block is not currently active\n",
-                   outpoint.hash.ToString().c_str(), outpoint.n);
-            verifiedUtxo.fVerified = false;
+            printf("SPV: Rejected UTXO %s:%d - source block has no current authority (%d)\n",
+                   outpoint.hash.ToString().c_str(), outpoint.n, (int)authority);
+            return false; // mutation-closed on every failed authority class
         }
     }
 
@@ -9528,9 +9606,101 @@ void CWallet::UpdateSPVUtxo(const COutPoint& outpoint, const SPVUtxo& utxo)
     mapSPVUtxos[outpoint] = verifiedUtxo;
 
     if (mapSPVUtxos.size() > GetSPVUtxoCacheMaxSize())
-    {
         PruneSPVUtxos();
+    return true;
+}
+
+void CWallet::PublishStakingMaterialization(const uint256& hashBlock,
+                                            unsigned int nFile,
+                                            unsigned int nBlockPos)
+{
+    if (hashBlock == uint256(0) || nFile == 0)
+        return;
+    LOCK(cs_spvutxos);
+    StakingMaterializationInfo& info = mapStakingMaterializations[hashBlock];
+    info.available = true;
+    info.pending = false;
+    info.nFile = nFile;
+    info.nBlockPos = nBlockPos;
+    info.nAccessSequence = ++nStakingMaterializationSequence;
+
+    // Availability is not authority and does not verify transaction inclusion.
+    for (std::map<COutPoint, SPVUtxo>::iterator it = mapSPVUtxos.begin();
+         it != mapSPVUtxos.end(); ++it)
+        if (it->second.hashBlock == hashBlock)
+            it->second.fHaveBlock = true;
+
+    PruneStakingMaterializationsLocked(*this);
+}
+
+bool CWallet::GetStakingMaterialization(const uint256& hashBlock,
+                                        StakingMaterializationInfo* out) const
+{
+    if (!out)
+        return false;
+    LOCK(cs_spvutxos);
+    std::map<uint256, StakingMaterializationInfo>::const_iterator it =
+        mapStakingMaterializations.find(hashBlock);
+    if (it == mapStakingMaterializations.end())
+    {
+        *out = StakingMaterializationInfo();
+        return false;
     }
+    *out = it->second;
+    return true;
+}
+
+bool CWallet::MarkStakingMaterializationRequested(const uint256& hashBlock,
+                                                   int64_t nNow)
+{
+    if (hashBlock == uint256(0))
+        return false;
+    LOCK(cs_spvutxos);
+    StakingMaterializationInfo& info = mapStakingMaterializations[hashBlock];
+    if (info.available)
+        return false;
+    if (info.pending && nNow - info.nLastRequest < SPV_BLOCK_REQUEST_INTERVAL)
+        return false;
+    info.pending = true;
+    info.nLastRequest = nNow;
+    info.nRequestCount++;
+    info.nAccessSequence = ++nStakingMaterializationSequence;
+
+    PruneStakingMaterializationsLocked(*this);
+    return mapStakingMaterializations.count(hashBlock) != 0;
+}
+
+void CWallet::InvalidateStakingMaterialization(const uint256& hashBlock)
+{
+    if (hashBlock == uint256(0))
+        return;
+    LOCK(cs_spvutxos);
+    StakingMaterializationInfo& info = mapStakingMaterializations[hashBlock];
+    info.available = false;
+    info.pending = false;
+    info.nFile = 0;
+    info.nBlockPos = 0;
+    info.nAccessSequence = ++nStakingMaterializationSequence;
+    PruneStakingMaterializationsLocked(*this);
+}
+
+bool CWallet::IsStakingMaterializationPending(const uint256& hashBlock) const
+{
+    StakingMaterializationInfo info;
+    return GetStakingMaterialization(hashBlock, &info) && info.pending;
+}
+
+size_t CWallet::GetStakingMaterializationCount() const
+{
+    LOCK(cs_spvutxos);
+    return mapStakingMaterializations.size();
+}
+
+void CWallet::ClearStakingMaterializations()
+{
+    LOCK(cs_spvutxos);
+    mapStakingMaterializations.clear();
+    nStakingMaterializationSequence = 0;
 }
 
 void CWallet::RemoveSPVUtxo(const COutPoint& outpoint)
@@ -9794,6 +9964,10 @@ bool CWallet::LoadSPVUtxoCache()
     if (!fHybridSPV)
         return true;
 
+    // Materialization coordinates/pending state are intentionally ephemeral;
+    // restart reloads only bounded SPV candidates, which may recover by hash.
+    ClearStakingMaterializations();
+
     boost::filesystem::path pathCache = GetDataDir() / "spvutxos.dat";
     if (!boost::filesystem::exists(pathCache))
     {
@@ -9867,11 +10041,9 @@ void CWallet::AvailableCoinsForStakingSPV(std::vector<COutPoint>& vCoins) const
         if (utxo.nValue < nMinimumInputValue)
             continue;
 
-        if (!utxo.fVerified && !utxo.fHaveBlock)
-        {
-            continue;
-        }
-
+        // Both-false entries are recovery candidates, never selection
+        // authority. SelectCoinsForStakingSPV performs typed authority first and
+        // either materializes exact bytes or schedules bounded recovery.
         vCoins.push_back(item.first);
     }
 }
@@ -9882,55 +10054,28 @@ void CWallet::MarkSPVBlockAvailable(const uint256& hashBlock)
     for (auto& item : mapSPVUtxos)
     {
         if (item.second.hashBlock == hashBlock)
-        {
             item.second.fHaveBlock = true;
-            item.second.fVerified = true;
-        }
     }
 }
 
 bool CWallet::RequestBlockForStaking(const uint256& hashBlock, bool fWait)
 {
-    int64_t nNow = GetTime();
-
-    {
-        LOCK(cs_spvutxos);
-        for (auto& item : mapSPVUtxos)
-        {
-            if (item.second.hashBlock == hashBlock)
-            {
-                if (nNow - item.second.nLastBlockRequest < SPV_BLOCK_REQUEST_INTERVAL)
-                {
-                    return false;
-                }
-                item.second.nLastBlockRequest = nNow;
-                break;
-            }
-        }
-    }
+    const int64_t nNow = GetTime();
+    if (!MarkStakingMaterializationRequested(hashBlock, nNow))
+        return false;
 
     extern bool FetchBlockForStaking(const uint256& hashBlock);
-    bool fRequested = FetchBlockForStaking(hashBlock);
+    const bool fRequested = FetchBlockForStaking(hashBlock);
 
     if (fWait && fRequested)
     {
-        int64_t nWaitUntil = GetTime() + 10;
+        const int64_t nWaitUntil = GetTime() + 10;
         while (GetTime() < nWaitUntil)
         {
             MilliSleep(100);
-
-            {
-                LOCK(cs_main);
-                if (mapBlockIndex.count(hashBlock))
-                {
-                    CBlockIndex* pindex = mapBlockIndex[hashBlock];
-                    if (pindex->nFile > 0)
-                    {
-                        MarkSPVBlockAvailable(hashBlock);
-                        return true;
-                    }
-                }
-            }
+            StakingMaterializationInfo info;
+            if (GetStakingMaterialization(hashBlock, &info) && info.available)
+                return true;
         }
         return false;
     }
@@ -9942,12 +10087,10 @@ bool CWallet::SelectCoinsForStakingSPV(std::set<std::pair<const CWalletTx*,unsig
 {
     std::vector<COutPoint> vSPVCoins;
     AvailableCoinsForStakingSPV(vSPVCoins);
-
     setCoinsRet.clear();
 
     LOCK2(cs_main, cs_wallet);
-
-    std::vector<uint256> vBlocksNeeded;
+    std::set<uint256> blocksNeeded;
 
     for (const COutPoint& outpoint : vSPVCoins)
     {
@@ -9961,72 +10104,81 @@ bool CWallet::SelectCoinsForStakingSPV(std::set<std::pair<const CWalletTx*,unsig
         if (it != mapWallet.end())
         {
             const CWalletTx* pcoin = &(it->second);
-            if (outpoint.n < pcoin->vout.size())
-            {
-                unsigned int nFile = 0;
-                unsigned int nBlockPos = 0;
-                if (GetStakingSourceDiskPosition(pcoin->hashBlock, &nFile, &nBlockPos))
-                {
-                    setCoinsRet.insert(std::make_pair(pcoin, outpoint.n));
-                }
-                else if (pcoin->hashBlock != uint256(0))
-                {
-                    vBlocksNeeded.push_back(pcoin->hashBlock);
-                }
-            }
+            if (outpoint.n >= pcoin->vout.size())
+                continue;
+            unsigned int nFile = 0, nBlockPos = 0;
+            bool available = false;
+            const ColdHotSeamResult authority = GetStakingSourceDiskPositionR(
+                *this, pcoin->hashBlock, &nFile, &nBlockPos, &available);
+            if (authority == COLD_HOT_SEAM_OK && available)
+                setCoinsRet.insert(std::make_pair(pcoin, outpoint.n));
+            else if (authority == COLD_HOT_SEAM_OK && pcoin->hashBlock != uint256(0))
+                blocksNeeded.insert(pcoin->hashBlock);
+            continue;
         }
-        else
+
+        SPVUtxo cached;
+        bool found = false;
         {
             LOCK(cs_spvutxos);
-            auto spvIt = mapSPVUtxos.find(outpoint);
+            std::map<COutPoint, SPVUtxo>::const_iterator spvIt = mapSPVUtxos.find(outpoint);
             if (spvIt != mapSPVUtxos.end())
             {
-                if (spvIt->second.fHaveBlock && spvIt->second.fVerified)
-                {
-                    unsigned int nFile = 0;
-                    unsigned int nBlockPos = 0;
-                    if (GetStakingSourceDiskPosition(spvIt->second.hashBlock, &nFile, &nBlockPos))
-                    {
-                        CBlock block;
-                        if (block.ReadFromDisk(nFile, nBlockPos, true))
-                        {
-                            for (const CTransaction& tx : block.vtx)
-                            {
-                                if (tx.GetHash() == outpoint.hash)
-                                {
-                                    CWalletTx wtx(const_cast<CWallet*>(this), tx);
-                                    wtx.hashBlock = spvIt->second.hashBlock;
-                                    wtx.nTime = spvIt->second.nTime;
-                                    const_cast<CWallet*>(this)->AddToWallet(wtx);
-
-                                    auto newIt = mapWallet.find(outpoint.hash);
-                                    if (newIt != mapWallet.end())
-                                    {
-                                        const CWalletTx* pcoin = &(newIt->second);
-                                        if (outpoint.n < pcoin->vout.size())
-                                            setCoinsRet.insert(std::make_pair(pcoin, outpoint.n));
-                                    }
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    else
-                    {
-                        vBlocksNeeded.push_back(spvIt->second.hashBlock);
-                    }
-                }
-                else if (!spvIt->second.fHaveBlock)
-                {
-                    vBlocksNeeded.push_back(spvIt->second.hashBlock);
-                }
+                cached = spvIt->second;
+                found = true;
             }
+        }
+        if (!found || cached.hashBlock == uint256(0))
+            continue;
+
+        unsigned int nFile = 0, nBlockPos = 0;
+        bool available = false;
+        const ColdHotSeamResult authority = GetStakingSourceDiskPositionR(
+            *this, cached.hashBlock, &nFile, &nBlockPos, &available);
+        if (authority != COLD_HOT_SEAM_OK)
+            continue; // materialization can never override source authority
+        if (!available)
+        {
+            blocksNeeded.insert(cached.hashBlock);
+            continue;
+        }
+
+        CBlock block;
+        if (!block.ReadFromDisk(nFile, nBlockPos, true) ||
+            block.GetHash() != cached.hashBlock)
+        {
+            CWallet* mutableWallet = const_cast<CWallet*>(this);
+            mutableWallet->InvalidateStakingMaterialization(cached.hashBlock);
+            blocksNeeded.insert(cached.hashBlock);
+            continue;
+        }
+
+        // Exact active block bytes are sufficient materialization evidence for
+        // a both-false persisted cache entry; authority was established above.
+        const_cast<CWallet*>(this)->PublishStakingMaterialization(
+            cached.hashBlock, nFile, nBlockPos);
+        for (const CTransaction& tx : block.vtx)
+        {
+            if (tx.GetHash() != outpoint.hash)
+                continue;
+            CWalletTx wtx(const_cast<CWallet*>(this), tx);
+            wtx.hashBlock = cached.hashBlock;
+            wtx.nTime = cached.nTime;
+            const_cast<CWallet*>(this)->AddToWallet(wtx);
+            std::map<uint256, CWalletTx>::const_iterator newIt = mapWallet.find(outpoint.hash);
+            if (newIt != mapWallet.end() && outpoint.n < newIt->second.vout.size())
+                setCoinsRet.insert(std::make_pair(&(newIt->second), outpoint.n));
+            break;
         }
     }
 
-    for (const uint256& hashBlock : vBlocksNeeded)
+    size_t requestsIssued = 0;
+    for (std::set<uint256>::const_iterator it = blocksNeeded.begin();
+         it != blocksNeeded.end() &&
+             requestsIssued < SPV_BLOCK_REQUESTS_PER_SELECTION; ++it)
     {
-        const_cast<CWallet*>(this)->RequestBlockForStaking(hashBlock, false);
+        if (const_cast<CWallet*>(this)->RequestBlockForStaking(*it, false))
+            requestsIssued++;
     }
 
     return !setCoinsRet.empty();

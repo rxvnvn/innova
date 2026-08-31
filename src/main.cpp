@@ -12981,7 +12981,52 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
         ibdmetrics::Get().block_receive_total.fetch_add(
             1, std::memory_order_relaxed);
-        bool fAccepted = ProcessBlock(pfrom, &block);
+
+        // A.9a.3h: a staking fetch may target an active cold source whose
+        // historical parent/index is intentionally non-resident. Validate and
+        // store those bytes as MATERIALIZATION only; this never supplies chain
+        // authority. Normal connectable blocks publish their accepted position
+        // below instead of being written twice.
+        bool fStoredStakingMaterialization = false;
+        unsigned int nStakingFile = 0;
+        unsigned int nStakingBlockPos = 0;
+        const bool fPendingStakingMaterialization =
+            fHybridSPV && pwalletMain &&
+            pwalletMain->IsStakingMaterializationPending(hashBlock);
+        if (fPendingStakingMaterialization)
+        {
+            std::map<uint256, CBlockIndex*>::const_iterator known =
+                mapBlockIndex.find(hashBlock);
+            if (known != mapBlockIndex.end() && known->second && known->second->nFile > 0)
+            {
+                nStakingFile = known->second->nFile;
+                nStakingBlockPos = known->second->nBlockPos;
+                fStoredStakingMaterialization = true;
+            }
+            else if (mapBlockIndex.count(block.hashPrevBlock) == 0 &&
+                     block.CheckBlock() &&
+                     block.WriteToDisk(nStakingFile, nStakingBlockPos))
+            {
+                fStoredStakingMaterialization = true;
+            }
+        }
+
+        bool fAccepted = fStoredStakingMaterialization
+            ? true
+            : ProcessBlock(pfrom, &block);
+        if (fStoredStakingMaterialization)
+            pwalletMain->PublishStakingMaterialization(
+                hashBlock, nStakingFile, nStakingBlockPos);
+        if (fAccepted && fPendingStakingMaterialization)
+        {
+            std::map<uint256, CBlockIndex*>::const_iterator accepted =
+                mapBlockIndex.find(hashBlock);
+            if (accepted != mapBlockIndex.end() && accepted->second &&
+                accepted->second->nFile > 0)
+                pwalletMain->PublishStakingMaterialization(
+                    hashBlock, accepted->second->nFile,
+                    accepted->second->nBlockPos);
+        }
         bool fEffRetryRecorded = false;
         if (fAccepted)
         {
@@ -13509,28 +13554,23 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         {
             uint256 hashBlock = Tribus(BEGIN(merkleBlock.header.nVersion), END(merkleBlock.header.nNonce));
 
+            // Global order: cs_main -> cs_wallet -> cs_spvutxos.  Keep current
+            // authority stable through publication; UpdateSPVUtxo rechecks under
+            // the same cs_main transaction and never acquires cs_main itself.
+            LOCK2(cs_main, pwalletMain->cs_wallet);
             int nHeight = 0;
-            bool fBlockInBestChain = false;
-            {
-                LOCK(cs_main);
-                ColdHotSeamSnapshot source;
-                std::string sourceError;
-                const ColdHotSeamResult authority =
-                    GetStakingSourceAuthority(hashBlock, &source, &sourceError);
-                if (authority == COLD_HOT_SEAM_OK)
-                {
-                    nHeight = source.snapshot.height;
-                    fBlockInBestChain = source.snapshot.fInMainChain;
-                }
-            }
-
-            if (!fBlockInBestChain)
+            ColdHotSeamSnapshot source;
+            std::string sourceError;
+            const ColdHotSeamResult authority =
+                GetStakingSourceAuthority(hashBlock, &source, &sourceError);
+            if (authority != COLD_HOT_SEAM_OK)
             {
                 if (fDebug)
-                    printf("SPV: Ignoring merkleblock for block not in best chain: %s\n", hashBlock.ToString().c_str());
+                    printf("SPV: Ignoring merkleblock without current authority: %s\n", hashBlock.ToString().c_str());
             }
             else
             {
+                nHeight = source.snapshot.height;
                 CPartialMerkleTree txnCopy = merkleBlock.txn;
                 std::vector<uint256> vMatchCopy;
                 txnCopy.ExtractMatches(vMatchCopy);
@@ -13547,7 +13587,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                         }
                     }
 
-                    LOCK(pwalletMain->cs_wallet);
                     std::map<uint256, CWalletTx>::iterator wit = pwalletMain->mapWallet.find(txhash);
                     if (wit != pwalletMain->mapWallet.end())
                     {

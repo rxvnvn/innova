@@ -117,6 +117,21 @@ public:
     )
 };
 
+struct StakingMaterializationInfo
+{
+    bool available;
+    bool pending;
+    unsigned int nFile;
+    unsigned int nBlockPos;
+    int64_t nLastRequest;
+    uint32_t nRequestCount;
+    uint64_t nAccessSequence;
+
+    StakingMaterializationInfo()
+        : available(false), pending(false), nFile(0), nBlockPos(0),
+          nLastRequest(0), nRequestCount(0), nAccessSequence(0) {}
+};
+
 struct SPVUtxo
 {
     uint256 txhash;         // tx hash
@@ -283,6 +298,7 @@ public:
         pwalletdbEncryption = NULL;
         nOrderPosNext = 0;
         nTimeFirstKey = 0;
+        nStakingMaterializationSequence = 0;
     }
 
     std::map<uint256, CWalletTx> mapWallet;
@@ -291,6 +307,11 @@ public:
     std::map<uint256, int> mapRequestCount;
 
     std::map<COutPoint, SPVUtxo> mapSPVUtxos;
+    // Bounded, ephemeral MATERIALIZATION facts keyed by stable logical block
+    // hash. This state never supplies chain authority, depth, maturity, or seam
+    // validity; cs_spvutxos protects it and mapSPVUtxos.
+    std::map<uint256, StakingMaterializationInfo> mapStakingMaterializations;
+    uint64_t nStakingMaterializationSequence;
     mutable CCriticalSection cs_spvutxos;
 
     //Innova Name DB
@@ -317,12 +338,25 @@ public:
     int64_t GetColdStakingBalance() const;
     bool NeedsStakingPreparation() const;
 
-    void UpdateSPVUtxo(const COutPoint& outpoint, const SPVUtxo& utxo);
+    // Caller holds cs_main. Returns false without cache mutation on invalid
+    // merkle proof or any non-OK current source authority.
+    bool UpdateSPVUtxo(const COutPoint& outpoint, const SPVUtxo& utxo);
     void RemoveSPVUtxo(const COutPoint& outpoint);
     void MarkSPVUtxoSpent(const COutPoint& outpoint);
     void AvailableCoinsForStakingSPV(std::vector<COutPoint>& vCoins) const;
     bool RequestBlockForStaking(const uint256& hashBlock, bool fWait = false);
     void MarkSPVBlockAvailable(const uint256& hashBlock);
+    void PublishStakingMaterialization(const uint256& hashBlock,
+                                       unsigned int nFile,
+                                       unsigned int nBlockPos);
+    bool GetStakingMaterialization(const uint256& hashBlock,
+                                   StakingMaterializationInfo* out) const;
+    bool MarkStakingMaterializationRequested(const uint256& hashBlock,
+                                              int64_t nNow);
+    void InvalidateStakingMaterialization(const uint256& hashBlock);
+    bool IsStakingMaterializationPending(const uint256& hashBlock) const;
+    size_t GetStakingMaterializationCount() const;
+    void ClearStakingMaterializations();
     void PopulateSPVUtxosFromWallet();
     void PruneSPVUtxos();
     bool IsSPVUtxoSpent(const COutPoint& outpoint) const;

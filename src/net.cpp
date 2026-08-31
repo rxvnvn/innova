@@ -6,6 +6,7 @@
 #include "db.h"
 #include "net.h"
 #include "main.h"
+#include "wallet.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
 #include "ibdsemantic.h"
@@ -10165,7 +10166,19 @@ bool FetchBlockForStaking(const uint256& hashBlock)
         {
             CBlockIndex* pindex = mapBlockIndex[hashBlock];
             if (pindex->nFile > 0)
-                return true;
+            {
+                CBlock localBlock;
+                if (localBlock.ReadFromDisk(pindex->nFile, pindex->nBlockPos, true) &&
+                    localBlock.GetHash() == hashBlock)
+                {
+                    if (pwalletMain)
+                        pwalletMain->PublishStakingMaterialization(
+                            hashBlock, pindex->nFile, pindex->nBlockPos);
+                    return true;
+                }
+                // Resident coordinates are materialization hints, not authority
+                // or proof of usable bytes. Fall through to stable-hash fetch.
+            }
         }
     }
 
