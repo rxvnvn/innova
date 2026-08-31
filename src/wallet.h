@@ -12,6 +12,13 @@
 
 
 #include "main.h"
+#include "cold_hot_seam.h"
+
+// Caller holds cs_main. Resolves a staking source with current active-chain
+// authority and verifies the cold/hot seam when a cold snapshot is used.
+ColdHotSeamResult GetStakingSourceAuthority(const uint256& hashBlock,
+                                            ColdHotSeamSnapshot* out,
+                                            std::string* error);
 #include "key.h"
 #include "silentpayments.h"
 #include "keystore.h"

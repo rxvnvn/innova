@@ -13513,17 +13513,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             bool fBlockInBestChain = false;
             {
                 LOCK(cs_main);
-                if (mapBlockIndex.count(hashBlock))
+                ColdHotSeamSnapshot source;
+                std::string sourceError;
+                const ColdHotSeamResult authority =
+                    GetStakingSourceAuthority(hashBlock, &source, &sourceError);
+                if (authority == COLD_HOT_SEAM_OK)
                 {
-                    CBlockIndex* pblockindex = mapBlockIndex[hashBlock];
-                    nHeight = pblockindex->nHeight;
-                    if (pindexBest && nHeight <= pindexBest->nHeight)
-                    {
-                        CBlockIndex* pcheck = pindexBest;
-                        while (pcheck && pcheck->nHeight > nHeight)
-                            pcheck = pcheck->pprev;
-                        fBlockInBestChain = (pcheck && pcheck->GetBlockHash() == hashBlock);
-                    }
+                    nHeight = source.snapshot.height;
+                    fBlockInBestChain = source.snapshot.fInMainChain;
                 }
             }
 

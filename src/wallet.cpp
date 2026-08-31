@@ -111,7 +111,7 @@ static bool GetWalletTxStakingAvailableCredit(const CWallet& wallet,
 }
 
 static bool GetTransparentStakingBalance(const CWallet& wallet,
-    unsigned int nSpendTime, int64_t* outBalance)
+    int64_t* outBalance)
 {
     if (!outBalance)
         return false;
@@ -120,7 +120,9 @@ static bool GetTransparentStakingBalance(const CWallet& wallet,
     for (WalletTxMap::const_iterator it = wallet.mapWallet.begin(); it != wallet.mapWallet.end(); ++it)
     {
         const CWalletTx& wtx = it->second;
-        if (wtx.nTime + nStakeMinAge > nSpendTime)
+        if (!wtx.IsFinal())
+            continue;
+        if (!pindexBest || wtx.nTime > pindexBest->GetBlockTime())
             continue;
 
         int nDepth = 0;
@@ -162,7 +164,7 @@ static bool GetStakingSourceDiskPosition(const uint256& hashBlock,
     {
         std::string err;
         ColdHotSeamSnapshot snap;
-        const ColdHotSeamResult r = nav->ResolveLogicalR(BlockIndexLogicalId(hashBlock), &snap, &err);
+        const ColdHotSeamResult r = GetStakingSourceAuthority(hashBlock, &snap, &err);
         if (r != COLD_HOT_SEAM_OK)
             return false;
         if (snap.snapshot.nFile <= 0)
@@ -185,6 +187,40 @@ static bool GetStakingSourceDiskPosition(const uint256& hashBlock,
 }
 
 } // namespace
+
+ColdHotSeamResult GetStakingSourceAuthority(const uint256& hashBlock,
+                                            ColdHotSeamSnapshot* out,
+                                            std::string* error)
+{
+    if (!out || hashBlock == uint256(0))
+        return COLD_HOT_SEAM_NOT_FOUND;
+    AssertLockHeld(cs_main);
+    *out = ColdHotSeamSnapshot();
+
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    if (nav)
+    {
+        const ColdHotSeamResult r = nav->ResolveLogicalR(
+            BlockIndexLogicalId(hashBlock), out, error);
+        if (r != COLD_HOT_SEAM_OK)
+            return r;
+        if (!out->snapshot.fInMainChain)
+            return COLD_HOT_SEAM_NOT_ACTIVE;
+        if (out->ref.IsCold() && !nav->VerifySeam(error))
+            return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+        return COLD_HOT_SEAM_OK;
+    }
+
+    std::map<uint256, CBlockIndex*>::const_iterator it = mapBlockIndex.find(hashBlock);
+    if (it == mapBlockIndex.end() || !it->second)
+        return COLD_HOT_SEAM_NOT_FOUND;
+    if (!it->second->IsInMainChain())
+        return COLD_HOT_SEAM_NOT_ACTIVE;
+    out->snapshot = LegacyBlockIndexAccessor().LookupByHash(hashBlock);
+    if (!out->snapshot.found)
+        return COLD_HOT_SEAM_NOT_FOUND;
+    return COLD_HOT_SEAM_OK;
+}
 
 #if BOOST_VERSION >= 107300
 #include <boost/bind/bind.hpp>
@@ -4421,7 +4457,7 @@ bool CWallet::GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, ui
     if (!fHybridSPV)
     {
         LOCK2(cs_main, cs_wallet);
-        fBalanceOk = GetTransparentStakingBalance(*this, GetTime(), &nBalance);
+        fBalanceOk = GetTransparentStakingBalance(*this, &nBalance);
     }
     const int64_t nBalanceCheckMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nBalanceStartTime;
 
@@ -4569,7 +4605,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
     if (!fHybridSPV)
     {
         LOCK2(cs_main, cs_wallet);
-        if (!GetTransparentStakingBalance(*this, txNew.nTime, &nBalance))
+        if (!GetTransparentStakingBalance(*this, &nBalance))
             return false;
     }
 
@@ -9463,8 +9499,6 @@ static size_t GetSPVUtxoCacheMaxSize()
 
 void CWallet::UpdateSPVUtxo(const COutPoint& outpoint, const SPVUtxo& utxo)
 {
-    LOCK(cs_spvutxos);
-
     SPVUtxo verifiedUtxo = utxo;
 
     if (!utxo.vMerkleBranch.empty())
@@ -9480,15 +9514,17 @@ void CWallet::UpdateSPVUtxo(const COutPoint& outpoint, const SPVUtxo& utxo)
     else if (utxo.fVerified)
     {
         LOCK(cs_main);
-        if (!mapBlockIndex.count(utxo.hashBlock))
+        ColdHotSeamSnapshot source;
+        std::string error;
+        if (GetStakingSourceAuthority(utxo.hashBlock, &source, &error) != COLD_HOT_SEAM_OK)
         {
-            printf("SPV: Rejected UTXO %s:%d - claimed verified but block %s not in index\n",
-                   outpoint.hash.ToString().c_str(), outpoint.n,
-                   utxo.hashBlock.ToString().c_str());
+            printf("SPV: Rejected UTXO %s:%d - source block is not currently active\n",
+                   outpoint.hash.ToString().c_str(), outpoint.n);
             verifiedUtxo.fVerified = false;
         }
     }
 
+    LOCK(cs_spvutxos);
     mapSPVUtxos[outpoint] = verifiedUtxo;
 
     if (mapSPVUtxos.size() > GetSPVUtxoCacheMaxSize())
