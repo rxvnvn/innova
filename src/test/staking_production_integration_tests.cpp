@@ -82,6 +82,8 @@ struct ProdFixture
 
     boost::filesystem::path root;
     std::map<uint256, CBlockIndex*> savedMap;
+    WalletTxMap savedWallet;
+    std::map<COutPoint, SPVUtxo> savedSpvUtxos;
     CBlockIndex* savedBest; CBlockIndex* savedGenesis;
     uint256 savedHashBest; uint256 savedTrust; int savedHeight;
     std::vector<CBlockIndex*> created;
@@ -90,6 +92,10 @@ struct ProdFixture
     // prefix records (so a HybridSPV wallet tx's merkle proof can be validated
     // against an actual non-zero block merkle root, matching the legacy proof).
     std::map<int, uint256> merkleRootOverride;
+    std::map<int, unsigned int> nFileOverride;
+    std::map<int, unsigned int> nBlockPosOverride;
+    std::map<int, unsigned int> nBitsOverride;
+    std::map<int, unsigned int> nTimeOverride;
     // A.9a.3e: optional override of the cold-block hash at a chosen height, so a
     // debug-integration fixture can make blockFrom.GetHash() be the COLD-only
     // (non-resident) source block. Off when srcOverriddenHash is null.
@@ -101,6 +107,16 @@ struct ProdFixture
         genSelected(false), srcOverriddenHash(uint256(0)), srcOverrideHeight(2)
     {
         ClearBlockIndexAccessorState(); ClearFindBlockByHeightCache(); savedMap.swap(mapBlockIndex);
+        if (pwalletMain)
+        {
+            LOCK(pwalletMain->cs_wallet);
+            savedWallet.swap(pwalletMain->mapWallet);
+        }
+        if (pwalletMain)
+        {
+            LOCK(pwalletMain->cs_spvutxos);
+            savedSpvUtxos.swap(pwalletMain->mapSPVUtxos);
+        }
         pindexBest = NULL; pindexGenesisBlock = NULL; hashBestChain = 0; nBestChainTrust = 0; nBestHeight = -1;
     }
     ~ProdFixture()
@@ -111,6 +127,18 @@ struct ProdFixture
         hashBestChain = savedHashBest; nBestChainTrust = savedTrust; nBestHeight = savedHeight;
         for (size_t i = 0; i < created.size(); ++i) { delete created[i]->phashBlock; delete created[i]; }
         mapBlockIndex.clear(); savedMap.swap(mapBlockIndex); ClearBlockIndexAccessorState(); ClearFindBlockByHeightCache();
+        if (pwalletMain)
+        {
+            LOCK(pwalletMain->cs_wallet);
+            pwalletMain->mapWallet.clear();
+            savedWallet.swap(pwalletMain->mapWallet);
+        }
+        if (pwalletMain)
+        {
+            LOCK(pwalletMain->cs_spvutxos);
+            pwalletMain->mapSPVUtxos.clear();
+            savedSpvUtxos.swap(pwalletMain->mapSPVUtxos);
+        }
         if (genSelected)
             boost::filesystem::remove_all(BlockIndexGenerationManager::GenerationPath(root.string(), 1));
     }
@@ -129,6 +157,14 @@ struct ProdFixture
             BlockIndexRecord r = ProdRecord(1000 + h, h, fGenerated(h), pprev);
             if (merkleRootOverride.count(h))
                 r.hashMerkleRoot = merkleRootOverride[h];
+            if (nFileOverride.count(h))
+                r.nFile = nFileOverride[h];
+            if (nBlockPosOverride.count(h))
+                r.nBlockPos = nBlockPosOverride[h];
+            if (nBitsOverride.count(h))
+                r.nBits = nBitsOverride[h];
+            if (nTimeOverride.count(h))
+                r.nTime = nTimeOverride[h];
             if (h == srcOverrideHeight && srcOverriddenHash != uint256(0))
                 r.hash = srcOverriddenHash;
             BlockIndexGenerationSourceRecord q; q.hash = r.hash; q.record = r;
@@ -706,35 +742,127 @@ public:
     virtual BlockIndexSnapshot GetTip() const { return tipSnap; }
 };
 
-// A.9a.3e: build a HybridSPV wallet-source transaction and the transparent
+// A.9a.3f: build a HybridSPV wallet-source transaction and the transparent
 // coinstake that spends it, used to drive the REAL CheckProofOfStake HybridSPV
 // fallback. wtx.hashBlock / branch are set per-test; the single-leaf merkle
 // tree (nIndex==0, empty branch) has root == srcHash, so the source block's
-// merkle root must be set to srcHash for a valid merkle authority.
+// merkle root must equal the source transaction hash for a valid merkle proof.
+static unsigned int g_hybridSpvFixtureSerial = 0;
 static void BuildHybridSpvWalletFixture(CWallet* wallet, CTransaction* srcOut,
     CWalletTx* wtxOut, CTransaction* coinstakeOut, uint256* srcHashOut)
 {
     CTransaction src;
     src.nVersion = 1;
-    CTxOut out; out.nValue = 1000; out.scriptPubKey = CScript() << OP_TRUE;
+    const unsigned int serial = ++g_hybridSpvFixtureSerial;
+    src.nTime = 1000 + 2 * 600 + serial;
+    CScript uniqueTrueScript = CScript() << (int64_t)serial << OP_DROP << OP_TRUE;
+    CTxOut out; out.nValue = 500000 * COIN - serial; out.scriptPubKey = uniqueTrueScript;
     src.vout.push_back(out);
 
     CWalletTx wtx(wallet, src);
     const uint256 srcHash = wtx.GetHash();
     wtx.hashBlock = uint256(0);
     wtx.nIndex = 0;
-    wtx.vMerkleBranch.clear(); // single-leaf merkle tree: root == srcHash
+    wtx.vMerkleBranch.clear();
 
     CTransaction coinstake;
     coinstake.nVersion = 1;
     CTxIn in; in.prevout = COutPoint(srcHash, 0); in.scriptSig = CScript();
     coinstake.vin.push_back(in);
     CTxOut emptyOut; emptyOut.nValue = 0; emptyOut.scriptPubKey = CScript();
-    coinstake.vout.push_back(emptyOut);   // vout[0] empty (nValue==0) -> IsCoinStake
-    CTxOut rewardOut; rewardOut.nValue = 1000; rewardOut.scriptPubKey = CScript() << OP_TRUE;
+    coinstake.vout.push_back(emptyOut);
+    CTxOut rewardOut; rewardOut.nValue = out.nValue; rewardOut.scriptPubKey = uniqueTrueScript;
     coinstake.vout.push_back(rewardOut);
 
     *srcOut = src; *wtxOut = wtx; *coinstakeOut = coinstake; *srcHashOut = srcHash;
+}
+
+struct HybridSpvRealSourceFixture
+{
+    CTransaction srcTx;
+    CWalletTx wtx;
+    CTransaction coinstake;
+    CBlock blockFrom;
+    uint256 srcTxHash;
+    uint256 sourceBlockHash;
+    unsigned int nFile;
+    unsigned int nBlockPos;
+    HybridSpvRealSourceFixture() : nFile(0), nBlockPos(0) {}
+};
+
+static void PrepareHybridSpvRealSource(ProdFixture& fx, HybridSpvRealSourceFixture* out)
+{
+    BOOST_REQUIRE(out != NULL);
+    BuildHybridSpvWalletFixture(pwalletMain, &out->srcTx, &out->wtx, &out->coinstake, &out->srcTxHash);
+
+    out->blockFrom.nVersion = 1;
+    out->blockFrom.hashPrevBlock = fx.Hash(1);
+    out->blockFrom.nTime = out->srcTx.nTime;
+    out->blockFrom.nBits = 0x207fffff;
+    out->blockFrom.nNonce = 7;
+    out->blockFrom.vtx.clear();
+        out->blockFrom.vtx.push_back(out->srcTx);
+        out->blockFrom.hashMerkleRoot = out->blockFrom.BuildMerkleTree();
+
+        // A.9a.3f: the source block must be a VALID regtest PoW block so that
+        // ReadFromDisk(fReadTransactions=true PoW check passes (a real
+        // CheckProofOfStake recovery needs a readable source block). Grind the
+        // nonce against the same nBits until GetPoWHash satisfies the target.
+
+
+        while (!CheckProofOfWork(out->blockFrom.GetPoWHash(), out->blockFrom.nBits))
+            out->blockFrom.nNonce++;
+
+
+        {
+            LOCK(cs_main);
+            BOOST_REQUIRE(out->blockFrom.WriteToDisk(out->nFile, out->nBlockPos));
+        }
+
+    out->sourceBlockHash = out->blockFrom.GetHash();
+    out->wtx.hashBlock = out->sourceBlockHash;
+    fx.srcOverriddenHash = out->sourceBlockHash;
+    fx.srcOverrideHeight = 2;
+    fx.merkleRootOverride[2] = out->blockFrom.hashMerkleRoot;
+    fx.nFileOverride[2] = out->nFile;
+    fx.nBlockPosOverride[2] = out->nBlockPos;
+    fx.nBitsOverride[2] = out->blockFrom.nBits;
+    fx.nTimeOverride[2] = out->blockFrom.nTime;
+}
+
+static void ApplyHybridSpvHotOverride(ProdFixture& fx, const HybridSpvRealSourceFixture& src)
+{
+    BOOST_REQUIRE(fx.created.size() > 2);
+    delete fx.created[2]->phashBlock;
+    fx.created[2]->phashBlock = new uint256(src.sourceBlockHash);
+    fx.created[2]->hashMerkleRoot = src.blockFrom.hashMerkleRoot;
+    fx.created[2]->nFile = src.nFile;
+    fx.created[2]->nBlockPos = src.nBlockPos;
+    fx.created[2]->nTime = src.blockFrom.nTime;
+    fx.created[2]->nBits = src.blockFrom.nBits;
+}
+
+static bool FindPassingStakeTime(const CBlockIndex* pindexPrev,
+    const CBlock& blockFrom, const CTransaction& txPrev, const uint256& txHash,
+    unsigned int* nTimeTxOut)
+{
+    BOOST_REQUIRE(nTimeTxOut != NULL);
+    uint256 hp, tp;
+    const unsigned int nStart = std::max((unsigned int)txPrev.nTime, (unsigned int)blockFrom.GetBlockTime());
+    const unsigned int nTxPrevOffset =
+        ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+        (2 * GetSizeOfCompactSize(0)) +
+        GetSizeOfCompactSize(blockFrom.vtx.size());
+    for (unsigned int nTimeTx = nStart; nTimeTx < nStart + 131072; ++nTimeTx)
+    {
+        if (CheckStakeKernelHash(pindexPrev, blockFrom.nBits, blockFrom, nTxPrevOffset, txPrev,
+                                 COutPoint(txHash, 0), nTimeTx, hp, tp, false))
+        {
+            *nTimeTxOut = nTimeTx;
+            return true;
+        }
+    }
+    return false;
 }
 
 static bool RunCheckProofOfStake(const CTransaction& coinstake,
@@ -744,181 +872,277 @@ static bool RunCheckProofOfStake(const CTransaction& coinstake,
     return CheckProofOfStake(pindexPrev, coinstake, nBits, hp, tp);
 }
 
-// A.9a.3e: test-only observation of the real CheckProofOfStake HybridSPV
-// maturity gate. Fires only when by-value maturity authority is satisfied and
-// the code is about to enter by-value source-block recovery.
-static int g_spvProbeFires = 0;
-static int g_spvProbeDepth = -1;
-static void ArmSpvProbe()
-{
-    g_spvProbeFires = 0; g_spvProbeDepth = -1;
-    SetHybridSvmRecoveryProbe([](int d){ g_spvProbeFires++; g_spvProbeDepth = d; });
-}
-static void DisarmSpvProbe() { SetHybridSvmRecoveryProbe(NULL); }
-
 } // namespace
 
-// A.9a.3e NEW-N6, H1: a deep COLD (non-resident) mature HybridSPV source must be
-// able to satisfy maturity/active-chain/merkle authority BY-VALUE and reach the
-// by-value source-block recovery -- exactly the A.10 scenario the previous
-// commit could not reach because GetDepthInMainChain required a resident
-// historical CBlockIndex. Crosses the REAL CheckProofOfStake boundary.
-BOOST_FIXTURE_TEST_CASE(checkproofofstake_hybridspv_cold_mature_byvalue_reaches_recovery, ProdFixture)
+// A.9a.3f NEW-N9 / T1: causal RED with valid fixture fields. Resident source at
+// height 2 yields positive legacy depth and a green baseline CheckProofOfStake;
+// removing only historical mapBlockIndex residency flips legacy depth to 0/-1
+// and the real legacy/no-navigator CheckProofOfStake rejects before recovery.
+BOOST_FIXTURE_TEST_CASE(legacy_hybridspv_causal_nonresident_map_lookup_red, ProdFixture)
 {
     const bool saveSPV = fHybridSPV;
     const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
     unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
-    fHybridSPV = true; nCoinbaseMaturity = 10; nModifierInterval = 60; nTargetSpacing = 5;
-    CTransaction srcTx; CWalletTx wtx; CTransaction coinstake; uint256 srcHash;
+    fHybridSPV = true; nCoinbaseMaturity = 10; nStakeMinAge = 0; nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
     try
     {
-        BuildHybridSpvWalletFixture(pwalletMain, &srcTx, &wtx, &coinstake, &srcHash);
-        merkleRootOverride[2] = srcHash; // single-leaf branch root
+        PrepareHybridSpvRealSource(*this, &src);
         Setup();
-        RetainNavigator();
         LOCK(cs_main);
-        BOOST_CHECK_MESSAGE(mapBlockIndex.count(Hash(2)) == 0,
-            "source must be cold-only (absent from mapBlockIndex)");
-        wtx.hashBlock = Hash(2);
-        pwalletMain->mapWallet[srcHash] = wtx;
-        ArmSpvProbe();
-        const bool r = RunCheckProofOfStake(coinstake, pindexBest, 0x1d00ffff);
-        (void)r; // full recovery then fails (synthetic source block not on disk);
-                 // the maturity gate + by-value recovery ENTRY is what we assert.
-        BOOST_CHECK_EQUAL(g_spvProbeFires, 1);
+        ApplyHybridSpvHotOverride(*this, src);
+        mapBlockIndex[src.sourceBlockHash] = created[2];
+        BOOST_REQUIRE_EQUAL(src.wtx.GetDepthInMainChain(), 18);
+        BOOST_REQUIRE(FindPassingStakeTime(pindexBest, src.blockFrom, src.srcTx, src.srcTxHash, &src.coinstake.nTime));
+        BOOST_CHECK(VerifySignature(src.srcTx, src.coinstake, 0, SCRIPT_VERIFY_NONE, 0));
+        {
+            uint256 hp, tp;
+            const unsigned int nTxPrevOffset = ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+                (2 * GetSizeOfCompactSize(0)) + GetSizeOfCompactSize(src.blockFrom.vtx.size());
+            BOOST_CHECK(CheckStakeKernelHash(pindexBest, src.blockFrom.nBits, src.blockFrom, nTxPrevOffset,
+                src.srcTx, COutPoint(src.srcTxHash, 0), src.coinstake.nTime, hp, tp, false));
+        }
+        pwalletMain->mapWallet[src.srcTxHash] = src.wtx;
+        pwalletMain->mapWallet[src.srcTxHash].BindWallet(pwalletMain);
+        BOOST_CHECK(RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits));
 
-        BOOST_CHECK_EQUAL(g_spvProbeDepth, 18); // exact legacy depth: 19 - 2 + 1
-        pwalletMain->mapWallet.erase(srcHash);
-        DisarmSpvProbe();
+        mapBlockIndex.erase(src.sourceBlockHash);
+        const int nNonResidentDepth = src.wtx.GetDepthInMainChain();
+        BOOST_CHECK(nNonResidentDepth == 0 || nNonResidentDepth == -1);
+        BOOST_CHECK(!RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits));
+        pwalletMain->mapWallet.erase(src.srcTxHash);
     }
     catch (...)
     {
-        pwalletMain->mapWallet.erase(srcHash); DisarmSpvProbe();
-        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
     }
-    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS;
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
 }
 
-// A.9a.3e H2/E11: a HOT active source (resident, above the cold seam) behaves
-// identically -- unchanged behavior through the real CheckProofOfStake.
+// A.9a.3f NEW-N10/T2: with the production navigator retained, the same cold-only
+// source is mature by value, passes the real CheckProofOfStake boundary, and no
+// historical CBlockIndex residency is required.
+BOOST_FIXTURE_TEST_CASE(checkproofofstake_hybridspv_cold_mature_byvalue_verified_seam, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
+    unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
+    fHybridSPV = true; nCoinbaseMaturity = 10; nStakeMinAge = 0; nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
+    try
+    {
+        PrepareHybridSpvRealSource(*this, &src);
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+        ApplyHybridSpvHotOverride(*this, src);
+        BOOST_CHECK_MESSAGE(mapBlockIndex.count(src.sourceBlockHash) == 0,
+            "source must remain cold-only (absent from mapBlockIndex)");
+        BOOST_REQUIRE(FindPassingStakeTime(pindexBest, src.blockFrom, src.srcTx, src.srcTxHash, &src.coinstake.nTime));
+        {
+            std::string e;
+            int depth = 0;
+            ColdHotSeamSnapshot snap;
+            const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+            BOOST_REQUIRE(nav != NULL);
+            BOOST_CHECK_EQUAL((int)nav->ResolveLogicalR(BlockIndexLogicalId(src.sourceBlockHash), &snap, &e), (int)COLD_HOT_SEAM_OK);
+            BOOST_CHECK(snap.ref.IsCold());
+            BOOST_CHECK_EQUAL(snap.snapshot.nFile, src.nFile);
+            BOOST_CHECK_EQUAL(snap.snapshot.nBlockPos, src.nBlockPos);
+            BOOST_CHECK_EQUAL((int)nav->GetHybridSvmMaturityAuthorityR(BlockIndexLogicalId(src.wtx.hashBlock), src.wtx.GetHash(), src.wtx.vMerkleBranch, src.wtx.nIndex, &depth, &e), (int)COLD_HOT_SEAM_OK);
+            BOOST_CHECK_EQUAL(depth, 18);
+        }
+        BOOST_CHECK(VerifySignature(src.srcTx, src.coinstake, 0, SCRIPT_VERIFY_NONE, 0));
+        {
+            uint256 hp, tp;
+            const unsigned int nTxPrevOffset = ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+                (2 * GetSizeOfCompactSize(0)) + GetSizeOfCompactSize(src.blockFrom.vtx.size());
+            BOOST_CHECK(CheckStakeKernelHash(pindexBest, src.blockFrom.nBits, src.blockFrom, nTxPrevOffset,
+                src.srcTx, COutPoint(src.srcTxHash, 0), src.coinstake.nTime, hp, tp, false));
+        }
+        pwalletMain->mapWallet[src.srcTxHash] = src.wtx;
+        pwalletMain->mapWallet[src.srcTxHash].BindWallet(pwalletMain);
+        BOOST_CHECK(RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits));
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+    }
+    catch (...)
+    {
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
+    }
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+}
+
+// A.9a.3f NEW-N10/T3: a COLD active source + UNCHANGED CURRENT + deliberately
+// DIVERGED live seam must FAIL AUTHORITY -- never a stale positive depth.
+// ResolveLogicalR only proves CURRENT is unchanged; it does NOT prove the frozen
+// active.dat membership still shares the live topology. VerifySeam must reject
+// before positive depth is issued.
+BOOST_FIXTURE_TEST_CASE(hybridspv_maturity_cold_source_divergent_live_seam_fails_authority, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
+    unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
+    fHybridSPV = true; nCoinbaseMaturity = 10; nStakeMinAge = 0; nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
+    try
+    {
+        PrepareHybridSpvRealSource(*this, &src);
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+        ApplyHybridSpvHotOverride(*this, src);
+        std::string e; ColdHotSeamSnapshot snap;
+        const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+        BOOST_REQUIRE(nav != NULL);
+        // Establish the cold source is ACTIVE and the mature authority issues positive
+        // depth WHILE the seam is intact.
+        BOOST_REQUIRE_EQUAL((int)nav->ResolveLogicalR(BlockIndexLogicalId(src.sourceBlockHash), &snap, &e), (int)COLD_HOT_SEAM_OK);
+        BOOST_CHECK(snap.ref.IsCold());
+        int depth = 0;
+        BOOST_REQUIRE_EQUAL((int)nav->GetHybridSvmMaturityAuthorityR(BlockIndexLogicalId(src.wtx.hashBlock), src.wtx.GetHash(), src.wtx.vMerkleBranch, src.wtx.nIndex, &depth, &e), (int)COLD_HOT_SEAM_OK);
+        BOOST_CHECK_EQUAL(depth, 18);
+        // Reorg reached the seam: replace the live chain's single-parent/generation
+        // anchor block hash at height SEAM while CURRENT stays pinned to generation 1.
+        BOOST_REQUIRE(created.size() > (size_t)SEAM);
+        BOOST_REQUIRE(created[SEAM]->phashBlock != NULL);
+        delete created[SEAM]->phashBlock;
+        created[SEAM]->phashBlock = new uint256(0x777777);
+        BOOST_CHECK_EQUAL(nav->ColdGeneration(), 1U); // CURRENT unchanged
+        depth = 0;
+        const ColdHotSeamResult r2 = nav->GetHybridSvmMaturityAuthorityR(
+            BlockIndexLogicalId(src.wtx.hashBlock), src.wtx.GetHash(), src.wtx.vMerkleBranch, src.wtx.nIndex, &depth, &e);
+        BOOST_CHECK_EQUAL((int)r2, (int)COLD_HOT_SEAM_AUTHORITY_FAILURE);
+        BOOST_CHECK_EQUAL(depth, 0);
+    }
+    catch (...)
+    {
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
+    }
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+}
+
+// A.9a.3f H2: a HOT active source above the seam still receives exact positive
+// depth authority without any cold lookup.
 BOOST_FIXTURE_TEST_CASE(checkproofofstake_hybridspv_hot_active_source_unchanged, ProdFixture)
 {
-    const bool saveSPV = fHybridSPV;
-    const int saveMaturity = nCoinbaseMaturity;
-    unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
-    fHybridSPV = true; nCoinbaseMaturity = 5; nModifierInterval = 60; nTargetSpacing = 5;
+    Setup();
+    RetainNavigator();
+    LOCK(cs_main);
+    const int hotH = 13;
     CTransaction srcTx; CWalletTx wtx; CTransaction coinstake; uint256 srcHash;
-    try
-    {
-        BuildHybridSpvWalletFixture(pwalletMain, &srcTx, &wtx, &coinstake, &srcHash);
-        Setup();
-        RetainNavigator();
-        LOCK(cs_main);
-        const int hotH = 13; // above the cold seam (SEAM=12): HOT-only/resident
-        created[hotH]->hashMerkleRoot = srcHash; // valid merkle root for the single-leaf branch
-        wtx.hashBlock = Hash(hotH);
-        pwalletMain->mapWallet[srcHash] = wtx;
-        ArmSpvProbe();
-        const bool r = RunCheckProofOfStake(coinstake, pindexBest, 0x1d00ffff);
-        (void)r;
-        BOOST_CHECK_EQUAL(g_spvProbeFires, 1);
-        BOOST_CHECK_EQUAL(g_spvProbeDepth, 19 - hotH + 1); // 7
-        pwalletMain->mapWallet.erase(srcHash);
-        DisarmSpvProbe();
-    }
-    catch (...)
-    {
-        pwalletMain->mapWallet.erase(srcHash); DisarmSpvProbe();
-        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
-    }
-    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS;
+    BuildHybridSpvWalletFixture(pwalletMain, &srcTx, &wtx, &coinstake, &srcHash);
+    created[hotH]->hashMerkleRoot = srcHash;
+    wtx.hashBlock = Hash(hotH);
+    int depth = 0;
+    std::string e;
+    const ColdHotSeamResult r = GetBlockIndexStakingNavigator()->GetHybridSvmMaturityAuthorityR(
+        BlockIndexLogicalId(wtx.hashBlock), wtx.GetHash(), wtx.vMerkleBranch, wtx.nIndex, &depth, &e);
+    BOOST_CHECK_EQUAL((int)r, (int)COLD_HOT_SEAM_OK);
+    BOOST_CHECK_EQUAL(depth, 19 - hotH + 1);
 }
 
-// A.9a.3e H4/E5: an IMMATURE source (found + active + valid merkle, but depth <
-// nCoinbaseMaturity) is rejected at the exact legacy boundary -- recovery is
-// never reached.
+// A.9a.3f H4/T8/T9: an otherwise-valid cold source that is below the maturity
+// boundary is rejected at the real CheckProofOfStake boundary.
 BOOST_FIXTURE_TEST_CASE(checkproofofstake_hybridspv_immature_rejected_at_legacy_boundary, ProdFixture)
 {
     const bool saveSPV = fHybridSPV;
     const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
     unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
-    fHybridSPV = true; nCoinbaseMaturity = 25; nModifierInterval = 60; nTargetSpacing = 5; // > depth 18
-    CTransaction srcTx; CWalletTx wtx; CTransaction coinstake; uint256 srcHash;
+    fHybridSPV = true; nCoinbaseMaturity = 25; nStakeMinAge = 0; nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
     try
     {
-        BuildHybridSpvWalletFixture(pwalletMain, &srcTx, &wtx, &coinstake, &srcHash);
-        merkleRootOverride[2] = srcHash;
+        PrepareHybridSpvRealSource(*this, &src);
         Setup();
         RetainNavigator();
         LOCK(cs_main);
-        wtx.hashBlock = Hash(2);
-        pwalletMain->mapWallet[srcHash] = wtx;
-        ArmSpvProbe();
-        const bool r = RunCheckProofOfStake(coinstake, pindexBest, 0x1d00ffff);
-        BOOST_CHECK(!r);                       // rejected
-        BOOST_CHECK_EQUAL(g_spvProbeFires, 0); // recovery never reached
-        pwalletMain->mapWallet.erase(srcHash);
-        DisarmSpvProbe();
+        ApplyHybridSpvHotOverride(*this, src);
+        BOOST_REQUIRE(FindPassingStakeTime(pindexBest, src.blockFrom, src.srcTx, src.srcTxHash, &src.coinstake.nTime));
+        BOOST_CHECK(VerifySignature(src.srcTx, src.coinstake, 0, SCRIPT_VERIFY_NONE, 0));
+        {
+            uint256 hp, tp;
+            const unsigned int nTxPrevOffset = ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+                (2 * GetSizeOfCompactSize(0)) + GetSizeOfCompactSize(src.blockFrom.vtx.size());
+            BOOST_CHECK(CheckStakeKernelHash(pindexBest, src.blockFrom.nBits, src.blockFrom, nTxPrevOffset,
+                src.srcTx, COutPoint(src.srcTxHash, 0), src.coinstake.nTime, hp, tp, false));
+        }
+        pwalletMain->mapWallet[src.srcTxHash] = src.wtx;
+        pwalletMain->mapWallet[src.srcTxHash].BindWallet(pwalletMain);
+        BOOST_CHECK(!RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits));
+        pwalletMain->mapWallet.erase(src.srcTxHash);
     }
     catch (...)
     {
-        pwalletMain->mapWallet.erase(srcHash); DisarmSpvProbe();
-        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
     }
-    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS;
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
 }
 
-// A.9a.3e H6/E6: an invalid merkle authority (block merkle root does not match
-// the wallet tx's single-leaf branch) is rejected exactly as legacy.
+// A.9a.3f H6: an invalid merkle authority is rejected before the real
+// CheckProofOfStake recovery path can succeed.
 BOOST_FIXTURE_TEST_CASE(checkproofofstake_hybridspv_merkle_mismatch_rejected, ProdFixture)
 {
     const bool saveSPV = fHybridSPV;
     const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
     unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
-    fHybridSPV = true; nCoinbaseMaturity = 10; nModifierInterval = 60; nTargetSpacing = 5;
-    CTransaction srcTx; CWalletTx wtx; CTransaction coinstake; uint256 srcHash;
+    fHybridSPV = true; nCoinbaseMaturity = 10; nStakeMinAge = 0; nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
     try
     {
-        BuildHybridSpvWalletFixture(pwalletMain, &srcTx, &wtx, &coinstake, &srcHash);
-        merkleRootOverride[2] = uint256(srcHash.Get64() ^ 1ULL); // WRONG root -> merkle must fail
+        PrepareHybridSpvRealSource(*this, &src);
+        merkleRootOverride[2] = uint256(src.srcTxHash.Get64() ^ 1ULL);
         Setup();
         RetainNavigator();
         LOCK(cs_main);
-        wtx.hashBlock = Hash(2);
-        pwalletMain->mapWallet[srcHash] = wtx;
-        ArmSpvProbe();
-        const bool r = RunCheckProofOfStake(coinstake, pindexBest, 0x1d00ffff);
-        BOOST_CHECK(!r);
-        BOOST_CHECK_EQUAL(g_spvProbeFires, 0); // merkle authority rejected before recovery
-        pwalletMain->mapWallet.erase(srcHash);
-        DisarmSpvProbe();
+        ApplyHybridSpvHotOverride(*this, src);
+        BOOST_REQUIRE(FindPassingStakeTime(pindexBest, src.blockFrom, src.srcTx, src.srcTxHash, &src.coinstake.nTime));
+        BOOST_CHECK(VerifySignature(src.srcTx, src.coinstake, 0, SCRIPT_VERIFY_NONE, 0));
+        {
+            uint256 hp, tp;
+            const unsigned int nTxPrevOffset = ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+                (2 * GetSizeOfCompactSize(0)) + GetSizeOfCompactSize(src.blockFrom.vtx.size());
+            BOOST_CHECK(CheckStakeKernelHash(pindexBest, src.blockFrom.nBits, src.blockFrom, nTxPrevOffset,
+                src.srcTx, COutPoint(src.srcTxHash, 0), src.coinstake.nTime, hp, tp, false));
+        }
+        pwalletMain->mapWallet[src.srcTxHash] = src.wtx;
+        pwalletMain->mapWallet[src.srcTxHash].BindWallet(pwalletMain);
+        BOOST_CHECK(!RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits));
+        pwalletMain->mapWallet.erase(src.srcTxHash);
     }
     catch (...)
     {
-        pwalletMain->mapWallet.erase(srcHash); DisarmSpvProbe();
-        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
     }
-    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS;
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
 }
 
-// A.9a.3e H7/E7: a STALE generation authority (CURRENT replaced after
-// retention) FAILS CLOSED: CheckProofOfStake rejects and never reaches recovery,
-// even though the source would be otherwise findable.
+// A.9a.3f H7/T13: stale generation authority fails closed at the real
+// CheckProofOfStake boundary.
 BOOST_FIXTURE_TEST_CASE(checkproofofstake_hybridspv_stale_generation_fails_closed, ProdFixture)
 {
     const bool saveSPV = fHybridSPV;
     const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
     unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
-    fHybridSPV = true; nCoinbaseMaturity = 10; nModifierInterval = 60; nTargetSpacing = 5;
-    CTransaction srcTx; CWalletTx wtx; CTransaction coinstake; uint256 srcHash;
+    fHybridSPV = true; nCoinbaseMaturity = 10; nStakeMinAge = 0; nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
     try
     {
-        BuildHybridSpvWalletFixture(pwalletMain, &srcTx, &wtx, &coinstake, &srcHash);
-        merkleRootOverride[2] = srcHash;
+        PrepareHybridSpvRealSource(*this, &src);
         Setup();
         RetainNavigator();
-        // Replace CURRENT with a different generation while the navigator is
-        // pinned to generation 1.
+        LOCK(cs_main);
+        ApplyHybridSpvHotOverride(*this, src);
+        BOOST_REQUIRE(FindPassingStakeTime(pindexBest, src.blockFrom, src.srcTx, src.srcTxHash, &src.coinstake.nTime));
         BlockIndexGenerationSource alt;
         uint256 pprev(0);
         BlockIndexRecord r0 = ProdRecord(42, 0, true, pprev);
@@ -931,22 +1155,17 @@ BOOST_FIXTURE_TEST_CASE(checkproofofstake_hybridspv_stale_generation_fails_close
             b2.Close();
             BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(), 2, &e2) == BLOCK_INDEX_LIFECYCLE_OK, e2);
         }
-        LOCK(cs_main);
-        wtx.hashBlock = Hash(2);
-        pwalletMain->mapWallet[srcHash] = wtx;
-        ArmSpvProbe();
-        const bool r = RunCheckProofOfStake(coinstake, pindexBest, 0x1d00ffff);
-        BOOST_CHECK(!r);
-        BOOST_CHECK_EQUAL(g_spvProbeFires, 0); // stale authority fails closed
-        pwalletMain->mapWallet.erase(srcHash);
-        DisarmSpvProbe();
+        pwalletMain->mapWallet[src.srcTxHash] = src.wtx;
+        pwalletMain->mapWallet[src.srcTxHash].BindWallet(pwalletMain);
+        BOOST_CHECK(!RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits));
+        pwalletMain->mapWallet.erase(src.srcTxHash);
     }
     catch (...)
     {
-        pwalletMain->mapWallet.erase(srcHash); DisarmSpvProbe();
-        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
     }
-    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nModifierInterval = saveI; nTargetSpacing = saveS;
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity; nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
 }
 
 // A.9a.3e H3/H10/E4: a KNOWN but INACTIVE (side/reorged) source must NEVER
@@ -1043,6 +1262,394 @@ BOOST_FIXTURE_TEST_CASE(debug_checkstakekernelhash_cold_source_byvalue_observati
         nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS; throw;
     }
     nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+}
+
+// ===========================================================================
+// A.9a.3f -- wallet staking-generation production-boundary tests (P5-P11 +
+// PopulateSPVUtxosFromWallet fourth-family closure). All remove ONLY historical
+// CBlockIndex residency as the causal variable: the retained navigator + stable
+// logical identity stay authoritative, and authority failure is never conflated
+// with missing materialization.
+// ===========================================================================
+namespace {
+
+// Seed a spendable P2PKH key in the global test wallet and return its CPubKey.
+static CPubKey SeedSpendableKey()
+{
+    CKey key;
+    key.MakeNewKey(true);
+    CPubKey pub = key.GetPubKey();
+    {
+        LOCK(pwalletMain->cs_wallet);
+        BOOST_REQUIRE_MESSAGE(pwalletMain->LoadKey(key, pub), "seed spendable key failed");
+    }
+    return pub;
+}
+
+// Build a source CTransaction whose spendable output pays `pub` (P2PKH) at the
+// given cold height. Call BEFORE Setup() so merkleRootOverride for `height` is
+// applied when the cold generation is built.
+struct ColdSpendableCoin
+{
+    CTransaction srcTx;
+    uint256 txHash;
+    CScript script;
+    int64_t value;
+};
+
+static ColdSpendableCoin PrepareColdSpendableCoin(ProdFixture& fx, const CPubKey& pub,
+    int height, int64_t nValue, bool fCoinStake)
+{
+    ColdSpendableCoin c;
+    c.script = GetScriptForDestination(pub.GetID());
+    c.value = nValue;
+    c.srcTx.nVersion = 1;
+    c.srcTx.nTime = 1000;                       // far past; passes min-age (nStakeMinAge=0)
+    if (fCoinStake)
+    {
+        // IsCoinStake(): vin[0].prevout non-null, vout[0] empty, vout[1] reward.
+        c.srcTx.vin.push_back(CTxIn(COutPoint(uint256(0xABCD), 0)));
+        c.srcTx.vout.push_back(CTxOut(0, CScript()));       // empty marker output
+        c.srcTx.vout.push_back(CTxOut(nValue, c.script));  // spendable reward
+    }
+    else
+    {
+        c.srcTx.vin.push_back(CTxIn(COutPoint(uint256(0xBEEF), 0)));
+        c.srcTx.vout.push_back(CTxOut(nValue, c.script));  // spendable output
+    }
+    c.txHash = c.srcTx.GetHash();
+    fx.merkleRootOverride[height] = c.txHash;   // single-leaf root == tx hash
+    return c;
+}
+
+// Insert the prepared coin into the wallet as a cold nonresident active tx whose
+// hashBlock == Hash(height) (uint256(1000+height), cold, absent from mapBlockIndex).
+static void InstallColdWalletTx(const ColdSpendableCoin& c, int height, int64_t nTime)
+{
+    CWalletTx wtx(pwalletMain, c.srcTx);
+    wtx.hashBlock = uint256(1000 + height);
+    wtx.nIndex = 0;
+    wtx.vMerkleBranch.clear();
+    wtx.nTime = nTime;
+    LOCK(pwalletMain->cs_wallet);
+    pwalletMain->mapWallet[c.txHash] = wtx;
+    pwalletMain->mapWallet[c.txHash].BindWallet(pwalletMain);
+}
+
+} // namespace (A.9a.3f helpers)
+
+// P5/G11: staking balance/trust path (GetTransparentStakingBalance via the real
+// GetStakeWeight production entry, !fHybridSPV) must COUNT a deep cold ACTIVE
+// nonresident wallet transaction equivalently to a resident source -- a spendable
+// cold coin must make the balance+selection gates pass.
+BOOST_FIXTURE_TEST_CASE(stakeweight_cold_nonresident_active_spendable_coin_balance_counted, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const bool saveRegTest = fRegTest;
+    const unsigned int saveMinAge = nStakeMinAge;
+    const int saveMaturity = nCoinbaseMaturity;
+    const int64_t saveReserve = nReserveBalance;
+    try
+    {
+        fHybridSPV = false; fRegTest = true; nStakeMinAge = 0; nCoinbaseMaturity = 10; nReserveBalance = 0;
+        const CPubKey pub = SeedSpendableKey();
+        ColdSpendableCoin c = PrepareColdSpendableCoin(*this, pub, 2, 500000 * COIN, false);
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+        BOOST_CHECK_MESSAGE(mapBlockIndex.count(uint256(1000 + 2)) == 0, "height-2 block must be cold-only/non-resident");
+        InstallColdWalletTx(c, 2, 1000);
+
+        uint64_t nMin = 0, nMax = 0, nW = 0;
+        const bool ok = pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nW);
+        BOOST_CHECK_MESSAGE(ok, "GetStakeWeight must succeed: cold nonresident active spendable coin is counted and selected");
+    }
+    catch (...)
+    {
+        fHybridSPV = saveSPV; fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; nReserveBalance = saveReserve; throw;
+    }
+    fHybridSPV = saveSPV; fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; nReserveBalance = saveReserve;
+}
+
+// P6/G12: the same staking trust/balance path must REJECT / not count a source
+// that is known-but-INACTIVE (side/reorged hot block), exactly as legacy would.
+// GetStakeWeight must fail the balance gate because the coin is not counted.
+BOOST_FIXTURE_TEST_CASE(stakeweight_cold_inactive_source_balance_not_counted, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const bool saveRegTest = fRegTest;
+    const unsigned int saveMinAge = nStakeMinAge;
+    const int saveMaturity = nCoinbaseMaturity;
+    const int64_t saveReserve = nReserveBalance;
+    try
+    {
+        fHybridSPV = false; fRegTest = true; nStakeMinAge = 0; nCoinbaseMaturity = 10; nReserveBalance = 0;
+        const CPubKey pub = SeedSpendableKey();
+        ColdSpendableCoin c = PrepareColdSpendableCoin(*this, pub, 2, 500000 * COIN, false);
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+
+        // Build a real known-but-INACTIVE hot source: a side CBlockIndex in
+        // mapBlockIndex but NOT reachable from best (pnext NULL, != pindexBest)
+        // => IsInMainChain() false. The maturity authority resolves HOT and
+        // returns NON-positive depth (NOT_FOUND), so the coin is not counted.
+        CBlockIndex* pSide = new CBlockIndex();
+        pSide->phashBlock = new uint256(0xDEADBEEF);
+        pSide->nHeight = 2;
+        pSide->pprev = created[1];
+        pSide->nTime = 1002;
+        pSide->nFlags = 0; pSide->nStakeModifier = 102;
+        created.push_back(pSide);
+        mapBlockIndex[uint256(0xDEADBEEF)] = pSide;
+
+        CWalletTx wtx(pwalletMain, c.srcTx);
+        wtx.hashBlock = uint256(0xDEADBEEF);   // known but INACTIVE side source
+        wtx.nIndex = 0; wtx.vMerkleBranch.clear(); wtx.nTime = 1000;
+        {
+            LOCK(pwalletMain->cs_wallet);
+            pwalletMain->mapWallet[c.txHash] = wtx;
+            pwalletMain->mapWallet[c.txHash].BindWallet(pwalletMain);
+        }
+
+        uint64_t nMin = 0, nMax = 0, nW = 0;
+        const bool ok = pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nW);
+        BOOST_CHECK_MESSAGE(!ok, "GetStakeWeight must reject: inactive/reorged source is not counted by the staking balance path");
+    }
+    catch (...)
+    {
+        fHybridSPV = saveSPV; fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; nReserveBalance = saveReserve; throw;
+    }
+    fHybridSPV = saveSPV; fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; nReserveBalance = saveReserve;
+}
+
+// P7/G13: AvailableCoinsForStaking must RETURN a deep mature COLD nonresident
+// ACTIVE spendable coin (it is not silently skipped when its historical
+// CBlockIndex is absent from mapBlockIndex). Retained navigator is REQUIRED so the
+// by-value maturity/depth authority (not the no-navigator legacy fallback) decides.
+BOOST_FIXTURE_TEST_CASE(availablecoinsforstaking_cold_nonresident_deep_mature_eligible, ProdFixture)
+{
+    const bool saveRegTest = fRegTest;
+    const unsigned int saveMinAge = nStakeMinAge;
+    const int saveMaturity = nCoinbaseMaturity;
+    try
+    {
+        fRegTest = true; nStakeMinAge = 0; nCoinbaseMaturity = 10;
+        const CPubKey pub = SeedSpendableKey();
+        ColdSpendableCoin c = PrepareColdSpendableCoin(*this, pub, 2, 500000 * COIN, false);
+        Setup();
+        RetainNavigator();
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        InstallColdWalletTx(c, 2, 1000);
+
+        std::vector<COutput> vCoins;
+        const bool r = pwalletMain->AvailableCoinsForStaking(vCoins, (unsigned int)GetTime());
+        bool found = false;
+        for (const COutput& out : vCoins)
+            if (out.tx->GetHash() == c.txHash) { found = true; break; }
+        BOOST_CHECK_MESSAGE(r && found, "AvailableCoinsForStaking must return the deep cold nonresident active coin");
+    }
+    catch (...)
+    {
+        fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; throw;
+    }
+    fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity;
+}
+
+// P8/G14: exact maturity boundary -- a cold coinstake at depth == required
+// maturity must be ELIGIBLE (blocksToMaturity == 0 at the exact boundary).
+BOOST_FIXTURE_TEST_CASE(availablecoinsforstaking_exact_maturity_boundary_eligible, ProdFixture)
+{
+    const bool saveRegTest = fRegTest;
+    const unsigned int saveMinAge = nStakeMinAge;
+    const int saveMaturity = nCoinbaseMaturity;
+    try
+    {
+        fRegTest = true; nStakeMinAge = 0;
+        const int kHeight = 2;
+        const int kDepth = (N - 1) - kHeight + 1;   // 18
+        nCoinbaseMaturity = kDepth;                  // exact boundary: depth == maturity
+        const CPubKey pub = SeedSpendableKey();
+        ColdSpendableCoin c = PrepareColdSpendableCoin(*this, pub, kHeight, 500000 * COIN, true);
+        Setup();
+        RetainNavigator();
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        InstallColdWalletTx(c, kHeight, 1000);
+
+        std::vector<COutput> vCoins;
+        const bool r = pwalletMain->AvailableCoinsForStaking(vCoins, (unsigned int)GetTime());
+        bool found = false;
+        for (const COutput& out : vCoins)
+            if (out.tx->GetHash() == c.txHash) { found = true; break; }
+        BOOST_CHECK_MESSAGE(r && found, "cold coinstake at EXACT maturity boundary must be eligible");
+    }
+    catch (...)
+    {
+        fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; throw;
+    }
+    fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity;
+}
+
+// P9/G15: maturity boundary - 1 -- the same cold coinstake at depth one below the
+// required maturity must NOT be eligible (blocksToMaturity > 0).
+BOOST_FIXTURE_TEST_CASE(availablecoinsforstaking_maturity_boundary_minus_one_ineligible, ProdFixture)
+{
+    const bool saveRegTest = fRegTest;
+    const unsigned int saveMinAge = nStakeMinAge;
+    const int saveMaturity = nCoinbaseMaturity;
+    try
+    {
+        fRegTest = true; nStakeMinAge = 0;
+        const int kHeight = 2;
+        const int kDepth = (N - 1) - kHeight + 1;   // 18
+        nCoinbaseMaturity = kDepth + 1;              // boundary-1: one MORE maturity
+        const CPubKey pub = SeedSpendableKey();
+        ColdSpendableCoin c = PrepareColdSpendableCoin(*this, pub, kHeight, 500000 * COIN, true);
+        Setup();
+        RetainNavigator();
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        InstallColdWalletTx(c, kHeight, 1000);
+
+        std::vector<COutput> vCoins;
+        const bool r = pwalletMain->AvailableCoinsForStaking(vCoins, (unsigned int)GetTime());
+        bool found = false;
+        for (const COutput& out : vCoins)
+            if (out.tx->GetHash() == c.txHash) { found = true; break; }
+        BOOST_CHECK_MESSAGE(!found, "cold coinstake one block below maturity must NOT be eligible");
+        (void)r;
+    }
+    catch (...)
+    {
+        fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; throw;
+    }
+    fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity;
+}
+
+// P10/G16: SelectCoinsForStakingSPV mapWallet branch must keep a COLD nonresident
+// ACTIVE source selectable/materializable by-value (no historical mapBlockIndex).
+// Driven through the real GetStakeWeight (fHybridSPV=true) which calls
+// SelectCoinsForStakingSPV; the mapWallet branch resolves the disk position
+// by-value and must return the coin.
+BOOST_FIXTURE_TEST_CASE(selectcoinsspv_mapwallet_cold_nonresident_source_selectable, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const bool saveRegTest = fRegTest;
+    const unsigned int saveMinAge = nStakeMinAge;
+    const int saveMaturity = nCoinbaseMaturity;
+    const int64_t saveReserve = nReserveBalance;
+    try
+    {
+        fHybridSPV = true; fRegTest = true; nStakeMinAge = 0; nCoinbaseMaturity = 10; nReserveBalance = 0;
+        const CPubKey pub = SeedSpendableKey();
+        ColdSpendableCoin c = PrepareColdSpendableCoin(*this, pub, 2, 500000 * COIN, false);
+        // Give the cold record a persisted disk position so the mapWallet branch
+        // resolves it BY-VALUE (navigator -> nFile>0) and selects the coin.
+        nFileOverride[2] = 5; nBlockPosOverride[2] = 64;
+        Setup();
+        RetainNavigator();
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        InstallColdWalletTx(c, 2, 1000);
+
+        // The SPV cache must offer the outpoint; the mapWallet branch resolves its
+        // disk position by-value and stays selectable without a resident CBlockIndex.
+        SPVUtxo u;
+        u.txhash = c.txHash; u.n = 0; u.nValue = c.value;
+        u.nHeight = 2; u.hashBlock = uint256(1000 + 2); u.nTime = 1000;
+        u.fHaveBlock = true; u.fVerified = true; u.fSpent = false; u.scriptPubKey = c.script;
+        {
+            LOCK(pwalletMain->cs_spvutxos);
+            pwalletMain->mapSPVUtxos[COutPoint(c.txHash, 0)] = u;
+        }
+
+        uint64_t nMin = 0, nMax = 0, nW = 0;
+        const bool ok = pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nW);
+        BOOST_CHECK_MESSAGE(ok, "SelectCoinsForStakingSPV mapWallet branch must keep a cold nonresident active source selectable");
+    }
+    catch (...)
+    {
+        fHybridSPV = saveSPV; fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; nReserveBalance = saveReserve; throw;
+    }
+    fHybridSPV = saveSPV; fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; nReserveBalance = saveReserve;
+}
+
+// P11/G17: SelectCoinsForStakingSPV SPV-cache branch -- a COLD nonresident active
+// source offered only through the SPV cache (not chosen from mapWallet) must be
+// materialized and selected by-value from its persisted disk position.
+BOOST_FIXTURE_TEST_CASE(selectcoinsspv_spvcache_cold_nonresident_source_materialized, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const bool saveRegTest = fRegTest;
+    const unsigned int saveMinAge = nStakeMinAge;
+    const int saveMaturity = nCoinbaseMaturity;
+    const int64_t saveReserve = nReserveBalance;
+    try
+    {
+        fHybridSPV = true; fRegTest = true; nStakeMinAge = 0; nCoinbaseMaturity = 10; nReserveBalance = 0;
+        // Prepare writes a real PoW source block and sets the cold record's
+        // merkleRoot/nFile/nBlockPos overrides at height 2; Setup must run AFTER
+        // it (same order as the proven T2 real-source test).
+        HybridSpvRealSourceFixture src;
+        PrepareHybridSpvRealSource(*this, &src);
+        Setup();
+        RetainNavigator();
+        BOOST_REQUIRE(mapBlockIndex.count(src.sourceBlockHash) == 0);
+
+        // Offer the outpoint ONLY through the SPV cache (not via mapWallet): the
+        // SPV-cache branch must read the block by-value from disk and materialize.
+        SPVUtxo u;
+        u.txhash = src.srcTxHash; u.n = 0; u.nValue = src.srcTx.vout[0].nValue;
+        u.nHeight = 2; u.hashBlock = src.sourceBlockHash; u.nTime = src.srcTx.nTime;
+        u.fHaveBlock = true; u.fVerified = true; u.fSpent = false; u.scriptPubKey = src.srcTx.vout[0].scriptPubKey;
+        {
+            LOCK(pwalletMain->cs_spvutxos);
+            pwalletMain->mapSPVUtxos[COutPoint(src.srcTxHash, 0)] = u;
+        }
+
+        uint64_t nMin = 0, nMax = 0, nW = 0;
+        const bool ok = pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nW);
+        BOOST_CHECK_MESSAGE(ok, "SelectCoinsForStakingSPV SPV-cache branch must materialize a cold nonresident source by-value");
+    }
+    catch (...)
+    {
+        fHybridSPV = saveSPV; fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; nReserveBalance = saveReserve; throw;
+    }
+    fHybridSPV = saveSPV; fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; nReserveBalance = saveReserve;
+}
+
+// Family #4: PopulateSPVUtxosFromWallet must ADMIT a deep cold nonresident ACTIVE
+// mature coin into the SPV staking cache -- it is NOT silently dropped because
+// mapBlockIndex does not contain its historical CBlockIndex.
+BOOST_FIXTURE_TEST_CASE(populatespvutxosfromwallet_admits_cold_nonresident_mature_coin, ProdFixture)
+{
+    const bool saveRegTest = fRegTest;
+    const unsigned int saveMinAge = nStakeMinAge;
+    const int saveMaturity = nCoinbaseMaturity;
+    try
+    {
+        fRegTest = true; nStakeMinAge = 0; nCoinbaseMaturity = 10;
+        const CPubKey pub = SeedSpendableKey();
+        ColdSpendableCoin c = PrepareColdSpendableCoin(*this, pub, 2, 500000 * COIN, false);
+        Setup();
+        RetainNavigator();
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        InstallColdWalletTx(c, 2, 1000);
+
+        BOOST_CHECK_MESSAGE(mapBlockIndex.count(uint256(1000 + 2)) == 0, "historical block must remain cold-only/non-resident");
+
+        pwalletMain->PopulateSPVUtxosFromWallet();
+
+        bool present = false;
+        {
+            LOCK(pwalletMain->cs_spvutxos);
+            present = pwalletMain->mapSPVUtxos.count(COutPoint(c.txHash, 0)) > 0;
+        }
+        BOOST_CHECK_MESSAGE(present, "PopulateSPVUtxosFromWallet must admit a deep cold nonresident active mature coin into the SPV cache (not drop it)");
+    }
+    catch (...)
+    {
+        fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity; throw;
+    }
+    fRegTest = saveRegTest; nStakeMinAge = saveMinAge; nCoinbaseMaturity = saveMaturity;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

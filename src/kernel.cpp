@@ -961,14 +961,6 @@ bool ReadStakeSourceTransactionForTesting(const CBlockIndex* pindexPrev,
 }
 
 
-// A.9a.3e (NEW-N6): observation hook backing SetHybridSvmRecoveryProbe. Off by
-// default; production never sets it. Fires after the by-value maturity gate.
-static HybridSvmRecoveryProbeFn g_hybridsvmRecoveryProbe = NULL;
-void SetHybridSvmRecoveryProbe(HybridSvmRecoveryProbeFn fn)
-{
-    g_hybridsvmRecoveryProbe = fn;
-}
-
 // Check kernel hash target and coinstake signature
 bool CheckProofOfStake(const CBlockIndex* pindexPrev, const CTransaction& tx, unsigned int nBits, uint256& hashProofOfStake, uint256& targetProofOfStake)
 {
@@ -1080,10 +1072,6 @@ bool CheckProofOfStake(const CBlockIndex* pindexPrev, const CTransaction& tx, un
                 if (!fAuthorityMature)
                     return tx.DoS(10, error("CheckProofOfStake() : SPV stake input needs %d confirmations, has %d",
                                             nCoinbaseMaturity, nAuthorityDepth));
-                // Maturity/authority satisfied by-value: report that the code
-                // is about to enter by-value source recovery (test observation).
-                if (g_hybridsvmRecoveryProbe)
-                    g_hybridsvmRecoveryProbe(nAuthorityDepth);
                 if (wtx.hashBlock != uint256(0))
                 {
                     // A.9a.3d: resolve the historical source block's disk

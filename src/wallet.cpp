@@ -15,6 +15,7 @@
 #include "ui_interface.h"
 #include "base58.h"
 #include "kernel.h"
+#include "blockindex_shadow_startup.h"
 #include "coincontrol.h"
 #include "spork.h"
 #include "collateral.h"
@@ -41,6 +42,149 @@ static int64_t RPCPerfTimeMicros(bool fEnabled)
 }
 
 #define RPCPERF_LOG(...) do { try { printf(__VA_ARGS__); } catch (...) {} } while (0)
+
+namespace {
+
+static ColdHotSeamResult GetWalletTxStakingDepth(const CWalletTx& wtx, int* outDepth)
+{
+    if (!outDepth)
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    AssertLockHeld(cs_main);
+    *outDepth = 0;
+
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    if (nav)
+    {
+        std::string err;
+        return nav->GetHybridSvmMaturityAuthorityR(
+            BlockIndexLogicalId(wtx.hashBlock), wtx.GetHash(),
+            wtx.vMerkleBranch, wtx.nIndex, outDepth, &err);
+    }
+
+    CBlockIndex* pindexRet = NULL;
+    *outDepth = wtx.GetDepthInMainChain(pindexRet);
+    return (*outDepth > 0) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_NOT_FOUND;
+}
+
+static ColdHotSeamResult GetWalletTxStakingMaturity(const CWalletTx& wtx,
+    int* outDepth, int* outBlocksToMaturity)
+{
+    if (outDepth)
+        *outDepth = 0;
+    if (outBlocksToMaturity)
+        *outBlocksToMaturity = 0;
+
+    int depth = 0;
+    const ColdHotSeamResult r = GetWalletTxStakingDepth(wtx, &depth);
+    if (outDepth)
+        *outDepth = depth;
+    if (r == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+        return r;
+
+    if (wtx.IsCoinBase() || wtx.IsCoinStake())
+    {
+        const int nWalletMaturity = fRegTest ? nCoinbaseMaturity : nCoinbaseMaturity + 10;
+        if (outBlocksToMaturity)
+            *outBlocksToMaturity = std::max(0, nWalletMaturity - depth);
+    }
+    return r;
+}
+
+static bool GetWalletTxStakingAvailableCredit(const CWallet& wallet,
+    const CWalletTx& wtx, int64_t* outCredit)
+{
+    if (!outCredit)
+        return false;
+    int64_t nCredit = 0;
+    for (unsigned int i = 0; i < wtx.vout.size(); i++)
+    {
+        if (wtx.IsSpent(i))
+            continue;
+        if (wtx.nVersion == NAME_TX_VERSION && hooks->IsNameScript(wtx.vout[i].scriptPubKey))
+            continue;
+        nCredit += wallet.GetCredit(wtx.vout[i], ISMINE_SPENDABLE);
+        if (!MoneyRange(nCredit))
+            throw std::runtime_error("GetWalletTxStakingAvailableCredit() : value out of range");
+    }
+    *outCredit = nCredit;
+    return true;
+}
+
+static bool GetTransparentStakingBalance(const CWallet& wallet,
+    unsigned int nSpendTime, int64_t* outBalance)
+{
+    if (!outBalance)
+        return false;
+    AssertLockHeld(cs_main);
+    int64_t nTotal = 0;
+    for (WalletTxMap::const_iterator it = wallet.mapWallet.begin(); it != wallet.mapWallet.end(); ++it)
+    {
+        const CWalletTx& wtx = it->second;
+        if (wtx.nTime + nStakeMinAge > nSpendTime)
+            continue;
+
+        int nDepth = 0;
+        int nBlocksToMaturity = 0;
+        const ColdHotSeamResult r = GetWalletTxStakingMaturity(wtx, &nDepth, &nBlocksToMaturity);
+        if (r == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+            return false;
+        if (nDepth < 1 || nBlocksToMaturity > 0)
+            continue;
+
+        int64_t nCredit = 0;
+        if (!GetWalletTxStakingAvailableCredit(wallet, wtx, &nCredit))
+            return false;
+        if (nCredit > 0 && nTotal > std::numeric_limits<int64_t>::max() - nCredit)
+        {
+            printf("ERROR: GetTransparentStakingBalance() : balance overflow detected\n");
+            *outBalance = std::numeric_limits<int64_t>::max();
+            return true;
+        }
+        nTotal += nCredit;
+    }
+    *outBalance = nTotal;
+    return true;
+}
+
+static bool GetStakingSourceDiskPosition(const uint256& hashBlock,
+    unsigned int* nFileOut, unsigned int* nBlockPosOut)
+{
+    if (nFileOut)
+        *nFileOut = 0;
+    if (nBlockPosOut)
+        *nBlockPosOut = 0;
+    AssertLockHeld(cs_main);
+    if (hashBlock == uint256(0))
+        return false;
+
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    if (nav)
+    {
+        std::string err;
+        ColdHotSeamSnapshot snap;
+        const ColdHotSeamResult r = nav->ResolveLogicalR(BlockIndexLogicalId(hashBlock), &snap, &err);
+        if (r != COLD_HOT_SEAM_OK)
+            return false;
+        if (snap.snapshot.nFile <= 0)
+            return false;
+        if (nFileOut)
+            *nFileOut = snap.snapshot.nFile;
+        if (nBlockPosOut)
+            *nBlockPosOut = snap.snapshot.nBlockPos;
+        return true;
+    }
+
+    std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(hashBlock);
+    if (mi == mapBlockIndex.end() || !mi->second || mi->second->nFile <= 0)
+        return false;
+    if (nFileOut)
+        *nFileOut = mi->second->nFile;
+    if (nBlockPosOut)
+        *nBlockPosOut = mi->second->nBlockPos;
+    return true;
+}
+
+} // namespace
 
 #if BOOST_VERSION >= 107300
 #include <boost/bind/bind.hpp>
@@ -2172,7 +2316,7 @@ void CWallet::AvailableCoinsMN(vector<COutput>& vCoins, bool fOnlyConfirmed, boo
     }
 }
 
-void CWallet::AvailableCoinsForStaking(vector<COutput>& vCoins, unsigned int nSpendTime) const
+bool CWallet::AvailableCoinsForStaking(vector<COutput>& vCoins, unsigned int nSpendTime) const
 {
     vCoins.clear();
 
@@ -2187,10 +2331,13 @@ void CWallet::AvailableCoinsForStaking(vector<COutput>& vCoins, unsigned int nSp
             if (pcoin->nTime + nStakeMinAge > nSpendTime)
                 continue;
 
-            if (pcoin->GetBlocksToMaturity() > 0)
+            int nDepth = 0;
+            int nBlocksToMaturity = 0;
+            const ColdHotSeamResult r = GetWalletTxStakingMaturity(*pcoin, &nDepth, &nBlocksToMaturity);
+            if (r == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+                return false;
+            if (nBlocksToMaturity > 0)
                 continue;
-
-            int nDepth = pcoin->GetDepthInMainChain();
             if (nDepth < 1)
                 continue;
 
@@ -2206,6 +2353,7 @@ void CWallet::AvailableCoinsForStaking(vector<COutput>& vCoins, unsigned int nSp
             };
         };
     }
+    return true;
 }
 
 static void ApproximateBestSubset(vector<pair<int64_t, pair<const CWalletTx*,unsigned int> > >vValue, int64_t nTotalLower, int64_t nTargetValue,
@@ -2750,7 +2898,8 @@ bool CWallet::SelectCoinsForStaking(int64_t nTargetValue, unsigned int nSpendTim
     LOCK2(cs_main, cs_wallet);
 
     vector<COutput> vCoins;
-    AvailableCoinsForStaking(vCoins, nSpendTime);
+    if (!AvailableCoinsForStaking(vCoins, nSpendTime))
+        return false;
 
     setCoinsRet.clear();
     nValueRet = 0;
@@ -4267,10 +4416,16 @@ bool CWallet::GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, ui
     const int64_t nStartTime = RPCPerfTimeMicros(fRPCPerfTrace);
     const int64_t nBalanceStartTime = RPCPerfTimeMicros(fRPCPerfTrace);
     // Choose coins to use
-    int64_t nBalance = GetBalance();
+    int64_t nBalance = nReserveBalance + 1;
+    bool fBalanceOk = true;
+    if (!fHybridSPV)
+    {
+        LOCK2(cs_main, cs_wallet);
+        fBalanceOk = GetTransparentStakingBalance(*this, GetTime(), &nBalance);
+    }
     const int64_t nBalanceCheckMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nBalanceStartTime;
 
-    if (nBalance <= nReserveBalance)
+    if (!fBalanceOk || nBalance <= nReserveBalance)
     {
         if (fRPCPerfTrace)
             RPCPERF_LOG("RPCPERF rpc=GetStakeWeight reason=balance_not_above_reserve balance_check_us=%lld selection_us=0 selected_utxos=0 txindex_reads=0 txindex_read_total_us=0 txindex_read_max_us=0 total_us=%lld\n",
@@ -4319,6 +4474,16 @@ bool CWallet::GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, ui
             RPCPERF_LOG("RPCPERF rpc=GetStakeWeight reason=no_candidates balance_check_us=%lld selection_us=%lld selected_utxos=0 txindex_reads=0 txindex_read_total_us=0 txindex_read_max_us=0 total_us=%lld\n",
                         (long long)nBalanceCheckMicros,
                         (long long)nSelectionMicros,
+                        (long long)(RPCPerfTimeMicros(true) - nStartTime));
+        return false;
+    }
+    if (fHybridSPV && nValueIn <= nReserveBalance)
+    {
+        if (fRPCPerfTrace)
+            RPCPERF_LOG("RPCPERF rpc=GetStakeWeight reason=spv_balance_not_above_reserve balance_check_us=%lld selection_us=%lld selected_utxos=%zu txindex_reads=0 txindex_read_total_us=0 txindex_read_max_us=0 total_us=%lld\n",
+                        (long long)nBalanceCheckMicros,
+                        (long long)nSelectionMicros,
+                        setCoins.size(),
                         (long long)(RPCPerfTimeMicros(true) - nStartTime));
         return false;
     }
@@ -4400,7 +4565,13 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
     txNew.vout.push_back(CTxOut(0, scriptEmpty));
 
     // Choose coins to use
-    int64_t nBalance = GetBalance();
+    int64_t nBalance = nReserveBalance + 1;
+    if (!fHybridSPV)
+    {
+        LOCK2(cs_main, cs_wallet);
+        if (!GetTransparentStakingBalance(*this, txNew.nTime, &nBalance))
+            return false;
+    }
 
     if (nBalance <= nReserveBalance)
         return false;
@@ -4441,6 +4612,9 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
         }
     }
     } // end fTryTransparent coin selection
+
+    if (fHybridSPV && nValueIn <= nReserveBalance)
+        return false;
 
     CScript scriptPubKeyKernel;
     CTxDB txdb("r");
@@ -9410,19 +9584,46 @@ void CWallet::PopulateSPVUtxosFromWallet()
         const CWalletTx& wtx = item.second;
         const uint256& txhash = item.first;
 
-        if (wtx.GetDepthInMainChain() < 1)
-            continue;
-
-        if (wtx.GetBlocksToMaturity() > 0)
-            continue;
-
+        // A.9a.3f (family #4): the SPV-cache population must NOT require arbitrary
+        // historical CBlockIndex residency. A deep-old active wallet coin whose
+        // block object is absent from mapBlockIndex must still be admitted into the
+        // SPV staking cache, otherwise AvailableCoinsForStakingSPV never offers it
+        // and it can never be staked. Depth/maturity and the disk position are
+        // resolved BY-VALUE through the retained navigator; only the pre-A.10
+        // no-navigator fallback uses legacy mapBlockIndex residency.
         uint256 hashBlock = wtx.hashBlock;
+        int nDepth = 0;
+        int nBlocksToMaturity = 0;
+        const ColdHotSeamResult sr = GetWalletTxStakingMaturity(wtx, &nDepth, &nBlocksToMaturity);
+        if (sr == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+            continue; // cannot vouch for membership -> fail closed (skip cache entry)
+        if (nDepth < 1 || nBlocksToMaturity > 0)
+            continue;
+
         int nHeight = 0;
-        CBlockIndex* pindex = NULL;
-        if (mapBlockIndex.count(hashBlock))
+        unsigned int nFile = 0;
+        unsigned int nBlockPos = 0;
+        const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+        if (nav)
         {
-            pindex = mapBlockIndex[hashBlock];
-            nHeight = pindex->nHeight;
+            std::string err;
+            ColdHotSeamSnapshot snap;
+            if (nav->ResolveLogicalR(BlockIndexLogicalId(hashBlock), &snap, &err) == COLD_HOT_SEAM_OK)
+            {
+                nHeight = snap.snapshot.height;
+                nFile = snap.snapshot.nFile;
+                nBlockPos = snap.snapshot.nBlockPos;
+            }
+        }
+        else
+        {
+            std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(hashBlock);
+            if (mi != mapBlockIndex.end() && mi->second)
+            {
+                nHeight = mi->second->nHeight;
+                nFile = mi->second->nFile;
+                nBlockPos = mi->second->nBlockPos;
+            }
         }
 
         for (unsigned int i = 0; i < wtx.vout.size(); i++)
@@ -9455,12 +9656,12 @@ void CWallet::PopulateSPVUtxosFromWallet()
             utxo.nLastBlockRequest = 0;
             utxo.nTxIndex = -1;
 
-            if (pindex && pindex->nFile > 0)
+            if (nFile > 0)
             {
                 if (mapBlockCache.find(hashBlock) == mapBlockCache.end())
                 {
                     CBlock block;
-                    if (block.ReadFromDisk(pindex, true))
+                    if (block.ReadFromDisk(nFile, nBlockPos, true))
                     {
                         block.BuildMerkleTree();
                         mapBlockCache[hashBlock] = block;
@@ -9726,17 +9927,15 @@ bool CWallet::SelectCoinsForStakingSPV(std::set<std::pair<const CWalletTx*,unsig
             const CWalletTx* pcoin = &(it->second);
             if (outpoint.n < pcoin->vout.size())
             {
-                if (pcoin->hashBlock != 0 && mapBlockIndex.count(pcoin->hashBlock))
+                unsigned int nFile = 0;
+                unsigned int nBlockPos = 0;
+                if (GetStakingSourceDiskPosition(pcoin->hashBlock, &nFile, &nBlockPos))
                 {
-                    CBlockIndex* pindex = mapBlockIndex[pcoin->hashBlock];
-                    if (pindex->nFile > 0)
-                    {
-                        setCoinsRet.insert(std::make_pair(pcoin, outpoint.n));
-                    }
-                    else
-                    {
-                        vBlocksNeeded.push_back(pcoin->hashBlock);
-                    }
+                    setCoinsRet.insert(std::make_pair(pcoin, outpoint.n));
+                }
+                else if (pcoin->hashBlock != uint256(0))
+                {
+                    vBlocksNeeded.push_back(pcoin->hashBlock);
                 }
             }
         }
@@ -9748,35 +9947,37 @@ bool CWallet::SelectCoinsForStakingSPV(std::set<std::pair<const CWalletTx*,unsig
             {
                 if (spvIt->second.fHaveBlock && spvIt->second.fVerified)
                 {
-                    if (mapBlockIndex.count(spvIt->second.hashBlock))
+                    unsigned int nFile = 0;
+                    unsigned int nBlockPos = 0;
+                    if (GetStakingSourceDiskPosition(spvIt->second.hashBlock, &nFile, &nBlockPos))
                     {
-                        CBlockIndex* pindex = mapBlockIndex[spvIt->second.hashBlock];
-                        if (pindex->nFile > 0)
+                        CBlock block;
+                        if (block.ReadFromDisk(nFile, nBlockPos, true))
                         {
-                            CBlock block;
-                            if (block.ReadFromDisk(pindex, true))
+                            for (const CTransaction& tx : block.vtx)
                             {
-                                for (const CTransaction& tx : block.vtx)
+                                if (tx.GetHash() == outpoint.hash)
                                 {
-                                    if (tx.GetHash() == outpoint.hash)
-                                    {
-                                        CWalletTx wtx(const_cast<CWallet*>(this), tx);
-                                        wtx.hashBlock = spvIt->second.hashBlock;
-                                        wtx.nTime = spvIt->second.nTime;
-                                        const_cast<CWallet*>(this)->AddToWallet(wtx);
+                                    CWalletTx wtx(const_cast<CWallet*>(this), tx);
+                                    wtx.hashBlock = spvIt->second.hashBlock;
+                                    wtx.nTime = spvIt->second.nTime;
+                                    const_cast<CWallet*>(this)->AddToWallet(wtx);
 
-                                        auto newIt = mapWallet.find(outpoint.hash);
-                                        if (newIt != mapWallet.end())
-                                        {
-                                            const CWalletTx* pcoin = &(newIt->second);
-                                            if (outpoint.n < pcoin->vout.size())
-                                                setCoinsRet.insert(std::make_pair(pcoin, outpoint.n));
-                                        }
-                                        break;
+                                    auto newIt = mapWallet.find(outpoint.hash);
+                                    if (newIt != mapWallet.end())
+                                    {
+                                        const CWalletTx* pcoin = &(newIt->second);
+                                        if (outpoint.n < pcoin->vout.size())
+                                            setCoinsRet.insert(std::make_pair(pcoin, outpoint.n));
                                     }
+                                    break;
                                 }
                             }
                         }
+                    }
+                    else
+                    {
+                        vBlocksNeeded.push_back(spvIt->second.hashBlock);
                     }
                 }
                 else if (!spvIt->second.fHaveBlock)

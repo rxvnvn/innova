@@ -435,6 +435,12 @@ ColdHotSeamResult ColdHotSeamNavigator::GetHybridSvmMaturityAuthorityR(
         return COLD_HOT_SEAM_NOT_FOUND; // known, not active -> legacy depth 0
     }
 
+    // Any operation combining frozen COLD membership with live HOT topology must
+    // first prove the pinned generation still shares the authoritative seam with
+    // the current active chain. CURRENT unchanged alone is insufficient.
+    if (snap.ref.IsCold() && !VerifySeam(error))
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+
     // MERKLE authority: prove the wallet transaction is IN THIS ACTIVE BLOCK,
     // not merely that "the block is active". Exact CheckMerkleBranch root match
     // (identical to legacy GetDepthInMainChainINTERNAL).

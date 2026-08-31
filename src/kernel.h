@@ -42,15 +42,6 @@ bool ReadStakeSourceTransactionForTesting(const CBlockIndex* pindexPrev,
 // Check whether the coinstake timestamp meets protocol
 bool CheckCoinStakeTimestamp(int64_t nTimeBlock, int64_t nTimeTx);
 
-// A.9a.3e (NEW-N6): test-only observation hook, OFF by default. Fires ONLY
-// after the by-value HybridSPV maturity authority has satisfied the exact
-// legacy maturity gate and CheckProofOfStake is about to enter by-value
-// source-block recovery. Read-only: it never alters consensus control flow
-// and production always runs with the hook unset. Its absence does not change
-// any acceptance/rejection decision.
-typedef void (*HybridSvmRecoveryProbeFn)(int byValueDepth);
-void SetHybridSvmRecoveryProbe(HybridSvmRecoveryProbeFn fn);
-
 // Get stake modifier checksum
 unsigned int GetStakeModifierChecksum(const CBlockIndex* pindex);
 

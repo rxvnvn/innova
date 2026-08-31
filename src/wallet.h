@@ -302,7 +302,7 @@ public:
     // check whether we are allowed to upgrade (or already support) to the named feature
     bool CanSupportFeature(enum WalletFeature wf) { AssertLockHeld(cs_wallet); return nWalletMaxVersion >= wf; }
 
-    void AvailableCoinsForStaking(std::vector<COutput>& vCoins, unsigned int nSpendTime) const;
+    bool AvailableCoinsForStaking(std::vector<COutput>& vCoins, unsigned int nSpendTime) const;
     void AvailableCoins(std::vector<COutput>& vCoins, bool fOnlyConfirmed=true, const CCoinControl *coinControl = NULL) const;
 
     bool CreateColdStakeDelegation(const CKeyID& stakerKeyID, const CKeyID& ownerKeyID,
