@@ -2990,6 +2990,198 @@ BOOST_FIXTURE_TEST_CASE(a9a3i_overlay_unreadable_coords_rejected_at_validation, 
     nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
 }
 
+
+// ==========================================================================
+// A.9a.3j — LOCAL CHECKSTAKE LOCK-CONTRACT CLOSURE
+// ==========================================================================
+
+// A.9a.3j T1: causal lock-contract proof.  CheckStake must hold cs_main
+// across the parent lookup and the initial CheckProofOfStake call.  The test
+// calls CheckStake WITHOUT pre-acquiring cs_main (the production StakeMiner
+// boundary).  A concurrent probe thread continuously tries to acquire cs_main
+// via try_lock() while CheckStake runs.  A boost::barrier ensures the probe
+// is actively spinning before CheckStake enters its critical section.
+//
+// This is causal: pre-fix, the probe always acquires cs_main (no contention);
+// post-fix, the probe observes contention during the critical section.
+BOOST_FIXTURE_TEST_CASE(a9a3j_checkstake_holds_cs_main_across_validation, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
+    unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
+    fHybridSPV = true; nCoinbaseMaturity = 10; nStakeMinAge = 0;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
+    try
+    {
+        PrepareHybridSpvRealSource(*this, &src);
+        // Make the source tx structurally valid (non-empty vin).
+        src.srcTx.vin.push_back(CTxIn(COutPoint(uint256(0xBEEF), 0)));
+        src.srcTxHash = src.srcTx.GetHash();
+        src.blockFrom.vtx[0] = src.srcTx;
+        src.coinstake.vin[0].prevout = COutPoint(src.srcTxHash, 0);
+        src.wtx = CWalletTx(pwalletMain, src.srcTx);
+        // Build a structurally valid source block with coinbase.
+        CTransaction coinbase;
+        coinbase.nTime = src.srcTx.nTime;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << OP_0 << OP_1;
+        coinbase.vout.push_back(CTxOut(0, CScript() << OP_TRUE));
+        src.blockFrom.vtx.insert(src.blockFrom.vtx.begin(), coinbase);
+        src.blockFrom.hashMerkleRoot = src.blockFrom.BuildMerkleTree();
+        while (!CheckProofOfWork(src.blockFrom.GetPoWHash(), src.blockFrom.nBits))
+            src.blockFrom.nNonce++;
+        {
+            LOCK(cs_main);
+            BOOST_REQUIRE(src.blockFrom.WriteToDisk(src.nFile, src.nBlockPos));
+        }
+        src.sourceBlockHash = src.blockFrom.GetHash();
+        src.wtx.hashBlock = src.sourceBlockHash;
+        src.wtx.nIndex = 1;
+        src.wtx.vMerkleBranch = src.blockFrom.GetMerkleBranch(1);
+        srcOverriddenHash = src.sourceBlockHash;
+        merkleRootOverride[2] = src.blockFrom.hashMerkleRoot;
+        nBitsOverride[2] = src.blockFrom.nBits;
+        nTimeOverride[2] = src.blockFrom.nTime;
+        nFileOverride[2] = src.nFile;
+        nBlockPosOverride[2] = src.nBlockPos;
+        Setup();
+        RetainNavigator();
+
+        // Insert the wallet tx so CheckProofOfStake can find it.
+        {
+            LOCK(cs_main);
+            pwalletMain->mapWallet[src.srcTxHash] = src.wtx;
+            pwalletMain->mapWallet[src.srcTxHash].BindWallet(pwalletMain);
+
+            BOOST_REQUIRE(FindPassingStakeTime(pindexBest, src.blockFrom,
+                src.srcTx, src.srcTxHash, &src.coinstake.nTime));
+        }
+
+        // Build a PoS block that CheckStake will validate.
+        CBlock stakeBlock;
+        stakeBlock.nVersion = 1;
+        stakeBlock.hashPrevBlock = hashBestChain;
+        stakeBlock.nTime = src.coinstake.nTime;
+        stakeBlock.nBits = pindexBest->nBits;
+        stakeBlock.nNonce = 1;
+        stakeBlock.vtx.push_back(coinbase);
+        stakeBlock.vtx.push_back(src.coinstake);
+        stakeBlock.hashMerkleRoot = stakeBlock.BuildMerkleTree();
+
+        // Concurrent probe: use a barrier so the probe thread is actively
+        // spinning before CheckStake starts.  Direct try_lock()/unlock() on
+        // the raw mutex avoids CCriticalBlock overhead per iteration.
+        // boost::barrier(2) ensures both threads reach the sync point before
+        // either proceeds — the probe enters its tight loop and the main
+        // thread then calls CheckStake.
+        boost::barrier syncPoint(2);
+        std::atomic<bool> contentionDetected{false};
+        std::atomic<bool> running{true};
+
+        boost::thread probe([&]() {
+            syncPoint.wait();
+            while (running.load(std::memory_order_relaxed))
+            {
+                if (!cs_main.try_lock())
+                {
+                    contentionDetected.store(true, std::memory_order_relaxed);
+                    break;
+                }
+                cs_main.unlock();
+                boost::this_thread::yield();
+            }
+        });
+
+        syncPoint.wait();
+        // Give the probe thread a moment to enter its spin loop.
+        boost::this_thread::yield();
+
+        // Call CheckStake WITHOUT pre-holding cs_main (production boundary).
+        // CheckStake will either succeed or fail for expected reasons
+        // (e.g., ProcessBlock rejection), but it must NOT fail due to
+        // missing cs_main.
+        CheckStake(&stakeBlock, *pwalletMain);
+
+        running.store(false, std::memory_order_relaxed);
+        probe.join();
+
+        // The probe must have detected contention, proving cs_main was held
+        // during the critical section (parent lookup + CheckProofOfStake).
+        BOOST_CHECK_MESSAGE(contentionDetected.load(std::memory_order_relaxed),
+            "CheckStake must hold cs_main during parent lookup and CheckProofOfStake; "
+            "concurrent probe did not detect lock contention");
+
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+    }
+    catch (...)
+    {
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity;
+        nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+        throw;
+    }
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity;
+    nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+}
+
+// A.9a.3j T2: missing-parent no-insertion proof.  When CheckStake is called
+// with a block whose hashPrevBlock is NOT in mapBlockIndex, the non-inserting
+// find() lookup must fail without polluting mapBlockIndex.  The old
+// operator[] would have inserted a null/default CBlockIndex* entry.
+BOOST_FIXTURE_TEST_CASE(a9a3j_checkstake_missing_parent_no_insertion, ProdFixture)
+{
+    Setup();
+
+    // Record mapBlockIndex state before the call.
+    const size_t sizeBefore = mapBlockIndex.size();
+
+    // Build a PoS block with a parent hash that does NOT exist in mapBlockIndex.
+    CBlock orphanBlock;
+    orphanBlock.nVersion = 1;
+    orphanBlock.hashPrevBlock = uint256(0xDEADBEEF);
+    orphanBlock.nTime = 9999;
+    orphanBlock.nBits = 0x207fffff;
+    orphanBlock.nNonce = 1;
+
+    // Add a minimal coinstake so IsProofOfStake() returns true.
+    CTransaction coinbase;
+    coinbase.nTime = 9999;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript() << OP_0 << OP_1;
+    coinbase.vout.push_back(CTxOut(0, CScript() << OP_TRUE));
+
+    CTransaction coinstake;
+    coinstake.nVersion = 1;
+    coinstake.nTime = 9999;
+    CTxIn in; in.prevout = COutPoint(uint256(0xF00D), 0);
+    coinstake.vin.push_back(in);
+    CTxOut emptyOut; emptyOut.nValue = 0; emptyOut.scriptPubKey = CScript();
+    coinstake.vout.push_back(emptyOut);
+    CTxOut rewardOut; rewardOut.nValue = COIN; rewardOut.scriptPubKey = CScript() << OP_TRUE;
+    coinstake.vout.push_back(rewardOut);
+
+    orphanBlock.vtx.push_back(coinbase);
+    orphanBlock.vtx.push_back(coinstake);
+    orphanBlock.hashMerkleRoot = orphanBlock.BuildMerkleTree();
+
+    // Verify the parent is truly absent.
+    BOOST_REQUIRE(mapBlockIndex.count(orphanBlock.hashPrevBlock) == 0);
+
+    // Call CheckStake WITHOUT cs_main (production boundary).
+    // Must fail because parent is not found.
+    BOOST_CHECK(!CheckStake(&orphanBlock, *pwalletMain));
+
+    // Critical: mapBlockIndex must NOT have grown.  The old operator[] would
+    // have inserted {hashPrevBlock -> NULL} into the map.
+    BOOST_CHECK_EQUAL(mapBlockIndex.size(), sizeBefore);
+    BOOST_CHECK_MESSAGE(mapBlockIndex.count(orphanBlock.hashPrevBlock) == 0,
+        "CheckStake must not insert a null CBlockIndex for a missing parent");
+}
+
 } // namespace (A.9a.3g helpers)
 
 BOOST_AUTO_TEST_SUITE_END()

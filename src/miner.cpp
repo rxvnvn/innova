@@ -914,25 +914,35 @@ bool CheckStake(CBlock* pblock, CWallet& wallet)
 
     if(!pblock->IsProofOfStake())
         return error("CheckStake() : %s is not a proof-of-stake block", hashBlock.GetHex().c_str());
+
+    // A.9a.3j: hold cs_main across the DAG-fork check, safe non-inserting
+    // parent lookup, and initial CheckProofOfStake.  The validation consumer
+    // (CheckProofOfStake -> GetHybridSvmMaturityAuthorityR / ResolveLogicalR /
+    // VerifySeam / GetStakingSourceDiskPositionR) requires caller-held
+    // cs_main.  Using find() instead of operator[] avoids inserting a null
+    // CBlockIndex entry when the parent is absent from mapBlockIndex.
     {
         LOCK(cs_main);
         if (pindexBest && pindexBest->nHeight + 1 >= FORK_HEIGHT_DAG)
             return error("CheckStake() : proof-of-stake block production disabled after DAG fork");
-    }
 
-   // verify hash target and signature of coinstake tx -
-    //if (!CheckProofOfStake(mapBlockIndex[pblock->hashPrevBlock], pblock->vtx[1], pblock->nBits, proofHash, hashTarget))
-	if (!CheckProofOfStake(mapBlockIndex[pblock->hashPrevBlock], pblock->vtx[1], pblock->nBits, proofHash, hashTarget))
-        return error("CheckStake() : proof-of-stake checking failed");
+        // Safe non-inserting parent lookup (A.9a.3j)
+        std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(pblock->hashPrevBlock);
+        if (mi == mapBlockIndex.end())
+            return error("CheckStake() : prev block %s not found in mapBlockIndex",
+                         pblock->hashPrevBlock.ToString().c_str());
+        CBlockIndex* pindexPrev = mi->second;
 
-    //// debug print
-    printf("CheckStake() : new proof-of-stake block found  \n  hash: %s \nproofhash: %s  \ntarget: %s\n", hashBlock.GetHex().c_str(), proofHash.GetHex().c_str(), hashTarget.GetHex().c_str());
-    pblock->print();
-    printf("out %s\n", FormatMoney(pblock->vtx[1].GetValueOut()).c_str());
+        // verify hash target and signature of coinstake tx
+        if (!CheckProofOfStake(pindexPrev, pblock->vtx[1], pblock->nBits, proofHash, hashTarget))
+            return error("CheckStake() : proof-of-stake checking failed");
 
-    // Found a solution
-    {
-        LOCK(cs_main);
+        //// debug print
+        printf("CheckStake() : new proof-of-stake block found  \n  hash: %s \nproofhash: %s  \ntarget: %s\n", hashBlock.GetHex().c_str(), proofHash.GetHex().c_str(), hashTarget.GetHex().c_str());
+        pblock->print();
+        printf("out %s\n", FormatMoney(pblock->vtx[1].GetValueOut()).c_str());
+
+        // Found a solution
         if (pblock->hashPrevBlock != hashBestChain)
             return error("CheckStake() : generated block is stale");
 

@@ -621,6 +621,7 @@ bool TxnHashInSystem(CTxDB* ptxdb, uint256& txnHash);
 uint256 WantedByOrphan(const CBlock* pblockOrphan);
 const CBlockIndex* GetLastBlockIndex(const CBlockIndex* pindex, bool fProofOfStake);
 void StakeMiner(CWallet *pwallet);
+bool CheckStake(CBlock* pblock, CWallet& wallet);
 void ResendWalletTransactions(bool fForce = false);
 
 bool Finalise();
