@@ -498,6 +498,7 @@ HEADERS += src/qt/bitcoingui.h \
     src/bignum.h \
     src/blockindex_accessor.h \
     src/blockindex_startup_authority.h \
+    src/blockindex_derived_state.h \
     src/blockindex_hashindex.h \
     src/fixed_blockindex_store.h \
     src/blockindex_activeindex.h \
@@ -671,6 +672,7 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/bootstrap.cpp \
     src/blockindex_accessor.cpp \
     src/blockindex_startup_authority.cpp \
+    src/blockindex_derived_state.cpp \
     src/blockindex_hashindex.cpp \
     src/fixed_blockindex_store.cpp \
     src/blockindex_activeindex.cpp \
