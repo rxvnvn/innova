@@ -8,6 +8,7 @@
 #include "../blockindex_accessor.h"
 #include "../main.h"
 
+#include <zlib.h>
 #include <map>
 #include <type_traits>
 #include <vector>
@@ -76,14 +77,16 @@ struct DerivedStateFixture
         BlockIndexDerivedEntry e;
         e.chainTrust = trust;
         e.stakeModifierChecksum = checksum;
-        e.stakeModifierTime = modTime;
+        e.stakeModifierTime = hasModTime ? modTime : 0;
         e.SetHasStakeModifierTime(hasModTime);
+        e.nSize = 0;
+        e.SetHasBlockSize(false);
         return e;
     }
 
     void BuildStore(BlockIndexDerivedStateStore* store, std::string* error)
     {
-        BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(testDir, testGeneration, store, error));
+        BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(testDir, testGeneration, NULL, store, error));
 
         // Append entries in RecordId order (1-based): genesis, one, two, tip, side
         BOOST_REQUIRE(store->Append(MakeEntry(trustGenesis, checksumGenesis, modifierTimeGenesis, false), error));
@@ -328,7 +331,7 @@ BOOST_AUTO_TEST_CASE(derived_state_differential_trust_matches_legacy)
     std::string diffDir = testDir + "/diff";
     boost::filesystem::create_directories(diffDir);
     BlockIndexDerivedStateStore derivedStore;
-    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(diffDir, testGeneration, &derivedStore, &error));
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(diffDir, testGeneration, NULL, &derivedStore, &error));
 
     const uint256 hashes[] = {hGenesis, hOne, hTwo, hTip};
     for (size_t i = 0; i < 4; ++i)
@@ -339,8 +342,10 @@ BOOST_AUTO_TEST_CASE(derived_state_differential_trust_matches_legacy)
         BlockIndexDerivedEntry entry;
         entry.chainTrust = result.record.derived.chainTrust;
         entry.stakeModifierChecksum = result.record.derived.stakeModifierChecksum;
-        entry.stakeModifierTime = result.record.derived.stakeModifierTime;
+        entry.stakeModifierTime = result.record.derived.hasStakeModifierTime ? result.record.derived.stakeModifierTime : 0;
         entry.SetHasStakeModifierTime(result.record.derived.hasStakeModifierTime);
+        entry.nSize = result.record.derived.hasBlockSize ? result.record.derived.blockSize : 0;
+        entry.SetHasBlockSize(result.record.derived.hasBlockSize);
         BOOST_REQUIRE(derivedStore.Append(entry, &error));
     }
     BOOST_REQUIRE(derivedStore.Finalize(&error));
@@ -424,15 +429,17 @@ BOOST_AUTO_TEST_CASE(derived_state_lookup_is_constant_time)
     BlockIndexDerivedStateStore store;
 
     // Build a store with many entries
-    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(testDir, testGeneration, &store, &error));
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(testDir, testGeneration, NULL, &store, &error));
     const int N = 1000;
     for (int i = 0; i < N; ++i)
     {
         BlockIndexDerivedEntry entry;
         entry.chainTrust = uint256(i + 1);
         entry.stakeModifierChecksum = (unsigned int)(i * 7);
-        entry.stakeModifierTime = 100000 + i;
+        entry.stakeModifierTime = (i % 2 == 0) ? (100000 + i) : 0;
         entry.SetHasStakeModifierTime(i % 2 == 0);
+        entry.nSize = 0;
+        entry.SetHasBlockSize(false);
         BOOST_REQUIRE(store.Append(entry, &error));
     }
     BOOST_REQUIRE(store.Finalize(&error));
@@ -483,6 +490,106 @@ BOOST_AUTO_TEST_CASE(derived_state_no_materialization_required)
     BOOST_CHECK_EQUAL(entry.stakeModifierChecksum, checksumOne);
     BOOST_CHECK_EQUAL(entry.HasStakeModifierTime(), true);
     BOOST_CHECK_EQUAL(entry.stakeModifierTime, modifierTimeOne);
+}
+
+// F5 — foreign-store substitution: same generation/count but different
+// content binding must fail validation
+BOOST_AUTO_TEST_CASE(derived_state_content_binding_blocks_foreign_store)
+{
+    std::string error;
+
+    // Build store A with known tip hash
+    uint256 tipHashA(uint256(0xAAAA));
+    unsigned char bindingA[32];
+    ComputeDerivedContentBinding(tipHashA, 3, testGeneration, bindingA);
+
+    std::string dirA = testDir + "/storeA";
+    boost::filesystem::create_directories(dirA);
+    BlockIndexDerivedStateStore storeA;
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(dirA, testGeneration, bindingA, &storeA, &error));
+    BOOST_REQUIRE(storeA.Append(MakeEntry(uint256(100), 0, 0, false), &error));
+    BOOST_REQUIRE(storeA.Append(MakeEntry(uint256(200), 111, 1000, true), &error));
+    BOOST_REQUIRE(storeA.Append(MakeEntry(uint256(300), 222, 2000, true), &error));
+    BOOST_REQUIRE(storeA.Finalize(&error));
+    storeA = BlockIndexDerivedStateStore();
+
+    // Build store B with different tip hash but same generation/count
+    uint256 tipHashB(uint256(0xBBBB));
+    unsigned char bindingB[32];
+    ComputeDerivedContentBinding(tipHashB, 3, testGeneration, bindingB);
+
+    std::string dirB = testDir + "/storeB";
+    boost::filesystem::create_directories(dirB);
+    BlockIndexDerivedStateStore storeB;
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(dirB, testGeneration, bindingB, &storeB, &error));
+    BOOST_REQUIRE(storeB.Append(MakeEntry(uint256(901), 0, 0, false), &error));
+    BOOST_REQUIRE(storeB.Append(MakeEntry(uint256(902), 999, 9000, true), &error));
+    BOOST_REQUIRE(storeB.Append(MakeEntry(uint256(903), 888, 8000, true), &error));
+    BOOST_REQUIRE(storeB.Finalize(&error));
+    storeB = BlockIndexDerivedStateStore();
+
+    // Copy store B's derived.dat over store A's
+    std::string derivedA = dirA + "/" + BLOCK_INDEX_DERIVED_FILE_NAME;
+    std::string derivedB = dirB + "/" + BLOCK_INDEX_DERIVED_FILE_NAME;
+    boost::filesystem::remove(derivedA);
+    boost::filesystem::copy_file(derivedB, derivedA);
+
+    // Opening store A with the foreign derived.dat should succeed (same gen)
+    BlockIndexDerivedStateStore readerA;
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::OpenReadOnly(dirA, testGeneration, &readerA, &error));
+
+    // But content binding validation against the ORIGINAL tip hash should FAIL
+    BOOST_CHECK(!readerA.ValidateContentBinding(tipHashA, 3, &error));
+    BOOST_CHECK(error.find("content binding mismatch") != std::string::npos);
+
+    // And validation against the FOREIGN tip hash should succeed
+    BOOST_CHECK(readerA.ValidateContentBinding(tipHashB, 3, &error));
+}
+
+// F16 — unknown flags must fail closed
+BOOST_AUTO_TEST_CASE(derived_state_unknown_flags_rejected)
+{
+    std::string error;
+    BlockIndexDerivedStateStore store;
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(testDir, testGeneration, NULL, &store, &error));
+
+    // Create a valid entry, encode it, then corrupt the flags field
+    BlockIndexDerivedEntry entry = MakeEntry(uint256(100), 42, 1000, true);
+    std::vector<unsigned char> encoded;
+    BOOST_REQUIRE(EncodeBlockIndexDerivedEntry(entry, &encoded, &error));
+
+    // Set an unknown flag bit (bit 31)
+    encoded[48] |= 0x80;
+
+    // Recompute checksum over bytes [0..52)
+    uint32_t newCrc = (uint32_t)crc32(0L, &encoded[0], 52);
+    encoded[52] = (unsigned char)(newCrc & 0xff);
+    encoded[53] = (unsigned char)((newCrc >> 8) & 0xff);
+    encoded[54] = (unsigned char)((newCrc >> 16) & 0xff);
+    encoded[55] = (unsigned char)((newCrc >> 24) & 0xff);
+
+    // Write the corrupted entry directly to the file
+    std::string derivedPath = testDir + "/" + BLOCK_INDEX_DERIVED_FILE_NAME;
+    FILE* f = fopen(derivedPath.c_str(), "ab");
+    BOOST_REQUIRE(f != NULL);
+    BOOST_REQUIRE(fwrite(&encoded[0], 1, encoded.size(), f) == encoded.size());
+    fclose(f);
+
+    // Finalize with count=1
+    store = BlockIndexDerivedStateStore();
+    // Reopen writable store manually
+    BlockIndexDerivedStateStore writer;
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(testDir + "/flags_test", testGeneration, NULL, &writer, &error));
+    BOOST_REQUIRE(writer.Append(entry, &error));
+    BOOST_REQUIRE(writer.Finalize(&error));
+    writer = BlockIndexDerivedStateStore();
+
+    // Now try to decode the corrupted entry
+    BlockIndexDerivedEntry decoded;
+    std::string decodeError;
+    bool ok = DecodeBlockIndexDerivedEntry(&encoded[0], encoded.size(), &decoded, &decodeError);
+    BOOST_CHECK(!ok);
+    BOOST_CHECK(decodeError.find("unknown flag") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -1,6 +1,7 @@
 #include "blockindex_generation_lifecycle.h"
 
 #include "blockindex_hashindex.h"
+#include "blockindex_derived_state.h"
 #include "util.h"
 
 #include <boost/filesystem.hpp>
@@ -336,6 +337,32 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
         if (tipRec.hash != m.committedTipHash || tipRec.height != m.committedTipHeight)
         {
             SetError(error, "committed tip record/hash/height incoherent with MANIFEST");
+            return BLOCK_INDEX_LIFECYCLE_ERROR;
+        }
+    }
+
+    // derived.dat validation (optional component for authoritative capability).
+    // If present, validate format, generation binding, entry count, and content
+    // binding. If absent, the generation is OLD_SHADOW_VALID (not authoritative-
+    // capable but still valid for shadow/legacy use).
+    const fs::path derivedPath = dir / BLOCK_INDEX_DERIVED_FILE_NAME;
+    if (fs::exists(derivedPath))
+    {
+        BlockIndexDerivedStateStore derivedStore;
+        if (!BlockIndexDerivedStateStore::OpenReadOnly(dir.string(), expectedGeneration, &derivedStore, error))
+        {
+            // derived.dat present but corrupt/mismatched: fail validation
+            return BLOCK_INDEX_LIFECYCLE_ERROR;
+        }
+        // Entry count must match MANIFEST record count
+        if (derivedStore.EntryCount() != m.recordCount)
+        {
+            SetError(error, "derived.dat entry count does not match MANIFEST record count");
+            return BLOCK_INDEX_LIFECYCLE_ERROR;
+        }
+        // Content binding must match MANIFEST tip/count/generation
+        if (!derivedStore.ValidateContentBinding(m.committedTipHash, m.recordCount, error))
+        {
             return BLOCK_INDEX_LIFECYCLE_ERROR;
         }
     }

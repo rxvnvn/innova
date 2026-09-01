@@ -5,6 +5,7 @@
 
 #include "util.h"
 
+#include <openssl/sha.h>
 #include <zlib.h>
 
 #include <algorithm>
@@ -38,20 +39,10 @@ static void WriteU32LE(std::vector<unsigned char>& out, uint32_t value)
     out.push_back((unsigned char)((value >> 24) & 0xff));
 }
 
-static void WriteI32LE(std::vector<unsigned char>& out, int32_t value)
-{
-    WriteU32LE(out, (uint32_t)value);
-}
-
 static void WriteU64LE(std::vector<unsigned char>& out, uint64_t value)
 {
     for (int i = 0; i < 8; ++i)
         out.push_back((unsigned char)((value >> (8 * i)) & 0xff));
-}
-
-static void WriteI64LE(std::vector<unsigned char>& out, int64_t value)
-{
-    WriteU64LE(out, (uint64_t)value);
 }
 
 static bool ReadU32LE(const unsigned char* data, size_t size, size_t* offset, uint32_t* out, std::string* error)
@@ -61,15 +52,6 @@ static bool ReadU32LE(const unsigned char* data, size_t size, size_t* offset, ui
     const unsigned char* p = data + *offset;
     *out = ((uint32_t)p[0]) | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
     *offset += 4;
-    return true;
-}
-
-static bool ReadI32LE(const unsigned char* data, size_t size, size_t* offset, int32_t* out, std::string* error)
-{
-    uint32_t tmp = 0;
-    if (!ReadU32LE(data, size, offset, &tmp, error))
-        return false;
-    *out = (int32_t)tmp;
     return true;
 }
 
@@ -99,57 +81,22 @@ static bool ReadI64LE(const unsigned char* data, size_t size, size_t* offset, in
     return true;
 }
 
-static unsigned char HexDigit(unsigned int value)
+// TRUE little-endian uint256: raw 32 bytes in memory order.
+// uint256 stores its data as uint32_t pn[8] in host byte order (which is LE
+// on all supported platforms). The raw byte representation IS true LE.
+static void WriteHashBytesLE(std::vector<unsigned char>& out, const uint256& hash)
 {
-    return (unsigned char)(value < 10 ? ('0' + value) : ('a' + value - 10));
+    // uint256::begin() returns pointer to the raw 32-byte representation
+    const unsigned char* raw = hash.begin();
+    out.insert(out.end(), raw, raw + 32);
 }
 
-static bool ParseHexNibble(char c, unsigned char* out)
-{
-    if (c >= '0' && c <= '9')
-    {
-        *out = (unsigned char)(c - '0');
-        return true;
-    }
-    if (c >= 'a' && c <= 'f')
-    {
-        *out = (unsigned char)(10 + (c - 'a'));
-        return true;
-    }
-    if (c >= 'A' && c <= 'F')
-    {
-        *out = (unsigned char)(10 + (c - 'A'));
-        return true;
-    }
-    return false;
-}
-
-static void WriteHashBytes(std::vector<unsigned char>& out, const uint256& hash)
-{
-    const std::string hex = hash.GetHex();
-    for (size_t i = 0; i < hex.size(); i += 2)
-    {
-        unsigned char hi = 0;
-        unsigned char lo = 0;
-        ParseHexNibble(hex[i], &hi);
-        ParseHexNibble(hex[i + 1], &lo);
-        out.push_back((unsigned char)((hi << 4) | lo));
-    }
-}
-
-static bool ReadHashBytes(const unsigned char* data, size_t size, size_t* offset, uint256* out, std::string* error)
+static bool ReadHashBytesLE(const unsigned char* data, size_t size, size_t* offset, uint256* out, std::string* error)
 {
     if (*offset > size || size - *offset < 32)
         return SetError(error, "short read for hash");
-    std::string hex;
-    hex.resize(64);
-    for (size_t i = 0; i < 32; ++i)
-    {
-        const unsigned char value = data[*offset + i];
-        hex[2 * i] = (char)HexDigit((value >> 4) & 0x0f);
-        hex[2 * i + 1] = (char)HexDigit(value & 0x0f);
-    }
-    *out = uint256(hex);
+    // uint256 can be constructed from raw bytes via begin() mutation
+    memcpy(out->begin(), data + *offset, 32);
     *offset += 32;
     return true;
 }
@@ -202,7 +149,7 @@ static bool WriteFileAtomically(const boost::filesystem::path& dest, const std::
     return true;
 }
 
-static bool EncodeDerivedHeader(const BlockIndexDerivedHeader& header, std::vector<unsigned char>* out)
+static bool EncodeDerivedHeaderV2(const BlockIndexDerivedHeader& header, std::vector<unsigned char>* out)
 {
     out->clear();
     out->insert(out->end(), BLOCK_INDEX_DERIVED_MAGIC, BLOCK_INDEX_DERIVED_MAGIC + 8);
@@ -212,24 +159,51 @@ static bool EncodeDerivedHeader(const BlockIndexDerivedHeader& header, std::vect
     WriteU32LE(*out, header.entrySize);
     WriteU64LE(*out, header.generation);
     WriteU64LE(*out, header.entryCount);
+    // content binding: 32 raw bytes
+    out->insert(out->end(), header.contentBinding, header.contentBinding + 32);
     WriteU64LE(*out, 0); // reserved
-    return out->size() == BLOCK_INDEX_DERIVED_HEADER_SIZE_V1;
+    return out->size() == BLOCK_INDEX_DERIVED_HEADER_SIZE_V2;
 }
 
 static bool DecodeDerivedHeader(const unsigned char* data, size_t size, BlockIndexDerivedHeader* header, std::string* error)
 {
-    if (size != BLOCK_INDEX_DERIVED_HEADER_SIZE_V1)
-        return SetError(error, "derived header size mismatch");
+    if (size < 8)
+        return SetError(error, "derived header too short for magic");
     if (memcmp(data, BLOCK_INDEX_DERIVED_MAGIC, 8) != 0)
         return SetError(error, "invalid derived magic");
+
+    // Read format/schema versions first to determine header layout
+    if (size < 24)
+        return SetError(error, "derived header too short for version");
     size_t offset = 8;
     if (!ReadU32LE(data, size, &offset, &header->formatVersion, error) ||
         !ReadU32LE(data, size, &offset, &header->schemaVersion, error) ||
         !ReadU32LE(data, size, &offset, &header->headerSize, error) ||
-        !ReadU32LE(data, size, &offset, &header->entrySize, error) ||
-        !ReadU64LE(data, size, &offset, &header->generation, error) ||
+        !ReadU32LE(data, size, &offset, &header->entrySize, error))
+        return false;
+
+    // V2 format only
+    if (header->formatVersion != BLOCK_INDEX_DERIVED_FORMAT_VERSION)
+        return SetError(error, "unsupported derived format version (expected V2)");
+    if (header->schemaVersion != BLOCK_INDEX_DERIVED_SCHEMA_VERSION)
+        return SetError(error, "unsupported derived schema version (expected V2)");
+    if (header->headerSize != BLOCK_INDEX_DERIVED_HEADER_SIZE_V2)
+        return SetError(error, "invalid derived header size (expected 80)");
+    if (header->entrySize != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2)
+        return SetError(error, "invalid derived entry size (expected 56)");
+    if (size != BLOCK_INDEX_DERIVED_HEADER_SIZE_V2)
+        return SetError(error, "derived header exact size mismatch");
+
+    if (!ReadU64LE(data, size, &offset, &header->generation, error) ||
         !ReadU64LE(data, size, &offset, &header->entryCount, error))
         return false;
+
+    // content binding: 32 raw bytes
+    if (size - offset < 32)
+        return SetError(error, "derived header too short for content binding");
+    memcpy(header->contentBinding, data + offset, 32);
+    offset += 32;
+
     uint64_t reserved = 0;
     if (!ReadU64LE(data, size, &offset, &reserved, error))
         return false;
@@ -243,6 +217,34 @@ static bool DecodeDerivedHeader(const unsigned char* data, size_t size, BlockInd
 
 } // namespace
 
+bool ComputeDerivedContentBinding(const uint256& tipHash,
+                                  uint64_t recordCount,
+                                  uint64_t generation,
+                                  unsigned char binding[32])
+{
+    // SHA256(tipHash || recordCount || generation) in true LE byte order
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+
+    // tipHash: raw 32 bytes (true LE)
+    SHA256_Update(&ctx, tipHash.begin(), 32);
+
+    // recordCount: LE 8 bytes
+    unsigned char rcBuf[8];
+    for (int i = 0; i < 8; ++i)
+        rcBuf[i] = (unsigned char)((recordCount >> (8 * i)) & 0xff);
+    SHA256_Update(&ctx, rcBuf, 8);
+
+    // generation: LE 8 bytes
+    unsigned char genBuf[8];
+    for (int i = 0; i < 8; ++i)
+        genBuf[i] = (unsigned char)((generation >> (8 * i)) & 0xff);
+    SHA256_Update(&ctx, genBuf, 8);
+
+    SHA256_Final(binding, &ctx);
+    return true;
+}
+
 bool EncodeBlockIndexDerivedEntry(const BlockIndexDerivedEntry& entry,
                                   std::vector<unsigned char>* out,
                                   std::string* error)
@@ -251,15 +253,21 @@ bool EncodeBlockIndexDerivedEntry(const BlockIndexDerivedEntry& entry,
         return SetError(error, "null encode output");
 
     out->clear();
-    out->reserve(BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1);
-    WriteHashBytes(*out, entry.chainTrust);
-    WriteU32LE(*out, entry.stakeModifierChecksum);
-    WriteI64LE(*out, entry.stakeModifierTime);
-    WriteU32LE(*out, entry.flags);
-    if (out->size() != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1 - 4)
+    out->reserve(BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2);
+    WriteHashBytesLE(*out, entry.chainTrust);           // [0..32)
+    WriteU32LE(*out, entry.stakeModifierChecksum);       // [32..36)
+    {
+        // int64 -> uint64 cast for LE encoding
+        std::vector<unsigned char> tmp;
+        WriteU64LE(tmp, (uint64_t)entry.stakeModifierTime);
+        out->insert(out->end(), tmp.begin(), tmp.end()); // [36..44)
+    }
+    WriteU32LE(*out, entry.nSize);                       // [44..48)
+    WriteU32LE(*out, entry.flags);                       // [48..52)
+    if (out->size() != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2 - 4)
         return SetError(error, "entry payload size mismatch during encode");
-    WriteU32LE(*out, EntryChecksum(&(*out)[0], out->size()));
-    if (out->size() != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1)
+    WriteU32LE(*out, EntryChecksum(&(*out)[0], out->size())); // [52..56)
+    if (out->size() != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2)
         return SetError(error, "entry size mismatch during encode");
     ClearError(error);
     return true;
@@ -271,11 +279,11 @@ bool DecodeBlockIndexDerivedEntry(const unsigned char* data, size_t size,
 {
     if (!data || !out)
         return SetError(error, "null decode input/output");
-    if (size != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1)
+    if (size != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2)
         return SetError(error, "entry size mismatch");
 
-    const uint32_t checksum = EntryChecksum(data, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1 - 4);
-    size_t checksumOffset = BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1 - 4;
+    const uint32_t checksum = EntryChecksum(data, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2 - 4);
+    size_t checksumOffset = BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2 - 4;
     uint32_t storedChecksum = 0;
     if (!ReadU32LE(data, size, &checksumOffset, &storedChecksum, error))
         return false;
@@ -283,13 +291,25 @@ bool DecodeBlockIndexDerivedEntry(const unsigned char* data, size_t size,
         return SetError(error, "derived entry checksum mismatch");
 
     size_t offset = 0;
-    if (!ReadHashBytes(data, size, &offset, &out->chainTrust, error) ||
+    if (!ReadHashBytesLE(data, size, &offset, &out->chainTrust, error) ||
         !ReadU32LE(data, size, &offset, &out->stakeModifierChecksum, error) ||
         !ReadI64LE(data, size, &offset, &out->stakeModifierTime, error) ||
+        !ReadU32LE(data, size, &offset, &out->nSize, error) ||
         !ReadU32LE(data, size, &offset, &out->flags, error))
         return false;
-    if (offset != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1 - 4)
+    if (offset != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2 - 4)
         return SetError(error, "entry payload trailing bytes");
+
+    // Validate unknown flags: reject if any unknown flag bits are set
+    if (out->flags & ~BLOCK_INDEX_DERIVED_FLAG_KNOWN_MASK)
+        return SetError(error, "derived entry has unknown flag bits");
+
+    // Canonicalize unavailable values: if flag not set, value must be 0
+    if (!out->HasStakeModifierTime() && out->stakeModifierTime != 0)
+        return SetError(error, "derived entry: modifier time not available but value nonzero");
+    if (!out->HasBlockSize() && out->nSize != 0)
+        return SetError(error, "derived entry: block size not available but value nonzero");
+
     ClearError(error);
     return true;
 }
@@ -304,8 +324,10 @@ struct BlockIndexDerivedStateStore::ReadHandle
 };
 
 BlockIndexDerivedStateStore::BlockIndexDerivedStateStore()
-    : generation(0), entryCount(0), writable(false), open(false)
+    : generation(0), entryCount(0), formatVersion(0), schemaVersion(0),
+      writable(false), open(false)
 {
+    memset(contentBinding, 0, 32);
 }
 
 bool BlockIndexDerivedStateStore::InitializePaths(const std::string& dir, std::string* error)
@@ -323,8 +345,9 @@ bool BlockIndexDerivedStateStore::WriteHeader(std::string* error)
     BlockIndexDerivedHeader header;
     header.generation = generation;
     header.entryCount = entryCount;
+    memcpy(header.contentBinding, contentBinding, 32);
     std::vector<unsigned char> bytes;
-    EncodeDerivedHeader(header, &bytes);
+    EncodeDerivedHeaderV2(header, &bytes);
     return WriteFileAtomically(derivedPath, bytes, error);
 }
 
@@ -333,10 +356,10 @@ bool BlockIndexDerivedStateStore::LoadHeader(uint64_t* fileSize, std::string* er
     if (!boost::filesystem::exists(derivedPath))
         return SetError(error, "missing derived.dat");
     const uint64_t size = boost::filesystem::file_size(derivedPath);
-    if (size < BLOCK_INDEX_DERIVED_HEADER_SIZE_V1)
+    if (size < BLOCK_INDEX_DERIVED_HEADER_SIZE_V2)
         return SetError(error, "truncated derived.dat header");
     std::vector<unsigned char> bytes;
-    if (!ReadExactFile(derivedPath, &bytes, BLOCK_INDEX_DERIVED_HEADER_SIZE_V1, error))
+    if (!ReadExactFile(derivedPath, &bytes, BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, error))
         return false;
     BlockIndexDerivedHeader header;
     if (!DecodeDerivedHeader(&bytes[0], bytes.size(), &header, error))
@@ -345,6 +368,9 @@ bool BlockIndexDerivedStateStore::LoadHeader(uint64_t* fileSize, std::string* er
         return false;
     generation = header.generation;
     entryCount = header.entryCount;
+    memcpy(contentBinding, header.contentBinding, 32);
+    formatVersion = header.formatVersion;
+    schemaVersion = header.schemaVersion;
     if (fileSize)
         *fileSize = size;
     ClearError(error);
@@ -358,9 +384,9 @@ bool BlockIndexDerivedStateStore::ValidateHeader(const BlockIndexDerivedHeader& 
         return SetError(error, "unsupported derived format version");
     if (header.schemaVersion != BLOCK_INDEX_DERIVED_SCHEMA_VERSION)
         return SetError(error, "unsupported derived schema version");
-    if (header.headerSize != BLOCK_INDEX_DERIVED_HEADER_SIZE_V1)
+    if (header.headerSize != BLOCK_INDEX_DERIVED_HEADER_SIZE_V2)
         return SetError(error, "invalid derived header size");
-    if (header.entrySize != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1)
+    if (header.entrySize != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2)
         return SetError(error, "invalid derived entry size");
     if (header.generation == 0)
         return SetError(error, "derived generation 0 is invalid");
@@ -371,6 +397,7 @@ bool BlockIndexDerivedStateStore::ValidateHeader(const BlockIndexDerivedHeader& 
 }
 
 bool BlockIndexDerivedStateStore::Create(const std::string& dir, uint64_t gen,
+                                          const unsigned char binding[32],
                                           BlockIndexDerivedStateStore* out,
                                           std::string* error)
 {
@@ -386,6 +413,10 @@ bool BlockIndexDerivedStateStore::Create(const std::string& dir, uint64_t gen,
         return SetError(error, "derived.dat already exists");
     store.generation = gen;
     store.entryCount = 0;
+    if (binding)
+        memcpy(store.contentBinding, binding, 32);
+    else
+        memset(store.contentBinding, 0, 32);
     store.writable = true;
     store.open = true;
     if (!store.WriteHeader(error))
@@ -414,11 +445,14 @@ bool BlockIndexDerivedStateStore::OpenReadOnly(const std::string& dir, uint64_t 
 
     // Validate entry region
     uint64_t entryEnd = 0;
-    if (!CheckedAddMul(BLOCK_INDEX_DERIVED_HEADER_SIZE_V1, store.entryCount,
-                       BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1, &entryEnd))
+    if (!CheckedAddMul(BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, store.entryCount,
+                       BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, &entryEnd))
         return SetError(error, "derived entry region overflow");
     if (fileSize < entryEnd)
         return SetError(error, "derived.dat truncated within entry region");
+    // Exact size check: reject trailing data
+    if (fileSize > entryEnd)
+        return SetError(error, "derived.dat has trailing data beyond entry region");
 
     FILE* readFile = fopen(store.derivedPath.string().c_str(), "rb");
     if (!readFile)
@@ -470,7 +504,7 @@ bool BlockIndexDerivedStateStore::AppendBatch(const std::vector<BlockIndexDerive
         return SetError(error, "entry count exhausted by batch");
 
     std::vector<unsigned char> bytes;
-    bytes.reserve(entries.size() * BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1);
+    bytes.reserve(entries.size() * BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2);
     for (size_t i = 0; i < entries.size(); ++i)
     {
         std::vector<unsigned char> encoded;
@@ -517,14 +551,14 @@ BlockIndexDerivedLookupStatus BlockIndexDerivedStateStore::Read(BlockIndexId id,
     }
 
     uint64_t offset = 0;
-    if (!CheckedAddMul(BLOCK_INDEX_DERIVED_HEADER_SIZE_V1, id - 1,
-                       BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1, &offset))
+    if (!CheckedAddMul(BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, id - 1,
+                       BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, &offset))
     {
         SetError(error, "entry offset overflow");
         return BLOCK_INDEX_DERIVED_LOOKUP_IO_ERROR;
     }
     uint64_t entryEnd = 0;
-    if (!CheckedAddMul(offset, 1, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1, &entryEnd))
+    if (!CheckedAddMul(offset, 1, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, &entryEnd))
     {
         SetError(error, "entry end overflow");
         return BLOCK_INDEX_DERIVED_LOOKUP_IO_ERROR;
@@ -546,7 +580,7 @@ BlockIndexDerivedLookupStatus BlockIndexDerivedStateStore::Read(BlockIndexId id,
         SetError(error, "seek failed for entry read");
         return BLOCK_INDEX_DERIVED_LOOKUP_IO_ERROR;
     }
-    std::vector<unsigned char> bytes(BLOCK_INDEX_DERIVED_ENTRY_SIZE_V1, 0);
+    std::vector<unsigned char> bytes(BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, 0);
     const size_t n = fread(&bytes[0], 1, bytes.size(), readHandle->file);
     if (n != bytes.size())
     {
@@ -563,14 +597,12 @@ bool BlockIndexDerivedStateStore::Finalize(std::string* error)
 {
     if (!open || !writable)
         return SetError(error, "store is not writable");
-    // Rewrite header in-place with final entry count (the header is at offset 0
-    // and is exactly BLOCK_INDEX_DERIVED_HEADER_SIZE_V1 bytes; the entry data
-    // follows immediately and must not be disturbed).
     BlockIndexDerivedHeader header;
     header.generation = generation;
     header.entryCount = entryCount;
+    memcpy(header.contentBinding, contentBinding, 32);
     std::vector<unsigned char> bytes;
-    EncodeDerivedHeader(header, &bytes);
+    EncodeDerivedHeaderV2(header, &bytes);
 
     FILE* file = fopen(derivedPath.string().c_str(), "r+b");
     if (!file)
@@ -599,4 +631,26 @@ uint64_t BlockIndexDerivedStateStore::Generation() const
 bool BlockIndexDerivedStateStore::IsOpen() const
 {
     return open;
+}
+
+uint32_t BlockIndexDerivedStateStore::FormatVersion() const
+{
+    return formatVersion;
+}
+
+uint32_t BlockIndexDerivedStateStore::SchemaVersion() const
+{
+    return schemaVersion;
+}
+
+bool BlockIndexDerivedStateStore::ValidateContentBinding(const uint256& expectedTipHash,
+                                                          uint64_t expectedRecordCount,
+                                                          std::string* error) const
+{
+    unsigned char expected[32];
+    ComputeDerivedContentBinding(expectedTipHash, expectedRecordCount, generation, expected);
+    if (memcmp(contentBinding, expected, 32) != 0)
+        return SetError(error, "derived content binding mismatch");
+    ClearError(error);
+    return true;
 }

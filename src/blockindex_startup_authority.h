@@ -21,6 +21,11 @@ enum BlockIndexStartupStatus
     BLOCK_INDEX_STARTUP_NOT_FOUND = 1,
     BLOCK_INDEX_STARTUP_NOT_ACTIVE = 2,
     BLOCK_INDEX_STARTUP_UNAVAILABLE_DERIVED_STATE = 3,
+    // V2-specific statuses
+    BLOCK_INDEX_STARTUP_NOT_AUTHORITATIVE_CAPABLE = 4,
+    BLOCK_INDEX_STARTUP_CORRUPT = 5,
+    BLOCK_INDEX_STARTUP_IO_ERROR = 6,
+    BLOCK_INDEX_STARTUP_GENERATION_MISMATCH = 7,
 };
 
 enum BlockIndexStartupAuthorityKind
@@ -169,6 +174,34 @@ public:
     virtual BlockIndexStartupResult GetNextActive(const BlockIndexLogicalId& current) const;
     virtual BlockIndexStartupResult RequireDerivedState(
         const BlockIndexLogicalId& id, unsigned int requirements) const;
+};
+
+// V2 StartupAuthority: reads from a validated generation with derived.dat.
+// No historical CBlockIndex pointer identity. No O(N) in-memory mirror.
+// No silent fallback to LegacyBlockIndexStartupAuthority.
+class V2BlockIndexStartupAuthority : public BlockIndexStartupAuthority
+{
+public:
+    V2BlockIndexStartupAuthority();
+    // Open the V2 authority from a generation root. Returns false on error.
+    bool Open(const std::string& root, std::string* error);
+    void Close();
+    bool IsOpen() const;
+
+    virtual BlockIndexStartupAuthorityIdentity Identity() const;
+    virtual BlockIndexStartupResult GetTip() const;
+    virtual BlockIndexStartupResult LookupByHash(const BlockIndexLogicalId& id) const;
+    virtual BlockIndexStartupResult LookupActiveByHash(const BlockIndexLogicalId& id) const;
+    virtual BlockIndexStartupResult GetActiveByHeight(int height) const;
+    virtual BlockIndexStartupResult GetParent(const BlockIndexLogicalId& child) const;
+    virtual BlockIndexStartupResult GetNextActive(const BlockIndexLogicalId& current) const;
+    virtual BlockIndexStartupResult RequireDerivedState(
+        const BlockIndexLogicalId& id, unsigned int requirements) const;
+
+private:
+    // Forward declarations for private implementation
+    struct Impl;
+    Impl* impl;
 };
 
 #endif // INNOVA_BLOCKINDEX_STARTUP_AUTHORITY_H

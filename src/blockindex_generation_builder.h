@@ -4,17 +4,17 @@
 #include "fixed_blockindex_store.h"
 #include "blockindex_hashindex.h"
 #include "blockindex_activeindex.h"
+#include "blockindex_derived_state.h"
 
 #include <stdint.h>
 #include <string>
 #include <vector>
 
-// Phase A.5: offline real-chain Block Index V2 generation builder.
+// Phase A.5 + A.10.1b-fix1: offline real-chain Block Index V2 generation builder.
 //
-// This builds a complete, coherent shadow generation (records.dat + active.dat
-// + hashindex + MANIFEST) from the EXISTING local legacy blockchain, using the
-// verified production store APIs. It is a real future migration primitive, not
-// a throwaway importer.
+// This builds a COMPLETE, AUTHORITATIVE-CAPABLE generation (records.dat +
+// active.dat + hashindex + derived.dat + MANIFEST) from the EXISTING local
+// legacy blockchain, using the verified production store APIs.
 //
 // Safety contract:
 //  - operates ONLY on a caller-supplied static snapshot directory of the legacy
@@ -45,8 +45,12 @@ struct BlockIndexGenerationSource
     uint256 hashBestChain;                                 // authoritative active-chain tip hash
     bool foundBestChain;                                   // true when hashBestChain was read
 
+    // DAG links from LevelDB (optional, for post-DAG trust computation)
+    std::map<uint256, std::vector<uint256> > dagLinks;     // hash -> parent hashes
+    bool foundDAGLinks;
+
     BlockIndexGenerationSource()
-        : foundBestChain(false)
+        : foundBestChain(false), foundDAGLinks(false)
     {
     }
 };
@@ -59,13 +63,15 @@ struct BlockIndexGenerationStats
     uint64_t sideChainRecords;
     int32_t activeTipHeight;
     uint256 activeTipHash;
+    bool hasDerived;
 
     BlockIndexGenerationStats()
         : totalRecords(0),
           activeRecords(0),
           sideChainRecords(0),
           activeTipHeight(-1),
-          activeTipHash(0)
+          activeTipHash(0),
+          hasDerived(false)
     {
     }
 };
@@ -73,6 +79,7 @@ struct BlockIndexGenerationStats
 // Reads every legacy "blockindex" record from a static LevelDB snapshot
 // directory (NOT the live datadir) and reconstructs the full source required to
 // build a generation. Uses the exact legacy CDiskBlockIndex serialization.
+// Also reads DAG links if present.
 bool ReadLegacyBlockIndexSource(const std::string& snapshotLevelDbDir,
                                 BlockIndexGenerationSource* out,
                                 std::string* error);
@@ -83,8 +90,9 @@ public:
     BlockIndexGenerationBuilder();
 
     // Build a COMPLETE generation at generationDir for the given generation id,
-    // from the given legacy source. On success the MANIFEST is left COMPLETE and
-    // `stats` is populated. Never writes outside generationDir.
+    // from the given legacy source. On success the MANIFEST is COMPLETE and
+    // `stats` is populated. Also produces derived.dat if source data permits.
+    // Never writes outside generationDir.
     bool Build(const BlockIndexGenerationSource& source,
                const std::string& generationDir,
                uint64_t generation,
@@ -98,6 +106,7 @@ private:
     FixedBlockIndexStore store;
     BlockIndexHashIndex hashIndex;
     BlockIndexActiveIndex activeIndex;
+    BlockIndexDerivedStateStore derivedStore;
     bool built;
 };
 
