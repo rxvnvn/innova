@@ -19,6 +19,16 @@
 ColdHotSeamResult GetStakingSourceAuthority(const uint256& hashBlock,
                                             ColdHotSeamSnapshot* out,
                                             std::string* error);
+
+// Caller holds cs_main.  Resolves the usable disk coordinates for a staking
+// source block, checking authority first then the ephemeral materialization
+// overlay.  Falls back to immutable cold-snapshot coordinates when no overlay
+// entry exists.  Returns COLD_HOT_SEAM_OK on successful resolution; sets
+// *availableOut=true and fills nFileOut/nBlockPosOut only when readable
+// positive coordinates are found.
+ColdHotSeamResult GetStakingSourceDiskPositionR(const CWallet& wallet,
+    const uint256& hashBlock, unsigned int* nFileOut,
+    unsigned int* nBlockPosOut, bool* availableOut);
 #include "key.h"
 #include "silentpayments.h"
 #include "keystore.h"

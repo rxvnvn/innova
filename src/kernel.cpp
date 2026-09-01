@@ -1074,27 +1074,30 @@ bool CheckProofOfStake(const CBlockIndex* pindexPrev, const CTransaction& tx, un
                                             nCoinbaseMaturity, nAuthorityDepth));
                 if (wtx.hashBlock != uint256(0))
                 {
-                    // A.9a.3d: resolve the historical source block's disk
-                    // position by-value (retained navigator) so HybridSPV source
-                    // recovery does not require an arbitrary historical
-                    // CBlockIndex to be resident in mapBlockIndex. operator[] is
-                    // never used for inspection. Safe non-inserting find() only
-                    // when no navigator is retained (pre-A.10 fully materialized).
+                    // A.9a.3i: resolve the source block's disk position using
+                    // the same authority-first, overlay-aware path that staking
+                    // selection/generation uses.  GetStakingSourceDiskPositionR
+                    // checks typed source authority, consults the ephemeral
+                    // materialization overlay (where recovered arrival
+                    // coordinates are published), and falls back to immutable
+                    // cold-snapshot coordinates only when no overlay entry
+                    // exists.  This closes the E3 gap where a recovered source
+                    // with frozen nFile=0 was invisible to validation despite
+                    // having correct overlay coordinates.
                     CBlock block;
                     bool fHaveBlock = false;
-                    const ColdHotSeamNavigator* spvNavR = GetBlockIndexStakingNavigator();
-                    if (spvNavR)
+                    unsigned int srcFile = 0, srcBlockPos = 0;
+                    bool srcAvailable = false;
+                    if (GetStakingSourceDiskPositionR(*pwalletMain, wtx.hashBlock,
+                            &srcFile, &srcBlockPos, &srcAvailable) == COLD_HOT_SEAM_OK
+                        && srcAvailable)
                     {
-                        std::string err;
-                        ColdHotSeamSnapshot src;
-                        if (spvNavR->ResolveLogicalR(BlockIndexLogicalId(wtx.hashBlock), &src, &err) == COLD_HOT_SEAM_OK)
-                            fHaveBlock = block.ReadFromDisk(src.snapshot.nFile, src.snapshot.nBlockPos, true);
-                    }
-                    else
-                    {
-                        std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(wtx.hashBlock);
-                        if (mi != mapBlockIndex.end())
-                            fHaveBlock = block.ReadFromDisk(mi->second, true);
+                        fHaveBlock = block.ReadFromDisk(srcFile, srcBlockPos, true);
+                        if (fHaveBlock && block.GetHash() != wtx.hashBlock)
+                        {
+                            pwalletMain->InvalidateStakingMaterialization(wtx.hashBlock);
+                            fHaveBlock = false;
+                        }
                     }
                     if (fHaveBlock)
                     {

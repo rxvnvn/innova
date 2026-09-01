@@ -2663,6 +2663,333 @@ BOOST_FIXTURE_TEST_CASE(a9a3h_materialization_overlay_is_bounded, ProdFixture)
         mapArgs.erase("-spvutxocachesize");
 }
 
+// A.9a.3i E3 CAUSAL RED: an active COLD source with frozen nFile=0 in the
+// navigator snapshot.  Without the materialization overlay, real
+// CheckProofOfStake fails because the frozen snapshot coordinates are
+// unreadable.  After the overlay publishes the real disk coordinates,
+// CheckProofOfStake succeeds -- proving the validation consumer now reads
+// through the same authority-first overlay-aware resolution used by
+// selection/generation.
+//
+// This is the decisive E3 boundary that A.9a.3h failed to cross.
+BOOST_FIXTURE_TEST_CASE(a9a3i_overlay_recovery_passes_checkproofofstake, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
+    unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
+    fHybridSPV = true; nCoinbaseMaturity = 10; nStakeMinAge = 0;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
+    CNode peer(INVALID_SOCKET, StakePeerAddress(8711), "a9a3i-validation-arrival", true);
+    bool peerAdded = false;
+    try
+    {
+        PrepareHybridSpvRealSource(*this, &src);
+        // The synthetic HybridSPV helper intentionally creates a vin-less
+        // source tx for kernel-only tests.  Real block arrival requires a
+        // structurally valid non-coinbase transaction, so rebuild that tx and
+        // propagate its identity through the wallet/coinstake fixture.
+        src.srcTx.vin.push_back(CTxIn(COutPoint(uint256(0xBEEF), 0)));
+        src.srcTxHash = src.srcTx.GetHash();
+        src.blockFrom.vtx[0] = src.srcTx;
+        src.coinstake.vin[0].prevout = COutPoint(src.srcTxHash, 0);
+        src.wtx = CWalletTx(pwalletMain, src.srcTx);
+        // Make the delivered source block structurally valid for the real
+        // ProcessMessage("block") path, then rewrite the exact bytes at the
+        // same coordinates used by the fixture.
+        CTransaction coinbase;
+        coinbase.nTime = src.srcTx.nTime;
+        coinbase.vin.resize(1);
+        coinbase.vin[0].prevout.SetNull();
+        coinbase.vin[0].scriptSig = CScript() << OP_0 << OP_1;
+        coinbase.vout.push_back(CTxOut(0, CScript() << OP_TRUE));
+        src.blockFrom.vtx.insert(src.blockFrom.vtx.begin(), coinbase);
+        src.blockFrom.hashMerkleRoot = src.blockFrom.BuildMerkleTree();
+        while (!CheckProofOfWork(src.blockFrom.GetPoWHash(), src.blockFrom.nBits))
+            src.blockFrom.nNonce++;
+        {
+            LOCK(cs_main);
+            BOOST_REQUIRE(src.blockFrom.WriteToDisk(src.nFile, src.nBlockPos));
+        }
+        src.sourceBlockHash = src.blockFrom.GetHash();
+        BOOST_REQUIRE(src.blockFrom.CheckBlock());
+        BOOST_REQUIRE(src.blockFrom.GetHash() == src.sourceBlockHash);
+        src.wtx.hashBlock = src.sourceBlockHash;
+        src.wtx.nIndex = 1;
+        src.wtx.vMerkleBranch = src.blockFrom.GetMerkleBranch(1);
+        srcOverriddenHash = src.sourceBlockHash;
+        merkleRootOverride[2] = src.blockFrom.hashMerkleRoot;
+        nBitsOverride[2] = src.blockFrom.nBits;
+        nTimeOverride[2] = src.blockFrom.nTime;
+        // Freeze the navigator snapshot: nFile=0 means "not yet materialized".
+        // The real block bytes were already written to disk by
+        // PrepareHybridSpvRealSource at src.nFile/src.nBlockPos.
+        nFileOverride[2] = 0;
+        nBlockPosOverride[2] = 0;
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+
+        // Precondition: source block absent from mapBlockIndex (cold-only).
+        BOOST_CHECK_MESSAGE(mapBlockIndex.count(src.sourceBlockHash) == 0,
+            "source must remain cold-only (absent from mapBlockIndex)");
+
+        // Precondition: navigator resolves as active COLD with frozen nFile=0.
+        {
+            std::string e;
+            ColdHotSeamSnapshot snap;
+            const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+            BOOST_REQUIRE(nav != NULL);
+            BOOST_CHECK(nav->ResolveLogicalR(
+                BlockIndexLogicalId(src.sourceBlockHash), &snap, &e) == COLD_HOT_SEAM_OK);
+            BOOST_CHECK(snap.ref.IsCold());
+            BOOST_CHECK_EQUAL(snap.snapshot.nFile, 0U);
+            BOOST_CHECK_EQUAL(snap.snapshot.nBlockPos, 0U);
+        }
+
+        // Precondition: typed authority (maturity, seam, merkle) passes.
+        {
+            std::string e; int depth = 0;
+            const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+            BOOST_CHECK(nav->GetHybridSvmMaturityAuthorityR(
+                BlockIndexLogicalId(src.wtx.hashBlock), src.wtx.GetHash(),
+                src.wtx.vMerkleBranch, src.wtx.nIndex, &depth, &e) == COLD_HOT_SEAM_OK);
+            BOOST_CHECK_EQUAL(depth, 18);
+        }
+
+        // Precondition: kernel time fixture passes.
+        BOOST_REQUIRE(FindPassingStakeTime(pindexBest, src.blockFrom,
+            src.srcTx, src.srcTxHash, &src.coinstake.nTime));
+        BOOST_CHECK(VerifySignature(src.srcTx, src.coinstake,
+            0, SCRIPT_VERIFY_NONE, 0));
+        {
+            uint256 hp, tp;
+            const unsigned int nTxPrevOffset =
+                ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+                (2 * GetSizeOfCompactSize(0)) +
+                GetSizeOfCompactSize(src.blockFrom.vtx.size());
+            BOOST_CHECK(CheckStakeKernelHash(pindexBest, src.blockFrom.nBits,
+                src.blockFrom, nTxPrevOffset, src.srcTx,
+                COutPoint(src.srcTxHash, 0), src.coinstake.nTime, hp, tp, false));
+        }
+
+        // Precondition: no materialization overlay yet.
+        StakingMaterializationInfo info;
+        BOOST_CHECK(!pwalletMain->GetStakingMaterialization(src.sourceBlockHash, &info));
+
+        // Add the both-false SPV candidate so production selection owns the
+        // request/recovery transition (as in the existing real-arrival test).
+        SPVUtxo candidate;
+        candidate.txhash = src.srcTxHash; candidate.n = 0;
+        candidate.nValue = src.srcTx.vout[0].nValue;
+        candidate.nHeight = 2; candidate.hashBlock = src.sourceBlockHash;
+        candidate.nTime = src.srcTx.nTime;
+        candidate.fHaveBlock = false; candidate.fVerified = false;
+        candidate.scriptPubKey = src.srcTx.vout[0].scriptPubKey;
+        {
+            LOCK(pwalletMain->cs_spvutxos);
+            pwalletMain->mapSPVUtxos[COutPoint(src.srcTxHash, 0)] = candidate;
+        }
+
+        // WITHOUT overlay: CheckProofOfStake must fail (frozen nFile=0 is
+        // unreadable and no overlay coordinates exist).  The wallet tx is
+        // inserted only for this validation boundary, not for request setup.
+        pwalletMain->mapWallet[src.srcTxHash] = src.wtx;
+        pwalletMain->mapWallet[src.srcTxHash].BindWallet(pwalletMain);
+        BOOST_CHECK_MESSAGE(
+            !RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits),
+            "CheckProofOfStake must reject when overlay is absent and snapshot nFile=0");
+
+        // Establish the production request path before real arrival.
+        peer.fSuccessfullyConnected = true;
+        peer.nVersion = PROTOCOL_VERSION;
+        AddStakingPeer(&peer); peerAdded = true;
+        uint64_t nMin = 0, nMax = 0, nWeight = 0;
+        BOOST_CHECK(!pwalletMain->GetStakeWeight(*pwalletMain, nMin, nMax, nWeight));
+        StakingMaterializationInfo requested;
+        BOOST_REQUIRE(pwalletMain->GetStakingMaterialization(src.sourceBlockHash, &requested));
+        BOOST_CHECK(requested.pending);
+        BOOST_CHECK_EQUAL(requested.nRequestCount, 1U);
+        RemoveStakingPeer(&peer); peerAdded = false;
+
+        // Deliver through the REAL block receive path.  This validates the
+        // request -> arrival -> overlay publication lifecycle rather than
+        // directly publishing test-only coordinates.
+        DeliverFullBlock(peer, src.blockFrom);
+        {
+            StakingMaterializationInfo arrived;
+            BOOST_REQUIRE(pwalletMain->GetStakingMaterialization(
+                src.sourceBlockHash, &arrived));
+            BOOST_CHECK(arrived.available);
+            BOOST_CHECK(!arrived.pending);
+            BOOST_CHECK(arrived.nFile > 0);
+        }
+
+        // WITH overlay: CheckProofOfStake must succeed.  This is the
+        // decisive E3 boundary that A.9a.3h failed to cross.
+        BOOST_CHECK_MESSAGE(
+            RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits),
+            "CheckProofOfStake must succeed after overlay publishes real coordinates");
+
+        // Verify: mapBlockIndex still absent (no historical index created).
+        BOOST_CHECK(mapBlockIndex.count(src.sourceBlockHash) == 0);
+
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+    }
+    catch (...)
+    {
+        if (peerAdded) RemoveStakingPeer(&peer);
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity;
+        nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+        throw;
+    }
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity;
+    nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+}
+
+// A.9a.3i negative E: active authority + overlay coordinates whose block hash
+// does not match wtx.hashBlock must be rejected.  The new code in kernel.cpp
+// verifies block.GetHash() == wtx.hashBlock after ReadFromDisk and
+// invalidates the stale overlay entry on mismatch.
+BOOST_FIXTURE_TEST_CASE(a9a3i_overlay_wrong_hash_rejected_at_validation, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
+    unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
+    fHybridSPV = true; nCoinbaseMaturity = 10; nStakeMinAge = 0;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
+    try
+    {
+        PrepareHybridSpvRealSource(*this, &src);
+        nFileOverride[2] = 0;
+        nBlockPosOverride[2] = 0;
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+
+        BOOST_REQUIRE(mapBlockIndex.count(src.sourceBlockHash) == 0);
+
+        // Authority passes.
+        {
+            std::string e; int depth = 0;
+            const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+            BOOST_REQUIRE(nav != NULL);
+            BOOST_REQUIRE(nav->GetHybridSvmMaturityAuthorityR(
+                BlockIndexLogicalId(src.wtx.hashBlock), src.wtx.GetHash(),
+                src.wtx.vMerkleBranch, src.wtx.nIndex, &depth, &e) == COLD_HOT_SEAM_OK);
+        }
+
+        BOOST_REQUIRE(FindPassingStakeTime(pindexBest, src.blockFrom,
+            src.srcTx, src.srcTxHash, &src.coinstake.nTime));
+
+        pwalletMain->mapWallet[src.srcTxHash] = src.wtx;
+        pwalletMain->mapWallet[src.srcTxHash].BindWallet(pwalletMain);
+
+        // Write a DIFFERENT block to disk and publish its coordinates as if
+        // they were the source block's materialization.  ReadFromDisk will
+        // succeed but block.GetHash() != wtx.hashBlock -> reject.
+        CBlock dummyBlock;
+        dummyBlock.nVersion = 1;
+        dummyBlock.hashPrevBlock = Hash(999);
+        dummyBlock.nTime = 9999;
+        dummyBlock.nBits = 0x207fffff;
+        dummyBlock.nNonce = 7;
+        while (!CheckProofOfWork(dummyBlock.GetPoWHash(), dummyBlock.nBits))
+            dummyBlock.nNonce++;
+        unsigned int dummyFile = 0, dummyPos = 0;
+        BOOST_REQUIRE(dummyBlock.WriteToDisk(dummyFile, dummyPos));
+        BOOST_REQUIRE(dummyBlock.GetHash() != src.sourceBlockHash);
+
+        pwalletMain->PublishStakingMaterialization(
+            src.sourceBlockHash, dummyFile, dummyPos);
+
+        // Must reject: overlay points to a block with wrong hash.
+        BOOST_CHECK_MESSAGE(
+            !RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits),
+            "CheckProofOfStake must reject overlay coordinates with wrong block hash");
+
+        // The overlay entry should have been invalidated by the hash mismatch.
+        StakingMaterializationInfo after;
+        BOOST_REQUIRE(pwalletMain->GetStakingMaterialization(src.sourceBlockHash, &after));
+        BOOST_CHECK(!after.available);
+
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+    }
+    catch (...)
+    {
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity;
+        nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+        throw;
+    }
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity;
+    nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+}
+
+// A.9a.3i negative F: active authority + overlay coordinates that point to
+// unreadable/non-existent disk locations must be rejected.  ReadFromDisk
+// fails, fHaveBlock stays false, and validation falls through to rejection.
+BOOST_FIXTURE_TEST_CASE(a9a3i_overlay_unreadable_coords_rejected_at_validation, ProdFixture)
+{
+    const bool saveSPV = fHybridSPV;
+    const int saveMaturity = nCoinbaseMaturity;
+    const unsigned int saveMinAge = nStakeMinAge;
+    unsigned int saveI = nModifierInterval, saveS = nTargetSpacing;
+    fHybridSPV = true; nCoinbaseMaturity = 10; nStakeMinAge = 0;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    HybridSpvRealSourceFixture src;
+    try
+    {
+        PrepareHybridSpvRealSource(*this, &src);
+        nFileOverride[2] = 0;
+        nBlockPosOverride[2] = 0;
+        Setup();
+        RetainNavigator();
+        LOCK(cs_main);
+
+        BOOST_REQUIRE(mapBlockIndex.count(src.sourceBlockHash) == 0);
+
+        {
+            std::string e; int depth = 0;
+            const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+            BOOST_REQUIRE(nav != NULL);
+            BOOST_REQUIRE(nav->GetHybridSvmMaturityAuthorityR(
+                BlockIndexLogicalId(src.wtx.hashBlock), src.wtx.GetHash(),
+                src.wtx.vMerkleBranch, src.wtx.nIndex, &depth, &e) == COLD_HOT_SEAM_OK);
+        }
+
+        BOOST_REQUIRE(FindPassingStakeTime(pindexBest, src.blockFrom,
+            src.srcTx, src.srcTxHash, &src.coinstake.nTime));
+
+        pwalletMain->mapWallet[src.srcTxHash] = src.wtx;
+        pwalletMain->mapWallet[src.srcTxHash].BindWallet(pwalletMain);
+
+        // Publish overlay with non-existent coordinates.
+        pwalletMain->PublishStakingMaterialization(
+            src.sourceBlockHash, 99, 99999);
+
+        // Must reject: ReadFromDisk fails at non-existent coordinates.
+        BOOST_CHECK_MESSAGE(
+            !RunCheckProofOfStake(src.coinstake, pindexBest, src.blockFrom.nBits),
+            "CheckProofOfStake must reject unreadable overlay coordinates");
+
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+    }
+    catch (...)
+    {
+        pwalletMain->mapWallet.erase(src.srcTxHash);
+        fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity;
+        nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+        throw;
+    }
+    fHybridSPV = saveSPV; nCoinbaseMaturity = saveMaturity;
+    nStakeMinAge = saveMinAge; nModifierInterval = saveI; nTargetSpacing = saveS;
+}
+
 } // namespace (A.9a.3g helpers)
 
 BOOST_AUTO_TEST_SUITE_END()

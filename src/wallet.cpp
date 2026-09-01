@@ -148,7 +148,49 @@ static bool GetTransparentStakingBalance(const CWallet& wallet,
     return true;
 }
 
-static ColdHotSeamResult GetStakingSourceDiskPositionR(const CWallet& wallet,
+static bool GetStakingTxIndex(const CWallet& wallet, CTxDB& txdb,
+    const CWalletTx& wtx, CTxIndex* txindexOut)
+{
+    if (!txindexOut)
+        return false;
+    AssertLockHeld(cs_main);
+    if (txdb.ReadTxIndex(wtx.GetHash(), *txindexOut))
+        return true;
+    if (!fHybridSPV || wtx.hashBlock == uint256(0))
+        return false;
+
+    unsigned int nFile = 0, nBlockPos = 0;
+    bool available = false;
+    if (GetStakingSourceDiskPositionR(wallet, wtx.hashBlock,
+            &nFile, &nBlockPos, &available) != COLD_HOT_SEAM_OK || !available)
+        return false;
+
+    CBlock block;
+    if (!block.ReadFromDisk(nFile, nBlockPos, true) ||
+        block.GetHash() != wtx.hashBlock)
+        return false;
+
+    unsigned int nTxPos = nBlockPos +
+        ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+        (2 * GetSizeOfCompactSize(0)) +
+        GetSizeOfCompactSize(block.vtx.size());
+    for (std::vector<CTransaction>::const_iterator it = block.vtx.begin();
+         it != block.vtx.end(); ++it)
+    {
+        if (it->GetHash() == wtx.GetHash())
+        {
+            *txindexOut = CTxIndex(CDiskTxPos(nFile, nBlockPos, nTxPos),
+                                   it->vout.size());
+            return true;
+        }
+        nTxPos += ::GetSerializeSize(*it, SER_DISK, CLIENT_VERSION);
+    }
+    return false;
+}
+
+} // namespace
+
+ColdHotSeamResult GetStakingSourceDiskPositionR(const CWallet& wallet,
     const uint256& hashBlock, unsigned int* nFileOut,
     unsigned int* nBlockPosOut, bool* availableOut)
 {
@@ -201,48 +243,6 @@ static ColdHotSeamResult GetStakingSourceDiskPositionR(const CWallet& wallet,
     }
     return COLD_HOT_SEAM_OK;
 }
-
-static bool GetStakingTxIndex(const CWallet& wallet, CTxDB& txdb,
-    const CWalletTx& wtx, CTxIndex* txindexOut)
-{
-    if (!txindexOut)
-        return false;
-    AssertLockHeld(cs_main);
-    if (txdb.ReadTxIndex(wtx.GetHash(), *txindexOut))
-        return true;
-    if (!fHybridSPV || wtx.hashBlock == uint256(0))
-        return false;
-
-    unsigned int nFile = 0, nBlockPos = 0;
-    bool available = false;
-    if (GetStakingSourceDiskPositionR(wallet, wtx.hashBlock,
-            &nFile, &nBlockPos, &available) != COLD_HOT_SEAM_OK || !available)
-        return false;
-
-    CBlock block;
-    if (!block.ReadFromDisk(nFile, nBlockPos, true) ||
-        block.GetHash() != wtx.hashBlock)
-        return false;
-
-    unsigned int nTxPos = nBlockPos +
-        ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
-        (2 * GetSizeOfCompactSize(0)) +
-        GetSizeOfCompactSize(block.vtx.size());
-    for (std::vector<CTransaction>::const_iterator it = block.vtx.begin();
-         it != block.vtx.end(); ++it)
-    {
-        if (it->GetHash() == wtx.GetHash())
-        {
-            *txindexOut = CTxIndex(CDiskTxPos(nFile, nBlockPos, nTxPos),
-                                   it->vout.size());
-            return true;
-        }
-        nTxPos += ::GetSerializeSize(*it, SER_DISK, CLIENT_VERSION);
-    }
-    return false;
-}
-
-} // namespace
 
 ColdHotSeamResult GetStakingSourceAuthority(const uint256& hashBlock,
                                             ColdHotSeamSnapshot* out,
