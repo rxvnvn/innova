@@ -294,13 +294,24 @@ int main(int argc, char** argv)
 
     if (argc < 4)
     {
-        fprintf(stderr, "usage: %s <snapshot_leveldb_dir> <out_generation_dir> <generation_id> [verify-only]\n", argv[0]);
+        fprintf(stderr, "usage: %s <snapshot_leveldb_dir> <out_generation_dir> <generation_id> [verify-only] [--block-data-dir <dir>]\n", argv[0]);
         return 2;
     }
     const std::string snapshotDir = argv[1];
     const std::string outDir = argv[2];
     const uint64_t generation = (uint64_t)atoll(argv[3]);
     const bool verifyOnly = (argc >= 5 && std::string(argv[4]) == "verify-only");
+
+    // Parse optional --block-data-dir argument (for exact nSize computation)
+    std::string blockDataDir;
+    for (int i = 4; i < argc; ++i)
+    {
+        if (std::string(argv[i]) == "--block-data-dir" && i + 1 < argc)
+        {
+            blockDataDir = argv[i + 1];
+            break;
+        }
+    }
 
     // 1) read source
     BlockIndexGenerationSource source;
@@ -309,6 +320,25 @@ int main(int argc, char** argv)
     {
         fprintf(stderr, "ERROR reading snapshot: %s\n", error.c_str());
         return 4;
+    }
+    // A.10.1b-fix3 C3: Load DAG links and scores from LevelDB snapshot
+    if (!ReadDAGLinksFromSnapshot(snapshotDir, &source.dagLinks, &source.dagScores, &error))
+    {
+        fprintf(stderr, "WARNING: DAG data not loaded (continuing without DAG trust): %s\n", error.c_str());
+        // Non-fatal: some snapshots may not have DAG data
+    }
+    else
+    {
+        source.foundDAGLinks = !source.dagLinks.empty();
+        printf("[DAG] loaded %llu DAG link entries, %llu DAG score entries\n",
+               (unsigned long long)source.dagLinks.size(),
+               (unsigned long long)source.dagScores.size());
+    }
+    // A.10.1b-fix3 C1: Wire block data directory for exact nSize
+    if (!blockDataDir.empty())
+    {
+        source.blockDataDir = blockDataDir;
+        printf("[BLOCK-DATA] blockDataDir=%s\n", blockDataDir.c_str());
     }
     printf("[SOURCE] records=%llu found_best=%s best=%s\n",
            (unsigned long long)source.records.size(),

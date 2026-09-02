@@ -99,6 +99,16 @@ bool ReadDAGLinksFromSnapshot(const std::string& snapshotLevelDbDir,
                               std::map<uint256, uint256>* dagScores,
                               std::string* error);
 
+// A.10.1b-fix3 C3: Reconstruct canonical DAG scores using production ColorBlock
+// semantics. Populates canonicalScores with the nDAGScore that production
+// RebuildDAGOrder would compute for each post-DAG PoW block.
+bool ReconstructCanonicalDAGScores(
+    const std::vector<std::pair<int32_t, uint256>>& heightSorted,
+    const std::map<uint256, const BlockIndexRecord*>& recordByHash,
+    const std::map<uint256, std::vector<uint256>>& dagLinks,
+    std::map<uint256, uint256>* canonicalScores,
+    std::string* error);
+
 class BlockIndexGenerationBuilder
 {
 public:

@@ -31,6 +31,149 @@ static void ClearError(std::string* error)
 
 } // namespace
 
+// A.10.1b-fix3 C3: Reconstruct canonical DAG scores using production ColorBlock
+// semantics. This calls the same CDAGManager::ColorBlock that production
+// RebuildDAGOrder uses, ensuring the builder's persisted chainTrust is exactly
+// the value that normal startup would establish.
+//
+// Approach: temporarily populate mapBlockIndex and g_dagManager with source
+// records and DAG links, call ColorBlock for each post-DAG PoW block in height
+// order, read the canonical nDAGScore, then restore global state.
+bool ReconstructCanonicalDAGScores(
+    const std::vector<std::pair<int32_t, uint256>>& heightSorted,
+    const std::map<uint256, const BlockIndexRecord*>& recordByHash,
+    const std::map<uint256, std::vector<uint256>>& dagLinks,
+    std::map<uint256, uint256>* canonicalScores,
+    std::string* error)
+{
+    if (!canonicalScores)
+        return false;
+
+    // Save global state
+    std::map<uint256, CBlockIndex*> savedMapBlockIndex;
+    savedMapBlockIndex.swap(mapBlockIndex);
+    g_dagManager.ClearDAGDataForTest();
+
+    // Track allocations for cleanup
+    std::vector<uint256*> allocatedHashes;
+    std::vector<CBlockIndex*> allocatedIndices;
+
+    bool ok = false;
+    {
+        // Build CBlockIndex objects and populate mapBlockIndex
+        std::map<uint256, CBlockIndex*> localIndex;
+        for (size_t i = 0; i < heightSorted.size(); ++i)
+        {
+            const uint256& hash = heightSorted[i].second;
+            std::map<uint256, const BlockIndexRecord*>::const_iterator rit = recordByHash.find(hash);
+            if (rit == recordByHash.end())
+                continue;
+            const BlockIndexRecord* rec = rit->second;
+
+            uint256* phash = new uint256(hash);
+            allocatedHashes.push_back(phash);
+
+            CBlockIndex* pindex = new CBlockIndex();
+            allocatedIndices.push_back(pindex);
+
+            pindex->phashBlock = phash;
+            pindex->nHeight = rec->height;
+            pindex->nBits = rec->nBits;
+            pindex->nTime = rec->nTime;
+            pindex->nVersion = rec->nVersion;
+
+            // Set PoW/PoS flags
+            pindex->nFlags = 0;
+            if (rec->prevoutStake.hash != uint256(0))
+                pindex->nFlags |= BLOCK_PROOF_OF_STAKE;
+
+            // Set parent pointer
+            if (rec->hashPrev != uint256(0))
+            {
+                std::map<uint256, CBlockIndex*>::iterator pit = localIndex.find(rec->hashPrev);
+                if (pit != localIndex.end())
+                    pindex->pprev = pit->second;
+            }
+
+            // Set nChainTrust for pre-DAG parents (linear trust)
+            uint256 parentTrust = 0;
+            if (pindex->pprev)
+                parentTrust = pindex->pprev->nChainTrust;
+            CBigNum bnTarget;
+            bnTarget.SetCompact(rec->nBits);
+            uint256 blockTrust = 0;
+            if (bnTarget > 0 && (rec->height < GetForkHeightDAG() || !(rec->prevoutStake.hash != uint256(0))))
+                blockTrust = ((CBigNum(1) << 256) / (bnTarget + 1)).getuint256();
+            pindex->nChainTrust = parentTrust + blockTrust;
+
+            localIndex[hash] = pindex;
+            mapBlockIndex[hash] = pindex;
+        }
+
+        // Populate g_dagManager with DAG links (without scores)
+        for (std::map<uint256, std::vector<uint256>>::const_iterator it = dagLinks.begin();
+             it != dagLinks.end(); ++it)
+        {
+            CBlockDAGData data;
+            data.vDAGParents = it->second;
+            data.fBlue = false;
+            data.nDAGScore = 0;
+            data.nDAGOrder = -1;
+            g_dagManager.SetDAGDataForTest(it->first, data);
+        }
+
+        // Call ColorBlock for each post-DAG PoW block in height order
+        for (size_t i = 0; i < heightSorted.size(); ++i)
+        {
+            const uint256& hash = heightSorted[i].second;
+            std::map<uint256, const BlockIndexRecord*>::const_iterator rit = recordByHash.find(hash);
+            if (rit == recordByHash.end())
+                continue;
+            const BlockIndexRecord* rec = rit->second;
+
+            // Only post-DAG PoW blocks get DAG coloring
+            if (rec->height < GetForkHeightDAG())
+                continue;
+            if (rec->prevoutStake.hash != uint256(0))
+                continue; // PoS block
+
+            std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
+            if (mi == mapBlockIndex.end())
+                continue;
+
+            // Use ColorBlockDAGKnight for blocks at/above FORK_HEIGHT_DAGKNIGHT
+            if (rec->height >= GetForkHeightDAGKnight())
+                g_dagManager.ColorBlockDAGKnight(mi->second);
+            else
+                g_dagManager.ColorBlock(mi->second);
+        }
+
+        // Read canonical nDAGScore from g_dagManager
+        for (size_t i = 0; i < heightSorted.size(); ++i)
+        {
+            const uint256& hash = heightSorted[i].second;
+            CBlockDAGData data;
+            if (g_dagManager.GetDAGData(hash, data) && data.nDAGScore != 0)
+                (*canonicalScores)[hash] = data.nDAGScore;
+        }
+
+        ok = true;
+    }
+
+    // Cleanup allocated objects
+    for (size_t i = 0; i < allocatedIndices.size(); ++i)
+        delete allocatedIndices[i];
+    for (size_t i = 0; i < allocatedHashes.size(); ++i)
+        delete allocatedHashes[i];
+
+    // Restore global state
+    mapBlockIndex.swap(savedMapBlockIndex);
+    g_dagManager.ClearDAGDataForTest();
+
+    return ok;
+}
+
+
 bool ReadLegacyBlockIndexSource(const std::string& snapshotLevelDbDir,
                                 BlockIndexGenerationSource* out,
                                 std::string* error)
@@ -353,6 +496,19 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
     for (size_t i = 0; i < ordered.size(); ++i)
         recordByHash[ordered[i].hash] = &ordered[i].record;
 
+    // A.10.1b-fix3: Fail closed for disconnected topology.
+    // A non-genesis record with nonzero hashPrev whose parent is absent from
+    // the source would silently receive zero parent trust/checksum/time.
+    // An authoritative generation must represent a coherent snapshot.
+    for (size_t i = 0; i < ordered.size(); ++i)
+    {
+        const BlockIndexRecord& rec = ordered[i].record;
+        if (rec.hashPrev != uint256(0) && recordByHash.find(rec.hashPrev) == recordByHash.end())
+            return SetError(error, "authoritative generation: record " +
+                            ordered[i].hash.GetHex() + " has disconnected parent " +
+                            rec.hashPrev.GetHex());
+    }
+
     // Height-sorted vector for sequential computation
     std::vector<std::pair<int32_t, uint256> > heightSorted;
     for (size_t i = 0; i < ordered.size(); ++i)
@@ -414,15 +570,30 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             // Post-DAG PoS: trust = 0
         }
         dc.chainTrust = parentTrust + blockTrust;
+    }
 
-        // A.10.1b-fix2 C3: Apply canonical post-DAG trust.
-        // For post-DAG PoW blocks with persisted DAG score, overwrite linear
-        // trust with nDAGScore. This matches RestoreDAGTrustIntoChainTrust
-        // semantics exactly.
+    // A.10.1b-fix3 C3: Reconstruct canonical DAG scores using production
+    // ColorBlock semantics. This replaces the prior approach of blindly copying
+    // source.dagScores (persisted nDAGScore from LevelDB snapshot).
+    std::map<uint256, uint256> canonicalDAGScores;
+    if (!source.dagLinks.empty())
+    {
+        if (!ReconstructCanonicalDAGScores(heightSorted, recordByHash, source.dagLinks,
+                                           &canonicalDAGScores, error))
+            return false;
+    }
+
+    // Apply canonical DAG trust for post-DAG PoW blocks
+    for (size_t i = 0; i < heightSorted.size(); ++i)
+    {
+        const uint256& hash = heightSorted[i].second;
+        const BlockIndexRecord* rec = recordByHash[hash];
+        DerivedComputed& dc = derivedByHash[hash];
+
         if (rec->height >= GetForkHeightDAG() && !(rec->prevoutStake.hash != uint256(0)))
         {
-            std::map<uint256, uint256>::const_iterator dit = source.dagScores.find(hash);
-            if (dit != source.dagScores.end() && dit->second != 0)
+            std::map<uint256, uint256>::const_iterator dit = canonicalDAGScores.find(hash);
+            if (dit != canonicalDAGScores.end() && dit->second != 0)
                 dc.chainTrust = dit->second;
         }
 
@@ -483,8 +654,18 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
                     CAutoFile filein(blockFile, SER_DISK, CLIENT_VERSION);
                     try {
                         filein >> block;
-                        dc.nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
-                        dc.hasBlockSize = (dc.nSize > 0);
+                        // A.10.1b-fix3 C1: Verify block identity before accepting nSize
+                        if (block.GetHash() == rec->hash)
+                        {
+                            dc.nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
+                            dc.hasBlockSize = (dc.nSize > 0);
+                        }
+                        else
+                        {
+                            // Block identity mismatch: wrong block at coordinates
+                            dc.nSize = 0;
+                            dc.hasBlockSize = false;
+                        }
                     }
                     catch (std::exception& e)
                     {
@@ -516,6 +697,31 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
 
         derivedByHash[hash] = dc;
     }
+
+    // A.10.1b-fix3: Compute DAG input digest at outer scope for manifest persistence
+    unsigned char dagInputDigest[32];
+    {
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        // A.10.1b-fix3: Commit to actual DAG reconstruction inputs (parent links),
+        // not just output scores. Production RebuildDAGOrder uses vDAGParents to
+        // reconstruct canonical DAG trust. The hash-sorted (hash, parentHashes)
+        // pairs are the semantic inputs that determine nDAGScore.
+        for (std::map<uint256, std::vector<uint256> >::const_iterator it = source.dagLinks.begin();
+             it != source.dagLinks.end(); ++it)
+        {
+            SHA256_Update(&ctx, it->first.begin(), 32); // block hash
+            // Commit to parent count + each parent hash
+            uint32_t parentCount = (uint32_t)it->second.size();
+            SHA256_Update(&ctx, &parentCount, 4);
+            for (size_t p = 0; p < it->second.size(); ++p)
+                SHA256_Update(&ctx, it->second[p].begin(), 32);
+        }
+        SHA256_Final(dagInputDigest, &ctx);
+    }
+
+    // A.10.1b-fix3 C1: capability decided inside derived block, used below
+    uint32_t generationCapability = BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
 
     // Create derived.dat and emit entries in RecordId order
     // A.10.1b-fix2 C2: Use placeholder binding initially; will be replaced
@@ -612,6 +818,7 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         }
 
         // Hashindex digest: SHA256 of all (hash, RecordId) pairs in RecordId order
+        // A.10.1b-fix3: use 8-byte LE RecordId to match active hashindex codec
         unsigned char hashIndexDigest[32];
         {
             SHA256_CTX ctx;
@@ -620,43 +827,59 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             {
                 // Hash: 32 raw bytes
                 SHA256_Update(&ctx, appended[i].first.begin(), 32);
-                // RecordId: 4 bytes LE
-                unsigned char idBuf[4];
+                // RecordId: 8 bytes LE (matching BLOCK_INDEX_HASH_VALUE_SIZE)
+                unsigned char idBuf[8];
                 BlockIndexId id = appended[i].second;
-                idBuf[0] = (unsigned char)(id & 0xff);
-                idBuf[1] = (unsigned char)((id >> 8) & 0xff);
-                idBuf[2] = (unsigned char)((id >> 16) & 0xff);
-                idBuf[3] = (unsigned char)((id >> 24) & 0xff);
-                SHA256_Update(&ctx, idBuf, 4);
+                for (int b = 0; b < 8; ++b)
+                    idBuf[b] = (unsigned char)((id >> (8 * b)) & 0xff);
+                SHA256_Update(&ctx, idBuf, 8);
             }
             SHA256_Final(hashIndexDigest, &ctx);
         }
 
-        // DAG input digest: SHA256 of all DAG link entries in hash order
-        unsigned char dagInputDigest[32];
+        // Compute generation root (dagInputDigest from outer scope)
+        // The content binding depends on capability:
+        // - AUTHORITATIVE: full generation root (requires block data)
+        // - OLD_SHADOW: simple metadata binding
+        bool allBlockSizeAvailable = true;
+        for (size_t i = 0; i < ordered.size(); ++i)
         {
-            SHA256_CTX ctx;
-            SHA256_Init(&ctx);
-            for (std::map<uint256, uint256>::const_iterator it = source.dagScores.begin();
-                 it != source.dagScores.end(); ++it)
+            std::map<uint256, DerivedComputed>::iterator dit = derivedByHash.find(ordered[i].hash);
+            if (dit == derivedByHash.end() || !dit->second.hasBlockSize)
             {
-                SHA256_Update(&ctx, it->first.begin(), 32);
-                SHA256_Update(&ctx, it->second.begin(), 32);
+                allBlockSizeAvailable = false;
+                break;
             }
-            SHA256_Final(dagInputDigest, &ctx);
         }
 
-        // Compute generation root
-        unsigned char generationRoot[32];
-        ComputeGenerationRoot(generation, tipHash, totalRecords,
-                              recordsDigest, activeDigest, hashIndexDigest,
-                              derivedEntriesDigest, dagInputDigest, generationRoot);
-
-        // Update derived header with generation root
-        derivedStore.SetContentBinding(generationRoot);
+        if (!source.blockDataDir.empty() && allBlockSizeAvailable)
+        {
+            // AUTHORITATIVE: use full generation root as content binding
+            unsigned char generationRoot[32];
+            ComputeGenerationRoot(generation, tipHash, totalRecords,
+                                  recordsDigest, activeDigest, hashIndexDigest,
+                                  derivedEntriesDigest, dagInputDigest, generationRoot);
+            derivedStore.SetContentBinding(generationRoot);
+        }
+        else
+        {
+            // OLD_SHADOW: use simple metadata binding
+            unsigned char shadowBinding[32];
+            ComputeDerivedContentBinding(tipHash, totalRecords, generation, shadowBinding);
+            derivedStore.SetContentBinding(shadowBinding);
+        }
 
         if (!derivedStore.Finalize(error))
             return false;
+
+        // Remember capability for manifest below
+        generationCapability = (!source.blockDataDir.empty() && allBlockSizeAvailable)
+            ? BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE
+            : BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
+
+        // If AUTHORITATIVE was requested but nSize missing, fail closed
+        if (!source.blockDataDir.empty() && !allBlockSizeAvailable)
+            return SetError(error, "authoritative generation requires mandatory nSize for all records");
     }
 
     FixedBlockIndexManifest manifest = store.GetManifest();
@@ -665,15 +888,16 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
     manifest.committedTipId = tipId;
     manifest.committedTipHeight = tipHeight;
     manifest.committedTipHash = tipHash;
-    // A.10.1b-fix2: Set explicit capability for authoritative generations
-    manifest.capability = BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE;
+    manifest.capability = generationCapability;
+    // A.10.1b-fix3: Persist dagInputDigest for validation recomputation
+    memcpy(manifest.dagInputDigest, dagInputDigest, 32);
     if (!store.WriteManifest(manifest, error))
         return false;
 
     // Verify decoration before marking COMPLETE
     FixedBlockIndexManifest verify = store.GetManifest();
     verify.state = BLOCK_INDEX_MANIFEST_COMPLETE;
-    verify.capability = BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE;
+    verify.capability = generationCapability;
     if (!store.WriteManifest(verify, error))
         return false;
 

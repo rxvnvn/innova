@@ -711,3 +711,9 @@ void BlockIndexDerivedStateStore::SetContentBinding(const unsigned char binding[
     else
         memset(contentBinding, 0, 32);
 }
+
+void BlockIndexDerivedStateStore::GetContentBinding(unsigned char out[32]) const
+{
+    if (out)
+        memcpy(out, contentBinding, 32);
+}

@@ -44,6 +44,8 @@ BlockIndexStartupStatus V2BlockIndexStartupAuthority::Open(const std::string& ro
     BlockIndexLifecycleStatus status = BlockIndexGenerationManager::ReadCurrent(root, &current, error);
     if (status == BLOCK_INDEX_LIFECYCLE_NOT_PUBLISHED)
         return BLOCK_INDEX_STARTUP_NOT_FOUND;
+    if (status == BLOCK_INDEX_LIFECYCLE_CORRUPT)
+        return BLOCK_INDEX_STARTUP_CORRUPT;
     if (status != BLOCK_INDEX_LIFECYCLE_OK)
         return BLOCK_INDEX_STARTUP_IO_ERROR;
 
@@ -74,9 +76,9 @@ BlockIndexStartupStatus V2BlockIndexStartupAuthority::Open(const std::string& ro
         return BLOCK_INDEX_STARTUP_NOT_AUTHORITATIVE_CAPABLE;
     }
 
-    // Open the V2 reader
+    // Open the V2 reader (reader expects root containing CURRENT, not genDir)
     BlockIndexV2ReaderOptions readerOpts;
-    if (!impl->reader.Open(genDir, readerOpts, error))
+    if (!impl->reader.Open(root, readerOpts, error))
         return BLOCK_INDEX_STARTUP_IO_ERROR;
 
     // Open derived.dat

@@ -235,6 +235,10 @@ public:
     // when generation root is computed from component digests).
     void SetContentBinding(const unsigned char binding[32]);
 
+    // A.10.1b-fix3: Read content binding (used by validation to compare
+    // against independently recomputed generation root).
+    void GetContentBinding(unsigned char out[32]) const;
+
 private:
     struct ReadHandle;
     boost::shared_ptr<ReadHandle> readHandle;

@@ -117,4 +117,14 @@ private:
                                                            std::string* error);
 };
 
+// A.10.1b-fix3: Independently recompute generation root from actual component
+// files on disk. Exposed for testing.
+bool RecomputeGenerationRootFromFiles(const boost::filesystem::path& dir,
+                                       uint64_t generation,
+                                       const uint256& tipHash,
+                                       uint64_t recordCount,
+                                       const unsigned char persistedDagInputDigest[32],
+                                       unsigned char recomputedRoot[32],
+                                       std::string* error);
+
 #endif

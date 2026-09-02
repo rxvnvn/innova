@@ -1,8 +1,12 @@
 #include "blockindex_generation_lifecycle.h"
 
 #include "blockindex_hashindex.h"
+#include "blockindex_activeindex.h"
 #include "blockindex_derived_state.h"
+#include "fixed_blockindex_store.h"
 #include "util.h"
+
+#include <openssl/sha.h>
 
 #include <boost/filesystem.hpp>
 
@@ -227,6 +231,169 @@ std::string BlockIndexGenerationManager::StagingPath(const std::string& root, ui
     return (fs::path(root) / StagingName(generation)).string();
 }
 
+// A.10.1b-fix3: Independently recompute generation root from actual component
+// files on disk. This verifies content integrity without trusting the builder's
+// in-memory state. Returns true on success, false on I/O or format error.
+// Exposed in header for testing.
+bool RecomputeGenerationRootFromFiles(const fs::path& dir,
+                                              uint64_t generation,
+                                              const uint256& tipHash,
+                                              uint64_t recordCount,
+                                              const unsigned char persistedDagInputDigest[32],
+                                              unsigned char recomputedRoot[32],
+                                              std::string* error)
+{
+    // 1. Recompute recordsDigest from records.dat
+    unsigned char recordsDigest[32];
+    {
+        const fs::path recordsPath = dir / BLOCK_INDEX_RECORDS_FILE_NAME;
+        FILE* rf = fopen(recordsPath.string().c_str(), "rb");
+        if (!rf)
+            return SetError(error, "cannot open records.dat for root recomputation");
+        fseeko(rf, (off_t)BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, SEEK_SET);
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        std::vector<unsigned char> recBuf(BLOCK_INDEX_RECORD_SIZE_V1);
+        for (uint64_t i = 0; i < recordCount; ++i)
+        {
+            if (fread(&recBuf[0], 1, BLOCK_INDEX_RECORD_SIZE_V1, rf) != BLOCK_INDEX_RECORD_SIZE_V1)
+            {
+                fclose(rf);
+                return SetError(error, "records.dat truncated during root recomputation");
+            }
+            SHA256_Update(&ctx, &recBuf[0], BLOCK_INDEX_RECORD_SIZE_V1);
+        }
+        fclose(rf);
+        SHA256_Final(recordsDigest, &ctx);
+    }
+
+    // 2. Recompute activeDigest from active.dat
+    unsigned char activeDigest[32];
+    {
+        const fs::path activePath = dir / BLOCK_INDEX_ACTIVE_FILE_NAME;
+        // Open active index to get physical height (entry count)
+        BlockIndexActiveIndex active;
+        if (!BlockIndexActiveIndex::Open(dir.string(), generation, &active, error))
+            return false;
+        int64_t physHeight = active.PhysicalHeight();
+        if (physHeight < 0)
+            return SetError(error, "active.dat empty during root recomputation");
+        FILE* af = fopen(activePath.string().c_str(), "rb");
+        if (!af)
+            return SetError(error, "cannot open active.dat for root recomputation");
+        fseeko(af, (off_t)BLOCK_INDEX_ACTIVE_HEADER_SIZE_V1, SEEK_SET);
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        std::vector<unsigned char> actBuf(BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
+        // Entries are at heights 0..physHeight, so physHeight+1 entries total
+        for (int64_t h = 0; h <= physHeight; ++h)
+        {
+            if (fread(&actBuf[0], 1, BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, af) != BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1)
+            {
+                fclose(af);
+                return SetError(error, "active.dat truncated during root recomputation");
+            }
+            SHA256_Update(&ctx, &actBuf[0], BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
+        }
+        fclose(af);
+        SHA256_Final(activeDigest, &ctx);
+    }
+
+    // 3. Recompute hashIndexDigest from records.dat
+    // The hashindex maps (hash -> RecordId) for every record. Since records are
+    // stored in deterministic hash-sorted order with sequential RecordId, we can
+    // recompute from records.dat by reading each record's hash and pairing with
+    // its RecordId (1-based index).
+    // A.10.1b-fix3: use 8-byte LE RecordId to match active hashindex codec.
+    // IMPORTANT: the builder hashes uint256::begin() (internal little-endian
+    // storage), NOT the big-endian encoded bytes from WriteHashBytes. We must
+    // decode the hash and use begin() to match.
+    unsigned char hashIndexDigest[32];
+    {
+        const fs::path recordsPath = dir / BLOCK_INDEX_RECORDS_FILE_NAME;
+        FILE* rf = fopen(recordsPath.string().c_str(), "rb");
+        if (!rf)
+            return SetError(error, "cannot open records.dat for hashindex recomputation");
+        fseeko(rf, (off_t)BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, SEEK_SET);
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        std::vector<unsigned char> recBuf(BLOCK_INDEX_RECORD_SIZE_V1);
+        for (uint64_t i = 0; i < recordCount; ++i)
+        {
+            if (fread(&recBuf[0], 1, BLOCK_INDEX_RECORD_SIZE_V1, rf) != BLOCK_INDEX_RECORD_SIZE_V1)
+            {
+                fclose(rf);
+                return SetError(error, "records.dat truncated during hashindex recomputation");
+            }
+            // Decode hash from encoded record (big-endian in file) to match
+            // builder's uint256::begin() (little-endian internal storage).
+            // WriteHashBytes stores via GetHex roundtrip = big-endian bytes.
+            // We reverse to get internal storage layout.
+            uint256 recHash;
+            {
+                // Convert big-endian encoded bytes to hex string, then to uint256
+                static const char hexChars[] = "0123456789abcdef";
+                std::string hex;
+                hex.resize(64);
+                for (size_t j = 0; j < 32; ++j)
+                {
+                    const unsigned char value = recBuf[j];
+                    hex[2 * j] = hexChars[(value >> 4) & 0x0f];
+                    hex[2 * j + 1] = hexChars[value & 0x0f];
+                }
+                recHash = uint256(hex);
+            }
+            // Use internal storage layout (little-endian) to match builder
+            SHA256_Update(&ctx, recHash.begin(), 32);
+            // RecordId (i+1) as 8-byte LE
+            uint64_t recordId = i + 1;
+            unsigned char idBuf[8];
+            for (int b = 0; b < 8; ++b)
+                idBuf[b] = (unsigned char)((recordId >> (8 * b)) & 0xff);
+            SHA256_Update(&ctx, idBuf, 8);
+        }
+        fclose(rf);
+        SHA256_Final(hashIndexDigest, &ctx);
+    }
+
+    // 4. Recompute derivedEntriesDigest from derived.dat
+    unsigned char derivedEntriesDigest[32];
+    {
+        const fs::path derivedPath = dir / BLOCK_INDEX_DERIVED_FILE_NAME;
+        FILE* df = fopen(derivedPath.string().c_str(), "rb");
+        if (!df)
+            return SetError(error, "cannot open derived.dat for root recomputation");
+        fseeko(df, (off_t)BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, SEEK_SET);
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        std::vector<unsigned char> dervBuf(BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2);
+        for (uint64_t i = 0; i < recordCount; ++i)
+        {
+            if (fread(&dervBuf[0], 1, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, df) !=
+                BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2)
+            {
+                fclose(df);
+                return SetError(error, "derived.dat truncated during root recomputation");
+            }
+            SHA256_Update(&ctx, &dervBuf[0], BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2);
+        }
+        fclose(df);
+        SHA256_Final(derivedEntriesDigest, &ctx);
+    }
+
+    // 5. dagInputDigest is read from persisted MANIFEST (cannot recompute from
+    // generation files alone without external LevelDB DAG snapshot).
+
+    // 6. Compute generation root from recomputed digests
+    if (!ComputeGenerationRoot(generation, tipHash, recordCount,
+                               recordsDigest, activeDigest, hashIndexDigest,
+                               derivedEntriesDigest, persistedDagInputDigest,
+                               recomputedRoot))
+        return SetError(error, "ComputeGenerationRoot failed during recomputation");
+
+    return true;
+}
+
 BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
     const std::string& generationDir, uint64_t expectedGeneration,
     bool requireStableName, uint64_t generation, std::string* error)
@@ -365,15 +532,31 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
             SetError(error, "derived.dat entry count does not match MANIFEST record count");
             return BLOCK_INDEX_LIFECYCLE_ERROR;
         }
-        // Content binding validation: for authoritative generations, the binding
-        // is the generation root (component content commitment). We validate it
-        // by checking that it is non-zero (a zero binding indicates an incomplete build).
+        // A.10.1b-fix3 C2: Independent generation root recomputation from actual files.
+        // Read the expected root from derived header contentBinding.
+        unsigned char storedRoot[32];
+        derivedStore.GetContentBinding(storedRoot);
         unsigned char zeroBinding[32];
         memset(zeroBinding, 0, 32);
-        // Read the derived header to check the binding
-        // Note: we can't recompute the generation root here without access to all
-        // component bytes, so we check that the binding is non-zero as a minimal
-        // sanity check. Full validation happens at V2 authority open time.
+        if (memcmp(storedRoot, zeroBinding, 32) == 0)
+        {
+            SetError(error, "authoritative generation has zero content binding (incomplete build)");
+            return BLOCK_INDEX_LIFECYCLE_ERROR;
+        }
+        // Independently recompute the generation root from actual component files.
+        // dagInputDigest is read from V3 MANIFEST (persisted by builder).
+        unsigned char recomputedRoot[32];
+        if (!RecomputeGenerationRootFromFiles(dir, expectedGeneration,
+                                              m.committedTipHash, m.recordCount,
+                                              m.dagInputDigest, recomputedRoot, error))
+        {
+            return BLOCK_INDEX_LIFECYCLE_ERROR;
+        }
+        if (memcmp(storedRoot, recomputedRoot, 32) != 0)
+        {
+            SetError(error, "authoritative generation root mismatch: derived header content binding does not match recomputed root from actual files");
+            return BLOCK_INDEX_LIFECYCLE_ERROR;
+        }
     }
     else if (fs::exists(derivedPath))
     {
