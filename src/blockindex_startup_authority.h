@@ -183,10 +183,16 @@ class V2BlockIndexStartupAuthority : public BlockIndexStartupAuthority
 {
 public:
     V2BlockIndexStartupAuthority();
-    // Open the V2 authority from a generation root. Returns false on error.
-    bool Open(const std::string& root, std::string* error);
+    // A.10.1b-fix2 W3: explicit destructor for resource cleanup
+    ~V2BlockIndexStartupAuthority();
+
+    // A.10.1b-fix2 E2: typed open result instead of bool + string
+    BlockIndexStartupStatus Open(const std::string& root, std::string* error);
     void Close();
     bool IsOpen() const;
+
+    // A.10.1b-fix2: check if the opened generation is authoritative-capable
+    bool IsAuthoritativeCapable() const;
 
     virtual BlockIndexStartupAuthorityIdentity Identity() const;
     virtual BlockIndexStartupResult GetTip() const;

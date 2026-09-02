@@ -15,6 +15,7 @@ static const uint32_t BLOCK_INDEX_RECORD_VERSION = 1;
 static const uint32_t BLOCK_INDEX_RECORD_SIZE_V1 = 228;
 static const uint32_t BLOCK_INDEX_RECORDS_HEADER_SIZE_V1 = 40;
 static const uint32_t BLOCK_INDEX_MANIFEST_SIZE_V1 = 88;
+static const uint32_t BLOCK_INDEX_MANIFEST_SIZE_V2 = 92; // +4 for capability field
 
 static const char* const BLOCK_INDEX_RECORDS_FILE_NAME = "records.dat";
 static const char* const BLOCK_INDEX_MANIFEST_FILE_NAME = "MANIFEST";
@@ -68,6 +69,19 @@ enum BlockIndexManifestState
     BLOCK_INDEX_MANIFEST_COMPLETE = 2,
 };
 
+// A.10.1b-fix2: explicit generation capability/schema contract.
+// Persisted in MANIFEST to distinguish old shadow generations from
+// authoritative-capable generations without relying on file presence alone.
+enum BlockIndexGenerationCapability
+{
+    // Old shadow generation: no derived.dat, no explicit capability field.
+    // Valid for shadow/legacy functionality. NOT authoritative-capable.
+    BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW = 0,
+    // Authoritative-capable generation: derived.dat present with all required
+    // components, content binding validated, explicit capability declared.
+    BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE = 1,
+};
+
 struct FixedBlockIndexManifest
 {
     uint32_t formatVersion;
@@ -80,18 +94,20 @@ struct FixedBlockIndexManifest
     int32_t committedTipHeight;
     uint32_t state;
     uint256 committedTipHash;
+    uint32_t capability; // A.10.1b-fix2: explicit generation capability
 
     FixedBlockIndexManifest()
         : formatVersion(BLOCK_INDEX_FORMAT_VERSION),
           recordVersion(BLOCK_INDEX_RECORD_VERSION),
-          manifestSize(BLOCK_INDEX_MANIFEST_SIZE_V1),
+          manifestSize(BLOCK_INDEX_MANIFEST_SIZE_V2),
           recordSize(BLOCK_INDEX_RECORD_SIZE_V1),
           generation(0),
           recordCount(0),
           committedTipId(BLOCK_INDEX_ID_INVALID),
           committedTipHeight(-1),
           state(BLOCK_INDEX_MANIFEST_BUILDING),
-          committedTipHash(0)
+          committedTipHash(0),
+          capability(BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW)
     {
     }
 };

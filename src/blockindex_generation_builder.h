@@ -49,6 +49,13 @@ struct BlockIndexGenerationSource
     std::map<uint256, std::vector<uint256> > dagLinks;     // hash -> parent hashes
     bool foundDAGLinks;
 
+    // A.10.1b-fix2: DAG scores from LevelDB (for canonical post-DAG trust)
+    std::map<uint256, uint256> dagScores;                  // hash -> nDAGScore
+
+    // A.10.1b-fix2: path to directory containing blk*.dat files for exact nSize.
+    // If empty, nSize will be marked unavailable (blocks not accessible).
+    std::string blockDataDir;
+
     BlockIndexGenerationSource()
         : foundBestChain(false), foundDAGLinks(false)
     {
@@ -83,6 +90,14 @@ struct BlockIndexGenerationStats
 bool ReadLegacyBlockIndexSource(const std::string& snapshotLevelDbDir,
                                 BlockIndexGenerationSource* out,
                                 std::string* error);
+
+// A.10.1b-fix2: Read DAG links and scores from a static LevelDB snapshot.
+// Used to populate source.dagLinks and source.dagScores for canonical
+// post-DAG trust computation.
+bool ReadDAGLinksFromSnapshot(const std::string& snapshotLevelDbDir,
+                              std::map<uint256, std::vector<uint256> >* dagLinks,
+                              std::map<uint256, uint256>* dagScores,
+                              std::string* error);
 
 class BlockIndexGenerationBuilder
 {

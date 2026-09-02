@@ -3,6 +3,7 @@
 #include "txdb-leveldb.h"
 #include "main.h"
 #include "kernel.h"
+#include "dag.h"
 
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>
@@ -115,6 +116,66 @@ bool ReadLegacyBlockIndexSource(const std::string& snapshotLevelDbDir,
     delete db;
 
     *out = src;
+    ClearError(error);
+    return true;
+}
+
+bool ReadDAGLinksFromSnapshot(const std::string& snapshotLevelDbDir,
+                              std::map<uint256, std::vector<uint256> >* dagLinks,
+                              std::map<uint256, uint256>* dagScores,
+                              std::string* error)
+{
+    if (!dagLinks || !dagScores)
+        return SetError(error, "null DAG links/scores output");
+
+    leveldb::Options options;
+    options.create_if_missing = false;
+    options.error_if_exists = false;
+    options.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    leveldb::DB* db = NULL;
+    leveldb::Status status = leveldb::DB::Open(options, snapshotLevelDbDir, &db);
+    if (!status.ok())
+        return SetError(error, std::string("snapshot LevelDB open failure for DAG: ") + status.ToString());
+
+    // Iterate "daglinks" prefix (same pattern as CTxDB::IterateDAGLinks)
+    leveldb::Iterator* iterator = db->NewIterator(leveldb::ReadOptions());
+    CDataStream ssPrefix(SER_DISK, CLIENT_VERSION);
+    ssPrefix << std::string("daglinks");
+    std::string strPrefix = ssPrefix.str();
+    iterator->Seek(strPrefix);
+
+    while (iterator->Valid())
+    {
+        leveldb::Slice keySlice = iterator->key();
+        if (keySlice.ToString().compare(0, strPrefix.size(), strPrefix) != 0)
+            break;
+
+        CDataStream ssKey(SER_DISK, CLIENT_VERSION);
+        ssKey.write(keySlice.data(), keySlice.size());
+        std::string strType;
+        ssKey >> strType;
+        if (strType != "daglinks")
+            break;
+
+        uint256 blockHash;
+        ssKey >> blockHash;
+
+        CBlockDAGData dagData;
+        CDataStream ssValue(SER_DISK, CLIENT_VERSION);
+        ssValue.write(iterator->value().data(), iterator->value().size());
+        ssValue >> dagData;
+
+        // Store parent hashes for DAG trust computation
+        (*dagLinks)[blockHash] = dagData.vDAGParents;
+        // Store DAG score for canonical post-DAG trust
+        if (dagData.nDAGScore != 0)
+            (*dagScores)[blockHash] = dagData.nDAGScore;
+
+        iterator->Next();
+    }
+    delete iterator;
+    delete db;
+
     ClearError(error);
     return true;
 }
@@ -333,10 +394,7 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         DerivedComputed dc;
 
         // nChainTrust: linear replay (parent.trust + GetBlockTrust)
-        // For post-DAG PoW blocks, the DAG score would overwrite this at
-        // runtime. The builder computes linear trust here; if DAG links are
-        // available, the DAG score computation would be done separately.
-        // For now, linear replay matches the startup computation.
+        // For post-DAG PoW blocks, the DAG score overwrites this.
         uint256 parentTrust = 0;
         if (rec->hashPrev != uint256(0))
         {
@@ -356,6 +414,17 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             // Post-DAG PoS: trust = 0
         }
         dc.chainTrust = parentTrust + blockTrust;
+
+        // A.10.1b-fix2 C3: Apply canonical post-DAG trust.
+        // For post-DAG PoW blocks with persisted DAG score, overwrite linear
+        // trust with nDAGScore. This matches RestoreDAGTrustIntoChainTrust
+        // semantics exactly.
+        if (rec->height >= GetForkHeightDAG() && !(rec->prevoutStake.hash != uint256(0)))
+        {
+            std::map<uint256, uint256>::const_iterator dit = source.dagScores.find(hash);
+            if (dit != source.dagScores.end() && dit->second != 0)
+                dc.chainTrust = dit->second;
+        }
 
         // nStakeModifierChecksum: by logical parent topology
         // Reproduce GetStakeModifierChecksum semantics
@@ -397,23 +466,72 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             // else: unavailable (no parent or parent has no memo)
         }
 
-        // nSize: mark unavailable for now (block file reading not yet integrated)
-        dc.nSize = 0;
-        dc.hasBlockSize = false;
+        // A.10.1b-fix2 C1: Compute exact nSize from block files.
+        // Read the block from blk*.dat using nFile/nBlockPos, deserialize,
+        // and compute GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION).
+        // If block files are not accessible, mark unavailable.
+        if (!source.blockDataDir.empty() && rec->nFile > 0)
+        {
+            std::string blockFn = strprintf("blk%04u.dat", rec->nFile);
+            boost::filesystem::path blockPath = boost::filesystem::path(source.blockDataDir) / blockFn;
+            FILE* blockFile = fopen(blockPath.string().c_str(), "rb");
+            if (blockFile)
+            {
+                if (fseeko(blockFile, (off_t)rec->nBlockPos, SEEK_SET) == 0)
+                {
+                    CBlock block;
+                    CAutoFile filein(blockFile, SER_DISK, CLIENT_VERSION);
+                    try {
+                        filein >> block;
+                        dc.nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
+                        dc.hasBlockSize = (dc.nSize > 0);
+                    }
+                    catch (std::exception& e)
+                    {
+                        // Block deserialization failed: mark unavailable
+                        dc.nSize = 0;
+                        dc.hasBlockSize = false;
+                    }
+                }
+                else
+                {
+                    fclose(blockFile);
+                    dc.nSize = 0;
+                    dc.hasBlockSize = false;
+                }
+            }
+            else
+            {
+                // Block file not found: mark unavailable
+                dc.nSize = 0;
+                dc.hasBlockSize = false;
+            }
+        }
+        else
+        {
+            // No block data directory or invalid nFile: mark unavailable
+            dc.nSize = 0;
+            dc.hasBlockSize = false;
+        }
 
         derivedByHash[hash] = dc;
     }
 
     // Create derived.dat and emit entries in RecordId order
+    // A.10.1b-fix2 C2: Use placeholder binding initially; will be replaced
+    // with generation root after all component digests are computed.
     {
-        // Compute content binding
-        unsigned char binding[32];
-        ComputeDerivedContentBinding(tipHash, totalRecords, generation, binding);
+        unsigned char placeholderBinding[32];
+        memset(placeholderBinding, 0, 32);
 
-        if (!BlockIndexDerivedStateStore::Create(generationDir, generation, binding, &derivedStore, error))
+        if (!BlockIndexDerivedStateStore::Create(generationDir, generation, placeholderBinding, &derivedStore, error))
             return false;
 
         // Emit in RecordId order (same as `appended` order)
+        // Also compute derived entries digest as we go
+        SHA256_CTX derivedEntriesCtx;
+        SHA256_Init(&derivedEntriesCtx);
+
         for (size_t i = 0; i < appended.size(); ++i)
         {
             const uint256& hash = appended[i].first;
@@ -429,9 +547,113 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             entry.nSize = dit->second.nSize;
             entry.SetHasBlockSize(dit->second.hasBlockSize);
 
+            // Encode entry for digest computation
+            std::vector<unsigned char> encoded;
+            if (!EncodeBlockIndexDerivedEntry(entry, &encoded, error))
+                return false;
+            SHA256_Update(&derivedEntriesCtx, &encoded[0], encoded.size());
+
             if (!derivedStore.Append(entry, error))
                 return false;
         }
+
+        // Compute derived entries digest
+        unsigned char derivedEntriesDigest[32];
+        SHA256_Final(derivedEntriesDigest, &derivedEntriesCtx);
+
+        // A.10.1b-fix2 C2: Compute component content digests.
+        // Records digest: SHA256 of all record entry bytes
+        unsigned char recordsDigest[32];
+        {
+            SHA256_CTX ctx;
+            SHA256_Init(&ctx);
+            // Read records.dat entries (skip header)
+            std::string recordsPath = generationDir + "/" + BLOCK_INDEX_RECORDS_FILE_NAME;
+            FILE* rf = fopen(recordsPath.c_str(), "rb");
+            if (!rf)
+                return SetError(error, "cannot open records.dat for digest");
+            fseeko(rf, (off_t)BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, SEEK_SET);
+            std::vector<unsigned char> recBuf(BLOCK_INDEX_RECORD_SIZE_V1);
+            for (uint64_t i = 0; i < totalRecords; ++i)
+            {
+                if (fread(&recBuf[0], 1, BLOCK_INDEX_RECORD_SIZE_V1, rf) != BLOCK_INDEX_RECORD_SIZE_V1)
+                {
+                    fclose(rf);
+                    return SetError(error, "records.dat truncated for digest");
+                }
+                SHA256_Update(&ctx, &recBuf[0], BLOCK_INDEX_RECORD_SIZE_V1);
+            }
+            fclose(rf);
+            SHA256_Final(recordsDigest, &ctx);
+        }
+
+        // Active digest: SHA256 of all active entry bytes
+        unsigned char activeDigest[32];
+        {
+            SHA256_CTX ctx;
+            SHA256_Init(&ctx);
+            std::string activePath = generationDir + "/" + BLOCK_INDEX_ACTIVE_FILE_NAME;
+            FILE* af = fopen(activePath.c_str(), "rb");
+            if (!af)
+                return SetError(error, "cannot open active.dat for digest");
+            fseeko(af, (off_t)BLOCK_INDEX_ACTIVE_HEADER_SIZE_V1, SEEK_SET);
+            std::vector<unsigned char> actBuf(BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
+            for (size_t h = 0; h < activeChainByHeight.size(); ++h)
+            {
+                if (fread(&actBuf[0], 1, BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, af) != BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1)
+                {
+                    fclose(af);
+                    return SetError(error, "active.dat truncated for digest");
+                }
+                SHA256_Update(&ctx, &actBuf[0], BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
+            }
+            fclose(af);
+            SHA256_Final(activeDigest, &ctx);
+        }
+
+        // Hashindex digest: SHA256 of all (hash, RecordId) pairs in RecordId order
+        unsigned char hashIndexDigest[32];
+        {
+            SHA256_CTX ctx;
+            SHA256_Init(&ctx);
+            for (size_t i = 0; i < appended.size(); ++i)
+            {
+                // Hash: 32 raw bytes
+                SHA256_Update(&ctx, appended[i].first.begin(), 32);
+                // RecordId: 4 bytes LE
+                unsigned char idBuf[4];
+                BlockIndexId id = appended[i].second;
+                idBuf[0] = (unsigned char)(id & 0xff);
+                idBuf[1] = (unsigned char)((id >> 8) & 0xff);
+                idBuf[2] = (unsigned char)((id >> 16) & 0xff);
+                idBuf[3] = (unsigned char)((id >> 24) & 0xff);
+                SHA256_Update(&ctx, idBuf, 4);
+            }
+            SHA256_Final(hashIndexDigest, &ctx);
+        }
+
+        // DAG input digest: SHA256 of all DAG link entries in hash order
+        unsigned char dagInputDigest[32];
+        {
+            SHA256_CTX ctx;
+            SHA256_Init(&ctx);
+            for (std::map<uint256, uint256>::const_iterator it = source.dagScores.begin();
+                 it != source.dagScores.end(); ++it)
+            {
+                SHA256_Update(&ctx, it->first.begin(), 32);
+                SHA256_Update(&ctx, it->second.begin(), 32);
+            }
+            SHA256_Final(dagInputDigest, &ctx);
+        }
+
+        // Compute generation root
+        unsigned char generationRoot[32];
+        ComputeGenerationRoot(generation, tipHash, totalRecords,
+                              recordsDigest, activeDigest, hashIndexDigest,
+                              derivedEntriesDigest, dagInputDigest, generationRoot);
+
+        // Update derived header with generation root
+        derivedStore.SetContentBinding(generationRoot);
 
         if (!derivedStore.Finalize(error))
             return false;
@@ -443,12 +665,15 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
     manifest.committedTipId = tipId;
     manifest.committedTipHeight = tipHeight;
     manifest.committedTipHash = tipHash;
+    // A.10.1b-fix2: Set explicit capability for authoritative generations
+    manifest.capability = BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE;
     if (!store.WriteManifest(manifest, error))
         return false;
 
     // Verify decoration before marking COMPLETE
     FixedBlockIndexManifest verify = store.GetManifest();
     verify.state = BLOCK_INDEX_MANIFEST_COMPLETE;
+    verify.capability = BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE;
     if (!store.WriteManifest(verify, error))
         return false;
 

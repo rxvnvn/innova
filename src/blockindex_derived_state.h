@@ -155,10 +155,39 @@ enum BlockIndexDerivedLookupStatus
 
 // Compute content binding: SHA256(tipHash || recordCount || generation)
 // All values in true little-endian byte order.
+// LEGACY: metadata-only binding (fix1). Retained for backward compatibility.
 bool ComputeDerivedContentBinding(const uint256& tipHash,
                                   uint64_t recordCount,
                                   uint64_t generation,
                                   unsigned char binding[32]);
+
+// A.10.1b-fix2: Compute generation root that commits to actual component
+// content. This replaces the metadata-only binding for authoritative generations.
+//
+// generationRoot = SHA256(
+//   domain "GENROOT" (8 bytes) ||
+//   version uint32 LE (1) ||
+//   generation uint64 LE ||
+//   committedTipHash (32 bytes) ||
+//   recordCount uint64 LE ||
+//   recordsDigest (32 bytes) ||
+//   activeDigest (32 bytes) ||
+//   hashIndexDigest (32 bytes) ||
+//   derivedEntriesDigest (32 bytes) ||
+//   dagInputDigest (32 bytes)
+// )
+//
+// Component digests are SHA256 of the canonical byte representation of each
+// component's content (entries only, not headers).
+bool ComputeGenerationRoot(uint64_t generation,
+                           const uint256& tipHash,
+                           uint64_t recordCount,
+                           const unsigned char recordsDigest[32],
+                           const unsigned char activeDigest[32],
+                           const unsigned char hashIndexDigest[32],
+                           const unsigned char derivedEntriesDigest[32],
+                           const unsigned char dagInputDigest[32],
+                           unsigned char root[32]);
 
 class BlockIndexDerivedStateStore
 {
@@ -201,6 +230,10 @@ public:
     bool ValidateContentBinding(const uint256& expectedTipHash,
                                 uint64_t expectedRecordCount,
                                 std::string* error) const;
+
+    // A.10.1b-fix2: Update content binding (used by builder before Finalize
+    // when generation root is computed from component digests).
+    void SetContentBinding(const unsigned char binding[32]);
 
 private:
     struct ReadHandle;

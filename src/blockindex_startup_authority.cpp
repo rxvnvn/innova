@@ -16,8 +16,9 @@ struct V2BlockIndexStartupAuthority::Impl
     BlockIndexDerivedStateStore derivedStore;
     uint64_t generation;
     bool open;
+    bool authoritativeCapable; // A.10.1b-fix2: explicit capability
 
-    Impl() : generation(0), open(false) {}
+    Impl() : generation(0), open(false), authoritativeCapable(false) {}
 };
 
 V2BlockIndexStartupAuthority::V2BlockIndexStartupAuthority()
@@ -25,42 +26,78 @@ V2BlockIndexStartupAuthority::V2BlockIndexStartupAuthority()
 {
 }
 
-// Note: destructor is not virtual in the base class, but we need cleanup.
-// The impl pointer is managed manually.
+// A.10.1b-fix2 W3: explicit destructor releases Impl and owned resources
+V2BlockIndexStartupAuthority::~V2BlockIndexStartupAuthority()
+{
+    Close();
+    delete impl;
+    impl = NULL;
+}
 
-bool V2BlockIndexStartupAuthority::Open(const std::string& root, std::string* error)
+// A.10.1b-fix2 E2: typed open result
+BlockIndexStartupStatus V2BlockIndexStartupAuthority::Open(const std::string& root, std::string* error)
 {
     Close();
 
     // Read CURRENT to get selected generation
     BlockIndexCurrentRecord current;
     BlockIndexLifecycleStatus status = BlockIndexGenerationManager::ReadCurrent(root, &current, error);
+    if (status == BLOCK_INDEX_LIFECYCLE_NOT_PUBLISHED)
+        return BLOCK_INDEX_STARTUP_NOT_FOUND;
     if (status != BLOCK_INDEX_LIFECYCLE_OK)
-        return false;
+        return BLOCK_INDEX_STARTUP_IO_ERROR;
 
     // Validate the generation (includes derived.dat validation if present)
     status = BlockIndexGenerationManager::ValidateGeneration(root, current.generation, error);
     if (status != BLOCK_INDEX_LIFECYCLE_OK)
-        return false;
+    {
+        // Classify the failure
+        if (status == BLOCK_INDEX_LIFECYCLE_MISSING_GENERATION)
+            return BLOCK_INDEX_STARTUP_NOT_FOUND;
+        if (status == BLOCK_INDEX_LIFECYCLE_CORRUPT)
+            return BLOCK_INDEX_STARTUP_CORRUPT;
+        return BLOCK_INDEX_STARTUP_IO_ERROR;
+    }
+
+    // Check MANIFEST capability
+    const std::string genDir = BlockIndexGenerationManager::GenerationPath(root, current.generation);
+    FixedBlockIndexOpenOptions storeOpts;
+    storeOpts.requireCompleteManifest = true;
+    FixedBlockIndexStore store;
+    if (!FixedBlockIndexStore::OpenReadOnly(genDir, storeOpts, &store, error))
+        return BLOCK_INDEX_STARTUP_IO_ERROR;
+    const FixedBlockIndexManifest& manifest = store.GetManifest();
+
+    if (manifest.capability != BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE)
+    {
+        // Old shadow generation: not authoritative-capable
+        return BLOCK_INDEX_STARTUP_NOT_AUTHORITATIVE_CAPABLE;
+    }
 
     // Open the V2 reader
     BlockIndexV2ReaderOptions readerOpts;
-    if (!impl->reader.Open(root, readerOpts, error))
-        return false;
+    if (!impl->reader.Open(genDir, readerOpts, error))
+        return BLOCK_INDEX_STARTUP_IO_ERROR;
 
     // Open derived.dat
-    const std::string genDir = BlockIndexGenerationManager::GenerationPath(root, current.generation);
     if (!BlockIndexDerivedStateStore::OpenReadOnly(genDir, current.generation, &impl->derivedStore, error))
     {
         impl->reader.Close();
-        return false;
+        return BLOCK_INDEX_STARTUP_CORRUPT;
     }
 
-    // Content binding was already validated by ValidateGeneration above.
+    // Verify entry count coherence
+    if (impl->derivedStore.EntryCount() != manifest.recordCount)
+    {
+        impl->reader.Close();
+        impl->derivedStore = BlockIndexDerivedStateStore();
+        return BLOCK_INDEX_STARTUP_GENERATION_MISMATCH;
+    }
 
     impl->generation = current.generation;
     impl->open = true;
-    return true;
+    impl->authoritativeCapable = true;
+    return BLOCK_INDEX_STARTUP_OK;
 }
 
 void V2BlockIndexStartupAuthority::Close()
@@ -77,6 +114,11 @@ void V2BlockIndexStartupAuthority::Close()
 bool V2BlockIndexStartupAuthority::IsOpen() const
 {
     return impl && impl->open;
+}
+
+bool V2BlockIndexStartupAuthority::IsAuthoritativeCapable() const
+{
+    return impl && impl->open && impl->authoritativeCapable;
 }
 
 BlockIndexStartupAuthorityIdentity V2BlockIndexStartupAuthority::Identity() const

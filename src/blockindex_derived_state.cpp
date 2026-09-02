@@ -245,6 +245,55 @@ bool ComputeDerivedContentBinding(const uint256& tipHash,
     return true;
 }
 
+bool ComputeGenerationRoot(uint64_t generation,
+                           const uint256& tipHash,
+                           uint64_t recordCount,
+                           const unsigned char recordsDigest[32],
+                           const unsigned char activeDigest[32],
+                           const unsigned char hashIndexDigest[32],
+                           const unsigned char derivedEntriesDigest[32],
+                           const unsigned char dagInputDigest[32],
+                           unsigned char root[32])
+{
+    // SHA256(domain || version || generation || tip || count || component digests)
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+
+    // Domain separator: "GENROOT" + null byte
+    static const unsigned char domain[8] = {'G','E','N','R','O','O','T','\0'};
+    SHA256_Update(&ctx, domain, 8);
+
+    // Version: uint32 LE = 1
+    unsigned char verBuf[4];
+    verBuf[0] = 1; verBuf[1] = 0; verBuf[2] = 0; verBuf[3] = 0;
+    SHA256_Update(&ctx, verBuf, 4);
+
+    // Generation: uint64 LE
+    unsigned char genBuf[8];
+    for (int i = 0; i < 8; ++i)
+        genBuf[i] = (unsigned char)((generation >> (8 * i)) & 0xff);
+    SHA256_Update(&ctx, genBuf, 8);
+
+    // Tip hash: raw 32 bytes
+    SHA256_Update(&ctx, tipHash.begin(), 32);
+
+    // Record count: uint64 LE
+    unsigned char rcBuf[8];
+    for (int i = 0; i < 8; ++i)
+        rcBuf[i] = (unsigned char)((recordCount >> (8 * i)) & 0xff);
+    SHA256_Update(&ctx, rcBuf, 8);
+
+    // Component digests (each 32 bytes)
+    SHA256_Update(&ctx, recordsDigest, 32);
+    SHA256_Update(&ctx, activeDigest, 32);
+    SHA256_Update(&ctx, hashIndexDigest, 32);
+    SHA256_Update(&ctx, derivedEntriesDigest, 32);
+    SHA256_Update(&ctx, dagInputDigest, 32);
+
+    SHA256_Final(root, &ctx);
+    return true;
+}
+
 bool EncodeBlockIndexDerivedEntry(const BlockIndexDerivedEntry& entry,
                                   std::vector<unsigned char>* out,
                                   std::string* error)
@@ -653,4 +702,12 @@ bool BlockIndexDerivedStateStore::ValidateContentBinding(const uint256& expected
         return SetError(error, "derived content binding mismatch");
     ClearError(error);
     return true;
+}
+
+void BlockIndexDerivedStateStore::SetContentBinding(const unsigned char binding[32])
+{
+    if (binding)
+        memcpy(contentBinding, binding, 32);
+    else
+        memset(contentBinding, 0, 32);
 }

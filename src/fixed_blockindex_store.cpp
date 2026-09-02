@@ -284,7 +284,9 @@ static bool EncodeManifestV1(const FixedBlockIndexManifest& manifest, std::vecto
     WriteI32LE(*out, manifest.committedTipHeight);
     WriteU32LE(*out, manifest.state);
     WriteHashBytes(*out, manifest.committedTipHash);
-    if (out->size() != BLOCK_INDEX_MANIFEST_SIZE_V1)
+    // A.10.1b-fix2: capability field (V2 manifest)
+    WriteU32LE(*out, manifest.capability);
+    if (out->size() != BLOCK_INDEX_MANIFEST_SIZE_V2)
         return SetError(error, "manifest size mismatch during encode");
     ClearError(error);
     return true;
@@ -292,7 +294,8 @@ static bool EncodeManifestV1(const FixedBlockIndexManifest& manifest, std::vecto
 
 static bool DecodeManifestV1(const unsigned char* data, size_t size, FixedBlockIndexManifest* manifest, std::string* error)
 {
-    if (size != BLOCK_INDEX_MANIFEST_SIZE_V1)
+    // Accept both V1 (88 bytes, no capability) and V2 (92 bytes, with capability)
+    if (size != BLOCK_INDEX_MANIFEST_SIZE_V1 && size != BLOCK_INDEX_MANIFEST_SIZE_V2)
         return SetError(error, "manifest size mismatch");
     if (memcmp(data, BLOCK_INDEX_MANIFEST_MAGIC, 8) != 0)
         return SetError(error, "invalid manifest magic");
@@ -308,6 +311,17 @@ static bool DecodeManifestV1(const unsigned char* data, size_t size, FixedBlockI
         !ReadU32LE(data, size, &offset, &manifest->state, error) ||
         !ReadHashBytes(data, size, &offset, &manifest->committedTipHash, error))
         return false;
+    // A.10.1b-fix2: capability field (present in V2 manifest, absent in V1)
+    if (size == BLOCK_INDEX_MANIFEST_SIZE_V2)
+    {
+        if (!ReadU32LE(data, size, &offset, &manifest->capability, error))
+            return false;
+    }
+    else
+    {
+        // V1 manifest: no capability field -> OLD_SHADOW
+        manifest->capability = BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
+    }
     if (offset != size)
         return SetError(error, "manifest trailing bytes");
     ClearError(error);
@@ -458,7 +472,9 @@ bool FixedBlockIndexStore::ValidateManifest(const FixedBlockIndexManifest& candi
         return SetError(error, "unsupported manifest format version");
     if (candidate.recordVersion != BLOCK_INDEX_RECORD_VERSION)
         return SetError(error, "unsupported manifest record version");
-    if (candidate.manifestSize != BLOCK_INDEX_MANIFEST_SIZE_V1)
+    // A.10.1b-fix2: accept both V1 (88) and V2 (92, with capability) manifests
+    if (candidate.manifestSize != BLOCK_INDEX_MANIFEST_SIZE_V1 &&
+        candidate.manifestSize != BLOCK_INDEX_MANIFEST_SIZE_V2)
         return SetError(error, "invalid manifest size");
     if (candidate.recordSize != BLOCK_INDEX_RECORD_SIZE_V1)
         return SetError(error, "invalid manifest record size");
@@ -560,10 +576,13 @@ bool FixedBlockIndexStore::OpenReadOnly(const std::string& dir, const FixedBlock
     uint64_t manifestGeneration = 0;
     if (!boost::filesystem::exists(store.manifestPath))
         return SetError(error, "missing MANIFEST");
-    if (boost::filesystem::file_size(store.manifestPath) != BLOCK_INDEX_MANIFEST_SIZE_V1)
+    // A.10.1b-fix2: accept both V1 (88) and V2 (92) manifest file sizes
+    const uint64_t manifestFileSize = boost::filesystem::file_size(store.manifestPath);
+    if (manifestFileSize != BLOCK_INDEX_MANIFEST_SIZE_V1 &&
+        manifestFileSize != BLOCK_INDEX_MANIFEST_SIZE_V2)
         return SetError(error, "invalid MANIFEST file size");
     std::vector<unsigned char> manifestBytes;
-    if (!ReadExactFile(store.manifestPath, &manifestBytes, BLOCK_INDEX_MANIFEST_SIZE_V1, error))
+    if (!ReadExactFile(store.manifestPath, &manifestBytes, (size_t)manifestFileSize, error))
         return false;
     FixedBlockIndexManifest manifest;
     if (!DecodeManifestV1(&manifestBytes[0], manifestBytes.size(), &manifest, error))
