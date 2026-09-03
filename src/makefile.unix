@@ -556,6 +556,7 @@ TEST_OBJS= \
     obj/test/dag_trust_restart_tests.o \
     obj/test/candidate_frontier_tests.o \
     obj/test/blockindex_hot_owner_tests.o \
+    obj/test/blockindex_first_consumer_tests.o \
     obj/test/cold_hot_seam_tests.o \
     obj/test/stable_navigation_identity_tests.o \
     obj/test/staking_production_integration_tests.o

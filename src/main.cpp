@@ -36,6 +36,7 @@
 #include "finality.h"
 #include "dag.h"
 #include "candidate_frontier.h"
+#include "blockindex_hot_owner.h"
 #include "hreg_registration.h"
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
@@ -9391,6 +9392,42 @@ uint256 CBlockIndex::GetBlockTrust() const
         return GetBlockEntropy((IsProofOfStake() && nHeight < FORK_HEIGHT_DAG) ? hashProof : *phashBlock);
 
     return ((CBigNum(1)<<256) / (bnTarget+1)).getuint256();
+}
+
+// -----------------------------------------------------------------------------
+// A.10.1f — First production BlockIndexHotOwner consumer.
+//
+// Block-trust metadata derivation (CBlockIndex::GetBlockTrust) driven through
+// the HotOwner pin contract: logical hash -> authority -> hot materialization ->
+// pin -> real consumer logic -> release. After the handle scope closes, the hot
+// object is eviction-eligible again (PinCount(hash)==0 unless anchored).
+//
+// Sparse-hot safe: GetBlockTrust() reads only nBits / nHeight / nFlags /
+// hashProof / *phashBlock — no pprev/pnext/pskip, no ancestry walk.
+//
+// Fail-closed: ok=false (nTrust=0) on ANY pin/materialization failure, so a
+// HotOwner failure is never silently masked by a legacy fallback.
+//
+// Lock contract: production callers already hold cs_main. This function does
+// not acquire cs_main; BlockIndexHotOwner is a LEAF (never takes cs_main), so
+// cs_main -> owner-internal-lock ordering holds with no new inversion.
+// -----------------------------------------------------------------------------
+BlockIndexHotDerivedTrust GetBlockTrustViaHotOwner(BlockIndexHotOwner& owner,
+                                                   const uint256& hash)
+{
+    BlockIndexHotDerivedTrust out;
+    const BlockIndexLogicalId id(hash);
+    BlockIndexHotHandle handle;
+    const BlockIndexHotStatus st = owner.Pin(id, &handle);
+    if (st != BlockIndexHotStatus::OK || !handle.IsValid())
+        return out;                      // fail-closed: materialization/pin failure
+    CBlockIndex* pindex = handle.Get();
+    if (!pindex)
+        return out;                      // fail-closed: no resident object
+    out.nTrust = pindex->GetBlockTrust(); // REAL production consumer logic
+    out.ok = true;
+    // handle released here -> PinCount(hash)==0, object eviction-eligible again
+    return out;
 }
 
 bool CBlockIndex::IsSuperMajority(int minVersion, const CBlockIndex* pstart, unsigned int nRequired, unsigned int nToCheck)

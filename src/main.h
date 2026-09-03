@@ -561,6 +561,39 @@ CBlockIndex* FindBlockByHeight(int nHeight);
 void ResetBlockIndexSkipStats();
 uint64_t GetBlockIndexSkipStatsCalls();
 uint64_t GetBlockIndexSkipStatsEdges();
+
+// -----------------------------------------------------------------------------
+// A.10.1f — First production BlockIndexHotOwner consumer.
+//
+// Block-trust metadata derivation driven through the HotOwner pin contract.
+// Sparse-hot safe: CBlockIndex::GetBlockTrust() reads only nBits / nHeight /
+// nFlags(BLOCK_PROOF_OF_STAKE) / hashProof / *phashBlock — every one of which
+// is materialized in the layer-1 BlockIndexHotMaterialized snapshot, and none
+// of which requires pprev/pnext/pskip resident topology.
+//
+// Fail-closed: ok=false is returned on ANY pin/materialization failure (no
+// silent legacy fallback that could hide a HotOwner failure). Authority is NOT
+// migrated: this consumer only reads a pin-safe hot object built from legacy
+// authority; it never decides active-chain/candidate/consensus truth.
+//
+// Lock contract: the production caller must already hold cs_main. This function
+// never acquires cs_main, and BlockIndexHotOwner is a LEAF subsystem (never
+// takes cs_main), so cs_main -> owner-internal-lock ordering holds and no new
+// lock inversion is introduced.
+// -----------------------------------------------------------------------------
+class BlockIndexHotOwner;
+
+struct BlockIndexHotDerivedTrust
+{
+    bool    ok;
+    uint256 nTrust;
+    BlockIndexHotDerivedTrust() : ok(false), nTrust(0) {}
+};
+
+/** Derive a block's own consensus trust from its logical identity through a
+ *  pinned hot object. First production HotOwner consumer. */
+BlockIndexHotDerivedTrust GetBlockTrustViaHotOwner(BlockIndexHotOwner& owner,
+                                                   const uint256& hash);
 // True when the block itself or any ancestor is in setInvalidBlockHash (i.e.
 // the operator invalidated it).  Must be consulted on every path that can
 // activate a chain; enforcement is done in one place for all call sites.
