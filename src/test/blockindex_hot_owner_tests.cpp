@@ -2,8 +2,13 @@
 
 #include "blockindex_hot_owner.h"
 #include "main.h"
+#include "sync.h"
 
+#include <atomic>
+#include <chrono>
 #include <memory>
+#include <thread>
+#include <vector>
 
 // =====================================================================
 // A.10.1d — BlockIndexHotOwner ownership / materialization. Legacy
@@ -27,7 +32,9 @@ public:
 
     std::map<uint256, Rec> authority;   // by-value authority (no CBlockIndex*)
     uint64_t currentGen;
-    mutable int materializeCalls;
+    // thread-safe counter (the owner's materializer runs OUTSIDE the owner lock,
+    // so concurrent peers may call it simultaneously).
+    mutable std::atomic<int> materializeCalls;
 
     SnapshotHotMaterializer() : currentGen(1), materializeCalls(0) {}
 
@@ -514,6 +521,251 @@ BOOST_AUTO_TEST_CASE(twophase_generation_moved_rejected)
     BlockIndexHotStatus st = owner.PublishMaterialized(tok, m);
     BOOST_CHECK(st == BlockIndexHotStatus::GENERATION_MISMATCH);
     BOOST_CHECK(!owner.IsResident(BlockIndexLogicalId(hs(22))));
+}
+
+// =====================================================================
+// A.10.1e — CONCURRENCY HARDENING (deterministic C0-C7 under a leaf lock)
+// =====================================================================
+// All tests run several threads against one owner + a shared materializer.
+// The owner's internal leaf lock (cs) serializes pin/evict/materialize state
+// transitions; the materializer is atomic-counted and runs OUTSIDE `cs`.
+
+// --- C0: concurrent Pin same hash from N peers -> one resident, N pins -----
+BOOST_AUTO_TEST_CASE(c0_concurrent_pin_same_hash)
+{
+    SnapshotHotMaterializer mat;
+    mat.Add(hs(31), hs(0), uint256(9), 1);
+    BlockIndexHotOwner owner;
+    owner.SetCurrentGeneration(mat.currentGen);
+    owner.SetMaterializer(&mat);
+
+    const int N = 8;
+    std::vector<BlockIndexHotHandle> handles(N);
+    std::vector<std::thread> threads;
+    std::atomic<int> okCount(0);
+    boost::barrier bar(N);
+    for (int i = 0; i < N; ++i)
+    {
+        threads.emplace_back([&, i]{
+            bar.wait();
+            BlockIndexHotStatus st = owner.Pin(BlockIndexLogicalId(hs(31)), &handles[i]);
+            if (st == BlockIndexHotStatus::OK) ++okCount;
+        });
+    }
+    for (auto& t : threads) t.join();
+    BOOST_CHECK_EQUAL(okCount.load(), N);
+    BOOST_CHECK(owner.ResidentCount() == (size_t)1); // ONE resident object
+    BOOST_CHECK(owner.PinCount() == (size_t)N);
+    // All handles point to the SAME object.
+    CBlockIndex* p0 = handles[0].Get();
+    for (int i = 1; i < N; ++i) BOOST_CHECK(handles[i].Get() == p0);
+    // Release all -> eligible.
+    for (auto& h : handles) h.Reset();
+    BOOST_CHECK(owner.PinCount() == (size_t)0);
+    BOOST_CHECK(!owner.EvictEligible().empty());
+}
+
+// --- C1: concurrent Pin/Evict race cannot free a live pin ----------------
+BOOST_AUTO_TEST_CASE(c1_pin_vs_evict_race)
+{
+    SnapshotHotMaterializer mat;
+    mat.Add(hs(2), hs(0), uint256(3), 1);
+    BlockIndexHotOwner owner;
+    owner.SetCurrentGeneration(mat.currentGen);
+    owner.SetMaterializer(&mat);
+
+    BlockIndexHotHandle h;
+    owner.Pin(BlockIndexLogicalId(hs(2)), &h); // pin held
+
+    // Concurrent eviction attempts while pinned.
+    std::thread t1([&]{ for (int i=0;i<2000;++i) owner.EvictResident(BlockIndexLogicalId(hs(2))); });
+    std::thread t2([&]{ for (int i=0;i<2000;++i) owner.EvictResident(BlockIndexLogicalId(hs(2))); });
+    std::thread t3([&]{ for (int i=0;i<2000;++i) owner.EvictResident(BlockIndexLogicalId(hs(2))); });
+    t1.join(); t2.join(); t3.join();
+
+    // The pin must have survived every eviction attempt.
+    BlockIndexHotStatus st = owner.EvictResident(BlockIndexLogicalId(hs(2)));
+    BOOST_CHECK(st == BlockIndexHotStatus::EVICTION_BLOCKED);
+    BOOST_CHECK(h.IsValid());
+    CBlockIndex* p = h.Get();
+    BOOST_REQUIRE(p != NULL);
+    BOOST_CHECK(owner.IsResident(BlockIndexLogicalId(hs(2))));
+    h.Reset();
+    BOOST_CHECK(owner.IsResident(BlockIndexLogicalId(hs(2)))); // still resident until evicted
+}
+
+// --- C2: concurrent Pin/Release -> PinCount returns to 0, no double-free ----
+BOOST_AUTO_TEST_CASE(c2_concurrent_pin_release)
+{
+    SnapshotHotMaterializer mat;
+    mat.Add(hs(3), hs(0), uint256(5), 1);
+    BlockIndexHotOwner owner;
+    owner.SetCurrentGeneration(mat.currentGen);
+    owner.SetMaterializer(&mat);
+
+    const int N = 8;
+    std::vector<std::thread> ts;
+    boost::barrier bar(N);
+    for (int i = 0; i < N; ++i)
+    {
+        ts.emplace_back([&, i]{
+            bar.wait();
+            for (int r = 0; r < 100; ++r)
+            {
+                BlockIndexHotHandle h;
+                owner.Pin(BlockIndexLogicalId(hs(3)), &h);
+                h.Reset();
+            }
+        });
+    }
+    for (auto& t : ts) t.join();
+    BOOST_CHECK(owner.PinCount() == (size_t)0);
+    BOOST_CHECK(owner.ResidentCount() == (size_t)1);
+    BlockIndexHotMetrics m = owner.Metrics();
+    BOOST_CHECK(m.pinnedCount == 0);
+}
+
+// --- C3: concurrent generation rollover vs delayed completion ------------
+BOOST_AUTO_TEST_CASE(c3_gen_rollover_stale_completion)
+{
+    SnapshotHotMaterializer mat;
+    mat.Add(hs(9), hs(0), uint256(9), 1, /*gen=*/1);
+    BlockIndexHotOwner owner;
+    owner.SetCurrentGeneration(1);
+    owner.SetMaterializer(&mat);
+
+    BlockIndexHotToken tok;
+    owner.RequestMaterialization(BlockIndexLogicalId(hs(9)), &tok); // PENDING under gen1
+    // Another thread rolls CURRENT to 2 before completion arrives.
+    std::thread t([&]{ owner.SetCurrentGeneration(2); });
+    t.join();
+    BlockIndexHotMaterialized m;
+    mat.Materialize(BlockIndexLogicalId(hs(9)), &m);
+    BlockIndexHotStatus st = owner.PublishMaterialized(tok, m);
+    BOOST_CHECK(st == BlockIndexHotStatus::GENERATION_MISMATCH);
+    BOOST_CHECK(!owner.IsResident(BlockIndexLogicalId(hs(9))));
+    BOOST_CHECK(owner.ResidentCount() == (size_t)0);
+}
+
+// --- C4: EvictEligible snapshot vs later Pin race -------------------------
+BOOST_AUTO_TEST_CASE(c4_evict_snapshot_vs_pin)
+{
+    SnapshotHotMaterializer mat;
+    mat.Add(hs(1), hs(0), uint256(9), 1);
+    mat.Add(hs(2), hs(0), uint256(4), 1);
+    BlockIndexHotOwner owner;
+    owner.SetCurrentGeneration(mat.currentGen);
+    owner.SetMaterializer(&mat);
+
+    // materialize two unpinned (evictable) objects
+    BlockIndexHotHandle h1; owner.Pin(BlockIndexLogicalId(hs(1)), &h1); h1.Reset();
+    BlockIndexHotHandle h2; owner.Pin(BlockIndexLogicalId(hs(2)), &h2); h2.Reset();
+
+    std::vector<BlockIndexLogicalId> snapshot = owner.EvictEligible();
+    BOOST_CHECK(snapshot.size() >= (size_t)2); // both are evictable in the snapshot
+
+    // Whereas the snapshot said "evictable", a consumer concurrently Pins hs(1).
+    BlockIndexHotHandle hKeep;
+    std::thread pinT([&]{ owner.Pin(BlockIndexLogicalId(hs(1)), &hKeep); });
+    pinT.join();
+    // The snapshot is advisory; the owner must re-check pins under the lock at
+    // eviction time. Because hKeep now holds a pin, eviction of hs(1) must block.
+    BlockIndexHotStatus st = owner.EvictResident(BlockIndexLogicalId(hs(1)));
+    BOOST_CHECK(st == BlockIndexHotStatus::EVICTION_BLOCKED);
+    // hs(2) remains evictable.
+    BlockIndexHotStatus st2 = owner.EvictResident(BlockIndexLogicalId(hs(2)));
+    BOOST_CHECK(st2 == BlockIndexHotStatus::OK);
+    hKeep.Reset();
+}
+
+// --- C5: anchor vs eviction race -----------------------------------------
+BOOST_AUTO_TEST_CASE(c5_anchor_vs_eviction)
+{
+    SnapshotHotMaterializer mat;
+    mat.Add(hs(0), uint256(0), uint256(2), 0); // genesis anchor
+    mat.Add(hs(5), hs(0), uint256(7), 1);
+    BlockIndexHotOwner owner;
+    owner.SetCurrentGeneration(mat.currentGen);
+    owner.SetMaterializer(&mat);
+    owner.PinPermanent(BlockIndexLogicalId(hs(0)));
+
+    BlockIndexHotHandle h5; owner.Pin(BlockIndexLogicalId(hs(5)), &h5); h5.Reset();
+
+    // Concurrent eviction attempts against the anchor while another thread pins it.
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 4; ++i)
+        ts.emplace_back([&]{ for (int r=0;r<2000;++r) owner.EvictResident(BlockIndexLogicalId(hs(0))); });
+    ts.emplace_back([&]{ BlockIndexHotHandle h; owner.Pin(BlockIndexLogicalId(hs(0)), &h); h.Reset(); });
+    for (auto& t : ts) t.join();
+
+    BlockIndexHotStatus st = owner.EvictResident(BlockIndexLogicalId(hs(0)));
+    BOOST_CHECK(st == BlockIndexHotStatus::EVICTION_BLOCKED);
+    BOOST_CHECK(owner.IsResident(BlockIndexLogicalId(hs(0))));
+    // non-anchor still evictable
+    BlockIndexHotStatus st5 = owner.EvictResident(BlockIndexLogicalId(hs(5)));
+    BOOST_CHECK(st5 == BlockIndexHotStatus::OK);
+}
+
+// --- C6: concurrent metrics snapshot is consistent (no torn read) ---------
+BOOST_AUTO_TEST_CASE(c6_concurrent_metrics_consistent)
+{
+    SnapshotHotMaterializer mat;
+    for (int i = 1; i <= 16; ++i) mat.Add(hs(i), hs(0), uint256(i + 1), 1);
+    BlockIndexHotOwner owner;
+    owner.SetCurrentGeneration(mat.currentGen);
+    owner.SetMaterializer(&mat);
+
+    std::atomic<bool> stop(false);
+    std::atomic<int> torn(0);
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 4; ++i)
+        ts.emplace_back([&, i]{
+            while (!stop)
+            {
+                BlockIndexHotHandle h;
+                owner.Pin(BlockIndexLogicalId(hs(1 + (i % 16))), &h);
+                h.Reset();
+            }
+        });
+    // Reader thread samples Metrics() repeatedly; they must never be inconsistent.
+    std::thread reader([&]{
+        for (int k = 0; k < 5000; ++k)
+        {
+            BlockIndexHotMetrics m = owner.Metrics();
+            if (m.residentCount < 0 || m.pinnedCount < 0 || m.evictableCount < 0 ||
+                m.residentCount > 16)
+                ++torn;
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    stop = true;
+    for (auto& t : ts) t.join();
+    reader.join();
+    BOOST_CHECK_EQUAL(torn.load(), 0); // metrics never inconsistent/torn
+}
+
+// --- C7: raw-pointer escape guarantee under a concurrent pin --------------
+BOOST_AUTO_TEST_CASE(c7_raw_pointer_valid_under_pin)
+{
+    SnapshotHotMaterializer mat;
+    mat.Add(hs(7), hs(0), uint256(9), 1);
+    BlockIndexHotOwner owner;
+    owner.SetCurrentGeneration(mat.currentGen);
+    owner.SetMaterializer(&mat);
+
+    BlockIndexHotHandle h;
+    owner.Pin(BlockIndexLogicalId(hs(7)), &h);
+    CBlockIndex* p = h.Get();
+    BOOST_REQUIRE(p != NULL);
+    // While the pin is held, concurrent eviction must be blocked, so the raw
+    // pointer handed out via Get() remains valid.
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 4; ++i)
+        ts.emplace_back([&]{ for (int r=0;r<2000;++r) owner.EvictResident(BlockIndexLogicalId(hs(7))); });
+    for (auto& t : ts) t.join();
+    BOOST_CHECK(h.IsValid());
+    BOOST_CHECK(h.Get() == p); // same live object, not freed
+    h.Reset();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -88,6 +88,9 @@ BlockIndexHotOwner::BlockIndexHotOwner()
 
 BlockIndexHotOwner::~BlockIndexHotOwner()
 {
+    // Caller must have quiesced all threads (owner destroyed before they exit);
+    // the lock is taken for hygiene in case other owner methods are running.
+    LOCK(cs);
     for (auto& kv : resident)
     {
         if (kv.second.index)
@@ -98,17 +101,32 @@ BlockIndexHotOwner::~BlockIndexHotOwner()
 
 void BlockIndexHotOwner::SetMaterializer(const BlockIndexHotMaterializer* m)
 {
+    LOCK(cs);
     materializer = m;
+}
+
+void BlockIndexHotOwner::SetCurrentGeneration(uint64_t gen)
+{
+    LOCK(cs);
+    currentGeneration = gen;
+}
+
+uint64_t BlockIndexHotOwner::CurrentGeneration() const
+{
+    LOCK(cs);
+    return currentGeneration;
 }
 
 bool BlockIndexHotOwner::IsResident(const BlockIndexLogicalId& id) const
 {
+    LOCK(cs);
     std::map<uint256, Entry>::const_iterator it = resident.find(id.GetHash());
     return it != resident.end() && it->second.materialized;
 }
 
 bool BlockIndexHotOwner::IsPinned(const BlockIndexLogicalId& id) const
 {
+    LOCK(cs);
     std::map<uint256, Entry>::const_iterator it = resident.find(id.GetHash());
     return it != resident.end() && it->second.pins > 0;
 }
@@ -121,10 +139,10 @@ BlockIndexHotOwner::Entry* BlockIndexHotOwner::EntryLocked(uint256 hash)
     return NULL;
 }
 
-BlockIndexHotStatus BlockIndexHotOwner::RequestMaterialization(const BlockIndexLogicalId& id,
-                                                                BlockIndexHotToken* token)
+BlockIndexHotStatus BlockIndexHotOwner::RequestMaterializationLocked(const BlockIndexLogicalId& id,
+                                                                      BlockIndexHotToken* token)
 {
-    // PHASE 1 (under owner lock): IDLE->PENDING + mint token. No I/O here.
+    // PHASE 1 (caller holds cs): IDLE->PENDING + mint token. No I/O here.
     Entry* e = EntryLocked(id.GetHash());
     if (!e)
     {
@@ -154,10 +172,17 @@ BlockIndexHotStatus BlockIndexHotOwner::RequestMaterialization(const BlockIndexL
     return BlockIndexHotStatus::MATERIALIZATION_PENDING;
 }
 
-BlockIndexHotStatus BlockIndexHotOwner::PublishMaterialized(const BlockIndexHotToken& token,
-                                                            const BlockIndexHotMaterialized& m)
+BlockIndexHotStatus BlockIndexHotOwner::RequestMaterialization(const BlockIndexLogicalId& id,
+                                                               BlockIndexHotToken* token)
 {
-    // PHASE 3 (under owner lock): validate token + generation, then atomically
+    LOCK(cs);
+    return RequestMaterializationLocked(id, token);
+}
+
+BlockIndexHotStatus BlockIndexHotOwner::PublishMaterializedLocked(const BlockIndexHotToken& token,
+                                                                  const BlockIndexHotMaterialized& m)
+{
+    // PHASE 3 (caller holds cs): validate token + generation, then atomically
     // publish. A stale/foreign completion can never publish (token seq/hash
     // must match the still-pending entry; generation must match CURRENT).
     if (!token.IsValid() || !m.found)
@@ -186,24 +211,54 @@ BlockIndexHotStatus BlockIndexHotOwner::PublishMaterialized(const BlockIndexHotT
     return BlockIndexHotStatus::OK;
 }
 
+BlockIndexHotStatus BlockIndexHotOwner::PublishMaterialized(const BlockIndexHotToken& token,
+                                                            const BlockIndexHotMaterialized& m)
+{
+    LOCK(cs);
+    return PublishMaterializedLocked(token, m);
+}
+
 BlockIndexHotStatus BlockIndexHotOwner::EnsureResident(const BlockIndexLogicalId& id)
 {
-    // Driver: request (lock), materialize OUTSIDE the lock, publish (lock).
+    // Driver: request (lock) -> materialize OUTSIDE the lock -> publish (lock).
     BlockIndexHotToken token;
-    BlockIndexHotStatus st = RequestMaterialization(id, &token);
+    BlockIndexHotStatus st;
+    {
+        LOCK(cs);
+        st = RequestMaterializationLocked(id, &token);
+    }
     if (st == BlockIndexHotStatus::OK)
         return BlockIndexHotStatus::OK; // already resident
     if (st != BlockIndexHotStatus::MATERIALIZATION_PENDING)
         return st;
 
-    // I/O (materializer) runs outside the owner lock.
+    // I/O (materializer) runs OUTSIDE the owner lock.
     BlockIndexHotMaterialized m;
-    if (!materializer || materializer->Materialize(id, &m) != BlockIndexHotStatus::OK || !m.found)
-        return BlockIndexHotStatus::MATERIALIZATION_UNAVAILABLE;
-    // Phase 3: re-acquire lock, validate token, atomic publish.
-    BlockIndexHotStatus pub = PublishMaterialized(token, m);
-    if (pub != BlockIndexHotStatus::OK)
+    bool ok = false;
+    if (materializer)
+        ok = (materializer->Materialize(id, &m) == BlockIndexHotStatus::OK && m.found);
+    if (!ok)
+    {
+        // materialize failed outside the lock; clear our pending marker under lock.
+        LOCK(cs);
+        Entry* e = EntryLocked(id.GetHash());
+        if (e && e->pending && e->seq == token.seq)
+        {
+            e->pending = false;
+            e->seq = 0;
+            if (metrics.inFlightCount > 0) --metrics.inFlightCount;
+        }
         ++metrics.materializationFailures;
+        return BlockIndexHotStatus::MATERIALIZATION_UNAVAILABLE;
+    }
+    // Phase 3: re-acquire lock, validate token, atomic publish.
+    BlockIndexHotStatus pub;
+    {
+        LOCK(cs);
+        pub = PublishMaterializedLocked(token, m);
+        if (pub != BlockIndexHotStatus::OK)
+            ++metrics.materializationFailures;
+    }
     return pub;
 }
 
@@ -212,21 +267,96 @@ BlockIndexHotStatus BlockIndexHotOwner::Pin(const BlockIndexLogicalId& id,
 {
     if (!out)
         return BlockIndexHotStatus::PIN_REQUIRED;
-    BlockIndexHotStatus st = EnsureResident(id);
-    if (st != BlockIndexHotStatus::OK)
+    BlockIndexHotToken token;
+    BlockIndexHotStatus st;
     {
+        // Phase 1 under lock.
+        LOCK(cs);
+        st = RequestMaterializationLocked(id, &token);
+        if (st == BlockIndexHotStatus::OK)
+        {
+            // Already resident: acquire the pin atomically with the read (no
+            // window for a concurrent eviction to free it).
+            Entry* e = EntryLocked(id.GetHash());
+            if (!e || !e->materialized)
+                return BlockIndexHotStatus::NOT_RESIDENT;
+            ++(e->pins);
+            ++metrics.pinnedCount;
+            out->owner = this;
+            out->hash = id.GetHash();
+            return BlockIndexHotStatus::OK;
+        }
+    }
+    if (st != BlockIndexHotStatus::MATERIALIZATION_PENDING)
+    {
+        LOCK(cs);
         ++metrics.materializationFailures;
         return st;
     }
-    // Under lock: acquire a lifetime claim on the resident object.
-    Entry* e = EntryLocked(id.GetHash());
-    if (!e || !e->materialized)
-        return BlockIndexHotStatus::NOT_RESIDENT;
-    ++(e->pins);
-    ++metrics.pinnedCount;
-    out->owner = this;
-    out->hash = id.GetHash();
-    return BlockIndexHotStatus::OK;
+
+    // I/O (materializer) OUTSIDE the lock.
+    BlockIndexHotMaterialized m;
+    bool ok = false;
+    if (materializer)
+        ok = (materializer->Materialize(id, &m) == BlockIndexHotStatus::OK && m.found);
+    if (!ok)
+    {
+        LOCK(cs);
+        Entry* e = EntryLocked(id.GetHash());
+        if (e && e->pending && e->seq == token.seq)
+        {
+            e->pending = false;
+            e->seq = 0;
+            if (metrics.inFlightCount > 0) --metrics.inFlightCount;
+        }
+        ++metrics.materializationFailures;
+        return BlockIndexHotStatus::MATERIALIZATION_UNAVAILABLE;
+    }
+
+    // Phase 3 under lock: publish AND acquire the pin atomically.
+    {
+        LOCK(cs);
+        BlockIndexHotStatus pub = PublishMaterializedLocked(token, m);
+        if (pub != BlockIndexHotStatus::OK)
+        {
+            // CASE A/B disambiguation, done under the same lock:
+            // - CASE A (genuine stale/foreign completion):the target is not validly
+            //   resident for the current generation -> return the typed stale/generation
+            //   error from publish (pub).
+            // - CASE B (a concurrent peer published the SAME logical hash first):the
+            //   pending state has already transitioned to RESIDENT, but our token is now
+            //   stale. If the entry is validly resident for the current generation, acquire
+            //   a pin on that same object and return OK, so all N concurrent Pins of one
+            //   hash converge on ONE resident object. The materializer is still adequate
+            //   for a cold materialization (residentGen was set at publish time), so no
+            //   recursive retry is needed or performed here.
+
+            Entry* e2 = EntryLocked(id.GetHash());
+            if (e2 && e2->materialized &&
+                (e2->residentGen == currentGeneration || e2->residentGen == 0 || currentGeneration == 0))
+            {
+                ++(e2->pins);
+                ++metrics.pinnedCount;
+                out->owner = this;
+                out->hash = id.GetHash();
+                return BlockIndexHotStatus::OK;
+            }
+            ++metrics.materializationFailures;
+
+            return pub;
+        }
+        Entry* e = EntryLocked(id.GetHash());
+        if (!e || !e->materialized)
+        {
+            ++metrics.materializationFailures;
+            return BlockIndexHotStatus::NOT_RESIDENT;
+        }
+        ++(e->pins);
+        ++metrics.pinnedCount;
+        out->owner = this;
+        out->hash = id.GetHash();
+        return BlockIndexHotStatus::OK;
+    }
 }
 
 BlockIndexHotStatus BlockIndexHotOwner::LookupResident(const BlockIndexLogicalId& id,
@@ -234,6 +364,7 @@ BlockIndexHotStatus BlockIndexHotOwner::LookupResident(const BlockIndexLogicalId
 {
     if (!out)
         return BlockIndexHotStatus::PIN_REQUIRED;
+    LOCK(cs);
     Entry* e = EntryLocked(id.GetHash());
     if (!e || !e->materialized)
         return BlockIndexHotStatus::NOT_RESIDENT;
@@ -246,6 +377,7 @@ BlockIndexHotStatus BlockIndexHotOwner::LookupResident(const BlockIndexLogicalId
 
 int BlockIndexHotOwner::ReleasePin(const uint256& hash)
 {
+    LOCK(cs);
     Entry* e = EntryLocked(hash);
     if (!e)
         return 0;
@@ -259,6 +391,7 @@ int BlockIndexHotOwner::ReleasePin(const uint256& hash)
 
 void BlockIndexHotOwner::PinPermanent(const BlockIndexLogicalId& id)
 {
+    LOCK(cs);
     Entry* e = EntryLocked(id.GetHash());
     if (!e)
     {
@@ -273,6 +406,7 @@ void BlockIndexHotOwner::PinPermanent(const BlockIndexLogicalId& id)
 
 std::vector<BlockIndexLogicalId> BlockIndexHotOwner::EvictEligible() const
 {
+    LOCK(cs);
     std::vector<BlockIndexLogicalId> out;
     for (const auto& kv : resident)
     {
@@ -287,6 +421,7 @@ std::vector<BlockIndexLogicalId> BlockIndexHotOwner::EvictEligible() const
 
 BlockIndexHotStatus BlockIndexHotOwner::EvictResident(const BlockIndexLogicalId& id)
 {
+    LOCK(cs);
     std::map<uint256, Entry>::iterator it = resident.find(id.GetHash());
     if (it == resident.end())
         return BlockIndexHotStatus::NOT_RESIDENT;
@@ -310,6 +445,7 @@ BlockIndexHotStatus BlockIndexHotOwner::EvictResident(const BlockIndexLogicalId&
 
 size_t BlockIndexHotOwner::ResidentCount() const
 {
+    LOCK(cs);
     size_t n = 0;
     for (const auto& kv : resident)
         if (kv.second.materialized) ++n;
@@ -318,6 +454,7 @@ size_t BlockIndexHotOwner::ResidentCount() const
 
 size_t BlockIndexHotOwner::PinCount() const
 {
+    LOCK(cs);
     size_t n = 0;
     for (const auto& kv : resident)
         n += (size_t)kv.second.pins;
@@ -326,6 +463,10 @@ size_t BlockIndexHotOwner::PinCount() const
 
 CBlockIndex* BlockIndexHotOwner::GetResidentRaw(const uint256& hash) const
 {
+    // ONLY valid while the caller holds a pin (handle) that guarantees the raw
+    // object's lifetime. Every public path that hands out a raw object does so
+    // through a pin acquired under `cs`, so eviction cannot free it concurrently.
+    LOCK(cs);
     std::map<uint256, Entry>::const_iterator it = resident.find(hash);
     if (it == resident.end() || !it->second.materialized)
         return NULL;
@@ -334,6 +475,7 @@ CBlockIndex* BlockIndexHotOwner::GetResidentRaw(const uint256& hash) const
 
 BlockIndexHotMetrics BlockIndexHotOwner::Metrics() const
 {
+    LOCK(cs);
     BlockIndexHotMetrics m = metrics;
     m.residentCount = (int64_t)ResidentCount();
     m.pinnedCount = (int64_t)PinCount();

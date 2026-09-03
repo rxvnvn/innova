@@ -8,6 +8,7 @@
 #include "blockindex_navigation.h"
 #include "blockindex_accessor.h"
 #include "main.h"
+#include "sync.h"
 
 #include <cstddef>
 #include <map>
@@ -151,8 +152,12 @@ struct BlockIndexHotMetrics
 
 /**
  * Owner of evictable CBlockIndex objects keyed by stable logical hash.
- * Not thread-safe by default (single-threaded for the checkpoint; a leaf
- * CCriticalSection guard is added when concurrency is introduced). 
+ *
+ * Thread-safe via one internal LEAF lock (cc `cs`). The lock is never acquired
+ * while cs_main/cs_wallet/cs_spvutxos are held by the caller IN REVERSE order,
+ * and the owner NEVER takes cs_main: it is a leaf, so it cannot create a lock
+ * cycle. The internal lock is held only for a *finite* state transition -- the
+ * materializer I/O explicitly runs OUTSIDE `cs` (two-phase split-lock, A.10.1d).
  */
 class BlockIndexHotOwner
 {
@@ -168,8 +173,8 @@ public:
     bool IsPinned(const BlockIndexLogicalId& id) const;
 
     /** Replace the owner's current generation tag (for GENERATION_MISMATCH). */
-    void SetCurrentGeneration(uint64_t gen) { currentGeneration = gen; }
-    uint64_t CurrentGeneration() const { return currentGeneration; }
+    void SetCurrentGeneration(uint64_t gen);
+    uint64_t CurrentGeneration() const;
 
     // --- materialization (two-phase: request under lock, materialize outside,
     //     publish under lock) ---
@@ -233,8 +238,13 @@ private:
     uint64_t currentGeneration;
     uint64_t nextTokenSeq;
     BlockIndexHotMetrics metrics;
+    mutable CCriticalSection cs;         // LEAF lock: never acquires cs_main etc.
 
-    Entry* EntryLocked(uint256 hash);
+    Entry* EntryLocked(uint256 hash);                       // requires cs (recursive)
+    BlockIndexHotStatus RequestMaterializationLocked(const BlockIndexLogicalId& id,
+                                                     BlockIndexHotToken* token); // requires cs
+    BlockIndexHotStatus PublishMaterializedLocked(const BlockIndexHotToken& token,
+                                                  const BlockIndexHotMaterialized& m); // requires cs
 };
 
 #endif // INNOVA_BLOCKINDEX_HOT_OWNER_H
