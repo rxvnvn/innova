@@ -123,6 +123,16 @@ bool V2BlockIndexStartupAuthority::IsAuthoritativeCapable() const
     return impl && impl->open && impl->authoritativeCapable;
 }
 
+const BlockIndexV2Reader* V2BlockIndexStartupAuthority::ReaderPtr() const
+{
+    return (impl && impl->open) ? &impl->reader : NULL;
+}
+
+const BlockIndexDerivedStateStore* V2BlockIndexStartupAuthority::DerivedStorePtr() const
+{
+    return (impl && impl->open) ? &impl->derivedStore : NULL;
+}
+
 BlockIndexStartupAuthorityIdentity V2BlockIndexStartupAuthority::Identity() const
 {
     BlockIndexStartupAuthorityIdentity out;

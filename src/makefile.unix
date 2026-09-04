@@ -397,6 +397,7 @@ OBJS= \
     obj/blockindex_accessor.o \
     obj/blockindex_startup_authority.o \
     obj/blockindex_startup_seam.o \
+    obj/blockindex_startup_bootstrap.o \
     obj/blockindex_derived_state.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
@@ -498,6 +499,7 @@ OBJS= \
     obj/blockindex_accessor.o \
     obj/blockindex_startup_authority.o \
     obj/blockindex_startup_seam.o \
+    obj/blockindex_startup_bootstrap.o \
     obj/blockindex_derived_state.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
@@ -549,6 +551,7 @@ TEST_OBJS= \
     obj/test/blockindex_accessor_tests.o \
     obj/test/blockindex_startup_authority_tests.o \
     obj/test/blockindex_startup_seam_tests.o \
+    obj/test/blockindex_startup_bootstrap_tests.o \
     obj/test/blockindex_derived_state_tests.o \
     obj/test/fixed_blockindex_store_tests.o \
     obj/test/blockindex_hashindex_tests.o \

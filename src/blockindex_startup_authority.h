@@ -8,6 +8,9 @@
 
 #include <stdint.h>
 
+class BlockIndexV2Reader;
+class BlockIndexDerivedStateStore;
+
 // A.10.1a: typed, by-value semantic boundary for startup block-index state.
 //
 // This contract does not establish production authority and does not own or
@@ -193,6 +196,13 @@ public:
 
     // A.10.1b-fix2: check if the opened generation is authoritative-capable
     bool IsAuthoritativeCapable() const;
+
+    // A.10.1i: expose the internally-opened generation-bound reader/derived
+    // stores so a materializer/bootstrap can bind the SAME stores (a second
+    // independent open of the same hashindex/derived.dat would collide on the
+    // LevelDB LOCK and break generation coherence). Returns NULL when not open.
+    const BlockIndexV2Reader* ReaderPtr() const;
+    const BlockIndexDerivedStateStore* DerivedStorePtr() const;
 
     virtual BlockIndexStartupAuthorityIdentity Identity() const;
     virtual BlockIndexStartupResult GetTip() const;
