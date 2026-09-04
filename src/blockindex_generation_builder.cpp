@@ -570,6 +570,9 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             // Post-DAG PoS: trust = 0
         }
         dc.chainTrust = parentTrust + blockTrust;
+
+        // Store intermediate chainTrust so subsequent loops can reference it
+        derivedByHash[hash] = dc;
     }
 
     // A.10.1b-fix3 C3: Reconstruct canonical DAG scores using production
@@ -695,6 +698,7 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             dc.hasBlockSize = false;
         }
 
+        // Update derivedByHash with all computed fields (chainTrust was already set)
         derivedByHash[hash] = dc;
     }
 

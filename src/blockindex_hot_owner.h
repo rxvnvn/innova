@@ -23,8 +23,11 @@
 //                     by-value via StartupAuthority / V2 reader / frontier.
 //   MATERIALIZATION : how to obtain an in-memory CBlockIndex (layer-1 metadata
 //                     from V2 source). Does NOT decide how long it stays alive.
+//                     The materializer interface (BlockIndexHotMaterializer) is
+//                     STATELESS; it holds no resident object cache.
 //   RESIDENCY       : how long a materialized CBlockIndex stays in RAM -- owned
 //                     ONLY by BlockIndexHotOwner, governed by pin lifetime.
+//                     HotOwner maintains a resident cache (std::map<uint256,Entry>).
 //
 // mapBlockIndex remains the authoritative/fully-resident legacy owner. The
 // HotOwner is ADDITIVE machinery (used by tests + future consumers); it does

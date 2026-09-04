@@ -505,6 +505,7 @@ OBJS= \
     obj/blockindex_shadow_runtime.o \
     obj/blockindex_shadow_startup.o \
     obj/blockindex_v2_reader.o \
+    obj/blockindex_authority_materializer.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 endif
@@ -557,6 +558,7 @@ TEST_OBJS= \
     obj/test/candidate_frontier_tests.o \
     obj/test/blockindex_hot_owner_tests.o \
     obj/test/blockindex_first_consumer_tests.o \
+    obj/test/blockindex_production_materializer_tests.o \
     obj/test/cold_hot_seam_tests.o \
     obj/test/stable_navigation_identity_tests.o \
     obj/test/staking_production_integration_tests.o
