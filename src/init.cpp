@@ -31,6 +31,7 @@
 #include "blockindex_active_chain_reader.h"
 #include "blockindex_generation_lifecycle.h"
 #include "hreg_registration.h"
+#include "blockindex_residency_counters.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -1488,6 +1489,9 @@ bool AppInit2()
 
     if (!LoadBlockIndex())
         return InitError(_("Error loading blkindex.dat"));
+    printf(" block index (legacy resident) loaded; mapBlockIndex.size()=%llu\n",
+           (unsigned long long)mapBlockIndex.size());
+    PrintBlockIndexResidency("LEGACY_RESIDENT", 0, "T1_blockindex", 0,0,0,0);
 
 authoritative_startup_ready:
     (void)0;
@@ -1510,6 +1514,7 @@ authoritative_startup_ready:
         if (!hreg::RebuildHRegStateFromActiveChainByValue(hregReader, 0, -1, hregErr))
             return InitError(strprintf("Block Index V2 authoritative HReg rebuild failed: %s", hregErr.c_str()));
         printf(" block index (authoritative) HReg rebuilt by value\n");
+        PrintAuthoritativeResidency("T1_blockindex");
     }
 
 
@@ -2029,6 +2034,12 @@ authoritative_startup_ready:
         printf("Debugging is Enabled.\n");
 	else
         printf("Debugging is not enabled.\n");
+
+    // ---- Activation Stage 1: startup-complete residency snapshot (T3) ----
+    if (g_fAuthoritativeStartup)
+        PrintAuthoritativeResidency("T3_startup_complete");
+    else
+        PrintBlockIndexResidency("LEGACY_RESIDENT", 0, "T3_startup_complete", 0,0,0,0);
 
     if (!NewThread(StartNode, NULL))
         InitError(_("Error: could not start node"));

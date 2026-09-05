@@ -37,6 +37,7 @@
 #include "dag.h"
 #include "candidate_frontier.h"
 #include "blockindex_hot_owner.h"
+#include "blockindex_residency_counters.h"
 #include "hreg_registration.h"
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
@@ -4724,6 +4725,7 @@ void CBlockIndex::BuildSkip()
         pskip = pprev->GetAncestor(GetSkipHeight(nHeight));
     else
         pskip = NULL;
+    g_res_pskip_links++;
 }
 
 const CBlockIndex* CBlockIndex::GetAncestor(int nHeightTarget) const

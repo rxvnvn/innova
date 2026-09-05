@@ -6,6 +6,7 @@
 #include "main.h"
 #include "txdb.h"
 #include "finality.h"
+#include "blockindex_residency_counters.h"
 #include "util.h"
 
 #include <algorithm>
@@ -957,6 +958,7 @@ bool CDAGManager::LoadEpochStates(CTxDB& txdb)
 
 void CDAGManager::RestoreDAGTrustIntoChainTrust()
 {
+    g_res_restoredagtrust_calls++;
     LOCK(cs_dag);
 
     int nCount = 0;

@@ -53,4 +53,8 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error);
 std::string AuthoritativeRootPath();
 uint64_t AuthoritativeGeneration();
 
+// A.10.1q / Stage1: emit the BLOCKINDEX_RESIDENCY line for the retained
+// authoritative context, including the bootstrap HotOwner live metrics.
+void PrintAuthoritativeResidency(const char* tag);
+
 #endif // INNOVA_BLOCKINDEX_AUTHORITATIVE_STARTUP_H

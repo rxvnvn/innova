@@ -19,6 +19,7 @@
 #include "txdb.h"
 #include "util.h"
 #include "main.h"
+#include "blockindex_residency_counters.h"
 
 extern bool RebuildMainChainForwardLinks();
 
@@ -975,12 +976,15 @@ static CBlockIndex *InsertBlockIndex(uint256 hash)
         throw runtime_error("LoadBlockIndex() : new CBlockIndex failed");
     mi = mapBlockIndex.insert(make_pair(hash, pindexNew)).first;
     pindexNew->phashBlock = &((*mi).first);
+    g_res_cblockindex_constructed++;
+    g_res_mapinserts++;
 
     return pindexNew;
 }
 
 bool CTxDB::LoadBlockIndex()
 {
+    g_res_loadblockindex_calls++;
     if (mapBlockIndex.size() > 0) {
         // Already loaded once in this session. It can happen during migration
         // from BDB.
@@ -1016,6 +1020,8 @@ bool CTxDB::LoadBlockIndex()
         CBlockIndex* pindexNew    = InsertBlockIndex(blockHash);
         pindexNew->pprev          = InsertBlockIndex(diskindex.hashPrev);
         pindexNew->pnext          = InsertBlockIndex(diskindex.hashNext);
+        g_res_pprev_links++;
+        g_res_pnext_links++;
         pindexNew->nFile          = diskindex.nFile;
         pindexNew->nBlockPos      = diskindex.nBlockPos;
         pindexNew->nHeight        = diskindex.nHeight;

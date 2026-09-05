@@ -2,6 +2,7 @@
 // Distributed under the MIT/X11 software license.
 
 #include "blockindex_startup_bootstrap.h"
+#include "blockindex_residency_counters.h"
 #include "blockindex_generation_lifecycle.h"
 
 BlockIndexStartupBootstrap::BlockIndexStartupBootstrap()
@@ -98,6 +99,7 @@ BlockIndexStartupStatus BlockIndexStartupBootstrap::Open(const std::string& root
     // bootstrap lifetime.
     owner_->PinPermanent(bestTipId_);
     owner_->PinPermanent(genesisId_);
+    g_res_anchors += 2;
 
     generation_ = gen;
     isOpen_ = true;

@@ -3,6 +3,7 @@
 
 #include "blockindex_authoritative_startup.h"
 
+#include "blockindex_residency_counters.h"
 #include "blockindex_startup_bootstrap.h"
 #include "blockindex_stake_seen_builder.h"
 #include "blockindex_candidate_startup_builder.h"
@@ -178,4 +179,19 @@ uint64_t AuthoritativeGeneration()
 {
     if (!g_authoritativeContext) return 0;
     return g_authoritativeContext->bootstrap.Generation();
+}
+
+// A.10.1q / Stage1: emit residency for the retained authoritative context,
+// reading the bootstrap HotOwner live metrics.
+void PrintAuthoritativeResidency(const char* tag)
+{
+    int64_t hc = 0, hp = 0, pc = 0, pp = 0;
+    if (g_authoritativeContext)
+    {
+        const BlockIndexHotMetrics m = g_authoritativeContext->bootstrap.Owner().Metrics();
+        hc = m.residentCount; hp = m.peakResidentCount;
+        pc = m.pinnedCount;   pp = m.pinnedCount; // pin peak == current pinned count at T (stable)
+    }
+    PrintBlockIndexResidency("BY_VALUE_AUTHORITATIVE",
+                            (int64_t)AuthoritativeGeneration(), tag, hc, hp, pc, pp);
 }

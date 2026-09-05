@@ -15,6 +15,7 @@
 #include "ui_interface.h"
 #include "base58.h"
 #include "kernel.h"
+#include "blockindex_residency_counters.h"
 #include "blockindex_shadow_startup.h"
 #include "coincontrol.h"
 #include "spork.h"
@@ -268,6 +269,7 @@ ColdHotSeamResult GetStakingSourceAuthority(const uint256& hashBlock,
     }
 
     std::map<uint256, CBlockIndex*>::const_iterator it = mapBlockIndex.find(hashBlock);
+    g_res_legacyaccessor_fallbacks++;
     if (it == mapBlockIndex.end() || !it->second)
         return COLD_HOT_SEAM_NOT_FOUND;
     if (!it->second->IsInMainChain())

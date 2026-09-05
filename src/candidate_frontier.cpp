@@ -2,6 +2,7 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include "blockindex_residency_counters.h"
 #include "candidate_frontier.h"
 #include "main.h"
 #include "txdb.h"
@@ -216,6 +217,7 @@ public:
 
 bool RebuildCandidateTips()
 {
+    g_res_rebuildcandidates_calls++;
     AssertLockHeld(cs_main);
     mapCandidateTips.clear();
 

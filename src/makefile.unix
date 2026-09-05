@@ -412,6 +412,7 @@ OBJS= \
     obj/blockindex_shadow_runtime.o \
     obj/blockindex_shadow_startup.o \
     obj/blockindex_authoritative_startup.o \
+    obj/blockindex_residency_counters.o \
     obj/blockindex_v2_reader.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
@@ -520,6 +521,7 @@ OBJS= \
     obj/blockindex_shadow_runtime.o \
     obj/blockindex_shadow_startup.o \
     obj/blockindex_authoritative_startup.o \
+    obj/blockindex_residency_counters.o \
     obj/blockindex_v2_reader.o \
     obj/blockindex_authority_materializer.o \
     obj/minizip/ioapi.o \
@@ -585,6 +587,7 @@ TEST_OBJS= \
     obj/test/stable_navigation_identity_tests.o \
     obj/test/authoritative_blockindex_hot_resolver_tests.o \
     obj/test/a10_1q_hreg_wallet_wiring_tests.o \
+    obj/test/blockindex_residency_counters_tests.o \
     obj/test/blockindex_authoritative_startup_tests.o \
     obj/test/staking_production_integration_tests.o
 
