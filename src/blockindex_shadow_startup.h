@@ -66,6 +66,14 @@ const ColdHotSeamNavigator* GetBlockIndexStakingNavigator();
 // (used by A.9a.3c code and tests; production startup calls the Retain path).
 void ClearBlockIndexStakingNavigator();
 
+// A.10.1p: authoritative by-value staking navigator. Opens a ColdHotSeamNavigator
+// and injects an AuthoritativeBlockIndexHotResolver bound to the navigator's own
+// cold (authoritative) reader, so the navigator's HOT side is by-value and
+// generation-coherent (no LegacyBlockIndexAccessor, no mapBlockIndex). The
+// resolver is retained alongside the navigator for its lifetime. Call only in
+// BY_VALUE_AUTHORITATIVE startup; otherwise use RetainBlockIndexStakingNavigator.
+bool RetainBlockIndexAuthoritativeNavigator(const std::string& v2Root, std::string* error);
+
 // Cache statistics of the retained reader (zeroed when none retained). Used by
 // the diagnostic RPC to report bounded cache state without reopening.
 BlockIndexV2ReaderCacheStats GetBlockIndexV2ShadowReaderCacheStats();

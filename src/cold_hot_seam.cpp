@@ -40,6 +40,11 @@ void ColdHotSeamNavigator::SetTestHotResolver(const ColdHotHotResolver* resolver
     testHotResolver = resolver;
 }
 
+void ColdHotSeamNavigator::SetProductionHotResolver(const ColdHotHotResolver* resolver)
+{
+    testHotResolver = resolver; // same injection slot; production-safe usage documented
+}
+
 bool ColdHotSeamNavigator::Open(const std::string& v2Root,
                                  const BlockIndexV2ReaderOptions& options,
                                  std::string* error)
@@ -70,6 +75,11 @@ uint64_t ColdHotSeamNavigator::ColdGeneration() const
 BlockIndexSnapshot ColdHotSeamNavigator::GetColdTip() const
 {
     return IsOpen() ? coldReader.GetTip() : BlockIndexSnapshot();
+}
+
+const BlockIndexV2Reader* ColdHotSeamNavigator::GetColdReader() const
+{
+    return IsOpen() ? &coldReader : NULL;
 }
 
 BlockIndexSnapshot ColdHotSeamNavigator::GetHotTip() const

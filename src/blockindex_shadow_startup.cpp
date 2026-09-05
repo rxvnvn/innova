@@ -1,5 +1,6 @@
 #include "blockindex_shadow_startup.h"
 
+#include "authoritative_blockindex_hot_resolver.h"
 #include "blockindex_shadow_runtime.h"
 #include "blockindex_v2_reader.h"
 #include "main.h"
@@ -26,6 +27,12 @@ std::unique_ptr<BlockIndexV2Reader> g_shadowReader;
 // navigation. Owns its own read-only V2 reader on the validated generation plus
 // the LegacyBlockIndexAccessor hot side. NULL until retained.
 std::unique_ptr<ColdHotSeamNavigator> g_stakingNavigator;
+
+// A.10.1p: the authoritative by-value hot resolver retained alongside the
+// authoritative navigator. Must outlive the navigator (it references the
+// navigator's cold reader). NULL unless RetainBlockIndexAuthoritativeNavigator
+// was used.
+std::unique_ptr<AuthoritativeBlockIndexHotResolver> g_stakingAuthoritativeResolver;
 
 } // namespace
 
@@ -235,6 +242,37 @@ bool RetainBlockIndexStakingNavigator(const std::string& root, std::string* erro
         return false;
     }
     g_stakingNavigator.swap(nav);
+    g_stakingAuthoritativeResolver.reset();
+    return true;
+}
+
+bool RetainBlockIndexAuthoritativeNavigator(const std::string& root, std::string* error)
+{
+    if (error)
+        error->clear();
+    LOCK(cs_shadowState);
+    std::unique_ptr<ColdHotSeamNavigator> nav(new ColdHotSeamNavigator());
+    BlockIndexV2ReaderOptions options;   // single shared 64 MiB bounded LRU default
+    std::string navErr;
+    if (!nav->Open(root, options, &navErr))
+    {
+        if (error)
+            *error = navErr;
+        return false;
+    }
+    // Bind a by-value hot resolver to the navigator's own cold (authoritative)
+    // reader so generation stays coherent and the hot side has no mapBlockIndex.
+    const BlockIndexV2Reader* coldReader = nav->GetColdReader();
+    if (!coldReader)
+    {
+        if (error)
+            *error = "authoritative navigator: no cold reader";
+        return false;
+    }
+    g_stakingAuthoritativeResolver.reset(
+        new AuthoritativeBlockIndexHotResolver(coldReader));
+    nav->SetProductionHotResolver(g_stakingAuthoritativeResolver.get());
+    g_stakingNavigator.swap(nav);
     return true;
 }
 
@@ -248,6 +286,7 @@ void ClearBlockIndexStakingNavigator()
 {
     LOCK(cs_shadowState);
     g_stakingNavigator.reset();
+    g_stakingAuthoritativeResolver.reset();
 }
 
 BlockIndexV2ReaderCacheStats GetBlockIndexV2ShadowReaderCacheStats()

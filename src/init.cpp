@@ -27,6 +27,7 @@
 #include "headersservededup.h"
 #include "getblocksservedinvzero.h"
 #include "blockindex_shadow_startup.h"
+#include "blockindex_authoritative_startup.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -1467,8 +1468,26 @@ bool AppInit2()
     uiInterface.InitMessage(_("Loading block index..."));
     printf("Loading block index...\n");
     nStart = GetTimeMillis();
+
+    // ---- A.10.1h..p / D R5: controlled authoritative by-value startup cutover ----
+    // Explicit opt-in via -blockindexv2authoritative=<generation-root>. Bypasses
+    // legacy LoadBlockIndex all-history CBlockIndex construction and boots from
+    // the validated V2 CURRENT generation. Fail-closed; NO fallback to legacy.
+    const std::string authRoot = GetArg("-blockindexv2authoritative", "");
+    if (!authRoot.empty())
+    {
+        std::string authErr;
+        if (!InitBlockIndexAuthoritative(authRoot, &authErr))
+            return InitError(strprintf("Block Index V2 authoritative startup failed: %s", authErr.c_str()));
+        printf(" block index (authoritative) %" PRId64"ms\n", GetTimeMillis() - nStart);
+        goto authoritative_startup_ready;
+    }
+
     if (!LoadBlockIndex())
         return InitError(_("Error loading blkindex.dat"));
+
+authoritative_startup_ready:
+    (void)0;
 
 
     // as LoadBlockIndex can take several minutes, it's possible the user
@@ -1865,7 +1884,12 @@ bool AppInit2()
 
     // IDAG Phase 2+3: DAG manager initialized via global constructor
     // Links loaded during LoadBlockIndex() in txdb-leveldb.cpp
-    if (pindexBest && pindexBest->nHeight >= FORK_HEIGHT_DAG)
+    // In authoritative mode, DAG links/runtime were loaded during bootstrap and
+    // DAG trust comes from authoritative derived.dat chainTrust (A.10.1o); the
+    // legacy mapBlockIndex-dependent RebuildDAGOrder/RestoreDAGTrustIntoChainTrust
+    // are NOT applicable (no historical CBlockIndex graph exists).
+    if (!g_fAuthoritativeStartup &&
+        pindexBest && pindexBest->nHeight >= FORK_HEIGHT_DAG)
     {
         // IDAG Phase 3: Check for clean height — use incremental rebuild if available
         // Also restore nPrunedBelowHeight for GetBlueSet boundary detection
@@ -1916,7 +1940,11 @@ bool AppInit2()
 
     // Candidate tip frontier: rebuild bounded tips index from full block index.
     // If no DAG blocks exist, the tips set is still valid for candidate selection.
-    RebuildCandidateTips();
+    // In authoritative mode the frontier was already built by
+    // BlockIndexCandidateStartupBuilder (A.10.1m) from by-value V2 records; the
+    // legacy full-mapBlockIndex scan is not applicable (no historical graph).
+    if (!g_fAuthoritativeStartup)
+        RebuildCandidateTips();
 
     RandAddSeedPerfmon();
 

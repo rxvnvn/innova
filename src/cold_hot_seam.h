@@ -78,6 +78,13 @@ public:
     // LegacyBlockIndexAccessor behavior. Never called by production startup.
     void SetTestHotResolver(const ColdHotHotResolver* resolver);
 
+    // A.10.1p: production-safe hot resolver install. Equivalent mechanism to the
+    // test setter but intended for authoritative startup: binds an external
+    // by-value hot resolver (e.g. AuthoritativeBlockIndexHotResolver) that must
+    // outlive this navigator and be generation-coherent with its cold reader.
+    // NULL restores the default LegacyBlockIndexAccessor hot side.
+    void SetProductionHotResolver(const ColdHotHotResolver* resolver);
+
     /** Require the pinned V2 generation to match CURRENT and the live active
      * chain at the generation tip. Does not auto-rebase. */
     bool VerifySeam(std::string* error) const;
@@ -205,6 +212,9 @@ public:
     BlockIndexSnapshot GetColdTip() const;
     BlockIndexSnapshot GetHotTip() const;
     uint64_t ColdGeneration() const;
+    // A.10.1p: expose the cold (authoritative) reader so a production by-value
+    // hot resolver can bind the SAME generation-coherent reader. Non-owning.
+    const BlockIndexV2Reader* GetColdReader() const;
 
 private:
     bool MakeCold(const BlockIndexSnapshot& snapshot, ColdHotSeamSnapshot* out,

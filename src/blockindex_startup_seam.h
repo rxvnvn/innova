@@ -37,6 +37,9 @@ enum class BlockIndexStartupMode
 {
     LEGACY_RESIDENT = 0,  // default; legacy startup unchanged
     BY_VALUE_SHADOW = 1,  // opt-in by-value decode; no CBlockIndex allocation
+    BY_VALUE_AUTHORITATIVE = 2, // explicit authoritative cutover (D R5); bypasses
+                                // legacy LoadBlockIndex, bootstraps from the
+                                // validated V2 CURRENT generation
 };
 
 // Factory owning the startup-authority selection. STATELESS; creation does not
