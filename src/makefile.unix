@@ -394,6 +394,7 @@ OBJS= \
     obj/bootstrap.o \
     obj/blockindex_navigation.o \
     obj/cold_hot_seam.o \
+    obj/authoritative_blockindex_hot_resolver.o \
     obj/blockindex_accessor.o \
     obj/blockindex_startup_authority.o \
     obj/blockindex_startup_seam.o \
@@ -500,6 +501,7 @@ OBJS= \
     obj/bootstrap.o \
     obj/blockindex_navigation.o \
     obj/cold_hot_seam.o \
+    obj/authoritative_blockindex_hot_resolver.o \
     obj/blockindex_accessor.o \
     obj/blockindex_startup_authority.o \
     obj/blockindex_startup_seam.o \
@@ -579,6 +581,7 @@ TEST_OBJS= \
     obj/test/blockindex_production_materializer_tests.o \
     obj/test/cold_hot_seam_tests.o \
     obj/test/stable_navigation_identity_tests.o \
+    obj/test/authoritative_blockindex_hot_resolver_tests.o \
     obj/test/staking_production_integration_tests.o
 
 .PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle check-cnpayment-guard release-check innova-blockindex-builder
