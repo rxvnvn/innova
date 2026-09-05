@@ -584,6 +584,7 @@ TEST_OBJS= \
     obj/test/cold_hot_seam_tests.o \
     obj/test/stable_navigation_identity_tests.o \
     obj/test/authoritative_blockindex_hot_resolver_tests.o \
+    obj/test/a10_1q_hreg_wallet_wiring_tests.o \
     obj/test/blockindex_authoritative_startup_tests.o \
     obj/test/staking_production_integration_tests.o
 

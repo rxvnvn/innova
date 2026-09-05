@@ -28,6 +28,9 @@
 #include "getblocksservedinvzero.h"
 #include "blockindex_shadow_startup.h"
 #include "blockindex_authoritative_startup.h"
+#include "blockindex_active_chain_reader.h"
+#include "blockindex_generation_lifecycle.h"
+#include "hreg_registration.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
 #include "spork.h"
@@ -1489,6 +1492,26 @@ bool AppInit2()
 authoritative_startup_ready:
     (void)0;
 
+    // ---- A.10.1q: BY_VALUE_AUTHORITATIVE HReg startup rebuild ----
+    // Route HReg through the by-value active-chain path (ca7c7e1) against the
+    // SAME selected generation as bootstrap+navigator. Fail-closed; never falls
+    // back to the legacy pointer rebuild. Legacy modes unchanged.
+    if (g_fAuthoritativeStartup)
+    {
+        const std::string root = AuthoritativeRootPath();
+        const uint64_t gen = AuthoritativeGeneration();
+        if (root.empty() || gen == 0)
+            return InitError(_("Block Index V2 authoritative startup: missing generation context for HReg"));
+        std::string hregErr;
+        BlockIndexActiveChainReader hregReader;
+        std::string genDir = BlockIndexGenerationManager::GenerationPath(root, gen);
+        if (!hregReader.Open(genDir, gen, &hregErr))
+            return InitError(strprintf("Block Index V2 authoritative HReg reader open failed: %s", hregErr.c_str()));
+        if (!hreg::RebuildHRegStateFromActiveChainByValue(hregReader, 0, -1, hregErr))
+            return InitError(strprintf("Block Index V2 authoritative HReg rebuild failed: %s", hregErr.c_str()));
+        printf(" block index (authoritative) HReg rebuilt by value\n");
+    }
+
 
     // as LoadBlockIndex can take several minutes, it's possible the user
     // requested to kill bitcoin-qt during the last operation. If so, exit.
@@ -1709,8 +1732,29 @@ authoritative_startup_ready:
         uiInterface.InitMessage(_("Rescanning..."));
         printf("Rescanning last %i blocks (from block %i)...\n", pindexBest->nHeight - pindexRescan->nHeight, pindexRescan->nHeight);
         nStart = GetTimeMillis();
-        pwalletMain->ScanForWalletTransactions(pindexRescan, true);
-        printf(" rescan      %15" PRId64"ms\n", GetTimeMillis() - nStart);
+        if (g_fAuthoritativeStartup)
+        {
+            // ---- A.10.1q: BY_VALUE_AUTHORITATIVE wallet rescan ----
+            // Route through ScanForWalletTransactionsByValue against the SAME
+            // selected generation. Scans from height 0; per-transaction result
+            // parity is preserved because the wallet's nTimeFirstKey birthday
+            // early-continue (mirrored in the by-value scan) skips pre-birthday
+            // blocks, matching the legacy result exactly. Never the pointer walk.
+            const std::string root = AuthoritativeRootPath();
+            const uint64_t gen = AuthoritativeGeneration();
+            if (root.empty() || gen == 0)
+                return InitError(_("Block Index V2 authoritative startup: missing generation context for wallet rescan"));
+            std::string scanErr;
+            BlockIndexActiveChainReader scanReader;
+            std::string genDir = BlockIndexGenerationManager::GenerationPath(root, gen);
+            if (!scanReader.Open(genDir, gen, &scanErr))
+                return InitError(strprintf("Block Index V2 authoritative wallet rescan reader open failed: %s", scanErr.c_str()));
+            pwalletMain->ScanForWalletTransactionsByValue(scanReader, 0, true);
+            printf(" rescan (authoritative) %15" PRId64"ms\n", GetTimeMillis() - nStart);
+        } else {
+            pwalletMain->ScanForWalletTransactions(pindexRescan, true);
+            printf(" rescan      %15" PRId64"ms\n", GetTimeMillis() - nStart);
+        }
     };
 
     // Add wallet transactions that aren't already in a block to mapTransactions

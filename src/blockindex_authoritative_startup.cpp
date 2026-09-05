@@ -165,3 +165,17 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
            nBestHeight, nBestChainTrust.ToString().substr(0, 16).c_str());
     return true;
 }
+
+// A.10.1q: expose the retained authoritative generation root + generation for
+// building a BlockIndexActiveChainReader against the SAME selected generation.
+std::string AuthoritativeRootPath()
+{
+    if (!g_authoritativeContext) return std::string();
+    return g_authoritativeContext->v2Root;
+}
+
+uint64_t AuthoritativeGeneration()
+{
+    if (!g_authoritativeContext) return 0;
+    return g_authoritativeContext->bootstrap.Generation();
+}

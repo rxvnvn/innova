@@ -32,6 +32,7 @@
 #ifndef INNOVA_BLOCKINDEX_AUTHORITATIVE_STARTUP_H
 #define INNOVA_BLOCKINDEX_AUTHORITATIVE_STARTUP_H
 
+#include <stdint.h>
 #include <string>
 
 // Set to true (by InitBlockIndexAuthoritative) while an authoritative by-value
@@ -44,5 +45,12 @@ extern bool g_fAuthoritativeStartup;
 // never falls back to legacy LoadBlockIndex. On success the authoritative
 // navigator/bootstrap are retained process-lifetime so globals stay valid.
 bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error);
+
+// A.10.1q: expose the retained authoritative generation root + generation so
+// init.cpp can build a BlockIndexActiveChainReader for HReg + wallet rescan
+// against the SAME selected generation (no second CURRENT open). Empty/0 if not
+// in authoritative mode.
+std::string AuthoritativeRootPath();
+uint64_t AuthoritativeGeneration();
 
 #endif // INNOVA_BLOCKINDEX_AUTHORITATIVE_STARTUP_H
