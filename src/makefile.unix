@@ -405,6 +405,7 @@ OBJS= \
     obj/blockindex_activeindex.o \
     obj/blockindex_active_chain_reader.o \
     obj/blockindex_generation_builder.o \
+    obj/blockindex_candidate_startup_builder.o \
     obj/blockindex_generation_lifecycle.o \
     obj/blockindex_shadow_runtime.o \
     obj/blockindex_shadow_startup.o \
@@ -509,6 +510,7 @@ OBJS= \
     obj/blockindex_activeindex.o \
     obj/blockindex_active_chain_reader.o \
     obj/blockindex_generation_builder.o \
+    obj/blockindex_candidate_startup_builder.o \
     obj/blockindex_generation_lifecycle.o \
     obj/blockindex_shadow_runtime.o \
     obj/blockindex_shadow_startup.o \
@@ -568,6 +570,7 @@ TEST_OBJS= \
     obj/test/blockindex_v2_reader_tests.o \
     obj/test/dag_trust_restart_tests.o \
     obj/test/candidate_frontier_tests.o \
+    obj/test/blockindex_candidate_startup_builder_tests.o \
     obj/test/blockindex_hot_owner_tests.o \
     obj/test/blockindex_first_consumer_tests.o \
     obj/test/blockindex_production_materializer_tests.o \
