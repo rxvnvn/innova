@@ -364,4 +364,51 @@ BOOST_AUTO_TEST_CASE(i12_no_map_dependency_causal)
     BOOST_CHECK(mapBlockIndex.find(fx.tip.hash) == mapBlockIndex.end());
 }
 
+
+
+// J0 - genesis anchor (A.10.1j): bootstrap materializes/pins exact genesis from
+// the same generation.
+BOOST_AUTO_TEST_CASE(j0_genesis_anchor)
+{
+    BootstrapFixture fx(3);
+    std::string error;
+    BlockIndexStartupBootstrap bt;
+    BOOST_REQUIRE_MESSAGE(OpenBootstrap(fx, bt, error) == BLOCK_INDEX_STARTUP_OK, error);
+    BOOST_REQUIRE(bt.IsOpen());
+    BOOST_REQUIRE(bt.GenesisObject() != NULL);
+    BOOST_CHECK_EQUAL(bt.GenesisObject()->nHeight, 0);
+    BOOST_CHECK(bt.Owner().IsResident(bt.GenesisId()));
+    BOOST_CHECK(bt.Owner().IsPinned(bt.GenesisId()));
+}
+
+// J1 - genesis lifetime: eviction blocked while anchored; the anchor persists
+// for the bootstrap lifetime.
+BOOST_AUTO_TEST_CASE(j1_genesis_lifetime)
+{
+    BootstrapFixture fx(3);
+    std::string error;
+    BlockIndexStartupBootstrap bt;
+    BOOST_REQUIRE_MESSAGE(OpenBootstrap(fx, bt, error) == BLOCK_INDEX_STARTUP_OK, error);
+    std::vector<BlockIndexLogicalId> eligible = bt.OwnerPtr()->EvictEligible();
+    bool found = false;
+    for (size_t i = 0; i < eligible.size(); ++i)
+        if (eligible[i] == bt.GenesisId()) found = true;
+    BOOST_CHECK_MESSAGE(!found, "genesis must never be eviction-eligible (anchor)");
+    BOOST_CHECK(bt.OwnerPtr()->EvictResident(bt.GenesisId()) == BlockIndexHotStatus::EVICTION_BLOCKED);
+}
+
+// J2 - sparse genesis: no historical pprev/pnext/pskip required to anchor.
+BOOST_AUTO_TEST_CASE(j2_sparse_genesis)
+{
+    BootstrapFixture fx(3);
+    std::string error;
+    BlockIndexStartupBootstrap bt;
+    BOOST_REQUIRE_MESSAGE(OpenBootstrap(fx, bt, error) == BLOCK_INDEX_STARTUP_OK, error);
+    CBlockIndex* g = bt.GenesisObject();
+    BOOST_REQUIRE(g != NULL);
+    BOOST_CHECK(g->pprev == NULL);
+    BOOST_CHECK(g->pnext == NULL);
+    BOOST_CHECK(g->pskip == NULL);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -5,7 +5,7 @@
 #include "blockindex_generation_lifecycle.h"
 
 BlockIndexStartupBootstrap::BlockIndexStartupBootstrap()
-    : generation_(0), bestTipId_(), isOpen_(false)
+    : generation_(0), bestTipId_(), genesisId_(), isOpen_(false)
 {
 }
 
@@ -77,6 +77,28 @@ BlockIndexStartupStatus BlockIndexStartupBootstrap::Open(const std::string& root
         return BLOCK_INDEX_STARTUP_CORRUPT;
     }
 
+    // 5. Resolve + anchor the genesis block of the SAME generation (A.10.1j).
+    //    Supplies pindexGenesisBlock for future authoritative startup.
+    const BlockIndexStartupResult genesisRes = authority_.GetActiveByHeight(0);
+    if (!genesisRes.HasRecord())
+    {
+        if (error) *error = "bootstrap: no genesis in authority";
+        return BLOCK_INDEX_STARTUP_NOT_FOUND;
+    }
+    genesisId_ = genesisRes.record.logicalId;
+
+    const BlockIndexHotStatus gPinSt = owner_->Pin(genesisId_, &genesisHandle_);
+    if (gPinSt != BlockIndexHotStatus::OK || !genesisHandle_.IsValid())
+    {
+        if (error) *error = "bootstrap: genesis pin/materialize failed (status " +
+            std::to_string((int)gPinSt) + ")";
+        return BLOCK_INDEX_STARTUP_CORRUPT;
+    }
+    // Anchor genesis (and best tip) as PINNED-PERMANENT: never evictable for the
+    // bootstrap lifetime.
+    owner_->PinPermanent(bestTipId_);
+    owner_->PinPermanent(genesisId_);
+
     generation_ = gen;
     isOpen_ = true;
     (void)options;
@@ -88,6 +110,7 @@ void BlockIndexStartupBootstrap::Close()
     if (!isOpen_)
         return;
     bestTipHandle_ = BlockIndexHotHandle();
+    genesisHandle_ = BlockIndexHotHandle();
     if (owner_)
         owner_.reset();
     if (mat_)
@@ -130,4 +153,16 @@ CBlockIndex* BlockIndexStartupBootstrap::BestTipObject() const
     if (!isOpen_ || !bestTipHandle_.IsValid())
         return NULL;
     return bestTipHandle_.Get();
+}
+
+BlockIndexLogicalId BlockIndexStartupBootstrap::GenesisId() const
+{
+    return genesisId_;
+}
+
+CBlockIndex* BlockIndexStartupBootstrap::GenesisObject() const
+{
+    if (!isOpen_ || !genesisHandle_.IsValid())
+        return NULL;
+    return genesisHandle_.Get();
 }

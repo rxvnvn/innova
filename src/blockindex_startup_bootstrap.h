@@ -78,6 +78,15 @@ public:
     // lifetime because it is a PINNED-PERMANENT anchor). NULL if not open.
     CBlockIndex* BestTipObject() const;
 
+    // ----- pinned genesis anchor (A.10.1j) -----
+    // The genesis block of the SAME selected generation, pinned as a PERMANENT
+    // anchor (never evictable) with the same bootstrap-lifetime ownership
+    // semantics as the best tip. Required so authoritative startup can supply
+    // pindexGenesisBlock without the legacy all-history graph.
+    BlockIndexLogicalId GenesisId() const;
+    // Resident, pinned, anchored genesis CBlockIndex*. NULL if not open.
+    CBlockIndex* GenesisObject() const;
+
     // ----- introspection / access (for tests and D readiness) -----
     const BlockIndexHotOwner& Owner() const { return *owner_; }
     BlockIndexHotOwner* OwnerPtr() { return owner_.get(); }
@@ -92,8 +101,10 @@ private:
     std::unique_ptr<BlockIndexAuthorityMaterializer> mat_;
     std::unique_ptr<BlockIndexHotOwner> owner_;
     BlockIndexHotHandle bestTipHandle_;
+    BlockIndexHotHandle genesisHandle_;
     uint64_t generation_;
     BlockIndexLogicalId bestTipId_;
+    BlockIndexLogicalId genesisId_;
     bool isOpen_;
 };
 
