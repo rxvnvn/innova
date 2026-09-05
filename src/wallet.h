@@ -12,6 +12,7 @@
 
 
 #include "main.h"
+#include "blockindex_active_chain_reader.h"
 #include "cold_hot_seam.h"
 
 // Caller holds cs_main. Resolves a staking source with current active-chain
@@ -452,6 +453,14 @@ public:
     bool EraseFromWallet(uint256 hash);
     void WalletUpdateSpent(const CTransaction& prevout, bool fBlock = false);
     int ScanForWalletTransactions(CBlockIndex* pindexStart, bool fUpdate = false);
+    // By-value rescan (A.10.1k/D-prereq). Scans the active chain by HEIGHT from
+    // `startHeight` to the reader's active height, reading each block by
+    // nFile/nBlockPos WITHOUT the resident mapBlockIndex/pnext CBlockIndex graph.
+    // Honors the same nTimeFirstKey (wallet birthday) early-continue as the legacy
+    // path. Returns the count of wallet-affecting transactions.
+    int ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader& reader,
+                                         int32_t startHeight,
+                                         bool fUpdate = false);
     void ReacceptWalletTransactions();
     void ResendWalletTransactions(bool fForce = false);
     int64_t GetBalance() const;

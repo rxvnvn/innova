@@ -471,4 +471,71 @@ bool RebuildHRegStateFromActiveChain(std::string& strError)
     return true;
 }
 
+// By-value active-chain rebuild (A.10.1k/D-prereq).
+//
+// Iterates the active chain by HEIGHT using BlockIndexActiveChainReader
+// (by-value coordinates from active.dat/records.dat), reading each block by
+// nFile/nBlockPos via CBlock::ReadFromDisk(nFile, nBlockPos) - which requires
+// NO resident CBlockIndex* and NO pnext/mapBlockIndex topology. The per-block
+// replay work is identical to the legacy rebuild, so the resulting registry
+// state is the same. Only a transient (single-block) set is resident.
+bool RebuildHRegStateFromActiveChainByValue(const BlockIndexActiveChainReader& reader,
+                                            int32_t startHeight,
+                                            int32_t heightLimit,
+                                            std::string& strError)
+{
+    g_registry.Clear();
+    strError.clear();
+    if (!reader.IsOpen())
+    {
+        strError = "HREG rebuild(bv): no by-value active reader open";
+        return false;
+    }
+
+    const int32_t activeHeight = (int32_t)reader.GetActiveHeight();
+    if (activeHeight < 0)
+        return true;
+
+    const int32_t begin = (startHeight <= 0) ? 0 : startHeight;
+    const int32_t end = (heightLimit < 0) ? activeHeight : std::min(heightLimit, activeHeight);
+
+    CTxDB txdb("r");
+    for (int32_t h = begin; h <= end; ++h)
+    {
+        if (!IsHRegRecognitionActive(h))
+            continue;
+
+        BlockIndexActiveBlock ab;
+        std::string lkErr;
+        if (!reader.LookupByHeight(h, &ab, &lkErr))
+        {
+            strError = strprintf("HREG rebuild(bv): lookup failed height=%d (%s)", h, lkErr.c_str());
+            return false;
+        }
+
+        CBlock block;
+        if (!block.ReadFromDisk(ab.nFile, ab.nBlockPos))
+        {
+            strError = strprintf("HREG rebuild(bv): failed ReadFromDisk height=%d", h);
+            return false;
+        }
+
+        std::map<uint256, CTransaction> mapLocalTx;
+        std::set<COutPoint> setLocalSpent;
+        for (unsigned int i = 0; i < block.vtx.size(); ++i)
+        {
+            CTransaction tx = block.vtx[i];
+            MapPrevTx mapInputs;
+            if (!BuildReplayInputsForTx(txdb, tx, mapLocalTx, setLocalSpent, mapInputs, strError))
+                return false;
+            if (!g_registry.ApplyConnectedTx(tx, mapInputs, h, strError))
+                return false;
+            for (unsigned int nIn = 0; nIn < tx.vin.size(); ++nIn)
+                setLocalSpent.insert(tx.vin[nIn].prevout);
+            mapLocalTx[tx.GetHash()] = tx;
+        }
+    }
+    return true;
+}
+
 } // namespace hreg

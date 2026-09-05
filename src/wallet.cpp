@@ -1847,6 +1847,59 @@ int CWallet::ScanForWalletTransactions(CBlockIndex* pindexStart, bool fUpdate)
     return ret;
 }
 
+// By-value rescan (A.10.1k/D-prereq). Mirrors the legacy
+// ScanForWalletTransactions loop but iterates the active chain BY HEIGHT via
+// BlockIndexActiveChainReader, reading each block by nFile/nBlockPos with NO
+// resident CBlockIndex* / pnext / mapBlockIndex dependency. Honors the same
+// nTimeFirstKey birthday early-continue. Only a single transient block is
+// resident at a time (no accumulating active-chain cache).
+int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader& reader,
+                                              int32_t startHeight,
+                                              bool fUpdate)
+{
+    int ret = 0;
+    if (!reader.IsOpen())
+        return 0;
+
+    const int32_t activeHeight = (int32_t)reader.GetActiveHeight();
+    if (activeHeight < startHeight)
+        return 0;
+
+    int32_t h = (startHeight < 0) ? 0 : startHeight;
+    int32_t dProgressTop = activeHeight;
+    int64_t nBirthday = nTimeFirstKey; // snapshot under the caller's wallet contract
+
+    while (h <= activeHeight && !fShutdown)
+    {
+        // no need to read and scan block before our wallet birthday
+        // (mirrors wallet.cpp:1825-1828 legacy early-continue)
+        BlockIndexActiveBlock ab;
+        std::string lkErr;
+        if (!reader.LookupByHeight(h, &ab, &lkErr))
+            break;
+        if (nBirthday && (ab.nTime < (uint32_t)(nBirthday - 7200)))
+        {
+            ++h;
+            continue;
+        }
+
+        CBlock block;
+        if (!block.ReadFromDisk(ab.nFile, ab.nBlockPos))
+        {
+            ++h;
+            continue;
+        }
+        BOOST_FOREACH(CTransaction& tx, block.vtx)
+        {
+            LOCK(cs_wallet);
+            if (AddToWalletIfInvolvingMe(tx, &block, fUpdate))
+                ret++;
+        }
+        ++h;
+    }
+    return ret;
+}
+
 /*
 void CWallet::ReacceptWalletTransactions()
 {

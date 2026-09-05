@@ -5,6 +5,7 @@
 
 #include "core.h"
 #include "main.h"
+#include "blockindex_active_chain_reader.h"
 
 #include <map>
 #include <string>
@@ -90,6 +91,17 @@ bool DisconnectHRegTx(const CTransaction& tx,
                       std::string& strError);
 
 bool RebuildHRegStateFromActiveChain(std::string& strError);
+
+// By-value active-chain rebuild (A.10.1k/D-prereq). Iterates the active chain
+// by HEIGHT from `reader` (by-value coordinates), reading each block by
+// nFile/nBlockPos WITHOUT the resident mapBlockIndex/pnext CBlockIndex graph.
+// Produces the same registry state as the legacy resident-path rebuild.
+// startHeight=0 or -1 -> start at genesis (height 0). heightLimit inclusive, or
+// -1 to use the reader's active height.
+bool RebuildHRegStateFromActiveChainByValue(const BlockIndexActiveChainReader& reader,
+                                            int32_t startHeight,
+                                            int32_t heightLimit,
+                                            std::string& strError);
 
 } // namespace hreg
 

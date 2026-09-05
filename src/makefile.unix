@@ -403,6 +403,7 @@ OBJS= \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
     obj/blockindex_activeindex.o \
+    obj/blockindex_active_chain_reader.o \
     obj/blockindex_generation_builder.o \
     obj/blockindex_generation_lifecycle.o \
     obj/blockindex_shadow_runtime.o \
@@ -506,6 +507,7 @@ OBJS= \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
     obj/blockindex_activeindex.o \
+    obj/blockindex_active_chain_reader.o \
     obj/blockindex_generation_builder.o \
     obj/blockindex_generation_lifecycle.o \
     obj/blockindex_shadow_runtime.o \
@@ -555,6 +557,7 @@ TEST_OBJS= \
     obj/test/blockindex_startup_seam_tests.o \
     obj/test/blockindex_startup_bootstrap_tests.o \
     obj/test/blockindex_dag_restart_seam_tests.o \
+    obj/test/blockindex_active_chain_reader_tests.o \
     obj/test/blockindex_derived_state_tests.o \
     obj/test/fixed_blockindex_store_tests.o \
     obj/test/blockindex_hashindex_tests.o \
