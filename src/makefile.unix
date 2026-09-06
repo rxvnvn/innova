@@ -83,7 +83,11 @@ ifndef USE_UPNP
     override USE_UPNP = -
 endif
 ifneq (${USE_UPNP}, -)
-    LIBS += -l miniupnpc
+    # Static miniupnpc for a portable production binary: link the exact archive
+    # (libminiupnpc.a) so the daemon has NO runtime dependency on the versioned
+    # libminiupnpc.so.N shared object. Avoids "libminiupnpc.so.17 not found" on
+    # hosts whose system miniupnpc soname differs. libminiupnpc-dev provides .a.
+    LIBS += -Wl,-Bstatic -l miniupnpc -Wl,-Bdynamic
     DEFS += -DUSE_UPNP=$(USE_UPNP)
 endif
 
