@@ -3,6 +3,9 @@
 #include "blockindex_generation_builder_lm.h"
 #include "blockindex_generation_writer.h"
 #include "blockindex_generation_lifecycle.h"
+#include "blockindex_live_acceptance.h"
+#include "blockindex_authoritative_restart.h"
+#include "blockindex_tip.h"
 #include "main.h"
 #include "util.h"
 
@@ -199,6 +202,101 @@ BOOST_AUTO_TEST_CASE(m6_finalized_generation_validates)
     BOOST_REQUIRE_MESSAGE(okps, "publish/select: '" + perr + "'");
     BOOST_REQUIRE(fs::exists(fs::path(dir) / "gen-000001"));
     printf("M6 PASS: LM builder finalized generation publishes + selects\n");
+}
+
+BOOST_AUTO_TEST_CASE(m7_snapshot_to_live_tip_catchup)
+{
+    const std::string dir = MakeTempDir();
+
+    // (1) LM-build gen-1 from a synthetic snapshot at tip S (=6).
+    const std::string snapDir = dir + "/snapshot";
+    fs::create_directories(snapDir);
+    leveldb::Options options;
+    options.create_if_missing = true;
+    options.error_if_exists = true;
+    options.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    leveldb::DB* db = NULL;
+    leveldb::Status status = leveldb::DB::Open(options, snapDir, &db);
+    BOOST_REQUIRE(status.ok());
+    const int S = 6;
+    std::vector<uint256> chainHashes = MakeChain(db, S); // heights 0..S
+    delete db;
+
+    const std::string staging = dir + "/build-000001.tmp";
+    BlockIndexGenerationBuilderLM lm;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, staging, &error), error);
+    std::string perr;
+    BOOST_REQUIRE_MESSAGE(BlockIndexGenerationWriter::ValidatePublishSelect(dir, 1, &perr),
+                          "publish: " + perr);
+    BOOST_REQUIRE(fs::exists(fs::path(dir) / "gen-000001"));
+
+    // (2) capture S+1..L into blockindex_tip while legacy advanced.
+    const uint64_t baseRec = (uint64_t)(S + 1);
+    const int baseTip = S;
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 1, baseRec, baseTip, &tip, &error));
+    const uint256 sHash = chainHashes[S];
+
+    BlockIndexLiveTail tail;
+    tail.SetSources(NULL, &tip);
+    tail.SetHorizon(64);
+    tail.SetCurrentGeneration(1);
+    BlockIndexLiveAcceptance seam;
+    // base-known: true only for the snapshot tip anchor sHash (and its chain,
+    // which the base gen holds). Provide a static trampoline context that marks
+    // the base block hashes 0..S as known by re-deriving from MakeChain hashes.
+    struct LMBaseCtxT { uint256 sHash; };
+    static LMBaseCtxT lmBaseCtx;
+    lmBaseCtx.sHash = sHash;
+    struct base_known_tramp {
+        static bool fn(const uint256& h, void* ud) {
+            LMBaseCtxT* c = (LMBaseCtxT*)ud;
+            // only the snapshot tip anchor is the base boundary; the rest of the
+            // base exists in gen-1 (immutable). For the seam, marking the tip
+            // anchor known is sufficient for S+1's parent.
+            return c->sHash == h;
+        }
+    };
+    seam.SetSources(&base_known_tramp::fn, &lmBaseCtx, &tip, &tail);
+
+    // Append S+1, S+2 (active) via the acceptance seam.
+    uint256 h7 = uint256(0xF0000007ULL + S);
+    {
+        BlockIndexRecord r;
+        r.hash = h7; r.hashPrev = sHash; r.height = S+1;
+        r.nFile = 1; r.nBlockPos = 100u + (unsigned)(S+1); r.nFlags = 0;
+        r.nVersion = 7; r.nTime = 1700000000u + (unsigned)(S+1);
+        r.nBits = 0x1d00ffff; r.nNonce = (unsigned)(S+1);
+        BlockIndexDerivedEntry d; d.chainTrust = uint256(1);
+        BlockIndexTipAppend a; a.record = r; a.derived = d;
+        std::string aerr;
+        BOOST_REQUIRE_MESSAGE(seam.CanAcceptDense(sHash, S+1, &aerr), aerr);
+        BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, S+1, &aerr), S+1);
+    }
+    uint256 h8 = uint256(0xF0000008ULL + S);
+    {
+        BlockIndexRecord r;
+        r.hash = h8; r.hashPrev = h7; r.height = S+2;
+        r.nFile = 1; r.nBlockPos = 100u + (unsigned)(S+2); r.nFlags = 0;
+        r.nVersion = 7; r.nTime = 1700000000u + (unsigned)(S+2);
+        r.nBits = 0x1d00ffff; r.nNonce = (unsigned)(S+2);
+        BlockIndexDerivedEntry d; d.chainTrust = uint256(2);
+        BlockIndexTipAppend a; a.record = r; a.derived = d;
+        std::string aerr;
+        BOOST_REQUIRE_MESSAGE(seam.CanAcceptDense(h7, S+2, &aerr), aerr);
+        BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, S+2, &aerr), S+2);
+    }
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), S+2); // L = 8
+
+    // (3) authoritative restart: gen-1 + blockindex_tip -> lands at L.
+    BlockIndexAuthoritativeRestart restart;
+    std::string rerr;
+    BOOST_REQUIRE_MESSAGE(restart.OpenBaseAndTip(dir, true, 1, NULL, &rerr), rerr);
+    BOOST_REQUIRE(restart.HasPostSTip());
+    BOOST_REQUIRE_EQUAL(restart.EffectiveTipHeight(), S+2);
+    printf("M7 PASS: snapshot S=%d -> live tip L=%d via LM gen + blockindex_tip catch-up\n",
+           S, (int)restart.EffectiveTipHeight());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
