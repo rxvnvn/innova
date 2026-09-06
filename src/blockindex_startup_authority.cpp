@@ -128,6 +128,22 @@ const BlockIndexV2Reader* V2BlockIndexStartupAuthority::ReaderPtr() const
     return (impl && impl->open) ? &impl->reader : NULL;
 }
 
+BlockIndexV2Reader V2BlockIndexStartupAuthority::ExtractReader()
+{
+    // Move the open reader (including its hashindex/active/store LevelDB handles)
+    // out of this authority so ONE process-open handle is reused downstream. The
+    // source is left closed with no handles (the reader's move leaves it so).
+    BlockIndexV2Reader out;
+    if (impl && impl->open)
+    {
+        out = std::move(impl->reader);
+        impl->open = false;
+        impl->generation = 0;
+        impl->derivedStore = BlockIndexDerivedStateStore();
+    }
+    return out;
+}
+
 const BlockIndexDerivedStateStore* V2BlockIndexStartupAuthority::DerivedStorePtr() const
 {
     return (impl && impl->open) ? &impl->derivedStore : NULL;

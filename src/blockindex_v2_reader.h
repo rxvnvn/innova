@@ -43,6 +43,16 @@ class BlockIndexV2Reader
 public:
     BlockIndexV2Reader();
     ~BlockIndexV2Reader();
+
+    // A.10.1q / Stage1: move support. The reader owns several open LevelDB
+    // handles (store/active/hashIndex); this project's authoritative startup
+    // uses one process-open reader shared across bootstrap + navigator to avoid
+    // a second hashindex LOCK. Moving transfers the open handles; the source is
+    // left closed (no LevelDB leak / no double close).
+    BlockIndexV2Reader(BlockIndexV2Reader&& other) noexcept;
+    BlockIndexV2Reader& operator=(BlockIndexV2Reader&& other) noexcept;
+    BlockIndexV2Reader(const BlockIndexV2Reader&) = delete;
+    BlockIndexV2Reader& operator=(const BlockIndexV2Reader&) = delete;
     bool Open(const std::string& root, const BlockIndexV2ReaderOptions& options, std::string* error);
     void Close();
     bool IsOpen() const;

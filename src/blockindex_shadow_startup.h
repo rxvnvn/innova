@@ -74,6 +74,16 @@ void ClearBlockIndexStakingNavigator();
 // BY_VALUE_AUTHORITATIVE startup; otherwise use RetainBlockIndexStakingNavigator.
 bool RetainBlockIndexAuthoritativeNavigator(const std::string& v2Root, std::string* error);
 
+// A.10.1q / Stage1: production authoritative navigator install that reuses an
+// ALREADY-OPEN generation reader (moved in) rather than reopening the same
+// hashindex/active/store LevelDB handles. The bootstrap ownership path uses this
+// to share ONE process-open handle (avoids a second LevelDB LOCK). The passed
+// reader must outlive the retained navigator (caller keeps ownership of the
+// originating bootstrap/context for the process lifetime). Keeps the same
+// resolver binding + by-value hot side semantics as the v2Root variant.
+bool RetainBlockIndexAuthoritativeNavigatorWithReader(BlockIndexV2Reader reader,
+                                                      std::string* error);
+
 // Cache statistics of the retained reader (zeroed when none retained). Used by
 // the diagnostic RPC to report bounded cache state without reopening.
 BlockIndexV2ReaderCacheStats GetBlockIndexV2ShadowReaderCacheStats();

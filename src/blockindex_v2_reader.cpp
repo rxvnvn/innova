@@ -8,6 +8,42 @@ static void Clear(std::string* error) { if (error) error->clear(); }
 BlockIndexV2Reader::BlockIndexV2Reader() : open(false), generation(0), cacheCapacity(0) {}
 BlockIndexV2Reader::~BlockIndexV2Reader() { Close(); }
 
+// Move constructor: transfer open LevelDB handles (store/active/hashIndex),
+// generation state, and the bounded LRU cache; leave the source closed.
+BlockIndexV2Reader::BlockIndexV2Reader(BlockIndexV2Reader&& other) noexcept
+    : open(false), generation(0), cacheCapacity(0)
+{
+    *this = std::move(other);
+}
+
+BlockIndexV2Reader& BlockIndexV2Reader::operator=(BlockIndexV2Reader&& other) noexcept
+{
+    if (this != &other)
+    {
+        Close();
+        LOCK(other.cs);
+        store = std::move(other.store);
+        active = std::move(other.active);
+        hashIndex = std::move(other.hashIndex);
+        rootPath = std::move(other.rootPath);
+        generationPath = std::move(other.generationPath);
+        generation = other.generation;
+        manifest = other.manifest;
+        cacheCapacity = other.cacheCapacity;
+        cache = std::move(other.cache);
+        lru = std::move(other.lru);
+        stats = other.stats;
+        open = other.open;
+        // Leave the source closed: its open LevelDB handles now live here.
+        other.open = false;
+        other.generation = 0;
+        other.cache.clear();
+        other.lru.clear();
+        other.stats = BlockIndexV2ReaderCacheStats();
+    }
+    return *this;
+}
+
 bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderOptions& options, std::string* error)
 {
     Close();

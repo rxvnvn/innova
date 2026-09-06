@@ -71,6 +71,13 @@ public:
 
     bool Open(const std::string& v2Root, const BlockIndexV2ReaderOptions& options,
               std::string* error);
+
+    // A.10.1q / Stage1: bind this navigator's cold reader to an ALREADY-OPEN
+    // generation reader owned by the caller (moved in), instead of reopening the
+    // generation's LevelDB handle. Used by authoritative startup so the bootstrap
+    // and navigator share ONE process-open hashindex/active/store handle (avoiding
+    // a second LevelDB LOCK). The passed reader must outlive this navigator.
+    bool OpenWithReader(BlockIndexV2Reader reader);
     void Close();
     bool IsOpen() const;
 

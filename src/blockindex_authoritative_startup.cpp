@@ -108,21 +108,11 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         setStakeSeen = ss; // A.10.1o builder reproduces legacy exactly
     }
 
-    // 4. Install the authoritative by-value staking navigator (A.10.1p) so
-    //    wallet-depth never falls back to LegacyBlockIndexAccessor.
-    {
-        std::string nerr;
-        if (!RetainBlockIndexAuthoritativeNavigator(v2Root, &nerr))
-        {
-            if (error) *error = "authoritative startup: navigator: " + nerr;
-            return false;
-        }
-    }
-
-    // 5. Build the candidate frontier by value (A.10.1m) from the authoritative
-    //    reader + derived store, and populate the legacy mapCandidateTips so
-    //    candidate selection (EvaluateCandidateFrontierByValue) uses the SAME
-    //    by-value result. (RebuildCandidateTips is skipped in authoritative mode.)
+    // 4. (moved after candidate build — see below) Build the candidate frontier
+    //    by value (A.10.1m) from the authoritative reader + derived store, and
+    //    populate the legacy mapCandidateTips so candidate selection
+    //    (EvaluateCandidateFrontierByValue) uses the SAME by-value result.
+    //    (RebuildCandidateTips is skipped in authoritative mode.)
     if (error) error->clear();
     {
         SnapshotCandidateFrontierStore store;
@@ -155,6 +145,28 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
                (unsigned long long)nCandidateTipGeneration);
     }
 
+    // 5. Install the authoritative by-value staking navigator (A.10.1p) so
+    //    wallet-depth never falls back to LegacyBlockIndexAccessor. Reuses the
+    //    bootstrap's SINGLE already-open generation reader (moved out here) so
+    //    no second hashindex/active/store LevelDB handle is opened (A.10.1q
+    //    Stage1 double-open fix). After this the bootstrap authority no longer
+    //    owns the reader; the navigator retains it for the process lifetime,
+    //    and the bootstrap context (anchors) stays alive in g_authoritativeContext.
+    {
+        BlockIndexV2Reader genReader = ctx->bootstrap.ExtractReader();
+        if (!genReader.IsOpen())
+        {
+            if (error) *error = "authoritative startup: bootstrap reader unavailable";
+            return false;
+        }
+        std::string nerr;
+        if (!RetainBlockIndexAuthoritativeNavigatorWithReader(std::move(genReader), &nerr))
+        {
+            if (error) *error = "authoritative startup: navigator: " + nerr;
+            return false;
+        }
+    }
+
     // HReg + wallet rescan are driven by init.cpp AFTER this returns, using
     // the by-value active-chain reader + by-value paths (ca7c7e1).
 
@@ -162,8 +174,8 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
     g_authoritativeContext = ctx.release();
     ::g_fAuthoritativeStartup = true;
     if (error) error->clear();
-    printf("BLOCKINDEX_V2_AUTHORITATIVE startup=bootstrap best_height=%d chaintrust=%s\n",
-           nBestHeight, nBestChainTrust.ToString().substr(0, 16).c_str());
+    printf("BLOCKINDEX_V2_AUTHORITATIVE startup=bootstrap best_height=%d best_chaintrust_hex=%s\n",
+           nBestHeight, nBestChainTrust.GetHex().c_str());
     return true;
 }
 

@@ -204,6 +204,14 @@ public:
     const BlockIndexV2Reader* ReaderPtr() const;
     const BlockIndexDerivedStateStore* DerivedStorePtr() const;
 
+    // A.10.1q / Stage1: move the internally-opened generation-bound reader out
+    // (transferring its LevelDB hashindex/active/store handles) so a consumer
+    // (e.g. the authoritative navigator) can reuse the SAME single open handle
+    // instead of a second open that would collide on the LevelDB LOCK. After
+    // this call the authority is left with no reader (impl closed); the caller
+    // owns the transferred reader. Only valid while open && authoritative.
+    BlockIndexV2Reader ExtractReader();
+
     virtual BlockIndexStartupAuthorityIdentity Identity() const;
     virtual BlockIndexStartupResult GetTip() const;
     virtual BlockIndexStartupResult LookupByHash(const BlockIndexLogicalId& id) const;

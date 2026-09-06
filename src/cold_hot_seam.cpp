@@ -56,6 +56,16 @@ bool ColdHotSeamNavigator::Open(const std::string& v2Root,
     return true;
 }
 
+bool ColdHotSeamNavigator::OpenWithReader(BlockIndexV2Reader reader)
+{
+    Close();
+    if (!reader.IsOpen())
+        return false;
+    coldReader = std::move(reader); // keep the single open LevelDB handle
+    open = true;
+    return true;
+}
+
 void ColdHotSeamNavigator::Close()
 {
     coldReader.Close();

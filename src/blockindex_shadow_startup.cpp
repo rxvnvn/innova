@@ -246,6 +246,29 @@ bool RetainBlockIndexStakingNavigator(const std::string& root, std::string* erro
     return true;
 }
 
+// Shared tail (caller ALREADY holds cs_shadowState): bind the by-value hot
+// resolver to the navigator's cold reader, install the production hot resolver,
+// and retain the navigator for the process lifetime. Returns false (fail-closed)
+// if the cold reader is unavailable.
+static bool RetainBlockIndexAuthoritativeNavigatorImpl(
+    std::unique_ptr<ColdHotSeamNavigator>& nav, std::string* error)
+{
+    if (error)
+        error->clear();
+    const BlockIndexV2Reader* coldReader = nav->GetColdReader();
+    if (!coldReader)
+    {
+        if (error)
+            *error = "authoritative navigator: no cold reader";
+        return false;
+    }
+    g_stakingAuthoritativeResolver.reset(
+        new AuthoritativeBlockIndexHotResolver(coldReader));
+    nav->SetProductionHotResolver(g_stakingAuthoritativeResolver.get());
+    g_stakingNavigator.swap(nav);
+    return true;
+}
+
 bool RetainBlockIndexAuthoritativeNavigator(const std::string& root, std::string* error)
 {
     if (error)
@@ -260,20 +283,23 @@ bool RetainBlockIndexAuthoritativeNavigator(const std::string& root, std::string
             *error = navErr;
         return false;
     }
-    // Bind a by-value hot resolver to the navigator's own cold (authoritative)
-    // reader so generation stays coherent and the hot side has no mapBlockIndex.
-    const BlockIndexV2Reader* coldReader = nav->GetColdReader();
-    if (!coldReader)
+    return RetainBlockIndexAuthoritativeNavigatorImpl(nav, error);
+}
+
+bool RetainBlockIndexAuthoritativeNavigatorWithReader(BlockIndexV2Reader reader,
+                                                      std::string* error)
+{
+    if (error)
+        error->clear();
+    LOCK(cs_shadowState);
+    std::unique_ptr<ColdHotSeamNavigator> nav(new ColdHotSeamNavigator());
+    if (!nav->OpenWithReader(std::move(reader)))
     {
         if (error)
-            *error = "authoritative navigator: no cold reader";
+            *error = "authoritative navigator: reader not open";
         return false;
     }
-    g_stakingAuthoritativeResolver.reset(
-        new AuthoritativeBlockIndexHotResolver(coldReader));
-    nav->SetProductionHotResolver(g_stakingAuthoritativeResolver.get());
-    g_stakingNavigator.swap(nav);
-    return true;
+    return RetainBlockIndexAuthoritativeNavigatorImpl(nav, error);
 }
 
 const ColdHotSeamNavigator* GetBlockIndexStakingNavigator()

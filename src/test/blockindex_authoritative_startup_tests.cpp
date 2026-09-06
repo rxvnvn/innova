@@ -12,6 +12,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include "../blockindex_authoritative_startup.h"
+#include "../blockindex_startup_bootstrap.h"
 #include "../blockindex_shadow_startup.h"      // RetainBlockIndexAuthoritativeNavigator / getter
 #include "../authoritative_blockindex_hot_resolver.h"
 #include "../blockindex_v2_reader.h"
@@ -136,6 +137,63 @@ BOOST_AUTO_TEST_CASE(r12_authoritative_navigator_by_value_causal)
         BOOST_CHECK(mapBlockIndex.find(fx.active[h].hash) == mapBlockIndex.end());
 
     ClearBlockIndexStakingNavigator();
+}
+
+// ACT-S1 / Run-B double-open fix: the production reader-reuse path (bootstrap
+// owns the open V2 reader, navigator adopts it instead of reopening the same
+// hashindex/active/store LevelDB) must install a working by-value navigator with
+// NO second LevelDB open / NO LOCK conflict, correct generation identity, real
+// by-value history resolution, and zero historical mapBlockIndex residency.
+BOOST_AUTO_TEST_CASE(runb_reader_reuse_navigator_no_double_open)
+{
+    AuthNavFixture fx(5);
+    std::string error;
+
+    // Causal precondition: historical hashes absent.
+    for (int h = 0; h <= 5; ++h)
+        BOOST_CHECK(mapBlockIndex.find(fx.active[h].hash) == mapBlockIndex.end());
+
+    // 1. Bootstrap opens the authoritative generation (owns reader + handles).
+    BlockIndexStartupBootstrap bootstrap;
+    BlockIndexV2ReaderOptions opts;
+    BOOST_REQUIRE_MESSAGE(
+        bootstrap.Open(fx.root.string(), opts, &error) == BLOCK_INDEX_STARTUP_OK, error);
+    BOOST_CHECK_EQUAL(bootstrap.Generation(), (uint64_t)1);
+    BOOST_REQUIRE(bootstrap.ReaderPtr() != NULL);
+    BOOST_REQUIRE(bootstrap.ReaderPtr()->IsOpen());
+
+    // 2. Extract the single open reader and hand it to the navigator (reuse path).
+    BlockIndexV2Reader gen = bootstrap.ExtractReader();
+    BOOST_REQUIRE(gen.IsOpen());
+    // After extraction the bootstrap authority no longer owns a reader (closed).
+    BOOST_CHECK(bootstrap.ReaderPtr() == NULL);
+
+    // 3. Install the production navigator via the reader-reuse function. This is
+    //    the path that previously double-opened the hashindex (LOCK conflict).
+    BOOST_REQUIRE_MESSAGE(
+        RetainBlockIndexAuthoritativeNavigatorWithReader(std::move(gen), &error), error);
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    BOOST_REQUIRE(nav != NULL);
+    BOOST_REQUIRE(nav->IsOpen());
+    BOOST_CHECK_EQUAL(nav->ColdGeneration(), (uint64_t)1);
+
+    // 4. Real by-value history resolution through the navigator's cold reader.
+    const BlockIndexV2Reader* cold = nav->GetColdReader();
+    BOOST_REQUIRE(cold != NULL);
+    {
+        BlockIndexSnapshot sn;
+        const BlockIndexV2ReadStatus st = cold->LookupByHash(fx.active[3].hash, &sn, &error);
+        BOOST_CHECK_EQUAL(st, BLOCK_INDEX_V2_READ_FOUND);
+        BOOST_CHECK(sn.found);
+        BOOST_CHECK(sn.hash == fx.active[3].hash);
+    }
+
+    // 5. Causal post: no historical mapBlockIndex residency / topology created.
+    for (int h = 0; h <= 5; ++h)
+        BOOST_CHECK(mapBlockIndex.find(fx.active[h].hash) == mapBlockIndex.end());
+
+    ClearBlockIndexStakingNavigator();
+    bootstrap.Close();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

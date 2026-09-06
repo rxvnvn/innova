@@ -95,6 +95,11 @@ public:
     const BlockIndexV2Reader* ReaderPtr() const { return authority_.ReaderPtr(); }
     const BlockIndexDerivedStateStore* DerivedStorePtr() const { return authority_.DerivedStorePtr(); }
     const V2BlockIndexStartupAuthority& Authority() const { return authority_; }
+    // A.10.1q / Stage1: move the authority's generation-bound V2 reader out so a
+    // downstream consumer (the authoritative navigator) reuses the SAME single
+    // open LevelDB handle. After this the bootstrap authority no longer owns a
+    // reader (open false). Intended for the one-owner authoritative startup path.
+    BlockIndexV2Reader ExtractReader() { return authority_.ExtractReader(); }
 
 private:
     V2BlockIndexStartupAuthority authority_;
