@@ -29,16 +29,21 @@ int main(int argc, char** argv)
 {
     if (argc < 4)
     {
-        fprintf(stderr, "usage: %s <snapshot_leveldb_dir> <out_staging_root> <generation_id> [--lifecycle-root <root>]\n", argv[0]);
+        fprintf(stderr, "usage: %s <snapshot_leveldb_dir> <out_staging_root> <generation_id> [--lifecycle-root <root>] [--block-data-dir <dir with blk*.dat>]\n", argv[0]);
         return 2;
     }
     std::string snapshotDir = argv[1];
     std::string stagingRoot = argv[2];
     uint64_t generation = (uint64_t)atoll(argv[3]);
     std::string lifecycleRoot;
+    std::string blockDataDir;
     for (int i = 4; i < argc; ++i)
+    {
         if (std::string(argv[i]) == "--lifecycle-root" && i + 1 < argc)
             lifecycleRoot = argv[++i];
+        else if (std::string(argv[i]) == "--block-data-dir" && i + 1 < argc)
+            blockDataDir = argv[++i];
+    }
     if (lifecycleRoot.empty())
     {
         // lifecycle root = parent of stagingRoot (so build-<gen>.tmp -> gen-<gen>)
@@ -46,12 +51,13 @@ int main(int argc, char** argv)
     }
 
     const std::string staging = lifecycleRoot + "/build-" + strprintf("%06llu", (unsigned long long)generation) + ".tmp";
-    fprintf(stderr, "lm-builder: snapshot=%s staging=%s gen=%llu\n",
-            snapshotDir.c_str(), staging.c_str(), (unsigned long long)generation);
+    fprintf(stderr, "lm-builder: snapshot=%s staging=%s gen=%llu blockdata=%s\n",
+            snapshotDir.c_str(), staging.c_str(), (unsigned long long)generation,
+            blockDataDir.empty() ? "(none)" : blockDataDir.c_str());
 
     BlockIndexGenerationBuilderLM lm;
     std::string error;
-    bool ok = lm.Build(snapshotDir, "", generation, staging, &error);
+    bool ok = lm.Build(snapshotDir, blockDataDir, generation, staging, &error);
     if (!ok)
     {
         fprintf(stderr, "lm-builder FAILED: %s\n", error.c_str());

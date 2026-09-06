@@ -8,8 +8,11 @@
 #include "kernel.h"
 #include "dag.h"
 
+#include <leveldb/cache.h>
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>
+
+#include <malloc.h>
 
 #include <boost/filesystem.hpp>
 
@@ -35,6 +38,26 @@ static void ClearError(std::string* error)
 {
     if (error)
         error->clear();
+}
+
+// Phase memory instrumentation (M8 diagnosis): print VmHWM (lifetime peak) +
+// current RSS. Not consensus; diag-only.
+static void LmDiagRss(const char* phase)
+{
+    FILE* f = fopen("/proc/self/status", "r");
+    if (!f) return;
+    char line[256];
+    long hwm = -1, rss = -1;
+    while (fgets(line, sizeof(line), f))
+    {
+        if (strncmp(line, "VmHWM:", 6) == 0) hwm = atol(line + 6);
+        else if (strncmp(line, "VmRSS:", 6) == 0) rss = atol(line + 6);
+    }
+    fclose(f);
+    fprintf(stderr, "LM_RSS phase=%s hwm_kb=%ld rss_kb=%ld\n", phase, hwm, rss);
+#if defined(__GLIBC__)
+    malloc_trim(0);
+#endif
 }
 
 // Read a single CDiskBlockIndex record from a snapshot LevelDB cursor into a
@@ -85,17 +108,36 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
 {
     BlockIndexId outTipId = BLOCK_INDEX_ID_INVALID;
     int64_t outTipHeight = -1;
+    // Hoisted: becomes false if any derived entry lacks a live nSize -> gates
+    // whether M6 may claim AUTHORITATIVE capability.
+    bool allHasBlockSize = true;
+    // Empty DAG input digest (SHA256 of zero bytes) — daglinks == 0 on mainnet
+    // (FORK_HEIGHT_DAG == 999999999), so the DAG input set is empty, exactly as
+    // the old builder produced. Cache it once for the AUTHORITATIVE binding.
+    unsigned char emptyDagDigest[32];
+    SHA256_CTX dagCtx;
+    SHA256_Init(&dagCtx);
+    SHA256_Final(emptyDagDigest, &dagCtx);
 
     // M2: Open snapshot read-only (dedicated copy, never the live datadir).
+    // CRITICAL (M8 RSS fix): the snapshot is a ~3GB / 8M-entry DB; opening it
+    // with DEFAULT LevelDB options loads a huge table cache + index/filter
+    // blocks for every SST -> a transient ~1.9GB RSS spike (the 1.87GiB HWM).
+    // Bound the snapshot's block cache + max_open_files so its table cache
+    // stays small and memory remains independent of N.
     leveldb::Options options;
     options.create_if_missing = false;
     options.error_if_exists = false;
     options.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    options.block_cache = leveldb::NewLRUCache(512 * 1024); // bounded
+    options.write_buffer_size = 1 * 1024 * 1024;
+    options.max_open_files = 64;
     leveldb::DB* db = NULL;
     leveldb::Status status = leveldb::DB::Open(options, snapshotLevelDbDir, &db);
     if (!status.ok())
         return SetError(error, std::string("lm: snapshot LevelDB open failure: ") +
                                status.ToString());
+    LmDiagRss("M2_after_db_open");
 
     // Open the shared writer (bound memory).
     if (!writer_.OpenTarget(stagingDir, generation, error))
@@ -256,6 +298,7 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         }
         fclose(rf);
     }
+    LmDiagRss("M2_runs_sorted");
 
     // ---- k-way merge of sorted runs, feeding records+hashindex to writer. ----
     // Buffer one record per run head; repeatedly pick min hash, append.
@@ -263,10 +306,15 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
     // Also build an EXTERNAL disk-backed LevelDB index hash -> (RecordId +
     // record) so active-chain (M3) and derived (M4) can look up any block by
     // hash in O(1) with bounded RAM (externalized, class C).
+    // Use BOUNDED LevelDB cache/buffer: an 8M-entry external index must not
+    // retain a large block cache or write buffer -> keep RAM independent of N.
     leveldb::Options lopt;
     lopt.create_if_missing = true;
     lopt.error_if_exists = true;
     lopt.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    lopt.block_cache = leveldb::NewLRUCache(512 * 1024);   // 512KB, bounded
+    lopt.write_buffer_size = 1 * 1024 * 1024;              // 1MB, bounded
+    lopt.max_open_files = 64;
     const std::string actIdxPath = (tmpDir / "actidx").string();
     std::string airr;
     if (!boost::filesystem::exists(actIdxPath))
@@ -363,6 +411,20 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
             }
             lastHash = heads[best]->first;
             ++total;
+            if ((total % 1000000) == 0)
+            {
+                long hw = -1;
+                FILE* sf = fopen("/proc/self/status", "r");
+                if (sf)
+                {
+                    char ln[256];
+                    while (fgets(ln, sizeof(ln), sf))
+                        if (strncmp(ln, "VmHWM:", 6) == 0) { hw = atol(ln + 6); break; }
+                    fclose(sf);
+                }
+                fprintf(stderr, "LM_RSS merge_records=%llu hwm_kb=%ld\n",
+                        (unsigned long long)total, hw);
+            }
             // advance this run head
             size_t got = fread(&headStorage[best], 1, sizeof(headStorage[best]), runFiles[best]);
             heads[best] = (got == sizeof(headStorage[best])) ? &headStorage[best] : NULL;
@@ -386,6 +448,7 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
     }
     (void)as_;
     const std::string idhashTmp = (tmpDir / "idhash.bin").string();
+    LmDiagRss("M2_merge_done");
 
     // ---- M3: streamed active-chain construction ----
     // Walk hashBestChain -> hashPrev down to genesis using the external actIdx
@@ -499,6 +562,7 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         }
         fclose(rf);
     }
+    LmDiagRss("M3_active_done");
 
     // ---- M4: streamed derived-state construction ----
     // Derived values (chainTrust/checksum/memo) must be computed in HEIGHT
@@ -626,12 +690,17 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         leveldb::Options dopts;
         dopts.create_if_missing = true;
         dopts.error_if_exists = true;
+        dopts.filter_policy = leveldb::NewBloomFilterPolicy(10);
+        dopts.block_cache = leveldb::NewLRUCache(512 * 1024); // bounded
+        dopts.write_buffer_size = 1 * 1024 * 1024;
+        dopts.max_open_files = 64;
         leveldb::DB* derIdx = NULL;
         leveldb::Status ds = leveldb::DB::Open(dopts, derIdxPath, &derIdx);
         if (!ds.ok())
             return SetError(error, "lm: open deridx failed: " + ds.ToString());
         struct DEntry {
             uint256 chainTrust; uint32_t checksum; int64_t modTime; bool hasModTime;
+            uint32_t nSize; bool hasBlockSize;
         };
         bool postDag = GetForkHeightDAG() >= 0; // use runtime fork height
         {
@@ -711,10 +780,58 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                         DEntry pd; if (pv.size() >= sizeof(pd)) { memcpy(&pd, pv.data(), sizeof(pd)); de.modTime = pd.modTime; de.hasModTime = pd.hasModTime; }
                     }
                 }
+                de.nSize = 0; de.hasBlockSize = false;
+                // A.10.1b-fix2 C1 (authoritative parity): compute exact nSize
+                // from block files, identical to the old trusted builder.
+                // Read the block from blk{file}.dat using nFile/nBlockPos,
+                // deserialize and compute GetSerializeSize(SER_NETWORK).
+                if (!blockDataDir.empty() && rec.nFile > 0)
+                {
+                    std::string blockFn = strprintf("blk%04u.dat", rec.nFile);
+                    boost::filesystem::path blockPath =
+                        boost::filesystem::path(blockDataDir) / blockFn;
+                    FILE* blockFile = fopen(blockPath.string().c_str(), "rb");
+                    if (blockFile)
+                    {
+                        if (fseeko(blockFile, (off_t)rec.nBlockPos, SEEK_SET) == 0)
+                        {
+                            // CAutoFile OWNS blockFile and closes it on scope exit
+                            // (success or exception). Never fclose() here.
+                            try {
+                                CBlock block;
+                                CAutoFile filein(blockFile, SER_DISK, CLIENT_VERSION);
+                                filein >> block;
+                                if (block.GetHash() == rec.hash)
+                                {
+                                    de.nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
+                                    de.hasBlockSize = (de.nSize > 0);
+                                }
+                            } catch (...) { de.nSize = 0; de.hasBlockSize = false; }
+                        }
+                        else
+                        {
+                            fclose(blockFile); // CAutoFile never constructed
+                            de.nSize = 0; de.hasBlockSize = false;
+                        }
+                    }
+                    else { de.nSize = 0; de.hasBlockSize = false; }
+                }
                 derIdx->Put(leveldb::WriteOptions(), leveldb::Slice(key),
                             leveldb::Slice((const char*)&de, sizeof(de)));
             }
             fclose(rf);
+        }
+        LmDiagRss("M4_derive_compute_done");
+        // Release actIdx now: step-c (emit) and M6 (finalize) do NOT need it.
+        // This removes the simultaneous actIdx+derIdx LevelDB cache footprint.
+        delete actIdx;
+        actIdx = NULL;
+        // Release the height-sorted + hrun temp files' in-RAM handles (FILE*
+        // already closed by the merge block; drop the path strings too).
+        {
+            std::vector<std::string>().swap(heightRuns);
+            // also free the hsrort.bin FILE handle? it's a path-only read; no
+            // retained FILE*. The defragged derIdx below is the main cost.
         }
         // c. emit derived.dat in RecordId order (id 1..N), using idhash.bin
 //    (id -> hash, written during the merge in RecordId/merge order). This
@@ -744,13 +861,15 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                 {
                     DEntry de;
                     memcpy(&de, pv.data(), sizeof(de));
+                    if (!de.hasBlockSize)
+                        allHasBlockSize = false;
                     BlockIndexDerivedEntry e;
                     e.chainTrust = de.chainTrust;
                     e.stakeModifierChecksum = de.checksum;
                     e.SetHasStakeModifierTime(de.hasModTime);
                     e.stakeModifierTime = de.modTime;
-                    // nSize: externalized in M6 (block files); mark unavailable here.
-                    e.SetHasBlockSize(false);
+                    e.nSize = de.nSize;
+                    e.SetHasBlockSize(de.hasBlockSize);
                     if (!writer_.AppendDerived(e, error))
                     {
                         fclose(idf); delete derIdx;
@@ -763,9 +882,11 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         }
         delete derIdx;
         (void)postDag;
+        LmDiagRss("M4_emit_done");
     }
 
-    delete actIdx;
+    delete actIdx;  // already NULL (released after M4 compute); no-op
+    LmDiagRss("M6_finalize_about");
 
     // Flush any remaining buffered active/derived batches to disk.
     if (!writer_.Flush(error))
@@ -781,21 +902,26 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         ClearError(error);
         return SetError(error, "lm: no active tip resolved during build");
     }
-    const uint32_t cap = blockDataDir.empty()
-        ? BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW
-        : BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE;
-    // NOTE: if blockDataDir is provided but nSize was not actually computed per
-    // record (M4 sets hasBlockSize=false), an AUTHORITATIVE capability would be
-    // invalid. For correctness we require the caller to have provided block data
-    // AND we set AUTHORITATIVE only when the M4 path populated nSize. The current
-    // M4 path does NOT compute nSize, so we force OLD_SHADOW unless nSize is
-    // proven available (post-M6 nSize wiring). Keep it OLD_SHADOW for now.
-    uint32_t finalCap = BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
-    (void)cap;
+    const bool authoritativeWanted = (!blockDataDir.empty());
+    // AUTHORITATIVE is only valid when every derived entry has a real nSize.
+    // Fail closed otherwise (must not silently downgrade an authoritative build,
+    // matching the old builder's requirement).
+    if (authoritativeWanted && !allHasBlockSize)
+    {
+        ClearError(error);
+        return SetError(error, "lm: authoritative generation requires mandatory nSize for all records");
+    }
+    const uint32_t finalCap = authoritativeWanted
+        ? BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE
+        : BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
     const uint64_t totalRecords = writer_.RecordCount(); // before Finalize closes
+    // mainnet daglinks == 0 (FORK_HEIGHT_DAG == 999999999); the DAG input set is
+    // empty, so its digest is SHA256(zero bytes) == e3b0c442..., byte-matching
+    // the old builder's manifested dagInputDigest. (See function-scope emptyDagDigest.)
     if (!writer_.Finalize(generation, hashBestChain, outTipId,
                           (int32_t)outTipHeight,
-                          totalRecords, finalCap, error))
+                          totalRecords, finalCap,
+                          emptyDagDigest, error))
         return false;
 
     ClearError(error);

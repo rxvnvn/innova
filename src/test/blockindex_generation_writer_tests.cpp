@@ -196,7 +196,7 @@ BOOST_AUTO_TEST_CASE(w1_writer_builds_valid_generation)
 
     BOOST_REQUIRE(w.Finalize(1, tipHash, tipId, (int32_t)activeIds.size()-1,
                              ordered.size(),
-                             BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW, NULL));
+                             BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW, NULL, NULL));
     w.Close();
 
     // Publish + validate + select (crash-safe CURRENT flip).
@@ -298,7 +298,7 @@ BOOST_AUTO_TEST_CASE(w2_w4_byte_parity_with_builder)
         if (idMap[ordered[i].hash] == tipId) { tipHash = ordered[i].hash; break; }
     BOOST_REQUIRE(w.Finalize(1, tipHash, tipId, (int32_t)activeIds.size()-1,
                              ordered.size(),
-                             BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW, NULL));
+                             BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW, NULL, NULL));
     w.Close();
 
     std::string wRecords = ReadFileBytes(staging + "/records.dat");

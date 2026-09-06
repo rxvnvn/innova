@@ -60,12 +60,18 @@ public:
     // Set the derived content binding (generation root or shadow binding), then
     // Finalize derived.dat and write the MANIFEST as COMPLETE with the given
     // committed tip.
+    // If generationCapability == AUTHORITATIVE, the content binding is recomputed
+    // from the on-disk generation files (RecomputeGenerationRootFromFiles) using
+    // dagInputDigest (may be the empty DAG digest on a dag-inert chain), and
+    // dagInputDigest is persisted in the MANIFEST for validation. Otherwise
+    // the legacy shadow (metadata-only) binding is used.
     bool Finalize(uint64_t generation,
                   const uint256& committedTipHash,
                   BlockIndexId committedTipId,
                   int32_t committedTipHeight,
                   uint64_t recordCount,
                   uint32_t generationCapability,
+                  const unsigned char* dagInputDigest /* may be NULL */,
                   std::string* error);
 
     // Compute the generation root from files (records/active/hashindex/derived)

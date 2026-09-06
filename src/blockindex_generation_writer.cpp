@@ -158,17 +158,43 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
                                           int32_t committedTipHeight,
                                           uint64_t recordCount,
                                           uint32_t generationCapability,
+                                          const unsigned char* dagInputDigest,
                                           std::string* error)
 {
     if (!Flush(error))
         return false;
 
-    // content binding: for migration we use the shadow/derived binding (the
-    // builder tool computes it; AUTHORITATIVE uses generation root set later).
+    // content binding depends on capability:
+    // - AUTHORITATIVE: full generation root recomputed from on-disk files
+    //   (commits to records+active+hashindex+derived+DAG inputs), with the
+    //   DAG input digest persisted in the MANIFEST for validation.
+    // - OLD_SHADOW: metadata-only binding (tipHash || recordCount || gen).
     unsigned char binding[32];
-    if (!ComputeDerivedContentBinding(committedTipHash, recordCount, generation,
-                                      binding))
-        return SetError(error, "writer: compute derived content binding failed");
+    if (generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE)
+    {
+        unsigned char dagDigest[32];
+        memset(dagDigest, 0, 32);
+        const unsigned char* usedDag = dagInputDigest ? dagInputDigest : dagDigest;
+        // RecomputeGenerationRootFromFiles reads the on-disk generation files
+        // (records.dat / active.dat / hashindex / derived.dat) and derives the
+        // same root the authority validation will recompute. Active + derived +
+        // records are flat stores (no LevelDB), so opening them read-only here
+        // cannot conflict with the still-open in-memory store handles.
+        boost::filesystem::path sdir(stagingDir_);
+        if (!RecomputeGenerationRootFromFiles(sdir, generation, committedTipHash,
+                                              recordCount, usedDag, binding, error))
+            return SetError(error, std::string("writer: recompute generation root failed: ") +
+                                   (error ? *error : "unknown"));
+    }
+    else
+    {
+        if (!ComputeDerivedContentBinding(committedTipHash, recordCount, generation,
+                                          binding))
+            return SetError(error, "writer: compute derived content binding failed");
+    }
+
+    // The derived header contentBinding holds the generation root (AUTHORITATIVE)
+    // or the shadow metadata binding.
     derived_.SetContentBinding(binding);
     if (!derived_.Finalize(error))
         return false;
@@ -180,6 +206,12 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
     man.committedTipHeight = committedTipHeight;
     man.committedTipHash = committedTipHash;
     man.capability = generationCapability;
+    if (generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE)
+    {
+        unsigned char dagDigest[32];
+        memset(dagDigest, 0, 32);
+        memcpy(man.dagInputDigest, dagInputDigest ? dagInputDigest : dagDigest, 32);
+    }
     if (!store_.WriteManifest(man, error))
         return false;
 
