@@ -2,6 +2,7 @@
 
 #include "blockindex_generation_builder_lm.h"
 #include "blockindex_generation_writer.h"
+#include "blockindex_generation_lifecycle.h"
 #include "main.h"
 #include "util.h"
 
@@ -167,6 +168,37 @@ BOOST_AUTO_TEST_CASE(m3_active_chain_streamed)
     BOOST_REQUIRE_EQUAL(derEntries, (size_t)(tip + 1));
     printf("M3/M4 PASS: LM builder streamed %zu active + %zu derived entries\n",
            entries, derEntries);
+}
+
+BOOST_AUTO_TEST_CASE(m6_finalized_generation_validates)
+{
+    const std::string dir = MakeTempDir();
+    const std::string snapDir = dir + "/snapshot";
+    fs::create_directories(snapDir);
+    leveldb::Options options;
+    options.create_if_missing = true;
+    options.error_if_exists = true;
+    options.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    leveldb::DB* db = NULL;
+    leveldb::Status status = leveldb::DB::Open(options, snapDir, &db);
+    BOOST_REQUIRE(status.ok());
+    const int tip = 5;
+    std::vector<uint256> hashes = MakeChain(db, tip);
+    delete db;
+
+    const std::string staging = dir + "/build-000001.tmp";
+    BlockIndexGenerationBuilderLM lm;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, staging, &error), error);
+
+    // M6: the finalized generation must be publishable/selectable (crash-safe
+    // CURRENT flip) via the shared writer lifecycle path.
+    std::string perr;
+    bool okps = BlockIndexGenerationWriter::ValidatePublishSelect(dir, 1, &perr);
+    printf("  publish/select ok=%d err='%s'\n", (int)okps, perr.c_str());
+    BOOST_REQUIRE_MESSAGE(okps, "publish/select: '" + perr + "'");
+    BOOST_REQUIRE(fs::exists(fs::path(dir) / "gen-000001"));
+    printf("M6 PASS: LM builder finalized generation publishes + selects\n");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

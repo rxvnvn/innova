@@ -83,6 +83,9 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                                           const std::string& stagingDir,
                                           std::string* error)
 {
+    BlockIndexId outTipId = BLOCK_INDEX_ID_INVALID;
+    int64_t outTipHeight = -1;
+
     // M2: Open snapshot read-only (dedicated copy, never the live datadir).
     leveldb::Options options;
     options.create_if_missing = false;
@@ -481,6 +484,11 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                 return SetError(error, "lm: active chain height discontinuity at " +
                                 strprintf("%lld", (long long)expectedH));
             }
+            if (idx == 0)
+            {
+                outTipId = id;
+                outTipHeight = h;
+            }
             if (!writer_.AppendActive(id, h, error))
             {
                 fclose(rf);
@@ -761,6 +769,33 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
 
     // Flush any remaining buffered active/derived batches to disk.
     if (!writer_.Flush(error))
+        return false;
+
+    // ---- M6: finalize (content binding + MANIFEST COMPLETE) ----
+    // The writer.Finalize sets the derived content binding (shadow or root) and
+    // writes the COMPLETE MANIFEST with the committed tip. Capability is
+    // OLD_SHADOW unless exact nSize (AUTHORITATIVE) was provided via blockDataDir
+    // (the nSize path is externalized; here we mark OLD_SHADOW if no block data).
+    if (outTipId == BLOCK_INDEX_ID_INVALID || outTipHeight < 0 || hashBestChain == 0)
+    {
+        ClearError(error);
+        return SetError(error, "lm: no active tip resolved during build");
+    }
+    const uint32_t cap = blockDataDir.empty()
+        ? BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW
+        : BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE;
+    // NOTE: if blockDataDir is provided but nSize was not actually computed per
+    // record (M4 sets hasBlockSize=false), an AUTHORITATIVE capability would be
+    // invalid. For correctness we require the caller to have provided block data
+    // AND we set AUTHORITATIVE only when the M4 path populated nSize. The current
+    // M4 path does NOT compute nSize, so we force OLD_SHADOW unless nSize is
+    // proven available (post-M6 nSize wiring). Keep it OLD_SHADOW for now.
+    uint32_t finalCap = BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
+    (void)cap;
+    const uint64_t totalRecords = writer_.RecordCount(); // before Finalize closes
+    if (!writer_.Finalize(generation, hashBestChain, outTipId,
+                          (int32_t)outTipHeight,
+                          totalRecords, finalCap, error))
         return false;
 
     ClearError(error);
