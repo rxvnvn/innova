@@ -528,18 +528,21 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
     };
     std::map<uint256, DerivedComputed> derivedByHash;
 
-    // Set of active chain hashes for active membership check
+    // Set of active chain hashes for active membership check.
+    // Build a one-time reverse map (BlockIndexId -> hash) so each active height
+    // resolves in O(1) instead of scanning idMap per height (which was O(N^2)
+    // over ~8M records / took hours at real chain scale). Pure tool optimization;
+    // no consensus / daemon / disk-format change.
     std::set<uint256> activeHashSet;
-    for (size_t h = 0; h < activeChainByHeight.size(); ++h)
     {
-        // Find hash for this RecordId
-        for (std::map<uint256, BlockIndexId>::iterator it = idMap.begin(); it != idMap.end(); ++it)
+        std::map<BlockIndexId, uint256> revIdMap;
+        for (std::map<uint256, BlockIndexId>::const_iterator it = idMap.begin(); it != idMap.end(); ++it)
+            revIdMap[it->second] = it->first;
+        for (size_t h = 0; h < activeChainByHeight.size(); ++h)
         {
-            if (it->second == activeChainByHeight[h])
-            {
-                activeHashSet.insert(it->first);
-                break;
-            }
+            std::map<BlockIndexId, uint256>::const_iterator rit = revIdMap.find(activeChainByHeight[h]);
+            if (rit != revIdMap.end())
+                activeHashSet.insert(rit->second);
         }
     }
 
@@ -738,7 +741,22 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             return false;
 
         // Emit in RecordId order (same as `appended` order)
-        // Also compute derived entries digest as we go
+        // Also compute derived entries digest as we go.
+        //
+        // Performance note (real-chain scale): BlockIndexDerivedStateStore::Append
+        // performs a per-record fopen + fwrite + FileCommit(fsync) + fclose. Calling
+        // it 8M times (once per historical record) is ~32 records/sec (O(N) fsyncs),
+        // i.e. on the order of tens of hours at ~8M blocks. We instead accumulate a
+        // bounded chunk and flush via AppendBatch, which writes the identical
+        // deterministic 56-byte entries in identical order but fsyncs once per batch.
+        // AppendBatch uses the exact same EncodeBlockIndexDerivedEntry encoder, so the
+        // derived.dat bytes are byte-identical to per-record Append. This is an offline
+        // builder / generation-build-path-only change: zero consensus, zero runtime
+        // semantics, zero V2 record/derived format, zero content/order/digest change.
+        const size_t kDerivedBatchEntries = 65536; // bounded RAM (~3.7 MB per chunk)
+        std::vector<BlockIndexDerivedEntry> derivedBatch;
+        derivedBatch.reserve(kDerivedBatchEntries);
+
         SHA256_CTX derivedEntriesCtx;
         SHA256_Init(&derivedEntriesCtx);
 
@@ -757,14 +775,28 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             entry.nSize = dit->second.nSize;
             entry.SetHasBlockSize(dit->second.hasBlockSize);
 
-            // Encode entry for digest computation
+            // Encode entry for digest computation (unchanged per-record).
             std::vector<unsigned char> encoded;
             if (!EncodeBlockIndexDerivedEntry(entry, &encoded, error))
                 return false;
             SHA256_Update(&derivedEntriesCtx, &encoded[0], encoded.size());
 
-            if (!derivedStore.Append(entry, error))
+            // Buffer for batched flush (bounded chunk, not a full 8M vector).
+            derivedBatch.push_back(entry);
+            if (derivedBatch.size() >= kDerivedBatchEntries)
+            {
+                if (!derivedStore.AppendBatch(derivedBatch, error))
+                    return false;
+                derivedBatch.clear();
+            }
+        }
+
+        // Final partial chunk.
+        if (!derivedBatch.empty())
+        {
+            if (!derivedStore.AppendBatch(derivedBatch, error))
                 return false;
+            derivedBatch.clear();
         }
 
         // Compute derived entries digest

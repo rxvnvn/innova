@@ -9,6 +9,9 @@
 #include "../main.h"
 
 #include <zlib.h>
+#include <algorithm>
+#include <fstream>
+#include <iterator>
 #include <map>
 #include <type_traits>
 #include <vector>
@@ -731,6 +734,97 @@ BOOST_AUTO_TEST_CASE(v2_authority_typed_generation_mismatch)
     // Opening with wrong generation fails
     BlockIndexDerivedStateStore reader2;
     BOOST_CHECK(!BlockIndexDerivedStateStore::OpenReadOnly(mismatchDir, testGeneration + 1, &reader2, &error));
+}
+
+// ACT-S1 offline-builder parity: AppendBatch (chunked flush, including a
+// partial final chunk) must produce byte-identical derived.dat and identical
+// logical content to per-record Append for the same entry sequence. This
+// guarantees the builder's batched derived write (which replaced per-record
+// Append to avoid 8M fsyncs) is output-identical.
+BOOST_AUTO_TEST_CASE(append_batch_byte_parity_with_per_record_append)
+{
+    std::string error;
+
+    // Entries: single-record, multi-record, and a count that forces a split
+    // with a partial final chunk. We test chunk boundaries by comparing a
+    // per-record store against a store built with small chunk steps.
+    const int N = 1007; // > small chunk 64, exercises multiple full chunks + final partial chunk
+    std::vector<BlockIndexDerivedEntry> entries;
+    for (int i = 0; i < N; ++i)
+    {
+        BlockIndexDerivedEntry e;
+        e.chainTrust = uint256(i + 1);
+        e.stakeModifierChecksum = (unsigned int)(i * 13);
+        e.stakeModifierTime = (i % 3 == 0) ? (200000 + i) : 0;
+        e.SetHasStakeModifierTime(i % 3 == 0);
+        e.nSize = (unsigned int)(i + 1);
+        e.SetHasBlockSize(true);
+        entries.push_back(e);
+    }
+
+    // -- Store A: per-record Append ---
+    std::string dirA = testDir + "/parity_appenda";
+    boost::filesystem::create_directories(dirA);
+    BlockIndexDerivedStateStore storeA;
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(dirA, testGeneration, NULL, &storeA, &error));
+    for (int i = 0; i < N; ++i)
+        BOOST_REQUIRE(storeA.Append(entries[i], &error));
+    BOOST_REQUIRE(storeA.Finalize(&error));
+    storeA = BlockIndexDerivedStateStore();
+
+    // -- Store B: AppendBatch in mixed chunk sizes (64 + a partial final chunk) --
+    std::string dirB = testDir + "/parity_appendb";
+    boost::filesystem::create_directories(dirB);
+    BlockIndexDerivedStateStore storeB;
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::Create(dirB, testGeneration, NULL, &storeB, &error));
+    const size_t chunk = 64;
+    size_t pos = 0;
+    while (pos < entries.size())
+    {
+        size_t n = std::min(chunk, entries.size() - pos);
+        std::vector<BlockIndexDerivedEntry> batch(entries.begin() + pos, entries.begin() + pos + n);
+        BOOST_REQUIRE(storeB.AppendBatch(batch, &error));
+        pos += n;
+    }
+    BOOST_REQUIRE(storeB.Finalize(&error));
+    storeB = BlockIndexDerivedStateStore();
+
+    // -- Byte-for-byte parity of derived.dat payload --
+    // Read both raw files and compare the entry region (skip each header).
+    boost::filesystem::path pA = boost::filesystem::path(dirA) / BLOCK_INDEX_DERIVED_FILE_NAME;
+    boost::filesystem::path pB = boost::filesystem::path(dirB) / BLOCK_INDEX_DERIVED_FILE_NAME;
+    BOOST_REQUIRE(boost::filesystem::exists(pA));
+    BOOST_REQUIRE(boost::filesystem::exists(pB));
+    // Reopen read-only to read header/entries via canonical APIs instead of
+    // parsing raw bytes; the payload equality is proven via EntryCount + each
+    // entry field. Also do a raw byte-compare of the whole file for strictness.
+    {
+        std::ifstream fa(pA.string(), std::ios::binary), fb(pB.string(), std::ios::binary);
+        BOOST_REQUIRE(fa.good() && fb.good());
+        std::vector<unsigned char> a((std::istreambuf_iterator<char>(fa)), std::istreambuf_iterator<char>());
+        std::vector<unsigned char> b((std::istreambuf_iterator<char>(fb)), std::istreambuf_iterator<char>());
+        BOOST_REQUIRE_EQUAL(a.size(), b.size());
+        BOOST_CHECK(std::equal(a.begin(), a.end(), b.begin()));
+    }
+
+    // -- Exact record count + readable parity --
+    BlockIndexDerivedStateStore rA, rB;
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::OpenReadOnly(dirA, testGeneration, &rA, &error));
+    BOOST_REQUIRE(BlockIndexDerivedStateStore::OpenReadOnly(dirB, testGeneration, &rB, &error));
+    BOOST_CHECK_EQUAL(rA.EntryCount(), (uint64_t)N);
+    BOOST_CHECK_EQUAL(rB.EntryCount(), (uint64_t)N);
+    for (int i = 1; i <= N; ++i)
+    {
+        BlockIndexDerivedEntry ea, eb;
+        BOOST_REQUIRE_EQUAL(rA.Read((BlockIndexId)i, &ea, &error), BLOCK_INDEX_DERIVED_LOOKUP_FOUND);
+        BOOST_REQUIRE_EQUAL(rB.Read((BlockIndexId)i, &eb, &error), BLOCK_INDEX_DERIVED_LOOKUP_FOUND);
+        BOOST_CHECK(ea.chainTrust == eb.chainTrust);
+        BOOST_CHECK_EQUAL(ea.stakeModifierChecksum, eb.stakeModifierChecksum);
+        BOOST_CHECK_EQUAL(ea.stakeModifierTime, eb.stakeModifierTime);
+        BOOST_CHECK_EQUAL(ea.HasStakeModifierTime(), eb.HasStakeModifierTime());
+        BOOST_CHECK_EQUAL(ea.nSize, eb.nSize);
+        BOOST_CHECK_EQUAL(ea.HasBlockSize(), eb.HasBlockSize());
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
