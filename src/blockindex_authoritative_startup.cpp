@@ -8,6 +8,7 @@
 #include "blockindex_stake_seen_builder.h"
 #include "blockindex_candidate_startup_builder.h"
 #include "blockindex_shadow_startup.h"   // RetainBlockIndexAuthoritativeNavigator
+#include "dag.h"                         // g_dagManager (attribution count)
 #include "blockindex_v2_reader.h"
 #include "candidate_frontier.h"
 #include "main.h"
@@ -206,4 +207,9 @@ void PrintAuthoritativeResidency(const char* tag)
     }
     PrintBlockIndexResidency("BY_VALUE_AUTHORITATIVE",
                             (int64_t)AuthoritativeGeneration(), tag, hc, hp, pc, pp);
+    printf("BLOCKINDEX_ATTRIBUTION %s stake_seen=%llu candidate_tips=%llu dag_entries=%d\n",
+           tag, (unsigned long long)setStakeSeen.size(),
+           (unsigned long long)mapCandidateTips.size(),
+           (int)g_dagManager.GetDAGEntryCount());
+    fflush(stdout);
 }

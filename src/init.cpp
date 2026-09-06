@@ -5,6 +5,7 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <malloc.h>   // Block Index V2: malloc_trim for authoritative arena release (Linux/glibc)
 #include "init.h"
 #include "main.h"
 #include "kernel.h"
@@ -2040,6 +2041,25 @@ authoritative_startup_ready:
         PrintAuthoritativeResidency("T3_startup_complete");
     else
         PrintBlockIndexResidency("LEGACY_RESIDENT", 0, "T3_startup_complete", 0,0,0,0);
+
+    // ---- Block Index V2 (A.10.2): release authoritative startup allocator arenas ----
+    // During BY_VALUE_AUTHORITATIVE startup the bootstrap reads the full 8M-record
+    // generation (records/derived/hashindex) and builds the ~2.6M-entry setStakeSeen
+    // + HReg + candidate frontier. Those temporaries are freed once startup completes,
+    // but glibc retains the arena high-water mark (~3.8 GiB) and does not return it to
+    // the OS. One-shot malloc_trim(0) after all large startup temporaries are released
+    // returns the free arena pages (measured: 4.05 GiB -> 275 MiB). This is a strictly
+    // optional memory hygiene step: failure/no-op is harmless, never required for
+    // correctness, and never runs inside the record loops. Consensus/serialization/V2
+    // generation contents are untouched. Legacy startup is unaffected.
+#if defined(__GLIBC__)
+    if (g_fAuthoritativeStartup && malloc_trim(0) == 1)
+    {
+        // Release succeeded; log under a debug-only note (no production noise).
+        if (fDebug)
+            printf("BlockIndexV2: released authoritative startup allocator arenas\n");
+    }
+#endif
 
     if (!NewThread(StartNode, NULL))
         InitError(_("Error: could not start node"));
