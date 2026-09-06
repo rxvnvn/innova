@@ -101,6 +101,22 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         return false;
     }
 
+    // Read hashBestChain (authoritative active-chain tip) before we stream.
+    uint256 hashBestChain = 0;
+    {
+        CDataStream ssBestKey(SER_DISK, CLIENT_VERSION);
+        ssBestKey << std::string("hashBestChain");
+        std::string bestVal;
+        leveldb::Status bs = db->Get(leveldb::ReadOptions(), ssBestKey.str(), &bestVal);
+        if (!bs.ok())
+        {
+            delete db;
+            return SetError(error, "lm: hashBestChain not found in snapshot");
+        }
+        CDataStream ss(bestVal.data(), bestVal.data() + bestVal.size(), SER_DISK, CLIENT_VERSION);
+        ss >> hashBestChain;
+    }
+
     // ---- Pass 1: scan ALL blockindex keys, decode, stream to records + a temp
     // external sort key file so RecordId assignment order matches the legacy
     // builder (hash-sorted) for byte parity. ----
@@ -241,6 +257,21 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
     // ---- k-way merge of sorted runs, feeding records+hashindex to writer. ----
     // Buffer one record per run head; repeatedly pick min hash, append.
     // (Records must be unique by hash; duplicates => fail.)
+    // Also build an EXTERNAL disk-backed LevelDB index hash -> (RecordId +
+    // record) so active-chain (M3) and derived (M4) can look up any block by
+    // hash in O(1) with bounded RAM (externalized, class C).
+    leveldb::Options lopt;
+    lopt.create_if_missing = true;
+    lopt.error_if_exists = true;
+    lopt.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    const std::string actIdxPath = (tmpDir / "actidx").string();
+    std::string airr;
+    if (!boost::filesystem::exists(actIdxPath))
+        boost::filesystem::create_directories(actIdxPath, ec);
+    leveldb::DB* actIdx = NULL;
+    leveldb::Status as_ = leveldb::DB::Open(lopt, actIdxPath, &actIdx);
+    if (!as_.ok())
+        return SetError(error, "lm: create actidx failed: " + as_.ToString());
     {
         std::vector<FILE*> runFiles(sortedRuns.size());
         std::vector<std::pair<uint256, BlockIndexRecord>*> heads(sortedRuns.size());
@@ -251,6 +282,7 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
             if (!runFiles[r])
             {
                 for (size_t j = 0; j < r; ++j) if (runFiles[j]) fclose(runFiles[j]);
+                delete actIdx;
                 return SetError(error, "lm: open run for merge failed");
             }
             // read one head
@@ -259,6 +291,8 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         }
         uint64_t total = 0;
         uint256 lastHash = 0;
+        leveldb::WriteBatch actBatch;
+        int actBatchCount = 0;
         for (;;)
         {
             // find min head
@@ -272,6 +306,7 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
             {
                 // duplicate hash -> fail closed
                 for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
+                delete actIdx;
                 return SetError(error, "lm: duplicate block hash in source");
             }
             // stream to writer (AppendRecord + PutHashIndex; writer batches)
@@ -280,7 +315,28 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                 !writer_.PutHashIndex(heads[best]->first, id, error))
             {
                 for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
+                delete actIdx;
                 return false;
+            }
+            // external index: key = 32-byte hash, value = (RecordId || record)
+            std::string key(heads[best]->first.begin(), heads[best]->first.end());
+            std::string val;
+            val.resize(sizeof(BlockIndexId) + sizeof(BlockIndexRecord));
+            memcpy(&val[0], &id, sizeof(id));
+            memcpy(&val[sizeof(BlockIndexId)], &heads[best]->second, sizeof(BlockIndexRecord));
+            actBatch.Put(leveldb::Slice(key), leveldb::Slice(val));
+            ++actBatchCount;
+            if (actBatchCount >= 4096)
+            {
+                leveldb::Status ws = actIdx->Write(leveldb::WriteOptions(), &actBatch);
+                if (!ws.ok())
+                {
+                    for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
+                    delete actIdx;
+                    return SetError(error, "lm: actidx write failed: " + ws.ToString());
+                }
+                actBatch.Clear();
+                actBatchCount = 0;
             }
             lastHash = heads[best]->first;
             ++total;
@@ -288,15 +344,137 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
             size_t got = fread(&headStorage[best], 1, sizeof(headStorage[best]), runFiles[best]);
             heads[best] = (got == sizeof(headStorage[best])) ? &headStorage[best] : NULL;
         }
+        if (actBatchCount > 0)
+        {
+            leveldb::Status ws = actIdx->Write(leveldb::WriteOptions(), &actBatch);
+            if (!ws.ok())
+            {
+                for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
+                delete actIdx;
+                return SetError(error, "lm: actidx final write failed: " + ws.ToString());
+            }
+            actBatch.Clear();
+            actBatchCount = 0;
+        }
         for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
-        (void)total;
+        // NOTE: actIdx stays open for M3 (active walk) and M4 (derived).
+        // writer_ also open; its records/hashindex handles are separate files.
     }
+    (void)as_;
 
-    // Records + hashindex streamed with O(chunk) memory. M3 (active) and M4
-    // (derived) and M5 (DAG) and M6 (digests) are implemented in subsequent
-    // commits building on this writer. For now the writer holds a valid records/
-    // hashindex; calling Finalize with a tip would require active+derived, so
-    // M2 alone leaves the staging incomplete (M3+ complete it).
+    // ---- M3: streamed active-chain construction ----
+    // Walk hashBestChain -> hashPrev down to genesis using the external actIdx
+    // (O(1) per step, bounded RAM). Write (height, RecordId) pairs tip-first to
+    // a temp file; then read backward (ascending height) and feed active.dat
+    // via the writer. Peak RAM O(1): only the active-pair temp file is O(N) and
+    // it is disk-backed.
+    const std::string activeTmp = (tmpDir / "active.pairs").string();
+    {
+        FILE* af = fopen(activeTmp.c_str(), "wb");
+        if (!af)
+        {
+            delete actIdx;
+            return SetError(error, "lm: open active pair file failed");
+        }
+        uint256 cur = hashBestChain;
+        bool reachedGen = false;
+        for (;;)
+        {
+            std::string key(cur.begin(), cur.end());
+            std::string val;
+            leveldb::Status gs = actIdx->Get(leveldb::ReadOptions(),
+                                             leveldb::Slice(key), &val);
+            if (!gs.ok())
+            {
+                fclose(af);
+                delete actIdx;
+                return SetError(error, "lm: active chain hash missing from index");
+            }
+            if (val.size() < sizeof(BlockIndexId) + sizeof(BlockIndexRecord))
+            {
+                fclose(af);
+                delete actIdx;
+                return SetError(error, "lm: active index value corrupt");
+            }
+            BlockIndexId id;
+            memcpy(&id, &val[0], sizeof(BlockIndexId));
+            BlockIndexRecord rec;
+            memcpy(&rec, &val[sizeof(BlockIndexId)], sizeof(BlockIndexRecord));
+            // write (height, RecordId) tip-first: height int32 + id 8 bytes
+            if (fwrite(&rec.height, 1, sizeof(rec.height), af) != sizeof(rec.height) ||
+                fwrite(&id, 1, sizeof(id), af) != sizeof(id))
+            {
+                fclose(af);
+                delete actIdx;
+                return SetError(error, "lm: write active pair failed");
+            }
+            if (rec.hashPrev == 0)
+            {
+                if (rec.height != 0)
+                {
+                    fclose(af);
+                    delete actIdx;
+                    return SetError(error, "lm: active genesis height != 0");
+                }
+                reachedGen = true;
+                break;
+            }
+            cur = rec.hashPrev;
+        }
+        fclose(af);
+        if (!reachedGen)
+        {
+            delete actIdx;
+            return SetError(error, "lm: active chain did not reach genesis");
+        }
+
+        // Read backward (ascending height): file has height-descending pairs.
+        // Validate height continuity 0..tip and feed active.dat ascending.
+        FILE* rf = fopen(activeTmp.c_str(), "rb");
+        if (!rf)
+        {
+            delete actIdx;
+            return SetError(error, "lm: reopen active pair file failed");
+        }
+        fseek(rf, 0, SEEK_END);
+        long fsz = ftell(rf);
+        long pairBytes = 12; // int32 height + 8-byte BlockIndexId
+        long pairCount = fsz / pairBytes;
+        int64_t expectedH = 0;
+        for (long idx = pairCount - 1; idx >= 0; --idx)
+        {
+            fseek(rf, idx * pairBytes, SEEK_SET);
+            int32_t h; BlockIndexId id;
+            if (fread(&h, 1, sizeof(h), rf) != sizeof(h) ||
+                fread(&id, 1, sizeof(id), rf) != sizeof(id))
+            {
+                fclose(rf);
+                delete actIdx;
+                return SetError(error, "lm: read active pair (backward) failed");
+            }
+            if (h != expectedH)
+            {
+                fclose(rf);
+                delete actIdx;
+                return SetError(error, "lm: active chain height discontinuity at " +
+                                strprintf("%lld", (long long)expectedH));
+            }
+            if (!writer_.AppendActive(id, h, error))
+            {
+                fclose(rf);
+                delete actIdx;
+                return false;
+            }
+            ++expectedH;
+        }
+        fclose(rf);
+    }
+    delete actIdx;
+
+    // Flush any remaining buffered active/derived batches to disk.
+    if (!writer_.Flush(error))
+        return false;
+
     ClearError(error);
     return true;
 }
