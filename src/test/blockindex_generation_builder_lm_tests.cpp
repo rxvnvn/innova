@@ -157,12 +157,16 @@ BOOST_AUTO_TEST_CASE(m3_active_chain_streamed)
     size_t entries = (actData.size() - hdr) / 8;
     BOOST_REQUIRE_EQUAL(entries, (size_t)(tip + 1));
 
-    // M3-3: no O(N) CBlockIndex graph was built (mapBlockIndex untouched by LM).
-    // (There is no global mapBlockIndex membership to assert here since the LM
-    // builder never populates it; the design guarantees this by construction.)
-
-    printf("M3 PASS: LM builder streamed %zu active entries (heights 0..%d)\n",
-           entries, tip);
+    // M4: derived.dat written, entry count == record count (N = tip+1).
+    fs::path derPath = fs::path(staging) / "derived.dat";
+    BOOST_REQUIRE(fs::exists(derPath));
+    std::string derData = ReadFileBytes(derPath.string());
+    // derived.dat = 80-byte V2 header + N x 56 bytes
+    size_t derHdr = 80;
+    size_t derEntries = derData.size() > derHdr ? (derData.size() - derHdr) / 56 : 0;
+    BOOST_REQUIRE_EQUAL(derEntries, (size_t)(tip + 1));
+    printf("M3/M4 PASS: LM builder streamed %zu active + %zu derived entries\n",
+           entries, derEntries);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
