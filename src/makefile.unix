@@ -374,6 +374,7 @@ OBJS= \
     obj/blockindex_authoritative_restart.o \
     obj/blockindex_fold_tool.o \
     obj/blockindex_generation_writer.o \
+    obj/blockindex_generation_builder_lm.o \
     obj/rpcsmessage.o \
     obj/rpcnyx.o \
     obj/script.o \
@@ -490,6 +491,7 @@ OBJS= \
     obj/blockindex_authoritative_restart.o \
     obj/blockindex_fold_tool.o \
     obj/blockindex_generation_writer.o \
+    obj/blockindex_generation_builder_lm.o \
     obj/script.o \
     obj/sync.o \
     obj/util.o \
