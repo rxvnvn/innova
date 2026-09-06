@@ -93,6 +93,27 @@ public:
     // Causal test assist: expose the underlying tip authority.
     const BlockIndexTipAuthority* TipAuthority() const;
 
+    // P4 — Reorg in the bounded tip authority.
+    // Reorg the ACTIVE chain to a fork height (disconnect the branch above it),
+    // then connect the provided new branch's blocks as the active chain. Side
+    // blocks (the old branch, and any non-active) remain persisted as records
+    // (like legacy mapBlockIndex keeps them) so a later reorg can re-join them.
+    //
+    // newBranch: the blocks of the new active chain from forkHeight+1 upward,
+    //            in order, with their active global heights in newHeights. The
+    //            first element's parent must be the active block at forkHeight.
+    // This is a CACHE/AUTHORITY reorg representation, NOT a consensus change: the
+    // caller (live path) has already validated the new branch and chosen it as
+    // best. The seam only persists the new active topology by-value.
+    //
+    // Returns BLOCK_INDEX_TIP_OK on success; tip authority reflects the new tip.
+    // On failure the tip is left at the truncate point (fail-closed; no partial
+    // new branch applied), recoverable by re-running.
+    BlockIndexTipStatus ReorgTo(int32_t forkHeight,
+                                const std::vector<BlockIndexTipAppend>& newBranch,
+                                const std::vector<int32_t>& newHeights,
+                                std::string* error);
+
 private:
     BaseKnownFn baseKnown_;
     void* baseUd_;

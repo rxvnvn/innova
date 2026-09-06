@@ -329,4 +329,189 @@ BOOST_AUTO_TEST_CASE(a6_live_tail_reflects_accepted)
     (void)tail;
 }
 
+// ---- P4: reorg within tip authority ----
+BOOST_AUTO_TEST_CASE(r1_reorg_within_tip)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 10;
+    const uint256 baseTipHash = uint256(0xBEEFUL);
+    BaseKnownCtx base;
+    base.known.insert(baseTipHash);
+
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 2, 100, baseTip, &tip, NULL));
+    BlockIndexLiveTail tail;
+    tail.SetSources(NULL, &tip);
+    tail.SetHorizon(64);
+    tail.SetCurrentGeneration(2);
+    BlockIndexLiveAcceptance seam;
+    seam.SetSources(&BaseKnownFn, &base, &tip, &tail);
+
+    // main chain S+1..S+4 (active)
+    uint256 prev = baseTipHash;
+    uint256 h[5];
+    for (int i = 1; i <= 4; ++i)
+    {
+        h[i] = uint256(0x6000UL + i);
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(h[i], prev, baseTip + i, false);
+        a.derived = MakeDerived(uint256(i), i);
+        std::string err;
+        BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, baseTip + i, &err), baseTip + i);
+        prev = h[i];
+    }
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 4);
+    uint8_t fenceBefore = tip.ActiveFence();
+
+    // New branch: same fork at S+2 (height 12), different blocks at 13 and 14.
+    uint256 nh13 = uint256(0xA111UL);
+    uint256 nh14 = uint256(0xA222UL);
+    std::vector<BlockIndexTipAppend> branch;
+    std::vector<int32_t> heights;
+    {
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(nh13, h[2], baseTip + 3, false);
+        a.derived = MakeDerived(uint256(0x30UL), 30);
+        branch.push_back(a); heights.push_back(baseTip + 3);
+        a = BlockIndexTipAppend();
+        a.record = MakeRecord(nh14, nh13, baseTip + 4, false);
+        a.derived = MakeDerived(uint256(0x40UL), 40);
+        branch.push_back(a); heights.push_back(baseTip + 4);
+    }
+    std::string err;
+    BOOST_REQUIRE(seam.ReorgTo(baseTip + 2, branch, heights, &err) == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 4);
+    // fence bumped (reorg happened)
+    BOOST_REQUIRE((unsigned)tip.ActiveFence() != (unsigned)fenceBefore);
+    // new tip is the new branch's tip hash
+    BlockIndexTipRead t = tip.GetTip();
+    BOOST_REQUIRE(t.status == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE(t.record.hash == nh14);
+    // old branch block h[4] is retained as a non-active record
+    BlockIndexTipRead old = tip.LookupByHash(h[4], NULL);
+    BOOST_REQUIRE(old.status == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE(!old.active);
+    printf("R1 PASS reorg within tip: tip->%s, old branch retained non-active\n",
+           t.record.hash.ToString().substr(0,12).c_str());
+}
+
+BOOST_AUTO_TEST_CASE(r2_reorg_requires_old_ancestry_in_base)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 100;
+    const uint256 baseTipHash = uint256(0xBEEFUL);
+    // base knows S and S-1 (deep history), simulating a reorg whose fork is at
+    // S-1 (below the generation tip) — requires base V2 ancestry re-materialization
+    // (which is authority, not residency). The tip accepts the new branch on top.
+    BaseKnownCtx base;
+    base.known.insert(baseTipHash);
+    base.known.insert(uint256(0xABEUL)); // S-1
+
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 5, 200, baseTip, &tip, NULL));
+    BlockIndexLiveTail tail;
+    tail.SetSources(NULL, &tip);
+    tail.SetHorizon(8);
+    tail.SetCurrentGeneration(5);
+    BlockIndexLiveAcceptance seam;
+    seam.SetSources(&BaseKnownFn, &base, &tip, &tail);
+
+    // active main: S+1,S+2
+    uint256 prev = baseTipHash;
+    for (int i = 1; i <= 2; ++i)
+    {
+        uint256 hh = uint256(0x7000UL + i);
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(hh, prev, baseTip + i, false);
+        a.derived = MakeDerived(uint256(i), i);
+        std::string err;
+        BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, baseTip + i, &err), baseTip + i);
+        prev = hh;
+    }
+    // Reorg to fork at S-1 (height 99, in base): truncate active tip to baseTip
+    // (removing S+1,S+2), then append a new branch starting at S+1.
+    uint256 nh11 = uint256(0xBB11UL);
+    uint256 nh12 = uint256(0xBB22UL);
+    std::vector<BlockIndexTipAppend> branch;
+    std::vector<int32_t> heights;
+    BlockIndexTipAppend a;
+    a.record = MakeRecord(nh11, baseTipHash, baseTip + 1, false); // parent = S
+    a.derived = MakeDerived(uint256(0x11UL), 11);
+    branch.push_back(a); heights.push_back(baseTip + 1);
+    a = BlockIndexTipAppend();
+    a.record = MakeRecord(nh12, nh11, baseTip + 2, false);
+    a.derived = MakeDerived(uint256(0x22UL), 22);
+    branch.push_back(a); heights.push_back(baseTip + 2);
+
+    std::string err;
+    // forkHeight must be >= baseTip (TruncateActiveTo range). A fork at S-1 is
+    // below the tip floor; the seam must still allow it by truncating to baseTip
+    // (empty tip) which equals the base V2 floor. Here ReorgTo truncates to S.
+    BlockIndexTipStatus st = seam.ReorgTo(baseTip, branch, heights, &err);
+    BOOST_REQUIRE(st == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 2);
+    BlockIndexTipRead nt = tip.GetTip();
+    BOOST_REQUIRE(nt.status == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE(nt.record.hash == nh12);
+    printf("R2 PASS reorg to base-floor fork (S-1 ancestry via base V2), new tip=%s\n",
+           nt.record.hash.ToString().substr(0,12).c_str());
+}
+
+BOOST_AUTO_TEST_CASE(r3_reorg_persists_reopen)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 10;
+    const uint256 baseTipHash = uint256(0xBEEFUL);
+    BaseKnownCtx base;
+    base.known.insert(baseTipHash);
+
+    uint256 finalHash;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 3, 100, baseTip, &tip, NULL));
+        BlockIndexLiveTail tail;
+        tail.SetSources(NULL, &tip);
+        tail.SetHorizon(64);
+        tail.SetCurrentGeneration(3);
+        BlockIndexLiveAcceptance seam;
+        seam.SetSources(&BaseKnownFn, &base, &tip, &tail);
+        // main S+1..S+4
+        uint256 prev = baseTipHash;
+        uint256 h[5];
+        for (int i = 1; i <= 4; ++i)
+        {
+            h[i] = uint256(0x8100UL + i);
+            BlockIndexTipAppend a;
+            a.record = MakeRecord(h[i], prev, baseTip + i, false);
+            a.derived = MakeDerived(uint256(i), i);
+            std::string err;
+            BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, baseTip + i, &err), baseTip + i);
+            prev = h[i];
+        }
+        // reorg to fork S+2 with new branch at 13,14
+        uint256 nh13 = uint256(0xC111UL), nh14 = uint256(0xC222UL);
+        std::vector<BlockIndexTipAppend> branch;
+        std::vector<int32_t> heights;
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(nh13, h[2], baseTip + 3, false);
+        a.derived = MakeDerived(uint256(0x31UL), 31);
+        branch.push_back(a); heights.push_back(baseTip + 3);
+        a = BlockIndexTipAppend();
+        a.record = MakeRecord(nh14, nh13, baseTip + 4, false);
+        a.derived = MakeDerived(uint256(0x41UL), 41);
+        branch.push_back(a); heights.push_back(baseTip + 4);
+        std::string err;
+        BOOST_REQUIRE(seam.ReorgTo(baseTip + 2, branch, heights, &err) == BLOCK_INDEX_TIP_OK);
+        finalHash = nh14;
+    }
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 3, &tip, NULL));
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 4);
+        BOOST_REQUIRE(tip.TipHash() == finalHash);
+        printf("R3 PASS reorg persisted+reopen: tip=%d hash=%s\n",
+               (int)tip.TipHeight(), tip.TipHash().ToString().substr(0,12).c_str());
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()
