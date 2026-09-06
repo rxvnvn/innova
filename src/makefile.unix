@@ -370,6 +370,7 @@ OBJS= \
     obj/blockindex_hot_owner.o \
     obj/blockindex_tip.o \
     obj/blockindex_live_tail.o \
+    obj/blockindex_live_acceptance.o \
     obj/rpcsmessage.o \
     obj/rpcnyx.o \
     obj/script.o \
@@ -482,6 +483,7 @@ OBJS= \
     obj/blockindex_hot_owner.o \
     obj/blockindex_tip.o \
     obj/blockindex_live_tail.o \
+    obj/blockindex_live_acceptance.o \
     obj/script.o \
     obj/sync.o \
     obj/util.o \
@@ -591,6 +593,7 @@ TEST_OBJS= \
     obj/test/blockindex_hot_owner_tests.o \
     obj/test/blockindex_tip_tests.o \
     obj/test/blockindex_live_tail_tests.o \
+    obj/test/blockindex_live_acceptance_tests.o \
     obj/test/blockindex_first_consumer_tests.o \
     obj/test/blockindex_production_materializer_tests.o \
     obj/test/cold_hot_seam_tests.o \
