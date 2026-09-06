@@ -368,6 +368,7 @@ OBJS= \
     obj/dag.o \
     obj/candidate_frontier.o \
     obj/blockindex_hot_owner.o \
+    obj/blockindex_tip.o \
     obj/rpcsmessage.o \
     obj/rpcnyx.o \
     obj/script.o \
@@ -478,6 +479,7 @@ OBJS= \
     obj/dag.o \
     obj/candidate_frontier.o \
     obj/blockindex_hot_owner.o \
+    obj/blockindex_tip.o \
     obj/script.o \
     obj/sync.o \
     obj/util.o \
@@ -585,6 +587,7 @@ TEST_OBJS= \
     obj/test/blockindex_candidate_startup_builder_tests.o \
     obj/test/blockindex_stake_seen_builder_tests.o \
     obj/test/blockindex_hot_owner_tests.o \
+    obj/test/blockindex_tip_tests.o \
     obj/test/blockindex_first_consumer_tests.o \
     obj/test/blockindex_production_materializer_tests.o \
     obj/test/cold_hot_seam_tests.o \
