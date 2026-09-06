@@ -747,6 +747,9 @@ innovad: $(OBJS:obj/%=obj/%)
 innova-blockindex-builder: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_generation_builder_tool.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
+innova-blockindex-builder-lm: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_generation_builder_lm_tool.o
+	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
+
 innova-blockindex-navdiff: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_navigation_diff_tool.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
