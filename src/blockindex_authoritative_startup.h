@@ -35,6 +35,8 @@
 #include <stdint.h>
 #include <string>
 
+class BlockIndexAuthoritativeLive; // fwd (G1 production live-authority accessor)
+
 // Set to true (by InitBlockIndexAuthoritative) while an authoritative by-value
 // startup is active. init.cpp uses it to skip the legacy DAG-rebuild /
 // candidate-tip mapBlockIndex scans that are replaced by by-value providers.
@@ -56,5 +58,12 @@ uint64_t AuthoritativeGeneration();
 // A.10.1q / Stage1: emit the BLOCKINDEX_RESIDENCY line for the retained
 // authoritative context, including the bootstrap HotOwner live metrics.
 void PrintAuthoritativeResidency(const char* tag);
+
+// G1: production live-authority accessor. NULL when NOT in authoritative mode.
+// The returned object (if any) is retained process-lifetime by the authoritative
+// startup context and bound to the single process-open base reader + the mutable
+// tip. Callers must NOT free it. Used by the live block path to resolve parents
+// by value and persist post-S blocks with bounded residency.
+BlockIndexAuthoritativeLive* GetAuthoritativeLiveAuthority();
 
 #endif // INNOVA_BLOCKINDEX_AUTHORITATIVE_STARTUP_H

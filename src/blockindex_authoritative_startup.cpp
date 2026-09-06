@@ -3,6 +3,7 @@
 
 #include "blockindex_authoritative_startup.h"
 
+#include "blockindex_authoritative_live.h"
 #include "blockindex_residency_counters.h"
 #include "blockindex_startup_bootstrap.h"
 #include "blockindex_stake_seen_builder.h"
@@ -27,6 +28,12 @@ struct AuthoritativeStartupContext
     BlockIndexStartupBootstrap bootstrap;
     std::string v2Root;
     bool ok;
+
+    // G1: production live-authority seam retained process-lifetime so the live
+    // block path can resolve parents by value + persist post-S blocks with
+    // bounded residency. Bound to the single process-open base reader (via the
+    // navigator's cold reader) + the mutable tip under <v2Root>/blockindex_tip.
+    std::unique_ptr<BlockIndexAuthoritativeLive> live;
 
     AuthoritativeStartupContext() : ok(false) {}
 };
@@ -168,6 +175,34 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         }
     }
 
+    // 5b. G1: retain the production live-authority seam bound to the SAME single
+    //     process-open base reader (the navigator's cold reader, which survives
+    //     process-lifetime) + the mutable tip under <v2Root>/blockindex_tip.
+    //     This is what lets the live block path resolve a parent by value and
+    //     persist post-S blocks without rebuilding historical mapBlockIndex.
+    {
+        const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+        const BlockIndexV2Reader* cold = nav ? nav->GetColdReader() : NULL;
+        if (!cold || !cold->IsOpen())
+        {
+            if (error) *error = "authoritative startup: live-authority base reader unavailable";
+            return false;
+        }
+        const int livetail = GetArg("-blockindexlivetail", 2048);
+        std::unique_ptr<BlockIndexAuthoritativeLive> live(new BlockIndexAuthoritativeLive());
+        std::string lerr;
+        if (!live->Open(v2Root, cold, livetail, &lerr))
+        {
+            if (error) *error = "authoritative startup: live authority: " + lerr;
+            return false; // fail closed
+        }
+        ctx->live = std::move(live);
+        printf("BLOCKINDEX_V2_AUTHORITATIVE live_authority=retained horizon=%d base_gen=%llu tip_height=%d\n",
+               livetail,
+               (unsigned long long)ctx->live->BaseGeneration(),
+               (int)ctx->live->TipAuthorityMutable()->TipHeight());
+    }
+
     // HReg + wallet rescan are driven by init.cpp AFTER this returns, using
     // the by-value active-chain reader + by-value paths (ca7c7e1).
 
@@ -192,6 +227,13 @@ uint64_t AuthoritativeGeneration()
 {
     if (!g_authoritativeContext) return 0;
     return g_authoritativeContext->bootstrap.Generation();
+}
+
+// G1: production live-authority accessor (NULL when not authoritative mode).
+BlockIndexAuthoritativeLive* GetAuthoritativeLiveAuthority()
+{
+    if (!g_authoritativeContext) return NULL;
+    return g_authoritativeContext->live.get();
 }
 
 // A.10.1q / Stage1: emit residency for the retained authoritative context,

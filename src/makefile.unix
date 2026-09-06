@@ -372,6 +372,7 @@ OBJS= \
     obj/blockindex_live_tail.o \
     obj/blockindex_live_acceptance.o \
     obj/blockindex_authoritative_restart.o \
+    obj/blockindex_authoritative_live.o \
     obj/blockindex_fold_tool.o \
     obj/blockindex_generation_writer.o \
     obj/blockindex_generation_builder_lm.o \
@@ -489,6 +490,7 @@ OBJS= \
     obj/blockindex_live_tail.o \
     obj/blockindex_live_acceptance.o \
     obj/blockindex_authoritative_restart.o \
+    obj/blockindex_authoritative_live.o \
     obj/blockindex_fold_tool.o \
     obj/blockindex_generation_writer.o \
     obj/blockindex_generation_builder_lm.o \
@@ -603,6 +605,7 @@ TEST_OBJS= \
     obj/test/blockindex_live_tail_tests.o \
     obj/test/blockindex_live_acceptance_tests.o \
     obj/test/blockindex_authoritative_restart_tests.o \
+    obj/test/blockindex_authoritative_live_tests.o \
     obj/test/blockindex_fold_tool_tests.o \
     obj/test/blockindex_p7_end_to_end_tests.o \
     obj/test/blockindex_generation_writer_tests.o \
