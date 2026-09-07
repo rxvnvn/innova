@@ -9931,7 +9931,28 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 
 
     // If don't already have its previous block, shunt it off to holding area until we get it
-    if (!mapBlockIndex.count(pblock->hashPrevBlock)) //pblock->hashPrevBlock != 0 &&
+    // ---- G1: historical-boundary orphan bypass ----
+    // In BY_VALUE_AUTHORITATIVE mode the parent of the first above-base block S+1
+    // (the base tip S) is authoritative in V2 (the immutable generation / mutable
+    // tip) but is intentionally NOT resident in mapBlockIndex. Treating it as a
+    // genuine peer-orphan would permanently strand S+1 (its parent never enters
+    // mapBlockIndex). So when authoritative mode is active AND the parent resolves
+    // by-value through the live authority, do NOT orphan it: fall through to the
+    // real AcceptBlock path, where the G1 parent-resolution wire materializes +
+    // validates the parent from V2. Legacy mode (g_fAuthoritativeStartup false) is
+    // byte-identical: the parent must be a resident mapBlockIndex member or the
+    // block is orphaned exactly as before.
+    bool fAuthoritativeParentResolved = false;
+    if (g_fAuthoritativeStartup && !mapBlockIndex.count(pblock->hashPrevBlock))
+    {
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        if (live && live->IsOpen())
+        {
+            std::string perr;
+            fAuthoritativeParentResolved = live->ResolveParent(pblock->hashPrevBlock, NULL, &perr);
+        }
+    }
+    if (!mapBlockIndex.count(pblock->hashPrevBlock) && !fAuthoritativeParentResolved) //pblock->hashPrevBlock != 0 &&
     {
         if (fDebug)
             printf("ProcessBlock: ORPHAN BLOCK hash=%s prev=%s coinbase_height=%d peer_orphans=%d global_orphans=%zu\n",
