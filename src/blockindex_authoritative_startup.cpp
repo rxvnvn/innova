@@ -230,10 +230,25 @@ uint64_t AuthoritativeGeneration()
 }
 
 // G1: production live-authority accessor (NULL when not authoritative mode).
+// Prefers the G1 test-only handle while set so a causal test can arm the real
+// ProcessBlock path against an isolated authoritative generation.
+static BlockIndexAuthoritativeLive* g_testLiveAuthority = NULL;
 BlockIndexAuthoritativeLive* GetAuthoritativeLiveAuthority()
 {
+    if (g_testLiveAuthority)
+        return g_testLiveAuthority;
     if (!g_authoritativeContext) return NULL;
     return g_authoritativeContext->live.get();
+}
+
+// G1 test-only arms (see header). Pair set/clear; inert when unset.
+void SetAuthoritativeLiveForTesting(BlockIndexAuthoritativeLive* live)
+{
+    g_testLiveAuthority = live;
+}
+void ClearAuthoritativeLiveForTesting()
+{
+    g_testLiveAuthority = NULL;
 }
 
 // A.10.1q / Stage1: emit residency for the retained authoritative context,

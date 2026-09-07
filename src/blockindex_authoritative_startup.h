@@ -66,4 +66,14 @@ void PrintAuthoritativeResidency(const char* tag);
 // by value and persist post-S blocks with bounded residency.
 BlockIndexAuthoritativeLive* GetAuthoritativeLiveAuthority();
 
+// G1 test-only arms for the DECISIVE causal closure (real ProcessBlock against
+// an authoritative base). A test installs its own open BlockIndexAuthoritativeLive
+// (bound to an isolated datadir generation) so the production block path observes
+// authoritative mode + a live authority WITHOUT going through InitBlockIndexAuthoritative
+// (which would mutate init.cpp process globals). GetAuthoritativeLiveAuthority()
+// prefers this test handle while set. MUST be paired with ClearAuthoritativeLiveForTesting().
+// These are NOT called by production startup and are inert when unset.
+void SetAuthoritativeLiveForTesting(BlockIndexAuthoritativeLive* live);
+void ClearAuthoritativeLiveForTesting();
+
 #endif // INNOVA_BLOCKINDEX_AUTHORITATIVE_STARTUP_H
