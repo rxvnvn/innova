@@ -52,6 +52,9 @@ public:
         p->nMint      = s.nMint;
         p->nMoneySupply = s.nMoneySupply;
         p->nStakeModifier = s.nStakeModifier;
+        // Preserve the authority's nFlags (BLOCK_STAKE_MODIFIER / GENERATED for
+        // genesis + stake blocks) — the legacy consensus walks rely on them.
+        p->nFlags = s.nFlags;
         if (s.hasStakeModifierTime)
             p->nStakeModifierTime = s.nStakeModifierTime;
         if (s.hasStakeModifierChecksum)

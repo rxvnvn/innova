@@ -36,6 +36,14 @@ public:
     std::vector<CBlockIndex*> ownedChain_;
     std::vector<uint256*>      ownedChainHashes_;
 
+    // G1-A: PERSISTENT full-topology residency, keyed by logical hash. Holds the
+    // parent chain materialized for AddToBlockIndex so accepted-mapBlockIndex
+    // entries' pprev stays valid ACROSS operations (survives
+    // ReleaseOperationMaterializations). anchor_ hashes are non-evictable.
+    std::map<uint256, CBlockIndex*> fullResident_;
+    std::map<uint256, uint256*>     fullResidentHash_;
+    std::set<uint256>               fullResidentAnchor_;
+
     Impl()
         : baseReader(NULL), horizon(2048), baseGeneration(0),
           open(false), baseTipHeight(-1), baseTipHash(0)
@@ -48,6 +56,16 @@ public:
         {
             delete ownedChain_[i];
             delete ownedChainHashes_[i];
+        }
+        for (std::map<uint256, CBlockIndex*>::iterator it = fullResident_.begin();
+             it != fullResident_.end(); ++it)
+        {
+            delete it->second;
+        }
+        for (std::map<uint256, uint256*>::iterator it = fullResidentHash_.begin();
+             it != fullResidentHash_.end(); ++it)
+        {
+            delete it->second;
         }
     }
 };
@@ -222,6 +240,14 @@ CBlockIndex* FullFromSnapshot(const BlockIndexSnapshot& s, uint256* ownHash)
     p->nMint      = s.nMint;
     p->nMoneySupply = s.nMoneySupply;
     p->nStakeModifier = s.nStakeModifier;
+    // G1-A: the by-value snapshot carries the authority's nFlags (incl.
+    // BLOCK_STAKE_MODIFIER / BLOCK_GENERATED for genesis + stake blocks). These
+    // MUST be preserved on the materialized object, or the legacy consensus
+    // walks (GetLastStakeModifier/GeneratedStakeModifier, IsProofOfStake,
+    // ComputeNextStakeModifier) diverge for a boundary accept. Prior to this a
+    // materialized genesis lost its BLOCK_STAKE_MODIFIER flag (nFlags=0),
+    // breaking the boundary block's stake-modifier walk.
+    p->nFlags = s.nFlags;
     if (s.hasStakeModifierTime)
         p->nStakeModifierTime = s.nStakeModifierTime;
     if (s.hasStakeModifierChecksum)
@@ -231,6 +257,154 @@ CBlockIndex* FullFromSnapshot(const BlockIndexSnapshot& s, uint256* ownHash)
     return p;
 }
 } // namespace
+
+CBlockIndex* BlockIndexAuthoritativeLive::ResolveAndRetainFullParent(
+    const uint256& parentHash, std::string* error)
+{
+    if (!impl_->open || !impl_->baseReader)
+    {
+        if (error) *error = "authoritative-live: not open";
+        return NULL;
+    }
+    // If already persisted-resident, return the existing object (idempotent).
+    {
+        std::map<uint256, CBlockIndex*>::iterator it = impl_->fullResident_.find(parentHash);
+        if (it != impl_->fullResident_.end())
+            return it->second;
+    }
+
+    // Walk the parent chain by value (tip-then-base) down to (and including)
+    // the floor needed for the boundary block's OWN consensus walks. The base
+    // tip S itself floors the ORIGINAL walk (MaterializeParentChain stops at S),
+    // but a boundary accept's ConnectBlock/AcceptBlock walks GET_MEDIAN_TIME_SPAN
+    // (11) pprev ancestors for median-time, plus a few for difficulty/stake.
+    // Those ancestors are BELOW S. Serving them means the retained chain must
+    // extend a bounded constant depth below S (never O(N)): ancestry within the
+    // consensus walk window is materialized and retained so the block's median
+    // time / difficulty / stake-modifier checks match legacy exactly. Entries
+    // below this bounded window are never resident (deep history stays V2-only).
+    std::vector<BlockIndexSnapshot> path;             // path[0] = parent (highest)
+    std::string rerr;
+    uint256 cur = parentHash;
+    bool reachedFloor = false;
+    // Walk down to height floorHeight = max(0, baseTipHeight - WALK) so the
+    // retained chain covers the median-time (11) + difficulty/stake margin.
+    const int WALK = CBlockIndex::nMedianTimeSpan + 2; // 13
+    const int floorHeight = std::max(0, impl_->baseTipHeight - WALK);
+    for (int guard = 0; guard < 20 * 1000 * 1000; ++guard)
+    {
+        bool stop = false;
+        if (cur == uint256(0))
+        {
+            reachedFloor = true; // reached genesis root
+            stop = true;
+        }
+        if (stop)
+            break;
+        BlockIndexSnapshot s;
+        bool found = false;
+        if (impl_->tip && impl_->tip->IsOpen())
+        {
+            BlockIndexTipRead tr = impl_->tip->LookupByHash(cur, error);
+            if (tr.status == BLOCK_INDEX_TIP_OK)
+            {
+                s.found = true;
+                s.hash = tr.record.hash;
+                s.hashPrev = tr.record.hashPrev;
+                s.hashMerkleRoot = tr.record.hashMerkleRoot;
+                s.height = tr.record.height;
+                s.nFile = tr.record.nFile;
+                s.nBlockPos = tr.record.nBlockPos;
+                s.nFlags = tr.record.nFlags;
+                s.nVersion = tr.record.nVersion;
+                s.nTime = tr.record.nTime;
+                s.nBits = tr.record.nBits;
+                s.nNonce = tr.record.nNonce;
+                s.nMint = tr.record.nMint;
+                s.nMoneySupply = tr.record.nMoneySupply;
+                s.nStakeModifier = tr.record.nStakeModifier;
+                s.prevoutStake = tr.record.prevoutStake;
+                s.nStakeTime = tr.record.nStakeTime;
+                s.hashProof = tr.record.hashProof;
+                s.fProofOfStake = (tr.record.prevoutStake.hash != uint256(0));
+                s.hasParent = (tr.record.hashPrev != uint256(0));
+                s.nChainTrust = tr.derived.chainTrust;
+                s.nStakeModifierChecksum = tr.derived.stakeModifierChecksum;
+                s.hasStakeModifierChecksum = true;
+                s.nStakeModifierTime = tr.derived.stakeModifierTime;
+                s.hasStakeModifierTime = tr.derived.HasStakeModifierTime();
+                found = true;
+            }
+        }
+        if (!found)
+        {
+            BlockIndexV2ReadStatus st = impl_->baseReader->LookupByHash(cur, &s, error);
+            if (st == BLOCK_INDEX_V2_READ_FOUND && s.found)
+                found = true;
+        }
+        if (!found)
+        {
+            if (error) *error = "authoritative-live(retain): walk lookup failed at " + cur.ToString();
+            return NULL;
+        }
+        path.push_back(s);
+        // Reached the bounded consensus-walk floor below S.
+        if (s.height <= floorHeight)
+        {
+            reachedFloor = true;
+            break;
+        }
+        cur = s.hashPrev;
+    }
+    if (!reachedFloor || path.empty())
+    {
+        if (error) *error = "authoritative-live(retain): floor mismatch/empty";
+        return NULL;
+    }
+
+    // Materialize into the PERSISTENT store (topology linked), reusing any
+    // ancestor that is already persisted-resident. path[0]=parent .. path.back()=floor S.
+    for (size_t i = 0; i < path.size(); ++i)
+    {
+        const uint256& h = path[i].hash;
+        if (impl_->fullResident_.count(h))
+            continue; // already resident; kept
+        uint256* own = new uint256(h);
+        CBlockIndex* obj = FullFromSnapshot(path[i], own);
+        impl_->fullResident_[h] = obj;
+        impl_->fullResidentHash_[h] = own;
+        // anchor the base tip (boundary) so it is never evicted
+        if (h == impl_->baseTipHash)
+            impl_->fullResidentAnchor_.insert(h);
+    }
+    // Link topology: pprev -> floor, pnext -> tip within the resolved chain AND
+    // against already-persistent ancestors so the whole pointer graph is valid.
+    // Build height-ordered list path[0] (highest) .. path.back() (floor).
+    for (size_t i = 0; i < path.size(); ++i)
+    {
+        CBlockIndex* o = impl_->fullResident_[path[i].hash];
+        const uint256& hPrev = path[i].hashPrev;
+        CBlockIndex* prev = (i + 1 < path.size()) ? impl_->fullResident_[path[i + 1].hash] : NULL;
+        if (!prev && hPrev != uint256(0))
+        {
+            std::map<uint256, CBlockIndex*>::iterator p = impl_->fullResident_.find(hPrev);
+            if (p != impl_->fullResident_.end())
+                prev = p->second;
+        }
+        o->pprev = prev;
+        o->pnext = (i > 0) ? impl_->fullResident_[path[i - 1].hash] : NULL;
+        o->pskip = o->pprev;
+    }
+    // nChainTrust is preserved from the snapshot: FullFromSnapshot sets
+    // p->nChainTrust = s.nChainTrust, and the reader now fills s.nChainTrust
+    // from the authoritative derived.dat (per-record cumulative trust). No
+    // recomputation is needed (and re-accumulating would wrongly drop the
+    // heritage of a boundary object that floors at itself). Anchor the base tip.
+    for (size_t i = 0; i < path.size(); ++i)
+        if (path[i].hash == impl_->baseTipHash)
+            impl_->fullResidentAnchor_.insert(path[i].hash);
+    return impl_->fullResident_[parentHash];
+}
 
 CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChain(
     const uint256& hash, BlockIndexHotHandle* out, std::string* error) const
@@ -245,15 +419,26 @@ CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChain(
     // valid until the enclosing ProcessBlock completes. Residency is bounded by
     // releasing at the end of the operation (ReleaseOperationMaterializations).
 
-    // Walk parent by value (tip-then-base) down to (and including) the base tip
-    // floor S, collecting snapshots tip-first. The base floor is the resident
-    // boundary; arbitrary deep history is never reconstructed here.
+    // Walk parent by value (tip-then-base) down to (and including) the
+    // bounded floor needed for the boundary block's OWN consensus walks.
+    // The base tip S is the logical boundary, but the boundary accept's
+    // AcceptBlock/ConnectBlock walks GET_MEDIAN_TIME_SPAN (11) pprev ancestors
+    // (median time) plus difficulty/stake margin below S. So the walk must cover
+    // a BOUNDED constant depth below S (never O(N)); deep history stays V2-only.
     std::vector<BlockIndexSnapshot> path; // path[0] = requested parent (highest height)
     uint256 cur = hash;
     bool reachedFloor = false;
+    const int WALK = CBlockIndex::nMedianTimeSpan + 2; // 13
+    const int floorHeight = std::max(0, impl_->baseTipHeight - WALK);
     for (int guard = 0; guard < 20 * 1000 * 1000; ++guard)
     {
+        bool stop = false;
         if (cur == uint256(0))
+        {
+            reachedFloor = true; // reached genesis root
+            stop = true;
+        }
+        if (stop)
             break;
         BlockIndexSnapshot s;
         bool found = false;
@@ -314,7 +499,8 @@ CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChain(
             return NULL;
         }
         path.push_back(s);
-        if (cur == impl_->baseTipHash)
+        // Reached the bounded consensus-walk floor below S.
+        if (s.height <= floorHeight)
         {
             reachedFloor = true;
             break;

@@ -1,4 +1,5 @@
 #include "blockindex_v2_reader.h"
+#include "blockindex_derived_state.h"
 
 namespace {
 static bool Fail(std::string* error, const std::string& text) { if (error) *error = text; return false; }
@@ -69,18 +70,44 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
     }
     LOCK(cs);
     store = std::move(nextStore); active = std::move(nextActive); hashIndex = std::move(nextHash);
+    // G1-A: optionally open derived.dat (non-fatal if absent — V1/shadow
+    // generations have no derived companion). When present, snapshots gain the
+    // authoritative per-record chainTrust for correct boundary heritage.
+    derived = BlockIndexDerivedStateStore();
+    {
+        std::string derr;
+        if (!BlockIndexDerivedStateStore::OpenReadOnly(dir, current.generation, &derived, &derr))
+            derived = BlockIndexDerivedStateStore(); // absent -> trust stays 0
+    }
     rootPath = root; generationPath = dir; generation = current.generation; manifest = nextManifest;
     cacheCapacity = options.cacheCapacityBytes; cache.clear(); lru.clear(); stats = BlockIndexV2ReaderCacheStats(); stats.capacityBytes = cacheCapacity; open = true;
     Clear(error); return true;
 }
-void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
+void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockIndexDerivedStateStore(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
 bool BlockIndexV2Reader::IsOpen() const { LOCK(cs); return open; }
 uint64_t BlockIndexV2Reader::Generation() const { LOCK(cs); return generation; }
 uint64_t BlockIndexV2Reader::RecordCount() const { LOCK(cs); return open ? manifest.recordCount : 0; }
 BlockIndexV2ReaderCacheStats BlockIndexV2Reader::CacheStats() const { LOCK(cs); return stats; }
 
 BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const BlockIndexRecord& r, bool inActive) const {
-    BlockIndexSnapshot s; s.found=true; s.id=id; s.hash=r.hash; s.hashPrev=r.hashPrev; s.hashMerkleRoot=r.hashMerkleRoot; s.height=r.height; s.nFile=r.nFile; s.nBlockPos=r.nBlockPos; s.nFlags=r.nFlags; s.nVersion=r.nVersion; s.nTime=r.nTime; s.nBits=r.nBits; s.nNonce=r.nNonce; s.nMint=r.nMint; s.nMoneySupply=r.nMoneySupply; s.nStakeModifier=r.nStakeModifier; s.prevoutStake=r.prevoutStake; s.nStakeTime=r.nStakeTime; s.hashProof=r.hashProof; s.fProofOfStake=(r.prevoutStake.hash != uint256(0)); s.fInMainChain=inActive; s.hasParent=(r.hashPrev != uint256(0)); return s;
+    BlockIndexSnapshot s; s.found=true; s.id=id; s.hash=r.hash; s.hashPrev=r.hashPrev; s.hashMerkleRoot=r.hashMerkleRoot; s.height=r.height; s.nFile=r.nFile; s.nBlockPos=r.nBlockPos; s.nFlags=r.nFlags; s.nVersion=r.nVersion; s.nTime=r.nTime; s.nBits=r.nBits; s.nNonce=r.nNonce; s.nMint=r.nMint; s.nMoneySupply=r.nMoneySupply; s.nStakeModifier=r.nStakeModifier; s.prevoutStake=r.prevoutStake; s.nStakeTime=r.nStakeTime; s.hashProof=r.hashProof; s.fProofOfStake=(r.prevoutStake.hash != uint256(0)); s.fInMainChain=inActive; s.hasParent=(r.hashPrev != uint256(0));
+    // G1-A: when derived.dat is present, surface the authoritative per-record
+    // chainTrust so the boundary AcceptBlock/AddToBlockIndex can accumulate a
+    // correct heritage (without it the parent snapshot carries chainTrust=0 and
+    // SetBestChain never fires — S+1 stays a side branch). ONLY nChainTrust is
+    // populated here: hasStakeModifierTime/Checksum remain governed by the cold
+    // seam's explicit derivation contract (staleness/availability), so those
+    // fields' behavior is unchanged. Absent derived store -> trust stays 0.
+    if (derived.IsOpen())
+    {
+        BlockIndexDerivedEntry de;
+        std::string derr;
+        if (derived.Read(id, &de, &derr) == BLOCK_INDEX_DERIVED_LOOKUP_FOUND)
+        {
+            s.nChainTrust = de.chainTrust;
+        }
+    }
+    return s;
 }
 void BlockIndexV2Reader::CachePut(const BlockIndexSnapshot& s) const {
     if (cacheCapacity == 0) return;

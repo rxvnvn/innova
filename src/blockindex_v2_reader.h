@@ -4,6 +4,7 @@
 #include "blockindex_navigation.h"
 #include "blockindex_activeindex.h"
 #include "blockindex_hashindex.h"
+#include "blockindex_derived_state.h"
 #include "blockindex_generation_lifecycle.h"
 
 #include <list>
@@ -83,6 +84,14 @@ private:
     FixedBlockIndexStore store;
     BlockIndexActiveIndex active;
     BlockIndexHashIndex hashIndex;
+    // G1-A: optional derived.dat companion store. Authoritative generations
+    // carry per-record chainTrust (and stake-modifier derived fields) in
+    // derived.dat. When present and opened, SnapshotFromRecord fills nChainTrust
+    // (and the derived stake-modifier fields) so the by-value authority is also
+    // authoritative for chainTrust — required for the boundary AcceptBlock/
+    // AddToBlockIndex to compute correct heritage. Absent (V1/shadow) -> trust
+    // stays 0 (prior behavior).
+    BlockIndexDerivedStateStore derived;
     uint64_t cacheCapacity;
     mutable std::map<BlockIndexId, CacheEntry> cache;
     mutable std::list<BlockIndexId> lru;

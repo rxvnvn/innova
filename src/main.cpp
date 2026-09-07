@@ -8724,6 +8724,25 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             return error("AddToBlockIndex() : pprev has invalid height %d", pindexNew->pprev->nHeight);
         pindexNew->nHeight = pindexNew->pprev->nHeight + 1;
     }
+    else if (g_fAuthoritativeStartup)
+    {
+        // G1-A: resolve + RETAIN the full-topology parent from the
+        // authoritative live authority so pindexNew->pprev points at a resident
+        // object that survives this ProcessBlock (no dangling), the chain-trust
+        // heritage accumulates (SetBestChain fires -> S+1 becomes active best),
+        // and SetBestChain/ConnectBlock/Reorganize can walk pprev/pnext/pskip.
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        if (live && live->IsOpen())
+        {
+            std::string perr;
+            CBlockIndex* matParent = live->ResolveAndRetainFullParent(hashPrevBlock, &perr);
+            if (!matParent)
+                return error("AddToBlockIndex() : authoritative parent retain failed: %s",
+                             perr.c_str());
+            pindexNew->pprev = matParent;
+            pindexNew->nHeight = matParent->nHeight + 1;
+        }
+    }
 
     if (pindexNew->nHeight >= FORK_HEIGHT_DAG && pindexNew->IsProofOfStake())
         return error("AddToBlockIndex() : proof-of-stake block at post-DAG height %d", pindexNew->nHeight);

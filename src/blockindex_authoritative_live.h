@@ -129,11 +129,29 @@ public:
                  const std::vector<int32_t>& newHeights,
                  std::string* error);
 
+    // G1-A: resolve and RETAIN the full-topology parent chain for `parentHash`
+    // in a PERSISTENT residency store that survives the single-block-operation
+    // lifetime. AddToBlockIndex uses this when the parent is V2-authoritative
+    // and non-resident in mapBlockIndex, so pindexNew->pprev points at a
+    // resident object that stays valid after ProcessBlock returns (no dangling
+    // pointer). The base tip S and the current accepted tip are anchored
+    // (non-evictable); deep/branch ancestry is evictable by the live-tail
+    // horizon (never a consensus/reorg bound).
+    //
+    // LIFETIME INVARIANT: any resident CBlockIndex whose pprev points to a
+    // materialized authoritative ancestor must never outlive that ancestor's
+    // safe residency/topology lifetime. This holds because the materialized
+    // chain is owned by `fullResident_` (anchor + horizon policy), and is NOT
+    // freed by ReleaseOperationMaterializations().
+    CBlockIndex* ResolveAndRetainFullParent(const uint256& parentHash,
+                                            std::string* error);
+
     // Release all operation-scoped parent materializations. Called at the END of a
     // single logical block acceptance (authoritative mode) so the residency of
     // materialized full-topology parents stays bounded to ONE block's worth of
-    // ancestors (not O(history)). Safe: the legacy engine only dereferences them
-    // within the current ProcessBlock (under cs_main, serialized).
+    // ancestors (not O(history)). The PERSISTENT full-topology store
+    // (ResolveAndRetainFullParent) is NOT freed here — its residency is governed
+    // by anchor/horizon policy so already-accepted blocks' pprev stays valid.
     void ReleaseOperationMaterializations();
 
     // ---- introspection ----
