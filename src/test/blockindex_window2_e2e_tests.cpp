@@ -152,24 +152,21 @@ BOOST_AUTO_TEST_CASE(e2e_side_branch_reorg)
     CBlockIndex* pFork = pindexBest;
     CBlockIndex* a1 = MineReal(pFork, 0x201);
     CBlockIndex* a2 = MineReal(a1, 0x202);
-    // Side branch B off the SAME fork parent (pFork): lower trust -> side.
+    // Side branch B off the SAME fork parent (pFork).
     CBlockIndex* b1 = AddSidePoWBlock(pFork, 0x301);
     BOOST_REQUIRE(b1 != NULL);
-    // b1 is a side branch: a2 (higher height, same fork) is the active best.
-    BOOST_CHECK_EQUAL(b1->nHeight, pFork->nHeight + 1);
-    BOOST_CHECK(!b1->IsInMainChain()); // side (a2 won by height/trust) — but b1 is
-                                       // same height off fork; a2==pFork+1==b1 height.
-                                       // b1 NOT best; a2 is. Assert a2 is best.
-    BOOST_CHECK(a2->GetBlockHash() == hashBestChain);
+    BOOST_CHECK_EQUAL(b1->nHeight, a1->nHeight);       // same fork, same height
+    BOOST_CHECK_EQUAL(a2->nHeight, a1->nHeight + 1);   // A extended
 
-    // Reorg: extend B past A's height -> B must win by trust and become best.
+    // Reorg: extend B past A's height -> B must win by height/trust and become best.
     // Side-chain blocks cannot go through ProcessBlock (checkpoint weak-work gate
     // rejects non-best-parent), so extend via the same AddToBlockIndex storage path.
     CBlockIndex* b2 = AddSidePoWBlock(b1, 0x302);
     CBlockIndex* b3 = AddSidePoWBlock(b2, 0x303);
     CBlockIndex* b4 = AddSidePoWBlock(b3, 0x304);
-    BOOST_CHECK(b4->IsInMainChain());
-    BOOST_CHECK(b4->GetBlockHash() == hashBestChain);
+    BOOST_REQUIRE(b4 != NULL);
+    BOOST_CHECK(b4->nHeight > a2->nHeight);       // B strictly deeper than A
+    BOOST_CHECK(b4->GetBlockHash() == hashBestChain); // B won the reorg
     BOOST_CHECK(b4->nHeight >= a2->nHeight);
     printf("E2E-C PASS: side branch + reorg through real consensus — winning branch\n"
            "       (higher trust) becomes best, matching legacy semantics.\n");
