@@ -240,15 +240,10 @@ CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChain(
         if (error) *error = "authoritative-live: not open";
         return NULL;
     }
-    // Evict the previous operation's chain (bounded residency: only this op's
-    // chain is resident; the next materialization replaces it).
-    for (size_t i = 0; i < impl_->ownedChain_.size(); ++i)
-    {
-        delete impl_->ownedChain_[i];
-        delete impl_->ownedChainHashes_[i];
-    }
-    impl_->ownedChain_.clear();
-    impl_->ownedChainHashes_.clear();
+    // Do NOT evict here: a single logical block acceptance (possibly a reorg that
+    // materializes a whole branch) may resolve many parents that must all stay
+    // valid until the enclosing ProcessBlock completes. Residency is bounded by
+    // releasing at the end of the operation (ReleaseOperationMaterializations).
 
     // Walk parent by value (tip-then-base) down to (and including) the base tip
     // floor S, collecting snapshots tip-first. The base floor is the resident
@@ -479,4 +474,20 @@ void BlockIndexAuthoritativeLive::Close()
     }
     impl_->baseReader = NULL;
     impl_->open = false;
+    ReleaseOperationMaterializations();
+}
+
+void BlockIndexAuthoritativeLive::ReleaseOperationMaterializations()
+{
+    // Free the operation-scoped full-topology parents. Called at the end of each
+    // logical block acceptance (authoritative mode) to keep residency bounded to
+    // ONE block's worth of ancestors.
+    if (!impl_) return;
+    for (size_t i = 0; i < impl_->ownedChain_.size(); ++i)
+    {
+        delete impl_->ownedChain_[i];
+        delete impl_->ownedChainHashes_[i];
+    }
+    impl_->ownedChain_.clear();
+    impl_->ownedChainHashes_.clear();
 }

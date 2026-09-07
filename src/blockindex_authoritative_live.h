@@ -129,6 +129,13 @@ public:
                  const std::vector<int32_t>& newHeights,
                  std::string* error);
 
+    // Release all operation-scoped parent materializations. Called at the END of a
+    // single logical block acceptance (authoritative mode) so the residency of
+    // materialized full-topology parents stays bounded to ONE block's worth of
+    // ancestors (not O(history)). Safe: the legacy engine only dereferences them
+    // within the current ProcessBlock (under cs_main, serialized).
+    void ReleaseOperationMaterializations();
+
     // ---- introspection ----
     const BlockIndexTipAuthority* TipAuthority() const;
     BlockIndexTipAuthority* TipAuthorityMutable();
