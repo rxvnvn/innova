@@ -40,6 +40,7 @@
 #include "blockindex_residency_counters.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_authoritative_live.h"
+#include "blockindex_shadow_startup.h"
 #include "hreg_registration.h"
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
@@ -8938,6 +8939,31 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         printf("AddToBlockIndex: height=%d total=%" PRId64"ms dag_init=%" PRId64"ms dag_color=%" PRId64"ms dag_write=%" PRId64"ms\n",
                pindexNew->nHeight, GetTimeMillis() - nAddStart, nDAGInitMs, nDAGColorMs, nDAGWriteMs);
 
+    // ---- G1: persist accepted authoritative blocks into the mutable tip ----
+    // In BY_VALUE_AUTHORITATIVE mode the accepted block (pindexNew, fully
+    // consensus-validated) must be recorded as permanent V2 authority in
+    // blockindex_tip so post-S blocks survive restart. This is a single consensus
+    // decision (the legacy engine's own AddToBlockIndex result) mirrored into the
+    // V2 mutable tip — not a second consensus path. Active vs side = whether it
+    // became best.
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        if (live && live->IsOpen())
+        {
+            BlockIndexRecord rec = BlockIndexRecordFromIndex(pindexNew);
+            BlockIndexDerivedEntry der = BlockIndexDerivedEntryFromIndex(pindexNew);
+            std::string perr;
+            const bool becameBest = (hash != uint256(0) && hash == hashBestChain);
+            bool okP = becameBest
+                ? live->AcceptActive(rec, der, pindexNew->nHeight, &perr)
+                : live->AcceptSide(rec, der, &perr);
+            if (!okP)
+                printf("BLOCKINDEX_V2_AUTHORITATIVE AddToBlockIndex persist FAILED height=%d: %s\n",
+                       pindexNew->nHeight, perr.c_str());
+        }
+    }
+
     return true;
 }
 
@@ -10075,6 +10101,17 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     // ppcoin: if responsible for sync-checkpoint send it
     if (pfrom && !CSyncCheckpoint::strMasterPrivKey.empty())
         Checkpoints::SendSyncCheckpoint(Checkpoints::AutoSelectSyncCheckpoint()->GetBlockHash());
+
+    // ---- G1: release operation-scoped parent materializations ----
+    // In authoritative mode, free the full-topology parents materialized for this
+    // block accept so residency stays bounded to one block's worth of ancestors
+    // (not O(history)). Called after the whole ProcessBlock succeeds, under
+    // cs_main (serialized), so no dangling pprev/pnext remains.
+    {
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        if (live)
+            live->ReleaseOperationMaterializations();
+    }
 
     return true;
 }

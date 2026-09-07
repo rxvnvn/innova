@@ -59,6 +59,25 @@ BlockIndexRecord BlockIndexRecordFromIndex(const CBlockIndex* pindex)
     return rec;
 }
 
+// G1: build a BlockIndexDerivedEntry from a CBlockIndex (by value) for mutable
+// tip persistence of an accepted authoritative block. Mirrors the V2 derived
+// fields (chainTrust, stake checksum/time, nSize, flags).
+BlockIndexDerivedEntry BlockIndexDerivedEntryFromIndex(const CBlockIndex* pindex)
+{
+    BlockIndexDerivedEntry d;
+    d.chainTrust = pindex->nChainTrust;
+    d.stakeModifierChecksum = pindex->nStakeModifierChecksum;
+    d.SetHasStakeModifierTime(true);
+    d.SetHasStakeModifierTime(pindex->GetBlockTime() == (int64_t)pindex->nTime ||
+                              (pindex->nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER));
+    d.stakeModifierTime = pindex->nStakeModifierTime;
+    if (d.HasStakeModifierTime())
+        d.stakeModifierTime = pindex->nStakeModifierTime;
+    d.SetHasBlockSize(pindex->nSize > 0);
+    d.nSize = pindex->nSize;
+    return d;
+}
+
 int LegacyBlockIndexShadowOracle::GetLegacyTipHeight()
 {
     LOCK(cs_main);

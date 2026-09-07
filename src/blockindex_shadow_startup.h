@@ -3,6 +3,7 @@
 
 #include "blockindex_shadow_runtime.h"
 #include "blockindex_v2_reader.h"
+#include "blockindex_derived_state.h"
 #include "cold_hot_seam.h"
 
 #include <string>
@@ -15,6 +16,10 @@
 // Build a BlockIndexRecord snapshot from a legacy CBlockIndex (by value, no
 // pointer escape). Caller must hold cs_main.
 BlockIndexRecord BlockIndexRecordFromIndex(const CBlockIndex* pindex);
+
+// G1: build a BlockIndexDerivedEntry from a CBlockIndex (by value) for mutable
+// tip persistence of an accepted authoritative block.
+BlockIndexDerivedEntry BlockIndexDerivedEntryFromIndex(const CBlockIndex* pindex);
 
 // Legacy oracle adapter that answers from the authoritative in-memory legacy
 // chain under cs_main.
