@@ -330,4 +330,164 @@ BOOST_AUTO_TEST_CASE(g1_legacy_mode_unchanged)
     printf("G1 PASS: legacy mode (no authoritative live authority) unchanged.\n");
 }
 
+// ---------------------------------------------------------------------------
+// G1 DECISIVE CAUSAL CLOSURE — real ProcessBlock orphan-gate decision.
+//
+// Proves the G1.4 historical-boundary orphan case THROUGH THE REAL ProcessBlock
+// path (not a direct seam call): a valid PoW block whose hashPrevBlock is
+// authoritative-in-V2-but-non-resident must NOT be stranding-orphaned by the gate
+// at main.cpp:9934 (the c1ece66 bypass), while a genuinely-unknown parent still
+// enters the normal orphan holding area. Legacy mode stays byte-identical.
+//
+// We assert on mapOrphanBlocks membership after ProcessBlock because that is the
+// exact gate the bypass changes. We do NOT fabricate a full consensus ACCEPT:
+// whether the block later passes ConnectBlock is a separate, later consensus
+// decision not at issue for this gate. The block is constructed to pass
+// CheckBlock(true,true,true) so it actually reaches the orphan gate.
+// ---------------------------------------------------------------------------
+
+// Construct a minimal PoW block (single coinbase) passing CheckBlock, with an
+// arbitrary hashPrevBlock and a mined nonce satisfying nBits. Returns NULL on
+// failure to mine (should not happen at regtest difficulty).
+static CBlock* BuildCheckBlockPassingPoWBallast(uint256 hashPrev, unsigned int nExtra)
+{
+    CBlock b;
+    b.nVersion = 1;
+    b.nTime = (unsigned int)GetTime();
+    b.hashPrevBlock = hashPrev;
+    CTransaction coinbase;
+    coinbase.nVersion = 1;
+    coinbase.nTime = (int64_t)b.nTime;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript() << nExtra;
+    coinbase.vout.resize(1);
+    coinbase.vout[0].nValue = 0;
+    coinbase.vout[0].scriptPubKey = CScript() << OP_TRUE;
+    b.vtx.push_back(coinbase);
+    b.hashMerkleRoot = b.BuildMerkleTree();
+    // Use a PROVEN-EASY target so nonce converges fast: the canonical regtest
+    // chain's own nBits (the testing fixture mines from genesis at this
+    // difficulty; its target is near bnProofOfWorkLimit ~2^255, so a Tribus hash
+    // drops below it within a handful of nonces). A hardcoded 0x1d00ffff would
+    // require ~2^32 Tribus hashes (~minutes) and hang the suite.
+    unsigned int nBits = 0x1d00ffffU;
+    {
+        LOCK(cs_main);
+        if (pindexBest)
+            nBits = pindexBest->nBits;
+    }
+    b.nBits = nBits;
+    uint256 hashTarget = CBigNum().SetCompact(b.nBits).getuint256();
+    for (unsigned int n = 0; n < 0x400000U; ++n)  // 4M cap; regtest converges in a few
+    {
+        b.nNonce = n;
+        if (b.GetHash() <= hashTarget)
+        {
+            CBlock* out = new CBlock(b);
+            return out;
+        }
+    }
+    return NULL;
+}
+
+// Drive a real ProcessBlock and return whether the block was stranding-orphaned
+// (i.e. present in mapOrphanBlocks after the call).
+static bool ProcessBlockOrphaned(CBlock* pblock)
+{
+    bool fOrphanedAtEnd = false;
+    LOCK(cs_main);
+    const uint256 hash = pblock->GetHash();
+    // Note: intentionally do NOT call CheckBlock here — callers pre-verify.
+    (void)ProcessBlock(NULL, pblock);
+    fOrphanedAtEnd = mapOrphanBlocks.count(hash) != 0;
+    // Clean up the orphan-side copy if the block was orphaned (owned by the map).
+    if (fOrphanedAtEnd)
+    {
+        // erase our copy; map owns CBlock* (delete under lock)
+        std::map<uint256, CBlock*>::iterator it = mapOrphanBlocks.find(hash);
+        if (it != mapOrphanBlocks.end())
+        {
+            delete it->second;
+            mapOrphanBlocks.erase(it);
+        }
+        mapOrphanBlocksByPrev.erase(hash); // best-effort
+    }
+    return fOrphanedAtEnd;
+}
+
+// G1-FINAL-A: authoritative-parent block is NOT stranding-orphaned by the real
+// ProcessBlock gate (parent proven in V2 authority). G1-FINAL-B/C: control —
+// unknown parent in both authoritative and legacy mode IS orphaned normally.
+BOOST_AUTO_TEST_CASE(g1_final_processblock_orphan_gate)
+{
+    G1Fixture fx(4);
+    BlockIndexV2Reader reader;
+    BlockIndexV2ReaderOptions opts;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reader.Open(fx.rootStr, opts, &error), error);
+
+    BlockIndexAuthoritativeLive live;
+    BOOST_REQUIRE_MESSAGE(live.Open(fx.rootStr, &reader, 2048, &error), error);
+    BOOST_REQUIRE(live.IsOpen());
+    const int baseTip = fx.baseTip; // S = 4
+    const uint256 sHash = fx.baseActive[baseTip];
+    // Precondition: S is NOT resident in mapBlockIndex (authoritative-by-value).
+    BOOST_CHECK_EQUAL(mapBlockIndex.count(sHash), (size_t)0);
+
+    // Arm authoritative mode for the real ProcessBlock path.
+    const bool savedAuth = g_fAuthoritativeStartup;
+    SetAuthoritativeLiveForTesting(&live);
+    ::g_fAuthoritativeStartup = true;
+
+    // (A) Block S+1 with parent = S (authoritative-in-V2, non-resident)
+    CBlock* blkA = BuildCheckBlockPassingPoWBallast(sHash, 0x511);
+    BOOST_CHECK(blkA != NULL);
+    bool fAOrphaned = false;
+    if (blkA)
+    {
+        fAOrphaned = ProcessBlockOrphaned(blkA);
+        delete blkA;
+    }
+    // Restore authoritative mode BEFORE asserting, so a failing assertion cannot
+    // leave the shared suite in authoritative mode.
+    ::g_fAuthoritativeStartup = savedAuth;
+    ClearAuthoritativeLiveForTesting();
+    BOOST_CHECK_MESSAGE(!fAOrphaned, "G1-FINAL-A: authoritative-V2 parent block must NOT be stranding-orphaned");
+
+    // (B) genuine unknown parent in authoritative mode (re-arm).
+    SetAuthoritativeLiveForTesting(&live);
+    ::g_fAuthoritativeStartup = true;
+    uint256 unknownPrev = uint256(0xDEADBEEFUL);
+    CBlock* blkB = BuildCheckBlockPassingPoWBallast(unknownPrev, 0x512);
+    BOOST_CHECK(blkB != NULL);
+    bool fBOrphaned = false;
+    if (blkB)
+    {
+        fBOrphaned = ProcessBlockOrphaned(blkB);
+        delete blkB;
+    }
+    ::g_fAuthoritativeStartup = savedAuth;
+    ClearAuthoritativeLiveForTesting();
+    BOOST_CHECK_MESSAGE(fBOrphaned, "G1-FINAL-B: unknown-parent block in authoritative mode must be orphaned normally");
+
+    // (C) Legacy mode: unknown parent must STILL be orphaned (byte-identical gate).
+    uint256 unknownPrev2 = uint256(0xCAFEF00DUL);
+    CBlock* blkC = BuildCheckBlockPassingPoWBallast(unknownPrev2, 0x513);
+    BOOST_CHECK(blkC != NULL);
+    bool fCOrphaned = false;
+    if (blkC)
+    {
+        fCOrphaned = ProcessBlockOrphaned(blkC);
+        delete blkC;
+    }
+    BOOST_CHECK_MESSAGE(fCOrphaned, "G1-FINAL-C: legacy-mode unknown parent must be orphaned (unchanged)");
+
+    live.Close();
+    reader.Close();
+    printf("G1-FINAL PASS: real ProcessBlock orphan gate — authoritative-V2 parent\n"
+           "       block is NOT stranding-orphaned (c1ece66 bypass active), unknown\n"
+           "       parent in authoritative AND legacy mode IS orphaned normally.\n");
+}
+
 BOOST_AUTO_TEST_SUITE_END()
