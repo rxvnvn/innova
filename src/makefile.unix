@@ -612,6 +612,7 @@ TEST_OBJS= \
     obj/test/blockindex_authoritative_restart_tests.o \
     obj/test/blockindex_authoritative_live_tests.o \
     obj/test/blockindex_catchup_tool_tests.o \
+    obj/test/blockindex_legacy_rollback_tests.o \
     obj/test/blockindex_fold_tool_tests.o \
     obj/test/blockindex_p7_end_to_end_tests.o \
     obj/test/blockindex_generation_writer_tests.o \
