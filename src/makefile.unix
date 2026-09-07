@@ -612,6 +612,7 @@ TEST_OBJS= \
     obj/test/blockindex_authoritative_restart_tests.o \
     obj/test/blockindex_authoritative_live_tests.o \
     obj/test/blockindex_catchup_tool_tests.o \
+    obj/test/blockindex_catchup_tool_cli_tests.o \
     obj/test/blockindex_legacy_rollback_tests.o \
     obj/test/blockindex_window2_e2e_tests.o \
     obj/test/blockindex_fold_tool_tests.o \
@@ -759,6 +760,9 @@ innova-blockindex-builder: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/bloc
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
 innova-blockindex-builder-lm: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_generation_builder_lm_tool.o
+	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
+
+blockindex-catchup-tool: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_catchup_tool_cli.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
 innova-blockindex-navdiff: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_navigation_diff_tool.o
