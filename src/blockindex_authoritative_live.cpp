@@ -25,9 +25,30 @@ public:
     bool open;
     std::string root;
 
+    // G1: owned full-topology parent materialization (bounded by the live-tail
+    // horizon). A MATERIALIZED_CHAIN_ floor is the base tip S (the already-resident
+    // boundary); the walk stops there and never reconstructs arbitrary deep history.
+    int32_t baseTipHeight;
+    uint256 baseTipHash;
+    // Owned chain objects + their owner-owned hash identities. Kept for the
+    // operation lifetime (the consensus engine dereferences pprev/pnext/pskip);
+    // evicted on the next materialization / Close so residency stays bounded.
+    std::vector<CBlockIndex*> ownedChain_;
+    std::vector<uint256*>      ownedChainHashes_;
+
     Impl()
-        : baseReader(NULL), horizon(2048), baseGeneration(0), open(false)
+        : baseReader(NULL), horizon(2048), baseGeneration(0),
+          open(false), baseTipHeight(-1), baseTipHash(0)
     {
+    }
+
+    ~Impl()
+    {
+        for (size_t i = 0; i < ownedChain_.size(); ++i)
+        {
+            delete ownedChain_[i];
+            delete ownedChainHashes_[i];
+        }
     }
 };
 
@@ -96,6 +117,8 @@ bool BlockIndexAuthoritativeLive::Open(const std::string& v2Root,
     const int32_t baseTipHeight = tipSnap.found ? (int32_t)tipSnap.height : -1;
     if (baseTipHeight < 0)
         return SetError(error, "authoritative-live: base generation has no tip");
+    impl_->baseTipHeight = baseTipHeight;
+    impl_->baseTipHash = tipSnap.found ? tipSnap.hash : uint256(0);
 
     // Open (or create) the mutable tip store under <v2Root>/blockindex_tip.
     impl_->tip.reset(new BlockIndexTipAuthority());
@@ -171,6 +194,172 @@ BlockIndexHotStatus BlockIndexAuthoritativeLive::Materialize(
     if (!out)
         return BlockIndexHotStatus::MATERIALIZATION_UNAVAILABLE;
     return impl_->tail->Pin(BlockIndexLogicalId(hash), out);
+}
+
+namespace {
+// Build a full-topology CBlockIndex from a by-value snapshot (scalar fields; the
+// caller links pprev/pnext/pskip).
+CBlockIndex* FullFromSnapshot(const BlockIndexSnapshot& s, uint256* ownHash)
+{
+    CBlockIndex* p = new CBlockIndex();
+    *ownHash = s.hash;
+    p->phashBlock = ownHash;
+    p->pprev = NULL;
+    p->pnext = NULL;
+    p->pskip = NULL;
+    p->nHeight     = s.height;
+    p->nFile       = s.nFile;
+    p->nBlockPos   = s.nBlockPos;
+    p->nChainTrust = s.nChainTrust;
+    p->hashProof   = s.hashProof;
+    p->hashMerkleRoot = s.hashMerkleRoot;
+    p->prevoutStake   = s.prevoutStake;
+    p->nStakeTime     = s.nStakeTime;
+    p->nVersion   = s.nVersion;
+    p->nTime      = s.nTime;
+    p->nBits      = s.nBits;
+    p->nNonce     = s.nNonce;
+    p->nMint      = s.nMint;
+    p->nMoneySupply = s.nMoneySupply;
+    p->nStakeModifier = s.nStakeModifier;
+    if (s.hasStakeModifierTime)
+        p->nStakeModifierTime = s.nStakeModifierTime;
+    if (s.hasStakeModifierChecksum)
+        p->nStakeModifierChecksum = s.nStakeModifierChecksum;
+    if (s.fProofOfStake)
+        p->nFlags |= CBlockIndex::BLOCK_PROOF_OF_STAKE;
+    return p;
+}
+} // namespace
+
+CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChain(
+    const uint256& hash, BlockIndexHotHandle* out, std::string* error) const
+{
+    if (!impl_->open || !impl_->baseReader)
+    {
+        if (error) *error = "authoritative-live: not open";
+        return NULL;
+    }
+    // Evict the previous operation's chain (bounded residency: only this op's
+    // chain is resident; the next materialization replaces it).
+    for (size_t i = 0; i < impl_->ownedChain_.size(); ++i)
+    {
+        delete impl_->ownedChain_[i];
+        delete impl_->ownedChainHashes_[i];
+    }
+    impl_->ownedChain_.clear();
+    impl_->ownedChainHashes_.clear();
+
+    // Walk parent by value (tip-then-base) down to (and including) the base tip
+    // floor S, collecting snapshots tip-first. The base floor is the resident
+    // boundary; arbitrary deep history is never reconstructed here.
+    std::vector<BlockIndexSnapshot> path; // path[0] = requested parent (highest height)
+    uint256 cur = hash;
+    bool reachedFloor = false;
+    for (int guard = 0; guard < 20 * 1000 * 1000; ++guard)
+    {
+        if (cur == uint256(0))
+            break;
+        BlockIndexSnapshot s;
+        bool found = false;
+        // tip authority first (blocks > S).
+        if (impl_->tip && impl_->tip->IsOpen())
+        {
+            BlockIndexTipRead tr = impl_->tip->LookupByHash(cur, error);
+            if (tr.status == BLOCK_INDEX_TIP_OK)
+            {
+                // convert tip read -> snapshot (mirror BlockIndexLiveTailMaterializer::TipToSnapshot)
+                s.found = true;
+                s.id = (uint64_t)0;
+                s.hash = tr.record.hash;
+                s.hashPrev = tr.record.hashPrev;
+                s.hashMerkleRoot = tr.record.hashMerkleRoot;
+                s.height = tr.record.height;
+                s.nFile = tr.record.nFile;
+                s.nBlockPos = tr.record.nBlockPos;
+                s.nFlags = tr.record.nFlags;
+                s.nVersion = tr.record.nVersion;
+                s.nTime = tr.record.nTime;
+                s.nBits = tr.record.nBits;
+                s.nNonce = tr.record.nNonce;
+                s.nMint = tr.record.nMint;
+                s.nMoneySupply = tr.record.nMoneySupply;
+                s.nStakeModifier = tr.record.nStakeModifier;
+                s.prevoutStake = tr.record.prevoutStake;
+                s.nStakeTime = tr.record.nStakeTime;
+                s.hashProof = tr.record.hashProof;
+                s.fProofOfStake = (tr.record.prevoutStake.hash != uint256(0));
+                s.hasParent = (tr.record.hashPrev != uint256(0));
+                s.nChainTrust = tr.derived.chainTrust;
+                s.nStakeModifierChecksum = tr.derived.stakeModifierChecksum;
+                s.hasStakeModifierChecksum = true;
+                s.nStakeModifierTime = tr.derived.stakeModifierTime;
+                s.hasStakeModifierTime = tr.derived.HasStakeModifierTime();
+                found = true;
+            }
+        }
+        if (!found)
+        {
+            // base V2 reader (blocks <= S).
+            BlockIndexV2ReadStatus st = impl_->baseReader->LookupByHash(cur, &s, error);
+            if (st == BLOCK_INDEX_V2_READ_FOUND && s.found)
+                found = true;
+        }
+        if (!found)
+        {
+            if (error) *error = "authoritative-live: chain walk lookup failed at " + cur.ToString();
+            // roll back partial owned chain
+            for (size_t i = 0; i < impl_->ownedChain_.size(); ++i)
+            {
+                delete impl_->ownedChain_[i];
+                delete impl_->ownedChainHashes_[i];
+            }
+            impl_->ownedChain_.clear();
+            impl_->ownedChainHashes_.clear();
+            return NULL;
+        }
+        path.push_back(s);
+        if (cur == impl_->baseTipHash)
+        {
+            reachedFloor = true;
+            break;
+        }
+        cur = s.hashPrev;
+    }
+    if (!reachedFloor)
+    {
+        if (error) *error = "authoritative-live: reached floor mismatch for " + hash.ToString();
+        return NULL;
+    }
+    if (path.empty())
+    {
+        if (error) *error = "authoritative-live: empty chain";
+        return NULL;
+    }
+
+    // Materialize objects (path[0]=requested parent .. path.back()=base floor S).
+    std::vector<CBlockIndex*> objs(path.size(), NULL);
+    std::vector<uint256*> owns(path.size(), NULL);
+    for (size_t i = 0; i < path.size(); ++i)
+    {
+        owns[i] = new uint256(path[i].hash);
+        objs[i] = FullFromSnapshot(path[i], owns[i]);
+        impl_->ownedChain_.push_back(objs[i]);
+        impl_->ownedChainHashes_.push_back(owns[i]);
+    }
+    // Link topology: pprev -> floor, pnext -> tip, pskip -> pprev (conservative).
+    for (size_t i = 0; i < objs.size(); ++i)
+    {
+        objs[i]->pprev = (i + 1 < objs.size()) ? objs[i + 1] : NULL;
+        objs[i]->pnext = (i > 0) ? objs[i - 1] : NULL;
+        objs[i]->pskip = objs[i]->pprev;
+    }
+
+    CBlockIndex* parent = objs.front(); // the requested parent
+    if (out)
+        *out = BlockIndexHotHandle(); // ownership retained by this authority for the op
+    ClearError(error);
+    return parent;
 }
 
 bool BlockIndexAuthoritativeLive::AcceptActive(const BlockIndexRecord& rec,

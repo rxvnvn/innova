@@ -38,6 +38,8 @@
 #include "candidate_frontier.h"
 #include "blockindex_hot_owner.h"
 #include "blockindex_residency_counters.h"
+#include "blockindex_authoritative_startup.h"
+#include "blockindex_authoritative_live.h"
 #include "hreg_registration.h"
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
@@ -9078,13 +9080,66 @@ bool CBlock::AcceptBlock()
 
     // Get prev block index
     map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashPrevBlock);
-    if (mi == mapBlockIndex.end())
+    CBlockIndex* pindexPrev = NULL;
+    if (mi != mapBlockIndex.end())
     {
-        TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
-        return DoS(10, error("AcceptBlock() : prev block not found"));
+        pindexPrev = (*mi).second;
     }
-    CBlockIndex* pindexPrev = (*mi).second;
-    int nHeight = pindexPrev->nHeight+1;
+    int nHeight = 0;
+    if (!pindexPrev)
+    {
+        // ---- G1: BY_VALUE_AUTHORITATIVE live block-path wire ----
+        // In authoritative mode the historical parent may be authoritative in V2
+        // (base generation or the mutable blockindex_tip) but NOT resident in
+        // mapBlockIndex. Resolve + materialize it authoritatively (bounded
+        // full-topology CBlockIndex chain, pinned for the operation lifetime)
+        // instead of weakening PREV_NOT_FOUND or repopulating historical
+        // mapBlockIndex. Legacy mode (g_fAuthoritativeStartup false) is unchanged.
+        if (!g_fAuthoritativeStartup)
+        {
+            TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
+            return DoS(10, error("AcceptBlock() : prev block not found"));
+        }
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        if (!live || !live->IsOpen())
+        {
+            // Fail closed: authoritative live authority expected but absent.
+            TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
+            return DoS(100, error("AcceptBlock() : authoritative live parent resolution unavailable"));
+        }
+        // Resolve the parent by value (base V2 or mutable tip).
+        int parentHeight = -1;
+        std::string perr;
+        if (!live->ResolveParent(hashPrevBlock, &parentHeight, &perr))
+        {
+            TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
+            return DoS(10, error("AcceptBlock() : prev block not found (authoritative, non-resident): %s", perr.c_str()));
+        }
+        // Materialize the full-topology parent chain, pinned for the whole
+        // validation + best-chain lifetime. The floor is set to the base tip S
+        // (bounded: only the post-S tail + the base boundary are resident). A deep
+        // reorg below S is served by the by-value chain walk, never a reorg cap.
+        BlockIndexHotHandle parentPin;
+        CBlockIndex* matParent = live->MaterializeParentChain(hashPrevBlock, &parentPin, &perr);
+        if (!matParent)
+        {
+            // On mainnet the base tip anchor is already resident; a missing
+            // materialization is a genuine authority failure -> fail closed.
+            TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
+            return DoS(100, error("AcceptBlock() : authoritative parent materialization failed: %s", perr.c_str()));
+        }
+        pindexPrev = matParent;
+        // nHeight from the materialized parent (already filled by-value).
+    }
+    else
+    {
+        nHeight = pindexPrev->nHeight + 1;
+    }
+    if (!g_fAuthoritativeStartup && pindexPrev && pindexPrev->nHeight < 0)
+        return error("AcceptBlock() : pprev has invalid height");
+
+    if (pindexPrev && nHeight == 0)
+        nHeight = pindexPrev->nHeight + 1;
 
     // Operator-invalidation gate: reject the block (and any descendant of an
     // operator-invalidated block) without peer punishment. This is not a

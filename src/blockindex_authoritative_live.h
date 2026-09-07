@@ -89,6 +89,16 @@ public:
     BlockIndexHotStatus Materialize(const uint256& hash,
                                     BlockIndexHotHandle* out) const;
 
+    // Materialize a FULL-TOPOLOGY CBlockIndex parent (pprev/pnext/pskip linked)
+    // for `hash`, pinned for the operation lifetime. The chain is materialized by
+    // value down to the base boundary (bounded by the live-tail horizon; a deep
+    // ancestry beyond the horizon is served by the by-value walk, never a reorg
+    // cap). Returns the parent CBlockIndex* (valid while `out` is alive) or NULL +
+    // error on authority/materialization failure (fail-closed).
+    CBlockIndex* MaterializeParentChain(const uint256& hash,
+                                        BlockIndexHotHandle* out,
+                                        std::string* error) const;
+
     // ---- live acceptance / persistence ----
     // Persist an accepted ACTIVE block (already consensus-validated by the live
     // engine) into the mutable tip + refresh the bounded live tail. activeHeight
