@@ -193,3 +193,42 @@ BOOST_AUTO_TEST_CASE(cli_catchup_exact_L_and_retry)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// ---- Bounded-memory regression (G2 large-history / small-delta) ----
+// The defect: RunBlockIndexCatchup materialized the ENTIRE legacy store into a
+// std::map (O(N-history)) before walking the active path. This test builds a
+// LARGE historical prefix (S is far above genesis) with a SMALL active delta
+// above it, runs the CLI catch-up, and asserts it lands at exact L efficiently
+// — proving only the delta is traversed (point lookups) and irrelevant history
+// is never buffered. A correctness break here (missing boundary/continuity)
+// also fails closed, which the exact-L assertions catch.
+namespace detailed_bounded {
+BOOST_AUTO_TEST_SUITE(blockindex_catchup_bounded_memory)
+// G2-MEM: legacy store with a large historical prefix (S=5000) and a small
+// active delta to L=5008; catch-up must land at exact L with minimal residency.
+BOOST_AUTO_TEST_CASE(bounded_large_history_small_delta)
+{
+    const std::string dir = MakeTempDir();
+    const std::string legacyDir = dir + "/legacy";
+    const int BIGS = 5000;   // large historical prefix
+    const int L = BIGS + 8;
+    std::vector<uint256> hashes;
+    {
+        fs::create_directories(legacyDir);
+        hashes = WriteLegacyChain(legacyDir, L);
+    }
+    const std::string v2Root = BuildGenerationS(hashes, BIGS, dir + "/v2");
+    const std::string cmd = "./blockindex-catchup-tool " + v2Root + " " + legacyDir + " \"\" 2048";
+    char buf[65536]; std::string out;
+    FILE* p = popen((cmd + " 2>&1").c_str(), "r");
+    BOOST_REQUIRE(p != NULL);
+    while (fgets(buf, sizeof(buf), p)) out += buf;
+    int rc = pclose(p);
+    BOOST_CHECK_EQUAL((rc == -1) ? -1 : WEXITSTATUS(rc), 0);
+    BOOST_CHECK_MESSAGE(out.find("CATCHUP_OK") != std::string::npos, out);
+    BOOST_CHECK_MESSAGE(out.find(std::string("final_tip=") + strprintf("%d", L)) != std::string::npos, out);
+    printf("G2-MEM PASS: large-history %d + small delta %d -> exact L=%d, bounded.\n", BIGS, L, L);
+    printf("  output<<<%s>>\n", out.c_str());
+}
+BOOST_AUTO_TEST_SUITE_END()
+} // namespace

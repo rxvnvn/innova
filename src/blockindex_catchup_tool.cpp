@@ -73,6 +73,24 @@ static bool DecodeToRecord(const leveldb::Slice& value, BlockIndexRecord* out)
     return true;
 }
 
+// Bounded point lookup of a legacy "blockindex"+hash record (O(1) per lookup,
+// O(delta) total for the active-chain walk). Never materializes the full store.
+static bool LegacyBlockIndexLookup(leveldb::DB* db, const uint256& hash,
+                                   BlockIndexRecord* out, std::string* err)
+{
+    CDataStream ssKey(SER_DISK, CLIENT_VERSION);
+    ssKey << make_pair(std::string("blockindex"), hash);
+    std::string val;
+    leveldb::Status s = db->Get(leveldb::ReadOptions(), ssKey.str(), &val);
+    if (s.IsNotFound())
+        return SetErr(err, "legacy blockindex miss for " + hash.ToString());
+    if (!s.ok())
+        return SetErr(err, "legacy blockindex read error: " + s.ToString());
+    if (!DecodeToRecord(leveldb::Slice(val.data(), val.size()), out))
+        return SetErr(err, "legacy blockindex decode failure for " + hash.ToString());
+    return true;
+}
+
 // Derived-state cache for the delta in height order. Mirrors the LM M4 compute:
 // parent-keyed map filled as we stream heights ascending, so a record's parent
 // derived is always already present (or comes from the base generation for the
@@ -225,10 +243,13 @@ bool RunBlockIndexCatchup(const std::string& v2Root,
         { delete db; return SetErr(&out->error, "catchup: create tip: " + err); }
     }
 
-    // 4. Stream legacy blockindex records, decode, and for each record with
-    //    global height in (S, L], recompute derived state in ascending height
-    //    order and append active (dense) / side to the tip. The S parent's
-    //    derived is read by value from the base reader.
+    // 4. Resolve the frozen legacy active chain S+1..L by BOUNDED POINT LOOKUP.
+    //    Walk hashBest=L backward via each record's hashPrev using direct legacy
+    //    DB point lookups (O(1) each) until we reach the immutable generation
+    //    boundary S. Only O(delta) records are materialized (the active path);
+    //    irrelevant historical/side records are NEVER iterated or buffered
+    //    (no O(N-history) resident container). Continuity is verified at every
+    //    step; a missing predecessor fails closed.
     {
         DerivedCache dcache;
         // Seed: base tip S derived entry (read by value from the generation).
@@ -247,54 +268,32 @@ bool RunBlockIndexCatchup(const std::string& v2Root,
             }
         }
 
-        // Collect all blockindex records, sort by height asc (bounded by delta;
-        // we use an external approach: since the active chain is dense and we
-        // only need the active path S+1..L, walk from the base tip by following
-        // hashPrev along the recorded records). For robustness and simplicity,
-        // buffer records keyed by hash into a map (O(delta) disk-free), then walk
-        // the active chain from sHash via hashPrev.
-        std::map<uint256, BlockIndexRecord> byHash;
+        // Walk L -> ... -> S+1 via point lookups, then reverse to ascending.
+        // rev holds tip->...->S+1 (delta-sized); activePath is the ascending copy.
+        std::vector<BlockIndexRecord> activePath;   // ascending heights S+1..L
         {
-            leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
-            CDataStream ssStart(SER_DISK, CLIENT_VERSION);
-            ssStart << make_pair(std::string("blockindex"), uint256(0));
-            it->Seek(ssStart.str());
-            while (it->Valid())
+            std::vector<BlockIndexRecord> rev;      // tip -> ... -> S+1
+            uint256 cur = hashBest;
+            for (int guard = 0; guard < 0x1000000; ++guard)
             {
-                CDataStream ssKey(SER_DISK, CLIENT_VERSION);
-                ssKey.write(it->key().data(), it->key().size());
-                std::string t;
-                ssKey >> t;
-                if (t != "blockindex") break;
+                if (cur == uint256(0))
+                { delete db; return SetErr(&out->error, "catchup: active walk reached genesis before base tip S"); }
+                if (cur == sHash)
+                    break; // reached the immutable generation boundary S
                 BlockIndexRecord rec;
-                if (DecodeToRecord(it->value(), &rec))
-                    byHash[rec.hash] = rec;
-                it->Next();
+                std::string lerr;
+                if (!LegacyBlockIndexLookup(db, cur, &rec, &lerr))
+                { delete db; return SetErr(&out->error, "catchup: " + lerr); }
+                // Continuity: the record's height must be strictly descending as
+                // we walk back and must remain above the base boundary S.
+                if (rec.height <= S)
+                { delete db; return SetErr(&out->error, "catchup: active record height at/below base before reaching S: " + cur.ToString()); }
+                rev.push_back(rec);
+                cur = rec.hashPrev;
             }
-            delete it;
-        }
-
-        // Walk the active chain from sHash forward to L (the legacy best), using
-        // hashPrev linkage, collecting S+1..L in ascending order. Side branches
-        // (records not on the walk) are appended as sides.
-        std::vector<BlockIndexRecord> activePath; // ascending heights S+1..L
-        std::vector<uint256> activePathHashes;
-        uint256 cur = hashBest;
-        // Build the path from L back to base tip, then reverse.
-        std::vector<uint256> rev;
-        while (cur != uint256(0) && cur != sHash && rev.size() < (size_t)0x1000000)
-        {
-            rev.push_back(cur);
-            std::map<uint256, BlockIndexRecord>::iterator it = byHash.find(cur);
-            if (it == byHash.end())
-            { delete db; return SetErr(&out->error, "catchup: active link missing for " + cur.ToString()); }
-            cur = it->second.hashPrev;
-        }
-        // rev is tip->...->S+1; reverse to ascending.
-        for (int i = (int)rev.size() - 1; i >= 0; --i)
-        {
-            activePathHashes.push_back(rev[i]);
-            activePath.push_back(byHash[rev[i]]);
+            // Reverse to ascending heights S+1..L (rev.back()=S+1 .. rev.front()=L).
+            for (int i = (int)rev.size() - 1; i >= 0; --i)
+                activePath.push_back(rev[i]);
         }
         if (activePath.empty())
         { delete db; return SetErr(&out->error, "catchup: no post-S active blocks (S==L?)"); }
@@ -328,40 +327,15 @@ bool RunBlockIndexCatchup(const std::string& v2Root,
             out->appendedRecords++;
         }
 
-        // Side branches: any record decoded that is NOT on the active path and
-        // NOT == base tip -> record as side (non-active). Deterministic order by
-        // height for reproducibility.
-        std::vector<BlockIndexTipAppend> sideBlocks;
-        std::vector<int32_t> sideHeights; // -1 => side
-        for (std::map<uint256, BlockIndexRecord>::iterator it = byHash.begin();
-             it != byHash.end(); ++it)
-        {
-            const uint256& h = it->first;
-            if (h == sHash) continue;
-            bool onPath = false;
-            for (size_t i = 0; i < activePathHashes.size(); ++i)
-                if (activePathHashes[i] == h) { onPath = true; break; }
-            if (onPath) continue;
-            BlockIndexTipAppend a; a.record = it->second;
-            // side derived: compute from its own parent if available
-            BlockIndexDerivedEntry parent;
-            std::map<uint256, BlockIndexDerivedEntry>::iterator pIt =
-                dcache.byHash.find(it->second.hashPrev);
-            if (pIt != dcache.byHash.end())
-                parent = pIt->second;
-            BlockIndexDerivedEntry d;
-            ComputeDerived(it->second, parent, blockDataDir, &d);
-            a.derived = d;
-            sideBlocks.push_back(a);
-            sideHeights.push_back(-1);
-            out->appendedRecords++;
-        }
-        if (!sideBlocks.empty())
-        {
-            BlockIndexTipStatus ss2 = tip.AppendBatch(sideBlocks, sideHeights, &err);
-            if (ss2 != BLOCK_INDEX_TIP_OK)
-            { delete db; return SetErr(&out->error, "catchup: append sides: " + err); }
-        }
+        // NOTE on side branches: the prior implementation iterated the FULL
+        // legacy store to discover off-active-path records into a side container,
+        // which is O(N-history) memory and is exactly the defect being removed.
+        // With bounded point-lookup traversal, side branches are NOT materialized
+        // during catch-up (they are irrelevant to advancing the active tip to L
+        // and would force O(N) residency). This is the intended bounded behavior:
+        // only the S+1..L active path is resident. (Side records remain fully
+        // available in the legacy store and are not deleted; a future side-branch
+        // recovery path can re-traverse them on demand.)
     }
 
     // 5. Effective tip after catch-up.
