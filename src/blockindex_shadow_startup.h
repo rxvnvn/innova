@@ -79,6 +79,10 @@ void ClearBlockIndexStakingNavigator();
 // BY_VALUE_AUTHORITATIVE startup; otherwise use RetainBlockIndexStakingNavigator.
 bool RetainBlockIndexAuthoritativeNavigator(const std::string& v2Root, std::string* error);
 
+// Returns the single retained authoritative navigator's cold V2 reader.
+// Non-owning; valid for process lifetime after authoritative startup.
+const BlockIndexV2Reader* GetAuthoritativeNavigatorReader();
+
 // A.10.1q / Stage1: production authoritative navigator install that reuses an
 // ALREADY-OPEN generation reader (moved in) rather than reopening the same
 // hashindex/active/store LevelDB handles. The bootstrap ownership path uses this

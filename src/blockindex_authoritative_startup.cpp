@@ -215,6 +215,17 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
     return true;
 }
 
+bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out)
+{
+    if (!out || !g_authoritativeContext)
+        return false;
+    const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
+    if (!reader || !reader->IsOpen())
+        return false;
+    std::string error;
+    return reader->GetActiveByHeight(height, out, &error) == BLOCK_INDEX_V2_READ_FOUND;
+}
+
 // A.10.1q: expose the retained authoritative generation root + generation for
 // building a BlockIndexActiveChainReader against the SAME selected generation.
 std::string AuthoritativeRootPath()

@@ -59,6 +59,7 @@ public:
     bool IsOpen() const;
     uint64_t Generation() const;
     uint64_t RecordCount() const;
+    std::string GenerationPath() const;
     BlockIndexSnapshot GetTip() const;
     bool CurrentSelectionChanged(std::string* error) const;
     BlockIndexV2ReaderCacheStats CacheStats() const;

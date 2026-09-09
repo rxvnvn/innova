@@ -87,6 +87,7 @@ void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockI
 bool BlockIndexV2Reader::IsOpen() const { LOCK(cs); return open; }
 uint64_t BlockIndexV2Reader::Generation() const { LOCK(cs); return generation; }
 uint64_t BlockIndexV2Reader::RecordCount() const { LOCK(cs); return open ? manifest.recordCount : 0; }
+std::string BlockIndexV2Reader::GenerationPath() const { LOCK(cs); return generationPath; }
 BlockIndexV2ReaderCacheStats BlockIndexV2Reader::CacheStats() const { LOCK(cs); return stats; }
 
 BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const BlockIndexRecord& r, bool inActive) const {

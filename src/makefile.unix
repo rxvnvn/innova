@@ -367,6 +367,7 @@ OBJS= \
     obj/finality.o \
     obj/dag.o \
     obj/candidate_frontier.o \
+    obj/candidate_frontier_metadata.o \
     obj/blockindex_hot_owner.o \
     obj/blockindex_tip.o \
     obj/blockindex_live_tail.o \
@@ -487,6 +488,7 @@ OBJS= \
     obj/finality.o \
     obj/dag.o \
     obj/candidate_frontier.o \
+    obj/candidate_frontier_metadata.o \
     obj/blockindex_hot_owner.o \
     obj/blockindex_tip.o \
     obj/blockindex_live_tail.o \

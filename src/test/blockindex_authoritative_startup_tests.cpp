@@ -196,4 +196,32 @@ BOOST_AUTO_TEST_CASE(runb_reader_reuse_navigator_no_double_open)
     bootstrap.Close();
 }
 
+BOOST_AUTO_TEST_CASE(authoritative_active_height_snapshot_no_legacy_topology)
+{
+    AuthNavFixture fx(5);
+    BlockIndexV2ReaderOptions opts;
+    BlockIndexV2Reader reader;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reader.Open(fx.root.string(), opts, &error), error);
+    AuthoritativeBlockIndexHotResolver resolver(&reader);
+
+    BlockIndexSnapshot snap = resolver.GetActiveByHeight(3);
+    BOOST_REQUIRE(snap.found);
+    BOOST_CHECK_EQUAL(snap.height, 3);
+    BOOST_CHECK(snap.hash == fx.active[3].hash);
+    BOOST_CHECK_EQUAL(snap.nFile, fx.active[3].nFile);
+    BOOST_CHECK_EQUAL(snap.nBlockPos, fx.active[3].nBlockPos);
+    BOOST_CHECK(mapBlockIndex.find(fx.active[3].hash) == mapBlockIndex.end());
+
+    // The resolver exposes no historical CBlockIndex topology; parent/next are
+    // by-value V2 lookups and the legacy global remains empty.
+    BlockIndexSnapshot parent = resolver.GetParentByHash(snap.hash);
+    BOOST_REQUIRE(parent.found);
+    BOOST_CHECK(parent.hash == fx.active[2].hash);
+    BlockIndexSnapshot next = resolver.GetNextActiveByHash(snap.hash);
+    BOOST_REQUIRE(next.found);
+    BOOST_CHECK(next.hash == fx.active[4].hash);
+    BOOST_CHECK(mapBlockIndex.empty() || mapBlockIndex.find(fx.active[3].hash) == mapBlockIndex.end());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

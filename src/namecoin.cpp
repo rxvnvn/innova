@@ -1,5 +1,6 @@
 #include <vector>
 #include "namecoin.h"
+#include "blockindex_authoritative_startup.h"
 #include "coincontrol.h"
 #include "script.h"
 #include "wallet.h"
@@ -619,6 +620,32 @@ CHooks* InitHook()
 }
 
 // version for connectInputs. Used when accepting blocks.
+// Authoritative startup has no historical CBlockIndex topology. Resolve the
+// bounded historical PoW fee anchor by value from the retained V2 reader.
+static bool AuthoritativeNameOpFee(int height, const NameTxInfo& nti, int64_t* outFee)
+{
+    if (!outFee) return false;
+    int cursor = height;
+    for (int attempt = 0; attempt < 11 && cursor >= 0; ++attempt)
+    {
+        BlockIndexSnapshot snap;
+        if (!AuthoritativeGetActiveSnapshotByHeight(cursor, &snap)) return false;
+        if (!snap.fProofOfStake)
+        {
+            int64_t txMinFee = nti.nRentalDays * snap.nMint / (365 * 100);
+            if (nti.op == OP_NAME_NEW) txMinFee += snap.nMint;
+            txMinFee = (int64_t)std::sqrt((double)(txMinFee / CENT)) * CENT;
+            txMinFee += (int)((nti.vchName.size() + nti.vchValue.size()) / 128) * CENT;
+            txMinFee += CENT - 1;
+            txMinFee = (txMinFee / CENT) * CENT;
+            *outFee = std::max<int64_t>(txMinFee, MIN_NAME_FEE);
+            return true;
+        }
+        cursor = snap.height - 1;
+    }
+    return false;
+}
+
 bool IsNameFeeEnough(CTxDB& txdb, const CTransaction& tx, const NameTxInfo& nti, const CBlockIndex* pindexBlock, const map<uint256, CTxIndex>& mapTestPool, bool fBlock, bool fMiner)
 {
     // get tx fee
@@ -629,6 +656,21 @@ bool IsNameFeeEnough(CTxDB& txdb, const CTransaction& tx, const NameTxInfo& nti,
     if (!const_cast<CTransaction&>(tx).FetchInputs(txdb, mapTestPool, fBlock, fMiner, mapInputs, fInvalid))
         return false;
     txFee = tx.GetValueIn(mapInputs) - tx.GetValueOut();
+
+    if (g_fAuthoritativeStartup)
+    {
+        bool txFeePass = false;
+        int cursor = pindexBlock ? pindexBlock->nHeight : -1;
+        for (int i = 1; i <= 10 && cursor >= 0; ++i)
+        {
+            int64_t netFee = 0;
+            if (!AuthoritativeNameOpFee(cursor, nti, &netFee))
+                return false;
+            if (txFee >= netFee) { txFeePass = true; break; }
+            --cursor;
+        }
+        return txFeePass;
+    }
 
 
     // scan last 10 PoW block for tx fee that matches the one specified in tx
@@ -2085,6 +2127,28 @@ NameTxReturn name_delete(const vector<unsigned char> &vchName)
 //     printf("Scanned Innova for names successfully!\n");
 // }
 
+static void FillAuthoritativeNameIndexBlock(const BlockIndexSnapshot& snap,
+                                             CBlockIndex* out)
+{
+    *out = CBlockIndex();
+    out->phashBlock = &snap.hash;
+    out->nHeight = snap.height;
+    out->nFile = snap.nFile;
+    out->nBlockPos = snap.nBlockPos;
+    out->nFlags = snap.nFlags;
+    out->nVersion = snap.nVersion;
+    out->nTime = snap.nTime;
+    out->nBits = snap.nBits;
+    out->nNonce = snap.nNonce;
+    out->nMint = snap.nMint;
+    out->nMoneySupply = snap.nMoneySupply;
+    out->nStakeModifier = snap.nStakeModifier;
+    out->prevoutStake = snap.prevoutStake;
+    out->nStakeTime = snap.nStakeTime;
+    out->hashProof = snap.hashProof;
+    out->nChainTrust = snap.nChainTrust;
+}
+
 bool createNameIndexFile()
 {
     printf("Scanning Innova blockchain for names to create a fast index...\n");
@@ -2118,7 +2182,20 @@ bool createNameIndexFile()
         }
         //uiInterface.InitMessage(strprintf("Creating name index... %i", percentageDone));
 
-        CBlockIndex* pindex = FindBlockByHeight(nHeight);
+        CBlockIndex authoritativeIndex;
+        BlockIndexSnapshot authoritativeSnapshot;
+        CBlockIndex* pindex = NULL;
+        if (g_fAuthoritativeStartup)
+        {
+            if (!AuthoritativeGetActiveSnapshotByHeight(nHeight, &authoritativeSnapshot))
+                return error("createNameIndexFile() : authoritative height lookup failed");
+            FillAuthoritativeNameIndexBlock(authoritativeSnapshot, &authoritativeIndex);
+            pindex = &authoritativeIndex;
+        }
+        else
+        {
+            pindex = FindBlockByHeight(nHeight);
+        }
         if (!pindex)
             continue;
         CBlock block;

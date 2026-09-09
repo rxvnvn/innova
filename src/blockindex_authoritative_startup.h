@@ -34,6 +34,7 @@
 
 #include <stdint.h>
 #include <string>
+#include "blockindex_accessor.h"
 
 class BlockIndexAuthoritativeLive; // fwd (G1 production live-authority accessor)
 
@@ -48,7 +49,10 @@ extern bool g_fAuthoritativeStartup;
 // navigator/bootstrap are retained process-lifetime so globals stay valid.
 bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error);
 
-// A.10.1q: expose the retained authoritative generation root + generation so
+// Read-only authoritative historical lookup used by legacy startup consumers that
+// need one by-value active-chain record; never materializes historical CBlockIndex.
+bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out);
+
 // init.cpp can build a BlockIndexActiveChainReader for HReg + wallet rescan
 // against the SAME selected generation (no second CURRENT open). Empty/0 if not
 // in authoritative mode.

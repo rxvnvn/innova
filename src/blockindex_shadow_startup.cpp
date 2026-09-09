@@ -305,6 +305,12 @@ bool RetainBlockIndexAuthoritativeNavigator(const std::string& root, std::string
     return RetainBlockIndexAuthoritativeNavigatorImpl(nav, error);
 }
 
+const BlockIndexV2Reader* GetAuthoritativeNavigatorReader()
+{
+    LOCK(cs_shadowState);
+    return g_stakingNavigator ? g_stakingNavigator->GetColdReader() : NULL;
+}
+
 bool RetainBlockIndexAuthoritativeNavigatorWithReader(BlockIndexV2Reader reader,
                                                       std::string* error)
 {

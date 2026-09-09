@@ -1,4 +1,5 @@
 #include "blockindex_generation_lifecycle.h"
+#include "candidate_frontier_metadata.h"
 
 #include "blockindex_hashindex.h"
 #include "blockindex_activeindex.h"
@@ -243,6 +244,8 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
                                               unsigned char recomputedRoot[32],
                                               std::string* error)
 {
+    if (!EnsureCandidateLeafMetadata(dir.string(), generation, error))
+        return false;
     // 1. Recompute recordsDigest from records.dat
     unsigned char recordsDigest[32];
     {
@@ -381,13 +384,20 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
         SHA256_Final(derivedEntriesDigest, &ctx);
     }
 
-    // 5. dagInputDigest is read from persisted MANIFEST (cannot recompute from
-    // generation files alone without external LevelDB DAG snapshot).
+    // 5. Bind the persisted candidate frontier into the canonical root. The
+    // same domain-separated mix is used by the builder before publication.
+    unsigned char candidateBinding[32];
+    if (!ComputeCandidateLeavesBinding(dir.string(), generation, candidateBinding, error))
+        return false;
+    unsigned char mixedDagInputDigest[32];
+    if (!MixCandidateLeavesIntoDagDigest(persistedDagInputDigest, candidateBinding,
+                                         mixedDagInputDigest))
+        return SetError(error, "candidate leaves root binding failed");
 
     // 6. Compute generation root from recomputed digests
     if (!ComputeGenerationRoot(generation, tipHash, recordCount,
                                recordsDigest, activeDigest, hashIndexDigest,
-                               derivedEntriesDigest, persistedDagInputDigest,
+                               derivedEntriesDigest, mixedDagInputDigest,
                                recomputedRoot))
         return SetError(error, "ComputeGenerationRoot failed during recomputation");
 
@@ -612,6 +622,12 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::PublishGeneration(const s
         SetError(error, "stable generation already exists (refusing to overwrite rollback): " + stable.string());
         return BLOCK_INDEX_LIFECYCLE_ERROR;
     }
+    // Materialize the immutable static candidate-leaf frontier before the
+    // generation becomes publishable. Old stable generations without this file
+    // remain compatible via the bounded external startup fallback.
+    if (!EnsureCandidateLeafMetadata(staging.string(), generation, error))
+        return BLOCK_INDEX_LIFECYCLE_ERROR;
+
     // Validate the staging generation structurally (build-N.tmp, not stable name).
     const BlockIndexLifecycleStatus v = ValidateGenerationDir(staging.string(), generation,
                                                              /*requireStableName=*/false, generation, error);

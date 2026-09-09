@@ -2,6 +2,7 @@
 // Distributed under the MIT/X11 software license.
 
 #include "blockindex_generation_writer.h"
+#include "candidate_frontier_metadata.h"
 
 #include "util.h"
 
@@ -175,11 +176,22 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
         unsigned char dagDigest[32];
         memset(dagDigest, 0, 32);
         const unsigned char* usedDag = dagInputDigest ? dagInputDigest : dagDigest;
-        // RecomputeGenerationRootFromFiles reads the on-disk generation files
-        // (records.dat / active.dat / hashindex / derived.dat) and derives the
-        // same root the authority validation will recompute. Active + derived +
-        // records are flat stores (no LevelDB), so opening them read-only here
-        // cannot conflict with the still-open in-memory store handles.
+        // Materialize candidate leaves before root computation so the writer and
+        // validator bind the same immutable sidecar.
+        FixedBlockIndexManifest preManifest = store_.GetManifest();
+        preManifest.recordCount = recordCount;
+        preManifest.committedTipId = committedTipId;
+        preManifest.committedTipHeight = committedTipHeight;
+        preManifest.committedTipHash = committedTipHash;
+        preManifest.state = BLOCK_INDEX_MANIFEST_BUILDING;
+        if (!store_.WriteManifest(preManifest, error))
+            return SetError(error, "writer: pre-root MANIFEST write failed: " + (error ? *error : ""));
+        if (!EnsureCandidateLeafMetadata(stagingDir_, generation, error))
+            return SetError(error, "writer: candidate leaves materialization failed: " + (error ? *error : ""));
+        unsigned char candidateBinding[32];
+        if (!ComputeCandidateLeavesBinding(stagingDir_, generation, candidateBinding, error))
+            return SetError(error, "writer: candidate leaves binding failed: " + (error ? *error : ""));
+        // RecomputeGenerationRootFromFiles applies the canonical mix itself.
         boost::filesystem::path sdir(stagingDir_);
         if (!RecomputeGenerationRootFromFiles(sdir, generation, committedTipHash,
                                               recordCount, usedDag, binding, error))

@@ -1,6 +1,7 @@
 #include <boost/test/unit_test.hpp>
 #include "../blockindex_generation_builder.h"
 #include "../blockindex_generation_lifecycle.h"
+#include "../candidate_frontier_metadata.h"
 #include "../blockindex_derived_state.h"
 #include "../blockindex_startup_authority.h"
 #include "../fixed_blockindex_store.h"
@@ -496,6 +497,18 @@ BOOST_AUTO_TEST_CASE(c2_changed_derived_entry_rejects)
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error),
                       (int)BLOCK_INDEX_LIFECYCLE_OK);
 
+    // Candidate-leaf sidecar tamper must fail closed even when the original
+    // generation files and MANIFEST remain untouched.
+    {
+        std::string leavesData = ReadWholeFile(genDir / BLOCK_INDEX_CANDIDATE_LEAVES_FILE_NAME);
+        BOOST_REQUIRE(leavesData.size() > 60);
+        leavesData[60] ^= 0x01;
+        WriteWholeFile(genDir / BLOCK_INDEX_CANDIDATE_LEAVES_FILE_NAME, leavesData);
+        error.clear();
+        BOOST_CHECK_NE(BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error),
+                       (int)BLOCK_INDEX_LIFECYCLE_OK);
+    }
+
     // Tamper: change a middle derived entry's chainTrust field
     std::string derivedData = ReadWholeFile(genDir / BLOCK_INDEX_DERIVED_FILE_NAME);
     const size_t entryOffset = BLOCK_INDEX_DERIVED_HEADER_SIZE_V2 + 2 * BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2;
@@ -643,6 +656,7 @@ BOOST_AUTO_TEST_CASE(c3_canonical_dag_trust_over_linear)
     {
         BlockIndexRecord r; r.hash = uint256(1); r.hashPrev = uint256(0);
         r.height = 0; r.nVersion = 1; r.nTime = 1000; r.nBits = nBits; r.hashProof = uint256(100);
+        r.nStakeModifier = 0; r.prevoutStake = COutPoint(); r.nFlags = 0;
         records.push_back(r);
     }
     // Pre-DAG chain h=1..10
@@ -651,24 +665,28 @@ BOOST_AUTO_TEST_CASE(c3_canonical_dag_trust_over_linear)
         BlockIndexRecord r; r.hash = uint256(h + 1); r.hashPrev = uint256(h);
         r.height = h; r.nVersion = 1; r.nTime = 1000 + h; r.nBits = nBits;
         r.hashProof = uint256(100 + h);
+        r.nStakeModifier = 0; r.prevoutStake = COutPoint(); r.nFlags = 0;
         records.push_back(r);
     }
     // A at h=11 (post-DAG, parent = preDAG at h=10, hash=11)
     {
         BlockIndexRecord r; r.hash = uint256(100); r.hashPrev = uint256(11);
         r.height = 11; r.nVersion = 1; r.nTime = 1100; r.nBits = nBits; r.hashProof = uint256(200);
+        r.nStakeModifier = 0; r.prevoutStake = COutPoint(); r.nFlags = 0;
         records.push_back(r);
     }
     // B at h=11 (post-DAG, parallel to A, parent = preDAG at h=10, hash=11)
     {
         BlockIndexRecord r; r.hash = uint256(200); r.hashPrev = uint256(11);
         r.height = 11; r.nVersion = 1; r.nTime = 1101; r.nBits = nBits; r.hashProof = uint256(300);
+        r.nStakeModifier = 0; r.prevoutStake = COutPoint(); r.nFlags = 0;
         records.push_back(r);
     }
     // C at h=12 (post-DAG, parent = A, merge parent = B)
     {
         BlockIndexRecord r; r.hash = uint256(300); r.hashPrev = uint256(100);
         r.height = 12; r.nVersion = 1; r.nTime = 1200; r.nBits = nBits; r.hashProof = uint256(400);
+        r.nStakeModifier = 0; r.prevoutStake = COutPoint(); r.nFlags = 0;
         records.push_back(r);
     }
 

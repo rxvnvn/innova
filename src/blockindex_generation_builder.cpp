@@ -1,4 +1,5 @@
 #include "blockindex_generation_builder.h"
+#include "candidate_frontier_metadata.h"
 
 #include "txdb-leveldb.h"
 #include "main.h"
@@ -890,11 +891,28 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
 
         if (!source.blockDataDir.empty() && allBlockSizeAvailable)
         {
-            // AUTHORITATIVE: use full generation root as content binding
-            unsigned char generationRoot[32];
-            ComputeGenerationRoot(generation, tipHash, totalRecords,
-                                  recordsDigest, activeDigest, hashIndexDigest,
-                                  derivedEntriesDigest, dagInputDigest, generationRoot);
+        FixedBlockIndexManifest preManifest = store.GetManifest();
+        preManifest.recordCount = totalRecords;
+        preManifest.committedTipId = tipId;
+        preManifest.committedTipHeight = tipHeight;
+        preManifest.committedTipHash = tipHash;
+        preManifest.state = BLOCK_INDEX_MANIFEST_BUILDING;
+        if (!store.WriteManifest(preManifest, error))
+            return false;
+        if (!EnsureCandidateLeafMetadata(generationDir, generation, error))
+            return false;
+        unsigned char candidateBinding[32];
+        if (!ComputeCandidateLeavesBinding(generationDir, generation, candidateBinding, error))
+            return false;
+        unsigned char mixedDagInputDigest[32];
+        if (!MixCandidateLeavesIntoDagDigest(dagInputDigest, candidateBinding,
+                                             mixedDagInputDigest))
+            return SetError(error, "candidate leaves root mix failed");
+        // AUTHORITATIVE: use full generation root as content binding
+        unsigned char generationRoot[32];
+        ComputeGenerationRoot(generation, tipHash, totalRecords,
+                              recordsDigest, activeDigest, hashIndexDigest,
+                              derivedEntriesDigest, mixedDagInputDigest, generationRoot);
             derivedStore.SetContentBinding(generationRoot);
         }
         else
