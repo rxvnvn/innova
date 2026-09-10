@@ -6,6 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include <malloc.h>   // Block Index V2: malloc_trim for authoritative arena release (Linux/glibc)
+#include <memory>     // A.13.4-R3 bounded CTxDB lifetime
 #include "init.h"
 #include "main.h"
 #include "kernel.h"
@@ -2003,20 +2004,56 @@ authoritative_startup_ready:
     {
         uiInterface.InitMessage(_("Rebuilding address index..."));
         nStart = GetTimeMillis();
-        CBlockIndex *pblockAddrIndex = pindexBest;
-    CTxDB txdbAddr("rw");
-    while(pblockAddrIndex)
-    {
-        uiInterface.InitMessage(strprintf("Rebuilding address index, Block %i", pblockAddrIndex->nHeight));
-        bool ReadFromDisk(const CBlockIndex* pindex, bool fReadTransactions=true);
-        CBlock pblockAddr;
-        if(pblockAddr.ReadFromDisk(pblockAddrIndex, true))
-            pblockAddr.RebuildAddressIndex(txdbAddr);
-        pblockAddrIndex = pblockAddrIndex->pprev;
-    }
-
-    printf("Rebuilt address index of %i blocks in %" PRId64"ms\n",
-           pblockAddrIndex->nHeight, GetTimeMillis() - nStart);
+        std::unique_ptr<CTxDB> txdbAddr(new CTxDB("rw"));
+        if (g_fAuthoritativeStartup)
+        {
+            const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
+            if (!reader || !reader->IsOpen())
+                return InitError(_("Authoritative address index replay: V2 reader unavailable"));
+            const int nCheckpointInterval = 250;
+            for (int nHeight = 0; nHeight <= nBestHeight; ++nHeight)
+            {
+                BlockIndexSnapshot snapshot;
+                std::string error;
+                if (reader->GetActiveByHeight(nHeight, &snapshot, &error) != BLOCK_INDEX_V2_READ_FOUND)
+                    return InitError(strprintf("Authoritative address index replay: height %d unavailable", nHeight));
+                uiInterface.InitMessage(strprintf("Rebuilding address index, Block %i", nHeight));
+                CBlock pblockAddr;
+                if (!pblockAddr.ReadFromDisk(snapshot.nFile, snapshot.nBlockPos, true))
+                    return InitError(strprintf("Authoritative address index replay: block %d unavailable", nHeight));
+                pblockAddr.RebuildAddressIndex(*txdbAddr);
+                if (nHeight < nBestHeight &&
+                    ((nHeight + 1) % nCheckpointInterval) == 0)
+                {
+                    txdbAddr->Close();
+                    txdbAddr.reset();
+                    try
+                    {
+                        txdbAddr.reset(new CTxDB("rw"));
+                    }
+                    catch (const std::exception& e)
+                    {
+                        return InitError(strprintf(
+                            "Authoritative address index replay: reopen failed after height %d: %s",
+                            nHeight, e.what()));
+                    }
+                }
+            }
+        }
+        else
+        {
+            CBlockIndex *pblockAddrIndex = pindexBest;
+            while(pblockAddrIndex)
+            {
+                uiInterface.InitMessage(strprintf("Rebuilding address index, Block %i", pblockAddrIndex->nHeight));
+                CBlock pblockAddr;
+                if(pblockAddr.ReadFromDisk(pblockAddrIndex, true))
+                    pblockAddr.RebuildAddressIndex(*txdbAddr);
+                pblockAddrIndex = pblockAddrIndex->pprev;
+            }
+        }
+        printf("Rebuilt address index of %i blocks in %" PRId64"ms\n",
+               nBestHeight + 1, GetTimeMillis() - nStart);
     }
 
     //// debug print

@@ -54,6 +54,9 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error);
 bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out);
 // Resolve one active block by hash through the retained cold/hot authority.
 // Returns false for unknown, non-active, closed, or authority-failed results.
+bool ResolveAuthoritativeBlockSnapshot(const uint256& hash,
+                                       BlockIndexSnapshot* out,
+                                       std::string* error);
 bool ResolveAuthoritativeActiveBlock(const uint256& hash,
                                      BlockIndexSnapshot* out,
                                      std::string* error);

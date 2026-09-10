@@ -21,6 +21,7 @@
 #include "../main.h"
 #include "../wallet.h"
 #include "../innovarpc.h"
+#include "../txdb-leveldb.h"
 #include "../json/json_spirit_value.h"
 
 #include <boost/filesystem.hpp>
@@ -34,7 +35,7 @@ extern void WalletTxToJSON(const CWalletTx& wtx, json_spirit::Object& entry);
 
 namespace {
 
-struct SB { uint256 hash; uint256 merkleRoot; CTransaction tx; unsigned int nFile=0, nBlockPos=0, nSize=0; };
+struct SB { uint256 hash; CTransaction tx; unsigned int nFile=0, nBlockPos=0, nSize=0; };
 
 static SB WriteBlock(const boost::filesystem::path& dir, uint256 prev,
                      unsigned int nTime, unsigned int nBits, unsigned int nNonce)
@@ -50,7 +51,6 @@ static SB WriteBlock(const boost::filesystem::path& dir, uint256 prev,
     CBlock block; block.nVersion = 1; block.hashPrevBlock = prev;
     block.nTime = nTime; block.nBits = nBits; block.nNonce = nNonce;
     block.vtx.push_back(coinbase); block.hashMerkleRoot = block.BuildMerkleTree();
-    info.merkleRoot = block.hashMerkleRoot;
     info.hash = block.GetHash();
     info.nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
     CDataStream ss(SER_DISK, CLIENT_VERSION); ss << block;
@@ -65,7 +65,7 @@ static SB WriteBlock(const boost::filesystem::path& dir, uint256 prev,
 }
 
 struct AuthNavFixture {
-    boost::filesystem::path root, blockDir;
+    boost::filesystem::path root;
     std::vector<SB> active;
     int tipHeight;
 
@@ -73,11 +73,9 @@ struct AuthNavFixture {
         root = boost::filesystem::temp_directory_path() /
             boost::filesystem::unique_path("innova-authnav-%%%%-%%%%-%%%%");
         boost::filesystem::create_directories(root);
-        blockDir = root / "blocks";
-        boost::filesystem::create_directories(blockDir);
         uint256 prev(0);
         for (int h = 0; h <= tipHeight; ++h) {
-            SB b = WriteBlock(blockDir, prev, (unsigned int)(1000+h), 0x1d00ffffU, (unsigned int)(100+h));
+            SB b = WriteBlock(root, prev, (unsigned int)(1000+h), 0x1d00ffffU, (unsigned int)(100+h));
             active.push_back(b); prev = b.hash;
         }
         BlockIndexGenerationSource src;
@@ -88,14 +86,15 @@ struct AuthNavFixture {
             rec.height = h; rec.nVersion = 1;
             rec.nTime = (unsigned int)(1000+h); rec.nBits = 0x1d00ffffU;
             rec.nNonce = (unsigned int)(100+h);
-            rec.hashMerkleRoot = active[h].merkleRoot;
             rec.nFile = active[h].nFile; rec.nBlockPos = active[h].nBlockPos;
+            rec.nFlags = 0;
+            rec.nMoneySupply = 0;
             BlockIndexGenerationSourceRecord sr; sr.hash=rec.hash; sr.record=rec;
             src.records.push_back(sr);
         }
         src.hashBestChain = active[tipHeight].hash;
         src.foundBestChain = true;
-        src.blockDataDir = blockDir.string();
+        src.blockDataDir.clear();
 
         boost::filesystem::path staging = root / "build-000001.tmp";
         std::string error;
@@ -106,7 +105,9 @@ struct AuthNavFixture {
         BOOST_REQUIRE_MESSAGE(
             BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error)==(int)BLOCK_INDEX_LIFECYCLE_OK, error);
     }
-    ~AuthNavFixture() { boost::system::error_code ec; boost::filesystem::remove_all(root, ec); }
+    ~AuthNavFixture() {
+        boost::system::error_code ec; boost::filesystem::remove_all(root, ec);
+    }
 };
 
 } // namespace
@@ -307,6 +308,94 @@ BOOST_AUTO_TEST_CASE(authoritative_wallet_depth_trust_json_no_historical_topolog
     pindexBest = oldBest;
     nBestHeight = oldHeight;
     ClearBlockIndexStakingNavigator();
+}
+
+BOOST_AUTO_TEST_CASE(reindexaddr_db_close_reopen_preserves_address_index)
+{
+    const bool hadDataDir = mapArgs.count("-datadir") != 0;
+    const std::string oldDataDir = hadDataDir ? mapArgs["-datadir"] : std::string();
+    const boost::filesystem::path root = boost::filesystem::temp_directory_path() /
+        boost::filesystem::unique_path("innova-reindexaddr-db-%%%%-%%%%");
+    const boost::filesystem::path referenceRoot = root / "reference";
+    const boost::filesystem::path checkpointedRoot = root / "checkpointed";
+    boost::filesystem::create_directories(referenceRoot);
+    boost::filesystem::create_directories(checkpointedRoot);
+
+    std::vector<uint160> addresses(3);
+    addresses[0].SetHex("0000000000000000000000000000000000000001");
+    addresses[1].SetHex("0000000000000000000000000000000000000002");
+    addresses[2].SetHex("0000000000000000000000000000000000000003");
+    std::vector<uint256> txs;
+    for (unsigned int i = 1; i <= 5; ++i)
+        txs.push_back(uint256(i));
+    const std::vector<std::pair<unsigned int, unsigned int> > sequence = {
+        {0, 0}, {1, 1}, {0, 0}, {2, 2},
+        {1, 3}, {0, 4}, {2, 2}, {2, 3}
+    };
+
+    auto apply = [&](CTxDB& db, std::vector<std::vector<uint256> >& logical,
+                     size_t begin, size_t end) {
+        for (size_t i = begin; i < end; ++i)
+        {
+            const unsigned int addressIndex = sequence[i].first;
+            const uint256& txHash = txs[sequence[i].second];
+            BOOST_REQUIRE(db.WriteAddrIndex(addresses[addressIndex], txHash));
+            if (std::find(logical[addressIndex].begin(), logical[addressIndex].end(), txHash) ==
+                logical[addressIndex].end())
+                logical[addressIndex].push_back(txHash);
+        }
+    };
+
+    std::vector<std::vector<uint256> > referenceLogical(3);
+    mapArgs["-datadir"] = referenceRoot.string();
+    {
+        CTxDB db("rw");
+        apply(db, referenceLogical, 0, sequence.size());
+        db.Close();
+    }
+    std::vector<std::vector<uint256> > referenceValues(3);
+    {
+        CTxDB db("rw");
+        for (size_t i = 0; i < addresses.size(); ++i)
+            BOOST_REQUIRE(db.ReadAddrIndex(addresses[i], referenceValues[i]));
+        db.Close();
+    }
+
+    std::vector<std::vector<uint256> > checkpointedLogical(3);
+    mapArgs["-datadir"] = checkpointedRoot.string();
+    const size_t split = sequence.size() / 2;
+    {
+        CTxDB db("rw");
+        apply(db, checkpointedLogical, 0, split);
+        db.Close();
+    }
+    {
+        CTxDB db("rw");
+        apply(db, checkpointedLogical, split, sequence.size());
+        db.Close();
+    }
+    {
+        CTxDB db("rw");
+        for (size_t i = 0; i < addresses.size(); ++i)
+        {
+            std::vector<uint256> actual;
+            BOOST_REQUIRE(db.ReadAddrIndex(addresses[i], actual));
+            BOOST_REQUIRE_EQUAL(actual.size(), referenceValues[i].size());
+            BOOST_REQUIRE_EQUAL(actual.size(), referenceLogical[i].size());
+            BOOST_REQUIRE_EQUAL(actual.size(), checkpointedLogical[i].size());
+            for (size_t j = 0; j < actual.size(); ++j)
+            {
+                BOOST_CHECK(actual[j] == referenceValues[i][j]);
+                BOOST_CHECK(actual[j] == referenceLogical[i][j]);
+                BOOST_CHECK(actual[j] == checkpointedLogical[i][j]);
+            }
+        }
+        db.Close();
+    }
+
+    if (hadDataDir) mapArgs["-datadir"] = oldDataDir; else mapArgs.erase("-datadir");
+    boost::system::error_code ec;
+    boost::filesystem::remove_all(root, ec);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

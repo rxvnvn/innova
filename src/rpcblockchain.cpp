@@ -10,6 +10,7 @@
 #include "bootstrap.h"
 #include "finality.h"
 #include "dag.h"
+#include "blockindex_authoritative_startup.h"
 #include "base58.h"
 #include "net.h"
 #include <errno.h>
@@ -150,6 +151,106 @@ double GetPoSKernelPS()
                     nBlocksExamined, nStakesHandled,
                     (long long)(RPCPerfTimeMicros() - nStartTime), dResult);
     return dResult;
+}
+
+static bool ReadAuthoritativeBlockByHash(const uint256& hash,
+                                         BlockIndexSnapshot* snapshot,
+                                         CBlock* block,
+                                         std::string* error)
+{
+    if (!snapshot || !block)
+        return false;
+    if (!ResolveAuthoritativeBlockSnapshot(hash, snapshot, error))
+        return false;
+    if (!block->ReadFromDisk(snapshot->nFile, snapshot->nBlockPos, true))
+    {
+        if (error) *error = "authoritative block: block bytes unavailable";
+        return false;
+    }
+    if (block->GetHash() != snapshot->hash)
+    {
+        if (error) *error = "authoritative block: disk hash mismatch";
+        return false;
+    }
+    return true;
+}
+
+static uint256 AuthoritativeBlockTrust(const BlockIndexSnapshot& snapshot,
+                                       const CBlock& block)
+{
+    CBigNum target;
+    target.SetCompact(snapshot.nBits);
+    if (target <= 0)
+        return uint256(0);
+    if (snapshot.height >= FORK_HEIGHT_DAG && snapshot.fProofOfStake)
+        return uint256(0);
+    if (snapshot.height >= FORK_HEIGHT_POEM)
+        return GetBlockEntropy((snapshot.fProofOfStake && snapshot.height < FORK_HEIGHT_DAG)
+            ? snapshot.hashProof : block.GetHash());
+    return ((CBigNum(1) << 256) / (target + 1)).getuint256();
+}
+
+static Object AuthoritativeBlockToJSON(const CBlock& block,
+                                       const BlockIndexSnapshot& snapshot,
+                                       bool fPrintTransactionDetail)
+{
+    Object result;
+    result.push_back(Pair("hash", snapshot.hash.GetHex()));
+    result.push_back(Pair("confirmations", snapshot.fInMainChain
+        ? nBestHeight - snapshot.height + 1 : -1));
+    result.push_back(Pair("size", (int)::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION)));
+    result.push_back(Pair("height", snapshot.height));
+    result.push_back(Pair("version", block.nVersion));
+    result.push_back(Pair("merkleroot", block.hashMerkleRoot.GetHex()));
+    result.push_back(Pair("mint", ValueFromAmount(snapshot.nMint)));
+    result.push_back(Pair("time", (int64_t)block.GetBlockTime()));
+    result.push_back(Pair("nonce", (uint64_t)block.nNonce));
+    result.push_back(Pair("bits", HexBits(block.nBits)));
+    result.push_back(Pair("difficulty", BitsToDouble(snapshot.nBits)));
+    result.push_back(Pair("blocktrust", leftTrim(AuthoritativeBlockTrust(snapshot, block).GetHex(), '0')));
+    result.push_back(Pair("chaintrust", leftTrim(snapshot.nChainTrust.GetHex(), '0')));
+    if (snapshot.hashPrev != uint256(0))
+        result.push_back(Pair("previousblockhash", snapshot.hashPrev.GetHex()));
+    BlockIndexSnapshot next;
+    if (snapshot.fInMainChain && AuthoritativeGetActiveSnapshotByHeight(snapshot.height + 1, &next))
+        result.push_back(Pair("nextblockhash", next.hash.GetHex()));
+    result.push_back(Pair("flags", strprintf("%s%s",
+        snapshot.fProofOfStake ? "proof-of-stake" : "proof-of-work",
+        (snapshot.nFlags & BLOCK_STAKE_MODIFIER) ? " stake-modifier" : "")));
+    result.push_back(Pair("proofhash", snapshot.hashProof.GetHex()));
+    result.push_back(Pair("entropybit", (int)((snapshot.nFlags & BLOCK_STAKE_ENTROPY) >> 1)));
+
+    Array txinfo;
+    for (const CTransaction& tx : block.vtx)
+    {
+        if (fPrintTransactionDetail)
+        {
+            Object entry;
+            entry.push_back(Pair("txid", tx.GetHash().GetHex()));
+            TxToJSON(tx, 0, entry);
+            txinfo.push_back(entry);
+        }
+        else
+            txinfo.push_back(tx.GetHash().GetHex());
+    }
+    result.push_back(Pair("tx", txinfo));
+    if (block.IsProofOfStake())
+        result.push_back(Pair("signature", HexStr(block.vchBlockSig.begin(), block.vchBlockSig.end())));
+    return result;
+}
+
+static Object AuthoritativeBlockHeaderToJSON(const CBlock& block,
+                                             const BlockIndexSnapshot& snapshot)
+{
+    Object result;
+    result.push_back(Pair("version", block.nVersion));
+    if (snapshot.hashPrev != uint256(0))
+        result.push_back(Pair("previousblockhash", snapshot.hashPrev.GetHex()));
+    result.push_back(Pair("merkleroot", block.hashMerkleRoot.GetHex()));
+    result.push_back(Pair("time", block.GetBlockTime()));
+    result.push_back(Pair("bits", strprintf("%08x", block.nBits)));
+    result.push_back(Pair("nonce", (uint64_t)block.nNonce));
+    return result;
 }
 
 Object blockHeader2ToJSON(const CBlock& block, const CBlockIndex* blockindex)
@@ -369,8 +470,20 @@ Value dumpbootstrap(const Array& params, bool fHelp)
         for (int nHeight = 0; nHeight <= nBlocks; nHeight++)
         {
             CBlock block;
-            CBlockIndex* pblockindex = FindBlockByHeight(nHeight);
-            block.ReadFromDisk(pblockindex, true);
+            if (g_fAuthoritativeStartup)
+            {
+                BlockIndexSnapshot snapshot;
+                std::string error;
+                if (!AuthoritativeGetActiveSnapshotByHeight(nHeight, &snapshot) ||
+                    !block.ReadFromDisk(snapshot.nFile, snapshot.nBlockPos, true))
+                    throw JSONRPCError(RPC_MISC_ERROR, "Authoritative bootstrap block unavailable");
+            }
+            else
+            {
+                CBlockIndex* pblockindex = FindBlockByHeight(nHeight);
+                if (!block.ReadFromDisk(pblockindex, true))
+                    throw JSONRPCError(RPC_MISC_ERROR, "Bootstrap block unavailable");
+            }
             fileout << FLATDATA(pchMessageStart) << fileout.GetSerializeSize(block) << block;
         }
     } catch(const boost::filesystem::filesystem_error &e) {
@@ -534,6 +647,15 @@ Value getblockhash(const Array& params, bool fHelp)
     if (nHeight < 0 || nHeight > nBestHeight)
         throw runtime_error("Block number out of range.");
 
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexSnapshot snapshot;
+        std::string error;
+        if (!AuthoritativeGetActiveSnapshotByHeight(nHeight, &snapshot))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block height not found in authoritative active chain");
+        return snapshot.hash.GetHex();
+    }
+
     CBlockIndex* pblockindex = FindBlockByHeight(nHeight);
     return pblockindex->phashBlock->GetHex();
 }
@@ -596,6 +718,22 @@ Value getblock(const Array& params, bool fHelp)
     int verbosity = 1;
     if (params.size() > 1) {
             verbosity = params[1].get_bool() ? 1 : 0;
+    }
+
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexSnapshot snapshot;
+        CBlock block;
+        std::string error;
+        if (!ReadAuthoritativeBlockByHash(hash, &snapshot, &block, &error))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error.empty() ? "Block not found" : error);
+        if (verbosity <= 0)
+        {
+            CDataStream ssBlock(SER_NETWORK, PROTOCOL_VERSION);
+            ssBlock << block;
+            return HexStr(ssBlock.begin(), ssBlock.end());
+        }
+        return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
     }
 
     if (mapBlockIndex.count(hash) == 0)
@@ -698,6 +836,17 @@ Value getblock_old(const Array& params, bool fHelp)
     std::string strHash = params[0].get_str();
     uint256 hash(strHash);
 
+    if (g_fAuthoritativeStartup)
+    {
+        LOCK(cs_main);
+        BlockIndexSnapshot snapshot;
+        CBlock block;
+        std::string error;
+        if (!ReadAuthoritativeBlockByHash(hash, &snapshot, &block, &error))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error.empty() ? "Block not found" : error);
+        return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
+    }
+
     if (mapBlockIndex.count(hash) == 0)
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
 
@@ -719,6 +868,18 @@ Value getblockbynumber(const Array& params, bool fHelp)
     int nHeight = params[0].get_int();
     if (nHeight < 0 || nHeight > nBestHeight)
         throw runtime_error("Block number out of range.");
+
+    if (g_fAuthoritativeStartup)
+    {
+        LOCK(cs_main);
+        BlockIndexSnapshot snapshot;
+        CBlock block;
+        std::string error;
+        if (!AuthoritativeGetActiveSnapshotByHeight(nHeight, &snapshot) ||
+            !block.ReadFromDisk(snapshot.nFile, snapshot.nBlockPos, true))
+            throw JSONRPCError(RPC_MISC_ERROR, "Authoritative block bytes unavailable");
+        return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
+    }
 
     CBlock block;
     CBlockIndex* pblockindex = mapBlockIndex[hashBestChain];
@@ -836,12 +997,24 @@ Value getcheckpoint(const Array& params, bool fHelp)
             "Show info of synchronized checkpoint.\n");
 
     Object result;
-    CBlockIndex* pindexCheckpoint;
 
     result.push_back(Pair("synccheckpoint", Checkpoints::hashSyncCheckpoint.ToString().c_str()));
-    pindexCheckpoint = mapBlockIndex[Checkpoints::hashSyncCheckpoint];
-    result.push_back(Pair("height", pindexCheckpoint->nHeight));
-    result.push_back(Pair("timestamp", DateTimeStrFormat(pindexCheckpoint->GetBlockTime()).c_str()));
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexSnapshot snapshot;
+        std::string error;
+        if (!ResolveAuthoritativeActiveBlock(Checkpoints::hashSyncCheckpoint, &snapshot, &error))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Authoritative synchronized checkpoint is unknown or non-active");
+        result.push_back(Pair("height", snapshot.height));
+        result.push_back(Pair("timestamp", DateTimeStrFormat(snapshot.nTime).c_str()));
+    }
+    else
+    {
+        CBlockIndex* pindexCheckpoint;
+        pindexCheckpoint = mapBlockIndex[Checkpoints::hashSyncCheckpoint];
+        result.push_back(Pair("height", pindexCheckpoint->nHeight));
+        result.push_back(Pair("timestamp", DateTimeStrFormat(pindexCheckpoint->GetBlockTime()).c_str()));
+    }
 
     // Check that the block satisfies synchronized checkpoint
     if (CheckpointsMode == Checkpoints::STRICT)
