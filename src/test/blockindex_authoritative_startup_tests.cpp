@@ -110,6 +110,33 @@ struct AuthNavFixture {
     }
 };
 
+class TestNonActiveHotResolver : public ColdHotHotResolver
+{
+public:
+    uint256 sideHash;
+    int sideHeight;
+
+    TestNonActiveHotResolver(const uint256& hash, int height)
+        : sideHash(hash), sideHeight(height) {}
+
+    BlockIndexSnapshot LookupByHash(const uint256& hash) const
+    {
+        BlockIndexSnapshot out;
+        if (hash == sideHash)
+        {
+            out.found = true;
+            out.hash = sideHash;
+            out.height = sideHeight;
+            out.fInMainChain = false;
+        }
+        return out;
+    }
+    BlockIndexSnapshot GetActiveByHeight(int) const { return BlockIndexSnapshot(); }
+    BlockIndexSnapshot GetParentByHash(const uint256&) const { return BlockIndexSnapshot(); }
+    BlockIndexSnapshot GetNextActiveByHash(const uint256&) const { return BlockIndexSnapshot(); }
+    BlockIndexSnapshot GetTip() const { return BlockIndexSnapshot(); }
+};
+
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(blockindex_authoritative_startup_tests)
@@ -396,6 +423,53 @@ BOOST_AUTO_TEST_CASE(reindexaddr_db_close_reopen_preserves_address_index)
     if (hadDataDir) mapArgs["-datadir"] = oldDataDir; else mapArgs.erase("-datadir");
     boost::system::error_code ec;
     boost::filesystem::remove_all(root, ec);
+}
+
+BOOST_AUTO_TEST_CASE(hreg_authoritative_resolution_contract_no_historical_topology)
+{
+    AuthNavFixture fx(5);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        RetainBlockIndexStakingNavigator(fx.root.string(), &error), error);
+
+    const bool oldAuthoritative = g_fAuthoritativeStartup;
+    g_fAuthoritativeStartup = true;
+    {
+        LOCK(cs_main);
+        BlockIndexSnapshot found;
+        AuthoritativeBlockResolutionResult foundResult =
+            ResolveAuthoritativeBlockSnapshotR(fx.active[3].hash, &found, &error);
+        BOOST_CHECK_EQUAL((int)foundResult, (int)AUTHORITATIVE_BLOCK_FOUND);
+        BOOST_CHECK_EQUAL(found.height, 3);
+        BOOST_CHECK(mapBlockIndex.find(fx.active[3].hash) == mapBlockIndex.end());
+
+        BlockIndexSnapshot missing;
+        AuthoritativeBlockResolutionResult missingResult =
+            ResolveAuthoritativeBlockSnapshotR(uint256(0x7777), &missing, &error);
+        BOOST_CHECK_EQUAL((int)missingResult, (int)AUTHORITATIVE_BLOCK_NOT_FOUND);
+        BOOST_CHECK(mapBlockIndex.empty() || mapBlockIndex.find(fx.active[3].hash) == mapBlockIndex.end());
+
+        TestNonActiveHotResolver sideResolver(uint256(0x8888), 3);
+        const ColdHotSeamNavigator* constNav = GetBlockIndexStakingNavigator();
+        BOOST_REQUIRE(constNav != NULL);
+        const_cast<ColdHotSeamNavigator*>(constNav)->SetTestHotResolver(&sideResolver);
+        BlockIndexSnapshot side;
+        AuthoritativeBlockResolutionResult sideResult =
+            ResolveAuthoritativeBlockSnapshotR(sideResolver.sideHash, &side, &error);
+        BOOST_CHECK_EQUAL((int)sideResult, (int)AUTHORITATIVE_BLOCK_NOT_ACTIVE);
+        BOOST_CHECK_EQUAL(side.height, 3);
+        const_cast<ColdHotSeamNavigator*>(constNav)->SetTestHotResolver(NULL);
+    }
+
+    ClearBlockIndexStakingNavigator();
+    {
+        LOCK(cs_main);
+        BlockIndexSnapshot unavailable;
+        AuthoritativeBlockResolutionResult failureResult =
+            ResolveAuthoritativeBlockSnapshotR(fx.active[3].hash, &unavailable, &error);
+        BOOST_CHECK_EQUAL((int)failureResult, (int)AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE);
+    }
+    g_fAuthoritativeStartup = oldAuthoritative;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

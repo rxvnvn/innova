@@ -2,10 +2,16 @@
 // Distributed under the MIT/X11 software license.
 
 #include <boost/test/unit_test.hpp>
+#include <boost/filesystem.hpp>
 
 #include "../hreg_registration.h"
 #include "../script.h"
 #include "../util.h"
+#include "../blockindex_authoritative_startup.h"
+#include "../blockindex_generation_builder.h"
+#include "../blockindex_generation_lifecycle.h"
+#include "../blockindex_shadow_startup.h"
+#include "../txdb-leveldb.h"
 
 using namespace hreg;
 
@@ -108,6 +114,105 @@ bool HasState(const std::vector<RegisteredCollateralState>& v, const COutPoint& 
         if (v[i].outpoint == op && v[i].state == st) return true;
     return false;
 }
+
+struct RealHRegDiskFixture
+{
+    boost::filesystem::path root;
+    CTransaction prev;
+    uint256 blockHash;
+    unsigned int blockFile;
+    unsigned int blockPos;
+    bool hadDataDir;
+    std::string oldDataDir;
+    bool oldAuthoritative;
+
+    RealHRegDiskFixture()
+        : blockFile(0), blockPos(0),
+          hadDataDir(mapArgs.count("-datadir") != 0),
+          oldDataDir(hadDataDir ? mapArgs["-datadir"] : std::string()),
+          oldAuthoritative(g_fAuthoritativeStartup)
+    {
+        root = boost::filesystem::temp_directory_path() /
+            boost::filesystem::unique_path("innova-hreg-real-%%%%-%%%%");
+        boost::filesystem::create_directories(root);
+        mapArgs["-datadir"] = root.string();
+
+        prev = MakePrevTx(std::vector<CTxOut>(1,
+            MakePrevOut(HREG_COLLATERAL, P2PKHScript(0x11))));
+        CTransaction coinbase = MakePrevTx(
+            std::vector<CTxOut>(1, MakePrevOut(0, CScript() << OP_TRUE)), true);
+        CBlock block;
+        block.nVersion = 1;
+        block.nTime = 1000;
+        block.nBits = 0x207fffffU;
+        block.nNonce = 100;
+        block.vtx.push_back(coinbase);
+        block.vtx.push_back(prev);
+        block.hashMerkleRoot = block.BuildMerkleTree();
+        blockHash = block.GetHash();
+        BOOST_REQUIRE(block.WriteToDisk(blockFile, blockPos));
+
+        const unsigned int firstTxPos = blockPos +
+            ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+            (2 * GetSizeOfCompactSize(0)) +
+            GetSizeOfCompactSize(block.vtx.size());
+        const unsigned int prevTxPos = firstTxPos +
+            ::GetSerializeSize(coinbase, SER_DISK, CLIENT_VERSION);
+        { CTxDB db("rw");
+          BOOST_REQUIRE(db.AddTxIndex(prev, CDiskTxPos(blockFile, blockPos, prevTxPos), 0));
+          db.Close(); }
+
+        BlockIndexGenerationSource source;
+        BlockIndexRecord record;
+        record.hash = blockHash;
+        record.height = 0;
+        record.nVersion = block.nVersion;
+        record.nTime = block.nTime;
+        record.nBits = block.nBits;
+        record.nNonce = block.nNonce;
+        record.nFile = blockFile;
+        record.nBlockPos = blockPos;
+        record.nFlags = 0;
+        record.nMoneySupply = 0;
+        BlockIndexGenerationSourceRecord sourceRecord;
+        sourceRecord.hash = blockHash;
+        sourceRecord.record = record;
+        source.records.push_back(sourceRecord);
+        source.hashBestChain = blockHash;
+        source.foundBestChain = true;
+        source.blockDataDir.clear();
+
+        std::string error;
+        boost::filesystem::path staging = root / "build-000001.tmp";
+        { BlockIndexGenerationBuilder builder;
+          BOOST_REQUIRE_MESSAGE(builder.Build(source, staging.string(), 1, NULL, &error), error);
+          builder.Close(); }
+        BOOST_REQUIRE_MESSAGE(
+            BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error) ==
+                (int)BLOCK_INDEX_LIFECYCLE_OK, error);
+        BOOST_REQUIRE_MESSAGE(
+            BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error) ==
+                (int)BLOCK_INDEX_LIFECYCLE_OK, error);
+    }
+
+    void OpenAuthority()
+    {
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(
+            RetainBlockIndexStakingNavigator(root.string(), &error), error);
+        g_fAuthoritativeStartup = true;
+    }
+
+    ~RealHRegDiskFixture()
+    {
+        ClearBlockIndexStakingNavigator();
+        g_fAuthoritativeStartup = oldAuthoritative;
+        if (hadDataDir) mapArgs["-datadir"] = oldDataDir;
+        else mapArgs.erase("-datadir");
+        boost::system::error_code ec;
+        boost::filesystem::remove_all(root, ec);
+    }
+};
 
 } // namespace
 
@@ -524,6 +629,58 @@ BOOST_AUTO_TEST_CASE(hreg_inactive_before_activation)
     BOOST_CHECK(ApplyHRegConnectedTx(reg, mp, 100, err));
     BOOST_CHECK(GetHRegStateSnapshotForTesting().empty());
     ClearHRegActivationOverrideForTesting();
+}
+
+BOOST_AUTO_TEST_CASE(hreg_authoritative_real_disk_activation_readiness)
+{
+    ClearHRegStateForTesting();
+    ClearHRegPrevTxHeightsForTesting();
+    RealHRegDiskFixture fixture;
+
+    CTransaction roundTrip;
+    uint256 roundTripBlock;
+    BOOST_REQUIRE(GetTransaction(fixture.prev.GetHash(), roundTrip, roundTripBlock));
+    BOOST_CHECK(roundTrip.GetHash() == fixture.prev.GetHash());
+    BOOST_CHECK(roundTripBlock == fixture.blockHash);
+
+    std::string error;
+    fixture.OpenAuthority();
+    {
+        LOCK(cs_main);
+        BlockIndexSnapshot snapshot;
+        BOOST_REQUIRE_EQUAL((int)ResolveAuthoritativeBlockSnapshotR(
+            roundTripBlock, &snapshot, &error),
+            (int)AUTHORITATIVE_BLOCK_FOUND);
+        BOOST_CHECK(snapshot.fInMainChain);
+        BOOST_CHECK_EQUAL(snapshot.height, 0);
+    }
+    BOOST_CHECK(mapBlockIndex.find(fixture.blockHash) == mapBlockIndex.end());
+
+    SetHRegActivationOverrideForTesting(1); // controlled tomorrow-lowered gate
+    CTransaction reg = MakeRegistrationTx(fixture.prev, 0);
+    MapPrevTx inputs;
+    PutPrev(inputs, fixture.prev);
+    BOOST_REQUIRE_MESSAGE(ApplyHRegConnectedTx(reg, inputs, 16, error), error);
+    BOOST_REQUIRE_EQUAL(GetHRegStateSnapshotForTesting().size(), 1U);
+    BOOST_CHECK_EQUAL(GetHRegStateSnapshotForTesting()[0].registrationHeight, 16);
+    BOOST_CHECK(mapBlockIndex.find(fixture.blockHash) == mapBlockIndex.end());
+
+    ClearHRegStateForTesting();
+    BOOST_CHECK(ApplyHRegConnectedTx(reg, inputs, 15, error));
+    BOOST_CHECK(GetHRegStateSnapshotForTesting().empty());
+    BOOST_CHECK(mapBlockIndex.find(fixture.blockHash) == mapBlockIndex.end());
+
+    ClearHRegStateForTesting();
+    ClearBlockIndexStakingNavigator();
+    BOOST_CHECK(!ApplyHRegConnectedTx(reg, inputs, 16, error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(error.find("navigator unavailable") != std::string::npos ||
+                error.find("authority") != std::string::npos ||
+                error.find("Authority") != std::string::npos);
+    BOOST_CHECK(GetHRegStateSnapshotForTesting().empty());
+
+    ClearHRegActivationOverrideForTesting();
+    ClearHRegPrevTxHeightsForTesting();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

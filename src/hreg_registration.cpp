@@ -6,6 +6,7 @@
 #include "checkpoints.h"
 #include "script.h"
 #include "txdb.h"
+#include "blockindex_authoritative_startup.h"
 
 #include <map>
 #include <set>
@@ -20,23 +21,64 @@ static const unsigned char HREG_MAGIC_BYTES[] = {'I', 'N', 'C', 'N', 0x01, 0x01}
 static int g_nHRegActivationOverride = -1;
 static std::map<uint256, int> g_mapPrevTxHeightForTesting;
 
-bool GetPrevTxHeight(const uint256& hashTx, int& nHeightOut)
+enum PrevTxHeightResult
 {
-    std::map<uint256, int>::const_iterator it = g_mapPrevTxHeightForTesting.find(hashTx);
-    if (it != g_mapPrevTxHeightForTesting.end())
+    PREV_TX_HEIGHT_FOUND = 0,
+    PREV_TX_HEIGHT_NOT_FOUND,
+    PREV_TX_HEIGHT_NOT_ACTIVE,
+    PREV_TX_HEIGHT_AUTHORITY_FAILURE,
+};
+
+PrevTxHeightResult GetPrevTxHeight(const uint256& hashTx, int& nHeightOut,
+                                   std::string* error)
+{
+    if (!g_fAuthoritativeStartup)
     {
-        nHeightOut = it->second;
-        return true;
+        std::map<uint256, int>::const_iterator it = g_mapPrevTxHeightForTesting.find(hashTx);
+        if (it != g_mapPrevTxHeightForTesting.end())
+        {
+            nHeightOut = it->second;
+            return PREV_TX_HEIGHT_FOUND;
+        }
     }
 
     CTransaction tx;
     uint256 hashBlock;
     if (!GetTransaction(hashTx, tx, hashBlock))
-        return false;
-    if (!mapBlockIndex.count(hashBlock) || mapBlockIndex[hashBlock] == NULL)
-        return false;
-    nHeightOut = mapBlockIndex[hashBlock]->nHeight;
-    return true;
+        return PREV_TX_HEIGHT_NOT_FOUND;
+    if (!g_fAuthoritativeStartup)
+    {
+        if (!mapBlockIndex.count(hashBlock) || mapBlockIndex[hashBlock] == NULL)
+            return PREV_TX_HEIGHT_NOT_FOUND;
+        nHeightOut = mapBlockIndex[hashBlock]->nHeight;
+        return PREV_TX_HEIGHT_FOUND;
+    }
+
+    if (hashBlock == uint256(0))
+    {
+        if (error) *error = "HREG authoritative previous transaction block unavailable";
+        return PREV_TX_HEIGHT_AUTHORITY_FAILURE;
+    }
+    BlockIndexSnapshot snapshot;
+    std::string resolveError;
+    AuthoritativeBlockResolutionResult resolved;
+    {
+        LOCK(cs_main);
+        resolved = ResolveAuthoritativeBlockSnapshotR(hashBlock, &snapshot, &resolveError);
+    }
+    if (resolved == AUTHORITATIVE_BLOCK_NOT_FOUND)
+        return PREV_TX_HEIGHT_NOT_FOUND;
+    if (resolved == AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+        return PREV_TX_HEIGHT_NOT_ACTIVE;
+    if (resolved != AUTHORITATIVE_BLOCK_FOUND)
+    {
+        if (error) *error = resolveError.empty()
+            ? "HREG authoritative previous transaction authority failure"
+            : resolveError;
+        return PREV_TX_HEIGHT_AUTHORITY_FAILURE;
+    }
+    nHeightOut = snapshot.height;
+    return PREV_TX_HEIGHT_FOUND;
 }
 
 bool ExtractExactMarkerPayload(const CScript& scriptPubKey, std::vector<unsigned char>& payloadOut)
@@ -67,11 +109,14 @@ bool IsHRegMarkerPayload(const std::vector<unsigned char>& payload)
 
 bool FindUniqueQualifyingInput(const CTransaction& tx, const MapPrevTx& mapInputs,
                                COutPoint& outpointRet, CScript& payeeRet, bool& fFound,
-                               bool& fDuplicate, bool& fMature)
+                               bool& fDuplicate, bool& fMature,
+                               bool& fAuthorityFailure, std::string& authorityError)
 {
     fFound = false;
     fDuplicate = false;
     fMature = false;
+    fAuthorityFailure = false;
+    authorityError.clear();
     int nFoundHeight = 0;
     for (unsigned int i = 0; i < tx.vin.size(); ++i)
     {
@@ -93,7 +138,16 @@ bool FindUniqueQualifyingInput(const CTransaction& tx, const MapPrevTx& mapInput
         if (!IsStandardP2PKHScript(prevTxOut.scriptPubKey, NULL))
             continue;
         int nPrevHeight = 0;
-        if (!GetPrevTxHeight(prevout.hash, nPrevHeight))
+        std::string heightError;
+        const PrevTxHeightResult heightResult =
+            GetPrevTxHeight(prevout.hash, nPrevHeight, &heightError);
+        if (heightResult == PREV_TX_HEIGHT_AUTHORITY_FAILURE)
+        {
+            fAuthorityFailure = true;
+            authorityError = heightError;
+            return false;
+        }
+        if (heightResult != PREV_TX_HEIGHT_FOUND)
             continue;
         if (fFound)
         {
@@ -274,10 +328,24 @@ RegistrationParseResult EvaluateHRegRegistrationTx(const CTransaction& tx,
     bool fFoundInput = false;
     bool fDuplicateInputs = false;
     bool fMature = false;
-    if (!FindUniqueQualifyingInput(tx, mapInputs, oldCollateral, payee, fFoundInput, fDuplicateInputs, fMature))
+    bool fAuthorityFailure = false;
+    std::string authorityError;
+    if (!FindUniqueQualifyingInput(tx, mapInputs, oldCollateral, payee, fFoundInput,
+                                   fDuplicateInputs, fMature, fAuthorityFailure,
+                                   authorityError))
     {
-        result.action = RegistrationParseResult::ACTION_REJECT;
-        result.reason = "duplicate qualifying collateral inputs";
+        if (fAuthorityFailure)
+        {
+            result.action = RegistrationParseResult::ACTION_REJECT;
+            result.reason = authorityError.empty()
+                ? "HREG authority failure while resolving collateral height"
+                : authorityError;
+        }
+        else
+        {
+            result.action = RegistrationParseResult::ACTION_REJECT;
+            result.reason = "duplicate qualifying collateral inputs";
+        }
         return result;
     }
     if (fDuplicateInputs)
@@ -290,7 +358,18 @@ RegistrationParseResult EvaluateHRegRegistrationTx(const CTransaction& tx,
         return result;
 
     int nPrevHeight = 0;
-    if (!GetPrevTxHeight(oldCollateral.hash, nPrevHeight))
+    std::string heightError;
+    const PrevTxHeightResult heightResult =
+        GetPrevTxHeight(oldCollateral.hash, nPrevHeight, &heightError);
+    if (heightResult == PREV_TX_HEIGHT_AUTHORITY_FAILURE)
+    {
+        result.action = RegistrationParseResult::ACTION_REJECT;
+        result.reason = heightError.empty()
+            ? "HREG authority failure while resolving collateral height"
+            : heightError;
+        return result;
+    }
+    if (heightResult != PREV_TX_HEIGHT_FOUND)
         return result;
     if (((nBlockHeight - 1) - nPrevHeight) < 15)
         return result;

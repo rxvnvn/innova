@@ -52,7 +52,20 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error);
 // Read-only authoritative historical lookup used by legacy startup consumers that
 // need one by-value active-chain record; never materializes historical CBlockIndex.
 bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out);
-// Resolve one active block by hash through the retained cold/hot authority.
+enum AuthoritativeBlockResolutionResult
+{
+    AUTHORITATIVE_BLOCK_FOUND = 0,
+    AUTHORITATIVE_BLOCK_NOT_FOUND,
+    AUTHORITATIVE_BLOCK_NOT_ACTIVE,
+    AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE,
+};
+
+// Typed hash resolution for callers that must distinguish ordinary absence,
+// non-active history, and authority failure. Never materializes CBlockIndex.
+AuthoritativeBlockResolutionResult ResolveAuthoritativeBlockSnapshotR(
+    const uint256& hash, BlockIndexSnapshot* out, std::string* error);
+
+// Resolve one block by hash through the retained cold/hot authority.
 // Returns false for unknown, non-active, closed, or authority-failed results.
 bool ResolveAuthoritativeBlockSnapshot(const uint256& hash,
                                        BlockIndexSnapshot* out,

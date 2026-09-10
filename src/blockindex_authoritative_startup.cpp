@@ -231,53 +231,90 @@ bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out)
     return reader->GetActiveByHeight(height, out, &error) == BLOCK_INDEX_V2_READ_FOUND;
 }
 
-bool ResolveAuthoritativeBlockSnapshot(const uint256& hash,
-                                       BlockIndexSnapshot* out,
-                                       std::string* error)
+AuthoritativeBlockResolutionResult ResolveAuthoritativeBlockSnapshotR(
+    const uint256& hash, BlockIndexSnapshot* out, std::string* error)
 {
     if (error) error->clear();
     if (!out)
-        return false;
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
     const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
     if (!nav)
     {
         if (error) *error = "authoritative block resolver: navigator unavailable";
-        return false;
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
     }
     ColdHotSeamSnapshot snap;
     std::string err;
     const ColdHotSeamResult r = nav->ResolveLogicalR(
         BlockIndexLogicalId(hash), &snap, &err);
-    if (r != COLD_HOT_SEAM_OK || !snap.snapshot.found)
+    if (r == COLD_HOT_SEAM_NOT_FOUND)
     {
         if (error) *error = err.empty() ? "authoritative block resolver: block not found" : err;
-        return false;
+        return AUTHORITATIVE_BLOCK_NOT_FOUND;
+    }
+    if (r == COLD_HOT_SEAM_NOT_ACTIVE)
+    {
+        if (error) *error = err.empty() ? "authoritative block resolver: block is not active" : err;
+        return AUTHORITATIVE_BLOCK_NOT_ACTIVE;
+    }
+    if (r != COLD_HOT_SEAM_OK || !snap.snapshot.found)
+    {
+        if (error) *error = err.empty() ? "authoritative block resolver: authority failure" : err;
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
     }
     if (!snap.snapshot.fInMainChain)
     {
         const BlockIndexV2Reader* cold = nav->GetColdReader();
+        if (!cold)
+        {
+            if (error) *error = "authoritative block resolver: active reader unavailable";
+            return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+        }
         BlockIndexSnapshot active;
         std::string activeError;
-        if (cold && cold->GetActiveByHeight(snap.snapshot.height, &active, &activeError) == BLOCK_INDEX_V2_READ_FOUND &&
+        const BlockIndexV2ReadStatus activeStatus =
+            cold->GetActiveByHeight(snap.snapshot.height, &active, &activeError);
+        if (activeStatus == BLOCK_INDEX_V2_READ_CORRUPT ||
+            activeStatus == BLOCK_INDEX_V2_READ_IO_ERROR ||
+            activeStatus == BLOCK_INDEX_V2_READ_NOT_OPEN)
+        {
+            if (error) *error = activeError.empty()
+                ? "authoritative block resolver: active membership authority failure"
+                : activeError;
+            return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+        }
+        if (activeStatus == BLOCK_INDEX_V2_READ_FOUND &&
             active.hash == snap.snapshot.hash)
+        {
             snap.snapshot = active;
+        }
+        else
+        {
+            if (error) *error = "authoritative block resolver: block is not active";
+            *out = snap.snapshot;
+            return AUTHORITATIVE_BLOCK_NOT_ACTIVE;
+        }
     }
     *out = snap.snapshot;
-    return true;
+    return AUTHORITATIVE_BLOCK_FOUND;
+}
+
+bool ResolveAuthoritativeBlockSnapshot(const uint256& hash,
+                                       BlockIndexSnapshot* out,
+                                       std::string* error)
+{
+    const AuthoritativeBlockResolutionResult result =
+        ResolveAuthoritativeBlockSnapshotR(hash, out, error);
+    return result == AUTHORITATIVE_BLOCK_FOUND ||
+           result == AUTHORITATIVE_BLOCK_NOT_ACTIVE;
 }
 
 bool ResolveAuthoritativeActiveBlock(const uint256& hash,
                                      BlockIndexSnapshot* out,
                                      std::string* error)
 {
-    if (!ResolveAuthoritativeBlockSnapshot(hash, out, error))
-        return false;
-    if (!out->fInMainChain)
-    {
-        if (error) *error = "authoritative block resolver: block is not active";
-        return false;
-    }
-    return true;
+    return ResolveAuthoritativeBlockSnapshotR(hash, out, error) ==
+           AUTHORITATIVE_BLOCK_FOUND;
 }
 
 // A.10.1q: expose the retained authoritative generation root + generation for
