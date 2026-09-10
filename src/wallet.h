@@ -14,6 +14,7 @@
 #include "main.h"
 #include "blockindex_active_chain_reader.h"
 #include "cold_hot_seam.h"
+#include "blockindex_authoritative_startup.h"
 
 // Caller holds cs_main. Resolves a staking source with current active-chain
 // authority and verifies the cold/hot seam when a cold snapshot is used.
@@ -1337,7 +1338,14 @@ public:
             LOCK(cs_main);
             if (!pindexBest || nTime > pindexBest->GetBlockTime())
                 return false;
-            if (!mapBlockIndex.count(hashBlock))
+            if (g_fAuthoritativeStartup)
+            {
+                BlockIndexSnapshot snapshot;
+                std::string error;
+                if (!ResolveAuthoritativeActiveBlock(hashBlock, &snapshot, &error))
+                    return false;
+            }
+            else if (!mapBlockIndex.count(hashBlock))
                 return false;
         }
         int nDepth = GetDepthInMainChain();

@@ -19,6 +19,9 @@
 #include "../blockindex_generation_builder.h"
 #include "../blockindex_generation_lifecycle.h"
 #include "../main.h"
+#include "../wallet.h"
+#include "../innovarpc.h"
+#include "../json/json_spirit_value.h"
 
 #include <boost/filesystem.hpp>
 
@@ -27,9 +30,11 @@
 #include <string>
 #include <vector>
 
+extern void WalletTxToJSON(const CWalletTx& wtx, json_spirit::Object& entry);
+
 namespace {
 
-struct SB { uint256 hash; unsigned int nFile=0, nBlockPos=0, nSize=0; };
+struct SB { uint256 hash; uint256 merkleRoot; CTransaction tx; unsigned int nFile=0, nBlockPos=0, nSize=0; };
 
 static SB WriteBlock(const boost::filesystem::path& dir, uint256 prev,
                      unsigned int nTime, unsigned int nBits, unsigned int nNonce)
@@ -41,9 +46,11 @@ static SB WriteBlock(const boost::filesystem::path& dir, uint256 prev,
     coinbase.vin.push_back(input);
     CTxOut output; output.nValue = 0; output.scriptPubKey = CScript() << OP_TRUE;
     coinbase.vout.push_back(output);
+    info.tx = coinbase;
     CBlock block; block.nVersion = 1; block.hashPrevBlock = prev;
     block.nTime = nTime; block.nBits = nBits; block.nNonce = nNonce;
     block.vtx.push_back(coinbase); block.hashMerkleRoot = block.BuildMerkleTree();
+    info.merkleRoot = block.hashMerkleRoot;
     info.hash = block.GetHash();
     info.nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
     CDataStream ss(SER_DISK, CLIENT_VERSION); ss << block;
@@ -81,6 +88,7 @@ struct AuthNavFixture {
             rec.height = h; rec.nVersion = 1;
             rec.nTime = (unsigned int)(1000+h); rec.nBits = 0x1d00ffffU;
             rec.nNonce = (unsigned int)(100+h);
+            rec.hashMerkleRoot = active[h].merkleRoot;
             rec.nFile = active[h].nFile; rec.nBlockPos = active[h].nBlockPos;
             BlockIndexGenerationSourceRecord sr; sr.hash=rec.hash; sr.record=rec;
             src.records.push_back(sr);
@@ -222,6 +230,83 @@ BOOST_AUTO_TEST_CASE(authoritative_active_height_snapshot_no_legacy_topology)
     BOOST_REQUIRE(next.found);
     BOOST_CHECK(next.hash == fx.active[4].hash);
     BOOST_CHECK(mapBlockIndex.empty() || mapBlockIndex.find(fx.active[3].hash) == mapBlockIndex.end());
+}
+
+BOOST_AUTO_TEST_CASE(authoritative_wallet_depth_trust_json_no_historical_topology)
+{
+    AuthNavFixture fx(5);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(RetainBlockIndexAuthoritativeNavigator(fx.root.string(), &error), error);
+
+    {
+        BlockIndexSnapshot anchor;
+        BOOST_REQUIRE(AuthoritativeGetActiveSnapshotByHeight(2, &anchor));
+        BOOST_CHECK_EQUAL(anchor.height, 2);
+        BOOST_CHECK(anchor.hash == fx.active[2].hash);
+        BOOST_CHECK(mapBlockIndex.find(anchor.hash) == mapBlockIndex.end());
+        BOOST_CHECK(!AuthoritativeGetActiveSnapshotByHeight(-1, &anchor));
+        BOOST_CHECK(!AuthoritativeGetActiveSnapshotByHeight(99, &anchor));
+        BlockIndexSnapshot unknown;
+        BOOST_CHECK(!ResolveAuthoritativeActiveBlock(uint256(0x7777), &unknown, &error));
+    }
+
+    const bool oldAuthoritative = g_fAuthoritativeStartup;
+    CBlockIndex* oldBest = pindexBest;
+    const int oldHeight = nBestHeight;
+    CBlockIndex best;
+    best.nHeight = 5;
+    best.nTime = 1005;
+    pindexBest = &best;
+    nBestHeight = 5;
+    g_fAuthoritativeStartup = true;
+
+    {
+        const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+        BOOST_REQUIRE(nav != NULL);
+        ColdHotSeamSnapshot diagnostic;
+        std::string diagnosticError;
+        const ColdHotSeamResult diagnosticResult = nav->ResolveLogicalR(
+            BlockIndexLogicalId(fx.active[3].hash), &diagnostic, &diagnosticError);
+        BOOST_TEST_MESSAGE("diagnostic resolver result=" << (int)diagnosticResult << " error=" << diagnosticError);
+        int diagnosticDepth = 0;
+        const ColdHotSeamResult diagnosticMaturity = nav->GetHybridSvmMaturityAuthorityR(
+            BlockIndexLogicalId(fx.active[3].hash), fx.active[3].tx.GetHash(),
+            std::vector<uint256>(), 0, &diagnosticDepth, &diagnosticError);
+        BOOST_TEST_MESSAGE("diagnostic maturity result=" << (int)diagnosticMaturity << " depth=" << diagnosticDepth << " error=" << diagnosticError);
+        BOOST_CHECK_EQUAL((int)diagnosticMaturity, (int)COLD_HOT_SEAM_OK);
+        BOOST_CHECK_EQUAL(diagnosticDepth, 3);
+    }
+
+    CWalletTx wtx(NULL, fx.active[3].tx);
+    wtx.hashBlock = fx.active[3].hash;
+    wtx.nIndex = 0;
+    {
+        LOCK(cs_main);
+        BOOST_CHECK_EQUAL(wtx.GetDepthInMainChain(), 3);
+        BOOST_CHECK(wtx.IsTrusted());
+        json_spirit::Object json;
+        WalletTxToJSON(wtx, json);
+        BOOST_CHECK_EQUAL(json_spirit::find_value(json, "blocktime").get_int64(), 1003);
+
+        CWalletTx unknown(NULL, fx.active[3].tx);
+        unknown.hashBlock = uint256(0x1234);
+        unknown.nIndex = 0;
+        BOOST_CHECK(unknown.GetDepthInMainChain() < 1);
+        BOOST_CHECK(!unknown.IsTrusted());
+
+        CWalletTx mismatch(NULL, fx.active[3].tx);
+        mismatch.hashBlock = fx.active[3].hash;
+        mismatch.nIndex = 0;
+        mismatch.vMerkleBranch.push_back(uint256(0x55));
+        BOOST_CHECK(mismatch.GetDepthInMainChain() < 1);
+
+        BOOST_CHECK(mapBlockIndex.empty() || mapBlockIndex.find(fx.active[3].hash) == mapBlockIndex.end());
+    }
+
+    g_fAuthoritativeStartup = oldAuthoritative;
+    pindexBest = oldBest;
+    nBestHeight = oldHeight;
+    ClearBlockIndexStakingNavigator();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

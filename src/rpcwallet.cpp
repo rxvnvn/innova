@@ -143,9 +143,20 @@ void WalletTxToJSON(const CWalletTx& wtx, Object& entry)
         entry.push_back(Pair("blockhash", wtx.hashBlock.GetHex()));
         entry.push_back(Pair("blockindex", wtx.nIndex));
         int64_t nTime = 0;
-        nTime = mapBlockIndex[wtx.hashBlock]->nTime;
+        if (g_fAuthoritativeStartup)
+        {
+            BlockIndexSnapshot snapshot;
+            std::string error;
+            if (ResolveAuthoritativeActiveBlock(wtx.hashBlock, &snapshot, &error))
+                nTime = snapshot.nTime;
+            else
+                nTime = -1; // authority failure: never consult historical mapBlockIndex
+        }
+        else
+            nTime = mapBlockIndex[wtx.hashBlock]->nTime;
 
-        entry.push_back(Pair("blocktime", nTime));
+        if (nTime >= 0)
+            entry.push_back(Pair("blocktime", nTime));
     };
     entry.push_back(Pair("txid", wtx.GetHash().GetHex()));
     entry.push_back(Pair("time", (int64_t)wtx.GetTxTime()));

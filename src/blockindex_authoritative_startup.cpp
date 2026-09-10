@@ -217,13 +217,57 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
 
 bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out)
 {
-    if (!out || !g_authoritativeContext)
+    if (!out)
         return false;
     const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
+    if (!reader)
+    {
+        const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+        reader = nav ? nav->GetColdReader() : NULL;
+    }
     if (!reader || !reader->IsOpen())
         return false;
     std::string error;
     return reader->GetActiveByHeight(height, out, &error) == BLOCK_INDEX_V2_READ_FOUND;
+}
+
+bool ResolveAuthoritativeActiveBlock(const uint256& hash,
+                                     BlockIndexSnapshot* out,
+                                     std::string* error)
+{
+    if (error) error->clear();
+    if (!out)
+        return false;
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    if (!nav)
+    {
+        if (error) *error = "authoritative block resolver: navigator unavailable";
+        return false;
+    }
+    ColdHotSeamSnapshot snap;
+    std::string err;
+    const ColdHotSeamResult r = nav->ResolveLogicalR(
+        BlockIndexLogicalId(hash), &snap, &err);
+    if (r != COLD_HOT_SEAM_OK || !snap.snapshot.found)
+    {
+        if (error) *error = err.empty() ? "authoritative block resolver: block not active" : err;
+        return false;
+    }
+    if (!snap.snapshot.fInMainChain)
+    {
+        const BlockIndexV2Reader* cold = nav->GetColdReader();
+        BlockIndexSnapshot active;
+        std::string activeError;
+        if (!cold || cold->GetActiveByHeight(snap.snapshot.height, &active, &activeError) != BLOCK_INDEX_V2_READ_FOUND ||
+            active.hash != snap.snapshot.hash)
+        {
+            if (error) *error = "authoritative block resolver: block is not active";
+            return false;
+        }
+        snap.snapshot = active;
+    }
+    *out = snap.snapshot;
+    return true;
 }
 
 // A.10.1q: expose the retained authoritative generation root + generation for

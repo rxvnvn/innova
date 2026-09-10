@@ -450,9 +450,21 @@ ColdHotSeamResult ColdHotSeamNavigator::GetHybridSvmMaturityAuthorityR(
     // known-but-not-active block must NEVER receive positive active depth.
     if (!snap.snapshot.fInMainChain)
     {
-        *outDepth = 0;
-        SeamClear(error);
-        return COLD_HOT_SEAM_NOT_FOUND; // known, not active -> legacy depth 0
+        BlockIndexSnapshot activeAtHeight;
+        std::string activeError;
+        const BlockIndexV2ReadStatus activeStatus = coldReader.GetActiveByHeight(
+            snap.snapshot.height, &activeAtHeight, &activeError);
+        if (activeStatus == BLOCK_INDEX_V2_READ_FOUND &&
+            activeAtHeight.hash == snap.snapshot.hash)
+        {
+            snap.snapshot = activeAtHeight;
+        }
+        else
+        {
+            *outDepth = 0;
+            SeamClear(error);
+            return COLD_HOT_SEAM_NOT_FOUND; // known side-chain/non-active block
+        }
     }
 
     // Any operation combining frozen COLD membership with live HOT topology must

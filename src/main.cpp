@@ -4480,6 +4480,20 @@ int CMerkleTx::GetDepthInMainChainINTERNAL(CBlockIndex* &pindexRet) const
         return 0;
     AssertLockHeld(cs_main);
 
+    if (g_fAuthoritativeStartup)
+    {
+        const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+        if (!nav)
+            return 0; // authority failure: fail closed
+        int depth = 0;
+        std::string error;
+        const ColdHotSeamResult r = nav->GetHybridSvmMaturityAuthorityR(
+            BlockIndexLogicalId(hashBlock), GetHash(), vMerkleBranch, nIndex,
+            &depth, &error);
+        pindexRet = NULL; // no historical CBlockIndex materialization
+        return r == COLD_HOT_SEAM_OK ? depth : 0;
+    }
+
     // Find the block it claims to be in
     map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashBlock);
     if (mi == mapBlockIndex.end())
@@ -4563,6 +4577,14 @@ int CTxIndex::GetDepthInMainChain() const
     CBlock block;
     if (!block.ReadFromDisk(pos.nFile, pos.nBlockPos, false))
         return 0;
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexSnapshot snapshot;
+        std::string error;
+        if (!ResolveAuthoritativeActiveBlock(block.GetHash(), &snapshot, &error))
+            return 0;
+        return 1 + nBestHeight - snapshot.height;
+    }
     // Find the block in the index
     map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(block.GetHash());
     if (mi == mapBlockIndex.end())

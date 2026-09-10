@@ -52,6 +52,11 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error);
 // Read-only authoritative historical lookup used by legacy startup consumers that
 // need one by-value active-chain record; never materializes historical CBlockIndex.
 bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out);
+// Resolve one active block by hash through the retained cold/hot authority.
+// Returns false for unknown, non-active, closed, or authority-failed results.
+bool ResolveAuthoritativeActiveBlock(const uint256& hash,
+                                     BlockIndexSnapshot* out,
+                                     std::string* error);
 
 // init.cpp can build a BlockIndexActiveChainReader for HReg + wallet rescan
 // against the SAME selected generation (no second CURRENT open). Empty/0 if not

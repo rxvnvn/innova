@@ -629,26 +629,39 @@ Value z_unshield(const Array& params, bool fHelp)
 
             int nAnchorHeight = nCurrentHeight - MIN_SHIELDED_SPEND_DEPTH;
             if (nAnchorHeight < 0) nAnchorHeight = 0;
-            CBlockIndex* pAnchorBlock = FindBlockByHeight(nAnchorHeight);
-            if (pAnchorBlock)
+            if (g_fAuthoritativeStartup)
             {
+                BlockIndexSnapshot anchor;
+                if (!AuthoritativeGetActiveSnapshotByHeight(nAnchorHeight, &anchor))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor unavailable");
                 CIncrementalMerkleTree oldTree;
-                if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock->GetBlockHash(), oldTree))
+                if (!txdb.ReadShieldedTreeAtBlock(anchor.hash, oldTree))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor snapshot unavailable");
+                tree = oldTree;
+            }
+            else
+            {
+                CBlockIndex* pAnchorBlock = FindBlockByHeight(nAnchorHeight);
+                if (pAnchorBlock)
                 {
-                    tree = oldTree;
-                    if (fDebug)
-                        printf("z_unshield: using anchor from height %d\n", nAnchorHeight);
+                    CIncrementalMerkleTree oldTree;
+                    if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock->GetBlockHash(), oldTree))
+                    {
+                        tree = oldTree;
+                        if (fDebug)
+                            printf("z_unshield: using anchor from height %d\n", nAnchorHeight);
+                    }
+                    else
+                    {
+                        txdb.ReadShieldedTree(tree);
+                        if (fDebug)
+                            printf("z_unshield: WARNING: no tree snapshot at height %d, using current\n", nAnchorHeight);
+                    }
                 }
                 else
                 {
                     txdb.ReadShieldedTree(tree);
-                    if (fDebug)
-                        printf("z_unshield: WARNING: no tree snapshot at height %d, using current\n", nAnchorHeight);
                 }
-            }
-            else
-            {
-                txdb.ReadShieldedTree(tree);
             }
             spend.anchor = tree.Root();
 
@@ -1004,17 +1017,30 @@ Value z_send(const Array& params, bool fHelp)
 
             int nAnchorHeight = nCurrentHeight - MIN_SHIELDED_SPEND_DEPTH;
             if (nAnchorHeight < 0) nAnchorHeight = 0;
-            CBlockIndex* pAnchorBlock = FindBlockByHeight(nAnchorHeight);
-            if (pAnchorBlock)
+            if (g_fAuthoritativeStartup)
             {
+                BlockIndexSnapshot anchor;
+                if (!AuthoritativeGetActiveSnapshotByHeight(nAnchorHeight, &anchor))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor unavailable");
                 CIncrementalMerkleTree oldTree;
-                if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock->GetBlockHash(), oldTree))
-                    tree = oldTree;
+                if (!txdb.ReadShieldedTreeAtBlock(anchor.hash, oldTree))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor snapshot unavailable");
+                tree = oldTree;
+            }
+            else
+            {
+                CBlockIndex* pAnchorBlock = FindBlockByHeight(nAnchorHeight);
+                if (pAnchorBlock)
+                {
+                    CIncrementalMerkleTree oldTree;
+                    if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock->GetBlockHash(), oldTree))
+                        tree = oldTree;
+                    else
+                        txdb.ReadShieldedTree(tree);
+                }
                 else
                     txdb.ReadShieldedTree(tree);
             }
-            else
-                txdb.ReadShieldedTree(tree);
             spend.anchor = tree.Root();
 
             vector<CPedersenCommitment> vAllCommitments;
@@ -1053,17 +1079,30 @@ Value z_send(const Array& params, bool fHelp)
             CIncrementalMerkleTree tree;
             int nAnchorHeight = nCurrentHeight - MIN_SHIELDED_SPEND_DEPTH;
             if (nAnchorHeight < 0) nAnchorHeight = 0;
-            CBlockIndex* pAnchorBlock = FindBlockByHeight(nAnchorHeight);
-            if (pAnchorBlock)
+            if (g_fAuthoritativeStartup)
             {
+                BlockIndexSnapshot anchor;
+                if (!AuthoritativeGetActiveSnapshotByHeight(nAnchorHeight, &anchor))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor unavailable");
                 CIncrementalMerkleTree oldTree;
-                if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock->GetBlockHash(), oldTree))
-                    tree = oldTree;
+                if (!txdb.ReadShieldedTreeAtBlock(anchor.hash, oldTree))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor snapshot unavailable");
+                tree = oldTree;
+            }
+            else
+            {
+                CBlockIndex* pAnchorBlock = FindBlockByHeight(nAnchorHeight);
+                if (pAnchorBlock)
+                {
+                    CIncrementalMerkleTree oldTree;
+                    if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock->GetBlockHash(), oldTree))
+                        tree = oldTree;
+                    else
+                        txdb.ReadShieldedTree(tree);
+                }
                 else
                     txdb.ReadShieldedTree(tree);
             }
-            else
-                txdb.ReadShieldedTree(tree);
             spend.anchor = tree.Root();
             int64_t nSerialIdx2 = -1;
             if (nCurrentHeight >= FORK_HEIGHT_SERIAL_V2)
@@ -2006,17 +2045,30 @@ Value z_nullsend(const Array& params, bool fHelp)
 
             int nAnchorHeight = nCurrentHeight - MIN_SHIELDED_SPEND_DEPTH;
             if (nAnchorHeight < 0) nAnchorHeight = 0;
-            CBlockIndex* pAnchorBlock = FindBlockByHeight(nAnchorHeight);
-            if (pAnchorBlock)
+            if (g_fAuthoritativeStartup)
             {
+                BlockIndexSnapshot anchor;
+                if (!AuthoritativeGetActiveSnapshotByHeight(nAnchorHeight, &anchor))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor unavailable");
                 CIncrementalMerkleTree oldTree;
-                if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock->GetBlockHash(), oldTree))
-                    tree = oldTree;
+                if (!txdb.ReadShieldedTreeAtBlock(anchor.hash, oldTree))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor snapshot unavailable");
+                tree = oldTree;
+            }
+            else
+            {
+                CBlockIndex* pAnchorBlock = FindBlockByHeight(nAnchorHeight);
+                if (pAnchorBlock)
+                {
+                    CIncrementalMerkleTree oldTree;
+                    if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock->GetBlockHash(), oldTree))
+                        tree = oldTree;
+                    else
+                        txdb.ReadShieldedTree(tree);
+                }
                 else
                     txdb.ReadShieldedTree(tree);
             }
-            else
-                txdb.ReadShieldedTree(tree);
             spend.anchor = tree.Root();
 
             std::vector<CPedersenCommitment> vAllCommitments;
@@ -2055,17 +2107,30 @@ Value z_nullsend(const Array& params, bool fHelp)
             CIncrementalMerkleTree tree;
             int nAnchorHeight2 = nCurrentHeight - MIN_SHIELDED_SPEND_DEPTH;
             if (nAnchorHeight2 < 0) nAnchorHeight2 = 0;
-            CBlockIndex* pAnchorBlock2 = FindBlockByHeight(nAnchorHeight2);
-            if (pAnchorBlock2)
+            if (g_fAuthoritativeStartup)
             {
+                BlockIndexSnapshot anchor;
+                if (!AuthoritativeGetActiveSnapshotByHeight(nAnchorHeight2, &anchor))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor unavailable");
                 CIncrementalMerkleTree oldTree;
-                if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock2->GetBlockHash(), oldTree))
-                    tree = oldTree;
+                if (!txdb.ReadShieldedTreeAtBlock(anchor.hash, oldTree))
+                    throw JSONRPCError(RPC_INTERNAL_ERROR, "Authoritative shielded anchor snapshot unavailable");
+                tree = oldTree;
+            }
+            else
+            {
+                CBlockIndex* pAnchorBlock2 = FindBlockByHeight(nAnchorHeight2);
+                if (pAnchorBlock2)
+                {
+                    CIncrementalMerkleTree oldTree;
+                    if (txdb.ReadShieldedTreeAtBlock(pAnchorBlock2->GetBlockHash(), oldTree))
+                        tree = oldTree;
+                    else
+                        txdb.ReadShieldedTree(tree);
+                }
                 else
                     txdb.ReadShieldedTree(tree);
             }
-            else
-                txdb.ReadShieldedTree(tree);
             spend.anchor = tree.Root();
             int64_t nSerialIdx2 = -1;
             if (nCurrentHeight >= FORK_HEIGHT_SERIAL_V2)
