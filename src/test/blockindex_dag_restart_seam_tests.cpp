@@ -7,6 +7,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include "../blockindex_dag_restart_seam.h"
+#include "../dag_source_binding_verifier.h"
 #include "../blockindex_startup_bootstrap.h"
 #include "../blockindex_startup_authority.h"
 #include "../blockindex_startup_seam.h"
@@ -21,6 +22,8 @@
 #include <leveldb/write_batch.h>
 
 #include <boost/filesystem.hpp>
+
+#include <openssl/sha.h>
 
 #include <assert.h>
 #include <stdio.h>
@@ -112,7 +115,48 @@ static bool WriteDagLinksEntry(const std::string& dbDir,
     delete db;
     return st.ok();
 }
-
+static bool ComputeDirectDagDigest(const std::string& dbDir, unsigned char out[32])
+{
+    leveldb::Options options;
+    options.create_if_missing = false;
+    leveldb::DB* db = NULL;
+    leveldb::Status st = leveldb::DB::Open(options, dbDir, &db);
+    if (!st.ok() || !db) return false;
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    CDataStream prefix(SER_DISK, CLIENT_VERSION);
+    prefix << std::string("daglinks");
+    std::string p = prefix.str();
+    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    it->Seek(p);
+    while (it->Valid())
+    {
+        if (it->key().ToString().compare(0, p.size(), p) != 0) break;
+        try
+        {
+            CDataStream key(SER_DISK, CLIENT_VERSION);
+            key.write(it->key().data(), it->key().size());
+            std::pair<std::string, uint256> pairKey;
+            key >> pairKey;
+            CDataStream value(SER_DISK, CLIENT_VERSION);
+            value.write(it->value().data(), it->value().size());
+            CBlockDAGData data;
+            value >> data;
+            SHA256_Update(&ctx, pairKey.second.begin(), 32);
+            uint32_t count = (uint32_t)data.vDAGParents.size();
+            SHA256_Update(&ctx, &count, 4);
+            for (size_t i = 0; i < data.vDAGParents.size(); ++i)
+                SHA256_Update(&ctx, data.vDAGParents[i].begin(), 32);
+        }
+        catch (...) { delete it; delete db; return false; }
+        it->Next();
+    }
+    st = it->status();
+    delete it; delete db;
+    if (!st.ok()) return false;
+    SHA256_Final(out, &ctx);
+    return true;
+}
 
 // Build an AUTHORITATIVE chain (real blk data) with a configurable number of
 // blocks, and open a bootstrap on it. Returns handles.
@@ -164,6 +208,13 @@ struct DagFixture
         }
         src.hashBestChain = blocks[heights].hash;
         src.foundBestChain = true;
+        for (int h = 0; h <= heights; ++h)
+            src.dagLinks[blocks[h].hash] = std::vector<uint256>();
+        if (heights >= 3)
+        {
+            src.dagLinks[blocks[3].hash].push_back(blocks[1].hash);
+            src.dagLinks[blocks[3].hash].push_back(blocks[2].hash);
+        }
         src.blockDataDir = blockDir.string();
 
         boost::filesystem::path staging = root / "build-000001.tmp";
@@ -195,6 +246,23 @@ struct DagFixture
         d.nDAGScore = score;
         bool ok = WriteDagLinksEntry(dagDbDir.string(), blocks[idx].hash, d);
         BOOST_REQUIRE_MESSAGE(ok, "failed to seed daglinks for block " << idx);
+    }
+
+    void SeedR1DagData()
+    {
+        for (int h = 0; h <= heights; ++h)
+        {
+            CBlockDAGData d;
+            if (h == 3)
+            {
+                d.vDAGParents.push_back(blocks[1].hash);
+                d.vDAGParents.push_back(blocks[2].hash);
+            }
+            d.fBlue = true;
+            d.nDAGScore = uint256((uint64_t)(100 + h));
+            bool ok = WriteDagLinksEntry(dagDbDir.string(), blocks[h].hash, d);
+            BOOST_REQUIRE_MESSAGE(ok, "failed to seed R1a daglinks for block " << h);
+        }
     }
 };
 
@@ -286,8 +354,108 @@ BOOST_AUTO_TEST_CASE(j13_corrupt_missing_fails_closed)
     BOOST_CHECK_MESSAGE(!r, "missing daglinks dir must fail closed");
 }
 
-// I0/I1/I2 reuse - genesis anchor on bootstrap (J0-J2 are in bootstrap suite;
-// here we spot-check genesis is anchored and evict-blocked).
+BOOST_AUTO_TEST_CASE(r1a_external_sort_digest_parity_and_bounds)
+{
+    uint256 small(1), larger(256);
+    CDataStream smallKey(SER_DISK, CLIENT_VERSION), largeKey(SER_DISK, CLIENT_VERSION);
+    smallKey << make_pair(std::string("daglinks"), small);
+    largeKey << make_pair(std::string("daglinks"), larger);
+    BOOST_CHECK(small < larger);
+    BOOST_CHECK(smallKey.str() > largeKey.str()); // serialized-key order differs
+
+    DagFixture fx(12);
+    fx.SeedR1DagData();
+    std::string error;
+    V2BlockIndexStartupAuthority auth;
+    BOOST_REQUIRE(auth.Open(fx.root.string(), &error) == BLOCK_INDEX_STARTUP_OK);
+    unsigned char expected[32];
+    BOOST_REQUIRE(auth.ReaderPtr()->GetDAGInputDigest(expected, &error));
+    unsigned char direct[32];
+    BOOST_REQUIRE(ComputeDirectDagDigest(fx.dagDbDir.string(), direct));
+    BOOST_CHECK(memcmp(expected, direct, 32) != 0);
+
+    DagSourceBindingVerifierOptions options;
+    options.chunkBytes = 128;
+    options.maxRecordsPerChunk = 1;
+    options.maxOpenRuns = 2;
+    options.tempParent = (fx.root / "r1a-temp").string();
+    DagSourceBindingResult result = DagSourceBindingVerifier::Verify(
+        fx.dagDbDir.string(), expected, options);
+    BOOST_REQUIRE_MESSAGE(result.status == DAG_SOURCE_BINDING_VERIFIED, result.error);
+    BOOST_CHECK_EQUAL(result.recordsProcessed, (uint64_t)13);
+    BOOST_CHECK(result.runCount >= 13);
+    BOOST_CHECK(result.mergePasses >= 1);
+    BOOST_CHECK(result.maxOpenRunsObserved <= 2U);
+    BOOST_CHECK(result.peakChunkRecords <= 1U);
+    BOOST_CHECK(result.temporaryBytesWritten > 0U);
+    BOOST_TEST_MESSAGE("R1a metrics records=" << result.recordsProcessed
+                       << " bytes=" << result.bytesProcessed
+                       << " temp_bytes=" << result.temporaryBytesWritten
+                       << " peak_chunk_bytes=" << result.peakChunkBytes
+                       << " peak_chunk_records=" << result.peakChunkRecords
+                       << " runs=" << result.runCount
+                       << " merge_passes=" << result.mergePasses
+                       << " max_open_runs=" << result.maxOpenRunsObserved);
+    for (int h = 0; h <= fx.heights; ++h)
+        BOOST_CHECK(mapBlockIndex.find(fx.blocks[h].hash) == mapBlockIndex.end());
+}
+
+BOOST_AUTO_TEST_CASE(r1a_empty_corrupt_missing_and_mismatch_failures)
+{
+    boost::filesystem::path root = boost::filesystem::temp_directory_path() /
+        boost::filesystem::unique_path("innova-blockindex-r1a-empty-%%%%-%%%%");
+    boost::filesystem::path empty = root / "empty";
+    boost::filesystem::create_directories(empty);
+    leveldb::Options create;
+    create.create_if_missing = true;
+    leveldb::DB* emptyDb = NULL;
+    BOOST_REQUIRE(leveldb::DB::Open(create, empty.string(), &emptyDb).ok());
+    delete emptyDb;
+    unsigned char emptyDigest[32];
+    SHA256_CTX emptyCtx;
+    SHA256_Init(&emptyCtx);
+    SHA256_Final(emptyDigest, &emptyCtx);
+    DagSourceBindingVerifierOptions options;
+    options.tempParent = (root / "tmp").string();
+    DagSourceBindingResult emptyResult = DagSourceBindingVerifier::Verify(
+        empty.string(), emptyDigest, options);
+    BOOST_CHECK_EQUAL((int)emptyResult.status, (int)DAG_SOURCE_BINDING_VERIFIED);
+
+    DagFixture fx(3);
+    fx.SeedR1DagData();
+    std::string error;
+    V2BlockIndexStartupAuthority auth;
+    BOOST_REQUIRE(auth.Open(fx.root.string(), &error) == BLOCK_INDEX_STARTUP_OK);
+    unsigned char expected[32];
+    BOOST_REQUIRE(auth.ReaderPtr()->GetDAGInputDigest(expected, &error));
+    options.tempParent = (fx.root / "tmp2").string();
+    unsigned char wrong[32];
+    memset(wrong, 0, sizeof(wrong));
+    DagSourceBindingResult mismatch = DagSourceBindingVerifier::Verify(
+        fx.dagDbDir.string(), wrong, options);
+    BOOST_CHECK_EQUAL((int)mismatch.status, (int)DAG_SOURCE_BINDING_DIGEST_MISMATCH);
+
+    DagSourceBindingResult missing = DagSourceBindingVerifier::Verify(
+        (fx.root / "missing").string(), expected, options);
+    BOOST_CHECK_EQUAL((int)missing.status, (int)DAG_SOURCE_BINDING_SOURCE_UNAVAILABLE);
+
+    boost::filesystem::path corrupt = fx.root / "corrupt";
+    boost::filesystem::create_directories(corrupt);
+    leveldb::DB* corruptDb = NULL;
+    BOOST_REQUIRE(leveldb::DB::Open(create, corrupt.string(), &corruptDb).ok());
+    CDataStream badKey(SER_DISK, CLIENT_VERSION);
+    badKey << make_pair(std::string("daglinks"), fx.blocks[0].hash);
+    BOOST_REQUIRE(corruptDb->Put(leveldb::WriteOptions(), badKey.str(), "corrupt").ok());
+    delete corruptDb;
+    DagSourceBindingResult corruptResult = DagSourceBindingVerifier::Verify(
+        corrupt.string(), expected, options);
+    BOOST_CHECK_EQUAL((int)corruptResult.status, (int)DAG_SOURCE_BINDING_DECODE_FAILURE);
+
+    boost::system::error_code ec;
+    boost::filesystem::remove_all(root, ec);
+}
+
+
 BOOST_AUTO_TEST_CASE(j_genesis_anchor_sanity)
 {
     DagFixture fx(3);

@@ -89,6 +89,15 @@ uint64_t BlockIndexV2Reader::Generation() const { LOCK(cs); return generation; }
 uint64_t BlockIndexV2Reader::RecordCount() const { LOCK(cs); return open ? manifest.recordCount : 0; }
 std::string BlockIndexV2Reader::GenerationPath() const { LOCK(cs); return generationPath; }
 BlockIndexV2ReaderCacheStats BlockIndexV2Reader::CacheStats() const { LOCK(cs); return stats; }
+bool BlockIndexV2Reader::GetDAGInputDigest(unsigned char out[32], std::string* error) const
+{
+    if (!out) return Fail(error, "null DAG input digest output");
+    LOCK(cs);
+    if (!open) return Fail(error, "reader is not open");
+    memcpy(out, manifest.dagInputDigest, 32);
+    Clear(error);
+    return true;
+}
 
 BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const BlockIndexRecord& r, bool inActive) const {
     BlockIndexSnapshot s; s.found=true; s.id=id; s.hash=r.hash; s.hashPrev=r.hashPrev; s.hashMerkleRoot=r.hashMerkleRoot; s.height=r.height; s.nFile=r.nFile; s.nBlockPos=r.nBlockPos; s.nFlags=r.nFlags; s.nVersion=r.nVersion; s.nTime=r.nTime; s.nBits=r.nBits; s.nNonce=r.nNonce; s.nMint=r.nMint; s.nMoneySupply=r.nMoneySupply; s.nStakeModifier=r.nStakeModifier; s.prevoutStake=r.prevoutStake; s.nStakeTime=r.nStakeTime; s.hashProof=r.hashProof; s.fProofOfStake=(r.prevoutStake.hash != uint256(0)); s.fInMainChain=inActive; s.hasParent=(r.hashPrev != uint256(0));

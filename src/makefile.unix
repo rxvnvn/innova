@@ -415,6 +415,7 @@ OBJS= \
     obj/blockindex_startup_seam.o \
     obj/blockindex_startup_bootstrap.o \
     obj/blockindex_dag_restart_seam.o \
+    obj/dag_source_binding_verifier.o \
     obj/blockindex_derived_state.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
@@ -535,6 +536,7 @@ OBJS= \
     obj/blockindex_startup_seam.o \
     obj/blockindex_startup_bootstrap.o \
     obj/blockindex_dag_restart_seam.o \
+    obj/dag_source_binding_verifier.o \
     obj/blockindex_derived_state.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \

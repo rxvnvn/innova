@@ -63,6 +63,7 @@ public:
     BlockIndexSnapshot GetTip() const;
     bool CurrentSelectionChanged(std::string* error) const;
     BlockIndexV2ReaderCacheStats CacheStats() const;
+    bool GetDAGInputDigest(unsigned char out[32], std::string* error) const;
     BlockIndexV2ReadStatus GetRecordById(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus LookupByHash(const uint256& hash, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetActiveByHeight(int height, BlockIndexSnapshot* out, std::string* error) const;
