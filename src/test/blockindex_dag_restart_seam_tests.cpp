@@ -8,6 +8,7 @@
 
 #include "../blockindex_dag_restart_seam.h"
 #include "../dag_source_binding_verifier.h"
+#include "../dag_logical_authority.h"
 #include "../blockindex_startup_bootstrap.h"
 #include "../blockindex_startup_authority.h"
 #include "../blockindex_startup_seam.h"
@@ -166,6 +167,8 @@ struct DagFixture
     boost::filesystem::path blockDir;
     boost::filesystem::path dagDbDir;
     std::vector<SyntheticBlockInfo> blocks;
+    SyntheticBlockInfo side;
+    uint256 danglingDagHash;
     int heights;
 
     explicit DagFixture(int n)
@@ -188,6 +191,9 @@ struct DagFixture
             prev = bi.hash;
         }
 
+        side = WriteSyntheticBlock(blockDir, blocks[0].hash, 2000, 0x1d00ffffU, 9001);
+        danglingDagHash = uint256((uint64_t)0xdeadbeef);
+
         BlockIndexGenerationSource src;
         for (int h = 0; h <= heights; ++h)
         {
@@ -206,14 +212,37 @@ struct DagFixture
             sr.record = rec;
             src.records.push_back(sr);
         }
+        {
+            BlockIndexRecord rec;
+            rec.hash = side.hash;
+            rec.hashPrev = blocks[0].hash;
+            rec.height = 1;
+            rec.nVersion = 1;
+            rec.nTime = 2000;
+            rec.nBits = 0x1d00ffffU;
+            rec.nNonce = 9001;
+            rec.nFile = side.nFile;
+            rec.nBlockPos = side.nBlockPos;
+            BlockIndexGenerationSourceRecord sr;
+            sr.hash = rec.hash;
+            sr.record = rec;
+            src.records.push_back(sr);
+        }
         src.hashBestChain = blocks[heights].hash;
         src.foundBestChain = true;
         for (int h = 0; h <= heights; ++h)
             src.dagLinks[blocks[h].hash] = std::vector<uint256>();
+        src.dagLinks[side.hash] = std::vector<uint256>();
+        src.dagLinks[danglingDagHash] = std::vector<uint256>();
         if (heights >= 3)
         {
             src.dagLinks[blocks[3].hash].push_back(blocks[1].hash);
             src.dagLinks[blocks[3].hash].push_back(blocks[2].hash);
+        }
+        if (heights >= 4)
+        {
+            src.dagLinks[blocks[4].hash].push_back(blocks[2].hash);
+            src.dagLinks[blocks[4].hash].push_back(blocks[3].hash);
         }
         src.blockDataDir = blockDir.string();
 
@@ -258,10 +287,29 @@ struct DagFixture
                 d.vDAGParents.push_back(blocks[1].hash);
                 d.vDAGParents.push_back(blocks[2].hash);
             }
+            else if (h == 4)
+            {
+                d.vDAGParents.push_back(blocks[2].hash);
+                d.vDAGParents.push_back(blocks[3].hash);
+            }
             d.fBlue = true;
-            d.nDAGScore = uint256((uint64_t)(100 + h));
+            d.nDAGScore = (h == 1 || h == 2) ? uint256((uint64_t)101) : uint256((uint64_t)(100 + h));
             bool ok = WriteDagLinksEntry(dagDbDir.string(), blocks[h].hash, d);
             BOOST_REQUIRE_MESSAGE(ok, "failed to seed R1a daglinks for block " << h);
+        }
+        {
+            CBlockDAGData sideData;
+            sideData.fBlue = true;
+            sideData.nDAGScore = uint256((uint64_t)199);
+            bool ok = WriteDagLinksEntry(dagDbDir.string(), side.hash, sideData);
+            BOOST_REQUIRE_MESSAGE(ok, "failed to seed R1a side daglinks");
+        }
+        {
+            CBlockDAGData dangling;
+            dangling.fBlue = true;
+            dangling.nDAGScore = uint256((uint64_t)31337);
+            bool ok = WriteDagLinksEntry(dagDbDir.string(), danglingDagHash, dangling);
+            BOOST_REQUIRE_MESSAGE(ok, "failed to seed R1a dangling daglinks");
         }
     }
 };
@@ -382,8 +430,8 @@ BOOST_AUTO_TEST_CASE(r1a_external_sort_digest_parity_and_bounds)
     DagSourceBindingResult result = DagSourceBindingVerifier::Verify(
         fx.dagDbDir.string(), expected, options);
     BOOST_REQUIRE_MESSAGE(result.status == DAG_SOURCE_BINDING_VERIFIED, result.error);
-    BOOST_CHECK_EQUAL(result.recordsProcessed, (uint64_t)13);
-    BOOST_CHECK(result.runCount >= 13);
+    BOOST_CHECK_EQUAL(result.recordsProcessed, (uint64_t)15);
+    BOOST_CHECK(result.runCount >= 15);
     BOOST_CHECK(result.mergePasses >= 1);
     BOOST_CHECK(result.maxOpenRunsObserved <= 2U);
     BOOST_CHECK(result.peakChunkRecords <= 1U);
@@ -455,6 +503,159 @@ BOOST_AUTO_TEST_CASE(r1a_empty_corrupt_missing_and_mismatch_failures)
     boost::filesystem::remove_all(root, ec);
 }
 
+
+BOOST_AUTO_TEST_CASE(r1_dag_logical_authority_by_value_parity_and_side_branch)
+{
+    DagFixture fx(6);
+    fx.SeedR1DagData();
+    std::string error;
+    V2BlockIndexStartupAuthority startup;
+    BOOST_REQUIRE(startup.Open(fx.root.string(), &error) == BLOCK_INDEX_STARTUP_OK);
+
+    DagLogicalAuthority authority;
+    BOOST_REQUIRE_MESSAGE(authority.Open(fx.dagDbDir.string(), *startup.ReaderPtr(), 2,
+                                           (fx.root / "authority-temp").string(), &error), error);
+
+    DagLogicalRecord dag3;
+    BOOST_REQUIRE_EQUAL((int)authority.LookupDAG(fx.blocks[3].hash, &dag3, &error),
+                        (int)DAG_LOGICAL_AUTHORITY_FOUND);
+    BOOST_REQUIRE_EQUAL(dag3.data.vDAGParents.size(), (size_t)2);
+
+    uint256 score;
+    BOOST_REQUIRE_EQUAL((int)authority.GetDAGScore(fx.blocks[1].hash, &score, &error),
+                        (int)DAG_LOGICAL_AUTHORITY_FOUND);
+    BOOST_CHECK(score == uint256((uint64_t)101));
+    BOOST_REQUIRE_EQUAL((int)authority.GetDAGScore(fx.blocks[4].hash, &score, &error),
+                        (int)DAG_LOGICAL_AUTHORITY_FOUND);
+    BOOST_CHECK(score == uint256((uint64_t)104));
+
+    uint256 selected;
+    BOOST_REQUIRE_EQUAL((int)authority.GetSelectedParent(fx.blocks[3].hash, &selected, &error),
+                        (int)DAG_LOGICAL_AUTHORITY_FOUND);
+    uint256 expectedTie = (fx.blocks[1].hash < fx.blocks[2].hash) ? fx.blocks[1].hash : fx.blocks[2].hash;
+    BOOST_CHECK(selected == expectedTie);
+    BOOST_REQUIRE_EQUAL((int)authority.GetSelectedParent(fx.blocks[4].hash, &selected, &error),
+                        (int)DAG_LOGICAL_AUTHORITY_FOUND);
+    BOOST_CHECK(selected == fx.blocks[3].hash);
+
+    BlockIndexSnapshot active;
+    BOOST_REQUIRE_EQUAL((int)authority.LookupBlock(fx.blocks[3].hash, &active, true, &error),
+                        (int)DAG_LOGICAL_AUTHORITY_FOUND);
+    BOOST_CHECK(active.fInMainChain);
+    BlockIndexSnapshot side;
+    BOOST_CHECK_EQUAL((int)authority.LookupBlock(fx.side.hash, &side, true, &error),
+                      (int)DAG_LOGICAL_AUTHORITY_NOT_ACTIVE);
+    BOOST_CHECK_EQUAL((int)authority.LookupBlock(fx.side.hash, &side, false, &error),
+                      (int)DAG_LOGICAL_AUTHORITY_FOUND);
+    BOOST_CHECK(!side.fInMainChain);
+
+    // Isolated legacy oracle: same persisted logical records through CDAGManager's
+    // test-only insertion surface; production R1 authority never calls this path.
+    CDAGManager legacy;
+    CBlockDAGData p1, p2, p3, p4;
+    p1.nDAGScore = uint256((uint64_t)101);
+    p2.nDAGScore = uint256((uint64_t)101);
+    p3.nDAGScore = uint256((uint64_t)103);
+    p4.nDAGScore = uint256((uint64_t)104);
+    p3.vDAGParents.push_back(fx.blocks[1].hash);
+    p3.vDAGParents.push_back(fx.blocks[2].hash);
+    p4.vDAGParents.push_back(fx.blocks[2].hash);
+    p4.vDAGParents.push_back(fx.blocks[3].hash);
+    legacy.SetDAGDataForTest(fx.blocks[1].hash, p1);
+    legacy.SetDAGDataForTest(fx.blocks[2].hash, p2);
+    legacy.SetDAGDataForTest(fx.blocks[3].hash, p3);
+    legacy.SetDAGDataForTest(fx.blocks[4].hash, p4);
+    BOOST_CHECK(legacy.GetSelectedParent(fx.blocks[3].hash) == expectedTie);
+    BOOST_CHECK(legacy.GetSelectedParent(fx.blocks[4].hash) == fx.blocks[3].hash);
+    legacy.ClearDAGDataForTest();
+
+    DagLogicalRecord missing;
+    BOOST_CHECK_EQUAL((int)authority.LookupDAG(uint256((uint64_t)0x123456), &missing, &error),
+                      (int)DAG_LOGICAL_AUTHORITY_NOT_FOUND);
+    BOOST_CHECK_EQUAL((int)authority.GetDAGScore(uint256((uint64_t)0x123456), &score, &error),
+                      (int)DAG_LOGICAL_AUTHORITY_NOT_FOUND);
+    BOOST_CHECK_EQUAL((int)authority.GetDAGScore(fx.danglingDagHash, &score, &error),
+                      (int)DAG_LOGICAL_AUTHORITY_FAILURE);
+
+    for (int h = 0; h <= fx.heights; ++h)
+    {
+        BOOST_CHECK(mapBlockIndex.find(fx.blocks[h].hash) == mapBlockIndex.end());
+        DagLogicalRecord record;
+        BOOST_CHECK_EQUAL((int)authority.LookupDAG(fx.blocks[h].hash, &record, &error),
+                          (int)DAG_LOGICAL_AUTHORITY_FOUND);
+    }
+    BOOST_CHECK(mapBlockIndex.find(fx.side.hash) == mapBlockIndex.end());
+    DagLogicalAuthorityStats stats = authority.CacheStats();
+    BOOST_CHECK_EQUAL(stats.capacity, (size_t)2);
+    BOOST_CHECK(stats.current <= stats.capacity);
+    BOOST_CHECK(stats.peak <= stats.capacity);
+}
+
+BOOST_AUTO_TEST_CASE(r1_dag_logical_authority_generation_change_fails_closed)
+{
+    DagFixture fx(4);
+    fx.SeedR1DagData();
+    std::string error;
+    V2BlockIndexStartupAuthority startup;
+    BOOST_REQUIRE(startup.Open(fx.root.string(), &error) == BLOCK_INDEX_STARTUP_OK);
+    DagLogicalAuthority authority;
+    BOOST_REQUIRE(authority.Open(fx.dagDbDir.string(), *startup.ReaderPtr(), 2,
+                                  (fx.root / "generation-temp").string(), &error));
+    const_cast<BlockIndexV2Reader*>(startup.ReaderPtr())->Close();
+    DagLogicalRecord record;
+    BOOST_CHECK_EQUAL((int)authority.LookupDAG(fx.blocks[1].hash, &record, &error),
+                      (int)DAG_LOGICAL_AUTHORITY_FAILURE);
+}
+
+BOOST_AUTO_TEST_CASE(r1_dag_logical_authority_cache_bound_scales)
+{
+    const int sizes[] = {3, 12};
+    for (size_t i = 0; i < sizeof(sizes) / sizeof(sizes[0]); ++i)
+    {
+        DagFixture fx(sizes[i]);
+        fx.SeedR1DagData();
+        std::string error;
+        V2BlockIndexStartupAuthority startup;
+        BOOST_REQUIRE(startup.Open(fx.root.string(), &error) == BLOCK_INDEX_STARTUP_OK);
+        DagLogicalAuthority authority;
+        BOOST_REQUIRE_MESSAGE(authority.Open(fx.dagDbDir.string(), *startup.ReaderPtr(), 2,
+                                               (fx.root / "cache-temp").string(), &error), error);
+        for (int h = 0; h <= fx.heights; ++h)
+        {
+            DagLogicalRecord record;
+            BOOST_REQUIRE_EQUAL((int)authority.LookupDAG(fx.blocks[h].hash, &record, &error),
+                                (int)DAG_LOGICAL_AUTHORITY_FOUND);
+        }
+        DagLogicalRecord sideRecord;
+        BOOST_REQUIRE_EQUAL((int)authority.LookupDAG(fx.side.hash, &sideRecord, &error),
+                            (int)DAG_LOGICAL_AUTHORITY_FOUND);
+        DagLogicalAuthorityStats stats = authority.CacheStats();
+        BOOST_CHECK_EQUAL(stats.capacity, (size_t)2);
+        BOOST_CHECK(stats.current <= 2U);
+        BOOST_CHECK(stats.peak <= 2U);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(r1_dag_logical_authority_binding_fail_closed)
+{
+    DagFixture fx(4);
+    fx.SeedR1DagData();
+    std::string error;
+    V2BlockIndexStartupAuthority startup;
+    BOOST_REQUIRE(startup.Open(fx.root.string(), &error) == BLOCK_INDEX_STARTUP_OK);
+    unsigned char wrong[32];
+    memset(wrong, 0, sizeof(wrong));
+    DagSourceBindingVerifierOptions bindingOptions;
+    bindingOptions.tempParent = (fx.root / "binding-temp").string();
+    DagSourceBindingResult bad = DagSourceBindingVerifier::Verify(
+        fx.dagDbDir.string(), wrong, bindingOptions);
+    BOOST_CHECK_EQUAL((int)bad.status, (int)DAG_SOURCE_BINDING_DIGEST_MISMATCH);
+
+    DagLogicalAuthority authority;
+    BOOST_CHECK(!authority.Open((fx.root / "missing-daglinks").string(), *startup.ReaderPtr(),
+                                2, (fx.root / "authority-temp").string(), &error));
+    BOOST_CHECK(!authority.IsOpen());
+}
 
 BOOST_AUTO_TEST_CASE(j_genesis_anchor_sanity)
 {
