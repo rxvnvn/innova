@@ -417,6 +417,8 @@ OBJS= \
     obj/blockindex_dag_restart_seam.o \
     obj/dag_source_binding_verifier.o \
     obj/dag_logical_authority.o \
+    obj/dag_tip_frontier.o \
+    obj/dag_tip_live_overlay.o \
     obj/blockindex_derived_state.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
@@ -539,6 +541,8 @@ OBJS= \
     obj/blockindex_dag_restart_seam.o \
     obj/dag_source_binding_verifier.o \
     obj/dag_logical_authority.o \
+    obj/dag_tip_frontier.o \
+    obj/dag_tip_live_overlay.o \
     obj/blockindex_derived_state.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
@@ -607,6 +611,7 @@ TEST_OBJS= \
     obj/test/blockindex_shadow_startup_tests.o \
     obj/test/blockindex_v2_reader_tests.o \
     obj/test/dag_trust_restart_tests.o \
+    obj/test/dag_tip_frontier_tests.o \
     obj/test/candidate_frontier_tests.o \
     obj/test/blockindex_candidate_startup_builder_tests.o \
     obj/test/blockindex_stake_seen_builder_tests.o \
