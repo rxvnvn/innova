@@ -42,10 +42,17 @@
 namespace fs = boost::filesystem;
 
 static std::vector<AcceptBlockDAGObserverEvent>* g_acceptBlockDAGEvents = NULL;
+static std::vector<ConnectBlockDAGSiblingObserverEvent>* g_connectBlockDAGSiblingEvents = NULL;
 static void CollectAcceptBlockDAGEvent(const AcceptBlockDAGObserverEvent& event)
 {
     if (g_acceptBlockDAGEvents)
         g_acceptBlockDAGEvents->push_back(event);
+}
+static void CollectConnectBlockDAGSiblingEvent(
+    const ConnectBlockDAGSiblingObserverEvent& event)
+{
+    if (g_connectBlockDAGSiblingEvents)
+        g_connectBlockDAGSiblingEvents->push_back(event);
 }
 
 CWallet* pwalletMain;
@@ -278,6 +285,80 @@ static bool HasFoundMetadata(const DirectSeamResult& result,
             return true;
     }
     return false;
+}
+
+struct ConnectSiblingResult
+{
+    bool ok;
+    int nDoS;
+    std::vector<ConnectBlockDAGSiblingObserverEvent> events;
+    ConnectSiblingResult() : ok(false), nDoS(0) {}
+};
+
+static ConnectSiblingResult RunConnectSiblingRule(
+    CBlock* block, CBlockIndex* index,
+    bool authoritative, BlockIndexAuthoritativeLive* live)
+{
+    ConnectSiblingResult result;
+    const bool savedAuth = ::g_fAuthoritativeStartup;
+    ::g_fAuthoritativeStartup = authoritative;
+    g_connectBlockDAGSiblingEvents = authoritative ? &result.events : NULL;
+    if (authoritative) SetAuthoritativeLiveForTesting(live);
+    {
+        ScopedConnectBlockDAGSiblingObserver observer(
+            authoritative ? &CollectConnectBlockDAGSiblingEvent : NULL);
+        LOCK(cs_main);
+        CTxDB txdb;
+        result.ok = block->ConnectBlock(txdb, index, true);
+        result.nDoS = block->nDoS;
+    }
+    if (authoritative) ClearAuthoritativeLiveForTesting();
+    g_connectBlockDAGSiblingEvents = NULL;
+    ::g_fAuthoritativeStartup = savedAuth;
+    return result;
+}
+
+static bool HasConnectSiblingEvent(
+    const ConnectSiblingResult& result,
+    ConnectBlockDAGSiblingObserverEventType type)
+{
+    for (size_t i = 0; i < result.events.size(); ++i)
+        if (result.events[i].type == type) return true;
+    return false;
+}
+
+static bool HasConnectSiblingFound(
+    const ConnectSiblingResult& result, const uint256& hash,
+    unsigned int nFile, unsigned int nBlockPos, bool active)
+{
+    for (size_t i = 0; i < result.events.size(); ++i)
+    {
+        const ConnectBlockDAGSiblingObserverEvent& event = result.events[i];
+        if (event.type == CONNECTBLOCK_DAG_SIBLING_AUTH_FOUND &&
+            event.hash == hash && event.nFile == nFile &&
+            event.nBlockPos == nBlockPos && event.active == active)
+            return true;
+    }
+    return false;
+}
+
+static void ConfigureConnectSiblingDAG(const uint256& currentHash,
+                                       const uint256& siblingHash,
+                                       unsigned int tag)
+{
+    g_dagManager.ClearDAGDataForTest();
+    const uint256 parentHash(0xDAB00000UL + tag);
+    CBlockDAGData current;
+    current.vDAGParents.push_back(parentHash);
+    current.nDAGOrder = 2;
+    CBlockDAGData parent;
+    parent.vDAGChildren.push_back(currentHash);
+    parent.vDAGChildren.push_back(siblingHash);
+    CBlockDAGData sibling;
+    sibling.nDAGOrder = 1;
+    g_dagManager.SetDAGDataForTest(currentHash, current);
+    g_dagManager.SetDAGDataForTest(parentHash, parent);
+    g_dagManager.SetDAGDataForTest(siblingHash, sibling);
 }
 
 static BlockIndexRecord BuildRealPosSideRecord(const uint256& parentHash,
@@ -651,6 +732,183 @@ BOOST_AUTO_TEST_CASE(boundary_genuine_s1_complete_connectblock)
     const int hor = 2; // deliberately small live-tail horizon
     BlockIndexAuthoritativeLive live;
     BOOST_REQUIRE_MESSAGE(live.Open(root.string(), &reader, hor, &error), error);
+
+    // R2b byte parity before removing the legacy sibling index entry.
+    chain[S - 2]->phashBlock = &coldMergeHash;
+    BlockIndexAuthoritativeParentInfo coldSiblingInfo;
+    BOOST_REQUIRE(live.ResolveParentInfo(coldMergeHash, &coldSiblingInfo, &error) ==
+                  BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND);
+    CBlock legacySiblingBytes;
+    CBlock authoritativeSiblingBytes;
+    BOOST_REQUIRE(legacySiblingBytes.ReadFromDisk(chain[S - 2]));
+    BOOST_REQUIRE(authoritativeSiblingBytes.ReadFromDisk(
+        coldSiblingInfo.nFile, coldSiblingInfo.nBlockPos, true));
+    BOOST_CHECK(legacySiblingBytes.GetHash() == coldMergeHash);
+    BOOST_CHECK(authoritativeSiblingBytes.GetHash() == coldMergeHash);
+    CDataStream legacySiblingStream(SER_DISK, CLIENT_VERSION);
+    CDataStream authoritativeSiblingStream(SER_DISK, CLIENT_VERSION);
+    legacySiblingStream << legacySiblingBytes;
+    authoritativeSiblingStream << authoritativeSiblingBytes;
+    BOOST_CHECK(legacySiblingStream.str() == authoritativeSiblingStream.str());
+
+    mapBlockIndex.erase(coldMergeHash);
+    chain[S - 2]->phashBlock = &coldMergeHash;
+    BOOST_REQUIRE(mapBlockIndex.count(coldMergeHash) == 0);
+
+    std::vector<uint256> connectParents;
+    connectParents.push_back(sHash);
+    connectParents.push_back(coldMergeHash);
+
+    CBlock* coldConnectBlock = BuildRealBlock(
+        pS, 0x3401, &sHash, &connectParents);
+    BOOST_REQUIRE(coldConnectBlock != NULL);
+    uint256 coldConnectHash = coldConnectBlock->GetHash();
+    CBlockIndex coldConnectIndex(1, 1, *coldConnectBlock);
+    coldConnectIndex.pprev = pS;
+    coldConnectIndex.nHeight = S + 1;
+    coldConnectIndex.phashBlock = &coldConnectHash;
+    ConfigureConnectSiblingDAG(coldConnectHash, coldMergeHash, 1);
+    const ConnectSiblingResult coldConnect = RunConnectSiblingRule(
+        coldConnectBlock, &coldConnectIndex, true, &live);
+    BOOST_CHECK(HasConnectSiblingEvent(coldConnect,
+                                       CONNECTBLOCK_DAG_SIBLING_ENTERED));
+    BOOST_CHECK(HasConnectSiblingFound(coldConnect, coldMergeHash,
+                                       coldSiblingInfo.nFile,
+                                       coldSiblingInfo.nBlockPos, true));
+    BOOST_CHECK(HasConnectSiblingEvent(
+        coldConnect, CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FOUND));
+    BOOST_CHECK(HasConnectSiblingEvent(coldConnect,
+                                       CONNECTBLOCK_DAG_SIBLING_RULE_PASSED));
+    BOOST_CHECK_EQUAL(coldConnect.nDoS, 0);
+    BOOST_CHECK(mapBlockIndex.count(coldMergeHash) == 0);
+    delete coldConnectBlock;
+
+    const uint256 hotSidePrevHash = *chain[S - 3]->phashBlock;
+    CBlock* hotSideBlock = BuildRealBlock(chain[S - 3], 0x3402,
+                                           &hotSidePrevHash, NULL);
+    BOOST_REQUIRE(hotSideBlock != NULL);
+    unsigned int hotSideFile = 0;
+    unsigned int hotSidePos = 0;
+    BOOST_REQUIRE(hotSideBlock->WriteToDisk(hotSideFile, hotSidePos));
+    const uint256 hotConnectSiblingHash = hotSideBlock->GetHash();
+    CBlockIndex hotSideIndex(hotSideFile, hotSidePos, *hotSideBlock);
+    hotSideIndex.nHeight = S - 2;
+    BlockIndexRecord hotConnectSiblingRecord = CBlockIndexToRecord(
+        &hotSideIndex, hotConnectSiblingHash);
+    hotConnectSiblingRecord.hashPrev = hotSidePrevHash;
+    BlockIndexDerivedEntry hotConnectSiblingDerived;
+    hotConnectSiblingDerived.chainTrust = uint256(0x3402UL);
+    BOOST_REQUIRE_MESSAGE(live.AcceptSide(hotConnectSiblingRecord,
+                                          hotConnectSiblingDerived, &error), error);
+    BOOST_REQUIRE(mapBlockIndex.count(hotConnectSiblingHash) == 0);
+
+    CBlock* hotConnectBlock = BuildRealBlock(
+        pS, 0x3403, &sHash, &connectParents);
+    BOOST_REQUIRE(hotConnectBlock != NULL);
+    uint256 hotConnectHash = hotConnectBlock->GetHash();
+    CBlockIndex hotConnectIndex(1, 1, *hotConnectBlock);
+    hotConnectIndex.pprev = pS;
+    hotConnectIndex.nHeight = S + 1;
+    hotConnectIndex.phashBlock = &hotConnectHash;
+    ConfigureConnectSiblingDAG(hotConnectHash, hotConnectSiblingHash, 2);
+    const ConnectSiblingResult hotConnect = RunConnectSiblingRule(
+        hotConnectBlock, &hotConnectIndex, true, &live);
+    BOOST_CHECK(HasConnectSiblingEvent(hotConnect,
+                                       CONNECTBLOCK_DAG_SIBLING_ENTERED));
+    BOOST_CHECK(HasConnectSiblingFound(hotConnect, hotConnectSiblingHash,
+                                       hotSideFile, hotSidePos, false));
+    BOOST_CHECK(HasConnectSiblingEvent(
+        hotConnect, CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FOUND));
+    BOOST_CHECK(HasConnectSiblingEvent(hotConnect,
+                                       CONNECTBLOCK_DAG_SIBLING_RULE_PASSED));
+    BOOST_CHECK_EQUAL(hotConnect.nDoS, 0);
+    delete hotConnectBlock;
+    delete hotSideBlock;
+
+    const uint256 unknownConnectSibling(0xBAD20001UL);
+    CBlock* unknownConnectBlock = BuildRealBlock(
+        pS, 0x3404, &sHash, &connectParents);
+    BOOST_REQUIRE(unknownConnectBlock != NULL);
+    uint256 unknownConnectHash = unknownConnectBlock->GetHash();
+    CBlockIndex unknownConnectIndex(1, 1, *unknownConnectBlock);
+    unknownConnectIndex.pprev = pS;
+    unknownConnectIndex.nHeight = S + 1;
+    unknownConnectIndex.phashBlock = &unknownConnectHash;
+    ConfigureConnectSiblingDAG(unknownConnectHash, unknownConnectSibling, 3);
+    const ConnectSiblingResult unknownConnectAuth = RunConnectSiblingRule(
+        unknownConnectBlock, &unknownConnectIndex, true, &live);
+    const ConnectSiblingResult unknownConnectLegacy = RunConnectSiblingRule(
+        unknownConnectBlock, &unknownConnectIndex, false, NULL);
+    BOOST_CHECK(HasConnectSiblingEvent(
+        unknownConnectAuth, CONNECTBLOCK_DAG_SIBLING_AUTH_NOT_FOUND));
+    BOOST_CHECK(HasConnectSiblingEvent(
+        unknownConnectAuth, CONNECTBLOCK_DAG_SIBLING_RULE_PASSED));
+    BOOST_CHECK_EQUAL(unknownConnectAuth.ok, unknownConnectLegacy.ok);
+    BOOST_CHECK_EQUAL(unknownConnectAuth.nDoS, unknownConnectLegacy.nDoS);
+    delete unknownConnectBlock;
+
+    const uint256 badMaterializationHash(0xBAD20002UL);
+    BlockIndexRecord badMaterializationRecord = hotConnectSiblingRecord;
+    badMaterializationRecord.hash = badMaterializationHash;
+    badMaterializationRecord.nFile = 0xffffffffU;
+    badMaterializationRecord.nBlockPos = 0;
+    BlockIndexDerivedEntry badMaterializationDerived;
+    BOOST_REQUIRE_MESSAGE(live.AcceptSide(badMaterializationRecord,
+                                          badMaterializationDerived, &error), error);
+    CBlock* badMaterializationBlock = BuildRealBlock(
+        pS, 0x3405, &sHash, &connectParents);
+    BOOST_REQUIRE(badMaterializationBlock != NULL);
+    uint256 badMaterializationCurrentHash = badMaterializationBlock->GetHash();
+    CBlockIndex badMaterializationIndex(1, 1, *badMaterializationBlock);
+    badMaterializationIndex.pprev = pS;
+    badMaterializationIndex.nHeight = S + 1;
+    badMaterializationIndex.phashBlock = &badMaterializationCurrentHash;
+    ConfigureConnectSiblingDAG(badMaterializationCurrentHash,
+                               badMaterializationHash, 4);
+    const ConnectSiblingResult badMaterialization = RunConnectSiblingRule(
+        badMaterializationBlock, &badMaterializationIndex, true, &live);
+    BOOST_CHECK(HasConnectSiblingFound(badMaterialization,
+                                       badMaterializationHash,
+                                       0xffffffffU, 0, false));
+    BOOST_CHECK(HasConnectSiblingEvent(
+        badMaterialization,
+        CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FAILURE));
+    BOOST_CHECK(HasConnectSiblingEvent(
+        badMaterialization, CONNECTBLOCK_DAG_SIBLING_RULE_REJECTED));
+    BOOST_CHECK(!badMaterialization.ok);
+    BOOST_CHECK_EQUAL(badMaterialization.nDoS, 0);
+    BOOST_CHECK(mapBlockIndex.count(badMaterializationHash) == 0);
+    delete badMaterializationBlock;
+
+    reader.Close();
+    CBlock* authorityFailureBlock = BuildRealBlock(
+        pS, 0x3406, &sHash, &connectParents);
+    BOOST_REQUIRE(authorityFailureBlock != NULL);
+    uint256 authorityFailureCurrentHash = authorityFailureBlock->GetHash();
+    CBlockIndex authorityFailureIndex(1, 1, *authorityFailureBlock);
+    authorityFailureIndex.pprev = pS;
+    authorityFailureIndex.nHeight = S + 1;
+    authorityFailureIndex.phashBlock = &authorityFailureCurrentHash;
+    ConfigureConnectSiblingDAG(authorityFailureCurrentHash, coldMergeHash, 5);
+    const ConnectSiblingResult connectAuthorityFailure = RunConnectSiblingRule(
+        authorityFailureBlock, &authorityFailureIndex, true, &live);
+    BOOST_CHECK(HasConnectSiblingEvent(
+        connectAuthorityFailure, CONNECTBLOCK_DAG_SIBLING_AUTH_FAILURE));
+    BOOST_CHECK(HasConnectSiblingEvent(
+        connectAuthorityFailure, CONNECTBLOCK_DAG_SIBLING_RULE_REJECTED));
+    BOOST_CHECK(!HasConnectSiblingEvent(
+        connectAuthorityFailure, CONNECTBLOCK_DAG_SIBLING_AUTH_NOT_FOUND));
+    BOOST_CHECK(!HasConnectSiblingEvent(
+        connectAuthorityFailure,
+        CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FOUND));
+    BOOST_CHECK(!connectAuthorityFailure.ok);
+    BOOST_CHECK_EQUAL(connectAuthorityFailure.nDoS, 0);
+    delete authorityFailureBlock;
+
+    live.Close();
+    BOOST_REQUIRE_MESSAGE(reader.Open(root.string(), opts, &error), error);
+    BOOST_REQUIRE_MESSAGE(live.Open(root.string(), &reader, hor, &error), error);
+    g_dagManager.ClearDAGDataForTest();
 
     // Make S V2-only in THIS process: erase 0..S from this process's
     // mapBlockIndex (safe: separate process, own globals).

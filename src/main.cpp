@@ -2465,6 +2465,7 @@ static void ProcessBlockRejectTraceRemember(const uint256& hash,
 
 static bool fAcceptBlockRejectTraceEnabled = false;
 static AcceptBlockDAGObserverFn g_acceptBlockDAGObserver = NULL;
+static ConnectBlockDAGSiblingObserverFn g_connectBlockDAGSiblingObserver = NULL;
 
 ScopedAcceptBlockDAGObserver::ScopedAcceptBlockDAGObserver(AcceptBlockDAGObserverFn fn)
     : previous_(g_acceptBlockDAGObserver)
@@ -2481,6 +2482,39 @@ void EmitAcceptBlockDAGObserverEvent(const AcceptBlockDAGObserverEvent& event)
 {
     if (g_acceptBlockDAGObserver)
         g_acceptBlockDAGObserver(event);
+}
+
+ScopedConnectBlockDAGSiblingObserver::ScopedConnectBlockDAGSiblingObserver(
+    ConnectBlockDAGSiblingObserverFn fn)
+    : previous_(g_connectBlockDAGSiblingObserver)
+{
+    g_connectBlockDAGSiblingObserver = fn;
+}
+
+ScopedConnectBlockDAGSiblingObserver::~ScopedConnectBlockDAGSiblingObserver()
+{
+    g_connectBlockDAGSiblingObserver = previous_;
+}
+
+void EmitConnectBlockDAGSiblingObserverEvent(
+    const ConnectBlockDAGSiblingObserverEvent& event)
+{
+    if (g_connectBlockDAGSiblingObserver)
+        g_connectBlockDAGSiblingObserver(event);
+}
+
+static void ObserveConnectBlockDAGSibling(
+    ConnectBlockDAGSiblingObserverEventType type,
+    const uint256& hash, unsigned int nFile,
+    unsigned int nBlockPos, bool active)
+{
+    ConnectBlockDAGSiblingObserverEvent event;
+    event.type = type;
+    event.hash = hash;
+    event.nFile = nFile;
+    event.nBlockPos = nBlockPos;
+    event.active = active;
+    EmitConnectBlockDAGSiblingObserverEvent(event);
 }
 
 static void ObserveAcceptBlockDAG(AcceptBlockDAGObserverEventType type,
@@ -6976,9 +7010,14 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
     bool fDAGActive = (pindex->nHeight >= FORK_HEIGHT_DAG);
     if (fDAGActive && pindex->phashBlock)
     {
-        std::set<uint256> siblings = g_dagManager.GetDAGSiblingBlocks(pindex->GetBlockHash());
+        const uint256 currentBlockHash = pindex->GetBlockHash();
+        if (g_fAuthoritativeStartup)
+            ObserveConnectBlockDAGSibling(
+                CONNECTBLOCK_DAG_SIBLING_ENTERED,
+                currentBlockHash, 0, 0, true);
+        std::set<uint256> siblings = g_dagManager.GetDAGSiblingBlocks(currentBlockHash);
         CBlockDAGData currentDagData;
-        bool fHaveCurrentDAGOrder = g_dagManager.GetDAGData(pindex->GetBlockHash(), currentDagData) &&
+        bool fHaveCurrentDAGOrder = g_dagManager.GetDAGData(currentBlockHash, currentDagData) &&
                                     currentDagData.nDAGOrder >= 0;
         for (const uint256& hashSibling : siblings)
         {
@@ -6990,13 +7029,73 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
             if (!fSiblingPrecedes)
                 continue;
 
-            // Load sibling block and collect its spent outputs
-            std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashSibling);
-            if (mi == mapBlockIndex.end())
-                continue;
             CBlock sibBlock;
-            if (!sibBlock.ReadFromDisk(mi->second))
-                continue;
+            if (g_fAuthoritativeStartup)
+            {
+                BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+                if (!live || !live->IsOpen())
+                {
+                    ObserveConnectBlockDAGSibling(
+                        CONNECTBLOCK_DAG_SIBLING_AUTH_FAILURE,
+                        hashSibling, 0, 0, false);
+                    ObserveConnectBlockDAGSibling(
+                        CONNECTBLOCK_DAG_SIBLING_RULE_REJECTED,
+                        hashSibling, 0, 0, false);
+                    return error("ConnectBlock() : DAG sibling authority unavailable");
+                }
+                BlockIndexAuthoritativeParentInfo siblingInfo;
+                std::string siblingError;
+                const BlockIndexAuthoritativeParentStatus siblingStatus =
+                    live->ResolveParentInfo(hashSibling, &siblingInfo, &siblingError);
+                if (siblingStatus == BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_FOUND)
+                {
+                    ObserveConnectBlockDAGSibling(
+                        CONNECTBLOCK_DAG_SIBLING_AUTH_NOT_FOUND,
+                        hashSibling, 0, 0, false);
+                    continue; // exact legacy unknown-sibling behavior
+                }
+                if (siblingStatus != BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND)
+                {
+                    ObserveConnectBlockDAGSibling(
+                        CONNECTBLOCK_DAG_SIBLING_AUTH_FAILURE,
+                        hashSibling, 0, 0, false);
+                    ObserveConnectBlockDAGSibling(
+                        CONNECTBLOCK_DAG_SIBLING_RULE_REJECTED,
+                        hashSibling, 0, 0, false);
+                    return error("ConnectBlock() : DAG sibling authority failure");
+                }
+                ObserveConnectBlockDAGSibling(
+                    CONNECTBLOCK_DAG_SIBLING_AUTH_FOUND,
+                    siblingInfo.hash, siblingInfo.nFile,
+                    siblingInfo.nBlockPos, siblingInfo.active);
+                if (!sibBlock.ReadFromDisk(siblingInfo.nFile,
+                                           siblingInfo.nBlockPos, true) ||
+                    sibBlock.GetHash() != hashSibling)
+                {
+                    ObserveConnectBlockDAGSibling(
+                        CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FAILURE,
+                        hashSibling, siblingInfo.nFile,
+                        siblingInfo.nBlockPos, siblingInfo.active);
+                    ObserveConnectBlockDAGSibling(
+                        CONNECTBLOCK_DAG_SIBLING_RULE_REJECTED,
+                        hashSibling, siblingInfo.nFile,
+                        siblingInfo.nBlockPos, siblingInfo.active);
+                    return error("ConnectBlock() : DAG sibling block bytes unavailable");
+                }
+                ObserveConnectBlockDAGSibling(
+                    CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FOUND,
+                    hashSibling, siblingInfo.nFile,
+                    siblingInfo.nBlockPos, siblingInfo.active);
+            }
+            else
+            {
+                // Legacy mode is intentionally unchanged.
+                std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashSibling);
+                if (mi == mapBlockIndex.end())
+                    continue;
+                if (!sibBlock.ReadFromDisk(mi->second))
+                    continue;
+            }
 
             for (const CTransaction& sibTx : sibBlock.vtx)
             {
@@ -7006,6 +7105,10 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
                     setDAGSpentOutputs.insert(txin.prevout);
             }
         }
+        if (g_fAuthoritativeStartup)
+            ObserveConnectBlockDAGSibling(
+                CONNECTBLOCK_DAG_SIBLING_RULE_PASSED,
+                currentBlockHash, 0, 0, true);
     }
 
     int64_t nTransparentValidateMicros = 0;

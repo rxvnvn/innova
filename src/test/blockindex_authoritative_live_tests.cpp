@@ -159,6 +159,12 @@ BOOST_AUTO_TEST_CASE(g1_live_acceptance_tip_advance_restart)
     BOOST_REQUIRE(live.IsOpen());
     const int baseTip = fx.baseTip; // 4
     BOOST_REQUIRE_EQUAL(live.TipAuthorityMutable()->TipHeight(), baseTip);
+    BlockIndexAuthoritativeParentInfo coldInfo;
+    BOOST_REQUIRE(live.ResolveParentInfo(fx.baseActive[2], &coldInfo, &error) ==
+                  BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND);
+    BOOST_CHECK_EQUAL(coldInfo.nFile, 1U);
+    BOOST_CHECK_EQUAL(coldInfo.nBlockPos, 102U);
+    BOOST_CHECK(coldInfo.active);
 
     // G1-H: historical mapBlockIndex residency is 0.
     {
@@ -246,6 +252,12 @@ BOOST_AUTO_TEST_CASE(g1_side_branch_retained)
         BOOST_REQUIRE_EQUAL(tr.status, BLOCK_INDEX_TIP_OK);
         BOOST_REQUIRE(!tr.active); // side, not active
     }
+    BlockIndexAuthoritativeParentInfo sideInfo;
+    BOOST_REQUIRE(live.ResolveParentInfo(sd, &sideInfo, &error) ==
+                  BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND);
+    BOOST_CHECK_EQUAL(sideInfo.nFile, 1U);
+    BOOST_CHECK_EQUAL(sideInfo.nBlockPos, (unsigned int)((baseTip + 1) * 100));
+    BOOST_CHECK(!sideInfo.active);
     live.Close();
     reader.Close();
     printf("G1 PASS: side branch retained by value, active tip unchanged.\n");

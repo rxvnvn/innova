@@ -236,6 +236,8 @@ BlockIndexAuthoritativeParentStatus BlockIndexAuthoritativeLive::ResolveParentIn
             out->height = tipRead.height;
             out->proofOfStake = (tipRead.record.prevoutStake.hash != uint256(0));
             out->active = tipRead.active;
+            out->nFile = tipRead.record.nFile;
+            out->nBlockPos = tipRead.record.nBlockPos;
             ClearError(error);
             return BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND;
         }
@@ -263,6 +265,8 @@ BlockIndexAuthoritativeParentStatus BlockIndexAuthoritativeLive::ResolveParentIn
     out->height = snapshot.height;
     out->proofOfStake = snapshot.fProofOfStake;
     out->active = snapshot.fInMainChain;
+    out->nFile = snapshot.nFile;
+    out->nBlockPos = snapshot.nBlockPos;
     ClearError(error);
     return BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND;
 }

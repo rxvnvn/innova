@@ -68,8 +68,11 @@ struct BlockIndexAuthoritativeParentInfo
     int height;
     bool proofOfStake;
     bool active;
+    unsigned int nFile;
+    unsigned int nBlockPos;
     BlockIndexAuthoritativeParentInfo()
-        : hash(0), height(-1), proofOfStake(false), active(false) {}
+        : hash(0), height(-1), proofOfStake(false), active(false),
+          nFile(0), nBlockPos(0) {}
 };
 class BlockIndexAuthoritativeLive
 {
@@ -97,9 +100,10 @@ public:
     bool ResolveParent(const uint256& parentHash, int* parentHeight,
                        std::string* error) const;
 
-    // Resolve cold immutable V2 or bounded mutable-hot metadata by value.
-    // requireActive is intentionally false for DAG merge parents: legitimate
-    // side branches remain usable logical parents.
+    // Resolve cold immutable V2 or bounded mutable-hot block metadata by value.
+    // requireActive is intentionally false: DAG merge parents and sibling blocks
+    // may be legitimate side records. nFile/nBlockPos are materialization
+    // coordinates only; their presence does not establish logical authority.
     BlockIndexAuthoritativeParentStatus ResolveParentInfo(
         const uint256& parentHash,
         BlockIndexAuthoritativeParentInfo* out,

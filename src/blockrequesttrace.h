@@ -309,6 +309,48 @@ private:
     ScopedAcceptBlockDAGObserver& operator=(const ScopedAcceptBlockDAGObserver&);
 };
 void EmitAcceptBlockDAGObserverEvent(const AcceptBlockDAGObserverEvent& event);
+
+// Test-only passive observation of the real ConnectBlock DAG sibling seam.
+enum ConnectBlockDAGSiblingObserverEventType
+{
+    CONNECTBLOCK_DAG_SIBLING_ENTERED = 0,
+    CONNECTBLOCK_DAG_SIBLING_AUTH_FOUND,
+    CONNECTBLOCK_DAG_SIBLING_AUTH_NOT_FOUND,
+    CONNECTBLOCK_DAG_SIBLING_AUTH_FAILURE,
+    CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FOUND,
+    CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FAILURE,
+    CONNECTBLOCK_DAG_SIBLING_RULE_PASSED,
+    CONNECTBLOCK_DAG_SIBLING_RULE_REJECTED
+};
+struct ConnectBlockDAGSiblingObserverEvent
+{
+    ConnectBlockDAGSiblingObserverEventType type;
+    uint256 hash;
+    unsigned int nFile;
+    unsigned int nBlockPos;
+    bool active;
+    ConnectBlockDAGSiblingObserverEvent()
+        : type(CONNECTBLOCK_DAG_SIBLING_ENTERED), hash(0),
+          nFile(0), nBlockPos(0), active(false) {}
+};
+typedef void (*ConnectBlockDAGSiblingObserverFn)(
+    const ConnectBlockDAGSiblingObserverEvent&);
+class ScopedConnectBlockDAGSiblingObserver
+{
+public:
+    explicit ScopedConnectBlockDAGSiblingObserver(
+        ConnectBlockDAGSiblingObserverFn fn);
+    ~ScopedConnectBlockDAGSiblingObserver();
+private:
+    ConnectBlockDAGSiblingObserverFn previous_;
+    ScopedConnectBlockDAGSiblingObserver(
+        const ScopedConnectBlockDAGSiblingObserver&);
+    ScopedConnectBlockDAGSiblingObserver& operator=(
+        const ScopedConnectBlockDAGSiblingObserver&);
+};
+void EmitConnectBlockDAGSiblingObserverEvent(
+    const ConnectBlockDAGSiblingObserverEvent& event);
+
 const char* AcceptBlockRejectReasonName(AcceptBlockRejectReason reason);
 const char* AcceptBlockRejectStageName(AcceptBlockRejectReason reason);
 
