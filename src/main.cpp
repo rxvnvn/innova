@@ -41,6 +41,7 @@
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_authoritative_live.h"
 #include "blockindex_shadow_startup.h"
+#include "blockrequesttrace.h"
 #include "hreg_registration.h"
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
@@ -2463,6 +2464,39 @@ static void ProcessBlockRejectTraceRemember(const uint256& hash,
 }
 
 static bool fAcceptBlockRejectTraceEnabled = false;
+static AcceptBlockDAGObserverFn g_acceptBlockDAGObserver = NULL;
+
+ScopedAcceptBlockDAGObserver::ScopedAcceptBlockDAGObserver(AcceptBlockDAGObserverFn fn)
+    : previous_(g_acceptBlockDAGObserver)
+{
+    g_acceptBlockDAGObserver = fn;
+}
+
+ScopedAcceptBlockDAGObserver::~ScopedAcceptBlockDAGObserver()
+{
+    g_acceptBlockDAGObserver = previous_;
+}
+
+void EmitAcceptBlockDAGObserverEvent(const AcceptBlockDAGObserverEvent& event)
+{
+    if (g_acceptBlockDAGObserver)
+        g_acceptBlockDAGObserver(event);
+}
+
+static void ObserveAcceptBlockDAG(AcceptBlockDAGObserverEventType type,
+                                  const uint256& hash, int height,
+                                  bool proofOfStake, bool active,
+                                  unsigned int parentIndex)
+{
+    AcceptBlockDAGObserverEvent event;
+    event.type = type;
+    event.hash = hash;
+    event.height = height;
+    event.proofOfStake = proofOfStake;
+    event.active = active;
+    event.parentIndex = parentIndex;
+    EmitAcceptBlockDAGObserverEvent(event);
+}
 
 bool InitAcceptBlockRejectTrace(bool fEnabled)
 {
@@ -9354,8 +9388,11 @@ bool CBlock::AcceptBlock()
     // IDAG Phase 2: Validate DAG parent commitment in coinbase OP_RETURN
     if (nHeight >= FORK_HEIGHT_DAG)
     {
-        // Search coinbase outputs for DAG parent commitment
+        ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_ENTERED, hash, nHeight,
+                              IsProofOfStake(), true, 0);
+
         std::vector<uint256> vDAGParents;
+        bool fDAGMergeParentDeferred = false;
         for (unsigned int i = 0; i < vtx[0].vout.size(); i++)
         {
             vDAGParents = ExtractDAGParents(vtx[0].vout[i].scriptPubKey);
@@ -9394,7 +9431,72 @@ bool CBlock::AcceptBlock()
                 return DoS(100, error("AcceptBlock() : DAG parent[%d] is self-reference", i));
             }
 
-            // Must exist in block index
+            // Must resolve through the complete authoritative cold+hot domain.
+            if (g_fAuthoritativeStartup)
+            {
+                BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+                if (!live || !live->IsOpen())
+                {
+                    return error("AcceptBlock() : DAG merge parent authority unavailable");
+                }
+                BlockIndexAuthoritativeParentInfo parentInfo;
+                std::string parentError;
+                BlockIndexAuthoritativeParentStatus parentStatus =
+                    live->ResolveParentInfo(vDAGParents[i], &parentInfo, &parentError);
+                if (parentStatus == BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_FOUND)
+                {
+                    ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_MERGE_PARENT_NOT_FOUND,
+                                          vDAGParents[i], nHeight, false, false, i);
+                    if (IsInitialBlockDownload())
+                    {
+                        ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_IBD_UNKNOWN_PARENT_DEFER,
+                                              vDAGParents[i], nHeight, false, false, i);
+                        fDAGMergeParentDeferred = true;
+                        if (fDebug)
+                            printf("AcceptBlock() : DAG merge parent[%d] %s not found during IBD, deferring validation\n",
+                                   i, vDAGParents[i].ToString().substr(0, 20).c_str());
+                        continue;
+                    }
+                    ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_NON_IBD_UNKNOWN_PARENT_REJECT,
+                                          vDAGParents[i], nHeight, false, false, i);
+                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
+                    return DoS(10, error("AcceptBlock() : DAG merge parent[%d] %s not found",
+                                          i, vDAGParents[i].ToString().substr(0, 20).c_str()));
+                }
+                if (parentStatus != BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND)
+                {
+                    ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_MERGE_PARENT_AUTHORITY_FAILURE,
+                                          vDAGParents[i], nHeight, false, false, i);
+                    ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_AUTHORITY_FAILURE_LOCAL_REJECT,
+                                          vDAGParents[i], nHeight, false, false, i);
+                    // Local authority failure is not a peer-invalid block and
+                    // must not become IBD defer or a DoS/misbehavior penalty.
+                    return error("AcceptBlock() : DAG merge parent[%d] authority failure",
+                                 i);
+                }
+                ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_MERGE_PARENT_FOUND,
+                                      parentInfo.hash, parentInfo.height,
+                                      parentInfo.proofOfStake, parentInfo.active, i);
+                if (parentInfo.height >= nHeight)
+                {
+                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
+                    return DoS(100, error("AcceptBlock() : DAG merge parent[%d] height %d >= block height %d",
+                                           i, parentInfo.height, nHeight));
+                }
+                if (parentInfo.height >= FORK_HEIGHT_DAG && parentInfo.proofOfStake)
+                {
+                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
+                    return DoS(100, error("AcceptBlock() : DAG merge parent[%d] is proof-of-stake", i));
+                }
+                if (!pindexPrev || pindexPrev->nHeight - parentInfo.height > DAG_MERGE_DEPTH)
+                {
+                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
+                    return DoS(50, error("AcceptBlock() : DAG merge parent[%d] too deep", i));
+                }
+                continue;
+            }
+
+            // Legacy mode is intentionally unchanged.
             if (!mapBlockIndex.count(vDAGParents[i]))
             {
                 if (IsInitialBlockDownload())
@@ -9409,7 +9511,6 @@ bool CBlock::AcceptBlock()
                                       i, vDAGParents[i].ToString().substr(0, 20).c_str()));
             }
 
-            // Merge parent must have lower height
             CBlockIndex* pMergeParent = mapBlockIndex[vDAGParents[i]];
             if (pMergeParent->nHeight >= nHeight)
             {
@@ -9422,8 +9523,6 @@ bool CBlock::AcceptBlock()
                 TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
                 return DoS(100, error("AcceptBlock() : DAG merge parent[%d] is proof-of-stake", i));
             }
-
-            // Merge parent within DAG_MERGE_DEPTH of primary parent
             if (pindexPrev->nHeight - pMergeParent->nHeight > DAG_MERGE_DEPTH)
             {
                 TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
@@ -9441,6 +9540,9 @@ bool CBlock::AcceptBlock()
                 }
             }
         }
+        if (g_fAuthoritativeStartup && !fDAGMergeParentDeferred)
+            ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_MERGE_VALIDATION_PASSED,
+                                  hash, nHeight, IsProofOfStake(), true, 0);
     }
 
     // Write block to history file

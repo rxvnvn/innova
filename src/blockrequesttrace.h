@@ -272,6 +272,43 @@ enum AcceptBlockRejectReason
 
 bool InitAcceptBlockRejectTrace(bool fEnabled);
 bool AcceptBlockRejectTraceEnabled();
+
+// Test-only passive observation of the real AcceptBlock DAG merge-parent seam.
+enum AcceptBlockDAGObserverEventType
+{
+    ACCEPTBLOCK_DAG_ENTERED = 0,
+    ACCEPTBLOCK_DAG_MERGE_PARENT_FOUND,
+    ACCEPTBLOCK_DAG_MERGE_PARENT_NOT_FOUND,
+    ACCEPTBLOCK_DAG_MERGE_PARENT_AUTHORITY_FAILURE,
+    ACCEPTBLOCK_DAG_MERGE_VALIDATION_PASSED,
+    ACCEPTBLOCK_DAG_IBD_UNKNOWN_PARENT_DEFER,
+    ACCEPTBLOCK_DAG_NON_IBD_UNKNOWN_PARENT_REJECT,
+    ACCEPTBLOCK_DAG_AUTHORITY_FAILURE_LOCAL_REJECT
+};
+struct AcceptBlockDAGObserverEvent
+{
+    AcceptBlockDAGObserverEventType type;
+    uint256 hash;
+    int height;
+    bool proofOfStake;
+    bool active;
+    unsigned int parentIndex;
+    AcceptBlockDAGObserverEvent()
+        : type(ACCEPTBLOCK_DAG_ENTERED), hash(0), height(-1),
+          proofOfStake(false), active(false), parentIndex(0) {}
+};
+typedef void (*AcceptBlockDAGObserverFn)(const AcceptBlockDAGObserverEvent&);
+class ScopedAcceptBlockDAGObserver
+{
+public:
+    explicit ScopedAcceptBlockDAGObserver(AcceptBlockDAGObserverFn fn);
+    ~ScopedAcceptBlockDAGObserver();
+private:
+    AcceptBlockDAGObserverFn previous_;
+    ScopedAcceptBlockDAGObserver(const ScopedAcceptBlockDAGObserver&);
+    ScopedAcceptBlockDAGObserver& operator=(const ScopedAcceptBlockDAGObserver&);
+};
+void EmitAcceptBlockDAGObserverEvent(const AcceptBlockDAGObserverEvent& event);
 const char* AcceptBlockRejectReasonName(AcceptBlockRejectReason reason);
 const char* AcceptBlockRejectStageName(AcceptBlockRejectReason reason);
 

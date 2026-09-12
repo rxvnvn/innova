@@ -203,6 +203,69 @@ bool BlockIndexAuthoritativeLive::ResolveParent(const uint256& parentHash,
     }
     return false; // PARENT_UNKNOWN: genuine orphan
 }
+BlockIndexAuthoritativeParentStatus BlockIndexAuthoritativeLive::ResolveParentInfo(
+    const uint256& parentHash,
+    BlockIndexAuthoritativeParentInfo* out,
+    std::string* error) const
+{
+    if (!out)
+    {
+        SetError(error, "authoritative-live: null parent info");
+        return BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE;
+    }
+    *out = BlockIndexAuthoritativeParentInfo();
+    if (!impl_->open || !impl_->baseReader || !impl_->baseReader->IsOpen())
+    {
+        SetError(error, "authoritative-live: parent authority unavailable");
+        return BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE;
+    }
+    if (impl_->baseReader->Generation() != impl_->baseGeneration)
+    {
+        SetError(error, "authoritative-live: parent authority generation changed");
+        return BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE;
+    }
+
+    // Mutable tip first: this covers bounded active and side records created
+    // after the immutable generation was selected.
+    if (impl_->tip && impl_->tip->IsOpen())
+    {
+        BlockIndexTipRead tipRead = impl_->tip->LookupByHash(parentHash, error);
+        if (tipRead.status == BLOCK_INDEX_TIP_OK)
+        {
+            out->hash = tipRead.record.hash;
+            out->height = tipRead.height;
+            out->proofOfStake = (tipRead.record.prevoutStake.hash != uint256(0));
+            out->active = tipRead.active;
+            ClearError(error);
+            return BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND;
+        }
+        if (tipRead.status != BLOCK_INDEX_TIP_NOT_FOUND)
+        {
+            SetError(error, "authoritative-live: mutable parent lookup failed");
+            return BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE;
+        }
+    }
+
+    BlockIndexSnapshot snapshot;
+    BlockIndexV2ReadStatus baseStatus =
+        impl_->baseReader->LookupByHash(parentHash, &snapshot, error);
+    if (baseStatus == BLOCK_INDEX_V2_READ_NOT_FOUND)
+    {
+        *out = BlockIndexAuthoritativeParentInfo();
+        return BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_FOUND;
+    }
+    if (baseStatus != BLOCK_INDEX_V2_READ_FOUND)
+    {
+        *out = BlockIndexAuthoritativeParentInfo();
+        return BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE;
+    }
+    out->hash = snapshot.hash;
+    out->height = snapshot.height;
+    out->proofOfStake = snapshot.fProofOfStake;
+    out->active = snapshot.fInMainChain;
+    ClearError(error);
+    return BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND;
+}
 
 BlockIndexHotStatus BlockIndexAuthoritativeLive::Materialize(
     const uint256& hash, BlockIndexHotHandle* out) const

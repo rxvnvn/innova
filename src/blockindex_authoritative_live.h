@@ -54,6 +54,23 @@
 // historical blocks from V2 on demand and running them; it is never rejected
 // for exceeding N. This module never imposes a reorg-depth cap.
 
+enum BlockIndexAuthoritativeParentStatus
+{
+    BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND = 0,
+    BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_FOUND,
+    BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_ACTIVE,
+    BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE
+};
+
+struct BlockIndexAuthoritativeParentInfo
+{
+    uint256 hash;
+    int height;
+    bool proofOfStake;
+    bool active;
+    BlockIndexAuthoritativeParentInfo()
+        : hash(0), height(-1), proofOfStake(false), active(false) {}
+};
 class BlockIndexAuthoritativeLive
 {
 public:
@@ -79,6 +96,14 @@ public:
     // parent is known by-value; false when unknown (genuine orphan) or error.
     bool ResolveParent(const uint256& parentHash, int* parentHeight,
                        std::string* error) const;
+
+    // Resolve cold immutable V2 or bounded mutable-hot metadata by value.
+    // requireActive is intentionally false for DAG merge parents: legitimate
+    // side branches remain usable logical parents.
+    BlockIndexAuthoritativeParentStatus ResolveParentInfo(
+        const uint256& parentHash,
+        BlockIndexAuthoritativeParentInfo* out,
+        std::string* error) const;
 
     // Materialize a bounded resident CBlockIndex for a logical hash via the
     // composite live tail (tip-then-base). Returns a pinned handle; the returned
