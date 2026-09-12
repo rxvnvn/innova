@@ -572,7 +572,7 @@ TipFrontierReader::TipFrontierReader() : impl_(new Impl()) {}
 TipFrontierReader::~TipFrontierReader() { Close(); delete impl_; }
 
 bool TipFrontierReader::Open(const std::string& path, uint64_t expectGeneration,
-                             unsigned char expectDagInputDigest[32], std::string* error)
+                             const unsigned char expectDagInputDigest[32], std::string* error)
 {
     Close();
     uint64_t gen = 0, tips = 0;
@@ -623,6 +623,13 @@ bool TipFrontierReader::GetFrontierDigest(unsigned char out[32]) const
 {
     if (!impl_->open) return false;
     memcpy(out, impl_->frontierDigest, 32);
+    return true;
+}
+
+bool TipFrontierReader::GetBoundDagInputDigest(unsigned char out[32]) const
+{
+    if (!impl_->open) return false;
+    memcpy(out, impl_->dagInput, 32);
     return true;
 }
 

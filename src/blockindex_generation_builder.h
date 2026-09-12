@@ -56,6 +56,10 @@ struct BlockIndexGenerationSource
     // If empty, nSize will be marked unavailable (blocks not accessible).
     std::string blockDataDir;
 
+    // R2c.1c: the LevelDB daglinks source directory the frontier artifact is
+    // built from. Empty when unavailable (e.g. DAG dormant / no daglinks store).
+    std::string dagLinksDir;
+
     BlockIndexGenerationSource()
         : foundBestChain(false), foundDAGLinks(false)
     {

@@ -329,6 +329,9 @@ int main(int argc, char** argv)
     }
     else
     {
+        // R2c.1c: bind the daglinks LevelDB source so the production builder can
+        // construct the generation-bound dag-tip-frontier artifact.
+        source.dagLinksDir = snapshotDir;
         source.foundDAGLinks = !source.dagLinks.empty();
         printf("[DAG] loaded %llu DAG link entries, %llu DAG score entries\n",
                (unsigned long long)source.dagLinks.size(),

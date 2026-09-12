@@ -81,6 +81,13 @@ enum BlockIndexGenerationCapability
     // Authoritative-capable generation: derived.dat present with all required
     // components, content binding validated, explicit capability declared.
     BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE = 1,
+    // Authoritative + DAG tip frontier capable: as AUTHORITATIVE but the
+    // generation additionally carries a mandatory, generation-bound, DAG-source
+    // bound dag-tip-frontier.dat artifact folded into the generation root.
+    // A selected frontier-capable generation must never silently lack its
+    // frontier. Fields added after this value are unknown to legacy readers and
+    // are ignored by V1-V3 manifest decoding.
+    BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER = 2,
 };
 
 struct FixedBlockIndexManifest

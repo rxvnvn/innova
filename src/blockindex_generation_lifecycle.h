@@ -119,11 +119,16 @@ private:
 
 // A.10.1b-fix3: Independently recompute generation root from actual component
 // files on disk. Exposed for testing.
+// bindFrontier (R2c.1c): when true the manifest asserts an AUTHORITATIVE_FRONTIER
+// capability and the dag-tip-frontier.dat binding is folded into the dag-input
+// mix (and the file MUST be present + valid). When false (legacy AUTHORITATIVE /
+// OLD_SHADOW), behavior is byte-identical to pre-R2c.1c.
 bool RecomputeGenerationRootFromFiles(const boost::filesystem::path& dir,
                                        uint64_t generation,
                                        const uint256& tipHash,
                                        uint64_t recordCount,
                                        const unsigned char persistedDagInputDigest[32],
+                                       bool bindFrontier,
                                        unsigned char recomputedRoot[32],
                                        std::string* error);
 

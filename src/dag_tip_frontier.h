@@ -129,12 +129,14 @@ public:
     // open(expectGeneration) binds the artifact to a generation; mismatch,
     // corrupt header, or digest failure is a typed failure.
     bool Open(const std::string& path, uint64_t expectGeneration,
-              unsigned char expectDagInputDigest[32], std::string* error);
+              const unsigned char expectDagInputDigest[32], std::string* error);
     void Close();
     bool IsOpen() const;
     uint64_t Generation() const;
     uint64_t TipCount() const;
     bool GetFrontierDigest(unsigned char out[32]) const;
+    // The dagInputDigest the artifact was bound to at open (for root folding).
+    bool GetBoundDagInputDigest(unsigned char out[32]) const;
     // true = next tip hash produced; false = exhausted or not open.
     bool Next(uint256* out);
     // Bounded contains() via linear scan only if genuinely useful (see report).

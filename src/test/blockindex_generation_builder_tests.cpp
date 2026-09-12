@@ -486,7 +486,7 @@ BOOST_AUTO_TEST_CASE(c2_changed_derived_entry_rejects)
 
         unsigned char recomputedRoot[32];
         BOOST_REQUIRE(RecomputeGenerationRootFromFiles(genDir, m.generation,
-            m.committedTipHash, m.recordCount, m.dagInputDigest, recomputedRoot, &error));
+            m.committedTipHash, m.recordCount, m.dagInputDigest, false, recomputedRoot, &error));
 
         BOOST_REQUIRE(WriteContentBindingInFile(genDir / BLOCK_INDEX_DERIVED_FILE_NAME, recomputedRoot, &error));
         BOOST_REQUIRE(WriteManifestCapability(genDir, BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE, &error));
@@ -551,7 +551,7 @@ BOOST_AUTO_TEST_CASE(c2_changed_records_entry_rejects)
         const FixedBlockIndexManifest& m = store.GetManifest();
         unsigned char recomputedRoot[32];
         BOOST_REQUIRE(RecomputeGenerationRootFromFiles(genDir, m.generation,
-            m.committedTipHash, m.recordCount, m.dagInputDigest, recomputedRoot, &error));
+            m.committedTipHash, m.recordCount, m.dagInputDigest, false, recomputedRoot, &error));
         BOOST_REQUIRE(WriteContentBindingInFile(genDir / BLOCK_INDEX_DERIVED_FILE_NAME, recomputedRoot, &error));
         BOOST_REQUIRE(WriteManifestCapability(genDir, BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE, &error));
     }

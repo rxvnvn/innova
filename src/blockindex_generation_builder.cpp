@@ -1,10 +1,12 @@
 #include "blockindex_generation_builder.h"
 #include "candidate_frontier_metadata.h"
+#include "dag_tip_frontier_metadata.h"
 
 #include "txdb-leveldb.h"
 #include "main.h"
 #include "kernel.h"
 #include "dag.h"
+#include "dag_tip_frontier.h"
 
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>
@@ -908,6 +910,24 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         if (!MixCandidateLeavesIntoDagDigest(dagInputDigest, candidateBinding,
                                              mixedDagInputDigest))
             return SetError(error, "candidate leaves root mix failed");
+        // R2c.1c: build + fold the DAG tip frontier for frontier-capable builds.
+        // The frontier artifact is created inside the generation build scope and
+        // MUST succeed before the manifest is marked COMPLETE (so a frontier
+        // build failure aborts publication of a frontier-capable generation).
+        const bool frontierCapableBuild = !source.dagLinksDir.empty();
+        if (frontierCapableBuild)
+        {
+            if (!EnsureDagTipFrontierMetadata(source.dagLinksDir, generationDir,
+                                              generation, dagInputDigest, error))
+                return false;
+            unsigned char frontierBinding[32];
+            if (!ComputeDagTipFrontierBinding(generationDir, generation,
+                                              dagInputDigest, frontierBinding, error))
+                return false;
+            unsigned char mixed2[32];
+            MixDagTipFrontierIntoDigest(mixedDagInputDigest, frontierBinding, mixed2);
+            memcpy(mixedDagInputDigest, mixed2, 32);
+        }
         // AUTHORITATIVE: use full generation root as content binding
         unsigned char generationRoot[32];
         ComputeGenerationRoot(generation, tipHash, totalRecords,
@@ -926,9 +946,16 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         if (!derivedStore.Finalize(error))
             return false;
 
-        // Remember capability for manifest below
-        generationCapability = (!source.blockDataDir.empty() && allBlockSizeAvailable)
-            ? BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE
+        // Remember capability for manifest below. R2c.1c: when the build is
+        // authoritative-capable AND a DAG tip frontier was produced, declare the
+        // frontier-capable capability (artifact mandatory + bound in the root).
+        const bool builderAuthoritative =
+            (!source.blockDataDir.empty() && allBlockSizeAvailable);
+        const bool frontierProduced = !source.dagLinksDir.empty();
+        generationCapability = builderAuthoritative
+            ? (frontierProduced
+               ? BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER
+               : BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE)
             : BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
 
         // If AUTHORITATIVE was requested but nSize missing, fail closed

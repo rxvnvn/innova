@@ -1,5 +1,6 @@
 #include "blockindex_generation_lifecycle.h"
 #include "candidate_frontier_metadata.h"
+#include "dag_tip_frontier_metadata.h"
 
 #include "blockindex_hashindex.h"
 #include "blockindex_activeindex.h"
@@ -241,6 +242,7 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
                                               const uint256& tipHash,
                                               uint64_t recordCount,
                                               const unsigned char persistedDagInputDigest[32],
+                                              bool bindFrontier,
                                               unsigned char recomputedRoot[32],
                                               std::string* error)
 {
@@ -393,6 +395,20 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
     if (!MixCandidateLeavesIntoDagDigest(persistedDagInputDigest, candidateBinding,
                                          mixedDagInputDigest))
         return SetError(error, "candidate leaves root binding failed");
+    // R2c.1c: fold the DAG tip frontier binding for frontier-capable generations.
+    // When declared, the dag-tip-frontier.dat artifact MUST be present and valid;
+    // a missing/corrupt/mismatched frontier fails closed here.
+    if (bindFrontier)
+    {
+        unsigned char frontierBinding[32];
+        if (!ComputeDagTipFrontierBinding(dir.string(), generation,
+                                          persistedDagInputDigest,
+                                          frontierBinding, error))
+            return false;
+        unsigned char mixed2[32];
+        MixDagTipFrontierIntoDigest(mixedDagInputDigest, frontierBinding, mixed2);
+        memcpy(mixedDagInputDigest, mixed2, 32);
+    }
 
     // 6. Compute generation root from recomputed digests
     if (!ComputeGenerationRoot(generation, tipHash, recordCount,
@@ -523,7 +539,10 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
     // If capability is AUTHORITATIVE, derived.dat MUST be present and valid.
     // If capability is OLD_SHADOW (or absent in V1 manifests), derived.dat is optional.
     const fs::path derivedPath = dir / BLOCK_INDEX_DERIVED_FILE_NAME;
-    if (m.capability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE)
+    const bool isFrontierCapable =
+        (m.capability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER);
+    if (m.capability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE ||
+        isFrontierCapable)
     {
         // Authoritative generation: derived.dat MUST be present and valid
         if (!fs::exists(derivedPath))
@@ -555,10 +574,13 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
         }
         // Independently recompute the generation root from actual component files.
         // dagInputDigest is read from V3 MANIFEST (persisted by builder).
+        // R2c.1c: bindFrontier=true for frontier-capable generations, which also
+        // requires dag-tip-frontier.dat present + valid (fails closed otherwise).
         unsigned char recomputedRoot[32];
         if (!RecomputeGenerationRootFromFiles(dir, expectedGeneration,
                                               m.committedTipHash, m.recordCount,
-                                              m.dagInputDigest, recomputedRoot, error))
+                                              m.dagInputDigest, isFrontierCapable,
+                                              recomputedRoot, error))
         {
             return BLOCK_INDEX_LIFECYCLE_ERROR;
         }

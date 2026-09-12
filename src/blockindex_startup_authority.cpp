@@ -70,7 +70,11 @@ BlockIndexStartupStatus V2BlockIndexStartupAuthority::Open(const std::string& ro
         return BLOCK_INDEX_STARTUP_IO_ERROR;
     const FixedBlockIndexManifest& manifest = store.GetManifest();
 
-    if (manifest.capability != BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE)
+    // R2c.1c: AUTHORITATIVE and AUTHORITATIVE_FRONTIER are both authoritative-
+    // capable (the latter additionally carries a mandatory, bound frontier,
+    // validated in ValidateGeneration; startup authority path unchanged).
+    if (manifest.capability != BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE &&
+        manifest.capability != BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER)
     {
         // Old shadow generation: not authoritative-capable
         return BLOCK_INDEX_STARTUP_NOT_AUTHORITATIVE_CAPABLE;

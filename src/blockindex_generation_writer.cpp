@@ -169,9 +169,16 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
     // - AUTHORITATIVE: full generation root recomputed from on-disk files
     //   (commits to records+active+hashindex+derived+DAG inputs), with the
     //   DAG input digest persisted in the MANIFEST for validation.
+    // - AUTHORITATIVE_FRONTIER (R2c.1c): same authoritative full root AND the
+    //   mandatory bound dag-tip-frontier.dat folded by RecomputeGenerationRootFromFiles
+    //   (bindFrontier=true). A caller that declares this capability MUST have
+    //   materialized the artifact in the staging dir first; otherwise the
+    //   recompute fails closed and the writer never finalizes a frontier-capable
+    //   generation without its artifact.
     // - OLD_SHADOW: metadata-only binding (tipHash || recordCount || gen).
     unsigned char binding[32];
-    if (generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE)
+    if (generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE ||
+        generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER)
     {
         unsigned char dagDigest[32];
         memset(dagDigest, 0, 32);
@@ -194,7 +201,10 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
         // RecomputeGenerationRootFromFiles applies the canonical mix itself.
         boost::filesystem::path sdir(stagingDir_);
         if (!RecomputeGenerationRootFromFiles(sdir, generation, committedTipHash,
-                                              recordCount, usedDag, binding, error))
+                                              recordCount, usedDag,
+                                              generationCapability ==
+                                                  BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER,
+                                              binding, error))
             return SetError(error, std::string("writer: recompute generation root failed: ") +
                                    (error ? *error : "unknown"));
     }
@@ -218,7 +228,8 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
     man.committedTipHeight = committedTipHeight;
     man.committedTipHash = committedTipHash;
     man.capability = generationCapability;
-    if (generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE)
+    if (generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE ||
+        generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER)
     {
         unsigned char dagDigest[32];
         memset(dagDigest, 0, 32);
