@@ -16,7 +16,7 @@
 #include <QLineEdit>
 #include <QMenu>
 #include <QMessageBox>
-#include <QRegExp>
+#include <QRegularExpression>
 #include <QSettings>
 
 #ifdef USE_QRCODE
@@ -46,8 +46,8 @@ protected:
         if (source->data(labelIndex, AddressTableModel::TypeRole).toString() != m_type)
             return false;
 
-        const QRegExp pattern = filterRegExp();
-        if (pattern.isEmpty())
+        const QRegularExpression pattern = filterRegularExpression();
+        if (pattern.pattern().isEmpty())
             return true;
 
         const QModelIndex addressIndex = source->index(row, AddressTableModel::Address, parent);

@@ -40,6 +40,7 @@
 
 #include <QApplication>
 #include <QMainWindow>
+#include <QActionGroup>
 #include <QMenuBar>
 #include <QMenu>
 #include <QIcon>
@@ -59,6 +60,7 @@
 #include <QMovie>
 #include <QFileDialog>
 #include <QDesktopServices>
+#include <QStandardPaths>
 #include <QTimer>
 #include <QDragEnterEvent>
 #include <QUrl>
@@ -872,7 +874,7 @@ void BitcoinGUI::setNumBlocks(int count, int nTotalBlocks)
             nBlocksPerSec = 0;
 
             if (nBlocksPerSec>0) {
-              nRemainingTime = QDateTime::fromTime_t((nTotalBlocks - count) / nBlocksPerSec).toUTC().toString("hh'h'mm'm'");
+              nRemainingTime = QDateTime::fromSecsSinceEpoch((nTotalBlocks - count) / nBlocksPerSec).toUTC().toString("hh'h'mm'm'");
           }
 
           QDateTime lastBlockDate = clientModel->getLastBlockDate();
@@ -1351,7 +1353,7 @@ void BitcoinGUI::encryptWallet(bool status)
 
 void BitcoinGUI::backupWallet()
 {
-    QString saveDir = QDesktopServices::storageLocation(QDesktopServices::DocumentsLocation);
+    QString saveDir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
     QString filename = QFileDialog::getSaveFileName(this, tr("Backup Wallet"), saveDir, tr("Wallet Data (*.dat)"));
 
     if(!filename.isEmpty()) {

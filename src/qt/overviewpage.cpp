@@ -49,9 +49,9 @@ public:
         bool confirmed = index.data(TransactionTableModel::ConfirmedRole).toBool();
         QVariant value = index.data(Qt::ForegroundRole);
         QColor foreground = option.palette.color(QPalette::Text);
-        if(qVariantCanConvert<QColor>(value))
+        if (value.canConvert<QColor>())
         {
-            foreground = qvariant_cast<QColor>(value);
+            foreground = value.value<QColor>();
         }
 
         QString amountText = BitcoinUnits::formatWithUnit(unit, amount, true);
@@ -64,7 +64,7 @@ public:
         amountFont.setBold(true);
         QFontMetrics amountMetrics(amountFont);
         QFontMetrics textMetrics(option.font);
-        int amountWidth = amountMetrics.width(amountText) + 12;
+        int amountWidth = amountMetrics.horizontalAdvance(amountText) + 12;
         if(amountWidth < 110)
             amountWidth = 110;
 

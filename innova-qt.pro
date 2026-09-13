@@ -6,7 +6,7 @@ DEFINES += QT_GUI BOOST_THREAD_USE_LIB BOOST_SPIRIT_THREADSAFE
 CONFIG += no_include_pwd
 CONFIG += thread
 CONFIG += static
-CONFIG += c++11
+CONFIG += c++17
 QT += core gui network widgets concurrent
 
 # Qt test build: qmake CONFIG+=qt_test
@@ -41,7 +41,6 @@ greaterThan(QT_MAJOR_VERSION, 4) {
 
 linux {
     QMAKE_CFLAGS += -std=gnu99
-        BOOST_LIB_PATH = /home/user/innova/build/lib
 }
 
 win32 {
@@ -670,17 +669,35 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/ibdblocklatency.cpp \
     src/pinglifecycletrace.cpp \
     src/bootstrap.cpp \
+    src/blockindex_navigation.cpp \
+    src/cold_hot_seam.cpp \
+    src/authoritative_blockindex_hot_resolver.cpp \
     src/blockindex_accessor.cpp \
     src/blockindex_startup_authority.cpp \
+    src/blockindex_startup_seam.cpp \
+    src/blockindex_startup_bootstrap.cpp \
+    src/blockindex_dag_restart_seam.cpp \
+    src/dag_source_binding_verifier.cpp \
+    src/dag_logical_authority.cpp \
+    src/dag_tip_frontier.cpp \
+    src/dag_tip_live_overlay.cpp \
+    src/dag_tips_delta.cpp \
+    src/dag_tip_frontier_metadata.cpp \
     src/blockindex_derived_state.cpp \
     src/blockindex_hashindex.cpp \
     src/fixed_blockindex_store.cpp \
     src/blockindex_activeindex.cpp \
+    src/blockindex_active_chain_reader.cpp \
     src/blockindex_generation_builder.cpp \
+    src/blockindex_candidate_startup_builder.cpp \
+    src/blockindex_stake_seen_builder.cpp \
     src/blockindex_generation_lifecycle.cpp \
     src/blockindex_shadow_runtime.cpp \
     src/blockindex_shadow_startup.cpp \
+    src/blockindex_authoritative_startup.cpp \
+    src/blockindex_residency_counters.cpp \
     src/blockindex_v2_reader.cpp \
+    src/blockindex_authority_materializer.cpp \
     src/smessage_stub.cpp \
     src/net.cpp \
     src/checkpoints.cpp \
@@ -761,6 +778,16 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/silentpayments.cpp \
     src/dandelion.cpp \
     src/finality.cpp \
+    src/candidate_frontier.cpp \
+    src/candidate_frontier_metadata.cpp \
+    src/blockindex_hot_owner.cpp \
+    src/blockindex_tip.cpp \
+    src/blockindex_live_tail.cpp \
+    src/blockindex_live_tail_full.cpp \
+    src/blockindex_live_acceptance.cpp \
+    src/blockindex_authoritative_restart.cpp \
+    src/blockindex_authoritative_live.cpp \
+    src/hreg_registration.cpp \
     src/dag.cpp
 
 #### I n n o v a sources

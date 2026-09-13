@@ -121,8 +121,7 @@ void MultisigInputEntry::on_transactionId_textChanged(const QString &transaction
         idStr.setNum(i);
         const CTxOut& txOut = tx.vout[i];
         int64_t amount = txOut.nValue;
-        QString amountStr;
-        amountStr.sprintf("%.6f", (double) amount / COIN);
+        QString amountStr = QString::asprintf("%.6f", (double) amount / COIN);
         CScript script = txOut.scriptPubKey;
         CTxDestination addr;
         if(ExtractDestination(script, addr))

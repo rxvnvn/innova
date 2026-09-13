@@ -144,7 +144,7 @@ CoinControlDialog::CoinControlDialog(QWidget *parent) :
     connect(ui->treeWidget, SIGNAL(itemChanged( QTreeWidgetItem*, int)), this, SLOT(viewItemChanged( QTreeWidgetItem*, int)));
 
     // click on header
-    ui->treeWidget->header()->setClickable(true);
+    ui->treeWidget->header()->setSectionsClickable(true);
     connect(ui->treeWidget->header(), SIGNAL(sectionClicked(int)), this, SLOT(headerSectionClicked(int)));
 
     // ok button
@@ -762,7 +762,7 @@ void CoinControlDialog::updateView()
         treeWidget->clear();
         treeWidget->setAlternatingRowColors(!treeMode);
         QFlags<Qt::ItemFlag> flgCheckbox=Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable;
-        QFlags<Qt::ItemFlag> flgTristate=Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable | Qt::ItemIsTristate;
+        QFlags<Qt::ItemFlag> flgTristate=Qt::ItemIsSelectable | Qt::ItemIsEnabled | Qt::ItemIsUserCheckable | Qt::ItemIsAutoTristate;
 
         int nDisplayUnit = BitcoinUnits::BTC;
         if (model && model->getOptionsModel())
@@ -845,7 +845,7 @@ void CoinControlDialog::updateView()
                 itemOutput->setData(COLUMN_CHECKBOX, AmountRole, QVariant::fromValue<qint64>(out.tx->vout[out.i].nValue));
 
                 // date
-                itemOutput->setText(COLUMN_DATE, QDateTime::fromTime_t(out.tx->GetTxTime()).toUTC().toString("yy-MM-dd hh:mm"));
+                itemOutput->setText(COLUMN_DATE, QDateTime::fromSecsSinceEpoch(out.tx->GetTxTime()).toUTC().toString("yy-MM-dd hh:mm"));
 
                 // immature PoS reward
                 if (out.tx->IsCoinStake() && out.tx->GetBlocksToMaturity() > 0 && out.tx->GetDepthInMainChain() > 0) {
