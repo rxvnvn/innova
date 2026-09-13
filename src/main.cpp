@@ -129,9 +129,23 @@ bool fSPVMode = false;
 bool fIbdHeadersObserve = false;
 bool fIbdHeaderScheduler = false;
 bool fRegTestIbd = false;
-// R2c.1d1 test-only default-off failpoint. It is never set by production
-// configuration and makes SetBestChain fail only to exercise Add rollback.
+// R2c.1d1/R2c.1d2a test-only default-off failpoints. They are never set by
+// production configuration; the DAG-link failures exercise local DB-failure
+// semantics without changing consensus or peer policy when disabled.
 bool g_testFailSetBestChainAfterDagInit = false;
+bool g_testFailInitialDagLinksCommit = false;
+bool g_testFailFailedAddDagLinksCleanupCommit = false;
+bool g_testFailReorganizeDagLinksEraseCommit = false;
+bool g_testSuppressDagSourceAbort = false;
+bool g_dagSourceUnhealthy = false;
+
+static bool AbortDagSourcePersistence(const char* message)
+{
+    g_dagSourceUnhealthy = true;
+    if (g_testSuppressDagSourceAbort)
+        return false;
+    return AbortNode(message);
+}
 static CIbdHeadersObserver g_ibdHeadersObserver(512); // OBSERVATION WINDOW, not policy
 
 namespace
@@ -8488,7 +8502,8 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
             if (pindex->nHeight >= FORK_HEIGHT_DAG && pindex->phashBlock)
                 txdbDAGClean.EraseDAGLinks(pindex->GetBlockHash());
         }
-        txdbDAGClean.TxnCommit();
+        if (g_testFailReorganizeDagLinksEraseCommit || !txdbDAGClean.TxnCommit())
+            return AbortDagSourcePersistence("Reorganize: DAG-link erase persistence failed; shutting down to prevent stale DAG source");
     }
     // Phase 2: Memory cleanup after LevelDB commit (reverse order: children first).
     // The legacy reorg transaction is durable at this point; publish only after
@@ -9017,7 +9032,12 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                         ibdactivepath::GetCounters().dag_epoch_commit_us_max,
                         ibdactivepath::GetCounters().dag_epoch_commit_count,
                         "dag_commit", pindexNew->nHeight);
-                    txdbDAG.TxnCommit();
+                    if (g_testFailInitialDagLinksCommit || !txdbDAG.TxnCommit())
+                    {
+                        if (fDagTipDeltaTransaction)
+                            DiscardDagTipDeltaTransaction();
+                        return AbortDagSourcePersistence("AddToBlockIndex: DAG-link persistence failed; shutting down to prevent stale DAG source");
+                    }
                 }
             }
             nDAGWriteMs = GetTimeMillis() - nDAGTimer;
@@ -9088,7 +9108,12 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                         if (g_dagManager.HasDAGData(hashParent))
                             g_dagManager.WriteDAGLinks(txdbDAGClean, hashParent);
                     }
-                    txdbDAGClean.TxnCommit();
+                    if (g_testFailFailedAddDagLinksCleanupCommit || !txdbDAGClean.TxnCommit())
+                    {
+                        if (fDagTipDeltaTransaction)
+                            DiscardDagTipDeltaTransaction();
+                        return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback persistence failed; shutting down to prevent stale DAG source");
+                    }
                 }
             }
 

@@ -49,6 +49,11 @@ namespace fs = boost::filesystem;
 
 extern CWallet* pwalletMain;
 extern bool g_testFailSetBestChainAfterDagInit;
+extern bool g_testFailInitialDagLinksCommit;
+extern bool g_testFailFailedAddDagLinksCleanupCommit;
+extern bool g_testFailReorganizeDagLinksEraseCommit;
+extern bool g_testSuppressDagSourceAbort;
+extern bool g_dagSourceUnhealthy;
 
 // ---- genuine-block mining (real consensus path) ----
 static CBlock* BuildPoWBlock(CBlockIndex* pindexPrev, unsigned int nExtra)
@@ -320,6 +325,98 @@ BOOST_AUTO_TEST_CASE(r2c1d1_real_nested_reorg_joins_add_transaction)
     std::set<uint256> post(postv.begin(),postv.end());
     BOOST_CHECK_EQUAL(begin,1); BOOST_CHECK_EQUAL(end,1); BOOST_CHECK_GT(records,0); BOOST_CHECK(replay==post);
     SetDagTipCommittedDeltaObserver(NULL,NULL);
+}
+
+BOOST_AUTO_TEST_CASE(r2c1d2a_initial_daglink_commit_failure_aborts_locally)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* parent = pindexBest;
+    while (parent->nHeight < GetForkHeightDAG()) parent = MineReal(parent, 0x5400 + parent->nHeight);
+    CBlock* block = BuildPoWBlock(parent, 0x5499);
+    BOOST_REQUIRE(block != NULL);
+    AttachDagParentsAndRemine(block, std::vector<uint256>(1, parent->GetBlockHash()));
+    unsigned int nFile = 0, nBlockPos = 0;
+    g_testSuppressDagSourceAbort = true;
+    g_dagSourceUnhealthy = false;
+    g_testFailInitialDagLinksCommit = true;
+    bool added = false;
+    { LOCK(cs_main); added = block->WriteToDisk(nFile, nBlockPos) && block->AddToBlockIndex(nFile, nBlockPos, block->GetHash()); }
+    g_testFailInitialDagLinksCommit = false;
+    delete block;
+    BOOST_CHECK(!added);
+    BOOST_CHECK(g_dagSourceUnhealthy);
+    g_dagSourceUnhealthy = false;
+    g_testSuppressDagSourceAbort = false;
+}
+
+BOOST_AUTO_TEST_CASE(r2c1d2a_failed_add_cleanup_commit_failure_aborts_locally)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* parent = pindexBest;
+    while (parent->nHeight < GetForkHeightDAG()) parent = MineReal(parent, 0x5500 + parent->nHeight);
+    CBlock* block = BuildPoWBlock(parent, 0x5599);
+    BOOST_REQUIRE(block != NULL);
+    AttachDagParentsAndRemine(block, std::vector<uint256>(1, parent->GetBlockHash()));
+    unsigned int nFile = 0, nBlockPos = 0;
+    g_testSuppressDagSourceAbort = true;
+    g_dagSourceUnhealthy = false;
+    g_testFailSetBestChainAfterDagInit = true;
+    g_testFailFailedAddDagLinksCleanupCommit = true;
+    bool added = false;
+    { LOCK(cs_main); added = block->WriteToDisk(nFile, nBlockPos) && block->AddToBlockIndex(nFile, nBlockPos, block->GetHash()); }
+    g_testFailSetBestChainAfterDagInit = false;
+    g_testFailFailedAddDagLinksCleanupCommit = false;
+    delete block;
+    BOOST_CHECK(!added);
+    BOOST_CHECK(g_dagSourceUnhealthy);
+    g_dagSourceUnhealthy = false;
+    g_testSuppressDagSourceAbort = false;
+}
+
+BOOST_AUTO_TEST_CASE(r2c1d2a_reorganize_erase_commit_failure_source_unhealthy)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* fork = pindexBest;
+    while (fork->nHeight < GetForkHeightDAG()) fork = MineReal(fork, 0x5600 + fork->nHeight);
+    // Build a clear best chain on the a-branch.
+    CBlockIndex* a1 = MineRealDag(fork, 0x5611);
+    CBlockIndex* a2 = MineRealDag(a1, 0x5612);
+    // Inject consecutive b-branch children (starting from the fork) with the
+    // DAG-link erase failpoint armed. The first injected block that triggers a
+    // real Reorganize reaches the production erase-commit site and flips source
+    // unhealthy (failpoint is read ONLY inside Reorganize). Loop is bounded.
+    g_testSuppressDagSourceAbort = true;
+    g_dagSourceUnhealthy = false;
+    g_testFailReorganizeDagLinksEraseCommit = true;
+    CBlockIndex* sidePrev = fork;
+    bool injected = false;
+    for (int i = 0; i < 6 && !g_dagSourceUnhealthy && !injected; ++i)
+    {
+        CBlock* block = BuildPoWBlock(sidePrev, 0x5620 + i);
+        BOOST_REQUIRE(block != NULL);
+        AttachDagParentsAndRemine(block, std::vector<uint256>(1, sidePrev->GetBlockHash()));
+        unsigned int nFile = 0, nBlockPos = 0;
+        bool added = false;
+        { LOCK(cs_main);
+          if (block->WriteToDisk(nFile, nBlockPos))
+              added = block->AddToBlockIndex(nFile, nBlockPos, block->GetHash());
+          sidePrev = mapBlockIndex.count(block->GetHash()) ? mapBlockIndex[block->GetHash()] : sidePrev;
+        }
+        injected = added;
+        delete block;
+    }
+    g_testFailReorganizeDagLinksEraseCommit = false;
+
+    // A real reorg occurred (either an added block that won, or an abort mid-reorg).
+    BOOST_CHECK(g_dagSourceUnhealthy);
+    // The failpoint aborts the production erase site: at least one Add did not
+    // return normally as a successful best-chain advance under healthy source.
+    BOOST_CHECK(injected == false || g_dagSourceUnhealthy);
+    g_dagSourceUnhealthy = false;
+    g_testSuppressDagSourceAbort = false;
 }
 
 BOOST_AUTO_TEST_SUITE_END()
