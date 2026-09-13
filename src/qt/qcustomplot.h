@@ -45,6 +45,7 @@
 #include <QMargins>
 #include <qmath.h>
 #include <limits>
+#include <algorithm>
 #if QT_VERSION < QT_VERSION_CHECK(5, 0, 0)
 #  include <qnumeric.h>
 #  include <QPrinter>
@@ -2482,9 +2483,9 @@ Q_DECLARE_TYPEINFO(QCPData, Q_MOVABLE_TYPE);
   This is the container in which QCPGraph holds its data.
   \see QCPData, QCPGraph::setData
 */
-typedef QMap<double, QCPData> QCPDataMap;
-typedef QMapIterator<double, QCPData> QCPDataMapIterator;
-typedef QMutableMapIterator<double, QCPData> QCPDataMutableMapIterator;
+typedef QMultiMap<double, QCPData> QCPDataMap;
+typedef QMultiMapIterator<double, QCPData> QCPDataMapIterator;
+typedef QMutableMultiMapIterator<double, QCPData> QCPDataMutableMapIterator;
 
 
 class QCP_LIB_DECL QCPGraph : public QCPAbstractPlottable
@@ -2652,9 +2653,9 @@ Q_DECLARE_TYPEINFO(QCPCurveData, Q_MOVABLE_TYPE);
   \see QCPCurveData, QCPCurve::setData
 */
 
-typedef QMap<double, QCPCurveData> QCPCurveDataMap;
-typedef QMapIterator<double, QCPCurveData> QCPCurveDataMapIterator;
-typedef QMutableMapIterator<double, QCPCurveData> QCPCurveDataMutableMapIterator;
+typedef QMultiMap<double, QCPCurveData> QCPCurveDataMap;
+typedef QMultiMapIterator<double, QCPCurveData> QCPCurveDataMapIterator;
+typedef QMutableMultiMapIterator<double, QCPCurveData> QCPCurveDataMutableMapIterator;
 
 
 class QCP_LIB_DECL QCPCurve : public QCPAbstractPlottable
@@ -2815,9 +2816,9 @@ Q_DECLARE_TYPEINFO(QCPBarData, Q_MOVABLE_TYPE);
   This is the container in which QCPBars holds its data.
   \see QCPBarData, QCPBars::setData
 */
-typedef QMap<double, QCPBarData> QCPBarDataMap;
-typedef QMapIterator<double, QCPBarData> QCPBarDataMapIterator;
-typedef QMutableMapIterator<double, QCPBarData> QCPBarDataMutableMapIterator;
+typedef QMultiMap<double, QCPBarData> QCPBarDataMap;
+typedef QMultiMapIterator<double, QCPBarData> QCPBarDataMapIterator;
+typedef QMutableMultiMapIterator<double, QCPBarData> QCPBarDataMutableMapIterator;
 
 
 class QCP_LIB_DECL QCPBars : public QCPAbstractPlottable
@@ -3137,9 +3138,9 @@ Q_DECLARE_TYPEINFO(QCPFinancialData, Q_MOVABLE_TYPE);
   This is the container in which QCPFinancial holds its data.
   \see QCPFinancial, QCPFinancial::setData
 */
-typedef QMap<double, QCPFinancialData> QCPFinancialDataMap;
-typedef QMapIterator<double, QCPFinancialData> QCPFinancialDataMapIterator;
-typedef QMutableMapIterator<double, QCPFinancialData> QCPFinancialDataMutableMapIterator;
+typedef QMultiMap<double, QCPFinancialData> QCPFinancialDataMap;
+typedef QMultiMapIterator<double, QCPFinancialData> QCPFinancialDataMapIterator;
+typedef QMutableMultiMapIterator<double, QCPFinancialData> QCPFinancialDataMutableMapIterator;
 
 
 class QCP_LIB_DECL QCPFinancial : public QCPAbstractPlottable

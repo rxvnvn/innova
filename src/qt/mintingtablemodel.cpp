@@ -18,6 +18,8 @@
 #include <QList>
 #include <QColor>
 #include <QTimer>
+
+#include <algorithm>
 #include <QIcon>
 #include <QDateTime>
 #include <QtAlgorithms>
@@ -99,7 +101,7 @@ public:
         //  can be emitted from end to beginning (so that earlier updates will not influence
         // the indices of latter ones).
         QList<uint256> updated_sorted = updated;
-        qSort(updated_sorted);
+        std::sort(updated_sorted.begin(), updated_sorted.end());
 
         {
             TRY_LOCK(cs_main, lockMain);
@@ -114,9 +116,9 @@ public:
                 bool inWallet = mi != wallet->mapWallet.end();
 
                 // Find bounds of this transaction in model
-                QList<KernelRecord>::iterator lower = qLowerBound(
+                QList<KernelRecord>::iterator lower = std::lower_bound(
                     cachedWallet.begin(), cachedWallet.end(), hash, TxLessThan());
-                QList<KernelRecord>::iterator upper = qUpperBound(
+                QList<KernelRecord>::iterator upper = std::upper_bound(
                     cachedWallet.begin(), cachedWallet.end(), hash, TxLessThan());
                 int lowerIndex = (lower - cachedWallet.begin());
                 int upperIndex = (upper - cachedWallet.begin());
@@ -359,7 +361,7 @@ QVariant MintingTableModel::data(const QModelIndex &index, int role) const
             //return formatTxPoSReward(rec);
         }
         break;
-      case Qt::BackgroundColorRole:
+      case Qt::BackgroundRole:
         minAge = nStakeMinAge / 60 / 60 / 8;
         maxAge = nStakeMaxAge / 60 / 60 / 24;
         if(rec->getAge() < minAge)

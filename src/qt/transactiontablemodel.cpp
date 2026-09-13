@@ -3,6 +3,8 @@
 #include "transactionrecord.h"
 #include "guiconstants.h"
 #include "transactiondesc.h"
+
+#include <algorithm>
 #include "walletmodel.h"
 #include "optionsmodel.h"
 #include "addresstablemodel.h"
@@ -104,9 +106,9 @@ public:
             bool inWallet = mi != wallet->mapWallet.end();
 
             // Find bounds of this transaction in model
-            QList<TransactionRecord>::iterator lower = qLowerBound(
+            QList<TransactionRecord>::iterator lower = std::lower_bound(
                 cachedWallet.begin(), cachedWallet.end(), hash, TxLessThan());
-            QList<TransactionRecord>::iterator upper = qUpperBound(
+            QList<TransactionRecord>::iterator upper = std::upper_bound(
                 cachedWallet.begin(), cachedWallet.end(), hash, TxLessThan());
             int lowerIndex = (lower - cachedWallet.begin());
             int upperIndex = (upper - cachedWallet.begin());
@@ -566,7 +568,7 @@ QVariant TransactionTableModel::data(const QModelIndex &index, int role) const
     case TypeRole:
         return rec->type;
     case DateRole:
-        return QDateTime::fromTime_t(static_cast<uint>(rec->time));
+        return QDateTime::fromSecsSinceEpoch(static_cast<uint>(rec->time));
     case LongDescriptionRole:
         return priv->describe(rec);
     case AddressRole:

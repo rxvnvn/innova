@@ -35,11 +35,12 @@
 #include <QSettings>
 #include <QBuffer>
 #include <QUrl>
+#include <QRegularExpression>
 
 MRichTextEdit::MRichTextEdit(QWidget *parent) : QWidget(parent) {
     setupUi(this);
     m_lastBlockList = 0;
-    f_textedit->setTabStopWidth(40);
+    f_textedit->setTabStopDistance(40);
 
     connect(f_textedit, SIGNAL(currentCharFormatChanged(QTextCharFormat)),
             this,     SLOT(slotCurrentCharFormatChanged(QTextCharFormat)));
@@ -150,7 +151,7 @@ MRichTextEdit::MRichTextEdit(QWidget *parent) : QWidget(parent) {
     // text background color
 
     QPixmap pix(16, 16);
-    pix.fill(QApplication::palette().background().color());
+    pix.fill(QApplication::palette().color(QPalette::Window));
     f_bgcolor->setIcon(pix);
 
     connect(f_bgcolor, SIGNAL(clicked()), this, SLOT(textBgColor()));
@@ -401,7 +402,7 @@ void MRichTextEdit::bgColorChanged(const QColor &c) {
     if (c.isValid()) {
         pix.fill(c);
       } else {
-        pix.fill(QApplication::palette().background().color());
+        pix.fill(QApplication::palette().color(QPalette::Window));
         }
     f_bgcolor->setIcon(pix);
 }
@@ -422,9 +423,9 @@ void MRichTextEdit::slotClipboardDataChanged() {
 QString MRichTextEdit::toHtml() const {
     QString s = f_textedit->toHtml();
     // convert emails to links
-    s = s.replace(QRegExp("(<[^a][^>]+>(?:<span[^>]+>)?|\\s)([a-zA-Z\\d]+@[a-zA-Z\\d]+\\.[a-zA-Z]+)"), "\\1<a href=\"mailto:\\2\">\\2</a>");
+    s = s.replace(QRegularExpression("(<[^a][^>]+>(?:<span[^>]+>)?|\\s)([a-zA-Z\\d]+@[a-zA-Z\\d]+\\.[a-zA-Z]+)"), "\\1<a href=\"mailto:\\2\">\\2</a>");
     // convert links
-    s = s.replace(QRegExp("(<[^a][^>]+>(?:<span[^>]+>)?|\\s)((?:https?|ftp|file)://[^\\s'\"<>]+)"), "\\1<a href=\"\\2\">\\2</a>");
+    s = s.replace(QRegularExpression("(<[^a][^>]+>(?:<span[^>]+>)?|\\s)((?:https?|ftp|file)://[^\\s'\"<>]+)"), "\\1<a href=\"\\2\">\\2</a>");
     // see also: Utils::linkify()
     return s;
 }

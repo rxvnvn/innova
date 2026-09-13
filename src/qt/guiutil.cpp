@@ -11,12 +11,14 @@
 #include <QFont>
 #include <QLineEdit>
 #include <QUrl>
-#include <QTextDocument> // For Qt::escape
+#include <QUrlQuery>
 #include <QAbstractItemView>
 #include <QApplication>
 #include <QClipboard>
 #include <QFileDialog>
 #include <QDesktopServices>
+#include <QStandardPaths>
+#include <QRegularExpression>
 #include <QThread>
 
 #ifndef Q_MOC_RUN
@@ -73,12 +75,12 @@ QString boostPathToQString(const boost::filesystem::path &path)
 
 QString dateTimeStr(const QDateTime &date)
 {
-    return date.date().toString(Qt::SystemLocaleShortDate) + QString(" ") + date.toString("hh:mm");
+    return QLocale().toString(date.date(), QLocale::ShortFormat) + QString(" ") + date.toString("hh:mm");
 }
 
 QString dateTimeStr(qint64 nTime)
 {
-    return dateTimeStr(QDateTime::fromTime_t((qint32)nTime));
+    return dateTimeStr(QDateTime::fromSecsSinceEpoch(static_cast<qint32>(nTime)));
 }
 
 QString formatDurationStr(int secs)
@@ -180,26 +182,28 @@ bool parseBitcoinURI(const QUrl &uri, SendCoinsRecipient *out)
     SendCoinsRecipient rv;
     rv.address = uri.path();
     rv.amount = 0;
-    QList<QPair<QString, QString> > items = uri.queryItems();
-    for (QList<QPair<QString, QString> >::iterator i = items.begin(); i != items.end(); i++)
+    const QList<QPair<QString, QString> > items = QUrlQuery(uri).queryItems();
+    for (QList<QPair<QString, QString> >::const_iterator i = items.cbegin(); i != items.cend(); ++i)
     {
+        QString key = i->first;
+        const QString &value = i->second;
         bool fShouldReturnFalse = false;
-        if (i->first.startsWith("req-"))
+        if (key.startsWith("req-"))
         {
-            i->first.remove(0, 4);
+            key.remove(0, 4);
             fShouldReturnFalse = true;
         }
 
-        if (i->first == "label")
+        if (key == "label")
         {
-            rv.label = i->second;
+            rv.label = value;
             fShouldReturnFalse = false;
         }
-        else if (i->first == "amount")
+        else if (key == "amount")
         {
-            if(!i->second.isEmpty())
+            if(!value.isEmpty())
             {
-                if(!BitcoinUnits::parse(BitcoinUnits::BTC, i->second, &rv.amount))
+                if(!BitcoinUnits::parse(BitcoinUnits::BTC, value, &rv.amount))
                 {
                     return false;
                 }
@@ -233,7 +237,7 @@ bool parseBitcoinURI(QString uri, SendCoinsRecipient *out)
 
 QString HtmlEscape(const QString& str, bool fMultiLine)
 {
-    QString escaped = Qt::escape(str);
+    QString escaped = str.toHtmlEscaped();
     if(fMultiLine)
     {
         escaped = escaped.replace("\n", "<br>\n");
@@ -300,7 +304,7 @@ QString getSaveFileName(QWidget *parent, const QString &caption,
     QString myDir;
     if(dir.isEmpty()) // Default to user documents location
     {
-        myDir = QDesktopServices::storageLocation(QDesktopServices::DocumentsLocation);
+        myDir = QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
     }
     else
     {
@@ -309,11 +313,12 @@ QString getSaveFileName(QWidget *parent, const QString &caption,
     QString result = QFileDialog::getSaveFileName(parent, caption, myDir, filter, &selectedFilter);
 
     /* Extract first suffix from filter pattern "Description (*.foo)" or "Description (*.foo *.bar ...) */
-    QRegExp filter_re(".* \\(\\*\\.(.*)[ \\)]");
+    QRegularExpression filterRe("^.* \\(\\*\\.(.*)[ \\)]$");
     QString selectedSuffix;
-    if(filter_re.exactMatch(selectedFilter))
+    const QRegularExpressionMatch filterMatch = filterRe.match(selectedFilter);
+    if(filterMatch.hasMatch())
     {
-        selectedSuffix = filter_re.cap(1);
+        selectedSuffix = filterMatch.captured(1);
     }
 
     /* Add suffix if needed */
