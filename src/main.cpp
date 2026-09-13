@@ -129,6 +129,9 @@ bool fSPVMode = false;
 bool fIbdHeadersObserve = false;
 bool fIbdHeaderScheduler = false;
 bool fRegTestIbd = false;
+// R2c.1d1 test-only default-off failpoint. It is never set by production
+// configuration and makes SetBestChain fail only to exercise Add rollback.
+bool g_testFailSetBestChainAfterDagInit = false;
 static CIbdHeadersObserver g_ibdHeadersObserver(512); // OBSERVATION WINDOW, not policy
 
 namespace
@@ -8487,7 +8490,10 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         }
         txdbDAGClean.TxnCommit();
     }
-    // Phase 2: Memory cleanup after LevelDB commit (reverse order: children first)
+    // Phase 2: Memory cleanup after LevelDB commit (reverse order: children first).
+    // The legacy reorg transaction is durable at this point; publish only after
+    // the remaining in-memory reorg completion path reaches its final success.
+    const bool fDagTipDeltaTransaction = BeginDagTipDeltaTransaction(DAG_TIP_DELTA_REORGANIZE);
     bool fDAGReorg = false;
     for (auto rit = vDisconnect.rbegin(); rit != vDisconnect.rend(); ++rit)
     {
@@ -8544,6 +8550,11 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 
     CollateralNReorgBlock = true;
     printf("REORGANIZE: done\n");
+
+    if (fDagTipDeltaTransaction)
+        CommitDagTipDeltaTransaction();
+    else
+        LeaveDagTipDeltaTransaction();
 
     return true;
 }
@@ -8607,6 +8618,8 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     if (IsBlockOperatorInvalid(pindexNew))
         return error("SetBestChain() : block %s (or an ancestor) is invalidated by the operator",
                      pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+    if (g_testFailSetBestChainAfterDagInit)
+        return false;
     uint256 hash = GetHash();
     ibdblocklatency::RecordSetBestChainBegin(hash);
     const uint256 hashOldBest = hashBestChain;
@@ -8958,6 +8971,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     }
 
     bool fDAGDataInitialized = false;
+    bool fDagTipDeltaTransaction = false;
     std::vector<uint256> vDAGParents;
 
     // IDAG Phase 2: Initialize DAG data for post-fork blocks
@@ -8974,6 +8988,9 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         if (!vDAGParents.empty())
         {
             int64_t nDAGTimer = GetTimeMillis();
+            // R2c.1d1: capture exact legacy membership changes, but defer
+            // passive publication until this AddToBlockIndex returns success.
+            fDagTipDeltaTransaction = BeginDagTipDeltaTransaction(DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX);
             g_dagManager.InitBlockDAGData(pindexNew, vDAGParents);
             fDAGDataInitialized = true;
             nDAGInitMs = GetTimeMillis() - nDAGTimer;
@@ -9082,6 +9099,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 setStakeSeen.erase(make_pair(pindexNew->prevoutStake, pindexNew->nStakeTime));
             delete pindexNew;
             ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
+            if (fDagTipDeltaTransaction)
+                DiscardDagTipDeltaTransaction();
             return false;
         }
     }
@@ -9141,6 +9160,9 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                        pindexNew->nHeight, perr.c_str());
         }
     }
+
+    if (fDagTipDeltaTransaction)
+        CommitDagTipDeltaTransaction();
 
     return true;
 }

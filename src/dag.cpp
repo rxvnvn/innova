@@ -8,6 +8,7 @@
 #include "finality.h"
 #include "blockindex_residency_counters.h"
 #include "util.h"
+#include "dag_tips_delta.h"
 
 #include <algorithm>
 #include <queue>
@@ -102,6 +103,22 @@ void CDAGManager::InvalidateBlueSetCacheForBlock(const uint256& hashBlock) const
     mapBlueSetCache.erase(hashBlock);
 }
 
+bool CDAGManager::TrackedInsertTip(const uint256& hash)
+{
+    const std::pair<std::set<uint256>::iterator, bool> r = setDAGTips.insert(hash);
+    if (r.second)
+        AppendDagTipDelta(DagTipDeltaRecord(DagTipDeltaRecord::TIP_ADD, hash));
+    return r.second;
+}
+
+bool CDAGManager::TrackedEraseTip(const uint256& hash)
+{
+    if (setDAGTips.erase(hash) == 0)
+        return false;
+    AppendDagTipDelta(DagTipDeltaRecord(DagTipDeltaRecord::TIP_REMOVE, hash));
+    return true;
+}
+
 void CDAGManager::RebuildPendingChildIndex()
 {
     mapPendingChildrenByParent.clear();
@@ -177,11 +194,11 @@ bool CDAGManager::InitBlockDAGData(CBlockIndex* pindex, const std::vector<uint25
 
     // Update DAG tips: this block is a tip only if no earlier child referenced it.
     if (data.vDAGChildren.empty())
-        setDAGTips.insert(hash);
+        TrackedInsertTip(hash);
     else
-        setDAGTips.erase(hash);
+        TrackedEraseTip(hash);
     for (const uint256& hashParent : vParents)
-        setDAGTips.erase(hashParent);
+        TrackedEraseTip(hashParent);
 
     static int64_t nLastRebuildTime = 0;
     if ((int)setDAGTips.size() > 64)
@@ -840,6 +857,9 @@ void CDAGManager::ClearDAGDataForTest()
 {
     LOCK(cs_dag);
     mapDAGData.clear();
+    setDAGTips.clear();
+    mapPendingChildrenByParent.clear();
+    mapBlueSetCache.clear();
 }
 
 
@@ -861,7 +881,7 @@ void CDAGManager::RemoveBlockDAGData(const uint256& hashBlock)
             children.erase(std::remove(children.begin(), children.end(), hashBlock), children.end());
             // Parent may become a tip again if it has no other children
             if (children.empty())
-                setDAGTips.insert(hashParent);
+                TrackedInsertTip(hashParent);
         }
         else
         {
@@ -882,7 +902,7 @@ void CDAGManager::RemoveBlockDAGData(const uint256& hashBlock)
     }
 
     // Remove from tips and data
-    setDAGTips.erase(hashBlock);
+    TrackedEraseTip(hashBlock);
     mapDAGData.erase(it);
     InvalidateBlueSetCacheForBlock(hashBlock);
 }
@@ -1150,7 +1170,7 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight)
                     auto& children = pit->second.vDAGChildren;
                     children.erase(std::remove(children.begin(), children.end(), hash), children.end());
                     if (children.empty())
-                        setDAGTips.insert(hashParent);
+                        TrackedInsertTip(hashParent);
                 }
                 auto pendingIt = mapPendingChildrenByParent.find(hashParent);
                 if (pendingIt != mapPendingChildrenByParent.end())
@@ -1163,7 +1183,7 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight)
             mapDAGData.erase(dit);
         }
         mapPendingChildrenByParent.erase(hash);
-        setDAGTips.erase(hash);
+        TrackedEraseTip(hash);
         InvalidateBlueSetCacheForBlock(hash);
         nPruned++;
     }

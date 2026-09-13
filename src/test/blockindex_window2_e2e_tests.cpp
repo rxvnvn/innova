@@ -36,15 +36,19 @@
 #include "wallet.h"
 #include "zkproof.h"
 #include "hooks.h"
+#include "dag.h"
+#include "dag_tips_delta.h"
 
 #include <boost/filesystem.hpp>
 #include <cstdio>
 #include <string>
 #include <vector>
+#include <set>
 
 namespace fs = boost::filesystem;
 
 extern CWallet* pwalletMain;
+extern bool g_testFailSetBestChainAfterDagInit;
 
 // ---- genuine-block mining (real consensus path) ----
 static CBlock* BuildPoWBlock(CBlockIndex* pindexPrev, unsigned int nExtra)
@@ -111,6 +115,52 @@ static CBlockIndex* AddSidePoWBlock(CBlockIndex* pindexPrev, unsigned int nExtra
     return pindex;
 }
 
+struct DagDeltaCapture
+{
+    std::vector<DagTipCommittedDeltaEvent> events;
+    static void Record(const DagTipCommittedDeltaEvent& e, void* p)
+    {
+        static_cast<DagDeltaCapture*>(p)->events.push_back(e);
+    }
+};
+
+static void AttachDagParentsAndRemine(CBlock* pblock, const std::vector<uint256>& parents)
+{
+    CTxOut out;
+    out.nValue = 0;
+    out.scriptPubKey = BuildDAGParentScript(parents);
+    pblock->vtx[0].vout.push_back(out);
+    pblock->hashMerkleRoot = pblock->BuildMerkleTree();
+    pblock->nNonce = 0;
+    uint256 target = CBigNum().SetCompact(pblock->nBits).getuint256();
+    while (pblock->GetHash() > target && pblock->nNonce < 0xffffffff)
+        ++pblock->nNonce;
+}
+
+static CBlockIndex* MineRealDag(CBlockIndex* pindexPrev, unsigned int nExtra)
+{
+    CBlock* b = BuildPoWBlock(pindexPrev, nExtra);
+    BOOST_REQUIRE(b != NULL);
+    AttachDagParentsAndRemine(b, std::vector<uint256>(1, pindexPrev->GetBlockHash()));
+    CBlockIndex* out = NULL;
+    { LOCK(cs_main); uint256 h = b->GetHash(); BOOST_REQUIRE(b->CheckBlock(true,true,true)); BOOST_REQUIRE(ProcessBlock(NULL,b)); out = mapBlockIndex[h]; }
+    delete b;
+    BOOST_REQUIRE(out != NULL);
+    return out;
+}
+
+static CBlockIndex* AddSideDag(CBlockIndex* pindexPrev, unsigned int nExtra)
+{
+    CBlock* b = BuildPoWBlock(pindexPrev, nExtra);
+    BOOST_REQUIRE(b != NULL);
+    AttachDagParentsAndRemine(b, std::vector<uint256>(1, pindexPrev->GetBlockHash()));
+    CBlockIndex* out = NULL;
+    { LOCK(cs_main); unsigned int f=0,p=0; BOOST_REQUIRE(b->WriteToDisk(f,p)); BOOST_REQUIRE(b->AddToBlockIndex(f,p,b->GetHash())); out=mapBlockIndex[b->GetHash()]; }
+    delete b;
+    BOOST_REQUIRE(out != NULL);
+    return out;
+}
+
 BOOST_AUTO_TEST_SUITE(blockindex_window2_e2e)
 
 // A+B: genuinely-valid mined blocks through the real consensus path ACCEPT and
@@ -170,6 +220,106 @@ BOOST_AUTO_TEST_CASE(e2e_side_branch_reorg)
     BOOST_CHECK(b4->nHeight >= a2->nHeight);
     printf("E2E-C PASS: side branch + reorg through real consensus — winning branch\n"
            "       (higher trust) becomes best, matching legacy semantics.\n");
+}
+
+BOOST_AUTO_TEST_CASE(r2c1d1_real_add_to_blockindex_dag_commits_replayable_delta)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+    CBlockIndex* parent = pindexBest;
+    while (parent->nHeight < GetForkHeightDAG())
+        parent = MineReal(parent, 0x5100 + parent->nHeight);
+
+    const std::vector<uint256> prev = g_dagManager.GetDAGTips();
+    const std::set<uint256> pre(prev.begin(), prev.end());
+    DagDeltaCapture capture;
+    SetDagTipCommittedDeltaObserver(&DagDeltaCapture::Record, &capture);
+    CBlock* block = BuildPoWBlock(parent, 0x5199);
+    BOOST_REQUIRE(block != NULL);
+    AttachDagParentsAndRemine(block, std::vector<uint256>(1, parent->GetBlockHash()));
+    unsigned int nFile = 0, nBlockPos = 0;
+    bool added = false;
+    {
+        LOCK(cs_main);
+        added = block->WriteToDisk(nFile, nBlockPos) &&
+                block->AddToBlockIndex(nFile, nBlockPos, block->GetHash());
+    }
+    delete block;
+    BOOST_REQUIRE(added);
+    const std::vector<uint256> postv = g_dagManager.GetDAGTips();
+    std::set<uint256> replay = pre;
+    int begins = 0, ends = 0;
+    for (size_t i = 0; i < capture.events.size(); ++i) {
+        const DagTipCommittedDeltaEvent& e = capture.events[i];
+        if (e.kind == DagTipCommittedDeltaEvent::BEGIN) { ++begins; BOOST_CHECK_EQUAL(e.origin, DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX); }
+        else if (e.kind == DagTipCommittedDeltaEvent::END) ++ends;
+        else if (e.record.op == DagTipDeltaRecord::TIP_ADD) replay.insert(e.record.hash);
+        else replay.erase(e.record.hash);
+    }
+    std::set<uint256> post(postv.begin(), postv.end());
+    BOOST_CHECK_EQUAL(begins, 1);
+    BOOST_CHECK_EQUAL(ends, 1);
+    BOOST_CHECK(replay == post);
+    SetDagTipCommittedDeltaObserver(NULL, NULL);
+}
+
+BOOST_AUTO_TEST_CASE(r2c1d1_real_failed_add_rolls_back_without_committed_delta)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* parent = pindexBest;
+    while (parent->nHeight < GetForkHeightDAG()) parent = MineReal(parent, 0x5200 + parent->nHeight);
+    const std::vector<uint256> pre = g_dagManager.GetDAGTips();
+    DagDeltaCapture capture;
+    SetDagTipCommittedDeltaObserver(&DagDeltaCapture::Record, &capture);
+    CBlock* block = BuildPoWBlock(parent, 0x5299);
+    BOOST_REQUIRE(block != NULL);
+    AttachDagParentsAndRemine(block, std::vector<uint256>(1, parent->GetBlockHash()));
+    unsigned int nFile = 0, nBlockPos = 0;
+    bool added = false;
+    g_testFailSetBestChainAfterDagInit = true;
+    {
+        LOCK(cs_main);
+        added = block->WriteToDisk(nFile, nBlockPos) && block->AddToBlockIndex(nFile, nBlockPos, block->GetHash());
+    }
+    g_testFailSetBestChainAfterDagInit = false;
+    delete block;
+    BOOST_CHECK(!added);
+    const std::vector<uint256> post = g_dagManager.GetDAGTips();
+    BOOST_CHECK(pre == post);
+    BOOST_CHECK(capture.events.empty());
+    SetDagTipCommittedDeltaObserver(NULL, NULL);
+}
+
+BOOST_AUTO_TEST_CASE(r2c1d1_real_nested_reorg_joins_add_transaction)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* fork = pindexBest;
+    while (fork->nHeight < GetForkHeightDAG()) fork = MineReal(fork, 0x5300 + fork->nHeight);
+    CBlockIndex* a1 = MineRealDag(fork, 0x5311);
+    CBlockIndex* a2 = MineRealDag(a1, 0x5312);
+    CBlockIndex* b1 = AddSideDag(fork, 0x5321);
+    CBlockIndex* b2 = AddSideDag(b1, 0x5322);
+    CBlockIndex* b3 = AddSideDag(b2, 0x5323);
+    const std::vector<uint256> prev = g_dagManager.GetDAGTips();
+    std::set<uint256> replay(prev.begin(), prev.end());
+    DagDeltaCapture capture;
+    SetDagTipCommittedDeltaObserver(&DagDeltaCapture::Record, &capture);
+    CBlockIndex* b4 = AddSideDag(b3, 0x5324);
+    BOOST_REQUIRE(b4->GetBlockHash() == hashBestChain);
+    const std::vector<uint256> postv = g_dagManager.GetDAGTips();
+    int begin=0,end=0,records=0;
+    for (size_t i=0;i<capture.events.size();++i) {
+        const DagTipCommittedDeltaEvent& e=capture.events[i];
+        if(e.kind==DagTipCommittedDeltaEvent::BEGIN) { ++begin; BOOST_CHECK_EQUAL(e.origin,DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX); }
+        else if(e.kind==DagTipCommittedDeltaEvent::END) ++end;
+        else { ++records; if(e.record.op==DagTipDeltaRecord::TIP_ADD) replay.insert(e.record.hash); else replay.erase(e.record.hash); }
+    }
+    std::set<uint256> post(postv.begin(),postv.end());
+    BOOST_CHECK_EQUAL(begin,1); BOOST_CHECK_EQUAL(end,1); BOOST_CHECK_GT(records,0); BOOST_CHECK(replay==post);
+    SetDagTipCommittedDeltaObserver(NULL,NULL);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

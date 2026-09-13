@@ -6,6 +6,7 @@
 #define INN_DAG_H
 
 #include "uint256.h"
+#include "dag_tips_delta.h"
 #include "serialize.h"
 #include "sync.h"
 #include "script.h"
@@ -279,6 +280,11 @@ private:
     void AddChildNoDuplicate(std::vector<uint256>& vChildren, const uint256& hashChild) const;
     void InvalidateBlueSetCacheForBlock(const uint256& hashBlock) const;
     void RebuildPendingChildIndex();
+
+    // R2c.1d1: only incremental live mutations use these membership-aware
+    // helpers. Startup bulk reconstruction deliberately remains raw/untracked.
+    bool TrackedInsertTip(const uint256& hash);
+    bool TrackedEraseTip(const uint256& hash);
 
     /** DAGKNIGHT: Infer local k from DAG neighborhood. */
     int InferLocalK(const uint256& hashBlock) const;
