@@ -20,12 +20,15 @@ struct Recorder
     uint64_t logical;
     unsigned int depth;
     DagTipDeltaOrigin origin;
+    bool hasFinalSourceState;
+    uint256 finalSourceState;
     std::vector<DagTipDeltaRecord> ram;
     boost::filesystem::path spillPath;
 
     Recorder() : observer(NULL), context(NULL), active(false), invalid(false),
                  spilled(false), capacity(256), logical(0), depth(0),
-                 origin(DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX) {}
+                 origin(DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX), hasFinalSourceState(false),
+                 finalSourceState(0) {}
 };
 
 Recorder g;
@@ -76,6 +79,8 @@ void ResetPending()
     g.ram.clear();
     g.logical = 0;
     g.depth = 0;
+    g.hasFinalSourceState = false;
+    g.finalSourceState = uint256(0);
     g.active = false;
     g.invalid = false;
     RemoveSpill();
@@ -112,6 +117,8 @@ DagTipDeltaState GetDagTipDeltaState()
     s.ramCapacity = g.capacity;
     s.ramRecords = g.ram.size();
     s.logicalRecords = g.logical;
+    s.hasIntendedFinalSourceStateId = g.hasFinalSourceState;
+    s.intendedFinalSourceStateId = g.finalSourceState;
     return s;
 }
 
@@ -151,6 +158,20 @@ void AppendDagTipDelta(const DagTipDeltaRecord& r)
     g.ram.push_back(r);
 }
 
+void SetDagTipDeltaFinalSourceStateId(const uint256& id)
+{
+    if (!g.active || g.invalid) return;
+    g.finalSourceState = id;
+    g.hasFinalSourceState = true;
+}
+
+bool GetDagTipDeltaFinalSourceStateId(uint256* out)
+{
+    if (!out || !g.active || !g.hasFinalSourceState) return false;
+    *out = g.finalSourceState;
+    return true;
+}
+
 void CommitDagTipDeltaTransaction()
 {
     if (!g.active) return;
@@ -168,8 +189,12 @@ void CommitDagTipDeltaTransaction()
         }
         for (size_t i = 0; !g.invalid && i < g.ram.size(); ++i)
             Deliver(DagTipCommittedDeltaEvent(g.origin, g.ram[i]));
-        if (!g.invalid)
-            Deliver(DagTipCommittedDeltaEvent(DagTipCommittedDeltaEvent::END, g.origin));
+        if (!g.invalid) {
+            DagTipCommittedDeltaEvent end(DagTipCommittedDeltaEvent::END, g.origin);
+            end.hasFinalSourceStateId = g.hasFinalSourceState;
+            end.finalSourceStateId = g.finalSourceState;
+            Deliver(end);
+        }
     }
     ResetPending();
 }

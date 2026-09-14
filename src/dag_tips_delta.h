@@ -19,17 +19,20 @@ struct DagTipCommittedDeltaEvent {
     enum Kind { BEGIN = 1, RECORD = 2, END = 3 } kind;
     DagTipDeltaOrigin origin;
     DagTipDeltaRecord record;
-    DagTipCommittedDeltaEvent(Kind k, DagTipDeltaOrigin o) : kind(k), origin(o), record() {}
-    DagTipCommittedDeltaEvent(DagTipDeltaOrigin o, const DagTipDeltaRecord& r) : kind(RECORD), origin(o), record(r) {}
+    bool hasFinalSourceStateId;
+    uint256 finalSourceStateId;
+    DagTipCommittedDeltaEvent(Kind k, DagTipDeltaOrigin o) : kind(k), origin(o), record(), hasFinalSourceStateId(false), finalSourceStateId(0) {}
+    DagTipCommittedDeltaEvent(DagTipDeltaOrigin o, const DagTipDeltaRecord& r) : kind(RECORD), origin(o), record(r), hasFinalSourceStateId(false), finalSourceStateId(0) {}
 };
 
 typedef void (*DagTipCommittedDeltaObserver)(const DagTipCommittedDeltaEvent&, void*);
 
 struct DagTipDeltaState {
-    bool enabled, active, failureLatched, spilled;
+    bool enabled, active, failureLatched, spilled, hasIntendedFinalSourceStateId;
     size_t ramCapacity, ramRecords;
     uint64_t logicalRecords;
-    DagTipDeltaState() : enabled(false), active(false), failureLatched(false), spilled(false), ramCapacity(0), ramRecords(0), logicalRecords(0) {}
+    uint256 intendedFinalSourceStateId;
+    DagTipDeltaState() : enabled(false), active(false), failureLatched(false), spilled(false), hasIntendedFinalSourceStateId(false), ramCapacity(0), ramRecords(0), logicalRecords(0), intendedFinalSourceStateId(0) {}
 };
 
 void SetDagTipCommittedDeltaObserver(DagTipCommittedDeltaObserver observer, void* context);
@@ -39,6 +42,10 @@ bool BeginDagTipDeltaTransaction(DagTipDeltaOrigin origin);
 // Close a joined nested scope without publication. Root callers use Commit/Discard.
 void LeaveDagTipDeltaTransaction();
 void AppendDagTipDelta(const DagTipDeltaRecord& record);
+// Root-only current source checkpoint. Nested source mutations overwrite this;
+// END consumers bind only the final successfully committed token.
+void SetDagTipDeltaFinalSourceStateId(const uint256& id);
+bool GetDagTipDeltaFinalSourceStateId(uint256* out);
 void CommitDagTipDeltaTransaction();
 void DiscardDagTipDeltaTransaction();
 #endif

@@ -1111,6 +1111,11 @@ void CDAGManager::RebuildDAGOrderIncremental(int nCleanHeight)
 }
 
 
+// Test-only default-off source-prune seams; production retains DAG_PRUNE_DEPTH
+// and normal LevelDB commit semantics.
+int g_testDagPruneDepth = 0;
+bool g_testFailDagPruneCommit = false;
+
 // ---------------------------------------------------------------------------
 // CDAGManager: DAG Pruning
 // ---------------------------------------------------------------------------
@@ -1119,7 +1124,8 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight)
 {
     LOCK(cs_dag);
 
-    int nPruneBelow = nHeight - DAG_PRUNE_DEPTH;
+    const int pruneDepth = g_testDagPruneDepth > 0 ? g_testDagPruneDepth : DAG_PRUNE_DEPTH;
+    int nPruneBelow = nHeight - pruneDepth;
     if (nPruneBelow <= 0)
         return true; // nothing to prune
 
@@ -1143,18 +1149,20 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight)
     if (vToErase.empty())
         return true;
 
-    // Phase 1: Write erasures + prune height to LevelDB atomically
-    if (!txdb.TxnBegin())
+    // Phase 1: Write erasures + prune height + source token atomically.
+    uint256 dagSourcePost;
+    if (!txdb.MintDAGSourceStateId(dagSourcePost) || !txdb.TxnBegin())
         return false;
 
     for (const uint256& hash : vToErase)
-        txdb.EraseDAGLinks(hash);
+        if (!txdb.EraseDAGLinks(hash)) { txdb.TxnAbort(); return false; }
 
-    // Persist prune height so GetBlueSet boundary check survives restart
-    txdb.WriteDAGCleanHeight(nPruneBelow);
-
-    if (!txdb.TxnCommit())
+    // Persist prune height so GetBlueSet boundary check survives restart.
+    if (!txdb.WriteDAGCleanHeight(nPruneBelow) ||
+        !txdb.WriteDAGSourceStateId(dagSourcePost) ||
+        g_testFailDagPruneCommit || !txdb.TxnCommit())
         return false;
+    SetDagTipDeltaFinalSourceStateId(dagSourcePost);
 
     // Phase 2: Erase from memory only after LevelDB commit succeeds
     for (const uint256& hash : vToErase)

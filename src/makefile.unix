@@ -788,6 +788,9 @@ innova-blockindex-navdiff: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/bloc
 test_innova_boundary: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/test/blockindex_authoritative_boundary_tests.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
 
+test_innova_dag_sourcestate: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/test/dag_sourcestate_bootstrap_tests.o
+	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
+
 test_innova: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) $(TEST_OBJS)
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
 

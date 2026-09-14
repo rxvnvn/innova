@@ -52,6 +52,9 @@ extern bool g_testFailSetBestChainAfterDagInit;
 extern bool g_testFailInitialDagLinksCommit;
 extern bool g_testFailFailedAddDagLinksCleanupCommit;
 extern bool g_testFailReorganizeDagLinksEraseCommit;
+extern bool g_testForceDagPruneInAdd;
+extern int g_testDagPruneDepth;
+extern bool g_testFailDagPruneCommit;
 extern bool g_testSuppressDagSourceAbort;
 extern bool g_dagSourceUnhealthy;
 
@@ -236,6 +239,9 @@ BOOST_AUTO_TEST_CASE(r2c1d1_real_add_to_blockindex_dag_commits_replayable_delta)
     while (parent->nHeight < GetForkHeightDAG())
         parent = MineReal(parent, 0x5100 + parent->nHeight);
 
+    CTxDB sourceBefore;
+    uint256 sourcePre;
+    BOOST_REQUIRE(sourceBefore.ReadDAGSourceStateId(sourcePre));
     const std::vector<uint256> prev = g_dagManager.GetDAGTips();
     const std::set<uint256> pre(prev.begin(), prev.end());
     DagDeltaCapture capture;
@@ -263,6 +269,19 @@ BOOST_AUTO_TEST_CASE(r2c1d1_real_add_to_blockindex_dag_commits_replayable_delta)
         else replay.erase(e.record.hash);
     }
     std::set<uint256> post(postv.begin(), postv.end());
+    CTxDB sourceAfter;
+    uint256 sourcePost;
+    BOOST_REQUIRE(sourceAfter.ReadDAGSourceStateId(sourcePost));
+    BOOST_CHECK(sourcePost != sourcePre);
+    bool sawFinal = false;
+    for (size_t i = 0; i < capture.events.size(); ++i)
+        if (capture.events[i].kind == DagTipCommittedDeltaEvent::END) {
+            BOOST_CHECK(capture.events[i].hasFinalSourceStateId);
+            BOOST_CHECK(capture.events[i].finalSourceStateId == sourcePost);
+            sawFinal = true;
+        }
+    BOOST_CHECK(sawFinal);
+    BOOST_CHECK(!g_dagSourceUnhealthy);
     BOOST_CHECK_EQUAL(begins, 1);
     BOOST_CHECK_EQUAL(ends, 1);
     BOOST_CHECK(replay == post);
@@ -275,12 +294,16 @@ BOOST_AUTO_TEST_CASE(r2c1d1_real_failed_add_rolls_back_without_committed_delta)
     if (hooks == NULL) hooks = InitHook();
     CBlockIndex* parent = pindexBest;
     while (parent->nHeight < GetForkHeightDAG()) parent = MineReal(parent, 0x5200 + parent->nHeight);
+    CTxDB sourceBefore;
+    uint256 sourcePre;
+    BOOST_REQUIRE(sourceBefore.ReadDAGSourceStateId(sourcePre));
     const std::vector<uint256> pre = g_dagManager.GetDAGTips();
     DagDeltaCapture capture;
     SetDagTipCommittedDeltaObserver(&DagDeltaCapture::Record, &capture);
     CBlock* block = BuildPoWBlock(parent, 0x5299);
     BOOST_REQUIRE(block != NULL);
     AttachDagParentsAndRemine(block, std::vector<uint256>(1, parent->GetBlockHash()));
+    const uint256 childHash = block->GetHash();
     unsigned int nFile = 0, nBlockPos = 0;
     bool added = false;
     g_testFailSetBestChainAfterDagInit = true;
@@ -292,6 +315,15 @@ BOOST_AUTO_TEST_CASE(r2c1d1_real_failed_add_rolls_back_without_committed_delta)
     delete block;
     BOOST_CHECK(!added);
     const std::vector<uint256> post = g_dagManager.GetDAGTips();
+    CTxDB sourceAfter;
+    uint256 sourcePost;
+    BOOST_REQUIRE(sourceAfter.ReadDAGSourceStateId(sourcePost));
+    BOOST_CHECK(sourcePost == sourcePre);
+    std::map<uint256, CBlockDAGData> links;
+    BOOST_REQUIRE(sourceAfter.IterateDAGLinks(links));
+    BOOST_CHECK(links.count(childHash) == 0);
+    BOOST_CHECK(!GetDagTipDeltaFinalSourceStateId(&sourcePost));
+    BOOST_CHECK(!g_dagSourceUnhealthy);
     BOOST_CHECK(pre == post);
     BOOST_CHECK(capture.events.empty());
     SetDagTipCommittedDeltaObserver(NULL, NULL);
@@ -308,6 +340,9 @@ BOOST_AUTO_TEST_CASE(r2c1d1_real_nested_reorg_joins_add_transaction)
     CBlockIndex* b1 = AddSideDag(fork, 0x5321);
     CBlockIndex* b2 = AddSideDag(b1, 0x5322);
     CBlockIndex* b3 = AddSideDag(b2, 0x5323);
+    CTxDB sourceBefore;
+    uint256 sourceBeforeReorg;
+    BOOST_REQUIRE(sourceBefore.ReadDAGSourceStateId(sourceBeforeReorg));
     const std::vector<uint256> prev = g_dagManager.GetDAGTips();
     std::set<uint256> replay(prev.begin(), prev.end());
     DagDeltaCapture capture;
@@ -323,8 +358,93 @@ BOOST_AUTO_TEST_CASE(r2c1d1_real_nested_reorg_joins_add_transaction)
         else { ++records; if(e.record.op==DagTipDeltaRecord::TIP_ADD) replay.insert(e.record.hash); else replay.erase(e.record.hash); }
     }
     std::set<uint256> post(postv.begin(),postv.end());
+    CTxDB sourceAfter;
+    uint256 sourceAfterReorg;
+    BOOST_REQUIRE(sourceAfter.ReadDAGSourceStateId(sourceAfterReorg));
+    BOOST_CHECK(sourceAfterReorg != sourceBeforeReorg);
+    bool sawFinalToken = false;
+    for (size_t i=0;i<capture.events.size();++i)
+        if (capture.events[i].kind == DagTipCommittedDeltaEvent::END) {
+            BOOST_CHECK(capture.events[i].hasFinalSourceStateId);
+            BOOST_CHECK(capture.events[i].finalSourceStateId == sourceAfterReorg);
+            sawFinalToken = true;
+        }
+    BOOST_CHECK(sawFinalToken);
     BOOST_CHECK_EQUAL(begin,1); BOOST_CHECK_EQUAL(end,1); BOOST_CHECK_GT(records,0); BOOST_CHECK(replay==post);
     SetDagTipCommittedDeltaObserver(NULL,NULL);
+}
+
+BOOST_AUTO_TEST_CASE(r2c1d2_prune_inside_add_binds_final_token)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* parent = pindexBest;
+    while (parent->nHeight < GetForkHeightDAG()) parent = MineReal(parent, 0x5700 + parent->nHeight);
+    CBlockIndex* d1 = MineRealDag(parent, 0x5711);
+    CBlockIndex* d2 = MineRealDag(d1, 0x5712);
+    CTxDB beforeDb; uint256 before;
+    BOOST_REQUIRE(beforeDb.ReadDAGSourceStateId(before));
+    DagDeltaCapture capture; SetDagTipCommittedDeltaObserver(&DagDeltaCapture::Record, &capture);
+    g_testDagPruneDepth = 1;
+    g_testForceDagPruneInAdd = true;
+    CBlockIndex* d3 = MineRealDag(d2, 0x5713);
+    g_testForceDagPruneInAdd = false;
+    g_testDagPruneDepth = 0;
+    BOOST_REQUIRE(d3 != NULL);
+    CTxDB afterDb; uint256 after;
+    BOOST_REQUIRE(afterDb.ReadDAGSourceStateId(after));
+    BOOST_CHECK(after != before);
+    bool sawEnd = false;
+    for (size_t i=0;i<capture.events.size();++i)
+        if (capture.events[i].kind == DagTipCommittedDeltaEvent::END) {
+            BOOST_CHECK(capture.events[i].hasFinalSourceStateId);
+            BOOST_CHECK(capture.events[i].finalSourceStateId == after);
+            sawEnd = true;
+        }
+    BOOST_CHECK(sawEnd);
+    SetDagTipCommittedDeltaObserver(NULL, NULL);
+}
+
+BOOST_AUTO_TEST_CASE(r2c1d2_prune_failure_discards_add_root)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* parent = pindexBest;
+    while (parent->nHeight < GetForkHeightDAG()) parent = MineReal(parent, 0x5800 + parent->nHeight);
+    CBlockIndex* d1 = MineRealDag(parent, 0x5811);
+    CBlockIndex* d2 = MineRealDag(d1, 0x5812);
+    DagDeltaCapture capture; SetDagTipCommittedDeltaObserver(&DagDeltaCapture::Record, &capture);
+    g_testSuppressDagSourceAbort = true; g_dagSourceUnhealthy = false;
+    g_testDagPruneDepth = 1; g_testForceDagPruneInAdd = true; g_testFailDagPruneCommit = true;
+    CBlock* b = BuildPoWBlock(d2, 0x5813); BOOST_REQUIRE(b != NULL);
+    AttachDagParentsAndRemine(b, std::vector<uint256>(1, d2->GetBlockHash()));
+    unsigned int f=0,p=0; bool ok=false;
+    { LOCK(cs_main); ok=b->WriteToDisk(f,p) && b->AddToBlockIndex(f,p,b->GetHash()); }
+    delete b;
+    g_testFailDagPruneCommit=false; g_testForceDagPruneInAdd=false; g_testDagPruneDepth=0;
+    BOOST_CHECK(!ok); BOOST_CHECK(g_dagSourceUnhealthy); BOOST_CHECK(capture.events.empty());
+    uint256 leaked; BOOST_CHECK(!GetDagTipDeltaFinalSourceStateId(&leaked));
+    g_dagSourceUnhealthy=false; g_testSuppressDagSourceAbort=false;
+    SetDagTipCommittedDeltaObserver(NULL, NULL);
+}
+
+BOOST_AUTO_TEST_CASE(r2c1d2_bootstrap_existing_token_preserved_without_delta)
+{
+    CTxDB txdb;
+    uint256 before;
+    BOOST_REQUIRE(txdb.ReadDAGSourceStateId(before));
+    const std::vector<uint256> tipsBefore = g_dagManager.GetDAGTips();
+    DagDeltaCapture capture;
+    SetDagTipCommittedDeltaObserver(&DagDeltaCapture::Record, &capture);
+    std::string error;
+    BOOST_REQUIRE(txdb.BootstrapDAGSourceStateId(&error));
+    BOOST_REQUIRE(error.empty());
+    uint256 after;
+    BOOST_REQUIRE(txdb.ReadDAGSourceStateId(after));
+    BOOST_CHECK(after == before);
+    BOOST_CHECK(g_dagManager.GetDAGTips() == tipsBefore);
+    BOOST_CHECK(capture.events.empty());
+    SetDagTipCommittedDeltaObserver(NULL, NULL);
 }
 
 BOOST_AUTO_TEST_CASE(r2c1d2a_initial_daglink_commit_failure_aborts_locally)
