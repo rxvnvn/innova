@@ -11,6 +11,9 @@
 #include "finality.h"
 #include "dag.h"
 #include "blockindex_authoritative_startup.h"
+#include "collateralnode.h"
+#include "activecollateralnode.h"
+#include "db.h"
 #include "base58.h"
 #include "net.h"
 #include <errno.h>
@@ -1760,6 +1763,409 @@ Value getepochinfo(const Array& params, bool fHelp)
         result.push_back(Pair("finality_tier", std::string("none")));
         result.push_back(Pair("consecutive_hard_epochs", 0));
         result.push_back(Pair("status", "not_computed"));
+    }
+    return result;
+}
+
+// Diagnostic-only CN guard outcome telemetry. Exposes the guard/validation
+// counters added for the AUD-002/AUD-003 discriminator. No consensus change.
+Value getcnvalidationstats(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "getcnvalidationstats\n"
+            "\nReturns diagnostic counters for the collateralnode payee-enforcement guard "
+            "and CN block validation (read-only; no consensus behavior change).\n");
+
+    size_t nLocalCN = 0;
+    unsigned int nMedian = 0;
+    {
+        LOCK(cs_collateralnodes);
+        nLocalCN = vecCollateralnodes.size();
+        nMedian = mnCount;
+    }
+    Object obj;
+    obj.push_back(Pair("guard_passed", GetCNValidationGuardPassedCount()));
+    obj.push_back(Pair("deferred", GetCNPaymentsDeferredCount()));
+    obj.push_back(Pair("guard_passed_minus_deferred",
+                       GetCNValidationGuardPassedCount() - GetCNPaymentsDeferredCount()));
+    obj.push_back(Pair("payee_found", GetCNValidationPayeeFoundCount()));
+    obj.push_back(Pair("payee_missing", GetCNValidationPayeeMissingCount()));
+    obj.push_back(Pair("findcnpayment_entered", GetCNValidationFindCNPaymentEnteredCount()));
+    obj.push_back(Pair("last_guard_reason", GetCNValidationLastGuardReason()));
+    obj.push_back(Pair("last_guard_height", GetCNValidationLastGuardHeight()));
+    obj.push_back(Pair("local_cn_count", (int64_t)nLocalCN));
+    obj.push_back(Pair("network_median_mnCount", (int64_t)nMedian));
+    return obj;
+}
+
+// Diagnostic-only: cs_db acquisition-wait telemetry for the wallet-flush
+// contention discriminator. Exposes how often a DB open waits on bitdb.cs_db
+// (whether held by the wallet-flush txn_checkpoint). No consensus/lock change.
+Value getdbwaitstats(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "getdbwaitstats\n"
+            "\nReturns diagnostic counters for cs_db acquisition waits (wallet-flush "
+            "contention discriminator; read-only).\n");
+    Object obj;
+    obj.push_back(Pair("db_lock_wait_count", GetDbLockWaitCount()));
+    obj.push_back(Pair("db_lock_wait_us_total", GetDbLockWaitUsTotal()));
+    obj.push_back(Pair("db_lock_wait_us_max", GetDbLockWaitUsMax()));
+    obj.push_back(Pair("db_lock_wait_over_100ms", GetDbLockWaitOver100ms()));
+    obj.push_back(Pair("db_lock_wait_over_500ms", GetDbLockWaitOver500ms()));
+    obj.push_back(Pair("db_lock_wait_over_100ms_while_flushing", GetDbLockWaitOver100msWhileFlushing()));
+    obj.push_back(Pair("flush_in_progress", (int)(dbFlushInProgress.load(std::memory_order_relaxed))));
+    return obj;
+}
+
+// ============================================================================
+// RECONSTRUCTED diagnostic RPCs (self-contained CN / memory). Strictly read-only.
+// ============================================================================
+
+static int GetDepthInMainChainReadOnly(const CWalletTx& tx)
+{
+    AssertLockHeld(cs_main);
+    if (tx.hashBlock == 0 || tx.nIndex == -1)
+        return mempool.exists(tx.GetHash()) ? 0 : -1;
+
+    map<uint256, CBlockIndex*>::const_iterator it = mapBlockIndex.find(tx.hashBlock);
+    if (it == mapBlockIndex.end() || !it->second || !it->second->IsInMainChain())
+        return mempool.exists(tx.GetHash()) ? 0 : -1;
+    if (!tx.fMerkleVerified &&
+        CBlock::CheckMerkleBranch(tx.GetHash(), tx.vMerkleBranch, tx.nIndex) !=
+            it->second->hashMerkleRoot)
+        return mempool.exists(tx.GetHash()) ? 0 : -1;
+    if (!pindexBest)
+        return 0;
+    return pindexBest->nHeight - it->second->nHeight + 1;
+}
+
+static int GetBlocksToMaturityReadOnly(const CWalletTx& tx, int depth)
+{
+    if (!(tx.IsCoinBase() || tx.IsCoinStake()))
+        return 0;
+    int walletMaturity = fRegTest ? nCoinbaseMaturity : nCoinbaseMaturity + 10;
+    return std::max(0, walletMaturity - depth);
+}
+
+static std::string IsMineCategory(isminetype mine)
+{
+    if ((mine & MINE_SPENDABLE) && (mine & MINE_WATCH_ONLY)) return "spendable+watch_only";
+    if (mine & MINE_SPENDABLE) return "spendable";
+    if (mine & MINE_WATCH_ONLY) return "watch_only";
+    return "no";
+}
+
+Value getcollateraloutpointdiagnostics(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 2)
+        throw runtime_error(
+            "getcollateraloutpointdiagnostics <txid> <vout>\n"
+            "\nReturns strictly read-only wallet and collateralnode selector diagnostics for one outpoint.\n");
+    if (params[0].type() != str_type || params[0].get_str().size() != 64 ||
+        !IsHex(params[0].get_str()))
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "txid must be exactly 64 hexadecimal characters");
+    if (params[1].type() != int_type)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "vout must be an integer");
+    int64_t voutValue = params[1].get_int64();
+    if (voutValue < 0 || voutValue > (int64_t)std::numeric_limits<unsigned int>::max())
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "vout is out of range");
+
+    uint256 txid;
+    txid.SetHex(params[0].get_str());
+    unsigned int vout = (unsigned int)voutValue;
+    Object result;
+    result.push_back(Pair("txid", txid.GetHex()));
+    result.push_back(Pair("vout", (int64_t)vout));
+
+    if (!pwalletMain)
+        throw JSONRPCError(RPC_WALLET_ERROR, "Wallet is not initialized");
+    LOCK2(cs_main, pwalletMain->cs_wallet);
+    map<uint256, CWalletTx>::const_iterator walletIt = pwalletMain->mapWallet.find(txid);
+    bool txExists = walletIt != pwalletMain->mapWallet.end();
+    bool outputExists = txExists && vout < walletIt->second.vout.size();
+    result.push_back(Pair("tx_exists", txExists));
+    result.push_back(Pair("output_exists", outputExists));
+    if (!outputExists)
+    {
+        string reason = txExists ? "vout does not exist" : "wallet transaction not found";
+        result.push_back(Pair("amount", Value()));
+        result.push_back(Pair("scriptPubKey", Value()));
+        result.push_back(Pair("is_mine", "unavailable"));
+        result.push_back(Pair("is_spent", false));
+        result.push_back(Pair("is_locked_coin", false));
+        result.push_back(Pair("depth", -1));
+        result.push_back(Pair("trusted", false));
+        result.push_back(Pair("trusted_reason", reason));
+        result.push_back(Pair("spendable", false));
+        result.push_back(Pair("in_available_coins", false));
+        result.push_back(Pair("in_available_coins_mn", false));
+        result.push_back(Pair("in_select_coins_collateralnode", false));
+        result.push_back(Pair("in_select_coins_collateralnode_for_pubkey", false));
+        result.push_back(Pair("get_vin_from_output_success", false));
+        result.push_back(Pair("get_key_exists", false));
+        result.push_back(Pair("available_coins_rejection", reason));
+        result.push_back(Pair("available_coins_mn_rejection", reason));
+        result.push_back(Pair("select_coins_collateralnode_rejection", reason));
+        result.push_back(Pair("select_coins_collateralnode_for_pubkey_rejection", reason));
+        result.push_back(Pair("get_vin_from_output_rejection", reason));
+        result.push_back(Pair("get_key_rejection", reason));
+        result.push_back(Pair("rejection_stage", txExists ? "output_lookup" : "wallet_lookup"));
+        result.push_back(Pair("rejection_reason", reason));
+        return result;
+    }
+
+    const CWalletTx& tx = walletIt->second;
+    const CTxOut& txout = tx.vout[vout];
+    isminetype mine = pwalletMain->IsMine(txout);
+    bool spent = tx.IsSpent(vout);
+    bool locked = pwalletMain->IsLockedCoin(txid, vout);
+    int depth = GetDepthInMainChainReadOnly(tx);
+    bool trusted = tx.IsFinal() && depth >= 1;
+    string trustedReason = (depth != 0) ? (trusted ? "confirmed in the main chain" :
+        "transaction is not final or is not in the main chain") :
+        "unknown at zero depth because exact trust evaluation would mutate wallet caches";
+    bool spendable = (mine & ISMINE_SPENDABLE) != ISMINE_NO;
+
+    CTxDestination destination;
+    bool destinationExists = ExtractDestination(txout.scriptPubKey, destination);
+    string address = destinationExists ? CBitcoinAddress(destination).ToString() : "";
+    Object script;
+    script.push_back(Pair("asm", txout.scriptPubKey.ToString()));
+    script.push_back(Pair("hex", HexStr(txout.scriptPubKey.begin(), txout.scriptPubKey.end())));
+    script.push_back(Pair("address", address));
+
+    // ---- Real AvailableCoinsMN(fOnlyConfirmed=true) predicate observations (mutation-free) ----
+    bool txIsFinal = tx.IsFinal();
+    bool txIsCoinBase = tx.IsCoinBase();
+    bool txIsCoinStake = tx.IsCoinStake();
+    int  depthReal = depth;
+    int  maturityReal = GetBlocksToMaturityReadOnly(tx, depthReal);
+    bool nTimeLeBest = false;
+    bool hashBlockPresent = false;
+    {
+        LOCK(cs_main);
+        nTimeLeBest = pindexBest ? (tx.nTime <= pindexBest->GetBlockTime()) : false;
+        hashBlockPresent = mapBlockIndex.count(tx.hashBlock) > 0;
+    }
+    bool trustedReal = txIsFinal && nTimeLeBest && hashBlockPresent && depthReal >= 1;
+
+    bool mnWholeTxOk = txIsFinal && trustedReal && maturityReal == 0 && depthReal > 0;
+    bool voutOk = !spent && txout.nValue > 0;
+    bool inAvailableRealMN = mnWholeTxOk && voutOk;
+    bool inSelectRealCN   = inAvailableRealMN && txout.nValue == GetMNCollateral() * COIN;
+
+    string realMNRejection;
+    if (!inAvailableRealMN) {
+        if (!txIsFinal) realMNRejection = "transaction is not final";
+        else if (!trustedReal)
+            realMNRejection = "transaction is not trusted [" +
+                std::string(!nTimeLeBest ? "nTime>bestBlockTime; " : "") +
+                std::string(!hashBlockPresent ? "hashBlock-not-in-index; " : "") +
+                std::string(depthReal < 1 ? "depth<1; " : "") + "]";
+        else if (maturityReal > 0) realMNRejection = "transaction is immature";
+        else if (depthReal <= 0)   realMNRejection = "transaction has no positive main-chain depth";
+        else if (spent)            realMNRejection = "output is spent";
+        else if (txout.nValue <= 0) realMNRejection = "output amount is not positive";
+        else realMNRejection = "excluded by AvailableCoinsMN for an unmodeled reason";
+    }
+    string realCNRejection = inSelectRealCN ? "" :
+        (realMNRejection.empty() ? "output amount is not the collateralnode collateral amount" : realMNRejection);
+
+    bool acWholeTxOk = txIsFinal && maturityReal == 0 && depthReal >= 0;
+    bool acNameOut = tx.nVersion == NAME_TX_VERSION &&
+                     hooks->IsNameScript(txout.scriptPubKey);
+    bool inAvailableRealAC = acWholeTxOk && !acNameOut && mine != MINE_NO &&
+                             !spent && !locked && txout.nValue >= nMinimumInputValue;
+    string realACRejection;
+    if (!inAvailableRealAC) {
+        if (!txIsFinal) realACRejection = "transaction is not final";
+        else if (maturityReal > 0) realACRejection = "transaction is immature";
+        else if (depthReal < 0) realACRejection = "transaction conflicts with the main chain";
+        else if (acNameOut) realACRejection = "output is an Innova Name output";
+        else if (mine == MINE_NO) realACRejection = "output is not owned by this wallet";
+        else if (spent) realACRejection = "output is spent";
+        else if (locked) realACRejection = "output is locked";
+        else if (txout.nValue < nMinimumInputValue) realACRejection = "output is below mininput";
+        else realACRejection = "excluded by AvailableCoins for an unmodeled reason";
+    }
+
+    CScript selectedAddressScript;
+    if (destinationExists)
+        selectedAddressScript.SetDestination(CBitcoinAddress(address).Get());
+    bool inSelectedForPubKeyReal = inAvailableRealAC && destinationExists &&
+        txout.scriptPubKey == selectedAddressScript &&
+        txout.nValue == GetMNCollateral() * COIN;
+    string selectedForPubKeyReason = inSelectedForPubKeyReal ? "" : realACRejection;
+    if (!inSelectedForPubKeyReal && selectedForPubKeyReason.empty() && !destinationExists)
+        selectedForPubKeyReason = "script has no extractable destination";
+    if (!inSelectedForPubKeyReal && selectedForPubKeyReason.empty() &&
+        txout.scriptPubKey != selectedAddressScript)
+        selectedForPubKeyReason = "output script does not match the collateral address";
+    if (!inSelectedForPubKeyReal && selectedForPubKeyReason.empty() &&
+        txout.nValue != GetMNCollateral() * COIN)
+        selectedForPubKeyReason = "output amount is not the collateralnode collateral amount";
+    if (!inSelectedForPubKeyReal && selectedForPubKeyReason.empty())
+        selectedForPubKeyReason = "excluded by SelectCoinsCollateralnodeForPubKey for an unmodeled reason";
+
+    CKeyID keyID;
+    bool keyIDExists = destinationExists && CBitcoinAddress(destination).GetKeyID(keyID);
+    CKey key;
+    bool keyExists = keyIDExists && pwalletMain->GetKey(keyID, key);
+    CTxIn vin;
+    CPubKey pubkey;
+    CKey vinKey;
+    bool getVinSuccess = activeCollateralnode.GetVinFromOutput(
+        COutput(&tx, vout, depth, spendable), vin, pubkey, vinKey);
+    string keyReason = keyExists ? "" :
+        (!destinationExists ? "script has no extractable destination" :
+         (!keyIDExists ? "destination does not refer to a key" : "private key is not available"));
+    string vinReason = getVinSuccess ? "" : keyReason;
+
+    result.push_back(Pair("amount", ValueFromAmount(txout.nValue)));
+    result.push_back(Pair("scriptPubKey", script));
+    result.push_back(Pair("is_mine", IsMineCategory(mine)));
+    result.push_back(Pair("is_spent", spent));
+    result.push_back(Pair("is_locked_coin", locked));
+    result.push_back(Pair("depth", depth));
+    result.push_back(Pair("trusted", (depth != 0) ? Value(trusted) : Value()));
+    result.push_back(Pair("trusted_reason", trustedReason));
+    result.push_back(Pair("spendable", spendable));
+    result.push_back(Pair("in_available_coins", inAvailableRealAC));
+    result.push_back(Pair("in_available_coins_mn", inAvailableRealMN));
+    result.push_back(Pair("in_select_coins_collateralnode", inSelectRealCN));
+    result.push_back(Pair("in_select_coins_collateralnode_for_pubkey", inSelectedForPubKeyReal));
+    result.push_back(Pair("get_vin_from_output_success", getVinSuccess));
+    result.push_back(Pair("get_key_exists", keyExists));
+    result.push_back(Pair("tx_final", txIsFinal));
+    result.push_back(Pair("tx_coinbase", txIsCoinBase));
+    result.push_back(Pair("tx_coinstake", txIsCoinStake));
+    result.push_back(Pair("tx_depth", depthReal));
+    result.push_back(Pair("tx_blocks_to_maturity", maturityReal));
+    result.push_back(Pair("tx_ntime", (int64_t)tx.nTime));
+    result.push_back(Pair("best_block_time", pindexBest ? (int64_t)pindexBest->GetBlockTime() : (int64_t)-1));
+    result.push_back(Pair("tx_ntime_le_besttime", nTimeLeBest));
+    result.push_back(Pair("tx_hashblock_present", hashBlockPresent));
+    result.push_back(Pair("tx_trusted_real_semantics", trustedReal));
+    result.push_back(Pair("available_coins_mn_fonly_confirmed", true));
+    result.push_back(Pair("available_coins_mn_fonly_unlocked", false));
+    result.push_back(Pair("available_coins_mn_coin_type", "ALL_COINS"));
+    result.push_back(Pair("available_coins_rejection", realACRejection));
+    result.push_back(Pair("available_coins_mn_rejection", realMNRejection));
+    result.push_back(Pair("select_coins_collateralnode_rejection", realCNRejection));
+    result.push_back(Pair("select_coins_collateralnode_for_pubkey_rejection", selectedForPubKeyReason));
+    result.push_back(Pair("get_vin_from_output_rejection", vinReason));
+    result.push_back(Pair("get_key_rejection", keyReason));
+    result.push_back(Pair("rejection_stage", realCNRejection.empty() ? "" : "SelectCoinsCollateralnode"));
+    result.push_back(Pair("rejection_reason", realCNRejection));
+    return result;
+}
+
+static inline size_t MemoryDiagMallocChunkRound(size_t n)
+{
+    const size_t align = 16;
+    return (n + align - 1) / align * align;
+}
+
+#if defined(__GLIBCXX__) && defined(__GNUC__)
+typedef std::_Rb_tree_node<std::pair<const uint256, CBlockIndex*> > CBlockIndexMapRbTreeNode;
+typedef std::_Rb_tree_node<std::pair<const COutPoint, unsigned int> > StakeSeenSetRbTreeNode;
+#endif
+
+Value getmemorydiagnostics(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+            "getmemorydiagnostics\n"
+            "\nReturns strictly read-only, cheap memory-usage diagnostics for the main\n"
+            "full-chain globals (mapBlockIndex, stake-seen set, collateralnode list, wallet).\n"
+            "Every value is a compile-time sizeof() constant, a container size() count, or\n"
+            "simple arithmetic on those; container contents are never traversed and no\n"
+            "wallet/collateralnode state is mutated.\n");
+
+    const size_t sizeofCBlockIndex = sizeof(CBlockIndex);
+    const size_t sizeofMapValueType = sizeof(std::pair<const uint256, CBlockIndex*>);
+#if defined(__GLIBCXX__) && defined(__GNUC__)
+    const size_t sizeofMapNode = sizeof(CBlockIndexMapRbTreeNode);
+#else
+    const size_t sizeofMapNode = sizeof(std::pair<const uint256, CBlockIndex*>)
+                                 + sizeof(void*) * 3 + 1;
+#endif
+    const size_t sizeofMapNodeAlloc = MemoryDiagMallocChunkRound(sizeofMapNode);
+    const size_t sizeofCBlockIndexAlloc = MemoryDiagMallocChunkRound(sizeofCBlockIndex);
+#if defined(__GLIBCXX__) && defined(__GNUC__)
+    const size_t sizeofStakeSeenNode = sizeof(StakeSeenSetRbTreeNode);
+#else
+    const size_t sizeofStakeSeenNode = sizeof(std::pair<const COutPoint, unsigned int>)
+        + sizeof(void*) * 3 + 1;
+#endif
+
+    size_t count = 0;
+    size_t setStakeSeenSize = 0;
+    size_t setStakeSeenOrphanSize = 0;
+    size_t setInvalidSize = 0;
+    size_t setRegSize = 0;
+    {
+        LOCK(cs_main);
+        count = mapBlockIndex.size();
+        setStakeSeenSize = setStakeSeen.size();
+        setStakeSeenOrphanSize = setStakeSeenOrphan.size();
+        setInvalidSize = setInvalidBlockHash.size();
+        setRegSize = setpwalletRegistered.size();
+    }
+    size_t mempoolSize = 0;
+    {
+        LOCK(cs_main);
+        mempoolSize = mempool.size();
+    }
+
+    size_t vecCNCount = 0;
+    size_t vecCNRanksCount = 0;
+    size_t mapSeenCNVotesCount = 0;
+    size_t mapCacheBlockHashesCount = 0;
+    {
+        LOCK(cs_collateralnodes);
+        vecCNCount = vecCollateralnodes.size();
+        vecCNRanksCount = vecCollateralnodeRanks.size();
+        mapSeenCNVotesCount = mapSeenCollateralnodeVotes.size();
+        mapCacheBlockHashesCount = mapCacheBlockHashes.size();
+    }
+
+    Object result;
+    result.push_back(Pair("mapBlockIndex_count", (int64_t)count));
+    result.push_back(Pair("sizeof_CBlockIndex", (int64_t)sizeofCBlockIndex));
+    result.push_back(Pair("sizeof_map_value_type", (int64_t)sizeofMapValueType));
+    result.push_back(Pair("sizeof_map_node", (int64_t)sizeofMapNode));
+    result.push_back(Pair("map_node_allocated_bytes", (int64_t)sizeofMapNodeAlloc));
+    result.push_back(Pair("sizeof_CBlockIndex_allocated_bytes", (int64_t)sizeofCBlockIndexAlloc));
+    result.push_back(Pair("estimated_payload_bytes", (int64_t)(count * sizeofCBlockIndex)));
+    result.push_back(Pair("estimated_container_bytes", (int64_t)(count * sizeofMapNodeAlloc)));
+    result.push_back(Pair("estimated_allocated_bytes",
+        (int64_t)(count * sizeofCBlockIndexAlloc + count * sizeofMapNodeAlloc)));
+
+    result.push_back(Pair("setStakeSeen_count", (int64_t)setStakeSeenSize));
+    result.push_back(Pair("setStakeSeen_estimated_bytes",
+        (int64_t)(setStakeSeenSize * sizeofStakeSeenNode)));
+    result.push_back(Pair("setStakeSeenOrphan_count", (int64_t)setStakeSeenOrphanSize));
+    result.push_back(Pair("setInvalidBlockHash_count", (int64_t)setInvalidSize));
+    result.push_back(Pair("setpwalletRegistered_count", (int64_t)setRegSize));
+    result.push_back(Pair("vecCollateralnodes_count", (int64_t)vecCNCount));
+    result.push_back(Pair("vecCollateralnodes_estimated_bytes",
+        (int64_t)(vecCNCount * sizeof(CCollateralNode))));
+    result.push_back(Pair("vecCollateralnodeRanks_count", (int64_t)vecCNRanksCount));
+    result.push_back(Pair("mapSeenCollateralnodeVotes_count", (int64_t)mapSeenCNVotesCount));
+    result.push_back(Pair("mapCacheBlockHashes_count", (int64_t)mapCacheBlockHashesCount));
+    result.push_back(Pair("mempool_count", (int64_t)mempoolSize));
+
+    if (pwalletMain)
+    {
+        LOCK(pwalletMain->cs_wallet);
+        result.push_back(Pair("mapWallet_count", (int64_t)pwalletMain->mapWallet.size()));
+        result.push_back(Pair("mapWallet_estimated_bytes",
+            (int64_t)(pwalletMain->mapWallet.size() * sizeof(std::pair<const uint256, CWalletTx>))));
+        result.push_back(Pair("setLockedCoins_count", (int64_t)pwalletMain->setLockedCoins.size()));
     }
     return result;
 }

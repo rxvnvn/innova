@@ -7,6 +7,7 @@
 
 #include "main.h"
 
+#include <atomic>
 #include <map>
 #include <string>
 #include <vector>
@@ -28,6 +29,16 @@ extern unsigned int nWalletDBUpdated;
 
 void ThreadFlushWalletDB(void* parg);
 bool BackupWallet(const CWallet& wallet, const std::string& strDest);
+
+// Diagnostic wallet-flush / cs_db contention telemetry (defined in db.cpp).
+void RecordDbLockWait(int64_t nWaitUs);
+int64_t GetDbLockWaitCount();
+int64_t GetDbLockWaitUsTotal();
+int64_t GetDbLockWaitUsMax();
+int64_t GetDbLockWaitOver100ms();
+int64_t GetDbLockWaitOver500ms();
+int64_t GetDbLockWaitOver100msWhileFlushing();
+extern std::atomic<bool> dbFlushInProgress;
 
 
 class CDBEnv

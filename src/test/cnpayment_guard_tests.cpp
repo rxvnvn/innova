@@ -26,15 +26,19 @@
 #include <boost/test/unit_test.hpp>
 
 #include <algorithm>
+#include <set>
 #include <string>
 #include <vector>
 
 #include "../checkpoints.h"
 #include "../collateralnode.h"
 #include "../collateral.h"
+#include "../activecollateralnode.h"
+#include "../innovarpc.h"
 #include "../main.h"
 #include "../net.h"
 #include "../util.h"
+#include "../wallet.h"
 
 namespace {
 
@@ -217,8 +221,297 @@ BOOST_AUTO_TEST_CASE(justcheck_disabled_old_never_validate)
     BOOST_CHECK_EQUAL(GetCNPaymentsDeferredCount(), 0);
 }
 
-BOOST_AUTO_TEST_SUITE_END()
+// Diagnostic counters (AUD-002/AUD-003): guard-level outcome counters are fully
+// unit-tested here. The ConnectBlock-internal counters (payee_found /
+// payee_missing / findcnpayment_entered) are incremented only inside the block
+// connect path and are validated end-to-end by the production discriminator;
+// here we pin their plumbing and that the guard layer never false-increments them.
 
+// 1. defer increments deferred only (thin list / IBD).
+BOOST_AUTO_TEST_CASE(diagnostic_defer_increments_deferred_only)
+{
+    ResetCNValidationCountersForTesting();
+    ResetCNPaymentsDeferredCountForTesting();
+    CBlockIndex idx;
+    idx.nTime = (unsigned)GetTime();
+    {
+        CScopedCNState s(false /*not IBD*/, 13 /*median*/, 5 /*thin*/);
+        BOOST_CHECK(!ShouldValidateCollateralnodePayments(&idx, false, true));
+    }
+    BOOST_CHECK_EQUAL(GetCNValidationGuardPassedCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNPaymentsDeferredCount(), 1);
+    BOOST_CHECK_EQUAL(GetCNValidationPayeeFoundCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNValidationPayeeMissingCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNValidationFindCNPaymentEnteredCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNValidationLastGuardReason(), 5); // thin/list/lock-busy
+}
+
+// 2. guard-pass increments passed only.
+BOOST_AUTO_TEST_CASE(diagnostic_guard_pass_increments_passed)
+{
+    ResetCNValidationCountersForTesting();
+    ResetCNPaymentsDeferredCountForTesting();
+    CBlockIndex idx;
+    idx.nTime = (unsigned)GetTime();
+    {
+        CScopedCNState s(false, 3 /*median*/, 5 /*local>=med*/);
+        BOOST_CHECK(ShouldValidateCollateralnodePayments(&idx, false, true));
+    }
+    BOOST_CHECK_EQUAL(GetCNValidationGuardPassedCount(), 1);
+    BOOST_CHECK_EQUAL(GetCNPaymentsDeferredCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNValidationPayeeFoundCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNValidationPayeeMissingCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNValidationFindCNPaymentEnteredCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNValidationLastGuardReason(), 6); // passed
+}
+
+// 6. counters do not alter the validation result (return value identical).
+BOOST_AUTO_TEST_CASE(diagnostic_counters_do_not_change_result)
+{
+    ResetCNValidationCountersForTesting();
+    ResetCNPaymentsDeferredCountForTesting();
+    CBlockIndex idx;
+    idx.nTime = (unsigned)GetTime();
+    // Repeated authoritative calls all return true and keep incrementing passed.
+    for (int i = 0; i < 3; ++i)
+    {
+        CScopedCNState s(false, 3, 5);
+        BOOST_CHECK(ShouldValidateCollateralnodePayments(&idx, false, true));
+    }
+    BOOST_CHECK_EQUAL(GetCNValidationGuardPassedCount(), 3);
+    BOOST_CHECK_EQUAL(GetCNPaymentsDeferredCount(), 0);
+    // Repeated thin calls all return false and keep incrementing deferred.
+    for (int i = 0; i < 3; ++i)
+    {
+        CScopedCNState s(false, 13, 5);
+        BOOST_CHECK(!ShouldValidateCollateralnodePayments(&idx, false, true));
+    }
+    BOOST_CHECK_EQUAL(GetCNValidationGuardPassedCount(), 3);
+    BOOST_CHECK_EQUAL(GetCNPaymentsDeferredCount(), 3);
+    BOOST_CHECK_EQUAL(GetCNValidationLastGuardReason(), 5);
+}
+
+// Plumbing: guard-level operations never touch the ConnectBlock-internal counters,
+// and last_guard_height is recorded.
+BOOST_AUTO_TEST_CASE(diagnostic_plumbing_and_last_height)
+{
+    ResetCNValidationCountersForTesting();
+    ResetCNPaymentsDeferredCountForTesting();
+    CBlockIndex idx;
+    idx.nHeight = 42;
+    idx.nTime = (unsigned)GetTime();
+    {
+        CScopedCNState s(false, 13, 5);
+        BOOST_CHECK(!ShouldValidateCollateralnodePayments(&idx, false, true));
+    }
+    BOOST_CHECK_EQUAL(GetCNValidationLastGuardHeight(), 42);
+    BOOST_CHECK_EQUAL(GetCNValidationFindCNPaymentEnteredCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNValidationPayeeMissingCount(), 0);
+    BOOST_CHECK_EQUAL(GetCNValidationPayeeFoundCount(), 0);
+}
+
+using json_spirit::find_value;
+
+BOOST_AUTO_TEST_CASE(collateral_outpoint_diagnostic_is_registered_and_read_only)
+{
+    const CRPCCommand* command = tableRPC["getcollateraloutpointdiagnostics"];
+    BOOST_REQUIRE(command != NULL);
+
+    CKey key;
+    key.MakeNewKey(true);
+    {
+        LOCK(pwalletMain->cs_wallet);
+        BOOST_REQUIRE(pwalletMain->AddKey(key));
+    }
+
+    CScript scriptPubKey;
+    scriptPubKey.SetDestination(key.GetPubKey().GetID());
+    CTransaction tx;
+    tx.vin.push_back(CTxIn(COutPoint(uint256(1), 0)));
+    tx.vout.push_back(CTxOut(GetMNCollateral() * COIN, scriptPubKey));
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(pindexBest != NULL);
+        tx.nTime = pindexBest->GetBlockTime();
+    }
+    const uint256 txid = tx.GetHash();
+    size_t mapWalletSizeBefore;
+    std::set<COutPoint> lockedCoinsBefore;
+    CDataStream mapWalletBefore(SER_DISK, CLIENT_VERSION);
+    CWalletTx cacheStateBefore;
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE(mempool.addUnchecked(txid, tx));
+    }
+    {
+        LOCK(pwalletMain->cs_wallet);
+        pwalletMain->mapWallet[txid] = CWalletTx(pwalletMain, tx);
+        pwalletMain->mapWallet[txid].BindWallet(pwalletMain);
+        pwalletMain->mapWallet[txid].hashBlock = pindexBest->GetBlockHash();
+        pwalletMain->mapWallet[txid].nIndex = -1;
+        mapWalletSizeBefore = pwalletMain->mapWallet.size();
+        lockedCoinsBefore = pwalletMain->setLockedCoins;
+        mapWalletBefore << pwalletMain->mapWallet;
+        cacheStateBefore = pwalletMain->mapWallet[txid];
+    }
+
+    json_spirit::Array params;
+    params.push_back(txid.GetHex());
+    params.push_back(0);
+    json_spirit::Object result = command->actor(params, false).get_obj();
+
+    BOOST_CHECK(find_value(result, "tx_exists").get_bool());
+    BOOST_CHECK(find_value(result, "output_exists").get_bool());
+    BOOST_CHECK_EQUAL(find_value(result, "is_mine").get_str(), "spendable");
+    BOOST_CHECK(!find_value(result, "is_spent").get_bool());
+    BOOST_CHECK(!find_value(result, "is_locked_coin").get_bool());
+    BOOST_CHECK_EQUAL(find_value(result, "depth").get_int(), 0);
+    BOOST_CHECK(find_value(result, "trusted").is_null());
+    BOOST_CHECK_EQUAL(find_value(result, "trusted_reason").get_str(),
+                      "unknown at zero depth because exact trust evaluation would mutate wallet caches");
+    BOOST_CHECK(find_value(result, "spendable").get_bool());
+    // zero-depth fixture: AvailableCoins (fOnlyConfirmed=false) includes it; AvailableCoinsMN
+    // (fOnlyConfirmed=true) excludes it because it is not confirmed (depth<1).
+    BOOST_CHECK(find_value(result, "in_available_coins").get_bool());
+    BOOST_CHECK(!find_value(result, "in_available_coins_mn").get_bool());
+    BOOST_CHECK(!find_value(result, "in_select_coins_collateralnode").get_bool());
+    BOOST_CHECK(find_value(result, "in_select_coins_collateralnode_for_pubkey").get_bool());
+    BOOST_CHECK(find_value(result, "get_vin_from_output_success").get_bool());
+    BOOST_CHECK(find_value(result, "get_key_exists").get_bool());
+    BOOST_CHECK_EQUAL(find_value(result, "available_coins_rejection").get_str(), "");
+    BOOST_CHECK(find_value(result, "available_coins_mn_rejection").get_str().find("transaction is not trusted") != std::string::npos);
+    BOOST_CHECK(find_value(result, "available_coins_mn_rejection").get_str().find("depth<1") != std::string::npos);
+    BOOST_CHECK_EQUAL(find_value(result, "select_coins_collateralnode_rejection").get_str(),
+                      find_value(result, "available_coins_mn_rejection").get_str());
+    BOOST_CHECK_EQUAL(find_value(result, "select_coins_collateralnode_for_pubkey_rejection").get_str(), "");
+    // Independent real-predicate observations.
+    BOOST_CHECK_EQUAL(find_value(result, "tx_depth").get_int(), 0);
+    BOOST_CHECK(find_value(result, "tx_hashblock_present").get_bool());
+    BOOST_CHECK(find_value(result, "tx_ntime_le_besttime").get_bool());
+    BOOST_CHECK(!find_value(result, "tx_trusted_real_semantics").get_bool());
+    BOOST_CHECK_EQUAL(find_value(result, "get_vin_from_output_rejection").get_str(), "");
+    BOOST_CHECK_EQUAL(find_value(result, "get_key_rejection").get_str(), "");
+
+    // Strict read-only: no wallet mutation (mapWallet bytes + lock set + cache flags).
+    {
+        LOCK(pwalletMain->cs_wallet);
+        CDataStream mapWalletAfter(SER_DISK, CLIENT_VERSION);
+        mapWalletAfter << pwalletMain->mapWallet;
+        BOOST_CHECK_EQUAL(pwalletMain->mapWallet.size(), mapWalletSizeBefore);
+        BOOST_CHECK_EQUAL(pwalletMain->mapWallet.count(txid), 1U);
+        BOOST_CHECK_EQUAL_COLLECTIONS(mapWalletBefore.begin(), mapWalletBefore.end(),
+                                      mapWalletAfter.begin(), mapWalletAfter.end());
+        BOOST_CHECK(pwalletMain->setLockedCoins == lockedCoinsBefore);
+        const CWalletTx& cacheStateAfter = pwalletMain->mapWallet[txid];
+        BOOST_CHECK_EQUAL(cacheStateAfter.fDebitCached, cacheStateBefore.fDebitCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fCreditCached, cacheStateBefore.fCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fImmatureCreditCached, cacheStateBefore.fImmatureCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fAvailableCreditCached, cacheStateBefore.fAvailableCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fWatchDebitCached, cacheStateBefore.fWatchDebitCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fWatchCreditCached, cacheStateBefore.fWatchCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fImmatureWatchCreditCached, cacheStateBefore.fImmatureWatchCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fAvailableWatchCreditCached, cacheStateBefore.fAvailableWatchCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fChangeCached, cacheStateBefore.fChangeCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fAvailableAnonCreditCached, cacheStateBefore.fAvailableAnonCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.fCreditSplitCached, cacheStateBefore.fCreditSplitCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nDebitCached, cacheStateBefore.nDebitCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nCreditCached, cacheStateBefore.nCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nImmatureCreditCached, cacheStateBefore.nImmatureCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nAvailableCreditCached, cacheStateBefore.nAvailableCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nWatchDebitCached, cacheStateBefore.nWatchDebitCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nWatchCreditCached, cacheStateBefore.nWatchCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nChangeCached, cacheStateBefore.nChangeCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nImmatureWatchCreditCached, cacheStateBefore.nImmatureWatchCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nAvailableWatchCreditCached, cacheStateBefore.nAvailableWatchCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nAvailableAnonCreditCached, cacheStateBefore.nAvailableAnonCreditCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nCredDCached, cacheStateBefore.nCredDCached);
+        BOOST_CHECK_EQUAL(cacheStateAfter.nCredAnonCached, cacheStateBefore.nCredAnonCached);
+        BOOST_CHECK_EQUAL(pwalletMain->mapWallet.erase(txid), 1U);
+    }
+    mempool.remove(tx);
+}
+
+BOOST_AUTO_TEST_CASE(collateral_outpoint_diagnostic_reports_missing_wallet_transaction)
+{
+    const CRPCCommand* command = tableRPC["getcollateraloutpointdiagnostics"];
+    BOOST_REQUIRE(command != NULL);
+    json_spirit::Array params;
+    params.push_back(uint256(42).GetHex());
+    params.push_back(0);
+    json_spirit::Object result = command->actor(params, false).get_obj();
+
+    BOOST_CHECK(!find_value(result, "tx_exists").get_bool());
+    BOOST_CHECK(!find_value(result, "output_exists").get_bool());
+    BOOST_CHECK(find_value(result, "amount").is_null());
+    BOOST_CHECK(find_value(result, "scriptPubKey").is_null());
+    BOOST_CHECK_EQUAL(find_value(result, "is_mine").get_str(), "unavailable");
+    BOOST_CHECK(!find_value(result, "get_key_exists").get_bool());
+    BOOST_CHECK_EQUAL(find_value(result, "available_coins_rejection").get_str(),
+                      "wallet transaction not found");
+    BOOST_CHECK_EQUAL(find_value(result, "rejection_stage").get_str(), "wallet_lookup");
+    BOOST_CHECK_EQUAL(find_value(result, "rejection_reason").get_str(),
+                      "wallet transaction not found");
+}
+
+BOOST_AUTO_TEST_CASE(memory_diagnostic_is_registered_consistent_and_read_only)
+{
+    const CRPCCommand* command = tableRPC["getmemorydiagnostics"];
+    BOOST_REQUIRE(command != NULL);
+
+    size_t mapWalletSizeBefore;
+    std::set<COutPoint> lockedCoinsBefore;
+    CDataStream mapWalletBefore(SER_DISK, CLIENT_VERSION);
+    {
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        mapWalletSizeBefore = pwalletMain->mapWallet.size();
+        lockedCoinsBefore = pwalletMain->setLockedCoins;
+        mapWalletBefore << pwalletMain->mapWallet;
+    }
+
+    json_spirit::Array params;
+    json_spirit::Object result = command->actor(params, false).get_obj();
+
+    BOOST_CHECK_EQUAL(find_value(result, "mapBlockIndex_count").get_int64(),
+                      (int64_t)mapBlockIndex.size());
+    BOOST_CHECK_EQUAL(find_value(result, "sizeof_CBlockIndex").get_int64(),
+                      (int64_t)sizeof(CBlockIndex));
+    BOOST_CHECK(find_value(result, "sizeof_map_value_type").get_int64() > 0);
+    BOOST_CHECK(find_value(result, "sizeof_map_node").get_int64() > 0);
+    BOOST_CHECK(find_value(result, "map_node_allocated_bytes").get_int64() > 0);
+    BOOST_CHECK(find_value(result, "sizeof_CBlockIndex_allocated_bytes").get_int64() >= 0);
+    BOOST_CHECK_EQUAL(find_value(result, "estimated_payload_bytes").get_int64(),
+                      (int64_t)mapBlockIndex.size() * (int64_t)sizeof(CBlockIndex));
+    BOOST_CHECK(find_value(result, "estimated_container_bytes").get_int64() >= 0);
+    BOOST_CHECK(find_value(result, "estimated_allocated_bytes").get_int64() >=
+                find_value(result, "estimated_payload_bytes").get_int64());
+    BOOST_CHECK_EQUAL(find_value(result, "setStakeSeen_count").get_int64(),
+                      (int64_t)setStakeSeen.size());
+    BOOST_CHECK(find_value(result, "setStakeSeen_estimated_bytes").get_int64() >= 0);
+    BOOST_CHECK(find_value(result, "setStakeSeenOrphan_count").get_int64() >= 0);
+    BOOST_CHECK(find_value(result, "setInvalidBlockHash_count").get_int64() >= 0);
+    BOOST_CHECK(find_value(result, "setpwalletRegistered_count").get_int64() >= 0);
+    BOOST_CHECK_EQUAL(find_value(result, "vecCollateralnodes_count").get_int64(),
+                      (int64_t)vecCollateralnodes.size());
+    BOOST_CHECK(find_value(result, "vecCollateralnodes_estimated_bytes").get_int64() >= 0);
+    BOOST_CHECK(find_value(result, "vecCollateralnodeRanks_count").get_int64() >= 0);
+    BOOST_CHECK(find_value(result, "mapSeenCollateralnodeVotes_count").get_int64() >= 0);
+    BOOST_CHECK(find_value(result, "mapCacheBlockHashes_count").get_int64() >= 0);
+    BOOST_CHECK(find_value(result, "mempool_count").get_int64() >= 0);
+    BOOST_CHECK_EQUAL(find_value(result, "mapWallet_count").get_int64(),
+                      (int64_t)mapWalletSizeBefore);
+    BOOST_CHECK(find_value(result, "setLockedCoins_count").get_int64() >= 0);
+
+    // Strict read-only: no wallet mutation.
+    {
+        LOCK2(cs_main, pwalletMain->cs_wallet);
+        CDataStream mapWalletAfter(SER_DISK, CLIENT_VERSION);
+        mapWalletAfter << pwalletMain->mapWallet;
+        BOOST_CHECK_EQUAL_COLLECTIONS(mapWalletBefore.begin(), mapWalletBefore.end(),
+                                      mapWalletAfter.begin(), mapWalletAfter.end());
+        BOOST_CHECK_EQUAL(pwalletMain->mapWallet.size(), mapWalletSizeBefore);
+        BOOST_CHECK(pwalletMain->setLockedCoins == lockedCoinsBefore);
+    }
+}BOOST_AUTO_TEST_SUITE_END()
 BOOST_AUTO_TEST_CASE(parse_collateralnode_outpoint_valid)
 {
     const std::string goodTx = "92da2832505942f0f86d23c0a1ccafe3ac02f5b7344a70e18eea673008eebf2c";
