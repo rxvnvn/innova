@@ -8,6 +8,7 @@
 #include "util.h"
 #include "main.h"
 #include "ui_interface.h"
+#include <atomic>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 
@@ -20,6 +21,49 @@ namespace fs = boost::filesystem;
 
 
 unsigned int nWalletDBUpdated;
+
+// ---------------------------------------------------------------------------
+// Diagnostic-only cs_db acquisition-wait telemetry (AUD wallet-flush follow-up).
+// Measures whether the wallet-flush thread's long BDB txn_checkpoint hold on
+// bitdb.cs_db delays other DB opens (incl. the block-path wallet write that runs
+// under cs_main). dbFlushInProgress lets us attribute long waits to the flush
+// thread specifically. No semantics / lock-order / durability change.
+// ---------------------------------------------------------------------------
+static std::atomic<int64_t> nDbLockWaitCount{0};
+static std::atomic<int64_t> nDbLockWaitUsTotal{0};
+static std::atomic<int64_t> nDbLockWaitUsMax{0};
+static std::atomic<int64_t> nDbLockWaitOver100ms{0};
+static std::atomic<int64_t> nDbLockWaitOver500ms{0};
+static std::atomic<int64_t> nDbLockWaitOver100msWhileFlushing{0};
+std::atomic<bool> dbFlushInProgress{false};
+
+void RecordDbLockWait(int64_t nWaitUs)
+{
+    if (nWaitUs <= 0)
+        return;
+    nDbLockWaitCount.fetch_add(1, std::memory_order_relaxed);
+    nDbLockWaitUsTotal.fetch_add(nWaitUs, std::memory_order_relaxed);
+    int64_t nMax = nDbLockWaitUsMax.load(std::memory_order_relaxed);
+    while (nWaitUs > nMax &&
+           !nDbLockWaitUsMax.compare_exchange_weak(nMax, nWaitUs, std::memory_order_relaxed))
+    {
+    }
+    if (nWaitUs >= 100000)
+    {
+        nDbLockWaitOver100ms.fetch_add(1, std::memory_order_relaxed);
+        if (dbFlushInProgress.load(std::memory_order_relaxed))
+            nDbLockWaitOver100msWhileFlushing.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (nWaitUs >= 500000)
+        nDbLockWaitOver500ms.fetch_add(1, std::memory_order_relaxed);
+}
+
+int64_t GetDbLockWaitCount() { return nDbLockWaitCount.load(std::memory_order_relaxed); }
+int64_t GetDbLockWaitUsTotal() { return nDbLockWaitUsTotal.load(std::memory_order_relaxed); }
+int64_t GetDbLockWaitUsMax() { return nDbLockWaitUsMax.load(std::memory_order_relaxed); }
+int64_t GetDbLockWaitOver100ms() { return nDbLockWaitOver100ms.load(std::memory_order_relaxed); }
+int64_t GetDbLockWaitOver500ms() { return nDbLockWaitOver500ms.load(std::memory_order_relaxed); }
+int64_t GetDbLockWaitOver100msWhileFlushing() { return nDbLockWaitOver100msWhileFlushing.load(std::memory_order_relaxed); }
 
 
 
@@ -245,7 +289,9 @@ CDB::CDB(const char *pszFile, const char* pszMode) :
         nFlags |= DB_CREATE;
 
     {
+        int64_t nDbLockWaitStart = GetTimeMicros();
         LOCK(bitdb.cs_db);
+        RecordDbLockWait(GetTimeMicros() - nDbLockWaitStart);
         if (!bitdb.Open(GetDataDir()))
             throw runtime_error("env open failed");
 

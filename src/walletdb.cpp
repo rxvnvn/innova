@@ -836,16 +836,21 @@ void ThreadFlushWalletDB(void* parg)
                     map<string, int>::iterator mi = bitdb.mapFileUseCount.find(strFile);
                     if (mi != bitdb.mapFileUseCount.end())
                     {
-                        printf("Flushing wallet.dat\n");
                         nLastFlushed = nWalletDBUpdated;
                         int64_t nStart = GetTimeMillis();
 
                         // Flush wallet.dat so it's self contained
+                        dbFlushInProgress.store(true, std::memory_order_relaxed);
                         bitdb.CloseDb(strFile);
                         bitdb.CheckpointLSN(strFile);
 
                         bitdb.mapFileUseCount.erase(mi++);
-                        printf("Flushed wallet.dat %" PRId64"ms\n", GetTimeMillis() - nStart);
+                        dbFlushInProgress.store(false, std::memory_order_relaxed);
+                        // Logging-only: silent on routine successful flushes; retain
+                        // slow-flush telemetry above a 100ms threshold.
+                        int64_t nFlushMs = GetTimeMillis() - nStart;
+                        if (nFlushMs >= 100)
+                            printf("Flushed wallet.dat %" PRId64 "ms\n", nFlushMs);
                     }
                 }
             }
