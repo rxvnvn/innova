@@ -136,6 +136,7 @@ bool g_testFailSetBestChainAfterDagInit = false;
 bool g_testFailInitialDagLinksCommit = false;
 bool g_testFailFailedAddDagLinksCleanupCommit = false;
 bool g_testFailReorganizeDagLinksEraseCommit = false;
+bool g_testForceDagPruneInAdd = false;
 bool g_testSuppressDagSourceAbort = false;
 bool g_dagSourceUnhealthy = false;
 
@@ -8493,22 +8494,37 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 
     // IDAG: Clean up DAG data for disconnected blocks
     // Phase 1: Batch all LevelDB erasures atomically
+    uint256 reorganizeSourcePost;
+    bool fReorganizeSourcePost = false;
     {
         CTxDB txdbDAGClean;
-        txdbDAGClean.TxnBegin();
+        uint256 dagSourcePost;
+        if (!txdbDAGClean.MintDAGSourceStateId(dagSourcePost) ||
+            !txdbDAGClean.TxnBegin())
+            return AbortDagSourcePersistence("Reorganize: DAG source-state setup failed; shutting down");
         for (auto rit = vDisconnect.rbegin(); rit != vDisconnect.rend(); ++rit)
         {
             CBlockIndex* pindex = *rit;
-            if (pindex->nHeight >= FORK_HEIGHT_DAG && pindex->phashBlock)
-                txdbDAGClean.EraseDAGLinks(pindex->GetBlockHash());
+            if (pindex->nHeight >= FORK_HEIGHT_DAG && pindex->phashBlock &&
+                !txdbDAGClean.EraseDAGLinks(pindex->GetBlockHash()))
+            {
+                txdbDAGClean.TxnAbort();
+                return AbortDagSourcePersistence("Reorganize: DAG-link erase write failed; shutting down");
+            }
         }
-        if (g_testFailReorganizeDagLinksEraseCommit || !txdbDAGClean.TxnCommit())
+        if (!txdbDAGClean.WriteDAGSourceStateId(dagSourcePost) ||
+            g_testFailReorganizeDagLinksEraseCommit || !txdbDAGClean.TxnCommit())
             return AbortDagSourcePersistence("Reorganize: DAG-link erase persistence failed; shutting down to prevent stale DAG source");
+        reorganizeSourcePost = dagSourcePost;
+        fReorganizeSourcePost = true;
+        SetDagTipDeltaFinalSourceStateId(dagSourcePost);
     }
     // Phase 2: Memory cleanup after LevelDB commit (reverse order: children first).
     // The legacy reorg transaction is durable at this point; publish only after
     // the remaining in-memory reorg completion path reaches its final success.
     const bool fDagTipDeltaTransaction = BeginDagTipDeltaTransaction(DAG_TIP_DELTA_REORGANIZE);
+    if (fReorganizeSourcePost)
+        SetDagTipDeltaFinalSourceStateId(reorganizeSourcePost);
     bool fDAGReorg = false;
     for (auto rit = vDisconnect.rbegin(); rit != vDisconnect.rend(); ++rit)
     {
@@ -8987,6 +9003,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
 
     bool fDAGDataInitialized = false;
     bool fDagTipDeltaTransaction = false;
+    uint256 dagSourcePre;
+    bool fDagSourcePreCaptured = false;
     std::vector<uint256> vDAGParents;
 
     // IDAG Phase 2: Initialize DAG data for post-fork blocks
@@ -9020,26 +9038,31 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
 
             nDAGTimer = GetTimeMillis();
             CTxDB txdbDAG;
-            if (txdbDAG.TxnBegin())
+            uint256 dagSourcePost;
+            if (!(fDagSourcePreCaptured = txdbDAG.ReadDAGSourceStateId(dagSourcePre)) ||
+                !txdbDAG.MintDAGSourceStateId(dagSourcePost) ||
+                !txdbDAG.TxnBegin() ||
+                !g_dagManager.WriteDAGLinks(txdbDAG, hash))
             {
-                g_dagManager.WriteDAGLinks(txdbDAG, hash);
-                // Also update parent entries (new child link)
-                for (const uint256& hashParent : vDAGParents)
-                    g_dagManager.WriteDAGLinks(txdbDAG, hashParent);
-                {
-                    ibdactivepath::ActivePathTimer ibdDAGCommitTimer(
-                        ibdactivepath::GetCounters().dag_epoch_commit_us_total,
-                        ibdactivepath::GetCounters().dag_epoch_commit_us_max,
-                        ibdactivepath::GetCounters().dag_epoch_commit_count,
-                        "dag_commit", pindexNew->nHeight);
-                    if (g_testFailInitialDagLinksCommit || !txdbDAG.TxnCommit())
-                    {
-                        if (fDagTipDeltaTransaction)
-                            DiscardDagTipDeltaTransaction();
-                        return AbortDagSourcePersistence("AddToBlockIndex: DAG-link persistence failed; shutting down to prevent stale DAG source");
-                    }
-                }
+                if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                return AbortDagSourcePersistence("AddToBlockIndex: DAG source-state setup failed; shutting down");
             }
+            for (const uint256& hashParent : vDAGParents)
+                if (g_dagManager.HasDAGData(hashParent) &&
+                    !g_dagManager.WriteDAGLinks(txdbDAG, hashParent))
+                {
+                    txdbDAG.TxnAbort();
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: DAG-link write failed; shutting down");
+                }
+            if (!txdbDAG.WriteDAGSourceStateId(dagSourcePost) ||
+                g_testFailInitialDagLinksCommit || !txdbDAG.TxnCommit())
+            {
+                if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                return AbortDagSourcePersistence("AddToBlockIndex: DAG-link persistence failed; shutting down to prevent stale DAG source");
+            }
+            if (fDagTipDeltaTransaction)
+                SetDagTipDeltaFinalSourceStateId(dagSourcePost);
             nDAGWriteMs = GetTimeMillis() - nDAGTimer;
 
             // Use DAG score for best-chain comparison
@@ -9079,9 +9102,26 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                         }
                     }
 
-                    // Prune old DAG data periodically
+                    // Prune old DAG data periodically. A false return means
+                    // source persistence failed before memory mutation; never
+                    // publish the pending ADD root as though it were healthy.
                     CTxDB txdbPrune;
-                    g_dagManager.PruneDAGData(txdbPrune, pindexNew->nHeight);
+                    if (!g_dagManager.PruneDAGData(txdbPrune, pindexNew->nHeight))
+                    {
+                        if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                        return AbortDagSourcePersistence("AddToBlockIndex: DAG prune persistence failed; shutting down");
+                    }
+                }
+                // Test-only: exercise the same Add -> PruneDAGData call without
+                // forging an epoch boundary or epoch-state topology.
+                if (g_testForceDagPruneInAdd && nCurrentEpoch <= nPreviousEpoch)
+                {
+                    CTxDB txdbPrune;
+                    if (!g_dagManager.PruneDAGData(txdbPrune, pindexNew->nHeight))
+                    {
+                        if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                        return AbortDagSourcePersistence("AddToBlockIndex: DAG prune persistence failed; shutting down");
+                    }
                 }
             }
         }
@@ -9100,20 +9140,27 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 g_dagManager.RemoveBlockDAGData(hash);
 
                 CTxDB txdbDAGClean;
-                if (txdbDAGClean.TxnBegin())
+                if (!fDagSourcePreCaptured || !txdbDAGClean.TxnBegin())
                 {
-                    txdbDAGClean.EraseDAGLinks(hash);
-                    for (const uint256& hashParent : vDAGParents)
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback TxnBegin failed; shutting down");
+                }
+                txdbDAGClean.EraseDAGLinks(hash);
+                for (const uint256& hashParent : vDAGParents)
+                {
+                    if (g_dagManager.HasDAGData(hashParent) &&
+                        !g_dagManager.WriteDAGLinks(txdbDAGClean, hashParent))
                     {
-                        if (g_dagManager.HasDAGData(hashParent))
-                            g_dagManager.WriteDAGLinks(txdbDAGClean, hashParent);
+                        txdbDAGClean.TxnAbort();
+                        if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                        return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback write failed; shutting down");
                     }
-                    if (g_testFailFailedAddDagLinksCleanupCommit || !txdbDAGClean.TxnCommit())
-                    {
-                        if (fDagTipDeltaTransaction)
-                            DiscardDagTipDeltaTransaction();
-                        return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback persistence failed; shutting down to prevent stale DAG source");
-                    }
+                }
+                if (!txdbDAGClean.WriteDAGSourceStateId(dagSourcePre) ||
+                    g_testFailFailedAddDagLinksCleanupCommit || !txdbDAGClean.TxnCommit())
+                {
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback persistence failed; shutting down to prevent stale DAG source");
                 }
             }
 

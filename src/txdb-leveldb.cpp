@@ -13,6 +13,7 @@
 #include <leveldb/cache.h>
 #include <leveldb/filter_policy.h>
 #include <memenv/memenv.h>
+#include <openssl/rand.h>
 
 #include "kernel.h"
 #include "checkpoints.h"
@@ -33,6 +34,13 @@ static CCriticalSection cs_txdb;
 static int nIBDBatchSize = 0;
 static int nIBDBatchCount = 0;
 static bool fIBDBatchPending = false;
+
+// R2c.1d2 bootstrap-only default-off failure seams. They are deliberately
+// consulted only by BootstrapDAGSourceStateId; ordinary transactions cannot be
+// affected by these tests.
+bool g_testFailDAGSourceStateBootstrapMint = false;
+bool g_testFailDAGSourceStateBootstrapTxnBegin = false;
+bool g_testFailDAGSourceStateBootstrapTxnCommit = false;
 static CCriticalSection cs_IBDBatch;
 
 void InitIBDBatching()
@@ -429,6 +437,78 @@ bool CTxDB::WriteDAGLinks(const uint256& hash, const CBlockDAGData& data)
 bool CTxDB::EraseDAGLinks(const uint256& hash)
 {
     return Erase(make_pair(string("daglinks"), hash));
+}
+
+bool CTxDB::ReadDAGSourceStateId(uint256& out)
+{
+    return Read(make_pair(string("dagsourcestate"), uint8_t(0)), out);
+}
+
+bool CTxDB::HasDAGSourceStateId()
+{
+    return Exists(make_pair(string("dagsourcestate"), uint8_t(0)));
+}
+
+bool CTxDB::WriteDAGSourceStateId(const uint256& id)
+{
+    return Write(make_pair(string("dagsourcestate"), uint8_t(0)), id);
+}
+
+bool CTxDB::MintDAGSourceStateId(uint256& out)
+{
+    if (g_testFailDAGSourceStateBootstrapMint ||
+        RAND_bytes(reinterpret_cast<unsigned char*>(&out), sizeof(out)) != 1)
+        return false;
+    return out != uint256(0);
+}
+
+bool CTxDB::BootstrapDAGSourceStateId(std::string* error)
+{
+    if (error) error->clear();
+    uint256 existing;
+    if (ReadDAGSourceStateId(existing))
+        return true; // Existing state identity is restart-idempotent.
+    if (HasDAGSourceStateId())
+    {
+        if (error) *error = "DAG source-state token is corrupt or undecodable";
+        return false;
+    }
+
+    uint256 minted;
+    if (!MintDAGSourceStateId(minted))
+    {
+        if (error) *error = "DAG source-state token generation failed";
+        return false;
+    }
+    if (g_testFailDAGSourceStateBootstrapTxnBegin || !TxnBegin())
+    {
+        if (error) *error = "DAG source-state bootstrap TxnBegin failed";
+        return false;
+    }
+    if (!WriteDAGSourceStateId(minted))
+    {
+        TxnAbort();
+        if (error) *error = "DAG source-state bootstrap token write failed";
+        return false;
+    }
+    if (g_testFailDAGSourceStateBootstrapTxnCommit)
+    {
+        TxnAbort(); // deterministic pre-write failure: no storage effect.
+        if (error) *error = "DAG source-state bootstrap TxnCommit failed";
+        return false;
+    }
+    if (!TxnCommit())
+    {
+        if (error) *error = "DAG source-state bootstrap TxnCommit failed";
+        return false;
+    }
+    uint256 readBack;
+    if (!ReadDAGSourceStateId(readBack) || readBack != minted)
+    {
+        if (error) *error = "DAG source-state bootstrap read-back mismatch";
+        return false;
+    }
+    return true;
 }
 
 // IDAG Phase 3: Epoch state persistence
@@ -1081,6 +1161,11 @@ bool CTxDB::LoadBlockIndex()
 
     // IDAG Phase 2+3: Load DAG links (ordering deferred to init.cpp for incremental support)
     g_dagManager.LoadDAGLinks(*this);
+    {
+        std::string dagStateError;
+        if (!BootstrapDAGSourceStateId(&dagStateError))
+            return error("CTxDB::LoadBlockIndex() : DAG source-state bootstrap failed: %s", dagStateError.c_str());
+    }
     g_dagManager.LoadEpochStates(*this);
     g_finalityTracker.LoadVotes(*this);
     g_finalityTracker.LoadTallyShares(*this);

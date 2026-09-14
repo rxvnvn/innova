@@ -13,6 +13,7 @@
 #include "blockindex_v2_reader.h"
 #include "candidate_frontier.h"
 #include "main.h"
+#include "txdb.h"
 
 #include <memory>
 #include <string>
@@ -201,6 +202,19 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
                livetail,
                (unsigned long long)ctx->live->BaseGeneration(),
                (int)ctx->live->TipAuthorityMutable()->TipHeight());
+    }
+
+    // 5c. R2c.1d2: authoritative startup bypasses legacy LoadBlockIndex(), so
+    // establish the zero-delta source-state identity here before this context
+    // can expose a live DAG writer. This never claims overlay health.
+    {
+        CTxDB txdb;
+        std::string derr;
+        if (!txdb.BootstrapDAGSourceStateId(&derr))
+        {
+            if (error) *error = "authoritative startup: DAG source-state bootstrap: " + derr;
+            return false;
+        }
     }
 
     // HReg + wallet rescan are driven by init.cpp AFTER this returns, using

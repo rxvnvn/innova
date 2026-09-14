@@ -276,10 +276,21 @@ public:
     bool WriteCheckpointPubKey(const std::string& strPubKey);
     bool LoadBlockIndex();
 
-    // IDAG Phase 2: DAG link persistence
+    // IDAG Phase 2: DAG link persistence. SourceStateId names the exact
+    // logical daglinks state and must be queued in the SAME TxnBegin/Commit
+    // batch as every mutation of this relation.
     bool WriteDAGLinks(const uint256& hash, const CBlockDAGData& data);
     bool EraseDAGLinks(const uint256& hash);
     bool IterateDAGLinks(std::map<uint256, CBlockDAGData>& mapOut);
+    bool ReadDAGSourceStateId(uint256& out);
+    bool HasDAGSourceStateId();
+    bool WriteDAGSourceStateId(const uint256& id);
+    // Production CSPRNG mint with explicit failure status; bootstrap/source
+    // mutation callers must not use a token when this returns false.
+    bool MintDAGSourceStateId(uint256& out);
+    // Zero-delta legacy upgrade: creates a token only when the key is absent.
+    // A present-but-undecodable token is corruption, never treated as missing.
+    bool BootstrapDAGSourceStateId(std::string* error);
 
     // IDAG Phase 3: Epoch state persistence
     bool WriteEpochState(int nEpoch, const CEpochState& state);
