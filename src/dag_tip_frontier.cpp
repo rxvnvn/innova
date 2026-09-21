@@ -235,91 +235,42 @@ static bool MergeRuns(const std::vector<boost::filesystem::path>& inputs,
     return true;
 }
 
-static void WriteU64LE(std::vector<unsigned char>& out, uint64_t v)
+// State carrier for bounded external-sort scan/run/merge/tip-extraction.
+// All failure paths throw std::runtime_error; caller (BuildDagTipFrontier) catches
+// and performs tempRoot cleanup.
+struct BuildScanState
 {
-    for (int i = 0; i < 8; ++i) { out.push_back((unsigned char)(v & 0xff)); v >>= 8; }
-}
+    leveldb::DB* db;
+    const std::string& dagLinksDir;
+    const unsigned char* expectedDigest;
+    const BuildOptions& options;
+    BuildResult* result;
+    const boost::filesystem::path& tempRoot;
 
-} // namespace
+    std::vector<boost::filesystem::path> runs;
+    std::vector<SortRecord> chunk;
+    size_t chunkBytes = 0;
+    uint64_t runNumber = 0;
+    uint64_t tips = 0;
+    unsigned char frontierDigest[32];
 
-// ---------------------------------------------------------------------------
-// Public builder
-// ---------------------------------------------------------------------------
+    BuildScanState(leveldb::DB* db_,
+                   const std::string& dagLinksDir_,
+                   const unsigned char* expectedDigest_,
+                   const BuildOptions& options_,
+                   BuildResult* result_,
+                   const boost::filesystem::path& tempRoot_)
+        : db(db_), dagLinksDir(dagLinksDir_), expectedDigest(expectedDigest_), options(options_),
+          result(result_), tempRoot(tempRoot_)
+    {}
 
-bool BuildDagTipFrontier(const std::string& dagLinksDir,
-                         const unsigned char expectedDigest[32],
-                         uint64_t generation,
-                         const std::string& outPath,
-                         const BuildOptions& options,
-                         BuildResult* result)
-{
-    if (!result) return false;
-    result->status = DAG_TIP_FRONTIER_BUILD_AUTHORITY_FAILURE;
-    boost::filesystem::path tempRoot;
-    try
+    void Execute()
     {
-        if (!expectedDigest)
-        {
-            result->error = "null expected DAG digest";
-            return false;
-        }
-        if (options.chunkBytes == 0 || options.maxRecordsPerChunk == 0 || options.maxOpenRuns < 2)
-        {
-            result->error = "invalid external-sort bounds";
-            return false;
-        }
-        if (options.tempParent.empty())
-        {
-            result->error = "temporary parent is not specified";
-            return false;
-        }
-
-        // Reuse the R1a external-sort verifier to bind this build to the exact
-        // DAG source digest (deterministic, order-correct, bounded external
-        // sort over the sorted node stream). The canonical dagInputDigest is
-        // defined over the SORTED daglinks node records, matching the
-        // generation-builder's digest semantics; feeding it during raw LevelDB
-        // iteration would be order-incorrect.
-        {
-            DagSourceBindingVerifierOptions vopts;
-            vopts.tempParent = options.tempParent;
-            DagSourceBindingResult binding = DagSourceBindingVerifier::Verify(
-                dagLinksDir, expectedDigest, vopts);
-            if (binding.status != DAG_SOURCE_BINDING_VERIFIED)
-            {
-                result->status = DAG_TIP_FRONTIER_BUILD_DECODE_FAILURE;
-                result->error = "source dagInputDigest binding failed: " + binding.error;
-                return false;
-            }
-        }
-
-        leveldb::Options dbOptions;
-        dbOptions.create_if_missing = false;
-        dbOptions.error_if_exists = false;
-        dbOptions.paranoid_checks = true;
-        leveldb::DB* db = NULL;
-        leveldb::Status openStatus = leveldb::DB::Open(dbOptions, dagLinksDir, &db);
-        if (!openStatus.ok())
-        {
-            result->status = DAG_TIP_FRONTIER_BUILD_SOURCE_UNAVAILABLE;
-            result->error = openStatus.ToString();
-            return false;
-        }
-
-        boost::filesystem::path parent(options.tempParent);
-        boost::filesystem::create_directories(parent);
-        tempRoot = parent / boost::filesystem::unique_path("dag-frontier-%%%%-%%%%-%%%%");
-        boost::filesystem::create_directories(tempRoot);
-
-        std::vector<boost::filesystem::path> runs;
-        std::vector<SortRecord> chunk;
-        size_t chunkBytes = 0;
         leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
         CDataStream prefixStream(SER_DISK, CLIENT_VERSION);
         prefixStream << std::string("daglinks");
         const std::string prefix = prefixStream.str();
         it->Seek(prefix);
-        uint64_t runNumber = 0;
         while (it->Valid())
         {
             const leveldb::Slice key = it->key();
@@ -421,7 +372,6 @@ bool BuildDagTipFrontier(const std::string& dagLinksDir,
         // The artifact is assembled AFTER tips are known: header (magic/version/
         // generation/dagInputDigest/frontierDigest/tipCount) + sorted tip hashes.
         boost::filesystem::path tipsFile = tempRoot / "tips.bin";
-        uint64_t tips = 0;
         SHA256_CTX digest;
         SHA256_Init(&digest);
         if (!runs.empty())
@@ -439,8 +389,91 @@ bool BuildDagTipFrontier(const std::string& dagLinksDir,
             std::ofstream emptyTips(tipsFile.string().c_str(), std::ios::binary | std::ios::trunc);
             emptyTips.close();
         }
-        unsigned char frontierDigest[32];
         SHA256_Final(frontierDigest, &digest);
+    }
+};
+
+static void WriteU64LE(std::vector<unsigned char>& out, uint64_t v)
+{
+    for (int i = 0; i < 8; ++i) { out.push_back((unsigned char)(v & 0xff)); v >>= 8; }
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Public builder
+// ---------------------------------------------------------------------------
+
+bool BuildDagTipFrontier(const std::string& dagLinksDir,
+                         const unsigned char expectedDigest[32],
+                         uint64_t generation,
+                         const std::string& outPath,
+                         const BuildOptions& options,
+                         BuildResult* result)
+{
+    if (!result) return false;
+    result->status = DAG_TIP_FRONTIER_BUILD_AUTHORITY_FAILURE;
+    boost::filesystem::path tempRoot;
+    try
+    {
+        if (!expectedDigest)
+        {
+            result->error = "null expected DAG digest";
+            return false;
+        }
+        if (options.chunkBytes == 0 || options.maxRecordsPerChunk == 0 || options.maxOpenRuns < 2)
+        {
+            result->error = "invalid external-sort bounds";
+            return false;
+        }
+        if (options.tempParent.empty())
+        {
+            result->error = "temporary parent is not specified";
+            return false;
+        }
+
+        // Reuse the R1a external-sort verifier to bind this build to the exact
+        // DAG source digest (deterministic, order-correct, bounded external
+        // sort over the sorted node stream). The canonical dagInputDigest is
+        // defined over the SORTED daglinks node records, matching the
+        // generation-builder's digest semantics; feeding it during raw LevelDB
+        // iteration would be order-incorrect.
+        {
+            DagSourceBindingVerifierOptions vopts;
+            vopts.tempParent = options.tempParent;
+            DagSourceBindingResult binding = DagSourceBindingVerifier::Verify(
+                dagLinksDir, expectedDigest, vopts);
+            if (binding.status != DAG_SOURCE_BINDING_VERIFIED)
+            {
+                result->status = DAG_TIP_FRONTIER_BUILD_DECODE_FAILURE;
+                result->error = "source dagInputDigest binding failed: " + binding.error;
+                return false;
+            }
+        }
+
+        leveldb::Options dbOptions;
+        dbOptions.create_if_missing = false;
+        dbOptions.error_if_exists = false;
+        dbOptions.paranoid_checks = true;
+        leveldb::DB* db = NULL;
+        leveldb::Status openStatus = leveldb::DB::Open(dbOptions, dagLinksDir, &db);
+        if (!openStatus.ok())
+        {
+            result->status = DAG_TIP_FRONTIER_BUILD_SOURCE_UNAVAILABLE;
+            result->error = openStatus.ToString();
+            return false;
+        }
+
+        boost::filesystem::path parent(options.tempParent);
+        boost::filesystem::create_directories(parent);
+        tempRoot = parent / boost::filesystem::unique_path("dag-frontier-%%%%-%%%%-%%%%");
+        boost::filesystem::create_directories(tempRoot);
+
+        // Execute bounded external-sort scan/run/merge/tip-extraction.
+        // BuildScanState throws std::runtime_error on all failure paths; catch
+        // block below performs tempRoot cleanup.
+        BuildScanState scanner(db, dagLinksDir, expectedDigest, options, result, tempRoot);
+        scanner.Execute();
 
         // Assemble artifact = header + tips content.
         std::vector<unsigned char> header;
@@ -448,12 +481,12 @@ bool BuildDagTipFrontier(const std::string& dagLinksDir,
         header.push_back(FRONTIER_VERSION);
         WriteU64LE(header, generation);
         header.insert(header.end(), expectedDigest, expectedDigest + 32);
-        header.insert(header.end(), frontierDigest, frontierDigest + 32);
-        WriteU64LE(header, tips);
-        std::ifstream tipsIn(tipsFile.string().c_str(), std::ios::binary);
+        header.insert(header.end(), scanner.frontierDigest, scanner.frontierDigest + 32);
+        WriteU64LE(header, scanner.tips);
+        std::ifstream tipsIn((tempRoot / "tips.bin").string().c_str(), std::ios::binary);
         std::vector<unsigned char> body((std::istreambuf_iterator<char>(tipsIn)), std::istreambuf_iterator<char>());
         tipsIn.close();
-        if (body.size() != tips * 32)
+        if (body.size() != scanner.tips * 32)
         {
             result->status = DAG_TIP_FRONTIER_BUILD_TEMP_IO_FAILURE;
             result->error = "tips body size mismatch";
@@ -475,7 +508,7 @@ bool BuildDagTipFrontier(const std::string& dagLinksDir,
             result->error = "artifact write failure";
             throw std::runtime_error("artifact write failure");
         }
-        result->frontierTipCount = tips;
+        result->frontierTipCount = scanner.tips;
         result->artifactBytes = (uint64_t)header.size() + (uint64_t)body.size();
         result->status = DAG_TIP_FRONTIER_BUILD_OK;
         result->error.clear();
@@ -496,6 +529,107 @@ bool BuildDagTipFrontier(const std::string& dagLinksDir,
         catch (...) {}
     }
     return result->status == DAG_TIP_FRONTIER_BUILD_OK;
+}
+
+bool DeriveCurrentDagTipsBounded(const std::string& dagLinksDir,
+                                 const std::string& outputPath,
+                                 const BuildOptions& options,
+                                 CurrentDagTipDerivationResult* result)
+{
+    if (!result) return false;
+    *result = CurrentDagTipDerivationResult();
+    if (options.chunkBytes == 0 || options.maxRecordsPerChunk == 0 ||
+        options.maxOpenRuns < 2 || options.tempParent.empty())
+    {
+        result->status = DAG_CURRENT_TIPS_DERIVATION_INVALID_OPTIONS;
+        result->error = "invalid external-sort bounds or temporary parent";
+        return false;
+    }
+
+    leveldb::Options dbOptions;
+    dbOptions.create_if_missing = false;
+    dbOptions.error_if_exists = false;
+    dbOptions.paranoid_checks = true;
+    leveldb::DB* db = NULL;
+    leveldb::Status openStatus = leveldb::DB::Open(dbOptions, dagLinksDir, &db);
+    if (!openStatus.ok())
+    {
+        result->status = DAG_CURRENT_TIPS_DERIVATION_SOURCE_UNAVAILABLE;
+        result->error = openStatus.ToString();
+        return false;
+    }
+
+    boost::filesystem::path tempRoot;
+    boost::filesystem::path staged;
+    BuildResult stats;
+    bool scannerOwnsDb = false;
+    const boost::filesystem::path destination(outputPath);
+    try
+    {
+        boost::filesystem::path parent(options.tempParent);
+        boost::filesystem::create_directories(parent);
+        tempRoot = parent / boost::filesystem::unique_path("dag-current-tips-%%%%-%%%%-%%%%");
+        boost::filesystem::create_directories(tempRoot);
+        scannerOwnsDb = true;
+        BuildScanState scanner(db, dagLinksDir, NULL, options, &stats, tempRoot);
+        scanner.Execute();
+
+        try
+        {
+            const boost::filesystem::path outputParent = destination.parent_path();
+            if (!outputParent.empty()) boost::filesystem::create_directories(outputParent);
+            staged = (outputParent.empty() ? boost::filesystem::current_path() : outputParent) /
+                boost::filesystem::unique_path("dag-current-tips-output-%%%%-%%%%.tmp");
+            boost::filesystem::copy_file(tempRoot / "tips.bin", staged,
+                                         boost::filesystem::copy_option::overwrite_if_exists);
+            boost::filesystem::rename(staged, destination);
+            staged.clear();
+        }
+        catch (const std::exception& ex)
+        {
+            result->status = DAG_CURRENT_TIPS_DERIVATION_OUTPUT_PUBLICATION_FAILURE;
+            result->error = ex.what();
+            if (!staged.empty()) { try { boost::filesystem::remove(staged); } catch (...) {} }
+            if (!tempRoot.empty()) { try { boost::filesystem::remove_all(tempRoot); } catch (...) {} }
+            return false;
+        }
+
+        result->nodesProcessed = stats.nodesProcessed;
+        result->parentRefsProcessed = stats.parentRefsProcessed;
+        result->tipCount = scanner.tips;
+        result->temporaryBytesWritten = stats.temporaryBytesWritten;
+        result->peakChunkBytes = stats.peakChunkBytes;
+        result->peakChunkRecords = stats.peakChunkRecords;
+        result->runCount = stats.runCount;
+        result->mergePasses = stats.mergePasses;
+        result->status = DAG_CURRENT_TIPS_DERIVATION_OK;
+        result->error.clear();
+    }
+    catch (const std::exception& ex)
+    {
+        switch (stats.status)
+        {
+        case DAG_TIP_FRONTIER_BUILD_DECODE_FAILURE:
+            result->status = DAG_CURRENT_TIPS_DERIVATION_DECODE_FAILURE;
+            break;
+        case DAG_TIP_FRONTIER_BUILD_SOURCE_CORRUPT:
+            result->status = DAG_CURRENT_TIPS_DERIVATION_SOURCE_CORRUPT;
+            break;
+        case DAG_TIP_FRONTIER_BUILD_TEMP_IO_FAILURE:
+            result->status = DAG_CURRENT_TIPS_DERIVATION_TEMP_IO_FAILURE;
+            break;
+        default:
+            result->status = DAG_CURRENT_TIPS_DERIVATION_INTERNAL_FAILURE;
+            break;
+        }
+        result->error = stats.error.empty() ? ex.what() : stats.error;
+        if (!scannerOwnsDb && db) { delete db; db = NULL; }
+        if (!staged.empty()) { try { boost::filesystem::remove(staged); } catch (...) {} }
+        if (!tempRoot.empty()) { try { boost::filesystem::remove_all(tempRoot); } catch (...) {} }
+        return false;
+    }
+    if (!tempRoot.empty()) { try { boost::filesystem::remove_all(tempRoot); } catch (...) {} }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

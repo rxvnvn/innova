@@ -26,12 +26,47 @@
 #define INNOVA_DAG_TIP_LIVE_OVERLAY_H
 
 #include <stdint.h>
+#include <cstring>
 #include <string>
 #include <vector>
 
 #include "uint256.h"
 
 namespace dag_tip_frontier {
+
+class TipFrontierReader;
+
+// Narrow default-off test seams; no configuration/RPC path.
+extern bool g_testFailLiveTipOverlayOverrideWrite;
+extern bool g_testFailLiveTipOverlayCheckpointWrite;
+
+enum LiveOverlayPhase
+{
+    LIVE_OVERLAY_PHASE_UNAVAILABLE = 0,
+    LIVE_OVERLAY_PHASE_APPLYING,
+    LIVE_OVERLAY_PHASE_CLEAN
+};
+
+// Versioned, value-only derived-state checkpoint. dagInputDigest and
+// frontierDigest bind the immutable seed artifact; appliedSourceStateId names
+// the mutable recovered daglinks relation. This is never source authority.
+// Version 2 certifies source-semantic delivery. Version 1 may contain a
+// legacy-residency false CLEAN and must take bounded recovery even at equal T.
+static const uint32_t LIVE_OVERLAY_CHECKPOINT_VERSION = 2;
+struct LiveTipOverlayCheckpoint
+{
+    uint32_t version;
+    uint64_t generationId;
+    unsigned char dagInputDigest[32];
+    unsigned char frontierDigest[32];
+    LiveOverlayPhase phase;
+    uint256 appliedSourceStateId;
+    LiveTipOverlayCheckpoint() : version(LIVE_OVERLAY_CHECKPOINT_VERSION), generationId(0), phase(LIVE_OVERLAY_PHASE_UNAVAILABLE), appliedSourceStateId(0)
+    {
+        memset(dagInputDigest, 0, sizeof(dagInputDigest));
+        memset(frontierDigest, 0, sizeof(frontierDigest));
+    }
+};
 
 enum LiveOverlayStatus
 {
@@ -71,6 +106,13 @@ public:
     // Streaming override iteration (hash, present). Never materializes the set.
     typedef void (*ForEachOverrideFn)(const uint256&, bool present, void* ctx);
     bool ForEachOverride(ForEachOverrideFn fn, void* ctx, std::string* error) const;
+    // Removes every persisted override in bounded disk-backed batches. Used only
+    // by a rebuild already durably marked APPLYING; never infer health from it.
+    bool ClearOverrides(std::string* error);
+    // Checkpoint is distinct from the legacy generation marker. Missing is
+    // explicitly unavailable; callers may establish CLEAN only after proof.
+    bool ReadCheckpoint(LiveTipOverlayCheckpoint* out, std::string* error) const;
+    bool WriteCheckpoint(const LiveTipOverlayCheckpoint& checkpoint, std::string* error);
 private:
     struct Impl;
     Impl* impl_;
@@ -111,6 +153,18 @@ public:
     size_t CacheCurrent() const;
     size_t CachePeak() const;
     uint64_t PersistentOverrideCount() const;
+    // Missing/corrupt checkpoint is unavailable; this method never treats a
+    // generation marker or override contents as checkpoint proof.
+    bool ReadCheckpoint(LiveTipOverlayCheckpoint* out, std::string* error) const;
+    bool WriteCheckpoint(const LiveTipOverlayCheckpoint& checkpoint, std::string* error);
+    // Rebuild-only APIs: reset persistent override state in bounded batches and
+    // obtain a separately validated immutable seed cursor for a streaming diff.
+    bool ClearPersistentOverrides(std::string* error);
+    bool OpenImmutableSeedReader(TipFrontierReader* out, std::string* error) const;
+    // Constructs a checkpoint bound to this already-validated immutable seed.
+    bool MakeCheckpoint(LiveOverlayPhase phase, const uint256& token,
+                        LiveTipOverlayCheckpoint* out, std::string* error) const;
+    bool IsImmutableBindingValid(const LiveTipOverlayCheckpoint& checkpoint) const;
 private:
     struct Impl;
     Impl* impl_;

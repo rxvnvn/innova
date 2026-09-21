@@ -21,8 +21,11 @@ struct DagTipCommittedDeltaEvent {
     DagTipDeltaRecord record;
     bool hasFinalSourceStateId;
     uint256 finalSourceStateId;
-    DagTipCommittedDeltaEvent(Kind k, DagTipDeltaOrigin o) : kind(k), origin(o), record(), hasFinalSourceStateId(false), finalSourceStateId(0) {}
-    DagTipCommittedDeltaEvent(DagTipDeltaOrigin o, const DagTipDeltaRecord& r) : kind(RECORD), origin(o), record(r), hasFinalSourceStateId(false), finalSourceStateId(0) {}
+    bool hasInitialSourceStateId;
+    uint256 initialSourceStateId;
+    uint64_t expectedRecordCount;
+    DagTipCommittedDeltaEvent(Kind k, DagTipDeltaOrigin o) : kind(k), origin(o), record(), hasFinalSourceStateId(false), finalSourceStateId(0), hasInitialSourceStateId(false), initialSourceStateId(0), expectedRecordCount(0) {}
+    DagTipCommittedDeltaEvent(DagTipDeltaOrigin o, const DagTipDeltaRecord& r) : kind(RECORD), origin(o), record(r), hasFinalSourceStateId(false), finalSourceStateId(0), hasInitialSourceStateId(false), initialSourceStateId(0), expectedRecordCount(0) {}
 };
 
 typedef void (*DagTipCommittedDeltaObserver)(const DagTipCommittedDeltaEvent&, void*);
@@ -42,6 +45,8 @@ bool BeginDagTipDeltaTransaction(DagTipDeltaOrigin origin);
 // Close a joined nested scope without publication. Root callers use Commit/Discard.
 void LeaveDagTipDeltaTransaction();
 void AppendDagTipDelta(const DagTipDeltaRecord& record);
+void SetDagTipDeltaInitialSourceStateId(const uint256& id);
+void InvalidateDagTipDeltaTransaction();
 // Root-only current source checkpoint. Nested source mutations overwrite this;
 // END consumers bind only the final successfully committed token.
 void SetDagTipDeltaFinalSourceStateId(const uint256& id);

@@ -106,8 +106,7 @@ void CDAGManager::InvalidateBlueSetCacheForBlock(const uint256& hashBlock) const
 bool CDAGManager::TrackedInsertTip(const uint256& hash)
 {
     const std::pair<std::set<uint256>::iterator, bool> r = setDAGTips.insert(hash);
-    if (r.second)
-        AppendDagTipDelta(DagTipDeltaRecord(DagTipDeltaRecord::TIP_ADD, hash));
+    // Live shadow deltas come exclusively from canonical CTxDB mutations.
     return r.second;
 }
 
@@ -115,7 +114,7 @@ bool CDAGManager::TrackedEraseTip(const uint256& hash)
 {
     if (setDAGTips.erase(hash) == 0)
         return false;
-    AppendDagTipDelta(DagTipDeltaRecord(DagTipDeltaRecord::TIP_REMOVE, hash));
+    // Legacy membership is maintained, but is not source authority.
     return true;
 }
 
@@ -280,6 +279,7 @@ CBlockIndex* CDAGManager::SelectBestDAGTip() const
 
 void CDAGManager::ColorBlock(CBlockIndex* pindex)
 {
+    std::map<uint256, CBlockIndex*>& mapBlockIndex = RecolorBlockIndex();
     LOCK(cs_dag);
 
     if (!pindex || !pindex->phashBlock)
@@ -554,6 +554,7 @@ uint256 CDAGManager::ComputeDAGScore(CBlockIndex* pindex)
 
 uint256 CDAGManager::GetSelectedParent(const uint256& hashBlock) const
 {
+    std::map<uint256, CBlockIndex*>& mapBlockIndex = RecolorBlockIndex();
     // No lock needed — caller should hold cs_dag
     auto it = mapDAGData.find(hashBlock);
     if (it == mapDAGData.end() || it->second.vDAGParents.empty())
@@ -599,6 +600,7 @@ uint256 CDAGManager::GetSelectedParent(const uint256& hashBlock) const
 
 std::set<uint256> CDAGManager::GetBlueSet(const uint256& hashBlock) const
 {
+    std::map<uint256, CBlockIndex*>& mapBlockIndex = RecolorBlockIndex();
     // No lock needed — caller should hold cs_dag
     // Bounded by DAG_MERGE_DEPTH * 4 to prevent DoS from deep BFS traversals
     static const int BLUESET_MAX_VISITED = DAG_MERGE_DEPTH * 4; // 256
@@ -750,6 +752,7 @@ int CDAGManager::AnticoneSize(const uint256& hashBlock, const std::set<uint256>&
 
 std::set<uint256> CDAGManager::GetPastSet(const uint256& hashBlock, int nMaxDepth) const
 {
+    std::map<uint256, CBlockIndex*>& mapBlockIndex = RecolorBlockIndex();
     // No lock needed — caller should hold cs_dag
     // Uses height-based depth (not BFS step count) for deterministic traversal
     std::set<uint256> past;
@@ -852,6 +855,28 @@ void CDAGManager::SetDAGDataForTest(const uint256& hash, const CBlockDAGData& da
     mapDAGData[hash] = data;
 }
 
+
+std::map<uint256, CBlockIndex*>& CDAGManager::RecolorBlockIndex() const
+{
+    return recolorBlockIndex ? *recolorBlockIndex : ::mapBlockIndex;
+}
+
+void CDAGManager::LoadRecolorCanvas(const std::map<uint256, CBlockDAGData>& records)
+{
+    LOCK(cs_dag);
+    mapDAGData = records;
+    mapBlueSetCache.clear();
+}
+
+uint256 CDAGManager::RecolorStateDigestForTest() const
+{
+    LOCK(cs_dag);
+    CHashWriter digest(SER_GETHASH, 0);
+    digest << mapDAGData << setDAGTips << mapPendingChildrenByParent
+           << mapBlueSetCache << mapEpochState << setEpochBoundaryBlocks
+           << nPrunedBelowHeight;
+    return digest.GetHash();
+}
 
 void CDAGManager::ClearDAGDataForTest()
 {
@@ -1543,6 +1568,7 @@ int CDAGManager::InferLocalK(const uint256& hashBlock) const
 
 void CDAGManager::ColorBlockDAGKnight(CBlockIndex* pindex)
 {
+    std::map<uint256, CBlockIndex*>& mapBlockIndex = RecolorBlockIndex();
     LOCK(cs_dag);
 
     if (!pindex || !pindex->phashBlock)

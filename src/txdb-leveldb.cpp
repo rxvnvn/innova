@@ -3,7 +3,12 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
+#include "dag_tips_delta.h"
+#include <atomic>
 #include <map>
+#include <set>
+#include <stdexcept>
+#include <stdint.h>
 
 #include <boost/version.hpp>
 #include <boost/filesystem.hpp>
@@ -202,6 +207,14 @@ void CTxDB::Close()
     activeBatch = NULL;
 }
 
+bool CTxDB::TxnAbort()
+{
+    if (activeBatch) InvalidateDagTipDeltaTransaction();
+    delete activeBatch;
+    activeBatch = NULL;
+    return true;
+}
+
 bool CTxDB::TxnBegin()
 {
     if (activeBatch)
@@ -228,6 +241,7 @@ bool CTxDB::TxnCommit()
     delete activeBatch;
     activeBatch = NULL;
     if (!status.ok()) {
+        InvalidateDagTipDeltaTransaction();
         printf("LevelDB batch commit failure: %s\n", status.ToString().c_str());
         return false;
     }
@@ -428,15 +442,393 @@ bool CTxDB::EraseCurveTreeAtBlock(const uint256& blockHash)
     return Erase(make_pair(string("cb"), blockHash));
 }
 
-// IDAG Phase 2: DAG link persistence
+// Revocation is deliberately outside activeBatch: abort cannot resurrect trust.
+// Failure to persist remains fail-closed in this process until a successful
+// explicit rebuild. The durable key survives close/reopen and crashes.
+static std::atomic<bool> dagChildCountRevocationWriteFailed(false);
+bool g_testFailDAGChildCountRevocation = false;
+bool g_testFailDAGChildCountRebuild = false;
+static std::string ChildCountRevocationKey()
+{
+    CDataStream key(SER_DISK, CLIENT_VERSION);
+    key << make_pair(std::string("dagchildcountinvalid"), uint8_t(0));
+    return key.str();
+}
+static bool ChildCountRevoked(leveldb::DB* db)
+{
+    if (dagChildCountRevocationWriteFailed || !db) return true;
+    std::string value;
+    const leveldb::Status status = db->Get(leveldb::ReadOptions(), ChildCountRevocationKey(), &value);
+    return !status.IsNotFound(); // IO error is unavailable, never healthy.
+}
+static bool RevokeChildCount(leveldb::DB* db)
+{
+    leveldb::WriteOptions options; options.sync = true;
+    if (!db || g_testFailDAGChildCountRevocation ||
+        !db->Put(options, ChildCountRevocationKey(), "rebuild-required").ok()) {
+        dagChildCountRevocationWriteFailed = true;
+        return false;
+    }
+    return true;
+}
+
+// R2c.2s: mutable DAG score authority certificate. Mirrors the child-count
+// lifecycle: a durable revocation poison asserts REBUILD_REQUIRED and a
+// versioned state marker binds the retained canonical score set to one
+// SourceStateId. A marker/token alone never certifies score freshness; only a
+// matching supported marker bound to the current token is healthy. Publishing
+// the marker is atomic with clearing the revocation poison.
+static const std::string SCORE_STATE_KEY = std::string("dagscorestate");
+static const std::string SCORE_INVALID_KEY = std::string("dagscoreinvalid");
+static std::atomic<bool> dagScoreRevocationWriteFailed(false);
+bool g_testFailDAGScoreRevocation = false;
+static std::string ScoreAuthorityRevocationKey()
+{
+    CDataStream key(SER_DISK, CLIENT_VERSION);
+    key << make_pair(SCORE_INVALID_KEY, uint8_t(0));
+    return key.str();
+}
+static bool ScoreAuthorityRevoked(leveldb::DB* db)
+{
+    if (dagScoreRevocationWriteFailed || !db) return true;
+    std::string value;
+    const leveldb::Status status = db->Get(leveldb::ReadOptions(), ScoreAuthorityRevocationKey(), &value);
+    return !status.IsNotFound(); // IO error is unavailable, never healthy.
+}
+static bool RevokeScoreAuthority(leveldb::DB* db)
+{
+    leveldb::WriteOptions options; options.sync = true;
+    if (!db || g_testFailDAGScoreRevocation ||
+        !db->Put(options, ScoreAuthorityRevocationKey(), "rebuild-required").ok()) {
+        dagScoreRevocationWriteFailed = true;
+        return false;
+    }
+    return true;
+}
+
+// IDAG Phase 2: DAG link persistence. vDAGParents is canonical; the
+// child-count projection is updated in this same active WriteBatch.
+bool CTxDB::ReadDAGLinks(const uint256& hash, CBlockDAGData& data)
+{
+    return Read(make_pair(string("daglinks"), hash), data);
+}
+
+// Bounded keyed source authority, never a resident DAG or overlay query.
+bool CTxDB::ReadDAGFrontierMembership(const uint256& hash, bool* member)
+{
+    if (!member) return false;
+    *member = false;
+    // Generic Exists falls through to disk after a staged tombstone. Frontier
+    // postimages must honor the active batch's canonical deletion instead.
+    CDataStream key(SER_DISK, CLIENT_VERSION);
+    key << make_pair(string("daglinks"), hash);
+    std::string raw; bool deleted = false;
+    if (activeBatch && ScanBatch(key, &raw, &deleted) && deleted) return true;
+    CBlockDAGData data;
+    if (!ReadDAGLinks(hash, data))
+        return !Exists(make_pair(string("daglinks"), hash));
+    uint64_t count = 0; bool present = false;
+    if (!ReadDAGChildCount(hash, &count, &present)) return false;
+    *member = count == 0;
+    return true;
+}
+
+namespace {
+// Lifetime is ONE keyed relation mutation: O(unique old/new parents), not
+// O(history) or O(transaction). Records stream to the existing bounded journal.
+class SourceFrontierChange {
+    CTxDB& db;
+    std::map<uint256, bool> before;
+    bool recording, complete;
+public:
+    explicit SourceFrontierChange(CTxDB& source) : db(source),
+        recording(GetDagTipDeltaState().active), complete(!recording) {
+        if (!recording) return;
+        uint256 token; std::string error;
+        if (!db.IsDAGChildCountIndexHealthy(&error) || !db.ReadDAGSourceStateId(token)) {
+            InvalidateDagTipDeltaTransaction(); recording = false; return;
+        }
+        SetDagTipDeltaInitialSourceStateId(token);
+    }
+    ~SourceFrontierChange() { if (!complete) InvalidateDagTipDeltaTransaction(); }
+    void Capture(const uint256& hash) {
+        if (!recording || before.count(hash)) return;
+        bool member = false;
+        if (!db.ReadDAGFrontierMembership(hash, &member)) {
+            InvalidateDagTipDeltaTransaction(); recording = false; return;
+        }
+        before[hash] = member;
+    }
+    void Finish() {
+        if (!recording) return;
+        for (const auto& entry : before) {
+            bool member = false;
+            if (!db.ReadDAGFrontierMembership(entry.first, &member)) return;
+            if (member != entry.second)
+                AppendDagTipDelta(DagTipDeltaRecord(member ? DagTipDeltaRecord::TIP_ADD :
+                    DagTipDeltaRecord::TIP_REMOVE, entry.first));
+        }
+        complete = true;
+    }
+};
+}
+
 bool CTxDB::WriteDAGLinks(const uint256& hash, const CBlockDAGData& data)
 {
-    return Write(make_pair(string("daglinks"), hash), data);
+    if (!activeBatch || ChildCountRevoked(GetInstance())) return false;
+    CBlockDAGData old;
+    const bool existed = ReadDAGLinks(hash, old);
+    if (!existed && Exists(make_pair(string("daglinks"), hash))) return false;
+    const std::set<uint256> before(old.vDAGParents.begin(), old.vDAGParents.end());
+    const std::set<uint256> after(data.vDAGParents.begin(), data.vDAGParents.end());
+    SourceFrontierChange delta(*this);
+    delta.Capture(hash);
+    for (const auto& p : before) if (!after.count(p)) delta.Capture(p);
+    for (const auto& p : after) if (!before.count(p)) delta.Capture(p);
+    if (ChildCountRevoked(GetInstance())) return false;
+    for (std::set<uint256>::const_iterator p = before.begin(); p != before.end(); ++p)
+        if (!after.count(*p)) {
+            uint64_t count = 0; bool present = false;
+            if (!ReadDAGChildCount(*p, &count, &present)) return false;
+            if (!present || count == 0) { RevokeChildCount(GetInstance()); return false; }
+            if (count == 1) { if (!Erase(make_pair(string("dagchildcount"), *p))) return false; }
+            else if (!Write(make_pair(string("dagchildcount"), *p), count - 1)) return false;
+        }
+    for (std::set<uint256>::const_iterator p = after.begin(); p != after.end(); ++p)
+        if (!before.count(*p)) {
+            uint64_t count = 0; bool present = false;
+            if (!ReadDAGChildCount(*p, &count, &present) || count == UINT64_MAX) return false;
+            if (!Write(make_pair(string("dagchildcount"), *p), count + 1)) return false;
+        }
+    if (!Write(make_pair(string("daglinks"), hash), data)) return false;
+    delta.Finish();
+    return true;
 }
 
 bool CTxDB::EraseDAGLinks(const uint256& hash)
 {
-    return Erase(make_pair(string("daglinks"), hash));
+    if (!activeBatch || ChildCountRevoked(GetInstance())) return false;
+    CBlockDAGData old;
+    if (!ReadDAGLinks(hash, old))
+        return !Exists(make_pair(string("daglinks"), hash));
+    const std::set<uint256> parents(old.vDAGParents.begin(), old.vDAGParents.end());
+    SourceFrontierChange delta(*this);
+    delta.Capture(hash);
+    for (const auto& p : parents) delta.Capture(p);
+    if (ChildCountRevoked(GetInstance())) return false;
+    for (std::set<uint256>::const_iterator p = parents.begin(); p != parents.end(); ++p) {
+        uint64_t count = 0; bool present = false;
+        if (!ReadDAGChildCount(*p, &count, &present)) return false;
+        if (!present || count == 0) { RevokeChildCount(GetInstance()); return false; }
+        if (count == 1) { if (!Erase(make_pair(string("dagchildcount"), *p))) return false; }
+        else if (!Write(make_pair(string("dagchildcount"), *p), count - 1)) return false;
+    }
+    if (!Erase(make_pair(string("daglinks"), hash))) return false;
+    delta.Finish();
+    return true;
+}
+
+bool CTxDB::ReadDAGChildCount(const uint256& parent, uint64_t* count, bool* present)
+{
+    if (!count || !present || ChildCountRevoked(GetInstance())) return false;
+    *count = 0; *present = false;
+    CDataStream key(SER_DISK, CLIENT_VERSION);
+    key << make_pair(string("dagchildcount"), parent);
+    std::string raw;
+    bool deleted = false;
+    const bool inBatch = activeBatch && ScanBatch(key, &raw, &deleted);
+    if (deleted) return true;
+    if (!inBatch) {
+        const leveldb::Status status = GetInstance()->Get(leveldb::ReadOptions(), key.str(), &raw);
+        if (status.IsNotFound()) return true;
+        if (!status.ok()) { RevokeChildCount(GetInstance()); return false; }
+    }
+    *present = true;
+    if (raw.size() == sizeof(uint64_t)) {
+        try {
+            CDataStream value(raw.data(), raw.data()+raw.size(), SER_DISK, CLIENT_VERSION);
+            value >> *count;
+            if (*count != 0 && value.empty()) return true;
+        } catch (const std::exception&) {}
+    }
+    RevokeChildCount(GetInstance());
+    return false;
+}
+
+bool CTxDB::IsDAGChildCountIndexHealthy(std::string* error)
+{
+    if (error) error->clear();
+    if (ChildCountRevoked(GetInstance())) { if (error) *error="DAG child-count projection revoked/rebuild-required"; return false; }
+    uint256 source;
+    if (!ReadDAGSourceStateId(source)) { if (error) *error="DAG child-count index: source token unavailable"; return false; }
+    const std::pair<std::string, uint8_t> key = make_pair(string("dagchildcountstate"), uint8_t(0));
+    if (!Exists(key)) { if (error) *error="DAG child-count index: state marker missing"; return false; }
+    std::pair<uint32_t,uint256> state;
+    if (!Read(key,state)) { if (error) *error="DAG child-count index: corrupt state marker"; return false; }
+    if (state.first != 1) { if (error) *error="DAG child-count index: unsupported state marker version"; return false; }
+    if (state.second != source) { if (error) *error="DAG child-count index: state marker/source token mismatch"; return false; }
+    return true;
+}
+
+bool CTxDB::EnsureDAGChildCountIndex(std::string* error)
+{
+    if (error) error->clear();
+    if (activeBatch) { if (error) *error="child-count rebuild requires quiesced source without active transaction"; return false; }
+    uint256 source;
+    if (!ReadDAGSourceStateId(source))
+    {
+        if (error) *error = "DAG child-count index: source token unavailable";
+        return false;
+    }
+    const std::pair<uint32_t, uint256> stateKey = make_pair((uint32_t)1, source);
+    std::pair<uint32_t, uint256> state;
+    if (!ChildCountRevoked(GetInstance()) && Read(make_pair(string("dagchildcountstate"), uint8_t(0)), state) && state == stateKey)
+        return true;
+    if (Exists(make_pair(string("dagchildcountstate"), uint8_t(0))) &&
+        !Read(make_pair(string("dagchildcountstate"), uint8_t(0)), state))
+    {
+        if (error) *error = "DAG child-count index: corrupt state marker";
+        return false;
+    }
+
+    if (!RevokeChildCount(GetInstance())) { if (error) *error="cannot persist child-count revocation"; return false; }
+    // No marker is trusted during rebuild. Counts are a bounded disk projection;
+    // a crash leaves no matching marker and the next startup rebuilds from the
+    // canonical child->parents relation rather than trusting partial counts.
+    if (!Erase(make_pair(string("dagchildcountstate"), uint8_t(0))))
+    {
+        if (error) *error = "DAG child-count index: cannot clear stale state";
+        return false;
+    }
+    leveldb::DB* db = GetInstance();
+    if (!db)
+    {
+        if (error) *error = "DAG child-count index: database unavailable";
+        return false;
+    }
+    CDataStream countPrefixStream(SER_DISK, CLIENT_VERSION);
+    countPrefixStream << string("dagchildcount");
+    const std::string countPrefix = countPrefixStream.str();
+    leveldb::Iterator* clear = db->NewIterator(leveldb::ReadOptions());
+    clear->Seek(countPrefix);
+    while (clear->Valid() && clear->key().ToString().compare(0, countPrefix.size(), countPrefix) == 0)
+    {
+        leveldb::Status s = db->Delete(leveldb::WriteOptions(), clear->key());
+        if (!s.ok()) { delete clear; if (error) *error = s.ToString(); return false; }
+        clear->Next();
+    }
+    if (!clear->status().ok()) { if (error) *error=clear->status().ToString(); delete clear; return false; }
+    delete clear;
+
+    CDataStream linksPrefixStream(SER_DISK, CLIENT_VERSION);
+    linksPrefixStream << string("daglinks");
+    const std::string linksPrefix = linksPrefixStream.str();
+    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    it->Seek(linksPrefix);
+    while (it->Valid() && it->key().ToString().compare(0, linksPrefix.size(), linksPrefix) == 0)
+    {
+        try {
+            CDataStream value(SER_DISK, CLIENT_VERSION);
+            value.write(it->value().data(), it->value().size());
+            CBlockDAGData child;
+            value >> child;
+            std::set<uint256> unique(child.vDAGParents.begin(), child.vDAGParents.end());
+            for (std::set<uint256>::const_iterator p = unique.begin(); p != unique.end(); ++p)
+            {
+                uint64_t count = 0; bool present = false;
+                present = Exists(make_pair(string("dagchildcount"), *p));
+                if ((present && (!Read(make_pair(string("dagchildcount"), *p), count) || count == 0)) || count == UINT64_MAX)
+                    throw std::runtime_error("child-count read/overflow");
+                if (!Write(make_pair(string("dagchildcount"), *p), count + 1))
+                    throw std::runtime_error("child-count write");
+            }
+        } catch (const std::exception& e) {
+            delete it; if (error) *error = std::string("DAG child-count index: ") + e.what(); return false;
+        }
+        it->Next();
+    }
+    if (!it->status().ok()) { std::string e = it->status().ToString(); delete it; if (error) *error = e; return false; }
+    delete it;
+    if (g_testFailDAGChildCountRebuild) { if (error) *error="injected rebuild failure before publication"; return false; }
+    uint256 finalSource;
+    if (!ReadDAGSourceStateId(finalSource) || finalSource != source)
+    {
+        if (error) *error = "DAG child-count index: source changed or state publication failed";
+        return false;
+    }
+    CDataStream markerKey(SER_DISK, CLIENT_VERSION), markerValue(SER_DISK, CLIENT_VERSION);
+    markerKey << make_pair(string("dagchildcountstate"), uint8_t(0));
+    markerValue << make_pair(uint32_t(1), source);
+    leveldb::WriteBatch publication;
+    publication.Put(markerKey.str(), markerValue.str());
+    publication.Delete(ChildCountRevocationKey());
+    leveldb::WriteOptions durable; durable.sync = true;
+    if (!db->Write(durable, &publication).ok()) { dagChildCountRevocationWriteFailed = true; if (error) *error="child-count certificate publication failed"; return false; }
+    dagChildCountRevocationWriteFailed = false;
+    return true;
+}
+
+bool CTxDB::RevokeDAGChildCountForTest()
+{
+    return RevokeChildCount(GetInstance());
+}
+
+bool CTxDB::IsDAGScoreAuthorityHealthy(std::string* error)
+{
+    if (error) error->clear();
+    if (ScoreAuthorityRevoked(GetInstance())) { if (error) *error="DAG score authority revoked/rebuild-required"; return false; }
+    uint256 source;
+    if (!ReadDAGSourceStateId(source)) { if (error) *error="DAG score authority: source token unavailable"; return false; }
+    CDataStream keyStream(SER_DISK, CLIENT_VERSION);
+    keyStream << make_pair(SCORE_STATE_KEY, uint8_t(0));
+    std::string key = keyStream.str();
+    std::string raw;
+    leveldb::DB* db = GetInstance();
+    if (!db) { if (error) *error="DAG score authority: database unavailable"; return false; }
+    const leveldb::Status st = db->Get(leveldb::ReadOptions(), key, &raw);
+    if (st.IsNotFound()) { if (error) *error="DAG score authority: state marker missing"; return false; }
+    if (!st.ok()) { if (error) *error="DAG score authority: state marker read error"; return false; }
+    std::pair<uint32_t,uint256> state;
+    try {
+        CDataStream is(raw.data(), raw.data()+raw.size(), SER_DISK, CLIENT_VERSION);
+        is >> state;
+        if (!is.empty()) { if (error) *error="DAG score authority: trailing bytes in state marker"; return false; }
+    } catch (const std::exception&) { if (error) *error="DAG score authority: corrupt state marker"; return false; }
+    if (state.first != 1) { if (error) *error="DAG score authority: unsupported state marker version"; return false; }
+    if (state.second != source) { if (error) *error="DAG score authority: state marker/source token mismatch"; return false; }
+    return true;
+}
+
+bool CTxDB::PublishDAGScoreCertificateAtomic(std::string* error)
+{
+    if (error) error->clear();
+    if (activeBatch) { if (error) *error="DAG score certificate publish requires quiesced source without active transaction"; return false; }
+    leveldb::DB* db = GetInstance();
+    if (!db) { if (error) *error="DAG score authority: database unavailable"; return false; }
+    uint256 finalSource;
+    if (!ReadDAGSourceStateId(finalSource)) { if (error) *error="DAG score authority: cannot read source for certification"; return false; }
+    CDataStream markerKey(SER_DISK, CLIENT_VERSION), markerValue(SER_DISK, CLIENT_VERSION);
+    markerKey << make_pair(SCORE_STATE_KEY, uint8_t(0));
+    markerValue << make_pair((uint32_t)1, finalSource);
+    leveldb::WriteBatch publication;
+    publication.Put(markerKey.str(), markerValue.str());
+    publication.Delete(ScoreAuthorityRevocationKey());
+    leveldb::WriteOptions durable; durable.sync = true;
+    if (!db->Write(durable, &publication).ok()) { dagScoreRevocationWriteFailed = true; if (error) *error="DAG score authority certificate publication failed"; return false; }
+    dagScoreRevocationWriteFailed = false;
+    return true;
+}
+
+bool CTxDB::RevokeDAGScoreAuthorityForTest()
+{
+    return RevokeScoreAuthority(GetInstance());
+}
+
+bool CTxDB::StageDAGLinkRawForTest(const uint256& hash, const CBlockDAGData& data, bool erase)
+{
+    if (!activeBatch) return false;
+    if (erase) return Erase(make_pair(string("daglinks"), hash));
+    return Write(make_pair(string("daglinks"), hash), data);
 }
 
 bool CTxDB::ReadDAGSourceStateId(uint256& out)
@@ -451,7 +843,43 @@ bool CTxDB::HasDAGSourceStateId()
 
 bool CTxDB::WriteDAGSourceStateId(const uint256& id)
 {
-    return Write(make_pair(string("dagsourcestate"), uint8_t(0)), id);
+    if (ChildCountRevoked(GetInstance())) return false;
+    // Validate the OLD binding before staging the new source token. A
+    // supported marker alone is not evidence that its projection is current.
+    const std::pair<std::string, uint8_t> key = make_pair(string("dagchildcountstate"), uint8_t(0));
+    const bool hasMarker = Exists(key);
+    if (hasMarker) {
+        std::string error;
+        if (!IsDAGChildCountIndexHealthy(&error)) return false;
+    }
+    if (!Write(make_pair(string("dagsourcestate"), uint8_t(0)), id)) return false;
+    // Tokenless legacy/bootstrap may advance without a projection marker;
+    // only explicit rebuild can create its initial healthy certificate.
+    if (!hasMarker) return true;
+    return Write(key, make_pair((uint32_t)1, id));
+}
+
+bool CTxDB::StageDAGScoreCertificateInBatch(const uint256& source, std::string* error)
+{
+    if (error) error->clear();
+    if (!activeBatch) { if (error) *error="S3 score-cert: no active transaction"; return false; }
+    if (!Write(make_pair(SCORE_STATE_KEY, uint8_t(0)), make_pair((uint32_t)1, source)))
+    { if (error) *error="S3 score-cert: marker stage failed"; return false; }
+    if (!Erase(ScoreAuthorityRevocationKey()))
+    { if (error) *error="S3 score-cert: revocation-key clear failed"; return false; }
+    return true;
+}
+
+bool CTxDB::StageDAGChildCountCertificateInBatch(const uint256& source, std::string* error)
+{
+    if (error) error->clear();
+    if (!activeBatch) { if (error) *error="S3 childcount-cert: no active transaction"; return false; }
+    const std::pair<std::string, uint8_t> key = make_pair(string("dagchildcountstate"), uint8_t(0));
+    if (!Write(key, make_pair((uint32_t)1, source)))
+    { if (error) *error="S3 childcount-cert: marker stage failed"; return false; }
+    if (!Erase(ChildCountRevocationKey()))
+    { if (error) *error="S3 childcount-cert: revocation-key clear failed"; return false; }
+    return true;
 }
 
 bool CTxDB::MintDAGSourceStateId(uint256& out)
@@ -841,6 +1269,149 @@ bool CTxDB::IterateDAGLinks(std::map<uint256, CBlockDAGData>& mapOut)
     return true;
 }
 
+// STRICT persisted daglinks enumeration for authoritative source construction.
+// Rejects (returns false, populates *error) any malformed record instead of
+// skipping it: malformed key, unexpected key-prefix field, malformed value,
+// missing/trailing bytes, or an iterator/read error. A canonical daglinks
+// record is exactly: key = pair<string("daglinks"), uint256>, value = the
+// CBlockDAGData serialization (vDAGParents, vDAGChildren, fBlue, nDAGScore,
+// nDAGOrder, then optional nInferredK for Phase-4/Phase-5 records). Duplicate
+// canonical identity (same hash twice) is rejected. After reading every
+// well-formed record the iterator status is checked and a read error yields
+// false. This is the fail-closed drain for EnumerateAuthoritativeStagedScope:
+// an incomplete/malformed retained canvas can never be silently certified.
+bool CTxDB::IterateDAGLinksStrict(std::map<uint256, CBlockDAGData>& mapOut, std::string* error)
+{
+    mapOut.clear();
+    if (error) error->clear();
+    leveldb::DB* db = GetInstance();
+    if (!db) { if (error) *error = "StrictDAGLinks: no DB instance"; return false; }
+
+    CDataStream ssPrefix(SER_DISK, CLIENT_VERSION);
+    ssPrefix << string("daglinks");
+    std::string strPrefix = ssPrefix.str();
+
+    leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+    bool ok = true;
+    std::string failReason;
+    it->Seek(strPrefix);
+    while (it->Valid())
+    {
+        const std::string strKey = it->key().ToString();
+        if (strKey.compare(0, strPrefix.size(), strPrefix) != 0)
+            break; // normal end of the daglinks prefix range
+
+        CDataStream ssKey(strKey.data(), strKey.data() + strKey.size(), SER_DISK, CLIENT_VERSION);
+        std::pair<std::string, uint256> keyPair;
+        try { ssKey >> keyPair; }
+        catch (const std::exception& e) { failReason = std::string("malformed key: ") + e.what(); ok = false; break; }
+        if (keyPair.first != "daglinks") { failReason = "malformed key: unexpected prefix field"; ok = false; break; }
+        if (ssKey.size() != 0) { failReason = "malformed key: trailing bytes"; ok = false; break; }
+        if (mapOut.count(keyPair.second)) { failReason = "duplicate canonical identity " + keyPair.second.GetHex(); ok = false; break; }
+
+        CDataStream ssValue(it->value().data(), it->value().data() + it->value().size(), SER_DISK, CLIENT_VERSION);
+        CBlockDAGData data;
+        try
+        {
+            ssValue >> data.vDAGParents;
+            ssValue >> data.vDAGChildren;
+            ssValue >> data.fBlue;
+            ssValue >> data.nDAGScore;
+            ssValue >> data.nDAGOrder;
+            if (ssValue.size() > 0)
+            {
+                ssValue >> data.nInferredK;
+                if (ssValue.size() != 0) { failReason = "malformed value: trailing bytes after nInferredK"; ok = false; break; }
+            }
+            else
+            {
+                data.nInferredK = -1;
+            }
+        }
+        catch (const std::exception& e) { failReason = std::string("malformed value for ") + keyPair.second.GetHex() + ": " + e.what(); ok = false; break; }
+
+        mapOut[keyPair.second] = data;
+        it->Next();
+    }
+
+    if (ok && !it->status().ok())
+    {
+        ok = false;
+        failReason = "iterator/read error: " + it->status().ToString();
+    }
+    delete it;
+    if (!ok)
+    {
+        mapOut.clear(); // no partial usable output on any malformed/read failure
+        if (error) *error = "StrictDAGLinks: " + failReason;
+        return false;
+    }
+    return true;
+}
+// S3 staged-view enumeration: scan the active WriteBatch for daglinks
+// writes/tombstones (prefix "daglinks"), so the authoritative staged view can be
+// built as (persisted daglinks + staged writes - staged tombstones). Fail closed
+// on any batch scan error; report activeBatchOpen=false when no txn is open.
+class CBatchDAGLinksScanner : public leveldb::WriteBatch::Handler {
+public:
+    // last-op-wins per daglinks key, matching keyed ScanBatch semantics:
+    // a final Delete yields a tombstone; a final Put yields a write.
+    std::map<uint256, bool> finalOp;          // hash -> true=delete, false=put
+    std::map<uint256, CBlockDAGData> finalData; // hash -> last written record
+    std::string daglinksPrefix;
+    bool failed;
+    CBatchDAGLinksScanner() : failed(false) {
+        CDataStream p(SER_DISK, CLIENT_VERSION); p << std::string("daglinks");
+        daglinksPrefix = p.str();
+    }
+    virtual void Put(const leveldb::Slice& key, const leveldb::Slice& value) {
+        std::string k = key.ToString();
+        if (k.compare(0, daglinksPrefix.size(), daglinksPrefix) != 0) return;
+        try {
+            CDataStream ssKey(k.data(), k.data()+k.size(), SER_DISK, CLIENT_VERSION);
+            std::pair<std::string, uint256> keyPair; ssKey >> keyPair;
+            if (keyPair.first != "daglinks") return;
+            CDataStream ssValue(value.data(), value.data()+value.size(), SER_DISK, CLIENT_VERSION);
+            CBlockDAGData data;
+            ssValue >> data.vDAGParents; ssValue >> data.vDAGChildren;
+            ssValue >> data.fBlue; ssValue >> data.nDAGScore; ssValue >> data.nDAGOrder;
+            if (ssValue.size() > 0) { try { ssValue >> data.nInferredK; } catch (const std::exception&) { data.nInferredK = -1; } }
+            else data.nInferredK = -1;
+            finalOp[keyPair.second] = false;       // last op so far = put
+            finalData[keyPair.second] = data;
+        } catch (const std::exception&) { failed = true; }
+    }
+    virtual void Delete(const leveldb::Slice& key) {
+        std::string k = key.ToString();
+        if (k.compare(0, daglinksPrefix.size(), daglinksPrefix) != 0) return;
+        try {
+            CDataStream ssKey(k.data(), k.data()+k.size(), SER_DISK, CLIENT_VERSION);
+            std::pair<std::string, uint256> keyPair; ssKey >> keyPair;
+            if (keyPair.first != "daglinks") return;
+            finalOp[keyPair.second] = true;        // last op so far = delete
+            finalData.erase(keyPair.second);
+        } catch (const std::exception&) { failed = true; }
+    }
+};
+bool CTxDB::ScanBatchDAGLinks(std::map<uint256, CBlockDAGData>* stagedWrites,
+                              std::set<uint256>* stagedTombstones,
+                              bool* activeBatchOpen, std::string* error)
+{
+    if (stagedWrites) stagedWrites->clear();
+    if (stagedTombstones) stagedTombstones->clear();
+    if (activeBatchOpen) *activeBatchOpen = (activeBatch != NULL);
+    if (!activeBatch) return true; // no transaction open: empty staged delta
+    CBatchDAGLinksScanner scanner;
+    const leveldb::Status status = activeBatch->Iterate(&scanner);
+    if (!status.ok()) { if (error) *error = "S3 staged view: batch scan failed: " + status.ToString(); return false; }
+    if (scanner.failed) { if (error) *error = "S3 staged view: malformed staged daglinks record"; return false; }
+    for (std::map<uint256,bool>::const_iterator it=scanner.finalOp.begin(); it!=scanner.finalOp.end(); ++it){
+        if (it->second) { if (stagedTombstones) stagedTombstones->insert(it->first); }
+        else if (stagedWrites && scanner.finalData.count(it->first)) (*stagedWrites)[it->first]=scanner.finalData.at(it->first);
+    }
+    return true;
+}
+
 class CBatchScanner : public leveldb::WriteBatch::Handler {
 public:
     std::string needle;
@@ -1165,6 +1736,8 @@ bool CTxDB::LoadBlockIndex()
         std::string dagStateError;
         if (!BootstrapDAGSourceStateId(&dagStateError))
             return error("CTxDB::LoadBlockIndex() : DAG source-state bootstrap failed: %s", dagStateError.c_str());
+        if (!EnsureDAGChildCountIndex(&dagStateError))
+            return error("CTxDB::LoadBlockIndex() : DAG child-count index failed: %s", dagStateError.c_str());
     }
     g_dagManager.LoadEpochStates(*this);
     g_finalityTracker.LoadVotes(*this);

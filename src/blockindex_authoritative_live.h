@@ -118,7 +118,7 @@ public:
     BlockIndexHotStatus Materialize(const uint256& hash,
                                     BlockIndexHotHandle* out) const;
 
-    // Materialize a FULL-TOPOLOGY CBlockIndex parent (pprev/pnext/pskip linked)
+    // Materialize a full-topology CBlockIndex parent (pprev/pnext/pskip linked)
     // for `hash`, pinned for the operation lifetime. The chain is materialized by
     // value down to the base boundary (bounded by the live-tail horizon; a deep
     // ancestry beyond the horizon is served by the by-value walk, never a reorg
@@ -127,6 +127,18 @@ public:
     CBlockIndex* MaterializeParentChain(const uint256& hash,
                                         BlockIndexHotHandle* out,
                                         std::string* error) const;
+
+    // Resolve a logical hash to a FULL by-value BlockIndexSnapshot from the
+    // CURRENT mutable retained tail (tip first, then the immutable base
+    // reader). This is the single current-tail snapshot seam exposed to the
+    // authoritative resolver so post-generation retained blocks (present only
+    // in the blockindex_tip mutable authority, absent from the selected
+    // immutable generation) can be resolved by value. Returns OK + the snapshot
+    // on found; AUTHORITY_MISSING when not present in the composite tail;
+    // CORRUPT_METADATA/I/O on a fail-closed authority error.
+    BlockIndexHotStatus ResolveBlockSnapshot(const uint256& hash,
+                                             BlockIndexSnapshot* out,
+                                             std::string* error) const;
 
     // ---- live acceptance / persistence ----
     // Persist an accepted ACTIVE block (already consensus-validated by the live

@@ -59,6 +59,47 @@ BlockIndexRecord BlockIndexRecordFromIndex(const CBlockIndex* pindex)
     return rec;
 }
 
+// G1-reorg: build a FULL by-value BlockIndexSnapshot from a validated in-flight
+// CBlockIndex (materialization input only; the CBlockIndex is NOT retained as
+// authority — every field is copied). This is the single seam the authoritative
+// Reorganize uses to construct the mutation-scoped pending snapshot overlay P,
+// so a post-generation reorg-winning block whose by-value metadata already exists
+// (Before SetBestChain) remains resolvable during staged enumeration/recolor
+// without external live-tail publication and without borrowing resident pointers.
+BlockIndexSnapshot BlockIndexSnapshotFromIndex(const CBlockIndex* pindex)
+{
+    BlockIndexSnapshot s;
+    if (!pindex)
+        return s;
+    s.found = true;
+    s.id = BLOCK_INDEX_ID_INVALID;
+    s.hash = pindex->GetBlockHash();
+    s.hashPrev = pindex->pprev ? pindex->pprev->GetBlockHash() : uint256(0);
+    s.hashMerkleRoot = pindex->hashMerkleRoot;
+    s.height = pindex->nHeight;
+    s.nFile = pindex->nFile;
+    s.nBlockPos = pindex->nBlockPos;
+    s.nFlags = pindex->nFlags;
+    s.nVersion = pindex->nVersion;
+    s.nTime = pindex->nTime;
+    s.nBits = pindex->nBits;
+    s.nNonce = pindex->nNonce;
+    s.nMint = pindex->nMint;
+    s.nMoneySupply = pindex->nMoneySupply;
+    s.nStakeModifier = pindex->nStakeModifier;
+    s.prevoutStake = pindex->prevoutStake;
+    s.nStakeTime = pindex->nStakeTime;
+    s.hashProof = pindex->hashProof;
+    s.fProofOfStake = (pindex->prevoutStake.hash != uint256(0));
+    // The caller (Reorganize authoritative staging) overrides fInMainChain/active
+    // per reorg phase; here default reflects the source CBlockIndex's best-chain
+    // relation if it can be read cheaply (we do NOT lock cs_main here).
+    s.fInMainChain = false;
+    s.hasParent = (s.hashPrev != uint256(0));
+    s.nChainTrust = pindex->nChainTrust;
+    return s;
+}
+
 // G1: build a BlockIndexDerivedEntry from a CBlockIndex (by value) for mutable
 // tip persistence of an accepted authoritative block. Mirrors the V2 derived
 // fields (chainTrust, stake checksum/time, nSize, flags).

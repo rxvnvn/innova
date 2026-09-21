@@ -156,30 +156,11 @@ BlockIndexTipStatus BlockIndexLiveAcceptance::ReorgTo(
         return BLOCK_INDEX_TIP_CORRUPT;
     }
 
-    // 1. Truncate the active chain to forkHeight (disconnect the current branch
-    //    above it). Side records are retained by TruncateActiveTo.
-    BlockIndexTipStatus tr = tip_->TruncateActiveTo(forkHeight, error);
-    if (tr != BLOCK_INDEX_TIP_OK)
-        return tr; // fail-closed: tip at fork height, no partial branch applied
-
-    // 2. Append the new branch's blocks as ACTIVE members, in order. If any
-    //    fails mid-way, we return fail-closed with the tip at forkHeight; the
-    //    caller can re-run. (Side records already persisted.)
-    for (size_t i = 0; i < newBranch.size(); ++i)
-    {
-        BlockIndexTipStatus st = tip_->Append(newBranch[i], newHeights[i], error);
-        if (st != BLOCK_INDEX_TIP_OK)
-            return st; // fail-closed; recoverable by re-running ReorgTo
-    }
-
-    // 3. Refresh live-tail for the new tip (bounded residency).
-    if (tail_ && !newBranch.empty())
-    {
-        BlockIndexLogicalId id(newBranch.back().record.hash);
-        BlockIndexHotHandle h;
-        tail_->Pin(id, &h);
-        h.Reset();
-        tail_->TrimToHorizon();
-    }
-    return BLOCK_INDEX_TIP_OK;
+    // REORG ACTIVE CHAIN TO THE RECONNECT BRANCH (fork+1..newTip). This works
+    // even when branch records were already accepted as SIDE during their own
+    // AddToBlockIndex: ReorgActiveTo PROMOTES existing records to active instead
+    // of skipping them (idempotent Append cannot reclassify a side record), and
+    // appends any branch record not yet present. Fail closed on any inconsistency;
+    // on partial application the tip is left at forkHeight, recoverable by rerun.
+    return tip_->ReorgActiveTo(forkHeight, newBranch, newHeights, error);
 }

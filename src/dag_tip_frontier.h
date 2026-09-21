@@ -110,6 +110,35 @@ bool BuildDagTipFrontier(const std::string& dagLinksDir,
                          const BuildOptions& options,
                          BuildResult* result);
 
+// Current-source-only bounded derivation. Writes a raw, headerless sequence of
+// sorted uint256 tip hashes to caller-owned outputPath. It has no generation,
+// immutable digest, SourceStateId, or overlay semantics.
+enum CurrentDagTipDerivationStatus
+{
+    DAG_CURRENT_TIPS_DERIVATION_INTERNAL_FAILURE = 0,
+    DAG_CURRENT_TIPS_DERIVATION_OK,
+    DAG_CURRENT_TIPS_DERIVATION_INVALID_OPTIONS,
+    DAG_CURRENT_TIPS_DERIVATION_SOURCE_UNAVAILABLE,
+    DAG_CURRENT_TIPS_DERIVATION_SOURCE_CORRUPT,
+    DAG_CURRENT_TIPS_DERIVATION_DECODE_FAILURE,
+    DAG_CURRENT_TIPS_DERIVATION_TEMP_IO_FAILURE,
+    DAG_CURRENT_TIPS_DERIVATION_OUTPUT_PUBLICATION_FAILURE
+};
+
+struct CurrentDagTipDerivationResult
+{
+    CurrentDagTipDerivationStatus status;
+    std::string error;
+    uint64_t nodesProcessed, parentRefsProcessed, tipCount;
+    uint64_t temporaryBytesWritten, peakChunkBytes, peakChunkRecords;
+    uint64_t runCount, mergePasses;
+    CurrentDagTipDerivationResult() : status(DAG_CURRENT_TIPS_DERIVATION_INTERNAL_FAILURE), nodesProcessed(0), parentRefsProcessed(0), tipCount(0), temporaryBytesWritten(0), peakChunkBytes(0), peakChunkRecords(0), runCount(0), mergePasses(0) {}
+};
+bool DeriveCurrentDagTipsBounded(const std::string& dagLinksDir,
+                                 const std::string& outputPath,
+                                 const BuildOptions& options,
+                                 CurrentDagTipDerivationResult* result);
+
 // Read the artifact header back (for verification tooling). Not required for
 // streaming reads.
 bool ReadDagTipFrontierHeader(const std::string& path,

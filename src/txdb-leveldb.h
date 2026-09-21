@@ -39,7 +39,7 @@ public:
         // Note that this is not the same as Close() because it deletes only
         // data scoped to this TxDB object.
         if (activeBatch)
-            delete activeBatch;
+            TxnAbort();
     }
 
     // Destroys the underlying shared global state accessed by this TxDB.
@@ -178,12 +178,13 @@ protected:
 public:
     bool TxnBegin();
     bool TxnCommit();
-    bool TxnAbort()
-    {
-        delete activeBatch;
-        activeBatch = NULL;
-        return true;
-    }
+    bool TxnAbort();
+
+    // True when a LevelDB WriteBatch is open on this CTxDB handle (i.e. an
+    // active source transaction). Batch-only authoritative helpers must reject
+    // calls without an open batch BEFORE any write, so a "no active
+    // transaction" failure can never leave a durable mutation behind.
+    bool HasActiveBatch() const { return activeBatch != NULL; }
 
     leveldb::DB* GetInstance()
     {
@@ -279,12 +280,69 @@ public:
     // IDAG Phase 2: DAG link persistence. SourceStateId names the exact
     // logical daglinks state and must be queued in the SAME TxnBegin/Commit
     // batch as every mutation of this relation.
+    bool ReadDAGLinks(const uint256& hash, CBlockDAGData& data);
+    bool ReadDAGFrontierMembership(const uint256& hash, bool* member);
     bool WriteDAGLinks(const uint256& hash, const CBlockDAGData& data);
     bool EraseDAGLinks(const uint256& hash);
+    // S3 staged-view enumeration: return the staged daglinks writes/tombstones
+    // held in the active WriteBatch (daglinks prefix only). Fail closed on any
+    // batch scan error or when no active transaction is open.
+    bool ScanBatchDAGLinks(std::map<uint256, CBlockDAGData>* stagedWrites,
+                           std::set<uint256>* stagedTombstones,
+                           bool* activeBatchOpen, std::string* error);
+    // Canonical bounded reverse-edge projection: number of retained child
+    // records whose canonical vDAGParents contains this parent exactly once.
+    bool ReadDAGChildCount(const uint256& parent, uint64_t* count, bool* present);
+    bool IsDAGChildCountIndexHealthy(std::string* error);
+    bool EnsureDAGChildCountIndex(std::string* error);
+    // R2c.2s: authoritative mutable DAG score authority. The persisted
+    // nDAGScore/fBlue/nInferredK fields are freshly derived from CURRENT ancestor
+    // coloring, not frozen at first coloring, so a separate durable certificate
+    // is required to bind the retained canonical score set to one SourceStateId.
+    // A pre-cutover or stale score set must never be accepted as certified-current.
+    //
+    // Healthy predicate (this layer only): supported marker version, marker
+    // bound to the CURRENT SourceStateId, no revocation poison, child-count
+    // authority also healthy. It never claims that a recolor was performed;
+    // that is EnsureDAGScoreAuthority's contract.
+    bool IsDAGScoreAuthorityHealthy(std::string* error);
+    // Atomic production publish: write the supported-version certificate marker
+    // bound to the CURRENT SourceStateId AND clear the revocation poison in one
+    // durable LevelDB batch. Callers must first complete the authoritative
+    // recolor (CDAGManager) at a stable source; this method only seals it.
+    bool PublishDAGScoreCertificateAtomic(std::string* error);
+    // Test-only: persistently revoke the score authority certificate against the
+    // shared live source handle (simulates detection at a chosen point).
+    bool RevokeDAGScoreAuthorityForTest();
+    // Test-only: persistently revoke the child-count projection against the
+    // shared live source handle (simulates detection at a chosen point). Not
+    // called by production paths.
+    bool RevokeDAGChildCountForTest();
+    // Test-only: stage a raw daglinks write/erase directly into the active
+    // WriteBatch (no child-count maintenance), matching the serialized daglinks
+    // records ScanBatchDAGLinks observes. Used by the S3 staged-readback tests to
+    // exercise pure batch-view precedence. Requires an open transaction.
+    bool StageDAGLinkRawForTest(const uint256& hash, const CBlockDAGData& data, bool erase);
+    // Lenient legacy enumeration (skips malformed records) for legacy/recovery
+    // callers. Do NOT use for authoritative source construction.
     bool IterateDAGLinks(std::map<uint256, CBlockDAGData>& mapOut);
+    // STRICT persisted daglinks enumeration for authoritative source construction.
+    // Unlike IterateDAGLinks this does NOT skip malformed records: a malformed
+    // key, malformed value, trailing bytes, or an iterator/read error returns
+    // false and reports the reason, so an incomplete/malformed retained canvas
+    // can never be silently certified (fail-closed authority).
+    bool IterateDAGLinksStrict(std::map<uint256, CBlockDAGData>& mapOut, std::string* error);
     bool ReadDAGSourceStateId(uint256& out);
     bool HasDAGSourceStateId();
     bool WriteDAGSourceStateId(const uint256& id);
+    // S3 batch-only: stage the DAG-score certificate marker bound to `source`
+    // (SCORE_STATE_KEY = {version 1, source}) and clear the score revocation key,
+    // all INSIDE the active WriteBatch. Requires an open transaction. This is the
+    // in-batch analog of the standalone quiesced-only PublishDAGScoreCertificateAtomic.
+    bool StageDAGScoreCertificateInBatch(const uint256& source, std::string* error);
+    // S3 batch-only: stage the child-count certificate marker bound to `source`
+    // and clear the child-count revocation key, all INSIDE the active WriteBatch.
+    bool StageDAGChildCountCertificateInBatch(const uint256& source, std::string* error);
     // Production CSPRNG mint with explicit failure status; bootstrap/source
     // mutation callers must not use a token when this returns false.
     bool MintDAGSourceStateId(uint256& out);

@@ -16,6 +16,7 @@
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>
 #include <leveldb/iterator.h>
+#include <leveldb/write_batch.h>
 
 #include <boost/filesystem.hpp>
 
@@ -27,10 +28,15 @@
 #include <string>
 
 namespace dag_tip_frontier {
+
+bool g_testFailLiveTipOverlayOverrideWrite = false;
+bool g_testFailLiveTipOverlayCheckpointWrite = false;
+
 namespace {
 
 static const char* const OVERRIDE_TYPE = "dagtipovr";
 static const char* const META_TYPE = "dagtovlmeta";
+static const char* const CHECKPOINT_TYPE = "dagtovlckpt";
 
 // Forward declarations for the streaming emit trampoline.
 struct LiveTipOverlayForward
@@ -79,6 +85,11 @@ static void MakeEntryKey(CDataStream& k, const uint256& hash)
 static void MakeMetaKey(CDataStream& k, uint64_t gen)
 {
     k << make_pair(std::string(META_TYPE), gen);
+}
+
+static void MakeCheckpointKey(CDataStream& k)
+{
+    k << std::string(CHECKPOINT_TYPE);
 }
 
 bool LiveTipOverlayStore::Open(const std::string& dbDir, uint64_t expectGeneration, std::string* error)
@@ -194,6 +205,11 @@ bool LiveTipOverlayStore::SetState(const uint256& hash, bool present, std::strin
     MakeEntryKey(k, hash);
     CDataStream v(SER_DISK, CLIENT_VERSION);
     v << uint8_t(present ? 1 : 0);
+    if (g_testFailLiveTipOverlayOverrideWrite)
+    {
+        if (error) *error = "overlay store injected override write failure";
+        return false;
+    }
     leveldb::Status st = impl_->db->Put(leveldb::WriteOptions(), leveldb::Slice(k.str()), leveldb::Slice(v.str()));
     if (!st.ok())
     {
@@ -266,6 +282,88 @@ bool LiveTipOverlayStore::ForEachOverride(ForEachOverrideFn fn, void* ctx, std::
     return true;
 }
 
+bool LiveTipOverlayStore::ClearOverrides(std::string* error)
+{
+    if (!impl_->open) { if (error) *error = "overlay store not open"; return false; }
+    CDataStream prefix(SER_DISK, CLIENT_VERSION);
+    prefix << std::string(OVERRIDE_TYPE);
+    const std::string pfx = prefix.str();
+    leveldb::Iterator* it = impl_->db->NewIterator(leveldb::ReadOptions());
+    it->Seek(pfx);
+    leveldb::WriteBatch batch;
+    size_t pending = 0;
+    while (it->Valid())
+    {
+        if (it->key().ToString().compare(0, pfx.size(), pfx) != 0) break;
+        batch.Delete(it->key());
+        ++pending;
+        it->Next();
+        if (pending == 256)
+        {
+            leveldb::Status st = impl_->db->Write(leveldb::WriteOptions(), &batch);
+            if (!st.ok()) { delete it; if (error) *error = "overlay override clear failure: " + st.ToString(); return false; }
+            batch.Clear(); pending = 0;
+        }
+    }
+    leveldb::Status iteratorStatus = it->status();
+    delete it;
+    if (!iteratorStatus.ok()) { if (error) *error = "overlay override clear iterator failure: " + iteratorStatus.ToString(); return false; }
+    if (pending != 0)
+    {
+        leveldb::Status st = impl_->db->Write(leveldb::WriteOptions(), &batch);
+        if (!st.ok()) { if (error) *error = "overlay override clear failure: " + st.ToString(); return false; }
+    }
+    impl_->entries = 0;
+    return true;
+}
+
+bool LiveTipOverlayStore::ReadCheckpoint(LiveTipOverlayCheckpoint* out, std::string* error) const
+{
+    if (out) *out = LiveTipOverlayCheckpoint();
+    if (!impl_->open || !out) { if (error) *error = "overlay store not open or null checkpoint"; return false; }
+    CDataStream key(SER_DISK, CLIENT_VERSION);
+    MakeCheckpointKey(key);
+    std::string value;
+    leveldb::Status st = impl_->db->Get(leveldb::ReadOptions(), leveldb::Slice(key.str()), &value);
+    if (st.IsNotFound()) { if (error) *error = "overlay checkpoint absent"; return false; }
+    if (!st.ok()) { if (error) *error = "overlay checkpoint read failure: " + st.ToString(); return false; }
+    try {
+        CDataStream in(value.data(), value.data() + value.size(), SER_DISK, CLIENT_VERSION);
+        uint8_t phase = 0;
+        in >> out->version >> out->generationId;
+        in.read((char*)out->dagInputDigest, sizeof(out->dagInputDigest));
+        in.read((char*)out->frontierDigest, sizeof(out->frontierDigest));
+        in >> phase >> out->appliedSourceStateId;
+        if (in.size() != 0 || out->version != LIVE_OVERLAY_CHECKPOINT_VERSION || phase > LIVE_OVERLAY_PHASE_CLEAN)
+            throw std::runtime_error("invalid checkpoint");
+        out->phase = (LiveOverlayPhase)phase;
+        return true;
+    } catch (const std::exception&) {
+        *out = LiveTipOverlayCheckpoint();
+        if (error) *error = "overlay checkpoint decode failure (corrupt)";
+        return false;
+    }
+}
+
+bool LiveTipOverlayStore::WriteCheckpoint(const LiveTipOverlayCheckpoint& checkpoint, std::string* error)
+{
+    if (!impl_->open) { if (error) *error = "overlay store not open"; return false; }
+    CDataStream key(SER_DISK, CLIENT_VERSION), value(SER_DISK, CLIENT_VERSION);
+    MakeCheckpointKey(key);
+    value << checkpoint.version << checkpoint.generationId;
+    value.write((const char*)checkpoint.dagInputDigest, sizeof(checkpoint.dagInputDigest));
+    value.write((const char*)checkpoint.frontierDigest, sizeof(checkpoint.frontierDigest));
+    value << uint8_t(checkpoint.phase) << checkpoint.appliedSourceStateId;
+    if (g_testFailLiveTipOverlayCheckpointWrite)
+    {
+        if (error) *error = "overlay checkpoint injected write failure";
+        return false;
+    }
+    leveldb::Status st = impl_->db->Put(leveldb::WriteOptions(), leveldb::Slice(key.str()), leveldb::Slice(value.str()));
+    if (!st.ok()) { if (error) *error = "overlay checkpoint write failure: " + st.ToString(); return false; }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Bounded overlay view
 // ---------------------------------------------------------------------------
@@ -279,7 +377,14 @@ struct LiveTipFrontierOverlay::Impl
     mutable size_t peak;
     bool open;
     uint64_t generation;
-    Impl() : cap(0), peak(0), open(false), generation(0) {}
+    std::string artifactPath;
+    unsigned char dagInputDigest[32];
+    unsigned char frontierDigest[32];
+    Impl() : cap(0), peak(0), open(false), generation(0)
+    {
+        memset(dagInputDigest, 0, sizeof(dagInputDigest));
+        memset(frontierDigest, 0, sizeof(frontierDigest));
+    }
 };
 
 LiveTipFrontierOverlay::LiveTipFrontierOverlay() : impl_(new Impl()) {}
@@ -302,6 +407,14 @@ bool LiveTipFrontierOverlay::Open(const std::string& artifactPath,
     }
     impl_->open = true;
     impl_->generation = generation;
+    impl_->artifactPath = artifactPath;
+    memcpy(impl_->dagInputDigest, dagInputDigest, sizeof(impl_->dagInputDigest));
+    if (!impl_->seed.GetFrontierDigest(impl_->frontierDigest))
+    {
+        Close();
+        if (error) *error = "overlay immutable frontier digest unavailable";
+        return false;
+    }
     impl_->cap = cacheCapacity;
     impl_->peak = 0;
     impl_->cache.clear();
@@ -315,6 +428,7 @@ void LiveTipFrontierOverlay::Close()
     impl_->cache.clear();
     impl_->open = false;
     impl_->generation = 0;
+    impl_->artifactPath.clear();
     impl_->cap = 0;
     impl_->peak = 0;
 }
@@ -402,6 +516,52 @@ size_t LiveTipFrontierOverlay::CacheCapacity() const { return impl_->cap; }
 size_t LiveTipFrontierOverlay::CacheCurrent() const { return impl_->cache.size(); }
 size_t LiveTipFrontierOverlay::CachePeak() const { return impl_->peak; }
 uint64_t LiveTipFrontierOverlay::PersistentOverrideCount() const { return impl_->store.EntryCount(); }
+
+bool LiveTipFrontierOverlay::ReadCheckpoint(LiveTipOverlayCheckpoint* out, std::string* error) const
+{
+    if (!impl_->open) { if (out) *out = LiveTipOverlayCheckpoint(); if (error) *error = "overlay not open"; return false; }
+    return impl_->store.ReadCheckpoint(out, error);
+}
+
+bool LiveTipFrontierOverlay::WriteCheckpoint(const LiveTipOverlayCheckpoint& checkpoint, std::string* error)
+{
+    if (!impl_->open) { if (error) *error = "overlay not open"; return false; }
+    return impl_->store.WriteCheckpoint(checkpoint, error);
+}
+
+bool LiveTipFrontierOverlay::ClearPersistentOverrides(std::string* error)
+{
+    if (!impl_->open) { if (error) *error = "overlay not open"; return false; }
+    impl_->cache.clear();
+    return impl_->store.ClearOverrides(error);
+}
+
+bool LiveTipFrontierOverlay::OpenImmutableSeedReader(TipFrontierReader* out, std::string* error) const
+{
+    if (!impl_->open || !out) { if (error) *error = "overlay not open or null seed reader"; return false; }
+    return out->Open(impl_->artifactPath, impl_->generation, impl_->dagInputDigest, error);
+}
+
+bool LiveTipFrontierOverlay::MakeCheckpoint(LiveOverlayPhase phase, const uint256& token,
+                                            LiveTipOverlayCheckpoint* out, std::string* error) const
+{
+    if (!impl_->open || !out) { if (error) *error = "overlay not open or null checkpoint"; return false; }
+    *out = LiveTipOverlayCheckpoint();
+    out->generationId = impl_->generation;
+    memcpy(out->dagInputDigest, impl_->dagInputDigest, sizeof(out->dagInputDigest));
+    memcpy(out->frontierDigest, impl_->frontierDigest, sizeof(out->frontierDigest));
+    out->phase = phase;
+    out->appliedSourceStateId = token;
+    return true;
+}
+
+bool LiveTipFrontierOverlay::IsImmutableBindingValid(const LiveTipOverlayCheckpoint& checkpoint) const
+{
+    return impl_->open && checkpoint.version == LIVE_OVERLAY_CHECKPOINT_VERSION &&
+           checkpoint.generationId == impl_->generation &&
+           memcmp(checkpoint.dagInputDigest, impl_->dagInputDigest, sizeof(checkpoint.dagInputDigest)) == 0 &&
+           memcmp(checkpoint.frontierDigest, impl_->frontierDigest, sizeof(checkpoint.frontierDigest)) == 0;
+}
 
 bool LiveTipFrontierOverlay::HasSeedMembership(const uint256& hash) const
 {

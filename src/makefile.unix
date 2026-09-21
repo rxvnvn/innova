@@ -420,6 +420,9 @@ OBJS= \
     obj/dag_logical_authority.o \
     obj/dag_tip_frontier.o \
     obj/dag_tip_live_overlay.o \
+    obj/dag_tip_overlay_consumer.o \
+    obj/dag_tip_overlay_recovery.o \
+    obj/dag_tip_overlay_runtime.o \
     obj/dag_tip_frontier_metadata.o \
     obj/blockindex_derived_state.o \
     obj/fixed_blockindex_store.o \
@@ -546,6 +549,9 @@ OBJS= \
     obj/dag_logical_authority.o \
     obj/dag_tip_frontier.o \
     obj/dag_tip_live_overlay.o \
+    obj/dag_tip_overlay_consumer.o \
+    obj/dag_tip_overlay_recovery.o \
+    obj/dag_tip_overlay_runtime.o \
     obj/dag_tip_frontier_metadata.o \
     obj/blockindex_derived_state.o \
     obj/fixed_blockindex_store.o \
@@ -789,6 +795,9 @@ test_innova_boundary: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/test/bloc
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
 
 test_innova_dag_sourcestate: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/test/dag_sourcestate_bootstrap_tests.o
+	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
+
+test_innova_dag_current_tips: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/test/standalone_engine_test_harness.o obj/test/dag_current_tips_tests.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
 
 test_innova: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) $(TEST_OBJS)

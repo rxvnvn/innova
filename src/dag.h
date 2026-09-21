@@ -159,7 +159,13 @@ class CDAGManager
 public:
     mutable CCriticalSection cs_dag;
 
-    CDAGManager() : nPrunedBelowHeight(-1) {}
+    CDAGManager() : nPrunedBelowHeight(-1), recolorBlockIndex(NULL) {}
+    // Isolated maintenance canvas. The caller owns this lookup for the entire
+    // canvas lifetime; coloring never falls back to the live index when set.
+    explicit CDAGManager(std::map<uint256, CBlockIndex*>& index)
+        : nPrunedBelowHeight(-1), recolorBlockIndex(&index) {}
+    void LoadRecolorCanvas(const std::map<uint256, CBlockDAGData>& records);
+    uint256 RecolorStateDigestForTest() const;
 
     /** Initialize DAG data for a newly accepted block.
      *  Must be called under cs_main. Sets parents, registers children, updates tips. */
@@ -228,6 +234,13 @@ public:
     /** Get epoch state (from memory cache). */
     bool GetEpochState(int nEpoch, CEpochState& stateOut) const;
 
+    // Read-only selection introspection; cannot manufacture an exemption.
+    bool IsEpochBoundaryForTest(const uint256& hash) const
+    {
+        LOCK(cs_dag);
+        return setEpochBoundaryBlocks.count(hash) != 0;
+    }
+
     /** Get the most recent finalized epoch state known to the DAG manager. */
     bool GetLastFinalizedEpochState(CEpochState& stateOut) const;
 
@@ -268,6 +281,9 @@ private:
     std::map<int, CCurveTree> mapEpochCurveTrees;
     std::set<uint256> setEpochBoundaryBlocks;
     int nPrunedBelowHeight;
+
+    std::map<uint256, CBlockIndex*>* recolorBlockIndex;
+    std::map<uint256, CBlockIndex*>& RecolorBlockIndex() const;
 
     // Performance: LRU cache for blue sets (avoids recomputing expensive BFS)
     mutable std::map<uint256, std::set<uint256>> mapBlueSetCache;

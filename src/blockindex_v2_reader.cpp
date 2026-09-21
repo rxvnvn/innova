@@ -88,6 +88,7 @@ bool BlockIndexV2Reader::IsOpen() const { LOCK(cs); return open; }
 uint64_t BlockIndexV2Reader::Generation() const { LOCK(cs); return generation; }
 uint64_t BlockIndexV2Reader::RecordCount() const { LOCK(cs); return open ? manifest.recordCount : 0; }
 std::string BlockIndexV2Reader::GenerationPath() const { LOCK(cs); return generationPath; }
+const FixedBlockIndexManifest& BlockIndexV2Reader::Manifest() const { return manifest; }
 BlockIndexV2ReaderCacheStats BlockIndexV2Reader::CacheStats() const { LOCK(cs); return stats; }
 bool BlockIndexV2Reader::GetDAGInputDigest(unsigned char out[32], std::string* error) const
 {

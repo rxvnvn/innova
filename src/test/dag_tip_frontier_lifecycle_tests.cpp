@@ -19,6 +19,9 @@
 #include "../main.h"
 #include "../dag.h"
 #include "../serialize.h"
+#include "../blockindex_authoritative_startup.h"
+#include "../txdb-leveldb.h"
+#include "../txdb.h"
 
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>
@@ -430,4 +433,576 @@ BOOST_AUTO_TEST_CASE(r2c1c_production_builder_missing_daglinks_no_frontier)
                       (int)BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_CHECK_EQUAL((int)BlockIndexGenerationManager::ValidateGeneration(fx.root.string(), 6, &perr),
                       (int)BLOCK_INDEX_LIFECYCLE_OK);
+}
+
+// =========================================================================
+// R2c.1d3a — InitBlockIndexAuthoritative integration matrix
+//
+// Exercises the REAL production InitBlockIndexAuthoritative() path on an
+// isolated temporary datadir using CTxDB/txleveldb semantically equivalent
+// to fx.dagDb. Tests the four capability states: PRESENT_VALID,
+// LEGACY_UNAVAILABLE, CORRUPT, repeated PRESENT_VALID.
+//
+// Uses the existing LifecycleFixture pattern + test-only reset API.
+// =========================================================================
+
+namespace {
+
+// Helper to compare uint256 sets - returns true if equal
+static bool SetsEqual(const std::set<uint256>& a, const std::set<uint256>& b)
+{
+    if (a.size() != b.size()) return false;
+    for (const auto& h : a) {
+        if (b.find(h) == b.end()) return false;
+    }
+    return true;
+}
+
+// Extended fixture that adds real txleveldb (CTxDB) and isolated -datadir
+// for testing InitBlockIndexAuthoritative.
+struct InitAuthoritativeFixture
+{
+    boost::filesystem::path root;
+    boost::filesystem::path blockDir;
+    boost::filesystem::path dagDb; // this is the txleveldb equivalent
+    std::vector<LifecycleBlockInfo> blocks;
+    BlockIndexGenerationSource src;
+    std::set<uint256> expectedTips;
+    int heights;
+    uint64_t selectedGeneration;
+
+    explicit InitAuthoritativeFixture(int n, bool frontierOn)
+        : heights(n), selectedGeneration(0)
+    {
+        // Isolated temporary datadir for the test
+        root = boost::filesystem::temp_directory_path()
+            / boost::filesystem::unique_path("r2c1d3a-initauth-%%%%-%%%%-%%%%");
+        boost::filesystem::create_directories(root);
+        blockDir = root / "blocks"; boost::filesystem::create_directories(blockDir);
+        dagDb = root / "immutable-dagdb"; boost::filesystem::create_directories(dagDb);
+
+        // GetDataDir is process-cached by TestingSetup; never attempt a late
+        // -datadir switch here. Immutable builder input stays fixture-owned.
+
+        // Build linear chain blocks
+        uint256 prev(0);
+        for (int h = 0; h <= heights; ++h)
+        {
+            LifecycleBlockInfo bi = WriteBlock(blockDir, prev, (unsigned int)(1000+h), (unsigned int)(100+h));
+            blocks.push_back(bi);
+            prev = bi.hash;
+        }
+
+        for (int h = 0; h <= heights; ++h)
+        {
+            BlockIndexRecord rec;
+            rec.hash = blocks[h].hash;
+            rec.hashPrev = (h == 0) ? uint256(0) : blocks[h-1].hash;
+            rec.height = h; rec.nVersion = 1;
+            rec.nTime = (unsigned int)(1000+h);
+            rec.nBits = 0x1d00ffffU; rec.nNonce = (unsigned int)(100+h);
+            rec.nFile = blocks[h].nFile; rec.nBlockPos = blocks[h].nBlockPos;
+            BlockIndexGenerationSourceRecord sr; sr.hash=rec.hash; sr.record=rec;
+            src.records.push_back(sr);
+        }
+        src.hashBestChain = blocks[heights].hash;
+        src.foundBestChain = true;
+        src.blockDataDir = blockDir.string();
+
+        // A linear DAG (each block parents = its single linear parent), plus a
+        // root. Tips per legacy algebra = {tip block} (every other node is a
+        // referenced parent). Deterministic and small.
+        std::map<uint256, std::vector<uint256> > parents;
+        for (int h = 0; h <= heights; ++h)
+        {
+            std::vector<uint256> p;
+            if (h > 0) p.push_back(blocks[h-1].hash);
+            parents[blocks[h].hash] = p;
+            src.dagLinks[blocks[h].hash] = p;
+        }
+        if (frontierOn)
+        {
+            src.dagLinksDir = dagDb.string();
+            for (int h = 0; h <= heights; ++h)
+                BOOST_REQUIRE(WriteDagLinksEntry(dagDb.string(), blocks[h].hash, parents[blocks[h].hash]));
+        }
+        // Legacy tips = all nodes minus referenced parents.
+        expectedTips.clear();
+        for (int h = 0; h <= heights; ++h) expectedTips.insert(blocks[h].hash);
+        for (int h = 0; h <= heights; ++h)
+            for (size_t p = 0; p < parents[blocks[h].hash].size(); ++p)
+                expectedTips.erase(parents[blocks[h].hash][p]);
+    }
+
+    ~InitAuthoritativeFixture()
+    {
+        // Clean up test-only authoritative startup state before destroying datadir
+        ResetBlockIndexAuthoritativeStartupForTest();
+        boost::system::error_code ec;
+        boost::filesystem::remove_all(root, ec);
+    }
+
+    // Build production V2 generation and publish/select it
+    bool BuildAndSelect(uint64_t gen, std::string* error)
+    {
+        boost::filesystem::path staging = root / (std::string("build-00000") + std::to_string(gen) + ".tmp");
+        BlockIndexGenerationBuilder b;
+        bool ok = b.Build(src, staging.string(), gen, NULL, error);
+        b.Close();
+        if (!ok) return false;
+        selectedGeneration = gen;
+
+        std::string perr;
+        if (BlockIndexGenerationManager::PublishGeneration(root.string(), gen, &perr) != (int)BLOCK_INDEX_LIFECYCLE_OK)
+        {
+            if (error) *error = "publish: " + perr;
+            return false;
+        }
+        std::string serr;
+        if (BlockIndexGenerationManager::SelectGeneration(root.string(), gen, &serr) != (int)BLOCK_INDEX_LIFECYCLE_OK)
+        {
+            if (error) *error = "select: " + serr;
+            return false;
+        }
+        return true;
+    }
+
+    // Quiesce the harness-owned shared CTxDB before replaying the identical
+    // logical daglinks relation into the actual cached production source path.
+    bool PrepareActualLiveDaglinks(std::string* error)
+    {
+        { CTxDB closeDb; closeDb.Close(); }
+        const std::string live = (GetDataDir() / "txleveldb").string();
+        for (std::map<uint256, std::vector<uint256> >::const_iterator it = src.dagLinks.begin(); it != src.dagLinks.end(); ++it)
+            if (!WriteDagLinksEntry(live, it->first, it->second))
+            { if (error) *error = "cannot write fixture daglinks to actual txleveldb"; return false; }
+        return true;
+    }
+
+    // Run the REAL InitBlockIndexAuthoritative on the selected generation
+    bool RunInitAuthoritative(std::string* error)
+    {
+        return InitBlockIndexAuthoritative(root.string(), error);
+    }
+
+    // Helper to open the frontier artifact and read tips
+    std::set<uint256> ReadFrontierTipsFromGen(const FixedBlockIndexManifest& m,
+                                               const std::string& genDir)
+    {
+        std::set<uint256> out;
+        boost::filesystem::path artifact = boost::filesystem::path(genDir) / BLOCK_INDEX_DAG_TIP_FRONTIER_FILE_NAME;
+        dag_tip_frontier::TipFrontierReader r;
+        std::string err;
+        BOOST_REQUIRE_MESSAGE(r.Open(artifact.string(), m.generation, m.dagInputDigest, &err), err);
+        uint256 h;
+        while (r.Next(&h)) out.insert(h);
+        return out;
+    }
+};
+
+} // namespace
+
+// PRESENT_VALID: A frontier-capable generation with valid dag-tip-frontier.dat
+// and real txleveldb source should initialize authoritative startup successfully
+// and establish a DagTipOverlayRuntime.
+BOOST_AUTO_TEST_CASE(r2c1d3a_init_authoritative_present_valid)
+{
+    InitAuthoritativeFixture fx(5, /*frontierOn=*/true);
+    BOOST_REQUIRE_EQUAL(fx.expectedTips.size(), 1u); // only tip remains
+
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(fx.BuildAndSelect(1, &error), error);
+
+    // Verify the generation has frontier capability
+    boost::filesystem::path genDir = fx.root / "gen-000001";
+    FixedBlockIndexOpenOptions opts; opts.requireCompleteManifest = true;
+    FixedBlockIndexStore store;
+    BOOST_REQUIRE(FixedBlockIndexStore::OpenReadOnly(genDir.string(), opts, &store, &error));
+    const FixedBlockIndexManifest& m = store.GetManifest();
+    BOOST_CHECK_EQUAL((int)m.capability, (int)BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER);
+
+    // Query capability - should be PRESENT_VALID
+    std::string detail;
+    DagTipFrontierCapability cap = QueryDagTipFrontierCapability(
+        genDir.string(), m.generation, m.capability, m.dagInputDigest, &detail);
+    BOOST_CHECK_EQUAL((int)cap, (int)DAG_TIP_FRONTIER_CAPABILITY_PRESENT_VALID);
+
+    // Now run the REAL InitBlockIndexAuthoritative
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+    BOOST_REQUIRE_MESSAGE(fx.RunInitAuthoritative(&error), error);
+
+    // Verify authoritative startup succeeded
+    BOOST_CHECK(g_fAuthoritativeStartup);
+    BOOST_CHECK(pindexBest != NULL);
+    BOOST_CHECK_EQUAL(pindexBest->nHeight, fx.heights);
+    BOOST_CHECK(hashBestChain == fx.blocks[fx.heights].hash);
+
+    // d3b: PRESENT_VALID retains the sole runtime and installs the sole
+    // committed-delta observer slot owned by that runtime.
+    BOOST_CHECK(HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_EQUAL(DagTipOverlayRuntimeGenerationForTest(), fx.selectedGeneration);
+    BOOST_CHECK(GetDagTipDeltaState().enabled);
+
+    // Verify frontier tips match legacy algebra
+    std::set<uint256> tips = fx.ReadFrontierTipsFromGen(m, genDir.string());
+    if (!SetsEqual(tips, fx.expectedTips)) {
+        BOOST_ERROR("frontier tips do not match expected tips");
+    }
+
+    // Clean up for next test: unregister before runtime destruction.
+    ResetBlockIndexAuthoritativeStartupForTest();
+    BOOST_CHECK(!GetDagTipDeltaState().enabled);
+}
+
+// LEGACY_UNAVAILABLE: A non-frontier generation (no dag-tip-frontier.dat)
+// should initialize authoritative startup but WITHOUT a DagTipOverlayRuntime.
+BOOST_AUTO_TEST_CASE(r2c1d3a_init_authoritative_legacy_unavailable)
+{
+    InitAuthoritativeFixture fx(4, /*frontierOn=*/false);
+
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(fx.BuildAndSelect(2, &error), error);
+
+    // Verify the generation does NOT have frontier capability
+    boost::filesystem::path genDir = fx.root / "gen-000002";
+    FixedBlockIndexOpenOptions opts; opts.requireCompleteManifest = true;
+    FixedBlockIndexStore store;
+    BOOST_REQUIRE(FixedBlockIndexStore::OpenReadOnly(genDir.string(), opts, &store, &error));
+    const FixedBlockIndexManifest& m = store.GetManifest();
+    BOOST_CHECK_EQUAL((int)m.capability, (int)BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE);
+
+    // Query capability - should be LEGACY_UNAVAILABLE
+    std::string detail;
+    DagTipFrontierCapability cap = QueryDagTipFrontierCapability(
+        genDir.string(), m.generation, m.capability, m.dagInputDigest, &detail);
+    BOOST_CHECK_EQUAL((int)cap, (int)DAG_TIP_FRONTIER_CAPABILITY_LEGACY_UNAVAILABLE);
+
+    // Run InitBlockIndexAuthoritative - should succeed but no overlay runtime
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+    BOOST_REQUIRE_MESSAGE(fx.RunInitAuthoritative(&error), error);
+
+    // Verify authoritative startup succeeded
+    BOOST_CHECK(g_fAuthoritativeStartup);
+    BOOST_CHECK(pindexBest != NULL);
+
+    // Verify NO DagTipOverlayRuntime was established (legacy gets none)
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_EQUAL(DagTipOverlayRuntimeGenerationForTest(), (uint64_t)0);
+
+    ResetBlockIndexAuthoritativeStartupForTest();
+}
+
+// CORRUPT: A generation that declares AUTHORITATIVE_FRONTIER but has a
+// corrupted dag-tip-frontier.dat should FAIL CLOSED in InitBlockIndexAuthoritative.
+BOOST_AUTO_TEST_CASE(r2c1d3a_init_authoritative_corrupt_fails_closed)
+{
+    InitAuthoritativeFixture fx(4, /*frontierOn=*/true);
+
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(fx.BuildAndSelect(3, &error), error);
+
+    // Corrupt the frontier artifact
+    boost::filesystem::path genDir = fx.root / "gen-000003";
+    boost::filesystem::path artifact = genDir / BLOCK_INDEX_DAG_TIP_FRONTIER_FILE_NAME;
+    BOOST_REQUIRE(boost::filesystem::exists(artifact));
+
+    // Read and truncate the artifact
+    std::string data;
+    {
+        FILE* f = fopen(artifact.string().c_str(), "rb");
+        BOOST_REQUIRE(f);
+        fseek(f, 0, SEEK_END);
+        long sz = ftell(f);
+        fseek(f, 0, SEEK_SET);
+        data.resize((size_t)sz);
+        fread(&data[0], 1, (size_t)sz, f);
+        fclose(f);
+    }
+    BOOST_REQUIRE(data.size() > 64);
+    data.resize(32); // truncate to corrupt
+
+    {
+        FILE* f = fopen(artifact.string().c_str(), "wb");
+        BOOST_REQUIRE(f);
+        fwrite(data.data(), 1, data.size(), f);
+        fclose(f);
+    }
+
+    // Query capability - should be CORRUPT
+    FixedBlockIndexOpenOptions opts; opts.requireCompleteManifest = true;
+    FixedBlockIndexStore store;
+    BOOST_REQUIRE(FixedBlockIndexStore::OpenReadOnly(genDir.string(), opts, &store, &error));
+    const FixedBlockIndexManifest& m = store.GetManifest();
+    std::string detail;
+    DagTipFrontierCapability cap = QueryDagTipFrontierCapability(
+        genDir.string(), m.generation, m.capability, m.dagInputDigest, &detail);
+    BOOST_CHECK_EQUAL((int)cap, (int)DAG_TIP_FRONTIER_CAPABILITY_CORRUPT);
+
+    // Run InitBlockIndexAuthoritative - MUST fail closed
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+    BOOST_CHECK(!fx.RunInitAuthoritative(&error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_CHECK(pindexBest == NULL);
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+
+    ResetBlockIndexAuthoritativeStartupForTest();
+}
+
+// Repeated PRESENT_VALID: Running InitBlockIndexAuthoritative twice on the
+// same valid generation (after reset) should succeed both times.
+BOOST_AUTO_TEST_CASE(r2c1d3a_init_authoritative_repeated_present_valid)
+{
+    InitAuthoritativeFixture fx(5, /*frontierOn=*/true);
+    BOOST_REQUIRE_EQUAL(fx.expectedTips.size(), 1u);
+
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(fx.BuildAndSelect(4, &error), error);
+
+    boost::filesystem::path genDir = fx.root / "gen-000004";
+    FixedBlockIndexOpenOptions opts; opts.requireCompleteManifest = true;
+    FixedBlockIndexStore store;
+    BOOST_REQUIRE(FixedBlockIndexStore::OpenReadOnly(genDir.string(), opts, &store, &error));
+    const FixedBlockIndexManifest& m = store.GetManifest();
+
+    // FIRST run
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+    BOOST_REQUIRE_MESSAGE(fx.RunInitAuthoritative(&error), error);
+    BOOST_CHECK(g_fAuthoritativeStartup);
+    BOOST_CHECK(HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_EQUAL(DagTipOverlayRuntimeGenerationForTest(), fx.selectedGeneration);
+    std::set<uint256> tips1 = fx.ReadFrontierTipsFromGen(m, genDir.string());
+    if (!SetsEqual(tips1, fx.expectedTips)) {
+        BOOST_ERROR("first run frontier tips do not match expected tips");
+    }
+
+    ResetBlockIndexAuthoritativeStartupForTest();
+
+    // SECOND run on the SAME generation
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+    BOOST_REQUIRE_MESSAGE(fx.RunInitAuthoritative(&error), error);
+    BOOST_CHECK(g_fAuthoritativeStartup);
+    BOOST_CHECK(HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_EQUAL(DagTipOverlayRuntimeGenerationForTest(), fx.selectedGeneration);
+    std::set<uint256> tips2 = fx.ReadFrontierTipsFromGen(m, genDir.string());
+    if (!SetsEqual(tips2, fx.expectedTips)) {
+        BOOST_ERROR("second run frontier tips do not match expected tips");
+    }
+    if (!SetsEqual(tips2, tips1)) {
+        BOOST_ERROR("second run tips do not match first run tips");
+    }
+
+    ResetBlockIndexAuthoritativeStartupForTest();
+}
+
+// =========================================================================
+// R2c.1d3b.i1 — NEGATIVE real-startup observer-registration matrix.
+//
+// Through the REAL InitBlockIndexAuthoritative() production path, proves that
+// a child-count authority that cannot be certified at the point of connection
+// refuses to install the committed-delta observer and never publishes a
+// false-healthy runtime. Single-threaded startup executes the source repair
+// (Bootstrap + Ensure) before the registration boundary, so repairable states
+// are recounted and then connect; only states the repair cannot certify, or an
+// authority that turns unhealthy at the exact registration boundary, are
+// refused. Both refusing layers are exercised here through the real path.
+// =========================================================================
+
+// Test-only failure seams located in src/txdb-leveldb.cpp (file scope in that
+// TU; declared here at file scope so the anonymous helpers + cases share them).
+extern bool g_testFailDAGChildCountRebuild;
+extern bool g_testFailDAGChildCountRevocation;
+
+namespace {
+
+static bool ObserverSlotActive()
+{
+    return GetDagTipDeltaState().enabled;
+}
+
+// CTxDB exposes Write/Erase as protected; a test subclass re-exposes them so a
+// fixture can seed raw child-count marker state into the shared live source.
+struct SeedDB : CTxDB
+{
+    explicit SeedDB(const char* mode) : CTxDB(mode) {}
+    using CTxDB::Write;
+    using CTxDB::Erase;
+};
+
+// Write an undecodable value under the state-marker key. BootstrapDAGSourceStateId
+// never touches it; EnsureDAGChildCountIndex refuses on the unreadable marker.
+static void SeedCorruptChildCountMarker()
+{
+    SeedDB db("+w");
+    db.Write(make_pair(std::string("dagchildcountstate"), uint8_t(0)), std::string("x"));
+    db.Close();
+}
+
+// Ensure a valid matching marker cannot take the fast path (force rebuild path).
+static void SeedNoChildCountMarker()
+{
+    SeedDB db("+w");
+    db.Erase(make_pair(std::string("dagchildcountstate"), uint8_t(0)));
+    db.Close();
+}
+
+// Persist the revocation/rebuild-required key against the shared live source.
+static void SeedChildCountRevocation()
+{
+    CTxDB db("+w");
+    db.RevokeDAGChildCountForTest();
+    db.Close();
+}
+
+// Restore the SHARED live txleveldb source to a certified healthy state so
+// subsequent tests in the process are unaffected. Drops any leftover marker so
+// Ensure always performs a full rebuild from daglinks and republishes.
+static void ForceRepairChildCountHealthy()
+{
+    SeedDB db("+w");
+    db.Erase(make_pair(std::string("dagchildcountstate"), uint8_t(0)));
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(db.EnsureDAGChildCountIndex(&err), err);
+    BOOST_CHECK_MESSAGE(db.IsDAGChildCountIndexHealthy(&err), err);
+    db.Close();
+}
+
+// Registration-boundary hook: revoke the authority at the exact point the
+// startup health re-check runs (after repair + runtime Start). Does NOT Close()
+// so the shared live handle survives for the boundary re-check.
+static void ForceRevokeAtRegistrationBoundary()
+{
+    CTxDB db("+w");
+    db.RevokeDAGChildCountForTest();
+}
+
+} // namespace
+
+// Unreadable child-count state marker at startup -> EnsureDAGChildCountIndex
+// fails closed; InitBlockIndexAuthoritative returns false, no runtime is
+// published, no observer is installed.
+BOOST_AUTO_TEST_CASE(r2c1d3b_i1_neg_startup_corrupt_marker_refuses_observer)
+{
+    InitAuthoritativeFixture fx(4, /*frontierOn=*/true);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(fx.BuildAndSelect(5, &error), error);
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+    SeedCorruptChildCountMarker();
+
+    const bool wasEnabled = ObserverSlotActive();
+    BOOST_CHECK(!fx.RunInitAuthoritative(&error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_EQUAL((int)ObserverSlotActive(), (int)wasEnabled);
+    BOOST_CHECK(error.find("child-count") != std::string::npos);
+
+    // Restore the shared live source for later tests, then reset.
+    SetDagObserverBoundaryHookForTest(NULL);
+    ForceRepairChildCountHealthy();
+    ResetBlockIndexAuthoritativeStartupForTest();
+}
+
+// Rebuild failure at startup -> Ensure leaves revocation durable and fails
+// closed; startup refuses to register an observer.
+BOOST_AUTO_TEST_CASE(r2c1d3b_i1_neg_startup_rebuild_failure_refuses_observer)
+{
+    InitAuthoritativeFixture fx(4, /*frontierOn=*/true);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(fx.BuildAndSelect(6, &error), error);
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+    SeedNoChildCountMarker();
+
+    const bool wasEnabled = ObserverSlotActive();
+    g_testFailDAGChildCountRebuild = true;
+    BOOST_CHECK(!fx.RunInitAuthoritative(&error));
+    g_testFailDAGChildCountRebuild = false;
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_EQUAL((int)ObserverSlotActive(), (int)wasEnabled);
+
+    SetDagObserverBoundaryHookForTest(NULL);
+    ForceRepairChildCountHealthy();
+    ResetBlockIndexAuthoritativeStartupForTest();
+}
+
+// Revocation persistence failure at startup -> fail-closed; no observer.
+BOOST_AUTO_TEST_CASE(r2c1d3b_i1_neg_startup_revocation_persistence_failure_refuses_observer)
+{
+    InitAuthoritativeFixture fx(4, /*frontierOn=*/true);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(fx.BuildAndSelect(7, &error), error);
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+    SeedNoChildCountMarker();
+
+    const bool wasEnabled = ObserverSlotActive();
+    g_testFailDAGChildCountRevocation = true;
+    BOOST_CHECK(!fx.RunInitAuthoritative(&error));
+    g_testFailDAGChildCountRevocation = false;
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_EQUAL((int)ObserverSlotActive(), (int)wasEnabled);
+
+    SetDagObserverBoundaryHookForTest(NULL);
+    ForceRepairChildCountHealthy();
+    ResetBlockIndexAuthoritativeStartupForTest();
+}
+
+// The registration-boundary health re-check refuses: even after a successful
+// source repair and runtime Start, once the authority turns unhealthy at the
+// exact registration point, InitBlockIndexAuthoritative fails closed and does
+// not install the observer or retain the runtime.
+BOOST_AUTO_TEST_CASE(r2c1d3b_i1_neg_boundary_refuses_unhealthy_observer)
+{
+    InitAuthoritativeFixture fx(4, /*frontierOn=*/true);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(fx.BuildAndSelect(8, &error), error);
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+
+    const bool wasEnabled = ObserverSlotActive();
+    SetDagObserverBoundaryHookForTest(&ForceRevokeAtRegistrationBoundary);
+    BOOST_CHECK(!fx.RunInitAuthoritative(&error));
+    SetDagObserverBoundaryHookForTest(NULL);
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(error.find("observer source unhealthy") != std::string::npos);
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_EQUAL((int)ObserverSlotActive(), (int)wasEnabled);
+
+    ForceRepairChildCountHealthy();
+    ResetBlockIndexAuthoritativeStartupForTest();
+}
+
+// Supporting positive: a REPAIRABLE revoked authority (poison present, no valid
+// marker) is recounted by the real startup Ensure, then connects; the observer
+// is installed only after the freshly rebuilt healthy predicate passes.
+BOOST_AUTO_TEST_CASE(r2c1d3b_i1_pos_startup_recovers_revoked_then_registers)
+{
+    InitAuthoritativeFixture fx(4, /*frontierOn=*/true);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(fx.BuildAndSelect(9, &error), error);
+    BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
+    SeedChildCountRevocation();
+
+    SetDagObserverBoundaryHookForTest(NULL);
+    BOOST_REQUIRE_MESSAGE(fx.RunInitAuthoritative(&error), error);
+    BOOST_CHECK(g_fAuthoritativeStartup);
+    BOOST_CHECK(HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK(ObserverSlotActive());
+
+    // The freshly repaired projection is healthy and marker-bound.
+    {
+        CTxDB db;
+        std::string herr;
+        BOOST_CHECK_MESSAGE(db.IsDAGChildCountIndexHealthy(&herr), herr);
+        db.Close();
+        CTxDB srcRead;
+        std::string serr;
+        BOOST_REQUIRE_MESSAGE(srcRead.IsDAGChildCountIndexHealthy(&serr), serr);
+        srcRead.Close();
+    }
+    ResetBlockIndexAuthoritativeStartupForTest();
+    BOOST_CHECK(!ObserverSlotActive());
 }

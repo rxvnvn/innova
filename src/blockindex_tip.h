@@ -160,6 +160,20 @@ public:
     // Increases activeFence. Returns new tip.
     BlockIndexTipStatus TruncateActiveTo(int32_t height, std::string* error);
 
+    // Reorg the ACTIVE chain to the given reconnect branch (fork+1..newTip) after
+    // a real Reorganize. Unlike Append/AppendBatch (which are idempotent replay
+    // and SKIP a hash already present as a side record), this PROMOTES existing
+    // records into active membership: the active chain becomes exactly the branch
+    // (dense over [baseTipHeight, baseTipHeight+branch.size()]), records already
+    // present as side are reclassified active, and any branch record not yet in
+    // the tip is appended. The caller supplies the branch in height-ascending
+    // order (forkHeight+1..tip) with matching active heights. Fail closed on any
+    // inconsistency/partial application (tip left at forkHeight, recoverable).
+    BlockIndexTipStatus ReorgActiveTo(int32_t forkHeight,
+                                      const std::vector<BlockIndexTipAppend>& branch,
+                                      const std::vector<int32_t>& branchHeights,
+                                      std::string* error);
+
     // ---- reads (by-value, composed as tip authority) ----
     BlockIndexTipRead GetTip() const;
     // Lookup a block by hash within the tip namespace.

@@ -21,6 +21,13 @@ BlockIndexRecord BlockIndexRecordFromIndex(const CBlockIndex* pindex);
 // tip persistence of an accepted authoritative block.
 BlockIndexDerivedEntry BlockIndexDerivedEntryFromIndex(const CBlockIndex* pindex);
 
+// G1-reorg: build a FULL by-value BlockIndexSnapshot from a validated in-flight
+// CBlockIndex (materialization input; copies every field, never retains the
+// pointer). Used by the authoritative Reorganize to construct the mutation-scoped
+// pending snapshot overlay P so a post-generation winning block still resolves
+// by value during staged recolor before external live-tail publication.
+BlockIndexSnapshot BlockIndexSnapshotFromIndex(const CBlockIndex* pindex);
+
 // Legacy oracle adapter that answers from the authoritative in-memory legacy
 // chain under cs_main.
 class LegacyBlockIndexShadowOracle : public BlockIndexShadowLegacyOracle

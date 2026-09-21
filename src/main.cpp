@@ -8445,9 +8445,13 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     {
         CBlock block;
         if (!block.ReadFromDisk(pindex))
-            return error("Reorganize() : ReadFromDisk for disconnect failed");
-        if (!block.DisconnectBlock(txdb, pindex))
-            return error("Reorganize() : DisconnectBlock %s failed", pindex->GetBlockHash().ToString().substr(0,20).c_str());
+                    {
+                        return error("Reorganize() : ReadFromDisk for disconnect failed");
+                    }
+                    if (!block.DisconnectBlock(txdb, pindex))
+                    {
+                        return error("Reorganize() : DisconnectBlock %s failed", pindex->GetBlockHash().ToString().substr(0,20).c_str());
+                    }
 
         // Queue memory transactions to resurrect.
         // We only do this for blocks after the last checkpoint (reorganisation before that
@@ -8464,7 +8468,9 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         CBlockIndex* pindex = vConnect[i];
         CBlock block;
         if (!block.ReadFromDisk(pindex))
+        {
             return error("Reorganize() : ReadFromDisk for connect failed");
+        }
 
         if (!IsInitialBlockDownload()) GetCollateralnodeRanks(pindex); // recalculate ranks for the this block hash if required
 
@@ -8479,11 +8485,15 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
             vDelete.push_back(tx);
     }
     if (!txdb.WriteHashBestChain(pindexNew->GetBlockHash()))
+    {
         return error("Reorganize() : WriteHashBestChain failed");
+    }
 
     // Make sure it's successfully written to disk before changing memory structure
     if (!txdb.TxnCommit())
+    {
         return error("Reorganize() : TxnCommit failed");
+    }
 
     // Clear setStakeSeen so disconnected stakes don't block the new branch
     for (CBlockIndex* pindex : vDisconnect)
@@ -8491,6 +8501,15 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         if (pindex->IsProofOfStake())
             setStakeSeen.erase(make_pair(pindex->prevoutStake, pindex->nStakeTime));
     }
+
+    // Capture canonical transitions BEFORE the first source edit, including
+    // standalone reorgs (a nested ADD retains ownership of publication).
+    const bool fDagTipDeltaTransaction = BeginDagTipDeltaTransaction(DAG_TIP_DELTA_REORGANIZE);
+    struct ReorgDeltaFailureGuard {
+        bool completed;
+        ReorgDeltaFailureGuard() : completed(false) {}
+        ~ReorgDeltaFailureGuard() { if (!completed) DiscardDagTipDeltaTransaction(); }
+    } deltaGuard;
 
     // IDAG: Clean up DAG data for disconnected blocks
     // Phase 1: Batch all LevelDB erasures atomically
@@ -8512,9 +8531,102 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
                 return AbortDagSourcePersistence("Reorganize: DAG-link erase write failed; shutting down");
             }
         }
-        if (!txdbDAGClean.WriteDAGSourceStateId(dagSourcePost) ||
-            g_testFailReorganizeDagLinksEraseCommit || !txdbDAGClean.TxnCommit())
-            return AbortDagSourcePersistence("Reorganize: DAG-link erase persistence failed; shutting down to prevent stale DAG source");
+        if (g_fAuthoritativeStartup)
+        {
+            // S3 atomic authoritative full-field persistence path.
+            // Topology erasures are staged in the batch above. Enumerate the merged
+            // staged scope (persisted + staged erasures - staged writes), run the
+            // isolated C-full/Option-R recolor against the staged view, stage the
+            // authoritative full-field for affected retained vertices, advance the
+            // SourceStateId, and stage BOTH certificates — all in this ONE batch.
+            // StageAuthoritativeDAGScoreState performs the token write + cert staging,
+            // so we do NOT call WriteDAGSourceStateId separately here (it would be the
+            // legacy quiesced path and double-advance is forbidden by token semantics).
+            //
+            // MUTATION-SCOPED PENDING OVERLAY (Option A): the winning/reconnect
+            // branch blocks (vConnect = fork+1..winner) are post-generation and, for
+            // the block that just triggered this SetBestChain->Reorganize, are NOT yet
+            // published to the external live authority (publication happens AFTER
+            // SetBestChain returns). Their complete by-value metadata was already
+            // validated (mapBlockIndex CBlockIndex + durable block index + daglinks).
+            // Build a bounded by-value BlockIndexSnapshot overlay P from those connect
+            // blocks and thread it into staged enumeration + recolor so every required
+            // retained vertex resolves by value DURING the mutation — without
+            // premature external live-tail publication and without borrowing resident
+            // pointers (authority != materialization; the CBlockIndex is used only as
+            // materialization input, copied immediately to by-value snapshots). P is
+            // owned by this Reorganize call, destroyed on return, never a global.
+            std::map<uint256,BlockIndexSnapshot> pendingOverlay;
+            for (const CBlockIndex* pc : vConnect)
+            {
+                if (pc->nHeight < FORK_HEIGHT_DAG) continue; // pre-DAG never in daglinks
+                BlockIndexSnapshot ps = BlockIndexSnapshotFromIndex(pc);
+                ps.fInMainChain = true; // this reorg makes the connected branch the active chain
+                pendingOverlay[pc->GetBlockHash()] = ps;
+            }
+            std::vector<std::pair<int32_t,uint256>> stagedScope;
+            std::string s3err;
+            if (!EnumerateAuthoritativeStagedScope(txdbDAGClean, &stagedScope, &pendingOverlay, &s3err))
+            {
+                txdbDAGClean.TxnAbort();
+                return AbortDagSourcePersistence("Reorganize: S3 staged-scope enumeration failed; shutting down");
+            }
+            AuthoritativeDAGStageResult s3res;
+            if (!StageAuthoritativeDAGScoreState(txdbDAGClean, stagedScope, dagSourcePost, &pendingOverlay, &s3res, &s3err))
+            {
+                txdbDAGClean.TxnAbort();
+                return AbortDagSourcePersistence("Reorganize: S3 atomic full-field staging failed; shutting down");
+            }
+            if (g_testFailReorganizeDagLinksEraseCommit || !txdbDAGClean.TxnCommit())
+            {
+                return AbortDagSourcePersistence("Reorganize: DAG-link erase/full-field persistence failed; shutting down to prevent stale DAG source");
+            }
+            // Re-wire the CURRENT mutable retained tail (BlockIndexAuthoritativeLive
+            // / blockindex_tip) to the post-reorg ACTIVE chain. The authoritative
+            // resolver resolves staged daglinks records by value from the current
+            // tail; after this reorg, the ordinary post-SetBestChain AddToBlockIndex
+            // publication (AcceptActive for the winner) only succeeds if the tip's
+            // active chain reflects the reorg (truncate to fork + re-append the new
+            // branch computes dense consecutive active heights). ReorgTo is the live
+            // tail's own fail-closed reorg (truncate + re-append; any partial
+            // application aborts the source and the node shuts down). Side records
+            // already persisted are retained. This is the ONLY path that updates the
+            // external live tail across a reorg — it is not premature authority
+            // publication: it records the consensus outcome that Reorganize (already
+            // durably committed by legacy TxnCommit above) selected.
+            {
+                BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority();
+                if (liveAuth && liveAuth->IsOpen())
+                {
+                    std::vector<BlockIndexRecord> reorgRecs;
+                    std::vector<BlockIndexDerivedEntry> reorgDerived;
+                    std::vector<int32_t> reorgHeights;
+                    reorgRecs.reserve(vConnect.size());
+                    reorgDerived.reserve(vConnect.size());
+                    reorgHeights.reserve(vConnect.size());
+                    for (size_t i = 0; i < vConnect.size(); ++i)
+                    {
+                        reorgRecs.push_back(BlockIndexRecordFromIndex(vConnect[i]));
+                        reorgDerived.push_back(BlockIndexDerivedEntryFromIndex(vConnect[i]));
+                        reorgHeights.push_back((int32_t)vConnect[i]->nHeight);
+                    }
+                    std::string reorgErr;
+                    if (!liveAuth->ReorgTo(pfork->nHeight, reorgRecs, reorgDerived, reorgHeights, &reorgErr))
+                    {
+                        return AbortDagSourcePersistence(
+                            reorgErr.empty() ? "Reorganize: authoritative live-tail reorg failed; shutting down"
+                                             : reorgErr.c_str());
+                    }
+                }
+            }
+        }
+        else
+        {
+            // Legacy non-authoritative path: unchanged (topology + token only).
+            if (!txdbDAGClean.WriteDAGSourceStateId(dagSourcePost) ||
+                g_testFailReorganizeDagLinksEraseCommit || !txdbDAGClean.TxnCommit())
+                return AbortDagSourcePersistence("Reorganize: DAG-link erase persistence failed; shutting down to prevent stale DAG source");
+        }
         reorganizeSourcePost = dagSourcePost;
         fReorganizeSourcePost = true;
         SetDagTipDeltaFinalSourceStateId(dagSourcePost);
@@ -8522,7 +8634,6 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     // Phase 2: Memory cleanup after LevelDB commit (reverse order: children first).
     // The legacy reorg transaction is durable at this point; publish only after
     // the remaining in-memory reorg completion path reaches its final success.
-    const bool fDagTipDeltaTransaction = BeginDagTipDeltaTransaction(DAG_TIP_DELTA_REORGANIZE);
     if (fReorganizeSourcePost)
         SetDagTipDeltaFinalSourceStateId(reorganizeSourcePost);
     bool fDAGReorg = false;
@@ -8586,6 +8697,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         CommitDagTipDeltaTransaction();
     else
         LeaveDagTipDeltaTransaction();
+    deltaGuard.completed = true;
 
     return true;
 }
@@ -9021,8 +9133,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         if (!vDAGParents.empty())
         {
             int64_t nDAGTimer = GetTimeMillis();
-            // R2c.1d1: capture exact legacy membership changes, but defer
-            // passive publication until this AddToBlockIndex returns success.
+            // Source-semantic records are captured by CTxDB keyed maintenance;
+            // defer publication until this logical ADD envelope succeeds.
             fDagTipDeltaTransaction = BeginDagTipDeltaTransaction(DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX);
             g_dagManager.InitBlockDAGData(pindexNew, vDAGParents);
             fDAGDataInitialized = true;

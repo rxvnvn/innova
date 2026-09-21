@@ -656,6 +656,125 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
     return BLOCK_INDEX_TIP_OK;
 }
 
+// Reorg the ACTIVE chain to the reconnect branch (fork+1..newTip). This is the
+// live-tail's own reorg: it reclassifies records that already exist as SIDE into
+// active membership AND appends branch records not yet present, so the active
+// chain (dense over [baseTipHeight, baseTipHeight+branch.size()]) exactly equals
+// the branch the Reorganize committed. Idempotent Append/AppendBatch cannot do
+// this (they skip existing hashes). Fail closed on any inconsistency: the tip is
+// left at forkHeight (TruncateActiveTo committed), recoverable by re-running.
+BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
+    int32_t forkHeight,
+    const std::vector<BlockIndexTipAppend>& branch,
+    const std::vector<int32_t>& branchHeights,
+    std::string* error)
+{
+    if (!impl->open)
+        return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (branch.size() != branchHeights.size())
+        return SetError(error, "reorg branch size mismatch"), BLOCK_INDEX_TIP_CORRUPT;
+    Impl* i = impl;
+    const int32_t baseTip = i->meta.baseTipHeight;
+
+    // 1. Truncate the ACTIVE chain to the fork (keeps side records, removes the
+    //    disconnected branch from active membership). Dense: activeIds covers
+    //    [baseTip+1, baseTip+activeIds.size()], so fork must be in range.
+    if (forkHeight < baseTip || forkHeight >= baseTip + (int32_t)i->activeIds.size())
+    {
+        if (forkHeight == baseTip)
+        {
+            // Already at the empty fork: activeIds empty is fine.
+        }
+        else
+        {
+            return SetError(error, "reorg fork height out of range"), BLOCK_INDEX_TIP_CORRUPT;
+        }
+    }
+    std::vector<BlockIndexId> baseActive;
+    if (forkHeight > baseTip)
+        baseActive.assign(i->activeIds.begin(), i->activeIds.begin() + (forkHeight - baseTip));
+    else
+        baseActive.clear();
+
+    // 2. Build the new full records/derived/active state. An existing record is
+    //    REUSED (regexist side -> promoted to active at its branch height); a
+    //    branch record not yet in the tip is APPENDED. Every branch block must be
+    //    post-fork and map to the expected dense height.
+    std::vector<BlockIndexRecord> allRecords = i->records;
+    std::vector<BlockIndexDerivedEntry> allDerived = i->derived;
+    std::vector<BlockIndexId> newActive = baseActive; // fork prefix
+    std::vector<BlockIndexId> allActive = newActive.empty()
+        ? std::vector<BlockIndexId>() : newActive;
+    std::set<uint256> seenBranch;
+    for (size_t k = 0; k < branch.size(); ++k)
+    {
+        const BlockIndexRecord& rec = branch[k].record;
+        const int32_t expectedHeight = baseTip + (int32_t)newActive.size() + 1;
+        if (branchHeights[k] != expectedHeight)
+            return SetError(error, "reorg branch non-dense height"), BLOCK_INDEX_TIP_CORRUPT;
+        if (!seenBranch.insert(rec.hash).second)
+            return SetError(error, "reorg branch duplicate"), BLOCK_INDEX_TIP_CORRUPT;
+        std::map<uint256, BlockIndexId>::iterator it = i->hashToId.find(rec.hash);
+        if (it != i->hashToId.end())
+        {
+            // Already present (side record): promote to active.
+            newActive.push_back(it->second);
+        }
+        else
+        {
+            BlockIndexId newId = i->baseLocalToId(allRecords.size());
+            allRecords.push_back(rec);
+            allDerived.push_back(branch[k].derived);
+            newActive.push_back(newId);
+        }
+    }
+    allActive = newActive;
+    // Dense active prefix check: every active member corresponds to a record.
+    for (size_t h = 0; h < allActive.size(); ++h)
+    {
+        bool found=false;
+        for (size_t j = 0; j < allRecords.size(); ++j)
+            if (i->baseLocalToId(j) == allActive[h]) { found=true; break; }
+        if (!found)
+            return SetError(error, "reorg active record missing"), BLOCK_INDEX_TIP_CORRUPT;
+    }
+
+    // 3. Persist stores (full commit-write); tip.meta stays the commit point.
+    if (!WriteRecordsFile(i->recordsPath, allRecords))
+        return SetError(error, "reorg tip-records failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!WriteDerivedFile(i->derivedPath, allDerived))
+        return SetError(error, "reorg tip-derived failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!WriteActiveFile(i->activePath, allActive))
+        return SetError(error, "reorg tip-active failed"), BLOCK_INDEX_TIP_IO_ERROR;
+
+    // 4. Advance tip.meta (dense tipHeight + tipHash), rebuild hashToId.
+    BlockIndexTipMeta newMeta = i->meta;
+    newMeta.activeFence++;
+    newMeta.tipRecordCount = allRecords.size();
+    newMeta.tipHeight = baseTip + (int32_t)allActive.size();
+    if (allActive.empty())
+        newMeta.tipHash = uint256(0);
+    else
+    {
+        BlockIndexId tipId = allActive.back();
+        for (size_t j = 0; j < allRecords.size(); ++j)
+            if (i->baseLocalToId(j) == tipId) newMeta.tipHash = allRecords[j].hash;
+    }
+    ComputeContentDigest(newMeta, allRecords, allDerived, allActive, newMeta.contentDigest);
+    // persist stores first then meta (commit point last).
+    if (!i->WriteMeta(error))
+        return BLOCK_INDEX_TIP_IO_ERROR;
+    i->meta = newMeta;
+    i->records = allRecords;
+    i->derived = allDerived;
+    i->activeIds = allActive;
+    i->hashToId.clear();
+    for (size_t j = 0; j < allRecords.size(); ++j)
+        i->hashToId[allRecords[j].hash] = i->baseLocalToId(j);
+    ClearError(error);
+    return BLOCK_INDEX_TIP_OK;
+}
+
 BlockIndexTipRead BlockIndexTipAuthority::GetTip() const
 {
     BlockIndexTipRead r;

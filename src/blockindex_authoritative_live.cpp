@@ -281,6 +281,36 @@ BlockIndexHotStatus BlockIndexAuthoritativeLive::Materialize(
     return impl_->tail->Pin(BlockIndexLogicalId(hash), out);
 }
 
+BlockIndexHotStatus BlockIndexAuthoritativeLive::ResolveBlockSnapshot(
+    const uint256& hash, BlockIndexSnapshot* out, std::string* error) const
+{
+    if (error) error->clear();
+    if (!impl_->open || !impl_->baseReader || !impl_->tip)
+        return BlockIndexHotStatus::AUTHORITY_MISSING;
+    if (!out)
+        return BlockIndexHotStatus::MATERIALIZATION_UNAVAILABLE;
+    // Use the SINGLE composite current-tail materializer (tip-then-base,
+    // by-value) — the same logical authority seam used by the live acceptance
+    // path — so a post-generation retained hash resolves from the mutable tip,
+    // and a generation/old hash falls back to the immutable base reader. No
+    // residency is allocated (this is a pure by-value snapshot read).
+    BlockIndexLiveTailMaterializer mat(impl_->baseReader, impl_->tip.get());
+    BlockIndexHotMaterialized m;
+    const BlockIndexHotStatus st = mat.Materialize(BlockIndexLogicalId(hash), &m);
+    if (st == BlockIndexHotStatus::OK)
+    {
+        if (!m.found || m.snapshot.hash != hash)
+        {
+            if (error) *error = "authoritative-live: current-tail snapshot identity mismatch for " + hash.GetHex();
+            return BlockIndexHotStatus::CORRUPT_METADATA;
+        }
+        *out = m.snapshot;
+        return BlockIndexHotStatus::OK;
+    }
+    if (error) *error = "authoritative-live: current-tail snapshot resolve failed (status=" + std::to_string((int)st) + ")";
+    return (st == BlockIndexHotStatus::AUTHORITY_MISSING) ? st : BlockIndexHotStatus::CORRUPT_METADATA;
+}
+
 namespace {
 // Build a full-topology CBlockIndex from a by-value snapshot (scalar fields; the
 // caller links pprev/pnext/pskip).

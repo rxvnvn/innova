@@ -60,6 +60,8 @@ public:
     uint64_t Generation() const;
     uint64_t RecordCount() const;
     std::string GenerationPath() const;
+    // Read-only selected manifest retained by this already-open reader.
+    const FixedBlockIndexManifest& Manifest() const;
     BlockIndexSnapshot GetTip() const;
     bool CurrentSelectionChanged(std::string* error) const;
     BlockIndexV2ReaderCacheStats CacheStats() const;
