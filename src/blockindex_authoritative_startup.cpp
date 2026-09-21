@@ -1194,6 +1194,51 @@ bool EnumerateAuthoritativeStagedScope(
 }
 
 // ---------------------------------------------------------------------------
+// S3 full-field diff staging (shared by the authoritative stage and the
+// rollback reconciliation). With diffOnlyWrites set, `chainedPending` keys are
+// mutation-owned vertices that are ALWAYS written (the new block of an ADD,
+// guaranteeing its authoritative values regardless of any earlier
+// topology-staged resident residue); every OTHER vertex is written only when
+// its layered full-field (staged write > tombstone > persisted DB) differs from
+// the canonical recolor record. With diffOnlyWrites clear every record is
+// staged (Reorganize/legacy semantics of the current engine). Returns false on
+// any read/write failure; callers fail closed and abort the batch.
+// ---------------------------------------------------------------------------
+static bool StageDAGFullFieldRecords(CTxDB& db,
+    const std::vector<CanonicalDAGRecolorRecord>& fields,
+    const std::map<uint256,BlockIndexSnapshot>* chainedPending,
+    bool diffOnlyWrites,
+    AuthoritativeDAGStageResult* result, std::string* error)
+{
+    for (const auto& rec : fields) {
+        const bool force = diffOnlyWrites && chainedPending &&
+                           chainedPending->count(rec.hash) != 0;
+        if (diffOnlyWrites && !force)
+        {
+            CBlockDAGData layered;
+            if (!db.ReadDAGLinks(rec.hash, layered))
+            { if (error) *error="S3 stage: diff full-field read failed for "+rec.hash.GetHex(); return false; }
+            if (layered.fBlue == rec.fBlue &&
+                layered.nDAGScore == rec.nDAGScore &&
+                layered.nInferredK == rec.nInferredK)
+                continue; // unchanged retained vertex -> not rewritten (minimal writeset)
+        }
+        CBlockDAGData data;
+        if (!db.ReadDAGLinks(rec.hash, data)) { if (error) *error="S3 stage: full-field read failed for "+rec.hash.GetHex(); return false; }
+        // Preserve the canonical topology (vDAGParents/vDAGChildren/order) and
+        // replace the derived full-field with the authoritative current-canonical values.
+        data.fBlue = rec.fBlue;
+        data.nDAGScore = rec.nDAGScore;
+        data.nInferredK = rec.nInferredK;
+        if (!db.WriteDAGLinks(rec.hash, data)) { if (error) *error="S3 stage: full-field stage failed for "+rec.hash.GetHex(); return false; }
+        result->fullFields.push_back(rec);
+        result->affectedHashes.push_back(rec.hash);
+        ++result->stagedFullFieldRecords;
+    }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
 // S3 atomic authoritative full-field staging (batch-only path).
 // Runs the accepted isolated C-full/Option-R recolor against the staged source
 // view (persisted daglinks + active-batch staged writes - staged tombstones),
@@ -1207,7 +1252,8 @@ bool StageAuthoritativeDAGScoreState(
     const uint256& newSourceToken,
     const std::map<uint256,BlockIndexSnapshot>* chainedPending,
     AuthoritativeDAGStageResult* result,
-    std::string* error)
+    std::string* error,
+    bool diffOnlyWrites)
 {
     if (!result) { if (error) *error="S3 stage: null output"; return false; }
     result->fullFields.clear(); result->affectedHashes.clear();
@@ -1239,19 +1285,18 @@ bool StageAuthoritativeDAGScoreState(
     // Stage authoritative full-field for every affected retained vertex back into
     // the SAME WriteBatch. WriteDAGLinks persists the full CBlockDAGData (parents +
     // fBlue + nDAGScore + nInferredK) and updates the child-count projection.
-    for (const auto& rec : fields) {
-        CBlockDAGData data;
-        if (!db.ReadDAGLinks(rec.hash, data)) { if (error) *error="S3 stage: full-field read failed for "+rec.hash.GetHex(); return false; }
-        // Preserve the canonical topology (vDAGParents/vDAGChildren/order) and
-        // replace the derived full-field with the authoritative current-canonical values.
-        data.fBlue = rec.fBlue;
-        data.nDAGScore = rec.nDAGScore;
-        data.nInferredK = rec.nInferredK;
-        if (!db.WriteDAGLinks(rec.hash, data)) { if (error) *error="S3 stage: full-field stage failed for "+rec.hash.GetHex(); return false; }
-        result->fullFields.push_back(rec);
-        result->affectedHashes.push_back(rec.hash);
-        ++result->stagedFullFieldRecords;
-    }
+    // diffOnlyWrites (used by ordinary incremental ADD): force-write canonical
+    // full-field for every mutation-owned pending vertex (chainedPending key; for
+    // ADD that is exactly the newly-added block, guaranteeing its authoritative
+    // values regardless of any earlier topology-staged resident residue), and for
+    // every OTHER retained vertex stage canonical full-field ONLY if it differs
+    // from the currently layered value (staged write > tombstone > persisted DB).
+    // This yields the exact incremental writeset ({new block} for single-parent
+    // ADD; any retained vertex whose full-field genuinely changes for a merge ADD)
+    // while still running the full canonical recolor for correct leaf heritage.
+    // Stage authoritative full-field for every affected retained vertex back into
+    // the SAME WriteBatch (shared diff-only loop; see StageDAGFullFieldRecords).
+    if (!StageDAGFullFieldRecords(db, fields, chainedPending, diffOnlyWrites, result, error)) return false;
     // Stage the new SourceStateId (advances the token; also binds the child-count
     // marker to it via WriteDAGSourceStateId), then both certificates.
     if (!db.WriteDAGSourceStateId(newSourceToken)) { if (error) *error="S3 stage: source token write failed"; return false; }
@@ -1260,6 +1305,39 @@ bool StageAuthoritativeDAGScoreState(
     // Rough write-batch byte estimate: daglinks records (full-field) + markers + token.
     size_t approx = (sizeof(uint256)+sizeof(CBlockDAGData)+32) * fields.size();
     approx += 128; // markers + token
+    result->writeBatchBytes = approx;
+    result->stagedTopologyEntries = stats.retainedVertices;
+    result->stats = stats;
+    return true;
+}
+
+bool ReconcileAuthoritativeDAGScoreInBatch(
+    CTxDB& db,
+    const std::vector<std::pair<int32_t,uint256>>& stagedScope,
+    AuthoritativeDAGStageResult* result,
+    std::string* error)
+{
+    if (!result) { if (error) *error="S3 reconcile: null output"; return false; }
+    result->fullFields.clear(); result->affectedHashes.clear();
+    if (error) error->clear();
+    // Batch-only contract, same as the authoritative stage.
+    if (!db.HasActiveBatch()) { if (error) *error="S3 reconcile: no active transaction (batch-only API)"; return false; }
+    // Recolor against the CURRENT merged staged view (the rollback batch already
+    // holds the restored parents and the tombstone for the erased new block), so
+    // every residue the failed mutation left on retained vertices is compared
+    // against the canonical state OF THE RESTORED CANVAS and written back where
+    // it differs. No pending overlay: the restored canvas has no un-published
+    // vertices. No token/certificate staging: the caller restores those exactly.
+    AuthoritativeDAGRecolorSource source(db);
+    std::vector<CanonicalDAGRecolorRecord> fields;
+    CanonicalDAGRecolorStats stats;
+    std::string rerr;
+    if (!ReconstructAuthoritativeDAGFields(stagedScope, source, &fields, &stats, &rerr)) {
+        if (error) *error="S3 reconcile: canonical recolor failed: "+rerr;
+        return false;
+    }
+    if (!StageDAGFullFieldRecords(db, fields, NULL, true, result, error)) return false;
+    size_t approx = (sizeof(uint256)+sizeof(CBlockDAGData)+32) * result->stagedFullFieldRecords;
     result->writeBatchBytes = approx;
     result->stagedTopologyEntries = stats.retainedVertices;
     result->stats = stats;

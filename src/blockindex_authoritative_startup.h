@@ -321,6 +321,30 @@ bool StageAuthoritativeDAGScoreState(
     const uint256& newSourceToken,
     const std::map<uint256,BlockIndexSnapshot>* chainedPending, // mutation-scoped pending (may be NULL)
     AuthoritativeDAGStageResult* result,
+    std::string* error,
+    bool diffOnlyWrites = false); // true = stage canonical full-field only for vertices whose
+                                  //      layered full-field differs from the canonical recolor
+                                  //      result (minimal writeset for ordinary incremental ADD);
+                                  //      fullFields/affectedHashes reflect only actually-written
+                                  //      vertices. false = stage every staged-scope vertex
+                                  //      (Reorganize/legacy of the current engine) unchanged.
+
+// S3 rollback reconciliation (batch-only, failure path). Re-derives the
+// canonical full-field over the RESTORED staged scope (no pending overlay, no
+// force set) and stages ONLY the vertices whose layered value differs from the
+// canonical recolor (diff-only). Used by the ADD rollback after a failed
+// SetBestChain: the failed ADD's already-committed batch may have persisted
+// genuinely-changed retained vertices (merge flips) AND rewritten parent records
+// from resident coloring that no longer reflects the restored canvas; erasing
+// the new block and rewriting parents alone is insufficient. This deliberately
+// stages NO token and NO certificates: the caller restores the SourceStateId via
+// WriteDAGSourceStateId (state-preserving) and the score certificate via an
+// exact captured-state restore. Requires an open transaction; fails closed on
+// any recolor/read error.
+bool ReconcileAuthoritativeDAGScoreInBatch(
+    CTxDB& db,                                  // active transaction (WriteBatch open)
+    const std::vector<std::pair<int32_t,uint256>>& stagedScope,
+    AuthoritativeDAGStageResult* result,
     std::string* error);
 
 // S3 staged view enumeration: return the merged retained scope

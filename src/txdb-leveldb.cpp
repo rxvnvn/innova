@@ -882,6 +882,43 @@ bool CTxDB::StageDAGChildCountCertificateInBatch(const uint256& source, std::str
     return true;
 }
 
+bool CTxDB::CaptureDAGScoreCertificateState(bool* markerPresent, std::string* markerRaw,
+                                            bool* revoked, std::string* error)
+{
+    if (error) error->clear();
+    if (!markerPresent || !markerRaw || !revoked) { if (error) *error="S3 capture: null output"; return false; }
+    leveldb::DB* db = GetInstance();
+    if (!db) { if (error) *error="S3 capture: database unavailable"; return false; }
+    *markerPresent = false; markerRaw->clear(); *revoked = false;
+    CDataStream markerKey(SER_DISK, CLIENT_VERSION);
+    markerKey << make_pair(SCORE_STATE_KEY, uint8_t(0));
+    std::string value;
+    const leveldb::Status st = db->Get(leveldb::ReadOptions(), markerKey.str(), &value);
+    if (st.IsNotFound()) { *markerPresent = false; }
+    else if (!st.ok()) { if (error) *error="S3 capture: score marker read error"; return false; }
+    else { *markerPresent = true; *markerRaw = value; }
+    // Revocation presence mirrors ScoreAuthorityRevoked(): any read error is
+    // unavailable, never healthy (captured as revoked, fail-closed).
+    std::string revValue;
+    const leveldb::Status rst = db->Get(leveldb::ReadOptions(), ScoreAuthorityRevocationKey(), &revValue);
+    *revoked = !rst.IsNotFound();
+    return true;
+}
+
+bool CTxDB::RestoreDAGScoreCertificateStateInBatch(bool markerPresent, const std::string& markerRaw,
+                                                   bool revoked, std::string* error)
+{
+    if (error) error->clear();
+    if (!activeBatch) { if (error) *error="S3 restore: no active transaction"; return false; }
+    CDataStream markerKey(SER_DISK, CLIENT_VERSION);
+    markerKey << make_pair(SCORE_STATE_KEY, uint8_t(0));
+    if (markerPresent) activeBatch->Put(markerKey.str(), markerRaw);
+    else activeBatch->Delete(markerKey.str());
+    if (revoked) activeBatch->Put(ScoreAuthorityRevocationKey(), "rebuild-required");
+    else activeBatch->Delete(ScoreAuthorityRevocationKey());
+    return true;
+}
+
 bool CTxDB::MintDAGSourceStateId(uint256& out)
 {
     if (g_testFailDAGSourceStateBootstrapMint ||

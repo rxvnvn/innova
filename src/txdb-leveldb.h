@@ -343,6 +343,20 @@ public:
     // S3 batch-only: stage the child-count certificate marker bound to `source`
     // and clear the child-count revocation key, all INSIDE the active WriteBatch.
     bool StageDAGChildCountCertificateInBatch(const uint256& source, std::string* error);
+    // S3 rollback support: capture the DURABLE pre-operation score-certificate
+    // state (raw marker bytes + presence, revocation poison presence) so a failed
+    // mutation can restore it EXACTLY. Reads the durable store directly; call
+    // BEFORE the mutation batch opens. A rollback must return to THIS state and
+    // must never fabricate a healthy certificate.
+    bool CaptureDAGScoreCertificateState(bool* markerPresent, std::string* markerRaw,
+                                         bool* revoked, std::string* error);
+    // S3 rollback support: stage the EXACT captured score-certificate state into
+    // the active WriteBatch (marker write-or-erase + revocation set-or-clear).
+    // Unlike StageDAGScoreCertificateInBatch this never fabricates a healthy
+    // marker: an uncertified or revoked pre-operation state stays uncertified or
+    // revoked after the rollback. Requires an open transaction.
+    bool RestoreDAGScoreCertificateStateInBatch(bool markerPresent, const std::string& markerRaw,
+                                                bool revoked, std::string* error);
     // Production CSPRNG mint with explicit failure status; bootstrap/source
     // mutation callers must not use a token when this returns false.
     bool MintDAGSourceStateId(uint256& out);

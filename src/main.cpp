@@ -9117,6 +9117,13 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     bool fDagTipDeltaTransaction = false;
     uint256 dagSourcePre;
     bool fDagSourcePreCaptured = false;
+    // S3 rollback coherence (authoritative): durable pre-operation score-certificate
+    // state captured before the ADD's source batch opens, so a failed SetBestChain
+    // rollback can restore it EXACTLY (never fabricate a healthy certificate).
+    bool fScoreCertPreCaptured = false;
+    bool fScoreCertPrePresent = false;
+    bool fScoreCertPreRevoked = false;
+    std::string scoreCertPreRaw;
     std::vector<uint256> vDAGParents;
 
     // IDAG Phase 2: Initialize DAG data for post-fork blocks
@@ -9151,6 +9158,23 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             nDAGTimer = GetTimeMillis();
             CTxDB txdbDAG;
             uint256 dagSourcePost;
+            if (g_fAuthoritativeStartup)
+            {
+                // S3 rollback coherence: capture the DURABLE pre-operation score
+                // certificate state (raw marker + revocation presence) BEFORE the
+                // source batch opens. A failed SetBestChain rollback restores this
+                // state exactly; it must never fabricate a healthy certificate for
+                // the restored token (that would mask an uncertified/revoked
+                // pre-operation state). Fail closed if the capture cannot be made.
+                std::string capErr;
+                if (!txdbDAG.CaptureDAGScoreCertificateState(&fScoreCertPrePresent, &scoreCertPreRaw,
+                                                             &fScoreCertPreRevoked, &capErr))
+                {
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: DAG score-certificate state capture failed; shutting down");
+                }
+                fScoreCertPreCaptured = true;
+            }
             if (!(fDagSourcePreCaptured = txdbDAG.ReadDAGSourceStateId(dagSourcePre)) ||
                 !txdbDAG.MintDAGSourceStateId(dagSourcePost) ||
                 !txdbDAG.TxnBegin() ||
@@ -9167,11 +9191,54 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                     if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
                     return AbortDagSourcePersistence("AddToBlockIndex: DAG-link write failed; shutting down");
                 }
-            if (!txdbDAG.WriteDAGSourceStateId(dagSourcePost) ||
-                g_testFailInitialDagLinksCommit || !txdbDAG.TxnCommit())
+            if (g_fAuthoritativeStartup)
             {
-                if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
-                return AbortDagSourcePersistence("AddToBlockIndex: DAG-link persistence failed; shutting down to prevent stale DAG source");
+                // S3 ADD authoritative full-field persistence: topology (new block
+                // daglinks + parent child-count) is already staged above. Enumerate
+                // the merged retained scope (persisted + staged writes - tombstones),
+                // run the isolated C-full/Option-R recolor against the staged view,
+                // stage canonical full-field DIFF-ONLY (force-write the new block;
+                // stage only genuinely-changed retained vertices otherwise), advance
+                // the SourceStateId once, and stage BOTH certificates bound to the
+                // SAME new token -- all in this ONE batch. The new post-generation
+                // block is not yet externally published (publication happens after
+                // SetBestChain), so its by-value snapshot is supplied as the
+                // mutation-scoped pending overlay, exactly like the Reorganize path.
+                std::map<uint256,BlockIndexSnapshot> addPending;
+                BlockIndexSnapshot ps = BlockIndexSnapshotFromIndex(pindexNew);
+                ps.fInMainChain = true; // this ADD is the current canonical mutation
+                addPending[hash] = ps;
+                std::vector<std::pair<int32_t,uint256>> stagedScope;
+                std::string s3err;
+                if (!EnumerateAuthoritativeStagedScope(txdbDAG, &stagedScope, &addPending, &s3err))
+                {
+                    txdbDAG.TxnAbort();
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: S3 ADD staged-scope enumeration failed; shutting down");
+                }
+                AuthoritativeDAGStageResult s3res;
+                if (!StageAuthoritativeDAGScoreState(txdbDAG, stagedScope, dagSourcePost,
+                                                     &addPending, &s3res, &s3err, true))
+                {
+                    txdbDAG.TxnAbort();
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: S3 atomic full-field staging failed; shutting down");
+                }
+                if (g_testFailInitialDagLinksCommit || !txdbDAG.TxnCommit())
+                {
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: DAG-link/full-field persistence failed; shutting down to prevent stale DAG source");
+                }
+            }
+            else
+            {
+                // Legacy non-authoritative path: unchanged (topology + token only).
+                if (!txdbDAG.WriteDAGSourceStateId(dagSourcePost) ||
+                    g_testFailInitialDagLinksCommit || !txdbDAG.TxnCommit())
+                {
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: DAG-link persistence failed; shutting down to prevent stale DAG source");
+                }
             }
             if (fDagTipDeltaTransaction)
                 SetDagTipDeltaFinalSourceStateId(dagSourcePost);
@@ -9268,8 +9335,52 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                         return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback write failed; shutting down");
                     }
                 }
-                if (!txdbDAGClean.WriteDAGSourceStateId(dagSourcePre) ||
-                    g_testFailFailedAddDagLinksCleanupCommit || !txdbDAGClean.TxnCommit())
+                if (!txdbDAGClean.WriteDAGSourceStateId(dagSourcePre))
+                {
+                    txdbDAGClean.TxnAbort();
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback token write failed; shutting down");
+                }
+                // S3 rollback coherence: WriteDAGSourceStateId restores the token
+                // AND the child-count marker back to dagSourcePre, but the failed
+                // ADD's already-committed batch may ALSO have persisted genuinely
+                // changed retained vertices (merge flips) and rewritten parent
+                // records from resident coloring that no longer reflects the
+                // restored canvas. Erasing the new block + rewriting parents alone
+                // is insufficient, so re-derive the canonical full-field over the
+                // RESTORED staged scope and reconcile every residue into THIS
+                // batch (diff-only: writes nothing when the canvas is already
+                // canonical). Then restore the EXACT pre-operation score
+                // certificate state captured before the ADD batch opened - never
+                // fabricate a healthy certificate. All in ONE atomic clean batch.
+                if (g_fAuthoritativeStartup)
+                {
+                    std::vector<std::pair<int32_t,uint256>> rbScope;
+                    std::string rbErr;
+                    if (!EnumerateAuthoritativeStagedScope(txdbDAGClean, &rbScope, NULL, &rbErr))
+                    {
+                        txdbDAGClean.TxnAbort();
+                        if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                        return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback reconcile enumeration failed; shutting down");
+                    }
+                    AuthoritativeDAGStageResult rbRes;
+                    if (!ReconcileAuthoritativeDAGScoreInBatch(txdbDAGClean, rbScope, &rbRes, &rbErr))
+                    {
+                        txdbDAGClean.TxnAbort();
+                        if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                        return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback reconcile failed; shutting down");
+                    }
+                    std::string certErr;
+                    if (fScoreCertPreCaptured &&
+                        !txdbDAGClean.RestoreDAGScoreCertificateStateInBatch(fScoreCertPrePresent,
+                            scoreCertPreRaw, fScoreCertPreRevoked, &certErr))
+                    {
+                        txdbDAGClean.TxnAbort();
+                        if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                        return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback score-cert restore failed; shutting down");
+                    }
+                }
+                if (g_testFailFailedAddDagLinksCleanupCommit || !txdbDAGClean.TxnCommit())
                 {
                     if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
                     return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback persistence failed; shutting down to prevent stale DAG source");
