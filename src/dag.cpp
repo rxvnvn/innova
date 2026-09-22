@@ -10,6 +10,7 @@
 #include "blockindex_authoritative_startup.h"
 #include "util.h"
 #include "dag_tips_delta.h"
+#include "dag_mutation_preview.h"
 
 #include <algorithm>
 #include <queue>
@@ -145,7 +146,8 @@ void CDAGManager::RebuildPendingChildIndex()
     }
 }
 
-bool CDAGManager::InitBlockDAGData(CBlockIndex* pindex, const std::vector<uint256>& vParents)
+bool CDAGManager::InitBlockDAGData(CBlockIndex* pindex, const std::vector<uint256>& vParents,
+                                   const DagMutationPreview* mutationPreview)
 {
     LOCK(cs_dag);
 
@@ -209,7 +211,11 @@ bool CDAGManager::InitBlockDAGData(CBlockIndex* pindex, const std::vector<uint25
             nLastRebuildTime = nNow;
             printf("InitBlockDAGData: tip flood detected (%d tips), triggering incremental rebuild\n",
                    (int)setDAGTips.size());
-            RebuildDAGOrderIncremental(nPrunedBelowHeight);
+            // R2c.2s/S5: mutation-internal synchronous consumer — the explicit
+            // transaction-scoped preview is threaded through; validation
+            // failure fails the rebuild closed (the journal is latched).
+            if (!RebuildDAGOrderIncremental(nPrunedBelowHeight, mutationPreview))
+                return false;
         }
     }
 
@@ -1034,9 +1040,25 @@ void CDAGManager::RestoreDAGTrustIntoChainTrust()
 // CDAGManager: Rebuild Ordering
 // ---------------------------------------------------------------------------
 
-void CDAGManager::RebuildDAGOrder()
+bool CDAGManager::RebuildDAGOrder(const DagMutationPreview* mutationPreview)
 {
     LOCK(cs_dag);
+
+    // R2c.2s/S5: explicit transaction-scoped preview validation (fail closed).
+    if (mutationPreview)
+    {
+        std::string previewError;
+        DagMutationPreviewStatus pst = ValidateDagMutationPreviewForConsumer(
+            mutationPreview, DAG_MUTATION_PREVIEW_CONSUMER_ORDER, &previewError);
+        if (pst != DAG_MUTATION_PREVIEW_OK)
+        {
+            fprintf(stderr, "RebuildDAGOrder: S5 preview validation failed: %s\n",
+                    DagMutationPreviewStatusName(pst));
+            fflush(stderr);
+            InvalidateDagTipDeltaTransaction();
+            return false;
+        }
+    }
 
     // Clear blue set cache to avoid stale entries during rebuild
     mapBlueSetCache.clear();
@@ -1081,6 +1103,7 @@ void CDAGManager::RebuildDAGOrder()
     }
 
     printf("RebuildDAGOrder: recolored and ordered %d DAG blocks\n", (int)vByHeight.size());
+    return true;
 }
 
 
@@ -1088,9 +1111,25 @@ void CDAGManager::RebuildDAGOrder()
 // CDAGManager: Incremental Rebuild (only recolors blocks above nCleanHeight)
 // ---------------------------------------------------------------------------
 
-void CDAGManager::RebuildDAGOrderIncremental(int nCleanHeight)
+bool CDAGManager::RebuildDAGOrderIncremental(int nCleanHeight, const DagMutationPreview* mutationPreview)
 {
     LOCK(cs_dag);
+
+    // R2c.2s/S5: explicit transaction-scoped preview validation (fail closed).
+    if (mutationPreview)
+    {
+        std::string previewError;
+        DagMutationPreviewStatus pst = ValidateDagMutationPreviewForConsumer(
+            mutationPreview, DAG_MUTATION_PREVIEW_CONSUMER_REORDER, &previewError);
+        if (pst != DAG_MUTATION_PREVIEW_OK)
+        {
+            fprintf(stderr, "RebuildDAGOrderIncremental: S5 preview validation failed: %s\n",
+                    DagMutationPreviewStatusName(pst));
+            fflush(stderr);
+            InvalidateDagTipDeltaTransaction();
+            return false;
+        }
+    }
 
     // Clear blue set cache to avoid stale entries during rebuild
     mapBlueSetCache.clear();
@@ -1134,6 +1173,7 @@ void CDAGManager::RebuildDAGOrderIncremental(int nCleanHeight)
 
     printf("RebuildDAGOrderIncremental: recolored %d blocks above height %d\n",
            (int)vByHeight.size(), nCleanHeight);
+    return true;
 }
 
 
@@ -1403,9 +1443,27 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture
 // CDAGManager: Epoch State Computation
 // ---------------------------------------------------------------------------
 
-bool CDAGManager::ComputeEpochState(int nEpoch, int nEpochInterval)
+bool CDAGManager::ComputeEpochState(int nEpoch, int nEpochInterval, const DagMutationPreview* mutationPreview)
 {
     LOCK(cs_dag);
+
+    // R2c.2s/S5: mutation-internal synchronous consumer. The owning envelope
+    // threads its explicit transaction-scoped preview; validation failure is
+    // fail-closed (the journal is latched and the caller aborts).
+    if (mutationPreview)
+    {
+        std::string previewError;
+        DagMutationPreviewStatus pst = ValidateDagMutationPreviewForConsumer(
+            mutationPreview, DAG_MUTATION_PREVIEW_CONSUMER_EPOCH, &previewError);
+        if (pst != DAG_MUTATION_PREVIEW_OK)
+        {
+            fprintf(stderr, "ComputeEpochState: S5 preview validation failed: %s\n",
+                    DagMutationPreviewStatusName(pst));
+            fflush(stderr);
+            InvalidateDagTipDeltaTransaction();
+            return false;
+        }
+    }
 
     CEpochState state;
     state.nEpoch = nEpoch;

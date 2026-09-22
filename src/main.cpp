@@ -35,6 +35,7 @@
 #include "curvetree.h"
 #include "finality.h"
 #include "dag.h"
+#include "dag_mutation_preview.h"
 #include "candidate_frontier.h"
 #include "blockindex_hot_owner.h"
 #include "blockindex_residency_counters.h"
@@ -8526,6 +8527,31 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     // Capture canonical transitions BEFORE the first source edit, including
     // standalone reorgs (a nested ADD retains ownership of publication).
     const bool fDagTipDeltaTransaction = BeginDagTipDeltaTransaction(DAG_TIP_DELTA_REORGANIZE);
+    // R2c.2s/S5: root creation or nested borrow of the single root-scoped
+    // transaction preview (one ownership domain; nested scopes share it).
+    // The seam is an authoritative-mode capability: in pure legacy mode the
+    // accepted legacy behavior is preserved (NULL = no seam involvement).
+    DagMutationPreview* mutationPreview = NULL;
+    if (fDagTipDeltaTransaction && g_fAuthoritativeStartup)
+    {
+        std::string s5PreviewError;
+        mutationPreview = BeginDagMutationPreviewRoot(&s5PreviewError);
+        if (!mutationPreview)
+        {
+            DiscardDagTipDeltaTransaction();
+            return AbortDagSourcePersistence("Reorganize: S5 mutation preview root failed; shutting down");
+        }
+    }
+    else if (g_fAuthoritativeStartup && GetDagTipDeltaState().active)
+    {
+        mutationPreview = BorrowDagMutationPreview();
+        if (!mutationPreview)
+        {
+            // An active root journal must own a root preview; a nested scope
+            // must never silently continue without the transaction-scoped view.
+            return AbortDagSourcePersistence("Reorganize: S5 nested preview borrow failed; shutting down");
+        }
+    }
     struct ReorgDeltaFailureGuard {
         bool completed;
         ReorgDeltaFailureGuard() : completed(false) {}
@@ -8598,6 +8624,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
                 txdbDAGClean.TxnAbort();
                 return AbortDagSourcePersistence("Reorganize: S3 atomic full-field staging failed; shutting down");
             }
+            CallDagMutationPreviewPhaseHook("reorg_staged_precommit");
             if (g_testFailReorganizeDagLinksEraseCommit || !txdbDAGClean.TxnCommit())
             {
                 return AbortDagSourcePersistence("Reorganize: DAG-link erase/full-field persistence failed; shutting down to prevent stale DAG source");
@@ -8651,6 +8678,10 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         reorganizeSourcePost = dagSourcePost;
         fReorganizeSourcePost = true;
         SetDagTipDeltaFinalSourceStateId(dagSourcePost);
+        // R2c.2s/S5: the reorg's physical source commit is now part of the
+        // envelope's committed prefix (root or nested scope).
+        MarkDagMutationCommittedPrefix();
+        CallDagMutationPreviewPhaseHook("reorg_source_committed");
     }
     // Phase 2: Memory cleanup after LevelDB commit (reverse order: children first).
     // The legacy reorg transaction is durable at this point; publish only after
@@ -8669,7 +8700,12 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     }
     // Re-color DAG blocks above fork point to ensure consistency with fresh-synced nodes
     if (fDAGReorg && pfork)
-        g_dagManager.RebuildDAGOrderIncremental(pfork->nHeight);
+    {
+        // R2c.2s/S5: mutation-internal synchronous consumer — explicit
+        // transaction-scoped preview threaded; fail-closed on validation.
+        if (!g_dagManager.RebuildDAGOrderIncremental(pfork->nHeight, mutationPreview))
+            return AbortDagSourcePersistence("Reorganize: S5 reorder consumer preview validation failed; shutting down");
+    }
 
     // Disconnect shorter branch
     for (CBlockIndex* pindex : vDisconnect)
@@ -8714,6 +8750,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     CollateralNReorgBlock = true;
     printf("REORGANIZE: done\n");
 
+    CallDagMutationPreviewPhaseHook("reorg_envelope_end");
     if (fDagTipDeltaTransaction)
         CommitDagTipDeltaTransaction();
     else
@@ -9161,6 +9198,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
 
     bool fDAGDataInitialized = false;
     bool fDagTipDeltaTransaction = false;
+    // R2c.2s/S5: root-scoped owned transaction preview (NULL in legacy mode).
+    DagMutationPreview* mutationPreview = NULL;
     uint256 dagSourcePre;
     bool fDagSourcePreCaptured = false;
     // S3 rollback coherence (authoritative): durable pre-operation score-certificate
@@ -9195,7 +9234,20 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             // Source-semantic records are captured by CTxDB keyed maintenance;
             // defer publication until this logical ADD envelope succeeds.
             fDagTipDeltaTransaction = BeginDagTipDeltaTransaction(DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX);
-            g_dagManager.InitBlockDAGData(pindexNew, vDAGParents);
+            if (fDagTipDeltaTransaction && g_fAuthoritativeStartup)
+            {
+                // R2c.2s/S5: the root mutation envelope owns the explicit
+                // transaction-scoped preview; nested scopes borrow it. Pure
+                // legacy mode keeps the accepted legacy behavior (no seam).
+                std::string s5PreviewError;
+                mutationPreview = BeginDagMutationPreviewRoot(&s5PreviewError);
+                if (!mutationPreview)
+                {
+                    DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence("AddToBlockIndex: S5 mutation preview root failed; shutting down");
+                }
+            }
+            g_dagManager.InitBlockDAGData(pindexNew, vDAGParents, mutationPreview);
             fDAGDataInitialized = true;
             nDAGInitMs = GetTimeMillis() - nDAGTimer;
 
@@ -9276,6 +9328,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                     if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
                     return AbortDagSourcePersistence("AddToBlockIndex: S3 atomic full-field staging failed; shutting down");
                 }
+                CallDagMutationPreviewPhaseHook("add_staged_precommit");
                 if (g_testFailInitialDagLinksCommit || !txdbDAG.TxnCommit())
                 {
                     if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
@@ -9294,6 +9347,10 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             }
             if (fDagTipDeltaTransaction)
                 SetDagTipDeltaFinalSourceStateId(dagSourcePost);
+            // R2c.2s/S5: record the completed physical source commit of this
+            // envelope for the owned transaction-scoped preview.
+            MarkDagMutationCommittedPrefix();
+            CallDagMutationPreviewPhaseHook("add_source_committed");
             nDAGWriteMs = GetTimeMillis() - nDAGTimer;
 
             // Use DAG score for best-chain comparison
@@ -9317,7 +9374,11 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                     int nEpochEnd = GetEpochBoundaryHeight(nCompletedEpoch + 1, pindexNew->nHeight) - 1;
                     int nEpochInterval = (nEpochEnd >= nEpochStart) ? (nEpochEnd - nEpochStart + 1) : GetEpochInterval(nEpochStart);
 
-                    g_dagManager.ComputeEpochState(nCompletedEpoch, nEpochInterval);
+                    if (!g_dagManager.ComputeEpochState(nCompletedEpoch, nEpochInterval, mutationPreview))
+                    {
+                        if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                        return AbortDagSourcePersistence("AddToBlockIndex: S5 epoch consumer preview validation failed; shutting down");
+                    }
 
                     CTxDB txdbEpoch;
                     if (txdbEpoch.TxnBegin())
@@ -9353,6 +9414,10 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                         if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
                         return AbortDagSourcePersistence("AddToBlockIndex: DAG prune persistence failed; shutting down");
                     }
+                    // R2c.2s/S5: the prune's own physical source commit is now
+                    // part of the envelope's committed prefix.
+                    MarkDagMutationCommittedPrefix();
+                    CallDagMutationPreviewPhaseHook("prune_committed");
                 }
                 // Test-only: exercise the same Add -> PruneDAGData call without
                 // forging an epoch boundary or epoch-state topology.
@@ -9368,6 +9433,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                         if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
                         return AbortDagSourcePersistence("AddToBlockIndex: DAG prune persistence failed; shutting down");
                     }
+                    MarkDagMutationCommittedPrefix();
+                    CallDagMutationPreviewPhaseHook("prune_committed");
                 }
             }
         }
@@ -9557,6 +9624,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         }
     }
 
+    CallDagMutationPreviewPhaseHook("add_envelope_end");
     if (fDagTipDeltaTransaction)
         CommitDagTipDeltaTransaction();
 

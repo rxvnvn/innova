@@ -5,6 +5,7 @@
 #include "uint256.h"
 #include <cstddef>
 #include <stdint.h>
+#include <string>
 
 struct DagTipDeltaRecord {
     enum Op { TIP_ADD = 1, TIP_REMOVE = 2 } op;
@@ -34,8 +35,9 @@ struct DagTipDeltaState {
     bool enabled, active, failureLatched, spilled, hasIntendedFinalSourceStateId;
     size_t ramCapacity, ramRecords;
     uint64_t logicalRecords;
+    uint64_t rootSerial; // increments each time a fresh root transaction begins
     uint256 intendedFinalSourceStateId;
-    DagTipDeltaState() : enabled(false), active(false), failureLatched(false), spilled(false), hasIntendedFinalSourceStateId(false), ramCapacity(0), ramRecords(0), logicalRecords(0), intendedFinalSourceStateId(0) {}
+    DagTipDeltaState() : enabled(false), active(false), failureLatched(false), spilled(false), hasIntendedFinalSourceStateId(false), ramCapacity(0), ramRecords(0), logicalRecords(0), rootSerial(0), intendedFinalSourceStateId(0) {}
 };
 
 void SetDagTipCommittedDeltaObserver(DagTipCommittedDeltaObserver observer, void* context);
@@ -53,4 +55,11 @@ void SetDagTipDeltaFinalSourceStateId(const uint256& id);
 bool GetDagTipDeltaFinalSourceStateId(uint256* out);
 void CommitDagTipDeltaTransaction();
 void DiscardDagTipDeltaTransaction();
+// Read-only pending-record iteration (R2c.2s/S5 mutation preview). Visits the
+// spilled prefix first, then the bounded in-RAM tail, in exact append order.
+// Does NOT consume/reset the journal and never mutates journal state (no
+// digest, no spill, no latching): malformed framing or I/O failure is
+// reported to the caller without touching the journal.
+typedef bool (*DagTipDeltaReadFn)(const DagTipDeltaRecord& record, void* context);
+bool ForEachDagTipDeltaRecord(DagTipDeltaReadFn fn, void* context, std::string* error);
 #endif

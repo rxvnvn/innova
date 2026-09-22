@@ -16,6 +16,7 @@
 #include "txdb.h"
 #include "dag_tip_overlay_runtime.h"
 #include "dag_tips_delta.h"
+#include "dag_mutation_preview.h"
 #include "dag_tip_frontier_metadata.h"
 #include "dag_tip_frontier.h"
 #include "fixed_blockindex_store.h"
@@ -419,6 +420,10 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         SetDagTipCommittedDeltaObserver(&DeliverCommittedDagTipDeltaToRuntime,
                                          ctx->dagTipRuntime.get());
         ctx->dagTipObserverRegistered = true;
+        // R2c.2s/S5: the same healthy runtime is the certified base source for
+        // the owned transaction-scoped preview seam (registration only; the
+        // seam remains unreachable without an explicit root envelope).
+        SetDagMutationPreviewRuntime(ctx->dagTipRuntime.get());
     }
 
     // HReg + wallet rescan are driven by init.cpp AFTER this returns, using
@@ -666,6 +671,10 @@ void ResetBlockIndexAuthoritativeStartupForTest()
         SetDagTipCommittedDeltaObserver(NULL, NULL);
         g_authoritativeContext->dagTipObserverRegistered = false;
     }
+    // R2c.2s/S5: drop the preview seam's runtime registration and any root
+    // ownership state before the runtime is destroyed.
+    ClearDagMutationPreviewRuntime();
+    ResetDagMutationPreviewForTest();
     // Then destroy the context, navigator, and only the globals published by
     // InitBlockIndexAuthoritative.
     delete g_authoritativeContext;

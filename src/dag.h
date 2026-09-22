@@ -171,6 +171,8 @@ struct DagPruneRollbackCapture
     DagPruneRollbackCapture() : cleanHeightPresent(false), cleanHeight(-1), committed(false) {}
 };
 
+class DagMutationPreview; // R2c.2s/S5 owned transaction-scoped preview seam
+
 class CDAGManager
 {
 public:
@@ -185,8 +187,12 @@ public:
     uint256 RecolorStateDigestForTest() const;
 
     /** Initialize DAG data for a newly accepted block.
-     *  Must be called under cs_main. Sets parents, registers children, updates tips. */
-    bool InitBlockDAGData(CBlockIndex* pindex, const std::vector<uint256>& vParents);
+     *  Must be called under cs_main. Sets parents, registers children, updates tips.
+     *  mutationPreview (R2c.2s/S5): the owning envelope's transaction-scoped
+     *  preview, explicitly threaded to mutation-internal consumers; NULL keeps
+     *  the accepted legacy behavior. */
+    bool InitBlockDAGData(CBlockIndex* pindex, const std::vector<uint256>& vParents,
+                          const DagMutationPreview* mutationPreview = NULL);
 
     /** Get current DAG tips (blocks with no children). */
     std::vector<uint256> GetDAGTips() const;
@@ -216,11 +222,13 @@ public:
     /** Load persisted epoch states and curve-tree snapshots from LevelDB. */
     bool LoadEpochStates(CTxDB& txdb);
 
-    /** Rebuild DAG ordering (GHOSTDAG/DAGKNIGHT) from loaded data. */
-    void RebuildDAGOrder();
+    /** Rebuild DAG ordering (GHOSTDAG/DAGKNIGHT) from loaded data.
+     *  mutationPreview (R2c.2s/S5): explicit transaction-scoped preview; when
+     *  non-NULL it is validated fail-closed before use. */
+    bool RebuildDAGOrder(const DagMutationPreview* mutationPreview = NULL);
 
     /** Rebuild DAG ordering incrementally (only blocks above nCleanHeight). */
-    void RebuildDAGOrderIncremental(int nCleanHeight);
+    bool RebuildDAGOrderIncremental(int nCleanHeight, const DagMutationPreview* mutationPreview = NULL);
 
     /**
      * After RebuildDAGOrder / RebuildDAGOrderIncremental, fold the
@@ -251,7 +259,7 @@ public:
                       const std::map<uint256,BlockIndexSnapshot>* chainedPending = NULL);
 
     /** Compute epoch state for a completed epoch. */
-    bool ComputeEpochState(int nEpoch, int nEpochInterval);
+    bool ComputeEpochState(int nEpoch, int nEpochInterval, const DagMutationPreview* mutationPreview = NULL);
 
     /** Write epoch state to LevelDB. */
     bool WriteEpochState(CTxDB& txdb, int nEpoch);

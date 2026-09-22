@@ -34,6 +34,7 @@ struct Recorder
     uint256 finalSourceState;
     bool hasInitialSourceState;
     uint256 initialSourceState;
+    uint64_t rootSerial;
     SHA256_CTX digest;
     std::vector<DagTipDeltaRecord> ram;
     boost::filesystem::path spillPath;
@@ -41,7 +42,8 @@ struct Recorder
     Recorder() : observer(NULL), context(NULL), active(false), invalid(false),
                  spilled(false), capacity(256), logical(0), depth(0),
                  origin(DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX), hasFinalSourceState(false),
-                 finalSourceState(0), hasInitialSourceState(false), initialSourceState(0) { SHA256_Init(&digest); }
+                 finalSourceState(0), hasInitialSourceState(false), initialSourceState(0),
+                 rootSerial(0) { SHA256_Init(&digest); }
 };
 
 Recorder g;
@@ -154,6 +156,7 @@ DagTipDeltaState GetDagTipDeltaState()
     s.ramCapacity = g.capacity;
     s.ramRecords = g.ram.size();
     s.logicalRecords = g.logical;
+    s.rootSerial = g.rootSerial;
     s.hasIntendedFinalSourceStateId = g.hasFinalSourceState;
     s.intendedFinalSourceStateId = g.finalSourceState;
     return s;
@@ -165,6 +168,7 @@ bool BeginDagTipDeltaTransaction(DagTipDeltaOrigin origin)
     // Joined scope: root owns origin, journal, and publication.
     if (g.active) { ++g.depth; return false; }
     ResetPending();
+    ++g.rootSerial;
     g.origin = origin;
     g.depth = 1;
     g.active = true;
@@ -271,4 +275,41 @@ void CommitDagTipDeltaTransaction()
 void DiscardDagTipDeltaTransaction()
 {
     ResetPending();
+}
+
+bool ForEachDagTipDeltaRecord(DagTipDeltaReadFn fn, void* context, std::string* error)
+{
+    if (error) error->clear();
+    if (!fn) { if (error) *error = "no visitor"; return false; }
+    if (!g.active) { if (error) *error = "no active journal"; return false; }
+    if (g.invalid) { if (error) *error = "journal invalid"; return false; }
+    // Spilled prefix first, then the bounded in-RAM tail: exact append order.
+    // Read-only: never consumes, resets, or latches journal state.
+    if (!g.spillPath.empty()) {
+        FILE* f = fopen(g.spillPath.string().c_str(), "rb");
+        if (!f) { if (error) *error = "spill open failed"; return false; }
+        unsigned char op = 0;
+        unsigned char bytes[32];
+        for (;;) {
+            size_t got = fread(&op, 1, 1, f);
+            if (got == 0) {
+                if (ferror(f)) { fclose(f); if (error) *error = "spill read error"; return false; }
+                break;
+            }
+            if (fread(bytes, 1, 32, f) != 32) { fclose(f); if (error) *error = "spill framing error"; return false; }
+            if (op != DagTipDeltaRecord::TIP_REMOVE && op != DagTipDeltaRecord::TIP_ADD) {
+                fclose(f); if (error) *error = "spill op error"; return false;
+            }
+            DagTipDeltaRecord r;
+            r.op = static_cast<DagTipDeltaRecord::Op>(op);
+            memcpy(r.hash.begin(), bytes, 32);
+            if (!fn(r, context)) { fclose(f); if (error) *error = "visitor aborted"; return false; }
+        }
+        const int closeResult = fclose(f);
+        if (closeResult != 0) { if (error) *error = "spill close error"; return false; }
+    }
+    for (size_t i = 0; i < g.ram.size(); ++i) {
+        if (!fn(g.ram[i], context)) { if (error) *error = "visitor aborted"; return false; }
+    }
+    return true;
 }

@@ -38,6 +38,7 @@
 #include "hooks.h"
 #include "dag.h"
 #include "dag_tips_delta.h"
+#include "dag_mutation_preview.h"
 #include "dag_tip_overlay_runtime.h"
 #include "dag_tip_frontier.h"
 #include "blockindex_authoritative_startup.h"
@@ -46,6 +47,7 @@
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
 #include <openssl/sha.h>
+#include <thread>
 #include <fstream>
 
 #include <boost/filesystem.hpp>
@@ -6951,5 +6953,706 @@ BOOST_AUTO_TEST_CASE(r2c2s_s4_f12_child_score_coherence)
     S4AssertCertsCoherent();
     BOOST_TEST_MESSAGE("S4_F12c divergent_childcount_repaired=1 certs_coherent=1");
 }
+
+
+// ===========================================================================
+// R2c.2s / S5 — owned transaction-scoped preview seam (Option B)
+// ===========================================================================
+// Coverage: internal-consumer receipt (ComputeEpochState / RebuildDAGOrder-
+// Incremental), complete committed pending prefix (staged-but-uncommitted
+// refused), nested reorg/prune sharing the single root ownership domain,
+// fail-closed matrix (wrong thread, stale nonce/token/generation, incomplete
+// prefix, health loss, abort invalidation, use-after-root), external callers
+// cannot reach the seam, boundedness (no global retained cache), nonresident
+// readability, Option-R value parity, lock-order compatibility, determinism.
+
+static bool S5HasPhase(const std::vector<std::string>& phases, const char* name)
+{
+    return std::find(phases.begin(), phases.end(), std::string(name)) != phases.end();
+}
+
+static bool S5CollectVisitor(const uint256& tip, void* ctx)
+{
+    static_cast<std::set<uint256>*>(ctx)->insert(tip);
+    return true;
+}
+
+struct S5Probe
+{
+    std::vector<std::string> phases;
+    std::map<std::string,int> status;
+    std::map<std::string,uint64_t> nonce;
+    std::map<std::string,size_t> tipCount;
+    std::map<std::string,int> resolveStatus;
+    std::map<std::string,bool> resolveFound;
+    std::map<std::string,uint256> resolveWinner;
+    std::map<std::string,const void*> ptr;
+    std::set<uint256> tipsAtAddCommitted;
+    std::set<uint256> tipsAtEnvelopeEnd;
+    uint64_t lastAddNonce;
+    int nestedNonceMatches;
+    uint64_t statsValidateAtFirstPhase;
+    bool sawFirstPhase;
+    uint256 candidateHash;
+    bool candidateRead;
+    int candStatus;
+    bool candRetained, candChildless, candHasFullField, candActive;
+    int candHeight;
+    uint256 candScore;
+    bool injectStaleTokenAtEnd, injectStaleGenAtEnd, healthLossArmed;
+    int statusAfterInjectToken, statusAfterInjectGen, statusAtHealthLoss;
+    bool healthRestoreOk;
+    bool doWrongThread; int wrongThreadStatus;
+    bool doExternalSelector; bool externalSelectorNonNull;
+    bool doLockedRead; int lockedReadStatus;
+    bool checkOldNonce; uint64_t oldNonceValue; bool oldNonceValid; bool oldNonceChecked;
+    S5Probe()
+        : lastAddNonce(0), nestedNonceMatches(0), statsValidateAtFirstPhase(0), sawFirstPhase(false),
+          candidateHash(0), candidateRead(false), candStatus(-2),
+          candRetained(false), candChildless(false), candHasFullField(false), candActive(false),
+          candHeight(-2), candScore(0),
+          injectStaleTokenAtEnd(false), injectStaleGenAtEnd(false), healthLossArmed(false),
+          statusAfterInjectToken(-2), statusAfterInjectGen(-2), statusAtHealthLoss(-2), healthRestoreOk(false),
+          doWrongThread(false), wrongThreadStatus(-2), doExternalSelector(false), externalSelectorNonNull(false),
+          doLockedRead(false), lockedReadStatus(-2),
+          checkOldNonce(false), oldNonceValue(0), oldNonceValid(false), oldNonceChecked(false) {}
+};
+
+static S5Probe* g_s5Probe = NULL;
+
+static void S5ProbeHook(const char* phase)
+{
+    S5Probe* pr = g_s5Probe;
+    if (!pr) return;
+    const std::string p(phase ? phase : "");
+    pr->phases.push_back(p);
+    if (!pr->sawFirstPhase)
+    {
+        pr->sawFirstPhase = true;
+        DagMutationPreview* pv0 = GetActiveDagMutationPreview();
+        if (pv0) pr->statsValidateAtFirstPhase = pv0->GetStats().validateCalls;
+    }
+    DagMutationPreview* pv = GetActiveDagMutationPreview();
+    pr->nonce[p] = pv ? pv->Nonce() : 0;
+    pr->ptr[p] = (const void*)pv;
+    if (!pv) { pr->status[p] = (int)DAG_MUTATION_PREVIEW_NO_ACTIVE_ROOT; return; }
+    std::string e;
+    pr->status[p] = (int)pv->Validate(&e);
+    {
+        std::set<uint256> tips; std::string te;
+        pv->ForEachCurrentTip(&S5CollectVisitor, &tips, &te);
+        pr->tipCount[p] = tips.size();
+        if (p == "add_source_committed") pr->tipsAtAddCommitted = tips;
+        if (p == "add_envelope_end") pr->tipsAtEnvelopeEnd = tips;
+    }
+    {
+        bool found = false; uint256 bh, bs; std::string re;
+        DagMutationPreviewStatus rs = pv->ResolveBestTip(&found, &bh, &bs, &re);
+        pr->resolveStatus[p] = (int)rs;
+        pr->resolveFound[p] = found;
+        pr->resolveWinner[p] = bh;
+    }
+    if (p == "add_source_committed")
+    {
+        pr->lastAddNonce = pv->Nonce();
+        if (pr->candidateHash != uint256(0))
+        {
+            DagMutationCandidateView v; std::string ce;
+            pr->candStatus = (int)pv->ReadCandidate(pr->candidateHash, &v, &ce);
+            pr->candRetained = v.retained; pr->candChildless = v.childless;
+            pr->candHasFullField = v.hasFullField; pr->candActive = v.active;
+            pr->candHeight = v.height; pr->candScore = v.nDAGScore;
+            pr->candidateRead = true;
+        }
+        if (pr->doWrongThread)
+        {
+            int st = -2;
+            std::thread t([&]() { std::string we; st = (int)pv->Validate(&we); });
+            t.join();
+            pr->wrongThreadStatus = st;
+        }
+        if (pr->doExternalSelector)
+        {
+            pr->externalSelectorNonNull = (g_dagManager.SelectBestDAGTip() != NULL);
+        }
+        if (pr->doLockedRead)
+        {
+            LOCK(g_dagManager.cs_dag);
+            std::string le;
+            pr->lockedReadStatus = (int)pv->Validate(&le);
+            std::set<uint256> tips; std::string te;
+            pv->ForEachCurrentTip(&S5CollectVisitor, &tips, &te);
+            bool found = false; uint256 bh, bs;
+            pv->ResolveBestTip(&found, &bh, &bs, &le);
+        }
+        if (pr->checkOldNonce && !pr->oldNonceChecked)
+        {
+            std::string oe;
+            pr->oldNonceValid = pv->ValidatePermitNonce(pr->oldNonceValue, &oe);
+            pr->oldNonceChecked = true;
+        }
+    }
+    if (p == "reorg_source_committed")
+    {
+        if (pr->lastAddNonce != 0 && pv->Nonce() == pr->lastAddNonce)
+            ++pr->nestedNonceMatches;
+    }
+    if (p == "add_envelope_end")
+    {
+        if (pr->healthLossArmed)
+        {
+            { CTxDB db; db.RevokeDAGChildCountForTest(); }
+            std::string he;
+            pr->statusAtHealthLoss = (int)pv->Validate(&he);
+            { CDataStream k(SER_DISK, CLIENT_VERSION);
+              k << std::make_pair(std::string("dagchildcountinvalid"), uint8_t(0));
+              S4RawDel(k.str()); }
+            { CTxDB db; std::string he2; pr->healthRestoreOk = db.IsDAGChildCountIndexHealthy(&he2); }
+        }
+        if (pr->injectStaleTokenAtEnd)
+        {
+            SetDagMutationPreviewCommittedTokenForTest(uint256(0xDEADBEEFu));
+            std::string te;
+            pr->statusAfterInjectToken = (int)pv->Validate(&te);
+        }
+        if (pr->injectStaleGenAtEnd)
+        {
+            uint64_t g = 0; pv->GetGeneration(&g);
+            SetDagMutationPreviewGenerationForTest(g + 1);
+            std::string ge;
+            pr->statusAfterInjectGen = (int)pv->Validate(&ge);
+        }
+    }
+}
+
+static void S5ArmProbe(S5Probe* probe)
+{
+    g_s5Probe = probe;
+    SetDagMutationPreviewPhaseHookForTest(&S5ProbeHook);
+    g_testS5ConsumerValidationsEpoch = 0;
+    g_testS5ConsumerValidationsReorder = 0;
+    g_testS5ConsumerValidationsOrder = 0;
+    g_testS5LastConsumerValidationStatus = -1;
+    g_testS5LastConsumerPreviewNonce = 0;
+    g_testS5LastConsumerPreviewPtr = NULL;
+    g_testS5NestedBorrowCalls = 0;
+}
+
+static void S5DisarmProbe()
+{
+    SetDagMutationPreviewPhaseHookForTest(NULL);
+    g_s5Probe = NULL;
+}
+
+// ---------------------------------------------------------------------------
+// S5-F1: internal consumer (ComputeEpochState) receipt + complete committed
+// pending prefix + nested prune sharing the root + use-after-root refusal +
+// stale nonce + determinism + boundedness.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s5_preview_epoch_consumer_and_complete_prefix)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+
+    // Act 0: real retained canvas to a real epoch end (legacy path).
+    CBlockIndex* p = pindexBest;
+    while (p->nHeight < GetForkHeightDAG()) p = MineReal(p, 0xA100 + p->nHeight);
+    const int epoch = GetEpochForHeight(p->nHeight);
+    const int epochEnd = GetEpochBoundaryHeight(epoch + 1, p->nHeight) - 1;
+    while (p->nHeight < epochEnd) p = MineRealDag(p, 0xA200 + p->nHeight);
+    BOOST_REQUIRE_EQUAL(p->nHeight, epochEnd);
+    const uint256 boundaryHash = p->GetBlockHash();
+
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("s5-preview-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_testForceDagPruneInAdd=false; g_testDagPruneDepth=0;
+            SetDagMutationPreviewPhaseHookForTest(NULL); g_s5Probe=NULL;
+            try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    g_testSuppressDagSourceAbort=true;
+
+    uint256 token0;
+    { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(token0)); }
+
+    S5Probe probe; S5ArmProbe(&probe);
+
+    // Act 1: epoch-crossing ADD (real ComputeEpochState consumer) + depth=1
+    // real crossing prune (nested within the same root envelope).
+    CBlockIndex* c=NULL;
+    { PruneSeamScope seams(1,false); c=MineRealDag(p,0xA301); }
+    BOOST_REQUIRE(c != NULL);
+    const uint256 cHash=c->GetBlockHash();
+    uint256 token1; { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(token1)); }
+    BOOST_CHECK(token1 != token0);
+
+    // Phase coverage.
+    BOOST_REQUIRE_MESSAGE(S5HasPhase(probe.phases,"add_staged_precommit"),"staged-precommit phase must fire");
+    BOOST_REQUIRE_MESSAGE(S5HasPhase(probe.phases,"add_source_committed"),"source-committed phase must fire");
+    BOOST_REQUIRE_MESSAGE(S5HasPhase(probe.phases,"prune_committed"),"prune-committed phase must fire");
+    BOOST_REQUIRE_MESSAGE(S5HasPhase(probe.phases,"add_envelope_end"),"envelope-end phase must fire");
+
+    // (1) The internal synchronous consumer (ComputeEpochState) obtained the
+    // correct transaction-relative preview and validated it fail-closed.
+    BOOST_CHECK_EQUAL(g_testS5ConsumerValidationsEpoch, 1);
+    BOOST_CHECK_EQUAL(g_testS5LastConsumerValidationStatus, (int)DAG_MUTATION_PREVIEW_OK);
+    BOOST_CHECK_MESSAGE(g_testS5LastConsumerPreviewPtr == probe.ptr["add_source_committed"],
+        "epoch consumer must receive the root envelope's own preview");
+    BOOST_CHECK_EQUAL(g_testS5LastConsumerPreviewNonce, probe.nonce["add_source_committed"]);
+
+    // (2) Preview sees the complete committed pending prefix, not partial state.
+    BOOST_CHECK_EQUAL(probe.status["add_staged_precommit"], (int)DAG_MUTATION_PREVIEW_INCOMPLETE_PREFIX);
+    BOOST_CHECK_EQUAL(probe.status["add_source_committed"], (int)DAG_MUTATION_PREVIEW_OK);
+    BOOST_CHECK_EQUAL(probe.status["prune_committed"], (int)DAG_MUTATION_PREVIEW_OK);
+    BOOST_CHECK_MESSAGE(probe.tipsAtAddCommitted.count(cHash) == 1,
+        "committed pending prefix must add the new block to the current frontier");
+    BOOST_CHECK_MESSAGE(probe.tipsAtAddCommitted.count(boundaryHash) == 0,
+        "the parent must no longer be a frontier member after the committed child");
+    // Boundedness: the view is bounded by base+pending, not by the >200-vertex
+    // retained canvas.
+    BOOST_CHECK_MESSAGE(probe.tipCount["add_envelope_end"] <= 8,
+        "frontier view must be bounded (base+pending), never history-sized");
+
+    // (3) Nested prune shares the root preview: same nonce, no independent scope.
+    BOOST_CHECK_EQUAL(probe.nonce["prune_committed"], probe.nonce["add_source_committed"]);
+    BOOST_CHECK_EQUAL(g_testS5NestedBorrowCalls, 0);
+
+    // Envelope end: the resolver sees the now-active new tip.
+    BOOST_CHECK_EQUAL(probe.status["add_envelope_end"], (int)DAG_MUTATION_PREVIEW_OK);
+    BOOST_CHECK(probe.resolveFound["add_envelope_end"]);
+    BOOST_CHECK(probe.resolveWinner["add_envelope_end"] == cHash);
+
+    // (5) Use-after-root: the captured permit refuses all reads after the root ends.
+    {
+        const DagMutationPreview* pv = (const DagMutationPreview*)probe.ptr["add_source_committed"];
+        BOOST_REQUIRE(pv != NULL);
+        std::string e;
+        BOOST_CHECK_EQUAL((int)pv->Validate(&e), (int)DAG_MUTATION_PREVIEW_NO_ACTIVE_ROOT);
+        std::set<uint256> tips; e.clear();
+        BOOST_CHECK_EQUAL((int)pv->ForEachCurrentTip(&S5CollectVisitor,&tips,&e), (int)DAG_MUTATION_PREVIEW_NO_ACTIVE_ROOT);
+        bool found=false; uint256 bh,bs; e.clear();
+        BOOST_CHECK_EQUAL((int)pv->ResolveBestTip(&found,&bh,&bs,&e), (int)DAG_MUTATION_PREVIEW_NO_ACTIVE_ROOT);
+        BOOST_CHECK(GetActiveDagMutationPreview() == NULL);
+    }
+    const uint64_t rootNonce = probe.nonce["add_source_committed"];
+
+    // (12) Determinism: a second identical-shape envelope produces identical
+    // shape observations; the first envelope's nonce is stale for the second.
+    S5Probe probe2;
+    probe2.checkOldNonce = true;
+    probe2.oldNonceValue = rootNonce;
+    S5ArmProbe(&probe2);
+    CBlockIndex* c2=NULL;
+    { PruneSeamScope seams(1,false); c2=MineRealDag(c,0xA302); }
+    BOOST_REQUIRE(c2 != NULL);
+    const uint256 c2Hash=c2->GetBlockHash();
+    BOOST_CHECK_MESSAGE(S5HasPhase(probe2.phases,"add_source_committed"),"second envelope source-committed phase must fire");
+    BOOST_CHECK_EQUAL(probe2.status["add_staged_precommit"], (int)DAG_MUTATION_PREVIEW_INCOMPLETE_PREFIX);
+    BOOST_CHECK_EQUAL(probe2.status["add_source_committed"], (int)DAG_MUTATION_PREVIEW_OK);
+    BOOST_CHECK_MESSAGE(probe2.tipsAtAddCommitted.count(c2Hash) == 1, "second envelope frontier must contain its new block");
+    BOOST_CHECK_MESSAGE(probe2.tipsAtAddCommitted.count(cHash) == 0, "previous tip must no longer be a frontier member");
+    BOOST_CHECK(probe2.resolveFound["add_envelope_end"]);
+    BOOST_CHECK(probe2.resolveWinner["add_envelope_end"] == c2Hash);
+    BOOST_CHECK(probe2.oldNonceChecked && !probe2.oldNonceValid);
+    BOOST_CHECK(probe2.nonce["add_source_committed"] != rootNonce);
+    BOOST_TEST_MESSAGE("S5_EPOCH pendingPrefixComplete=1 tipsBounded=1 nestedPruneShared=1 useAfterRoot=refused staleNonce=refused determinism=1");
+    S5DisarmProbe();
+}
+
+// ---------------------------------------------------------------------------
+// S5-F2: nested reorg inside a root ADD envelope borrows the single root
+// ownership domain; the reorder consumer receives the root preview; Option-R
+// boundary values served by the preview equal the canonical persisted values.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s5_preview_nested_reorg_borrow)
+{
+    SetMockTime(1700002400);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xB100+fork->nHeight);
+    fork=MineRealDag(fork,0xB110);
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("s5-nested-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_testForceDagPruneInAdd=false; g_testDagPruneDepth=0;
+            SetDagMutationPreviewPhaseHookForTest(NULL); g_s5Probe=NULL; SetMockTime(0);
+            try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+    g_testSuppressDagSourceAbort=true;
+
+    S5Probe probe; S5ArmProbe(&probe);
+
+    // Active branch with a forced prune whose line crosses the fork ancestry.
+    CBlockIndex* a1=AddSideDag(fork,0xB211);
+    CBlockIndex* active=a1;
+    for(unsigned i=0;i<5;++i) active=AddSideDag(active,0xB212+i);
+    { PruneSeamScope seams(1,true); active=AddSideDag(active,0xB218); }
+    CBlockIndex* a7=active;
+
+    // Side branch below the prune line; real ADDs until the nested reorg fires
+    // inside the winning ADD's envelope.
+    CBlockIndex* b1=AddSideDag(fork,0xB221);
+    CBlockIndex* branch=b1;
+    for(unsigned i=0;i<25 && pindexBest==a7;++i)
+    {
+        std::unique_ptr<CBlock> block(BuildPoWBlock(branch,0xB230+i));
+        BOOST_REQUIRE(block.get()!=NULL);
+        AttachDagParentsAndRemine(block.get(),std::vector<uint256>(1,branch->GetBlockHash()));
+        LOCK(cs_main); unsigned int file=0,pos=0;
+        BOOST_REQUIRE(block->WriteToDisk(file,pos));
+        const bool ok=block->AddToBlockIndex(file,pos,block->GetHash());
+        BOOST_REQUIRE_MESSAGE(ok,"reorg-firing ADD must succeed");
+        branch=mapBlockIndex[block->GetHash()]; BOOST_REQUIRE(branch!=NULL);
+    }
+    BOOST_REQUIRE_MESSAGE(pindexBest==branch,"reorg to the side branch must complete");
+    const uint256 branchHash=branch->GetBlockHash();
+    const uint256 b1Hash=b1->GetBlockHash();
+
+    // (3) Nested reorg borrowed the ROOT ownership: nonce identity at the
+    // nested commit + explicit borrow recorded + reorder consumer validated.
+    BOOST_REQUIRE_MESSAGE(S5HasPhase(probe.phases,"reorg_staged_precommit"),"nested reorg staging phase must fire");
+    BOOST_REQUIRE_MESSAGE(S5HasPhase(probe.phases,"reorg_source_committed"),"nested reorg commit phase must fire");
+    BOOST_CHECK_MESSAGE(probe.nestedNonceMatches >= 1,
+        "nested reorg must observe the same root preview nonce (single ownership domain)");
+    BOOST_CHECK_MESSAGE(g_testS5NestedBorrowCalls >= 1,"nested reorg must borrow the root preview");
+    BOOST_CHECK_MESSAGE(g_testS5ConsumerValidationsReorder >= 1,"reorder consumer must validate the root preview");
+    BOOST_CHECK_EQUAL(g_testS5LastConsumerValidationStatus, (int)DAG_MUTATION_PREVIEW_OK);
+    BOOST_CHECK_EQUAL(g_testS5LastConsumerPreviewNonce, probe.lastAddNonce);
+    BOOST_CHECK_EQUAL(probe.status["reorg_source_committed"], (int)DAG_MUTATION_PREVIEW_OK);
+    const int borrowsAtNested = g_testS5NestedBorrowCalls;
+
+    // (10) Option-R parity through the preview: the reconnected branch vertex
+    // b1 was colored through the erased-parent boundary closure; the preview
+    // must serve exactly the canonical persisted value (no recolor-on-read,
+    // no resident residue).
+    S5Probe probe3;
+    probe3.candidateHash = b1Hash;
+    S5ArmProbe(&probe3);
+    {
+        std::unique_ptr<CBlock> extra(BuildPoWBlock(branch,0xB260));
+        BOOST_REQUIRE(extra.get()!=NULL);
+        AttachDagParentsAndRemine(extra.get(),std::vector<uint256>(1,branch->GetBlockHash()));
+        LOCK(cs_main); unsigned int file=0,pos=0;
+        BOOST_REQUIRE(extra->WriteToDisk(file,pos));
+        BOOST_REQUIRE_MESSAGE(extra->AddToBlockIndex(file,pos,extra->GetHash()),"post-reorg ADD must succeed");
+    }
+    std::map<uint256,CBlockDAGData> persistedAfter;
+    { CTxDB db; BOOST_REQUIRE(db.IterateDAGLinks(persistedAfter)); }
+    BOOST_REQUIRE(persistedAfter.count(b1Hash));
+    BOOST_REQUIRE(persistedAfter.count(branchHash));
+    BOOST_CHECK(probe3.candidateRead);
+    BOOST_CHECK_EQUAL(probe3.candStatus, (int)DAG_MUTATION_PREVIEW_OK);
+    BOOST_CHECK_MESSAGE(probe3.candRetained, "b1 must be retained");
+    BOOST_CHECK_MESSAGE(!probe3.candChildless, "b1 has a child on the reconnected branch");
+    BOOST_CHECK_MESSAGE(probe3.candHasFullField, "b1 must carry a canonical full-field record");
+    BOOST_CHECK_MESSAGE(probe3.candActive, "b1 is on the post-reorg active chain");
+    BOOST_CHECK_MESSAGE(probe3.candScore == persistedAfter[b1Hash].nDAGScore,
+        "preview must serve the exact Option-R canonical persisted score");
+    BOOST_TEST_MESSAGE("S5_NESTED_REORG borrows="<<borrowsAtNested
+        <<" nestedNonceMatches="<<probe.nestedNonceMatches
+        <<" optionR_score_parity=1");
+    S5DisarmProbe();
+}
+
+// ---------------------------------------------------------------------------
+// S5-F3: fail-closed matrix: precommit failure, post-commit rollback, health
+// loss, wrong thread, stale token, stale generation, external callers, lock
+// order.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s5_preview_failure_matrix)
+{
+    SetMockTime(1700002500);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xC100+fork->nHeight);
+    fork=MineRealDag(fork,0xC110);
+    CBlockIndex* base=MineRealDag(fork,0xC111);
+
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("s5-matrix-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_testFailInitialDagLinksCommit=false;
+            g_testFailSetBestChainAfterDagInit=false; g_dagSourceUnhealthy=false;
+            SetDagMutationPreviewPhaseHookForTest(NULL); g_s5Probe=NULL; SetMockTime(0);
+            try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    g_testSuppressDagSourceAbort=true;
+
+    uint256 tokenBefore;
+    { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(tokenBefore)); }
+
+    // (a) Precommit failure: abort invalidates the created preview.
+    {
+        S5Probe probeA; S5ArmProbe(&probeA);
+        std::unique_ptr<CBlock> add(BuildPoWBlock(base,0xC120));
+        AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,base->GetBlockHash()));
+        unsigned int f=0,p=0;
+        g_testFailInitialDagLinksCommit=true;
+        bool added=false;
+        {
+            LOCK(cs_main); BOOST_REQUIRE(add->WriteToDisk(f,p));
+            added = add->AddToBlockIndex(f,p,add->GetHash());
+            g_testFailInitialDagLinksCommit=false;
+            g_testSuppressDagSourceAbort=false;
+        }
+        BOOST_CHECK_MESSAGE(!added,"precommit-failed ADD must not return success");
+        BOOST_CHECK(g_dagSourceUnhealthy);
+        g_dagSourceUnhealthy=false;
+        BOOST_REQUIRE_MESSAGE(S5HasPhase(probeA.phases,"add_staged_precommit"),"precommit phase must fire before the failed commit");
+        const DagMutationPreview* pv=(const DagMutationPreview*)probeA.ptr["add_staged_precommit"];
+        BOOST_REQUIRE(pv!=NULL);
+        std::string e;
+        BOOST_CHECK_MESSAGE(pv->Validate(&e)==DAG_MUTATION_PREVIEW_NO_ACTIVE_ROOT,
+            "abort after preview creation must invalidate all preview access");
+        BOOST_CHECK(GetActiveDagMutationPreview()==NULL);
+        S5DisarmProbe();
+    }
+    // (b) Post-source-commit failure: rollback invalidates; token restored.
+    {
+        S5Probe probeB; S5ArmProbe(&probeB);
+        std::unique_ptr<CBlock> add(BuildPoWBlock(base,0xC130));
+        AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,base->GetBlockHash()));
+        unsigned int f=0,p=0;
+        g_testFailSetBestChainAfterDagInit=true;
+        bool added=false;
+        {
+            LOCK(cs_main); BOOST_REQUIRE(add->WriteToDisk(f,p));
+            added = add->AddToBlockIndex(f,p,add->GetHash());
+            g_testFailSetBestChainAfterDagInit=false;
+            g_testSuppressDagSourceAbort=false;
+        }
+        BOOST_CHECK_MESSAGE(!added,"post-commit-failed ADD must not return success");
+        {
+            // The rollback path restores the pre-operation source instead of
+            // aborting the node; the failed block must not be externally
+            // published and the old token must be re-bound (checked below).
+            BlockIndexSnapshot post; std::string pe;
+            BOOST_CHECK_MESSAGE(ResolveAuthoritativeBlockSnapshotR(add->GetHash(),&post,&pe)!=AUTHORITATIVE_BLOCK_FOUND,
+                "failed ADD block must not be published");
+        }
+        BOOST_REQUIRE_MESSAGE(S5HasPhase(probeB.phases,"add_source_committed"),"post-commit phase must have fired");
+        BOOST_CHECK_EQUAL(probeB.status["add_source_committed"],(int)DAG_MUTATION_PREVIEW_OK);
+        const DagMutationPreview* pv=(const DagMutationPreview*)probeB.ptr["add_source_committed"];
+        BOOST_REQUIRE(pv!=NULL);
+        std::string e;
+        BOOST_CHECK_MESSAGE(pv->Validate(&e)==DAG_MUTATION_PREVIEW_NO_ACTIVE_ROOT,
+            "rollback must invalidate the preview");
+        uint256 tokenAfter;
+        { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(tokenAfter)); }
+        BOOST_CHECK_MESSAGE(tokenAfter==tokenBefore,"rollback must restore the exact pre-operation token");
+        S5DisarmProbe();
+    }
+    // (c) Successful ADD with the adversarial matrix armed at safe points.
+    {
+        S5Probe probeC;
+        probeC.doWrongThread = true;
+        probeC.doExternalSelector = true;
+        probeC.doLockedRead = true;
+        probeC.healthLossArmed = true;
+        probeC.injectStaleTokenAtEnd = true;
+        probeC.injectStaleGenAtEnd = true;
+        S5ArmProbe(&probeC);
+        std::unique_ptr<CBlock> add(BuildPoWBlock(base,0xC140));
+        AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,base->GetBlockHash()));
+        unsigned int f=0,p=0;
+        bool added=false;
+        {
+            LOCK(cs_main); BOOST_REQUIRE(add->WriteToDisk(f,p));
+            added = add->AddToBlockIndex(f,p,add->GetHash());
+        }
+        BOOST_REQUIRE_MESSAGE(added,"matrix ADD must succeed");
+        BOOST_CHECK_EQUAL(probeC.status["add_source_committed"],(int)DAG_MUTATION_PREVIEW_OK);
+        // (4) wrong-thread use fails closed.
+        BOOST_CHECK_EQUAL(probeC.wrongThreadStatus,(int)DAG_MUTATION_PREVIEW_WRONG_THREAD);
+        // (7) external callers keep legacy behavior; the seam is not reachable.
+        BOOST_CHECK(probeC.externalSelectorNonNull);
+        {
+            std::string le;
+            BOOST_CHECK_EQUAL((int)ValidateDagMutationPreviewForConsumer(NULL,DAG_MUTATION_PREVIEW_CONSUMER_EPOCH,&le),
+                (int)DAG_MUTATION_PREVIEW_OK);
+        }
+        // (11) lock order: preview reads under cs_dag (consumer context) succeed.
+        BOOST_CHECK_EQUAL(probeC.lockedReadStatus,(int)DAG_MUTATION_PREVIEW_OK);
+        // Health loss refuses reads fail-closed; restored health verified.
+        BOOST_CHECK_EQUAL(probeC.statusAtHealthLoss,(int)DAG_MUTATION_PREVIEW_SOURCE_UNHEALTHY);
+        BOOST_CHECK(probeC.healthRestoreOk);
+        // (5) stale token / stale generation refuse.
+        BOOST_CHECK_EQUAL(probeC.statusAfterInjectToken,(int)DAG_MUTATION_PREVIEW_STALE_TOKEN);
+        BOOST_CHECK_EQUAL(probeC.statusAfterInjectGen,(int)DAG_MUTATION_PREVIEW_GENERATION_MISMATCH);
+        // After the envelope: no preview remains.
+        const DagMutationPreview* pv=(const DagMutationPreview*)probeC.ptr["add_source_committed"];
+        BOOST_REQUIRE(pv!=NULL);
+        std::string e;
+        BOOST_CHECK_EQUAL((int)pv->Validate(&e),(int)DAG_MUTATION_PREVIEW_NO_ACTIVE_ROOT);
+        BOOST_TEST_MESSAGE("S5_MATRIX precommitAbort=1 postcommitRollback=1 wrongThread="<<probeC.wrongThreadStatus
+            <<" staleToken="<<probeC.statusAfterInjectToken<<" staleGen="<<probeC.statusAfterInjectGen
+            <<" healthLoss="<<probeC.statusAtHealthLoss<<" lockOrder="<<probeC.lockedReadStatus
+            <<" externalLegacy=1");
+        S5DisarmProbe();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S5-F4: nonresident retained vertices remain readable through authoritative
+// bounded mechanisms; no global retained cache (stats reset per envelope).
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s5_preview_nonresident_and_bounded_state)
+{
+    SetMockTime(1700002600);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xD100+fork->nHeight);
+    fork=MineRealDag(fork,0xD110);
+    CBlockIndex* mid=MineRealDag(fork,0xD111);
+    CBlockIndex* base=MineRealDag(mid,0xD112);
+    const uint256 midHash=mid->GetBlockHash();
+
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("s5-nonres-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false;
+            SetDagMutationPreviewPhaseHookForTest(NULL); g_s5Probe=NULL; SetMockTime(0);
+            try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    g_testSuppressDagSourceAbort=true;
+
+    // Evict a retained mid-chain vertex from the RESIDENT legacy manager only;
+    // the canonical persisted source stays intact.
+    g_dagManager.RemoveBlockDAGData(midHash);
+    BOOST_CHECK(!g_dagManager.HasDAGData(midHash));
+    {
+        CBlockDAGData persistedMid;
+        CTxDB db; BOOST_REQUIRE_MESSAGE(db.ReadDAGLinks(midHash,persistedMid),"canonical source intact despite eviction");
+    }
+
+    S5Probe probe;
+    probe.candidateHash = midHash;
+    S5ArmProbe(&probe);
+    std::unique_ptr<CBlock> add(BuildPoWBlock(base,0xD120));
+    AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,base->GetBlockHash()));
+    unsigned int f=0,p=0;
+    bool added=false;
+    {
+        LOCK(cs_main); BOOST_REQUIRE(add->WriteToDisk(f,p));
+        added = add->AddToBlockIndex(f,p,add->GetHash());
+    }
+    BOOST_REQUIRE_MESSAGE(added,"ADD must succeed");
+
+    // (9) Nonresident retained vertex readable through authoritative mechanisms.
+    BOOST_CHECK(probe.candidateRead);
+    BOOST_CHECK_EQUAL(probe.candStatus,(int)DAG_MUTATION_PREVIEW_OK);
+    BOOST_CHECK_MESSAGE(probe.candRetained,"evicted vertex must remain retained via authoritative reads");
+    BOOST_CHECK_MESSAGE(!probe.candChildless,"mid-chain vertex has children");
+    BOOST_CHECK_MESSAGE(probe.candHasFullField,"full-field must be present");
+    BOOST_CHECK_MESSAGE(probe.candActive,"mid-chain vertex is on the active chain");
+    BOOST_CHECK_EQUAL(probe.candHeight,mid->nHeight);
+    {
+        // Post-envelope canonical read: no further source writes after the
+        // envelope, so the value observed by the preview must equal it exactly.
+        CBlockDAGData persistedMidAfter;
+        CTxDB db; BOOST_REQUIRE(db.ReadDAGLinks(midHash,persistedMidAfter));
+        BOOST_CHECK_MESSAGE(probe.candScore==persistedMidAfter.nDAGScore,"preview must serve the exact persisted score");
+    }
+
+    // (8) No global retained cache: per-envelope stats reset; bounded counters.
+    const DagMutationPreview* pv=(const DagMutationPreview*)probe.ptr["add_source_committed"];
+    BOOST_REQUIRE(pv!=NULL);
+    const uint64_t v1 = pv->GetStats().validateCalls;
+    BOOST_CHECK_MESSAGE(v1 >= 3, "first envelope must have accumulated validation calls");
+    S5Probe probe2;
+    S5ArmProbe(&probe2);
+    std::unique_ptr<CBlock> add2(BuildPoWBlock(mapBlockIndex[add->GetHash()],0xD130));
+    AttachDagParentsAndRemine(add2.get(),std::vector<uint256>(1,add->GetHash()));
+    bool added2=false;
+    {
+        LOCK(cs_main); BOOST_REQUIRE(add2->WriteToDisk(f,p));
+        added2 = add2->AddToBlockIndex(f,p,add2->GetHash());
+    }
+    BOOST_REQUIRE_MESSAGE(added2,"second ADD must succeed");
+    BOOST_CHECK_MESSAGE(probe2.statsValidateAtFirstPhase <= 4 && probe2.statsValidateAtFirstPhase < v1,
+        "preview stats must reset per envelope (no accumulation across mutations)");
+    BOOST_CHECK_MESSAGE(probe2.tipCount["add_envelope_end"] <= 8,
+        "frontier view must stay bounded by base+pending");
+    BOOST_TEST_MESSAGE("S5_NONRESIDENT nonresidentRead=1 scoreParity=1 statsReset=1 bounded=1");
+    S5DisarmProbe();
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()
