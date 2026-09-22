@@ -88,6 +88,7 @@ extern int g_testDagDeltaDeliveredEvents;
 extern int g_testDagDeltaLastDeliveredKind;
 extern int g_testDagDeltaLastDeliveredOrigin;
 extern uint256 GetBlockEntropy(const uint256& hashValue);
+extern bool g_testFailDAGChildCountRebuild; // S4-F12 child-count untrusted refusal
 
 // Production runtime/consumer, real mutable txleveldb, disposable overlay only.
 // Full scans here are test setup/oracles, NEVER ordinary mutation delivery.
@@ -433,6 +434,11 @@ struct CounterfactualOracle
         return out;
     }
 };
+
+// Raw persisted-marker helpers (definitions in the S4 section; declared here for
+// earlier fixtures that must establish explicit persisted pre-states).
+static std::string S4MarkerKey();
+static void S4RawDel(const std::string& key);
 
 
 // A+B: genuinely-valid mined blocks through the real consensus path ACCEPT and
@@ -5531,6 +5537,12 @@ BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_prune_rollback_setbestchain_failure)
     auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
     g_testSuppressDagSourceAbort=true;
 
+    // S4: authoritative startup now certifies the score authority at Init (the
+    // S4 reconcile). The original "never certified in this session" precondition
+    // is established explicitly here so this fixture still exercises exact
+    // absence restore + the no-fabrication guarantee under the S4 contract.
+    S4RawDel(S4MarkerKey());
+
     // ---- Case 0: pre-state NEVER CERTIFIED (both markers absent) - the
     // rollback must restore exact absence, never fabricate a certificate.
     {
@@ -5991,4 +6003,953 @@ BOOST_AUTO_TEST_CASE(r2c2s_s12_postponed_reconnect_txdb_lifetime)
     BOOST_TEST_MESSAGE("S12_DONE postponed="<<g_testS12LastPostponed<<" chain=b3 tokenAdvanced=1"
         <<" closeDuringOp="<<(g_testS12SeenCloseCount-preClose)<<" stale=0");
 }
+
+// =========================================================================
+// S4 — startup/migration authoritative score reconcile e2e fixtures.
+// Each fixture is run standalone (fresh process: TestingSetup provides a fresh
+// datadir; the fixture builds its own window2 world, snapshot + generation).
+// =========================================================================
+
+// Re-expose protected raw access for test seeding/inspection.
+struct S4Readback : CTxDB
+{
+    explicit S4Readback(const char* mode="r+") : CTxDB(mode) {}
+    using CTxDB::Read;
+    using CTxDB::Write;
+    using CTxDB::Erase;
+};
+
+// Full raw key/value snapshot of the shared source db.
+static std::map<std::string,std::string> S4RawKV()
+{
+    CTxDB db; std::map<std::string,std::string> raw;
+    std::unique_ptr<leveldb::Iterator> it(db.GetInstance()->NewIterator(leveldb::ReadOptions()));
+    for (it->SeekToFirst(); it->Valid(); it->Next()) raw[it->key().ToString()]=it->value().ToString();
+    BOOST_REQUIRE(it->status().ok());
+    return raw;
+}
+
+// Source-scoped fingerprint: daglinks + child counts + all markers + token.
+static std::string S4SourceFingerprint(const std::map<std::string,std::string>& raw)
+{
+    static const char* prefixes[] = {"daglinks","dagchildcount","dagchildcountstate",
+                                     "dagscorestate","dagscoreinvalid","dagsourcestate"};
+    std::vector<std::pair<std::string,std::string> > subset;
+    for (std::map<std::string,std::string>::const_iterator it=raw.begin();it!=raw.end();++it)
+        for (size_t p=0;p<sizeof(prefixes)/sizeof(prefixes[0]);++p)
+        {
+            CDataStream ps(SER_DISK,CLIENT_VERSION); ps<<std::string(prefixes[p]);
+            const std::string pre=ps.str();
+            if (it->first.size()>=pre.size() && memcmp(it->first.data(),pre.data(),pre.size())==0)
+            { subset.push_back(*it); break; }
+        }
+    SHA256_CTX ctx; SHA256_Init(&ctx);
+    for (size_t i=0;i<subset.size();++i)
+    { SHA256_Update(&ctx,subset[i].first.data(),subset[i].first.size());
+      SHA256_Update(&ctx,subset[i].second.data(),subset[i].second.size()); }
+    unsigned char d[SHA256_DIGEST_LENGTH]; SHA256_Final(d,&ctx);
+    return HexStr(std::vector<unsigned char>(d,d+SHA256_DIGEST_LENGTH));
+}
+
+// Score-authority-scoped fingerprint (score marker + poison + source token).
+// Used where a child-count refusal may legitimately leave child-count poison.
+static std::string S4ScoreAuthorityFingerprint(const std::map<std::string,std::string>& raw)
+{
+    static const char* prefixes[] = {"dagscorestate","dagscoreinvalid","dagsourcestate"};
+    std::vector<std::pair<std::string,std::string> > subset;
+    for (std::map<std::string,std::string>::const_iterator it=raw.begin();it!=raw.end();++it)
+        for (size_t p=0;p<sizeof(prefixes)/sizeof(prefixes[0]);++p)
+        {
+            CDataStream ps(SER_DISK,CLIENT_VERSION); ps<<std::string(prefixes[p]);
+            const std::string pre=ps.str();
+            if (it->first.size()>=pre.size() && memcmp(it->first.data(),pre.data(),pre.size())==0)
+            { subset.push_back(*it); break; }
+        }
+    SHA256_CTX ctx; SHA256_Init(&ctx);
+    for (size_t i=0;i<subset.size();++i)
+    { SHA256_Update(&ctx,subset[i].first.data(),subset[i].first.size());
+      SHA256_Update(&ctx,subset[i].second.data(),subset[i].second.size()); }
+    unsigned char d[SHA256_DIGEST_LENGTH]; SHA256_Final(d,&ctx);
+    return HexStr(std::vector<unsigned char>(d,d+SHA256_DIGEST_LENGTH));
+}
+
+static std::string S4MarkerKey()
+{
+    CDataStream k(SER_DISK,CLIENT_VERSION);
+    k << std::make_pair(std::string("dagscorestate"), uint8_t(0));
+    return k.str();
+}
+static std::string S4EncPair(uint32_t version, const uint256& token)
+{
+    CDataStream v(SER_DISK,CLIENT_VERSION); v << std::make_pair(version,token); return v.str();
+}
+static void S4RawPut(const std::string& key, const std::string& value)
+{
+    CTxDB db; BOOST_REQUIRE(db.GetInstance()->Put(leveldb::WriteOptions(),key,value).ok());
+}
+static void S4RawDel(const std::string& key)
+{
+    CTxDB db; BOOST_REQUIRE(db.GetInstance()->Delete(leveldb::WriteOptions(),key).ok());
+}
+static bool S4CertState(bool* present, std::string* raw, bool* revoked)
+{
+    CTxDB db; std::string e;
+    return db.CaptureDAGScoreCertificateState(present,raw,revoked,&e);
+}
+static uint256 S4Token()
+{
+    CTxDB db; uint256 t; BOOST_REQUIRE(db.ReadDAGSourceStateId(t)); return t;
+}
+// Audit extension (independent freeze audit): exact raw write-set verification.
+static std::string S4DaglinksKey(const uint256& hash)
+{
+    CDataStream k(SER_DISK,CLIENT_VERSION); k << std::make_pair(std::string("daglinks"),hash);
+    return k.str();
+}
+static std::string S4TokenKey()
+{
+    CDataStream k(SER_DISK,CLIENT_VERSION); k << std::make_pair(std::string("dagsourcestate"),uint8_t(0));
+    return k.str();
+}
+static std::vector<std::string> S4RawDiffKeys(const std::map<std::string,std::string>& before,
+                                              const std::map<std::string,std::string>& after)
+{
+    std::vector<std::string> out;
+    for (std::map<std::string,std::string>::const_iterator it=before.begin();it!=before.end();++it)
+    {
+        std::map<std::string,std::string>::const_iterator a=after.find(it->first);
+        if (a==after.end() || a->second!=it->second) out.push_back(it->first);
+    }
+    for (std::map<std::string,std::string>::const_iterator it=after.begin();it!=after.end();++it)
+        if (!before.count(it->first)) out.push_back(it->first);
+    std::sort(out.begin(),out.end());
+    return out;
+}
+static bool S4SameKeySet(std::vector<std::string> got, std::vector<std::string> expected)
+{
+    std::sort(got.begin(),got.end()); std::sort(expected.begin(),expected.end());
+    return got==expected;
+}
+
+struct S4FullField { uint256 nDAGScore; bool fBlue; int nInferredK; };
+
+// Test-only seam state used by the S4 fixtures (declared before S4Cleanup,
+// which resets it).
+static int g_s4FailBarrier=0;
+static bool g_s4TokenInjectArmed=false;
+static bool g_s4BoundaryProbeArmed=false;
+static bool g_s4BoundaryScoreHealthy=false;
+static bool g_s4BoundaryRuntime=false;
+
+static bool S4BarrierHook(int barrier,std::string* err)
+{
+    if (g_s4FailBarrier==barrier) { if(err) *err="S4 injected barrier failure"; return false; }
+    if (barrier==5 && g_s4TokenInjectArmed)
+    {
+        // Audit extension: raw-write a DIFFERENT source token while the
+        // reconcile batch is open. The production pre-commit token re-read must
+        // detect the divergence and discard the batch; the injected write is
+        // restored by the case afterwards.
+        CTxDB db("+w");
+        CDataStream k(SER_DISK,CLIENT_VERSION); k << std::make_pair(std::string("dagsourcestate"),uint8_t(0));
+        CDataStream v(SER_DISK,CLIENT_VERSION); v << uint256(0xBEEF);
+        if (!db.GetInstance()->Put(leveldb::WriteOptions(),k.str(),v.str()).ok())
+        { if(err) *err="token inject failed"; return false; }
+    }
+    return true;
+}
+static void S4BoundaryProbe()
+{
+    if(!g_s4BoundaryProbeArmed) return;
+    CTxDB db("r"); std::string e;
+    g_s4BoundaryScoreHealthy=db.IsDAGScoreAuthorityHealthy(&e);
+    g_s4BoundaryRuntime=HasDagTipOverlayRuntimeForTest();
+}
+static void S4BoundaryRevokeScore()
+{
+    CTxDB db("+w");
+    db.RevokeDAGScoreAuthorityForTest();
+}
+
+// Resident oracle: post-mining resident full-field for every DAG-era PoW block
+// (S2-accepted parity: resident post-recolor == canonical for these worlds).
+static std::map<uint256,S4FullField> S4CaptureResidentOracle(
+    std::vector<std::pair<int32_t,uint256> >* scopeOut)
+{
+    std::map<uint256,S4FullField> out;
+    size_t total=0, dagEraPow=0, withData=0;
+    LOCK(cs_main);
+    { LOCK(g_dagManager.cs_dag);
+      for (std::map<uint256,CBlockIndex*>::const_iterator it=mapBlockIndex.begin();it!=mapBlockIndex.end();++it)
+      {
+          CBlockIndex* pi=it->second; if(!pi) continue;
+          ++total;
+          if (pi->nHeight<GetForkHeightDAG() || !pi->IsProofOfWork()) continue;
+          ++dagEraPow;
+          CBlockDAGData dd;
+          if (!g_dagManager.GetDAGData(it->first,dd))
+          { // Not a canvas member: DAG-era blocks without DAG metadata (no DAG
+            // parents in the coinbase) have neither resident data nor daglinks.
+            BOOST_TEST_MESSAGE("S4 oracle: skipping DAG-era block without resident DAG data h="<<pi->nHeight<<" "<<it->first.GetHex().substr(0,12));
+            continue; }
+          ++withData;
+          S4FullField f; f.nDAGScore=dd.nDAGScore; f.fBlue=dd.fBlue; f.nInferredK=dd.nInferredK;
+          out[it->first]=f;
+          scopeOut->push_back(std::make_pair((int32_t)pi->nHeight,it->first));
+      }
+    }
+    BOOST_TEST_MESSAGE("S4 oracle scan: mapBlockIndex="<<total<<" dag_era_pow="<<dagEraPow<<" with_resident_data="<<withData);
+    std::sort(scopeOut->begin(),scopeOut->end());
+    return out;
+}
+
+// Compare persisted authoritative full-field against the oracle for the scope.
+static size_t S4ComparePersistedToOracle(const std::map<uint256,S4FullField>& oracle, size_t* checked)
+{
+    size_t mismatch=0; *checked=0;
+    for (std::map<uint256,S4FullField>::const_iterator it=oracle.begin();it!=oracle.end();++it)
+    {
+        CTxDB db; CBlockDAGData data;
+        BOOST_REQUIRE_MESSAGE(db.ReadDAGLinks(it->first,data),"persisted record missing for "+it->first.GetHex());
+        ++*checked;
+        if (data.nDAGScore!=it->second.nDAGScore || data.fBlue!=it->second.fBlue ||
+            data.nInferredK!=it->second.nInferredK) ++mismatch;
+    }
+    return mismatch;
+}
+
+// Corrupt persisted full-field (all three fields) for one retained vertex.
+static void S4CorruptPersistedFullField(const uint256& hash, unsigned int salt)
+{
+    S4Readback db; CBlockDAGData data;
+    BOOST_REQUIRE_MESSAGE(db.ReadDAGLinks(hash,data),"corrupt target not persisted");
+    data.nDAGScore = data.nDAGScore ^ uint256(salt);
+    data.fBlue = !data.fBlue;
+    data.nInferredK = data.nInferredK + (int)salt;
+    CDataStream k(SER_DISK,CLIENT_VERSION); k << std::make_pair(std::string("daglinks"),hash);
+    CDataStream v(SER_DISK,CLIENT_VERSION); v << data;
+    S4RawPut(k.str(),v.str());
+}
+
+// Both certificates must bind to the SAME current token after any S4 success.
+static void S4AssertCertsCoherent()
+{
+    S4Readback db; uint256 t;
+    BOOST_REQUIRE(db.ReadDAGSourceStateId(t));
+    std::pair<uint32_t,uint256> cc,sc;
+    BOOST_REQUIRE(db.Read(std::make_pair(std::string("dagchildcountstate"),uint8_t(0)),cc));
+    BOOST_REQUIRE(db.Read(std::make_pair(std::string("dagscorestate"),uint8_t(0)),sc));
+    BOOST_CHECK_EQUAL(cc.first,1u);
+    BOOST_CHECK_EQUAL(sc.first,1u);
+    BOOST_CHECK_MESSAGE(cc.second==t,"child-count cert token divergence");
+    BOOST_CHECK_MESSAGE(sc.second==t,"score cert token divergence");
+}
+
+// Token-stability discriminator: SourceStateId may only advance with physical
+// canonical source mutation (ADD/Reorganize/PRUNE); startup reconcile must not.
+static void S4AssertTokenUnchanged(const uint256& expected, const char* tag)
+{
+    CTxDB db; uint256 cur;
+    BOOST_REQUIRE_MESSAGE(db.ReadDAGSourceStateId(cur), std::string(tag)+": source token unreadable");
+    BOOST_CHECK_MESSAGE(cur==expected, std::string(tag)+": source token must not advance");
+}
+
+// World prologue: real world (fork + one DAG block), snapshot, generation.
+struct S4World
+{
+    fs::path root; CBlockIndex* fork;
+    explicit S4World(const char* tag)
+    {
+        SetMockTime(1700001500);
+        BOOST_REQUIRE(CZKContext::Initialize());
+        if (!hooks) hooks=InitHook();
+        fork=pindexBest;
+        while (fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xE000+fork->nHeight);
+        fork=MineRealDag(fork,0xE0F0);
+        root=fs::temp_directory_path()/fs::unique_path(tag);
+        fs::create_directories(root/"snapshot");
+    }
+    void SnapshotAndBuild(std::string* aerr)
+    {
+        { CTxDB db; db.Close(); }
+        const auto liveDir=GetDataDir()/"txleveldb";
+        for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+            if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+        BlockIndexGenerationSource src;
+        BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,aerr),*aerr);
+        BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,aerr),*aerr);
+        src.foundDAGLinks=true;
+        src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+        BlockIndexGenerationBuilder ab;
+        BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,aerr),*aerr); ab.Close();
+        BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,aerr),BLOCK_INDEX_LIFECYCLE_OK);
+        BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    }
+};
+
+struct S4Cleanup
+{
+    fs::path root; CBlockIndex* best; CBlockIndex* genesis; std::set<uint256> invalidPre;
+    S4Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock),invalidPre(setInvalidBlockHash){}
+    ~S4Cleanup()
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        SetDagObserverBoundaryHookForTest(NULL);
+        SetS4ReconcileBarrierHookForTest(NULL);
+        g_testFailS4ReconcileCommit=false;
+        g_s4FailBarrier=0;
+        pindexBest=best; pindexGenesisBlock=genesis;
+        if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+        setInvalidBlockHash=invalidPre;
+        { CTxDB db; db.WriteInvalidBlockSet(setInvalidBlockHash); }
+        SetMockTime(0); try{fs::remove_all(root);}catch(...){}
+    }
+};
+
+// F1 — healthy fast start: already-healthy S3-written authority must be a
+// strict no-op (zero source writes, zero token/cert churn) and still register.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f1_healthy_fast_start)
+{
+    S4World w("s4-f1-%%%%-%%%%"); std::string aerr;
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    uint256 t0=S4Token();
+    { CTxDB db; std::string e; BOOST_REQUIRE_MESSAGE(db.PublishDAGScoreCertificateAtomic(&e),"arm healthy cert: "+e); }
+    const std::map<std::string,std::string> rawBefore=S4RawKV();
+    const std::string fpBefore=S4SourceFingerprint(rawBefore);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    BOOST_CHECK(HasDagTipOverlayRuntimeForTest());
+    S4ReconcileStats st;
+    BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+    BOOST_CHECK_MESSAGE(st.healthyFastPath,"F1: expected healthy fast path");
+    BOOST_CHECK(!st.reconciled);
+    const std::map<std::string,std::string> rawAfter=S4RawKV();
+    BOOST_CHECK_EQUAL(S4SourceFingerprint(rawAfter),fpBefore);
+    BOOST_TEST_MESSAGE("S4_F1 fast_path="<<(st.healthyFastPath?1:0)<<" reconciled="<<(st.reconciled?1:0)
+        <<" source_fp_same="<<(S4SourceFingerprint(rawAfter)==fpBefore?1:0)
+        <<" full_raw_same="<<(rawAfter==rawBefore?1:0));
+    { CTxDB db; std::string e; uint256 t1;
+      BOOST_REQUIRE(db.ReadDAGSourceStateId(t1)); BOOST_CHECK(t1==t0);
+      BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&e),e);
+      BOOST_REQUIRE_MESSAGE(db.IsDAGChildCountIndexHealthy(&e),e); }
+    S4AssertCertsCoherent();
+}
+
+// F2 — absent score cert migration: reconcile before runtime registration;
+// second restart becomes a no-op.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f2_absent_score_cert_migration)
+{
+    S4World w("s4-f2-%%%%-%%%%"); std::string aerr;
+    // Resident oracle BEFORE the generation build: BlockIndexGenerationBuilder
+    // clears resident DAG state by design (simulating restart).
+    std::vector<std::pair<int32_t,uint256> > scope;
+    const std::map<uint256,S4FullField> oracle=S4CaptureResidentOracle(&scope);
+    BOOST_REQUIRE(!scope.empty());
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    uint256 t0=S4Token();
+    S4RawDel(S4MarkerKey()); // absent
+    const std::map<std::string,std::string> rawBefore=S4RawKV();
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    S4ReconcileStats st;
+    BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+    BOOST_CHECK_MESSAGE(st.reconciled && st.preState=="absent","F2: expected absent reconcile");
+    BOOST_CHECK_EQUAL(st.scopeVertices,scope.size());
+    size_t checked=0; const size_t mm=S4ComparePersistedToOracle(oracle,&checked);
+    BOOST_CHECK_EQUAL(mm,0u);
+    { CTxDB db; std::string e;
+      BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&e),e);
+      uint256 t1; BOOST_REQUIRE(db.ReadDAGSourceStateId(t1));
+      BOOST_CHECK_MESSAGE(t1==t0,"reconcile must not advance the source token"); }
+    S4AssertCertsCoherent();
+    // Only changed daglinks records + the score marker may have changed.
+    const std::map<std::string,std::string> rawAfter=S4RawKV();
+    size_t diffKeys=0; bool onlyAllowed=true;
+    for (std::map<std::string,std::string>::const_iterator it=rawAfter.begin();it!=rawAfter.end();++it)
+    { std::map<std::string,std::string>::const_iterator b=rawBefore.find(it->first);
+      if (b==rawBefore.end() || b->second!=it->second)
+      { ++diffKeys; if (it->first!=S4MarkerKey() && it->first.compare(0,9,"daglinks")!=0) onlyAllowed=false; } }
+    BOOST_CHECK_MESSAGE(onlyAllowed,"F2: unexpected non-source/non-daglinks write during reconcile");
+    BOOST_TEST_MESSAGE("S4_F2 reconciled=1 scope="<<st.scopeVertices<<" changed="<<st.changedFullFields
+        <<" written="<<st.recordsWritten<<" oracle_checked="<<checked<<" mismatch="<<mm
+        <<" diff_keys="<<diffKeys);
+    // Second restart: no-op fast path.
+    const std::string fpAfter=S4SourceFingerprint(rawAfter);
+    ResetBlockIndexAuthoritativeStartupForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    S4ReconcileStats st2;
+    BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st2));
+    BOOST_CHECK_MESSAGE(st2.healthyFastPath,"F2: second restart must be a no-op");
+    BOOST_CHECK_EQUAL(S4SourceFingerprint(S4RawKV()),fpAfter);
+    BOOST_TEST_MESSAGE("S4_F2 second_restart_fast_path="<<(st2.healthyFastPath?1:0));
+}
+
+// F3 — stale score cert: never expose runtime with a stale marker; reconcile
+// binds the cert to the CURRENT token (no token advance).
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f3_stale_score_cert)
+{
+    S4World w("s4-f3-%%%%-%%%%"); std::string aerr;
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    uint256 t0=S4Token();
+    uint256 fake; BOOST_REQUIRE(CTxDB().MintDAGSourceStateId(fake));
+    S4RawPut(S4MarkerKey(),S4EncPair(1,fake)); // stale: bound to a different token
+    g_s4BoundaryProbeArmed=true;
+    SetDagObserverBoundaryHookForTest(&S4BoundaryProbe);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    g_s4BoundaryProbeArmed=false;
+    S4ReconcileStats st;
+    BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+    BOOST_CHECK_MESSAGE(st.reconciled && st.preState=="stale","F3: expected stale reconcile");
+    BOOST_CHECK_MESSAGE(g_s4BoundaryScoreHealthy,
+        "F3: at the registration boundary the score authority must already be certified healthy");
+    BOOST_CHECK_MESSAGE(!g_s4BoundaryRuntime,
+        "F3: runtime must not be externally visible at the health boundary");
+    bool present=false,revoked=false; std::string raw;
+    BOOST_REQUIRE(S4CertState(&present,&raw,&revoked));
+    BOOST_CHECK(present && !revoked);
+    BOOST_CHECK_MESSAGE(raw==S4EncPair(1,t0),"F3: cert must be rebound to the current token");
+    uint256 t1; { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(t1)); }
+    BOOST_CHECK_MESSAGE(t1==t0,"F3: no token advance");
+    S4AssertCertsCoherent();
+    BOOST_TEST_MESSAGE("S4_F3 reconciled=1 pre=stale token_stable=1 boundary_healthy=1");
+}
+
+// F4 — revoked score cert: startup recovery semantics exact; failure must not
+// fabricate health; a successful reconcile clears the durable poison.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f4_revoked_score_cert)
+{
+    S4World w("s4-f4-%%%%-%%%%"); std::string aerr;
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    uint256 t0=S4Token();
+    { CTxDB db; BOOST_REQUIRE_MESSAGE(db.RevokeDAGScoreAuthorityForTest(),"arm revocation"); }
+    { bool p=false,r=false; std::string raw; BOOST_REQUIRE(S4CertState(&p,&raw,&r)); BOOST_CHECK(r); }
+    // Failure variant: injected commit failure must leave the poison and the
+    // marker preimage EXACT (no fabricated health).
+    const std::map<std::string,std::string> rawBefore=S4RawKV();
+    g_testFailS4ReconcileCommit=true;
+    g_dagManager.ClearDAGDataForTest();
+    std::string ferr;
+    BOOST_CHECK(!InitBlockIndexAuthoritative(w.root.string(),&ferr));
+    g_testFailS4ReconcileCommit=false;
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK(S4RawKV()==rawBefore);
+    { bool p=false,r=false; std::string raw; BOOST_REQUIRE(S4CertState(&p,&raw,&r)); BOOST_CHECK_MESSAGE(r,"F4: poison must survive a failed reconcile"); }
+    BOOST_TEST_MESSAGE("S4_F4 commit_failure_old_state=1 no_runtime=1 poison_intact=1 err="<<ferr);
+    // Positive: the reviewed recovery path (fresh recolor + republish) repairs.
+    ResetBlockIndexAuthoritativeStartupForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    S4ReconcileStats st;
+    BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+    BOOST_CHECK_MESSAGE(st.reconciled && st.preState=="revoked","F4: expected revoked reconcile");
+    bool p=false,r=false; std::string raw;
+    BOOST_REQUIRE(S4CertState(&p,&raw,&r));
+    BOOST_CHECK(p && !r);
+    BOOST_CHECK_MESSAGE(raw==S4EncPair(1,t0),"F4: repaired cert must bind the current token");
+    { CTxDB db; std::string e; BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&e),e); }
+    S4AssertCertsCoherent();
+    S4AssertTokenUnchanged(t0,"F4");
+    BOOST_TEST_MESSAGE("S4_F4 repaired=1 poison_cleared=1");
+}
+
+// F5 — corrupt score cert: undecodable marker fails closed (never treated as
+// absent); decodable-but-unsupported/trailing markers are rebuilt to a CLEAN
+// current-token marker via the reviewed path.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f5_corrupt_score_cert)
+{
+    S4World w("s4-f5-%%%%-%%%%"); std::string aerr;
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    uint256 t0=S4Token();
+    // (a) undecodable garbage -> hard failure, preimage exact.
+    S4RawPut(S4MarkerKey(),std::string("x"));
+    const std::map<std::string,std::string> rawBefore=S4RawKV();
+    g_dagManager.ClearDAGDataForTest();
+    std::string ferr;
+    BOOST_CHECK(!InitBlockIndexAuthoritative(w.root.string(),&ferr));
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_MESSAGE(ferr.find("corrupt")!=std::string::npos,"F5a: must fail closed on corrupt marker: "+ferr);
+    BOOST_CHECK_MESSAGE(S4RawKV()==rawBefore,"F5a: corrupt marker must remain byte-identical (no silent repair)");
+    BOOST_TEST_MESSAGE("S4_F5a fail_closed=1 preimage_exact=1 err="<<ferr);
+    // (b) decodable pair + trailing junk -> rebuilt to a clean marker.
+    ResetBlockIndexAuthoritativeStartupForTest();
+    S4RawPut(S4MarkerKey(),S4EncPair(1,t0)+std::string("JUNK"));
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    { S4ReconcileStats st; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+      BOOST_CHECK_MESSAGE(st.reconciled && st.preState=="trailing","F5b: expected trailing rebuild"); }
+    { bool p=false,r=false; std::string raw; BOOST_REQUIRE(S4CertState(&p,&raw,&r));
+      BOOST_CHECK(p && !r); BOOST_CHECK_MESSAGE(raw==S4EncPair(1,t0),"F5b: marker must be rewritten clean"); }
+    BOOST_TEST_MESSAGE("S4_F5b trailing_rebuilt=1 clean_marker=1");
+    // (c) unsupported version -> rebuilt to supported v1 bound to current token.
+    ResetBlockIndexAuthoritativeStartupForTest();
+    S4RawPut(S4MarkerKey(),S4EncPair(7,t0));
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    { S4ReconcileStats st; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+      BOOST_CHECK_MESSAGE(st.reconciled && st.preState=="unsupported","F5c: expected unsupported rebuild"); }
+    { bool p=false,r=false; std::string raw; BOOST_REQUIRE(S4CertState(&p,&raw,&r));
+      BOOST_CHECK(p && !r); BOOST_CHECK_MESSAGE(raw==S4EncPair(1,t0),"F5c: marker must be v1 current-token"); }
+    S4AssertCertsCoherent();
+    S4AssertTokenUnchanged(t0,"F5");
+    BOOST_TEST_MESSAGE("S4_F5c unsupported_rebuilt=1 v1_current=1");
+}
+
+// --- Part B helpers ---------------------------------------------------------
+
+// Merge block: extends prevA on the active chain while declaring parents
+// {prevA, prevB}. Exercises multi-parent + DAGKnight full-field paths.
+static CBlockIndex* S4AddMergeDag(CBlockIndex* prevA, CBlockIndex* prevB, unsigned int salt)
+{
+    CBlock* b = BuildPoWBlock(prevA, salt);
+    BOOST_REQUIRE(b != NULL);
+    std::vector<uint256> parents;
+    parents.push_back(prevA->GetBlockHash());
+    parents.push_back(prevB->GetBlockHash());
+    AttachDagParentsAndRemine(b, parents);
+    CBlockIndex* out = NULL;
+    { LOCK(cs_main); uint256 h = b->GetHash();
+      BOOST_REQUIRE(b->CheckBlock(true,true,true));
+      BOOST_REQUIRE_MESSAGE(ProcessBlock(NULL,b), "merge block rejected");
+      out = mapBlockIndex[h]; }
+    delete b;
+    BOOST_REQUIRE(out != NULL);
+    return out;
+}
+
+struct S4RichHashes { uint256 a1,a2,a3,b1,b2,m; };
+
+// fork(11) -> a-chain 12..14 (active); b-chain 12',13' (side); merge m(15)
+// with parents {a3,b2} (DAGKnight-era multi-parent merge). All retained.
+static S4RichHashes S4MineRichWorld(S4World& w)
+{
+    S4RichHashes h;
+    CBlockIndex* a1 = MineRealDag(w.fork, 0xA101); h.a1 = a1->GetBlockHash();
+    CBlockIndex* a2 = MineRealDag(a1, 0xA202); h.a2 = a2->GetBlockHash();
+    CBlockIndex* a3 = MineRealDag(a2, 0xA303); h.a3 = a3->GetBlockHash();
+    CBlockIndex* b1 = AddSideDag(w.fork, 0xB101); h.b1 = b1->GetBlockHash();
+    CBlockIndex* b2 = AddSideDag(b1, 0xB202); h.b2 = b2->GetBlockHash();
+    CBlockIndex* m = S4AddMergeDag(a3, b2, 0xC101); h.m = m->GetBlockHash();
+    BOOST_REQUIRE(pindexBest == m);
+    return h;
+}
+
+// --- F6: canonical full-field drift repaired to the independent resident
+// oracle (merge + DAGKnight so all three fields are load-bearing).
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f6_full_field_drift_repair)
+{
+    S4World w("s4-f6-%%%%-%%%%"); std::string aerr;
+    const S4RichHashes h = S4MineRichWorld(w);
+    std::vector<std::pair<int32_t,uint256> > scope;
+    const std::map<uint256,S4FullField> oracle = S4CaptureResidentOracle(&scope);
+    BOOST_REQUIRE(scope.size() >= 6); // a1,a2,a3,b1,b2,m
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    S4RawDel(S4MarkerKey());
+    // Deliberate drift with topology intact: wrong nDAGScore on one vertex,
+    // wrong fBlue/nInferredK on the merge vertex.
+    S4CorruptPersistedFullField(h.a2, 0x51);
+    S4CorruptPersistedFullField(h.m, 0x52);
+    { CTxDB db; CBlockDAGData dd; BOOST_REQUIRE(db.ReadDAGLinks(h.m,dd));
+      BOOST_TEST_MESSAGE("S4_F6 drift_pre fBlue="<<(dd.fBlue?1:0)<<" k="<<dd.nInferredK); }
+    const uint256 t0=S4Token();
+    const std::map<std::string,std::string> rawBefore=S4RawKV();
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    S4ReconcileStats st; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+    BOOST_CHECK_MESSAGE(st.reconciled, "F6: drift requires reconcile");
+    BOOST_CHECK_EQUAL(st.scopeVertices, scope.size());
+    size_t checked=0; const size_t mm = S4ComparePersistedToOracle(oracle,&checked);
+    BOOST_CHECK_EQUAL(mm,0u);
+    BOOST_CHECK_EQUAL(checked,scope.size());
+    { CTxDB db; std::string e; BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&e),e); }
+    // Deterministic reconstruction: two independent recolor runs agree exactly.
+    {
+        CTxDB db; std::vector<std::pair<int32_t,uint256> > sc; std::string e;
+        BOOST_REQUIRE_MESSAGE(EnumerateAuthoritativeStagedScope(db,&sc,NULL,&e),e);
+        std::vector<CanonicalDAGRecolorRecord> r1,r2; CanonicalDAGRecolorStats rs1,rs2;
+        AuthoritativeDAGRecolorSource s1(db), s2(db);
+        BOOST_REQUIRE_MESSAGE(ReconstructAuthoritativeDAGFields(sc,s1,&r1,&rs1,&e),e);
+        BOOST_REQUIRE_MESSAGE(ReconstructAuthoritativeDAGFields(sc,s2,&r2,&rs2,&e),e);
+        BOOST_CHECK_MESSAGE(r1==r2,"F6: recolor must be deterministic / order-independent");
+    }
+    // Audit extension: actual committed write-set must be EXACTLY the two
+    // drifted daglinks records + the score marker. No token write, no child-count
+    // churn, no poison write, no unrelated field.
+    {
+        const std::vector<std::string> diff=S4RawDiffKeys(rawBefore,S4RawKV());
+        std::vector<std::string> expect; expect.push_back(S4MarkerKey());
+        expect.push_back(S4DaglinksKey(h.a2)); expect.push_back(S4DaglinksKey(h.m));
+        BOOST_CHECK_MESSAGE(S4SameKeySet(diff,expect),"F6: actual write set must be exactly {a2,m,marker}");
+        BOOST_TEST_MESSAGE("S4_F6 actual_writes="<<diff.size()<<" (expected 3)");
+    }
+    S4AssertCertsCoherent();
+    S4AssertTokenUnchanged(t0,"F6");
+    BOOST_TEST_MESSAGE("S4_F6 reconciled=1 scope="<<scope.size()<<" oracle_checked="<<checked<<" mismatch="<<mm
+        <<" changed="<<st.changedFullFields<<" written="<<st.recordsWritten);
+}
+
+// --- F7: nonresident retained vertex (absent from mapBlockIndex/mapDAGData
+// authority at reconcile time) repaired from canonical storage + by-value
+// metadata to exact oracle parity.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f7_nonresident_retained)
+{
+    S4World w("s4-f7-%%%%-%%%%"); std::string aerr;
+    const S4RichHashes h = S4MineRichWorld(w);
+    std::vector<std::pair<int32_t,uint256> > scope;
+    const std::map<uint256,S4FullField> oracle = S4CaptureResidentOracle(&scope);
+    BOOST_REQUIRE(scope.size() >= 6);
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    S4RawDel(S4MarkerKey());
+    // Evict a mid-chain retained vertex from ALL resident authority.
+    g_dagManager.RemoveBlockDAGData(h.a2);
+    BOOST_REQUIRE_EQUAL(mapBlockIndex.erase(h.a2), 1u);
+    // Corrupt its persisted fields so any skip would be visible.
+    S4CorruptPersistedFullField(h.a2, 0x71);
+    const uint256 t0=S4Token();
+    const std::map<std::string,std::string> rawBefore=S4RawKV();
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_CHECK(mapBlockIndex.find(h.a2)==mapBlockIndex.end());
+    { CBlockDAGData dd; BOOST_CHECK(!g_dagManager.GetDAGData(h.a2,dd)); }
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    S4ReconcileStats st; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+    BOOST_CHECK(st.reconciled);
+    size_t checked=0; const size_t mm = S4ComparePersistedToOracle(oracle,&checked);
+    BOOST_CHECK_EQUAL(mm,0u);
+    { CTxDB db; CBlockDAGData dd; BOOST_REQUIRE(db.ReadDAGLinks(h.a2,dd));
+      const S4FullField& o = oracle.at(h.a2);
+      BOOST_CHECK(dd.nDAGScore==o.nDAGScore && dd.fBlue==o.fBlue && dd.nInferredK==o.nInferredK); }
+    // Audit extension: actual write set = exactly the evicted/corrupted vertex + marker.
+    {
+        const std::vector<std::string> diff=S4RawDiffKeys(rawBefore,S4RawKV());
+        std::vector<std::string> expect; expect.push_back(S4MarkerKey());
+        expect.push_back(S4DaglinksKey(h.a2));
+        BOOST_CHECK_MESSAGE(S4SameKeySet(diff,expect),"F7: actual write set must be exactly {a2,marker}");
+        BOOST_TEST_MESSAGE("S4_F7 actual_writes="<<diff.size()<<" (expected 2)");
+    }
+    S4AssertCertsCoherent();
+    S4AssertTokenUnchanged(t0,"F7");
+    BOOST_TEST_MESSAGE("S4_F7 nonresident_evicted="<<h.a2.GetHex().substr(0,12)<<" reconciled=1 oracle_checked="
+        <<checked<<" mismatch="<<mm<<" changed="<<st.changedFullFields);
+}
+
+// --- F8: erased/pruned parent (Option-R) restart: retained child references a
+// parent erased from canonical daglinks; exact reconstruction vs the accepted
+// S2 counterfactual oracle.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f8_erased_parent_option_r)
+{
+    S4World w("s4-f8-%%%%-%%%%"); std::string aerr;
+    // S2-style world: a-branch (a1 + 6) is replaced by a heavier b-branch whose
+    // merge tip b3 references the (soon erased) a-branch tip a1.
+    CBlockIndex* a1 = MineRealDag(w.fork, 0xA801);
+    const uint256 hA1 = a1->GetBlockHash();
+    CBlockIndex* active = a1;
+    for (int i=0;i<6;++i) active = MineRealDag(active, 0xA810+i);
+    CBlockIndex* b1 = AddSideDag(w.fork, 0xB801);
+    CBlockIndex* b2 = AddSideDag(b1, 0xB802);
+    CBlockIndex* b3 = S4AddMergeDag(b2, a1, 0xB810);
+    const uint256 hB3 = b3->GetBlockHash();
+    CBlockIndex* branch = b3;
+    for (int i=0;i<12 && pindexBest!=branch;++i) branch = AddSideDag(branch, 0xB820+i);
+    BOOST_REQUIRE_MESSAGE(pindexBest==branch, "reorg must make the b-branch active");
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    S4RawDel(S4MarkerKey());
+    // a1 erased from canonical source; retained b3 still references it.
+    { CTxDB db; CBlockDAGData dd;
+      BOOST_CHECK_MESSAGE(!db.ReadDAGLinks(hA1,dd), "F8: a1 must be erased after the reorg");
+      CBlockDAGData b3d; BOOST_REQUIRE(db.ReadDAGLinks(hB3,b3d));
+      bool ref=false; for (size_t i=0;i<b3d.vDAGParents.size();++i) if (b3d.vDAGParents[i]==hA1) ref=true;
+      BOOST_CHECK_MESSAGE(ref, "F8: retained b3 must reference the erased parent"); }
+    const std::map<std::string,std::string> rawBefore=S4RawKV();
+    // Independent S2 oracle (counterfactual closure injection). Built after
+    // startup: the authoritative navigator is installed by Init, and the
+    // reconcile never mutates topology, so the oracle reads identical inputs.
+    const uint256 t0=S4Token();
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    S4ReconcileStats st; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+    BOOST_CHECK_MESSAGE(st.reconciled, "F8: erased-parent restart requires reconcile");
+    BOOST_CHECK_MESSAGE(st.boundaryClosures>0, "F8: Option-R boundary reconstruction must be exercised");
+    std::map<uint256,CanonicalDAGRecolorRecord> cf;
+    std::vector<std::pair<int32_t,uint256> > scope; std::string e;
+    { CTxDB db; BOOST_REQUIRE_MESSAGE(EnumerateAuthoritativeStagedScope(db,&scope,NULL,&e),e);
+      AuthoritativeDAGRecolorSource src(db);
+      std::vector<uint256> erased; erased.push_back(hA1);
+      cf = CounterfactualOracle::Build(scope, src, erased, &e);
+      BOOST_REQUIRE_MESSAGE(!cf.empty(), "counterfactual oracle failed: "+e); }
+    // Compare canonical retained vertices exactly; the counterfactual oracle's
+    // injected erased parent (+ recovered closure) is support material only:
+    // it must NOT be resurrected into persisted canonical daglinks.
+    std::set<uint256> retained; for (size_t i=0;i<scope.size();++i) retained.insert(scope[i].second);
+    size_t mismatch=0, checked=0, support=0;
+    for (std::map<uint256,CanonicalDAGRecolorRecord>::const_iterator it=cf.begin();it!=cf.end();++it)
+    {
+        CTxDB db; CBlockDAGData dd;
+        if (!retained.count(it->first))
+        {
+            BOOST_CHECK_MESSAGE(!db.ReadDAGLinks(it->first,dd),
+                "F8: erased/support vertex must not be resurrected: "+it->first.GetHex());
+            ++support; continue;
+        }
+        BOOST_REQUIRE_MESSAGE(db.ReadDAGLinks(it->first,dd),"missing "+it->first.GetHex());
+        ++checked;
+        if (dd.nDAGScore!=it->second.nDAGScore || dd.fBlue!=it->second.fBlue || dd.nInferredK!=it->second.nInferredK) ++mismatch;
+    }
+    BOOST_CHECK_EQUAL(mismatch,0u);
+    BOOST_CHECK_MESSAGE(support>0, "F8: counterfactual must inject the erased parent as support material");
+    BOOST_CHECK_EQUAL(checked, scope.size()); // every surviving canonical vertex compared, none skipped
+    // Audit extension: the Option-R reconcile must not write ANY field; the only
+    // committed mutation is the score marker itself.
+    {
+        const std::vector<std::string> diff=S4RawDiffKeys(rawBefore,S4RawKV());
+        std::vector<std::string> expect; expect.push_back(S4MarkerKey());
+        BOOST_CHECK_MESSAGE(S4SameKeySet(diff,expect),"F8: actual write set must be exactly {marker}");
+        BOOST_TEST_MESSAGE("S4_F8 actual_writes="<<diff.size()<<" (expected 1)");
+    }
+    S4AssertCertsCoherent();
+    S4AssertTokenUnchanged(t0,"F8");
+    BOOST_TEST_MESSAGE("S4_F8 scope="<<scope.size()<<" counterfactual_checked="<<checked<<" mismatch="<<mismatch
+        <<" support="<<support<<" boundary_closures="<<st.boundaryClosures<<" erased_parent="<<hA1.GetHex().substr(0,12));
+    // Reopen deterministic: second authoritative startup is a no-op fast path and
+    // observes the exact same canonical state (no resurrection, no drift).
+    const std::string fpAfter=S4SourceFingerprint(S4RawKV());
+    ResetBlockIndexAuthoritativeStartupForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    S4ReconcileStats st2; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st2));
+    BOOST_CHECK_MESSAGE(st2.healthyFastPath, "F8: second startup must be a no-op (healthy fast path)");
+    BOOST_CHECK_EQUAL(S4SourceFingerprint(S4RawKV()),fpAfter);
+    size_t mismatch2=0, checked2=0;
+    for (std::map<uint256,CanonicalDAGRecolorRecord>::const_iterator it=cf.begin();it!=cf.end();++it)
+    {
+        if (!retained.count(it->first)) continue;
+        CTxDB db; CBlockDAGData dd;
+        BOOST_REQUIRE_MESSAGE(db.ReadDAGLinks(it->first,dd),"reopen missing "+it->first.GetHex());
+        ++checked2;
+        if (dd.nDAGScore!=it->second.nDAGScore || dd.fBlue!=it->second.fBlue || dd.nInferredK!=it->second.nInferredK) ++mismatch2;
+    }
+    BOOST_CHECK_EQUAL(mismatch2,0u);
+    BOOST_CHECK_EQUAL(checked2, scope.size());
+    { CTxDB db; CBlockDAGData dd; BOOST_CHECK(!db.ReadDAGLinks(hA1,dd)); }
+    S4AssertCertsCoherent();
+    BOOST_TEST_MESSAGE("S4_F8 reopen_fast_path="<<(st2.healthyFastPath?1:0)<<" retained_recheck="<<checked2<<" mismatch="<<mismatch2);
+}
+
+// --- F9: failure matrix. PRE-COMMIT injections: disk OLD/coherent, no
+// runtime, no fabricated certificate. POST-COMMIT/pre-publication: disk
+// NEW/coherent, startup fails, no half-published owner.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f9_failure_matrix)
+{
+    S4World w("s4-f9-%%%%-%%%%"); std::string aerr;
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    SetS4ReconcileBarrierHookForTest(&S4BarrierHook);
+    const int barriers[5] = {1,2,3,4,5};
+    for (int i=0;i<5;++i)
+    {
+        S4RawDel(S4MarkerKey());
+        const std::map<std::string,std::string> rawBefore = S4RawKV();
+        g_s4FailBarrier = barriers[i];
+        g_dagManager.ClearDAGDataForTest();
+        std::string ferr;
+        BOOST_CHECK_MESSAGE(!InitBlockIndexAuthoritative(w.root.string(),&ferr), "barrier "<<barriers[i]<<" must fail");
+        g_s4FailBarrier = 0;
+        BOOST_CHECK(!g_fAuthoritativeStartup);
+        BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+        BOOST_CHECK(!GetDagTipDeltaState().enabled);
+        BOOST_CHECK_MESSAGE(S4RawKV()==rawBefore, "barrier "<<barriers[i]<<": disk must remain OLD/coherent");
+        ResetBlockIndexAuthoritativeStartupForTest();
+        BOOST_TEST_MESSAGE("S4_F9 barrier="<<barriers[i]<<" old_state=1 no_runtime=1 err="<<ferr);
+    }
+    // Commit-failure seam: identical PRE-COMMIT guarantees.
+    {
+        S4RawDel(S4MarkerKey());
+        const std::map<std::string,std::string> rawBefore = S4RawKV();
+        g_testFailS4ReconcileCommit = true;
+        g_dagManager.ClearDAGDataForTest();
+        std::string ferr;
+        BOOST_CHECK(!InitBlockIndexAuthoritative(w.root.string(),&ferr));
+        g_testFailS4ReconcileCommit = false;
+        BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+        BOOST_CHECK_MESSAGE(S4RawKV()==rawBefore, "commit failure: disk must remain OLD/coherent");
+        ResetBlockIndexAuthoritativeStartupForTest();
+        BOOST_TEST_MESSAGE("S4_F9 commit_failure old_state=1 no_runtime=1 err="<<ferr);
+    }
+    // Post-commit / pre-publication: disk NEW/coherent, startup fails, no owner.
+    {
+        S4RawDel(S4MarkerKey());
+        g_s4FailBarrier = 6;
+        g_dagManager.ClearDAGDataForTest();
+        std::string ferr;
+        BOOST_CHECK(!InitBlockIndexAuthoritative(w.root.string(),&ferr));
+        g_s4FailBarrier = 0;
+        BOOST_CHECK(!g_fAuthoritativeStartup);
+        BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+        BOOST_CHECK(!GetDagTipDeltaState().enabled);
+        { CTxDB db; std::string e; BOOST_CHECK_MESSAGE(db.IsDAGScoreAuthorityHealthy(&e),
+            "post-commit failure must leave NEW/coherent state: "+e); }
+        ResetBlockIndexAuthoritativeStartupForTest();
+        BOOST_TEST_MESSAGE("S4_F9 barrier=6 new_state=1 no_owner=1 err="<<ferr);
+    }
+    // Token-stability injection (audit extension): a source-token change
+    // between certificate staging and the commit must discard the whole batch
+    // (PRE-COMMIT guarantees: exact OLD disk, no runtime, no fabricated cert).
+    {
+        S4RawDel(S4MarkerKey());
+        const std::map<std::string,std::string> rawBefore = S4RawKV();
+        std::map<std::string,std::string>::const_iterator tokIt = rawBefore.find(S4TokenKey());
+        BOOST_REQUIRE(tokIt != rawBefore.end());
+        const std::string tokenRaw = tokIt->second;
+        const uint256 t0 = S4Token();
+        g_s4TokenInjectArmed = true;
+        g_dagManager.ClearDAGDataForTest();
+        std::string ferr;
+        BOOST_CHECK_MESSAGE(!InitBlockIndexAuthoritative(w.root.string(),&ferr), "token change must fail startup");
+        g_s4TokenInjectArmed = false;
+        BOOST_CHECK_MESSAGE(ferr.find("token changed") != std::string::npos, "expected token-change abort: "+ferr);
+        BOOST_CHECK(!g_fAuthoritativeStartup);
+        BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+        BOOST_CHECK(!GetDagTipDeltaState().enabled);
+        // Restore the injected token value; everything else must be byte-identical.
+        S4RawPut(S4TokenKey(), tokenRaw);
+        BOOST_CHECK_MESSAGE(S4RawKV()==rawBefore, "token-stability abort must leave exact OLD state");
+        ResetBlockIndexAuthoritativeStartupForTest();
+        // Recoverability: after the restore the normal reconcile path succeeds.
+        g_dagManager.ClearDAGDataForTest();
+        std::string rerr;
+        BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&rerr), rerr);
+        BOOST_CHECK(S4Token()==t0);
+        ResetBlockIndexAuthoritativeStartupForTest();
+        BOOST_TEST_MESSAGE("S4_F9 token_stability old_state=1 no_runtime=1 recovered=1");
+    }
+    SetS4ReconcileBarrierHookForTest(NULL);
+}
+
+// --- F10: publication RAII. Fail deliberately AFTER runtime/owner
+// construction (boundary revocation) but before final success: no dangling
+// globals/observers/runtime; a subsequent startup succeeds cleanly.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f10_publication_raii)
+{
+    S4World w("s4-f10-%%%%-%%%%"); std::string aerr;
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    S4RawDel(S4MarkerKey());
+    SetDagObserverBoundaryHookForTest(&S4BoundaryRevokeScore);
+    g_dagManager.ClearDAGDataForTest();
+    std::string ferr;
+    BOOST_CHECK(!InitBlockIndexAuthoritative(w.root.string(),&ferr));
+    BOOST_CHECK_MESSAGE(ferr.find("observer score authority unhealthy")!=std::string::npos, ferr);
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK(!GetDagTipDeltaState().enabled);
+    BOOST_CHECK_MESSAGE(pindexBest==NULL, "failure must unwind published startup globals");
+    BOOST_CHECK_EQUAL(nBestHeight, -1);
+    SetDagObserverBoundaryHookForTest(NULL);
+    BOOST_TEST_MESSAGE("S4_F10 fail_after_runtime_construction err="<<ferr<<" globals_unwound=1 no_observer=1");
+    // No lingering state: restore authority health, restart succeeds.
+    ResetBlockIndexAuthoritativeStartupForTest();
+    { CTxDB db; std::string e; BOOST_REQUIRE_MESSAGE(db.PublishDAGScoreCertificateAtomic(&e), e); }
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    BOOST_CHECK(HasDagTipOverlayRuntimeForTest());
+    S4ReconcileStats st; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+    BOOST_TEST_MESSAGE("S4_F10 recovery_fast_path="<<(st.healthyFastPath?1:0)<<" registered=1");
+}
+
+// --- F11: reopen determinism. Successful reconcile -> restart cycle ->
+// scope/full fields/token/certs identical; no second reconcile.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f11_reopen_determinism)
+{
+    S4World w("s4-f11-%%%%-%%%%"); std::string aerr;
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    S4RawDel(S4MarkerKey());
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    S4ReconcileStats st; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+    BOOST_CHECK(st.reconciled);
+    const std::map<std::string,std::string> raw1 = S4RawKV();
+    const std::string fp1 = S4SourceFingerprint(raw1);
+    bool p1=false,r1=false; std::string m1; BOOST_REQUIRE(S4CertState(&p1,&m1,&r1));
+    uint256 t1; { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(t1)); }
+    // Clean restart cycle.
+    { CTxDB db; db.Close(); }
+    ResetBlockIndexAuthoritativeStartupForTest();
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    S4ReconcileStats st2; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st2));
+    BOOST_CHECK_MESSAGE(st2.healthyFastPath, "F11: reopen must be a no-op fast path");
+    BOOST_CHECK_EQUAL(S4SourceFingerprint(S4RawKV()), fp1);
+    bool p2=false,r2=false; std::string m2; BOOST_REQUIRE(S4CertState(&p2,&m2,&r2));
+    BOOST_CHECK(p1==p2 && m1==m2 && r1==r2);
+    uint256 t2; { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(t2)); }
+    BOOST_CHECK(t1==t2);
+    BOOST_TEST_MESSAGE("S4_F11 reopen_fast_path=1 fp_identical=1 token_identical=1 cert_identical=1");
+}
+
+// --- F12: child/score certificate coherence. (a) child-count authority
+// untrusted -> startup refuses and the score authority is NOT certified on top
+// of it; (b) divergent stale score marker repaired to the shared token;
+// (c) divergent stale child-count marker repaired before publication.
+BOOST_AUTO_TEST_CASE(r2c2s_s4_f12_child_score_coherence)
+{
+    S4World w("s4-f12-%%%%-%%%%"); std::string aerr;
+    w.SnapshotAndBuild(&aerr);
+    S4Cleanup cleanup(w.root);
+    { CTxDB db; db.Close(); }
+    uint256 t0 = S4Token();
+    // (a)
+    { CTxDB db; BOOST_REQUIRE(db.RevokeDAGChildCountForTest()); }
+    S4RawDel(S4MarkerKey());
+    const std::string scoreFpBefore = S4ScoreAuthorityFingerprint(S4RawKV());
+    g_testFailDAGChildCountRebuild = true;
+    g_dagManager.ClearDAGDataForTest();
+    std::string ferr;
+    BOOST_CHECK(!InitBlockIndexAuthoritative(w.root.string(),&ferr));
+    g_testFailDAGChildCountRebuild = false;
+    BOOST_CHECK_MESSAGE(ferr.find("child-count")!=std::string::npos, ferr);
+    BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
+    BOOST_CHECK_MESSAGE(S4ScoreAuthorityFingerprint(S4RawKV())==scoreFpBefore,
+        "F12a: score authority must be untouched while child-count is untrusted");
+    BOOST_TEST_MESSAGE("S4_F12a child_untrusted_refused=1 score_untouched=1 err="<<ferr);
+    { CTxDB db; std::string e; BOOST_REQUIRE_MESSAGE(db.EnsureDAGChildCountIndex(&e), e); }
+    ResetBlockIndexAuthoritativeStartupForTest();
+    // (b)
+    uint256 fake; { CTxDB db; BOOST_REQUIRE(db.MintDAGSourceStateId(fake)); }
+    S4RawPut(S4MarkerKey(), S4EncPair(1,fake));
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    { S4ReconcileStats st; BOOST_REQUIRE(GetLastS4ReconcileStatsForTest(&st));
+      BOOST_CHECK_MESSAGE(st.reconciled && st.preState=="stale", "F12b: divergent score marker requires reconcile"); }
+    S4AssertCertsCoherent();
+    BOOST_TEST_MESSAGE("S4_F12b divergent_score_repaired=1 certs_coherent=1");
+    // (c)
+    ResetBlockIndexAuthoritativeStartupForTest();
+    { CDataStream k(SER_DISK,CLIENT_VERSION);
+      k << std::make_pair(std::string("dagchildcountstate"), uint8_t(0));
+      S4RawPut(k.str(), S4EncPair(1,fake)); }
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(w.root.string(),&aerr),aerr);
+    { CTxDB db; std::string e; BOOST_REQUIRE_MESSAGE(db.IsDAGChildCountIndexHealthy(&e),e); }
+    S4AssertCertsCoherent();
+    BOOST_TEST_MESSAGE("S4_F12c divergent_childcount_repaired=1 certs_coherent=1");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

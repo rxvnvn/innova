@@ -96,6 +96,47 @@ static bool WriteDagLinksEntry(const std::string& dbDir, const uint256& hash,
     return st.ok();
 }
 
+// S4 test-only: wipe the shared mutable DAG source residue (daglinks +
+// child-count projection + all source/authority markers) so each fixture
+// presents exactly its own world to the authoritative startup. The source
+// token itself is KEPT: it is an opaque identity, and because every marker and
+// projection is wiped together with the links, nothing certifies the previous
+// canvas; the startup rebuilds counts + score authority against the new links
+// under the same token. Uses the same raw leveldb access as WriteDagLinksEntry;
+// never used in production.
+static bool ResetSharedDAGSource(const std::string& dbDir, std::string* error)
+{
+    leveldb::Options opts; opts.create_if_missing = true;
+    opts.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    leveldb::DB* db = NULL;
+    leveldb::Status st = leveldb::DB::Open(opts, dbDir, &db);
+    if (!st.ok() || !db) { if (error) *error = "reset: cannot open " + dbDir; return false; }
+    const char* prefixes[] = { "daglinks", "dagchildcount", "dagchildcountstate",
+                               "dagscorestate", "dagscoreinvalid" };
+    std::vector<std::string> doomed;
+    for (size_t p = 0; p < sizeof(prefixes)/sizeof(prefixes[0]); ++p)
+    {
+        CDataStream ps(SER_DISK, CLIENT_VERSION);
+        ps << std::string(prefixes[p]);
+        const std::string prefix = ps.str();
+        leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
+        for (it->Seek(prefix); it->Valid(); it->Next())
+        {
+            const leveldb::Slice k = it->key();
+            if (k.size() < prefix.size() || memcmp(k.data(), prefix.data(), prefix.size()) != 0) break;
+            doomed.push_back(k.ToString());
+        }
+        delete it;
+    }
+    for (size_t i = 0; i < doomed.size(); ++i)
+    {
+        st = db->Delete(leveldb::WriteOptions(), doomed[i]);
+        if (!st.ok()) { if (error) *error = "reset: delete failed"; delete db; return false; }
+    }
+    delete db;
+    return true;
+}
+
 // Build a small authoritative chain with a daglinks store, run the PRODUCTION
 // builder, and return the staging dir + the final legacy tip reference.
 struct LifecycleFixture
@@ -567,12 +608,17 @@ struct InitAuthoritativeFixture
         return true;
     }
 
-    // Quiesce the harness-owned shared CTxDB before replaying the identical
-    // logical daglinks relation into the actual cached production source path.
+    // S4: the shared mutable source must present EXACTLY this fixture's world
+    // for the startup score reconcile (strict retained-canvas enumeration +
+    // fail-closed metadata resolution). Reset the accumulated source residue -
+    // daglinks, child-count projection, and all authority markers (the source
+    // token is kept; all markers are rebuilt under it from the new links) -
+    // then replay the fixture's daglinks. Test-only; production never resets.
     bool PrepareActualLiveDaglinks(std::string* error)
     {
         { CTxDB closeDb; closeDb.Close(); }
         const std::string live = (GetDataDir() / "txleveldb").string();
+        if (!ResetSharedDAGSource(live, error)) return false;
         for (std::map<uint256, std::vector<uint256> >::const_iterator it = src.dagLinks.begin(); it != src.dagLinks.end(); ++it)
             if (!WriteDagLinksEntry(live, it->first, it->second))
             { if (error) *error = "cannot write fixture daglinks to actual txleveldb"; return false; }

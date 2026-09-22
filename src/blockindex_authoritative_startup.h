@@ -341,6 +341,18 @@ bool StageAuthoritativeDAGScoreState(
                                   //      vertices. false = stage every staged-scope vertex
                                   //      (Reorganize/legacy of the current engine) unchanged.
 
+// Shared diff-only full-field staging helper (S3 engine + S3 rollback + S4
+// startup reconcile). Requires an open transaction (WriteDAGLinks refuses
+// without); stages canonical full-field only for records whose layered value
+// differs (diffOnlyWrites) or every record (clear). Never stages a token or a
+// certificate. Fail closed on any read/write failure.
+bool StageDAGFullFieldRecords(
+    CTxDB& db,
+    const std::vector<CanonicalDAGRecolorRecord>& fields,
+    const std::map<uint256,BlockIndexSnapshot>* chainedPending,
+    bool diffOnlyWrites,
+    AuthoritativeDAGStageResult* result, std::string* error);
+
 // S3 rollback reconciliation (batch-only, failure path). Re-derives the
 // canonical full-field over the RESTORED staged scope (no pending overlay, no
 // force set) and stages ONLY the vertices whose layered value differs from the
@@ -371,5 +383,68 @@ bool EnumerateAuthoritativeStagedScope(
     std::vector<std::pair<int32_t,uint256>>* scope,
     const std::map<uint256,BlockIndexSnapshot>* chainedPending, // may be NULL
     std::string* error);
+
+// ---------------------------------------------------------------------------
+// S4 startup/migration authoritative score reconcile.
+//
+// On authoritative startup (PRESENT_VALID runtime path), BEFORE any runtime /
+// observer registration, certify that the persisted DAG score authority is
+// provably healthy for the CURRENT canonical source token. If it is not, the
+// CURRENT canonical retained DAG full-field state (nDAGScore/fBlue/nInferredK)
+// is reconstructed from authoritative sources (strict canonical daglinks +
+// by-value block metadata + entropy-correct trust + Option-R boundaries) and
+// persisted atomically: ONE WriteBatch carrying the diff-only full-field
+// writes, the score-certificate marker bound to the already-current token, and
+// the poison clear. Only then may registration proceed.
+//
+// The SourceStateId is NEVER advanced here: derived full-field is not
+// source-state identity (S1/S3 contract - the certificate binds the retained
+// canonical score set to the current token; the S3 rollback reconcile is the
+// accepted precedent for field correction without a token). The child-count
+// certificate is untouched (already bound to the same token; no divergence).
+//
+// Repairable (fresh recolor + republish is the only healthy route; mirrors the
+// accepted child-count rebuild contract): marker absent, stale-token, revoked,
+// or decodable-but-unsupported/trailing. Unrepairable: undecodable/corrupt
+// marker, unreadable token/marker, or any enumeration/recolor/stage/commit
+// failure -> fail closed. Never reinterprets corruption as absence; never
+// fabricates a healthy certificate.
+struct S4ReconcileStats
+{
+    bool healthyFastPath;       // authority already healthy -> zero writes
+    bool reconciled;            // a reconcile commit was performed
+    size_t scopeVertices;      // retained canonical DAG-era scope size
+    size_t preDAGFiltered;     // strict-enumerated pre-DAG keys excluded from the canvas
+    size_t changedFullFields;  // full-field records actually rewritten (diff-only)
+    size_t recordsWritten;      // == changedFullFields (one WriteDAGLinks per record)
+    size_t boundaryClosures;    // Option-R boundary closures reconstructed
+    size_t metadataResolved;    // BlockIndexSnapshot entries materialized by the recolor
+    size_t recoloredVertices;   // coloring-order entries (retained + boundary closures)
+    size_t estimatedBatchBytes; // bounded estimate of the committed mutation batch
+    size_t materializedObjects; // temporary canvas objects (freed before return)
+    uint64_t elapsedMs;
+    std::string preState;       // healthy/absent/stale/unsupported/trailing/revoked
+    S4ReconcileStats() : healthyFastPath(false), reconciled(false), scopeVertices(0),
+        preDAGFiltered(0), changedFullFields(0), recordsWritten(0), boundaryClosures(0),
+        metadataResolved(0), recoloredVertices(0), estimatedBatchBytes(0),
+        materializedObjects(0), elapsedMs(0) {}
+};
+bool ReconcileAuthoritativeDAGScoreAuthority(CTxDB& db, S4ReconcileStats* stats,
+                                             std::string* error);
+
+// Test-only last-stats capture (inert; returns false until a call happened).
+bool GetLastS4ReconcileStatsForTest(S4ReconcileStats* out);
+
+// Test-only S4 reconcile barrier hook (NULL in production = no-op). Barrier
+// points, in execution order: 1 pre enumeration; 2 pre canonical recolor;
+// 3 pre full-field stage; 4 pre score-marker stage; 5 pre commit; 6 post
+// commit pre health re-read. A false return (with *error set) fails the
+// reconcile; barriers 1-5 leave the durable source ALL-OLD (batch aborted),
+// barrier 6 leaves it NEW/coherent with the startup failing closed.
+typedef bool (*S4ReconcileBarrierHook)(int barrier, std::string* error);
+void SetS4ReconcileBarrierHookForTest(S4ReconcileBarrierHook hook);
+
+// Test-only deterministic commit-failure seam (false in production).
+extern bool g_testFailS4ReconcileCommit;
 
 #endif // INNOVA_BLOCKINDEX_AUTHORITATIVE_STARTUP_H

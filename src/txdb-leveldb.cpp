@@ -884,8 +884,11 @@ bool CTxDB::StageDAGScoreCertificateInBatch(const uint256& source, std::string* 
     if (!activeBatch) { if (error) *error="S3 score-cert: no active transaction"; return false; }
     if (!Write(make_pair(SCORE_STATE_KEY, uint8_t(0)), make_pair((uint32_t)1, source)))
     { if (error) *error="S3 score-cert: marker stage failed"; return false; }
-    if (!Erase(ScoreAuthorityRevocationKey()))
-    { if (error) *error="S3 score-cert: revocation-key clear failed"; return false; }
+    // Raw key: ScoreAuthorityRevocationKey() is ALREADY encoded; routing it
+    // through the templated Erase() would re-encode (length-prefix) and delete
+    // a different key. Mirror the raw batch deletes used by the restore path
+    // and by PublishDAGScoreCertificateAtomic.
+    activeBatch->Delete(ScoreAuthorityRevocationKey());
     return true;
 }
 
@@ -896,8 +899,9 @@ bool CTxDB::StageDAGChildCountCertificateInBatch(const uint256& source, std::str
     const std::pair<std::string, uint8_t> key = make_pair(string("dagchildcountstate"), uint8_t(0));
     if (!Write(key, make_pair((uint32_t)1, source)))
     { if (error) *error="S3 childcount-cert: marker stage failed"; return false; }
-    if (!Erase(ChildCountRevocationKey()))
-    { if (error) *error="S3 childcount-cert: revocation-key clear failed"; return false; }
+    // Raw key (same defect class as StageDAGScoreCertificateInBatch): the
+    // pre-encoded revocation key must not be re-encoded through Erase().
+    activeBatch->Delete(ChildCountRevocationKey());
     return true;
 }
 
