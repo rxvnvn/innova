@@ -67,8 +67,27 @@ extern bool g_testFailDagPruneCommit;
 extern bool g_testSuppressDagSourceAbort;
 extern bool g_dagSourceUnhealthy;
 extern bool CorruptDagTipDeltaSpillForTest(int);
+extern int g_testDagPruneFailStage;
 extern bool g_testFailDagTipDeltaSpillWrite;
 extern bool g_testFailDagTipDeltaSpillClose;
+extern bool g_testS12LifetimeProbe;
+extern int g_testS12LastPostponed;
+extern void* g_testS12SeenTxdbAddr;
+extern void* g_testS12SeenPdb;
+extern void* g_testS12SeenGlobal;
+extern bool g_testS12SeenPdbWasClosed;
+extern int g_testS12SeenCloseCount;
+extern int g_testS12SeenOpenCount;
+extern int g_testS12SeenDeliveredEvents;
+extern int g_testTxdbCloseCount;
+extern void* g_testTxdbLastClosedPtr;
+extern int g_testTxdbOpenCount;
+extern void* g_testTxdbLastOpenedPtr;
+extern void* GetGlobalTxdbPtrForTest();
+extern int g_testDagDeltaDeliveredEvents;
+extern int g_testDagDeltaLastDeliveredKind;
+extern int g_testDagDeltaLastDeliveredOrigin;
+extern uint256 GetBlockEntropy(const uint256& hashValue);
 
 // Production runtime/consumer, real mutable txleveldb, disposable overlay only.
 // Full scans here are test setup/oracles, NEVER ordinary mutation delivery.
@@ -298,6 +317,36 @@ static CBlockIndex* AddSideDag(CBlockIndex* pindexPrev, unsigned int nExtra)
     delete b;
     BOOST_REQUIRE(out != NULL);
     return out;
+}
+
+// S12 discriminator helper: add a side DAG-era block whose resulting chain
+// trust is trust-controlled by retrying nExtra until
+//   maxTrustInclusive >= prev->nChainTrust + GetBlockEntropy(hash) > minTrustExclusive.
+// Post-POEM trust is entropy(hash)-based, so this makes the side branch's
+// relative ordering deterministic instead of hash luck.
+static CBlockIndex* MineSideDagTrusted(CBlockIndex* pindexPrev, unsigned int nBase,
+                                       const uint256& maxTrustInclusive,
+                                       const uint256& minTrustExclusive)
+{
+    for (unsigned int k = 0; k < 8000; ++k) {
+        CBlock* b = BuildPoWBlock(pindexPrev, nBase + k);
+        BOOST_REQUIRE(b != NULL);
+        AttachDagParentsAndRemine(b, std::vector<uint256>(1, pindexPrev->GetBlockHash()));
+        const uint256 trust = pindexPrev->nChainTrust + GetBlockEntropy(b->GetHash());
+        if (trust <= maxTrustInclusive && trust > minTrustExclusive) {
+            CBlockIndex* out = NULL;
+            { LOCK(cs_main); unsigned int f=0,p=0;
+              BOOST_REQUIRE(b->WriteToDisk(f,p));
+              BOOST_REQUIRE(b->AddToBlockIndex(f,p,b->GetHash()));
+              out = mapBlockIndex[b->GetHash()]; }
+            delete b;
+            BOOST_REQUIRE(out != NULL);
+            return out;
+        }
+        delete b;
+    }
+    BOOST_FAIL("S12: no trust-controlled side block variant found");
+    return NULL;
 }
 
 BOOST_AUTO_TEST_SUITE(blockindex_window2_e2e)
@@ -4788,4 +4837,1158 @@ BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_live_add_merge_setbestchain_failure_
     }
 }
 
+// ---------------------------------------------------------------------------
+// S3 authoritative PRUNE helpers (real production-path fixture suite).
+// ---------------------------------------------------------------------------
+namespace {
+// Semantic view of a persisted daglinks row: the exact facts PRUNE and rollback
+// must preserve (topology parents + full-field). vDAGChildren/nDAGOrder are
+// resident ordering/bookkeeping that legitimately evolves with child
+// registration; the semantic view deliberately excludes them.
+static std::string DagSemanticBytes(const CBlockDAGData& d)
+{
+    CDataStream s(SER_DISK, CLIENT_VERSION);
+    s << d.vDAGParents; s << d.fBlue; s << d.nDAGScore; s << d.nInferredK;
+    return s.str();
+}
+static std::map<uint256,std::string> DumpDagSemantic()
+{
+    std::map<uint256,std::string> out;
+    CTxDB db;
+    std::map<uint256,CBlockDAGData> all;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(db.IterateDAGLinksStrict(all,&err),err);
+    for (std::map<uint256,CBlockDAGData>::const_iterator it=all.begin();it!=all.end();++it)
+        out[it->first]=DagSemanticBytes(it->second);
+    return out;
+}
+static int32_t PruneResolveHeight(const uint256& hash)
+{
+    BlockIndexSnapshot snap; std::string e;
+    BOOST_REQUIRE_MESSAGE(ResolveAuthoritativeBlockSnapshot(hash,&snap,&e),e);
+    BOOST_REQUIRE(snap.found && snap.hash==hash);
+    return (int32_t)snap.height;
+}
+// Expected prunable set for line H under the production selection rule:
+// height < H, by-value, minus the REAL epoch-boundary exemption set.
+static std::set<uint256> ExpectedPrunable(const std::map<uint256,std::string>& view, int nPruneBelow)
+{
+    std::set<uint256> out;
+    for (std::map<uint256,std::string>::const_iterator it=view.begin();it!=view.end();++it)
+    {
+        if (g_dagManager.IsEpochBoundaryForTest(it->first)) continue;
+        if (PruneResolveHeight(it->first) < nPruneBelow) out.insert(it->first);
+    }
+    return out;
+}
+static std::set<uint256> ViewKeys(const std::map<uint256,std::string>& v)
+{
+    std::set<uint256> out;
+    for (std::map<uint256,std::string>::const_iterator it=v.begin();it!=v.end();++it) out.insert(it->first);
+    return out;
+}
+static void DiffViews(const std::map<uint256,std::string>& before,
+                      const std::map<uint256,std::string>& after,
+                      std::set<uint256>* deleted, std::set<uint256>* added,
+                      size_t* survivingChanged)
+{
+    deleted->clear(); added->clear(); *survivingChanged=0;
+    for (std::map<uint256,std::string>::const_iterator it=before.begin();it!=before.end();++it)
+        if (!after.count(it->first)) deleted->insert(it->first);
+    for (std::map<uint256,std::string>::const_iterator it=after.begin();it!=after.end();++it)
+    {
+        std::map<uint256,std::string>::const_iterator b=before.find(it->first);
+        if (b==before.end()) { added->insert(it->first); continue; }
+        if (b->second != it->second) ++(*survivingChanged);
+    }
+}
+struct PruneSeamScope
+{
+    int depth; bool force;
+    PruneSeamScope(int d, bool f):depth(g_testDagPruneDepth),force(g_testForceDagPruneInAdd)
+    { g_testDagPruneDepth=d; g_testForceDagPruneInAdd=f; }
+    ~PruneSeamScope(){ g_testDagPruneDepth=depth; g_testForceDagPruneInAdd=force; }
+};
+} // namespace
+
+// ---------------------------------------------------------------------------
+// S3 authoritative PRUNE: real production-path epoch-boundary fixture.
+// Act 1: full retained canvas to a REAL epoch end; epoch-crossing ADD (real
+// ComputeEpochState) with depth=1 -> REAL crossing prune; then a forced prune
+// that deletes the non-exempt vertex below the line while the REAL
+// epoch-boundary exemption survives.
+// Act 2: resident-evicted (nonresident) pruned + surviving vertices and a
+// multi-parent merge ADD whose pruned parent crosses the prune boundary.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_live_prune_e2e)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    // ---- Act 0: real retained canvas to a real epoch end (legacy path).
+    CBlockIndex* p = pindexBest;
+    while (p->nHeight < GetForkHeightDAG()) p = MineReal(p, 0x9100 + p->nHeight);
+    const int epoch = GetEpochForHeight(p->nHeight);
+    const int epochEnd = GetEpochBoundaryHeight(epoch + 1, p->nHeight) - 1;
+    while (p->nHeight < epochEnd) p = MineRealDag(p, 0x9200 + p->nHeight);
+    BOOST_REQUIRE_EQUAL(p->nHeight, epochEnd);
+    const uint256 boundaryHash = p->GetBlockHash();
+
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("s3-live-prune-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_testForceDagPruneInAdd=false; g_testDagPruneDepth=0;
+            try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+    g_testSuppressDagSourceAbort=true;
+
+    // ---- S0: durable pre-session snapshot.
+    uint256 token0;
+    { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(token0)); }
+    std::map<uint256,std::string> view0 = DumpDagSemantic();
+    BOOST_REQUIRE_MESSAGE(view0.size()>200,"real retained canvas expected (epoch mined)");
+    BOOST_REQUIRE(view0.count(boundaryHash));
+    BOOST_TEST_MESSAGE("S3_PRUNE_E2E act0 canvas="<<view0.size()<<" boundaryHeight="<<p->nHeight<<" token0="<<token0.GetHex());
+
+    // ---- Act 1a: epoch-crossing ADD (real ComputeEpochState) + depth=1 ->
+    // real crossing prune. survivor set: {boundary} (+the new block).
+    CBlockIndex* c = NULL;
+    {
+        {
+            PruneSeamScope seams(1,false);
+            c = MineRealDag(p, 0x9301);
+        }
+        BOOST_REQUIRE(c != NULL);
+        BOOST_CHECK(!g_dagSourceUnhealthy);
+        BOOST_CHECK_MESSAGE(g_dagManager.IsEpochBoundaryForTest(boundaryHash),
+            "real epoch-boundary exemption must be present after the crossing");
+        std::map<uint256,std::string> viewCross = DumpDagSemantic();
+        std::set<uint256> del,add; size_t changed=0;
+        DiffViews(view0, viewCross, &del, &add, &changed);
+        std::set<uint256> expected = ExpectedPrunable(view0, p->nHeight /* nPruneBelow == epochEnd */);
+        size_t missing=0, unexpected=0;
+        for (std::set<uint256>::const_iterator it=expected.begin();it!=expected.end();++it) if(!del.count(*it)) ++missing;
+        for (std::set<uint256>::const_iterator it=del.begin();it!=del.end();++it) if(!expected.count(*it)) ++unexpected;
+        BOOST_CHECK_EQUAL(missing,0u); BOOST_CHECK_EQUAL(unexpected,0u);
+        BOOST_CHECK(del == expected);
+        BOOST_CHECK(viewCross.count(boundaryHash)!=0);
+        BOOST_CHECK(viewCross.at(boundaryHash)==view0.at(boundaryHash));
+        BOOST_REQUIRE_EQUAL(add.size(),1u);
+        BOOST_CHECK(add.count(c->GetBlockHash())!=0);
+        BOOST_CHECK_EQUAL(changed,0u);
+        int cleanCross=-1; { CTxDB db; BOOST_REQUIRE(db.ReadDAGCleanHeight(cleanCross)); }
+        BOOST_CHECK_EQUAL(cleanCross, epochEnd);
+        BOOST_TEST_MESSAGE("S3_PRUNE_CROSS before_retained="<<view0.size()
+            <<" pruned_vertices="<<del.size()<<" after_retained="<<viewCross.size()
+            <<" surviving_changed="<<changed<<" surviving_unchanged="<<(viewCross.size()-1)
+            <<" missing_deletes="<<missing<<" unexpected_deletes="<<unexpected
+            <<" cleanHeight="<<cleanCross<<" exempt_survivor=1");
+    }
+
+    // ---- Act 1b: plain ADD (no prune), then forced prune at depth=1.
+    CBlockIndex* q = MineRealDag(c, 0x9302);      // height epochEnd+2
+    BOOST_REQUIRE_EQUAL(q->nHeight, epochEnd + 2);
+    uint256 tokenPreTrigger;
+    { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(tokenPreTrigger)); }
+    std::map<uint256,std::string> viewPreTrigger = DumpDagSemantic();
+    BOOST_REQUIRE(viewPreTrigger.count(p->GetBlockHash()));
+    BOOST_REQUIRE(viewPreTrigger.count(q->GetBlockHash()));
+
+    DagDeltaCapture capTrigger;
+    uint256 tokenFinal; uint256 triggerHash;
+    CBlockIndex* triggerPtr = NULL;
+    uint256 belowLineHash;
+    std::map<uint256,std::string> viewFinal;
+    {
+        SetDagTipCommittedDeltaObserver(&DagDeltaCapture::Record,&capTrigger);
+        CBlockIndex* trigger = NULL;
+        { PruneSeamScope seams(1,true); trigger = MineRealDag(q, 0x9303); }
+        SetDagTipCommittedDeltaObserver(NULL,NULL);
+        BOOST_REQUIRE(trigger != NULL);
+        BOOST_CHECK(!g_dagSourceUnhealthy);
+        triggerPtr = trigger;
+        triggerHash = trigger->GetBlockHash();
+        viewFinal = DumpDagSemantic();
+        { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(tokenFinal)); }
+    }
+    {
+        std::set<uint256> del,add; size_t changed=0;
+        DiffViews(viewPreTrigger, viewFinal, &del, &add, &changed);
+        std::set<uint256> expected = ExpectedPrunable(viewPreTrigger, q->nHeight /* line == epochEnd+1 */);
+        size_t missing=0, unexpected=0;
+        for (std::set<uint256>::const_iterator it=expected.begin();it!=expected.end();++it) if(!del.count(*it)) ++missing;
+        for (std::set<uint256>::const_iterator it=del.begin();it!=del.end();++it) if(!expected.count(*it)) ++unexpected;
+        BOOST_CHECK_EQUAL(missing,0u); BOOST_CHECK_EQUAL(unexpected,0u);
+        // Exempt boundary survives even though its height is below the line;
+        // the non-exempt below-line vertex is deleted; the at-line vertex survives.
+        BOOST_CHECK(del.count(p->GetBlockHash())==0);
+        BOOST_CHECK(viewFinal.count(boundaryHash)!=0);
+        BOOST_CHECK(viewFinal.at(boundaryHash)==view0.at(boundaryHash));
+        BOOST_CHECK(viewFinal.count(q->GetBlockHash())!=0);
+        BOOST_CHECK(add.count(triggerHash)!=0);
+        BOOST_CHECK_EQUAL(changed,0u);
+        BOOST_TEST_MESSAGE("S3_PRUNE_TRIGGER before_retained="<<viewPreTrigger.size()
+            <<" pruned_vertices="<<del.size()<<" after_retained="<<viewFinal.size()
+            <<" surviving_changed="<<changed<<" missing_deletes="<<missing
+            <<" unexpected_deletes="<<unexpected
+            <<" tokenPre="<<tokenPreTrigger.GetHex()<<" tokenPost="<<tokenFinal.GetHex());
+        // Token trace: envelope BEGIN=pre token, END=durable post token (the
+        // prune's physical commit is the envelope's final source state).
+        bool sawBegin=false, sawEnd=false;
+        for (size_t i=0;i<capTrigger.events.size();++i)
+        {
+            if (capTrigger.events[i].kind==DagTipCommittedDeltaEvent::BEGIN)
+            { BOOST_CHECK(capTrigger.events[i].hasInitialSourceStateId);
+              BOOST_CHECK(capTrigger.events[i].initialSourceStateId==tokenPreTrigger); sawBegin=true; }
+            if (capTrigger.events[i].kind==DagTipCommittedDeltaEvent::END)
+            { BOOST_CHECK(capTrigger.events[i].hasFinalSourceStateId);
+              BOOST_CHECK(capTrigger.events[i].finalSourceStateId==tokenFinal); sawEnd=true; }
+        }
+        BOOST_CHECK(sawBegin); BOOST_CHECK(sawEnd);
+        BOOST_CHECK(tokenFinal != tokenPreTrigger);
+        // A: immediately-below-line vertex pruned; B: at-line vertex survives.
+        BOOST_REQUIRE_EQUAL(del.size(),1u);
+        belowLineHash = *del.begin();
+        BOOST_CHECK(!viewFinal.count(belowLineHash));
+        // Both certificates bound to the SAME (new) token = S3 prune branch hit.
+        {
+            struct MarkerRead : CTxDB { using CTxDB::Read; } db;
+            std::pair<uint32_t,uint256> childMarker, scoreMarker;
+            BOOST_REQUIRE(db.Read(std::make_pair(std::string("dagchildcountstate"),uint8_t(0)),childMarker));
+            BOOST_REQUIRE(db.Read(std::make_pair(std::string("dagscorestate"),uint8_t(0)),scoreMarker));
+            BOOST_CHECK(childMarker.second==tokenFinal);
+            BOOST_CHECK(scoreMarker.second==tokenFinal);
+            uint256 srcFinal; BOOST_REQUIRE(db.ReadDAGSourceStateId(srcFinal));
+            BOOST_CHECK(srcFinal==tokenFinal);
+            std::string h1,h2;
+            BOOST_CHECK_MESSAGE(db.IsDAGChildCountIndexHealthy(&h1),h1);
+            BOOST_CHECK_MESSAGE(db.IsDAGScoreAuthorityHealthy(&h2),h2);
+            int cleanFinal=-1; BOOST_REQUIRE(db.ReadDAGCleanHeight(cleanFinal));
+            BOOST_CHECK_EQUAL(cleanFinal, q->nHeight);
+        }
+        BOOST_TEST_MESSAGE("S3_PRUNE_TRIGGER certs childBound=1 scoreBound=1 health=1");
+
+        // Canonical before/after oracles over the survivors + the never-pruned
+        // retained-path counterfactual for the pruned below-line vertex:
+        // survivors' canonical fields must be IDENTICAL across
+        //   (pre canvas, pruned vertex retained) == (post canvas, closure path)
+        //   == (post canvas, pruned vertex injected retained).
+        std::vector<std::pair<int32_t,uint256>> scopePre, scopePost;
+        for (std::map<uint256,std::string>::const_iterator it=viewPreTrigger.begin();it!=viewPreTrigger.end();++it)
+            scopePre.push_back(std::make_pair(PruneResolveHeight(it->first),it->first));
+        std::sort(scopePre.begin(),scopePre.end());
+        { CTxDB db; std::string serr; BOOST_REQUIRE_MESSAGE(EnumerateAuthoritativeStagedScope(db,&scopePost,NULL,&serr),serr); }
+        std::map<uint256,CanonicalDAGRecolorRecord> oBefore,oAfter,oNever;
+        {
+            CTxDB db; std::string oerr;
+            oBefore = CounterfactualOracle::Build(scopePre, AuthoritativeDAGRecolorSource(db),
+                                                  std::vector<uint256>(1,belowLineHash), &oerr);
+            BOOST_REQUIRE_MESSAGE(!oBefore.empty(),oerr);
+            oAfter = CounterfactualOracle::Build(scopePost, AuthoritativeDAGRecolorSource(db),
+                                                 std::vector<uint256>(), &oerr);
+            BOOST_REQUIRE_MESSAGE(!oAfter.empty(),oerr);
+            oNever = CounterfactualOracle::Build(scopePost, AuthoritativeDAGRecolorSource(db),
+                                                 std::vector<uint256>(1,belowLineHash), &oerr);
+            BOOST_REQUIRE_MESSAGE(!oNever.empty(),oerr);
+        }
+        size_t oracleMismatch=0;
+        for (std::map<uint256,std::string>::const_iterator it=viewFinal.begin();it!=viewFinal.end();++it)
+        {
+            CBlockDAGData data; { CTxDB db; BOOST_REQUIRE(db.ReadDAGLinks(it->first,data)); }
+            BOOST_REQUIRE(oAfter.count(it->first)!=0);
+            BOOST_REQUIRE(oNever.count(it->first)!=0);
+            const CanonicalDAGRecolorRecord& a=oAfter.at(it->first);
+            const CanonicalDAGRecolorRecord& n=oNever.at(it->first);
+            if (data.nDAGScore!=a.nDAGScore||data.fBlue!=a.fBlue||data.nInferredK!=a.nInferredK) ++oracleMismatch;
+            if (data.nDAGScore!=n.nDAGScore||data.fBlue!=n.fBlue||data.nInferredK!=n.nInferredK) ++oracleMismatch;
+            if (it->first!=triggerHash)
+            {
+                BOOST_REQUIRE(oBefore.count(it->first)!=0);
+                const CanonicalDAGRecolorRecord& b=oBefore.at(it->first);
+                if (data.nDAGScore!=b.nDAGScore||data.fBlue!=b.fBlue||data.nInferredK!=b.nInferredK) ++oracleMismatch;
+            }
+        }
+        BOOST_CHECK_EQUAL(oracleMismatch,0u);
+        BOOST_TEST_MESSAGE("S3_PRUNE_ORACLE survivors_parity_mismatch="<<oracleMismatch
+            <<" scopePost="<<scopePost.size()<<" oNeverInjected=1");
+    }
+
+    // ---- Act 2: nonresident vertices + multi-parent merge across the boundary.
+    const uint256 qHash = q->GetBlockHash(); // at-line survivor; pruned in Act 2
+    // The historical canvas vertex (the exempt boundary) was NEVER resident in
+    // this authoritative session (the resident manager only accumulates blocks
+    // added post-init) - a true historical nonresident retained vertex. The
+    // to-be-pruned at-line survivor is additionally EVICTED from the resident
+    // manager (memory only; canonical persisted source intact): the prune
+    // decision must come from the canonical source (a legacy residency-based
+    // selection would skip the evicted candidate), and the surviving
+    // nonresident vertices must still resolve + recolor by value.
+    BOOST_CHECK(!g_dagManager.HasDAGData(boundaryHash));
+    BOOST_REQUIRE(g_dagManager.HasDAGData(qHash));
+    g_dagManager.RemoveBlockDAGData(qHash);
+    BOOST_CHECK(!g_dagManager.HasDAGData(qHash));
+    BOOST_CHECK(!g_dagManager.HasDAGData(boundaryHash));
+    {
+        CTxDB db; CBlockDAGData tmp;
+        BOOST_CHECK_MESSAGE(db.ReadDAGLinks(qHash,tmp),"canonical source intact despite resident eviction");
+        BOOST_CHECK_MESSAGE(db.ReadDAGLinks(boundaryHash,tmp),"canonical source intact despite resident eviction");
+    }
+    uint256 tokenBeforeAct2;
+    { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(tokenBeforeAct2)); }
+    std::map<uint256,std::string> viewPreAct2 = DumpDagSemantic();
+    BOOST_REQUIRE(viewPreAct2.count(qHash));
+    BOOST_REQUIRE(viewPreAct2.count(boundaryHash));
+
+    uint256 tokenFinal2; uint256 mergeHash;
+    std::map<uint256,std::string> viewFinal2;
+    {
+        std::unique_ptr<CBlock> m(BuildPoWBlock(triggerPtr, 0x9401));
+        BOOST_REQUIRE(m.get()!=NULL);
+        std::vector<uint256> parents;
+        parents.push_back(triggerHash); // at-line survivor (height trigger-1)
+        parents.push_back(qHash);       // below-line nonresident vertex (will be pruned)
+        AttachDagParentsAndRemine(m.get(), parents);
+        { PruneSeamScope seams(1,true);
+          LOCK(cs_main);
+          BOOST_REQUIRE(m->CheckBlock(true,true,true));
+          BOOST_REQUIRE(ProcessBlock(NULL,m.get()));
+          mergeHash = m->GetHash();
+        }
+        BOOST_CHECK(!g_dagSourceUnhealthy);
+        viewFinal2 = DumpDagSemantic();
+        { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(tokenFinal2)); }
+    }
+    {
+        std::set<uint256> del,add; size_t changed=0;
+        DiffViews(viewPreAct2, viewFinal2, &del, &add, &changed);
+        std::set<uint256> expected = ExpectedPrunable(viewPreAct2, triggerPtr->nHeight /* line == trigger height */);
+        size_t missing=0, unexpected=0;
+        for (std::set<uint256>::const_iterator it=expected.begin();it!=expected.end();++it) if(!del.count(*it)) ++missing;
+        for (std::set<uint256>::const_iterator it=del.begin();it!=del.end();++it) if(!expected.count(*it)) ++unexpected;
+        BOOST_CHECK_EQUAL(missing,0u); BOOST_CHECK_EQUAL(unexpected,0u);
+        // A (below line, nonresident): pruned; B (at line): survives.
+        BOOST_CHECK_EQUAL(del.size(),1u);
+        BOOST_CHECK(del.count(qHash)!=0);
+        BOOST_CHECK(!viewFinal2.count(qHash));
+        BOOST_CHECK(viewFinal2.count(triggerHash)!=0);
+        // C: exempt-below-line survivor (nonresident) intact + unchanged.
+        BOOST_CHECK(viewFinal2.count(boundaryHash)!=0);
+        BOOST_CHECK(viewFinal2.at(boundaryHash)==viewPreAct2.at(boundaryHash));
+        // D: parent of surviving retained child: the at-line survivor's record
+        // still references the pruned parent in canonical topology.
+        {
+            CTxDB db; CBlockDAGData cdata; BOOST_REQUIRE(db.ReadDAGLinks(triggerHash,cdata));
+            BOOST_CHECK(std::count(cdata.vDAGParents.begin(),cdata.vDAGParents.end(),qHash)==1);
+        }
+        // E: the pruned vertex was ABSENT from resident mapDAGData at decision
+        // time (proven above) yet was deleted from the canonical source.
+        // F: merge vertex persisted with the pruned parent + unchanged survivors.
+        BOOST_REQUIRE_EQUAL(add.size(),1u);
+        BOOST_CHECK(add.count(mergeHash)!=0);
+        BOOST_CHECK_EQUAL(changed,0u);
+        BOOST_TEST_MESSAGE("S3_PRUNE_ACT2 before_retained="<<viewPreAct2.size()
+            <<" pruned_vertices="<<del.size()<<" after_retained="<<viewFinal2.size()
+            <<" surviving_changed="<<changed<<" missing_deletes="<<missing
+            <<" unexpected_deletes="<<unexpected<<" nonresident_pruned=1 nonresident_survivor=1"
+            <<" merge_crossed_boundary=1 tokenPre="<<tokenBeforeAct2.GetHex()
+            <<" tokenPost="<<tokenFinal2.GetHex());
+        // Certificates bound to the same new token; clean height = line.
+        {
+            struct MarkerRead : CTxDB { using CTxDB::Read; } db;
+            std::pair<uint32_t,uint256> childMarker, scoreMarker;
+            BOOST_REQUIRE(db.Read(std::make_pair(std::string("dagchildcountstate"),uint8_t(0)),childMarker));
+            BOOST_REQUIRE(db.Read(std::make_pair(std::string("dagscorestate"),uint8_t(0)),scoreMarker));
+            BOOST_CHECK(childMarker.second==tokenFinal2);
+            BOOST_CHECK(scoreMarker.second==tokenFinal2);
+            std::string h1,h2;
+            BOOST_CHECK_MESSAGE(db.IsDAGChildCountIndexHealthy(&h1),h1);
+            BOOST_CHECK_MESSAGE(db.IsDAGScoreAuthorityHealthy(&h2),h2);
+            int clean2=-1; BOOST_REQUIRE(db.ReadDAGCleanHeight(clean2));
+            BOOST_CHECK_EQUAL(clean2, triggerPtr->nHeight);
+        }
+        // Oracle parity for the merge + survivors under the never-pruned counterfactual.
+        std::vector<std::pair<int32_t,uint256>> scopePost2;
+        { CTxDB db; std::string serr; BOOST_REQUIRE_MESSAGE(EnumerateAuthoritativeStagedScope(db,&scopePost2,NULL,&serr),serr); }
+        std::map<uint256,CanonicalDAGRecolorRecord> oAfter2,oNever2;
+        {
+            CTxDB db; std::string oerr;
+            oAfter2 = CounterfactualOracle::Build(scopePost2, AuthoritativeDAGRecolorSource(db),
+                                                  std::vector<uint256>(), &oerr);
+            BOOST_REQUIRE_MESSAGE(!oAfter2.empty(),oerr);
+            oNever2 = CounterfactualOracle::Build(scopePost2, AuthoritativeDAGRecolorSource(db),
+                                                  std::vector<uint256>(1,qHash), &oerr);
+            BOOST_REQUIRE_MESSAGE(!oNever2.empty(),oerr);
+        }
+        size_t mm2=0;
+        for (std::map<uint256,std::string>::const_iterator it=viewFinal2.begin();it!=viewFinal2.end();++it)
+        {
+            CBlockDAGData data; { CTxDB db; BOOST_REQUIRE(db.ReadDAGLinks(it->first,data)); }
+            BOOST_REQUIRE(oAfter2.count(it->first)!=0);
+            BOOST_REQUIRE(oNever2.count(it->first)!=0);
+            const CanonicalDAGRecolorRecord& a=oAfter2.at(it->first);
+            const CanonicalDAGRecolorRecord& n=oNever2.at(it->first);
+            if (data.nDAGScore!=a.nDAGScore||data.fBlue!=a.fBlue||data.nInferredK!=a.nInferredK) ++mm2;
+            if (data.nDAGScore!=n.nDAGScore||data.fBlue!=n.fBlue||data.nInferredK!=n.nInferredK) ++mm2;
+        }
+        BOOST_CHECK_EQUAL(mm2,0u);
+        BOOST_TEST_MESSAGE("S3_PRUNE_ACT2_ORACLE mismatch="<<mm2<<" scope="<<scopePost2.size());
+    }
+
+    // ---- Reopen: exact retained set, fields, certs, clean height, no residue.
+    {
+        CTxDB reopened;
+        uint256 tokenRe; BOOST_REQUIRE(reopened.ReadDAGSourceStateId(tokenRe));
+        BOOST_CHECK(tokenRe==tokenFinal2);
+        std::map<uint256,std::string> viewRe = DumpDagSemantic();
+        BOOST_CHECK(viewRe==viewFinal2);
+        BOOST_CHECK(!viewRe.count(qHash));
+        BOOST_CHECK(!viewRe.count(belowLineHash));
+        int clean=-1; BOOST_REQUIRE(reopened.ReadDAGCleanHeight(clean));
+        BOOST_CHECK_EQUAL(clean, triggerPtr->nHeight);
+        std::string h1,h2;
+        BOOST_CHECK_MESSAGE(reopened.IsDAGChildCountIndexHealthy(&h1),h1);
+        BOOST_CHECK_MESSAGE(reopened.IsDAGScoreAuthorityHealthy(&h2),h2);
+        std::vector<std::pair<int32_t,uint256>> scopeRe;
+        std::string serr; BOOST_REQUIRE_MESSAGE(EnumerateAuthoritativeStagedScope(reopened,&scopeRe,NULL,&serr),serr);
+        std::vector<std::pair<int32_t,uint256>> scopeExpected;
+        for (std::map<uint256,std::string>::const_iterator it=viewFinal2.begin();it!=viewFinal2.end();++it)
+            scopeExpected.push_back(std::make_pair(PruneResolveHeight(it->first),it->first));
+        std::sort(scopeExpected.begin(),scopeExpected.end());
+        BOOST_CHECK(scopeRe==scopeExpected);
+        BOOST_TEST_MESSAGE("S3_PRUNE_REOPEN tokenStable=1 viewEqual=1 certHealth=1 scopeEqual=1 deletedAbsent=1");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3 authoritative PRUNE failure matrix. Every injectable stage of the S3
+// prune physical source commit must leave the durable source ALL-OLD: batch
+// aborted, canvas/token/clean-height/both-certificates byte-identical, nothing
+// partial. The production PruneDAGData is called directly (the same function
+// the real ADD callers use) on a real authoritative session; each attempt must
+// leave the state untouched so all injects run against the same baseline.
+// ---------------------------------------------------------------------------
+namespace {
+int g_pruneFailMatrixBarrierTarget = -1;
+bool PruneFailMatrixBarrierHook(int barrier, std::string* error)
+{
+    if (barrier == g_pruneFailMatrixBarrierTarget)
+    {
+        if (error) *error = "S3 prune failure matrix: injected stage-barrier failure";
+        return false;
+    }
+    return true;
+}
+// Full durable view of the authoritative source for all-old comparisons.
+struct PruneStateSnapshot
+{
+    bool childPresent, scorePresent, cleanPresent;
+    std::pair<uint32_t,uint256> childMarker, scoreMarker;
+    int cleanHeight;
+    uint256 token;
+    std::map<uint256,std::string> view;
+    std::vector<std::pair<int32_t,uint256>> scope;
+    // Adversarial (independent audit): raw child-count projection over the key
+    // set the prune erase/restore +/-1 relation can touch (record hashes + parents).
+    std::map<uint256,std::pair<bool,uint64_t>> counts;
+};
+static PruneStateSnapshot SnapshotPruneState()
+{
+    PruneStateSnapshot s;
+    s.childPresent = s.scorePresent = s.cleanPresent = false;
+    s.cleanHeight = -1;
+    {
+        struct Readback : CTxDB { using CTxDB::Read; } db;
+        s.childPresent = db.Read(std::make_pair(std::string("dagchildcountstate"),uint8_t(0)), s.childMarker);
+        s.scorePresent = db.Read(std::make_pair(std::string("dagscorestate"),uint8_t(0)), s.scoreMarker);
+        s.cleanPresent = db.ReadDAGCleanHeight(s.cleanHeight);
+        BOOST_REQUIRE(db.ReadDAGSourceStateId(s.token));
+        std::string serr;
+        BOOST_REQUIRE_MESSAGE(EnumerateAuthoritativeStagedScope(db, &s.scope, NULL, &serr), serr);
+        // Adversarial (independent audit): capture the RAW child-count projection
+        // for every key the prune erase/restore +/-1 relation can touch: the record
+        // hashes themselves plus their parents. Makes CheckPruneAllOld cover per-key
+        // counts, not just the marker/health projection.
+        std::set<uint256> ckeys;
+        for (size_t i = 0; i < s.scope.size(); ++i)
+            ckeys.insert(s.scope[i].second);
+        std::set<uint256> pkeys;
+        for (std::set<uint256>::const_iterator it = ckeys.begin(); it != ckeys.end(); ++it)
+        {
+            CBlockDAGData d;
+            if (db.ReadDAGLinks(*it, d))
+                for (size_t j = 0; j < d.vDAGParents.size(); ++j)
+                    pkeys.insert(d.vDAGParents[j]);
+        }
+        for (std::set<uint256>::const_iterator it = pkeys.begin(); it != pkeys.end(); ++it)
+            ckeys.insert(*it);
+        for (std::set<uint256>::const_iterator it = ckeys.begin(); it != ckeys.end(); ++it)
+        {
+            uint64_t cnt = 0; bool present = false;
+            BOOST_REQUIRE(db.ReadDAGChildCount(*it, &cnt, &present));
+            s.counts[*it] = std::make_pair(present, cnt);
+        }
+    }
+    s.view = DumpDagSemantic();
+    return s;
+}
+static void CheckPruneAllOld(const PruneStateSnapshot& a, const PruneStateSnapshot& b, const std::string& tag)
+{
+    BOOST_CHECK_MESSAGE(a.view == b.view, tag << ": daglinks canvas changed");
+    BOOST_CHECK_MESSAGE(a.token == b.token, tag << ": source token changed");
+    BOOST_CHECK_MESSAGE(a.cleanPresent == b.cleanPresent, tag << ": clean-height presence changed");
+    if (a.cleanPresent && b.cleanPresent)
+        BOOST_CHECK_MESSAGE(a.cleanHeight == b.cleanHeight, tag << ": clean height changed");
+    BOOST_CHECK_MESSAGE(a.childPresent == b.childPresent, tag << ": child-count marker presence changed");
+    if (a.childPresent && b.childPresent)
+        BOOST_CHECK_MESSAGE(a.childMarker == b.childMarker, tag << ": child-count marker changed");
+    BOOST_CHECK_MESSAGE(a.scorePresent == b.scorePresent, tag << ": score marker presence changed");
+    if (a.scorePresent && b.scorePresent)
+        BOOST_CHECK_MESSAGE(a.scoreMarker == b.scoreMarker, tag << ": score marker changed");
+    BOOST_CHECK_MESSAGE(a.scope == b.scope, tag << ": staged scope changed");
+    BOOST_CHECK_MESSAGE(a.counts == b.counts,
+        tag << ": raw child-count projection changed (present/count per key)");
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_prune_failure_matrix)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* p = pindexBest;
+    while (p->nHeight < GetForkHeightDAG()) p = MineReal(p, 0x9500 + p->nHeight);
+    for (int i = 0; i < 5; ++i) p = MineRealDag(p, 0x9600 + i);
+
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("s3-prune-failmatrix-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_testForceDagPruneInAdd=false; g_testDagPruneDepth=0;
+            g_testDagPruneFailStage=0; g_testFailDagPruneCommit=false; g_dagSourceUnhealthy=false;
+            SetAuthoritativeStageBarrierHookForTest(NULL);
+            try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+    g_testSuppressDagSourceAbort=true;
+    g_testDagPruneDepth = 1;   // nPruneBelow == tip: real deletion set available
+
+    const int nLine = pindexBest->nHeight + 1;   // nPruneBelow == tip height
+    const CBlockIndex* tip = pindexBest;
+    PruneStateSnapshot s0 = SnapshotPruneState();
+    BOOST_REQUIRE_MESSAGE(s0.view.size() >= 6, "small retained canvas expected");
+    BOOST_REQUIRE(s0.token != uint256(0));
+
+    struct Inject { const char* name; int stage; int barrier; bool commitSeam; };
+    const Inject injects[] = {
+        {"stage1-selection",           1, -1, false},
+        {"stage2-pre-deletion",        2, -1, false},
+        {"stage3-post-deletion",       3, -1, false},
+        {"barrier1-pre-recolor",       0,  1, false},
+        {"barrier2-pre-fullfield",     0,  2, false},
+        {"barrier3-pre-token",         0,  3, false},
+        {"barrier4-pre-scorecert",     0,  4, false},
+        {"barrier5-pre-childcert",     0,  5, false},
+        {"stage9-pre-commit",          9, -1, false},
+        {"commit-seam",                0, -1, true },
+    };
+    const size_t nInjects = sizeof(injects)/sizeof(injects[0]);
+    for (size_t i = 0; i < nInjects; ++i)
+    {
+        const Inject& inj = injects[i];
+        PruneStateSnapshot pre = SnapshotPruneState();
+        BOOST_REQUIRE_MESSAGE(pre.view == s0.view, inj.name << ": state drifted before inject");
+        g_testDagPruneFailStage = inj.stage;
+        g_pruneFailMatrixBarrierTarget = inj.barrier;
+        if (inj.barrier > 0) SetAuthoritativeStageBarrierHookForTest(&PruneFailMatrixBarrierHook);
+        g_testFailDagPruneCommit = inj.commitSeam;
+        DagPruneRollbackCapture cap;
+        CTxDB txdb;
+        const bool ok = g_dagManager.PruneDAGData(txdb, nLine, &cap, NULL);
+        SetAuthoritativeStageBarrierHookForTest(NULL);
+        g_pruneFailMatrixBarrierTarget = -1;
+        g_testDagPruneFailStage = 0;
+        g_testFailDagPruneCommit = false;
+        BOOST_CHECK_MESSAGE(!ok, inj.name << ": prune must fail under injection");
+        BOOST_CHECK_MESSAGE(!cap.committed, inj.name << ": no prune commit may be recorded");
+        PruneStateSnapshot post = SnapshotPruneState();
+        CheckPruneAllOld(pre, post, std::string(inj.name));
+        BOOST_CHECK_MESSAGE(post.view == s0.view, inj.name << ": state changed vs the original snapshot");
+        BOOST_TEST_MESSAGE("S3_PRUNE_FAILMATRIX inject="<<inj.name<<" failedAsInjected="<<(!ok)<<" allOld="<<(post.view==pre.view));
+    }
+
+    // Control: without injection the same call succeeds, advances the token,
+    // deletes the exact expected set, persists the clean height at the line;
+    // a reopen keeps it.
+    {
+        PruneStateSnapshot pre = SnapshotPruneState();
+        DagPruneRollbackCapture cap;
+        CTxDB txdb;
+        BOOST_REQUIRE(g_dagManager.PruneDAGData(txdb, nLine, &cap, NULL));
+        BOOST_CHECK(cap.committed);
+        PruneStateSnapshot post = SnapshotPruneState();
+        std::set<uint256> del; for (std::map<uint256,std::string>::const_iterator it=pre.view.begin();it!=pre.view.end();++it) if (!post.view.count(it->first)) del.insert(it->first);
+        std::set<uint256> add; for (std::map<uint256,std::string>::const_iterator it=post.view.begin();it!=post.view.end();++it) if (!pre.view.count(it->first)) add.insert(it->first);
+        std::set<uint256> expected = ExpectedPrunable(pre.view, tip->nHeight);
+        BOOST_CHECK(del == expected);
+        BOOST_CHECK(del.size() >= 4u);
+        BOOST_CHECK(add.empty());
+        BOOST_CHECK(post.token != pre.token);
+        BOOST_CHECK(post.cleanPresent && post.cleanHeight == tip->nHeight);
+        BOOST_CHECK_EQUAL(cap.records.size(), del.size());
+        {
+            CTxDB db; std::string h1,h2;
+            BOOST_CHECK_MESSAGE(db.IsDAGChildCountIndexHealthy(&h1),h1);
+            BOOST_CHECK_MESSAGE(db.IsDAGScoreAuthorityHealthy(&h2),h2);
+        }
+        BOOST_TEST_MESSAGE("S3_PRUNE_FAILMATRIX control deleted="<<del.size()<<" tokenAdvanced="<<(post.token!=pre.token)<<" cleanHeightStored="<<(post.cleanPresent&&post.cleanHeight==tip->nHeight));
+        { CTxDB db; db.Close(); }
+        PruneStateSnapshot re = SnapshotPruneState();
+        CheckPruneAllOld(post, re, "control-reopen");
+        for (std::set<uint256>::const_iterator it=del.begin();it!=del.end();++it)
+            BOOST_CHECK(!re.view.count(*it));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3 authoritative PRUNE x outer SetBestChain-failure rollback. The prune is a
+// SEPARATE physical source commit inside the ADD envelope; when the envelope
+// then fails and rolls back, the rollback must restore the exact pre-envelope
+// source, INCLUDING the resurrected prune deletions, the durable clean-height
+// marker, and the exact pre-operation score-certificate state (no
+// fabrication). One rollback batch; reopen-verified; healthy and revoked
+// pre-states. Reopen-parity proves no mixed state survives a real restart.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_prune_rollback_setbestchain_failure)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* p = pindexBest;
+    while (p->nHeight < GetForkHeightDAG()) p = MineReal(p, 0x9700 + p->nHeight);
+    for (int i = 0; i < 5; ++i) p = MineRealDag(p, 0x9800 + i);
+
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("s3-prune-rollback-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_testForceDagPruneInAdd=false; g_testDagPruneDepth=0;
+            g_testFailSetBestChainAfterDagInit=false; g_dagSourceUnhealthy=false;
+            try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+    g_testSuppressDagSourceAbort=true;
+
+    // ---- Case 0: pre-state NEVER CERTIFIED (both markers absent) - the
+    // rollback must restore exact absence, never fabricate a certificate.
+    {
+        PruneStateSnapshot s0 = SnapshotPruneState();
+        BOOST_TEST_MESSAGE("S3_PRUNE_ROLLBACK case0-prestate childPresent="<<s0.childPresent<<" scorePresent="<<s0.scorePresent);
+        BOOST_CHECK(!s0.scorePresent);   // never certified in this session yet
+        uint256 failedHash;
+        bool added=true;
+        {
+            std::unique_ptr<CBlock> add(BuildPoWBlock(pindexBest,0x9900));
+            BOOST_REQUIRE(add.get()!=NULL);
+            AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,pindexBest->GetBlockHash()));
+            unsigned int f=0,pos=0;
+            PruneSeamScope seams(1,true);
+            g_testFailSetBestChainAfterDagInit=true;
+            {
+                LOCK(cs_main); BOOST_REQUIRE(add->WriteToDisk(f,pos));
+                added = add->AddToBlockIndex(f,pos,add->GetHash());
+                g_testFailSetBestChainAfterDagInit=false;
+                failedHash = add->GetHash();
+            }
+        }
+        BOOST_CHECK_MESSAGE(!added,"SetBestChain-failed ADD (with nested prune commit) must not return success");
+        BOOST_CHECK_MESSAGE(!g_dagSourceUnhealthy,"rollback must complete cleanly (no abort)");
+        g_testSuppressDagSourceAbort=false;
+        { CTxDB db; db.Close(); }  // real restart: reopen
+        PruneStateSnapshot re = SnapshotPruneState();
+        CheckPruneAllOld(s0, re, "rollback-0-absent");
+        {
+            CTxDB db; CBlockDAGData tmp;
+            BOOST_CHECK_MESSAGE(!db.ReadDAGLinks(failedHash,tmp),"failed block's DAG row must be erased");
+            std::string h2;
+            BOOST_CHECK_MESSAGE(!db.IsDAGScoreAuthorityHealthy(&h2),"absent pre-state must remain uncertified (no fabrication)");
+        }
+        BOOST_TEST_MESSAGE("S3_PRUNE_ROLLBACK case0(absent) allOld=1 absenceRestored="<<(!re.scorePresent)<<" noFabrication=1");
+        g_testSuppressDagSourceAbort=true;
+    }
+
+    // ---- Heal: one real authoritative ADD (no prune) binds both certificates
+    // so the healthy-preservation case below starts from a healthy state.
+    {
+        CBlockIndex* healed = MineRealDag(pindexBest, 0x98F5);
+        BOOST_REQUIRE(healed != NULL);
+    }
+
+    // ---- Case A: pre-state healthy (both certs bound + healthy).
+    {
+        PruneStateSnapshot s0 = SnapshotPruneState();
+        BOOST_CHECK(s0.childPresent && s0.scorePresent);
+        uint256 failedHash;
+        bool added=true;
+        {
+            std::unique_ptr<CBlock> add(BuildPoWBlock(pindexBest,0x9900));
+            BOOST_REQUIRE(add.get()!=NULL);
+            AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,pindexBest->GetBlockHash()));
+            unsigned int f=0,pos=0;
+            PruneSeamScope seams(1,true);
+            g_testFailSetBestChainAfterDagInit=true;
+            {
+                LOCK(cs_main); BOOST_REQUIRE(add->WriteToDisk(f,pos));
+                added = add->AddToBlockIndex(f,pos,add->GetHash());
+                g_testFailSetBestChainAfterDagInit=false;
+                failedHash = add->GetHash();
+            }
+        }
+        BOOST_CHECK_MESSAGE(!added,"SetBestChain-failed ADD (with nested prune commit) must not return success");
+        BOOST_CHECK_MESSAGE(!g_dagSourceUnhealthy,"rollback must complete cleanly (no abort)");
+        g_testSuppressDagSourceAbort=false;
+        { CTxDB db; db.Close(); }  // real restart: reopen
+        PruneStateSnapshot re = SnapshotPruneState();
+        CheckPruneAllOld(s0, re, "rollback-A-healthy");
+        {
+            CTxDB db; CBlockDAGData tmp;
+            BOOST_CHECK_MESSAGE(!db.ReadDAGLinks(failedHash,tmp),"failed block's DAG row must be erased");
+            std::string h1,h2;
+            BOOST_CHECK_MESSAGE(db.IsDAGChildCountIndexHealthy(&h1),h1);
+            BOOST_CHECK_MESSAGE(db.IsDAGScoreAuthorityHealthy(&h2),h2);
+        }
+        BOOST_TEST_MESSAGE("S3_PRUNE_ROLLBACK caseA(healthy) allOld=1 restoredRecords="<<s0.view.size()<<" healthyRestored=1 reopenExact=1");
+        g_testSuppressDagSourceAbort=true;
+    }
+
+    // ---- Case B: pre-state score certificate revoked - exact restore, never
+    // fabricated healthy authority.
+    {
+        { CTxDB db; BOOST_REQUIRE(db.RevokeDAGScoreAuthorityForTest()); }
+        PruneStateSnapshot s0 = SnapshotPruneState();
+        { CTxDB db; std::string h2; BOOST_CHECK(!db.IsDAGScoreAuthorityHealthy(&h2)); }
+        uint256 failedHash;
+        bool added=true;
+        {
+            std::unique_ptr<CBlock> add(BuildPoWBlock(pindexBest,0x9901));
+            BOOST_REQUIRE(add.get()!=NULL);
+            AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,pindexBest->GetBlockHash()));
+            unsigned int f=0,pos=0;
+            PruneSeamScope seams(1,true);
+            g_testFailSetBestChainAfterDagInit=true;
+            {
+                LOCK(cs_main); BOOST_REQUIRE(add->WriteToDisk(f,pos));
+                added = add->AddToBlockIndex(f,pos,add->GetHash());
+                g_testFailSetBestChainAfterDagInit=false;
+                failedHash = add->GetHash();
+            }
+        }
+        BOOST_CHECK(!added);
+        g_testSuppressDagSourceAbort=false;
+        { CTxDB db; db.Close(); }
+        PruneStateSnapshot re = SnapshotPruneState();
+        CheckPruneAllOld(s0, re, "rollback-B-revoked");
+        {
+            CTxDB db; std::string h2;
+            BOOST_CHECK_MESSAGE(!db.IsDAGScoreAuthorityHealthy(&h2),"revoked score authority must remain exactly revoked (no fabrication)");
+            CBlockDAGData tmp; BOOST_CHECK(!db.ReadDAGLinks(failedHash,tmp));
+        }
+        BOOST_TEST_MESSAGE("S3_PRUNE_ROLLBACK caseB(revoked) allOld=1 noFabrication=1 reopenExact=1");
+        g_testSuppressDagSourceAbort=true;
+    }
+
+    // ---- Case C (independent audit): pre-state PRESENT clean-height with an
+    // old value - the rollback must restore the exact prior value, neither the
+    // staged new line nor absence.
+    {
+        // Seed: one SUCCESSFUL forced-prune ADD so clean-height is committed.
+        { PruneSeamScope seams(1,true); CBlockIndex* seeded = MineRealDag(pindexBest, 0x9902); BOOST_REQUIRE(seeded != NULL); }
+        BOOST_REQUIRE(!g_dagSourceUnhealthy);
+        PruneStateSnapshot s0 = SnapshotPruneState();
+        BOOST_CHECK_MESSAGE(s0.cleanPresent, "case C pre-state must have clean-height present");
+        const int v1 = s0.cleanHeight;
+        uint256 failedHash;
+        bool added=true;
+        {
+            std::unique_ptr<CBlock> add(BuildPoWBlock(pindexBest,0x9903));
+            BOOST_REQUIRE(add.get()!=NULL);
+            AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,pindexBest->GetBlockHash()));
+            unsigned int f=0,pos=0;
+            PruneSeamScope seams(1,true);
+            g_testFailSetBestChainAfterDagInit=true;
+            {
+                LOCK(cs_main); BOOST_REQUIRE(add->WriteToDisk(f,pos));
+                added = add->AddToBlockIndex(f,pos,add->GetHash());
+                g_testFailSetBestChainAfterDagInit=false;
+                failedHash = add->GetHash();
+            }
+        }
+        BOOST_CHECK_MESSAGE(!added,"SetBestChain-failed ADD (with nested prune commit) must not return success");
+        BOOST_CHECK_MESSAGE(!g_dagSourceUnhealthy,"rollback must complete cleanly (no abort)");
+        g_testSuppressDagSourceAbort=false;
+        { CTxDB db; db.Close(); }  // real restart: reopen
+        PruneStateSnapshot re = SnapshotPruneState();
+        CheckPruneAllOld(s0, re, "rollback-C-present-cleanheight");
+        BOOST_CHECK_MESSAGE(re.cleanPresent && re.cleanHeight == v1,
+            "clean-height must be restored to the exact pre-operation value "<<v1
+            <<" (got present="<<re.cleanPresent<<" value="<<re.cleanHeight<<")");
+        {
+            CTxDB db; CBlockDAGData tmp;
+            BOOST_CHECK_MESSAGE(!db.ReadDAGLinks(failedHash,tmp),"failed block's DAG row must be erased");
+        }
+        BOOST_TEST_MESSAGE("S3_PRUNE_ROLLBACK caseC(present) allOld=1 cleanHeightRestored="<<re.cleanHeight<<" (was "<<v1<<") reopenExact=1");
+        g_testSuppressDagSourceAbort=true;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// S3 authoritative PRUNE x later real Reorganize. Sequence: real authoritative
+// ADDs build the active branch and a forced prune deletes below a line that
+// crosses the two branches' common ancestry; a later real Reorganize must then
+// disconnect/connect ACROSS the prune boundary, keeping the pending resolver,
+// score authority, Option-R erased-parent reconstruction, oracle parity and
+// reopen all intact.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_prune_reorg_interaction)
+{
+    SetMockTime(1700001200);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xC200+fork->nHeight);
+    fork=MineRealDag(fork,0xC210);
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("s3-prune-reorg-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_testForceDagPruneInAdd=false; g_testDagPruneDepth=0;
+            SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+    g_testSuppressDagSourceAbort=true;
+
+    // Active branch: real authoritative ADDs; the last one carries the forced
+    // prune (depth=1) whose line crosses the shared ancestry below the fork.
+    CBlockIndex* a1=AddSideDag(fork,0xC211);
+    CBlockIndex* active=a1;
+    for(unsigned i=0;i<5;++i) active=AddSideDag(active,0xC212+i);
+    CBlockIndex* a6=active;                       // will survive the prune line
+    {
+        PruneSeamScope seams(1,true);
+        active=AddSideDag(active,0xC218);         // prune line = active.height-1
+    }
+    CBlockIndex* a7=active;
+    BOOST_TEST_MESSAGE("S3_PRUNE_REORG post_prune active="<<a7->nHeight<<" fork="<<fork->nHeight);
+
+    // The prune deleted everything below the line (fork ancestry included).
+    // NOTE: authoritative ADDs deliver a committed delta whose consumer closes
+    // and reopens the shared txleveldb handle ("never hold txleveldb LOCK"), so
+    // CTxDB handles must never be cached across ADDs. Use a fresh scoped handle.
+    CBlockDAGData tmp;
+    {
+        CTxDB dbp;
+        BOOST_REQUIRE_MESSAGE(dbp.ReadDAGLinks(a7->GetBlockHash(),tmp),"pruned ADD itself must survive");
+        BOOST_REQUIRE_MESSAGE(dbp.ReadDAGLinks(a6->GetBlockHash(),tmp),"at-line vertex must survive");
+        BOOST_CHECK_MESSAGE(!dbp.ReadDAGLinks(a1->GetBlockHash(),tmp),"below-line vertex must be pruned");
+        BOOST_CHECK_MESSAGE(!dbp.ReadDAGLinks(fork->GetBlockHash(),tmp),"below-line fork ancestry must be pruned");
+    }
+    BOOST_TEST_MESSAGE("S3_PRUNE_REORG pruneApplied=1 lineCrossesFork=1");
+
+    // Side branch forked BELOW the prune line; real ADDs until the reorg fires.
+    CBlockIndex* b1=AddSideDag(fork,0xC221);
+    CBlockIndex* branch=b1;
+    unsigned nSide=1;
+    for(unsigned i=0;i<25 && pindexBest==a7;++i) {
+        std::unique_ptr<CBlock> block(BuildPoWBlock(branch,0xC230+i)); BOOST_REQUIRE(block.get());
+        AttachDagParentsAndRemine(block.get(),std::vector<uint256>(1,branch->GetBlockHash()));
+        LOCK(cs_main); unsigned int file=0,pos=0; BOOST_REQUIRE(block->WriteToDisk(file,pos));
+        const bool ok=block->AddToBlockIndex(file,pos,block->GetHash());
+        BlockIndexSnapshot candidate;
+        const auto resolved=ResolveAuthoritativeBlockSnapshotR(block->GetHash(),&candidate,&aerr);
+        BOOST_TEST_MESSAGE("S3_PRUNE_REORG side="<<block->GetHash().GetHex().substr(0,16)<<" added="<<ok
+            <<" source_unhealthy="<<g_dagSourceUnhealthy<<" resolver="<<int(resolved));
+        BOOST_REQUIRE_MESSAGE(ok,"real authoritative SetBestChain/Reorganize must succeed across the prune boundary");
+        branch=mapBlockIndex[block->GetHash()]; BOOST_REQUIRE(branch); ++nSide;
+    }
+    BOOST_REQUIRE_MESSAGE(pindexBest==branch,"reorg to the side branch must complete");
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    CTxDB db0;   // fresh handle AFTER the reorg (delta delivery closed the old one)
+    aerr.clear();
+    BOOST_REQUIRE_MESSAGE(db0.IsDAGScoreAuthorityHealthy(&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(db0.IsDAGChildCountIndexHealthy(&aerr),aerr);
+    CBlockDAGData erased;
+    BOOST_REQUIRE_MESSAGE(!db0.ReadDAGLinks(a7->GetBlockHash(),erased),"disconnected tip must be erased");
+    BOOST_REQUIRE_MESSAGE(!db0.ReadDAGLinks(a6->GetBlockHash(),erased),"disconnected survivor must be erased");
+    BOOST_TEST_MESSAGE("S3_PRUNE_REORG reorgDone=1 side_blocks="<<nSide<<" new_tip="<<branch->nHeight);
+
+    // Canonical full-field parity across the prune boundary: counterfactual as
+    // if the pruned fork vertex (parent of the reconnected branch) were still
+    // retained. Option-R closure must reconstruct it exactly.
+    std::vector<std::pair<int32_t,uint256>> scope;
+    BOOST_REQUIRE_MESSAGE(EnumerateAuthoritativeStagedScope(db0,&scope,NULL,&aerr),aerr);
+    auto oracle=CounterfactualOracle::Build(scope,AuthoritativeDAGRecolorSource(db0),
+        std::vector<uint256>(1,fork->GetBlockHash()),&aerr);
+    BOOST_REQUIRE_MESSAGE(!oracle.empty(),aerr);
+    BOOST_REQUIRE(oracle.count(branch->GetBlockHash()));
+    BOOST_REQUIRE_MESSAGE(oracle.count(fork->GetBlockHash()),"oracle must cover the pruned fork closure vertex");
+    size_t nMismatch=0;
+    for(const auto& entry:scope) {
+        BOOST_REQUIRE(oracle.count(entry.second));
+        CBlockDAGData data; BOOST_REQUIRE(db0.ReadDAGLinks(entry.second,data));
+        const auto& expected=oracle.at(entry.second);
+        if (data.nDAGScore!=expected.nDAGScore||data.fBlue!=expected.fBlue||data.nInferredK!=expected.nInferredK) ++nMismatch;
+        BOOST_CHECK(data.nDAGScore==expected.nDAGScore); BOOST_CHECK_EQUAL(data.fBlue,expected.fBlue);
+        BOOST_CHECK_EQUAL(data.nInferredK,expected.nInferredK);
+    }
+    BOOST_TEST_MESSAGE("S3_PRUNE_REORG oracleParity mismatch="<<nMismatch<<" scope="<<scope.size());
+    uint256 tokenBefore; BOOST_REQUIRE(db0.ReadDAGSourceStateId(tokenBefore));
+    db0.Close();
+
+    // Reopen (real restart equivalence): exact retained scope, stable token,
+    // reorg-erased and prune-erased rows stay absent, certs healthy, and every
+    // retained field still matches the boundary-closure oracle.
+    CTxDB reopened;
+    std::vector<std::pair<int32_t,uint256>> scope2;
+    BOOST_REQUIRE_MESSAGE(EnumerateAuthoritativeStagedScope(reopened,&scope2,NULL,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(scope2==scope,"retained scope must be exact across reopen");
+    uint256 tokenAfter; BOOST_REQUIRE(reopened.ReadDAGSourceStateId(tokenAfter));
+    BOOST_CHECK(tokenAfter==tokenBefore);
+    BOOST_REQUIRE_MESSAGE(!reopened.ReadDAGLinks(a6->GetBlockHash(),erased),"reorg-erased survivor absent across reopen");
+    BOOST_REQUIRE_MESSAGE(!reopened.ReadDAGLinks(a7->GetBlockHash(),erased),"reorg-erased tip absent across reopen");
+    BOOST_REQUIRE_MESSAGE(!reopened.ReadDAGLinks(a1->GetBlockHash(),erased),"pruned vertex stays absent across reopen");
+    BOOST_REQUIRE_MESSAGE(!reopened.ReadDAGLinks(fork->GetBlockHash(),erased),"pruned fork stays absent across reopen");
+    BOOST_REQUIRE_MESSAGE(reopened.IsDAGScoreAuthorityHealthy(&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(reopened.IsDAGChildCountIndexHealthy(&aerr),aerr);
+    for(const auto& entry:scope) {
+        CBlockDAGData data; BOOST_REQUIRE(reopened.ReadDAGLinks(entry.second,data));
+        const auto& expected=oracle.at(entry.second);
+        BOOST_CHECK(data.nDAGScore==expected.nDAGScore); BOOST_CHECK_EQUAL(data.fBlue,expected.fBlue);
+        BOOST_CHECK_EQUAL(data.nInferredK,expected.nInferredK);
+    }
+    BOOST_TEST_MESSAGE("S3_PRUNE_REORG reopenExact=1 scopeEqual=1 tokenStable=1 deletedAbsent=1 oracleMismatch=0");
+}
+
+// ---------------------------------------------------------------------------
+// S12: reorg-publication / postponed-reconnect CTxDB lifetime discriminator.
+//
+// Production flow under test (real operator semantics, no test-only shortcuts):
+//   invalidateblock(A_2)
+//     -> RollbackActiveChainTo(A_1): root reorg delta delivers mid-stack
+//     -> ActivateBestEligibleChain(): reorg to the heavier side branch B with a
+//        NON-EMPTY postponed-reconnect list; the root delta delivery happens
+//        mid-stack (inside Reorganize) and, pre-fix, the runtime consumer's
+//        source reader closed the shared txleveldb handle; the reconnect loop
+//        then used the same pre-existing CTxDB instance -> use-after-free.
+//
+// Geometry (entropy-trust controlled): active A_1..A_3; side B_1..B_3 with
+//   T_B3 <= T_A3 (never activates at its own addition),
+//   T_B2 > T_A1 and T_B3 > T_A1 (candidate filter + walk fire post-rollback).
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s12_postponed_reconnect_txdb_lifetime)
+{
+    SetMockTime(1700001300);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xD000+fork->nHeight);
+    fork=MineRealDag(fork,0xD0F0);
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("s12-lifetime-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis; std::set<uint256> invalidPre;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock),invalidPre(setInvalidBlockHash){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_testS12LifetimeProbe=false; g_testS12LastPostponed=0;
+            setInvalidBlockHash=invalidPre;
+            { CTxDB db; db.WriteInvalidBlockSet(setInvalidBlockHash); }
+            SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+    g_testSuppressDagSourceAbort=true;
+    g_testS12LifetimeProbe=true;
+
+    // Active branch A: three real authoritative ADDs (entropy trust strictly
+    // increases, so each activates).
+    CBlockIndex* a1=AddSideDag(fork,0xD101);
+    CBlockIndex* a2=AddSideDag(a1,0xD102);
+    CBlockIndex* a3=AddSideDag(a2,0xD103);
+    BOOST_REQUIRE_MESSAGE(pindexBest==a3,"A branch must be active");
+    const uint256 tA3=a3->nChainTrust, tA1=a1->nChainTrust;
+
+    // Side branch B: trust-controlled (never overtakes A at its own addition;
+    // strictly beats the post-rollback best so the postponed list is non-empty).
+    CBlockIndex* b1=MineSideDagTrusted(fork,0xD300,tA3,uint256(0));
+    CBlockIndex* b2=MineSideDagTrusted(b1,0xD400,tA3,tA1);
+    CBlockIndex* b3=MineSideDagTrusted(b2,0xD500,tA3,tA1);
+    BOOST_REQUIRE_MESSAGE(pindexBest==a3,"B must stay a side branch before invalidation");
+    BOOST_TEST_MESSAGE("S12_SETUP fork="<<fork->nHeight<<" a3="<<a3->nHeight<<" b3="<<b3->nHeight
+        <<" tA1="<<tA1.GetHex().substr(0,12)<<" tA3="<<tA3.GetHex().substr(0,12)
+        <<" tB3="<<b3->nChainTrust.GetHex().substr(0,12));
+
+    // Pre-operation identity + baseline counters.
+    void* preGlobal=NULL;
+    { CTxDB probe("r"); preGlobal=probe.GetInstance(); }
+    const int preClose=g_testTxdbCloseCount, preOpen=g_testTxdbOpenCount, preDeliv=g_testDagDeltaDeliveredEvents;
+    uint256 tokBefore; { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(tokBefore)); }
+    BOOST_TEST_MESSAGE("S12_PRE global="<<preGlobal<<" close="<<preClose<<" open="<<preOpen<<" deliv="<<preDeliv);
+
+    // REAL production flow (operator semantics): invalidateblock(A_2).
+    std::string ierr;
+    BOOST_REQUIRE_MESSAGE(InvalidateBlock(*a2->phashBlock,ierr),ierr);
+
+    // Post-operation discriminator evidence (seam line already on stderr).
+    BOOST_TEST_MESSAGE("S12_SEAM postponed="<<g_testS12LastPostponed
+        <<" pdb="<<g_testS12SeenPdb<<" global="<<g_testS12SeenGlobal
+        <<" pdb_was_closed="<<(int)g_testS12SeenPdbWasClosed
+        <<" close_count="<<g_testS12SeenCloseCount<<" open_count="<<g_testS12SeenOpenCount
+        <<" delivered="<<g_testS12SeenDeliveredEvents
+        <<" last_kind="<<g_testDagDeltaLastDeliveredKind
+        <<" last_origin="<<g_testDagDeltaLastDeliveredOrigin);
+
+    // (1) mid-stack committed-delta delivery actually happened, REORGANIZE origin.
+    BOOST_REQUIRE_MESSAGE(g_testS12SeenDeliveredEvents>=preDeliv+2,
+        "committed delta must be delivered during the invalidate flow");
+    BOOST_CHECK_MESSAGE(g_testDagDeltaLastDeliveredKind==DagTipCommittedDeltaEvent::END,
+        "last delivered event must be END");
+    BOOST_CHECK_MESSAGE(g_testDagDeltaLastDeliveredOrigin==DAG_TIP_DELTA_REORGANIZE,
+        "delivery origin must be REORGANIZE");
+    // (2) postponed-reconnect list non-empty (the reconnect loop runs).
+    BOOST_REQUIRE_MESSAGE(g_testS12LastPostponed>0,"postponed reconnect list must be non-empty");
+    // (3) NO shared-handle close under the in-flight owner (the S12 hazard).
+    BOOST_REQUIRE_MESSAGE(g_testTxdbCloseCount==preClose,
+        "S12 HAZARD: shared txleveldb handle was closed mid-operation");
+    // NOTE: the raw pdb==last-ever-closed-pointer equality is allocator-reuse
+    // sensitive across the fixture's history; the load-bearing gate is the
+    // close-count delta above plus the live-identity check below.
+    BOOST_REQUIRE_MESSAGE(g_testS12SeenGlobal!=NULL,
+        "S12 HAZARD: shared handle must be alive at the reconnect loop");
+    // (4) the mid-stack CTxDB still holds the live global handle.
+    BOOST_REQUIRE_MESSAGE(g_testS12SeenPdb!=NULL && g_testS12SeenPdb==g_testS12SeenGlobal,
+        "mid-stack txdb must hold the live global handle at the reconnect loop");
+    BOOST_REQUIRE_MESSAGE(g_testS12SeenTxdbAddr!=NULL,"txdb object identity must be recorded");
+
+    // Chain + source result correctness.
+    BOOST_REQUIRE_MESSAGE(pindexBest==b3,"activation must complete to the B branch");
+    BOOST_REQUIRE_EQUAL(hashBestChain.GetHex(),b3->GetBlockHash().GetHex());
+    uint256 tokAfter; { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(tokAfter)); }
+    BOOST_CHECK(tokAfter!=tokBefore);
+    {
+        CTxDB db;
+        CBlockDAGData data;
+        BOOST_CHECK_MESSAGE(!db.ReadDAGLinks(a1->GetBlockHash(),data),"disconnected A_1 record must be erased");
+        BOOST_CHECK_MESSAGE(!db.ReadDAGLinks(a2->GetBlockHash(),data),"disconnected A_2 record must be erased");
+        BOOST_CHECK_MESSAGE(db.ReadDAGLinks(b1->GetBlockHash(),data),"B_1 record must survive");
+        BOOST_CHECK_MESSAGE(db.ReadDAGLinks(b2->GetBlockHash(),data),"B_2 record must survive");
+        BOOST_CHECK_MESSAGE(db.ReadDAGLinks(b3->GetBlockHash(),data),"B_3 record must survive");
+        std::string herr;
+        BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&herr),herr);
+        BOOST_REQUIRE_MESSAGE(db.IsDAGChildCountIndexHealthy(&herr),herr);
+        // Both certificates bound to the same new token.
+        struct MarkerRead : CTxDB { using CTxDB::Read; } mdb;
+        std::pair<uint32_t,uint256> childMarker, scoreMarker;
+        BOOST_REQUIRE(mdb.Read(std::make_pair(std::string("dagchildcountstate"),uint8_t(0)),childMarker));
+        BOOST_REQUIRE(mdb.Read(std::make_pair(std::string("dagscorestate"),uint8_t(0)),scoreMarker));
+        BOOST_CHECK(childMarker.second==tokAfter);
+        BOOST_CHECK(scoreMarker.second==tokAfter);
+    }
+    // Reopen exact.
+    { CTxDB db; db.Close(); }
+    {
+        CTxDB db;
+        uint256 tokReopen; BOOST_REQUIRE(db.ReadDAGSourceStateId(tokReopen));
+        BOOST_CHECK(tokReopen==tokAfter);
+        CBlockDAGData data;
+        BOOST_CHECK(db.ReadDAGLinks(b3->GetBlockHash(),data));
+        BOOST_CHECK(!db.ReadDAGLinks(a1->GetBlockHash(),data));
+        std::string herr;
+        BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&herr),herr);
+        BOOST_REQUIRE_MESSAGE(db.IsDAGChildCountIndexHealthy(&herr),herr);
+    }
+    BOOST_TEST_MESSAGE("S12_DONE postponed="<<g_testS12LastPostponed<<" chain=b3 tokenAdvanced=1"
+        <<" closeDuringOp="<<(g_testS12SeenCloseCount-preClose)<<" stale=0");
+}
 BOOST_AUTO_TEST_SUITE_END()

@@ -308,6 +308,18 @@ struct AuthoritativeDAGStageResult
     size_t stagedFullFieldRecords = 0;
     size_t writeBatchBytes = 0;                          // approx batch bytes (daglinks+fiel+markers)
 };
+// Test-only stage-barrier injection point for the S3 authoritative staging
+// engine (NULL in production = no-op). Installed by integration tests to prove
+// that a failure injected between any two staging sub-steps still leaves the
+// durable source ALL-OLD: every stage lives in the single WriteBatch, so a
+// barrier failure is turned into a batch abort by the caller and nothing
+// partial can become durable. Barriers, in engine order:
+//   1 = pre canonical recolor; 2 = pre full-field staging; 3 = pre SourceStateId
+//   staging; 4 = pre score-certificate staging; 5 = pre child-count-certificate
+//   staging. A false return (with *error set) fails the stage engine.
+typedef bool (*AuthoritativeStageBarrierHook)(int barrier, std::string* error);
+void SetAuthoritativeStageBarrierHookForTest(AuthoritativeStageBarrierHook hook);
+
 // S3 batch-only full-field staging. `chainedPending` (NULL when absent) supplies
 // mutation-scoped, by-value snapshots for post-generation blocks that are part
 // of THIS logical mutation but not yet published to the external live authority

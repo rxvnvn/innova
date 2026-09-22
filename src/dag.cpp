@@ -7,6 +7,7 @@
 #include "txdb.h"
 #include "finality.h"
 #include "blockindex_residency_counters.h"
+#include "blockindex_authoritative_startup.h"
 #include "util.h"
 #include "dag_tips_delta.h"
 
@@ -1140,12 +1141,19 @@ void CDAGManager::RebuildDAGOrderIncremental(int nCleanHeight)
 // and normal LevelDB commit semantics.
 int g_testDagPruneDepth = 0;
 bool g_testFailDagPruneCommit = false;
+// Test-only injection point for the S3 authoritative prune stages:
+// 0=off, 1=post-selection (pre-batch), 2=pre-deletion, 3=post-deletion
+// (child-count staged), 9=pre final commit. Engine-internal stages (recolor,
+// full-field, token, certificates) are injected through the authoritative
+// stage-barrier hook on the shared stage engine.
+int g_testDagPruneFailStage = 0;
 
 // ---------------------------------------------------------------------------
 // CDAGManager: DAG Pruning
 // ---------------------------------------------------------------------------
 
-bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight)
+bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture* rollbackCapture,
+                               const std::map<uint256,BlockIndexSnapshot>* chainedPending)
 {
     LOCK(cs_dag);
 
@@ -1157,18 +1165,80 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight)
     int nPruned = 0;
     std::vector<uint256> vToErase;
 
-    for (const auto& pair : mapDAGData)
+    if (g_fAuthoritativeStartup)
     {
-        // Don't prune epoch boundary blocks
-        if (setEpochBoundaryBlocks.count(pair.first))
-            continue;
+        // S3 authoritative prune selection: the canonical persisted daglinks
+        // source is the sole selector (never mapDAGData/mapBlockIndex
+        // residency), heights resolve by value through the authoritative
+        // resolver, and the real epoch-boundary exemption set is honored
+        // exactly as in the legacy selection. A nonresident canonical record
+        // is pruned by this path; a resident-only record is not.
+        std::map<uint256, CBlockDAGData> persisted;
+        std::string selErr;
+        if (!txdb.IterateDAGLinksStrict(persisted, &selErr))
+        {
+            fprintf(stderr, "PruneDAGData: S3 prune selection failed: %s\n", selErr.c_str()); fflush(stderr);
+            return false; // fail closed: never prune an unreadable canvas
+        }
+        for (const auto& pair : persisted)
+        {
+            // Don't prune epoch boundary blocks
+            if (setEpochBoundaryBlocks.count(pair.first))
+                continue;
+            BlockIndexSnapshot snap;
+            bool fHaveSnap = false;
+            if (chainedPending)
+            {
+                // Mutation-scoped pending overlay first (exact same precedence as
+                // the S3 enumerate/stage callers): a vertex committed by THIS
+                // envelope (e.g. the block being added) is not yet resolvable
+                // through generation/live authority but is known by value here.
+                std::map<uint256,BlockIndexSnapshot>::const_iterator pit = chainedPending->find(pair.first);
+                if (pit != chainedPending->end())
+                {
+                    snap = pit->second;
+                    fHaveSnap = true;
+                }
+            }
+            if (!fHaveSnap)
+            {
+                std::string resErr;
+                if (!ResolveAuthoritativeBlockSnapshot(pair.first, &snap, &resErr) ||
+                    !snap.found || snap.hash != pair.first)
+                {
+                    std::map<uint256, CBlockIndex*>::iterator dbgmi = mapBlockIndex.find(pair.first);
+                    fprintf(stderr, "PruneDAGData: S3 prune height resolution failed for %s: %s (mapHeight=%d)\n",
+                           pair.first.ToString().substr(0,20).c_str(), resErr.c_str(),
+                           dbgmi != mapBlockIndex.end() ? dbgmi->second->nHeight : -1);
+                    fflush(stderr);
+                    return false;
+                }
+            }
+            if (snap.height < nPruneBelow)
+                vToErase.push_back(pair.first);
+        }
+    }
+    else
+    {
+        for (const auto& pair : mapDAGData)
+        {
+            // Don't prune epoch boundary blocks
+            if (setEpochBoundaryBlocks.count(pair.first))
+                continue;
 
-        std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(pair.first);
-        if (mi == mapBlockIndex.end())
-            continue;
+            std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(pair.first);
+            if (mi == mapBlockIndex.end())
+                continue;
 
-        if (mi->second->nHeight < nPruneBelow)
-            vToErase.push_back(pair.first);
+            if (mi->second->nHeight < nPruneBelow)
+                vToErase.push_back(pair.first);
+        }
+    }
+
+    if (g_testDagPruneFailStage == 1)
+    {
+        fprintf(stderr, "PruneDAGData: injected selection-stage failure\n"); fflush(stderr);
+        return false;
     }
 
     if (vToErase.empty())
@@ -1177,16 +1247,114 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight)
     // Phase 1: Write erasures + prune height + source token atomically.
     uint256 dagSourcePost;
     if (!txdb.MintDAGSourceStateId(dagSourcePost) || !txdb.TxnBegin())
+    {
+        fprintf(stderr, "PruneDAGData: S3 prune mint/TxnBegin failed\n"); fflush(stderr);
         return false;
+    }
 
-    for (const uint256& hash : vToErase)
-        if (!txdb.EraseDAGLinks(hash)) { txdb.TxnAbort(); return false; }
+    if (g_fAuthoritativeStartup)
+    {
+        // S3 authoritative PRUNE physical source commit: canonical deletions,
+        // post-prune canonical full-field reconciliation over surviving retained
+        // vertices, exactly one SourceStateId advance, and BOTH certificates
+        // bound to the same new token. One WriteBatch, one TxnCommit; staged
+        // reads resolve through the batch (staged write > tombstone > disk); no
+        // resident fallback anywhere in the decision or the derivation.
+        if (rollbackCapture)
+        {
+            // Exact pre-image for a later SetBestChain-failure rollback: every
+            // deleted durable row byte-for-byte plus the durable clean-height
+            // marker state. Fail closed if a pre-image cannot be made.
+            for (size_t i = 0; i < vToErase.size(); ++i)
+            {
+                CBlockDAGData pre;
+                if (!txdb.ReadDAGLinks(vToErase[i], pre))
+                {
+                    fprintf(stderr, "PruneDAGData: S3 prune rollback pre-image read failed for %s\n",
+                           vToErase[i].ToString().substr(0,20).c_str()); fflush(stderr);
+                    txdb.TxnAbort();
+                    return false;
+                }
+                rollbackCapture->records.push_back(std::make_pair(vToErase[i], pre));
+            }
+            rollbackCapture->cleanHeightPresent = txdb.ReadDAGCleanHeight(rollbackCapture->cleanHeight);
+        }
+        if (g_testDagPruneFailStage == 2)
+        {
+            fprintf(stderr, "PruneDAGData: injected pre-deletion failure\n"); fflush(stderr);
+            txdb.TxnAbort();
+            return false;
+        }
+        // Token trace evidence: the durable token this physical prune commit
+        // advances FROM (the ADD envelope's own source commit ran earlier).
+        uint256 prunePreToken;
+        txdb.ReadDAGSourceStateId(prunePreToken);
+        for (const uint256& hash : vToErase)
+            if (!txdb.EraseDAGLinks(hash))
+            {
+                fprintf(stderr, "PruneDAGData: S3 prune topology/child-count erase failed for %s\n",
+                       hash.ToString().substr(0,20).c_str()); fflush(stderr);
+                txdb.TxnAbort();
+                return false;
+            }
+        if (g_testDagPruneFailStage == 3)
+        {
+            fprintf(stderr, "PruneDAGData: injected post-deletion (child-count staged) failure\n"); fflush(stderr);
+            txdb.TxnAbort();
+            return false;
+        }
+        std::vector<std::pair<int32_t,uint256>> stagedScope;
+        std::string stageErr;
+        if (!EnumerateAuthoritativeStagedScope(txdb, &stagedScope, chainedPending, &stageErr))
+        {
+            fprintf(stderr, "PruneDAGData: S3 prune scope enumeration failed: %s\n", stageErr.c_str()); fflush(stderr);
+            txdb.TxnAbort();
+            return false;
+        }
+        AuthoritativeDAGStageResult prRes;
+        if (!StageAuthoritativeDAGScoreState(txdb, stagedScope, dagSourcePost, chainedPending, &prRes,
+                                             &stageErr, /*diffOnlyWrites=*/true))
+        {
+            fprintf(stderr, "PruneDAGData: S3 prune authoritative staging failed: %s\n", stageErr.c_str()); fflush(stderr);
+            txdb.TxnAbort();
+            return false;
+        }
+        if (g_testDagPruneFailStage == 9)
+        {
+            fprintf(stderr, "PruneDAGData: injected final-commit failure\n"); fflush(stderr);
+            txdb.TxnAbort();
+            return false;
+        }
+        // Persist prune height so GetBlueSet boundary check survives restart.
+        if (!txdb.WriteDAGCleanHeight(nPruneBelow))
+        {
+            fprintf(stderr, "PruneDAGData: S3 prune clean-height write failed\n"); fflush(stderr);
+            txdb.TxnAbort();
+            return false;
+        }
+        if (g_testFailDagPruneCommit || !txdb.TxnCommit())
+        {
+            fprintf(stderr, "PruneDAGData: S3 prune final commit failed\n"); fflush(stderr);
+            return false;
+        }
+        if (rollbackCapture) rollbackCapture->committed = true;
+        fprintf(stderr, "PruneDAGData: S3 prune committed below %d: deleted=%d surviving=%d changedFullFields=%d scopeClosure=%d token=%s preToken=%s\n",
+               nPruneBelow, (int)vToErase.size(), (int)stagedScope.size(),
+               (int)prRes.stagedFullFieldRecords, (int)prRes.stats.boundaryVertices,
+               dagSourcePost.ToString().substr(0,20).c_str(),
+               prunePreToken.ToString().substr(0,20).c_str()); fflush(stderr);
+    }
+    else
+    {
+        for (const uint256& hash : vToErase)
+            if (!txdb.EraseDAGLinks(hash)) { txdb.TxnAbort(); return false; }
 
-    // Persist prune height so GetBlueSet boundary check survives restart.
-    if (!txdb.WriteDAGCleanHeight(nPruneBelow) ||
-        !txdb.WriteDAGSourceStateId(dagSourcePost) ||
-        g_testFailDagPruneCommit || !txdb.TxnCommit())
-        return false;
+        // Persist prune height so GetBlueSet boundary check survives restart.
+        if (!txdb.WriteDAGCleanHeight(nPruneBelow) ||
+            !txdb.WriteDAGSourceStateId(dagSourcePost) ||
+            g_testFailDagPruneCommit || !txdb.TxnCommit())
+            return false;
+    }
     SetDagTipDeltaFinalSourceStateId(dagSourcePost);
 
     // Phase 2: Erase from memory only after LevelDB commit succeeds

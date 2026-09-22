@@ -140,8 +140,29 @@ bool g_testForceDagPruneInAdd = false;
 bool g_testSuppressDagSourceAbort = false;
 bool g_dagSourceUnhealthy = false;
 
+// S12 test-only CTxDB lifetime discriminator probes (inert when unset).
+extern int g_testTxdbCloseCount;
+extern void* g_testTxdbLastClosedPtr;
+extern int g_testTxdbOpenCount;
+extern void* g_testTxdbLastOpenedPtr;
+extern void* GetGlobalTxdbPtrForTest();
+extern int g_testDagDeltaDeliveredEvents;
+extern int g_testDagDeltaLastDeliveredKind;
+extern int g_testDagDeltaLastDeliveredOrigin;
+bool g_testS12LifetimeProbe = false;
+int g_testS12LastPostponed = 0;
+void* g_testS12SeenTxdbAddr = NULL;
+void* g_testS12SeenPdb = NULL;
+void* g_testS12SeenGlobal = NULL;
+bool g_testS12SeenPdbWasClosed = false;
+int g_testS12SeenCloseCount = 0;
+int g_testS12SeenOpenCount = 0;
+int g_testS12SeenDeliveredEvents = 0;
+
 static bool AbortDagSourcePersistence(const char* message)
 {
+    fprintf(stderr, "AbortDagSourcePersistence: %s\n", message);
+    fflush(stderr);
     g_dagSourceUnhealthy = true;
     if (g_testSuppressDagSourceAbort)
         return false;
@@ -8829,6 +8850,8 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
 
         if (!vpindexSecondary.empty())
             printf("Postponing %" PRIszu" reconnects\n", vpindexSecondary.size());
+        if (g_testS12LifetimeProbe)
+            g_testS12LastPostponed = (int)vpindexSecondary.size();
 
         // Switch to new best branch
         if (!Reorganize(txdb, pindexIntermediate))
@@ -8836,6 +8859,29 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
             txdb.TxnAbort();
             InvalidChainFound(pindexNew);
             return error("SetBestChain() : Reorganize failed");
+        }
+
+        // S12 test-only lifetime identity probe: after Reorganize (whose root
+        // delta commit may have delivered to the runtime consumer and closed
+        // the shared handle), record whether THIS txdb's pdb is now stale.
+        if (g_testS12LifetimeProbe)
+        {
+            g_testS12SeenTxdbAddr = (void*)&txdb;
+            g_testS12SeenPdb = (void*)txdb.GetInstance();
+            g_testS12SeenGlobal = GetGlobalTxdbPtrForTest();
+            g_testS12SeenPdbWasClosed =
+                (g_testS12SeenPdb != NULL && g_testS12SeenPdb == g_testTxdbLastClosedPtr);
+            g_testS12SeenCloseCount = g_testTxdbCloseCount;
+            g_testS12SeenOpenCount = g_testTxdbOpenCount;
+            g_testS12SeenDeliveredEvents = g_testDagDeltaDeliveredEvents;
+            fprintf(stderr,
+                "S12_LIFETIME_SEAM postponed=%d txdb=%p pdb=%p global=%p pdb_was_closed=%d"
+                " close_count=%d open_count=%d delivered=%d last_kind=%d last_origin=%d\n",
+                g_testS12LastPostponed, g_testS12SeenTxdbAddr, g_testS12SeenPdb,
+                g_testS12SeenGlobal, (int)g_testS12SeenPdbWasClosed,
+                g_testS12SeenCloseCount, g_testS12SeenOpenCount,
+                g_testS12SeenDeliveredEvents, g_testDagDeltaLastDeliveredKind,
+                g_testDagDeltaLastDeliveredOrigin);
         }
 
         // Connect further blocks
@@ -9124,6 +9170,12 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     bool fScoreCertPrePresent = false;
     bool fScoreCertPreRevoked = false;
     std::string scoreCertPreRaw;
+    // S3 prune rollback pre-image (authoritative): if THIS envelope's epoch
+    // crossing commits an authoritative PRUNE physical source commit, the
+    // deleted durable records + clean-height marker are captured here so a
+    // failed SetBestChain rollback restores the exact pre-envelope source in
+    // ONE batch. Envelope-scoped (plain local); never a global.
+    DagPruneRollbackCapture pruneRollbackCapture;
     std::vector<uint256> vDAGParents;
 
     // IDAG Phase 2: Initialize DAG data for post-fork blocks
@@ -9284,8 +9336,19 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                     // Prune old DAG data periodically. A false return means
                     // source persistence failed before memory mutation; never
                     // publish the pending ADD root as though it were healthy.
+                    // The envelope-scoped capture preserves the exact deleted
+                    // records so a later SetBestChain-failure rollback can
+                    // restore the pre-prune source in the same single batch.
+                    // The mutation-scoped pending overlay supplies the block
+                    // being added (committed by this envelope's ADD commit but
+                    // not yet externally resolvable) exactly like the S3
+                    // enumerate/stage callers.
+                    std::map<uint256,BlockIndexSnapshot> prunePending;
+                    BlockIndexSnapshot pruneSnap = BlockIndexSnapshotFromIndex(pindexNew);
+                    pruneSnap.fInMainChain = true;
+                    prunePending[pindexNew->GetBlockHash()] = pruneSnap;
                     CTxDB txdbPrune;
-                    if (!g_dagManager.PruneDAGData(txdbPrune, pindexNew->nHeight))
+                    if (!g_dagManager.PruneDAGData(txdbPrune, pindexNew->nHeight, &pruneRollbackCapture, &prunePending))
                     {
                         if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
                         return AbortDagSourcePersistence("AddToBlockIndex: DAG prune persistence failed; shutting down");
@@ -9295,8 +9358,12 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 // forging an epoch boundary or epoch-state topology.
                 if (g_testForceDagPruneInAdd && nCurrentEpoch <= nPreviousEpoch)
                 {
+                    std::map<uint256,BlockIndexSnapshot> prunePending2;
+                    BlockIndexSnapshot pruneSnap2 = BlockIndexSnapshotFromIndex(pindexNew);
+                    pruneSnap2.fInMainChain = true;
+                    prunePending2[pindexNew->GetBlockHash()] = pruneSnap2;
                     CTxDB txdbPrune;
-                    if (!g_dagManager.PruneDAGData(txdbPrune, pindexNew->nHeight))
+                    if (!g_dagManager.PruneDAGData(txdbPrune, pindexNew->nHeight, &pruneRollbackCapture, &prunePending2))
                     {
                         if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
                         return AbortDagSourcePersistence("AddToBlockIndex: DAG prune persistence failed; shutting down");
@@ -9355,6 +9422,40 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 // fabricate a healthy certificate. All in ONE atomic clean batch.
                 if (g_fAuthoritativeStartup)
                 {
+                    // S3 prune rollback: if THIS envelope also committed an
+                    // authoritative PRUNE physical source commit (its own source
+                    // commit after the ADD's), the failed-ADD rollback must
+                    // restore the exact PRE-PRUNE source or the durable canvas
+                    // would keep the deletions while token/certs roll back
+                    // (mixed state). Re-create every deleted durable record
+                    // byte-for-byte in THIS batch (restoring parent child-counts
+                    // through the same keyed relation update) and restore the
+                    // durable clean-height marker exactly (write the pre-value,
+                    // or erase it when it was absent). The canonical reconcile
+                    // below then runs over the fully restored pre-envelope
+                    // canvas. All in ONE atomic batch; never fabricates records.
+                    if (pruneRollbackCapture.committed)
+                    {
+                        for (size_t i = 0; i < pruneRollbackCapture.records.size(); ++i)
+                        {
+                            if (!txdbDAGClean.WriteDAGLinks(pruneRollbackCapture.records[i].first,
+                                                            pruneRollbackCapture.records[i].second))
+                            {
+                                txdbDAGClean.TxnAbort();
+                                if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                                return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback prune-record restore failed; shutting down");
+                            }
+                        }
+                        const bool cleanRestored = pruneRollbackCapture.cleanHeightPresent
+                            ? txdbDAGClean.WriteDAGCleanHeight(pruneRollbackCapture.cleanHeight)
+                            : txdbDAGClean.EraseDAGCleanHeight();
+                        if (!cleanRestored)
+                        {
+                            txdbDAGClean.TxnAbort();
+                            if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                            return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback clean-height restore failed; shutting down");
+                        }
+                    }
                     std::vector<std::pair<int32_t,uint256>> rbScope;
                     std::string rbErr;
                     if (!EnumerateAuthoritativeStagedScope(txdbDAGClean, &rbScope, NULL, &rbErr))

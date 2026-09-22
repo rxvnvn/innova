@@ -13,7 +13,11 @@ enum DagTipOverlayRuntimeStatus { DAG_TIP_OVERLAY_RUNTIME_UNAVAILABLE=0, DAG_TIP
 struct DagTipOverlayRuntimeConfig {
     uint64_t generation; std::string artifactPath, overlayDbDir, dagLinksDir; unsigned char dagInputDigest[32]; size_t cacheCapacity;
     DagTipOverlaySourceStateReader sourceReader; DagTipOverlaySourceHealthy sourceHealthy; void* context;
-    DagTipOverlayRuntimeConfig() : generation(0), cacheCapacity(0), sourceReader(NULL), sourceHealthy(NULL), context(NULL) { memset(dagInputDigest,0,32); }
+    // Caller-safe runtime-scoped reader (consumer END validation + Available()).
+    // It must NOT close another in-flight owner's shared DB handle (S12).
+    // Falls back to sourceReader when unset (legacy/test configs).
+    DagTipOverlaySourceStateReader runtimeSourceReader;
+    DagTipOverlayRuntimeConfig() : generation(0), cacheCapacity(0), sourceReader(NULL), sourceHealthy(NULL), context(NULL), runtimeSourceReader(NULL) { memset(dagInputDigest,0,32); }
 };
 class DagTipOverlayRuntime {
 public:

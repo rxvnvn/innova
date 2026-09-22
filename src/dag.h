@@ -154,6 +154,23 @@ struct CBlockDAGData
 // DAG Manager — holds all DAG state, drives GHOSTDAG/DAGKNIGHT coloring + ordering
 // ---------------------------------------------------------------------------
 
+struct BlockIndexSnapshot; // forward declaration (defined in blockindex_authoritative_startup.h)
+
+// Envelope-scoped pre-image of an authoritative (S3) DAG prune. The caller
+// (AddToBlockIndex) owns the instance for the duration of the ADD envelope so
+// a later SetBestChain-failure rollback can restore the exact pre-prune source:
+// every deleted durable record byte-for-byte plus the durable clean-height
+// marker state. Never a process-global; never touched in legacy mode.
+// path; a NULL pointer means "no rollback pre-image requested".
+struct DagPruneRollbackCapture
+{
+    std::vector<std::pair<uint256, CBlockDAGData> > records; // exact deleted rows
+    bool cleanHeightPresent;
+    int cleanHeight;
+    bool committed; // the prune's physical source commit succeeded
+    DagPruneRollbackCapture() : cleanHeightPresent(false), cleanHeight(-1), committed(false) {}
+};
+
 class CDAGManager
 {
 public:
@@ -222,8 +239,16 @@ public:
      */
     void RestoreDAGTrustIntoChainTrust();
 
-    /** Prune DAG data below nHeight - DAG_PRUNE_DEPTH, preserving epoch boundaries. */
-    bool PruneDAGData(CTxDB& txdb, int nHeight);
+    /** Prune DAG data below nHeight - DAG_PRUNE_DEPTH, preserving epoch boundaries.
+     *  rollbackCapture (optional, S3 authoritative mode only) receives the exact
+     *  pre-image of every deleted durable record + the durable clean-height
+     *  marker so a failed outer envelope can restore the pre-prune source.
+     *  chainedPending (optional) supplies the mutation-scoped pending overlay for
+     *  vertices committed by the CURRENT envelope (e.g. the block being added),
+     *  which are not yet resolvable through generation/live authority - exactly
+     *  like the S3 enumerate/stage callers. */
+    bool PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture* rollbackCapture = NULL,
+                      const std::map<uint256,BlockIndexSnapshot>* chainedPending = NULL);
 
     /** Compute epoch state for a completed epoch. */
     bool ComputeEpochState(int nEpoch, int nEpochInterval);

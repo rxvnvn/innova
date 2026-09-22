@@ -34,6 +34,13 @@ namespace fs = boost::filesystem;
 
 leveldb::DB *txdb; // global pointer for LevelDB object instance
 
+// S12 test-only shared-handle lifetime identity probes. Inert unless a fixture
+// reads them; they never alter behavior.
+int g_testTxdbCloseCount = 0;
+void* g_testTxdbLastClosedPtr = NULL;
+int g_testTxdbOpenCount = 0;
+void* g_testTxdbLastOpenedPtr = NULL;
+
 static CCriticalSection cs_txdb;
 
 static int nIBDBatchSize = 0;
@@ -135,6 +142,8 @@ CTxDB::CTxDB(const char* pszMode)
 
     init_blockindex(options); // Init directory
     pdb = txdb;
+    ++g_testTxdbOpenCount;
+    g_testTxdbLastOpenedPtr = (void*)txdb;
 
     if (Exists(string("version")))
     {
@@ -197,6 +206,10 @@ CTxDB::CTxDB(const char* pszMode)
 void CTxDB::Close()
 {
     LOCK(cs_txdb);
+    if (txdb) {
+        ++g_testTxdbCloseCount;
+        g_testTxdbLastClosedPtr = (void*)txdb;
+    }
     delete txdb;
     txdb = pdb = NULL;
     delete options.filter_policy;
@@ -205,6 +218,12 @@ void CTxDB::Close()
     options.block_cache = NULL;
     delete activeBatch;
     activeBatch = NULL;
+}
+
+// S12 test-only accessor: current shared/global txleveldb handle identity.
+void* GetGlobalTxdbPtrForTest()
+{
+    return (void*)txdb;
 }
 
 bool CTxDB::TxnAbort()
@@ -1072,6 +1091,11 @@ bool CTxDB::WriteDAGCleanHeight(int nHeight)
 bool CTxDB::ReadDAGCleanHeight(int& nHeight)
 {
     return Read(string("dagcleanheight"), nHeight);
+}
+
+bool CTxDB::EraseDAGCleanHeight()
+{
+    return Erase(string("dagcleanheight"));
 }
 
 bool CTxDB::WriteFinalityVote(const uint256& nullifier, const CFinalityVote& vote)

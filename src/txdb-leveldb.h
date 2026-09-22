@@ -370,6 +370,7 @@ public:
     bool IterateCurveTreeEpochs(std::map<int, CCurveTree>& mapOut);
     bool WriteDAGCleanHeight(int nHeight);
     bool ReadDAGCleanHeight(int& nHeight);
+    bool EraseDAGCleanHeight();
 
     // IDAG finality vote persistence
     bool WriteFinalityVote(const uint256& nullifier, const CFinalityVote& vote);

@@ -11,6 +11,12 @@
 bool g_testFailDagTipDeltaSpillWrite = false;
 bool g_testFailDagTipDeltaSpillClose = false;
 
+// S12 test-only delivery discriminator probes: prove the committed delta was
+// actually delivered (observer invoked) mid-stack, and from which origin.
+int g_testDagDeltaDeliveredEvents = 0;
+int g_testDagDeltaLastDeliveredKind = 0;
+int g_testDagDeltaLastDeliveredOrigin = 0;
+
 namespace {
 
 struct Recorder
@@ -102,6 +108,9 @@ void ResetPending()
 void Deliver(const DagTipCommittedDeltaEvent& e)
 {
     if (!g.observer) return;
+    ++g_testDagDeltaDeliveredEvents;
+    g_testDagDeltaLastDeliveredKind = (int)e.kind;
+    g_testDagDeltaLastDeliveredOrigin = (int)e.origin;
     try { g.observer(e, g.context); }
     catch (...) { g.invalid = true; }
 }

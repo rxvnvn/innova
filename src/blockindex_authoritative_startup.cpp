@@ -33,6 +33,11 @@ namespace {
 // installs it via SetDagObserverBoundaryHookForTest. See the header comment.
 static DagObserverBoundaryHook g_testDagObserverBoundaryHook = NULL;
 
+// Test-only S3 stage-barrier hook (NULL in production = no-op). Declared here so
+// StageAuthoritativeDAGScoreState can consult it; only a test installs it via
+// SetAuthoritativeStageBarrierHookForTest.
+static AuthoritativeStageBarrierHook g_testAuthoritativeStageBarrierHook = NULL;
+
 // Process-lifetime owner of the authoritative startup context. The bootstrap's
 // HotOwner owns the best-tip/genesis CBlockIndex objects that pindexBest /
 // pindexGenesisBlock point to; it MUST outlive every consumer touching those
@@ -68,6 +73,19 @@ static bool ReadAuthoritativeDagSourceState(uint256* out, void*)
     const bool ok = db.ReadDAGSourceStateId(*out);
     db.Close(); // recovery subsequently opens daglinks directly; never hold txleveldb LOCK.
     return ok;
+}
+// Caller-safe runtime variant: used by the live delivery consumer (END
+// validation) and runtime availability checks. Unlike the startup/recovery
+// reader above it NEVER closes the shared txleveldb handle: runtime delivery
+// runs while a CTxDB owned by the enclosing operation (SetBestChain /
+// Reorganize / postponed-reconnect loop) may still be in flight, and closing
+// the shared handle there would leave that owner's pdb dangling (S12).
+// Close-before-direct-open discipline remains with the startup/recovery reader.
+static bool ReadAuthoritativeDagSourceStateRuntime(uint256* out, void*)
+{
+    if (!out) return false;
+    CTxDB db("r");
+    return db.ReadDAGSourceStateId(*out);
 }
 static bool HealthyAuthoritativeDagSource(void*)
 {
@@ -328,6 +346,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
     if (dagFrontierCapability == DAG_TIP_FRONTIER_CAPABILITY_PRESENT_VALID)
     {
         dagRuntimeConfig.sourceReader = &ReadAuthoritativeDagSourceState;
+        dagRuntimeConfig.runtimeSourceReader = &ReadAuthoritativeDagSourceStateRuntime;
         dagRuntimeConfig.sourceHealthy = &HealthyAuthoritativeDagSource;
         std::unique_ptr<dag_tip_frontier::DagTipOverlayRuntime> runtime(new dag_tip_frontier::DagTipOverlayRuntime());
         std::string rerr;
@@ -554,6 +573,22 @@ void ClearAuthoritativeLiveForTesting()
 void SetDagObserverBoundaryHookForTest(DagObserverBoundaryHook hook)
 {
     g_testDagObserverBoundaryHook = hook;
+}
+
+// Test-only S3 stage-barrier hook setter + synchronous barrier helper. The
+// static is declared at the top of this namespace so the shared staging engine
+// can consult it; production never installs a hook (inert, no behavior change).
+void SetAuthoritativeStageBarrierHookForTest(AuthoritativeStageBarrierHook hook)
+{
+    g_testAuthoritativeStageBarrierHook = hook;
+}
+static bool AuthoritativeStageBarrier(int barrier, std::string* error)
+{
+    if (!g_testAuthoritativeStageBarrierHook) return true;
+    std::string berr;
+    if (g_testAuthoritativeStageBarrierHook(barrier, &berr)) return true;
+    if (error) *error = berr.empty() ? "S3 stage: injected stage-barrier failure" : berr;
+    return false;
 }
 
 // A.10.1q / Stage1: emit residency for the retained authoritative context,
@@ -1278,6 +1313,7 @@ bool StageAuthoritativeDAGScoreState(
     std::vector<CanonicalDAGRecolorRecord> fields;
     CanonicalDAGRecolorStats stats;
     std::string rerr;
+    if (!AuthoritativeStageBarrier(1, error)) return false;
     if (!ReconstructAuthoritativeDAGFields(stagedScope, source, &fields, &stats, &rerr)) {
         if (error) *error="S3 stage: canonical recolor failed: "+rerr;
         return false;
@@ -1296,11 +1332,15 @@ bool StageAuthoritativeDAGScoreState(
     // while still running the full canonical recolor for correct leaf heritage.
     // Stage authoritative full-field for every affected retained vertex back into
     // the SAME WriteBatch (shared diff-only loop; see StageDAGFullFieldRecords).
+    if (!AuthoritativeStageBarrier(2, error)) return false;
     if (!StageDAGFullFieldRecords(db, fields, chainedPending, diffOnlyWrites, result, error)) return false;
     // Stage the new SourceStateId (advances the token; also binds the child-count
     // marker to it via WriteDAGSourceStateId), then both certificates.
+    if (!AuthoritativeStageBarrier(3, error)) return false;
     if (!db.WriteDAGSourceStateId(newSourceToken)) { if (error) *error="S3 stage: source token write failed"; return false; }
+    if (!AuthoritativeStageBarrier(4, error)) return false;
     if (!db.StageDAGScoreCertificateInBatch(newSourceToken, error)) return false;
+    if (!AuthoritativeStageBarrier(5, error)) return false;
     if (!db.StageDAGChildCountCertificateInBatch(newSourceToken, error)) return false;
     // Rough write-batch byte estimate: daglinks records (full-field) + markers + token.
     size_t approx = (sizeof(uint256)+sizeof(CBlockDAGData)+32) * fields.size();
