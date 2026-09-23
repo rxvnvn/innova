@@ -39,6 +39,7 @@
 #include "dag.h"
 #include "dag_tips_delta.h"
 #include "dag_mutation_preview.h"
+#include "dag_tip_selector.h"
 #include "dag_tip_overlay_runtime.h"
 #include "dag_tip_frontier.h"
 #include "blockindex_authoritative_startup.h"
@@ -320,6 +321,57 @@ static CBlockIndex* AddSideDag(CBlockIndex* pindexPrev, unsigned int nExtra)
     delete b;
     BOOST_REQUIRE(out != NULL);
     return out;
+}
+
+// ---------------------------------------------------------------------------
+// R2c.2/S6 vehicle builds for deliberately-degraded-authority mutation
+// fixtures. The production authoritative primary selection correctly FAILS
+// CLOSED when the score authority is uncertified/revoked (or the overlay
+// runtime is intentionally stale). Rollback/prune fixtures that construct a
+// vehicle block for a MUTATION under test - the mutation itself still runs
+// through the unchanged production path - therefore build the vehicle through
+// the legacy construction branch; the block BUILD is not the subject under
+// test and every assertion on the mutation/rollback semantics is unchanged.
+// ---------------------------------------------------------------------------
+static CBlock* BuildPoWBlockVehicle(CBlockIndex* pindexPrev, unsigned int nExtra)
+{
+    const bool fSavedAuthoritative = g_fAuthoritativeStartup;
+    g_fAuthoritativeStartup = false;
+    CBlock* b = BuildPoWBlock(pindexPrev, nExtra);
+    g_fAuthoritativeStartup = fSavedAuthoritative;
+    return b;
+}
+
+static CBlockIndex* MineRealDagVehicle(CBlockIndex* pindexPrev, unsigned int nExtra)
+{
+    CBlock* b = BuildPoWBlockVehicle(pindexPrev, nExtra);
+    BOOST_REQUIRE(b != NULL);
+    AttachDagParentsAndRemine(b, std::vector<uint256>(1, pindexPrev->GetBlockHash()));
+    CBlockIndex* out = NULL;
+    { LOCK(cs_main); uint256 h = b->GetHash(); BOOST_REQUIRE(b->CheckBlock(true,true,true)); BOOST_REQUIRE(ProcessBlock(NULL,b)); out = mapBlockIndex[h]; }
+    delete b;
+    BOOST_REQUIRE(out != NULL);
+    return out;
+}
+
+// S6: delta observer tap that records events for the fixture AND forwards them
+// to the registered overlay runtime. The S3 token-trace fixtures replace the
+// production observer during their capture window; without forwarding, the
+// runtime's applied token would go stale and the (correct) fail-closed
+// authoritative selection would refuse to build. Later mutations use the pure
+// forwarding observer below so the runtime stays current for the rest of the
+// fixture.
+static void DagDeltaCaptureRecordAndForward(const DagTipCommittedDeltaEvent& e, void* p)
+{
+    DagDeltaCapture::Record(e, p);
+    dag_tip_frontier::DagTipOverlayRuntime* rt = GetDagTipOverlayRuntimeForTest();
+    if (rt) { std::string ignored; rt->ConsumeCommittedDelta(e, &ignored); }
+}
+
+static void ForwardCommittedDeltaToRuntime(const DagTipCommittedDeltaEvent& e, void*)
+{
+    dag_tip_frontier::DagTipOverlayRuntime* rt = GetDagTipOverlayRuntimeForTest();
+    if (rt) { std::string ignored; rt->ConsumeCommittedDelta(e, &ignored); }
 }
 
 // S12 discriminator helper: add a side DAG-era block whose resulting chain
@@ -5027,10 +5079,13 @@ BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_live_prune_e2e)
     uint256 belowLineHash;
     std::map<uint256,std::string> viewFinal;
     {
-        SetDagTipCommittedDeltaObserver(&DagDeltaCapture::Record,&capTrigger);
+        SetDagTipCommittedDeltaObserver(&DagDeltaCaptureRecordAndForward,&capTrigger);
         CBlockIndex* trigger = NULL;
         { PruneSeamScope seams(1,true); trigger = MineRealDag(q, 0x9303); }
-        SetDagTipCommittedDeltaObserver(NULL,NULL);
+        // S6: keep the runtime fed for the remainder of the fixture (the
+        // capture window above already forwarded); never leave the observer
+        // unwired while authoritative consumers keep running.
+        SetDagTipCommittedDeltaObserver(&ForwardCommittedDeltaToRuntime,NULL);
         BOOST_REQUIRE(trigger != NULL);
         BOOST_CHECK(!g_dagSourceUnhealthy);
         triggerPtr = trigger;
@@ -5554,7 +5609,7 @@ BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_prune_rollback_setbestchain_failure)
         uint256 failedHash;
         bool added=true;
         {
-            std::unique_ptr<CBlock> add(BuildPoWBlock(pindexBest,0x9900));
+            std::unique_ptr<CBlock> add(BuildPoWBlockVehicle(pindexBest,0x9900));
             BOOST_REQUIRE(add.get()!=NULL);
             AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,pindexBest->GetBlockHash()));
             unsigned int f=0,pos=0;
@@ -5586,7 +5641,7 @@ BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_prune_rollback_setbestchain_failure)
     // ---- Heal: one real authoritative ADD (no prune) binds both certificates
     // so the healthy-preservation case below starts from a healthy state.
     {
-        CBlockIndex* healed = MineRealDag(pindexBest, 0x98F5);
+        CBlockIndex* healed = MineRealDagVehicle(pindexBest, 0x98F5);
         BOOST_REQUIRE(healed != NULL);
     }
 
@@ -5636,7 +5691,7 @@ BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_prune_rollback_setbestchain_failure)
         uint256 failedHash;
         bool added=true;
         {
-            std::unique_ptr<CBlock> add(BuildPoWBlock(pindexBest,0x9901));
+            std::unique_ptr<CBlock> add(BuildPoWBlockVehicle(pindexBest,0x9901));
             BOOST_REQUIRE(add.get()!=NULL);
             AttachDagParentsAndRemine(add.get(),std::vector<uint256>(1,pindexBest->GetBlockHash()));
             unsigned int f=0,pos=0;
@@ -5668,7 +5723,7 @@ BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_prune_rollback_setbestchain_failure)
     // staged new line nor absence.
     {
         // Seed: one SUCCESSFUL forced-prune ADD so clean-height is committed.
-        { PruneSeamScope seams(1,true); CBlockIndex* seeded = MineRealDag(pindexBest, 0x9902); BOOST_REQUIRE(seeded != NULL); }
+        { PruneSeamScope seams(1,true); CBlockIndex* seeded = MineRealDagVehicle(pindexBest, 0x9902); BOOST_REQUIRE(seeded != NULL); }
         BOOST_REQUIRE(!g_dagSourceUnhealthy);
         PruneStateSnapshot s0 = SnapshotPruneState();
         BOOST_CHECK_MESSAGE(s0.cleanPresent, "case C pre-state must have clean-height present");
@@ -7654,5 +7709,1140 @@ BOOST_AUTO_TEST_CASE(r2c2s_s5_preview_nonresident_and_bounded_state)
     S5DisarmProbe();
 }
 
+
+// ===========================================================================
+// R2c.2/S6 — authoritative primary DAG tip selector fixtures.
+//
+// Coverage map (directive matrix):
+//   S6-A: external CLEAN selection, resident legacy parity, real new tip,
+//         side (non-active) exclusion, valid-no-eligible active-head fallback.
+//   S6-B: failure semantics: source unhealthy, runtime absent, TOCTOU (token
+//         change / health loss during enumeration), CPU identity + collateral
+//         fail-closed semantics, legacy-mode discriminator.
+//   S6-C: boundary resolution (by-value walk + active-at-height agreement),
+//         materialization lifetime, finality-shape composition, negatives.
+//   S6-D: internal S5-preview selection during real ADD (crossing) + REORG
+//         envelopes; parity with the accepted S5 resolver; forced-unavailable
+//         propagation through the internal consumer entry.
+//   S6-E: synthetic reduction matrix (single/tie/zero/PoS/active/filters/
+//         read-failure/revalidation/enumeration-failure).
+// ===========================================================================
+
+struct S6Fixture
+{
+    fs::path root;
+    CBlockIndex* forkBest;
+    int epochEnd;
+    uint256 boundaryHash;
+    S6Fixture()
+        : root(fs::temp_directory_path() / fs::unique_path("s6-sel-%%%%-%%%%")),
+          forkBest(NULL), epochEnd(-1), boundaryHash(0) {}
+};
+
+struct S6Cleanup
+{
+    fs::path root;
+    CBlockIndex* best;
+    CBlockIndex* genesis;
+    S6Cleanup(const fs::path& r)
+        : root(r), best(pindexBest), genesis(pindexGenesisBlock) {}
+    ~S6Cleanup()
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        pindexBest = best;
+        pindexGenesisBlock = genesis;
+        if (best) { nBestHeight = best->nHeight; hashBestChain = best->GetBlockHash(); nBestChainTrust = best->nChainTrust; }
+        g_testSuppressDagSourceAbort = false; g_testForceDagPruneInAdd = false; g_testDagPruneDepth = 0;
+        g_dagSourceUnhealthy = false;
+        SetDagMutationPreviewPhaseHookForTest(NULL);
+        SetDagTipSelectorEnumerationHookForTest(NULL, NULL);
+        SetDagTipSelectorForceUnavailableForTest(false, DAG_TIP_SELECTION_REASON_NONE);
+        SetMockTime(0);
+        try { fs::remove_all(root); } catch (...) {}
+    }
+};
+
+static void S6BuildAuthoritativeFixture(S6Fixture& fx, unsigned nonceBase)
+{
+    SetMockTime(1700003600);
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* p = pindexBest;
+    while (p->nHeight < GetForkHeightDAG()) p = MineReal(p, nonceBase + p->nHeight);
+    const int epoch = GetEpochForHeight(p->nHeight);
+    const int epochEnd = GetEpochBoundaryHeight(epoch + 1, p->nHeight) - 1;
+    while (p->nHeight < epochEnd) p = MineRealDag(p, nonceBase + 0x100 + p->nHeight);
+    BOOST_REQUIRE_EQUAL(p->nHeight, epochEnd);
+    fx.forkBest = p;
+    fx.epochEnd = epochEnd;
+    fx.boundaryHash = p->GetBlockHash();
+
+    fs::create_directories(fx.root / "snapshot");
+    { CTxDB db; db.Close(); }
+    const auto liveDir = GetDataDir() / "txleveldb";
+    for (fs::directory_iterator it(liveDir), end; it != end; ++it)
+        if (fs::is_regular_file(it->path()))
+            fs::copy_file(it->path(), fx.root / "snapshot" / it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((fx.root / "snapshot").string(), &src, &aerr), aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((fx.root / "snapshot").string(), &src.dagLinks, &src.dagScores, &aerr), aerr);
+    src.foundDAGLinks = true;
+    src.blockDataDir = GetDataDir().string();
+    src.dagLinksDir = (fx.root / "snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src, (fx.root / "build-000001.tmp").string(), 1, NULL, &aerr), aerr);
+    ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(fx.root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(fx.root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &aerr), aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    g_testSuppressDagSourceAbort = true;
+    ResetDagTipSelectorStatsForTest();
+}
+
+// ---------------------------------------------------------------------------
+// S6-A: external CLEAN selection parity + real tip + side exclusion + fallback
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s6_external_clean_selection_parity_and_filters)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+
+    // Legacy-mode discriminator (before any authoritative boot): the selector
+    // reports LEGACY and the historical resident selector still answers.
+    {
+        std::string e;
+        DagTipSelectionResult lg = SelectDagTipForExternalConsumer(&e);
+        BOOST_CHECK_EQUAL((int)lg.status, (int)DAG_TIP_SELECTION_LEGACY);
+        DagTipSelectionResult lgi = SelectDagTipForInternalConsumer(NULL, &e);
+        BOOST_CHECK_EQUAL((int)lgi.status, (int)DAG_TIP_SELECTION_LEGACY);
+        BOOST_CHECK(g_dagManager.SelectBestDAGTip() != NULL);
+    }
+
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+    S6BuildAuthoritativeFixture(fx, 0xE100);
+    BOOST_CHECK(IsDagTipSelectorRuntimeRegistered());
+
+    std::string e;
+
+    // (1) resident parity: external selection == legacy selection on the same
+    // authoritative state (the base tip is the only eligible candidate).
+    uint256 hashP = fx.forkBest->GetBlockHash();
+    DagTipSelectionResult s1 = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s1.IsUsable(), e);
+    BOOST_CHECK_MESSAGE(s1.status == DAG_TIP_SELECTION_SELECTED,
+        "base tip must be an eligible selected candidate");
+    BOOST_CHECK_MESSAGE(s1.hash == hashP, "selection must return the base tip hash");
+    BOOST_CHECK_EQUAL(s1.height, fx.forkBest->nHeight);
+    CBlockIndex* legacy1 = g_dagManager.SelectBestDAGTip();
+    BOOST_REQUIRE(legacy1 != NULL);
+    BOOST_CHECK_MESSAGE(s1.hash == legacy1->GetBlockHash(),
+        "resident parity: authoritative selection must equal legacy selection");
+
+    // (2) a real new active tip: winner follows the new tip; parity holds.
+    CBlockIndex* c1 = MineRealDag(fx.forkBest, 0xE201);
+    BOOST_REQUIRE(c1 != NULL);
+    uint256 hashC1 = c1->GetBlockHash();
+    DagTipSelectionResult s2 = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s2.IsUsable(), e);
+    BOOST_CHECK_MESSAGE(s2.status == DAG_TIP_SELECTION_SELECTED, "new active tip must win");
+    BOOST_CHECK(s2.hash == hashC1);
+    BOOST_CHECK_EQUAL(s2.height, c1->nHeight);
+    CBlockIndex* legacy2 = g_dagManager.SelectBestDAGTip();
+    BOOST_REQUIRE(legacy2 != NULL);
+    BOOST_CHECK(legacy2->GetBlockHash() == hashC1);
+    BOOST_CHECK(s2.hash == legacy2->GetBlockHash());
+    {
+        CBlockDAGData d;
+        BOOST_REQUIRE(g_dagManager.GetDAGData(hashC1, d));
+        BOOST_CHECK_MESSAGE(s2.score == d.nDAGScore,
+            "selected score must equal the canonical resident score for the live vertex");
+        CBlockDAGData pd;
+        { CTxDB db; BOOST_REQUIRE(db.ReadDAGLinks(hashC1, pd)); }
+        BOOST_CHECK_MESSAGE(s2.score == pd.nDAGScore,
+            "selected score must equal the canonical persisted score (no recolor-on-read)");
+    }
+
+    // (3) a lower-trust fork below the current tip: retained + childless + in
+    // the frontier, but NOT on the active chain -> excluded by eligibility; the
+    // active tip remains the winner, and legacy reaches the same winner.
+    CBlockIndex* side = AddSideDag(c1, 0xE202); // extends the active chain (new tip)
+    BOOST_REQUIRE(side != NULL);
+    uint256 hashSide = side->GetBlockHash();
+    DagTipSelectionResult sExt = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(sExt.IsUsable(), e);
+    BOOST_CHECK_MESSAGE(sExt.status == DAG_TIP_SELECTION_SELECTED && sExt.hash == hashSide,
+        "extending the active chain must move the winner to the new tip");
+    CBlockIndex* fork = AddSideDag(fx.forkBest, 0xE203); // fork at lower trust
+    BOOST_REQUIRE(fork != NULL);
+    uint256 hashFork = fork->GetBlockHash();
+    BOOST_CHECK(fork != side);
+    BOOST_CHECK(fork->nHeight < side->nHeight);
+    DagTipSelectorStats statsBefore = GetDagTipSelectorStats();
+    DagTipSelectionResult s3 = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s3.IsUsable(), e);
+    BOOST_CHECK_MESSAGE(s3.status == DAG_TIP_SELECTION_SELECTED,
+        "the active tip must remain selectable");
+    BOOST_CHECK_MESSAGE(s3.hash == hashSide, "fork must be excluded; the active tip wins");
+    BOOST_CHECK_MESSAGE(s3.hash != hashFork, "non-active-chain candidate must never win");
+    DagTipSelectorStats statsAfter = GetDagTipSelectorStats();
+    BOOST_CHECK_MESSAGE(statsAfter.frontierEmits > statsBefore.frontierEmits,
+        "the fork must have been enumerated in the frontier and excluded by the eligibility filter");
+    CBlockIndex* legacy3 = g_dagManager.SelectBestDAGTip();
+    BOOST_REQUIRE(legacy3 != NULL);
+    BOOST_CHECK_MESSAGE(legacy3->GetBlockHash() == hashSide, "resident parity on the fork state");
+    BOOST_CHECK(s3.hash == legacy3->GetBlockHash());
+
+    BOOST_TEST_MESSAGE("S6_EXTERNAL residentParity=1 newTipSelected=1 extendedTipSelected=1 forkExcluded=1 scoreParity=1");
+}
+
+// ---------------------------------------------------------------------------
+// S6-B: failure semantics + CPU consumers + TOCTOU
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s6_external_failure_semantics_and_cpu_consumers)
+{
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+    S6BuildAuthoritativeFixture(fx, 0xE300);
+
+    uint256 token0; { CTxDB db; BOOST_REQUIRE(db.ReadDAGSourceStateId(token0)); }
+    std::string e;
+
+    // (1) healthy: selection usable; CPU consumers agree with it.
+    DagTipSelectionResult s0 = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s0.IsUsable(), e);
+    CPUMiningWorkIdentity id0 = CaptureCurrentCPUMiningWorkIdentityForTest();
+    BOOST_CHECK(!id0.fSelectionUnavailable);
+    BOOST_CHECK(id0.hashPrimaryParent == s0.hash);
+    BOOST_CHECK_EQUAL(id0.nHeight, s0.height + 1);
+    BOOST_CHECK(IsCPUMiningWorkCurrentForTest(id0, false));
+    BOOST_CHECK(IsCPUMiningCollateralStateReadyForTest());
+
+    // (2) source unhealthy: fail closed everywhere; no legacy fallback.
+    g_dagSourceUnhealthy = true;
+    DagTipSelectionResult s1 = SelectDagTipForExternalConsumer(&e);
+    BOOST_CHECK_EQUAL((int)s1.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+    BOOST_CHECK(s1.hash == uint256(0));
+    CPUMiningWorkIdentity id1 = CaptureCurrentCPUMiningWorkIdentityForTest();
+    BOOST_CHECK(id1.fSelectionUnavailable);
+    BOOST_CHECK(!CPUMiningWorkIdentityMatches(id0, id1, false));
+    BOOST_CHECK(!IsCPUMiningWorkCurrentForTest(id0, false));
+    BOOST_CHECK(!IsCPUMiningCollateralStateReadyForTest());
+    g_dagSourceUnhealthy = false;
+    DagTipSelectionResult s2 = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s2.IsUsable(), e);
+
+    // (3) runtime absent while authoritative mode is on: fail closed.
+    ClearDagTipSelectorRuntime();
+    DagTipSelectionResult s3 = SelectDagTipForExternalConsumer(&e);
+    BOOST_CHECK_EQUAL((int)s3.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+    BOOST_CHECK_EQUAL((int)s3.reason, (int)DAG_TIP_SELECTION_REASON_RUNTIME_ABSENT);
+    SetDagTipSelectorRuntime(GetDagTipOverlayRuntimeForTest());
+    BOOST_CHECK(IsDagTipSelectorRuntimeRegistered());
+
+    // (4) score-authority revocation: specific fail-closed reason.
+    { CTxDB db; BOOST_REQUIRE(db.RevokeDAGScoreAuthorityForTest()); }
+    DagTipSelectionResult s4 = SelectDagTipForExternalConsumer(&e);
+    BOOST_CHECK_EQUAL((int)s4.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+    BOOST_CHECK_EQUAL((int)s4.reason, (int)DAG_TIP_SELECTION_REASON_SCORE_AUTHORITY_UNHEALTHY);
+    { CDataStream k(SER_DISK, CLIENT_VERSION);
+      k << std::make_pair(std::string("dagscoreinvalid"), uint8_t(0));
+      S4RawDel(k.str()); }
+    DagTipSelectionResult s4b = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s4b.IsUsable(), e);
+
+    // (5) child-count revocation: specific fail-closed reason.
+    { CTxDB db; BOOST_REQUIRE(db.RevokeDAGChildCountForTest()); }
+    DagTipSelectionResult s5 = SelectDagTipForExternalConsumer(&e);
+    BOOST_CHECK_EQUAL((int)s5.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+    BOOST_CHECK_EQUAL((int)s5.reason, (int)DAG_TIP_SELECTION_REASON_CHILD_COUNT_UNHEALTHY);
+    { CDataStream k(SER_DISK, CLIENT_VERSION);
+      k << std::make_pair(std::string("dagchildcountinvalid"), uint8_t(0));
+      S4RawDel(k.str()); }
+    { CTxDB db; std::string he2; BOOST_REQUIRE(db.IsDAGChildCountIndexHealthy(&he2)); }
+    DagTipSelectionResult s5b = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s5b.IsUsable(), e);
+
+    // (6) TOCTOU: token change during enumeration => REVALIDATION_FAILED, no
+    // partial winner; restoring the token recovers.
+    struct HookCtx { uint256 fake; bool fired; } hctx;
+    hctx.fake = uint256(0x5EED0001); hctx.fired = false;
+    SetDagTipSelectorEnumerationHookForTest(
+        [](void* p) { HookCtx* c = (HookCtx*)p; c->fired = true; CTxDB db; db.WriteDAGSourceStateId(c->fake); },
+        &hctx);
+    DagTipSelectionResult s6 = SelectDagTipForExternalConsumer(&e);
+    BOOST_CHECK(hctx.fired);
+    BOOST_CHECK_EQUAL((int)s6.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+    BOOST_CHECK_EQUAL((int)s6.reason, (int)DAG_TIP_SELECTION_REASON_REVALIDATION_FAILED);
+    BOOST_CHECK(s6.hash == uint256(0));
+    SetDagTipSelectorEnumerationHookForTest(NULL, NULL);
+    { CTxDB db; BOOST_REQUIRE(db.WriteDAGSourceStateId(token0)); }
+    DagTipSelectionResult s7 = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s7.IsUsable(), e);
+
+    // (7) TOCTOU: health loss during enumeration => REVALIDATION_FAILED.
+    SetDagTipSelectorEnumerationHookForTest(
+        [](void*) { g_dagSourceUnhealthy = true; }, NULL);
+    DagTipSelectionResult s8 = SelectDagTipForExternalConsumer(&e);
+    BOOST_CHECK_EQUAL((int)s8.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+    BOOST_CHECK_EQUAL((int)s8.reason, (int)DAG_TIP_SELECTION_REASON_REVALIDATION_FAILED);
+    SetDagTipSelectorEnumerationHookForTest(NULL, NULL);
+    g_dagSourceUnhealthy = false;
+
+    BOOST_TEST_MESSAGE("S6_FAILURE unhealthyFailClosed=1 runtimeAbsent=1 scoreRevoked=1 countRevoked=1 tokenToctou=1 healthToctou=1 cpuIdentityFailClosed=1 cpuCollateralFailClosed=1");
+}
+
+// ---------------------------------------------------------------------------
+// S6-C: boundary resolution + materialization (finality-shape composition)
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s6_boundary_resolution_and_materialization)
+{
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+    S6BuildAuthoritativeFixture(fx, 0xE400);
+    auto live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    std::string e;
+
+    // Crossing ADD (real epoch consumer with the S6 selector inside).
+    // R2c.2/S6-repair (Phase 10): reset the consumer counter BEFORE the tested
+    // production action so a previous action in this process cannot satisfy
+    // the post-action assertion (counter=0 -> action -> counter>=1).
+    g_testS5ConsumerValidationsEpoch = 0;
+    CBlockIndex* c = NULL;
+    { PruneSeamScope seams(1, false); c = MineRealDag(fx.forkBest, 0xE501); }
+    BOOST_REQUIRE(c != NULL);
+    uint256 hashC = c->GetBlockHash();
+    BOOST_REQUIRE_MESSAGE(g_testS5ConsumerValidationsEpoch >= 1,
+        "the epoch consumer must have validated the preview during the crossing ADD");
+
+    // (1) finality-shape composition on real state: external selection ->
+    // by-value boundary walk -> bounded materialization.
+    DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(sel.IsUsable(), e);
+    BOOST_CHECK(sel.hash == hashC);
+    DagTipSelectionResult b1 = ResolveAuthoritativeBoundaryAtHeight(sel.hash, fx.epochEnd, &e);
+    BOOST_REQUIRE_MESSAGE(b1.IsUsable(), e);
+    BOOST_CHECK_MESSAGE(b1.hash == fx.boundaryHash,
+        "boundary walk must resolve the real epoch boundary block");
+    DagTipSelectionResult b2 = ResolveAuthoritativeActiveAtHeight(fx.epochEnd, &e);
+    BOOST_REQUIRE_MESSAGE(b2.IsUsable(), e);
+    BOOST_CHECK_MESSAGE(b2.hash == fx.boundaryHash,
+        "active-at-height must agree with the selected-parent walk");
+    BOOST_CHECK(b1.hash == b2.hash);
+
+    // (2) bounded materialization of selected + boundary hashes.
+    // NOTE: MaterializeParentChain is operation-scoped: the authority owns the
+    // chain until the next ProcessBlock releases it; the handle is filled empty
+    // by design. Validity is proven by the returned pointer's identity.
+    {
+        BlockIndexHotHandle h;
+        CBlockIndex* pBoundary = live->MaterializeParentChain(fx.boundaryHash, &h, &e);
+        BOOST_REQUIRE_MESSAGE(pBoundary != NULL, e);
+        BOOST_CHECK(pBoundary->GetBlockHash() == fx.boundaryHash);
+        BOOST_CHECK_EQUAL(pBoundary->nHeight, fx.epochEnd);
+    }
+    {
+        BlockIndexHotHandle h;
+        CBlockIndex* pSel = live->MaterializeParentChain(sel.hash, &h, &e);
+        BOOST_REQUIRE_MESSAGE(pSel != NULL, e);
+        BOOST_CHECK(pSel->GetBlockHash() == hashC);
+    }
+
+    // (3) longer walk agreement: mine deeper, walk must still land exactly.
+    CBlockIndex* d = c;
+    for (int i = 0; i < 3; ++i) d = MineRealDag(d, 0xE510 + i);
+    DagTipSelectionResult sel2 = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(sel2.IsUsable(), e);
+    DagTipSelectionResult b3 = ResolveAuthoritativeBoundaryAtHeight(sel2.hash, fx.epochEnd, &e);
+    BOOST_REQUIRE_MESSAGE(b3.IsUsable(), e);
+    BOOST_CHECK(b3.hash == fx.boundaryHash);
+
+    // (4) negatives: target above the selected start; unknown height.
+    DagTipSelectionResult n1 = ResolveAuthoritativeBoundaryAtHeight(sel2.hash, fx.epochEnd + 500, &e);
+    BOOST_CHECK_EQUAL((int)n1.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+    DagTipSelectionResult n2 = ResolveAuthoritativeActiveAtHeight(fx.epochEnd + 500, &e);
+    BOOST_CHECK_EQUAL((int)n2.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+
+    BOOST_TEST_MESSAGE("S6_BOUNDARY walk=1 activeAtHeightAgree=1 materialized=1 longWalk=1 negatives=1 epochConsumer=1");
+}
+
+// ---------------------------------------------------------------------------
+// S6-D: internal S5-preview selection during real ADD + REORG envelopes
+// ---------------------------------------------------------------------------
+struct S6Probe
+{
+    int internalStatusAtCommitted;
+    uint256 internalHashAtCommitted;
+    int s5ResolverFoundAtCommitted;
+    int s5ResolverStatusAtCommitted;
+    std::string s5ResolverErrorAtCommitted;
+    int parityAtCommitted;
+    int forcedUnavailableStatus;
+    int forcedUnavailableReason;
+    int internalStatusAtEnd;
+    uint256 internalHashAtEnd;
+    int internalStatusAtReorgCommitted;
+    int internalStatusAtReorgEnd;
+    uint256 internalHashAtReorgEnd;
+    bool sawAddCommitted, sawAddEnd, sawReorgCommitted, sawReorgEnd;
+    S6Probe()
+        : internalStatusAtCommitted(-1), internalHashAtCommitted(0),
+          s5ResolverFoundAtCommitted(-1), s5ResolverStatusAtCommitted(-1),
+          parityAtCommitted(-1),
+          forcedUnavailableStatus(-1), forcedUnavailableReason(-1),
+          internalStatusAtEnd(-1), internalHashAtEnd(0),
+          internalStatusAtReorgCommitted(-1), internalStatusAtReorgEnd(-1),
+          internalHashAtReorgEnd(0),
+          sawAddCommitted(false), sawAddEnd(false), sawReorgCommitted(false), sawReorgEnd(false) {}
+};
+static S6Probe* g_s6Probe = NULL;
+
+static void S6ProbeHook(const char* phase)
+{
+    if (!g_s6Probe) return;
+    std::string p = phase ? phase : "";
+    std::string e;
+    if (p == "add_source_committed")
+    {
+        g_s6Probe->sawAddCommitted = true;
+        const DagMutationPreview* pv = GetActiveDagMutationPreview();
+        DagTipSelectionResult sel = SelectDagTipForInternalConsumer(pv, &e);
+        g_s6Probe->internalStatusAtCommitted = (int)sel.status;
+        g_s6Probe->internalHashAtCommitted = sel.hash;
+        bool found = false; uint256 bh(0), bs(0); std::string re;
+        DagMutationPreviewStatus rs = pv ? pv->ResolveBestTip(&found, &bh, &bs, &re)
+                                         : DAG_MUTATION_PREVIEW_NO_ACTIVE_ROOT;
+        g_s6Probe->s5ResolverStatusAtCommitted = (int)rs;
+        g_s6Probe->s5ResolverErrorAtCommitted = re;
+        if (rs == DAG_MUTATION_PREVIEW_OK)
+        {
+            g_s6Probe->s5ResolverFoundAtCommitted = found ? 1 : 0;
+            if (found)
+                g_s6Probe->parityAtCommitted = (sel.IsUsable() && sel.hash == bh) ? 1 : 0;
+            else
+                g_s6Probe->parityAtCommitted = (sel.status == DAG_TIP_SELECTION_VALID_NO_ELIGIBLE) ? 1 : 0;
+        }
+        SetDagTipSelectorForceUnavailableForTest(true, DAG_TIP_SELECTION_REASON_SOURCE_UNHEALTHY);
+        DagTipSelectionResult forced = SelectDagTipForInternalConsumer(pv, &e);
+        g_s6Probe->forcedUnavailableStatus = (int)forced.status;
+        g_s6Probe->forcedUnavailableReason = (int)forced.reason;
+        SetDagTipSelectorForceUnavailableForTest(false, DAG_TIP_SELECTION_REASON_NONE);
+    }
+    else if (p == "add_envelope_end")
+    {
+        g_s6Probe->sawAddEnd = true;
+        DagTipSelectionResult sel = SelectDagTipForInternalConsumer(GetActiveDagMutationPreview(), &e);
+        g_s6Probe->internalStatusAtEnd = (int)sel.status;
+        g_s6Probe->internalHashAtEnd = sel.hash;
+    }
+    else if (p == "reorg_source_committed")
+    {
+        g_s6Probe->sawReorgCommitted = true;
+        DagTipSelectionResult sel = SelectDagTipForInternalConsumer(GetActiveDagMutationPreview(), &e);
+        g_s6Probe->internalStatusAtReorgCommitted = (int)sel.status;
+    }
+    else if (p == "reorg_envelope_end")
+    {
+        g_s6Probe->sawReorgEnd = true;
+        DagTipSelectionResult sel = SelectDagTipForInternalConsumer(GetActiveDagMutationPreview(), &e);
+        g_s6Probe->internalStatusAtReorgEnd = (int)sel.status;
+        g_s6Probe->internalHashAtReorgEnd = sel.hash;
+    }
+}
+
+BOOST_AUTO_TEST_CASE(r2c2s_s6_internal_preview_selection_add_and_reorg)
+{
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+    S6BuildAuthoritativeFixture(fx, 0xE600);
+
+    S6Probe probe; g_s6Probe = &probe;
+    SetDagMutationPreviewPhaseHookForTest(S6ProbeHook);
+
+    // (1) real crossing ADD: internal consumers observe the transaction-scoped
+    // preview; before publication the new block is not active yet, after
+    // publication it is the selected winner.
+    CBlockIndex* c = NULL;
+    { PruneSeamScope seams(1, false); c = MineRealDag(fx.forkBest, 0xE701); }
+    BOOST_REQUIRE(c != NULL);
+    uint256 hashC = c->GetBlockHash();
+
+    BOOST_REQUIRE_MESSAGE(probe.sawAddCommitted && probe.sawAddEnd,
+        "ADD envelope phases must fire");
+    BOOST_CHECK_MESSAGE(probe.internalStatusAtCommitted == (int)DAG_TIP_SELECTION_VALID_NO_ELIGIBLE,
+        "pre-publication: the not-yet-active new block is ineligible; valid-no-eligible fallback applies");
+    BOOST_CHECK_MESSAGE(probe.internalHashAtCommitted == fx.boundaryHash,
+        "pre-publication fallback must be the pre-publication authoritative active head");
+    BOOST_CHECK_EQUAL(probe.s5ResolverFoundAtCommitted, 0);
+    const int committedS5Found = probe.s5ResolverFoundAtCommitted;
+    const int committedS5Status = probe.s5ResolverStatusAtCommitted;
+    const std::string committedS5Error = probe.s5ResolverErrorAtCommitted;
+    const int committedParity = probe.parityAtCommitted;
+    BOOST_CHECK_MESSAGE(probe.parityAtCommitted == 1,
+        "unified algorithm must agree with the accepted S5 resolver on the same preview");
+    BOOST_CHECK_EQUAL(probe.forcedUnavailableStatus, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+    BOOST_CHECK_EQUAL(probe.forcedUnavailableReason, (int)DAG_TIP_SELECTION_REASON_SOURCE_UNHEALTHY);
+    BOOST_CHECK_EQUAL(probe.internalStatusAtEnd, (int)DAG_TIP_SELECTION_SELECTED);
+    BOOST_CHECK_MESSAGE(probe.internalHashAtEnd == hashC,
+        "post-publication: the new active tip must be the selected winner");
+
+    // (2) nested REORG: the reorg envelope's internal consumers use the same
+    // preview; the post-reorg winner is the reconnected active tip.
+    CBlockIndex* a1 = AddSideDag(fx.forkBest, 0xE711);
+    CBlockIndex* active = a1;
+    for (unsigned i = 0; i < 5; ++i) active = AddSideDag(active, 0xE712 + i);
+    { PruneSeamScope seams(1, true); active = AddSideDag(active, 0xE718); }
+    CBlockIndex* a7 = active;
+    CBlockIndex* b1 = AddSideDag(fx.forkBest, 0xE721);
+    CBlockIndex* branch = b1;
+    for (unsigned i = 0; i < 25 && pindexBest == a7; ++i)
+    {
+        std::unique_ptr<CBlock> block(BuildPoWBlock(branch, 0xE730 + i));
+        BOOST_REQUIRE(block.get() != NULL);
+        AttachDagParentsAndRemine(block.get(), std::vector<uint256>(1, branch->GetBlockHash()));
+        LOCK(cs_main); unsigned int file = 0, pos = 0;
+        BOOST_REQUIRE(block->WriteToDisk(file, pos));
+        BOOST_REQUIRE_MESSAGE(block->AddToBlockIndex(file, pos, block->GetHash()),
+                              "reorg-firing ADD must succeed");
+        branch = mapBlockIndex[block->GetHash()];
+        BOOST_REQUIRE(branch != NULL);
+    }
+    BOOST_REQUIRE_MESSAGE(pindexBest == branch, "reorg to the side branch must complete");
+    uint256 branchHash = branch->GetBlockHash();
+
+    BOOST_REQUIRE_MESSAGE(probe.sawReorgCommitted && probe.sawReorgEnd,
+        "REORG envelope phases must fire");
+    BOOST_CHECK_MESSAGE(probe.internalStatusAtReorgCommitted == (int)DAG_TIP_SELECTION_SELECTED ||
+                        probe.internalStatusAtReorgCommitted == (int)DAG_TIP_SELECTION_VALID_NO_ELIGIBLE,
+        "REORG internal selection must be usable at source commit");
+    BOOST_CHECK_EQUAL(probe.internalStatusAtReorgEnd, (int)DAG_TIP_SELECTION_SELECTED);
+    BOOST_CHECK_MESSAGE(probe.internalHashAtReorgEnd == branchHash,
+        "post-reorg winner must be the reconnected active tip");
+
+    BOOST_TEST_MESSAGE(std::string("S6_INTERNAL addCommittedFallback=1 addEndSelected=1 forcedUnavailable=1 reorgCommitted=1 reorgEndSelected=1 s5Status=") +
+        std::to_string(committedS5Status) + " s5Found=" + std::to_string(committedS5Found) +
+        " s5Parity=" + std::to_string(committedParity) + " s5Err=" + committedS5Error);
+    SetDagMutationPreviewPhaseHookForTest(NULL);
+    g_s6Probe = NULL;
+}
+
+// ---------------------------------------------------------------------------
+// S6-E: synthetic reduction matrix (production reduction, controlled context)
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s6_synthetic_reduction_matrix)
+{
+    uint256 hHead(0x6001), hA(0x6002), hB(0x6003), hC(0x6004);
+    const int nFork = GetForkHeightDAG();
+    const int nPostDag = nFork + 10;
+    const int nPreDag = nFork > 10 ? nFork - 10 : 1;
+
+    // (1) single eligible candidate => selected.
+    {
+        std::vector<DagTipSyntheticCandidate> v(1);
+        v[0].hash = hA; v[0].score = 0x11; v[0].height = 10;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, false, false, false);
+        BOOST_CHECK_EQUAL((int)r.status, (int)DAG_TIP_SELECTION_SELECTED);
+        BOOST_CHECK(r.hash == hA);
+        BOOST_CHECK_EQUAL(r.height, 10);
+    }
+    // (2) higher score wins even when its hash is larger.
+    {
+        std::vector<DagTipSyntheticCandidate> v(2);
+        v[0].hash = hA; v[0].score = 0x11; v[0].height = 10;
+        v[1].hash = hC; v[1].score = 0x22; v[1].height = 10;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, false, false, false);
+        BOOST_CHECK_EQUAL((int)r.status, (int)DAG_TIP_SELECTION_SELECTED);
+        BOOST_CHECK(r.hash == hC);
+    }
+    // (3) equal score => numerically smaller hash wins (both orders).
+    {
+        std::vector<DagTipSyntheticCandidate> v(2);
+        v[0].hash = hC; v[0].score = 0x33; v[0].height = 10;
+        v[1].hash = hA; v[1].score = 0x33; v[1].height = 10;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, false, false, false);
+        BOOST_CHECK(r.hash == hA);
+        std::vector<DagTipSyntheticCandidate> v2(2);
+        v2[0].hash = hA; v2[0].score = 0x33; v2[0].height = 10;
+        v2[1].hash = hC; v2[1].score = 0x33; v2[1].height = 10;
+        DagTipSelectionResult r2 = SelectDagTipFromSyntheticFrontierForTest(v2, hHead, 9, false, false, false);
+        BOOST_CHECK(r2.hash == hA);
+    }
+    // (4) zero-score candidate is eligible and selected.
+    {
+        std::vector<DagTipSyntheticCandidate> v(1);
+        v[0].hash = hB; v[0].score = 0; v[0].height = 10;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, false, false, false);
+        BOOST_CHECK_EQUAL((int)r.status, (int)DAG_TIP_SELECTION_SELECTED);
+        BOOST_CHECK(r.hash == hB);
+    }
+    // (5) post-DAG PoS excluded; non-active excluded; not-retained/not-childless
+    // excluded => no eligible => fallback to the active head.
+    {
+        std::vector<DagTipSyntheticCandidate> v(4);
+        v[0].hash = hA; v[0].score = 0x99; v[0].height = nPostDag; v[0].proofOfStake = true;  // post-DAG PoS
+        v[1].hash = hB; v[1].score = 0x99; v[1].height = nPostDag; v[1].active = false;      // side
+        v[2].hash = hC; v[2].score = 0x99; v[2].height = nPostDag; v[2].childless = false;   // has child
+        v[3].hash = uint256(0x6005); v[3].score = 0x99; v[3].height = nPostDag; v[3].retained = false;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, false, false, false);
+        BOOST_CHECK_EQUAL((int)r.status, (int)DAG_TIP_SELECTION_VALID_NO_ELIGIBLE);
+        BOOST_CHECK(r.fromActiveHeadFallback);
+        BOOST_CHECK(r.hash == hHead);
+        BOOST_CHECK_EQUAL(r.height, 9);
+    }
+    // (6) pre-DAG PoS is NOT excluded (height below the fork).
+    {
+        std::vector<DagTipSyntheticCandidate> v(1);
+        v[0].hash = hA; v[0].score = 0x44; v[0].height = nPreDag; v[0].proofOfStake = true;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, false, false, false);
+        BOOST_CHECK_EQUAL((int)r.status, (int)DAG_TIP_SELECTION_SELECTED);
+        BOOST_CHECK(r.hash == hA);
+    }
+    // (7) empty frontier => valid-no-eligible fallback; no head => UNAVAILABLE.
+    {
+        std::vector<DagTipSyntheticCandidate> v;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, false, false, false);
+        BOOST_CHECK_EQUAL((int)r.status, (int)DAG_TIP_SELECTION_VALID_NO_ELIGIBLE);
+        BOOST_CHECK(r.hash == hHead);
+        DagTipSelectionResult r2 = SelectDagTipFromSyntheticFrontierForTest(v, uint256(0), -1, false, false, true);
+        BOOST_CHECK_EQUAL((int)r2.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+        BOOST_CHECK_EQUAL((int)r2.reason, (int)DAG_TIP_SELECTION_REASON_ACTIVE_HEAD_UNAVAILABLE);
+    }
+    // (8) candidate read failure => UNAVAILABLE; NO partial winner returned.
+    {
+        std::vector<DagTipSyntheticCandidate> v(2);
+        v[0].hash = hA; v[0].score = 0x55; v[0].height = 10;
+        v[1].hash = hB; v[1].score = 0x66; v[1].height = 10; v[1].readFails = true;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, false, false, false);
+        BOOST_CHECK_EQUAL((int)r.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+        BOOST_CHECK_EQUAL((int)r.reason, (int)DAG_TIP_SELECTION_REASON_METADATA_UNAVAILABLE);
+        BOOST_CHECK(r.hash == uint256(0));
+    }
+    // (9) enumeration failure => UNAVAILABLE.
+    {
+        std::vector<DagTipSyntheticCandidate> v(1);
+        v[0].hash = hA; v[0].score = 0x55; v[0].height = 10;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, true, false, false);
+        BOOST_CHECK_EQUAL((int)r.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+        BOOST_CHECK_EQUAL((int)r.reason, (int)DAG_TIP_SELECTION_REASON_FRONTIER_UNAVAILABLE);
+    }
+    // (10) revalidation failure after a tentative winner => UNAVAILABLE, no
+    // stale winner.
+    {
+        std::vector<DagTipSyntheticCandidate> v(1);
+        v[0].hash = hA; v[0].score = 0x55; v[0].height = 10;
+        DagTipSelectionResult r = SelectDagTipFromSyntheticFrontierForTest(v, hHead, 9, false, true, false);
+        BOOST_CHECK_EQUAL((int)r.status, (int)DAG_TIP_SELECTION_UNAVAILABLE);
+        BOOST_CHECK_EQUAL((int)r.reason, (int)DAG_TIP_SELECTION_REASON_REVALIDATION_FAILED);
+        BOOST_CHECK(r.hash == uint256(0));
+    }
+
+    BOOST_TEST_MESSAGE("S6_SYNTHETIC single=1 higherScore=1 tieSmallerHash=1 zeroEligible=1 filters=1 preDagPos=1 fallback=1 readFail=1 enumFail=1 revalFail=1");
+}
+
+// ---------------------------------------------------------------------------
+// S6-repair (blocker repair cycle): fresh-boot nonresident winner.
+//
+// Proves the ORIGINAL blocker state (authoritative boot publishes no
+// mapBlockIndex entries; the legitimate winner is the committed tip and is
+// NONRESIDENT) is served: the selector returns SELECTED(expectedHash); the
+// bounded scoped materialization resolves that exact hash; CreateNewBlock
+// succeeds and the template's primary parent is the selected winner; NO
+// history-sized residency reconstruction occurs (mapBlockIndex untouched).
+// RED (pre-repair): CreateNewBlock returned NULL ("selected winner is
+// nonresident"). GREEN (post-repair): template served via bounded
+// materialization; resident/nonresident template parity pinned.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s6repair_fresh_boot_nonresident_winner_create_block)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+    S6BuildAuthoritativeFixture(fx, 0xF100);
+
+    const uint256 winner = fx.forkBest->GetBlockHash();
+    const int winnerHeight = fx.forkBest->nHeight;
+
+    // (0) Case A (resident): same logical authoritative state, winner resident.
+    // Baseline template for the parity comparison.
+    std::unique_ptr<CBlock> blockResident(CreateNewBlock(pwalletMain, false, NULL, NULL));
+    BOOST_REQUIRE_MESSAGE(blockResident.get() != NULL, "resident-winner template must build");
+    BOOST_CHECK_EQUAL(blockResident->hashPrevBlock.ToString(), winner.ToString());
+
+    // (1) Simulate the fresh V2 process boundary: the authoritative boot
+    // publishes NO mapBlockIndex entries (bootstrap anchors only). Clear the
+    // resident map the in-process prologue filled so the winner is nonresident
+    // exactly as after a real restart.
+    std::map<uint256, CBlockIndex*> savedMap;
+    { LOCK(cs_main); savedMap = mapBlockIndex; mapBlockIndex.clear(); }
+
+    std::string e;
+    // (2) Discriminator: selection authority is HEALTHY and selects the exact
+    // expected winner — any failure below is due to winner materialization/
+    // residency, NOT selector unavailability.
+    DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(sel.IsUsable(), e);
+    BOOST_CHECK_EQUAL((int)sel.status, (int)DAG_TIP_SELECTION_SELECTED);
+    BOOST_CHECK_EQUAL(sel.hash.ToString(), winner.ToString());
+    BOOST_CHECK_EQUAL(sel.height, winnerHeight);
+
+    // (3) The selected winner is NOT resident.
+    { LOCK(cs_main); BOOST_CHECK(mapBlockIndex.find(winner) == mapBlockIndex.end()); }
+
+    // (3b) Direct scoped-materialization seam: serves the exact winner hash
+    // with a usable bounded topology (ancestor window present), releases
+    // deterministically, and leaves no residency behind.
+    {
+        LOCK(cs_main);
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        BOOST_REQUIRE(live != NULL);
+        ScopedMaterializedChain sc;
+        std::string merr;
+        CBlockIndex* m = sc.Acquire(live, winner, &merr);
+        BOOST_REQUIRE_MESSAGE(m != NULL, merr);
+        BOOST_CHECK_EQUAL(m->GetBlockHash().ToString(), winner.ToString());
+        BOOST_CHECK_EQUAL(m->nHeight, winnerHeight);
+        BOOST_CHECK(m->pprev != NULL);            // bounded ancestor window present
+        BOOST_CHECK(m->GetPastTimeLimit() > 0);   // 11-deep median-time walk served
+        BOOST_CHECK_EQUAL(mapBlockIndex.size(), (size_t)0); // no residency created
+        sc.Release();
+        BOOST_CHECK(sc.Parent() == NULL);
+    }
+
+    // (4) GREEN: CreateNewBlock serves the nonresident authoritative winner.
+    std::unique_ptr<CBlock> blockNonresident(CreateNewBlock(pwalletMain, false, NULL, NULL));
+    BOOST_REQUIRE_MESSAGE(blockNonresident.get() != NULL,
+        "CreateNewBlock must serve a valid SELECTED nonresident winner via bounded materialization");
+    BOOST_CHECK_EQUAL(blockNonresident->hashPrevBlock.ToString(), winner.ToString());
+
+    // (5) Parent-semantics parity: resident vs nonresident path produce the
+    // same template identity (same winner; same nBits; same nTime under
+    // deterministic mock time; same coinbase scriptSig; byte-identical block).
+    BOOST_CHECK_EQUAL(blockNonresident->nBits, blockResident->nBits);
+    BOOST_CHECK_EQUAL(blockNonresident->nTime, blockResident->nTime);
+    BOOST_CHECK_EQUAL(blockNonresident->vtx[0].vin[0].scriptSig.ToString(),
+                      blockResident->vtx[0].vin[0].scriptSig.ToString());
+    BOOST_CHECK(blockNonresident->GetHash() == blockResident->GetHash());
+
+    // (6) No history-sized residency reconstruction: mapBlockIndex is
+    // untouched (still empty) after the nonresident build.
+    { LOCK(cs_main); BOOST_CHECK_EQUAL(mapBlockIndex.size(), (size_t)0); }
+
+    // (7) CPU mining attempt prep: the production attempt consumer
+    // (PrepareCPUMiningAttempt, used by RunCPUMinerWorker) must prepare
+    // against the nonresident winner via the attempt-scoped materialization.
+    {
+        CPUMiningWorkIdentity ident = CaptureCurrentCPUMiningWorkIdentityForTest();
+        BOOST_CHECK(!ident.fSelectionUnavailable);
+        BOOST_CHECK_EQUAL(ident.hashPrimaryParent.ToString(), winner.ToString());
+        BOOST_CHECK_EQUAL(ident.nHeight, winnerHeight + 1);
+        std::unique_ptr<CBlock> attemptBlock(CreateNewBlock(pwalletMain, false, NULL, NULL));
+        BOOST_REQUIRE(attemptBlock.get() != NULL);
+        int parentHeight = -1;
+        uint256 target = 0;
+        bool prepared = PrepareCPUMiningAttemptForTest(attemptBlock.get(), ident, 0, &parentHeight, &target);
+        BOOST_CHECK_MESSAGE(prepared, "attempt prep must succeed for a nonresident authoritative parent");
+        BOOST_CHECK_EQUAL(parentHeight, winnerHeight);
+        BOOST_CHECK(target != uint256(0));
+    }
+
+    BOOST_TEST_MESSAGE("S6REPAIR_FRESH_BOOT nonresidentWinner=1 selHash=" << sel.hash.ToString().substr(0,16)
+        << " templatePrev=" << blockNonresident->hashPrevBlock.ToString().substr(0,16)
+        << " nBitsParity=" << (blockNonresident->nBits == blockResident->nBits)
+        << " timeParity=" << (blockNonresident->nTime == blockResident->nTime)
+        << " scriptSigParity=" << (blockNonresident->vtx[0].vin[0].scriptSig.ToString() == blockResident->vtx[0].vin[0].scriptSig.ToString())
+        << " blockHashParity=" << (blockNonresident->GetHash() == blockResident->GetHash())
+        << " mapStillEmpty=1");
+
+    // restore resident map for the remainder of the process
+    { LOCK(cs_main); mapBlockIndex = savedMap; }
+}
+
+// ---------------------------------------------------------------------------
+// S6-repair (Phase 9): stale active-membership containment.
+//
+// A candidate that WAS active above the base boundary must be classified
+// NON-active by the CURRENT live authority once a real reorg supersedes it
+// (retained/childless in the tip authority, removed from active membership);
+// the selector must exclude it and the current active tip must win. The
+// frozen base membership is contained by the live truncation floor (live
+// truncation can never reach below the base tip).
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2c2s_s6repair_stale_active_membership_containment)
+{
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+    S6BuildAuthoritativeFixture(fx, 0xF200);
+    auto live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    std::string e;
+
+    // (1) P: a post-generation block on the base tip; P is ACTIVE and the
+    // current winner.
+    CBlockIndex* P = NULL;
+    { PruneSeamScope seams(1, false); P = MineRealDag(fx.forkBest, 0xF201); }
+    BOOST_REQUIRE(P != NULL);
+    const uint256 hashP = P->GetBlockHash();
+    {
+        BlockIndexAuthoritativeParentInfo info;
+        BOOST_REQUIRE_EQUAL((int)live->ResolveParentInfo(hashP, &info, &e),
+                            (int)BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND);
+        BOOST_CHECK_MESSAGE(info.active, "P must be active before the reorg");
+    }
+    DagTipSelectionResult s1 = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s1.IsUsable(), e);
+    BOOST_CHECK_EQUAL(s1.hash.ToString(), hashP.ToString());
+
+    // (2) Real reorg: a competing branch from the base tip grows until its
+    // trust exceeds the active branch; AddToBlockIndex fires
+    // SetBestChain -> Reorganize (the accepted S5/S3 pattern).
+    CBlockIndex* branch = AddSideDag(fx.forkBest, 0xF211);
+    for (unsigned i = 0; i < 25 && pindexBest != branch; ++i)
+        branch = AddSideDag(branch, 0xF220 + i);
+    BOOST_REQUIRE_MESSAGE(pindexBest == branch, "reorg to the competing branch must complete");
+    const uint256 hashBranch = branch->GetBlockHash();
+    BOOST_CHECK(hashBranch != hashP);
+
+    // (3) Current live authority dominates: P was active, is now superseded.
+    {
+        BlockIndexAuthoritativeParentInfo info;
+        BOOST_REQUIRE_EQUAL((int)live->ResolveParentInfo(hashP, &info, &e),
+                            (int)BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND);
+        BOOST_CHECK_MESSAGE(!info.active,
+            "reorged-out candidate must be classified NON-active by current live state");
+    }
+
+    // (4) Selector: the stale-membership candidate must never win; the current
+    // active tip must be the winner (exact hash).
+    DagTipSelectionResult s2 = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(s2.IsUsable(), e);
+    BOOST_CHECK_MESSAGE(s2.hash != hashP, "stale-membership candidate must never be selected");
+    BOOST_CHECK_EQUAL(s2.hash.ToString(), hashBranch.ToString());
+
+    // (5) Containment floor: live truncation can never reach below the base
+    // tip (frozen base membership cannot be superseded by live state).
+    {
+        std::string terr;
+        BOOST_CHECK(live->TipAuthorityMutable()->TruncateActiveTo(fx.forkBest->nHeight - 1, &terr) != BLOCK_INDEX_TIP_OK);
+        BOOST_CHECK(!terr.empty());
+    }
+
+    BOOST_TEST_MESSAGE("S6REPAIR_STALE_MEMBERSHIP activeBefore=1 activeAfter=0 excluded=1 winner="
+        << hashBranch.ToString().substr(0, 16) << " stale=" << hashP.ToString().substr(0, 16));
+}
+
+// ---------------------------------------------------------------------------
+// S6-repair-cycle-2 (B1): authoritative coinbase maturity / ancestry.
+//
+// The legacy coinbase-maturity predicate (CTransaction::ConnectInputs,
+// main.cpp:6189-6192) walks pprev from pindexBlock for up to nCoinbaseMaturity
+// levels and rejects when the spent coinbase's block disk position is found.
+// In authoritative V2 mode the pprev topology is sparse/bounded:
+//   * fresh boot: pindexBest is a bootstrap anchor with pprev == NULL, so the
+//     walk sees ONLY depth 0 -> mempool admission fails open for depths >= 1;
+//   * nonresident winner: the bounded materialization covers the window
+//     [base tip - 13, winner]; at fresh boot (winner = base anchor) that is
+//     depths 0..13 -> miner tx selection fails open for depths >= 14.
+// A coinbase spend at depth 14..64 (nCoinbaseMaturity = 65) can therefore be
+// admitted, selected into a template, and yet be rejected by full-chain
+// validation ("tried to spend coinbase at depth N").
+//
+// This fixture reproduces that exact production chain through REAL entry
+// points (CTxMemPool::accept, CreateNewBlock, CTransaction::ConnectInputs)
+// under a faithful fresh-boot simulation (mapBlockIndex cleared; pindexBest
+// context = anchor copy with pprev/pskip/pnext == NULL - exactly the object
+// state the authoritative bootstrap publishes). It pins the maturity boundary
+// matrix {0,1,13,14,20,63,64 -> immature; 65,66 -> mature} and requires the
+// authoritative verdict to equal the full-resident (legacy) verdict.
+// ---------------------------------------------------------------------------
+struct CoinbaseMaturityScope
+{
+    int saved;
+    explicit CoinbaseMaturityScope(int v) : saved(nCoinbaseMaturity) { nCoinbaseMaturity = v; }
+    ~CoinbaseMaturityScope() { nCoinbaseMaturity = saved; }
+};
+
+// BuildPoWBlock variant paying `dest` in the coinbase. The standard fixture
+// builder burns the reward to an unspendable script; this one keeps the output
+// spendable so the fixture can construct a real signed spend of it.
+static CBlock* BuildPoWBlockToScript(CBlockIndex* pindexPrev, unsigned int nExtra, const CScript& dest)
+{
+    CBlock* pblock = CreateNewBlock(pwalletMain, false, NULL, NULL);
+    if (!pblock) return NULL;
+    pblock->nVersion = 1;
+    pblock->nTime = std::max((unsigned int)GetTime(),
+                             (unsigned int)(pindexPrev->GetMedianTimePast() + 1));
+    pblock->hashPrevBlock = *pindexPrev->phashBlock;
+    pblock->vtx[0].vin[0].scriptSig = CScript() << (pindexPrev->nHeight + 1) << nExtra;
+    if (!pblock->vtx.empty() && !pblock->vtx[0].vout.empty())
+        pblock->vtx[0].vout[0].scriptPubKey = dest;
+    pblock->hashMerkleRoot = pblock->BuildMerkleTree();
+    uint256 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
+    while (pblock->GetHash() > hashTarget && pblock->nNonce < 0xffffffff)
+        ++pblock->nNonce;
+    return pblock;
+}
+
+// MineRealDag equivalent for a spendable coinbase; returns the block index and
+// copies the coinbase transaction out for later spending.
+static CBlockIndex* MineRealDagToScript(CBlockIndex* pindexPrev, unsigned int nExtra,
+                                        const CScript& dest, CTransaction* outCoinbase)
+{
+    CBlock* b = BuildPoWBlockToScript(pindexPrev, nExtra, dest);
+    BOOST_REQUIRE(b != NULL);
+    AttachDagParentsAndRemine(b, std::vector<uint256>(1, pindexPrev->GetBlockHash()));
+    if (outCoinbase) *outCoinbase = b->vtx[0];
+    CBlockIndex* out = NULL;
+    { LOCK(cs_main); uint256 h = b->GetHash(); BOOST_REQUIRE(b->CheckBlock(true,true,true)); BOOST_REQUIRE(ProcessBlock(NULL,b)); out = mapBlockIndex[h]; }
+    delete b;
+    BOOST_REQUIRE(out != NULL);
+    return out;
+}
+
+// A signed P2PKH spend of coinbaseTx.vout[0] (generous fee; the remaining
+// checks of the admission path see a fully valid transaction).
+static CTransaction BuildMaturitySpend(const CTransaction& coinbaseTx, const CKeyStore& ks, const CScript& destOut)
+{
+    CTransaction tx;
+    tx.nVersion = 1;
+    tx.nTime = (unsigned int)GetAdjustedTime();
+    tx.vin.resize(1);
+    tx.vin[0].prevout.hash = coinbaseTx.GetHash();
+    tx.vin[0].prevout.n = 0;
+    tx.vout.resize(1);
+    tx.vout[0].nValue = coinbaseTx.vout[0].nValue / 10 * 9; // ~10% fee
+    tx.vout[0].scriptPubKey = destOut;
+    BOOST_REQUIRE(SignSignature(ks, coinbaseTx, tx, 0));
+    return tx;
+}
+
+// S6BuildAuthoritativeFixture variant that mines special blocks with
+// spendable coinbases at chosen depths below the epoch-end tip, all BEFORE
+// the generation snapshot - so after the authoritative boot the tip is the
+// base anchor exactly as on a real fresh boot (no post-boot blocks), and the
+// maturity sources are generation-resident yet spendable.
+static void S6BuildAuthoritativeFixtureWithMaturitySpecials(S6Fixture& fx, unsigned nonceBase,
+        const CScript& dest, const int* specialDepths, int nSpecialDepths,
+        std::map<int, CTransaction>& specialCoinbase)
+{
+    SetMockTime(1700003600);
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+    CBlockIndex* p = pindexBest;
+    while (p->nHeight < GetForkHeightDAG()) p = MineReal(p, nonceBase + p->nHeight);
+    const int epoch = GetEpochForHeight(p->nHeight);
+    const int epochEnd = GetEpochBoundaryHeight(epoch + 1, p->nHeight) - 1;
+    while (p->nHeight < epochEnd)
+    {
+        const int next = p->nHeight + 1;
+        const int d = epochEnd - next; // depth from the final tip (= epochEnd)
+        bool fSpecial = false;
+        for (int k = 0; k < nSpecialDepths; ++k)
+            if (specialDepths[k] == d) fSpecial = true;
+        if (fSpecial)
+        {
+            CTransaction cb;
+            p = MineRealDagToScript(p, nonceBase + 0x100 + next, dest, &cb);
+            specialCoinbase[d] = cb;
+        }
+        else
+        {
+            p = MineRealDag(p, nonceBase + 0x100 + next);
+        }
+    }
+    BOOST_REQUIRE_EQUAL(p->nHeight, epochEnd);
+    fx.forkBest = p;
+    fx.epochEnd = epochEnd;
+    fx.boundaryHash = p->GetBlockHash();
+
+    fs::create_directories(fx.root / "snapshot");
+    { CTxDB db; db.Close(); }
+    const auto liveDir = GetDataDir() / "txleveldb";
+    for (fs::directory_iterator it(liveDir), end; it != end; ++it)
+        if (fs::is_regular_file(it->path()))
+            fs::copy_file(it->path(), fx.root / "snapshot" / it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((fx.root / "snapshot").string(), &src, &aerr), aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((fx.root / "snapshot").string(), &src.dagLinks, &src.dagScores, &aerr), aerr);
+    src.foundDAGLinks = true;
+    src.blockDataDir = GetDataDir().string();
+    src.dagLinksDir = (fx.root / "snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src, (fx.root / "build-000001.tmp").string(), 1, NULL, &aerr), aerr);
+    ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(fx.root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(fx.root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &aerr), aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    g_testSuppressDagSourceAbort = true;
+    ResetDagTipSelectorStatsForTest();
+}
+
+BOOST_AUTO_TEST_CASE(r2c2s_s6repair2_b1_authoritative_coinbase_maturity)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+
+    // Spendable coinbase key + output script.
+    CKey spendKey; spendKey.MakeNewKey(true);
+    CBasicKeyStore keyStore; keyStore.AddKey(spendKey);
+    const CScript dest = CScript() << OP_DUP << OP_HASH160
+        << spendKey.GetPubKey().GetID() << OP_EQUALVERIFY << OP_CHECKSIG;
+
+    // Fresh-boot chain: special blocks with spendable coinbases at depths
+    // {0,1,13,14,20,63,64,65,66} below the final tip E (= epoch end). All
+    // specials are part of the GENERATION snapshot, so after the boot the tip
+    // is the base anchor exactly as on a real fresh boot (no post-boot blocks).
+    const int specialDepths[9] = {0, 1, 13, 14, 20, 63, 64, 65, 66};
+    std::map<int, CTransaction> specialCoinbase; // depth -> coinbase tx
+    S6BuildAuthoritativeFixtureWithMaturitySpecials(fx, 0xB100, dest, specialDepths, 9, specialCoinbase);
+    const int E = fx.forkBest->nHeight;
+    BOOST_REQUIRE_EQUAL(pindexBest->nHeight, E);
+    BOOST_REQUIRE_EQUAL((int)specialCoinbase.size(), 9);
+
+    // Fresh-boot state AS PRODUCED BY THE BOOT ITSELF: the authoritative
+    // startup publishes its own bootstrap anchor as pindexBest (a fresh
+    // linkless object - see PublishStartupGlobals,
+    // blockindex_authoritative_startup.cpp:138) and publishes NO
+    // mapBlockIndex entries. Prove the anchor state, then clear the resident
+    // map the in-process prologue filled so residency is exactly as after a
+    // real restart.
+    {
+        LOCK(cs_main);
+        BOOST_REQUIRE_MESSAGE(pindexBest->pprev == NULL,
+            "fresh-boot anchor must be linkless (pprev == NULL)");
+        BOOST_CHECK_EQUAL(pindexBest->GetBlockHash().ToString(),
+                          fx.forkBest->GetBlockHash().ToString());
+        BOOST_TEST_MESSAGE("FRESH_BOOT_ANCHOR pprevNull=" << (pindexBest->pprev == NULL)
+            << " anchorIsFreshObject=" << (pindexBest != fx.forkBest)
+            << " height=" << pindexBest->nHeight);
+    }
+    std::map<uint256, CBlockIndex*> savedMap;
+    {
+        LOCK(cs_main);
+        savedMap = mapBlockIndex;
+        mapBlockIndex.clear();
+    }
+
+    // Pin mainnet maturity (regtest default is 1) for the verdict checks only.
+    CoinbaseMaturityScope maturity(65);
+
+    // ---- A: maturity boundary matrix through the REAL mempool admission path.
+    // Contract: immature d in {0,1,13,14,20,63,64}; mature d in {65,66}.
+    // The d=65/66 rows are the control: the SAME tx shape is accepted there,
+    // so a rejection below can only be the maturity gate.
+    int mismatches = 0;
+    {
+        CTxDB txdb("r");
+        for (int k = 0; k < 9; ++k)
+        {
+            const int d = specialDepths[k];
+            CTransaction spend = BuildMaturitySpend(specialCoinbase[d], keyStore, dest);
+            bool accepted = false;
+            {
+                LOCK(cs_main);
+                // The REAL fresh-boot anchor is pindexBest itself (linkless,
+                // published by the boot): the admission path sees exactly the
+                // production object state.
+                accepted = mempool.accept(txdb, spend, true, NULL, true); // check-only
+            }
+            const bool expectAccepted = (d >= 65);
+            if (accepted != expectAccepted) ++mismatches;
+            BOOST_TEST_MESSAGE("MATURITY_MATRIX d=" << d
+                << " accepted=" << accepted << " expected=" << expectAccepted);
+        }
+    }
+    BOOST_CHECK_EQUAL(mismatches, 0);
+
+    // ---- B: full B1 flow at depth 20 (the audit's window representative):
+    // real admission -> template inclusion must be impossible.
+    CTransaction spend20 = BuildMaturitySpend(specialCoinbase[20], keyStore, dest);
+    const uint256 spend20Hash = spend20.GetHash();
+    bool admitted = false;
+    {
+        CTxDB txdb("r");
+        LOCK(cs_main);
+        admitted = mempool.accept(txdb, spend20, true, NULL, false); // real admission attempt
+    }
+    BOOST_TEST_MESSAGE("B1_FLOW d=20 txid=" << spend20Hash.ToString().substr(0, 16)
+        << " admitted=" << admitted);
+    BOOST_CHECK_MESSAGE(!admitted, "immature coinbase spend must not be admitted (authoritative maturity)");
+    { LOCK(cs_main); BOOST_CHECK_EQUAL((int)mempool.mapTx.count(spend20Hash), 0); }
+
+    std::unique_ptr<CBlock> tmpl(CreateNewBlock(pwalletMain, false, NULL, NULL));
+    BOOST_REQUIRE(tmpl.get() != NULL);
+    bool included = false;
+    for (size_t i = 0; i < tmpl->vtx.size(); ++i)
+        if (tmpl->vtx[i].GetHash() == spend20Hash) included = true;
+    BOOST_TEST_MESSAGE("B1_FLOW d=20 included=" << included
+        << " templateHash=" << tmpl->GetHash().ToString().substr(0, 16));
+    BOOST_CHECK_MESSAGE(!included, "immature spend must never enter the template");
+
+    // ---- C: the miner's independent selection predicate (the exact
+    // ConnectInputs call the tx-selection loop runs at miner.cpp:703) under
+    // the fresh-boot winner (= the linkless anchor; the materialized window
+    // covers depths 0..13). Pre-fix the window edge sits at depth 13: d=13 is
+    // caught, d>=14 fails open. The authoritative verdict must reject every
+    // immature depth regardless of the window.
+    {
+        LOCK(cs_main);
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        BOOST_REQUIRE(live != NULL);
+        ScopedMaterializedChain winnerChain;
+        std::string me;
+        CBlockIndex* w = winnerChain.Acquire(live, pindexBest->GetBlockHash(), &me);
+        BOOST_REQUIRE_MESSAGE(w != NULL, me);
+        const int minerProbeDepths[3] = {13, 14, 20};
+        for (int k = 0; k < 3; ++k)
+        {
+            const int d = minerProbeDepths[k];
+            CTransaction sp = BuildMaturitySpend(specialCoinbase[d], keyStore, dest);
+            MapPrevTx mapInputs;
+            std::map<uint256, CTxIndex> mapUnused;
+            bool fInvalid = false;
+            CTxDB txdb("r");
+            BOOST_REQUIRE(sp.FetchInputs(txdb, mapUnused, false, false, mapInputs, fInvalid));
+            bool minerOk = sp.ConnectInputs(txdb, mapInputs, mapUnused, CDiskTxPos(1,1,1), w,
+                                            false, true, MANDATORY_SCRIPT_VERIFY_FLAGS);
+            BOOST_TEST_MESSAGE("B1_MINER d=" << d << " connectInputsOk=" << minerOk);
+            BOOST_CHECK_MESSAGE(!minerOk, "miner selection predicate must reject the immature spend at any depth");
+        }
+        winnerChain.Release();
+    }
+
+    // ---- C2: no residency reconstruction on the authoritative path.
+    { LOCK(cs_main); BOOST_CHECK_EQUAL(mapBlockIndex.size(), (size_t)0); }
+
+    // ---- D: full-resident (legacy) verdict = consensus reference. Restore
+    // the complete topology and run the SAME production predicate with the
+    // legacy walk (authoritative branch off): it must also reject -> parity.
+    {
+        LOCK(cs_main);
+        mapBlockIndex = savedMap;
+        // The full-resident reference tip is the in-process LINKED object (the
+        // object a legacy node's LoadBlockIndex publishes), NOT the linkless
+        // authoritative anchor pindexBest.
+        CBlockIndex* refTip = savedMap.count(fx.forkBest->GetBlockHash())
+            ? savedMap[fx.forkBest->GetBlockHash()] : fx.forkBest;
+        BOOST_REQUIRE_MESSAGE(refTip->pprev != NULL,
+            "full-resident reference tip must be linked (legacy topology)");
+        const bool fSavedAuth = g_fAuthoritativeStartup;
+        g_fAuthoritativeStartup = false;
+        MapPrevTx mapInputs;
+        std::map<uint256, CTxIndex> mapUnused;
+        bool fInvalid = false;
+        CTxDB txdb("r");
+        BOOST_REQUIRE(spend20.FetchInputs(txdb, mapUnused, false, false, mapInputs, fInvalid));
+        bool legacyOk = spend20.ConnectInputs(txdb, mapInputs, mapUnused, CDiskTxPos(1,1,1), refTip,
+                                              false, false);
+        g_fAuthoritativeStartup = fSavedAuth;
+        BOOST_TEST_MESSAGE("B1_FLOW d=20 legacyResidentOk=" << legacyOk);
+        BOOST_CHECK_MESSAGE(!legacyOk, "full-resident (legacy) verdict must reject the immature spend");
+    }
+
+    // restore resident map for the remainder of the process
+    { LOCK(cs_main); mapBlockIndex = savedMap; }
+}
 
 BOOST_AUTO_TEST_SUITE_END()

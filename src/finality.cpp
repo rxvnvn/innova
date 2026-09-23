@@ -12,6 +12,10 @@
 #include "txdb.h"
 #include "base58.h"
 #include "kernel.h"
+#include "dag_tip_selector.h"
+#include "blockindex_authoritative_live.h"
+#include "blockindex_authoritative_startup.h"
+#include "blockindex_hot_owner.h"
 
 #include <openssl/bn.h>
 #include <openssl/ec.h>
@@ -4593,27 +4597,70 @@ bool ProduceFinalityVote()
     CBlockIndex* pEpochBlock = NULL;
     if (nCurrentHeight >= FORK_HEIGHT_DAG)
     {
-        CBlockIndex* pDAGTip = g_dagManager.SelectBestDAGTip();
-        if (pDAGTip)
+        if (g_fAuthoritativeStartup)
         {
-            // Walk back to epoch boundary on the DAG selected-parent chain.
-            CBlockIndex* pWalk = pDAGTip;
-            std::set<uint256> setVisited;
-            while (pWalk && pWalk->nHeight > nEpochHeight && pWalk->phashBlock)
+            // R2c.2/S6: authoritative selection + value-semantic boundary
+            // resolution. UNAVAILABLE => no vote this round (fail closed;
+            // NO legacy selector and NO resident FindBlockByHeight fallback).
+            std::string selError;
+            DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&selError);
+            if (!sel.IsUsable())
             {
-                if (!setVisited.insert(pWalk->GetBlockHash()).second)
-                    break;
-                uint256 hashParent = g_dagManager.GetSelectedParent(pWalk->GetBlockHash());
-                std::map<uint256, CBlockIndex*>::iterator miParent = mapBlockIndex.find(hashParent);
-                if (miParent == mapBlockIndex.end())
-                    break;
-                pWalk = miParent->second;
+                fprintf(stderr, "ProduceFinalityVote: authoritative selection unavailable: %s\n",
+                        selError.c_str()); fflush(stderr);
+                return false;
             }
-            if (pWalk && pWalk->nHeight == nEpochHeight)
-                pEpochBlock = pWalk;
+            std::string berr;
+            DagTipSelectionResult bres =
+                ResolveAuthoritativeBoundaryAtHeight(sel.hash, nEpochHeight, &berr);
+            if (bres.status == DAG_TIP_SELECTION_UNAVAILABLE)
+            {
+                fprintf(stderr, "ProduceFinalityVote: authoritative boundary unavailable: %s\n",
+                        berr.c_str()); fflush(stderr);
+                return false;
+            }
+            // R2c.2/S6: the accepted full-topology materializer is safe here:
+            // ProduceFinalityVote holds cs_main for the whole vote construction,
+            // so no ProcessBlock can interleave. The operation-scoped
+            // materializations are released at the end of the next ProcessBlock,
+            // after this vote is built.
+            BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+            BlockIndexHotHandle boundaryPin; // filled empty by the authority (op-owned)
+            std::string matError;
+            pEpochBlock = live ? live->MaterializeParentChain(bres.hash, &boundaryPin,
+                                                              &matError)
+                               : NULL;
+            if (!pEpochBlock)
+            {
+                fprintf(stderr, "ProduceFinalityVote: boundary materialization failed: %s\n",
+                        matError.c_str()); fflush(stderr);
+                return false;
+            }
+        }
+        else
+        {
+            CBlockIndex* pDAGTip = g_dagManager.SelectBestDAGTip();
+            if (pDAGTip)
+            {
+                // Walk back to epoch boundary on the DAG selected-parent chain.
+                CBlockIndex* pWalk = pDAGTip;
+                std::set<uint256> setVisited;
+                while (pWalk && pWalk->nHeight > nEpochHeight && pWalk->phashBlock)
+                {
+                    if (!setVisited.insert(pWalk->GetBlockHash()).second)
+                        break;
+                    uint256 hashParent = g_dagManager.GetSelectedParent(pWalk->GetBlockHash());
+                    std::map<uint256, CBlockIndex*>::iterator miParent = mapBlockIndex.find(hashParent);
+                    if (miParent == mapBlockIndex.end())
+                        break;
+                    pWalk = miParent->second;
+                }
+                if (pWalk && pWalk->nHeight == nEpochHeight)
+                    pEpochBlock = pWalk;
+            }
         }
     }
-    if (!pEpochBlock)
+    if (!pEpochBlock && !g_fAuthoritativeStartup)
         pEpochBlock = FindBlockByHeight(nEpochHeight);
     if (!pEpochBlock)
         return false;

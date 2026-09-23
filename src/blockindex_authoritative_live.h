@@ -14,6 +14,7 @@
 #include <memory>
 #include <set>
 #include <string>
+#include <vector>
 
 // G1 — production live-authority seam for BY_VALUE_AUTHORITATIVE mode.
 //
@@ -60,6 +61,18 @@ enum BlockIndexAuthoritativeParentStatus
     BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_FOUND,
     BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_ACTIVE,
     BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE
+};
+
+// R2c.2/S6-repair-cycle-2 (B1): authoritative by-value spend-maturity verdict.
+// MATURE = the source block is not an ancestor of the spending context within
+// the bounded window; IMMATURE = found at depth < maxDepth (reject, exactly
+// like the legacy predicate); UNAVAILABLE = the authority cannot answer
+// (fail closed - the caller must reject, never assume mature).
+enum BlockIndexAuthoritativeMaturityStatus
+{
+    BLOCK_INDEX_MATURITY_MATURE = 0,
+    BLOCK_INDEX_MATURITY_IMMATURE,
+    BLOCK_INDEX_MATURITY_UNAVAILABLE
 };
 
 struct BlockIndexAuthoritativeParentInfo
@@ -128,6 +141,24 @@ public:
                                         BlockIndexHotHandle* out,
                                         std::string* error) const;
 
+    // R2c.2/S6-repair: narrowly scoped, CALLER-OWNED variant of the bounded
+    // full-topology parent materialization. Same by-value walk policy as
+    // MaterializeParentChain (tip-then-base; floor = base tip height - WALK),
+    // but the materialized objects are appended to the CALLER's containers and
+    // are NOT registered in the operation-global store — so their lifetime is
+    // exactly the caller's, never dependent on
+    // ReleaseOperationMaterializations()/the next ProcessBlock. `walkLookupFailed`
+    // (optional) distinguishes a chain-walk lookup failure (the operation-global
+    // store's fail-closed rollback trigger) from floor-mismatch/empty failures.
+    // Caller must hold cs_main. Returns the requested parent CBlockIndex*
+    // (valid while the caller keeps `objs`/`owns` alive) or NULL + error
+    // (fail closed; no legacy fallback).
+    CBlockIndex* MaterializeParentChainInto(const uint256& hash,
+                                            std::vector<CBlockIndex*>* objs,
+                                            std::vector<uint256*>* owns,
+                                            std::string* error,
+                                            bool* walkLookupFailed = NULL) const;
+
     // Resolve a logical hash to a FULL by-value BlockIndexSnapshot from the
     // CURRENT mutable retained tail (tip first, then the immutable base
     // reader). This is the single current-tail snapshot seam exposed to the
@@ -139,6 +170,19 @@ public:
     BlockIndexHotStatus ResolveBlockSnapshot(const uint256& hash,
                                              BlockIndexSnapshot* out,
                                              std::string* error) const;
+
+    // R2c.2/S6-repair-cycle-2 (B1): authoritative by-value verdict for the
+    // legacy ConnectInputs coinbase/coinstake maturity predicate ("is the
+    // source block, identified by its disk position nFile/nBlockPos, among
+    // the ancestors of startHash at depth < maxDepth?"). Never uses pprev or
+    // mapBlockIndex residency; each step resolves by value (tip authority
+    // first, then the immutable base generation); bounded by maxDepth (the
+    // caller passes nCoinbaseMaturity), never by chain history.
+    // MATURE / IMMATURE / UNAVAILABLE (fail closed; the caller must reject,
+    // never assume mature). Caller must hold cs_main.
+    BlockIndexAuthoritativeMaturityStatus ResolveSpendMaturity(
+        const uint256& startHash, unsigned int srcFile, unsigned int srcBlockPos,
+        int maxDepth, int* outDepth, std::string* error) const;
 
     // ---- live acceptance / persistence ----
     // Persist an accepted ACTIVE block (already consensus-validated by the live
@@ -213,6 +257,50 @@ private:
     Impl* impl_;
     // baseKnown callback state owner (Impl is the ud payload).
     friend bool BlockIndexAuthoritativeLiveBaseKnown(const uint256& hash, void* ud);
+};
+
+// R2c.2/S6-repair: RAII ownership token for a bounded, authoritative,
+// full-topology parent materialization. Narrowly scoped variant of
+// MaterializeParentChain for consumers that must not depend on the
+// operation-global store (ReleaseOperationMaterializations at the end of the
+// next ProcessBlock) and must release the reconstructed objects
+// deterministically at their own scope exit.
+//
+//   Acquire(hash)  -> bounded by-value walk (same policy as
+//                     MaterializeParentChain: tip-then-base, floor = base tip
+//                     height - WALK); objects owned by this token.
+//   Parent()       -> the requested parent CBlockIndex* (valid while the token
+//                     is alive and not re-Acquired).
+//   Release()/dtor -> frees every reconstructed object. The pointer must NOT
+//                     be used after Release and must NOT escape the token's
+//                     scope (no async retention).
+//
+// The winner identity is decided by the selector's value result; this token
+// only provides a temporary usable parent REPRESENTATION for the legacy
+// consensus/block-build code. Caller must hold cs_main for Acquire.
+class ScopedMaterializedChain
+{
+public:
+    ScopedMaterializedChain() : parent_(NULL) {}
+    ~ScopedMaterializedChain() { Release(); }
+
+    // Fail-closed: NULL + error on authority/materialization failure. Never
+    // falls back to legacy/resident authority.
+    CBlockIndex* Acquire(BlockIndexAuthoritativeLive* live,
+                         const uint256& hash, std::string* error);
+
+    void Release();
+
+    CBlockIndex* Parent() const { return parent_; }
+    bool IsValid() const { return parent_ != NULL; }
+
+private:
+    ScopedMaterializedChain(const ScopedMaterializedChain&);
+    ScopedMaterializedChain& operator=(const ScopedMaterializedChain&);
+
+    std::vector<CBlockIndex*> owned_;
+    std::vector<uint256*>     ownedHashes_;
+    CBlockIndex*              parent_;
 };
 
 // Production accessor (NULL when NOT in authoritative mode). The object is

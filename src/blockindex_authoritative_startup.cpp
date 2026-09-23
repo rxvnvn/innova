@@ -17,6 +17,7 @@
 #include "dag_tip_overlay_runtime.h"
 #include "dag_tips_delta.h"
 #include "dag_mutation_preview.h"
+#include "dag_tip_selector.h"
 #include "dag_tip_frontier_metadata.h"
 #include "dag_tip_frontier.h"
 #include "fixed_blockindex_store.h"
@@ -424,6 +425,31 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         // the owned transaction-scoped preview seam (registration only; the
         // seam remains unreachable without an explicit root envelope).
         SetDagMutationPreviewRuntime(ctx->dagTipRuntime.get());
+        // R2c.2/S6: the same healthy runtime is the CLEAN read source for the
+        // authoritative primary DAG tip selector's external consumers
+        // (registration only; every read revalidates availability).
+        SetDagTipSelectorRuntime(ctx->dagTipRuntime.get());
+    }
+    else
+    {
+        // R2c.2/S6-repair (blocker repair cycle, Phase 8): a selected
+        // generation without a valid DAG tip frontier artifact cannot install
+        // the authoritative selector runtime. Booting it would set
+        // g_fAuthoritativeStartup=true with the runtime permanently absent —
+        // a half-operational node whose primary selection, block-template
+        // creation, finality voting and CPU-mining consumers all fail for the
+        // process lifetime (RUNTIME_ABSENT) with no startup diagnostic. The
+        // authoritative startup contract is all-or-nothing and fail-closed
+        // (init.cpp routes any failure to InitError; there is no legacy
+        // fallback). Refuse explicitly instead.
+        fprintf(stderr,
+                "BLOCKINDEX_V2_AUTHORITATIVE ERROR: frontier_capability=%u generation=%llu best_height=%d — selector runtime cannot be installed; mining would be permanently unavailable. Regenerate the generation with dag-links present to enable frontier capability.\n",
+                (unsigned)dagFrontierCapability,
+                (unsigned long long)dagRuntimeConfig.generation,
+                nBestHeight);
+        fflush(stderr);
+        if (error) *error = "authoritative startup: selected generation lacks DAG tip frontier capability — selector runtime would be permanently unavailable; refusing to boot a half-operational authoritative node";
+        return false;
     }
 
     // HReg + wallet rescan are driven by init.cpp AFTER this returns, using
@@ -675,6 +701,8 @@ void ResetBlockIndexAuthoritativeStartupForTest()
     // ownership state before the runtime is destroyed.
     ClearDagMutationPreviewRuntime();
     ResetDagMutationPreviewForTest();
+    // R2c.2/S6: drop the selector's runtime registration with the same ordering.
+    ClearDagTipSelectorRuntime();
     // Then destroy the context, navigator, and only the globals published by
     // InitBlockIndexAuthoritative.
     delete g_authoritativeContext;

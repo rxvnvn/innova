@@ -10,6 +10,10 @@
 #include "collateralnode.h"
 #include "dag.h"
 #include "finality.h"
+#include "dag_tip_selector.h"
+#include "blockindex_authoritative_live.h"
+#include "blockindex_authoritative_startup.h"
+#include "blockindex_hot_owner.h"
 
 #include <chrono>
 #include <limits>
@@ -146,12 +150,73 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
     if (!pblock.get())
         return NULL;
 
-    CBlockIndex* pindexPrev;
+    CBlockIndex* pindexPrev = NULL;
+    // R2c.2/S6-repair: bounded winner materialization token. The selected
+    // winner is served either as the resident process-lifetime object (fast
+    // path — same identity; semantically equivalent to the materialized path)
+    // or, when nonresident (fresh V2 boot publishes no mapBlockIndex entries),
+    // via a bounded authoritative by-value materialization owned by this token
+    // and released when this build returns. The token must outlive every
+    // pindexPrev use below. Selection authority remains the selector's value
+    // result; the token only provides a temporary usable parent representation.
+    ScopedMaterializedChain winnerChain;
     {
         LOCK2(cs_main, g_dagManager.cs_dag);
-        pindexPrev = g_dagManager.SelectBestDAGTip();
-        if (!pindexPrev)
-            pindexPrev = pindexBest;
+        if (g_fAuthoritativeStartup)
+        {
+            // R2c.2/S6: authoritative primary selection. UNAVAILABLE fails
+            // closed (no legacy selector, no resident pindexBest fallback).
+            std::string selError;
+            DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&selError);
+            if (sel.status == DAG_TIP_SELECTION_UNAVAILABLE)
+            {
+                fprintf(stderr, "CreateNewBlock: ERROR: authoritative selection unavailable: %s\n",
+                        selError.c_str()); fflush(stderr);
+                return NULL;
+            }
+            if (sel.IsUsable())
+            {
+                // Fast path: resident process-lifetime object for the SAME
+                // selected hash (optimization only; not required for
+                // correctness).
+                std::map<uint256, CBlockIndex*>::iterator miSel = mapBlockIndex.find(sel.hash);
+                if (miSel != mapBlockIndex.end() && miSel->second)
+                {
+                    pindexPrev = miSel->second;
+                }
+                else
+                {
+                    // Nonresident winner: bounded authoritative materialization
+                    // of the SELECTED hash (same by-value walk policy as the
+                    // accepted full-topology materializer; released at the end
+                    // of this build). Winner identity remains the selector's
+                    // value result; this only provides a usable parent
+                    // representation for the legacy block build.
+                    std::string matError;
+                    pindexPrev = winnerChain.Acquire(GetAuthoritativeLiveAuthority(), sel.hash, &matError);
+                    if (!pindexPrev)
+                    {
+                        fprintf(stderr, "CreateNewBlock: ERROR: winner materialization unavailable: %s\n",
+                                matError.c_str()); fflush(stderr);
+                        return NULL;
+                    }
+                }
+            }
+            else
+            {
+                // Defensive: LEGACY cannot be returned while authoritative
+                // mode is on; keep the historical shape for completeness.
+                pindexPrev = g_dagManager.SelectBestDAGTip();
+                if (!pindexPrev)
+                    pindexPrev = pindexBest;
+            }
+        }
+        else
+        {
+            pindexPrev = g_dagManager.SelectBestDAGTip();
+            if (!pindexPrev)
+                pindexPrev = pindexBest;
+        }
     }
     if (!pindexPrev)
     {
@@ -1150,14 +1215,48 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
     LOCK(cs_main);
 
     identity.hashBestChain = hashBestChain;
-    CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
-    if (!pindexParent)
-        pindexParent = pindexBest;
-    if (pindexParent)
+    if (g_fAuthoritativeStartup)
     {
-        identity.hashPrimaryParent = pindexParent->GetBlockHash();
-        identity.nHeight = pindexParent->nHeight + 1;
+        // R2c.2/S6: authoritative primary selection (external CLEAN context).
+        // UNAVAILABLE marks the identity as not-current (fail closed); the
+        // legacy selector is never consulted in authoritative mode.
+        std::string selError;
+        DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&selError);
+        if (sel.status == DAG_TIP_SELECTION_UNAVAILABLE)
+        {
+            identity.fSelectionUnavailable = true;
+        }
+        else if (sel.IsUsable())
+        {
+            identity.hashPrimaryParent = sel.hash;
+            identity.nHeight = sel.height + 1;
+        }
+        else
+        {
+            CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
+            if (!pindexParent)
+                pindexParent = pindexBest;
+            if (pindexParent)
+            {
+                identity.hashPrimaryParent = pindexParent->GetBlockHash();
+                identity.nHeight = pindexParent->nHeight + 1;
+            }
+        }
     }
+    else
+    {
+        CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
+        if (!pindexParent)
+            pindexParent = pindexBest;
+        if (pindexParent)
+        {
+            identity.hashPrimaryParent = pindexParent->GetBlockHash();
+            identity.nHeight = pindexParent->nHeight + 1;
+        }
+    }
+    // Residual (documented, still legacy): the work-identity tip set is the
+    // separate setDAGTips enumeration (merge-parent-era protocol). It is NOT
+    // the primary selection and is not cut over in this milestone.
     if (identity.nHeight >= FORK_HEIGHT_DAG)
     {
         identity.vDAGTips = g_dagManager.GetDAGTips();
@@ -1172,12 +1271,39 @@ bool IsCPUMiningCollateralStateReady()
     int nNextHeight = 0;
     {
         LOCK2(cs_main, g_dagManager.cs_dag);
-        CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
-        if (!pindexParent)
-            pindexParent = pindexBest;
-        if (!pindexParent)
-            return false;
-        nNextHeight = pindexParent->nHeight + 1;
+        if (g_fAuthoritativeStartup)
+        {
+            // R2c.2/S6: authoritative primary selection. UNAVAILABLE => not
+            // ready (the miner waits; fail closed, no legacy fallback).
+            std::string selError;
+            DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&selError);
+            if (sel.status == DAG_TIP_SELECTION_UNAVAILABLE)
+                return false;
+            if (sel.IsUsable())
+            {
+                if (sel.height < 0)
+                    return false;
+                nNextHeight = sel.height + 1;
+            }
+            else
+            {
+                CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
+                if (!pindexParent)
+                    pindexParent = pindexBest;
+                if (!pindexParent)
+                    return false;
+                nNextHeight = pindexParent->nHeight + 1;
+            }
+        }
+        else
+        {
+            CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
+            if (!pindexParent)
+                pindexParent = pindexBest;
+            if (!pindexParent)
+                return false;
+            nNextHeight = pindexParent->nHeight + 1;
+        }
     }
 
     bool fPaymentsRequired = fTestNet
@@ -1199,6 +1325,55 @@ bool IsCPUMiningWorkCurrent(const CPUMiningWorkIdentity& identity, bool fCheckMe
     return CPUMiningWorkIdentityMatches(identity,
                                         CaptureCurrentCPUMiningWorkIdentity(),
                                         fCheckMempool);
+}
+
+// R2c.2/S6-repair: prepare a CPU mining attempt. Resolves a usable primary
+// parent for the built block: resident fast path (process-lifetime
+// mapBlockIndex object), else — in authoritative mode — a bounded
+// attempt-scoped materialization of the exact hashPrevBlock owned by the
+// caller's token (released when the attempt scope ends; no pointer escapes).
+// Verifies the parent height against the work identity, sets the extra nonce,
+// and derives the target. Fail closed (returns false; the attempt is skipped;
+// no legacy fallback) when no usable parent exists.
+static bool PrepareCPUMiningAttempt(CBlock* pblock,
+                                    const CPUMiningWorkIdentity& workIdentity,
+                                    ScopedMaterializedChain& attemptChain,
+                                    unsigned int nExtraNonce,
+                                    unsigned int nWorkerId,
+                                    CBlockIndex** outPrev,
+                                    uint256* outTarget)
+{
+    *outPrev = NULL;
+    *outTarget = 0;
+    LOCK(cs_main);
+    std::map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(pblock->hashPrevBlock);
+    if (miPrev != mapBlockIndex.end() && miPrev->second)
+    {
+        *outPrev = miPrev->second;
+    }
+    else if (g_fAuthoritativeStartup)
+    {
+        // Nonresident primary parent: bounded authoritative materialization of
+        // the exact hashPrevBlock (same by-value walk policy as the accepted
+        // full-topology materializer). Fail closed if unavailable.
+        std::string matError;
+        *outPrev = attemptChain.Acquire(GetAuthoritativeLiveAuthority(),
+                                        pblock->hashPrevBlock, &matError);
+        if (!*outPrev)
+        {
+            fprintf(stderr, "CPUMiner[%u]: ERROR: primary parent materialization unavailable: %s\n",
+                    nWorkerId, matError.c_str()); fflush(stderr);
+        }
+    }
+    if (*outPrev && (*outPrev)->nHeight + 1 == workIdentity.nHeight)
+    {
+        CBigNum bnTarget;
+        SetExtraNonce(pblock, *outPrev, nExtraNonce);
+        bnTarget.SetCompact(pblock->nBits);
+        *outTarget = bnTarget.getuint256();
+        return true;
+    }
+    return false;
 }
 
 void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
@@ -1270,23 +1445,14 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
         CPUMiningWorkIdentity workIdentity = identityAfter;
         uint256 hashTarget;
         CBlockIndex* pindexBlockPrev = NULL;
-        bool fPrepared = false;
-        {
-            LOCK(cs_main);
-            std::map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(pblock->hashPrevBlock);
-            if (miPrev != mapBlockIndex.end() && miPrev->second)
-            {
-                pindexBlockPrev = miPrev->second;
-                if (pindexBlockPrev->nHeight + 1 == workIdentity.nHeight)
-                {
-                    CBigNum bnTarget;
-                    SetExtraNonce(pblock.get(), pindexBlockPrev, nExtraNonce);
-                    bnTarget.SetCompact(pblock->nBits);
-                    hashTarget = bnTarget.getuint256();
-                    fPrepared = true;
-                }
-            }
-        }
+        // R2c.2/S6-repair: attempt-scoped bounded parent materialization token.
+        // When the primary parent is authoritative-but-nonresident (fresh V2
+        // boot), PrepareCPUMiningAttempt materializes it into this token and
+        // uses it only within this attempt's scope; it is released when the
+        // attempt iteration ends (no pointer escapes into later state).
+        ScopedMaterializedChain attemptChain;
+        bool fPrepared = PrepareCPUMiningAttempt(pblock.get(), workIdentity, attemptChain,
+                                                 nExtraNonce, nWorkerId, &pindexBlockPrev, &hashTarget);
 
         uint64_t nNextExtraNonce = static_cast<uint64_t>(nExtraNonce) + nThreads;
         nExtraNonce = nNextExtraNonce > std::numeric_limits<unsigned int>::max()
@@ -1397,10 +1563,48 @@ std::thread CreateCPUMinerThread(const std::function<void()>& function)
 }
 }
 
+// R2c.2/S6: test-facing exports of the real production CPU-mining consumer
+// functions (no behavior change; the wrappers call the same code the mining
+// loop uses).
+CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentityForTest()
+{
+    return CaptureCurrentCPUMiningWorkIdentity();
+}
+
+bool IsCPUMiningCollateralStateReadyForTest()
+{
+    return IsCPUMiningCollateralStateReady();
+}
+
+bool IsCPUMiningWorkCurrentForTest(const CPUMiningWorkIdentity& identity, bool fCheckMempool)
+{
+    return IsCPUMiningWorkCurrent(identity, fCheckMempool);
+}
+
+bool PrepareCPUMiningAttemptForTest(CBlock* pblock,
+                                    const CPUMiningWorkIdentity& workIdentity,
+                                    unsigned int nExtraNonce,
+                                    int* outParentHeight,
+                                    uint256* outTarget)
+{
+    // Test-scoped token: any materialized parent is released before return;
+    // only scalar results escape.
+    ScopedMaterializedChain chain;
+    CBlockIndex* prev = NULL;
+    bool ok = PrepareCPUMiningAttempt(pblock, workIdentity, chain, nExtraNonce,
+                                      0 /* nWorkerId */, &prev, outTarget);
+    *outParentHeight = prev ? prev->nHeight : -1;
+    return ok;
+}
+
 bool CPUMiningWorkIdentityMatches(const CPUMiningWorkIdentity& a,
                                   const CPUMiningWorkIdentity& b,
                                   bool fCheckMempool)
 {
+    // R2c.2/S6: an identity captured while the authoritative primary selection
+    // was unavailable is never considered current (fail closed).
+    if (a.fSelectionUnavailable || b.fSelectionUnavailable)
+        return false;
     if (a.hashBestChain != b.hashBestChain ||
         a.hashPrimaryParent != b.hashPrimaryParent ||
         a.vDAGTips != b.vDAGTips)

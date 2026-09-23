@@ -701,7 +701,12 @@ BOOST_AUTO_TEST_CASE(r2c1d3a_init_authoritative_present_valid)
 }
 
 // LEGACY_UNAVAILABLE: A non-frontier generation (no dag-tip-frontier.dat)
-// should initialize authoritative startup but WITHOUT a DagTipOverlayRuntime.
+// cannot install the authoritative selector runtime.
+// R2c.2/S6-repair (blocker repair cycle, Phase 8): such startup must FAIL
+// CLOSED. Previously it booted with g_fAuthoritativeStartup=true and no
+// runtime — a permanently half-operational node (primary selection /
+// mining / finality all UNAVAILABLE for the process lifetime) with no
+// startup diagnostic. The all-or-nothing contract refuses instead.
 BOOST_AUTO_TEST_CASE(r2c1d3a_init_authoritative_legacy_unavailable)
 {
     InitAuthoritativeFixture fx(4, /*frontierOn=*/false);
@@ -723,15 +728,14 @@ BOOST_AUTO_TEST_CASE(r2c1d3a_init_authoritative_legacy_unavailable)
         genDir.string(), m.generation, m.capability, m.dagInputDigest, &detail);
     BOOST_CHECK_EQUAL((int)cap, (int)DAG_TIP_FRONTIER_CAPABILITY_LEGACY_UNAVAILABLE);
 
-    // Run InitBlockIndexAuthoritative - should succeed but no overlay runtime
+    // R2c.2/S6-repair: InitBlockIndexAuthoritative must REFUSE to boot a
+    // generation that cannot support the selector runtime (fail closed;
+    // all-or-nothing). No g_fAuthoritativeStartup, no owner, no runtime.
     BOOST_REQUIRE_MESSAGE(fx.PrepareActualLiveDaglinks(&error), error);
-    BOOST_REQUIRE_MESSAGE(fx.RunInitAuthoritative(&error), error);
-
-    // Verify authoritative startup succeeded
-    BOOST_CHECK(g_fAuthoritativeStartup);
-    BOOST_CHECK(pindexBest != NULL);
-
-    // Verify NO DagTipOverlayRuntime was established (legacy gets none)
+    BOOST_CHECK(!fx.RunInitAuthoritative(&error));
+    BOOST_CHECK(!error.empty());
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_CHECK(pindexBest == NULL);
     BOOST_CHECK(!HasDagTipOverlayRuntimeForTest());
     BOOST_CHECK_EQUAL(DagTipOverlayRuntimeGenerationForTest(), (uint64_t)0);
 

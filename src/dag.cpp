@@ -11,6 +11,7 @@
 #include "util.h"
 #include "dag_tips_delta.h"
 #include "dag_mutation_preview.h"
+#include "dag_tip_selector.h"
 
 #include <algorithm>
 #include <queue>
@@ -1089,11 +1090,37 @@ bool CDAGManager::RebuildDAGOrder(const DagMutationPreview* mutationPreview)
         }
     }
 
-    // Assign linear ordering from best tip
-    CBlockIndex* pBestTip = SelectBestDAGTip();
-    if (pBestTip && pBestTip->phashBlock)
+    // Assign linear ordering from best tip.
+    // R2c.2/S6: authoritative primary selection (value-semantic). In
+    // authoritative mode the winner hash comes from the accepted S5 preview
+    // (fail closed on UNAVAILABLE); the legacy resident selector runs only in
+    // genuine legacy mode (LEGACY status).
+    uint256 hashBestTip(0);
     {
-        std::vector<uint256> vOrder = GetDAGLinearOrder(pBestTip->GetBlockHash());
+        std::string selError;
+        DagTipSelectionResult sel = SelectDagTipForInternalConsumer(mutationPreview, &selError);
+        if (sel.status == DAG_TIP_SELECTION_UNAVAILABLE)
+        {
+            fprintf(stderr, "RebuildDAGOrder: S6 authoritative selection unavailable: %s\n",
+                    selError.c_str());
+            fflush(stderr);
+            InvalidateDagTipDeltaTransaction();
+            return false;
+        }
+        if (sel.IsUsable())
+        {
+            hashBestTip = sel.hash;
+        }
+        else
+        {
+            CBlockIndex* pBestTip = SelectBestDAGTip();
+            if (pBestTip && pBestTip->phashBlock)
+                hashBestTip = pBestTip->GetBlockHash();
+        }
+    }
+    if (hashBestTip != 0)
+    {
+        std::vector<uint256> vOrder = GetDAGLinearOrder(hashBestTip);
         for (int i = 0; i < (int)vOrder.size(); i++)
         {
             auto it = mapDAGData.find(vOrder[i]);
@@ -1158,11 +1185,35 @@ bool CDAGManager::RebuildDAGOrderIncremental(int nCleanHeight, const DagMutation
         }
     }
 
-    // Assign linear ordering from best tip
-    CBlockIndex* pBestTip = SelectBestDAGTip();
-    if (pBestTip && pBestTip->phashBlock)
+    // Assign linear ordering from best tip.
+    // R2c.2/S6: authoritative primary selection (value-semantic); see
+    // RebuildDAGOrder for the contract.
+    uint256 hashBestTip(0);
     {
-        std::vector<uint256> vOrder = GetDAGLinearOrder(pBestTip->GetBlockHash());
+        std::string selError;
+        DagTipSelectionResult sel = SelectDagTipForInternalConsumer(mutationPreview, &selError);
+        if (sel.status == DAG_TIP_SELECTION_UNAVAILABLE)
+        {
+            fprintf(stderr, "RebuildDAGOrderIncremental: S6 authoritative selection unavailable: %s\n",
+                    selError.c_str());
+            fflush(stderr);
+            InvalidateDagTipDeltaTransaction();
+            return false;
+        }
+        if (sel.IsUsable())
+        {
+            hashBestTip = sel.hash;
+        }
+        else
+        {
+            CBlockIndex* pBestTip = SelectBestDAGTip();
+            if (pBestTip && pBestTip->phashBlock)
+                hashBestTip = pBestTip->GetBlockHash();
+        }
+    }
+    if (hashBestTip != 0)
+    {
+        std::vector<uint256> vOrder = GetDAGLinearOrder(hashBestTip);
         for (int i = 0; i < (int)vOrder.size(); i++)
         {
             auto it = mapDAGData.find(vOrder[i]);
@@ -1482,37 +1533,79 @@ bool CDAGManager::ComputeEpochState(int nEpoch, int nEpochInterval, const DagMut
 
     // Post-DAG epoch boundaries follow the selected-parent chain, not a
     // height-sorted side effect of local arrival order.
-    CBlockIndex* pBoundary = NULL;
-    CBlockIndex* pBestTip = SelectBestDAGTip();
-    if (pBestTip && pBestTip->nHeight >= state.nHeightEnd)
+    // R2c.2/S6: authoritative primary selection (value-semantic) +, in
+    // authoritative mode, value-semantic boundary resolution: by-value
+    // selected-parent walk with the authoritative active-at-height fallback;
+    // fail closed on unresolvable boundaries. The legacy resident walk +
+    // FindBlockByHeight remain only for genuine legacy mode.
+    uint256 hashBestTip(0);
+    uint256 hashBoundary(0);
     {
-        CBlockIndex* pWalk = pBestTip;
-        std::set<uint256> setVisited;
-        while (pWalk && pWalk->nHeight > state.nHeightEnd && pWalk->phashBlock)
+        std::string selError;
+        DagTipSelectionResult sel = SelectDagTipForInternalConsumer(mutationPreview, &selError);
+        if (sel.status == DAG_TIP_SELECTION_UNAVAILABLE)
         {
-            if (!setVisited.insert(pWalk->GetBlockHash()).second)
-                break;
-            uint256 hashParent = GetSelectedParent(pWalk->GetBlockHash());
-            std::map<uint256, CBlockIndex*>::iterator miParent = mapBlockIndex.find(hashParent);
-            if (miParent == mapBlockIndex.end())
-                break;
-            pWalk = miParent->second;
+            fprintf(stderr, "ComputeEpochState: S6 authoritative selection unavailable: %s\n",
+                    selError.c_str());
+            fflush(stderr);
+            InvalidateDagTipDeltaTransaction();
+            return false;
         }
-        if (pWalk && pWalk->nHeight == state.nHeightEnd)
-            pBoundary = pWalk;
+        if (sel.IsUsable())
+        {
+            hashBestTip = sel.hash;
+            std::string berr;
+            DagTipSelectionResult bres =
+                ResolveAuthoritativeBoundaryAtHeight(hashBestTip, state.nHeightEnd, &berr);
+            if (bres.status == DAG_TIP_SELECTION_UNAVAILABLE)
+            {
+                fprintf(stderr, "ComputeEpochState: S6 authoritative boundary unavailable: %s\n",
+                        berr.c_str());
+                fflush(stderr);
+                InvalidateDagTipDeltaTransaction();
+                return false;
+            }
+            hashBoundary = bres.hash;
+        }
+        else
+        {
+            CBlockIndex* pBoundary = NULL;
+            CBlockIndex* pBestTip = SelectBestDAGTip();
+            if (pBestTip && pBestTip->phashBlock)
+                hashBestTip = pBestTip->GetBlockHash();
+            if (pBestTip && pBestTip->nHeight >= state.nHeightEnd)
+            {
+                CBlockIndex* pWalk = pBestTip;
+                std::set<uint256> setVisited;
+                while (pWalk && pWalk->nHeight > state.nHeightEnd && pWalk->phashBlock)
+                {
+                    if (!setVisited.insert(pWalk->GetBlockHash()).second)
+                        break;
+                    uint256 hashParent = GetSelectedParent(pWalk->GetBlockHash());
+                    std::map<uint256, CBlockIndex*>::iterator miParent = mapBlockIndex.find(hashParent);
+                    if (miParent == mapBlockIndex.end())
+                        break;
+                    pWalk = miParent->second;
+                }
+                if (pWalk && pWalk->nHeight == state.nHeightEnd)
+                    pBoundary = pWalk;
+            }
+            if (!pBoundary)
+                pBoundary = FindBlockByHeight(state.nHeightEnd);
+            if (pBoundary && pBoundary->phashBlock)
+                hashBoundary = pBoundary->GetBlockHash();
+        }
     }
-    if (!pBoundary)
-        pBoundary = FindBlockByHeight(state.nHeightEnd);
-    if (pBoundary && pBoundary->phashBlock)
+    if (hashBoundary != 0)
     {
-        state.hashBoundaryBlock = pBoundary->GetBlockHash();
-        setEpochBoundaryBlocks.insert(state.hashBoundaryBlock);
+        state.hashBoundaryBlock = hashBoundary;
+        setEpochBoundaryBlocks.insert(hashBoundary);
     }
 
     std::set<uint256> setOrdered;
-    if (pBestTip && pBestTip->phashBlock)
+    if (hashBestTip != 0)
     {
-        std::vector<uint256> vOrder = GetDAGLinearOrder(pBestTip->GetBlockHash());
+        std::vector<uint256> vOrder = GetDAGLinearOrder(hashBestTip);
         for (const uint256& hashBlock : vOrder)
         {
             std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashBlock);

@@ -503,18 +503,26 @@ CBlockIndex* BlockIndexAuthoritativeLive::ResolveAndRetainFullParent(
     return impl_->fullResident_[parentHash];
 }
 
-CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChain(
-    const uint256& hash, BlockIndexHotHandle* out, std::string* error) const
+CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChainInto(
+    const uint256& hash,
+    std::vector<CBlockIndex*>* objs,
+    std::vector<uint256*>* owns,
+    std::string* error,
+    bool* walkLookupFailed) const
 {
+    if (walkLookupFailed) *walkLookupFailed = false;
     if (!impl_->open || !impl_->baseReader)
     {
         if (error) *error = "authoritative-live: not open";
         return NULL;
     }
-    // Do NOT evict here: a single logical block acceptance (possibly a reorg that
-    // materializes a whole branch) may resolve many parents that must all stay
-    // valid until the enclosing ProcessBlock completes. Residency is bounded by
-    // releasing at the end of the operation (ReleaseOperationMaterializations).
+    if (!objs || !owns)
+    {
+        if (error) *error = "authoritative-live: null output container";
+        return NULL;
+    }
+    objs->clear();
+    owns->clear();
 
     // Walk parent by value (tip-then-base) down to (and including) the
     // bounded floor needed for the boundary block's OWN consensus walks.
@@ -585,14 +593,7 @@ CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChain(
         if (!found)
         {
             if (error) *error = "authoritative-live: chain walk lookup failed at " + cur.ToString();
-            // roll back partial owned chain
-            for (size_t i = 0; i < impl_->ownedChain_.size(); ++i)
-            {
-                delete impl_->ownedChain_[i];
-                delete impl_->ownedChainHashes_[i];
-            }
-            impl_->ownedChain_.clear();
-            impl_->ownedChainHashes_.clear();
+            if (walkLookupFailed) *walkLookupFailed = true;
             return NULL;
         }
         path.push_back(s);
@@ -615,29 +616,183 @@ CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChain(
         return NULL;
     }
 
-    // Materialize objects (path[0]=requested parent .. path.back()=base floor S).
-    std::vector<CBlockIndex*> objs(path.size(), NULL);
-    std::vector<uint256*> owns(path.size(), NULL);
+    // Materialize objects (path[0]=requested parent .. path.back()=base floor S)
+    // into the CALLER-owned containers. No operation-global store registration:
+    // ownership and lifetime are exactly the caller's.
     for (size_t i = 0; i < path.size(); ++i)
     {
-        owns[i] = new uint256(path[i].hash);
-        objs[i] = FullFromSnapshot(path[i], owns[i]);
+        uint256* own = new uint256(path[i].hash);
+        CBlockIndex* obj = FullFromSnapshot(path[i], own);
+        objs->push_back(obj);
+        owns->push_back(own);
+    }
+    // Link topology: pprev -> floor, pnext -> tip, pskip -> pprev (conservative).
+    for (size_t i = 0; i < objs->size(); ++i)
+    {
+        (*objs)[i]->pprev = (i + 1 < objs->size()) ? (*objs)[i + 1] : NULL;
+        (*objs)[i]->pnext = (i > 0) ? (*objs)[i - 1] : NULL;
+        (*objs)[i]->pskip = (*objs)[i]->pprev;
+    }
+    ClearError(error);
+    return objs->front(); // the requested parent
+}
+
+// R2c.2/S6-repair-cycle-2 (B1): authoritative by-value spend-maturity verdict.
+//
+// Reproduces the EXACT legacy coinbase/coinstake maturity predicate of
+// CTransaction::ConnectInputs (main.cpp:6189-6192) - "is the spent source
+// block (identified by its disk position nFile/nBlockPos) among the ancestors
+// of startHash at depth < maxDepth?" - WITHOUT pprev chains, CBlockIndex
+// materialization, or mapBlockIndex residency:
+//
+//   MATURITY / ANCESTRY TRUTH != TEMPORARY pprev MATERIALIZATION DEPTH
+//
+// Each step resolves by value (mutable tip authority first, then the immutable
+// base generation); the walk is bounded by the protocol constant maxDepth
+// (the caller passes nCoinbaseMaturity), never by chain history. Semantics
+// parity with the legacy walk (pinned by the boundary-matrix fixture):
+//   - compares depths 0..maxDepth-1 (the legacy loop visits exactly those);
+//   - reaching the genesis root before maxDepth => MATURE (the source is not
+//     on this chain within the window);
+//   - lookup failure, or a non-genesis record without a parent link =>
+//     UNAVAILABLE (fail closed: the caller must reject, never assume mature).
+// Caller must hold cs_main (same contract as MaterializeParentChainInto).
+BlockIndexAuthoritativeMaturityStatus BlockIndexAuthoritativeLive::ResolveSpendMaturity(
+    const uint256& startHash, unsigned int srcFile, unsigned int srcBlockPos,
+    int maxDepth, int* outDepth, std::string* error) const
+{
+    if (outDepth) *outDepth = 0;
+    if (!impl_->open || !impl_->baseReader)
+    {
+        if (error) *error = "authoritative-live: not open";
+        return BLOCK_INDEX_MATURITY_UNAVAILABLE;
+    }
+    if (maxDepth <= 0)
+        return BLOCK_INDEX_MATURITY_MATURE; // the legacy loop compares nothing
+
+    uint256 cur = startHash;
+    int depth = 0;
+    for (int guard = 0; guard <= maxDepth; ++guard)
+    {
+        if (cur == uint256(0))
+            return BLOCK_INDEX_MATURITY_MATURE; // reached the genesis root
+
+        BlockIndexSnapshot s;
+        bool found = false;
+        // tip authority first (blocks > S).
+        if (impl_->tip && impl_->tip->IsOpen())
+        {
+            BlockIndexTipRead tr = impl_->tip->LookupByHash(cur, error);
+            if (tr.status == BLOCK_INDEX_TIP_OK)
+            {
+                s.found = true;
+                s.hash = tr.record.hash;
+                s.hashPrev = tr.record.hashPrev;
+                s.height = tr.record.height;
+                s.nFile = tr.record.nFile;
+                s.nBlockPos = tr.record.nBlockPos;
+                found = true;
+            }
+        }
+        if (!found)
+        {
+            // base V2 reader (blocks <= S).
+            BlockIndexV2ReadStatus st = impl_->baseReader->LookupByHash(cur, &s, error);
+            if (st == BLOCK_INDEX_V2_READ_FOUND && s.found)
+                found = true;
+        }
+        if (!found)
+        {
+            if (error) *error = "authoritative-live: maturity walk lookup failed at " + cur.ToString();
+            return BLOCK_INDEX_MATURITY_UNAVAILABLE; // fail closed
+        }
+
+        if (s.nFile == srcFile && s.nBlockPos == srcBlockPos)
+        {
+            if (outDepth) *outDepth = depth;
+            return BLOCK_INDEX_MATURITY_IMMATURE;
+        }
+        if (depth + 1 >= maxDepth)
+            return BLOCK_INDEX_MATURITY_MATURE; // compared depths 0..maxDepth-1
+
+        if (s.hashPrev == uint256(0))
+        {
+            if (s.height == 0)
+                return BLOCK_INDEX_MATURITY_MATURE; // genesis root: source not on this chain
+            if (error) *error = "authoritative-live: maturity walk parent link missing at height "
+                                + std::to_string(s.height);
+            return BLOCK_INDEX_MATURITY_UNAVAILABLE; // truncated/corrupt: fail closed
+        }
+        cur = s.hashPrev;
+        ++depth;
+    }
+    if (error) *error = "authoritative-live: maturity walk guard exhausted for " + startHash.ToString();
+    return BLOCK_INDEX_MATURITY_UNAVAILABLE; // fail closed
+}
+
+CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChain(
+    const uint256& hash, BlockIndexHotHandle* out, std::string* error) const
+{
+    // Operation-scoped variant: same bounded by-value walk, but the objects are
+    // retained in the operation-global store and released by
+    // ReleaseOperationMaterializations() at the end of the operation. Do NOT
+    // evict here: a single logical block acceptance (possibly a reorg that
+    // materializes a whole branch) may resolve many parents that must all stay
+    // valid until the enclosing ProcessBlock completes.
+    std::vector<CBlockIndex*> objs;
+    std::vector<uint256*> owns;
+    bool walkLookupFailed = false;
+    CBlockIndex* parent = MaterializeParentChainInto(hash, &objs, &owns, error, &walkLookupFailed);
+    if (!parent)
+    {
+        // Preserve the accepted fail-closed semantics exactly: a chain walk
+        // lookup failure releases the operation-scoped store (the enclosing
+        // operation fails closed); floor-mismatch/empty-chain do not.
+        if (walkLookupFailed)
+        {
+            for (size_t i = 0; i < impl_->ownedChain_.size(); ++i)
+            {
+                delete impl_->ownedChain_[i];
+                delete impl_->ownedChainHashes_[i];
+            }
+            impl_->ownedChain_.clear();
+            impl_->ownedChainHashes_.clear();
+        }
+        return NULL;
+    }
+    for (size_t i = 0; i < objs.size(); ++i)
+    {
         impl_->ownedChain_.push_back(objs[i]);
         impl_->ownedChainHashes_.push_back(owns[i]);
     }
-    // Link topology: pprev -> floor, pnext -> tip, pskip -> pprev (conservative).
-    for (size_t i = 0; i < objs.size(); ++i)
-    {
-        objs[i]->pprev = (i + 1 < objs.size()) ? objs[i + 1] : NULL;
-        objs[i]->pnext = (i > 0) ? objs[i - 1] : NULL;
-        objs[i]->pskip = objs[i]->pprev;
-    }
-
-    CBlockIndex* parent = objs.front(); // the requested parent
     if (out)
         *out = BlockIndexHotHandle(); // ownership retained by this authority for the op
-    ClearError(error);
     return parent;
+}
+
+CBlockIndex* ScopedMaterializedChain::Acquire(BlockIndexAuthoritativeLive* live,
+                                              const uint256& hash, std::string* error)
+{
+    Release();
+    if (!live)
+    {
+        if (error) *error = "scoped-materialization: live authority unavailable";
+        return NULL;
+    }
+    parent_ = live->MaterializeParentChainInto(hash, &owned_, &ownedHashes_, error);
+    return parent_;
+}
+
+void ScopedMaterializedChain::Release()
+{
+    for (size_t i = 0; i < owned_.size(); ++i)
+    {
+        delete owned_[i];
+        delete ownedHashes_[i];
+    }
+    owned_.clear();
+    ownedHashes_.clear();
+    parent_ = NULL;
 }
 
 bool BlockIndexAuthoritativeLive::AcceptActive(const BlockIndexRecord& rec,

@@ -46,9 +46,12 @@ struct CPUMiningWorkIdentity
     std::vector<uint256> vDAGTips;
     unsigned int nTransactionsUpdated;
     int nHeight;
+    // R2c.2/S6: set when the authoritative primary selection was UNAVAILABLE
+    // at capture time; such an identity is never considered current.
+    bool fSelectionUnavailable;
 
     CPUMiningWorkIdentity()
-        : nTransactionsUpdated(0), nHeight(0)
+        : nTransactionsUpdated(0), nHeight(0), fSelectionUnavailable(false)
     {
     }
 };
@@ -57,6 +60,20 @@ struct CPUMiningWorkIdentity
 bool CPUMiningWorkIdentityMatches(const CPUMiningWorkIdentity& a,
                                   const CPUMiningWorkIdentity& b,
                                   bool fCheckMempool);
+
+// R2c.2/S6 test-facing exports: call the real production CPU-mining consumers
+// (capture / collateral gate / work-current check) from focused fixtures.
+CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentityForTest();
+bool IsCPUMiningCollateralStateReadyForTest();
+bool IsCPUMiningWorkCurrentForTest(const CPUMiningWorkIdentity& identity, bool fCheckMempool);
+// R2c.2/S6-repair: call the real production attempt-prep consumer with a
+// test-scoped materialization token (released before return; no pointer
+// escapes to the caller).
+bool PrepareCPUMiningAttemptForTest(CBlock* pblock,
+                                    const CPUMiningWorkIdentity& workIdentity,
+                                    unsigned int nExtraNonce,
+                                    int* outParentHeight,
+                                    uint256* outTarget);
 
 /** Check that a built block commits to the chain/DAG work snapshot. */
 bool CPUMiningBlockMatchesWorkIdentity(const CBlock& block,

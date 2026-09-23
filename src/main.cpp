@@ -6187,9 +6187,38 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
 
             // If prev is coinbase or coinstake, check that it's matured
             if (txPrev.IsCoinBase() || txPrev.IsCoinStake())
-                for (const CBlockIndex* pindex = pindexBlock; pindex && pindexBlock->nHeight - pindex->nHeight < nCoinbaseMaturity; pindex = pindex->pprev)
-                    if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nFile)
-                        return error("ConnectInputs() : tried to spend %s at depth %d", txPrev.IsCoinBase() ? "coinbase" : "coinstake", pindexBlock->nHeight - pindex->nHeight);
+            {
+                if (g_fAuthoritativeStartup)
+                {
+                    // R2c.2/S6-repair-cycle-2 (B1): authoritative by-value
+                    // maturity verdict. The legacy pprev walk below fails open
+                    // on authoritative topology (a fresh-boot anchor has
+                    // pprev == NULL so only depth 0 is seen; the bounded
+                    // materialization window is [base tip - 13, winner]), so
+                    // maturity truth must come from the authoritative chain by
+                    // value - never from truncated residency. Unavailable
+                    // authority FAILS CLOSED (reject), distinct from immature.
+                    BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority();
+                    if (liveAuth == NULL || !liveAuth->IsOpen())
+                        return error("ConnectInputs() : maturity authority unavailable for %s (authoritative, %s)", txPrev.IsCoinBase() ? "coinbase" : "coinstake", GetHash().ToString().c_str());
+                    int nAuthDepth = 0;
+                    std::string strAuthErr;
+                    BlockIndexAuthoritativeMaturityStatus authStatus = liveAuth->ResolveSpendMaturity(
+                        pindexBlock->GetBlockHash(), txindex.pos.nFile, txindex.pos.nBlockPos,
+                        nCoinbaseMaturity, &nAuthDepth, &strAuthErr);
+                    if (authStatus == BLOCK_INDEX_MATURITY_IMMATURE)
+                        return error("ConnectInputs() : tried to spend %s at depth %d (authoritative)", txPrev.IsCoinBase() ? "coinbase" : "coinstake", nAuthDepth);
+                    if (authStatus == BLOCK_INDEX_MATURITY_UNAVAILABLE)
+                        return error("ConnectInputs() : maturity authority unavailable for %s: %s (authoritative)", txPrev.IsCoinBase() ? "coinbase" : "coinstake", strAuthErr.c_str());
+                    // MATURE: continue with the remaining checks.
+                }
+                else
+                {
+                    for (const CBlockIndex* pindex = pindexBlock; pindex && pindexBlock->nHeight - pindex->nHeight < nCoinbaseMaturity; pindex = pindex->pprev)
+                        if (pindex->nBlockPos == txindex.pos.nBlockPos && pindex->nFile == txindex.pos.nFile)
+                            return error("ConnectInputs() : tried to spend %s at depth %d", txPrev.IsCoinBase() ? "coinbase" : "coinstake", pindexBlock->nHeight - pindex->nHeight);
+                }
+            }
 
             // ppcoin: check transaction timestamp
             if (txPrev.nTime > nTime)

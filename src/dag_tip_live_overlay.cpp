@@ -53,6 +53,7 @@ static void EmitAddedNonSeedTramp(const uint256& h, bool present, void* c)
 {
     LiveTipOverlayForward* f = static_cast<LiveTipOverlayForward*>(c);
     if (!f || !present || !f->self) return;
+    if (f->stop) return; // visitor aborted: stop emitting (no further visitor invocations)
     bool inSeed = f->self->HasSeedMembership(h);
     if (inSeed) return; // already emitted in pass 1
     if (f->fn && !((*f->fn)(h, f->outerCtx))) f->stop = true;
@@ -465,13 +466,19 @@ bool LiveTipFrontierOverlay::ForEachTip(ForEachFn fn, void* ctx, std::string* er
     // and seed tips overridden PRESENT exactly once.
     impl_->seed.ResetStream();
     uint256 h;
+    bool aborted = false;
     while (impl_->seed.Next(&h))
     {
         bool hasOv = false, present = false;
         if (!impl_->store.GetState(h, &hasOv, &present, error)) return false;
         if (hasOv && !present) continue;      // ABSENT -> suppress
-        if (fn && !(*fn)(h, ctx)) break;      // PRESENT or no-override -> emit
+        if (fn && !(*fn)(h, ctx)) { aborted = true; break; } // PRESENT or no-override -> emit
     }
+    // R2c.2/S6-repair (Phase 11): a visitor abort stops emission immediately.
+    // The caller carries the failure state (the abort contract still returns
+    // true; the sticky caller-side failure decides the outcome), so no further
+    // visitor invocations / candidate I/O occur after an abort.
+    if (aborted) return true;
     // Pass 2: emit PRESENT overrides absent from the immutable seed (added
     // non-seed tips). ABSENT entries present nothing. Uses the documented
     // O(N) seed.Contains for this substrate (no index).

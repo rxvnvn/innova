@@ -368,6 +368,7 @@ OBJS= \
     obj/dag.o \
     obj/dag_tips_delta.o \
     obj/dag_mutation_preview.o \
+    obj/dag_tip_selector.o \
     obj/candidate_frontier.o \
     obj/candidate_frontier_metadata.o \
     obj/blockindex_hot_owner.o \
@@ -499,6 +500,7 @@ OBJS= \
     obj/dag.o \
     obj/dag_tips_delta.o \
     obj/dag_mutation_preview.o \
+    obj/dag_tip_selector.o \
     obj/candidate_frontier.o \
     obj/candidate_frontier_metadata.o \
     obj/blockindex_hot_owner.o \
