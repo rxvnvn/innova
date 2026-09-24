@@ -32,6 +32,8 @@
 #include "db.h"
 #include "txdb.h"
 #include "main.h"
+#include "blockrequesttrace.h"
+#include <cstdlib>
 #include "miner.h"
 #include "wallet.h"
 #include "zkproof.h"
@@ -301,6 +303,8 @@ static void AttachDagParentsAndRemine(CBlock* pblock, const std::vector<uint256>
 
 static CBlockIndex* MineRealDag(CBlockIndex* pindexPrev, unsigned int nExtra)
 {
+    const bool fSavedAbtrace = AcceptBlockRejectTraceEnabled();
+    InitAcceptBlockRejectTrace(true);
     CBlock* b = BuildPoWBlock(pindexPrev, nExtra);
     BOOST_REQUIRE(b != NULL);
     AttachDagParentsAndRemine(b, std::vector<uint256>(1, pindexPrev->GetBlockHash()));
@@ -309,6 +313,28 @@ static CBlockIndex* MineRealDag(CBlockIndex* pindexPrev, unsigned int nExtra)
     delete b;
     BOOST_REQUIRE(out != NULL);
     return out;
+}
+
+static void RebindMapBlockIndexHashPointersForTest()
+{
+    AssertLockHeld(cs_main);
+    for (std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.begin();
+         it != mapBlockIndex.end(); ++it)
+    {
+        BOOST_REQUIRE_MESSAGE(it->second != NULL,
+            "fixture mapBlockIndex may not contain a null CBlockIndex pointer");
+        it->second->phashBlock = &it->first;
+        BOOST_REQUIRE(it->second->phashBlock == &it->first);
+        BOOST_REQUIRE(*it->second->phashBlock == it->first);
+        BOOST_REQUIRE(it->second->GetBlockHash() == it->first);
+    }
+}
+
+static void RestoreMapBlockIndexForFixture(const std::map<uint256, CBlockIndex*>& saved)
+{
+    AssertLockHeld(cs_main);
+    mapBlockIndex = saved;
+    RebindMapBlockIndexHashPointersForTest();
 }
 
 static CBlockIndex* AddSideDag(CBlockIndex* pindexPrev, unsigned int nExtra)
@@ -2049,9 +2075,9 @@ BOOST_AUTO_TEST_CASE(r2c2s_s2_erased_parent_live_vs_restart_discriminator)
     ResetBlockIndexAuthoritativeStartupForTest();
     { LOCK(cs_main);
       for (std::map<uint256,CBlockIndex*>::iterator it=mapBlockIndex.begin(); it!=mapBlockIndex.end(); ++it)
-        if (savedMap.count(it->first)==0){ delete it->second->phashBlock; delete it->second; }
+        if (savedMap.count(it->first)==0){ delete it->second; }
       mapBlockIndex.clear();
-      mapBlockIndex=savedMap;
+      RestoreMapBlockIndexForFixture(savedMap);
       pindexBest=savedBest; pindexGenesisBlock=savedGenesis;
       hashBestChain=savedBestChain; nBestHeight=savedBestHeight; nBestChainTrust=savedBestTrust;
     }
@@ -2692,9 +2718,9 @@ BOOST_AUTO_TEST_CASE(s2_boundary_load_bearing_live_vs_restart)
     ResetBlockIndexAuthoritativeStartupForTest();
     { LOCK(cs_main);
       for (std::map<uint256,CBlockIndex*>::iterator it=mapBlockIndex.begin(); it!=mapBlockIndex.end(); ++it)
-        if (savedMap.count(it->first)==0){ delete it->second->phashBlock; delete it->second; }
+        if (savedMap.count(it->first)==0){ delete it->second; }
       mapBlockIndex.clear();
-      mapBlockIndex=savedMap;
+      RestoreMapBlockIndexForFixture(savedMap);
       pindexBest=savedBest; pindexGenesisBlock=savedGenesis;
       hashBestChain=savedBestChain; nBestHeight=savedBestHeight; nBestChainTrust=savedBestTrust;
     }
@@ -3134,8 +3160,8 @@ BOOST_AUTO_TEST_CASE(r2c2s_s3_abort_preserves_old_score_source)
     ResetBlockIndexAuthoritativeStartupForTest();
     { LOCK(cs_main);
       for (std::map<uint256,CBlockIndex*>::iterator it=mapBlockIndex.begin(); it!=mapBlockIndex.end(); ++it)
-        if (savedMap.count(it->first)==0){ delete it->second->phashBlock; delete it->second; }
-      mapBlockIndex.clear(); mapBlockIndex=savedMap;
+        if (savedMap.count(it->first)==0){ delete it->second; }
+      mapBlockIndex.clear(); RestoreMapBlockIndexForFixture(savedMap);
       pindexBest=savedBest; pindexGenesisBlock=savedGenesis;
       hashBestChain=savedBestChain; nBestHeight=savedBestHeight; nBestChainTrust=savedBestTrust; }
     g_dagManager.ClearDAGDataForTest();
@@ -7728,6 +7754,92 @@ BOOST_AUTO_TEST_CASE(r2c2s_s5_preview_nonresident_and_bounded_state)
 //         read-failure/revalidation/enumeration-failure).
 // ===========================================================================
 
+// Enabled only by the isolated S7 invocation. No file operations when unset.
+struct S7ParentTrace;
+static S7ParentTrace* s7ParentTrace = NULL;
+struct S7ParentTrace
+{
+    std::ofstream out;
+    std::string phase;
+    uint64_t sequence, calls, resets;
+    std::unique_ptr<ScopedProcessBlockParentObserver> observer;
+    static std::string Escape(const std::string& value)
+    {
+        std::string out;
+        for (size_t i = 0; i < value.size(); ++i)
+        {
+            if (value[i] == '\n') out += "\\n";
+            else if (value[i] == '\r') out += "\\r";
+            else if (value[i] == '\t') out += "\\t";
+            else if (value[i] == '\\') out += "\\\\";
+            else out += value[i];
+        }
+        return out;
+    }
+    S7ParentTrace() : phase("fixture_start"), sequence(0), calls(0), resets(0)
+    {
+        const char* dir = std::getenv("S7_PARENT_TRACE_DIR");
+        if (!dir || !*dir) return;
+        const char* label = std::getenv("S7_PARENT_TRACE_LABEL");
+        BOOST_REQUIRE_MESSAGE(label && *label, "S7_PARENT_TRACE_LABEL required with trace directory");
+        const std::string name(label);
+        BOOST_REQUIRE(name.find_first_not_of("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") == std::string::npos);
+        const fs::path path = fs::path(dir) / (name + "-parent.tsv");
+        BOOST_REQUIRE_MESSAGE(!fs::exists(path), "trace label must be unique; preserve previous invocation");
+        fs::create_directories(path.parent_path());
+        out.open(path.string().c_str(), std::ios::out | std::ios::app);
+        BOOST_REQUIRE(out.good());
+        out << "# diagnostic_* are separate read samples, NOT the production bool lookup; status -1=not sampled; reset_count=authoritative startup resets in this fixture\n";
+        out.flush();
+        LOCK(cs_main);
+        observer.reset(new ScopedProcessBlockParentObserver(Capture));
+        s7ParentTrace = this;
+    }
+    ~S7ParentTrace()
+    {
+        LOCK(cs_main);
+        observer.reset();
+        if (s7ParentTrace == this) s7ParentTrace = NULL;
+    }
+    static void Capture(const ProcessBlockParentObserverEvent& e)
+    {
+        S7ParentTrace& t = *s7ParentTrace;
+        if (e.kind == PROCESSBLOCK_PARENT_ENTRY) ++t.calls;
+        t.out << "event=" << ++t.sequence << "\tphase=" << t.phase
+              << "\tcall_sequence=" << t.calls << "\treset_count=" << t.resets;
+#define S7_FIELD(field) t.out << "\t" #field "=" << e.field
+        S7_FIELD(kind);
+        t.out << "\tchild=" << e.child.ToString() << "\tprev=" << e.prev.ToString();
+        S7_FIELD(prevMapCount); S7_FIELD(childMapCount); S7_FIELD(authoritative);
+        S7_FIELD(livePresent); S7_FIELD(liveOpen); S7_FIELD(boolAttempted); S7_FIELD(boolResult);
+        t.out << "\tboolError=" << Escape(e.boolError) << "\trouteError=" << Escape(e.routeError);
+        S7_FIELD(diagnosticParentStatus); S7_FIELD(diagnosticActive); S7_FIELD(diagnosticHeight);
+        S7_FIELD(diagnosticFile); S7_FIELD(diagnosticBlockPos);
+        t.out << "\tdiagnosticParentError=" << Escape(e.diagnosticParentError);
+        S7_FIELD(diagnosticTipStatus); S7_FIELD(diagnosticSnapshotStatus);
+        t.out << "\tdiagnosticTipError=" << Escape(e.diagnosticTipError)
+              << "\tdiagnosticSnapshotError=" << Escape(e.diagnosticSnapshotError);
+        S7_FIELD(diagnosticTailSampled); S7_FIELD(diagnosticTailResident);
+        S7_FIELD(baseGeneration); S7_FIELD(authoritativeGeneration);
+        t.out << "\tbestHash=" << e.bestHash.ToString();
+        S7_FIELD(bestHeight); S7_FIELD(diagnosticSourceRead);
+        t.out << "\tdiagnosticSourceState=" << e.diagnosticSourceState.ToString();
+        S7_FIELD(monotonicMicros); S7_FIELD(wallMicros); S7_FIELD(orphanCount); S7_FIELD(acceptResult);
+#undef S7_FIELD
+        t.out << '\n';
+        t.out.flush();
+        BOOST_CHECK_MESSAGE(t.out.good(), "S7 parent trace write failed");
+    }
+};
+static void S7ParentTracePhase(const char* phase, bool reset = false)
+{
+    if (!s7ParentTrace) return;
+    s7ParentTrace->phase = phase;
+    if (reset) ++s7ParentTrace->resets;
+    s7ParentTrace->out << "# phase=" << phase << " reset_count=" << s7ParentTrace->resets << '\n';
+    s7ParentTrace->out.flush();
+}
+
 struct S6Fixture
 {
     fs::path root;
@@ -7748,6 +7860,7 @@ struct S6Cleanup
         : root(r), best(pindexBest), genesis(pindexGenesisBlock) {}
     ~S6Cleanup()
     {
+        S7ParentTracePhase("cleanup_authority_reset", true);
         ResetBlockIndexAuthoritativeStartupForTest();
         pindexBest = best;
         pindexGenesisBlock = genesis;
@@ -7757,6 +7870,7 @@ struct S6Cleanup
         SetDagMutationPreviewPhaseHookForTest(NULL);
         SetDagTipSelectorEnumerationHookForTest(NULL, NULL);
         SetDagTipSelectorForceUnavailableForTest(false, DAG_TIP_SELECTION_REASON_NONE);
+        SetMergeParentForceUnavailableForTest(false, DAG_TIP_SELECTION_REASON_NONE);
         SetMockTime(0);
         try { fs::remove_all(root); } catch (...) {}
     }
@@ -7764,6 +7878,7 @@ struct S6Cleanup
 
 static void S6BuildAuthoritativeFixture(S6Fixture& fx, unsigned nonceBase)
 {
+    S7ParentTracePhase("fixture_mining");
     SetMockTime(1700003600);
     BOOST_REQUIRE(CZKContext::Initialize());
     if (hooks == NULL) hooks = InitHook();
@@ -7777,6 +7892,7 @@ static void S6BuildAuthoritativeFixture(S6Fixture& fx, unsigned nonceBase)
     fx.epochEnd = epochEnd;
     fx.boundaryHash = p->GetBlockHash();
 
+    S7ParentTracePhase("fixture_snapshot_build");
     fs::create_directories(fx.root / "snapshot");
     { CTxDB db; db.Close(); }
     const auto liveDir = GetDataDir() / "txleveldb";
@@ -7795,6 +7911,7 @@ static void S6BuildAuthoritativeFixture(S6Fixture& fx, unsigned nonceBase)
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(fx.root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(fx.root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
     g_dagManager.ClearDAGDataForTest();
+    S7ParentTracePhase("fixture_authoritative_startup");
     BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &aerr), aerr);
     BOOST_REQUIRE(g_fAuthoritativeStartup);
     g_testSuppressDagSourceAbort = true;
@@ -8454,7 +8571,469 @@ BOOST_AUTO_TEST_CASE(r2c2s_s6repair_fresh_boot_nonresident_winner_create_block)
         << " mapStillEmpty=1");
 
     // restore resident map for the remainder of the process
-    { LOCK(cs_main); mapBlockIndex = savedMap; }
+    { LOCK(cs_main); RestoreMapBlockIndexForFixture(savedMap); }
+}
+
+// ---------------------------------------------------------------------------
+// R2c.2/S7 — AUTHORITATIVE MERGE-PARENT CUTOVER (CreateNewBlock).
+//
+// The legacy merge-parent commitment (src/miner.cpp:265-334) derives its
+// candidate set from g_dagManager.GetDAGTips() (setDAGTips) and requires
+// mapBlockIndex RESIDENCY. After the authoritative fresh-boot boundary the
+// legitimate frontier tips are nonresident, so the legacy path can only ever
+// emit the primary parent: every legitimate merge parent is silently omitted.
+//
+// This fixture proves, on the REAL production path:
+//   RED   — with the candidates nonresident, the legacy-authority path emits a
+//           primary-only commitment (the bypass), while the SAME authoritative
+//           state legitimately contains two eligible merge parents;
+//   GREEN — the authoritative value-only result resolves those retained
+//           nonresident candidates by value, includes them, and produces a
+//           vector IDENTICAL to the resident case (exact legacy parity, since
+//           the resident vector is pinned against an independent legacy oracle);
+//   PHASE F — the CPU-mining work identity fingerprints the SAME authoritative
+//           frontier, so CPUMiningBlockMatchesWorkIdentity accepts the
+//           authoritatively built template (no split authority);
+//   FAIL-CLOSED — an unavailable authority produces NO template and is never
+//           collapsed into "no extra parents";
+//   BOUNDED — no mapBlockIndex residency is created and the reduction performs
+//           at most one metadata read per frontier tip.
+// ---------------------------------------------------------------------------
+static std::vector<uint256> S7CommitmentOf(const CBlock& b)
+{
+    if (b.vtx.empty()) return std::vector<uint256>();
+    for (const CTxOut& out : b.vtx[0].vout)
+    {
+        std::vector<uint256> v = ExtractDAGParents(out.scriptPubKey);
+        if (!v.empty()) return v;
+    }
+    return std::vector<uint256>();
+}
+
+// Independent legacy oracle: the exact legacy merge-parent rule (miner.cpp:265-334)
+// evaluated over the RESIDENT map. Used to pin the resident vector so the
+// authoritative result is compared against legacy semantics, not against itself.
+static std::vector<uint256> S7LegacyMergeParentOracle(const uint256& primaryHash,
+                                                      int primaryHeight)
+{
+    std::vector<std::pair<uint256, uint256>> v;
+    std::vector<uint256> tips = g_dagManager.GetDAGTips();
+    for (size_t i = 0; i < tips.size(); ++i)
+    {
+        const uint256& h = tips[i];
+        if (h == primaryHash) continue;
+        std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(h);
+        if (mi == mapBlockIndex.end() || mi->second == NULL) continue;
+        CBlockIndex* p = mi->second;
+        if (p != pindexBest && p->nChainTrust > nBestChainTrust) continue;
+        v.push_back(std::make_pair(g_dagManager.ComputeDAGScore(p), h));
+    }
+    std::sort(v.begin(), v.end(),
+              [](const std::pair<uint256, uint256>& a, const std::pair<uint256, uint256>& b) {
+                  if (a.first != b.first) return a.first > b.first;
+                  return a.second < b.second;
+              });
+    std::vector<uint256> out;
+    size_t total = 1; // primary already occupies index 0
+    for (size_t i = 0; i < v.size(); ++i)
+    {
+        if (total >= (size_t)MAX_DAG_PARENTS) break;
+        CBlockIndex* p = mapBlockIndex[v[i].second];
+        if (p == NULL) continue;
+        if (p->nHeight < primaryHeight - DAG_MERGE_DEPTH) continue;
+        if (p->nHeight >= primaryHeight + 1) continue;
+        out.push_back(v[i].second);
+        ++total;
+    }
+    return out;
+}
+
+BOOST_AUTO_TEST_CASE(r2c2s_s7_merge_parent_authoritative_cutover)
+{
+    S7ParentTrace parentTrace;
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+    S6BuildAuthoritativeFixture(fx, 0xF300);
+
+    // ---- topology: P = the active child of the retained base; S1..S3 = side
+    // siblings of P. The authoritative frontier is then the childless set
+    // {S1,S2,S3}: the selector picks ONE of them as the primary and the
+    // remaining ones are the eligible merge parents. The primary is READ BACK
+    // from the selector (never assumed) so the fixture stays faithful to the
+    // real CreateNewBlock caller.
+    S7ParentTracePhase("primary_child");
+    CBlockIndex* P = MineRealDag(fx.forkBest, 0xF301);
+    BOOST_REQUIRE(P != NULL);
+    const uint256 hashP = P->GetBlockHash();
+
+    S7ParentTracePhase("phase_0");
+    // ---- (0) VALID EMPTY: a single-tip frontier has no extra merge parents and
+    // must be reported VALID — never collapsed into UNAVAILABLE.
+    {
+        std::string e0;
+        DagTipSelectionResult sel0 = SelectDagTipForExternalConsumer(&e0);
+        BOOST_REQUIRE_MESSAGE(sel0.IsUsable(), e0);
+        DagFrontierTipsResult fr0 = SelectFrontierTipsForExternalConsumer(&e0);
+        BOOST_REQUIRE_MESSAGE(fr0.IsUsable(), e0);
+        BOOST_REQUIRE_MESSAGE(fr0.tips.size() == 1, "expected a single-tip frontier before widening");
+        DagMergeParentResult mp0 = SelectMergeParentsForExternalConsumer(sel0.hash, sel0.height, &e0);
+        BOOST_REQUIRE_MESSAGE(mp0.IsUsable(), e0);
+        BOOST_CHECK_EQUAL((int)mp0.status, (int)DAG_MERGE_PARENT_VALID);
+        BOOST_CHECK_EQUAL(mp0.parents.size(), (size_t)1);
+        BOOST_CHECK_EQUAL(mp0.parents[0].ToString(), sel0.hash.ToString());
+        BOOST_CHECK(!mp0.HasExtraParents());
+        std::unique_ptr<CBlock> blk0(CreateNewBlock(pwalletMain, false, NULL, NULL));
+        BOOST_REQUIRE(blk0.get() != NULL);
+        BOOST_CHECK_EQUAL(S7CommitmentOf(*blk0).size(), (size_t)1);
+        BOOST_TEST_MESSAGE("S7_EMPTY frontierTips=1 parents=1 status=VALID (distinct from UNAVAILABLE)");
+    }
+
+    S7ParentTracePhase("side_siblings");
+    CBlockIndex* S1 = AddSideDag(P, 0xF311);
+    CBlockIndex* S2 = AddSideDag(P, 0xF312);
+    CBlockIndex* S3 = AddSideDag(P, 0xF313);
+    CBlockIndex* S4 = AddSideDag(P, 0xF314);
+    CBlockIndex* S5 = AddSideDag(P, 0xF315);
+    CBlockIndex* S6 = AddSideDag(P, 0xF316);
+    BOOST_REQUIRE(S1 != NULL);
+    BOOST_REQUIRE(S2 != NULL);
+    BOOST_REQUIRE(S3 != NULL);
+    BOOST_REQUIRE(S4 != NULL);
+    BOOST_REQUIRE(S5 != NULL);
+    BOOST_REQUIRE(S6 != NULL);
+    const uint256 hashS1 = S1->GetBlockHash();
+    const uint256 hashS2 = S2->GetBlockHash();
+    const uint256 hashS3 = S3->GetBlockHash();
+    const uint256 hashS4 = S4->GetBlockHash();
+    const uint256 hashS5 = S5->GetBlockHash();
+    const uint256 hashS6 = S6->GetBlockHash();
+
+    std::string e;
+    DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(sel.IsUsable(), e);
+    const uint256 primaryHash = sel.hash;
+    const int primaryHeight = sel.height;
+    BOOST_REQUIRE(primaryHash != hashP);
+
+    // ---- topology diagnostics (source-of-truth dump for the audit record)
+    {
+        std::string te;
+        DagFrontierTipsResult fr = SelectFrontierTipsForExternalConsumer(&te);
+        std::vector<uint256> legacyTips = g_dagManager.GetDAGTips();
+        std::string sTips, sLegacy;
+        if (fr.IsUsable())
+            for (size_t i = 0; i < fr.tips.size(); ++i)
+                sTips += fr.tips[i].ToString().substr(0, 12) + " ";
+        for (size_t i = 0; i < legacyTips.size(); ++i)
+            sLegacy += legacyTips[i].ToString().substr(0, 12) + " ";
+        LOCK(cs_main);
+        BOOST_TEST_MESSAGE("S7_TOPO forkBest=" << fx.forkBest->GetBlockHash().ToString().substr(0, 12)
+            << " h=" << fx.forkBest->nHeight
+            << " | P=" << hashP.ToString().substr(0, 12) << " h=" << P->nHeight
+            << " | S1=" << hashS1.ToString().substr(0, 12) << " h=" << S1->nHeight
+            << " | S2=" << hashS2.ToString().substr(0, 12) << " h=" << S2->nHeight
+            << " | S3=" << hashS3.ToString().substr(0, 12) << " h=" << S3->nHeight
+            << " | S4=" << hashS4.ToString().substr(0, 12) << " h=" << S4->nHeight
+            << " | S5=" << hashS5.ToString().substr(0, 12) << " h=" << S5->nHeight
+            << " | S6=" << hashS6.ToString().substr(0, 12) << " h=" << S6->nHeight
+            << " | pindexBest=" << (pindexBest ? pindexBest->GetBlockHash().ToString().substr(0, 12) : std::string("NULL"))
+            << " | hashBestChain=" << hashBestChain.ToString().substr(0, 12)
+            << " | sel=" << sel.hash.ToString().substr(0, 12) << " selH=" << sel.height
+            << " | authTips[" << (fr.IsUsable() ? fr.tips.size() : (size_t)0) << "]=" << sTips
+            << " | legacyTips[" << legacyTips.size() << "]=" << sLegacy);
+    }
+
+    S7ParentTracePhase("phase_1");
+    // ---- (1) RESIDENT: independent legacy oracle == authoritative result.
+    const std::vector<uint256> legacyOracle = S7LegacyMergeParentOracle(primaryHash, primaryHeight);
+    BOOST_REQUIRE_MESSAGE(legacyOracle.size() >= 3,
+        "fixture topology must expose several eligible extra merge parents (ordering coverage)");
+
+    ResetDagMergeParentStatsForTest();
+    DagMergeParentResult mpResident = SelectMergeParentsForExternalConsumer(primaryHash, primaryHeight, &e);
+    BOOST_REQUIRE_MESSAGE(mpResident.IsUsable(), e);
+    BOOST_REQUIRE_EQUAL(mpResident.parents.size(), legacyOracle.size() + 1);
+    BOOST_CHECK_EQUAL(mpResident.parents[0].ToString(), primaryHash.ToString());
+    for (size_t i = 0; i < legacyOracle.size(); ++i)
+        BOOST_CHECK_EQUAL(mpResident.parents[i + 1].ToString(), legacyOracle[i].ToString());
+
+    std::unique_ptr<CBlock> blkResident(CreateNewBlock(pwalletMain, false, NULL, NULL));
+    BOOST_REQUIRE(blkResident.get() != NULL);
+    const std::vector<uint256> cmResident = S7CommitmentOf(*blkResident);
+    BOOST_CHECK(cmResident == mpResident.parents);
+
+    S7ParentTracePhase("phase_2");
+    {
+        LOCK(cs_main);
+        BOOST_TEST_MESSAGE("S7_PHASE2_CLEARED best_ptr=" << (void*)pindexBest
+            << " best_hash=" << pindexBest->GetBlockHash().ToString()
+            << " best_h=" << pindexBest->nHeight
+            << " hashBestChain=" << hashBestChain.ToString()
+            << " mapsize=" << mapBlockIndex.size());
+    }
+    // ---- (2) RED: authoritative fresh-boot boundary (candidates nonresident).
+    std::map<uint256, CBlockIndex*> savedMap;
+    { LOCK(cs_main); savedMap = mapBlockIndex; mapBlockIndex.clear(); }
+    {
+        LOCK(cs_main);
+        BOOST_CHECK(mapBlockIndex.find(primaryHash) == mapBlockIndex.end());
+        for (size_t i = 0; i < legacyOracle.size(); ++i)
+            BOOST_CHECK_MESSAGE(mapBlockIndex.find(legacyOracle[i]) == mapBlockIndex.end(),
+                "eligible merge-parent candidate must be absent from mapBlockIndex (nonresident boundary)");
+    }
+
+    // The legacy-authority merge-parent path can no longer see the candidates.
+    std::unique_ptr<CBlock> blkLegacy;
+    {
+        const bool savedAuth = g_fAuthoritativeStartup;
+        g_fAuthoritativeStartup = false;
+        blkLegacy.reset(CreateNewBlock(pwalletMain, false, NULL, NULL));
+        g_fAuthoritativeStartup = savedAuth;
+    }
+    BOOST_REQUIRE(blkLegacy.get() != NULL);
+    const std::vector<uint256> cmLegacy = S7CommitmentOf(*blkLegacy);
+    BOOST_REQUIRE_EQUAL(cmLegacy.size(), (size_t)1); // RED: ALL candidates omitted
+    BOOST_CHECK_EQUAL(cmLegacy[0].ToString(), primaryHash.ToString());
+    BOOST_TEST_MESSAGE("S7_RED legacy_authority_commitment_parents=" << cmLegacy.size()
+        << " authoritative_eligible_extras=" << legacyOracle.size());
+
+    S7ParentTracePhase("phase_3");
+    // ---- (3) GREEN: same nonresident boundary, authoritative path.
+    ResetDagMergeParentStatsForTest();
+    DagMergeParentResult mpNonresident = SelectMergeParentsForExternalConsumer(primaryHash, primaryHeight, &e);
+    BOOST_REQUIRE_MESSAGE(mpNonresident.IsUsable(), e);
+    BOOST_REQUIRE(mpNonresident.HasExtraParents());
+    // Resident / nonresident parity: identical vector.
+    BOOST_CHECK(mpNonresident.parents == mpResident.parents);
+
+    std::unique_ptr<CBlock> blkNonresident(CreateNewBlock(pwalletMain, false, NULL, NULL));
+    BOOST_REQUIRE_MESSAGE(blkNonresident.get() != NULL,
+        "authoritative merge-parent template must build with nonresident candidates");
+    const std::vector<uint256> cmNonresident = S7CommitmentOf(*blkNonresident);
+    BOOST_CHECK(cmNonresident == mpResident.parents);
+    BOOST_CHECK_EQUAL(cmNonresident.size(), legacyOracle.size() + 1);
+    BOOST_CHECK_EQUAL(cmNonresident[0].ToString(), primaryHash.ToString());
+    for (size_t i = 1; i < cmNonresident.size(); ++i)
+    {
+        bool fEligible = false;
+        for (size_t j = 0; j < legacyOracle.size(); ++j)
+            if (cmNonresident[i] == legacyOracle[j]) fEligible = true;
+        BOOST_CHECK_MESSAGE(fEligible,
+            "every merge parent must be an eligible authoritative frontier tip");
+        BOOST_CHECK_MESSAGE(cmNonresident[i] != primaryHash,
+            "selected primary must not reappear as an extra merge parent");
+    }
+
+    // Determinism: repeated calls produce the identical vector.
+    DagMergeParentResult mpAgain = SelectMergeParentsForExternalConsumer(primaryHash, primaryHeight, &e);
+    BOOST_REQUIRE(mpAgain.IsUsable());
+    BOOST_CHECK(mpAgain.parents == mpNonresident.parents);
+
+    // ---- commitment / result dump (audit record)
+    {
+        std::string sR, sL, sN, sMR, sMN, sOr;
+        for (size_t i = 0; i < cmResident.size(); ++i) sR += cmResident[i].ToString().substr(0, 12) + " ";
+        for (size_t i = 0; i < cmLegacy.size(); ++i) sL += cmLegacy[i].ToString().substr(0, 12) + " ";
+        for (size_t i = 0; i < cmNonresident.size(); ++i) sN += cmNonresident[i].ToString().substr(0, 12) + " ";
+        for (size_t i = 0; i < mpResident.parents.size(); ++i) sMR += mpResident.parents[i].ToString().substr(0, 12) + " ";
+        for (size_t i = 0; i < mpNonresident.parents.size(); ++i) sMN += mpNonresident.parents[i].ToString().substr(0, 12) + " ";
+        for (size_t i = 0; i < legacyOracle.size(); ++i) sOr += legacyOracle[i].ToString().substr(0, 12) + " ";
+        BOOST_TEST_MESSAGE("S7_COMMIT resident[" << cmResident.size() << "]=" << sR
+            << "| legacy[" << cmLegacy.size() << "]=" << sL
+            << "| nonresident[" << cmNonresident.size() << "]=" << sN
+            << "| mpResident[" << mpResident.parents.size() << "]=" << sMR
+            << "| mpNonresident[" << mpNonresident.parents.size() << "]=" << sMN
+            << "| legacyOracle[" << legacyOracle.size() << "]=" << sOr);
+    }
+
+    S7ParentTracePhase("phase_4");
+    // ---- (4) No residency reconstruction.
+    { LOCK(cs_main); BOOST_CHECK_EQUAL(mapBlockIndex.size(), (size_t)0); }
+
+    S7ParentTracePhase("phase_5");
+    // ---- (5) Phase F: work identity watches the SAME authoritative universe.
+    {
+        CPUMiningWorkIdentity ident = CaptureCurrentCPUMiningWorkIdentityForTest();
+        BOOST_CHECK(!ident.fSelectionUnavailable);
+        BOOST_CHECK_EQUAL(ident.hashPrimaryParent.ToString(), primaryHash.ToString());
+        for (size_t i = 0; i < legacyOracle.size(); ++i)
+            BOOST_CHECK_MESSAGE(std::find(ident.vDAGTips.begin(), ident.vDAGTips.end(), legacyOracle[i]) != ident.vDAGTips.end(),
+                "work identity must fingerprint every eligible authoritative merge parent");
+        BOOST_CHECK_MESSAGE(CPUMiningBlockMatchesWorkIdentity(*blkNonresident, ident),
+            "the authoritative template must match the authoritative work identity (no split authority)");
+
+        std::vector<uint256> legacyTips = g_dagManager.GetDAGTips();
+        std::sort(legacyTips.begin(), legacyTips.end());
+        BOOST_TEST_MESSAGE("S7_IDENTITY authoritative_tips=" << ident.vDAGTips.size()
+            << " legacy_setDAGTips=" << legacyTips.size());
+    }
+
+    S7ParentTracePhase("phase_6");
+    // ---- (6) FAIL-CLOSED: unavailable authority => no template, never "empty".
+    {
+        SetMergeParentForceUnavailableForTest(true, DAG_TIP_SELECTION_REASON_FRONTIER_UNAVAILABLE);
+        DagMergeParentResult fu = SelectMergeParentsForExternalConsumer(primaryHash, primaryHeight, &e);
+        BOOST_CHECK_EQUAL((int)fu.status, (int)DAG_MERGE_PARENT_UNAVAILABLE);
+        BOOST_CHECK(!fu.IsUsable());
+        BOOST_CHECK(fu.parents.empty());
+        std::unique_ptr<CBlock> blkFail(CreateNewBlock(pwalletMain, false, NULL, NULL));
+        BOOST_CHECK_MESSAGE(blkFail.get() == NULL,
+            "an unavailable authoritative merge-parent authority must fail closed");
+        SetMergeParentForceUnavailableForTest(false, DAG_TIP_SELECTION_REASON_NONE);
+    }
+
+    S7ParentTracePhase("phase_7");
+    {
+        LOCK(cs_main);
+        BOOST_TEST_MESSAGE("S7_PRE_RESTORE best_ptr=" << (void*)pindexBest
+            << " best_hash=" << pindexBest->GetBlockHash().ToString()
+            << " best_h=" << pindexBest->nHeight
+            << " hashBestChain=" << hashBestChain.ToString()
+            << " mapsize=" << mapBlockIndex.size()
+            << " savedMapSize=" << savedMap.size()
+            << " savedMapHasBest=" << savedMap.count(hashBestChain)
+            << " savedMapBestPtr=" << (savedMap.count(hashBestChain) ? (void*)savedMap[hashBestChain] : (void*)NULL)
+            << " bestPtrInSaved=" << (savedMap.count(hashBestChain) && savedMap[hashBestChain]==pindexBest));
+    }
+    // ---- (7) Boundedness of the reduction.
+    {
+        DagMergeParentStats st = GetDagMergeParentStats();
+        BOOST_CHECK(st.calls >= 1);
+        BOOST_CHECK(st.frontierEmits >= st.candidateReads); // <=1 read per emitted tip
+        BOOST_CHECK(st.published >= 1);
+        BOOST_CHECK_EQUAL(st.capped, (uint64_t)0);
+        BOOST_TEST_MESSAGE("S7_BOUNDED calls=" << st.calls << " frontierVisits=" << st.frontierVisits
+            << " frontierEmits=" << st.frontierEmits << " candidateReads=" << st.candidateReads
+            << " primaryExcluded=" << st.primaryExcluded << " trustExcluded=" << st.trustExcluded
+            << " unresolvableSkipped=" << st.unresolvableSkipped
+            << " depthExcluded=" << st.depthExcluded << " heightExcluded=" << st.heightExcluded
+            << " published=" << st.published << " unavailable=" << st.unavailable);
+    }
+
+    // restore resident map for the remainder of the process
+    { LOCK(cs_main); RestoreMapBlockIndexForFixture(savedMap); }
+
+    {
+        LOCK(cs_main);
+        CBlockIndex* bestObj = pindexBest;
+        CBlockIndex* mapObj = mapBlockIndex.count(hashBestChain) ? mapBlockIndex[hashBestChain] : NULL;
+        BOOST_TEST_MESSAGE("S7_RESTORE_STATE best_ptr=" << (void*)bestObj << " best_objhash=" << bestObj->GetBlockHash().ToString() << " best_objheight=" << bestObj->nHeight << " hashBestChain=" << hashBestChain.ToString() << " mapobj_ptr=" << (void*)mapObj << " mapobj_hash=" << (mapObj ? mapObj->GetBlockHash().ToString() : std::string("NULL")) << " count(hashBestChain)=" << mapBlockIndex.count(hashBestChain) << " sameptr=" << (bestObj == mapObj));
+    }
+
+    S7ParentTracePhase("phase_8");
+    // ---- (8) TRUNCATION: many eligible tips inside the depth window.
+    //
+    // A childless sibling that extends the CURRENT best tip competes with it and
+    // is pruned by the resulting reorg, so same-height siblings cannot
+    // accumulate. Instead: build a chain on the active path, then hang ONE
+    // childless side tip off each chain block. Every side tip is a legitimate
+    // frontier member, none competes with the chain tip, and all of them sit
+    // inside [primaryHeight - DAG_MERGE_DEPTH, primaryHeight] — so the PROTOCOL
+    // CAP, not the depth window, is what bounds the result.
+    {
+        // Extend the CURRENT best tip: ProcessBlock's weak-work gate rejects a
+        // block whose parent is not the best chain, so chain blocks must be
+        // built on the live best tip (side tips are hung on afterwards through
+        // the storage path, which does not take that gate).
+        CBlockIndex* cur = NULL;
+        {
+            LOCK(cs_main);
+            std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(hashBestChain);
+            cur = (it == mapBlockIndex.end()) ? NULL : it->second;
+        }
+        BOOST_REQUIRE(cur != NULL);
+        BOOST_TEST_MESSAGE("S7_PHASE8_CUR ptr=" << (void*)cur
+            << " hash=" << cur->GetBlockHash().ToString()
+            << " height=" << cur->nHeight
+            << " pindexBest_ptr=" << (void*)pindexBest
+            << " pindexBest_hash=" << pindexBest->GetBlockHash().ToString()
+            << " pindexBest_height=" << pindexBest->nHeight
+            << " hashBestChain=" << hashBestChain.ToString()
+            << " mapCount(hashBestChain)=" << mapBlockIndex.count(hashBestChain)
+            << " mapAt_hash=" << mapBlockIndex[hashBestChain]->GetBlockHash().ToString()
+            << " mapAt_ptr=" << (void*)mapBlockIndex[hashBestChain]
+            << " sameObject=" << (cur == mapBlockIndex[hashBestChain] && cur == pindexBest));
+        std::vector<CBlockIndex*> chain;
+        for (unsigned int i = 0; i < 40; ++i)
+        {
+            cur = MineRealDag(cur, 0xF600 + i);
+            BOOST_REQUIRE(cur != NULL);
+            chain.push_back(cur);
+        }
+        for (size_t i = 0; i < chain.size(); ++i)
+            BOOST_REQUIRE(AddSideDag(chain[i], 0xF700 + i) != NULL);
+
+        std::string te;
+        DagFrontierTipsResult fr = SelectFrontierTipsForExternalConsumer(&te);
+        BOOST_REQUIRE_MESSAGE(fr.IsUsable(), te);
+        BOOST_TEST_MESSAGE("S7_TRUNC frontierTips=" << fr.tips.size()
+            << " MAX_DAG_PARENTS=" << MAX_DAG_PARENTS << " DAG_MERGE_DEPTH=" << DAG_MERGE_DEPTH);
+        BOOST_REQUIRE_MESSAGE(fr.tips.size() > (size_t)MAX_DAG_PARENTS,
+            "frontier must exceed the protocol parent bound to exercise truncation");
+
+        DagTipSelectionResult selT = SelectDagTipForExternalConsumer(&e);
+        BOOST_REQUIRE_MESSAGE(selT.IsUsable(), e);
+        const std::vector<uint256> oracleT = S7LegacyMergeParentOracle(selT.hash, selT.height);
+        ResetDagMergeParentStatsForTest();
+        DagMergeParentResult mpT = SelectMergeParentsForExternalConsumer(selT.hash, selT.height, &e);
+        BOOST_REQUIRE_MESSAGE(mpT.IsUsable(), e);
+        DagMergeParentStats stT = GetDagMergeParentStats();
+        BOOST_TEST_MESSAGE("S7_TRUNC primaryHeight=" << selT.height
+            << " parents=" << mpT.parents.size()
+            << " oracleExtras=" << oracleT.size() << " capped=" << stT.capped
+            << " frontierEmits=" << stT.frontierEmits << " candidateReads=" << stT.candidateReads
+            << " unresolvableSkipped=" << stT.unresolvableSkipped
+            << " trustExcluded=" << stT.trustExcluded
+            << " primaryExcluded=" << stT.primaryExcluded
+            << " depthExcluded=" << stT.depthExcluded
+            << " heightExcluded=" << stT.heightExcluded);
+        // Exact legacy cap semantics: the primary counts, so the vector is
+        // capped at MAX_DAG_PARENTS with at most MAX_DAG_PARENTS-1 extras.
+        BOOST_REQUIRE_EQUAL(mpT.parents.size(), (size_t)MAX_DAG_PARENTS);
+        BOOST_CHECK_EQUAL(mpT.parents[0].ToString(), selT.hash.ToString());
+        BOOST_REQUIRE_EQUAL(oracleT.size(), (size_t)MAX_DAG_PARENTS - 1);
+        for (size_t i = 0; i < oracleT.size(); ++i)
+            BOOST_CHECK_EQUAL(mpT.parents[i + 1].ToString(), oracleT[i].ToString());
+
+        BOOST_CHECK(stT.capped >= (uint64_t)1);
+        BOOST_CHECK(stT.frontierEmits >= stT.candidateReads);
+    }
+
+    S7ParentTracePhase("phase_9");
+    // ---- (9) AUTHORITY HEALTH: every failure class fails closed.
+    {
+        static const DagTipSelectionReason kReasons[] = {
+            DAG_TIP_SELECTION_REASON_SOURCE_UNHEALTHY,
+            DAG_TIP_SELECTION_REASON_SCORE_AUTHORITY_UNHEALTHY,
+            DAG_TIP_SELECTION_REASON_CHILD_COUNT_UNHEALTHY,
+            DAG_TIP_SELECTION_REASON_GENERATION_MISMATCH,
+            DAG_TIP_SELECTION_REASON_TOKEN_MISMATCH,
+            DAG_TIP_SELECTION_REASON_RUNTIME_ABSENT,
+            DAG_TIP_SELECTION_REASON_RUNTIME_UNAVAILABLE,
+            DAG_TIP_SELECTION_REASON_FRONTIER_UNAVAILABLE,
+            DAG_TIP_SELECTION_REASON_METADATA_UNAVAILABLE,
+            DAG_TIP_SELECTION_REASON_REVALIDATION_FAILED
+        };
+        const size_t nReasons = sizeof(kReasons) / sizeof(kReasons[0]);
+        for (size_t i = 0; i < nReasons; ++i)
+        {
+            SetMergeParentForceUnavailableForTest(true, kReasons[i]);
+            DagMergeParentResult mp = SelectMergeParentsForExternalConsumer(primaryHash, primaryHeight, &e);
+            BOOST_CHECK_EQUAL((int)mp.status, (int)DAG_MERGE_PARENT_UNAVAILABLE);
+            BOOST_CHECK(!mp.IsUsable());
+            BOOST_CHECK(mp.parents.empty());
+            BOOST_CHECK_EQUAL((int)mp.reason, (int)kReasons[i]);
+            DagFrontierTipsResult fr = SelectFrontierTipsForExternalConsumer(&e);
+            BOOST_CHECK_EQUAL((int)fr.status, (int)DAG_MERGE_PARENT_UNAVAILABLE);
+            std::unique_ptr<CBlock> blk(CreateNewBlock(pwalletMain, false, NULL, NULL));
+            BOOST_CHECK_MESSAGE(blk.get() == NULL,
+                "authority-health failure must fail closed (no template), never a primary-only result");
+            SetMergeParentForceUnavailableForTest(false, DAG_TIP_SELECTION_REASON_NONE);
+        }
+        BOOST_TEST_MESSAGE("S7_HEALTH reasons_fail_closed=" << nReasons);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -8718,6 +9297,19 @@ BOOST_AUTO_TEST_CASE(r2c2s_s6repair2_b1_authoritative_coinbase_maturity)
             << " anchorIsFreshObject=" << (pindexBest != fx.forkBest)
             << " height=" << pindexBest->nHeight);
     }
+    const uint256 maturityForkHash = fx.forkBest->GetBlockHash();
+    CBlockIndex* maturitySavedTip = NULL;
+    const uint256* maturityOldHashStorage = NULL;
+    {
+        LOCK(cs_main);
+        std::map<uint256, CBlockIndex*>::const_iterator before = mapBlockIndex.find(maturityForkHash);
+        BOOST_REQUIRE(before != mapBlockIndex.end());
+        maturitySavedTip = before->second;
+        BOOST_REQUIRE(maturitySavedTip != NULL);
+        maturityOldHashStorage = maturitySavedTip->phashBlock;
+        BOOST_REQUIRE(maturityOldHashStorage == &before->first);
+        BOOST_CHECK(*maturityOldHashStorage == maturityForkHash);
+    }
     std::map<uint256, CBlockIndex*> savedMap;
     {
         LOCK(cs_main);
@@ -8820,6 +9412,25 @@ BOOST_AUTO_TEST_CASE(r2c2s_s6repair2_b1_authoritative_coinbase_maturity)
     {
         LOCK(cs_main);
         mapBlockIndex = savedMap;
+        std::map<uint256, CBlockIndex*>::iterator restored = mapBlockIndex.find(maturityForkHash);
+        BOOST_REQUIRE(restored != mapBlockIndex.end());
+        BOOST_REQUIRE(restored->second == maturitySavedTip);
+        BOOST_TEST_MESSAGE("B1_RESTORE_RED ptr=" << (void*)restored->second
+            << " height=" << restored->second->nHeight
+            << " expectedHash=" << maturityForkHash.ToString()
+            << " observedHash=" << restored->second->GetBlockHash().ToString()
+            << " oldStorage=" << (const void*)maturityOldHashStorage
+            << " restoredStorage=" << (const void*)&restored->first
+            << " rebound=" << (restored->second->phashBlock == &restored->first));
+        BOOST_CHECK_MESSAGE(restored->second->phashBlock != &restored->first,
+            "RED: raw-pointer map copy/clear/restore must expose the old dangling phashBlock before fixture repair");
+        RebindMapBlockIndexHashPointersForTest();
+        BOOST_REQUIRE(restored->second->phashBlock == &restored->first);
+        BOOST_REQUIRE(*restored->second->phashBlock == restored->first);
+        BOOST_REQUIRE(restored->second->GetBlockHash() == restored->first);
+        BOOST_TEST_MESSAGE("B1_RESTORE_GREEN ptr=" << (void*)restored->second
+            << " hash=" << restored->second->GetBlockHash().ToString()
+            << " rebound=1");
         // The full-resident reference tip is the in-process LINKED object (the
         // object a legacy node's LoadBlockIndex publishes), NOT the linkless
         // authoritative anchor pindexBest.
@@ -8842,7 +9453,288 @@ BOOST_AUTO_TEST_CASE(r2c2s_s6repair2_b1_authoritative_coinbase_maturity)
     }
 
     // restore resident map for the remainder of the process
-    { LOCK(cs_main); mapBlockIndex = savedMap; }
+    { LOCK(cs_main); RestoreMapBlockIndexForFixture(savedMap); }
+}
+
+// ---------------------------------------------------------------------------
+// S7-REPAIR R2 / G6: authoritative canonical-membership ROW-PRESENCE contract.
+//
+// The independent freeze audit (2026-09-23) reproduced: deleting ONE canonical
+// `daglinks` LevelDB row out-of-band for an enumerated frontier tip silently
+// dropped that merge parent (5 -> 4 parents) with status VALID, reason 0, and
+// both authority certificates still healthy. The mechanism was the enumeration
+// predicate collapsing ROW-ABSENT into "*member = false" BEFORE
+// ReadMergeCandidate was ever reached.
+//
+// The repair (a) attests canonical ROW PRESENCE separately from frontier
+// membership (CTxDB::ReadDAGFrontierMembershipAttested) and (b) fails the WHOLE
+// external CLEAN enumeration when an enumerated authoritative tip has no
+// canonical row (new reason DAG_TIP_SELECTION_REASON_FRONTIER_ROW_ABSENT +
+// DagMergeParentStats::frontierRowAbsent). Legitimate non-members (row present,
+// childCount > 0) keep the historical silent-skip semantics, and a legitimately
+// empty frontier stays VALID.
+// ---------------------------------------------------------------------------
+namespace {
+// Out-of-band canonical row mutation on the LIVE datadir (no in-tree
+// production path produces this; it models external row loss), with an exact
+// restore of the original serialized bytes.
+struct G6RowMutation
+{
+    leveldb::DB* db;
+    std::string key;
+    std::string value;
+    bool armed;
+    G6RowMutation() : db(NULL), armed(false) {}
+    ~G6RowMutation() { Restore(); }
+    bool KeyFor(const uint256& victim, std::string* out)
+    {
+        CDataStream k(SER_DISK, CLIENT_VERSION);
+        k << std::make_pair(std::string("daglinks"), victim);
+        *out = k.str();
+        return true;
+    }
+    bool ArmRemove(CTxDB& tdb, const uint256& victim)
+    {
+        db = tdb.GetInstance();
+        if (!db) return false;
+        KeyFor(victim, &key);
+        if (!db->Get(leveldb::ReadOptions(), key, &value).ok()) return false;
+        if (!db->Delete(leveldb::WriteOptions(), key).ok()) return false;
+        armed = true;
+        return true;
+    }
+    bool ArmCorrupt(CTxDB& tdb, const uint256& victim)
+    {
+        db = tdb.GetInstance();
+        if (!db) return false;
+        KeyFor(victim, &key);
+        if (!db->Get(leveldb::ReadOptions(), key, &value).ok()) return false;
+        if (!db->Put(leveldb::WriteOptions(), key, std::string("x")).ok()) return false;
+        armed = true;
+        return true;
+    }
+    void Restore()
+    {
+        if (armed && db) db->Put(leveldb::WriteOptions(), key, value);
+        armed = false;
+    }
+};
+} // namespace
+
+BOOST_AUTO_TEST_CASE(r2c8s_g6_missing_canonical_row_fails_closed)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+    S6BuildAuthoritativeFixture(fx, 0xF400);
+    // Auditor topology (independent freeze audit probe): one active child of the
+    // retained base plus six side siblings, so the frontier holds six tips and a
+    // selection yields 5 extra merge parents.
+    CBlockIndex* P = MineRealDag(fx.forkBest, 0xF401);
+    BOOST_REQUIRE(P != NULL);
+    for (unsigned i = 0; i < 6; ++i) BOOST_REQUIRE(AddSideDag(P, 0xF411 + i) != NULL);
+    LOCK(cs_main);
+
+    std::string e;
+    DagTipSelectionResult primary = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(primary.IsUsable(), e);
+    DagMergeParentResult before = SelectMergeParentsForExternalConsumer(primary.hash, primary.height, &e);
+    BOOST_REQUIRE_MESSAGE(before.IsUsable() && before.parents.size() > 1, e);
+    BOOST_REQUIRE(primary.hash == before.parents[0]);
+
+    // (f) every ENUMERATED authoritative tip must have a canonical daglinks row
+    // in the healthy baseline (the immutable seed is built from the daglinks
+    // key prefix only, so a seed tip cannot legitimately be row-absent).
+    {
+        DagFrontierTipsResult fr = SelectFrontierTipsForExternalConsumer(&e);
+        BOOST_REQUIRE_MESSAGE(fr.IsUsable() && fr.tips.size() > 1, e);
+        CTxDB r("r");
+        for (size_t i = 0; i < fr.tips.size(); ++i)
+        {
+            bool member = false, rowPresent = false;
+            BOOST_REQUIRE(r.ReadDAGFrontierMembershipAttested(fr.tips[i], &member, &rowPresent));
+            BOOST_CHECK_MESSAGE(rowPresent && member,
+                "an enumerated authoritative frontier tip must have a canonical row and be a member");
+        }
+        BOOST_TEST_MESSAGE("G6_BASELINE_TIPS_ALL_ROW_PRESENT tips=" << fr.tips.size());
+    }
+
+    const uint256 victim = before.parents[1];
+    {
+        CTxDB r("r");
+        bool member = false, rowPresent = false;
+        BOOST_REQUIRE(r.ReadDAGFrontierMembershipAttested(victim, &member, &rowPresent));
+        BOOST_CHECK(rowPresent && member);
+    }
+
+    CTxDB tdb;
+    G6RowMutation mutation;
+    BOOST_REQUIRE(mutation.ArmRemove(tdb, victim));
+
+    // (a) attested vs legacy read on the SAME mutated state: the attested read
+    // distinguishes ROW-ABSENT from membership while the legacy reader keeps the
+    // frozen collapse semantics (unchanged for S5 preview / delta capture).
+    {
+        CTxDB r("r");
+        bool member = true, rowPresent = true;
+        BOOST_REQUIRE_MESSAGE(r.ReadDAGFrontierMembershipAttested(victim, &member, &rowPresent),
+            "row absence is a successful attestation outcome, never an IO failure");
+        BOOST_CHECK_MESSAGE(!rowPresent, "attested read must report the canonical row ABSENT");
+        BOOST_CHECK(!member);
+        bool legacyMember = true;
+        BOOST_CHECK(r.ReadDAGFrontierMembership(victim, &legacyMember));
+        BOOST_CHECK_MESSAGE(!legacyMember,
+            "legacy reader semantics are frozen: row absence still collapses into member=false");
+    }
+
+    // (b)/(c)/(d) the authority certificates and the immutable frontier digest
+    // are row-blind: they stay healthy across the row loss. Recorded as the
+    // reason the row-level contract (not a certificate/schema change) closes G6.
+    bool childHealthy = false, scoreHealthy = false;
+    {
+        CTxDB r("r");
+        childHealthy = r.IsDAGChildCountIndexHealthy(&e);
+        scoreHealthy = r.IsDAGScoreAuthorityHealthy(&e);
+    }
+
+    const uint64_t absentBefore = GetDagMergeParentStats().frontierRowAbsent;
+    DagMergeParentResult after = SelectMergeParentsForExternalConsumer(primary.hash, primary.height, &e);
+    const std::string mergeError = e;
+    DagFrontierTipsResult tipsAfter = SelectFrontierTipsForExternalConsumer(&e);
+    DagTipSelectionResult primaryAfter = SelectDagTipForExternalConsumer(&e);
+    const uint64_t absentDelta = GetDagMergeParentStats().frontierRowAbsent - absentBefore;
+
+    BOOST_TEST_MESSAGE("G6_ABSENT victim=" << victim.ToString().substr(0, 12)
+        << " beforeParents=" << before.parents.size()
+        << " afterParents=" << after.parents.size()
+        << " status=" << (int)after.status << " reason=" << (int)after.reason
+        << " reasonName=" << DagTipSelectionReasonName(after.reason)
+        << " childHealthy=" << childHealthy << " scoreHealthy=" << scoreHealthy
+        << " tipsStatus=" << (int)tipsAfter.status << " tipsReason=" << (int)tipsAfter.reason
+        << " tipsCount=" << tipsAfter.tips.size()
+        << " primaryStatus=" << (int)primaryAfter.status
+        << " primaryReason=" << (int)primaryAfter.reason
+        << " rowAbsentCounter=" << absentDelta
+        << " error=" << mergeError);
+
+    // GREEN: the whole enumeration fails closed - no partial parent vector.
+    BOOST_CHECK_MESSAGE(after.status == DAG_MERGE_PARENT_UNAVAILABLE,
+        "a missing canonical row for an enumerated frontier tip must fail the whole enumeration");
+    BOOST_CHECK(after.parents.empty());
+    BOOST_CHECK_EQUAL((int)after.reason, (int)DAG_TIP_SELECTION_REASON_FRONTIER_ROW_ABSENT);
+    BOOST_CHECK_EQUAL(std::string(DagTipSelectionReasonName(after.reason)), std::string("FRONTIER_ROW_ABSENT"));
+    BOOST_CHECK_MESSAGE(absentDelta >= 1, "the fail-closed path must be counted (frontierRowAbsent)");
+    BOOST_CHECK_MESSAGE(tipsAfter.status == DAG_MERGE_PARENT_UNAVAILABLE && tipsAfter.tips.empty(),
+        "the frontier-tip snapshot must not publish a partial tip set");
+    BOOST_CHECK(!primaryAfter.IsUsable());
+    BOOST_TEST_MESSAGE("G6_CERTIFICATES_ROW_BLIND childHealthy=" << childHealthy
+        << " scoreHealthy=" << scoreHealthy);
+
+    // Reason-value freeze: the new reason is APPENDED (INTERNAL_FAILURE stays 17).
+    BOOST_CHECK_EQUAL((int)DAG_TIP_SELECTION_REASON_INTERNAL_FAILURE, 17);
+    BOOST_CHECK_EQUAL((int)DAG_TIP_SELECTION_REASON_FRONTIER_ROW_ABSENT, 18);
+
+    // (e) recovery boundary from the selector's own contract: restoring the
+    // canonical row restores the VALID vector (the strict rule is not sticky and
+    // needs no reconcile to UNDO it).
+    mutation.Restore();
+    {
+        CTxDB r("r");
+        bool member = false, rowPresent = false;
+        BOOST_REQUIRE(r.ReadDAGFrontierMembershipAttested(victim, &member, &rowPresent));
+        BOOST_CHECK(rowPresent && member);
+    }
+    DagMergeParentResult restored = SelectMergeParentsForExternalConsumer(primary.hash, primary.height, &e);
+    BOOST_REQUIRE_MESSAGE(restored.IsUsable(), e);
+    BOOST_CHECK(restored.parents == before.parents);
+
+    // Reopen of the SAME datadir: a fresh CTxDB handle + fresh selection keeps
+    // the fail-closed verdict while the row is absent.
+    BOOST_REQUIRE(mutation.ArmRemove(tdb, victim));
+    {
+        CTxDB reopen("r");
+        std::string he;
+        BOOST_CHECK(reopen.IsDAGChildCountIndexHealthy(&he));
+    }
+    DagMergeParentResult reopened = SelectMergeParentsForExternalConsumer(primary.hash, primary.height, &e);
+    BOOST_TEST_MESSAGE("G6_REOPEN status=" << (int)reopened.status
+        << " reason=" << (int)reopened.reason << " parents=" << reopened.parents.size());
+    BOOST_CHECK_MESSAGE(reopened.status == DAG_MERGE_PARENT_UNAVAILABLE &&
+        reopened.reason == DAG_TIP_SELECTION_REASON_FRONTIER_ROW_ABSENT && reopened.parents.empty(),
+        "reopening the same datadir must not turn canonical row loss into a valid reduced vector");
+    mutation.Restore();
+}
+
+BOOST_AUTO_TEST_CASE(r2c8s_g6_legitimate_absence_preserved_and_malformed_still_fails_closed)
+{
+    BOOST_REQUIRE(CZKContext::Initialize());
+    if (hooks == NULL) hooks = InitHook();
+
+    S6Fixture fx; S6Cleanup cleanup(fx.root);
+    S6BuildAuthoritativeFixture(fx, 0xF500);
+    // Same six-tip frontier topology as the missing-row case (5 extra parents).
+    CBlockIndex* P = MineRealDag(fx.forkBest, 0xF501);
+    BOOST_REQUIRE(P != NULL);
+    for (unsigned i = 0; i < 6; ++i) BOOST_REQUIRE(AddSideDag(P, 0xF511 + i) != NULL);
+    LOCK(cs_main);
+
+    std::string e;
+    DagTipSelectionResult primary = SelectDagTipForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(primary.IsUsable(), e);
+    DagMergeParentResult before = SelectMergeParentsForExternalConsumer(primary.hash, primary.height, &e);
+    BOOST_REQUIRE_MESSAGE(before.IsUsable() && before.parents.size() > 1, e);
+    const uint64_t absentBefore = GetDagMergeParentStats().frontierRowAbsent;
+
+    // (1) legitimate semantic absence: a hash that is NOT part of the enumerated
+    // authoritative frontier and has NO canonical row attests rowPresent=false
+    // WITHOUT failing anything, and the enumeration stays VALID.
+    const uint256 stranger = uint256(0x6F6F6F6F);
+    {
+        CTxDB r("r");
+        bool member = true, rowPresent = true;
+        BOOST_REQUIRE(r.ReadDAGFrontierMembershipAttested(stranger, &member, &rowPresent));
+        BOOST_CHECK_MESSAGE(!rowPresent && !member,
+            "a non-enumerated, row-less hash is a legitimate attested absence");
+    }
+    // (2) a legitimate non-tip: row present with childCount > 0 attests
+    // rowPresent == true, member == false (historical silent-skip semantics).
+    {
+        CTxDB r("r");
+        bool member = true, rowPresent = false;
+        BOOST_REQUIRE(r.ReadDAGFrontierMembershipAttested(fx.forkBest->GetBlockHash(), &member, &rowPresent));
+        BOOST_CHECK_MESSAGE(rowPresent, "the retained base row must still be present");
+        BOOST_CHECK_MESSAGE(!member, "a row with children is not a frontier member");
+    }
+
+    DagMergeParentResult again = SelectMergeParentsForExternalConsumer(primary.hash, primary.height, &e);
+    BOOST_REQUIRE_MESSAGE(again.IsUsable(), e);
+    BOOST_CHECK(again.parents == before.parents);
+    BOOST_CHECK_MESSAGE(GetDagMergeParentStats().frontierRowAbsent == absentBefore,
+        "legitimate semantic absence must never trip the fail-closed counter");
+    DagFrontierTipsResult frAgain = SelectFrontierTipsForExternalConsumer(&e);
+    BOOST_REQUIRE_MESSAGE(frAgain.IsUsable(), e);
+    BOOST_CHECK(!frAgain.tips.empty());
+    BOOST_TEST_MESSAGE("G6_LEGIT_ABSENCE parents=" << again.parents.size()
+        << " tips=" << frAgain.tips.size() << " rowAbsentDelta=0");
+
+    // (3) malformed canonical row still fails closed (unchanged contract).
+    const uint256 victim = before.parents[1];
+    CTxDB tdb;
+    G6RowMutation mutation;
+    BOOST_REQUIRE(mutation.ArmCorrupt(tdb, victim));
+    DagMergeParentResult malformed = SelectMergeParentsForExternalConsumer(primary.hash, primary.height, &e);
+    BOOST_TEST_MESSAGE("G6_MALFORMED status=" << (int)malformed.status
+        << " reason=" << (int)malformed.reason
+        << " reasonName=" << DagTipSelectionReasonName(malformed.reason)
+        << " parents=" << malformed.parents.size() << " error=" << e);
+    BOOST_CHECK(malformed.status == DAG_MERGE_PARENT_UNAVAILABLE);
+    BOOST_CHECK(malformed.parents.empty());
+    BOOST_CHECK_EQUAL((int)malformed.reason, (int)DAG_TIP_SELECTION_REASON_IO_FAILURE);
+    mutation.Restore();
+    DagMergeParentResult healed = SelectMergeParentsForExternalConsumer(primary.hash, primary.height, &e);
+    BOOST_REQUIRE_MESSAGE(healed.IsUsable(), e);
+    BOOST_CHECK(healed.parents == before.parents);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

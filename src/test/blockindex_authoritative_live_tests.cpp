@@ -30,6 +30,8 @@
 #include "blockindex_tip.h"
 #include "blockindex_live_tail.h"
 #include "main.h"
+#include "blockrequesttrace.h"
+#include <memory>
 
 #include <boost/filesystem.hpp>
 
@@ -500,6 +502,116 @@ BOOST_AUTO_TEST_CASE(g1_final_processblock_orphan_gate)
     printf("G1-FINAL PASS: real ProcessBlock orphan gate — authoritative-V2 parent\n"
            "       block is NOT stranding-orphaned (c1ece66 bypass active), unknown\n"
            "       parent in authoritative AND legacy mode IS orphaned normally.\n");
+}
+
+// Phase-2 observer contract: exercise the real caller, never repair semantics.
+static std::vector<ProcessBlockParentObserverEvent> parentEvents;
+static void CaptureParentEvent(const ProcessBlockParentObserverEvent& event)
+{
+    parentEvents.push_back(event);
+}
+
+BOOST_AUTO_TEST_CASE(g1_processblock_parent_observer_open_and_closed_authority)
+{
+    G1Fixture fx(4);
+    BlockIndexV2Reader reader;
+    BlockIndexV2ReaderOptions opts;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reader.Open(fx.rootStr, opts, &error), error);
+    BlockIndexAuthoritativeLive live;
+    BOOST_REQUIRE_MESSAGE(live.Open(fx.rootStr, &reader, 2048, &error), error);
+    const uint256 prev = fx.baseActive[fx.baseTip];
+    BlockIndexAuthoritativeParentInfo absent;
+    BOOST_REQUIRE(live.ResolveParentInfo(uint256(0xDEAD0521UL), &absent, &error) ==
+                  BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_FOUND);
+    LOCK(cs_main);
+    BOOST_REQUIRE_EQUAL(mapBlockIndex.count(prev), 0U);
+    struct Restore
+    {
+        bool auth;
+        std::vector<uint256> children;
+        Restore() : auth(g_fAuthoritativeStartup) {}
+        ~Restore()
+        {
+            for (size_t i = 0; i < children.size(); ++i)
+            {
+                std::map<uint256, CBlock*>::iterator found = mapOrphanBlocks.find(children[i]);
+                if (found == mapOrphanBlocks.end()) continue;
+                CBlock* block = found->second;
+                for (std::multimap<uint256, CBlock*>::iterator it = mapOrphanBlocksByPrev.begin();
+                     it != mapOrphanBlocksByPrev.end();)
+                {
+                    if (it->second == block) mapOrphanBlocksByPrev.erase(it++);
+                    else ++it;
+                }
+                mapOrphanBlocks.erase(found);
+                delete block;
+            }
+            g_fAuthoritativeStartup = auth;
+            ClearAuthoritativeLiveForTesting();
+        }
+    } restore;
+    SetAuthoritativeLiveForTesting(&live);
+    g_fAuthoritativeStartup = true;
+    ScopedProcessBlockParentObserver observer(CaptureParentEvent);
+    for (int closed = 0; closed != 2; ++closed)
+    {
+        if (closed) live.Close();
+        BlockIndexSnapshot canonical;
+        BOOST_REQUIRE(reader.LookupByHash(prev, &canonical, &error) == BLOCK_INDEX_V2_READ_FOUND);
+        BOOST_REQUIRE_EQUAL(mapBlockIndex.count(prev), 0U);
+        std::unique_ptr<CBlock> block(BuildCheckBlockPassingPoWBallast(prev, 0x521 + closed));
+        BOOST_REQUIRE(block.get() != NULL);
+        BOOST_REQUIRE(block->CheckBlock(true, true, true));
+        restore.children.push_back(block->GetHash());
+        parentEvents.clear();
+        const bool result = ProcessBlock(NULL, block.get());
+        bool sawBool = false, sawFallthrough = false, sawOrphan = false, sawReturn = false;
+        BOOST_REQUIRE(!parentEvents.empty());
+        BOOST_CHECK_EQUAL(parentEvents.front().kind, PROCESSBLOCK_PARENT_ENTRY);
+        int64_t lastMicros = 0;
+        for (size_t i = 0; i < parentEvents.size(); ++i)
+        {
+            const ProcessBlockParentObserverEvent& e = parentEvents[i];
+            BOOST_CHECK(e.child == block->GetHash());
+            BOOST_CHECK(e.prev == prev);
+            BOOST_CHECK(e.monotonicMicros >= lastMicros);
+            lastMicros = e.monotonicMicros;
+            BOOST_CHECK_EQUAL(e.livePresent, true);
+            BOOST_CHECK_EQUAL(e.liveOpen, !closed);
+            if (e.kind == PROCESSBLOCK_PARENT_BOOL_RESULT)
+            {
+                sawBool = true;
+                BOOST_CHECK_EQUAL(e.boolAttempted, !closed);
+                BOOST_CHECK_EQUAL(e.boolResult, !closed);
+                BOOST_CHECK_EQUAL(e.diagnosticParentStatus, closed ?
+                    BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE : BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND);
+            }
+            sawFallthrough |= e.kind == PROCESSBLOCK_PARENT_ACCEPT_FALLTHROUGH;
+            sawOrphan |= e.kind == PROCESSBLOCK_PARENT_ORPHAN_ADMITTED;
+            sawReturn |= e.kind == PROCESSBLOCK_PARENT_ACCEPT_RETURN;
+            if (e.kind == PROCESSBLOCK_PARENT_ORPHAN_ADMITTED)
+            {
+                BOOST_CHECK_EQUAL(e.childMapCount, 0U);
+                BOOST_CHECK_EQUAL(e.orphanCount, mapOrphanBlocks.size());
+            }
+            if (e.kind == PROCESSBLOCK_PARENT_ACCEPT_RETURN)
+                BOOST_CHECK_EQUAL(e.acceptResult, result ? 1 : 0);
+        }
+        BOOST_TEST_MESSAGE("PARENT_OBSERVER closed=" << closed << " process_result=" << result
+            << " events=" << parentEvents.size() << " orphan=" << sawOrphan
+            << " fallthrough=" << sawFallthrough << " accept_return=" << sawReturn);
+        BOOST_CHECK(sawBool);
+        BOOST_CHECK_EQUAL(sawReturn, !closed);
+        BOOST_CHECK_EQUAL(sawFallthrough, !closed);
+        BOOST_CHECK_EQUAL(sawOrphan, !!closed);
+        BOOST_CHECK_EQUAL(mapOrphanBlocks.count(block->GetHash()), closed ? 1U : 0U);
+        if (closed)
+        {
+            BOOST_CHECK(result);
+            BOOST_CHECK_EQUAL(mapBlockIndex.count(block->GetHash()), 0U);
+        }
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

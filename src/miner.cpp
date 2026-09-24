@@ -267,56 +267,120 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
     {
         std::vector<uint256> vDAGParents;
 
-        // Primary parent = pindexPrev
-        if (pindexPrev->phashBlock)
-            vDAGParents.push_back(pindexPrev->GetBlockHash());
-
-        // Collect merge parents from DAG tips (cs_main for mapBlockIndex access)
+        if (g_fAuthoritativeStartup)
         {
-            LOCK2(cs_main, g_dagManager.cs_dag);
-            std::vector<uint256> vTips = g_dagManager.GetDAGTips();
-
-            std::vector<std::pair<uint256, uint256>> vTipScores;
-            for (const uint256& hashTip : vTips)
+            // G8 lock fence: the authoritative merge-parent selection below
+            // reads shared chain-selection state — the selector takes no locks
+            // of its own (dag_tip_selector.cpp) and bare-reads hashBestChain /
+            // nBestChainTrust, which SetBestChain writes under cs_main
+            // (main.cpp), plus the overlay runtime state, the by-value live
+            // authority, and your DB ownership (LevelDB) — so entire selection
+            // must run under cs_main. Production callers (getblocktemplate,
+            // getwork, StakeMiner, CPU worker) reach CreateNewBlock WITHOUT
+            // holding cs_main, so the fence must live here. cs_main is
+            // recursive (AnnotatedMixin<boost::recursive_mutex>, sync.h:85),
+            // so nesting inside the earlier LOCK2-shaped scopes is legal. The
+            // fence covers the whole authoritative arm (hash read, selector
+            // call, UNAVAILABLE/primary-anchor checks, value-only assignment)
+            // and closes before BuildDAGParentScript/vout and the long
+            // template assembly: no new lock is held across any wallet call
+            // or template construction, no cs_dag->cs_main edge is
+            // introduced, and the lock order cs_main->cs_dag (existing LOCK2
+            // scope above, and the legacy branch's LOCK2 below) is unchanged.
+            LOCK(cs_main);
+            // R2c.2/S7: AUTHORITATIVE value-only merge-parent result. The legacy
+            // frontier authority (g_dagManager.GetDAGTips()/setDAGTips,
+            // mapBlockIndex residency, ComputeDAGScore(CBlockIndex*)) is NOT
+            // consulted in this mode. UNAVAILABLE fails closed: no legacy
+            // fallback, no resident pindexBest fallback.
+            //
+            // The result is bound to the SAME primary this template builds on
+            // (index 0 + exclusion proof), and it is value-only: no borrowed
+            // CBlockIndex* is returned and no all-frontier materialization occurs.
+            DagMergeParentResult mp;
+            if (!pindexPrev->phashBlock)
             {
-                if (pindexPrev->phashBlock && hashTip == pindexPrev->GetBlockHash())
-                    continue; // skip primary parent
-                std::map<uint256, CBlockIndex*>::iterator miTip = mapBlockIndex.find(hashTip);
-                if (miTip == mapBlockIndex.end() || miTip->second == NULL)
-                    continue;
-                CBlockIndex* pTip = miTip->second;
-                if (pTip != pindexBest && pTip->nChainTrust > nBestChainTrust)
-                    continue;
-                uint256 nScore = g_dagManager.ComputeDAGScore(pTip);
-                vTipScores.push_back(std::make_pair(nScore, hashTip));
+                fprintf(stderr, "CreateNewBlock: ERROR: authoritative primary parent has no hash\n");
+                fflush(stderr);
+                return NULL;
             }
-            std::sort(vTipScores.begin(), vTipScores.end(),
-                      [](const std::pair<uint256, uint256>& a, const std::pair<uint256, uint256>& b) {
-                          if (a.first != b.first)
-                              return a.first > b.first; // higher score first
-                          return a.second < b.second;   // deterministic tiebreak
-                      });
-
-            for (const auto& pair : vTipScores)
+            const uint256 primaryHash = pindexPrev->GetBlockHash();
+            std::string mpError;
+            mp = SelectMergeParentsForExternalConsumer(
+                primaryHash, pindexPrev->nHeight, &mpError);
+            if (mp.status == DAG_MERGE_PARENT_UNAVAILABLE)
             {
-                if (vDAGParents.size() >= (unsigned int)MAX_DAG_PARENTS)
-                    break;
+                fprintf(stderr, "CreateNewBlock: ERROR: authoritative merge-parent selection unavailable: %s\n",
+                        mpError.c_str()); fflush(stderr);
+                return NULL;
+            }
+            // Invariant: parents[0] is the primary this block extends. A valid
+            // empty result (primary only) is a legitimate state.
+            if (mp.parents.empty() || mp.parents[0] != primaryHash)
+            {
+                fprintf(stderr, "CreateNewBlock: ERROR: authoritative merge-parent result is not primary-anchored\n");
+                fflush(stderr);
+                return NULL;
+            }
+            vDAGParents = mp.parents;
+            // End of the G8 cs_main fence (LOCK above): selection, primary-anchor
+            // check and the value-only assignment are complete; BuildDAGParentScript
+            // and the vout push below run unlocked. No wallet/GetReservedKey call
+            // and no template assembly happened inside this scope.
+        }
+        else
+        {
+            // Primary parent = pindexPrev
+            if (pindexPrev->phashBlock)
+                vDAGParents.push_back(pindexPrev->GetBlockHash());
 
-                const uint256& hashTip = pair.second;
+            // Collect merge parents from DAG tips (cs_main for mapBlockIndex access)
+            {
+                LOCK2(cs_main, g_dagManager.cs_dag);
+                std::vector<uint256> vTips = g_dagManager.GetDAGTips();
 
-                // Merge parent must exist and be within DAG_MERGE_DEPTH
-                std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashTip);
-                if (mi == mapBlockIndex.end() || mi->second == NULL)
-                    continue;
-                CBlockIndex* pTip = mi->second;
-                if (pTip != pindexBest && pTip->nChainTrust > nBestChainTrust)
-                    continue;
-                if (pTip->nHeight < pindexPrev->nHeight - DAG_MERGE_DEPTH)
-                    continue;
-                if (pTip->nHeight >= nHeight)
-                    continue;
+                std::vector<std::pair<uint256, uint256>> vTipScores;
+                for (const uint256& hashTip : vTips)
+                {
+                    if (pindexPrev->phashBlock && hashTip == pindexPrev->GetBlockHash())
+                        continue; // skip primary parent
+                    std::map<uint256, CBlockIndex*>::iterator miTip = mapBlockIndex.find(hashTip);
+                    if (miTip == mapBlockIndex.end() || miTip->second == NULL)
+                        continue;
+                    CBlockIndex* pTip = miTip->second;
+                    if (pTip != pindexBest && pTip->nChainTrust > nBestChainTrust)
+                        continue;
+                    uint256 nScore = g_dagManager.ComputeDAGScore(pTip);
+                    vTipScores.push_back(std::make_pair(nScore, hashTip));
+                }
+                std::sort(vTipScores.begin(), vTipScores.end(),
+                          [](const std::pair<uint256, uint256>& a, const std::pair<uint256, uint256>& b) {
+                              if (a.first != b.first)
+                                  return a.first > b.first; // higher score first
+                              return a.second < b.second;   // deterministic tiebreak
+                          });
 
-                vDAGParents.push_back(hashTip);
+                for (const auto& pair : vTipScores)
+                {
+                    if (vDAGParents.size() >= (unsigned int)MAX_DAG_PARENTS)
+                        break;
+
+                    const uint256& hashTip = pair.second;
+
+                    // Merge parent must exist and be within DAG_MERGE_DEPTH
+                    std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashTip);
+                    if (mi == mapBlockIndex.end() || mi->second == NULL)
+                        continue;
+                    CBlockIndex* pTip = mi->second;
+                    if (pTip != pindexBest && pTip->nChainTrust > nBestChainTrust)
+                        continue;
+                    if (pTip->nHeight < pindexPrev->nHeight - DAG_MERGE_DEPTH)
+                        continue;
+                    if (pTip->nHeight >= nHeight)
+                        continue;
+
+                    vDAGParents.push_back(hashTip);
+                }
             }
         }
 
@@ -1254,15 +1318,56 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
             identity.nHeight = pindexParent->nHeight + 1;
         }
     }
-    // Residual (documented, still legacy): the work-identity tip set is the
-    // separate setDAGTips enumeration (merge-parent-era protocol). It is NOT
-    // the primary selection and is not cut over in this milestone.
+    // R2c.2/S7: the work-identity tip set must watch the SAME authoritative
+    // parent universe that CreateNewBlock builds its merge-parent commitment
+    // from. Watching the legacy setDAGTips enumeration while the template used
+    // the authoritative frontier would create a split authority: (a)
+    // CPUMiningBlockMatchesWorkIdentity would reject a legitimately built
+    // template whose merge parent is authoritative-but-absent from setDAGTips,
+    // and (b) a changed authoritative frontier would not invalidate stale work.
     if (identity.nHeight >= FORK_HEIGHT_DAG)
     {
-        identity.vDAGTips = g_dagManager.GetDAGTips();
-        std::sort(identity.vDAGTips.begin(), identity.vDAGTips.end());
+        if (g_fAuthoritativeStartup)
+        {
+            std::string tipsError;
+            DagFrontierTipsResult fr = SelectFrontierTipsForExternalConsumer(&tipsError);
+            if (fr.status == DAG_MERGE_PARENT_UNAVAILABLE)
+            {
+                // Fail closed: an unavailable authority is never "no tips".
+                identity.fSelectionUnavailable = true;
+            }
+            else
+            {
+                identity.vDAGTips = fr.tips;
+                std::sort(identity.vDAGTips.begin(), identity.vDAGTips.end());
+            }
+        }
+        else
+        {
+            identity.vDAGTips = g_dagManager.GetDAGTips();
+            std::sort(identity.vDAGTips.begin(), identity.vDAGTips.end());
+        }
     }
     identity.nTransactionsUpdated = mempool.GetTransactionsUpdated();
+    if (g_fAuthoritativeStartup)
+    {
+        // R2c.2/S7 / audit-D (OPEN D repair): the identity must be invalidated
+        // by any authoritative canonical source transition that could change
+        // the template's parent vector or primary selection. The structural
+        // fields above (hashBestChain / hashPrimaryParent / vDAGTips) do NOT
+        // cover a persisted-score-only rewrite (which can reorder the capped
+        // merge-parent vector while every structural field stays equal), so
+        // the authoritative source-state token is carried as well: every
+        // in-tree topology/child-count/score mutation advances it inside the
+        // same envelope. Fail closed on an unreadable token - an unknown
+        // source state is never "current".
+        uint256 sourceToken;
+        CTxDB sourceDb("r");
+        if (!sourceDb.ReadDAGSourceStateId(sourceToken))
+            identity.fSelectionUnavailable = true;
+        else
+            identity.hashDAGSourceState = sourceToken;
+    }
     return identity;
 }
 
@@ -1607,7 +1712,8 @@ bool CPUMiningWorkIdentityMatches(const CPUMiningWorkIdentity& a,
         return false;
     if (a.hashBestChain != b.hashBestChain ||
         a.hashPrimaryParent != b.hashPrimaryParent ||
-        a.vDAGTips != b.vDAGTips)
+        a.vDAGTips != b.vDAGTips ||
+        a.hashDAGSourceState != b.hashDAGSourceState)
         return false;
     return !fCheckMempool || a.nTransactionsUpdated == b.nTransactionsUpdated;
 }

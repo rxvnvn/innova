@@ -552,6 +552,52 @@ bool CTxDB::ReadDAGFrontierMembership(const uint256& hash, bool* member)
     return true;
 }
 
+// G6 authoritative row-level attestation. Same membership postimage as
+// ReadDAGFrontierMembership, but canonical ROW PRESENCE is attested
+// separately so an authoritative enumeration can distinguish a legitimate
+// non-member (row present, has children) from an enumerated frontier tip whose
+// canonical row is MISSING (incomplete canonical source => fail closed; never
+// a silently reduced VALID vector). Additive: the legacy reader is unchanged
+// for S5 preview / delta capture consumers.
+bool CTxDB::ReadDAGFrontierMembershipAttested(const uint256& hash, bool* member, bool* rowPresent)
+{
+    if (!member || !rowPresent) return false;
+    *member = false;
+    *rowPresent = false;
+    CDataStream key(SER_DISK, CLIENT_VERSION);
+    key << make_pair(string("daglinks"), hash);
+    // Active batch first, exactly like ReadDAGFrontierMembership: a staged
+    // tombstone is the canonical postimage even while the durable row exists
+    // on disk. A staged write is a row-present postimage whose child-count
+    // projection is not yet sealed, so it can never be attested as a tip.
+    if (activeBatch) {
+        std::string staged; bool deleted = false;
+        bool batchOpen = false;
+        try { batchOpen = ScanBatch(key, &staged, &deleted); }
+        catch (const std::exception&) { return false; } // fail closed on batch scan error
+        if (deleted) return true;                       // staged tombstone: *rowPresent = false
+        if (batchOpen) { *rowPresent = true; return true; } // staged write: present, not a tip
+    }
+    std::string raw;
+    const leveldb::Status status = GetInstance()->Get(leveldb::ReadOptions(), key.str(), &raw);
+    if (status.IsNotFound()) return true;               // canonical row absent: *rowPresent = false
+    if (!status.ok()) return false;                     // IO failure: fail closed
+    {
+        CBlockDAGData data;
+        try {
+            CDataStream ssValue(raw.data(), raw.data() + raw.size(), SER_DISK, CLIENT_VERSION);
+            ssValue >> data;
+        } catch (const std::exception&) { return false; } // malformed row: fail closed
+    }
+    uint64_t count = 0; bool present = false;
+    // Revoked/unreadable child-count projection must fail the attestation, not
+    // degrade into "not a member".
+    if (!ReadDAGChildCount(hash, &count, &present)) return false;
+    *rowPresent = true;
+    *member = (count == 0);
+    return true;
+}
+
 namespace {
 // Lifetime is ONE keyed relation mutation: O(unique old/new parents), not
 // O(history) or O(transaction). Records stream to the existing bounded journal.

@@ -227,6 +227,36 @@ BOOST_AUTO_TEST_CASE(work_identity_detects_same_height_reorg_and_dag_tip_change)
     BOOST_CHECK(!CPUMiningWorkIdentityMatches(original, current, true));
 }
 
+// R2c.2/S7 / audit-D: an authoritative canonical source transition that leaves
+// every structural field equal (e.g. a persisted-score-only rewrite, which can
+// reorder the capped merge-parent vector) must still invalidate stale work.
+BOOST_AUTO_TEST_CASE(work_identity_detects_authoritative_source_only_change)
+{
+    CPUMiningWorkIdentity original;
+    original.hashBestChain = uint256(1);
+    original.hashPrimaryParent = uint256(1);
+    original.nHeight = FORK_HEIGHT_DAG + 1;
+    original.vDAGTips.push_back(uint256(2));
+    original.hashDAGSourceState = uint256(0xAA);
+
+    CPUMiningWorkIdentity current = original;
+    BOOST_CHECK(CPUMiningWorkIdentityMatches(original, current, true));
+
+    // Source-only transition: every structural field identical, token advanced.
+    current.hashDAGSourceState = uint256(0xAB);
+    BOOST_CHECK(!CPUMiningWorkIdentityMatches(original, current, false));
+    BOOST_CHECK(!CPUMiningWorkIdentityMatches(original, current, true));
+
+    // Legacy mode leaves the field 0 on both sides: unchanged semantics.
+    CPUMiningWorkIdentity legacyA, legacyB;
+    legacyA.hashBestChain = legacyB.hashBestChain = uint256(1);
+    legacyA.hashPrimaryParent = legacyB.hashPrimaryParent = uint256(1);
+    legacyA.vDAGTips.push_back(uint256(2));
+    legacyB.vDAGTips.push_back(uint256(2));
+    BOOST_CHECK(CPUMiningWorkIdentityMatches(legacyA, legacyB, false));
+    BOOST_CHECK(!CPUMiningWorkIdentityMatches(legacyA, original, false));
+}
+
 BOOST_AUTO_TEST_CASE(block_identity_detects_stale_parent_and_dag_commitment)
 {
     CPUMiningWorkIdentity identity;

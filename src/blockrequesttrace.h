@@ -273,6 +273,68 @@ enum AcceptBlockRejectReason
 bool InitAcceptBlockRejectTrace(bool fEnabled);
 bool AcceptBlockRejectTraceEnabled();
 
+// Test-only synchronous parent-gate observer. Install/remove under cs_main.
+// Callbacks must not mutate chain state or throw. NULL performs no diagnostic
+// reads. All diagnostic* fields are SEPARATE samples, never evidence of what
+// the preceding production bool lookup read. Status -1 means not sampled.
+enum ProcessBlockParentObserverKind
+{
+    PROCESSBLOCK_PARENT_ENTRY = 0,
+    PROCESSBLOCK_PARENT_BOOL_RESULT,
+    PROCESSBLOCK_PARENT_ORPHAN_ADMITTED,
+    PROCESSBLOCK_PARENT_ACCEPT_FALLTHROUGH,
+    PROCESSBLOCK_PARENT_ACCEPT_PARENT_BOOL_FALSE,
+    PROCESSBLOCK_PARENT_ACCEPT_PARENT_MATERIALIZATION_FAILURE,
+    PROCESSBLOCK_PARENT_ACCEPT_PARENT_MATERIALIZED,
+    PROCESSBLOCK_PARENT_ACCEPT_RETURN
+};
+struct ProcessBlockParentObserverEvent
+{
+    int kind;
+    uint256 child, prev;
+    unsigned int prevMapCount, childMapCount;
+    bool authoritative, livePresent, liveOpen;
+    bool boolAttempted, boolResult;
+    std::string boolError, routeError;
+    int diagnosticParentStatus;
+    bool diagnosticActive;
+    int diagnosticHeight;
+    unsigned int diagnosticFile, diagnosticBlockPos;
+    std::string diagnosticParentError;
+    int diagnosticTipStatus, diagnosticSnapshotStatus;
+    std::string diagnosticTipError, diagnosticSnapshotError;
+    bool diagnosticTailSampled, diagnosticTailResident;
+    uint64_t baseGeneration, authoritativeGeneration;
+    uint256 bestHash;
+    int bestHeight;
+    bool diagnosticSourceRead;
+    uint256 diagnosticSourceState;
+    int64_t monotonicMicros, wallMicros;
+    uint64_t orphanCount;
+    int acceptResult; // -1 except ACCEPT_RETURN; 0/1 is the real AcceptBlock bool
+    ProcessBlockParentObserverEvent()
+        : kind(PROCESSBLOCK_PARENT_ENTRY), prevMapCount(0), childMapCount(0),
+          authoritative(false), livePresent(false), liveOpen(false),
+          boolAttempted(false), boolResult(false), diagnosticParentStatus(-1),
+          diagnosticActive(false), diagnosticHeight(-1), diagnosticFile(0), diagnosticBlockPos(0),
+          diagnosticTipStatus(-1), diagnosticSnapshotStatus(-1),
+          diagnosticTailSampled(false), diagnosticTailResident(false),
+          baseGeneration(0), authoritativeGeneration(0), bestHeight(-1),
+          diagnosticSourceRead(false), monotonicMicros(0), wallMicros(0),
+          orphanCount(0), acceptResult(-1) {}
+};
+typedef void (*ProcessBlockParentObserverFn)(const ProcessBlockParentObserverEvent&);
+class ScopedProcessBlockParentObserver
+{
+public:
+    explicit ScopedProcessBlockParentObserver(ProcessBlockParentObserverFn fn);
+    ~ScopedProcessBlockParentObserver();
+private:
+    ProcessBlockParentObserverFn previous_;
+    ScopedProcessBlockParentObserver(const ScopedProcessBlockParentObserver&);
+    ScopedProcessBlockParentObserver& operator=(const ScopedProcessBlockParentObserver&);
+};
+
 // Test-only passive observation of the real AcceptBlock DAG merge-parent seam.
 enum AcceptBlockDAGObserverEventType
 {

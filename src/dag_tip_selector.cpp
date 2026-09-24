@@ -36,6 +36,7 @@
 #include "blockindex_tip.h"
 #include "blockindex_v2_reader.h"
 
+#include <algorithm>
 #include <set>
 
 // Defined in main.cpp; the overlay runtime's health predicate reads the same
@@ -54,6 +55,12 @@ DagTipSelectorEnumerationHook g_s6EnumHook = NULL;
 void* g_s6EnumHookCtx = NULL;
 bool g_s6ForceUnavailable = false;
 DagTipSelectionReason g_s6ForceReason = DAG_TIP_SELECTION_REASON_NONE;
+
+// R2c.2/S7 — merge-parent reduction state (ownership bookkeeping + counters only;
+// no authority data, no retained collections).
+DagMergeParentStats g_s7MergeStats;
+bool g_s7MergeForceUnavailable = false;
+DagTipSelectionReason g_s7MergeForceReason = DAG_TIP_SELECTION_REASON_NONE;
 
 void FailResult(DagTipSelectionResult* res, DagTipSelectionReason reason,
                 const std::string& diagnostic)
@@ -88,6 +95,25 @@ struct CandidateView
 };
 
 // ---------------------------------------------------------------------------
+// R2c.2/S7 — merge-parent candidate view. SUPERSET of CandidateView: the
+// merge-parent reduction additionally needs the candidate's accumulated
+// chainTrust (the legacy `nChainTrust > nBestChainTrust` threshold) and whether
+// it is resolvable by value at all (the legacy `mapBlockIndex` presence gate).
+// ---------------------------------------------------------------------------
+struct MergeCandidateView
+{
+    uint256 hash;
+    bool resolvable;      // false => legacy residency-miss parity (silent skip)
+    uint256 nChainTrust;  // accumulated chain trust (best-chain threshold input)
+    uint256 nDAGScore;    // persisted canonical score (ComputeDAGScore parity)
+    int height;
+    bool proofOfStake;
+    MergeCandidateView()
+        : hash(0), resolvable(false), nChainTrust(0), nDAGScore(0), height(-1),
+          proofOfStake(false) {}
+};
+
+// ---------------------------------------------------------------------------
 // Source abstraction: the read context. Both implementations below produce the
 // same candidate view; only the read source differs.
 // ---------------------------------------------------------------------------
@@ -107,6 +133,22 @@ struct SelectionSource
                                    DagTipSelectionReason* reason, std::string* error) = 0;
     // Revalidate the snapshot identity before a result may be released.
     virtual bool Revalidate(DagTipSelectionReason* reason, std::string* error) = 0;
+
+    // R2c.2/S7 — merge-parent metadata read (accumulated chainTrust + by-value
+    // resolvability). NON-PURE with a FAIL-CLOSED default: a read context that
+    // cannot supply the merge-parent contract (e.g. the internal S5 preview,
+    // whose candidate view carries no chainTrust) refuses rather than silently
+    // returning a wrong threshold input. Only the external CLEAN source
+    // implements it, and only external CLEAN consumers may call the
+    // merge-parent entry point.
+    virtual bool ReadMergeCandidate(const uint256& hash, MergeCandidateView* out,
+                                    DagTipSelectionReason* reason, std::string* error)
+    {
+        (void)hash; (void)out;
+        if (reason) *reason = DAG_TIP_SELECTION_REASON_INTERNAL_FAILURE;
+        if (error) *error = "selector: read context does not support merge-parent metadata";
+        return false;
+    }
 };
 
 // ---------------------------------------------------------------------------
@@ -375,6 +417,7 @@ struct CleanStreamCtx
     bool (*fn)(const uint256&, void*);
     void* userCtx;
     bool failed;
+    DagTipSelectionReason failReason;
     std::string error;
 };
 
@@ -382,15 +425,36 @@ bool CleanEmitVisitor(const uint256& hash, void* vctx)
 {
     CleanStreamCtx* s = (CleanStreamCtx*)vctx;
     ++g_s6Stats.frontierVisits;
+    ++g_s7MergeStats.frontierVisits;
     bool member = false;
-    if (!s->db->ReadDAGFrontierMembership(hash, &member))
+    bool rowPresent = false;
+    // G6: the membership predicate must attest canonical ROW PRESENCE, not just
+    // membership. Enumerated authority (immutable seed + applied TIP_ADD deltas)
+    // can only offer hashes that HAD a canonical daglinks row; an enumerated tip
+    // whose row is absent means the canonical source is INCOMPLETE (e.g. a row
+    // deleted out-of-band). Collapsing that into *member == false would silently
+    // drop the merge parent and publish a REDUCED VALID vector, so fail the whole
+    // enumeration instead (the caller returns UNAVAILABLE, never a partial vector).
+    if (!s->db->ReadDAGFrontierMembershipAttested(hash, &member, &rowPresent))
     {
         s->failed = true;
+        s->failReason = DAG_TIP_SELECTION_REASON_IO_FAILURE;
         s->error = "selector: frontier predicate read failed";
         return false;
     }
+    if (!rowPresent)
+    {
+        ++g_s7MergeStats.frontierRowAbsent;
+        s->failed = true;
+        s->failReason = DAG_TIP_SELECTION_REASON_FRONTIER_ROW_ABSENT;
+        s->error = "selector: canonical frontier row absent for enumerated authoritative tip";
+        return false;
+    }
+    // Legitimate non-tip (row present, childCount > 0) keeps the historical
+    // silent-skip semantics.
     if (!member) return true;
     ++g_s6Stats.frontierEmits;
+    ++g_s7MergeStats.frontierEmits;
     return s->fn(hash, s->userCtx);
 }
 
@@ -495,6 +559,7 @@ struct CleanSelectionSource : SelectionSource
         s.fn = fn;
         s.userCtx = ctx;
         s.failed = false;
+        s.failReason = DAG_TIP_SELECTION_REASON_NONE;
         std::string e;
         if (!overlay->ForEachTip(&CleanEmitVisitor, &s, &e))
         {
@@ -504,7 +569,12 @@ struct CleanSelectionSource : SelectionSource
         }
         if (s.failed)
         {
-            if (reason) *reason = DAG_TIP_SELECTION_REASON_IO_FAILURE;
+            // G6: the visitor distinguishes an IO failure from an enumerated
+            // authoritative tip whose canonical row is absent; both fail the whole
+            // enumeration (never a partial vector).
+            if (reason) *reason = s.failReason == DAG_TIP_SELECTION_REASON_NONE
+                                          ? DAG_TIP_SELECTION_REASON_IO_FAILURE
+                                          : s.failReason;
             if (error) *error = s.error;
             return false;
         }
@@ -515,6 +585,71 @@ struct CleanSelectionSource : SelectionSource
                        DagTipSelectionReason* reason, std::string* error) override
     {
         return ReadCandidateKeyed(hash, out, reason, error);
+    }
+
+    // R2c.2/S7 — merge-parent metadata by value. Reads the persisted canonical
+    // score plus the authoritative snapshot (tip-then-base). No mapBlockIndex,
+    // no mapDAGData, no residency requirement.
+    bool ReadMergeCandidate(const uint256& hash, MergeCandidateView* out,
+                            DagTipSelectionReason* reason, std::string* error) override
+    {
+        *out = MergeCandidateView();
+        out->hash = hash;
+
+        // Persisted canonical score (the legacy ComputeDAGScore source). An
+        // absent record is NOT an error: legacy falls back to chainTrust.
+        bool hasScoreRecord = false;
+        uint256 persistedScore = 0;
+        {
+            CTxDB db("r");
+            CBlockDAGData data;
+            if (db.ReadDAGLinks(hash, data))
+            {
+                hasScoreRecord = true;
+                persistedScore = data.nDAGScore;
+            }
+        }
+
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        if (!live || !live->IsOpen())
+        {
+            if (reason) *reason = DAG_TIP_SELECTION_REASON_LIVE_AUTHORITY_MISSING;
+            if (error) *error = "merge-parent: live authority unavailable during candidate read";
+            return false;
+        }
+        BlockIndexSnapshot snap;
+        std::string e;
+        const BlockIndexHotStatus st = live->ResolveBlockSnapshot(hash, &snap, &e);
+        if (st == BlockIndexHotStatus::AUTHORITY_MISSING)
+        {
+            // Legacy parity: a candidate that cannot be resolved is silently
+            // skipped, exactly like the legacy `mapBlockIndex.find == end`
+            // branch. It is NOT an authority failure.
+            out->resolvable = false;
+            return true;
+        }
+        if (st != BlockIndexHotStatus::OK)
+        {
+            // Fail closed: an authority/IO/corruption failure must never be
+            // collapsed into a silent omission that changes the result.
+            if (reason) *reason = DAG_TIP_SELECTION_REASON_METADATA_UNAVAILABLE;
+            if (error) *error = e.empty() ? "merge-parent: candidate metadata read failed" : e;
+            return false;
+        }
+        out->resolvable = true;
+        out->height = snap.height;
+        out->proofOfStake = snap.fProofOfStake;
+        out->nChainTrust = snap.nChainTrust;
+        // ComputeDAGScore parity (dag.cpp:540-556): post-DAG PoS scores 0; a
+        // persisted canonical record wins; otherwise the accumulated
+        // chainTrust fallback for a block with no DAG record.
+        if (snap.height >= FORK_HEIGHT_DAG && snap.fProofOfStake)
+            out->nDAGScore = 0;
+        else if (hasScoreRecord)
+            out->nDAGScore = persistedScore;
+        else
+            out->nDAGScore = snap.nChainTrust;
+        return true;
     }
 
     bool ResolveActiveHead(uint256* hash, int* height,
@@ -929,6 +1064,114 @@ bool ResolveActiveAtHeightInternal(int height, uint256* out, std::string* error)
     return false;
 }
 
+// ---------------------------------------------------------------------------
+// R2c.2/S7 — the MERGE-PARENT reduction. A SEPARATE algorithm from the primary
+// selector's argmax: it shares only the read context (SelectionSource), never
+// the reduction. Character-equivalent to the legacy CreateNewBlock merge-parent
+// loop (src/miner.cpp:265-334) with the residency gate replaced by the
+// authoritative by-value resolvability gate.
+// ---------------------------------------------------------------------------
+struct MergeCand
+{
+    uint256 score;
+    uint256 hash;
+    int height;
+};
+
+struct MergeResolveCtx
+{
+    SelectionSource* src;
+    uint256 primaryHash;
+    uint256 bestHash;
+    uint256 bestTrust;
+    std::vector<MergeCand> cands;
+    bool failed;
+    DagTipSelectionReason reason;
+    std::string error;
+    MergeResolveCtx()
+        : src(NULL), primaryHash(0), bestHash(0), bestTrust(0), failed(false),
+          reason(DAG_TIP_SELECTION_REASON_NONE) {}
+};
+
+bool S7MergeResolveVisitor(const uint256& tip, void* vctx)
+{
+    MergeResolveCtx* r = (MergeResolveCtx*)vctx;
+    MergeCandidateView view;
+    DagTipSelectionReason reason = DAG_TIP_SELECTION_REASON_NONE;
+    std::string e;
+    ++g_s7MergeStats.candidateReads;
+    if (!r->src->ReadMergeCandidate(tip, &view, &reason, &e))
+    {
+        r->failed = true;
+        r->reason = reason;
+        r->error = e;
+        return false;
+    }
+    if (!view.resolvable)
+    {
+        // Legacy `mapBlockIndex.find == end` parity: silently skipped.
+        ++g_s7MergeStats.unresolvableSkipped;
+        return true;
+    }
+    if (tip == r->primaryHash)
+    {
+        ++g_s7MergeStats.primaryExcluded;
+        return true;
+    }
+    if (tip != r->bestHash && view.nChainTrust > r->bestTrust)
+    {
+        ++g_s7MergeStats.trustExcluded;
+        return true;
+    }
+    MergeCand c;
+    c.score = view.nDAGScore;
+    c.hash = tip;
+    c.height = view.height;
+    r->cands.push_back(c);
+    return true;
+}
+
+// Exact legacy ordering (miner.cpp:293-298): score DESC, then hash ASC.
+bool MergeCandGreater(const MergeCand& a, const MergeCand& b)
+{
+    if (a.score != b.score) return a.score > b.score;
+    return a.hash < b.hash;
+}
+
+struct FrontierCollectCtx
+{
+    std::vector<uint256>* tips;
+};
+
+bool S7FrontierCollectVisitor(const uint256& tip, void* vctx)
+{
+    static_cast<FrontierCollectCtx*>(vctx)->tips->push_back(tip);
+    return true;
+}
+
+void FailMergeResult(DagMergeParentResult* res, DagTipSelectionReason reason,
+                     const std::string& diagnostic, const uint256& primaryHash,
+                     int primaryHeight)
+{
+    res->status = DAG_MERGE_PARENT_UNAVAILABLE;
+    res->reason = reason;
+    res->parents.clear();
+    res->primaryHash = primaryHash;
+    res->primaryHeight = primaryHeight;
+    res->diagnostic = diagnostic;
+    ++g_s7MergeStats.unavailable;
+}
+
+void FailFrontierResult(DagFrontierTipsResult* res, DagTipSelectionReason reason,
+                        const std::string& diagnostic)
+{
+    res->status = DAG_MERGE_PARENT_UNAVAILABLE;
+    res->reason = reason;
+    res->tips.clear();
+    res->diagnostic = diagnostic;
+    ++g_s7MergeStats.unavailable;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -989,6 +1232,204 @@ DagTipSelectionResult SelectDagTipForExternalConsumer(std::string* error)
     res = RunUnifiedSelection(&src, false);
     if (error) *error = res.diagnostic;
     return res;
+}
+
+// ---------------------------------------------------------------------------
+// R2c.2/S7 — external CLEAN entry points (no mutation permit by construction).
+// ---------------------------------------------------------------------------
+DagMergeParentResult SelectMergeParentsForExternalConsumer(const uint256& primaryHash,
+                                                           int primaryHeight,
+                                                           std::string* error)
+{
+    DagMergeParentResult res;
+    res.primaryHash = primaryHash;
+    res.primaryHeight = primaryHeight;
+    if (error) error->clear();
+
+    if (!g_fAuthoritativeStartup)
+    {
+        res.status = DAG_MERGE_PARENT_LEGACY;
+        return res;
+    }
+    ++g_s7MergeStats.calls;
+
+    if (g_s7MergeForceUnavailable)
+    {
+        FailMergeResult(&res, g_s7MergeForceReason == DAG_TIP_SELECTION_REASON_NONE
+                                  ? DAG_TIP_SELECTION_REASON_INTERNAL_FAILURE
+                                  : g_s7MergeForceReason,
+                        "merge-parent: forced unavailable (test)", primaryHash, primaryHeight);
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+    if (primaryHash == uint256(0) || primaryHeight < 0)
+    {
+        FailMergeResult(&res, DAG_TIP_SELECTION_REASON_INTERNAL_FAILURE,
+                        "merge-parent: caller-bound primary is not usable",
+                        primaryHash, primaryHeight);
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+
+    CleanSelectionSource src;
+    uint256 token0;
+    DagTipSelectionReason reason = DAG_TIP_SELECTION_REASON_NONE;
+    std::string err;
+    if (!src.Begin(&token0, &reason, &err))
+    {
+        FailMergeResult(&res, reason, err, primaryHash, primaryHeight);
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+
+    MergeResolveCtx ctx;
+    ctx.src = &src;
+    ctx.primaryHash = primaryHash;
+    // The trust threshold reads the SAME value-only scalars the legacy loop
+    // reads (main.cpp:107 nBestChainTrust, main.cpp:121 hashBestChain); they are
+    // maintained in authoritative mode by CBlock::SetBestChain (main.cpp:8839,
+    // :8990-8994) which AddToBlockIndex drives at :9475-9478. No mapBlockIndex.
+    ctx.bestHash = hashBestChain;
+    ctx.bestTrust = nBestChainTrust;
+
+    reason = DAG_TIP_SELECTION_REASON_NONE;
+    err.clear();
+    if (!src.ForEachFrontier(&S7MergeResolveVisitor, &ctx, &reason, &err))
+    {
+        FailMergeResult(&res, ctx.failed ? ctx.reason : reason,
+                        ctx.failed ? ctx.error : err, primaryHash, primaryHeight);
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+    if (ctx.failed)
+    {
+        FailMergeResult(&res, ctx.reason, ctx.error, primaryHash, primaryHeight);
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+
+    std::sort(ctx.cands.begin(), ctx.cands.end(), MergeCandGreater);
+
+    std::vector<uint256> parents;
+    parents.push_back(primaryHash); // index 0, exactly like legacy miner.cpp:271-272
+
+    for (size_t i = 0; i < ctx.cands.size(); ++i)
+    {
+        // Exact legacy cap semantics (miner.cpp:302-303): the cap counts the
+        // primary, so at most MAX_DAG_PARENTS - 1 extras are appended.
+        if (parents.size() >= (size_t)MAX_DAG_PARENTS)
+        {
+            ++g_s7MergeStats.capped;
+            break;
+        }
+        if (ctx.cands[i].height < primaryHeight - DAG_MERGE_DEPTH)
+        {
+            ++g_s7MergeStats.depthExcluded;
+            continue;
+        }
+        if (ctx.cands[i].height >= primaryHeight + 1)
+        {
+            ++g_s7MergeStats.heightExcluded;
+            continue;
+        }
+        parents.push_back(ctx.cands[i].hash);
+    }
+
+    // Never release a result built from a source that moved under us.
+    reason = DAG_TIP_SELECTION_REASON_NONE;
+    err.clear();
+    if (!src.Revalidate(&reason, &err))
+    {
+        FailMergeResult(&res, reason == DAG_TIP_SELECTION_REASON_NONE
+                                  ? DAG_TIP_SELECTION_REASON_REVALIDATION_FAILED
+                                  : reason,
+                        err, primaryHash, primaryHeight);
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+
+    res.status = DAG_MERGE_PARENT_VALID;
+    res.reason = DAG_TIP_SELECTION_REASON_NONE;
+    res.parents = parents;
+    ++g_s7MergeStats.published;
+    return res;
+}
+
+DagFrontierTipsResult SelectFrontierTipsForExternalConsumer(std::string* error)
+{
+    DagFrontierTipsResult res;
+    if (error) error->clear();
+
+    if (!g_fAuthoritativeStartup)
+    {
+        res.status = DAG_MERGE_PARENT_LEGACY;
+        return res;
+    }
+
+    if (g_s7MergeForceUnavailable)
+    {
+        FailFrontierResult(&res, g_s7MergeForceReason == DAG_TIP_SELECTION_REASON_NONE
+                                    ? DAG_TIP_SELECTION_REASON_INTERNAL_FAILURE
+                                    : g_s7MergeForceReason,
+                           "merge-parent: forced unavailable (test)");
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+
+    CleanSelectionSource src;
+    uint256 token0;
+    DagTipSelectionReason reason = DAG_TIP_SELECTION_REASON_NONE;
+    std::string err;
+    if (!src.Begin(&token0, &reason, &err))
+    {
+        FailFrontierResult(&res, reason, err);
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+
+    FrontierCollectCtx ctx;
+    ctx.tips = &res.tips;
+    reason = DAG_TIP_SELECTION_REASON_NONE;
+    err.clear();
+    if (!src.ForEachFrontier(&S7FrontierCollectVisitor, &ctx, &reason, &err))
+    {
+        FailFrontierResult(&res, reason, err);
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+    std::sort(res.tips.begin(), res.tips.end());
+
+    reason = DAG_TIP_SELECTION_REASON_NONE;
+    err.clear();
+    if (!src.Revalidate(&reason, &err))
+    {
+        FailFrontierResult(&res, reason == DAG_TIP_SELECTION_REASON_NONE
+                                    ? DAG_TIP_SELECTION_REASON_REVALIDATION_FAILED
+                                    : reason,
+                           err);
+        if (error) *error = res.diagnostic;
+        return res;
+    }
+
+    res.status = DAG_MERGE_PARENT_VALID;
+    res.reason = DAG_TIP_SELECTION_REASON_NONE;
+    return res;
+}
+
+DagMergeParentStats GetDagMergeParentStats()
+{
+    return g_s7MergeStats;
+}
+
+void ResetDagMergeParentStatsForTest()
+{
+    g_s7MergeStats = DagMergeParentStats();
+}
+
+void SetMergeParentForceUnavailableForTest(bool armed, DagTipSelectionReason reason)
+{
+    g_s7MergeForceUnavailable = armed;
+    g_s7MergeForceReason = reason;
 }
 
 DagTipSelectionResult ResolveAuthoritativeBoundaryAtHeight(const uint256& fromHash,
@@ -1206,6 +1647,7 @@ const char* DagTipSelectionReasonName(DagTipSelectionReason reason)
     case DAG_TIP_SELECTION_REASON_TRAVERSAL_UNAVAILABLE: return "TRAVERSAL_UNAVAILABLE";
     case DAG_TIP_SELECTION_REASON_REVALIDATION_FAILED: return "REVALIDATION_FAILED";
     case DAG_TIP_SELECTION_REASON_INTERNAL_FAILURE: return "INTERNAL_FAILURE";
+    case DAG_TIP_SELECTION_REASON_FRONTIER_ROW_ABSENT: return "FRONTIER_ROW_ABSENT";
     default: return "UNKNOWN";
     }
 }

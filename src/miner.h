@@ -46,6 +46,17 @@ struct CPUMiningWorkIdentity
     std::vector<uint256> vDAGTips;
     unsigned int nTransactionsUpdated;
     int nHeight;
+    // R2c.2/S7 / audit-D (OPEN D): authoritative canonical DAG source-state
+    // token at capture time. Every in-tree topology / child-count / persisted
+    // score mutation stages its new token inside the same authoritative
+    // envelope, so two identities that agree on every structural field but
+    // disagree on this token are NOT the same work: a source-only (e.g.
+    // persisted recolor) transition can reorder the template's capped
+    // merge-parent vector without moving hashBestChain / hashPrimaryParent /
+    // vDAGTips. Authoritative mode fills it under cs_main and fails closed if
+    // it is unreadable; legacy mode leaves it 0 on both sides, so the legacy
+    // comparison is unchanged.
+    uint256 hashDAGSourceState;
     // R2c.2/S6: set when the authoritative primary selection was UNAVAILABLE
     // at capture time; such an identity is never considered current.
     bool fSelectionUnavailable;

@@ -282,6 +282,21 @@ public:
     // batch as every mutation of this relation.
     bool ReadDAGLinks(const uint256& hash, CBlockDAGData& data);
     bool ReadDAGFrontierMembership(const uint256& hash, bool* member);
+    // G6 authoritative row-level attestation. Identical membership contract to
+    // ReadDAGFrontierMembership (row present AND childCount == 0), but it ALSO
+    // attests canonical ROW PRESENCE SEPARATELY, so an authoritative consumer
+    // can distinguish "legitimately not a frontier member" (row present, has
+    // children / durable row absent by semantics) from "an enumerated
+    // authoritative frontier tip whose canonical row is MISSING" (incomplete
+    // canonical source - must fail closed, never a reduced valid vector).
+    // Returns false fail-closed on any IO error, malformed/unreadable canonical
+    // row, or revoked/unreadable child-count projection. On true:
+    //   *rowPresent = canonical daglinks postimage exists (active-batch staged
+    //                 tombstone honoured exactly like ReadDAGFrontierMembership);
+    //   *member     = *rowPresent && childCount == 0.
+    // Read-only attestation: never writes, never revokes, never mutates the
+    // child-count or score certificates. The legacy reader above is unchanged.
+    bool ReadDAGFrontierMembershipAttested(const uint256& hash, bool* member, bool* rowPresent);
     bool WriteDAGLinks(const uint256& hash, const CBlockDAGData& data);
     bool EraseDAGLinks(const uint256& hash);
     // S3 staged-view enumeration: return the staged daglinks writes/tombstones

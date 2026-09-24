@@ -2503,6 +2503,87 @@ static void ProcessBlockRejectTraceRemember(const uint256& hash,
     }
 }
 
+static ProcessBlockParentObserverFn g_processBlockParentObserver = NULL;
+ScopedProcessBlockParentObserver::ScopedProcessBlockParentObserver(ProcessBlockParentObserverFn fn)
+    : previous_(g_processBlockParentObserver)
+{
+    AssertLockHeld(cs_main);
+    g_processBlockParentObserver = fn;
+}
+ScopedProcessBlockParentObserver::~ScopedProcessBlockParentObserver()
+{
+    AssertLockHeld(cs_main);
+    g_processBlockParentObserver = previous_;
+}
+
+// Borrow the already-open database under the caller's cs_main, just as the
+// block path does. Never construct CTxDB here: its constructor can open/create
+// a database. This diagnostic reads the committed source token, not a batch.
+extern leveldb::DB* txdb;
+static void ObserveProcessBlockParent(const CBlock& block, int kind,
+    bool attempted = false, bool result = false, const std::string* boolError = NULL,
+    int acceptResult = -1)
+{
+    if (!g_processBlockParentObserver) return;
+    AssertLockHeld(cs_main);
+    ProcessBlockParentObserverEvent e;
+    e.kind = kind;
+    e.child = block.GetHash(); e.prev = block.hashPrevBlock;
+    e.prevMapCount = mapBlockIndex.count(e.prev);
+    e.childMapCount = mapBlockIndex.count(e.child);
+    e.authoritative = g_fAuthoritativeStartup;
+    e.boolAttempted = attempted; e.boolResult = result;
+    if (boolError)
+    {
+        if (kind == PROCESSBLOCK_PARENT_BOOL_RESULT || kind == PROCESSBLOCK_PARENT_ACCEPT_PARENT_BOOL_FALSE)
+            e.boolError = *boolError;
+        else e.routeError = *boolError;
+    }
+    e.monotonicMicros = ibdactivepath::MonotonicMicros();
+    e.wallMicros = GetTimeMicros();
+    e.orphanCount = mapOrphanBlocks.size();
+    e.acceptResult = acceptResult;
+    e.bestHash = hashBestChain; e.bestHeight = nBestHeight;
+    e.authoritativeGeneration = AuthoritativeGeneration();
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    e.livePresent = live != NULL; e.liveOpen = live && live->IsOpen();
+    if (live)
+    {
+        e.baseGeneration = live->BaseGeneration();
+        BlockIndexAuthoritativeParentInfo info;
+        e.diagnosticParentStatus = (int)live->ResolveParentInfo(e.prev, &info, &e.diagnosticParentError);
+        e.diagnosticActive = info.active; e.diagnosticHeight = info.height;
+        e.diagnosticFile = info.nFile; e.diagnosticBlockPos = info.nBlockPos;
+        BlockIndexSnapshot snapshot;
+        e.diagnosticSnapshotStatus = (int)live->ResolveBlockSnapshot(e.prev, &snapshot, &e.diagnosticSnapshotError);
+        const BlockIndexTipAuthority* tip = live->TipAuthority();
+        if (tip && tip->IsOpen())
+            e.diagnosticTipStatus = (int)tip->LookupByHash(e.prev, &e.diagnosticTipError).status;
+        if (e.liveOpen)
+        {
+            e.diagnosticTailSampled = true;
+            e.diagnosticTailResident = live->Tail().IsResident(BlockIndexLogicalId(e.prev));
+        }
+    }
+    if (txdb)
+    {
+        CDataStream key(SER_DISK, CLIENT_VERSION);
+        key << std::make_pair(std::string("dagsourcestate"), uint8_t(0));
+        std::string value;
+        if (txdb->Get(leveldb::ReadOptions(), key.str(), &value).ok())
+        {
+            try
+            {
+                CDataStream bytes(value.data(), value.data() + value.size(), SER_DISK, CLIENT_VERSION);
+                bytes >> e.diagnosticSourceState;
+                e.diagnosticSourceRead = true;
+            }
+            catch (const std::exception&) {} // diagnostic failure, no production output
+        }
+    }
+    g_processBlockParentObserver(e);
+}
+
 static bool fAcceptBlockRejectTraceEnabled = false;
 static AcceptBlockDAGObserverFn g_acceptBlockDAGObserver = NULL;
 static ConnectBlockDAGSiblingObserverFn g_connectBlockDAGSiblingObserver = NULL;
@@ -9831,6 +9912,7 @@ bool CBlock::AcceptBlock()
         std::string perr;
         if (!live->ResolveParent(hashPrevBlock, &parentHeight, &perr))
         {
+            ObserveProcessBlockParent(*this, PROCESSBLOCK_PARENT_ACCEPT_PARENT_BOOL_FALSE, true, false, &perr);
             TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
             return DoS(10, error("AcceptBlock() : prev block not found (authoritative, non-resident): %s", perr.c_str()));
         }
@@ -9842,11 +9924,13 @@ bool CBlock::AcceptBlock()
         CBlockIndex* matParent = live->MaterializeParentChain(hashPrevBlock, &parentPin, &perr);
         if (!matParent)
         {
+            ObserveProcessBlockParent(*this, PROCESSBLOCK_PARENT_ACCEPT_PARENT_MATERIALIZATION_FAILURE, true, true, &perr);
             // On mainnet the base tip anchor is already resident; a missing
             // materialization is a genuine authority failure -> fail closed.
             TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
             return DoS(100, error("AcceptBlock() : authoritative parent materialization failed: %s", perr.c_str()));
         }
+        ObserveProcessBlockParent(*this, PROCESSBLOCK_PARENT_ACCEPT_PARENT_MATERIALIZED, true, true, &perr);
         pindexPrev = matParent;
         // nHeight from the materialized parent (already filled by-value).
     }
@@ -10563,6 +10647,7 @@ bool RecoverFromInvalidatedBestChain()
 bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 {
     AssertLockHeld(cs_main);
+    ObserveProcessBlockParent(*pblock, PROCESSBLOCK_PARENT_ENTRY);
 
     ibdactivepath::ActivePathTimer ibdProcessBlockTimer(
         ibdactivepath::GetCounters().processblock_us_total,
@@ -10703,6 +10788,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     // validates the parent from V2. Legacy mode (g_fAuthoritativeStartup false) is
     // byte-identical: the parent must be a resident mapBlockIndex member or the
     // block is orphaned exactly as before.
+    bool fParentLookupAttempted = false;
     bool fAuthoritativeParentResolved = false;
     if (g_fAuthoritativeStartup && !mapBlockIndex.count(pblock->hashPrevBlock))
     {
@@ -10711,8 +10797,12 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         {
             std::string perr;
             fAuthoritativeParentResolved = live->ResolveParent(pblock->hashPrevBlock, NULL, &perr);
+            fParentLookupAttempted = true;
+            ObserveProcessBlockParent(*pblock, PROCESSBLOCK_PARENT_BOOL_RESULT, true, fAuthoritativeParentResolved, &perr);
         }
     }
+    if (!fParentLookupAttempted)
+        ObserveProcessBlockParent(*pblock, PROCESSBLOCK_PARENT_BOOL_RESULT);
     if (!mapBlockIndex.count(pblock->hashPrevBlock) && !fAuthoritativeParentResolved) //pblock->hashPrevBlock != 0 &&
     {
         if (fDebug)
@@ -10816,9 +10906,11 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
                     mapOrphanBlocks.size());
             }
         }
+        ObserveProcessBlockParent(*pblock, PROCESSBLOCK_PARENT_ORPHAN_ADMITTED);
         return true;
     }
 
+    ObserveProcessBlockParent(*pblock, PROCESSBLOCK_PARENT_ACCEPT_FALLTHROUGH);
     // Store to disk
     int64_t nAcceptStart = GetTimeMillis();
     bool fAcceptBlock = false;
@@ -10826,6 +10918,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         CSyncLockPhase phase("ProcessMessage(block)", "acceptblock");
         fAcceptBlock = pblock->AcceptBlock();
     }
+    ObserveProcessBlockParent(*pblock, PROCESSBLOCK_PARENT_ACCEPT_RETURN, false, false, NULL, fAcceptBlock ? 1 : 0);
     if (!fAcceptBlock) {
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_ACCEPTBLOCK_FALSE);
         ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
