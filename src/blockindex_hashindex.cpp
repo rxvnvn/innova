@@ -113,7 +113,17 @@ static leveldb::Options MakeHashIndexOptions(bool create)
     options.block_cache = leveldb::NewLRUCache(8 * 1048576);
     options.filter_policy = leveldb::NewBloomFilterPolicy(10);
     options.write_buffer_size = 8 * 1048576;
-    options.max_open_files = 256;
+    // M1 memory blocker: the vendored LevelDB CLAMPS max_open_files to
+    // >= 64 + kNumNonTableCacheFiles (=74) in src/leveldb/db/db_impl.cc:97, and the
+    // TableCache is sized max_open_files - kNumNonTableCacheFiles (db_impl.cc:141).
+    // The hashindex generation holds ~185 small .sst tables; at 256 no table is ever
+    // LRU-evicted, so every table stays open+mmap'd for process lifetime (PosixEnv::
+    // NewRandomAccessFile mmaps unconditionally, src/leveldb/util/env_posix.cc:315-341)
+    // and the faulted pages are charged to this process as file-backed RSS
+    // (measured 282,528-298,708 kB of the ~558 MB steady state). 74 => table cache 64
+    // => LRU eviction closes+munmaps tables; the data stays in the HOST page cache so
+    // re-reads remain cheap. Config-only: no on-disk format, semantic or consensus change.
+    options.max_open_files = 74;
     options.compression = leveldb::kSnappyCompression;
     return options;
 }
