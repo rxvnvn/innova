@@ -748,4 +748,136 @@ BOOST_AUTO_TEST_CASE(g1_processblock_parent_authority_failure_fails_closed)
            " (ProcessBlock=false, no orphan admission).\n");
 }
 
+// ---------------------------------------------------------------------------
+// L5 (F4) + L4 (F3) through the REAL materializer.
+//
+// The retained window is a CONTIGUOUS materialized chain whose lowest node (the
+// residency floor = max(0, baseTipHeight - WALK), WALK = nMedianTimeSpan + 2 = 13)
+// has pprev == NULL. Its skip links must obey the SAME semantics ordinary
+// resident chains obey (CBlockIndex::BuildSkip): pskip is the node at
+// GetSkipHeight(h) when that node is materialized, and NULL when it is not.
+// Substituting pprev desynchronises GetAncestor's height counter, so ancestor
+// lookups return SILENTLY WRONG nodes and CBlockLocator::Set - which restores
+// wallet/sync state - persists them.
+// ---------------------------------------------------------------------------
+
+struct RefChain
+{
+    std::vector<uint256> hashes;
+    std::vector<CBlockIndex*> nodes;
+    ~RefChain() { for (size_t i = 0; i < nodes.size(); ++i) delete nodes[i]; }
+};
+
+// Fully resident reference chain (heights 0..count-1) linked by the production
+// BuildSkip: the semantics the retained window must match, without transcribing
+// GetSkipHeight into the test.
+static RefChain BuildResidentReference(int count)
+{
+    RefChain r;
+    CBlockIndex* prev = NULL;
+    for (int i = 0; i < count; ++i)
+    {
+        r.hashes.push_back(uint256((uint64_t)(0x900000 + i)));
+        CBlockIndex* p = new CBlockIndex();
+        p->phashBlock = &r.hashes.back();
+        p->pprev = prev;
+        p->nHeight = i;
+        p->pskip = NULL;
+        p->BuildSkip();
+        if (prev)
+            prev->pnext = p;
+        r.nodes.push_back(p);
+        prev = p;
+    }
+    return r;
+}
+
+BOOST_AUTO_TEST_CASE(g1_traversal_floor_skip_topology_and_getancestor)
+{
+    G1Fixture fx(20); // S = 20 -> retained window floor = 20 - 13 = 7
+    BlockIndexV2Reader reader;
+    BlockIndexV2ReaderOptions opts;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reader.Open(fx.rootStr, opts, &error), error);
+    BlockIndexAuthoritativeLive live;
+    BOOST_REQUIRE_MESSAGE(live.Open(fx.rootStr, &reader, 2048, &error), error);
+
+    const int baseTip = fx.baseTip;
+    const uint256 child = uint256(0xE2000001UL);
+    {
+        BlockIndexRecord r = G1Record(child, fx.baseActive[baseTip], baseTip + 1, false);
+        BlockIndexDerivedEntry d = G1Derived(uint256(0xC1UL), 101);
+        BOOST_REQUIRE_MESSAGE(live.AcceptActive(r, d, baseTip + 1, &error), error);
+    }
+    const int floorHeight = baseTip - (int)CBlockIndex::nMedianTimeSpan - 2; // 7
+
+    std::string rerr;
+    CBlockIndex* pwin = live.ResolveAndRetainFullParent(child, &rerr);
+    BOOST_REQUIRE_MESSAGE(pwin != NULL, rerr);
+    BOOST_CHECK_EQUAL(pwin->nHeight, baseTip + 1);
+
+    // Rematerializing the same hash must yield the same retained object.
+    std::string rerr2;
+    CBlockIndex* pwin2 = live.ResolveAndRetainFullParent(child, &rerr2);
+    BOOST_CHECK(pwin2 == pwin);
+
+    // Enumerate the materialized window along pprev.
+    std::vector<CBlockIndex*> win;
+    for (CBlockIndex* p = pwin; p != NULL; p = p->pprev)
+        win.push_back(p);
+    BOOST_REQUIRE(win.size() >= 2);
+    BOOST_CHECK_EQUAL(win.back()->nHeight, floorHeight);
+    BOOST_CHECK(win.back()->pprev == NULL); // the residency floor: nothing below is resident
+
+    // BOUNDEDNESS: the repair must not deepen residency, populate legacy history,
+    // or add any ancestry cache. Window depth stays inside WALK (nMedianTimeSpan+2)
+    // and no window entry is registered in mapBlockIndex.
+    BOOST_CHECK_LE(win.size(), (size_t)(CBlockIndex::nMedianTimeSpan + 4));
+    for (size_t i = 0; i < win.size(); ++i)
+        BOOST_CHECK_EQUAL(mapBlockIndex.count(win[i]->GetBlockHash()), (size_t)0);
+
+    // (F4) skip topology parity with an ordinary resident chain.
+    RefChain ref = BuildResidentReference(pwin->nHeight + 1);
+    for (size_t i = 0; i < win.size(); ++i)
+    {
+        const int h = win[i]->nHeight;
+        const CBlockIndex* refSkip = ref.nodes[h]->pskip;
+        if (refSkip == NULL || refSkip->nHeight < floorHeight)
+        {
+            BOOST_CHECK_MESSAGE(win[i]->pskip == NULL,
+                "height " << h << ": a skip target below the retained floor must be NULL, "
+                "never a substituted pprev");
+        }
+        else
+        {
+            BOOST_REQUIRE_MESSAGE(win[i]->pskip != NULL, "height " << h << ": skip target is materialized");
+            BOOST_CHECK_EQUAL(win[i]->pskip->nHeight, refSkip->nHeight);
+        }
+    }
+
+    // (F3/F4) GetAncestor through the real materialized object.
+    for (int t = floorHeight; t <= pwin->nHeight; ++t)
+    {
+        const CBlockIndex* a = pwin->GetAncestor(t);
+        BOOST_REQUIRE_MESSAGE(a != NULL, "in-window target " << t << " must be materialized");
+        BOOST_CHECK_EQUAL(a->nHeight, t);
+        BOOST_CHECK(a->GetBlockHash() == win[pwin->nHeight - t]->GetBlockHash());
+    }
+    BOOST_CHECK(pwin->GetAncestor(floorHeight - 1) == NULL);
+    BOOST_CHECK(pwin->GetAncestor(floorHeight - 2) == NULL); // SIGSEGV before the fix
+    BOOST_CHECK(pwin->GetAncestor(0) == NULL);
+
+    // (F3) CBlockLocator must truncate safely at the retained floor.
+    CBlockLocator loc(pwin);
+    uint256 hashFirst, hashLast;
+    BOOST_REQUIRE(loc.GetHashes(hashFirst, hashLast));
+    BOOST_CHECK(hashFirst == pwin->GetBlockHash());
+    BOOST_CHECK(hashLast == GetGenesisBlockHash());
+
+    live.Close();
+    reader.Close();
+    printf("G1-TRAVERSAL PASS: retained-window pskip matches resident BuildSkip semantics; "
+           "GetAncestor exact in-window, NULL below the floor; locator truncates safely\n");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

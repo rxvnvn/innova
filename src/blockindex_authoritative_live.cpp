@@ -490,8 +490,18 @@ CBlockIndex* BlockIndexAuthoritativeLive::ResolveAndRetainFullParent(
         }
         o->pprev = prev;
         o->pnext = (i > 0) ? impl_->fullResident_[path[i - 1].hash] : NULL;
-        o->pskip = o->pprev;
+        o->pskip = NULL; // constructed by the skip pass below (BuildSkip semantics)
     }
+    // Skip links must satisfy the SAME invariant ordinary resident chains do:
+    // pskip is the node at GetSkipHeight(h) when that node is materialized, and
+    // NULL when it is not. Substituting pprev (the previous construction) made
+    // GetAncestor's height counter disagree with the pointer, so ancestor
+    // lookups (CBlockLocator::Set, median-time/difficulty/stake walks, RPC) could
+    // return SILENTLY WRONG nodes. Ascending height order (floor first) so each
+    // step sees already-correct lower links; a target below the retained floor is
+    // not materialized and correctly yields NULL.
+    for (size_t i = path.size(); i-- > 0; )
+        impl_->fullResident_[path[i].hash]->BuildSkip();
     // nChainTrust is preserved from the snapshot: FullFromSnapshot sets
     // p->nChainTrust = s.nChainTrust, and the reader now fills s.nChainTrust
     // from the authoritative derived.dat (per-record cumulative trust). No
@@ -626,13 +636,18 @@ CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChainInto(
         objs->push_back(obj);
         owns->push_back(own);
     }
-    // Link topology: pprev -> floor, pnext -> tip, pskip -> pprev (conservative).
+    // Link topology: pprev -> floor, pnext -> tip. Skip links are constructed by
+    // the same BuildSkip semantics ordinary resident chains use (ascending height
+    // order, floor first): pskip == the node at GetSkipHeight(h) when that node
+    // is materialized here, else NULL. Never a substituted pprev.
     for (size_t i = 0; i < objs->size(); ++i)
     {
         (*objs)[i]->pprev = (i + 1 < objs->size()) ? (*objs)[i + 1] : NULL;
         (*objs)[i]->pnext = (i > 0) ? (*objs)[i - 1] : NULL;
-        (*objs)[i]->pskip = (*objs)[i]->pprev;
+        (*objs)[i]->pskip = NULL;
     }
+    for (size_t i = objs->size(); i-- > 0; )
+        (*objs)[i]->BuildSkip();
     ClearError(error);
     return objs->front(); // the requested parent
 }

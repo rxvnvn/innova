@@ -4953,6 +4953,15 @@ const CBlockIndex* CBlockIndex::GetAncestor(int nHeightTarget) const
     int nHeightWalk = nHeight;
     while (nHeightWalk > nHeightTarget)
     {
+        // Retained-ancestry floor: an authoritative (partial) chain is only
+        // materialized down to a bounded window (WALK = nMedianTimeSpan + 2), so
+        // the pprev/pskip walk can be exhausted before nHeightTarget is reached.
+        // The walk must never dereference a NULL walker: an ancestor below the
+        // materialized floor is by-value-only, so report it as unavailable
+        // (NULL) instead of stepping through NULL. Fully resident (legacy)
+        // chains are unaffected: the walker reaches every target before this.
+        if (!pindexWalk)
+            return NULL;
         const int nHeightSkip = GetSkipHeight(nHeightWalk);
         const int nHeightSkipPrev = GetSkipHeight(nHeightWalk - 1);
         if (pindexWalk->pskip &&
