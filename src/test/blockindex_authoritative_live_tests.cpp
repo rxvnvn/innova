@@ -582,7 +582,9 @@ BOOST_AUTO_TEST_CASE(g1_processblock_parent_observer_open_and_closed_authority)
             if (e.kind == PROCESSBLOCK_PARENT_BOOL_RESULT)
             {
                 sawBool = true;
-                BOOST_CHECK_EQUAL(e.boolAttempted, !closed);
+                // The typed parent classification is ALWAYS attempted in
+                // authoritative mode; boolResult reflects FOUND/NOT_ACTIVE.
+                BOOST_CHECK_EQUAL(e.boolAttempted, true);
                 BOOST_CHECK_EQUAL(e.boolResult, !closed);
                 BOOST_CHECK_EQUAL(e.diagnosticParentStatus, closed ?
                     BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE : BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND);
@@ -604,14 +606,146 @@ BOOST_AUTO_TEST_CASE(g1_processblock_parent_observer_open_and_closed_authority)
         BOOST_CHECK(sawBool);
         BOOST_CHECK_EQUAL(sawReturn, !closed);
         BOOST_CHECK_EQUAL(sawFallthrough, !closed);
-        BOOST_CHECK_EQUAL(sawOrphan, !!closed);
-        BOOST_CHECK_EQUAL(mapOrphanBlocks.count(block->GetHash()), closed ? 1U : 0U);
+        BOOST_CHECK(!sawOrphan);
+        BOOST_CHECK_EQUAL(mapOrphanBlocks.count(block->GetHash()), 0U);
         if (closed)
         {
-            BOOST_CHECK(result);
+            // AUTHORITY_UNAVAILABLE (live authority closed, parent present-by-value)
+            // must FAIL CLOSED: ProcessBlock returns false, no orphan admission.
+            BOOST_CHECK(!result);
             BOOST_CHECK_EQUAL(mapBlockIndex.count(block->GetHash()), 0U);
         }
     }
+}
+
+// R2 ORPHAN-ABSENT-vs-UNAVAILABLE CONTRACT: when the authoritative live
+// authority is UNAVAILABLE (closed / not open / storage error), a parent whose
+// existence cannot be determined MUST FAIL CLOSED at the ProcessBlock gate —
+// never fail open into a genuine orphan. The parent is present-by-value here
+// (asserted FOUND below) but momentarily unresolvable; admitting the child into
+// mapOrphanBlocks would strand it forever (there is NO by-value orphan retry;
+// only P2P parent arrival re-runs the orphan loop) and would incorrectly ask
+// peers for a block the node already holds authoritatively.
+//   RED  (current source): ProcessBlock returns TRUE + admits to mapOrphanBlocks.
+//   GREEN(required): ProcessBlock returns FALSE, no orphan admission.
+// R2c.2 AcceptBlock closure: ProcessBlock has already resolved this cold
+// parent as FOUND, then the base authority becomes unavailable before the
+// legacy AcceptBlock second lookup. This must remain a LOCAL failure, never
+// accumulate DoS against a P2P peer. Against the pre-closure candidate this
+// real ProcessBlock -> AcceptBlock path returns false with block.nDoS == 10.
+static BlockIndexV2Reader* g_closeBaseReaderAfterParentFound = NULL;
+static void CloseBaseReaderAfterParentFound(const ProcessBlockParentObserverEvent& event)
+{
+    parentEvents.push_back(event);
+    if (event.kind == PROCESSBLOCK_PARENT_BOOL_RESULT && event.boolResult &&
+        g_closeBaseReaderAfterParentFound)
+    {
+        g_closeBaseReaderAfterParentFound->Close();
+        g_closeBaseReaderAfterParentFound = NULL;
+    }
+}
+
+BOOST_AUTO_TEST_CASE(g1_acceptblock_second_lookup_authority_failure_no_dos)
+{
+    G1Fixture fx(4);
+    BlockIndexV2Reader reader;
+    BlockIndexV2ReaderOptions opts;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reader.Open(fx.rootStr, opts, &error), error);
+    BlockIndexAuthoritativeLive live;
+    BOOST_REQUIRE_MESSAGE(live.Open(fx.rootStr, &reader, 2048, &error), error);
+    const uint256 prev = fx.baseActive[fx.baseTip];
+    BOOST_REQUIRE_EQUAL(mapBlockIndex.count(prev), 0U);
+    BlockIndexAuthoritativeParentInfo before;
+    BOOST_REQUIRE(live.ResolveParentInfo(prev, &before, &error) ==
+                  BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND);
+    std::unique_ptr<CBlock> block(BuildCheckBlockPassingPoWBallast(prev, 0x7A12));
+    BOOST_REQUIRE(block.get() != NULL);
+    BOOST_REQUIRE(block->CheckBlock(true, true, true));
+
+    const bool savedAuth = g_fAuthoritativeStartup;
+    SetAuthoritativeLiveForTesting(&live);
+    g_fAuthoritativeStartup = true;
+    parentEvents.clear();
+    g_closeBaseReaderAfterParentFound = &reader;
+    {
+        ScopedProcessBlockParentObserver observer(CloseBaseReaderAfterParentFound);
+        LOCK(cs_main);
+        const bool fAccepted = ProcessBlock(NULL, block.get());
+        BOOST_CHECK(!fAccepted);
+    }
+    g_closeBaseReaderAfterParentFound = NULL;
+    g_fAuthoritativeStartup = savedAuth;
+    ClearAuthoritativeLiveForTesting();
+
+    BOOST_CHECK(!reader.IsOpen());
+    BOOST_CHECK_EQUAL(block->nDoS, 0);
+    BOOST_CHECK_EQUAL(mapOrphanBlocks.count(block->GetHash()), 0U);
+    live.Close();
+    printf("G1 ACCEPTBLOCK-CLOSURE: second lookup authority failure is local"
+           " (ProcessBlock=false, DoS=0).\n");
+}
+
+BOOST_AUTO_TEST_CASE(g1_processblock_parent_authority_failure_fails_closed)
+{
+    G1Fixture fx(4);
+    BlockIndexV2Reader reader;
+    BlockIndexV2ReaderOptions opts;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reader.Open(fx.rootStr, opts, &error), error);
+    BlockIndexAuthoritativeLive live;
+    BOOST_REQUIRE_MESSAGE(live.Open(fx.rootStr, &reader, 2048, &error), error);
+    const uint256 prev = fx.baseActive[fx.baseTip]; // S; authority-known, NOT in mapBlockIndex
+    BOOST_CHECK_EQUAL(mapBlockIndex.count(prev), (size_t)0);
+    {
+        // Precondition: the parent IS resolvable by value while the authority is healthy.
+        BlockIndexAuthoritativeParentInfo check;
+        BOOST_REQUIRE(live.ResolveParentInfo(prev, &check, &error) ==
+                      BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND);
+    }
+
+    std::unique_ptr<CBlock> block(BuildCheckBlockPassingPoWBallast(prev, 0x7A11));
+    BOOST_REQUIRE(block.get() != NULL);
+    BOOST_REQUIRE(block->CheckBlock(true, true, true));
+    const uint256 child = block->GetHash();
+
+    const bool savedAuth = g_fAuthoritativeStartup;
+    SetAuthoritativeLiveForTesting(&live);
+    g_fAuthoritativeStartup = true;
+
+    // Simulate AUTHORITY_UNAVAILABLE on a genuinely-present-by-value parent.
+    live.Close();
+
+    bool fAccepted = false;
+    {
+        LOCK(cs_main);
+        fAccepted = ProcessBlock(NULL, block.get());
+    }
+    const bool fOrphaned = mapOrphanBlocks.count(child) != 0;
+    if (fOrphaned)
+    {
+        std::map<uint256, CBlock*>::iterator it = mapOrphanBlocks.find(child);
+        if (it != mapOrphanBlocks.end())
+        {
+            delete it->second;
+            mapOrphanBlocks.erase(it);
+        }
+        mapOrphanBlocksByPrev.erase(child);
+    }
+    g_fAuthoritativeStartup = savedAuth;
+    ClearAuthoritativeLiveForTesting();
+
+    BOOST_CHECK_MESSAGE(
+        !fAccepted,
+        "authority-unavailable parent MUST fail closed: ProcessBlock must return false");
+    BOOST_CHECK_MESSAGE(
+        !fOrphaned,
+        "authority-unavailable parent MUST NOT be admitted to mapOrphanBlocks");
+
+    live.Close();
+    reader.Close();
+    printf("G1 ORPHAN-CONTRACT: authority-unavailable parent fails closed"
+           " (ProcessBlock=false, no orphan admission).\n");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

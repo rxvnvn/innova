@@ -2471,6 +2471,7 @@ const char* ProcessBlockRejectReasonName(ProcessBlockRejectReason reason)
     case PBREJECT_OPERATOR_INVALIDATED: return "OPERATOR_INVALIDATED";
     case PBREJECT_ACCEPTBLOCK_FALSE: return "ACCEPTBLOCK_FALSE";
     case PBREJECT_UNKNOWN_FALSE: return "UNKNOWN_FALSE";
+    case PBREJECT_AUTHORITY_UNAVAILABLE: return "AUTHORITY_UNAVAILABLE";
     }
     return "UNKNOWN_FALSE";
 }
@@ -9903,15 +9904,30 @@ bool CBlock::AcceptBlock()
         BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
         if (!live || !live->IsOpen())
         {
-            // Fail closed: authoritative live authority expected but absent.
+            // Authority unavailability is a local infrastructure failure, never
+            // evidence of peer-invalid input.  Fail closed without DoS.
             TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
-            return DoS(100, error("AcceptBlock() : authoritative live parent resolution unavailable"));
+            return error("AcceptBlock() : authoritative live parent resolution unavailable");
         }
-        // Resolve the parent by value (base V2 or mutable tip).
-        int parentHeight = -1;
+        // Resolve the parent by value (base V2 or mutable tip).  Do not use the
+        // legacy bool wrapper here: it collapses DEFINITELY_ABSENT and
+        // AUTHORITY_UNAVAILABLE, which can turn a local second-lookup failure
+        // into DoS against the delivering peer.
+        BlockIndexAuthoritativeParentInfo parentInfo;
         std::string perr;
-        if (!live->ResolveParent(hashPrevBlock, &parentHeight, &perr))
+        const BlockIndexAuthoritativeParentStatus parentStatus =
+            live->ResolveParentInfo(hashPrevBlock, &parentInfo, &perr);
+        if (parentStatus == BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE)
         {
+            ObserveProcessBlockParent(*this, PROCESSBLOCK_PARENT_ACCEPT_PARENT_BOOL_FALSE, true, false, &perr);
+            TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
+            return error("AcceptBlock() : authoritative parent resolution unavailable: %s", perr.c_str());
+        }
+        if (parentStatus != BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND &&
+            parentStatus != BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_ACTIVE)
+        {
+            // This is the only definite-absence outcome. Preserve the legacy
+            // missing-parent peer-invalid handling for it.
             ObserveProcessBlockParent(*this, PROCESSBLOCK_PARENT_ACCEPT_PARENT_BOOL_FALSE, true, false, &perr);
             TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
             return DoS(10, error("AcceptBlock() : prev block not found (authoritative, non-resident): %s", perr.c_str()));
@@ -9925,10 +9941,11 @@ bool CBlock::AcceptBlock()
         if (!matParent)
         {
             ObserveProcessBlockParent(*this, PROCESSBLOCK_PARENT_ACCEPT_PARENT_MATERIALIZATION_FAILURE, true, true, &perr);
-            // On mainnet the base tip anchor is already resident; a missing
-            // materialization is a genuine authority failure -> fail closed.
+            // A materialization failure after a typed-known parent is an
+            // authority failure, not peer-invalid input.  Fail closed without
+            // carrying DoS into the P2P handler.
             TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
-            return DoS(100, error("AcceptBlock() : authoritative parent materialization failed: %s", perr.c_str()));
+            return error("AcceptBlock() : authoritative parent materialization failed: %s", perr.c_str());
         }
         ObserveProcessBlockParent(*this, PROCESSBLOCK_PARENT_ACCEPT_PARENT_MATERIALIZED, true, true, &perr);
         pindexPrev = matParent;
@@ -10790,19 +10807,59 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     // block is orphaned exactly as before.
     bool fParentLookupAttempted = false;
     bool fAuthoritativeParentResolved = false;
+    bool fAuthoritativeParentAuthorityFailure = false;
     if (g_fAuthoritativeStartup && !mapBlockIndex.count(pblock->hashPrevBlock))
     {
         BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        BlockIndexAuthoritativeParentStatus parentStatus =
+            BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE;
+        std::string perr;
         if (live && live->IsOpen())
         {
-            std::string perr;
-            fAuthoritativeParentResolved = live->ResolveParent(pblock->hashPrevBlock, NULL, &perr);
-            fParentLookupAttempted = true;
-            ObserveProcessBlockParent(*pblock, PROCESSBLOCK_PARENT_BOOL_RESULT, true, fAuthoritativeParentResolved, &perr);
+            // Typed by-value classification (blockindex_authoritative_live.h):
+            //   FOUND     -> parent known (resident OR nonresident canonical)
+            //   NOT_FOUND -> parent DEFINITELY ABSENT -> genuine orphan
+            //   FAILURE   -> parent existence UNAVAILABLE -> MUST fail closed
+            // This replaces the previously-collapsed bool ResolveParent, which
+            // folded an authority failure into 'genuine orphan' (fail-open).
+            BlockIndexAuthoritativeParentInfo parentInfo;
+            parentStatus =
+                live->ResolveParentInfo(pblock->hashPrevBlock, &parentInfo, &perr);
         }
+        else
+        {
+            perr = "authoritative-live: parent authority unavailable";
+        }
+        fParentLookupAttempted = true;
+        fAuthoritativeParentResolved =
+            (parentStatus == BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND ||
+             parentStatus == BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_ACTIVE);
+        fAuthoritativeParentAuthorityFailure =
+            (parentStatus == BLOCK_INDEX_AUTHORITATIVE_PARENT_FAILURE);
+        ObserveProcessBlockParent(*pblock, PROCESSBLOCK_PARENT_BOOL_RESULT,
+                                  true, fAuthoritativeParentResolved, &perr);
     }
     if (!fParentLookupAttempted)
         ObserveProcessBlockParent(*pblock, PROCESSBLOCK_PARENT_BOOL_RESULT);
+
+    // ---- G1: fail closed on AUTHORITY_UNAVAILABLE ----
+    // A parent whose existence the authority could not determine (not open,
+    // storage/I-O error, generation/source-token mismatch, corrupt record) is
+    // NOT a genuine orphan. Admitting the child into mapOrphanBlocks would
+    // strand it forever (there is NO by-value orphan retry — only P2P parent
+    // arrival re-runs the orphan loop) and would incorrectly ask peers to
+    // re-deliver a block the node already holds authoritatively. Reject this
+    // block WITHOUT peer penalty; it may be reprocessed once the authority
+    // recovers. This keeps AUTHORITY != MATERIALIZATION != definite ABSENCE
+    // distinct on the parent-existence gate.
+    if (fAuthoritativeParentAuthorityFailure)
+    {
+        TraceProcessBlockReject(pfrom, pblock, PBREJECT_AUTHORITY_UNAVAILABLE);
+        ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
+        return error("ProcessBlock() : authoritative parent resolution unavailable for prev=%s",
+                     pblock->hashPrevBlock.ToString().substr(0, 20).c_str());
+    }
+
     if (!mapBlockIndex.count(pblock->hashPrevBlock) && !fAuthoritativeParentResolved) //pblock->hashPrevBlock != 0 &&
     {
         if (fDebug)
