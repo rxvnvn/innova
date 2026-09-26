@@ -3184,4 +3184,775 @@ BOOST_FIXTURE_TEST_CASE(a9a3j_checkstake_missing_parent_no_insertion, ProdFixtur
 
 } // namespace (A.9a.3g helpers)
 
+// ===========================================================================
+// F1 — authoritative stake-modifier BY-VALUE cutover: parity, RED->GREEN and
+// failure semantics.
+//
+// ONE logical chain is materialized twice:
+//   * a resident CBlockIndex graph registered in mapBlockIndex (the legacy
+//     world), optionally TRUNCATED at a retained floor whose pprev == NULL,
+//     which is exactly the production authoritative window shape;
+//   * a V2 generation whose records mirror the same logical chain.
+// Production ComputeNextStakeModifier is then executed twice over the same
+// chain: navigator cleared (legacy resident provider) and navigator retained
+// (authoritative by-value provider). Wherever the legacy provider can produce a
+// result, the by-value provider must produce the IDENTICAL (modifier, flag);
+// where the legacy provider fails or silently truncates, the by-value provider
+// must still be exact.
+// ===========================================================================
+namespace f1cutover {
+
+struct F1Spec
+{
+    int nBlocks;          // heights 0..nBlocks-1
+    int64_t nTime0;
+    int64_t nSpacing;
+    int nSeam;            // generation covers 0..nSeam
+    int nFloor;           // resident window starts here (0 == fully resident)
+
+    F1Spec(int nBlocks_, int64_t nSpacing_, int nFloor_ = 0, int nSeam_ = -1,
+           int64_t nTime0_ = 1000)
+        : nBlocks(nBlocks_), nTime0(nTime0_), nSpacing(nSpacing_),
+          nSeam(nSeam_ < 0 ? (nBlocks_ - 1) : nSeam_), nFloor(nFloor_) {}
+};
+
+// Deterministic chain: generated modifier on genesis + every 3rd block;
+// alternating PoS/PoW with a real entropy-bit mix, so both the PoS >>32
+// selection adjustment and the entropy extraction are exercised.
+static bool F1Gen(int h) { return (h == 0 || h % 3 == 0); }
+static unsigned int F1Flags(int h)
+{
+    unsigned int f = 0;
+    if (h % 2 == 1)
+    {
+        f |= CBlockIndex::BLOCK_PROOF_OF_STAKE;
+        f |= CBlockIndex::BLOCK_STAKE_ENTROPY;   // entropy bit 1
+    }
+    if (F1Gen(h))
+        f |= CBlockIndex::BLOCK_STAKE_MODIFIER;
+    return f;
+}
+static uint256 F1Hash(int h) { return uint256(0xF10000 + h); }
+
+struct F1Fixture
+{
+    boost::filesystem::path root;
+    std::map<uint256, CBlockIndex*> savedMap;
+    CBlockIndex* savedBest; CBlockIndex* savedGenesis;
+    uint256 savedHashBest; uint256 savedTrust; int savedHeight;
+    std::vector<CBlockIndex*> created;
+    std::vector<boost::filesystem::path> roots;
+    F1Spec spec;
+
+    F1Fixture() : savedBest(pindexBest), savedGenesis(pindexGenesisBlock),
+        savedHashBest(hashBestChain), savedTrust(nBestChainTrust),
+        savedHeight(nBestHeight), spec(40, 600)
+    {
+        ClearBlockIndexAccessorState(); ClearFindBlockByHeightCache();
+        savedMap.swap(mapBlockIndex);
+        pindexBest = NULL; pindexGenesisBlock = NULL; hashBestChain = 0;
+        nBestChainTrust = 0; nBestHeight = -1;
+    }
+    ~F1Fixture()
+    {
+        ClearBlockIndexStakingNavigator();
+        ClearBlockIndexAccessorState(); ClearFindBlockByHeightCache();
+        pindexBest = savedBest; pindexGenesisBlock = savedGenesis;
+        hashBestChain = savedHashBest; nBestChainTrust = savedTrust; nBestHeight = savedHeight;
+        for (size_t i = 0; i < created.size(); ++i) { delete created[i]->phashBlock; delete created[i]; }
+        mapBlockIndex.clear(); savedMap.swap(mapBlockIndex);
+        ClearBlockIndexAccessorState(); ClearFindBlockByHeightCache();
+        for (size_t i = 0; i < roots.size(); ++i)
+            boost::filesystem::remove_all(BlockIndexGenerationManager::GenerationPath(roots[i].string(), 1));
+    }
+
+    void Build(const F1Spec& s)
+    {
+        spec = s;
+        // (1) V2 generation mirroring the SAME logical chain (0..nSeam).
+        BlockIndexGenerationSource prefix;
+        for (int h = 0; h <= s.nSeam; ++h)
+        {
+            BlockIndexRecord r;
+            r.hash = F1Hash(h);
+            r.hashPrev = (h == 0) ? uint256(0) : F1Hash(h - 1);
+            r.height = h; r.nVersion = 1;
+            r.nTime = (unsigned int)(s.nTime0 + (int64_t)h * s.nSpacing);
+            r.nBits = 0x1d00ffff;
+            r.nFlags = F1Flags(h);
+            r.nStakeModifier = 100 + h;
+            r.hashProof = uint256(0xA0000 + h);
+            // Mirror the store's record validation: a PoS record must carry a
+            // non-zero nStakeTime (and no PoW record may carry one).
+            if (h % 2 == 1)
+            {
+                r.prevoutStake = COutPoint(F1Hash(h), 0);
+                r.nStakeTime = (unsigned int)(s.nTime0 + (int64_t)h * s.nSpacing);
+            }
+            BlockIndexGenerationSourceRecord q; q.hash = r.hash; q.record = r;
+            prefix.records.push_back(q);
+        }
+        prefix.hashBestChain = F1Hash(s.nSeam); prefix.foundBestChain = true;
+        root = UniqueRoot();
+        roots.push_back(root);
+        BlockIndexGenerationBuilder builder; BlockIndexGenerationStats stats; std::string cerr;
+        BOOST_REQUIRE_MESSAGE(builder.Build(prefix,
+            (root / BlockIndexGenerationManager::GenerationName(1)).string(), 1, &stats, &cerr), cerr);
+        builder.Close();
+        BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &cerr) == BLOCK_INDEX_LIFECYCLE_OK, cerr);
+
+        // (2) Resident CBlockIndex graph, TRUNCATED at the retained floor: the
+        // floor block has pprev == NULL exactly like production's window.
+        CBlockIndex* prev = NULL;
+        for (int h = s.nFloor; h < s.nBlocks; ++h)
+        {
+            CBlockIndex* p = new CBlockIndex();
+            p->phashBlock = new uint256(F1Hash(h));
+            p->nHeight = h; p->pprev = prev;
+            p->nTime = (unsigned int)(s.nTime0 + (int64_t)h * s.nSpacing);
+            p->nFlags = F1Flags(h);
+            p->nStakeModifier = 100 + h;
+            p->hashProof = uint256(0xA0000 + h);
+            if (h % 2 == 1)
+            {
+                p->prevoutStake = COutPoint(F1Hash(h), 0);
+                p->nStakeTime = (unsigned int)(s.nTime0 + (int64_t)h * s.nSpacing);
+            }
+            if (prev) prev->pnext = p;
+            created.push_back(p);
+            mapBlockIndex[p->GetBlockHash()] = p;
+            prev = p;
+        }
+        pindexGenesisBlock = created[0];
+        pindexBest = created.back();
+        hashBestChain = pindexBest->GetBlockHash();
+        nBestHeight = pindexBest->nHeight;
+        nBestChainTrust = pindexBest->nChainTrust;
+    }
+
+    CBlockIndex* At(int h) const
+    {
+        for (size_t i = 0; i < created.size(); ++i)
+            if (created[i]->nHeight == h)
+                return created[i];
+        return NULL;
+    }
+
+    // Run production ComputeNextStakeModifier over heights [nFrom..nTo] with the
+    // legacy resident provider (fByValue=false) or the authoritative by-value
+    // provider (fByValue=true). Failed heights are recorded separately so a
+    // caller can distinguish "wrong value" from "returned false".
+    void Run(bool fByValue, int nFrom, int nTo,
+             std::vector<std::pair<uint64_t,bool> >& out, std::vector<int>& vFailed)
+    {
+        out.clear(); vFailed.clear();
+        if (fByValue)
+        {
+            std::string e;
+            BOOST_REQUIRE_MESSAGE(RetainBlockIndexStakingNavigator(root.string(), &e), e);
+            BOOST_REQUIRE(GetBlockIndexStakingNavigator() != NULL);
+        }
+        else
+        {
+            BOOST_REQUIRE(GetBlockIndexStakingNavigator() == NULL);
+        }
+        const size_t nMapBefore = mapBlockIndex.size();
+        LOCK(cs_main);
+        for (int h = nFrom; h <= nTo; ++h)
+        {
+            CBlockIndex* pprev = (h == 0) ? NULL : At(h - 1);
+            BOOST_REQUIRE(pprev != NULL || h == 0);
+            uint64_t mod = 0; bool gen = false;
+            if (!ComputeNextStakeModifier(pprev, mod, gen))
+                vFailed.push_back(h);
+            out.push_back(std::make_pair(mod, gen));
+        }
+        // F1 boundedness: the by-value provider must not insert anything into
+        // mapBlockIndex (no residency growth, no mapBlockIndex authority).
+        BOOST_CHECK_EQUAL(mapBlockIndex.size(), nMapBefore);
+    }
+};
+
+// Build a fresh fixture for one scenario and run it; the fixture destructor
+// releases the generation, the navigator and the resident graph.
+static void RunScenario(const F1Spec& s, bool fByValue, int nFrom, int nTo,
+                        std::vector<std::pair<uint64_t,bool> >& out, std::vector<int>& vFailed)
+{
+    F1Fixture fx;
+    fx.Build(s);
+    fx.Run(fByValue, nFrom, nTo, out, vFailed);
+}
+
+} // namespace f1cutover
+
+using namespace f1cutover;
+
+// F1(a)+F1(b) PARITY: on a FULLY RESIDENT chain the authoritative by-value
+// provider must return exactly the legacy modifier and generated flag for every
+// tested height (pre-first-modifier, modifier boundaries, several intervals).
+BOOST_AUTO_TEST_CASE(f1_fully_resident_legacy_byvalue_parity)
+{
+    unsigned int saveInterval = nModifierInterval, saveSpacing = nTargetSpacing;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        std::vector<F1Spec> specs;
+        specs.push_back(F1Spec(40, 600, 0));   // 600 s spacing
+        specs.push_back(F1Spec(130, 15, 0));   // 15 s spacing
+        specs.push_back(F1Spec(65, 1, 0));     // 1 s spacing
+        for (size_t k = 0; k < specs.size(); ++k)
+        {
+            std::vector<std::pair<uint64_t,bool> > legacy, byval;
+            std::vector<int> fL, fB;
+            RunScenario(specs[k], false, 1, specs[k].nBlocks - 1, legacy, fL);
+            RunScenario(specs[k], true,  1, specs[k].nBlocks - 1, byval, fB);
+            BOOST_TEST_MESSAGE("F1 parity spec#" << k << " spacing=" << specs[k].nSpacing
+                << " blocks=" << specs[k].nBlocks << " legacy_fail=" << fL.size()
+                << " byvalue_fail=" << fB.size());
+            BOOST_CHECK_EQUAL(fL.size(), 0U);
+            BOOST_CHECK_EQUAL(fB.size(), 0U);
+            BOOST_REQUIRE_EQUAL(legacy.size(), byval.size());
+            for (size_t i = 0; i < legacy.size(); ++i)
+            {
+                BOOST_CHECK(legacy[i].first == byval[i].first);
+                BOOST_CHECK(legacy[i].second == byval[i].second);
+            }
+        }
+    }
+    catch (...) { nModifierInterval = saveInterval; nTargetSpacing = saveSpacing; throw; }
+    nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+}
+
+// RED F1-R1 + GREEN: a retained window that contains NO generated-modifier
+// block. The legacy pointer walk stops at the floor (pprev == NULL) and fails
+// with "no generation at genesis block"; the authoritative by-value provider
+// descends below the floor BY VALUE and returns the exact modifier a fully
+// resident chain produces.
+BOOST_AUTO_TEST_CASE(f1_retained_floor_last_modifier_byvalue_recovers)
+{
+    unsigned int saveInterval = nModifierInterval, saveSpacing = nTargetSpacing;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        // Floor 10 => resident window {10,11}; generated ancestors exist only
+        // below the floor (9, 6, 3, 0). The cold store covers the whole logical
+        // chain (as production's does: the retained floor sits BELOW the cold
+        // tip), so the by-value walk can descend through the floor.
+        const int nFloor = 10;
+        const int nBlocks = nFloor + 2;
+        const int nSeam = nBlocks - 1;
+        const F1Spec truncated(nBlocks, 600, nFloor, nSeam);
+        const F1Spec full(nBlocks, 600, 0, nSeam);
+
+        std::vector<std::pair<uint64_t,bool> > ref, byval;
+        std::vector<int> fRef, fByval;
+        RunScenario(full, false, nBlocks - 1, nBlocks - 1, ref, fRef);
+        BOOST_CHECK_EQUAL(fRef.size(), 0U);
+        RunScenario(truncated, true, nBlocks - 1, nBlocks - 1, byval, fByval);
+        BOOST_CHECK_EQUAL(fByval.size(), 0U);
+
+        // GREEN: the by-value result equals the fully resident reference.
+        BOOST_REQUIRE_EQUAL(ref.size(), 1U);
+        BOOST_REQUIRE_EQUAL(byval.size(), 1U);
+        BOOST_TEST_MESSAGE("F1 by-value at h=" << (nBlocks - 1)
+            << " modifier=0x" << std::hex << byval[0].first << std::dec
+            << " generated=" << byval[0].second);
+        BOOST_CHECK(ref[0].first == byval[0].first);
+        BOOST_CHECK(ref[0].second == byval[0].second);
+
+        // RED (recorded, not weakened): the legacy resident provider CANNOT
+        // resolve the modifier on the same truncated window.
+        std::vector<std::pair<uint64_t,bool> > truncLegacy;
+        std::vector<int> fTrunc;
+        RunScenario(truncated, false, nBlocks - 1, nBlocks - 1, truncLegacy, fTrunc);
+        BOOST_TEST_MESSAGE("RED F1-R1 legacy retained-floor failures=" << fTrunc.size());
+        BOOST_CHECK_EQUAL(fTrunc.size(), 1U);
+        BOOST_CHECK_EQUAL(truncLegacy[0].first, (uint64_t)0);
+    }
+    catch (...) { nModifierInterval = saveInterval; nTargetSpacing = saveSpacing; throw; }
+    nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+}
+
+// GREEN, depth adversarial: the authoritative result must NOT depend on the
+// retained window depth (production WALK = nMedianTimeSpan + 2 = 13). For a
+// range of retained floors - shallow, 13/14/64/65/deep - and spacings (1 s,
+// 5 s, 15 s, 120 s) the by-value modifier must equal the fully resident legacy
+// reference. Truncated-legacy results are recorded as RED evidence.
+BOOST_AUTO_TEST_CASE(f1_byvalue_independent_of_retained_floor_depth_and_spacing)
+{
+    unsigned int saveInterval = nModifierInterval, saveSpacing = nTargetSpacing;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        struct Cfg { int nBlocks; int64_t nSpacing; int nFloor; int nSeam; };
+        std::vector<Cfg> cfgs;
+        {
+            const Cfg base[] = {
+                { 40,  600, 30,  -1 },  // shallow: 10 resident blocks, full cold prefix
+                { 130, 600, 100, -1 },  // deep historical window
+                { 65,  1,   50,  -1 },  // 1 s spacing: window spans ~2113 blocks
+                { 130, 15,  64,  -1 },  // 15 s spacing, floor at 64
+                { 130, 15,  65,  -1 },  // 15 s spacing, floor at 65
+                { 300, 5,   200, -1 },  // 5 s spacing, deep floor
+                { 200, 120, 13,  -1 },  // 120 s spacing, floor at 13
+                { 40,  600, 20,  30 },  // cold->hot seam crossing mid-walk (31..39 hot-only)
+            };
+            for (size_t i = 0; i < sizeof(base) / sizeof(base[0]); ++i)
+                cfgs.push_back(base[i]);
+            // MANDATED DEPTH/SPACING MATRIX (audit: depth 14/128/512/>1000 were not
+            // covered). Cross product of floors crossing the production retained
+            // window depth (WALK = 13) with every supported fixture spacing. The
+            // resident span (4 blocks) keeps the chain-time window OPEN at the floor
+            // for every spacing (3 gaps * 600 s < nSelectionInterval), so each row
+            // really does continue the window BELOW the retained floor by value.
+            const int nDepths[] = { 13, 14, 64, 65, 128, 512, 1024 };
+            const int64_t nSpacings[] = { 1, 15, 120, 600 };
+            for (size_t di = 0; di < sizeof(nDepths) / sizeof(nDepths[0]); ++di)
+                for (size_t si = 0; si < sizeof(nSpacings) / sizeof(nSpacings[0]); ++si)
+                {
+                    Cfg c; c.nBlocks = nDepths[di] + 4; c.nSpacing = nSpacings[si];
+                    c.nFloor = nDepths[di]; c.nSeam = -1;
+                    cfgs.push_back(c);
+                }
+        }
+        const int nCfgs = (int)cfgs.size();
+        size_t nRedFail = 0, nRedSilentWrong = 0;
+        for (int c = 0; c < nCfgs; ++c)
+        {
+            const int nSeam = (cfgs[c].nSeam < 0) ? (cfgs[c].nBlocks - 1) : cfgs[c].nSeam;
+            const F1Spec full(cfgs[c].nBlocks, cfgs[c].nSpacing, 0, nSeam);
+            const F1Spec trunc(cfgs[c].nBlocks, cfgs[c].nSpacing, cfgs[c].nFloor, nSeam);
+            const int nFrom = cfgs[c].nFloor + 1;
+            const int nTo = cfgs[c].nBlocks - 1;
+
+            std::vector<std::pair<uint64_t,bool> > ref, byval, truncLegacy;
+            std::vector<int> fRef, fByval, fTrunc;
+            RunScenario(full, false, nFrom, nTo, ref, fRef);
+            RunScenario(trunc, true, nFrom, nTo, byval, fByval);
+            RunScenario(trunc, false, nFrom, nTo, truncLegacy, fTrunc);
+
+            // RED accounting: heights where the truncated resident window is NOT
+            // equivalent to the full-history reference - either the legacy walk
+            // failed, or it SILENTLY produced a different modifier (the
+            // correctness-critical case, caught only by checkpoints).
+            size_t nTruncWrong = 0, nTruncSilentWrong = 0;
+            for (size_t i = 0; i < ref.size(); ++i)
+            {
+                bool fFailed = false;
+                for (size_t k = 0; k < fTrunc.size(); ++k)
+                    if (fTrunc[k] == nFrom + (int)i) { fFailed = true; break; }
+                if (fFailed) { ++nTruncWrong; continue; }
+                if (truncLegacy[i].first != ref[i].first || truncLegacy[i].second != ref[i].second)
+                { ++nTruncWrong; ++nTruncSilentWrong; }
+            }
+            nRedFail += fTrunc.size();
+            nRedSilentWrong += nTruncSilentWrong;
+
+            BOOST_TEST_MESSAGE("F1 depth spec#" << c << " spacing=" << cfgs[c].nSpacing
+                << " floor=" << cfgs[c].nFloor << " legacy_fail=" << fRef.size()
+                << " byvalue_fail=" << fByval.size() << " truncated_legacy_fail=" << fTrunc.size()
+                << " truncated_wrong=" << nTruncWrong << " truncated_SILENT_wrong=" << nTruncSilentWrong);
+            BOOST_CHECK_EQUAL(fRef.size(), 0U);
+            BOOST_CHECK_EQUAL(fByval.size(), 0U);
+            BOOST_REQUIRE_EQUAL(ref.size(), byval.size());
+            for (size_t i = 0; i < ref.size(); ++i)
+            {
+                BOOST_CHECK(ref[i].first == byval[i].first);
+                BOOST_CHECK(ref[i].second == byval[i].second);
+            }
+        }
+        // RED (recorded, not weakened): the legacy resident provider is NOT
+        // equivalent on truncated windows, and at least one of those divergences
+        // is SILENT (a different modifier with no error).
+        BOOST_TEST_MESSAGE("RED F1-R3 aggregate: legacy_failures=" << nRedFail
+            << " silent_wrong_modifiers=" << nRedSilentWrong);
+        BOOST_CHECK_GT(nRedFail + nRedSilentWrong, (size_t)0);
+        BOOST_CHECK_GT(nRedSilentWrong, (size_t)0);
+    }
+    catch (...) { nModifierInterval = saveInterval; nTargetSpacing = saveSpacing; throw; }
+    nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+}
+
+// F1 AUDIT BLOCKER 2 - FLOOR PROVENANCE (RED/GREEN).
+//
+// The hybrid collector reaches the retained floor (pprev == NULL) while the
+// chain-time candidate window is still OPEN and resolves it with
+// ColdHotSeamNavigator::ResolveLogicalR, which is COLD-FIRST WITH A HOT
+// FALLBACK. A hot resolution is the LegacyBlockIndexAccessor over
+// mapBlockIndex, and it encodes the floor's own pprev == NULL as
+// hashPrev == 0 / hasParent == false (blockindex_accessor.cpp:74-78) - i.e.
+// "resident pointer ancestry ended", which is NOT "logical canonical chain
+// ended". Interpreting that as genesis silently TRUNCATES the candidate window
+// (min(64, size) lowers the round count) and yields a different modifier with
+// no error at all.
+//
+// Fixture: the cold generation covers heights 0..19 only, while the resident
+// chain covers 20..39 with the floor at 20 (pprev == NULL). The floor is
+// therefore a HOT resolution that reports hashPrev == 0, while the authority
+// PROVABLY holds the ancestry below the floor (block 19 resolves cold) - the
+// exact blocker shape the audit rejected.
+//
+// OLD behaviour: the truncated window was accepted as complete -> success with
+// a modifier that diverges from the fully resident oracle.
+// NEW behaviour: a floor whose provenance is not cold-authoritative may never be
+// used to infer the end of the chain, so the authoritative provider FAILS
+// CLOSED.
+BOOST_AUTO_TEST_CASE(f1_hot_floor_hashprev_zero_fails_closed_without_cold_provenance)
+{
+    unsigned int saveInterval = nModifierInterval, saveSpacing = nTargetSpacing;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        const int nFloor = 20, nBlocks = 40, nSeam = nFloor - 1; // cold stops BELOW the floor
+        const F1Spec blocked(nBlocks, 15, nFloor, nSeam);
+        const F1Spec oracleSpec(nBlocks, 15, 0, nBlocks - 1);    // same logical chain, fully resident
+        const int nFrom = nFloor + 1, nTo = nBlocks - 1;
+
+        // Fully resident oracle (legacy provider) over the SAME logical chain.
+        std::vector<std::pair<uint64_t,bool> > oracle;
+        std::vector<int> fOracle;
+        RunScenario(oracleSpec, false, nFrom, nTo, oracle, fOracle);
+        BOOST_CHECK_EQUAL(fOracle.size(), 0U);
+        BOOST_REQUIRE_EQUAL(oracle.size(), (size_t)(nTo - nFrom + 1));
+
+        // Blocked world: navigator retained, cold authority cannot reach the floor.
+        F1Fixture fx;
+        fx.Build(blocked);
+        std::string e;
+        BOOST_REQUIRE_MESSAGE(RetainBlockIndexStakingNavigator(fx.root.string(), &e), e);
+        BOOST_REQUIRE(GetBlockIndexStakingNavigator() != NULL);
+
+        // Direct evidence of the blocker shape: the floor is a HOT resolution
+        // reporting hashPrev == 0, while the ancestry below it IS cold-provable.
+        {
+            LOCK(cs_main);
+            const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+            BOOST_REQUIRE(nav != NULL);
+            std::string perr;
+            ColdHotSeamSnapshot floorSnap;
+            const ColdHotSeamResult fr = nav->ResolveLogicalR(
+                BlockIndexLogicalId(F1Hash(nFloor)), &floorSnap, &perr);
+            BOOST_REQUIRE_MESSAGE(fr == COLD_HOT_SEAM_OK, perr);
+            ColdHotSeamSnapshot below;
+            const ColdHotSeamResult br = nav->ResolveLogicalR(
+                BlockIndexLogicalId(F1Hash(nFloor - 1)), &below, &perr);
+            BOOST_REQUIRE_MESSAGE(br == COLD_HOT_SEAM_OK, perr);
+            BOOST_TEST_MESSAGE("F1 floor provenance: floor h=" << nFloor
+                << " domain=" << (floorSnap.ref.IsCold() ? "COLD" : (floorSnap.ref.IsHot() ? "HOT" : "INVALID"))
+                << " hashPrev=" << floorSnap.snapshot.hashPrev.ToString()
+                << " hasParent=" << floorSnap.snapshot.hasParent
+                << "; h=" << (nFloor - 1) << " domain=" << (below.ref.IsCold() ? "COLD" : "HOT"));
+            BOOST_CHECK(floorSnap.ref.IsHot());                      // hot floor, NOT cold-authoritative
+            BOOST_CHECK(floorSnap.snapshot.hashPrev == uint256(0));  // mislabelled as logical genesis
+            BOOST_CHECK(!floorSnap.snapshot.hasParent);
+            BOOST_CHECK(below.ref.IsCold());                         // authority PROVES ancestry continues
+        }
+
+        const size_t nMapBefore = mapBlockIndex.size();
+        size_t nSucceeded = 0, nFailClosed = 0, nSilentDivergence = 0;
+        std::string sFailClosed;
+        {
+            LOCK(cs_main);
+            for (int h = nFrom; h <= nTo; ++h)
+            {
+                CBlockIndex* pprev = fx.At(h - 1);
+                BOOST_REQUIRE(pprev != NULL);
+                uint64_t mod = 1; bool gen = true;
+                const bool ok = ComputeNextStakeModifier(pprev, mod, gen);
+                const size_t i = (size_t)(h - nFrom);
+                if (ok)
+                {
+                    ++nSucceeded;
+                    if (mod != oracle[i].first || gen != oracle[i].second)
+                        ++nSilentDivergence;
+                }
+                else
+                {
+                    ++nFailClosed;
+                    BOOST_CHECK_EQUAL(mod, 0U);   // fail-closed output discipline
+                    BOOST_CHECK(!gen);
+                    sFailClosed += (sFailClosed.empty() ? "" : ",") + std::to_string(h);
+                }
+            }
+            BOOST_CHECK_EQUAL(mapBlockIndex.size(), nMapBefore);
+        }
+        BOOST_TEST_MESSAGE("F1 floor provenance: succeeded=" << nSucceeded
+            << " fail_closed=" << nFailClosed << " silent_divergence=" << nSilentDivergence
+            << " fail_closed_heights={" << sFailClosed << "}");
+        // NEW CONTRACT: an unproven hot floor may not terminate the chain. No
+        // result may silently diverge from the oracle, and the provenance gate
+        // must actually engage (at least one height FAILS CLOSED).
+        BOOST_CHECK_EQUAL(nSilentDivergence, (size_t)0);
+        BOOST_CHECK_GT(nFailClosed, (size_t)0);
+    }
+    catch (...) { nModifierInterval = saveInterval; nTargetSpacing = saveSpacing; throw; }
+    nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+}
+
+// F1 AUDIT BLOCKER 2 - VALID OPPOSITE CONTROL.
+//
+// A floor resolved from the cold authoritative source whose by-value parent edge
+// is hashPrev == 0 IS a canonical genesis/end-of-chain. It must TERMINATE
+// NORMALLY, not fail closed. Chain 0..99 is fully resident AND fully cold, so
+// the residency floor is genesis itself (pprev == NULL at height 0) and the
+// chain-time window is still open there (99 * 15 s < nSelectionInterval): every
+// tested height reaches phase 2 at genesis with a COLD-proven hashPrev == 0 and
+// must still equal the fully resident legacy reference exactly.
+BOOST_AUTO_TEST_CASE(f1_cold_proven_genesis_floor_terminates_normally)
+{
+    unsigned int saveInterval = nModifierInterval, saveSpacing = nTargetSpacing;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        const int nBlocks = 100, nSeam = nBlocks - 1;
+        const F1Spec spec(nBlocks, 15, 0, nSeam);   // fully resident AND fully cold
+        const int nFrom = 1, nTo = nBlocks - 1;
+
+        std::vector<std::pair<uint64_t,bool> > ref, byval;
+        std::vector<int> fRef, fBy;
+        RunScenario(spec, false, nFrom, nTo, ref, fRef);
+        BOOST_CHECK_EQUAL(fRef.size(), 0U);
+        RunScenario(spec, true, nFrom, nTo, byval, fBy);
+        // A cold-proven hashPrev == 0 floor must NOT be a false failure.
+        BOOST_CHECK_EQUAL(fBy.size(), 0U);
+        BOOST_REQUIRE_EQUAL(ref.size(), byval.size());
+        for (size_t i = 0; i < ref.size(); ++i)
+        {
+            BOOST_CHECK(ref[i].first == byval[i].first);
+            BOOST_CHECK(ref[i].second == byval[i].second);
+        }
+
+        // ...and the genesis floor must really resolve COLD with hashPrev == 0
+        // (the control for the provenance gate above).
+        F1Fixture fx;
+        fx.Build(spec);
+        std::string e;
+        BOOST_REQUIRE_MESSAGE(RetainBlockIndexStakingNavigator(fx.root.string(), &e), e);
+        {
+            LOCK(cs_main);
+            const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+            BOOST_REQUIRE(nav != NULL);
+            std::string perr;
+            ColdHotSeamSnapshot genSnap;
+            const ColdHotSeamResult r = nav->ResolveLogicalR(
+                BlockIndexLogicalId(F1Hash(0)), &genSnap, &perr);
+            BOOST_REQUIRE_MESSAGE(r == COLD_HOT_SEAM_OK, perr);
+            BOOST_TEST_MESSAGE("F1 genesis control: h=0 domain="
+                << (genSnap.ref.IsCold() ? "COLD" : (genSnap.ref.IsHot() ? "HOT" : "INVALID"))
+                << " hashPrev=" << genSnap.snapshot.hashPrev.ToString()
+                << " hasParent=" << genSnap.snapshot.hasParent);
+            BOOST_CHECK(genSnap.ref.IsCold());
+            BOOST_CHECK(genSnap.snapshot.hashPrev == uint256(0));
+            BOOST_CHECK(!genSnap.snapshot.hasParent);
+        }
+    }
+    catch (...) { nModifierInterval = saveInterval; nTargetSpacing = saveSpacing; throw; }
+    nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+}
+
+// F1 FAIL-CLOSED CONTRACT (exact boundary).
+//
+// The hybrid walk consults the authoritative by-value authority exactly when
+// the live chain's pointer walk is exhausted at the residency floor while the
+// walk is still unresolved. Two-sided proof:
+//   * healthy authority -> the cross-floor walk resolves and equals the fully
+//     resident legacy reference (GREEN);
+//   * stale authority -> every such computation FAILS CLOSED: no partial
+//     modifier, no truncated-window result, no silent legacy fallback, and no
+//     mapBlockIndex mutation.
+// Where the live chain alone fully determines the answer (the start block IS a
+// generated-modifier block) no authority call happens at all, which is what
+// keeps fully resident worlds bit-identical to legacy.
+// NOTE: this fixture is deliberately TRUNCATED at the floor, so the legacy
+// resident provider cannot resolve these walks (RED F1-R1) - the fail-closed
+// assertion below therefore also proves there is no silent legacy fallback.
+BOOST_AUTO_TEST_CASE(f1_stale_authority_fails_closed_where_authority_is_required)
+{
+    unsigned int saveInterval = nModifierInterval, saveSpacing = nTargetSpacing;
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        // Resident window 10..13; generated-modifier blocks live at 0,3,6,9,12,
+        // so from the floor every walk must cross it BY VALUE.
+        const int nFloor = 10, nBlocks = 14, nSeam = nBlocks - 1;
+        const F1Spec truncated(nBlocks, 600, nFloor, nSeam);
+        const F1Spec full(nBlocks, 600, 0, nSeam);
+        // Probe height whose pprev (height 11) MUST cross the floor: neither 11
+        // nor 10 carries BLOCK_STAKE_MODIFIER, so the legacy resident walk fails
+        // (RED F1-R1) while the by-value continuation resolves it to the nearest
+        // generated ancestor below the floor (height 9).
+        const int nProbeHeight = nFloor + 2;
+
+        // ---- Control: healthy authority resolves the cross-floor walk exactly.
+        std::vector<std::pair<uint64_t,bool> > ref, byval, truncLegacy;
+        std::vector<int> fRef, fBy, fTrunc;
+        RunScenario(full, false, nProbeHeight, nProbeHeight, ref, fRef);
+        BOOST_CHECK_EQUAL(fRef.size(), 0U);
+        RunScenario(truncated, true, nProbeHeight, nProbeHeight, byval, fBy);
+        BOOST_CHECK_EQUAL(fBy.size(), 0U);
+        BOOST_REQUIRE_EQUAL(ref.size(), 1U);
+        BOOST_REQUIRE_EQUAL(byval.size(), 1U);
+        BOOST_CHECK(ref[0].first == byval[0].first);
+        BOOST_CHECK(ref[0].second == byval[0].second);
+        // RED (recorded, not weakened): the legacy resident provider cannot
+        // resolve the same walk on the truncated window.
+        RunScenario(truncated, false, nProbeHeight, nProbeHeight, truncLegacy, fTrunc);
+        BOOST_TEST_MESSAGE("RED F1-R1 legacy retained-floor failures=" << fTrunc.size());
+        BOOST_CHECK_EQUAL(fTrunc.size(), 1U);
+
+        // ---- Stale authority: retain the navigator pinned to generation 1,
+        // then point CURRENT at an unrelated generation 2 so every by-value
+        // lookup is a stale authority.
+        F1Fixture fx;
+        fx.Build(truncated);
+        std::string e;
+        BOOST_REQUIRE_MESSAGE(RetainBlockIndexStakingNavigator(fx.root.string(), &e), e);
+        BOOST_REQUIRE(GetBlockIndexStakingNavigator() != NULL);
+        {
+            BlockIndexGenerationSource alt;
+            BlockIndexRecord r0;
+            r0.hash = uint256(0x5151); r0.hashPrev = uint256(0); r0.height = 0;
+            r0.nVersion = 1; r0.nTime = 1000; r0.nBits = 0x1d00ffff;
+            r0.nFlags = CBlockIndex::BLOCK_STAKE_MODIFIER; r0.nStakeModifier = 1;
+            r0.hashProof = uint256(0xB0000);
+            BlockIndexGenerationSourceRecord q0; q0.hash = r0.hash; q0.record = r0;
+            alt.records.push_back(q0);
+            alt.hashBestChain = r0.hash; alt.foundBestChain = true;
+            BlockIndexGenerationBuilder b2; BlockIndexGenerationStats st2; std::string e2;
+            BOOST_REQUIRE_MESSAGE(b2.Build(alt,
+                (fx.root / BlockIndexGenerationManager::GenerationName(2)).string(), 2, &st2, &e2), e2);
+            b2.Close();
+            BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(fx.root.string(), 2, &e2) == BLOCK_INDEX_LIFECYCLE_OK, e2);
+            fx.roots.push_back(fx.root);   // clean generation 2 as well
+        }
+        {
+            const size_t nMapBefore = mapBlockIndex.size();
+            LOCK(cs_main);
+            // EXACT BOUNDARY. The authoritative by-value authority is required
+            // precisely where the live pointer walk is exhausted at the
+            // residency floor while the walk is still unresolved:
+            //   * h=10 (the floor itself), h=11 and h=13 must cross the floor
+            //     BY VALUE -> stale authority -> FAIL CLOSED;
+            //   * h=12 -> the start block ITSELF carries BLOCK_STAKE_MODIFIER, so
+            //     the answer is a direct live read, and the interval early return
+            //     (the found modifier time IS the start's own time, same 600 s
+            //     bucket) keeps it out of the candidate window entirely. It is
+            //     resolved EXACTLY from the live chain with NO authority call and
+            //     must therefore still succeed, returning the start modifier with
+            //     fGeneratedStakeModifier == false.
+            std::string sFailClosed, sNoAuthority;
+            for (int h = nFloor; h < nBlocks; ++h)   // pprev = At(h)
+            {
+                CBlockIndex* pprev = fx.At(h);
+                BOOST_REQUIRE(pprev != NULL);
+                uint64_t mod = 0; bool gen = true;
+                if (!ComputeNextStakeModifier(pprev, mod, gen))
+                {
+                    // Fail closed: no partial modifier, no generated flag leaked.
+                    BOOST_CHECK_EQUAL(mod, 0U);
+                    BOOST_CHECK(!gen);
+                    sFailClosed += (sFailClosed.empty() ? "" : ",") + std::to_string(h);
+                }
+                else
+                {
+                    // The authority-free case must be exactly the generated start.
+                    BOOST_CHECK((pprev->nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER) != 0);
+                    BOOST_CHECK_EQUAL(mod, (uint64_t)pprev->nStakeModifier);
+                    BOOST_CHECK(!gen);
+                    sNoAuthority += (sNoAuthority.empty() ? "" : ",") + std::to_string(h);
+                }
+            }
+            BOOST_CHECK_EQUAL(sFailClosed, std::string("10,11,13"));
+            BOOST_CHECK_EQUAL(sNoAuthority, std::string("12"));
+            BOOST_CHECK_EQUAL(mapBlockIndex.size(), nMapBefore);
+            BOOST_TEST_MESSAGE("F1 fail-closed boundary: fail_closed={" << sFailClosed
+                << "} authority_free={" << sNoAuthority << "}");
+        }
+    }
+    catch (...) { nModifierInterval = saveInterval; nTargetSpacing = saveSpacing; throw; }
+    nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+}
+
+// F1 AUTHORITATIVE BOUNDARY: the -stakemodifieropt memo must NEVER bypass the
+// authoritative by-value provider.
+//
+// The memo is an in-memory (chain-own, non-serialized) nStakeModifierTime
+// shortcut whose coherence with the frozen by-value authority is not provable.
+// In non-authoritative mode it is authoritative by design (it is written from the
+// accepted chain's own modifier), so a poisoned memo IS returned there; that is
+// exactly why authoritative mode must not consult it. With a navigator retained
+// the answer must come from the by-value authority, must equal the legacy
+// reference, and must not mutate mapBlockIndex.
+BOOST_AUTO_TEST_CASE(f1_authoritative_memo_cannot_bypass_byvalue_provider)
+{
+    unsigned int saveInterval = nModifierInterval, saveSpacing = nTargetSpacing;
+    const bool hadOpt = mapArgs.count("-stakemodifieropt") != 0;
+    const std::string oldOpt = hadOpt ? mapArgs["-stakemodifieropt"] : std::string();
+    nModifierInterval = 60; nTargetSpacing = 5;
+    try
+    {
+        const int nBlocks = 40, nSeam = nBlocks - 1;
+        const F1Spec full(nBlocks, 600, 0, nSeam);
+
+        // (0) Reference from the UNPOISONED fully resident chain, memo flag OFF:
+        //     pprev = height nBlocks-2 (not a generated-modifier block).
+        std::vector<std::pair<uint64_t,bool> > ref;
+        std::vector<int> fRef;
+        RunScenario(full, false, nBlocks - 1, nBlocks - 1, ref, fRef);
+        BOOST_CHECK_EQUAL(fRef.size(), 0U);
+        BOOST_REQUIRE_EQUAL(ref.size(), 1U);
+
+        F1Fixture fx;
+        fx.Build(full);
+        CBlockIndex* pprev = fx.At(nBlocks - 2);
+        BOOST_REQUIRE(pprev != NULL);
+        BOOST_REQUIRE(!pprev->GeneratedStakeModifier());
+        // Poison the memo with a value that is NOT the authoritative answer, in
+        // the start block's own 600 s bucket so the memo path WOULD be taken.
+        const uint64_t nPoison = 0xDEADBEEFDEADBEEFULL;
+        pprev->nStakeModifier = nPoison;
+        pprev->nStakeModifierTime = pprev->GetBlockTime();
+        mapArgs["-stakemodifieropt"] = "1";
+
+        const size_t nMapBefore = mapBlockIndex.size();
+
+        // (1) NON-AUTHORITATIVE: the memo shortcut is honoured (legacy unchanged).
+        uint64_t mMemo = 0; bool gMemo = true;
+        {
+            LOCK(cs_main);
+            BOOST_REQUIRE(GetBlockIndexStakingNavigator() == NULL);
+            BOOST_REQUIRE(ComputeNextStakeModifier(pprev, mMemo, gMemo));
+        }
+        BOOST_CHECK_EQUAL(mMemo, nPoison);
+        BOOST_CHECK(!gMemo);
+
+        // (2) AUTHORITATIVE: retaining the navigator must DISCARD the memo.
+        {
+            std::string e;
+            BOOST_REQUIRE_MESSAGE(RetainBlockIndexStakingNavigator(fx.root.string(), &e), e);
+            BOOST_REQUIRE(GetBlockIndexStakingNavigator() != NULL);
+            uint64_t mAuth = 0; bool gAuth = false;
+            {
+                LOCK(cs_main);
+                BOOST_REQUIRE(ComputeNextStakeModifier(pprev, mAuth, gAuth));
+            }
+            BOOST_CHECK(mAuth != nPoison);          // the memo did NOT bypass
+            BOOST_CHECK_EQUAL(mAuth, ref[0].first); // equals the legacy reference
+            BOOST_CHECK_EQUAL(gAuth, ref[0].second);
+            BOOST_CHECK_EQUAL(mapBlockIndex.size(), nMapBefore);
+            BOOST_TEST_MESSAGE("F1 memo boundary: memo=0x" << std::hex << (unsigned long long)mMemo
+                << std::dec << " authoritative=0x" << std::hex << (unsigned long long)mAuth
+                << std::dec << " reference=0x" << std::hex << (unsigned long long)ref[0].first << std::dec);
+        }
+    }
+    catch (...)
+    {
+        nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+        if (hadOpt) mapArgs["-stakemodifieropt"] = oldOpt; else mapArgs.erase("-stakemodifieropt");
+        throw;
+    }
+    nModifierInterval = saveInterval; nTargetSpacing = saveSpacing;
+    if (hadOpt) mapArgs["-stakemodifieropt"] = oldOpt; else mapArgs.erase("-stakemodifieropt");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -157,45 +157,372 @@ int64_t GetStakeModifierSelectionInterval()
     return GetStakeModifierSelectionIntervalInternal();
 }
 
-// select a block from the candidate blocks in vSortedByTimestamp, excluding
-// already selected blocks in mapSelectedBlocks, and with timestamp up to
-// nSelectionIntervalStop. vSelHash[i] is the precomputed selection hash for
-// vSortedByTimestamp[i] (round-invariant: hashProof||prevModifier, >>32 for PoS)
-// so each candidate is hashed exactly once across the 64 rounds.
-static bool SelectBlockFromCandidates(vector<pair<int64_t, uint256> >& vSortedByTimestamp,
+// ---------------------------------------------------------------------------
+// F1 — authoritative stake-modifier BY-VALUE cutover.
+//
+// Stake-modifier truth must not depend on CBlockIndex residency: no fixed
+// height window can serve this algorithm, because both halves are bounded by
+// CHAIN TIME, not by a block count:
+//   * the "last generated modifier" walk  <= nModifierInterval  (600 s)
+//   * the generation candidate window     =  nSelectionInterval (21135 s)
+// At 1 s spacing those are ~600 and ~21135 blocks. Deepening fullResident_ or
+// materializing ancestors is therefore architecturally wrong.
+//
+// ONE selection algorithm, TWO input providers:
+//   * VALIDATE_RECORD_INDEX (resident): reproduces the legacy behaviour exactly,
+//     including the legacy mapBlockIndex guard (expressed as record data, so the
+//     legacy error/abort ORDER is preserved bit-for-bit);
+//   * by-value: walks the logical parent chain by value (cold_hot_seam) and
+//     never touches mapBlockIndex / pprev / CBlockIndex materialization.
+// Authority failures fail closed: a partial/truncated candidate set is never
+// used to compute a modifier.
+//
+// A candidate is fully describable by value: the algorithm reads only time,
+// hash, hashProof, nFlags (=> IsProofOfStake / GetStakeEntropyBit) and height.
+// Pointer identity is never needed by any consumer.
+// ---------------------------------------------------------------------------
+struct StakeModifierCandidateValue
+{
+    int64_t nTime;
+    uint256 hash;
+    uint256 hashProof;
+    unsigned int nFlags;
+    int nHeight;
+    // Provider guarantee that this candidate resolves to a block-index record.
+    // The resident provider mirrors the legacy mapBlockIndex guard (a false
+    // value reproduces the legacy error and aborts selection); the by-value
+    // provider always has the record by construction.
+    bool fHaveRecord;
+
+    StakeModifierCandidateValue() : nTime(0), hash(0), hashProof(0), nFlags(0), nHeight(0), fHaveRecord(false) {}
+
+    bool IsProofOfStake() const { return (nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) != 0; }
+    unsigned int GetStakeEntropyBit() const { return (nFlags & CBlockIndex::BLOCK_STAKE_ENTROPY) >> 1; }
+};
+
+// Candidate ordering used by both providers: exactly the legacy
+// `std::sort(vector<pair<int64_t,uint256> >)` order (time first, then hash).
+// Candidate keys are unique (a hash identifies one block), so the sorted
+// sequence is uniquely determined independently of the sort algorithm.
+struct StakeModifierCandidateLess
+{
+    bool operator()(const StakeModifierCandidateValue& a, const StakeModifierCandidateValue& b) const
+    {
+        if (a.nTime != b.nTime)
+            return a.nTime < b.nTime;
+        return a.hash < b.hash;
+    }
+};
+
+// Round-invariant selection hash for one candidate: hashProof || prevModifier,
+// PoS-adjusted (>>32). Identical construction to the legacy inline precompute.
+static uint256 StakeModifierSelectionHash(const StakeModifierCandidateValue& c, uint64_t nStakeModifierPrev)
+{
+    CDataStream ss(SER_GETHASH, 0);
+    ss << c.hashProof << nStakeModifierPrev;
+    uint256 h = Hash(ss.begin(), ss.end());
+    if (c.IsProofOfStake())
+        h >>= 32;
+    return h;
+}
+
+// Select a block from the candidate records, excluding already selected hashes,
+// with timestamp up to nSelectionIntervalStop. vSelHash[i] is the precomputed
+// selection hash for vCandidates[i] so each candidate is hashed exactly once
+// across the 64 rounds. Returns false in exactly the legacy failure cases
+// (no candidate selectable, or a candidate without a resolved record - the
+// legacy error is emitted here, and the caller adds its own round wrapper).
+static bool SelectBlockFromCandidateValues(
+    const vector<StakeModifierCandidateValue>& vCandidates,
     const vector<uint256>& vSelHash,
-    map<uint256, const CBlockIndex*>& mapSelectedBlocks,
-    int64_t nSelectionIntervalStop, uint64_t nStakeModifierPrev, const CBlockIndex** pindexSelected)
+    set<uint256>& setSelectedBlocks,
+    int64_t nSelectionIntervalStop, size_t* pnSelectedIndex)
 {
     bool fSelected = false;
     uint256 hashBest = 0;
-    *pindexSelected = (const CBlockIndex*) 0;
-    for (size_t i = 0; i < vSortedByTimestamp.size(); i++)
+    *pnSelectedIndex = 0;
+    for (size_t i = 0; i < vCandidates.size(); i++)
     {
-        const PAIRTYPE(int64_t, uint256)& item = vSortedByTimestamp[i];
-        if (!mapBlockIndex.count(item.second))
-            return error("SelectBlockFromCandidates: failed to find block index for candidate block %s", item.second.ToString().c_str());
-        const CBlockIndex* pindex = mapBlockIndex[item.second];
-        if (fSelected && pindex->GetBlockTime() > nSelectionIntervalStop)
+        const StakeModifierCandidateValue& candidate = vCandidates[i];
+        if (!candidate.fHaveRecord)
+            return error("SelectBlockFromCandidates: failed to find block index for candidate block %s", candidate.hash.ToString().c_str());
+        if (fSelected && candidate.nTime > nSelectionIntervalStop)
             break;
-        if (mapSelectedBlocks.count(pindex->GetBlockHash()) > 0)
+        if (setSelectedBlocks.count(candidate.hash) > 0)
             continue;
         const uint256& hashSelection = vSelHash[i];
         if (fSelected && hashSelection < hashBest)
         {
             hashBest = hashSelection;
-            *pindexSelected = (const CBlockIndex*) pindex;
+            *pnSelectedIndex = i;
         }
         else if (!fSelected)
         {
             fSelected = true;
             hashBest = hashSelection;
-            *pindexSelected = (const CBlockIndex*) pindex;
+            *pnSelectedIndex = i;
         }
     }
     if (fDebug && GetBoolArg("-printstakemodifier"))
         printf("SelectBlockFromCandidates: selection hash=%s\n", hashBest.ToString().c_str());
     return fSelected;
+}
+
+// LEGACY RESIDENT PROVIDER: adapt the ordered candidate hashes into value
+// records from mapBlockIndex. A candidate absent from the resident map keeps
+// fHaveRecord=false so the selection algorithm emits the exact legacy error at
+// the exact legacy position (this is the F1(b) residency dependency).
+static bool CollectCandidatesResident(
+    const vector<pair<int64_t, uint256> >& vSortedByTimestamp,
+    vector<StakeModifierCandidateValue>& vOut)
+{
+    vOut.clear();
+    vOut.reserve(vSortedByTimestamp.size());
+    for (size_t i = 0; i < vSortedByTimestamp.size(); i++)
+    {
+        const PAIRTYPE(int64_t, uint256)& item = vSortedByTimestamp[i];
+        StakeModifierCandidateValue c;
+        c.hash = item.second;
+        c.fHaveRecord = (mapBlockIndex.count(item.second) > 0);
+        if (c.fHaveRecord)
+        {
+            const CBlockIndex* pindex = mapBlockIndex[item.second];
+            c.nTime = pindex->GetBlockTime();
+            c.hash = pindex->GetBlockHash();
+            c.hashProof = pindex->hashProof;
+            c.nFlags = pindex->nFlags;
+            c.nHeight = pindex->nHeight;
+        }
+        vOut.push_back(c);
+    }
+    return true;
+}
+
+// AUTHORITATIVE BY-VALUE CONTINUATION (F1(b)): collect the REMAINDER of the
+// generation candidate window in the by-value domain, starting at `hashStart`
+// (the first block BELOW the live chain's residency floor, obtained from the
+// floor's by-value parent edge). Walks logical parents BY VALUE down to the
+// exact chain-TIME boundary: no mapBlockIndex, no CBlockIndex materialization,
+// no fixed height depth, no residency growth. A partial window is NEVER
+// returned: any navigation authority failure aborts (fail closed), so a
+// truncated candidate set can never silently yield a different modifier.
+// Appends to vOut in walk order; the caller sorts once for both providers.
+static bool CollectCandidatesByValue(const ColdHotSeamNavigator* nav,
+    const uint256& hashStart, int64_t nSelectionIntervalStart,
+    vector<StakeModifierCandidateValue>& vOut, int& nHeightFirstCandidate,
+    std::string& err)
+{
+    ColdHotSeamSnapshot cur;
+    const ColdHotSeamResult r0 = nav->ResolveLogicalR(BlockIndexLogicalId(hashStart), &cur, &err);
+    if (r0 == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+        return false; // stale/corrupt/divergent authority -> FAIL CLOSED
+    if (r0 != COLD_HOT_SEAM_OK)
+    {
+        // A genuine NOT_FOUND is fail-closed here too: without the record the
+        // completeness of the window cannot be proven.
+        err = "authoritative candidate collection: by-value ancestry not resolvable";
+        return false;
+    }
+    bool fFellOffChain = false;
+    for (;;)
+    {
+        // PROVENANCE GATE (F1 audit blocker 2). Every block of this by-value
+        // continuation - and therefore its parent edge - must be proven COLD
+        // (bound to the pinned authoritative V2 generation). A HOT snapshot is a
+        // pointer view: LegacyBlockIndexAccessor encodes pprev == NULL as
+        // hashPrev == 0 / hasParent == false (blockindex_accessor.cpp:74-78),
+        // i.e. "resident pointer ancestry ended", which is NOT "logical
+        // canonical chain ended". Accepting it would silently truncate the
+        // chain-time window (min(64, size) lowers the round count) and change
+        // the generated modifier, so a non-cold-proven snapshot FAILS CLOSED.
+        if (!cur.ref.IsCold())
+        {
+            err = "authoritative candidate collection: by-value ancestry provenance is not cold-authoritative";
+            return false; // FAIL CLOSED; never a truncated window
+        }
+        if ((int64_t)cur.snapshot.nTime < nSelectionIntervalStart)
+            break; // first block BELOW the window: cur is the legacy post-loop pindex
+        StakeModifierCandidateValue c;
+        c.nTime = (int64_t)cur.snapshot.nTime;
+        c.hash = cur.snapshot.hash;
+        c.hashProof = cur.snapshot.hashProof;
+        c.nFlags = cur.snapshot.nFlags;
+        c.nHeight = cur.snapshot.height;
+        c.fHaveRecord = true; // authority-sourced: the record exists by construction
+        vOut.push_back(c);
+        if (!cur.snapshot.hasParent)
+        {
+            // Cold-proven parent edge: this IS the canonical start of the chain.
+            fFellOffChain = true; // legacy: pindex = pindex->pprev == NULL
+            break;
+        }
+        ColdHotSeamSnapshot parent;
+        const ColdHotSeamResult pr = nav->GetParentR(cur.ref, &parent, &err);
+        if (pr == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+            return false; // FAIL CLOSED; never a truncated window
+        if (pr != COLD_HOT_SEAM_OK)
+        {
+            err = "authoritative candidate collection: parent unresolvable at authority boundary";
+            return false;
+        }
+        cur = parent;
+    }
+    // Legacy: nHeightFirstCandidate = pindex ? pindex->nHeight + 1 : 0, where
+    // pindex is the first block below the window (or NULL if the walk fell off).
+    nHeightFirstCandidate = fFellOffChain ? 0 : (cur.snapshot.height + 1);
+    return true;
+}
+
+// HYBRID AUTHORITATIVE CANDIDATE COLLECTOR (F1(b)).
+//
+// PHASE 1 walks the LIVE chain exactly as the legacy collector does (follow
+// pprev while the chain-time window holds), so a fully resident world is
+// byte-identical to legacy: same candidates, same order, same fields.
+//
+// PHASE 2 is entered only where PHASE 1 is exhausted at the retained window's
+// floor (pprev NULL) while the window is still open. The floor block is
+// resolvable BY VALUE (it lies at or below the frozen generation tip), so its
+// by-value parent edge continues the window in the authoritative by-value
+// domain through the EXISTING GetParentR primitive. The candidate set is then
+// complete regardless of residency depth: a truncated window (which would
+// change the generated modifier silently) is impossible, and an authority
+// failure FAILS CLOSED instead of producing a shorter list.
+//
+// FLOOR PROVENANCE CONTRACT (F1 audit blocker 2): ResolveLogicalR is cold-first
+// with a HOT FALLBACK, so a resolution result alone does not prove authority.
+// The floor's parent edge may only be interpreted once the snapshot is proven
+// COLD-authoritative (BlockIndexNavigationRef::IsCold - the EXISTING typed
+// provenance distinction of the navigator; no second authority is introduced).
+// A hot floor snapshot carries pprev == NULL as hashPrev == 0, which means
+// "resident pointer ancestry ended" and NOT "logical canonical chain ended":
+// inferring chain end from it would silently truncate the window. Therefore
+//   * cold-proven floor + hashPrev != 0 -> continue phase 2 by value;
+//   * cold-proven floor + hashPrev == 0 -> canonical end of chain, terminate;
+//   * provenance not proven (hot floor, cold miss, authority failure) ->
+//     FAIL CLOSED (no mapBlockIndex fallback, no deeper materialization).
+static bool CollectCandidatesHybrid(const ColdHotSeamNavigator* nav,
+    const CBlockIndex* pindexPrev, int64_t nSelectionIntervalStart,
+    vector<StakeModifierCandidateValue>& vOut, int& nHeightFirstCandidate,
+    std::string& err)
+{
+    vOut.clear();
+    nHeightFirstCandidate = 0;
+    const CBlockIndex* pindex = pindexPrev;
+    const CBlockIndex* pFloor = NULL;
+    while (pindex && pindex->GetBlockTime() >= nSelectionIntervalStart)
+    {
+        StakeModifierCandidateValue c;
+        c.nTime = pindex->GetBlockTime();
+        c.hash = pindex->GetBlockHash();
+        c.hashProof = pindex->hashProof;
+        c.nFlags = pindex->nFlags;
+        c.nHeight = pindex->nHeight;
+        c.fHaveRecord = true; // live chain: this record's fields are read directly
+        vOut.push_back(c);
+        if (pindex->pprev == NULL)
+        {
+            pFloor = pindex; // residency floor reached with the window still open
+            pindex = NULL;
+            break;
+        }
+        pindex = pindex->pprev;
+    }
+    if (pFloor != NULL)
+    {
+        ColdHotSeamSnapshot floorSnap;
+        const ColdHotSeamResult fr = nav->ResolveLogicalR(
+            BlockIndexLogicalId(pFloor->GetBlockHash()), &floorSnap, &err);
+        if (fr == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+            return false; // FAIL CLOSED
+        if (fr != COLD_HOT_SEAM_OK)
+        {
+            err = "authoritative candidate collection: residency floor not resolvable by value";
+            return false; // completeness unprovable -> FAIL CLOSED
+        }
+        // FLOOR PROVENANCE GATE (F1 audit blocker 2): only a COLD-proven floor may
+        // have its parent edge interpreted. ResolveLogicalR falls back to the hot
+        // domain on a genuine cold miss, and a hot floor reports its own
+        // pprev == NULL as hashPrev == 0 - which would be read as "logical end of
+        // chain" and silently truncate the candidate set. A non-cold-proven floor
+        // is therefore not proof of genesis: FAIL CLOSED (never infer chain end
+        // from a hot pointer floor, never fall back to mapBlockIndex, never
+        // deepen the walk or materialize deeper ancestry).
+        if (!floorSnap.ref.IsCold())
+        {
+            err = "authoritative candidate collection: residency floor provenance is not cold-authoritative";
+            return false; // FAIL CLOSED
+        }
+        if (floorSnap.snapshot.hashPrev != 0)
+        {
+            if (!CollectCandidatesByValue(nav, floorSnap.snapshot.hashPrev,
+                                          nSelectionIntervalStart, vOut,
+                                          nHeightFirstCandidate, err))
+                return false; // FAIL CLOSED; never a truncated window
+        }
+        // else: cold-proven floor with no authoritative parent edge - the floor IS
+        // the logical start of the chain, so the window collected so far is already
+        // complete (nHeightFirstCandidate stays 0).
+    }
+    else
+    {
+        nHeightFirstCandidate = pindex ? (pindex->nHeight + 1) : 0;
+    }
+    // Reproduce the legacy reversal + sort so both providers emit the identical
+    // (time, hash)-ascending candidate sequence.
+    reverse(vOut.begin(), vOut.end());
+    sort(vOut.begin(), vOut.end(), StakeModifierCandidateLess());
+    return true;
+}
+
+// F1(a): last generated stake modifier for `pindexPrev`.
+//
+// PHASE 1 walks the LIVE chain exactly as legacy GetLastStakeModifier does
+// (follow pprev while it exists, until a generated-modifier block), so a fully
+// resident world stays bit-identical to legacy.
+//
+// PHASE 2 is entered only where that pointer walk is exhausted: at the retained
+// window's floor, where pprev is NULL while the LOGICAL parent still exists.
+// The floor block is itself resolvable BY VALUE (it lies at or below the frozen
+// generation tip), so the walk continues in the authoritative by-value domain
+// through the EXISTING ColdHotSeamNavigator::GetLastStakeModifierR. Correctness
+// therefore no longer depends on how deep the resident window happens to be,
+// and the walk never silently continues from a truncated pointer chain.
+//
+// Returns: 1 = resolved, 0 = no generated modifier in the ancestry (legacy's
+// "no generation at genesis block"), -1 = authority failure (fail closed).
+static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
+    const CBlockIndex* pindexPrev, uint64_t& nStakeModifier, int64_t& nModifierTime,
+    std::string& err)
+{
+    if (!pindexPrev)
+        return 0; // legacy: "GetLastStakeModifier: null pindex"
+    // PHASE 1 - live-chain walk, byte-identical to legacy semantics.
+    const CBlockIndex* p = pindexPrev;
+    while (p->pprev && !p->GeneratedStakeModifier())
+        p = p->pprev;
+    if (p->GeneratedStakeModifier())
+    {
+        nStakeModifier = p->nStakeModifier;
+        nModifierTime  = p->GetBlockTime();
+        return 1;
+    }
+    // PHASE 2 - the pointer walk stopped at the residency floor without a
+    // generated modifier. Continue BY VALUE from that floor block.
+    if (p->nHeight == 0)
+        return 0; // genuine genesis floor: exactly legacy's error case
+    uint64_t nMod = 0;
+    int64_t  nTime = 0;
+    const ColdHotSeamResult r = nav->GetLastStakeModifierR(
+        BlockIndexLogicalId(p->GetBlockHash()), &nMod, &nTime, &err);
+    if (r == COLD_HOT_SEAM_OK)
+    {
+        nStakeModifier = nMod;
+        nModifierTime  = nTime;
+        return 1;
+    }
+    if (r == COLD_HOT_SEAM_NOT_FOUND)
+        return 0; // authoritative answer: the ancestry holds no generated modifier
+    return -1;    // AUTHORITY_FAILURE (or any non-OK) -> fail closed
 }
 
 // Stake Modifier (hash modifier of proof-of-stake):
@@ -211,6 +538,17 @@ static bool SelectBlockFromCandidates(vector<pair<int64_t, uint256> >& vSortedBy
 // block. This is to make it difficult for an attacker to gain control of
 // additional bits in the stake modifier, even after generating a chain of
 // blocks.
+// Fail-closed output discipline for ComputeNextStakeModifier: on ANY failure the
+// outputs are reset, so a caller that ignores the false result can never observe
+// a partially computed modifier. This matters because the last-modifier value is
+// written into nStakeModifier before the candidate selection can still fail.
+static bool FailComputeNextStakeModifier(uint64_t& nStakeModifier, bool& fGeneratedStakeModifier)
+{
+    nStakeModifier = 0;
+    fGeneratedStakeModifier = false;
+    return false;
+}
+
 bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeModifier, bool& fGeneratedStakeModifier)
 {
     nStakeModifier = 0;
@@ -223,19 +561,54 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeMod
     // First find current stake modifier and its generation block time
     // if it's not old enough, return the same stake modifier
     int64_t nModifierTime = 0;
-    // -stakemodifieropt (default off): recover previous modifier/time in O(1)
-    // from the in-memory (chain-own, not serialized) nStakeModifierTime memo
-    // instead of the GetLastStakeModifier backward walk. Fallback to legacy when
-    // unset (0) / flag off, so semantics are bit-identical.
-    bool fOpt = GetBoolArg("-stakemodifieropt", false);
+    // F1 AUTHORITATIVE BOUNDARY: the authoritative by-value provider must be
+    // consulted whenever a production navigator is retained. The
+    // -stakemodifieropt memo is an in-memory (chain-own, not serialized)
+    // nStakeModifierTime shortcut whose coherence with the frozen by-value
+    // authority is NOT provable, so letting it short-circuit here would return a
+    // memoised modifier without ever consulting the authority (a silent
+    // divergence from consensus truth). The memo is therefore used ONLY in
+    // non-authoritative mode; with no navigator retained the legacy semantics
+    // below are unchanged.
+    const ColdHotSeamNavigator* navMemo = GetBlockIndexStakingNavigator();
+    bool fOpt = (navMemo == NULL) && GetBoolArg("-stakemodifieropt", false);
     if (fOpt && pindexPrev && pindexPrev->nStakeModifierTime != 0)
     {
         nStakeModifier = pindexPrev->nStakeModifier;
         nModifierTime  = pindexPrev->nStakeModifierTime;
     }
-    else if (!GetLastStakeModifier(pindexPrev, nStakeModifier, nModifierTime))
+    else
     {
-        return error("ComputeNextStakeModifier: unable to get last modifier");
+        // F1(a): whenever a production navigator is retained, resolve the last
+        // generated modifier BY VALUE. The walk is bounded by CHAIN TIME
+        // (<= nModifierInterval) and never requires the generated ancestor to be
+        // resident. Authority failure FAILS CLOSED - it must never silently fall
+        // back to the resident pprev walk, which is exactly the retained-floor
+        // failure this cutover removes. With no navigator retained the legacy
+        // resident walk below is unchanged, so fully resident worlds are
+        // bit-identical.
+        const ColdHotSeamNavigator* navLast = navMemo;
+        if (navLast)
+        {
+            std::string lerr;
+            const int lr = ResolveLastStakeModifierByValue(navLast, pindexPrev,
+                                                           nStakeModifier, nModifierTime, lerr);
+            if (lr == 0)
+            {
+                FailComputeNextStakeModifier(nStakeModifier, fGeneratedStakeModifier);
+                return error("GetLastStakeModifier: no generation at genesis block (authoritative by-value)");
+            }
+            if (lr < 0)
+            {
+                FailComputeNextStakeModifier(nStakeModifier, fGeneratedStakeModifier);
+                return error("ComputeNextStakeModifier: unable to get last modifier (authoritative authority failure: %s)", lerr.c_str());
+            }
+        }
+        else if (!GetLastStakeModifier(pindexPrev, nStakeModifier, nModifierTime))
+        {
+            FailComputeNextStakeModifier(nStakeModifier, fGeneratedStakeModifier);
+            return error("ComputeNextStakeModifier: unable to get last modifier");
+        }
     }
     if (fDebug)
     {
@@ -244,40 +617,59 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeMod
     if (nModifierTime / nModifierInterval >= pindexPrev->GetBlockTime() / nModifierInterval)
         return true;
 
-    // Sort candidate blocks by timestamp
-    vector<pair<int64_t, uint256> > vSortedByTimestamp;
-    vSortedByTimestamp.reserve(64 * nModifierInterval / nTargetSpacing);
+    // Candidate block collection. Bounded by CHAIN TIME (nSelectionIntervalStart)
+    // in BOTH providers - never by a fixed height depth: the window can span
+    // ~21135 blocks at 1 s spacing and ~1409 at 15 s, and there is no consensus
+    // maximum in blocks.
     int64_t nSelectionInterval = GetStakeModifierSelectionInterval();
     int64_t nSelectionIntervalStart = (pindexPrev->GetBlockTime() / nModifierInterval) * nModifierInterval - nSelectionInterval;
-    const CBlockIndex* pindex = pindexPrev;
-    while (pindex && pindex->GetBlockTime() >= nSelectionIntervalStart)
+    int nHeightFirstCandidate = 0;
+    vector<StakeModifierCandidateValue> vCandidates;
+    vCandidates.reserve(64 * nModifierInterval / nTargetSpacing);
+    const ColdHotSeamNavigator* navCandidates = GetBlockIndexStakingNavigator();
+    if (navCandidates)
     {
-        vSortedByTimestamp.push_back(make_pair(pindex->GetBlockTime(), pindex->GetBlockHash()));
-        pindex = pindex->pprev;
+        // F1(b) AUTHORITATIVE PROVIDER: by-value parent walk. No mapBlockIndex,
+        // no CBlockIndex materialization, no residency growth, no fixed depth.
+        // A truncated/partial window is NEVER used: any authority failure aborts
+        // the whole computation (fail closed), so a short candidate set can never
+        // silently yield a different modifier.
+        std::string cErr;
+        if (!CollectCandidatesHybrid(navCandidates, pindexPrev, nSelectionIntervalStart,
+                                     vCandidates, nHeightFirstCandidate, cErr))
+        {
+            FailComputeNextStakeModifier(nStakeModifier, fGeneratedStakeModifier);
+            return error("ComputeNextStakeModifier: authoritative candidate collection failed: %s", cErr.c_str());
+        }
     }
-    int nHeightFirstCandidate = pindex ? (pindex->nHeight + 1) : 0;
-    reverse(vSortedByTimestamp.begin(), vSortedByTimestamp.end());
-    sort(vSortedByTimestamp.begin(), vSortedByTimestamp.end());
+    else
+    {
+        // LEGACY RESIDENT PROVIDER: byte-identical collection, reversal and sort.
+        vector<pair<int64_t, uint256> > vSortedByTimestamp;
+        vSortedByTimestamp.reserve(64 * nModifierInterval / nTargetSpacing);
+        const CBlockIndex* pindex = pindexPrev;
+        while (pindex && pindex->GetBlockTime() >= nSelectionIntervalStart)
+        {
+            vSortedByTimestamp.push_back(make_pair(pindex->GetBlockTime(), pindex->GetBlockHash()));
+            pindex = pindex->pprev;
+        }
+        nHeightFirstCandidate = pindex ? (pindex->nHeight + 1) : 0;
+        reverse(vSortedByTimestamp.begin(), vSortedByTimestamp.end());
+        sort(vSortedByTimestamp.begin(), vSortedByTimestamp.end());
+        CollectCandidatesResident(vSortedByTimestamp, vCandidates);
+    }
 
     // Select 64 blocks from candidate blocks to generate stake modifier.
     // Precompute each candidate's selection hash ONCE: it is round-invariant
-    // (inputs = pindex->hashProof || nStakeModifier, where nStakeModifier is the
-    // previous modifier, constant across all 64 rounds). The precompute applies
-    // the PoS >>32 adjustment; the 64 rounds then reuse the exact same value.
+    // (inputs = hashProof || nStakeModifier, where nStakeModifier is the previous
+    // modifier, constant across all 64 rounds). The precompute applies the PoS
+    // >>32 adjustment; the 64 rounds then reuse the exact same value.
     vector<uint256> vSelHash;
-    vSelHash.reserve(vSortedByTimestamp.size());
+    vSelHash.reserve(vCandidates.size());
     {
         int64_t nPreUs = GetTimeMicros();
-        for (const PAIRTYPE(int64_t, uint256)& item : vSortedByTimestamp)
-        {
-            const CBlockIndex* pc = mapBlockIndex[item.second];
-            CDataStream ss(SER_GETHASH, 0);
-            ss << pc->hashProof << nStakeModifier;
-            uint256 h = Hash(ss.begin(), ss.end());
-            if (pc->IsProofOfStake())
-                h >>= 32;
-            vSelHash.push_back(h);
-        }
+        for (const StakeModifierCandidateValue& candidate : vCandidates)
+            vSelHash.push_back(StakeModifierSelectionHash(candidate, nStakeModifier));
         if (fOpt)
         {
             int64_t nPreUs2 = GetTimeMicros() - nPreUs;
@@ -288,41 +680,50 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeMod
 
     uint64_t nStakeModifierNew = 0;
     int64_t nSelectionIntervalStop = nSelectionIntervalStart;
-    map<uint256, const CBlockIndex*> mapSelectedBlocks;
-    for (int nRound=0; nRound<min(64, (int)vSortedByTimestamp.size()); nRound++)
+    set<uint256> setSelectedBlocks;
+    size_t nSelectedIndex = 0;
+    for (int nRound=0; nRound<min(64, (int)vCandidates.size()); nRound++)
     {
         // add an interval section to the current selection round
         nSelectionIntervalStop += GetStakeModifierSelectionIntervalSection(nRound);
         // select a block from the candidates of current round
-        if (!SelectBlockFromCandidates(vSortedByTimestamp, vSelHash, mapSelectedBlocks, nSelectionIntervalStop, nStakeModifier, &pindex))
+        if (!SelectBlockFromCandidateValues(vCandidates, vSelHash, setSelectedBlocks, nSelectionIntervalStop, &nSelectedIndex))
+        {
+            FailComputeNextStakeModifier(nStakeModifier, fGeneratedStakeModifier);
             return error("ComputeNextStakeModifier: unable to select block at round %d", nRound);
+        }
         // write the entropy bit of the selected block
-        nStakeModifierNew |= (((uint64_t)pindex->GetStakeEntropyBit()) << nRound);
+        nStakeModifierNew |= (((uint64_t)vCandidates[nSelectedIndex].GetStakeEntropyBit()) << nRound);
         // add the selected block from candidates to selected list
-        mapSelectedBlocks.insert(make_pair(pindex->GetBlockHash(), pindex));
+        setSelectedBlocks.insert(vCandidates[nSelectedIndex].hash);
         if (fDebug && GetBoolArg("-printstakemodifier"))
-            printf("ComputeNextStakeModifier: selected round %d stop=%s height=%d bit=%d\n", nRound, DateTimeStrFormat(nSelectionIntervalStop).c_str(), pindex->nHeight, pindex->GetStakeEntropyBit());
+            printf("ComputeNextStakeModifier: selected round %d stop=%s height=%d bit=%d\n", nRound, DateTimeStrFormat(nSelectionIntervalStop).c_str(), vCandidates[nSelectedIndex].nHeight, vCandidates[nSelectedIndex].GetStakeEntropyBit());
     }
 
     // Print selection map for visualization of the selected blocks
     if (fDebug && GetBoolArg("-printstakemodifier"))
     {
         string strSelectionMap = "";
-        // '-' indicates proof-of-work blocks not selected
-        strSelectionMap.insert(0, pindexPrev->nHeight - nHeightFirstCandidate + 1, '-');
-        pindex = pindexPrev;
-        while (pindex && pindex->nHeight >= nHeightFirstCandidate)
+        // '-' indicates proof-of-work blocks not selected. The candidate set IS
+        // the window, so the map is rendered from the value records.
+        strSelectionMap.insert(0, (size_t)(pindexPrev->nHeight - nHeightFirstCandidate + 1), '-');
+        const size_t nMap = strSelectionMap.size();
+        for (size_t i = 0; i < vCandidates.size(); i++)
         {
+            const size_t nPos = (size_t)(vCandidates[i].nHeight - nHeightFirstCandidate);
             // '=' indicates proof-of-stake blocks not selected
-            if (pindex->IsProofOfStake())
-                strSelectionMap.replace(pindex->nHeight - nHeightFirstCandidate, 1, "=");
-            pindex = pindex->pprev;
+            if (nPos < nMap && vCandidates[i].IsProofOfStake())
+                strSelectionMap.replace(nPos, 1, "=");
         }
-        for (const PAIRTYPE(uint256, const CBlockIndex*)& item : mapSelectedBlocks)
+        for (size_t i = 0; i < vCandidates.size(); i++)
         {
+            if (setSelectedBlocks.count(vCandidates[i].hash) == 0)
+                continue;
+            const size_t nPos = (size_t)(vCandidates[i].nHeight - nHeightFirstCandidate);
             // 'S' indicates selected proof-of-stake blocks
             // 'W' indicates selected proof-of-work blocks
-            strSelectionMap.replace(item.second->nHeight - nHeightFirstCandidate, 1, item.second->IsProofOfStake()? "S" : "W");
+            if (nPos < nMap)
+                strSelectionMap.replace(nPos, 1, vCandidates[i].IsProofOfStake()? "S" : "W");
         }
         printf("ComputeNextStakeModifier: selection height [%d, %d] map %s\n", nHeightFirstCandidate, pindexPrev->nHeight, strSelectionMap.c_str());
     }
