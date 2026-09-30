@@ -20,6 +20,12 @@
 class CBlockIndex;
 class CTxDB;
 
+// R3 / C6 section 6 — test seam for the FINAL positive prune predicate. It wraps the
+// same static predicate dag.cpp uses at the consensus site (ResolveParentScoreAuthoritative);
+// there is no second implementation and no test-only semantics.
+struct BlockIndexSnapshot;
+bool DAGRowObjectivelyPrunedForTest(CTxDB& db, const uint256& hash, int32_t height, std::string* why);
+
 // ---------------------------------------------------------------------------
 // Constants
 // ---------------------------------------------------------------------------
@@ -165,10 +171,18 @@ struct BlockIndexSnapshot; // forward declaration (defined in blockindex_authori
 struct DagPruneRollbackCapture
 {
     std::vector<std::pair<uint256, CBlockDAGData> > records; // exact deleted rows
+    // F2-B1-R: exact pre-image of the row-erase provenance record per deleted row
+    // (parallel to `records`; -1 = no record existed). A prune erase clears a stale
+    // non-prune de-materialization record for the row it physically erases, so the
+    // rollback must be able to put the marker state back exactly.
+    std::vector<int> rowEraseOrigins;
     bool cleanHeightPresent;
     int cleanHeight;
+    bool pruneFloorPresent; // exact pre-image of the erase-provenance marker
+    int pruneFloor;
     bool committed; // the prune's physical source commit succeeded
-    DagPruneRollbackCapture() : cleanHeightPresent(false), cleanHeight(-1), committed(false) {}
+    DagPruneRollbackCapture() : cleanHeightPresent(false), cleanHeight(-1),
+        pruneFloorPresent(false), pruneFloor(-1), committed(false) {}
 };
 
 class DagMutationPreview; // R2c.2s/S5 owned transaction-scoped preview seam
@@ -212,6 +226,101 @@ public:
 
     /** DAGKNIGHT adaptive coloring for a block (Phase 4). */
     void ColorBlockDAGKnight(CBlockIndex* pindex);
+
+    // --- F2: authoritative DAG parent-score cutover -------------------------
+    // INVARIANT: DAG PARENT SCORE TRUTH != mapDAGData RESIDENCY and
+    //            DAG PARENT SCORE TRUTH != mapBlockIndex RESIDENCY.
+    // A valid score of exactly ZERO is a legitimate FOUND value and is never
+    // conflated with a resolution failure.
+    enum class DAGParentScoreStatus
+    {
+        FOUND,      // a definitive score (possibly zero) was resolved
+        NOT_FOUND,  // the parent has no score source (authority vertex absent)
+        FAILURE     // the authoritative source is unhealthy/unreadable/inconsistent
+    };
+
+    /** B-1: WHICH authoritative source produced a FOUND score. The status is
+     *  unchanged (consumers only test FAILURE); this records the typed absence
+     *  classification so a FOUND value is never silently attributable to the
+     *  wrong authority:
+     *    CANONICAL_ROW        = a certified-current canonical daglinks row
+     *                           (FOUND_CANONICAL_SCORE),
+     *    PRUNED_BOUNDARY      = the row is legitimately gone under the accepted
+     *                           prune/erase lifecycle and the exact former scalar
+     *                           was reconstructed by value (FOUND_PRUNED_BOUNDARY),
+     *    DEGRADED_CERTIFICATE_BOUNDARY = the certificate does not bind the
+     *                           retained set in this session (uncertified, or a
+     *                           rebuild-required revocation the accepting
+     *                           mutation itself re-certifies at commit) and the
+     *                           exact former scalar was reconstructed by value.
+     */
+    enum class DAGParentScoreSource
+    {
+        NONE,
+        CANONICAL_ROW,
+        PRUNED_BOUNDARY,
+        DEGRADED_CERTIFICATE_BOUNDARY
+    };
+
+    struct DAGParentScoreResult
+    {
+        DAGParentScoreStatus status;
+        uint256 score;
+        DAGParentScoreSource source;
+        DAGParentScoreResult() : status(DAGParentScoreStatus::NOT_FOUND), score(0),
+                                 source(DAGParentScoreSource::NONE) {}
+    };
+
+    /** One logical DAG parent-score resolver (F2).
+     *
+     *  fAuthoritativeParentScore == false (legacy live mode and every isolated
+     *  recolor canvas) preserves TODAY's resident semantics byte-for-byte: the
+     *  block's own mapDAGData entry, then the (non post-DAG proof-of-stake)
+     *  resident mapBlockIndex chainTrust fallback; a miss yields NOT_FOUND with
+     *  score 0, exactly as before.
+     *
+     *  fAuthoritativeParentScore == true (the authoritative accept path) resolves
+     *  the parent score from the authority, never from residency:
+     *    - post-DAG proof-of-stake parent  -> FOUND(0) (consensus exclusion),
+     *    - pre-DAG parent                  -> entropy-correct accumulated trust
+     *                                         (GetAuthoritativeAccumulatedChainTrust),
+     *    - post-DAG proof-of-work parent   -> the certified persisted DAG score
+     *                                         row (ReadDAGLinks) gated by
+     *                                         IsDAGScoreAuthorityHealthy.
+     *  Any unavailable/unhealthy/unreadable authority returns FAILURE; score 0 is
+     *  NEVER substituted on failure and there is NO resident fallback.
+     */
+    /** B-1 mutation-vs-query policy for the authoritative parent-score rule.
+     *
+     *  QUERY (default): the accepted direct-resolution contract. A certificate
+     *  that does not bind the retained set (uncertified) or that is positively
+     *  degraded (revoked/corrupt/unavailable) is FAILURE, never a value.
+     *
+     *  MUTATION: the authoritative coloring of a block being ACCEPTED. The
+     *  mutation's own commit republishes the score certificate at its new source
+     *  token (StageAuthoritativeDAGScoreState -> StageDAGScoreCertificateInBatch),
+     *  so a non-binding certificate must not brick the accept path: the exact
+     *  former scalar is reconstructed by value under the same provenance and
+     *  source-binding rules, and the mutation re-certifies at commit. A corrupt or
+     *  unavailable authority still fails closed in BOTH policies, because that is
+     *  positive evidence of damage rather than of a certificate that simply is not
+     *  binding yet.
+     */
+    enum class DAGParentScorePolicy { QUERY, MUTATION };
+
+    DAGParentScoreResult ResolveDagParentScore(const uint256& hashParent,
+                                               bool fAuthoritativeParentScore,
+                                               std::string* error,
+                                               DAGParentScorePolicy policy =
+                                                   DAGParentScorePolicy::QUERY) const;
+
+    /** Authoritative-mode coloring of a newly accepted block (F2).
+     *  Returns false (fail closed) when a parent score cannot be resolved
+     *  authoritatively; the DAG data of `pindex` is left unmodified on failure.
+     *  When g_fAuthoritativeStartup is false this is exactly the legacy
+     *  void ColorBlock/ColorBlockDAGKnight behaviour and never fails. */
+    bool ColorBlockAuthoritative(CBlockIndex* pindex, std::string* error);
+    bool ColorBlockDAGKnightAuthoritative(CBlockIndex* pindex, std::string* error);
 
     /** Write DAG links for a block to LevelDB. */
     bool WriteDAGLinks(CTxDB& txdb, const uint256& hash);
@@ -317,6 +426,17 @@ private:
 
     std::map<uint256, CBlockIndex*>* recolorBlockIndex;
     std::map<uint256, CBlockIndex*>& RecolorBlockIndex() const;
+
+    // F2 resolver internals (see ResolveDagParentScore for the contract).
+    DAGParentScoreResult ResolveParentScoreLegacy(const uint256& hashParent) const;
+    DAGParentScoreResult ResolveParentScoreAuthoritative(const uint256& hashParent,
+                                                         std::string* error,
+                                                         DAGParentScorePolicy policy =
+                                                             DAGParentScorePolicy::QUERY) const;
+    bool ColorBlockImpl(CBlockIndex* pindex, bool fAuthoritativeParentScore,
+                        std::string* error);
+    bool ColorBlockDAGKnightImpl(CBlockIndex* pindex, bool fAuthoritativeParentScore,
+                                 std::string* error);
 
     // Performance: LRU cache for blue sets (avoids recomputing expensive BFS)
     mutable std::map<uint256, std::set<uint256>> mapBlueSetCache;

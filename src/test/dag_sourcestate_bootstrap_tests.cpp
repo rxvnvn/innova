@@ -118,7 +118,7 @@ BOOST_AUTO_TEST_CASE(source_semantic_frontier_envelope_and_abort)
     BOOST_CHECK(capture.events.back().finalSourceStateId == t1);
     capture.events.clear();
     BOOST_REQUIRE(BeginDagTipDeltaTransaction(DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX));
-    BOOST_REQUIRE(db.TxnBegin()); BOOST_REQUIRE(db.EraseDAGLinks(c));
+    BOOST_REQUIRE(db.TxnBegin()); BOOST_REQUIRE(db.EraseDAGLinks(c, DAGRowEraseOrigin::PRUNE));
     BOOST_REQUIRE(db.TxnAbort());
     CommitDagTipDeltaTransaction(); // even an erroneous caller cannot publish aborted edits
     BOOST_CHECK(capture.events.empty());
@@ -139,7 +139,7 @@ BOOST_AUTO_TEST_CASE(source_semantic_replacement_cardinality_and_retention_matri
         capture.events.clear(); uint256 before; BOOST_REQUIRE(db.ReadDAGSourceStateId(before));
         BOOST_REQUIRE(BeginDagTipDeltaTransaction(DAG_TIP_DELTA_ADD_TO_BLOCK_INDEX));
         BOOST_REQUIRE(db.TxnBegin());
-        if(erase) BOOST_REQUIRE(db.EraseDAGLinks(hash));
+        if(erase) BOOST_REQUIRE(db.EraseDAGLinks(hash, DAGRowEraseOrigin::PRUNE));
         else {CBlockDAGData data;data.vDAGParents=parents;BOOST_REQUIRE(db.WriteDAGLinks(hash,data));}
         const uint256 token(++sequence); BOOST_REQUIRE(db.WriteDAGSourceStateId(token));
         BOOST_REQUIRE(db.TxnCommit());SetDagTipDeltaFinalSourceStateId(token);CommitDagTipDeltaTransaction();
@@ -356,7 +356,7 @@ BOOST_AUTO_TEST_CASE(child_count_raw_corruption_rejects_mutation)
         if(mode==3) BOOST_REQUIRE(db.GetInstance()->Delete(leveldb::WriteOptions(),key.str()).ok());
         else BOOST_REQUIRE(db.GetInstance()->Put(leveldb::WriteOptions(),key.str(),value.str()).ok());
         BOOST_REQUIRE(db.TxnBegin());
-        if(mode==3) BOOST_CHECK(!db.EraseDAGLinks(uint256(10)));
+        if(mode==3) BOOST_CHECK(!db.EraseDAGLinks(uint256(10), DAGRowEraseOrigin::PRUNE));
         else BOOST_CHECK(!db.WriteDAGLinks(uint256(11),d));
         BOOST_REQUIRE(db.TxnAbort());
         CBlockDAGData retained; BOOST_REQUIRE(db.ReadDAGLinks(uint256(10),retained));

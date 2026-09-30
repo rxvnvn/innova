@@ -231,7 +231,10 @@ enum ProcessBlockRejectReason
     PBREJECT_OPERATOR_INVALIDATED,
     PBREJECT_ACCEPTBLOCK_FALSE,
     PBREJECT_UNKNOWN_FALSE,
-    PBREJECT_AUTHORITY_UNAVAILABLE
+    PBREJECT_AUTHORITY_UNAVAILABLE,
+    // R5/C8: unconditional full-vector duplicate/zero DAG-parent structural reject,
+    // decided from the block's complete parent vector alone (never from state).
+    PBREJECT_DAG_PARENT_STRUCTURAL
 };
 
 bool InitProcessBlockRejectTrace(bool fEnabled);

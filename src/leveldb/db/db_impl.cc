@@ -1395,6 +1395,18 @@ bool DBImpl::GetProperty(const Slice& property, std::string* value) {
   } else if (in == "sstables") {
     *value = versions_->current()->DebugString();
     return true;
+  } else if (in == "last-sequence") {
+    // Innova V2 custody-continuity substrate (READ-ONLY, additive).
+    // Exposes the engine's monotone write sequence so a supported writer can seal
+    // it and a later supported open can verify EXACT equality. Any Put/Delete by
+    // any writer on this store consumes sequence numbers and advances this value,
+    // and it cannot be rewound by the application layer. Write semantics and the
+    // record format are untouched by this accessor.
+    char seqbuf[32];
+    snprintf(seqbuf, sizeof(seqbuf), "%llu",
+             static_cast<unsigned long long>(versions_->LastSequence()));
+    *value = seqbuf;
+    return true;
   }
 
   return false;

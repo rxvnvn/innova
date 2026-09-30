@@ -18,8 +18,13 @@
 #include "dag_tips_delta.h"
 #include "dag_mutation_preview.h"
 #include "dag_tip_selector.h"
+#include <mutex>              // R4 AUTHORITY_READY barrier
+#include <condition_variable> // R4 AUTHORITY_READY barrier
+#include <chrono>             // R4 AUTHORITY_READY barrier
+#include "txdb-leveldb.h"      // R4 prerequisite reads (DAG score health / custody state)
 #include "dag_tip_frontier_metadata.h"
 #include "dag_tip_frontier.h"
+#include "blockindex_dag_restart_seam.h"   // R3 production custody wiring
 #include "fixed_blockindex_store.h"
 #include "finality.h"
 
@@ -152,6 +157,112 @@ bool PublishStartupGlobals(AuthoritativeStartupContext& ctx, std::string* error)
 
     if (error) error->clear();
     return true;
+}
+
+// ---------------------------------------------------------------------------
+// R4 — AUTHORITY_READY barrier implementation.
+//
+// ONE lifecycle barrier. It is published ONLY by the authoritative startup, after the six
+// frozen prerequisites have been evaluated against real live state; every consensus-sensitive
+// consumer waits on it. Legacy (non-authoritative) operation has no V2 authority and therefore
+// no barrier requirement: the wait returns immediately there. No finality semantics are
+// defined here — see the FINALITY FIREWALL note in the header.
+// ---------------------------------------------------------------------------
+namespace {
+
+std::mutex g_authorityReadyMutex;
+std::condition_variable g_authorityReadyCond;
+bool g_authorityReadySet = false;
+std::string g_authorityReadyDetail;
+
+} // namespace
+
+std::string AuthorityReadyPrerequisites::WhyNotReady() const
+{
+    if (!durableIndexLoaded)                return "V2 durable index not loaded";
+    if (!immutableAuthorityAvailable)       return "immutable authority not available";
+    if (!dagDurableStateRestored)           return "DAG durable state not restored/validated";
+    if (!trustProjectionReconciled)         return "R2 trust projection not reconciled";
+    if (!finalityEpochOwnerLifecycleReady)  return "FINALITY_EPOCH_OWNER_READY lifecycle condition not satisfied";
+    if (!provenanceCertificationComplete)   return "R3 provenance/projection certification not complete";
+    return "";
+}
+
+bool AuthorityReadyMarkIfSatisfied(const AuthorityReadyPrerequisites& p, std::string* detail)
+{
+    const std::string why = p.WhyNotReady();
+    if (!why.empty())
+    {
+        // A partially ready node is never published: the barrier stays unset and every
+        // consumer stays gated.
+        if (detail) *detail = "AUTHORITY_READY refused: " + why;
+        {
+            std::lock_guard<std::mutex> lock(g_authorityReadyMutex);
+            g_authorityReadyDetail = why;   // refusal survives for diagnostics
+        }
+        return false;
+    }
+    {
+        std::lock_guard<std::mutex> lock(g_authorityReadyMutex);
+        g_authorityReadySet = true;
+        g_authorityReadyDetail = "prerequisites satisfied";
+    }
+    g_authorityReadyCond.notify_all();
+    if (detail) *detail = "AUTHORITY_READY published";
+    return true;
+}
+
+bool AuthorityReadyIsSet()
+{
+    std::lock_guard<std::mutex> lock(g_authorityReadyMutex);
+    return g_authorityReadySet;
+}
+
+std::string AuthorityReadyStateName()
+{
+    std::lock_guard<std::mutex> lock(g_authorityReadyMutex);
+    return g_authorityReadySet ? "READY" : "NOT_READY";
+}
+
+bool AuthorityReadyWait(uint64_t timeoutMs, std::string* error)
+{
+    std::unique_lock<std::mutex> lock(g_authorityReadyMutex);
+    if (g_authorityReadySet) return true;
+    if (!g_fAuthoritativeStartup) return true;   // legacy mode: no V2 authority to wait for
+    const bool signalled = g_authorityReadyCond.wait_for(
+        lock, std::chrono::milliseconds(timeoutMs), [](){ return g_authorityReadySet; });
+    if (!g_authorityReadySet)
+    {
+        (void)signalled;
+        if (error) *error = "AUTHORITY_READY not published within the consumer gate window";
+        return false;
+    }
+    return true;
+}
+
+bool AuthorityReadyConsumerEnter(const char* consumer, std::string* error)
+{
+    std::string werr;
+    if (!AuthorityReadyWait(60000, &werr))
+    {
+        if (error) *error = std::string("consumer '") + (consumer ? consumer : "?") +
+                            "' cannot cross AUTHORITY_READY: " + werr;
+        return false;
+    }
+    return true;
+}
+
+std::string AuthorityReadyRefusalDetail()
+{
+    std::lock_guard<std::mutex> lock(g_authorityReadyMutex);
+    return g_authorityReadyDetail;
+}
+
+void AuthorityReadyResetForTest()
+{
+    std::lock_guard<std::mutex> lock(g_authorityReadyMutex);
+    g_authorityReadySet = false;
+    g_authorityReadyDetail.clear();
 }
 
 bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
@@ -452,6 +563,36 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         return false;
     }
 
+    // R3 certification-stage result, consumed by the R4 AUTHORITY_READY prerequisite
+    // 'R3 provenance/projection certification complete' at the true exit of this function.
+    // VERIFIED / SUSPENDED / UNAVAILABLE are all COMPLETED determinations: a store that
+    // cannot be positively certified must stay uncertified and fail closed (frozen R3
+    // contract) and must NOT be prevented from booting. Only an I/O failure (probe false)
+    // leaves the stage incomplete.
+    bool custodyStageComplete = false;
+
+    // R3 section 2 (production custody wiring) — establish / verify provenance custody at
+    // the frozen lifecycle point: every durable prerequisite above is loaded and validated
+    // and nothing has been published yet. This uses the SAME certification implementation
+    // as R3.6 (there is deliberately no startup-only interpretation).
+    {
+        int custodyState = 2;
+        uint64_t custodyEpoch = 0;
+        std::string custodyDetail;
+        custodyStageComplete = EstablishDAGProvenanceCustodyAtStartup(&custodyState, &custodyEpoch, &custodyDetail);
+        std::string custodyMsg = std::string("BLOCKINDEX_V2_AUTHORITATIVE custody_state=") +
+                                 std::to_string(custodyState) + " custody_epoch=" +
+                                 std::to_string((unsigned long long)custodyEpoch);
+        if (!custodyDetail.empty()) custodyMsg += " detail=" + custodyDetail;
+        printf("%s\n", custodyMsg.c_str());
+        fflush(stdout);
+        // Any state other than VERIFIED is REPORTED, never normalized: coverage is
+        // unavailable/suspended for this session, availability loss stays explicit, and
+        // provenance-dependent reconstruction fails closed through the final predicate.
+        // A false-positive prune attribution remains impossible either way.
+
+    }
+
     // HReg + wallet rescan are driven by init.cpp AFTER this returns, using
     // the by-value active-chain reader + by-value paths (ca7c7e1).
 
@@ -459,6 +600,66 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
     globalsGuard.Disarm();
     g_authoritativeContext = ctx.release();
     ::g_fAuthoritativeStartup = true;
+
+    // R4 — AUTHORITY_READY: evaluated at the TRUE successful exit of the authoritative startup,
+    // after the immutable authority has actually opened (`g_authoritativeContext` registered above
+    // and the live authority open) and after every other frozen prerequisite is satisfied. The
+    // barrier is published only when all six hold; no consumer may publish readiness itself.
+    {
+        AuthorityReadyPrerequisites pre;
+        pre.durableIndexLoaded = (dagRuntimeConfig.generation != 0);
+        {
+            auto readyAuthority = GetAuthoritativeLiveAuthority();
+            pre.immutableAuthorityAvailable = (readyAuthority != NULL && readyAuthority->IsOpen());
+        }
+        {
+            std::string dagHealthErr;
+            CTxDB dagHealthDb("r");
+            pre.dagDurableStateRestored = dagHealthDb.IsDAGScoreAuthorityHealthy(&dagHealthErr);
+            // The R3 certification stage must have COMPLETED (a definite custody state was
+            // determined: VERIFIED, SUSPENDED or UNAVAILABLE — the last being the frozen
+            // fail-closed determination for a store that cannot be positively certified).
+            // Only an I/O failure leaves the stage incomplete and the barrier unset. The state is
+            // read here too so the diagnostic reflects the durable store at the true exit.
+            const DAGCustodyState exitCustodyState = dagHealthDb.GetDAGCustodyState();
+            pre.provenanceCertificationComplete = custodyStageComplete;
+            (void)exitCustodyState;
+            dagHealthDb.Close();
+        }
+        {
+            // R2 trust projection reconciliation, evaluated over the frozen R2 domain.
+            // The composite/pre-DAG accumulated-trust provider is defined on the PRE-DAG domain
+            // and legitimately refuses a post-DAG hash; so the condition is: the authoritative
+            // domain must resolve the current best chain, and it must additionally reproduce the
+            // accumulated trust through the R2 composite provider whenever the best chain is
+            // pre-DAG. Nothing is fabricated for a post-DAG chain (the DAG trust path owns it).
+            BlockIndexSnapshot bestSnap;
+            std::string bestSnapErr;
+            const bool bestResolved =
+                ResolveAuthoritativeBlockSnapshot(hashBestChain, &bestSnap, &bestSnapErr);
+            if (bestResolved && bestSnap.height < GetForkHeightDAG())
+            {
+                std::string trustErr;
+                uint256 projectedTrust;
+                pre.trustProjectionReconciled =
+                    GetAuthoritativeAccumulatedChainTrust(hashBestChain, &projectedTrust, &trustErr);
+            }
+            else
+            {
+                pre.trustProjectionReconciled = bestResolved;
+            }
+        }
+        // FINALITY_EPOCH_OWNER_READY is a LIFECYCLE readiness condition only: the finality
+        // voter's authoritative selector runtime must be installed. No late-vote, equivocation,
+        // denominator, FINALITY_MIN_VOTERS, irreversibility or NullStake semantics are defined,
+        // chosen or normalized here.
+        pre.finalityEpochOwnerLifecycleReady = IsDagTipSelectorRuntimeRegistered();
+        std::string readyDetail;
+        const bool authorityReady = AuthorityReadyMarkIfSatisfied(pre, &readyDetail);
+        printf("BLOCKINDEX_V2_AUTHORITATIVE authority_ready=%d detail=%s\n",
+               authorityReady ? 1 : 0, readyDetail.c_str());
+        fflush(stdout);
+    }
     if (error) error->clear();
     printf("BLOCKINDEX_V2_AUTHORITATIVE startup=bootstrap best_height=%d best_chaintrust_hex=%s\n",
            nBestHeight, nBestChainTrust.GetHex().c_str());
@@ -1224,43 +1425,192 @@ uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap)
     return ((CBigNum(1) << 256) / (bnTarget + 1)).getuint256();
 }
 
-// Bounded authoritative accumulated chainTrust = chainTrust(parent) + blockTrust.
-// Walks the ACTIVE chain from genesis to `snap` (via the same navigator cold
-// reader used by ResolveAuthoritativeBlockSnapshot), accumulating
-// GetAuthoritativeBlockTrust. The walk is bounded by the fixed pre-DAG active
-// ancestry depth, never all history; no resident mapBlockIndex.
+// PRE-DAG AUTHORITATIVE ACCUMULATED TRUST.
+//
+// CONTRACT (the load-bearing invariant of this provider):
+//
+//   AuthoritativeAccumulatedTrust(H) == SUM GetAuthoritativeBlockTrust(X)
+//
+// for every block X on the REQUESTED HASH'S OWN ancestry genesis -> ... -> H,
+// resolved through the exact persisted hashPrev links of the authoritative
+// store. It is expressly NOT "the active-chain block at height(H)": a pre-DAG
+// side branch at height h has its own accumulated trust, and resolving by
+// target height alone returns the wrong uint256 for it.
+//
+// NAVIGATION (hash-driven, by value, no residency):
+//   requested hash -> exact snapshot (identity-checked)
+//                  -> exact logical parent (BlockIndexV2Reader::GetParent, which
+//                     itself validates the child record and the parent hash)
+//                  -> ... -> the ONE record whose PERSISTED authority proves it
+//                     has no parent (snapshot.hasParent == false, i.e. the
+//                     authoritative record's hashPrev is zero).
+// This is the same cold authoritative reader ResolveAuthoritativeBlockSnapshot
+// uses. It works for side branches (LookupByHash resolves any indexed record,
+// not only active ones), touches no resident CBlockIndex, no mapBlockIndex, and
+// introduces no cache. In particular it does NOT read derived.dat chainTrust as
+// accumulated-trust authority.
+//
+// PROVENANCE / END-OF-CHAIN (never repeat the F1 hot-floor bug): the walk stops
+// ONLY on a persisted `hashPrev == 0`. A child whose persisted authority claims
+// a parent (hashPrev != 0) that the store cannot resolve, a hot/resident
+// truncation, a missing local pointer, or any unavailable authority is an
+// INCONSISTENT authority and FAILS CLOSED. Absence is never reinterpreted as
+// canonical genesis.
+//
+// FAIL CLOSED on: reader unavailable/not open; requested hash absent or
+// identity-mismatched; requested hash not pre-DAG (this provider's contract);
+// any non-FOUND reader status (CORRUPT / IO_ERROR / NOT_OPEN); an unresolvable
+// claimed parent; a parent hash/height that contradicts the child
+// (parent.height == child.height - 1 required).
+//
+// BOUNDEDNESS: O(depth) time, O(1) temporary memory (one snapshot at a time, no
+// vector), no object-graph reconstruction, no cache, no mapBlockIndex /
+// mapDAGData growth. Depth is bounded by the requested height, and the requested
+// height is bounded by FORK_HEIGHT_DAG by the check below.
 bool GetAuthoritativeAccumulatedChainTrust(const uint256& hash,
                                            uint256* out, std::string* error)
 {
     if (!out) { if (error) *error = "trust accumulator: null output"; return false; }
     *out = 0;
-    const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
-    if (!reader)
+    // R2 / C2 — ONE RESOLUTION DOMAIN, ONE AUTHORITY.
+    // The pre-DAG accumulated-trust authority resolves over the SAME complete
+    // committed hot+cold domain the authoritative resolver uses
+    // (BlockIndexAuthoritativeLive::ResolveBlockSnapshot — the single current-tail
+    // snapshot seam consumed by ResolveParentScoreAuthoritative). A pre-DAG parent
+    // retained only in the MUTABLE HOT TAIL (accepted after the immutable
+    // generation was selected) therefore resolves exactly like a cold parent;
+    // residency of the parent CBlockIndex is never consulted and never decides
+    // whether the ancestor exists. A hot parent and a cold parent produce the
+    // identical semantic result.
+    //
+    // The cold immutable reader is used ONLY when no composite authority is open
+    // at all (non-authoritative / graded contexts). That is a strictly narrower
+    // domain, so it can only FAIL CLOSED — it can never substitute a value, and a
+    // hot-only parent can never be silently reported as absent genesis.
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    const bool fComposite = (live != NULL && live->IsOpen());
+    const BlockIndexV2Reader* reader = NULL;
+    if (!fComposite)
     {
-        const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
-        reader = nav ? nav->GetColdReader() : NULL;
+        reader = GetAuthoritativeNavigatorReader();
+        if (!reader)
+        {
+            const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+            reader = nav ? nav->GetColdReader() : NULL;
+        }
+        if (!reader || !reader->IsOpen()) { if (error) *error = "trust accumulator: reader unavailable"; return false; }
     }
-    if (!reader || !reader->IsOpen()) { if (error) *error = "trust accumulator: reader unavailable"; return false; }
 
-    BlockIndexSnapshot target;
-    std::string terr;
-    const BlockIndexV2ReadStatus st = reader->LookupByHash(hash, &target, &terr);
-    if (st != BLOCK_INDEX_V2_READ_FOUND) { if (error) *error = "trust accumulator: hash not resolvable: " + terr; return false; }
-    if (target.height < 0) { if (error) *error = "trust accumulator: negative height"; return false; }
-
-    // Active-chain walk from genesis to target. Bounded by the active height
-    // (= pre-DAG boundary for this consumer); designed for startup/reorg
-    // maintenance, not a hot per-tip selector path.
-    for (int h = 0; h <= target.height; ++h)
+    BlockIndexSnapshot cur;
+    std::string rerr;
+    if (fComposite)
     {
-        BlockIndexSnapshot cur;
-        std::string cerr;
-        const BlockIndexV2ReadStatus cst = reader->GetActiveByHeight(h, &cur, &cerr);
-        if (cst != BLOCK_INDEX_V2_READ_FOUND) { if (error) *error = "trust accumulator: active height gap at " + std::to_string(h) + ": " + cerr; return false; }
-        *out = *out + GetAuthoritativeBlockTrust(cur);
+        const BlockIndexHotStatus hst = live->ResolveBlockSnapshot(hash, &cur, &rerr);
+        if (hst != BlockIndexHotStatus::OK)
+        {
+            if (error) *error = "trust accumulator: requested hash not resolvable by value in the "
+                                "authoritative hot+cold domain: "
+                                + (rerr.empty() ? std::string("(no detail)") : rerr);
+            return false;
+        }
     }
-    if (error) error->clear();
-    return true;
+    else
+    {
+        const BlockIndexV2ReadStatus rst = reader->LookupByHash(hash, &cur, &rerr);
+        if (rst != BLOCK_INDEX_V2_READ_FOUND)
+        {
+            if (error) *error = "trust accumulator: requested hash not resolvable by value: "
+                                + (rerr.empty() ? std::string("(no detail)") : rerr);
+            return false;
+        }
+    }
+    if (!cur.found || cur.hash != hash)
+    {
+        if (error) *error = "trust accumulator: requested hash identity mismatch for " + hash.GetHex();
+        return false;
+    }
+    if (cur.height < 0) { if (error) *error = "trust accumulator: negative height"; return false; }
+    if (cur.height >= GetForkHeightDAG())
+    {
+        // This provider is the PRE-DAG accumulated-trust authority. A post-DAG
+        // route reaching it is inconsistent metadata, not a pre-DAG parent.
+        if (error) *error = "trust accumulator: hash " + hash.GetHex()
+                            + " is not pre-DAG (height " + std::to_string(cur.height) + ")";
+        return false;
+    }
+
+    uint256 acc = 0;
+    for (;;)
+    {
+        acc = acc + GetAuthoritativeBlockTrust(cur);
+        if (!cur.hasParent)
+        {
+            // The persisted authoritative record itself proves this vertex is a
+            // chain start (authoritative hashPrev == 0). Not an inferred
+            // termination and not a resident/hot truncation.
+            *out = acc;
+            if (error) error->clear();
+            return true;
+        }
+
+        BlockIndexSnapshot parent;
+        std::string perr;
+        if (fComposite)
+        {
+            // Same composite domain for the ancestry walk: the parent is resolved
+            // by its claimed hashPrev within the complete committed hot+cold
+            // domain, so a hot-only ancestor is walked exactly like a cold one.
+            const BlockIndexHotStatus phst = live->ResolveBlockSnapshot(cur.hashPrev, &parent, &perr);
+            if (phst == BlockIndexHotStatus::AUTHORITY_MISSING)
+            {
+                // The child's persisted authority claims a parent (hashPrev != 0)
+                // but the complete committed hot+cold domain does not carry it.
+                // Incomplete authority is NEVER read as canonical genesis.
+                if (error) *error = "trust accumulator: claimed parent " + cur.hashPrev.GetHex()
+                                    + " of " + cur.hash.GetHex()
+                                    + " is absent from the authoritative hot+cold domain";
+                return false;
+            }
+            if (phst != BlockIndexHotStatus::OK)
+            {
+                if (error) *error = "trust accumulator: parent authority failure at " + cur.hash.GetHex() + ": "
+                                    + (perr.empty() ? std::string("(no detail)") : perr);
+                return false;
+            }
+        }
+        else
+        {
+            const BlockIndexV2ReadStatus pst = reader->GetParent(cur.id, &parent, &perr);
+            if (pst == BLOCK_INDEX_V2_READ_NOT_FOUND)
+            {
+                // The child's persisted authority claims a parent (hashPrev != 0)
+                // but no authoritative record carries that hash. Incomplete
+                // authority is NEVER read as canonical genesis.
+                if (error) *error = "trust accumulator: claimed parent " + cur.hashPrev.GetHex()
+                                    + " of " + cur.hash.GetHex() + " is absent from the authoritative store";
+                return false;
+            }
+            if (pst != BLOCK_INDEX_V2_READ_FOUND)
+            {
+                if (error) *error = "trust accumulator: parent authority failure at " + cur.hash.GetHex() + ": "
+                                    + (perr.empty() ? std::string("(no detail)") : perr);
+                return false;
+            }
+        }
+        if (!parent.found || parent.hash != cur.hashPrev)
+        {
+            if (error) *error = "trust accumulator: parent identity mismatch for " + cur.hash.GetHex();
+            return false;
+        }
+        if (parent.height != cur.height - 1)
+        {
+            if (error) *error = "trust accumulator: parent height inconsistency at " + cur.hash.GetHex()
+                                + " (child " + std::to_string(cur.height)
+                                + ", parent " + std::to_string(parent.height) + ")";
+            return false;
+        }
+        cur = parent;
+    }
 }
 
 // ---------------------------------------------------------------------------

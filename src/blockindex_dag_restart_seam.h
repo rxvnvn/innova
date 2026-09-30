@@ -63,7 +63,18 @@ struct DagRestartResult
     bool     ok;
     std::string error;
 
-    DagRestartResult() : totalRestored(0), ok(false) {}
+    // R3 / C6 section 6 + R3.8 — provenance custody state observed over the SAME
+    // durable store, reported (never "interpreted"): 0 == VERIFIED, 1 == SUSPENDED,
+    // 2 == UNAVAILABLE. A watermark mismatch, an absent/invalid certificate, an
+    // unavailable engine capability or a suspended custody is NOT empty DAG state,
+    // NOT zero state and NOT an objectively pruned row. The restore set above is
+    // unaffected (it restores PRESENT nonzero scores); any decision about an ABSENT
+    // row is "affected reconstruction" and fails closed through the final predicate.
+    int custodyState;
+    bool provenanceUnavailable;
+    std::string custodyDetail;
+
+    DagRestartResult() : totalRestored(0), ok(false), custodyState(2), provenanceUnavailable(true) {}
 };
 
 // By-value DAG restart seam.
@@ -78,6 +89,26 @@ struct DagRestartResult
 // mutates global DAG consensus state. It is a pure read-side by-value
 // reconstruction used as the correctness substrate for D (and for differential
 // tests proving parity with the legacy oracle).
+// R3 section 2 / section 4 — PRODUCTION CUSTODY WIRING.
+//
+// Called by the authoritative startup at the frozen lifecycle point (all durable
+// prerequisites loaded and validated, nothing published yet) and implemented on top of
+// the SAME certification/seal implementation the R3.6/R3.7 machinery already uses — there
+// is deliberately no startup-only interpretation of provenance.
+//
+//   * an already VERIFIED custody (exact sealed watermark + verifying certificate) is
+//     confirmed;
+//   * a store with no seal at all is certified from its own durable state (certified
+//     domain from the clean height / prune floor) with custody-epoch establishment — no
+//     backfill, no forced reindex, no manufactured provenance for historical absences;
+//   * a SUSPENDED custody (watermark continuity lost) is never re-certified into
+//     admissibility, and a seal that failed to verify is never overridden;
+//   * a store without a certifiable domain or with a refusing scan stays UNCERTIFIED.
+//
+// custodyState: 0 == VERIFIED, 1 == SUSPENDED, 2 == UNAVAILABLE (as DagRestartResult).
+// Returns false only on a storage-level failure of the custody records themselves.
+bool EstablishDAGProvenanceCustodyAtStartup(int* custodyState, uint64_t* epoch, std::string* detail);
+
 class BlockIndexDagRestartSeam
 {
 public:

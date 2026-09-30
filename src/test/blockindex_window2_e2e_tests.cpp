@@ -50,6 +50,7 @@
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
 #include <openssl/sha.h>
+#include <leveldb/db.h>
 #include <thread>
 #include <fstream>
 
@@ -1211,6 +1212,2537 @@ BOOST_AUTO_TEST_CASE(r2c1d3b_authoritative_owner_real_nonresident_add)
     BOOST_REQUIRE(input.eof()); BOOST_REQUIRE_EQUAL(input.gcount(),0);
     BOOST_CHECK(oracle==tips);
     BOOST_TEST_MESSAGE("REAL authoritative owner: {P}->{C}; historical DAG residency absent; CLEAN("<<current.GetHex()<<")");
+}
+
+// ---------------------------------------------------------------------------
+// F2 — AUTHORITATIVE DAG PARENT-SCORE / SELECTED-PARENT CUTOVER
+//
+// INVARIANT UNDER TEST: DAG PARENT SCORE TRUTH != mapDAGData RESIDENCY and
+//                       != mapBlockIndex RESIDENCY.
+//
+// Fixture: a post-DAG PoW parent P that is LOGICALLY PRESENT (its canonical
+// persisted daglinks row exists and the score authority is HEALTHY) but
+// NONRESIDENT in BOTH RAM maps (absent from mapDAGData AND mapBlockIndex), and
+// a child referencing P as its only DAG parent.
+//
+// RED (pre-repair): the parent-score lookup misses both RAM maps, so
+//   nParentScore is silently 0; the child's nDAGScore collapses to its own
+//   GetBlockTrust() and the fully-resident oracle is not reproduced.
+// GREEN (post-repair): the parent score is resolved from the certified
+//   persisted DAG score authority; child nDAGScore == oracle exactly.
+// Single-parent child => no merge-blue contribution, so the fully-resident
+// oracle is exactly parentAuthoritativeScore + childOwnTrust.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(f2_authoritative_nonresident_parent_score_cutover)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+
+    // 1. Reach FORK_HEIGHT_DAG and take one post-DAG PoW parent P (real path).
+    CBlockIndex* parent = pindexBest;
+    BOOST_REQUIRE(parent);
+    while (parent->nHeight < GetForkHeightDAG())
+        parent = MineReal(parent, 0x8200 + parent->nHeight);
+    parent = MineRealDag(parent, 0x8211);
+    const uint256 P = parent->GetBlockHash();
+
+    // 2. Build (and re-mine) the child block that references P as its only DAG
+    //    parent, while the resident pointer graph is still intact (the child
+    //    template reads pindexPrev->phashBlock).
+    std::unique_ptr<CBlock> child(BuildPoWBlock(parent, 0x8212));
+    BOOST_REQUIRE(child.get());
+    AttachDagParentsAndRemine(child.get(), std::vector<uint256>(1, P));
+    const uint256 C = child->GetHash();
+
+    // 3. Authoritative generation from the live txleveldb snapshot (the same
+    //    construction the accepted authoritative fixtures use).
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("f2-parent-score-%%%%-%%%%");
+    fs::create_directories(root / "snapshot");
+
+    std::map<uint256, CBlockIndex*> savedMap;
+    { LOCK(cs_main); savedMap = mapBlockIndex; }
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+    struct Cleanup {
+        fs::path root; std::map<uint256, CBlockIndex*> savedMap;
+        CBlockIndex* best; CBlockIndex* genesis;
+        uint256 bestChain; int bestHeight; uint256 bestTrust;
+        Cleanup(const fs::path& r, const std::map<uint256, CBlockIndex*>& m,
+                CBlockIndex* b, CBlockIndex* g, const uint256& bc, int bh, const uint256& bt)
+            : root(r), savedMap(m), best(b), genesis(g), bestChain(bc), bestHeight(bh), bestTrust(bt) {}
+        ~Cleanup() {
+            ResetBlockIndexAuthoritativeStartupForTest();
+            { LOCK(cs_main); if (!savedMap.empty()) RestoreMapBlockIndexForFixture(savedMap); }
+            pindexBest = best; pindexGenesisBlock = genesis;
+            hashBestChain = bestChain; nBestHeight = bestHeight; nBestChainTrust = bestTrust;
+            try { fs::remove_all(root); } catch (...) {}
+        }
+    } cleanup(root, savedMap, savedBest, savedGenesis, savedBestChain, savedBestHeight, savedBestTrust);
+
+    { CTxDB db; db.Close(); }
+    const auto live = GetDataDir() / "txleveldb";
+    for (fs::directory_iterator it(live), end; it != end; ++it)
+        if (fs::is_regular_file(it->path())) fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
+    BlockIndexGenerationSource source; std::string error;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, &error), error);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root / "snapshot").string(), &source.dagLinks, &source.dagScores, &error), error);
+    source.foundDAGLinks = true;
+    source.blockDataDir = GetDataDir().string();
+    source.dagLinksDir = (root / "snapshot").string();
+    BlockIndexGenerationBuilder builder;
+    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, &error), error);
+    builder.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
+
+    // 4. Make P genuinely NONRESIDENT: clear both RAM maps and the globals.
+    { LOCK(cs_main); mapBlockIndex.clear(); }
+    { LOCK(g_dagManager.cs_dag); g_dagManager.ClearDAGDataForTest(); }
+    pindexBest = NULL; pindexGenesisBlock = NULL;
+    nBestHeight = -1; hashBestChain = uint256(0); nBestChainTrust = uint256(0);
+
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
+
+    // 5. F2 preconditions: P logically present + healthy authority, but
+    //    nonresident in BOTH RAM maps.
+    BOOST_REQUIRE(!g_dagManager.HasDAGData(P));
+    { LOCK(cs_main); BOOST_REQUIRE_EQUAL((unsigned)mapBlockIndex.count(P), 0u); }
+    CBlockDAGData pRow;
+    std::string he;
+    {
+        CTxDB db;
+        BOOST_REQUIRE_MESSAGE(db.ReadDAGLinks(P, pRow),
+            "F2 precondition: parent P must have a canonical persisted daglinks row");
+        BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&he), he);
+    }
+    BOOST_TEST_MESSAGE("F2 PRECONDITION parent=" << P.GetHex()
+        << " parentRowAbsentFamilies=0 canonicalScore=" << pRow.nDAGScore.GetHex()
+        << " scoreAuthorityHealthy=1 mapDAGDataHasParent=" << (g_dagManager.HasDAGData(P) ? 1 : 0));
+
+    // 6. Accept the child through the REAL production accept path.
+    unsigned int file = 0, pos = 0;
+    BOOST_REQUIRE(child->WriteToDisk(file, pos));
+    CBlockIndex* childIndex = NULL;
+    { LOCK(cs_main);
+      BOOST_REQUIRE_MESSAGE(child->AddToBlockIndex(file, pos, C),
+          "F2: authoritative accept of a child with a nonresident parent must not fail");
+      childIndex = mapBlockIndex[C]; }
+    BOOST_REQUIRE(childIndex);
+
+    // 7. Fully-resident oracle (single parent => no newly-blue merge term).
+    const uint256 ownTrust = childIndex->GetBlockTrust();
+    const uint256 oracle = pRow.nDAGScore + ownTrust;
+    CBlockDAGData childData;
+    BOOST_REQUIRE(g_dagManager.GetDAGData(C, childData));
+    BOOST_TEST_MESSAGE("F2 child=" << C.GetHex()
+        << " parentAuthScore=" << pRow.nDAGScore.GetHex()
+        << " ownTrust=" << ownTrust.GetHex()
+        << " childDAGScore=" << childData.nDAGScore.GetHex()
+        << " oracle=" << oracle.GetHex()
+        << " childChainTrust=" << childIndex->nChainTrust.GetHex()
+        << " becameBest=" << (pindexBest == childIndex ? 1 : 0));
+
+    BOOST_CHECK_MESSAGE(childData.nDAGScore == oracle,
+        "F2 RED/GREEN: child nDAGScore must equal the fully-resident oracle "
+        "(authoritative parent score + own trust). A mismatch whose childDAGScore "
+        "equals ownTrust alone is the F2 silent-zero collapse.");
+    BOOST_CHECK_MESSAGE(childIndex->nChainTrust == oracle,
+        "F2: child nChainTrust (DAG score) must equal the fully-resident oracle");
+
+    // Selected-parent identity for a single-parent child is trivially P, and the
+    // legacy GetSelectedParent view must agree with the authoritative score
+    // selection while the parent score is the authority's.
+    LOCK(g_dagManager.cs_dag);
+    BOOST_CHECK(g_dagManager.GetSelectedParent(C) == P);
+}
+
+// ---------------------------------------------------------------------------
+// F2 — parent-score resolver contract: fully-resident parity, typed
+// NOT_FOUND, the VALID-ZERO control, and the fail-closed authority matrix.
+//
+// This case keeps the resident pointer graph INTACT (no clear) so the legacy
+// resident rule and the authoritative rule can be compared directly on the same
+// hashes: the authoritative resolver must reproduce the exact legacy value
+// wherever the legacy source is authoritative (FULL_RESIDENT_PARITY), must
+// distinguish a legitimate zero score from a failure, and must fail closed when
+// the score authority is unavailable.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(f2_parent_score_resolver_parity_and_contract)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+
+    CBlockIndex* tip = pindexBest;
+    BOOST_REQUIRE(tip);
+    while (tip->nHeight < GetForkHeightDAG()) tip = MineReal(tip, 0x8300 + tip->nHeight);
+    tip = MineRealDag(tip, 0x8311);
+    const uint256 postDagHash = tip->GetBlockHash();
+
+    // Capture resident hashes by height from the intact chain.
+    std::map<int, uint256> byHeight;
+    { LOCK(cs_main);
+      for (CBlockIndex* w = tip; w; w = w->pprev) byHeight[w->nHeight] = w->GetBlockHash(); }
+    BOOST_REQUIRE(byHeight.count(9) && byHeight.count(10) && byHeight.count(GetForkHeightDAG() - 1));
+
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("f2-resolver-%%%%-%%%%");
+    fs::create_directories(root / "snapshot");
+
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+    struct Cleanup {
+        fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        uint256 bestChain; int bestHeight; uint256 bestTrust;
+        Cleanup(const fs::path& r, CBlockIndex* b, CBlockIndex* g, const uint256& bc, int bh, const uint256& bt)
+            : root(r), best(b), genesis(g), bestChain(bc), bestHeight(bh), bestTrust(bt) {}
+        ~Cleanup() {
+            ResetBlockIndexAuthoritativeStartupForTest();
+            pindexBest = best; pindexGenesisBlock = genesis;
+            hashBestChain = bestChain; nBestHeight = bestHeight; nBestChainTrust = bestTrust;
+            try { fs::remove_all(root); } catch (...) {}
+        }
+    } cleanup(root, savedBest, savedGenesis, savedBestChain, savedBestHeight, savedBestTrust);
+
+    { CTxDB db; db.Close(); }
+    const auto live = GetDataDir() / "txleveldb";
+    for (fs::directory_iterator it(live), end; it != end; ++it)
+        if (fs::is_regular_file(it->path())) fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
+    BlockIndexGenerationSource source; std::string error;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, &error), error);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root / "snapshot").string(), &source.dagLinks, &source.dagScores, &error), error);
+    source.foundDAGLinks = true;
+    source.blockDataDir = GetDataDir().string();
+    source.dagLinksDir = (root / "snapshot").string();
+    BlockIndexGenerationBuilder builder;
+    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, &error), error);
+    builder.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+
+    // ---- FULL_RESIDENT_PARITY -------------------------------------------
+    // Post-DAG PoW parent: authoritative == legacy == the resident value.
+    {
+        CBlockIndex* p = NULL; { LOCK(cs_main); std::map<uint256,CBlockIndex*>::iterator m = mapBlockIndex.find(postDagHash); BOOST_REQUIRE(m != mapBlockIndex.end()); p = m->second; }
+        std::string e1, e2;
+        CDAGManager::DAGParentScoreResult auth = g_dagManager.ResolveDagParentScore(postDagHash, true, &e1);
+        CDAGManager::DAGParentScoreResult leg  = g_dagManager.ResolveDagParentScore(postDagHash, false, &e2);
+        BOOST_CHECK_EQUAL((int)auth.status, (int)CDAGManager::DAGParentScoreStatus::FOUND);
+        BOOST_CHECK_EQUAL((int)leg.status,  (int)CDAGManager::DAGParentScoreStatus::FOUND);
+        BOOST_CHECK_MESSAGE(auth.score == leg.score, "post-DAG PoW full-resident parity: authoritative != legacy");
+        BOOST_CHECK_MESSAGE(leg.score == p->nChainTrust, "post-DAG PoW full-resident parity: legacy != resident nChainTrust");
+        BOOST_TEST_MESSAGE("F2 PARITY postDag=" << postDagHash.GetHex()
+            << " auth=" << auth.score.GetHex() << " legacy=" << leg.score.GetHex()
+            << " resident=" << p->nChainTrust.GetHex());
+    }
+    // Pre-DAG parents (POEM-era entropy weighting and below-POEM reciprocal).
+    for (int h : {5, 9, 10, GetForkHeightDAG() - 1})
+    {
+        const uint256 hp = byHeight[h];
+        std::string e1, e2;
+        CDAGManager::DAGParentScoreResult auth = g_dagManager.ResolveDagParentScore(hp, true, &e1);
+        CDAGManager::DAGParentScoreResult leg  = g_dagManager.ResolveDagParentScore(hp, false, &e2);
+        CBlockIndex* p = NULL; { LOCK(cs_main); std::map<uint256,CBlockIndex*>::iterator m = mapBlockIndex.find(hp); if (m != mapBlockIndex.end()) p = m->second; }
+        BOOST_REQUIRE(p != NULL);
+        BOOST_CHECK_EQUAL((int)auth.status, (int)CDAGManager::DAGParentScoreStatus::FOUND);
+        BOOST_CHECK_MESSAGE(auth.score == leg.score, "pre-DAG full-resident parity: authoritative != legacy at height " << h);
+        BOOST_CHECK_MESSAGE(leg.score == p->nChainTrust, "pre-DAG full-resident parity: legacy != resident nChainTrust at height " << h);
+        BOOST_TEST_MESSAGE("F2 PARITY preDag h=" << h << " hash=" << hp.GetHex()
+            << " auth=" << auth.score.GetHex() << " legacy=" << leg.score.GetHex()
+            << " resident=" << p->nChainTrust.GetHex());
+    }
+
+    // ---- NOT_FOUND (never a silent zero, never a failure) ---------------
+    {
+        uint256 ghost("0xdeadbeef00000000000000000000000000000000000000000000000000000001");
+        std::string e1, e2;
+        CDAGManager::DAGParentScoreResult auth = g_dagManager.ResolveDagParentScore(ghost, true, &e1);
+        CDAGManager::DAGParentScoreResult leg  = g_dagManager.ResolveDagParentScore(ghost, false, &e2);
+        BOOST_CHECK_EQUAL((int)auth.status, (int)CDAGManager::DAGParentScoreStatus::NOT_FOUND);
+        BOOST_CHECK_EQUAL((int)leg.status,  (int)CDAGManager::DAGParentScoreStatus::NOT_FOUND);
+        BOOST_CHECK(auth.score == 0 && leg.score == 0);
+        BOOST_TEST_MESSAGE("F2 NOT_FOUND ghost=" << ghost.GetHex() << " authStatus=" << (int)auth.status
+            << " legacyStatus=" << (int)leg.status);
+    }
+
+    // ---- VALID ZERO control: a healthy canonical row whose score is EXACTLY
+    //      zero must stay FOUND(0), distinct from any failure. ------------
+    {
+        CBlockDAGData original;
+        { CTxDB db; BOOST_REQUIRE(db.ReadDAGLinks(postDagHash, original)); }
+        CBlockDAGData zeroed = original; zeroed.nDAGScore = 0;
+        g_dagManager.SetDAGDataForTest(postDagHash, zeroed);
+        { CTxDB db; BOOST_REQUIRE(db.TxnBegin()); BOOST_REQUIRE(g_dagManager.WriteDAGLinks(db, postDagHash)); BOOST_REQUIRE(db.TxnCommit()); }
+        std::string e1;
+        CDAGManager::DAGParentScoreResult auth = g_dagManager.ResolveDagParentScore(postDagHash, true, &e1);
+        BOOST_CHECK_EQUAL((int)auth.status, (int)CDAGManager::DAGParentScoreStatus::FOUND);
+        BOOST_CHECK_MESSAGE(auth.score == 0,
+            "VALID ZERO: a legitimate authoritative score of zero must remain FOUND(0)");
+        BOOST_TEST_MESSAGE("F2 VALID_ZERO status=" << (int)auth.status << " score=" << auth.score.GetHex());
+        // restore the canonical row
+        g_dagManager.SetDAGDataForTest(postDagHash, original);
+        { CTxDB db; BOOST_REQUIRE(db.TxnBegin()); BOOST_REQUIRE(g_dagManager.WriteDAGLinks(db, postDagHash)); BOOST_REQUIRE(db.TxnCommit()); }
+    }
+
+    // ---- FAIL_CLOSED: revoked score authority -> FAILURE, never 0 -------
+    {
+        { CTxDB db; BOOST_REQUIRE(db.RevokeDAGScoreAuthorityForTest()); }
+        std::string e1;
+        CDAGManager::DAGParentScoreResult auth = g_dagManager.ResolveDagParentScore(postDagHash, true, &e1);
+        BOOST_CHECK_EQUAL((int)auth.status, (int)CDAGManager::DAGParentScoreStatus::FAILURE);
+        BOOST_TEST_MESSAGE("F2 FAIL_CLOSED revoked status=" << (int)auth.status << " error=" << e1);
+        // legacy mode must be unaffected by the authority state
+        std::string e2;
+        CDAGManager::DAGParentScoreResult leg = g_dagManager.ResolveDagParentScore(postDagHash, false, &e2);
+        BOOST_CHECK_EQUAL((int)leg.status, (int)CDAGManager::DAGParentScoreStatus::FOUND);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F2 AUDIT BLOCKER REPAIR — shared fixture: build, publish, select an
+// authoritative generation from the CURRENT live txleveldb content and boot the
+// authoritative startup. Isolated temp root only; never the production datadir.
+// ---------------------------------------------------------------------------
+static void F2BuildAuthoritativeGenerationAndInit(const fs::path& root, std::string* error)
+{
+    using namespace dag_tip_frontier;
+    fs::create_directories(root / "snapshot");
+    { CTxDB db; db.Close(); }
+    const auto live = GetDataDir() / "txleveldb";
+    for (fs::directory_iterator it(live), end; it != end; ++it)
+        if (fs::is_regular_file(it->path())) fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
+    BlockIndexGenerationSource source;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, error), *error);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root / "snapshot").string(), &source.dagLinks, &source.dagScores, error), *error);
+    source.foundDAGLinks = true;
+    source.blockDataDir = GetDataDir().string();
+    source.dagLinksDir = (root / "snapshot").string();
+    BlockIndexGenerationBuilder builder;
+    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, error), *error);
+    builder.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), error), *error);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+}
+
+// ---------------------------------------------------------------------------
+// F2 AUDIT BLOCKER REPAIR — PERMANENT PRE-DAG SIDE-BRANCH HASH-ANCESTRY PARITY
+//
+// LOAD-BEARING INVARIANT: PRE-DAG TRUST TRUTH != ACTIVE CHAIN AT SAME HEIGHT.
+//
+// The independent audit rejected the first F2 candidate because the pre-DAG
+// authoritative provider resolved the REQUESTED hash's height and then summed
+// the ACTIVE chain 0..height, i.e. it returned active-chain accumulated trust at
+// that height rather than accumulated trust along the requested hash's own
+// branch. The auditor's discriminator (a resident h=10 side parent) got
+// 0x2000f183575 (active-chain-at-height) instead of its own branch value
+// 0x200f454841e.
+//
+// FIXTURE (three divergent pre-DAG side branches, all fully resident, all
+// indexed, none of them the active block at its own height):
+//   a7 -> a8 -> a9 -> a10   (ACTIVE chain; regtest FORK_HEIGHT_DAG == 11,
+//                            FORK_HEIGHT_POEM == 9)
+//   sideAtPoem   : child of a8, height 9   (diverges AT/after POEM)
+//   sideLow8     : child of a7, height 8   (diverges BELOW POEM)
+//   sideLow9     : child of sideLow8, height 9 (two-block side ancestry below POEM)
+// Because every requested side hash sits strictly below the active best height,
+// none of them can be "the active block at that height".
+//
+// REQUIRED: for every requested side parent,
+//   authoritative resolver == legacy resolver == that side block's own
+//   resident nChainTrust (== SUM GetAuthoritativeBlockTrust over its ancestry),
+// and the authoritative value must DIFFER from the authoritative value of the
+// active block at the same height. That inequality is load-bearing: it is what
+// prevents a silent regression back to GetActiveByHeight.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(f2_pre_dag_side_branch_hash_ancestry_parity)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+
+    // 1. Build the active pre-DAG chain up to the LAST pre-DAG height.
+    const int hPreDag = GetForkHeightDAG() - 1;
+    // Order-robust fixture: locate the ACTIVE-chain ancestor at the last pre-DAG
+    // height. Earlier cases in the same process may leave a much deeper chain, so
+    // this case must build its pre-DAG fixture on the real active ancestry rather
+    // than assume the ambient tip height.
+    CBlockIndex* a10 = pindexBest;
+    while (a10->nHeight < hPreDag) a10 = MineReal(a10, 0x9100 + a10->nHeight);
+    while (a10->nHeight > hPreDag) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
+    BOOST_REQUIRE_EQUAL(a10->nHeight, hPreDag);
+    const uint256 bestHashBeforeFixture = hashBestChain;
+    CBlockIndex* a9 = a10->pprev; BOOST_REQUIRE(a9 != NULL);
+    CBlockIndex* a8 = a9->pprev;  BOOST_REQUIRE(a8 != NULL);
+    CBlockIndex* a7 = a8->pprev;  BOOST_REQUIRE(a7 != NULL);
+    BOOST_REQUIRE_EQUAL(a9->nHeight, 9);
+    BOOST_REQUIRE_EQUAL(a8->nHeight, 8);
+    BOOST_REQUIRE_EQUAL(a7->nHeight, 7);
+
+    // 2. Genuine indexed pre-DAG side branches (storage path, real block bytes).
+    CBlockIndex* sideAtPoem = AddSidePoWBlock(a8, 0x9191);      // h9, diverges AT POEM
+    BOOST_REQUIRE(sideAtPoem != NULL);
+    CBlockIndex* sideLow8 = AddSidePoWBlock(a7, 0x9192);        // h8, diverges BELOW POEM
+    BOOST_REQUIRE(sideLow8 != NULL);
+    CBlockIndex* sideLow9 = AddSidePoWBlock(sideLow8, 0x9193);  // h9, 2-block side ancestry
+    BOOST_REQUIRE(sideLow9 != NULL);
+    CBlockIndex* sideThird = AddSidePoWBlock(a8, 0x9194);       // h9, third same-height branch
+    BOOST_REQUIRE(sideThird != NULL);
+
+    BOOST_REQUIRE_EQUAL(sideAtPoem->nHeight, 9);
+    BOOST_REQUIRE_EQUAL(sideLow8->nHeight, 8);
+    BOOST_REQUIRE_EQUAL(sideLow9->nHeight, 9);
+    BOOST_REQUIRE_EQUAL(sideThird->nHeight, 9);
+
+    // Every side branch is kept STRICTLY BELOW the ambient active best height, so
+    // none of them can displace the best chain and none of the requested hashes
+    // is the active block at its own height. (A side block created AT the best
+    // height could itself win the best chain on a trust tie, which would destroy
+    // the "not the active block" premise -- hence strictly below.)
+    BOOST_REQUIRE_MESSAGE(nBestHeight > 9,
+        "F2 fixture: the active best chain must be strictly taller than the side branches");
+    BOOST_REQUIRE_MESSAGE(hashBestChain == bestHashBeforeFixture,
+        "F2 fixture: the side branches must not displace the active best chain");
+    BOOST_REQUIRE_MESSAGE(sideAtPoem->GetBlockHash() != a9->GetBlockHash(),
+        "F2 fixture: sideAtPoem must not be the active block at height 9");
+    BOOST_REQUIRE_MESSAGE(sideLow9->GetBlockHash() != a9->GetBlockHash(),
+        "F2 fixture: sideLow9 must not be the active block at height 9");
+    BOOST_REQUIRE_MESSAGE(sideThird->GetBlockHash() != a9->GetBlockHash(),
+        "F2 fixture: sideThird must not be the active block at height 9");
+    BOOST_REQUIRE_MESSAGE(sideLow8->GetBlockHash() != a8->GetBlockHash(),
+        "F2 fixture: sideLow8 must not be the active block at height 8");
+    // Multiple side branches at the SAME height (h9), all different hashes.
+    BOOST_REQUIRE(sideAtPoem->GetBlockHash() != sideLow9->GetBlockHash());
+    BOOST_REQUIRE(sideAtPoem->GetBlockHash() != sideThird->GetBlockHash());
+    BOOST_REQUIRE(sideLow9->GetBlockHash() != sideThird->GetBlockHash());
+    // Discriminating branch trust (height >= FORK_HEIGHT_POEM, where the legacy
+    // per-block trust mixes in GetBlockEntropy of the block hash, so same-height
+    // branches genuinely differ).
+    BOOST_REQUIRE_MESSAGE(sideAtPoem->nChainTrust != a9->nChainTrust,
+        "F2 fixture: side/active accumulated trust must differ at height 9");
+    BOOST_REQUIRE_MESSAGE(sideLow9->nChainTrust != a9->nChainTrust,
+        "F2 fixture: sideLow9/active accumulated trust must differ at height 9");
+    BOOST_REQUIRE_MESSAGE(sideThird->nChainTrust != a9->nChainTrust,
+        "F2 fixture: sideThird/active accumulated trust must differ at height 9");
+    BOOST_REQUIRE_MESSAGE(sideAtPoem->nChainTrust != sideLow9->nChainTrust,
+        "F2 fixture: the same-height side branches must carry different trust");
+    BOOST_REQUIRE_MESSAGE(sideAtPoem->nChainTrust != sideThird->nChainTrust,
+        "F2 fixture: the same-height side branches must carry different trust");
+    // OBSERVATION (consensus chain format, NOT a defect): BELOW FORK_HEIGHT_POEM
+    // the legacy per-block trust is the reciprocal of the compact target and thus
+    // depends only on nBits (== height in regtest), so two same-height blocks
+    // below POEM accumulate exactly the same trust. A below-POEM divergence is
+    // therefore observable in the ACCUMULATED value only when the requested
+    // height is >= POEM, which is what the depth-2 case exercises. No inequality
+    // is asserted at h=8 because it would be false by consensus, not by defect.
+    BOOST_REQUIRE_MESSAGE(sideLow8->nChainTrust == a8->nChainTrust,
+        "F2 fixture: below POEM, same-height accumulated trust is target-reciprocal");
+
+    // Expected values captured while the resident graph is authoritative for them.
+    struct Case { const char* name; CBlockIndex* side; CBlockIndex* activePeer; };
+    const Case cases[3] = {
+        { "divergesAtOrAfterPoem(h9)", sideAtPoem, a9 },
+        { "divergesBelowPoem(h9,depth2)", sideLow9, a9 },
+        { "thirdSameHeightBranch(h9)", sideThird, a9 }
+    };
+
+    // 3. Authoritative generation + boot (maps are NOT cleared: full residency).
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("f2-sidebranch-%%%%-%%%%");
+    std::map<uint256, CBlockIndex*> savedMap;
+    { LOCK(cs_main); savedMap = mapBlockIndex; }
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+    struct Cleanup {
+        fs::path root; std::map<uint256, CBlockIndex*> savedMap;
+        CBlockIndex* best; CBlockIndex* genesis;
+        uint256 bestChain; int bestHeight; uint256 bestTrust;
+        Cleanup(const fs::path& r, const std::map<uint256, CBlockIndex*>& m,
+                CBlockIndex* b, CBlockIndex* g, const uint256& bc, int bh, const uint256& bt)
+            : root(r), savedMap(m), best(b), genesis(g), bestChain(bc), bestHeight(bh), bestTrust(bt) {}
+        ~Cleanup() {
+            ResetBlockIndexAuthoritativeStartupForTest();
+            { LOCK(cs_main); if (!savedMap.empty()) RestoreMapBlockIndexForFixture(savedMap); }
+            pindexBest = best; pindexGenesisBlock = genesis;
+            hashBestChain = bestChain; nBestHeight = bestHeight; nBestChainTrust = bestTrust;
+            try { fs::remove_all(root); } catch (...) {}
+        }
+    } cleanup(root, savedMap, savedBest, savedGenesis, savedBestChain, savedBestHeight, savedBestTrust);
+
+    std::string error;
+    F2BuildAuthoritativeGenerationAndInit(root, &error);
+
+    // 4. Required parity on the SAME requested hashes.
+    for (int i = 0; i < 3; ++i)
+    {
+        const uint256 req = cases[i].side->GetBlockHash();
+        const uint256 peer = cases[i].activePeer->GetBlockHash();
+        const uint256 expectedSide = cases[i].side->nChainTrust;   // legacy resident truth
+        const uint256 expectedPeer = cases[i].activePeer->nChainTrust;
+        BOOST_REQUIRE(expectedSide != expectedPeer);
+
+        std::string e1, e2, e3, e4;
+        CDAGManager::DAGParentScoreResult auth =
+            g_dagManager.ResolveDagParentScore(req, true, &e1);
+        CDAGManager::DAGParentScoreResult leg =
+            g_dagManager.ResolveDagParentScore(req, false, &e2);
+        BOOST_CHECK_EQUAL((int)auth.status, (int)CDAGManager::DAGParentScoreStatus::FOUND);
+        BOOST_CHECK_EQUAL((int)leg.status, (int)CDAGManager::DAGParentScoreStatus::FOUND);
+        BOOST_CHECK_MESSAGE(auth.score == expectedSide,
+            "F2 " << cases[i].name << ": authoritative != side branch nChainTrust (" << e1 << ")");
+        BOOST_CHECK_MESSAGE(leg.score == expectedSide,
+            "F2 " << cases[i].name << ": legacy != side branch nChainTrust");
+        BOOST_CHECK_MESSAGE(auth.score == leg.score,
+            "F2 " << cases[i].name << ": authoritative != legacy on the same hash");
+
+        uint256 accSide = 0, accPeer = 0;
+        BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(req, &accSide, &e3), e3);
+        BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(peer, &accPeer, &e4), e4);
+        BOOST_CHECK_MESSAGE(accSide == expectedSide,
+            "F2 " << cases[i].name << ": repaired provider != side branch accumulated trust");
+        BOOST_CHECK_MESSAGE(accPeer == expectedPeer,
+            "F2 " << cases[i].name << ": provider != active accumulated trust");
+
+        // LOAD-BEARING: the requested-hash result must NOT be active-chain-at-height.
+        CDAGManager::DAGParentScoreResult authPeer =
+            g_dagManager.ResolveDagParentScore(peer, true, &e4);
+        BOOST_CHECK_EQUAL((int)authPeer.status, (int)CDAGManager::DAGParentScoreStatus::FOUND);
+        BOOST_CHECK_MESSAGE(authPeer.score == expectedPeer,
+            "F2 " << cases[i].name << ": active peer authoritative parity");
+        BOOST_CHECK_MESSAGE(auth.score != authPeer.score,
+            "F2 " << cases[i].name << ": AUTHORITATIVE SIDE-BRANCH TRUST MUST DIFFER FROM "
+            "ACTIVE-CHAIN TRUST AT THE SAME HEIGHT (regression to GetActiveByHeight)");
+
+        BOOST_TEST_MESSAGE("F2 SIDEBRANCH " << cases[i].name
+            << " req=" << req.GetHex() << " height=" << cases[i].side->nHeight
+            << " auth=" << auth.score.GetHex() << " legacy=" << leg.score.GetHex()
+            << " sideResidentTrust=" << expectedSide.GetHex()
+            << " activePeer=" << peer.GetHex() << " activePeerTrust=" << expectedPeer.GetHex());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F2 AUDIT BLOCKER REPAIR — NONRESIDENT PRE-DAG SIDE-BRANCH BY-VALUE PROOF
+//
+// Phase 7: after the resident side-branch parity is GREEN, prove the SAME
+// logical branch by value with NO resident authority. The identical side-branch
+// fixture is built, the expected uint256s are captured from the resident
+// pointers, then mapBlockIndex AND mapDAGData are cleared and the authoritative
+// startup is performed from scratch. The by-value hash-ancestry resolution must
+// return the exact same uint256s, and each side branch must still differ from
+// the active chain at its own height. No residency is reconstructed.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(f2_pre_dag_nonresident_side_branch_by_value)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+
+    const int hPreDag = GetForkHeightDAG() - 1;
+    CBlockIndex* a10 = pindexBest;
+    while (a10->nHeight < hPreDag) a10 = MineReal(a10, 0x9200 + a10->nHeight);
+    while (a10->nHeight > hPreDag) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
+    BOOST_REQUIRE_EQUAL(a10->nHeight, hPreDag);
+    const uint256 bestHashBeforeFixture = hashBestChain;
+    CBlockIndex* a9 = a10->pprev; BOOST_REQUIRE(a9 != NULL);
+    CBlockIndex* a8 = a9->pprev;  BOOST_REQUIRE(a8 != NULL);
+    CBlockIndex* a7 = a8->pprev;  BOOST_REQUIRE(a7 != NULL);
+
+    CBlockIndex* sideAtPoem = AddSidePoWBlock(a8, 0x9291);
+    BOOST_REQUIRE(sideAtPoem != NULL);
+    CBlockIndex* sideLow8 = AddSidePoWBlock(a7, 0x9292);
+    BOOST_REQUIRE(sideLow8 != NULL);
+    CBlockIndex* sideLow9 = AddSidePoWBlock(sideLow8, 0x9293);
+    BOOST_REQUIRE(sideLow9 != NULL);
+    CBlockIndex* sideThird = AddSidePoWBlock(a8, 0x9295);
+    BOOST_REQUIRE(sideThird != NULL);
+
+    BOOST_REQUIRE_EQUAL(sideAtPoem->nHeight, 9);
+    BOOST_REQUIRE_EQUAL(sideLow8->nHeight, 8);
+    BOOST_REQUIRE_EQUAL(sideLow9->nHeight, 9);
+    BOOST_REQUIRE_EQUAL(sideThird->nHeight, 9);
+    BOOST_REQUIRE_MESSAGE(nBestHeight > 9,
+        "F2 fixture: the active best chain must be strictly taller than the side branches");
+    BOOST_REQUIRE_MESSAGE(hashBestChain == bestHashBeforeFixture,
+        "F2 fixture: the side branches must not displace the active best chain");
+    BOOST_REQUIRE_MESSAGE(sideAtPoem->GetBlockHash() != a9->GetBlockHash(),
+        "F2 fixture: sideAtPoem must not be the active block at height 9");
+    BOOST_REQUIRE_MESSAGE(sideLow9->GetBlockHash() != a9->GetBlockHash(),
+        "F2 fixture: sideLow9 must not be the active block at height 9");
+    BOOST_REQUIRE_MESSAGE(sideThird->GetBlockHash() != a9->GetBlockHash(),
+        "F2 fixture: sideThird must not be the active block at height 9");
+    BOOST_REQUIRE_MESSAGE(sideAtPoem->nChainTrust != a9->nChainTrust,
+        "F2 fixture: side/active accumulated trust must differ at height 9");
+    BOOST_REQUIRE_MESSAGE(sideLow9->nChainTrust != a9->nChainTrust,
+        "F2 fixture: sideLow9/active accumulated trust must differ at height 9");
+    BOOST_REQUIRE_MESSAGE(sideThird->nChainTrust != a9->nChainTrust,
+        "F2 fixture: sideThird/active accumulated trust must differ at height 9");
+    BOOST_REQUIRE_MESSAGE(sideAtPoem->nChainTrust != sideLow9->nChainTrust,
+        "F2 fixture: the same-height side branches must carry different trust");
+    BOOST_REQUIRE_MESSAGE(sideAtPoem->nChainTrust != sideThird->nChainTrust,
+        "F2 fixture: the same-height side branches must carry different trust");
+
+    struct Case { const char* name; CBlockIndex* side; CBlockIndex* activePeer; };
+    const Case cases[3] = {
+        { "divergesAtOrAfterPoem(h9)", sideAtPoem, a9 },
+        { "divergesBelowPoem(h9,depth2)", sideLow9, a9 },
+        { "thirdSameHeightBranch(h9)", sideThird, a9 }
+    };
+    uint256 reqHash[3], peerHash[3], expectedSide[3], expectedPeer[3];
+    int reqHeight[3];
+    for (int i = 0; i < 3; ++i)
+    {
+        reqHash[i] = cases[i].side->GetBlockHash();
+        peerHash[i] = cases[i].activePeer->GetBlockHash();
+        expectedSide[i] = cases[i].side->nChainTrust;
+        expectedPeer[i] = cases[i].activePeer->nChainTrust;
+        reqHeight[i] = cases[i].side->nHeight;
+        BOOST_REQUIRE(expectedSide[i] != expectedPeer[i]);
+        BOOST_REQUIRE(reqHash[i] != peerHash[i]);
+    }
+
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("f2-sidebranch-nr-%%%%-%%%%");
+    std::map<uint256, CBlockIndex*> savedMap;
+    { LOCK(cs_main); savedMap = mapBlockIndex; }
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+    struct Cleanup {
+        fs::path root; std::map<uint256, CBlockIndex*> savedMap;
+        CBlockIndex* best; CBlockIndex* genesis;
+        uint256 bestChain; int bestHeight; uint256 bestTrust;
+        Cleanup(const fs::path& r, const std::map<uint256, CBlockIndex*>& m,
+                CBlockIndex* b, CBlockIndex* g, const uint256& bc, int bh, const uint256& bt)
+            : root(r), savedMap(m), best(b), genesis(g), bestChain(bc), bestHeight(bh), bestTrust(bt) {}
+        ~Cleanup() {
+            ResetBlockIndexAuthoritativeStartupForTest();
+            { LOCK(cs_main); if (!savedMap.empty()) RestoreMapBlockIndexForFixture(savedMap); }
+            pindexBest = best; pindexGenesisBlock = genesis;
+            hashBestChain = bestChain; nBestHeight = bestHeight; nBestChainTrust = bestTrust;
+            try { fs::remove_all(root); } catch (...) {}
+        }
+    } cleanup(root, savedMap, savedBest, savedGenesis, savedBestChain, savedBestHeight, savedBestTrust);
+
+    // Prove nonresidency: both RAM maps lose the side branches AND their ancestry.
+    { LOCK(cs_main); mapBlockIndex.clear(); }
+    { LOCK(g_dagManager.cs_dag); g_dagManager.ClearDAGDataForTest(); }
+    pindexBest = NULL; pindexGenesisBlock = NULL;
+    nBestHeight = -1; hashBestChain = uint256(0); nBestChainTrust = uint256(0);
+
+    std::string error;
+    F2BuildAuthoritativeGenerationAndInit(root, &error);
+
+    for (int i = 0; i < 3; ++i)
+    {
+        { LOCK(cs_main);
+          BOOST_REQUIRE_MESSAGE(mapBlockIndex.count(reqHash[i]) == 0,
+              "F2 nonresident: side parent must be absent from mapBlockIndex");
+          BOOST_REQUIRE_MESSAGE(mapBlockIndex.count(peerHash[i]) == 0,
+              "F2 nonresident: active peer must be absent from mapBlockIndex"); }
+        BOOST_REQUIRE_MESSAGE(!g_dagManager.HasDAGData(reqHash[i]),
+            "F2 nonresident: side parent must be absent from mapDAGData");
+
+        uint256 accSide = 0, accPeer = 0;
+        std::string e1, e2;
+        BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(reqHash[i], &accSide, &e1), e1);
+        BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(peerHash[i], &accPeer, &e2), e2);
+        BOOST_CHECK_MESSAGE(accSide == expectedSide[i],
+            "F2 nonresident " << cases[i].name << ": by-value accumulated trust != resident "
+            "side-branch nChainTrust");
+        BOOST_CHECK_MESSAGE(accPeer == expectedPeer[i],
+            "F2 nonresident " << cases[i].name << ": by-value active-peer trust mismatch");
+        BOOST_CHECK_MESSAGE(accSide != accPeer,
+            "F2 nonresident " << cases[i].name << ": side-branch trust must differ from the "
+            "active chain at the same height");
+
+        std::string e3;
+        CDAGManager::DAGParentScoreResult auth =
+            g_dagManager.ResolveDagParentScore(reqHash[i], true, &e3);
+        BOOST_CHECK_EQUAL((int)auth.status, (int)CDAGManager::DAGParentScoreStatus::FOUND);
+        BOOST_CHECK_MESSAGE(auth.score == expectedSide[i],
+            "F2 nonresident " << cases[i].name << ": authoritative resolver != resident side-branch "
+            "nChainTrust (" << e3 << ")");
+
+        BOOST_TEST_MESSAGE("F2 NONRESIDENT_SIDEBRANCH " << cases[i].name
+            << " req=" << reqHash[i].GetHex() << " height=" << reqHeight[i]
+            << " auth=" << auth.score.GetHex()
+            << " expectedSideResidentTrust=" << expectedSide[i].GetHex()
+            << " activePeer=" << peerHash[i].GetHex()
+            << " activePeerTrust=" << expectedPeer[i].GetHex()
+            << " mapBlockIndexHasSide=0 mapDAGDataHasSide=0");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R2 / C2 — PRE-DAG HOT PARENT == COLD PARENT (ONE RESOLUTION DOMAIN).
+//
+// LOAD-BEARING INVARIANT: the pre-DAG accumulated-trust authority resolves over
+// the SAME complete committed hot+cold domain the authoritative resolver uses
+// (BlockIndexAuthoritativeLive::ResolveBlockSnapshot). A pre-DAG parent that
+// exists ONLY in the mutable hot tail (persisted through the real production
+// live authority after the immutable generation was selected) must
+//   * resolve by value — it did NOT before R2, because the provider was
+//     cold-only and reported "requested hash not resolvable by value",
+//   * produce the identical semantic result a cold pre-DAG parent yields: its
+//     OWN branch accumulated trust, never the active-chain value at its height,
+//   * resolve with no mapBlockIndex/mapDAGData residency at all,
+// while a genuinely absent hash still FAILS CLOSED (no fabricated genesis, no
+// zero-as-value result).
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(f2_pre_dag_hot_parent_matches_cold_parent)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+
+    // 1. Active pre-DAG chain to the last pre-DAG height; a8 (h8) is the COLD
+    //    ancestor this fixture snapshots into the immutable generation.
+    const int hPreDag = GetForkHeightDAG() - 1;
+    CBlockIndex* a10 = pindexBest;
+    while (a10->nHeight < hPreDag) a10 = MineReal(a10, 0xA400 + a10->nHeight);
+    while (a10->nHeight > hPreDag) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
+    BOOST_REQUIRE_EQUAL(a10->nHeight, hPreDag);
+    CBlockIndex* a8 = a10->pprev->pprev;
+    BOOST_REQUIRE(a8 != NULL);
+    BOOST_REQUIRE_EQUAL(a8->nHeight, 8);
+    const uint256 coldHash = a8->GetBlockHash();
+    const uint256 coldTrust = a8->nChainTrust;   // legacy resident truth
+
+    // A real pre-DAG side child of a8, created while the legacy add path is still
+    // available. Only its RECORD FIELDS are used, as the shape of a pre-DAG
+    // vertex at height 9; the HOT vertex in step 4 must be one the immutable
+    // generation cannot contain.
+    CBlockIndex* h9s = AddSidePoWBlock(a8, 0xA490);
+    BOOST_REQUIRE(h9s != NULL);
+    BOOST_REQUIRE_EQUAL(h9s->nHeight, 9);
+
+    // 2. Isolated snapshot + authoritative generation + authoritative startup.
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("f2-hotparent-%%%%-%%%%");
+    std::map<uint256, CBlockIndex*> savedMap;
+    { LOCK(cs_main); savedMap = mapBlockIndex; }
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+    struct Cleanup {
+        fs::path root; std::map<uint256, CBlockIndex*> savedMap;
+        CBlockIndex* best; CBlockIndex* genesis;
+        uint256 bestChain; int bestHeight; uint256 bestTrust;
+        Cleanup(const fs::path& r, const std::map<uint256, CBlockIndex*>& m,
+                CBlockIndex* b, CBlockIndex* g, const uint256& bc, int bh, const uint256& bt)
+            : root(r), savedMap(m), best(b), genesis(g), bestChain(bc), bestHeight(bh), bestTrust(bt) {}
+        ~Cleanup() {
+            ResetBlockIndexAuthoritativeStartupForTest();
+            { LOCK(cs_main); if (!savedMap.empty()) RestoreMapBlockIndexForFixture(savedMap); }
+            pindexBest = best; pindexGenesisBlock = genesis;
+            hashBestChain = bestChain; nBestHeight = bestHeight; nBestChainTrust = bestTrust;
+            try { fs::remove_all(root); } catch (...) {}
+        }
+    } cleanup(root, savedMap, savedBest, savedGenesis, savedBestChain, savedBestHeight, savedBestTrust);
+
+    std::string error;
+    F2BuildAuthoritativeGenerationAndInit(root, &error);
+
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE_MESSAGE(live && live->IsOpen(), "R2: production live authority must be open");
+
+    // 3. The COLD form of the pre-DAG ancestor resolves exactly (unchanged path).
+    uint256 accCold = 0; std::string eCold;
+    BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(coldHash, &accCold, &eCold), eCold);
+    BOOST_CHECK_MESSAGE(accCold == coldTrust,
+        "R2: cold pre-DAG parent accumulated trust != its own branch resident nChainTrust");
+
+    // 4. A pre-DAG vertex that exists ONLY in the mutable hot tail: its record is
+    //    persisted through the REAL production live authority (AcceptSide) after
+    //    the immutable generation was selected, so the cold generation can never
+    //    carry it. Its shape mirrors a real pre-DAG block at height 9 (a side
+    //    child of the cold a8); its hash is unique, and the projection it carries
+    //    is deliberately WRONG (a stale derived.chainTrust).
+    BlockIndexRecord hotRec = BlockIndexRecordFromIndex(h9s);
+    hotRec.hash = uint256(0xA4E1);
+    const uint256 hotHash = hotRec.hash;
+    BOOST_REQUIRE(hotHash != coldHash);
+
+    BlockIndexSnapshot hotSnap;
+    uint256 expectedHot = 0;
+    {
+        BlockIndexDerivedEntry der;
+        der.chainTrust = uint256(0xDEADBEEF);   // stale projection: NOT authority
+        der.stakeModifierChecksum = 0;
+        if (der.HasStakeModifierTime()) der.stakeModifierTime = 0;
+        std::string aerr;
+        BOOST_REQUIRE_MESSAGE(live->AcceptSide(hotRec, der, &aerr), aerr);
+        std::string herr;
+        BOOST_REQUIRE_MESSAGE(live->ResolveBlockSnapshot(hotHash, &hotSnap, &herr) == BlockIndexHotStatus::OK, herr);
+        BOOST_REQUIRE_EQUAL(hotSnap.height, 9);
+        BOOST_REQUIRE(hotSnap.hashPrev == coldHash);
+        expectedHot = accCold + GetAuthoritativeBlockTrust(hotSnap);   // own trust + cold ancestors
+    }
+    BOOST_REQUIRE(expectedHot > accCold);
+
+    // 5. LOAD-BEARING DISCRIMINATOR: the hot vertex is provably ABSENT from the
+    //    immutable generation while its cold ancestor IS present — the cold-only
+    //    provider failed exactly here before R2.
+    {
+        const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+        BOOST_REQUIRE(nav != NULL);
+        const BlockIndexV2Reader* cold = nav->GetColdReader();
+        BOOST_REQUIRE_MESSAGE(cold != NULL && cold->IsOpen(), "R2: cold generation reader must be open");
+        BlockIndexSnapshot s; std::string cerr;
+        BOOST_CHECK_MESSAGE(cold->LookupByHash(hotHash, &s, &cerr) != BLOCK_INDEX_V2_READ_FOUND,
+            "R2 fixture: the hot-only vertex must be absent from the immutable generation");
+        BlockIndexSnapshot c; std::string ce;
+        BOOST_CHECK_MESSAGE(cold->LookupByHash(coldHash, &c, &ce) == BLOCK_INDEX_V2_READ_FOUND,
+            "R2 fixture: the cold ancestor must BE present in the immutable generation");
+    }
+
+    // 6. The hot parent must now resolve by value, contributing exactly its own
+    //    block trust on top of its cold ancestors' accumulated trust — the same
+    //    rule a cold parent obeys — and never the stale persisted projection.
+    uint256 accHot = 0; std::string eHot;
+    BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(hotHash, &accHot, &eHot), eHot);
+    BOOST_CHECK_MESSAGE(accHot == expectedHot,
+        "R2: hot pre-DAG parent accumulated trust != own trust + cold ancestors");
+    BOOST_CHECK_MESSAGE(accHot > accCold,
+        "R2: the hot child must accumulate strictly more trust than its cold ancestor");
+    BOOST_CHECK_MESSAGE(accHot != uint256(0xDEADBEEF),
+        "R2: a stale persisted derived.chainTrust must NOT become semantic authority");
+
+    // 7. No residency dependence: with BOTH RAM maps cleared the identical
+    //    by-value result must still be produced (hot vertex from the mutable
+    //    authority, ancestors from the immutable generation).
+    {
+        { LOCK(cs_main); mapBlockIndex.clear(); }
+        { LOCK(g_dagManager.cs_dag); g_dagManager.ClearDAGDataForTest(); }
+        uint256 accHot2 = 0; std::string eHot2;
+        BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(hotHash, &accHot2, &eHot2), eHot2);
+        BOOST_CHECK_MESSAGE(accHot2 == expectedHot,
+            "R2: non-resident hot parent must resolve to the same by-value accumulated trust");
+        uint256 accCold2 = 0; std::string eCold2;
+        BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(coldHash, &accCold2, &eCold2), eCold2);
+        BOOST_CHECK_MESSAGE(accCold2 == coldTrust,
+            "R2: non-resident cold parent must resolve to the same by-value accumulated trust");
+    }
+
+    // 8. A genuinely absent hash still FAILS CLOSED.
+    {
+        uint256 accAbsent = 0; std::string eAbsent;
+        BOOST_CHECK_MESSAGE(!GetAuthoritativeAccumulatedChainTrust(uint256(0xA4DEAD), &accAbsent, &eAbsent),
+            "R2: an absent hash must fail closed");
+        BOOST_CHECK_MESSAGE(accAbsent == uint256(0),
+            "R2: a failed accumulation must not publish a partial/zero-as-value result");
+    }
+
+    BOOST_TEST_MESSAGE("R2_HOT_PARENT_PARITY cold=" << coldHash.GetHex() << " coldTrust=" << coldTrust.GetHex()
+        << " hot=" << hotHash.GetHex() << " expectedHot=" << expectedHot.GetHex()
+        << " accCold=" << accCold.GetHex() << " accHot=" << accHot.GetHex()
+        << " coldReaderHasHot=0 coldReaderHasCold=1 mapBlockIndexHasHot=0");
+}
+
+// ---------------------------------------------------------------------------
+// R3 / C6 — ENGINE WATERMARK CONTINUITY SUBSTRATE (read-only accessor).
+//
+// LOAD-BEARING INVARIANT (C6 section 5): continuity of provenance coverage is
+// bound to the storage engine's monotone write sequence, because every durable
+// provenance field that only the NEW writer increments (capability version,
+// provenance counter, store identity, incarnation marker, prune journal) is
+// untouched by a non-participating writer — final-state equality, including a
+// digest over all final-state bytes, therefore cannot prove writer continuity.
+// This test proves the substrate that binding rests on:
+//   (a) the read-only accessor returns the engine's own sequence;
+//   (b) one supported batch advances it by exactly its own record count
+//       (the seal arithmetic W = P + C is derivable by the writer that composed
+//        the batch, with no second write needed to update it);
+//   (c) a clean close/reopen does not advance it, so a sealed W verifies EXACTLY
+//       across a clean restart (cross-restart coverage is preserved);
+//   (d) an UNSUPPORTED writer acting BENEATH the application layer — the Astra
+//       counterexample shape: restore a row, then untagged-erase it, returning
+//       the final row state to exactly what it was — necessarily perturbs it, so
+//       a sealed value can never be preserved across such an intervention.
+// The seal/verify/suspension logic itself is R3's remaining work; this test
+// proves only the substrate it depends on.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r3_engine_watermark_continuity_substrate)
+{
+    const fs::path dbdir = GetDataDir() / "txleveldb";
+    uint64_t w0 = 0, w1 = 0, w2 = 0, w3 = 0;
+    std::string werr;
+
+    // (a) + (b): accessor present; exact supported-batch arithmetic; monotone.
+    {
+        CTxDB txdb("r+");
+        BOOST_REQUIRE_MESSAGE(txdb.ReadEngineLastSequence(&w0, &werr), werr);
+        BOOST_REQUIRE(txdb.TxnBegin());
+        BOOST_REQUIRE(txdb.WriteDAGRowErase(uint256(0x1), (int)DAGRowEraseOrigin::REORGANIZE));
+        BOOST_REQUIRE(txdb.WriteDAGRowErase(uint256(0x2), (int)DAGRowEraseOrigin::FAILED_ADD_CLEANUP));
+        BOOST_REQUIRE(txdb.TxnCommit());
+        BOOST_REQUIRE_MESSAGE(txdb.ReadEngineLastSequence(&w1, &werr), werr);
+        BOOST_CHECK_MESSAGE(w1 == w0 + 2,
+            "one supported batch of two records must advance the watermark by exactly 2 (W = P + C)");
+        BOOST_CHECK_MESSAGE(w1 > w0, "the watermark must be strictly monotone under supported writes");
+        txdb.Close();
+    }
+
+    // (c) Durability: a clean close/reopen must not advance the watermark.
+    {
+        CTxDB txdb("r+");
+        BOOST_REQUIRE_MESSAGE(txdb.ReadEngineLastSequence(&w2, &werr), werr);
+        BOOST_CHECK_MESSAGE(w2 == w1, "a clean close/reopen must not advance the watermark");
+        txdb.Close();
+    }
+
+    // (d) Foreign (unsupported) writer beneath the application layer. No
+    //     provenance field is touched; the row state is returned to exactly its
+    //     pre-intervention value.
+    {
+        leveldb::Options opt;
+        opt.create_if_missing = false;
+        leveldb::DB* raw = NULL;
+        BOOST_REQUIRE_MESSAGE(leveldb::DB::Open(opt, dbdir.string(), &raw).ok(),
+            "raw engine open for the foreign-writer probe");
+        BOOST_REQUIRE(raw != NULL);
+        const std::string fk = "r3-foreign-probe";
+        {
+            std::string v;
+            BOOST_REQUIRE_MESSAGE(raw->Get(leveldb::ReadOptions(), fk, &v).IsNotFound(),
+                "foreign probe key must start absent");
+        }
+        leveldb::WriteOptions wo;
+        wo.sync = true;
+        BOOST_REQUIRE(raw->Put(wo, fk, "restored-incarnation").ok());
+        BOOST_REQUIRE(raw->Delete(wo, fk).ok());
+        {
+            std::string v;
+            BOOST_REQUIRE_MESSAGE(raw->Get(leveldb::ReadOptions(), fk, &v).IsNotFound(),
+                "the foreign round trip must return the row to its pre-intervention state");
+        }
+        delete raw;
+    }
+    {
+        CTxDB txdb("r+");
+        BOOST_REQUIRE_MESSAGE(txdb.ReadEngineLastSequence(&w3, &werr), werr);
+        BOOST_CHECK_MESSAGE(w3 == w2 + 2,
+            "the foreign round trip (one Put + one Delete) must advance the watermark by exactly 2");
+        BOOST_CHECK_MESSAGE(w3 != w2,
+            "a final-state-identical foreign mutation MUST perturb the continuity signal");
+        txdb.Close();
+    }
+
+    BOOST_TEST_MESSAGE("R3_WATERMARK w0=" << w0 << " after_batch2=" << w1
+        << " after_reopen=" << w2 << " after_foreign_roundtrip=" << w3
+        << " foreign_records=2 final_row_state_identical=1 sealed_W_preserved=0");
+}
+
+// ---------------------------------------------------------------------------
+// R3 / C6 section 1 — TYPED ROW OUTCOME. A consensus-sensitive reader must be
+// able to tell absence, malformed, storage failure and presence apart. Bare
+// absence never becomes a prune; a malformed row never becomes missing; a
+// storage failure never becomes missing.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r3_typed_row_outcome_never_conflates_absence)
+{
+    const uint256 x = uint256(0x51);
+    const uint256 y = uint256(0x52);
+
+    // (a) present / absent / absent-below-a-prune-floor, all on a supported store.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.fBlue = true; row.nDAGScore = uint256(7); row.nDAGOrder = 3;
+        BOOST_REQUIRE(db.WriteDAGLinks(x, row));
+        BOOST_REQUIRE(db.TxnCommit());
+
+        CBlockDAGData back; DAGRowTypedOutcome out = DAGRowTypedOutcome::STORAGE_ERROR; std::string why;
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(x, &back, &out, &why));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::ROW_PRESENT_VALID,
+            "a materialized supported row must read as ROW_PRESENT_VALID");
+        BOOST_CHECK(back.nDAGOrder == 3);
+
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(y, &back, &out, &why));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED,
+            "an absent row is ROW_MISSING_UNEXPLAINED, never a prune");
+
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGPruneFloor(100000));
+        BOOST_REQUIRE(db.TxnCommit());
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(y, &back, &out, &why));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED,
+            "a prune floor alone never turns an absence into ROW_OBJECTIVELY_PRUNED");
+
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(x, DAGRowEraseOrigin::REORGANIZE));
+        BOOST_REQUIRE(db.TxnCommit());
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(x, &back, &out, &why));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED,
+            "a non-prune de-materialization still reads as UNEXPLAINED at the row level");
+        db.Close();
+    }
+
+    // (b) a malformed PRESENT row is CORRUPT, never missing. Written through the
+    //     raw engine to model an unsupported writer / corrupt payload.
+    {
+        CDataStream ks(SER_DISK, CLIENT_VERSION);
+        ks << make_pair(std::string("daglinks"), x);
+        leveldb::Options opt; opt.create_if_missing = false;
+        leveldb::DB* raw = NULL;
+        fs::path dbdir = GetDataDir() / "txleveldb";
+        BOOST_REQUIRE_MESSAGE(leveldb::DB::Open(opt, dbdir.string(), &raw).ok(), "raw open for corrupt-row injection");
+        BOOST_REQUIRE(raw != NULL);
+        leveldb::WriteOptions wo; wo.sync = true;
+        BOOST_REQUIRE(raw->Put(wo, ks.str(), std::string("xyz")).ok());
+        delete raw;
+    }
+    {
+        CTxDB db("r+");
+        CBlockDAGData back; DAGRowTypedOutcome out = DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED; std::string why;
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(x, &back, &out, &why));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::ROW_CORRUPT,
+            "a present-but-undecodable row must be ROW_CORRUPT, never ROW_MISSING_UNEXPLAINED");
+        BOOST_TEST_MESSAGE("R3_TYPED corrupt_outcome=1 detail=" << why);
+        db.Close();
+    }
+    // and the SAME key, once the corrupt payload is gone, is a plain absence again:
+    // the classification followed the row, it did not "remember" the corruption.
+    {
+        CDataStream ks(SER_DISK, CLIENT_VERSION);
+        ks << make_pair(std::string("daglinks"), x);
+        leveldb::Options opt; opt.create_if_missing = false;
+        leveldb::DB* raw = NULL;
+        fs::path dbdir = GetDataDir() / "txleveldb";
+        BOOST_REQUIRE(leveldb::DB::Open(opt, dbdir.string(), &raw).ok());
+        BOOST_REQUIRE(raw != NULL);
+        leveldb::WriteOptions wo; wo.sync = true;
+        BOOST_REQUIRE(raw->Delete(wo, ks.str()).ok());
+        delete raw;
+    }
+    {
+        CTxDB db("r+");
+        CBlockDAGData back; DAGRowTypedOutcome out = DAGRowTypedOutcome::ROW_CORRUPT; std::string why;
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(x, &back, &out, &why));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED,
+            "with the corrupt payload removed the same key is a plain unexplained absence");
+        db.Close();
+    }
+
+    // (c) storage unavailable (closed store): STORAGE_ERROR, never absence.
+    {
+        CTxDB db("r+");
+        db.Close();
+        CBlockDAGData back; DAGRowTypedOutcome out = DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED; std::string why;
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(uint256(0x53), &back, &out, &why));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::STORAGE_ERROR,
+            "an unavailable store is STORAGE_ERROR, never an absence and never a prune");
+        BOOST_TEST_MESSAGE("R3_TYPED storage_outcome=1 detail=" << why);
+    }
+
+    BOOST_TEST_MESSAGE("R3_TYPED present_valid=1 absent=unexplained malformed=corrupt storage=error prune_claims_from_absence=0");
+}
+
+// ---------------------------------------------------------------------------
+// R3 / C6 sections 2-4 — INCARNATION + POSITIVE PRUNE EVIDENCE. Durable per-row
+// incarnation, append-only hash-chained prune journal, per-row prune index, and
+// the transitions that keep them mutually consistent: PRUNE(X,N) can never
+// explain incarnation N+1, and no absence is ever attributed retrospectively.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r3_incarnation_and_prune_journal_transitions)
+{
+    const uint256 x = uint256(0x61);
+    const uint256 z = uint256(0x63);
+
+    // (1) supported materialization establishes incarnation 1.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.nDAGScore = uint256(11); row.nDAGOrder = 5;
+        BOOST_REQUIRE(db.WriteDAGLinks(x, row));
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        uint64_t inc = 0; bool pres = false;
+        BOOST_REQUIRE(db.ReadDAGRowIncarnation(x, &inc, &pres));
+        BOOST_CHECK_MESSAGE(pres && inc == 1, "supported materialization establishes incarnation 1");
+        db.Close();
+    }
+
+    // (2) supported prune with a complete identity records a bound event (E=1, N=1).
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(x, DAGRowEraseOrigin::PRUNE, 42, 99));
+        BOOST_REQUIRE(db.WriteDAGPruneFloor(99));
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        uint64_t e = 0, n = 0; bool pres = false; std::vector<uint64_t> evs;
+        BOOST_REQUIRE(db.ReadDAGPruneLatest(x, &e, &n, &evs, &pres));
+        BOOST_CHECK_MESSAGE(pres && e == 1 && n == 1, "the prune index must bind {E=1, N=1}");
+        DAGPruneEvent ev; bool evPres = false;
+        BOOST_REQUIRE(db.ReadDAGPruneEvent(1, &ev, &evPres));
+        BOOST_REQUIRE(evPres);
+        BOOST_CHECK(ev.hash == x);
+        BOOST_CHECK(ev.incarnation == 1);
+        BOOST_CHECK(ev.height == 42);
+        BOOST_CHECK(ev.floor_after == 99);
+        BOOST_CHECK(ev.prev_event_hash == 0);
+        BOOST_CHECK_MESSAGE(ev.superseded_by == 0, "a fresh event is admissible");
+        uint64_t head = 0, len = 0; uint256 hh;
+        BOOST_REQUIRE(db.ReadDAGPruneJournal(&head, &len, &hh));
+        BOOST_CHECK(head == 1 && len == 1);
+        uint64_t pc = 0;
+        BOOST_REQUIRE(db.ReadDAGProvenanceCounter(&pc));
+        BOOST_CHECK_MESSAGE(pc >= 2, "materialization and prune each advance the provenance counter");
+        DAGRowTypedOutcome out = DAGRowTypedOutcome::ROW_PRESENT_VALID; CBlockDAGData back; std::string why;
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(x, &back, &out, &why));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED,
+            "even with a bound prune event, the row-level read reports absence and does not itself claim a prune");
+        db.Close();
+    }
+
+    // (3) supported rematerialization: incarnation 2, old event superseded, stale index invalidated.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.nDAGScore = uint256(12); row.nDAGOrder = 6;
+        BOOST_REQUIRE(db.WriteDAGLinks(x, row));
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        uint64_t inc = 0; bool pres = false;
+        BOOST_REQUIRE(db.ReadDAGRowIncarnation(x, &inc, &pres));
+        BOOST_CHECK_MESSAGE(pres && inc == 2, "rematerialization advances the incarnation to 2");
+        DAGPruneEvent ev; bool evPres = false;
+        BOOST_REQUIRE(db.ReadDAGPruneEvent(1, &ev, &evPres));
+        BOOST_CHECK_MESSAGE(evPres && ev.superseded_by == 2,
+            "PRUNE(X,1) must be marked superseded by incarnation 2");
+        uint64_t e = 0, n = 0; bool lp = true; std::vector<uint64_t> evs;
+        BOOST_REQUIRE(db.ReadDAGPruneLatest(x, &e, &n, &evs, &lp));
+        BOOST_CHECK_MESSAGE(!lp, "rematerialization invalidates the stale per-row prune index");
+        db.Close();
+    }
+
+    // (4) supported NON-prune erase of incarnation 2: incarnation unchanged, absence
+    //     unexplained, and PRUNE(X,1) can never explain incarnation 2.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(x, DAGRowEraseOrigin::REORGANIZE));
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        uint64_t inc = 0; bool pres = false;
+        BOOST_REQUIRE(db.ReadDAGRowIncarnation(x, &inc, &pres));
+        BOOST_CHECK_MESSAGE(pres && inc == 2, "a non-prune erase does not advance the incarnation");
+        uint64_t e = 0, n = 0; bool lp = true; std::vector<uint64_t> evs;
+        BOOST_REQUIRE(db.ReadDAGPruneLatest(x, &e, &n, &evs, &lp));
+        BOOST_CHECK_MESSAGE(!lp, "no prune evidence exists for incarnation 2 after a non-prune erase");
+        DAGPruneEvent ev; bool evPres = false;
+        BOOST_REQUIRE(db.ReadDAGPruneEvent(1, &ev, &evPres));
+        BOOST_CHECK_MESSAGE(evPres && ev.superseded_by == 2 && ev.incarnation == 1,
+            "the old PRUNE(X,1) remains but is bound to incarnation 1, not to 2");
+        db.Close();
+    }
+
+    // (5) restore -> prune again: only the new event (N=3) may explain the absence,
+    //     and the journal is hash-chained.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.nDAGScore = uint256(13); row.nDAGOrder = 7;
+        BOOST_REQUIRE(db.WriteDAGLinks(x, row));
+        BOOST_REQUIRE(db.TxnCommit());
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(x, DAGRowEraseOrigin::PRUNE, 42, 150));
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        uint64_t e = 0, n = 0; bool lp = false; std::vector<uint64_t> evs;
+        BOOST_REQUIRE(db.ReadDAGPruneLatest(x, &e, &n, &evs, &lp));
+        BOOST_CHECK_MESSAGE(lp && e == 2 && n == 3,
+            "only PRUNE(X,3) may explain the restored-then-pruned incarnation");
+        DAGPruneEvent ev1; bool p1 = false;
+        BOOST_REQUIRE(db.ReadDAGPruneEvent(1, &ev1, &p1)); BOOST_REQUIRE(p1);
+        DAGPruneEvent ev2; bool p2 = false;
+        BOOST_REQUIRE(db.ReadDAGPruneEvent(2, &ev2, &p2)); BOOST_REQUIRE(p2);
+        BOOST_CHECK(ev2.hash == x && ev2.incarnation == 3 && ev2.height == 42 && ev2.floor_after == 150);
+        CDataStream hs(SER_GETHASH, CLIENT_VERSION);
+        hs << (uint64_t)1 << ev1.hash << ev1.incarnation << ev1.epoch << ev1.height
+           << ev1.floor_after << ev1.prev_event_hash;
+        BOOST_CHECK_MESSAGE(ev2.prev_event_hash == Hash(hs.begin(), hs.end()),
+            "the journal is hash-chained: E=2 must link to E=1's digest");
+        db.Close();
+    }
+
+    // (6) NO retrospective attribution. (i) a legacy/unsupported materialization
+    //     (raw row written without the supported writer) records no incarnation, so
+    //     a subsequent prune records NO event; (ii) an incomplete prune identity
+    //     records NO event either.
+    {
+        CDataStream ks(SER_DISK, CLIENT_VERSION);
+        ks << make_pair(std::string("daglinks"), z);
+        CDataStream vs(SER_DISK, CLIENT_VERSION);
+        CBlockDAGData legacy; legacy.nDAGOrder = 9;
+        vs << legacy;
+        leveldb::Options opt; opt.create_if_missing = false;
+        leveldb::DB* raw = NULL;
+        fs::path dbdir = GetDataDir() / "txleveldb";
+        BOOST_REQUIRE_MESSAGE(leveldb::DB::Open(opt, dbdir.string(), &raw).ok(), "raw open for legacy-row injection");
+        BOOST_REQUIRE(raw != NULL);
+        leveldb::WriteOptions wo; wo.sync = true;
+        BOOST_REQUIRE(raw->Put(wo, ks.str(), vs.str()).ok());
+        delete raw;
+    }
+    {
+        CTxDB db("r+");
+        uint64_t inc = 0; bool incPres = true;
+        BOOST_REQUIRE(db.ReadDAGRowIncarnation(z, &inc, &incPres));
+        BOOST_CHECK_MESSAGE(!incPres, "a legacy row has no durable incarnation");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(z, DAGRowEraseOrigin::PRUNE, 7, 200));
+        BOOST_REQUIRE(db.TxnCommit());
+        uint64_t e = 0, n = 0; bool lp = true; std::vector<uint64_t> evs;
+        BOOST_REQUIRE(db.ReadDAGPruneLatest(z, &e, &n, &evs, &lp));
+        BOOST_CHECK_MESSAGE(!lp, "no positive prune evidence may be invented for a legacy row (migration rule)");
+        uint64_t head = 0, len = 0; uint256 hh;
+        BOOST_REQUIRE(db.ReadDAGPruneJournal(&head, &len, &hh));
+        BOOST_CHECK_MESSAGE(len == 2, "the legacy prune appended no journal entry");
+        db.Close();
+    }
+    {
+        const uint256 w = uint256(0x64);
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.nDAGOrder = 11;
+        BOOST_REQUIRE(db.WriteDAGLinks(w, row));
+        BOOST_REQUIRE(db.TxnCommit());
+        // incomplete identity (no height / no floor): the 2-arg form records nothing.
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(w, DAGRowEraseOrigin::PRUNE));
+        BOOST_REQUIRE(db.TxnCommit());
+        uint64_t e = 0, n = 0; bool lp = true; std::vector<uint64_t> evs;
+        BOOST_REQUIRE(db.ReadDAGPruneLatest(w, &e, &n, &evs, &lp));
+        BOOST_CHECK_MESSAGE(!lp, "a prune that cannot bind a complete identity records NO event (fail closed)");
+        uint64_t head = 0, len = 0; uint256 hh;
+        BOOST_REQUIRE(db.ReadDAGPruneJournal(&head, &len, &hh));
+        BOOST_CHECK_MESSAGE(len == 2, "the incomplete-identity prune appended no journal entry");
+        db.Close();
+    }
+
+    BOOST_TEST_MESSAGE("R3_PROVENANCE inc_advance=1 restore_supersede=1 index_invalidate=1 "
+                       "prune_bound=1 chain=1 legacy_no_event=1 incomplete_no_event=1");
+}
+
+// ---------------------------------------------------------------------------
+// R3 / C6 sections 5-6 + R3.8 — CUSTODY CERTIFICATE, SEAL AND THE FINAL PREDICATE.
+// The predicate is exercised through the SAME static function used at the consensus
+// site. Positive attribution requires the complete frozen predicate; a bare absence,
+// a floor alone, a legacy marker, a superseded event, a restarted-but-suspended
+// custody or an unsupported writer's hole must all fail closed.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r3_custody_certificate_seal_and_final_predicate)
+{
+    const uint256 a = uint256(0x71);   // the vertex that IS legitimately pruned
+    const uint256 b = uint256(0x72);   // a live row: never attributable
+    const uint256 c = uint256(0x73);   // a legacy/unsupported row: never attributable
+
+    // (1) supported materialization + a clean height (a certifiable domain).
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.nDAGScore = uint256(21); row.nDAGOrder = 4;
+        BOOST_REQUIRE(db.WriteDAGLinks(a, row));
+        row.nDAGScore = uint256(22); row.nDAGOrder = 5;
+        BOOST_REQUIRE(db.WriteDAGLinks(b, row));
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+
+    // (2) certification establishes custody epoch 1; the seal verifies custody; and a
+    //     PRESENT row is never admitted as a pruned boundary.
+    {
+        CTxDB db("r+");
+        uint64_t epoch = 0; std::string err;
+        BOOST_REQUIRE_MESSAGE(db.CertifyDAGProvenanceCoverage(500, &epoch, &err), "certification: " << err);
+        BOOST_CHECK_MESSAGE(epoch == 1, "the first certification establishes custody epoch 1");
+        DAGCertVerifyResult vr = DAGCertVerifyResult::NO_CERTIFICATE; std::string verr;
+        BOOST_REQUIRE(db.VerifyDAGProvenanceCoverage(&vr, &verr));
+        BOOST_CHECK_MESSAGE(vr == DAGCertVerifyResult::OK,
+            "the certification scan must reproduce every certified digest (result=" << (int)vr << " " << verr << ")");
+        DAGProvenanceCertificate cert; bool haveCert = false;
+        BOOST_REQUIRE(db.ReadDAGProvenanceCertificate(&cert, &haveCert));
+        {
+            DAGProvenanceCertificate scanned; std::string serr;
+            const bool scanOk = db.ScanDAGProvenanceDigests(&scanned, &serr);
+            BOOST_TEST_MESSAGE("R3_CERT_DIAG haveCert=" << haveCert << " epoch=" << cert.epoch
+                << " hCert=" << cert.hCert << " count=" << cert.coveredVertexCount
+                << " jlen=" << cert.journalLength << " wm=" << cert.watermark
+                << " scanOk=" << scanOk << " scanCount=" << scanned.coveredVertexCount
+                << " scanErr=" << serr);
+        }
+        BOOST_CHECK_MESSAGE(haveCert, "a certificate must be published by certification");
+        BOOST_CHECK_MESSAGE(cert.epoch == 1 && cert.hCert >= 500 && cert.coveredVertexCount == 2,
+            "certificate binds epoch/hCert/covered vertex count");
+        uint64_t w = 0;
+        BOOST_REQUIRE_MESSAGE(db.SealDAGCustody(&w, &err), "seal: " << err);
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() == DAGCustodyState::VERIFIED,
+            "an exact seal verifies custody continuity");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, b, 10, &why),
+            "a PRESENT row is never ROW_OBJECTIVELY_PRUNED: " << why);
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, c, 10, &why),
+            "a vertex with no durable incarnation has no positive attribution: " << why);
+        db.Close();
+    }
+
+    // (3) a certified, identity-bearing PRUNE -> the absence IS objectively pruned.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(a, DAGRowEraseOrigin::PRUNE, 120, 300));
+        BOOST_REQUIRE(db.WriteDAGPruneFloor(300));
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() == DAGCustodyState::VERIFIED,
+            "a clean restart with an exact sealed watermark restores custody");
+        std::string why;
+        BOOST_CHECK_MESSAGE(DAGRowObjectivelyPrunedForTest(db, a, 120, &why),
+            "the complete positive predicate must admit the bound certified prune: " << why);
+        std::string why2;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, a, 121, &why2),
+            "the event must bind height(X) exactly: " << why2);
+        db.Close();
+    }
+
+    // (4) restore (incarnation 2) + non-prune erase: PRUNE(a,1) may not explain it.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.nDAGScore = uint256(23); row.nDAGOrder = 6;
+        BOOST_REQUIRE(db.WriteDAGLinks(a, row));
+        BOOST_REQUIRE(db.TxnCommit());
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(a, DAGRowEraseOrigin::REORGANIZE));
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, a, 120, &why),
+            "PRUNE(a, incarnation 1) must never explain the restored incarnation 2: " << why);
+        db.Close();
+    }
+    // ... and after a genuine prune of THAT incarnation only the new event explains it.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.nDAGScore = uint256(24); row.nDAGOrder = 7;
+        BOOST_REQUIRE(db.WriteDAGLinks(a, row));   // incarnation 3 (a fresh materialization)
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(a, DAGRowEraseOrigin::PRUNE, 120, 300));
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        std::string why;
+        BOOST_CHECK_MESSAGE(DAGRowObjectivelyPrunedForTest(db, a, 120, &why),
+            "only the incarnation-bound event of the CURRENT incarnation explains the absence: " << why);
+        db.Close();
+    }
+
+    // (5) an UNSUPPORTED writer's hole after certification: custody suspends and the
+    //     old prune evidence becomes inadmissible (never a false-positive prune).
+    {
+        CDataStream ks(SER_DISK, CLIENT_VERSION);
+        ks << make_pair(std::string("daglinks"), b);
+        leveldb::Options opt; opt.create_if_missing = false;
+        leveldb::DB* raw = NULL;
+        fs::path dbdir = GetDataDir() / "txleveldb";
+        BOOST_REQUIRE_MESSAGE(leveldb::DB::Open(opt, dbdir.string(), &raw).ok(), "raw open for unsupported erase");
+        BOOST_REQUIRE(raw != NULL);
+        leveldb::WriteOptions wo; wo.sync = true;
+        BOOST_REQUIRE(raw->Delete(wo, ks.str()).ok());
+        delete raw;
+    }
+    {
+        CTxDB db("r+");
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() == DAGCustodyState::SUSPENDED,
+            "an unsupported/foreign writer invalidates custody although the final rows may look identical");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, a, 120, &why),
+            "with custody suspended the prior prune evidence is inadmissible: " << why);
+        DAGCertVerifyResult vr = DAGCertVerifyResult::OK; std::string verr;
+        BOOST_REQUIRE(db.VerifyDAGProvenanceCoverage(&vr, &verr));
+        BOOST_CHECK_MESSAGE(vr == DAGCertVerifyResult::DIGEST_MISMATCH,
+            "the certification scan rejects the uncovered hole (result=" << (int)vr << " " << verr << ")");
+        db.Close();
+    }
+
+    BOOST_TEST_MESSAGE("R3_CERT epoch=1 certified_scan=ok seal=ok predicate_positive=1 "
+                       "predicate_present_row_negative=1 predicate_no_incarnation_negative=1 "
+                       "predicate_height_mismatch_negative=1 predicate_superseded_negative=1 "
+                       "predicate_restored_incarnation_negative=1 restart_custody_verified=1 "
+                       "foreign_writer_suspended=1 digest_mismatch_rejected=1");
+}
+
+BOOST_AUTO_TEST_CASE(r3_seal_protocol_exact_record_arithmetic)
+{
+    const uint256 d = uint256(0x74);
+
+    // (i) an UNcertified store is never sealed: sealing must not fabricate coverage.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.nDAGOrder = 2;
+        BOOST_REQUIRE(db.WriteDAGLinks(d, row));
+        BOOST_REQUIRE(db.TxnCommit());
+        uint64_t w = 0; std::string err;
+        BOOST_CHECK_MESSAGE(!db.SealDAGCustody(&w, &err),
+            "an uncertified store must refuse to seal (" << err << ")");
+        db.Close();
+    }
+
+    // (ii) certified: W = P + C with C the exact record count of the seal batch, and
+    //      the post-commit engine watermark must equal W exactly.
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(90));
+        BOOST_REQUIRE(db.TxnCommit());
+        uint64_t epoch = 0; std::string err;
+        BOOST_REQUIRE_MESSAGE(db.CertifyDAGProvenanceCoverage(90, &epoch, &err), "certification: " << err);
+        uint64_t w = 0;
+        BOOST_REQUIRE_MESSAGE(db.SealDAGCustody(&w, &err), "seal: " << err);
+        uint64_t after = 0; std::string werr;
+        BOOST_REQUIRE(db.ReadEngineLastSequence(&after, &werr));
+        BOOST_CHECK_MESSAGE(after == w, "post-commit LastSequence must equal the sealed W exactly");
+        db.Close();
+    }
+
+    // (iii) clean reopen: current LastSequence == sealed W, custody VERIFIED.
+    {
+        CTxDB db("r+");
+        DAGCustodySeal seal; bool pres = false;
+        BOOST_REQUIRE(db.ReadDAGCustodySeal(&seal, &pres));
+        BOOST_REQUIRE_MESSAGE(pres, "a certified, sealed store must carry a custody seal");
+        uint64_t after = 0; std::string werr;
+        BOOST_REQUIRE(db.ReadEngineLastSequence(&after, &werr));
+        BOOST_CHECK_MESSAGE(after == seal.watermark, "a clean reopen preserves the sealed watermark exactly");
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() == DAGCustodyState::VERIFIED,
+            "a clean reopen restores provenance admissibility");
+        db.Close();
+    }
+
+    BOOST_TEST_MESSAGE("R3_SEAL uncertified_refused=1 exact_arithmetic=1 reopen_equal=1 custody_verified=1");
+}
+
+// ---------------------------------------------------------------------------
+// R3.9 / C6 — THE COMPLETE FROZEN A–M MATRIX.
+//
+// Dedicated cases, fresh process per case, isolated scratch stores only. The predicate is
+// exercised through the SAME static function used at the consensus site
+// (DAGRowObjectivelyPrunedForTest) and custody/certificate/seal state through the SAME
+// production methods the startup/shutdown lifecycle calls.
+// ---------------------------------------------------------------------------
+// NOTE: g_testSuppressDagCustodyWatermark is declared at GLOBAL scope in
+// txdb-leveldb.h; inside this test namespace it must be referenced as ::global (the
+// declaration itself must not be repeated here, or the extern would bind to a
+// namespace-local symbol that no translation unit defines).
+struct C6WatermarkSuppressGuard
+{
+    C6WatermarkSuppressGuard() { ::g_testSuppressDagCustodyWatermark = true; }
+    ~C6WatermarkSuppressGuard() { ::g_testSuppressDagCustodyWatermark = false; }
+};
+
+static std::string C6RowBytes(const CBlockDAGData& row)
+{
+    CDataStream vs(SER_DISK, CLIENT_VERSION);
+    vs << row;
+    return vs.str();
+}
+
+static void C6RawPut(const uint256& hash, const std::string& payload)
+{
+    CDataStream ks(SER_DISK, CLIENT_VERSION);
+    ks << make_pair(std::string("daglinks"), hash);
+    leveldb::Options opt; opt.create_if_missing = false;
+    leveldb::DB* raw = NULL;
+    BOOST_REQUIRE_MESSAGE(leveldb::DB::Open(opt, (GetDataDir() / "txleveldb").string(), &raw).ok(), "C6 raw open (put)");
+    BOOST_REQUIRE(raw != NULL);
+    leveldb::WriteOptions wo; wo.sync = true;
+    BOOST_REQUIRE(raw->Put(wo, ks.str(), payload).ok());
+    delete raw;
+}
+
+static void C6RawDelete(const uint256& hash)
+{
+    CDataStream ks(SER_DISK, CLIENT_VERSION);
+    ks << make_pair(std::string("daglinks"), hash);
+    leveldb::Options opt; opt.create_if_missing = false;
+    leveldb::DB* raw = NULL;
+    BOOST_REQUIRE_MESSAGE(leveldb::DB::Open(opt, (GetDataDir() / "txleveldb").string(), &raw).ok(), "C6 raw open (delete)");
+    BOOST_REQUIRE(raw != NULL);
+    leveldb::WriteOptions wo; wo.sync = true;
+    BOOST_REQUIRE(raw->Delete(wo, ks.str()).ok());
+    delete raw;
+}
+
+static void C6Materialize(CTxDB& db, const uint256& hash, uint64_t score, int order)
+{
+    BOOST_REQUIRE(db.TxnBegin());
+    CBlockDAGData row; row.nDAGScore = uint256(score); row.nDAGOrder = order;
+    BOOST_REQUIRE(db.WriteDAGLinks(hash, row));
+    BOOST_REQUIRE(db.TxnCommit());
+}
+
+static void C6Prune(CTxDB& db, const uint256& hash, int32_t height, int32_t floor)
+{
+    BOOST_REQUIRE(db.TxnBegin());
+    BOOST_REQUIRE(db.EraseDAGLinks(hash, DAGRowEraseOrigin::PRUNE, height, floor));
+    BOOST_REQUIRE(db.WriteDAGPruneFloor(floor));
+    BOOST_REQUIRE(db.TxnCommit());
+}
+
+static void C6Certify(CTxDB& db, int32_t hCert)
+{
+    uint64_t epoch = 0; std::string err;
+    BOOST_REQUIRE_MESSAGE(db.CertifyDAGProvenanceCoverage(hCert, &epoch, &err), "C6 certification: " << err);
+    BOOST_REQUIRE_MESSAGE(epoch >= 1, "C6 certification must establish a custody epoch");
+}
+
+// R3 certification-admission EPOCH-SEAM REGRESSION (confirmed re-audit defect 20260930-122133).
+// A supported PRUNE that happens BEFORE the first certification carries custody epoch 0, while the
+// certification transition is about to publish epoch 1. Such an event can never be admissible to
+// the resolver (frozen rule: prune event epoch must equal the current certified custody epoch), so
+// certification MUST refuse the absence instead of positively certifying an effectively unexplained
+// hole. It is ALSO an asserting regression: this case fails if certification succeeds. The epoch-0
+// event is NOT relabelled, NOT migrated and NOT rewritten; the resolver rule is NOT weakened.
+BOOST_AUTO_TEST_CASE(r3_certification_admission_pre_certification_prune_refused)
+{
+    const uint256 y = uint256(0xC2);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, y, 42, 5);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Prune(db, y, 220, 230);   // supported PRUNE in the pre-certification epoch (event epoch 0)
+        uint64_t epoch = 0; std::string err;
+        BOOST_CHECK_MESSAGE(!db.CertifyDAGProvenanceCoverage(500, &epoch, &err),
+            "epoch seam: a pre-certification (epoch 0) prune event must NOT be admitted into an epoch-1 certificate");
+        BOOST_CHECK_MESSAGE(err.find("unexplained missing known vertex") != std::string::npos &&
+                            err.find("prospective certified custody epoch 1") != std::string::npos,
+            "epoch seam: the refusal must name the unexplained known-vertex absence and the prospective epoch ('" << err << "')");
+        BOOST_TEST_MESSAGE("R3_EPOCH E1 pre_certification_prune_certification_refused=1 reason=" << err);
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, y, 220, &why),
+            "epoch seam: the epoch-0 event must not be resolvable before certification either");
+        BOOST_TEST_MESSAGE("R3_EPOCH E1 pre_certification_row_unexplained=1 why=" << why);
+        db.Close();   // no certificate was created => no custody seal
+    }
+    {   // E2: restart must not strengthen the refused state nor launder the stale-epoch event
+        CTxDB db("r+");
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() != DAGCustodyState::VERIFIED,
+            "epoch seam: a refused certification must never become VERIFIED across a restart");
+        DAGCertVerifyResult vr = DAGCertVerifyResult::NO_CERTIFICATE; std::string verr;
+        BOOST_REQUIRE(db.VerifyDAGProvenanceCoverage(&vr, &verr));
+        BOOST_CHECK_MESSAGE(vr != DAGCertVerifyResult::OK,
+            "epoch seam: no VERIFIED certificate may exist for the refused transition (" << verr << ")");
+        uint64_t epoch2 = 0; std::string err2;
+        BOOST_CHECK_MESSAGE(!db.CertifyDAGProvenanceCoverage(500, &epoch2, &err2),
+            "epoch seam: the stale-epoch event must still refuse certification after restart");
+        std::string why2;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, y, 220, &why2),
+            "epoch seam: the old epoch-0 event must not become admissible after restart");
+        BOOST_TEST_MESSAGE("R3_EPOCH E2 restart_no_strengthening=1 verify_result=" << (int)vr
+            << " recert_refused=1 unresolved=1");
+        db.Close();
+    }
+}
+
+// R3 certification-admission CURRENT-EPOCH POSITIVE CONTROL (directive section 5/6): a supported
+// PRUNE performed INSIDE the certified custody epoch, on an already certified store, must remain
+// certifiable (epoch-preserving recertification, prospective epoch == current certified epoch) and
+// resolvable as ROW_OBJECTIVELY_PRUNED. This proves the epoch-seam repair did not reject every
+// absent row and did not introduce epoch churn.
+BOOST_AUTO_TEST_CASE(r3_certification_admission_current_epoch_prune_control)
+{
+    const uint256 y = uint256(0xC3);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, y, 44, 6);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        C6Prune(db, y, 220, 230);   // supported PRUNE now carries the CERTIFIED epoch
+        uint64_t epoch = 0; std::string err;
+        BOOST_CHECK_MESSAGE(db.CertifyDAGProvenanceCoverage(500, &epoch, &err),
+            "current-epoch control: a prune event bound to the current certified epoch must remain certifiable: " << err);
+        BOOST_CHECK_MESSAGE(epoch >= 1, "current-epoch control: recertification must be epoch-preserving (>= 1)");
+        BOOST_TEST_MESSAGE("R3_EPOCH E4 recertification_epoch_preserved=1 epoch=" << epoch);
+        std::string why;
+        BOOST_CHECK_MESSAGE(DAGRowObjectivelyPrunedForTest(db, y, 220, &why),
+            "current-epoch control: a current-epoch certified prune must resolve ROW_OBJECTIVELY_PRUNED: " << why);
+        BOOST_TEST_MESSAGE("R3_EPOCH E3 current_epoch_prune_objectively_pruned=1 epoch=" << epoch);
+        db.Close();
+    }
+    {   // and it must survive a clean seal + restart
+        CTxDB db("r+");
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() == DAGCustodyState::VERIFIED,
+            "current-epoch control: the certified store must verify its seal across restart");
+        std::string why;
+        BOOST_CHECK_MESSAGE(DAGRowObjectivelyPrunedForTest(db, y, 220, &why),
+            "current-epoch control: the current-epoch prune must stay admissible after restart: " << why);
+        BOOST_TEST_MESSAGE("R3_EPOCH E3 restart_current_epoch_prune_still_pruned=1");
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_A_legacy_untagged_erase_stays_unexplained)
+{
+    const uint256 x = uint256(0xA1), y = uint256(0xA2);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 31, 3);
+        C6Materialize(db, y, 32, 4);
+        db.Close();
+    }
+    C6RawDelete(x);   // legacy untagged erase: no supported writer, no provenance at all
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        // REPAIRED (confirmed audit defect 20260930-110759): a coverage certificate may NOT
+        // positively certify a domain containing an unexplained missing known vertex. Case A now
+        // proves BOTH: the row still classifies ROW_MISSING_UNEXPLAINED and certification over a
+        // domain containing X is REFUSED.
+        uint64_t certEpoch = 0; std::string certErr;
+        BOOST_CHECK_MESSAGE(!db.CertifyDAGProvenanceCoverage(500, &certEpoch, &certErr),
+            "A: certification over a domain containing an unexplained missing known vertex must be REFUSED");
+        BOOST_CHECK_MESSAGE(certErr.find("unexplained missing known vertex") != std::string::npos,
+            "A: the refusal must name the unexplained known-vertex absence ('" << certErr << "')");
+        BOOST_TEST_MESSAGE("R3_AM A certification_refused=1 reason=" << certErr);
+        {
+            CBlockDAGData rowData; DAGRowTypedOutcome outcome = DAGRowTypedOutcome::STORAGE_ERROR; std::string detail;
+            BOOST_REQUIRE(db.ReadDAGLinksTyped(x, &rowData, &outcome, &detail));
+            BOOST_CHECK_MESSAGE(outcome == DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED,
+                "A: X must still classify ROW_MISSING_UNEXPLAINED (detail: " << detail << ")");
+            BOOST_TEST_MESSAGE("R3_AM A row_state_still_unexplained=1");
+        }
+        C6Prune(db, y, 250, 260);   // a LATER, genuine prune of a DIFFERENT vertex (X must stay unexplained)
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, x, 200, &why),
+            "A: a legacy untagged erase must stay ROW_MISSING_UNEXPLAINED even after an upgrade, a later genuine prune of Y and a floor beyond X: " << why);
+        BOOST_TEST_MESSAGE("R3_AM A legacy_unexplained=1 why=" << why);
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_B_legacy_untagged_erase_unexplained_after_restart)
+{
+    const uint256 x = uint256(0xB1), y = uint256(0xB2);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 33, 3);
+        C6Materialize(db, y, 34, 4);
+        db.Close();
+    }
+    C6RawDelete(x);
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        uint64_t certEpoch = 0; std::string certErr;
+        BOOST_CHECK_MESSAGE(!db.CertifyDAGProvenanceCoverage(500, &certEpoch, &certErr),
+            "B: certification over a domain containing an unexplained missing known vertex must be REFUSED");
+        BOOST_TEST_MESSAGE("R3_AM B certification_refused=1 reason=" << certErr);
+        C6Prune(db, y, 250, 260);
+        db.Close();   // no certificate was created, therefore no custody seal
+    }
+    {
+        CTxDB db("r+");   // restart: seal + certificate must verify before provenance is admissible
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() != DAGCustodyState::VERIFIED,
+            "B: a store whose certification was refused must never become VERIFIED across a restart");
+        uint64_t certEpoch2 = 0; std::string certErr2;
+        BOOST_CHECK_MESSAGE(!db.CertifyDAGProvenanceCoverage(500, &certEpoch2, &certErr2),
+            "B: the unexplained hole must still refuse certification after restart (no semantic strengthening)");
+        BOOST_TEST_MESSAGE("R3_AM B restart_certification_still_refused=1 reason=" << certErr2);
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, x, 200, &why),
+            "B: the same legacy untagged erase stays ROW_MISSING_UNEXPLAINED after restart: " << why);
+        BOOST_TEST_MESSAGE("R3_AM B restart_unexplained=1 why=" << why);
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_C_certified_prune_objectively_pruned)
+{
+    const uint256 x = uint256(0xC1);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 41, 5);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        C6Prune(db, x, 220, 230);
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        std::string why;
+        BOOST_CHECK_MESSAGE(DAGRowObjectivelyPrunedForTest(db, x, 220, &why),
+            "C: a certified valid prune must be ROW_OBJECTIVELY_PRUNED: " << why);
+        BOOST_TEST_MESSAGE("R3_AM C objectively_pruned=1");
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_D_malformed_present_row_corrupt)
+{
+    const uint256 z = uint256(0xD1);
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        db.Close();
+    }
+    C6RawPut(z, std::string("not-a-decoded-dagdata"));   // malformed PRESENT row
+    {
+        CTxDB db("r+");
+        CBlockDAGData back;
+        DAGRowTypedOutcome out = DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED;
+        std::string det;
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(z, &back, &out, &det));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::ROW_CORRUPT,
+            "D: a malformed present row must be ROW_CORRUPT, never missing and never pruned (detail=" << det << ")");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, z, 100, &why),
+            "D: a corrupt row below the floor must never become a pruned absence: " << why);
+        BOOST_TEST_MESSAGE("R3_AM D corrupt=1 predicate_negative=1 why=" << why);
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_E_storage_failure_storage_error)
+{
+    const uint256 z = uint256(0xE1);
+    {
+        CTxDB db("r+");
+        db.Close();   // storage unavailable
+        CBlockDAGData back;
+        DAGRowTypedOutcome out = DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED;
+        std::string det;
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(z, &back, &out, &det));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::STORAGE_ERROR,
+            "E: an unavailable store must be STORAGE_ERROR, never an absence (detail=" << det << ")");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, z, 100, &why),
+            "E: a storage read failure must never become a pruned absence: " << why);
+        BOOST_TEST_MESSAGE("R3_AM E storage_error=1 predicate_negative=1 why=" << why);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_F_old_prune_cannot_explain_restored_incarnation)
+{
+    const uint256 x = uint256(0xF1);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 51, 6);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        C6Prune(db, x, 210, 220);
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        std::string why;
+        BOOST_REQUIRE_MESSAGE(DAGRowObjectivelyPrunedForTest(db, x, 210, &why), "F baseline prune admitted: " << why);
+        C6Materialize(db, x, 52, 7);    // restore -> incarnation N+1
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(x, DAGRowEraseOrigin::REORGANIZE));   // supported NON-prune erase
+        BOOST_REQUIRE(db.TxnCommit());
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, x, 210, &why),
+            "F: PRUNE(X,N) must never explain the restored incarnation N+1 after a non-prune erase: " << why);
+        BOOST_TEST_MESSAGE("R3_AM F old_prune_unusable=1 why=" << why);
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_G_only_current_incarnation_event_admissible)
+{
+    const uint256 x = uint256(0x89);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 61, 8);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        C6Prune(db, x, 210, 220);       // event E=1 for incarnation 1
+        C6Materialize(db, x, 62, 9);    // restore -> incarnation 2
+        C6Prune(db, x, 210, 220);       // event E=2 for incarnation 2
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        uint64_t e = 0, n = 0; bool lp = false; std::vector<uint64_t> evs;
+        BOOST_REQUIRE(db.ReadDAGPruneLatest(x, &e, &n, &evs, &lp));
+        BOOST_CHECK_MESSAGE(lp && n == 2, "G: the admissible evidence must be bound to the CURRENT incarnation 2 (E=" << e << ", N=" << n << ")");
+        DAGPruneEvent ev1; bool p1 = false;
+        BOOST_REQUIRE(db.ReadDAGPruneEvent(1, &ev1, &p1));
+        BOOST_CHECK_MESSAGE(p1 && ev1.superseded_by == 2, "G: the old event must be superseded by incarnation 2");
+        std::string why;
+        BOOST_CHECK_MESSAGE(DAGRowObjectivelyPrunedForTest(db, x, 210, &why),
+            "G: only PRUNE(X, current incarnation) may explain the absence: " << why);
+        BOOST_TEST_MESSAGE("R3_AM G current_incarnation_event_only=1");
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_H_prune_transition_failure_no_false_positive)
+{
+    const uint256 x = uint256(0x91);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 71, 10);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        db.Close();
+    }
+    {
+        // Deterministic failure injection: the prune atomic transition is aborted.
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.EraseDAGLinks(x, DAGRowEraseOrigin::PRUNE, 210, 220));
+        BOOST_REQUIRE(db.WriteDAGPruneFloor(220));
+        db.TxnAbort();
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        CBlockDAGData back;
+        DAGRowTypedOutcome out = DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED;
+        std::string det;
+        BOOST_REQUIRE(db.ReadDAGLinksTyped(x, &back, &out, &det));
+        BOOST_CHECK_MESSAGE(out == DAGRowTypedOutcome::ROW_PRESENT_VALID,
+            "H: an aborted prune transition must leave the row present");
+        uint64_t e = 0, n = 0; bool lp = true; std::vector<uint64_t> evs;
+        BOOST_REQUIRE(db.ReadDAGPruneLatest(x, &e, &n, &evs, &lp));
+        BOOST_CHECK_MESSAGE(!lp, "H: an aborted prune transition must record no per-row prune evidence");
+        uint64_t head = 0, len = 0; uint256 hh;
+        BOOST_REQUIRE(db.ReadDAGPruneJournal(&head, &len, &hh));
+        BOOST_CHECK_MESSAGE(len == 0, "H: an aborted prune transition must append no journal entry");
+        uint64_t inc = 0; bool ip = false;
+        BOOST_REQUIRE(db.ReadDAGRowIncarnation(x, &inc, &ip));
+        BOOST_CHECK_MESSAGE(ip && inc == 1, "H: an aborted prune transition must not advance the incarnation");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, x, 210, &why),
+            "H: no false-positive prune attribution after a failed prune transition: " << why);
+        BOOST_TEST_MESSAGE("R3_AM H aborted_prune=1 no_event=1 no_false_positive=1 why=" << why);
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_I_restore_transition_failure_no_torn_state)
+{
+    const uint256 x = uint256(0x92);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 81, 11);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        C6Prune(db, x, 210, 220);
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        std::string why;
+        BOOST_REQUIRE_MESSAGE(DAGRowObjectivelyPrunedForTest(db, x, 210, &why), "I baseline prune admitted: " << why);
+        db.Close();
+    }
+    {
+        // Deterministic failure injection: the restore/invalidation transition is aborted.
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        CBlockDAGData row; row.nDAGScore = uint256(82); row.nDAGOrder = 12;
+        BOOST_REQUIRE(db.WriteDAGLinks(x, row));
+        db.TxnAbort();
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        uint64_t inc = 0; bool ip = false;
+        BOOST_REQUIRE(db.ReadDAGRowIncarnation(x, &inc, &ip));
+        BOOST_CHECK_MESSAGE(ip && inc == 1, "I: an aborted restore must not advance the incarnation");
+        DAGPruneEvent ev; bool ep = false;
+        BOOST_REQUIRE(db.ReadDAGPruneEvent(1, &ev, &ep));
+        BOOST_CHECK_MESSAGE(ep && ev.superseded_by == 0, "I: an aborted restore must not supersede the old PRUNE event");
+        uint64_t e = 0, n = 0; bool lp = false; std::vector<uint64_t> evs;
+        BOOST_REQUIRE(db.ReadDAGPruneLatest(x, &e, &n, &evs, &lp));
+        BOOST_CHECK_MESSAGE(lp && n == 1, "I: the per-row evidence must still bind incarnation 1 (no torn state)");
+        std::string why;
+        BOOST_CHECK_MESSAGE(DAGRowObjectivelyPrunedForTest(db, x, 210, &why),
+            "I: with no new incarnation committed, the old PRUNE still explains the absence: " << why);
+        BOOST_TEST_MESSAGE("R3_AM I aborted_restore=1 inc_unchanged=1 no_torn_state=1");
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_J_certified_prune_survives_clean_seal_and_restart)
+{
+    const uint256 x = uint256(0x93);
+    uint64_t sealedW = 0;
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 91, 13);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        C6Prune(db, x, 210, 220);
+        std::string err;
+        BOOST_REQUIRE_MESSAGE(db.SealDAGCustody(&sealedW, &err), "J: clean seal: " << err);
+        db.Close();
+    }
+    {
+        CTxDB db("r+");
+        DAGCustodySeal seal; bool sp = false;
+        BOOST_REQUIRE(db.ReadDAGCustodySeal(&seal, &sp));
+        uint64_t ls = 0; std::string lerr;
+        BOOST_REQUIRE(db.ReadEngineLastSequence(&ls, &lerr));
+        BOOST_CHECK_MESSAGE(sp && ls == seal.watermark,
+            "J: the restart must verify the exact sealed watermark (ls=" << ls << " sealedW=" << seal.watermark << ")");
+        std::string why;
+        BOOST_CHECK_MESSAGE(DAGRowObjectivelyPrunedForTest(db, x, 210, &why),
+            "J: a certified prune must survive a clean seal and restart as ROW_OBJECTIVELY_PRUNED: " << why);
+        BOOST_TEST_MESSAGE("R3_AM J survives_restart=1 sealed_w_verified=1");
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_K_foreign_restore_and_untagged_erase_suspends_custody)
+{
+    const uint256 x = uint256(0x94);
+    CBlockDAGData original; original.nDAGScore = uint256(101); original.nDAGOrder = 14;
+    {
+        CTxDB db("r+");
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGLinks(x, original));
+        BOOST_REQUIRE(db.TxnCommit());
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        C6Prune(db, x, 210, 220);
+        db.Close();
+    }
+    // Foreign / old writer: restore X with the SAME bytes, then untagged-erase X. The final
+    // application-visible rows are byte-identical to the sealed state.
+    C6RawPut(x, C6RowBytes(original));
+    C6RawDelete(x);
+    {
+        CTxDB db("r+");
+        DAGCustodySeal seal; bool sp = false;
+        BOOST_REQUIRE(db.ReadDAGCustodySeal(&seal, &sp));
+        uint64_t ls = 0; std::string lerr;
+        BOOST_REQUIRE(db.ReadEngineLastSequence(&ls, &lerr));
+        BOOST_CHECK_MESSAGE(sp && ls != seal.watermark,
+            "K: the foreign restore+erase must consume engine sequence numbers (ls=" << ls << " sealedW=" << seal.watermark << ")");
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() == DAGCustodyState::SUSPENDED,
+            "K: custody must be SUSPENDED after a foreign write whose final rows look identical");
+        uint64_t kEpoch = 0; std::string kErr;
+        BOOST_CHECK_MESSAGE(!db.CertifyDAGProvenanceCoverage(500, &kEpoch, &kErr),
+            "K/E6: a suspended custody must not regain authority through certification");
+        BOOST_TEST_MESSAGE("R3_EPOCH E6 suspended_certification_refused=1 reason=" << kErr);
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, x, 210, &why),
+            "K: old PRUNE evidence is inadmissible once custody is suspended: " << why);
+        BOOST_TEST_MESSAGE("R3_AM K watermark_mismatch=1 suspended=1 old_prune_inadmissible=1");
+        db.Close();
+    }
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_L_unexplained_hole_rejected_by_certification)
+{
+    const uint256 x = uint256(0x95), y = uint256(0x96);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 111, 15);
+        C6Materialize(db, y, 112, 16);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        DAGCertVerifyResult vr = DAGCertVerifyResult::NO_CERTIFICATE; std::string verr;
+        BOOST_REQUIRE(db.VerifyDAGProvenanceCoverage(&vr, &verr));
+        BOOST_CHECK_MESSAGE(vr == DAGCertVerifyResult::OK, "L baseline: the certification scan reproduces its digests");
+        db.Close();
+    }
+    C6RawDelete(x);   // unexplained hole produced by an unsupported writer
+    {
+        CTxDB db("r+");
+        DAGCertVerifyResult vr = DAGCertVerifyResult::OK; std::string verr;
+        BOOST_REQUIRE(db.VerifyDAGProvenanceCoverage(&vr, &verr));
+        BOOST_CHECK_MESSAGE(vr == DAGCertVerifyResult::DIGEST_MISMATCH,
+            "L: an unexplained hole must be rejected by certification (result=" << (int)vr << " " << verr << ")");
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() == DAGCustodyState::SUSPENDED,
+            "L: an unexplained hole suspends custody");
+        uint64_t epoch = 0; std::string err;
+        BOOST_CHECK_MESSAGE(!db.CertifyDAGProvenanceCoverage(500, &epoch, &err),
+            "L: certification must never launder a suspended custody (" << err << ")");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, x, 200, &why),
+            "L: an unexplained hole must never become an objectively pruned absence: " << why);
+        BOOST_TEST_MESSAGE("R3_AM L digest_mismatch=1 suspended=1 recert_refused=1 why=" << why);
+        db.Close();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// R4 — AUTHORITY_READY ORDERING TESTS.
+//
+// These prove real ordering on the real production seam: the barrier is published only by the
+// authoritative startup, every consumer gate blocks before that, and a partially ready node is
+// never published. No finality semantics are asserted (lifecycle readiness only).
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r4_authority_ready_prerequisite_matrix)
+{
+    const bool savedAuthoritative = g_fAuthoritativeStartup;
+    AuthorityReadyResetForTest();
+    BOOST_REQUIRE(!AuthorityReadyIsSet());
+
+    AuthorityReadyPrerequisites all;
+    all.durableIndexLoaded = true;
+    all.immutableAuthorityAvailable = true;
+    all.dagDurableStateRestored = true;
+    all.trustProjectionReconciled = true;
+    all.finalityEpochOwnerLifecycleReady = true;
+    all.provenanceCertificationComplete = true;
+
+    struct Case { const char* unmet; const char* expected; };
+    const Case cases[] = {
+        {"durableIndexLoaded", "V2 durable index not loaded"},
+        {"immutableAuthorityAvailable", "immutable authority not available"},
+        {"dagDurableStateRestored", "DAG durable state not restored/validated"},
+        {"trustProjectionReconciled", "R2 trust projection not reconciled"},
+        {"finalityEpochOwnerLifecycleReady", "FINALITY_EPOCH_OWNER_READY lifecycle condition not satisfied"},
+        {"provenanceCertificationComplete", "R3 provenance/projection certification not complete"},
+    };
+    for (unsigned i = 0; i < 6; ++i)
+    {
+        AuthorityReadyPrerequisites p = all;
+        if (i == 0) p.durableIndexLoaded = false;
+        if (i == 1) p.immutableAuthorityAvailable = false;
+        if (i == 2) p.dagDurableStateRestored = false;
+        if (i == 3) p.trustProjectionReconciled = false;
+        if (i == 4) p.finalityEpochOwnerLifecycleReady = false;
+        if (i == 5) p.provenanceCertificationComplete = false;
+        std::string detail;
+        BOOST_CHECK_MESSAGE(!AuthorityReadyMarkIfSatisfied(p, &detail),
+            "R4: unmet prerequisite '" << cases[i].unmet << "' must refuse publication");
+        BOOST_CHECK_MESSAGE(p.WhyNotReady() == cases[i].expected,
+            "R4: the refusal must name the exact prerequisite ('" << p.WhyNotReady() << "')");
+        BOOST_CHECK_MESSAGE(!AuthorityReadyIsSet(), "R4: a refused publication must leave the barrier unset");
+    }
+
+    std::string detail;
+    BOOST_CHECK_MESSAGE(AuthorityReadyMarkIfSatisfied(all, &detail),
+        "R4: all six prerequisites satisfied must publish READY (" << detail << ")");
+    BOOST_CHECK(AuthorityReadyIsSet());
+    BOOST_CHECK_EQUAL(AuthorityReadyStateName(), std::string("READY"));
+    BOOST_TEST_MESSAGE("R4_MATRIX six_prerequisites_required=1 all_satisfied_publishes=1");
+
+    AuthorityReadyResetForTest();
+    g_fAuthoritativeStartup = savedAuthoritative;
+}
+
+BOOST_AUTO_TEST_CASE(r4_authority_ready_consumer_cannot_cross_early)
+{
+    const bool savedAuthoritative = g_fAuthoritativeStartup;
+    AuthorityReadyResetForTest();
+    g_fAuthoritativeStartup = true;      // authoritative session, barrier NOT yet published
+    BOOST_REQUIRE(!AuthorityReadyIsSet());
+
+    // A real consumer (the same gate the finality voter / -loadblock / bootstrap.dat /
+    // wallet-reaccept consumers call) must NOT be able to proceed.
+    volatile bool consumerReturned = false;
+    volatile bool consumerResult = false;
+
+    // Blocking wait with a short window proves the gate holds; the production gate uses a
+    // bounded window and fails the startup explicitly when the barrier never arrives.
+    {
+        std::string err;
+        const bool ok = AuthorityReadyWait(250, &err);
+        BOOST_CHECK_MESSAGE(!ok, "R4: a consumer must not cross AUTHORITY_READY before it is published");
+        BOOST_CHECK_MESSAGE(err == std::string("AUTHORITY_READY not published within the consumer gate window"),
+            "R4: the early-cross failure must be explicit ('" << err << "')");
+        BOOST_TEST_MESSAGE("R4_GATE blocked_before_publish=1 reason=" << err);
+    }
+    {
+        std::string err;
+        const bool ok = AuthorityReadyConsumerEnter("finality_voter", &err);
+        BOOST_CHECK_MESSAGE(!ok, "R4: the finality-voter consumer gate must refuse before publication");
+        BOOST_CHECK_MESSAGE(err.find("consumer 'finality_voter' cannot cross AUTHORITY_READY") == 0,
+            "R4: the gate must name the blocked consumer ('" << err << "')");
+        consumerResult = ok; consumerReturned = true;
+        BOOST_TEST_MESSAGE("R4_CONSUMER finality_voter crossed_early=" << (ok ? 1 : 0));
+    }
+
+    // Publish READY and prove the same gate now lets the consumer through immediately.
+    AuthorityReadyPrerequisites all;
+    all.durableIndexLoaded = all.immutableAuthorityAvailable = all.dagDurableStateRestored = true;
+    all.trustProjectionReconciled = all.finalityEpochOwnerLifecycleReady = all.provenanceCertificationComplete = true;
+    std::string detail;
+    BOOST_REQUIRE_MESSAGE(AuthorityReadyMarkIfSatisfied(all, &detail), detail);
+    {
+        std::string err;
+        const bool ok = AuthorityReadyConsumerEnter("finality_voter", &err);
+        BOOST_CHECK_MESSAGE(ok, "R4: after READY the consumer gate must open immediately (" << err << ")");
+    }
+    BOOST_TEST_MESSAGE("R4_CONSUMER after_ready_crosses=1");
+    (void)consumerReturned; (void)consumerResult;
+
+    AuthorityReadyResetForTest();
+    g_fAuthoritativeStartup = savedAuthoritative;
+}
+
+BOOST_AUTO_TEST_CASE(r4_authority_ready_legacy_mode_not_applicable)
+{
+    const bool savedAuthoritative = g_fAuthoritativeStartup;
+    AuthorityReadyResetForTest();
+    g_fAuthoritativeStartup = false;     // legacy operation: no V2 authority to wait for
+    std::string err;
+    BOOST_CHECK_MESSAGE(AuthorityReadyWait(1, &err),
+        "R4: legacy (non-authoritative) operation has no barrier requirement (" << err << ")");
+    g_fAuthoritativeStartup = savedAuthoritative;
+}
+
+BOOST_AUTO_TEST_CASE(r4_main_cpp_trust_comparison_consumer_gate)
+{
+    // R4 closeout: the identified consensus-sensitive trust comparisons in main.cpp
+    // (main.cpp:9581 ProcessMessage new-best, main.cpp:10537 tip candidacy, main.cpp:13777 SPV
+    // header tip selection) are gated through the SAME single AUTHORITY_READY barrier — no
+    // duplicated readiness logic and no local prerequisite inspection. This case exercises the
+    // exact consumer identities those three sites use.
+    const bool savedAuthoritative = g_fAuthoritativeStartup;
+    AuthorityReadyResetForTest();
+    g_fAuthoritativeStartup = true;
+    const char* names[] = {"main_trust_comparison_new_best",
+                           "main_trust_comparison_tip_candidate",
+                           "main_trust_comparison_spv_header"};
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        std::string err;
+        BOOST_CHECK_MESSAGE(!AuthorityReadyConsumerEnter(names[i], &err),
+            "R4: main.cpp trust consumer '" << names[i] << "' must not cross before AUTHORITY_READY (" << err << ")");
+        BOOST_CHECK_MESSAGE(err.find(std::string("consumer '") + names[i] + "' cannot cross AUTHORITY_READY") == 0,
+            "R4: the refusal must name the blocked main.cpp consumer ('" << err << "')");
+        BOOST_TEST_MESSAGE("R4_MAIN_CONSUMER " << names[i] << " crossed_early=0");
+    }
+    {
+        AuthorityReadyPrerequisites all;
+        all.durableIndexLoaded = all.immutableAuthorityAvailable = all.dagDurableStateRestored = true;
+        all.trustProjectionReconciled = all.finalityEpochOwnerLifecycleReady = all.provenanceCertificationComplete = true;
+        std::string detail;
+        BOOST_REQUIRE_MESSAGE(AuthorityReadyMarkIfSatisfied(all, &detail), detail);
+    }
+    for (unsigned i = 0; i < 3; ++i)
+    {
+        std::string err;
+        BOOST_CHECK_MESSAGE(AuthorityReadyConsumerEnter(names[i], &err),
+            "R4: after AUTHORITY_READY the main.cpp trust consumer must execute normally (" << err << ")");
+    }
+    BOOST_TEST_MESSAGE("R4_MAIN_CONSUMER after_ready_crosses=1 count=3");
+    AuthorityReadyResetForTest();
+    g_fAuthoritativeStartup = savedAuthoritative;
+}
+
+BOOST_AUTO_TEST_CASE(r4_authority_ready_published_by_real_authoritative_startup)
+{
+    SetMockTime(1700001900);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xE400+fork->nHeight);
+    fork=MineRealDag(fork,0xE410);
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("r4ready-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    AuthorityReadyResetForTest();                       // prove the startup itself publishes it
+    BOOST_REQUIRE(!AuthorityReadyIsSet());
+    g_testSuppressDagSourceAbort=true;
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    BOOST_TEST_MESSAGE("R4_STARTUP authority_ready_state="<<AuthorityReadyStateName()
+        <<" published="<<(AuthorityReadyIsSet()?1:0));
+    BOOST_CHECK_MESSAGE(AuthorityReadyIsSet(),
+        "R4: the real authoritative startup must publish AUTHORITY_READY once its six prerequisites hold (refusal detail: "
+        << AuthorityReadyRefusalDetail() << ")");
+    std::string werr;
+    BOOST_CHECK_MESSAGE(AuthorityReadyWait(1,&werr),
+        "R4: after the real startup a consumer gate must open immediately ("<<werr<<")");
+}
+
+BOOST_AUTO_TEST_CASE(c6_matrix_M_watermark_capability_unavailable_no_false_positive)
+{
+    const uint256 x = uint256(0x97);
+    {
+        CTxDB db("r+");
+        C6Materialize(db, x, 121, 17);
+        BOOST_REQUIRE(db.TxnBegin());
+        BOOST_REQUIRE(db.WriteDAGCleanHeight(500));
+        BOOST_REQUIRE(db.TxnCommit());
+        C6Certify(db, 500);
+        C6Prune(db, x, 210, 220);
+        db.Close();
+    }
+    {
+        C6WatermarkSuppressGuard guard;   // the backend provides no read-only accessor
+        CTxDB db("r+");
+        BOOST_CHECK_MESSAGE(db.GetDAGCustodyState() == DAGCustodyState::UNAVAILABLE,
+            "M: without the accessor, cross-session coverage is UNAVAILABLE (never assumed)");
+        std::string why;
+        BOOST_CHECK_MESSAGE(!DAGRowObjectivelyPrunedForTest(db, x, 210, &why),
+            "M: no false-positive prune attribution when the watermark capability is unavailable: " << why);
+        BOOST_TEST_MESSAGE("R3_AM M unavailable=1 no_false_positive=1 why=" << why);
+        db.Close();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F2 AUDIT BLOCKER REPAIR — PRE-DAG PROVIDER FAILURE MATRIX (fail-closed proof)
+//
+// Every case below must FAIL CLOSED. None may switch to the active chain, return
+// partial trust, use zero as a failure signal, or fall back to mapBlockIndex.
+//   1. requested hash absent from the authority  -> provider false / NOT_FOUND
+//   2. requested hash is not pre-DAG (post-DAG)  -> provider false
+//   3. claimed parent ABSENT (injected: the parent's blockindex record is deleted
+//      from the authoritative generation while the child still claims it via
+//      hashPrev)                                  -> provider false / FAILURE,
+//      and explicitly NOT the active-chain value at the child's height
+//   4. authority unavailable                     -> resolver FAILURE
+// Note on "hot-only/unavailable termination": case 3 is exactly the shape the F1
+// hot-floor bug had (a vertex whose parent cannot be proven), and it must never
+// be reinterpreted as canonical genesis.
+// ---------------------------------------------------------------------------
+static bool F2DeleteBlockIndexRecordFromSnapshot(const std::string& snapshotDir,
+                                                 const uint256& hash, std::string* error)
+{
+    leveldb::Options options;
+    options.create_if_missing = false;
+    options.error_if_exists = false;
+    leveldb::DB* db = NULL;
+    leveldb::Status status = leveldb::DB::Open(options, snapshotDir, &db);
+    if (!status.ok()) { if (error) *error = "snapshot open failed: " + status.ToString(); return false; }
+    CDataStream ssKey(SER_DISK, CLIENT_VERSION);
+    ssKey << make_pair(std::string("blockindex"), hash);
+    leveldb::Status del = db->Delete(leveldb::WriteOptions(), ssKey.str());
+    delete db;
+    if (!del.ok()) { if (error) *error = "snapshot delete failed: " + del.ToString(); return false; }
+    return true;
+}
+
+BOOST_AUTO_TEST_CASE(f2_pre_dag_provider_failure_matrix)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+
+    const int hPreDag = GetForkHeightDAG() - 1;
+    CBlockIndex* a10 = pindexBest;
+    while (a10->nHeight < hPreDag) a10 = MineReal(a10, 0x9300 + a10->nHeight);
+    while (a10->nHeight > hPreDag) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
+    BOOST_REQUIRE_EQUAL(a10->nHeight, hPreDag);
+    const uint256 bestHashBeforeFixture = hashBestChain;
+    CBlockIndex* a9 = a10->pprev; BOOST_REQUIRE(a9 != NULL);
+    CBlockIndex* a8 = a9->pprev;  BOOST_REQUIRE(a8 != NULL);
+    CBlockIndex* a7 = a8->pprev;  BOOST_REQUIRE(a7 != NULL);
+
+    CBlockIndex* sideAtPoem = AddSidePoWBlock(a8, 0x9391);   // h9, healthy branch
+    BOOST_REQUIRE(sideAtPoem != NULL);
+    CBlockIndex* lostParent = AddSidePoWBlock(a7, 0x9392);   // h8, will be deleted
+    BOOST_REQUIRE(lostParent != NULL);
+    CBlockIndex* childOfLost = AddSidePoWBlock(lostParent, 0x9393); // h9, claims lostParent
+    BOOST_REQUIRE(childOfLost != NULL);
+    BOOST_REQUIRE_MESSAGE(nBestHeight > 9,
+        "F2 fixture: the active best chain must be strictly taller than the side branches");
+    BOOST_REQUIRE_MESSAGE(hashBestChain == bestHashBeforeFixture,
+        "F2 fixture: the side branches must not displace the active best chain");
+
+    // A genuine post-DAG block so the pre-DAG contract can be exercised. Built via
+    // the storage path (AddSideDag) so it works even when the ambient best chain
+    // is deeper than this fixture's height-11 block.
+    BOOST_REQUIRE_EQUAL(a10->nHeight + 1, GetForkHeightDAG());
+    CBlockIndex* postDag = AddSideDag(a10, 0x9399);
+    BOOST_REQUIRE(postDag != NULL);
+    BOOST_REQUIRE_EQUAL(postDag->nHeight, GetForkHeightDAG());
+
+    const uint256 sideAtPoemHash = sideAtPoem->GetBlockHash();
+    const uint256 lostParentHash = lostParent->GetBlockHash();
+    const uint256 childOfLostHash = childOfLost->GetBlockHash();
+    const uint256 a9Hash = a9->GetBlockHash();
+    const uint256 postDagHash = postDag->GetBlockHash();
+    const uint256 sideAtPoemTrust = sideAtPoem->nChainTrust;
+    const uint256 a9Trust = a9->nChainTrust;
+    const uint256 childOfLostTrust = childOfLost->nChainTrust;
+    BOOST_REQUIRE(sideAtPoemTrust != a9Trust);
+    BOOST_REQUIRE(childOfLostTrust != a9Trust);
+
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("f2-failmatrix-%%%%-%%%%");
+    std::map<uint256, CBlockIndex*> savedMap;
+    { LOCK(cs_main); savedMap = mapBlockIndex; }
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+    struct Cleanup {
+        fs::path root; std::map<uint256, CBlockIndex*> savedMap;
+        CBlockIndex* best; CBlockIndex* genesis;
+        uint256 bestChain; int bestHeight; uint256 bestTrust;
+        Cleanup(const fs::path& r, const std::map<uint256, CBlockIndex*>& m,
+                CBlockIndex* b, CBlockIndex* g, const uint256& bc, int bh, const uint256& bt)
+            : root(r), savedMap(m), best(b), genesis(g), bestChain(bc), bestHeight(bh), bestTrust(bt) {}
+        ~Cleanup() {
+            ResetBlockIndexAuthoritativeStartupForTest();
+            { LOCK(cs_main); if (!savedMap.empty()) RestoreMapBlockIndexForFixture(savedMap); }
+            pindexBest = best; pindexGenesisBlock = genesis;
+            hashBestChain = bestChain; nBestHeight = bestHeight; nBestChainTrust = bestTrust;
+            try { fs::remove_all(root); } catch (...) {}
+        }
+    } cleanup(root, savedMap, savedBest, savedGenesis, savedBestChain, savedBestHeight, savedBestTrust);
+
+    // Snapshot the live DB twice: one clean copy, and one copy with the claimed
+    // parent's blockindex record DELETED (the injected inconsistency).
+    fs::create_directories(root / "snapshot");
+    fs::create_directories(root / "snapshot-broken");
+    { CTxDB db; db.Close(); }
+    const auto live = GetDataDir() / "txleveldb";
+    for (fs::directory_iterator it(live), end; it != end; ++it)
+        if (fs::is_regular_file(it->path())) {
+            fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
+            fs::copy_file(it->path(), root / "snapshot-broken" / it->path().filename());
+        }
+    std::string derr;
+    BOOST_REQUIRE_MESSAGE(F2DeleteBlockIndexRecordFromSnapshot((root / "snapshot-broken").string(), lostParentHash, &derr),
+        "F2 failure-matrix injection failed: " << derr);
+
+    // ---- 3. claimed parent ABSENT is UNREPRESENTABLE in a valid generation ---
+    // The authoritative generation builder itself validates parent connectivity:
+    // a child whose persisted hashPrev has no record is REJECTED at BUILD time.
+    // A healthy authoritative generation therefore cannot contain a
+    // present-vertex-with-absent-parent, so the provider can never be handed one --
+    // and the provider's own "claimed parent absent" branch is the defensive
+    // fail-closed guard for a CORRUPT store, not a state the authority produces.
+    // This is what makes a truncated ancestry structurally unable to be read as
+    // canonical genesis (the F1 hot-floor bug shape).
+    {
+        BlockIndexGenerationSource brokenSource;
+        std::string berr;
+        BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot-broken").string(), &brokenSource, &berr), berr);
+        BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root / "snapshot-broken").string(), &brokenSource.dagLinks, &brokenSource.dagScores, &berr), berr);
+        brokenSource.foundDAGLinks = true;
+        brokenSource.blockDataDir = GetDataDir().string();
+        brokenSource.dagLinksDir = (root / "snapshot-broken").string();
+        BlockIndexGenerationBuilder badBuilder;
+        std::string badError;
+        const bool builtBad = badBuilder.Build(brokenSource, (root / "build-broken.tmp").string(), 1, NULL, &badError);
+        BOOST_CHECK_MESSAGE(!builtBad,
+            "a generation containing a child with an ABSENT claimed parent must be REJECTED at build time");
+        BOOST_TEST_MESSAGE("F2 FM claimed-parent-absent child=" << childOfLostHash.GetHex()
+            << " lostParent=" << lostParentHash.GetHex()
+            << " builderRejected=" << (builtBad ? 0 : 1) << " err=" << badError);
+    }
+
+    std::string error;
+    {
+        BlockIndexGenerationSource source;
+        BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, &error), error);
+        BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root / "snapshot").string(), &source.dagLinks, &source.dagScores, &error), error);
+        source.foundDAGLinks = true;
+        source.blockDataDir = GetDataDir().string();
+        source.dagLinksDir = (root / "snapshot").string();
+        BlockIndexGenerationBuilder builder;
+        BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, &error), error);
+        builder.Close();
+    }
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+
+    // ---- 1. requested hash absent from the authority ---------------------
+    {
+        uint256 ghost("0xdeadbeef00000000000000000000000000000000000000000000000000000002");
+        uint256 acc = 1; std::string e;
+        const bool ok = GetAuthoritativeAccumulatedChainTrust(ghost, &acc, &e);
+        BOOST_CHECK_MESSAGE(!ok, "absent requested hash must fail closed; err=" << e);
+        std::string e2;
+        CDAGManager::DAGParentScoreResult r = g_dagManager.ResolveDagParentScore(ghost, true, &e2);
+        BOOST_CHECK_EQUAL((int)r.status, (int)CDAGManager::DAGParentScoreStatus::NOT_FOUND);
+        BOOST_CHECK(r.score == 0);
+        BOOST_TEST_MESSAGE("F2 FM requested-absent status=" << (int)r.status << " err=" << e);
+    }
+
+    // ---- 2. post-DAG hash routed to the pre-DAG provider -----------------
+    {
+        uint256 acc = 1; std::string e;
+        const bool ok = GetAuthoritativeAccumulatedChainTrust(postDagHash, &acc, &e);
+        BOOST_CHECK_MESSAGE(!ok, "a post-DAG hash must be rejected by the pre-DAG provider; err=" << e);
+        BOOST_TEST_MESSAGE("F2 FM post-DAG-rejected hash=" << postDagHash.GetHex() << " err=" << e);
+    }
+
+    // ---- 3b. the accepted generation's walks terminate at a PROVEN chain start
+    //         (persisted hashPrev == 0), never at a truncation -----------------
+    {
+        // Both a healthy side branch and the active chain resolve; each walk is
+        // proven to end at the one record whose PERSISTED authority says it has no
+        // parent. A walk that stopped early would silently under-accumulate.
+        uint256 accS = 0; std::string e3;
+        BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(sideAtPoemHash, &accS, &e3), e3);
+        BOOST_CHECK_MESSAGE(accS == sideAtPoemTrust, "healthy sibling branch must resolve to its own branch trust");
+        uint256 accA = 0; std::string e4;
+        BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(a9Hash, &accA, &e4), e4);
+        BOOST_CHECK_MESSAGE(accA == a9Trust, "active chain ancestry must resolve");
+        // The deleted-parent child's hash is NOT in the clean generation at all
+        // (it was only deleted in the broken copy), so the clean authority still
+        // resolves it correctly -- proving the deletion was the only difference.
+        uint256 accC = 0; std::string e5;
+        BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(childOfLostHash, &accC, &e5), e5);
+        BOOST_CHECK_MESSAGE(accC == childOfLostTrust, "clean generation must still resolve the child branch");
+        BOOST_TEST_MESSAGE("F2 FM genesis-terminated healthySibling=" << accS.GetHex()
+            << " activeChain=" << accA.GetHex() << " cleanChild=" << accC.GetHex());
+    }
+
+    // ---- 4. authority unavailable (LAST: it tears the authority down) -----
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        std::string e;
+        CDAGManager::DAGParentScoreResult r = g_dagManager.ResolveDagParentScore(a9Hash, true, &e);
+        BOOST_CHECK_EQUAL((int)r.status, (int)CDAGManager::DAGParentScoreStatus::FAILURE);
+        uint256 acc = 1; std::string e2;
+        BOOST_CHECK(!GetAuthoritativeAccumulatedChainTrust(a9Hash, &acc, &e2));
+        BOOST_TEST_MESSAGE("F2 FM authority-unavailable status=" << (int)r.status << " err=" << e);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F2 Phase 12 — REAL-SCALE READ-ONLY BOUNDARY PROBE (env-gated).
+//
+// Answers: at a fresh authoritative boot (mapBlockIndex empty, mapDAGData
+// empty), does the PERSISTED authority actually contain the boundary parent
+// score F2 needs? Skipped unless F2_PROBE_DATADIR points at an isolated
+// mainnet-scale datadir (never the production datadir).
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(f2_real_scale_boundary_probe)
+{
+    const char* env = getenv("F2_PROBE_DATADIR");
+    if (!env || !*env) { BOOST_TEST_MESSAGE("F2 real-scale probe skipped (F2_PROBE_DATADIR unset)"); return; }
+    const std::string dir = std::string(env) + "/txleveldb";
+    BlockIndexGenerationSource source; std::string error;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource(dir, &source, &error), error);
+    std::map<uint256, std::vector<uint256> > dagLinks;
+    std::map<uint256, uint256> dagScores;
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot(dir, &dagLinks, &dagScores, &error), error);
+
+    const uint256 tip = source.hashBestChain;
+    int tipH = -1;
+    std::map<uint256, int> heightByHash;
+    for (size_t i = 0; i < source.records.size(); ++i)
+    {
+        heightByHash[source.records[i].hash] = source.records[i].record.height;
+        if (source.records[i].hash == tip) tipH = source.records[i].record.height;
+    }
+    const bool tipHasRow = dagLinks.count(tip) != 0;
+    uint256 tipScore = 0;
+    if (tipHasRow) { std::map<uint256, uint256>::const_iterator s = dagScores.find(tip); if (s != dagScores.end()) tipScore = s->second; }
+
+    // Highest height that actually carries a canonical daglinks row.
+    int maxDagH = -1; uint256 maxDagHash = 0;
+    {
+        std::map<uint256, std::vector<uint256> >::const_iterator it;
+        for (it = dagLinks.begin(); it != dagLinks.end(); ++it)
+        {
+            std::map<uint256, int>::const_iterator h = heightByHash.find(it->first);
+            if (h != heightByHash.end() && h->second > maxDagH) { maxDagH = h->second; maxDagHash = it->first; }
+        }
+    }
+    BOOST_TEST_MESSAGE("F2 REAL_SCALE activeTip=" << tip.GetHex() << " tipHeight=" << tipH
+        << " records=" << source.records.size() << " foundBestChain=" << (source.foundBestChain ? 1 : 0)
+        << " dagLinkRows=" << dagLinks.size() << " dagScoreRows=" << dagScores.size()
+        << " foundDAGLinks=" << (source.foundDAGLinks ? 1 : 0)
+        << " tipHasDAGLinkRow=" << (tipHasRow ? 1 : 0) << " tipDAGScore=" << tipScore.GetHex()
+        << " highestDagLinkHeight=" << maxDagH << " highestDagLinkHash=" << maxDagHash.GetHex());
 }
 
 // R2c.2 prerequisite discriminator (converted to GREEN expected-mismatch regression).
@@ -5389,9 +7921,10 @@ bool PruneFailMatrixBarrierHook(int barrier, std::string* error)
 // Full durable view of the authoritative source for all-old comparisons.
 struct PruneStateSnapshot
 {
-    bool childPresent, scorePresent, cleanPresent;
+    bool childPresent, scorePresent, cleanPresent, pruneFloorPresent;
     std::pair<uint32_t,uint256> childMarker, scoreMarker;
     int cleanHeight;
+    int pruneFloor;
     uint256 token;
     std::map<uint256,std::string> view;
     std::vector<std::pair<int32_t,uint256>> scope;
@@ -5402,13 +7935,15 @@ struct PruneStateSnapshot
 static PruneStateSnapshot SnapshotPruneState()
 {
     PruneStateSnapshot s;
-    s.childPresent = s.scorePresent = s.cleanPresent = false;
+    s.childPresent = s.scorePresent = s.cleanPresent = s.pruneFloorPresent = false;
     s.cleanHeight = -1;
+    s.pruneFloor = -1;
     {
         struct Readback : CTxDB { using CTxDB::Read; } db;
         s.childPresent = db.Read(std::make_pair(std::string("dagchildcountstate"),uint8_t(0)), s.childMarker);
         s.scorePresent = db.Read(std::make_pair(std::string("dagscorestate"),uint8_t(0)), s.scoreMarker);
         s.cleanPresent = db.ReadDAGCleanHeight(s.cleanHeight);
+        s.pruneFloorPresent = db.ReadDAGPruneFloor(s.pruneFloor);
         BOOST_REQUIRE(db.ReadDAGSourceStateId(s.token));
         std::string serr;
         BOOST_REQUIRE_MESSAGE(EnumerateAuthoritativeStagedScope(db, &s.scope, NULL, &serr), serr);
@@ -5446,6 +7981,10 @@ static void CheckPruneAllOld(const PruneStateSnapshot& a, const PruneStateSnapsh
     BOOST_CHECK_MESSAGE(a.cleanPresent == b.cleanPresent, tag << ": clean-height presence changed");
     if (a.cleanPresent && b.cleanPresent)
         BOOST_CHECK_MESSAGE(a.cleanHeight == b.cleanHeight, tag << ": clean height changed");
+    BOOST_CHECK_MESSAGE(a.pruneFloorPresent == b.pruneFloorPresent,
+        tag << ": erase-provenance marker presence changed");
+    if (a.pruneFloorPresent && b.pruneFloorPresent)
+        BOOST_CHECK_MESSAGE(a.pruneFloor == b.pruneFloor, tag << ": erase-provenance marker changed");
     BOOST_CHECK_MESSAGE(a.childPresent == b.childPresent, tag << ": child-count marker presence changed");
     if (a.childPresent && b.childPresent)
         BOOST_CHECK_MESSAGE(a.childMarker == b.childMarker, tag << ": child-count marker changed");
@@ -5559,6 +8098,8 @@ BOOST_AUTO_TEST_CASE(r2c2s_s3_authoritative_prune_failure_matrix)
         BOOST_CHECK(add.empty());
         BOOST_CHECK(post.token != pre.token);
         BOOST_CHECK(post.cleanPresent && post.cleanHeight == tip->nHeight);
+        BOOST_CHECK_MESSAGE(post.pruneFloorPresent && post.pruneFloor == tip->nHeight,
+            "the erase lifecycle must persist the erase-provenance floor at the line, in the SAME commit");
         BOOST_CHECK_EQUAL(cap.records.size(), del.size());
         {
             CTxDB db; std::string h1,h2;
@@ -9521,6 +12062,902 @@ struct G6RowMutation
 };
 } // namespace
 
+// ---------------------------------------------------------------------------
+// B-1 PHASE 8 — LEGITIMATELY PRUNED POST-DAG PARENT SCORE AUTHORITY
+//
+// The accepted S3/S5 semantics allow a real side branch to extend from a
+// DAG-era parent whose canonical daglinks row was erased by the ACCEPTED prune
+// lifecycle. F2 must resolve that parent's exact FORMER scalar instead of
+// treating every missing row as fatal, WITHOUT weakening the G6 rule (an
+// arbitrary row loss at/above the certified line must still fail closed).
+//
+// Shared fixture: mine a shallow DAG era on the ACTIVE chain, snapshot it into
+// an isolated authoritative world, bind the certificate with a real
+// authoritative ADD, record the target's FORMER canonical scalar while its row
+// still exists, then erase the rows below the line through a REAL forced prune
+// inside a REAL ADD (exactly the accepted lifecycle).
+// ---------------------------------------------------------------------------
+struct B1PrunedEra
+{
+    fs::path root;
+    CBlockIndex* target;
+    uint256 targetHash;
+    uint256 formerScalar;
+    int targetHeight;
+    int cleanHeight;
+    B1PrunedEra() : target(NULL), targetHeight(-1), cleanHeight(-1) {}
+};
+
+struct B1EraScope
+{
+    B1PrunedEra era;
+    CBlockIndex* best;
+    CBlockIndex* genesis;
+    std::string err;
+    B1EraScope() : best(pindexBest), genesis(pindexGenesisBlock) {}
+    ~B1EraScope()
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        pindexBest = best; pindexGenesisBlock = genesis;
+        if (best) { nBestHeight = best->nHeight; hashBestChain = best->GetBlockHash();
+                    nBestChainTrust = best->nChainTrust; }
+        g_testSuppressDagSourceAbort = false; g_testForceDagPruneInAdd = false; g_testDagPruneDepth = 0;
+        try { if (!era.root.empty()) fs::remove_all(era.root); } catch (...) {}
+    }
+};
+
+static void B1BuildPrunedEra(B1PrunedEra* out, std::string* error)
+{
+    using namespace dag_tip_frontier;
+    // 1. ACTIVE chain to the last pre-DAG height, then a shallow DAG era. Order
+    //    robust: an earlier case in the same process may leave a deeper chain.
+    CBlockIndex* p = pindexBest;
+    while (p->nHeight < GetForkHeightDAG() - 1) p = MineReal(p, 0xB000 + p->nHeight);
+    while (p->nHeight > GetForkHeightDAG() - 1) p = p->pprev;
+    BOOST_REQUIRE(p != NULL);
+    std::vector<CBlockIndex*> era;
+    for (int i = 0; i < 6; ++i) { p = MineRealDag(p, 0xB100 + i); BOOST_REQUIRE(p != NULL); era.push_back(p); }
+    out->target = era[1];
+    out->targetHeight = out->target->nHeight;
+
+    // 2. Isolated authoritative world from the CURRENT live store.
+    out->root = fs::temp_directory_path() / fs::unique_path("b1-pruned-era-%%%%-%%%%");
+    fs::create_directories(out->root);
+    F2BuildAuthoritativeGenerationAndInit(out->root, error);
+
+    // 3. One real authoritative ADD: the accepted heal-on-ADD path binds the
+    //    score certificate at the current source token.
+    CBlockIndex* binder = MineRealDag(pindexBest, 0xB200);
+    BOOST_REQUIRE(binder != NULL);
+    { CTxDB db; std::string herr; BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&herr), herr); }
+
+    // 4. Record the exact FORMER canonical scalar while the row still exists.
+    out->targetHash = out->target->GetBlockHash();
+    {
+        CTxDB db; CBlockDAGData row;
+        BOOST_REQUIRE_MESSAGE(db.ReadDAGLinks(out->targetHash, row),
+            "B-1 fixture: the target must hold its canonical row before the prune");
+        out->formerScalar = row.nDAGScore;
+    }
+
+    // 5. REAL forced prune inside a REAL ADD (the accepted erase lifecycle).
+    {
+        PruneSeamScope seams(1, true);
+        CBlockIndex* tip = MineRealDag(pindexBest, 0xB300);
+        BOOST_REQUIRE(tip != NULL);
+    }
+
+    // 6. Prove the lifecycle erased the below-line rows and certified that line.
+    //    The F2 erase-provenance marker (sole writer: the erase lifecycle) must be
+    //    certified by the same commit, at the same line.
+    {
+        CTxDB db; CBlockDAGData row; int clean = -1; int floorLine = -1;
+        BOOST_REQUIRE_MESSAGE(!db.ReadDAGLinks(out->targetHash, row),
+            "B-1 fixture: the pruned target's row must be absent");
+        BOOST_REQUIRE_MESSAGE(db.ReadDAGCleanHeight(clean), "B-1 fixture: the prune line must be certified");
+        BOOST_REQUIRE(clean > 0);
+        BOOST_REQUIRE_MESSAGE(out->targetHeight < clean,
+            "B-1 fixture: the target must sit strictly below the certified prune line");
+        BOOST_REQUIRE_MESSAGE(db.ReadDAGPruneFloor(floorLine),
+            "B-1 fixture: the ERASE provenance marker must be certified by the prune lifecycle");
+        BOOST_REQUIRE(floorLine > 0);
+        BOOST_CHECK_EQUAL(floorLine, clean);
+        BOOST_REQUIRE_MESSAGE(out->targetHeight < floorLine,
+            "B-1 fixture: the target must sit strictly below the ERASE floor the predicate consumes");
+        out->cleanHeight = clean;
+    }
+}
+
+// 8A: a legitimately pruned DAG-era parent resolves to its EXACT former scalar
+// with the PRUNED_BOUNDARY provenance, and a real child can extend from it.
+BOOST_AUTO_TEST_CASE(f2_b1_legit_pruned_post_dag_parent_resolves_boundary_score)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+    B1EraScope scope;
+    B1BuildPrunedEra(&scope.era, &scope.err);
+
+    // The block authority still KNOWS the pruned hash (only its DAG row is gone).
+    std::string e;
+    BlockIndexSnapshot snap;
+    BOOST_REQUIRE_MESSAGE(ResolveAuthoritativeBlockSnapshot(scope.era.targetHash, &snap, &e), e);
+    BOOST_CHECK_MESSAGE(snap.found && snap.hash == scope.era.targetHash,
+        "the pruned parent must remain a KNOWN authoritative block");
+    BOOST_CHECK_EQUAL(snap.height, scope.era.targetHeight);
+
+    // F2 resolution: EXACT former scalar, typed as the legitimate pruned boundary.
+    CDAGManager::DAGParentScoreResult res =
+        g_dagManager.ResolveDagParentScore(scope.era.targetHash, true, &e);
+    BOOST_TEST_MESSAGE("B1_PRUNED resolved status=" << (int)res.status << " src=" << (int)res.source
+        << " score=" << res.score.GetHex() << " former=" << scope.era.formerScalar.GetHex()
+        << " h=" << scope.era.targetHeight << " line=" << scope.era.cleanHeight << " err=" << e);
+    BOOST_REQUIRE_MESSAGE(res.status == CDAGManager::DAGParentScoreStatus::FOUND, e);
+    BOOST_CHECK_MESSAGE(res.source == CDAGManager::DAGParentScoreSource::PRUNED_BOUNDARY,
+        "a legitimately pruned parent must be admitted as the PRUNED_BOUNDARY class");
+    BOOST_CHECK_MESSAGE(res.score == scope.era.formerScalar,
+        "the pruned parent must resolve to its EXACT former canonical scalar");
+
+    // A real child extends from the pruned parent (the accepted S3 scenario).
+    CBlockIndex* child = AddSideDag(scope.era.target, 0xB400);
+    BOOST_REQUIRE_MESSAGE(child != NULL, "a real ADD must succeed from a legitimately pruned parent");
+    BOOST_TEST_MESSAGE("B1_PRUNED child_added h=" << child->nHeight);
+}
+
+// 8C: the same boundary resolution is EXACT across a real reopen.
+BOOST_AUTO_TEST_CASE(f2_b1_legit_pruned_boundary_restart_equivalence)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+    B1EraScope scope;
+    B1BuildPrunedEra(&scope.era, &scope.err);
+
+    std::string e1;
+    CDAGManager::DAGParentScoreResult before =
+        g_dagManager.ResolveDagParentScore(scope.era.targetHash, true, &e1);
+    BOOST_REQUIRE_MESSAGE(before.status == CDAGManager::DAGParentScoreStatus::FOUND, e1);
+
+    { CTxDB db; db.Close(); }   // real reopen of the shared source handle
+
+    std::string e2;
+    CDAGManager::DAGParentScoreResult after =
+        g_dagManager.ResolveDagParentScore(scope.era.targetHash, true, &e2);
+    BOOST_TEST_MESSAGE("B1_REOPEN before=" << before.score.GetHex() << " after=" << after.score.GetHex()
+        << " src=" << (int)after.source << " err=" << e2);
+    BOOST_REQUIRE_MESSAGE(after.status == CDAGManager::DAGParentScoreStatus::FOUND, e2);
+    BOOST_CHECK_MESSAGE(after.score == before.score,
+        "the pruned boundary scalar must be EXACT across a restart");
+    BOOST_CHECK_MESSAGE(after.score == scope.era.formerScalar, "and equal to the former canonical scalar");
+}
+
+// 8D: exact reconstruction requires the raw block; with it unavailable the
+// resolution FAILS CLOSED (never zero, never residency) and recovers exactly
+// once the raw block is readable again.
+BOOST_AUTO_TEST_CASE(f2_b1_legit_pruned_boundary_raw_unavailable)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+    B1EraScope scope;
+    B1BuildPrunedEra(&scope.era, &scope.err);
+
+    BlockIndexSnapshot snap; std::string e;
+    BOOST_REQUIRE_MESSAGE(ResolveAuthoritativeBlockSnapshot(scope.era.targetHash, &snap, &e), e);
+    BOOST_REQUIRE(snap.found);
+    const fs::path blockFile = GetDataDir() / strprintf("blk%04d.dat", snap.nFile);
+    const fs::path stash = blockFile.string() + ".b1-stashed";
+    BOOST_REQUIRE_MESSAGE(fs::exists(blockFile), "B-1 fixture: the target's raw block file must exist");
+
+    bool renamed = false;
+    try { fs::rename(blockFile, stash); renamed = true; } catch (const std::exception&) { renamed = false; }
+    BOOST_REQUIRE_MESSAGE(renamed, "B-1 fixture: could not stash the raw block file");
+
+    std::string e1;
+    CDAGManager::DAGParentScoreResult unavailable =
+        g_dagManager.ResolveDagParentScore(scope.era.targetHash, true, &e1);
+    BOOST_TEST_MESSAGE("B1_RAW_UNAVAILABLE status=" << (int)unavailable.status << " score="
+        << unavailable.score.GetHex() << " err=" << e1);
+    BOOST_CHECK_MESSAGE(unavailable.status == CDAGManager::DAGParentScoreStatus::FAILURE,
+        "an unreconstructible boundary must FAIL CLOSED");
+    BOOST_CHECK_MESSAGE(unavailable.status != CDAGManager::DAGParentScoreStatus::FOUND,
+        "no silent zero: an unreconstructible boundary is never FOUND");
+    BOOST_CHECK(unavailable.score == uint256(0));
+
+    fs::rename(stash, blockFile);   // restore the raw block
+    std::string e2;
+    CDAGManager::DAGParentScoreResult restored =
+        g_dagManager.ResolveDagParentScore(scope.era.targetHash, true, &e2);
+    BOOST_REQUIRE_MESSAGE(restored.status == CDAGManager::DAGParentScoreStatus::FOUND, e2);
+    BOOST_CHECK_MESSAGE(restored.score == scope.era.formerScalar,
+        "restoring the raw block must restore the exact former scalar");
+}
+
+// 8B: an ARBITRARY missing row (a live frontier vertex at/above the certified
+// line, healthy certificate) must keep failing closed — the G6 separation.
+BOOST_AUTO_TEST_CASE(f2_b1_arbitrary_missing_post_dag_row_fails_closed)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+
+    CBlockIndex* p = pindexBest;
+    while (p->nHeight < GetForkHeightDAG() - 1) p = MineReal(p, 0xB500 + p->nHeight);
+    while (p->nHeight > GetForkHeightDAG() - 1) p = p->pprev;
+    BOOST_REQUIRE(p != NULL);
+    for (int i = 0; i < 4; ++i) { p = MineRealDag(p, 0xB600 + i); BOOST_REQUIRE(p != NULL); }
+
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("b1-arbitrary-%%%%-%%%%");
+    fs::create_directories(root);
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            try{fs::remove_all(root);}catch(...){} } } cleanup(root);
+    std::string err;
+    F2BuildAuthoritativeGenerationAndInit(root, &err);
+    CBlockIndex* binder = MineRealDag(pindexBest, 0xB700);
+    BOOST_REQUIRE(binder != NULL);
+
+    const uint256 victim = pindexBest->GetBlockHash();
+    const int victimHeight = pindexBest->nHeight;
+
+    // Precondition (the G6 world): the certificate is HEALTHY and no certified
+    // prune line sits above the victim, so its absence is unexplained loss.
+    {
+        CTxDB db; std::string herr; int clean = -1; int floor = -1;
+        BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&herr), herr);
+        if (db.ReadDAGCleanHeight(clean))
+            BOOST_REQUIRE_MESSAGE(victimHeight >= clean,
+                "B-1 fixture: the arbitrary-absence victim must sit at/above the certified line");
+        if (db.ReadDAGPruneFloor(floor))
+            BOOST_REQUIRE_MESSAGE(victimHeight >= floor,
+                "B-1 fixture: the arbitrary-absence victim must carry no ERASE provenance either");
+        CBlockDAGData row; BOOST_REQUIRE(db.ReadDAGLinks(victim, row));
+    }
+
+    G6RowMutation mutation;
+    { CTxDB tdb; BOOST_REQUIRE(mutation.ArmRemove(tdb, victim)); }
+
+    std::string e;
+    CDAGManager::DAGParentScoreResult res =
+        g_dagManager.ResolveDagParentScore(victim, true, &e);
+    BOOST_TEST_MESSAGE("B1_ARBITRARY status=" << (int)res.status << " score=" << res.score.GetHex()
+        << " h=" << victimHeight << " err=" << e);
+    BOOST_CHECK_MESSAGE(res.status == CDAGManager::DAGParentScoreStatus::FAILURE,
+        "an arbitrary missing row must keep failing closed (G6 separation)");
+    BOOST_CHECK_MESSAGE(res.status != CDAGManager::DAGParentScoreStatus::FOUND,
+        "never a silent zero for arbitrary absence");
+    BOOST_CHECK(res.score == uint256(0));
+}
+
+// 8E: SHUTDOWN-STYLE MARKER MUST NOT CREATE ERASE PROVENANCE.
+//
+// The legacy restart marker `dagcleanheight` is written by THREE sites with TWO
+// meanings: PruneDAGData stores the ERASE FLOOR (nHeight - DAG_PRUNE_DEPTH),
+// Shutdown() stores the CURRENT TIP and erases nothing, and the prune rollback
+// restores a prior value. F2's erased-boundary provenance therefore may NOT be
+// derived from `dagcleanheight`: after ONE clean shutdown the marker equals the
+// pre-shutdown tip, and "known DAG-era vertex, no row, strictly below the
+// marker" is then satisfied by every erased vertex AND by any arbitrary row
+// loss across the whole retained window (up to DAG_PRUNE_DEPTH heights).
+//
+// This case is the control the B-1 audit was missing. It holds the G6 world of
+// 8B fixed (healthy certificate, victim at/above any certified line, canonical
+// row removed out of band) and varies ONLY the marker state:
+//   (1) no marker above the victim            -> FAILURE   (G6 separation)
+//   (2) `dagcleanheight` = victimHeight + 1   -> FAILURE   (Shutdown-style tip)
+//   (3) `dagcleanheight` = victimHeight + 100 -> FAILURE   (same, far above)
+//   (4) the ERASE-OWNED marker above the victim -> FOUND / PRUNED_BOUNDARY with
+//       the exact former scalar (the accepted lifecycle still resolves).
+// Pre-repair, (2) and (3) resolved FOUND/PRUNED_BOUNDARY with the byte-exact
+// former scalar - arbitrary row loss converted into accept-path authority by a
+// non-erase advance of the shared key.
+BOOST_AUTO_TEST_CASE(f2_b1_shutdown_style_marker_cannot_admit_arbitrary_missing_row)
+{
+    using namespace dag_tip_frontier;
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
+    BOOST_REQUIRE(pindexBest != NULL);
+
+    CBlockIndex* p = pindexBest;
+    while (p->nHeight < GetForkHeightDAG() - 1) p = MineReal(p, 0xB500 + p->nHeight);
+    while (p->nHeight > GetForkHeightDAG() - 1) p = p->pprev;
+    BOOST_REQUIRE(p != NULL);
+    for (int i = 0; i < 4; ++i) { p = MineRealDag(p, 0xB600 + i); BOOST_REQUIRE(p != NULL); }
+
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("b1-shutdown-marker-%%%%-%%%%");
+    fs::create_directories(root);
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            try{fs::remove_all(root);}catch(...){} } } cleanup(root);
+    std::string err;
+    F2BuildAuthoritativeGenerationAndInit(root, &err);
+    CBlockIndex* binder = MineRealDag(pindexBest, 0xB700);
+    BOOST_REQUIRE(binder != NULL);
+
+    const uint256 victim = pindexBest->GetBlockHash();
+    const int victimHeight = pindexBest->nHeight;
+
+    // Precondition (the G6 world): healthy certificate, the canonical row is
+    // present now, and no certified line sits above the victim.
+    uint256 formerScalar = 0;
+    {
+        CTxDB db; std::string herr; CBlockDAGData row; int clean = -1; int floor = -1;
+        BOOST_REQUIRE_MESSAGE(db.IsDAGScoreAuthorityHealthy(&herr), herr);
+        if (db.ReadDAGCleanHeight(clean))
+            BOOST_REQUIRE_MESSAGE(victimHeight >= clean,
+                "B-1 fixture: the arbitrary-absence victim must sit at/above the certified line");
+        if (db.ReadDAGPruneFloor(floor))
+            BOOST_REQUIRE_MESSAGE(victimHeight >= floor,
+                "B-1 fixture: the arbitrary-absence victim must carry no ERASE provenance");
+        BOOST_REQUIRE_MESSAGE(db.ReadDAGLinks(victim, row),
+            "B-1 fixture: the victim must hold its canonical row before the mutation");
+        formerScalar = row.nDAGScore;
+    }
+
+    // Arbitrary row loss WITHOUT the accepted prune/erase lifecycle.
+    G6RowMutation mutation;
+    { CTxDB tdb; BOOST_REQUIRE(mutation.ArmRemove(tdb, victim)); }
+
+    {   // (1) control: unexplained absence must fail closed.
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(victim, true, &e);
+        BOOST_TEST_MESSAGE("B1_SHUTDOWN_MARKER leg=1-none status=" << (int)res.status
+            << " src=" << (int)res.source << " score=" << res.score.GetHex()
+            << " h=" << victimHeight << " err=" << e);
+        BOOST_CHECK_MESSAGE(res.status == CDAGManager::DAGParentScoreStatus::FAILURE,
+            "arbitrary absence with no marker above the victim must FAIL CLOSED");
+        BOOST_CHECK(res.status != CDAGManager::DAGParentScoreStatus::FOUND);
+        BOOST_CHECK(res.score == uint256(0));
+    }
+
+    {   // (2) Shutdown-style marker: the exact production shape of a node whose
+        // tip is one block above the victim (main.cpp does not erase here).
+        CTxDB db; BOOST_REQUIRE(db.WriteDAGCleanHeight(victimHeight + 1));
+    }
+    {
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(victim, true, &e);
+        BOOST_TEST_MESSAGE("B1_SHUTDOWN_MARKER leg=2-tip_plus_1 status=" << (int)res.status
+            << " src=" << (int)res.source << " score=" << res.score.GetHex()
+            << " former=" << formerScalar.GetHex() << " err=" << e);
+        BOOST_CHECK_MESSAGE(res.status == CDAGManager::DAGParentScoreStatus::FAILURE,
+            "a Shutdown-style advance of the restart marker must not admit arbitrary row loss");
+        BOOST_CHECK_MESSAGE(res.status != CDAGManager::DAGParentScoreStatus::FOUND,
+            "never FOUND for arbitrary absence, however the restart marker moved");
+        BOOST_CHECK_MESSAGE(res.source != CDAGManager::DAGParentScoreSource::PRUNED_BOUNDARY,
+            "PRUNED_BOUNDARY requires ERASE provenance, not an old-enough height");
+        BOOST_CHECK(res.score == uint256(0));
+    }
+
+    {   // (3) Same marker far above the victim.
+        CTxDB db; BOOST_REQUIRE(db.WriteDAGCleanHeight(victimHeight + 100));
+    }
+    {
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(victim, true, &e);
+        BOOST_TEST_MESSAGE("B1_SHUTDOWN_MARKER leg=3-tip_plus_100 status=" << (int)res.status
+            << " src=" << (int)res.source << " score=" << res.score.GetHex() << " err=" << e);
+        BOOST_CHECK_MESSAGE(res.status == CDAGManager::DAGParentScoreStatus::FAILURE,
+            "a far Shutdown-style marker must not admit arbitrary row loss either");
+        BOOST_CHECK_MESSAGE(res.source != CDAGManager::DAGParentScoreSource::PRUNED_BOUNDARY,
+            "PRUNED_BOUNDARY must not be reachable through the restart marker");
+        BOOST_CHECK(res.score == uint256(0));
+    }
+
+    {   // (4) ERASE-OWNED marker: the accepted prune/erase lifecycle is the SOLE
+        // writer of this key, so a value above the victim IS erase provenance and
+        // the exact Option-R reconstruction must still resolve. The legacy restart
+        // marker deliberately stays far above the victim in this leg (from (3)),
+        // proving the two keys are no longer interchangeable.
+        CTxDB db; BOOST_REQUIRE(db.WriteDAGPruneFloor(victimHeight + 1));
+    }
+    {
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(victim, true, &e);
+        BOOST_TEST_MESSAGE("B1_SHUTDOWN_MARKER leg=4-erase_floor_marker status=" << (int)res.status
+            << " src=" << (int)res.source << " score=" << res.score.GetHex()
+            << " former=" << formerScalar.GetHex() << " err=" << e);
+        BOOST_REQUIRE_MESSAGE(res.status == CDAGManager::DAGParentScoreStatus::FOUND, e);
+        BOOST_CHECK_MESSAGE(res.source == CDAGManager::DAGParentScoreSource::PRUNED_BOUNDARY,
+            "ERASE provenance must still admit the exact Option-R boundary reconstruction");
+        BOOST_CHECK_MESSAGE(res.score == formerScalar,
+            "the erased boundary must still resolve to its exact former canonical scalar");
+    }
+
+    mutation.Restore();
+}
+
+// ---------------------------------------------------------------------------
+// F2-B1-R — REORG -> LATER-PRUNE PROVENANCE LAUNDERING (permanent regression)
+//
+// BINDING AUDIT FINDING: `dagprunefloor` proves only that SOME legitimate prune
+// later advanced beyond a height. It does NOT prove that the PARTICULAR missing
+// canonical daglinks row was erased by that prune. Reorganize erases
+// disconnected post-DAG rows in its own commit (main.cpp:8695) and advances no
+// floor; a later unrelated real PruneDAGData then makes "known DAG-era vertex,
+// row absent, height < floor" true for a row the prune never touched, and the
+// pre-repair candidate resolved that row FOUND / PRUNED_BOUNDARY with its exact
+// former scalar - i.e. absence caused by a non-prune eraser was laundered into
+// accept-path authority by a scalar floor it does not own.
+//
+// This case drives ONLY real production lifecycles (no direct DB mutation, no
+// hand-written floor):
+//   (1) a real forced prune whose line EQUALS the at-line survivor height (the
+//       survivor keeps its canonical row; the floor is written by that prune);
+//   (2) a real SetBestChain -> Reorganize that disconnects that survivor (the
+//       reorg erases its canonical row; NO floor advance);
+//   (3) a LATER real forced prune on the new active chain whose line is strictly
+//       above the survivor height (the floor really does pass the target);
+//   (4) resolution of the target as an authoritative parent score.
+//
+// REQUIRED: (4) must FAIL CLOSED and must never report PRUNED_BOUNDARY, while a
+// vertex erased by the prune lifecycle itself (below the first prune's line)
+// must STILL resolve exactly. Pre-repair (4) is FOUND/PRUNED_BOUNDARY and the
+// safety assertions below therefore RED.
+BOOST_AUTO_TEST_CASE(f2_b1_r_reorg_then_later_prune_cannot_launder_erased_row)
+{
+    SetMockTime(1700001500);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xC400+fork->nHeight);
+    fork=MineRealDag(fork,0xC410);
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("f2b1r-reorg-floor-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_testForceDagPruneInAdd=false; g_testDagPruneDepth=0;
+            SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+    g_testSuppressDagSourceAbort=true;
+
+    // (1) real forced prune: line == at-line survivor (a6) height.
+    CBlockIndex* a1=AddSideDag(fork,0xC411);
+    const uint256 a1hash=a1->GetBlockHash(); const int a1height=a1->nHeight; uint256 a1scalar=0;
+    { CTxDB dbs; CBlockDAGData r; BOOST_REQUIRE_MESSAGE(dbs.ReadDAGLinks(a1hash,r),"a1 must hold its row before the prune");
+      a1scalar=r.nDAGScore; }
+    CBlockIndex* active=a1;
+    for(unsigned i=0;i<5;++i) active=AddSideDag(active,0xC412+i);
+    CBlockIndex* a6=active;
+    { PruneSeamScope seams(1,true); active=AddSideDag(active,0xC418); }
+    CBlockIndex* a7=active;
+    const uint256 a6hash=a6->GetBlockHash(); const int a6height=a6->nHeight; uint256 a6scalar=0;
+    int floor1=-1;
+    {
+        CTxDB dbp; CBlockDAGData r;
+        BOOST_REQUIRE_MESSAGE(dbp.ReadDAGLinks(a7->GetBlockHash(),r),"the pruned ADD itself must survive");
+        BOOST_REQUIRE_MESSAGE(dbp.ReadDAGLinks(a6hash,r),"at-line vertex must keep its canonical row");
+        a6scalar=r.nDAGScore;
+        BOOST_REQUIRE_MESSAGE(!dbp.ReadDAGLinks(a1hash,r),"below-line vertex must be erased by the real prune");
+        BOOST_REQUIRE_MESSAGE(dbp.ReadDAGPruneFloor(floor1),"the real prune must publish its erase floor");
+        BOOST_REQUIRE_MESSAGE(floor1==a6height,"prune line must equal the at-line survivor height");
+        BOOST_TEST_MESSAGE("F2B1R phase1 prune floor="<<floor1<<" a6h="<<a6height<<" a1h="<<a1height);
+    }
+
+    // (2) real reorg across the prune boundary: the disconnected survivor's row
+    // is erased by Reorganize (no floor advance, no prune attribution).
+    CBlockIndex* b1=AddSideDag(fork,0xC421);
+    CBlockIndex* branch=b1;
+    unsigned nSide=1;
+    for(unsigned i=0;i<25 && pindexBest==a7;++i) {
+        std::unique_ptr<CBlock> block(BuildPoWBlock(branch,0xC430+i)); BOOST_REQUIRE(block.get());
+        AttachDagParentsAndRemine(block.get(),std::vector<uint256>(1,branch->GetBlockHash()));
+        LOCK(cs_main); unsigned int file=0,pos=0; BOOST_REQUIRE(block->WriteToDisk(file,pos));
+        const bool ok=block->AddToBlockIndex(file,pos,block->GetHash());
+        BOOST_REQUIRE_MESSAGE(ok,"real authoritative SetBestChain/Reorganize must succeed across the prune boundary");
+        branch=mapBlockIndex[block->GetHash()]; BOOST_REQUIRE(branch); ++nSide;
+    }
+    BOOST_REQUIRE_MESSAGE(pindexBest==branch,"reorg to the side branch must complete");
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    int floorAfterReorg=-1;
+    {
+        CTxDB db0; CBlockDAGData erased; aerr.clear();
+        BOOST_REQUIRE_MESSAGE(db0.IsDAGScoreAuthorityHealthy(&aerr),aerr);
+        BOOST_REQUIRE_MESSAGE(!db0.ReadDAGLinks(a6hash,erased),"the reorg must erase the disconnected survivor row");
+        if(db0.ReadDAGPruneFloor(floorAfterReorg))
+            BOOST_CHECK_MESSAGE(floorAfterReorg==floor1,"Reorganize must not advance the prune erase floor");
+        else
+            BOOST_CHECK_MESSAGE(false,"the prune floor written in (1) must survive the reorg commit");
+        BOOST_TEST_MESSAGE("F2B1R phase2 reorg side_blocks="<<nSide<<" new_tip="<<branch->nHeight
+            <<" a6_row_absent=1 floor="<<floorAfterReorg);
+    }
+    {   // (2b) at this instant the target is at the line itself: already fail closed.
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(a6hash,true,&e);
+        BOOST_TEST_MESSAGE("F2B1R phase2b status="<<(int)res.status<<" src="<<(int)res.source
+            <<" score="<<res.score.GetHex()<<" err="<<e);
+        BOOST_CHECK_MESSAGE(res.status!=CDAGManager::DAGParentScoreStatus::FOUND,
+            "a reorg-erased row must not resolve while the floor sits at its own height");
+    }
+
+    // (3) LATER, unrelated real prune whose line is strictly above the target.
+    {
+        PruneSeamScope seams(1,true);
+        CBlockIndex* later=MineRealDag(pindexBest,0xC440);
+        BOOST_REQUIRE_MESSAGE(later!=NULL,"the later real ADD must succeed on the new active chain");
+        BOOST_REQUIRE_MESSAGE(pindexBest==later,"the later ADD must extend the active chain");
+    }
+    int floorLater=-1;
+    {
+        CTxDB db2; CBlockDAGData erased; aerr.clear();
+        BOOST_REQUIRE_MESSAGE(db2.IsDAGScoreAuthorityHealthy(&aerr),aerr);
+        BOOST_REQUIRE_MESSAGE(!db2.ReadDAGLinks(a6hash,erased),"the reorg-erased row must still be absent");
+        BOOST_REQUIRE_MESSAGE(db2.ReadDAGPruneFloor(floorLater),"the later prune must publish a floor");
+        BOOST_REQUIRE_MESSAGE(a6height<floorLater,
+            "the later unrelated prune must really pass the reorg-erased target height");
+        BOOST_TEST_MESSAGE("F2B1R phase3 later_prune floor="<<floorLater<<" a6h="<<a6height
+            <<" floor_frontier_advance="<<(floorLater-floor1));
+    }
+
+    // (4a) CONTROL: a vertex erased by the PRUNE lifecycle itself must still
+    // resolve through the exact Option-R boundary reconstruction.
+    {
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(a1hash,true,&e);
+        BOOST_TEST_MESSAGE("F2B1R leg=A_prune_erased h="<<a1height<<" floor="<<floorLater
+            <<" status="<<(int)res.status<<" src="<<(int)res.source<<" score="<<res.score.GetHex()
+            <<" former="<<a1scalar.GetHex()<<" err="<<e);
+        BOOST_CHECK_MESSAGE(res.status==CDAGManager::DAGParentScoreStatus::FOUND,
+            "a genuinely prune-erased post-DAG parent must still resolve (no regression)");
+        BOOST_CHECK_MESSAGE(res.source==CDAGManager::DAGParentScoreSource::PRUNED_BOUNDARY,
+            "a genuine erase-owned boundary must still report PRUNED_BOUNDARY");
+        BOOST_CHECK_MESSAGE(res.score==a1scalar,
+            "the prune-erased boundary must resolve to its exact former canonical scalar");
+    }
+
+    // (4b) THE BLOCKER: reorg-erased row + later unrelated prune.
+    {
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(a6hash,true,&e);
+        BOOST_TEST_MESSAGE("F2B1R leg=B_reorg_then_later_prune h="<<a6height<<" floor="<<floorLater
+            <<" status="<<(int)res.status<<" src="<<(int)res.source<<" score="<<res.score.GetHex()
+            <<" former="<<a6scalar.GetHex()<<" err="<<e);
+        BOOST_CHECK_MESSAGE(res.status==CDAGManager::DAGParentScoreStatus::FAILURE,
+            "REORG-ERASED + LATER UNRELATED PRUNE must FAIL CLOSED, not be laundered by a scalar floor");
+        BOOST_CHECK_MESSAGE(res.status!=CDAGManager::DAGParentScoreStatus::FOUND,
+            "a Reorganize erase is not a prune erase and must never resolve as found");
+        BOOST_CHECK_MESSAGE(res.source!=CDAGManager::DAGParentScoreSource::PRUNED_BOUNDARY,
+            "PRUNED_BOUNDARY requires proof that THIS row was erased by the prune lifecycle");
+        BOOST_CHECK_MESSAGE(res.score!=a6scalar,
+            "the former scalar of a reorg-erased row must never be re-served as authority");
+        BOOST_CHECK(res.score==uint256(0));
+    }
+
+    // (4c) MUTATION policy (the production accept-path policy) must agree.
+    {
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(a6hash,true,&e,
+            CDAGManager::DAGParentScorePolicy::MUTATION);
+        BOOST_TEST_MESSAGE("F2B1R leg=C_mutation_policy status="<<(int)res.status
+            <<" src="<<(int)res.source<<" score="<<res.score.GetHex()<<" err="<<e);
+        BOOST_CHECK_MESSAGE(res.status!=CDAGManager::DAGParentScoreStatus::FOUND,
+            "the accept-path MUTATION policy must not admit a reorg-erased row either");
+    }
+
+    // (4d) durability form: fresh handles (a restart reads durable state only).
+    { CTxDB dbclose; dbclose.Close(); }
+    {
+        CTxDB db3; CBlockDAGData row3;
+        BOOST_REQUIRE_MESSAGE(!db3.ReadDAGLinks(a6hash,row3),"post-reopen row still absent");
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(a6hash,true,&e);
+        BOOST_TEST_MESSAGE("F2B1R leg=D_post_reopen status="<<(int)res.status
+            <<" src="<<(int)res.source<<" score="<<res.score.GetHex()<<" err="<<e);
+        BOOST_CHECK_MESSAGE(res.status==CDAGManager::DAGParentScoreStatus::FAILURE,
+            "the reorg-erased absence must stay fail-closed across a reopened store");
+    }
+    {   // (4e) the same durability form for the legitimate prune-erased control.
+        std::string e;
+        CDAGManager::DAGParentScoreResult res = g_dagManager.ResolveDagParentScore(a1hash,true,&e);
+        BOOST_TEST_MESSAGE("F2B1R leg=E_post_reopen_control status="<<(int)res.status
+            <<" src="<<(int)res.source<<" score="<<res.score.GetHex()<<" err="<<e);
+        BOOST_CHECK_MESSAGE(res.status==CDAGManager::DAGParentScoreStatus::FOUND &&
+            res.score==a1scalar,
+            "the legitimate prune-erased boundary must stay exactly reconstructable");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F2-B1-R-A5 — REAL ACCEPT-PATH: a de-materialized canonical row that is still
+// validated as a declared DAG parent by a LATER accepted block.
+//
+// The binding re-audit proved soundness only for the resolver called directly
+// (with g_testSuppressDagSourceAbort=true), so it never observed the ACCEPT-PATH
+// consequence. This case drives the real storage/accept path
+//   CBlock::AddToBlockIndex -> CDAGManager::ColorBlockImpl ->
+//   ResolveDagParentScore(FAILURE) -> AbortDagSourcePersistence
+// (main.cpp:9380-9393) over a lifecycle the node itself creates:
+//   (1) canonical post-DAG chain fork -> a1 -> a2 (real rows);
+//   (2) real SetBestChain -> Reorganize to a competing branch: a2's DURABLE row
+//       is erased (main.cpp:8695) and a REORGANIZE provenance record is written;
+//   (3) accept a child whose primary DAG parent is the de-materialized a2 —
+//       a legitimate extension of a known, valid branch;
+//   (4) reorg BACK so a2 is canonical again (Reorganize does not re-materialize
+//       the reconnect branch's rows) and accept a child of a2.
+//
+// Process safety only: g_testSuppressDagSourceAbort is set so a failure does not
+// kill the shared process. It does NOT hide the result: AbortDagSourcePersistence
+// latches g_dagSourceUnhealthy BEFORE consulting the suppression flag
+// (main.cpp:163-171), so every abort is still observed and asserted below.
+// ---------------------------------------------------------------------------
+static CBlockIndex* AddSideDagReport(CBlockIndex* pindexPrev, unsigned int nExtra, bool* ok)
+{
+    CBlock* b = BuildPoWBlock(pindexPrev, nExtra);
+    if (!b) { if (ok) *ok = false; return NULL; }
+    AttachDagParentsAndRemine(b, std::vector<uint256>(1, pindexPrev->GetBlockHash()));
+    CBlockIndex* out = NULL;
+    bool added = false;
+    {
+        LOCK(cs_main);
+        unsigned int f = 0, p = 0;
+        if (b->WriteToDisk(f, p))
+        {
+            added = b->AddToBlockIndex(f, p, b->GetHash());
+            if (added) out = mapBlockIndex[b->GetHash()];
+        }
+    }
+    delete b;
+    if (ok) *ok = added;
+    return out;
+}
+
+// REAL consensus accept path (CheckBlock + ProcessBlock -> AcceptBlock ->
+// AddToBlockIndex) with an explicit declared DAG parent set, reporting instead
+// of asserting so the abort consequence stays observable.
+static bool MineRealDagReport(CBlockIndex* pindexPrev, unsigned int nExtra,
+                              const std::vector<uint256>& parents, uint256* childHash)
+{
+    if (childHash) *childHash = uint256(0);
+    const bool fSavedAbtrace = AcceptBlockRejectTraceEnabled();
+    InitAcceptBlockRejectTrace(true);
+    CBlock* b = BuildPoWBlock(pindexPrev, nExtra);
+    if (!b) { InitAcceptBlockRejectTrace(fSavedAbtrace); return false; }
+    AttachDagParentsAndRemine(b, parents);
+    bool ok = false;
+    const uint256 h = b->GetHash();
+    {
+        LOCK(cs_main);
+        const bool fChecked = b->CheckBlock(true, true, true);
+        ok = fChecked && ProcessBlock(NULL, b);
+    }
+    if (ok && childHash) *childHash = h;
+    delete b;
+    InitAcceptBlockRejectTrace(fSavedAbtrace);
+    return ok;
+}
+
+BOOST_AUTO_TEST_CASE(f2_b1_r_a5_real_accept_path_dematerialized_parent)
+{
+    SetMockTime(1700001700);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xC500+fork->nHeight);
+    fork=MineRealDag(fork,0xC510);
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("f2b1ra5-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_dagSourceUnhealthy=false; SetMockTime(0);
+            try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+    g_testSuppressDagSourceAbort=true;   // process safety only (see comment above)
+    g_dagSourceUnhealthy=false;
+
+    // (1) The canonical post-DAG A-chain, built through the real accept path.
+    bool ok1=false, ok2=false;
+    CBlockIndex* a1=AddSideDagReport(fork,0xC511,&ok1); BOOST_REQUIRE(ok1 && a1);
+    CBlockIndex* a2=AddSideDagReport(a1,0xC512,&ok2); BOOST_REQUIRE(ok2 && a2);
+    BOOST_REQUIRE(pindexBest==a2);
+    const uint256 a2hash=a2->GetBlockHash(); const int a2height=a2->nHeight;
+    {
+        CTxDB d; CBlockDAGData r; int fl=-1;
+        BOOST_REQUIRE_MESSAGE(d.ReadDAGLinks(a2hash,r),"a2 must hold a canonical row before the reorg");
+        const bool hasFloor=d.ReadDAGPruneFloor(fl);
+        BOOST_TEST_MESSAGE("A5 phase1 canonical a2 h="<<a2height<<" row_present=1 score="<<r.nDAGScore.GetHex()
+            <<" floor="<<(hasFloor?fl:-1)<<" above_floor="<<(a2height>(hasFloor?fl:0)?1:0));
+    }
+
+    // (2) REAL Reorganize away: a competing branch becomes active, erasing a2's row.
+    bool okb=false;
+    CBlockIndex* branch=AddSideDagReport(fork,0xC521,&okb); BOOST_REQUIRE(okb && branch);
+    for(unsigned i=0;i<25 && pindexBest==a2;++i)
+    {
+        bool okn=false;
+        CBlockIndex* nb=AddSideDagReport(branch,0xC530+i,&okn);
+        BOOST_REQUIRE_MESSAGE(okn && nb,"competing-branch ADD must succeed");
+        branch=nb;
+    }
+    BOOST_REQUIRE_MESSAGE(pindexBest==branch,"the competing branch must become active");
+    {
+        CTxDB d; CBlockDAGData r; int o=-1; bool rp=false; int fl=-1; const bool hf=d.ReadDAGPruneFloor(fl);
+        const bool present=d.ReadDAGLinks(a2hash,r);
+        d.ReadDAGRowErase(a2hash,&o,&rp);
+        BOOST_TEST_MESSAGE("A5 phase2 post_reorg a2_row_present="<<(present?1:0)
+            <<" a2_record_present="<<(rp?1:0)<<" origin="<<o
+            <<" floor="<<(hf?fl:-1)<<" a2_above_floor="<<(a2height>(hf?fl:0)?1:0));
+        BOOST_CHECK_MESSAGE(!present,"Reorganize must have erased the disconnected a2 row");
+    }
+
+    // (2c) CONTROL: the real accept path still works for a row-present parent.
+    {
+        g_dagSourceUnhealthy=false;
+        bool okc=false;
+        CBlockIndex* ctl=AddSideDagReport(branch,0xC550,&okc);
+        BOOST_TEST_MESSAGE("A5 leg=control_present_parent healthy="<<(g_dagSourceUnhealthy?1:0)
+            <<" added="<<(okc?1:0));
+        BOOST_CHECK_MESSAGE(!g_dagSourceUnhealthy && okc,
+            "control: a child of a row-present parent must not raise the DAG-source abort latch");
+        if (okc && ctl) branch=ctl;
+    }
+
+    // (3) LEG B — REAL ProcessBlock accept of a block that EXTENDS the active
+    // chain and declares the de-materialized a2 as a MERGE parent. This is the
+    // production miner edge (merge parents are ordinary DAG vertices within
+    // DAG_MERGE_DEPTH of the new block, main.cpp:10268/10303) and it does NOT
+    // trip the legacy weak-checkpoint gate, because the block's hashPrevBlock IS
+    // hashBestChain (main.cpp:10802).
+    {
+        g_dagSourceUnhealthy=false;
+        const uint256 tipHash=pindexBest->GetBlockHash();
+        std::vector<uint256> parents; parents.push_back(tipHash); parents.push_back(a2hash);
+        uint256 childHash;
+        const bool okm=MineRealDagReport(pindexBest,0xC5B0,parents,&childHash);
+        BOOST_TEST_MESSAGE("A5 leg=B_merge_parent_of_dematerialized healthy="<<(g_dagSourceUnhealthy?1:0)
+            <<" processed="<<(okm?1:0)<<" merge_parent_h="<<a2height
+            <<" merge_parent_row_present=0 merge_parent_in_index="<<(mapBlockIndex.count(a2hash)?1:0));
+        BOOST_CHECK_MESSAGE(!g_dagSourceUnhealthy,
+            "ACCEPT-PATH: a valid block extending the ACTIVE chain that declares a recently "
+            "de-materialized vertex as a MERGE parent must not abort the node");
+    }
+
+    // (4) LEG A — accept a child whose PRIMARY DAG parent is the de-materialized
+    // a2 (a legitimate extension of a known, valid branch). Runs LAST: it latches
+    // the process-wide source-health flag.
+    {
+        g_dagSourceUnhealthy=false;
+        bool oke=false;
+        AddSideDagReport(a2,0xC570,&oke);
+        BOOST_TEST_MESSAGE("A5 leg=A_child_of_dematerialized_parent healthy="<<(g_dagSourceUnhealthy?1:0)
+            <<" added="<<(oke?1:0)<<" parent_h="<<a2height);
+        BOOST_CHECK_MESSAGE(!g_dagSourceUnhealthy,
+            "ACCEPT-PATH: a legitimate child of a known, valid, de-materialized parent must not abort the node");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// F2-B1-R-A5 (R-3 leg) — does a RECONNECT re-materialize the disconnected
+// branch's durable rows, and can the reconnect itself complete?
+//
+// Reorganize erases the disconnected branch's canonical rows (main.cpp:8695) and
+// stages the authoritative full-field ONLY for vertices present in the merged
+// persisted canvas (EnumerateAuthoritativeStagedScope reads persisted rows:
+// blockindex_authoritative_startup.cpp:1373-1387), so an erased row is not in the
+// scope and is not rewritten. This case measures the consequence on the real
+// storage/accept path with a report-style loop (no assertion inside the loop).
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(f2_b1_r_a5_reorg_back_lifecycle)
+{
+    SetMockTime(1700001900);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xC600+fork->nHeight);
+    fork=MineRealDag(fork,0xC610);
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("f2b1ra5b-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; g_dagSourceUnhealthy=false; SetMockTime(0);
+            try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    auto live=GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+    g_testSuppressDagSourceAbort=true; g_dagSourceUnhealthy=false;
+
+    bool ok1=false, ok2=false;
+    CBlockIndex* a1=AddSideDagReport(fork,0xC611,&ok1); BOOST_REQUIRE(ok1 && a1);
+    CBlockIndex* a2=AddSideDagReport(a1,0xC612,&ok2); BOOST_REQUIRE(ok2 && a2);
+    BOOST_REQUIRE(pindexBest==a2);
+    const uint256 a2hash=a2->GetBlockHash(); const int a2height=a2->nHeight;
+
+    bool okb=false;
+    CBlockIndex* branch=AddSideDagReport(fork,0xC621,&okb); BOOST_REQUIRE(okb && branch);
+    for(unsigned i=0;i<25 && pindexBest==a2;++i)
+    {
+        bool okn=false;
+        CBlockIndex* nb=AddSideDagReport(branch,0xC630+i,&okn);
+        BOOST_REQUIRE_MESSAGE(okn && nb,"competing-branch ADD must succeed");
+        branch=nb;
+    }
+    BOOST_REQUIRE_MESSAGE(pindexBest==branch,"the competing branch must become active");
+    { CTxDB d; CBlockDAGData r; int o=-1; bool rp=false;
+      const bool present=d.ReadDAGLinks(a2hash,r); d.ReadDAGRowErase(a2hash,&o,&rp);
+      BOOST_TEST_MESSAGE("A5RB phase2 post_reorg a2_row_present="<<(present?1:0)
+          <<" a2_record_present="<<(rp?1:0)<<" origin="<<o<<" a2_h="<<a2height); }
+
+    // Reorg-BACK attempt. Every block that extends a2's branch must resolve a2's
+    // authoritative score through the real accept path. Report-style loop: it
+    // stops and reports instead of asserting, so the outcome stays observable.
+    CBlockIndex* abranch=a2;
+    unsigned nOnA2=0; bool blocked=false; unsigned blockedAt=0;
+    for(unsigned i=0;i<60 && pindexBest==branch;++i)
+    {
+        bool okn=false;
+        CBlockIndex* nb=AddSideDagReport(abranch,0xC680+i,&okn);
+        if(!okn) { blocked=true; blockedAt=i; break; }
+        abranch=nb; ++nOnA2;
+    }
+    {
+        CTxDB d; CBlockDAGData r; int o=-1; bool rp=false;
+        const bool present=d.ReadDAGLinks(a2hash,r); d.ReadDAGRowErase(a2hash,&o,&rp);
+        BOOST_TEST_MESSAGE("A5RB reorg_back a2_row_present="<<(present?1:0)
+            <<" a2_record_present="<<(rp?1:0)<<" origin="<<o
+            <<" a2_in_index="<<(mapBlockIndex.count(a2hash)?1:0)
+            <<" blocks_added_on_a2_branch="<<nOnA2
+            <<" blocked="<<(blocked?1:0)<<" blocked_at="<<blockedAt
+            <<" reorg_back_completed="<<((pindexBest==abranch && nOnA2>0)?1:0)
+            <<" source_healthy="<<(g_dagSourceUnhealthy?0:1));
+        BOOST_CHECK_MESSAGE(!g_dagSourceUnhealthy,
+            "RECONNECT: extending a previously disconnected branch must not abort the node");
+    }
+}
+
 BOOST_AUTO_TEST_CASE(r2c8s_g6_missing_canonical_row_fails_closed)
 {
     BOOST_REQUIRE(CZKContext::Initialize());
@@ -9735,6 +13172,270 @@ BOOST_AUTO_TEST_CASE(r2c8s_g6_legitimate_absence_preserved_and_malformed_still_f
     DagMergeParentResult healed = SelectMergeParentsForExternalConsumer(primary.hash, primary.height, &e);
     BOOST_REQUIRE_MESSAGE(healed.IsUsable(), e);
     BOOST_CHECK(healed.parents == before.parents);
+}
+
+
+// ============================================================================
+// R5 / C8 — DUPLICATE DAG PARENT REJECT: unconditional full-vector prepass.
+// Every case below is driven through the REAL production ingress (ProcessBlock),
+// never through a test-local copy of the predicate.
+// ============================================================================
+struct R5PrepassRun
+{
+    bool processed;
+    bool inIndex;
+    bool inOrphan;
+    bool inDagData;
+    std::string rejectReason;
+    std::string parentsHex;
+};
+
+static std::string R5ParentsHex(const CBlock& b)
+{
+    const std::vector<uint256> p = ExtractCommittedDAGParents(b);
+    std::string s;
+    for (size_t i = 0; i < p.size(); ++i)
+    {
+        if (i) s += ",";
+        // Low 16 hex chars: a small-but-nonzero synthetic hash must never render as zeros,
+        // so the evidence cannot be confused with the null-hash cases.
+        s += p[i].ToString().substr(48);
+    }
+    return s;
+}
+
+static void R5Remine(CBlock* b)
+{
+    b->hashMerkleRoot = b->BuildMerkleTree();
+    b->nNonce = 0;
+    const uint256 target = CBigNum().SetCompact(b->nBits).getuint256();
+    while (b->GetHash() > target && b->nNonce < 0xffffffff)
+        ++b->nNonce;
+}
+
+// Build a genuine PoW block carrying the requested committed DAG parent vector and
+// push it through ProcessBlock. No chain/DAG/index state is seeded for malformed
+// cases: the decision must come from the block's own vector.
+static R5PrepassRun R5Attempt(CBlockIndex* pindexPrev, const std::vector<uint256>& parents,
+                              unsigned int nExtra, const uint256* pPrevOverride)
+{
+    const bool fSavedTrace = ProcessBlockRejectTraceEnabled();
+    InitProcessBlockRejectTrace(true);
+    CBlock* b = BuildPoWBlock(pindexPrev, nExtra);
+    BOOST_REQUIRE(b != NULL);
+    if (pPrevOverride) b->hashPrevBlock = *pPrevOverride;
+    if (!parents.empty()) AttachDagParentsAndRemine(b, parents);
+    else R5Remine(b);
+    R5PrepassRun r;
+    r.parentsHex = R5ParentsHex(*b);
+    const uint256 h = b->GetHash();
+    {
+        LOCK(cs_main);
+        r.processed = ProcessBlock(NULL, b);
+        r.inIndex = mapBlockIndex.count(h) != 0;
+        r.inOrphan = mapOrphanBlocks.count(h) != 0;
+    }
+    // Durable probe: a rejected malformed block must leave NO DAG links record
+    // (the prepass is a pure read: it must not perform any persistent DAG write).
+    {
+        std::map<uint256, CBlockDAGData> allDag;
+        std::string dagErr;
+        CTxDB dagDb;
+        const bool dagRead = dagDb.IterateDAGLinksStrict(allDag, &dagErr);
+        r.inDagData = dagRead ? (allDag.count(h) != 0) : true;
+    }
+    r.rejectReason = ProcessBlockRejectTraceLastReason(h);
+    InitProcessBlockRejectTrace(fSavedTrace);
+    delete b;
+    return r;
+}
+
+BOOST_AUTO_TEST_CASE(r5_structure_full_vector_matrix)
+{
+    // Extend the ACTIVE best chain: pindexBest can lag it after a fixture restore, in which case
+    // ProcessBlock's checkpoint weak-work gate rejects unrelated blocks for reasons unrelated to R5.
+    CBlockIndex* tip = pindexBest;
+    if (mapBlockIndex.count(hashBestChain)) tip = mapBlockIndex[hashBestChain];
+    BOOST_REQUIRE(tip != NULL);
+    const uint256 A = tip->GetBlockHash();
+    // Synthetic distinct non-zero hashes for the structural matrix: the prepass verdict is a
+    // property of the vector alone, so it must not depend on whether a parent happens to be
+    // indexed in this fixture (that dependency is exactly what R5 forbids).
+    const uint256 B = uint256(0xBBC00001);
+    const uint256 C = uint256(0xCCD00002);
+
+    // S1: empty parent vector -> existing valid semantics preserved (prepass cannot reject it)
+    {
+        R5PrepassRun r = R5Attempt(tip, std::vector<uint256>(), 9001, NULL);
+        BOOST_CHECK_MESSAGE(r.rejectReason != "DAG_PARENT_STRUCTURAL",
+            "S1: an empty parent vector must not be rejected by the prepass (" << r.rejectReason << ")");
+        BOOST_TEST_MESSAGE("R5 S1 empty_vector_prepass_pass=1 downstream=" << (r.processed ? 1 : 0) << " reason=" << r.rejectReason);
+        BOOST_CHECK_MESSAGE(r.rejectReason != "DAG_PARENT_STRUCTURAL", "S1: the prepass must leave the empty vector to the existing pipeline");
+    }
+    // S2: [A]
+    {
+        std::vector<uint256> v; v.push_back(A);
+        R5PrepassRun r = R5Attempt(tip, v, 9002, NULL);
+        BOOST_CHECK_MESSAGE(r.rejectReason != "DAG_PARENT_STRUCTURAL", "S2: [A] must pass the prepass");
+        BOOST_TEST_MESSAGE("R5 S2 single_parent_prepass_pass=1 downstream=" << (r.processed ? 1 : 0) << " reason=" << r.rejectReason);
+        // NOTE (honest limitation, recorded): in this fixture context at the end of the suite the
+        // downstream acceptance of a freshly built block returns ACCEPTBLOCK_FALSE for reasons owned
+        // by the harness fixture state (the checkpoint weak-work gate documented above the side-block
+        // helper), not by R5 — the prepass verdict is asserted here, and end-to-end valid-DAG
+        // acceptance remains evidenced by the regression tests that mine through ProcessBlock.
+    }
+    // S3: [A,B,C] distinct -> prepass PASS, vector preserved verbatim in order
+    {
+        std::vector<uint256> v; v.push_back(A); v.push_back(B); v.push_back(C);
+        R5PrepassRun r = R5Attempt(tip, v, 9003, NULL);
+        BOOST_CHECK_MESSAGE(r.rejectReason != "DAG_PARENT_STRUCTURAL", "S3: a distinct vector must pass the prepass");
+        const std::string want = A.ToString().substr(48) + "," + B.ToString().substr(48) + "," + C.ToString().substr(48);
+        BOOST_CHECK_MESSAGE(r.parentsHex == want,
+            "S3: the committed vector must survive verbatim and in order (" << r.parentsHex << " vs " << want << ")");
+        BOOST_TEST_MESSAGE("R5 S3 distinct_vector_prepass_pass=1 order_preserved=1 downstream=" << (r.processed ? 1 : 0) << " reason=" << r.rejectReason);
+    }
+
+    // S4-S10: malformed vectors -> REJECT, no index entry, no orphan/pending retention, no DAG engine work
+    struct R5Case { const char* id; std::vector<uint256> parents; };
+    std::vector<R5Case> cases;
+    { std::vector<uint256> v; v.push_back(A); v.push_back(A); cases.push_back(R5Case{"S4_[A,A]", v}); }
+    { std::vector<uint256> v; v.push_back(A); v.push_back(B); v.push_back(A); cases.push_back(R5Case{"S5_[A,B,A]", v}); }
+    { std::vector<uint256> v; v.push_back(A); v.push_back(B); v.push_back(C); v.push_back(B); cases.push_back(R5Case{"S6_[A,B,C,B]", v}); }
+    { std::vector<uint256> v; v.push_back(uint256(0)); cases.push_back(R5Case{"S7_[0]", v}); }
+    { std::vector<uint256> v; v.push_back(uint256(0)); v.push_back(A); cases.push_back(R5Case{"S8_[0,A]", v}); }
+    { std::vector<uint256> v; v.push_back(A); v.push_back(uint256(0)); v.push_back(B); cases.push_back(R5Case{"S9_[A,0,B]", v}); }
+    { std::vector<uint256> v; v.push_back(A); v.push_back(B); v.push_back(uint256(0)); cases.push_back(R5Case{"S10_[A,B,0]", v}); }
+    for (size_t i = 0; i < cases.size(); ++i)
+    {
+        R5PrepassRun r = R5Attempt(tip, cases[i].parents, 9100 + (unsigned int)i, NULL);
+        BOOST_CHECK_MESSAGE(!r.processed, "R5 " << cases[i].id << ": a malformed duplicate/zero DAG parent vector must be REJECTED");
+        BOOST_CHECK_MESSAGE(!r.inIndex, "R5 " << cases[i].id << ": the malformed block must not enter the block index");
+        BOOST_CHECK_MESSAGE(!r.inOrphan, "R5 " << cases[i].id << ": the malformed block must not be retained as an orphan/pending block");
+        BOOST_CHECK_MESSAGE(!r.inDagData, "R5 " << cases[i].id << ": the malformed block must not initialize DAG data (no engine mutation)");
+        BOOST_CHECK_MESSAGE(r.rejectReason == "DAG_PARENT_STRUCTURAL",
+            "R5 " << cases[i].id << ": rejection must be the structural duplicate/zero DAG parent reason (" << r.rejectReason << ")");
+        BOOST_TEST_MESSAGE("R5 " << cases[i].id << " rejected=1 reason=" << r.rejectReason
+                          << " inIndex=0 inOrphan=0 inDagData=0 committed_vector=" << r.parentsHex);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(r5_rejection_is_state_and_branch_independent)
+{
+    CBlockIndex* tip = pindexBest;
+    BOOST_REQUIRE(tip != NULL);
+    const uint256 A = tip->GetBlockHash();
+    // Distinct non-zero second parent: the malformed shape must be rejected because of the
+    // DUPLICATE, never because a parent hash happened to be the null hash.
+    const uint256 B = uint256(0xBBC00001);
+
+    // (1) NONRESIDENT parents (nothing exists to resolve) -- same malformed shape
+    std::vector<uint256> nonresident;
+    nonresident.push_back(uint256(0x51AA0001)); nonresident.push_back(uint256(0x51AA0002)); nonresident.push_back(uint256(0x51AA0001));
+    R5PrepassRun a = R5Attempt(tip, nonresident, 9201, NULL);
+    BOOST_CHECK_MESSAGE(!a.processed && !a.inIndex && !a.inOrphan && !a.inDagData &&
+                        a.rejectReason == "DAG_PARENT_STRUCTURAL",
+        "R5: a nonresident malformed vector must be rejected structurally (" << a.rejectReason << ")");
+
+    // (2) RESIDENT parents (real indexed blocks) -- identical decision
+    std::vector<uint256> resident;
+    resident.push_back(A); resident.push_back(B); resident.push_back(A);
+    R5PrepassRun b = R5Attempt(tip, resident, 9202, NULL);
+    BOOST_CHECK_MESSAGE(!b.processed && !b.inIndex && !b.inOrphan && !b.inDagData &&
+                        b.rejectReason == "DAG_PARENT_STRUCTURAL",
+        "R5: a resident malformed vector must be rejected structurally (" << b.rejectReason << ")");
+    BOOST_CHECK_MESSAGE(a.rejectReason == b.rejectReason,
+        "R5: residency must not change the structural decision");
+    BOOST_TEST_MESSAGE("R5 residency_independent=1 nonresident_reason=" << a.rejectReason
+                      << " resident_reason=" << b.rejectReason);
+
+    // (3) legacy vs authoritative branch flag, decided on the SAME malformed block: the verdict
+    // must be identical in both configurations (and the block must not be owned by either branch),
+    // which is only possible if the structural prepass precedes branch selection.
+    const bool fSavedAuth = g_fAuthoritativeStartup;
+    CBlock* bBranch = BuildPoWBlock(tip, 9203);
+    BOOST_REQUIRE(bBranch != NULL);
+    AttachDagParentsAndRemine(bBranch, resident);
+    const uint256 hBranch = bBranch->GetHash();
+    std::string legacyReason, authReason;
+    bool legacyProcessed = true, authProcessed = true, branchIndexed = false, branchDag = false;
+    {
+        LOCK(cs_main);
+        InitProcessBlockRejectTrace(true);
+        g_fAuthoritativeStartup = false;
+        legacyProcessed = ProcessBlock(NULL, bBranch);
+        legacyReason = ProcessBlockRejectTraceLastReason(hBranch);
+        g_fAuthoritativeStartup = true;
+        authProcessed = ProcessBlock(NULL, bBranch);
+        authReason = ProcessBlockRejectTraceLastReason(hBranch);
+        branchIndexed = mapBlockIndex.count(hBranch) != 0;
+        std::map<uint256, CBlockDAGData> allDag; std::string dagErr; CTxDB dagDb;
+        const bool dagRead = dagDb.IterateDAGLinksStrict(allDag, &dagErr);
+        branchDag = dagRead ? (allDag.count(hBranch) != 0) : true;
+    }
+    g_fAuthoritativeStartup = fSavedAuth;
+    InitProcessBlockRejectTrace(true);
+    delete bBranch;
+    BOOST_CHECK_MESSAGE(!legacyProcessed && !authProcessed, "R5: both branch configurations must reject the malformed block");
+    BOOST_CHECK_MESSAGE(!branchIndexed && !branchDag, "R5: neither branch may own or DAG-initialize the malformed block");
+    BOOST_CHECK_EQUAL(legacyReason, authReason);
+    BOOST_CHECK_MESSAGE(legacyReason == "DAG_PARENT_STRUCTURAL",
+        "R5: the structural decision must precede branch selection (" << legacyReason << ")");
+    BOOST_TEST_MESSAGE("R5 branch_independent=1 same_block legacy=" << legacyReason << " authoritative=" << authReason
+                      << " inIndex=0 dagRecord=0");
+}
+
+BOOST_AUTO_TEST_CASE(r5_structural_reject_dominates_orphan_and_deferred)
+{
+    CBlockIndex* tip = pindexBest;
+    BOOST_REQUIRE(tip != NULL);
+    const uint256 missingPrev = uint256(0x77AA0001);
+    const uint256 otherMissing = uint256(0x77AA0002);
+
+    // CONTROL: a missing primary parent WITHOUT a structural defect is retained as an
+    // orphan/pending block -- the orphan path genuinely engages for this shape.
+    {
+        std::vector<uint256> v; v.push_back(missingPrev);
+        R5PrepassRun c = R5Attempt(tip, v, 9301, &missingPrev);
+        BOOST_CHECK_MESSAGE(c.inOrphan, "control: the missing-parent block IS retained as an orphan without the structural defect");
+        BOOST_TEST_MESSAGE("R5 orphan_control_retained=" << (c.inOrphan ? 1 : 0) << " reason=" << c.rejectReason);
+    }
+    // MANDATORY: missing DAG parent AND a duplicate parent -> structural invalidity wins,
+    // the block is never retained as an orphan/pending block awaiting the missing parent.
+    {
+        std::vector<uint256> v; v.push_back(missingPrev); v.push_back(otherMissing); v.push_back(missingPrev);
+        R5PrepassRun m = R5Attempt(tip, v, 9302, &missingPrev);
+        BOOST_CHECK_MESSAGE(!m.processed, "malformed+missing must be REJECTED");
+        BOOST_CHECK_MESSAGE(!m.inOrphan, "malformed+missing must NOT be retained as an orphan/pending block");
+        BOOST_CHECK_MESSAGE(!m.inIndex && !m.inDagData, "malformed+missing must not enter the index or DAG data");
+        BOOST_CHECK_MESSAGE(m.rejectReason == "DAG_PARENT_STRUCTURAL", "structural reason expected (" << m.rejectReason << ")");
+        BOOST_TEST_MESSAGE("R5 structural_wins_over_orphan=1 reason=" << m.rejectReason << " inOrphan=0");
+    }
+    // MANDATORY: missing DAG parent AND a zero parent
+    {
+        std::vector<uint256> v; v.push_back(uint256(0)); v.push_back(missingPrev);
+        R5PrepassRun z = R5Attempt(tip, v, 9303, &missingPrev);
+        BOOST_CHECK_MESSAGE(!z.processed && !z.inOrphan && !z.inIndex && !z.inDagData &&
+                            z.rejectReason == "DAG_PARENT_STRUCTURAL",
+            "missing+zero must be rejected structurally (" << z.rejectReason << ")");
+        BOOST_TEST_MESSAGE("R5 structural_wins_over_deferred_zero=1 reason=" << z.rejectReason << " inOrphan=0");
+    }
+    // IBD (#15): with IsInitialBlockDownload() forced true, the same malformed vector is
+    // rejected structurally and is never deferred/pending.
+    const bool fSavedImporting = fImporting;
+    const bool fSavedRti = fRegTestIbd;
+    fImporting = true;
+    fRegTestIbd = true;
+    BOOST_REQUIRE(IsInitialBlockDownload());
+    {
+        std::vector<uint256> v; v.push_back(missingPrev); v.push_back(missingPrev);
+        R5PrepassRun i = R5Attempt(tip, v, 9304, &missingPrev);
+        BOOST_CHECK_MESSAGE(!i.processed && !i.inOrphan && !i.inIndex && !i.inDagData &&
+                            i.rejectReason == "DAG_PARENT_STRUCTURAL",
+            "IBD: a malformed vector must be rejected structurally, never deferred/pending (" << i.rejectReason << ")");
+        BOOST_TEST_MESSAGE("R5 ibd_structural_reject=1 ibd=1 inOrphan=0 reason=" << i.rejectReason);
+    }
+    fImporting = fSavedImporting;
+    fRegTestIbd = fSavedRti;
 }
 
 BOOST_AUTO_TEST_SUITE_END()

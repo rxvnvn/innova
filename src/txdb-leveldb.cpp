@@ -22,8 +22,10 @@
 
 #include "kernel.h"
 #include "checkpoints.h"
-#include "txdb.h"
+#include "txdb-leveldb.h"
+#include <set>
 #include "util.h"
+#include "hash.h"   // R3: event/journal hash chaining (C6 section 3)
 #include "main.h"
 #include "blockindex_residency_counters.h"
 
@@ -131,6 +133,7 @@ CTxDB::CTxDB(const char* pszMode)
 
     if (txdb) {
         pdb = txdb;
+        VerifyDAGCustodyAtOpen(NULL);   // R3.7 open-time custody continuity
         return;
     }
 
@@ -144,6 +147,8 @@ CTxDB::CTxDB(const char* pszMode)
     pdb = txdb;
     ++g_testTxdbOpenCount;
     g_testTxdbLastOpenedPtr = (void*)txdb;
+    VerifyDAGCustodyAtOpen(NULL);   // R3.7: open-time custody continuity is established
+                                    // from the seal, never assumed from row bytes
 
     if (Exists(string("version")))
     {
@@ -209,6 +214,15 @@ void CTxDB::Close()
     if (txdb) {
         ++g_testTxdbCloseCount;
         g_testTxdbLastClosedPtr = (void*)txdb;
+    }
+    // R3.7: a supported clean close self-verifies and seals the custody watermark in a
+    // single-record synchronous batch committing to W = P + C. It refuses (and never
+    // fabricates) when the store is read-only, is not certified, or has an open batch;
+    // an exact post-commit mismatch suspends coverage inside SealDAGCustody.
+    if (pdb != NULL && !fReadOnly && activeBatch == NULL)
+    {
+        std::string sealErr;
+        SealDAGCustody(NULL, &sealErr);
     }
     delete txdb;
     txdb = pdb = NULL;
@@ -638,6 +652,10 @@ public:
 };
 }
 
+// R3 / C6 section 6 helpers (defined with the certificate machinery below; declared
+// here because the provenance transitions above need the canonical row serialization).
+static std::string SerializeRowPayload(const CBlockDAGData& data);
+
 bool CTxDB::WriteDAGLinks(const uint256& hash, const CBlockDAGData& data)
 {
     if (!activeBatch || ChildCountRevoked(GetInstance())) return false;
@@ -665,16 +683,70 @@ bool CTxDB::WriteDAGLinks(const uint256& hash, const CBlockDAGData& data)
             if (!ReadDAGChildCount(*p, &count, &present) || count == UINT64_MAX) return false;
             if (!Write(make_pair(string("dagchildcount"), *p), count + 1)) return false;
         }
+    // R3 / C6 section 4 — RESTORE INVALIDATION (property 6-B), in this SAME batch
+    // and BEFORE the row payload is published. A supported materialization
+    // establishes the row's incarnation (first materialization -> 1, every later
+    // rematerialization -> N+1) and invalidates/supersedes every prior prune event
+    // of this vertex, so no crash point can leave the restored row explained by a
+    // dead PRUNE(X, N) record. Evidence invalidation precedes publication.
+    uint64_t priorIncarnation = 0; bool haveIncarnation = false;
+    uint64_t newIncarnation = 1;
+    {
+        if (!ReadDAGRowIncarnation(hash, &priorIncarnation, &haveIncarnation)) return false;
+        newIncarnation = haveIncarnation ? priorIncarnation + 1 : 1;
+        if (haveIncarnation && newIncarnation <= priorIncarnation) return false; // overflow: fail closed
+        uint64_t latestEvent = 0, latestIncarnation = 0; bool haveLatest = false;
+        std::vector<uint64_t> rowEvents;
+        if (!ReadDAGPruneLatest(hash, &latestEvent, &latestIncarnation, &rowEvents, &haveLatest)) return false;
+        if (haveLatest)
+        {
+            for (size_t i = 0; i < rowEvents.size(); ++i)
+            {
+                DAGPruneEvent ev; bool present = false;
+                if (!ReadDAGPruneEvent(rowEvents[i], &ev, &present)) return false;
+                if (!present) continue;                  // history not retained: nothing to supersede
+                if (ev.hash != hash) return false;        // index/event disagreement: fail closed
+                if (ev.superseded_by == 0)
+                {
+                    ev.superseded_by = newIncarnation;    // inadmissible from this incarnation on
+                    if (!WriteDAGPruneEvent(rowEvents[i], ev)) return false;
+                }
+            }
+            if (!EraseDAGPruneLatest(hash)) return false;
+        }
+        if (!WriteDAGRowIncarnation(hash, newIncarnation)) return false;
+        uint64_t provCounter = 0;
+        if (!ReadDAGProvenanceCounter(&provCounter)) return false;
+        if (!Write(string("dagprovcounter"), provCounter + 1)) return false;
+    }
     if (!Write(make_pair(string("daglinks"), hash), data)) return false;
+    // R3 / C6 section 6: a supported materialization is a provenance mutation, so the
+    // coverage certificate is re-published IN THIS SAME BATCH (no-op when the store is
+    // not certified: a mutation may never fabricate a certificate).
+    if (!RepublishDAGProvenanceCertificateOnWrite(hash, SerializeRowPayload(data),
+                                                 existed ? SerializeRowPayload(old) : std::string(),
+                                                 existed, haveIncarnation,
+                                                 priorIncarnation, newIncarnation))
+        return false;
     delta.Finish();
     return true;
 }
 
-bool CTxDB::EraseDAGLinks(const uint256& hash)
+bool CTxDB::EraseDAGLinks(const uint256& hash, DAGRowEraseOrigin origin)
+{
+    return EraseDAGLinks(hash, origin, DAGROW_HEIGHT_UNKNOWN, DAGROW_HEIGHT_UNKNOWN);
+}
+
+bool CTxDB::EraseDAGLinks(const uint256& hash, DAGRowEraseOrigin origin, int32_t rowHeight,
+                          int32_t pruneFloorAfter)
 {
     if (!activeBatch || ChildCountRevoked(GetInstance())) return false;
     CBlockDAGData old;
     if (!ReadDAGLinks(hash, old))
+        // Nothing was materialized here: this erase removes no canonical row and
+        // therefore attributes NOTHING. In particular it must not register a
+        // non-prune de-materialization for a row another lifecycle already erased,
+        // and must not clear a record it did not supersede.
         return !Exists(make_pair(string("daglinks"), hash));
     const std::set<uint256> parents(old.vDAGParents.begin(), old.vDAGParents.end());
     SourceFrontierChange delta(*this);
@@ -689,7 +761,1083 @@ bool CTxDB::EraseDAGLinks(const uint256& hash)
         else if (!Write(make_pair(string("dagchildcount"), *p), count - 1)) return false;
     }
     if (!Erase(make_pair(string("daglinks"), hash))) return false;
+    // F2-B1-R: bind THIS row's absence to the lifecycle that caused it, inside the
+    // SAME atomic batch as the erase (same function, same activeBatch), so no
+    // crash can leave the absence without its provenance or the provenance
+    // without the absence.
+    if (origin == DAGRowEraseOrigin::PRUNE)
+    {
+        // The row WAS materialized and is now erased by the accepted prune
+        // lifecycle: the absence is genuinely prune-attributed, so any stale
+        // non-prune de-materialization record for this vertex is superseded.
+        // Conditional, because an unconditional Delete would write a tombstone for
+        // every pruned row although the record is almost never present.
+        // R3 / C6 section 3-4 (retirement): the legacy row-erase marker convention is
+        // RETIRED as evidence in this same delta as the final predicate. Nothing reads
+        // it any more (the predicate attributes absence only from bound positive prune
+        // evidence), so this origin no longer writes or clears a marker record. The
+        // record API is retained only so historical stores and existing callers keep
+        // working; those records are inert.
+        (void)origin;
+        // R3 / C6 section 3 — POSITIVE PRUNE EVIDENCE, in this same atomic batch as
+        // the erase: a monotone, hash-chained journal entry binding (X, N, epoch,
+        // height, floor_after) plus the per-row index binding {E, N}. This replaces
+        // the prune-writes-nothing convention. A prune that cannot bind a COMPLETE
+        // identity records nothing at all (fail closed) — partial evidence is never
+        // written, because partial evidence is exactly what could be mistaken for a
+        // protocol prune later.
+        if (rowHeight != DAGROW_HEIGHT_UNKNOWN && pruneFloorAfter != DAGROW_HEIGHT_UNKNOWN)
+        {
+            uint64_t incarnation = 0; bool haveIncarnation = false;
+            if (!ReadDAGRowIncarnation(hash, &incarnation, &haveIncarnation)) return false;
+            if (haveIncarnation)
+            {
+                uint64_t head = 0, length = 0; uint256 headHash;
+                if (!ReadDAGPruneJournal(&head, &length, &headHash)) return false;
+                const uint64_t event = head + 1;
+                if (event == 0) return false;                 // event identity overflow: fail closed
+                uint64_t epoch = 0;
+                if (!ReadDAGCustodyEpoch(&epoch)) return false;
+                DAGPruneEvent ev;
+                ev.hash = hash;
+                ev.incarnation = incarnation;
+                ev.epoch = epoch;
+                ev.height = rowHeight;
+                ev.floor_after = pruneFloorAfter;
+                ev.prev_event_hash = headHash;
+                ev.superseded_by = 0;
+                if (!WriteDAGPruneEvent(event, ev)) return false;
+                CDataStream hs(SER_GETHASH, CLIENT_VERSION);
+                hs << event << ev.hash << ev.incarnation << ev.epoch << ev.height
+                   << ev.floor_after << ev.prev_event_hash;
+                const uint256 eventHash = Hash(hs.begin(), hs.end());
+                CDataStream js(SER_DISK, CLIENT_VERSION);
+                js << event << (length + 1) << eventHash;
+                if (!Write(string("dagprunejournal"), js.str())) return false;
+                std::vector<uint64_t> rowEvents;
+                rowEvents.push_back(event);               // events of the current incarnation epoch
+                if (!WriteDAGPruneLatest(hash, event, incarnation, rowEvents)) return false;
+                uint64_t provCounter = 0;
+                if (!ReadDAGProvenanceCounter(&provCounter)) return false;
+                if (!Write(string("dagprovcounter"), provCounter + 1)) return false;
+            }
+            // else: the row had no durable incarnation (legacy or unsupported
+            // materialization). Positive attribution is impossible, so none is
+            // recorded and this absence stays unexplained (C6 migration rule).
+        }
+        // else: the caller could not supply the complete prune identity. No event.
+    }
+    else
+    {
+        // A NON-prune lifecycle erased this row. R3 / C6 (retirement): no marker is
+        // written any more — a non-prune de-materialization has NO admissible evidence
+        // by construction (it produces no bound prune event for the current
+        // incarnation), so under the final predicate its absence is
+        // ROW_MISSING_UNEXPLAINED and fails closed. The row's incarnation is
+        // deliberately NOT advanced (nothing was rematerialized), but this is still a
+        // provenance-relevant custody mutation, so the mutation counter advances.
+        uint64_t provCounter = 0;
+        if (!ReadDAGProvenanceCounter(&provCounter)) return false;
+        if (!Write(string("dagprovcounter"), provCounter + 1)) return false;
+    }
+    // R3 / C6 section 6: the erased row left the covered set, so the coverage
+    // certificate is re-published in this same batch (no-op for an uncertified store).
+    if (!RepublishDAGProvenanceCertificateOnErase(hash, SerializeRowPayload(old))) return false;
     delta.Finish();
+    return true;
+}
+
+// R3 / C6 continuity substrate (section 5). READ-ONLY: the engine's monotone
+// write-sequence watermark, reached through the vendored engine's existing
+// property dispatch. Failure to provide it is a fail-closed result, never a
+// default: coverage must not survive a session boundary without it.
+bool CTxDB::ReadEngineLastSequence(uint64_t* sequence, std::string* detail) const
+{
+    if (!sequence) return false;
+    *sequence = 0;
+    if (!pdb)
+    {
+        if (detail) *detail = "engine watermark unavailable: no DB instance";
+        return false;
+    }
+    // R3.9 case M: deterministic simulation of a backend WITHOUT the read-only accessor.
+    // The suppression only makes the capability unavailable (it can never make an
+    // unavailable capability look available), so fail-closed semantics are strengthened,
+    // never weakened.
+    if (g_testSuppressDagCustodyWatermark)
+    {
+        if (detail) *detail = "engine watermark unavailable: accessor not provided by this backend (simulated)";
+        return false;
+    }
+    std::string value;
+    if (!pdb->GetProperty("leveldb.last-sequence", &value) || value.empty())
+    {
+        // Legacy/foreign backend without the read-only accessor: the conservative
+        // fallback applies (only PRUNE evidence recorded in the current custody
+        // epoch is admissible; coverage does not survive a session boundary).
+        if (detail) *detail = "engine watermark unavailable: accessor not provided by this backend";
+        return false;
+    }
+    uint64_t parsed = 0;
+    bool anyDigit = false;
+    for (size_t i = 0; i < value.size(); ++i)
+    {
+        const char c = value[i];
+        if (c < '0' || c > '9')
+        {
+            if (detail) *detail = "engine watermark malformed: " + value;
+            return false;
+        }
+        if (parsed > (UINT64_MAX - (uint64_t)(c - '0')) / 10)
+        {
+            if (detail) *detail = "engine watermark overflow: " + value;
+            return false;
+        }
+        parsed = parsed * 10 + (uint64_t)(c - '0');
+        anyDigit = true;
+    }
+    if (!anyDigit)
+    {
+        if (detail) *detail = "engine watermark malformed: empty value";
+        return false;
+    }
+    *sequence = parsed;
+    if (detail) detail->clear();
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// R3 / C6 provenance state (additive). Sections 1-4 of the accepted C6 contract:
+// typed row outcome, per-row incarnation, positive prune evidence, custody state.
+// (DAGROW_HEIGHT_UNKNOWN is declared in txdb-leveldb.h.)
+// ---------------------------------------------------------------------------
+
+// R3 / C6 section 1 — typed DAG-row read. The legacy bool read collapses
+// not-found, I/O failure and deserialization failure into one false, which the
+// consensus path then reads as "row absent". This classifies the three apart and
+// NEVER reports a present-but-malformed row or an I/O failure as absence.
+// Returns false only on a programming error (null out-params); on true the
+// caller MUST branch on *outcome.
+bool CTxDB::ReadDAGLinksTyped(const uint256& hash, CBlockDAGData* data,
+                              DAGRowTypedOutcome* outcome, std::string* detail)
+{
+    if (!outcome) return false;
+    *outcome = DAGRowTypedOutcome::STORAGE_ERROR;
+    if (detail) detail->clear();
+    if (data) *data = CBlockDAGData();
+    if (!pdb)
+    {
+        if (detail) *detail = "typed row read: no DB instance";
+        return true;
+    }
+    CDataStream ssKey(SER_DISK, CLIENT_VERSION);
+    ssKey << make_pair(string("daglinks"), hash);
+    std::string raw;
+    bool fromDb = true;
+    if (activeBatch)
+    {
+        // ScanBatch THROWS on a batch-iterate failure (it cannot report one
+        // otherwise). An iterator/status failure is a storage error, never an
+        // absence: classify it, do not let it escape as an absence and do not
+        // silently fall back to the committed store.
+        try
+        {
+            bool deleted = false;
+            fromDb = (ScanBatch(ssKey, &raw, &deleted) == false);
+            if (deleted)
+            {
+                *outcome = DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED;
+                return true;
+            }
+        }
+        catch (const std::exception& e)
+        {
+            *outcome = DAGRowTypedOutcome::STORAGE_ERROR;
+            if (detail) *detail = std::string("typed row read: staged-view scan failed: ") + e.what();
+            return true;
+        }
+    }
+    if (fromDb)
+    {
+        const leveldb::Status status = pdb->Get(leveldb::ReadOptions(), ssKey.str(), &raw);
+        if (status.IsNotFound())
+        {
+            *outcome = DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED;
+            return true;
+        }
+        if (!status.ok())
+        {
+            *outcome = DAGRowTypedOutcome::STORAGE_ERROR;
+            if (detail) *detail = "typed row read: leveldb status: " + status.ToString();
+            return true;
+        }
+    }
+    // Present: it MUST decode. A present-but-undecodable row is CORRUPT, never
+    // missing, and never pruned.
+    try
+    {
+        CDataStream ssValue(raw.data(), raw.data() + raw.size(), SER_DISK, CLIENT_VERSION);
+        CBlockDAGData parsed;
+        ssValue >> parsed;
+        if (!ssValue.empty())
+        {
+            *outcome = DAGRowTypedOutcome::ROW_CORRUPT;
+            if (detail) *detail = "typed row read: trailing bytes after row payload";
+            return true;
+        }
+        if (data) *data = parsed;
+        *outcome = DAGRowTypedOutcome::ROW_PRESENT_VALID;
+    }
+    catch (const std::exception& e)
+    {
+        *outcome = DAGRowTypedOutcome::ROW_CORRUPT;
+        if (detail) *detail = std::string("typed row read: malformed row payload: ") + e.what();
+    }
+    return true;
+}
+
+bool CTxDB::ReadDAGRowIncarnation(const uint256& hash, uint64_t* incarnation, bool* present)
+{
+    if (!incarnation || !present) return false;
+    *incarnation = 0; *present = false;
+    const std::pair<std::string, uint256> key = make_pair(string("dagrowinc"), hash);
+    if (!Read(key, *incarnation))
+        return !Exists(key);   // present but unreadable -> fail closed
+    *present = true;
+    return true;
+}
+
+bool CTxDB::WriteDAGRowIncarnation(const uint256& hash, uint64_t incarnation)
+{
+    return Write(make_pair(string("dagrowinc"), hash), incarnation);
+}
+
+bool CTxDB::ReadDAGPruneLatest(const uint256& hash, uint64_t* event, uint64_t* incarnation,
+                               std::vector<uint64_t>* events, bool* present)
+{
+    if (!event || !incarnation || !present) return false;
+    *event = 0; *incarnation = 0; *present = false;
+    if (events) events->clear();
+    const std::pair<std::string, uint256> key = make_pair(string("dagprunelatest"), hash);
+    std::string raw;
+    if (!Read(key, raw))
+        return !Exists(key);   // present but unreadable -> fail closed
+    try
+    {
+        CDataStream ss(raw.data(), raw.data() + raw.size(), SER_DISK, CLIENT_VERSION);
+        std::vector<uint64_t> evs;
+        ss >> *event >> *incarnation >> evs;
+        if (!ss.empty()) return false;
+        if (events) *events = evs;
+        *present = true;
+        return true;
+    }
+    catch (const std::exception&) { return false; }
+}
+
+bool CTxDB::WriteDAGPruneLatest(const uint256& hash, uint64_t event, uint64_t incarnation,
+                                const std::vector<uint64_t>& events)
+{
+    CDataStream ss(SER_DISK, CLIENT_VERSION);
+    ss << event << incarnation << events;
+    return Write(make_pair(string("dagprunelatest"), hash), ss.str());
+}
+
+bool CTxDB::EraseDAGPruneLatest(const uint256& hash)
+{
+    return Erase(make_pair(string("dagprunelatest"), hash));
+}
+
+bool CTxDB::ReadDAGPruneEvent(uint64_t event, DAGPruneEvent* out, bool* present)
+{
+    if (!out || !present) return false;
+    *out = DAGPruneEvent(); *present = false;
+    const std::pair<std::string, uint64_t> key = make_pair(string("dagprunevent"), event);
+    std::string raw;
+    if (!Read(key, raw))
+        return !Exists(key);   // present but unreadable -> fail closed
+    try
+    {
+        CDataStream ss(raw.data(), raw.data() + raw.size(), SER_DISK, CLIENT_VERSION);
+        ss >> out->hash >> out->incarnation >> out->epoch >> out->height >> out->floor_after
+           >> out->prev_event_hash >> out->superseded_by;
+        if (!ss.empty()) { *out = DAGPruneEvent(); return false; }
+    }
+    catch (const std::exception&) { *out = DAGPruneEvent(); return false; }
+    *present = true;
+    return true;
+}
+
+bool CTxDB::WriteDAGPruneEvent(uint64_t event, const DAGPruneEvent& ev)
+{
+    CDataStream ss(SER_DISK, CLIENT_VERSION);
+    ss << ev.hash << ev.incarnation << ev.epoch << ev.height << ev.floor_after
+       << ev.prev_event_hash << ev.superseded_by;
+    return Write(make_pair(string("dagprunevent"), event), ss.str());
+}
+
+bool CTxDB::ReadDAGPruneJournal(uint64_t* head, uint64_t* length, uint256* head_hash)
+{
+    if (!head || !length || !head_hash) return false;
+    *head = 0; *length = 0; *head_hash = 0;
+    const std::string key = string("dagprunejournal");
+    std::string raw;
+    if (!Read(key, raw))
+        return !Exists(key);   // present but unreadable -> fail closed
+    try
+    {
+        CDataStream ss(raw.data(), raw.data() + raw.size(), SER_DISK, CLIENT_VERSION);
+        ss >> *head >> *length >> *head_hash;
+        return ss.empty();
+    }
+    catch (const std::exception&) { return false; }
+}
+
+bool CTxDB::ReadDAGProvenanceCounter(uint64_t* counter)
+{
+    if (!counter) return false;
+    *counter = 0;
+    const std::string key = string("dagprovcounter");
+    if (!Read(key, *counter))
+        return !Exists(key);   // absent = counter 0 (never started); corrupt -> fail closed
+    return true;
+}
+
+bool CTxDB::ReadDAGCustodyEpoch(uint64_t* epoch)
+{
+    if (!epoch) return false;
+    // 0 = no custody epoch established yet. Events recorded in epoch 0 are not
+    // admissible for positive attribution (C6 section 5 migration rule), so this
+    // is a fail-closed default, never a fabricated epoch identity.
+    *epoch = 0;
+    const std::string key = string("dagcustodyepoch");
+    if (!Read(key, *epoch))
+        return !Exists(key);
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// R3 / C6 sections 5-6 — coverage certificate + custody seal.
+//
+// The certificate IS the accumulator: every digest is maintained incrementally by
+// the supported writer in the SAME batch as the mutation it describes, and each is
+// independently recomputable by a full scan of the committed store (the
+// certification scan). "The certificate verifies" is therefore a recomputation,
+// never a timestamp, a floor advancement or a final-state digest alone.
+// ---------------------------------------------------------------------------
+static DAGCustodyState g_dagCustodyState = DAGCustodyState::UNAVAILABLE;
+static bool g_dagCertDeepVerified = false;
+bool g_testSuppressDagCustodyWatermark = false;   // R3.9 case M (test-only; see header)
+
+static uint256 XorUint256(uint256 a, uint256 b)
+{
+    uint256 r = a;
+    for (int i = 0; i < 32; ++i) r.begin()[i] = a.begin()[i] ^ b.begin()[i];
+    return r;
+}
+
+static uint256 HashRowCoverage(const uint256& hash, const std::string& raw)
+{
+    CDataStream s(SER_GETHASH, CLIENT_VERSION);
+    s << (unsigned char)'P' << hash << raw;
+    return Hash(s.begin(), s.end());
+}
+
+static uint256 HashIncarnation(const uint256& hash, uint64_t inc)
+{
+    CDataStream s(SER_GETHASH, CLIENT_VERSION);
+    s << (unsigned char)'I' << hash << inc;
+    return Hash(s.begin(), s.end());
+}
+
+static uint256 HashKnownVertex(const uint256& hash)
+{
+    CDataStream s(SER_GETHASH, CLIENT_VERSION);
+    s << (unsigned char)'V' << hash;
+    return Hash(s.begin(), s.end());
+}
+
+static uint256 HashFloorState(int32_t floorValue, int32_t cleanHeight)
+{
+    CDataStream s(SER_GETHASH, CLIENT_VERSION);
+    s << (unsigned char)'F' << floorValue << cleanHeight;
+    return Hash(s.begin(), s.end());
+}
+
+static std::string SerializeRowPayload(const CBlockDAGData& data)
+{
+    CDataStream s(SER_DISK, CLIENT_VERSION);
+    s << data;
+    return s.str();
+}
+
+static std::string SerializeDAGProvenanceCertificate(const DAGProvenanceCertificate& c)
+{
+    CDataStream s(SER_DISK, CLIENT_VERSION);
+    s << c.version << c.capabilityVersion << c.storeInstanceId << c.epoch << c.hCert
+      << c.watermark << c.mutationCounter << c.coveredVertexCount << c.coveredRowDigest
+      << c.perRowIncarnationDigest << c.knownVertexDigest << c.floorStateDigest
+      << c.journalHeadHash << c.journalLength << c.floorValue << c.cleanHeightValue;
+    return s.str();
+}
+
+static bool DeserializeDAGProvenanceCertificate(const std::string& raw, DAGProvenanceCertificate* out)
+{
+    if (!out) return false;
+    try
+    {
+        CDataStream s(raw.data(), raw.data() + raw.size(), SER_DISK, CLIENT_VERSION);
+        s >> out->version >> out->capabilityVersion >> out->storeInstanceId >> out->epoch
+          >> out->hCert >> out->watermark >> out->mutationCounter >> out->coveredVertexCount
+          >> out->coveredRowDigest >> out->perRowIncarnationDigest >> out->knownVertexDigest
+          >> out->floorStateDigest >> out->journalHeadHash >> out->journalLength
+          >> out->floorValue >> out->cleanHeightValue;
+        return s.empty();
+    }
+    catch (const std::exception&) { return false; }
+}
+
+static std::string SerializeDAGCustodySeal(const DAGCustodySeal& s)
+{
+    CDataStream ss(SER_DISK, CLIENT_VERSION);
+    ss << s.watermark << s.epoch << s.counter;
+    return ss.str();
+}
+
+static bool DeserializeDAGCustodySeal(const std::string& raw, DAGCustodySeal* out)
+{
+    if (!out) return false;
+    try
+    {
+        CDataStream s(raw.data(), raw.data() + raw.size(), SER_DISK, CLIENT_VERSION);
+        s >> out->watermark >> out->epoch >> out->counter;
+        return s.empty();
+    }
+    catch (const std::exception&) { return false; }
+}
+
+bool CTxDB::ReadDAGProvenanceCertificate(DAGProvenanceCertificate* cert, bool* present)
+{
+    if (!cert || !present) return false;
+    *cert = DAGProvenanceCertificate();
+    *present = false;
+    const std::string key = string("dagcert");
+    std::string raw;
+    if (!Read(key, raw))
+        return !Exists(key);   // present but unreadable -> fail closed
+    if (!DeserializeDAGProvenanceCertificate(raw, cert)) return false;
+    *present = true;
+    return true;
+}
+
+bool CTxDB::ReadDAGCustodySeal(DAGCustodySeal* seal, bool* present)
+{
+    if (!seal || !present) return false;
+    *seal = DAGCustodySeal();
+    *present = false;
+    const std::string key = string("dagcustodyseal");
+    std::string raw;
+    if (!Read(key, raw))
+        return !Exists(key);
+    if (!DeserializeDAGCustodySeal(raw, seal)) return false;
+    *present = true;
+    return true;
+}
+
+DAGCustodyState CTxDB::GetDAGCustodyState() const { return g_dagCustodyState; }
+bool CTxDB::IsDAGProvenanceDeepVerified() const { return g_dagCertDeepVerified; }
+
+bool CTxDB::ScanDAGProvenanceDigests(DAGProvenanceCertificate* out, std::string* error, bool enforceAdmission,
+                                    uint64_t prospectiveEpoch)
+{
+    if (!out) return false;
+    if (!pdb) { if (error) *error = "provenance scan: no DB instance"; return false; }
+    uint256 covAcc = 0, incAcc = 0, vertAcc = 0;
+    uint64_t vertCount = 0;
+    // R3 certification-admission repair (audit 20260930): a certificate may not positively
+    // certify a domain that contains an unexplained missing KNOWN vertex. The scan therefore
+    // also collects the two key families so the semantic admission check below can run
+    // non-circularly on durable provenance facts only.
+    std::set<uint256> rowHashes, knownVertexHashes;
+    leveldb::Iterator* it = pdb->NewIterator(leveldb::ReadOptions());
+    if (it == NULL) { if (error) *error = "provenance scan: no iterator"; return false; }
+    for (it->SeekToFirst(); it->Valid(); it->Next())
+    {
+        const leveldb::Slice k = it->key();
+        // Keys are serialized pair<std::string,uint256> (prefix || 32-byte key) with no
+        // extra marker; the prefix length is a CompactSize. Parse the prefix as a string
+        // rather than assuming a byte offset, so a key of any other family (or a
+        // malformed key) is simply skipped instead of mis-attributed.
+        std::string prefix;
+        uint256 h;
+        bool parsed = false;
+        try
+        {
+            CDataStream ssKey(SER_DISK, CLIENT_VERSION);
+            ssKey.write(k.data(), k.size());
+            ssKey >> prefix;
+            if (prefix == "daglinks" || prefix == "dagrowinc")
+            {
+                ssKey >> h;
+                parsed = true;
+            }
+        }
+        catch (const std::exception&)
+        {
+            // A malformed key of a provenance family is a storage-integrity failure, not
+            // something to skip silently.
+            if (prefix == "daglinks" || prefix == "dagrowinc")
+            {
+                delete it;
+                if (error) *error = "provenance scan: malformed provenance key";
+                return false;
+            }
+        }
+        if (parsed)
+        {
+            if (prefix == "daglinks")
+            {
+                // A PRESENT row must be well-formed: a corrupt payload is a storage-integrity
+                // failure, never silently certified (frozen: ROW_CORRUPT must refuse).
+                try
+                {
+                    CBlockDAGData parsedRow;
+                    CDataStream rs(it->value().data(), it->value().data() + it->value().size(),
+                                   SER_DISK, CLIENT_VERSION);
+                    rs >> parsedRow;
+                    if (!rs.empty()) { delete it; if (error) *error = "provenance scan: trailing bytes in daglinks payload"; return false; }
+                }
+                catch (const std::exception&)
+                {
+                    delete it;
+                    if (error) *error = "provenance scan: corrupt daglinks payload (ROW_CORRUPT)";
+                    return false;
+                }
+                rowHashes.insert(h);
+                covAcc = XorUint256(covAcc, HashRowCoverage(h, it->value().ToString()));
+            }
+            else if (prefix == "dagrowinc")
+            {
+                uint64_t inc = 0;
+                try
+                {
+                    CDataStream s(it->value().data(), it->value().data() + it->value().size(),
+                                  SER_DISK, CLIENT_VERSION);
+                    s >> inc;
+                    if (!s.empty()) { delete it; if (error) *error = "provenance scan: trailing bytes in incarnation record"; return false; }
+                }
+                catch (const std::exception&)
+                {
+                    delete it;
+                    if (error) *error = "provenance scan: malformed incarnation record";
+                    return false;
+                }
+                knownVertexHashes.insert(h);
+                incAcc = XorUint256(incAcc, HashIncarnation(h, inc));
+                vertAcc = XorUint256(vertAcc, HashKnownVertex(h));
+                ++vertCount;
+            }
+        }
+    }
+    const leveldb::Status st = it->status();
+    delete it;
+    if (!st.ok()) { if (error) *error = "provenance scan: iterator status: " + st.ToString(); return false; }
+
+    // ---------------------------------------------------------------------------------
+    // R3 coverage-certification ADMISSION (repair of the confirmed audit defect).
+    //
+    // For every KNOWN DAG vertex (a vertex with a durable dagrowinc record) inside the
+    // proposed covered domain:
+    //   * daglinks[X] present and well-formed  -> certification may continue (checked above);
+    //   * daglinks[X] absent                  -> certification may continue ONLY when the
+    //     absence is positively explained by the frozen provenance facts applicable at
+    //     certification time: the per-row prune index must bind the CURRENT durable
+    //     incarnation N, and the bound journal event must exist, be non-superseded, be
+    //     bound to exactly (X, N), and lie inside the proposed domain.
+    // Anything else is an UNEXPLAINED hole and certification MUST refuse.
+    //
+    // NON-CIRCULARITY: this check reads only durable provenance facts (daglinks / dagrowinc /
+    // dagprunelatest / dagprunevent) plus the store's own domain bounds. It never consults the
+    // certificate being created and never calls the certificate-dependent resolution
+    // predicate, so there is no certificate<->prune circularity. Admitting an absence here
+    // does NOT make it resolvable: per-row resolution separately applies the stricter
+    // frozen rules (verified certificate, admissible custody epoch, journal/domain binding).
+    // Deliberately NOT positive explanation: floor alone, the retired erase marker, timestamps,
+    // final row digests, or mere incarnation existence.
+    // ---------------------------------------------------------------------------------
+    if (enforceAdmission)
+    {
+        int32_t admissionFloor = 0, admissionClean = 0;
+        const bool admissionHasFloor = ReadDAGPruneFloor(admissionFloor);
+        const bool admissionHasClean = ReadDAGCleanHeight(admissionClean);
+        int32_t hDomain = 0;
+        if (admissionHasFloor && admissionHasClean) hDomain = admissionFloor > admissionClean ? admissionFloor : admissionClean;
+        else if (admissionHasFloor) hDomain = admissionFloor;
+        else if (admissionHasClean) hDomain = admissionClean;
+        for (std::set<uint256>::const_iterator vi = knownVertexHashes.begin(); vi != knownVertexHashes.end(); ++vi)
+        {
+            const uint256& vertex = *vi;
+            if (rowHashes.count(vertex)) continue;   // present + well-formed
+            uint64_t curInc = 0; bool incPresent = false;
+            if (!ReadDAGRowIncarnation(vertex, &curInc, &incPresent))
+            {
+                if (error) *error = "provenance scan: incarnation read failed for " + vertex.GetHex();
+                return false;
+            }
+            if (!incPresent) continue;               // raced/removed: nothing to explain
+            uint64_t latestEvent = 0, latestInc = 0; bool latestPresent = false;
+            std::vector<uint64_t> latestEvents;
+            if (!ReadDAGPruneLatest(vertex, &latestEvent, &latestInc, &latestEvents, &latestPresent))
+            {
+                if (error) *error = "provenance scan: prune index read failed for " + vertex.GetHex();
+                return false;
+            }
+            bool explained = false;
+            if (latestPresent && latestInc == curInc)
+            {
+                DAGPruneEvent ev; bool evPresent = false;
+                if (!ReadDAGPruneEvent(latestEvent, &ev, &evPresent))
+                {
+                    if (error) *error = "provenance scan: prune event read failed for " + vertex.GetHex();
+                    return false;
+                }
+                if (evPresent && ev.hash == vertex && ev.incarnation == curInc && ev.superseded_by == 0 &&
+                    ev.height != DAGROW_HEIGHT_UNKNOWN && (hDomain <= 0 || (ev.height >= 0 && ev.height < hDomain)) &&
+                    ev.epoch == prospectiveEpoch)
+                {
+                    // The event is admissible under the epoch this transition is about to publish,
+                    // so certification cannot cover a row the resolver will refuse.
+                    explained = true;
+                }
+            }
+            if (!explained)
+            {
+                if (error) *error = "provenance scan: unexplained missing known vertex " + vertex.GetHex() +
+                                    " (no admissible positive prune explanation for the current incarnation " +
+                                    std::to_string((unsigned long long)curInc) + " in the prospective certified custody epoch " +
+                                    std::to_string((unsigned long long)prospectiveEpoch) + ") — certification refused";
+                return false;
+            }
+        }
+    }
+    out->version = 1;
+    out->capabilityVersion = 1;
+    out->coveredRowDigest = covAcc;
+    out->perRowIncarnationDigest = incAcc;
+    out->knownVertexDigest = vertAcc;
+    out->coveredVertexCount = vertCount;
+    return true;
+}
+
+bool CTxDB::CertifyDAGProvenanceCoverage(int32_t hCert, uint64_t* epoch, std::string* error)
+{
+    if (activeBatch) { if (error) *error = "certification refused: an active batch is open"; return false; }
+    // A suspended custody (watermark continuity lost) is NEVER re-certified into
+    // admissibility: certification may establish a fresh session-scoped custody epoch, but
+    // it may never launder a store whose continuity already failed.
+    if (g_dagCustodyState == DAGCustodyState::SUSPENDED)
+    {
+        if (error) *error = "certification refused: custody is suspended (watermark continuity lost)";
+        return false;
+    }
+    int32_t floorValue = 0, cleanHeight = 0;
+    const bool haveFloor = ReadDAGPruneFloor(floorValue);
+    const bool haveClean = ReadDAGCleanHeight(cleanHeight);
+    if (!haveFloor && !haveClean)
+    {
+        // No floor and no clean height: there is no certifiable provenance domain.
+        // Fail closed; never certify an inferred domain.
+        if (error) *error = "certification refused: no prune floor and no clean height establish a certifiable domain";
+        return false;
+    }
+    // EPOCH-SEAM REPAIR (confirmed re-audit defect 20260930-122133): the custody epoch this
+    // certification transition is ABOUT TO publish must be known BEFORE admission. It is a value
+    // determined by the transition itself (frozen selection: curEpoch == 0 ? 1 : curEpoch), not
+    // authority derived from the certificate, so this is not circular. An absent known vertex may
+    // only be admitted when its bound prune event's epoch equals this prospective certified epoch;
+    // otherwise the event would be refused by the resolver immediately after certification, which
+    // would let the certificate positively cover an effectively unexplained absence.
+    uint64_t prospectiveCertifiedEpoch = 0;
+    if (!ReadDAGCustodyEpoch(&prospectiveCertifiedEpoch)) { if (error) *error = "certification refused: custody epoch unreadable"; return false; }
+    prospectiveCertifiedEpoch = (prospectiveCertifiedEpoch == 0) ? 1 : prospectiveCertifiedEpoch;
+    DAGProvenanceCertificate cert;
+    if (!ScanDAGProvenanceDigests(&cert, error, true, prospectiveCertifiedEpoch)) return false;
+    // Durable store identity: created exactly once, never silently regenerated.
+    uint256 storeId;
+    bool haveId = false;
+    {
+        const std::string key = string("dagstoreid");
+        std::string raw;
+        if (Read(key, raw))
+        {
+            try
+            {
+                CDataStream s(raw.data(), raw.data() + raw.size(), SER_DISK, CLIENT_VERSION);
+                s >> storeId;
+                haveId = s.empty();
+            }
+            catch (const std::exception&) { haveId = false; }
+            if (!haveId) { if (error) *error = "certification refused: store instance id unreadable"; return false; }
+        }
+        else if (Exists(key))
+        {
+            if (error) *error = "certification refused: store instance id unreadable";
+            return false;
+        }
+        else
+        {
+            storeId = GetRandHash();
+            haveId = false;   // written below, inside the publication batch
+        }
+    }
+    const uint64_t newEpoch = prospectiveCertifiedEpoch;   // read and validated before admission
+    int32_t hDomain = hCert;
+    if (haveClean && cleanHeight > hDomain) hDomain = cleanHeight;
+    if (haveFloor && floorValue > hDomain) hDomain = floorValue;
+    uint64_t head = 0, length = 0; uint256 headHash;
+    if (!ReadDAGPruneJournal(&head, &length, &headHash)) { if (error) *error = "certification refused: prune journal unreadable"; return false; }
+    uint64_t counter = 0;
+    if (!ReadDAGProvenanceCounter(&counter)) { if (error) *error = "certification refused: provenance counter unreadable"; return false; }
+    uint64_t w = 0; std::string werr;
+    const bool haveWatermark = ReadEngineLastSequence(&w, &werr);
+    cert.version = 1;
+    cert.capabilityVersion = 1;
+    cert.storeInstanceId = storeId;
+    cert.epoch = newEpoch;
+    cert.hCert = hDomain;
+    cert.watermark = haveWatermark ? w : 0;
+    cert.mutationCounter = counter;
+    cert.journalHeadHash = headHash;
+    cert.journalLength = length;
+    cert.floorValue = haveFloor ? floorValue : -1;
+    cert.cleanHeightValue = haveClean ? cleanHeight : -1;
+    cert.floorStateDigest = HashFloorState(cert.floorValue, cert.cleanHeightValue);
+    if (!TxnBegin()) return false;
+    if (!haveId)
+    {
+        CDataStream s(SER_DISK, CLIENT_VERSION);
+        s << storeId;
+        if (!Write(string("dagstoreid"), s.str())) { TxnAbort(); if (error) *error = "certification failed: store id write"; return false; }
+    }
+    if (!Write(string("dagcustodyepoch"), newEpoch)) { TxnAbort(); if (error) *error = "certification failed: epoch write"; return false; }
+    if (!Write(string("dagcert"), SerializeDAGProvenanceCertificate(cert))) { TxnAbort(); if (error) *error = "certification failed: certificate write"; return false; }
+    if (!TxnCommit()) { if (error) *error = "certification failed: commit"; return false; }
+    g_dagCertDeepVerified = true;      // the scan was performed against the committed store
+    // Certification IS the custody-establishing act: it binds the certificate, the epoch
+    // and the certified domain to the durable state as it exists now. Custody therefore
+    // becomes VERIFIED for this session (a clean shutdown seals W, so the next open
+    // verifies exact cross-session continuity; a suspended store never reaches here).
+    g_dagCustodyState = DAGCustodyState::VERIFIED;
+    if (epoch) *epoch = newEpoch;
+    return true;
+}
+
+bool CTxDB::VerifyDAGProvenanceCoverage(DAGCertVerifyResult* result, std::string* error)
+{
+    if (result) *result = DAGCertVerifyResult::OK;
+    DAGProvenanceCertificate cert;
+    bool haveCert = false;
+    if (!ReadDAGProvenanceCertificate(&cert, &haveCert))
+    {
+        if (result) *result = DAGCertVerifyResult::STORAGE_ERROR;
+        if (error) *error = "certificate unreadable";
+        return false;
+    }
+    if (!haveCert) { if (result) *result = DAGCertVerifyResult::NO_CERTIFICATE; return true; }
+    uint256 storeId;
+    {
+        const std::string key = string("dagstoreid");
+        std::string raw;
+        bool haveId = false;
+        if (Read(key, raw))
+        {
+            try { CDataStream s(raw.data(), raw.data() + raw.size(), SER_DISK, CLIENT_VERSION); s >> storeId; haveId = s.empty(); }
+            catch (const std::exception&) { haveId = false; }
+        }
+        else if (Exists(key)) { if (result) *result = DAGCertVerifyResult::STORAGE_ERROR; if (error) *error = "store id unreadable"; return false; }
+        if (!haveId || storeId != cert.storeInstanceId)
+        {
+            if (result) *result = DAGCertVerifyResult::STORE_INSTANCE_MISMATCH;
+            return true;
+        }
+    }
+    uint64_t curEpoch = 0;
+    if (!ReadDAGCustodyEpoch(&curEpoch)) { if (result) *result = DAGCertVerifyResult::STORAGE_ERROR; return false; }
+    if (curEpoch == 0 || curEpoch != cert.epoch)
+    {
+        if (result) *result = DAGCertVerifyResult::EPOCH_MISMATCH;
+        return true;
+    }
+    uint64_t head = 0, length = 0; uint256 headHash;
+    if (!ReadDAGPruneJournal(&head, &length, &headHash)) { if (result) *result = DAGCertVerifyResult::STORAGE_ERROR; return false; }
+    if (headHash != cert.journalHeadHash || length != cert.journalLength)
+    {
+        if (result) *result = DAGCertVerifyResult::JOURNAL_MISMATCH;
+        return true;
+    }
+    DAGProvenanceCertificate scanned;
+    if (!ScanDAGProvenanceDigests(&scanned, error, false))
+    {
+        if (result) *result = DAGCertVerifyResult::STORAGE_ERROR;
+        return false;
+    }
+    int32_t floorValue = 0, cleanHeight = 0;
+    const bool haveFloor = ReadDAGPruneFloor(floorValue);
+    const bool haveClean = ReadDAGCleanHeight(cleanHeight);
+    const uint256 floorDigest = HashFloorState(haveFloor ? floorValue : -1, haveClean ? cleanHeight : -1);
+    if (scanned.coveredRowDigest != cert.coveredRowDigest ||
+        scanned.perRowIncarnationDigest != cert.perRowIncarnationDigest ||
+        scanned.knownVertexDigest != cert.knownVertexDigest ||
+        scanned.coveredVertexCount != cert.coveredVertexCount ||
+        floorDigest != cert.floorStateDigest)
+    {
+        if (result) *result = DAGCertVerifyResult::DIGEST_MISMATCH;
+        if (error)
+            *error = "certification scan mismatch: the committed store no longer reproduces the certified digests"
+                     " (an unexplained hole, or a hole produced by an unsupported writer)";
+        return true;
+    }
+    g_dagCertDeepVerified = true;
+    if (result) *result = DAGCertVerifyResult::OK;
+    return true;
+}
+
+bool CTxDB::VerifyDAGProvenanceCoverageShallow(DAGCertVerifyResult* result, std::string* error)
+{
+    if (result) *result = DAGCertVerifyResult::OK;
+    DAGProvenanceCertificate cert;
+    bool haveCert = false;
+    if (!ReadDAGProvenanceCertificate(&cert, &haveCert))
+    {
+        if (result) *result = DAGCertVerifyResult::STORAGE_ERROR;
+        if (error) *error = "certificate unreadable";
+        return false;
+    }
+    if (!haveCert) { if (result) *result = DAGCertVerifyResult::NO_CERTIFICATE; return true; }
+    if (cert.version != 1 || cert.capabilityVersion != 1)
+    {
+        if (result) *result = DAGCertVerifyResult::DIGEST_MISMATCH;
+        if (error) *error = "certificate layout/capability version mismatch";
+        return true;
+    }
+    uint64_t curEpoch = 0;
+    if (!ReadDAGCustodyEpoch(&curEpoch)) { if (result) *result = DAGCertVerifyResult::STORAGE_ERROR; return false; }
+    if (curEpoch == 0 || curEpoch != cert.epoch) { if (result) *result = DAGCertVerifyResult::EPOCH_MISMATCH; return true; }
+    uint64_t head = 0, length = 0; uint256 headHash;
+    if (!ReadDAGPruneJournal(&head, &length, &headHash)) { if (result) *result = DAGCertVerifyResult::STORAGE_ERROR; return false; }
+    if (headHash != cert.journalHeadHash || length != cert.journalLength)
+    {
+        if (result) *result = DAGCertVerifyResult::JOURNAL_MISMATCH;
+        return true;
+    }
+    uint64_t counter = 0;
+    if (!ReadDAGProvenanceCounter(&counter)) { if (result) *result = DAGCertVerifyResult::STORAGE_ERROR; return false; }
+    if (counter != cert.mutationCounter)
+    {
+        if (result) *result = DAGCertVerifyResult::DIGEST_MISMATCH;
+        if (error) *error = "certificate is stale: the provenance mutation counter has advanced without republication";
+        return true;
+    }
+    if (result) *result = DAGCertVerifyResult::OK;
+    return true;
+}
+
+bool CTxDB::RepublishDAGProvenanceCertificateOnWrite(const uint256& hash,
+                                                    const std::string& newPayload,
+                                                    const std::string& oldPayload,
+                                                    bool fRowExisted, bool hadIncarnation,
+                                                    uint64_t incBefore, uint64_t incAfter)
+{
+    DAGProvenanceCertificate cert;
+    bool haveCert = false;
+    if (!ReadDAGProvenanceCertificate(&cert, &haveCert)) return false;
+    if (!haveCert) return true;   // uncertified store: no mutation may fabricate a certificate
+    if (fRowExisted) cert.coveredRowDigest = XorUint256(cert.coveredRowDigest, HashRowCoverage(hash, oldPayload));
+    cert.coveredRowDigest = XorUint256(cert.coveredRowDigest, HashRowCoverage(hash, newPayload));
+    if (!hadIncarnation)
+    {
+        cert.knownVertexDigest = XorUint256(cert.knownVertexDigest, HashKnownVertex(hash));
+        cert.coveredVertexCount += 1;
+    }
+    else
+    {
+        cert.perRowIncarnationDigest = XorUint256(cert.perRowIncarnationDigest, HashIncarnation(hash, incBefore));
+    }
+    cert.perRowIncarnationDigest = XorUint256(cert.perRowIncarnationDigest, HashIncarnation(hash, incAfter));
+    return RepublishDAGProvenanceCertificateCommon(&cert);
+}
+
+bool CTxDB::RepublishDAGProvenanceCertificateOnErase(const uint256& hash, const std::string& oldPayload)
+{
+    DAGProvenanceCertificate cert;
+    bool haveCert = false;
+    if (!ReadDAGProvenanceCertificate(&cert, &haveCert)) return false;
+    if (!haveCert) return true;
+    cert.coveredRowDigest = XorUint256(cert.coveredRowDigest, HashRowCoverage(hash, oldPayload));
+    return RepublishDAGProvenanceCertificateCommon(&cert);
+}
+
+// R3.6: a floor / clean-height change is part of the certified coverage state, so it
+// re-binds the floor-state digest and re-publishes the certificate in the ACTIVE batch.
+// A store that is not certified is never certified by this side effect.
+bool CTxDB::RepublishDAGProvenanceFloorBinding()
+{
+    DAGProvenanceCertificate cert;
+    bool haveCert = false;
+    if (!ReadDAGProvenanceCertificate(&cert, &haveCert)) return false;
+    if (!haveCert) return true;
+    return RepublishDAGProvenanceCertificateCommon(&cert);
+}
+
+bool CTxDB::RepublishDAGProvenanceCertificateCommon(DAGProvenanceCertificate* cert)
+{
+    if (!cert) return false;
+    int32_t floorValue = 0, cleanHeight = 0;
+    const bool haveFloor = ReadDAGPruneFloor(floorValue);
+    const bool haveClean = ReadDAGCleanHeight(cleanHeight);
+    cert->floorValue = haveFloor ? floorValue : -1;
+    cert->cleanHeightValue = haveClean ? cleanHeight : -1;
+    cert->floorStateDigest = HashFloorState(cert->floorValue, cert->cleanHeightValue);
+    if (haveClean && cleanHeight > cert->hCert) cert->hCert = cleanHeight;
+    if (haveFloor && floorValue > cert->hCert) cert->hCert = floorValue;
+    uint64_t counter = 0;
+    if (!ReadDAGProvenanceCounter(&counter)) return false;
+    cert->mutationCounter = counter;
+    uint64_t head = 0, length = 0; uint256 headHash;
+    if (!ReadDAGPruneJournal(&head, &length, &headHash)) return false;
+    cert->journalHeadHash = headHash;
+    cert->journalLength = length;
+    uint64_t w = 0; std::string werr;
+    cert->watermark = ReadEngineLastSequence(&w, &werr) ? w : 0;
+    return Write(string("dagcert"), SerializeDAGProvenanceCertificate(*cert));
+}
+
+bool CTxDB::SealDAGCustody(uint64_t* sealedWatermark, std::string* error)
+{
+    if (activeBatch) { if (error) *error = "seal refused: an active batch is open"; return false; }
+    DAGProvenanceCertificate cert;
+    bool haveCert = false;
+    if (!ReadDAGProvenanceCertificate(&cert, &haveCert))
+    {
+        if (error) *error = "seal unavailable: certificate unreadable";
+        return false;
+    }
+    if (!haveCert)
+    {
+        if (error) *error = "seal unavailable: no certificate (provenance coverage not established)";
+        return false;
+    }
+    if (g_dagCustodyState == DAGCustodyState::SUSPENDED)
+    {
+        if (error) *error = "seal refused: custody is already suspended";
+        return false;
+    }
+    uint64_t p = 0; std::string werr;
+    if (!ReadEngineLastSequence(&p, &werr))
+    {
+        g_dagCustodyState = DAGCustodyState::UNAVAILABLE;   // capability lost: coverage does not survive
+        if (error) *error = "seal unavailable: engine watermark capability: " + werr;
+        return false;
+    }
+    // This batch contains exactly ONE record (the seal itself), so C == 1 exactly and
+    // the seal commits to W = P + C in the same record that the commit publishes.
+    const uint64_t c = 1;
+    const uint64_t w = p + c;
+    DAGCustodySeal seal;
+    seal.watermark = w;
+    seal.epoch = cert.epoch;
+    {
+        uint64_t counter = 0;
+        if (!ReadDAGProvenanceCounter(&counter)) { if (error) *error = "seal unavailable: counter unreadable"; return false; }
+        seal.counter = counter;
+    }
+    if (!TxnBegin()) return false;
+    if (!Write(string("dagcustodyseal"), SerializeDAGCustodySeal(seal)))
+    {
+        TxnAbort();
+        if (error) *error = "seal failed: write";
+        return false;
+    }
+    if (!TxnCommit())
+    {
+        g_dagCustodyState = DAGCustodyState::SUSPENDED;
+        if (error) *error = "seal failed: commit";
+        return false;
+    }
+    uint64_t after = 0;
+    if (!ReadEngineLastSequence(&after, &werr) || after != w)
+    {
+        // Exact mismatch: fail closed. Never a second write to "fix" the seal.
+        g_dagCustodyState = DAGCustodyState::SUSPENDED;
+        if (error) *error = "seal verification failed: actual LastSequence != W";
+        return false;
+    }
+    g_dagCustodyState = DAGCustodyState::VERIFIED;
+    if (sealedWatermark) *sealedWatermark = w;
+    return true;
+}
+
+bool CTxDB::VerifyDAGCustodyAtOpen(std::string* error)
+{
+    DAGCustodySeal seal;
+    bool haveSeal = false;
+    if (!ReadDAGCustodySeal(&seal, &haveSeal))
+    {
+        g_dagCustodyState = DAGCustodyState::UNAVAILABLE;
+        if (error) *error = "custody seal unreadable";
+        return false;
+    }
+    if (!haveSeal)
+    {
+        g_dagCustodyState = DAGCustodyState::UNAVAILABLE;
+        if (error) *error = "no custody seal: cross-session coverage is unavailable";
+        return true;
+    }
+    uint64_t cur = 0; std::string werr;
+    if (!ReadEngineLastSequence(&cur, &werr))
+    {
+        g_dagCustodyState = DAGCustodyState::UNAVAILABLE;
+        if (error) *error = "engine watermark capability unavailable: " + werr;
+        return true;
+    }
+    if (cur != seal.watermark)
+    {
+        // An unsupported/foreign writer consumed engine sequence numbers: the final
+        // application-visible rows may look identical, but custody continuity does not.
+        g_dagCustodyState = DAGCustodyState::SUSPENDED;
+        if (error) *error = "custody watermark mismatch: LastSequence != sealed W";
+        return true;
+    }
+    // R3.8 (restart seam): a restart may restore provenance admissibility ONLY when the
+    // certificate, the journal/incarnations and the exact custody watermark all verify.
+    // An unexplained hole, an invalid certificate or a broken journal is NOT "empty DAG
+    // state", NOT "zero state" and NOT an objectively pruned row: it suspends coverage so
+    // that live and restart interpretation of the same durable state agree.
+    DAGCertVerifyResult resumed = DAGCertVerifyResult::NO_CERTIFICATE;
+    std::string verr;
+    if (!VerifyDAGProvenanceCoverage(&resumed, &verr))
+    {
+        g_dagCustodyState = DAGCustodyState::SUSPENDED;
+        if (error) *error = "restored certification could not be evaluated: " + verr;
+        return true;
+    }
+    if (resumed == DAGCertVerifyResult::NO_CERTIFICATE)
+    {
+        // Nothing was ever certified: cross-session coverage is unavailable. This is
+        // availability loss (explicitly acceptable), never a false-positive prune.
+        g_dagCustodyState = DAGCustodyState::UNAVAILABLE;
+        if (error) *error = "no coverage certificate: cross-session provenance coverage is unavailable";
+        return true;
+    }
+    if (resumed != DAGCertVerifyResult::OK)
+    {
+        g_dagCustodyState = DAGCustodyState::SUSPENDED;
+        if (error) *error = "restored provenance certification rejected (result=" +
+                            std::to_string((int)resumed) + ")" +
+                            (verr.empty() ? std::string() : ": " + verr);
+        return true;
+    }
+    g_dagCustodyState = DAGCustodyState::VERIFIED;
     return true;
 }
 
@@ -840,28 +1988,33 @@ bool CTxDB::RevokeDAGChildCountForTest()
 
 bool CTxDB::IsDAGScoreAuthorityHealthy(std::string* error)
 {
+    return GetDAGScoreAuthorityStatus(error) == DAG_SCORE_AUTHORITY_HEALTHY;
+}
+
+CTxDB::DAGScoreAuthorityStatus CTxDB::GetDAGScoreAuthorityStatus(std::string* error)
+{
     if (error) error->clear();
-    if (ScoreAuthorityRevoked(GetInstance())) { if (error) *error="DAG score authority revoked/rebuild-required"; return false; }
+    if (ScoreAuthorityRevoked(GetInstance())) { if (error) *error="DAG score authority revoked/rebuild-required"; return DAG_SCORE_AUTHORITY_REVOKED; }
     uint256 source;
-    if (!ReadDAGSourceStateId(source)) { if (error) *error="DAG score authority: source token unavailable"; return false; }
+    if (!ReadDAGSourceStateId(source)) { if (error) *error="DAG score authority: source token unavailable"; return DAG_SCORE_AUTHORITY_UNAVAILABLE; }
     CDataStream keyStream(SER_DISK, CLIENT_VERSION);
     keyStream << make_pair(SCORE_STATE_KEY, uint8_t(0));
     std::string key = keyStream.str();
     std::string raw;
     leveldb::DB* db = GetInstance();
-    if (!db) { if (error) *error="DAG score authority: database unavailable"; return false; }
+    if (!db) { if (error) *error="DAG score authority: database unavailable"; return DAG_SCORE_AUTHORITY_UNAVAILABLE; }
     const leveldb::Status st = db->Get(leveldb::ReadOptions(), key, &raw);
-    if (st.IsNotFound()) { if (error) *error="DAG score authority: state marker missing"; return false; }
-    if (!st.ok()) { if (error) *error="DAG score authority: state marker read error"; return false; }
+    if (st.IsNotFound()) { if (error) *error="DAG score authority: state marker missing"; return DAG_SCORE_AUTHORITY_UNCERTIFIED; }
+    if (!st.ok()) { if (error) *error="DAG score authority: state marker read error"; return DAG_SCORE_AUTHORITY_UNAVAILABLE; }
     std::pair<uint32_t,uint256> state;
     try {
         CDataStream is(raw.data(), raw.data()+raw.size(), SER_DISK, CLIENT_VERSION);
         is >> state;
-        if (!is.empty()) { if (error) *error="DAG score authority: trailing bytes in state marker"; return false; }
-    } catch (const std::exception&) { if (error) *error="DAG score authority: corrupt state marker"; return false; }
-    if (state.first != 1) { if (error) *error="DAG score authority: unsupported state marker version"; return false; }
-    if (state.second != source) { if (error) *error="DAG score authority: state marker/source token mismatch"; return false; }
-    return true;
+        if (!is.empty()) { if (error) *error="DAG score authority: trailing bytes in state marker"; return DAG_SCORE_AUTHORITY_CORRUPT; }
+    } catch (const std::exception&) { if (error) *error="DAG score authority: corrupt state marker"; return DAG_SCORE_AUTHORITY_CORRUPT; }
+    if (state.first != 1) { if (error) *error="DAG score authority: unsupported state marker version"; return DAG_SCORE_AUTHORITY_CORRUPT; }
+    if (state.second != source) { if (error) *error="DAG score authority: state marker/source token mismatch"; return DAG_SCORE_AUTHORITY_CORRUPT; }
+    return DAG_SCORE_AUTHORITY_HEALTHY;
 }
 
 bool CTxDB::PublishDAGScoreCertificateAtomic(std::string* error)
@@ -1135,7 +2288,10 @@ bool CTxDB::IterateCurveTreeEpochs(std::map<int, CCurveTree>& mapOut)
 
 bool CTxDB::WriteDAGCleanHeight(int nHeight)
 {
-    return Write(string("dagcleanheight"), nHeight);
+    if (!Write(string("dagcleanheight"), nHeight)) return false;
+    // R3 / C6 section 6: the clean height is part of the certified coverage state and
+    // bounds the certified domain, so it re-publishes the certificate in the same batch.
+    return RepublishDAGProvenanceFloorBinding();
 }
 
 bool CTxDB::ReadDAGCleanHeight(int& nHeight)
@@ -1146,6 +2302,54 @@ bool CTxDB::ReadDAGCleanHeight(int& nHeight)
 bool CTxDB::EraseDAGCleanHeight()
 {
     return Erase(string("dagcleanheight"));
+}
+
+// F2 erase provenance: written ONLY by the prune/erase lifecycle
+// (CDAGManager::PruneDAGData, in the same atomic batch as the erasures) and
+// consumed ONLY as ERASE provenance (LegitimatePrunedBoundary). Distinct key,
+// distinct meaning - never advanced by Shutdown().
+bool CTxDB::WriteDAGPruneFloor(int nHeight)
+{
+    if (!Write(string("dagprunefloor"), nHeight)) return false;
+    // R3 / C6 section 6: the floor is part of the certified coverage state, so a floor
+    // change re-binds and re-publishes the certificate IN THE SAME BATCH (no-op when the
+    // store is uncertified). Without this the certificate would go stale the moment a
+    // prune advanced the floor.
+    return RepublishDAGProvenanceFloorBinding();
+}
+
+bool CTxDB::ReadDAGPruneFloor(int& nHeight)
+{
+    return Read(string("dagprunefloor"), nHeight);
+}
+
+bool CTxDB::EraseDAGPruneFloor()
+{
+    return Erase(string("dagprunefloor"));
+}
+
+// F2-B1-R row-erase provenance (see header). Read is three-state: false means the
+// store could not be read (callers fail closed); true with *present=false means
+// there is no record (the absence is not attributable to a non-prune lifecycle).
+bool CTxDB::WriteDAGRowErase(const uint256& hash, int origin)
+{
+    return Write(make_pair(string("dagrowerase"), hash), origin);
+}
+
+bool CTxDB::ReadDAGRowErase(const uint256& hash, int* origin, bool* present)
+{
+    if (!origin || !present) return false;
+    *origin = -1; *present = false;
+    const std::pair<std::string, uint256> key = make_pair(string("dagrowerase"), hash);
+    if (!Read(key, *origin))
+        return !Exists(key);   // present but unreadable/malformed -> fail closed
+    *present = true;
+    return true;
+}
+
+bool CTxDB::EraseDAGRowErase(const uint256& hash)
+{
+    return Erase(make_pair(string("dagrowerase"), hash));
 }
 
 bool CTxDB::WriteFinalityVote(const uint256& nullifier, const CFinalityVote& vote)

@@ -8,6 +8,7 @@
 #include "finality.h"
 #include "blockindex_residency_counters.h"
 #include "blockindex_authoritative_startup.h"
+#include "blockindex_authoritative_live.h"
 #include "util.h"
 #include "dag_tips_delta.h"
 #include "dag_mutation_preview.h"
@@ -285,20 +286,558 @@ CBlockIndex* CDAGManager::SelectBestDAGTip() const
 // CDAGManager: GHOSTDAG Blue-Set Coloring (pre-DAGKNIGHT)
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// CDAGManager: F2 authoritative DAG parent-score resolution
+// ---------------------------------------------------------------------------
+// DAG PARENT SCORE TRUTH != mapDAGData/mapBlockIndex RESIDENCY. The two
+// resolvers below are the ONE logical parent-score rule used by the coloring
+// entry points; they differ only in which source is authoritative.
+
+CDAGManager::DAGParentScoreResult
+CDAGManager::ResolveDagParentScore(const uint256& hashParent,
+                                   bool fAuthoritativeParentScore,
+                                   std::string* error,
+                                   DAGParentScorePolicy policy) const
+{
+    if (error) error->clear();
+    if (!fAuthoritativeParentScore)
+        return ResolveParentScoreLegacy(hashParent);
+    return ResolveParentScoreAuthoritative(hashParent, error, policy);
+}
+
+// Legacy resident rule, preserved byte-for-byte from the historical loop body.
+CDAGManager::DAGParentScoreResult
+CDAGManager::ResolveParentScoreLegacy(const uint256& hashParent) const
+{
+    DAGParentScoreResult r;
+    auto pit = mapDAGData.find(hashParent);
+    if (pit != mapDAGData.end())
+    {
+        r.status = DAGParentScoreStatus::FOUND;
+        r.score = pit->second.nDAGScore;
+        return r;
+    }
+    // Pre-DAG parent: use accumulated chain trust as base score
+    std::map<uint256, CBlockIndex*>& idx = RecolorBlockIndex();
+    std::map<uint256, CBlockIndex*>::iterator mi = idx.find(hashParent);
+    if (mi != idx.end() &&
+        !(mi->second->nHeight >= FORK_HEIGHT_DAG && mi->second->IsProofOfStake()))
+    {
+        r.status = DAGParentScoreStatus::FOUND;
+        r.score = mi->second->nChainTrust;
+        return r;
+    }
+    // Legacy miss: the caller ranks this parent at score 0 (unchanged).
+    r.status = DAGParentScoreStatus::NOT_FOUND;
+    r.score = 0;
+    return r;
+}
+
+// B-1 provenance predicate for a post-DAG parent whose canonical row is absent.
+//
+// The ACCEPTED prune/erase lifecycle (CDAGManager::PruneDAGData) erases exactly
+// the persisted vertices whose height is STRICTLY BELOW the prune line
+// (`snap.height < nPruneBelow`) and persists that same line as the durable DAG
+// PRUNE FLOOR (WriteDAGPruneFloor(nPruneBelow), in the SAME atomic commit).
+// That marker has exactly ONE writer - the erase lifecycle - so a vertex below
+// it is legitimately row-absent by the lifecycle's own contract, while any
+// absence at or above it is unexplained loss.
+//
+// The predicate deliberately does NOT read `dagcleanheight`: that key is ALSO
+// written by Shutdown() with the CURRENT TIP and erases nothing (and restored by
+// the prune rollback), so "height < ReadDAGCleanHeight()" proves only that the
+// vertex is old enough, not that it was erased. Reading it let a single clean
+// shutdown turn arbitrary row loss anywhere below the tip into FOUND /
+// PRUNED_BOUNDARY.
+//
+// Deliberately resident-free and value-only: no mapBlockIndex, no mapDAGData,
+// no resident pointer. Returns false (=> the caller fails closed) whenever the
+// erase marker is not certified or the requested vertex is not a known DAG-era
+// block.
+// R3 / C6 sections 1+3+5+6 — THE FINAL POSITIVE PRUNE PREDICATE.
+//
+// ROW_OBJECTIVELY_PRUNED(X) is admitted ONLY when the complete frozen positive
+// predicate verifies. Deliberately resident-free and value-only: no mapBlockIndex,
+// no mapDAGData, no resident pointer.
+//
+//   * a bare absence never proves a prune
+//   * a floor alone never proves a prune (floor CORROBORATES only)
+//   * an old erase marker never proves a prune (the legacy marker convention is
+//     retired as evidence; the historical records are neither read nor rewritten)
+//
+// Every failure is ROW_MISSING_UNEXPLAINED (fail closed) — never "present", never
+// "empty", never "zero state".
+static bool DAGRowObjectivelyPruned(CTxDB& db, const BlockIndexSnapshot& snap,
+                                   const uint256& hash, std::string* why)
+{
+    if (!snap.found || snap.hash != hash)
+    {
+        if (why) *why = "not a known authoritative vertex";
+        return false;
+    }
+    if (snap.height < FORK_HEIGHT_DAG)
+    {
+        if (why) *why = "pre-DAG height: owned by the pre-DAG provider";
+        return false;
+    }
+    // (0) The row must genuinely be ABSENT: this predicate attributes an absence and
+    //     must never be reachable for a present row. A present row is FOUND (not a
+    //     pruned boundary); a malformed row is CORRUPT and a storage failure is a
+    //     STORAGE error, and neither may be laundered into prune provenance.
+    {
+        CBlockDAGData row;
+        DAGRowTypedOutcome outcome = DAGRowTypedOutcome::ROW_PRESENT_VALID;
+        std::string rowDetail;
+        if (!db.ReadDAGLinksTyped(hash, &row, &outcome, &rowDetail))
+        {
+            if (why) *why = "typed DAG row read returned no classification";
+            return false;
+        }
+        if (outcome != DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED)
+        {
+            if (why) *why = outcome == DAGRowTypedOutcome::ROW_PRESENT_VALID
+                ? "row is present: a present row is not a pruned boundary"
+                : (outcome == DAGRowTypedOutcome::ROW_CORRUPT
+                    ? "malformed row: a corrupt row is never treated as a pruned absence"
+                    : "row store failure: a storage/iterator failure is never an absence");
+            return false;
+        }
+    }
+    // (1) Custody continuity. An unsupported/foreign writer invalidates trusted custody
+    //     even when the final application-visible rows look identical.
+    if (db.GetDAGCustodyState() != DAGCustodyState::VERIFIED)
+    {
+        if (why) *why = db.GetDAGCustodyState() == DAGCustodyState::SUSPENDED
+            ? "custody suspended (watermark continuity lost): prior prune evidence inadmissible"
+            : "cross-session custody unavailable: coverage does not survive";
+        return false;
+    }
+    // (2) Coverage certificate: positively certified domain, bound to this store,
+    //     this custody epoch and the current journal/counter state.
+    DAGCertVerifyResult certRes = DAGCertVerifyResult::NO_CERTIFICATE;
+    std::string certErr;
+    if (!db.VerifyDAGProvenanceCoverageShallow(&certRes, &certErr))
+    {
+        if (why) *why = "coverage certificate unreadable: " + certErr;
+        return false;
+    }
+    if (certRes != DAGCertVerifyResult::OK)
+    {
+        if (why) *why = "coverage certificate does not verify (result=" +
+                        std::to_string((int)certRes) + ")" + (certErr.empty() ? std::string() : ": " + certErr);
+        return false;
+    }
+    DAGProvenanceCertificate cert;
+    bool haveCert = false;
+    if (!db.ReadDAGProvenanceCertificate(&cert, &haveCert) || !haveCert || cert.epoch == 0)
+    {
+        if (why) *why = "coverage certificate missing or carries no custody epoch";
+        return false;
+    }
+    if (!db.IsDAGProvenanceDeepVerified())
+    {
+        if (why) *why = "certified domain not positively proven in this session (no certification scan)";
+        return false;
+    }
+    // (3) Inside the certified domain.
+    if (snap.height >= cert.hCert)
+    {
+        if (why) *why = "height outside the certified provenance domain [FORK_HEIGHT_DAG, " +
+                        std::to_string(cert.hCert) + ")";
+        return false;
+    }
+    // (4) Current durable incarnation for X.
+    uint64_t incarnation = 0;
+    bool haveIncarnation = false;
+    if (!db.ReadDAGRowIncarnation(hash, &incarnation, &haveIncarnation))
+    {
+        if (why) *why = "row incarnation unreadable";
+        return false;
+    }
+    if (!haveIncarnation || incarnation == 0)
+    {
+        if (why) *why = "no durable incarnation for X: no positive attribution is possible";
+        return false;
+    }
+    // (5) The per-row index must bind the CURRENT incarnation, not some earlier one.
+    uint64_t latestEvent = 0, latestIncarnation = 0;
+    bool haveLatest = false;
+    std::vector<uint64_t> rowEvents;
+    if (!db.ReadDAGPruneLatest(hash, &latestEvent, &latestIncarnation, &rowEvents, &haveLatest))
+    {
+        if (why) *why = "per-row prune index unreadable";
+        return false;
+    }
+    if (!haveLatest || latestEvent == 0 || latestIncarnation != incarnation)
+    {
+        if (why) *why = "no admissible prune evidence bound to the current incarnation " +
+                        std::to_string(incarnation);
+        return false;
+    }
+    // (6) The referenced event must exist, bind (X, N) and still be admissible.
+    DAGPruneEvent ev;
+    bool haveEvent = false;
+    if (!db.ReadDAGPruneEvent(latestEvent, &ev, &haveEvent))
+    {
+        if (why) *why = "prune event unreadable";
+        return false;
+    }
+    if (!haveEvent)
+    {
+        if (why) *why = "referenced prune event missing from the journal";
+        return false;
+    }
+    if (ev.hash != hash || ev.incarnation != incarnation)
+    {
+        if (why) *why = "prune event does not bind (X, N) for the current incarnation";
+        return false;
+    }
+    if (ev.superseded_by != 0)
+    {
+        if (why) *why = "prune event was superseded by incarnation " + std::to_string(ev.superseded_by);
+        return false;
+    }
+    if (ev.epoch == 0 || ev.epoch != cert.epoch)
+    {
+        if (why) *why = "prune event epoch is not the certified custody epoch (event=" +
+                        std::to_string(ev.epoch) + " cert=" + std::to_string(cert.epoch) + ")";
+        return false;
+    }
+    // (7) Journal integrity: the certified head/length must still hold and must contain E.
+    uint64_t head = 0, length = 0;
+    uint256 headHash;
+    if (!db.ReadDAGPruneJournal(&head, &length, &headHash))
+    {
+        if (why) *why = "prune journal unreadable";
+        return false;
+    }
+    if (length != cert.journalLength || headHash != cert.journalHeadHash)
+    {
+        if (why) *why = "prune journal is not the certified journal (head/length mismatch)";
+        return false;
+    }
+    if (latestEvent > head)
+    {
+        if (why) *why = "prune event id is beyond the journal head";
+        return false;
+    }
+    // (8) Height corroboration: the event binds height(X) exactly.
+    if (ev.height != snap.height)
+    {
+        if (why) *why = "prune event height does not match the authoritative height of X";
+        return false;
+    }
+    // (9) Floor / clean-height corroboration (corroboration ONLY: it establishes nothing).
+    int32_t floorValue = 0;
+    int32_t cleanHeight = 0;
+    const bool haveFloor = db.ReadDAGPruneFloor(floorValue);
+    const bool haveClean = db.ReadDAGCleanHeight(cleanHeight);
+    if (!haveFloor || floorValue <= 0)
+    {
+        if (why) *why = "no prune floor: the absence cannot be corroborated";
+        return false;
+    }
+    if (ev.floor_after <= 0 || floorValue < ev.floor_after)
+    {
+        if (why) *why = "prune floor is below the event's post-prune floor (floor must not regress)";
+        return false;
+    }
+    if (!(snap.height < ev.floor_after))
+    {
+        if (why) *why = "X is not below the event's post-prune floor";
+        return false;
+    }
+    if (haveClean && cleanHeight < ev.height)
+    {
+        if (why) *why = "clean height is below the event height";
+        return false;
+    }
+    std::string deepErr;
+    DAGCertVerifyResult deepRes = DAGCertVerifyResult::NO_CERTIFICATE;
+    if (!db.VerifyDAGProvenanceCoverage(&deepRes, &deepErr) || deepRes != DAGCertVerifyResult::OK)
+    {
+        if (why) *why = "coverage certification scan does not reproduce the certified digests (result=" +
+                        std::to_string((int)deepRes) + ")" + (deepErr.empty() ? std::string() : ": " + deepErr);
+        return false;
+    }
+    return true;
+}
+
+// R3 / C6 section 6 — test seam. Wraps the SAME static predicate used at the consensus
+// site with a value-only snapshot so the frozen predicate (not a re-implementation) can
+// be exercised directly against an isolated store.
+bool DAGRowObjectivelyPrunedForTest(CTxDB& db, const uint256& hash, int32_t height, std::string* why)
+{
+    BlockIndexSnapshot snap;
+    snap.found = true;
+    snap.hash = hash;
+    snap.height = height;
+    return DAGRowObjectivelyPruned(db, snap, hash, why);
+}
+
+// Authoritative live rule. Score TRUTH comes from the authority, never from
+// mapDAGData/mapBlockIndex residency, and score 0 is never substituted on
+// failure.
+CDAGManager::DAGParentScoreResult
+CDAGManager::ResolveParentScoreAuthoritative(const uint256& hashParent,
+                                             std::string* error,
+                                             DAGParentScorePolicy policy) const
+{
+    DAGParentScoreResult r;
+
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (!live || !live->IsOpen())
+    {
+        r.status = DAGParentScoreStatus::FAILURE;
+        if (error) *error = "DAG parent score: authoritative live authority unavailable";
+        return r;
+    }
+    BlockIndexSnapshot snap;
+    std::string e;
+    const BlockIndexHotStatus st = live->ResolveBlockSnapshot(hashParent, &snap, &e);
+    if (st == BlockIndexHotStatus::AUTHORITY_MISSING)
+    {
+        // NOT_FOUND is produced ONLY when the logical parent is genuinely absent
+        // from the authority. AUTHORITY_MISSING alone cannot prove that: it also
+        // covers an authority that is present but cannot expose the vertex. So
+        // require the independent typed parent authority to confirm absence.
+        // A vertex the authority DOES know (FOUND / NOT_ACTIVE) which the
+        // composite view could not resolve is inconsistent metadata, and an
+        // unavailable/changed-generational authority is a failure: both FAIL
+        // CLOSED. Absence must never hide an unhealthy/revoked/mismatched source.
+        BlockIndexAuthoritativeParentInfo pinfo;
+        std::string perr;
+        const BlockIndexAuthoritativeParentStatus pst =
+            live->ResolveParentInfo(hashParent, &pinfo, &perr);
+        if (pst == BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_FOUND)
+        {
+            // Legacy parity: a parent that is not an authority vertex at all is
+            // ranked at score 0 exactly like the legacy `mapBlockIndex.find == end`
+            // branch. This is NOT an authority failure.
+            r.status = DAGParentScoreStatus::NOT_FOUND;
+            r.score = 0;
+            return r;
+        }
+        r.status = DAGParentScoreStatus::FAILURE;
+        if (error) *error = "DAG parent score: parent absence not provable (status=" +
+                            std::to_string((int)pst) + "): " +
+                            (perr.empty() ? std::string("(no detail)") : perr);
+        return r;
+    }
+    if (st != BlockIndexHotStatus::OK)
+    {
+        r.status = DAGParentScoreStatus::FAILURE;
+        if (error) *error = "DAG parent score: parent metadata unavailable: " +
+                            (e.empty() ? std::string("(no detail)") : e);
+        return r;
+    }
+
+    // Post-DAG proof-of-stake exclusion: contributes no score. A legitimate
+    // FOUND(0), never conflated with a resolution failure.
+    if (snap.height >= FORK_HEIGHT_DAG && snap.fProofOfStake)
+    {
+        r.status = DAGParentScoreStatus::FOUND;
+        r.score = 0;
+        return r;
+    }
+
+    // Pre-DAG parent: the entropy-correct by-value accumulated trust that the
+    // legacy ColorBlock fallback consumes. NEVER the reciprocal-only
+    // derived.dat chainTrust, and no resident mapBlockIndex.
+    if (snap.height < FORK_HEIGHT_DAG)
+    {
+        uint256 trust = 0;
+        std::string terr;
+        if (!GetAuthoritativeAccumulatedChainTrust(hashParent, &trust, &terr))
+        {
+            r.status = DAGParentScoreStatus::FAILURE;
+            if (error) *error = "DAG parent score: pre-DAG accumulated trust unavailable: " +
+                                (terr.empty() ? std::string("(no detail)") : terr);
+            return r;
+        }
+        r.status = DAGParentScoreStatus::FOUND;
+        r.score = trust;
+        return r;
+    }
+
+    // Post-DAG proof-of-work parent: the exact former DAG-overwritten scalar.
+    // Source order (B-1):
+    //   1. the CERTIFIED-CURRENT canonical row, when the score authority is
+    //      healthy and holds the row (FOUND_CANONICAL_SCORE);
+    //   2. else, if the row's absence is explained by the ACCEPTED prune/erase
+    //      lifecycle (a known DAG-era vertex strictly below the certified prune
+    //      line), the value is reconstructed by value from immutable
+    //      authoritative inputs (Option-R) (FOUND_PRUNED_BOUNDARY);
+    //   3. else, if the retained set is merely NOT CERTIFIED in this session, the
+    //      same exact reconstruction applies (a certificate is bound BY an add,
+    //      so an uncertified session must still be able to color).
+    // Revoked/corrupt/unavailable authority, an absence NOT explained by the
+    // lifecycle (arbitrary row loss), and an unreconstructible scalar all FAIL
+    // CLOSED. Never substitute 0; never fall back to residency.
+    {
+        CTxDB db("r");
+        std::string herr;
+        const CTxDB::DAGScoreAuthorityStatus ast = db.GetDAGScoreAuthorityStatus(&herr);
+        // Positive evidence of damage (or an unreadable/absent store) fails closed
+        // in BOTH policies: it is never "just" a stale certificate.
+        if (ast == CTxDB::DAG_SCORE_AUTHORITY_CORRUPT ||
+            ast == CTxDB::DAG_SCORE_AUTHORITY_UNAVAILABLE)
+        {
+            r.status = DAGParentScoreStatus::FAILURE;
+            if (error) *error = "DAG parent score: score authority unhealthy: " +
+                                (herr.empty() ? std::string("(no detail)") : herr);
+            return r;
+        }
+        // Accepted direct-resolution contract: a revocation is FAILURE, never a
+        // value. Only the accepting mutation may treat it as re-certifiable,
+        // because that mutation's own commit republishes the certificate.
+        if (ast == CTxDB::DAG_SCORE_AUTHORITY_REVOKED &&
+            policy != DAGParentScorePolicy::MUTATION)
+        {
+            r.status = DAGParentScoreStatus::FAILURE;
+            if (error) *error = "DAG parent score: score authority unhealthy: " +
+                                (herr.empty() ? std::string("(no detail)") : herr);
+            return r;
+        }
+        // R3 / C6 section 1 — TYPED ROW READ. The legacy bool read collapses
+        // not-found, an I/O/iterator failure and a malformed payload into one
+        // false, which this consensus path then read as "row absent" and handed to
+        // the prune-attribution boundary. Those are three different facts: a
+        // malformed row is CORRUPT, a storage failure is a STORAGE error, and only
+        // a genuine absence may reach the boundary check. Both of the former fail
+        // closed here (a corrupt row is never "missing"; a storage failure is never
+        // "missing"), so no failure mode can be laundered into prune provenance.
+        CBlockDAGData data;
+        DAGRowTypedOutcome rowOutcome = DAGRowTypedOutcome::ROW_MISSING_UNEXPLAINED;
+        std::string rowDetail;
+        if (!db.ReadDAGLinksTyped(hashParent, &data, &rowOutcome, &rowDetail))
+        {
+            r.status = DAGParentScoreStatus::FAILURE;
+            if (error) *error = "DAG parent score: typed DAG row read returned no classification for " +
+                                hashParent.GetHex();
+            return r;
+        }
+        if (rowOutcome == DAGRowTypedOutcome::STORAGE_ERROR)
+        {
+            r.status = DAGParentScoreStatus::FAILURE;
+            if (error)
+                *error = "DAG parent score: DAG row storage failure for post-DAG parent " +
+                         hashParent.GetHex() + " (a storage/iterator failure is never an absence)" +
+                         (rowDetail.empty() ? std::string() : ": " + rowDetail);
+            return r;
+        }
+        if (rowOutcome == DAGRowTypedOutcome::ROW_CORRUPT)
+        {
+            r.status = DAGParentScoreStatus::FAILURE;
+            if (error)
+                *error = "DAG parent score: malformed DAG row for post-DAG parent " +
+                         hashParent.GetHex() + " (a corrupt row is never treated as absent)" +
+                         (rowDetail.empty() ? std::string() : ": " + rowDetail);
+            return r;
+        }
+        const bool fRowPresent = (rowOutcome == DAGRowTypedOutcome::ROW_PRESENT_VALID);
+        if (ast == CTxDB::DAG_SCORE_AUTHORITY_HEALTHY)
+        {
+            if (fRowPresent)
+            {
+                r.status = DAGParentScoreStatus::FOUND;
+                r.score = data.nDAGScore;
+                r.source = DAGParentScoreSource::CANONICAL_ROW;
+                return r;
+            }
+            // Healthy certificate, row gone. R3 / C6: the absence is admitted as
+            // ROW_OBJECTIVELY_PRUNED only when the COMPLETE frozen positive predicate
+            // verifies (incarnation-bound prune event, admissible custody epoch,
+            // certified domain, verified certificate, verified custody watermark,
+            // corroborating floor). Every other missing row is ROW_MISSING_UNEXPLAINED
+            // and fails closed: a bare absence, a floor alone and a legacy erase marker
+            // prove nothing.
+            std::string whyUnexplained;
+            if (!DAGRowObjectivelyPruned(db, snap, hashParent, &whyUnexplained))
+            {
+                r.status = DAGParentScoreStatus::FAILURE;
+                if (error)
+                {
+                    *error = "DAG parent score: canonical DAG score row absent for post-DAG parent " +
+                             hashParent.GetHex() +
+                             " (ROW_MISSING_UNEXPLAINED: no positive bound prune evidence)";
+                    if (!whyUnexplained.empty()) *error += ": " + whyUnexplained;
+                }
+                return r;
+            }
+        }
+        // Non-binding certificate (uncertified, or a revocation in the accepting
+        // mutation) or an explained pruned boundary: reconstruct the exact former
+        // scalar by value and bind it to one stable source identity.
+        uint256 tokenBefore, tokenAfter;
+        if (!db.ReadDAGSourceStateId(tokenBefore))
+        {
+            r.status = DAGParentScoreStatus::FAILURE;
+            if (error) *error = "DAG parent score: boundary reconstruction requires a bound source token";
+            return r;
+        }
+        BoundaryScoreResult bres;
+        std::string berr;
+        AuthoritativeDAGRecolorSource bsrc(db);
+        const bool fReconstructed = bsrc.ReconstructBoundaryScore(hashParent, &bres, &berr);
+        if (!fReconstructed ||
+            !bres.valid || bres.hash != hashParent || bres.height != snap.height)
+        {
+            r.status = DAGParentScoreStatus::FAILURE;
+            if (error) *error = "DAG parent score: boundary scalar reconstruction unavailable for post-DAG parent " +
+                                hashParent.GetHex() + ": " +
+                                (berr.empty() ? std::string("identity binding mismatch") : berr);
+            return r;
+        }
+        // Source binding: the reconstruction must have been made at ONE stable
+        // authoritative source identity (a concurrent source advance invalidates
+        // the value rather than being silently accepted).
+        if (!db.ReadDAGSourceStateId(tokenAfter) || tokenAfter != tokenBefore)
+        {
+            r.status = DAGParentScoreStatus::FAILURE;
+            if (error) *error = "DAG parent score: boundary reconstruction source token changed for post-DAG parent " +
+                                hashParent.GetHex();
+            return r;
+        }
+        r.status = DAGParentScoreStatus::FOUND;
+        r.score = bres.score;
+        r.source = (ast == CTxDB::DAG_SCORE_AUTHORITY_HEALTHY)
+                       ? DAGParentScoreSource::PRUNED_BOUNDARY
+                       : DAGParentScoreSource::DEGRADED_CERTIFICATE_BOUNDARY;
+        return r;
+    }
+}
+
 void CDAGManager::ColorBlock(CBlockIndex* pindex)
 {
+    std::string error;
+    (void)ColorBlockImpl(pindex, false, &error);
+}
+
+bool CDAGManager::ColorBlockAuthoritative(CBlockIndex* pindex, std::string* error)
+{
+    // The authoritative accept path. Mode is decided by the authoritative
+    // startup flag; outside it this is exactly the legacy coloring and cannot
+    // fail.
+    return ColorBlockImpl(pindex, g_fAuthoritativeStartup, error);
+}
+
+bool CDAGManager::ColorBlockImpl(CBlockIndex* pindex, bool fAuthoritativeParentScore,
+                                 std::string* error)
+{
+    if (error) error->clear();
     std::map<uint256, CBlockIndex*>& mapBlockIndex = RecolorBlockIndex();
     LOCK(cs_dag);
 
     if (!pindex || !pindex->phashBlock)
-        return;
+        return true;
     if (pindex->nHeight >= FORK_HEIGHT_DAG && pindex->IsProofOfStake())
-        return;
+        return true;
 
     uint256 hash = pindex->GetBlockHash();
     auto it = mapDAGData.find(hash);
     if (it == mapDAGData.end())
-        return;
+        return true;
 
     CBlockDAGData& data = it->second;
     const std::vector<uint256>& vParents = data.vDAGParents;
@@ -308,7 +847,7 @@ void CDAGManager::ColorBlock(CBlockIndex* pindex)
         // Genesis or pre-DAG block: always blue
         data.fBlue = true;
         data.nDAGScore = pindex->GetBlockTrust();
-        return;
+        return true;
     }
 
     // Find selected parent = parent with highest DAG score
@@ -318,20 +857,18 @@ void CDAGManager::ColorBlock(CBlockIndex* pindex)
 
     for (const uint256& hashParent : vParents)
     {
-        uint256 nParentScore = 0;
-        auto pit = mapDAGData.find(hashParent);
-        if (pit != mapDAGData.end())
-        {
-            nParentScore = pit->second.nDAGScore;
-        }
-        else
-        {
-            // Pre-DAG parent: use accumulated chain trust as base score
-            std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashParent);
-            if (mi != mapBlockIndex.end() &&
-                !(mi->second->nHeight >= FORK_HEIGHT_DAG && mi->second->IsProofOfStake()))
-                nParentScore = mi->second->nChainTrust;
-        }
+        // F2: ONE logical parent-score resolver. Legacy/canvas mode is
+        // byte-identical to the historical resident rule; authoritative mode
+        // reads the certified authority and NEVER substitutes 0 on failure.
+        // B-1: this is the ACCEPT-path coloring, so a non-binding certificate is
+        // resolved by exact boundary reconstruction instead of bricking the
+        // node; the mutation's commit re-certifies it.
+        DAGParentScoreResult pres =
+            ResolveDagParentScore(hashParent, fAuthoritativeParentScore, error,
+                                  DAGParentScorePolicy::MUTATION);
+        if (pres.status == DAGParentScoreStatus::FAILURE)
+            return false;
+        const uint256 nParentScore = pres.score;
 
         if (nParentScore > nBestParentScore ||
             (nParentScore == nBestParentScore && (hashSelectedParent == 0 || hashParent < hashSelectedParent)))
@@ -349,7 +886,7 @@ void CDAGManager::ColorBlock(CBlockIndex* pindex)
         else
             data.nDAGScore = pindex->GetBlockTrust();
         data.fBlue = true;
-        return;
+        return true;
     }
 
     // Inherit blue set from selected parent
@@ -421,6 +958,7 @@ void CDAGManager::ColorBlock(CBlockIndex* pindex)
         }
     }
     data.nDAGScore = nScore;
+    return true;
 }
 
 
@@ -1255,6 +1793,12 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture
 
     int nPruned = 0;
     std::vector<uint256> vToErase;
+    // R3 / C6 section 3: the height of each vertex being pruned, captured at
+    // selection time from the SAME authoritative by-value resolution that already
+    // decides prunability (or the legacy resident height). It is the only place
+    // this value exists: the row payload carries no height, and the prune-event
+    // journal entry must bind height(X) exactly. Parallel to vToErase.
+    std::vector<int32_t> vToEraseHeights;
 
     if (g_fAuthoritativeStartup)
     {
@@ -1306,7 +1850,10 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture
                 }
             }
             if (snap.height < nPruneBelow)
+            {
                 vToErase.push_back(pair.first);
+                vToEraseHeights.push_back(snap.height);
+            }
         }
     }
     else
@@ -1322,7 +1869,10 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture
                 continue;
 
             if (mi->second->nHeight < nPruneBelow)
+            {
                 vToErase.push_back(pair.first);
+                vToEraseHeights.push_back(mi->second->nHeight);
+            }
         }
     }
 
@@ -1367,8 +1917,18 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture
                     return false;
                 }
                 rollbackCapture->records.push_back(std::make_pair(vToErase[i], pre));
+                int preOrigin = -1; bool preOriginPresent = false;
+                if (!txdb.ReadDAGRowErase(vToErase[i], &preOrigin, &preOriginPresent))
+                {
+                    fprintf(stderr, "PruneDAGData: S3 prune rollback row-erase pre-image read failed for %s\n",
+                           vToErase[i].ToString().substr(0,20).c_str()); fflush(stderr);
+                    txdb.TxnAbort();
+                    return false;
+                }
+                rollbackCapture->rowEraseOrigins.push_back(preOriginPresent ? preOrigin : -1);
             }
             rollbackCapture->cleanHeightPresent = txdb.ReadDAGCleanHeight(rollbackCapture->cleanHeight);
+            rollbackCapture->pruneFloorPresent = txdb.ReadDAGPruneFloor(rollbackCapture->pruneFloor);
         }
         if (g_testDagPruneFailStage == 2)
         {
@@ -1380,11 +1940,19 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture
         // advances FROM (the ADD envelope's own source commit ran earlier).
         uint256 prunePreToken;
         txdb.ReadDAGSourceStateId(prunePreToken);
-        for (const uint256& hash : vToErase)
-            if (!txdb.EraseDAGLinks(hash))
+        if (vToEraseHeights.size() != vToErase.size())
+        {
+            fprintf(stderr, "PruneDAGData: S3 prune height/vertex capture mismatch (%d vs %d)\n",
+                   (int)vToEraseHeights.size(), (int)vToErase.size()); fflush(stderr);
+            txdb.TxnAbort();
+            return false;
+        }
+        for (size_t i = 0; i < vToErase.size(); ++i)
+            if (!txdb.EraseDAGLinks(vToErase[i], DAGRowEraseOrigin::PRUNE,
+                                    vToEraseHeights[i], nPruneBelow))
             {
                 fprintf(stderr, "PruneDAGData: S3 prune topology/child-count erase failed for %s\n",
-                       hash.ToString().substr(0,20).c_str()); fflush(stderr);
+                       vToErase[i].ToString().substr(0,20).c_str()); fflush(stderr);
                 txdb.TxnAbort();
                 return false;
             }
@@ -1423,6 +1991,16 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture
             txdb.TxnAbort();
             return false;
         }
+        // F2 erase provenance: the same atomic commit persists the ERASE FLOOR of
+        // THIS erasure. Sole writer of this key is the erase lifecycle, so a
+        // below-floor absence is attributable to it; no non-erase site (Shutdown)
+        // may advance it.
+        if (!txdb.WriteDAGPruneFloor(nPruneBelow))
+        {
+            fprintf(stderr, "PruneDAGData: S3 prune erase-floor write failed\n"); fflush(stderr);
+            txdb.TxnAbort();
+            return false;
+        }
         if (g_testFailDagPruneCommit || !txdb.TxnCommit())
         {
             fprintf(stderr, "PruneDAGData: S3 prune final commit failed\n"); fflush(stderr);
@@ -1437,11 +2015,15 @@ bool CDAGManager::PruneDAGData(CTxDB& txdb, int nHeight, DagPruneRollbackCapture
     }
     else
     {
-        for (const uint256& hash : vToErase)
-            if (!txdb.EraseDAGLinks(hash)) { txdb.TxnAbort(); return false; }
+        if (vToEraseHeights.size() != vToErase.size())
+            return false;
+        for (size_t i = 0; i < vToErase.size(); ++i)
+            if (!txdb.EraseDAGLinks(vToErase[i], DAGRowEraseOrigin::PRUNE,
+                                    vToEraseHeights[i], nPruneBelow)) { txdb.TxnAbort(); return false; }
 
         // Persist prune height so GetBlueSet boundary check survives restart.
         if (!txdb.WriteDAGCleanHeight(nPruneBelow) ||
+            !txdb.WriteDAGPruneFloor(nPruneBelow) ||
             !txdb.WriteDAGSourceStateId(dagSourcePost) ||
             g_testFailDagPruneCommit || !txdb.TxnCommit())
             return false;
@@ -1887,18 +2469,31 @@ int CDAGManager::InferLocalK(const uint256& hashBlock) const
 
 void CDAGManager::ColorBlockDAGKnight(CBlockIndex* pindex)
 {
+    std::string error;
+    (void)ColorBlockDAGKnightImpl(pindex, false, &error);
+}
+
+bool CDAGManager::ColorBlockDAGKnightAuthoritative(CBlockIndex* pindex, std::string* error)
+{
+    return ColorBlockDAGKnightImpl(pindex, g_fAuthoritativeStartup, error);
+}
+
+bool CDAGManager::ColorBlockDAGKnightImpl(CBlockIndex* pindex, bool fAuthoritativeParentScore,
+                                          std::string* error)
+{
+    if (error) error->clear();
     std::map<uint256, CBlockIndex*>& mapBlockIndex = RecolorBlockIndex();
     LOCK(cs_dag);
 
     if (!pindex || !pindex->phashBlock)
-        return;
+        return true;
     if (pindex->nHeight >= FORK_HEIGHT_DAG && pindex->IsProofOfStake())
-        return;
+        return true;
 
     uint256 hash = pindex->GetBlockHash();
     auto it = mapDAGData.find(hash);
     if (it == mapDAGData.end())
-        return;
+        return true;
 
     CBlockDAGData& data = it->second;
     const std::vector<uint256>& vParents = data.vDAGParents;
@@ -1908,7 +2503,7 @@ void CDAGManager::ColorBlockDAGKnight(CBlockIndex* pindex)
         data.fBlue = true;
         data.nDAGScore = pindex->GetBlockTrust();
         data.nInferredK = 0;
-        return;
+        return true;
     }
 
     uint256 hashSelectedParent;
@@ -1916,17 +2511,14 @@ void CDAGManager::ColorBlockDAGKnight(CBlockIndex* pindex)
 
     for (const uint256& hashParent : vParents)
     {
-        uint256 nParentScore = 0;
-        auto pit = mapDAGData.find(hashParent);
-        if (pit != mapDAGData.end())
-            nParentScore = pit->second.nDAGScore;
-        else
-        {
-            std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashParent);
-            if (mi != mapBlockIndex.end() &&
-                !(mi->second->nHeight >= FORK_HEIGHT_DAG && mi->second->IsProofOfStake()))
-                nParentScore = mi->second->nChainTrust;
-        }
+        // F2: ONE logical parent-score resolver (see ColorBlockImpl). B-1: the
+        // same accept-path policy applies.
+        DAGParentScoreResult pres =
+            ResolveDagParentScore(hashParent, fAuthoritativeParentScore, error,
+                                  DAGParentScorePolicy::MUTATION);
+        if (pres.status == DAGParentScoreStatus::FAILURE)
+            return false;
+        const uint256 nParentScore = pres.score;
 
         bool fIsPrimary = (hashParent == vParents[0]);
         if (nParentScore > nBestParentScore ||
@@ -1946,7 +2538,7 @@ void CDAGManager::ColorBlockDAGKnight(CBlockIndex* pindex)
             data.nDAGScore = pindex->GetBlockTrust();
         data.fBlue = true;
         data.nInferredK = 0;
-        return;
+        return true;
     }
 
     // DAGKNIGHT: Infer local k from DAG structure
@@ -2016,4 +2608,5 @@ void CDAGManager::ColorBlockDAGKnight(CBlockIndex* pindex)
             nScore = nScore + mi->second->GetBlockTrust();
     }
     data.nDAGScore = nScore;
+    return true;
 }

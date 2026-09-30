@@ -73,6 +73,52 @@ bool ResolveAuthoritativeActiveBlock(const uint256& hash,
                                      BlockIndexSnapshot* out,
                                      std::string* error);
 
+// ---------------------------------------------------------------------------
+// R4 — AUTHORITY_READY: ONE lifecycle readiness barrier (not a decorative flag).
+//
+// The six frozen prerequisites are evaluated against REAL live state at the end of
+// InitBlockIndexAuthoritative; READY is published only when every one of them holds. Every
+// consensus-sensitive consumer waits on this barrier and must not cross before it. This is
+// lifecycle readiness only: FINALITY_EPOCH_OWNER_READY contributes the readiness of its
+// already-frozen lifecycle condition and NOTHING finality-semantic (no late-vote semantics,
+// no equivocation rule, no certificate denominator, no FINALITY_MIN_VOTERS, no
+// irreversibility definition, no private NullStake semantics).
+// ---------------------------------------------------------------------------
+struct AuthorityReadyPrerequisites
+{
+    bool durableIndexLoaded;                 // V2 durable index loaded (selected generation)
+    bool immutableAuthorityAvailable;        // immutable authority available (live authority open)
+    bool dagDurableStateRestored;            // DAG durable state restored/validated
+    bool trustProjectionReconciled;          // R2 trust projection reconciled
+    bool finalityEpochOwnerLifecycleReady;   // FINALITY_EPOCH_OWNER_READY lifecycle condition
+    bool provenanceCertificationComplete;    // R3 provenance/projection certification complete
+    AuthorityReadyPrerequisites()
+        : durableIndexLoaded(false), immutableAuthorityAvailable(false),
+          dagDurableStateRestored(false), trustProjectionReconciled(false),
+          finalityEpochOwnerLifecycleReady(false), provenanceCertificationComplete(false) {}
+    // First unmet prerequisite ("" when all are satisfied).
+    std::string WhyNotReady() const;
+};
+
+// Publish READY only when every prerequisite holds. Never marks a partially ready node.
+bool AuthorityReadyMarkIfSatisfied(const AuthorityReadyPrerequisites& p, std::string* detail);
+
+bool AuthorityReadyIsSet();
+
+// Blocking consumer gate. Returns true only when READY has been published. In legacy
+// (non-authoritative) operation the barrier is not applicable and returns true immediately.
+bool AuthorityReadyWait(uint64_t timeoutMs, std::string* error);
+
+// Consumer-side gate used by the lifecycle consumers in init.cpp: waits for the barrier and
+// returns false when it did not become ready, so the caller fails the startup explicitly.
+bool AuthorityReadyConsumerEnter(const char* consumer, std::string* error);
+
+// Test seams (never used on a production path).
+void AuthorityReadyResetForTest();
+// Refusal detail of the last publication attempt (diagnostics only).
+std::string AuthorityReadyRefusalDetail();
+std::string AuthorityReadyStateName();
+
 // init.cpp can build a BlockIndexActiveChainReader for HReg + wallet rescan
 // against the SAME selected generation (no second CURRENT open). Empty/0 if not
 // in authoritative mode.
@@ -125,12 +171,23 @@ void SetDagObserverBoundaryHookForTest(DagObserverBoundaryHook hook);
 // selection, plus reciprocal-target trust below POEM.
 uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap);
 
-// R2c.2s/S2: bounded authoritative accumulated chainTrust for a retained hash.
-// Returns in *out the exact accumulated legacy nChainTrust value that the real
-// ColorBlock pre-DAG parent fallback consumes, computed by walking the active
-// chain (bounded by the fixed pre-DAG boundary; no all-history cache, no
-// resident mapBlockIndex). Returns false on authority failure or if the hash is
-// not resolvable as an active authoritative vertex.
+// R2c.2s/S2 (repaired): bounded authoritative accumulated chainTrust for the
+// REQUESTED HASH'S OWN PRE-DAG ANCESTRY. Returns in *out the exact accumulated
+// legacy nChainTrust value that the real ColorBlock pre-DAG parent fallback
+// consumes, computed as SUM GetAuthoritativeBlockTrust(X) over the hash-driven
+// ancestry genesis -> ... -> hash resolved through the authoritative store's
+// persisted hashPrev links (BlockIndexV2Reader::LookupByHash + GetParent).
+// It is NOT the active chain at the same height: `PRE-DAG TRUST TRUTH !=
+// ACTIVE CHAIN AT SAME HEIGHT`, so a side-branch parent resolves to its own
+// branch trust. No all-history cache, no resident mapBlockIndex, no residency
+// and no score cache; O(depth) time bounded by the requested pre-DAG height and
+// O(1) temporary memory.
+// FAILS CLOSED (false) on: reader unavailable; requested hash absent or
+// identity-mismatched; requested hash not pre-DAG; any non-FOUND reader status;
+// a claimed parent (authoritative hashPrev != 0) that is absent, unreadable, or
+// contradicts the child's hash/height. A true chain start is recognised ONLY
+// from the persisted authoritative `hashPrev == 0`; absence is never
+// reinterpreted as canonical genesis.
 bool GetAuthoritativeAccumulatedChainTrust(const uint256& hash,
                                            uint256* out, std::string* error);
 

@@ -2471,6 +2471,7 @@ const char* ProcessBlockRejectReasonName(ProcessBlockRejectReason reason)
     case PBREJECT_OPERATOR_INVALIDATED: return "OPERATOR_INVALIDATED";
     case PBREJECT_ACCEPTBLOCK_FALSE: return "ACCEPTBLOCK_FALSE";
     case PBREJECT_UNKNOWN_FALSE: return "UNKNOWN_FALSE";
+    case PBREJECT_DAG_PARENT_STRUCTURAL: return "DAG_PARENT_STRUCTURAL";
     case PBREJECT_AUTHORITY_UNAVAILABLE: return "AUTHORITY_UNAVAILABLE";
     }
     return "UNKNOWN_FALSE";
@@ -8692,7 +8693,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         {
             CBlockIndex* pindex = *rit;
             if (pindex->nHeight >= FORK_HEIGHT_DAG && pindex->phashBlock &&
-                !txdbDAGClean.EraseDAGLinks(pindex->GetBlockHash()))
+                !txdbDAGClean.EraseDAGLinks(pindex->GetBlockHash(), DAGRowEraseOrigin::REORGANIZE))
             {
                 txdbDAGClean.TxnAbort();
                 return AbortDagSourcePersistence("Reorganize: DAG-link erase write failed; shutting down");
@@ -9371,12 +9372,27 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             fDAGDataInitialized = true;
             nDAGInitMs = GetTimeMillis() - nDAGTimer;
 
-            // IDAG Phase 4: Fork-gate between GHOSTDAG and DAGKNIGHT coloring
+            // IDAG Phase 4: Fork-gate between GHOSTDAG and DAGKNIGHT coloring.
+            // F2: the accept path resolves every DAG parent score from the
+            // authoritative source (never from mapDAGData/mapBlockIndex
+            // residency) and fails closed on authority failure instead of
+            // silently ranking a nonresident parent at score 0.
             nDAGTimer = GetTimeMillis();
-            if (pindexNew->nHeight >= FORK_HEIGHT_DAGKNIGHT)
-                g_dagManager.ColorBlockDAGKnight(pindexNew);
-            else
-                g_dagManager.ColorBlock(pindexNew);
+            {
+                std::string dagParentScoreError;
+                const bool fDagColored =
+                    (pindexNew->nHeight >= FORK_HEIGHT_DAGKNIGHT)
+                        ? g_dagManager.ColorBlockDAGKnightAuthoritative(pindexNew, &dagParentScoreError)
+                        : g_dagManager.ColorBlockAuthoritative(pindexNew, &dagParentScoreError);
+                if (!fDagColored)
+                {
+                    g_dagManager.RemoveBlockDAGData(hash);
+                    if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                    return AbortDagSourcePersistence(
+                        ("AddToBlockIndex: authoritative DAG parent-score resolution failed; "
+                         "shutting down: " + dagParentScoreError).c_str());
+                }
+            }
             nDAGColorMs = GetTimeMillis() - nDAGTimer;
 
             nDAGTimer = GetTimeMillis();
@@ -9562,6 +9578,18 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
 
     LOCK(cs_main);
 
+    // R4 — AUTHORITY_READY consumer gate (main.cpp trust comparison #1, ProcessMessage block
+    // acceptance). Owner-authorized R4 hunk ONLY: no consensus-sensitive trust comparison may
+    // execute before the barrier.
+    {
+        std::string authorityGateErr;
+        if (!AuthorityReadyConsumerEnter("main_trust_comparison_new_best", &authorityGateErr))
+        {
+            printf("R4 consumer gate: %s\n", authorityGateErr.c_str());
+            return false;
+        }
+    }
+
     // New best
     if (pindexNew->nChainTrust > nBestChainTrust)
     {
@@ -9578,7 +9606,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                     if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
                     return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback TxnBegin failed; shutting down");
                 }
-                txdbDAGClean.EraseDAGLinks(hash);
+                txdbDAGClean.EraseDAGLinks(hash, DAGRowEraseOrigin::FAILED_ADD_CLEANUP);
                 for (const uint256& hashParent : vDAGParents)
                 {
                     if (g_dagManager.HasDAGData(hashParent) &&
@@ -9618,7 +9646,9 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                     // byte-for-byte in THIS batch (restoring parent child-counts
                     // through the same keyed relation update) and restore the
                     // durable clean-height marker exactly (write the pre-value,
-                    // or erase it when it was absent). The canonical reconcile
+                    // or erase it when it was absent) plus the F2 erase-provenance
+                    // marker with the same exact-pre-image rule. The canonical
+                    // reconcile
                     // below then runs over the fully restored pre-envelope
                     // canvas. All in ONE atomic batch; never fabricates records.
                     if (pruneRollbackCapture.committed)
@@ -9633,6 +9663,25 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                                 return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback prune-record restore failed; shutting down");
                             }
                         }
+                        // F2-B1-R: restore the exact row-erase provenance pre-image
+                        // of every restored row as well, so the rolled-back canvas
+                        // proves erase provenance exactly as it did before the
+                        // envelope (never the erased/prune-attributed state).
+                        for (size_t i = 0; i < pruneRollbackCapture.records.size(); ++i)
+                        {
+                            const uint256& rhash = pruneRollbackCapture.records[i].first;
+                            const int preOrigin = i < pruneRollbackCapture.rowEraseOrigins.size()
+                                ? pruneRollbackCapture.rowEraseOrigins[i] : -1;
+                            const bool markerRestored = preOrigin < 0
+                                ? txdbDAGClean.EraseDAGRowErase(rhash)
+                                : txdbDAGClean.WriteDAGRowErase(rhash, preOrigin);
+                            if (!markerRestored)
+                            {
+                                txdbDAGClean.TxnAbort();
+                                if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                                return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback row-erase provenance restore failed; shutting down");
+                            }
+                        }
                         const bool cleanRestored = pruneRollbackCapture.cleanHeightPresent
                             ? txdbDAGClean.WriteDAGCleanHeight(pruneRollbackCapture.cleanHeight)
                             : txdbDAGClean.EraseDAGCleanHeight();
@@ -9641,6 +9690,19 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                             txdbDAGClean.TxnAbort();
                             if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
                             return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback clean-height restore failed; shutting down");
+                        }
+                        // F2 erase provenance: restore the exact pre-envelope marker
+                        // state too (the pre-value, or absence when it was absent), so
+                        // the rolled-back canvas proves ERASE provenance exactly as it
+                        // did before the envelope - never the staged line.
+                        const bool floorRestored = pruneRollbackCapture.pruneFloorPresent
+                            ? txdbDAGClean.WriteDAGPruneFloor(pruneRollbackCapture.pruneFloor)
+                            : txdbDAGClean.EraseDAGPruneFloor();
+                        if (!floorRestored)
+                        {
+                            txdbDAGClean.TxnAbort();
+                            if (fDagTipDeltaTransaction) DiscardDagTipDeltaTransaction();
+                            return AbortDagSourcePersistence("AddToBlockIndex: DAG-link rollback erase-floor restore failed; shutting down");
                         }
                     }
                     std::vector<std::pair<int32_t,uint256>> rbScope;
@@ -10485,6 +10547,13 @@ static bool ActivateBestEligibleChain()
             continue; // not a tip
         if (IsBlockOperatorInvalid(pindex))
             continue;
+        // R4 — AUTHORITY_READY consumer gate (main.cpp trust comparison #2, tip candidacy).
+        // Owner-authorized R4 hunk ONLY.
+        {
+            std::string authorityGateErr;
+            if (!AuthorityReadyConsumerEnter("main_trust_comparison_tip_candidate", &authorityGateErr))
+                continue;   // no trust candidacy may be evaluated before AUTHORITY_READY
+        }
         if (pindex->nChainTrust <= nBestChainTrust)
             continue;
         CBlock block;
@@ -10670,6 +10739,62 @@ bool RecoverFromInvalidatedBestChain()
     return RollbackActiveChainTo(pHeal);
 }
 
+// ---------------------------------------------------------------------------
+// R5 / C8 — DUPLICATE DAG PARENT REJECT (unconditional full-vector prepass).
+//
+// Structural invalidity of an incoming block's DAG parent commitment is decided
+// from the block's COMPLETE parent vector alone, before any DAG interpretation
+// that could make acceptance depend on fork activation, engine mode,
+// legacy-vs-authoritative branch selection, materialization or residency.
+//
+// Contract (frozen C8): reject when any parent is the null hash, or when the
+// same parent hash appears more than once anywhere in the vector (global, not
+// adjacent). The vector is inspected verbatim: it is never mutated, sorted,
+// deduplicated, truncated, or reinterpreted, and later valid processing receives
+// exactly the original vector.
+//
+// State independence is deliberate and total: these helpers read only the block
+// itself. They do not resolve parents, do not touch mapBlockIndex, do not touch
+// any DAG RAM map (mapDAGData), do not read daglinks from the store, do not
+// query the hot/cold authority, and do not consult nDAGScore / nDAGOrder / fBlue
+// / nInferredK / selected-parent / trust or finality state.
+bool CheckDAGParentVectorStructure(const std::vector<uint256>& vParents, std::string* why)
+{
+    std::set<uint256> seenParents;
+    for (size_t i = 0; i < vParents.size(); ++i)
+    {
+        if (vParents[i] == uint256(0))
+        {
+            if (why) *why = strprintf("DAG parent[%u] is the null hash (zero DAG parent)", (unsigned int)i);
+            return false;
+        }
+        if (!seenParents.insert(vParents[i]).second)
+        {
+            if (why)
+                *why = strprintf("DAG parent[%u] %s is a duplicate DAG parent in the complete parent vector",
+                                 (unsigned int)i, vParents[i].ToString().substr(0, 20).c_str());
+            return false;
+        }
+    }
+    return true;
+}
+
+// Extract the committed DAG parent vector from a block's coinbase OP_RETURN
+// without touching any chain or DAG state. A block with no IDAG commitment
+// (every pre-fork legacy block, whose coinbase carries no IDAG tag) yields an
+// empty vector and is therefore structurally trivially valid here.
+std::vector<uint256> ExtractCommittedDAGParents(const CBlock& block)
+{
+    std::vector<uint256> vParents;
+    if (block.vtx.empty()) return vParents;
+    for (unsigned int i = 0; i < block.vtx[0].vout.size(); i++)
+    {
+        vParents = ExtractDAGParents(block.vtx[0].vout[i].scriptPubKey);
+        if (!vParents.empty()) break;
+    }
+    return vParents;
+}
+
 bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 {
     AssertLockHeld(cs_main);
@@ -10702,6 +10827,29 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         TraceProcessBlockReject(pfrom, pblock, PBREJECT_DUPLICATE_ORPHAN);
         ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_ALREADY_HAVE);
         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,20).c_str());
+    }
+
+    // R5/C8 — UNCONDITIONAL FULL-VECTOR DUPLICATE/ZERO-PARENT PREPASS.
+    // Runs before the operator gate, before orphan retention, before any
+    // IBD/deferred or pending-parent classification, before the preliminary
+    // CheckBlock, before DAG engine work and before legacy-vs-authoritative
+    // branch selection. A malformed vector is structurally invalid on its own
+    // and must never become an orphan, a deferred/pending block, or an outcome
+    // that differs by node state. Nothing here resolves a parent or reads
+    // chain/DAG/index state.
+    {
+        const std::vector<uint256> vDAGParentsPrepass = ExtractCommittedDAGParents(*pblock);
+        std::string sPrepassReason;
+        if (!CheckDAGParentVectorStructure(vDAGParentsPrepass, &sPrepassReason))
+        {
+            TraceProcessBlockReject(pfrom, pblock, PBREJECT_DAG_PARENT_STRUCTURAL);
+            ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
+            // Same peer-penalty treatment the existing ProcessBlock DAG-consensus
+            // rejection uses; no new ban policy is invented.
+            if (pfrom)
+                pfrom->Misbehaving(100);
+            return error("ProcessBlock() : %s", sPrepassReason.c_str());
+        }
     }
 
     // Operator-invalidation gate: reject before any orphan admission or
@@ -13725,7 +13873,14 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 pindexNew->nBlockPos = 0;
                 pindexNew->nChainTrust = pindexPrev->nChainTrust + pindexNew->GetBlockTrust();
 
-                if (pindexNew->nChainTrust > nBestChainTrust)
+                // R4 — AUTHORITY_READY consumer gate (main.cpp trust comparison #3, SPV header
+                // tip selection). Owner-authorized R4 hunk ONLY.
+                bool spvTrustGateOpen = true;
+                {
+                    std::string authorityGateErr;
+                    spvTrustGateOpen = AuthorityReadyConsumerEnter("main_trust_comparison_spv_header", &authorityGateErr);
+                }
+                if (spvTrustGateOpen && pindexNew->nChainTrust > nBestChainTrust)
                 {
                     pindexPrev->pnext = pindexNew;
                     pindexBest = pindexNew;

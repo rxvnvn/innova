@@ -1764,6 +1764,12 @@ authoritative_startup_ready:
         }
     };
 
+    // R4 — AUTHORITY_READY consumer gate: 'wallet_reaccept' must not cross before the barrier.
+    {
+        std::string authorityGateErr;
+        if (!AuthorityReadyConsumerEnter("wallet_reaccept", &authorityGateErr))
+            return InitError(authorityGateErr);
+    }
     // Add wallet transactions that aren't already in a block to mapTransactions
     pwalletMain->ReacceptWalletTransactions();
 
@@ -1782,6 +1788,12 @@ authoritative_startup_ready:
 
     // ********************************************************* Step 9: import blocks
 
+    // R4 — AUTHORITY_READY consumer gate: 'loadblock_import' must not cross before the barrier.
+    {
+        std::string authorityGateErr;
+        if (!AuthorityReadyConsumerEnter("loadblock_import", &authorityGateErr))
+            return InitError(authorityGateErr);
+    }
     if (mapArgs.count("-loadblock"))
     {
         uiInterface.InitMessage(_("Importing blockchain data file."));
@@ -1795,6 +1807,12 @@ authoritative_startup_ready:
         exit(0);
     }
 
+    // R4 — AUTHORITY_READY consumer gate: 'bootstrap_dat_import' must not cross before the barrier.
+    {
+        std::string authorityGateErr;
+        if (!AuthorityReadyConsumerEnter("bootstrap_dat_import", &authorityGateErr))
+            return InitError(authorityGateErr);
+    }
     fs::path pathBootstrap = GetDataDir() / "bootstrap.dat";
     if (fs::exists(pathBootstrap)) {
         uiInterface.InitMessage(_("Importing bootstrap blockchain data file."));
@@ -1931,6 +1949,12 @@ authoritative_startup_ready:
 
     if (!GetBoolArg("-nofinalityvoting", false) &&
         FORK_HEIGHT_FINALITY < MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT)
+    // R4 — AUTHORITY_READY consumer gate: 'finality_voter' must not cross before the barrier.
+    {
+        std::string authorityGateErr;
+        if (!AuthorityReadyConsumerEnter("finality_voter", &authorityGateErr))
+            return InitError(authorityGateErr);
+    }
         NewThread(ThreadFinalityVoter, NULL);
 
     // IDAG Phase 2+3: DAG manager initialized via global constructor
@@ -2098,6 +2122,12 @@ authoritative_startup_ready:
     }
 #endif
 
+    // R4 — AUTHORITY_READY consumer gate: 'service_network_threads' must not cross before the barrier.
+    {
+        std::string authorityGateErr;
+        if (!AuthorityReadyConsumerEnter("service_network_threads", &authorityGateErr))
+            return InitError(authorityGateErr);
+    }
     if (!NewThread(StartNode, NULL))
         InitError(_("Error: could not start node"));
 

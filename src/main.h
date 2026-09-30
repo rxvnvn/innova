@@ -460,6 +460,12 @@ extern int64_t nReserveBalance;
 extern int64_t nMinimumInputValue;
 extern bool fUseFastIndex;
 extern bool fImporting;
+
+// R5 / C8 — test-visible seam for the UNCONDITIONAL full-vector duplicate/zero DAG-parent
+// prepass and the state-free committed-parent extraction it consumes. These are the exact
+// production predicates used by ProcessBlock; tests exercise them through the real ingress.
+bool CheckDAGParentVectorStructure(const std::vector<uint256>& vParents, std::string* why);
+std::vector<uint256> ExtractCommittedDAGParents(const CBlock& block);
 extern bool fReindex;
 extern unsigned int nDerivationMethodIndex;
 extern unsigned int nCoinCacheSize;
