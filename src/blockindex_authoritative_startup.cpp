@@ -1426,34 +1426,6 @@ bool ReconstructAuthoritativeDAGFields(
     }
 }
 
-bool ReconstructAuthoritativeDAGScore(
-    const std::vector<std::pair<int32_t,uint256>>& heightSorted,
-    const std::map<uint256,std::vector<uint256>>& dagLinks,
-    std::map<uint256,uint256>* canonicalScores, std::string* error)
-{
-    if(!canonicalScores) { if(error) *error="recolor: null score output"; return false; }
-    canonicalScores->clear();
-    CTxDB db("r");
-    class SuppliedLinksSource : public AuthoritativeDAGRecolorSource {
-        const std::map<uint256,std::vector<uint256>>& links;
-    public:
-        SuppliedLinksSource(CTxDB& db,const std::map<uint256,std::vector<uint256>>& l)
-            :AuthoritativeDAGRecolorSource(db),links(l){}
-        bool Parents(const uint256& h,std::vector<uint256>* out,std::string* error) const override {
-            auto it=links.find(h);
-            if(it==links.end()) { if(error) *error="recolor: missing supplied links"; return false; }
-            *out=it->second; return true;
-        }
-    } source(db,dagLinks);
-    std::vector<std::pair<int32_t,uint256>> scope;
-    for(const auto& item:heightSorted) if(dagLinks.count(item.second)) scope.push_back(item);
-    if(scope.size()!=dagLinks.size()) { if(error) *error="recolor: incomplete supplied scope"; return false; }
-    std::vector<CanonicalDAGRecolorRecord> fields;
-    if(!ReconstructAuthoritativeDAGFields(scope,source,&fields,NULL,error)) return false;
-    for(const auto& record:fields) canonicalScores->emplace(record.hash,record.nDAGScore);
-    return true;
-}
-
 uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap)
 {
     CBigNum bnTarget;

@@ -198,7 +198,6 @@ public:
     explicit CDAGManager(std::map<uint256, CBlockIndex*>& index)
         : nPrunedBelowHeight(-1), recolorBlockIndex(&index) {}
     void LoadRecolorCanvas(const std::map<uint256, CBlockDAGData>& records);
-    uint256 RecolorStateDigestForTest() const;
 
     /** Initialize DAG data for a newly accepted block.
      *  Must be called under cs_main. Sets parents, registers children, updates tips.
@@ -330,31 +329,6 @@ public:
 
     /** Load persisted epoch states and curve-tree snapshots from LevelDB. */
     bool LoadEpochStates(CTxDB& txdb);
-
-    /** Rebuild DAG ordering (GHOSTDAG/DAGKNIGHT) from loaded data.
-     *  mutationPreview (R2c.2s/S5): explicit transaction-scoped preview; when
-     *  non-NULL it is validated fail-closed before use. */
-    bool RebuildDAGOrder(const DagMutationPreview* mutationPreview = NULL);
-
-    /** Rebuild DAG ordering incrementally (only blocks above nCleanHeight). */
-    bool RebuildDAGOrderIncremental(int nCleanHeight, const DagMutationPreview* mutationPreview = NULL);
-
-    /**
-     * After RebuildDAGOrder / RebuildDAGOrderIncremental, fold the
-     * recomputed canonical mapDAGData[hash].nDAGScore back into
-     * CBlockIndex::nChainTrust for every post-DAG proof-of-work block.
-     *
-     * During live acceptance (main.cpp:8813-8815) the same overwrite is
-     * applied so that DAG score drives best-chain comparison.  Restart
-     * rebuilds the score inside mapDAGData but currently leaves the
-     * block-index nChainTrust at its linear prefix-sum value.  This gap
-     * is the restart-trust divergence.
-     *
-     * The method is idempotent and safe to call on any loaded block
-     * index: pre-DAG blocks, post-DAG PoS blocks (rejected at fork
-     * height), and blocks without DAG metadata are left untouched.
-     */
-    void RestoreDAGTrustIntoChainTrust();
 
     /** Prune DAG data below nHeight - DAG_PRUNE_DEPTH, preserving epoch boundaries.
      *  rollbackCapture (optional, S3 authoritative mode only) receives the exact

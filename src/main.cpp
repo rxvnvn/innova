@@ -8882,25 +8882,17 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     // the remaining in-memory reorg completion path reaches its final success.
     if (fReorganizeSourcePost)
         SetDagTipDeltaFinalSourceStateId(reorganizeSourcePost);
-    bool fDAGReorg = false;
     for (auto rit = vDisconnect.rbegin(); rit != vDisconnect.rend(); ++rit)
     {
         CBlockIndex* pindex = *rit;
         if (LegacyDagConsensusAuthorityEnabled() && pindex->nHeight >= FORK_HEIGHT_DAG && pindex->phashBlock)
         {
             g_dagManager.RemoveBlockDAGData(pindex->GetBlockHash());
-            fDAGReorg = true;
         }
     }
-    // Re-color DAG blocks above fork point to ensure consistency with fresh-synced nodes
-    // LEGACY DAG RETIREMENT (Phase 1): DAG recolour is retired authority.
-    if (LegacyDagConsensusAuthorityEnabled() && fDAGReorg && pfork)
-    {
-        // R2c.2s/S5: mutation-internal synchronous consumer — explicit
-        // transaction-scoped preview threaded; fail-closed on validation.
-        if (!g_dagManager.RebuildDAGOrderIncremental(pfork->nHeight, mutationPreview))
-            return AbortDagSourcePersistence("Reorganize: S5 reorder consumer preview validation failed; shutting down");
-    }
+    // LEGACY DAG RETIREMENT (Phase 2 / Slice 1): the reorg-time DAG recolour
+    // consumer (RebuildDAGOrderIncremental) was retired and physically removed
+    // with its implementation.  Ordinary linear reorg publication is unaffected.
 
     // Disconnect shorter branch
     for (CBlockIndex* pindex : vDisconnect)

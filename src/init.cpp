@@ -1977,29 +1977,12 @@ authoritative_startup_ready:
             if (nPruneBelow > 0)
                 g_dagManager.SetPrunedBelowHeight(nPruneBelow);
         }
-        if (nDAGCleanHeight > 0)
-        {
-            printf("IDAG: Found DAG clean height %d, using incremental rebuild\n", nDAGCleanHeight);
-            g_dagManager.RebuildDAGOrderIncremental(nDAGCleanHeight);
-        }
-        else if (!g_dagManager.GetDAGTips().empty())
-        {
-            printf("IDAG: No clean height found, full DAG rebuild\n");
-            g_dagManager.RebuildDAGOrder();
-        }
-
-        // Canonical DAG trust replay: fold mapDAGData[hash].nDAGScore
-        // into CBlockIndex::nChainTrust for post-DAG PoW blocks, mirroring
-        // the live overwrite at main.cpp:8813-8815.  This closes the
-        // restart-trust divergence: on restart, nChainTrust was left at the
-        // linear-prefix value while live used the DAG score for best-chain
-        // comparison.  Safe for pre-DAG, post-DAG PoS, and blocks without
-        // DAG metadata — those are left unchanged.
-        g_dagManager.RestoreDAGTrustIntoChainTrust();
-        // Restore nBestChainTrust from the canonical tip — it may have
-        // been updated by the replay above.
-        if (pindexBest)
-            nBestChainTrust = pindexBest->nChainTrust;
+        // LEGACY DAG RETIREMENT (Phase 2 / Slice 1): the DAG order-rebuild
+        // (RebuildDAGOrder / RebuildDAGOrderIncremental) and the DAG score
+        // trust overwrite (RestoreDAGTrustIntoChainTrust) were retired and
+        // physically removed together with their implementation; DAG order
+        // and DAG score no longer drive nChainTrust or best-chain selection
+        // in any profile.  The prune-boundary seeding above is retained.
 
         std::vector<uint256> vTips = g_dagManager.GetDAGTips();
         printf("IDAG: DAG active at height %d, %d tips, %d entries\n",

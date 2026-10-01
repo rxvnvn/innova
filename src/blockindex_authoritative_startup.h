@@ -305,14 +305,6 @@ bool ReconstructAuthoritativeDAGFields(
     std::vector<CanonicalDAGRecolorRecord>* result,
     CanonicalDAGRecolorStats* stats, std::string* error);
 
-// Compatibility score projection for existing callers. The dagLinks keys are
-// the retained scope; extra ordering metadata does not extend that scope.
-bool ReconstructAuthoritativeDAGScore(
-    const std::vector<std::pair<int32_t,uint256>>& heightSorted,
-    const std::map<uint256,std::vector<uint256>>& dagLinks,
-    std::map<uint256,uint256>* canonicalScores,
-    std::string* error);
-
 // ---------------------------------------------------------------------------
 // S3 atomic authoritative full-field persistence.
 //
