@@ -3046,7 +3046,10 @@ bool CTxDB::LoadBlockIndex()
     }
 
     // IDAG Phase 2+3: Load DAG links (ordering deferred to init.cpp for incremental support)
-    g_dagManager.LoadDAGLinks(*this);
+    // LEGACY DAG RETIREMENT (Phase 1): the resident DAG graph map exists only to
+    // serve the dormant Legacy DAG engine; the retired profile does not populate it.
+    if (LegacyDagConsensusAuthorityEnabled())
+        g_dagManager.LoadDAGLinks(*this);
     {
         std::string dagStateError;
         if (!BootstrapDAGSourceStateId(&dagStateError))

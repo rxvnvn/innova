@@ -271,7 +271,10 @@ enum AcceptBlockRejectReason
     ABREJECT_DAG_PARENT,
     ABREJECT_DISK_SPACE,
     ABREJECT_WRITE_TO_DISK,
-    ABREJECT_ADD_TO_BLOCK_INDEX
+    ABREJECT_ADD_TO_BLOCK_INDEX,
+    // LEGACY DAG RETIREMENT (Phase 1): a block entering the DAG-only
+    // consensus domain while the Legacy DAG engine is retired is refused.
+    ABREJECT_LEGACY_DAG_RETIRED_DOMAIN
 };
 
 bool InitAcceptBlockRejectTrace(bool fEnabled);

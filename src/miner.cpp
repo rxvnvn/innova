@@ -162,7 +162,32 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
     ScopedMaterializedChain winnerChain;
     {
         LOCK2(cs_main, g_dagManager.cs_dag);
-        if (g_fAuthoritativeStartup)
+        if (g_fAuthoritativeStartup && !LegacyDagConsensusAuthorityEnabled())
+        {
+            // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is
+            // retired with the engine. The current consensus head is the
+            // authoritative ACTIVE CHAIN HEAD (hashBestChain), served by value from
+            // the live authority — no DAG selector, no sibling precedence and no
+            // nDAGOrder semantics are consulted, and the absence of DAG state never
+            // returns NULL.
+            std::map<uint256, CBlockIndex*>::iterator miTip = mapBlockIndex.find(hashBestChain);
+            if (miTip != mapBlockIndex.end() && miTip->second)
+            {
+                pindexPrev = miTip->second;
+            }
+            else
+            {
+                std::string matError;
+                pindexPrev = winnerChain.Acquire(GetAuthoritativeLiveAuthority(), hashBestChain, &matError);
+                if (!pindexPrev)
+                {
+                    fprintf(stderr, "CreateNewBlock: ERROR: authoritative head materialization unavailable: %s\n",
+                            matError.c_str()); fflush(stderr);
+                    return NULL;
+                }
+            }
+        }
+        else if (g_fAuthoritativeStartup)
         {
             // R2c.2/S6: authoritative primary selection. UNAVAILABLE fails
             // closed (no legacy selector, no resident pindexBest fallback).
@@ -206,14 +231,20 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
             {
                 // Defensive: LEGACY cannot be returned while authoritative
                 // mode is on; keep the historical shape for completeness.
-                pindexPrev = g_dagManager.SelectBestDAGTip();
+                // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector is not a
+                // consensus authority; the retired profile uses the ordinary linear
+                // head directly.
+                pindexPrev = LegacyDagConsensusAuthorityEnabled() ? g_dagManager.SelectBestDAGTip() : pindexBest;
                 if (!pindexPrev)
                     pindexPrev = pindexBest;
             }
         }
         else
         {
-            pindexPrev = g_dagManager.SelectBestDAGTip();
+            // LEGACY DAG RETIREMENT (Phase 1): the Legacy DAG tip selector is
+            // retired authority; the ordinary linear head is the current consensus
+            // head when the DAG engine is not the (scoped) authority.
+            pindexPrev = LegacyDagConsensusAuthorityEnabled() ? g_dagManager.SelectBestDAGTip() : pindexBest;
             if (!pindexPrev)
                 pindexPrev = pindexBest;
         }
@@ -233,6 +264,18 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
 
 
     int nHeight = pindexPrev->nHeight+1; // height of new block
+
+    // LEGACY DAG RETIREMENT (Phase 1) — FUTURE-ACTIVATION FIREWALL (production
+    // path): a template at or above the DAG activation height would enter the
+    // DAG-only consensus domain, which the retired profile does not support. Fail
+    // closed explicitly; never silently build a legacy template for it and never
+    // invoke the retired colouring/score/order engine.
+    if (LegacyDagRetiredDomainAtHeight(nHeight))
+    {
+        ++g_testLegacyDagRetiredDomainRefusals;
+        printf("CreateNewBlock: refusing block template at height %d: retired Legacy DAG consensus domain is unsupported\n", nHeight);
+        return NULL;
+    }
     if (fProofOfStake && nHeight >= FORK_HEIGHT_DAG)
     {
         if (fDebug && GetBoolArg("-printcoinstake"))
@@ -262,8 +305,10 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
         txNew.vout[0].SetEmpty();
     }
 
-    // IDAG Phase 2: Add DAG parent commitment to coinbase
-    if (nHeight >= FORK_HEIGHT_DAG)
+    // IDAG Phase 2: Add DAG parent commitment to coinbase.
+    // LEGACY DAG RETIREMENT (Phase 1): the merge-parent commitment is retired
+    // authority and is produced only inside the explicitly scoped profile.
+    if (LegacyDagConsensusAuthorityEnabled() && nHeight >= FORK_HEIGHT_DAG)
     {
         std::vector<uint256> vDAGParents;
 
@@ -529,7 +574,7 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
         // fees to the coinbase value.
         std::set<uint256> setDAGSiblingTxids;
         std::set<COutPoint> setDAGSiblingSpentOutpoints;
-        if (nHeight >= FORK_HEIGHT_DAG && pindexPrev->phashBlock)
+        if (LegacyDagConsensusAuthorityEnabled() && nHeight >= FORK_HEIGHT_DAG && pindexPrev->phashBlock)
         {
             std::set<uint256> siblings = g_dagManager.GetDAGSiblingBlocks(pindexPrev->GetBlockHash());
             CBlockDAGData parentDagData;
@@ -1279,7 +1324,22 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
     LOCK(cs_main);
 
     identity.hashBestChain = hashBestChain;
-    if (g_fAuthoritativeStartup)
+    if (!LegacyDagConsensusAuthorityEnabled())
+    {
+        // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is retired
+        // with the engine, so the CPU-mining work identity's primary parent is the
+        // authoritative ACTIVE CHAIN HEAD (hashBestChain). No DAG selector, sibling
+        // precedence or nDAGOrder state is consulted, and the absence of DAG state
+        // is never treated as unavailable authority.
+        CBlockIndex* pindexParent = pindexBest;
+        if (mapBlockIndex.count(hashBestChain)) pindexParent = mapBlockIndex[hashBestChain];
+        if (pindexParent)
+        {
+            identity.hashPrimaryParent = pindexParent->GetBlockHash();
+            identity.nHeight = pindexParent->nHeight + 1;
+        }
+    }
+    else if (g_fAuthoritativeStartup)
     {
         // R2c.2/S6: authoritative primary selection (external CLEAN context).
         // UNAVAILABLE marks the identity as not-current (fail closed); the
@@ -1325,7 +1385,8 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
     // CPUMiningBlockMatchesWorkIdentity would reject a legitimately built
     // template whose merge parent is authoritative-but-absent from setDAGTips,
     // and (b) a changed authoritative frontier would not invalidate stale work.
-    if (identity.nHeight >= FORK_HEIGHT_DAG)
+    // LEGACY DAG RETIREMENT (Phase 1): the DAG frontier tip set is retired authority.
+    if (LegacyDagConsensusAuthorityEnabled() && identity.nHeight >= FORK_HEIGHT_DAG)
     {
         if (g_fAuthoritativeStartup)
         {
@@ -1349,6 +1410,11 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
         }
     }
     identity.nTransactionsUpdated = mempool.GetTransactionsUpdated();
+    // LEGACY DAG RETIREMENT (Phase 1): the DAG source-state token is an artefact of
+    // the retired DAG-source envelope. In the retired profile its absence must not
+    // make the work identity unavailable (invalidation is carried by the structural
+    // fields: hashBestChain / hashPrimaryParent), while in the scoped profile the
+    // frozen fail-closed behaviour is unchanged.
     if (g_fAuthoritativeStartup)
     {
         // R2c.2/S7 / audit-D (OPEN D repair): the identity must be invalidated
@@ -1364,7 +1430,11 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
         uint256 sourceToken;
         CTxDB sourceDb("r");
         if (!sourceDb.ReadDAGSourceStateId(sourceToken))
-            identity.fSelectionUnavailable = true;
+        {
+            if (LegacyDagConsensusAuthorityEnabled())
+                identity.fSelectionUnavailable = true;
+            // retired profile: no DAG source token involvement (no dependency)
+        }
         else
             identity.hashDAGSourceState = sourceToken;
     }
@@ -1376,7 +1446,17 @@ bool IsCPUMiningCollateralStateReady()
     int nNextHeight = 0;
     {
         LOCK2(cs_main, g_dagManager.cs_dag);
-        if (g_fAuthoritativeStartup)
+        if (!LegacyDagConsensusAuthorityEnabled())
+        {
+            // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is
+            // retired; readiness is computed from the authoritative linear head.
+            CBlockIndex* pindexParent = pindexBest;
+            if (mapBlockIndex.count(hashBestChain)) pindexParent = mapBlockIndex[hashBestChain];
+            if (!pindexParent)
+                return false;
+            nNextHeight = pindexParent->nHeight + 1;
+        }
+        else if (g_fAuthoritativeStartup)
         {
             // R2c.2/S6: authoritative primary selection. UNAVAILABLE => not
             // ready (the miner waits; fail closed, no legacy fallback).

@@ -1963,7 +1963,7 @@ authoritative_startup_ready:
     // DAG trust comes from authoritative derived.dat chainTrust (A.10.1o); the
     // legacy mapBlockIndex-dependent RebuildDAGOrder/RestoreDAGTrustIntoChainTrust
     // are NOT applicable (no historical CBlockIndex graph exists).
-    if (!g_fAuthoritativeStartup &&
+    if (LegacyDagConsensusAuthorityEnabled() && !g_fAuthoritativeStartup &&
         pindexBest && pindexBest->nHeight >= FORK_HEIGHT_DAG)
     {
         // IDAG Phase 3: Check for clean height — use incremental rebuild if available

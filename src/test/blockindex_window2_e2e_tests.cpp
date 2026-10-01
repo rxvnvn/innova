@@ -49,6 +49,7 @@
 #include "blockindex_shadow_startup.h"
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
+#include "blockindex_authoritative_restart.h"
 #include <openssl/sha.h>
 #include <leveldb/db.h>
 #include <thread>
@@ -13436,6 +13437,448 @@ BOOST_AUTO_TEST_CASE(r5_structural_reject_dominates_orphan_and_deferred)
     }
     fImporting = fSavedImporting;
     fRegTestIbd = fSavedRti;
+}
+
+// ============================================================================
+// LEGACY DAG RETIREMENT — PHASE 1 focused tests.
+// The Legacy DAG engine is retired as a consensus authority. These tests drive
+// the REAL production ingress (ProcessBlock -> AcceptBlock) and the REAL
+// production mining path (CreateNewBlock); no test-local copy of the guard is
+// relied upon. The retired profile is forced through the test-only seam
+// (g_testForceLegacyDagRetired) and the DAG-only domain is forced with the
+// test-only height override (g_testForkHeightDagOverride), so mainnet semantics
+// are reproduced without touching a height constant.
+// ============================================================================
+
+BOOST_AUTO_TEST_CASE(p1_retirement_firewall_refuses_retired_dag_domain)
+{
+    CBlockIndex* tip = pindexBest;
+    if (mapBlockIndex.count(hashBestChain)) tip = mapBlockIndex[hashBestChain];
+    BOOST_REQUIRE(tip != NULL);
+    const bool fSavedRetired = g_testForceLegacyDagRetired;
+    const int  nSavedOverride = g_testForkHeightDagOverride;
+    const int  nBlockHeight = tip->nHeight + 1;   // successor height (>= 1 on this fixture)
+
+    // Helper: build one genuine PoW DAG-child of the tip and offer it to the REAL
+    // production ingress (ProcessBlock), reporting the observable outcome and the
+    // live retirement-firewall refusal count delta.
+    struct P1Attempt { bool processed; bool inIndex; bool dagRow; int refusals; };
+    CBlock* blocks[2] = { NULL, NULL };
+    P1Attempt res[2];
+    for (int k = 0; k < 2; ++k)
+    {
+        CBlock* b = BuildPoWBlock(tip, 9750 + (unsigned int)k);
+        BOOST_REQUIRE(b != NULL);
+        AttachDagParentsAndRemine(b, std::vector<uint256>(1, tip->GetBlockHash()));
+        blocks[k] = b;
+        g_testForceLegacyDagRetired = (k == 1);
+        // k == 0 -> explicitly scoped experimental profile (the harness default on
+        //           regtest): the block is NOT in the retired domain.
+        // k == 1 -> RETIRED profile with the DAG-only domain forced to start at the
+        //           block's own height (test-only height seam).
+        g_testForkHeightDagOverride = (k == 1) ? nBlockHeight : 0;
+        const int nBefore = g_testLegacyDagRetiredDomainRefusals;
+        const uint256 h = b->GetHash();
+        res[k].processed = true; res[k].inIndex = true;
+        {
+            LOCK(cs_main);
+            res[k].processed = ProcessBlock(NULL, b);
+            res[k].inIndex = mapBlockIndex.count(h) != 0;
+        }
+        {
+            std::map<uint256, CBlockDAGData> allDag;
+            std::string dagErr;
+            CTxDB dagDb;
+            const bool dagRead = dagDb.IterateDAGLinksStrict(allDag, &dagErr);
+            res[k].dagRow = dagRead ? (allDag.count(h) != 0) : true;
+        }
+        res[k].refusals = g_testLegacyDagRetiredDomainRefusals - nBefore;
+    }
+    g_testForceLegacyDagRetired = fSavedRetired;
+    g_testForkHeightDagOverride = nSavedOverride;
+
+    // CONTROL (scoped profile): the retirement firewall must NOT fire here.
+    BOOST_CHECK_MESSAGE(res[0].refusals == 0,
+        "control: the retirement firewall must not fire in the scoped experimental profile (refusals="
+        << res[0].refusals << ")");
+    // RETIRED profile inside the DAG-only domain: explicit fail-closed refusal.
+    BOOST_CHECK_MESSAGE(res[1].refusals == 1,
+        "FIREWALL: entering the retired DAG-only domain must be refused exactly once at the production ingress (refusals="
+        << res[1].refusals << ")");
+    BOOST_CHECK_MESSAGE(!res[1].processed,
+        "FIREWALL: a block in the retired Legacy DAG consensus domain must be refused (fail closed)");
+    BOOST_CHECK_MESSAGE(!res[1].inIndex,
+        "FIREWALL: the refused block must not enter the block index");
+    BOOST_CHECK_MESSAGE(!res[1].dagRow,
+        "FIREWALL: the retired Legacy DAG engine must NOT be executed (no DAG-links row may be written)");
+    BOOST_TEST_MESSAGE("P1_FIREWALL scoped_refusals=" << res[0].refusals
+                       << " retired_refusals=" << res[1].refusals
+                       << " refused=1 inIndex=0 dagRow=0 engine_executed=0 profile=retired domain_height="
+                       << nBlockHeight << " scoped_downstream=" << (res[0].processed ? 1 : 0));
+    delete blocks[0];
+    delete blocks[1];
+}
+
+BOOST_AUTO_TEST_CASE(p1_retirement_mining_is_linear_and_domain_refused)
+{
+    const bool fSavedRetired = g_testForceLegacyDagRetired;
+    const int  nSavedOverride = g_testForkHeightDagOverride;
+
+    // (a) RETIRED PROFILE, no DAG domain: the template must be built from the
+    //     current authoritative LINEAR head with no DAG merge-parent output and no
+    //     DAG selector / sibling / nDAGOrder involvement.
+    g_testForceLegacyDagRetired = true;
+    g_testForkHeightDagOverride = 0; // no domain override: the next height is linear
+    std::unique_ptr<CBlock> tmpl(CreateNewBlock(pwalletMain, false, NULL, NULL));
+    BOOST_REQUIRE_MESSAGE(tmpl.get() != NULL,
+        "mining must still produce a template in the retired profile (no DAG state required)");
+    CBlockIndex* linearHead = pindexBest;
+    if (mapBlockIndex.count(hashBestChain)) linearHead = mapBlockIndex[hashBestChain];
+    BOOST_REQUIRE(linearHead != NULL);
+    BOOST_CHECK_MESSAGE(tmpl->hashPrevBlock == linearHead->GetBlockHash(),
+        "mining must extend the authoritative linear head (" << tmpl->hashPrevBlock.ToString().substr(0, 20)
+        << " vs " << linearHead->GetBlockHash().ToString().substr(0, 20) << ")");
+    BOOST_CHECK_MESSAGE(tmpl->vtx.size() == 1,
+        "no DAG merge-parent output may be produced in the retired profile (vtx=" << tmpl->vtx.size() << ")");
+    BOOST_TEST_MESSAGE("P1_MINING head=linear parent=" << tmpl->hashPrevBlock.ToString().substr(0, 20)
+                       << " vtx=" << tmpl->vtx.size() << " dag_parent_output=0 height=" << linearHead->nHeight);
+
+    // (b) MINING FIREWALL: a template whose height enters the retired DAG-only
+    //     domain must be refused explicitly (never silently built as legacy), and
+    //     the refusal must be counted at the production mining site.
+    const int nBefore = g_testLegacyDagRetiredDomainRefusals;
+    g_testForkHeightDagOverride = linearHead->nHeight + 1; // next template height is in the domain
+    std::unique_ptr<CBlock> refused(CreateNewBlock(pwalletMain, false, NULL, NULL));
+    const int nDelta = g_testLegacyDagRetiredDomainRefusals - nBefore;
+    g_testForceLegacyDagRetired = fSavedRetired;
+    g_testForkHeightDagOverride = nSavedOverride;
+    BOOST_CHECK_MESSAGE(nDelta == 1,
+        "FIREWALL: the mining site must record exactly one retired-domain refusal (delta=" << nDelta << ")");
+    BOOST_CHECK_MESSAGE(refused.get() == NULL,
+        "FIREWALL: mining must refuse a template in the retired Legacy DAG consensus domain");
+    BOOST_TEST_MESSAGE("P1_MINING_FIREWALL refusals=" << nDelta << " domain_height=" << (linearHead->nHeight + 1));
+}
+
+BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
+{
+    // LEGACY DAG RETIREMENT (Phase 1): in the RETIRED profile the real
+    // authoritative startup must still succeed and publish AUTHORITY_READY without
+    // requiring dormant Legacy DAG provenance/custody certification or DAG durable
+    // score-authority health. The barrier is rebased onto the CURRENT consensus
+    // authority (V2 durable index + immutable authority + linear trust projection).
+    SetMockTime(1700001950);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    CBlockIndex* fork=pindexBest;
+    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xE500+fork->nHeight);
+    fork=MineRealDag(fork,0xE510);
+    const fs::path root=fs::temp_directory_path()/fs::unique_path("p1retired-%%%%-%%%%");
+    fs::create_directories(root/"snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis; bool retired;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock),retired(g_testForceLegacyDagRetired){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); g_testForceLegacyDagRetired=retired;
+            pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir=GetDataDir()/"txleveldb";
+    for(fs::directory_iterator it(liveDir),end;it!=end;++it)
+        if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root/"snapshot").string(),&src.dagLinks,&src.dagScores,&aerr),aerr);
+    src.foundDAGLinks=true;
+    src.blockDataDir=GetDataDir().string(); src.dagLinksDir=(root/"snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    AuthorityReadyResetForTest();
+    BOOST_REQUIRE(!AuthorityReadyIsSet());
+    g_testSuppressDagSourceAbort=true;
+    // THE RETIRED PROFILE: Legacy DAG authority disabled for the whole startup.
+    g_testForceLegacyDagRetired = true;
+    BOOST_CHECK_MESSAGE(!LegacyDagConsensusAuthorityEnabled(),
+        "retired seam must disable Legacy DAG consensus authority before startup");
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    BOOST_TEST_MESSAGE("P1_STARTUP authority_ready_state="<<AuthorityReadyStateName()
+        <<" published="<<(AuthorityReadyIsSet()?1:0)<<" profile=retired dag_custody_required=0");
+    BOOST_CHECK_MESSAGE(AuthorityReadyIsSet(),
+        "P1: the real authoritative startup must publish AUTHORITY_READY in the retired profile without "
+        "Legacy DAG provenance/custody certification (refusal detail: " << AuthorityReadyRefusalDetail() << ")");
+    const std::string readyDetail = AuthorityReadyRefusalDetail();
+    BOOST_CHECK_MESSAGE(readyDetail.find("dag") == std::string::npos &&
+                        readyDetail.find("custody") == std::string::npos &&
+                        readyDetail.find("provenance") == std::string::npos,
+        "P1: no readiness prerequisite may remain unsatisfied for a DAG-only reason (" << readyDetail << ")");
+    std::string werr;
+    BOOST_CHECK_MESSAGE(AuthorityReadyWait(1,&werr),
+        "P1: after the retired-profile startup a consumer gate must open immediately ("<<werr<<")");
+}
+
+BOOST_AUTO_TEST_CASE(p1_retirement_cpu_mining_consumers_use_linear_head)
+{
+    // LEGACY DAG RETIREMENT (Phase 1): the REAL production CPU-mining consumers
+    // (work-identity capture / collateral readiness / work-current check, exposed
+    // through the existing R2c.2/S6 test-facing hooks) must not require the retired
+    // DAG tip selector, the DAG frontier tip set or the DAG source-state token.
+    const bool fSavedRetired = g_testForceLegacyDagRetired;
+    const int  nSavedOverride = g_testForkHeightDagOverride;
+    g_testForceLegacyDagRetired = true;
+    g_testForkHeightDagOverride = 0;
+    CBlockIndex* head = pindexBest;
+    if (mapBlockIndex.count(hashBestChain)) head = mapBlockIndex[hashBestChain];
+    BOOST_REQUIRE(head != NULL);
+    const CPUMiningWorkIdentity id = CaptureCurrentCPUMiningWorkIdentityForTest();
+    const bool fCollateralReady = IsCPUMiningCollateralStateReadyForTest();
+    const bool fWorkCurrent = IsCPUMiningWorkCurrentForTest(id, false);
+    g_testForceLegacyDagRetired = fSavedRetired;
+    g_testForkHeightDagOverride = nSavedOverride;
+
+    BOOST_CHECK_MESSAGE(!id.fSelectionUnavailable,
+        "retired profile: the work identity must not be marked unavailable for a DAG-only reason");
+    BOOST_CHECK_MESSAGE(id.hashPrimaryParent == head->GetBlockHash(),
+        "retired profile: the work identity primary parent must be the authoritative LINEAR head ("
+        << id.hashPrimaryParent.ToString().substr(0, 20) << " vs "
+        << head->GetBlockHash().ToString().substr(0, 20) << ")");
+    BOOST_CHECK_MESSAGE(id.nHeight == head->nHeight + 1,
+        "retired profile: the identity height must follow the authoritative linear head ("
+        << id.nHeight << " vs " << (head->nHeight + 1) << ")");
+    BOOST_CHECK_MESSAGE(id.vDAGTips.empty(),
+        "retired profile: no DAG frontier tip set may be collected (size=" << id.vDAGTips.size() << ")");
+    BOOST_CHECK_MESSAGE(fCollateralReady,
+        "retired profile: collateral readiness must be computed without the DAG tip selector");
+    BOOST_CHECK_MESSAGE(fWorkCurrent,
+        "retired profile: a freshly captured identity must be current without any DAG-state dependency");
+    BOOST_TEST_MESSAGE("P1_CPUMINING primary_parent=linear selection_unavailable=0 dag_tips=" << id.vDAGTips.size()
+                       << " collateral_ready=" << (fCollateralReady ? 1 : 0)
+                       << " work_current=" << (fWorkCurrent ? 1 : 0));
+}
+
+BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
+{
+    // ========================================================================
+    // PHASE 1 FINAL E2E GATE — retired-profile ORDINARY LINEAR REORG + RESTART.
+    // Real production path only: ProcessBlock / AddToBlockIndex -> SetBestChain ->
+    // Reorganize -> PublishAuthoritativeLiveTailReorg, with the Legacy DAG engine
+    // disabled for the whole scenario (LegacyDagConsensusAuthorityEnabled() == false).
+    // This is NOT a DAG test: every block of both branches is an ordinary linear
+    // PoW block with no DAG parent commitment.
+    // ========================================================================
+    SetMockTime(1700002300);
+    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
+    const bool fSavedRetired = g_testForceLegacyDagRetired;
+    const int  nSavedOverride = g_testForkHeightDagOverride;
+    // Fixture chain is built first in the harness default profile (as every other
+    // fixture does), then the RETIRED profile is engaged for the whole scenario.
+    CBlockIndex* fork = pindexBest;
+    while (fork->nHeight < GetForkHeightDAG()) fork = MineReal(fork, 0xD100 + fork->nHeight);
+    g_testForceLegacyDagRetired = true;
+    g_testForkHeightDagOverride = 1000000;   // every real height stays below the DAG domain
+    BOOST_REQUIRE_MESSAGE(!LegacyDagConsensusAuthorityEnabled(),
+        "the retired profile must be in effect for the whole scenario");
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("p1linreorg-%%%%-%%%%");
+    fs::create_directories(root / "snapshot");
+    struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis; bool retired; int ovr;
+        Cleanup(const fs::path& r):root(r),best(pindexBest),genesis(pindexGenesisBlock),
+            retired(g_testForceLegacyDagRetired),ovr(g_testForkHeightDagOverride){}
+        ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest(); g_testForceLegacyDagRetired=retired;
+            g_testForkHeightDagOverride=ovr; pindexBest=best; pindexGenesisBlock=genesis;
+            if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
+            g_testSuppressDagSourceAbort=false; SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
+    } cleanup(root);
+    { CTxDB db; db.Close(); }
+    const auto liveDir = GetDataDir() / "txleveldb";
+    for (fs::directory_iterator it(liveDir), end; it != end; ++it)
+        if (fs::is_regular_file(it->path())) fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
+    BlockIndexGenerationSource src; std::string aerr;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &src, &aerr), aerr);
+    BOOST_REQUIRE_MESSAGE(ReadDAGLinksFromSnapshot((root / "snapshot").string(), &src.dagLinks, &src.dagScores, &aerr), aerr);
+    src.foundDAGLinks = true;
+    src.blockDataDir = GetDataDir().string(); src.dagLinksDir = (root / "snapshot").string();
+    BlockIndexGenerationBuilder ab;
+    BOOST_REQUIRE_MESSAGE(ab.Build(src, (root / "build-000001.tmp").string(), 1, NULL, &aerr), aerr); ab.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
+    g_dagManager.ClearDAGDataForTest();
+    AuthorityReadyResetForTest();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &aerr), aerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    BOOST_REQUIRE(!LegacyDagConsensusAuthorityEnabled());
+    auto live = GetAuthoritativeLiveAuthority(); BOOST_REQUIRE(live && live->IsOpen());
+
+    // --- branch B (ACTIVE first): A -> B1..B6, ordinary linear blocks built and
+    //     offered through the REAL production acceptance path (ProcessBlock ->
+    //     AcceptBlock -> SetBestChain), not the storage-level test shortcut -----
+    const int nRefusalsBefore = g_testLegacyDagRetiredDomainRefusals;
+    CBlockIndex* a1 = MineReal(fork, 0xD111);
+    CBlockIndex* active = a1;
+    for (unsigned i = 0; i < 6; ++i) active = MineReal(active, 0xD112 + i);
+    BOOST_REQUIRE(pindexBest == active);
+    const uint256 activeHash = active->GetBlockHash();
+    const uint256 activeTrust = active->nChainTrust;
+    BOOST_TEST_MESSAGE("P1_REORG branch_B active_tip=" << activeHash.ToString().substr(0, 20)
+                       << " height=" << active->nHeight << " trust=" << activeTrust.ToString().substr(0, 16));
+
+    // --- branch C (COMPETING): A -> C1, C2, then extend through the REAL
+    //     production acceptance path until SetBestChain/Reorganize switches -----
+    CBlockIndex* c1 = MineReal(fork, 0xD121);
+    CBlockIndex* c2 = MineReal(c1, 0xD122);
+    CBlockIndex* branch = c2;
+    bool reorgObserved = false;
+    for (unsigned i = 0; i < 12 && pindexBest == active; ++i)
+    {
+        // REAL production acceptance path: ProcessBlock -> AcceptBlock ->
+        // SetBestChain -> Reorganize (the competing branch becomes best on trust).
+        CBlockIndex* next = MineReal(branch, 0xD130 + i);
+        BOOST_REQUIRE_MESSAGE(next != NULL, "the retired-profile linear reorg must succeed through ProcessBlock/SetBestChain/Reorganize");
+        branch = next;
+        if (pindexBest != active) reorgObserved = true;
+    }
+    BOOST_REQUIRE_MESSAGE(reorgObserved, "the competing branch must become best through a REAL reorganization");
+    const uint256 reorgHash = pindexBest->GetBlockHash();
+    const uint256 reorgTrust = pindexBest->nChainTrust;
+    const int reorgHeight = pindexBest->nHeight;
+
+    // --- post-reorg assertions: tip / membership / ordinary trust / V2 tail ---
+    BOOST_CHECK_MESSAGE(reorgHash == branch->GetBlockHash(),
+        "the expected C-side tip must be selected (" << reorgHash.ToString().substr(0, 20) << ")");
+    BOOST_CHECK_MESSAGE(hashBestChain == reorgHash, "the active chain hash must be the reorged tip");
+    BOOST_CHECK_MESSAGE(reorgTrust == branch->pprev->nChainTrust + branch->GetBlockTrust(),
+        "the selected tip trust must be the ORDINARY linear recurrence (no DAG score overwrite)");
+    BOOST_CHECK_MESSAGE(reorgTrust != activeTrust, "the reorg must have changed the accumulated trust");
+    BlockIndexSnapshot postSnap;
+    BOOST_REQUIRE_MESSAGE(ResolveAuthoritativeBlockSnapshot(reorgHash, &postSnap, &aerr), aerr);
+    BOOST_CHECK_MESSAGE(postSnap.height == reorgHeight,
+        "the V2 authoritative by-value snapshot must agree with the active tip height");
+    bool dagRowForTip = false;
+    { std::map<uint256, CBlockDAGData> all; std::string e; CTxDB db;
+      const bool rd = db.IterateDAGLinksStrict(all, &e); dagRowForTip = rd ? (all.count(reorgHash) != 0) : true; }
+    const int nRefusalsAfter = g_testLegacyDagRetiredDomainRefusals;
+    BOOST_CHECK_MESSAGE(!dagRowForTip,
+        "no Legacy DAG row may be written or required for the reorged tip in the retired profile");
+    BOOST_CHECK_MESSAGE(nRefusalsAfter == nRefusalsBefore,
+        "no retirement firewall refusal may be involved in a legitimate linear reorg");
+    BOOST_CHECK_MESSAGE(!g_dagSourceUnhealthy, "the retired-profile reorg must not latch any DAG-source failure");
+    // Mechanism probe: the live authority's own recorded tip, in-process, right
+    // after the reorg (before any restart), and the derived by-value record.
+    {
+        BlockIndexAuthoritativeLive* lv = GetAuthoritativeLiveAuthority();
+        int liveTipH = -2; uint256 liveTipHash;
+        if (lv && lv->IsOpen() && lv->TipAuthority())
+        {
+            const BlockIndexTipRead tr = lv->TipAuthority()->GetTip();
+            if (tr.status == BLOCK_INDEX_TIP_OK) { liveTipH = tr.height; liveTipHash = tr.record.hash; }
+        }
+        BOOST_CHECK_MESSAGE(liveTipHash == reorgHash && liveTipH == reorgHeight,
+            "the retired-profile reorg MUST publish the exact reorged tip to the authoritative live tail ("
+            << liveTipH << " vs " << reorgHeight << ")");
+        BOOST_TEST_MESSAGE("P1_REORG_LIVETAIL live_inprocess_tip_height=" << liveTipH
+                           << " live_inprocess_tip_matches_reorged=" << (liveTipHash == reorgHash ? 1 : 0)
+                           << " reorg_height=" << reorgHeight);
+    }
+
+    BOOST_TEST_MESSAGE("P1_REORG reorg_completed=1 profile=retired tip=" << reorgHash.ToString().substr(0, 20)
+                       << " height=" << reorgHeight << " trust_changed=1 v2_snapshot_matches=1 dag_row=0"
+                       << " dag_source_unhealthy=0 firewall_refusals_delta=0");
+
+    // --- RESTART PARITY: CLEAN production shutdown, then reopen from the SAME
+    //     isolated persisted fixture (real close of the authoritative live tail
+    //     and the txdb, exactly as a node shutdown does). ----------------------
+    {
+        BlockIndexAuthoritativeLive* shuttingDown = GetAuthoritativeLiveAuthority();
+        if (shuttingDown && shuttingDown->IsOpen()) shuttingDown->Close();
+    }
+    { CTxDB db; db.Close(); }
+    ResetBlockIndexAuthoritativeStartupForTest();
+    AuthorityReadyResetForTest();
+    BOOST_REQUIRE(!AuthorityReadyIsSet());
+    // ---------------------------------------------------------------------
+    // (a) V2 AUTHORITATIVE RESTART RECONSTRUCTION (production component P5):
+    //     base generation S + the persisted mutable post-S tip authority under
+    //     <root>/blockindex_tip. The live acceptance path persisted the reorged
+    //     active tip there (BlockIndexTipAuthority Append / ReorgActiveTo).
+    // ---------------------------------------------------------------------
+    std::string rerr;
+    {
+        BlockIndexAuthoritativeRestart restart;
+        BOOST_REQUIRE_MESSAGE(restart.OpenBaseAndTip(root.string(), true, 1, NULL, &rerr), rerr);
+        BOOST_CHECK_MESSAGE(restart.HasPostSTip(),
+            "the authoritative restart reconstruction must find persisted post-generation records");
+        BOOST_CHECK_MESSAGE(restart.EffectiveTipHash() == reorgHash,
+            "the authoritative restart must land on the EXACT reorged tip ("
+            << restart.EffectiveTipHash().ToString().substr(0, 20) << " vs "
+            << reorgHash.ToString().substr(0, 20) << ")");
+        BOOST_CHECK_MESSAGE(restart.EffectiveTipHeight() == reorgHeight,
+            "the authoritative restart must land on the reorged height ("
+            << restart.EffectiveTipHeight() << " vs " << reorgHeight << ")");
+        BOOST_TEST_MESSAGE("P1_REORG_RESTART post_s_tip=" << (restart.HasPostSTip() ? 1 : 0)
+                           << " effective_tip_height=" << restart.EffectiveTipHeight()
+                           << " effective_tip_matches_reorged_tip=" << (restart.EffectiveTipHash() == reorgHash ? 1 : 0)
+                           << " tip_records=" << restart.TipRecordCount());
+        restart.Close();
+    }
+    // (a2) The PERSISTED mutable tip itself, reopened from disk: exact reorged tip
+    //      and the ORDINARY accumulated trust (no DAG score restoration involved).
+    {
+        BlockIndexTipAuthority tip; std::string terr;
+        BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(root.string(), 1, &tip, &terr), terr);
+        const BlockIndexTipRead ptr2 = tip.GetTip();
+        BOOST_CHECK_EQUAL(ptr2.status, BLOCK_INDEX_TIP_OK);
+        BOOST_CHECK_MESSAGE(ptr2.height == reorgHeight && ptr2.record.hash == reorgHash,
+            "the persisted mutable tip must be the EXACT reorged tip ("
+            << ptr2.height << " vs " << reorgHeight << ")");
+        BOOST_CHECK_MESSAGE(ptr2.derived.chainTrust == reorgTrust,
+            "the persisted tip must carry the ORDINARY accumulated trust");
+        BOOST_CHECK_MESSAGE(ptr2.active, "the persisted tip must be marked active");
+        BOOST_TEST_MESSAGE("P1_REORG_RESTART_PERSIST persisted_tip_height=" << ptr2.height
+                           << " persisted_tip_matches_reorged=" << (ptr2.record.hash == reorgHash ? 1 : 0)
+                           << " persisted_trust_matches=" << (ptr2.derived.chainTrust == reorgTrust ? 1 : 0)
+                           << " active=" << (ptr2.active ? 1 : 0));
+        tip.Close();
+    }
+
+    // ---------------------------------------------------------------------
+    // (b) PRODUCTION BOOT ENTRY (init.cpp:1486 calls exactly this function) in
+    //     the RETIRED profile: it must succeed, publish AUTHORITY_READY, keep the
+    //     reorged rows durably present and require no DAG custody / provenance /
+    //     DAG row / firewall involvement.
+    // ---------------------------------------------------------------------
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &rerr), rerr);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    BOOST_REQUIRE(!LegacyDagConsensusAuthorityEnabled());
+    const bool fBootReady = AuthorityReadyIsSet();
+    const std::string bootDetail = AuthorityReadyRefusalDetail();
+    const bool fMembershipPreserved = mapBlockIndex.count(reorgHash) != 0;
+    bool fDagRowAfterBoot = false;
+    { std::map<uint256, CBlockDAGData> all; std::string e; CTxDB db;
+      const bool rd = db.IterateDAGLinksStrict(all, &e); fDagRowAfterBoot = rd ? (all.count(reorgHash) != 0) : true; }
+    const int refusalsAfterBoot = g_testLegacyDagRetiredDomainRefusals;
+    BOOST_CHECK_MESSAGE(fBootReady, "AUTHORITY_READY must reach READY after the retired-profile restart");
+    BOOST_CHECK_MESSAGE(bootDetail.find("dag") == std::string::npos &&
+                        bootDetail.find("custody") == std::string::npos &&
+                        bootDetail.find("provenance") == std::string::npos,
+        "no DAG-only prerequisite may gate readiness after restart (" << bootDetail << ")");
+    BOOST_CHECK_MESSAGE(fMembershipPreserved,
+        "restart must preserve the reorged block's durable membership");
+    BOOST_CHECK_MESSAGE(!fDagRowAfterBoot, "no Legacy DAG row may be required after restart");
+    BOOST_CHECK_MESSAGE(refusalsAfterBoot == nRefusalsBefore,
+        "no retirement firewall refusal may occur after restart");
+    BOOST_TEST_MESSAGE("P1_REORG_RESTART_BOOT authority_ready=" << (fBootReady ? 1 : 0)
+                       << " membership_preserved=" << (fMembershipPreserved ? 1 : 0)
+                       << " dag_custody_required=0 dag_row_required=0 firewall_refusals_delta="
+                       << (refusalsAfterBoot - nRefusalsBefore));
+    // Pinned OBSERVATION O1 — DOCUMENTED, NOT BLESSED (see FINAL E2E CLOSURE §O1
+    // in the Phase-1 report): the production boot entry restores the base-generation
+    // anchor and does not itself fold the persisted post-S tip that the P5 restart
+    // reconstruction (a) resolves above. Reported to the owner; no claim is made
+    // here that the boot's behaviour is correct.
+    BOOST_TEST_MESSAGE("P1_REORG_BOOT_OBSERVATION boot_best_height=" << nBestHeight
+                       << " persisted_post_s_tip_height=" << reorgHeight
+                       << " generation_base_height=" << fork->nHeight
+                       << " boot_folds_persisted_tip=0");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

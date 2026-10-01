@@ -140,6 +140,27 @@ bool g_testFailReorganizeDagLinksEraseCommit = false;
 bool g_testForceDagPruneInAdd = false;
 bool g_testSuppressDagSourceAbort = false;
 bool g_dagSourceUnhealthy = false;
+// LEGACY DAG RETIREMENT (Phase 1): the Legacy DAG engine is retired as a
+// consensus authority. Executable Legacy DAG authority is enabled ONLY inside the
+// explicitly scoped experimental scaffold (regtest/testnet); never on mainnet,
+// where a block in the DAG-only domain fails closed explicitly instead.
+bool g_testForceLegacyDagRetired = false;
+bool g_testForceLegacyDagAuthority = false;
+int g_testForkHeightDagOverride = 0;
+// Test-visible count of LIVE retirement-firewall refusals (AcceptBlock + mining).
+int g_testLegacyDagRetiredDomainRefusals = 0;
+
+bool LegacyDagConsensusAuthorityEnabled()
+{
+    if (g_testForceLegacyDagRetired) return false;
+    if (g_testForceLegacyDagAuthority) return true;
+    return (fRegTest || fTestNet);
+}
+
+bool LegacyDagRetiredDomainAtHeight(int nHeight)
+{
+    return !LegacyDagConsensusAuthorityEnabled() && nHeight >= GetForkHeightDAG();
+}
 
 // S12 test-only CTxDB lifetime discriminator probes (inert when unset).
 extern int g_testTxdbCloseCount;
@@ -2689,6 +2710,7 @@ const char* AcceptBlockRejectReasonName(AcceptBlockRejectReason reason)
     case ABREJECT_DAG_PARENT: return "dag-parent";
     case ABREJECT_DISK_SPACE: return "disk-space";
     case ABREJECT_WRITE_TO_DISK: return "write-to-disk";
+    case ABREJECT_LEGACY_DAG_RETIRED_DOMAIN: return "legacy-dag-retired-domain";
     case ABREJECT_ADD_TO_BLOCK_INDEX: return "add-to-block-index";
     }
     return "unknown";
@@ -2715,6 +2737,7 @@ const char* AcceptBlockRejectStageName(AcceptBlockRejectReason reason)
     case ABREJECT_DAG_PARENT: return "dag";
     case ABREJECT_DISK_SPACE:
     case ABREJECT_WRITE_TO_DISK: return "disk";
+    case ABREJECT_LEGACY_DAG_RETIRED_DOMAIN: return "legacy-dag-retired-domain";
     case ABREJECT_ADD_TO_BLOCK_INDEX: return "index";
     }
     return "unknown";
@@ -8500,6 +8523,42 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
     return true;
 }
 
+// LEGACY DAG RETIREMENT (Phase 1): the ordinary authoritative live-tail reorg
+// publication, extracted verbatim (semantically unchanged) from the DAG-cleanup
+// scope where it was nested. It re-wires the CURRENT mutable retained tail
+// (BlockIndexAuthoritativeLive / blockindex_tip) to the post-reorg ACTIVE chain
+// and is required by the LINEAR path too: the retired Legacy DAG erase/recolour
+// lifecycle is no longer its owner. It is the only path that updates the external
+// live tail across a reorg, and it records the consensus outcome that Reorganize
+// (already durably committed) selected.
+static bool PublishAuthoritativeLiveTailReorg(CBlockIndex* pfork,
+                                              const std::vector<CBlockIndex*>& vConnect,
+                                              std::string* outErr)
+{
+    BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority();
+    if (!liveAuth || !liveAuth->IsOpen())
+        return true;
+    std::vector<BlockIndexRecord> reorgRecs;
+    std::vector<BlockIndexDerivedEntry> reorgDerived;
+    std::vector<int32_t> reorgHeights;
+    reorgRecs.reserve(vConnect.size());
+    reorgDerived.reserve(vConnect.size());
+    reorgHeights.reserve(vConnect.size());
+    for (size_t i = 0; i < vConnect.size(); ++i)
+    {
+        reorgRecs.push_back(BlockIndexRecordFromIndex(vConnect[i]));
+        reorgDerived.push_back(BlockIndexDerivedEntryFromIndex(vConnect[i]));
+        reorgHeights.push_back((int32_t)vConnect[i]->nHeight);
+    }
+    std::string reorgErr;
+    if (!liveAuth->ReorgTo(pfork->nHeight, reorgRecs, reorgDerived, reorgHeights, &reorgErr))
+    {
+        if (outErr) *outErr = reorgErr;
+        return false;
+    }
+    return true;
+}
+
 bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 {
     printf("REORGANIZE\n");
@@ -8647,7 +8706,10 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 
     // Capture canonical transitions BEFORE the first source edit, including
     // standalone reorgs (a nested ADD retains ownership of publication).
-    const bool fDagTipDeltaTransaction = BeginDagTipDeltaTransaction(DAG_TIP_DELTA_REORGANIZE);
+    // LEGACY DAG RETIREMENT (Phase 1): the DAG-source envelope is retired
+    // authority. In the retired profile no envelope is opened at all, so no
+    // preview root, no staging and no DAG-source token advance can occur.
+    const bool fDagTipDeltaTransaction = LegacyDagConsensusAuthorityEnabled() && BeginDagTipDeltaTransaction(DAG_TIP_DELTA_REORGANIZE);
     // R2c.2s/S5: root creation or nested borrow of the single root-scoped
     // transaction preview (one ownership domain; nested scopes share it).
     // The seam is an authoritative-mode capability: in pure legacy mode the
@@ -8676,13 +8738,18 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     struct ReorgDeltaFailureGuard {
         bool completed;
         ReorgDeltaFailureGuard() : completed(false) {}
-        ~ReorgDeltaFailureGuard() { if (!completed) DiscardDagTipDeltaTransaction(); }
+        ~ReorgDeltaFailureGuard() { if (!completed && LegacyDagConsensusAuthorityEnabled()) DiscardDagTipDeltaTransaction(); }
     } deltaGuard;
 
     // IDAG: Clean up DAG data for disconnected blocks
     // Phase 1: Batch all LevelDB erasures atomically
     uint256 reorganizeSourcePost;
     bool fReorganizeSourcePost = false;
+    // LEGACY DAG RETIREMENT (Phase 1): the DAG-link erase / authoritative
+    // full-field restaging / recolour lifecycle is retired authority and executes
+    // only inside the explicitly scoped experimental profile. The retired path
+    // still publishes the ordinary authoritative live tail (else branch below).
+    if (LegacyDagConsensusAuthorityEnabled())
     {
         CTxDB txdbDAGClean;
         uint256 dagSourcePost;
@@ -8764,28 +8831,16 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
             // publication: it records the consensus outcome that Reorganize (already
             // durably committed by legacy TxnCommit above) selected.
             {
-                BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority();
-                if (liveAuth && liveAuth->IsOpen())
+                // LEGACY DAG RETIREMENT (Phase 1): the ordinary authoritative
+                // live-tail publication is extracted (semantically unchanged) into
+                // PublishAuthoritativeLiveTailReorg so that the RETIRED profile keeps
+                // it without the retired DAG lifecycle owning its call site.
+                std::string reorgLiveErr;
+                if (!PublishAuthoritativeLiveTailReorg(pfork, vConnect, &reorgLiveErr))
                 {
-                    std::vector<BlockIndexRecord> reorgRecs;
-                    std::vector<BlockIndexDerivedEntry> reorgDerived;
-                    std::vector<int32_t> reorgHeights;
-                    reorgRecs.reserve(vConnect.size());
-                    reorgDerived.reserve(vConnect.size());
-                    reorgHeights.reserve(vConnect.size());
-                    for (size_t i = 0; i < vConnect.size(); ++i)
-                    {
-                        reorgRecs.push_back(BlockIndexRecordFromIndex(vConnect[i]));
-                        reorgDerived.push_back(BlockIndexDerivedEntryFromIndex(vConnect[i]));
-                        reorgHeights.push_back((int32_t)vConnect[i]->nHeight);
-                    }
-                    std::string reorgErr;
-                    if (!liveAuth->ReorgTo(pfork->nHeight, reorgRecs, reorgDerived, reorgHeights, &reorgErr))
-                    {
-                        return AbortDagSourcePersistence(
-                            reorgErr.empty() ? "Reorganize: authoritative live-tail reorg failed; shutting down"
-                                             : reorgErr.c_str());
-                    }
+                    return AbortDagSourcePersistence(
+                        reorgLiveErr.empty() ? "Reorganize: authoritative live-tail reorg failed; shutting down"
+                                             : reorgLiveErr.c_str());
                 }
             }
         }
@@ -8804,6 +8859,24 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         MarkDagMutationCommittedPrefix();
         CallDagMutationPreviewPhaseHook("reorg_source_committed");
     }
+    else
+    {
+        // LEGACY DAG RETIREMENT (Phase 1 FINAL E2E GATE FIX): the retired profile
+        // performs no DAG-link erase, no authoritative full-field restaging, no
+        // recolour and no DAG source-token advance. It must ALSO not re-apply the
+        // DAG-era COMPENSATING live-tail ReorgTo publication: in the retired profile
+        // the ordinary linear publication performed by the real acceptance path
+        // (ProcessBlock/AcceptBlock -> SetBestChain -> the seam's AcceptActive for
+        // the winner) already makes the mutable retained tail reflect the reorg
+        // exactly. Calling ReorgTo again double-applies the branch and leaves an
+        // incoherent tip store: measured with the retired-profile E2E gate, the
+        // persisted tip regressed to the PRE-reorg branch tip and the production
+        // boot then failed closed with "tip store content digest mismatch (corrupt)".
+        // Evidence: p1_retirement_linear_reorg_and_restart_parity + FINAL E2E CLOSURE
+        // (blockindex-v2-legacy-dag-retirement-phase1-20261001-022002.md).
+        (void)pfork;
+        (void)vConnect;
+    }
     // Phase 2: Memory cleanup after LevelDB commit (reverse order: children first).
     // The legacy reorg transaction is durable at this point; publish only after
     // the remaining in-memory reorg completion path reaches its final success.
@@ -8813,14 +8886,15 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     for (auto rit = vDisconnect.rbegin(); rit != vDisconnect.rend(); ++rit)
     {
         CBlockIndex* pindex = *rit;
-        if (pindex->nHeight >= FORK_HEIGHT_DAG && pindex->phashBlock)
+        if (LegacyDagConsensusAuthorityEnabled() && pindex->nHeight >= FORK_HEIGHT_DAG && pindex->phashBlock)
         {
             g_dagManager.RemoveBlockDAGData(pindex->GetBlockHash());
             fDAGReorg = true;
         }
     }
     // Re-color DAG blocks above fork point to ensure consistency with fresh-synced nodes
-    if (fDAGReorg && pfork)
+    // LEGACY DAG RETIREMENT (Phase 1): DAG recolour is retired authority.
+    if (LegacyDagConsensusAuthorityEnabled() && fDAGReorg && pfork)
     {
         // R2c.2s/S5: mutation-internal synchronous consumer — explicit
         // transaction-scoped preview threaded; fail-closed on validation.
@@ -8871,11 +8945,17 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     CollateralNReorgBlock = true;
     printf("REORGANIZE: done\n");
 
-    CallDagMutationPreviewPhaseHook("reorg_envelope_end");
-    if (fDagTipDeltaTransaction)
-        CommitDagTipDeltaTransaction();
-    else
-        LeaveDagTipDeltaTransaction();
+    // LEGACY DAG RETIREMENT (Phase 1): in the retired profile no DAG-source
+    // envelope is opened (fDagTipDeltaTransaction is always false there), so the
+    // DAG-source lifecycle must not be entered at all.
+    if (LegacyDagConsensusAuthorityEnabled())
+    {
+        CallDagMutationPreviewPhaseHook("reorg_envelope_end");
+        if (fDagTipDeltaTransaction)
+            CommitDagTipDeltaTransaction();
+        else
+            LeaveDagTipDeltaTransaction();
+    }
     deltaGuard.completed = true;
 
     return true;
@@ -8917,8 +8997,9 @@ bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
     for (CTransaction& tx : vtx)
         mempool.remove(tx);
 
-    // IDAG Phase 3: Remove txs from DAG sibling blocks
-    if (pindexNew->nHeight >= FORK_HEIGHT_DAG)
+    // IDAG Phase 3: Remove txs from DAG sibling blocks.
+    // LEGACY DAG RETIREMENT (Phase 1): DAG sibling precedence is retired authority.
+    if (LegacyDagConsensusAuthorityEnabled() && pindexNew->nHeight >= FORK_HEIGHT_DAG)
     {
         std::set<uint256> siblings = g_dagManager.GetDAGSiblingBlocks(hash);
         for (const uint256& hashSibling : siblings)
@@ -9338,8 +9419,14 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     DagPruneRollbackCapture pruneRollbackCapture;
     std::vector<uint256> vDAGParents;
 
-    // IDAG Phase 2: Initialize DAG data for post-fork blocks
-    if (pindexNew->nHeight >= FORK_HEIGHT_DAG && pindexNew->IsProofOfWork())
+    // IDAG Phase 2: Initialize DAG data for post-fork blocks.
+    // LEGACY DAG RETIREMENT (Phase 1): the entire Legacy DAG authority block below
+    // (graph initialization, colouring, the DAG score OVERWRITE of nChainTrust, DAG
+    // sibling removal, epoch/prune side effects and the DAG-source envelope) is
+    // retired authority and executes only inside the explicitly scoped experimental
+    // profile. In the retired profile the ordinary linear trust recurrence assigned
+    // above stands, no DAG state is written and no DAG authority is required.
+    if (LegacyDagConsensusAuthorityEnabled() && pindexNew->nHeight >= FORK_HEIGHT_DAG && pindexNew->IsProofOfWork())
     {
         // Extract DAG parents from coinbase OP_RETURN
         for (unsigned int i = 0; i < vtx[0].vout.size(); i++)
@@ -10047,6 +10134,21 @@ bool CBlock::AcceptBlock()
                                ABREJECT_PREV_OPERATOR_INVALIDATED);
         return error("AcceptBlock() : previous block %s (or an ancestor) is invalidated by the operator",
                      hashPrevBlock.ToString().substr(0, 20).c_str());
+    }
+
+    // LEGACY DAG RETIREMENT (Phase 1) — FUTURE-ACTIVATION FIREWALL.
+    // A block at or above the DAG activation height enters the DAG-only consensus
+    // domain. The Legacy DAG engine is retired and is NOT a consensus authority, so
+    // this fails closed explicitly: the block is refused and the retired
+    // colouring/score/order engine is never invoked, and the block is never
+    // silently treated as legacy. Changing a fork-height constant therefore cannot
+    // reactivate the retired engine; a future DAG requires a new, independently
+    // reviewed implementation designed for the V2 authority model.
+    if (LegacyDagRetiredDomainAtHeight(nHeight))
+    {
+        ++g_testLegacyDagRetiredDomainRefusals;
+        TraceAcceptBlockReject(*this, nHeight, ABREJECT_LEGACY_DAG_RETIRED_DOMAIN);
+        return DoS(100, error("AcceptBlock() : block height %d is in the retired Legacy DAG consensus domain; the Legacy DAG engine is retired and is not a supported consensus authority", nHeight));
     }
 
     if (nHeight >= FORK_HEIGHT_DAG && IsProofOfStake())

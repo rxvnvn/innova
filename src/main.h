@@ -291,11 +291,29 @@ inline int GetForkHeightDAG()
 {
     extern bool fRegTest;
     extern bool fTestNet;
+    extern int g_testForkHeightDagOverride;
+    // LEGACY DAG RETIREMENT (Phase 1) test seam: a positive override exists only
+    // so a focused test can place the chain inside or outside the DAG activation
+    // domain. It is never set by production configuration.
+    if (g_testForkHeightDagOverride > 0) return g_testForkHeightDagOverride;
     if (fRegTest) return 11;
     if (fTestNet) return 11;        // clean public IDAG testnet
     return MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;                  // mainnet maintenance build: keep experimental v5 fork gates inert
 }
 #define FORK_HEIGHT_DAG (GetForkHeightDAG())
+
+// LEGACY DAG RETIREMENT (Phase 1) — capability, retired-domain predicate and the
+// test-only seams. The dormant Legacy DAG engine is NOT a supported consensus
+// authority; the supported Innova profile is linear/V2 (see
+// blockindex-v2-legacy-dag-retirement-decision-20261001-011818.md). A block that
+// enters the DAG-only consensus domain while the engine is retired fails closed
+// explicitly; changing a height constant can never silently reactivate it.
+extern bool g_testForceLegacyDagRetired;
+extern bool g_testForceLegacyDagAuthority;
+extern int g_testForkHeightDagOverride;
+extern int g_testLegacyDagRetiredDomainRefusals;
+bool LegacyDagConsensusAuthorityEnabled();
+bool LegacyDagRetiredDomainAtHeight(int nHeight);
 
 // IDAG privacy root transition: FCMP spends bind to the last finalized
 // epoch curve-tree snapshot instead of the mutable per-block tree.

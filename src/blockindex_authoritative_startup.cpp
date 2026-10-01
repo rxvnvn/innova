@@ -541,6 +541,16 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         // (registration only; every read revalidates availability).
         SetDagTipSelectorRuntime(ctx->dagTipRuntime.get());
     }
+    else if (!LegacyDagConsensusAuthorityEnabled())
+    {
+        // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is retired
+        // with the engine, so a generation that lacks the DAG tip frontier
+        // capability is NOT a reason to refuse boot. Current mining selects the
+        // authoritative active-chain head directly, and no current consensus path
+        // consults the DAG selector — the node is not half-operational.
+        printf("BLOCKINDEX_V2_AUTHORITATIVE: Legacy DAG retired; DAG tip selector runtime not installed (not required)\n");
+        fflush(stdout);
+    }
     else
     {
         // R2c.2/S6-repair (blocker repair cycle, Phase 8): a selected
@@ -579,7 +589,21 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         int custodyState = 2;
         uint64_t custodyEpoch = 0;
         std::string custodyDetail;
-        custodyStageComplete = EstablishDAGProvenanceCustodyAtStartup(&custodyState, &custodyEpoch, &custodyDetail);
+        if (LegacyDagConsensusAuthorityEnabled())
+        {
+            custodyStageComplete = EstablishDAGProvenanceCustodyAtStartup(&custodyState, &custodyEpoch, &custodyDetail);
+        }
+        else
+        {
+            // LEGACY DAG RETIREMENT (Phase 1): the dormant Legacy DAG engine owns no
+            // durable authority, so provenance/custody certification is no longer a
+            // prerequisite of current consensus startup. The implementation stays
+            // physically present and unreachable in the retired profile; the state is
+            // REPORTED (never normalized to VERIFIED) and gates nothing.
+            custodyState = 3;
+            custodyStageComplete = true;
+            custodyDetail = "Legacy DAG retired: provenance/custody certification not required";
+        }
         std::string custodyMsg = std::string("BLOCKINDEX_V2_AUTHORITATIVE custody_state=") +
                                  std::to_string(custodyState) + " custody_epoch=" +
                                  std::to_string((unsigned long long)custodyEpoch);
@@ -612,6 +636,17 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
             auto readyAuthority = GetAuthoritativeLiveAuthority();
             pre.immutableAuthorityAvailable = (readyAuthority != NULL && readyAuthority->IsOpen());
         }
+        if (!LegacyDagConsensusAuthorityEnabled())
+        {
+            // LEGACY DAG RETIREMENT (Phase 1): the DAG durable score authority and the
+            // R3 provenance/custody certification exist only to serve the dormant
+            // Legacy DAG engine. They no longer gate readiness of the CURRENT
+            // consensus authority (V2 durable index + immutable authority + linear
+            // trust projection, all still required below).
+            pre.dagDurableStateRestored = true;
+            pre.provenanceCertificationComplete = true;
+        }
+        else
         {
             std::string dagHealthErr;
             CTxDB dagHealthDb("r");
@@ -653,7 +688,18 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         // voter's authoritative selector runtime must be installed. No late-vote, equivocation,
         // denominator, FINALITY_MIN_VOTERS, irreversibility or NullStake semantics are defined,
         // chosen or normalized here.
-        pre.finalityEpochOwnerLifecycleReady = IsDagTipSelectorRuntimeRegistered();
+        if (LegacyDagConsensusAuthorityEnabled())
+        {
+            pre.finalityEpochOwnerLifecycleReady = IsDagTipSelectorRuntimeRegistered();
+        }
+        else
+        {
+            // LEGACY DAG RETIREMENT (Phase 1): the finality epoch owner's DAG-selector
+            // runtime is retired with the engine. Lifecycle readiness is rebased onto
+            // the CURRENT consensus authority (the open immutable authoritative live
+            // tail). No finality semantics, carriers or thresholds are changed here.
+            pre.finalityEpochOwnerLifecycleReady = pre.immutableAuthorityAvailable;
+        }
         std::string readyDetail;
         const bool authorityReady = AuthorityReadyMarkIfSatisfied(pre, &readyDetail);
         printf("BLOCKINDEX_V2_AUTHORITATIVE authority_ready=%d detail=%s\n",
