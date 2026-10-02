@@ -3,6 +3,7 @@
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
 #include "main.h"
+#include "finality_epoch_store.h"
 #include "txdb-leveldb.h"
 #include "wallet.h"
 #include "walletdb.h"
@@ -14,7 +15,7 @@
 #include "dandelion.h"
 #include "init.h"
 #include "base58.h"
-#include "dag.h"
+#include "epoch_state.h"
 #include "finality.h"
 
 #include <string>
@@ -60,7 +61,7 @@ static bool LoadWalletFCMPProofTree(CTxDB& txdb, int nCurrentHeight,
     if (nCurrentHeight >= FORK_HEIGHT_EPOCH_ROOT_FCMP)
     {
         CEpochState finalizedEpochState;
-        if (!g_dagManager.GetLastFinalizedEpochState(finalizedEpochState))
+        if (!GetFinalityEpochStateStore().GetLastFinalizedEpochState(finalizedEpochState))
         {
             strErrorOut = "No finalized epoch curve-tree root is available yet";
             return false;

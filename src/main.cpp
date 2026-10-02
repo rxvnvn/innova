@@ -6,6 +6,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "alert.h"
+#include "finality_epoch_store.h"
 #include "bloom.h"
 #include "checkpoints.h"
 #include "db.h"
@@ -34,8 +35,7 @@
 #include "lelantus.h"
 #include "curvetree.h"
 #include "finality.h"
-#include "dag.h"
-#include "dag_mutation_preview.h"
+#include "epoch_state.h"
 #include "candidate_frontier.h"
 #include "blockindex_hot_owner.h"
 #include "blockindex_residency_counters.h"
@@ -140,27 +140,9 @@ bool g_testFailReorganizeDagLinksEraseCommit = false;
 bool g_testForceDagPruneInAdd = false;
 bool g_testSuppressDagSourceAbort = false;
 bool g_dagSourceUnhealthy = false;
-// LEGACY DAG RETIREMENT (Phase 1): the Legacy DAG engine is retired as a
-// consensus authority. Executable Legacy DAG authority is enabled ONLY inside the
-// explicitly scoped experimental scaffold (regtest/testnet); never on mainnet,
-// where a block in the DAG-only domain fails closed explicitly instead.
-bool g_testForceLegacyDagRetired = false;
-bool g_testForceLegacyDagAuthority = false;
-int g_testForkHeightDagOverride = 0;
-// Test-visible count of LIVE retirement-firewall refusals (AcceptBlock + mining).
-int g_testLegacyDagRetiredDomainRefusals = 0;
-
-bool LegacyDagConsensusAuthorityEnabled()
-{
-    if (g_testForceLegacyDagRetired) return false;
-    if (g_testForceLegacyDagAuthority) return true;
-    return (fRegTest || fTestNet);
-}
-
-bool LegacyDagRetiredDomainAtHeight(int nHeight)
-{
-    return !LegacyDagConsensusAuthorityEnabled() && nHeight >= GetForkHeightDAG();
-}
+// LEGACY DAG RETIREMENT (Phase 2 / H9 FINAL): the Legacy DAG activation
+// capability, its retired-domain firewall predicate and their test-only seams are
+// removed. There is no longer an engine to enable or a DAG-only domain to guard.
 
 // S12 test-only CTxDB lifetime discriminator probes (inert when unset).
 extern int g_testTxdbCloseCount;
@@ -168,9 +150,6 @@ extern void* g_testTxdbLastClosedPtr;
 extern int g_testTxdbOpenCount;
 extern void* g_testTxdbLastOpenedPtr;
 extern void* GetGlobalTxdbPtrForTest();
-extern int g_testDagDeltaDeliveredEvents;
-extern int g_testDagDeltaLastDeliveredKind;
-extern int g_testDagDeltaLastDeliveredOrigin;
 bool g_testS12LifetimeProbe = false;
 int g_testS12LastPostponed = 0;
 void* g_testS12SeenTxdbAddr = NULL;
@@ -2608,73 +2587,6 @@ static void ObserveProcessBlockParent(const CBlock& block, int kind,
 }
 
 static bool fAcceptBlockRejectTraceEnabled = false;
-static AcceptBlockDAGObserverFn g_acceptBlockDAGObserver = NULL;
-static ConnectBlockDAGSiblingObserverFn g_connectBlockDAGSiblingObserver = NULL;
-
-ScopedAcceptBlockDAGObserver::ScopedAcceptBlockDAGObserver(AcceptBlockDAGObserverFn fn)
-    : previous_(g_acceptBlockDAGObserver)
-{
-    g_acceptBlockDAGObserver = fn;
-}
-
-ScopedAcceptBlockDAGObserver::~ScopedAcceptBlockDAGObserver()
-{
-    g_acceptBlockDAGObserver = previous_;
-}
-
-void EmitAcceptBlockDAGObserverEvent(const AcceptBlockDAGObserverEvent& event)
-{
-    if (g_acceptBlockDAGObserver)
-        g_acceptBlockDAGObserver(event);
-}
-
-ScopedConnectBlockDAGSiblingObserver::ScopedConnectBlockDAGSiblingObserver(
-    ConnectBlockDAGSiblingObserverFn fn)
-    : previous_(g_connectBlockDAGSiblingObserver)
-{
-    g_connectBlockDAGSiblingObserver = fn;
-}
-
-ScopedConnectBlockDAGSiblingObserver::~ScopedConnectBlockDAGSiblingObserver()
-{
-    g_connectBlockDAGSiblingObserver = previous_;
-}
-
-void EmitConnectBlockDAGSiblingObserverEvent(
-    const ConnectBlockDAGSiblingObserverEvent& event)
-{
-    if (g_connectBlockDAGSiblingObserver)
-        g_connectBlockDAGSiblingObserver(event);
-}
-
-static void ObserveConnectBlockDAGSibling(
-    ConnectBlockDAGSiblingObserverEventType type,
-    const uint256& hash, unsigned int nFile,
-    unsigned int nBlockPos, bool active)
-{
-    ConnectBlockDAGSiblingObserverEvent event;
-    event.type = type;
-    event.hash = hash;
-    event.nFile = nFile;
-    event.nBlockPos = nBlockPos;
-    event.active = active;
-    EmitConnectBlockDAGSiblingObserverEvent(event);
-}
-
-static void ObserveAcceptBlockDAG(AcceptBlockDAGObserverEventType type,
-                                  const uint256& hash, int height,
-                                  bool proofOfStake, bool active,
-                                  unsigned int parentIndex)
-{
-    AcceptBlockDAGObserverEvent event;
-    event.type = type;
-    event.hash = hash;
-    event.height = height;
-    event.proofOfStake = proofOfStake;
-    event.active = active;
-    event.parentIndex = parentIndex;
-    EmitAcceptBlockDAGObserverEvent(event);
-}
 
 bool InitAcceptBlockRejectTrace(bool fEnabled)
 {
@@ -5372,7 +5284,7 @@ static bool LoadFCMPValidationRoot(CTxDB& txdb, int nBlockHeight,
     if (nBlockHeight >= FORK_HEIGHT_EPOCH_ROOT_FCMP)
     {
         CEpochState finalizedEpochState;
-        if (!g_dagManager.GetLastFinalizedEpochState(finalizedEpochState))
+        if (!GetFinalityEpochStateStore().GetLastFinalizedEpochState(finalizedEpochState))
         {
             strErrorOut = "missing finalized epoch FCMP root";
             return false;
@@ -7190,110 +7102,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
 
     // IDAG: Collect spent outputs from DAG sibling blocks (lower hash = canonical earlier)
     // Transactions conflicting with already-spent outputs from siblings are skipped
-    std::set<COutPoint> setDAGSpentOutputs;
-    bool fDAGActive = (pindex->nHeight >= FORK_HEIGHT_DAG);
-    if (fDAGActive && pindex->phashBlock)
-    {
-        const uint256 currentBlockHash = pindex->GetBlockHash();
-        if (g_fAuthoritativeStartup)
-            ObserveConnectBlockDAGSibling(
-                CONNECTBLOCK_DAG_SIBLING_ENTERED,
-                currentBlockHash, 0, 0, true);
-        std::set<uint256> siblings = g_dagManager.GetDAGSiblingBlocks(currentBlockHash);
-        CBlockDAGData currentDagData;
-        bool fHaveCurrentDAGOrder = g_dagManager.GetDAGData(currentBlockHash, currentDagData) &&
-                                    currentDagData.nDAGOrder >= 0;
-        for (const uint256& hashSibling : siblings)
-        {
-            bool fSiblingPrecedes = (hashSibling < pindex->GetBlockHash());
-            CBlockDAGData siblingDagData;
-            if (fHaveCurrentDAGOrder && g_dagManager.GetDAGData(hashSibling, siblingDagData) &&
-                siblingDagData.nDAGOrder >= 0)
-                fSiblingPrecedes = siblingDagData.nDAGOrder < currentDagData.nDAGOrder;
-            if (!fSiblingPrecedes)
-                continue;
-
-            CBlock sibBlock;
-            if (g_fAuthoritativeStartup)
-            {
-                BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
-                if (!live || !live->IsOpen())
-                {
-                    ObserveConnectBlockDAGSibling(
-                        CONNECTBLOCK_DAG_SIBLING_AUTH_FAILURE,
-                        hashSibling, 0, 0, false);
-                    ObserveConnectBlockDAGSibling(
-                        CONNECTBLOCK_DAG_SIBLING_RULE_REJECTED,
-                        hashSibling, 0, 0, false);
-                    return error("ConnectBlock() : DAG sibling authority unavailable");
-                }
-                BlockIndexAuthoritativeParentInfo siblingInfo;
-                std::string siblingError;
-                const BlockIndexAuthoritativeParentStatus siblingStatus =
-                    live->ResolveParentInfo(hashSibling, &siblingInfo, &siblingError);
-                if (siblingStatus == BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_FOUND)
-                {
-                    ObserveConnectBlockDAGSibling(
-                        CONNECTBLOCK_DAG_SIBLING_AUTH_NOT_FOUND,
-                        hashSibling, 0, 0, false);
-                    continue; // exact legacy unknown-sibling behavior
-                }
-                if (siblingStatus != BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND)
-                {
-                    ObserveConnectBlockDAGSibling(
-                        CONNECTBLOCK_DAG_SIBLING_AUTH_FAILURE,
-                        hashSibling, 0, 0, false);
-                    ObserveConnectBlockDAGSibling(
-                        CONNECTBLOCK_DAG_SIBLING_RULE_REJECTED,
-                        hashSibling, 0, 0, false);
-                    return error("ConnectBlock() : DAG sibling authority failure");
-                }
-                ObserveConnectBlockDAGSibling(
-                    CONNECTBLOCK_DAG_SIBLING_AUTH_FOUND,
-                    siblingInfo.hash, siblingInfo.nFile,
-                    siblingInfo.nBlockPos, siblingInfo.active);
-                if (!sibBlock.ReadFromDisk(siblingInfo.nFile,
-                                           siblingInfo.nBlockPos, true) ||
-                    sibBlock.GetHash() != hashSibling)
-                {
-                    ObserveConnectBlockDAGSibling(
-                        CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FAILURE,
-                        hashSibling, siblingInfo.nFile,
-                        siblingInfo.nBlockPos, siblingInfo.active);
-                    ObserveConnectBlockDAGSibling(
-                        CONNECTBLOCK_DAG_SIBLING_RULE_REJECTED,
-                        hashSibling, siblingInfo.nFile,
-                        siblingInfo.nBlockPos, siblingInfo.active);
-                    return error("ConnectBlock() : DAG sibling block bytes unavailable");
-                }
-                ObserveConnectBlockDAGSibling(
-                    CONNECTBLOCK_DAG_SIBLING_MATERIALIZATION_FOUND,
-                    hashSibling, siblingInfo.nFile,
-                    siblingInfo.nBlockPos, siblingInfo.active);
-            }
-            else
-            {
-                // Legacy mode is intentionally unchanged.
-                std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashSibling);
-                if (mi == mapBlockIndex.end())
-                    continue;
-                if (!sibBlock.ReadFromDisk(mi->second))
-                    continue;
-            }
-
-            for (const CTransaction& sibTx : sibBlock.vtx)
-            {
-                if (sibTx.IsCoinBase() || sibTx.IsCoinStake())
-                    continue;
-                for (const CTxIn& txin : sibTx.vin)
-                    setDAGSpentOutputs.insert(txin.prevout);
-            }
-        }
-        if (g_fAuthoritativeStartup)
-            ObserveConnectBlockDAGSibling(
-                CONNECTBLOCK_DAG_SIBLING_RULE_PASSED,
-                currentBlockHash, 0, 0, true);
-    }
 
     int64_t nTransparentValidateMicros = 0;
     int64_t nShieldedValidateMicros = 0;
@@ -7355,29 +7163,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
         }
         else
         {
-            // IDAG Phase 2: Skip transactions whose inputs conflict with DAG siblings
-            if (fDAGActive && !tx.IsCoinStake())
-            {
-                bool fConflict = false;
-                for (const CTxIn& txin : tx.vin)
-                {
-                    if (setDAGSpentOutputs.count(txin.prevout))
-                    {
-                        fConflict = true;
-                        break;
-                    }
-                }
-                if (fConflict)
-                {
-                    if (fDebug)
-                        printf("ConnectBlock() : DAG conflict skip tx %s (inputs spent by sibling)\n",
-                               hashTx.ToString().substr(0, 20).c_str());
-                    // Skip this tx but don't fail the block
-                    nTxPos += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
-                    pos.nTxPos += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
-                    continue;
-                }
-            }
 
             bool fInvalid;
             if (!tx.FetchInputs(txdb, mapQueuedChanges, true, false, mapInputs, fInvalid))
@@ -8707,25 +8492,10 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 
     // IDAG: Clean up DAG data for disconnected blocks
     // Phase 1: Batch all LevelDB erasures atomically
-    uint256 reorganizeSourcePost;
-    bool fReorganizeSourcePost = false;
     // LEGACY DAG RETIREMENT (Phase 1): the DAG-link erase / authoritative
     // full-field restaging / recolour lifecycle is retired authority and executes
     // only inside the explicitly scoped experimental profile. The retired path
     // still publishes the ordinary authoritative live tail (else branch below).
-    // Phase 2: Memory cleanup after LevelDB commit (reverse order: children first).
-    // The legacy reorg transaction is durable at this point; publish only after
-    // the remaining in-memory reorg completion path reaches its final success.
-    if (fReorganizeSourcePost)
-        SetDagTipDeltaFinalSourceStateId(reorganizeSourcePost);
-    for (auto rit = vDisconnect.rbegin(); rit != vDisconnect.rend(); ++rit)
-    {
-        CBlockIndex* pindex = *rit;
-        if (LegacyDagConsensusAuthorityEnabled() && pindex->nHeight >= FORK_HEIGHT_DAG && pindex->phashBlock)
-        {
-            g_dagManager.RemoveBlockDAGData(pindex->GetBlockHash());
-        }
-    }
     // LEGACY DAG RETIREMENT (Phase 2 / Slice 1): the reorg-time DAG recolour
     // consumer (RebuildDAGOrderIncremental) was retired and physically removed
     // with its implementation.  Ordinary linear reorg publication is unaffected.
@@ -8813,14 +8583,6 @@ bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
     for (CTransaction& tx : vtx)
         mempool.remove(tx);
 
-    // IDAG Phase 3: Remove txs from DAG sibling blocks.
-    // LEGACY DAG RETIREMENT (Phase 1): DAG sibling precedence is retired authority.
-    if (LegacyDagConsensusAuthorityEnabled() && pindexNew->nHeight >= FORK_HEIGHT_DAG)
-    {
-        std::set<uint256> siblings = g_dagManager.GetDAGSiblingBlocks(hash);
-        for (const uint256& hashSibling : siblings)
-            mempool.RemoveDAGConflicts(hashSibling);
-    }
 
     return true;
 }
@@ -8928,15 +8690,15 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
                 (g_testS12SeenPdb != NULL && g_testS12SeenPdb == g_testTxdbLastClosedPtr);
             g_testS12SeenCloseCount = g_testTxdbCloseCount;
             g_testS12SeenOpenCount = g_testTxdbOpenCount;
-            g_testS12SeenDeliveredEvents = g_testDagDeltaDeliveredEvents;
+            g_testS12SeenDeliveredEvents = 0;
             fprintf(stderr,
                 "S12_LIFETIME_SEAM postponed=%d txdb=%p pdb=%p global=%p pdb_was_closed=%d"
                 " close_count=%d open_count=%d delivered=%d last_kind=%d last_origin=%d\n",
                 g_testS12LastPostponed, g_testS12SeenTxdbAddr, g_testS12SeenPdb,
                 g_testS12SeenGlobal, (int)g_testS12SeenPdbWasClosed,
                 g_testS12SeenCloseCount, g_testS12SeenOpenCount,
-                g_testS12SeenDeliveredEvents, g_testDagDeltaLastDeliveredKind,
-                g_testDagDeltaLastDeliveredOrigin);
+                g_testS12SeenDeliveredEvents, 0,
+                0);
         }
 
         // Connect further blocks
@@ -9109,6 +8871,56 @@ bool CBlock::GetCoinAge(uint64_t& nCoinAge) const
     return true;
 }
 
+// H6E (Legacy DAG retirement, Phase 2): the CURRENT V2 owner of a best-chain
+// CUTOVER. A newly-best block that is not a direct child of the currently
+// published live tip is not an append: it replaces (part of) the published
+// active chain. BlockIndexTipAuthority::Append is extension-only and correctly
+// fails closed (BLOCK_INDEX_TIP_CORRUPT) for a non-child/same-height replacement,
+// so such an event is published through the existing live-tail reorg operation
+// (BlockIndexAuthoritativeLive::ReorgTo) with the fork point of the old published
+// active tip and the new active suffix. Reuses the single existing reorg
+// construction helper (PublishAuthoritativeLiveTailReorg); no second
+// implementation, no DAG-specific logic.
+static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* live,
+                                                CBlockIndex* pindexNew,
+                                                const uint256& oldPublishedTipHash,
+                                                std::string* outErr)
+{
+    CBlockIndex* pOldTip = NULL;
+    {
+        std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(oldPublishedTipHash);
+        if (it != mapBlockIndex.end())
+            pOldTip = it->second;
+    }
+    if (!pOldTip)
+    {
+        if (outErr) *outErr = "authoritative-live cutover: published tip not in the block index";
+        return false;
+    }
+    // Last common ancestor of the published active tip and the new best chain.
+    int nForkHeight = -1;
+    int nH = pindexNew->nHeight < pOldTip->nHeight ? pindexNew->nHeight : pOldTip->nHeight;
+    while (nH >= 0)
+    {
+        if (pindexNew->GetAncestor(nH) == pOldTip->GetAncestor(nH))
+        {
+            nForkHeight = nH;
+            break;
+        }
+        --nH;
+    }
+    if (nForkHeight < 0)
+    {
+        if (outErr) *outErr = "authoritative-live cutover: no common ancestor with the published tip";
+        return false;
+    }
+    CBlockIndex* pfork = pindexNew->GetAncestor(nForkHeight);
+    std::vector<CBlockIndex*> vConnect;
+    for (int h = nForkHeight + 1; h <= pindexNew->nHeight; ++h)
+        vConnect.push_back(pindexNew->GetAncestor(h));
+    return PublishAuthoritativeLiveTailReorg(pfork, vConnect, outErr);
+}
+
 bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const uint256& hashProof)
 {
     ibdactivepath::ActivePathTimer ibdAddToBlockIndexTimer(
@@ -9214,7 +9026,6 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             return false;
     }
 
-    bool fDagTipDeltaTransaction = false;
     // R2c.2s/S5: root-scoped owned transaction preview (NULL in legacy mode).
     // S3 rollback coherence (authoritative): durable pre-operation score-certificate
     // state captured before the ADD's source batch opens, so a failed SetBestChain
@@ -9262,8 +9073,6 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 setStakeSeen.erase(make_pair(pindexNew->prevoutStake, pindexNew->nStakeTime));
             delete pindexNew;
             ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
-            if (fDagTipDeltaTransaction)
-                DiscardDagTipDeltaTransaction();
             return false;
         }
     }
@@ -9315,18 +9124,32 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             BlockIndexDerivedEntry der = BlockIndexDerivedEntryFromIndex(pindexNew);
             std::string perr;
             const bool becameBest = (hash != uint256(0) && hash == hashBestChain);
-            bool okP = becameBest
-                ? live->AcceptActive(rec, der, pindexNew->nHeight, &perr)
-                : live->AcceptSide(rec, der, &perr);
+            bool okP = false;
+            if (!becameBest)
+            {
+                okP = live->AcceptSide(rec, der, &perr);
+            }
+            else
+            {
+                // H6E: extension vs cutover. Append/AcceptActive is extension-only;
+                // a non-child (or same-height) best-chain replacement is a cutover
+                // and must be published via the existing reorg operation.
+                const BlockIndexTipAuthority* tipAuth = live->TipAuthority();
+                BlockIndexTipRead tipRead = tipAuth ? tipAuth->GetTip() : BlockIndexTipRead();
+                const bool fTipPresent = (tipRead.status == BLOCK_INDEX_TIP_OK);
+                const bool fExtension =
+                    (pindexNew->pprev != NULL &&
+                     (!fTipPresent || tipRead.record.hash == pindexNew->pprev->GetBlockHash()));
+                if (fExtension)
+                    okP = live->AcceptActive(rec, der, pindexNew->nHeight, &perr);
+                else
+                    okP = PublishAuthoritativeLiveTailCutover(live, pindexNew, tipRead.record.hash, &perr);
+            }
             if (!okP)
                 printf("BLOCKINDEX_V2_AUTHORITATIVE AddToBlockIndex persist FAILED height=%d: %s\n",
                        pindexNew->nHeight, perr.c_str());
         }
     }
-
-    CallDagMutationPreviewPhaseHook("add_envelope_end");
-    if (fDagTipDeltaTransaction)
-        CommitDagTipDeltaTransaction();
 
     return true;
 }
@@ -9575,13 +9398,6 @@ bool CBlock::AcceptBlock()
     // silently treated as legacy. Changing a fork-height constant therefore cannot
     // reactivate the retired engine; a future DAG requires a new, independently
     // reviewed implementation designed for the V2 authority model.
-    if (LegacyDagRetiredDomainAtHeight(nHeight))
-    {
-        ++g_testLegacyDagRetiredDomainRefusals;
-        TraceAcceptBlockReject(*this, nHeight, ABREJECT_LEGACY_DAG_RETIRED_DOMAIN);
-        return DoS(100, error("AcceptBlock() : block height %d is in the retired Legacy DAG consensus domain; the Legacy DAG engine is retired and is not a supported consensus authority", nHeight));
-    }
-
     if (nHeight >= FORK_HEIGHT_DAG && IsProofOfStake())
     {
         TraceAcceptBlockReject(*this, nHeight, ABREJECT_POS_AFTER_DAG);
@@ -9709,164 +9525,6 @@ bool CBlock::AcceptBlock()
     }
 
     // IDAG Phase 2: Validate DAG parent commitment in coinbase OP_RETURN
-    if (nHeight >= FORK_HEIGHT_DAG)
-    {
-        ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_ENTERED, hash, nHeight,
-                              IsProofOfStake(), true, 0);
-
-        std::vector<uint256> vDAGParents;
-        bool fDAGMergeParentDeferred = false;
-        for (unsigned int i = 0; i < vtx[0].vout.size(); i++)
-        {
-            vDAGParents = ExtractDAGParents(vtx[0].vout[i].scriptPubKey);
-            if (!vDAGParents.empty())
-                break;
-        }
-
-        if (vDAGParents.empty())
-        {
-            TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-            return DoS(100, error("AcceptBlock() : post-DAG-fork block missing DAG parent commitment"));
-        }
-
-        if (vDAGParents.size() > (unsigned int)MAX_DAG_PARENTS)
-        {
-            TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-            return DoS(100, error("AcceptBlock() : too many DAG parents (%d > %d)", (int)vDAGParents.size(), MAX_DAG_PARENTS));
-        }
-
-        // Primary parent (index 0) must match hashPrevBlock
-        if (vDAGParents[0] != hashPrevBlock)
-        {
-            TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-            return DoS(100, error("AcceptBlock() : DAG primary parent %s != hashPrevBlock %s",
-                                   vDAGParents[0].ToString().substr(0, 20).c_str(),
-                                   hashPrevBlock.ToString().substr(0, 20).c_str()));
-        }
-
-        // Validate merge parents
-        for (unsigned int i = 1; i < vDAGParents.size(); i++)
-        {
-            // No self-reference
-            if (vDAGParents[i] == hash)
-            {
-                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                return DoS(100, error("AcceptBlock() : DAG parent[%d] is self-reference", i));
-            }
-
-            // Must resolve through the complete authoritative cold+hot domain.
-            if (g_fAuthoritativeStartup)
-            {
-                BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
-                if (!live || !live->IsOpen())
-                {
-                    return error("AcceptBlock() : DAG merge parent authority unavailable");
-                }
-                BlockIndexAuthoritativeParentInfo parentInfo;
-                std::string parentError;
-                BlockIndexAuthoritativeParentStatus parentStatus =
-                    live->ResolveParentInfo(vDAGParents[i], &parentInfo, &parentError);
-                if (parentStatus == BLOCK_INDEX_AUTHORITATIVE_PARENT_NOT_FOUND)
-                {
-                    ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_MERGE_PARENT_NOT_FOUND,
-                                          vDAGParents[i], nHeight, false, false, i);
-                    if (IsInitialBlockDownload())
-                    {
-                        ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_IBD_UNKNOWN_PARENT_DEFER,
-                                              vDAGParents[i], nHeight, false, false, i);
-                        fDAGMergeParentDeferred = true;
-                        if (fDebug)
-                            printf("AcceptBlock() : DAG merge parent[%d] %s not found during IBD, deferring validation\n",
-                                   i, vDAGParents[i].ToString().substr(0, 20).c_str());
-                        continue;
-                    }
-                    ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_NON_IBD_UNKNOWN_PARENT_REJECT,
-                                          vDAGParents[i], nHeight, false, false, i);
-                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                    return DoS(10, error("AcceptBlock() : DAG merge parent[%d] %s not found",
-                                          i, vDAGParents[i].ToString().substr(0, 20).c_str()));
-                }
-                if (parentStatus != BLOCK_INDEX_AUTHORITATIVE_PARENT_FOUND)
-                {
-                    ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_MERGE_PARENT_AUTHORITY_FAILURE,
-                                          vDAGParents[i], nHeight, false, false, i);
-                    ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_AUTHORITY_FAILURE_LOCAL_REJECT,
-                                          vDAGParents[i], nHeight, false, false, i);
-                    // Local authority failure is not a peer-invalid block and
-                    // must not become IBD defer or a DoS/misbehavior penalty.
-                    return error("AcceptBlock() : DAG merge parent[%d] authority failure",
-                                 i);
-                }
-                ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_MERGE_PARENT_FOUND,
-                                      parentInfo.hash, parentInfo.height,
-                                      parentInfo.proofOfStake, parentInfo.active, i);
-                if (parentInfo.height >= nHeight)
-                {
-                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                    return DoS(100, error("AcceptBlock() : DAG merge parent[%d] height %d >= block height %d",
-                                           i, parentInfo.height, nHeight));
-                }
-                if (parentInfo.height >= FORK_HEIGHT_DAG && parentInfo.proofOfStake)
-                {
-                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                    return DoS(100, error("AcceptBlock() : DAG merge parent[%d] is proof-of-stake", i));
-                }
-                if (!pindexPrev || pindexPrev->nHeight - parentInfo.height > DAG_MERGE_DEPTH)
-                {
-                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                    return DoS(50, error("AcceptBlock() : DAG merge parent[%d] too deep", i));
-                }
-                continue;
-            }
-
-            // Legacy mode is intentionally unchanged.
-            if (!mapBlockIndex.count(vDAGParents[i]))
-            {
-                if (IsInitialBlockDownload())
-                {
-                    if (fDebug)
-                        printf("AcceptBlock() : DAG merge parent[%d] %s not found during IBD, deferring validation\n",
-                               i, vDAGParents[i].ToString().substr(0, 20).c_str());
-                    continue;
-                }
-                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                return DoS(10, error("AcceptBlock() : DAG merge parent[%d] %s not found",
-                                      i, vDAGParents[i].ToString().substr(0, 20).c_str()));
-            }
-
-            CBlockIndex* pMergeParent = mapBlockIndex[vDAGParents[i]];
-            if (pMergeParent->nHeight >= nHeight)
-            {
-                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                return DoS(100, error("AcceptBlock() : DAG merge parent[%d] height %d >= block height %d",
-                                       i, pMergeParent->nHeight, nHeight));
-            }
-            if (pMergeParent->nHeight >= FORK_HEIGHT_DAG && pMergeParent->IsProofOfStake())
-            {
-                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                return DoS(100, error("AcceptBlock() : DAG merge parent[%d] is proof-of-stake", i));
-            }
-            if (pindexPrev->nHeight - pMergeParent->nHeight > DAG_MERGE_DEPTH)
-            {
-                TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                return DoS(50, error("AcceptBlock() : DAG merge parent[%d] too deep (%d below primary)",
-                                      i, pindexPrev->nHeight - pMergeParent->nHeight));
-            }
-
-            // No duplicate parents
-            for (unsigned int j = 0; j < i; j++)
-            {
-                if (vDAGParents[j] == vDAGParents[i])
-                {
-                    TraceAcceptBlockReject(*this, nHeight, ABREJECT_DAG_PARENT);
-                    return DoS(100, error("AcceptBlock() : duplicate DAG parent at index %d and %d", j, i));
-                }
-            }
-        }
-        if (g_fAuthoritativeStartup && !fDAGMergeParentDeferred)
-            ObserveAcceptBlockDAG(ACCEPTBLOCK_DAG_MERGE_VALIDATION_PASSED,
-                                  hash, nHeight, IsProofOfStake(), true, 0);
-    }
 
     // Write block to history file
     if (!CheckDiskSpace(::GetSerializeSize(*this, SER_DISK, CLIENT_VERSION)))
@@ -10272,62 +9930,6 @@ bool RecoverFromInvalidatedBestChain()
     return RollbackActiveChainTo(pHeal);
 }
 
-// ---------------------------------------------------------------------------
-// R5 / C8 — DUPLICATE DAG PARENT REJECT (unconditional full-vector prepass).
-//
-// Structural invalidity of an incoming block's DAG parent commitment is decided
-// from the block's COMPLETE parent vector alone, before any DAG interpretation
-// that could make acceptance depend on fork activation, engine mode,
-// legacy-vs-authoritative branch selection, materialization or residency.
-//
-// Contract (frozen C8): reject when any parent is the null hash, or when the
-// same parent hash appears more than once anywhere in the vector (global, not
-// adjacent). The vector is inspected verbatim: it is never mutated, sorted,
-// deduplicated, truncated, or reinterpreted, and later valid processing receives
-// exactly the original vector.
-//
-// State independence is deliberate and total: these helpers read only the block
-// itself. They do not resolve parents, do not touch mapBlockIndex, do not touch
-// any DAG RAM map (mapDAGData), do not read daglinks from the store, do not
-// query the hot/cold authority, and do not consult nDAGScore / nDAGOrder / fBlue
-// / nInferredK / selected-parent / trust or finality state.
-bool CheckDAGParentVectorStructure(const std::vector<uint256>& vParents, std::string* why)
-{
-    std::set<uint256> seenParents;
-    for (size_t i = 0; i < vParents.size(); ++i)
-    {
-        if (vParents[i] == uint256(0))
-        {
-            if (why) *why = strprintf("DAG parent[%u] is the null hash (zero DAG parent)", (unsigned int)i);
-            return false;
-        }
-        if (!seenParents.insert(vParents[i]).second)
-        {
-            if (why)
-                *why = strprintf("DAG parent[%u] %s is a duplicate DAG parent in the complete parent vector",
-                                 (unsigned int)i, vParents[i].ToString().substr(0, 20).c_str());
-            return false;
-        }
-    }
-    return true;
-}
-
-// Extract the committed DAG parent vector from a block's coinbase OP_RETURN
-// without touching any chain or DAG state. A block with no IDAG commitment
-// (every pre-fork legacy block, whose coinbase carries no IDAG tag) yields an
-// empty vector and is therefore structurally trivially valid here.
-std::vector<uint256> ExtractCommittedDAGParents(const CBlock& block)
-{
-    std::vector<uint256> vParents;
-    if (block.vtx.empty()) return vParents;
-    for (unsigned int i = 0; i < block.vtx[0].vout.size(); i++)
-    {
-        vParents = ExtractDAGParents(block.vtx[0].vout[i].scriptPubKey);
-        if (!vParents.empty()) break;
-    }
-    return vParents;
-}
-
 bool ProcessBlock(CNode* pfrom, CBlock* pblock)
 {
     AssertLockHeld(cs_main);
@@ -10362,28 +9964,6 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         return error("ProcessBlock() : already have block (orphan) %s", hash.ToString().substr(0,20).c_str());
     }
 
-    // R5/C8 — UNCONDITIONAL FULL-VECTOR DUPLICATE/ZERO-PARENT PREPASS.
-    // Runs before the operator gate, before orphan retention, before any
-    // IBD/deferred or pending-parent classification, before the preliminary
-    // CheckBlock, before DAG engine work and before legacy-vs-authoritative
-    // branch selection. A malformed vector is structurally invalid on its own
-    // and must never become an orphan, a deferred/pending block, or an outcome
-    // that differs by node state. Nothing here resolves a parent or reads
-    // chain/DAG/index state.
-    {
-        const std::vector<uint256> vDAGParentsPrepass = ExtractCommittedDAGParents(*pblock);
-        std::string sPrepassReason;
-        if (!CheckDAGParentVectorStructure(vDAGParentsPrepass, &sPrepassReason))
-        {
-            TraceProcessBlockReject(pfrom, pblock, PBREJECT_DAG_PARENT_STRUCTURAL);
-            ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
-            // Same peer-penalty treatment the existing ProcessBlock DAG-consensus
-            // rejection uses; no new ban policy is invented.
-            if (pfrom)
-                pfrom->Misbehaving(100);
-            return error("ProcessBlock() : %s", sPrepassReason.c_str());
-        }
-    }
 
     // Operator-invalidation gate: reject before any orphan admission or
     // consensus work. This is not a consensus failure - no peer punishment and

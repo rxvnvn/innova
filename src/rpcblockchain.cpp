@@ -4,12 +4,13 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "main.h"
+#include "finality_epoch_store.h"
 #include "innovarpc.h"
 #include "init.h"
 #include "txdb.h"
 #include "bootstrap.h"
 #include "finality.h"
-#include "dag.h"
+#include "epoch_state.h"
 #include "blockindex_authoritative_startup.h"
 #include "collateralnode.h"
 #include "activecollateralnode.h"
@@ -383,33 +384,6 @@ Object blockToJSON(const CBlock& block, const CBlockIndex* blockindex, bool fPri
             certArray.push_back(certObj);
         }
         result.push_back(Pair("finality_tally_certificates", certArray));
-    }
-
-    // IDAG Phase 2: DAG metadata
-    if (blockindex->nHeight >= FORK_HEIGHT_DAG && blockindex->phashBlock)
-    {
-        result.push_back(Pair("dag_block_producer", std::string("pow")));
-        result.push_back(Pair("pos_block_production", false));
-        CBlockDAGData dagData;
-        if (g_dagManager.GetDAGData(blockindex->GetBlockHash(), dagData))
-        {
-            Array dagparents;
-            for (const uint256& hp : dagData.vDAGParents)
-                dagparents.push_back(hp.GetHex());
-            result.push_back(Pair("dagparents", dagparents));
-
-            Array dagchildren;
-            for (const uint256& hc : dagData.vDAGChildren)
-                dagchildren.push_back(hc.GetHex());
-            result.push_back(Pair("dagchildren", dagchildren));
-
-            result.push_back(Pair("dagblue", dagData.fBlue));
-            result.push_back(Pair("dagscore", dagData.nDAGScore.GetHex()));
-            result.push_back(Pair("dagorder", dagData.nDAGOrder));
-            if (!dagData.vDAGParents.empty())
-                result.push_back(Pair("selected_parent", dagData.vDAGParents[0].GetHex()));
-            result.push_back(Pair("epoch", GetEpochForHeight(blockindex->nHeight)));
-        }
     }
 
     result.push_back(Pair("modifier", strprintf("%016" PRIx64, blockindex->nStakeModifier)));
@@ -1529,7 +1503,7 @@ Value getfinalityinfo(const Array& params, bool fHelp)
     result.push_back(Pair("private_promotion_status", strPrivatePromotionStatus));
 
     CEpochState currentEpochState;
-    if (g_dagManager.GetEpochState(nCurrentEpoch, currentEpochState))
+    if (GetFinalityEpochStateStore().GetEpochState(nCurrentEpoch, currentEpochState))
     {
         result.push_back(Pair("epoch_curve_root", currentEpochState.hashCurveRoot.GetHex()));
         result.push_back(Pair("epoch_nullifier_root", currentEpochState.hashNullifierRoot.GetHex()));
@@ -1545,7 +1519,7 @@ Value getfinalityinfo(const Array& params, bool fHelp)
     }
     CEpochState finalizedEpochState;
     int nFinalizedEpoch = GetEpochForHeight(nFinalizedHeight);
-    if (g_dagManager.GetEpochState(nFinalizedEpoch, finalizedEpochState))
+    if (GetFinalityEpochStateStore().GetEpochState(nFinalizedEpoch, finalizedEpochState))
         result.push_back(Pair("finalized_epoch_root", finalizedEpochState.hashCurveRoot.GetHex()));
     else
     {
@@ -1711,7 +1685,7 @@ Value getepochinfo(const Array& params, bool fHelp)
     result.push_back(Pair("epoch_interval", GetEpochInterval(nCurrentHeight)));
 
     CEpochState state;
-    if (g_dagManager.GetEpochState(nEpoch, state))
+    if (GetFinalityEpochStateStore().GetEpochState(nEpoch, state))
     {
         result.push_back(Pair("height_start", state.nHeightStart));
         result.push_back(Pair("height_end", state.nHeightEnd));

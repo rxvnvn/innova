@@ -46,7 +46,7 @@
 #include "zkproof.h"
 #include "dandelion.h"
 #include "finality.h"
-#include "dag.h"
+#include "epoch_state.h"
 #include "candidate_frontier.h"
 
 #ifdef USE_NATIVETOR
@@ -158,13 +158,11 @@ void Shutdown(void* parg)
             pwalletMain->SaveSPVUtxoCache();
         }
 
-        // IDAG Phase 3: Save DAG clean height for incremental rebuild on restart
-        if (pindexBest && pindexBest->nHeight >= FORK_HEIGHT_DAG)
-        {
-            CTxDB txdbClean;
-            txdbClean.WriteDAGCleanHeight(pindexBest->nHeight);
-            printf("IDAG: Saved DAG clean height %d\n", pindexBest->nHeight);
-        }
+        // LEGACY DAG RETIREMENT (Phase 2 / H7): the DAG clean-height shutdown
+        // writer is retired. Its only startup consumer (the incremental DAG
+        // rebuild seeding) was removed in H3, and no current production path
+        // reads the key. The persisted "dagcleanheight" key, if present in an
+        // existing database, is inert compatibility data and is not rewritten.
 
         FlushIBDBatch();
         IBDEfficiencyShutdownSummary();
@@ -1957,44 +1955,6 @@ authoritative_startup_ready:
     }
         NewThread(ThreadFinalityVoter, NULL);
 
-    // IDAG Phase 2+3: DAG manager initialized via global constructor
-    // Links loaded during LoadBlockIndex() in txdb-leveldb.cpp
-    // In authoritative mode, DAG links/runtime were loaded during bootstrap and
-    // DAG trust comes from authoritative derived.dat chainTrust (A.10.1o); the
-    // legacy mapBlockIndex-dependent RebuildDAGOrder/RestoreDAGTrustIntoChainTrust
-    // are NOT applicable (no historical CBlockIndex graph exists).
-    if (LegacyDagConsensusAuthorityEnabled() && !g_fAuthoritativeStartup &&
-        pindexBest && pindexBest->nHeight >= FORK_HEIGHT_DAG)
-    {
-        // IDAG Phase 3: Check for clean height — use incremental rebuild if available
-        // Also restore nPrunedBelowHeight for GetBlueSet boundary detection
-        CTxDB txdbDAGInit;
-        int nDAGCleanHeight = -1;
-        if (txdbDAGInit.ReadDAGCleanHeight(nDAGCleanHeight) && nDAGCleanHeight > 0)
-        {
-            // Clean height may also serve as prune boundary
-            int nPruneBelow = nDAGCleanHeight - DAG_PRUNE_DEPTH;
-            if (nPruneBelow > 0)
-                g_dagManager.SetPrunedBelowHeight(nPruneBelow);
-        }
-        // LEGACY DAG RETIREMENT (Phase 2 / Slice 1): the DAG order-rebuild
-        // (RebuildDAGOrder / RebuildDAGOrderIncremental) and the DAG score
-        // trust overwrite (RestoreDAGTrustIntoChainTrust) were retired and
-        // physically removed together with their implementation; DAG order
-        // and DAG score no longer drive nChainTrust or best-chain selection
-        // in any profile.  The prune-boundary seeding above is retained.
-
-        std::vector<uint256> vTips = g_dagManager.GetDAGTips();
-        printf("IDAG: DAG active at height %d, %d tips, %d entries\n",
-               pindexBest->nHeight, (int)vTips.size(), g_dagManager.GetDAGEntryCount());
-
-        // IDAG Phase 4: DAGKNIGHT status
-        if (pindexBest->nHeight >= FORK_HEIGHT_DAGKNIGHT)
-            printf("IDAG Phase 4: DAGKNIGHT adaptive ordering active (no fixed k)\n");
-        else
-            printf("IDAG: GHOSTDAG ordering active (k=%d), DAGKNIGHT activates at height %d\n",
-                   GHOSTDAG_K, FORK_HEIGHT_DAGKNIGHT);
-    }
 
     // Candidate tip frontier: rebuild bounded tips index from full block index.
     // If no DAG blocks exist, the tips set is still valid for candidate selection.

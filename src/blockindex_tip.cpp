@@ -761,10 +761,15 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
             if (i->baseLocalToId(j) == tipId) newMeta.tipHash = allRecords[j].hash;
     }
     ComputeContentDigest(newMeta, allRecords, allDerived, allActive, newMeta.contentDigest);
-    // persist stores first then meta (commit point last).
+    // Commit point: adopt the new meta BEFORE writing it, exactly as
+    // AppendBatch/TruncateActiveTo do. Writing meta while i->meta still holds the
+    // pre-reorg state would commit the NEW stores (records/derived/active) against
+    // the OLD meta (tipRecordCount/tipHeight/contentDigest), so the next Open
+    // truncates the freshly-published reorg branch back to the pre-reorg commit
+    // point and reports a content-digest mismatch (silent loss of the cutover).
+    i->meta = newMeta;
     if (!i->WriteMeta(error))
         return BLOCK_INDEX_TIP_IO_ERROR;
-    i->meta = newMeta;
     i->records = allRecords;
     i->derived = allDerived;
     i->activeIds = allActive;

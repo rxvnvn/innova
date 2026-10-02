@@ -29,7 +29,7 @@
 //     -> derived.dat (streamed)
 //   DAG scores: height-ordered incremental coloring keeping only the
 //     DAG_MERGE_DEPTH window + a transient CBlockIndex per block (NO N-object
-//     graph) -> exact same ColorBlock/ColorBlockDAGKnight scores
+//     graph) -> exact same linear block-trust scores
 //   digests: file-based (streamed stores) -> generation root -> MANIFEST
 //   lifecycle: Publish -> Validate -> atomic Select (old CURRENT untouched)
 //

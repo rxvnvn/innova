@@ -20,8 +20,6 @@
 //      (RetainBlockIndexAuthoritativeNavigator, A.10.1p) so wallet-depth never
 //      falls back to LegacyBlockIndexAccessor.
 //   5. Run HReg by-value rebuild + wallet rescan by-value (ca7c7e1).
-//   6. DAG trust uses authoritative derived.dat chainTrust (A.9a.1b-corrected;
-//      validation, no RestoreDAGTrustIntoChainTrust map scan).
 //   7. Build the candidate frontier via BlockIndexCandidateStartupBuilder
 //      (A.10.1m); later RebuildCandidateTips() is skipped.
 //   8. Continue normal startup.
@@ -35,7 +33,6 @@
 #include <stdint.h>
 #include <string>
 #include "blockindex_accessor.h"
-#include "dag.h" // CBlockDAGData (Option-R boundary closure records)
 
 class BlockIndexAuthoritativeLive; // fwd (G1 production live-authority accessor)
 
@@ -76,7 +73,7 @@ bool ResolveAuthoritativeActiveBlock(const uint256& hash,
 // ---------------------------------------------------------------------------
 // R4 — AUTHORITY_READY: ONE lifecycle readiness barrier (not a decorative flag).
 //
-// The six frozen prerequisites are evaluated against REAL live state at the end of
+// The four current prerequisites are evaluated against REAL live state at the end of
 // InitBlockIndexAuthoritative; READY is published only when every one of them holds. Every
 // consensus-sensitive consumer waits on this barrier and must not cross before it. This is
 // lifecycle readiness only: FINALITY_EPOCH_OWNER_READY contributes the readiness of its
@@ -88,14 +85,11 @@ struct AuthorityReadyPrerequisites
 {
     bool durableIndexLoaded;                 // V2 durable index loaded (selected generation)
     bool immutableAuthorityAvailable;        // immutable authority available (live authority open)
-    bool dagDurableStateRestored;            // DAG durable state restored/validated
     bool trustProjectionReconciled;          // R2 trust projection reconciled
     bool finalityEpochOwnerLifecycleReady;   // FINALITY_EPOCH_OWNER_READY lifecycle condition
-    bool provenanceCertificationComplete;    // R3 provenance/projection certification complete
     AuthorityReadyPrerequisites()
         : durableIndexLoaded(false), immutableAuthorityAvailable(false),
-          dagDurableStateRestored(false), trustProjectionReconciled(false),
-          finalityEpochOwnerLifecycleReady(false), provenanceCertificationComplete(false) {}
+          trustProjectionReconciled(false), finalityEpochOwnerLifecycleReady(false) {}
     // First unmet prerequisite ("" when all are satisfied).
     std::string WhyNotReady() const;
 };
@@ -149,21 +143,6 @@ void ClearAuthoritativeLiveForTesting();
 // Test-only lifecycle seam for isolated real InitBlockIndexAuthoritative cases.
 // Never called by production startup.
 void ResetBlockIndexAuthoritativeStartupForTest();
-bool HasDagTipOverlayRuntimeForTest();
-namespace dag_tip_frontier { class DagTipOverlayRuntime; }
-dag_tip_frontier::DagTipOverlayRuntime* GetDagTipOverlayRuntimeForTest();
-uint64_t DagTipOverlayRuntimeGenerationForTest();
-
-// Test-only registration-boundary injection point. Production startup leaves the
-// hook NULL (no-op). A test may install a hook that runs after the startup source
-// repair + runtime Start but immediately BEFORE the observer health re-check, so
-// an integration test can prove that a source authority which turns unhealthy at
-// the exact registration point refuses to install the global observer. Only the
-// timing is injected; the production IsDAGChildCountIndexHealthy predicate makes
-// the decision unmodified.
-typedef void (*DagObserverBoundaryHook)();
-void SetDagObserverBoundaryHookForTest(DagObserverBoundaryHook hook);
-
 // R2c.2s/S2: authoritative by-value trust provider. Reproduces EXACT legacy
 // CBlockIndex::GetBlockTrust semantics for a block described by a by-value
 // authoritative snapshot (no resident CBlockIndex). Correctly applies
@@ -190,310 +169,5 @@ uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap);
 // reinterpreted as canonical genesis.
 bool GetAuthoritativeAccumulatedChainTrust(const uint256& hash,
                                            uint256* out, std::string* error);
-
-// Explicit by-value source contract. No borrowed block/DAG objects escape.
-// Implementations must expose one stable source view for the call lifetime.
-struct BoundaryScoreResult; // Option-R value-only boundary result (defined below)
-class CanonicalDAGRecolorSource
-{
-public:
-    virtual ~CanonicalDAGRecolorSource() {}
-    virtual bool Block(const uint256&, BlockIndexSnapshot*, std::string*) const = 0;
-    virtual bool Parents(const uint256&, std::vector<uint256>*, std::string*) const = 0;
-    virtual bool PreDAGTrust(const uint256&, uint256*, std::string*) const = 0;
-    // Option-R: reconstruct the exact former DAG-overwritten scalar of a
-    // referenced non-retained DAG-era parent (its daglinks record is erased).
-    // Must fail closed (false + empty result) when the raw block or any required
-    // recursive metadata is unavailable, malformed, or identity-mismatched.
-    // Returns the minimal boundary value the absent-DAG branch actually consumes
-    // (the exact former nDAGScore); never fabricates topology or borrowed state.
-    virtual bool ReconstructBoundaryScore(const uint256&,
-                                          BoundaryScoreResult*, std::string*) const = 0;
-    // Option-R closure: materialize the bounded DAG-context closure (the erased
-    // parent P plus its blue-set/K-sample/anticone ancestors) as REAL canvas
-    // records so GetBlueSet(P)/InferLocalK traverse genuine topology instead of
-    // an empty set. Outputs: metadata (by-value snapshots for every closure
-    // vertex incl pre-DAG), preDAGTrust (accumulated trust for pre-DAG leaves),
-    // records (CBlockDAGData with recovered vDAGParents for every DAG-era closure
-    // vertex), and ordered (height-sorted closure). Fail closed on any missing/
-    // malformed required input. The caller merges these into its isolated canvas
-    // and colors the union in height order.
-    virtual bool ReconstructBoundaryClosure(
-        const uint256&,
-        std::map<uint256,BlockIndexSnapshot>* metadata,
-        std::map<uint256,uint256>* preDAGTrust,
-        std::map<uint256,CBlockDAGData>* records,
-        std::vector<std::pair<int32_t,uint256>>* ordered,
-        std::string* error) const = 0;
-};
-class CTxDB;
-class AuthoritativeDAGRecolorSource : public CanonicalDAGRecolorSource
-{
-    CTxDB& db;
-    // Optional mutation-scoped pending snapshot overlay (by value, NEVER
-    // borrowed pointers). When non-NULL, Block()/height resolution consults
-    // these snapshots FIRST (pending mutation-owned snapshot > current
-    // certified live retained tail > immutable generation), so a post-generation
-    // block that is part of THIS logical mutation but not yet published to the
-    // external live authority remains resolvable during a reorg's staged
-    // enumeration/recolor. Owned by the enclosing mutation (Reorganize/add);
-    // never a global; may be NULL. See EnumerateAuthoritativeStagedScope.
-    std::map<uint256,BlockIndexSnapshot> pendingSnapshots_;
-public:
-    explicit AuthoritativeDAGRecolorSource(CTxDB& source) : db(source) {}
-    void SetPendingSnapshots(const std::map<uint256,BlockIndexSnapshot>& p) { pendingSnapshots_ = p; }
-    const std::map<uint256,BlockIndexSnapshot>& GetPendingSnapshots() const { return pendingSnapshots_; }
-    bool Block(const uint256&, BlockIndexSnapshot*, std::string*) const override;
-    bool Parents(const uint256&, std::vector<uint256>*, std::string*) const override;
-    bool PreDAGTrust(const uint256&, uint256*, std::string*) const override;
-    bool ReconstructBoundaryScore(const uint256&,
-                                  BoundaryScoreResult*, std::string*) const override;
-    bool ReconstructBoundaryClosure(
-        const uint256&,
-        std::map<uint256,BlockIndexSnapshot>* metadata,
-        std::map<uint256,uint256>* preDAGTrust,
-        std::map<uint256,CBlockDAGData>* records,
-        std::vector<std::pair<int32_t,uint256>>* ordered,
-        std::string* error) const override;
-};
-// Option-R value-only boundary result. The exact former DAG-overwritten scalar
-// a retained child's absent-DAG branch consumes for a non-retained DAG-era parent.
-struct BoundaryScoreResult
-{
-    uint256 hash;         // block identity the result is bound to
-    int32_t height;       // authoritative height of that block
-    uint256 score;        // exact former DAG-overwritten nChainTrust (former nDAGScore)
-    uint64_t sourceGeneration; // authoritative generation the inputs came from
-    bool valid;           // false until a fully-reconstructed, certified value is set
-    BoundaryScoreResult() : height(-1), sourceGeneration(0), valid(false) {}
-};
-struct CanonicalDAGRecolorRecord
-{
-    uint256 hash;
-    int32_t height;
-    uint256 nDAGScore;
-    bool fBlue;
-    int nInferredK;
-    bool operator==(const CanonicalDAGRecolorRecord& b) const
-    {
-        return hash==b.hash && height==b.height && nDAGScore==b.nDAGScore &&
-               fBlue==b.fBlue && nInferredK==b.nInferredK;
-    }
-};
-struct CanonicalDAGRecolorStats
-{
-    size_t retainedVertices = 0;
-    size_t preDAGBaseVertices = 0;
-    size_t boundaryVertices = 0;
-    size_t materializedObjects = 0;
-    size_t objectBytes = 0; // excludes STL nodes/cache; measured RSS is separate
-    // Finer-grained Option-R / C-full temporary structure counters (memory gate):
-    size_t boundaryClosureVertices = 0;   // total closure vertices across all boundaries
-    size_t boundaryClosureDagRecords = 0; // DAG-era closure records (CBlockDAGData)
-    size_t metadataSnapshots = 0;         // BlockIndexSnapshot entries materialized
-    size_t preDAGTrustEntries = 0;        // pre-DAG trust memo entries
-    size_t parentsMemoEntries = 0;        // parents-of memo entries (boundary + retained)
-    size_t localIndexEntries = 0;         // localIndex (by-value CBlockIndex*) entries
-    size_t colorOrderEntries = 0;         // coloring-order (retained + closure) entries
-    size_t rawBlockBytes = 0;             // cumulative raw CBlock bytes read (peak, sequential)
-    size_t estimatedTemporaryBytes = 0;   // approximate peak bytes of all temporaries
-};
-// Exact scope, sorted (height,hash) output. Failure leaves output empty.
-bool ReconstructAuthoritativeDAGFields(
-    const std::vector<std::pair<int32_t,uint256>>& scope,
-    const CanonicalDAGRecolorSource& source,
-    std::vector<CanonicalDAGRecolorRecord>* result,
-    CanonicalDAGRecolorStats* stats, std::string* error);
-
-// ---------------------------------------------------------------------------
-// S3 atomic authoritative full-field persistence.
-//
-// The staged delta (daglinks writes + tombstones) is applied into the active
-// CTxDB WriteBatch by the caller (WriteDAGLinks/EraseDAGLinks) as part of a
-// PHYSICAL SOURCE COMMIT. This engine then, inside that SAME batch:
-//   1. builds a transaction-owned staged source view
-//        (staged write/replacement > staged tombstone > persisted DB)
-//      using CTxDB::Read (which resolves activeBatch via ScanBatch) for parents
-//      and the by-value authoritative metadata/trust providers for blocks;
-//   2. enumerates the retained canonical scope from the merged view
-//      (persisted daglinks keys + staged writes - staged tombstones);
-//   3. runs the accepted isolated C-full/Option-R recolor against that view
-//      (NO global mapBlockIndex/g_dagManager mutation);
-//   4. produces full-field (nDAGScore/fBlue/nInferredK) for every affected
-//      retained canonical vertex in the C-full affected closure;
-//   5. stages those full-field records back into the SAME WriteBatch (the
-//      daglinks record carries full-field, so WriteDAGLinks persists it);
-//   6. advances the SourceStateId exactly once and stages BOTH certificate
-//      markers (child-count + DAG-score) bound to that token, in the batch;
-//   7. the caller commits the batch atomically; on any failure the caller
-//      aborts and nothing escapes.
-//
-// This is the batch-only staging path. It does NOT call the standalone
-// quiesced-only publishers (EnsureDAGChildCountIndex / PublishDAGScoreCertificateAtomic).
-//
-// Caller contract: an active transaction must already be open with the topology
-// mutation staged (WriteDAGLinks/EraseDAGLinks already applied). `newSourceToken`
-// is minted by the caller (MintDAGSourceStateId) BEFORE this call and passed in.
-// This engine stages (into the SAME WriteBatch) the authoritative full-field
-// records for the affected retained closure, the new SourceStateId, the child-count
-// certificate, and the DAG-score certificate - so token + certs + topology +
-// full-field are all committed in ONE atomic batch by the caller's TxnCommit.
-//
-// Outputs:
-//   result        - full-field records for every affected retained vertex.
-//   affectedHashes- the C-full affected closure (all vertices whose derived
-//                   full-field changed) - caller may persist/observe.
-// Fail closed: returns false with empty output on any staged-view failure,
-// enumeration error, recolor failure, boundary reconstruction failure, or
-// missing/malformed staged data. On false the caller must TxnAbort (nothing
-// staged by this engine escapes because it only adds to the already-open batch,
-// which TxnAbort discards wholesale).
-struct AuthoritativeDAGStageResult
-{
-    std::vector<CanonicalDAGRecolorRecord> fullFields;   // affected retained vertices
-    CanonicalDAGRecolorStats stats;
-    std::vector<uint256> affectedHashes;                 // C-full affected closure
-    size_t stagedTopologyEntries = 0;
-    size_t stagedFullFieldRecords = 0;
-    size_t writeBatchBytes = 0;                          // approx batch bytes (daglinks+fiel+markers)
-};
-// Test-only stage-barrier injection point for the S3 authoritative staging
-// engine (NULL in production = no-op). Installed by integration tests to prove
-// that a failure injected between any two staging sub-steps still leaves the
-// durable source ALL-OLD: every stage lives in the single WriteBatch, so a
-// barrier failure is turned into a batch abort by the caller and nothing
-// partial can become durable. Barriers, in engine order:
-//   1 = pre canonical recolor; 2 = pre full-field staging; 3 = pre SourceStateId
-//   staging; 4 = pre score-certificate staging; 5 = pre child-count-certificate
-//   staging. A false return (with *error set) fails the stage engine.
-typedef bool (*AuthoritativeStageBarrierHook)(int barrier, std::string* error);
-void SetAuthoritativeStageBarrierHookForTest(AuthoritativeStageBarrierHook hook);
-
-// S3 batch-only full-field staging. `chainedPending` (NULL when absent) supplies
-// mutation-scoped, by-value snapshots for post-generation blocks that are part
-// of THIS logical mutation but not yet published to the external live authority
-// (e.g. the winning block of a Reorganize that must be resolvable for staged
-// recolor while SetBestChain has not yet returned). Consulted FIRST during the
-// recolor (pending mutation-owned snapshot > current certified live tail >
-// immutable generation). Never a global; owned by the calling mutation.
-bool StageAuthoritativeDAGScoreState(
-    CTxDB& db,                                  // active transaction (WriteBatch open)
-    const std::vector<std::pair<int32_t,uint256>>& stagedScope, // merged retained scope
-    const uint256& newSourceToken,
-    const std::map<uint256,BlockIndexSnapshot>* chainedPending, // mutation-scoped pending (may be NULL)
-    AuthoritativeDAGStageResult* result,
-    std::string* error,
-    bool diffOnlyWrites = false); // true = stage canonical full-field only for vertices whose
-                                  //      layered full-field differs from the canonical recolor
-                                  //      result (minimal writeset for ordinary incremental ADD);
-                                  //      fullFields/affectedHashes reflect only actually-written
-                                  //      vertices. false = stage every staged-scope vertex
-                                  //      (Reorganize/legacy of the current engine) unchanged.
-
-// Shared diff-only full-field staging helper (S3 engine + S3 rollback + S4
-// startup reconcile). Requires an open transaction (WriteDAGLinks refuses
-// without); stages canonical full-field only for records whose layered value
-// differs (diffOnlyWrites) or every record (clear). Never stages a token or a
-// certificate. Fail closed on any read/write failure.
-bool StageDAGFullFieldRecords(
-    CTxDB& db,
-    const std::vector<CanonicalDAGRecolorRecord>& fields,
-    const std::map<uint256,BlockIndexSnapshot>* chainedPending,
-    bool diffOnlyWrites,
-    AuthoritativeDAGStageResult* result, std::string* error);
-
-// S3 rollback reconciliation (batch-only, failure path). Re-derives the
-// canonical full-field over the RESTORED staged scope (no pending overlay, no
-// force set) and stages ONLY the vertices whose layered value differs from the
-// canonical recolor (diff-only). Used by the ADD rollback after a failed
-// SetBestChain: the failed ADD's already-committed batch may have persisted
-// genuinely-changed retained vertices (merge flips) AND rewritten parent records
-// from resident coloring that no longer reflects the restored canvas; erasing
-// the new block and rewriting parents alone is insufficient. This deliberately
-// stages NO token and NO certificates: the caller restores the SourceStateId via
-// WriteDAGSourceStateId (state-preserving) and the score certificate via an
-// exact captured-state restore. Requires an open transaction; fails closed on
-// any recolor/read error.
-bool ReconcileAuthoritativeDAGScoreInBatch(
-    CTxDB& db,                                  // active transaction (WriteBatch open)
-    const std::vector<std::pair<int32_t,uint256>>& stagedScope,
-    AuthoritativeDAGStageResult* result,
-    std::string* error);
-
-// S3 staged view enumeration: return the merged retained scope
-// (persisted daglinks keys + staged writes - staged tombstones), height-sorted.
-// chainedPending (NULL when absent): same mutation-scoped by-value pending
-// snapshots consulted FIRST when resolving retained-vertex heights, so a winning
-// post-generation block that is not yet externally published (SetBestChain not
-// yet returned) resolves by value during a live Reorganize. Fail closed on any
-// read/enumeration error; identity/hash mismatch on a pending snapshot fails.
-bool EnumerateAuthoritativeStagedScope(
-    CTxDB& db,
-    std::vector<std::pair<int32_t,uint256>>* scope,
-    const std::map<uint256,BlockIndexSnapshot>* chainedPending, // may be NULL
-    std::string* error);
-
-// ---------------------------------------------------------------------------
-// S4 startup/migration authoritative score reconcile.
-//
-// On authoritative startup (PRESENT_VALID runtime path), BEFORE any runtime /
-// observer registration, certify that the persisted DAG score authority is
-// provably healthy for the CURRENT canonical source token. If it is not, the
-// CURRENT canonical retained DAG full-field state (nDAGScore/fBlue/nInferredK)
-// is reconstructed from authoritative sources (strict canonical daglinks +
-// by-value block metadata + entropy-correct trust + Option-R boundaries) and
-// persisted atomically: ONE WriteBatch carrying the diff-only full-field
-// writes, the score-certificate marker bound to the already-current token, and
-// the poison clear. Only then may registration proceed.
-//
-// The SourceStateId is NEVER advanced here: derived full-field is not
-// source-state identity (S1/S3 contract - the certificate binds the retained
-// canonical score set to the current token; the S3 rollback reconcile is the
-// accepted precedent for field correction without a token). The child-count
-// certificate is untouched (already bound to the same token; no divergence).
-//
-// Repairable (fresh recolor + republish is the only healthy route; mirrors the
-// accepted child-count rebuild contract): marker absent, stale-token, revoked,
-// or decodable-but-unsupported/trailing. Unrepairable: undecodable/corrupt
-// marker, unreadable token/marker, or any enumeration/recolor/stage/commit
-// failure -> fail closed. Never reinterprets corruption as absence; never
-// fabricates a healthy certificate.
-struct S4ReconcileStats
-{
-    bool healthyFastPath;       // authority already healthy -> zero writes
-    bool reconciled;            // a reconcile commit was performed
-    size_t scopeVertices;      // retained canonical DAG-era scope size
-    size_t preDAGFiltered;     // strict-enumerated pre-DAG keys excluded from the canvas
-    size_t changedFullFields;  // full-field records actually rewritten (diff-only)
-    size_t recordsWritten;      // == changedFullFields (one WriteDAGLinks per record)
-    size_t boundaryClosures;    // Option-R boundary closures reconstructed
-    size_t metadataResolved;    // BlockIndexSnapshot entries materialized by the recolor
-    size_t recoloredVertices;   // coloring-order entries (retained + boundary closures)
-    size_t estimatedBatchBytes; // bounded estimate of the committed mutation batch
-    size_t materializedObjects; // temporary canvas objects (freed before return)
-    uint64_t elapsedMs;
-    std::string preState;       // healthy/absent/stale/unsupported/trailing/revoked
-    S4ReconcileStats() : healthyFastPath(false), reconciled(false), scopeVertices(0),
-        preDAGFiltered(0), changedFullFields(0), recordsWritten(0), boundaryClosures(0),
-        metadataResolved(0), recoloredVertices(0), estimatedBatchBytes(0),
-        materializedObjects(0), elapsedMs(0) {}
-};
-bool ReconcileAuthoritativeDAGScoreAuthority(CTxDB& db, S4ReconcileStats* stats,
-                                             std::string* error);
-
-// Test-only last-stats capture (inert; returns false until a call happened).
-bool GetLastS4ReconcileStatsForTest(S4ReconcileStats* out);
-
-// Test-only S4 reconcile barrier hook (NULL in production = no-op). Barrier
-// points, in execution order: 1 pre enumeration; 2 pre canonical recolor;
-// 3 pre full-field stage; 4 pre score-marker stage; 5 pre commit; 6 post
-// commit pre health re-read. A false return (with *error set) fails the
-// reconcile; barriers 1-5 leave the durable source ALL-OLD (batch aborted),
-// barrier 6 leaves it NEW/coherent with the startup failing closed.
-typedef bool (*S4ReconcileBarrierHook)(int barrier, std::string* error);
-void SetS4ReconcileBarrierHookForTest(S4ReconcileBarrierHook hook);
-
-// Test-only deterministic commit-failure seam (false in production).
-extern bool g_testFailS4ReconcileCommit;
 
 #endif // INNOVA_BLOCKINDEX_AUTHORITATIVE_STARTUP_H

@@ -8,9 +8,8 @@
 #include "miner.h"
 #include "kernel.h"
 #include "collateralnode.h"
-#include "dag.h"
+#include "epoch_state.h"
 #include "finality.h"
-#include "dag_tip_selector.h"
 #include "blockindex_authoritative_live.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_hot_owner.h"
@@ -161,8 +160,8 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
     // result; the token only provides a temporary usable parent representation.
     ScopedMaterializedChain winnerChain;
     {
-        LOCK2(cs_main, g_dagManager.cs_dag);
-        if (g_fAuthoritativeStartup && !LegacyDagConsensusAuthorityEnabled())
+        LOCK(cs_main);
+        if (g_fAuthoritativeStartup)
         {
             // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is
             // retired with the engine. The current consensus head is the
@@ -187,64 +186,12 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
                 }
             }
         }
-        else if (g_fAuthoritativeStartup)
-        {
-            // R2c.2/S6: authoritative primary selection. UNAVAILABLE fails
-            // closed (no legacy selector, no resident pindexBest fallback).
-            std::string selError;
-            DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&selError);
-            if (sel.status == DAG_TIP_SELECTION_UNAVAILABLE)
-            {
-                fprintf(stderr, "CreateNewBlock: ERROR: authoritative selection unavailable: %s\n",
-                        selError.c_str()); fflush(stderr);
-                return NULL;
-            }
-            if (sel.IsUsable())
-            {
-                // Fast path: resident process-lifetime object for the SAME
-                // selected hash (optimization only; not required for
-                // correctness).
-                std::map<uint256, CBlockIndex*>::iterator miSel = mapBlockIndex.find(sel.hash);
-                if (miSel != mapBlockIndex.end() && miSel->second)
-                {
-                    pindexPrev = miSel->second;
-                }
-                else
-                {
-                    // Nonresident winner: bounded authoritative materialization
-                    // of the SELECTED hash (same by-value walk policy as the
-                    // accepted full-topology materializer; released at the end
-                    // of this build). Winner identity remains the selector's
-                    // value result; this only provides a usable parent
-                    // representation for the legacy block build.
-                    std::string matError;
-                    pindexPrev = winnerChain.Acquire(GetAuthoritativeLiveAuthority(), sel.hash, &matError);
-                    if (!pindexPrev)
-                    {
-                        fprintf(stderr, "CreateNewBlock: ERROR: winner materialization unavailable: %s\n",
-                                matError.c_str()); fflush(stderr);
-                        return NULL;
-                    }
-                }
-            }
-            else
-            {
-                // Defensive: LEGACY cannot be returned while authoritative
-                // mode is on; keep the historical shape for completeness.
-                // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector is not a
-                // consensus authority; the retired profile uses the ordinary linear
-                // head directly.
-                pindexPrev = LegacyDagConsensusAuthorityEnabled() ? g_dagManager.SelectBestDAGTip() : pindexBest;
-                if (!pindexPrev)
-                    pindexPrev = pindexBest;
-            }
-        }
         else
         {
             // LEGACY DAG RETIREMENT (Phase 1): the Legacy DAG tip selector is
             // retired authority; the ordinary linear head is the current consensus
             // head when the DAG engine is not the (scoped) authority.
-            pindexPrev = LegacyDagConsensusAuthorityEnabled() ? g_dagManager.SelectBestDAGTip() : pindexBest;
+            pindexPrev = pindexBest;
             if (!pindexPrev)
                 pindexPrev = pindexBest;
         }
@@ -265,17 +212,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
 
     int nHeight = pindexPrev->nHeight+1; // height of new block
 
-    // LEGACY DAG RETIREMENT (Phase 1) — FUTURE-ACTIVATION FIREWALL (production
-    // path): a template at or above the DAG activation height would enter the
-    // DAG-only consensus domain, which the retired profile does not support. Fail
-    // closed explicitly; never silently build a legacy template for it and never
-    // invoke the retired colouring/score/order engine.
-    if (LegacyDagRetiredDomainAtHeight(nHeight))
-    {
-        ++g_testLegacyDagRetiredDomainRefusals;
-        printf("CreateNewBlock: refusing block template at height %d: retired Legacy DAG consensus domain is unsupported\n", nHeight);
-        return NULL;
-    }
     if (fProofOfStake && nHeight >= FORK_HEIGHT_DAG)
     {
         if (fDebug && GetBoolArg("-printcoinstake"))
@@ -305,142 +241,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
         txNew.vout[0].SetEmpty();
     }
 
-    // IDAG Phase 2: Add DAG parent commitment to coinbase.
-    // LEGACY DAG RETIREMENT (Phase 1): the merge-parent commitment is retired
-    // authority and is produced only inside the explicitly scoped profile.
-    if (LegacyDagConsensusAuthorityEnabled() && nHeight >= FORK_HEIGHT_DAG)
-    {
-        std::vector<uint256> vDAGParents;
-
-        if (g_fAuthoritativeStartup)
-        {
-            // G8 lock fence: the authoritative merge-parent selection below
-            // reads shared chain-selection state — the selector takes no locks
-            // of its own (dag_tip_selector.cpp) and bare-reads hashBestChain /
-            // nBestChainTrust, which SetBestChain writes under cs_main
-            // (main.cpp), plus the overlay runtime state, the by-value live
-            // authority, and your DB ownership (LevelDB) — so entire selection
-            // must run under cs_main. Production callers (getblocktemplate,
-            // getwork, StakeMiner, CPU worker) reach CreateNewBlock WITHOUT
-            // holding cs_main, so the fence must live here. cs_main is
-            // recursive (AnnotatedMixin<boost::recursive_mutex>, sync.h:85),
-            // so nesting inside the earlier LOCK2-shaped scopes is legal. The
-            // fence covers the whole authoritative arm (hash read, selector
-            // call, UNAVAILABLE/primary-anchor checks, value-only assignment)
-            // and closes before BuildDAGParentScript/vout and the long
-            // template assembly: no new lock is held across any wallet call
-            // or template construction, no cs_dag->cs_main edge is
-            // introduced, and the lock order cs_main->cs_dag (existing LOCK2
-            // scope above, and the legacy branch's LOCK2 below) is unchanged.
-            LOCK(cs_main);
-            // R2c.2/S7: AUTHORITATIVE value-only merge-parent result. The legacy
-            // frontier authority (g_dagManager.GetDAGTips()/setDAGTips,
-            // mapBlockIndex residency, ComputeDAGScore(CBlockIndex*)) is NOT
-            // consulted in this mode. UNAVAILABLE fails closed: no legacy
-            // fallback, no resident pindexBest fallback.
-            //
-            // The result is bound to the SAME primary this template builds on
-            // (index 0 + exclusion proof), and it is value-only: no borrowed
-            // CBlockIndex* is returned and no all-frontier materialization occurs.
-            DagMergeParentResult mp;
-            if (!pindexPrev->phashBlock)
-            {
-                fprintf(stderr, "CreateNewBlock: ERROR: authoritative primary parent has no hash\n");
-                fflush(stderr);
-                return NULL;
-            }
-            const uint256 primaryHash = pindexPrev->GetBlockHash();
-            std::string mpError;
-            mp = SelectMergeParentsForExternalConsumer(
-                primaryHash, pindexPrev->nHeight, &mpError);
-            if (mp.status == DAG_MERGE_PARENT_UNAVAILABLE)
-            {
-                fprintf(stderr, "CreateNewBlock: ERROR: authoritative merge-parent selection unavailable: %s\n",
-                        mpError.c_str()); fflush(stderr);
-                return NULL;
-            }
-            // Invariant: parents[0] is the primary this block extends. A valid
-            // empty result (primary only) is a legitimate state.
-            if (mp.parents.empty() || mp.parents[0] != primaryHash)
-            {
-                fprintf(stderr, "CreateNewBlock: ERROR: authoritative merge-parent result is not primary-anchored\n");
-                fflush(stderr);
-                return NULL;
-            }
-            vDAGParents = mp.parents;
-            // End of the G8 cs_main fence (LOCK above): selection, primary-anchor
-            // check and the value-only assignment are complete; BuildDAGParentScript
-            // and the vout push below run unlocked. No wallet/GetReservedKey call
-            // and no template assembly happened inside this scope.
-        }
-        else
-        {
-            // Primary parent = pindexPrev
-            if (pindexPrev->phashBlock)
-                vDAGParents.push_back(pindexPrev->GetBlockHash());
-
-            // Collect merge parents from DAG tips (cs_main for mapBlockIndex access)
-            {
-                LOCK2(cs_main, g_dagManager.cs_dag);
-                std::vector<uint256> vTips = g_dagManager.GetDAGTips();
-
-                std::vector<std::pair<uint256, uint256>> vTipScores;
-                for (const uint256& hashTip : vTips)
-                {
-                    if (pindexPrev->phashBlock && hashTip == pindexPrev->GetBlockHash())
-                        continue; // skip primary parent
-                    std::map<uint256, CBlockIndex*>::iterator miTip = mapBlockIndex.find(hashTip);
-                    if (miTip == mapBlockIndex.end() || miTip->second == NULL)
-                        continue;
-                    CBlockIndex* pTip = miTip->second;
-                    if (pTip != pindexBest && pTip->nChainTrust > nBestChainTrust)
-                        continue;
-                    uint256 nScore = g_dagManager.ComputeDAGScore(pTip);
-                    vTipScores.push_back(std::make_pair(nScore, hashTip));
-                }
-                std::sort(vTipScores.begin(), vTipScores.end(),
-                          [](const std::pair<uint256, uint256>& a, const std::pair<uint256, uint256>& b) {
-                              if (a.first != b.first)
-                                  return a.first > b.first; // higher score first
-                              return a.second < b.second;   // deterministic tiebreak
-                          });
-
-                for (const auto& pair : vTipScores)
-                {
-                    if (vDAGParents.size() >= (unsigned int)MAX_DAG_PARENTS)
-                        break;
-
-                    const uint256& hashTip = pair.second;
-
-                    // Merge parent must exist and be within DAG_MERGE_DEPTH
-                    std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashTip);
-                    if (mi == mapBlockIndex.end() || mi->second == NULL)
-                        continue;
-                    CBlockIndex* pTip = mi->second;
-                    if (pTip != pindexBest && pTip->nChainTrust > nBestChainTrust)
-                        continue;
-                    if (pTip->nHeight < pindexPrev->nHeight - DAG_MERGE_DEPTH)
-                        continue;
-                    if (pTip->nHeight >= nHeight)
-                        continue;
-
-                    vDAGParents.push_back(hashTip);
-                }
-            }
-        }
-
-        if (!vDAGParents.empty())
-        {
-            CScript dagScript = BuildDAGParentScript(vDAGParents);
-            if (dagScript.size() > 0)
-            {
-                CTxOut dagOut;
-                dagOut.nValue = 0;
-                dagOut.scriptPubKey = dagScript;
-                txNew.vout.push_back(dagOut);
-            }
-        }
-    }
 
     // Add our coinbase tx as first transaction
     pblock->vtx.push_back(txNew);
@@ -572,36 +372,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
         // skips transactions whose inputs were already spent by earlier DAG
         // siblings, so CreateNewBlock must exclude them before adding their
         // fees to the coinbase value.
-        std::set<uint256> setDAGSiblingTxids;
-        std::set<COutPoint> setDAGSiblingSpentOutpoints;
-        if (LegacyDagConsensusAuthorityEnabled() && nHeight >= FORK_HEIGHT_DAG && pindexPrev->phashBlock)
-        {
-            std::set<uint256> siblings = g_dagManager.GetDAGSiblingBlocks(pindexPrev->GetBlockHash());
-            CBlockDAGData parentDagData;
-            if (g_dagManager.GetDAGData(pindexPrev->GetBlockHash(), parentDagData))
-            {
-                BOOST_FOREACH(const uint256& hashChild, parentDagData.vDAGChildren)
-                    siblings.insert(hashChild);
-            }
-
-            BOOST_FOREACH(const uint256& hashSib, siblings)
-            {
-                std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashSib);
-                if (mi == mapBlockIndex.end())
-                    continue;
-                CBlock sibBlock;
-                if (!sibBlock.ReadFromDisk(mi->second))
-                    continue;
-                for (const CTransaction& sibTx : sibBlock.vtx)
-                {
-                    if (sibTx.IsCoinBase() || sibTx.IsCoinStake())
-                        continue;
-                    setDAGSiblingTxids.insert(sibTx.GetHash());
-                    BOOST_FOREACH(const CTxIn& txin, sibTx.vin)
-                        setDAGSiblingSpentOutpoints.insert(txin.prevout);
-                }
-            }
-        }
 
         // This vector will be sorted into a priority queue:
         vector<TxPriority> vecPriority;
@@ -612,11 +382,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
             if (tx.IsCoinBase() || tx.IsCoinStake() || !tx.IsFinal())
                 continue;
 
-            // IDAG: Skip transactions already in DAG sibling blocks
-            if (!setDAGSiblingTxids.empty() && setDAGSiblingTxids.count(tx.GetHash()))
-                continue;
-            if (TransactionSpendsAnyOutpoint(tx, setDAGSiblingSpentOutpoints))
-                continue;
 
             // Transparent finality votes use existing UTXOs as stake proofs.
             // Consensus rejects blocks that both commit such a vote and spend
@@ -1324,7 +1089,7 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
     LOCK(cs_main);
 
     identity.hashBestChain = hashBestChain;
-    if (!LegacyDagConsensusAuthorityEnabled())
+    if (true)
     {
         // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is retired
         // with the engine, so the CPU-mining work identity's primary parent is the
@@ -1339,105 +1104,7 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
             identity.nHeight = pindexParent->nHeight + 1;
         }
     }
-    else if (g_fAuthoritativeStartup)
-    {
-        // R2c.2/S6: authoritative primary selection (external CLEAN context).
-        // UNAVAILABLE marks the identity as not-current (fail closed); the
-        // legacy selector is never consulted in authoritative mode.
-        std::string selError;
-        DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&selError);
-        if (sel.status == DAG_TIP_SELECTION_UNAVAILABLE)
-        {
-            identity.fSelectionUnavailable = true;
-        }
-        else if (sel.IsUsable())
-        {
-            identity.hashPrimaryParent = sel.hash;
-            identity.nHeight = sel.height + 1;
-        }
-        else
-        {
-            CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
-            if (!pindexParent)
-                pindexParent = pindexBest;
-            if (pindexParent)
-            {
-                identity.hashPrimaryParent = pindexParent->GetBlockHash();
-                identity.nHeight = pindexParent->nHeight + 1;
-            }
-        }
-    }
-    else
-    {
-        CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
-        if (!pindexParent)
-            pindexParent = pindexBest;
-        if (pindexParent)
-        {
-            identity.hashPrimaryParent = pindexParent->GetBlockHash();
-            identity.nHeight = pindexParent->nHeight + 1;
-        }
-    }
-    // R2c.2/S7: the work-identity tip set must watch the SAME authoritative
-    // parent universe that CreateNewBlock builds its merge-parent commitment
-    // from. Watching the legacy setDAGTips enumeration while the template used
-    // the authoritative frontier would create a split authority: (a)
-    // CPUMiningBlockMatchesWorkIdentity would reject a legitimately built
-    // template whose merge parent is authoritative-but-absent from setDAGTips,
-    // and (b) a changed authoritative frontier would not invalidate stale work.
-    // LEGACY DAG RETIREMENT (Phase 1): the DAG frontier tip set is retired authority.
-    if (LegacyDagConsensusAuthorityEnabled() && identity.nHeight >= FORK_HEIGHT_DAG)
-    {
-        if (g_fAuthoritativeStartup)
-        {
-            std::string tipsError;
-            DagFrontierTipsResult fr = SelectFrontierTipsForExternalConsumer(&tipsError);
-            if (fr.status == DAG_MERGE_PARENT_UNAVAILABLE)
-            {
-                // Fail closed: an unavailable authority is never "no tips".
-                identity.fSelectionUnavailable = true;
-            }
-            else
-            {
-                identity.vDAGTips = fr.tips;
-                std::sort(identity.vDAGTips.begin(), identity.vDAGTips.end());
-            }
-        }
-        else
-        {
-            identity.vDAGTips = g_dagManager.GetDAGTips();
-            std::sort(identity.vDAGTips.begin(), identity.vDAGTips.end());
-        }
-    }
     identity.nTransactionsUpdated = mempool.GetTransactionsUpdated();
-    // LEGACY DAG RETIREMENT (Phase 1): the DAG source-state token is an artefact of
-    // the retired DAG-source envelope. In the retired profile its absence must not
-    // make the work identity unavailable (invalidation is carried by the structural
-    // fields: hashBestChain / hashPrimaryParent), while in the scoped profile the
-    // frozen fail-closed behaviour is unchanged.
-    if (g_fAuthoritativeStartup)
-    {
-        // R2c.2/S7 / audit-D (OPEN D repair): the identity must be invalidated
-        // by any authoritative canonical source transition that could change
-        // the template's parent vector or primary selection. The structural
-        // fields above (hashBestChain / hashPrimaryParent / vDAGTips) do NOT
-        // cover a persisted-score-only rewrite (which can reorder the capped
-        // merge-parent vector while every structural field stays equal), so
-        // the authoritative source-state token is carried as well: every
-        // in-tree topology/child-count/score mutation advances it inside the
-        // same envelope. Fail closed on an unreadable token - an unknown
-        // source state is never "current".
-        uint256 sourceToken;
-        CTxDB sourceDb("r");
-        if (!sourceDb.ReadDAGSourceStateId(sourceToken))
-        {
-            if (LegacyDagConsensusAuthorityEnabled())
-                identity.fSelectionUnavailable = true;
-            // retired profile: no DAG source token involvement (no dependency)
-        }
-        else
-            identity.hashDAGSourceState = sourceToken;
-    }
     return identity;
 }
 
@@ -1445,46 +1112,13 @@ bool IsCPUMiningCollateralStateReady()
 {
     int nNextHeight = 0;
     {
-        LOCK2(cs_main, g_dagManager.cs_dag);
-        if (!LegacyDagConsensusAuthorityEnabled())
+        LOCK(cs_main);
+        if (true)
         {
             // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is
             // retired; readiness is computed from the authoritative linear head.
             CBlockIndex* pindexParent = pindexBest;
             if (mapBlockIndex.count(hashBestChain)) pindexParent = mapBlockIndex[hashBestChain];
-            if (!pindexParent)
-                return false;
-            nNextHeight = pindexParent->nHeight + 1;
-        }
-        else if (g_fAuthoritativeStartup)
-        {
-            // R2c.2/S6: authoritative primary selection. UNAVAILABLE => not
-            // ready (the miner waits; fail closed, no legacy fallback).
-            std::string selError;
-            DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&selError);
-            if (sel.status == DAG_TIP_SELECTION_UNAVAILABLE)
-                return false;
-            if (sel.IsUsable())
-            {
-                if (sel.height < 0)
-                    return false;
-                nNextHeight = sel.height + 1;
-            }
-            else
-            {
-                CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
-                if (!pindexParent)
-                    pindexParent = pindexBest;
-                if (!pindexParent)
-                    return false;
-                nNextHeight = pindexParent->nHeight + 1;
-            }
-        }
-        else
-        {
-            CBlockIndex* pindexParent = g_dagManager.SelectBestDAGTip();
-            if (!pindexParent)
-                pindexParent = pindexBest;
             if (!pindexParent)
                 return false;
             nNextHeight = pindexParent->nHeight + 1;
@@ -1651,20 +1285,12 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
             continue;
         }
 
-        if (fDebug)
-        {
-            std::string strDAGTips;
-            for (const uint256& hashTip : workIdentity.vDAGTips)
-            {
-                if (!strDAGTips.empty())
-                    strDAGTips += ",";
-                strDAGTips += hashTip.ToString();
-            }
-            printf("CPUMiner[%u]: Work identity best=%s parent=%s dag-tips=[%s]\n",
-                   nWorkerId, workIdentity.hashBestChain.ToString().c_str(),
-                   workIdentity.hashPrimaryParent.ToString().c_str(),
-                   strDAGTips.c_str());
-        }
+    if (fDebug)
+    {
+        printf("CPUMiner[%u]: Work identity best=%s parent=%s\n",
+               nWorkerId, workIdentity.hashBestChain.ToString().c_str(),
+               workIdentity.hashPrimaryParent.ToString().c_str());
+    }
 
         printf("CPUMiner[%u]: Mining block at height %d, target bits=0x%08x\n",
                nWorkerId, workIdentity.nHeight, pblock->nBits);
@@ -1803,25 +1429,6 @@ bool CPUMiningBlockMatchesWorkIdentity(const CBlock& block,
 {
     if (block.hashPrevBlock != identity.hashPrimaryParent)
         return false;
-    if (identity.nHeight < FORK_HEIGHT_DAG)
-        return true;
-    if (block.vtx.empty())
-        return false;
-
-    std::vector<uint256> vParents;
-    for (const CTxOut& output : block.vtx[0].vout)
-    {
-        vParents = ExtractDAGParents(output.scriptPubKey);
-        if (!vParents.empty())
-            break;
-    }
-    if (vParents.empty() || vParents[0] != identity.hashPrimaryParent)
-        return false;
-
-    for (size_t i = 1; i < vParents.size(); ++i)
-        if (std::find(identity.vDAGTips.begin(), identity.vDAGTips.end(), vParents[i]) ==
-            identity.vDAGTips.end())
-            return false;
     return true;
 }
 

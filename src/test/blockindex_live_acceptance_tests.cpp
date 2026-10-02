@@ -514,4 +514,167 @@ BOOST_AUTO_TEST_CASE(r3_reorg_persists_reopen)
     }
 }
 
+// ---- H6E: extension-vs-cutover contracts (same-height best-chain replacement) ----
+
+// Append is extension-only: a same-height non-child replacement must stay
+// rejected by the tip store (fail-closed), proving the cutover must not be
+// routed through Append.
+BOOST_AUTO_TEST_CASE(h6e1_append_same_height_nonchild_rejected)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 10;
+    const uint256 baseTipHash = uint256(0xBEEFUL);
+    BaseKnownCtx base;
+    base.known.insert(baseTipHash);
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 2, 100, baseTip, &tip, NULL));
+    BlockIndexLiveTail tail;
+    tail.SetSources(NULL, &tip);
+    tail.SetHorizon(64);
+    tail.SetCurrentGeneration(2);
+    BlockIndexLiveAcceptance seam;
+    seam.SetSources(&BaseKnownFn, &base, &tip, &tail);
+
+    uint256 h1 = uint256(0x7101UL);
+    uint256 h2 = uint256(0x7102UL);
+    BlockIndexTipAppend a;
+    a.record = MakeRecord(h1, baseTipHash, baseTip + 1, false);
+    a.derived = MakeDerived(uint256(0x71UL), 71);
+    std::string err;
+    BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, baseTip + 1, &err), baseTip + 1);
+    a = BlockIndexTipAppend();
+    a.record = MakeRecord(h2, h1, baseTip + 2, false);
+    a.derived = MakeDerived(uint256(0x72UL), 72);
+    BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, baseTip + 2, &err), baseTip + 2);
+
+    // Same-height (S+2) replacement whose parent is the active S+1 is a cutover,
+    // not an append: the tip store must refuse it.
+    uint256 repl = uint256(0x71FFUL);
+    BlockIndexTipAppend bad;
+    bad.record = MakeRecord(repl, h1, baseTip + 2, false);
+    bad.derived = MakeDerived(uint256(0x73UL), 73);
+    std::string err2;
+    BlockIndexTipStatus st = seam.AcceptActive(bad, baseTip + 2, &err2);
+    BOOST_REQUIRE(st != BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 2);
+    BlockIndexTipRead t = tip.GetTip();
+    BOOST_REQUIRE(t.record.hash == h2);           // published tip unchanged
+    BOOST_REQUIRE(tip.LookupByHash(repl, NULL).status != BLOCK_INDEX_TIP_OK);
+    printf("H6E1 PASS append extension-only: same-height non-child refused (st=%d), tip still %s\n",
+           (int)st, t.record.hash.ToString().substr(0,12).c_str());
+}
+
+// The same event published through ReorgTo (the current cutover owner) must
+// succeed and make the replacement hash the live authoritative tip, resolvable
+// by hash at the same height.
+BOOST_AUTO_TEST_CASE(h6e2_reorgto_same_height_replacement_publishes_and_resolves)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 10;
+    const uint256 baseTipHash = uint256(0xBEEFUL);
+    BaseKnownCtx base;
+    base.known.insert(baseTipHash);
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 2, 100, baseTip, &tip, NULL));
+    BlockIndexLiveTail tail;
+    tail.SetSources(NULL, &tip);
+    tail.SetHorizon(64);
+    tail.SetCurrentGeneration(2);
+    BlockIndexLiveAcceptance seam;
+    seam.SetSources(&BaseKnownFn, &base, &tip, &tail);
+
+    uint256 h1 = uint256(0x7201UL);
+    uint256 h2 = uint256(0x7202UL);
+    BlockIndexTipAppend a;
+    a.record = MakeRecord(h1, baseTipHash, baseTip + 1, false);
+    a.derived = MakeDerived(uint256(0x81UL), 81);
+    std::string err;
+    BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, baseTip + 1, &err), baseTip + 1);
+    a = BlockIndexTipAppend();
+    a.record = MakeRecord(h2, h1, baseTip + 2, false);
+    a.derived = MakeDerived(uint256(0x82UL), 82);
+    BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, baseTip + 2, &err), baseTip + 2);
+
+    // Same-height cutover: fork at S+1, single replacement record at S+2.
+    uint256 repl = uint256(0x72FFUL);
+    std::vector<BlockIndexTipAppend> branch;
+    std::vector<int32_t> heights;
+    BlockIndexTipAppend b;
+    b.record = MakeRecord(repl, h1, baseTip + 2, false);
+    b.derived = MakeDerived(uint256(0x83UL), 83);
+    branch.push_back(b); heights.push_back(baseTip + 2);
+    std::string rerr;
+    BOOST_REQUIRE(seam.ReorgTo(baseTip + 1, branch, heights, &rerr) == BLOCK_INDEX_TIP_OK);
+
+    BlockIndexTipRead t = tip.GetTip();
+    BOOST_REQUIRE(t.status == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE_EQUAL(t.height, baseTip + 2);
+    BOOST_REQUIRE(t.record.hash == repl);                    // replacement hash IS the tip
+    BOOST_REQUIRE(tip.LookupByHash(repl, NULL).status == BLOCK_INDEX_TIP_OK); // resolvable
+    BlockIndexTipRead old = tip.LookupByHash(h2, NULL);
+    BOOST_REQUIRE(old.status == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE(!old.active);                              // old tip retained, not active
+    printf("H6E2 PASS same-height cutover via ReorgTo: tip=%s h=%d resolvable, old tip non-active\n",
+           t.record.hash.ToString().substr(0,12).c_str(), (int)t.height);
+}
+
+// Multi-block cutover: every replacement record must be resolvable and the old
+// active suffix must no longer be the active tip.
+BOOST_AUTO_TEST_CASE(h6e3_reorgto_multiblock_cutover_all_records_resolvable)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 10;
+    const uint256 baseTipHash = uint256(0xBEEFUL);
+    BaseKnownCtx base;
+    base.known.insert(baseTipHash);
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 2, 100, baseTip, &tip, NULL));
+    BlockIndexLiveTail tail;
+    tail.SetSources(NULL, &tip);
+    tail.SetHorizon(64);
+    tail.SetCurrentGeneration(2);
+    BlockIndexLiveAcceptance seam;
+    seam.SetSources(&BaseKnownFn, &base, &tip, &tail);
+
+    uint256 h[5];
+    uint256 prev = baseTipHash;
+    for (int i = 1; i <= 4; ++i)
+    {
+        h[i] = uint256(0x7300UL + i);
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(h[i], prev, baseTip + i, false);
+        a.derived = MakeDerived(uint256(0x90UL + i), 90 + i);
+        std::string err;
+        BOOST_REQUIRE_EQUAL(seam.AcceptActive(a, baseTip + i, &err), baseTip + i);
+        prev = h[i];
+    }
+    // Competing branch forks at S+2 and replaces S+3,S+4.
+    uint256 n3 = uint256(0x73A1UL);
+    uint256 n4 = uint256(0x73A2UL);
+    std::vector<BlockIndexTipAppend> branch;
+    std::vector<int32_t> heights;
+    BlockIndexTipAppend a;
+    a.record = MakeRecord(n3, h[2], baseTip + 3, false);
+    a.derived = MakeDerived(uint256(0xA1UL), 0xA1);
+    branch.push_back(a); heights.push_back(baseTip + 3);
+    a = BlockIndexTipAppend();
+    a.record = MakeRecord(n4, n3, baseTip + 4, false);
+    a.derived = MakeDerived(uint256(0xA2UL), 0xA2);
+    branch.push_back(a); heights.push_back(baseTip + 4);
+    std::string rerr;
+    BOOST_REQUIRE(seam.ReorgTo(baseTip + 2, branch, heights, &rerr) == BLOCK_INDEX_TIP_OK);
+
+    BlockIndexTipRead t = tip.GetTip();
+    BOOST_REQUIRE(t.status == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE(t.record.hash == n4);
+    BOOST_REQUIRE(tip.LookupByHash(n3, NULL).status == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE(tip.LookupByHash(n4, NULL).status == BLOCK_INDEX_TIP_OK);
+    BlockIndexTipRead o3 = tip.LookupByHash(h[3], NULL);
+    BlockIndexTipRead o4 = tip.LookupByHash(h[4], NULL);
+    BOOST_REQUIRE(o3.status == BLOCK_INDEX_TIP_OK && !o3.active);
+    BOOST_REQUIRE(o4.status == BLOCK_INDEX_TIP_OK && !o4.active);
+    printf("H6E3 PASS multi-block cutover: tip=%s, replacement records resolvable, old S+3/S+4 non-active\n",
+           t.record.hash.ToString().substr(0,12).c_str());
+}
+
 BOOST_AUTO_TEST_SUITE_END()

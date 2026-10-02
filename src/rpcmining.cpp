@@ -4,6 +4,7 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "main.h"
+#include "finality_epoch_store.h"
 #include "blockindex_accessor.h"
 #include "db.h"
 #include "txdb.h"
@@ -12,7 +13,7 @@
 #include "collateralnode.h"
 #include "innovarpc.h"
 #include "finality.h"
-#include "dag.h"
+#include "epoch_state.h"
 #include "base58.h"
 #include <chrono>
 
@@ -409,7 +410,7 @@ Value getfinalitystakinginfo(const Array& params, bool fHelp)
     obj.push_back(Pair("private_promotion_status", strPrivatePromotionStatus));
 
     CEpochState currentEpochState;
-    if (g_dagManager.GetEpochState(nEpoch, currentEpochState))
+    if (GetFinalityEpochStateStore().GetEpochState(nEpoch, currentEpochState))
     {
         obj.push_back(Pair("epoch_curve_root", currentEpochState.hashCurveRoot.GetHex()));
         obj.push_back(Pair("epoch_nullifier_root", currentEpochState.hashNullifierRoot.GetHex()));

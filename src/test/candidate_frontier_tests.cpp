@@ -2,7 +2,7 @@
 
 #include "main.h"
 #include "candidate_frontier.h"
-#include "dag.h"
+#include "epoch_state.h"
 
 extern std::map<uint256, CBlockIndex*> mapBlockIndex;
 extern CBlockIndex* pindexBest;
@@ -10,7 +10,6 @@ extern uint256 nBestChainTrust;
 extern std::set<uint256> setInvalidBlockHash;
 extern std::map<uint256, CandidateTipRecord> mapCandidateTips;
 extern uint256 hashBestChain;
-extern CDAGManager g_dagManager;
 extern int nBestHeight;
 
 bool IsBlockOperatorInvalid(const CBlockIndex* pindex);

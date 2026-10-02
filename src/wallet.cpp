@@ -9,6 +9,7 @@
 //   cs_spvutxos is always acquired last when needed.
 
 #include "txdb.h"
+#include "finality_epoch_store.h"
 #include "wallet.h"
 #include "walletdb.h"
 #include "crypter.h"
@@ -27,7 +28,7 @@
 #include "nullstake.h"
 #include "curvetree.h"
 #include "lelantus.h"
-#include "dag.h"
+#include "epoch_state.h"
 #include <openssl/crypto.h>  
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/range/algorithm.hpp>
@@ -302,7 +303,7 @@ static bool LoadWalletFCMPProofTree(CTxDB& txdb, int nBlockHeight,
     if (nBlockHeight >= FORK_HEIGHT_EPOCH_ROOT_FCMP)
     {
         CEpochState finalizedEpochState;
-        if (!g_dagManager.GetLastFinalizedEpochState(finalizedEpochState))
+        if (!GetFinalityEpochStateStore().GetLastFinalizedEpochState(finalizedEpochState))
         {
             strErrorOut = "No finalized epoch curve-tree root is available yet";
             return false;

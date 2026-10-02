@@ -7,7 +7,7 @@
 #include "main.h"
 #include "txdb.h"
 #include "finality.h"
-#include "dag.h"
+#include "epoch_state.h"
 
 #include <set>
 #include <map>

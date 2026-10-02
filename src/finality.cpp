@@ -3,16 +3,16 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "finality.h"
+#include "finality_epoch_store.h"
 #include "main.h"
 #include "init.h"
 #include "wallet.h"
 #include "net.h"
 #include "util.h"
-#include "dag.h"
+#include "epoch_state.h"
 #include "txdb.h"
 #include "base58.h"
 #include "kernel.h"
-#include "dag_tip_selector.h"
 #include "blockindex_authoritative_live.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_hot_owner.h"
@@ -2558,7 +2558,7 @@ bool CFinalityTracker::CheckVote(const CFinalityVote& vote, CTxDB& txdb, std::st
 
         int nFinalizedEpoch = GetEpochForHeight(GetFinalizedHeight());
         CEpochState finalizedEpochState;
-        if (!g_dagManager.GetEpochState(nFinalizedEpoch, finalizedEpochState))
+        if (!GetFinalityEpochStateStore().GetEpochState(nFinalizedEpoch, finalizedEpochState))
             return reject("private finality proof missing finalized epoch roots");
         if (vote.privateProof.hashCurveRoot != finalizedEpochState.hashCurveRoot ||
             vote.privateProof.hashNullifierRoot != finalizedEpochState.hashNullifierRoot)
@@ -2698,7 +2698,7 @@ bool CFinalityTracker::CheckTallyCertificate(const CFinalityTallyCertificate& ce
     {
         int nFinalizedEpoch = GetEpochForHeight(GetFinalizedHeight());
         CEpochState finalizedEpochState;
-        if (!g_dagManager.GetEpochState(nFinalizedEpoch, finalizedEpochState))
+        if (!GetFinalityEpochStateStore().GetEpochState(nFinalizedEpoch, finalizedEpochState))
             return reject("private tally certificate missing finalized epoch roots");
         if (cert.hashCurveRoot != finalizedEpochState.hashCurveRoot ||
             cert.hashNullifierRoot != finalizedEpochState.hashNullifierRoot)
@@ -4366,7 +4366,7 @@ static bool ProducePrivateNullStakeFinalityVote(CTxDB& txdb,
         return false;
 
     CEpochState finalizedEpochState;
-    if (!g_dagManager.GetLastFinalizedEpochState(finalizedEpochState))
+    if (!GetFinalityEpochStateStore().GetLastFinalizedEpochState(finalizedEpochState))
         return false;
 
     CCurveTree finalizedCurveTree;
@@ -4592,73 +4592,40 @@ bool ProduceFinalityVote()
     int nCurrentHeight = pindexBest->nHeight;
     int nCurrentEpoch = GetEpochForHeight(nCurrentHeight);
 
-    // IDAG Phase 2: If DAG is active, vote for DAG-selected best tip
+    // LEGACY DAG RETIREMENT (Phase 2 / H9 FINAL): the DAG tip selector and its
+    // boundary resolver are removed. On the authoritative profile the active-chain
+    // head is hashBestChain (served by value from the live authority) and the
+    // epoch boundary is the active-chain ancestor at nEpochHeight. UNAVAILABLE =>
+    // no vote this round (fail closed; NO resident FindBlockByHeight fallback).
     int nEpochHeight = GetEpochBoundaryHeight(nCurrentEpoch, nCurrentHeight);
     CBlockIndex* pEpochBlock = NULL;
-    if (nCurrentHeight >= FORK_HEIGHT_DAG)
+    if (nCurrentHeight >= FORK_HEIGHT_DAG && g_fAuthoritativeStartup)
     {
-        if (g_fAuthoritativeStartup)
+        // ProduceFinalityVote holds cs_main for the whole vote construction, so no
+        // ProcessBlock can interleave; the op-scoped materialization is released
+        // at the end of the next ProcessBlock, after this vote is built.
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        BlockIndexHotHandle boundaryPin; // filled empty by the authority (op-owned)
+        std::string matError;
+        CBlockIndex* pHead = live ? live->MaterializeParentChain(hashBestChain, &boundaryPin,
+                                                                 &matError)
+                                  : NULL;
+        if (!pHead)
         {
-            // R2c.2/S6: authoritative selection + value-semantic boundary
-            // resolution. UNAVAILABLE => no vote this round (fail closed;
-            // NO legacy selector and NO resident FindBlockByHeight fallback).
-            std::string selError;
-            DagTipSelectionResult sel = SelectDagTipForExternalConsumer(&selError);
-            if (!sel.IsUsable())
-            {
-                fprintf(stderr, "ProduceFinalityVote: authoritative selection unavailable: %s\n",
-                        selError.c_str()); fflush(stderr);
-                return false;
-            }
-            std::string berr;
-            DagTipSelectionResult bres =
-                ResolveAuthoritativeBoundaryAtHeight(sel.hash, nEpochHeight, &berr);
-            if (bres.status == DAG_TIP_SELECTION_UNAVAILABLE)
-            {
-                fprintf(stderr, "ProduceFinalityVote: authoritative boundary unavailable: %s\n",
-                        berr.c_str()); fflush(stderr);
-                return false;
-            }
-            // R2c.2/S6: the accepted full-topology materializer is safe here:
-            // ProduceFinalityVote holds cs_main for the whole vote construction,
-            // so no ProcessBlock can interleave. The operation-scoped
-            // materializations are released at the end of the next ProcessBlock,
-            // after this vote is built.
-            BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
-            BlockIndexHotHandle boundaryPin; // filled empty by the authority (op-owned)
-            std::string matError;
-            pEpochBlock = live ? live->MaterializeParentChain(bres.hash, &boundaryPin,
-                                                              &matError)
-                               : NULL;
-            if (!pEpochBlock)
-            {
-                fprintf(stderr, "ProduceFinalityVote: boundary materialization failed: %s\n",
-                        matError.c_str()); fflush(stderr);
-                return false;
-            }
+            fprintf(stderr, "ProduceFinalityVote: authoritative head materialization failed: %s\n",
+                    matError.c_str()); fflush(stderr);
+            return false;
         }
-        else
+        CBlockIndex* pWalk = pHead;
+        while (pWalk && pWalk->nHeight > nEpochHeight)
+            pWalk = pWalk->pprev;
+        if (!pWalk || pWalk->nHeight != nEpochHeight)
         {
-            CBlockIndex* pDAGTip = g_dagManager.SelectBestDAGTip();
-            if (pDAGTip)
-            {
-                // Walk back to epoch boundary on the DAG selected-parent chain.
-                CBlockIndex* pWalk = pDAGTip;
-                std::set<uint256> setVisited;
-                while (pWalk && pWalk->nHeight > nEpochHeight && pWalk->phashBlock)
-                {
-                    if (!setVisited.insert(pWalk->GetBlockHash()).second)
-                        break;
-                    uint256 hashParent = g_dagManager.GetSelectedParent(pWalk->GetBlockHash());
-                    std::map<uint256, CBlockIndex*>::iterator miParent = mapBlockIndex.find(hashParent);
-                    if (miParent == mapBlockIndex.end())
-                        break;
-                    pWalk = miParent->second;
-                }
-                if (pWalk && pWalk->nHeight == nEpochHeight)
-                    pEpochBlock = pWalk;
-            }
+            fprintf(stderr, "ProduceFinalityVote: authoritative epoch boundary unavailable at height %d\n",
+                    nEpochHeight); fflush(stderr);
+            return false;
         }
+        pEpochBlock = pWalk;
     }
     if (!pEpochBlock && !g_fAuthoritativeStartup)
         pEpochBlock = FindBlockByHeight(nEpochHeight);

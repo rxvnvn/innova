@@ -1,6 +1,5 @@
 #include "blockindex_generation_lifecycle.h"
 #include "candidate_frontier_metadata.h"
-#include "dag_tip_frontier_metadata.h"
 
 #include "blockindex_hashindex.h"
 #include "blockindex_activeindex.h"
@@ -395,20 +394,6 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
     if (!MixCandidateLeavesIntoDagDigest(persistedDagInputDigest, candidateBinding,
                                          mixedDagInputDigest))
         return SetError(error, "candidate leaves root binding failed");
-    // R2c.1c: fold the DAG tip frontier binding for frontier-capable generations.
-    // When declared, the dag-tip-frontier.dat artifact MUST be present and valid;
-    // a missing/corrupt/mismatched frontier fails closed here.
-    if (bindFrontier)
-    {
-        unsigned char frontierBinding[32];
-        if (!ComputeDagTipFrontierBinding(dir.string(), generation,
-                                          persistedDagInputDigest,
-                                          frontierBinding, error))
-            return false;
-        unsigned char mixed2[32];
-        MixDagTipFrontierIntoDigest(mixedDagInputDigest, frontierBinding, mixed2);
-        memcpy(mixedDagInputDigest, mixed2, 32);
-    }
 
     // 6. Compute generation root from recomputed digests
     if (!ComputeGenerationRoot(generation, tipHash, recordCount,

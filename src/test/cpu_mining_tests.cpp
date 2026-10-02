@@ -3,7 +3,7 @@
 #include "hashblock.h"
 #include "innovarpc.h"
 #include "miner.h"
-#include "dag.h"
+#include "epoch_state.h"
 #include "main.h"
 #include "finality.h"
 #include "txdb.h"
@@ -257,37 +257,7 @@ BOOST_AUTO_TEST_CASE(work_identity_detects_authoritative_source_only_change)
     BOOST_CHECK(!CPUMiningWorkIdentityMatches(legacyA, original, false));
 }
 
-BOOST_AUTO_TEST_CASE(block_identity_detects_stale_parent_and_dag_commitment)
-{
-    CPUMiningWorkIdentity identity;
-    identity.hashBestChain = uint256(1);
-    identity.hashPrimaryParent = uint256(1);
-    identity.nHeight = FORK_HEIGHT_DAG;
-    identity.vDAGTips.push_back(uint256(1));
-    identity.vDAGTips.push_back(uint256(2));
 
-    CBlock block;
-    block.hashPrevBlock = identity.hashPrimaryParent;
-    CTransaction coinbase;
-    coinbase.vin.resize(1);
-    coinbase.vout.resize(1);
-    std::vector<uint256> parents;
-    parents.push_back(uint256(1));
-    parents.push_back(uint256(2));
-    coinbase.vout[0].scriptPubKey = BuildDAGParentScript(parents);
-    block.vtx.push_back(coinbase);
-
-    BOOST_CHECK(CPUMiningBlockMatchesWorkIdentity(block, identity));
-
-    CPUMiningWorkIdentity replacement = identity;
-    replacement.hashBestChain = uint256(3);
-    replacement.hashPrimaryParent = uint256(3);
-    BOOST_CHECK(!CPUMiningBlockMatchesWorkIdentity(block, replacement));
-
-    replacement = identity;
-    replacement.vDAGTips.resize(1);
-    BOOST_CHECK(!CPUMiningBlockMatchesWorkIdentity(block, replacement));
-}
 
 BOOST_AUTO_TEST_CASE(rpc_reports_actual_stopped_state)
 {

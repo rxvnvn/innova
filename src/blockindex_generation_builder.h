@@ -45,23 +45,12 @@ struct BlockIndexGenerationSource
     uint256 hashBestChain;                                 // authoritative active-chain tip hash
     bool foundBestChain;                                   // true when hashBestChain was read
 
-    // DAG links from LevelDB (optional, for post-DAG trust computation)
-    std::map<uint256, std::vector<uint256> > dagLinks;     // hash -> parent hashes
-    bool foundDAGLinks;
-
-    // A.10.1b-fix2: DAG scores from LevelDB (for canonical post-DAG trust)
-    std::map<uint256, uint256> dagScores;                  // hash -> nDAGScore
-
     // A.10.1b-fix2: path to directory containing blk*.dat files for exact nSize.
     // If empty, nSize will be marked unavailable (blocks not accessible).
     std::string blockDataDir;
 
-    // R2c.1c: the LevelDB daglinks source directory the frontier artifact is
-    // built from. Empty when unavailable (e.g. DAG dormant / no daglinks store).
-    std::string dagLinksDir;
-
     BlockIndexGenerationSource()
-        : foundBestChain(false), foundDAGLinks(false)
+        : foundBestChain(false)
     {
     }
 };
@@ -94,24 +83,6 @@ struct BlockIndexGenerationStats
 bool ReadLegacyBlockIndexSource(const std::string& snapshotLevelDbDir,
                                 BlockIndexGenerationSource* out,
                                 std::string* error);
-
-// A.10.1b-fix2: Read DAG links and scores from a static LevelDB snapshot.
-// Used to populate source.dagLinks and source.dagScores for canonical
-// post-DAG trust computation.
-bool ReadDAGLinksFromSnapshot(const std::string& snapshotLevelDbDir,
-                              std::map<uint256, std::vector<uint256> >* dagLinks,
-                              std::map<uint256, uint256>* dagScores,
-                              std::string* error);
-
-// A.10.1b-fix3 C3: Reconstruct canonical DAG scores using production ColorBlock
-// semantics. Populates canonicalScores with the nDAGScore that production
-// RebuildDAGOrder would compute for each post-DAG PoW block.
-bool ReconstructCanonicalDAGScores(
-    const std::vector<std::pair<int32_t, uint256>>& heightSorted,
-    const std::map<uint256, const BlockIndexRecord*>& recordByHash,
-    const std::map<uint256, std::vector<uint256>>& dagLinks,
-    std::map<uint256, uint256>* canonicalScores,
-    std::string* error);
 
 class BlockIndexGenerationBuilder
 {

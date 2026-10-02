@@ -627,14 +627,8 @@ BOOST_AUTO_TEST_CASE(disconnected_topology_rejects)
                         "Expected 'disconnected' in error, got: " << error);
 }
 
-// C3: canonical DAG trust != linear trust; builder reconstructs via ColorBlock
-// Fixture: genesis (h=0) -> ... -> preDAG (h=10) -> A (h=11) and B (h=11).
-// C (h=12) has selected parent A and merge parent B.
-// Heights must be contiguous for the active chain walk.
-// Linear trust for C = parentTrust(A) + blockTrust(C)
-// Canonical DAG trust for C = selectedParentScore + blockTrust(C) + blockTrust(B)
-//   because B is a blue merge parent (anticone size <= GHOSTDAG_K=18).
-BOOST_AUTO_TEST_CASE(c3_canonical_dag_trust_over_linear)
+// H9R: Legacy merge edges and scores cannot overwrite current linear trust.
+BOOST_AUTO_TEST_CASE(c3_generation_trust_is_linear_ancestry)
 {
     const unsigned int nBits = 0x1d00ffff;
     std::string error;
@@ -698,50 +692,24 @@ BOOST_AUTO_TEST_CASE(c3_canonical_dag_trust_over_linear)
     src.hashBestChain = uint256(300); // C
     src.foundBestChain = true;
 
-    // DAG links: A and B have preDAG(h=10) as DAG parent; C has A and B
-    src.dagLinks[uint256(100)] = {uint256(11)}; // A's DAG parent
-    src.dagLinks[uint256(200)] = {uint256(11)}; // B's DAG parent
-    src.dagLinks[uint256(300)] = {uint256(100), uint256(200)}; // C's DAG parents
+    // H9CLOSURE: the Legacy DAG source intake (source.dagLinks/dagScores and
+    // ReadDAGLinksFromSnapshot) is physically removed; the builder source carries
+    // records + hashBestChain only.
 
-    // Step 1: Call ReconstructCanonicalDAGScores
-    std::vector<std::pair<int32_t, uint256>> heightSorted;
-    std::map<uint256, const BlockIndexRecord*> recordByHash;
-    for (size_t i = 0; i < src.records.size(); ++i)
+    const uint256 hashC(300);
+    // Current invariant: sum production block trust along hashPrev, not merge edges.
+    uint256 linearC = 0;
+    for (const auto& r : records)
     {
-        heightSorted.push_back({src.records[i].record.height, src.records[i].hash});
-        recordByHash[src.records[i].hash] = &src.records[i].record;
+        if (r.hash == uint256(200)) continue; // side/merge sibling is NOT ancestry
+        CBlockIndex block;
+        block.phashBlock = &r.hash;
+        block.nHeight = r.height; block.nBits = r.nBits;
+        block.nFlags = r.nFlags; block.hashProof = r.hashProof;
+        linearC += block.GetBlockTrust();
     }
-    std::sort(heightSorted.begin(), heightSorted.end());
 
-    std::map<uint256, uint256> canonicalScores;
-    BOOST_REQUIRE_MESSAGE(ReconstructCanonicalDAGScores(heightSorted, recordByHash,
-                                                        src.dagLinks, &canonicalScores, &error),
-                          error);
-
-    // Verify canonical score for C exists
-    uint256 hashC = uint256(300);
-    BOOST_REQUIRE_MESSAGE(canonicalScores.count(hashC),
-                          "canonical DAG score missing for C");
-
-    // Compute expected values
-    CBigNum bnTarget;
-    bnTarget.SetCompact(nBits);
-    uint256 blockTrust = ((CBigNum(1) << 256) / (bnTarget + 1)).getuint256();
-
-    // Linear trust for C: 13 * blockTrust (genesis + 10 pre-DAG + A + C)
-    uint256 linearC = CBigNum(blockTrust).getuint256();
-    for (int i = 1; i < 13; ++i)
-        linearC = (CBigNum(linearC) + CBigNum(blockTrust)).getuint256();
-
-    // Canonical: A's DAG score = preDAG(10).nChainTrust + blockTrust = 11*blockTrust + blockTrust = 12*blockTrust
-    // C's canonical = A's DAG score + blockTrust(C) + blockTrust(B) = 12*bt + bt + bt = 14*bt
-    uint256 canonicalC = canonicalScores[hashC];
-
-    // Verify canonical != linear
-    BOOST_CHECK_MESSAGE(canonicalC != linearC,
-                        "canonical must differ from linear trust");
-
-    // Step 2: Build generation and verify builder uses canonical score
+    // Step 2: Build generation and verify builder keeps linear trust
     boost::filesystem::path root = UniqueGenDir("c3-dag-trust");
     boost::filesystem::path genDir = root / "gen-000001";
     {
@@ -757,11 +725,11 @@ BOOST_AUTO_TEST_CASE(c3_canonical_dag_trust_over_linear)
     BlockIndexDerivedEntry entryC;
     BlockIndexDerivedLookupStatus readStatus = dstore.Read(src.records.size(), &entryC, &error);
     BOOST_REQUIRE_MESSAGE(readStatus == BLOCK_INDEX_DERIVED_LOOKUP_FOUND, error);
-    BOOST_CHECK_MESSAGE(entryC.chainTrust == canonicalC,
-                        "builder chainTrust for C must equal canonical DAG score");
+    BOOST_CHECK_MESSAGE(entryC.chainTrust == linearC,
+                        "builder chainTrust for C must equal linear ancestry trust");
 
-    // Step 3: Inject incorrect dagScore — builder must ignore it
-    src.dagScores[hashC] = uint256(999999);
+    // Step 3: rebuild and confirm the same linear-ancestry trust (no legacy DAG
+    // input exists to influence it).
     boost::filesystem::path root2 = UniqueGenDir("c3-dag-trust-injected");
     boost::filesystem::path genDir2 = root2 / "gen-000001";
     {
@@ -774,8 +742,8 @@ BOOST_AUTO_TEST_CASE(c3_canonical_dag_trust_over_linear)
     BlockIndexDerivedEntry entryC2;
     readStatus = dstore2.Read(src.records.size(), &entryC2, &error);
     BOOST_REQUIRE_MESSAGE(readStatus == BLOCK_INDEX_DERIVED_LOOKUP_FOUND, error);
-    BOOST_CHECK_MESSAGE(entryC2.chainTrust == canonicalC,
-                        "builder must ignore injected dagScore and use canonical reconstruction");
+    BOOST_CHECK_MESSAGE(entryC2.chainTrust == linearC,
+                        "builder chainTrust must be linear ancestry trust (no legacy DAG input surface)");
 }
 
 // ---- Helper: generate synthetic block data files ----

@@ -321,22 +321,8 @@ int main(int argc, char** argv)
         fprintf(stderr, "ERROR reading snapshot: %s\n", error.c_str());
         return 4;
     }
-    // A.10.1b-fix3 C3: Load DAG links and scores from LevelDB snapshot
-    if (!ReadDAGLinksFromSnapshot(snapshotDir, &source.dagLinks, &source.dagScores, &error))
-    {
-        fprintf(stderr, "WARNING: DAG data not loaded (continuing without DAG trust): %s\n", error.c_str());
-        // Non-fatal: some snapshots may not have DAG data
-    }
-    else
-    {
-        // R2c.1c: bind the daglinks LevelDB source so the production builder can
-        // construct the generation-bound dag-tip-frontier artifact.
-        source.dagLinksDir = snapshotDir;
-        source.foundDAGLinks = !source.dagLinks.empty();
-        printf("[DAG] loaded %llu DAG link entries, %llu DAG score entries\n",
-               (unsigned long long)source.dagLinks.size(),
-               (unsigned long long)source.dagScores.size());
-    }
+    // H9CLOSURE: the Legacy DAG source intake (daglinks snapshot reader) is
+    // physically removed; the builder no longer loads DAG links/scores.
     // A.10.1b-fix3 C1: Wire block data directory for exact nSize
     if (!blockDataDir.empty())
     {
