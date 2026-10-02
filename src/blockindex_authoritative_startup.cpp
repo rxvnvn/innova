@@ -24,7 +24,6 @@
 #include "txdb-leveldb.h"      // R4 prerequisite reads (DAG score health / custody state)
 #include "dag_tip_frontier_metadata.h"
 #include "dag_tip_frontier.h"
-#include "blockindex_dag_restart_seam.h"   // R3 production custody wiring
 #include "fixed_blockindex_store.h"
 #include "finality.h"
 
@@ -181,10 +180,8 @@ std::string AuthorityReadyPrerequisites::WhyNotReady() const
 {
     if (!durableIndexLoaded)                return "V2 durable index not loaded";
     if (!immutableAuthorityAvailable)       return "immutable authority not available";
-    if (!dagDurableStateRestored)           return "DAG durable state not restored/validated";
     if (!trustProjectionReconciled)         return "R2 trust projection not reconciled";
     if (!finalityEpochOwnerLifecycleReady)  return "FINALITY_EPOCH_OWNER_READY lifecycle condition not satisfied";
-    if (!provenanceCertificationComplete)   return "R3 provenance/projection certification not complete";
     return "";
 }
 
@@ -476,21 +473,6 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         // certificate bound to the CURRENT token (no token advance); corrupt /
         // unreadable / recolor failure -> fail closed. Registration below is the
         // publication boundary and only runs on success.
-        {
-            CTxDB txdb;
-            S4ReconcileStats s4stats;
-            std::string s4err;
-            if (!ReconcileAuthoritativeDAGScoreAuthority(txdb, &s4stats, &s4err))
-            {
-                if (error) *error = "authoritative startup: DAG score authority reconcile: " + s4err;
-                return false;
-            }
-            printf("BLOCKINDEX_V2_AUTHORITATIVE s4_score_authority fast_path=%d reconciled=%d pre=%s scope=%zu changed=%zu written=%zu elapsed_ms=%llu\n",
-                   s4stats.healthyFastPath ? 1 : 0, s4stats.reconciled ? 1 : 0,
-                   s4stats.preState.c_str(), s4stats.scopeVertices,
-                   s4stats.changedFullFields, s4stats.recordsWritten,
-                   (unsigned long long)s4stats.elapsedMs);
-        }
         dagRuntimeConfig.sourceReader = &ReadAuthoritativeDagSourceState;
         dagRuntimeConfig.runtimeSourceReader = &ReadAuthoritativeDagSourceStateRuntime;
         dagRuntimeConfig.sourceHealthy = &HealthyAuthoritativeDagSource;
@@ -507,26 +489,6 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         // Test-only: a hook may make the authority transition unhealthy at this
         // exact boundary so the re-check's refusal is proven (NULL = no-op).
         if (g_testDagObserverBoundaryHook) g_testDagObserverBoundaryHook();
-        {
-            CTxDB source("r");
-            std::string healthError;
-            const bool childCountHealthy = source.IsDAGChildCountIndexHealthy(&healthError);
-            std::string scoreHealthError;
-            const bool scoreHealthy = childCountHealthy &&
-                source.IsDAGScoreAuthorityHealthy(&scoreHealthError);
-            source.Close();
-            if (!childCountHealthy) {
-                if (error) *error = "authoritative startup: observer source unhealthy: " + healthError;
-                return false;
-            }
-            // S4: the score authority must also be healthy AT the registration
-            // boundary (a runtime may never be observable with an absent/stale/
-            // revoked/corrupt score certificate).
-            if (!scoreHealthy) {
-                if (error) *error = "authoritative startup: observer score authority unhealthy: " + scoreHealthError;
-                return false;
-            }
-        }
         // Registration comes only after Start established a healthy runtime.
         // Context teardown clears this global slot before runtime destruction.
         SetDagTipCommittedDeltaObserver(&DeliverCommittedDagTipDeltaToRuntime,
@@ -589,21 +551,14 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         int custodyState = 2;
         uint64_t custodyEpoch = 0;
         std::string custodyDetail;
-        if (LegacyDagConsensusAuthorityEnabled())
-        {
-            custodyStageComplete = EstablishDAGProvenanceCustodyAtStartup(&custodyState, &custodyEpoch, &custodyDetail);
-        }
-        else
-        {
-            // LEGACY DAG RETIREMENT (Phase 1): the dormant Legacy DAG engine owns no
-            // durable authority, so provenance/custody certification is no longer a
-            // prerequisite of current consensus startup. The implementation stays
-            // physically present and unreachable in the retired profile; the state is
-            // REPORTED (never normalized to VERIFIED) and gates nothing.
-            custodyState = 3;
-            custodyStageComplete = true;
-            custodyDetail = "Legacy DAG retired: provenance/custody certification not required";
-        }
+        // LEGACY DAG RETIREMENT (Phase 1, updated Phase 2 / Slice 3): the dormant Legacy DAG
+        // engine owns no durable authority, so provenance/custody certification is not a
+        // prerequisite of current consensus startup. Its startup-time establishment was the
+        // retired engine's executable implementation and has been physically removed; the state
+        // is REPORTED (never normalized to VERIFIED) and gates nothing.
+        custodyState = 3;
+        custodyStageComplete = true;
+        custodyDetail = "Legacy DAG retired: provenance/custody certification not required";
         std::string custodyMsg = std::string("BLOCKINDEX_V2_AUTHORITATIVE custody_state=") +
                                  std::to_string(custodyState) + " custody_epoch=" +
                                  std::to_string((unsigned long long)custodyEpoch);
@@ -635,31 +590,6 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         {
             auto readyAuthority = GetAuthoritativeLiveAuthority();
             pre.immutableAuthorityAvailable = (readyAuthority != NULL && readyAuthority->IsOpen());
-        }
-        if (!LegacyDagConsensusAuthorityEnabled())
-        {
-            // LEGACY DAG RETIREMENT (Phase 1): the DAG durable score authority and the
-            // R3 provenance/custody certification exist only to serve the dormant
-            // Legacy DAG engine. They no longer gate readiness of the CURRENT
-            // consensus authority (V2 durable index + immutable authority + linear
-            // trust projection, all still required below).
-            pre.dagDurableStateRestored = true;
-            pre.provenanceCertificationComplete = true;
-        }
-        else
-        {
-            std::string dagHealthErr;
-            CTxDB dagHealthDb("r");
-            pre.dagDurableStateRestored = dagHealthDb.IsDAGScoreAuthorityHealthy(&dagHealthErr);
-            // The R3 certification stage must have COMPLETED (a definite custody state was
-            // determined: VERIFIED, SUSPENDED or UNAVAILABLE — the last being the frozen
-            // fail-closed determination for a store that cannot be positively certified).
-            // Only an I/O failure leaves the stage incomplete and the barrier unset. The state is
-            // read here too so the diagnostic reflects the durable store at the true exit.
-            const DAGCustodyState exitCustodyState = dagHealthDb.GetDAGCustodyState();
-            pre.provenanceCertificationComplete = custodyStageComplete;
-            (void)exitCustodyState;
-            dagHealthDb.Close();
         }
         {
             // R2 trust projection reconciliation, evaluated over the frozen R2 domain.
@@ -1871,196 +1801,3 @@ bool ReconcileAuthoritativeDAGScoreInBatch(
 // (TxnAbort discards the batch wholesale); a failure after the commit leaves it
 // NEW/coherent with startup failing closed and nothing published.
 // ---------------------------------------------------------------------------
-bool ReconcileAuthoritativeDAGScoreAuthority(CTxDB& db, S4ReconcileStats* stats,
-                                             std::string* error)
-{
-    if (error) error->clear();
-    if (stats) *stats = S4ReconcileStats();
-    const int64_t startedMs = GetTimeMillis();
-
-    // Quiesced-source contract (mirrors EnsureDAGChildCountIndex): reconcile
-    // owns its own batch; never run inside an open transaction.
-    if (db.HasActiveBatch())
-    { if (error) *error = "S4 reconcile: requires a quiesced source without an active transaction"; return false; }
-
-    // Never certify score authority on top of an untrusted topology/count
-    // source (matrix F): child-count health is a precondition, checked before
-    // any score decision.
-    {
-        std::string ccErr;
-        if (!db.IsDAGChildCountIndexHealthy(&ccErr))
-        { if (error) *error = "S4 reconcile: child-count authority unhealthy: " + ccErr; return false; }
-    }
-
-    // Fast path (matrix A): already provably healthy for the current token ->
-    // zero writes, zero token churn, zero certificate churn.
-    {
-        std::string healthErr;
-        if (db.IsDAGScoreAuthorityHealthy(&healthErr))
-        {
-            if (stats)
-            {
-                stats->healthyFastPath = true;
-                stats->preState = "healthy";
-                stats->elapsedMs = (uint64_t)(GetTimeMillis() - startedMs);
-            }
-            g_lastS4ReconcileStats = stats ? *stats : S4ReconcileStats();
-            g_lastS4ReconcileStatsValid = true;
-            fprintf(stderr, "S4_RECONCILE fast_path=1 reconciled=0 pre=healthy scope=0 changed=0 written=0 elapsed_ms=%llu\n",
-                    (unsigned long long)(stats ? stats->elapsedMs : 0));
-            fflush(stderr);
-            return true;
-        }
-    }
-
-    // Classify the durable marker state from raw bytes. Mirrors the accepted
-    // child-count contract: undecodable/unreadable -> fail closed (never
-    // reinterpret corruption as absence); decodable pair of ANY version/token
-    // (or with trailing junk) -> repairable through the reviewed fresh-recolor
-    // + republish route; absent -> migration; poison -> revocation repair.
-    bool markerPresent = false, revoked = false;
-    std::string markerRaw, capErr;
-    if (!db.CaptureDAGScoreCertificateState(&markerPresent, &markerRaw, &revoked, &capErr))
-    { if (error) *error = "S4 reconcile: score certificate capture failed: " + capErr; return false; }
-
-    uint256 token0;
-    if (!db.ReadDAGSourceStateId(token0))
-    { if (error) *error = "S4 reconcile: current SourceStateId unavailable"; return false; }
-
-    std::string preState;
-    if (revoked) preState = "revoked";
-    else if (!markerPresent) preState = "absent";
-    else
-    {
-        bool decodable = false;
-        std::pair<uint32_t,uint256> pair;
-        try
-        {
-            CDataStream is(markerRaw.data(), markerRaw.data()+markerRaw.size(), SER_DISK, CLIENT_VERSION);
-            is >> pair;
-            decodable = true;
-        }
-        catch (const std::exception&) { decodable = false; }
-        if (!decodable)
-        { if (error) *error = "S4 reconcile: corrupt score state marker (undecodable; refusing to reinterpret corruption as absence)"; return false; }
-        if (pair.first != 1) preState = "unsupported";
-        else if (pair.second != token0) preState = "stale";
-        else preState = "trailing";
-    }
-
-    // Bounded canonical reconcile. Enumerate the strict retained scope, recolor
-    // it from authoritative sources, persist atomically.
-    if (!db.TxnBegin())
-    { if (error) *error = "S4 reconcile: TxnBegin failed"; return false; }
-
-    if (!S4ReconcileBarrier(1, error)) { db.TxnAbort(); return false; }
-    std::vector<std::pair<int32_t,uint256>> scope;
-    std::string scopeErr;
-    if (!EnumerateAuthoritativeStagedScope(db, &scope, NULL, &scopeErr))
-    {
-        db.TxnAbort();
-        if (error) *error = "S4 reconcile: strict scope enumeration failed: " + scopeErr;
-        return false;
-    }
-    // Canonical retained canvas = DAG-era vertices. The production source gate
-    // (AddToBlockIndex) writes daglinks ONLY for nHeight >= FORK_HEIGHT_DAG PoW
-    // blocks; pre-DAG vertices contribute through PreDAGTrust, never as canvas
-    // records. Pre-DAG keys are therefore excluded from the score canvas AFTER
-    // the strict enumeration (which still fail-closed on any unresolvable or
-    // malformed record - no silent omission of a required record).
-    size_t preDAGFiltered = 0;
-    {
-        std::vector<std::pair<int32_t,uint256>> dagScope;
-        dagScope.reserve(scope.size());
-        for (size_t i = 0; i < scope.size(); ++i)
-        {
-            if (scope[i].first >= GetForkHeightDAG()) dagScope.push_back(scope[i]);
-            else ++preDAGFiltered;
-        }
-        scope.swap(dagScope);
-    }
-
-    if (!S4ReconcileBarrier(2, error)) { db.TxnAbort(); return false; }
-    AuthoritativeDAGRecolorSource source(db);
-    std::vector<CanonicalDAGRecolorRecord> fields;
-    CanonicalDAGRecolorStats recolorStats;
-    std::string recolorErr;
-    if (!ReconstructAuthoritativeDAGFields(scope, source, &fields, &recolorStats, &recolorErr))
-    {
-        db.TxnAbort();
-        if (error) *error = "S4 reconcile: canonical recolor failed: " + recolorErr;
-        return false;
-    }
-
-    if (!S4ReconcileBarrier(3, error)) { db.TxnAbort(); return false; }
-    AuthoritativeDAGStageResult stageResult;
-    std::string stageErr;
-    if (!StageDAGFullFieldRecords(db, fields, NULL, /*diffOnlyWrites=*/true, &stageResult, &stageErr))
-    {
-        db.TxnAbort();
-        if (error) *error = "S4 reconcile: full-field staging failed: " + stageErr;
-        return false;
-    }
-
-    if (!S4ReconcileBarrier(4, error)) { db.TxnAbort(); return false; }
-    std::string markerErr;
-    if (!db.StageDAGScoreCertificateInBatch(token0, &markerErr))
-    {
-        db.TxnAbort();
-        if (error) *error = "S4 reconcile: score certificate staging failed: " + markerErr;
-        return false;
-    }
-
-    // Pre-commit window: injected failure, commit-failure seam, and the source
-    // token stability re-read (matrix G). A token change discards the batch.
-    if (!S4ReconcileBarrier(5, error)) { db.TxnAbort(); return false; }
-    if (g_testFailS4ReconcileCommit)
-    { db.TxnAbort(); if (error) *error = "S4 reconcile: injected commit failure"; return false; }
-    uint256 tokenPreCommit;
-    if (!db.ReadDAGSourceStateId(tokenPreCommit))
-    { db.TxnAbort(); if (error) *error = "S4 reconcile: source token stability re-read failed"; return false; }
-    if (tokenPreCommit != token0)
-    { db.TxnAbort(); if (error) *error = "S4 reconcile: source token changed during reconcile (batch discarded)"; return false; }
-
-    if (!db.TxnCommit())
-    { db.TxnAbort(); if (error) *error = "S4 reconcile: TxnCommit failed"; return false; }
-
-    // Post-commit: disk is NEW/coherent. Any failure below fails startup closed
-    // (no runtime/observer was or will be published on this path).
-    if (!S4ReconcileBarrier(6, error)) return false;
-    {
-        std::string postErr;
-        if (!db.IsDAGScoreAuthorityHealthy(&postErr))
-        {
-            if (error) *error = "S4 reconcile: post-commit health re-read failed: " + postErr;
-            return false;
-        }
-    }
-
-    if (stats)
-    {
-        stats->reconciled = true;
-        stats->preState = preState;
-        stats->scopeVertices = scope.size();
-        stats->preDAGFiltered = preDAGFiltered;
-        stats->changedFullFields = stageResult.stagedFullFieldRecords;
-        stats->recordsWritten = stageResult.stagedFullFieldRecords;
-        stats->boundaryClosures = recolorStats.boundaryVertices;
-        stats->metadataResolved = recolorStats.metadataSnapshots;
-        stats->recoloredVertices = recolorStats.colorOrderEntries;
-        stats->estimatedBatchBytes = stageResult.stagedFullFieldRecords * (sizeof(CBlockDAGData) + 48) + 128;
-        stats->materializedObjects = recolorStats.materializedObjects;
-        stats->elapsedMs = (uint64_t)(GetTimeMillis() - startedMs);
-    }
-    g_lastS4ReconcileStats = stats ? *stats : S4ReconcileStats();
-    g_lastS4ReconcileStatsValid = true;
-    fprintf(stderr, "S4_RECONCILE fast_path=0 reconciled=1 pre=%s scope=%zu pre_dag_filtered=%zu changed=%zu written=%zu boundary_closures=%zu metadata=%zu recolored=%zu batch_bytes=%zu materialized=%zu elapsed_ms=%llu\n",
-            preState.c_str(), scope.size(), preDAGFiltered, stageResult.stagedFullFieldRecords,
-            stageResult.stagedFullFieldRecords, recolorStats.boundaryVertices,
-            recolorStats.metadataSnapshots, recolorStats.colorOrderEntries,
-            stageResult.stagedFullFieldRecords * (sizeof(CBlockDAGData) + 48) + 128,
-            recolorStats.materializedObjects,
-            (unsigned long long)(stats ? stats->elapsedMs : 0));
-    fflush(stderr);
-    return true;
-}
