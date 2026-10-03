@@ -403,7 +403,6 @@ WalletModel::SendCoinsReturn WalletModel::sendCoins(const QList<SendCoinsRecipie
         return SendCoinsReturn(AmountWithFeeExceedsBalance, nTransactionFee);
     }
 
-    std::map<int, std::string> mapStealthNarr;
 
     {
         LOCK2(cs_main, wallet->cs_wallet);
@@ -418,96 +417,11 @@ WalletModel::SendCoinsReturn WalletModel::sendCoins(const QList<SendCoinsRecipie
 
             if (rcp.typeInd == AddressTableModel::AT_Stealth)
             {
-                CStealthAddress sxAddr;
-                if (sxAddr.SetEncoded(sAddr))
-                {
-                    ec_secret ephem_secret;
-                    ec_secret secretShared;
-                    ec_point pkSendTo;
-                    ec_point ephem_pubkey;
-
-
-                    if (GenerateRandomSecret(ephem_secret) != 0)
-                    {
-                        printf("GenerateRandomSecret failed.\n");
-                        return Aborted;
-                    };
-
-                    if (StealthSecret(ephem_secret, sxAddr.scan_pubkey, sxAddr.spend_pubkey, secretShared, pkSendTo) != 0)
-                    {
-                        printf("Could not generate receiving public key.\n");
-                        return Aborted;
-                    };
-
-                    CPubKey cpkTo(pkSendTo);
-                    if (!cpkTo.IsValid())
-                    {
-                        printf("Invalid public key generated.\n");
-                        return Aborted;
-                    };
-
-                    CKeyID ckidTo = cpkTo.GetID();
-
-                    CBitcoinAddress addrTo(ckidTo);
-
-                    if (SecretToPublicKey(ephem_secret, ephem_pubkey) != 0)
-                    {
-                        printf("Could not generate ephem public key.\n");
-                        return Aborted;
-                    };
-
-                    if (fDebug)
-                    {
-                        printf("Stealth send to generated pubkey %" PRIszu": %s\n", pkSendTo.size(), HexStr(pkSendTo).c_str());
-                        printf("hash %s\n", addrTo.ToString().c_str());
-                        printf("ephem_pubkey %" PRIszu": %s\n", ephem_pubkey.size(), HexStr(ephem_pubkey).c_str());
-                    };
-
-                    CScript scriptPubKey;
-                    scriptPubKey.SetDestination(addrTo.Get());
-
-                    vecSend.push_back(make_pair(scriptPubKey, rcp.amount));
-
-                    CScript scriptP = CScript() << OP_RETURN << ephem_pubkey;
-
-                    if (rcp.narration.length() > 0)
-                    {
-                        std::string sNarr = rcp.narration.toStdString();
-
-                        if (sNarr.length() > 24)
-                        {
-                            printf("Narration is too long.\n");
-                            return NarrationTooLong;
-                        };
-
-                        std::vector<unsigned char> vchNarr;
-
-                        SecMsgCrypter crypter;
-                        crypter.SetKey(&secretShared.e[0], &ephem_pubkey[0]);
-
-                        if (!crypter.Encrypt((uint8_t*)&sNarr[0], sNarr.length(), vchNarr))
-                        {
-                            printf("Narration encryption failed.\n");
-                            return Aborted;
-                        };
-
-                        if (vchNarr.size() > 48)
-                        {
-                            printf("Encrypted narration is too long.\n");
-                            return Aborted;
-                        };
-
-                        if (vchNarr.size() > 0)
-                            scriptP = scriptP << OP_RETURN << vchNarr;
-
-                        int pos = vecSend.size()-1;
-                        mapStealthNarr[pos] = sNarr;
-                    };
-
-                    vecSend.push_back(make_pair(scriptP, 0));
-
-                    continue;
-                }; // else drop through to normal
+                // M6D: active transparent -> legacy Stealth payment product retired.
+                // Retained stealth surfaces are receive/address management and the
+                // RingSig/ANON subsystem; never silently create a legacy Stealth tx.
+                printf("Stealth payment creation retired; use anon transfer instead.\n");
+                return Aborted;
             }
 
             CScript scriptPubKey;
@@ -549,22 +463,6 @@ WalletModel::SendCoinsReturn WalletModel::sendCoins(const QList<SendCoinsRecipie
         bool fCreated = wallet->CreateTransaction(vecSend, wtx, keyChange, nFeeRequired,
                                                   nChangePos, coinControl, NULL,
                                                   &strFailReason);
-
-        std::map<int, std::string>::iterator it;
-        for (it = mapStealthNarr.begin(); it != mapStealthNarr.end(); ++it)
-        {
-            int pos = it->first;
-            if (nChangePos > -1 && it->first >= nChangePos)
-                pos++;
-
-            char key[64];
-            if (snprintf(key, sizeof(key), "n_%u", pos) < 1)
-            {
-                printf("CreateStealthTransaction(): Error creating narration key.");
-                continue;
-            };
-            wtx.mapValue[key] = it->second;
-        };
 
 
         if(!fCreated)

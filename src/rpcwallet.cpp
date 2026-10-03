@@ -924,10 +924,6 @@ Value sendtoaddress(const Array& params, bool fHelp)
 
     EnsureWalletIsUnlocked();
 
-    if (params[0].get_str().length() > 75
-        && IsStealthAddress(params[0].get_str()))
-        return sendtostealthaddress(params, false);
-
     CBitcoinAddress address(params[0].get_str());
     if (!address.IsValid())
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Innova address");
@@ -2912,54 +2908,6 @@ Value importstealthaddress(const Array& params, bool fHelp)
         throw runtime_error("Could not save to wallet.");
 
     return result;
-}
-
-Value sendtostealthaddress(const Array& params, bool fHelp)
-{
-    if (fHelp || params.size() < 2 || params.size() > 5)
-        throw runtime_error(
-            "sendtostealthaddress <stealth_address> <amount> [narration] [comment] [comment-to]\n"
-            "Send funds to a stealth address.\n"
-            "<stealth_address> is the recipient's stealth address\n"
-            "<amount> is a real number and is rounded to the nearest 0.000001\n"
-            "[narration] is an optional 24 character narration stored in the transaction"
-            + HelpRequiringPassphrase());
-
-    if (pwalletMain->IsLocked())
-        throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
-
-    std::string sEncoded = params[0].get_str();
-
-    if (!IsStealthAddress(sEncoded))
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Invalid Innova stealth address.");
-
-    int64_t nAmount = AmountFromValue(params[1]);
-
-    std::string sNarr;
-    if (params.size() > 2 && params[2].type() != null_type && !params[2].get_str().empty())
-        sNarr = params[2].get_str();
-
-    if (sNarr.length() > 24)
-        throw runtime_error("Narration must be 24 characters or less.");
-
-    CStealthAddress sxAddr;
-    if (!sxAddr.SetEncoded(sEncoded))
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Could not decode stealth address.");
-
-    CWalletTx wtx;
-    if (params.size() > 3 && params[3].type() != null_type && !params[3].get_str().empty())
-        wtx.mapValue["comment"] = params[3].get_str();
-    if (params.size() > 4 && params[4].type() != null_type && !params[4].get_str().empty())
-        wtx.mapValue["to"]      = params[4].get_str();
-
-    std::string sError;
-    if (!pwalletMain->SendStealthMoneyToDestination(sxAddr, nAmount, sNarr, wtx, sError))
-    {
-        printf("SendStealthMoneyToDestination failed: %s\n", sError.c_str());
-        throw JSONRPCError(RPC_WALLET_ERROR, sError);
-    }
-
-    return wtx.GetHash().GetHex();
 }
 
 Value clearwallettransactions(const Array& params, bool fHelp)
