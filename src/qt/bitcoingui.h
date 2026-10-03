@@ -86,7 +86,6 @@ private:
 	  MultisigDialog *multisigPage;
     StakingPage *stakingPage;
     PrivacyPage *privacyPage;
-    QWidget *nullsendPage;
 	  CollateralnodeManager *collateralnodeManagerPage;
     AddressBookPage *addressBookPage;
     AddressBookPage *receiveCoinsPage;
@@ -110,7 +109,6 @@ private:
 	  QAction *multisigAction;
     QAction *stakingAction;
     QAction *privacyAction;
-    QAction *nullsendAction;
 	  QAction *collateralnodeManagerAction;
     QAction *quitAction;
     QAction *sendCoinsAction;
@@ -208,8 +206,6 @@ private slots:
     void gotoStakingPage();
     /** Switch to Privacy page */
     void gotoPrivacyPage();
-    /** Switch to NullSend page */
-    void gotoNullSendPage();
 
 
 

@@ -1486,9 +1486,6 @@ uint256 SignatureHash(CScript scriptCode, const CTransaction& txTo, unsigned int
     }
     CTransaction txTmp(txTo);
 
-    if (txTmp.IsShielded())
-        txTmp.bindingSig.bindingSig.vchSignature.clear();
-
     // In case concatenating two scripts ends up with two codeseparators,
     // or an extra one at the end, this prevents all those possible incompatibilities.
     scriptCode.FindAndDelete(CScript(OP_CODESEPARATOR));

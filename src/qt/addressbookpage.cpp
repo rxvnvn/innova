@@ -118,11 +118,6 @@ AddressBookPage::AddressBookPage(Mode mode, Tabs tab, QWidget *parent) :
 
         // Add address type generation buttons for the Receive tab
         {
-            QPushButton *btnNewShielded = new QPushButton(tr("New shielde&d address"), this);
-            btnNewShielded->setToolTip(tr("Generate a new shielded address"));
-            ui->horizontalLayout->insertWidget(1, btnNewShielded);
-            connect(btnNewShielded, SIGNAL(clicked()), this, SLOT(onNewShieldedAddressClicked()));
-
             QPushButton *btnNewSP = new QPushButton(tr("New silent p&ayment address"), this);
             btnNewSP->setToolTip(tr("Generate a new Silent Payment address"));
             ui->horizontalLayout->insertWidget(2, btnNewSP);
@@ -500,42 +495,6 @@ void AddressBookPage::selectNewAddress(const QModelIndex &parent, int begin, int
 void AddressBookPage::setWalletModel(WalletModel *walletModel)
 {
     this->walletModel = walletModel;
-}
-
-void AddressBookPage::onNewShieldedAddressClicked()
-{
-    if (!walletModel)
-        return;
-
-    bool ok;
-    QString label = QInputDialog::getText(this, tr("New Shielded Address"),
-        tr("Label for new shielded address (optional):"), QLineEdit::Normal, "", &ok);
-    if (!ok) return;
-
-    WalletModel::UnlockContext ctx(walletModel->requestUnlock());
-    if (!ctx.isValid())
-        return;
-
-    QString newAddr = walletModel->getNewShieldedAddress();
-    if (newAddr.isEmpty())
-    {
-        QMessageBox::warning(this, tr("Error"), tr("Failed to generate shielded address."));
-        return;
-    }
-
-    // Save label for this z-address (persisted via QSettings)
-    if (!label.isEmpty())
-    {
-        QSettings settings;
-        settings.setValue("addrLabel/" + newAddr, label);
-    }
-
-    // Full refresh so z-address appears with correct "Shielded" type
-    if (model) model->refresh();
-
-    QApplication::clipboard()->setText(newAddr);
-    QMessageBox::information(this, tr("New Shielded Address"),
-        tr("Address copied to clipboard:\n\n%1").arg(newAddr));
 }
 
 void AddressBookPage::onNewSPAddressClicked()

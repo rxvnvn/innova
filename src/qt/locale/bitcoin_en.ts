@@ -183,11 +183,7 @@ This product includes software developed by the OpenSSL Project for use in the O
         <source>New shielde&amp;d address</source>
         <translation>New shielde&amp;d address</translation>
     </message>
-    <message>
-        <location filename="../addressbookpage.cpp" line="+0"/>
-        <source>Generate a new shielded address</source>
-        <translation>Generate a new shielded address</translation>
-    </message>
+
     <message>
         <location filename="../addressbookpage.cpp" line="+0"/>
         <source>New silent p&amp;ayment address</source>
@@ -208,11 +204,7 @@ This product includes software developed by the OpenSSL Project for use in the O
         <source>Generate a new staking address for cold staking</source>
         <translation>Generate a new staking address for cold staking</translation>
     </message>
-    <message>
-        <location filename="../addressbookpage.cpp" line="+0"/>
-        <source>Label for new shielded address (optional):</source>
-        <translation>Label for new shielded address (optional):</translation>
-    </message>
+
     <message>
         <location filename="../addressbookpage.cpp" line="+0"/>
         <source>Label for new silent payment address (optional):</source>
@@ -864,10 +856,7 @@ Address: %4
         <source>Node Information</source>
         <translation>Node Information</translation>
     </message>
-    <message>
-        <source>&amp;NullSend</source>
-        <translation>&amp;NullSend</translation>
-    </message>
+
     <message>
         <source>Staking &amp;Inputs</source>
         <translation>Staking &amp;Inputs</translation>
@@ -1492,14 +1481,7 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <source>Total of coins that was staked, and do not yet count toward the current balance</source>
         <translation>Total of coins that was staked, and do not yet count toward the current balance</translation>
     </message>
-    <message>
-        <source>Shielded (Private):</source>
-        <translation>Shielded (Private):</translation>
-    </message>
-    <message>
-        <source>Coins in the shielded (private) pool. Hidden from the public ledger.</source>
-        <translation>Coins in the shielded (private) pool. Hidden from the public ledger.</translation>
-    </message>
+
     <message>
         <source>Unconfirmed:</source>
         <translation>Unconfirmed:</translation>
@@ -1572,10 +1554,7 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <source>Stake balance</source>
         <translation>Stake balance</translation>
     </message>
-    <message>
-        <source>Shielded (private) balance. Shield coins via the Send page to move funds here.</source>
-        <translation>Shielded (private) balance. Shield coins via the Send page to move funds here.</translation>
-    </message>
+
     <message>
         <source>Your current total balance</source>
         <translation>Your current total balance</translation>

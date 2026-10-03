@@ -8,8 +8,6 @@
 #include "miner.h"
 #include "kernel.h"
 #include "collateralnode.h"
-#include "epoch_state.h"
-#include "finality.h"
 #include "blockindex_authoritative_live.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_hot_owner.h"
@@ -26,20 +24,6 @@ using namespace std;
 //
 
 extern unsigned int nMinerSleep;
-
-static bool TransactionSpendsAnyOutpoint(const CTransaction& tx,
-                                         const std::set<COutPoint>& setOutpoints)
-{
-    if (setOutpoints.empty())
-        return false;
-
-    BOOST_FOREACH(const CTxIn& txin, tx.vin)
-    {
-        if (setOutpoints.count(txin.prevout))
-            return true;
-    }
-    return false;
-}
 
 int static FormatHashBlocks(void* pbuffer, unsigned int len)
 {
@@ -291,20 +275,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
 
     pblock->nBits = GetNextTargetRequired(pindexPrev, fProofOfStake);
 
-    std::vector<CFinalityVote> vFinalityVotesForBlock;
-    std::set<COutPoint> setFinalityStakeProofOutpoints;
-    if (!fProofOfStake && nHeight >= FORK_HEIGHT_DAG)
-    {
-        vFinalityVotesForBlock = g_finalityTracker.GetPendingVotesForBlock(nHeight);
-        BOOST_FOREACH(const CFinalityVote& vote, vFinalityVotesForBlock)
-        {
-            if (vote.IsPrivate())
-                continue;
-            BOOST_FOREACH(const COutPoint& proof, vote.vStakeProof)
-                setFinalityStakeProofOutpoints.insert(proof);
-        }
-    }
-
     // Collect memory pool transactions into the block
     int64_t nFees = 0;
     {
@@ -381,14 +351,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
             if (tx.IsCoinBase() || tx.IsCoinStake() || !tx.IsFinal())
                 continue;
 
-
-            // Transparent finality votes use existing UTXOs as stake proofs.
-            // Consensus rejects blocks that both commit such a vote and spend
-            // the proof UTXO, so reserve those outpoints while building the
-            // candidate block.
-            if (TransactionSpendsAnyOutpoint(tx, setFinalityStakeProofOutpoints))
-                continue;
-
             COrphan* porphan = NULL;
             double dPriority = 0;
             int64_t nTotalIn = 0;
@@ -460,16 +422,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
             // client code rounds up the size to the nearest 1K. That's good, because it gives an
             // incentive to create smaller transactions.
             int64_t nFee = nTotalIn-tx.GetValueOut();
-            if (tx.IsShielded() && tx.nValueBalance != 0)
-            {
-                if ((tx.nValueBalance > 0 && nFee > std::numeric_limits<int64_t>::max() - tx.nValueBalance) ||
-                    (tx.nValueBalance < 0 && nFee < std::numeric_limits<int64_t>::min() - tx.nValueBalance))
-                {
-                    printf("CreateNewBlock: fee overflow with shielded value balance, skipping tx\n");
-                    continue;
-                }
-                nFee += tx.nValueBalance;
-            }
             double dFeePerKb =  double(nFee) / (double(nTxSize)/1000.0);
 
             if (porphan)
@@ -560,8 +512,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
 
                     nTxFees += nSumAnon;
                 };
-                if (tx.IsShielded() && tx.nValueBalance != 0)
-                    nTxFees += tx.nValueBalance;
                 nFee = nTxFees;
             };
             // TODO: must this be done twice!?
@@ -608,68 +558,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
                         }
                     }
                 }
-            }
-        }
-
-        int64_t nFinalityRewardTotal = 0;
-        if (!fProofOfStake && nHeight >= FORK_HEIGHT_DAG)
-        {
-            for (const CFinalityVote& vote : vFinalityVotesForBlock)
-            {
-                if (nFinalityRewardTotal > MAX_MONEY - vote.nReward)
-                    break;
-
-                CScript voteScript = BuildFinalityVoteScript(vote);
-                unsigned int nVoteCommitSize = ::GetSerializeSize(voteScript, SER_NETWORK, PROTOCOL_VERSION);
-                if (nBlockSize + nVoteCommitSize + 64 >= nBlockMaxSize)
-                    break;
-
-                CTxOut voteOut;
-                voteOut.nValue = 0;
-                voteOut.scriptPubKey = voteScript;
-                pblock->vtx[0].vout.push_back(voteOut);
-
-                CPubKey pubkey(vote.vchPubKey);
-                if (!pubkey.IsValid())
-                    continue;
-
-                CTxOut rewardOut;
-                rewardOut.nValue = vote.nReward;
-                rewardOut.scriptPubKey = GetScriptForDestination(pubkey.GetID());
-                pblock->vtx[0].vout.push_back(rewardOut);
-
-                nFinalityRewardTotal += vote.nReward;
-                nBlockSize += nVoteCommitSize + 64;
-            }
-
-            std::vector<CFinalityTallyShare> vFinalityShares = g_finalityTracker.GetPendingTallySharesForBlock(nHeight);
-            for (const CFinalityTallyShare& share : vFinalityShares)
-            {
-                CScript shareScript = BuildFinalityTallyShareScript(share);
-                unsigned int nShareCommitSize = ::GetSerializeSize(shareScript, SER_NETWORK, PROTOCOL_VERSION);
-                if (nBlockSize + nShareCommitSize + 16 >= nBlockMaxSize)
-                    break;
-
-                CTxOut shareOut;
-                shareOut.nValue = 0;
-                shareOut.scriptPubKey = shareScript;
-                pblock->vtx[0].vout.push_back(shareOut);
-                nBlockSize += nShareCommitSize + 16;
-            }
-
-            std::vector<CFinalityTallyCertificate> vFinalityCerts = g_finalityTracker.GetPendingTallyCertificatesForBlock(nHeight);
-            for (const CFinalityTallyCertificate& cert : vFinalityCerts)
-            {
-                CScript certScript = BuildFinalityTallyCertificateScript(cert);
-                unsigned int nCertCommitSize = ::GetSerializeSize(certScript, SER_NETWORK, PROTOCOL_VERSION);
-                if (nBlockSize + nCertCommitSize + 16 >= nBlockMaxSize)
-                    break;
-
-                CTxOut certOut;
-                certOut.nValue = 0;
-                certOut.scriptPubKey = certScript;
-                pblock->vtx[0].vout.push_back(certOut);
-                nBlockSize += nCertCommitSize + 16;
             }
         }
 
@@ -798,7 +686,6 @@ void StakeMiner(CWallet *pwallet)
 
     bool fTryToSync = true;
     int64_t nTimeLastStake = 0;
-    int nLastFinalityEpochVoted = -1;
 
     while (true)
     {
@@ -874,32 +761,6 @@ void StakeMiner(CWallet *pwallet)
         {
             if (fDebug && GetBoolArg("-printcoinstake"))
                 printf("StakeMiner() chain stale, pausing for sync\n");
-            MilliSleep(5000);
-            continue;
-        }
-
-        // IDAG: after the DAG fork, stakers no longer create blocks. The
-        // staking thread only produces transparent finality votes.
-        bool fPostDAGFinalityMode = false;
-        bool fShouldProduceFinalityVote = false;
-        int nFinalityEpoch = -1;
-        {
-            LOCK(cs_main);
-            if (pindexBest && pindexBest->nHeight >= FORK_HEIGHT_DAG)
-            {
-                fPostDAGFinalityMode = true;
-                nFinalityEpoch = GetEpochForHeight(pindexBest->nHeight);
-                int nEpochBoundary = GetEpochBoundaryHeight(nFinalityEpoch, pindexBest->nHeight);
-                int nEpochProgress = pindexBest->nHeight - nEpochBoundary;
-                fShouldProduceFinalityVote = (nEpochProgress < FINALITY_VOTE_WINDOW &&
-                                              nFinalityEpoch != nLastFinalityEpochVoted);
-            }
-        }
-        if (fPostDAGFinalityMode)
-        {
-            ProcessFinalityTallyCommittee();
-            if (fShouldProduceFinalityVote && ProduceFinalityVote())
-                nLastFinalityEpochVoted = nFinalityEpoch;
             MilliSleep(5000);
             continue;
         }

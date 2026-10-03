@@ -7,10 +7,7 @@
 #define BITCOIN_LEVELDB_H
 
 #include "main.h"
-#include "epoch_state.h"
-#include "finality.h"
 #include "ringsig.h"
-#include "curvetree.h"
 
 #include <map>
 #include <string>
@@ -252,45 +249,7 @@ public:
     bool ReadAnonOutput(CPubKey& pkCoin, CAnonOutput& ao);
     bool EraseAnonOutput(CPubKey& pkCoin);
 
-    bool WriteShieldedNullifier(const uint256& nullifier, const CShieldedNullifierSpent& nfs);
-    bool ReadShieldedNullifier(const uint256& nullifier, CShieldedNullifierSpent& nfs);
-    bool EraseShieldedNullifier(const uint256& nullifier);
-
-    bool WriteShieldedAnchor(const uint256& anchor);
-    bool ReadShieldedAnchor(const uint256& anchor);
-    bool EraseShieldedAnchor(const uint256& anchor);
-    bool WriteShieldedAnchorHeight(const uint256& anchor, int nHeight);
-    bool ReadShieldedAnchorHeight(const uint256& anchor, int& nHeight);
-
-    bool WriteShieldedTree(const CIncrementalMerkleTree& tree);
-    bool ReadShieldedTree(CIncrementalMerkleTree& tree);
-
-    bool WriteShieldedTreeAtBlock(const uint256& blockHash, const CIncrementalMerkleTree& tree);
-    bool ReadShieldedTreeAtBlock(const uint256& blockHash, CIncrementalMerkleTree& tree);
-
-    bool WriteShieldedPoolValue(int64_t nValue);
-    bool ReadShieldedPoolValue(int64_t& nValue);
-
-    bool WriteShieldedCommitment(uint64_t nIndex, const CPedersenCommitment& commit);
-    bool ReadShieldedCommitment(uint64_t nIndex, CPedersenCommitment& commit);
-    bool ReadAllShieldedCommitments(std::vector<CPedersenCommitment>& vCommitments);
-    bool ReadShieldedCommitmentCount(uint64_t& nCount);
-    bool WriteShieldedCommitmentCount(uint64_t nCount);
-
-    bool WriteShieldedCommitmentHeight(uint64_t nIndex, int nHeight);
-    bool ReadShieldedCommitmentHeight(uint64_t nIndex, int& nHeight);
-    bool WriteShieldedCommitmentIndex(const std::vector<unsigned char>& vchCommitment, uint64_t nIndex);
-    bool ReadShieldedCommitmentIndex(const std::vector<unsigned char>& vchCommitment, uint64_t& nIndex);
-
-    bool WriteCurveTree(const CCurveTree& tree);
-    bool ReadCurveTree(CCurveTree& tree);
-    bool WriteCurveTreeAtBlock(const uint256& blockHash, const CCurveTree& tree);
-    bool ReadCurveTreeAtBlock(const uint256& blockHash, CCurveTree& tree);
-    bool EraseCurveTreeAtBlock(const uint256& blockHash);
-    bool WriteCurveTreeAtEpoch(int nEpoch, const CCurveTree& tree);
-    bool ReadCurveTreeAtEpoch(int nEpoch, CCurveTree& tree);
-
-	bool ReadAddrIndex(uint160 addrHash, std::vector<uint256>& txHashes);
+bool ReadAddrIndex(uint160 addrHash, std::vector<uint256>& txHashes);
     bool WriteAddrIndex(uint160 addrHash, uint256 txHash);
     bool ReadTxIndex(uint256 hash, CTxIndex& txindex);
     bool UpdateTxIndex(uint256 hash, const CTxIndex& txindex);
@@ -413,11 +372,6 @@ public:
     // Zero-delta legacy upgrade: creates a token only when the key is absent.
     // A present-but-undecodable token is corruption, never treated as missing.
 
-    // IDAG Phase 3: Epoch state persistence
-    bool WriteEpochState(int nEpoch, const CEpochState& state);
-    bool IterateEpochStates(std::map<int, CEpochState>& mapOut);
-    bool IterateCurveTreeEpochs(std::map<int, CCurveTree>& mapOut);
-
     // F2 erase provenance. `dagcleanheight` above is written by THREE sites with
     // TWO meanings (the prune path stores the erase floor, Shutdown stores the
     // current tip, and the prune rollback restores a prior value), so it cannot
@@ -511,19 +465,6 @@ public:
     // Shared tail of the two republication paths: re-bind floor/hCert/counter/journal
     // from the durable state and re-publish the certificate in the ACTIVE batch.
 
-    // IDAG finality vote persistence
-    bool WriteFinalityVote(const uint256& nullifier, const CFinalityVote& vote);
-    bool ReadFinalityVote(const uint256& nullifier, CFinalityVote& vote);
-    bool EraseFinalityVote(const uint256& nullifier);
-    bool IterateFinalityVotes(std::map<uint256, CFinalityVote>& mapOut);
-    bool WriteFinalityTallyShare(const uint256& hashShare, const CFinalityTallyShare& share);
-    bool ReadFinalityTallyShare(const uint256& hashShare, CFinalityTallyShare& share);
-    bool EraseFinalityTallyShare(const uint256& hashShare);
-    bool IterateFinalityTallyShares(std::map<uint256, CFinalityTallyShare>& mapOut);
-    bool WriteFinalityTallyCertificate(const uint256& hashCert, const CFinalityTallyCertificate& cert);
-    bool ReadFinalityTallyCertificate(const uint256& hashCert, CFinalityTallyCertificate& cert);
-    bool EraseFinalityTallyCertificate(const uint256& hashCert);
-    bool IterateFinalityTallyCertificates(std::map<uint256, CFinalityTallyCertificate>& mapOut);
 private:
     bool LoadBlockIndexGuts();
 };

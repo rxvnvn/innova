@@ -55,7 +55,7 @@ void OptionsModel::Init()
     nReserveBalance = settings.value("nReserveBalance").toLongLong();
     language = settings.value("language", "").toString();
     nStakingModeOption = settings.value("nStakingMode", 0).toInt();
-    if (nStakingModeOption >= 0 && nStakingModeOption <= 3)
+    if (nStakingModeOption == 0 || nStakingModeOption == 2)
     {
         LOCK(cs_stakingMode);
         nStakingMode = (StakingMode)nStakingModeOption;
@@ -239,7 +239,7 @@ bool OptionsModel::setData(const QModelIndex & index, const QVariant & value, in
             break;
         case StakingModeOpt: {
             int nMode = value.toInt();
-            if (nMode >= 0 && nMode <= 3) {
+            if (nMode == 0 || nMode == 2) {
                 nStakingModeOption = nMode;
                 {
                     LOCK(cs_stakingMode);

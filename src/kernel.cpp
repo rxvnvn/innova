@@ -13,7 +13,6 @@
 #include "main.h"
 #include "wallet.h"
 #include "init.h"
-#include "nullstake.h"
 
 using namespace std;
 
@@ -1367,61 +1366,6 @@ bool CheckProofOfStake(const CBlockIndex* pindexPrev, const CTransaction& tx, un
 {
     if (!tx.IsCoinStake())
         return error("CheckProofOfStake() : called on non-coinstake %s", tx.GetHash().ToString().c_str());
-
-    if (tx.nVersion == SHIELDED_TX_VERSION_NULLSTAKE)
-    {
-        if (tx.nullstakeProof.IsNull() || tx.vShieldedSpend.empty())
-            return tx.DoS(100, error("CheckProofOfStake() : NullStake proof missing or no spends"));
-
-        int64_t nWeight = GetWeight((int64_t)tx.nullstakeProof.nBlockTimeFrom,
-                                     (int64_t)tx.nullstakeProof.nTimeTx);
-
-        if (!VerifyNullStakeKernelProof(tx.nullstakeProof, tx.vShieldedSpend[0].cv, nBits, nWeight))
-            return tx.DoS(1, error("CheckProofOfStake() : NullStake kernel proof verification failed"));
-
-        hashProofOfStake = PedersenKernelHash(tx.nullstakeProof.nStakeModifier,
-                                               tx.nullstakeProof.nBlockTimeFrom,
-                                               tx.nullstakeProof.nTxPrevOffset,
-                                               tx.nullstakeProof.nTxTimePrev,
-                                               tx.nullstakeProof.nVoutN,
-                                               tx.nullstakeProof.nTimeTx);
-        targetProofOfStake = 0;
-        return true;
-    }
-
-    if (tx.nVersion == SHIELDED_TX_VERSION_NULLSTAKE_V2)
-    {
-        if (tx.nullstakeProofV2.IsNull() || tx.vShieldedSpend.empty())
-            return tx.DoS(100, error("CheckProofOfStake() : NullStake V2 proof missing or no spends"));
-
-        if (!VerifyNullStakeKernelProofV2(tx.nullstakeProofV2, tx.vShieldedSpend[0].cv, nBits))
-            return tx.DoS(1, error("CheckProofOfStake() : NullStake V2 kernel proof verification failed"));
-
-        {
-            CDataStream ss(SER_GETHASH, 0);
-            ss << tx.nullstakeProofV2;
-            hashProofOfStake = Hash(ss.begin(), ss.end());
-        }
-        targetProofOfStake = 0;
-        return true;
-    }
-
-    if (tx.nVersion == SHIELDED_TX_VERSION_NULLSTAKE_COLD)
-    {
-        if (tx.nullstakeProofV3.IsNull() || tx.vShieldedSpend.empty())
-            return tx.DoS(100, error("CheckProofOfStake() : NullStake V3 proof missing or no spends"));
-
-        if (!VerifyNullStakeKernelProofV3(tx.nullstakeProofV3, tx.vShieldedSpend[0].cv, nBits))
-            return tx.DoS(1, error("CheckProofOfStake() : NullStake V3 kernel proof verification failed"));
-
-        {
-            CDataStream ss(SER_GETHASH, 0);
-            ss << tx.nullstakeProofV3;
-            hashProofOfStake = Hash(ss.begin(), ss.end());
-        }
-        targetProofOfStake = 0;
-        return true;
-    }
 
     if (tx.vin.empty())
         return error("CheckProofOfStake() : no inputs for transparent coinstake %s", tx.GetHash().ToString().c_str());

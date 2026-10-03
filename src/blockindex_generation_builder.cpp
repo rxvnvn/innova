@@ -4,7 +4,6 @@
 #include "txdb-leveldb.h"
 #include "main.h"
 #include "kernel.h"
-#include "epoch_state.h"
 
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>

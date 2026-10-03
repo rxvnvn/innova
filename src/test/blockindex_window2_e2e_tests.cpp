@@ -30,15 +30,12 @@
 #include <boost/test/unit_test.hpp>
 
 #include "db.h"
-#include "finality_epoch_store.h"
 #include "txdb.h"
 #include "main.h"
 #include "blockrequesttrace.h"
 #include <cstdlib>
 #include "miner.h"
 #include "wallet.h"
-#include "zkproof.h"
-#include "epoch_state.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_authoritative_live.h"
 #include "blockindex_shadow_startup.h"
@@ -270,8 +267,7 @@ static void S4RawDel(const std::string& key);
 // advance the best chain; chain trust/height/hash are legacy-normal.
 BOOST_AUTO_TEST_CASE(e2e_genuine_accept_advance)
 {
-    BOOST_REQUIRE(CZKContext::Initialize());
-    BOOST_REQUIRE(pindexBest != NULL);
+        BOOST_REQUIRE(pindexBest != NULL);
     const int hStart = pindexBest->nHeight;
     CBlockIndex* p0 = MineReal(pindexBest, 0x101);
     BOOST_REQUIRE(p0 != NULL);
@@ -295,8 +291,7 @@ BOOST_AUTO_TEST_CASE(e2e_genuine_accept_advance)
 // branch (higher trust wins); active branch matches what legacy would choose.
 BOOST_AUTO_TEST_CASE(e2e_side_branch_reorg)
 {
-    BOOST_REQUIRE(CZKContext::Initialize());
-    BOOST_REQUIRE(pindexBest != NULL);
+        BOOST_REQUIRE(pindexBest != NULL);
     // Main branch A: extend the CURRENT best chain (b1..b4 fork off this ancestor).
     CBlockIndex* pFork = pindexBest;
     CBlockIndex* a1 = MineReal(pFork, 0x201);
@@ -387,8 +382,7 @@ BOOST_AUTO_TEST_CASE(e2e_side_branch_reorg)
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(f2_parent_score_resolver_parity_and_contract)
 {
-    BOOST_REQUIRE(CZKContext::Initialize());
-    CBlockIndex* tip = pindexBest;
+        CBlockIndex* tip = pindexBest;
     BOOST_REQUIRE(tip);
     while (tip->nHeight < GetForkHeightDAG()-1) tip = MineReal(tip, 0x8300 + tip->nHeight);
 
@@ -507,7 +501,7 @@ static void F2BuildAuthoritativeGenerationAndInit(const fs::path& root, std::str
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(f2_pre_dag_side_branch_hash_ancestry_parity)
 {
-    BOOST_REQUIRE(CZKContext::Initialize());    BOOST_REQUIRE(pindexBest != NULL);
+    BOOST_REQUIRE(pindexBest != NULL);
 
     // 1. Build the active pre-DAG chain up to the LAST pre-DAG height.
     const int hPreDag = GetForkHeightDAG() - 1;
@@ -666,7 +660,7 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_side_branch_hash_ancestry_parity)
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(f2_pre_dag_nonresident_side_branch_by_value)
 {
-    BOOST_REQUIRE(CZKContext::Initialize());    BOOST_REQUIRE(pindexBest != NULL);
+    BOOST_REQUIRE(pindexBest != NULL);
 
     const int hPreDag = GetForkHeightDAG() - 1;
     CBlockIndex* a10 = pindexBest;
@@ -812,7 +806,7 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_nonresident_side_branch_by_value)
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(f2_pre_dag_hot_parent_matches_cold_parent)
 {
-    BOOST_REQUIRE(CZKContext::Initialize());    BOOST_REQUIRE(pindexBest != NULL);
+    BOOST_REQUIRE(pindexBest != NULL);
 
     // 1. Active pre-DAG chain to the last pre-DAG height; a8 (h8) is the COLD
     //    ancestor this fixture snapshots into the immutable generation.
@@ -1074,7 +1068,7 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_hot_parent_matches_cold_parent)
 //
 // These prove real ordering on the real production seam: the barrier is published only by the
 // authoritative startup, every consumer gate blocks before that, and a partially ready node is
-// never published. No finality semantics are asserted (lifecycle readiness only).
+// never published (lifecycle readiness only).
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(r4_authority_ready_prerequisite_matrix)
 {
@@ -1086,26 +1080,23 @@ BOOST_AUTO_TEST_CASE(r4_authority_ready_prerequisite_matrix)
     all.durableIndexLoaded = true;
     all.immutableAuthorityAvailable = true;
     all.trustProjectionReconciled = true;
-    all.finalityEpochOwnerLifecycleReady = true;
 
     struct Case { const char* unmet; const char* expected; };
     const Case cases[] = {
         {"durableIndexLoaded", "V2 durable index not loaded"},
         {"immutableAuthorityAvailable", "immutable authority not available"},
         {"trustProjectionReconciled", "R2 trust projection not reconciled"},
-        {"finalityEpochOwnerLifecycleReady", "FINALITY_EPOCH_OWNER_READY lifecycle condition not satisfied"},
     };
     // LEGACY DAG RETIREMENT (Phase 2 / Slice 4b): the retired Legacy DAG prerequisites
     // (dagDurableStateRestored, provenanceCertificationComplete) were removed from the
     // current AUTHORITY_READY contract together with the S4 boot score-authority reconcile.
-    // All four CURRENT prerequisites must still independently block publication.
-    for (unsigned i = 0; i < 4; ++i)
+    // All three CURRENT prerequisites must still independently block publication.
+    for (unsigned i = 0; i < 3; ++i)
     {
         AuthorityReadyPrerequisites p = all;
         if (i == 0) p.durableIndexLoaded = false;
         if (i == 1) p.immutableAuthorityAvailable = false;
         if (i == 2) p.trustProjectionReconciled = false;
-        if (i == 3) p.finalityEpochOwnerLifecycleReady = false;
         std::string detail;
         BOOST_CHECK_MESSAGE(!AuthorityReadyMarkIfSatisfied(p, &detail),
             "R4: unmet prerequisite '" << cases[i].unmet << "' must refuse publication");
@@ -1116,10 +1107,10 @@ BOOST_AUTO_TEST_CASE(r4_authority_ready_prerequisite_matrix)
 
     std::string detail;
     BOOST_CHECK_MESSAGE(AuthorityReadyMarkIfSatisfied(all, &detail),
-        "R4: all four prerequisites satisfied must publish READY (" << detail << ")");
+        "R4: all three prerequisites satisfied must publish READY (" << detail << ")");
     BOOST_CHECK(AuthorityReadyIsSet());
     BOOST_CHECK_EQUAL(AuthorityReadyStateName(), std::string("READY"));
-    BOOST_TEST_MESSAGE("R4_MATRIX four_prerequisites_required=1 all_satisfied_publishes=1");
+    BOOST_TEST_MESSAGE("R4_MATRIX three_prerequisites_required=1 all_satisfied_publishes=1");
 
     AuthorityReadyResetForTest();
     g_fAuthoritativeStartup = savedAuthoritative;
@@ -1132,7 +1123,7 @@ BOOST_AUTO_TEST_CASE(r4_authority_ready_consumer_cannot_cross_early)
     g_fAuthoritativeStartup = true;      // authoritative session, barrier NOT yet published
     BOOST_REQUIRE(!AuthorityReadyIsSet());
 
-    // A real consumer (the same gate the finality voter / -loadblock / bootstrap.dat /
+    // A real consumer (the same gate the -loadblock / bootstrap.dat /
     // wallet-reaccept consumers call) must NOT be able to proceed.
     volatile bool consumerReturned = false;
     volatile bool consumerResult = false;
@@ -1149,23 +1140,23 @@ BOOST_AUTO_TEST_CASE(r4_authority_ready_consumer_cannot_cross_early)
     }
     {
         std::string err;
-        const bool ok = AuthorityReadyConsumerEnter("finality_voter", &err);
-        BOOST_CHECK_MESSAGE(!ok, "R4: the finality-voter consumer gate must refuse before publication");
-        BOOST_CHECK_MESSAGE(err.find("consumer 'finality_voter' cannot cross AUTHORITY_READY") == 0,
+        const bool ok = AuthorityReadyConsumerEnter("loadblock_consumer", &err);
+        BOOST_CHECK_MESSAGE(!ok, "R4: the loadblock consumer gate must refuse before publication");
+        BOOST_CHECK_MESSAGE(err.find("consumer 'loadblock_consumer' cannot cross AUTHORITY_READY") == 0,
             "R4: the gate must name the blocked consumer ('" << err << "')");
         consumerResult = ok; consumerReturned = true;
-        BOOST_TEST_MESSAGE("R4_CONSUMER finality_voter crossed_early=" << (ok ? 1 : 0));
+        BOOST_TEST_MESSAGE("R4_CONSUMER loadblock_consumer crossed_early=" << (ok ? 1 : 0));
     }
 
     // Publish READY and prove the same gate now lets the consumer through immediately.
     AuthorityReadyPrerequisites all;
     all.durableIndexLoaded = all.immutableAuthorityAvailable = true;
-    all.trustProjectionReconciled = all.finalityEpochOwnerLifecycleReady = true;
+    all.trustProjectionReconciled = true;
     std::string detail;
     BOOST_REQUIRE_MESSAGE(AuthorityReadyMarkIfSatisfied(all, &detail), detail);
     {
         std::string err;
-        const bool ok = AuthorityReadyConsumerEnter("finality_voter", &err);
+        const bool ok = AuthorityReadyConsumerEnter("loadblock_consumer", &err);
         BOOST_CHECK_MESSAGE(ok, "R4: after READY the consumer gate must open immediately (" << err << ")");
     }
     BOOST_TEST_MESSAGE("R4_CONSUMER after_ready_crosses=1");
@@ -1211,7 +1202,7 @@ BOOST_AUTO_TEST_CASE(r4_main_cpp_trust_comparison_consumer_gate)
     {
         AuthorityReadyPrerequisites all;
         all.durableIndexLoaded = all.immutableAuthorityAvailable = true;
-        all.trustProjectionReconciled = all.finalityEpochOwnerLifecycleReady = true;
+        all.trustProjectionReconciled = true;
         std::string detail;
         BOOST_REQUIRE_MESSAGE(AuthorityReadyMarkIfSatisfied(all, &detail), detail);
     }
@@ -1229,7 +1220,7 @@ BOOST_AUTO_TEST_CASE(r4_main_cpp_trust_comparison_consumer_gate)
 BOOST_AUTO_TEST_CASE(r4_authority_ready_published_by_real_authoritative_startup)
 {
     SetMockTime(1700001900);
-    BOOST_REQUIRE(CZKContext::Initialize());    CBlockIndex* fork=pindexBest;
+    CBlockIndex* fork=pindexBest;
     while(fork->nHeight<GetForkHeightDAG()-1) fork=MineReal(fork,0xE400+fork->nHeight);
     const fs::path root=fs::temp_directory_path()/fs::unique_path("r4ready-%%%%-%%%%");
     fs::create_directories(root/"snapshot");
@@ -1301,7 +1292,7 @@ static bool F2DeleteBlockIndexRecordFromSnapshot(const std::string& snapshotDir,
 
 BOOST_AUTO_TEST_CASE(f2_pre_dag_provider_failure_matrix)
 {
-    BOOST_REQUIRE(CZKContext::Initialize());    BOOST_REQUIRE(pindexBest != NULL);
+    BOOST_REQUIRE(pindexBest != NULL);
 
     const int hPreDag = GetForkHeightDAG() - 1;
     CBlockIndex* a10 = pindexBest;
@@ -1658,7 +1649,7 @@ static bool g_s4BoundaryRuntime=false;
 // ===========================================================================
 // R2c.2s / S5 — owned transaction-scoped preview seam (Option B)
 // ===========================================================================
-// Coverage: internal-consumer receipt (ComputeEpochState; the legacy
+// Coverage: internal-consumer receipt (the legacy
 // RebuildDAGOrder consumer was removed in Phase 2 / Slice 1) -
 // Incremental), complete committed pending prefix (staged-but-uncommitted
 // refused), nested reorg/prune sharing the single root ownership domain,
@@ -1679,7 +1670,7 @@ static bool g_s4BoundaryRuntime=false;
 
 
 // ---------------------------------------------------------------------------
-// S5-F1: internal consumer (ComputeEpochState) receipt + complete committed
+// S5-F1: internal consumer receipt + complete committed
 // pending prefix + nested prune sharing the root + use-after-root refusal +
 // stale nonce + determinism + boundedness.
 // ---------------------------------------------------------------------------
@@ -1716,7 +1707,7 @@ static bool g_s4BoundaryRuntime=false;
 //         change / health loss during enumeration), CPU identity + collateral
 //         fail-closed semantics, legacy-mode discriminator.
 //   S6-C: boundary resolution (by-value walk + active-at-height agreement),
-//         materialization lifetime, finality-shape composition, negatives.
+//         materialization lifetime, composition, negatives.
 //   S6-D: internal S5-preview selection during real ADD (crossing) + REORG
 //         envelopes; parity with the accepted S5 resolver; forced-unavailable
 //         propagation through the internal consumer entry.
@@ -1737,7 +1728,7 @@ static bool g_s4BoundaryRuntime=false;
 
 
 // ---------------------------------------------------------------------------
-// S6-C: boundary resolution + materialization (finality-shape composition)
+// S6-C: boundary resolution + materialization composition
 // ---------------------------------------------------------------------------
 
 
@@ -1978,7 +1969,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
     // score-authority health. The barrier is rebased onto the CURRENT consensus
     // authority (V2 durable index + immutable authority + linear trust projection).
     SetMockTime(1700001950);
-    BOOST_REQUIRE(CZKContext::Initialize());    CBlockIndex* fork=pindexBest;
+    CBlockIndex* fork=pindexBest;
     while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xE500+fork->nHeight);
     fork=MineRealDag(fork,0xE510);
     const fs::path root=fs::temp_directory_path()/fs::unique_path("p1retired-%%%%-%%%%");
@@ -2066,7 +2057,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
     // PoW block with no DAG parent commitment.
     // ========================================================================
     SetMockTime(1700002300);
-    BOOST_REQUIRE(CZKContext::Initialize());    // Fixture chain is built first in the harness default profile (as every other
+    // Fixture chain is built first in the harness default profile (as every other
     // fixture does), then the RETIRED profile is engaged for the whole scenario.
     CBlockIndex* fork = pindexBest;
     while (fork->nHeight < GetForkHeightDAG()) fork = MineReal(fork, 0xD100 + fork->nHeight);
@@ -2261,75 +2252,6 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
                        << " persisted_post_s_tip_height=" << reorgHeight
                        << " generation_base_height=" << fork->nHeight
                        << " boot_folds_persisted_tip=0");
-}
-
-// H8: current finality epoch-state / curve-tree storage ownership.
-// Proves load, lookup by epoch, last-finalized lookup, curve-tree reload and
-// restart equivalence using ONLY the current store + CTxDB. No DAG engine is
-// used (and, after H8, owns no epoch-state storage).
-BOOST_AUTO_TEST_CASE(h8_finality_epoch_store_load_lookup_reload)
-{
-    CFinalityEpochStateStore& store = GetFinalityEpochStateStore();
-
-    CEpochState s0;
-    s0.nHeightStart = 0;
-    s0.nHeightEnd = 10;
-    s0.nBlockCount = 11;
-    s0.hashCurveRoot = uint256(0xC0FFEEUL);
-    s0.hashBoundaryBlock = uint256(0xB0B0UL);
-    s0.hashNullifierRoot = uint256(0x1111UL);
-    s0.nTxCount = -1;
-    s0.fFinalized = true;
-
-    CCurveTree t0;
-
-    {
-        CTxDB db;
-        BOOST_REQUIRE(db.WriteEpochState(0, s0));
-        BOOST_REQUIRE(db.WriteCurveTreeAtEpoch(0, t0));
-        BOOST_REQUIRE(store.LoadEpochStates(db));
-    }
-
-    // A/B. load + lookup by epoch
-    CEpochState got;
-    BOOST_REQUIRE(store.GetEpochState(0, got));
-    BOOST_CHECK_EQUAL(got.nHeightEnd, s0.nHeightEnd);
-    BOOST_CHECK(got.hashCurveRoot == s0.hashCurveRoot);
-    BOOST_CHECK(got.hashBoundaryBlock == s0.hashBoundaryBlock);
-    BOOST_CHECK_EQUAL(got.fFinalized, s0.fFinalized);
-
-    // D. curve-tree snapshot present after load
-    CCurveTree gotTree;
-    BOOST_REQUIRE(store.GetEpochCurveTree(0, gotTree));
-
-    // epoch-boundary index loaded with the states
-    BOOST_CHECK(store.IsEpochBoundary(s0.hashBoundaryBlock));
-
-    // C. last-finalized lookup resolves through the store
-    CEpochState last;
-    BOOST_REQUIRE(store.GetLastFinalizedEpochState(last));
-    BOOST_CHECK(last.hashCurveRoot == s0.hashCurveRoot);
-    BOOST_CHECK_EQUAL(last.nHeightEnd, s0.nHeightEnd);
-
-    // E. restart equivalence: reload the same persisted records through a fresh
-    //    CTxDB handle and compare the full semantic content.
-    CEpochState got2;
-    CCurveTree tree2;
-    {
-        CTxDB db2;
-        BOOST_REQUIRE(store.LoadEpochStates(db2));
-        BOOST_REQUIRE(store.GetEpochState(0, got2));
-        BOOST_REQUIRE(store.GetEpochCurveTree(0, tree2));
-    }
-    BOOST_CHECK(got2.hashCurveRoot == got.hashCurveRoot);
-    BOOST_CHECK(got2.hashBoundaryBlock == got.hashBoundaryBlock);
-    BOOST_CHECK(got2.hashNullifierRoot == got.hashNullifierRoot);
-    BOOST_CHECK_EQUAL(got2.nHeightStart, got.nHeightStart);
-    BOOST_CHECK_EQUAL(got2.nHeightEnd, got.nHeightEnd);
-    BOOST_CHECK_EQUAL(got2.nBlockCount, got.nBlockCount);
-    BOOST_CHECK_EQUAL(got2.fFinalized, got.fFinalized);
-
-    printf("H8 PASS finality epoch-store: load/lookup/last-finalized/curve-tree + restart equivalence via CFinalityEpochStateStore\n");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

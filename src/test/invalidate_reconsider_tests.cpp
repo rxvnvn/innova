@@ -13,8 +13,8 @@
 //
 // The test suite shares one global TestingSetup (mock BDB, regtest, genesis-only
 // chain when these tests run).  Blocks are mined at the regtest PoW limit
-// (~50% of hashes valid), so a nonce search is trivial.  All mining stays below
-// the regtest finality (10) and DAG (11) fork heights.
+// ~50% of hashes valid), so a nonce search is trivial.  All mining stays below
+// the regtest DAG (11) fork height.
 //
 // Side-chain blocks cannot be delivered through ProcessBlock in this client: the
 // sync-checkpoint weak-work gate (main.cpp ProcessBlock) rejects any block whose
@@ -29,7 +29,6 @@
 #include "miner.h"
 #include "txdb.h"
 #include "wallet.h"
-#include "zkproof.h"
 
 #include <algorithm>
 
@@ -170,7 +169,6 @@ BOOST_AUTO_TEST_SUITE(invalidate_reconsider_tests)
 // reconsidering the block restores eligibility without forcing an activation.
 BOOST_AUTO_TEST_CASE(inactive_side_chain_invalidation)
 {
-    BOOST_REQUIRE(CZKContext::Initialize());
     {
         // Build the fork.  P2 is the fork parent; A wins by trust (4 blocks), B is
     // a side chain (3 blocks).

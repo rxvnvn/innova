@@ -22,7 +22,6 @@
 #include "getblocksservedinvzero.h"
 #include "collateralnode.h"
 #include "dandelion.h"
-#include "shielded.h"
 #include <sys/stat.h>
 #include <algorithm>
 #include <cctype>
@@ -9886,10 +9885,9 @@ void RelayTransaction(const CTransaction& tx, const uint256& hash, const CDataSt
         vRelayExpiration.push_back(std::make_pair(GetTime() + 15 * 60, inv));
     }
 
-    bool fShielded = tx.IsShielded();
     if (dandelionState.IsEnabled())
     {
-        if (dandelionState.AddTransaction(hash, fShielded, false))
+        if (dandelionState.AddTransaction(hash, false, false))
         {
             std::vector<int> vPeerIds;
             {
@@ -9900,10 +9898,7 @@ void RelayTransaction(const CTransaction& tx, const uint256& hash, const CDataSt
             dandelionRouter.UpdateEpoch(GetTime(), vPeerIds);
 
             CDandelionTxState txState;
-            if (!dandelionState.GetTxState(hash, txState))
-            {
-                txState.fShielded = fShielded;
-            }
+            dandelionState.GetTxState(hash, txState);
             if (!dandelionRouter.ShouldFluff(txState))
             {
                 int nStemPeerId = dandelionRouter.GetStemPeer(hash);

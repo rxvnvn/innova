@@ -426,20 +426,6 @@ BOOST_AUTO_TEST_CASE(anonymous_like_tx_no_registration_effect)
     ClearHRegActivationOverrideForTesting();
 }
 
-BOOST_AUTO_TEST_CASE(shielded_like_tx_no_registration_effect)
-{
-    ClearHRegStateForTesting();
-    SetHRegActivationOverrideForTesting(1);
-    CTransaction prev = MakePrevTx(std::vector<CTxOut>(1, MakePrevOut(HREG_COLLATERAL, P2PKHScript(0x11))));
-    CTransaction tx = MakeRegistrationTx(prev, 0);
-    tx.nVersion = SHIELDED_TX_VERSION;
-    MapPrevTx mp; PutPrev(mp, prev); SetHRegPrevTxHeightForTesting(prev.GetHash(), 80);
-    std::string err;
-    BOOST_CHECK(ApplyHRegConnectedTx(tx, mp, 100, err));
-    BOOST_CHECK(GetHRegStateSnapshotForTesting().empty());
-    ClearHRegActivationOverrideForTesting();
-}
-
 BOOST_AUTO_TEST_CASE(spend_then_attempted_registration_no_state)
 {
     ClearHRegStateForTesting();

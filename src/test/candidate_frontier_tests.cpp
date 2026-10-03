@@ -2,7 +2,6 @@
 
 #include "main.h"
 #include "candidate_frontier.h"
-#include "epoch_state.h"
 
 extern std::map<uint256, CBlockIndex*> mapBlockIndex;
 extern CBlockIndex* pindexBest;
@@ -632,28 +631,6 @@ BOOST_AUTO_TEST_CASE(t7_reconsider)
     assert_snapshot_winner(s, uint256(0)); // invalid -> none
     s.operatorInvalid.erase(byvalue_hash(2));
     assert_snapshot_winner(s, byvalue_hash(2)); // reconsidered -> wins
-}
-
-// T8 — reorg / finality-compatible candidate. Finality active; a side tip whose
-// fork point is >= finalized height is eligible; one below is excluded.
-BOOST_AUTO_TEST_CASE(t8_finality_reorg)
-{
-    SnapshotCandidateFrontierStore s;
-    // 0 -> 1 -> 2(best). Side: 0 -> 1 -> S (fork at height 1).
-    s.AddBlock(byvalue_hash(0), uint256(0), uint256(2), 0);
-    s.AddBlock(byvalue_hash(1), byvalue_hash(0), uint256(4), 1);
-    s.AddBlock(byvalue_hash(2), byvalue_hash(1), uint256(6), 2);
-    s.AddBlock(byvalue_hash(3), byvalue_hash(1), uint256(9), 2); // S, fork ht 1
-    s.SetBest(byvalue_hash(2), uint256(6));
-    s.finalizedHeight = 1;
-    s.finalityActive = true;
-    s.tipHashes.push_back(byvalue_hash(3));
-    s.hasData.insert(byvalue_hash(3));
-    assert_snapshot_winner(s, byvalue_hash(3)); // fork ht 1 >= finalized 1
-
-    // Now raise finalized height above the fork: excluded.
-    s.finalizedHeight = 2;
-    assert_snapshot_winner(s, uint256(0));
 }
 
 // T9 — unavailable materialization: candidate excluded, authority unchanged.

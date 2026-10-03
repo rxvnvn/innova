@@ -32,7 +32,7 @@ public:
         DetachDatabases,   // bool
         Language,          // QString
         CoinControlFeatures, // bool
-        StakingModeOpt,      // int (0=transparent, 1=nullstake, 2=cold, 3=nullstake-cold)
+        StakingModeOpt,      // int (0=transparent, 2=cold)
         OptionIDRowCount,
     };
 

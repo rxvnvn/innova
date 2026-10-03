@@ -349,22 +349,10 @@ OBJS= \
     obj/rpcblockchain.o \
     obj/rpcblockindexshadow.o \
     obj/rpcrawtransaction.o \
-    obj/rpcshielded.o \
-    obj/nullsend.o \
-    obj/shieldedcoinjoin.o \
-    obj/shielded.o \
-    obj/zkproof.o \
-    obj/lelantus.o \
-    obj/curvetree.o \
-    obj/ipa.o \
-    obj/ed25519_zk.o \
-    obj/nullstake.o \
+    obj/rpcsilentpayments.o \
     obj/poseidon2.o \
-    obj/bulletproof_ac.o \
     obj/silentpayments.o \
     obj/dandelion.o \
-    obj/finality.o \
-    obj/finality_epoch_store.o \
     obj/candidate_frontier.o \
     obj/candidate_frontier_metadata.o \
     obj/blockindex_hot_owner.o \
@@ -461,22 +449,10 @@ OBJS= \
     obj/rpcblockchain.o \
     obj/rpcblockindexshadow.o \
     obj/rpcrawtransaction.o \
-    obj/rpcshielded.o \
-    obj/nullsend.o \
-    obj/shieldedcoinjoin.o \
-    obj/shielded.o \
-    obj/zkproof.o \
-    obj/lelantus.o \
-    obj/curvetree.o \
-    obj/ipa.o \
-    obj/ed25519_zk.o \
-    obj/nullstake.o \
+    obj/rpcsilentpayments.o \
     obj/poseidon2.o \
-    obj/bulletproof_ac.o \
     obj/silentpayments.o \
     obj/dandelion.o \
-    obj/finality.o \
-    obj/finality_epoch_store.o \
     obj/candidate_frontier.o \
     obj/candidate_frontier_metadata.o \
     obj/blockindex_hot_owner.o \
@@ -555,10 +531,7 @@ TEST_OBJS= \
     obj/test/cpu_mining_tests.o \
     obj/test/build_metadata_tests.o \
     obj/test/p2p_sync_tests.o \
-    obj/test/bulletproof_ac_tests.o \
-    obj/test/finality_tally_tests.o \
     obj/test/coincontrol_lock_tests.o \
-    obj/test/fcmp_root_tests.o \
     obj/test/ibdforensic_tests.o \
     obj/test/ibdblocklatency_tests.o \
     obj/test/ibdsemantic_tests.o \

@@ -73,23 +73,20 @@ bool ResolveAuthoritativeActiveBlock(const uint256& hash,
 // ---------------------------------------------------------------------------
 // R4 — AUTHORITY_READY: ONE lifecycle readiness barrier (not a decorative flag).
 //
-// The four current prerequisites are evaluated against REAL live state at the end of
+// The three current prerequisites are evaluated against REAL live state at the end of
 // InitBlockIndexAuthoritative; READY is published only when every one of them holds. Every
 // consensus-sensitive consumer waits on this barrier and must not cross before it. This is
-// lifecycle readiness only: FINALITY_EPOCH_OWNER_READY contributes the readiness of its
-// already-frozen lifecycle condition and NOTHING finality-semantic (no late-vote semantics,
-// no equivocation rule, no certificate denominator, no FINALITY_MIN_VOTERS, no
-// irreversibility definition, no private NullStake semantics).
+// lifecycle readiness only: every prerequisite is an existing frozen V2 lifecycle condition
+// and NOTHING finality-semantic.
 // ---------------------------------------------------------------------------
 struct AuthorityReadyPrerequisites
 {
     bool durableIndexLoaded;                 // V2 durable index loaded (selected generation)
     bool immutableAuthorityAvailable;        // immutable authority available (live authority open)
     bool trustProjectionReconciled;          // R2 trust projection reconciled
-    bool finalityEpochOwnerLifecycleReady;   // FINALITY_EPOCH_OWNER_READY lifecycle condition
     AuthorityReadyPrerequisites()
         : durableIndexLoaded(false), immutableAuthorityAvailable(false),
-          trustProjectionReconciled(false), finalityEpochOwnerLifecycleReady(false) {}
+          trustProjectionReconciled(false) {}
     // First unmet prerequisite ("" when all are satisfied).
     std::string WhyNotReady() const;
 };

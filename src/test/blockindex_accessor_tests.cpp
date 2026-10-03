@@ -3,7 +3,6 @@
 #include "../main.h"
 #include "../miner.h"
 #include "../wallet.h"
-#include "../zkproof.h"
 
 #include <algorithm>
 #include <type_traits>
@@ -189,7 +188,6 @@ BOOST_AUTO_TEST_CASE(real_chain_lookup_parent_ancestor_tip_and_height_match_dire
 
 BOOST_AUTO_TEST_CASE(fork_point_matches_direct_legacy_on_synthetic_side_branch)
 {
-    BOOST_REQUIRE(CZKContext::Initialize());
 
     CBlockIndex *pP1, *pP2, *pA3, *pA4, *pB1, *pB3;
     {

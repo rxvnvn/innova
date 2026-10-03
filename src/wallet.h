@@ -239,43 +239,13 @@ public:
     StealthKeyMetaMap mapStealthKeyMeta;
     uint32_t nStealth, nFoundStealth; // for reporting, zero before use
 
-    std::map<CShieldedPaymentAddress, CShieldedSpendingKey> mapShieldedSpendingKeys;
-    std::map<CShieldedPaymentAddress, CShieldedIncomingViewingKey> mapShieldedViewingKeys;
-
-    struct CShieldedWalletNote
-    {
-        CShieldedNote note;
-        uint256 txhash;
-        uint32_t nPosition;    // Position in the Merkle tree
-        bool fSpent;
-        int nHeight;           // Block height containing this note
-        uint64_t nLeafIndex;   // Position in the Curve Tree (FCMP++)
-
-        CShieldedWalletNote() : nPosition(0), fSpent(false), nHeight(0), nLeafIndex(0) {}
-
-        IMPLEMENT_SERIALIZE
-        (
-            READWRITE(note);
-            READWRITE(txhash);
-            READWRITE(nPosition);
-            READWRITE(fSpent);
-            READWRITE(nHeight);
-            READWRITE(nLeafIndex);
-        )
-    };
-    std::vector<CShieldedWalletNote> vShieldedNotes;
-    mutable CCriticalSection cs_shielded;
-
-    std::map<uint256, CColdStakeDelegation> mapColdStakeDelegations;  // hashOwner -> delegation
-    bool AddColdStakeDelegation(const CColdStakeDelegation& deleg);
-    bool ImportColdStakeDelegation(const CColdStakeDelegation& deleg);
-    bool RevokeColdStakeDelegation(const uint256& hashOwner);
-    std::vector<CShieldedWalletNote> SelectShieldedNotesForColdStaking(const CColdStakeDelegation& deleg) const;
 
     std::vector<CSilentPaymentKey> vSilentPaymentKeys;
     bool AddSilentPaymentKey(CSilentPaymentKey&& key);
-    bool HaveSilentPaymentKeys() const { LOCK(cs_shielded); return !vSilentPaymentKeys.empty(); }
+    mutable CCriticalSection cs_silentpayments;
+    bool HaveSilentPaymentKeys() const { LOCK(cs_silentpayments); return !vSilentPaymentKeys.empty(); }
     bool GenerateNewSilentPaymentKey(CSilentPaymentAddress& addrOut);
+    void ScanBlockForSilentPayments(const CBlock& block, int nHeight);
 
     typedef std::map<unsigned int, CMasterKey> MasterKeyMap;
     MasterKeyMap mapMasterKeys;
@@ -527,15 +497,6 @@ public:
     bool EraseAllAnonData();
 
     bool CacheAnonStats();
-
-    CShieldedPaymentAddress GenerateNewShieldedAddress();
-    bool AddShieldedSpendingKey(const CShieldedPaymentAddress& addr, const CShieldedSpendingKey& key);
-    bool AddShieldedViewingKey(const CShieldedPaymentAddress& addr, const CShieldedIncomingViewingKey& ivk);
-    bool HaveShieldedSpendingKey(const CShieldedPaymentAddress& addr) const;
-    bool HaveShieldedViewingKey(const CShieldedPaymentAddress& addr) const;
-    bool IsShieldedOutputMine(const CShieldedOutputDescription& output, CShieldedNote& noteOut) const;
-    int64_t GetShieldedBalance() const;
-    void ScanBlockForShieldedNotes(const CBlock& block, int nHeight);
 
     bool CreateCollateralTransaction(CTransaction& txCollateral, std::string strReason);
     bool ConvertList(std::vector<CTxIn> vCoins, std::vector<int64_t>& vecAmounts);

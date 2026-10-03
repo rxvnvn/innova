@@ -6,8 +6,6 @@
 #include "candidate_frontier.h"
 #include "main.h"
 #include "txdb.h"
-#include "finality.h"
-#include "epoch_state.h"
 
 #include <set>
 #include <map>
@@ -20,7 +18,6 @@ extern std::set<uint256> setInvalidBlockHash;
 extern std::map<uint256, CandidateTipRecord> mapCandidateTips;
 extern uint64_t nCandidateTipGeneration;
 extern bool fCandidateFrontierShadowActive;
-extern CFinalityTracker g_finalityTracker;
 
 bool IsBlockOperatorInvalid(const CBlockIndex* pindex);
 
@@ -45,38 +42,6 @@ static bool AncestryOperatorInvalidByValue(const CandidateFrontierStore& store,
     return false;
 }
 
-// Compute the fork point height between two chains reachable by parent-walk,
-// returning the fork height, or -1 if the fork is below the finalized height
-// (i.e. the candidate is not finality-compatible). Returns >= 0 on success.
-static int FinalityForkHeight(const CandidateFrontierStore& store,
-                              const uint256& candidateHash, const uint256& bestHash)
-{
-    CandidateFrontierAuthorityRecord c = store.Lookup(candidateHash);
-    CandidateFrontierAuthorityRecord b = store.Lookup(bestHash);
-    if (!c.found || !b.found)
-        return -1;
-    // Equalize heights by parent-walk.
-    while (c.height > b.height)
-    {
-        c = store.GetParent(c.hash);
-        if (!c.found) return -1;
-    }
-    while (b.height > c.height)
-    {
-        b = store.GetParent(b.hash);
-        if (!b.found) return -1;
-    }
-    while (c.hash != b.hash)
-    {
-        c = store.GetParent(c.hash);
-        b = store.GetParent(b.hash);
-        if (!c.found || !b.found) return -1;
-    }
-    if (!c.found)
-        return -1;
-    return c.height;
-}
-
 // ---------------------------------------------------------------------------
 // A.10.1c core: by-value candidate evaluation (INV2).
 //
@@ -97,8 +62,6 @@ CandidateFrontierAuthorityRecord EvaluateCandidateFrontierByValue(
         return best; // no best chain active
 
     const uint256 bestTrust = store.GetBestTrust();
-    const int nFinalHeight = store.GetFinalizedHeight();
-    const bool fFinalityActive = (nFinalHeight > 0);
     const uint256 bestHash = store.GetBestTip();
 
     const std::vector<uint256> tips = store.GetCandidateTipHashes();
@@ -117,13 +80,6 @@ CandidateFrontierAuthorityRecord EvaluateCandidateFrontierByValue(
         // filter 3: materialization availability (never mutates authority)
         if (!store.HasBlockData(tip))
             continue;
-        // filter 4: finality fork compatibility
-        if (fFinalityActive)
-        {
-            const int forkHt = FinalityForkHeight(store, tip, bestHash);
-            if (forkHt < 0 || forkHt < nFinalHeight)
-                continue;
-        }
         // baseline + strict > (exact legacy comparator; equal trust never replaces)
         if (!best.found || rec.chainTrust > best.chainTrust)
         {
@@ -142,21 +98,12 @@ CandidateFrontierAuthorityRecord EvaluateCandidateFrontierByValue(
 // Legacy shadow adapter. Internally reads the resident graph to construct
 // by-value records (allowed for the transition/shadow adapter), but the
 // evaluator (EvaluateCandidateFrontierByValue) never sees a CBlockIndex*.
-// Evaluates finality activation exactly like legacy: active only when
-// finalized height > 0 AND best height >= FORK_HEIGHT_FINALITY.
 class LegacyCandidateFrontierStore : public CandidateFrontierStore
 {
 public:
     bool IsBestActive() const { return pindexBest != NULL; }
     uint256 GetBestTrust() const { return nBestChainTrust; }
     uint256 GetBestTip() const { return pindexBest ? *pindexBest->phashBlock : uint256(0); }
-    int GetFinalizedHeight() const
-    {
-        const int h = g_finalityTracker.GetFinalizedHeight();
-        if (h > 0 && pindexBest && pindexBest->nHeight >= FORK_HEIGHT_FINALITY)
-            return h;
-        return 0;
-    }
     bool IsOperatorHash(const uint256& h) const { return setInvalidBlockHash.count(h) != 0; }
 
     CandidateFrontierAuthorityRecord Lookup(const uint256& hash) const
@@ -368,10 +315,6 @@ void ShadowCompareCandidateSelection()
             if (item.second->pprev != NULL)
                 setReferenced.insert(*item.second->pprev->phashBlock);
 
-        const int nFinalHeight = g_finalityTracker.GetFinalizedHeight();
-        bool fFinActive = (nFinalHeight > 0 && pindexBest &&
-                           pindexBest->nHeight >= FORK_HEIGHT_FINALITY);
-
         for (const auto& item : mapBlockIndex)
         {
             CBlockIndex* pindex = item.second;
@@ -384,22 +327,6 @@ void ShadowCompareCandidateSelection()
             CBlock block;
             if (!block.ReadFromDisk(pindex))
                 continue;
-            if (fFinActive)
-            {
-                CBlockIndex* pFork = pindex;
-                CBlockIndex* pOther = pindexBest;
-                while (pFork != pOther)
-                {
-                    while (pFork != NULL && pFork->nHeight > pOther->nHeight)
-                        pFork = pFork->pprev;
-                    if (pFork == pOther)
-                        break;
-                    if (pOther != NULL)
-                        pOther = pOther->pprev;
-                }
-                if (pFork == NULL || pFork->nHeight < nFinalHeight)
-                    continue;
-            }
             if (pindexLegacy == NULL ||
                 pindex->nChainTrust > pindexLegacy->nChainTrust)
                 pindexLegacy = pindex;

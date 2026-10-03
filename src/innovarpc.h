@@ -199,7 +199,6 @@ extern json_spirit::Value getsubsidy(const json_spirit::Array& params, bool fHel
 extern json_spirit::Value getmininginfo(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getgenerate(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getstakinginfo(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value getfinalitystakinginfo(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value setgenerate(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getblocktemplate(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value submitblock(const json_spirit::Array& params, bool fHelp);
@@ -282,11 +281,6 @@ extern json_spirit::Value gettxout(const json_spirit::Array& params, bool fHelp)
 extern json_spirit::Value importaddress(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value burn(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value proofofdata(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
-extern json_spirit::Value getfinalityinfo(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
-extern json_spirit::Value submitfinalitytallyshare(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
-extern json_spirit::Value submitfinalitytallycert(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
-extern json_spirit::Value isblockfinalized(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
-extern json_spirit::Value getepochinfo(const json_spirit::Array& params, bool fHelp);    // in rpcblockchain.cpp
 
 
 
@@ -327,39 +321,12 @@ extern json_spirit::Value getpoolinfo(const json_spirit::Array& params, bool fHe
 extern json_spirit::Value masternode(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value collateralnode(const json_spirit::Array& params, bool fHelp);
 
-// Enhanced NullSend mixing (rpcwallet.cpp)
-extern json_spirit::Value startmixing(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value stopmixing(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value getmixingstatus(const json_spirit::Array& params, bool fHelp);
-
-
-
-extern json_spirit::Value z_getnewaddress(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_listaddresses(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_getbalance(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_gettotalbalance(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_shield(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_unshield(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_listunspent(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_validateaddress(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_exportkey(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_importkey(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_exportviewingkey(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_importviewingkey(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_getshieldedinfo(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_migrateanon(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_send(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_nullsend(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value z_nullsendinfo(const json_spirit::Array& params, bool fHelp);
-#define z_coinjoin z_nullsend
-#define z_coinjoininfo z_nullsendinfo
-extern json_spirit::Value n_delegatestake(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value n_importdelegation(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value n_revokecoldstake(const json_spirit::Array& params, bool fHelp);
-extern json_spirit::Value n_coldstakeinfo(const json_spirit::Array& params, bool fHelp);
-
 extern json_spirit::Value sp_getnewaddress(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value sp_listaddresses(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value sp_send(const json_spirit::Array& params, bool fHelp);
+
+
+
+
 
 #endif

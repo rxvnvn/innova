@@ -38,12 +38,8 @@
 #include "collateralnodeconfig.h"
 #include "innova_spinner_frames.h"
 #include "ringsig.h"
-#include "nullsend.h"
 #include "bootstrap.h"
-#include "zkproof.h"
 #include "dandelion.h"
-#include "finality.h"
-#include "epoch_state.h"
 #include "candidate_frontier.h"
 
 #ifdef USE_NATIVETOR
@@ -146,8 +142,6 @@ void Shutdown(void* parg)
     {
         fShutdown = true;
         ShutdownCPUMining();
-
-        CZKContext::Shutdown();
 
         if (fHybridSPV && pwalletMain)
         {
@@ -555,12 +549,7 @@ std::string HelpMessage()
         "  -onionseed             " + _("Find peers using .onion seeds (default: 0 unless -connect)") + "\n" +
         "  -nativetor=<n>         " + _("Enable or disable Native Tor Onion Node (default: 0)") +
         "  -staking               " + _("Stake your coins to support network and gain reward (default: 1)") + "\n" +
-        "  -stakingmode=<mode>    " + _("Staking mode: transparent, nullstake, cold, coldprivate (default: transparent)") + "\n" +
-        "  -finalityvotemode=<m>  " + _("Post-DAG finality voting mode: auto, transparent, nullstake, nullstakecold (default: auto)") + "\n" +
-        "  -finalitytallymode=<m> " + _("Hidden finality tally mode: off, committee, auto (default: off)") + "\n" +
-        "  -finalitytallypubkey=<key> " + _("Advertise a finality tally committee public key") + "\n" +
-        "  -finalitytallyprivkey=<key> " + _("Enable local finality tally share handling with a private key") + "\n" +
-        "  -finalitytallythreshold=<m-of-n> " + _("Finality tally committee threshold descriptor") + "\n" +
+        "  -stakingmode=<mode>    " + _("Staking mode: transparent, cold (default: transparent)") + "\n" +
 
         "\n" + _("SPV (Light Client) options:") + "\n" +
         "  -spv                   " + _("Run in SPV mode (light client, headers only)") + "\n" +
@@ -572,7 +561,6 @@ std::string HelpMessage()
         "  -regtestibd          " + _("Enable experimental normal IBD evaluation on regtest") + "\n" +
         "  -spvutxocachesize=<n> " + _("Maximum SPV UTXO cache entries (default: 10000, Pi: 1000)") + "\n" +
         "  -cnsyncslots=<n>      " + _("Collateral node slots reserved for sync during IBD (default: 4)") + "\n" +
-        "  -mixingpoolsize=<n>   " + _("NullSend mixing pool size (2-16, default: 5)") + "\n" +
         "  -rpcratelimit=<n>     " + _("RPC requests per second per IP (0=disabled, default: 100)") + "\n" +
         "  -minstakeinterval=<n>  " + _("Minimum time in seconds between successful stakes (default: 30)") + "\n" +
         "  -minersleep=<n>        " + _("Milliseconds between stake attempts. Lowering this param will not result in more stakes. (default: 1000)") + "\n" +
@@ -951,33 +939,14 @@ bool AppInit2()
     {
         string strStakingMode = GetArg("-stakingmode", "transparent");
         LOCK(cs_stakingMode);
-        if (strStakingMode == "nullstake" || strStakingMode == "private" || strStakingMode == "1")
-            nStakingMode = STAKE_NULLSTAKE;
-        else if (strStakingMode == "cold" || strStakingMode == "2")
+        if (strStakingMode == "cold" || strStakingMode == "2")
             nStakingMode = STAKE_COLD;
-        else if (strStakingMode == "coldprivate" || strStakingMode == "nullstakecold" || strStakingMode == "3")
-            nStakingMode = STAKE_NULLSTAKE_COLD;
         else if (strStakingMode == "transparent" || strStakingMode == "0")
             nStakingMode = STAKE_TRANSPARENT;
         else
         {
             printf("WARNING: Unknown -stakingmode '%s', using transparent\n", strStakingMode.c_str());
             nStakingMode = STAKE_TRANSPARENT;
-        }
-    }
-
-    {
-        CFinalityTallyConfig tallyConfig = GetFinalityTallyConfig();
-        if (!tallyConfig.fModeValid)
-            printf("WARNING: Unknown -finalitytallymode, using off\n");
-        if (tallyConfig.fEnabled && !tallyConfig.CanRelayPrivateVotes())
-        {
-            printf("WARNING: finality tally mode '%s' is enabled but requires ordered -finalitytallypubkey entries, a valid -finalitytallythreshold=<m-of-n>, and encrypted tally support; private finality promotion will stay disabled\n",
-                   tallyConfig.strMode.c_str());
-        }
-        if (tallyConfig.fEnabled && tallyConfig.fPrivKeyConfigured && !tallyConfig.CanProduceCertificates())
-        {
-            printf("WARNING: -finalitytallyprivkey is configured but tally certificate production is disabled until committee pubkey and threshold config are valid\n");
         }
     }
 
@@ -1874,18 +1843,6 @@ authoritative_startup_ready:
     //Threading still needs reworking
     NewThread(ThreadCheckCollaTeralPool, NULL);
 
-    NewThread(ThreadNullSend, NULL);
-
-    if (!GetBoolArg("-nofinalityvoting", false) &&
-        FORK_HEIGHT_FINALITY < MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT)
-    // R4 — AUTHORITY_READY consumer gate: 'finality_voter' must not cross before the barrier.
-    {
-        std::string authorityGateErr;
-        if (!AuthorityReadyConsumerEnter("finality_voter", &authorityGateErr))
-            return InitError(authorityGateErr);
-    }
-        NewThread(ThreadFinalityVoter, NULL);
-
 
     // Candidate tip frontier: rebuild bounded tips index from full block index.
     // If no DAG blocks exist, the tips set is still valid for candidate selection.
@@ -2007,13 +1964,6 @@ authoritative_startup_ready:
 
     if (fServer)
         NewThread(ThreadRPCServer, NULL);
-
-    // Step 11.5: ZK proof context
-    if (!CZKContext::Initialize())
-    {
-        printf("ERROR: Failed to initialize ZK proof context. Shielded transactions will be rejected.\n");
-        printf("       This node will not be able to validate shielded blocks post fork height.\n");
-    }
 
     // Step 11.6: Dandelion++
     if (GetBoolArg("-dandelion", true))

@@ -5,7 +5,6 @@
 #include "wallet.h"
 #include "base58.h"
 #include "stealth.h"
-#include "shielded.h"
 #include "silentpayments.h"
 
 #include <QFont>
@@ -28,7 +27,7 @@ struct AddressTableEntry
     QString label;
     QString address;
     bool stealth;
-    QString addressTypeStr; // "Transparent", "Stealth", "Shielded", "Silent Payment", "Staking"
+    QString addressTypeStr; // "Transparent", "Stealth", "Silent Payment", "Staking"
 
     AddressTableEntry() {}
     AddressTableEntry(Type type, const QString &label, const QString &address, const bool &stealth = false, const QString &addrType = "Transparent"):
@@ -100,24 +99,9 @@ public:
                                   true, "Stealth"));
             };
 
-            // Load shielded (z-) and Silent Payment addresses (safely — may not exist in all wallets)
+            // Load Silent Payment addresses (safely — may not exist in all wallets)
             try {
                 QSettings settings;
-                LOCK(wallet->cs_shielded);
-                for (const auto& pair : wallet->mapShieldedSpendingKeys)
-                {
-                    try {
-                        CDataStream ss(SER_NETWORK, PROTOCOL_VERSION);
-                        ss << pair.first;
-                        std::vector<unsigned char> vch(ss.begin(), ss.end());
-                        std::string addrStr = EncodeBase58Check(vch);
-                        QString qAddr = QString::fromStdString(addrStr);
-                        QString label = settings.value("addrLabel/" + qAddr, "Shielded Address").toString();
-                        cachedAddressTable.append(AddressTableEntry(AddressTableEntry::Receiving,
-                                          label, qAddr, false, "Shielded"));
-                    } catch (...) {} // Skip malformed entries
-                }
-
                 for (const CSilentPaymentKey& key : wallet->vSilentPaymentKeys)
                 {
                     try {
@@ -131,7 +115,7 @@ public:
                         }
                     } catch (...) {}
                 }
-            } catch (...) {} // cs_shielded may not exist in older wallets
+            } catch (...) {} // Silent Payment keys may not exist in older wallets
         }
         // qLowerBound() and qUpperBound() require our cachedAddressTable list to be sorted in asc order
         std::sort(cachedAddressTable.begin(), cachedAddressTable.end(), AddressTableEntryLessThan());
@@ -257,7 +241,6 @@ QVariant AddressTableModel::data(const QModelIndex &index, int role) const
     {
         if (index.column() == Type)
         {
-            if (rec->addressTypeStr == "Shielded") return QColor("#4CAF50");
             if (rec->addressTypeStr == "Silent Payment") return QColor("#9C27B0");
             if (rec->addressTypeStr == "Staking") return QColor("#FF9800");
             if (rec->addressTypeStr == "Stealth") return QColor("#2196F3");

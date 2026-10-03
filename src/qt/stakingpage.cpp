@@ -59,14 +59,10 @@ StakingPage::StakingPage(QWidget *parent) :
     stakingTabs->setDocumentMode(true);
 
     setupTransparentPanel();
-    setupNullStakePanel();
     setupColdStakingPanel();
-    setupNullStakeColdPanel();
 
     stakingTabs->addTab(transparentPanel, tr("Transparent"));
-    stakingTabs->addTab(nullstakePanel, tr("NullStake"));
     stakingTabs->addTab(coldStakingPanel, tr("Cold Staking"));
-    stakingTabs->addTab(nullstakeColdPanel, tr("Private Cold Stake"));
 
     mainLayout->addWidget(stakingTabs);
 
@@ -95,7 +91,7 @@ void StakingPage::setupTransparentPanel()
     QVBoxLayout *groupLayout = new QVBoxLayout(group);
 
     QLabel *infoLabel = new QLabel(tr(
-        "Transparent staking uses your regular (non-shielded) coins to stake. "
+        "Transparent staking uses your regular coins to stake. "
         "This is the standard Proof-of-Stake mechanism. Your coins remain visible "
         "on the blockchain while staking."));
     infoLabel->setWordWrap(true);
@@ -111,64 +107,6 @@ void StakingPage::setupTransparentPanel()
     layout->addStretch();
 }
 
-void StakingPage::setupNullStakePanel()
-{
-    nullstakePanel = new QWidget();
-    QVBoxLayout *outerLayout = new QVBoxLayout(nullstakePanel);
-    outerLayout->setContentsMargins(0, 0, 0, 0);
-    QScrollArea *nsScroll = new QScrollArea();
-    nsScroll->setWidgetResizable(true);
-    nsScroll->setFrameShape(QFrame::NoFrame);
-    QWidget *nsContent = new QWidget();
-    QVBoxLayout *layout = new QVBoxLayout(nsContent);
-
-    QGroupBox *group = new QGroupBox(tr("NullStake Private Staking (V1/V2)"));
-    QVBoxLayout *groupLayout = new QVBoxLayout(group);
-
-    QLabel *infoLabel = new QLabel(tr(
-        "NullStake uses your shielded (private) coins for staking via Zero-Knowledge proofs. "
-        "The amount you stake, the rewards you earn, and your identity as a staker are all hidden. "
-        "You need shielded coins to use this mode — shield some coins below."));
-    infoLabel->setWordWrap(true);
-    groupLayout->addWidget(infoLabel);
-
-    labelShieldedBalance = new QLabel(tr("Shielded Balance: Checking..."));
-    QFont bf = labelShieldedBalance->font(); bf.setBold(true);
-    labelShieldedBalance->setFont(bf);
-    groupLayout->addWidget(labelShieldedBalance);
-
-    labelShieldedStatus = new QLabel("");
-    labelShieldedStatus->setWordWrap(true);
-    groupLayout->addWidget(labelShieldedStatus);
-
-    // Shield coins section with amount choice
-    QFrame *shieldFrame = new QFrame();
-    shieldFrame->setFrameShape(QFrame::StyledPanel);
-    shieldFrame->setFrameShadow(QFrame::Sunken);
-    QGridLayout *shieldGrid = new QGridLayout(shieldFrame);
-    shieldGrid->setSpacing(12);
-
-    QLabel *shieldAmtLabel = new QLabel(tr("Amount to Shield:"));
-    shieldAmtLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    editShieldAmount = new QLineEdit();
-    editShieldAmount->setPlaceholderText(tr("0.00000000 (or * for entire balance)"));
-    editShieldAmount->setMaximumWidth(280);
-    shieldGrid->addWidget(shieldAmtLabel, 0, 0);
-    shieldGrid->addWidget(editShieldAmount, 0, 1);
-
-    btnShieldCoins = new QPushButton(tr("Shield Coins"));
-    btnShieldCoins->setToolTip(tr("Move the specified amount to shielded pool for private staking"));
-    btnShieldCoins->setMinimumSize(150, 0);
-    connect(btnShieldCoins, SIGNAL(clicked()), this, SLOT(onShieldCoinsClicked()));
-    shieldGrid->addWidget(btnShieldCoins, 1, 1);
-
-    groupLayout->addWidget(shieldFrame);
-    layout->addWidget(group);
-    layout->addStretch();
-
-    nsScroll->setWidget(nsContent);
-    outerLayout->addWidget(nsScroll);
-}
 
 void StakingPage::setupColdStakingPanel()
 {
@@ -273,79 +211,6 @@ void StakingPage::setupColdStakingPanel()
     outerLayout->addWidget(scrollArea);
 }
 
-void StakingPage::setupNullStakeColdPanel()
-{
-    nullstakeColdPanel = new QWidget();
-    QVBoxLayout *outerLayout = new QVBoxLayout(nullstakeColdPanel);
-    outerLayout->setContentsMargins(0, 0, 0, 0);
-
-    QScrollArea *scrollArea = new QScrollArea();
-    scrollArea->setWidgetResizable(true);
-    scrollArea->setFrameShape(QFrame::NoFrame);
-
-    QWidget *scrollContent = new QWidget();
-    QVBoxLayout *layout = new QVBoxLayout(scrollContent);
-
-    QGroupBox *infoGroup = new QGroupBox(tr("NullStake V3 — Private Cold Staking"));
-    QVBoxLayout *infoLayout = new QVBoxLayout(infoGroup);
-
-    QLabel *infoLabel = new QLabel(tr(
-        "Private Cold Staking combines the privacy of NullStake with the convenience of cold staking. "
-        "Your shielded coins are delegated to a VPS staker, but the spending keys stay offline "
-        "and the staking amount remains hidden via Zero-Knowledge proofs.\n\n"
-        "How it works:\n"
-        "1. Shield coins into your private pool\n"
-        "2. Generate a staking address on your VPS\n"
-        "3. Delegate your shielded coins to the VPS staker\n"
-        "4. The VPS stakes privately on your behalf 24/7\n"
-        "5. Rewards go to your shielded wallet\n"
-        "6. Revoke anytime — VPS cannot spend your coins"));
-    infoLabel->setWordWrap(true);
-    infoLayout->addWidget(infoLabel);
-    layout->addWidget(infoGroup);
-
-    QGroupBox *delegateGroup = new QGroupBox(tr("Private Delegation"));
-    QVBoxLayout *delegateLayout = new QVBoxLayout(delegateGroup);
-
-    QFrame *formFrame = new QFrame();
-    formFrame->setFrameShape(QFrame::StyledPanel);
-    formFrame->setFrameShadow(QFrame::Sunken);
-    QGridLayout *grid = new QGridLayout(formFrame);
-    grid->setSpacing(12);
-
-    QLabel *stakerLabel = new QLabel(tr("VPS Staker Address:"));
-    stakerLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    editNullColdStakerAddr = new QLineEdit();
-    editNullColdStakerAddr->setPlaceholderText(tr("Paste staking address from your VPS"));
-    editNullColdStakerAddr->setFont(QFont("monospace"));
-    grid->addWidget(stakerLabel, 0, 0);
-    grid->addWidget(editNullColdStakerAddr, 0, 1);
-
-    QLabel *amtLabel = new QLabel(tr("Amount:"));
-    amtLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    editNullColdAmount = new QLineEdit();
-    editNullColdAmount->setPlaceholderText(tr("0.00000000"));
-    editNullColdAmount->setMaximumWidth(220);
-    grid->addWidget(amtLabel, 1, 0);
-    grid->addWidget(editNullColdAmount, 1, 1);
-
-    delegateLayout->addWidget(formFrame);
-
-    QHBoxLayout *btnRow = new QHBoxLayout();
-    btnNullColdDelegate = new QPushButton(tr("Delegate Privately"));
-    btnNullColdDelegate->setMinimumSize(150, 0);
-    btnNullColdDelegate->setStyleSheet("QPushButton { background-color: #9C27B0; color: white; }");
-    connect(btnNullColdDelegate, SIGNAL(clicked()), this, SLOT(onNullColdDelegateClicked()));
-    btnRow->addWidget(btnNullColdDelegate);
-    btnRow->addStretch();
-    delegateLayout->addLayout(btnRow);
-
-    layout->addWidget(delegateGroup);
-    layout->addStretch();
-
-    scrollArea->setWidget(scrollContent);
-    outerLayout->addWidget(scrollArea);
-}
 
 void StakingPage::setModel(WalletModel *model)
 {
@@ -354,7 +219,7 @@ void StakingPage::setModel(WalletModel *model)
     {
         {
             LOCK(cs_stakingMode);
-            stakingTabs->setCurrentIndex((int)nStakingMode);
+            stakingTabs->setCurrentIndex((nStakingMode == STAKE_COLD) ? 1 : 0);
         }
 
         if (model->getOptionsModel())
@@ -370,11 +235,11 @@ void StakingPage::setModel(WalletModel *model)
 
 void StakingPage::onStakingModeChanged(int index)
 {
-    if (index < 0 || index > 3)
+    if (index < 0 || index > 1)
         return;
 
-    // Map tab index to staking mode: 0=transparent, 1=nullstake, 2=cold, 3=nullstake cold (uses cold mode)
-    int modeIdx = (index == 3) ? 2 : index; // NullStake Cold uses STAKE_COLD mode internally
+    // Map tab index to staking mode: 0=transparent (STAKE_TRANSPARENT), 1=cold (STAKE_COLD)
+    int modeIdx = (index == 1) ? 2 : 0;
     {
         LOCK(cs_stakingMode);
         nStakingMode = (StakingMode)modeIdx;
@@ -386,7 +251,7 @@ void StakingPage::onStakingModeChanged(int index)
     {
         model->getOptionsModel()->setData(
             model->getOptionsModel()->index(OptionsModel::StakingModeOpt),
-            QVariant(index), Qt::EditRole);
+            QVariant(modeIdx), Qt::EditRole);
     }
 
     updateBalances();
@@ -400,9 +265,6 @@ void StakingPage::updateModeDescription(int mode)
         labelStakingMode->setText(tr("Mode: Transparent Staking"));
         break;
     case 1:
-        labelStakingMode->setText(tr("Mode: NullStake Private Staking"));
-        break;
-    case 2:
         labelStakingMode->setText(tr("Mode: Cold Staking (Delegated)"));
         break;
     default:
@@ -462,43 +324,7 @@ void StakingPage::updateBalances()
             .arg(BitcoinUnits::formatWithUnit(unit, nBalance)));
         break;
     }
-    case 1: // NullStake
-    {
-        int64_t nShielded = pwalletMain->GetShieldedBalance();
-        int64_t nTransparent = pwalletMain->GetBalance();
-        labelStakingBalance->setText(tr("Shielded Balance: %1")
-            .arg(BitcoinUnits::formatWithUnit(unit, nShielded)));
-        labelShieldedBalance->setText(tr("Shielded Balance: %1")
-            .arg(BitcoinUnits::formatWithUnit(unit, nShielded)));
-
-        // Shield button always enabled when transparent coins exist (ease of use)
-        btnShieldCoins->setEnabled(nTransparent > 0);
-
-        if (nShielded == 0 && nTransparent > 0)
-        {
-            labelShieldedStatus->setText(tr(
-                "You have transparent coins but no shielded coins. "
-                "Click 'Shield Coins' to move coins to the shielded pool for private staking."));
-            labelShieldedStatus->setStyleSheet("QLabel { color: #CC6600; }");
-        }
-        else if (nShielded > 0 && nTransparent > 0)
-        {
-            labelShieldedStatus->setText(tr("Ready for private staking. You can shield more coins anytime."));
-            labelShieldedStatus->setStyleSheet("QLabel { color: green; }");
-        }
-        else if (nShielded > 0)
-        {
-            labelShieldedStatus->setText(tr("Ready for private staking."));
-            labelShieldedStatus->setStyleSheet("QLabel { color: green; }");
-        }
-        else
-        {
-            labelShieldedStatus->setText(tr("No coins available. Receive coins first."));
-            labelShieldedStatus->setStyleSheet("");
-        }
-        break;
-    }
-    case 2: // Cold
+    case 1: // Cold
     {
         int64_t nCold = pwalletMain->GetColdStakingBalance();
         labelStakingBalance->setText(tr("Cold Staking Balance: %1")
@@ -509,83 +335,6 @@ void StakingPage::updateBalances()
     }
     default:
         break;
-    }
-}
-
-void StakingPage::onShieldCoinsClicked()
-{
-    if (!model || !pwalletMain)
-        return;
-
-    QString amountStr = editShieldAmount->text().trimmed();
-    if (amountStr.isEmpty())
-    {
-        QMessageBox::warning(this, tr("Shield Coins"),
-            tr("Please enter an amount to shield, or * to shield your entire balance."));
-        return;
-    }
-
-    QMessageBox::StandardButton reply;
-    reply = QMessageBox::question(this, tr("Shield Coins"),
-        tr("Shield %1 to the shielded pool for private staking?\n\n"
-           "A shielded address will be created automatically if you don't have one.\n"
-           "Once shielded, NullStake will use these coins.").arg(amountStr),
-        QMessageBox::Yes | QMessageBox::No);
-
-    if (reply != QMessageBox::Yes)
-        return;
-
-    WalletModel::UnlockContext ctx(model->requestUnlock());
-    if (!ctx.isValid())
-        return;
-
-    QString fromAddr = (amountStr == "*") ? "*" : "";
-    QString resultOut;
-    WalletModel::StatusCode status = model->shieldCoins(fromAddr, amountStr, resultOut);
-
-    if (status == WalletModel::OK)
-    {
-        QMessageBox::information(this, tr("Shield Coins"),
-            tr("Coins shielded successfully!\n\n%1\n\n"
-               "Your shielded balance will update after confirmation.").arg(resultOut));
-        editShieldAmount->clear();
-        updateStakingStatus();
-    }
-    else
-    {
-        QMessageBox::warning(this, tr("Shield Coins"),
-            tr("Failed to shield coins:\n\n%1").arg(resultOut));
-    }
-}
-
-void StakingPage::onNullColdDelegateClicked()
-{
-    if (!model || !pwalletMain)
-        return;
-
-    QString stakerAddr = editNullColdStakerAddr->text().trimmed();
-    QString amountStr = editNullColdAmount->text().trimmed();
-
-    if (stakerAddr.isEmpty() || amountStr.isEmpty())
-    {
-        QMessageBox::warning(this, tr("Private Cold Staking"),
-            tr("Please enter both the VPS staker address and the amount to delegate."));
-        return;
-    }
-
-    QMessageBox::StandardButton reply;
-    reply = QMessageBox::question(this, tr("Private Cold Delegation"),
-        tr("Delegate %1 INN privately to VPS staker?\n\nStaker: %2\n\n"
-           "Your spending keys stay offline. The VPS can only stake, not spend.")
-           .arg(amountStr, stakerAddr.left(30) + "..."),
-        QMessageBox::Yes | QMessageBox::No);
-
-    if (reply == QMessageBox::Yes)
-    {
-        QString rpcCmd = QString("n_delegatestake \"%1\" %2").arg(stakerAddr, amountStr);
-        QMessageBox::information(this, tr("Private Cold Staking"),
-            tr("Execute in Debug Console:\n\n  %1\n\n"
-               "Monitor with: n_coldstakeinfo").arg(rpcCmd));
     }
 }
 

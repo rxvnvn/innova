@@ -70,7 +70,6 @@ private slots:
     void selectionChanged();
     void updateEmptyState();
     void on_showQRCode_clicked();
-    void onNewShieldedAddressClicked();
     void onNewSPAddressClicked();
     void onNewStakingAddressClicked();
     /** Spawn contextual menu (right mouse menu) for address book entry */

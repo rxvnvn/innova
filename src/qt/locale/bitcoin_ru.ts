@@ -183,11 +183,7 @@ This product includes software developed by the OpenSSL Project for use in the O
         <source>New shielde&amp;d address</source>
         <translation>Новый защи&amp;щённый адрес</translation>
     </message>
-    <message>
-        <location filename="../addressbookpage.cpp" line="+0"/>
-        <source>Generate a new shielded address</source>
-        <translation>Создать новый защищённый адрес</translation>
-    </message>
+
     <message>
         <location filename="../addressbookpage.cpp" line="+0"/>
         <source>New silent p&amp;ayment address</source>
@@ -208,11 +204,7 @@ This product includes software developed by the OpenSSL Project for use in the O
         <source>Generate a new staking address for cold staking</source>
         <translation>Создать новый адрес для холодного стейкинга</translation>
     </message>
-    <message>
-        <location filename="../addressbookpage.cpp" line="+0"/>
-        <source>Label for new shielded address (optional):</source>
-        <translation>Метка для нового защищённого адреса (необязательно):</translation>
-    </message>
+
     <message>
         <location filename="../addressbookpage.cpp" line="+0"/>
         <source>Label for new silent payment address (optional):</source>
@@ -850,10 +842,7 @@ Address: %4
         <source>Node Information</source>
         <translation>Информация об узле</translation>
     </message>
-    <message>
-        <source>&amp;NullSend</source>
-        <translation>&amp;NullSend</translation>
-    </message>
+
     <message>
         <source>&amp;Collateral Nodes</source>
         <translation>Коллатеральные &amp;узлы</translation>
@@ -1474,14 +1463,7 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <source>Total of coins that was staked, and do not yet count toward the current balance</source>
         <translation>Сумма монет для стейкинга, которые пока не учитываются в текущем балансе</translation>
     </message>
-    <message>
-        <source>Shielded (Private):</source>
-        <translation>Приватный баланс:</translation>
-    </message>
-    <message>
-        <source>Coins in the shielded (private) pool. Hidden from the public ledger.</source>
-        <translation>Монеты в приватном пуле. Скрыты от публичного реестра.</translation>
-    </message>
+
     <message>
         <source>Unconfirmed:</source>
         <translation>Неподтверждено:</translation>
@@ -1554,10 +1536,7 @@ This label turns red, if the priority is smaller than &quot;medium&quot;.
         <source>Stake balance</source>
         <translation>Баланс стейкинга</translation>
     </message>
-    <message>
-        <source>Shielded (private) balance. Shield coins via the Send page to move funds here.</source>
-        <translation>Приватный баланс. Чтобы переместить сюда средства, экранируйте монеты на странице отправки.</translation>
-    </message>
+
     <message>
         <source>Your current total balance</source>
         <translation>Ваш текущий общий баланс</translation>

@@ -327,7 +327,6 @@ static const CRPCCommand vRPCCommands[] =
     { "getsubsidy",             &getsubsidy,             true,   false },
     { "getmininginfo",          &getmininginfo,          true,   false },
     { "getstakinginfo",         &getstakinginfo,         true,   false },
-    { "getfinalitystakinginfo", &getfinalitystakinginfo, true,   false },
     { "getnewaddress",          &getnewaddress,          true,   false },
     { "getnewpubkey",           &getnewpubkey,           true,   false },
     { "getaccountaddress",      &getaccountaddress,      true,   false },
@@ -429,6 +428,11 @@ static const CRPCCommand vRPCCommands[] =
     { "getcoldstakinginfo",     &getcoldstakinginfo,     true,   false},
     { "revokecoldstaking",      &revokecoldstaking,      false,  true},
 
+    /* Silent payments */
+    { "sp_getnewaddress",       &sp_getnewaddress,       false,  true },
+    { "sp_listaddresses",       &sp_listaddresses,       true,   false },
+    { "sp_send",                &sp_send,                false,  true },
+
     /* SPV (Light Client) mode */
     { "getspvinfo",             &getspvinfo,             true,   false},
     { "spvrescan",              &spvrescan,              false,  false},
@@ -440,57 +444,9 @@ static const CRPCCommand vRPCCommands[] =
     { "masternode",           	&masternode,             true,   false},
     { "collateralnode",           &collateralnode,           true,   false},
 
-    /* NullSend Mixing */
-    { "startmixing",            &startmixing,            false,  true},
-    { "stopmixing",             &stopmixing,             false,  false},
-    { "getmixingstatus",        &getmixingstatus,        true,   false},
-
 
 
     { "proofofdata",          &proofofdata,              false,  true  },
-
-    // Innova Name Commands
-
-    /* Shielded Transaction Commands */
-    { "z_getnewaddress",        &z_getnewaddress,        false,  true },
-    { "z_listaddresses",        &z_listaddresses,        true,   false },
-    { "z_getbalance",           &z_getbalance,           true,   false },
-    { "z_gettotalbalance",      &z_gettotalbalance,      true,   false },
-    { "z_shield",               &z_shield,               false,  true },
-    { "z_unshield",             &z_unshield,             false,  true },
-    { "z_listunspent",          &z_listunspent,          true,   false },
-    { "z_validateaddress",      &z_validateaddress,      true,   false },
-    { "z_exportkey",            &z_exportkey,            false,  true },
-    { "z_importkey",            &z_importkey,            false,  true },
-    { "z_exportviewingkey",     &z_exportviewingkey,     false,  true },
-    { "z_importviewingkey",     &z_importviewingkey,     false,  true },
-    { "z_getshieldedinfo",      &z_getshieldedinfo,      true,   false },
-    { "z_migrateanon",          &z_migrateanon,          false,  true },
-    { "z_send",                 &z_send,                 false,  true },
-    { "z_nullsend",             &z_nullsend,             false,  true },
-    { "z_nullsendinfo",         &z_nullsendinfo,         true,   false },
-
-    /* Cold Staking Delegation Commands (NullStake V3) */
-    { "n_delegatestake",        &n_delegatestake,        false,  true },
-    { "n_importdelegation",     &n_importdelegation,     false,  true },
-    { "n_revokecoldstake",      &n_revokecoldstake,      false,  true },
-    { "n_coldstakeinfo",        &n_coldstakeinfo,        true,   false },
-
-    /* Silent Payment Commands */
-    { "sp_getnewaddress",       &sp_getnewaddress,       false,  true },
-    { "sp_listaddresses",       &sp_listaddresses,       true,   false },
-    { "sp_send",                &sp_send,                false,  true },
-
-    /* IDAG Phase 1: Finality commands */
-    { "getfinalityinfo",        &getfinalityinfo,        true,   false },
-    { "submitfinalitytallyshare", &submitfinalitytallyshare, false, false },
-    { "submitfinalitytallycert", &submitfinalitytallycert, false, false },
-    { "isblockfinalized",       &isblockfinalized,       true,   false },
-
-    /* IDAG: DAG consensus commands (Phase 2-4) */
-    { "getepochinfo",           &getepochinfo,           true,   false },
-
-
 };
 
 CRPCTable::CRPCTable()
@@ -1687,17 +1643,7 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "getblocktemplate"       && n > 0) ConvertTo<Object>(params[0]);
     if (strMethod == "listsinceblock"         && n > 1) ConvertTo<int64_t>(params[1]);
 
-    if (strMethod == "z_shield"              && n > 1) ConvertTo<double>(params[1]);
-    if (strMethod == "z_unshield"            && n > 2) ConvertTo<double>(params[2]);
-    if (strMethod == "z_send"                && n > 2) ConvertTo<double>(params[2]);
-    if (strMethod == "z_send"                && n > 3) ConvertTo<int64_t>(params[3]);
-    if (strMethod == "n_delegatestake"       && n > 1) ConvertTo<double>(params[1]);
-    if (strMethod == "z_nullsend"            && n > 1) ConvertTo<double>(params[1]);
-    if (strMethod == "z_nullsend"            && n > 2) ConvertTo<int64_t>(params[2]);
-    if (strMethod == "z_nullsend"            && n > 3) ConvertTo<int64_t>(params[3]);
-    if (strMethod == "z_nullsend"            && n > 4) ConvertTo<int64_t>(params[4]);
 
-    if (strMethod == "sp_send"                && n > 1) ConvertTo<double>(params[1]);
 
     if (strMethod == "sendalert"              && n > 2) ConvertTo<int64_t>(params[2]);
     if (strMethod == "sendalert"              && n > 3) ConvertTo<int64_t>(params[3]);
@@ -1754,7 +1700,6 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "setbestblockbyheight"   && n > 0) ConvertTo<int64_t>(params[0]);
 
     // IDAG DAG Commands
-    if (strMethod == "getepochinfo"           && n > 0) ConvertTo<int64_t>(params[0]);
 
     //Innova Name Commands
 

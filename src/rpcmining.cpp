@@ -4,7 +4,6 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "main.h"
-#include "finality_epoch_store.h"
 #include "blockindex_accessor.h"
 #include "db.h"
 #include "txdb.h"
@@ -12,8 +11,6 @@
 #include "miner.h"
 #include "collateralnode.h"
 #include "innovarpc.h"
-#include "finality.h"
-#include "epoch_state.h"
 #include "base58.h"
 #include <chrono>
 
@@ -27,26 +24,6 @@ static int64_t RPCPerfTimeMicros()
 
 using namespace json_spirit;
 using namespace std;
-
-static std::string MiningFinalityTierName(FinalityTier tier)
-{
-    if (tier == FINALITY_HARD) return "hard";
-    if (tier == FINALITY_SOFT) return "soft";
-    if (tier == FINALITY_TENTATIVE) return "tentative";
-    return "none";
-}
-
-int64_t GetFinalityStakingEpochBlockTimeForTesting(int nHeight)
-{
-    LOCK(cs_main);
-    if (!pindexBest)
-        return 0;
-    const int nEpoch = GetEpochForHeight(nHeight);
-    const int nEpochBoundary = GetEpochBoundaryHeight(nEpoch, nHeight);
-    LegacyBlockIndexAccessor accessor;
-    BlockIndexSnapshot snap = accessor.GetActiveByHeight(nEpochBoundary);
-    return snap.found ? (int64_t)snap.nTime : pindexBest->GetBlockTime();
-}
 
 Value getgenerate(const Array& params, bool fHelp)
 {
@@ -193,7 +170,6 @@ Value getstakinginfo(const Array& params, bool fHelp)
     obj.push_back(Pair("enabled", GetBoolArg("-staking", true)));
     obj.push_back(Pair("staking", staking));
     obj.push_back(Pair("pos_block_production", fPoSBlockProduction));
-    obj.push_back(Pair("finality_voting", nBestHeight >= FORK_HEIGHT_DAG && !GetBoolArg("-nofinalityvoting", false)));
     obj.push_back(Pair("errors", GetWarnings("statusbar")));
 
     obj.push_back(Pair("currentblocksize", (uint64_t)nLastBlockSize));
@@ -210,212 +186,6 @@ Value getstakinginfo(const Array& params, bool fHelp)
 
     return obj;
 }
-
-Value getfinalitystakinginfo(const Array& params, bool fHelp)
-{
-    if (fHelp || params.size() != 0)
-        throw runtime_error(
-            "getfinalitystakinginfo\n"
-            "Returns transparent finality staking status for the post-DAG finality voter.\n");
-
-    int nHeight = 0;
-    int nEpoch = 0;
-    int nEpochBoundary = 0;
-    int nEpochProgress = 0;
-    int64_t nEpochBlockTime = 0;
-    {
-        LOCK(cs_main);
-        if (pindexBest)
-        {
-            nHeight = pindexBest->nHeight;
-            nEpoch = GetEpochForHeight(nHeight);
-            nEpochBoundary = GetEpochBoundaryHeight(nEpoch, nHeight);
-            nEpochProgress = nHeight - nEpochBoundary;
-            LegacyBlockIndexAccessor accessor;
-            BlockIndexSnapshot epochBoundary = accessor.GetActiveByHeight(nEpochBoundary);
-            nEpochBlockTime = epochBoundary.found ? (int64_t)epochBoundary.nTime : pindexBest->GetBlockTime();
-        }
-    }
-
-    int64_t nEligibleWeight = 0;
-    int nEligibleUtxos = 0;
-    std::set<CKeyID> setVoterKeys;
-
-    if (pwalletMain)
-    {
-        LOCK2(cs_main, pwalletMain->cs_wallet);
-        std::vector<COutput> vCoins;
-        pwalletMain->AvailableCoins(vCoins);
-        CTxDB txdb("r");
-        for (const COutput& out : vCoins)
-        {
-            if (!out.tx || out.i < 0 || (unsigned int)out.i >= out.tx->vout.size())
-                continue;
-            const CTxOut& txout = out.tx->vout[out.i];
-            if (txout.nValue <= 0 || !MoneyRange(txout.nValue))
-                continue;
-
-            CTxDestination dest;
-            if (!ExtractDestination(txout.scriptPubKey, dest))
-                continue;
-            CKeyID keyID;
-            if (!CBitcoinAddress(dest).GetKeyID(keyID))
-                continue;
-            CKey key;
-            if (!pwalletMain->GetKey(keyID, key))
-                continue;
-
-            CTxIndex txindex;
-            if (!txdb.ReadTxIndex(out.tx->GetHash(), txindex))
-                continue;
-            if ((unsigned int)out.i >= txindex.vSpent.size() || !txindex.vSpent[out.i].IsNull())
-                continue;
-
-            CBlock blockFrom;
-            if (!blockFrom.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
-                continue;
-            if (blockFrom.GetBlockTime() + nStakeMinAge > nEpochBlockTime)
-                continue;
-
-            nEligibleUtxos++;
-            setVoterKeys.insert(keyID);
-            if (nEligibleWeight <= MAX_MONEY - txout.nValue)
-                nEligibleWeight += txout.nValue;
-            else
-                nEligibleWeight = MAX_MONEY;
-        }
-    }
-
-    Object obj;
-    obj.push_back(Pair("enabled", !GetBoolArg("-nofinalityvoting", false)));
-    obj.push_back(Pair("dag_active", nHeight >= FORK_HEIGHT_DAG));
-    obj.push_back(Pair("pos_block_production", nHeight < FORK_HEIGHT_DAG));
-    obj.push_back(Pair("dag_block_producer", std::string("pow")));
-    obj.push_back(Pair("height", nHeight));
-    obj.push_back(Pair("epoch", nEpoch));
-    obj.push_back(Pair("epoch_boundary_height", nEpochBoundary));
-    obj.push_back(Pair("epoch_progress", nEpochProgress));
-    obj.push_back(Pair("vote_window", FINALITY_VOTE_WINDOW));
-    obj.push_back(Pair("eligible_weight", FormatMoney(nEligibleWeight)));
-    obj.push_back(Pair("eligible_utxos", nEligibleUtxos));
-    obj.push_back(Pair("eligible_keys", (int)setVoterKeys.size()));
-    obj.push_back(Pair("pending_votes", g_finalityTracker.GetPendingVoteCount()));
-    obj.push_back(Pair("pending_rewards", FormatMoney(g_finalityTracker.GetPendingRewardTotal())));
-    obj.push_back(Pair("expected_epoch_reward", FormatMoney(GetFinalityVoteReward(nEligibleWeight, GetEpochInterval(nHeight)))));
-    obj.push_back(Pair("finality_tier", MiningFinalityTierName(g_finalityTracker.GetFinalityTier())));
-    obj.push_back(Pair("consecutive_hard_epochs", g_finalityTracker.GetConsecutiveHardEpochCount()));
-    obj.push_back(Pair("finalized_epoch", GetEpochForHeight(g_finalityTracker.GetFinalizedHeight())));
-    obj.push_back(Pair("finalized_hash", g_finalityTracker.GetFinalizedHash().GetHex()));
-    obj.push_back(Pair("finality_model", std::string("active-epoch-committed-weight")));
-    obj.push_back(Pair("absolute_stake_floor", false));
-    obj.push_back(Pair("private_finality_mode", std::string("hidden-weight-nullstake")));
-    obj.push_back(Pair("tally_certificate_required_for_private_votes", true));
-    CFinalityTallyConfig tallyConfig = GetFinalityTallyConfig();
-    obj.push_back(Pair("private_promotion_enabled", nHeight >= FORK_HEIGHT_DAG && tallyConfig.CanRelayPrivateVotes()));
-    obj.push_back(Pair("tally_mode", tallyConfig.strMode));
-    obj.push_back(Pair("tally_mode_valid", tallyConfig.fModeValid));
-    obj.push_back(Pair("tally_pubkey_configured", tallyConfig.fPubKeyConfigured));
-    obj.push_back(Pair("tally_committee_valid", tallyConfig.fCommitteeValid));
-    obj.push_back(Pair("tally_privkey_configured", tallyConfig.fPrivKeyConfigured));
-    obj.push_back(Pair("tally_privkey_valid", tallyConfig.fPrivKeyValid));
-    obj.push_back(Pair("tally_threshold", GetArg("-finalitytallythreshold", "")));
-    obj.push_back(Pair("tally_threshold_valid", tallyConfig.fThresholdValid));
-    obj.push_back(Pair("tally_threshold_m", tallyConfig.nThresholdM));
-    obj.push_back(Pair("tally_committee_size", tallyConfig.nThresholdN));
-    obj.push_back(Pair("tally_configured_pubkeys", (int)tallyConfig.vCommitteePubKeys.size()));
-    obj.push_back(Pair("tally_committee_set_hash", tallyConfig.committeeSetHash.GetHex()));
-    obj.push_back(Pair("tally_local_committee_index", tallyConfig.nLocalCommitteeIndex));
-    obj.push_back(Pair("tally_encrypted_shares_ready", tallyConfig.fEncryptedTallyReady));
-    int nDecryptableTallyShares = CountDecryptableFinalityTallyShares(nEpoch);
-    int nTallyAggregatePartials = g_finalityTracker.GetEpochTallyAggregatePartialCount(nEpoch);
-    obj.push_back(Pair("tally_decryptable_shares", nDecryptableTallyShares));
-    obj.push_back(Pair("tally_aggregate_partials", nTallyAggregatePartials));
-    obj.push_back(Pair("tally_certificate_production_enabled", nHeight >= FORK_HEIGHT_DAG && tallyConfig.CanProduceCertificates()));
-
-    int nTransparentVotes = 0;
-    int nPrivateVotes = 0;
-    g_finalityTracker.GetEpochVoteModeCounts(nEpoch, nTransparentVotes, nPrivateVotes);
-    obj.push_back(Pair("transparent_votes", nTransparentVotes));
-    obj.push_back(Pair("private_votes", nPrivateVotes));
-    obj.push_back(Pair("tally_shares", g_finalityTracker.GetEpochTallyShareCount(nEpoch)));
-
-    std::vector<CFinalityTallyCertificate> vCerts = g_finalityTracker.GetEpochTallyCertificates(nEpoch);
-    std::vector<CFinalityTallyCertificate> vPendingCerts =
-        g_finalityTracker.GetPendingTallyCertificatesForBlock(nHeight + 1);
-    Array certs;
-    bool fHavePrivateCert = false;
-    bool fHavePendingPrivateCert = false;
-    int nTallyCertificateVersion = 0;
-    std::string strTallyCertificateSource = "none";
-    for (const CFinalityTallyCertificate& cert : vCerts)
-    {
-        Object certObj;
-        certObj.push_back(Pair("hash", cert.GetHash().GetHex()));
-        certObj.push_back(Pair("version", cert.nVersion));
-        certObj.push_back(Pair("tier", MiningFinalityTierName((FinalityTier)cert.nTier)));
-        certObj.push_back(Pair("private_weight", cert.HasPrivateWeight()));
-        certObj.push_back(Pair("source", std::string("epoch-tracker")));
-        certObj.push_back(Pair("tally_share_hashes", (int)cert.vTallyShareHashes.size()));
-        certObj.push_back(Pair("curve_root", cert.hashCurveRoot.GetHex()));
-        certObj.push_back(Pair("nullifier_root", cert.hashNullifierRoot.GetHex()));
-        certObj.push_back(Pair("committee_set_hash", cert.committeeSetHash.GetHex()));
-        certs.push_back(certObj);
-        if (cert.HasPrivateWeight())
-        {
-            fHavePrivateCert = true;
-            nTallyCertificateVersion = cert.nVersion;
-            strTallyCertificateSource = "connected";
-        }
-    }
-    for (const CFinalityTallyCertificate& cert : vPendingCerts)
-    {
-        if (cert.nEpoch != nEpoch || !cert.HasPrivateWeight())
-            continue;
-        fHavePendingPrivateCert = true;
-        if (!fHavePrivateCert)
-        {
-            nTallyCertificateVersion = cert.nVersion;
-            strTallyCertificateSource = "pending";
-        }
-    }
-    obj.push_back(Pair("tally_certificates", certs));
-    obj.push_back(Pair("private_certificate_present", fHavePrivateCert));
-    obj.push_back(Pair("pending_private_certificate_present", fHavePendingPrivateCert));
-    obj.push_back(Pair("tally_certificate_version", nTallyCertificateVersion));
-    obj.push_back(Pair("tally_certificate_source", strTallyCertificateSource));
-    std::string strPrivatePromotionStatus = "waiting-for-shares";
-    if (nHeight < FORK_HEIGHT_DAG)
-        strPrivatePromotionStatus = "inactive-pre-dag";
-    else if (!tallyConfig.CanRelayPrivateVotes())
-        strPrivatePromotionStatus = "committee-config-invalid";
-    else if (!tallyConfig.CanProduceCertificates())
-        strPrivatePromotionStatus = "waiting-for-local-committee-key";
-    else if (fHavePrivateCert)
-        strPrivatePromotionStatus = "connected-certificate";
-    else if (fHavePendingPrivateCert)
-        strPrivatePromotionStatus = "pending-certificate";
-    else if (nDecryptableTallyShares > 0 || nTallyAggregatePartials > 0)
-        strPrivatePromotionStatus = "collecting-partials";
-    obj.push_back(Pair("private_promotion_status", strPrivatePromotionStatus));
-
-    CEpochState currentEpochState;
-    if (GetFinalityEpochStateStore().GetEpochState(nEpoch, currentEpochState))
-    {
-        obj.push_back(Pair("epoch_curve_root", currentEpochState.hashCurveRoot.GetHex()));
-        obj.push_back(Pair("epoch_nullifier_root", currentEpochState.hashNullifierRoot.GetHex()));
-        obj.push_back(Pair("epoch_finality_certificate", currentEpochState.hashFinalityCertificate.GetHex()));
-    }
-    else
-    {
-        uint256 hashZero = 0;
-        obj.push_back(Pair("epoch_curve_root", hashZero.GetHex()));
-        obj.push_back(Pair("epoch_nullifier_root", hashZero.GetHex()));
-        obj.push_back(Pair("epoch_finality_certificate", hashZero.GetHex()));
-        obj.push_back(Pair("epoch_root_status", std::string("not_computed")));
-    }
-    return obj;
-}
-
 
 Value setgenerate(const Array& params, bool fHelp)
 {

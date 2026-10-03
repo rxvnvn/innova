@@ -22,7 +22,7 @@ bool RebuildCandidateTips();
 //
 // AUTHORITY fields  : tip logical hash, exact canonical chainTrust,
 //                     height (ancestry/fork walks), operator validity,
-//                     finality compatibility, best-trust threshold.
+//                     best-trust threshold.
 // MATERIALIZATION   : HasBlockData() is a separate availability predicate; a
 //                     missing result never mutates candidate authority.
 //
@@ -52,7 +52,6 @@ public:
     virtual bool    IsBestActive() const = 0;   // a best tip exists
     virtual uint256 GetBestTrust() const = 0;   // nBestChainTrust threshold
     virtual uint256 GetBestTip() const = 0;     // active tip logical hash
-    virtual int     GetFinalizedHeight() const = 0; // 0 if not active
     virtual bool    IsOperatorHash(const uint256& hash) const = 0; // setInvalidBlockHash
 
     // --- by-value record access (ancestry/fork walks + tip enumeration) ---
@@ -95,16 +94,13 @@ public:
     uint256 bestHash;
     uint256 bestTrust;
     bool    hasBest;
-    int     finalizedHeight;
-    bool    finalityActive;  // = (finalizedHeight > 0 && finality gate open)
     std::map<uint256, BVec> blocks;    // hash -> record (hash-sorted)
     std::vector<uint256>    tipHashes;
     std::set<uint256>       operatorInvalid;
     std::set<uint256>       hasData;
 
     SnapshotCandidateFrontierStore()
-        : bestHash(0), bestTrust(0), hasBest(false), finalizedHeight(0),
-          finalityActive(false) {}
+        : bestHash(0), bestTrust(0), hasBest(false) {}
 
     void SetBest(const uint256& h, const uint256& trust)
     {
@@ -119,7 +115,6 @@ public:
     bool IsBestActive() const { return hasBest; }
     uint256 GetBestTrust() const { return bestTrust; }
     uint256 GetBestTip() const { return bestHash; }
-    int GetFinalizedHeight() const { return finalityActive ? finalizedHeight : 0; }
     bool IsOperatorHash(const uint256& h) const { return operatorInvalid.count(h) != 0; }
 
     CandidateFrontierAuthorityRecord Lookup(const uint256& hash) const

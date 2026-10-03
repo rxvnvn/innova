@@ -337,7 +337,7 @@
        <item>
         <widget class="QLabel" name="stakingModeInfoLabel">
          <property name="text">
-          <string>Choose how your wallet stakes coins. Transparent uses regular coins, Zarcanum uses shielded coins for privacy, and Cold Staking delegates to a VPS node.</string>
+          <string>Choose how your wallet stakes coins. Transparent uses regular coins, and Cold Staking delegates to a VPS node.</string>
          </property>
          <property name="wordWrap">
           <bool>true</bool>
@@ -359,7 +359,7 @@
          <item>
           <widget class="QValueComboBox" name="stakingMode">
            <property name="toolTip">
-            <string>Select staking mode: Transparent (standard), Zarcanum (private), or Cold (delegated to VPS)</string>
+            <string>Select staking mode: Transparent (standard) or Cold (delegated to VPS)</string>
            </property>
           </widget>
          </item>

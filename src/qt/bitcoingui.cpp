@@ -32,7 +32,6 @@
 #include "wallet.h"
 #include "stakingpage.h"
 #include "privacypage.h"
-#include "nullsendpage.h"
 
 #ifdef Q_OS_MAC
 #include "macdockiconhandler.h"
@@ -98,7 +97,6 @@ enum ToolbarGlyph
     GlyphHistory,
     GlyphAddressBook,
     GlyphStake,
-    GlyphNullSend,
     GlyphCollateralNodes,
     GlyphExport,
     GlyphLock,
@@ -157,16 +155,6 @@ static QPixmap MakeToolbarPixmap(ToolbarGlyph glyph, const QColor& primary, cons
         painter.drawLine(QPointF(16, 25), QPointF(20, 13));
         painter.drawLine(QPointF(16, 20), QPointF(11, 17));
         break;
-    case GlyphNullSend:
-    {
-        QPolygonF shield;
-        shield << QPointF(16, 6) << QPointF(25, 10) << QPointF(23, 22) << QPointF(16, 27) << QPointF(9, 22) << QPointF(7, 10);
-        painter.drawPolygon(shield);
-        painter.drawLine(QPointF(11, 16), QPointF(21, 16));
-        painter.drawLine(QPointF(18, 12), QPointF(22, 16));
-        painter.drawLine(QPointF(18, 20), QPointF(22, 16));
-        break;
-    }
     case GlyphCollateralNodes:
         painter.drawLine(QPointF(11, 12), QPointF(21, 12));
         painter.drawLine(QPointF(11, 12), QPointF(16, 23));
@@ -293,7 +281,6 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
 	multisigPage = new MultisigDialog(this);
     stakingPage = new StakingPage(this);
     privacyPage = new PrivacyPage(this);
-    nullsendPage = new NullSendPage(this);
 
     transactionsPage = new QWidget(this);
     QVBoxLayout *vbox = new QVBoxLayout();
@@ -327,7 +314,6 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     centralWidget->addWidget(collateralnodeManagerPage);
     centralWidget->addWidget(stakingPage);
     centralWidget->addWidget(privacyPage);
-    centralWidget->addWidget(nullsendPage);
     setCentralWidget(centralWidget);
 
     // Create status bar
@@ -431,12 +417,6 @@ void BitcoinGUI::createActions()
 
 
 
-    nullsendAction = new QAction(MakeToolbarIcon(GlyphNullSend), tr("&NullSend"), this);
-    nullsendAction->setToolTip(tr("NullSend multi-party mixing for transaction unlinkability"));
-    nullsendAction->setCheckable(true);
-    nullsendAction->setStatusTip(tr("NullSend Mixing"));
-    tabGroup->addAction(nullsendAction);
-
     sendCoinsAction = new QAction(MakeToolbarIcon(GlyphSend), tr("&Send"), this);
     sendCoinsAction->setToolTip(tr("Send coins to an Innova address"));
     sendCoinsAction->setCheckable(true);
@@ -513,8 +493,6 @@ void BitcoinGUI::createActions()
     connect(stakingAction, SIGNAL(triggered()), this, SLOT(gotoStakingPage()));
     connect(privacyAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
     connect(privacyAction, SIGNAL(triggered()), this, SLOT(gotoPrivacyPage()));
-    connect(nullsendAction, SIGNAL(triggered()), this, SLOT(showNormalIfMinimized()));
-    connect(nullsendAction, SIGNAL(triggered()), this, SLOT(gotoNullSendPage()));
 
     quitAction = new QAction(QIcon(":/icons/quit"), tr("E&xit"), this);
     quitAction->setToolTip(tr("Quit application"));
@@ -632,7 +610,6 @@ void BitcoinGUI::createMenuBar()
     window->addAction(stakingAction);
     window->addAction(mintingAction);
     window->addAction(collateralnodeManagerAction);
-    window->addAction(nullsendAction);
     window->addAction(multisigAction);
     window->addSeparator();
     window->addAction(openInfoAction);
@@ -728,7 +705,6 @@ void BitcoinGUI::setWalletModel(WalletModel *walletModel)
 		multisigPage->setModel(walletModel);
         stakingPage->setModel(walletModel);
         privacyPage->setModel(walletModel);
-        qobject_cast<NullSendPage*>(nullsendPage)->setModel(walletModel);
 
         setEncryptionStatus(walletModel->getEncryptionStatus());
         connect(walletModel, SIGNAL(encryptionStatusChanged(int)), this, SLOT(setEncryptionStatus(int)));
@@ -1148,15 +1124,6 @@ void BitcoinGUI::gotoPrivacyPage()
 {
     privacyAction->setChecked(true);
     centralWidget->setCurrentWidget(privacyPage);
-
-    exportAction->setEnabled(false);
-    disconnect(exportAction, SIGNAL(triggered()), 0, 0);
-}
-
-void BitcoinGUI::gotoNullSendPage()
-{
-    nullsendAction->setChecked(true);
-    centralWidget->setCurrentWidget(nullsendPage);
 
     exportAction->setEnabled(false);
     disconnect(exportAction, SIGNAL(triggered()), 0, 0);

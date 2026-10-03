@@ -17,7 +17,6 @@
 #include <condition_variable> // R4 AUTHORITY_READY barrier
 #include <chrono>             // R4 AUTHORITY_READY barrier
 #include "fixed_blockindex_store.h"
-#include "finality.h"
 
 #include <memory>
 #include <string>
@@ -105,7 +104,6 @@ std::string AuthorityReadyPrerequisites::WhyNotReady() const
     if (!durableIndexLoaded)                return "V2 durable index not loaded";
     if (!immutableAuthorityAvailable)       return "immutable authority not available";
     if (!trustProjectionReconciled)         return "R2 trust projection not reconciled";
-    if (!finalityEpochOwnerLifecycleReady)  return "FINALITY_EPOCH_OWNER_READY lifecycle condition not satisfied";
     return "";
 }
 
@@ -423,7 +421,6 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         }
         // Lifecycle readiness belongs to the current immutable/live authority.
         // No DAG runtime, custody or certificate is a current prerequisite.
-        pre.finalityEpochOwnerLifecycleReady = pre.immutableAuthorityAvailable;
         std::string readyDetail;
         const bool authorityReady = AuthorityReadyMarkIfSatisfied(pre, &readyDetail);
         printf("BLOCKINDEX_V2_AUTHORITATIVE authority_ready=%d detail=%s\n",

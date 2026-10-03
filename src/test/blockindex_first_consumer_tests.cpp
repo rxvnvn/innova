@@ -2,7 +2,6 @@
 
 #include "blockindex_hot_owner.h"
 #include "main.h"
-#include "finality.h"
 #include "sync.h"
 
 #include <atomic>

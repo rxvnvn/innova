@@ -6,7 +6,6 @@
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
 #include "alert.h"
-#include "finality_epoch_store.h"
 #include "bloom.h"
 #include "checkpoints.h"
 #include "db.h"
@@ -27,12 +26,7 @@
 #include "kernel.h"
 #include "collateral.h"
 #include "collateralnode.h"
-#include "nullsend.h"
 #include "dandelion.h"
-#include "lelantus.h"
-#include "curvetree.h"
-#include "finality.h"
-#include "epoch_state.h"
 #include "candidate_frontier.h"
 #include "blockindex_hot_owner.h"
 #include "blockindex_residency_counters.h"
@@ -57,10 +51,6 @@ using boost::placeholders::_2;
 using namespace std;
 namespace fs = boost::filesystem;
 
-static bool LoadFCMPValidationRoot(CTxDB& txdb, int nBlockHeight,
-                                   CCurveTreeNode& rootOut,
-                                   uint256& hashExpectedRootOut,
-                                   std::string& strErrorOut);
 static bool AlreadyHave(CTxDB& txdb, const CInv& inv);
 
 //
@@ -569,7 +559,6 @@ CCriticalSection cs_stakingMode;
 
 int nLastFinalizedHeight = 0;
 uint256 hashLastFinalized = 0;
-CCriticalSection cs_finality;
 
 CMedianFilter<int> cPeerBlockCounts(5, 0); // Amount of blocks that other nodes claim to have
 
@@ -3147,7 +3136,7 @@ bool CTransaction::ReadFromDisk(COutPoint prevout)
 
 bool IsStandardTx(const CTransaction& tx, string& reason)
 {
-    if (tx.nVersion > CTransaction::CURRENT_VERSION && tx.nVersion != ANON_TXN_VERSION && !tx.IsShielded()) { //WIP
+    if (tx.nVersion > CTransaction::CURRENT_VERSION && tx.nVersion != ANON_TXN_VERSION) { //WIP
         reason = "version";
         return false;
     }
@@ -3585,9 +3574,9 @@ int64_t ApplyBlockSizePenalty(int64_t nReward, const CBlock& block, const CBlock
 bool CTransaction::CheckTransaction() const
 {
     // Basic checks that don't depend on any context
-    if (vin.empty() && !IsShielded())
+    if (vin.empty())
         return DoS(10, error("CTransaction::CheckTransaction() : vin empty"));
-    if (vout.empty() && !IsShielded())
+    if (vout.empty())
         return DoS(10, error("CTransaction::CheckTransaction() : vout empty"));
     // Size limits
     if (::GetSerializeSize(*this, SER_NETWORK, PROTOCOL_VERSION) > MAX_BLOCK_SIZE)
@@ -3653,98 +3642,6 @@ bool CTransaction::CheckTransaction() const
         };
     };
 
-    if (IsShielded())
-    {
-        if (IsCoinBase())
-            return DoS(100, error("CTransaction::CheckTransaction() : shielded transaction cannot be coinbase"));
-        if (IsCoinStake() && nVersion != SHIELDED_TX_VERSION_NULLSTAKE && nVersion != SHIELDED_TX_VERSION_NULLSTAKE_V2 && nVersion != SHIELDED_TX_VERSION_NULLSTAKE_COLD)
-            return DoS(100, error("CTransaction::CheckTransaction() : shielded transaction cannot be coinstake"));
-
-        if (vShieldedSpend.empty() && vShieldedOutput.empty())
-            return DoS(100, error("CTransaction::CheckTransaction() : shielded tx has no shielded components"));
-
-        if (vShieldedSpend.size() > MAX_SHIELDED_INPUTS)
-            return DoS(100, error("CTransaction::CheckTransaction() : too many shielded spends (%u > %u)",
-                                  (unsigned int)vShieldedSpend.size(), (unsigned int)MAX_SHIELDED_INPUTS));
-        if (vShieldedOutput.size() > MAX_SHIELDED_OUTPUTS)
-            return DoS(100, error("CTransaction::CheckTransaction() : too many shielded outputs (%u > %u)",
-                                  (unsigned int)vShieldedOutput.size(), (unsigned int)MAX_SHIELDED_OUTPUTS));
-
-        if (nValueBalance < -MAX_MONEY || nValueBalance > MAX_MONEY)
-            return DoS(100, error("CTransaction::CheckTransaction() : shielded nValueBalance out of range"));
-
-        set<uint256> vNullifiers;
-        for (const CShieldedSpendDescription& spend : vShieldedSpend)
-        {
-            if (spend.nullifier == 0)
-                return DoS(100, error("CTransaction::CheckTransaction() : zero shielded nullifier"));
-
-            if (vNullifiers.count(spend.nullifier))
-                return DoS(100, error("CTransaction::CheckTransaction() : duplicate shielded nullifier"));
-            vNullifiers.insert(spend.nullifier);
-        }
-
-        if (IsDSP())
-        {
-            if (nBestHeight < FORK_HEIGHT_DSP)
-                return DoS(100, error("CTransaction::CheckTransaction() : DSP transactions not active until height %d", FORK_HEIGHT_DSP));
-
-            if (nPrivacyMode > PRIVACY_MODE_MASK)
-                return DoS(100, error("CTransaction::CheckTransaction() : invalid privacy mode %d (max 7)", nPrivacyMode));
-
-            bool fHideAmount   = DSP_HideAmount(nPrivacyMode);
-            bool fHideSender   = DSP_HideSender(nPrivacyMode);
-            bool fHideReceiver = DSP_HideReceiver(nPrivacyMode);
-
-            for (size_t i = 0; i < vShieldedSpend.size(); i++)
-            {
-                const CShieldedSpendDescription& spend = vShieldedSpend[i];
-                if (!fHideAmount)
-                {
-                    if (spend.nPlaintextValue < 0 || spend.nPlaintextValue > MAX_MONEY)
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP spend %u invalid plaintext value", (unsigned int)i));
-                    if (spend.vchPlaintextBlind.size() != 32)
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP spend %u missing blinding factor", (unsigned int)i));
-                }
-                else
-                {
-                    if (spend.nPlaintextValue != -1)
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP spend %u has plaintext value in hidden-amount mode", (unsigned int)i));
-                    if (!spend.vchPlaintextBlind.empty())
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP spend %u has blinding factor in hidden-amount mode", (unsigned int)i));
-                }
-                if (!fHideSender)
-                {
-                    if (!spend.vchLelantusProof.empty() || !spend.vAnonSet.empty())
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP spend %u has Lelantus proof in public-sender mode", (unsigned int)i));
-                }
-            }
-
-            for (size_t i = 0; i < vShieldedOutput.size(); i++)
-            {
-                const CShieldedOutputDescription& output = vShieldedOutput[i];
-                if (!fHideAmount)
-                {
-                    if (output.nPlaintextValue < 0 || output.nPlaintextValue > MAX_MONEY)
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP output %u invalid plaintext value", (unsigned int)i));
-                    if (output.vchPlaintextBlind.size() != 32)
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP output %u missing blinding factor", (unsigned int)i));
-                }
-                else
-                {
-                    if (output.nPlaintextValue != -1)
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP output %u has plaintext value in hidden-amount mode", (unsigned int)i));
-                    if (!output.vchPlaintextBlind.empty())
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP output %u has blinding factor in hidden-amount mode", (unsigned int)i));
-                }
-                if (fHideReceiver)
-                {
-                    if (!output.vchRecipientScript.empty())
-                        return DoS(100, error("CTransaction::CheckTransaction() : DSP output %u has public recipient in hidden-receiver mode", (unsigned int)i));
-                }
-            }
-        }
-    };
 
     if (IsCoinBase())
     {
@@ -3774,7 +3671,7 @@ int64_t CTransaction::GetMinFee(unsigned int nBlockSize, enum GetMinFee_mode mod
 {
     // Base fee is either MIN_TX_FEE or MIN_RELAY_TX_FEE for standard txns, and MIN_TX_FEE_ANON for anon txns
 
-    if (nVersion == ANON_TXN_VERSION || IsShielded())
+    if (nVersion == ANON_TXN_VERSION)
         mode = GMF_ANON;
 
     int64_t nBaseFee;
@@ -3813,9 +3710,9 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
                         bool* pfMissingInputs, bool fOnlyCheckWithoutAdding)
 {
     AssertLockHeld(cs_main);
-    printf("CTxMemPool::accept, fCheckInputs = %d, fOnlyCheckWithoutAdding = %d, ver=%d, vin=%u, vout=%u, vSS=%u, vSO=%u\n",
+    printf("CTxMemPool::accept, fCheckInputs = %d, fOnlyCheckWithoutAdding = %d, ver=%d, vin=%u, vout=%u\n",
            fCheckInputs, fOnlyCheckWithoutAdding, tx.nVersion, (unsigned)tx.vin.size(),
-           (unsigned)tx.vout.size(), (unsigned)tx.vShieldedSpend.size(), (unsigned)tx.vShieldedOutput.size());
+           (unsigned)tx.vout.size());
     if (pfMissingInputs)
         *pfMissingInputs = false;
 
@@ -3906,15 +3803,12 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
 
             nFees = tx.GetValueIn(mapInputs) - tx.GetValueOut();
 
-            if (tx.IsShielded() && tx.nValueBalance != 0)
-                nFees += tx.nValueBalance;
-
             GetMinFee_mode feeMode = GMF_RELAY;
 
             if (tx.nVersion == ANON_TXN_VERSION)
             {
                 if (nBestHeight >= FORK_HEIGHT_RINGSIG_DEPRECATION)
-                    return error("CTxMemPool::accept() : ring signature transactions (ANON_TXN_VERSION) deprecated after height %d. Use shielded transactions.", FORK_HEIGHT_RINGSIG_DEPRECATION);
+                    return error("CTxMemPool::accept() : ring signature transactions (ANON_TXN_VERSION) deprecated after height %d.", FORK_HEIGHT_RINGSIG_DEPRECATION);
 
                 int64_t nSumAnon;
                 if (!tx.CheckAnonInputs(txdb, nSumAnon, fInvalid, true))
@@ -3931,227 +3825,6 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
                 feeMode = GMF_ANON;
             };
 
-            if (tx.IsShielded())
-            {
-                if (pindexBest && pindexBest->nHeight < FORK_HEIGHT_SHIELDED)
-                    return error("CTxMemPool::accept() : shielded tx rejected before fork height %d", FORK_HEIGHT_SHIELDED);
-
-                for (const CShieldedSpendDescription& spend : tx.vShieldedSpend)
-                {
-                    CShieldedNullifierSpent nfs;
-                    if (txdb.ReadShieldedNullifier(spend.nullifier, nfs))
-                        return error("CTxMemPool::accept() : shielded nullifier %s already spent",
-                                     spend.nullifier.ToString().substr(0,10).c_str());
-
-                    CShieldedNullifierSpent nfsMem;
-                    if (lookupShieldedNullifier(spend.nullifier, nfsMem))
-                        return error("CTxMemPool::accept() : shielded nullifier %s already in mempool",
-                                     spend.nullifier.ToString().substr(0,10).c_str());
-
-                    if (!txdb.ReadShieldedAnchor(spend.anchor))
-                        return error("CTxMemPool::accept() : shielded anchor %s not found",
-                                     spend.anchor.ToString().substr(0,10).c_str());
-                    int nAnchorHeight = 0;
-                    if (txdb.ReadShieldedAnchorHeight(spend.anchor, nAnchorHeight))
-                    {
-                        if (nBestHeight - nAnchorHeight < MIN_SHIELDED_SPEND_DEPTH)
-                            return error("CTxMemPool::accept() : shielded anchor %s too recent (height=%d, need %d confirmations)",
-                                         spend.anchor.ToString().substr(0,10).c_str(),
-                                         nAnchorHeight, MIN_SHIELDED_SPEND_DEPTH);
-                    }
-                }
-
-                int64_t nTransparentIn = tx.GetValueIn(mapInputs);
-                int64_t nTransparentOut = tx.GetValueOut();
-
-                int64_t nEffectiveIn = nTransparentIn;
-                if (tx.nValueBalance > 0)
-                {
-                    if (nEffectiveIn > MAX_MONEY - tx.nValueBalance)
-                        return error("CTxMemPool::accept() : nEffectiveIn overflow");
-                    nEffectiveIn += tx.nValueBalance;
-                }
-
-                int64_t nEffectiveOut = nTransparentOut;
-                if (tx.nValueBalance < 0)
-                {
-                    if (tx.nValueBalance == std::numeric_limits<int64_t>::min())
-                        return error("CTxMemPool::accept() : nValueBalance is INT64_MIN");
-                    int64_t nAbsBalance = -tx.nValueBalance;
-                    if (nEffectiveOut > MAX_MONEY - nAbsBalance)
-                        return error("CTxMemPool::accept() : nEffectiveOut overflow");
-                    nEffectiveOut += nAbsBalance;
-                }
-
-                if (nEffectiveIn < nEffectiveOut)
-                    return error("CTxMemPool::accept() : shielded value balance mismatch (in=%" PRId64 " out=%" PRId64 ")",
-                                 nEffectiveIn, nEffectiveOut);
-
-                nFees = nEffectiveIn - nEffectiveOut;
-
-                if (!CZKContext::IsInitialized())
-                    return error("CTxMemPool::accept() : ZK context not initialized, cannot validate shielded tx");
-
-                {
-                    uint256 sighash = tx.GetBindingSigHash();
-
-                    bool fHideAmount   = tx.IsDSP() ? DSP_HideAmount(tx.nPrivacyMode)   : true;
-                    bool fHideSender   = tx.IsDSP() ? DSP_HideSender(tx.nPrivacyMode)   : true;
-
-                    if (nBestHeight >= FORK_HEIGHT_FCMP_VALIDATION && !tx.vShieldedSpend.empty()
-                        && tx.nVersion < SHIELDED_TX_VERSION_FCMP)
-                    {
-                        return error("CTxMemPool::accept() : tx version %d with shielded spends rejected after FCMP fork (need version >= %d)",
-                                     tx.nVersion, SHIELDED_TX_VERSION_FCMP);
-                    }
-
-                    if (tx.nVersion >= SHIELDED_TX_VERSION_FCMP && nBestHeight >= FORK_HEIGHT_FCMP_VALIDATION
-                        && !tx.vShieldedSpend.empty())
-                    {
-                        for (size_t j = 0; j < tx.vShieldedSpend.size(); j++)
-                        {
-                            if (tx.vShieldedSpend[j].fcmpProof.IsNull())
-                                return error("CTxMemPool::accept() : FCMP version tx spend %u missing mandatory FCMP proof", (unsigned)j);
-                        }
-                    }
-
-                    CCurveTreeNode fcmpRootNode;
-                    uint256 hashExpectedFCMPRoot = 0;
-                    if (tx.nVersion >= SHIELDED_TX_VERSION_FCMP && nBestHeight >= FORK_HEIGHT_FCMP_VALIDATION
-                        && !tx.vShieldedSpend.empty())
-                    {
-                        CTxDB txdb("r");
-                        std::string strFCMPError;
-                        if (!LoadFCMPValidationRoot(txdb, nBestHeight, fcmpRootNode, hashExpectedFCMPRoot, strFCMPError))
-                            return error("CTxMemPool::accept() : %s", strFCMPError.c_str());
-                        if (!CheckFCMPSpendRoots(tx, nBestHeight, hashExpectedFCMPRoot, strFCMPError))
-                            return error("CTxMemPool::accept() : %s", strFCMPError.c_str());
-                    }
-
-                    for (size_t i = 0; i < tx.vShieldedSpend.size(); i++)
-                    {
-                        if (fHideAmount)
-                        {
-                            if (!VerifyBulletproofRangeProof(tx.vShieldedSpend[i].cv, tx.vShieldedSpend[i].rangeProof))
-                                return error("CTxMemPool::accept() : shielded spend %d range proof failed", (int)i);
-                        }
-                        else
-                        {
-                            if (!VerifyPedersenCommitment(tx.vShieldedSpend[i].cv,
-                                                           tx.vShieldedSpend[i].nPlaintextValue,
-                                                           tx.vShieldedSpend[i].vchPlaintextBlind))
-                                return error("CTxMemPool::accept() : DSP spend %d commitment opening proof failed", (int)i);
-                        }
-
-                        if (tx.vShieldedSpend[i].vchSpendAuthSig.empty() || tx.vShieldedSpend[i].vchRk.empty())
-                            return error("CTxMemPool::accept() : shielded spend %d missing spend auth signature or rk", (int)i);
-
-                        if (!VerifySpendAuthSignature(tx.vShieldedSpend[i].vchRk, sighash, tx.vShieldedSpend[i].vchSpendAuthSig))
-                            return error("CTxMemPool::accept() : shielded spend %d spend auth signature failed", (int)i);
-
-                        if (fHideSender)
-                        {
-                            if (tx.vShieldedSpend[i].vchLelantusProof.empty() || tx.vShieldedSpend[i].vAnonSet.empty())
-                                return error("CTxMemPool::accept() : shielded spend %d missing mandatory Lelantus proof", (int)i);
-
-                            if ((int)tx.vShieldedSpend[i].vAnonSet.size() < LELANTUS_MIN_SET_SIZE)
-                                return error("CTxMemPool::accept() : shielded spend %d anonymity set size %d below minimum %d",
-                                             (int)i, (int)tx.vShieldedSpend[i].vAnonSet.size(), LELANTUS_MIN_SET_SIZE);
-
-                            {
-                                // Verify all vAnonSet commitments exist on-chain
-                                {
-                                    CTxDB txdb("r");
-                                    std::set<std::vector<unsigned char>> setChainCommitments;
-                                    uint64_t nCommitCount = 0;
-                                    txdb.ReadShieldedCommitmentCount(nCommitCount);
-                                    for (uint64_t ci = 0; ci < nCommitCount; ci++)
-                                    {
-                                        CPedersenCommitment chainCommit;
-                                        if (txdb.ReadShieldedCommitment(ci, chainCommit))
-                                            setChainCommitments.insert(chainCommit.vchCommitment);
-                                    }
-
-                                    for (size_t j = 0; j < tx.vShieldedSpend[i].vAnonSet.size(); j++)
-                                    {
-                                        if (setChainCommitments.find(tx.vShieldedSpend[i].vAnonSet[j].vchCommitment) == setChainCommitments.end())
-                                            return error("CTxMemPool::accept() : shielded spend %d anonymity set commitment %d not found in chain state", (int)i, (int)j);
-                                    }
-                                }
-
-                                CAnonymitySet anonSet;
-                                anonSet.vCommitments = tx.vShieldedSpend[i].vAnonSet;
-                                CLelantusProof proof;
-                                proof.vchProof = tx.vShieldedSpend[i].vchLelantusProof;
-                                proof.serialNumber = tx.vShieldedSpend[i].lelantusSerial;
-
-                                if (!VerifyLelantusProof(anonSet, proof, tx.vShieldedSpend[i].cv))
-                                    return error("CTxMemPool::accept() : shielded spend %d Lelantus proof failed", (int)i);
-                            }
-                        }
-
-                        // FCMP++ proof: required after FORK_HEIGHT_FCMP_VALIDATION for FCMP tx versions
-                        if (tx.nVersion >= SHIELDED_TX_VERSION_FCMP && nBestHeight >= FORK_HEIGHT_FCMP_VALIDATION)
-                        {
-                            if (tx.vShieldedSpend[i].fcmpProof.IsNull())
-                                return error("CTxMemPool::accept() : shielded spend %d missing FCMP++ proof (required post-fork)", (int)i);
-
-                            if (!VerifyFCMPProof(fcmpRootNode, tx.vShieldedSpend[i].fcmpProof, tx.vShieldedSpend[i].cv))
-                                return error("CTxMemPool::accept() : shielded spend %d FCMP++ proof failed", (int)i);
-                        }
-
-                        if (fDebug)
-                            printf("CTxMemPool::accept() : spend %d passed all checks\n", (int)i);
-                    }
-
-                    if (fDebug)
-                        printf("CTxMemPool::accept() : verifying output proofs\n");
-                    for (size_t i = 0; i < tx.vShieldedOutput.size(); i++)
-                    {
-                        if (fHideAmount)
-                        {
-                            if (!VerifyBulletproofRangeProof(tx.vShieldedOutput[i].cv, tx.vShieldedOutput[i].rangeProof))
-                                return error("CTxMemPool::accept() : shielded output %d range proof failed", (int)i);
-                        }
-                        else
-                        {
-                            if (!VerifyPedersenCommitment(tx.vShieldedOutput[i].cv,
-                                                           tx.vShieldedOutput[i].nPlaintextValue,
-                                                           tx.vShieldedOutput[i].vchPlaintextBlind))
-                                return error("CTxMemPool::accept() : DSP output %d commitment opening proof failed", (int)i);
-                        }
-                    }
-
-                    if (!fHideAmount)
-                    {
-                        int64_t nPlainIn = 0, nPlainOut = 0;
-                        for (size_t i = 0; i < tx.vShieldedSpend.size(); i++)
-                            nPlainIn += tx.vShieldedSpend[i].nPlaintextValue;
-                        for (size_t i = 0; i < tx.vShieldedOutput.size(); i++)
-                            nPlainOut += tx.vShieldedOutput[i].nPlaintextValue;
-                        if (nPlainIn - nPlainOut != tx.nValueBalance)
-                            return error("CTxMemPool::accept() : DSP plaintext value balance mismatch (in=%" PRId64 " out=%" PRId64 " balance=%" PRId64 ")",
-                                         nPlainIn, nPlainOut, tx.nValueBalance);
-                    }
-
-                    if (fDebug)
-                        printf("CTxMemPool::accept() : output proofs passed\n");
-
-                    if (tx.bindingSig.IsNull())
-                        return error("CTxMemPool::accept() : shielded tx missing mandatory binding signature");
-
-                    {
-                        std::vector<CPedersenCommitment> vInCommits, vOutCommits;
-                        for (size_t i = 0; i < tx.vShieldedSpend.size(); i++)
-                            vInCommits.push_back(tx.vShieldedSpend[i].cv);
-                        for (size_t i = 0; i < tx.vShieldedOutput.size(); i++)
-                            vOutCommits.push_back(tx.vShieldedOutput[i].cv);
-
-                        if (!VerifyBindingSignature(vInCommits, vOutCommits, tx.nValueBalance, sighash, tx.bindingSig.bindingSig))
-                            return error("CTxMemPool::accept() : shielded binding signature verification failed");
-                    }
-                }
-            };
 
             // Note: if you modify this code to accept non-standard transactions, then
             // you should add code here to check that the transaction does a
@@ -4215,16 +3888,6 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
             }
             addUnchecked(hash, tx);
 
-            if (tx.IsShielded())
-            {
-                for (unsigned int i = 0; i < tx.vShieldedSpend.size(); i++)
-                {
-                    CShieldedNullifierSpent nfs;
-                    nfs.txnHash = hash;
-                    nfs.nIndex = i;
-                    insertShieldedNullifier(tx.vShieldedSpend[i].nullifier, nfs);
-                }
-            }
 
         }
 
@@ -4254,9 +3917,6 @@ bool AcceptableInputs(CTxMemPool& pool, const CTransaction &txo, bool fLimitFree
 
     if (!tx.CheckTransaction())
         return error("AcceptableInputs : CheckTransaction failed");
-
-    if (tx.IsShielded())
-        return error("AcceptableInputs : shielded transactions require full validation");
 
     // Coinbase is only valid in a block, not as a loose transaction
     if (tx.IsCoinBase())
@@ -4459,13 +4119,6 @@ bool CTxMemPool::remove(const CTransaction &tx, bool fRecursive)
                 };
             };
 
-            if (tx.IsShielded())
-            {
-                for (const CShieldedSpendDescription& spend : tx.vShieldedSpend)
-                {
-                    removeShieldedNullifier(spend.nullifier);
-                }
-            };
 
             nTransactionsUpdated++;
         };
@@ -4486,38 +4139,6 @@ bool CTxMemPool::removeConflicts(const CTransaction &tx)
         }
     }
 
-    if (tx.IsShielded())
-    {
-        for (const CShieldedSpendDescription& spend : tx.vShieldedSpend)
-        {
-            for (std::map<uint256, CTransaction>::iterator mi = mapTx.begin(); mi != mapTx.end(); )
-            {
-                const CTransaction& txPool = mi->second;
-                if (txPool.GetHash() == tx.GetHash()) { ++mi; continue; }
-                if (!txPool.IsShielded()) { ++mi; continue; }
-
-                bool fConflict = false;
-                for (const CShieldedSpendDescription& poolSpend : txPool.vShieldedSpend)
-                {
-                    if (poolSpend.nullifier == spend.nullifier)
-                    {
-                        fConflict = true;
-                        break;
-                    }
-                }
-                if (fConflict)
-                {
-                    CTransaction txToRemove = txPool;
-                    ++mi;
-                    remove(txToRemove, true);
-                }
-                else
-                {
-                    ++mi;
-                }
-            }
-        }
-    }
 
     return true;
 }
@@ -4548,15 +4169,11 @@ void CTxMemPool::RemoveDAGConflicts(const uint256& hashBlock)
 
         if (mapTx.count(txHash))
         {
-            // Full cleanup: mapTx, mapNextTx, mapShieldedNullifier
+            // Full cleanup: mapTx, mapNextTx
             CTransaction txCopy = mapTx[txHash];
 
             for (const CTxIn& txin : txCopy.vin)
                 mapNextTx.erase(txin.prevout);
-
-            // Clean up shielded nullifiers
-            for (const CShieldedSpendDescription& spend : txCopy.vShieldedSpend)
-                mapShieldedNullifier.erase(spend.nullifier);
 
             mapTx.erase(txHash);
             nRemoved++;
@@ -4575,7 +4192,6 @@ void CTxMemPool::clear()
     mapTx.clear();
     mapNextTx.clear();
     mapKeyImage.clear();
-    mapShieldedNullifier.clear();
     setDAGSeenTxids.clear();
     ++nTransactionsUpdated;
 }
@@ -5185,158 +4801,9 @@ static void LogGetBlocksServerEvent(
            (unsigned long long)state.nEstimatedSuppressedBytes);
 }
 
-static bool CheckFinalityVoteRewardOutputs(const CBlock& block, const std::vector<CFinalityVote>& vVotes, int64_t& nFinalityRewardOut)
-{
-    nFinalityRewardOut = 0;
-    if (vVotes.empty())
-        return true;
-    if (vVotes.size() > FINALITY_MAX_BLOCK_VOTES)
-        return error("CheckFinalityVoteRewardOutputs() : too many finality votes in block");
-    if (block.vtx.empty())
-        return false;
 
-    std::set<uint256> setNullifiers;
-    std::vector<bool> vMatched(block.vtx[0].vout.size(), false);
 
-    for (const CFinalityVote& vote : vVotes)
-    {
-        if (!setNullifiers.insert(vote.nullifier).second)
-            return error("CheckFinalityVoteRewardOutputs() : duplicate finality vote nullifier");
-        if (vote.IsPrivate())
-            continue;
-        if (vote.nReward < 0 || !MoneyRange(vote.nReward))
-            return error("CheckFinalityVoteRewardOutputs() : finality reward out of range");
-        if (nFinalityRewardOut > MAX_MONEY - vote.nReward)
-            return error("CheckFinalityVoteRewardOutputs() : finality reward total overflow");
 
-        CPubKey pubkey(vote.vchPubKey);
-        if (!pubkey.IsValid())
-            return error("CheckFinalityVoteRewardOutputs() : finality vote pubkey invalid");
-        CScript rewardScript = GetScriptForDestination(pubkey.GetID());
-
-        bool fFoundReward = (vote.nReward == 0);
-        for (unsigned int i = 0; i < block.vtx[0].vout.size(); i++)
-        {
-            if (vMatched[i])
-                continue;
-            const CTxOut& out = block.vtx[0].vout[i];
-            if (out.nValue == vote.nReward && out.scriptPubKey == rewardScript)
-            {
-                vMatched[i] = true;
-                fFoundReward = true;
-                break;
-            }
-        }
-        if (!fFoundReward)
-            return error("CheckFinalityVoteRewardOutputs() : missing finality reward output for voter");
-
-        nFinalityRewardOut += vote.nReward;
-    }
-
-    return true;
-}
-
-static bool CheckFinalityStakeProofsNotSpentInBlock(const CBlock& block, const std::vector<CFinalityVote>& vVotes)
-{
-    if (vVotes.empty())
-        return true;
-
-    std::set<COutPoint> setSpentInBlock;
-    for (const CTransaction& tx : block.vtx)
-    {
-        if (tx.IsCoinBase())
-            continue;
-        for (const CTxIn& txin : tx.vin)
-            setSpentInBlock.insert(txin.prevout);
-    }
-
-    for (const CFinalityVote& vote : vVotes)
-    {
-        if (vote.IsPrivate())
-            continue;
-        for (const COutPoint& proof : vote.vStakeProof)
-        {
-            if (setSpentInBlock.count(proof))
-                return error("CheckFinalityStakeProofsNotSpentInBlock() : finality stake proof spent in same block");
-        }
-    }
-
-    return true;
-}
-
-static bool LoadFCMPValidationRoot(CTxDB& txdb, int nBlockHeight,
-                                   CCurveTreeNode& rootOut,
-                                   uint256& hashExpectedRootOut,
-                                   std::string& strErrorOut)
-{
-    CCurveTree curveTree;
-
-    if (nBlockHeight >= FORK_HEIGHT_EPOCH_ROOT_FCMP)
-    {
-        CEpochState finalizedEpochState;
-        if (!GetFinalityEpochStateStore().GetLastFinalizedEpochState(finalizedEpochState))
-        {
-            strErrorOut = "missing finalized epoch FCMP root";
-            return false;
-        }
-        if (!txdb.ReadCurveTreeAtEpoch(finalizedEpochState.nEpoch, curveTree))
-        {
-            strErrorOut = "missing finalized epoch curve-tree snapshot";
-            return false;
-        }
-        if (!curveTree.IsEmpty())
-            curveTree.RebuildParentNodes();
-        hashExpectedRootOut = curveTree.GetRoot();
-        if (hashExpectedRootOut == 0 || hashExpectedRootOut != finalizedEpochState.hashCurveRoot)
-        {
-            strErrorOut = "finalized epoch curve-tree root mismatch";
-            return false;
-        }
-    }
-    else
-    {
-        if (!txdb.ReadCurveTree(curveTree))
-        {
-            strErrorOut = "failed to read mutable curve tree";
-            return false;
-        }
-        if (!curveTree.IsEmpty())
-            curveTree.RebuildParentNodes();
-        hashExpectedRootOut = curveTree.GetRoot();
-    }
-
-    if (curveTree.IsEmpty() || hashExpectedRootOut == 0)
-    {
-        strErrorOut = "empty curve tree";
-        return false;
-    }
-
-    rootOut = curveTree.GetRootNode();
-    return true;
-}
-
-bool CheckFCMPSpendRoots(const CTransaction& tx, int nBlockHeight,
-                         const uint256& hashExpectedRoot,
-                         std::string& strErrorOut)
-{
-    if (nBlockHeight < FORK_HEIGHT_EPOCH_ROOT_FCMP)
-        return true;
-
-    for (size_t i = 0; i < tx.vShieldedSpend.size(); i++)
-    {
-        const CShieldedSpendDescription& spend = tx.vShieldedSpend[i];
-        if (spend.curveTreeRoot != hashExpectedRoot)
-        {
-            strErrorOut = strprintf("shielded spend %u FCMP root %s does not match finalized epoch root %s",
-                                    (unsigned)i,
-                                    spend.curveTreeRoot.ToString().substr(0,10).c_str(),
-                                    hashExpectedRoot.ToString().substr(0,10).c_str());
-            return false;
-        }
-    }
-
-    return true;
-}
 
 // Proof of Work miner's coin base reward
 int64_t GetProofOfWorkReward(int nHeight, int64_t nFees)
@@ -6176,7 +5643,7 @@ unsigned int CTransaction::GetP2SHSigOpCount(const MapPrevTx& inputs) const
 }
 
 bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTxIndex>& mapTestPool, const CDiskTxPos& posThisTx,
-    const CBlockIndex* pindexBlock, bool fBlock, bool fMiner, unsigned int flags, bool fValidateSig, bool fSkipFCMP)
+    const CBlockIndex* pindexBlock, bool fBlock, bool fMiner, unsigned int flags, bool fValidateSig)
 {
     // Take over previous transactions' spent pointers
     // fBlock is true when this is called from AcceptBlock when a new best-block is added to the blockchain
@@ -6328,207 +5795,10 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
             nValueIn += nSumAnon;
         };
 
-        if (IsShielded())
-        {
-            if (pindexBlock && pindexBlock->nHeight < FORK_HEIGHT_SHIELDED)
-                return DoS(100, error("ConnectInputs() : shielded tx before activation height %d", FORK_HEIGHT_SHIELDED));
-
-            for (const CShieldedSpendDescription& spend : vShieldedSpend)
-            {
-                CShieldedNullifierSpent nfs;
-                if (txdb.ReadShieldedNullifier(spend.nullifier, nfs))
-                    return DoS(100, error("ConnectInputs() : shielded nullifier %s already spent in tx %s",
-                                          spend.nullifier.ToString().substr(0,10).c_str(),
-                                          nfs.txnHash.ToString().substr(0,10).c_str()));
-
-                if (!txdb.ReadShieldedAnchor(spend.anchor))
-                    return DoS(100, error("ConnectInputs() : shielded anchor %s not found",
-                                          spend.anchor.ToString().substr(0,10).c_str()));
-                int nAnchorHeight = 0;
-                if (pindexBlock && txdb.ReadShieldedAnchorHeight(spend.anchor, nAnchorHeight))
-                {
-                    if (pindexBlock->nHeight - nAnchorHeight < MIN_SHIELDED_SPEND_DEPTH)
-                        return DoS(100, error("ConnectInputs() : shielded anchor %s too recent (height=%d, block=%d, need %d)",
-                                              spend.anchor.ToString().substr(0,10).c_str(),
-                                              nAnchorHeight, pindexBlock->nHeight, MIN_SHIELDED_SPEND_DEPTH));
-                }
-            }
-
-            if (nValueBalance > 0)
-            {
-                if (nValueIn > MAX_MONEY - nValueBalance)
-                    return DoS(100, error("ConnectInputs() : nValueIn overflow with shielded balance"));
-                nValueIn += nValueBalance;
-            }
-            if (nValueBalance == std::numeric_limits<int64_t>::min())
-                return DoS(100, error("ConnectInputs() : nValueBalance is INT64_MIN"));
-            int64_t nShieldedAbsorbed = (nValueBalance < 0) ? (-nValueBalance) : 0;
-
-            if (GetValueOut() > MAX_MONEY - nShieldedAbsorbed)
-                return DoS(100, error("ConnectInputs() : GetValueOut + nShieldedAbsorbed overflow"));
-
-            // NullStake coinstakes are exempt: the reward enters the shielded pool
-            // from block subsidy, not from transparent inputs. The reward amount
-            // is validated separately in ConnectBlock() against GetProofOfStakeReward().
-            if ((nVersion != SHIELDED_TX_VERSION_NULLSTAKE && nVersion != SHIELDED_TX_VERSION_NULLSTAKE_V2 && nVersion != SHIELDED_TX_VERSION_NULLSTAKE_COLD) || !IsCoinStake())
-            {
-                if (nValueIn < GetValueOut() + nShieldedAbsorbed)
-                    return DoS(100, error("ConnectInputs() : %s shielded value balance failed (in=%" PRId64 " out=%" PRId64 " shielded=%" PRId64 ")",
-                                          GetHash().ToString().substr(0,10).c_str(),
-                                          nValueIn, GetValueOut(), nShieldedAbsorbed));
-            }
-
-            // use DoS(100) to ban peers sending shielded tx when ZK unavailable
-            if (!CZKContext::IsInitialized())
-                return DoS(100, error("ConnectInputs() : ZK context not initialized, cannot validate shielded tx"));
-
-            {
-                uint256 sighash = GetBindingSigHash();
-
-                // DSP mode flags (default to fully private for v2000)
-                bool fHideAmount   = IsDSP() ? DSP_HideAmount(nPrivacyMode)   : true;
-                bool fHideSender   = IsDSP() ? DSP_HideSender(nPrivacyMode)   : true;
-
-                int nBlockHeight = pindexBlock ? pindexBlock->nHeight : nBestHeight;
-
-                // Post-fork enforcement: after FCMP fork, reject old tx versions with shielded spends
-                if (nBlockHeight >= FORK_HEIGHT_FCMP_VALIDATION && !vShieldedSpend.empty()
-                    && nVersion < SHIELDED_TX_VERSION_FCMP)
-                {
-                    return DoS(100, error("ConnectInputs() : tx version %d with shielded spends rejected after FCMP fork (need version >= %d)",
-                                          nVersion, SHIELDED_TX_VERSION_FCMP));
-                }
-
-                CCurveTreeNode ciRootNode;
-                uint256 hashExpectedFCMPRoot = 0;
-                if (nVersion >= SHIELDED_TX_VERSION_FCMP && nBlockHeight >= FORK_HEIGHT_FCMP_VALIDATION
-                    && !vShieldedSpend.empty())
-                {
-                    std::string strFCMPError;
-                    if (!LoadFCMPValidationRoot(txdb, nBlockHeight, ciRootNode, hashExpectedFCMPRoot, strFCMPError))
-                        return DoS(100, error("ConnectInputs() : %s", strFCMPError.c_str()));
-                    if (!CheckFCMPSpendRoots(*this, nBlockHeight, hashExpectedFCMPRoot, strFCMPError))
-                        return DoS(100, error("ConnectInputs() : %s", strFCMPError.c_str()));
-                }
-
-                for (size_t i = 0; i < vShieldedSpend.size(); i++)
-                {
-                    if (fHideAmount)
-                    {
-                        if (!VerifyBulletproofRangeProof(vShieldedSpend[i].cv, vShieldedSpend[i].rangeProof))
-                            return DoS(100, error("ConnectInputs() : shielded spend %d range proof failed", (int)i));
-                    }
-                    else
-                    {
-                        if (!VerifyPedersenCommitment(vShieldedSpend[i].cv,
-                                                       vShieldedSpend[i].nPlaintextValue,
-                                                       vShieldedSpend[i].vchPlaintextBlind))
-                            return DoS(100, error("ConnectInputs() : DSP spend %d commitment opening proof failed", (int)i));
-                    }
-
-                    if (vShieldedSpend[i].vchSpendAuthSig.empty() || vShieldedSpend[i].vchRk.empty())
-                        return DoS(100, error("ConnectInputs() : shielded spend %d missing spend auth sig or rk", (int)i));
-
-                    if (!VerifySpendAuthSignature(vShieldedSpend[i].vchRk, sighash, vShieldedSpend[i].vchSpendAuthSig))
-                        return DoS(100, error("ConnectInputs() : shielded spend %d spend auth sig failed", (int)i));
-
-                    if (fHideSender)
-                    {
-                        if (vShieldedSpend[i].vchLelantusProof.empty() || vShieldedSpend[i].vAnonSet.empty())
-                            return DoS(100, error("ConnectInputs() : shielded spend %d missing mandatory Lelantus proof", (int)i));
-
-                        if ((int)vShieldedSpend[i].vAnonSet.size() < LELANTUS_MIN_SET_SIZE)
-                            return DoS(100, error("ConnectInputs() : shielded spend %d anonymity set size %d below minimum %d",
-                                                  (int)i, (int)vShieldedSpend[i].vAnonSet.size(), LELANTUS_MIN_SET_SIZE));
-
-                        {
-                            {
-                                std::set<std::vector<unsigned char>> setChainCommitments;
-                                uint64_t nCommitCount = 0;
-                                txdb.ReadShieldedCommitmentCount(nCommitCount);
-                                for (uint64_t ci = 0; ci < nCommitCount; ci++)
-                                {
-                                    CPedersenCommitment chainCommit;
-                                    if (txdb.ReadShieldedCommitment(ci, chainCommit))
-                                        setChainCommitments.insert(chainCommit.vchCommitment);
-                                }
-
-                                for (size_t j = 0; j < vShieldedSpend[i].vAnonSet.size(); j++)
-                                {
-                                    if (setChainCommitments.find(vShieldedSpend[i].vAnonSet[j].vchCommitment) == setChainCommitments.end())
-                                        return DoS(100, error("ConnectInputs() : shielded spend %d anonymity set commitment %d not in chain state", (int)i, (int)j));
-                                }
-                            }
-
-                            CAnonymitySet anonSet;
-                            anonSet.vCommitments = vShieldedSpend[i].vAnonSet;
-                            CLelantusProof proof;
-                            proof.vchProof = vShieldedSpend[i].vchLelantusProof;
-                            proof.serialNumber = vShieldedSpend[i].lelantusSerial;
-
-                            if (!VerifyLelantusProof(anonSet, proof, vShieldedSpend[i].cv))
-                                return DoS(100, error("ConnectInputs() : shielded spend %d Lelantus proof failed", (int)i));
-                        }
-                    }
-
-                    // FCMP++ proof: required after FORK_HEIGHT_FCMP_VALIDATION for FCMP tx versions
-                    if (!fSkipFCMP && nVersion >= SHIELDED_TX_VERSION_FCMP && nBlockHeight >= FORK_HEIGHT_FCMP_VALIDATION)
-                    {
-                        if (vShieldedSpend[i].fcmpProof.IsNull())
-                            return DoS(100, error("ConnectInputs() : shielded spend %d missing FCMP++ proof (required post-fork)", (int)i));
-
-                        if (!VerifyFCMPProof(ciRootNode, vShieldedSpend[i].fcmpProof, vShieldedSpend[i].cv))
-                            return DoS(100, error("ConnectInputs() : shielded spend %d FCMP++ proof failed", (int)i));
-                    }
-                }
-                for (size_t i = 0; i < vShieldedOutput.size(); i++)
-                {
-                    if (fHideAmount)
-                    {
-                        if (!VerifyBulletproofRangeProof(vShieldedOutput[i].cv, vShieldedOutput[i].rangeProof))
-                            return DoS(100, error("ConnectInputs() : shielded output %d range proof failed", (int)i));
-                    }
-                    else
-                    {
-                        if (!VerifyPedersenCommitment(vShieldedOutput[i].cv,
-                                                       vShieldedOutput[i].nPlaintextValue,
-                                                       vShieldedOutput[i].vchPlaintextBlind))
-                            return DoS(100, error("ConnectInputs() : DSP output %d commitment opening proof failed", (int)i));
-                    }
-                }
-
-                if (!fHideAmount)
-                {
-                    int64_t nPlainIn = 0, nPlainOut = 0;
-                    for (size_t i = 0; i < vShieldedSpend.size(); i++)
-                        nPlainIn += vShieldedSpend[i].nPlaintextValue;
-                    for (size_t i = 0; i < vShieldedOutput.size(); i++)
-                        nPlainOut += vShieldedOutput[i].nPlaintextValue;
-                    if (nPlainIn - nPlainOut != nValueBalance)
-                        return DoS(100, error("ConnectInputs() : DSP plaintext value balance mismatch"));
-                }
-
-                if (bindingSig.IsNull())
-                    return DoS(100, error("ConnectInputs() : shielded tx missing mandatory binding signature"));
-
-                {
-                    std::vector<CPedersenCommitment> vInCommits, vOutCommits;
-                    for (size_t i = 0; i < vShieldedSpend.size(); i++)
-                        vInCommits.push_back(vShieldedSpend[i].cv);
-                    for (size_t i = 0; i < vShieldedOutput.size(); i++)
-                        vOutCommits.push_back(vShieldedOutput[i].cv);
-
-                    if (!VerifyBindingSignature(vInCommits, vOutCommits, nValueBalance, sighash, bindingSig.bindingSig))
-                        return DoS(100, error("ConnectInputs() : shielded binding signature verification failed"));
-                }
-            }
-        };
 
         if (!IsCoinStake())
         {
             int64_t nEffectiveOut = GetValueOut();
-            if (IsShielded() && nValueBalance < 0)
-                nEffectiveOut += (-nValueBalance); // shielded value absorbed from transparent
 
             if (nValueIn < nEffectiveOut)
                 return DoS(100, error("ConnectInputs() : %s value in < value out", GetHash().ToString().substr(0,10).c_str()));
@@ -6574,83 +5844,7 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
         }
     }
 
-    if (pindex->nHeight >= FORK_HEIGHT_DAG)
-    {
-        std::vector<CFinalityTallyCertificate> vFinalityCerts = ExtractFinalityTallyCertificatesFromBlock(*this);
-        if (!vFinalityCerts.empty() &&
-            !g_finalityTracker.DisconnectBlockTallyCertificates(txdb, pindex->GetBlockHash(), vFinalityCerts))
-            return error("DisconnectBlock() : DisconnectBlockTallyCertificates failed");
 
-        std::vector<CFinalityTallyShare> vFinalityShares = ExtractFinalityTallySharesFromBlock(*this);
-        if (!vFinalityShares.empty() &&
-            !g_finalityTracker.DisconnectBlockTallyShares(txdb, pindex->GetBlockHash(), vFinalityShares))
-            return error("DisconnectBlock() : DisconnectBlockTallyShares failed");
-
-        std::vector<CFinalityVote> vFinalityVotes = ExtractFinalityVotesFromBlock(*this);
-        if (!vFinalityVotes.empty() &&
-            !g_finalityTracker.DisconnectBlockVotes(txdb, pindex->GetBlockHash(), vFinalityVotes))
-            return error("DisconnectBlock() : DisconnectBlockVotes failed");
-    }
-
-    if (pindex->nHeight >= FORK_HEIGHT_SHIELDED)
-    {
-        for (const CTransaction& tx : vtx)
-        {
-            if (!tx.IsShielded())
-                continue;
-
-            for (const CShieldedSpendDescription& spend : tx.vShieldedSpend)
-            {
-                txdb.EraseShieldedNullifier(spend.nullifier);
-            }
-
-            int64_t nShieldedPool = 0;
-            txdb.ReadShieldedPoolValue(nShieldedPool);
-            nShieldedPool += tx.nValueBalance; // reverse the subtraction done in ConnectBlock
-            txdb.WriteShieldedPoolValue(nShieldedPool);
-            nShieldedPoolValue = nShieldedPool;
-        }
-
-        CIncrementalMerkleTree currentTree;
-        if (txdb.ReadShieldedTree(currentTree))
-        {
-            uint256 currentRoot = currentTree.Root();
-            txdb.EraseShieldedAnchor(currentRoot);
-        }
-
-        CIncrementalMerkleTree prevTree;
-        if (txdb.ReadShieldedTreeAtBlock(pindex->GetBlockHash(), prevTree))
-        {
-            txdb.WriteShieldedTree(prevTree);
-
-            txdb.WriteShieldedCommitmentCount(prevTree.Size());
-        }
-
-        if (pindex->nHeight >= FORK_HEIGHT_FCMP &&
-            pindex->nHeight < FORK_HEIGHT_EPOCH_ROOT_FCMP)
-        {
-            CCurveTree restoredCurveTree;
-            if (txdb.ReadCurveTreeAtBlock(pindex->GetBlockHash(), restoredCurveTree))
-            {
-                txdb.WriteCurveTree(restoredCurveTree);
-            }
-            else
-            {
-                // fallback: O(n) rebuild
-                printf("DisconnectBlock() : WARNING - Curve Tree snapshot not found for block %s, falling back to O(n) rebuild\n",
-                       pindex->GetBlockHash().ToString().substr(0,16).c_str());
-                uint64_t nRestoredCount = prevTree.Size();
-                for (uint64_t i = 0; i < nRestoredCount; i++)
-                {
-                    CPedersenCommitment commit;
-                    if (txdb.ReadShieldedCommitment(i, commit))
-                        restoredCurveTree.InsertLeaf(commit);
-                }
-                txdb.WriteCurveTree(restoredCurveTree);
-            }
-            txdb.EraseCurveTreeAtBlock(pindex->GetBlockHash());
-        }
-    }
 
     // Update block index on disk without changing it in memory.
     // The memory index structure will be changed after the db commits.
@@ -6781,46 +5975,6 @@ static int64_t nTimeConnect = 0;
 static int64_t nTimeIndex = 0;
 static int64_t nTimeCallbacks = 0;
 static int64_t nTimeTotal = 0;
-
-// Seed deterministic unspendable commitments at fork height for Lelantus anonymity set.
-// Each seed: blind_i = SHA256("Innova_Genesis_Seed_" || i), cv_i = blind_i * G (zero value),
-// cmu_i = SHA256("Innova_Genesis_Seed_CMU_" || i). Unspendable: no spending key, no nullifier derivation.
-bool SeedGenesisCommitments(CTxDB& txdb, CIncrementalMerkleTree& shieldedTree, CCurveTree* pCurveTree)
-{
-    for (int i = 0; i < LELANTUS_GENESIS_SEED_COUNT; i++)
-    {
-        // Deterministic blinding factor
-        CHashWriter ssBlind(SER_GETHASH, 0);
-        ssBlind << std::string("Innova_Genesis_Seed_");
-        ssBlind << i;
-        uint256 blindHash = ssBlind.GetHash();
-        std::vector<unsigned char> vchBlind(blindHash.begin(), blindHash.begin() + 32);
-
-        CPedersenCommitment cv;
-        if (!CreateBlindCommitment(vchBlind, cv))
-            return error("SeedGenesisCommitments() : CreateBlindCommitment failed for seed %d", i);
-
-        // Deterministic note commitment (Merkle leaf)
-        CHashWriter ssCmu(SER_GETHASH, 0);
-        ssCmu << std::string("Innova_Genesis_Seed_CMU_");
-        ssCmu << i;
-        uint256 cmu = ssCmu.GetHash();
-
-        // Append to Merkle tree and write to commitment DB
-        shieldedTree.Append(cmu);
-        uint64_t nCommitIdx = shieldedTree.Size() - 1;
-        if (!txdb.WriteShieldedCommitment(nCommitIdx, cv))
-            return error("SeedGenesisCommitments() : WriteShieldedCommitment failed for seed %d", i);
-
-        if (pCurveTree)
-            pCurveTree->InsertLeaf(cv);
-    }
-
-    if (fDebug)
-        printf("SeedGenesisCommitments() : seeded %d genesis commitments for Lelantus anonymity set\n",
-               LELANTUS_GENESIS_SEED_COUNT);
-    return true;
-}
 
 // ---------------------------------------------------------------------------
 // Collateralnode payee/rank enforcement guard.
@@ -6982,15 +6136,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     if (pindex->nHeight >= FORK_HEIGHT_DAG && IsProofOfStake())
         return DoS(100, error("ConnectBlock() : proof-of-stake blocks are not allowed after DAG fork"));
 
-    std::vector<CFinalityVote> vFinalityVotes = ExtractFinalityVotesFromBlock(*this);
-    if (!vFinalityVotes.empty() && (pindex->nHeight < FORK_HEIGHT_DAG || IsProofOfStake()))
-        return DoS(100, error("ConnectBlock() : finality votes are only valid in post-DAG proof-of-work blocks"));
-    std::vector<CFinalityTallyShare> vFinalityShares = ExtractFinalityTallySharesFromBlock(*this);
-    if (!vFinalityShares.empty() && (pindex->nHeight < FORK_HEIGHT_DAG || IsProofOfStake()))
-        return DoS(100, error("ConnectBlock() : finality tally shares are only valid in post-DAG proof-of-work blocks"));
-    std::vector<CFinalityTallyCertificate> vFinalityCerts = ExtractFinalityTallyCertificatesFromBlock(*this);
-    if (!vFinalityCerts.empty() && (pindex->nHeight < FORK_HEIGHT_DAG || IsProofOfStake()))
-        return DoS(100, error("ConnectBlock() : finality tally certificates are only valid in post-DAG proof-of-work blocks"));
 
     // strict script verification post-fork
     unsigned int flags = SCRIPT_VERIFY_NONE;
@@ -7030,52 +6175,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 
     std::vector<CAmount> vFees (vtx.size(), 0);
 
-    bool fFCMPBatchVerified = false;
-    if (pindex->nHeight >= FORK_HEIGHT_FCMP_VALIDATION)
-    {
-        std::vector<CFCMPProof> vBlockProofs;
-        std::vector<CPedersenCommitment> vBlockCommitments;
-        CCurveTreeNode fcmpRootNode;
-        uint256 hashExpectedFCMPRoot = 0;
-        bool fHaveFCMPRoot = false;
-
-        for (unsigned int i = 1; i < vtx.size(); i++)
-        {
-            if (vtx[i].nVersion >= SHIELDED_TX_VERSION_FCMP)
-            {
-                if (vtx[i].vShieldedSpend.size() > 1000)
-                    return DoS(100, error("ConnectBlock() : tx %d has too many shielded spends (%u)", i, (unsigned int)vtx[i].vShieldedSpend.size()));
-
-                for (const auto& spend : vtx[i].vShieldedSpend)
-                {
-                    if (spend.fcmpProof.IsNull())
-                        return DoS(100, error("ConnectBlock() : tx %d spend missing FCMP++ proof", i));
-                    if (!fHaveFCMPRoot)
-                    {
-                        std::string strFCMPError;
-                        if (!LoadFCMPValidationRoot(txdb, pindex->nHeight, fcmpRootNode, hashExpectedFCMPRoot, strFCMPError))
-                            return DoS(100, error("ConnectBlock() : %s", strFCMPError.c_str()));
-                        fHaveFCMPRoot = true;
-                    }
-                    if (pindex->nHeight >= FORK_HEIGHT_EPOCH_ROOT_FCMP && spend.curveTreeRoot != hashExpectedFCMPRoot)
-                        return DoS(100, error("ConnectBlock() : tx %d spend FCMP root does not match finalized epoch root", i));
-                    vBlockProofs.push_back(spend.fcmpProof);
-                    vBlockCommitments.push_back(spend.cv);
-                }
-            }
-        }
-
-        if (!vBlockProofs.empty())
-        {
-            if (!BatchVerifyFCMPProofs(fcmpRootNode, vBlockProofs, vBlockCommitments))
-                return DoS(100, error("ConnectBlock() : batch FCMP++ proof verification failed"));
-
-            fFCMPBatchVerified = true;
-
-            if (fDebug)
-                printf("ConnectBlock() : batch verified %d FCMP++ proofs\n", (int)vBlockProofs.size());
-        }
-    }
 
     std::set<uint256> setBlockNullifiers;
 
@@ -7083,12 +6182,8 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     // Transactions conflicting with already-spent outputs from siblings are skipped
 
     int64_t nTransparentValidateMicros = 0;
-    int64_t nShieldedValidateMicros = 0;
-    int64_t nPrivateStakeValidateMicros = 0;
     int64_t nAnonValidateMicros = 0;
     unsigned int nTransparentValidateCount = 0;
-    unsigned int nShieldedValidateCount = 0;
-    unsigned int nPrivateStakeValidateCount = 0;
     unsigned int nAnonValidateCount = 0;
 
     const bool fHRegActive = hreg::IsHRegRecognitionActive(pindex->nHeight);
@@ -7147,13 +6242,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             if (!tx.FetchInputs(txdb, mapQueuedChanges, true, false, mapInputs, fInvalid))
                 return false;
 
-            for (const CShieldedSpendDescription& spend : tx.vShieldedSpend)
-            {
-                if (!setBlockNullifiers.insert(spend.nullifier).second)
-                    return DoS(100, error("ConnectBlock() : duplicate nullifier %s across txs in block",
-                                          spend.nullifier.ToString().substr(0,10).c_str()));
-            }
-
             // Add in sigops done by pay-to-script-hash inputs;
             // this is to prevent a "rogue miner" from creating
             // an incredibly-expensive-to-validate block.
@@ -7181,24 +6269,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
                 nTxValueIn += nSumAnon;
             };
 
-            if (tx.IsShielded())
-            {
-                if (tx.nValueBalance > 0)
-                {
-                    if (tx.nValueBalance > std::numeric_limits<int64_t>::max() - nTxValueIn)
-                        return DoS(100, error("ConnectBlock() : shielded value balance overflow (unshield)"));
-                    nTxValueIn += tx.nValueBalance;
-                }
-                else if (tx.nValueBalance < 0)
-                {
-                    if (tx.nValueBalance == std::numeric_limits<int64_t>::min())
-                        return DoS(100, error("ConnectBlock() : shielded value balance INT64_MIN"));
-                    int64_t nAbsBalance = -tx.nValueBalance;
-                    if (nAbsBalance > std::numeric_limits<int64_t>::max() - nTxValueOut)
-                        return DoS(100, error("ConnectBlock() : shielded value balance overflow (shield)"));
-                    nTxValueOut += nAbsBalance;
-                }
-            }
 
             if (nTxValueIn > std::numeric_limits<int64_t>::max() - nValueIn)
                 return DoS(100, error("ConnectBlock() : block value-in overflow"));
@@ -7216,7 +6286,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             if (tx.IsCoinStake())
                 nStakeReward = nTxValueOut - nTxValueIn;
 
-            if (!tx.ConnectInputs(txdb, mapInputs, mapQueuedChanges, posThisTx, pindex, true, false, flags, true, fFCMPBatchVerified))
+            if (!tx.ConnectInputs(txdb, mapInputs, mapQueuedChanges, posThisTx, pindex, true, false, flags, true))
                 return false;
 
             if (fHRegActive)
@@ -7227,19 +6297,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             }
 
             int64_t nTxValidateMicros = GetTimeMicros() - nTxValidateStart;
-            if (tx.IsCoinStake() && (tx.nVersion == SHIELDED_TX_VERSION_NULLSTAKE ||
-                                     tx.nVersion == SHIELDED_TX_VERSION_NULLSTAKE_V2 ||
-                                     tx.nVersion == SHIELDED_TX_VERSION_NULLSTAKE_COLD))
-            {
-                nPrivateStakeValidateMicros += nTxValidateMicros;
-                nPrivateStakeValidateCount++;
-            }
-            else if (tx.IsShielded())
-            {
-                nShieldedValidateMicros += nTxValidateMicros;
-                nShieldedValidateCount++;
-            }
-            else if (tx.nVersion == ANON_TXN_VERSION)
+            if (tx.nVersion == ANON_TXN_VERSION)
             {
                 nAnonValidateMicros += nTxValidateMicros;
                 nAnonValidateCount++;
@@ -7267,35 +6325,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     // LogPrint("bench", "    - Verify %u txins: %.2fms (%.3fms/txin) [%.2fs]\n", nInputs - 1, 0.001 * (nTime2 - nTimeStart), nInputs <= 1 ? 0 : 0.001 * (nTime2 - nTimeStart) / (nInputs-1), nTimeVerify * 0.000001);
 
 
-    int64_t nFinalityRewardOut = 0;
-    if (!vFinalityVotes.empty())
-    {
-        if (!CheckFinalityStakeProofsNotSpentInBlock(*this, vFinalityVotes))
-            return DoS(100, error("ConnectBlock() : finality stake proof spent in including block"));
-        if (!CheckFinalityVoteRewardOutputs(*this, vFinalityVotes, nFinalityRewardOut))
-            return DoS(100, error("ConnectBlock() : finality vote reward outputs invalid"));
-        for (const CFinalityVote& vote : vFinalityVotes)
-        {
-            std::string strVoteError;
-            if (!g_finalityTracker.CheckVote(vote, txdb, &strVoteError))
-                return DoS(100, error("ConnectBlock() : finality vote invalid: %s", strVoteError.c_str()));
-        }
-    }
-    for (const CFinalityTallyCertificate& cert : vFinalityCerts)
-    {
-        std::string strCertError;
-        if (!cert.IsValidBasic(&strCertError))
-            return DoS(100, error("ConnectBlock() : finality tally certificate invalid: %s", strCertError.c_str()));
-        if (GetEpochForHeight(cert.nHeight) != cert.nEpoch ||
-            GetEpochBoundaryHeight(cert.nEpoch, cert.nHeight) != cert.nHeight)
-            return DoS(100, error("ConnectBlock() : finality tally certificate has wrong epoch boundary"));
-    }
-    for (const CFinalityTallyShare& share : vFinalityShares)
-    {
-        std::string strShareError;
-        if (!g_finalityTracker.CheckTallyShare(share, &strShareError, &vFinalityVotes))
-            return DoS(100, error("ConnectBlock() : finality tally share invalid: %s", strShareError.c_str()));
-    }
 
     if (IsProofOfWork())
     {
@@ -7312,9 +6341,9 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         nReward = ApplyBlockSizePenalty(nReward, *this, pindex->pprev);
 
         // Check coinbase reward
-        if (nReward > MAX_MONEY - nFinalityRewardOut)
-            return DoS(50, error("ConnectBlock() : finality reward overflow"));
-        int64_t nAllowedCoinbase = nReward + nFinalityRewardOut;
+        if (nReward > MAX_MONEY)
+            return DoS(50, error("ConnectBlock() : coinbase reward overflow"));
+        int64_t nAllowedCoinbase = nReward;
 
         if (vtx[0].GetValueOut() > nAllowedCoinbase)
             return DoS(50, error("ConnectBlock() : coinbase reward exceeded (actual=%" PRId64" vs calculated=%" PRId64")",
@@ -7326,196 +6355,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         if (nStakeReward == 0 && !vtx[1].IsCoinStake())
             return DoS(100, error("ConnectBlock() : PoS block but vtx[1] is not coinstake"));
 
-        if (vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE_V2)
-        {
-            if (pindex->nHeight < FORK_HEIGHT_NULLSTAKE_V2)
-                return DoS(100, error("ConnectBlock() : NullStake V2 coinstake before fork height"));
-
-            if (vtx[1].nullstakeProofV2.IsNull())
-                return DoS(100, error("ConnectBlock() : NullStake V2 kernel proof missing"));
-
-            if (vtx[1].vShieldedSpend.empty())
-                return DoS(100, error("ConnectBlock() : NullStake V2 coinstake has no shielded spends"));
-
-            if (vtx[1].nullstakeProofV2.nTimeTx != nTime)
-                return DoS(100, error("ConnectBlock() : NullStake V2 nTimeTx %" PRId64 " != block time %" PRId64,
-                                       (int64_t)vtx[1].nullstakeProofV2.nTimeTx, (int64_t)nTime));
-
-            if (pindex->pprev)
-            {
-                if (vtx[1].nullstakeProofV2.nStakeModifier != pindex->pprev->nStakeModifier)
-                    return DoS(100, error("ConnectBlock() : NullStake V2 stake modifier mismatch (proof=0x%016" PRIx64 " chain=0x%016" PRIx64 ")",
-                                           vtx[1].nullstakeProofV2.nStakeModifier, pindex->pprev->nStakeModifier));
-            }
-
-            if (!VerifyNullStakeKernelProofV2(vtx[1].nullstakeProofV2,
-                                              vtx[1].vShieldedSpend[0].cv,
-                                              nBits))
-                return DoS(100, error("ConnectBlock() : NullStake V2 kernel proof invalid"));
-
-            CCurveTree nullstakeTree;
-            if (!txdb.ReadCurveTree(nullstakeTree))
-                return DoS(100, error("ConnectBlock() : failed to read curve tree for NullStake V2"));
-            nullstakeTree.RebuildParentNodes();
-
-            CCurveTreeNode nullstakeRoot = nullstakeTree.GetRootNode();
-            if (vtx[1].vShieldedSpend[0].fcmpProof.IsNull())
-                return DoS(100, error("ConnectBlock() : NullStake V2 stake FCMP proof missing"));
-            if (!VerifyFCMPProof(nullstakeRoot, vtx[1].vShieldedSpend[0].fcmpProof,
-                                  vtx[1].vShieldedSpend[0].cv))
-                return DoS(100, error("ConnectBlock() : NullStake V2 stake FCMP proof invalid"));
-
-            uint64_t nCoinAge = 1;  // Minimum coin-day for V2
-            int64_t nCalculatedStakeReward = ApplyBlockSizePenalty(GetProofOfStakeReward(nCoinAge, nFees), *this, pindex->pprev);
-            if (nStakeReward > nCalculatedStakeReward)
-                return DoS(100, error("ConnectBlock() : NullStake V2 coinstake pays too much(actual=%" PRId64" vs calculated=%" PRId64")", nStakeReward, nCalculatedStakeReward));
-        }
-        else if (vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE_COLD)
-        {
-            if (pindex->nHeight < FORK_HEIGHT_NULLSTAKE_V3)
-                return DoS(100, error("ConnectBlock() : NullStake V3 cold stake coinstake before fork height"));
-
-            if (vtx[1].nullstakeProofV3.IsNull())
-                return DoS(100, error("ConnectBlock() : NullStake V3 kernel proof missing"));
-
-            if (vtx[1].vShieldedSpend.empty())
-                return DoS(100, error("ConnectBlock() : NullStake V3 coinstake has no shielded spends"));
-
-            if (vtx[1].nullstakeProofV3.acProof.GetProofSize() > BPAC_V3_MAX_PROOF_SIZE)
-                return DoS(100, error("ConnectBlock() : NullStake V3 proof exceeds size limit (%u > %u)",
-                                       (unsigned int)vtx[1].nullstakeProofV3.acProof.GetProofSize(),
-                                       (unsigned int)BPAC_V3_MAX_PROOF_SIZE));
-
-            if (vtx[1].nullstakeProofV3.nTimeTx != nTime)
-                return DoS(100, error("ConnectBlock() : NullStake V3 nTimeTx %" PRId64 " != block time %" PRId64,
-                                       (int64_t)vtx[1].nullstakeProofV3.nTimeTx, (int64_t)nTime));
-
-            {
-                uint256 zeroHash;
-                memset(zeroHash.begin(), 0, 32);
-                if (vtx[1].nullstakeProofV3.delegationHash == zeroHash)
-                    return DoS(100, error("ConnectBlock() : NullStake V3 delegation hash is zero"));
-            }
-
-            if (vtx[1].nullstakeProofV3.vchPkStake.size() != 33)
-                return DoS(100, error("ConnectBlock() : NullStake V3 pk_stake invalid size"));
-            if (vtx[1].nullstakeProofV3.vchPkOwner.size() != 33)
-                return DoS(100, error("ConnectBlock() : NullStake V3 pk_owner invalid size"));
-
-            if (pindex->pprev)
-            {
-                if (vtx[1].nullstakeProofV3.nStakeModifier != pindex->pprev->nStakeModifier)
-                    return DoS(100, error("ConnectBlock() : NullStake V3 stake modifier mismatch (proof=0x%016" PRIx64 " chain=0x%016" PRIx64 ")",
-                                           vtx[1].nullstakeProofV3.nStakeModifier, pindex->pprev->nStakeModifier));
-            }
-
-            if (!VerifyNullStakeKernelProofV3(vtx[1].nullstakeProofV3,
-                                              vtx[1].vShieldedSpend[0].cv,
-                                              nBits))
-                return DoS(100, error("ConnectBlock() : NullStake V3 kernel proof invalid"));
-
-            CCurveTree nullstakeV3Tree;
-            if (!txdb.ReadCurveTree(nullstakeV3Tree))
-                return DoS(100, error("ConnectBlock() : failed to read curve tree for NullStake V3"));
-            nullstakeV3Tree.RebuildParentNodes();
-
-            CCurveTreeNode nullstakeV3Root = nullstakeV3Tree.GetRootNode();
-            if (vtx[1].vShieldedSpend[0].fcmpProof.IsNull())
-                return DoS(100, error("ConnectBlock() : NullStake V3 stake FCMP proof missing"));
-            if (!VerifyFCMPProof(nullstakeV3Root, vtx[1].vShieldedSpend[0].fcmpProof,
-                                  vtx[1].vShieldedSpend[0].cv))
-                return DoS(100, error("ConnectBlock() : NullStake V3 stake FCMP proof invalid"));
-
-            // V3 reward: same conservative approach as V2
-            uint64_t nCoinAge = 1;
-            int64_t nCalculatedStakeReward = ApplyBlockSizePenalty(GetProofOfStakeReward(nCoinAge, nFees), *this, pindex->pprev);
-            if (nStakeReward > nCalculatedStakeReward)
-                return DoS(100, error("ConnectBlock() : NullStake V3 coinstake pays too much(actual=%" PRId64" vs calculated=%" PRId64")", nStakeReward, nCalculatedStakeReward));
-        }
-        else if (vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE)
-        {
-            if (pindex->nHeight < FORK_HEIGHT_NULLSTAKE)
-                return DoS(100, error("ConnectBlock() : NullStake coinstake before fork height"));
-
-            if (vtx[1].nullstakeProof.IsNull())
-                return DoS(100, error("ConnectBlock() : NullStake kernel proof missing"));
-
-            if (vtx[1].vShieldedSpend.empty())
-                return DoS(100, error("ConnectBlock() : NullStake coinstake has no shielded spends"));
-
-            if (vtx[1].nullstakeProof.nTimeTx != nTime)
-                return DoS(100, error("ConnectBlock() : NullStake nTimeTx %" PRId64 " != block time %" PRId64,
-                                       (int64_t)vtx[1].nullstakeProof.nTimeTx, (int64_t)nTime));
-
-            if (vtx[1].nullstakeProof.nBlockTimeFrom >= vtx[1].nullstakeProof.nTimeTx)
-                return DoS(100, error("ConnectBlock() : NullStake nBlockTimeFrom >= nTimeTx"));
-
-            {
-                int64_t nStakeAge = (int64_t)vtx[1].nullstakeProof.nTimeTx - (int64_t)vtx[1].nullstakeProof.nBlockTimeFrom;
-                if (nStakeAge < nStakeMinAge)
-                    return DoS(100, error("ConnectBlock() : NullStake stake age %" PRId64 " < minimum %" PRId64, nStakeAge, (int64_t)nStakeMinAge));
-                if (nStakeAge > 365 * 24 * 60 * 60)
-                    return DoS(50, error("ConnectBlock() : NullStake stake age %" PRId64 " exceeds 1 year", nStakeAge));
-            }
-
-            {
-                bool fFoundBlockTime = false;
-                CBlockIndex* pBlockFrom = NULL;
-                CBlockIndex* pWalk = pindex->pprev;
-                // increase lookback to cover nStakeMaxAge (90 days)
-                // With 15s blocks: 90 days = 518,400 blocks. Use 600,000 for margin.
-                // Was 1000 which only covered ~4.2 hours -- far less than 10-hour nStakeMinAge
-                for (int i = 0; i < 600000 && pWalk != NULL; i++, pWalk = pWalk->pprev)
-                {
-                    if ((int64_t)pWalk->nTime == (int64_t)vtx[1].nullstakeProof.nBlockTimeFrom)
-                    {
-                        fFoundBlockTime = true;
-                        pBlockFrom = pWalk;
-                        break;
-                    }
-                }
-                if (!fFoundBlockTime || pBlockFrom == NULL)
-                    return DoS(100, error("ConnectBlock() : NullStake nBlockTimeFrom does not match any recent block"));
-
-                // verify stake modifier matches chain state
-                uint64_t nExpectedStakeModifier = 0;
-                int nStakeModifierHeight = 0;
-                int64_t nStakeModifierTime = 0;
-                if (!GetKernelStakeModifier(pBlockFrom->GetBlockHash(), pindex->pprev, nExpectedStakeModifier,
-                                            nStakeModifierHeight, nStakeModifierTime, false))
-                    return DoS(100, error("ConnectBlock() : Failed to get stake modifier for NullStake proof"));
-
-                if (vtx[1].nullstakeProof.nStakeModifier != nExpectedStakeModifier)
-                    return DoS(100, error("ConnectBlock() : NullStake stake modifier mismatch (proof=0x%016" PRIx64 " chain=0x%016" PRIx64 ")",
-                                          vtx[1].nullstakeProof.nStakeModifier, nExpectedStakeModifier));
-            }
-
-            int64_t nWeight = GetWeight((int64_t)vtx[1].nullstakeProof.nBlockTimeFrom,
-                                         (int64_t)vtx[1].nullstakeProof.nTimeTx);
-
-            if (!VerifyNullStakeKernelProof(vtx[1].nullstakeProof,
-                                            vtx[1].vShieldedSpend[0].cv,
-                                            nBits, nWeight))
-                return DoS(100, error("ConnectBlock() : NullStake kernel proof invalid"));
-
-            CCurveTree nullstakeTree;
-            if (!txdb.ReadCurveTree(nullstakeTree))
-                return DoS(100, error("ConnectBlock() : failed to read curve tree for NullStake"));
-            nullstakeTree.RebuildParentNodes();
-
-            CCurveTreeNode nullstakeRoot = nullstakeTree.GetRootNode();
-            if (vtx[1].vShieldedSpend[0].fcmpProof.IsNull())
-                return DoS(100, error("ConnectBlock() : NullStake stake FCMP proof missing"));
-            if (!VerifyFCMPProof(nullstakeRoot, vtx[1].vShieldedSpend[0].fcmpProof,
-                                  vtx[1].vShieldedSpend[0].cv))
-                return DoS(100, error("ConnectBlock() : NullStake stake FCMP proof invalid"));
-
-            uint64_t nCoinAge = nWeight > 0 ? (uint64_t)nWeight : 1;
-            int64_t nCalculatedStakeReward = ApplyBlockSizePenalty(GetProofOfStakeReward(nCoinAge, nFees), *this, pindex->pprev);
-            if (nStakeReward > nCalculatedStakeReward)
-                return DoS(100, error("ConnectBlock() : NullStake coinstake pays too much(actual=%" PRId64" vs calculated=%" PRId64")", nStakeReward, nCalculatedStakeReward));
-        }
-        else
         {
             uint64_t nCoinAge;
             if (!vtx[1].GetCoinAge(txdb, nCoinAge))
@@ -7525,40 +6364,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 
             if (nStakeReward > nCalculatedStakeReward)
                 return DoS(100, error("ConnectBlock() : coinstake pays too much(actual=%" PRId64" vs calculated=%" PRId64")", nStakeReward, nCalculatedStakeReward));
-        }
-
-        // Reject shielded coinstake unless NullStake version is allowed
-        if (pindex->nHeight >= FORK_HEIGHT_SHIELDED)
-        {
-            if (vtx[1].IsShielded())
-            {
-                // PRIV-AUDIT-3: After V2 fork, reject V1 proofs (they leak UTXO identity)
-                bool fNullStakeAllowed = (vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE && pindex->nHeight >= FORK_HEIGHT_NULLSTAKE && pindex->nHeight < FORK_HEIGHT_NULLSTAKE_V2)
-                    || (vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE_V2 && pindex->nHeight >= FORK_HEIGHT_NULLSTAKE_V2)
-                    || (vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE_COLD && pindex->nHeight >= FORK_HEIGHT_NULLSTAKE_V3);
-                if (!fNullStakeAllowed)
-                    return DoS(100, error("ConnectBlock() : shielded transaction cannot be coinstake (Layer 2)"));
-            }
-
-            // Reject coinstake inputs from shielded transactions
-            if (vtx[1].nVersion != SHIELDED_TX_VERSION_NULLSTAKE && vtx[1].nVersion != SHIELDED_TX_VERSION_NULLSTAKE_V2 && vtx[1].nVersion != SHIELDED_TX_VERSION_NULLSTAKE_COLD)
-            {
-                MapPrevTx mapShieldedCheck;
-                bool fShieldedInvalid = false;
-                if (vtx[1].FetchInputs(txdb, mapQueuedChanges, true, false, mapShieldedCheck, fShieldedInvalid))
-                {
-                    for (unsigned int j = 0; j < vtx[1].vin.size(); j++)
-                    {
-                        const COutPoint& prevout = vtx[1].vin[j].prevout;
-                        if (mapShieldedCheck.count(prevout.hash))
-                        {
-                            const CTransaction& txPrev = mapShieldedCheck[prevout.hash].second;
-                            if (txPrev.IsShielded())
-                                return DoS(100, error("ConnectBlock() : coinstake input from shielded transaction (Layer 3)"));
-                        }
-                    }
-                }
-            }
         }
 
         if (pindex->nHeight >= FORK_HEIGHT_COLD_STAKING)
@@ -7726,12 +6531,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         int nCNEnforcementHeight = fTestNet ? MN_ENFORCEMENT_ACTIVE_HEIGHT_TESTNET : MN_ENFORCEMENT_ACTIVE_HEIGHT;
 
         if(IsProofOfStake() && pindexBest != NULL){
-            // (reward goes entirely to shielded pool, no MN payment)
-            if (vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE || vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE_V2 || vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE_COLD)
-            {
-                // NullStake/V3: no collateralnode payments
-            }
-            else if(pindexBest->GetBlockHash() == hashPrevBlock){
+            if(pindexBest->GetBlockHash() == hashPrevBlock){
 
                 // make sure the ranks are updated to prev block
                 GetCollateralnodeRanks(pindexBest);
@@ -8035,115 +6835,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         }
     }
 
-    if (pindex->nHeight >= FORK_HEIGHT_SHIELDED && !fJustCheck)
-    {
-        CIncrementalMerkleTree shieldedTree;
-        if (pindex->pprev)
-            txdb.ReadShieldedTree(shieldedTree); // OK if not found (empty tree)
-
-        txdb.WriteShieldedTreeAtBlock(pindex->GetBlockHash(), shieldedTree);
-
-        CCurveTree curveTree;
-        bool fMutableCurveTree = (pindex->nHeight >= FORK_HEIGHT_FCMP &&
-                                  pindex->nHeight < FORK_HEIGHT_EPOCH_ROOT_FCMP);
-        if (fMutableCurveTree && pindex->pprev)
-            txdb.ReadCurveTree(curveTree); // OK if not found (empty)
-
-        if (fMutableCurveTree)
-            txdb.WriteCurveTreeAtBlock(pindex->GetBlockHash(), curveTree);
-
-        // Seed genesis commitments at the fork activation block
-        // These provide the initial Lelantus anonymity set (16 unspendable decoys)
-        if (pindex->nHeight == FORK_HEIGHT_SHIELDED)
-        {
-            CCurveTree* pCurveTreePtr = fMutableCurveTree ? &curveTree : nullptr;
-            if (!SeedGenesisCommitments(txdb, shieldedTree, pCurveTreePtr))
-                return error("ConnectBlock() : SeedGenesisCommitments failed");
-        }
-
-        int64_t nShieldedPool = 0;
-        txdb.ReadShieldedPoolValue(nShieldedPool); // OK if not found (zero)
-
-        // Catch cross-tx nullifier duplicates within this block
-        std::set<uint256> setBlockNullifiers;
-
-        for (const CTransaction& tx : vtx)
-        {
-            if (!tx.IsShielded())
-                continue;
-
-            for (unsigned int i = 0; i < tx.vShieldedSpend.size(); i++)
-            {
-                if (!setBlockNullifiers.insert(tx.vShieldedSpend[i].nullifier).second)
-                    return error("ConnectBlock() : duplicate nullifier %s across transactions in block",
-                                 tx.vShieldedSpend[i].nullifier.ToString().substr(0,10).c_str());
-
-                CShieldedNullifierSpent nfs;
-                nfs.txnHash = tx.GetHash();
-                nfs.nIndex = i;
-                if (!txdb.WriteShieldedNullifier(tx.vShieldedSpend[i].nullifier, nfs))
-                    return error("ConnectBlock() : WriteShieldedNullifier failed");
-            }
-
-            // Append note commitments to the Merkle tree and commitment index
-            for (const CShieldedOutputDescription& output : tx.vShieldedOutput)
-            {
-                shieldedTree.Append(output.cmu);
-
-                // Index Pedersen commitment for Lelantus anonymity set construction
-                uint64_t nCommitIdx = shieldedTree.Size() - 1;
-                if (!txdb.WriteShieldedCommitment(nCommitIdx, output.cv))
-                    return error("ConnectBlock() : WriteShieldedCommitment failed");
-
-                if (!txdb.WriteShieldedCommitmentHeight(nCommitIdx, pindex->nHeight))
-                    return error("ConnectBlock() : WriteShieldedCommitmentHeight failed");
-                // Reverse index for spend validation
-                if (!txdb.WriteShieldedCommitmentIndex(output.cv.vchCommitment, nCommitIdx))
-                    return error("ConnectBlock() : WriteShieldedCommitmentIndex failed");
-
-                if (fMutableCurveTree)
-                    curveTree.InsertLeaf(output.cv);
-            }
-
-            nShieldedPool -= tx.nValueBalance;
-
-            if (nShieldedPool < 0)
-                return error("ConnectBlock() : shielded pool would go negative (%" PRId64 "), inflation detected", nShieldedPool);
-        }
-
-        if (!txdb.WriteShieldedTree(shieldedTree))
-            return error("ConnectBlock() : WriteShieldedTree failed");
-        if (!txdb.WriteShieldedCommitmentCount(shieldedTree.Size()))
-            return error("ConnectBlock() : WriteShieldedCommitmentCount failed");
-
-        if (fMutableCurveTree)
-        {
-            if (!txdb.WriteCurveTree(curveTree))
-                return error("ConnectBlock() : WriteCurveTree failed");
-        }
-
-        uint256 treeRoot = shieldedTree.Root();
-        if (!txdb.WriteShieldedAnchor(treeRoot))
-            return error("ConnectBlock() : WriteShieldedAnchor failed");
-        // Only write anchor height for NEW anchors (don't reset age each block)
-        {
-            int nExistingHeight = 0;
-            if (!txdb.ReadShieldedAnchorHeight(treeRoot, nExistingHeight))
-            {
-                if (!txdb.WriteShieldedAnchorHeight(treeRoot, pindex->nHeight))
-                    return error("ConnectBlock() : WriteShieldedAnchorHeight failed");
-            }
-        }
-
-        if (!txdb.WriteShieldedPoolValue(nShieldedPool))
-            return error("ConnectBlock() : WriteShieldedPoolValue failed");
-
-        nShieldedPoolValue = nShieldedPool;
-
-        if (fDebug)
-            printf("ConnectBlock() : shielded tree root=%s, pool=%" PRId64 "\n",
-                   treeRoot.ToString().substr(0,10).c_str(), nShieldedPool);
-    }
 
     // ppcoin: track money supply and mint amount info
     pindex->nMint = nValueOut - nValueIn + nFees;
@@ -8152,21 +6843,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     if (pindex->nMoneySupply < 0)
         return error("ConnectBlock() : negative money supply at height %d", pindex->nHeight);
 
-    if (!fJustCheck && !vFinalityVotes.empty())
-    {
-        if (!g_finalityTracker.ConnectBlockVotes(txdb, pindex->GetBlockHash(), vFinalityVotes))
-            return error("ConnectBlock() : ConnectBlockVotes failed");
-    }
-    if (!fJustCheck && !vFinalityShares.empty())
-    {
-        if (!g_finalityTracker.ConnectBlockTallyShares(txdb, pindex->GetBlockHash(), vFinalityShares))
-            return error("ConnectBlock() : ConnectBlockTallyShares failed");
-    }
-    if (!fJustCheck && !vFinalityCerts.empty())
-    {
-        if (!g_finalityTracker.ConnectBlockTallyCertificates(txdb, pindex->GetBlockHash(), vFinalityCerts))
-            return error("ConnectBlock() : ConnectBlockTallyCertificates failed");
-    }
 
     // innova: collect valid name tx
     // NOTE: tx.UpdateCoins should not affect this loop, probably...
@@ -8176,12 +6852,10 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     if (fJustCheck)
     {
         if (fDebug && GetBoolArg("-showtimers", false))
-            printf("ConnectBlock: height=%d justcheck total=%" PRId64"ms check=%" PRId64"ms tx_transparent=%u/%" PRId64"us tx_shielded=%u/%" PRId64"us tx_anon=%u/%" PRId64"us tx_privstake=%u/%" PRId64"us\n",
+            printf("ConnectBlock: height=%d justcheck total=%" PRId64"ms check=%" PRId64"ms tx_transparent=%u/%" PRId64"us tx_anon=%u/%" PRId64"us\n",
                    pindex->nHeight, GetTimeMillis() - nConnectBlockStart, nConnectCheckMs,
                    nTransparentValidateCount, nTransparentValidateMicros,
-                   nShieldedValidateCount, nShieldedValidateMicros,
-                   nAnonValidateCount, nAnonValidateMicros,
-                   nPrivateStakeValidateCount, nPrivateStakeValidateMicros);
+                   nAnonValidateCount, nAnonValidateMicros);
         return true;
     }
 
@@ -8261,12 +6935,10 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     uiInterface.NotifyRanksUpdated();
 
     if (fDebug && GetBoolArg("-showtimers", false))
-        printf("ConnectBlock: height=%d total=%" PRId64"ms check=%" PRId64"ms tx_transparent=%u/%" PRId64"us tx_shielded=%u/%" PRId64"us tx_anon=%u/%" PRId64"us tx_privstake=%u/%" PRId64"us\n",
+        printf("ConnectBlock: height=%d total=%" PRId64"ms check=%" PRId64"ms tx_transparent=%u/%" PRId64"us tx_anon=%u/%" PRId64"us\n",
                pindex->nHeight, GetTimeMillis() - nConnectBlockStart, nConnectCheckMs,
                nTransparentValidateCount, nTransparentValidateMicros,
-               nShieldedValidateCount, nShieldedValidateMicros,
-               nAnonValidateCount, nAnonValidateMicros,
-               nPrivateStakeValidateCount, nPrivateStakeValidateMicros);
+               nAnonValidateCount, nAnonValidateMicros);
 
     return true;
 }
@@ -8317,28 +6989,6 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         return error("Reorganize() : block %s (or an ancestor) is invalidated by the operator",
                      pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
 
-    {
-        int nFinalHeight = g_finalityTracker.GetFinalizedHeight();
-        if (nFinalHeight > 0 && pindexBest && pindexBest->nHeight >= FORK_HEIGHT_FINALITY)
-        {
-            CBlockIndex* pCheck = pindexBest;
-            CBlockIndex* pLonger = pindexNew;
-            while (pCheck != pLonger)
-            {
-                while (pLonger && pLonger->nHeight > pCheck->nHeight)
-                    pLonger = pLonger->pprev;
-                if (pCheck == pLonger)
-                    break;
-                if (pCheck)
-                    pCheck = pCheck->pprev;
-            }
-            if (pCheck && pCheck->nHeight < nFinalHeight)
-            {
-                return error("Reorganize() : rejected - fork point height %d is below finalized height %d",
-                             pCheck->nHeight, nFinalHeight);
-            }
-        }
-    }
 
     // Find the fork
     CBlockIndex* pfork = pindexBest;
@@ -8473,27 +7123,9 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
         if (pindex->pprev)
             pindex->pprev->pnext = pindex;
 
-    // Resurrect memory transactions, re-validate shielded anchors
+    // Resurrect memory transactions
     for (CTransaction& tx : vResurrect)
     {
-        if (tx.IsShielded())
-        {
-            bool fValidAnchors = true;
-            for (const CShieldedSpendDescription& spend : tx.vShieldedSpend)
-            {
-                if (!txdb.ReadShieldedAnchor(spend.anchor))
-                {
-                    fValidAnchors = false;
-                    if (fDebug)
-                        printf("Reorganize() : dropping shielded tx %s - anchor %s no longer valid\n",
-                               tx.GetHash().ToString().substr(0,10).c_str(),
-                               spend.anchor.ToString().substr(0,10).c_str());
-                    break;
-                }
-            }
-            if (!fValidAnchors)
-                continue; // Don't resurrect this tx - anchors are invalid
-        }
         tx.AcceptToMemoryPool(txdb);
     }
 
@@ -8586,33 +7218,6 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     }
     else
     {
-        {
-            int nFinalHeight = g_finalityTracker.GetFinalizedHeight();
-            if (nFinalHeight > 0 && pindexBest && pindexBest->nHeight >= FORK_HEIGHT_FINALITY)
-            {
-                CBlockIndex* pWalk = pindexNew;
-                while (pWalk && pWalk->nHeight > nBestHeight)
-                    pWalk = pWalk->pprev;
-                CBlockIndex* pOld = pindexBest;
-                while (pOld && pWalk && pOld != pWalk)
-                {
-                    if (pOld->nHeight > pWalk->nHeight)
-                        pOld = pOld->pprev;
-                    else if (pWalk->nHeight > pOld->nHeight)
-                        pWalk = pWalk->pprev;
-                    else
-                    {
-                        pOld = pOld->pprev;
-                        pWalk = pWalk->pprev;
-                    }
-                }
-                if (pOld && pOld->nHeight < nFinalHeight)
-                {
-                    txdb.TxnAbort();
-                    return error("SetBestChain() : rejected reorg - fork below finalized height %d", nFinalHeight);
-                }
-            }
-        }
 
         // the first block in the new chain that will cause it to become the new best chain
         CBlockIndex *pindexIntermediate = pindexNew;
@@ -9547,6 +8152,28 @@ bool CBlock::AcceptBlock()
     return true;
 }
 
+uint256 GetBlockEntropy(const uint256& hashValue)
+{
+    uint256 comp = ~hashValue;
+    if (comp == 0)
+        return 0;
+
+    CBigNum bnComp(comp);
+    unsigned int nBitSize = bnComp.bitSize();
+
+    uint256 result = 0;
+    result = (uint64_t)nBitSize << 32;
+
+    if (nBitSize > 33)
+    {
+        uint256 shifted = comp >> (nBitSize - 33);
+        uint32_t nFracBits = (uint32_t)(shifted.Get64(0) & 0xFFFFFFFF);
+        result += nFracBits;
+    }
+
+    return result;
+}
+
 uint256 CBlockIndex::GetBlockTrust() const
 {
     CBigNum bnTarget;
@@ -9655,7 +8282,7 @@ static bool IsAncestorOfBest(const CBlockIndex* pindex)
 }
 
 // Roll the active chain back so its tip becomes pindexTarget (an ancestor of
-// the current best). Reuses SetBestChain/Reorganize, so finality, DAG and
+// the current best). Reuses SetBestChain/Reorganize, so DAG and
 // stake-seen cleanup are handled by the existing machinery. The wallet and
 // collateral callbacks inside that machinery are safe with no wallet /
 // collateral nodes registered (startup healing).
@@ -9692,7 +8319,6 @@ static bool ActivateBestEligibleChain()
         if (item.second->pprev != NULL)
             setReferenced.insert(*item.second->pprev->phashBlock);
 
-    const int nFinalHeight = g_finalityTracker.GetFinalizedHeight();
     CBlockIndex* pindexCandidate = NULL;
     for (const PAIRTYPE(const uint256, CBlockIndex*)& item : mapBlockIndex)
     {
@@ -9713,22 +8339,6 @@ static bool ActivateBestEligibleChain()
         CBlock block;
         if (!block.ReadFromDisk(pindex))
             continue; // incomplete / header-only index entry
-        if (nFinalHeight > 0 && pindexBest->nHeight >= FORK_HEIGHT_FINALITY)
-        {
-            CBlockIndex* pFork = pindex;
-            CBlockIndex* pOther = pindexBest;
-            while (pFork != pOther)
-            {
-                while (pFork != NULL && pFork->nHeight > pOther->nHeight)
-                    pFork = pFork->pprev;
-                if (pFork == pOther)
-                    break;
-                if (pOther != NULL)
-                    pOther = pOther->pprev;
-            }
-            if (pFork == NULL || pFork->nHeight < nFinalHeight)
-                continue; // would be rejected by SetBestChain anyway
-        }
         if (pindexCandidate == NULL ||
             pindex->nChainTrust > pindexCandidate->nChainTrust)
             pindexCandidate = pindex;
@@ -9773,22 +8383,6 @@ bool InvalidateBlock(const uint256& hash, std::string& strError)
         return true; // idempotent: already explicitly invalidated
 
     const bool fOnBest = IsAncestorOfBest(pindex);
-
-    // Prevalidate finality before any persistent mutation so the operator gets
-    // a deterministic error and the chain state is untouched.
-    if (fOnBest)
-    {
-        CBlockIndex* pTarget = pindex->pprev;
-        const int nFinalHeight = g_finalityTracker.GetFinalizedHeight();
-        if (nFinalHeight > 0 && pTarget != NULL && pTarget->nHeight < nFinalHeight)
-        {
-            strError = strprintf(
-                "Cannot invalidate block at height %d: its parent height %d is "
-                "below the finalized height %d",
-                pindex->nHeight, pTarget->nHeight, nFinalHeight);
-            return false;
-        }
-    }
 
     // Persist FIRST. A crash here leaves the set written and the best chain
     // un-rolled-back; startup healing completes the rollback.
@@ -10341,41 +8935,6 @@ bool CBlock::CheckBlockSignature() const
 {
     if (IsProofOfWork())
         return vchBlockSig.empty();
-
-    // NullStake V1/V2: verify block signature against rk from the first shielded spend
-    if (vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE || vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE_V2)
-    {
-        if (vchBlockSig.empty())
-            return false;
-
-        if (vtx[1].vShieldedSpend.empty() || vtx[1].vShieldedSpend[0].vchRk.empty())
-            return false;
-
-        if (vtx[1].vShieldedSpend[0].vchRk.size() != 33 && vtx[1].vShieldedSpend[0].vchRk.size() != 65)
-            return false;
-
-        CPubKey rkPubKey(vtx[1].vShieldedSpend[0].vchRk);
-        if (!rkPubKey.IsValid() || !rkPubKey.IsFullyValid())
-            return false;
-
-        return rkPubKey.Verify(GetHash(), vchBlockSig);
-    }
-
-    // NullStake V3 (Private Cold Staking): verify block signature against pk_stake
-    if (vtx[1].nVersion == SHIELDED_TX_VERSION_NULLSTAKE_COLD)
-    {
-        if (vchBlockSig.empty())
-            return false;
-
-        if (vtx[1].nullstakeProofV3.vchPkStake.size() != 33)
-            return false;
-
-        CPubKey pkStake(vtx[1].nullstakeProofV3.vchPkStake);
-        if (!pkStake.IsValid() || !pkStake.IsFullyValid())
-            return false;
-
-        return pkStake.Verify(GetHash(), vchBlockSig);
-    }
 
     vector<valtype> vSolutions;
     txnouttype whichType;
@@ -13861,8 +12420,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     {
         //ProcessMessageCollateralN(pfrom, strCommand, vRecv);
         ProcessMessageCollateralnode(pfrom, strCommand, vRecv);
-        ProcessMessageNullSend(pfrom, strCommand, vRecv);
-        ProcessMessageFinality(pfrom, strCommand, vRecv);
 
         // Ignore unknown commands for extensibility
     }

@@ -30,17 +30,13 @@ public slots:
 
 private slots:
     void onStakingModeChanged(int index);
-    void onShieldCoinsClicked();
     void onDelegateClicked();
     void onRevokeDelegation();
     void onRefreshDelegations();
-    void onNullColdDelegateClicked();
 
 private:
     void setupTransparentPanel();
-    void setupNullStakePanel();
     void setupColdStakingPanel();
-    void setupNullStakeColdPanel();
     void updateModeDescription(int mode);
 
     WalletModel *model;
@@ -56,12 +52,6 @@ private:
     QLabel *labelTransparentUTXOs;
     QLabel *labelTransparentWeight;
 
-    QWidget *nullstakePanel;
-    QLabel *labelShieldedBalance;
-    QLabel *labelShieldedStatus;
-    QLineEdit *editShieldAmount;
-    QPushButton *btnShieldCoins;
-
     QWidget *coldStakingPanel;
     QLabel *labelColdStakingInfo;
     QLabel *labelColdBalance;
@@ -71,11 +61,6 @@ private:
     QPushButton *btnDelegate;
     QPushButton *btnRefreshDelegations;
     QTableWidget *tableDelegations;
-
-    QWidget *nullstakeColdPanel;
-    QLineEdit *editNullColdStakerAddr;
-    QLineEdit *editNullColdAmount;
-    QPushButton *btnNullColdDelegate;
 
     QTimer *updateTimer;
 };
