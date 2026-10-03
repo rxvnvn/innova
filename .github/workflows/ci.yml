@@ -48,10 +48,10 @@ jobs:
           cd src
           make USE_NATIVETOR=- -f makefile.unix -j$(nproc)
 
-      - name: BPAC, NullStake, and tally crypto Boost tests
+      - name: IBD / ping / CN-payment-guard Boost tests
         run: |
           cd src
-          make USE_NATIVETOR=- -f makefile.unix check-bpac check-finality-tally
+          make USE_NATIVETOR=- -f makefile.unix check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle check-cnpayment-guard
 
       - name: Build Qt wallet
         run: |

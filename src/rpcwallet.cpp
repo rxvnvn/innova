@@ -3028,7 +3028,7 @@ Value clearwallettransactions(const Array& params, bool fHelp)
 
     snprintf(cbuf, sizeof(cbuf), "Removed %u transactions.", nTransactions);
     result.push_back(Pair("complete", std::string(cbuf)));
-    result.push_back(Pair("", "Reload with scanforstealthtxns or re-download blockchain."));
+    result.push_back(Pair("", "Reload the wallet or re-download the blockchain."));
 
 
     return result;

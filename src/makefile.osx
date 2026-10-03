@@ -139,7 +139,6 @@ OBJS= \
     obj/main.o \
     obj/net.o \
     obj/ibdefficiency.o \
-    obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \
     obj/rpcdump.o \
@@ -149,24 +148,9 @@ OBJS= \
     obj/rpcblockchain.o \
     obj/rpcblockindexshadow.o \
     obj/rpcrawtransaction.o \
-    obj/rpcsmessage.o \
-    obj/rpcnyx.o \
-    obj/rpcshielded.o \
-    obj/nullsend.o \
-    obj/shieldedcoinjoin.o \
-    obj/shielded.o \
-    obj/zkproof.o \
-    obj/lelantus.o \
-    obj/curvetree.o \
-    obj/ipa.o \
-    obj/ed25519_zk.o \
-    obj/nullstake.o \
     obj/poseidon2.o \
-    obj/bulletproof_ac.o \
     obj/silentpayments.o \
     obj/dandelion.o \
-    obj/finality.o \
-    obj/dag.o \
     obj/script.o \
     obj/sync.o \
     obj/util.o \
@@ -176,20 +160,16 @@ OBJS= \
     obj/kernel.o \
     obj/pbkdf2.o \
     obj/scrypt.o \
-    obj/smessage.o \
     obj/stealth.o \
     obj/activecollateralnode.o \
     obj/collateralnodeconfig.o \
     obj/collateralnode.o \
     obj/rpccollateral.o \
-    obj/spork.o \
     obj/collateral.o \
     obj/eccryptoverify.o \
     obj/ringsig.o \
     obj/bloom.o \
     obj/state.o \
-    obj/idns.o \
-    obj/namecoin.o \
     obj/utiltime.o \
     obj/stun.o \
     obj/bootstrap.o \
@@ -213,10 +193,7 @@ endif
 TEST_OBJS= \
     obj/test/test_innova.o \
     obj/test/p2p_sync_tests.o \
-    obj/test/bulletproof_ac_tests.o \
-    obj/test/finality_tally_tests.o \
     obj/test/coincontrol_lock_tests.o \
-    obj/test/fcmp_root_tests.o \
     obj/test/blockindex_accessor_tests.o \
     obj/test/fixed_blockindex_store_tests.o \
     obj/test/blockindex_hashindex_tests.o \
@@ -226,7 +203,7 @@ TEST_OBJS= \
     obj/test/blockindex_shadow_startup_tests.o \
     obj/test/blockindex_v2_reader_tests.o
 
-.PHONY: all innova-build check-bpac check-finality-tally check-fcmp release-check
+.PHONY: all innova-build release-check
 
 INNOVA_SPINNER ?= 1
 INNOVA_SPINNER_SCRIPT ?= ../contrib/innova_build_spinner.sh
@@ -240,16 +217,7 @@ endif
 
 innova-build: innovad
 
-check-bpac: test_innova
-	./test_innova --run_test=bulletproof_ac_tests
-
-check-finality-tally: test_innova
-	./test_innova --run_test=finality_tally_tests
-
-check-fcmp: test_innova
-	./test_innova --run_test=fcmp_root_tests
-
-release-check: innova-build check-bpac check-finality-tally check-fcmp
+release-check: innova-build
 
 #
 # LevelDB support

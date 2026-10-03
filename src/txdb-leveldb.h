@@ -264,8 +264,6 @@ bool ReadAddrIndex(uint160 addrHash, std::vector<uint256>& txHashes);
     bool EraseBlockIndex(const uint256& blockhash);
     bool ReadHashBestChain(uint256& hashBestChain);
     bool WriteHashBestChain(uint256 hashBestChain);
-    bool ReadHashBestHeaderChain(uint256& hashBestChain);
-    bool WriteHashBestHeaderChain(uint256 hashBestChain);
     bool ReadBestInvalidTrust(CBigNum& bnBestInvalidTrust);
     bool WriteBestInvalidTrust(CBigNum bnBestInvalidTrust);
     bool ReadInvalidBlockSet(std::set<uint256>& setInvalidBlockHash);

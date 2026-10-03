@@ -74,22 +74,13 @@ static const unsigned int ADAPTIVE_MEDIAN_WINDOW = 1000;          // 1000-block 
 static const unsigned int ADAPTIVE_LONG_MEDIAN_WINDOW = 100000;   // 100K-block long-term anchor (~28h at 1s)
 static const unsigned int ADAPTIVE_LONG_MEDIAN_CAP = 50;          // short-term median <= 50x long-term median
 
-// Effective block size: pre-DAG uses legacy, post-DAG uses adaptive
-inline unsigned int GetMaxBlockSize(int nHeight)
-{
-    extern int GetForkHeightDAG();
-    if (nHeight >= GetForkHeightDAG())
-        return ADAPTIVE_BLOCK_CEILING;
-    return MAX_BLOCK_SIZE_LEGACY;
-}
-
 // Pre-fork constants — used for all consensus checks before FORK_HEIGHT_DAG
 static const unsigned int MAX_BLOCK_SIZE = MAX_BLOCK_SIZE_LEGACY;       // 1MB until DAG fork
 static const unsigned int MAX_BLOCK_SIZE_GEN = MAX_BLOCK_SIZE / 2;
 static const unsigned int MAX_STANDARD_TX_SIZE = MAX_BLOCK_SIZE_GEN / 5;
 static const unsigned int MAX_BLOCK_SIGOPS = MAX_BLOCK_SIZE / 50;
 
-// Post-fork limits (used via GetMaxBlockSize(nHeight) after DAG activation)
+// Post-fork limits (used after DAG activation)
 static const unsigned int MAX_BLOCK_SIGOPS_ADAPTIVE = ADAPTIVE_BLOCK_CEILING / 50;
 /** The maximum number of sigops we're willing to relay/mine in a single tx */
 static const unsigned int MAX_TX_SIGOPS = MAX_BLOCK_SIGOPS/5;
@@ -223,17 +214,6 @@ inline int GetForkHeightDAG()
 // supported Innova profile is linear/V2. FORK_HEIGHT_DAG remains only as a
 // harmless height constant reported by GetForkHeightDAG().
 
-// IDAG Phase 4: DAGKNIGHT adaptive ordering (replaces GHOSTDAG)
-inline int GetForkHeightDAGKnight()
-{
-    extern bool fRegTest;
-    extern bool fTestNet;
-    if (fRegTest) return 13;
-    if (fTestNet) return 13;        // clean public IDAG testnet
-    return MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;                  // mainnet maintenance build: keep experimental v5 fork gates inert
-}
-#define FORK_HEIGHT_DAGKNIGHT (GetForkHeightDAGKnight())
-
 // IDAG: Fork-gated block time — 15s pre-DAG, 1s post-DAG
 inline unsigned int GetTargetSpacingForHeight(int nHeight)
 {
@@ -243,17 +223,6 @@ inline unsigned int GetTargetSpacingForHeight(int nHeight)
     if (nHeight >= FORK_HEIGHT_DAG) return 1; // 1-second blocks post-DAG
     return nTargetSpacing; // 15 seconds pre-DAG
 }
-
-// Hard fork height for IDNS name reset
-// names before this height treated as expired; 0 = no reset
-inline int GetForkHeightIDNSReset() {
-    extern bool fRegTest;
-    extern bool fTestNet;
-    if (fRegTest) return 0;     // No reset in regtest (clean chain)
-    if (fTestNet) return 0;     // No reset in testnet (clean chain)
-    return 8000000;             // Mainnet: wipe all names before this height
-}
-#define FORK_HEIGHT_IDNS_RESET (GetForkHeightIDNSReset())
 
 inline int64_t PastDrift(int64_t nTime, int nHeight) {
     if (nHeight >= FORK_HEIGHT_TIGHTER_DRIFT)

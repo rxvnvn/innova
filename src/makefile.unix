@@ -588,7 +588,7 @@ TEST_OBJS= \
     obj/test/blockindex_authoritative_startup_tests.o \
     obj/test/staking_production_integration_tests.o
 
-.PHONY: all innova-build check-bpac check-finality-tally check-fcmp check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle check-cnpayment-guard release-check innova-blockindex-builder
+.PHONY: all innova-build check-ibdforensic check-ibdblocklatency check-ibdheaderscheduler check-pinglifecycle check-cnpayment-guard release-check innova-blockindex-builder
 
 INNOVA_SPINNER ?= 1
 INNOVA_SPINNER_SCRIPT ?= ../contrib/innova_build_spinner.sh
@@ -602,15 +602,6 @@ endif
 
 innova-build: innovad
 
-check-bpac: test_innova
-	./test_innova --run_test=bulletproof_ac_tests
-
-check-finality-tally: test_innova
-	./test_innova --run_test=finality_tally_tests
-
-check-fcmp: test_innova
-	./test_innova --run_test=fcmp_root_tests
-
 check-ibdforensic: test_innova
 	./test_innova --run_test=ibdforensic_tests
 
@@ -623,7 +614,7 @@ check-ibdheaderscheduler: test_innova
 check-pinglifecycle: test_innova
 	./test_innova --run_test=pinglifecycle_tests
 
-release-check: innova-build check-bpac check-finality-tally check-fcmp
+release-check: innova-build
 
 #
 # LevelDB support

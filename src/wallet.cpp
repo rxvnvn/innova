@@ -7959,7 +7959,6 @@ bool CWallet::ExpandLockedAnonOutput(CWalletDB *pwdb, CKeyID &ckeyId, CLockedAno
 
     COwnedAnonOutput oao(lao.outpoint, fSpentAOut);
     if (!pwdb->WriteOwnedAnonOutput(pkImage, oao)
-      ||!pwdb->WriteOldOutputLink(pkOldImage, pkImage)
       ||!pwdb->WriteOwnedAnonOutputLink(pkCoin, pkImage))
     {
         return error("%s: WriteOwnedAnonOutput() failed.", __func__);

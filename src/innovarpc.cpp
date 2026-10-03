@@ -1693,13 +1693,10 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "createmultisig"         && n > 1) ConvertTo<Array>(params[1]);
 
     if (strMethod == "scanforalltxns"         && n > 0) ConvertTo<int64_t>(params[0]);
-    if (strMethod == "scanforstealthtxns"     && n > 0) ConvertTo<int64_t>(params[0]);
 
     if (strMethod == "setbestblockbyheight"   && n > 0) ConvertTo<int64_t>(params[0]);
 
     // IDAG DAG Commands
-
-    //Innova Name Commands
 
     return params;
 }

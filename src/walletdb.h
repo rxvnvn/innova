@@ -272,23 +272,6 @@ public:
         return Erase(std::make_pair(std::string("oal"), pkCoin));
     }
 
-    bool ReadOldOutputLink(const std::vector<uint8_t>& pkImage, std::vector<uint8_t>& vchImage)
-    {
-        return Read(std::make_pair(std::string("ool"), pkImage), vchImage);
-    }
-
-    bool WriteOldOutputLink(const std::vector<uint8_t>& pkImage, const std::vector<uint8_t>& vchImage)
-    {
-        nWalletDBUpdated++;
-        return Write(std::make_pair(std::string("ool"), pkImage), vchImage, true);
-    }
-
-    bool EraseOldOutputLink(const std::vector<uint8_t>& pkImage)
-    {
-        nWalletDBUpdated++;
-        return Erase(std::make_pair(std::string("ool"), pkImage));
-    }
-
     bool WriteStealthKeyMeta(const CKeyID& keyId, const CStealthKeyMetadata& sxKeyMeta)
     {
         nWalletDBUpdated++;

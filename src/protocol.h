@@ -17,8 +17,6 @@
 #include "state.h"
 
 
-#define IDNS_PORT 6565
-
 extern bool fTestNet;
 extern bool fRegTest;
 static inline unsigned short GetDefaultPort()
