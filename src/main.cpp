@@ -28,7 +28,6 @@
 #include "collateral.h"
 #include "collateralnode.h"
 #include "nullsend.h"
-#include "namecoin.h"
 #include "dandelion.h"
 #include "lelantus.h"
 #include "curvetree.h"
@@ -2775,8 +2774,6 @@ extern enum Checkpoints::CPMode CheckpointsMode;
 
 std::set<uint256> setValidatedTx;
 
-CHooks* hooks; // This adds Innova Name DB hooks which allow splicing of code inside standard Innova functions.
-
 //////////////////////////////////////////////////////////////////////////////
 //
 // dispatching functions
@@ -3150,7 +3147,7 @@ bool CTransaction::ReadFromDisk(COutPoint prevout)
 
 bool IsStandardTx(const CTransaction& tx, string& reason)
 {
-    if (tx.nVersion > CTransaction::CURRENT_VERSION && tx.nVersion != ANON_TXN_VERSION && tx.nVersion != NAMECOIN_TX_VERSION && !tx.IsShielded()) { //WIP
+    if (tx.nVersion > CTransaction::CURRENT_VERSION && tx.nVersion != ANON_TXN_VERSION && !tx.IsShielded()) { //WIP
         reason = "version";
         return false;
     }
@@ -3770,7 +3767,6 @@ bool CTransaction::CheckTransaction() const
 			}
 	}
 	*/
-    //return hooks->CheckTransaction(*this);
     return true;
 }
 
@@ -3838,11 +3834,9 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
     if (tx.IsCoinStake())
         return tx.DoS(100, error("CTxMemPool::accept() : coinstake as individual tx"));
 
-    //bool isNameTx = hooks->IsNameFeeEnough(txdb, tx); //accept name tx with correct fee.
-    bool isNameTx = tx.nVersion == NAMECOIN_TX_VERSION;
     // Rather not work on nonstandard transactions (unless -testnet)
     string reason;
-    if (!fTestNet && !IsStandardTx(tx, reason) && !isNameTx) //!IsStandardTx(tx, reason)
+    if (!fTestNet && !IsStandardTx(tx, reason))
         return error("CTxMemPool::accept() : nonstandard transaction type");
 
     // Do we already have it?
@@ -3907,7 +3901,7 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
             return false;
         }
             // Check for non-standard pay-to-script-hash in inputs
-            if (!AreInputsStandard(tx, mapInputs) && !fTestNet && !isNameTx)
+            if (!AreInputsStandard(tx, mapInputs) && !fTestNet)
                 return error("CTxMemPool::accept() : nonstandard transaction input");
 
             nFees = tx.GetValueIn(mapInputs) - tx.GetValueOut();
@@ -4168,7 +4162,7 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
 
             int64_t txMinFee = tx.GetMinFee(1000, feeMode, nSize);
 
-            if (nFees < txMinFee && !isNameTx)
+            if (nFees < txMinFee)
             {
                 return error("CTxMemPool::accept() : not enough fees %s, %" PRId64" < %" PRId64,
                              hash.ToString().c_str(),
@@ -4232,8 +4226,6 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
                 }
             }
 
-            //Add the TX to our Pending Names in Name DB
-            hooks->AddToPendingNames(tx);
         }
 
         ///// are we sure this is ok when loading transactions or restoring block txes
@@ -5835,7 +5827,6 @@ void Misbehaving(NodeId pnode, int howmuch)
 
 bool CTransaction::DisconnectInputs(CTxDB& txdb)
 {
-    //hooks->DisconnectInputs(*this); //Disconnect Name DB Inputs
 
     // Relinquish previous transactions' spent pointers
     if (!IsCoinBase())
@@ -6321,12 +6312,6 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
             // vTxPrev.push_back(txPrev);
             // vTxindex.push_back(txindex);
         }
-        //vector<nameTempProxy>& vName
-        //If it can't connect inputs return false to the Name DB
-        // if (!hooks->ConnectInputs(txdb, mapTestPool, *this, posThisTx, pindexBlock, fBlock, fMiner, flags, vName)) {
-        //     return false;
-        // }
-
         if (nVersion == ANON_TXN_VERSION)
         {
             if (pindexBlock && pindexBlock->nHeight >= FORK_HEIGHT_RINGSIG_DEPRECATION)
@@ -6566,7 +6551,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
     return true;
 }
 
-bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fWriteNames)
+bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 {
     // Disconnect in reverse order. HREG reverse-state replay must happen
     // immediately after each tx's inputs are disconnected, while earlier same-
@@ -6676,10 +6661,6 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fWriteNames)
         if (!txdb.WriteBlockIndex(blockindexPrev))
             return error("DisconnectBlock() : WriteBlockIndex failed");
     }
-
-    // innova: undo name transactions in reverse order
-    for (int i = vtx.size() - 1; i >= 0; i--)
-        hooks->DisconnectInputs(vtx[i]);
 
     // ppcoin: clean up wallet after disconnecting coinstake
     for (CTransaction& tx : vtx)
@@ -6983,7 +6964,7 @@ void ResetCNValidationCountersForTesting()
     nCNLastGuardHeight.store(0, std::memory_order_relaxed);
 }
 
-bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, bool fWriteNames)
+bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 {
     ibdactivepath::ActivePathTimer ibdConnectTimer(
         ibdactivepath::GetCounters().connectblock_us_total,
@@ -8189,16 +8170,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
 
     // innova: collect valid name tx
     // NOTE: tx.UpdateCoins should not affect this loop, probably...
-    // vector<nameTempProxy> vName;
-    // for (unsigned int i=0; i<vtx.size(); i++)
-    // {
-    //     if (fDebug) printf("ConnectBlock() for Name Index\n");
-    //     const CTransaction &tx = vtx[i];
-    //     //if (!tx.IsCoinBase()) //|| !tx.IsCoinStake()
-    //     //hooks->CheckInputs(tx, pindex, vName, vPos[i].second, vFees[i]); // collect valid name tx to vName
-    //     // hooks->CheckInputs(txdb, mapTestPool, tx, vPos[i].second, pindexBlock)
-    // }
-
     if (!txdb.WriteBlockIndex(CDiskBlockIndex(pindex)))
         return error("Connect() : WriteBlockIndex for pindex failed");
 
@@ -8277,12 +8248,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck, boo
         blockindexPrev.hashNext = pindex->GetBlockHash();
         if (!txdb.WriteBlockIndex(blockindexPrev))
             return error("ConnectBlock() : WriteBlockIndex failed");
-    }
-
-    // Check Name Release Height to Connect Blocks
-    if (pindex->nHeight >= RELEASE_HEIGHT) {
-        // add names to innovanamesindex.dat
-        hooks->ConnectBlock(txdb, pindex);
     }
 
     if (fHRegActive)

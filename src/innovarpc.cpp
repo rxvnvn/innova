@@ -450,18 +450,6 @@ static const CRPCCommand vRPCCommands[] =
     { "proofofdata",          &proofofdata,              false,  true  },
 
     // Innova Name Commands
-    { "name_new",               &name_new,               false,  true },
-    { "name_update",            &name_update,            false,  true },
-    { "name_delete",            &name_delete,            false,  true },
-    { "sendtoname",             &sendtoname,             false,  true },
-    { "name_list",              &name_list,              false,  false },
-    { "name_scan",              &name_scan,              false,  false },
-    { "name_mempool",           &name_mempool,           false,  false },
-    { "name_history",           &name_history,           false,  false },
-    { "name_filter",            &name_filter,            false,  false },
-    { "name_show",              &name_show,              false,  false },
-    { "name_debug",             &name_debug,             false,  false },
-    { "name_count",             &name_count,             false,  false },
 
     /* Shielded Transaction Commands */
     { "z_getnewaddress",        &z_getnewaddress,        false,  true },
@@ -1664,7 +1652,6 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "delegatestake"          && n > 1) ConvertTo<double>(params[1]);
     if (strMethod == "listcoldutxos"          && n > 0) ConvertTo<bool>(params[0]);
     if (strMethod == "sendtoaddress"          && n > 1) ConvertTo<double>(params[1]);
-    if (strMethod == "sendtoname"             && n > 1) ConvertTo<double>(params[1]);
     if (strMethod == "burn"                   && n > 0) ConvertTo<double>(params[0]);
     if (strMethod == "settxfee"               && n > 0) ConvertTo<double>(params[0]);
     if (strMethod == "getreceivedbyaddress"   && n > 1) ConvertTo<int64_t>(params[1]);
@@ -1770,14 +1757,6 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "getepochinfo"           && n > 0) ConvertTo<int64_t>(params[0]);
 
     //Innova Name Commands
-    if (strMethod == "name_new"               && n > 2) ConvertTo<boost::int64_t>(params[2]);
-    if (strMethod == "name_new"               && n > 4) ConvertTo<boost::int64_t>(params[4]);
-    if (strMethod == "name_update"            && n > 2) ConvertTo<boost::int64_t>(params[2]);
-    if (strMethod == "name_update"            && n > 4) ConvertTo<boost::int64_t>(params[4]);
-    if (strMethod == "name_filter"            && n > 1) ConvertTo<boost::int64_t>(params[1]);
-    if (strMethod == "name_filter"            && n > 2) ConvertTo<boost::int64_t>(params[2]);
-    if (strMethod == "name_filter"            && n > 3) ConvertTo<boost::int64_t>(params[3]);
-    if (strMethod == "sendtoname"             && n > 1) ConvertTo<double>(params[1]);
 
     return params;
 }

@@ -1231,9 +1231,6 @@ Value getreceivedbyaccount(const Array& params, bool fHelp)
             if (ExtractDestination(txout.scriptPubKey, address) && IsMine(*pwalletMain, address) && setAddress.count(address))
                 if (wtx.GetDepthInMainChain() >= nMinDepth)
                 {
-                    // ignore namecoin TxOut
-                    if (hooks->IsNameTx(wtx.nVersion) && hooks->IsNameScript(txout.scriptPubKey))
-                        continue; //note: this will never execute, because ExtractDestination will not exctract nameTx address. Maybe fix this?
                     nAmount += txout.nValue;
                 }
         }
@@ -1839,9 +1836,6 @@ Value deletetransaction(const Array& params, bool fHelp)
 
     ret = pwalletMain->EraseFromWallet(wtx.GetHash());
     result.push_back(Pair("erasing tx from wallet.dat", ret));
-
-    ret = hooks->deletePendingName(wtx);
-    result.push_back(Pair("removing name tx (if this is name tx) from pending name operations", ret));
 
     int nMismatchSpent;
     int64_t nBalanceInQuestion;

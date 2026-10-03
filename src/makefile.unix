@@ -398,8 +398,6 @@ OBJS= \
     obj/ringsig.o \
     obj/bloom.o \
     obj/state.o \
-	obj/idns.o \
-	obj/namecoin.o \
 	obj/utiltime.o \
     obj/stun.o \
     obj/bootstrap.o \
@@ -513,8 +511,6 @@ OBJS= \
     obj/ringsig.o \
     obj/bloom.o \
     obj/state.o \
-	obj/idns.o \
-	obj/namecoin.o \
 	obj/utiltime.o \
     obj/stun.o \
     obj/bootstrap.o \

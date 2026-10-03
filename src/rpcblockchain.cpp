@@ -1949,16 +1949,13 @@ Value getcollateraloutpointdiagnostics(const Array& params, bool fHelp)
         (realMNRejection.empty() ? "output amount is not the collateralnode collateral amount" : realMNRejection);
 
     bool acWholeTxOk = txIsFinal && maturityReal == 0 && depthReal >= 0;
-    bool acNameOut = tx.nVersion == NAME_TX_VERSION &&
-                     hooks->IsNameScript(txout.scriptPubKey);
-    bool inAvailableRealAC = acWholeTxOk && !acNameOut && mine != MINE_NO &&
+    bool inAvailableRealAC = acWholeTxOk && mine != MINE_NO &&
                              !spent && !locked && txout.nValue >= nMinimumInputValue;
     string realACRejection;
     if (!inAvailableRealAC) {
         if (!txIsFinal) realACRejection = "transaction is not final";
         else if (maturityReal > 0) realACRejection = "transaction is immature";
         else if (depthReal < 0) realACRejection = "transaction conflicts with the main chain";
-        else if (acNameOut) realACRejection = "output is an Innova Name output";
         else if (mine == MINE_NO) realACRejection = "output is not owned by this wallet";
         else if (spent) realACRejection = "output is spent";
         else if (locked) realACRejection = "output is locked";

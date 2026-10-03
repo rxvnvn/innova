@@ -38,7 +38,6 @@
 #include "miner.h"
 #include "wallet.h"
 #include "zkproof.h"
-#include "hooks.h"
 #include "epoch_state.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_authoritative_live.h"
@@ -272,8 +271,6 @@ static void S4RawDel(const std::string& key);
 BOOST_AUTO_TEST_CASE(e2e_genuine_accept_advance)
 {
     BOOST_REQUIRE(CZKContext::Initialize());
-    if (hooks == NULL)
-        hooks = InitHook(); // needed by ConnectBlock (same as invalidate_reconsider)
     BOOST_REQUIRE(pindexBest != NULL);
     const int hStart = pindexBest->nHeight;
     CBlockIndex* p0 = MineReal(pindexBest, 0x101);
@@ -299,8 +296,6 @@ BOOST_AUTO_TEST_CASE(e2e_genuine_accept_advance)
 BOOST_AUTO_TEST_CASE(e2e_side_branch_reorg)
 {
     BOOST_REQUIRE(CZKContext::Initialize());
-    if (hooks == NULL)
-        hooks = InitHook();
     BOOST_REQUIRE(pindexBest != NULL);
     // Main branch A: extend the CURRENT best chain (b1..b4 fork off this ancestor).
     CBlockIndex* pFork = pindexBest;
@@ -392,8 +387,7 @@ BOOST_AUTO_TEST_CASE(e2e_side_branch_reorg)
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(f2_parent_score_resolver_parity_and_contract)
 {
-    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
-
+    BOOST_REQUIRE(CZKContext::Initialize());
     CBlockIndex* tip = pindexBest;
     BOOST_REQUIRE(tip);
     while (tip->nHeight < GetForkHeightDAG()-1) tip = MineReal(tip, 0x8300 + tip->nHeight);
@@ -513,8 +507,7 @@ static void F2BuildAuthoritativeGenerationAndInit(const fs::path& root, std::str
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(f2_pre_dag_side_branch_hash_ancestry_parity)
 {
-    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
-    BOOST_REQUIRE(pindexBest != NULL);
+    BOOST_REQUIRE(CZKContext::Initialize());    BOOST_REQUIRE(pindexBest != NULL);
 
     // 1. Build the active pre-DAG chain up to the LAST pre-DAG height.
     const int hPreDag = GetForkHeightDAG() - 1;
@@ -673,8 +666,7 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_side_branch_hash_ancestry_parity)
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(f2_pre_dag_nonresident_side_branch_by_value)
 {
-    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
-    BOOST_REQUIRE(pindexBest != NULL);
+    BOOST_REQUIRE(CZKContext::Initialize());    BOOST_REQUIRE(pindexBest != NULL);
 
     const int hPreDag = GetForkHeightDAG() - 1;
     CBlockIndex* a10 = pindexBest;
@@ -820,8 +812,7 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_nonresident_side_branch_by_value)
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(f2_pre_dag_hot_parent_matches_cold_parent)
 {
-    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
-    BOOST_REQUIRE(pindexBest != NULL);
+    BOOST_REQUIRE(CZKContext::Initialize());    BOOST_REQUIRE(pindexBest != NULL);
 
     // 1. Active pre-DAG chain to the last pre-DAG height; a8 (h8) is the COLD
     //    ancestor this fixture snapshots into the immutable generation.
@@ -1238,8 +1229,7 @@ BOOST_AUTO_TEST_CASE(r4_main_cpp_trust_comparison_consumer_gate)
 BOOST_AUTO_TEST_CASE(r4_authority_ready_published_by_real_authoritative_startup)
 {
     SetMockTime(1700001900);
-    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
-    CBlockIndex* fork=pindexBest;
+    BOOST_REQUIRE(CZKContext::Initialize());    CBlockIndex* fork=pindexBest;
     while(fork->nHeight<GetForkHeightDAG()-1) fork=MineReal(fork,0xE400+fork->nHeight);
     const fs::path root=fs::temp_directory_path()/fs::unique_path("r4ready-%%%%-%%%%");
     fs::create_directories(root/"snapshot");
@@ -1311,8 +1301,7 @@ static bool F2DeleteBlockIndexRecordFromSnapshot(const std::string& snapshotDir,
 
 BOOST_AUTO_TEST_CASE(f2_pre_dag_provider_failure_matrix)
 {
-    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks = InitHook();
-    BOOST_REQUIRE(pindexBest != NULL);
+    BOOST_REQUIRE(CZKContext::Initialize());    BOOST_REQUIRE(pindexBest != NULL);
 
     const int hPreDag = GetForkHeightDAG() - 1;
     CBlockIndex* a10 = pindexBest;
@@ -1989,8 +1978,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
     // score-authority health. The barrier is rebased onto the CURRENT consensus
     // authority (V2 durable index + immutable authority + linear trust projection).
     SetMockTime(1700001950);
-    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
-    CBlockIndex* fork=pindexBest;
+    BOOST_REQUIRE(CZKContext::Initialize());    CBlockIndex* fork=pindexBest;
     while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xE500+fork->nHeight);
     fork=MineRealDag(fork,0xE510);
     const fs::path root=fs::temp_directory_path()/fs::unique_path("p1retired-%%%%-%%%%");
@@ -2078,8 +2066,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
     // PoW block with no DAG parent commitment.
     // ========================================================================
     SetMockTime(1700002300);
-    BOOST_REQUIRE(CZKContext::Initialize()); if (!hooks) hooks=InitHook();
-    // Fixture chain is built first in the harness default profile (as every other
+    BOOST_REQUIRE(CZKContext::Initialize());    // Fixture chain is built first in the harness default profile (as every other
     // fixture does), then the RETIRED profile is engaged for the whole scenario.
     CBlockIndex* fork = pindexBest;
     while (fork->nHeight < GetForkHeightDAG()) fork = MineReal(fork, 0xD100 + fork->nHeight);

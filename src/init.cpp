@@ -39,7 +39,6 @@
 #include "innova_spinner_frames.h"
 #include "ringsig.h"
 #include "nullsend.h"
-#include "idns.h"
 #include "bootstrap.h"
 #include "zkproof.h"
 #include "dandelion.h"
@@ -81,7 +80,6 @@ using namespace std;
 namespace fs = boost::filesystem;
 
 CWallet* pwalletMain = NULL;
-IDns* idns = NULL;
 CClientUIInterface uiInterface;
 bool fConfChange;
 bool fEnforceCanonical;
@@ -169,9 +167,6 @@ void Shutdown(void* parg)
         ibdforensic::ShutdownAndDump();
         ibdexptrace::EmitSummary(GetTimeMicros());
 
-        if(idns) {
-            delete idns;
-        }
         Finalise();
         /*
 
@@ -1091,7 +1086,6 @@ bool AppInit2()
     if (!lock.try_lock())
         return InitError(strprintf(_("Cannot obtain a lock on data directory %s. Innova is probably already running."), strDataDir.c_str()));
 
-    hooks = InitHook(); //Initialized Innova Name Hooks
     if (GetBoolArg("-shrinkdebugfile", !fDebug))
         ShrinkDebugFile();
     printf("\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n\n");
@@ -1537,61 +1531,6 @@ authoritative_startup_ready:
                v2.compatibility == BLOCK_INDEX_SHADOW_COMPAT_ANCESTOR) &&
               v2.sampleMismatches == 0))
             return InitError(_("Block Index V2 shadow failed structural/compatibility validation (strict mode)"));
-    }
-
-    //Create Innova Name index - this must happen before ReacceptWalletTransactions()
-    uiInterface.InitMessage(_("Loading name index..."));
-    printf("Loading Innova name index...\n");
-    nStart2 = GetTimeMillis();
-
-    extern bool createNameIndexFile();
-
-    {
-        fs::path pathNamesDB = GetDataDir() / "innovanamesindex.dat";
-        fs::path pathNamesVer = GetDataDir() / "innovanamesindex.version";
-        int nResetHeight = FORK_HEIGHT_IDNS_RESET;
-        bool fNeedRebuild = false;
-
-        if (fs::exists(pathNamesDB))
-        {
-            if (nResetHeight > 0)
-            {
-                int nStoredReset = 0;
-                FILE* fVer = fopen(pathNamesVer.string().c_str(), "r");
-                if (fVer)
-                {
-                    fscanf(fVer, "%d", &nStoredReset);
-                    fclose(fVer);
-                }
-                if (nStoredReset < nResetHeight)
-                {
-                    printf("IDNS reset: database era %d < reset height %d, rebuilding...\n",
-                           nStoredReset, nResetHeight);
-                    fs::remove(pathNamesDB);
-                    fNeedRebuild = true;
-                }
-            }
-        }
-        else
-        {
-            fNeedRebuild = true;
-        }
-
-        if (fNeedRebuild && !createNameIndexFile())
-        {
-            printf("Fatal error: Failed to create innovanamesindex.dat\n");
-            return false;
-        }
-
-        if (nResetHeight > 0)
-        {
-            FILE* fVer = fopen(pathNamesVer.string().c_str(), "w");
-            if (fVer)
-            {
-                fprintf(fVer, "%d\n", nResetHeight);
-                fclose(fVer);
-            }
-        }
     }
 
     printf("Loaded Name DB %15" PRId64"ms\n", GetTimeMillis() - nStart2);
@@ -2069,29 +2008,6 @@ authoritative_startup_ready:
     if (fServer)
         NewThread(ThreadRPCServer, NULL);
 
-    // Init Innova DNS.
-    if (GetBoolArg("-idns", true))
-    {
-        #define IDNS_PORT 6565
-        int port = GetArg("-idnsport", IDNS_PORT);
-        int verbose = GetArg("-idnsverbose", 1);
-        if (port <= 0)
-            port = IDNS_PORT;
-        string suffix  = GetArg("-idnssuffix", "");
-        string bind_ip = GetArg("-idnsbindip", "");
-        string allowed = GetArg("-idnsallowed", "");
-        string localcf = GetArg("-idnslocalcf", "");
-        try {
-            idns = new IDns(bind_ip.c_str(), port,
-            suffix.c_str(), allowed.c_str(), localcf.c_str(), verbose);
-            printf("Innova DNS Server started on %d!\n", port);
-        } catch (const std::exception& e) {
-            printf("WARNING: IDNS failed to start: %s\n", e.what());
-            printf("         Node will continue without IDNS service.\n");
-            idns = NULL;
-        }
-    }
-
     // Step 11.5: ZK proof context
     if (!CZKContext::Initialize())
     {
@@ -2124,9 +2040,6 @@ authoritative_startup_ready:
 #if !defined(QT_GUI)
     // Loop until process is exit()ed from shutdown() function,
     // called from ThreadRPCServer thread when a "stop" command is received.
-    if(idns) {
-	    idns->Run();
-    }
     while (1)
         //MilliSleep(5000);
         sleep(5);

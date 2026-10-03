@@ -27,7 +27,6 @@
 
 #include "main.h"
 #include "miner.h"
-#include "hooks.h"
 #include "txdb.h"
 #include "wallet.h"
 #include "zkproof.h"
@@ -172,8 +171,6 @@ BOOST_AUTO_TEST_SUITE(invalidate_reconsider_tests)
 BOOST_AUTO_TEST_CASE(inactive_side_chain_invalidation)
 {
     BOOST_REQUIRE(CZKContext::Initialize());
-    if (hooks == NULL)
-        hooks = InitHook();  // needed by ConnectBlock at height >= RELEASE_HEIGHT (0 in regtest)
     {
         // Build the fork.  P2 is the fork parent; A wins by trust (4 blocks), B is
     // a side chain (3 blocks).

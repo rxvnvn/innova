@@ -107,9 +107,7 @@ static const unsigned int MAX_INV_SZ = 50000;
 static const unsigned int INV_RATE_LIMIT_WINDOW = 60;    // Time window in seconds
 static const unsigned int INV_RATE_LIMIT_ITEMS = 2000;   // Max inv items per window (generous for sync)
 static const int64_t MIN_TX_FEE = 1000;
-static const int64_t MIN_NAME_FEE = 90000000; // 0.9 INN Name OP Miner Fee
-static const int64_t NAME_FEE = 10000000; // 0.1 INN Name
-static const CAmount MIN_TXOUT_AMOUNT = NAME_FEE;
+static const CAmount MIN_TXOUT_AMOUNT = 10000000; // 0.1 INN dust threshold
 static const int64_t MIN_TX_FEE_ANON = 10000;
 static const int64_t MIN_RELAY_TX_FEE = MIN_TX_FEE;
 static const int64_t MAX_MONEY = 18000000 * COIN; // 18,000,000 INN Innova Max
@@ -1640,8 +1638,8 @@ public:
     }
 
 
-    bool DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fWriteNames = true);
-    bool ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck=false, bool fWriteNames = true);
+    bool DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex);
+    bool ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck=false);
     bool ReadFromDisk(const CBlockIndex* pindex, bool fReadTransactions=true);
     bool SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew);
     bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const uint256& hashProof);

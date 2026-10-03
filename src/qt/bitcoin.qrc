@@ -60,7 +60,6 @@
         <file alias="block">res/icons/block.png</file>
         <file alias="refresh">res/icons/refresh.png</file>
         <file alias="cn">res/icons/cn.png</file>
-        <file alias="platinumname">res/icons/platinumnames.png</file>
     </qresource>
     <qresource prefix="/images">
         <file alias="about">res/images/about.png</file>

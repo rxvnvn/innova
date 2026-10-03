@@ -1017,14 +1017,5 @@ bool IsPayToColdStaking(const CScript& script);
 bool ExtractColdStakeKeys(const CScript& script, CKeyID& stakerKeyID, CKeyID& ownerKeyID);
 CScript GetScriptForColdStaking(const CKeyID& stakerKeyID, const CKeyID& ownerKeyID);
 
-// namecoin stuff
-// static const unsigned int MAX_NAME_LENGTH = 512;
-// static const unsigned int MAX_VALUE_LENGTH = 20*1024;
-// static const int MAX_RENTAL_DAYS = 366000000;  // in days
-
-// bool checkNameValues(NameTxInfo& ret);
-// bool DecodeNameScript(const CScript& script, NameTxInfo& ret, CScript::const_iterator& pc);
-// bool DecodeNameScript(const CScript& script, NameTxInfo& ret);
-// bool RemoveNameScriptPrefix(const CScript& scriptIn, CScript& scriptOut);
 
 #endif
