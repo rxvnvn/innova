@@ -29,7 +29,6 @@
 #include "ibdexptrace.h"
 #include "sync.h"
 
-class CRequestTracker;
 class CNode;
 class CBlockIndex;
 class CBlockLocator;
@@ -541,28 +540,7 @@ enum
     // Nodes may always request a MSG_FILTERED_BLOCK in a getdata, however,
     // MSG_FILTERED_BLOCK should not appear in any invs except as a part of getdata.
     MSG_FILTERED_BLOCK,
-    MSG_TXLOCK_REQUEST,
-    MSG_TXLOCK_VOTE,
-    MSG_SPORK,
     MSG_COLLATERALNODE_WINNER
-};
-
-class CRequestTracker
-{
-public:
-    void (*fn)(void*, CDataStream&);
-    void* param1;
-
-    explicit CRequestTracker(void (*fnIn)(void*, CDataStream&)=NULL, void* param1In=NULL)
-    {
-        fn = fnIn;
-        param1 = param1In;
-    }
-
-    bool IsNull()
-    {
-        return fn == NULL;
-    }
 };
 
 
@@ -1311,8 +1289,6 @@ protected:
 	std::vector<std::string> vecRequestsFulfilled; //keep track of what client has asked for
 
 public:
-    std::map<uint256, CRequestTracker> mapRequests;
-    CCriticalSection cs_mapRequests;
     // Serving-side getheaders dedup bookkeeping (only used while
     // -headersserveddedup is enabled).  Keyed by a fingerprint of the full
     // (locator, hashStop, active-tip) request; one entry per distinct request
@@ -2880,7 +2856,6 @@ inline void RelayInventory(const CInv& inv)
 class CTransaction;
 void RelayTransaction(const CTransaction& tx, const uint256& hash);
 void RelayTransaction(const CTransaction& tx, const uint256& hash, const CDataStream& ss);
-void RelayTransactionLockReq(const CTransaction& tx, const uint256& hash, bool relayToAll=false);
 void RelayCollaTeralFinalTransaction(const int sessionID, const CTransaction& txNew);
 void RelayCollaTeralIn(const std::vector<CTxIn>& in, const int64_t& nAmount, const CTransaction& txCollateral, const std::vector<CTxOut>& out);
 void RelayCollaTeralStatus(const int sessionID, const int newState, const int newEntriesCount, const int newAccepted, const std::string error="");

@@ -201,7 +201,6 @@ private:
     WalletThread *walletThread;
 
     qint64 cachedNumTransactions;
-    int cachedTxLocks;
     EncryptionStatus cachedEncryptionStatus;
     int cachedNumBlocks;
     bool fForceBalanceCheck;

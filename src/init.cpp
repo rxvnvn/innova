@@ -36,7 +36,6 @@
 #include "blockindex_residency_counters.h"
 #include "activecollateralnode.h"
 #include "collateralnodeconfig.h"
-#include "spork.h"
 #include "innova_spinner_frames.h"
 #include "ringsig.h"
 #include "nullsend.h"
@@ -56,6 +55,7 @@
 #include <boost/filesystem/fstream.hpp>
 #include <boost/interprocess/sync/file_lock.hpp>
 #include <boost/algorithm/string/predicate.hpp>
+#include <boost/lexical_cast.hpp>
 #include <openssl/crypto.h>
 #include <openssl/opensslv.h>
 #include <openssl/rand.h>
@@ -1114,8 +1114,6 @@ bool AppInit2()
     {
         if (!collateralnodePayments.SetPrivKey(GetArg("-collateralnodepaymentskey", "")))
             return InitError(_("Unable to sign collateralnode payment winner, wrong key?"));
-        if (!sporkManager.SetPrivKey(GetArg("-collateralnodepaymentskey", "")))
-            return InitError(_("Unable to sign spork message, wrong key?"));
     }
 
     //ignore collateralnodes below protocol version

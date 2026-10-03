@@ -145,7 +145,7 @@ getinfo
 | `cs_main` | блокирующий outer lock в `CRPCTable::execute`; рекурсивно в wallet helpers | `pindexBest`, `nBestHeight`, block index, depth/trust | Сам RPC chain state не меняет; unlock может пропустить ожидающий поток |
 | `pwalletMain->cs_wallet` | второй outer lock; рекурсивно почти во всех wallet getters | `mapWallet`, balances, keypool, wallet version | credit caches; reserve/return key; возможен `TopUpKeyPool()` |
 | `cs_vNodes` | blocking snapshot connection count в actor; рекурсивный `TRY_LOCK` в IBD; blocking в hybrid-SPV `FetchBlockForStaking` | connection count, peer heights и flags | в full-node ветке нет записи; hybrid-SPV может отправить `getdata` |
-| `cs_mapRequests` (per peer) | **не берётся**; этот mutex защищает callback-map `mapRequests`, а не download queue | нет | к `mapAskFor` не относится |
+| `cs_mapRequests` (per peer) | удалён в Core Minimalization M2D (callback-map `mapRequests` больше не существует); к download queue отношения не имел | нет | к `mapAskFor` не относится |
 | `mapAskFor` | отдельного mutex в этом дереве нет | IBD читает наличие элементов | после исправления query не пишет, но чтение всё ещё конкурирует с message-handler |
 | `cs_mapAlreadyAskedFor` | **не берётся** | нет | нет |
 | `cs_pnodeSync` | **не берётся** | нет | `pnodeSync` не назначается |
@@ -221,8 +221,8 @@ message-handler/отправке запросов, то есть query RPC и GU
 P2P-изменение `getinfo` в normal full-node пути.
 
 IBD по-прежнему читает `mapAskFor` и in-flight поля без отдельного peer-state
-mutex: `cs_mapRequests` защищает другой контейнер (`mapRequests`) и не является
-lock для `mapAskFor`. Это остаточное ограничение наблюдаемости, но не RPC-side
+mutex: `cs_mapRequests`/`mapRequests` удалены в M2D и lock для `mapAskFor`
+не являются. Это остаточное ограничение наблюдаемости, но не RPC-side
 mutation. `initialblockdownload` также может меняться из-за fresh-height/stale-time
 эвристик без смены active chain.
 

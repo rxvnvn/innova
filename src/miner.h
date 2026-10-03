@@ -21,17 +21,11 @@
 CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake=false, int64_t* pFees = 0,
                        CReserveKey* pReserveKey = 0);
 
-/** Modify the extranonce in a block */
-void IncrementExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int& nExtraNonce);
 
 /** Set an explicit coinbase extranonce and rebuild the merkle root. */
 void SetExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int nExtraNonce);
 
-/** Do mining precalculation */
-void FormatHashBuffers(CBlock* pblock, char* pmidstate, char* pdata, char* phash1);
 
-/** Check mined proof-of-work block */
-bool CheckWork(CBlock* pblock, CWallet& wallet, CReserveKey& reservekey);
 
 /** Check mined proof-of-stake block */
 bool CheckStake(CBlock* pblock, CWallet& wallet);

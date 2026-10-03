@@ -316,7 +316,6 @@ static const CRPCCommand vRPCCommands[] =
     { "getnettotals",           &getnettotals,           true,   true },
     { "disconnectnode",         &disconnectnode,         true,   true },
     { "getnetworkinfo",         &getnetworkinfo,         true,   true },
-    { "gethashespersec",        &gethashespersec,        true,   false },
     { "addnode",                &addnode,                true,   true },
     { "setban",                 &setban,                 true,   true },
     { "listbanned",             &listbanned,             true,   true },
@@ -371,8 +370,6 @@ static const CRPCCommand vRPCCommands[] =
 	{ "listaddressgroups",      &listaddressgroups,      false,  false },
     { "signmessage",            &signmessage,            false,  false },
     { "verifymessage",          &verifymessage,          false,  false },
-    { "getwork",                &getwork,                true,   false },
-    { "getworkex",              &getworkex,              true,   false },
     { "listaccounts",           &listaccounts,           false,  false },
     { "settxfee",               &settxfee,               false,  false },
     { "setgenerate",            &setgenerate,            true,   true },
@@ -1219,7 +1216,7 @@ void JSONRequest::parse(const Value& valRequest)
     if (valMethod.type() != str_type)
         throw JSONRPCError(RPC_INVALID_REQUEST, "Method must be a string");
     strMethod = valMethod.get_str();
-    if (strMethod != "getwork" && strMethod != "getblocktemplate")
+    if (strMethod != "getblocktemplate")
         printf("ThreadRPCServer time_us=%lld method=%s\n",
                (long long)GetTimeMicros(), strMethod.c_str());
 

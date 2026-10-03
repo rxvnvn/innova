@@ -114,10 +114,6 @@ defaults to 1. A value of -1 uses the number of logical CPUs, capped at 16;
 0, values below -1, and values above 16 are invalid. If 'generate' is false,
 all workers are stopped and joined. Mining is disabled by default.
 .TP
-\fBgethashespersec\fR
-Returns an estimate of the network proof-of-work hash rate. It is not the local
-CPU miner's hash rate.
-.TP
 \fBgetmininginfo\fR
 Returns mining and chain information, including whether CPU mining workers are
 running and their actual number.
@@ -136,14 +132,6 @@ Returns the total amount received by 'innovaaddress' in transactions with at lea
 .TP
 \fBgettransaction 'txid'\fR
 Returns information about a specific transaction, given hexadecimal transaction ID.
-.TP
-\fBgetwork 'data'\fR
-If 'data' is specified, tries to solve the block and returns true if it was successful. If 'data' is not specified, returns formatted hash 'data' to work on:
-
-    "midstate" : precomputed hash state after hashing the first half of the data.
-    "data"     : block data.
-    "hash1"    : formatted hash buffer for second hash.
-    "target"   : little endian hash target.
 .TP
 \fBhelp 'command'\fR
 List commands, or get help for a command.

@@ -8,7 +8,6 @@
 #include "ui_interface.h"
 #include "wallet.h"
 #include "walletdb.h" // for BackupWallet
-#include "spork.h"
 #include "base58.h"
 #include "stealth_crypter.h"
 #include "shielded.h"

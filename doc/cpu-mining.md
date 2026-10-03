@@ -42,9 +42,6 @@ values below `-1`, and values above 16 are rejected. Supplying the same worker
 count while mining is already active does not create duplicate workers;
 supplying a different count safely restarts the worker pool.
 
-`gethashespersec` estimates the proof-of-work hash rate of the network. It does
-not report the local CPU miner's performance.
-
 ## Resource use and rewards
 
 CPU mining can create sustained high processor load and significant heat.

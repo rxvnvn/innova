@@ -107,7 +107,6 @@ HEADERS += build/build.h \
            src/sph_jh.h \
            src/sph_keccak.h \
            src/sph_types.h \
-           src/spork.h \
            src/state.h \
            src/stealth.h \
            src/strlcpy.h \
@@ -548,7 +547,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/collateral.cpp \
            src/collateralnode.cpp \
            src/collateralnodeconfig.cpp \
-           src/core.cpp \
            src/crypter.cpp \
            src/curvetree.cpp \
            src/dag.cpp \
@@ -600,7 +598,6 @@ SOURCES += qrc_bitcoin.cpp \
            src/shielded.cpp \
            src/shieldedcoinjoin.cpp \
            src/silentpayments.cpp \
-           src/spork.cpp \
            src/state.cpp \
            src/stealth.cpp \
            src/stun.cpp \

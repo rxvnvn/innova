@@ -97,12 +97,6 @@ elif cmd == "getmininginfo":
 	except:
 		print "\n---An error occurred---\n"
 
-elif cmd == "gethashespersec":
-	try:
-		print access.gethashespersec()
-	except:
-		print "\n---An error occurred---\n"
-
 elif cmd == "getinfo":
 	try:
 		print access.getinfo()
@@ -145,16 +139,6 @@ elif cmd == "gettransaction":
 	try:
 		txid = raw_input("Enter a transaction ID: ")
 		print access.gettransaction(txid)
-	except:
-		print "\n---An error occurred---\n"
-
-elif cmd == "getwork":
-	try:
-		data = raw_input("Data (optional): ")
-		try:
-			print access.gettransaction(data)
-		except:
-			print access.gettransaction()
 	except:
 		print "\n---An error occurred---\n"
 

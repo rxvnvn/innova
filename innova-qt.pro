@@ -537,7 +537,6 @@ HEADERS += src/qt/bitcoingui.h \
     src/activecollateralnode.h \
     src/collateralnode.h \
     src/collateralnodeconfig.h \
-    src/spork.h \
     src/shielded.h \
     src/nullsend.h \
     src/shieldedcoinjoin.h \
@@ -654,7 +653,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/key.cpp \
     src/script.cpp \
     src/main.cpp \
-    src/core.cpp \
     src/bloom.cpp \
     src/state.cpp \
     src/ringsig.cpp \
@@ -762,7 +760,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/activecollateralnode.cpp \
     src/collateralnode.cpp \
     src/collateralnodeconfig.cpp \
-    src/spork.cpp \
     src/shielded.cpp \
     src/nullsend.cpp \
     src/shieldedcoinjoin.cpp \

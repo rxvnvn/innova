@@ -8007,13 +8007,9 @@ void ThreadSocketHandler2(void* parg)
                             TRY_LOCK(pnode->cs_vRecvMsg, lockRecv);
                             if (lockRecv)
                             {
-                                TRY_LOCK(pnode->cs_mapRequests, lockReq);
-                                if (lockReq)
-                                {
                                     TRY_LOCK(pnode->cs_inventory, lockInv);
                                     if (lockInv)
                                         fDelete = true;
-                                }
                             }
                         }
                     }
@@ -9930,22 +9926,6 @@ void RelayTransaction(const CTransaction& tx, const uint256& hash, const CDataSt
     }
 
     RelayInventory(inv);
-}
-
-void RelayTransactionLockReq(const CTransaction& tx, const uint256& hash, bool relayToAll)
-{
-    CInv inv(MSG_TXLOCK_REQUEST, tx.GetHash());
-
-    //broadcast the new lock
-    LOCK(cs_vNodes);
-    BOOST_FOREACH(CNode* pnode, vNodes)
-    {
-        if(!relayToAll && !pnode->fRelayTxes)
-            continue;
-
-        pnode->PushMessage("txlreq", tx);
-    }
-
 }
 
 void RelayCollaTeralFinalTransaction(const int sessionID, const CTransaction& txNew)

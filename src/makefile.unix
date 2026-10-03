@@ -340,7 +340,6 @@ OBJS= \
     obj/ibdblocklatency.o \
     obj/ibdforensic.o \
     obj/pinglifecycletrace.o \
-    obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \
     obj/rpcdump.o \
@@ -394,7 +393,6 @@ OBJS= \
     obj/collateralnodeconfig.o \
     obj/collateralnode.o \
     obj/rpccollateral.o \
-    obj/spork.o \
     obj/collateral.o \
     obj/eccryptoverify.o \
     obj/ringsig.o \
@@ -456,7 +454,6 @@ OBJS= \
     obj/ibdblocklatency.o \
     obj/ibdforensic.o \
     obj/pinglifecycletrace.o \
-    obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \
     obj/rpcdump.o \
@@ -511,7 +508,6 @@ OBJS= \
     obj/collateralnode.o \
     obj/hreg_registration.o \
     obj/rpccollateral.o \
-    obj/spork.o \
     obj/collateral.o \
     obj/eccryptoverify.o \
     obj/ringsig.o \
