@@ -122,9 +122,6 @@ QString formatServicesStr(quint64 mask)
             //case NODE_GETUTXO:
             //    strList.append("GETUTXO");
             //    break;
-            case SMSG_RELAY:
-                strList.append("SMSG_RELAY");
-                break;
             default:
                 strList.append(QString("%1[%2]").arg("UNKNOWN").arg(check));
         };

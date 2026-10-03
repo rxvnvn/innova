@@ -14,7 +14,6 @@
 #include "ibdmetrics.h"
 #include "ibdsemantic.h"
 #include "stealth.h"
-#include "smessage.h"
 #include "collateral.h"
 #include "ringsig.h"
 #include "txdb.h"
@@ -4027,6 +4026,19 @@ static bool compareTxnTime(const CWalletTx* pa, const CWalletTx* pb)
 {
     return pa->nTime < pb->nTime;
 };
+
+namespace {
+// Generic local-time formatter. Formerly provided by the retired SMSG/NYX
+// smessage.cpp; rehomed here as the only surviving consumer is txnreport().
+std::string getTimeString(int64_t timestamp, char *buffer, size_t nBuffer)
+{
+    struct tm* dt;
+    time_t t = timestamp;
+    dt = localtime(&t);
+    strftime(buffer, nBuffer, "%Y-%m-%d %H:%M:%S %z", dt);
+    return std::string(buffer);
+}
+}
 
 Value txnreport(const Array& params, bool fHelp)
 {

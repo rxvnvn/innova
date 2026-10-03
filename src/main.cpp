@@ -29,7 +29,6 @@
 #include "collateralnode.h"
 #include "nullsend.h"
 #include "spork.h"
-#include "smessage.h"
 #include "namecoin.h"
 #include "dandelion.h"
 #include "lelantus.h"

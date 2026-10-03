@@ -1077,34 +1077,6 @@ public:
 
 
 
-class SecMsgNode
-{
-public:
-    SecMsgNode()
-    {
-        lastSeen        = 0;
-        lastMatched     = 0;
-        ignoreUntil     = 0;
-        nWakeCounter    = 0;
-        nPeerId         = 0;
-        fEnabled        = false;
-        lastTypingReceived = 0;
-        nTypingViolations  = 0;
-    };
-
-    ~SecMsgNode() {};
-
-    int64_t                     lastSeen;
-    int64_t                     lastMatched;
-    int64_t                     ignoreUntil;
-    uint32_t                    nWakeCounter;
-    uint32_t                    nPeerId;
-    bool                        fEnabled;
-    int64_t                     lastTypingReceived;  // Last typing timestamp (rate limiting)
-    uint32_t                    nTypingViolations;
-
-};
-
 typedef enum BanReason
 {
     BanReasonUnknown          = 0,
@@ -1515,8 +1487,6 @@ public:
     // Per-peer delivery quality used by the timeout-aware IBD ranking.  See
     // the IbdPeerDeliveryQuality / IbdPeerQualityTier documentation above.
     IbdPeerDeliveryQuality ibdQuality;
-
-    SecMsgNode smsgData;
 
     // Ping time measurement:
     // The pong reply we're expecting, or 0 if no pong expected.

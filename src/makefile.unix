@@ -379,8 +379,6 @@ OBJS= \
     obj/blockindex_fold_tool.o \
     obj/blockindex_generation_writer.o \
     obj/blockindex_generation_builder_lm.o \
-    obj/rpcsmessage.o \
-    obj/rpcnyx.o \
     obj/script.o \
     obj/sync.o \
     obj/util.o \
@@ -390,8 +388,8 @@ OBJS= \
     obj/kernel.o \
     obj/pbkdf2.o \
     obj/scrypt.o \
-    obj/smessage.o \
     obj/stealth.o \
+    obj/stealth_crypter.o \
     obj/activecollateralnode.o \
     obj/collateralnodeconfig.o \
     obj/collateralnode.o \
@@ -468,8 +466,6 @@ OBJS= \
     obj/rpcblockchain.o \
     obj/rpcblockindexshadow.o \
     obj/rpcrawtransaction.o \
-    obj/rpcsmessage.o \
-    obj/rpcnyx.o \
     obj/rpcshielded.o \
     obj/nullsend.o \
     obj/shieldedcoinjoin.o \
@@ -508,8 +504,8 @@ OBJS= \
     obj/kernel.o \
     obj/pbkdf2.o \
     obj/scrypt.o \
-    obj/smessage.o \
     obj/stealth.o \
+    obj/stealth_crypter.o \
     obj/activecollateralnode.o \
     obj/collateralnodeconfig.o \
     obj/collateralnode.o \

@@ -39,7 +39,7 @@ ColdHotSeamResult GetStakingSourceDiskPositionR(const CWallet& wallet,
 #include "util.h"
 #include "walletdb.h"
 #include "stealth.h"
-#include "smessage.h"
+#include "stealth_crypter.h"
 #include "hooks.h"
 #include "bloom.h"
 

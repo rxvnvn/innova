@@ -296,7 +296,7 @@ void ProcessMessageCollateralnode(CNode* pfrom, std::string& strCommand, CDataSt
         bool stop;
         vRecv >> vin >> vchSig >> sigTime >> stop;
 
-        if (fDebugCN & fDebugSmsg) printf("iseep - Received: vin: %s sigTime: %lld stop: %s\n", vin.ToString().c_str(), sigTime, stop ? "true" : "false");
+        if (fDebugCN) printf("iseep - Received: vin: %s sigTime: %lld stop: %s\n", vin.ToString().c_str(), sigTime, stop ? "true" : "false");
         // 3-minute future timestamp tolerance
         if (sigTime > pindexBest->GetBlockTime() + PING_SIG_TOLERANCE) {
             if (fDebugCN) printf("iseep - Signature rejected, too far into the future %s, sig %d local %d \n", vin.ToString().c_str(), sigTime, GetAdjustedTime());

@@ -10,7 +10,7 @@
 #include "walletdb.h" // for BackupWallet
 #include "spork.h"
 #include "base58.h"
-#include "smessage.h"
+#include "stealth_crypter.h"
 #include "shielded.h"
 #include "silentpayments.h"
 #include "innovarpc.h"
