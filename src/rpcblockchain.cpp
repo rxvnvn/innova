@@ -171,16 +171,13 @@ static bool ReadAuthoritativeBlockByHash(const uint256& hash,
 static uint256 AuthoritativeBlockTrust(const BlockIndexSnapshot& snapshot,
                                        const CBlock& block)
 {
-    CBigNum target;
-    target.SetCompact(snapshot.nBits);
-    if (target <= 0)
-        return uint256(0);
-    if (snapshot.height >= FORK_HEIGHT_DAG && snapshot.fProofOfStake)
-        return uint256(0);
-    if (snapshot.height >= FORK_HEIGHT_POEM)
-        return GetBlockEntropy((snapshot.fProofOfStake && snapshot.height < FORK_HEIGHT_DAG)
-            ? snapshot.hashProof : block.GetHash());
-    return ((CBigNum(1) << 256) / (target + 1)).getuint256();
+    // V2-R1 (PM1-P0-08): delegate to THE one authoritative by-value block-trust
+    // rule. `block` is the authoritative block whose hash was already verified to
+    // equal snapshot.hash (see the caller's disk-hash check), so block.GetHash()
+    // is the same entropy/reciprocal input the previous in-place copy used.
+    return GetAuthoritativeBlockTrustValue(snapshot.nBits, snapshot.height,
+                                           snapshot.fProofOfStake, snapshot.hashProof,
+                                           block.GetHash());
 }
 
 static Object AuthoritativeBlockToJSON(const CBlock& block,

@@ -655,19 +655,11 @@ void PrintAuthoritativeResidency(const char* tag)
 //
 uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap)
 {
-    CBigNum bnTarget;
-    bnTarget.SetCompact(snap.nBits);
-    if (bnTarget <= 0)
-        return 0;
-    if (snap.height >= GetForkHeightDAG() && snap.fProofOfStake)
-        return 0;
-    if (snap.height >= GetForkHeightPoem())
-    {
-        const uint256& entropyInput = (snap.fProofOfStake && snap.height < GetForkHeightDAG())
-            ? snap.hashProof : snap.hash;
-        return GetBlockEntropy(entropyInput);
-    }
-    return ((CBigNum(1) << 256) / (bnTarget + 1)).getuint256();
+    // V2-R1 (PM1-P0-08): delegate to the single authoritative surviving rule so
+    // the live authoritative path, the regular builder, the LM builder and
+    // catch-up cannot diverge.
+    return GetAuthoritativeBlockTrustValue(snap.nBits, snap.height, snap.fProofOfStake,
+                                           snap.hashProof, snap.hash);
 }
 
 // PRE-DAG AUTHORITATIVE ACCUMULATED TRUST.

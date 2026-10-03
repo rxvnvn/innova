@@ -24,6 +24,12 @@
 
 namespace fs = boost::filesystem;
 
+// V2-R1 test-only fault-injection seams (default false; NEVER set by production
+// code). Deterministic PM1-P0-10 negative tests need to surface a local derIdx
+// I/O error and a checked Put failure without waiting for a real disk fault.
+bool g_lmV2R1ForceDerivedLookupError = false;
+bool g_lmV2R1ForceDerivedPutFailure = false;
+
 namespace {
 
 static bool SetError(std::string* error, const std::string& message)
@@ -87,6 +93,43 @@ static bool DecodeToRecord(const leveldb::Slice& value, BlockIndexRecord* out)
     r.nStakeModifier = diskindex.nStakeModifier;
     r.nStakeTime = diskindex.nStakeTime;
     return true;
+}
+
+// Per-record derived scratch entry for the external hash -> derived LevelDB used
+// during M4. Disposable same-process scratch (native ABI), not a persisted format.
+struct DEntry {
+    uint256 chainTrust; uint32_t checksum; int64_t modTime; bool hasModTime;
+    uint32_t nSize; bool hasBlockSize;
+};
+
+// V2-R1 (PM1-P0-10): typed local-store lookup result. A missing key and a
+// storage/corruption error must NOT collapse to the same "absent" outcome.
+enum LmDerivedLookupStatus { LM_DERIVED_FOUND = 0, LM_DERIVED_NOT_FOUND = 1, LM_DERIVED_ERROR = 2 };
+
+static LmDerivedLookupStatus LookupDerivedEntry(leveldb::DB* derIdx, const std::string& key,
+                                                DEntry* out, std::string* error)
+{
+    if (g_lmV2R1ForceDerivedLookupError)
+    {
+        if (error) *error = "injected deridx lookup error";
+        return LM_DERIVED_ERROR;
+    }
+    std::string val;
+    leveldb::Status st = derIdx->Get(leveldb::ReadOptions(), leveldb::Slice(key), &val);
+    if (st.IsNotFound())
+        return LM_DERIVED_NOT_FOUND;
+    if (!st.ok())
+    {
+        if (error) *error = st.ToString();
+        return LM_DERIVED_ERROR;
+    }
+    if (val.size() < sizeof(DEntry))
+    {
+        if (error) *error = "derived entry value corrupt";
+        return LM_DERIVED_ERROR;
+    }
+    memcpy(out, val.data(), sizeof(DEntry));
+    return LM_DERIVED_FOUND;
 }
 
 } // namespace
@@ -697,10 +740,6 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         leveldb::Status ds = leveldb::DB::Open(dopts, derIdxPath, &derIdx);
         if (!ds.ok())
             return SetError(error, "lm: open deridx failed: " + ds.ToString());
-        struct DEntry {
-            uint256 chainTrust; uint32_t checksum; int64_t modTime; bool hasModTime;
-            uint32_t nSize; bool hasBlockSize;
-        };
         bool postDag = GetForkHeightDAG() >= 0; // use runtime fork height
         {
             FILE* rf = fopen(hSortedPath.c_str(), "rb");
@@ -724,39 +763,56 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                 }
                 BlockIndexRecord rec;
                 memcpy(&rec, &val[sizeof(BlockIndexId)], sizeof(BlockIndexRecord));
-                DEntry de;
-                // chainTrust: parent + blockTrust
+
+                // PM1-P0-08: refuse ambiguous PoS classification BEFORE deriving
+                // trust (legacy nFlags classification vs V2 prevoutStake inference).
+                if (!PosClassificationConsistent(rec.nFlags, rec.prevoutStake.hash))
+                {
+                    fclose(rf); delete derIdx;
+                    return SetError(error, "lm: record " + rec.hash.GetHex() +
+                                    " has ambiguous PoS classification (nFlags vs prevoutStake)");
+                }
+                const bool fPos = (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) != 0;
+
+                // ONE surviving trust rule (identical to CBlockIndex::GetBlockTrust
+                // and GetAuthoritativeBlockTrust: POEM entropy + post-DAG PoS zero).
+                const uint256 blockTrust =
+                    GetAuthoritativeBlockTrustValue(rec.nBits, rec.height, fPos, rec.hashProof, rec.hash);
+
+                // Required parent derived state. In height order a nonzero-hashPrev
+                // parent MUST already be derived; absence == disconnected topology
+                // (rejected by the regular builder too). A local storage ERROR is
+                // distinct from NOT_FOUND and always fails closed.
                 uint256 parentTrust = 0;
+                uint32_t parentChecksum = 0;
+                int64_t parentModTime = 0;
+                bool parentHasModTime = false;
                 if (rec.hashPrev != uint256(0))
                 {
+                    DEntry pd;
+                    std::string perr;
                     std::string pk(rec.hashPrev.begin(), rec.hashPrev.end());
-                    std::string pv;
-                    if (derIdx->Get(leveldb::ReadOptions(), leveldb::Slice(pk), &pv).ok())
+                    LmDerivedLookupStatus ps = LookupDerivedEntry(derIdx, pk, &pd, &perr);
+                    if (ps == LM_DERIVED_NOT_FOUND)
                     {
-                        DEntry pd;
-                        if (pv.size() >= sizeof(pd))
-                        {
-                            memcpy(&pd, pv.data(), sizeof(pd));
-                            parentTrust = pd.chainTrust;
-                        }
+                        fclose(rf); delete derIdx;
+                        return SetError(error, "lm: record " + rec.hash.GetHex() +
+                                        " has disconnected parent " + rec.hashPrev.GetHex());
                     }
-                }
-                CBigNum bn; bn.SetCompact(rec.nBits);
-                uint256 bt = 0;
-                if (bn > 0 && (rec.height < GetForkHeightDAG() || rec.prevoutStake.hash == uint256(0)))
-                    bt = ((CBigNum(1)<<256)/(bn+1)).getuint256();
-                de.chainTrust = parentTrust + bt;
-                // checksum
-                unsigned int parentChecksum = 0;
-                if (rec.hashPrev != uint256(0))
-                {
-                    std::string pk(rec.hashPrev.begin(), rec.hashPrev.end());
-                    std::string pv;
-                    if (derIdx->Get(leveldb::ReadOptions(), leveldb::Slice(pk), &pv).ok())
+                    if (ps == LM_DERIVED_ERROR)
                     {
-                        DEntry pd; if (pv.size() >= sizeof(pd)) { memcpy(&pd, pv.data(), sizeof(pd)); parentChecksum = pd.checksum; }
+                        fclose(rf); delete derIdx;
+                        return SetError(error, "lm: parent derived lookup failed: " + perr);
                     }
+                    parentTrust = pd.chainTrust;
+                    parentChecksum = pd.checksum;
+                    parentModTime = pd.modTime;
+                    parentHasModTime = pd.hasModTime;
                 }
+
+                DEntry de;
+                de.chainTrust = parentTrust + blockTrust;
+                // checksum (parent checksum comes from the single checked lookup above)
                 CDataStream ss(SER_GETHASH, 0);
                 if (rec.hashPrev != uint256(0)) ss << parentChecksum;
                 uint256 proof = (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) ? rec.hashProof : uint256(0);
@@ -764,7 +820,8 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                 uint256 hc = Hash(ss.begin(), ss.end());
                 hc >>= (256 - 32);
                 de.checksum = hc.Get64();
-                // memo
+                // memo (parent memo from the single checked lookup; genesis/no-parent
+                // -> deterministic 0/false, matching the regular builder)
                 if (rec.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
                 {
                     de.modTime = (int64_t)rec.nTime;
@@ -772,12 +829,13 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                 }
                 else if (rec.hashPrev != uint256(0))
                 {
-                    std::string pk(rec.hashPrev.begin(), rec.hashPrev.end());
-                    std::string pv;
-                    if (derIdx->Get(leveldb::ReadOptions(), leveldb::Slice(pk), &pv).ok())
-                    {
-                        DEntry pd; if (pv.size() >= sizeof(pd)) { memcpy(&pd, pv.data(), sizeof(pd)); de.modTime = pd.modTime; de.hasModTime = pd.hasModTime; }
-                    }
+                    de.modTime = parentModTime;
+                    de.hasModTime = parentHasModTime;
+                }
+                else
+                {
+                    de.modTime = 0;
+                    de.hasModTime = false;
                 }
                 de.nSize = 0; de.hasBlockSize = false;
                 // A.10.1b-fix2 C1 (authoritative parity): compute exact nSize
@@ -815,8 +873,13 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                     }
                     else { de.nSize = 0; de.hasBlockSize = false; }
                 }
-                derIdx->Put(leveldb::WriteOptions(), leveldb::Slice(key),
-                            leveldb::Slice((const char*)&de, sizeof(de)));
+                if (g_lmV2R1ForceDerivedPutFailure ||
+                    !derIdx->Put(leveldb::WriteOptions(), leveldb::Slice(key),
+                                 leveldb::Slice((const char*)&de, sizeof(de))).ok())
+                {
+                    fclose(rf); delete derIdx;
+                    return SetError(error, "lm: deridx write failed");
+                }
             }
             fclose(rf);
         }
@@ -854,26 +917,30 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                     return SetError(error, "lm: idhash short read");
                 }
                 std::string hash(hashBuf, 32);
-                std::string pv;
-                if (derIdx->Get(leveldb::ReadOptions(), leveldb::Slice(hash), &pv).ok() &&
-                    pv.size() >= sizeof(DEntry))
+                DEntry de;
+                std::string derr;
+                LmDerivedLookupStatus es = LookupDerivedEntry(derIdx, hash, &de, &derr);
+                if (es != LM_DERIVED_FOUND)
                 {
-                    DEntry de;
-                    memcpy(&de, pv.data(), sizeof(de));
-                    if (!de.hasBlockSize)
-                        allHasBlockSize = false;
-                    BlockIndexDerivedEntry e;
-                    e.chainTrust = de.chainTrust;
-                    e.stakeModifierChecksum = de.checksum;
-                    e.SetHasStakeModifierTime(de.hasModTime);
-                    e.stakeModifierTime = de.modTime;
-                    e.nSize = de.nSize;
-                    e.SetHasBlockSize(de.hasBlockSize);
-                    if (!writer_.AppendDerived(e, error))
-                    {
-                        fclose(idf); delete derIdx;
-                        return false;
-                    }
+                    fclose(idf); delete derIdx;
+                    return SetError(error, std::string("lm: derived entry ") +
+                                    (es == LM_DERIVED_NOT_FOUND ? "missing" : "lookup failed") +
+                                    " during emit" +
+                                    (derr.empty() ? std::string() : (" " + derr)));
+                }
+                if (!de.hasBlockSize)
+                    allHasBlockSize = false;
+                BlockIndexDerivedEntry e;
+                e.chainTrust = de.chainTrust;
+                e.stakeModifierChecksum = de.checksum;
+                e.SetHasStakeModifierTime(de.hasModTime);
+                e.stakeModifierTime = de.modTime;
+                e.nSize = de.nSize;
+                e.SetHasBlockSize(de.hasBlockSize);
+                if (!writer_.AppendDerived(e, error))
+                {
+                    fclose(idf); delete derIdx;
+                    return false;
                 }
                 (void)id;
             }

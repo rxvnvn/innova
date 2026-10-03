@@ -50,6 +50,39 @@ class CBlock;
 /** Compute POEM entropy weight for a block hash (rehomed from finality.cpp in M5D). */
 uint256 GetBlockEntropy(const uint256& hashValue);
 
+/**
+ * V2-R1 (PM1-P0-08): THE one authoritative surviving block-trust rule, BY VALUE.
+ *
+ * Single network block-trust formula. Its body is exactly the legacy
+ * CBlockIndex::GetBlockTrust() semantics; CBlockIndex::GetBlockTrust() and the
+ * authoritative by-value GetAuthoritativeBlockTrust() both delegate here, and
+ * the low-memory (LM) generation builder + the legacy S->L catch-up derive
+ * their persisted chainTrust through it. One rule for every writer path:
+ *   1. target = SetCompact(nBits); if target <= 0 -> 0
+ *   2. if nHeight >= FORK_HEIGHT_DAG && fProofOfStake -> 0
+ *   3. if nHeight >= FORK_HEIGHT_POEM -> GetBlockEntropy(
+ *          (fProofOfStake && nHeight < FORK_HEIGHT_DAG) ? hashProof : blockHash)
+ *   4. else -> reciprocal ( (1<<256) / (target+1) )
+ * This does NOT change network consensus; it restores writer parity with the
+ * existing surviving rules (supported testnet/regtest at/after POEM entropy,
+ * post-DAG PoS zero).
+ */
+uint256 GetAuthoritativeBlockTrustValue(uint32_t nBits, int32_t nHeight,
+                                        bool fProofOfStake, const uint256& hashProof,
+                                        const uint256& blockHash);
+
+/**
+ * V2-R1 (PM1-P0-08): migration PoS-classification validation boundary.
+ *
+ * The legacy authority classifies PoS from nFlags (CBlockIndex::BLOCK_PROOF_OF_STAKE);
+ * the V2 reader may infer PoS from prevoutStake.hash != 0. For production-valid
+ * records these agree (CDiskBlockIndex serializes prevoutStake only for
+ * nFlags-PoS, and resets it null for PoW). Migration must refuse to derive trust
+ * when a record's two classifications disagree, rather than persist ambiguous
+ * authority. Returns true iff the classifications are consistent.
+ */
+bool PosClassificationConsistent(uint32_t nFlags, const uint256& prevoutStakeHash);
+
 class CBlockIndex;
 class CKeyItem;
 class CReserveKey;

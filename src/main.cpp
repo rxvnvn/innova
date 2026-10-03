@@ -8174,7 +8174,14 @@ uint256 GetBlockEntropy(const uint256& hashValue)
     return result;
 }
 
-uint256 CBlockIndex::GetBlockTrust() const
+// V2-R1 (PM1-P0-08): THE one authoritative surviving block-trust rule, by value.
+// This is the single network consensus trust formula. CBlockIndex::GetBlockTrust
+// below and GetAuthoritativeBlockTrust (blockindex_authoritative_startup.cpp)
+// both delegate here, and the LM generation builder + catch-up derive their
+// persisted trust through it. Body is byte-for-byte the legacy formula.
+uint256 GetAuthoritativeBlockTrustValue(uint32_t nBits, int32_t nHeight,
+                                        bool fProofOfStake, const uint256& hashProof,
+                                        const uint256& blockHash)
 {
     CBigNum bnTarget;
     bnTarget.SetCompact(nBits);
@@ -8182,13 +8189,27 @@ uint256 CBlockIndex::GetBlockTrust() const
     if (bnTarget <= 0)
         return 0;
 
-    if (nHeight >= FORK_HEIGHT_DAG && IsProofOfStake())
+    if (nHeight >= FORK_HEIGHT_DAG && fProofOfStake)
         return 0;
 
     if (nHeight >= FORK_HEIGHT_POEM)
-        return GetBlockEntropy((IsProofOfStake() && nHeight < FORK_HEIGHT_DAG) ? hashProof : *phashBlock);
+        return GetBlockEntropy((fProofOfStake && nHeight < FORK_HEIGHT_DAG) ? hashProof : blockHash);
 
-    return ((CBigNum(1)<<256) / (bnTarget+1)).getuint256();
+    return ((CBigNum(1) << 256) / (bnTarget + 1)).getuint256();
+}
+
+// V2-R1 (PM1-P0-08): migration PoS-classification validation boundary (see main.h).
+bool PosClassificationConsistent(uint32_t nFlags, const uint256& prevoutStakeHash)
+{
+    const bool fProofOfStake = (nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) != 0;
+    const bool fHasStakeSource = (prevoutStakeHash != uint256(0));
+    return fProofOfStake == fHasStakeSource;
+}
+
+uint256 CBlockIndex::GetBlockTrust() const
+{
+    // Delegates to the single authoritative surviving rule.
+    return GetAuthoritativeBlockTrustValue(nBits, nHeight, IsProofOfStake(), hashProof, *phashBlock);
 }
 
 // -----------------------------------------------------------------------------

@@ -110,12 +110,15 @@ static void ComputeDerived(const BlockIndexRecord& rec,
                            const std::string& blockDataDir,
                            BlockIndexDerivedEntry* out)
 {
-    // chainTrust = parentTrust + blockTrust
+    // chainTrust = parentTrust + blockTrust, using the ONE authoritative
+    // surviving trust rule (POEM entropy + post-DAG PoS zero), identical to the
+    // regular builder, the LM builder and the live authoritative path.
+    // PM1-P0-08: legacy nFlags PoS classification; the caller validates that it
+    // is consistent with prevoutStake before this is reached.
     uint256 parentTrust = parentDerived.chainTrust;
-    CBigNum bn; bn.SetCompact(rec.nBits);
-    uint256 bt = 0;
-    if (bn > 0 && (rec.height < GetForkHeightDAG() || rec.prevoutStake.hash == uint256(0)))
-        bt = ((CBigNum(1)<<256)/(bn+1)).getuint256();
+    const bool fPos = (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) != 0;
+    const uint256 bt = GetAuthoritativeBlockTrustValue(rec.nBits, rec.height, fPos,
+                                                       rec.hashProof, rec.hash);
     out->chainTrust = parentTrust + bt;
 
     // checksum
@@ -253,19 +256,20 @@ bool RunBlockIndexCatchup(const std::string& v2Root,
     {
         DerivedCache dcache;
         // Seed: base tip S derived entry (read by value from the generation).
+        // PM1-P0-10: a failed seed lookup must fail closed, never silently leave
+        // the base parent's trust/checksum/memo at zero.
         {
             BlockIndexSnapshot ss;
             std::string derr;
-            if (reader.LookupByHash(sHash, &ss, &derr) == BLOCK_INDEX_V2_READ_FOUND && ss.found)
-            {
-                BlockIndexDerivedEntry d;
-                d.chainTrust = ss.nChainTrust;
-                d.stakeModifierChecksum = ss.nStakeModifierChecksum;
-                d.SetHasStakeModifierTime(ss.hasStakeModifierTime);
-                d.stakeModifierTime = ss.nStakeModifierTime;
-                d.SetHasBlockSize(false); d.nSize = 0;
-                dcache.byHash[sHash] = d;
-            }
+            if (reader.LookupByHash(sHash, &ss, &derr) != BLOCK_INDEX_V2_READ_FOUND || !ss.found)
+            { delete db; return SetErr(&out->error, "catchup: base tip S derived seed lookup failed: " + derr); }
+            BlockIndexDerivedEntry d;
+            d.chainTrust = ss.nChainTrust;
+            d.stakeModifierChecksum = ss.nStakeModifierChecksum;
+            d.SetHasStakeModifierTime(ss.hasStakeModifierTime);
+            d.stakeModifierTime = ss.nStakeModifierTime;
+            d.SetHasBlockSize(false); d.nSize = 0;
+            dcache.byHash[sHash] = d;
         }
 
         // Walk L -> ... -> S+1 via point lookups, then reverse to ascending.
@@ -297,6 +301,13 @@ bool RunBlockIndexCatchup(const std::string& v2Root,
         }
         if (activePath.empty())
         { delete db; return SetErr(&out->error, "catchup: no post-S active blocks (S==L?)"); }
+        // PM1-P0-08: validate PoS classification for the whole tail BEFORE any
+        // append, so an ambiguous record fails closed without a partial tip.
+        for (size_t i = 0; i < activePath.size(); ++i)
+        {
+            if (!PosClassificationConsistent(activePath[i].nFlags, activePath[i].prevoutStake.hash))
+            { delete db; return SetErr(&out->error, "catchup: record " + activePath[i].hash.ToString() + " has ambiguous PoS classification (nFlags vs prevoutStake)"); }
+        }
         out->targetHeight = activePath.back().height;
         out->targetHash = activePath.back().hash;
 
@@ -309,11 +320,13 @@ bool RunBlockIndexCatchup(const std::string& v2Root,
         for (size_t i = 0; i < activePath.size(); ++i)
         {
             const BlockIndexRecord& rec = activePath[i];
-            BlockIndexDerivedEntry parent;
+            // PM1-P0-10: a required parent's derived state must be available; a
+            // miss is broken topology, never a zero default.
             std::map<uint256, BlockIndexDerivedEntry>::iterator pIt =
                 dcache.byHash.find(rec.hashPrev);
-            if (pIt != dcache.byHash.end())
-                parent = pIt->second;
+            if (rec.hashPrev != uint256(0) && pIt == dcache.byHash.end())
+            { delete db; return SetErr(&out->error, "catchup: parent derived state missing for " + rec.hash.ToString()); }
+            BlockIndexDerivedEntry parent = (pIt != dcache.byHash.end()) ? pIt->second : BlockIndexDerivedEntry();
             BlockIndexDerivedEntry d;
             ComputeDerived(rec, parent, blockDataDir, &d);
             dcache.byHash[rec.hash] = d;

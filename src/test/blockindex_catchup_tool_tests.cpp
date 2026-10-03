@@ -34,6 +34,11 @@
 
 namespace fs = boost::filesystem;
 
+// V2-R1: network flags are process globals; the POEM/DAG boundary test toggles
+// regtest and restores them.
+extern bool fRegTest;
+extern bool fTestNet;
+
 static std::string MakeTempDir()
 {
     char tmpl[] = "/tmp/innova-g2-XXXXXX";
@@ -95,6 +100,51 @@ static std::vector<uint256> WriteLegacyChain(leveldb::DB* db, int tip)
         ssVal << hashes[tip];
         leveldb::Status s = db->Put(leveldb::WriteOptions(), ssKey.str(), ssVal.str());
         BOOST_REQUIRE(s.ok());
+    }
+    return hashes;
+}
+
+// V2-R1: same as WriteLegacyChain but with per-height nFlags (PoS blocks get a
+// real stake source + stake time, so the decoded record's nFlags/PoS
+// classification is consistent). Hashes do not depend on nFlags.
+static std::vector<uint256> WriteLegacyChainEx(leveldb::DB* db, int tip,
+                                               const std::vector<uint32_t>& flags)
+{
+    std::vector<uint256> hashes(tip + 1);
+    for (int h = 0; h <= tip; ++h)
+    {
+        CDiskBlockIndex bi;
+        bi.nHeight = h;
+        bi.nFile = 1;
+        bi.nBlockPos = (unsigned)(100 + h);
+        bi.hashPrev = (h == 0) ? uint256(0) : hashes[h - 1];
+        bi.nVersion = 7;
+        bi.nTime = 1700000000u + (unsigned)h;
+        bi.nBits = 0x1d00ffff;
+        bi.nNonce = (unsigned)h;
+        bi.nFlags = flags[h];
+        bi.hashMerkleRoot = uint256(0x1111ULL + h);
+        bi.hashProof = uint256(0x2222ULL + h);
+        if (bi.IsProofOfStake())
+        {
+            bi.prevoutStake = COutPoint(uint256(0xDE00ULL + h), 0);
+            bi.nStakeTime = 1700000000u + (unsigned)h;
+        }
+        bi.nMint = 100 + h;
+        bi.nMoneySupply = 500 + h * 3;
+        hashes[h] = bi.GetBlockHash();
+        CDataStream ssKey(SER_DISK, CLIENT_VERSION);
+        ssKey << make_pair(std::string("blockindex"), hashes[h]);
+        CDataStream ssVal(SER_DISK, CLIENT_VERSION);
+        ssVal << bi;
+        BOOST_REQUIRE(db->Put(leveldb::WriteOptions(), ssKey.str(), ssVal.str()).ok());
+    }
+    {
+        CDataStream ssKey(SER_DISK, CLIENT_VERSION);
+        ssKey << std::string("hashBestChain");
+        CDataStream ssVal(SER_DISK, CLIENT_VERSION);
+        ssVal << hashes[tip];
+        BOOST_REQUIRE(db->Put(leveldb::WriteOptions(), ssKey.str(), ssVal.str()).ok());
     }
     return hashes;
 }
@@ -289,6 +339,58 @@ BOOST_AUTO_TEST_CASE(g2_catchup_wrong_base_fails_closed)
     BOOST_CHECK(!res2.ok);
 
     printf("G2-F PASS: mismatched/absent base authority fails closed (no partial tip).\n");
+}
+
+// V2-R1 (PM1-P0-08 / section 18): catch-up trust continuity across the POEM/DAG
+// boundary. The migration base trust + catch-up tail trust must equal the
+// continuous authoritative derivation (the ONE surviving rule) at every height.
+BOOST_AUTO_TEST_CASE(v2r1_catchup_trust_continuity_poem_boundary)
+{
+    bool frSaved = fRegTest, ftSaved = fTestNet;
+    fRegTest = true; fTestNet = false; // POEM=9, DAG=11
+
+    const std::string dir = MakeTempDir();
+    const std::string legacyDir = dir + "/legacy";
+    fs::create_directories(legacyDir);
+    leveldb::Options options;
+    options.create_if_missing = true;
+    options.error_if_exists = true;
+    options.filter_policy = leveldb::NewBloomFilterPolicy(10);
+    leveldb::DB* db = NULL;
+    BOOST_REQUIRE(leveldb::DB::Open(options, legacyDir, &db).ok());
+
+    const int L = 11, S = 8;
+    std::vector<uint32_t> flags(L + 1, 0u);
+    flags[9]  |= CBlockIndex::BLOCK_PROOF_OF_STAKE; // POEM window PoS
+    flags[10] |= CBlockIndex::BLOCK_PROOF_OF_STAKE;
+    std::vector<uint256> hashes = WriteLegacyChainEx(db, L, flags);
+    delete db;
+
+    const std::string v2Root = BuildGenerationS(hashes, S, dir + "/v2");
+
+    BlockIndexCatchupResult res;
+    BOOST_REQUIRE_MESSAGE(RunBlockIndexCatchup(v2Root, legacyDir, "", 2048, &res), res.error);
+    BOOST_REQUIRE_EQUAL(res.finalTipHeight, L);
+    BOOST_CHECK(res.finalTipHash == hashes[L]);
+
+    // Read the persisted tip authority and compare each appended derived
+    // chainTrust against the continuous rule-based cumulative value.
+    BlockIndexTipAuthority tip; std::string terr;
+    BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(v2Root, 1, &tip, &terr), terr);
+    BOOST_REQUIRE_EQUAL((int)tip.TipHeight(), L);
+    for (int h = S + 1; h <= L; ++h)
+    {
+        BlockIndexTipRead tr = tip.LookupActiveByHeight(h, &terr);
+        BOOST_CHECK_MESSAGE(tr.status == BLOCK_INDEX_TIP_OK, "tip read h=" << h << " status=" << (int)tr.status);
+        uint256 exp = 0;
+        for (int k = 0; k <= h; ++k)
+        {
+            const bool fPos = (flags[k] & CBlockIndex::BLOCK_PROOF_OF_STAKE) != 0;
+            exp = exp + GetAuthoritativeBlockTrustValue(0x1d00ffff, k, fPos, uint256(0x2222ULL + k), hashes[k]);
+        }
+        BOOST_CHECK_MESSAGE(tr.derived.chainTrust == exp, "catch-up chainTrust mismatch at h=" << h);
+    }
+    fRegTest = frSaved; fTestNet = ftSaved;
 }
 
 BOOST_AUTO_TEST_SUITE_END()
