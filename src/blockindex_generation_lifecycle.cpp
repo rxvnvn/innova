@@ -650,8 +650,10 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::PublishGeneration(const s
         SetError(error, "publication rename failed: " + staging.string() + " -> " + stable.string());
         return BLOCK_INDEX_LIFECYCLE_ERROR;
     }
-    std::string dirErr;
-    SyncDirectory(fs::path(root), &dirErr); // best-effort durability of the rename
+    // R3 (PM1-P1-02): the publication rename must be durably visible, or a crash
+    // could leave a validated-but-unpublished generation. Checked/propagated.
+    if (!SyncDirectoryChecked(fs::path(root), error))
+        return BLOCK_INDEX_LIFECYCLE_ERROR;
 
     // Reopen gen-N and validate again after rename.
     const BlockIndexLifecycleStatus v2 = ValidateGenerationDir(stable.string(), generation,
@@ -681,8 +683,12 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::SelectGeneration(const st
     const fs::path currentPath = fs::path(root) / BLOCK_INDEX_CURRENT_FILE_NAME;
     if (!WriteFileDurable(currentPath, encoded, error))
         return BLOCK_INDEX_LIFECYCLE_ERROR;
-    std::string dirErr;
-    SyncDirectory(fs::path(root), &dirErr); // best-effort durability of CURRENT create/rename
+    // R3 (PM1-P1-02): CURRENT selection must be durably visible. A crash between
+    // publish and select leaves the generation published-but-unselected; that is
+    // unambiguous and safely replayable (selection is a single atomic CURRENT
+    // encode; re-running publish+select is deterministic).
+    if (!SyncDirectoryChecked(fs::path(root), error))
+        return BLOCK_INDEX_LIFECYCLE_ERROR;
 
     ClearError(error);
     return BLOCK_INDEX_LIFECYCLE_OK;

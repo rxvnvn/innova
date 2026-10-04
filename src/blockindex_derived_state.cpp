@@ -642,6 +642,39 @@ BlockIndexDerivedLookupStatus BlockIndexDerivedStateStore::Read(BlockIndexId id,
     return BLOCK_INDEX_DERIVED_LOOKUP_FOUND;
 }
 
+bool BlockIndexDerivedStateStore::VerifyIntegrity(std::string* error) const
+{
+    if (!open || !readHandle)
+        return SetError(error, "derived store is not open for integrity check");
+    uint64_t entryEnd = 0;
+    if (!CheckedAddMul(BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, entryCount,
+                       BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, &entryEnd))
+        return SetError(error, "derived entry region overflow during integrity check");
+    if (readHandle->fileSize < entryEnd)
+        return SetError(error, "derived.dat truncated within entry region during integrity check");
+    std::vector<unsigned char> bytes(BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, 0);
+    {
+        LOCK(readHandle->cs);
+        if (fseeko(readHandle->file, (off_t)BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, SEEK_SET) != 0)
+            return SetError(error, "seek failed for derived integrity check");
+        for (uint64_t i = 0; i < entryCount; ++i)
+        {
+            const size_t n = fread(&bytes[0], 1, bytes.size(), readHandle->file);
+            if (n != bytes.size())
+                return SetError(error, "short derived entry read at id " + std::to_string(i + 1));
+            BlockIndexDerivedEntry e;
+            if (!DecodeBlockIndexDerivedEntry(&bytes[0], bytes.size(), &e, error))
+            {
+                if (!error || error->empty())
+                    SetError(error, "derived entry checksum/integrity failure at id " + std::to_string(i + 1));
+                return false;
+            }
+        }
+    }
+    ClearError(error);
+    return true;
+}
+
 bool BlockIndexDerivedStateStore::Finalize(std::string* error)
 {
     if (!open || !writable)

@@ -1,5 +1,6 @@
 #include "candidate_frontier_metadata.h"
 #include "fixed_blockindex_store.h"
+#include "util.h"
 #include <boost/filesystem.hpp>
 #include <leveldb/cache.h>
 #include <leveldb/db.h>
@@ -46,7 +47,7 @@ bool EnsureCandidateLeafMetadata(const std::string& dir,uint64_t generation,std:
  for(BlockIndexId id=1;id<=count;++id){BlockIndexRecord r;std::string er;if(!store.Read(id,&r,&er))return fail("candidate leaves record reread failed: "+er);std::string v;leveldb::Status gs=g_cfmV2R1ForceMarkerLookupError?leveldb::Status::IOError(leveldb::Slice("injected marker lookup error")):db->Get(leveldb::ReadOptions(),leveldb::Slice((const char*)r.hash.begin(),32),&v);if(gs.IsNotFound())leaves.push_back(r.hash);else if(!gs.ok())return fail("candidate leaves marker lookup failed: "+gs.ToString());}
  delete db;db=0;fs::remove_all(tmp,ec);std::sort(leaves.begin(),leaves.end()); unsigned char digest[32];HashLeaves(leaves,digest);
  std::vector<unsigned char> data(8+4+8+8+32+leaves.size()*32);memcpy(&data[0],MAGIC,8);U32(&data[8],1);U64(&data[12],generation);U64(&data[20],leaves.size());memcpy(&data[28],digest,32);for(size_t i=0;i<leaves.size();++i)memcpy(&data[60+i*32],leaves[i].begin(),32);
- fs::path tmpFile=outPath.string()+".tmp";FILE*f=fopen(tmpFile.string().c_str(),"wb");if(!f)return Err(error,"candidate leaves output open failed");bool ok=fwrite(&data[0],1,data.size(),f)==data.size();fflush(f);fclose(f);if(!ok){fs::remove(tmpFile,ec);return Err(error,"candidate leaves output write failed");}if(rename(tmpFile.string().c_str(),outPath.string().c_str())!=0)return Err(error,"candidate leaves publish failed");return true;
+ fs::path tmpFile=outPath.string()+".tmp";FILE*f=fopen(tmpFile.string().c_str(),"wb");if(!f)return Err(error,"candidate leaves output open failed");bool ok=fwrite(&data[0],1,data.size(),f)==data.size();std::string cferr;bool fcok=FileCommitChecked(f,&cferr);fclose(f);if(!ok||!fcok){fs::remove(tmpFile,ec);return Err(error,"candidate leaves output write failed: "+cferr);}if(rename(tmpFile.string().c_str(),outPath.string().c_str())!=0)return Err(error,"candidate leaves publish failed");std::string cderr;if(!SyncDirectoryChecked(outPath.parent_path(),&cderr))return Err(error,"candidate leaves dir sync failed: "+cderr);return true;
 }
 
 bool ReadCandidateLeafMetadata(const std::string& dir,uint64_t generation,std::vector<uint256>* leaves,std::string* error)

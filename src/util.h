@@ -296,6 +296,25 @@ bool WildcardMatch(const std::string& str, const std::string& mask);
 void FileCommit(FILE *fileout);
 bool RenameOver(boost::filesystem::path src, boost::filesystem::path dest);
 
+// R3 (PM1-P1-02): checked durability primitives. Same effect as FileCommit /
+// RenameOver but they PROPAGATE failure (flush/fsync/rename/dir-fsync return
+// codes are checked) so the Block Index V2 authority commit sequence can fail
+// closed. These are used only on the R3 authority surfaces; unrelated legacy
+// I/O keeps using the best-effort FileCommit/RenameOver above.
+bool FileCommitChecked(FILE* fileout, std::string* error);
+bool RenameOverChecked(const boost::filesystem::path& src, const boost::filesystem::path& dest, std::string* error);
+// Durably persist a directory entry change (rename/create) inside `dir`.
+// Uses O_DIRECTORY where the platform supports it. On platforms without a
+// portable directory fsync (Windows) returns true (visibility via MoveFileEx
+// is relied on, matching the existing best-effort directory sync contract).
+bool SyncDirectoryChecked(const boost::filesystem::path& dir, std::string* error);
+
+// R3F test-only durability failure injection. Armed ONLY by tests; the next call
+// to the matching checked primitive returns failure once (one-shot, auto-reset).
+// Names: "FILE_SYNC", "DIR_SYNC", "RENAME". Inert in normal daemon operation.
+void DurabilityFailpointSetForTesting(const std::string& name, bool armed);
+bool DurabilityFailpointConsumeForTesting(const std::string& name);
+
 boost::filesystem::path GetDefaultDataDir();
 const boost::filesystem::path &GetDataDir(bool fNetSpecific = true);
 boost::filesystem::path GetConfigFile();

@@ -1451,6 +1451,16 @@ bool AppInit2()
 authoritative_startup_ready:
     (void)0;
 
+    // R3 (PM1-P0-03): if a previous run crashed or failed between the V2
+    // authority commit and the legacy compatibility-mirror update, the legacy
+    // view may lag the V2 authority. V2 wins: deterministically re-mirror it.
+    if (g_fAuthoritativeStartup)
+    {
+        std::string mirrorErr;
+        if (!ReconcileLegacyCompatibilityMirror(mirrorErr))
+            return InitError(strprintf("Block Index V2 legacy mirror reconciliation failed: %s", mirrorErr.c_str()));
+    }
+
     // ---- A.10.1q: BY_VALUE_AUTHORITATIVE HReg startup rebuild ----
     // Route HReg through the by-value active-chain path (ca7c7e1) against the
     // SAME selected generation as bootstrap+navigator. Fail-closed; never falls

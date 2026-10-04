@@ -30,6 +30,10 @@ BlockIndexV2Reader& BlockIndexV2Reader::operator=(BlockIndexV2Reader&& other) no
         generationPath = std::move(other.generationPath);
         generation = other.generation;
         manifest = other.manifest;
+        derivedRebuilt = std::move(other.derivedRebuilt);
+        other.derivedRebuilt.clear();
+        blockDataDirForRebuild = std::move(other.blockDataDirForRebuild);
+        other.blockDataDirForRebuild.clear();
         cacheCapacity = other.cacheCapacity;
         cache = std::move(other.cache);
         lru = std::move(other.lru);
@@ -61,6 +65,22 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
     if (nextManifest.generation != current.generation ||
         !BlockIndexActiveIndex::Open(dir, current.generation, &nextActive, error) ||
         !BlockIndexHashIndex::Open(dir, current.generation, &nextHash, error)) return false;
+    // R3G (PM1-P0-05): authoritative-record integrity at open. A check-by-use
+    // scheme lets a single corrupt record surface as a partial read / silent
+    // zero instead of failing closed. Records carry per-entry CRC (V1), so the
+    // store is fully validated here: ANY unreadable/corrupt record fails the
+    // open (authoritative corruption is never rebuildable). Bounded O(records)
+    // by-value; no materialization.
+    {
+        std::string vErr;
+        for (BlockIndexId vid = 1; vid <= nextManifest.recordCount; ++vid)
+        {
+            BlockIndexRecord vr;
+            if (!nextStore.Read(vid, &vr, &vErr))
+                return Fail(error, "authoritative records integrity failure at RecordId "
+                                   + std::to_string(vid) + ": " + vErr);
+        }
+    }
     if (nextManifest.committedTipHeight >= 0) {
         BlockIndexId tipId = BLOCK_INDEX_ID_INVALID;
         BlockIndexRecord tip;
@@ -68,22 +88,94 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
             !nextStore.Read(tipId, &tip, error) || tip.hash != nextManifest.committedTipHash ||
             tip.height != nextManifest.committedTipHeight) return Fail(error, "reader manifest/active tip coherence failure");
     }
+    // R3G: the generation's blk*.dat directory for a possible nSize rebuild.
+    // Same bounded local probe the builder uses (never a chain datum: nSize is
+    // auxiliary metadata; an unavailable blk directory keeps nSize
+    // hasBlockSize=false in the rebuilt entries — exactly like the builder
+    // running without block data). Durable block data at
+    // <lifecycle_root>/blocks is where real migrations root blk0001.dat.
+    {
+        boost::filesystem::path blockDir = boost::filesystem::path(root) / "blocks";
+        if (boost::filesystem::exists(blockDir))
+            blockDataDirForRebuild = blockDir.string();
+        else
+            blockDataDirForRebuild.clear();
+    }
     LOCK(cs);
     store = std::move(nextStore); active = std::move(nextActive); hashIndex = std::move(nextHash);
-    // G1-A: optionally open derived.dat (non-fatal if absent — V1/shadow
-    // generations have no derived companion). When present, snapshots gain the
-    // authoritative per-record chainTrust for correct boundary heritage.
+    // R3G (PM1-P0-05): derived-state availability contract.
+    //
+    //   (1) ABSENT file (V1/shadow generation): legitimate. Trust stays 0 — the
+    //       G1-A prior behavior is preserved.
+    //   (2) PRESENT-BUT-CORRUPT file: authoritative-derived corruption. Instead
+    //       of failing closed UNCONDITIONALLY (the pre-R3G state), the reader
+    //       now performs the DETERMINISTIC derived replay over the authoritative
+    //       generation inputs (records.dat + active.dat via the one shared
+    //       primitive in blockindex_derived_replay) and opens with the rebuilt,
+    //       parity-exact in-memory derived state. Failure of the replay means
+    //       an AUTHORITATIVE input is corrupt/unreadable/disconnected — that is
+    //       never rebuildable and fails closed.
+    //   (3) The generation is IMMUTABLE: the rebuild is performed IN MEMORY
+    //       (by-value) so no file is rewritten inside a published generation
+    //       (that would violate generation immutability and invalidate the
+    //       recomputed generation root). Every consumer keeps reading by value;
+    //       the only difference is that *all* derived state, not merely a
+    //       residue entry, is served from the regenerated cache.
     derived = BlockIndexDerivedStateStore();
+    std::map<BlockIndexId, BlockIndexDerivedEntry> rebuiltDerived;
     {
         std::string derr;
-        if (!BlockIndexDerivedStateStore::OpenReadOnly(dir, current.generation, &derived, &derr))
-            derived = BlockIndexDerivedStateStore(); // absent -> trust stays 0
+        const bool derivedFilePresent =
+            boost::filesystem::exists(boost::filesystem::path(dir) / BLOCK_INDEX_DERIVED_FILE_NAME);
+        bool derivedOk = BlockIndexDerivedStateStore::OpenReadOnly(dir, current.generation, &derived, &derr);
+        if (derivedOk && derivedFilePresent)
+        {
+            std::string ivErr;
+            if (!derived.VerifyIntegrity(&ivErr)) { derivedOk = false; derr = ivErr; }
+        }
+        if (!derivedOk)
+        {
+            derived = BlockIndexDerivedStateStore();
+            if (derivedFilePresent)
+            {
+                // R3G (PM1-P0-05): PRESENT-BUT-CORRUPT derived.dat is
+                // authoritative-DERIVED corruption and only it is rebuildable:
+                //     * the generation inputs (records.dat / active.dat /
+                //       hashindex) were opened AND tip-validated above — in
+                //       particular the load-bearing tip coherence check already
+                //       re-read the committed tip record with a clean CRC and
+                //       verified its hash/height against MANIFEST — while the
+                //       derived companion stays sealed. So later per-record
+                //       failures in this replay are impossible for a
+                //       generation that passed the reader's own validation, and
+                //     * derivation is pure computation from an already-cleaned
+                //       in-memory tree for chainTrust/checksum/memo, and from
+                //       blk*.dat byte ranges ONLY for the auxiliary nSize.
+                // Deterministic rebuild via THE shared primitive (the catch-up
+                // tool's exact algorithm): active chain from an authoritative
+                // seed backend, then full side-branch closure. On any replay
+                // failure (authoritative input unreadable / topology
+                // disconnected) the open FAILS CLOSED. The generation is
+                // IMMUTABLE, so the rebuild stays in memory (by-value) — no
+                // file inside the published generation is rewritten, and the
+                // recomputed generation root contract stays intact.
+                BlockIndexDerivedReplayStatus rst;
+                std::string rerr;
+                if (!RebuildAllDerivedFromAuthoritative(
+                        store, active, nextManifest, blockDataDirForRebuild,
+                        &rebuiltDerived, &rst, &rerr))
+                    return Fail(error, "derived.dat present but unreadable (corrupt) and authoritative rebuild failed: " + rerr);
+                derivedRebuilt.swap(rebuiltDerived);
+            }
+            // else: ABSENT derived file — legitimate V1/shadow shape, trust
+            // stays 0 (unchanged G1-A prior behavior).
+        }
     }
     rootPath = root; generationPath = dir; generation = current.generation; manifest = nextManifest;
     cacheCapacity = options.cacheCapacityBytes; cache.clear(); lru.clear(); stats = BlockIndexV2ReaderCacheStats(); stats.capacityBytes = cacheCapacity; open = true;
     Clear(error); return true;
 }
-void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockIndexDerivedStateStore(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
+void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockIndexDerivedStateStore(); derivedRebuilt.clear(); blockDataDirForRebuild.clear(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
 bool BlockIndexV2Reader::IsOpen() const { LOCK(cs); return open; }
 uint64_t BlockIndexV2Reader::Generation() const { LOCK(cs); return generation; }
 uint64_t BlockIndexV2Reader::RecordCount() const { LOCK(cs); return open ? manifest.recordCount : 0; }
@@ -109,15 +201,31 @@ BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const
     // populated here: hasStakeModifierTime/Checksum remain governed by the cold
     // seam's explicit derivation contract (staleness/availability), so those
     // fields' behavior is unchanged. Absent derived store -> trust stays 0.
+    //
+    // R3G (PM1-P0-05): when the sealed companion is corrupt, the same serving
+    // rule reads the by-value rebuilt cache instead (the exact semantic output
+    // of THE shared replay primitive). Callers hold cs (GetRecordById et al.),
+    // so cache access is serialized; an entry found in either source sets
+    // nChainTrust only — identical serving semantics.
+    BlockIndexDerivedEntry de;
+    bool hadDerived = false;
     if (derived.IsOpen())
     {
-        BlockIndexDerivedEntry de;
         std::string derr;
         if (derived.Read(id, &de, &derr) == BLOCK_INDEX_DERIVED_LOOKUP_FOUND)
+            hadDerived = true;
+    }
+    if (!hadDerived)
+    {
+        std::map<BlockIndexId, BlockIndexDerivedEntry>::const_iterator rit = derivedRebuilt.find(id);
+        if (rit != derivedRebuilt.end())
         {
-            s.nChainTrust = de.chainTrust;
+            de = rit->second;
+            hadDerived = true;
         }
     }
+    if (hadDerived)
+        s.nChainTrust = de.chainTrust;
     return s;
 }
 void BlockIndexV2Reader::CachePut(const BlockIndexSnapshot& s) const {

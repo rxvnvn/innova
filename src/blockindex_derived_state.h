@@ -231,6 +231,12 @@ public:
                                 uint64_t expectedRecordCount,
                                 std::string* error) const;
 
+    // R3G (PM1-P0-05): full-entry CRC validation at open time. Iterates every
+    // committed entry and decodes it (checksum-checked); returns false on any
+    // single corrupt/undecodable entry so a PRESENT-BUT-CORRUPT derived.dat is
+    // detected during Open (not lazily per-Read) and can trigger a rebuild.
+    bool VerifyIntegrity(std::string* error) const;
+
     // A.10.1b-fix2: Update content binding (used by builder before Finalize
     // when generation root is computed from component digests).
     void SetContentBinding(const unsigned char binding[32]);

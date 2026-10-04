@@ -5,6 +5,7 @@
 #include "blockindex_activeindex.h"
 #include "blockindex_hashindex.h"
 #include "blockindex_derived_state.h"
+#include "blockindex_derived_replay.h"
 #include "blockindex_generation_lifecycle.h"
 
 #include <list>
@@ -95,7 +96,21 @@ private:
     // authoritative for chainTrust — required for the boundary AcceptBlock/
     // AddToBlockIndex to compute correct heritage. Absent (V1/shadow) -> trust
     // stays 0 (prior behavior).
+    //
+    // R3G (PM1-P0-05): when the companion is PRESENT-BUT-CORRUPT, Open performs
+    // the deterministic derived rebuild over the authoritative generation
+    // inputs (THE shared primitive, blockindex_derived_replay) and serves the
+    // SNAPSHOT-TYPE derived fields (chainTrust / modifierTime /
+    // modifierChecksum availability) from the REGISTered by-value cache in
+    // derivedRebuilt. The cache is populated ONLY inside that recovery and is
+    // never a durability/authoritative predecessor of the sealed generation
+    // files (generation immutability — in-memory by-value rebuild).
     BlockIndexDerivedStateStore derived;
+    // R3G: DERIVED-TYPE rebuild cache (snapshot fields only; see above).
+    std::map<BlockIndexId, BlockIndexDerivedEntry> derivedRebuilt;
+    // R3G: the generation's blk*.dat directory, recorded at Open for a possible
+    // derived rebuild (nSize materializer). Empty when unavailable.
+    std::string blockDataDirForRebuild;
     uint64_t cacheCapacity;
     mutable std::map<BlockIndexId, CacheEntry> cache;
     mutable std::list<BlockIndexId> lru;

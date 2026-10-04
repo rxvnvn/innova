@@ -68,6 +68,17 @@
 static const uint32_t BLOCK_INDEX_TIP_META_VERSION = 2;
 static const uint32_t BLOCK_INDEX_TIP_META_VERSION_V1 = 1;
 
+// R3 test-only failpoints around the durability boundaries. Inert unless a test
+// explicitly arms them; production code never arms them. Names:
+//   FP_DURING_TAIL_UPDATE                  - after a tail temp file is durable,
+//                                            before its atomic rename
+//   FP_AFTER_TAIL_DURABLE_BEFORE_META      - all tail stores durable, before
+//                                            the tip.meta commit
+//   FP_BEFORE_META_RENAME                  - tip.meta temp durable, before rename
+//   FP_AFTER_META_RENAME_BEFORE_DIRSYNC    - tip.meta renamed, before dir fsync
+void BlockIndexTipSetFailpointForTesting(const std::string& name, bool armed);
+bool BlockIndexTipFailpointHit(const std::string& name);
+
 struct BlockIndexTipMeta
 {
     uint32_t version;

@@ -397,6 +397,7 @@ OBJS= \
     obj/blockindex_startup_seam.o \
     obj/blockindex_startup_bootstrap.o \
     obj/blockindex_derived_state.o \
+    obj/blockindex_derived_replay.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
     obj/blockindex_activeindex.o \
@@ -498,6 +499,7 @@ OBJS= \
     obj/blockindex_startup_seam.o \
     obj/blockindex_startup_bootstrap.o \
     obj/blockindex_derived_state.o \
+    obj/blockindex_derived_replay.o \
     obj/fixed_blockindex_store.o \
     obj/blockindex_hashindex.o \
     obj/blockindex_activeindex.o \
@@ -565,6 +567,8 @@ TEST_OBJS= \
     obj/test/blockindex_stake_seen_builder_tests.o \
     obj/test/blockindex_hot_owner_tests.o \
     obj/test/blockindex_tip_tests.o \
+    obj/test/blockindex_r3f_crossstore_tests.o \
+    obj/test/blockindex_crash_corruption_tests.o \
     obj/test/blockindex_live_tail_tests.o \
     obj/test/blockindex_live_tail_full_tests.o \
     obj/test/blockindex_live_acceptance_tests.o \

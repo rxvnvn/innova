@@ -6,6 +6,7 @@
 #include "blockindex_tip.h"
 #include "blockindex_v2_reader.h"
 #include "blockindex_derived_state.h"
+#include "blockindex_derived_replay.h"
 #include "hash.h"
 #include "main.h"
 #include "kernel.h"
@@ -101,77 +102,20 @@ struct DerivedCache
     std::map<uint256, BlockIndexDerivedEntry> byHash;
 };
 
-// Compute the derived entry for one record given its parent's derived entry (or
-// an empty entry for a no-parent / base-first record). Mirrors LM M4 lines
-// 728-783 (chainTrust = parent + blockTrust; checksum via parent checksum +
-// flags/proof/stakeModifier; memo; nSize from blk files when requested).
+// PM1-P0-05 / R3G: the LM M4 derived semantic core (formerly this file's
+// static ComputeDerived) is extracted VERBATIM into the ONE shared production
+// primitive (blockindex_derived_replay.{h,cpp}, ComputeDerivedFromParent) so
+// that catch-up and the reader's corruption rebuild share EXACTLY ONE
+// derived-semantics algorithm. The tool now DELEGATES to it; catch-up
+// behavior is unchanged: (a) the availability preamble in the shared fn only
+// rewrites fields this call site always wrote from fresh default entries —
+// (b) inputs/outputs are identical (rec, parent's derived, blk dir, out).
 static void ComputeDerived(const BlockIndexRecord& rec,
                            const BlockIndexDerivedEntry& parentDerived,
                            const std::string& blockDataDir,
                            BlockIndexDerivedEntry* out)
 {
-    // chainTrust = parentTrust + blockTrust, using the ONE authoritative
-    // surviving trust rule (POEM entropy + post-DAG PoS zero), identical to the
-    // regular builder, the LM builder and the live authoritative path.
-    // PM1-P0-08: legacy nFlags PoS classification; the caller validates that it
-    // is consistent with prevoutStake before this is reached.
-    uint256 parentTrust = parentDerived.chainTrust;
-    const bool fPos = (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) != 0;
-    const uint256 bt = GetAuthoritativeBlockTrustValue(rec.nBits, rec.height, fPos,
-                                                       rec.hashProof, rec.hash);
-    out->chainTrust = parentTrust + bt;
-
-    // checksum
-    unsigned int parentChecksum = parentDerived.stakeModifierChecksum;
-    CDataStream ss(SER_GETHASH, 0);
-    if (rec.hashPrev != uint256(0)) ss << parentChecksum;
-    uint256 proof = (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) ? rec.hashProof : uint256(0);
-    ss << rec.nFlags << proof << rec.nStakeModifier;
-    uint256 hc = Hash(ss.begin(), ss.end());
-    hc >>= (256 - 32);
-    out->stakeModifierChecksum = hc.Get64();
-
-    // memo
-    out->SetHasStakeModifierTime(false);
-    out->stakeModifierTime = 0;
-    if (rec.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
-    {
-        out->SetHasStakeModifierTime(true);
-        out->stakeModifierTime = (int64_t)rec.nTime;
-    }
-    else if (rec.hashPrev != uint256(0) && parentDerived.HasStakeModifierTime())
-    {
-        out->SetHasStakeModifierTime(true);
-        out->stakeModifierTime = parentDerived.stakeModifierTime;
-    }
-
-    // nSize (from blk files when available; else unavailable -> 0)
-    out->SetHasBlockSize(false);
-    out->nSize = 0;
-    if (!blockDataDir.empty() && rec.nFile > 0)
-    {
-        std::string blockFn = strprintf("blk%04u.dat", rec.nFile);
-        fs::path blockPath = fs::path(blockDataDir) / blockFn;
-        FILE* blockFile = fopen(blockPath.string().c_str(), "rb");
-        if (blockFile)
-        {
-            if (fseeko(blockFile, (off_t)rec.nBlockPos, SEEK_SET) == 0)
-            {
-                try {
-                    CBlock block;
-                    CAutoFile filein(blockFile, SER_DISK, CLIENT_VERSION);
-                    filein >> block;
-                    if (block.GetHash() == rec.hash)
-                    {
-                        out->nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
-                        out->SetHasBlockSize(out->nSize > 0);
-                    }
-                } catch (...) { /* CAutoFile closed the FILE* */ }
-            }
-            else
-                fclose(blockFile); // CAutoFile never constructed
-        }
-    }
+    ComputeDerivedFromParent(rec, parentDerived, blockDataDir, out);
 }
 
 } // namespace

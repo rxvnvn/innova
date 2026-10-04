@@ -60,6 +60,13 @@ namespace boost {
 # include <sys/prctl.h>
 #endif
 
+#ifndef WIN32
+// R3 (PM1-P1-02): O_DIRECTORY / fsync / close for SyncDirectoryChecked.
+#include <fcntl.h>
+#include <unistd.h>
+#endif
+#include <set>
+
 using namespace std;
 
 //Collateralnode  features
@@ -1459,6 +1466,105 @@ void FileCommit(FILE *fileout)
     _commit(_fileno(fileout));
 #else
     fsync(fileno(fileout));
+#endif
+}
+
+// R3F test-only durability failure injection (see util.h). One-shot: consumed by
+// the next matching primitive call. Inert unless a test arms it.
+static std::set<std::string> g_durabilityFailpoints;
+void DurabilityFailpointSetForTesting(const std::string& name, bool armed)
+{
+    if (armed) g_durabilityFailpoints.insert(name);
+    else g_durabilityFailpoints.erase(name);
+}
+bool DurabilityFailpointConsumeForTesting(const std::string& name)
+{
+    std::set<std::string>::iterator it = g_durabilityFailpoints.find(name);
+    if (it == g_durabilityFailpoints.end())
+        return false;
+    g_durabilityFailpoints.erase(it);
+    return true;
+}
+
+// R3 (PM1-P1-02): checked durability primitives (see util.h).
+bool FileCommitChecked(FILE* fileout, std::string* error)
+{
+    if (!fileout)
+    {
+        if (error) *error = "file commit: null stream";
+        return false;
+    }
+    if (DurabilityFailpointConsumeForTesting("FILE_SYNC"))
+    {
+        if (error) *error = "injected file sync failure";
+        return false;
+    }
+    if (fflush(fileout) != 0)
+    {
+        if (error) *error = "file commit: fflush failed";
+        return false;
+    }
+#ifdef WIN32
+    if (_commit(_fileno(fileout)) != 0)
+    {
+        if (error) *error = "file commit: _commit failed";
+        return false;
+    }
+#else
+    if (fsync(fileno(fileout)) != 0)
+    {
+        if (error) *error = "file commit: fsync failed";
+        return false;
+    }
+#endif
+    return true;
+}
+
+bool RenameOverChecked(const boost::filesystem::path& src, const boost::filesystem::path& dest, std::string* error)
+{
+    if (DurabilityFailpointConsumeForTesting("RENAME"))
+    {
+        if (error) *error = "injected rename failure";
+        return false;
+    }
+    if (!RenameOver(src, dest))
+    {
+        if (error) *error = "rename failed: " + src.string() + " -> " + dest.string();
+        return false;
+    }
+    return true;
+}
+
+bool SyncDirectoryChecked(const boost::filesystem::path& dir, std::string* error)
+{
+    if (DurabilityFailpointConsumeForTesting("DIR_SYNC"))
+    {
+        if (error) *error = "injected directory sync failure";
+        return false;
+    }
+#ifdef WIN32
+    (void)dir;
+    (void)error;
+    return true; // no portable directory fsync on Windows; MoveFileEx visibility relied on
+#else
+    int flags = O_RDONLY;
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+    int fd = ::open(dir.string().c_str(), flags);
+    if (fd < 0)
+    {
+        if (error) *error = "directory open failed: " + dir.string();
+        return false;
+    }
+    int rc = fsync(fd);
+    ::close(fd);
+    if (rc != 0)
+    {
+        if (error) *error = "directory fsync failed: " + dir.string();
+        return false;
+    }
+    return true;
 #endif
 }
 

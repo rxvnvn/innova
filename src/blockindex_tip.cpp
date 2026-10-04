@@ -37,6 +37,9 @@ static const uint32_t BLOCK_INDEX_TIP_INVALID_ENTRY_SIZE = 33;
 static const uint32_t BLOCK_INDEX_TIP_INVALID_MAGIC = 0x564E4931u; // "1INV"
 static const uint32_t BLOCK_INDEX_TIP_INVALID_FILE_VERSION = 1;
 
+// R3 test-only failpoint registry (armed only by tests; empty in production).
+static std::set<std::string> g_tipFailpoints;
+
 static bool SetError(std::string* error, const std::string& message)
 {
     if (error)
@@ -220,8 +223,57 @@ static void ComputeInvalidDigest(const std::vector<BlockIndexTipInvalidEntry>& e
     SHA256_Final(digest, &ctx);
 }
 
+// R3 (PM1-P0-04): committed-region immutability. Every mutable tail store is
+// written copy-on-write: a complete temporary file is flushed + fsynced, then
+// atomically renamed over the target, then the containing directory is fsynced.
+// The previously committed file is therefore never truncated or partially
+// overwritten, so a crash at any point leaves the last committed bytes intact
+// (only an orphaned temp file remains). This replaces the earlier in-place
+// fopen("wb") full rewrite whose torn write could destroy the committed prefix
+// and turn a recoverable crash into a fail-closed, unrecoverable short store.
+static bool WriteFileCoW(const fs::path& path, const std::vector<unsigned char>& b,
+                         std::string* error)
+{
+    const fs::path tmp = fs::path(path.string() + ".tmp");
+    FILE* f = fopen(tmp.string().c_str(), "wb");
+    if (!f)
+    {
+        if (error) *error = "open temp failed: " + tmp.string();
+        return false;
+    }
+    if (!b.empty() && fwrite(&b[0], 1, b.size(), f) != b.size())
+    {
+        fclose(f);
+        if (error) *error = "write temp failed: " + tmp.string();
+        return false;
+    }
+    if (!FileCommitChecked(f, error))
+    {
+        fclose(f);
+        return false;
+    }
+    if (fclose(f) != 0)
+    {
+        if (error) *error = "close temp failed: " + tmp.string();
+        return false;
+    }
+    // Test-only crash injection: the complete temp file is durable but the
+    // atomic rename has not happened; the committed file must survive.
+    if (BlockIndexTipFailpointHit("FP_DURING_TAIL_UPDATE"))
+    {
+        if (error) *error = "failpoint FP_DURING_TAIL_UPDATE";
+        return false;
+    }
+    if (!RenameOverChecked(tmp, path, error))
+        return false;
+    if (!SyncDirectoryChecked(path.parent_path(), error))
+        return false;
+    return true;
+}
+
 static bool WriteInvalidFile(const fs::path& path,
-                             const std::vector<BlockIndexTipInvalidEntry>& entries)
+                             const std::vector<BlockIndexTipInvalidEntry>& entries,
+                             std::string* error = NULL)
 {
     std::vector<unsigned char> b;
     WriteRawLE32(b, BLOCK_INDEX_TIP_INVALID_MAGIC);
@@ -232,17 +284,7 @@ static bool WriteInvalidFile(const fs::path& path,
         b.insert(b.end(), entries[i].hash.begin(), entries[i].hash.end());
         b.push_back(entries[i].intent);
     }
-    FILE* f = fopen(path.string().c_str(), "wb");
-    if (!f)
-        return false;
-    if (!b.empty() && fwrite(&b[0], 1, b.size(), f) != b.size())
-    {
-        fclose(f);
-        return false;
-    }
-    FileCommit(f);
-    fclose(f);
-    return true;
+    return WriteFileCoW(path, b, error);
 }
 
 // Parse the invalid log. Returns true on a well-formed file (magic + version
@@ -311,11 +353,9 @@ static bool ReadWholeFile(const fs::path& path, std::string* out)
 
 // Re-encode records.dat / active.dat / derived.dat committed region from the
 // in-memory committed state (used when repairing an uncommitted tail).
-static bool WriteRecordsFile(const fs::path& path, const std::vector<BlockIndexRecord>& records)
+static bool WriteRecordsFile(const fs::path& path, const std::vector<BlockIndexRecord>& records,
+                             std::string* error = NULL)
 {
-    FILE* f = fopen(path.string().c_str(), "wb");
-    if (!f)
-        return false;
     std::vector<unsigned char> hdr;
     WriteRawLE32(hdr, BLOCK_INDEX_FORMAT_VERSION);
     WriteRawLE32(hdr, BLOCK_INDEX_RECORD_VERSION);
@@ -323,53 +363,45 @@ static bool WriteRecordsFile(const fs::path& path, const std::vector<BlockIndexR
     WriteRawLE32(hdr, BLOCK_INDEX_RECORD_SIZE_V1);
     WriteRawLE64(hdr, records.size());
     WriteRawLE64(hdr, 0); WriteRawLE64(hdr, 0); WriteRawLE64(hdr, 0);
-    if (fwrite(&hdr[0], 1, hdr.size(), f) != hdr.size()) { fclose(f); return false; }
+    std::vector<unsigned char> b = hdr;
     for (size_t i = 0; i < records.size(); ++i)
     {
         std::vector<unsigned char> enc;
         if (!EncodeBlockIndexRecordV1(records[i], &enc, NULL))
         {
-            fclose(f);
+            if (error) *error = "encode tip-records entry failed";
             return false;
         }
-        if (fwrite(&enc[0], 1, enc.size(), f) != enc.size()) { fclose(f); return false; }
+        b.insert(b.end(), enc.begin(), enc.end());
     }
-    FileCommit(f);
-    fclose(f);
-    return true;
+    return WriteFileCoW(path, b, error);
 }
 
-static bool WriteActiveFile(const fs::path& path, const std::vector<BlockIndexId>& ids)
+static bool WriteActiveFile(const fs::path& path, const std::vector<BlockIndexId>& ids,
+                            std::string* error = NULL)
 {
-    FILE* f = fopen(path.string().c_str(), "wb");
-    if (!f)
-        return false;
     std::vector<unsigned char> hdr;
     WriteRawLE32(hdr, BLOCK_INDEX_ACTIVE_SCHEMA_VERSION);
     WriteRawLE32(hdr, BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE);
     WriteRawLE32(hdr, BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
     WriteRawLE64(hdr, 0); WriteRawLE64(hdr, 0); WriteRawLE64(hdr, 0); WriteRawLE64(hdr, 0);
-    if (fwrite(&hdr[0], 1, hdr.size(), f) != hdr.size()) { fclose(f); return false; }
+    std::vector<unsigned char> b = hdr;
     for (size_t i = 0; i < ids.size(); ++i)
     {
         std::string enc;
         if (!EncodeBlockIndexActiveEntry(ids[i], &enc, NULL))
         {
-            fclose(f);
+            if (error) *error = "encode tip-active entry failed";
             return false;
         }
-        if (fwrite(enc.data(), 1, enc.size(), f) != enc.size()) { fclose(f); return false; }
+        b.insert(b.end(), enc.begin(), enc.end());
     }
-    FileCommit(f);
-    fclose(f);
-    return true;
+    return WriteFileCoW(path, b, error);
 }
 
-static bool WriteDerivedFile(const fs::path& path, const std::vector<BlockIndexDerivedEntry>& derived)
+static bool WriteDerivedFile(const fs::path& path, const std::vector<BlockIndexDerivedEntry>& derived,
+                             std::string* error = NULL)
 {
-    FILE* f = fopen(path.string().c_str(), "wb");
-    if (!f)
-        return false;
     std::vector<unsigned char> hdr;
     WriteRawLE32(hdr, BLOCK_INDEX_DERIVED_FORMAT_VERSION);
     WriteRawLE32(hdr, BLOCK_INDEX_DERIVED_SCHEMA_VERSION);
@@ -379,23 +411,32 @@ static bool WriteDerivedFile(const fs::path& path, const std::vector<BlockIndexD
     WriteRawLE64(hdr, derived.size());
     for (int i = 0; i < 32; ++i) hdr.push_back(0);
     WriteRawLE64(hdr, 0);
-    if (fwrite(&hdr[0], 1, hdr.size(), f) != hdr.size()) { fclose(f); return false; }
+    std::vector<unsigned char> b = hdr;
     for (size_t i = 0; i < derived.size(); ++i)
     {
         std::vector<unsigned char> enc;
         if (!EncodeBlockIndexDerivedEntry(derived[i], &enc, NULL))
         {
-            fclose(f);
+            if (error) *error = "encode tip-derived entry failed";
             return false;
         }
-        if (fwrite(&enc[0], 1, enc.size(), f) != enc.size()) { fclose(f); return false; }
+        b.insert(b.end(), enc.begin(), enc.end());
     }
-    FileCommit(f);
-    fclose(f);
-    return true;
+    return WriteFileCoW(path, b, error);
 }
 
 } // namespace
+
+// R3 test-only failpoints (definitions; declared in blockindex_tip.h).
+void BlockIndexTipSetFailpointForTesting(const std::string& name, bool armed)
+{
+    if (armed) g_tipFailpoints.insert(name);
+    else g_tipFailpoints.erase(name);
+}
+bool BlockIndexTipFailpointHit(const std::string& name)
+{
+    return g_tipFailpoints.count(name) != 0;
+}
 
 struct BlockIndexTipAuthority::Impl
 {
@@ -455,16 +496,30 @@ struct BlockIndexTipAuthority::Impl
             fclose(f);
             return SetError(error, "write tip.meta tmp failed");
         }
-        FileCommit(f);
-        fclose(f);
-        if (!RenameOver(tmp, metaPath))
-            return SetError(error, "rename tip.meta failed");
-        int fd = ::open(tipDir.string().c_str(), O_RDONLY);
-        if (fd >= 0)
+        // R3 (PM1-P0-04 / PM1-P1-02): the tip.meta rename is THE single logical
+        // commit point for post-S authority. Every step is checked and must
+        // propagate: an unchecked fsync or directory-sync failure here would
+        // silently lose (or silently revert) an acknowledged transition.
+        if (!FileCommitChecked(f, error))
         {
-            fsync(fd);
-            ::close(fd);
+            fclose(f);
+            return false;
         }
+        if (fclose(f) != 0)
+            return SetError(error, "close tip.meta tmp failed");
+        if (BlockIndexTipFailpointHit("FP_BEFORE_META_RENAME"))
+            return SetError(error, "failpoint FP_BEFORE_META_RENAME");
+        if (!RenameOverChecked(tmp, metaPath, error))
+            return false;
+        if (BlockIndexTipFailpointHit("FP_AFTER_META_RENAME_BEFORE_DIRSYNC"))
+            return SetError(error, "failpoint FP_AFTER_META_RENAME_BEFORE_DIRSYNC");
+        // R3F: inject a real directory-sync failure at the meta commit point (the
+        // rename already happened, so the new authority is visible; the protocol
+        // reports failure rather than pretending the commit was durable).
+        if (DurabilityFailpointConsumeForTesting("META_DIR_SYNC"))
+            return SetError(error, "injected meta directory sync failure");
+        if (!SyncDirectoryChecked(tipDir, error))
+            return false;
         return true;
     }
 };
@@ -751,16 +806,21 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     std::vector<BlockIndexId> allActive = i->activeIds;
     allActive.insert(allActive.end(), newActive.begin(), newActive.end());
 
-    if (!WriteRecordsFile(i->recordsPath, allRecords))
-        return SetError(error, "append tip-records failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!WriteDerivedFile(i->derivedPath, allDerived))
-        return SetError(error, "append tip-derived failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!WriteActiveFile(i->activePath, allActive))
-        return SetError(error, "append tip-active failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    std::string werr;
+    if (!WriteRecordsFile(i->recordsPath, allRecords, &werr))
+        return SetError(error, "append tip-records failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!WriteDerivedFile(i->derivedPath, allDerived, &werr))
+        return SetError(error, "append tip-derived failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!WriteActiveFile(i->activePath, allActive, &werr))
+        return SetError(error, "append tip-active failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
     // v2: keep the store set complete and upgrade an opened v1 tip
     // deterministically on the first legitimate new commit.
-    if (!WriteInvalidFile(i->invalidPath, i->invalidEntries))
-        return SetError(error, "append tip-invalid failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!WriteInvalidFile(i->invalidPath, i->invalidEntries, &werr))
+        return SetError(error, "append tip-invalid failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+
+    // Test-only: all tail stores durable, crash before the tip.meta commit.
+    if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
+        return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
 
     // 2. Advance tip.meta.
     BlockIndexTipMeta newMeta = i->meta;
@@ -783,7 +843,13 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     }
     ComputeContentDigest(newMeta, allRecords, allDerived, allActive, newMeta.contentDigest);
 
-    // 3. Commit point: write tip.meta.
+    // 3. Commit point: write tip.meta. On failure restore the in-memory
+    //    committed state so it matches disk (a failed commit must never leave
+    //    the in-memory authority ahead of the last committed tip.meta).
+    const BlockIndexTipMeta savedMeta = i->meta;
+    const std::vector<BlockIndexRecord> savedRecords = i->records;
+    const std::vector<BlockIndexDerivedEntry> savedDerived = i->derived;
+    const std::vector<BlockIndexId> savedActive = i->activeIds;
     i->meta = newMeta;
     i->records = allRecords;
     i->derived = allDerived;
@@ -791,7 +857,16 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     for (size_t k = 0; k < newRecords.size(); ++k)
         i->hashToId[newRecords[k].hash] = i->baseLocalToId(i->records.size() - newRecords.size() + k);
     if (!i->WriteMeta(error))
+    {
+        i->meta = savedMeta;
+        i->records = savedRecords;
+        i->derived = savedDerived;
+        i->activeIds = savedActive;
+        i->hashToId.clear();
+        for (size_t j = 0; j < i->records.size(); ++j)
+            i->hashToId[i->records[j].hash] = i->baseLocalToId(j);
         return BLOCK_INDEX_TIP_IO_ERROR;
+    }
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
 }
@@ -816,6 +891,9 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
     if (!WriteActiveFile(i->activePath, allActive))
         return SetError(error, "truncate tip-active failed"), BLOCK_INDEX_TIP_IO_ERROR;
 
+    if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
+        return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
+
     BlockIndexTipMeta newMeta = i->meta;
     newMeta.activeFence++;
     newMeta.tipHeight = height;
@@ -830,10 +908,16 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
     }
     ComputeContentDigest(newMeta, i->records, i->derived, allActive, newMeta.contentDigest);
 
+    const BlockIndexTipMeta savedMeta = i->meta;
+    const std::vector<BlockIndexId> savedActive = i->activeIds;
     i->meta = newMeta;
     i->activeIds = allActive;
     if (!i->WriteMeta(error))
+    {
+        i->meta = savedMeta;
+        i->activeIds = savedActive;
         return BLOCK_INDEX_TIP_IO_ERROR;
+    }
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
 }
@@ -949,9 +1033,26 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     // the OLD meta (tipRecordCount/tipHeight/contentDigest), so the next Open
     // truncates the freshly-published reorg branch back to the pre-reorg commit
     // point and reports a content-digest mismatch (silent loss of the cutover).
+    // Test-only: all tail stores durable, crash before the tip.meta commit.
+    if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
+        return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
+
+    const BlockIndexTipMeta savedMeta = i->meta;
+    const std::vector<BlockIndexRecord> savedRecords = i->records;
+    const std::vector<BlockIndexDerivedEntry> savedDerived = i->derived;
+    const std::vector<BlockIndexId> savedActive = i->activeIds;
     i->meta = newMeta;
     if (!i->WriteMeta(error))
+    {
+        i->meta = savedMeta;
+        i->records = savedRecords;
+        i->derived = savedDerived;
+        i->activeIds = savedActive;
+        i->hashToId.clear();
+        for (size_t j = 0; j < i->records.size(); ++j)
+            i->hashToId[i->records[j].hash] = i->baseLocalToId(j);
         return BLOCK_INDEX_TIP_IO_ERROR;
+    }
     i->records = allRecords;
     i->derived = allDerived;
     i->activeIds = allActive;
@@ -1056,6 +1157,9 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
     ComputeContentDigest(newMeta, allRecords, allDerived, allActive, newMeta.contentDigest);
     newMeta.invalidLogCount = (uint32_t)allEntries.size();
     ComputeInvalidDigest(allEntries, newMeta.invalidDigest);
+
+    if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
+        return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
 
     i->meta = newMeta;
     i->invalidEntries = allEntries;
@@ -1381,6 +1485,9 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
     newMeta.version = BLOCK_INDEX_TIP_META_VERSION;
     newMeta.invalidLogCount = (uint32_t)allEntries.size();
     ComputeInvalidDigest(allEntries, newMeta.invalidDigest);
+
+    if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
+        return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
 
     i->meta = newMeta;
     i->invalidEntries = allEntries;

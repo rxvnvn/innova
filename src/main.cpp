@@ -6951,6 +6951,23 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 // lifecycle is no longer its owner. It is the only path that updates the external
 // live tail across a reorg, and it records the consensus outcome that Reorganize
 // (already durably committed) selected.
+// R3F test-only fault injection for the production authority transition path
+// (declared main.h). Inert unless armed by a test; one-shot.
+static std::set<std::string> g_mainFailpoints;
+void MainFailpointSetForTesting(const std::string& name, bool armed)
+{
+    if (armed) g_mainFailpoints.insert(name);
+    else g_mainFailpoints.erase(name);
+}
+bool MainFailpointHitForTesting(const std::string& name)
+{
+    std::set<std::string>::iterator it = g_mainFailpoints.find(name);
+    if (it == g_mainFailpoints.end())
+        return false;
+    g_mainFailpoints.erase(it);
+    return true;
+}
+
 static bool PublishAuthoritativeLiveTailReorg(CBlockIndex* pfork,
                                               const std::vector<CBlockIndex*>& vConnect,
                                               std::string* outErr)
@@ -7752,14 +7769,26 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 const bool fExtension =
                     (pindexNew->pprev != NULL &&
                      (!fTipPresent || tipRead.record.hash == pindexNew->pprev->GetBlockHash()));
-                if (fExtension)
+                if (MainFailpointHitForTesting("FP_BEFORE_V2_AUTHORITY_COMMIT"))
+                {
+                    okP = false;
+                    perr = "failpoint FP_BEFORE_V2_AUTHORITY_COMMIT";
+                }
+                else if (fExtension)
                     okP = live->AcceptActive(rec, der, pindexNew->nHeight, &perr);
                 else
                     okP = PublishAuthoritativeLiveTailCutover(live, pindexNew, tipRead.record.hash, &perr);
             }
             if (!okP)
-                printf("BLOCKINDEX_V2_AUTHORITATIVE AddToBlockIndex persist FAILED height=%d: %s\n",
-                       pindexNew->nHeight, perr.c_str());
+            {
+                // R3 (PM1-P0-03): the V2 authoritative publish is MANDATORY.
+                // A silent printf-and-continue here would leave the legacy view
+                // (already written by SetBestChain above) as a de-facto second
+                // authority for this transition. Fail the transition instead;
+                // startup reconciliation re-mirrors the legacy view from V2.
+                return error("AddToBlockIndex() : V2 authoritative persist failed at height %d: %s",
+                             pindexNew->nHeight, perr.c_str());
+            }
         }
     }
 
@@ -8338,6 +8367,73 @@ static bool PersistInvalidBlockSet()
     return txdb.TxnCommit();
 }
 
+// -----------------------------------------------------------------------------
+// R3 (PM1-P0-03): the legacy CTxDB view (hashBestChain + the operator-invalid
+// mirror set) is a POST-COMMIT COMPATIBILITY MIRROR, never post-S authority.
+// If a crash or a mirror-update failure lands between the V2 authority commit
+// (tip.meta) and the legacy mirror update, the mirror can lag or be stale. On
+// startup the V2 authority WINS: detect the divergence and deterministically
+// re-mirror the legacy view to the committed V2 tip. The legacy store must
+// never override valid V2 authority, and this path never reopens legacy
+// read-open/create behavior (PM1-P0-07 stays out of scope).
+// -----------------------------------------------------------------------------
+bool ReconcileLegacyCompatibilityMirror(std::string& strError)
+{
+    if (!g_fAuthoritativeStartup)
+        return true; // legacy mode: legacy is the authority; nothing to reconcile
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (!live || !live->IsOpen())
+        return true;
+    const BlockIndexTipAuthority* tip = live->TipAuthority();
+    if (!tip)
+        return true;
+    const BlockIndexTipRead t = tip->GetTip();
+    if (t.status != BLOCK_INDEX_TIP_OK)
+        return true; // no committed post-S tip yet: nothing to mirror
+
+    uint256 legacyBest(0);
+    {
+        CTxDB txdb;
+        txdb.ReadHashBestChain(legacyBest);
+    }
+    const std::set<uint256> v2Invalid = tip->OperatorInvalidSet();
+    const bool invalidMirrorChanged = (v2Invalid != setInvalidBlockHash);
+    const bool bestMirrorChanged = (legacyBest != t.record.hash);
+
+    if (!bestMirrorChanged && !invalidMirrorChanged)
+        return true; // mirror already agrees with V2 authority
+
+    CTxDB txdb;
+    if (!txdb.TxnBegin())
+    {
+        strError = "legacy mirror reconciliation: TxnBegin failed";
+        return false;
+    }
+    if (bestMirrorChanged && !txdb.WriteHashBestChain(t.record.hash))
+    {
+        txdb.TxnAbort();
+        strError = "legacy mirror reconciliation: WriteHashBestChain failed";
+        return false;
+    }
+    if (invalidMirrorChanged)
+        txdb.WriteInvalidBlockSet(v2Invalid);
+    if (!txdb.TxnCommit())
+    {
+        strError = "legacy mirror reconciliation: TxnCommit failed";
+        return false;
+    }
+
+    if (bestMirrorChanged)
+    {
+        printf("BLOCKINDEX_V2_R3_RECONCILE legacy hashBestChain %s -> V2 tip %s (mirror was stale)\n",
+               legacyBest.ToString().substr(0, 20).c_str(), t.record.hash.ToString().substr(0, 20).c_str());
+        hashBestChain = t.record.hash;
+    }
+    if (invalidMirrorChanged)
+        setInvalidBlockHash = v2Invalid;
+    return true;
+}
+
 static bool IsAncestorOfBest(const CBlockIndex* pindex)
 {
     for (const CBlockIndex* p = pindexBest; p != NULL; p = p->pprev)
@@ -8532,8 +8628,12 @@ bool InvalidateBlock(const uint256& hash, std::string& strError)
         // the best remaining eligible branch above the fork by canonical trust (R1).
         if (tip->SelectBestEligibleBranch(fork, hash, true, &branch, &bheights, NULL, NULL, &ferr) != BLOCK_INDEX_TIP_OK)
         { strError = "authoritative selection failed: " + ferr; return false; }
+        if (MainFailpointHitForTesting("FP_BEFORE_V2_AUTHORITY_COMMIT"))
+        { strError = "failpoint FP_BEFORE_V2_AUTHORITY_COMMIT"; return false; }
         if (tip->ApplyOperatorInvalidAndReorg(hash, true, fork, branch, bheights, &ferr) != BLOCK_INDEX_TIP_OK)
         { strError = "authoritative invalidate failed: " + ferr; return false; }
+        if (MainFailpointHitForTesting("FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"))
+        { strError = "failpoint FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"; return false; }
         setInvalidBlockHash.insert(hash); // non-authoritative compatibility mirror
         RefreshAuthoritativeTransientProjection();
         printf("InvalidateBlock(auth-v2): invalidated %s height=%d fork=%d new_tip_height=%d\n",

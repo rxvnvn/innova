@@ -517,6 +517,17 @@ bool InvalidateBlock(const uint256& hash, std::string& strError);
 // with *pszError set on prevalidation failure (no state change).
 bool ReconsiderBlock(const uint256& hash, std::string& strError);
 
+// R3 (PM1-P0-03): startup reconciliation of the legacy compatibility mirror
+// against committed V2 authority (V2 wins). No-op in legacy mode.
+bool ReconcileLegacyCompatibilityMirror(std::string& strError);
+
+// R3F test-only fault injection for the PRODUCTION authority transition path.
+// Inert unless armed by a test; one-shot. Names:
+//   "FP_BEFORE_V2_AUTHORITY_COMMIT"
+//   "FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"
+void MainFailpointSetForTesting(const std::string& name, bool armed);
+bool MainFailpointHitForTesting(const std::string& name);
+
 // V2-R2D (PM1-P0-09) test seam: expose the authoritative-live reorg cutover
 // guard to a runtime fixture so the NULL/NULL ancestor-alias elimination can be
 // asserted (two unresolved ancestors must NOT be treated as a common ancestor).
