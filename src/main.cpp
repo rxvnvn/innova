@@ -7004,6 +7004,22 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
             return error("Reorganize() : pfork->pprev is null");
     }
 
+    // V2-R2 (PM1-P0-09): explicit below-base contract. A reorg whose fork point
+    // is BELOW the immutable base tip S is not representable by the mutable tail
+    // (which begins at S+1) and must never be silently treated as an ordinary tail
+    // reorg. Fail closed HERE, before any disconnect/connect, so no partial or
+    // cross-layer authority change is applied and the old authority remains
+    // intact (restart returns the same authority). fork == S is allowed (the
+    // exact-S seam; the whole tail is replaceable from S).
+    if (g_fAuthoritativeStartup)
+    {
+        const int32_t nBaseS = AuthoritativeBaseTipHeight();
+        if (nBaseS >= 0 && pfork->nHeight < nBaseS)
+            return error("Reorganize() : fork point %d is below the immutable base tip %d; "
+                         "below-base reorg requires an explicit rebase/rebuild (V2-R2 fail-closed)",
+                         pfork->nHeight, nBaseS);
+    }
+
     // List of what to disconnect
     vector<CBlockIndex*> vDisconnect;
     for (CBlockIndex* pindex = pindexBest; pindex != pfork; pindex = pindex->pprev)
@@ -7466,11 +7482,17 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
         return false;
     }
     // Last common ancestor of the published active tip and the new best chain.
+    // V2-R2 (PM1-P0-09): a NULL GetAncestor result (below the retained
+    // materialization floor) must NOT be treated as a common ancestor -- two NULLs
+    // compare equal and would select a bogus fork height, then dereference a NULL
+    // pfork. Require BOTH sides non-NULL for a real common ancestor.
     int nForkHeight = -1;
     int nH = pindexNew->nHeight < pOldTip->nHeight ? pindexNew->nHeight : pOldTip->nHeight;
     while (nH >= 0)
     {
-        if (pindexNew->GetAncestor(nH) == pOldTip->GetAncestor(nH))
+        CBlockIndex* ancNew = pindexNew->GetAncestor(nH);
+        CBlockIndex* ancOld = pOldTip->GetAncestor(nH);
+        if (ancNew != NULL && ancOld != NULL && ancNew == ancOld)
         {
             nForkHeight = nH;
             break;
@@ -7482,11 +7504,33 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
         if (outErr) *outErr = "authoritative-live cutover: no common ancestor with the published tip";
         return false;
     }
+    // V2-R2 (PM1-P0-09): the cutover fork must lie at or above the immutable base
+    // tip S. A fork below S is a below-base reorg and is NOT served by the mutable
+    // tail; fail closed explicitly rather than driving ReorgTo with a fork the tip
+    // authority will reject after legacy state was already mutated.
+    if (g_fAuthoritativeStartup)
+    {
+        const int32_t nBaseS = AuthoritativeBaseTipHeight();
+        if (nBaseS >= 0 && nForkHeight < nBaseS)
+        {
+            if (outErr) *outErr = "authoritative-live cutover: fork point below the immutable base tip";
+            return false;
+        }
+    }
     CBlockIndex* pfork = pindexNew->GetAncestor(nForkHeight);
     std::vector<CBlockIndex*> vConnect;
     for (int h = nForkHeight + 1; h <= pindexNew->nHeight; ++h)
         vConnect.push_back(pindexNew->GetAncestor(h));
     return PublishAuthoritativeLiveTailReorg(pfork, vConnect, outErr);
+}
+
+// V2-R2D test seam (see main.h): forwards to the static cutover guard.
+bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* live,
+                                                   CBlockIndex* pindexNew,
+                                                   const uint256& oldPublishedTipHash,
+                                                   std::string* outErr)
+{
+    return PublishAuthoritativeLiveTailCutover(live, pindexNew, oldPublishedTipHash, outErr);
 }
 
 bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const uint256& hashProof)
@@ -8379,9 +8423,124 @@ static bool ActivateBestEligibleChain()
     return true;
 }
 
+// V2-R2D (PM1-P0-02): by-value authoritative-V2 target resolution. Resolves a
+// block hash across the composed V2 domain (mutable tip first, then the immutable
+// base generation) WITHOUT requiring mapBlockIndex residency. Returns:
+//   0 FOUND above immutable base tip S   (mutable tail: operator-supported)
+//   1 FOUND at or below S                (immutable base: rebase/rebuild required)
+//   2 NOT FOUND                          (no mutation)
+//   3 authority/storage ERROR            (fail closed, no mutation)
+static int ResolveAuthoritativeTargetV2(const uint256& hash, int32_t* outHeight,
+                                        bool* outInvalid, std::string* outErr)
+{
+    if (outHeight) *outHeight = -1;
+    if (outInvalid) *outInvalid = false;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (live == NULL)
+    {
+        if (outErr) *outErr = "authoritative live authority absent";
+        return 3;
+    }
+    BlockIndexSnapshot snap;
+    std::string rerr;
+    const BlockIndexHotStatus st = live->ResolveBlockSnapshot(hash, &snap, &rerr);
+    if (st == BlockIndexHotStatus::OK && snap.found)
+    {
+        if (outHeight) *outHeight = snap.height;
+        const BlockIndexTipAuthority* tip = live->TipAuthority();
+        if (outInvalid && tip) *outInvalid = tip->IsOperatorInvalid(hash);
+        const int32_t s = AuthoritativeBaseTipHeight();
+        return (s >= 0 && snap.height > s) ? 0 : 1;
+    }
+    if (st == BlockIndexHotStatus::AUTHORITY_MISSING)
+        return 2;
+    if (outErr) *outErr = rerr.empty() ? "authoritative resolve failed" : rerr;
+    return 3;
+}
+
+// V2-R2D: refresh the in-process transient projection to match the newly committed
+// durable V2 authority after an authoritative operator mutation. pindexBest and the
+// best-chain pointers are PROJECTIONS ONLY -- materialized from the durable tip via
+// the bounded retained-parent topology. The durable tip authority remains the OWNER;
+// this never rebuilds historical residency (PM1-P0-06 remains OPEN) and materializes
+// at most the post-S retained ancestor chain (anchor/horizon bounded).
+static void RefreshAuthoritativeTransientProjection()
+{
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (live == NULL) return;
+    const BlockIndexTipAuthority* tipAuth = live->TipAuthority();
+    if (tipAuth == NULL) return;
+    const BlockIndexTipRead tipRead = tipAuth->GetTip();
+    const int32_t baseTipHeight = AuthoritativeBaseTipHeight();
+    if (tipRead.status == BLOCK_INDEX_TIP_OK && tipRead.height > baseTipHeight)
+    {
+        std::string tipErr;
+        CBlockIndex* tipObj = live->ResolveAndRetainFullParent(tipRead.record.hash, &tipErr);
+        if (tipObj != NULL)
+        {
+            pindexBest = tipObj;
+            nBestHeight = tipObj->nHeight;
+            hashBestChain = tipObj->GetBlockHash();
+            nBestChainTrust = tipObj->nChainTrust;
+        }
+    }
+    // If the tip fell back to/below S, the base bootstrap-owned anchor already
+    // projects the best tip; leave pindexBest unchanged rather than truncate it.
+}
+
 bool InvalidateBlock(const uint256& hash, std::string& strError)
 {
     LOCK(cs_main);
+
+    // V2-R2D (PM1-P0-02): authoritative-V2 routing. Resolve the target BY VALUE
+    // across the composed V2 domain (no mapBlockIndex residency requirement). The
+    // durable operator-invalid authority is the mutable tip (tip-invalid.dat), and
+    // the invalid intent + resulting active tip are published in ONE fused tip.meta
+    // commit (ApplyOperatorInvalidAndReorg). The legacy set is a mirror only.
+    if (g_fAuthoritativeStartup)
+    {
+        int32_t targetHeight = -1; bool alreadyInvalid = false; std::string rerr;
+        const int tier = ResolveAuthoritativeTargetV2(hash, &targetHeight, &alreadyInvalid, &rerr);
+        if (tier == 3) { strError = rerr.empty() ? "authoritative resolve error" : rerr; return false; }
+        if (tier == 2) { strError = "Block not found"; return false; }
+        if (tier == 1)
+        {
+            strError = "Cannot invalidate a block at or below the immutable base tip: "
+                       "rebase/rebuild required (V2-R2D fail-closed)";
+            return false; // BEFORE mutation; old authority intact
+        }
+        if (fImporting || fReindex) { strError = "Cannot invalidate while importing or reindexing"; return false; }
+        if (alreadyInvalid) return true; // idempotent, no mutation
+
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        BlockIndexTipAuthority* tip = live ? const_cast<BlockIndexTipAuthority*>(live->TipAuthority()) : NULL;
+        if (tip == NULL) { strError = "authoritative tip authority absent"; return false; }
+
+        // Determine the fork point: if the target is on the ACTIVE chain, truncate
+        // active membership to the target's parent; otherwise the active tip is
+        // unchanged (fork at the current tip, empty branch).
+        int32_t fork = tip->TipHeight();
+        const BlockIndexTipRead ar = tip->LookupActiveByHeight(targetHeight, NULL);
+        if (ar.status == BLOCK_INDEX_TIP_OK && ar.record.hash == hash)
+            fork = targetHeight - 1;
+        if (fork < AuthoritativeBaseTipHeight()) fork = AuthoritativeBaseTipHeight();
+
+        std::vector<BlockIndexTipAppend> branch;
+        std::vector<int32_t> bheights;
+        std::string ferr;
+        // Bounded V2 eligible-tip selection: with the target treated as invalid, pick
+        // the best remaining eligible branch above the fork by canonical trust (R1).
+        if (tip->SelectBestEligibleBranch(fork, hash, true, &branch, &bheights, NULL, NULL, &ferr) != BLOCK_INDEX_TIP_OK)
+        { strError = "authoritative selection failed: " + ferr; return false; }
+        if (tip->ApplyOperatorInvalidAndReorg(hash, true, fork, branch, bheights, &ferr) != BLOCK_INDEX_TIP_OK)
+        { strError = "authoritative invalidate failed: " + ferr; return false; }
+        setInvalidBlockHash.insert(hash); // non-authoritative compatibility mirror
+        RefreshAuthoritativeTransientProjection();
+        printf("InvalidateBlock(auth-v2): invalidated %s height=%d fork=%d new_tip_height=%d\n",
+               hash.ToString().substr(0, 20).c_str(), (int)targetHeight, (int)fork, (int)tip->TipHeight());
+        fflush(stdout);
+        return true;
+    }
 
     std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
     if (mi == mapBlockIndex.end())
@@ -8435,6 +8594,50 @@ bool InvalidateBlock(const uint256& hash, std::string& strError)
 bool ReconsiderBlock(const uint256& hash, std::string& strError)
 {
     LOCK(cs_main);
+
+    // V2-R2D (PM1-P0-02): authoritative-V2 routing. Resolve the target BY VALUE
+    // (no mapBlockIndex residency). Reverse the durable operator-invalid intent on
+    // the mutable tip authority (tip-invalid.dat) via a fused tip.meta commit. The
+    // legacy set is a mirror only. At/below the immutable base tip S is refused
+    // before mutation (rebase/rebuild required).
+    if (g_fAuthoritativeStartup)
+    {
+        int32_t targetHeight = -1; bool alreadyInvalid = false; std::string rerr;
+        const int tier = ResolveAuthoritativeTargetV2(hash, &targetHeight, &alreadyInvalid, &rerr);
+        if (tier == 3) { strError = rerr.empty() ? "authoritative resolve error" : rerr; return false; }
+        if (tier == 2) { strError = "Block not found"; return false; }
+        if (tier == 1)
+        {
+            strError = "Cannot reconsider a block at or below the immutable base tip: "
+                       "rebase/rebuild required (V2-R2D fail-closed)";
+            return false; // BEFORE mutation; old authority intact
+        }
+        if (fImporting || fReindex) { strError = "Cannot reconsider while importing or reindexing"; return false; }
+        if (!alreadyInvalid) return true; // idempotent: not operator-invalid, no mutation
+
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        BlockIndexTipAuthority* tip = live ? const_cast<BlockIndexTipAuthority*>(live->TipAuthority()) : NULL;
+        if (tip == NULL) { strError = "authoritative tip authority absent"; return false; }
+
+        // Re-select from the reconsidered block's parent height with the target treated
+        // as ELIGIBLE, so the restored branch reconnects when canonical trust makes it
+        // best (a stronger competing branch keeps the tip).
+        int32_t fork = targetHeight - 1;
+        if (fork < AuthoritativeBaseTipHeight()) fork = AuthoritativeBaseTipHeight();
+        std::vector<BlockIndexTipAppend> branch;
+        std::vector<int32_t> bheights;
+        std::string ferr;
+        if (tip->SelectBestEligibleBranch(fork, hash, false, &branch, &bheights, NULL, NULL, &ferr) != BLOCK_INDEX_TIP_OK)
+        { strError = "authoritative selection failed: " + ferr; return false; }
+        if (tip->ApplyOperatorInvalidAndReorg(hash, false, fork, branch, bheights, &ferr) != BLOCK_INDEX_TIP_OK)
+        { strError = "authoritative reconsider failed: " + ferr; return false; }
+        setInvalidBlockHash.erase(hash); // non-authoritative compatibility mirror
+        RefreshAuthoritativeTransientProjection();
+        printf("ReconsiderBlock(auth-v2): reconsidered %s height=%d\n",
+               hash.ToString().substr(0, 20).c_str(), (int)targetHeight);
+        fflush(stdout);
+        return true;
+    }
 
     std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
     if (mi == mapBlockIndex.end())

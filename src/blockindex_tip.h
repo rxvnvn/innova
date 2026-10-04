@@ -12,6 +12,7 @@
 
 #include <boost/shared_ptr.hpp>
 #include <cstdint>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -50,7 +51,22 @@
 // Residency: this store itself is by-value; it does NOT keep CBlockIndex
 // resident. Resident residency is owned by the HotOwner live tail (P2).
 
-static const uint32_t BLOCK_INDEX_TIP_META_VERSION = 1;
+// Mutable tip protocol version history:
+//   v1 (104-byte tip.meta): base identity + committed tip + fence + content
+//                           digest. Carried NO operator-invalid authority.
+//   v2 (140-byte tip.meta): adds the durable operator-invalid log. The invalid
+//                           set is an APPEND-ONLY log (tip-invalid.dat) whose
+//                           committed length + digest ride in tip.meta, so Open
+//                           truncates an uncommitted tail exactly like the other
+//                           tip stores (crash-safe, deterministic) -- the exact
+//                           same fail-safe methodology as tip-records/derived/
+//                           active. tip.meta remains the SINGLE commit point.
+// A v1 tip remains readable: on open its operator-invalid set is EMPTY and no
+// rewrite occurs merely to read it. The first legitimate new mutable commit
+// upgrades the meta to v2. An UNKNOWN future version FAILS CLOSED (never
+// silently guessed).
+static const uint32_t BLOCK_INDEX_TIP_META_VERSION = 2;
+static const uint32_t BLOCK_INDEX_TIP_META_VERSION_V1 = 1;
 
 struct BlockIndexTipMeta
 {
@@ -63,13 +79,17 @@ struct BlockIndexTipMeta
     uint64_t tipRecordCount;      // total records in tip-records.dat (committed)
     uint8_t  activeFence;         // monotonic reorg fence (increments per reorg)
     unsigned char contentDigest[32]; // SHA256 over all tip stores' committed region
+    // ---- v2 mutable protocol: durable operator-invalid authority ----
+    uint32_t invalidLogCount;        // committed entries in tip-invalid.dat
+    unsigned char invalidDigest[32]; // SHA256 over the committed invalid log
 
     BlockIndexTipMeta()
         : version(BLOCK_INDEX_TIP_META_VERSION), baseGeneration(0),
           baseRecordCount(0), baseTipHeight(-1), tipHeight(-1), tipHash(0),
-          tipRecordCount(0), activeFence(0)
+          tipRecordCount(0), activeFence(0), invalidLogCount(0)
     {
         memset(contentDigest, 0, 32);
+        memset(invalidDigest, 0, 32);
     }
 };
 
@@ -194,6 +214,70 @@ public:
     uint8_t  ActiveFence() const;
     bool     IsOpen() const;
     bool     IsEmpty() const;          // no tip records committed
+
+    // ---- durable operator-invalid authority (v2 mutable protocol) ----
+    // By-value only: never holds CBlockIndex pointers, never requires
+    // historical residency. Persisted in tip-invalid.dat, committed by tip.meta
+    // (invalidLogCount + invalidDigest) as part of the SAME mutable authority
+    // publication as the committed tip.
+    uint32_t InvalidLogCount() const;
+    bool     IsOperatorInvalid(const uint256& hash) const;
+    std::set<uint256> OperatorInvalidSet() const;
+    // Append one operator intent to the log and commit it as part of the mutable
+    // tip authority (tip.meta is the commit point): invalidate=true records the
+    // hash invalid; invalidate=false (reconsider) clears it. Idempotent -- an
+    // intent that does not change the current derived state is a no-op (no log
+    // entry). Fail closed on IO/validation error; committed authority unchanged.
+    BlockIndexTipStatus SetOperatorInvalid(const uint256& hash,
+                                           bool invalidate,
+                                           std::string* error);
+
+    // FUSED mutable authority transition (V2-R2D): apply ONE operator-invalid
+    // intent AND the resulting active-chain reorg (truncate to forkHeight, then
+    // promote/append `branch`) as a SINGLE logical authority publication. All
+    // stores are written (records/derived/active/invalid), then ONE tip.meta
+    // WriteMeta commits invalidLogCount+invalidDigest AND the resulting active
+    // fields (tipRecordCount/tipHeight/tipHash/activeFence/contentDigest)
+    // TOGETHER. There is therefore no ordinary successful path where the
+    // committed invalid set and the committed tip describe incompatible
+    // authority states. The invalid intent is idempotent (no log entry when it
+    // does not change the derived set). Physical publication back-stops on the
+    // single tip.meta commit point; GLOBAL cross-store crash atomicity remains
+    // PM1-P0-03/04 (OPEN).
+    BlockIndexTipStatus ApplyOperatorInvalidAndReorg(
+        const uint256& hash, bool invalidate,
+        int32_t forkHeight,
+        const std::vector<BlockIndexTipAppend>& branch,
+        const std::vector<int32_t>& branchHeights,
+        std::string* error);
+
+    // ---- V2-R2D bounded eligible-tip selection (mutable-authority) ----
+    // Enumerate committed tip records (bounded to the mutable tip window; never
+    // the full history). Each result carries record + persisted derived state.
+    BlockIndexTipStatus AllRecords(std::vector<BlockIndexTipRead>* out,
+                                   std::string* error) const;
+
+    // Select the best ELIGIBLE tip strictly above forkHeight using ONLY persisted
+    // V2 tip state (no mapBlockIndex residency, no full-history materialization):
+    //   - a candidate is ineligible if it IS the invalid target, is itself
+    //     operator-invalid, or any ancestor within the tip window up to forkHeight
+    //     is invalid / missing / height-inconsistent;
+    //   - eligibility uses the committed operator-invalid set;
+    //   - selection maximizes the canonical accumulated chainTrust (R1 semantics:
+    //     the persisted derived chainTrust value, NOT an independent formula),
+    //     deterministic tie-break by hash.
+    // Returns the reconnect branch (forkHeight+1 .. bestTip, ascending) ready for
+    // ApplyOperatorInvalidAndReorg. When no eligible candidate exists, the branch
+    // is EMPTY and outBestHeight == forkHeight (tip = fork). OK on success.
+    BlockIndexTipStatus SelectBestEligibleBranch(
+        int32_t forkHeight,
+        const uint256& pendingHash,
+        bool pendingInvalidate,
+        std::vector<BlockIndexTipAppend>* outBranch,
+        std::vector<int32_t>* outHeights,
+        uint256* outBestHash,
+        int32_t* outBestHeight,
+        std::string* error) const;
 
     void Close();
 

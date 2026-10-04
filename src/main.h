@@ -516,6 +516,16 @@ bool InvalidateBlock(const uint256& hash, std::string& strError);
 // eligible chain (which may re-connect the reconsidered branch).  Returns false
 // with *pszError set on prevalidation failure (no state change).
 bool ReconsiderBlock(const uint256& hash, std::string& strError);
+
+// V2-R2D (PM1-P0-09) test seam: expose the authoritative-live reorg cutover
+// guard to a runtime fixture so the NULL/NULL ancestor-alias elimination can be
+// asserted (two unresolved ancestors must NOT be treated as a common ancestor).
+// Inert in production; never called by the daemon.
+class BlockIndexAuthoritativeLive;
+bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* live,
+                                                   CBlockIndex* pindexNew,
+                                                   const uint256& oldPublishedTipHash,
+                                                   std::string* outErr);
 // Called from CTxDB::LoadBlockIndex (both backends) after setInvalidBlockHash is
 // loaded and the naive pindexBest reconstructed: rolls the best chain back to
 // the highest valid ancestor if it descends from an operator-invalidated block.

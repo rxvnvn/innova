@@ -2254,4 +2254,671 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
                        << " boot_folds_persisted_tip=0");
 }
 
+// ===========================================================================
+// V2-R2 (PM1-P0-01): CLEAN-RESTART AUTHORITY OF THE DURABLE POST-S TIP.
+//
+// The immutable base anchor publishes S. If the durable mutable tip holds
+// post-S authority (L > S), a CLEAN RESTART MUST publish L as the authoritative
+// best tip -- never silently truncate to the base tip S. Drives the REAL
+// production boot entry (InitBlockIndexAuthoritative, the function init.cpp
+// calls), persists a post-S block through the production live-authority seam
+// (the same AcceptActive call AddToBlockIndex makes on accept of an active
+// block), then simulates a FRESH PROCESS (ResetBlockIndexAuthoritativeStartupForTest
+// destroys the retained context and releases the stores) and boots again.
+// ===========================================================================
+BOOST_AUTO_TEST_CASE(r2_p01_restart_publishes_durable_post_s_tip)
+{
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("r2p01-%%%%-%%%%");
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+    struct Cleanup {
+        fs::path root; CBlockIndex* best; CBlockIndex* genesis;
+        uint256 bestChain; int bestHeight; uint256 bestTrust;
+        Cleanup(const fs::path& r, CBlockIndex* b, CBlockIndex* g, const uint256& bc, int bh, const uint256& bt)
+            : root(r), best(b), genesis(g), bestChain(bc), bestHeight(bh), bestTrust(bt) {}
+        ~Cleanup() {
+            ResetBlockIndexAuthoritativeStartupForTest();
+            pindexBest = best; pindexGenesisBlock = genesis;
+            hashBestChain = bestChain; nBestHeight = bestHeight; nBestChainTrust = bestTrust;
+            try { fs::remove_all(root); } catch (...) {}
+        }
+    } cleanup(root, savedBest, savedGenesis, savedBestChain, savedBestHeight, savedBestTrust);
+
+    // Build + publish + select an authoritative generation and boot it: pindexBest = S.
+    std::string error;
+    F2BuildAuthoritativeGenerationAndInit(root, &error);
+    const int S = nBestHeight;
+    const uint256 baseTipHash = hashBestChain;
+    BOOST_REQUIRE(S >= 0);
+
+    // Persist a post-S block into the DURABLE mutable tip via the production
+    // live-authority seam (the exact call AddToBlockIndex makes for an accepted
+    // active block).
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    const uint256 lHash = uint256(0xABCDEF01UL);
+    BlockIndexRecord rec;
+    rec.hash = lHash; rec.hashPrev = baseTipHash; rec.height = S + 1;
+    rec.nFile = 1; rec.nBlockPos = (unsigned)(S + 1) * 100; rec.nFlags = 0; rec.nVersion = 7;
+    rec.nTime = 1700000000u + (unsigned)(S + 1); rec.nBits = 0x1d00ffff; rec.nNonce = (unsigned)(S + 1);
+    BlockIndexDerivedEntry der;
+    der.chainTrust = uint256(0xBEEFUL); der.stakeModifierChecksum = 7;
+    der.SetHasStakeModifierTime(true); der.stakeModifierTime = 1700000000;
+    der.SetHasBlockSize(true); der.nSize = 1200;
+    BOOST_REQUIRE_MESSAGE(live->AcceptActive(rec, der, S + 1, &error), error);
+    BOOST_REQUIRE_EQUAL(live->TipAuthorityMutable()->TipHeight(), S + 1);
+
+    // ---- SIMULATED CLEAN RESTART (fresh process) ----
+    ResetBlockIndexAuthoritativeStartupForTest();
+    BOOST_CHECK(!g_fAuthoritativeStartup);
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+
+    // PM1-P0-01: the authoritative best tip MUST be the durable post-S tip L.
+    BOOST_CHECK_MESSAGE(nBestHeight == S + 1,
+        "PM1-P0-01: after restart the authoritative best height MUST be the durable post-S tip "
+        << (S + 1) << ", not the base tip " << S << " (got " << nBestHeight << ")");
+    BOOST_CHECK_MESSAGE(hashBestChain == lHash,
+        "PM1-P0-01: after restart the authoritative best chain MUST be the durable post-S tip hash "
+        << lHash.ToString().substr(0, 20) << " (got " << hashBestChain.ToString().substr(0, 20) << ")");
+    BOOST_TEST_MESSAGE("R2_P01_RESTART base_tip_height=" << S << " post_s_tip_height=" << (S + 1)
+                       << " boot_best_height=" << nBestHeight
+                       << " boot_folds_persisted_tip=" << (hashBestChain == lHash ? 1 : 0));
+}
+
+// V2-R2B (PM1-P0-01 negative closure): a corrupted durable tip MUST fail closed
+// at authoritative startup -- never silently publish S as if nothing happened.
+BOOST_AUTO_TEST_CASE(r2b_p01_negative_corrupt_tip_fails_closed)
+{
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("r2bp01n-%%%%-%%%%");
+    std::string error;
+    F2BuildAuthoritativeGenerationAndInit(root, &error);
+    const int S = nBestHeight;
+    BOOST_REQUIRE(S >= 0);
+
+    // Corrupt tip.meta's mutable protocol version to an unknown value.
+    const std::string metaPath = (root / "blockindex_tip" / "tip.meta").string();
+    unsigned char buf[160];
+    size_t n = 0;
+    {
+        FILE* f = fopen(metaPath.c_str(), "rb");
+        BOOST_REQUIRE(f != NULL);
+        n = fread(buf, 1, sizeof(buf), f);
+        fclose(f);
+        BOOST_REQUIRE(n >= 104);
+        buf[0] = 99; buf[1] = 0; buf[2] = 0; buf[3] = 0; // unknown future version
+        f = fopen(metaPath.c_str(), "wb");
+        BOOST_REQUIRE(f != NULL);
+        BOOST_REQUIRE(fwrite(buf, 1, n, f) == n);
+        fclose(f);
+    }
+
+    ResetBlockIndexAuthoritativeStartupForTest();
+    std::string err;
+    const bool ok = InitBlockIndexAuthoritative(root.string(), &err);
+    BOOST_CHECK_MESSAGE(!ok,
+        "R2B-P01-N3: corrupted durable tip MUST fail closed at authoritative startup (ok="
+        << ok << " err=" << err << ")");
+    BOOST_TEST_MESSAGE("R2B_P01N corrupt_tip_startup_ok=" << (ok ? 1 : 0) << " err=" << err);
+    ResetBlockIndexAuthoritativeStartupForTest();
+    try { fs::remove_all(root); } catch (...) {}
+}
+
+// V2-R2B (PM1-P0-09): the immutable-base boundary oracle is distinct from the
+// published best tip. It returns S in authoritative mode and -1 otherwise, so a
+// reorg cutover can refuse a fork below S without confusing it with the tip.
+BOOST_AUTO_TEST_CASE(r2b_p09_base_tip_oracle)
+{
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("r2bp09-%%%%-%%%%");
+    std::string error;
+    F2BuildAuthoritativeGenerationAndInit(root, &error);
+    const int S = nBestHeight;
+    BOOST_CHECK_EQUAL(AuthoritativeBaseTipHeight(), S);
+    BOOST_TEST_MESSAGE("R2B_P09 base_tip_oracle=" << AuthoritativeBaseTipHeight() << " S=" << S);
+    ResetBlockIndexAuthoritativeStartupForTest();
+    BOOST_CHECK_EQUAL(AuthoritativeBaseTipHeight(), -1);
+    try { fs::remove_all(root); } catch (...) {}
+}
+
+// ===========================================================================
+// V2-R2D CLOSURE FIXTURES
+//
+// Real S>0 authoritative generation built synthetically (deterministic, no
+// ambient mining) with real on-disk block files, published + selected + booted
+// through the REAL production startup entry InitBlockIndexAuthoritative. All
+// operator transitions are driven through the REAL production functions
+// (InvalidateBlock / ReconsiderBlock) and the real BlockIndexAuthoritativeLive
+// seam; nothing here calls test-only storage helpers.
+// ===========================================================================
+struct R2DSB
+{
+    uint256 hash;
+    unsigned int nFile, nBlockPos, nSize;
+};
+
+static R2DSB R2DWriteSyntheticBlock(const fs::path& blockDir, uint256 prev,
+                                 unsigned int nTime, unsigned int nBits,
+                                 unsigned int nNonce, unsigned int nFile)
+{
+    R2DSB info; info.nFile = nFile;
+    CTransaction coinbase; coinbase.nVersion = 1; coinbase.nTime = nTime;
+    CTxIn input; input.prevout = COutPoint(uint256(0), 0xffffffff);
+    input.scriptSig = CScript() << OP_TRUE; input.nSequence = 0xffffffff;
+    coinbase.vin.push_back(input);
+    CTxOut output; output.nValue = 0; output.scriptPubKey = CScript() << OP_TRUE;
+    coinbase.vout.push_back(output);
+    CBlock block; block.nVersion = 1; block.hashPrevBlock = prev;
+    block.nTime = nTime; block.nBits = nBits; block.nNonce = nNonce;
+    block.vtx.push_back(coinbase); block.hashMerkleRoot = block.BuildMerkleTree();
+    info.hash = block.GetHash();
+    info.nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
+    CDataStream ss(SER_DISK, CLIENT_VERSION); ss << block;
+    unsigned int ns = ss.size();
+    char name[32]; snprintf(name, sizeof(name), "blk%04u.dat", nFile);
+    fs::path f = blockDir / name;
+    FILE* fp = fopen(f.string().c_str(), "ab"); BOOST_REQUIRE(fp != NULL);
+    unsigned char magic[] = {0xfa,0xbf,0xb5,0xda};
+    fwrite(magic,1,4,fp); fwrite(&ns,4,1,fp);
+    long pos = ftell(fp); info.nBlockPos = (unsigned int)pos;
+    fwrite(&ss[0],1,ss.size(),fp); fflush(fp); fclose(fp);
+    return info;
+}
+
+// Build a self-contained immutable generation genesis..S (S>0) with real block
+// files and boot it through the REAL production startup. Returns true on a
+// successful authoritative boot; fills outActive with hashes[0..S].
+static bool R2DBuildSyntheticGenerationAndInit(const fs::path& root, int S,
+                                               std::vector<uint256>* outActive,
+                                               std::string* error)
+{
+    fs::create_directories(root / "blocks");
+    std::vector<uint256> active;
+    uint256 prev(0);
+    BlockIndexGenerationSource src;
+    for (int h = 0; h <= S; ++h)
+    {
+        R2DSB b = R2DWriteSyntheticBlock(root / "blocks", prev,
+                                      1700000000u + (unsigned)h, 0x1d00ffffU,
+                                      (unsigned)h, 1);
+        BlockIndexRecord rec;
+        rec.hash = b.hash; rec.hashPrev = prev; rec.height = h;
+        rec.nVersion = 1; rec.nTime = 1700000000u + (unsigned)h;
+        rec.nBits = 0x1d00ffffU; rec.nNonce = (unsigned)h;
+        rec.nFile = b.nFile; rec.nBlockPos = b.nBlockPos; rec.nFlags = 0;
+        rec.nMoneySupply = 0;
+        BlockIndexGenerationSourceRecord sr; sr.hash = b.hash; sr.record = rec;
+        src.records.push_back(sr);
+        active.push_back(b.hash);
+        prev = b.hash;
+    }
+    src.hashBestChain = active[S];
+    src.foundBestChain = true;
+    src.blockDataDir = (root / "blocks").string();
+    BlockIndexGenerationBuilder b;
+    if (!b.Build(src, (root / "build-000001.tmp").string(), 1, NULL, error)) return false;
+    b.Close();
+    if (BlockIndexGenerationManager::PublishGeneration(root.string(), 1, error) != BLOCK_INDEX_LIFECYCLE_OK) return false;
+    if (BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error) != BLOCK_INDEX_LIFECYCLE_OK) return false;
+    if (outActive) *outActive = active;
+    return InitBlockIndexAuthoritative(root.string(), error);
+}
+
+static BlockIndexRecord R2DMakeRecord(const uint256& hash, const uint256& prev, int height)
+{
+    BlockIndexRecord r;
+    r.hash = hash; r.hashPrev = prev; r.height = height;
+    r.nFile = 1; r.nBlockPos = (unsigned)(height * 100); r.nFlags = 0;
+    r.nVersion = 5; r.nTime = 1700000000u + (unsigned)height;
+    r.nBits = 0x1d00ffff; r.nNonce = (unsigned)height;
+    return r;
+}
+
+static BlockIndexDerivedEntry R2DMakeDerived(const uint256& trust, uint32_t checksum)
+{
+    BlockIndexDerivedEntry d;
+    d.chainTrust = trust; d.stakeModifierChecksum = checksum;
+    d.SetHasStakeModifierTime(true); d.stakeModifierTime = 1700000000;
+    d.SetHasBlockSize(true); d.nSize = 1200 + (checksum % 100);
+    return d;
+}
+
+static std::vector<unsigned char> R2DReadFile(const std::string& path)
+{
+    std::vector<unsigned char> v;
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return v;
+    unsigned char buf[4096]; size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), f)) > 0) v.insert(v.end(), buf, buf + n);
+    fclose(f);
+    return v;
+}
+
+static bool R2DWriteFile(const std::string& path, const std::vector<unsigned char>& v)
+{
+    FILE* f = fopen(path.c_str(), "wb");
+    if (!f) return false;
+    bool ok = v.empty() || (fwrite(&v[0], 1, v.size(), f) == v.size());
+    fclose(f);
+    return ok;
+}
+
+static bool R2DTruncateFileTo(const std::string& path, size_t newLen)
+{
+    FILE* f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    std::vector<unsigned char> buf; unsigned char tmp[4096]; size_t n;
+    while ((n = fread(tmp, 1, sizeof(tmp), f)) > 0) buf.insert(buf.end(), tmp, tmp + n);
+    fclose(f);
+    if (newLen > buf.size()) return false;
+    buf.resize(newLen);
+    return R2DWriteFile(path, buf);
+}
+
+// RAII authoritative boot fixture: builds + boots a real S>0 generation, then
+// restores every process global it disturbed on destruction.
+struct R2DGenFixture
+{
+    fs::path root;
+    int S;
+    std::vector<uint256> active;
+    CBlockIndex* sBest; CBlockIndex* sGen; uint256 sHash; int sH; uint256 sT;
+    std::set<uint256> sInvalid;
+
+    explicit R2DGenFixture(int s) : S(s), sBest(NULL), sGen(NULL), sH(-1)
+    {
+        sBest = pindexBest; sGen = pindexGenesisBlock;
+        sHash = hashBestChain; sH = nBestHeight; sT = nBestChainTrust;
+        sInvalid = setInvalidBlockHash;
+        root = fs::temp_directory_path() / fs::unique_path("r2dgen-%%%%-%%%%");
+        std::string error;
+        BOOST_REQUIRE_MESSAGE(R2DBuildSyntheticGenerationAndInit(root, S, &active, &error), error);
+        BOOST_REQUIRE(g_fAuthoritativeStartup);
+    }
+    ~R2DGenFixture()
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        pindexBest = sBest; pindexGenesisBlock = sGen;
+        hashBestChain = sHash; nBestHeight = sH; nBestChainTrust = sT;
+        setInvalidBlockHash = sInvalid;
+        try { fs::remove_all(root); } catch (...) {}
+    }
+};
+
+static void R2DAppendActive(BlockIndexAuthoritativeLive* live, const uint256& hash,
+                            const uint256& prev, int height, const uint256& trust)
+{
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(
+        live->AcceptActive(R2DMakeRecord(hash, prev, height),
+                           R2DMakeDerived(trust, (uint32_t)height), height, &err), err);
+}
+
+static void R2DAppendSide(BlockIndexAuthoritativeLive* live, const uint256& hash,
+                          const uint256& prev, int height, const uint256& trust)
+{
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(
+        live->AcceptSide(R2DMakeRecord(hash, prev, height),
+                         R2DMakeDerived(trust, (uint32_t)height), &err), err);
+}
+
+// Install post-S active branch A (S+1,S+2; higher trust) and competing side
+// branch B (S+1,S+2; lower trust) sharing the immutable base tip S as ancestor.
+static void R2DInstallBranches(BlockIndexAuthoritativeLive* live, const uint256& sHash, int S,
+                               const uint256& A1, const uint256& A2,
+                               const uint256& B1, const uint256& B2)
+{
+    R2DAppendActive(live, A1, sHash, S + 1, uint256(100));
+    R2DAppendActive(live, A2, A1, S + 2, uint256(200));
+    R2DAppendSide(live, B1, sHash, S + 1, uint256(50));
+    R2DAppendSide(live, B2, B1, S + 2, uint256(150));
+}
+
+// ---------------------------------------------------------------------------
+// COHORT A: live transient projection == durable selected tip (invalidate AND
+// reconsider), asserted BEFORE and AFTER a clean restart. Exercises the real
+// production InvalidateBlock/ReconsiderBlock on a non-resident target.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2d_p02_live_transient_projection_before_after_restart)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S; const uint256 sHash = fx.active[S];
+    BOOST_REQUIRE(S > 0);
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    BlockIndexTipAuthority* tip = live->TipAuthorityMutable();
+    BOOST_REQUIRE(tip != NULL);
+    BOOST_REQUIRE_EQUAL(AuthoritativeBaseTipHeight(), S);
+
+    const uint256 A1(0xA10001UL), A2(0xA10002UL), B1(0xB10001UL), B2(0xB10002UL);
+    R2DInstallBranches(live, sHash, S, A1, A2, B1, B2);
+    BOOST_REQUIRE(tip->GetTip().record.hash == A2);
+
+    // Pre-mutation projection is the immutable base anchor S (no post-S tip was
+    // published by the boot); proves the projection is genuinely refreshed below.
+    BOOST_CHECK_MESSAGE(nBestHeight == S && pindexBest != NULL,
+        "pre-mutation projection must be the immutable base anchor S");
+    // PM1-P0-06 non-regression: no historical CBlockIndex population introduced.
+    {
+        LOCK(cs_main);
+        int hist = 0;
+        for (size_t h = 0; h < fx.active.size(); ++h) if (mapBlockIndex.count(fx.active[h])) ++hist;
+        BOOST_CHECK_EQUAL(hist, 0);
+        BOOST_CHECK_EQUAL(mapBlockIndex.count(A1), (size_t)0);
+        BOOST_CHECK_EQUAL(mapBlockIndex.count(A2), (size_t)0);
+    }
+
+    // ---- production InvalidateBlock(A1): active branch loses, B selected ----
+    {
+        std::string err;
+        BOOST_REQUIRE_MESSAGE(InvalidateBlock(A1, err), err);
+        const BlockIndexTipRead dt = tip->GetTip();
+        BOOST_REQUIRE(dt.status == BLOCK_INDEX_TIP_OK);
+        BOOST_CHECK_MESSAGE(dt.record.hash == B2,
+            "invalidate: durable selected tip must be the competing branch tip");
+        BOOST_CHECK_MESSAGE(pindexBest != NULL && pindexBest->GetBlockHash() == dt.record.hash,
+            "LIVE PROJECTION (invalidate): projected best tip MUST equal durable selected tip");
+        BOOST_CHECK_EQUAL(nBestHeight, dt.height);
+        BOOST_CHECK(hashBestChain == dt.record.hash);
+        BOOST_TEST_MESSAGE("R2D_LIVE_PROJ invalidate durable_tip=" << dt.record.hash.ToString()
+            << " projected=" << (pindexBest ? pindexBest->GetBlockHash().ToString() : std::string("<null>"))
+            << " height=" << nBestHeight);
+    }
+
+    // ---- restart: same authoritative tip ----
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        std::string e2;
+        BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &e2), e2);
+        const BlockIndexTipAuthority* tip2 = GetAuthoritativeLiveAuthority()->TipAuthority();
+        BOOST_REQUIRE(tip2 != NULL);
+        BOOST_CHECK_MESSAGE(tip2->GetTip().record.hash == B2,
+            "restart after invalidate must keep the durable selected tip");
+        BOOST_CHECK_EQUAL(nBestHeight, S + 2);
+        BOOST_CHECK(hashBestChain == B2);
+    }
+
+    // ---- production ReconsiderBlock(A1): branch A restored as best ----
+    {
+        std::string e3;
+        BOOST_REQUIRE_MESSAGE(ReconsiderBlock(A1, e3), e3);
+        BlockIndexTipAuthority* tip3 = GetAuthoritativeLiveAuthority()->TipAuthorityMutable();
+        const BlockIndexTipRead dt3 = tip3->GetTip();
+        BOOST_CHECK_MESSAGE(dt3.record.hash == A2,
+            "reconsider: branch A must be restored as the durable authority");
+        BOOST_CHECK_MESSAGE(pindexBest != NULL && pindexBest->GetBlockHash() == dt3.record.hash,
+            "LIVE PROJECTION (reconsider): projected best tip MUST equal durable selected tip");
+        BOOST_CHECK_EQUAL(nBestHeight, dt3.height);
+        BOOST_CHECK(hashBestChain == dt3.record.hash);
+    }
+
+    // ---- restart: restored authority remains ----
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        std::string e4;
+        BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &e4), e4);
+        const BlockIndexTipAuthority* tip4 = GetAuthoritativeLiveAuthority()->TipAuthority();
+        BOOST_CHECK_MESSAGE(tip4->GetTip().record.hash == A2,
+            "restart after reconsider must keep the restored authority");
+        BOOST_CHECK_EQUAL(nBestHeight, S + 2);
+        BOOST_CHECK(hashBestChain == A2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COHORT A (non-resident): the target is NOT resident in mapBlockIndex; the real
+// production resolver finds it BY VALUE, the invalid intent is durably committed,
+// the best eligible competing authority is selected, the projection updates
+// immediately, and everything persists across restart / reconsider.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2d_p02_nonresident_production_operator_target)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S; const uint256 sHash = fx.active[S];
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    BlockIndexTipAuthority* tip = live->TipAuthorityMutable();
+    BOOST_REQUIRE(tip != NULL);
+
+    const uint256 A1(0xAA1001UL), A2(0xAA1002UL), B1(0xBB1001UL), B2(0xBB1002UL);
+    R2DInstallBranches(live, sHash, S, A1, A2, B1, B2);
+
+    // EXPLICIT non-residency of the production target and the competing tip.
+    BOOST_CHECK_MESSAGE(mapBlockIndex.count(A1) == 0, "target A1 must NOT be resident in mapBlockIndex");
+    BOOST_CHECK_EQUAL(mapBlockIndex.count(A2), (size_t)0);
+    BOOST_CHECK_EQUAL(mapBlockIndex.count(B2), (size_t)0);
+    // ... yet the by-value authority resolves A1 (the production resolver's source).
+    {
+        BlockIndexSnapshot snap; std::string serr;
+        BOOST_REQUIRE(live->ResolveBlockSnapshot(A1, &snap, &serr) == BlockIndexHotStatus::OK);
+        BOOST_CHECK(snap.found);
+        BOOST_CHECK_EQUAL(snap.height, S + 1);
+    }
+
+    // Production InvalidateBlock(A1) with A1 NON-RESIDENT.
+    {
+        std::string err;
+        BOOST_REQUIRE_MESSAGE(InvalidateBlock(A1, err), err);
+        BOOST_CHECK_MESSAGE(tip->IsOperatorInvalid(A1),
+            "invalid intent must be durably committed in the mutable tip");
+        BOOST_CHECK(tip->GetTip().record.hash == B2);
+        BOOST_CHECK(pindexBest != NULL && pindexBest->GetBlockHash() == B2);
+        BOOST_TEST_MESSAGE("R2D_NONRESIDENT invalidate target_nresident=0 tip=" << tip->GetTip().record.hash.ToString());
+    }
+
+    // Restart: invalid intent + selected authority persist.
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        std::string e2;
+        BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &e2), e2);
+        BlockIndexTipAuthority* tip2 = GetAuthoritativeLiveAuthority()->TipAuthorityMutable();
+        BOOST_CHECK(tip2->IsOperatorInvalid(A1));
+        BOOST_CHECK(tip2->GetTip().record.hash == B2);
+        BOOST_CHECK(hashBestChain == B2);
+    }
+
+    // Production ReconsiderBlock(A1) with A1 still NON-RESIDENT.
+    {
+        BOOST_CHECK_EQUAL(mapBlockIndex.count(A1), (size_t)0);
+        std::string e3;
+        BOOST_REQUIRE_MESSAGE(ReconsiderBlock(A1, e3), e3);
+        BlockIndexTipAuthority* tip3 = GetAuthoritativeLiveAuthority()->TipAuthorityMutable();
+        BOOST_CHECK(!tip3->IsOperatorInvalid(A1));
+        BOOST_CHECK(tip3->GetTip().record.hash == A2);
+        BOOST_CHECK(pindexBest != NULL && pindexBest->GetBlockHash() == A2);
+    }
+
+    // Restart: restored authority persists.
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        std::string e4;
+        BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &e4), e4);
+        BOOST_CHECK(hashBestChain == A2);
+        BOOST_CHECK_EQUAL(nBestHeight, S + 2);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COHORT C: real S>0 seam + deep-reorg boundary + operator boundary + NULL/NULL
+// alias elimination.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2d_p09_real_s0_seam_deep_reorg_boundary)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S; const uint256 sHash = fx.active[S];
+    BOOST_REQUIRE_MESSAGE(S > 0, "COHORT C requires a real S>0 generation");
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    BlockIndexTipAuthority* tip = live->TipAuthorityMutable();
+    BOOST_REQUIRE(tip != NULL);
+    BOOST_REQUIRE_EQUAL(AuthoritativeBaseTipHeight(), S);
+
+    const uint256 A1(0xC1A001UL), A2(0xC1A002UL), B1(0xC1B001UL), B2(0xC1B002UL);
+    R2DInstallBranches(live, sHash, S, A1, A2, B1, B2);
+    BOOST_REQUIRE(tip->GetTip().record.hash == A2);
+
+    // (1) FORK == S: legal competing post-S transition whose common ancestor is
+    //     exactly the immutable base tip S. Invalidate the S+1 active block so the
+    //     fork lands exactly at S and branch B replaces A. ALLOWED.
+    {
+        std::string err;
+        BOOST_REQUIRE_MESSAGE(InvalidateBlock(A1, err), err);
+        const BlockIndexTipRead dt = tip->GetTip();
+        BOOST_CHECK_MESSAGE(dt.record.hash == B2,
+            "FORK==S: a legal post-S transition with common ancestor S must be ALLOWED");
+        BOOST_CHECK_EQUAL(tip->TipHeight(), S + 2);
+        BOOST_TEST_MESSAGE("R2D_FORK_EQ_S allowed tip=" << dt.record.hash.ToString()
+            << " S=" << S << " fork_used=S height=" << tip->TipHeight());
+    }
+    // Restart: same authority.
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        std::string e2;
+        BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &e2), e2);
+        BOOST_CHECK(GetAuthoritativeLiveAuthority()->TipAuthority()->GetTip().record.hash == B2);
+        BOOST_CHECK_EQUAL(nBestHeight, S + 2);
+        BOOST_CHECK(hashBestChain == B2);
+    }
+
+    // (2)+(3) FORK == S-1 and DEEPER FORK: the fused mutable-authority transition
+    //     primitive the production operator drives MUST fail closed BEFORE mutation.
+    {
+        BlockIndexTipAuthority* tipN = GetAuthoritativeLiveAuthority()->TipAuthorityMutable();
+        const int32_t h0 = tipN->TipHeight();
+        const uint256 hash0 = tipN->GetTip().record.hash;
+        const uint32_t log0 = tipN->InvalidLogCount();
+        const uint256 Z1(0xDEAD0001UL), Z2(0xDEAD0002UL);
+        std::vector<BlockIndexTipAppend> emptyBranch; std::vector<int32_t> emptyHeights;
+        std::string e1, e2, e3;
+        BOOST_CHECK_MESSAGE(tipN->ApplyOperatorInvalidAndReorg(Z1, true, S - 1, emptyBranch, emptyHeights, &e1) != BLOCK_INDEX_TIP_OK,
+            "FORK==S-1: must fail closed BEFORE mutation");
+        BOOST_CHECK_MESSAGE(tipN->ApplyOperatorInvalidAndReorg(Z2, true, S - 2, emptyBranch, emptyHeights, &e2) != BLOCK_INDEX_TIP_OK,
+            "DEEPER FORK: must fail closed BEFORE mutation");
+        BOOST_CHECK_MESSAGE(tipN->ReorgActiveTo(S - 1, emptyBranch, emptyHeights, &e3) != BLOCK_INDEX_TIP_OK,
+            "FORK==S-1 (ReorgActiveTo): must fail closed BEFORE mutation");
+        // unchanged: durable authority, effective tip, mutable metadata, invalid state
+        BOOST_CHECK_EQUAL(tipN->TipHeight(), h0);
+        BOOST_CHECK(tipN->GetTip().record.hash == hash0);
+        BOOST_CHECK_EQUAL(tipN->InvalidLogCount(), log0);
+        BOOST_CHECK(!tipN->IsOperatorInvalid(Z1));
+        BOOST_CHECK(!tipN->IsOperatorInvalid(Z2));
+        BOOST_TEST_MESSAGE("R2D_BELOW_S failclosed fork_s_1=1 deeper=1 unchanged=1");
+    }
+    // Restart: exact same previous authority.
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        std::string e4;
+        BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &e4), e4);
+        const BlockIndexTipAuthority* tip4 = GetAuthoritativeLiveAuthority()->TipAuthority();
+        BOOST_CHECK_EQUAL(tip4->TipHeight(), S + 2);
+        BOOST_CHECK(tip4->GetTip().record.hash == B2);
+        BOOST_CHECK(!tip4->IsOperatorInvalid(uint256(0xDEAD0001UL)));
+    }
+
+    // (4) PRODUCTION OPERATOR BOUNDARY: InvalidateBlock(S) and InvalidateBlock(S-1)
+    //     rejected BEFORE mutation (rebase/rebuild contract).
+    {
+        BlockIndexAuthoritativeLive* l4 = GetAuthoritativeLiveAuthority();
+        BlockIndexTipAuthority* t4 = l4->TipAuthorityMutable();
+        const int32_t h0 = t4->TipHeight(); const uint256 hash0 = t4->GetTip().record.hash;
+        const std::set<uint256> inv0 = t4->OperatorInvalidSet();
+        std::string e1, e2;
+        BOOST_CHECK_MESSAGE(!InvalidateBlock(sHash, e1),
+            "InvalidateBlock(S) MUST be rejected before mutation");
+        BOOST_CHECK_MESSAGE(!InvalidateBlock(fx.active[S - 1], e2),
+            "InvalidateBlock(S-1) MUST be rejected before mutation");
+        BOOST_CHECK_EQUAL(t4->TipHeight(), h0);
+        BOOST_CHECK(t4->GetTip().record.hash == hash0);
+        BOOST_CHECK(t4->OperatorInvalidSet() == inv0);
+        BOOST_TEST_MESSAGE("R2D_OP_BOUNDARY invalidate_S=0 invalidate_S_1=0 errS="
+                           << e1.substr(0, 48));
+    }
+    // Restart: unchanged.
+    {
+        ResetBlockIndexAuthoritativeStartupForTest();
+        std::string e5;
+        BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(fx.root.string(), &e5), e5);
+        BOOST_CHECK_EQUAL(nBestHeight, S + 2);
+        BOOST_CHECK(hashBestChain == B2);
+    }
+
+    // (5) NULL/NULL ALIAS regression: two UNRESOLVED retained ancestors must NOT be
+    //     treated as a valid common ancestor. Runtime assertion on the real
+    //     production cutover guard.
+    {
+        BlockIndexAuthoritativeLive* l5 = GetAuthoritativeLiveAuthority();
+        CBlockIndex newIdx; newIdx.nHeight = 5; newIdx.pprev = NULL;
+        CBlockIndex oldIdx; oldIdx.nHeight = 4; oldIdx.pprev = NULL;
+        const uint256 oldHash(0xD1D1D1UL);
+        { LOCK(cs_main); mapBlockIndex[oldHash] = &oldIdx; }
+        std::string e;
+        const bool r = PublishAuthoritativeLiveTailCutoverForTesting(l5, &newIdx, oldHash, &e);
+        { LOCK(cs_main); mapBlockIndex.erase(oldHash); }   // erase BEFORE asserting (no dangling)
+        BOOST_CHECK_MESSAGE(!r, "NULL==NULL MUST NOT be treated as a valid common ancestor (fail closed)");
+        BOOST_CHECK_MESSAGE(e.find("no common ancestor") != std::string::npos,
+            "NULL/NULL alias must be reported as no-common-ancestor (err=" << e << ")");
+        BOOST_TEST_MESSAGE("R2D_NULL_ALIAS failclosed=" << (r ? 0 : 1) << " err=" << e);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// COHORT B: startup-level PM1-P0-01 N1 / N2 (drive the REAL production startup
+// entry). The durable mutable tip claims a post-S tip L>S but the committed
+// record is missing (N1) or inconsistent (N2); authoritative startup MUST fail
+// closed and publish NO partial authority (never silently fall back to S).
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(r2d_p01_startup_n1_missing_post_s_record_fails_closed)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S; const uint256 sHash = fx.active[S];
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    const uint256 L(0x11AA11UL);
+    R2DAppendActive(live, L, sHash, S + 1, uint256(9));
+    BOOST_REQUIRE_EQUAL(live->TipAuthorityMutable()->TipHeight(), S + 1);
+    ResetBlockIndexAuthoritativeStartupForTest();   // simulate process end (stores closed)
+
+    // Corrupt: truncate tip-records.dat below the tip.meta-committed record count
+    // while the durable tip still CLAIMS height S+1 (required record missing).
+    const std::string rp = (fx.root / "blockindex_tip" / "tip-records.dat").string();
+    BOOST_REQUIRE(R2DTruncateFileTo(rp, 0));
+
+    std::string err;
+    const bool ok = InitBlockIndexAuthoritative(fx.root.string(), &err);
+    BOOST_CHECK_MESSAGE(!ok, "STARTUP N1: missing committed post-S record MUST fail closed");
+    BOOST_CHECK_MESSAGE(pindexBest == NULL && nBestHeight == -1,
+        "STARTUP N1: no partial authority publication / no silent fallback to S");
+    BOOST_TEST_MESSAGE("R2D_P01_N1 startup_ok=" << (int)ok << " no_fallback=" << (pindexBest == NULL) << " err=" << err);
+}
+
+BOOST_AUTO_TEST_CASE(r2d_p01_startup_n2_inconsistent_post_s_record_fails_closed)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S; const uint256 sHash = fx.active[S];
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    const uint256 L(0x22BB22UL);
+    R2DAppendActive(live, L, sHash, S + 1, uint256(9));
+    BOOST_REQUIRE_EQUAL(live->TipAuthorityMutable()->TipHeight(), S + 1);
+    ResetBlockIndexAuthoritativeStartupForTest();
+
+    // Corrupt: flip a byte inside the committed record region so the committed
+    // post-S record no longer matches the tip.meta content digest (inconsistent).
+    const std::string rp = (fx.root / "blockindex_tip" / "tip-records.dat").string();
+    std::vector<unsigned char> rec = R2DReadFile(rp);
+    BOOST_REQUIRE(rec.size() > 64);
+    rec[64] ^= 0xFF;
+    BOOST_REQUIRE(R2DWriteFile(rp, rec));
+
+    std::string err;
+    const bool ok = InitBlockIndexAuthoritative(fx.root.string(), &err);
+    BOOST_CHECK_MESSAGE(!ok, "STARTUP N2: inconsistent committed post-S record MUST fail closed");
+    BOOST_CHECK_MESSAGE(pindexBest == NULL && nBestHeight == -1,
+        "STARTUP N2: no partial authority publication / no silent fallback to S");
+    BOOST_TEST_MESSAGE("R2D_P01_N2 startup_ok=" << (int)ok << " no_fallback=" << (pindexBest == NULL) << " err=" << err);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

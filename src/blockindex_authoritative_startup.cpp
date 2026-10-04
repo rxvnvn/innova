@@ -184,6 +184,18 @@ void AuthorityReadyResetForTest()
     g_authorityReadyDetail.clear();
 }
 
+// V2-R2 (PM1-P0-01/P0-09): immutable base tip height S of the retained
+// authoritative generation (bootstrap best-tip anchor). Returns -1 outside
+// authoritative mode or before the base is bound. This is the base boundary,
+// NOT the published best tip.
+int32_t AuthoritativeBaseTipHeight()
+{
+    if (!g_fAuthoritativeStartup || !g_authoritativeContext)
+        return -1;
+    CBlockIndex* base = g_authoritativeContext->bootstrap.BestTipObject();
+    return base ? base->nHeight : -1;
+}
+
 bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
 {
     if (g_authoritativeContext)
@@ -338,6 +350,63 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
                livetail,
                (unsigned long long)ctx->live->BaseGeneration(),
                (int)ctx->live->TipAuthorityMutable()->TipHeight());
+    }
+
+    // V2-R2 (PM1-P0-01): PublishStartupGlobals (above) yields the IMMUTABLE base
+    // tip S from the bootstrap anchor. If the durable mutable tip holds post-S
+    // authority (L > S), the authoritative best tip after restart MUST be L, not
+    // S. Materialize L by value through the live authority's PERSISTENT
+    // full-topology store (bounded by the live-tail horizon; no historical
+    // mapBlockIndex reconstruction, no legacy fallback) and publish it as the
+    // process best tip. Fail closed on any materialization failure — never
+    // silently truncate authority back to S.
+    {
+        const BlockIndexTipAuthority* tipAuth = ctx->live->TipAuthority();
+        const BlockIndexTipRead tipRead = tipAuth ? tipAuth->GetTip() : BlockIndexTipRead();
+        const int32_t baseTipHeight =
+            ctx->bootstrap.BestTipObject() ? ctx->bootstrap.BestTipObject()->nHeight : -1;
+        if (tipRead.status == BLOCK_INDEX_TIP_OK && tipRead.height > baseTipHeight)
+        {
+            std::string tipErr;
+            CBlockIndex* tipObj =
+                ctx->live->ResolveAndRetainFullParent(tipRead.record.hash, &tipErr);
+            if (!tipObj)
+            {
+                if (error) *error = "authoritative startup: post-S tip materialization failed: " + tipErr;
+                return false; // fail closed; never silently truncate authority back to S
+            }
+            pindexBest = tipObj;
+            nBestHeight = tipObj->nHeight;
+            hashBestChain = tipObj->GetBlockHash();
+            nBestChainTrust = tipObj->nChainTrust;
+            printf("BLOCKINDEX_V2_AUTHORITATIVE best_tip=post_s height=%d hash=%s base_tip=%d\n",
+                   nBestHeight, hashBestChain.ToString().substr(0, 20).c_str(), (int)baseTipHeight);
+            fflush(stdout);
+        }
+    }
+
+    // V2-R2B (PM1-P0-02): restore durable operator-invalid authority. Above S the
+    // mutable tip is the durable owner of operator invalidation; the legacy txdb
+    // invalid set is deliberately NOT loaded on the authoritative path (it is a
+    // compatibility mirror only). Publish the COMMITTED operator-invalid set from
+    // the mutable tip into the process authority so an invalidated block stays
+    // invalid across restart and best-eligible selection can honour it. Fail
+    // closed: the tip store was already validated by Open, so a failure here is
+    // an authority inconsistency, not an absence.
+    {
+        const BlockIndexTipAuthority* tipAuth = ctx->live ? ctx->live->TipAuthority() : NULL;
+        if (tipAuth)
+        {
+            const std::set<uint256> inv = tipAuth->OperatorInvalidSet();
+            for (std::set<uint256>::const_iterator it = inv.begin(); it != inv.end(); ++it)
+                setInvalidBlockHash.insert(*it);
+            if (!inv.empty())
+            {
+                printf("BLOCKINDEX_V2_AUTHORITATIVE operator_invalid_restored=%u\n",
+                       (unsigned)inv.size());
+                fflush(stdout);
+            }
+        }
     }
 
     // R3 certification-stage result, consumed by the R4 AUTHORITY_READY prerequisite

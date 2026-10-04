@@ -25,10 +25,17 @@ static const char* const BLOCK_INDEX_TIP_META_FILE = "tip.meta";
 static const char* const BLOCK_INDEX_TIP_RECORDS_FILE = "tip-records.dat";
 static const char* const BLOCK_INDEX_TIP_ACTIVE_FILE = "tip-active.dat";
 static const char* const BLOCK_INDEX_TIP_DERIVED_FILE = "tip-derived.dat";
+static const char* const BLOCK_INDEX_TIP_INVALID_FILE = "tip-invalid.dat";
 
 static const uint32_t BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE = 48;
 static const uint32_t BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE = 44;
 static const uint32_t BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE = 72;
+// v2 mutable protocol: append-only operator-invalid log.
+// header: magic(4) + version(4) + count(4); entry: hash(32) + intent(1).
+static const uint32_t BLOCK_INDEX_TIP_INVALID_HEADER_SIZE = 12;
+static const uint32_t BLOCK_INDEX_TIP_INVALID_ENTRY_SIZE = 33;
+static const uint32_t BLOCK_INDEX_TIP_INVALID_MAGIC = 0x564E4931u; // "1INV"
+static const uint32_t BLOCK_INDEX_TIP_INVALID_FILE_VERSION = 1;
 
 static bool SetError(std::string* error, const std::string& message)
 {
@@ -85,13 +92,17 @@ static bool EncodeTipMeta(const BlockIndexTipMeta& meta, std::string* out)
     WriteRawLE64(b, meta.tipRecordCount);
     WriteRawLE32(b, meta.activeFence);
     b.insert(b.end(), meta.contentDigest, meta.contentDigest + 32);
+    // v2: durable operator-invalid log commitment (same commit point).
+    WriteRawLE32(b, meta.invalidLogCount);
+    b.insert(b.end(), meta.invalidDigest, meta.invalidDigest + 32);
     out->assign((const char*)&b[0], b.size());
     return true;
 }
 
 static bool DecodeTipMeta(const char* data, size_t size, BlockIndexTipMeta* out)
 {
-    // layout: 4 + 8 + 8 + 4 + 4 + 32 + 8 + 4 + 32 = 104 bytes
+    // v1 layout: 4 + 8 + 8 + 4 + 4 + 32 + 8 + 4 + 32 = 104 bytes
+    // v2 layout: v1 + invalidLogCount(4) + invalidDigest(32) = 140 bytes
     if (size < 104)
         return false;
     const unsigned char* p = (const unsigned char*)data;
@@ -105,8 +116,26 @@ static bool DecodeTipMeta(const char* data, size_t size, BlockIndexTipMeta* out)
     m.tipRecordCount = ReadRawLE64(p + 60);
     m.activeFence = (uint8_t)ReadRawLE32(p + 68);
     memcpy(m.contentDigest, p + 72, 32);
-    if (m.version != BLOCK_INDEX_TIP_META_VERSION)
+    // Backward-safe version handling. Accept the previous supported version
+    // (v1: no operator-invalid authority -> EMPTY set). Accept the current
+    // version (v2) only when its full layout is present. Anything else (an
+    // unknown future version, a truncated v2) FAILS CLOSED -- never guessed.
+    if (m.version == BLOCK_INDEX_TIP_META_VERSION_V1)
+    {
+        m.invalidLogCount = 0;
+        memset(m.invalidDigest, 0, 32);
+    }
+    else if (m.version == BLOCK_INDEX_TIP_META_VERSION)
+    {
+        if (size < 140)
+            return false;
+        m.invalidLogCount = ReadRawLE32(p + 104);
+        memcpy(m.invalidDigest, p + 108, 32);
+    }
+    else
+    {
         return false;
+    }
     *out = m;
     return true;
 }
@@ -150,6 +179,117 @@ static void ComputeContentDigest(const BlockIndexTipMeta& meta,
     }
     SHA256_Update(&ctx, &meta.activeFence, 1);
     SHA256_Final(digest, &ctx);
+}
+
+// ---- v2 operator-invalid log ----
+// An entry is one operator intent applied in append order: intent 1 marks the
+// hash operator-invalid, intent 0 (reconsider) clears it. The derived set is
+// the replay of the committed prefix (last intent wins). This keeps the store
+// append-only so tip.meta (invalidLogCount) remains the sole commit point and
+// Open truncates an uncommitted tail exactly like the other tip stores.
+struct BlockIndexTipInvalidEntry
+{
+    uint256 hash;
+    uint8_t intent; // 1 = invalidate, 0 = reconsider
+
+    BlockIndexTipInvalidEntry() : hash(0), intent(0) {}
+};
+
+static void ComputeInvalidDigest(const std::vector<BlockIndexTipInvalidEntry>& entries,
+                                 unsigned char digest[32])
+{
+    SHA256_CTX ctx;
+    SHA256_Init(&ctx);
+    unsigned char versionBytes[4] = {0, 0, 0, BLOCK_INDEX_TIP_INVALID_FILE_VERSION};
+    (void)versionBytes; // version is a constant tag; bind the count + entries
+    for (int j = 0; j < 4; ++j)
+    {
+        unsigned char b = (unsigned char)((BLOCK_INDEX_TIP_INVALID_FILE_VERSION >> (8 * j)) & 0xff);
+        SHA256_Update(&ctx, &b, 1);
+    }
+    for (int j = 0; j < 4; ++j)
+    {
+        unsigned char b = (unsigned char)(((uint32_t)entries.size() >> (8 * j)) & 0xff);
+        SHA256_Update(&ctx, &b, 1);
+    }
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        SHA256_Update(&ctx, entries[i].hash.begin(), 32);
+        SHA256_Update(&ctx, &entries[i].intent, 1);
+    }
+    SHA256_Final(digest, &ctx);
+}
+
+static bool WriteInvalidFile(const fs::path& path,
+                             const std::vector<BlockIndexTipInvalidEntry>& entries)
+{
+    std::vector<unsigned char> b;
+    WriteRawLE32(b, BLOCK_INDEX_TIP_INVALID_MAGIC);
+    WriteRawLE32(b, BLOCK_INDEX_TIP_INVALID_FILE_VERSION);
+    WriteRawLE32(b, (uint32_t)entries.size());
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        b.insert(b.end(), entries[i].hash.begin(), entries[i].hash.end());
+        b.push_back(entries[i].intent);
+    }
+    FILE* f = fopen(path.string().c_str(), "wb");
+    if (!f)
+        return false;
+    if (!b.empty() && fwrite(&b[0], 1, b.size(), f) != b.size())
+    {
+        fclose(f);
+        return false;
+    }
+    FileCommit(f);
+    fclose(f);
+    return true;
+}
+
+// Parse the invalid log. Returns true on a well-formed file (magic + version
+// match, bounded entry count); entries beyond the committed count are kept so
+// the caller can truncate an uncommitted tail. Returns false on a malformed
+// header (fail closed).
+static bool ParseInvalidFile(const std::string& data,
+                             std::vector<BlockIndexTipInvalidEntry>* out)
+{
+    if (data.size() < BLOCK_INDEX_TIP_INVALID_HEADER_SIZE)
+        return false;
+    const unsigned char* p = (const unsigned char*)data.data();
+    if (ReadRawLE32(p + 0) != BLOCK_INDEX_TIP_INVALID_MAGIC)
+        return false;
+    if (ReadRawLE32(p + 4) != BLOCK_INDEX_TIP_INVALID_FILE_VERSION)
+        return false;
+    uint32_t count = ReadRawLE32(p + 8);
+    size_t avail = (data.size() - BLOCK_INDEX_TIP_INVALID_HEADER_SIZE) /
+                   BLOCK_INDEX_TIP_INVALID_ENTRY_SIZE;
+    if (count > avail)
+        return false; // header claims more committed entries than are present
+    out->clear();
+    for (uint32_t i = 0; i < count; ++i)
+    {
+        const unsigned char* e = p + BLOCK_INDEX_TIP_INVALID_HEADER_SIZE +
+                                 (size_t)i * BLOCK_INDEX_TIP_INVALID_ENTRY_SIZE;
+        BlockIndexTipInvalidEntry ent;
+        memcpy(ent.hash.begin(), e, 32);
+        ent.intent = e[32];
+        if (ent.intent != 0 && ent.intent != 1)
+            return false; // undefined intent -> deterministic reject
+        out->push_back(ent);
+    }
+    return true;
+}
+
+static void DeriveInvalidSet(const std::vector<BlockIndexTipInvalidEntry>& entries,
+                             std::set<uint256>* out)
+{
+    out->clear();
+    for (size_t i = 0; i < entries.size(); ++i)
+    {
+        if (entries[i].intent == 1)
+            out->insert(entries[i].hash);
+        else
+            out->erase(entries[i].hash);
+    }
 }
 
 // ---- file helpers ----
@@ -265,6 +405,7 @@ struct BlockIndexTipAuthority::Impl
     fs::path recordsPath;
     fs::path activePath;
     fs::path derivedPath;
+    fs::path invalidPath;
 
     BlockIndexTipMeta meta;
 
@@ -273,6 +414,10 @@ struct BlockIndexTipAuthority::Impl
     std::vector<BlockIndexDerivedEntry> derived;
     std::vector<BlockIndexId> activeIds; // dense: activeIds[h] = RecordId for height h
     std::map<uint256, BlockIndexId> hashToId;
+
+    // v2 durable operator-invalid authority (by-value; no CBlockIndex).
+    std::vector<BlockIndexTipInvalidEntry> invalidEntries; // committed log prefix
+    std::set<uint256> invalidSet;                          // derived set
 
     bool open;
 
@@ -286,6 +431,7 @@ struct BlockIndexTipAuthority::Impl
         recordsPath = tipDir / BLOCK_INDEX_TIP_RECORDS_FILE;
         activePath = tipDir / BLOCK_INDEX_TIP_ACTIVE_FILE;
         derivedPath = tipDir / BLOCK_INDEX_TIP_DERIVED_FILE;
+        invalidPath = tipDir / BLOCK_INDEX_TIP_INVALID_FILE;
         return true;
     }
 
@@ -366,10 +512,15 @@ bool BlockIndexTipAuthority::Create(const std::string& root,
         return SetError(error, "init tip-active failed");
     if (!WriteDerivedFile(i->derivedPath, i->derived))
         return SetError(error, "init tip-derived failed");
+    // v2: create the (empty) operator-invalid log so the store set is complete.
+    if (!WriteInvalidFile(i->invalidPath, i->invalidEntries))
+        return SetError(error, "init tip-invalid failed");
     // compute the content digest over the (empty) committed region so that a
     // subsequent Open's recomputation matches (it must not be all-zero).
     ComputeContentDigest(i->meta, i->records, i->derived, i->activeIds,
                          i->meta.contentDigest);
+    ComputeInvalidDigest(i->invalidEntries, i->meta.invalidDigest);
+    i->meta.invalidLogCount = 0;
     if (!i->WriteMeta(error))
         return false;
     i->open = true;
@@ -508,9 +659,35 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
         i->meta.contentDigest[0] = 0;
     }
 
+    // 8. v2: load + validate the committed operator-invalid log. tip.meta's
+    //    invalidLogCount is the commit point for the log, exactly as
+    //    tipRecordCount is for tip-records: a longer file is an uncommitted
+    //    tail (crash mid-commit) and is truncated; a shorter file, a digest
+    //    mismatch, or a malformed header FAIL CLOSED. A v1 tip carries an
+    //    EMPTY set (backward compatible; no rewrite merely to read it).
+    std::vector<BlockIndexTipInvalidEntry> invalidEntries;
+    if (meta.invalidLogCount > 0)
+    {
+        std::string invData;
+        if (!ReadWholeFile(i->invalidPath, &invData))
+            return SetError(error, "read tip-invalid failed (committed set missing)");
+        if (!ParseInvalidFile(invData, &invalidEntries))
+            return SetError(error, "parse tip-invalid failed (corrupt)");
+        if (invalidEntries.size() < meta.invalidLogCount)
+            return SetError(error, "tip-invalid short of committed count (corrupt)");
+        if (invalidEntries.size() > meta.invalidLogCount)
+            invalidEntries.resize(meta.invalidLogCount); // drop uncommitted tail
+        unsigned char invDigest[32];
+        ComputeInvalidDigest(invalidEntries, invDigest);
+        if (memcmp(invDigest, meta.invalidDigest, 32) != 0)
+            return SetError(error, "tip-invalid digest mismatch (corrupt)");
+    }
+
     i->records = records;
     i->derived = derived;
     i->activeIds = activeIds;
+    i->invalidEntries = invalidEntries;
+    DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
     i->open = true;
     ClearError(error);
     return true;
@@ -580,9 +757,14 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         return SetError(error, "append tip-derived failed"), BLOCK_INDEX_TIP_IO_ERROR;
     if (!WriteActiveFile(i->activePath, allActive))
         return SetError(error, "append tip-active failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    // v2: keep the store set complete and upgrade an opened v1 tip
+    // deterministically on the first legitimate new commit.
+    if (!WriteInvalidFile(i->invalidPath, i->invalidEntries))
+        return SetError(error, "append tip-invalid failed"), BLOCK_INDEX_TIP_IO_ERROR;
 
     // 2. Advance tip.meta.
     BlockIndexTipMeta newMeta = i->meta;
+    newMeta.version = BLOCK_INDEX_TIP_META_VERSION; // v1 -> v2 upgrade on write
     newMeta.tipRecordCount = allRecords.size();
     if (!allActive.empty())
     {
@@ -780,6 +962,124 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     return BLOCK_INDEX_TIP_OK;
 }
 
+BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
+    const uint256& hash, bool invalidate,
+    int32_t forkHeight,
+    const std::vector<BlockIndexTipAppend>& branch,
+    const std::vector<int32_t>& branchHeights,
+    std::string* error)
+{
+    if (!impl->open)
+        return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (branch.size() != branchHeights.size())
+        return SetError(error, "fused reorg branch size mismatch"), BLOCK_INDEX_TIP_CORRUPT;
+    Impl* i = impl;
+    const int32_t baseTip = i->meta.baseTipHeight;
+
+    // (a) operator-invalid intent -- idempotent (no log entry if unchanged).
+    std::vector<BlockIndexTipInvalidEntry> allEntries = i->invalidEntries;
+    const bool currentlyInvalid = i->invalidSet.count(hash) != 0;
+    if (currentlyInvalid != invalidate)
+    {
+        BlockIndexTipInvalidEntry ent;
+        ent.hash = hash;
+        ent.intent = invalidate ? 1 : 0;
+        allEntries.push_back(ent);
+    }
+
+    // (b) resulting active membership (fused from ReorgActiveTo steps 1-2).
+    if (forkHeight < baseTip || forkHeight >= baseTip + (int32_t)i->activeIds.size())
+    {
+        if (forkHeight != baseTip)
+            return SetError(error, "fused reorg fork height out of range"), BLOCK_INDEX_TIP_CORRUPT;
+    }
+    std::vector<BlockIndexId> baseActive;
+    if (forkHeight > baseTip)
+        baseActive.assign(i->activeIds.begin(), i->activeIds.begin() + (forkHeight - baseTip));
+
+    std::vector<BlockIndexRecord> allRecords = i->records;
+    std::vector<BlockIndexDerivedEntry> allDerived = i->derived;
+    std::vector<BlockIndexId> newActive = baseActive;
+    std::set<uint256> seenBranch;
+    for (size_t k = 0; k < branch.size(); ++k)
+    {
+        const BlockIndexRecord& rec = branch[k].record;
+        const int32_t expectedHeight = baseTip + (int32_t)newActive.size() + 1;
+        if (branchHeights[k] != expectedHeight)
+            return SetError(error, "fused reorg branch non-dense height"), BLOCK_INDEX_TIP_CORRUPT;
+        if (!seenBranch.insert(rec.hash).second)
+            return SetError(error, "fused reorg branch duplicate"), BLOCK_INDEX_TIP_CORRUPT;
+        std::map<uint256, BlockIndexId>::iterator it = i->hashToId.find(rec.hash);
+        if (it != i->hashToId.end())
+            newActive.push_back(it->second); // promote existing side record
+        else
+        {
+            BlockIndexId newId = i->baseLocalToId(allRecords.size());
+            allRecords.push_back(rec);
+            allDerived.push_back(branch[k].derived);
+            newActive.push_back(newId);
+        }
+    }
+    std::vector<BlockIndexId> allActive = newActive;
+
+    // Persist all four stores. tip.meta below is the SOLE commit point for BOTH
+    // the invalid log and the active membership (uncommitted tails are ignored).
+    if (!WriteRecordsFile(i->recordsPath, allRecords))
+        return SetError(error, "fused tip-records failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!WriteDerivedFile(i->derivedPath, allDerived))
+        return SetError(error, "fused tip-derived failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!WriteActiveFile(i->activePath, allActive))
+        return SetError(error, "fused tip-active failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!WriteInvalidFile(i->invalidPath, allEntries))
+        return SetError(error, "fused tip-invalid failed"), BLOCK_INDEX_TIP_IO_ERROR;
+
+    // ONE tip.meta commit: invalid intent AND the resulting active tip together.
+    const BlockIndexTipMeta savedMeta = i->meta;
+    const std::vector<BlockIndexRecord> savedRecords = i->records;
+    const std::vector<BlockIndexDerivedEntry> savedDerived = i->derived;
+    const std::vector<BlockIndexId> savedActive = i->activeIds;
+    const std::vector<BlockIndexTipInvalidEntry> savedEntries = i->invalidEntries;
+
+    BlockIndexTipMeta newMeta = i->meta;
+    newMeta.version = BLOCK_INDEX_TIP_META_VERSION;
+    newMeta.activeFence++;
+    newMeta.tipRecordCount = allRecords.size();
+    newMeta.tipHeight = baseTip + (int32_t)allActive.size();
+    if (allActive.empty())
+        newMeta.tipHash = uint256(0);
+    else
+    {
+        BlockIndexId tipId = allActive.back();
+        for (size_t j = 0; j < allRecords.size(); ++j)
+            if (i->baseLocalToId(j) == tipId) newMeta.tipHash = allRecords[j].hash;
+    }
+    ComputeContentDigest(newMeta, allRecords, allDerived, allActive, newMeta.contentDigest);
+    newMeta.invalidLogCount = (uint32_t)allEntries.size();
+    ComputeInvalidDigest(allEntries, newMeta.invalidDigest);
+
+    i->meta = newMeta;
+    i->invalidEntries = allEntries;
+    DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
+    if (!i->WriteMeta(error))
+    {
+        i->meta = savedMeta;
+        i->records = savedRecords;
+        i->derived = savedDerived;
+        i->activeIds = savedActive;
+        i->invalidEntries = savedEntries;
+        DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
+        return BLOCK_INDEX_TIP_IO_ERROR;
+    }
+    i->records = allRecords;
+    i->derived = allDerived;
+    i->activeIds = allActive;
+    i->hashToId.clear();
+    for (size_t j = 0; j < allRecords.size(); ++j)
+        i->hashToId[allRecords[j].hash] = i->baseLocalToId(j);
+    ClearError(error);
+    return BLOCK_INDEX_TIP_OK;
+}
+
 BlockIndexTipRead BlockIndexTipAuthority::GetTip() const
 {
     BlockIndexTipRead r;
@@ -875,6 +1175,128 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupActiveByHeight(int32_t height, s
     return r;
 }
 
+BlockIndexTipStatus BlockIndexTipAuthority::AllRecords(std::vector<BlockIndexTipRead>* out,
+                                                       std::string* error) const
+{
+    if (out) out->clear();
+    if (!impl->open)
+    {
+        if (error) *error = "tip not open";
+        return BLOCK_INDEX_TIP_IO_ERROR;
+    }
+    for (size_t j = 0; j < impl->records.size(); ++j)
+    {
+        BlockIndexId id = impl->baseLocalToId(j);
+        BlockIndexTipRead r;
+        r.status = BLOCK_INDEX_TIP_OK;
+        r.record = impl->records[j];
+        r.derived = impl->derived[j];
+        r.height = impl->records[j].height;
+        r.active = false;
+        for (size_t h = 0; h < impl->activeIds.size(); ++h)
+            if (impl->activeIds[h] == id) { r.active = true; break; }
+        if (out) out->push_back(r);
+    }
+    return BLOCK_INDEX_TIP_OK;
+}
+
+BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
+    int32_t forkHeight, const uint256& pendingHash, bool pendingInvalidate,
+    std::vector<BlockIndexTipAppend>* outBranch, std::vector<int32_t>* outHeights,
+    uint256* outBestHash, int32_t* outBestHeight, std::string* error) const
+{
+    if (outBranch) outBranch->clear();
+    if (outHeights) outHeights->clear();
+    if (outBestHash) *outBestHash = 0;
+    if (outBestHeight) *outBestHeight = forkHeight;
+    if (!impl->open)
+    {
+        if (error) *error = "tip not open";
+        return BLOCK_INDEX_TIP_IO_ERROR;
+    }
+
+    std::map<uint256, size_t> localOf;
+    for (size_t j = 0; j < impl->records.size(); ++j)
+        localOf[impl->records[j].hash] = j;
+
+    bool found = false;
+    size_t bestJ = 0;
+    for (size_t j = 0; j < impl->records.size(); ++j)
+    {
+        const BlockIndexRecord& rec = impl->records[j];
+        if (rec.height <= forkHeight) continue;          // at/below the fork
+        // Effective eligibility: the PENDING intent overrides the committed set for
+        // the target hash (invalidate => treat as invalid; reconsider => treat as
+        // eligible), so a reconsider can re-select the branch it restores.
+        bool selfInvalid = (rec.hash == pendingHash)
+                               ? pendingInvalidate
+                               : (impl->invalidSet.count(rec.hash) != 0);
+        if (selfInvalid) continue;
+        // Authenticate ancestry up to the fork: every intermediate must be present
+        // in the tip window, height-consistent, and not operator-invalid.
+        int32_t h = rec.height;
+        uint256 cur = rec.hashPrev;
+        bool ok = true;
+        // Walk down to the fork-adjacent node (height forkHeight+1). Its parent IS
+        // the fork itself, which may be the immutable base tip and is therefore NOT
+        // in the tip record window -- do not require it to be present here.
+        while (h > forkHeight + 1)
+        {
+            bool ancInvalid = (cur == pendingHash)
+                                  ? pendingInvalidate
+                                  : (impl->invalidSet.count(cur) != 0);
+            if (ancInvalid) { ok = false; break; }
+            std::map<uint256, size_t>::const_iterator it = localOf.find(cur);
+            if (it == localOf.end()) { ok = false; break; }  // leaves the tip window
+            const BlockIndexRecord& p = impl->records[it->second];
+            if (p.height + 1 != h) { ok = false; break; }    // inconsistent linkage
+            cur = p.hashPrev;
+            h = p.height;
+        }
+        if (!ok) continue;
+        if (!found ||
+            impl->derived[j].chainTrust > impl->derived[bestJ].chainTrust ||
+            (impl->derived[j].chainTrust == impl->derived[bestJ].chainTrust &&
+             rec.hash < impl->records[bestJ].hash))
+        {
+            found = true;
+            bestJ = j;
+        }
+    }
+
+    if (!found)
+        return BLOCK_INDEX_TIP_OK;   // no eligible candidate above fork -> tip = fork
+
+    // Reconstruct the branch (fork+1 .. bestTip) ascending into a temp vector.
+    std::vector<size_t> chain;
+    size_t j = bestJ;
+    while (true)
+    {
+        chain.push_back(j);
+        if (impl->records[j].height <= forkHeight + 1)
+            break;   // fork-adjacent node: its parent is the fork (not in window)
+        std::map<uint256, size_t>::const_iterator it = localOf.find(impl->records[j].hashPrev);
+        if (it == localOf.end())
+        {
+            if (error) *error = "branch walk lost parent below tip window";
+            return BLOCK_INDEX_TIP_CORRUPT;
+        }
+        j = it->second;
+    }
+    for (size_t k = chain.size(); k-- > 0; )
+    {
+        size_t idx = chain[k];
+        BlockIndexTipAppend ap;
+        ap.record = impl->records[idx];
+        ap.derived = impl->derived[idx];
+        if (outBranch) outBranch->push_back(ap);
+        if (outHeights) outHeights->push_back(impl->records[idx].height);
+    }
+    if (outBestHash) *outBestHash = impl->records[bestJ].hash;
+    if (outBestHeight) *outBestHeight = impl->records[bestJ].height;
+    return BLOCK_INDEX_TIP_OK;
+}
+
 BlockIndexTipRead BlockIndexTipAuthority::LookupParent(const uint256& childHash, std::string* error) const
 {
     BlockIndexTipRead child = LookupByHash(childHash, error);
@@ -903,6 +1325,78 @@ uint64_t BlockIndexTipAuthority::TipRecordCount() const { return impl->meta.tipR
 uint8_t BlockIndexTipAuthority::ActiveFence() const { return impl->meta.activeFence; }
 bool BlockIndexTipAuthority::IsOpen() const { return impl->open; }
 bool BlockIndexTipAuthority::IsEmpty() const { return impl->open && impl->records.empty(); }
+
+// ---- v2 durable operator-invalid authority ----
+uint32_t BlockIndexTipAuthority::InvalidLogCount() const
+{
+    return impl->meta.invalidLogCount;
+}
+
+bool BlockIndexTipAuthority::IsOperatorInvalid(const uint256& hash) const
+{
+    return impl->invalidSet.count(hash) != 0;
+}
+
+std::set<uint256> BlockIndexTipAuthority::OperatorInvalidSet() const
+{
+    return impl->invalidSet;
+}
+
+BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& hash,
+                                                               bool invalidate,
+                                                               std::string* error)
+{
+    if (!impl->open)
+        return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
+    Impl* i = impl;
+
+    // Idempotent: an intent that does not change the derived state is a no-op
+    // (no log entry, no commit). Keeps the log bounded by real transitions.
+    const bool currentlyInvalid = i->invalidSet.count(hash) != 0;
+    if (currentlyInvalid == invalidate)
+    {
+        ClearError(error);
+        return BLOCK_INDEX_TIP_OK;
+    }
+
+    // Append the intent. The log is append-only and replay-ordered (last intent
+    // for a hash wins), so this keeps tip.meta as the sole commit point.
+    std::vector<BlockIndexTipInvalidEntry> allEntries = i->invalidEntries;
+    BlockIndexTipInvalidEntry ent;
+    ent.hash = hash;
+    ent.intent = invalidate ? 1 : 0;
+    allEntries.push_back(ent);
+
+    // 1. Persist the extended log. Still guarded by the OLD tip.meta commit
+    //    point: if the meta write below fails, Open truncates the extra entry.
+    if (!WriteInvalidFile(i->invalidPath, allEntries))
+        return SetError(error, "write tip-invalid failed"), BLOCK_INDEX_TIP_IO_ERROR;
+
+    // 2. Commit point: advance tip.meta with the new committed length + digest.
+    //    The operator-invalid set is thereby part of the SAME mutable authority
+    //    publication as the committed tip.
+    const BlockIndexTipMeta savedMeta = i->meta;
+    const std::vector<BlockIndexTipInvalidEntry> savedEntries = i->invalidEntries;
+    BlockIndexTipMeta newMeta = i->meta;
+    newMeta.version = BLOCK_INDEX_TIP_META_VERSION;
+    newMeta.invalidLogCount = (uint32_t)allEntries.size();
+    ComputeInvalidDigest(allEntries, newMeta.invalidDigest);
+
+    i->meta = newMeta;
+    i->invalidEntries = allEntries;
+    DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
+    if (!i->WriteMeta(error))
+    {
+        // Roll the in-memory authority back so it matches the committed disk
+        // state (the caller sees a failed publish, not a phantom one).
+        i->meta = savedMeta;
+        i->invalidEntries = savedEntries;
+        DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
+        return BLOCK_INDEX_TIP_IO_ERROR;
+    }
+    ClearError(error);
+    return BLOCK_INDEX_TIP_OK;
+}
 
 void BlockIndexTipAuthority::Close()
 {

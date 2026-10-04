@@ -116,6 +116,14 @@ std::string AuthorityReadyStateName();
 std::string AuthoritativeRootPath();
 uint64_t AuthoritativeGeneration();
 
+// V2-R2 (PM1-P0-01/P0-09): the immutable base tip height S of the retained
+// authoritative generation (the bootstrap best-tip anchor), or -1 when not in
+// authoritative mode / no base open. This is the immutable base boundary; a
+// post-S reorg must have forkHeight >= S, and a fork below S is not representable
+// by the mutable tail and must fail closed. NOTE: this returns the BASE tip S,
+// NOT the published best tip (which may be L > S after PM1-P0-01).
+int32_t AuthoritativeBaseTipHeight();
+
 // A.10.1q / Stage1: emit the BLOCKINDEX_RESIDENCY line for the retained
 // authoritative context, including the bootstrap HotOwner live metrics.
 void PrintAuthoritativeResidency(const char* tag);
