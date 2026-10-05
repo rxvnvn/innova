@@ -181,18 +181,18 @@ BOOST_AUTO_TEST_CASE(current_codec_exact_bytes_roundtrip_and_fail_closed)
 
 BOOST_AUTO_TEST_CASE(generation_naming_are_exact_and_large_ids_supported)
 {
-    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationName(1), std::string("gen-000001"));
-    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationName(2), std::string("gen-000002"));
-    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::StagingName(1), std::string("build-000001.tmp"));
-    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::StagingName(2), std::string("build-000002.tmp"));
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationName(1), std::string("blockindex-gen-000001"));
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationName(2), std::string("blockindex-gen-000002"));
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::StagingName(1), std::string("blockindex-build-000001.tmp"));
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::StagingName(2), std::string("blockindex-build-000002.tmp"));
     // large ids
-    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationName(999999), std::string("gen-999999"));
-    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationName(1000000), std::string("gen-1000000"));
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationName(999999), std::string("blockindex-gen-999999"));
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationName(1000000), std::string("blockindex-gen-1000000"));
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationName(18446744073709551615ULL),
-                      std::string("gen-18446744073709551615"));
+                      std::string("blockindex-gen-18446744073709551615"));
     // path forms
-    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationPath("/r", 1), "/r/gen-000001");
-    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::StagingPath("/r", 1), "/r/build-000001.tmp");
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::GenerationPath("/r", 1), "/r/blockindex-gen-000001");
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::StagingPath("/r", 1), "/r/blockindex-build-000001.tmp");
 }
 
 BOOST_AUTO_TEST_CASE(publish_select_open_lifecycle_roundtrip)
@@ -214,8 +214,8 @@ BOOST_AUTO_TEST_CASE(publish_select_open_lifecycle_roundtrip)
     // publish build-1.tmp -> gen-1
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error),
                       (int)BLOCK_INDEX_LIFECYCLE_OK);
-    BOOST_CHECK(boost::filesystem::exists(boost::filesystem::path(root.string()) / "gen-000001"));
-    BOOST_CHECK(!boost::filesystem::exists(boost::filesystem::path(root.string()) / "build-000001.tmp"));
+    BOOST_CHECK(boost::filesystem::exists(boost::filesystem::path(root.string()) / "blockindex-gen-000001"));
+    BOOST_CHECK(!boost::filesystem::exists(boost::filesystem::path(root.string()) / "blockindex-build-000001.tmp"));
 
     // publication does NOT change CURRENT (absent still)
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::ReadCurrent(root.string(), &cur, &error),
@@ -228,7 +228,7 @@ BOOST_AUTO_TEST_CASE(publish_select_open_lifecycle_roundtrip)
     // select generation 1 -> writes CURRENT
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error),
                       (int)BLOCK_INDEX_LIFECYCLE_OK);
-    BOOST_CHECK(boost::filesystem::exists(boost::filesystem::path(root.string()) / "CURRENT"));
+    BOOST_CHECK(boost::filesystem::exists(boost::filesystem::path(root.string()) / "blockindex-current"));
 
     // CURRENT now resolves to 1
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::ReadCurrent(root.string(), &cur, &error),
@@ -251,7 +251,7 @@ BOOST_AUTO_TEST_CASE(publish_rejects_building_corrupt_id_mismatch_and_missing_co
     BuildStaging(root.string(), 1);
     // corrupt MANIFEST state to BUILDING manually
     {
-        std::string mp = (boost::filesystem::path(root.string()) / "build-000001.tmp" / BLOCK_INDEX_MANIFEST_FILE_NAME).string();
+        std::string mp = (boost::filesystem::path(root.string()) / "blockindex-build-000001.tmp" / BLOCK_INDEX_MANIFEST_FILE_NAME).string();
         unsigned char d[88];
         FILE* g = fopen(mp.c_str(), "rb");
         BOOST_REQUIRE(g != NULL);
@@ -268,7 +268,7 @@ BOOST_AUTO_TEST_CASE(publish_rejects_building_corrupt_id_mismatch_and_missing_co
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error),
                       (int)BLOCK_INDEX_LIFECYCLE_ERROR);
     BOOST_CHECK(!error.empty());
-    BOOST_CHECK(!boost::filesystem::exists(boost::filesystem::path(root.string()) / "gen-000001"));
+    BOOST_CHECK(!boost::filesystem::exists(boost::filesystem::path(root.string()) / "blockindex-gen-000001"));
 
     // 2) generation-id mismatch: build as gen 2 but publish as gen 1
     boost::filesystem::path root2 = UniqueRoot("reject-id");
@@ -282,7 +282,7 @@ BOOST_AUTO_TEST_CASE(publish_rejects_building_corrupt_id_mismatch_and_missing_co
     // 3) missing required component (delete records.dat)
     boost::filesystem::path root3 = UniqueRoot("reject-missing");
     BuildStaging(root3.string(), 1);
-    boost::filesystem::remove(boost::filesystem::path(root3.string()) / "build-000001.tmp" / BLOCK_INDEX_RECORDS_FILE_NAME);
+    boost::filesystem::remove(boost::filesystem::path(root3.string()) / "blockindex-build-000001.tmp" / BLOCK_INDEX_RECORDS_FILE_NAME);
     error.clear();
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::PublishGeneration(root3.string(), 1, &error),
                       (int)BLOCK_INDEX_LIFECYCLE_ERROR);
@@ -343,9 +343,9 @@ BOOST_AUTO_TEST_CASE(current_absent_corrupt_and_missing_generation_semantics)
         BlockIndexCurrentRecord r; r.generation = 99;
         EncodeBlockIndexCurrentRecord(r, &enc, &err2);
         // write CURRENT.tmp then rename over (use the durable writer semantics)
-        FILE* f = fopen((root.string() + "/CURRENT.tmp").c_str(), "wb");
+        FILE* f = fopen((root.string() + "/blockindex-current.tmp").c_str(), "wb");
         fwrite(enc.data(), 1, enc.size(), f); fclose(f);
-        rename((root.string() + "/CURRENT.tmp").c_str(), (root.string() + "/CURRENT").c_str());
+        rename((root.string() + "/blockindex-current.tmp").c_str(), (root.string() + "/blockindex-current").c_str());
     }
     error.clear();
     sel = 0;
@@ -387,7 +387,7 @@ BOOST_AUTO_TEST_CASE(rollback_selection_switches_between_generations)
     BOOST_CHECK_EQUAL(sel, 1ULL);
 
     // neither generation modified by selection
-    BOOST_CHECK(boost::filesystem::exists(boost::filesystem::path(root.string()) / "gen-000002"));
+    BOOST_CHECK(boost::filesystem::exists(boost::filesystem::path(root.string()) / "blockindex-gen-000002"));
     BlockIndexCurrentRecord cur;
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::ReadCurrent(root.string(), &cur, &error), (int)BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_CHECK_EQUAL(cur.generation, 1ULL);
@@ -398,9 +398,9 @@ BOOST_AUTO_TEST_CASE(no_auto_discovery_and_orphan_and_build_ignored)
     boost::filesystem::path root = UniqueRoot("nodiscovery");
     std::string error;
     // place several stable gen dirs + a higher orphan + a build tmp
-    BuildGenerationInto(root.string(), 1, "gen-000001", 3, 1, 1000, 2000);
-    BuildGenerationInto(root.string(), 2, "gen-000002", 3, 1, 3000, 4000);
-    BuildGenerationInto(root.string(), 999999, "gen-999999", 3, 1, 5000, 6000);
+    BuildGenerationInto(root.string(), 1, "blockindex-gen-000001", 3, 1, 1000, 2000);
+    BuildGenerationInto(root.string(), 2, "blockindex-gen-000002", 3, 1, 3000, 4000);
+    BuildGenerationInto(root.string(), 999999, "blockindex-gen-999999", 3, 1, 5000, 6000);
     BuildStaging(root.string(), 3); // build-000003.tmp
 
     // CURRENT -> gen-000001
@@ -417,7 +417,7 @@ BOOST_AUTO_TEST_CASE(no_auto_discovery_and_orphan_and_build_ignored)
     BOOST_CHECK_EQUAL(BlockIndexGenerationManager::OpenCurrent(root.string(), &sel, &error),
                       (int)BLOCK_INDEX_LIFECYCLE_NOT_PUBLISHED);
     // build-3 must never be selected even if it is COMPLETE
-    BOOST_REQUIRE(boost::filesystem::exists(boost::filesystem::path(root.string()) / "build-000003.tmp"));
+    BOOST_REQUIRE(boost::filesystem::exists(boost::filesystem::path(root.string()) / "blockindex-build-000003.tmp"));
 }
 
 BOOST_AUTO_TEST_SUITE_END()

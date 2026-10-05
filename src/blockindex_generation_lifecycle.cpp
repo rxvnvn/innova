@@ -214,7 +214,7 @@ bool DecodeBlockIndexCurrentRecord(const char* data, size_t size, BlockIndexCurr
 
 std::string BlockIndexGenerationManager::GenerationName(uint64_t generation)
 {
-    return strprintf("gen-%06llu", (unsigned long long)generation);
+    return strprintf("blockindex-gen-%06llu", (unsigned long long)generation);
 }
 
 std::string BlockIndexGenerationManager::GenerationPath(const std::string& root, uint64_t generation)
@@ -224,7 +224,7 @@ std::string BlockIndexGenerationManager::GenerationPath(const std::string& root,
 
 std::string BlockIndexGenerationManager::StagingName(uint64_t generation)
 {
-    return strprintf("build-%06llu.tmp", (unsigned long long)generation);
+    return strprintf("blockindex-build-%06llu.tmp", (unsigned long long)generation);
 }
 
 std::string BlockIndexGenerationManager::StagingPath(const std::string& root, uint64_t generation)
@@ -424,7 +424,7 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
     {
         if (dir.filename().string() != GenerationName(generation))
         {
-            SetError(error, "generation directory name does not match gen-%06llu: " + dir.string());
+            SetError(error, "generation directory name does not match blockindex-gen-%06llu: " + dir.string());
             return BLOCK_INDEX_LIFECYCLE_ERROR;
         }
         // A build-*.tmp is never a selectable stable generation.

@@ -80,7 +80,7 @@ static void BuildGen(const std::string& root, const std::vector<QBlock>& blocks,
     src.hashBestChain = blocks.back().hash;
     src.foundBestChain = true;
     src.blockDataDir = ::GetDataDir().string(); // builder computes exact nSize from blk*.dat
-    boost::filesystem::path staging = boost::filesystem::path(root) / "build-000001.tmp";
+    boost::filesystem::path staging = boost::filesystem::path(root) / "blockindex-build-000001.tmp";
     { BlockIndexGenerationBuilder b;
       BOOST_REQUIRE_MESSAGE(b.Build(src, staging.string(), generation, NULL, error), *error); b.Close(); }
     BOOST_REQUIRE_MESSAGE(

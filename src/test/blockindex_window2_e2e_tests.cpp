@@ -421,7 +421,7 @@ BOOST_AUTO_TEST_CASE(f2_parent_score_resolver_parity_and_contract)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, &error), error);
     source.blockDataDir = GetDataDir().string();
     BlockIndexGenerationBuilder builder;
-    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, &error), error);
+    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "blockindex-build-000001.tmp").string(), 1, NULL, &error), error);
     builder.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
@@ -461,7 +461,7 @@ static void F2BuildAuthoritativeGenerationAndInit(const fs::path& root, std::str
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, error), *error);
     source.blockDataDir = GetDataDir().string();
     BlockIndexGenerationBuilder builder;
-    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, error), *error);
+    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "blockindex-build-000001.tmp").string(), 1, NULL, error), *error);
     builder.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
@@ -1238,7 +1238,7 @@ BOOST_AUTO_TEST_CASE(r4_authority_ready_published_by_real_authoritative_startup)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
     src.blockDataDir=GetDataDir().string();
     BlockIndexGenerationBuilder ab;
-    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"blockindex-build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
     AuthorityReadyResetForTest();                       // prove the startup itself publishes it
@@ -1389,7 +1389,7 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_provider_failure_matrix)
         brokenSource.blockDataDir = GetDataDir().string();
         BlockIndexGenerationBuilder badBuilder;
         std::string badError;
-        const bool builtBad = badBuilder.Build(brokenSource, (root / "build-broken.tmp").string(), 1, NULL, &badError);
+        const bool builtBad = badBuilder.Build(brokenSource, (root / "blockindex-build-broken.tmp").string(), 1, NULL, &badError);
         BOOST_CHECK_MESSAGE(!builtBad,
             "a generation containing a child with an ABSENT claimed parent must be REJECTED at build time");
         BOOST_TEST_MESSAGE("F2 FM claimed-parent-absent child=" << childOfLostHash.GetHex()
@@ -1403,7 +1403,7 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_provider_failure_matrix)
         BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, &error), error);
         source.blockDataDir = GetDataDir().string();
         BlockIndexGenerationBuilder builder;
-        BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, &error), error);
+        BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "blockindex-build-000001.tmp").string(), 1, NULL, &error), error);
         builder.Close();
     }
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
@@ -1989,7 +1989,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
     src.blockDataDir=GetDataDir().string();
     BlockIndexGenerationBuilder ab;
-    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"blockindex-build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
     AuthorityReadyResetForTest();
@@ -2078,7 +2078,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &src, &aerr), aerr);
     src.blockDataDir = GetDataDir().string();
     BlockIndexGenerationBuilder ab;
-    BOOST_REQUIRE_MESSAGE(ab.Build(src, (root / "build-000001.tmp").string(), 1, NULL, &aerr), aerr); ab.Close();
+    BOOST_REQUIRE_MESSAGE(ab.Build(src, (root / "blockindex-build-000001.tmp").string(), 1, NULL, &aerr), aerr); ab.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
     AuthorityReadyResetForTest();
@@ -2458,7 +2458,7 @@ static bool R2DBuildSyntheticGenerationAndInit(const fs::path& root, int S,
     src.foundBestChain = true;
     src.blockDataDir = (root / "blocks").string();
     BlockIndexGenerationBuilder b;
-    if (!b.Build(src, (root / "build-000001.tmp").string(), 1, NULL, error)) return false;
+    if (!b.Build(src, (root / "blockindex-build-000001.tmp").string(), 1, NULL, error)) return false;
     b.Close();
     if (BlockIndexGenerationManager::PublishGeneration(root.string(), 1, error) != BLOCK_INDEX_LIFECYCLE_OK) return false;
     if (BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error) != BLOCK_INDEX_LIFECYCLE_OK) return false;

@@ -238,7 +238,7 @@ BOOST_AUTO_TEST_CASE(m3_active_chain_streamed)
     delete db; // close before the LM builder opens it read-only
 
     // Run the low-memory builder.
-    const std::string staging = dir + "/build-000001.tmp";
+    const std::string staging = dir + "/blockindex-build-000001.tmp";
     BlockIndexGenerationBuilderLM lm;
     std::string error;
     // builder M2/M3 only supports records+hashindex+active (derived not yet);
@@ -284,7 +284,7 @@ BOOST_AUTO_TEST_CASE(m6_finalized_generation_validates)
     std::vector<uint256> hashes = MakeChain(db, tip);
     delete db;
 
-    const std::string staging = dir + "/build-000001.tmp";
+    const std::string staging = dir + "/blockindex-build-000001.tmp";
     BlockIndexGenerationBuilderLM lm;
     std::string error;
     BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, staging, &error), error);
@@ -295,7 +295,7 @@ BOOST_AUTO_TEST_CASE(m6_finalized_generation_validates)
     bool okps = BlockIndexGenerationWriter::ValidatePublishSelect(dir, 1, &perr);
     printf("  publish/select ok=%d err='%s'\n", (int)okps, perr.c_str());
     BOOST_REQUIRE_MESSAGE(okps, "publish/select: '" + perr + "'");
-    BOOST_REQUIRE(fs::exists(fs::path(dir) / "gen-000001"));
+    BOOST_REQUIRE(fs::exists(fs::path(dir) / "blockindex-gen-000001"));
     printf("M6 PASS: LM builder finalized generation publishes + selects\n");
 }
 
@@ -317,14 +317,14 @@ BOOST_AUTO_TEST_CASE(m7_snapshot_to_live_tip_catchup)
     std::vector<uint256> chainHashes = MakeChain(db, S); // heights 0..S
     delete db;
 
-    const std::string staging = dir + "/build-000001.tmp";
+    const std::string staging = dir + "/blockindex-build-000001.tmp";
     BlockIndexGenerationBuilderLM lm;
     std::string error;
     BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, staging, &error), error);
     std::string perr;
     BOOST_REQUIRE_MESSAGE(BlockIndexGenerationWriter::ValidatePublishSelect(dir, 1, &perr),
                           "publish: " + perr);
-    BOOST_REQUIRE(fs::exists(fs::path(dir) / "gen-000001"));
+    BOOST_REQUIRE(fs::exists(fs::path(dir) / "blockindex-gen-000001"));
 
     // (2) capture S+1..L into blockindex_tip while legacy advanced.
     const uint64_t baseRec = (uint64_t)(S + 1);
@@ -413,7 +413,7 @@ BOOST_AUTO_TEST_CASE(v2r1_mainnet_pre_poem_trust_parity)
     delete db;
 
     BlockIndexGenerationBuilderLM lm; std::string lerr;
-    BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, dir + "/build-000001.tmp", &lerr), lerr);
+    BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, dir + "/blockindex-build-000001.tmp", &lerr), lerr);
 
     std::string perr;
     BOOST_REQUIRE_MESSAGE(BlockIndexGenerationWriter::ValidatePublishSelect(dir, 1, &perr), perr);
@@ -458,7 +458,7 @@ BOOST_AUTO_TEST_CASE(v2r1_poem_dag_boundary_trust_parity)
     delete db;
 
     BlockIndexGenerationBuilderLM lm; std::string lerr;
-    BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, dir + "/build-000001.tmp", &lerr), lerr);
+    BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, dir + "/blockindex-build-000001.tmp", &lerr), lerr);
     std::string perr;
     BOOST_REQUIRE_MESSAGE(BlockIndexGenerationWriter::ValidatePublishSelect(dir, 1, &perr), perr);
     BlockIndexV2Reader reader; BlockIndexV2ReaderOptions ropts; std::string rerr;
@@ -500,11 +500,11 @@ BOOST_AUTO_TEST_CASE(v2r1_malformed_pos_classification_rejected)
     delete db;
 
     BlockIndexGenerationBuilderLM lm; std::string lerr;
-    bool ok = lm.Build(snapDir, "", 1, dir + "/build-000001.tmp", &lerr);
+    bool ok = lm.Build(snapDir, "", 1, dir + "/blockindex-build-000001.tmp", &lerr);
     BOOST_CHECK_MESSAGE(!ok, "ambiguous PoS classification must FAIL migration");
     BOOST_CHECK(lerr.find("ambiguous PoS classification") != std::string::npos);
-    BOOST_CHECK(!fs::exists(fs::path(dir) / "CURRENT"));
-    BOOST_CHECK(!fs::exists(fs::path(dir) / "gen-000001"));
+    BOOST_CHECK(!fs::exists(fs::path(dir) / "blockindex-current"));
+    BOOST_CHECK(!fs::exists(fs::path(dir) / "blockindex-gen-000001"));
     fRegTest = frSaved; fTestNet = ftSaved;
 }
 
@@ -535,10 +535,10 @@ BOOST_AUTO_TEST_CASE(v2r1_disconnected_side_parent_fails_closed)
     delete db;
 
     BlockIndexGenerationBuilderLM lm; std::string lerr;
-    bool ok = lm.Build(snapDir, "", 1, dir + "/build-000001.tmp", &lerr);
+    bool ok = lm.Build(snapDir, "", 1, dir + "/blockindex-build-000001.tmp", &lerr);
     BOOST_CHECK_MESSAGE(!ok, "disconnected side parent must FAIL migration");
     BOOST_CHECK(lerr.find("disconnected parent") != std::string::npos);
-    BOOST_CHECK(!fs::exists(fs::path(dir) / "CURRENT"));
+    BOOST_CHECK(!fs::exists(fs::path(dir) / "blockindex-current"));
     fRegTest = frSaved; fTestNet = ftSaved;
 }
 
@@ -559,11 +559,11 @@ BOOST_AUTO_TEST_CASE(v2r1_parent_lookup_error_fails_closed)
 
     g_lmV2R1ForceDerivedLookupError = true;
     BlockIndexGenerationBuilderLM lm; std::string lerr;
-    bool ok = lm.Build(snapDir, "", 1, dir + "/build-000001.tmp", &lerr);
+    bool ok = lm.Build(snapDir, "", 1, dir + "/blockindex-build-000001.tmp", &lerr);
     g_lmV2R1ForceDerivedLookupError = false;
     BOOST_CHECK_MESSAGE(!ok, "injected parent-lookup ERROR must FAIL CLOSED");
     BOOST_CHECK(lerr.find("parent derived lookup failed") != std::string::npos);
-    BOOST_CHECK(!fs::exists(fs::path(dir) / "CURRENT"));
+    BOOST_CHECK(!fs::exists(fs::path(dir) / "blockindex-current"));
     fRegTest = frSaved; fTestNet = ftSaved;
 }
 
@@ -583,11 +583,11 @@ BOOST_AUTO_TEST_CASE(v2r1_derived_index_put_failure_fails_closed)
 
     g_lmV2R1ForceDerivedPutFailure = true;
     BlockIndexGenerationBuilderLM lm; std::string lerr;
-    bool ok = lm.Build(snapDir, "", 1, dir + "/build-000001.tmp", &lerr);
+    bool ok = lm.Build(snapDir, "", 1, dir + "/blockindex-build-000001.tmp", &lerr);
     g_lmV2R1ForceDerivedPutFailure = false;
     BOOST_CHECK_MESSAGE(!ok, "injected deridx Put failure must FAIL CLOSED");
     BOOST_CHECK(lerr.find("deridx write failed") != std::string::npos);
-    BOOST_CHECK(!fs::exists(fs::path(dir) / "CURRENT"));
+    BOOST_CHECK(!fs::exists(fs::path(dir) / "blockindex-current"));
     fRegTest = frSaved; fTestNet = ftSaved;
 }
 
@@ -611,7 +611,7 @@ BOOST_AUTO_TEST_CASE(v2r1_candidate_marker_notfound_ok_error_fails_closed)
         leveldb::DB* db = OpenSnapshot(snapDir);
         std::vector<LmChainBlock> chain = MakeFlagsChain(db, tip, flags, false);
         delete db;
-        const std::string stage = dir + "/build-000001.tmp";
+        const std::string stage = dir + "/blockindex-build-000001.tmp";
         BlockIndexGenerationBuilderLM lm; std::string lerr;
         BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, stage, &lerr), lerr);
         BOOST_REQUIRE(!fs::exists(fs::path(stage) / "candidate-leaves.dat"));
@@ -632,7 +632,7 @@ BOOST_AUTO_TEST_CASE(v2r1_candidate_marker_notfound_ok_error_fails_closed)
         leveldb::DB* db = OpenSnapshot(snapDir);
         MakeFlagsChain(db, tip, flags, false);
         delete db;
-        const std::string stage = dir + "/build-000001.tmp";
+        const std::string stage = dir + "/blockindex-build-000001.tmp";
         BlockIndexGenerationBuilderLM lm; std::string lerr;
         BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, stage, &lerr), lerr);
         g_cfmV2R1ForceMarkerLookupError = true;
@@ -642,7 +642,7 @@ BOOST_AUTO_TEST_CASE(v2r1_candidate_marker_notfound_ok_error_fails_closed)
         BOOST_CHECK_MESSAGE(!ok, "candidate marker lookup ERROR must FAIL CLOSED");
         BOOST_CHECK(merr.find("candidate leaves marker lookup failed") != std::string::npos);
         BOOST_CHECK(!fs::exists(fs::path(stage) / "candidate-leaves.dat"));
-        BOOST_CHECK(!fs::exists(fs::path(dir) / "CURRENT"));
+        BOOST_CHECK(!fs::exists(fs::path(dir) / "blockindex-current"));
     }
     fRegTest = frSaved; fTestNet = ftSaved;
 }
@@ -667,12 +667,12 @@ BOOST_AUTO_TEST_CASE(v2r1_regular_vs_lm_byte_parity)
     BlockIndexGenerationSource src; std::string serr;
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource(snapDir, &src, &serr), serr);
     BlockIndexGenerationBuilder rb; BlockIndexGenerationStats stats; std::string berr;
-    const std::string regStage = regRoot + "/build-000001.tmp";
+    const std::string regStage = regRoot + "/blockindex-build-000001.tmp";
     BOOST_REQUIRE_MESSAGE(rb.Build(src, regStage, 1, &stats, &berr), berr);
     rb.Close();
 
     const std::string lmRoot = dir + "/lm"; fs::create_directories(lmRoot);
-    const std::string lmStage = lmRoot + "/build-000001.tmp";
+    const std::string lmStage = lmRoot + "/blockindex-build-000001.tmp";
     BlockIndexGenerationBuilderLM lm; std::string lerr;
     BOOST_REQUIRE_MESSAGE(lm.Build(snapDir, "", 1, lmStage, &lerr), lerr);
 

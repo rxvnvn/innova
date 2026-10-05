@@ -32,6 +32,8 @@
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_active_chain_reader.h"
 #include "blockindex_generation_lifecycle.h"
+#include "blockindex_startup_ownership.h"
+#include "blockindex_native_bootstrap.h"
 #include "hreg_registration.h"
 #include "blockindex_residency_counters.h"
 #include "activecollateralnode.h"
@@ -1428,25 +1430,52 @@ bool AppInit2()
     printf("Loading block index...\n");
     nStart = GetTimeMillis();
 
-    // ---- A.10.1h..p / D R5: controlled authoritative by-value startup cutover ----
-    // Explicit opt-in via -blockindexv2authoritative=<generation-root>. Bypasses
-    // legacy LoadBlockIndex all-history CBlockIndex construction and boots from
-    // the validated V2 CURRENT generation. Fail-closed; NO fallback to legacy.
-    const std::string authRoot = GetArg("-blockindexv2authoritative", "");
-    if (!authRoot.empty())
+    // ---- PM1-P0-07b (C2/C4): SINGLE normal production startup ownership ----
+    // The durable ownership commit point is the existing logical CURRENT marker.
+    // Normal production authority is Block Index V2 ONLY: the startup ownership
+    // classifier decides, the C2 native bootstrap/migration substrate creates or
+    // migrates the durable generation, and InitBlockIndexAuthoritative boots from
+    // it. The legacy txleveldb store remains an ACTIVE runtime database for its
+    // still-required namespaces (and the R3 compatibility mirror) but is NEVER
+    // consulted as block-index authority. -blockindexv2authoritative is an
+    // explicit diagnostic OVERRIDE of the root only; normal production
+    // correctness does not depend on it. Fail-closed: NO legacy fallback.
     {
+        const std::string v2Root = ResolveBlockIndexV2Root(
+            GetArg("-blockindexv2authoritative", ""), GetDataDir().string());
+
+        BlockIndexStartupOwnershipDecision own;
+        std::string ownErr;
+        if (!ClassifyBlockIndexStartupOwnership(v2Root, GetDataDir().string(), &own, &ownErr))
+            return InitError(strprintf("Block index startup ownership classification failed: %s", ownErr.c_str()));
+        printf("BLOCK_INDEX_STARTUP_OWNERSHIP state=%s legacyPresent=%d legacyReadable=%d "
+               "unpublished=%d v2Current=%d root=%s\n",
+               BlockIndexStartupOwnershipStateName(own.state),
+               own.legacyPresent ? 1 : 0, own.legacyReadable ? 1 : 0,
+               own.unpublishedArtifacts ? 1 : 0, (int)own.v2CurrentStatus, v2Root.c_str());
+
+        if (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW ||
+            own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED)
+        {
+            std::string prepErr;
+            if (PrepareNativeBlockIndexGeneration(v2Root, GetDataDir().string(), own.state, &prepErr)
+                != BLOCK_INDEX_NATIVE_PREPARE_OK)
+                return InitError(strprintf("Block index V2 native bootstrap failed (%s): %s",
+                                           BlockIndexStartupOwnershipStateName(own.state), prepErr.c_str()));
+            printf("BLOCK_INDEX_STARTUP_NATIVE_PREPARE state=%s durable CURRENT published\n",
+                   BlockIndexStartupOwnershipStateName(own.state));
+        }
+        else if (own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE)
+        {
+            return InitError(strprintf("Block index startup ownership state %s is fatal; refusing startup (no legacy fallback)",
+                                       BlockIndexStartupOwnershipStateName(own.state)));
+        }
+
         std::string authErr;
-        if (!InitBlockIndexAuthoritative(authRoot, &authErr))
+        if (!InitBlockIndexAuthoritative(v2Root, &authErr))
             return InitError(strprintf("Block Index V2 authoritative startup failed: %s", authErr.c_str()));
         printf(" block index (authoritative) %" PRId64"ms\n", GetTimeMillis() - nStart);
-        goto authoritative_startup_ready;
     }
-
-    if (!LoadBlockIndex())
-        return InitError(_("Error loading blkindex.dat"));
-    printf(" block index (legacy resident) loaded; mapBlockIndex.size()=%llu\n",
-           (unsigned long long)mapBlockIndex.size());
-    PrintBlockIndexResidency("LEGACY_RESIDENT", 0, "T1_blockindex", 0,0,0,0);
 
 authoritative_startup_ready:
     (void)0;
@@ -1854,13 +1883,13 @@ authoritative_startup_ready:
     NewThread(ThreadCheckCollaTeralPool, NULL);
 
 
-    // Candidate tip frontier: rebuild bounded tips index from full block index.
-    // If no DAG blocks exist, the tips set is still valid for candidate selection.
-    // In authoritative mode the frontier was already built by
-    // BlockIndexCandidateStartupBuilder (A.10.1m) from by-value V2 records; the
-    // legacy full-mapBlockIndex scan is not applicable (no historical graph).
+    // Candidate tip frontier: in normal production the frontier was built by
+    // BlockIndexCandidateStartupBuilder (A.10.1m) from the by-value V2 generation
+    // (candidate-leaves.dat). LEGACY_RESIDENT and the historical full-resident
+    // scan are RETIRED as a normal production mode (PM1-P0-07b C4); their absence
+    // is a hard fail-closed invariant, never a silent fallback.
     if (!g_fAuthoritativeStartup)
-        RebuildCandidateTips();
+        return InitError(_("Block index startup invariant violated: normal production must be Block Index V2 authoritative (LEGACY_RESIDENT retired)"));
 
     RandAddSeedPerfmon();
 
@@ -1939,10 +1968,9 @@ authoritative_startup_ready:
         printf("Debugging is not enabled.\n");
 
     // ---- Activation Stage 1: startup-complete residency snapshot (T3) ----
-    if (g_fAuthoritativeStartup)
-        PrintAuthoritativeResidency("T3_startup_complete");
-    else
-        PrintBlockIndexResidency("LEGACY_RESIDENT", 0, "T3_startup_complete", 0,0,0,0);
+    // PM1-P0-07b (C4): LEGACY_RESIDENT is retired as a normal production mode;
+    // startup already failed closed above if authoritative mode was not entered.
+    PrintAuthoritativeResidency("T3_startup_complete");
 
     // ---- Block Index V2 (A.10.2): release authoritative startup allocator arenas ----
     // During BY_VALUE_AUTHORITATIVE startup the bootstrap reads the full 8M-record

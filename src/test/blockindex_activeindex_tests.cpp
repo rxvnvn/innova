@@ -24,7 +24,7 @@ static boost::filesystem::path UniqueGenDir(const std::string& tag)
         boost::filesystem::path(tag + "-%%%%-%%%%-%%%%");
     boost::filesystem::path dir = boost::filesystem::temp_directory_path() /
         boost::filesystem::unique_path(model) /
-        "gen-000001";
+        "blockindex-gen-000001";
     boost::filesystem::create_directories(dir);
     return dir;
 }

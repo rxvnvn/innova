@@ -104,7 +104,7 @@ struct CandFixture
         src.foundBestChain = true;
         src.blockDataDir = blockDir.string();
 
-        boost::filesystem::path staging = root / "build-000001.tmp";
+        boost::filesystem::path staging = root / "blockindex-build-000001.tmp";
         std::string error;
         { BlockIndexGenerationBuilder b;
           BOOST_REQUIRE_MESSAGE(b.Build(src, staging.string(), 1, NULL, &error), error); b.Close(); }
@@ -116,7 +116,7 @@ struct CandFixture
         BlockIndexV2ReaderOptions o;
         BOOST_REQUIRE_MESSAGE(reader.Open(root.string(), o, &error), error);
         BOOST_REQUIRE_MESSAGE(
-            BlockIndexDerivedStateStore::OpenReadOnly((root/"gen-000001").string(), 1, &derived, &error), error);
+            BlockIndexDerivedStateStore::OpenReadOnly((root/"blockindex-gen-000001").string(), 1, &derived, &error), error);
     }
     ~CandFixture() {
         boost::system::error_code ec;

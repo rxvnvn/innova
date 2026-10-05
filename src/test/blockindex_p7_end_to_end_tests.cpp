@@ -120,7 +120,7 @@ static void BuildBaseGeneration(const std::string& root, uint64_t gen,
     fs::path tmp = fs::temp_directory_path() / fs::unique_path("innova-p7-%%%%-%%%%");
     BOOST_REQUIRE_MESSAGE(b.Build(src, tmp.string(), gen, &stats, &error), error);
     b.Close();
-    fs::path target = fs::path(root) / (strprintf("gen-%06llu", (unsigned long long)gen));
+    fs::path target = fs::path(root) / (strprintf("blockindex-gen-%06llu", (unsigned long long)gen));
     fs::create_directories(root);
     BOOST_REQUIRE(!fs::exists(target));
     fs::rename(tmp, target);

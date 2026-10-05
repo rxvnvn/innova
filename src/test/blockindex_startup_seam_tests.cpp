@@ -148,7 +148,7 @@ struct SeamFixture
         src.foundBestChain = true;
         src.blockDataDir = blockDir.string();
 
-        boost::filesystem::path staging = root / "build-000001.tmp";
+        boost::filesystem::path staging = root / "blockindex-build-000001.tmp";
         std::string error;
         {
             BlockIndexGenerationBuilder b;
@@ -177,7 +177,7 @@ struct SeamFixture
         FixedBlockIndexOpenOptions opts;
         opts.requireCompleteManifest = true;
         FixedBlockIndexStore store;
-        if (!FixedBlockIndexStore::OpenReadOnly((root / "gen-000001").string(), opts, &store, &error))
+        if (!FixedBlockIndexStore::OpenReadOnly((root / "blockindex-gen-000001").string(), opts, &store, &error))
             return false;
         return store.GetManifest().capability ==
             (uint32_t)BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE;
@@ -375,7 +375,7 @@ BOOST_AUTO_TEST_CASE(h9_corrupt_input_fails_closed)
 {
     SeamFixture fx(3);
     // Corrupt the records.dat in the selected generation so Open must fail.
-    boost::filesystem::path records = fx.root / "gen-000001" / "records.dat";
+    boost::filesystem::path records = fx.root / "blockindex-gen-000001" / "records.dat";
     std::string data;
     {
         FILE* f = fopen(records.string().c_str(), "rb");

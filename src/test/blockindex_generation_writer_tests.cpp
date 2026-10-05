@@ -129,7 +129,7 @@ BOOST_AUTO_TEST_CASE(w1_writer_builds_valid_generation)
                  const BlockIndexGenerationSourceRecord& b) { return a.hash < b.hash; });
 
     BlockIndexGenerationWriter w;
-    std::string staging = dir + "/build-000001.tmp";
+    std::string staging = dir + "/blockindex-build-000001.tmp";
     BOOST_REQUIRE(w.OpenTarget(staging, 1, NULL));
 
     std::map<uint256, BlockIndexId> idMap;
@@ -232,7 +232,7 @@ BOOST_AUTO_TEST_CASE(w2_w4_byte_parity_with_builder)
     const std::string wdir = dir + "/writer";
     fs::create_directories(wdir);
     BlockIndexGenerationWriter w;
-    std::string staging = wdir + "/build-000001.tmp";
+    std::string staging = wdir + "/blockindex-build-000001.tmp";
     BOOST_REQUIRE(w.OpenTarget(staging, 1, NULL));
     std::map<uint256, BlockIndexId> idMap;
     std::map<uint256, BlockIndexRecord> recByHash;

@@ -112,7 +112,7 @@ struct ReaderFixture
         src.hashBestChain = blocks[tipHeight].hash;
         src.foundBestChain = true;
         src.blockDataDir = blockDir.string();
-        boost::filesystem::path staging = root / "build-000001.tmp";
+        boost::filesystem::path staging = root / "blockindex-build-000001.tmp";
         std::string error;
         {
             BlockIndexGenerationBuilder b;
@@ -147,7 +147,7 @@ BOOST_AUTO_TEST_CASE(k1_by_value_active_height_no_map_no_pnext_causal)
     ReaderFixture fx(5);
     std::string error;
     BlockIndexActiveChainReader reader;
-    BOOST_REQUIRE_MESSAGE(reader.Open((fx.root / "gen-000001").string(), 1, &error), error);
+    BOOST_REQUIRE_MESSAGE(reader.Open((fx.root / "blockindex-gen-000001").string(), 1, &error), error);
     BOOST_REQUIRE(reader.IsOpen());
 
     // Causal precondition: none of the historical hashes are resident.
@@ -181,7 +181,7 @@ BOOST_AUTO_TEST_CASE(k2_bounded_iteration_no_accumulation)
     ReaderFixture fx(40);
     std::string error;
     BlockIndexActiveChainReader reader;
-    BOOST_REQUIRE(reader.Open((fx.root / "gen-000001").string(), 1, &error));
+    BOOST_REQUIRE(reader.Open((fx.root / "blockindex-gen-000001").string(), 1, &error));
     BOOST_CHECK_EQUAL((int)reader.GetActiveHeight(), 40);
     for (int h = 0; h <= 40; ++h)
     {

@@ -466,6 +466,12 @@ bool CheckDiskSpace(uint64_t nAdditionalBytes=0);
 FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode="rb");
 FILE* AppendBlockFile(unsigned int& nFileRet);
 bool LoadBlockIndex(bool fAllowNew=true);
+// PM1-P0-07b (C2-A): the SINGLE canonical genesis-block construction for the
+// active network (mainnet/testnet/regtest). Extracted verbatim from the legacy
+// LoadBlockIndex() genesis-materialisation branch so the native V2 bootstrap and
+// the legacy resident path share ONE genesis consensus implementation. Never
+// invents fields; on failure the block is not valid to build on.
+bool CreateBlockIndexGenesisBlock(CBlock& block);
 void PrintBlockTree();
 CBlockIndex* FindBlockByHeight(int nHeight);
 void ResetBlockIndexSkipStats();

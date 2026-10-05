@@ -121,7 +121,7 @@ static void BuildBaseGeneration(const std::string& root, uint64_t gen,
     fs::path tmp = fs::temp_directory_path() / fs::unique_path("innova-fold-base-%%%%-%%%%");
     BOOST_REQUIRE_MESSAGE(builder.Build(src, tmp.string(), gen, &stats, &error), error);
     builder.Close();
-    fs::path target = fs::path(root) / (strprintf("gen-%06llu", (unsigned long long)gen));
+    fs::path target = fs::path(root) / (strprintf("blockindex-gen-%06llu", (unsigned long long)gen));
     fs::create_directories(root);
     BOOST_REQUIRE(!fs::exists(target));
     BOOST_REQUIRE_NO_THROW(fs::rename(tmp, target));
@@ -185,8 +185,8 @@ BOOST_AUTO_TEST_CASE(f1_fold_basic_create_flip_truncate)
     BOOST_REQUIRE(cst == BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(cur.generation, baseGen + 1);
     // base gen still exists
-    BOOST_REQUIRE(fs::exists(fs::path(root) / "gen-000001"));
-    BOOST_REQUIRE(fs::exists(fs::path(root) / "gen-000002"));
+    BOOST_REQUIRE(fs::exists(fs::path(root) / "blockindex-gen-000001"));
+    BOOST_REQUIRE(fs::exists(fs::path(root) / "blockindex-gen-000002"));
     printf("F1 PASS fold: CURRENT->gen-2, base gen-1 retained, foldHeight=%d\n",
            (int)foldHeight);
 }
@@ -252,7 +252,7 @@ BOOST_AUTO_TEST_CASE(f3_fold_noop_below_base_tip)
     BOOST_REQUIRE_EQUAL(r.foldRecordCount, 0u);
     BOOST_REQUIRE_EQUAL(r.newGeneration, baseGen); // no new gen selected/flipped
     // no gen-2 created (no publish happened)
-    BOOST_REQUIRE(!fs::exists(fs::path(root) / "gen-000002"));
+    BOOST_REQUIRE(!fs::exists(fs::path(root) / "blockindex-gen-000002"));
     printf("F3 PASS fold below base tip is no-op (no gen-2, no flip)\n");
 }
 

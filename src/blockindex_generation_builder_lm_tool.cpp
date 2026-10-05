@@ -50,7 +50,7 @@ int main(int argc, char** argv)
         lifecycleRoot = stagingRoot;
     }
 
-    const std::string staging = lifecycleRoot + "/build-" + strprintf("%06llu", (unsigned long long)generation) + ".tmp";
+    const std::string staging = lifecycleRoot + "/blockindex-build-" + strprintf("%06llu", (unsigned long long)generation) + ".tmp";
     fprintf(stderr, "lm-builder: snapshot=%s staging=%s gen=%llu blockdata=%s\n",
             snapshotDir.c_str(), staging.c_str(), (unsigned long long)generation,
             blockDataDir.empty() ? "(none)" : blockDataDir.c_str());

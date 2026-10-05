@@ -34,7 +34,7 @@
 static const uint32_t BLOCK_INDEX_CURRENT_FORMAT_VERSION = 1;
 static const uint32_t BLOCK_INDEX_CURRENT_SCHEMA_VERSION = 1;
 static const uint32_t BLOCK_INDEX_CURRENT_SIZE_V1 = 28;
-static const char* const BLOCK_INDEX_CURRENT_FILE_NAME = "CURRENT";
+static const char* const BLOCK_INDEX_CURRENT_FILE_NAME = "blockindex-current";
 
 struct BlockIndexCurrentRecord
 {

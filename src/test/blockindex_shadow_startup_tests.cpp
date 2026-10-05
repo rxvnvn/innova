@@ -285,9 +285,9 @@ BOOST_AUTO_TEST_CASE(current_absent_and_corrupt_and_missing_generation)
         std::string e;
         EncodeBlockIndexCurrentRecord(r, &enc, &e);
         boost::filesystem::create_directories(boost::filesystem::path(root.string()));
-        FILE* f = fopen((root.string() + "/CURRENT.tmp").c_str(), "wb");
+        FILE* f = fopen((root.string() + "/blockindex-current.tmp").c_str(), "wb");
         fwrite(enc.data(), 1, enc.size(), f); fclose(f);
-        rename((root.string() + "/CURRENT.tmp").c_str(), (root.string() + "/CURRENT").c_str());
+        rename((root.string() + "/blockindex-current.tmp").c_str(), (root.string() + "/blockindex-current").c_str());
         MockLegacyOracle legacy; legacy.BuildActive(10, 1000);
         BlockIndexV2ShadowRuntime runtime;
         std::string error;
@@ -302,7 +302,7 @@ BOOST_AUTO_TEST_CASE(structural_generation_corruption_detected)
 {
     boost::filesystem::path root = UniqueRoot("structcorrupt");
     BuildShadowGeneration(root.string(), 1, 20, 1, 1000, 9000);
-    boost::filesystem::remove(boost::filesystem::path(root.string()) / "gen-000001" / BLOCK_INDEX_RECORDS_FILE_NAME);
+    boost::filesystem::remove(boost::filesystem::path(root.string()) / "blockindex-gen-000001" / BLOCK_INDEX_RECORDS_FILE_NAME);
     MockLegacyOracle legacy; legacy.BuildActive(20, 1000);
     BlockIndexV2ShadowRuntime runtime;
     std::string error;

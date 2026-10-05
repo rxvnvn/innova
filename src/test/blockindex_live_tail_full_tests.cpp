@@ -71,7 +71,7 @@ struct G1FullFixture
         BlockIndexGenerationBuilder b;
         BlockIndexGenerationStats stats;
         std::string error;
-        fs::path tmp = root / "build-000001.tmp";
+        fs::path tmp = root / "blockindex-build-000001.tmp";
         BOOST_REQUIRE_MESSAGE(b.Build(src, tmp.string(), 1, &stats, &error), error);
         b.Close();
         std::string perr;

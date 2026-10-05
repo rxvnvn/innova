@@ -58,7 +58,7 @@ static BlockIndexGenerationSource Source()
 static void BuildSelected(const boost::filesystem::path& root)
 {
     BlockIndexGenerationBuilder b; BlockIndexGenerationStats st; std::string e;
-    BOOST_REQUIRE_MESSAGE(b.Build(Source(), (root/"gen-000001").string(), 1, &st, &e),e); b.Close();
+    BOOST_REQUIRE_MESSAGE(b.Build(Source(), (root/"blockindex-gen-000001").string(), 1, &st, &e),e); b.Close();
     BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&e)==BLOCK_INDEX_LIFECYCLE_OK,e);
 }
 
@@ -74,7 +74,7 @@ static void OpenDerivedStore(const boost::filesystem::path& root, BlockIndexDeri
 {
     std::string e;
     BOOST_REQUIRE_MESSAGE(BlockIndexDerivedStateStore::OpenReadOnly(
-        (root / "gen-000001").string(), 1, store, &e), e);
+        (root / "blockindex-gen-000001").string(), 1, store, &e), e);
 }
 
 } // namespace

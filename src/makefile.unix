@@ -354,6 +354,7 @@ OBJS= \
     obj/silentpayments.o \
     obj/dandelion.o \
     obj/candidate_frontier.o \
+    obj/candidate_frontier_legacy.o \
     obj/candidate_frontier_metadata.o \
     obj/blockindex_hot_owner.o \
     obj/blockindex_tip.o \
@@ -406,6 +407,8 @@ OBJS= \
     obj/blockindex_candidate_startup_builder.o \
     obj/blockindex_stake_seen_builder.o \
     obj/blockindex_generation_lifecycle.o \
+    obj/blockindex_startup_ownership.o \
+    obj/blockindex_native_bootstrap.o \
     obj/blockindex_shadow_runtime.o \
     obj/blockindex_shadow_startup.o \
     obj/blockindex_authoritative_startup.o \
@@ -455,6 +458,7 @@ OBJS= \
     obj/silentpayments.o \
     obj/dandelion.o \
     obj/candidate_frontier.o \
+    obj/candidate_frontier_legacy.o \
     obj/candidate_frontier_metadata.o \
     obj/blockindex_hot_owner.o \
     obj/blockindex_tip.o \
@@ -508,6 +512,8 @@ OBJS= \
     obj/blockindex_candidate_startup_builder.o \
     obj/blockindex_stake_seen_builder.o \
     obj/blockindex_generation_lifecycle.o \
+    obj/blockindex_startup_ownership.o \
+    obj/blockindex_native_bootstrap.o \
     obj/blockindex_shadow_runtime.o \
     obj/blockindex_shadow_startup.o \
     obj/blockindex_authoritative_startup.o \
@@ -562,7 +568,10 @@ TEST_OBJS= \
     obj/test/blockindex_generation_lifecycle_tests.o \
     obj/test/blockindex_shadow_startup_tests.o \
     obj/test/blockindex_v2_reader_tests.o \
+    obj/test/blockindex_p07_startup_ownership_tests.o \
+    obj/test/blockindex_p07b_native_bootstrap_tests.o \
     obj/test/candidate_frontier_tests.o \
+    obj/test/candidate_frontier_decoupling_tests.o \
     obj/test/blockindex_candidate_startup_builder_tests.o \
     obj/test/blockindex_stake_seen_builder_tests.o \
     obj/test/blockindex_hot_owner_tests.o \

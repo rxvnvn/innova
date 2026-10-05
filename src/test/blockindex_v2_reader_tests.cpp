@@ -28,7 +28,7 @@ static BlockIndexGenerationSource Source()
 static void BuildSelected(const boost::filesystem::path& root)
 {
     BlockIndexGenerationBuilder b; BlockIndexGenerationStats st; std::string e;
-    BOOST_REQUIRE_MESSAGE(b.Build(Source(), (root/"gen-000001").string(), 1, &st, &e),e); b.Close();
+    BOOST_REQUIRE_MESSAGE(b.Build(Source(), (root/"blockindex-gen-000001").string(), 1, &st, &e),e); b.Close();
     BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&e)==BLOCK_INDEX_LIFECYCLE_OK,e);
 }
 static void Open(const boost::filesystem::path& root, BlockIndexV2Reader* r, uint64_t cap=64ULL*1024*1024)
@@ -109,19 +109,20 @@ BOOST_AUTO_TEST_CASE(concurrent_mixed_reads_are_consistent)
 }
 BOOST_AUTO_TEST_CASE(failure_records_crc_corruption_is_isolated)
 {
-    // A single corrupted record body (CRC mismatch) must surface as a per-record
-    // failure, not take down the reader or adjacent lookups.
+    // A single corrupted record body (CRC mismatch) is AUTHORITATIVE-record
+    // corruption: under the R3G open-time integrity contract Open must fail
+    // closed (never a check-by-use silent-zero/partial-read hazard). The stale
+    // A.8 per-record-isolation expectation for record bodies is superseded.
     boost::filesystem::path root=UniqueRoot();BuildSelected(root);
     std::string e; std::vector<unsigned char> b=ReadFileBytes(GenDir(root)/BLOCK_INDEX_RECORDS_FILE_NAME,&e);BOOST_REQUIRE(!b.empty());
     // record id 3 body begins at header + (3-1)*recordSize; corrupt a payload byte (not the trailing checksum).
     const size_t rec3 = BLOCK_INDEX_RECORDS_HEADER_SIZE_V1 + 2*BLOCK_INDEX_RECORD_SIZE_V1;
     BOOST_REQUIRE(b.size()>rec3+BLOCK_INDEX_RECORD_SIZE_V1); FlipBytes(b, rec3+100, 1);
     WriteFileBytes(GenDir(root)/BLOCK_INDEX_RECORDS_FILE_NAME, b, &e);
-    BlockIndexV2Reader r;Open(root,&r);BlockIndexSnapshot s;
-    BOOST_CHECK_EQUAL(r.GetRecordById(3,&s,&e),BLOCK_INDEX_V2_READ_CORRUPT);BOOST_CHECK(!e.empty());
-    BOOST_CHECK_EQUAL(r.GetRecordById(1,&s,&e),BLOCK_INDEX_V2_READ_FOUND);
-    BOOST_CHECK_EQUAL(r.GetRecordById(4,&s,&e),BLOCK_INDEX_V2_READ_FOUND);
-    BOOST_CHECK_EQUAL(r.GetActiveByHeight(7,&s,&e),BLOCK_INDEX_V2_READ_FOUND);
+    BlockIndexV2Reader r;BlockIndexV2ReaderOptions o;std::string openErr;
+    BOOST_CHECK_MESSAGE(!r.Open(root.string(),o,&openErr),"open must fail closed on corrupt authoritative record body: "<<openErr);
+    BOOST_CHECK(!r.IsOpen());BOOST_CHECK(!openErr.empty());
+    BOOST_CHECK(openErr.find("authoritative records integrity failure")!=std::string::npos);
 }
 BOOST_AUTO_TEST_CASE(failure_active_bad_record_id_fails_closed_isolated)
 {

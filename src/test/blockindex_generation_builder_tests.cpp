@@ -25,7 +25,7 @@ static boost::filesystem::path UniqueGenDir(const std::string& tag)
         boost::filesystem::path(tag + "-%%%%-%%%%-%%%%");
     boost::filesystem::path dir = boost::filesystem::temp_directory_path() /
         boost::filesystem::unique_path(model) /
-        "gen-000001";
+        "blockindex-gen-000001";
     boost::filesystem::create_directories(dir);
     return dir;
 }
@@ -464,7 +464,7 @@ BOOST_AUTO_TEST_CASE(c1_no_blockdata_produces_old_shadow)
 BOOST_AUTO_TEST_CASE(c2_changed_derived_entry_rejects)
 {
     boost::filesystem::path root = UniqueGenDir("c2-derived-reject");
-    boost::filesystem::path genDir = root / "gen-000001";
+    boost::filesystem::path genDir = root / "blockindex-gen-000001";
     BlockIndexGenerationSource src = BuildSyntheticSource(5, 1, 10000, 20000);
     std::string error;
     {
@@ -532,7 +532,7 @@ BOOST_AUTO_TEST_CASE(c2_changed_derived_entry_rejects)
 BOOST_AUTO_TEST_CASE(c2_changed_records_entry_rejects)
 {
     boost::filesystem::path root = UniqueGenDir("c2-records-reject");
-    boost::filesystem::path genDir = root / "gen-000001";
+    boost::filesystem::path genDir = root / "blockindex-gen-000001";
     BlockIndexGenerationSource src = BuildSyntheticSource(5, 1, 10000, 20000);
     std::string error;
     {
@@ -711,7 +711,7 @@ BOOST_AUTO_TEST_CASE(c3_generation_trust_is_linear_ancestry)
 
     // Step 2: Build generation and verify builder keeps linear trust
     boost::filesystem::path root = UniqueGenDir("c3-dag-trust");
-    boost::filesystem::path genDir = root / "gen-000001";
+    boost::filesystem::path genDir = root / "blockindex-gen-000001";
     {
         BlockIndexGenerationBuilder b;
         BOOST_REQUIRE_MESSAGE(b.Build(src, genDir.string(), 1, NULL, &error), error);
@@ -731,7 +731,7 @@ BOOST_AUTO_TEST_CASE(c3_generation_trust_is_linear_ancestry)
     // Step 3: rebuild and confirm the same linear-ancestry trust (no legacy DAG
     // input exists to influence it).
     boost::filesystem::path root2 = UniqueGenDir("c3-dag-trust-injected");
-    boost::filesystem::path genDir2 = root2 / "gen-000001";
+    boost::filesystem::path genDir2 = root2 / "blockindex-gen-000001";
     {
         BlockIndexGenerationBuilder b;
         BOOST_REQUIRE_MESSAGE(b.Build(src, genDir2.string(), 1, NULL, &error), error);
@@ -879,7 +879,7 @@ BOOST_AUTO_TEST_CASE(c1_authoritative_lifecycle_roundtrip)
     boost::filesystem::path root = boost::filesystem::temp_directory_path() /
         boost::filesystem::unique_path("innova-blockindex-genbuilder-/auth-lifecycle-%%%%-%%%%-%%%%");
     boost::filesystem::create_directories(root);
-    boost::filesystem::path genDir = root / "gen-000001";
+    boost::filesystem::path genDir = root / "blockindex-gen-000001";
     boost::filesystem::path blockDir = root / "blocks";
     boost::filesystem::create_directories(blockDir);
 
@@ -911,7 +911,7 @@ BOOST_AUTO_TEST_CASE(c1_authoritative_lifecycle_roundtrip)
 
     // Build into staging directory (PublishGeneration expects build-000001.tmp)
     std::string error;
-    boost::filesystem::path stagingDir = root / "build-000001.tmp";
+    boost::filesystem::path stagingDir = root / "blockindex-build-000001.tmp";
     {
         BlockIndexGenerationBuilder b;
         bool buildOk = b.Build(src, stagingDir.string(), 1, NULL, &error);
@@ -1052,8 +1052,8 @@ BOOST_AUTO_TEST_CASE(c3_side_branch_checksum_differential)
 
     // Build into staging (UniqueGenDir already created root/gen-000001)
     boost::filesystem::path root = UniqueGenDir("side-branch-checksum");
-    boost::filesystem::path stagingDir = root / "build-000001.tmp";
-    boost::filesystem::path genDir = root / "gen-000001";
+    boost::filesystem::path stagingDir = root / "blockindex-build-000001.tmp";
+    boost::filesystem::path genDir = root / "blockindex-gen-000001";
     {
         BlockIndexGenerationBuilder b;
         BOOST_REQUIRE_MESSAGE(b.Build(src, stagingDir.string(), 1, NULL, &error), error);

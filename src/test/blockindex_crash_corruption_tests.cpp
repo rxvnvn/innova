@@ -845,7 +845,7 @@ struct R3G_GenFixture
         BlockIndexGenerationBuilder b;
         BlockIndexGenerationStats st;
         std::string error;
-        BOOST_REQUIRE_MESSAGE(b.Build(src, (root / "build-000001.tmp").string(), 1, &st, &error), error);
+        BOOST_REQUIRE_MESSAGE(b.Build(src, (root / "blockindex-build-000001.tmp").string(), 1, &st, &error), error);
         b.Close();
         BOOST_REQUIRE_MESSAGE(
             BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error) ==

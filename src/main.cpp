@@ -9394,6 +9394,150 @@ bool RebuildMainChainForwardLinks()
     return true;
 }
 
+// PM1-P0-07b (C2-A): SINGLE canonical genesis-block construction for the active
+// network. Body moved verbatim from the legacy LoadBlockIndex() genesis branch
+// (same timestamps / merkle root / nBits / nNonce / validation) so the native V2
+// bootstrap and the legacy resident path share ONE genesis consensus
+// implementation. Never invents fields.
+bool CreateBlockIndexGenesisBlock(CBlock& block)
+{
+    if(fRegTest)
+    {
+        const char* pszTimestampRegTest = "Innova RegTest Mode";
+        CTransaction txNewRegTest;
+
+        txNewRegTest.nTime = 1296688602;
+        txNewRegTest.vin.resize(1);
+        txNewRegTest.vout.resize(1);
+        txNewRegTest.vin[0].scriptSig = CScript() << 0 << CBigNum(42) << vector<unsigned char>((const unsigned char*)pszTimestampRegTest, (const unsigned char*)pszTimestampRegTest + strlen(pszTimestampRegTest));
+        txNewRegTest.vout[0].SetEmpty();
+
+        block.vtx.push_back(txNewRegTest);
+        block.hashPrevBlock = 0;
+        block.hashMerkleRoot = block.BuildMerkleTree();
+        block.nTime    = 1296688602;
+        block.nVersion = 1;
+        block.nBits    = bnProofOfWorkLimit.GetCompact();
+        block.nNonce   = 2;
+
+        printf("RegTest blockRegTest.GetHash() == %s\n", block.GetHash().ToString().c_str());
+        printf("RegTest blockRegTest.hashMerkleRoot == %s\n", block.hashMerkleRoot.ToString().c_str());
+        printf("RegTest blockRegTest.nBits = 0x%08x\n", block.nBits);
+        return true;
+    }
+    else if(fTestNet)
+    {
+        const char* pszTimestampTestNet = "Innova Public IDAG Hidden Finality Testnet | May 26 2026 | Epoch-Root FCMP";
+        CTransaction txNewTestNet;
+
+        txNewTestNet.nTime = 1779753600;
+        txNewTestNet.vin.resize(1);
+        txNewTestNet.vout.resize(1);
+        txNewTestNet.vin[0].scriptSig = CScript() << 0 << CBigNum(42) << vector<unsigned char>((const unsigned char*)pszTimestampTestNet, (const unsigned char*)pszTimestampTestNet + strlen(pszTimestampTestNet));
+        txNewTestNet.vout[0].SetEmpty();
+
+        block.vtx.push_back(txNewTestNet);
+        block.hashPrevBlock = 0;
+        block.hashMerkleRoot = block.BuildMerkleTree();
+        block.nTime    = 1779753600;
+        block.nVersion = 1;
+        block.nBits    = bnProofOfWorkLimit.GetCompact();
+        block.nNonce   = 127761;
+
+        if (false && (block.GetHash() != hashGenesisBlockTestNet))
+        {
+        // This will figure out a valid hash and Nonce if you're
+        // creating a different genesis block:
+            uint256 hashTarget = CBigNum().SetCompact(block.nBits).getuint256();
+            while (block.GetHash() > hashTarget)
+            {
+                ++block.nNonce;
+                if (block.nNonce == 0)
+                {
+                    printf("NONCE WRAPPED, incrementing time");
+                    ++block.nTime;
+                }
+            }
+        }
+        block.print();
+        printf("TestNet blocktest.GetHash() == %s\n", block.GetHash().ToString().c_str());
+        printf("TestNet blocktest.hashMerkleRoot == %s\n", block.hashMerkleRoot.ToString().c_str());
+        printf("TestNet blocktest.nTime = %u \n", block.nTime);
+        printf("TestNet blocktest.nNonce = %u \n", block.nNonce);
+
+
+        //// debug print
+        if (block.hashMerkleRoot != uint256("0xa18a28c4cde90e5c637c63715018a466511dd22eccd8f371512eec3074b1b19d"))
+            return error("TestNetLoadBlockIndex() : invalid testnet genesis merkle root %s", block.hashMerkleRoot.ToString().c_str());
+        block.print();
+        if (block.GetHash() != hashGenesisBlockTestNet)
+            return error("TestNetLoadBlockIndex() : invalid testnet genesis hash %s", block.GetHash().ToString().c_str());
+        if (!block.CheckBlock())
+            return error("TestNetLoadBlockIndex() : testnet genesis block validation failed");
+
+        // -- debug print
+        if (fDebugChain)
+        {
+            printf("Initialised Innova TestNet genesis block:\n");
+            block.print();
+        };
+        return true;
+    }
+    else
+    {
+        const char* pszTimestamp = "Innova Blockchain starts on 12/10/2019";
+        CTransaction txNew;
+        txNew.nTime = 1576002227;
+        txNew.vin.resize(1);
+        txNew.vout.resize(1);
+        txNew.vin[0].scriptSig = CScript() << 0 << CBigNum(42) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
+        txNew.vout[0].SetEmpty();
+
+        block.vtx.push_back(txNew);
+        block.hashPrevBlock = 0;
+        block.hashMerkleRoot = block.BuildMerkleTree();
+        block.nTime    = 1576002227;
+        block.nVersion = 1;
+        block.nBits    = bnProofOfWorkLimit.GetCompact();
+        block.nNonce   = 253080;
+
+        if (false && (block.GetHash() != hashGenesisBlock)) {
+        // This will figure out a valid hash and Nonce if you're
+        // creating a different genesis block:
+            uint256 hashTarget = CBigNum().SetCompact(block.nBits).getuint256();
+            while (block.GetHash() > hashTarget)
+            {
+                ++block.nNonce;
+                if (block.nNonce == 0)
+                {
+                    printf("NONCE WRAPPED, incrementing time");
+                    ++block.nTime;
+                }
+            }
+        }
+        block.print();
+        printf("block.GetHash() == %s\n", block.GetHash().ToString().c_str());
+        printf("block.hashMerkleRoot == %s\n", block.hashMerkleRoot.ToString().c_str());
+        printf("block.nTime = %u \n", block.nTime);
+        printf("block.nNonce = %u \n", block.nNonce);
+
+
+        //// debug print
+        assert(block.hashMerkleRoot == uint256("0x7fe3177ea86b03a9c8773b32a3db36f32f4011bec4a0724032c36bc1c9d569a0"));
+        block.print();
+        assert(block.GetHash() == hashGenesisBlock);
+        assert(block.CheckBlock());
+
+        // -- debug print
+        if (fDebugChain)
+        {
+            printf("Initialised genesis block:\n");
+            block.print();
+        };
+        return true;
+    }
+}
+
 bool LoadBlockIndex(bool fAllowNew)
 {
     LOCK(cs_main);
@@ -9440,179 +9584,23 @@ bool LoadBlockIndex(bool fAllowNew)
         if (!fAllowNew)
             return false;
 
-        if(fRegTest)
-        {
-            const char* pszTimestampRegTest = "Innova RegTest Mode";
-            CTransaction txNewRegTest;
+        CBlock block;
+        if (!CreateBlockIndexGenesisBlock(block))
+            return error("LoadBlockIndex() : genesis block construction failed");
 
-            txNewRegTest.nTime = 1296688602;
-            txNewRegTest.vin.resize(1);
-            txNewRegTest.vout.resize(1);
-            txNewRegTest.vin[0].scriptSig = CScript() << 0 << CBigNum(42) << vector<unsigned char>((const unsigned char*)pszTimestampRegTest, (const unsigned char*)pszTimestampRegTest + strlen(pszTimestampRegTest));
-            txNewRegTest.vout[0].SetEmpty();
+        // Start new block file
+        unsigned int nFile;
+        unsigned int nBlockPos;
+        if (!block.WriteToDisk(nFile, nBlockPos))
+            return error("LoadBlockIndex() : writing genesis block to disk failed");
+        uint256 hashGenesis = block.GetHash();
+        if (!block.AddToBlockIndex(nFile, nBlockPos, hashGenesis))
+            return error("LoadBlockIndex() : genesis block not accepted");
 
-            CBlock blockRegTest;
-            blockRegTest.vtx.push_back(txNewRegTest);
-            blockRegTest.hashPrevBlock = 0;
-            blockRegTest.hashMerkleRoot = blockRegTest.BuildMerkleTree();
-            blockRegTest.nTime    = 1296688602;
-            blockRegTest.nVersion = 1;
-            blockRegTest.nBits    = bnProofOfWorkLimit.GetCompact();
-            blockRegTest.nNonce   = 2;
-
-            printf("RegTest blockRegTest.GetHash() == %s\n", blockRegTest.GetHash().ToString().c_str());
-            printf("RegTest blockRegTest.hashMerkleRoot == %s\n", blockRegTest.hashMerkleRoot.ToString().c_str());
-            printf("RegTest blockRegTest.nBits = 0x%08x\n", blockRegTest.nBits);
-
-            unsigned int nFile;
-            unsigned int nBlockPos;
-            if (!blockRegTest.WriteToDisk(nFile, nBlockPos))
-                return error("RegTestLoadBlockIndex() : writing genesis block to disk failed");
-
-            uint256 hashRegTestGenesis = blockRegTest.GetHash();
-            if (!blockRegTest.AddToBlockIndex(nFile, nBlockPos, hashRegTestGenesis))
-                return error("RegTestLoadBlockIndex() : genesis block not accepted");
-
-            if (!Checkpoints::WriteSyncCheckpoint(hashRegTestGenesis))
-                return error("RegTestLoadBlockIndex() : failed to init sync checkpoint");
-
-            printf("RegTest genesis block initialized: %s\n", hashRegTestGenesis.ToString().c_str());
-        }
-        else if(fTestNet)
-        {
-            const char* pszTimestampTestNet = "Innova Public IDAG Hidden Finality Testnet | May 26 2026 | Epoch-Root FCMP";
-            CTransaction txNewTestNet;
-
-            txNewTestNet.nTime = 1779753600;
-            txNewTestNet.vin.resize(1);
-            txNewTestNet.vout.resize(1);
-            txNewTestNet.vin[0].scriptSig = CScript() << 0 << CBigNum(42) << vector<unsigned char>((const unsigned char*)pszTimestampTestNet, (const unsigned char*)pszTimestampTestNet + strlen(pszTimestampTestNet));
-            txNewTestNet.vout[0].SetEmpty();
-
-            CBlock blocktest;
-            blocktest.vtx.push_back(txNewTestNet);
-            blocktest.hashPrevBlock = 0;
-            blocktest.hashMerkleRoot = blocktest.BuildMerkleTree();
-            blocktest.nTime    = 1779753600;
-            blocktest.nVersion = 1;
-            blocktest.nBits    = bnProofOfWorkLimit.GetCompact();
-            blocktest.nNonce   = 127761;
-
-            if (false && (blocktest.GetHash() != hashGenesisBlockTestNet))
-            {
-            // This will figure out a valid hash and Nonce if you're
-            // creating a different genesis block:
-                uint256 hashTarget = CBigNum().SetCompact(blocktest.nBits).getuint256();
-                while (blocktest.GetHash() > hashTarget)
-                {
-                    ++blocktest.nNonce;
-                    if (blocktest.nNonce == 0)
-                    {
-                        printf("NONCE WRAPPED, incrementing time");
-                        ++blocktest.nTime;
-                    }
-                }
-            }
-            blocktest.print();
-            printf("TestNet blocktest.GetHash() == %s\n", blocktest.GetHash().ToString().c_str());
-            printf("TestNet blocktest.hashMerkleRoot == %s\n", blocktest.hashMerkleRoot.ToString().c_str());
-            printf("TestNet blocktest.nTime = %u \n", blocktest.nTime);
-            printf("TestNet blocktest.nNonce = %u \n", blocktest.nNonce);
-
-
-            //// debug print
-            if (blocktest.hashMerkleRoot != uint256("0xa18a28c4cde90e5c637c63715018a466511dd22eccd8f371512eec3074b1b19d"))
-                return error("TestNetLoadBlockIndex() : invalid testnet genesis merkle root %s", blocktest.hashMerkleRoot.ToString().c_str());
-            blocktest.print();
-            if (blocktest.GetHash() != hashGenesisBlockTestNet)
-                return error("TestNetLoadBlockIndex() : invalid testnet genesis hash %s", blocktest.GetHash().ToString().c_str());
-            if (!blocktest.CheckBlock())
-                return error("TestNetLoadBlockIndex() : testnet genesis block validation failed");
-
-            // -- debug print
-            if (fDebugChain)
-            {
-                printf("Initialised Innova TestNet genesis block:\n");
-                blocktest.print();
-            };
-
-            // Start new block file
-            unsigned int nFile;
-            unsigned int nBlockPos;
-            if (!blocktest.WriteToDisk(nFile, nBlockPos))
-                return error("TestNetLoadBlockIndex() : writing genesis block to disk failed");
-            if (!blocktest.AddToBlockIndex(nFile, nBlockPos, hashGenesisBlockTestNet))
-                return error("TestNetLoadBlockIndex() : Testnet genesis block not accepted");
-
-            // ppcoin: initialize synchronized checkpoint
-            if (!Checkpoints::WriteSyncCheckpoint(hashGenesisBlockTestNet))
-                return error("TestNetLoadBlockIndex() : failed to init sync checkpoint");
-
-        } else {
-
-            const char* pszTimestamp = "Innova Blockchain starts on 12/10/2019";
-            CTransaction txNew;
-            txNew.nTime = 1576002227;
-            txNew.vin.resize(1);
-            txNew.vout.resize(1);
-            txNew.vin[0].scriptSig = CScript() << 0 << CBigNum(42) << vector<unsigned char>((const unsigned char*)pszTimestamp, (const unsigned char*)pszTimestamp + strlen(pszTimestamp));
-            txNew.vout[0].SetEmpty();
-
-            CBlock block;
-            block.vtx.push_back(txNew);
-            block.hashPrevBlock = 0;
-            block.hashMerkleRoot = block.BuildMerkleTree();
-            block.nTime    = 1576002227;
-            block.nVersion = 1;
-            block.nBits    = bnProofOfWorkLimit.GetCompact();
-            block.nNonce   = 253080;
-
-            if (false && (block.GetHash() != hashGenesisBlock)) {
-            // This will figure out a valid hash and Nonce if you're
-            // creating a different genesis block:
-                uint256 hashTarget = CBigNum().SetCompact(block.nBits).getuint256();
-                while (block.GetHash() > hashTarget)
-                {
-                    ++block.nNonce;
-                    if (block.nNonce == 0)
-                    {
-                        printf("NONCE WRAPPED, incrementing time");
-                        ++block.nTime;
-                    }
-                }
-            }
-            block.print();
-            printf("block.GetHash() == %s\n", block.GetHash().ToString().c_str());
-            printf("block.hashMerkleRoot == %s\n", block.hashMerkleRoot.ToString().c_str());
-            printf("block.nTime = %u \n", block.nTime);
-            printf("block.nNonce = %u \n", block.nNonce);
-
-
-            //// debug print
-            assert(block.hashMerkleRoot == uint256("0x7fe3177ea86b03a9c8773b32a3db36f32f4011bec4a0724032c36bc1c9d569a0"));
-            block.print();
-            assert(block.GetHash() == hashGenesisBlock);
-            assert(block.CheckBlock());
-
-            // -- debug print
-            if (fDebugChain)
-            {
-                printf("Initialised genesis block:\n");
-                block.print();
-            };
-
-            // Start new block file
-            unsigned int nFile;
-            unsigned int nBlockPos;
-            if (!block.WriteToDisk(nFile, nBlockPos))
-                return error("LoadBlockIndex() : writing genesis block to disk failed");
-            if (!block.AddToBlockIndex(nFile, nBlockPos, hashGenesisBlock))
-                return error("LoadBlockIndex() : genesis block not accepted");
-
-            // ppcoin: initialize synchronized checkpoint
-            if (!Checkpoints::WriteSyncCheckpoint(hashGenesisBlock))
-                return error("LoadBlockIndex() : failed to init sync checkpoint");
-        }
+        // ppcoin: initialize synchronized checkpoint
+        if (!Checkpoints::WriteSyncCheckpoint(hashGenesis))
+            return error("LoadBlockIndex() : failed to init sync checkpoint");
+        printf("Genesis block initialized: %s\n", hashGenesis.ToString().c_str());
     }
 
     string strPubKey = "";

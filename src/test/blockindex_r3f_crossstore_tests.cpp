@@ -127,7 +127,7 @@ static bool R3FXSBuildGenerationAndInit(const fs::path& root, int S,
     src.foundBestChain = true;
     src.blockDataDir = (root / "blocks").string();
     BlockIndexGenerationBuilder b;
-    if (!b.Build(src, (root / "build-000001.tmp").string(), 1, NULL, error)) return false;
+    if (!b.Build(src, (root / "blockindex-build-000001.tmp").string(), 1, NULL, error)) return false;
     b.Close();
     if (BlockIndexGenerationManager::PublishGeneration(root.string(), 1, error) != BLOCK_INDEX_LIFECYCLE_OK) return false;
     if (BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error) != BLOCK_INDEX_LIFECYCLE_OK) return false;

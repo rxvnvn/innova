@@ -102,7 +102,7 @@ BOOST_AUTO_TEST_CASE(authoritative_byvalue_adds_no_historical_residency)
     src.foundBestChain = true;
     src.blockDataDir = blocksDir.string();
     std::string error;
-    boost::filesystem::path staging = root / "build-000001.tmp";
+    boost::filesystem::path staging = root / "blockindex-build-000001.tmp";
     { BlockIndexGenerationBuilder b;
       BOOST_REQUIRE_MESSAGE(b.Build(src, staging.string(), 1, NULL, &error), error); b.Close(); }
     BOOST_REQUIRE_MESSAGE(

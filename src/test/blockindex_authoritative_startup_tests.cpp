@@ -96,7 +96,7 @@ struct AuthNavFixture {
         src.foundBestChain = true;
         src.blockDataDir.clear();
 
-        boost::filesystem::path staging = root / "build-000001.tmp";
+        boost::filesystem::path staging = root / "blockindex-build-000001.tmp";
         std::string error;
         { BlockIndexGenerationBuilder b;
           BOOST_REQUIRE_MESSAGE(b.Build(src, staging.string(), 1, NULL, &error), error); b.Close(); }

@@ -122,7 +122,7 @@ struct G1Fixture
         BlockIndexGenerationBuilder b;
         BlockIndexGenerationStats stats;
         std::string error;
-        fs::path tmp = root / "build-000001.tmp";
+        fs::path tmp = root / "blockindex-build-000001.tmp";
         BOOST_REQUIRE_MESSAGE(b.Build(src, tmp.string(), baseGen, &stats, &error), error);
         b.Close();
         // Leave build-000001.tmp as-is; lifecycle Publish renames it to gen-000001

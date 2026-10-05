@@ -75,7 +75,7 @@ static FoldStagingResult BuildFoldStaging(const std::string& v2Root,
     const int32_t baseTip = baseM.committedTipHeight;
     res.baseCount = baseCount;
 
-    fs::path staging = fs::path(v2Root) / (strprintf("build-%06llu.tmp", (unsigned long long)newGen));
+    fs::path staging = fs::path(v2Root) / (strprintf("blockindex-build-%06llu.tmp", (unsigned long long)newGen));
     boost::system::error_code ec;
     if (fs::exists(staging))
         fs::remove_all(staging, ec);
@@ -293,7 +293,7 @@ BlockIndexFoldResult BlockIndexFoldTool::Fold(const std::string& v2Root,
     r.foldHeight = foldHeight;
 
     const uint64_t baseGen = (newGen > 0) ? (newGen - 1) : 0;
-    fs::path baseDir = fs::path(v2Root) / (strprintf("gen-%06llu", (unsigned long long)baseGen));
+    fs::path baseDir = fs::path(v2Root) / (strprintf("blockindex-gen-%06llu", (unsigned long long)baseGen));
     fs::path tipRoot = fs::path(v2Root);
 
     // A1. Open base generation (read-only).

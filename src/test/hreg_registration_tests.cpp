@@ -183,7 +183,7 @@ struct RealHRegDiskFixture
         source.blockDataDir.clear();
 
         std::string error;
-        boost::filesystem::path staging = root / "build-000001.tmp";
+        boost::filesystem::path staging = root / "blockindex-build-000001.tmp";
         { BlockIndexGenerationBuilder builder;
           BOOST_REQUIRE_MESSAGE(builder.Build(source, staging.string(), 1, NULL, &error), error);
           builder.Close(); }
