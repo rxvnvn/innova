@@ -4,6 +4,7 @@
 #include "blockindex_native_bootstrap.h"
 
 #include "blockindex_generation_builder.h"
+#include "blockindex_generation_builder_lm.h"
 #include "blockindex_generation_lifecycle.h"
 #include "fixed_blockindex_store.h"
 
@@ -200,6 +201,11 @@ BlockIndexNativePrepareStatus PrepareNativeBlockIndexGeneration(
     BlockIndexGenerationSource source;
     std::string snapDir = (fs::path(v2Root) / "blockindex-migsrc.tmp").string();
     bool haveSnap = false;
+    // COHORT M: legacy migration streams from the static snapshot with the
+    // bounded low-memory builder instead of materializing every historical
+    // record (and ~10 O(N) work maps) in RAM. Genesis (EMPTY_NEW) keeps the
+    // direct in-memory source: it is a single canonical record.
+    bool streamFromSnapshot = false;
 
     if (state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW)
     {
@@ -211,13 +217,7 @@ BlockIndexNativePrepareStatus PrepareNativeBlockIndexGeneration(
         if (!SnapshotLegacyBlockIndexDb(dataDir, snapDir, error))
             return BLOCK_INDEX_NATIVE_PREPARE_FAILED;
         haveSnap = true;
-        if (!ReadLegacyBlockIndexSource(snapDir, &source, error))
-        {
-            fs::remove_all(snapDir, ec);
-            return BLOCK_INDEX_NATIVE_PREPARE_FAILED;
-        }
-        // Exact nSize from the LIVE datadir blk*.dat files (read-only).
-        source.blockDataDir = dataDir;
+        streamFromSnapshot = true;
     }
     else
     {
@@ -230,10 +230,24 @@ BlockIndexNativePrepareStatus PrepareNativeBlockIndexGeneration(
     bool ok = false;
     try
     {
-        BlockIndexGenerationBuilder builder;
-        BlockIndexGenerationStats stats;
-        ok = builder.Build(source, staging, gen, &stats, error);
-        builder.Close();
+        if (streamFromSnapshot)
+        {
+            // Bounded/streaming path: the low-memory builder opens the snapshot
+            // read-only itself (bounded LevelDB cache) and streams
+            // records/active/derived through the shared generation writer. Peak
+            // RAM is independent of the historical block count. nSize (exact
+            // block size) is read from the live blk*.dat files, read-only, via
+            // blockDataDir. It fails closed if any record lacks an exact nSize.
+            BlockIndexGenerationBuilderLM lm;
+            ok = lm.Build(snapDir, dataDir, gen, staging, error);
+        }
+        else
+        {
+            BlockIndexGenerationBuilder builder;
+            BlockIndexGenerationStats stats;
+            ok = builder.Build(source, staging, gen, &stats, error);
+            builder.Close();
+        }
 
         if (ok)
             ok = (BlockIndexGenerationManager::PublishGeneration(v2Root, gen, error) == BLOCK_INDEX_LIFECYCLE_OK);

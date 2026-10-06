@@ -988,6 +988,17 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                           emptyDagDigest, error))
         return false;
 
+    // COHORT M: drop the builder's scratch directory. The external-sort runs,
+    // the temporary actidx/deridx LevelDBs and the idhash/hsort files all live
+    // under <stagingDir>/.lm-tmp, and <stagingDir> is renamed into the immutable
+    // generation on publish. Leaving it would ship O(N) scratch INSIDE the
+    // published generation (measured ~3x the canonical generation size), so it
+    // must be removed once the generation is finalized.
+    {
+        boost::system::error_code rmec;
+        fs::remove_all(tmpDir, rmec);
+    }
+
     ClearError(error);
     return true;
 }
