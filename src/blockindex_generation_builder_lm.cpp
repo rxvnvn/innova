@@ -439,7 +439,16 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
             memcpy(&val[sizeof(BlockIndexId)], &heads[best]->second, sizeof(BlockIndexRecord));
             actBatch.Put(leveldb::Slice(key), leveldb::Slice(val));
             ++actBatchCount;
-            if (actBatchCount >= 4096)
+            // Write the actIdx external index in larger batches. This DB is opened
+            // with a BOUNDED 1MB write_buffer (RAM independent of N). A ~1MB batch
+            // (4096 records) equalled that buffer, so every Write produced a full
+            // memtable flush and L0 file, and the resulting flush/compaction churn
+            // dominated the merge phase (measured: 195 flushes, ~45% of the merge
+            // wall time at K=13). ~4MB batches (16384 records) cut the flush count
+            // (195 -> 48) and the merge time ~45%, with bounded extra RAM (~4MB
+            // batch buffer; measured peak +~12MB, still well within the bounded
+            // migration footprint). No change to indexed content or ordering.
+            if (actBatchCount >= 16384)
             {
                 leveldb::Status ws = actIdx->Write(leveldb::WriteOptions(), &actBatch);
                 if (!ws.ok())
