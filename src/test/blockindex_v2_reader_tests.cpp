@@ -3,6 +3,7 @@
 #include "../blockindex_generation_builder.h"
 #include "../blockindex_generation_lifecycle.h"
 #include <boost/filesystem.hpp>
+#include <zlib.h>
 #include <boost/thread.hpp>
 #include <leveldb/db.h>
 #include <fstream>
@@ -258,6 +259,41 @@ BOOST_AUTO_TEST_CASE(u4_sequential_r3g_detects_first_and_last_record_corruption)
       BOOST_CHECK_MESSAGE(!r.Open(root.string(),o,&openErr), "open must fail closed on corrupt last record: "<<openErr);
       BOOST_CHECK(!r.IsOpen());
       BOOST_CHECK(openErr.find("RecordId")!=std::string::npos); }
+}
+
+// U6 (Cohort U) — corruption equivalence for the R3G-only class: a record whose
+// CRC is VALID but whose decoded contents violate the record contract. The R3G
+// scan decodes every record with DecodeBlockIndexRecordV1, which runs
+// ValidateRecord; generation-root validation never decodes a record, so this
+// class is detected ONLY by the reader-open scan and must keep failing closed.
+BOOST_AUTO_TEST_CASE(u6_r3g_rejects_crc_valid_but_semantically_invalid_record)
+{
+    boost::filesystem::path root=UniqueRoot();BuildSelected(root);
+    std::string e; std::vector<unsigned char> b=ReadFileBytes(GenDir(root)/BLOCK_INDEX_RECORDS_FILE_NAME,&e);
+    BOOST_REQUIRE(!b.empty());
+    // Take record 2 (a PoW record in the fixture): flip its nFlags to
+    // BLOCK_PROOF_OF_STAKE while nStakeTime stays 0. The CRC is then recomputed so
+    // the byte-level checksum is valid and only ValidateRecord can reject it.
+    const size_t rec = BLOCK_INDEX_RECORDS_HEADER_SIZE_V1 + 1*BLOCK_INDEX_RECORD_SIZE_V1;
+    BOOST_REQUIRE(b.size() >= rec + BLOCK_INDEX_RECORD_SIZE_V1);
+    const size_t nFlagsOff = rec + 172;               // [160..164) height, +164 nFile, +168 nBlockPos, +172 nFlags
+    const size_t crcOff = rec + BLOCK_INDEX_RECORD_SIZE_V1 - 4;
+    b[nFlagsOff] = (unsigned char)CBlockIndex::BLOCK_PROOF_OF_STAKE;
+    const uint32_t crc = (uint32_t)crc32(0L, &b[rec], BLOCK_INDEX_RECORD_SIZE_V1 - 4);
+    b[crcOff+0]=(unsigned char)(crc & 0xff); b[crcOff+1]=(unsigned char)((crc>>8)&0xff);
+    b[crcOff+2]=(unsigned char)((crc>>16)&0xff); b[crcOff+3]=(unsigned char)((crc>>24)&0xff);
+    WriteFileBytes(GenDir(root)/BLOCK_INDEX_RECORDS_FILE_NAME, b, &e);
+
+    // Codec level: must reject (semantic, not checksum, failure).
+    { BlockIndexRecord d; std::string de;
+      BOOST_CHECK(!DecodeBlockIndexRecordV1(&b[rec], BLOCK_INDEX_RECORD_SIZE_V1, &d, &de));
+      BOOST_CHECK(!de.empty()); }
+    // Reader-open level: corruption must not reach a usable reader.
+    { BlockIndexV2Reader r; BlockIndexV2ReaderOptions o; std::string openErr;
+      BOOST_CHECK_MESSAGE(!r.Open(root.string(), o, &openErr),
+          "open must fail closed on a CRC-valid but semantically invalid record: " << openErr);
+      BOOST_CHECK(!r.IsOpen());
+      BOOST_CHECK(openErr.find("authoritative records integrity failure") != std::string::npos); }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
