@@ -8,7 +8,8 @@
 #include "blockindex_derived_replay.h"
 #include "blockindex_generation_lifecycle.h"
 
-#include <list>
+#include <functional>
+#include <string>
 #include <map>
 
 // A.8: one immutable, CURRENT-selected generation; pointer-free historical API.
@@ -60,6 +61,15 @@ public:
     bool IsOpen() const;
     uint64_t Generation() const;
     uint64_t RecordCount() const;
+
+    // T2 (Cohort T): bounded SEQUENTIAL traversal of every committed record in
+    // RecordId order. Same predicate surface as GetRecordById but with none of
+    // its per-record costs (reader lock per call, LRU lookup/insert/eviction,
+    // active-membership work, snapshot materialization) - appropriate for a
+    // known full-generation scan. O(1) auxiliary memory, no LRU population, no
+    // CBlockIndex materialization, fail-closed on short/corrupt records.
+    bool ForEachRecordSequential(const std::function<bool(BlockIndexId, const BlockIndexRecord&)>& visit,
+                                 std::string* error) const;
     std::string GenerationPath() const;
     // Read-only selected manifest retained by this already-open reader.
     const FixedBlockIndexManifest& Manifest() const;

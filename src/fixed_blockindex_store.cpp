@@ -751,6 +751,73 @@ bool FixedBlockIndexStore::Read(BlockIndexId id, BlockIndexRecord* out, std::str
     return DecodeBlockIndexRecordV1(&bytes[0], bytes.size(), out, error);
 }
 
+bool FixedBlockIndexStore::ReadAllSequential(const std::function<bool(BlockIndexId, const BlockIndexRecord&)>& visit,
+                                             std::string* error) const
+{
+    if (!open)
+        return SetError(error, "store is not open");
+    if (!visit)
+        return SetError(error, "null sequential visitor");
+
+    // Own forward-only handle: the scan must not contend with the shared
+    // random-access read handle.
+    FILE* f = fopen(recordsPath.string().c_str(), "rb");
+    if (!f)
+        return SetError(error, "records.dat open failed for sequential scan");
+
+    // Same committed-region bound Read() enforces per record, checked once up
+    // front so a short file fails closed before any record is visited.
+    uint64_t regionEnd = 0;
+    if (!CheckedAddMul(BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, manifest.recordCount,
+                       BLOCK_INDEX_RECORD_SIZE_V1, &regionEnd))
+    {
+        fclose(f);
+        return SetError(error, "committed region size overflow");
+    }
+    if (fseeko(f, 0, SEEK_END) != 0)
+    {
+        fclose(f);
+        return SetError(error, "seek end failed for sequential scan");
+    }
+    const off_t fileSize = ftello(f);
+    if (fileSize < 0 || (uint64_t)fileSize < regionEnd)
+    {
+        fclose(f);
+        return SetError(error, "records.dat shorter than committed region");
+    }
+    if (fseeko(f, (off_t)BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, SEEK_SET) != 0)
+    {
+        fclose(f);
+        return SetError(error, "seek to first record failed for sequential scan");
+    }
+
+    std::vector<unsigned char> bytes(BLOCK_INDEX_RECORD_SIZE_V1, 0);
+    for (uint64_t i = 0; i < manifest.recordCount; ++i)
+    {
+        const size_t n = fread(&bytes[0], 1, bytes.size(), f);
+        if (n != bytes.size())
+        {
+            fclose(f);
+            return SetError(error, "truncated record bytes during sequential scan");
+        }
+        BlockIndexRecord rec;
+        if (!DecodeBlockIndexRecordV1(&bytes[0], bytes.size(), &rec, error))
+        {
+            fclose(f);
+            return false;
+        }
+        if (!visit((BlockIndexId)(i + 1), rec))
+        {
+            fclose(f);
+            ClearError(error);
+            return true;
+        }
+    }
+    fclose(f);
+    ClearError(error);
+    return true;
+}
+
 bool FixedBlockIndexStore::WriteManifest(const FixedBlockIndexManifest& candidate, std::string* error)
 {
     if (!open || !writable)

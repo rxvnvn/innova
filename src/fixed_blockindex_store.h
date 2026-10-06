@@ -7,6 +7,7 @@
 #include <boost/shared_ptr.hpp>
 #include "sync.h"
 #include <stdint.h>
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -152,6 +153,17 @@ public:
                      std::vector<BlockIndexId>* outIds,
                      std::string* error);
     bool Read(BlockIndexId id, BlockIndexRecord* out, std::string* error) const;
+    // T2 (Cohort T): bounded SEQUENTIAL read of every committed record in
+    // RecordId order (1..CommittedRecordCount). This exists for known
+    // full-generation scans, where per-record Read() is the wrong access
+    // pattern. It opens its OWN forward-only handle (no contention with the
+    // random-access handle), uses O(1) auxiliary memory (one record buffer),
+    // and applies the SAME committed-region bound and per-entry decode/CRC
+    // check as Read(). It fails closed on any short/corrupt read. `visit`
+    // returning false stops early and is NOT an error; `error` is cleared on
+    // success. Returns false only on a real failure.
+    bool ReadAllSequential(const std::function<bool(BlockIndexId, const BlockIndexRecord&)>& visit,
+                           std::string* error) const;
     bool WriteManifest(const FixedBlockIndexManifest& manifest, std::string* error);
 
     uint64_t CommittedRecordCount() const;

@@ -192,6 +192,13 @@ bool BlockIndexV2Reader::GetDAGInputDigest(unsigned char out[32], std::string* e
     return true;
 }
 
+bool BlockIndexV2Reader::ForEachRecordSequential(
+    const std::function<bool(BlockIndexId, const BlockIndexRecord&)>& visit, std::string* error) const {
+    LOCK(cs);
+    if (!open) { Fail(error, "reader is not open"); return false; }
+    return store.ReadAllSequential(visit, error);
+}
+
 BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const BlockIndexRecord& r, bool inActive) const {
     BlockIndexSnapshot s; s.found=true; s.id=id; s.hash=r.hash; s.hashPrev=r.hashPrev; s.hashMerkleRoot=r.hashMerkleRoot; s.height=r.height; s.nFile=r.nFile; s.nBlockPos=r.nBlockPos; s.nFlags=r.nFlags; s.nVersion=r.nVersion; s.nTime=r.nTime; s.nBits=r.nBits; s.nNonce=r.nNonce; s.nMint=r.nMint; s.nMoneySupply=r.nMoneySupply; s.nStakeModifier=r.nStakeModifier; s.prevoutStake=r.prevoutStake; s.nStakeTime=r.nStakeTime; s.hashProof=r.hashProof; s.fProofOfStake=(r.prevoutStake.hash != uint256(0)); s.fInMainChain=inActive; s.hasParent=(r.hashPrev != uint256(0));
     // G1-A: when derived.dat is present, surface the authoritative per-record

@@ -15,6 +15,7 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <fstream>
 #include <string>
 #include <vector>
 #include <set>
@@ -160,6 +161,80 @@ BOOST_AUTO_TEST_CASE(o6_no_map_causal)
     for (size_t i = 0; i < fx.active.size(); ++i)
         BOOST_CHECK(mapBlockIndex.find(fx.active[i].hash) == mapBlockIndex.end());
     BOOST_CHECK(mapBlockIndex.find(fx.sidePos.hash) == mapBlockIndex.end());
+}
+
+// T2 (Cohort T): the bounded sequential rebuild must produce EXACTLY the legacy
+// GetRecordById oracle output - same size, same keys, no missing, no extra.
+BOOST_AUTO_TEST_CASE(t2_sequential_matches_legacy_getrecordbyid_oracle)
+{
+    StakeFixture fx;
+    std::string error;
+
+    // Legacy oracle: the pre-T2 builder algorithm, verbatim.
+    std::set<std::pair<COutPoint,unsigned int> > legacy;
+    const uint64_t count = fx.reader.RecordCount();
+    BOOST_REQUIRE(count > 0);
+    for (BlockIndexId id = 1; id <= count; ++id)
+    {
+        BlockIndexSnapshot snap; std::string rerr;
+        BOOST_REQUIRE(fx.reader.GetRecordById(id, &snap, &rerr) == BLOCK_INDEX_V2_READ_FOUND);
+        if (!(snap.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE)) continue;
+        legacy.insert(std::make_pair(snap.prevoutStake, snap.nStakeTime));
+    }
+
+    BlockIndexStakeSeenBuilder b;
+    std::set<std::pair<COutPoint,unsigned int> > seq;
+    BOOST_REQUIRE_MESSAGE(b.Build(fx.reader, &seq, &error), error);
+
+    BOOST_CHECK_EQUAL(seq.size(), legacy.size());
+    BOOST_CHECK(seq == legacy); // set equality: no missing and no extra entries
+    // Boundary participation matches the oracle: record 1 is genesis PoW and is
+    // excluded; the active PoS record is included.
+    BOOST_CHECK_EQUAL(legacy.count(std::make_pair(fx.posPrevout, fx.posStakeTime)), (size_t)1);
+    BOOST_CHECK_EQUAL(legacy.count(std::make_pair(fx.sidePrevout, fx.sideStakeTime)), (size_t)1);
+}
+
+// T2 (Cohort T): the sequential path must fail closed, never degrade corruption
+// into an empty or partial setStakeSeen.
+BOOST_AUTO_TEST_CASE(t2_sequential_fails_closed_on_corruption)
+{
+    // Short file: the committed region is no longer fully present.
+    {
+        StakeFixture fx;
+        boost::filesystem::path recPath =
+            fx.root / BlockIndexGenerationManager::GenerationName(1) / BLOCK_INDEX_RECORDS_FILE_NAME;
+        BOOST_REQUIRE(boost::filesystem::exists(recPath));
+        const boost::uintmax_t full = boost::filesystem::file_size(recPath);
+        // Drop the final record's worth of bytes.
+        boost::filesystem::resize_file(recPath, full - BLOCK_INDEX_RECORD_SIZE_V1);
+
+        BlockIndexStakeSeenBuilder b;
+        std::set<std::pair<COutPoint,unsigned int> > ss;
+        std::string error;
+        BOOST_CHECK(b.Build(fx.reader, &ss, &error) == false);
+        BOOST_CHECK(!error.empty());
+        BOOST_CHECK(ss.empty());
+    }
+    // Malformed record bytes: per-entry CRC catches it.
+    {
+        StakeFixture fx;
+        boost::filesystem::path recPath =
+            fx.root / BlockIndexGenerationManager::GenerationName(1) / BLOCK_INDEX_RECORDS_FILE_NAME;
+        std::fstream f(recPath.string().c_str(), std::ios::in | std::ios::out | std::ios::binary);
+        BOOST_REQUIRE(f.is_open());
+        const std::streamoff off =
+            (std::streamoff)BLOCK_INDEX_RECORDS_HEADER_SIZE_V1 + (std::streamoff)BLOCK_INDEX_RECORD_SIZE_V1 + 100;
+        char c = 0; f.seekg(off); f.read(&c, 1); BOOST_REQUIRE(f.gcount() == 1);
+        c = (char)((unsigned char)c ^ 0x5a);
+        f.seekp(off); f.write(&c, 1); f.flush(); f.close();
+
+        BlockIndexStakeSeenBuilder b;
+        std::set<std::pair<COutPoint,unsigned int> > ss;
+        std::string error;
+        BOOST_CHECK(b.Build(fx.reader, &ss, &error) == false);
+        BOOST_CHECK(!error.empty());
+        BOOST_CHECK(ss.empty());
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()

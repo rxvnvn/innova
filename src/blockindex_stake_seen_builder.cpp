@@ -25,21 +25,27 @@ bool BlockIndexStakeSeenBuilder::Build(const BlockIndexV2Reader& reader,
         return false;
     }
 
-    const uint64_t count = reader.RecordCount();
-    for (BlockIndexId id = 1; id <= count; ++id)
-    {
-        BlockIndexSnapshot snap;
-        std::string rerr;
-        BlockIndexV2ReadStatus st = reader.GetRecordById(id, &snap, &rerr);
-        if (st != BLOCK_INDEX_V2_READ_FOUND)
+    // T2 (Cohort T): this is a known full-generation sequential traversal. The
+    // legacy loop called GetRecordById per record, paying the reader lock, an
+    // LRU lookup/miss/insert (which the one-shot scan never reuses) and
+    // active-membership work - none of which this predicate consumes. Stream
+    // records instead. Semantics are identical: the loop inserted
+    // (prevoutStake, nStakeTime) for every record carrying the PoS flag,
+    // SnapshotFromRecord copies nFlags/prevoutStake/nStakeTime verbatim, the
+    // legacy path never consulted active membership, and insertion into a
+    // std::set makes RecordId order irrelevant.
+    bool ok = reader.ForEachRecordSequential(
+        [out](BlockIndexId, const BlockIndexRecord& rec) -> bool
         {
-            if (error) *error = "stake_seen builder: corrupt record id=" +
-                std::to_string((uint64_t)id) + ": " + rerr;
-            return false;
-        }
-        if (!(snap.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE))
-            continue;
-        out->insert(std::make_pair(snap.prevoutStake, snap.nStakeTime));
+            if (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE)
+                out->insert(std::make_pair(rec.prevoutStake, rec.nStakeTime));
+            return true;
+        }, error);
+    if (!ok)
+    {
+        if (error && error->empty())
+            *error = "stake_seen builder: sequential scan of records.dat failed";
+        return false;
     }
     return true;
 }
