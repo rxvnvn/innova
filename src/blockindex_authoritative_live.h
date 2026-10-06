@@ -244,6 +244,10 @@ public:
     BlockIndexTipAuthority* TipAuthorityMutable();
     const BlockIndexLiveTail& Tail() const;
     int Horizon() const;
+    // PM1-P0-06 A1-b S1/S3: O(1) persistent full-topology residency counters
+    // (the fullResident_ map). Current + high-water; never a measurement history.
+    size_t ResidentCount() const;
+    size_t ResidentPeak() const;
     uint64_t BaseGeneration() const;
     bool IsOpen() const;
 

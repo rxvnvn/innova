@@ -8,6 +8,8 @@
 
 #include "kernel.h"
 #include "cold_hot_seam.h"
+#include "blockindex_authoritative_live.h"
+#include "blockindex_authoritative_startup.h"
 #include "blockindex_shadow_startup.h"
 #include "txdb.h"
 #include "main.h"
@@ -507,8 +509,35 @@ static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
     }
     // PHASE 2 - the pointer walk stopped at the residency floor without a
     // generated modifier. Continue BY VALUE from that floor block.
+    // PM1-P0-06 A1-c: the floor block may itself be a LIVE (post-generation)
+    // block, which the immutable cold reader cannot resolve (ResolveLogicalR ->
+    // LookupByHash cold miss). Walk TIP-FIRST-THEN-BASE through the authoritative
+    // live authority so a live floor block is resolvable; fall back to the
+    // cold-only navigator only when no live authority is retained.
     if (p->nHeight == 0)
         return 0; // genuine genesis floor: exactly legacy's error case
+    if (BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority())
+    {
+        uint256 h = p->GetBlockHash();
+        for (int guard = 0; guard < 200000000; ++guard)
+        {
+            BlockIndexSnapshot snap;
+            std::string e2;
+            const BlockIndexHotStatus st = liveAuth->ResolveBlockSnapshot(h, &snap, &e2);
+            if (st != BlockIndexHotStatus::OK)
+                return -1; // authority failure -> fail closed
+            if (snap.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
+            {
+                nStakeModifier = snap.nStakeModifier;
+                nModifierTime  = (int64_t)snap.nStakeModifierTime;
+                return 1;
+            }
+            if (snap.height == 0 || snap.hashPrev == 0)
+                return 0; // genuine genesis floor
+            h = snap.hashPrev;
+        }
+        return -1; // guard exhausted -> fail closed
+    }
     uint64_t nMod = 0;
     int64_t  nTime = 0;
     const ColdHotSeamResult r = nav->GetLastStakeModifierR(

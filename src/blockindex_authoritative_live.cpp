@@ -43,10 +43,11 @@ public:
     std::map<uint256, CBlockIndex*> fullResident_;
     std::map<uint256, uint256*>     fullResidentHash_;
     std::set<uint256>               fullResidentAnchor_;
+    size_t                          fullResidentPeak_;
 
     Impl()
         : baseReader(NULL), horizon(2048), baseGeneration(0),
-          open(false), baseTipHeight(-1), baseTipHash(0)
+          open(false), baseTipHeight(-1), baseTipHash(0), fullResidentPeak_(0)
     {
     }
 
@@ -474,6 +475,8 @@ CBlockIndex* BlockIndexAuthoritativeLive::ResolveAndRetainFullParent(
         if (h == impl_->baseTipHash)
             impl_->fullResidentAnchor_.insert(h);
     }
+    if (impl_->fullResident_.size() > impl_->fullResidentPeak_)
+        impl_->fullResidentPeak_ = impl_->fullResident_.size();
     // Link topology: pprev -> floor, pnext -> tip within the resolved chain AND
     // against already-persistent ancestors so the whole pointer graph is valid.
     // Build height-ordered list path[0] (highest) .. path.back() (floor).
@@ -898,6 +901,16 @@ const BlockIndexLiveTail& BlockIndexAuthoritativeLive::Tail() const
 int BlockIndexAuthoritativeLive::Horizon() const
 {
     return impl_->horizon;
+}
+
+size_t BlockIndexAuthoritativeLive::ResidentCount() const
+{
+    return impl_->fullResident_.size();
+}
+
+size_t BlockIndexAuthoritativeLive::ResidentPeak() const
+{
+    return impl_->fullResidentPeak_;
 }
 
 uint64_t BlockIndexAuthoritativeLive::BaseGeneration() const

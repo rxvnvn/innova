@@ -606,10 +606,45 @@ bool PeerOrphanStorageLimitExceeded(NodeId peer, int* pnOrphanCountPeer)
 // Returns 1 when the local active-chain tip is an ancestor of the peer's
 // advertised best-known block, 0 when the peer is on a competing branch, and
 // -1 when the peer's best-known block is unknown or too deep to check.
-static int TipAncestorOfPeerBestKnown(const uint256& hashPeerBest)
+// PM1-P0-06 A1-b: non-static so the dedicated by-value parity suite can exercise
+// both the legacy raw walk and the authoritative by-value branch directly.
+int TipAncestorOfPeerBestKnown(const uint256& hashPeerBest)
 {
     if (hashPeerBest == 0)
         return -1;
+    if (g_fAuthoritativeStartup)
+    {
+        // PM1-P0-06 A1: authoritative by-value. No persistent mapBlockIndex
+        // residency or raw pprev walk is required; the peer-best identity and
+        // its ancestry are resolved through the V2 authority by value.
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        if (live == NULL || !live->IsOpen())
+            return -1;
+        BlockIndexSnapshot peer;
+        std::string perr;
+        if (live->ResolveBlockSnapshot(hashPeerBest, &peer, &perr) != BlockIndexHotStatus::OK || !peer.found)
+            return -1; // unknown peer best
+        if (peer.height < nBestHeight)
+            return 0;
+        uint256 cur = peer.hash;
+        int curHeight = peer.height;
+        for (int i = 0; i < 8000000; ++i)
+        {
+            if (curHeight == nBestHeight)
+                return (cur == hashBestChain) ? 1 : 0;
+            if (curHeight < nBestHeight)
+                return 0;
+            BlockIndexSnapshot sn;
+            std::string err;
+            if (live->ResolveBlockSnapshot(cur, &sn, &err) != BlockIndexHotStatus::OK || !sn.found)
+                return -1; // required record unavailable -> unknown
+            if (sn.hashPrev == uint256(0))
+                return 0;  // parentless boundary above nBestHeight
+            cur = sn.hashPrev;
+            curHeight = sn.height - 1;
+        }
+        return -1;
+    }
     std::map<uint256, CBlockIndex*>::const_iterator mi =
         mapBlockIndex.find(hashPeerBest);
     if (mi == mapBlockIndex.end())
@@ -7002,9 +7037,16 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
 
     // Operator-invalidation gate (defense in depth; SetBestChain precedes every
     // Reorganize call, but guard here too for direct callers).
-    if (IsBlockOperatorInvalid(pindexNew))
-        return error("Reorganize() : block %s (or an ancestor) is invalidated by the operator",
-                     pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+    // PM1-P0-06 A1: authoritative by-value verdict; fail closed if unavailable.
+    {
+        BlockIndexOperatorInvalidResult oir = IsBlockOperatorInvalidTyped(pindexNew);
+        if (oir == BLOCK_INDEX_OPERATOR_UNAVAILABLE)
+            return error("Reorganize() : operator-invalid authority unavailable for %s (fail closed)",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+        if (oir == BLOCK_INDEX_OPERATOR_INVALID)
+            return error("Reorganize() : block %s (or an ancestor) is invalidated by the operator",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+    }
 
 
     // Find the fork
@@ -7183,9 +7225,16 @@ bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
 
     // Operator-invalidation gate (defense in depth; the primary gate is in
     // SetBestChain, which precedes every SetBestChainInner call).
-    if (IsBlockOperatorInvalid(pindexNew))
-        return error("SetBestChainInner() : block %s (or an ancestor) is invalidated by the operator",
-                     pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+    // PM1-P0-06 A1: authoritative by-value verdict; fail closed if unavailable.
+    {
+        BlockIndexOperatorInvalidResult oir = IsBlockOperatorInvalidTyped(pindexNew);
+        if (oir == BLOCK_INDEX_OPERATOR_UNAVAILABLE)
+            return error("SetBestChainInner() : operator-invalid authority unavailable for %s (fail closed)",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+        if (oir == BLOCK_INDEX_OPERATOR_INVALID)
+            return error("SetBestChainInner() : block %s (or an ancestor) is invalidated by the operator",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+    }
 
     // Adding to current best branch
     if (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash))
@@ -7224,9 +7273,16 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
         "setbestchain", pindexNew->nHeight);
     // Operator-invalidation gate: never activate a chain that descends from an
     // operator-invalidated block, regardless of how it reached SetBestChain.
-    if (IsBlockOperatorInvalid(pindexNew))
-        return error("SetBestChain() : block %s (or an ancestor) is invalidated by the operator",
-                     pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+    // PM1-P0-06 A1: authoritative by-value verdict; fail closed if unavailable.
+    {
+        BlockIndexOperatorInvalidResult oir = IsBlockOperatorInvalidTyped(pindexNew);
+        if (oir == BLOCK_INDEX_OPERATOR_UNAVAILABLE)
+            return error("SetBestChain() : operator-invalid authority unavailable for %s (fail closed)",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+        if (oir == BLOCK_INDEX_OPERATOR_INVALID)
+            return error("SetBestChain() : block %s (or an ancestor) is invalidated by the operator",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+    }
     if (g_testFailSetBestChainAfterDagInit)
         return false;
     uint256 hash = GetHash();
@@ -7550,6 +7606,59 @@ bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* 
     return PublishAuthoritativeLiveTailCutover(live, pindexNew, oldPublishedTipHash, outErr);
 }
 
+// PM1-P0-06 A1-b S2: physically bound authoritative mapBlockIndex residency to
+// the live horizon. In BY_VALUE_AUTHORITATIVE mode mapBlockIndex is a bounded
+// hot compatibility index, not a process-lifetime O(chain) owner: entries that
+// retire below the retained floor (tipHeight - horizon + 1) are detached from
+// every surviving raw link and freed. Historical consumers below the floor use
+// the by-value V2 authority (cohorts 1A/1D). Caller must hold cs_main.
+// nTipHeightForFloor: the tip height used to derive the retention floor. The
+// caller passes the PRE-connect nBestHeight so that deferring the call (see
+// AddToBlockIndex) does not shift the accepted A1-c window
+// (floor = tipHeight - horizon + 1, retained = horizon + 1). -1 = current nBestHeight.
+static void RetireBlockIndexBelowFloor(int nTipHeightForFloor = -1)
+{
+    if (!g_fAuthoritativeStartup)
+        return;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (live == NULL || !live->IsOpen())
+        return;
+    const int horizon = live->Horizon();
+    if (horizon <= 0)
+        return;
+    const int nFloorTipHeight = (nTipHeightForFloor >= 0) ? nTipHeightForFloor : nBestHeight;
+    const int floor = nFloorTipHeight - horizon + 1;
+    if (floor <= 0)
+        return;
+
+    // Phase A: detach every surviving raw link that points below the floor, so
+    // no surviving object references storage that Phase B frees.
+    for (std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.begin();
+         it != mapBlockIndex.end(); ++it)
+    {
+        CBlockIndex* o = it->second;
+        if (o->pprev && o->pprev->nHeight < floor) o->pprev = NULL;
+        if (o->pskip && o->pskip->nHeight < floor) o->pskip = NULL;
+        if (o->pnext && o->pnext->nHeight < floor) o->pnext = NULL;
+    }
+    // Phase B: free every entry below the floor (never the active tip or the
+    // bootstrap-owned genesis pointer).
+    for (std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.begin();
+         it != mapBlockIndex.end(); )
+    {
+        CBlockIndex* o = it->second;
+        if (o->nHeight < floor && o != pindexBest && o != pindexGenesisBlock)
+        {
+            it = mapBlockIndex.erase(it);
+            delete o;
+        }
+        else
+        {
+            ++it;
+        }
+    }
+}
+
 bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const uint256& hashProof)
 {
     ibdactivepath::ActivePathTimer ibdAddToBlockIndexTimer(
@@ -7635,6 +7744,26 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         setStakeSeen.insert(make_pair(pindexNew->prevoutStake, pindexNew->nStakeTime));
     pindexNew->phashBlock = &((*mi).first);
     pindexNew->BuildSkip();
+
+    // PM1-P0-06 A1-b/A1-c S2: bound authoritative residency to the live horizon.
+    // In BY_VALUE_AUTHORITATIVE mode mapBlockIndex is a bounded hot compatibility
+    // index, not a process-lifetime O(chain) owner: entries that retire below the
+    // retained floor (tipHeight - horizon + 1) are detached from every surviving
+    // raw link and freed. Historical consumers below the floor use the by-value V2
+    // authority (cohorts 1A/1D; the A1-c repair made the stake-modifier by-value
+    // continuation resolve LIVE floor blocks too). Caller holds cs_main.
+    //
+    // LIFETIME (PM1-P0-06 Phase-D L3): capture the retention floor NOW, using the
+    // PRE-connect nBestHeight, then defer the physical retirement to the END of
+    // this function. Retiring here would free/detach entries that this same call
+    // still dereferences below -- pindexNew->pprev->GetBlockHash() in the
+    // legacy-mirror write, SetBestChain/ConnectBlock, and the authoritative tip
+    // append. When an accepted block sits BELOW the retained floor, retiring here
+    // frees pindexNew itself and the following dereference is a use-after-free.
+    // Capturing at source keeps the accepted A1-c window EXACTLY as before
+    // (floor = tipHeight - horizon + 1 -> retained = horizon + 1) while the free
+    // itself now happens after every use of the retained topology.
+    const int nAcceptFloorTipHeight = nBestHeight;
 
     // Write to disk block index
     CTxDB txdb;
@@ -7792,6 +7921,16 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         }
     }
 
+    // PM1-P0-06 Phase-D L3: retire below-floor residency only AFTER every use of
+    // the newly accepted index within this call is complete (legacy mirror write,
+    // SetBestChain, authoritative tip append). pindexNew is preserved when it
+    // became best (RetireBlockIndexBelowFloor() never frees pindexBest); a
+    // below-floor side block is freed here, which is safe because no caller
+    // dereferences pindexNew after AddToBlockIndex returns (AcceptBlock uses
+    // `hash` only). The floor is derived from the PRE-connect tip height captured
+    // above so the retained window matches the accepted A1-c semantics exactly.
+    RetireBlockIndexBelowFloor(nAcceptFloorTipHeight);
+
     return true;
 }
 
@@ -7932,6 +8071,46 @@ bool CBlock::AcceptBlock()
         return error("AcceptBlock() : block already in mapBlockIndex");
     }
 
+    // ---- PM1-P0-06 Phase-D DR: KNOWN BLOCK != RESIDENT CBlockIndex ----
+    // In BY_VALUE_AUTHORITATIVE mode mapBlockIndex is a bounded RESIDENT window
+    // (often empty), so residency membership can no longer answer "is this block
+    // already authoritative-known?". Ask the durable by-value V2 authority
+    // instead: the composite tip-then-base snapshot read is bounded, allocates no
+    // CBlockIndex, does not repopulate mapBlockIndex and never falls back to
+    // legacy authority. Without this, a re-delivered historical/fork block
+    // passes here and is re-written to blk*.dat on every delivery (the real L5
+    // write-amplification defect). Legacy/non-authoritative mode is untouched.
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexAuthoritativeLive* liveDup = GetAuthoritativeLiveAuthority();
+        if (!liveDup || !liveDup->IsOpen())
+        {
+            // Fail closed: without the durable authority we cannot decide
+            // duplicate vs new, and we must never silently fall back to legacy
+            // residency after CURRENT.
+            TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_DUPLICATE);
+            return error("AcceptBlock() : authoritative duplicate authority unavailable (fail closed)");
+        }
+        BlockIndexSnapshot dupSnapshot;
+        std::string dupErr;
+        const BlockIndexHotStatus dupStatus =
+            liveDup->ResolveBlockSnapshot(hash, &dupSnapshot, &dupErr);
+        if (dupStatus == BlockIndexHotStatus::OK)
+        {
+            TraceAcceptBlockReject(*this, dupSnapshot.height, ABREJECT_DUPLICATE);
+            return error("AcceptBlock() : block already in authoritative V2 index at height %d (%s)",
+                         dupSnapshot.height, hash.ToString().substr(0,20).c_str());
+        }
+        if (dupStatus != BlockIndexHotStatus::AUTHORITY_MISSING)
+        {
+            // OK handled above; AUTHORITY_MISSING means genuinely unknown. Any
+            // other status is an authority/corruption failure -> fail closed.
+            TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_DUPLICATE);
+            return error("AcceptBlock() : authoritative duplicate lookup failed for %s: %s (fail closed)",
+                         hash.ToString().substr(0,20).c_str(), dupErr.c_str());
+        }
+    }
+
     // Get prev block index
     map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashPrevBlock);
     CBlockIndex* pindexPrev = NULL;
@@ -8023,12 +8202,18 @@ bool CBlock::AcceptBlock()
         return error("AcceptBlock() : block %s is invalidated by the operator",
                      hash.ToString().substr(0, 20).c_str());
     }
-    if (IsBlockOperatorInvalid(pindexPrev))
     {
-        TraceAcceptBlockReject(*this, nHeight,
-                               ABREJECT_PREV_OPERATOR_INVALIDATED);
-        return error("AcceptBlock() : previous block %s (or an ancestor) is invalidated by the operator",
-                     hashPrevBlock.ToString().substr(0, 20).c_str());
+        BlockIndexOperatorInvalidResult oir = IsBlockOperatorInvalidTyped(pindexPrev);
+        if (oir == BLOCK_INDEX_OPERATOR_UNAVAILABLE)
+            return error("AcceptBlock() : operator-invalid authority unavailable for previous block %s (fail closed)",
+                         hashPrevBlock.ToString().substr(0, 20).c_str());
+        if (oir == BLOCK_INDEX_OPERATOR_INVALID)
+        {
+            TraceAcceptBlockReject(*this, nHeight,
+                                   ABREJECT_PREV_OPERATOR_INVALIDATED);
+            return error("AcceptBlock() : previous block %s (or an ancestor) is invalidated by the operator",
+                         hashPrevBlock.ToString().substr(0, 20).c_str());
+        }
     }
 
     // LEGACY DAG RETIREMENT (Phase 1) — FUTURE-ACTIVATION FIREWALL.
@@ -8356,6 +8541,75 @@ bool IsBlockOperatorInvalid(const CBlockIndex* pindex)
         if (setInvalidBlockHash.count(*p->phashBlock))
             return true;
     return false;
+}
+
+// PM1-P0-06 A1: typed operator-invalid verdict. In BY_VALUE_AUTHORITATIVE mode
+// the ancestry relationship is answered through the authoritative V2 authority
+// (tip OperatorInvalidSet + by-value parent walk); the persistent raw pprev
+// chain is NOT required. A historical lookup failure FAILS CLOSED
+// (BLOCK_INDEX_OPERATOR_UNAVAILABLE), never folded into "not invalid".
+BlockIndexOperatorInvalidResult IsBlockOperatorInvalidTyped(const CBlockIndex* pindex)
+{
+    if (pindex == NULL)
+        return BLOCK_INDEX_OPERATOR_VALID;
+
+    if (!g_fAuthoritativeStartup)
+    {
+        // Legacy/raw path: byte-identical semantics to the bool form.
+        if (setInvalidBlockHash.empty())
+            return BLOCK_INDEX_OPERATOR_VALID;
+        for (const CBlockIndex* p = pindex; p != NULL; p = p->pprev)
+            if (setInvalidBlockHash.count(*p->phashBlock))
+                return BLOCK_INDEX_OPERATOR_INVALID;
+        return BLOCK_INDEX_OPERATOR_VALID;
+    }
+
+    // BY_VALUE_AUTHORITATIVE.
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (live == NULL || !live->IsOpen())
+        return BLOCK_INDEX_OPERATOR_UNAVAILABLE; // fail closed
+    const BlockIndexTipAuthority* tip = live->TipAuthority();
+    if (tip == NULL)
+        return BLOCK_INDEX_OPERATOR_UNAVAILABLE; // fail closed
+
+    const std::set<uint256> invalidSet = tip->OperatorInvalidSet();
+    if (invalidSet.empty())
+        return BLOCK_INDEX_OPERATOR_VALID; // O(1) fast path
+
+    // Bound the by-value ancestry walk by the LOWEST operator-invalid height so
+    // the per-accepted-block check is never O(chain) for a shallow invalid set.
+    int minInvalidHeight = -1;
+    for (std::set<uint256>::const_iterator it = invalidSet.begin();
+         it != invalidSet.end(); ++it)
+    {
+        BlockIndexSnapshot is;
+        std::string ierr;
+        const BlockIndexHotStatus ist = live->ResolveBlockSnapshot(*it, &is, &ierr);
+        if (ist != BlockIndexHotStatus::OK || !is.found)
+            return BLOCK_INDEX_OPERATOR_UNAVAILABLE; // cannot place an invalid id -> fail closed
+        if (minInvalidHeight < 0 || is.height < minInvalidHeight)
+            minInvalidHeight = is.height;
+    }
+
+    // Walk the candidate's ancestry by value (tip-then-base), checking each
+    // logical hash against the invalid set; stop once below the lowest invalid
+    // height (no invalid can lie further down).
+    uint256 cur = pindex->GetBlockHash();
+    for (;;)
+    {
+        if (invalidSet.count(cur))
+            return BLOCK_INDEX_OPERATOR_INVALID;
+        BlockIndexSnapshot sn;
+        std::string err;
+        const BlockIndexHotStatus st = live->ResolveBlockSnapshot(cur, &sn, &err);
+        if (st != BlockIndexHotStatus::OK || !sn.found)
+            return BLOCK_INDEX_OPERATOR_UNAVAILABLE; // missing required record -> fail closed
+        if (sn.height <= 0 || sn.hashPrev == uint256(0))
+            return BLOCK_INDEX_OPERATOR_VALID; // genesis / parentless boundary
+        if (minInvalidHeight >= 0 && (sn.height - 1) < minInvalidHeight)
+            return BLOCK_INDEX_OPERATOR_VALID;
+        cur = sn.hashPrev;
+    }
 }
 
 static bool PersistInvalidBlockSet()

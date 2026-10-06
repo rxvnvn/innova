@@ -513,7 +513,36 @@ BlockIndexHotDerivedTrust GetBlockTrustViaHotOwner(BlockIndexHotOwner& owner,
 // True when the block itself or any ancestor is in setInvalidBlockHash (i.e.
 // the operator invalidated it).  Must be consulted on every path that can
 // activate a chain; enforcement is done in one place for all call sites.
+//
+// PM1-P0-06 A1: in BY_VALUE_AUTHORITATIVE mode the ancestry is answered through
+// the authoritative V2 by-value authority (tip OperatorInvalidSet + by-value
+// parent walk), never through persistent raw pprev history. The bool form is
+// retained ONLY for legacy/test callers (legacy raw pprev walk, unchanged).
+// Production consensus callers MUST use the typed form so a historical lookup
+// failure FAILS CLOSED instead of being folded into "not invalid".
 bool IsBlockOperatorInvalid(const CBlockIndex* pindex);
+
+// Typed operator-invalid verdict (PM1-P0-06 A1).
+//   BLOCK_INDEX_OPERATOR_INVALID      - the block, or an ancestor, is invalid.
+//   BLOCK_INDEX_OPERATOR_VALID        - no invalid block on the ancestry.
+//   BLOCK_INDEX_OPERATOR_UNAVAILABLE  - the authority could not answer (closed
+//                                       authority, corrupt/absent required
+//                                       record). Callers MUST fail closed
+//                                       (reject the block/operation); never
+//                                       treat as VALID.
+enum BlockIndexOperatorInvalidResult
+{
+    BLOCK_INDEX_OPERATOR_VALID = 0,
+    BLOCK_INDEX_OPERATOR_INVALID,
+    BLOCK_INDEX_OPERATOR_UNAVAILABLE
+};
+BlockIndexOperatorInvalidResult IsBlockOperatorInvalidTyped(const CBlockIndex* pindex);
+
+// PM1-P0-06 A1-b: peer tip-ancestry probe (1 when the local active-chain tip is
+// an ancestor of the peer's advertised best-known block, 0 when the peer is on
+// a competing branch, -1 when the peer's best-known block is unknown or too
+// deep). Exposed for the dedicated by-value parity suite.
+int TipAncestorOfPeerBestKnown(const uint256& hashPeerBest);
 // Mark hash and its active-chain descendants invalid, rolling the active chain
 // back to the block's parent (and activating the best eligible alternative).
 // Returns false with *pszError set on prevalidation failure (no state change).

@@ -570,6 +570,8 @@ TEST_OBJS= \
     obj/test/blockindex_v2_reader_tests.o \
     obj/test/blockindex_p07_startup_ownership_tests.o \
     obj/test/blockindex_p07b_native_bootstrap_tests.o \
+    obj/test/blockindex_p06_operator_invalid_byvalue_tests.o \
+    obj/test/blockindex_p06_a1b_residency_scaling_tests.o \
     obj/test/candidate_frontier_tests.o \
     obj/test/candidate_frontier_decoupling_tests.o \
     obj/test/blockindex_candidate_startup_builder_tests.o \
@@ -753,3 +755,13 @@ FORCE:
 
 check-cnpayment-guard: test_innova
 	./test_innova --run_test=cnpayment_guard_tests
+
+# PM1-P0-06 A1-c G2: the residency harness cases are long stateful mining
+# fixtures (300+ accepted blocks each). Two such drives in ONE process abort,
+# so each case runs in its own fresh process (fresh-node semantics). All three
+# must execute; overall RC must be 0. No retry, no suppression.
+check-p06-residency-isolated: test_innova
+	./test_innova --run_test=blockindex_p06_a1b_residency_scaling_tests/p06_a1b_s4_connectable_plateau
+	./test_innova --run_test=blockindex_p06_a1b_residency_scaling_tests/p06_a1c_safety_after_turnover
+	./test_innova --run_test=blockindex_p06_a1b_residency_scaling_tests/p06_a1c_g1_below_floor_invalidation
+	@echo "P06-RESIDENCY-ISOLATED: ALL GREEN"
