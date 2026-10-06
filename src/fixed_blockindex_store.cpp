@@ -97,11 +97,6 @@ static bool ReadI64LE(const unsigned char* data, size_t size, size_t* offset, in
     return true;
 }
 
-static unsigned char HexDigit(unsigned int value)
-{
-    return (unsigned char)(value < 10 ? ('0' + value) : ('a' + value - 10));
-}
-
 static bool ParseHexNibble(char c, unsigned char* out)
 {
     if (c >= '0' && c <= '9')
@@ -139,15 +134,18 @@ static bool ReadHashBytes(const unsigned char* data, size_t size, size_t* offset
 {
     if (*offset > size || size - *offset < 32)
         return SetError(error, "short read for hash");
-    std::string hex;
-    hex.resize(64);
+    // U4b (Cohort U): decode straight into uint256 internal storage. The file
+    // stores the hash as big-endian display bytes (WriteHashBytes == GetHex) and
+    // uint256 internal storage is little-endian (SetHex fills pn[0] from the LAST
+    // hex pair), so the internal layout is the byte reversal of the 32 file
+    // bytes. The previous code built a 64-char hex string and re-parsed it
+    // through uint256(hex): the identical value, but with a heap-allocating
+    // string and a hex parse per hash. Every decoded record pays this 5x, and
+    // startup decodes every record at least twice (reader-open integrity scan and
+    // the stake-seen rebuild) - ~82M conversions on the real generation.
+    unsigned char* dst = out->begin();
     for (size_t i = 0; i < 32; ++i)
-    {
-        const unsigned char value = data[*offset + i];
-        hex[2 * i] = (char)HexDigit((value >> 4) & 0x0f);
-        hex[2 * i + 1] = (char)HexDigit(value & 0x0f);
-    }
-    *out = uint256(hex);
+        dst[i] = data[*offset + 31 - i];
     *offset += 32;
     return true;
 }

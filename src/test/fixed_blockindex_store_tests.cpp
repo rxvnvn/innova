@@ -9,6 +9,7 @@
 #include <stdio.h>
 
 #include <fstream>
+#include <cstdlib>
 #include <limits>
 #include <set>
 #include <string>
@@ -419,6 +420,46 @@ BOOST_AUTO_TEST_CASE(legacy_encode_decode_semantics_match_for_admitted_v1_fields
         BOOST_REQUIRE(DecodeBlockIndexRecordV1(encoded.data(), encoded.size(), &decoded, &error));
         ExpectRecordMatchesIndex(decoded, pindex);
     }
+}
+
+BOOST_AUTO_TEST_CASE(u4b_record_hash_wire_format_is_big_endian_and_decodes_identically)
+{
+    // U4b (Cohort U): the record codec serializes each hash as its big-endian
+    // display bytes, and the decoder must reconstruct the identical uint256 via a
+    // direct internal-layout copy (the previous decoder round-tripped through a
+    // hex string + uint256(hex)). This pins the wire-format contract both share,
+    // for all five hash fields.
+    BlockIndexRecord rec = MakeRecord(31, 5, true);
+    rec.hash = uint256(std::string("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"));
+    rec.hashPrev = uint256(std::string("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"));
+    rec.hashMerkleRoot = uint256(std::string("00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"));
+    rec.hashProof = uint256(std::string("ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"));
+    rec.prevoutStake.hash = uint256(std::string("1234567890abcdeffedcba09876543211234567890abcdeffedcba0987654321"));
+
+    std::vector<unsigned char> bytes; std::string error;
+    BOOST_REQUIRE(EncodeBlockIndexRecordV1(rec, &bytes, &error));
+    BOOST_REQUIRE_MESSAGE(error.empty(), error);
+    BOOST_REQUIRE_EQUAL(bytes.size(), BLOCK_INDEX_RECORD_SIZE_V1);
+
+    // Wire format (WriteHashBytes): 32 bytes per hash, byte k = hex pair k of
+    // GetHex(), i.e. the big-endian display order verbatim. The decoder must
+    // therefore reverse this layout into uint256 internal storage.
+    const std::string h = rec.hash.GetHex();
+    BOOST_CHECK_EQUAL((int)bytes[0], (int)(unsigned char)strtol(h.substr(0, 2).c_str(), NULL, 16));
+    BOOST_CHECK_EQUAL((int)bytes[31], (int)(unsigned char)strtol(h.substr(62, 2).c_str(), NULL, 16));
+    const std::string p = rec.hashPrev.GetHex();
+    BOOST_CHECK_EQUAL((int)bytes[32], (int)(unsigned char)strtol(p.substr(0, 2).c_str(), NULL, 16));
+    BOOST_CHECK_EQUAL((int)bytes[63], (int)(unsigned char)strtol(p.substr(62, 2).c_str(), NULL, 16));
+
+    BlockIndexRecord dec;
+    BOOST_REQUIRE(DecodeBlockIndexRecordV1(&bytes[0], bytes.size(), &dec, &error));
+    BOOST_REQUIRE_MESSAGE(error.empty(), error);
+    BOOST_CHECK(dec.hash == rec.hash);
+    BOOST_CHECK(dec.hashPrev == rec.hashPrev);
+    BOOST_CHECK(dec.hashMerkleRoot == rec.hashMerkleRoot);
+    BOOST_CHECK(dec.hashProof == rec.hashProof);
+    BOOST_CHECK(dec.prevoutStake.hash == rec.prevoutStake.hash);
+    ExpectRecordsEqual(rec, dec);
 }
 
 BOOST_AUTO_TEST_SUITE_END()
