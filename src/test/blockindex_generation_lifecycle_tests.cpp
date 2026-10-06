@@ -483,4 +483,100 @@ BOOST_AUTO_TEST_CASE(t1_structure_probe_skips_root_recompute_full_validation_sti
     // validation disappears from the startup path while the bootstrap's remains).
 }
 
+// ---------------------------------------------------------------------------
+// U5 (Cohort U) fixture: an AUTHORITATIVE-capability generation. The builder
+// declares AUTHORITATIVE only when every record's block size resolves from
+// blk*.dat, so this fixture writes real serialized blocks. Only an authoritative
+// generation makes ValidateGeneration perform the records.dat root
+// recomputation (the code path U5 changed).
+// ---------------------------------------------------------------------------
+struct U5Blk { uint256 hash; unsigned int nFile; unsigned int nBlockPos; };
+
+static U5Blk U5WriteBlock(const boost::filesystem::path& dir, uint256 prev,
+                          unsigned int nTime, unsigned int nBits, unsigned int nNonce)
+{
+    U5Blk info; info.nFile = 1; info.nBlockPos = 0;
+    CTransaction coinbase; coinbase.nVersion = 1; coinbase.nTime = nTime;
+    CTxIn input; input.prevout = COutPoint(uint256(0), 0xffffffff);
+    input.scriptSig = CScript() << OP_TRUE; input.nSequence = 0xffffffff;
+    coinbase.vin.push_back(input);
+    CTxOut output; output.nValue = 0; output.scriptPubKey = CScript() << OP_TRUE;
+    coinbase.vout.push_back(output);
+    CBlock block; block.nVersion = 1; block.hashPrevBlock = prev;
+    block.nTime = nTime; block.nBits = nBits; block.nNonce = nNonce;
+    block.vtx.push_back(coinbase); block.hashMerkleRoot = block.BuildMerkleTree();
+    info.hash = block.GetHash();
+    CDataStream ss(SER_DISK, CLIENT_VERSION); ss << block;
+    unsigned int ns = ss.size();
+    boost::filesystem::path f = dir / "blk0001.dat";
+    FILE* fp = fopen(f.string().c_str(), "ab");
+    BOOST_REQUIRE(fp != NULL);
+    unsigned char magic[] = {0xfa,0xbf,0xb5,0xda};
+    fwrite(magic,1,4,fp); fwrite(&ns,4,1,fp);
+    long pos = ftell(fp); info.nBlockPos = (unsigned int)pos;
+    fwrite(&ss[0],1,ss.size(),fp); fflush(fp); fclose(fp);
+    return info;
+}
+
+// U5 (Cohort U): the fused single-pass records.dat recomputation (recordsDigest
+// + hashIndexDigest together, hash decoded by direct byte reversal) must
+// reproduce the generation root the BUILDER wrote from the original two-pass
+// definitions. ValidateGeneration recomputes the root and compares it against
+// the stored content binding, so an OK result here is a byte-identity proof of
+// both digests; a single flipped record byte must still be rejected.
+BOOST_AUTO_TEST_CASE(u5_authoritative_fused_recompute_reproduces_canonical_root)
+{
+    boost::filesystem::path root = UniqueRoot("u5auth");
+    boost::filesystem::path blockDir = root / "blocks";
+    boost::filesystem::create_directories(blockDir);
+    std::string error;
+    BlockIndexGenerationSource src;
+    uint256 prev(0);
+    for (int h = 0; h <= 4; ++h)
+    {
+        const unsigned int nt = 1000u + (unsigned int)h;
+        U5Blk info = U5WriteBlock(blockDir, prev, nt, 0x1d00ffffU, 101u + (unsigned int)h);
+        BlockIndexRecord rec;
+        rec.hash = info.hash; rec.hashPrev = prev; rec.height = h; rec.nVersion = 1;
+        rec.nTime = nt; rec.nBits = 0x1d00ffffU; rec.nNonce = 101u + (unsigned int)h;
+        rec.nFile = info.nFile; rec.nBlockPos = info.nBlockPos; rec.nFlags = 0;
+        BlockIndexGenerationSourceRecord sr; sr.hash = rec.hash; sr.record = rec;
+        src.records.push_back(sr);
+        prev = info.hash;
+    }
+    src.hashBestChain = prev; src.foundBestChain = true; src.blockDataDir = blockDir.string();
+
+    boost::filesystem::path staging = root / "blockindex-build-000001.tmp";
+    { BlockIndexGenerationBuilder b; BOOST_REQUIRE_MESSAGE(b.Build(src, staging.string(), 1, NULL, &error), error); b.Close(); }
+    BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error) == (int)BLOCK_INDEX_LIFECYCLE_OK, error);
+    BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error) == (int)BLOCK_INDEX_LIFECYCLE_OK, error);
+
+    // Fixture guard: only an AUTHORITATIVE generation exercises the recompute.
+    { FixedBlockIndexOpenOptions o; FixedBlockIndexStore st;
+      BOOST_REQUIRE_MESSAGE(FixedBlockIndexStore::OpenReadOnly(
+          BlockIndexGenerationManager::GenerationPath(root.string(), 1), o, &st, &error), error);
+      BOOST_CHECK(st.GetManifest().capability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE); }
+
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::ValidateGenerationStructure(root.string(), 1, &error), (int)BLOCK_INDEX_LIFECYCLE_OK);
+    error.clear();
+    BOOST_CHECK_EQUAL(BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error), (int)BLOCK_INDEX_LIFECYCLE_OK);
+    error.clear();
+
+    // A single flipped record byte must still fail the full validation (the root
+    // binds every record byte).
+    {
+        boost::filesystem::path recPath =
+            boost::filesystem::path(BlockIndexGenerationManager::GenerationPath(root.string(), 1))
+            / BLOCK_INDEX_RECORDS_FILE_NAME;
+        std::fstream f(recPath.string().c_str(), std::ios::in | std::ios::out | std::ios::binary);
+        BOOST_REQUIRE(f.is_open());
+        const std::streamoff off = (std::streamoff)BLOCK_INDEX_RECORDS_HEADER_SIZE_V1 + 100;
+        char c = 0; f.seekg(off); f.read(&c, 1); BOOST_REQUIRE(f.gcount() == 1);
+        c = (char)((unsigned char)c ^ 0x5a);
+        f.seekp(off); f.write(&c, 1); f.flush(); f.close();
+        BOOST_CHECK_EQUAL(BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error), (int)BLOCK_INDEX_LIFECYCLE_ERROR);
+        error.clear();
+    }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

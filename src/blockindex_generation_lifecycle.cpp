@@ -247,17 +247,32 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
 {
     if (!EnsureCandidateLeafMetadata(dir.string(), generation, error))
         return false;
-    // 1. Recompute recordsDigest from records.dat
+    // 1. Recompute recordsDigest and hashIndexDigest from records.dat
+    //
+    // U5 (Cohort U): these two digests previously required TWO full passes over
+    // records.dat. Both domains derive from the SAME record bytes, so ONE
+    // sequential pass feeds both SHA256 contexts with EXACTLY the previous
+    // inputs. The hashindex digest input is the record hash in uint256 internal
+    // (little-endian) layout, which the builder hashed via uint256::begin(). The
+    // file stores that hash as big-endian display bytes (WriteHashBytes ==
+    // GetHex), so the internal layout is the byte reversal of the record's first
+    // 32 bytes. The old code expressed those same 32 bytes indirectly by decoding
+    // each record's hash to a hex string and re-parsing it through uint256 -
+    // identical input, strictly more work per record.
     unsigned char recordsDigest[32];
+    unsigned char hashIndexDigest[32];
     {
         const fs::path recordsPath = dir / BLOCK_INDEX_RECORDS_FILE_NAME;
         FILE* rf = fopen(recordsPath.string().c_str(), "rb");
         if (!rf)
             return SetError(error, "cannot open records.dat for root recomputation");
         fseeko(rf, (off_t)BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, SEEK_SET);
-        SHA256_CTX ctx;
-        SHA256_Init(&ctx);
+        SHA256_CTX recordsCtx;
+        SHA256_CTX hashIndexCtx;
+        SHA256_Init(&recordsCtx);
+        SHA256_Init(&hashIndexCtx);
         std::vector<unsigned char> recBuf(BLOCK_INDEX_RECORD_SIZE_V1);
+        unsigned char hashInternal[32];
         for (uint64_t i = 0; i < recordCount; ++i)
         {
             if (fread(&recBuf[0], 1, BLOCK_INDEX_RECORD_SIZE_V1, rf) != BLOCK_INDEX_RECORD_SIZE_V1)
@@ -265,10 +280,22 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
                 fclose(rf);
                 return SetError(error, "records.dat truncated during root recomputation");
             }
-            SHA256_Update(&ctx, &recBuf[0], BLOCK_INDEX_RECORD_SIZE_V1);
+            SHA256_Update(&recordsCtx, &recBuf[0], BLOCK_INDEX_RECORD_SIZE_V1);
+            // Hash field is the record's first 32 bytes; reverse into the
+            // internal little-endian storage layout the builder hashed.
+            for (int j = 0; j < 32; ++j)
+                hashInternal[j] = recBuf[31 - j];
+            SHA256_Update(&hashIndexCtx, hashInternal, 32);
+            // RecordId (i+1) as 8-byte LE (matches the active hashindex codec).
+            uint64_t recordId = i + 1;
+            unsigned char idBuf[8];
+            for (int b = 0; b < 8; ++b)
+                idBuf[b] = (unsigned char)((recordId >> (8 * b)) & 0xff);
+            SHA256_Update(&hashIndexCtx, idBuf, 8);
         }
         fclose(rf);
-        SHA256_Final(recordsDigest, &ctx);
+        SHA256_Final(recordsDigest, &recordsCtx);
+        SHA256_Final(hashIndexDigest, &hashIndexCtx);
     }
 
     // 2. Recompute activeDigest from active.dat
@@ -303,62 +330,6 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
         SHA256_Final(activeDigest, &ctx);
     }
 
-    // 3. Recompute hashIndexDigest from records.dat
-    // The hashindex maps (hash -> RecordId) for every record. Since records are
-    // stored in deterministic hash-sorted order with sequential RecordId, we can
-    // recompute from records.dat by reading each record's hash and pairing with
-    // its RecordId (1-based index).
-    // A.10.1b-fix3: use 8-byte LE RecordId to match active hashindex codec.
-    // IMPORTANT: the builder hashes uint256::begin() (internal little-endian
-    // storage), NOT the big-endian encoded bytes from WriteHashBytes. We must
-    // decode the hash and use begin() to match.
-    unsigned char hashIndexDigest[32];
-    {
-        const fs::path recordsPath = dir / BLOCK_INDEX_RECORDS_FILE_NAME;
-        FILE* rf = fopen(recordsPath.string().c_str(), "rb");
-        if (!rf)
-            return SetError(error, "cannot open records.dat for hashindex recomputation");
-        fseeko(rf, (off_t)BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, SEEK_SET);
-        SHA256_CTX ctx;
-        SHA256_Init(&ctx);
-        std::vector<unsigned char> recBuf(BLOCK_INDEX_RECORD_SIZE_V1);
-        for (uint64_t i = 0; i < recordCount; ++i)
-        {
-            if (fread(&recBuf[0], 1, BLOCK_INDEX_RECORD_SIZE_V1, rf) != BLOCK_INDEX_RECORD_SIZE_V1)
-            {
-                fclose(rf);
-                return SetError(error, "records.dat truncated during hashindex recomputation");
-            }
-            // Decode hash from encoded record (big-endian in file) to match
-            // builder's uint256::begin() (little-endian internal storage).
-            // WriteHashBytes stores via GetHex roundtrip = big-endian bytes.
-            // We reverse to get internal storage layout.
-            uint256 recHash;
-            {
-                // Convert big-endian encoded bytes to hex string, then to uint256
-                static const char hexChars[] = "0123456789abcdef";
-                std::string hex;
-                hex.resize(64);
-                for (size_t j = 0; j < 32; ++j)
-                {
-                    const unsigned char value = recBuf[j];
-                    hex[2 * j] = hexChars[(value >> 4) & 0x0f];
-                    hex[2 * j + 1] = hexChars[value & 0x0f];
-                }
-                recHash = uint256(hex);
-            }
-            // Use internal storage layout (little-endian) to match builder
-            SHA256_Update(&ctx, recHash.begin(), 32);
-            // RecordId (i+1) as 8-byte LE
-            uint64_t recordId = i + 1;
-            unsigned char idBuf[8];
-            for (int b = 0; b < 8; ++b)
-                idBuf[b] = (unsigned char)((recordId >> (8 * b)) & 0xff);
-            SHA256_Update(&ctx, idBuf, 8);
-        }
-        fclose(rf);
-        SHA256_Final(hashIndexDigest, &ctx);
-    }
 
     // 4. Recompute derivedEntriesDigest from derived.dat
     unsigned char derivedEntriesDigest[32];
@@ -401,7 +372,6 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
                                derivedEntriesDigest, mixedDagInputDigest,
                                recomputedRoot))
         return SetError(error, "ComputeGenerationRoot failed during recomputation");
-
     return true;
 }
 
