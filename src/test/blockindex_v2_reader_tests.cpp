@@ -233,4 +233,31 @@ BOOST_AUTO_TEST_CASE(failure_relevant_truncation_prevents_open)
       BlockIndexV2Reader r;BlockIndexV2ReaderOptions o;
       BOOST_CHECK(!r.Open(root.string(),o,&e));BOOST_CHECK(!r.IsOpen());BOOST_CHECK(!e.empty()); }
 }
+// U4 (Cohort U): the R3G open-time record-integrity scan now runs through ONE
+// bounded forward-only stream instead of a per-RecordId random-access read.
+// Boundary records must still fail closed exactly like the old loop.
+BOOST_AUTO_TEST_CASE(u4_sequential_r3g_detects_first_and_last_record_corruption)
+{
+    // First committed record body corrupted.
+    { boost::filesystem::path root=UniqueRoot();BuildSelected(root);
+      std::string e; std::vector<unsigned char> b=ReadFileBytes(GenDir(root)/BLOCK_INDEX_RECORDS_FILE_NAME,&e);BOOST_REQUIRE(!b.empty());
+      FlipBytes(b, BLOCK_INDEX_RECORDS_HEADER_SIZE_V1 + 100, 1);
+      WriteFileBytes(GenDir(root)/BLOCK_INDEX_RECORDS_FILE_NAME,b,&e);
+      BlockIndexV2Reader r;BlockIndexV2ReaderOptions o;std::string openErr;
+      BOOST_CHECK_MESSAGE(!r.Open(root.string(),o,&openErr), "open must fail closed on corrupt first record: "<<openErr);
+      BOOST_CHECK(!r.IsOpen());
+      BOOST_CHECK(openErr.find("RecordId 1")!=std::string::npos); }
+
+    // Last committed record body corrupted.
+    { boost::filesystem::path root=UniqueRoot();BuildSelected(root);
+      std::string e; std::vector<unsigned char> b=ReadFileBytes(GenDir(root)/BLOCK_INDEX_RECORDS_FILE_NAME,&e);BOOST_REQUIRE(!b.empty());
+      const size_t last = b.size() - BLOCK_INDEX_RECORD_SIZE_V1;
+      FlipBytes(b, last + 100, 1);
+      WriteFileBytes(GenDir(root)/BLOCK_INDEX_RECORDS_FILE_NAME,b,&e);
+      BlockIndexV2Reader r;BlockIndexV2ReaderOptions o;std::string openErr;
+      BOOST_CHECK_MESSAGE(!r.Open(root.string(),o,&openErr), "open must fail closed on corrupt last record: "<<openErr);
+      BOOST_CHECK(!r.IsOpen());
+      BOOST_CHECK(openErr.find("RecordId")!=std::string::npos); }
+}
+
 BOOST_AUTO_TEST_SUITE_END()

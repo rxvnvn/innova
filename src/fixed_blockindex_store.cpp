@@ -804,6 +804,8 @@ bool FixedBlockIndexStore::ReadAllSequential(const std::function<bool(BlockIndex
         if (!DecodeBlockIndexRecordV1(&bytes[0], bytes.size(), &rec, error))
         {
             fclose(f);
+            if (error)
+                *error = "record decode failure at RecordId " + std::to_string(i + 1) + ": " + *error;
             return false;
         }
         if (!visit((BlockIndexId)(i + 1), rec))

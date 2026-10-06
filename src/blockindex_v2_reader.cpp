@@ -72,14 +72,18 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
     // open (authoritative corruption is never rebuildable). Bounded O(records)
     // by-value; no materialization.
     {
+        // U4 (Cohort U): the per-record bounds+decode+CRC check is unchanged, but
+        // it is performed through ONE bounded forward-only stream instead of a
+        // per-RecordId random-access read. Each iteration of this scan is a
+        // one-shot sequential visit, so the previous loop paid a seek, a lock
+        // acquisition and a fresh buffer per record for zero reuse. Same
+        // committed-region bound, same DecodeBlockIndexRecordV1 (which verifies
+        // the per-entry checksum), same fail-closed result at the same point
+        // (before AUTHORITY_READY); only the error text gains the failing id.
         std::string vErr;
-        for (BlockIndexId vid = 1; vid <= nextManifest.recordCount; ++vid)
-        {
-            BlockIndexRecord vr;
-            if (!nextStore.Read(vid, &vr, &vErr))
-                return Fail(error, "authoritative records integrity failure at RecordId "
-                                   + std::to_string(vid) + ": " + vErr);
-        }
+        if (!nextStore.ReadAllSequential(
+                [](BlockIndexId, const BlockIndexRecord&) -> bool { return true; }, &vErr))
+            return Fail(error, "authoritative records integrity failure: " + vErr);
     }
     if (nextManifest.committedTipHeight >= 0) {
         BlockIndexId tipId = BLOCK_INDEX_ID_INVALID;
