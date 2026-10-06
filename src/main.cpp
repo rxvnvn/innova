@@ -3485,125 +3485,7 @@ int CMerkleTx::SetMerkleBranch(const CBlock* pblock)
 
 
 
-// ---------------------------------------------------------------------------
-// Adaptive Block Size (Monero-inspired, tuned for 1s DAG blocks)
-// ---------------------------------------------------------------------------
 
-unsigned int GetAdaptiveBlockSizeLimit(const CBlockIndex* pindex)
-{
-    if (!pindex)
-        return MAX_BLOCK_SIZE_LEGACY;
-
-    // Pre-DAG: fixed 1 MB
-    if (pindex->nHeight < FORK_HEIGHT_DAG)
-        return MAX_BLOCK_SIZE_LEGACY;
-
-    // Walk back ADAPTIVE_MEDIAN_WINDOW blocks and collect sizes
-    std::vector<unsigned int> vSizes;
-    vSizes.reserve(ADAPTIVE_MEDIAN_WINDOW);
-    const CBlockIndex* pWalk = pindex;
-
-    for (unsigned int i = 0; i < ADAPTIVE_MEDIAN_WINDOW && pWalk; i++)
-    {
-        vSizes.push_back(pWalk->nSize > 0 ? pWalk->nSize : 1);
-        pWalk = pWalk->pprev;
-    }
-
-    if (vSizes.empty())
-        return ADAPTIVE_BLOCK_FLOOR;
-
-    // Short-term median
-    std::sort(vSizes.begin(), vSizes.end());
-    unsigned int nShortMedian = vSizes[vSizes.size() / 2];
-
-    // Apply floor: penalty-free zone
-    if (nShortMedian < ADAPTIVE_BLOCK_FLOOR)
-        nShortMedian = ADAPTIVE_BLOCK_FLOOR;
-
-    // Long-term median anchor (independent window, starts after short-term window)
-    std::vector<unsigned int> vLongSizes;
-    // pWalk is already at the end of the short-term window — continue from there
-    unsigned int nLongSamples = std::min(ADAPTIVE_LONG_MEDIAN_WINDOW, (unsigned int)50000);
-    for (unsigned int i = 0; i < nLongSamples && pWalk; i++)
-    {
-        vLongSizes.push_back(pWalk->nSize > 0 ? pWalk->nSize : 1);
-        pWalk = pWalk->pprev;
-    }
-
-    if (!vLongSizes.empty())
-    {
-        std::sort(vLongSizes.begin(), vLongSizes.end());
-        unsigned int nLongMedian = vLongSizes[vLongSizes.size() / 2];
-        if (nLongMedian < ADAPTIVE_BLOCK_FLOOR)
-            nLongMedian = ADAPTIVE_BLOCK_FLOOR;
-
-        // Cap short-term median at ADAPTIVE_LONG_MEDIAN_CAP * long-term median (overflow-safe)
-        uint64_t nCap64 = (uint64_t)nLongMedian * ADAPTIVE_LONG_MEDIAN_CAP;
-        unsigned int nCap = (nCap64 > ADAPTIVE_BLOCK_CEILING) ? ADAPTIVE_BLOCK_CEILING : (unsigned int)nCap64;
-        if (nShortMedian > nCap)
-            nShortMedian = nCap;
-    }
-
-    // Effective limit = 2x median (max allowed size, matches Monero) — overflow-safe
-    uint64_t nEffective64 = (uint64_t)nShortMedian * 2;
-    unsigned int nEffectiveLimit = (nEffective64 > ADAPTIVE_BLOCK_CEILING) ? ADAPTIVE_BLOCK_CEILING : (unsigned int)nEffective64;
-
-    // Clamp to ceiling
-    if (nEffectiveLimit > ADAPTIVE_BLOCK_CEILING)
-        nEffectiveLimit = ADAPTIVE_BLOCK_CEILING;
-
-    return nEffectiveLimit;
-}
-
-int64_t GetBlockSizePenalty(unsigned int nBlockSize, unsigned int nMedianSize)
-{
-    // No penalty if block is at or below the median
-    if (nBlockSize <= nMedianSize || nMedianSize == 0)
-        return 0;
-
-    // Quadratic penalty: penalty = baseReward * ((blockSize / median) - 1)^2
-    // Returns the penalty as a fraction of COIN (COIN = 100% of block reward lost)
-    // At blockSize == 2 * median: penalty = COIN (100% — miner gets nothing)
-    // Clamp ratio: block can't exceed 2x median by consensus, so cap at 2*COIN
-    int64_t nRatio = ((int64_t)nBlockSize * COIN) / nMedianSize;
-    if (nRatio > 2 * COIN)
-        nRatio = 2 * COIN;
-    int64_t nExcess = nRatio - COIN; // (blockSize/median - 1) * COIN
-    if (nExcess <= 0)
-        return 0;
-
-    // penalty = excess^2 / COIN (quadratic, overflow-safe with clamped nExcess <= COIN)
-    int64_t nPenalty = (nExcess * nExcess) / COIN;
-
-    // Cap at COIN (100% penalty)
-    if (nPenalty > COIN)
-        nPenalty = COIN;
-
-    return nPenalty;
-}
-
-/** Apply adaptive block size penalty to a reward. Returns adjusted reward.
- *  Must be called with the block being validated and its parent index. */
-int64_t ApplyBlockSizePenalty(int64_t nReward, const CBlock& block, const CBlockIndex* pindexPrev)
-{
-    if (!pindexPrev || pindexPrev->nHeight + 1 < FORK_HEIGHT_DAG)
-        return nReward;
-
-    unsigned int nBlockBytes = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
-    // The adaptive limit is 2x median; the median is limit/2
-    unsigned int nMedian = GetAdaptiveBlockSizeLimit(pindexPrev) / 2;
-    if (nMedian < ADAPTIVE_BLOCK_FLOOR)
-        nMedian = ADAPTIVE_BLOCK_FLOOR;
-
-    int64_t nPenalty = GetBlockSizePenalty(nBlockBytes, nMedian);
-    if (nPenalty > 0 && nReward > 0)
-    {
-        int64_t nPenaltyAmount = (nReward * nPenalty) / COIN;
-        nReward -= nPenaltyAmount;
-        if (nReward < 0) nReward = 0;
-    }
-    return nReward;
-}
 
 
 bool CTransaction::CheckTransaction() const
@@ -6168,8 +6050,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         return false;
     int64_t nConnectCheckMs = GetTimeMillis() - nConnectCheckStart;
 
-    if (pindex->nHeight >= FORK_HEIGHT_DAG && IsProofOfStake())
-        return DoS(100, error("ConnectBlock() : proof-of-stake blocks are not allowed after DAG fork"));
 
 
     // strict script verification post-fork
@@ -6372,8 +6252,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             nRewardHeight = pindex->nHeight - 1;
         int64_t nReward = GetProofOfWorkReward(nRewardHeight, nFees);
 
-        // Adaptive block size penalty (post-DAG): reduce allowed reward for oversized blocks
-        nReward = ApplyBlockSizePenalty(nReward, *this, pindex->pprev);
 
         // Check coinbase reward
         if (nReward > MAX_MONEY)
@@ -6395,7 +6273,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             if (!vtx[1].GetCoinAge(txdb, nCoinAge))
                 return error("ConnectBlock() : %s unable to get coin age for coinstake", vtx[1].GetHash().ToString().substr(0,10).c_str());
 
-            int64_t nCalculatedStakeReward = ApplyBlockSizePenalty(GetProofOfStakeReward(nCoinAge, nFees), *this, pindex->pprev);
+            int64_t nCalculatedStakeReward = GetProofOfStakeReward(nCoinAge, nFees);
 
             if (nStakeReward > nCalculatedStakeReward)
                 return DoS(100, error("ConnectBlock() : coinstake pays too much(actual=%" PRId64" vs calculated=%" PRId64")", nStakeReward, nCalculatedStakeReward));
@@ -6574,7 +6452,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
                 uint64_t nCoinAge;
                 if (!vtx[1].GetCoinAge(txdb, nCoinAge))
                     return error("CheckBlock-POS : %s unable to get coin age for coinstake, Can't Calculate Collateralnode Reward\n", vtx[1].GetHash().ToString().substr(0,10).c_str());
-                int64_t nCalculatedStakeReward = ApplyBlockSizePenalty(GetProofOfStakeReward(nCoinAge, nFees), *this, pindex->pprev);
+                int64_t nCalculatedStakeReward = GetProofOfStakeReward(nCoinAge, nFees);
 
                 // Calculate expected collateralnodePaymentAmmount
                 int64_t collateralnodePaymentAmount = GetCollateralnodePayment(pindex->nHeight, nCalculatedStakeReward);
@@ -7710,8 +7588,6 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         }
     }
 
-    if (pindexNew->nHeight >= FORK_HEIGHT_DAG && pindexNew->IsProofOfStake())
-        return error("AddToBlockIndex() : proof-of-stake block at post-DAG height %d", pindexNew->nHeight);
 
     // ppcoin: compute chain trust score
     pindexNew->nChainTrust = (pindexNew->pprev ? pindexNew->pprev->nChainTrust : 0) + pindexNew->GetBlockTrust();
@@ -7793,15 +7669,11 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     // deleted durable records + clean-height marker are captured here so a
     // failed SetBestChain rollback restores the exact pre-envelope source in
     // ONE batch. Envelope-scoped (plain local); never a global.
-    std::vector<uint256> vDAGParents;
-
-    // IDAG Phase 2: Initialize DAG data for post-fork blocks.
-    // LEGACY DAG RETIREMENT (Phase 1): the entire Legacy DAG authority block below
-    // (graph initialization, colouring, the DAG score OVERWRITE of nChainTrust, DAG
+    // LEGACY DAG RETIREMENT (FINAL): the Legacy DAG authority block (graph
+    // initialization, colouring, the DAG score OVERWRITE of nChainTrust, DAG
     // sibling removal, epoch/prune side effects and the DAG-source envelope) is
-    // retired authority and executes only inside the explicitly scoped experimental
-    // profile. In the retired profile the ordinary linear trust recurrence assigned
-    // above stands, no DAG state is written and no DAG authority is required.
+    // permanently removed. The ordinary linear trust recurrence assigned above
+    // stands; no DAG state is written and no DAG authority is required.
 
     LOCK(cs_main);
 
@@ -8216,43 +8088,16 @@ bool CBlock::AcceptBlock()
         }
     }
 
-    // LEGACY DAG RETIREMENT (Phase 1) — FUTURE-ACTIVATION FIREWALL.
-    // A block at or above the DAG activation height enters the DAG-only consensus
-    // domain. The Legacy DAG engine is retired and is NOT a consensus authority, so
-    // this fails closed explicitly: the block is refused and the retired
-    // colouring/score/order engine is never invoked, and the block is never
-    // silently treated as legacy. Changing a fork-height constant therefore cannot
-    // reactivate the retired engine; a future DAG requires a new, independently
-    // reviewed implementation designed for the V2 authority model.
-    if (nHeight >= FORK_HEIGHT_DAG && IsProofOfStake())
-    {
-        TraceAcceptBlockReject(*this, nHeight, ABREJECT_POS_AFTER_DAG);
-        return DoS(100, error("AcceptBlock() : proof-of-stake blocks are not allowed after DAG fork height %d", FORK_HEIGHT_DAG));
-    }
 
-    // Block size enforcement (height-aware)
+
+    // Block size enforcement (linear profile: strict 1MB limit)
     {
         unsigned int nBlockBytes = ::GetSerializeSize(*this, SER_NETWORK, PROTOCOL_VERSION);
-        if (nHeight < FORK_HEIGHT_DAG)
+        if (nBlockBytes > MAX_BLOCK_SIZE_LEGACY)
         {
-            // Pre-fork: strict 1MB limit (matches old wallet consensus)
-            if (nBlockBytes > MAX_BLOCK_SIZE_LEGACY)
-            {
-                TraceAcceptBlockReject(*this, nHeight, ABREJECT_BLOCK_SIZE);
-                return DoS(100, error("AcceptBlock() : block size %u exceeds legacy limit %u at height %d",
-                                      nBlockBytes, MAX_BLOCK_SIZE_LEGACY, nHeight));
-            }
-        }
-        else
-        {
-            // Post-fork: adaptive limit
-            unsigned int nAdaptiveLimit = GetAdaptiveBlockSizeLimit(pindexPrev);
-            if (nBlockBytes > nAdaptiveLimit)
-            {
-                TraceAcceptBlockReject(*this, nHeight, ABREJECT_BLOCK_SIZE);
-                return DoS(50, error("AcceptBlock() : block size %u exceeds adaptive limit %u at height %d",
-                                      nBlockBytes, nAdaptiveLimit, nHeight));
-            }
+            TraceAcceptBlockReject(*this, nHeight, ABREJECT_BLOCK_SIZE);
+            return DoS(100, error("AcceptBlock() : block size %u exceeds legacy limit %u at height %d",
+                                  nBlockBytes, MAX_BLOCK_SIZE_LEGACY, nHeight));
         }
     }
 
@@ -8350,7 +8195,6 @@ bool CBlock::AcceptBlock()
         return DoS(100, error("AcceptBlock() : block height mismatch in coinbase"));
     }
 
-    // IDAG Phase 2: Validate DAG parent commitment in coinbase OP_RETURN
 
     // Write block to history file
     if (!CheckDiskSpace(::GetSerializeSize(*this, SER_DISK, CLIENT_VERSION)))
@@ -8447,11 +8291,8 @@ uint256 GetAuthoritativeBlockTrustValue(uint32_t nBits, int32_t nHeight,
     if (bnTarget <= 0)
         return 0;
 
-    if (nHeight >= FORK_HEIGHT_DAG && fProofOfStake)
-        return 0;
-
     if (nHeight >= FORK_HEIGHT_POEM)
-        return GetBlockEntropy((fProofOfStake && nHeight < FORK_HEIGHT_DAG) ? hashProof : blockHash);
+        return GetBlockEntropy(fProofOfStake ? hashProof : blockHash);
 
     return ((CBigNum(1) << 256) / (bnTarget + 1)).getuint256();
 }
@@ -9119,18 +8960,6 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         return error("ProcessBlock() : duplicate proof-of-stake (%s, %d) for block %s", pblock->GetProofOfStake().first.ToString().c_str(), pblock->GetProofOfStake().second, hash.ToString().c_str());
     }
 
-    if (pblock->IsProofOfStake() && mapBlockIndex.count(pblock->hashPrevBlock))
-    {
-        CBlockIndex* pindexPrev = mapBlockIndex[pblock->hashPrevBlock];
-        if (pindexPrev && pindexPrev->nHeight + 1 >= FORK_HEIGHT_DAG)
-        {
-            if (pfrom)
-                pfrom->Misbehaving(100);
-            TraceProcessBlockReject(pfrom, pblock, PBREJECT_POS_AFTER_DAG);
-            ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
-            return error("ProcessBlock() : proof-of-stake block after DAG fork");
-        }
-    }
 
     // Preliminary checks
     int64_t nCheckStart = GetTimeMillis();
@@ -12028,9 +11857,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             CBlockIndex* pindexPrev = mapBlockIndex[header.hashPrevBlock];
             pfrom->UpdateBestKnownBlock(pindexPrev->nHeight + 1, hash);
 
-            // PoS blocks have nNonce==0 in legacy headers, but post-DAG all
-            // headers must be valid PoW headers.
-            if (pindexPrev->nHeight + 1 >= FORK_HEIGHT_DAG || header.nNonce != 0)
+            // PoS blocks carry nNonce==0 in legacy headers and are not PoW
+            // verified; proof-of-work headers must satisfy the target.
+            if (header.nNonce != 0)
             {
                 if (!CheckProofOfWork(hash, header.nBits))
                 {

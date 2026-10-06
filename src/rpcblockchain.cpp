@@ -285,7 +285,7 @@ Object blockToJSON(const CBlock& block, const CBlockIndex* blockindex, bool fPri
 
     if (blockindex->nHeight >= FORK_HEIGHT_POEM)
     {
-        uint256 hashProofVal = (blockindex->IsProofOfStake() && blockindex->nHeight < FORK_HEIGHT_DAG) ? blockindex->hashProof : block.GetHash();
+        uint256 hashProofVal = blockindex->IsProofOfStake() ? blockindex->hashProof : block.GetHash();
         result.push_back(Pair("entropy", GetBlockEntropy(hashProofVal).GetHex()));
     }
 

@@ -21,7 +21,6 @@ BlockIndexCandidateStartupBuilder::BlockIndexCandidateStartupBuilder()
 
 bool BlockIndexCandidateStartupBuilder::Build(const BlockIndexV2Reader& reader,
                                               const BlockIndexDerivedStateStore& derived,
-                                              int forkHeightDAG,
                                               SnapshotCandidateFrontierStore* store,
                                               std::string* error) const
 {
@@ -46,7 +45,6 @@ bool BlockIndexCandidateStartupBuilder::Build(const BlockIndexV2Reader& reader,
     }
 
     const uint64_t count = reader.RecordCount();
-    (void)forkHeightDAG; // era-independent tip/tracking semantics
 
     const BlockIndexSnapshot bestTip = reader.GetTip();
     const BlockIndexId bestId = bestTip.id;

@@ -126,8 +126,8 @@ static uint256 LegacyGetBlockTrust(uint256 hash, unsigned int nBits, int height,
     return leg.GetBlockTrust();
 }
 
-// Fork-sensitive heights: choose relative to the RUNTIME fork values so every
-// branch of GetBlockTrust() is exercised regardless of the exact fork height.
+// Heights chosen to exercise every surviving branch of GetBlockTrust() (the
+// supported linear/V2 rule; there is no DAG fork height any more).
 struct ConsumerFixture
 {
     uint256 hPow;   unsigned int nBitsPow;   int hPowHeight;   bool powIsStake;   uint256 powProof;
@@ -137,13 +137,12 @@ struct ConsumerFixture
 
     ConsumerFixture()
     {
-        const int dag  = (int)GetForkHeightDAG();
         const int poem = (int)GetForkHeightPoem();
 
         hPow   = ch(1); nBitsPow   = 0x207fffffU; hPowHeight   = 4;   powIsStake   = false; powProof   = cpoof(1);
-        hStake = ch(2); nBitsStake = 0x207fffffU; hStakeHeight = (dag > 4 ? dag : 10); stakeIsStake = true; stakeProof = cpoof(2);
+        hStake = ch(2); nBitsStake = 0x207fffffU; hStakeHeight = 10;  stakeIsStake = true;  stakeProof = cpoof(2);
         hZero  = ch(3); nBitsZero  = 0;           hZeroHeight  = 6;
-        hPoem  = ch(4); nBitsPoem  = 0x1f1f1f1fU; hPoemHeight  = std::max(dag, poem) + 1; poemIsStake = false; poemProof = cpoof(4);
+        hPoem  = ch(4); nBitsPoem  = 0x1f1f1f1fU; hPoemHeight  = poem + 3; poemIsStake = false; poemProof = cpoof(4);
     }
 };
 
@@ -259,7 +258,7 @@ BOOST_AUTO_TEST_CASE(f4_legacy_hot_differential)
     BOOST_CHECK(r2.ok);
     BOOST_CHECK(r2.nTrust == LegacyGetBlockTrust(fx.hStake, fx.nBitsStake, fx.hStakeHeight,
                                                  fx.stakeIsStake, fx.stakeProof));
-    BOOST_CHECK(r2.nTrust == uint256(0));                   // post-DAG PoS -> 0
+    BOOST_CHECK(r2.nTrust != uint256(0));                   // linear profile: PoS is admissible
 
     BlockIndexHotDerivedTrust r3 = GetBlockTrustViaHotOwner(owner, fx.hZero);
     BOOST_CHECK(r3.ok);

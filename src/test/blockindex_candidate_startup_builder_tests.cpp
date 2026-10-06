@@ -141,7 +141,7 @@ BOOST_AUTO_TEST_CASE(m0_linear_and_side_tips)
     BOOST_CHECK(mapBlockIndex.find(fx.active[5].hash) == mapBlockIndex.end());
     BOOST_CHECK(mapBlockIndex.find(fx.side.hash) == mapBlockIndex.end());
 
-    BOOST_REQUIRE_MESSAGE(builder.Build(fx.reader, fx.derived, 0x7fffffff, &store, &error), error);
+    BOOST_REQUIRE_MESSAGE(builder.Build(fx.reader, fx.derived, &store, &error), error);
 
     // tips: active tip (height5) + side tip (height1 fork)
     std::vector<uint256> tips = store.GetCandidateTipHashes();
@@ -190,7 +190,7 @@ BOOST_AUTO_TEST_CASE(m9_no_map_causal)
     BlockIndexCandidateStartupBuilder builder;
     for (int h = 0; h <= 3; ++h)
         BOOST_CHECK(mapBlockIndex.find(fx.active[h].hash) == mapBlockIndex.end());
-    BOOST_REQUIRE(builder.Build(fx.reader, fx.derived, 0x7fffffff, &store, &error));
+    BOOST_REQUIRE(builder.Build(fx.reader, fx.derived, &store, &error));
     // after
     for (int h = 0; h <= 3; ++h)
         BOOST_CHECK(mapBlockIndex.find(fx.active[h].hash) == mapBlockIndex.end());
@@ -204,7 +204,7 @@ BOOST_AUTO_TEST_CASE(m10_no_pprev_causal)
     std::string error;
     SnapshotCandidateFrontierStore store;
     BlockIndexCandidateStartupBuilder builder;
-    BOOST_REQUIRE(builder.Build(fx.reader, fx.derived, 0x7fffffff, &store, &error));
+    BOOST_REQUIRE(builder.Build(fx.reader, fx.derived, &store, &error));
     // no pprev/topology reconstructed: synthetic hashes stay absent from the
     // resident map (only the global testing-setup genesis block is resident).
     for (int h = 0; h <= 3; ++h)

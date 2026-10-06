@@ -290,7 +290,7 @@ BOOST_AUTO_TEST_CASE(c3_byvalue_parity_vs_legacy_oracle)
 
     SnapshotCandidateFrontierStore store;
     BlockIndexCandidateStartupBuilder cb;
-    BOOST_REQUIRE_MESSAGE(cb.Build(reader, derived, 1440, &store, &err), err);
+    BOOST_REQUIRE_MESSAGE(cb.Build(reader, derived, &store, &err), err);
 
     // by-value winner from the candidate-leaves-sourced store
     const CandidateFrontierAuthorityRecord selByValue = EvaluateCandidateFrontierByValue(store);
@@ -332,7 +332,7 @@ BOOST_AUTO_TEST_CASE(c3_notfound_vs_error_fail_closed)
     BOOST_REQUIRE_MESSAGE(C3OpenStores(v2root, &reader, &derived, &err), err);
     SnapshotCandidateFrontierStore store;
     BlockIndexCandidateStartupBuilder cb;
-    BOOST_REQUIRE_MESSAGE(cb.Build(reader, derived, 1440, &store, &err), err);
+    BOOST_REQUIRE_MESSAGE(cb.Build(reader, derived, &store, &err), err);
 
     // (a) NOT_FOUND: an unknown hash is a clean found=false, never an error.
     CandidateFrontierAuthorityRecord missing = store.Lookup(uint256(0xdeadbeefULL));
@@ -383,7 +383,7 @@ BOOST_AUTO_TEST_CASE(c3_notfound_vs_error_fail_closed)
             {
                 SnapshotCandidateFrontierStore s2;
                 BlockIndexCandidateStartupBuilder cb2;
-                if (!cb2.Build(r2, d2, 1440, &s2, &e2))
+                if (!cb2.Build(r2, d2, &s2, &e2))
                     failClosed = true; // builder refused -> no store produced
             }
             r2.Close();
@@ -411,7 +411,7 @@ BOOST_AUTO_TEST_CASE(c3_restart_rebuild_same_winner)
         BOOST_REQUIRE_MESSAGE(C3OpenStores(v2root, &reader, &derived, &err), err);
         SnapshotCandidateFrontierStore store;
         BlockIndexCandidateStartupBuilder cb;
-        BOOST_REQUIRE_MESSAGE(cb.Build(reader, derived, 1440, &store, &err), err);
+        BOOST_REQUIRE_MESSAGE(cb.Build(reader, derived, &store, &err), err);
         CandidateFrontierAuthorityRecord sel = EvaluateCandidateFrontierByValue(store);
         BOOST_REQUIRE(sel.found);
         first = sel.hash;
@@ -423,7 +423,7 @@ BOOST_AUTO_TEST_CASE(c3_restart_rebuild_same_winner)
         BOOST_REQUIRE_MESSAGE(C3OpenStores(v2root, &reader, &derived, &err), err);
         SnapshotCandidateFrontierStore store;
         BlockIndexCandidateStartupBuilder cb;
-        BOOST_REQUIRE_MESSAGE(cb.Build(reader, derived, 1440, &store, &err), err);
+        BOOST_REQUIRE_MESSAGE(cb.Build(reader, derived, &store, &err), err);
         CandidateFrontierAuthorityRecord sel = EvaluateCandidateFrontierByValue(store);
         BOOST_REQUIRE(sel.found);
         BOOST_REQUIRE(sel.hash == first);

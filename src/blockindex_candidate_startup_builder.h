@@ -46,13 +46,12 @@ public:
 
     // Build the by-value candidate frontier store from a selected generation's
     // reader + derived store. `reader`/`derived` must be open and generation-
-    // coherent (A.10.1i bootstrap style). `forkHeightDAG` = FORK_HEIGHT_DAG.
+    // coherent (A.10.1i bootstrap style).
     // On success fills `store` (existing concrete by-value frontier store) and
     // returns true. Fails closed on any read/corruption/generation error; never
     // falls back to legacy RebuildCandidateTips.
     bool Build(const BlockIndexV2Reader& reader,
                const BlockIndexDerivedStateStore& derived,
-               int forkHeightDAG,
                SnapshotCandidateFrontierStore* store,
                std::string* error) const;
 };

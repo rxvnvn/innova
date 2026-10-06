@@ -59,13 +59,11 @@ uint256 GetBlockEntropy(const uint256& hashValue);
  * the low-memory (LM) generation builder + the legacy S->L catch-up derive
  * their persisted chainTrust through it. One rule for every writer path:
  *   1. target = SetCompact(nBits); if target <= 0 -> 0
- *   2. if nHeight >= FORK_HEIGHT_DAG && fProofOfStake -> 0
- *   3. if nHeight >= FORK_HEIGHT_POEM -> GetBlockEntropy(
- *          (fProofOfStake && nHeight < FORK_HEIGHT_DAG) ? hashProof : blockHash)
- *   4. else -> reciprocal ( (1<<256) / (target+1) )
+ *   2. if nHeight >= FORK_HEIGHT_POEM -> GetBlockEntropy(
+ *          fProofOfStake ? hashProof : blockHash)
+ *   3. else -> reciprocal ( (1<<256) / (target+1) )
  * This does NOT change network consensus; it restores writer parity with the
- * existing surviving rules (supported testnet/regtest at/after POEM entropy,
- * post-DAG PoS zero).
+ * existing surviving rules (supported testnet/regtest at/after POEM entropy).
  */
 uint256 GetAuthoritativeBlockTrustValue(uint32_t nBits, int32_t nHeight,
                                         bool fProofOfStake, const uint256& hashProof,
@@ -97,23 +95,19 @@ class CNode;
 // extern CFeeRate minRelayTxFee;
 static const int ZERO_POW_BLOCK = 50000; // 50k blocks before Proof of Stake consensus, back to hybrid PoW/PoS at block 2000000, final reward 0.0001 INN per block
 static const int FAIR_LAUNCH_BLOCK = 490; // Last Block until full block reward starts
-// Pre-DAG: fixed 1 MB block size (legacy compatibility)
+// Linear profile: fixed 1 MB block size (legacy compatibility)
 static const unsigned int MAX_BLOCK_SIZE_LEGACY = 1000000;
 
-// Post-DAG: adaptive block size (Monero-inspired, tuned for 1s blocks)
-static const unsigned int ADAPTIVE_BLOCK_CEILING = 8000000;       // 8 MB absolute hard ceiling
-static const unsigned int ADAPTIVE_BLOCK_FLOOR = 300000;          // 300 KB penalty-free zone
-static const unsigned int ADAPTIVE_MEDIAN_WINDOW = 1000;          // 1000-block short-term median (~17 min at 1s)
-static const unsigned int ADAPTIVE_LONG_MEDIAN_WINDOW = 100000;   // 100K-block long-term anchor (~28h at 1s)
-static const unsigned int ADAPTIVE_LONG_MEDIAN_CAP = 50;          // short-term median <= 50x long-term median
+// Absolute hard ceiling for the block/wire sanity envelope (8 MB).
+static const unsigned int ADAPTIVE_BLOCK_CEILING = 8000000;
 
-// Pre-fork constants — used for all consensus checks before FORK_HEIGHT_DAG
-static const unsigned int MAX_BLOCK_SIZE = MAX_BLOCK_SIZE_LEGACY;       // 1MB until DAG fork
+// Linear-profile block-size constants — used for all consensus checks.
+static const unsigned int MAX_BLOCK_SIZE = MAX_BLOCK_SIZE_LEGACY;       // 1MB (linear profile)
 static const unsigned int MAX_BLOCK_SIZE_GEN = MAX_BLOCK_SIZE / 2;
 static const unsigned int MAX_STANDARD_TX_SIZE = MAX_BLOCK_SIZE_GEN / 5;
 static const unsigned int MAX_BLOCK_SIGOPS = MAX_BLOCK_SIZE / 50;
 
-// Post-fork limits (used after DAG activation)
+// Sigops budget for the hard-ceiling envelope.
 static const unsigned int MAX_BLOCK_SIGOPS_ADAPTIVE = ADAPTIVE_BLOCK_CEILING / 50;
 /** The maximum number of sigops we're willing to relay/mine in a single tx */
 static const unsigned int MAX_TX_SIGOPS = MAX_BLOCK_SIGOPS/5;
@@ -149,17 +143,6 @@ static const int MN_ENFORCEMENT_ACTIVE_HEIGHT = 4500; // Enforce collateralnode 
 static const int MN_ENFORCEMENT_ACTIVE_HEIGHT_TESTNET = 999999; // Enforce CN payments after this height for Innova Testnet!
 
 inline bool MoneyRange(int64_t nValue) { return (nValue >= 0 && nValue <= MAX_MONEY); }
-
-/** Get the adaptive effective block size limit for a given height.
- *  Uses the median of recent block sizes with a penalty-free floor. */
-unsigned int GetAdaptiveBlockSizeLimit(const CBlockIndex* pindex);
-
-/** Calculate the block reward penalty for an oversized block (Monero-style quadratic).
- *  Returns the fraction of reward lost (0 = no penalty, COIN = 100% penalty). */
-int64_t GetBlockSizePenalty(unsigned int nBlockSize, unsigned int nMedianSize);
-
-/** Apply adaptive block size penalty to a reward amount. */
-int64_t ApplyBlockSizePenalty(int64_t nReward, const CBlock& block, const CBlockIndex* pindexPrev);
 
 // Threshold for nLockTime: below this value it is interpreted as block number, otherwise as UNIX timestamp.
 static const unsigned int LOCKTIME_THRESHOLD = 500000000; // Tue Nov  5 00:53:20 1985 UTC
@@ -231,30 +214,20 @@ inline int GetForkHeightPoem()
 }
 #define FORK_HEIGHT_POEM (GetForkHeightPoem())
 
-// IDAG Phase 2+3: Full DAG consensus + throughput scaling
-inline int GetForkHeightDAG()
-{
-    extern bool fRegTest;
-    extern bool fTestNet;
-    if (fRegTest) return 11;
-    if (fTestNet) return 11;        // clean public IDAG testnet
-    return MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;                  // mainnet maintenance build: keep experimental v5 fork gates inert
-}
-#define FORK_HEIGHT_DAG (GetForkHeightDAG())
+// LEGACY DAG RETIREMENT (FINAL): the Legacy DAG engine, its activation
+// capability, its retired-domain firewall and the DAG activation boundary
+// itself are permanently removed. The supported Innova profile is linear/V2:
+// there is no DAG fork height and no post-DAG rule set. A future DAG, if ever
+// implemented, will be a NEW design and must not rely on any activation
+// semantics removed here.
 
-// LEGACY DAG RETIREMENT (Phase 2 / H9 FINAL): the Legacy DAG engine, its
-// activation capability and its retired-domain firewall are removed. The
-// supported Innova profile is linear/V2. FORK_HEIGHT_DAG remains only as a
-// harmless height constant reported by GetForkHeightDAG().
-
-// IDAG: Fork-gated block time — 15s pre-DAG, 1s post-DAG
+// Supported (linear) block time.
 inline unsigned int GetTargetSpacingForHeight(int nHeight)
 {
     extern bool fRegTest;
     extern unsigned int nTargetSpacing;
     if (fRegTest) return 1; // regtest always 1s
-    if (nHeight >= FORK_HEIGHT_DAG) return 1; // 1-second blocks post-DAG
-    return nTargetSpacing; // 15 seconds pre-DAG
+    return nTargetSpacing;  // linear profile
 }
 
 inline int64_t PastDrift(int64_t nTime, int nHeight) {

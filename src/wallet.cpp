@@ -4116,8 +4116,7 @@ bool CWallet::GetStakeWeight(const CKeyStore& keystore, uint64_t& nMinWeight, ui
 bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int64_t nSearchInterval, int64_t nFees, CTransaction& txNew, CKey& key)
 {
     CBlockIndex* pindexPrev = pindexBest;
-    if (pindexPrev && pindexPrev->nHeight + 1 >= FORK_HEIGHT_DAG)
-        return false;
+
     CBigNum bnTargetPerCoinDay;
     bnTargetPerCoinDay.SetCompact(nBits);
 
@@ -4183,20 +4182,7 @@ bool CWallet::CreateCoinStake(const CKeyStore& keystore, unsigned int nBits, int
 
     CScript scriptPubKeyKernel;
     CTxDB txdb("r");
-    // Post-DAG blocks target 1-second spacing, but the staking thread may
-    // sleep longer after an unsuccessful search. Cover the elapsed search
-    // interval up to the existing 10-second cap so timestamp slots are not
-    // skipped.
     int nMaxStakeSearchInterval = 10;
-    {
-        LOCK(cs_main);
-        if (pindexBest && pindexBest->nHeight >= FORK_HEIGHT_DAG)
-        {
-            nMaxStakeSearchInterval = (int)std::min(nSearchInterval, (int64_t)10);
-            if (nMaxStakeSearchInterval < 2)
-                nMaxStakeSearchInterval = 2;
-        }
-    }
 
     if (fTryTransparent && !setCoins.empty())
     BOOST_FOREACH(PAIRTYPE(const CWalletTx*, unsigned int) pcoin, setCoins)

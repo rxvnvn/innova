@@ -164,10 +164,13 @@ uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap);
 // It is NOT the active chain at the same height: `PRE-DAG TRUST TRUTH !=
 // ACTIVE CHAIN AT SAME HEIGHT`, so a side-branch parent resolves to its own
 // branch trust. No all-history cache, no resident mapBlockIndex, no residency
-// and no score cache; O(depth) time bounded by the requested pre-DAG height and
-// O(1) temporary memory.
+// and no score cache; O(depth) time bounded by the requested height and O(1)
+// temporary memory.
+// NOTE: retained as a by-value accumulated-trust verification primitive (by-value
+// parity tests). The production authoritative startup establishes nBestChainTrust
+// O(1) from the committed tip record and no longer walks ancestry.
 // FAILS CLOSED (false) on: reader unavailable; requested hash absent or
-// identity-mismatched; requested hash not pre-DAG; any non-FOUND reader status;
+// identity-mismatched; any non-FOUND reader status;
 // a claimed parent (authoritative hashPrev != 0) that is absent, unreadable, or
 // contradicts the child's hash/height. A true chain start is recognised ONLY
 // from the persisted authoritative `hashPrev == 0`; absence is never

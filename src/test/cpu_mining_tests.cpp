@@ -232,7 +232,7 @@ BOOST_AUTO_TEST_CASE(work_identity_detects_authoritative_source_only_change)
     CPUMiningWorkIdentity original;
     original.hashBestChain = uint256(1);
     original.hashPrimaryParent = uint256(1);
-    original.nHeight = FORK_HEIGHT_DAG + 1;
+    original.nHeight = 12;
     original.vDAGTips.push_back(uint256(2));
     original.hashDAGSourceState = uint256(0xAA);
 

@@ -274,7 +274,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         std::string cberr;
         if (!cb.Build(*ctx->bootstrap.ReaderPtr(),
                       *ctx->bootstrap.DerivedStorePtr(),
-                      GetForkHeightDAG(), &store, &cberr))
+                      &store, &cberr))
         {
             if (error) *error = "authoritative startup: candidate: " + cberr;
             return false;
@@ -466,27 +466,16 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
             pre.immutableAuthorityAvailable = (readyAuthority != NULL && readyAuthority->IsOpen());
         }
         {
-            // R2 trust projection reconciliation, evaluated over the frozen R2 domain.
-            // The composite/pre-DAG accumulated-trust provider is defined on the PRE-DAG domain
-            // and legitimately refuses a post-DAG hash; so the condition is: the authoritative
-            // domain must resolve the current best chain, and it must additionally reproduce the
-            // accumulated trust through the R2 composite provider whenever the best chain is
-            // pre-DAG. Nothing is fabricated for a post-DAG chain (the DAG trust path owns it).
+            // R2 readiness invariant (linear profile): the authoritative domain must resolve
+            // the current best chain. The retired DAG-era trust-projection reconciliation — an
+            // O(chain) ancestry walk whose only purpose was to distinguish the pre-DAG composite
+            // trust provider from the (now removed) DAG trust path — is deleted. The accumulated
+            // chain trust is still established O(1) from the authoritative tip record
+            // (nBestChainTrust = tipObj->nChainTrust) and is not recomputed here.
             BlockIndexSnapshot bestSnap;
             std::string bestSnapErr;
-            const bool bestResolved =
+            pre.trustProjectionReconciled =
                 ResolveAuthoritativeBlockSnapshot(hashBestChain, &bestSnap, &bestSnapErr);
-            if (bestResolved && bestSnap.height < GetForkHeightDAG())
-            {
-                std::string trustErr;
-                uint256 projectedTrust;
-                pre.trustProjectionReconciled =
-                    GetAuthoritativeAccumulatedChainTrust(hashBestChain, &projectedTrust, &trustErr);
-            }
-            else
-            {
-                pre.trustProjectionReconciled = bestResolved;
-            }
         }
         // Lifecycle readiness belongs to the current immutable/live authority.
         // No DAG runtime, custody or certificate is a current prerequisite.
@@ -716,11 +705,9 @@ void PrintAuthoritativeResidency(const char* tag)
 // R2c.2s/S2: authoritative by-value trust provider. Reproduces EXACT legacy
 // CBlockIndex::GetBlockTrust semantics (main.cpp:9812-9827).
 //   1. target = SetCompact(nBits); if target <= 0 -> 0
-//   2. if nHeight >= FORK_HEIGHT_DAG && IsProofOfStake() -> 0
-//   3. if nHeight >= FORK_HEIGHT_POEM
-//        -> GetBlockEntropy( (IsProofOfStake() && nHeight < FORK_HEIGHT_DAG)
-//                              ? hashProof : blockHash )
-//   4. else -> reciprocal ( (1<<256) / (target+1) )
+//   2. if nHeight >= FORK_HEIGHT_POEM
+//        -> GetBlockEntropy( IsProofOfStake() ? hashProof : blockHash )
+//   3. else -> reciprocal ( (1<<256) / (target+1) )
 //
 uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap)
 {
@@ -731,7 +718,7 @@ uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap)
                                            snap.hashProof, snap.hash);
 }
 
-// PRE-DAG AUTHORITATIVE ACCUMULATED TRUST.
+// AUTHORITATIVE ACCUMULATED TRUST (by value).
 //
 // CONTRACT (the load-bearing invariant of this provider):
 //
@@ -739,7 +726,7 @@ uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap)
 //
 // for every block X on the REQUESTED HASH'S OWN ancestry genesis -> ... -> H,
 // resolved through the exact persisted hashPrev links of the authoritative
-// store. It is expressly NOT "the active-chain block at height(H)": a pre-DAG
+// store. It is expressly NOT "the active-chain block at height(H)": a
 // side branch at height h has its own accumulated trust, and resolving by
 // target height alone returns the wrong uint256 for it.
 //
@@ -764,15 +751,13 @@ uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap)
 // canonical genesis.
 //
 // FAIL CLOSED on: reader unavailable/not open; requested hash absent or
-// identity-mismatched; requested hash not pre-DAG (this provider's contract);
-// any non-FOUND reader status (CORRUPT / IO_ERROR / NOT_OPEN); an unresolvable
+// identity-mismatched; any non-FOUND reader status (CORRUPT / IO_ERROR / NOT_OPEN); an unresolvable
 // claimed parent; a parent hash/height that contradicts the child
 // (parent.height == child.height - 1 required).
 //
 // BOUNDEDNESS: O(depth) time, O(1) temporary memory (one snapshot at a time, no
 // vector), no object-graph reconstruction, no cache, no mapBlockIndex /
-// mapDAGData growth. Depth is bounded by the requested height, and the requested
-// height is bounded by FORK_HEIGHT_DAG by the check below.
+// mapDAGData growth. Depth is bounded by the requested height.
 bool GetAuthoritativeAccumulatedChainTrust(const uint256& hash,
                                            uint256* out, std::string* error)
 {
@@ -836,14 +821,6 @@ bool GetAuthoritativeAccumulatedChainTrust(const uint256& hash,
         return false;
     }
     if (cur.height < 0) { if (error) *error = "trust accumulator: negative height"; return false; }
-    if (cur.height >= GetForkHeightDAG())
-    {
-        // This provider is the PRE-DAG accumulated-trust authority. A post-DAG
-        // route reaching it is inconsistent metadata, not a pre-DAG parent.
-        if (error) *error = "trust accumulator: hash " + hash.GetHex()
-                            + " is not pre-DAG (height " + std::to_string(cur.height) + ")";
-        return false;
-    }
 
     uint256 acc = 0;
     for (;;)

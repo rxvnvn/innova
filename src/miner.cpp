@@ -196,12 +196,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
 
     int nHeight = pindexPrev->nHeight+1; // height of new block
 
-    if (fProofOfStake && nHeight >= FORK_HEIGHT_DAG)
-    {
-        if (fDebug && GetBoolArg("-printcoinstake"))
-            printf("CreateNewBlock: refusing proof-of-stake block template at post-DAG height %d\n", nHeight);
-        return NULL;
-    }
 
     if (!fProofOfStake)
     {
@@ -229,8 +223,8 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
     // Add our coinbase tx as first transaction
     pblock->vtx.push_back(txNew);
 
-    // Largest block you're willing to create (adaptive post-DAG):
-    unsigned int nAdaptiveLimit = GetAdaptiveBlockSizeLimit(pindexPrev);
+    // Largest block you're willing to create (linear profile: fixed 1 MB):
+    const unsigned int nAdaptiveLimit = MAX_BLOCK_SIZE_LEGACY;
     unsigned int nBlockMaxSize = GetArg("-blockmaxsize", nAdaptiveLimit / 2);
     // Limit to between 1K and the adaptive ceiling (underflow-safe)
     unsigned int nMaxAllowed = (nAdaptiveLimit > 1000) ? (nAdaptiveLimit - 1000) : 1000;
@@ -640,8 +634,6 @@ bool CheckStake(CBlock* pblock, CWallet& wallet)
     // CBlockIndex entry when the parent is absent from mapBlockIndex.
     {
         LOCK(cs_main);
-        if (pindexBest && pindexBest->nHeight + 1 >= FORK_HEIGHT_DAG)
-            return error("CheckStake() : proof-of-stake block production disabled after DAG fork");
 
         // Safe non-inserting parent lookup (A.9a.3j)
         std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(pblock->hashPrevBlock);
@@ -765,14 +757,7 @@ void StakeMiner(CWallet *pwallet)
             continue;
         }
 
-        // Post-DAG: reduce stake interval to match nMaxStakeSearchInterval (2s)
-        // This ensures no timestamp slots are skipped between staking attempts
         int64_t nEffectiveStakeInterval = nMinStakeInterval;
-        {
-            LOCK(cs_main);
-            if (pindexBest && pindexBest->nHeight >= FORK_HEIGHT_DAG)
-                nEffectiveStakeInterval = std::min(nEffectiveStakeInterval, (int64_t)2);
-        }
         if (nEffectiveStakeInterval > 0 && nTimeLastStake + nEffectiveStakeInterval > GetTime())
         {
             if (fDebug && GetBoolArg("-printcoinstake"))

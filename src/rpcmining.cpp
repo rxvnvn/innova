@@ -152,7 +152,7 @@ Value getstakinginfo(const Array& params, bool fHelp)
 
     double dNetworkWeight = GetPoSKernelPS();
     uint64_t nNetworkWeight = (uint64_t)dNetworkWeight;
-    bool fPoSBlockProduction = nBestHeight + 1 < FORK_HEIGHT_DAG;
+    const bool fPoSBlockProduction = true; // linear profile: staking enabled
     bool staking = fPoSBlockProduction && nLastCoinStakeSearchInterval && nWeight;
     int64_t nExpectedTime = -1;
     if (staking && nWeight > 0 && dNetworkWeight > 0.0)

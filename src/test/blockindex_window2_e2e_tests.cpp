@@ -29,6 +29,11 @@
 // ACCEPT of a genuinely-mined successor is proven here by the positive control.
 #include <boost/test/unit_test.hpp>
 
+// Fixture chain-depth marker used by the by-value trust fixtures below. This is
+// ONLY a chain-depth marker: the supported linear/V2 profile has no consensus
+// rule change at any height, so no activation semantics attach to it.
+static const int kFixtureDepth = 11;
+
 #include "db.h"
 #include "txdb.h"
 #include "main.h"
@@ -384,13 +389,13 @@ BOOST_AUTO_TEST_CASE(f2_parent_score_resolver_parity_and_contract)
 {
         CBlockIndex* tip = pindexBest;
     BOOST_REQUIRE(tip);
-    while (tip->nHeight < GetForkHeightDAG()-1) tip = MineReal(tip, 0x8300 + tip->nHeight);
+    while (tip->nHeight < kFixtureDepth - 1) tip = MineReal(tip, 0x8300 + tip->nHeight);
 
     // Capture resident hashes by height from the intact chain.
     std::map<int, uint256> byHeight;
     { LOCK(cs_main);
       for (CBlockIndex* w = tip; w; w = w->pprev) byHeight[w->nHeight] = w->GetBlockHash(); }
-    BOOST_REQUIRE(byHeight.count(9) && byHeight.count(10) && byHeight.count(GetForkHeightDAG() - 1));
+    BOOST_REQUIRE(byHeight.count(9) && byHeight.count(10) && byHeight.count(kFixtureDepth - 1));
 
     const fs::path root = fs::temp_directory_path() / fs::unique_path("f2-resolver-%%%%-%%%%");
     fs::create_directories(root / "snapshot");
@@ -429,7 +434,7 @@ BOOST_AUTO_TEST_CASE(f2_parent_score_resolver_parity_and_contract)
     BOOST_REQUIRE(g_fAuthoritativeStartup);
 
     // Current contract: exact linear parent trust, independent of the retired resolver.
-    for (int h : {5, 9, 10, GetForkHeightDAG() - 1})
+    for (int h : {5, 9, 10, kFixtureDepth - 1})
     {
         const uint256 hp = byHeight[h];
         CBlockIndex* resident = NULL;
@@ -482,10 +487,9 @@ static void F2BuildAuthoritativeGenerationAndInit(const fs::path& root, std::str
 // 0x2000f183575 (active-chain-at-height) instead of its own branch value
 // 0x200f454841e.
 //
-// FIXTURE (three divergent pre-DAG side branches, all fully resident, all
-// indexed, none of them the active block at its own height):
-//   a7 -> a8 -> a9 -> a10   (ACTIVE chain; regtest FORK_HEIGHT_DAG == 11,
-//                            FORK_HEIGHT_POEM == 9)
+// FIXTURE (three divergent side branches, all fully resident, all indexed,
+// none of them the active block at its own height):
+//   a7 -> a8 -> a9 -> a10   (ACTIVE chain; regtest FORK_HEIGHT_POEM == 9)
 //   sideAtPoem   : child of a8, height 9   (diverges AT/after POEM)
 //   sideLow8     : child of a7, height 8   (diverges BELOW POEM)
 //   sideLow9     : child of sideLow8, height 9 (two-block side ancestry below POEM)
@@ -499,20 +503,20 @@ static void F2BuildAuthoritativeGenerationAndInit(const fs::path& root, std::str
 // active block at the same height. That inequality is load-bearing: it is what
 // prevents a silent regression back to GetActiveByHeight.
 // ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(f2_pre_dag_side_branch_hash_ancestry_parity)
+BOOST_AUTO_TEST_CASE(f2_byvalue_side_branch_hash_ancestry_parity)
 {
     BOOST_REQUIRE(pindexBest != NULL);
 
-    // 1. Build the active pre-DAG chain up to the LAST pre-DAG height.
-    const int hPreDag = GetForkHeightDAG() - 1;
-    // Order-robust fixture: locate the ACTIVE-chain ancestor at the last pre-DAG
-    // height. Earlier cases in the same process may leave a much deeper chain, so
-    // this case must build its pre-DAG fixture on the real active ancestry rather
+    // 1. Build the active fixture chain up to the fixture depth.
+    const int hFixtureTop = kFixtureDepth - 1;
+    // Order-robust fixture: locate the ACTIVE-chain ancestor at the fixture
+    // depth. Earlier cases in the same process may leave a much deeper chain, so
+    // this case must build its fixture on the real active ancestry rather
     // than assume the ambient tip height.
     CBlockIndex* a10 = pindexBest;
-    while (a10->nHeight < hPreDag) a10 = MineReal(a10, 0x9100 + a10->nHeight);
-    while (a10->nHeight > hPreDag) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
-    BOOST_REQUIRE_EQUAL(a10->nHeight, hPreDag);
+    while (a10->nHeight < hFixtureTop) a10 = MineReal(a10, 0x9100 + a10->nHeight);
+    while (a10->nHeight > hFixtureTop) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
+    BOOST_REQUIRE_EQUAL(a10->nHeight, hFixtureTop);
     const uint256 bestHashBeforeFixture = hashBestChain;
     CBlockIndex* a9 = a10->pprev; BOOST_REQUIRE(a9 != NULL);
     CBlockIndex* a8 = a9->pprev;  BOOST_REQUIRE(a8 != NULL);
@@ -658,15 +662,15 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_side_branch_hash_ancestry_parity)
 // return the exact same uint256s, and each side branch must still differ from
 // the active chain at its own height. No residency is reconstructed.
 // ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(f2_pre_dag_nonresident_side_branch_by_value)
+BOOST_AUTO_TEST_CASE(f2_byvalue_nonresident_side_branch)
 {
     BOOST_REQUIRE(pindexBest != NULL);
 
-    const int hPreDag = GetForkHeightDAG() - 1;
+    const int hFixtureTop = kFixtureDepth - 1;
     CBlockIndex* a10 = pindexBest;
-    while (a10->nHeight < hPreDag) a10 = MineReal(a10, 0x9200 + a10->nHeight);
-    while (a10->nHeight > hPreDag) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
-    BOOST_REQUIRE_EQUAL(a10->nHeight, hPreDag);
+    while (a10->nHeight < hFixtureTop) a10 = MineReal(a10, 0x9200 + a10->nHeight);
+    while (a10->nHeight > hFixtureTop) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
+    BOOST_REQUIRE_EQUAL(a10->nHeight, hFixtureTop);
     const uint256 bestHashBeforeFixture = hashBestChain;
     CBlockIndex* a9 = a10->pprev; BOOST_REQUIRE(a9 != NULL);
     CBlockIndex* a8 = a9->pprev;  BOOST_REQUIRE(a8 != NULL);
@@ -789,32 +793,32 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_nonresident_side_branch_by_value)
 }
 
 // ---------------------------------------------------------------------------
-// R2 / C2 — PRE-DAG HOT PARENT == COLD PARENT (ONE RESOLUTION DOMAIN).
+// R2 / C2 — HOT PARENT == COLD PARENT (ONE RESOLUTION DOMAIN).
 //
-// LOAD-BEARING INVARIANT: the pre-DAG accumulated-trust authority resolves over
+// LOAD-BEARING INVARIANT: the by-value accumulated-trust provider resolves over
 // the SAME complete committed hot+cold domain the authoritative resolver uses
-// (BlockIndexAuthoritativeLive::ResolveBlockSnapshot). A pre-DAG parent that
+// (BlockIndexAuthoritativeLive::ResolveBlockSnapshot). A parent that
 // exists ONLY in the mutable hot tail (persisted through the real production
 // live authority after the immutable generation was selected) must
 //   * resolve by value — it did NOT before R2, because the provider was
 //     cold-only and reported "requested hash not resolvable by value",
-//   * produce the identical semantic result a cold pre-DAG parent yields: its
+//   * produce the identical semantic result a cold parent yields: its
 //     OWN branch accumulated trust, never the active-chain value at its height,
 //   * resolve with no mapBlockIndex/mapDAGData residency at all,
 // while a genuinely absent hash still FAILS CLOSED (no fabricated genesis, no
 // zero-as-value result).
 // ---------------------------------------------------------------------------
-BOOST_AUTO_TEST_CASE(f2_pre_dag_hot_parent_matches_cold_parent)
+BOOST_AUTO_TEST_CASE(f2_byvalue_hot_parent_matches_cold_parent)
 {
     BOOST_REQUIRE(pindexBest != NULL);
 
-    // 1. Active pre-DAG chain to the last pre-DAG height; a8 (h8) is the COLD
+    // 1. Active fixture chain to the fixture depth; a8 (h8) is the COLD
     //    ancestor this fixture snapshots into the immutable generation.
-    const int hPreDag = GetForkHeightDAG() - 1;
+    const int hFixtureTop = kFixtureDepth - 1;
     CBlockIndex* a10 = pindexBest;
-    while (a10->nHeight < hPreDag) a10 = MineReal(a10, 0xA400 + a10->nHeight);
-    while (a10->nHeight > hPreDag) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
-    BOOST_REQUIRE_EQUAL(a10->nHeight, hPreDag);
+    while (a10->nHeight < hFixtureTop) a10 = MineReal(a10, 0xA400 + a10->nHeight);
+    while (a10->nHeight > hFixtureTop) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
+    BOOST_REQUIRE_EQUAL(a10->nHeight, hFixtureTop);
     CBlockIndex* a8 = a10->pprev->pprev;
     BOOST_REQUIRE(a8 != NULL);
     BOOST_REQUIRE_EQUAL(a8->nHeight, 8);
@@ -1221,7 +1225,7 @@ BOOST_AUTO_TEST_CASE(r4_authority_ready_published_by_real_authoritative_startup)
 {
     SetMockTime(1700001900);
     CBlockIndex* fork=pindexBest;
-    while(fork->nHeight<GetForkHeightDAG()-1) fork=MineReal(fork,0xE400+fork->nHeight);
+    while(fork->nHeight<kFixtureDepth - 1) fork=MineReal(fork,0xE400+fork->nHeight);
     const fs::path root=fs::temp_directory_path()/fs::unique_path("r4ready-%%%%-%%%%");
     fs::create_directories(root/"snapshot");
     struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
@@ -1258,18 +1262,17 @@ BOOST_AUTO_TEST_CASE(r4_authority_ready_published_by_real_authoritative_startup)
 
 
 // ---------------------------------------------------------------------------
-// F2 AUDIT BLOCKER REPAIR — PRE-DAG PROVIDER FAILURE MATRIX (fail-closed proof)
+// F2 AUDIT BLOCKER REPAIR — BY-VALUE TRUST PROVIDER FAILURE MATRIX (fail-closed proof)
 //
 // Every case below must FAIL CLOSED. None may switch to the active chain, return
 // partial trust, use zero as a failure signal, or fall back to mapBlockIndex.
 //   1. requested hash absent from the authority  -> provider false / NOT_FOUND
-//   2. requested hash is not pre-DAG (post-DAG)  -> provider false
-//   3. claimed parent ABSENT (injected: the parent's blockindex record is deleted
+//   2. claimed parent ABSENT (injected: the parent's blockindex record is deleted
 //      from the authoritative generation while the child still claims it via
 //      hashPrev)                                  -> provider false / FAILURE,
 //      and explicitly NOT the active-chain value at the child's height
-//   4. authority unavailable                     -> resolver FAILURE
-// Note on "hot-only/unavailable termination": case 3 is exactly the shape the F1
+//   3. authority unavailable                     -> resolver FAILURE
+// Note on "hot-only/unavailable termination": case 2 is exactly the shape the F1
 // hot-floor bug had (a vertex whose parent cannot be proven), and it must never
 // be reinterpreted as canonical genesis.
 // ---------------------------------------------------------------------------
@@ -1290,15 +1293,15 @@ static bool F2DeleteBlockIndexRecordFromSnapshot(const std::string& snapshotDir,
     return true;
 }
 
-BOOST_AUTO_TEST_CASE(f2_pre_dag_provider_failure_matrix)
+BOOST_AUTO_TEST_CASE(f2_byvalue_provider_failure_matrix)
 {
     BOOST_REQUIRE(pindexBest != NULL);
 
-    const int hPreDag = GetForkHeightDAG() - 1;
+    const int hFixtureTop = kFixtureDepth - 1;
     CBlockIndex* a10 = pindexBest;
-    while (a10->nHeight < hPreDag) a10 = MineReal(a10, 0x9300 + a10->nHeight);
-    while (a10->nHeight > hPreDag) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
-    BOOST_REQUIRE_EQUAL(a10->nHeight, hPreDag);
+    while (a10->nHeight < hFixtureTop) a10 = MineReal(a10, 0x9300 + a10->nHeight);
+    while (a10->nHeight > hFixtureTop) { BOOST_REQUIRE(a10->pprev != NULL); a10 = a10->pprev; }
+    BOOST_REQUIRE_EQUAL(a10->nHeight, hFixtureTop);
     const uint256 bestHashBeforeFixture = hashBestChain;
     CBlockIndex* a9 = a10->pprev; BOOST_REQUIRE(a9 != NULL);
     CBlockIndex* a8 = a9->pprev;  BOOST_REQUIRE(a8 != NULL);
@@ -1315,19 +1318,10 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_provider_failure_matrix)
     BOOST_REQUIRE_MESSAGE(hashBestChain == bestHashBeforeFixture,
         "F2 fixture: the side branches must not displace the active best chain");
 
-    // A genuine post-DAG block so the pre-DAG contract can be exercised. Built via
-    // the storage path (AddSidePoWBlock) so it works even when the ambient best
-    // chain is deeper than this fixture's height-11 block.
-    BOOST_REQUIRE_EQUAL(a10->nHeight + 1, GetForkHeightDAG());
-    CBlockIndex* postDag = AddSidePoWBlock(a10, 0x9399);
-    BOOST_REQUIRE(postDag != NULL);
-    BOOST_REQUIRE_EQUAL(postDag->nHeight, GetForkHeightDAG());
-
     const uint256 sideAtPoemHash = sideAtPoem->GetBlockHash();
     const uint256 lostParentHash = lostParent->GetBlockHash();
     const uint256 childOfLostHash = childOfLost->GetBlockHash();
     const uint256 a9Hash = a9->GetBlockHash();
-    const uint256 postDagHash = postDag->GetBlockHash();
     const uint256 sideAtPoemTrust = sideAtPoem->nChainTrust;
     const uint256 a9Trust = a9->nChainTrust;
     const uint256 childOfLostTrust = childOfLost->nChainTrust;
@@ -1419,14 +1413,6 @@ BOOST_AUTO_TEST_CASE(f2_pre_dag_provider_failure_matrix)
         BOOST_CHECK_MESSAGE(!ok, "absent requested hash must fail closed; err=" << e);
         BOOST_CHECK(acc == 0);
         BOOST_TEST_MESSAGE("F2 FM requested-absent refused=1 err=" << e);
-    }
-
-    // ---- 2. post-DAG hash routed to the pre-DAG provider -----------------
-    {
-        uint256 acc = 1; std::string e;
-        const bool ok = GetAuthoritativeAccumulatedChainTrust(postDagHash, &acc, &e);
-        BOOST_CHECK_MESSAGE(!ok, "a post-DAG hash must be rejected by the pre-DAG provider; err=" << e);
-        BOOST_TEST_MESSAGE("F2 FM post-DAG-rejected hash=" << postDagHash.GetHex() << " err=" << e);
     }
 
     // ---- 3b. the accepted generation's walks terminate at a PROVEN chain start
@@ -1970,7 +1956,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
     // authority (V2 durable index + immutable authority + linear trust projection).
     SetMockTime(1700001950);
     CBlockIndex* fork=pindexBest;
-    while(fork->nHeight<GetForkHeightDAG()) fork=MineReal(fork,0xE500+fork->nHeight);
+    while(fork->nHeight<kFixtureDepth) fork=MineReal(fork,0xE500+fork->nHeight);
     fork=MineRealDag(fork,0xE510);
     const fs::path root=fs::temp_directory_path()/fs::unique_path("p1retired-%%%%-%%%%");
     fs::create_directories(root/"snapshot");
@@ -2060,7 +2046,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
     // Fixture chain is built first in the harness default profile (as every other
     // fixture does), then the RETIRED profile is engaged for the whole scenario.
     CBlockIndex* fork = pindexBest;
-    while (fork->nHeight < GetForkHeightDAG()) fork = MineReal(fork, 0xD100 + fork->nHeight);
+    while (fork->nHeight < kFixtureDepth) fork = MineReal(fork, 0xD100 + fork->nHeight);
     const fs::path root = fs::temp_directory_path() / fs::unique_path("p1linreorg-%%%%-%%%%");
     fs::create_directories(root / "snapshot");
     struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;

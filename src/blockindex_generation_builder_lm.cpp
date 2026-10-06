@@ -153,9 +153,9 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
     // Hoisted: becomes false if any derived entry lacks a live nSize -> gates
     // whether M6 may claim AUTHORITATIVE capability.
     bool allHasBlockSize = true;
-    // Empty DAG input digest (SHA256 of zero bytes) — daglinks == 0 on mainnet
-    // (FORK_HEIGHT_DAG == 999999999), so the DAG input set is empty, exactly as
-    // the old builder produced. Cache it once for the AUTHORITATIVE binding.
+    // Empty DAG input digest (SHA256 of zero bytes) — the retired DAG input set is
+    // permanently empty, exactly as the old builder produced. Cache it once for the
+    // AUTHORITATIVE binding.
     unsigned char emptyDagDigest[32];
     SHA256_CTX dagCtx;
     SHA256_Init(&dagCtx);
@@ -740,7 +740,6 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         leveldb::Status ds = leveldb::DB::Open(dopts, derIdxPath, &derIdx);
         if (!ds.ok())
             return SetError(error, "lm: open deridx failed: " + ds.ToString());
-        bool postDag = GetForkHeightDAG() >= 0; // use runtime fork height
         {
             FILE* rf = fopen(hSortedPath.c_str(), "rb");
             if (!rf) { delete derIdx; return SetError(error, "lm: open hsort for derive failed"); }
@@ -947,7 +946,6 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
             fclose(idf);
         }
         delete derIdx;
-        (void)postDag;
         LmDiagRss("M4_emit_done");
     }
 
@@ -981,9 +979,9 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         ? BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE
         : BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
     const uint64_t totalRecords = writer_.RecordCount(); // before Finalize closes
-    // mainnet daglinks == 0 (FORK_HEIGHT_DAG == 999999999); the DAG input set is
-    // empty, so its digest is SHA256(zero bytes) == e3b0c442..., byte-matching
-    // the old builder's manifested dagInputDigest. (See function-scope emptyDagDigest.)
+    // The retired DAG input set is permanently empty, so its digest is
+    // SHA256(zero bytes) == e3b0c442..., byte-matching the old builder's manifested
+    // dagInputDigest. (See function-scope emptyDagDigest.)
     if (!writer_.Finalize(generation, hashBestChain, outTipId,
                           (int32_t)outTipHeight,
                           totalRecords, finalCap,
