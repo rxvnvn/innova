@@ -107,6 +107,21 @@ public:
                                                  uint64_t* selectedGeneration,
                                                  std::string* error);
 
+    // Startup-ownership classification probe. Performs every STRUCTURAL check of
+    // ValidateGeneration (directory/stable name, required components, MANIFEST
+    // COMPLETE + generation binding, active.dat binding + committed-tip
+    // coherence, hashindex binding, derived.dat presence + entry count +
+    // non-zero content binding) but does NOT independently recompute the
+    // generation root from immutable component bytes. It exists so startup
+    // ownership classification does not duplicate the full validation the
+    // authoritative bootstrap performs moments later; the bootstrap still
+    // performs the complete ValidateGeneration before AUTHORITY_READY, so a
+    // generation whose content root does not match is still refused startup
+    // (fail closed) - only the error surface moves.
+    static BlockIndexLifecycleStatus ValidateGenerationStructure(const std::string& root,
+                                                                 uint64_t generation,
+                                                                 std::string* error);
+
 private:
     // Structural validation against a concrete generation directory (used for
     // both build-N.tmp and gen-N by the public wrappers).
@@ -114,6 +129,7 @@ private:
                                                            uint64_t expectedGeneration,
                                                            bool requireStableName,
                                                            uint64_t generation,
+                                                           bool fullRootRecompute,
                                                            std::string* error);
 };
 

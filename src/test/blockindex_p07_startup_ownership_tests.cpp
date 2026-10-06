@@ -176,4 +176,24 @@ BOOST_AUTO_TEST_CASE(p07_11_canonical_default_root_is_effective_datadir)
     BOOST_CHECK(!fs::exists(fs::path(root) / "blockindex"));
 }
 
+// T1 (Cohort T): a generation directory that EXISTS but is missing required
+// components is structurally unreadable and must stay fail-closed (FATAL), never
+// downgraded to EMPTY_NEW or LEGACY_MIGRATION_REQUIRED.
+BOOST_AUTO_TEST_CASE(p07_12_present_but_structurally_broken_generation_is_fatal)
+{
+    P07TempRoot t;
+    fs::path v2Root = t.path / "bzindexv2";
+    fs::path dataDir = t.path / "data";
+    fs::create_directories(dataDir / "txleveldb"); // valid legacy also present
+    fs::create_directories(v2Root / "blockindex-gen-000001"); // dir present, empty
+    WriteValidCurrent(v2Root.string(), 1);
+
+    BlockIndexStartupOwnershipDecision d;
+    std::string err;
+    BOOST_REQUIRE(ClassifyBlockIndexStartupOwnership(v2Root.string(), dataDir.string(), &d, &err));
+    BOOST_CHECK_EQUAL(d.state, BLOCK_INDEX_STARTUP_OWNERSHIP_FATAL_CORRUPTION);
+    BOOST_CHECK_EQUAL(d.v2CurrentStatus, BLOCK_INDEX_LIFECYCLE_OK); // CURRENT itself parses
+    BOOST_CHECK(!d.v2Valid);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

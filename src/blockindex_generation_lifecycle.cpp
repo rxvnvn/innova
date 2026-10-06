@@ -407,7 +407,8 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
 
 BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
     const std::string& generationDir, uint64_t expectedGeneration,
-    bool requireStableName, uint64_t generation, std::string* error)
+    bool requireStableName, uint64_t generation, bool fullRootRecompute,
+    std::string* error)
 {
     if (generation == 0)
     {
@@ -561,18 +562,25 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
         // dagInputDigest is read from V3 MANIFEST (persisted by builder).
         // R2c.1c: bindFrontier=true for frontier-capable generations, which also
         // requires dag-tip-frontier.dat present + valid (fails closed otherwise).
-        unsigned char recomputedRoot[32];
-        if (!RecomputeGenerationRootFromFiles(dir, expectedGeneration,
-                                              m.committedTipHash, m.recordCount,
-                                              m.dagInputDigest, isFrontierCapable,
-                                              recomputedRoot, error))
+        // fullRootRecompute=false is used ONLY by the startup-ownership
+        // classification probe (T1): structural checks above are identical, the
+        // expensive immutable-byte re-derivation is deferred to the authoritative
+        // bootstrap, which always runs the full validation before AUTHORITY_READY.
+        if (fullRootRecompute)
         {
-            return BLOCK_INDEX_LIFECYCLE_ERROR;
-        }
-        if (memcmp(storedRoot, recomputedRoot, 32) != 0)
-        {
-            SetError(error, "authoritative generation root mismatch: derived header content binding does not match recomputed root from actual files");
-            return BLOCK_INDEX_LIFECYCLE_ERROR;
+            unsigned char recomputedRoot[32];
+            if (!RecomputeGenerationRootFromFiles(dir, expectedGeneration,
+                                                  m.committedTipHash, m.recordCount,
+                                                  m.dagInputDigest, isFrontierCapable,
+                                                  recomputedRoot, error))
+            {
+                return BLOCK_INDEX_LIFECYCLE_ERROR;
+            }
+            if (memcmp(storedRoot, recomputedRoot, 32) != 0)
+            {
+                SetError(error, "authoritative generation root mismatch: derived header content binding does not match recomputed root from actual files");
+                return BLOCK_INDEX_LIFECYCLE_ERROR;
+            }
         }
     }
     else if (fs::exists(derivedPath))
@@ -605,7 +613,16 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGeneration(const 
                                                                           std::string* error)
 {
     return ValidateGenerationDir(GenerationPath(root, generation), generation,
-                                 /*requireStableName=*/true, generation, error);
+                                 /*requireStableName=*/true, generation,
+                                 /*fullRootRecompute=*/true, error);
+}
+
+BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationStructure(
+    const std::string& root, uint64_t generation, std::string* error)
+{
+    return ValidateGenerationDir(GenerationPath(root, generation), generation,
+                                 /*requireStableName=*/true, generation,
+                                 /*fullRootRecompute=*/false, error);
 }
 
 BlockIndexLifecycleStatus BlockIndexGenerationManager::PublishGeneration(const std::string& root,
@@ -637,7 +654,8 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::PublishGeneration(const s
 
     // Validate the staging generation structurally (build-N.tmp, not stable name).
     const BlockIndexLifecycleStatus v = ValidateGenerationDir(staging.string(), generation,
-                                                             /*requireStableName=*/false, generation, error);
+                                                             /*requireStableName=*/false, generation,
+                                                             /*fullRootRecompute=*/true, error);
     if (v != BLOCK_INDEX_LIFECYCLE_OK)
         return v;
 
@@ -657,7 +675,8 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::PublishGeneration(const s
 
     // Reopen gen-N and validate again after rename.
     const BlockIndexLifecycleStatus v2 = ValidateGenerationDir(stable.string(), generation,
-                                                              /*requireStableName=*/true, generation, error);
+                                                              /*requireStableName=*/true, generation,
+                                                              /*fullRootRecompute=*/true, error);
     if (v2 != BLOCK_INDEX_LIFECYCLE_OK)
         return v2;
 

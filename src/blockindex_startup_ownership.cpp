@@ -75,12 +75,18 @@ bool ClassifyBlockIndexStartupOwnership(const std::string& v2Root,
     switch (st)
     {
     case BLOCK_INDEX_LIFECYCLE_OK:
-        // CURRENT present + parseable: validate the selected generation
-        // structurally (read-only) before declaring V2 authority.
+        // CURRENT present + parseable: probe the selected generation
+        // STRUCTURALLY (read-only) before declaring V2 authority. T1: this uses
+        // the structure-only probe (no independent root re-derivation from
+        // immutable component bytes). The authoritative bootstrap performs the
+        // FULL ValidateGeneration - including the root re-derivation - before
+        // AUTHORITY_READY, so a generation whose content root does not match is
+        // still refused startup (fail closed); only the error surface moves.
         {
-            uint64_t gen = 0;
+            const uint64_t gen = cur.generation;
             std::string openErr;
-            BlockIndexLifecycleStatus os = BlockIndexGenerationManager::OpenCurrent(v2Root, &gen, &openErr);
+            BlockIndexLifecycleStatus os =
+                BlockIndexGenerationManager::ValidateGenerationStructure(v2Root, cur.generation, &openErr);
             if (os == BLOCK_INDEX_LIFECYCLE_OK)
             {
                 d.state = BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE;
