@@ -536,6 +536,7 @@ endif
 TEST_OBJS= \
     obj/test/test_innova.o \
     obj/test/blockindex_block94_maturity_tests.o \
+    obj/test/blockindex_activeheight_resolver_tests.o \
     obj/test/Checkpoints_tests.o \
     obj/test/cpu_mining_tests.o \
     obj/test/build_metadata_tests.o \

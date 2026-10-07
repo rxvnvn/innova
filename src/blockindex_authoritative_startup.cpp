@@ -495,16 +495,44 @@ bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out)
 {
     if (!out)
         return false;
+    // 1. Immutable base generation (active heights <= its committed tip).
     const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
     if (!reader)
     {
         const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
         reader = nav ? nav->GetColdReader() : NULL;
     }
-    if (!reader || !reader->IsOpen())
+    if (reader && reader->IsOpen())
+    {
+        std::string baseErr;
+        if (reader->GetActiveByHeight(height, out, &baseErr) == BLOCK_INDEX_V2_READ_FOUND)
+            return true;
+    }
+    // 2. Mutable authoritative live tail (post-generation ACTIVE blocks). On a
+    //    fresh node the immutable generation holds only genesis, while every
+    //    newly accepted active block lives in the mutable tip; the by-HEIGHT path
+    //    must therefore consult the tail exactly as the by-HASH resolver already
+    //    does (Astra R-1 immutable-then-tail fallback). LookupActiveByHeight
+    //    matches ACTIVE members only, so a side record that shares a height is
+    //    never selected. Fail closed when neither authoritative source resolves.
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (!live || !live->IsOpen())
         return false;
-    std::string error;
-    return reader->GetActiveByHeight(height, out, &error) == BLOCK_INDEX_V2_READ_FOUND;
+    const BlockIndexTipAuthority* tip = live->TipAuthority();
+    if (!tip || !tip->IsOpen())
+        return false;
+    std::string tipErr;
+    const BlockIndexTipRead tr = tip->LookupActiveByHeight(height, &tipErr);
+    if (tr.status != BLOCK_INDEX_TIP_OK)
+        return false;
+    BlockIndexSnapshot snap;
+    std::string snapErr;
+    if (live->ResolveBlockSnapshot(tr.record.hash, &snap, &snapErr) != BlockIndexHotStatus::OK)
+        return false;
+    if (!snap.fInMainChain)
+        return false; // an active height must never resolve to a non-active record
+    *out = snap;
+    return true;
 }
 
 AuthoritativeBlockResolutionResult ResolveAuthoritativeBlockSnapshotR(
