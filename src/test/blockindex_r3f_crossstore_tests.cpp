@@ -50,6 +50,9 @@
 #include "blockindex_tip.h"
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
+#include "cold_hot_seam.h"   // ColdHotSeamNavigator / GetBlockIndexStakingNavigator
+#include "blockindex_shadow_startup.h"   // GetBlockIndexStakingNavigator
+#include "authoritative_blockindex_hot_resolver.h"
 
 #include <boost/filesystem.hpp>
 #include <cstdio>
@@ -562,6 +565,104 @@ BOOST_AUTO_TEST_CASE(r3f_xs_s4_operator_invalid_v2_first_ordering)
             "S4 reconsider: legacy mirror must agree with the (restored) V2 tip");
         BOOST_TEST_MESSAGE("R3F_XS S4 restart+reconcile v2_tip=" << tipR->GetTip().record.hash.ToString()
             << " legacy=" << R3FXSLegacyBest().ToString());
+    }
+}
+
+// ===========================================================================
+// R-1 seam extension (block-connect coinstake stake-source path).
+//
+// A POST-generation retained block — present only in the mutable live tail,
+// absent from the selected immutable generation — MUST resolve through the
+// production seam navigator. The legacy block-connect path
+// (kernel.cpp: IsBlockInCandidateAncestryNavigated -> ColdHotSeamNavigator::
+// ResolveLogicalR) previously read only the immutable generation, so a genuine
+// live-tail ancestor came back NOT_FOUND ("not an ancestor"), ReadStakeSource
+// Transaction failed, and CheckProofOfStake failed closed at the first PoS
+// block (fresh chain stall at the generation boundary). The hot resolver now
+// consults the mutable authoritative tail on a genuine generation miss — the
+// same immutable-then-tail model already accepted for the by-hash resolver.
+// ===========================================================================
+BOOST_AUTO_TEST_CASE(r3f_xs_seam_resolves_post_generation_tail_block)
+{
+    R3FXSFixture fx(12);
+    const int S = fx.S; const uint256 sHash = fx.active[S];
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    BOOST_REQUIRE_EQUAL(AuthoritativeBaseTipHeight(), S);
+
+    const uint256 A1(0xE1A001UL), A2(0xE1A002UL), B1(0xE1B001UL), B2(0xE1B002UL);
+    R3FXSInstallBranches(live, sHash, S, A1, A2, B1, B2);
+
+    const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
+    BOOST_REQUIRE(nav != NULL);
+    const BlockIndexV2Reader* gen = nav->GetColdReader();
+    BOOST_REQUIRE(gen != NULL && gen->IsOpen());
+
+    // Fixture premise: A1 is POST-generation — absent from the immutable
+    // generation by hash AND by height.
+    {
+        BlockIndexSnapshot gs; std::string ge;
+        BOOST_CHECK_MESSAGE(gen->LookupByHash(A1, &gs, &ge) != BLOCK_INDEX_V2_READ_FOUND,
+            "fixture: A1 must NOT be present in the immutable generation");
+        BOOST_CHECK_MESSAGE(gen->GetActiveByHeight(S + 1, &gs, &ge) != BLOCK_INDEX_V2_READ_FOUND,
+            "fixture: height S+1 must NOT be present in the immutable generation");
+    }
+
+    // --- FIX: the seam resolves the post-generation ACTIVE block by value ---
+    {
+        ColdHotSeamSnapshot snap; std::string e;
+        const ColdHotSeamResult r = nav->ResolveLogicalR(BlockIndexLogicalId(A1), &snap, &e);
+        BOOST_CHECK_MESSAGE(r == COLD_HOT_SEAM_OK,
+            "seam MUST resolve a live-tail ACTIVE block (A1); result=" << (int)r << " err=" << e);
+        if (r == COLD_HOT_SEAM_OK)
+        {
+            BOOST_CHECK_MESSAGE(snap.snapshot.hash == A1, "resolved hash must equal A1");
+            BOOST_CHECK_MESSAGE(snap.snapshot.fInMainChain, "A1 is an ACTIVE block");
+            BOOST_CHECK_EQUAL(snap.snapshot.height, S + 1);
+        }
+    }
+
+    // --- the exact walk step the defect exercised: parent of A2 is A1, both
+    //     live-tail; GetParentR must cross the post-generation boundary ---
+    {
+        ColdHotSeamSnapshot s2; std::string e2;
+        BOOST_REQUIRE_MESSAGE(nav->ResolveLogicalR(BlockIndexLogicalId(A2), &s2, &e2) == COLD_HOT_SEAM_OK,
+            "seam must resolve A2 (live-tail ACTIVE); err=" << e2);
+        ColdHotSeamSnapshot p; std::string pe;
+        const ColdHotSeamResult pr = nav->GetParentR(s2.ref, &p, &pe);
+        BOOST_CHECK_MESSAGE(pr == COLD_HOT_SEAM_OK,
+            "seam GetParentR must resolve a live-tail parent; result=" << (int)pr << " err=" << pe);
+        if (pr == COLD_HOT_SEAM_OK)
+        {
+            BOOST_CHECK_MESSAGE(p.snapshot.hash == A1,
+                "parent of A2 must be A1 (got " << p.snapshot.hash.ToString() << ")");
+            BOOST_CHECK_EQUAL(p.snapshot.height, S + 1);
+        }
+    }
+
+    // --- by-height crossing the boundary must select the ACTIVE block by value
+    //     (A1), never a side record sharing the height (B1) ---
+    {
+        AuthoritativeBlockIndexHotResolver res(nav->GetColdReader());
+        const BlockIndexSnapshot a = res.GetActiveByHeight(S + 1);
+        BOOST_CHECK_MESSAGE(a.found && a.hash == A1,
+            "by-height at S+1 must resolve to the ACTIVE block A1, never side B1 (got "
+            << (a.found ? a.hash.ToString() : std::string("<not found>")) << ")");
+        BOOST_CHECK_MESSAGE(a.found && a.fInMainChain,
+            "the by-height live-tail result must be an ACTIVE member");
+        const BlockIndexSnapshot a2 = res.GetNextActiveByHash(A1);
+        BOOST_CHECK_MESSAGE(a2.found && a2.hash == A2,
+            "next-active after A1 must be A2 (got "
+            << (a2.found ? a2.hash.ToString() : std::string("<not found>")) << ")");
+    }
+
+    // --- NEGATIVE: a genuinely unknown hash must STILL fail closed ---
+    {
+        ColdHotSeamSnapshot snap; std::string e;
+        const ColdHotSeamResult r =
+            nav->ResolveLogicalR(BlockIndexLogicalId(uint256(0xDEADBEEFUL)), &snap, &e);
+        BOOST_CHECK_MESSAGE(r == COLD_HOT_SEAM_NOT_FOUND,
+            "an unknown hash must remain a fail-closed NOT_FOUND; result=" << (int)r);
     }
 }
 
