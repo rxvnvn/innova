@@ -976,22 +976,32 @@ bool CStalledSyncRecoveryState::ShouldRecover(
         return false;
     }
 
-    if (nPeerHeight <= nLocalHeight || fPipelineActive)
+    if (nPeerHeight <= nLocalHeight)
     {
-        if (nPeerHeight <= nLocalHeight)
-        {
-            ibdsemantic::RecordRecoverySkipPeerNotAhead();
-        }
-        else
-        {
-            const int64_t nStallAgeHere = nLastProgressTime == 0
-                ? 0 : nNow - nLastProgressTime;
-            if (nStallAgeHere >= nStallTimeout)
-                ibdsemantic::RecordRecoverySkipPipelineActiveAfterTimeout();
-            else
-                ibdsemantic::RecordRecoverySkipPipelineActive();
-        }
+        ibdsemantic::RecordRecoverySkipPeerNotAhead();
         return false;
+    }
+
+    if (fPipelineActive)
+    {
+        // A healthy, actively-downloading pipeline must suppress stalled-sync
+        // recovery: an ordinary block download in progress is not a stall.
+        // However, once the local height has not advanced for the full stall
+        // timeout, the supposedly-active pipeline is stale (for example a hung
+        // in-flight request that never times out).  Previously this case
+        // returned false unconditionally, so a single stale in-flight entry
+        // suppressed recovery forever while the node consumed nothing.  Do NOT
+        // return false merely because fPipelineActive is set: record the
+        // observation and fall through to the existing timeout/cooldown
+        // eligibility machinery below, which still bounds recovery frequency.
+        const int64_t nStallAgeHere = nLastProgressTime == 0
+            ? 0 : nNow - nLastProgressTime;
+        if (nStallAgeHere < nStallTimeout)
+        {
+            ibdsemantic::RecordRecoverySkipPipelineActive();
+            return false;
+        }
+        ibdsemantic::RecordRecoverySkipPipelineActiveAfterTimeout();
     }
 
     const unsigned int nBackoffShift =

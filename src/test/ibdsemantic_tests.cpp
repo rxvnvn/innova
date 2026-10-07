@@ -493,18 +493,80 @@ BOOST_AUTO_TEST_CASE(recovery_pipeline_active_skip)
     BOOST_CHECK_EQUAL(snap.recovery_triggered, 0);
 }
 
-BOOST_AUTO_TEST_CASE(recovery_pipeline_active_after_timeout_skip)
+BOOST_AUTO_TEST_CASE(recovery_pipeline_active_after_timeout_becomes_eligible)
 {
+    // THE BUG (old behavior): a pipeline that stayed "active" past the stall
+    // timeout returned false forever -- a single stale in-flight entry
+    // suppressed recovery while the node consumed nothing.  The repair makes
+    // such a stale pipeline fall through to the existing timeout/cooldown
+    // eligibility machinery.  This case FAILS against the pre-fix code.
     EnableAndReset();
     CStalledSyncRecoveryState state;
     state.MarkSyncRequestSent(SEM_TEST_TIME);
-    // Stall age 20 >= timeout while the pipeline stays busy.
-    BOOST_CHECK(!state.ShouldRecover(
+    // Stall age 20 >= timeout 15 while the pipeline stays busy, and the
+    // cooldown default (30) has also elapsed for the first attempt.
+    BOOST_CHECK(state.ShouldRecover(
         nBestHeight, nBestHeight + 10, true, SEM_TEST_TIME + 20, 15, 30));
     const ibdsemantic::IBDSemanticSnapshot snap = SemSnapshot();
     BOOST_CHECK_EQUAL(snap.recovery_skip_pipeline_active_after_timeout, 1);
     BOOST_CHECK_EQUAL(snap.recovery_skip_pipeline_active, 0);
+    BOOST_CHECK_EQUAL(snap.recovery_triggered, 1);
+}
+
+BOOST_AUTO_TEST_CASE(recovery_pipeline_active_after_timeout_excludes_sibling_reasons)
+{
+    // Same stale-pipeline input, but the stall timeout has NOT expired yet:
+    // this must remain a plain pipeline-active skip (healthy pipeline is
+    // unaffected by the repair).
+    EnableAndReset();
+    CStalledSyncRecoveryState state;
+    state.MarkSyncRequestSent(SEM_TEST_TIME);
+    BOOST_CHECK(!state.ShouldRecover(
+        nBestHeight, nBestHeight + 10, true, SEM_TEST_TIME + 5, 15, 30));
+    const ibdsemantic::IBDSemanticSnapshot snap = SemSnapshot();
+    BOOST_CHECK_EQUAL(snap.recovery_skip_pipeline_active, 1);
+    BOOST_CHECK_EQUAL(snap.recovery_skip_pipeline_active_after_timeout, 0);
     BOOST_CHECK_EQUAL(snap.recovery_triggered, 0);
+}
+
+BOOST_AUTO_TEST_CASE(recovery_stale_pipeline_respects_cooldown)
+{
+    // A stale pipeline must not cause a recovery storm: after the first
+    // eligible recovery the existing exponential cooldown still holds the
+    // immediately following evaluations.
+    EnableAndReset();
+    CStalledSyncRecoveryState state;
+    state.MarkSyncRequestSent(SEM_TEST_TIME);
+    BOOST_CHECK(state.ShouldRecover(
+        nBestHeight, nBestHeight + 10, true, SEM_TEST_TIME + 20, 15, 30));
+    BOOST_CHECK(!state.ShouldRecover(
+        nBestHeight, nBestHeight + 10, true, SEM_TEST_TIME + 21, 15, 30));
+    BOOST_CHECK(!state.ShouldRecover(
+        nBestHeight, nBestHeight + 10, true, SEM_TEST_TIME + 22, 15, 30));
+    const ibdsemantic::IBDSemanticSnapshot snap = SemSnapshot();
+    BOOST_CHECK_EQUAL(snap.recovery_triggered, 1);
+    BOOST_CHECK_EQUAL(snap.recovery_skip_cooldown, 2);
+}
+
+BOOST_AUTO_TEST_CASE(recovery_pipeline_active_suppresses_after_progress)
+{
+    // After height progress refreshes the progress timestamp, an active
+    // pipeline must again suppress recovery until the timeout is exceeded.
+    EnableAndReset();
+    CStalledSyncRecoveryState state;
+    state.MarkSyncRequestSent(SEM_TEST_TIME);
+    // Height advances: the state re-seeds its progress clock and skips.
+    BOOST_CHECK(!state.ShouldRecover(
+        nBestHeight + 1, nBestHeight + 10, true, SEM_TEST_TIME + 20, 15, 30));
+    const ibdsemantic::IBDSemanticSnapshot snap = SemSnapshot();
+    BOOST_CHECK_EQUAL(snap.recovery_skip_height_changed, 1);
+    BOOST_CHECK_EQUAL(snap.recovery_triggered, 0);
+    // Immediately afterwards the pipeline is active and fresh again.
+    BOOST_CHECK(!state.ShouldRecover(
+        nBestHeight + 1, nBestHeight + 10, true, SEM_TEST_TIME + 21, 15, 30));
+    const ibdsemantic::IBDSemanticSnapshot snap2 = SemSnapshot();
+    BOOST_CHECK_EQUAL(snap2.recovery_skip_pipeline_active, 1);
+    BOOST_CHECK_EQUAL(snap2.recovery_triggered, 0);
 }
 
 BOOST_AUTO_TEST_CASE(recovery_timeout_not_reached_skip)

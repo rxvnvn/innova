@@ -1830,8 +1830,12 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_uses_capped_exponential_cooldown)
     }
 }
 
-BOOST_AUTO_TEST_CASE(stalled_sync_recovery_inflight_block_suppresses_request)
+BOOST_AUTO_TEST_CASE(stalled_sync_recovery_stale_inflight_block_no_longer_suppresses_request)
 {
+    // Liveness repair: a pipeline that stays "active" past the stall timeout is
+    // stale for recovery purposes (for example a hung in-flight request that
+    // never times out), so it must NOT suppress recovery forever.  This case
+    // FAILS against the pre-fix implementation.
     BOOST_REQUIRE(pindexBest != NULL);
     static const int64_t STALL_TIMEOUT = 15;
     static const int64_t RECOVERY_COOLDOWN = 30;
@@ -1846,15 +1850,26 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_inflight_block_suppresses_request)
     BOOST_CHECK(MaybeQueueStalledSyncRecovery(
                     peers, pindexBest, nBestHeight, TEST_TIME,
                     STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+
     peer.setBlocksInFlight.insert(hashPending);
+    // Fresh active pipeline (progress age < timeout): still suppressed.
     BOOST_CHECK(MaybeQueueStalledSyncRecovery(
-                    peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
+                    peers, pindexBest, nBestHeight, TEST_TIME + 1,
                     STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
     BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+
+    // Stale active pipeline (progress age >= timeout): eligible again.
+    BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
+                      peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
+                      STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
 }
 
-BOOST_AUTO_TEST_CASE(stalled_sync_recovery_pending_getblocks_suppresses_request)
+BOOST_AUTO_TEST_CASE(stalled_sync_recovery_stale_pending_getblocks_no_longer_suppresses_request)
 {
+    // Liveness repair: the same rule applies when the stale pipeline state is a
+    // pending getblocks request rather than an in-flight block.  This case
+    // FAILS against the pre-fix implementation.
     BOOST_REQUIRE(pindexBest != NULL);
     static const int64_t STALL_TIMEOUT = 15;
     static const int64_t RECOVERY_COOLDOWN = 30;
@@ -1868,11 +1883,17 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_pending_getblocks_suppresses_request)
     BOOST_CHECK(MaybeQueueStalledSyncRecovery(
                     peers, pindexBest, nBestHeight, TEST_TIME,
                     STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
-    peer.getBlocksIndex.push_back(pindexBest);
-    peer.getBlocksHash.push_back(uint256(0));
-    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
-                    peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
-                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+
+    // A real pending ordinary request occupies the single pending slot.
+    BOOST_REQUIRE(peer.PushGetBlocks(
+        pindexBest, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_CONTINUATION));
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+
+    // Stale pipeline: recovery becomes eligible again and the stale pending
+    // request is coalesced, never accumulating a second queued request.
+    BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
+                      peers, pindexBest, nBestHeight, TEST_TIME + STALL_TIMEOUT + 1,
+                      STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
     BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
 }
 
@@ -1954,17 +1975,19 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_mixed_askfor_and_inflight_uses_inflig
     peer.setBlocksInFlight.insert(hashPending);
 
     const int64_t nRecoveryTime = TEST_TIME + STALL_TIMEOUT + 1;
-    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
-                    peers, pindexBest, nBestHeight, nRecoveryTime,
-                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
-    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
-
-    peer.setBlocksInFlight.clear();
+    // Liveness repair: a stale active pipeline (progress age >= timeout) makes
+    // recovery eligible even while an in-flight block is present.  Pre-fix this
+    // returned NULL forever.  This case FAILS against the pre-fix code.
     BOOST_REQUIRE(MaybeQueueStalledSyncRecovery(
                       peers, pindexBest, nBestHeight, nRecoveryTime,
                       STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == &peer);
     BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
     BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peers, hashPending), 1U);
+    // The immediately repeated evaluation is held by the cooldown: no storm.
+    BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                    peers, pindexBest, nBestHeight, nRecoveryTime,
+                    STALL_TIMEOUT, RECOVERY_COOLDOWN, state) == NULL);
+    BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
 }
 
 BOOST_AUTO_TEST_CASE(stalled_sync_recovery_ignores_cross_peer_block_askfor)
