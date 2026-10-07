@@ -1464,18 +1464,22 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupActiveByHeight(int32_t height, s
         r.status = BLOCK_INDEX_TIP_NOT_FOUND;
         return r;
     }
-    BlockIndexId id = impl->activeIds[(size_t)rel];
-    for (size_t j = 0; j < impl->records.size(); ++j)
-        if (impl->baseLocalToId(j) == id)
-        {
-            r.status = BLOCK_INDEX_TIP_OK;
-            r.record = impl->records[j];
-            r.derived = impl->derived[j];
-            r.active = true;
-            r.height = impl->records[j].height;
-            return r;
-        }
-    r.status = BLOCK_INDEX_TIP_CORRUPT;
+    // R5: the id->record mapping is pure arithmetic (id == baseRecordCount +
+    // slot + 1), exactly like LookupByHash. The previous O(records) linear scan
+    // ran on every by-height lookup (the hot live-tail/seam path) and dominated
+    // the block-connect profile after the append repair landed.
+    const BlockIndexId id = impl->activeIds[(size_t)rel];
+    const int64_t slot = (int64_t)id - (int64_t)impl->meta.baseRecordCount - 1;
+    if (slot < 0 || slot >= (int64_t)impl->records.size())
+    {
+        r.status = BLOCK_INDEX_TIP_CORRUPT;
+        return r;
+    }
+    r.status = BLOCK_INDEX_TIP_OK;
+    r.record = impl->records[(size_t)slot];
+    r.derived = impl->derived[(size_t)slot];
+    r.active = true;
+    r.height = impl->records[(size_t)slot].height;
     return r;
 }
 

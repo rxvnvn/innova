@@ -450,6 +450,41 @@ BOOST_AUTO_TEST_CASE(t10b_hash_lookup_slot_equiv)
     printf("T10b PASS LookupByHash slot arithmetic: all slots + side + not-found\n");
 }
 
+// t10c (R5): LookupActiveByHeight must resolve every active height to its exact
+// record by slot arithmetic (no linear scan), matching record order.
+BOOST_AUTO_TEST_CASE(t10c_active_by_height_slot_equiv)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 1500;
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 11, 1500, baseTip, &tip, NULL));
+    const size_t n = 40;
+    std::vector<uint256> hs(n);
+    uint256 prev = uint256(0x1a1aUL);
+    for (size_t i = 0; i < n; ++i)
+    {
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(uint256(0x5000UL + i + 1), prev, baseTip + (int)i + 1, true);
+        a.derived = MakeDerived(uint256(3), 500 + (uint64_t)i);
+        std::string err;
+        BOOST_REQUIRE(tip.Append(a, baseTip + (int)i + 1, &err) == BLOCK_INDEX_TIP_OK);
+        hs[i] = a.record.hash;
+        prev = a.record.hash;
+    }
+    for (size_t i = 0; i < n; ++i)
+    {
+        BlockIndexTipRead r = tip.LookupActiveByHeight(baseTip + (int)i + 1, NULL);
+        BOOST_REQUIRE(r.status == BLOCK_INDEX_TIP_OK);
+        BOOST_CHECK(r.record.hash == hs[i]);
+        BOOST_CHECK(r.active);
+        BOOST_CHECK_EQUAL(r.height, baseTip + (int)i + 1);
+    }
+    BOOST_CHECK(tip.LookupActiveByHeight(baseTip, NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
+    BOOST_CHECK(tip.LookupActiveByHeight(baseTip + (int)n + 1, NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
+    printf("t10c PASS LookupActiveByHeight slot-equivalent for %zu heights\n", n);
+    tip.Close();
+}
+
 // =====================================================================
 // R4 — incremental (append-only) tail persistence.
 // =====================================================================
