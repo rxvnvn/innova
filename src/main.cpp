@@ -5598,16 +5598,41 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
                     // maturity truth must come from the authoritative chain by
                     // value - never from truncated residency. Unavailable
                     // authority FAILS CLOSED (reject), distinct from immature.
+                    //
+                    // FRESH-IBD BLOCK-94 REPAIR: the block being connected is NOT
+                    // yet published into the mutable tip authority at this point.
+                    // AddToBlockIndex performs the V2 authoritative publish
+                    // (AcceptActive/AcceptSide) only AFTER SetBestChain returns,
+                    // because it mirrors the legacy engine's OWN decision and so
+                    // cannot run before ConnectBlock. Anchoring the by-value walk
+                    // at the spender's own hash therefore failed closed at depth 0
+                    // for EVERY block spending a coinbase/coinstake - the first
+                    // such block on mainnet is height 94 (the fresh self-sync
+                    // blocker), while blocks 1..93 contain no such spend and never
+                    // exercised the path. Reproduce depth 0 from the resident
+                    // spender (exactly the legacy predicate) and walk depths
+                    // 1..nCoinbaseMaturity-1 by value from the already-published
+                    // parent. Semantics are IDENTICAL to the legacy loop below.
                     BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority();
                     if (liveAuth == NULL || !liveAuth->IsOpen())
                         return error("ConnectInputs() : maturity authority unavailable for %s (authoritative, %s)", txPrev.IsCoinBase() ? "coinbase" : "coinstake", GetHash().ToString().c_str());
+                    // depth 0: the block being connected itself (resident, in hand).
+                    if (pindexBlock != NULL &&
+                        pindexBlock->nFile == txindex.pos.nFile &&
+                        pindexBlock->nBlockPos == txindex.pos.nBlockPos)
+                        return error("ConnectInputs() : tried to spend %s at depth 0 (authoritative)", txPrev.IsCoinBase() ? "coinbase" : "coinstake");
+                    // depths 1..nCoinbaseMaturity-1: by-value walk from the parent
+                    // (the parent is already published to the tip authority).
+                    const CBlockIndex* pindexMaturityPrev = (pindexBlock != NULL) ? pindexBlock->pprev : NULL;
+                    if (pindexMaturityPrev == NULL)
+                        return error("ConnectInputs() : maturity authority anchor unavailable for %s (authoritative)", txPrev.IsCoinBase() ? "coinbase" : "coinstake");
                     int nAuthDepth = 0;
                     std::string strAuthErr;
                     BlockIndexAuthoritativeMaturityStatus authStatus = liveAuth->ResolveSpendMaturity(
-                        pindexBlock->GetBlockHash(), txindex.pos.nFile, txindex.pos.nBlockPos,
-                        nCoinbaseMaturity, &nAuthDepth, &strAuthErr);
+                        pindexMaturityPrev->GetBlockHash(), txindex.pos.nFile, txindex.pos.nBlockPos,
+                        nCoinbaseMaturity - 1, &nAuthDepth, &strAuthErr);
                     if (authStatus == BLOCK_INDEX_MATURITY_IMMATURE)
-                        return error("ConnectInputs() : tried to spend %s at depth %d (authoritative)", txPrev.IsCoinBase() ? "coinbase" : "coinstake", nAuthDepth);
+                        return error("ConnectInputs() : tried to spend %s at depth %d (authoritative)", txPrev.IsCoinBase() ? "coinbase" : "coinstake", nAuthDepth + 1);
                     if (authStatus == BLOCK_INDEX_MATURITY_UNAVAILABLE)
                         return error("ConnectInputs() : maturity authority unavailable for %s: %s (authoritative)", txPrev.IsCoinBase() ? "coinbase" : "coinstake", strAuthErr.c_str());
                     // MATURE: continue with the remaining checks.
