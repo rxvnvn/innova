@@ -141,6 +141,55 @@ struct G1Fixture
 
 BOOST_AUTO_TEST_SUITE(blockindex_authoritative_live_tests)
 
+// REGRESSION (genesis anchor): the base-generation snapshot of the genesis and
+// the EXACT accept-time parent CBlockIndex returned by
+// ResolveAndRetainFullParent MUST both expose the committed derived
+// stake-modifier checksum. Pre-fix the base snapshot surfaced ONLY nChainTrust,
+// so the materialized genesis carried nStakeModifierChecksum=0, seeding the whole
+// live stake-modifier recurrence with 0 (canonical genesis 0x0e00670b was lost).
+// The anchor is EXTERNAL to the recurrence: the persisted derived entry on disk.
+// A recurrence-only check cannot catch this (a 0-seeded chain is self-consistent).
+BOOST_AUTO_TEST_CASE(g1_base_snapshot_and_materialized_expose_derived_stake_modifier_checksum)
+{
+    G1Fixture fx(4); // S = 4, generation 1, genesis at height 0
+    BlockIndexV2Reader reader;
+    BlockIndexV2ReaderOptions opts;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reader.Open(fx.rootStr, opts, &error), error);
+
+    BlockIndexSnapshot snap;
+    BOOST_REQUIRE(reader.LookupByHash(fx.baseActive[0], &snap, &error) == BLOCK_INDEX_V2_READ_FOUND);
+    BOOST_CHECK_EQUAL(snap.height, 0);
+
+    // EXTERNAL ANCHOR: the persisted derived entry (authority), read from disk.
+    std::string genDir;
+    for (fs::directory_iterator it(fx.root), end; it != end; ++it)
+    {
+        const std::string name = it->path().filename().string();
+        if (name.compare(0, 14, "blockindex-gen") == 0) { genDir = it->path().string(); break; }
+    }
+    BOOST_REQUIRE_MESSAGE(!genDir.empty(), "generation dir not found");
+    BlockIndexDerivedStateStore dstore;
+    BOOST_REQUIRE_MESSAGE(
+        BlockIndexDerivedStateStore::OpenReadOnly(genDir, 1, &dstore, &error), error);
+    BlockIndexDerivedEntry de;
+    BOOST_REQUIRE(dstore.Read(snap.id, &de, &error) == BLOCK_INDEX_DERIVED_LOOKUP_FOUND);
+
+    // Invariant 1: base snapshot surfaces the committed derived checksum.
+    BOOST_CHECK_MESSAGE(snap.hasStakeModifierChecksum,
+        "base snapshot must expose the committed derived stake-modifier checksum");
+    BOOST_CHECK_EQUAL((unsigned)snap.nStakeModifierChecksum, (unsigned)de.stakeModifierChecksum);
+
+    // Invariant 2: the materialized accept-time parent carries the SAME value
+    // (never silently zero).
+    BlockIndexAuthoritativeLive live;
+    BOOST_REQUIRE_MESSAGE(live.Open(fx.rootStr, &reader, 2048, &error), error);
+    CBlockIndex* g = live.ResolveAndRetainFullParent(fx.baseActive[0], &error);
+    BOOST_REQUIRE(g != NULL);
+    BOOST_CHECK_EQUAL(g->nHeight, 0);
+    BOOST_CHECK_EQUAL((unsigned)g->nStakeModifierChecksum, (unsigned)de.stakeModifierChecksum);
+}
+
 // G1-A/B/C + G1-D + G1-H: base S, residency 0, accept S+1..S+k via the seam,
 // tip advances, restart keeps S+k, mapBlockIndex never populated.
 BOOST_AUTO_TEST_CASE(g1_live_acceptance_tip_advance_restart)

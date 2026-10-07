@@ -236,7 +236,24 @@ BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const
         }
     }
     if (hadDerived)
+    {
         s.nChainTrust = de.chainTrust;
+        // G1-A repair: a base-generation snapshot MUST expose the authoritative
+        // per-record stake-modifier checksum from derived.dat whenever the
+        // committed derived entry exists. Previously ONLY nChainTrust was
+        // surfaced here; the checksum was left absent (hasStakeModifierChecksum
+        // false), so every base-served block materialized with
+        // nStakeModifierChecksum=0. For the genesis this seeded the whole live
+        // recurrence with 0 (canonical 0x0e00670b -> observed 0x00000000),
+        // making the entire live chain non-canonical and h100000 fail the
+        // (correct) 0xcf12d0aa checkpoint. See
+        // blockindex_authoritative_live.cpp ResolveAndRetainFullParent base
+        // branch (the exact accept-time consumer).
+        s.nStakeModifierChecksum = de.stakeModifierChecksum;
+        s.hasStakeModifierChecksum = true;
+        // stake-modifier TIME availability stays governed by the derived entry's
+        // own flag (a zero time is valid; availability is separate).
+    }
     return s;
 }
 void BlockIndexV2Reader::CachePut(const BlockIndexSnapshot& s) const {
