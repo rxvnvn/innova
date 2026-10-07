@@ -182,6 +182,44 @@ BOOST_AUTO_TEST_CASE(hash_key_and_recordid_value_codecs_are_exact_and_determinis
     BOOST_CHECK_EQUAL(decoded, 0x0102030405060708ULL);
 }
 
+BOOST_AUTO_TEST_CASE(hash_key_is_the_big_endian_display_bytes)
+{
+    // R5: EncodeBlockIndexHashKey must emit exactly the big-endian display bytes
+    // of the hash (what GetHex() would produce). The previous implementation
+    // built them through a hex string + nibble re-parse; this guards the byte
+    // identity of the direct encoding, including hashes with non-zero high words.
+    std::string error;
+    const char* hexes[] = {
+        "0000000000000000000000000000000000000000000000000000000000000000",
+        "00000000000000000000000000000000000000000000000000000000000000ff",
+        "ff00000000000000000000000000000000000000000000000000000000000000",
+        "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "deadbeefcafebabe00112233445566778899aabbccddeeff00112233445566aa"
+    };
+    for (size_t h = 0; h < sizeof(hexes) / sizeof(hexes[0]); ++h)
+    {
+        uint256 hash;
+        hash.SetHex(hexes[h]);
+        std::string key;
+        BOOST_REQUIRE(EncodeBlockIndexHashKey(hash, &key, &error));
+        BOOST_REQUIRE_EQUAL(key.size(), (size_t)BLOCK_INDEX_HASH_KEY_SIZE);
+        BOOST_CHECK_EQUAL((unsigned char)key[0], (unsigned char)BLOCK_INDEX_HASH_KEY_PREFIX);
+        const std::string disp = hash.GetHex();
+        BOOST_REQUIRE_EQUAL(disp, std::string(hexes[h]));
+        // The key carries the 32 display BYTES of the hash; pack the reference hex.
+        std::string want(32, '\0');
+        for (size_t i = 0; i < 32; ++i)
+        {
+            const char hi = disp[2 * i], lo = disp[2 * i + 1];
+            const int hv = (hi <= '9') ? hi - '0' : hi - 'a' + 10;
+            const int lv = (lo <= '9') ? lo - '0' : lo - 'a' + 10;
+            want[i] = (char)((hv << 4) | lv);
+        }
+        BOOST_CHECK_EQUAL_COLLECTIONS(key.begin() + 1, key.end(), want.begin(), want.end());
+    }
+    printf("R5 PASS EncodeBlockIndexHashKey == big-endian display bytes\n");
+}
+
 BOOST_AUTO_TEST_CASE(malformed_value_length_and_zero_recordid_fail_closed)
 {
     BlockIndexId decoded = 0;

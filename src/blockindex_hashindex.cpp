@@ -71,36 +71,19 @@ static bool DecodeU64LE(const char* data, size_t size, uint64_t* out, std::strin
     return true;
 }
 
-static bool ParseHexNibble(char c, unsigned char* out)
-{
-    if (c >= '0' && c <= '9') {
-        *out = (unsigned char)(c - '0');
-        return true;
-    }
-    if (c >= 'a' && c <= 'f') {
-        *out = (unsigned char)(10 + (c - 'a'));
-        return true;
-    }
-    if (c >= 'A' && c <= 'F') {
-        *out = (unsigned char)(10 + (c - 'A'));
-        return true;
-    }
-    return false;
-}
-
 static bool AppendHashBytes(const uint256& hash, std::string* out, std::string* error)
 {
-    const std::string hex = hash.GetHex();
-    if (hex.size() != 64)
-        return SetError(error, "unexpected hash hex size");
-    for (size_t i = 0; i < hex.size(); i += 2)
-    {
-        unsigned char hi = 0;
-        unsigned char lo = 0;
-        if (!ParseHexNibble(hex[i], &hi) || !ParseHexNibble(hex[i + 1], &lo))
-            return SetError(error, "invalid hash hex nibble");
-        out->push_back((char)((hi << 4) | lo));
-    }
+    // R5: byte-identical to the previous GetHex() + ParseHexNibble round-trip,
+    // which was a pure binary -> hex-string -> binary identity (a heap-allocating
+    // 64-char string plus a 64-nibble parse per hash) and dominated the by-hash
+    // lookup path under live IBD load (~23% of one core, mostly snprintf). The
+    // key is the 32 big-endian display bytes of the hash; uint256 internal
+    // storage is the byte reversal of that (see ReadHashBytes in
+    // fixed_blockindex_store.cpp), so emit the reversed internal bytes directly.
+    (void)error;
+    const unsigned char* p = hash.begin();
+    for (size_t i = 0; i < 32; ++i)
+        out->push_back((char)p[31 - i]);
     return true;
 }
 
