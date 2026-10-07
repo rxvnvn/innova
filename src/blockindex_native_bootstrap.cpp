@@ -15,6 +15,7 @@
 extern void* GetGlobalTxdbPtrForTest();
 
 #include <boost/filesystem.hpp>
+#include <boost/version.hpp>
 
 #include <stdio.h>
 #include <string>
@@ -96,7 +97,13 @@ bool SnapshotLegacyBlockIndexDb(const std::string& dataDir,
             }
             else
             {
+#if BOOST_VERSION >= 107800
+                fs::copy_file(it->path(), target, fs::copy_options::overwrite_existing);
+#elif BOOST_VERSION >= 104000
                 fs::copy_file(it->path(), target, fs::copy_option::overwrite_if_exists);
+#else
+                fs::copy_file(it->path(), target);
+#endif
             }
         }
     }
