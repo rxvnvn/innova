@@ -1226,24 +1226,40 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
         r.status = BLOCK_INDEX_TIP_NOT_FOUND;
         return r;
     }
-    BlockIndexId id = it->second;
-    for (size_t j = 0; j < impl->records.size(); ++j)
-        if (impl->baseLocalToId(j) == id)
-        {
-            r.status = BLOCK_INDEX_TIP_OK;
-            r.record = impl->records[j];
-            r.derived = impl->derived[j];
-            r.height = impl->records[j].height;
-            r.active = false;
-            for (size_t h = 0; h < impl->activeIds.size(); ++h)
-                if (impl->activeIds[h] == id)
-                {
-                    r.active = true;
-                    break;
-                }
-            return r;
-        }
-    r.status = BLOCK_INDEX_TIP_CORRUPT;
+    // baseLocalToId(j) == baseRecordCount + j + 1 is an affine map, so the record
+    // slot for a RecordId is a DIRECT computation. The former per-call linear
+    // scan over the whole records vector (and a second scan over activeIds)
+    // dominated fresh-IBD CPU: each by-value lookup walked the entire retained
+    // tail. Results are identical; only the lookup cost changes (O(N) -> O(1)).
+    const BlockIndexId id = it->second;
+    const uint64_t base = impl->meta.baseRecordCount;
+    if (id <= base)
+    {
+        r.status = BLOCK_INDEX_TIP_CORRUPT;
+        return r;
+    }
+    const uint64_t slot = id - base - 1;
+    if (slot >= impl->records.size() || slot >= impl->derived.size())
+    {
+        r.status = BLOCK_INDEX_TIP_CORRUPT;
+        return r;
+    }
+    r.status = BLOCK_INDEX_TIP_OK;
+    r.record = impl->records[(size_t)slot];
+    r.derived = impl->derived[(size_t)slot];
+    r.height = impl->records[(size_t)slot].height;
+    // Active membership: activeIds is dense by relative index (activeIds[rel] is
+    // the active RecordId at global height baseTipHeight + rel + 1), so a record
+    // is active iff it occupies its own height's slot. Equivalent to the former
+    // scan over activeIds, without the O(activeIds) cost.
+    r.active = false;
+    const int32_t h = impl->records[(size_t)slot].height;
+    if (h > impl->meta.baseTipHeight)
+    {
+        const uint64_t rel = (uint64_t)(h - impl->meta.baseTipHeight - 1);
+        if (rel < impl->activeIds.size() && impl->activeIds[(size_t)rel] == id)
+            r.active = true;
+    }
     return r;
 }
 

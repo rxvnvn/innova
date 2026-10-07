@@ -400,6 +400,56 @@ BOOST_AUTO_TEST_CASE(t10_lookups)
     printf("T10 PASS lookups (getTip/byHash/byHeight/parent/next)\n");
 }
 
+// A.10.1q regression: LookupByHash resolves the record slot by DIRECT arithmetic
+// (id - baseRecordCount - 1) instead of the former O(records) scan (+O(activeIds)
+// scan). This case proves the slot-arithmetic lookup is result-identical over
+// EVERY slot: each hash returns its own record/derived/height, ACTIVE records stay
+// active, a side record over an already-active height stays inactive, and an
+// unknown hash still fails closed NOT_FOUND.
+BOOST_AUTO_TEST_CASE(t10b_hash_lookup_slot_equiv)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 800;
+    const uint256 basePrev = uint256(0xABABUL);
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 7, 1000, baseTip, &tip, NULL));
+    BuildChain(tip, 8, NULL, basePrev, baseTip); // 801..808, hashes 0x1111..0x1118
+
+    // Every slot (first .. last) must resolve to exactly its own record.
+    for (uint32_t i = 0; i < 8; ++i)
+    {
+        const uint256 h = uint256(0x1111UL + i);
+        BlockIndexTipRead rd = tip.LookupByHash(h, NULL);
+        BOOST_REQUIRE_MESSAGE(rd.status == BLOCK_INDEX_TIP_OK, "slot " << i << " must resolve");
+        BOOST_REQUIRE(rd.record.hash == h);
+        BOOST_REQUIRE(rd.record.hashPrev == (i == 0 ? basePrev : uint256(0x1110UL + i)));
+        BOOST_REQUIRE_EQUAL(rd.height, baseTip + 1 + (int)i);
+        BOOST_REQUIRE(rd.active); // BuildChain appends ACTIVE records
+        BOOST_REQUIRE(rd.derived.chainTrust == uint256(i + 1));
+        BOOST_REQUIRE_EQUAL(rd.derived.stakeModifierChecksum, 1000u + i);
+        BOOST_REQUIRE_EQUAL(rd.derived.nSize, 1200u + ((1000u + i) % 100u));
+    }
+
+    // Side record over the LAST active height (808): recorded, never active.
+    const uint256 sideHash = uint256(0x5151UL);
+    BlockIndexTipAppend a;
+    a.record = MakeRecord(sideHash, uint256(0x1117UL), baseTip + 8, false);
+    a.derived = MakeDerived(uint256(0xF00DUL), 777);
+    std::string err;
+    BOOST_REQUIRE(tip.Append(a, -1, &err) == BLOCK_INDEX_TIP_OK);
+    BlockIndexTipRead side = tip.LookupByHash(sideHash, NULL);
+    BOOST_REQUIRE(side.status == BLOCK_INDEX_TIP_OK);
+    BOOST_CHECK_MESSAGE(!side.active, "a side record over an active height must not be active");
+    BOOST_REQUIRE(side.derived.chainTrust == uint256(0xF00DUL));
+    // The active member at that height is still the ACTIVE record, not the side one.
+    BlockIndexTipRead still = tip.LookupByHash(uint256(0x1118UL), NULL);
+    BOOST_REQUIRE(still.status == BLOCK_INDEX_TIP_OK && still.active);
+
+    // Unknown hash: fail closed, unchanged.
+    BOOST_REQUIRE(tip.LookupByHash(uint256(0xDEADUL), NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
+    printf("T10b PASS LookupByHash slot arithmetic: all slots + side + not-found\n");
+}
+
 // =====================================================================
 // R2B — durable operator-invalid authority (v2 mutable protocol).
 //   T11 invalidate persists across reopen
