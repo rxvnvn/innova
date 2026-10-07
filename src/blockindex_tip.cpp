@@ -351,8 +351,126 @@ static bool ReadWholeFile(const fs::path& path, std::string* out)
     return true;
 }
 
-// Re-encode records.dat / active.dat / derived.dat committed region from the
-// in-memory committed state (used when repairing an uncommitted tail).
+// ---- R4: incremental (append-only) tail persistence -------------------------
+// A normal AppendBatch appends ONLY the newly encoded entries to the end of each
+// mutable tail store. Each store is a fixed-size header followed by fixed-size
+// entries, and Open decodes to EOF then truncates to the committed tip.meta
+// counts, so an appended-but-uncommitted suffix is recovered exactly as before.
+// Cost becomes O(new records) instead of O(retained tail).
+//
+// The count field of each header is the first LE64 after the LE32 header fields.
+static const uint32_t BLOCK_INDEX_TIP_RECORDS_COUNT_OFFSET = 16;
+static const uint32_t BLOCK_INDEX_TIP_DERIVED_COUNT_OFFSET = 16;
+static const uint32_t BLOCK_INDEX_TIP_ACTIVE_COUNT_OFFSET  = 12;
+
+// Truncate a store file to exactly headerSize + committedCount*entrySize. Used to
+// discard a stale uncommitted suffix before appending (idempotent; a no-op after a
+// clean shutdown) and during Open recovery. Fails closed if the file is SHORTER
+// than the committed region.
+static bool TruncateStoreToCommitted(const fs::path& path, uint64_t headerSize,
+                                     uint64_t entrySize, uint64_t committedCount,
+                                     std::string* error)
+{
+    const uint64_t want = headerSize + committedCount * entrySize;
+    boost::system::error_code ec;
+    uint64_t have = (uint64_t)fs::file_size(path, ec);
+    if (ec)
+    {
+        if (error) *error = "stat store failed: " + path.string();
+        return false;
+    }
+    if (have == want)
+        return true;
+    if (have < want)
+    {
+        if (error) *error = "store short of committed bytes: " + path.string();
+        return false;
+    }
+    fs::resize_file(path, want, ec);
+    if (ec)
+    {
+        if (error) *error = "truncate store failed: " + path.string();
+        return false;
+    }
+    return true;
+}
+
+// Append bytes to the end of an existing store and fsync. b empty is a no-op.
+// After the bytes are durable, honour the FP_DURING_TAIL_UPDATE failpoint (the
+// append-path analogue of the copy-on-write "temp durable, not yet published"
+// crash boundary): the caller aborts with the appended bytes uncommitted, and
+// recovery truncates them.
+static bool AppendBytesDurable(const fs::path& path, const std::vector<unsigned char>& b,
+                               std::string* error)
+{
+    if (b.empty())
+        return true;
+    FILE* f = fopen(path.string().c_str(), "r+b");
+    if (!f)
+    {
+        if (error) *error = "open append failed: " + path.string();
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 ||
+        (!b.empty() && fwrite(&b[0], 1, b.size(), f) != b.size()))
+    {
+        fclose(f);
+        if (error) *error = "append write failed: " + path.string();
+        return false;
+    }
+    if (!FileCommitChecked(f, error))
+    {
+        fclose(f);
+        return false;
+    }
+    if (BlockIndexTipFailpointHit("FP_DURING_TAIL_UPDATE"))
+    {
+        fclose(f);
+        if (error) *error = "failpoint FP_DURING_TAIL_UPDATE";
+        return false;
+    }
+    if (fclose(f) != 0)
+    {
+        if (error) *error = "append close failed: " + path.string();
+        return false;
+    }
+    return true;
+}
+
+// Rewrite only the 8-byte committed-entry count field of a store header, then
+// fsync. The count is informational (Open bounds by tip.meta), but keeping it
+// accurate preserves the on-disk invariant.
+static bool UpdateStoreCount(const fs::path& path, uint32_t countOffset, uint64_t count,
+                             std::string* error)
+{
+    FILE* f = fopen(path.string().c_str(), "r+b");
+    if (!f)
+    {
+        if (error) *error = "open count update failed: " + path.string();
+        return false;
+    }
+    unsigned char b[8];
+    for (int j = 0; j < 8; ++j)
+        b[j] = (unsigned char)((count >> (8 * j)) & 0xff);
+    if (fseek(f, (long)countOffset, SEEK_SET) != 0 || fwrite(b, 1, 8, f) != 8)
+    {
+        fclose(f);
+        if (error) *error = "count update write failed: " + path.string();
+        return false;
+    }
+    if (!FileCommitChecked(f, error))
+    {
+        fclose(f);
+        return false;
+    }
+    if (fclose(f) != 0)
+    {
+        if (error) *error = "count update close failed: " + path.string();
+        return false;
+    }
+    return true;
+}
+
 static bool WriteRecordsFile(const fs::path& path, const std::vector<BlockIndexRecord>& records,
                              std::string* error = NULL)
 {
@@ -691,6 +809,28 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
         activeIds.size() < expActiveSize)
         return SetError(error, "tip stores short of committed tip.meta (corrupt)");
 
+    // R4: a suffix beyond tip.meta is uncommitted residue and must be PHYSICALLY
+    // removed, not merely dropped in memory: a later append lands at EOF, so a
+    // stale suffix left on disk would place new entries after the residue and
+    // make the sequential decode read the wrong records. Truncate exactly to the
+    // committed boundary (bytes beyond tip.meta are never authoritative).
+    if (repaired)
+    {
+        if (!TruncateStoreToCommitted(i->recordsPath, BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE,
+                                      BLOCK_INDEX_RECORD_SIZE_V1, meta.tipRecordCount, error) ||
+            !TruncateStoreToCommitted(i->derivedPath, BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE,
+                                      BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, meta.tipRecordCount, error) ||
+            !TruncateStoreToCommitted(i->activePath, BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE,
+                                      BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, expActiveSize, error))
+            return false;
+        // Keep the informational header counts consistent with the truncated files.
+        std::string cerr;
+        if (!UpdateStoreCount(i->recordsPath, BLOCK_INDEX_TIP_RECORDS_COUNT_OFFSET, meta.tipRecordCount, &cerr) ||
+            !UpdateStoreCount(i->derivedPath, BLOCK_INDEX_TIP_DERIVED_COUNT_OFFSET, meta.tipRecordCount, &cerr) ||
+            !UpdateStoreCount(i->activePath, BLOCK_INDEX_TIP_ACTIVE_COUNT_OFFSET, expActiveSize, &cerr))
+            return SetError(error, "tip header count repair failed: " + cerr);
+    }
+
     // 6. Rebuild hashToId.
     i->hashToId.clear();
     for (size_t j = 0; j < records.size(); ++j)
@@ -795,24 +935,60 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         return BLOCK_INDEX_TIP_OK; // all duplicates: no-op
     }
 
-    // 1. Persist stores (full commit-write of the extended committed region).
-    //    tip.meta remains the commit point; if a later write or the meta write
-    //    fails, the stores are ahead of tip.meta and Open truncates them back
-    //    to the committed tip (fail-safe, deterministic).
-    std::vector<BlockIndexRecord> allRecords = i->records;
-    allRecords.insert(allRecords.end(), newRecords.begin(), newRecords.end());
-    std::vector<BlockIndexDerivedEntry> allDerived = i->derived;
-    allDerived.insert(allDerived.end(), newDerived.begin(), newDerived.end());
-    std::vector<BlockIndexId> allActive = i->activeIds;
-    allActive.insert(allActive.end(), newActive.begin(), newActive.end());
+    // 1. Persist (R4 incremental): append ONLY the newly encoded entries to the
+    //    end of each mutable tail store instead of re-encoding + rewriting the
+    //    whole retained tail. tip.meta remains the commit point; the appended
+    //    bytes are an uncommitted suffix until it is written, and Open truncates
+    //    any suffix beyond tip.meta's counts (fail-safe, deterministic).
+    std::vector<unsigned char> recBytes, derBytes, actBytes;
+    for (size_t k = 0; k < newRecords.size(); ++k)
+    {
+        std::vector<unsigned char> enc;
+        if (!EncodeBlockIndexRecordV1(newRecords[k], &enc, NULL))
+            return SetError(error, "encode tip-records entry failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        recBytes.insert(recBytes.end(), enc.begin(), enc.end());
+    }
+    for (size_t k = 0; k < newDerived.size(); ++k)
+    {
+        std::vector<unsigned char> enc;
+        if (!EncodeBlockIndexDerivedEntry(newDerived[k], &enc, NULL))
+            return SetError(error, "encode tip-derived entry failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        derBytes.insert(derBytes.end(), enc.begin(), enc.end());
+    }
+    for (size_t k = 0; k < newActive.size(); ++k)
+    {
+        std::string enc;
+        if (!EncodeBlockIndexActiveEntry(newActive[k], &enc, NULL))
+            return SetError(error, "encode tip-active entry failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        actBytes.insert(actBytes.end(), enc.begin(), enc.end());
+    }
 
+    const uint64_t committedRecords = i->records.size();
+    const uint64_t committedDerived = i->derived.size();
+    const uint64_t committedActive = i->activeIds.size();
     std::string werr;
-    if (!WriteRecordsFile(i->recordsPath, allRecords, &werr))
+    // Drop any stale uncommitted suffix first so the new bytes land exactly at the
+    // committed boundary (idempotent; no-op after a clean shutdown).
+    if (!TruncateStoreToCommitted(i->recordsPath, BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE,
+                                  BLOCK_INDEX_RECORD_SIZE_V1, committedRecords, &werr) ||
+        !TruncateStoreToCommitted(i->derivedPath, BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE,
+                                  BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, committedDerived, &werr) ||
+        !TruncateStoreToCommitted(i->activePath, BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE,
+                                  BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, committedActive, &werr))
+        return SetError(error, "append tip truncate failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!AppendBytesDurable(i->recordsPath, recBytes, &werr))
         return SetError(error, "append tip-records failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!WriteDerivedFile(i->derivedPath, allDerived, &werr))
+    if (!AppendBytesDurable(i->derivedPath, derBytes, &werr))
         return SetError(error, "append tip-derived failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!WriteActiveFile(i->activePath, allActive, &werr))
+    if (!AppendBytesDurable(i->activePath, actBytes, &werr))
         return SetError(error, "append tip-active failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!UpdateStoreCount(i->recordsPath, BLOCK_INDEX_TIP_RECORDS_COUNT_OFFSET,
+                          committedRecords + newRecords.size(), &werr) ||
+        !UpdateStoreCount(i->derivedPath, BLOCK_INDEX_TIP_DERIVED_COUNT_OFFSET,
+                          committedDerived + newDerived.size(), &werr) ||
+        !UpdateStoreCount(i->activePath, BLOCK_INDEX_TIP_ACTIVE_COUNT_OFFSET,
+                          committedActive + newActive.size(), &werr))
+        return SetError(error, "append tip count update failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
     // v2: keep the store set complete and upgrade an opened v1 tip
     // deterministically on the first legitimate new commit.
     if (!WriteInvalidFile(i->invalidPath, i->invalidEntries, &werr))
@@ -825,46 +1001,54 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     // 2. Advance tip.meta.
     BlockIndexTipMeta newMeta = i->meta;
     newMeta.version = BLOCK_INDEX_TIP_META_VERSION; // v1 -> v2 upgrade on write
-    newMeta.tipRecordCount = allRecords.size();
-    if (!allActive.empty())
-    {
-        // activeIds is dense RELATIVE to baseTipHeight: allActive.size() entries
-        // cover global heights [baseTipHeight+1, baseTipHeight+allActive.size()].
-        newMeta.tipHeight = i->meta.baseTipHeight + (int32_t)allActive.size();
-        BlockIndexId tipId = allActive.back();
-        for (size_t j = 0; j < allRecords.size(); ++j)
-            if (i->baseLocalToId(j) == tipId)
-                newMeta.tipHash = allRecords[j].hash;
-    }
-    else
+    newMeta.tipRecordCount = committedRecords + newRecords.size();
+    const uint64_t totalActive = committedActive + newActive.size();
+    if (totalActive == 0)
     {
         newMeta.tipHeight = i->meta.baseTipHeight; // no tip active blocks yet
         newMeta.tipHash = uint256(0);
     }
-    ComputeContentDigest(newMeta, allRecords, allDerived, allActive, newMeta.contentDigest);
+    else if (!newActive.empty())
+    {
+        // activeIds is dense RELATIVE to baseTipHeight: the committed append
+        // extends it to (committedActive + newActive.size()) entries covering
+        // global heights [baseTipHeight+1, baseTipHeight + that count].
+        newMeta.tipHeight = i->meta.baseTipHeight + (int32_t)totalActive;
+        // Resolve the tip hash by slot arithmetic over the appended window only.
+        const BlockIndexId tipId = newActive.back();
+        const BlockIndexId firstNew = i->baseLocalToId(committedRecords);
+        if (tipId < firstNew || (size_t)(tipId - firstNew) >= newRecords.size())
+            return SetError(error, "tip id outside appended window"), BLOCK_INDEX_TIP_CORRUPT;
+        newMeta.tipHash = newRecords[(size_t)(tipId - firstNew)].hash;
+    }
+    else
+    {
+        // Side-only append: the ACTIVE tip is unchanged (newMeta already holds
+        // the committed tip height/hash).
+        newMeta.tipHeight = i->meta.tipHeight;
+        newMeta.tipHash = i->meta.tipHash;
+    }
 
-    // 3. Commit point: write tip.meta. On failure restore the in-memory
-    //    committed state so it matches disk (a failed commit must never leave
-    //    the in-memory authority ahead of the last committed tip.meta).
+    // 3. Commit: mutate the in-memory state INCREMENTALLY (O(new)), compute the
+    //    content digest, then publish tip.meta. A failed commit rolls the
+    //    in-memory append back so authority never runs ahead of the last
+    //    committed tip.meta (the appended disk suffix stays uncommitted).
     const BlockIndexTipMeta savedMeta = i->meta;
-    const std::vector<BlockIndexRecord> savedRecords = i->records;
-    const std::vector<BlockIndexDerivedEntry> savedDerived = i->derived;
-    const std::vector<BlockIndexId> savedActive = i->activeIds;
-    i->meta = newMeta;
-    i->records = allRecords;
-    i->derived = allDerived;
-    i->activeIds = allActive;
+    i->records.insert(i->records.end(), newRecords.begin(), newRecords.end());
+    i->derived.insert(i->derived.end(), newDerived.begin(), newDerived.end());
+    i->activeIds.insert(i->activeIds.end(), newActive.begin(), newActive.end());
     for (size_t k = 0; k < newRecords.size(); ++k)
-        i->hashToId[newRecords[k].hash] = i->baseLocalToId(i->records.size() - newRecords.size() + k);
+        i->hashToId[newRecords[k].hash] = i->baseLocalToId(committedRecords + k);
+    ComputeContentDigest(newMeta, i->records, i->derived, i->activeIds, newMeta.contentDigest);
+    i->meta = newMeta;
     if (!i->WriteMeta(error))
     {
         i->meta = savedMeta;
-        i->records = savedRecords;
-        i->derived = savedDerived;
-        i->activeIds = savedActive;
-        i->hashToId.clear();
-        for (size_t j = 0; j < i->records.size(); ++j)
-            i->hashToId[i->records[j].hash] = i->baseLocalToId(j);
+        i->records.resize(committedRecords);
+        i->derived.resize(committedDerived);
+        i->activeIds.resize(committedActive);
+        for (size_t k = 0; k < newRecords.size(); ++k)
+            i->hashToId.erase(newRecords[k].hash);
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
     ClearError(error);

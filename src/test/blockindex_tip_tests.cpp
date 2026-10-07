@@ -451,6 +451,159 @@ BOOST_AUTO_TEST_CASE(t10b_hash_lookup_slot_equiv)
 }
 
 // =====================================================================
+// R4 — incremental (append-only) tail persistence.
+// =====================================================================
+
+// R4-1: a normal append must write O(new) bytes: the tail-store growth per
+// append is exactly the encoded entry sizes and does NOT scale with the
+// retained tail size.
+BOOST_AUTO_TEST_CASE(r4_incremental_append_writes_constant_bytes)
+{
+    const uint64_t REC = 228, DER = 56, ACT = 8;      // entry sizes
+    const uint64_t HREC = 48, HDER = 72, HACT = 44;   // header sizes
+    const size_t tails[3] = {16, 256, 2048};
+    for (int t = 0; t < 3; ++t)
+    {
+        const std::string dir = MakeTempDir();
+        const int baseTip = 1000 + t * 10;
+        const size_t n = tails[t];
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 7, 1000, baseTip, &tip, NULL));
+        uint256 tipHash;
+        BuildChain(tip, (uint32_t)n, &tipHash, uint256(0x7000UL + (unsigned long)(t + 1)), baseTip);
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), n);
+        const fs::path rp = fs::path(dir) / "blockindex_tip" / "tip-records.dat";
+        const fs::path dp = fs::path(dir) / "blockindex_tip" / "tip-derived.dat";
+        const fs::path ap = fs::path(dir) / "blockindex_tip" / "tip-active.dat";
+        const uint64_t r0 = fs::file_size(rp), d0 = fs::file_size(dp), a0 = fs::file_size(ap);
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(uint256(0x8000UL + (unsigned long)(t + 1)), tipHash, baseTip + (int)n + 1, true);
+        a.derived = MakeDerived(uint256(5), 500);
+        std::string err;
+        BOOST_REQUIRE(tip.Append(a, baseTip + (int)n + 1, &err) == BLOCK_INDEX_TIP_OK);
+        const uint64_t r1 = fs::file_size(rp), d1 = fs::file_size(dp), a1 = fs::file_size(ap);
+        BOOST_CHECK_MESSAGE(r1 - r0 == REC,
+            "records growth must be exactly one entry at tail " << n << " (got " << (r1 - r0) << ")");
+        BOOST_CHECK_MESSAGE(d1 - d0 == DER,
+            "derived growth must be exactly one entry at tail " << n << " (got " << (d1 - d0) << ")");
+        BOOST_CHECK_MESSAGE(a1 - a0 == ACT,
+            "active growth must be exactly one entry at tail " << n << " (got " << (a1 - a0) << ")");
+        // Absolute file size == header + committed entries: no tail re-encoding.
+        BOOST_CHECK_EQUAL(r1, HREC + (n + 1) * REC);
+        BOOST_CHECK_EQUAL(d1, HDER + (n + 1) * DER);
+        BOOST_CHECK_EQUAL(a1, HACT + (n + 1) * ACT);
+        printf("R4-1 tail=%zu bytes/append: rec=%llu der=%llu act=%llu (O(new), not O(tail))\n",
+               n, (unsigned long long)(r1 - r0), (unsigned long long)(d1 - d0),
+               (unsigned long long)(a1 - a0));
+        tip.Close();
+    }
+}
+
+// R4-2: crash-before-meta leaves an uncommitted suffix on disk. The NEXT append
+// (no reopen) must truncate that residue so the new record lands exactly at the
+// committed boundary, and a restart must recover the exact committed state.
+BOOST_AUTO_TEST_CASE(r4_uncommitted_suffix_then_append_is_exact)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 2000;
+    uint256 tipHash;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 31, 700, baseTip, &tip, NULL));
+        BuildChain(tip, 2, &tipHash, uint256(0x2000UL), baseTip); // 2001, 2002
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 2u);
+        // Append #3 aborts after the stores are durable but before tip.meta.
+        BlockIndexTipSetFailpointForTesting("FP_AFTER_TAIL_DURABLE_BEFORE_META", true);
+        BlockIndexTipAppend a3;
+        a3.record = MakeRecord(uint256(0x3333UL), tipHash, baseTip + 3, true);
+        a3.derived = MakeDerived(uint256(9), 3003);
+        std::string err;
+        BOOST_REQUIRE(tip.Append(a3, baseTip + 3, &err) == BLOCK_INDEX_TIP_IO_ERROR);
+        BlockIndexTipSetFailpointForTesting("FP_AFTER_TAIL_DURABLE_BEFORE_META", false);
+        // In-memory authority must NOT be ahead of the committed tip.meta.
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 2u);
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 2);
+        // Next append must discard the residue and commit exactly one record.
+        BlockIndexTipAppend a4;
+        a4.record = MakeRecord(uint256(0x4444UL), tipHash, baseTip + 3, true);
+        a4.derived = MakeDerived(uint256(10), 4004);
+        BOOST_REQUIRE(tip.Append(a4, baseTip + 3, &err) == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 3u);
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 3);
+        BOOST_REQUIRE(tip.TipHash() == uint256(0x4444UL));
+        BOOST_REQUIRE(tip.LookupByHash(uint256(0x3333UL), NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
+        BOOST_REQUIRE(tip.LookupByHash(uint256(0x4444UL), NULL).record.hash == uint256(0x4444UL));
+        tip.Close();
+    }
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 31, &tip, NULL));
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 3u);
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 3);
+        BOOST_REQUIRE(tip.TipHash() == uint256(0x4444UL));
+        BOOST_REQUIRE(tip.LookupByHash(uint256(0x3333UL), NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
+        BlockIndexTipRead h = tip.LookupActiveByHeight(baseTip + 3, NULL);
+        BOOST_REQUIRE(h.status == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE(h.record.hash == uint256(0x4444UL));
+        printf("R4-2 PASS uncommitted suffix truncated by next append; restart exact\n");
+    }
+}
+
+// R4-3: a mixed AppendBatch (2 chained ACTIVE + 1 side fork) round-trips and is
+// recovered exactly after restart.
+BOOST_AUTO_TEST_CASE(r4_batch_mixed_records_roundtrip)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 3000;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        BlockIndexTipAuthority tip;
+        if (pass == 0)
+            BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 32, 700, baseTip, &tip, NULL));
+        else
+            BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 32, &tip, NULL));
+        if (pass == 0)
+        {
+            std::vector<BlockIndexTipAppend> blocks;
+            std::vector<int32_t> hs;
+            BlockIndexTipAppend b1;
+            b1.record = MakeRecord(uint256(0x4001UL), uint256(0x3000UL), baseTip + 1, true);
+            b1.derived = MakeDerived(uint256(1), 7001);
+            BlockIndexTipAppend b2; // side fork off 0x4001 at height baseTip+2
+            b2.record = MakeRecord(uint256(0x4002UL), uint256(0x4001UL), baseTip + 2, false);
+            b2.derived = MakeDerived(uint256(2), 7002);
+            BlockIndexTipAppend b3; // second side fork off 0x4001
+            b3.record = MakeRecord(uint256(0x4003UL), uint256(0x4001UL), baseTip + 2, false);
+            b3.derived = MakeDerived(uint256(3), 7003);
+            // One ACTIVE record per batch (the density rule ties the next active
+            // height to the committed tip); the side records ride along.
+            blocks.push_back(b1); hs.push_back(baseTip + 1);
+            blocks.push_back(b2); hs.push_back(-1);
+            blocks.push_back(b3); hs.push_back(-1);
+            std::string err;
+            BOOST_REQUIRE(tip.AppendBatch(blocks, hs, &err) == BLOCK_INDEX_TIP_OK);
+            tip.Close();
+            continue;
+        }
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 3u);
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 1);
+        BOOST_REQUIRE(tip.TipHash() == uint256(0x4001UL));
+        BOOST_REQUIRE(tip.LookupByHash(uint256(0x4001UL), NULL).active);
+        BlockIndexTipRead s2 = tip.LookupByHash(uint256(0x4002UL), NULL);
+        BOOST_REQUIRE(s2.status == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE(!s2.active);
+        BlockIndexTipRead s3 = tip.LookupByHash(uint256(0x4003UL), NULL);
+        BOOST_REQUIRE(s3.status == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE(!s3.active);
+        BlockIndexTipRead h = tip.LookupActiveByHeight(baseTip + 1, NULL);
+        BOOST_REQUIRE(h.status == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE(h.record.hash == uint256(0x4001UL));
+        printf("R4-3 PASS mixed batch round-trip (pass=%d)\n", pass);
+        tip.Close();
+    }
+}
+
+// =====================================================================
 // R2B — durable operator-invalid authority (v2 mutable protocol).
 //   T11 invalidate persists across reopen
 //   T12 reconsider clears + persists
