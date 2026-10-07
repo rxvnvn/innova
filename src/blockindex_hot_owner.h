@@ -211,6 +211,10 @@ public:
     // --- counts / metrics ---
     size_t ResidentCount() const;
     size_t PinCount() const;
+    /** OBSERVABILITY/TEST: number of entries currently tracked in the resident
+     *  map (materialized + pinned + anchors + in-flight). Proves that eviction
+     *  DROPS entries so the map stays bounded, rather than growing O(history). */
+    size_t EntryCount() const;
     BlockIndexHotMetrics Metrics() const;
 
     /** Mark a logical hash as a required anchor (never evictable). */

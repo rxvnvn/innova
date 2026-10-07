@@ -440,6 +440,16 @@ BlockIndexHotStatus BlockIndexHotOwner::EvictResident(const BlockIndexLogicalId&
     e.pending = false;
     if (metrics.residentCount > 0) --metrics.residentCount;
     ++metrics.evictions;
+    // A.10.1d-performance repair #1: DROP the resident entry entirely instead of
+    // retaining a permanently non-materialized placeholder. A retained
+    // placeholder made `resident` grow ~= chain height, while
+    // BlockIndexLiveTail::TrimToHorizon() -> EvictEligible() (called once per
+    // accepted block) iterated the WHOLE map => O(history) scan per block.
+    // An evicted id remains fully re-materializable: a later Pin()/EnsureResident()
+    // re-inserts the entry via RequestMaterializationLocked() and re-materializes
+    // it from authority, yielding the SAME typed states a placeholder did
+    // (IsResident/GetResidentRaw -> absent => NOT_RESIDENT/NULL; Pin -> PENDING->OK).
+    resident.erase(it);
     return BlockIndexHotStatus::OK;
 }
 
@@ -459,6 +469,12 @@ size_t BlockIndexHotOwner::PinCount() const
     for (const auto& kv : resident)
         n += (size_t)kv.second.pins;
     return n;
+}
+
+size_t BlockIndexHotOwner::EntryCount() const
+{
+    LOCK(cs);
+    return (size_t)resident.size();
 }
 
 CBlockIndex* BlockIndexHotOwner::GetResidentRaw(const uint256& hash) const

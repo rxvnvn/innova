@@ -768,4 +768,46 @@ BOOST_AUTO_TEST_CASE(c7_raw_pointer_valid_under_pin)
     h.Reset();
 }
 
+// --- H-EVICT-DROP (A.10.1d perf repair #1): eviction DROPS the entry --------
+// Regression: `resident` must NOT retain a per-evicted-block placeholder, else
+// EvictEligible() (called once per accepted block via TrimToHorizon) scans
+// O(history). Materialize many distinct blocks, release pins, evict each, then
+// assert the entry count returns to 0 and an evicted id is re-materializable.
+BOOST_AUTO_TEST_CASE(h_evict_drops_entry_and_is_rematerializable)
+{
+    SnapshotHotMaterializer mat;
+    const int K = 64;
+    for (int i = 1; i <= K; ++i)
+        mat.Add(hs(i), hs(i - 1), uint256(i), i);
+
+    BlockIndexHotOwner owner;
+    owner.SetMaterializer(&mat);
+
+    for (int i = 1; i <= K; ++i)
+    {
+        BlockIndexHotHandle h;
+        BOOST_REQUIRE(owner.Pin(BlockIndexLogicalId(hs(i)), &h) == BlockIndexHotStatus::OK);
+        h.Reset(); // release -> evictable
+    }
+    BOOST_CHECK_EQUAL(owner.EntryCount(), (size_t)K);   // all tracked
+    BOOST_CHECK_EQUAL(owner.ResidentCount(), (size_t)K);
+
+    // Evict every block: each eviction must DROP its entry (pre-fix it lingered
+    // forever as materialized=false, growing the map ~= history).
+    int evicted = 0;
+    for (int i = 1; i <= K; ++i)
+        if (owner.EvictResident(BlockIndexLogicalId(hs(i))) == BlockIndexHotStatus::OK)
+            ++evicted;
+    BOOST_CHECK_EQUAL(evicted, K);
+    BOOST_CHECK_EQUAL(owner.EntryCount(), (size_t)0);    // <-- the repair
+    BOOST_CHECK_EQUAL(owner.ResidentCount(), (size_t)0);
+
+    // An evicted id must stay fully re-materializable with identical metadata.
+    BlockIndexHotHandle h2;
+    BOOST_REQUIRE(owner.Pin(BlockIndexLogicalId(hs(7)), &h2) == BlockIndexHotStatus::OK);
+    BOOST_REQUIRE(h2.Get() != NULL);
+    BOOST_CHECK(h2.Get()->nHeight == 7);
+    BOOST_CHECK_EQUAL(owner.EntryCount(), (size_t)1);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
