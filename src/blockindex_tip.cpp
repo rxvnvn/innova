@@ -128,7 +128,8 @@ static bool DecodeTipMeta(const char* data, size_t size, BlockIndexTipMeta* out)
         m.invalidLogCount = 0;
         memset(m.invalidDigest, 0, 32);
     }
-    else if (m.version == BLOCK_INDEX_TIP_META_VERSION)
+    else if (m.version == BLOCK_INDEX_TIP_META_VERSION ||
+             m.version == BLOCK_INDEX_TIP_META_VERSION_V3)
     {
         if (size < 140)
             return false;
@@ -143,6 +144,34 @@ static bool DecodeTipMeta(const char* data, size_t size, BlockIndexTipMeta* out)
     return true;
 }
 
+// ---- shared digest byte emissions (single source of truth for v2 AND v3) ----
+// Records: hash(32) || hashPrev(32) || height(4 LE).  Derived: chainTrust(32) ||
+// stakeModifierChecksum(4 LE).  Active: RecordId(8 LE). Byte-for-byte identical
+// to the original inline v2 emissions -- the v2 digest value is unchanged.
+static size_t EncodeRecordDigestBytes(const BlockIndexRecord& r, unsigned char* out)
+{
+    memcpy(out, r.hash.begin(), 32);
+    memcpy(out + 32, r.hashPrev.begin(), 32);
+    for (int j = 0; j < 4; ++j)
+        out[64 + j] = (unsigned char)((r.height >> (8 * j)) & 0xff);
+    return 68;
+}
+
+static size_t EncodeDerivedDigestBytes(const BlockIndexDerivedEntry& d, unsigned char* out)
+{
+    memcpy(out, d.chainTrust.begin(), 32);
+    for (int j = 0; j < 4; ++j)
+        out[32 + j] = (unsigned char)((d.stakeModifierChecksum >> (8 * j)) & 0xff);
+    return 36;
+}
+
+static void EncodeActiveDigestBytes(BlockIndexId id, unsigned char* out)
+{
+    for (int j = 0; j < 8; ++j)
+        out[j] = (unsigned char)((id >> (8 * j)) & 0xff);
+}
+
+// v2 streaming digest: SHA256( R_all || D_all || A_all || fence ). UNCHANGED.
 static void ComputeContentDigest(const BlockIndexTipMeta& meta,
                                  const std::vector<BlockIndexRecord>& records,
                                  const std::vector<BlockIndexDerivedEntry>& derived,
@@ -151,37 +180,58 @@ static void ComputeContentDigest(const BlockIndexTipMeta& meta,
 {
     SHA256_CTX ctx;
     SHA256_Init(&ctx);
+    unsigned char buf[68];
     for (size_t i = 0; i < records.size(); ++i)
     {
-        const BlockIndexRecord& r = records[i];
-        SHA256_Update(&ctx, r.hash.begin(), 32);
-        SHA256_Update(&ctx, r.hashPrev.begin(), 32);
-        for (int j = 0; j < 4; ++j)
-        {
-            unsigned char b = (unsigned char)((r.height >> (8 * j)) & 0xff);
-            SHA256_Update(&ctx, &b, 1);
-        }
+        size_t n = EncodeRecordDigestBytes(records[i], buf);
+        SHA256_Update(&ctx, buf, n);
     }
     for (size_t i = 0; i < derived.size(); ++i)
     {
-        const BlockIndexDerivedEntry& d = derived[i];
-        SHA256_Update(&ctx, d.chainTrust.begin(), 32);
-        for (int j = 0; j < 4; ++j)
-        {
-            unsigned char b = (unsigned char)((d.stakeModifierChecksum >> (8 * j)) & 0xff);
-            SHA256_Update(&ctx, &b, 1);
-        }
+        size_t n = EncodeDerivedDigestBytes(derived[i], buf);
+        SHA256_Update(&ctx, buf, n);
     }
     for (size_t i = 0; i < activeIds.size(); ++i)
     {
-        for (int j = 0; j < 8; ++j)
-        {
-            unsigned char b = (unsigned char)((activeIds[i] >> (8 * j)) & 0xff);
-            SHA256_Update(&ctx, &b, 1);
-        }
+        EncodeActiveDigestBytes(activeIds[i], buf);
+        SHA256_Update(&ctx, buf, 8);
     }
     SHA256_Update(&ctx, &meta.activeFence, 1);
     SHA256_Final(digest, &ctx);
+}
+
+// ---- v3 chained append accumulator (Repair #2) ----------------------------
+static const char BLOCK_INDEX_TIP_V3_DOMAIN_R[] = "INNOVA-TIP-DIGEST-V3/R";
+static const char BLOCK_INDEX_TIP_V3_DOMAIN_D[] = "INNOVA-TIP-DIGEST-V3/D";
+static const char BLOCK_INDEX_TIP_V3_DOMAIN_A[] = "INNOVA-TIP-DIGEST-V3/A";
+
+static void DigestChainInit(unsigned char out[32], const char* domain)
+{
+    SHA256_CTX c;
+    SHA256_Init(&c);
+    SHA256_Update(&c, domain, strlen(domain));
+    SHA256_Final(out, &c);
+}
+
+static void DigestChainExtend(unsigned char state[32], const unsigned char* data, size_t n)
+{
+    SHA256_CTX c;
+    SHA256_Init(&c);
+    SHA256_Update(&c, state, 32);
+    SHA256_Update(&c, data, n);
+    SHA256_Final(state, &c);   // chain := SHA256(prev || element bytes)
+}
+
+static void DigestV3Finalize(const unsigned char R[32], const unsigned char D[32],
+                             const unsigned char A[32], uint8_t fence, unsigned char out[32])
+{
+    SHA256_CTX c;
+    SHA256_Init(&c);
+    SHA256_Update(&c, R, 32);
+    SHA256_Update(&c, D, 32);
+    SHA256_Update(&c, A, 32);
+    SHA256_Update(&c, &fence, 1);
+    SHA256_Final(out, &c);
 }
 
 // ---- v2 operator-invalid log ----
@@ -580,7 +630,37 @@ struct BlockIndexTipAuthority::Impl
 
     bool open;
 
-    Impl() : open(false) {}
+    // Repair #2: v3 chained digest state. RAM-ONLY, never persisted, never an
+    // independent authority -- rebuilt at Open and on any non-append mutation.
+    unsigned char chainR[32];
+    unsigned char chainD[32];
+    unsigned char chainA[32];
+    bool chainsValid;
+
+    Impl() : open(false), chainsValid(false) {}
+
+    // Rebuild the three index-order chains from a committed vector set.
+    void BuildChainsFor(const std::vector<BlockIndexRecord>& recs,
+                        const std::vector<BlockIndexDerivedEntry>& ders,
+                        const std::vector<BlockIndexId>& acts)
+    {
+        unsigned char b[68];
+        DigestChainInit(chainR, BLOCK_INDEX_TIP_V3_DOMAIN_R);
+        for (size_t j = 0; j < recs.size(); ++j)
+        { size_t n = EncodeRecordDigestBytes(recs[j], b); DigestChainExtend(chainR, b, n); }
+        DigestChainInit(chainD, BLOCK_INDEX_TIP_V3_DOMAIN_D);
+        for (size_t j = 0; j < ders.size(); ++j)
+        { size_t n = EncodeDerivedDigestBytes(ders[j], b); DigestChainExtend(chainD, b, n); }
+        DigestChainInit(chainA, BLOCK_INDEX_TIP_V3_DOMAIN_A);
+        for (size_t j = 0; j < acts.size(); ++j)
+        { EncodeActiveDigestBytes(acts[j], b); DigestChainExtend(chainA, b, 8); }
+        chainsValid = true;
+    }
+    void EnsureChains()
+    {
+        if (!chainsValid)
+            BuildChainsFor(records, derived, activeIds);
+    }
 
     bool InitializePaths(const std::string& rootIn)
     {
@@ -836,10 +916,22 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
     for (size_t j = 0; j < records.size(); ++j)
         i->hashToId[records[j].hash] = i->baseLocalToId(j);
 
-    // 7. Validate content digest. On mismatch: if we repaired, rewrite stores +
-    //    meta to the committed state; if not repaired it indicates corruption.
+    // 7. Validate content digest. v3 metas use the chained accumulator; v1/v2
+    //    metas use the UNCHANGED streaming digest. On mismatch: if we repaired
+    //    an uncommitted tail, rewrite stores + recompute; otherwise corruption.
+    const bool metaIsV3 = (meta.version == BLOCK_INDEX_TIP_META_VERSION_V3);
     unsigned char digest[32];
-    ComputeContentDigest(meta, records, derived, activeIds, digest);
+    if (metaIsV3)
+    {
+        // One O(N) pass -- also leaves the RAM chains built so the first
+        // subsequent commit can extend them in O(new).
+        i->BuildChainsFor(records, derived, activeIds);
+        DigestV3Finalize(i->chainR, i->chainD, i->chainA, meta.activeFence, digest);
+    }
+    else
+    {
+        ComputeContentDigest(meta, records, derived, activeIds, digest);
+    }
     if (memcmp(digest, meta.contentDigest, 32) != 0)
     {
         if (!repaired)
@@ -853,6 +945,11 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
             return SetError(error, "repair tip-derived failed");
         i->meta.contentDigest[0] = 0;
     }
+
+    // For a non-v3 meta, the RAM chains are not yet built; build lazily on the
+    // first commit (EnsureChains) so an ordinary Open stays O(N)-once.
+    if (!metaIsV3)
+        i->chainsValid = false;
 
     // 8. v2: load + validate the committed operator-invalid log. tip.meta's
     //    invalidLogCount is the commit point for the log, exactly as
@@ -1000,7 +1097,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
 
     // 2. Advance tip.meta.
     BlockIndexTipMeta newMeta = i->meta;
-    newMeta.version = BLOCK_INDEX_TIP_META_VERSION; // v1 -> v2 upgrade on write
+    newMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3; // upgrade to v3 on write
     newMeta.tipRecordCount = committedRecords + newRecords.size();
     const uint64_t totalActive = committedActive + newActive.size();
     if (totalActive == 0)
@@ -1029,17 +1126,29 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         newMeta.tipHash = i->meta.tipHash;
     }
 
-    // 3. Commit: mutate the in-memory state INCREMENTALLY (O(new)), compute the
-    //    content digest, then publish tip.meta. A failed commit rolls the
-    //    in-memory append back so authority never runs ahead of the last
-    //    committed tip.meta (the appended disk suffix stays uncommitted).
+    // 3. Commit: mutate the in-memory state INCREMENTALLY (O(new)), extend the
+    //    v3 digest chains by ONLY the new entries (O(new)), then publish
+    //    tip.meta. A failed commit rolls the in-memory append AND the chains
+    //    back so authority never runs ahead of the last committed tip.meta.
+    i->EnsureChains();
     const BlockIndexTipMeta savedMeta = i->meta;
+    unsigned char savedR[32], savedD[32], savedA[32];
+    memcpy(savedR, i->chainR, 32); memcpy(savedD, i->chainD, 32); memcpy(savedA, i->chainA, 32);
     i->records.insert(i->records.end(), newRecords.begin(), newRecords.end());
     i->derived.insert(i->derived.end(), newDerived.begin(), newDerived.end());
     i->activeIds.insert(i->activeIds.end(), newActive.begin(), newActive.end());
     for (size_t k = 0; k < newRecords.size(); ++k)
         i->hashToId[newRecords[k].hash] = i->baseLocalToId(committedRecords + k);
-    ComputeContentDigest(newMeta, i->records, i->derived, i->activeIds, newMeta.contentDigest);
+    {
+        unsigned char b[68];
+        for (size_t k = 0; k < newRecords.size(); ++k)
+        { size_t n = EncodeRecordDigestBytes(newRecords[k], b); DigestChainExtend(i->chainR, b, n); }
+        for (size_t k = 0; k < newDerived.size(); ++k)
+        { size_t n = EncodeDerivedDigestBytes(newDerived[k], b); DigestChainExtend(i->chainD, b, n); }
+        for (size_t k = 0; k < newActive.size(); ++k)
+        { EncodeActiveDigestBytes(newActive[k], b); DigestChainExtend(i->chainA, b, 8); }
+        DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
+    }
     i->meta = newMeta;
     if (!i->WriteMeta(error))
     {
@@ -1049,6 +1158,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         i->activeIds.resize(committedActive);
         for (size_t k = 0; k < newRecords.size(); ++k)
             i->hashToId.erase(newRecords[k].hash);
+        memcpy(i->chainR, savedR, 32); memcpy(i->chainD, savedD, 32); memcpy(i->chainA, savedA, 32);
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
     ClearError(error);
@@ -1079,6 +1189,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
         return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
 
     BlockIndexTipMeta newMeta = i->meta;
+    newMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
     newMeta.activeFence++;
     newMeta.tipHeight = height;
     if (allActive.empty())
@@ -1090,7 +1201,9 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
             if (i->baseLocalToId(j) == tipId)
                 newMeta.tipHash = i->records[j].hash;
     }
-    ComputeContentDigest(newMeta, i->records, i->derived, allActive, newMeta.contentDigest);
+    // Non-append mutation: REBUILD the v3 chains from the resulting vectors.
+    i->BuildChainsFor(i->records, i->derived, allActive);
+    DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
 
     const BlockIndexTipMeta savedMeta = i->meta;
     const std::vector<BlockIndexId> savedActive = i->activeIds;
@@ -1100,6 +1213,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
     {
         i->meta = savedMeta;
         i->activeIds = savedActive;
+        i->chainsValid = false;
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
     ClearError(error);
@@ -1199,6 +1313,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
 
     // 4. Advance tip.meta (dense tipHeight + tipHash), rebuild hashToId.
     BlockIndexTipMeta newMeta = i->meta;
+    newMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
     newMeta.activeFence++;
     newMeta.tipRecordCount = allRecords.size();
     newMeta.tipHeight = baseTip + (int32_t)allActive.size();
@@ -1210,7 +1325,9 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
         for (size_t j = 0; j < allRecords.size(); ++j)
             if (i->baseLocalToId(j) == tipId) newMeta.tipHash = allRecords[j].hash;
     }
-    ComputeContentDigest(newMeta, allRecords, allDerived, allActive, newMeta.contentDigest);
+    // Non-append mutation: REBUILD the v3 chains from the resulting vectors.
+    i->BuildChainsFor(allRecords, allDerived, allActive);
+    DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
     // Commit point: adopt the new meta BEFORE writing it, exactly as
     // AppendBatch/TruncateActiveTo do. Writing meta while i->meta still holds the
     // pre-reorg state would commit the NEW stores (records/derived/active) against
@@ -1235,6 +1352,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
         i->hashToId.clear();
         for (size_t j = 0; j < i->records.size(); ++j)
             i->hashToId[i->records[j].hash] = i->baseLocalToId(j);
+        i->chainsValid = false;
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
     i->records = allRecords;
@@ -1326,7 +1444,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
     const std::vector<BlockIndexTipInvalidEntry> savedEntries = i->invalidEntries;
 
     BlockIndexTipMeta newMeta = i->meta;
-    newMeta.version = BLOCK_INDEX_TIP_META_VERSION;
+    newMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
     newMeta.activeFence++;
     newMeta.tipRecordCount = allRecords.size();
     newMeta.tipHeight = baseTip + (int32_t)allActive.size();
@@ -1338,7 +1456,9 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
         for (size_t j = 0; j < allRecords.size(); ++j)
             if (i->baseLocalToId(j) == tipId) newMeta.tipHash = allRecords[j].hash;
     }
-    ComputeContentDigest(newMeta, allRecords, allDerived, allActive, newMeta.contentDigest);
+    // Non-append mutation: REBUILD the v3 chains from the resulting vectors.
+    i->BuildChainsFor(allRecords, allDerived, allActive);
+    DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
     newMeta.invalidLogCount = (uint32_t)allEntries.size();
     ComputeInvalidDigest(allEntries, newMeta.invalidDigest);
 
@@ -1686,7 +1806,13 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
     const BlockIndexTipMeta savedMeta = i->meta;
     const std::vector<BlockIndexTipInvalidEntry> savedEntries = i->invalidEntries;
     BlockIndexTipMeta newMeta = i->meta;
-    newMeta.version = BLOCK_INDEX_TIP_META_VERSION;
+    // An operator intent changes neither records/derived/active nor the fence, so
+    // the contentDigest is ALREADY correct for the current protocol version.
+    // Upgrade v1 -> v2 (same OLD digest flavour); keep a v3 tip as v3. This path
+    // must NOT switch the digest flavour, or a v2 tip relabelled/validated as the
+    // legacy layout would fail closed.
+    if (newMeta.version != BLOCK_INDEX_TIP_META_VERSION_V3)
+        newMeta.version = BLOCK_INDEX_TIP_META_VERSION;
     newMeta.invalidLogCount = (uint32_t)allEntries.size();
     ComputeInvalidDigest(allEntries, newMeta.invalidDigest);
 

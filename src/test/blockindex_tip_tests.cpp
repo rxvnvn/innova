@@ -7,6 +7,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <openssl/sha.h>
 #include <string>
 #include <vector>
 
@@ -1101,6 +1103,252 @@ BOOST_AUTO_TEST_CASE(n2_inconsistent_committed_record_fails_closed)
     BOOST_CHECK_MESSAGE(!ok, "N2: Open must FAIL CLOSED on an inconsistent committed post-S record");
     BOOST_CHECK(!err.empty());
     printf("N2 PASS inconsistent-committed-record -> fail closed (err=%s)\n", err.substr(0, 48).c_str());
+}
+
+// =====================================================================
+// Repair #2 (v3 chained digest) — Gate A regressions.
+// Independent ORACLE: recompute digest_v3 = SHA256(Rch||Dch||Ach||fence) over the
+// SAME committed vectors with OpenSSL, entirely outside blockindex_tip.cpp, and
+// compare against the PERSISTED tip.meta contentDigest. This proves live
+// incremental == independent rebuild, not merely that Open accepts its own value.
+// =====================================================================
+static void R2PutLE32(std::vector<unsigned char>& b, uint32_t v)
+{ for (int i = 0; i < 4; ++i) b.push_back((unsigned char)((v >> (8 * i)) & 0xff)); }
+static void R2PutLE64(std::vector<unsigned char>& b, uint64_t v)
+{ for (int i = 0; i < 8; ++i) b.push_back((unsigned char)((v >> (8 * i)) & 0xff)); }
+static void R2Sha(const std::vector<unsigned char>& in, unsigned char out[32])
+{ SHA256_CTX c; SHA256_Init(&c); if (!in.empty()) SHA256_Update(&c, &in[0], in.size()); SHA256_Final(out, &c); }
+static void R2ChainInit(unsigned char out[32], const char* dom)
+{ std::vector<unsigned char> b(dom, dom + strlen(dom)); R2Sha(b, out); }
+static void R2ChainExtend(unsigned char st[32], const std::vector<unsigned char>& e)
+{ std::vector<unsigned char> in(st, st + 32); in.insert(in.end(), e.begin(), e.end()); R2Sha(in, st); }
+
+static void OracleDigestV3(const std::vector<BlockIndexRecord>& recs,
+                           const std::vector<BlockIndexDerivedEntry>& ders,
+                           const std::vector<BlockIndexId>& acts,
+                           uint8_t fence, unsigned char out[32])
+{
+    unsigned char R[32], D[32], A[32];
+    R2ChainInit(R, "INNOVA-TIP-DIGEST-V3/R");
+    for (size_t i = 0; i < recs.size(); ++i)
+    {
+        std::vector<unsigned char> e(recs[i].hash.begin(), recs[i].hash.end());
+        e.insert(e.end(), recs[i].hashPrev.begin(), recs[i].hashPrev.end());
+        R2PutLE32(e, (uint32_t)recs[i].height);
+        R2ChainExtend(R, e);
+    }
+    R2ChainInit(D, "INNOVA-TIP-DIGEST-V3/D");
+    for (size_t i = 0; i < ders.size(); ++i)
+    {
+        std::vector<unsigned char> e(ders[i].chainTrust.begin(), ders[i].chainTrust.end());
+        R2PutLE32(e, ders[i].stakeModifierChecksum);
+        R2ChainExtend(D, e);
+    }
+    R2ChainInit(A, "INNOVA-TIP-DIGEST-V3/A");
+    for (size_t i = 0; i < acts.size(); ++i)
+    { std::vector<unsigned char> e; R2PutLE64(e, acts[i]); R2ChainExtend(A, e); }
+    std::vector<unsigned char> fin(R, R + 32);
+    fin.insert(fin.end(), D, D + 32);
+    fin.insert(fin.end(), A, A + 32);
+    fin.push_back(fence);
+    R2Sha(fin, out);
+}
+
+static void ReadMetaDigest(const std::string& dir, unsigned char out[32], uint32_t* ver)
+{
+    std::vector<unsigned char> m = ReadRawFile(dir + "/blockindex_tip/tip.meta");
+    BOOST_REQUIRE(m.size() >= 104);
+    if (ver) *ver = (uint32_t)m[0] | ((uint32_t)m[1] << 8) | ((uint32_t)m[2] << 16) | ((uint32_t)m[3] << 24);
+    memcpy(out, &m[72], 32);
+}
+
+// R2-A: ORACLE equivalence. Live incremental v3 digest == independent rebuild,
+// and the store reopens (Open rebuilds v3 independently and must validate).
+BOOST_AUTO_TEST_CASE(r2a_v3_oracle_matches_incremental_and_reopen)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 400; const uint64_t baseRec = 900; const uint32_t N = 7;
+    std::vector<BlockIndexRecord> recs; std::vector<BlockIndexDerivedEntry> ders;
+    std::vector<BlockIndexId> acts; uint256 prev(0xBEEFUL);
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 21, baseRec, baseTip, &tip, NULL));
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            uint256 h = uint256(0x1111UL + i);
+            BlockIndexRecord r = MakeRecord(h, prev, baseTip + 1 + (int)i, (i % 2) == 0);
+            BlockIndexDerivedEntry d = MakeDerived(uint256(i + 1), 1000 + i);
+            BlockIndexTipAppend a; a.record = r; a.derived = d;
+            BOOST_REQUIRE(tip.Append(a, baseTip + 1 + (int)i, NULL) == BLOCK_INDEX_TIP_OK);
+            recs.push_back(r); ders.push_back(d); acts.push_back(baseRec + i + 1);
+            prev = h;
+        }
+    }
+    unsigned char got[32]; uint32_t ver = 0; ReadMetaDigest(dir, got, &ver);
+    BOOST_REQUIRE_EQUAL(ver, 3u);
+    unsigned char want[32]; OracleDigestV3(recs, ders, acts, 0, want);
+    BOOST_CHECK_MESSAGE(memcmp(got, want, 32) == 0,
+                        "R2A: live incremental v3 digest MUST equal the independent oracle");
+    BlockIndexTipAuthority re;
+    BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 21, &re, NULL),
+                          "R2A: v3 store MUST reopen and validate");
+    BOOST_CHECK_EQUAL(re.TipHeight(), baseTip + (int)N);
+    printf("R2A PASS v3 oracle == incremental == reopen\n");
+}
+
+// R2-B: v2 -> v3 transition. Fresh store is v2; first commit upgrades to v3.
+BOOST_AUTO_TEST_CASE(r2b_v2_to_v3_transition)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 600;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 22, 500, baseTip, &tip, NULL));
+        unsigned char g[32]; uint32_t v = 0; ReadMetaDigest(dir, g, &v);
+        BOOST_CHECK_EQUAL(v, 2u); // created store is v2 (legacy digest)
+        uint256 fin; BuildChain(tip, 1, &fin, uint256(0xAAUL), baseTip);
+        ReadMetaDigest(dir, g, &v);
+        BOOST_CHECK_EQUAL(v, 3u); // first commit upgrades to v3
+    }
+    BlockIndexTipAuthority re;
+    BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 22, &re, NULL),
+                          "R2B: upgraded v3 store MUST reopen");
+    printf("R2B PASS v2->v3 transition\n");
+}
+
+// R2-C: restart equivalence across multiple append sessions. chainTrust must
+// keep INCREASING across the restart, or tip-selection treats the new blocks as
+// an inferior branch and the tip legitimately does not advance.
+BOOST_AUTO_TEST_CASE(r2c_v3_restart_accumulates)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 300;
+    uint256 prev, s1tip;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 23, 100, baseTip, &tip, NULL));
+        prev = tip.TipHash();
+        for (int i = 0; i < 5; ++i)
+        {
+            uint256 h = uint256(0x1000UL + i);
+            BlockIndexRecord r = MakeRecord(h, prev, baseTip + 1 + i, (i % 2) == 0);
+            BlockIndexDerivedEntry d = MakeDerived(uint256(i + 1), 1000 + i);
+            BlockIndexTipAppend a; a.record = r; a.derived = d;
+            BOOST_REQUIRE(tip.Append(a, baseTip + 1 + i, NULL) == BLOCK_INDEX_TIP_OK);
+            prev = h;
+        }
+        s1tip = prev;
+        BOOST_CHECK_EQUAL(tip.TipHeight(), baseTip + 5);
+    }
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 23, &tip, NULL));
+        BOOST_CHECK_EQUAL(tip.TipHeight(), baseTip + 5);
+        BOOST_CHECK(tip.TipHash() == s1tip);  // reopened tip identity preserved
+        for (int i = 0; i < 5; ++i)
+        {
+            uint256 h = uint256(0x2000UL + i);
+            BlockIndexRecord r = MakeRecord(h, prev, baseTip + 6 + i, (i % 2) == 0);
+            BlockIndexDerivedEntry d = MakeDerived(uint256(6 + i), 2000 + i); // trust continues UP
+            BlockIndexTipAppend a; a.record = r; a.derived = d;
+            BOOST_REQUIRE(tip.Append(a, baseTip + 6 + i, NULL) == BLOCK_INDEX_TIP_OK);
+            prev = h;
+        }
+        BOOST_CHECK_EQUAL(tip.TipHeight(), baseTip + 10);
+    }
+    { BlockIndexTipAuthority tip; BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 23, &tip, NULL));
+      BOOST_CHECK_EQUAL(tip.TipHeight(), baseTip + 10); }
+    printf("R2C PASS v3 restart accumulates\n");
+}
+
+// R2-D: side branch then reorg (truncate) -> v3 rebuild validates.
+BOOST_AUTO_TEST_CASE(r2d_v3_side_and_truncate)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 200;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 24, 50, baseTip, &tip, NULL));
+        uint256 fin; BuildChain(tip, 4, &fin, uint256(0x02UL), baseTip);
+        // side record (not active)
+        BlockIndexTipAppend s; s.record = MakeRecord(uint256(0x5EEDUL), fin, baseTip + 5, false);
+        s.derived = MakeDerived(uint256(99), 4242);
+        BOOST_REQUIRE(tip.Append(s, -1, NULL) == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE(tip.TruncateActiveTo(baseTip + 2, NULL) == BLOCK_INDEX_TIP_OK);
+    }
+    BlockIndexTipAuthority re;
+    BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 24, &re, NULL),
+                          "R2D: v3 side+truncate store MUST reopen");
+    printf("R2D PASS v3 side branch + truncate reopen\n");
+}
+
+// R2-E: v3 meta with a truncated body MUST fail closed (no guessing).
+BOOST_AUTO_TEST_CASE(r2e_v3_truncated_meta_fail_closed)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 150;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 25, 10, baseTip, &tip, NULL));
+        uint256 fin; BuildChain(tip, 2, &fin, uint256(0x03UL), baseTip);
+    }
+    std::vector<unsigned char> m = ReadRawFile(dir + "/blockindex_tip/tip.meta");
+    BOOST_REQUIRE(m.size() >= 140);
+    m.resize(104); // keep version=3 header but drop the v2/v3 tail -> must fail closed
+    WriteRawFile(dir + "/blockindex_tip/tip.meta", m);
+    BlockIndexTipAuthority re; std::string err;
+    BOOST_REQUIRE_MESSAGE(!BlockIndexTipAuthority::Open(dir, 25, &re, &err),
+                          "R2E: truncated v3 meta MUST fail closed");
+    printf("R2E PASS truncated v3 meta fail-closed\n");
+}
+
+// R2-F: operator-invalid on a v3 tip keeps v3 and persists.
+BOOST_AUTO_TEST_CASE(r2f_v3_operator_invalid_keeps_v3)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 120; const uint256 hX(0x77UL);
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 26, 5, baseTip, &tip, NULL));
+        uint256 fin; BuildChain(tip, 3, &fin, uint256(0x04UL), baseTip);
+        BOOST_REQUIRE(tip.SetOperatorInvalid(hX, true, NULL) == BLOCK_INDEX_TIP_OK);
+        unsigned char g[32]; uint32_t v = 0; ReadMetaDigest(dir, g, &v);
+        BOOST_CHECK_EQUAL(v, 3u); // must stay v3
+    }
+    BlockIndexTipAuthority re;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 26, &re, NULL));
+    BOOST_CHECK(re.IsOperatorInvalid(hX));
+    printf("R2F PASS v3 operator-invalid persists\n");
+}
+
+// R2-G: after a reorg the persisted digest equals the oracle over the RESULTING
+// committed vectors (records/derived unchanged, active truncated, fence bumped).
+BOOST_AUTO_TEST_CASE(r2g_v3_oracle_after_reorg)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 100; const uint64_t baseRec = 20; const uint32_t N = 6;
+    std::vector<BlockIndexRecord> recs; std::vector<BlockIndexDerivedEntry> ders;
+    uint256 prev(0xC0DEUL);
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 27, baseRec, baseTip, &tip, NULL));
+        for (uint32_t i = 0; i < N; ++i)
+        {
+            uint256 h = uint256(0x2222UL + i);
+            BlockIndexRecord r = MakeRecord(h, prev, baseTip + 1 + (int)i, (i % 2) == 0);
+            BlockIndexDerivedEntry d = MakeDerived(uint256(i + 5), 700 + i);
+            BlockIndexTipAppend a; a.record = r; a.derived = d;
+            BOOST_REQUIRE(tip.Append(a, baseTip + 1 + (int)i, NULL) == BLOCK_INDEX_TIP_OK);
+            recs.push_back(r); ders.push_back(d); prev = h;
+        }
+        BOOST_REQUIRE(tip.TruncateActiveTo(baseTip + 3, NULL) == BLOCK_INDEX_TIP_OK);
+    }
+    std::vector<BlockIndexId> actsAfter;
+    for (int i = 0; i < 3; ++i) actsAfter.push_back(baseRec + i + 1);
+    unsigned char got[32]; uint32_t ver = 0; ReadMetaDigest(dir, got, &ver);
+    BOOST_REQUIRE_EQUAL(ver, 3u);
+    unsigned char want[32]; OracleDigestV3(recs, ders, actsAfter, 1 /*fence bumped*/, want);
+    BOOST_CHECK_MESSAGE(memcmp(got, want, 32) == 0,
+                        "R2G: post-reorg v3 digest MUST equal the oracle over the resulting vectors");
+    BlockIndexTipAuthority re;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 27, &re, NULL));
+    BOOST_CHECK_EQUAL(re.TipHeight(), baseTip + 3);
+    printf("R2G PASS v3 oracle after reorg\n");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

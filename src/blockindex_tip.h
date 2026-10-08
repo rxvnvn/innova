@@ -67,6 +67,16 @@
 // silently guessed).
 static const uint32_t BLOCK_INDEX_TIP_META_VERSION = 2;
 static const uint32_t BLOCK_INDEX_TIP_META_VERSION_V1 = 1;
+// v3 (Repair #2): the content digest is the chained append accumulator
+//   digest_v3 = SHA256( Rch || Dch || Ach || activeFence )
+// with three INDEPENDENT index-order chains over the committed records/derived/
+// activeIds (same per-element bytes as v2). It is a pure function of the
+// committed state, so it is identical whether maintained incrementally on a
+// normal append (O(new)) or rebuilt by Open (O(N)). v3 reuses the SAME 140-byte
+// tip.meta layout; only the 32-byte contentDigest MEANING changes. A v2 tip
+// opens and validates with the v2 digest; the first new commit upgrades to v3.
+// A v3 tip is NOT readable by a pre-v3 binary (fail closed) -- accepted one-way.
+static const uint32_t BLOCK_INDEX_TIP_META_VERSION_V3 = 3;
 
 // R3 test-only failpoints around the durability boundaries. Inert unless a test
 // explicitly arms them; production code never arms them. Names:
