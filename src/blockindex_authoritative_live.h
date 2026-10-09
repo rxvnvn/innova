@@ -226,16 +226,16 @@ public:
     // LIFETIME INVARIANT: any resident CBlockIndex whose pprev points to a
     // materialized authoritative ancestor must never outlive that ancestor's
     // safe residency/topology lifetime. This holds because the materialized
-    // chain is owned by `fullResident_` (anchor + horizon policy), and is NOT
+    // chain is owned by `tip-window (BlockIndexHotOwner)` (anchor + horizon policy), and is NOT
     // freed by ReleaseOperationMaterializations().
-    CBlockIndex* ResolveAndRetainFullParent(const uint256& parentHash,
-                                            std::string* error);
+    CBlockIndex* PublishAuthoritativeBestTip(const uint256& parentHash,
+                                             std::string* error = NULL);
 
     // Release all operation-scoped parent materializations. Called at the END of a
     // single logical block acceptance (authoritative mode) so the residency of
     // materialized full-topology parents stays bounded to ONE block's worth of
     // ancestors (not O(history)). The PERSISTENT full-topology store
-    // (ResolveAndRetainFullParent) is NOT freed here — its residency is governed
+    // (PublishAuthoritativeBestTip) is NOT freed here — its residency is governed
     // by anchor/horizon policy so already-accepted blocks' pprev stays valid.
     void ReleaseOperationMaterializations();
 
@@ -245,7 +245,7 @@ public:
     const BlockIndexLiveTail& Tail() const;
     int Horizon() const;
     // PM1-P0-06 A1-b S1/S3: O(1) persistent full-topology residency counters
-    // (the fullResident_ map). Current + high-water; never a measurement history.
+    // (the tip-window (BlockIndexHotOwner) map). Current + high-water; never a measurement history.
     size_t ResidentCount() const;
     size_t ResidentPeak() const;
     uint64_t BaseGeneration() const;

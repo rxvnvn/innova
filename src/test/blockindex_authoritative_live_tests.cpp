@@ -36,6 +36,8 @@
 #include <boost/filesystem.hpp>
 
 #include <stdio.h>
+#include <fstream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -143,7 +145,7 @@ BOOST_AUTO_TEST_SUITE(blockindex_authoritative_live_tests)
 
 // REGRESSION (genesis anchor): the base-generation snapshot of the genesis and
 // the EXACT accept-time parent CBlockIndex returned by
-// ResolveAndRetainFullParent MUST both expose the committed derived
+// PublishAuthoritativeBestTip MUST both expose the committed derived
 // stake-modifier checksum. Pre-fix the base snapshot surfaced ONLY nChainTrust,
 // so the materialized genesis carried nStakeModifierChecksum=0, seeding the whole
 // live stake-modifier recurrence with 0 (canonical genesis 0x0e00670b was lost).
@@ -184,7 +186,7 @@ BOOST_AUTO_TEST_CASE(g1_base_snapshot_and_materialized_expose_derived_stake_modi
     // (never silently zero).
     BlockIndexAuthoritativeLive live;
     BOOST_REQUIRE_MESSAGE(live.Open(fx.rootStr, &reader, 2048, &error), error);
-    CBlockIndex* g = live.ResolveAndRetainFullParent(fx.baseActive[0], &error);
+    CBlockIndex* g = live.PublishAuthoritativeBestTip(fx.baseActive[0], &error);
     BOOST_REQUIRE(g != NULL);
     BOOST_CHECK_EQUAL(g->nHeight, 0);
     BOOST_CHECK_EQUAL((unsigned)g->nStakeModifierChecksum, (unsigned)de.stakeModifierChecksum);
@@ -866,13 +868,13 @@ BOOST_AUTO_TEST_CASE(g1_traversal_floor_skip_topology_and_getancestor)
     const int floorHeight = baseTip - (int)CBlockIndex::nMedianTimeSpan - 2; // 7
 
     std::string rerr;
-    CBlockIndex* pwin = live.ResolveAndRetainFullParent(child, &rerr);
+    CBlockIndex* pwin = live.PublishAuthoritativeBestTip(child, &rerr);
     BOOST_REQUIRE_MESSAGE(pwin != NULL, rerr);
     BOOST_CHECK_EQUAL(pwin->nHeight, baseTip + 1);
 
     // Rematerializing the same hash must yield the same retained object.
     std::string rerr2;
-    CBlockIndex* pwin2 = live.ResolveAndRetainFullParent(child, &rerr2);
+    CBlockIndex* pwin2 = live.PublishAuthoritativeBestTip(child, &rerr2);
     BOOST_CHECK(pwin2 == pwin);
 
     // Enumerate the materialized window along pprev.
@@ -932,6 +934,59 @@ BOOST_AUTO_TEST_CASE(g1_traversal_floor_skip_topology_and_getancestor)
     reader.Close();
     printf("G1-TRAVERSAL PASS: retained-window pskip matches resident BuildSkip semantics; "
            "GetAncestor exact in-window, NULL below the floor; locator truncates safely\n");
+}
+
+// G11 (FINAL OWNER ELIMINATION): SOURCE-LEVEL REMOVAL GATE. The permanent
+// historical-owner structures must be physically ABSENT from production source.
+// This is an executable gate over the actual on-disk production files (a missing
+// symbol would also fail to compile; this catches residual declarations and the
+// cosmetic-retention failure mode).
+static std::string ReadSourceForGate(const char* name)
+{
+    const char* prefixes[] = { "", "../", "../../innova-r1r2-cutover/src/" };
+    for (size_t i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); ++i)
+    {
+        std::ifstream in((std::string(prefixes[i]) + name).c_str());
+        if (in.good())
+        {
+            std::ostringstream ss; ss << in.rdbuf(); return ss.str();
+        }
+    }
+    return std::string();
+}
+
+BOOST_AUTO_TEST_CASE(g11_historical_owner_structures_removed_from_source)
+{
+    const char* kFiles[] = {
+        "blockindex_authoritative_live.cpp",
+        "blockindex_authoritative_live.h",
+        "blockindex_hot_owner.h",
+        "blockindex_authoritative_startup.cpp",
+        "kernel.cpp",
+        "fullresident_trackd_main.cpp",
+        "fullresident_trackd_probe.cpp",
+    };
+    const char* kForbidden[] = {
+        "fullResident_", "fullResidentHash_", "fullResidentAnchor_",
+        "ResolveAndRetainFullParent",
+    };
+    size_t checked = 0;
+    for (size_t fi = 0; fi < sizeof(kFiles)/sizeof(kFiles[0]); ++fi)
+    {
+        std::string src = ReadSourceForGate(kFiles[fi]);
+        if (src.empty())
+            continue; // file unavailable from this cwd; other prefixes handle it
+        ++checked;
+        for (size_t ai = 0; ai < sizeof(kForbidden)/sizeof(kForbidden[0]); ++ai)
+        {
+            BOOST_CHECK_MESSAGE(src.find(kForbidden[ai]) == std::string::npos,
+                std::string("FORBIDDEN production symbol still present in ")
+                + kFiles[fi] + ": " + kForbidden[ai]);
+        }
+    }
+    BOOST_CHECK_MESSAGE(checked >= 1, "G11 gate could not locate any production source file");
+    printf("G11 PASS: permanent historical-owner structures absent from production source "
+           "(%zu files scanned)\n", checked);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

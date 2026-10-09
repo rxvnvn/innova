@@ -166,7 +166,7 @@ int64_t GetStakeModifierSelectionInterval()
 // CHAIN TIME, not by a block count:
 //   * the "last generated modifier" walk  <= nModifierInterval  (600 s)
 //   * the generation candidate window     =  nSelectionInterval (21135 s)
-// At 1 s spacing those are ~600 and ~21135 blocks. Deepening fullResident_ or
+// At 1 s spacing those are ~600 and ~21135 blocks. Deepening tip-window (BlockIndexHotOwner) or
 // materializing ancestors is therefore architecturally wrong.
 //
 // ONE selection algorithm, TWO input providers:

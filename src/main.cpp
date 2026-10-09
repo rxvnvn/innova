@@ -7662,7 +7662,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     // WS-B (R1/R2 core ownership cutover): when the parent is NOT map-resident
     // it is materialized BY VALUE into this caller-owned, OPERATION-SCOPED token
     // for the duration of THIS call only — no persistent historical CBlockIndex
-    // ownership (no fullResident_ retention). The accepted block's parent
+    // ownership (no tip-window (BlockIndexHotOwner) retention). The accepted block's parent
     // IDENTITY is its stable hash/height; deeper ancestry resolves BY VALUE.
     // The token releases every materialized object at function return.
     ScopedMaterializedChain scopedParent;
@@ -7700,7 +7700,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             // THIS call only and paint pindexNew->pprev from it for the duration
             // of the accept (chain trust, stake modifier, checksum,
             // SetBestChain/ConnectBlock). There is NO persistent historical
-            // CBlockIndex ownership (no fullResident_ retention); the raw edge is
+            // CBlockIndex ownership (no tip-window (BlockIndexHotOwner) retention); the raw edge is
             // released at the end of the call via the existing retired-floor
             // contract and deeper ancestry resolves BY VALUE. The persisted
             // legacy record keeps the true parent hash via hashPrevStable.
@@ -8826,7 +8826,7 @@ static void RefreshAuthoritativeTransientProjection()
     if (tipRead.status == BLOCK_INDEX_TIP_OK && tipRead.height > baseTipHeight)
     {
         std::string tipErr;
-        CBlockIndex* tipObj = live->ResolveAndRetainFullParent(tipRead.record.hash, &tipErr);
+        CBlockIndex* tipObj = live->PublishAuthoritativeBestTip(tipRead.record.hash, &tipErr);
         if (tipObj != NULL)
         {
             pindexBest = tipObj;

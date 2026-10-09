@@ -453,6 +453,65 @@ BlockIndexHotStatus BlockIndexHotOwner::EvictResident(const BlockIndexLogicalId&
     return BlockIndexHotStatus::OK;
 }
 
+BlockIndexHotStatus BlockIndexHotOwner::AdoptOwned(const BlockIndexLogicalId& id,
+                                                   CBlockIndex* obj,
+                                                   const uint256& ownHash, bool anchor)
+{
+    if (obj == NULL)
+        return BlockIndexHotStatus::CORRUPT_METADATA;
+    LOCK(cs);
+    const uint256 h = id.GetHash();
+    std::map<uint256, Entry>::iterator it = resident.find(h);
+    if (it == resident.end())
+        it = resident.insert(std::make_pair(h, Entry())).first;
+    else if (it->second.index != NULL && it->second.index != obj)
+        return BlockIndexHotStatus::OK; // already owns a distinct object; keep it
+    Entry& e = it->second;
+    e.id = id;
+    e.ownHash = ownHash;
+    e.index = obj;
+    e.materialized = true;
+    e.pending = false;
+    e.anchor = anchor;
+    obj->phashBlock = &e.ownHash; // owner-stable identity (std::map node address)
+    return BlockIndexHotStatus::OK;
+}
+
+bool BlockIndexHotOwner::IsAnchored(const uint256& hash) const
+{
+    LOCK(cs);
+    std::map<uint256, Entry>::const_iterator it = resident.find(hash);
+    return it != resident.end() && it->second.anchor;
+}
+
+std::vector<uint256> BlockIndexHotOwner::OwnedHashes() const
+{
+    LOCK(cs);
+    std::vector<uint256> out;
+    for (std::map<uint256, Entry>::const_iterator kv = resident.begin();
+         kv != resident.end(); ++kv)
+        if (kv->second.materialized && kv->second.index)
+            out.push_back(kv->first);
+    return out;
+}
+
+bool BlockIndexHotOwner::ReleaseOwned(const uint256& hash)
+{
+    LOCK(cs);
+    std::map<uint256, Entry>::iterator it = resident.find(hash);
+    if (it == resident.end())
+        return false;
+    if (it->second.index)
+        delete it->second.index;
+    resident.erase(it);
+    return true;
+}
+
+size_t BlockIndexHotOwner::OwnedCount() const
+{
+    return ResidentCount();
+}
+
 size_t BlockIndexHotOwner::ResidentCount() const
 {
     LOCK(cs);

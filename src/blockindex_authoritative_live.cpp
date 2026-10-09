@@ -4,6 +4,7 @@
 
 #include "blockindex_authoritative_live.h"
 
+#include "blockindex_hot_owner.h"
 #include "blockindex_startup_bootstrap.h"
 #include "blockindex_accessor.h"
 
@@ -53,18 +54,23 @@ public:
     // raw-pprev deep walks are required under the authority contract). KEEP
     // covers the bounded mapBlockIndex span, the LivingTail span and WALK
     // (nMedianTimeSpan+2) with margin.
-    std::map<uint256, CBlockIndex*> fullResident_;
-    std::map<uint256, uint256*>     fullResidentHash_;
-    std::set<uint256>               fullResidentAnchor_;
-    size_t                          fullResidentPeak_;
+    // OWNERSHIP CONTRACT (disk-native): the published best-tip working set is
+    // owned by the BOUNDED BlockIndexHotOwner below -- identity-keyed
+    // (BlockIndexLogicalId / hash), with explicit anchor lifetime, bounded
+    // resident count and deterministic release on eviction/destruction. There is
+    // NO process-permanent historical CBlockIndex registry here (the former
+    // tip-window (BlockIndexHotOwner)/tipWindow identity slots/tip-window anchors maps are GONE); the
+    // owner frees every adopted object at eviction or destruction.
+    BlockIndexHotOwner tipWindow_;
+    size_t          tipWindowPeak_;
     // REPAIR #4: operational bookkeeping for the bounded window (all O(window)
     // or O(1); never O(history)).
-    int32_t       fullResidentLiveTipHeight_;  // highest accepted height (tip anchor)
+    int32_t       tipWindowLiveTipHeight_;  // highest accepted height (tip anchor)
 
     Impl()
         : baseReader(NULL), horizon(2048), baseGeneration(0),
-          open(false), baseTipHeight(-1), baseTipHash(0), fullResidentPeak_(0),
-          fullResidentLiveTipHeight_(-1)
+          open(false), baseTipHeight(-1), baseTipHash(0), tipWindowPeak_(0),
+          tipWindowLiveTipHeight_(-1)
     {
     }
 
@@ -75,16 +81,8 @@ public:
             delete ownedChain_[i];
             delete ownedChainHashes_[i];
         }
-        for (std::map<uint256, CBlockIndex*>::iterator it = fullResident_.begin();
-             it != fullResident_.end(); ++it)
-        {
-            delete it->second;
-        }
-        for (std::map<uint256, uint256*>::iterator it = fullResidentHash_.begin();
-             it != fullResidentHash_.end(); ++it)
-        {
-            delete it->second;
-        }
+        // tipWindow_ (BlockIndexHotOwner) owns every adopted tip-window object and
+        // frees it in its own destructor; no manual release is required here.
     }
 };
 
@@ -114,7 +112,7 @@ static bool SetError(std::string* error, const std::string& message)
 }
 
 // ---------------------------------------------------------------------------
-// REPAIR #4 - bounded live-authority residency domain (fullResident_ window).
+// REPAIR #4 - bounded live-authority residency domain (tip-window (BlockIndexHotOwner) window).
 //
 //   RESIDENCY LIFETIME != AUTHORITY: an object below the KEEP window holds
 //   NO consumer identity by construction (mapBlockIndex-retirements already
@@ -122,9 +120,9 @@ static bool SetError(std::string* error, const std::string& message)
 //   by value through ResolveBlockSnapshot).
 //
 // All functions in this unnamed namespace are cs_main-serialized by their
-// callers (ResolveAndRetainFullParent -> AddToBlockIndex -> ProcessBlock);
+// callers (PublishAuthoritativeBestTip -> AddToBlockIndex -> ProcessBlock);
 // the Impl does not lock independently. Cost of the steady-state pass is
-// O(mapBlockIndex + fullResident_) per accepted block: BOTH maps are bounded
+// O(mapBlockIndex + tip-window (BlockIndexHotOwner)) per accepted block: BOTH maps are bounded
 // by the KEEP window, never O(history).
 // ---------------------------------------------------------------------------
 
@@ -152,7 +150,7 @@ static inline bool RR4HoldsTopology(const CBlockIndex* o, const CBlockIndex* vic
 }
 
 // Null every raw pprev/pskip/pnext edge that points AT `victim` from a
-// still-resident fullResident_ object or a bounded mapBlockIndex entry, then
+// still-resident tip-window (BlockIndexHotOwner) object or a bounded mapBlockIndex entry, then
 // clear the victim's OWN edges. Contract:
 //   * no later resident walk can dereference freed storage;
 //   * a survivor whose edge to the victim is nulled terminates its raw walk at
@@ -163,16 +161,13 @@ static inline bool RR4HoldsTopology(const CBlockIndex* o, const CBlockIndex* vic
 static void RR4ReleaseEdges(BlockIndexAuthoritativeLive::Impl* self,
                             const uint256& victimHash)
 {
-    std::map<uint256, CBlockIndex*>::iterator vit = self->fullResident_.find(victimHash);
-    if (vit == self->fullResident_.end())
-        return;
-    CBlockIndex* victim = vit->second;
+    CBlockIndex* victim = self->tipWindow_.GetResidentRaw(victimHash);
     if (!victim)
         return;
-    for (std::map<uint256, CBlockIndex*>::iterator rit = self->fullResident_.begin();
-         rit != self->fullResident_.end(); ++rit)
+    std::vector<uint256> residentHashes = self->tipWindow_.OwnedHashes();
+    for (size_t ri = 0; ri < residentHashes.size(); ++ri)
     {
-        CBlockIndex* o = rit->second;
+        CBlockIndex* o = self->tipWindow_.GetResidentRaw(residentHashes[ri]);
         if (!o || o == victim)
             continue;
         if (o->pprev == victim) o->pprev = NULL;
@@ -197,10 +192,10 @@ static void RR4ReleaseEdges(BlockIndexAuthoritativeLive::Impl* self,
     victim->pskip = NULL;
 }
 
-// REPAIR #4 EXECUTION: the single production eviction pass over fullResident_,
-// driven from ResolveAndRetainFullParent after each accepted-block residency
+// REPAIR #4 EXECUTION: the single production eviction pass over tip-window (BlockIndexHotOwner),
+// driven from PublishAuthoritativeBestTip after each accepted-block residency
 // rotation. Caller contract (cs_main-serialized):
-//   * fullResidentLiveTipHeight_ = the highest accepted / top-anchored height;
+//   * tipWindowLiveTipHeight_ = the highest accepted / top-anchored height;
 //   * eviction NEVER frees an identity that is still held: anchors,
 //     pindexBest / pindexGenesisBlock, and any object reachable from the
 //     BOUNDED mapBlockIndex span (as an entry itself, or through a raw
@@ -208,17 +203,17 @@ static void RR4ReleaseEdges(BlockIndexAuthoritativeLive::Impl* self,
 //   * only a surviving RAW edge that points at the victim is nulled (deep
 //     ancestry continues BY VALUE through the V2 authority; no legacy
 //     fallback chain is left behind);
-//   * the victim is erased from fullResident_ / fullResidentHash_ and freed;
-//     fullResidentAnchor_ hashes are never victims;
+//   * the victim is erased from tip-window (BlockIndexHotOwner) / tipWindow identity slots and freed;
+//     tip-window anchors hashes are never victims;
 //   * re-materialization of an evicted identity goes through the existing
 //     by-value snapshot path (ResolveBlockSnapshot / FullFromSnapshot).
 static void RR4EvictBelowFloorInto(BlockIndexAuthoritativeLive::Impl* self)
 {
     if (!self || !self->open || !self->baseReader || !self->baseReader->IsOpen())
         return; // fail closed: never evict without a healthy re-materializable floor
-    if (self->fullResident_.size() <= 1)
+    if (self->tipWindow_.OwnedCount() <= 1)
         return;
-    int32_t tipHeight = self->fullResidentLiveTipHeight_;
+    int32_t tipHeight = self->tipWindowLiveTipHeight_;
     if (tipHeight < 0 && self->tip)
         tipHeight = self->tip->TipHeight();
     if (tipHeight < 0)
@@ -250,25 +245,20 @@ static void RR4EvictBelowFloorInto(BlockIndexAuthoritativeLive::Impl* self)
     }
 
     std::vector<uint256> evictIDs;
-    std::vector<uint256*> evictOwns;
-    for (std::map<uint256, CBlockIndex*>::iterator it = self->fullResident_.begin();
-         it != self->fullResident_.end(); ++it)
+    std::vector<uint256> residentHashes = self->tipWindow_.OwnedHashes();
+    for (size_t ri = 0; ri < residentHashes.size(); ++ri)
     {
-        CBlockIndex* victim = it->second;
+        const uint256& h = residentHashes[ri];
+        CBlockIndex* victim = self->tipWindow_.GetResidentRaw(h);
         if (!victim || victim->nHeight >= floor)
             continue; // inside the retained window
-        if (self->fullResidentAnchor_.count(it->first))
+        if (self->tipWindow_.IsAnchored(h))
             continue; // explicitly anchored (base tip / live-tip authority)
         if (victim == pindexBest || victim == pindexGenesisBlock)
             continue; // permanent global identity holders
         if (heldSet.count(victim))
             continue; // identity-held by the bounded mapBlockIndex topology
-        evictIDs.push_back(it->first);
-        {
-            std::map<uint256, uint256*>::const_iterator ho =
-                self->fullResidentHash_.find(it->first);
-            evictOwns.push_back(ho != self->fullResidentHash_.end() ? ho->second : NULL);
-        }
+        evictIDs.push_back(h);
     }
     if (evictIDs.empty())
         return;
@@ -278,19 +268,7 @@ static void RR4EvictBelowFloorInto(BlockIndexAuthoritativeLive::Impl* self)
     for (size_t k = 0; k < evictIDs.size(); ++k)
         RR4ReleaseEdges(self, evictIDs[k]);
     for (size_t k = 0; k < evictIDs.size(); ++k)
-    {
-        std::map<uint256, CBlockIndex*>::iterator it = self->fullResident_.find(evictIDs[k]);
-        if (it != self->fullResident_.end())
-        {
-            delete it->second;
-            self->fullResident_.erase(it);
-        }
-        if (evictOwns[k])
-        {
-            delete evictOwns[k];
-            self->fullResidentHash_.erase(evictIDs[k]);
-        }
-    }
+        self->tipWindow_.ReleaseOwned(evictIDs[k]); // frees object + owned identity
 }
 
 } // namespace
@@ -556,7 +534,7 @@ CBlockIndex* FullFromSnapshot(const BlockIndexSnapshot& s, uint256* ownHash)
 }
 } // namespace
 
-CBlockIndex* BlockIndexAuthoritativeLive::ResolveAndRetainFullParent(
+CBlockIndex* BlockIndexAuthoritativeLive::PublishAuthoritativeBestTip(
     const uint256& parentHash, std::string* error)
 {
     if (!impl_->open || !impl_->baseReader)
@@ -564,11 +542,11 @@ CBlockIndex* BlockIndexAuthoritativeLive::ResolveAndRetainFullParent(
         if (error) *error = "authoritative-live: not open";
         return NULL;
     }
-    // If already persisted-resident, return the existing object (idempotent).
+    // If already adopted, return the existing owned object (idempotent).
     {
-        std::map<uint256, CBlockIndex*>::iterator it = impl_->fullResident_.find(parentHash);
-        if (it != impl_->fullResident_.end())
-            return it->second;
+        CBlockIndex* existing = impl_->tipWindow_.GetResidentRaw(parentHash);
+        if (existing)
+            return existing;
     }
 
     // Walk the parent chain by value (tip-then-base) down to (and including)
@@ -665,34 +643,30 @@ CBlockIndex* BlockIndexAuthoritativeLive::ResolveAndRetainFullParent(
     for (size_t i = 0; i < path.size(); ++i)
     {
         const uint256& h = path[i].hash;
-        if (impl_->fullResident_.count(h))
-            continue; // already resident; kept
-        uint256* own = new uint256(h);
-        CBlockIndex* obj = FullFromSnapshot(path[i], own);
-        impl_->fullResident_[h] = obj;
-        impl_->fullResidentHash_[h] = own;
-        // anchor the base tip (boundary) so it is never evicted
-        if (h == impl_->baseTipHash)
-            impl_->fullResidentAnchor_.insert(h);
+        if (impl_->tipWindow_.GetResidentRaw(h))
+            continue; // already adopted; kept
+        uint256 ownTmp(h);
+        CBlockIndex* obj = FullFromSnapshot(path[i], &ownTmp);
+        // OWNERSHIP: adopt under the bounded hot owner. phashBlock is re-pointed
+        // at the owner-stable identity slot (std::map node address). The base tip
+        // (boundary) is anchored so the eviction pass never frees it.
+        impl_->tipWindow_.AdoptOwned(BlockIndexLogicalId(h), obj, h,
+                                     h == impl_->baseTipHash);
     }
-    if (impl_->fullResident_.size() > impl_->fullResidentPeak_)
-        impl_->fullResidentPeak_ = impl_->fullResident_.size();
+    if (impl_->tipWindow_.OwnedCount() > impl_->tipWindowPeak_)
+        impl_->tipWindowPeak_ = impl_->tipWindow_.OwnedCount();
     // Link topology: pprev -> floor, pnext -> tip within the resolved chain AND
     // against already-persistent ancestors so the whole pointer graph is valid.
     // Build height-ordered list path[0] (highest) .. path.back() (floor).
     for (size_t i = 0; i < path.size(); ++i)
     {
-        CBlockIndex* o = impl_->fullResident_[path[i].hash];
+        CBlockIndex* o = impl_->tipWindow_.GetResidentRaw(path[i].hash);
         const uint256& hPrev = path[i].hashPrev;
-        CBlockIndex* prev = (i + 1 < path.size()) ? impl_->fullResident_[path[i + 1].hash] : NULL;
+        CBlockIndex* prev = (i + 1 < path.size()) ? impl_->tipWindow_.GetResidentRaw(path[i + 1].hash) : NULL;
         if (!prev && hPrev != uint256(0))
-        {
-            std::map<uint256, CBlockIndex*>::iterator p = impl_->fullResident_.find(hPrev);
-            if (p != impl_->fullResident_.end())
-                prev = p->second;
-        }
+            prev = impl_->tipWindow_.GetResidentRaw(hPrev);
         o->pprev = prev;
-        o->pnext = (i > 0) ? impl_->fullResident_[path[i - 1].hash] : NULL;
+        o->pnext = (i > 0) ? impl_->tipWindow_.GetResidentRaw(path[i - 1].hash) : NULL;
         o->pskip = NULL; // constructed by the skip pass below (BuildSkip semantics)
     }
     // Skip links must satisfy the SAME invariant ordinary resident chains do:
@@ -704,32 +678,28 @@ CBlockIndex* BlockIndexAuthoritativeLive::ResolveAndRetainFullParent(
     // step sees already-correct lower links; a target below the retained floor is
     // not materialized and correctly yields NULL.
     for (size_t i = path.size(); i-- > 0; )
-        impl_->fullResident_[path[i].hash]->BuildSkip();
+        impl_->tipWindow_.GetResidentRaw(path[i].hash)->BuildSkip();
     // nChainTrust is preserved from the snapshot: FullFromSnapshot sets
     // p->nChainTrust = s.nChainTrust, and the reader now fills s.nChainTrust
     // from the authoritative derived.dat (per-record cumulative trust). No
     // recomputation is needed (and re-accumulating would wrongly drop the
     // heritage of a boundary object that floors at itself). Anchor the base tip.
-    for (size_t i = 0; i < path.size(); ++i)
-        if (path[i].hash == impl_->baseTipHash)
-            impl_->fullResidentAnchor_.insert(path[i].hash);
+    // (base-tip anchoring was applied at adoption time by AdoptOwned).
     // REPAIR #4 (P06-R4/D6): the caller resolves HEIGHTS inside the tip
     // authority by-hash-by-pointer only for the stacked accepted child. The
     // resident objects exposed hereafter hold bindings to the accepted tip's
-    // pprev; deepen the fullResident_ rotation only when the authority floor
+    // pprev; deepen the tip-window (BlockIndexHotOwner) rotation only when the authority floor
     // has moved (KEEP window over the live tip height). pindexNew's OWN ppex
     // pre-call retention is bound to the mapBlockIndex entry (bounded by the
     // retired-floor contract at tipHeight - horizon + 1), never to a
-    // fullResident_ deep boundary below it.
+    // tip-window (BlockIndexHotOwner) deep boundary below it.
     {
-        std::map<uint256, CBlockIndex*>::const_iterator top =
-            impl_->fullResident_.find(parentHash);
-        if (top != impl_->fullResident_.end() && top->second &&
-            top->second->nHeight > impl_->fullResidentLiveTipHeight_)
-            impl_->fullResidentLiveTipHeight_ = top->second->nHeight;
+        CBlockIndex* top = impl_->tipWindow_.GetResidentRaw(parentHash);
+        if (top && top->nHeight > impl_->tipWindowLiveTipHeight_)
+            impl_->tipWindowLiveTipHeight_ = top->nHeight;
         RR4EvictBelowFloorInto(impl_);
     }
-    return impl_->fullResident_[parentHash];
+    return impl_->tipWindow_.GetResidentRaw(parentHash);
 }
 
 CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChainInto(
@@ -1121,12 +1091,12 @@ int BlockIndexAuthoritativeLive::Horizon() const
 
 size_t BlockIndexAuthoritativeLive::ResidentCount() const
 {
-    return impl_->fullResident_.size();
+    return impl_->tipWindow_.OwnedCount();
 }
 
 size_t BlockIndexAuthoritativeLive::ResidentPeak() const
 {
-    return impl_->fullResidentPeak_;
+    return impl_->tipWindowPeak_;
 }
 
 uint64_t BlockIndexAuthoritativeLive::BaseGeneration() const

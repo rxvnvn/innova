@@ -150,7 +150,7 @@ struct P06SharedIndexIsolation
         hashBestChain = sBestChain; nBestHeight = sHeight; nBestChainTrust = sTrust;
         // Free the CASE-LOCAL mapBlockIndex entries this case mined. They are NOT
         // authority-owned: the authority retains its parents as SEPARATE by-value
-        // objects (ResolveAndRetainFullParent), so the
+        // objects (PublishAuthoritativeBestTip), so the
         // ResetBlockIndexAuthoritativeStartupForTest() above freed those but NOT
         // these. Leaving them was an accepted per-case leak (LSan: 33 CBlockIndex
         // / ~7920 B per case), because 'scratch' destructs without deleting.
@@ -632,7 +632,7 @@ BOOST_AUTO_TEST_CASE(p06_l3_below_floor_accept_no_uaf)
 
     // Resolve the OLD parent BY VALUE — it is no longer resident in mapBlockIndex.
     std::string rerr;
-    CBlockIndex* oldParent = live->ResolveAndRetainFullParent(oldHash, &rerr);
+    CBlockIndex* oldParent = live->PublishAuthoritativeBestTip(oldHash, &rerr);
     BOOST_REQUIRE_MESSAGE(oldParent != NULL, "below-floor parent resolve failed: " << rerr);
     BOOST_REQUIRE_EQUAL(oldParent->nHeight, 5);
     BOOST_REQUIRE(oldParent->nHeight < floor);
@@ -741,7 +741,7 @@ BOOST_AUTO_TEST_CASE(p06_dr_known_block_not_rewritten)
         tip = P06MineReal(tip, 0xB000u + (unsigned)i);
 
     std::string rerr;
-    CBlockIndex* oldParent = live->ResolveAndRetainFullParent(oldHash, &rerr);
+    CBlockIndex* oldParent = live->PublishAuthoritativeBestTip(oldHash, &rerr);
     BOOST_REQUIRE_MESSAGE(oldParent != NULL, "below-floor parent resolve failed: " << rerr);
 
     CBlock* pblock = P06BuildPoWBlock(oldParent, 0xD00Du);

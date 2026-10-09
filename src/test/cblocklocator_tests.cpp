@@ -91,7 +91,7 @@ ForkTree BuildForkTree(int activeLen, int forkHeight, int sideLen)
 }
 
 // Authoritative retained-window topology (src/blockindex_authoritative_live.cpp
-// ResolveAndRetainFullParent / MaterializeParentChainInto): a CONTIGUOUS chain
+// PublishAuthoritativeBestTip / MaterializeParentChainInto): a CONTIGUOUS chain
 // whose LOWEST node - the residency floor - has no materialized ancestor
 // (floor.pprev == NULL). Entries below the floor are never resident; ancestry
 // there is served by value, not by pprev traversal (WALK = nMedianTimeSpan + 2

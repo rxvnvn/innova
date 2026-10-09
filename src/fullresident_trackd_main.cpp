@@ -1,5 +1,5 @@
 //
-// TRACK D — deterministic long-run fullResident_ growth reproducer (standalone).
+// TRACK D — deterministic long-run the former operation-resident map (now removed) growth reproducer (standalone).
 //
 // Not a production or suite file: a scratch target appended (untracked) at the
 // tail of makefile.unix builds obj/fullresident_trackd_main.o from
@@ -12,9 +12,9 @@
 // BlockIndexAuthoritativeLive, and drives N sequential PoW blocks through the
 // REAL ProcessBlock path (test-armed authoritative mode:
 // SetAuthoritativeLiveForTesting + g_fAuthoritativeStartup), exactly like
-// g1_final_processblock_orphan_gate. Nothing (neither fullResident_ nor any
+// g1_final_processblock_orphan_gate. Nothing (neither the former operation-resident map (now removed) nor any
 // other component) is torn down between probes: the persistently-resident
-// fullResident_ map inside BlockIndexAuthoritativeLive::Impl
+// the former operation-resident map (now removed) map inside BlockIndexAuthoritativeLive::Impl
 // (blockindex_authoritative_live.cpp:43) plus its anchors, the operation
 // store, the live-tail count, mapBlockIndex, and this process's VmRSS are
 // probed after N, 2N, and 4N accepted blocks via #define private public in

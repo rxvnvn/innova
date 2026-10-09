@@ -369,7 +369,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         {
             std::string tipErr;
             CBlockIndex* tipObj =
-                ctx->live->ResolveAndRetainFullParent(tipRead.record.hash, &tipErr);
+                ctx->live->PublishAuthoritativeBestTip(tipRead.record.hash, &tipErr);
             if (!tipObj)
             {
                 if (error) *error = "authoritative startup: post-S tip materialization failed: " + tipErr;

@@ -224,6 +224,18 @@ public:
      *  guarantees lifetime; NULL if absent/not materialized). */
     CBlockIndex* GetResidentRaw(const uint256& hash) const;
 
+    // --- A.10.1e: tip-window ownership ADOPTION (ADDITIVE, bounded) ----------
+    // Take ownership of a caller-built CBlockIndex under a stable logical id.
+    // The owner frees it on eviction / destruction and re-points phashBlock at
+    // the owner-stable identity slot. Uses the SAME bounded resident map and the
+    // SAME eviction policies; it introduces no new owner or unbounded registry.
+    BlockIndexHotStatus AdoptOwned(const BlockIndexLogicalId& id, CBlockIndex* obj,
+                                   const uint256& ownHash, bool anchor);
+    bool IsAnchored(const uint256& hash) const;
+    std::vector<uint256> OwnedHashes() const;   // iteration order == resident map order
+    bool ReleaseOwned(const uint256& hash);     // force-release + free (ignores pins/anchor)
+    size_t OwnedCount() const;                  // == ResidentCount()
+
 private:
     struct Entry
     {

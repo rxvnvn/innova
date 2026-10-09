@@ -247,7 +247,7 @@ BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const
         // recurrence with 0 (canonical 0x0e00670b -> observed 0x00000000),
         // making the entire live chain non-canonical and h100000 fail the
         // (correct) 0xcf12d0aa checkpoint. See
-        // blockindex_authoritative_live.cpp ResolveAndRetainFullParent base
+        // blockindex_authoritative_live.cpp PublishAuthoritativeBestTip base
         // branch (the exact accept-time consumer).
         s.nStakeModifierChecksum = de.stakeModifierChecksum;
         s.hasStakeModifierChecksum = true;

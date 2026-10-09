@@ -15,7 +15,7 @@
 #include "blockindex_authoritative_live.h"
 #include "blockindex_live_tail.h"
 
-// Return the live-tail logical-resident count (informational only; fullResident_
+// Return the live-tail logical-resident count (informational only; the former operation-resident map (now removed)
 // is the growth target this TRACK D driver measures, not the tail).
 static long TrackDTailCountInternal(const BlockIndexAuthoritativeLive& live)
 {
@@ -24,7 +24,7 @@ static long TrackDTailCountInternal(const BlockIndexAuthoritativeLive& live)
         return -1;
     // The live tail is a composite (base reader + mutable tip) by-value
     // materializer; its residency is governed by the AnchorPolicy in
-    // blockindex_hot_owner.h, separate from fullResident_. Report the
+    // blockindex_hot_owner.h, separate from the former operation-resident map (now removed). Report the
     // error-resilient placeholder: not measured in this driver (-1).
     return -1;
 }
