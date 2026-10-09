@@ -7659,6 +7659,14 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     // returns previously leaked pindexNew.
     CBlockIndex* pindexNew = new CBlockIndex(nFile, nBlockPos, *this);
     std::unique_ptr<CBlockIndex> pindexNewGuard(pindexNew);
+    // WS-B (R1/R2 core ownership cutover): when the parent is NOT map-resident
+    // it is materialized BY VALUE into this caller-owned, OPERATION-SCOPED token
+    // for the duration of THIS call only — no persistent historical CBlockIndex
+    // ownership (no fullResident_ retention). The accepted block's parent
+    // IDENTITY is its stable hash/height; deeper ancestry resolves BY VALUE.
+    // The token releases every materialized object at function return.
+    ScopedMaterializedChain scopedParent;
+    bool fScopedParent = false;
     pindexNew->phashBlock = &hash;
     map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(hashPrevBlock);
     if (miPrev != mapBlockIndex.end())
@@ -7670,21 +7678,43 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     }
     else if (g_fAuthoritativeStartup)
     {
-        // G1-A: resolve + RETAIN the full-topology parent from the
-        // authoritative live authority so pindexNew->pprev points at a resident
-        // object that survives this ProcessBlock (no dangling), the chain-trust
-        // heritage accumulates (SetBestChain fires -> S+1 becomes active best),
-        // and SetBestChain/ConnectBlock/Reorganize can walk pprev/pnext/pskip.
+        // WS-B: the parent is NOT map-resident. Decide its ownership by the
+        // EXISTING retained-floor contract (floor = tipHeight - horizon + 1):
+        //   * parent ABOVE the floor -> a window ancestor: keep the existing
+        //     bounded-window retention (unchanged semantics).
+        //   * parent BELOW the floor (aged / deep side-branch fork) -> do NOT
+        //     persistently own it: materialize BY VALUE into OPERATION-SCOPED
+        //     storage for THIS call only, then release the raw edges (the
+        //     retired-floor contract) so deeper ancestry resolves BY VALUE.
         BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
         if (live && live->IsOpen())
         {
             std::string perr;
-            CBlockIndex* matParent = live->ResolveAndRetainFullParent(hashPrevBlock, &perr);
-            if (!matParent)
-                return error("AddToBlockIndex() : authoritative parent retain failed: %s",
-                             perr.c_str());
-            pindexNew->pprev = matParent;
-            pindexNew->nHeight = matParent->nHeight + 1;
+            BlockIndexSnapshot psnap;
+            int parentHeight = -1;
+            if (live->ResolveBlockSnapshot(hashPrevBlock, &psnap, &perr) == BlockIndexHotStatus::OK)
+                parentHeight = psnap.height;
+            const int horizon = live->Horizon();
+            const int floor = (horizon > 0) ? (nBestHeight - horizon + 1) : 1;
+            if (parentHeight >= floor)
+            {
+                CBlockIndex* retained = live->ResolveAndRetainFullParent(hashPrevBlock, &perr);
+                if (!retained)
+                    return error("AddToBlockIndex() : authoritative parent retain failed: %s",
+                                 perr.c_str());
+                pindexNew->pprev = retained;
+                pindexNew->nHeight = retained->nHeight + 1;
+            }
+            else
+            {
+                CBlockIndex* matParent = scopedParent.Acquire(live, hashPrevBlock, &perr);
+                if (!matParent)
+                    return error("AddToBlockIndex() : authoritative parent materialization failed: %s",
+                                 perr.c_str());
+                pindexNew->pprev = matParent;
+                pindexNew->nHeight = matParent->nHeight + 1;
+                fScopedParent = true;
+            }
         }
     }
 
@@ -7892,6 +7922,20 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                              pindexNew->nHeight, perr.c_str());
             }
         }
+    }
+
+    // WS-B (R1/R2 core ownership cutover): the accepted block's parent was
+    // OPERATION-SCOPED, not persistently owned. Apply the existing retired-floor
+    // contract NOW: the parent is below the retained floor (it was not
+    // map-resident), so the raw topology edges are released exactly as
+    // RetireBlockIndexBelowFloor does for aged entries, and any deeper ancestry
+    // resolves BY VALUE (ResolveBlockSnapshot / the by-value chain walk). This
+    // runs BEFORE the scoped token frees its objects at function return, so no
+    // accepted block ever retains a pointer into operation-scoped storage.
+    if (fScopedParent && pindexNew->pprev != NULL && !mapBlockIndex.count(hashPrevBlock))
+    {
+        pindexNew->pprev = NULL;
+        pindexNew->pskip = NULL;
     }
 
     // PM1-P0-06 Phase-D L3: retire below-floor residency only AFTER every use of
