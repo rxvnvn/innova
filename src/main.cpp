@@ -7668,6 +7668,10 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     ScopedMaterializedChain scopedParent;
     bool fScopedParent = false;
     pindexNew->phashBlock = &hash;
+    // R1/R2 core rewrite: record the stable by-value parent identity so the
+    // legacy CDiskBlockIndex mirror stays correct even when the parent object is
+    // operation-scoped / released (never persist a pointer-derived parent).
+    pindexNew->hashPrevStable = hashPrevBlock;
     map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(hashPrevBlock);
     if (miPrev != mapBlockIndex.end())
     {
@@ -7689,32 +7693,25 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
         if (live && live->IsOpen())
         {
+            // R1/R2 core rewrite (disk-native ownership): the parent is NOT
+            // map-resident (below the retained floor / aged / deep side-branch
+            // fork / post-restart boundary). Its identity is BY VALUE:
+            // materialize it into OPERATION-SCOPED, caller-owned storage for
+            // THIS call only and paint pindexNew->pprev from it for the duration
+            // of the accept (chain trust, stake modifier, checksum,
+            // SetBestChain/ConnectBlock). There is NO persistent historical
+            // CBlockIndex ownership (no fullResident_ retention); the raw edge is
+            // released at the end of the call via the existing retired-floor
+            // contract and deeper ancestry resolves BY VALUE. The persisted
+            // legacy record keeps the true parent hash via hashPrevStable.
             std::string perr;
-            BlockIndexSnapshot psnap;
-            int parentHeight = -1;
-            if (live->ResolveBlockSnapshot(hashPrevBlock, &psnap, &perr) == BlockIndexHotStatus::OK)
-                parentHeight = psnap.height;
-            const int horizon = live->Horizon();
-            const int floor = (horizon > 0) ? (nBestHeight - horizon + 1) : 1;
-            if (parentHeight >= floor)
-            {
-                CBlockIndex* retained = live->ResolveAndRetainFullParent(hashPrevBlock, &perr);
-                if (!retained)
-                    return error("AddToBlockIndex() : authoritative parent retain failed: %s",
-                                 perr.c_str());
-                pindexNew->pprev = retained;
-                pindexNew->nHeight = retained->nHeight + 1;
-            }
-            else
-            {
-                CBlockIndex* matParent = scopedParent.Acquire(live, hashPrevBlock, &perr);
-                if (!matParent)
-                    return error("AddToBlockIndex() : authoritative parent materialization failed: %s",
-                                 perr.c_str());
-                pindexNew->pprev = matParent;
-                pindexNew->nHeight = matParent->nHeight + 1;
-                fScopedParent = true;
-            }
+            CBlockIndex* matParent = scopedParent.Acquire(live, hashPrevBlock, &perr);
+            if (!matParent)
+                return error("AddToBlockIndex() : authoritative parent materialization failed: %s",
+                             perr.c_str());
+            pindexNew->pprev = matParent;
+            pindexNew->nHeight = matParent->nHeight + 1;
+            fScopedParent = true;
         }
     }
 

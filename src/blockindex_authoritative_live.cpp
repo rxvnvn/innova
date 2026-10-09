@@ -524,6 +524,8 @@ CBlockIndex* FullFromSnapshot(const BlockIndexSnapshot& s, uint256* ownHash)
     p->nHeight     = s.height;
     p->nFile       = s.nFile;
     p->nBlockPos   = s.nBlockPos;
+    // R1/R2 core rewrite: by-value parent identity for the persistence path.
+    p->hashPrevStable = s.hashPrev;
     p->nChainTrust = s.nChainTrust;
     p->hashProof   = s.hashProof;
     p->hashMerkleRoot = s.hashMerkleRoot;

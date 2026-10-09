@@ -1453,6 +1453,13 @@ public:
     int nHeight;
     unsigned int nFile;
     unsigned int nBlockPos;
+    // R1/R2 core rewrite (disk-native ownership): stable BY-VALUE parent
+    // identity for the PERSISTENCE path. The legacy CDiskBlockIndex mirror must
+    // record the true parent hash even after the live pprev pointer has been
+    // released (bounded hot window / operation-scoped consensus context). This
+    // field is never serialized directly; CDiskBlockIndex::hashPrev reads it as
+    // its fallback so persisted parent identity is pointer-free.
+    uint256 hashPrevStable;
     unsigned int nFlags;  // ppcoin: block index flags
     enum
     {
@@ -1478,6 +1485,7 @@ public:
         pskip = NULL;
         nFile = 0;
         nBlockPos = 0;
+        hashPrevStable = 0;
         nHeight = 0;
         nChainTrust = 0;
         nMint = 0;
@@ -1505,6 +1513,7 @@ public:
         pnext = NULL;
         nFile = nFileIn;
         nBlockPos = nBlockPosIn;
+        hashPrevStable = 0;
         nHeight = 0;
         nChainTrust = 0;
         nMint = 0;
@@ -1691,7 +1700,11 @@ public:
 
     explicit CDiskBlockIndex(CBlockIndex* pindex) : CBlockIndex(*pindex)
     {
-        hashPrev = (pprev ? pprev->GetBlockHash() : 0);
+        // R1/R2 core rewrite: parent identity is BY VALUE. Prefer the live
+        // pprev when present; otherwise fall back to the block's stable parent
+        // hash so the persisted legacy record stays correct even after the hot
+        // window / consensus context released the parent object.
+        hashPrev = (pprev ? pprev->GetBlockHash() : hashPrevStable);
         hashNext = (pnext ? pnext->GetBlockHash() : 0);
     }
 
