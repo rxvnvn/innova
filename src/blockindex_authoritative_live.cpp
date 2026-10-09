@@ -624,6 +624,20 @@ CBlockIndex* BlockIndexAuthoritativeLive::PublishAuthoritativeBestTip(
             return NULL;
         }
         path.push_back(s);
+        // R2-STARTUP: bound the retained materialization to the live-tail
+        // horizon. When the mutable tip has grown far beyond the immutable
+        // base (e.g. gen-1 is minimal and the whole chain lives in the tip),
+        // walking all the way back to the base floor is O(height) and builds
+        // an O(path) anon vector behind a bounded hot window — the startup OOM
+        // at ~2M blocks under 1 GiB. Deeper ancestry is never resident; it is
+        // served BY VALUE via the V2 reader. The boundary block's own consensus
+        // walks (median-time 11, difficulty, stake) reach only ~13 ancestors,
+        // all within the tail, so capping at the horizon changes no outcome.
+        if (path.size() >= (size_t)impl_->horizon)
+        {
+            reachedFloor = true;
+            break;
+        }
         // Reached the bounded consensus-walk floor below S.
         if (s.height <= floorHeight)
         {
@@ -796,6 +810,20 @@ CBlockIndex* BlockIndexAuthoritativeLive::MaterializeParentChainInto(
             return NULL;
         }
         path.push_back(s);
+        // R2-STARTUP: bound the retained materialization to the live-tail
+        // horizon. When the mutable tip has grown far beyond the immutable
+        // base (e.g. gen-1 is minimal and the whole chain lives in the tip),
+        // walking all the way back to the base floor is O(height) and builds
+        // an O(path) anon vector behind a bounded hot window — the startup OOM
+        // at ~2M blocks under 1 GiB. Deeper ancestry is never resident; it is
+        // served BY VALUE via the V2 reader. The boundary block's own consensus
+        // walks (median-time 11, difficulty, stake) reach only ~13 ancestors,
+        // all within the tail, so capping at the horizon changes no outcome.
+        if (path.size() >= (size_t)impl_->horizon)
+        {
+            reachedFloor = true;
+            break;
+        }
         // Reached the bounded consensus-walk floor below S.
         if (s.height <= floorHeight)
         {

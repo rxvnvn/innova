@@ -13,6 +13,9 @@
 #include <openssl/sha.h>
 #include <unistd.h>
 #include <zlib.h>
+#if defined(__GLIBC__)
+#include <malloc.h>
+#endif
 
 #include <algorithm>
 #include <cstdio>
@@ -199,6 +202,21 @@ static const char* const BLOCK_INDEX_TIP_HASHINDEX_MARKER_FILE = "tip-hashindex.
 static const uint32_t BLOCK_INDEX_TIP_HASHINDEX_MARKER_MAGIC = 0x494E4E54; // "TNNI"
 static const uint32_t BLOCK_INDEX_TIP_HASHINDEX_MARKER_VERSION = 1;
 static const size_t BLOCK_INDEX_TIP_HASHINDEX_MARKER_SIZE = 4 + 4 + 8; // magic+ver+count
+
+// R2-STARTUP (workstream B/D): bound the glibc arena high-water during the
+// O(N) streaming passes. Periodically return freed arena pages to the OS so the
+// transient per-record allocations cannot drive startup anon memory to an
+// O(height) high-water under a strict cgroup cap. glibc-only, best-effort,
+// never required for correctness (no-op builds are unaffected).
+#if defined(__GLIBC__)
+static void PeriodicStartupTrim(uint64_t& counter)
+{
+    if (((++counter) & 0xFFFFull) == 0)
+        malloc_trim(0);
+}
+#else
+static void PeriodicStartupTrim(uint64_t&) {}
+#endif
 
 // Records: hash(32) || hashPrev(32) || height(4 LE).  Derived: chainTrust(32) ||
 // stakeModifierChecksum(4 LE).  Active: RecordId(8 LE). Byte-for-byte identical
@@ -1075,9 +1093,11 @@ struct BlockIndexTipAuthority::Impl
             if (!sideIndex.OpenOrCreateWritable(tipDir, &oerr))
                 return SetError(error, "tip-hashindex recreate: " + oerr);
             std::string perr;
+            uint64_t rebuildTrimCtr = 0;
             const bool built = recordsWin.StreamVisit(0, N,
-                [this](uint64_t slot, const BlockIndexRecord& r) {
+                [this, &rebuildTrimCtr](uint64_t slot, const BlockIndexRecord& r) {
                     BlockIndexId id = baseLocalToId(slot);
+                    PeriodicStartupTrim(rebuildTrimCtr);
                     return sideIndex.Put(r.hash, id, NULL);
                 }, &perr);
             if (!built)
@@ -1105,20 +1125,26 @@ struct BlockIndexTipAuthority::Impl
         const uint64_t rc = recordsWin.Count();
         const uint64_t dc = derivedWin.Count();
         const uint64_t ac = activeWin.Count();
+        uint64_t trimCtrR = 0;
         bool rok = recordsWin.StreamVisit(0, rc,
-            [&b, this](uint64_t, const BlockIndexRecord& r) {
+            [&b, this, &trimCtrR](uint64_t, const BlockIndexRecord& r) {
+                PeriodicStartupTrim(trimCtrR);
                 size_t n = EncodeRecordDigestBytes(r, b);
                 DigestChainExtend(chainR, b, n);
                 return true;
             }, &werr);
+        uint64_t trimCtrD = 0;
         bool dok = derivedWin.StreamVisit(0, dc,
-            [&b, this](uint64_t, const BlockIndexDerivedEntry& d) {
+            [&b, this, &trimCtrD](uint64_t, const BlockIndexDerivedEntry& d) {
+                PeriodicStartupTrim(trimCtrD);
                 size_t n = EncodeDerivedDigestBytes(d, b);
                 DigestChainExtend(chainD, b, n);
                 return true;
             }, &werr);
+        uint64_t trimCtrA = 0;
         bool aok = activeWin.StreamVisit(0, ac,
-            [&b, this](uint64_t, const BlockIndexId& id) {
+            [&b, this, &trimCtrA](uint64_t, const BlockIndexId& id) {
+                PeriodicStartupTrim(trimCtrA);
                 EncodeActiveDigestBytes(id, b);
                 DigestChainExtend(chainA, b, 8);
                 return true;
@@ -2506,6 +2532,17 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
         !impl->derivedWin.Get(slot, &dd, &gerr))
     {
         r.status = BLOCK_INDEX_TIP_IO_ERROR;
+        return r;
+    }
+    // R2-STARTUP (workstream A): use-time self-check. The open-time O(N) full
+    // hashindex verify is skipped on a clean marker-consistent open (see
+    // ReconcileSideIndexOnOpen); a torn/stale/mismapped index entry must
+    // therefore fail closed HERE: the record stored at the index-resolved slot
+    // must equal the queried hash, else the entry resolves as absent
+    // (NOT_FOUND) — never as a different block.
+    if (rr.hash != hash)
+    {
+        r.status = BLOCK_INDEX_TIP_NOT_FOUND;
         return r;
     }
     r.status = BLOCK_INDEX_TIP_OK;
