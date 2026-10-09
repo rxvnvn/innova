@@ -396,6 +396,17 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
 void RecordGetHeadersResponse(CNode* pnode, size_t nHeaders, unsigned int nBytes);
 void LogSyncDiagnosticsMaybe();
 CNode* MaybeQueueStalledSyncRecovery(const std::vector<CNode*>& vNodes,
+                                     const uint256& hashTip,
+                                     int nTipHeight,
+                                     int nLocalHeight,
+                                     int64_t nNow,
+                                     int64_t nStallTimeout,
+                                     int64_t nCooldown,
+                                     CStalledSyncRecoveryState& state,
+                                     std::string* pstrSkipReason = NULL);
+// Legacy/test-compat shim (NOT used by the authoritative production path). The
+// production caller passes the by-value identity overload above.
+CNode* MaybeQueueStalledSyncRecovery(const std::vector<CNode*>& vNodes,
                                      CBlockIndex* pindexTip,
                                      int nLocalHeight,
                                      int64_t nNow,
@@ -2316,6 +2327,13 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     // when it was dedup-skipped or superseded by a more meaningful pending
     // request (the callers must not treat a dropped request as queued).
     bool PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
+                       ibdmetrics::GetBlocksSource source =
+                           ibdmetrics::GETBLOCKS_SOURCE_OTHER);
+    // R1 core-ownership cutover: by-value begin identity overload. Production
+    // callers pass the authoritative begin identity (hash + height) read by
+    // value, so no historical CBlockIndex* is captured or escapes cs_main.
+    // Identical single-flight queue/coalesce/dedup semantics.
+    bool PushGetBlocks(const uint256& hashBegin, int nBeginHeight, uint256 hashEnd,
                        ibdmetrics::GetBlocksSource source =
                            ibdmetrics::GETBLOCKS_SOURCE_OTHER);
     // Marks a flushed pending request as the active single-flight cycle.

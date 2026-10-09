@@ -8,6 +8,7 @@
 #include "main.h"
 #include "wallet.h"
 #include "ibdmetrics.h"
+#include "blockindex_manager.h"
 #include "ibdactivepath.h"
 #include "ibdsemantic.h"
 #include "pinglifecycletrace.h"
@@ -272,14 +273,15 @@ struct PipelineWakeSnapshot
     size_t nQueuedGetBlocks;
     size_t nOutstandingGetBlocks;
     size_t nDeferredInv;
-    CBlockIndex* pindexTip;
+    uint256 hashTip;       // R1 cutover: by-value tip identity (no CBlockIndex*)
+    int nTipHeight;
     int nLocalHeight;
     std::vector<CNode*> vDeferredPeers;
     std::vector<PipelineWakeCandidate> vCandidates;
 
     PipelineWakeSnapshot()
         : nQueuedBlocks(0), nInflightBlocks(0), nQueuedGetBlocks(0),
-          nOutstandingGetBlocks(0), nDeferredInv(0), pindexTip(NULL),
+          nOutstandingGetBlocks(0), nDeferredInv(0), hashTip(0), nTipHeight(-1),
           nLocalHeight(-1) {}
 };
 
@@ -359,11 +361,11 @@ static bool ComparePipelineWakeCandidates(const PipelineWakeCandidate& a,
 }
 
 static bool IsPipelineWakeDedupBlocked(const CNode* pnode,
-                                       CBlockIndex* pindexBegin,
+                                       const uint256& hashBegin,
                                        const uint256& hashEnd,
                                        int64_t nNow)
 {
-    return pnode->hashLastGetBlocksBegin == (pindexBegin ? pindexBegin->GetBlockHash() : uint256(0)) &&
+    return pnode->hashLastGetBlocksBegin == hashBegin &&
            pnode->hashLastGetBlocksEnd == hashEnd &&
            pnode->nLastGetBlocksTime != 0 &&
            nNow - pnode->nLastGetBlocksTime < 5;
@@ -2644,6 +2646,20 @@ CNode* MaybeQueueStalledSyncRecovery(
     int64_t nCooldown, CStalledSyncRecoveryState& state,
     std::string* pstrSkipReason)
 {
+    // Legacy/test-compat shim: extract the tip identity BY VALUE and forward.
+    // The authoritative production path never passes a historical pointer here.
+    return MaybeQueueStalledSyncRecovery(
+        vNodesIn, pindexTip ? pindexTip->GetBlockHash() : uint256(0),
+        pindexTip ? pindexTip->nHeight : -1, nLocalHeight, nNow,
+        nStallTimeout, nCooldown, state, pstrSkipReason);
+}
+
+CNode* MaybeQueueStalledSyncRecovery(
+    const std::vector<CNode*>& vNodesIn, const uint256& hashTip, int nTipHeight,
+    int nLocalHeight, int64_t nNow, int64_t nStallTimeout,
+    int64_t nCooldown, CStalledSyncRecoveryState& state,
+    std::string* pstrSkipReason)
+{
     int64_t nMaxPeerHeight = -1;
     bool fPipelineActive = false;
     std::vector<CNode*> vEligiblePeers;
@@ -2705,7 +2721,7 @@ CNode* MaybeQueueStalledSyncRecovery(
 
     bool fShouldRecover = false;
     bool fShouldRecoverEvaluated = false;
-    if (pindexTip != NULL && !vEligiblePeers.empty())
+    if (hashTip != uint256(0) && !vEligiblePeers.empty())
     {
         fShouldRecoverEvaluated = true;
         fShouldRecover = state.ShouldRecover(
@@ -2714,7 +2730,7 @@ CNode* MaybeQueueStalledSyncRecovery(
     }
 
     const char* pszFinalSkipReason = "none";
-    if (pindexTip == NULL)
+    if (hashTip == uint256(0))
         pszFinalSkipReason = "missing_tip";
     else if (vEligiblePeers.empty())
         pszFinalSkipReason = "no_eligible_peers";
@@ -2809,7 +2825,7 @@ CNode* MaybeQueueStalledSyncRecovery(
         pnodeRecovery, nLocalHeight, (int)nMaxPeerHeight, nStallAgeBefore,
         state.RecoveryAttempts());
     pnodeRecovery->PushGetBlocks(
-        pindexTip, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_RECOVERY);
+        hashTip, nTipHeight, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_RECOVERY);
 
     uint256 hashRejected;
     if (state.TakeRejectedBlockForRetry(hashRejected))
@@ -2831,7 +2847,7 @@ CNode* MaybeQueueStalledSyncRecovery(
         BlockRequestTraceStallRecovery(
             pnodeRecovery, nLocalHeight,
             (int)GetPeerAdvertisedHeight(pnodeRecovery), nAge,
-            pindexTip->GetBlockHash(), pindexTip->nHeight,
+            hashTip, nTipHeight,
             uint256(0), vNoErasedHashes);
     }
     if (SyncTraceEnabled())
@@ -4452,15 +4468,39 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
             return outcome;
         }
 
+        // R1 core-ownership cutover: read the best-tip identity BY VALUE from
+        // the V2 authority so no historical CBlockIndex* escapes cs_main.
+        uint256 hashTip = uint256(0);
+        int nTipHeight = -1;
+        {
+            std::string tipErr;
+            if (GetBlockIndexManager().BestTipHash(&hashTip, &tipErr) == BLOCK_INDEX_MANAGER_OK &&
+                GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) == BLOCK_INDEX_MANAGER_OK)
+            {
+                // authoritative by-value identity (no pointer)
+            }
+            else if (!g_fAuthoritativeStartup && pindexBest)
+            {
+                hashTip = pindexBest->GetBlockHash();
+                nTipHeight = pindexBest->nHeight;
+            }
+            else
+            {
+                hashTip = uint256(0);
+                nTipHeight = -1;
+            }
+        }
+
         if (!IsInitialBlockDownload() || fImporting || fReindex || fSPVMode ||
-            pindexBest == NULL)
+            hashTip == uint256(0))
         {
             outcome = PIPELINE_WAKE_TERMINAL_NOT_IBD;
         }
         else
         {
-            snapshot.pindexTip = pindexBest;
-            snapshot.nLocalHeight = nBestHeight;
+            snapshot.hashTip = hashTip;
+            snapshot.nTipHeight = nTipHeight;
+            snapshot.nLocalHeight = nTipHeight;
             int64_t nMaxPeerHeight = -1;
             const int64_t nNow = GetTime();
             BOOST_FOREACH(CNode* pnode, vNodesCopy)
@@ -4558,7 +4598,7 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
                 if (pnode->fDisconnect)
                     continue;
                 if (IsPipelineWakeDedupBlocked(
-                        pnode, snapshot.pindexTip, uint256(0), nNow))
+                        pnode, snapshot.hashTip, uint256(0), nNow))
                 {
                     ibdmetrics::Get().pipeline_wake_getblocks_dedup.fetch_add(
                         1, std::memory_order_relaxed);
@@ -4569,7 +4609,7 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
                 ibdmetrics::Get().pipeline_wake_getblocks_attempted.fetch_add(
                     1, std::memory_order_relaxed);
                 if (pnode->PushGetBlocks(
-                        snapshot.pindexTip, uint256(0),
+                        snapshot.hashTip, snapshot.nTipHeight, uint256(0),
                         ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE))
                 {
                     ibdmetrics::Get().pipeline_wake_getblocks_queued.fetch_add(
@@ -6334,19 +6374,28 @@ static int GetBlocksSourcePriority(ibdmetrics::GetBlocksSource source)
 bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
                          ibdmetrics::GetBlocksSource source)
 {
+    // R1 core-ownership cutover: the legacy CBlockIndex* begin identity is
+    // converted to a stable by-value (hash, height) pair here and never
+    // retained. Authoritative production callers use the by-value overload
+    // directly, so no historical CBlockIndex* leaves cs_main.
+    return PushGetBlocks(pindexBegin ? pindexBegin->GetBlockHash() : uint256(0),
+                         pindexBegin ? pindexBegin->nHeight : -1, hashEnd, source);
+}
+
+bool CNode::PushGetBlocks(const uint256& hashBeginKey, int nBeginHeight, uint256 hashEnd,
+                         ibdmetrics::GetBlocksSource source)
+{
     int64_t nNow = GetTime();
     ibdmetrics::RecordGetBlocksDecision(source);
 
     // Stage F (L6c): hash-native begin identity. No CBlockIndex* is stored or
     // queued; the getblocks locator is reconstructed by the manager at flush.
-    const uint256 hashBeginKey = pindexBegin ? pindexBegin->GetBlockHash() : uint256(0);
-    const int nBeginHeight = pindexBegin ? pindexBegin->nHeight : -1;
 
     // Diagnostic-only: capture the client-side getblocks decision.
     if (ibdexptrace::Enabled())
     {
         const int nPeerH = nBestKnownHeight >= 0 ? nBestKnownHeight : nChainHeight;
-        const int nLocH = pindexBegin ? pindexBegin->nHeight : -1;
+        const int nLocH = nBeginHeight;
         ibdexptrace::NoteGetBlocks(
             GetId(), nLocH, nPeerH,
             (nLocH >= 0 && nPeerH >= nLocH) ? (nPeerH - nLocH) : -1,
@@ -6354,7 +6403,7 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
             false, hashEnd);
     }
 
-    if ((pindexBegin ? pindexBegin->GetBlockHash() : uint256(0)) == hashLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd) {
+    if (hashBeginKey == hashLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd) {
         ibdmetrics::Get().getblocks_identical_to_last_sent.fetch_add(
             1, std::memory_order_relaxed);
         if (nNow - nLastGetBlocksTime < 5)
@@ -6370,7 +6419,7 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
         }
     }
 
-    hashLastGetBlocksBegin = pindexBegin ? pindexBegin->GetBlockHash() : uint256(0);
+    hashLastGetBlocksBegin = hashBeginKey;
     hashLastGetBlocksEnd = hashEnd;
     nLastGetBlocksTime = nNow;
 
@@ -6434,14 +6483,14 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
     {
         BlockRequestTraceGetBlocksQueued(
             this,
-            pindexBegin ? pindexBegin->GetBlockHash() : uint256(0),
-            pindexBegin ? pindexBegin->nHeight : -1,
+            hashBeginKey,
+            nBeginHeight,
             hashEnd);
     }
 
     return true;
 
-    //PushMessage("getblocks", CBlockLocator(pindexBegin), hashEnd);
+    //PushMessage("getblocks", CBlockLocator(hashBeginKey), hashEnd);
 }
 
 void CNode::PushGetHeaders(const CBlockLocator& locator, uint256 hashStop, const std::string& strReason)
@@ -9311,16 +9360,33 @@ void ThreadMessageHandler2(void* parg)
             BOOST_FOREACH(CNode* pnode, vNodesCopy)
                 pnode->ExpireBlockInFlight(nNowUs);
 
-            CBlockIndex* pindexTip = NULL;
+            // R1 core-ownership cutover: capture the best-tip identity BY VALUE
+            // under cs_main; no historical CBlockIndex* escapes the lock.
+            uint256 hashTip = uint256(0);
+            int nTipHeight = -1;
             int nLocalHeight = -1;
             bool fHaveChainState = false;
             {
                 TRY_LOCK(cs_main, lockMain);
                 if (lockMain)
                 {
-                    pindexTip = pindexBest;
-                    nLocalHeight = nBestHeight;
                     fHaveChainState = true;
+                    std::string tipErr;
+                    if (GetBlockIndexManager().BestTipHash(&hashTip, &tipErr) == BLOCK_INDEX_MANAGER_OK &&
+                        GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) == BLOCK_INDEX_MANAGER_OK)
+                    {
+                        nLocalHeight = nTipHeight;
+                    }
+                    else if (!g_fAuthoritativeStartup && pindexBest)
+                    {
+                        hashTip = pindexBest->GetBlockHash();
+                        nTipHeight = pindexBest->nHeight;
+                        nLocalHeight = nBestHeight;
+                    }
+                    else
+                    {
+                        nLocalHeight = nBestHeight; // no identity -> "missing_tip"
+                    }
                 }
             }
 
@@ -9330,7 +9396,7 @@ void ThreadMessageHandler2(void* parg)
                 {
                     LOCK(cs_stalledSyncRecovery);
                     pnodeRecovery = MaybeQueueStalledSyncRecovery(
-                        vNodesCopy, pindexTip, nLocalHeight, nNow,
+                        vNodesCopy, hashTip, nTipHeight, nLocalHeight, nNow,
                         std::max<int64_t>(
                             5, GetArg("-syncstalltimeout", 15)),
                         std::max<int64_t>(

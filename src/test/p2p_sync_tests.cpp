@@ -13608,4 +13608,83 @@ BOOST_AUTO_TEST_CASE(pos_stake_source_resolves_only_from_candidate_side_branch)
     BOOST_CHECK(forkRejectedOnMain);
 }
 
+// R1 core-ownership cutover DELETION GATE.
+//
+// Proves the STALLED-SYNC-RECOVERY production consumer works from a BY-VALUE
+// best-tip identity (hash + height) while the historical best-tip CBlockIndex*
+// is UNAVAILABLE (pindexBest == NULL). This is the SAME identity path the
+// production MsgHandlerThread now uses (net.cpp): the tip identity is read by
+// value from the V2 authority and the historical pointer never leaves cs_main.
+//
+// Discriminator: with pindexBest == NULL the LEGACY pointer form yields NO
+// recovery ("missing_tip"), whereas the by-value identity form queues the
+// recovery — so the test FAILS against the pre-migration pointer-only contract
+// and PASSES only when a real by-value identity is used.
+BOOST_AUTO_TEST_CASE(r1_stalled_recovery_identity_pointer_free_pindexbest_null)
+{
+    static const int64_t STALL_TIMEOUT = 15;
+    static const int64_t RECOVERY_COOLDOWN = 30;
+
+    // Stable by-value identity, deliberately NOT sourced from any CBlockIndex*.
+    // In production: BlockIndexManager::BestTipHash()/ActiveTipHeight().
+    const uint256 hashTipIdentity(0x13571357ull);
+    const int nTipHeightIdentity = nBestHeight;
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress(97), "identity-only-peer", true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 10);
+    std::vector<CNode*> peers;
+    peers.push_back(&peer);
+
+    // (1) Temporal gate still holds: valid identity, but before the stall
+    //     timeout there is no recovery.
+    {
+        CStalledSyncRecoveryState stateEarly;
+        stateEarly.MarkSyncRequestSent(TEST_TIME);
+        BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                        peers, hashTipIdentity, nTipHeightIdentity, nBestHeight,
+                        TEST_TIME, STALL_TIMEOUT, RECOVERY_COOLDOWN,
+                        stateEarly) == NULL);
+        BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+    }
+
+    // (2) Discriminator under pindexBest == NULL.
+    CBlockIndex* savedBest = pindexBest;
+    pindexBest = NULL;
+
+    // 2a) The LEGACY pointer form (historical object required) yields NO
+    //     recovery: with a NULL pointer the identity is absent -> missing_tip.
+    {
+        std::string skipReason;
+        CStalledSyncRecoveryState stateNull;
+        stateNull.MarkSyncRequestSent(TEST_TIME);
+        BOOST_CHECK(MaybeQueueStalledSyncRecovery(
+                        peers, (CBlockIndex*)NULL, nBestHeight,
+                        TEST_TIME + STALL_TIMEOUT,
+                        STALL_TIMEOUT, RECOVERY_COOLDOWN,
+                        stateNull, &skipReason) == NULL);
+        BOOST_CHECK_EQUAL(skipReason, std::string("missing_tip"));
+        BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 0U);
+    }
+
+    // 2b) The BY-VALUE identity form queues the recovery, with pindexBest still
+    //     NULL -> the production consumer needs NO historical CBlockIndex*.
+    {
+        CStalledSyncRecoveryState stateByValue;
+        stateByValue.MarkSyncRequestSent(TEST_TIME);
+        CNode* owner = MaybeQueueStalledSyncRecovery(
+            peers, hashTipIdentity, nTipHeightIdentity, nBestHeight,
+            TEST_TIME + STALL_TIMEOUT,
+            STALL_TIMEOUT, RECOVERY_COOLDOWN, stateByValue);
+        BOOST_REQUIRE(owner != NULL);
+        BOOST_CHECK_EQUAL(owner->getBlocksIndex.size(), 1U);
+        // by-value identity propagated verbatim (no pointer involved)
+        BOOST_CHECK(owner->getBlocksIndex[0] == hashTipIdentity);
+        BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
+        // no historical pointer fallback occurred
+        BOOST_CHECK(pindexBest == NULL);
+    }
+
+    pindexBest = savedBest;
+}
+
 BOOST_AUTO_TEST_SUITE_END()
