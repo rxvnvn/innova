@@ -97,6 +97,23 @@ BOOST_AUTO_TEST_SUITE(blockindex_activeheight_resolver_tests)
 
 BOOST_AUTO_TEST_CASE(active_snapshot_by_height_base_plus_live_tail)
 {
+    // ---- H0 isolation: snapshot ALL shared block-index globals this test mutates ----
+    // This test drives a real isolated authoritative startup + real ProcessBlock
+    // accepts, which insert entries into the shared mapBlockIndex and populate the
+    // candidate frontier / stake-seen set. ResetBlockIndexAuthoritativeStartupForTest()
+    // deletes the authority context (freeing fullResident_-owned parents whose raw
+    // pointers still sit in mapBlockIndex) but does NOT restore these containers, so
+    // the next suite inherited dangling mapBlockIndex entries + a non-genesis chain.
+    // Reset to genesis-only baseline here is NOT sufficient; restore the exact prior state.
+    const std::map<uint256, CBlockIndex*> savedMapBlockIndex = mapBlockIndex;
+    const std::map<uint256, CandidateTipRecord> savedCandidateTips = mapCandidateTips;
+    const std::set<std::pair<COutPoint, unsigned int> > savedStakeSeen = setStakeSeen;
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+
     // ---- 1. baseline connectable chain ----
     CBlockIndex* tip = pindexBest;
     while (tip->nHeight < 6)
@@ -114,11 +131,6 @@ BOOST_AUTO_TEST_CASE(active_snapshot_by_height_base_plus_live_tail)
     std::string error;
     AHRBuildRoot(root, &error);
 
-    CBlockIndex* savedBest = pindexBest;
-    CBlockIndex* savedGenesis = pindexGenesisBlock;
-    uint256 savedBestChain = hashBestChain;
-    int savedBestHeight = nBestHeight;
-    uint256 savedBestTrust = nBestChainTrust;
     const bool hadLivetail = mapArgs.count("-blockindexlivetail") != 0;
     const std::string savedLivetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
 
@@ -179,6 +191,10 @@ BOOST_AUTO_TEST_CASE(active_snapshot_by_height_base_plus_live_tail)
 
     // ---- cleanup ----
     ResetBlockIndexAuthoritativeStartupForTest();
+    // Restore the shared containers (drops the test's dangling mapBlockIndex entries).
+    mapBlockIndex = savedMapBlockIndex;
+    mapCandidateTips = savedCandidateTips;
+    setStakeSeen = savedStakeSeen;
     pindexBest = savedBest;
     pindexGenesisBlock = savedGenesis;
     hashBestChain = savedBestChain;

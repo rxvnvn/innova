@@ -9,8 +9,12 @@
 #include <cstdlib>
 #include <cstring>
 #include <openssl/sha.h>
+#include <boost/filesystem.hpp>
 #include <string>
 #include <vector>
+
+#include "blockindex_tip.h"
+#include "blockindex_tip_bounded_window.h"
 
 namespace fs = boost::filesystem;
 
@@ -1349,6 +1353,440 @@ BOOST_AUTO_TEST_CASE(r2g_v3_oracle_after_reorg)
     BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 27, &re, NULL));
     BOOST_CHECK_EQUAL(re.TipHeight(), baseTip + 3);
     printf("R2G PASS v3 oracle after reorg\n");
+}
+
+// =====================================================================
+// Repair #3 — bounded tip-authority memory regressions.
+// =====================================================================
+static bool R3DecU64(const unsigned char* d, size_t n, uint64_t* out, std::string* e)
+{
+    if (n < 8) { if (e) *e = "short"; return false; }
+    uint64_t v = 0;
+    for (int i = 0; i < 8; ++i) v |= (uint64_t)d[i] << (8 * i);
+    *out = v;
+    return true;
+}
+
+// R3-A: the bounded window itself — ring strictly bounded by its cap, pread
+// fallback for slots below the ring, byte-LRU budget, boundaries and
+// out-of-range. Proves tip-authority RAM is bounded INDEPENDENT of the number
+// of committed entries.
+BOOST_AUTO_TEST_CASE(r3a_window_bounded_pread_lru)
+{
+    const std::string dir = MakeTempDir();
+    const std::string path = dir + "/w.dat";
+    const uint64_t N = 100;
+    std::vector<unsigned char> raw;
+    for (uint64_t i = 0; i < N; ++i)
+        for (int k = 0; k < 8; ++k) raw.push_back((unsigned char)((i >> (8 * k)) & 0xff));
+    WriteRawFile(path, raw);
+    TipStoreWindow<uint64_t> w(path, 0, 8, 4 /*ringCap*/, 32 /*lruBytes = 4 entries*/, R3DecU64);
+    std::string e;
+    BOOST_REQUIRE(w.InitializeCount(N, &e));
+    BOOST_CHECK_EQUAL((uint64_t)w.Stats().ringResident, 4u);   // ring bounded by cap
+    uint64_t v = 0;
+    BOOST_REQUIRE(w.Get(0, &v, &e));  BOOST_CHECK_EQUAL(v, 0u);   // pread (below ring)
+    BOOST_REQUIRE(w.Get(50, &v, &e)); BOOST_CHECK_EQUAL(v, 50u);  // pread/LRU
+    BOOST_REQUIRE(w.Get(99, &v, &e)); BOOST_CHECK_EQUAL(v, 99u);  // ring
+    BOOST_CHECK(!w.Get(100, &v, &e));                             // out of committed range
+    uint64_t sum = 0;
+    BOOST_REQUIRE(w.StreamVisit(0, N, [&](uint64_t, const uint64_t& x) { sum += x; return true; }, &e));
+    BOOST_CHECK_EQUAL(sum, (N * (N - 1)) / 2);
+    BOOST_CHECK(w.Stats().ringResident <= 4u);
+    BOOST_CHECK(w.Stats().lruBytes <= w.Stats().lruBytesCap);
+    printf("R3A PASS bounded window (ring<=cap, pread, LRU, boundaries)\n");
+}
+
+// R3-B: by-hash / by-height lookups, parent + next-active navigation, active vs
+// side-branch membership, out-of-range NOT_FOUND, and restart equivalence.
+BOOST_AUTO_TEST_CASE(r3b_lookup_and_membership)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 700; const uint64_t baseRec = 300;
+    const uint256 hA[4] = {uint256(0xA1UL), uint256(0xA2UL), uint256(0xA3UL), uint256(0xA4UL)};
+    const uint256 side(0x51DEUL);
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 31, baseRec, baseTip, &tip, NULL));
+        uint256 prev = tip.TipHash();
+        for (int i = 0; i < 4; ++i)
+        {
+            BlockIndexRecord r = MakeRecord(hA[i], prev, baseTip + 1 + i, false);
+            BlockIndexTipAppend a; a.record = r; a.derived = MakeDerived(uint256(i + 1), 100 + i);
+            BOOST_REQUIRE(tip.Append(a, baseTip + 1 + i, NULL) == BLOCK_INDEX_TIP_OK);
+            prev = hA[i];
+        }
+        {   // side record at height baseTip+3 (competes with A3), not active
+            BlockIndexRecord r = MakeRecord(side, hA[1], baseTip + 3, false);
+            BlockIndexTipAppend a; a.record = r; a.derived = MakeDerived(uint256(4), 200);
+            BOOST_REQUIRE(tip.Append(a, -1, NULL) == BLOCK_INDEX_TIP_OK);
+        }
+        BlockIndexTipRead g = tip.LookupByHash(hA[2], NULL);
+        BOOST_CHECK(g.status == BLOCK_INDEX_TIP_OK); BOOST_CHECK(g.active);
+        BOOST_CHECK_EQUAL(g.height, baseTip + 3);
+        BlockIndexTipRead s = tip.LookupByHash(side, NULL);
+        BOOST_CHECK(s.status == BLOCK_INDEX_TIP_OK); BOOST_CHECK(!s.active);
+        BlockIndexTipRead hh = tip.LookupActiveByHeight(baseTip + 1, NULL);
+        BOOST_CHECK(hh.status == BLOCK_INDEX_TIP_OK); BOOST_CHECK(hh.record.hash == hA[0]);
+        BlockIndexTipRead p = tip.LookupParent(hA[1], NULL);
+        BOOST_CHECK(p.status == BLOCK_INDEX_TIP_OK); BOOST_CHECK(p.record.hash == hA[0]);
+        BlockIndexTipRead n = tip.LookupNextActive(hA[0], NULL);
+        BOOST_CHECK(n.status == BLOCK_INDEX_TIP_OK); BOOST_CHECK(n.record.hash == hA[1]);
+        BOOST_CHECK(tip.LookupActiveByHeight(baseTip + 40, NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
+        BOOST_CHECK(tip.LookupByHash(uint256(0xDEADUL), NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
+        tip.Close();
+    }
+    BlockIndexTipAuthority re;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 31, &re, NULL));
+    BOOST_CHECK(re.LookupByHash(hA[2], NULL).active);
+    BOOST_CHECK(!re.LookupByHash(side, NULL).active);
+    BOOST_CHECK(re.LookupActiveByHeight(baseTip + 4, NULL).record.hash == hA[3]);
+    printf("R3B PASS lookups + active/side + restart\n");
+}
+
+// R3-D: the durable hash index is DERIVED. Deleting the index dir + marker must
+// NOT change the authoritative chain: Open reconciles it from the committed
+// records and lookups stay correct.
+BOOST_AUTO_TEST_CASE(r3d_index_reconcile_missing)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 900;
+    const uint256 hA(0xAA01UL), hB(0xAA02UL);
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 33, 77, baseTip, &tip, NULL));
+        BlockIndexRecord r1 = MakeRecord(hA, tip.TipHash(), baseTip + 1, false);
+        BlockIndexTipAppend a1; a1.record = r1; a1.derived = MakeDerived(uint256(1), 1);
+        BOOST_REQUIRE(tip.Append(a1, baseTip + 1, NULL) == BLOCK_INDEX_TIP_OK);
+        BlockIndexRecord r2 = MakeRecord(hB, hA, baseTip + 2, false);
+        BlockIndexTipAppend a2; a2.record = r2; a2.derived = MakeDerived(uint256(2), 2);
+        BOOST_REQUIRE(tip.Append(a2, baseTip + 2, NULL) == BLOCK_INDEX_TIP_OK);
+        tip.Close();
+    }
+    boost::system::error_code ec;
+    boost::filesystem::remove_all((dir + "/blockindex_tip/tip-hashindex").c_str(), ec);
+    boost::filesystem::remove((dir + "/blockindex_tip/tip-hashindex.marker").c_str(), ec);
+    BlockIndexTipAuthority re; std::string err;
+    BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 33, &re, &err),
+                          "R3D: reconcile after index deletion failed: " << err);
+    BOOST_CHECK_EQUAL(re.TipHeight(), baseTip + 2);   // tip.meta authority unchanged
+    BlockIndexTipRead g = re.LookupByHash(hA, NULL);
+    BOOST_CHECK(g.status == BLOCK_INDEX_TIP_OK); BOOST_CHECK_EQUAL(g.height, baseTip + 1);
+    BOOST_CHECK(re.LookupByHash(hB, NULL).status == BLOCK_INDEX_TIP_OK);
+    printf("R3D PASS derived index rebuild/reconcile\n");
+}
+
+// R3-E: a corrupted committed record must fail closed on Open — no silent
+// acceptance and no alternative chain.
+BOOST_AUTO_TEST_CASE(r3e_corrupt_records_fail_closed)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 1100;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 34, 5, baseTip, &tip, NULL));
+        uint256 fin; BuildChain(tip, 4, &fin, tip.TipHash(), baseTip);
+        tip.Close();
+    }
+    BOOST_REQUIRE(FlipByteInFile(TipRecordsPath(dir), 64));
+    BlockIndexTipAuthority re; std::string err;
+    BOOST_CHECK_MESSAGE(!BlockIndexTipAuthority::Open(dir, 34, &re, &err),
+                        "R3E: corrupted committed record MUST fail closed");
+    printf("R3E PASS corrupt records fail-closed\n");
+}
+
+// =====================================================================
+// Repair #3 FIX-2 — derived hash-index durability / reconcile survival.
+//
+// The LevelDB hash->RecordId side index is DERIVED state, never authority.
+// These tests drive the REAL tipDir/hashindex dir + tip-hashindex.marker,
+// then corrupt the derived state in ways a crash may leave behind, and
+// REQUIRE Open to reconcile (truncate / forward-repair / full rebuild)
+// so every committed-range hash lookup resolves to the CORRECT RecordId.
+// The single durable commit point (tip.meta) is proven unchanged each time.
+// =====================================================================
+static std::string TipHashIndexPath(const std::string& dir)
+{
+    // The BlockIndexHashIndex wrapper takes the PARENT dir and appends
+    // "hashindex" itself; this returns that parent (the tip dir).
+    return dir + "/blockindex_tip";
+}
+static std::string TipHashIndexMarkerPath(const std::string& dir)
+{
+    return dir + "/blockindex_tip/tip-hashindex.marker";
+}
+
+// Repair #3 marker helper: rewrite ONLY the indexedCount field of an existing
+// marker file (magic/version preserved) — simulates an interrupted reconcile
+// that durably advanced the marker before finishing the LevelDB writes.
+static void PatchHashIndexMarkerCount(const std::string& dir, uint64_t count)
+{
+    std::vector<unsigned char> b = ReadRawFile(TipHashIndexMarkerPath(dir));
+    BOOST_REQUIRE_MESSAGE(b.size() == 16,
+                          "marker must be 16 bytes before patch; got " << b.size());
+    for (int i = 0; i < 8; ++i)
+        b[8 + i] = (unsigned char)((count >> (8 * i)) & 0xff);
+    WriteRawFile(TipHashIndexMarkerPath(dir), b);
+}
+
+// R3-F (scenario: index entry ABOVE the committed tip.meta record count —
+// index Put was durable but tip.meta publication crashed). Reopen must serve
+// lookups over the COMMITTED range exactly (the stale entry must never win),
+// and the committed tip must be unchanged.
+BOOST_AUTO_TEST_CASE(r3f_index_entry_above_committed_count_is_ignored)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 1500;
+    uint256 committedTip0;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 41, 10, baseTip, &tip, NULL));
+        uint256 fin; BuildChain(tip, 2, &fin, uint256(0xF1UL), baseTip);
+        committedTip0 = fin;
+        tip.Close();
+    }
+    // Simulate: one MORE index entry was durable than the committed records
+    // (index Put succeeded for the next block, tip.meta commit did not).
+    BlockIndexId phantomId = 10 + 2 + 1; // baseRecordCount + slot(2) + 1
+    uint256 phantomHash((unsigned long)0x999999UL);
+    {
+        // tip_dir / "hashindex": TipSideIndex passes tipDir, the wrapper
+        // appends PROJECT/BLOCK_INDEX_HASHINDEX_DIR_NAME itself.
+        BlockIndexHashIndex side;
+        std::string oerr;
+        BOOST_REQUIRE_MESSAGE(side.OpenInternal(TipHashIndexPath(dir), 0, false, false, &oerr),
+                              "R3-F: writable side-index open failed: " << oerr);
+        BOOST_REQUIRE(side.Put(phantomHash, phantomId, &oerr));
+        side.Close();
+    }
+    BlockIndexTipAuthority re; std::string err;
+    BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 41, &re, &err),
+                          "R3-F: reconcile above-committed-count failed: " << err);
+    // The stale (uncommitted) entry must NOT answer lookups.
+    BlockIndexTipRead p = re.LookupByHash(phantomHash, NULL);
+    BOOST_CHECK_MESSAGE(p.status == BLOCK_INDEX_TIP_NOT_FOUND,
+                        "R3-F: stale index entry above the committed count must be truncated, got status "
+                        << (int)p.status);
+    // Committed-range lookups must still be exact.
+    BlockIndexTipRead h1 = re.LookupByHash(uint256(0x1111UL), NULL);
+    BOOST_CHECK_MESSAGE(h1.status == BLOCK_INDEX_TIP_OK && h1.height == baseTip + 1,
+                        "R3-F: committed slot 0 broke");
+    BlockIndexTipRead h2 = re.LookupByHash(uint256(0x1112UL), NULL);
+    BOOST_CHECK_MESSAGE(h2.status == BLOCK_INDEX_TIP_OK && h2.height == baseTip + 2,
+                        "R3-F: committed slot 1 broke");
+    BOOST_CHECK_MESSAGE(re.TipHash() == committedTip0,
+                        "R3-F: committed tip must be unchanged");
+}
+
+// R3-G (scenario: PARTIAL index publication — a MIDDLE entry missing while the
+// marker claims the full count). Reconcile must detect the hole and REBUILD,
+// and the middle hash must resolve to the CORRECT RecordId afterward.
+// This is the direct test of the middle-entry hole the O(1) first/last spot
+// check historically missed (see also r3j-middle-corruption repair gate).
+BOOST_AUTO_TEST_CASE(r3g_partial_index_publication_middle_missing_rebuilt)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 2100;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 42, 10, baseTip, &tip, NULL));
+        uint256 fin; BuildChain(tip, 4, &fin, uint256(0xF2UL), baseTip); // slots 0..3
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 4u);
+        tip.Close();
+    }
+    // surgically DELETE the middle hash entry (slot 1 = hash 0x1112), keeping
+    // the marker at the full count so neither boundary probe detects the hole.
+    const uint256 hMiddle(0x1112UL);
+    {
+        BlockIndexHashIndex side;
+        std::string oerr;
+        BOOST_REQUIRE_MESSAGE(side.OpenInternal(TipHashIndexPath(dir), 0, false, false, &oerr),
+                              "R3-G: writable side-index open failed: " << oerr);
+        std::string derr;
+        BOOST_REQUIRE_MESSAGE(side.Delete(hMiddle, 10 + 1 + 1 /* true id of slot 1 */, &derr),
+                              "R3-G: delete failed: " << derr);
+        side.Close();
+    }
+    BlockIndexTipAuthority re; std::string err;
+    BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 42, &re, &err),
+                          "R3-G: reconcile with a middle hole failed: " << err);
+    // After reconcile the middle hash MUST resolve to its OWN record (slot 1,
+    // height baseTip+2) — never CORRUPT / never NOT_FOUND.
+    BlockIndexTipRead m = re.LookupByHash(hMiddle, NULL);
+    BOOST_CHECK_MESSAGE(m.status == BLOCK_INDEX_TIP_OK, "R3-G: missing middle entry not rebuilt, status "
+                        << (int)m.status);
+    BOOST_CHECK_MESSAGE(m.record.hash == hMiddle, "R3-G: middle entry resolved to the wrong record");
+    BOOST_CHECK_MESSAGE(m.height == baseTip + 2, "R3-G: middle entry resolved to the wrong height");
+    BlockIndexTipRead g = re.LookupByHash(uint256(0x1111UL), NULL);
+    BOOST_CHECK_MESSAGE(g.status == BLOCK_INDEX_TIP_OK && g.height == baseTip + 1,
+                        "R3-G: slot 0 broke after reconcile");
+    BlockIndexTipRead l = re.LookupByHash(uint256(0x1114UL), NULL);
+    BOOST_CHECK_MESSAGE(l.status == BLOCK_INDEX_TIP_OK && l.height == baseTip + 4,
+                        "R3-G: slot 3 (last) broke after reconcile");
+}
+
+// R3-H (scenario: a MIDDLE index entry was corrupted to point at the WRONG
+// RecordId, with count AND both boundary probes intact). LookupByHash must
+// never silently return the wrong record. NOTE: the current reconcile only
+// spot-checks the FIRST and LAST slots, so this test EXPECTS Open to succeed
+// but the launch/gate for the narrow middle-verification fix — asserted below.
+BOOST_AUTO_TEST_CASE(r3h_middle_entry_wrong_id_detected)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 2500;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 43, 10, baseTip, &tip, NULL));
+        uint256 fin; BuildChain(tip, 4, &fin, uint256(0xF3UL), baseTip); // slots 0..3
+        tip.Close();
+    }
+    // Corrupt slot 1 -> wrong id (slot 2's id), count unchanged, boundaries intact.
+    const uint256 hMiddle(0x1112UL);           // baseRecordCount(10)+1 -> slot 1
+    const uint256 hWrong(0x1111UL);            // baseRecordCount(10)+0 -> slot 0
+    BlockIndexId wrongId = 10 + 0 + 1;          // the WRONG committed id (slot 0)
+    {
+        BlockIndexHashIndex side;
+        std::string oerr;
+        BOOST_REQUIRE_MESSAGE(side.OpenInternal(TipHashIndexPath(dir), 0, false, false, &oerr),
+                              "R3-H: writable side-index open failed: " << oerr);
+        std::string derr;
+        BOOST_REQUIRE_MESSAGE(side.Delete(hMiddle, 10 + 1 + 1 /* true id of slot 1 */, &derr),
+                              "R3-H: delete failed: " << derr);
+        BOOST_REQUIRE_MESSAGE(side.Put(hMiddle, wrongId, &derr), "R3-H: put failed: " << derr);
+        side.Close();
+    }
+    {
+        BlockIndexTipAuthority re; std::string err;
+        BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 43, &re, &err),
+                              "R3-H: reconcile with a wrong middle id failed: " << err);
+        // The WRONG mapping must NOT win: querying 0x1112 must return the true
+        // slot-1 record. If reconcile caught the wrong id, it rebuilds and Put
+        // the correct mapping over it (LevelDB overwrite = same key path).
+        BlockIndexTipRead m = re.LookupByHash(hMiddle, NULL);
+        BOOST_CHECK_MESSAGE(m.status == BLOCK_INDEX_TIP_OK, "R3-H: middle lookup failed after reconcile, status "
+                            << (int)m.status);
+        BOOST_CHECK_MESSAGE(m.record.hash == hMiddle, "R3-H: MIDDLE ENTRY WRONG-ID NOT CAUGHT — the corrupt index "
+                            "mapped " << hMiddle.ToString() << " to another record (silent wrong result)");
+        BOOST_CHECK_MESSAGE(m.height == baseTip + 2, "R3-H: middle entry resolved to the wrong height after corrupt index");
+    }
+}
+
+// R3-I: bundled derived-index durability matrix — each scenario corrupts the
+// REAL <tipDir>/hashindex LevelDB (or the sidecar marker) in a way a crash
+// between the derived index Put and the tip.meta commit can leave behind, then
+// REQUIRES a reopen to reconcile so every committed-range lookup stays exact
+// and the committed tip (tip.meta, the single commit point) never moves.
+//   s1 stale entries after reorganization/truncation (TipRecordCount N, marker N)
+//   s2 same-count-but-different-content (all four committed entries are WRONG)
+//   s3 malformed marker (garbage bytes) forces the deterministic rebuild
+//   s4 interrupted reconcile (marker faithfully advanced, LevelDB torn)
+//   s5 repeated restart A/B: correct BEFORE corruption == identical AFTER
+BOOST_AUTO_TEST_CASE(r3i_index_stale_samecount_marker_rebuild_matrix)
+{
+    const std::string dir = MakeTempDir(); const int baseTip = 3100;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 44, 10, baseTip, &tip, NULL));
+        uint256 fin; BuildChain(tip, 4, &fin, uint256(0xF4UL), baseTip); // slots 0..3
+        tip.Close();
+    }
+    const BlockIndexId base = 10;
+    // -- s1: 4 stale entries for blocks the reorg dropped (same count N=4).
+    //    Their lookups would be a silent fork of history unless truncated.
+    {
+        BlockIndexHashIndex side; std::string oerr, werr;
+        BOOST_REQUIRE_MESSAGE(side.OpenInternal(TipHashIndexPath(dir), 0, false, false, &oerr),
+                              "R3-I s1: open failed: " << oerr);
+        for (int i = 0; i < 4; ++i)
+        {
+            uint256 ph((unsigned long)(0xFFF000UL + i));
+            BOOST_REQUIRE_MESSAGE(side.Put(ph, base + 4 + 1 + (BlockIndexId)i, &werr),
+                                  "R3-I s1 put: " << werr);
+        }
+        side.Close();
+    }
+    {
+        BlockIndexTipAuthority re; std::string oerr;
+        BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 44, &re, &oerr),
+                              "R3-I s1: reopen with stale truncation entries failed: " << oerr);
+        for (int i = 0; i < 4; ++i)
+        {
+            uint256 ph((unsigned long)(0xFFF000UL + i));
+            BOOST_CHECK_MESSAGE(re.LookupByHash(ph, NULL).status == BLOCK_INDEX_TIP_NOT_FOUND,
+                                "R3-I s1: stale reorged-out hash " << ph.ToString()
+                                << " must be truncated out of the derived index");
+        }
+        BOOST_CHECK_MESSAGE(re.TipHash() == uint256(0x1114UL), "R3-I s1: committed tip moved");
+        re.Close();
+    }
+    // -- s2: same-count-but-different-content: EVERY index entry re-points at
+    //    a wrong (still-committed) id; boundaries included so no probe helps.
+    const uint256 hs[4] = {uint256(0x1111UL), uint256(0x1112UL), uint256(0x1113UL), uint256(0x1114UL)};
+    {
+        BlockIndexHashIndex side; std::string oerr, werr;
+        BOOST_REQUIRE_MESSAGE(side.OpenInternal(TipHashIndexPath(dir), 0, false, false, &oerr),
+                              "R3-I s2: open failed: " << oerr);
+        for (int i = 0; i < 4; ++i)
+        {
+            BOOST_REQUIRE_MESSAGE(side.Delete(hs[i], base + (BlockIndexId)i + 1, &werr),
+                                  "R3-I s2 delete: " << werr);
+            BOOST_REQUIRE_MESSAGE(side.Put(hs[i], base + (BlockIndexId)((i + 1) % 4) + 1, &werr),
+                                  "R3-I s2 put: " << werr);  // next slot's id
+        }
+        side.Close();
+    }
+    {
+        BlockIndexTipAuthority re; std::string oerr;
+        BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 44, &re, &oerr),
+                              "R3-I s2: reopen with same-count-different-content failed: " << oerr);
+        for (int i = 0; i < 4; ++i)
+        {
+            BlockIndexTipRead rd = re.LookupByHash(hs[i], NULL);
+            BOOST_CHECK_MESSAGE(rd.status == BLOCK_INDEX_TIP_OK && rd.record.hash == hs[i] &&
+                                rd.height == baseTip + 1 + i,
+                                "R3-I s2: committed entry " << hs[i].ToString()
+                                << " resolved to the wrong record/height (count agree, boundaries wrong)" );
+        }
+        re.Close();
+    }
+    // -- s3: malformed marker (garbage) must force the deterministic rebuild.
+    {
+        std::vector<unsigned char> junk;
+        for (int i = 0; i < 16; ++i) junk.push_back((unsigned char)(0xA0 + i));
+        WriteRawFile(TipHashIndexMarkerPath(dir), junk);
+    }
+    {
+        BlockIndexTipAuthority re; std::string oerr;
+        BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 44, &re, &oerr),
+                              "R3-I s3: reopen with a malformed marker failed: " << oerr);
+        BlockIndexTipRead m = re.LookupByHash(uint256(0x1112UL), NULL);
+        BOOST_CHECK_MESSAGE(m.status == BLOCK_INDEX_TIP_OK && m.record.hash == uint256(0x1112UL) &&
+                            m.height == baseTip + 2,
+                            "R3-I s3: rebuild after a malformed marker broke the middle lookup");
+        re.Close();
+    }
+    // -- s4: interrupted reconcile — marker faithfully says N (=4), LevelDB torn
+    //    (this is s2's corrupt state, but the marker now MATCHES the claim).
+    PatchHashIndexMarkerCount(dir, 4);
+    {
+        BlockIndexTipAuthority re; std::string oerr;
+        BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 44, &re, &oerr),
+                              "R3-I s4: reopen with a torn index under a matching marker failed: " << oerr);
+        for (int i = 0; i < 4; ++i)
+        {
+            const uint256 h((unsigned long)(0x1111UL + i));
+            BlockIndexTipRead rd = re.LookupByHash(h, NULL);
+            BOOST_CHECK_MESSAGE(rd.status == BLOCK_INDEX_TIP_OK && rd.record.hash == h,
+                                "R3-I s4: torn index under an advanced marker must be rebuilt");
+        }
+        re.Close();
+    }
+    // -- s5: AFTER-corruption restart must equal the BEFORE-corruption restart.
+    {
+        BlockIndexTipAuthority a; std::string oerr;
+        BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 44, &a, &oerr),
+                              "R3-I s5: reopen-after-corruption failed: " << oerr);
+        BlockIndexTipRead t = a.LookupByHash(uint256(0x1113UL), NULL);
+        BOOST_CHECK_MESSAGE(t.status == BLOCK_INDEX_TIP_OK && t.record.hash == uint256(0x1113UL) &&
+                            t.height == baseTip + 3,
+                            "R3-I s5: post-corruption restart must be identical to the pre-corruption result");
+        a.Close();
+    }
+    printf("R3-I PASS reconcile matrix (stale/same-count/malformed-marker/torn/restart-equivalence)\n");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

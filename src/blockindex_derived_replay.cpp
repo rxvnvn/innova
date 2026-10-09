@@ -47,7 +47,21 @@ void ComputeDerivedFromParent(const BlockIndexRecord& rec,
                                                        rec.hashProof, rec.hash);
     out->chainTrust = parentTrust + bt;
 
-    // checksum
+    // checksum - canonical kernel.cpp GetStakeModifierChecksum semantics: a
+    // parentless NON-genesis block (non-canonical chain root / side-branch root)
+    // carries a FORCED 0 checksum, and that forced 0 feeds the descendants
+    // recurrence via parentChecksum below. Only a parentless block whose hash IS
+    // GetGenesisBlockHash() takes the parentless (genesis-shape) recurrence.
+    // Mirrors kernel.cpp GetStakeModifierChecksum, the V2 reader
+    // (blockindex_v2_reader.cpp:447-451 / 374-378) and the Stage E builder guard
+    // (blockindex_generation_builder.cpp:398). Without this, replay produced the
+    // genesis-shape value for a non-genesis root and poisoned every descendant.
+    if (rec.hashPrev == uint256(0) && rec.hash != GetGenesisBlockHash())
+    {
+        out->stakeModifierChecksum = 0;
+    }
+    else
+    {
     unsigned int parentChecksum = parentDerived.stakeModifierChecksum;
     CDataStream ss(SER_GETHASH, 0);
     if (rec.hashPrev != uint256(0)) ss << parentChecksum;
@@ -56,6 +70,7 @@ void ComputeDerivedFromParent(const BlockIndexRecord& rec,
     uint256 hc = Hash(ss.begin(), ss.end());
     hc >>= (256 - 32);
     out->stakeModifierChecksum = hc.Get64();
+    }
 
     // memo
     out->SetHasStakeModifierTime(false);

@@ -135,6 +135,13 @@ void PrintAuthoritativeResidency(const char* tag);
 // by value and persist post-S blocks with bounded residency.
 BlockIndexAuthoritativeLive* GetAuthoritativeLiveAuthority();
 
+// Stage C: the retained authoritative base reader (the single process-open
+// generation reader), or NULL when not in authoritative mode. Non-owning;
+// callers must NOT free it. Used by the Block Index Manager as the
+// generation / record-count source and offline read backend.
+class BlockIndexV2Reader;
+const BlockIndexV2Reader* GetAuthoritativeBaseReader();
+
 // G1 test-only arms for the DECISIVE causal closure (real ProcessBlock against
 // an authoritative base). A test installs its own open BlockIndexAuthoritativeLive
 // (bound to an isolated datadir generation) so the production block path observes

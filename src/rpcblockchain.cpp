@@ -9,6 +9,7 @@
 #include "txdb.h"
 #include "bootstrap.h"
 #include "blockindex_authoritative_startup.h"
+#include "blockindex_manager.h"
 #include "collateralnode.h"
 #include "activecollateralnode.h"
 #include "db.h"
@@ -68,6 +69,45 @@ double GetDifficulty(const CBlockIndex* blockindex)
     };
 
     return BitsToDouble(blockindex->nBits);
+}
+
+// Stage D: authoritative difficulty read group. When the by-value Block Index
+// Manager can serve (authoritative mode / bound reader), derive BOTH difficulty
+// figures from manager-backed by-value history — the nearest PoW and nearest PoS
+// block at or before the active tip — using the SAME BitsToDouble formula. In
+// legacy mode, or if the authority cannot answer, it declines so the caller uses
+// the existing CBlockIndex path; output/error semantics are unchanged.
+bool ManagerDifficultyPair(double* dPoW, double* dPoS)
+{
+    BlockIndexManager& mgr = GetBlockIndexManager();
+    std::string e;
+    if (!mgr.IsAvailable(&e))
+        return false;
+    uint256 tip;
+    if (mgr.BestTipHash(&tip, &e) != BLOCK_INDEX_MANAGER_OK)
+        return false;
+    BlockIndexSnapshot powBlock, posBlock;
+    if (mgr.GetLastBlockIndexByProofType(tip, false, &powBlock, &e) != BLOCK_INDEX_MANAGER_OK)
+        return false;
+    if (mgr.GetLastBlockIndexByProofType(tip, true, &posBlock, &e) != BLOCK_INDEX_MANAGER_OK)
+        return false;
+    *dPoW = BitsToDouble(powBlock.nBits);
+    *dPoS = BitsToDouble(posBlock.nBits);
+    return true;
+}
+
+// R1 slice-1 (best-tip pointer decoupling): resolve the ACTIVE TIP's scalar
+// metadata BY VALUE through the authoritative Block Index Manager, with NO
+// dependency on the historical CBlockIndex object `pindexBest`.
+//
+// Returns true when the manager (authoritative mode, or a bound V2 reader in
+// tests) resolved the committed tip. Returns false ONLY when no by-value
+// authority is available; in that case an authoritative caller MUST fail
+// closed and must NEVER fall back to `pindexBest`, while a non-authoritative
+// caller may consult the legacy globals (legacy-only behavior retained).
+static bool BestTipSnapshotByValue(BlockIndexSnapshot* out, std::string* error)
+{
+    return GetBlockIndexManager().GetTip(out, error) == BLOCK_INDEX_MANAGER_OK;
 }
 
 double GetPoWMHashPS()
@@ -153,8 +193,12 @@ static bool ReadAuthoritativeBlockByHash(const uint256& hash,
 {
     if (!snapshot || !block)
         return false;
-    if (!ResolveAuthoritativeBlockSnapshot(hash, snapshot, error))
+    std::string resolveError;
+    if (GetBlockIndexManager().LookupByHash(hash, snapshot, &resolveError) != BLOCK_INDEX_MANAGER_OK)
+    {
+        if (error) *error = resolveError.empty() ? "Block not found" : resolveError;
         return false;
+    }
     if (!block->ReadFromDisk(snapshot->nFile, snapshot->nBlockPos, true))
     {
         if (error) *error = "authoritative block: block bytes unavailable";
@@ -457,6 +501,15 @@ Value getbestblockhash(const Array& params, bool fHelp)
             "getbestblockhash\n"
             "Returns the hash of the best block in the longest block chain.");
 
+    if (g_fAuthoritativeStartup)
+    {
+        uint256 tip;
+        std::string error;
+        if (GetBlockIndexManager().BestTipHash(&tip, &error) == BLOCK_INDEX_MANAGER_OK)
+            return tip.GetHex();
+        throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "Best block unavailable" : error);
+    }
+
     return hashBestChain.GetHex();
 }
 
@@ -466,6 +519,15 @@ Value getblockcount(const Array& params, bool fHelp)
         throw runtime_error(
             "getblockcount\n"
             "Returns the number of blocks in the longest block chain.");
+
+    if (g_fAuthoritativeStartup)
+    {
+        int tipHeight = -1;
+        std::string error;
+        if (GetBlockIndexManager().ActiveTipHeight(&tipHeight, &error) == BLOCK_INDEX_MANAGER_OK)
+            return tipHeight;
+        throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "Block count unavailable" : error);
+    }
 
     return nBestHeight;
 }
@@ -478,9 +540,15 @@ Value getdifficulty(const Array& params, bool fHelp)
             "getdifficulty\n"
             "Returns the difficulty as a multiple of the minimum difficulty.");
 
+    double dPoW, dPoS;
+    if (!ManagerDifficultyPair(&dPoW, &dPoS))
+    {
+        dPoW = GetDifficulty();
+        dPoS = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+    }
     Object obj;
-    obj.push_back(Pair("proof-of-work",        GetDifficulty()));
-    obj.push_back(Pair("proof-of-stake",       GetDifficulty(GetLastBlockIndex(pindexBest, true))));
+    obj.push_back(Pair("proof-of-work",        dPoW));
+    obj.push_back(Pair("proof-of-stake",       dPoS));
     obj.push_back(Pair("search-interval",      (int)nLastCoinStakeSearchInterval));
     return obj;
 }
@@ -527,17 +595,15 @@ Value getblockhash(const Array& params, bool fHelp)
     if (nHeight < 0 || nHeight > nBestHeight)
         throw runtime_error("Block number out of range.");
 
-    if (g_fAuthoritativeStartup)
-    {
-        BlockIndexSnapshot snapshot;
-        std::string error;
-        if (!AuthoritativeGetActiveSnapshotByHeight(nHeight, &snapshot))
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block height not found in authoritative active chain");
-        return snapshot.hash.GetHex();
-    }
-
-    CBlockIndex* pblockindex = FindBlockByHeight(nHeight);
-    return pblockindex->phashBlock->GetHex();
+    // Stage F: authoritative-only. LEGACY_RESIDENT is retired (init hard-fails
+    // unless the authoritative V2 startup succeeded), so the historical
+    // FindBlockByHeight()/CBlockIndex* fallback was unreachable production code
+    // and is physically deleted. The active-chain height lookup is by-value.
+    BlockIndexSnapshot snapshot;
+    std::string error;
+    if (GetBlockIndexManager().GetActiveByHeight(nHeight, &snapshot, &error) != BLOCK_INDEX_MANAGER_OK)
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block height not found in authoritative active chain");
+    return snapshot.hash.GetHex();
 }
 
 //New getblock RPC Command for Innovaium Compatibility
@@ -677,6 +743,23 @@ Value getblockheader(const Array& params, bool fHelp)
     if (params.size() > 1)
         fVerbose = params[1].get_bool();
 
+    if (g_fAuthoritativeStartup)
+    {
+        LOCK(cs_main);
+        BlockIndexSnapshot snapshot;
+        CBlock block;
+        std::string error;
+        if (!ReadAuthoritativeBlockByHash(hash, &snapshot, &block, &error))
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error.empty() ? "Block not found" : error);
+        if (!fVerbose)
+        {
+            CDataStream ssBlock(SER_NETWORK, PROTOCOL_VERSION);
+            ssBlock << block;
+            return HexStr(ssBlock.begin(), ssBlock.end());
+        }
+        return AuthoritativeBlockHeaderToJSON(block, snapshot);
+    }
+
     if (mapBlockIndex.count(hash) == 0)
         throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
 
@@ -755,7 +838,7 @@ Value getblockbynumber(const Array& params, bool fHelp)
         BlockIndexSnapshot snapshot;
         CBlock block;
         std::string error;
-        if (!AuthoritativeGetActiveSnapshotByHeight(nHeight, &snapshot) ||
+        if (GetBlockIndexManager().GetActiveByHeight(nHeight, &snapshot, &error) != BLOCK_INDEX_MANAGER_OK ||
             !block.ReadFromDisk(snapshot.nFile, snapshot.nBlockPos, true))
             throw JSONRPCError(RPC_MISC_ERROR, "Authoritative block bytes unavailable");
         return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
@@ -945,6 +1028,14 @@ Value gettxout(const Array& params, bool fHelp)
 
     LOCK(cs_main);
 
+    // R1 slice-1: resolve the active tip BY VALUE (bestblock hash + tip height)
+    // from the authoritative block-index manager. On the authoritative path a
+    // failure fails closed; the historical pindexBest object is never dereferenced.
+    BlockIndexSnapshot tipSnapshot; std::string tipError;
+    const bool fTipByValue = BestTipSnapshotByValue(&tipSnapshot, &tipError);
+    if (!fTipByValue && g_fAuthoritativeStartup)
+        throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Best block unavailable" : tipError);
+
     Object ret;
 
     uint256 hash;
@@ -962,7 +1053,7 @@ Value gettxout(const Array& params, bool fHelp)
     if (n<0 || (unsigned int)n>=tx.vout.size() || tx.vout[n].IsNull())
       return Value::null;
 
-    ret.push_back(Pair("bestblock", pindexBest->GetBlockHash().GetHex()));
+    ret.push_back(Pair("bestblock", (fTipByValue ? tipSnapshot.hash : pindexBest->GetBlockHash()).GetHex()));
     if (hashBlock == 0)
       ret.push_back(Pair("confirmations", 0));
     else
@@ -1002,7 +1093,7 @@ Value gettxout(const Array& params, bool fHelp)
           if(isSpent)
             return Value::null;
 
-          ret.push_back(Pair("confirmations", pindexBest->nHeight - pindex->nHeight + 1));
+          ret.push_back(Pair("confirmations", (fTipByValue ? tipSnapshot.height : pindexBest->nHeight) - pindex->nHeight + 1));
         }
         else
           return Value::null;
@@ -1047,12 +1138,29 @@ Value getblockchaininfo(const Array& params, bool fHelp)
     obj.push_back(Pair("blocks",         (int)nBestHeight));
     obj.push_back(Pair("bestblockhash",  hashBestChain.GetHex()));
 
-    diff.push_back(Pair("proof-of-work",  GetDifficulty()));
-    diff.push_back(Pair("proof-of-stake", GetDifficulty(GetLastBlockIndex(pindexBest, true))));
+    double dPoW, dPoS;
+    if (!ManagerDifficultyPair(&dPoW, &dPoS))
+    {
+        dPoW = GetDifficulty();
+        dPoS = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+    }
+    diff.push_back(Pair("proof-of-work",  dPoW));
+    diff.push_back(Pair("proof-of-stake", dPoS));
 
     obj.push_back(Pair("difficulty",     diff));
     obj.push_back(Pair("initialblockdownload",  IsInitialBlockDownload()));
-    obj.push_back(Pair("moneysupply",   ValueFromAmount(pindexBest->nMoneySupply)));
+    // R1 slice-1: best-tip money supply read BY VALUE from the authoritative
+    // block-index manager. The historical pindexBest object is NOT dereferenced
+    // on the authoritative path (a failure fails closed rather than falling back).
+    {
+        BlockIndexSnapshot tipSnapshot; std::string tipError;
+        if (BestTipSnapshotByValue(&tipSnapshot, &tipError))
+            obj.push_back(Pair("moneysupply", ValueFromAmount(tipSnapshot.nMoneySupply)));
+        else if (g_fAuthoritativeStartup)
+            throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Money supply unavailable" : tipError);
+        else
+            obj.push_back(Pair("moneysupply", ValueFromAmount(pindexBest->nMoneySupply)));
+    }
     //obj.push_back(Pair("size_on_disk",   CalculateCurrentUsage()));
     return obj;
 }
@@ -1154,15 +1262,30 @@ Value getstakemodifiercheckpoints(const Array& params, bool fHelp)
 
     LOCK(cs_main);
 
-    if (!pindexBest)
-        throw runtime_error("Block index not available");
+    // R1 slice-1: the best-tip height is read BY VALUE from the authoritative
+    // block-index manager; the historical pindexBest object is not dereferenced
+    // on the authoritative path (a failure fails closed rather than falling back).
+    int nBestTipHeight = -1;
+    {
+        BlockIndexSnapshot tipSnapshot; std::string tipError;
+        if (BestTipSnapshotByValue(&tipSnapshot, &tipError))
+            nBestTipHeight = tipSnapshot.height;
+        else if (g_fAuthoritativeStartup)
+            throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Block index not available" : tipError);
+        else
+        {
+            if (!pindexBest)
+                throw runtime_error("Block index not available");
+            nBestTipHeight = pindexBest->nHeight;
+        }
+    }
 
     Object result;
     Array checkpoints;
     std::string cppOutput = "// Stake modifier checkpoints - generated by getstakemodifiercheckpoints\n";
 
     int nCurrentHeight = nStartHeight;
-    int nBestHeight = pindexBest->nHeight;
+    int nBestHeight = nBestTipHeight;
 
     while (nCurrentHeight <= nBestHeight)
     {

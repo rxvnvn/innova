@@ -642,6 +642,13 @@ AuthoritativeBlockResolutionResult ResolveAuthoritativeBlockSnapshotR(
     return AUTHORITATIVE_BLOCK_FOUND;
 }
 
+const BlockIndexV2Reader* GetAuthoritativeBaseReader()
+{
+    if (!g_fAuthoritativeStartup || !g_authoritativeContext)
+        return NULL;
+    return g_authoritativeContext->bootstrap.ReaderPtr();
+}
+
 bool ResolveAuthoritativeBlockSnapshot(const uint256& hash,
                                        BlockIndexSnapshot* out,
                                        std::string* error)

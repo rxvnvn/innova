@@ -253,6 +253,12 @@ BOOST_AUTO_TEST_CASE(g1_live_acceptance_tip_advance_restart)
     }
 
     // G1-D: authoritative restart from base + tip recovers S+2 (not S).
+    // A restart means the PREVIOUS holder releases the tip-dir LevelDB LOCK: the
+    // LOCK is EXCLUSIVE by contract (never bypassed), so opening a second
+    // authority while the first is still open legitimately fails with
+    // "LOCK already held". Model the restart by closing the live authority
+    // FIRST, then reopening the same on-disk tip.
+    live.Close();
     {
         BlockIndexTipAuthority tip2;
         BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(fx.rootStr, 1, &tip2, &error), error);
@@ -260,7 +266,6 @@ BOOST_AUTO_TEST_CASE(g1_live_acceptance_tip_advance_restart)
         BOOST_REQUIRE(tip2.TipHash() == h2);
     }
 
-    live.Close();
     reader.Close();
     printf("G1 PASS: S=4, accepted S+1..S+2 (tip advance), restart at S+2,\n"
            "       historical mapBlockIndex residency 0.\n");

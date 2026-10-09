@@ -426,6 +426,37 @@ bool BlockIndexHashIndex::Put(const uint256& hash, BlockIndexId id, std::string*
     return true;
 }
 
+bool BlockIndexHashIndex::Delete(const uint256& hash, BlockIndexId expectedId, std::string* error)
+{
+    if (!IsOpen())
+        return SetError(error, "hashindex is not open");
+    if (state->logicalReadOnly)
+        return SetError(error, "hashindex is logically read-only");
+    LOCK(state->cs);
+    std::string key;
+    if (!EncodeBlockIndexHashKey(hash, &key, error))
+        return false;
+    bool notFound = false;
+    std::string existing;
+    if (!LevelDbGet(state->db, key, &existing, error, &notFound))
+        return false;
+    if (notFound)
+    {
+        ClearError(error);
+        return true; // already absent
+    }
+    BlockIndexId existingId = BLOCK_INDEX_ID_INVALID;
+    if (!DecodeBlockIndexRecordIdValue(existing.data(), existing.size(), &existingId, error))
+        return false;
+    if (existingId != expectedId)
+        return SetError(error, "hashindex residue id mismatch (refusing delete)");
+    leveldb::Status status = state->db->Delete(leveldb::WriteOptions(), key);
+    if (!status.ok())
+        return SetError(error, std::string("hashindex delete failure: ") + status.ToString());
+    ClearError(error);
+    return true;
+}
+
 BlockIndexHashLookupStatus BlockIndexHashIndex::Lookup(const uint256& hash, BlockIndexId* outId, std::string* error) const
 {
     if (!IsOpen())

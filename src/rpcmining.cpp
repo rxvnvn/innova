@@ -83,8 +83,15 @@ Value getmininginfo(const Array& params, bool fHelp)
     obj.push_back(Pair("currentblocktx",(uint64_t)nLastBlockTx));
 
     nSectionStart = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
-    diff.push_back(Pair("proof-of-work",  GetDifficulty()));
-    diff.push_back(Pair("proof-of-stake", GetDifficulty(GetLastBlockIndex(pindexBest, true))));
+    extern bool ManagerDifficultyPair(double* dPoW, double* dPoS);
+    double dPoW, dPoS;
+    if (!ManagerDifficultyPair(&dPoW, &dPoS))
+    {
+        dPoW = GetDifficulty();
+        dPoS = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+    }
+    diff.push_back(Pair("proof-of-work",  dPoW));
+    diff.push_back(Pair("proof-of-stake", dPoS));
     if (fRPCPerfTrace)
     {
         const int64_t nDuration = RPCPerfTimeMicros() - nSectionStart;
@@ -176,7 +183,11 @@ Value getstakinginfo(const Array& params, bool fHelp)
     obj.push_back(Pair("currentblocktx", (uint64_t)nLastBlockTx));
     obj.push_back(Pair("pooledtx", (uint64_t)mempool.size()));
 
-    obj.push_back(Pair("difficulty", GetDifficulty(GetLastBlockIndex(pindexBest, true))));
+    extern bool ManagerDifficultyPair(double* dPoW, double* dPoS);
+    double dPoWgt, dPoSgt;
+    if (!ManagerDifficultyPair(&dPoWgt, &dPoSgt))
+        dPoSgt = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+    obj.push_back(Pair("difficulty", dPoSgt));
     obj.push_back(Pair("search-interval", (int)nLastCoinStakeSearchInterval));
 
     obj.push_back(Pair("weight", (uint64_t)nWeight));

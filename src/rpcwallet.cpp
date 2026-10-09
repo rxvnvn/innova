@@ -17,6 +17,7 @@
 #include "collateral.h"
 #include "ringsig.h"
 #include "txdb.h"
+#include "blockindex_manager.h"
 
 #include <openssl/crypto.h>
 #include <chrono>
@@ -270,7 +271,18 @@ Value getinfo(const Array& params, bool fHelp)
 
     obj.push_back(Pair("blocks",        (int)nBestHeight));
     obj.push_back(Pair("timeoffset",    (int64_t)GetTimeOffset()));
-    obj.push_back(Pair("moneysupply",   ValueFromAmount(pindexBest->nMoneySupply)));
+    // R1 slice-1: best-tip money supply read BY VALUE from the authoritative
+    // block-index manager. The historical pindexBest object is NOT dereferenced
+    // on the authoritative path (a failure fails closed rather than falling back).
+    {
+        BlockIndexSnapshot tipSnapshot; std::string tipError;
+        if (GetBlockIndexManager().GetTip(&tipSnapshot, &tipError) == BLOCK_INDEX_MANAGER_OK)
+            obj.push_back(Pair("moneysupply", ValueFromAmount(tipSnapshot.nMoneySupply)));
+        else if (g_fAuthoritativeStartup)
+            throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Money supply unavailable" : tipError);
+        else
+            obj.push_back(Pair("moneysupply", ValueFromAmount(pindexBest->nMoneySupply)));
+    }
     obj.push_back(Pair("connections",   nConnections));
     obj.push_back(Pair("datareceived",  bytesReadable(CNode::GetTotalBytesRecv())));
     obj.push_back(Pair("datasent",      bytesReadable(CNode::GetTotalBytesSent())));
@@ -288,8 +300,15 @@ Value getinfo(const Array& params, bool fHelp)
     if(!fNativeTor)
         obj.push_back(Pair("ip", addrSeenByPeer.ToStringIP()));
 
-    diff.push_back(Pair("proof-of-work", GetDifficulty()));
-    diff.push_back(Pair("proof-of-stake", GetDifficulty(GetLastBlockIndex(pindexBest, true))));
+    extern bool ManagerDifficultyPair(double* dPoW, double* dPoS);
+    double dPoWsi, dPoSsi;
+    if (!ManagerDifficultyPair(&dPoWsi, &dPoSsi))
+    {
+        dPoWsi = GetDifficulty();
+        dPoSsi = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+    }
+    diff.push_back(Pair("proof-of-work", dPoWsi));
+    diff.push_back(Pair("proof-of-stake", dPoSsi));
     obj.push_back(Pair("difficulty", diff));
 
     nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);

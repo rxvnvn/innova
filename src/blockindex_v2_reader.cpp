@@ -253,8 +253,25 @@ BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const
         s.hasStakeModifierChecksum = true;
         // stake-modifier TIME availability stays governed by the derived entry's
         // own flag (a zero time is valid; availability is separate).
+        // Stage D: surface the derived serialized block size. Availability is
+        // governed by the entry's own HAS_BLOCK_SIZE flag: an absent flag means
+        // \"unavailable\" (hasBlockSize=false), NOT a zero value. The persisted
+        // derived representation is used verbatim; the block file is never
+        // rescanned here.
+        s.nSize = (unsigned int)de.nSize;
+        s.hasBlockSize = (de.flags & BLOCK_INDEX_DERIVED_FLAG_HAS_BLOCK_SIZE) != 0;
     }
     return s;
+}
+BlockIndexV2ReadStatus BlockIndexV2Reader::GetBlockSize(BlockIndexId id, unsigned int* out, bool* outHasSize, std::string* error) const {
+    if (!out || !outHasSize) { Fail(error, "null block size output"); return BLOCK_INDEX_V2_READ_IO_ERROR; }
+    BlockIndexSnapshot s;
+    BlockIndexV2ReadStatus r = GetRecordById(id, &s, error);
+    if (r != BLOCK_INDEX_V2_READ_FOUND) { *out = 0; *outHasSize = false; return r; }
+    *out = s.nSize;
+    *outHasSize = s.hasBlockSize;
+    Clear(error);
+    return BLOCK_INDEX_V2_READ_FOUND;
 }
 void BlockIndexV2Reader::CachePut(const BlockIndexSnapshot& s) const {
     if (cacheCapacity == 0) return;

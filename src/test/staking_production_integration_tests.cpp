@@ -3234,6 +3234,78 @@ static unsigned int F1Flags(int h)
 }
 static uint256 F1Hash(int h) { return uint256(0xF10000 + h); }
 
+// Stage G final (Workstream A): an EXPLICIT, fixture-owned by-value hot oracle.
+// It represents the fixture's actual hot/live records (all heights) as value
+// snapshots with REAL parent edges - no global live-authority singleton and no
+// historical CBlockIndex* graph is required to discover ancestry. Installed via
+// ColdHotSeamNavigator::SetTestHotResolver so the authoritative by-value
+// candidate walker can resolve hot-tail ancestors by value.
+struct F1HotResolver : public ColdHotHotResolver
+{
+    std::map<uint256, BlockIndexSnapshot> byHash;
+    std::map<int, BlockIndexSnapshot> byHeight;
+    uint256 tipHash;
+
+    static BlockIndexSnapshot Snap(int h, int64_t nTime0, int64_t nSpacing)
+    {
+        BlockIndexSnapshot s;
+        s.found = true;
+        s.id = (BlockIndexId)(0x10000 + h);
+        s.hash = F1Hash(h);
+        s.hashPrev = (h == 0) ? uint256(0) : F1Hash(h - 1);
+        s.hasParent = (h > 0);
+        s.parentId = (h > 0) ? (BlockIndexId)(0x10000 + h - 1) : BLOCK_INDEX_ID_INVALID;
+        s.height = h;
+        s.nVersion = 1;
+        s.nTime = (unsigned int)(nTime0 + (int64_t)h * nSpacing);
+        s.nBits = 0x1d00ffff;
+        s.nFlags = F1Flags(h);
+        s.nStakeModifier = 100 + h;
+        s.hashProof = uint256(0xA0000 + h);
+        s.fProofOfStake = ((s.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) != 0);
+        s.fInMainChain = true;
+        if (h % 2 == 1) { s.prevoutStake = COutPoint(F1Hash(h), 0); s.nStakeTime = s.nTime; }
+        return s;
+    }
+
+    void Build(int nBlocks, int64_t nTime0, int64_t nSpacing)
+    {
+        byHash.clear(); byHeight.clear();
+        for (int h = 0; h < nBlocks; ++h)
+        {
+            BlockIndexSnapshot s = Snap(h, nTime0, nSpacing);
+            byHash[s.hash] = s;
+            byHeight[h] = s;
+        }
+        tipHash = F1Hash(nBlocks - 1);
+    }
+
+    BlockIndexSnapshot LookupByHash(const uint256& hash) const
+    {
+        std::map<uint256, BlockIndexSnapshot>::const_iterator it = byHash.find(hash);
+        return it == byHash.end() ? BlockIndexSnapshot() : it->second;
+    }
+    BlockIndexSnapshot GetActiveByHeight(int height) const
+    {
+        std::map<int, BlockIndexSnapshot>::const_iterator it = byHeight.find(height);
+        return it == byHeight.end() ? BlockIndexSnapshot() : it->second;
+    }
+    BlockIndexSnapshot GetParentByHash(const uint256& hash) const
+    {
+        std::map<uint256, BlockIndexSnapshot>::const_iterator it = byHash.find(hash);
+        if (it == byHash.end() || !it->second.hasParent) return BlockIndexSnapshot();
+        return LookupByHash(it->second.hashPrev);
+    }
+    BlockIndexSnapshot GetNextActiveByHash(const uint256& hash) const
+    {
+        std::map<uint256, BlockIndexSnapshot>::const_iterator it = byHash.find(hash);
+        if (it == byHash.end()) return BlockIndexSnapshot();
+        std::map<int, BlockIndexSnapshot>::const_iterator nx = byHeight.find(it->second.height + 1);
+        return nx == byHeight.end() ? BlockIndexSnapshot() : nx->second;
+    }
+    BlockIndexSnapshot GetTip() const { return LookupByHash(tipHash); }
+};
+
 struct F1Fixture
 {
     boost::filesystem::path root;
@@ -3243,6 +3315,7 @@ struct F1Fixture
     std::vector<CBlockIndex*> created;
     std::vector<boost::filesystem::path> roots;
     F1Spec spec;
+    F1HotResolver hot; // explicit by-value hot oracle (Stage G final)
 
     F1Fixture() : savedBest(pindexBest), savedGenesis(pindexGenesisBlock),
         savedHashBest(hashBestChain), savedTrust(nBestChainTrust),
@@ -3269,6 +3342,9 @@ struct F1Fixture
     void Build(const F1Spec& s)
     {
         spec = s;
+        // Stage G final: explicit by-value hot oracle over the SAME logical chain
+        // (all heights 0..nBlocks-1), so hot-tail ancestry is resolvable by value.
+        hot.Build(s.nBlocks, s.nTime0, s.nSpacing);
         // (1) V2 generation mirroring the SAME logical chain (0..nSeam).
         BlockIndexGenerationSource prefix;
         for (int h = 0; h <= s.nSeam; ++h)
@@ -3351,6 +3427,10 @@ struct F1Fixture
             std::string e;
             BOOST_REQUIRE_MESSAGE(RetainBlockIndexStakingNavigator(root.string(), &e), e);
             BOOST_REQUIRE(GetBlockIndexStakingNavigator() != NULL);
+            // Stage G final: install the explicit fixture-owned by-value hot oracle
+            // so hot-tail ancestors resolve by value (no live-authority singleton).
+            const_cast<ColdHotSeamNavigator*>(GetBlockIndexStakingNavigator())
+                ->SetTestHotResolver(&hot);
         }
         else
         {

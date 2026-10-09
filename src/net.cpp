@@ -363,7 +363,7 @@ static bool IsPipelineWakeDedupBlocked(const CNode* pnode,
                                        const uint256& hashEnd,
                                        int64_t nNow)
 {
-    return pnode->pindexLastGetBlocksBegin == pindexBegin &&
+    return pnode->hashLastGetBlocksBegin == (pindexBegin ? pindexBegin->GetBlockHash() : uint256(0)) &&
            pnode->hashLastGetBlocksEnd == hashEnd &&
            pnode->nLastGetBlocksTime != 0 &&
            nNow - pnode->nLastGetBlocksTime < 5;
@@ -2612,17 +2612,16 @@ uint64_t RecoveryTraceTrigger(CNode* pnode, int nLocalHeight, int nPeerHeight,
     return id;
 }
 
-void RecoveryTraceQueue(CNode* pnode, uint64_t id, CBlockIndex* pindexBegin,
+void RecoveryTraceQueue(CNode* pnode, uint64_t id, uint256 hashBegin, int nHeightBegin,
                         uint256 hashStop, size_t before, size_t after)
 {
     if (!id || !BlockRequestTraceEnabled()) return;
     printf("RECOVERY_GETBLOCKS_QUEUE recovery_id=%llu peer_id=%d locator_tip=%s locator_height=%d stop_hash=%s queue_before=%zu queue_after=%zu\n",
            (unsigned long long)id, pnode->GetId(),
-           pindexBegin ? pindexBegin->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(),
-           pindexBegin ? pindexBegin->nHeight : -1, hashStop.ToString().c_str(), before, after);
+           hashBegin.ToString().c_str(), nHeightBegin, hashStop.ToString().c_str(), before, after);
 }
 
-void RecoveryTraceSend(CNode* pnode, uint64_t id, CBlockIndex* pindexBegin,
+void RecoveryTraceSend(CNode* pnode, uint64_t id, uint256 hashBegin, int nHeightBegin,
                        uint256 hashStop, size_t before)
 {
     if (!id)
@@ -2631,8 +2630,7 @@ void RecoveryTraceSend(CNode* pnode, uint64_t id, CBlockIndex* pindexBegin,
     if (BlockRequestTraceEnabled())
         printf("RECOVERY_GETBLOCKS_SEND recovery_id=%llu peer_id=%d locator_tip=%s locator_height=%d stop_hash=%s queue_size_before_clear=%zu\n",
                (unsigned long long)id, pnode->GetId(),
-               pindexBegin ? pindexBegin->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(),
-               pindexBegin ? pindexBegin->nHeight : -1, hashStop.ToString().c_str(), before);
+               hashBegin.ToString().c_str(), nHeightBegin, hashStop.ToString().c_str(), before);
     RecoveryResponseResult previous;
     const bool fHadPrevious = pnode->SupersedeRecoveryResponseWindow(nNow, previous);
     if (fHadPrevious && BlockRequestTraceEnabled())
@@ -6339,6 +6337,11 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
     int64_t nNow = GetTime();
     ibdmetrics::RecordGetBlocksDecision(source);
 
+    // Stage F (L6c): hash-native begin identity. No CBlockIndex* is stored or
+    // queued; the getblocks locator is reconstructed by the manager at flush.
+    const uint256 hashBeginKey = pindexBegin ? pindexBegin->GetBlockHash() : uint256(0);
+    const int nBeginHeight = pindexBegin ? pindexBegin->nHeight : -1;
+
     // Diagnostic-only: capture the client-side getblocks decision.
     if (ibdexptrace::Enabled())
     {
@@ -6351,7 +6354,7 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
             false, hashEnd);
     }
 
-    if (pindexBegin == pindexLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd) {
+    if ((pindexBegin ? pindexBegin->GetBlockHash() : uint256(0)) == hashLastGetBlocksBegin && hashEnd == hashLastGetBlocksEnd) {
         ibdmetrics::Get().getblocks_identical_to_last_sent.fetch_add(
             1, std::memory_order_relaxed);
         if (nNow - nLastGetBlocksTime < 5)
@@ -6367,7 +6370,7 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
         }
     }
 
-    pindexLastGetBlocksBegin = pindexBegin;
+    hashLastGetBlocksBegin = pindexBegin ? pindexBegin->GetBlockHash() : uint256(0);
     hashLastGetBlocksEnd = hashEnd;
     nLastGetBlocksTime = nNow;
 
@@ -6376,13 +6379,13 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
 
     if (getBlocksIndex.empty())
     {
-        getBlocksIndex.push_back(pindexBegin);
+        getBlocksIndex.push_back(hashBeginKey);
         getBlocksHash.push_back(hashEnd);
         getBlocksSources.push_back(source);
         getBlocksRecoveryIds.push_back(nRecoveryId);
         ibdmetrics::GetBlocksQueuedAdd(1, true);
         ibdmetrics::RecordGetBlocksQueueSuccess(source);
-        RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
+        RecoveryTraceQueue(this, nRecoveryId, hashBeginKey, nBeginHeight, hashEnd,
                            0, getBlocksIndex.size());
     }
     else
@@ -6396,24 +6399,24 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
         // source (the stalled sync it serves is more urgent than whatever
         // could be pending).
         const ibdmetrics::GetBlocksSource existingSource = getBlocksSources[0];
-        if (getBlocksIndex[0] == pindexBegin && getBlocksHash[0] == hashEnd)
+        if (getBlocksIndex[0] == hashBeginKey && getBlocksHash[0] == hashEnd)
         {
             ibdmetrics::Get().getblocks_pending_coalesce.fetch_add(
                 1, std::memory_order_relaxed);
-            RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
+            RecoveryTraceQueue(this, nRecoveryId, hashBeginKey, nBeginHeight, hashEnd,
                                getBlocksIndex.size(), getBlocksIndex.size());
             return true;
         }
         if (GetBlocksSourcePriority(source) >
             GetBlocksSourcePriority(existingSource))
         {
-            getBlocksIndex[0] = pindexBegin;
+            getBlocksIndex[0] = hashBeginKey;
             getBlocksHash[0] = hashEnd;
             getBlocksSources[0] = source;
             getBlocksRecoveryIds[0] = nRecoveryId;
             ibdmetrics::Get().getblocks_pending_replaced.fetch_add(
                 1, std::memory_order_relaxed);
-            RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
+            RecoveryTraceQueue(this, nRecoveryId, hashBeginKey, nBeginHeight, hashEnd,
                                getBlocksIndex.size() - 1,
                                getBlocksIndex.size());
         }
@@ -6421,7 +6424,7 @@ bool CNode::PushGetBlocks(CBlockIndex* pindexBegin, uint256 hashEnd,
         {
             ibdmetrics::Get().getblocks_pending_drop.fetch_add(
                 1, std::memory_order_relaxed);
-            RecoveryTraceQueue(this, nRecoveryId, pindexBegin, hashEnd,
+            RecoveryTraceQueue(this, nRecoveryId, hashBeginKey, nBeginHeight, hashEnd,
                                getBlocksIndex.size(), getBlocksIndex.size());
             return false;
         }
@@ -7120,7 +7123,7 @@ bool CNode::ExpireGetBlocksOutstanding(int64_t now_us)
     // request so the same locator can be retried without the 5 s identical-
     // locator dedup (PushGetBlocks / IsPipelineWakeDedupBlocked) or the 10 s
     // continuation cooldown (nLastGetBlocksTime == 0) blocking the retry.
-    pindexLastGetBlocksBegin = NULL;
+    hashLastGetBlocksBegin = 0;
     hashLastGetBlocksEnd = 0;
     nLastGetBlocksTime = 0;
     // One-shot wake/cooldown bypass: the expired cycle must be retried

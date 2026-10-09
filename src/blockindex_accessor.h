@@ -47,8 +47,13 @@ struct BlockIndexSnapshot
     bool fInMainChain;
     uint64_t nStakeModifierTime;    // value is consumable only when hasStakeModifierTime
     unsigned int nStakeModifierChecksum; // value is consumable only when hasStakeModifierChecksum
+    // Derived serialized block size (derived.dat). Value is consumable ONLY when
+    // hasBlockSize is true: a zero is never \"available\", and an absent/uncapable
+    // generation leaves hasBlockSize=false (fail closed, never zero-substituted).
+    unsigned int nSize;
     bool hasStakeModifierTime;
     bool hasStakeModifierChecksum;
+    bool hasBlockSize;
 
     BlockIndexSnapshot()
         : found(false),
@@ -78,8 +83,10 @@ struct BlockIndexSnapshot
           fInMainChain(false),
           nStakeModifierTime(0),
           nStakeModifierChecksum(0),
+          nSize(0),
           hasStakeModifierTime(false),
-          hasStakeModifierChecksum(false)
+          hasStakeModifierChecksum(false),
+          hasBlockSize(false)
     {
     }
 };

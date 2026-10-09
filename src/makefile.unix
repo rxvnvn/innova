@@ -414,6 +414,7 @@ OBJS= \
     obj/blockindex_authoritative_startup.o \
     obj/blockindex_residency_counters.o \
     obj/blockindex_v2_reader.o \
+    obj/blockindex_manager.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 else
@@ -519,6 +520,7 @@ OBJS= \
     obj/blockindex_authoritative_startup.o \
     obj/blockindex_residency_counters.o \
     obj/blockindex_v2_reader.o \
+    obj/blockindex_manager.o \
     obj/blockindex_authority_materializer.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
@@ -558,6 +560,7 @@ TEST_OBJS= \
     obj/test/cblocklocator_tests.o \
     obj/test/invalidate_reconsider_tests.o \
     obj/test/blockindex_accessor_tests.o \
+    obj/test/blockindex_manager_tests.o \
     obj/test/blockindex_startup_authority_tests.o \
     obj/test/blockindex_startup_seam_tests.o \
     obj/test/blockindex_startup_bootstrap_tests.o \

@@ -85,6 +85,11 @@ public:
     BlockIndexV2ReadStatus GetAncestor(BlockIndexId id, int targetHeight, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetStakeModifierTime(BlockIndexId id, int64_t* out, std::string* error) const;
     BlockIndexV2ReadStatus GetStakeModifierChecksum(BlockIndexId id, unsigned int* out, std::string* error) const;
+    // Derived serialized block size from derived.dat (Stage D). *outHasSize is
+    // false when the generation/record carries no authoritative value: an absent
+    // value is reported unavailable, NEVER as zero, and never by rescanning the
+    // block file.
+    BlockIndexV2ReadStatus GetBlockSize(BlockIndexId id, unsigned int* out, bool* outHasSize, std::string* error) const;
     BlockIndexV2ReadStatus GetStakingMetadata(BlockIndexId id, BlockIndexStakingMetadata* out, std::string* error) const;
     BlockIndexV2ReadStatus FindFork(BlockIndexId a, BlockIndexId b, BlockIndexSnapshot* out, std::string* error) const;
 

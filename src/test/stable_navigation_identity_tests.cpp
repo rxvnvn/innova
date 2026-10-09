@@ -130,10 +130,15 @@ BOOST_FIXTURE_TEST_CASE(cold_hot_seam_rejects_wrong_domain_and_crosses_by_hash, 
     BOOST_CHECK(cold.ref.IsCold()); BOOST_CHECK(hot.ref.IsHot());
     BOOST_CHECK(cold.ref.logical == hot.ref.logical);
     BOOST_CHECK(cold.ref != hot.ref);
-    // V1 has no serialized memo/checksum: raw snapshot values are unavailable,
-    // rather than authoritative zero. The explicit derivation below is required.
-    BOOST_CHECK(!cold.snapshot.hasStakeModifierTime);
-    BOOST_CHECK(!cold.snapshot.hasStakeModifierChecksum);
+    // Stage E regression for the builder-derived guard: with the non-genesis-root
+    // guard in the builder's derived.dat producer, the PERSISTED cold-snapshot
+    // checksum and the reader's explicit GetStakingMetadata recurrence MUST AGREE
+    // (same canonical recurrence). Before the guard they diverged (2540991004 vs
+    // 1484507649) — this equality FAILS against the unguarded builder.
+    BlockIndexStakingMetadata coldMeta;
+    BOOST_REQUIRE_MESSAGE(seam.GetStakingMetadata(cold.ref, &coldMeta, &error), error);
+    BOOST_CHECK(cold.snapshot.hasStakeModifierChecksum);
+    BOOST_CHECK_EQUAL(cold.snapshot.nStakeModifierChecksum, coldMeta.nStakeModifierChecksum);
 
     // The same numeric local ID (1) cannot be accepted as an unrelated cold ref:
     // resolver requires both generation and the expected logical hash.

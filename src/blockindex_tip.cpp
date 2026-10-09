@@ -3,6 +3,9 @@
 
 #include "blockindex_tip.h"
 
+#include "blockindex_tip_bounded_window.h"
+#include "blockindex_hashindex.h"
+
 #include "util.h"
 
 #include <boost/filesystem.hpp>
@@ -144,7 +147,59 @@ static bool DecodeTipMeta(const char* data, size_t size, BlockIndexTipMeta* out)
     return true;
 }
 
-// ---- shared digest byte emissions (single source of truth for v2 AND v3) ----
+// ---- Repair #3: bounded-memory tip store windows ----------------------------
+// Caps: the suffix ring holds at most TIP_RING_CAP_ENTRIES newest entries of
+// each store (the live-tail working set); the LRU caps TOTAL decoded bytes
+// across entries. Both are compile-time ABI constants so tip-authority RAM
+// is provably bounded: O(ring + lru + new appends), never O(chain height).
+static const size_t BLOCK_INDEX_TIP_RING_CAP_ENTRIES = 65536;
+static const size_t BLOCK_INDEX_TIP_LRU_BYTES_CAP = 2 * 1048576; // 2 MB
+
+// Concrete window instantiations (decode via the existing store codecs).
+typedef TipStoreWindow<BlockIndexRecord> TipStoreRecordsWindow;
+typedef TipStoreWindow<BlockIndexDerivedEntry> TipStoreDerivedWindow;
+typedef TipStoreWindow<BlockIndexId> TipStoreActiveWindow;
+
+static bool TipDecodeRecord(const unsigned char* data, size_t size,
+                            BlockIndexRecord* out, std::string* error)
+{
+    return DecodeBlockIndexRecordV1(data, size, out, error);
+}
+static bool TipDecodeDerived(const unsigned char* data, size_t size,
+                             BlockIndexDerivedEntry* out, std::string* error)
+{
+    return DecodeBlockIndexDerivedEntry(data, size, out, error);
+}
+static bool TipDecodeActive(const unsigned char* data, size_t size,
+                            BlockIndexId* out, std::string* error)
+{
+    return DecodeBlockIndexActiveEntry((const char*)data, size, out, error);
+}
+
+// ---- Repair #3: durable hash->RecordId side index ----------------------------
+// The index is DERIVED state and NEVER a second commit point: tip.meta remains
+// the single durable authority. LevelDB directory <tipDir>/tip-hashindex maps
+// the tip namespace hashes of slots [0, tipRecordCount) to RecordIds
+// (id == baseRecordCount + slot + 1).
+//
+// Indexed-count marker: the wrapper BlockIndexHashIndex is a frozen primitive
+// (its Put/Lookup channel covers only 'h'-prefixed 33-byte hash keys and its
+// meta keys meta:* are validated at Open). Rather than fork it, the marker is
+// a small CoW sidecar FILE <tipDir>/tip-hashindex.marker (magic + version +
+// LE64 count, tmp+fsync+rename+dirsync, same discipline as every tip store).
+// A missing/stale/mismatched marker simply forces a wider rebuild; it is
+// never authoritative.
+//
+// Generation binding: BlockIndexHashIndex validates its own meta:generation.
+// The tip index uses a PID-UNIQUE nonce at Create; on Open the expected
+// generation is passed 0 (wildcard) and the reconcile below treats an
+// unfriendly directory as "rebuild".
+static const char* const BLOCK_INDEX_TIP_HASHINDEX_DIR_NAME = "tip-hashindex";
+static const char* const BLOCK_INDEX_TIP_HASHINDEX_MARKER_FILE = "tip-hashindex.marker";
+static const uint32_t BLOCK_INDEX_TIP_HASHINDEX_MARKER_MAGIC = 0x494E4E54; // "TNNI"
+static const uint32_t BLOCK_INDEX_TIP_HASHINDEX_MARKER_VERSION = 1;
+static const size_t BLOCK_INDEX_TIP_HASHINDEX_MARKER_SIZE = 4 + 4 + 8; // magic+ver+count
+
 // Records: hash(32) || hashPrev(32) || height(4 LE).  Derived: chainTrust(32) ||
 // stakeModifierChecksum(4 LE).  Active: RecordId(8 LE). Byte-for-byte identical
 // to the original inline v2 emissions -- the v2 digest value is unchanged.
@@ -593,6 +648,272 @@ static bool WriteDerivedFile(const fs::path& path, const std::vector<BlockIndexD
     return WriteFileCoW(path, b, error);
 }
 
+// ---- Repair #3: streaming CoW rewrite helpers -------------------------------
+// Copy the retained PREFIX of a fixed-record store into a temp file (with
+// header) and fsync it, so a reorg/truncate publishes the retained prefix by
+// tmp+rename WITHOUT materializing the store in RAM (O(N) I/O, O(1) RAM).
+// The source stores already hold the current COMMITTED bytes; a final entry
+// override (the reorg's appended branch records, in id order) is emitted via
+// the existing Encode* codec entries at matching slots.
+static bool SetupStoreHeader(std::vector<unsigned char>* hdr, uint32_t which,
+                             uint64_t count)
+{
+    hdr->clear();
+    if (which == 0) // records
+    {
+        WriteRawLE32(*hdr, BLOCK_INDEX_FORMAT_VERSION);
+        WriteRawLE32(*hdr, BLOCK_INDEX_RECORD_VERSION);
+        WriteRawLE32(*hdr, BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE);
+        WriteRawLE32(*hdr, BLOCK_INDEX_RECORD_SIZE_V1);
+        WriteRawLE64(*hdr, count);
+        WriteRawLE64(*hdr, 0); WriteRawLE64(*hdr, 0); WriteRawLE64(*hdr, 0);
+        return hdr->size() == BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE;
+    }
+    if (which == 1) // derived
+    {
+        WriteRawLE32(*hdr, BLOCK_INDEX_DERIVED_FORMAT_VERSION);
+        WriteRawLE32(*hdr, BLOCK_INDEX_DERIVED_SCHEMA_VERSION);
+        WriteRawLE32(*hdr, BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE);
+        WriteRawLE32(*hdr, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2);
+        WriteRawLE64(*hdr, 0);
+        WriteRawLE64(*hdr, count);
+        for (int i = 0; i < 32; ++i) hdr->push_back(0);
+        WriteRawLE64(*hdr, 0);
+        return hdr->size() == BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE;
+    }
+    // active
+    WriteRawLE32(*hdr, BLOCK_INDEX_ACTIVE_SCHEMA_VERSION);
+    WriteRawLE32(*hdr, BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE);
+    WriteRawLE32(*hdr, BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
+    WriteRawLE64(*hdr, 0); WriteRawLE64(*hdr, 0); WriteRawLE64(*hdr, 0); WriteRawLE64(*hdr, 0);
+    return hdr->size() == BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE;
+}
+
+// Clamp a copy buffer to <= 64 KiB for the streaming helpers.
+static inline size_t keepActiveBufSize(uint64_t entries, uint32_t entrySize)
+{
+    const uint64_t bytes = entries * entrySize;
+    return (size_t)std::min<uint64_t>(bytes ? bytes : 1, 65536);
+}
+
+// Stream the retained active prefix [0, keepCount) of tip-active.dat into a
+// CoW temp file (writes header + entries bytewise; O(count) I/O, O(1) RAM),
+// leaving the temp DURABLE but unrenamed (the caller renames + dirsyncs).
+static bool StreamActiveFileTo(const fs::path& activePath,
+                               uint64_t keepCount, std::string* error)
+{
+    const fs::path tmp = fs::path(activePath.string() + ".tmp");
+    FILE* f = fopen(tmp.string().c_str(), "wb");
+    if (!f)
+        return SetError(error, "open active tmp failed: " + tmp.string());
+    std::vector<unsigned char> hdr;
+    if (!SetupStoreHeader(&hdr, 2, keepCount) ||
+        fwrite(&hdr[0], 1, hdr.size(), f) != hdr.size())
+    {
+        fclose(f);
+        return SetError(error, "write active tmp header failed");
+    }
+    // Bytewise copy from the source file (header + keepCount entries).
+    FILE* s = fopen(activePath.string().c_str(), "rb");
+    if (!s)
+    {
+        fclose(f);
+        return SetError(error, "open active source failed: " + activePath.string());
+    }
+    if (fseek(s, (long)BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE, SEEK_SET) != 0)
+    {
+        fclose(s); fclose(f);
+        return SetError(error, "seek active source past header failed");
+    }
+    std::vector<char> buf(keepActiveBufSize(keepCount, BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1));
+    const size_t want = (size_t)keepCount * BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1;
+    size_t got = 0;
+    while (got < want)
+    {
+        size_t chunk = std::min<size_t>(buf.size(), want - got);
+        size_t r = fread(&buf[0], 1, chunk, s);
+        if (r == 0)
+            break;
+        if (fwrite(&buf[0], 1, r, f) != r)
+        {
+            fclose(s); fclose(f);
+            return SetError(error, "write active tmp copy failed");
+        }
+        got += r;
+    }
+    fclose(s);
+    if (got != want)
+    {
+        fclose(f);
+        return SetError(error, "active stream source short");
+    }
+    if (!FileCommitChecked(f, error))
+    {
+        fclose(f);
+        return false;
+    }
+    if (fclose(f) != 0)
+        return SetError(error, "close active tmp failed");
+    return true;
+}
+
+// ---- Repair #3: hash-index marker sidecar (DERIVED, never authoritative) -----
+// tip-hashindex.marker: magic(4) | version(4) | indexedCount(8). Crash-safe
+// via the same WriteFileCoW discipline as the tail stores. It only ever
+// Widens/Narrows the reconciliation delta; a corrupt/missing/absent marker
+// simply forces a full rebuild of the index from the committed records.
+static bool WriteHashIndexMarker(const fs::path& markerPath, uint64_t count,
+                                 std::string* error)
+{
+    std::vector<unsigned char> b;
+    WriteRawLE32(b, BLOCK_INDEX_TIP_HASHINDEX_MARKER_MAGIC);
+    WriteRawLE32(b, BLOCK_INDEX_TIP_HASHINDEX_MARKER_VERSION);
+    WriteRawLE64(b, count);
+    return WriteFileCoW(markerPath, b, error);
+}
+
+static bool ReadHashIndexMarker(const fs::path& markerPath, uint64_t* countOut,
+                                bool* present)
+{
+    *present = false;
+    boost::system::error_code ec;
+    if (!fs::exists(markerPath, ec))
+        return true; // absent marker: rebuild as a FULL rebuild
+    std::string data;
+    if (!ReadWholeFile(markerPath, &data))
+        return true; // unreadable: full rebuild
+    if (data.size() < BLOCK_INDEX_TIP_HASHINDEX_MARKER_SIZE)
+        return true; // torn/stale marker: full rebuild
+    const unsigned char* p = (const unsigned char*)data.data();
+    if (ReadRawLE32(p + 0) != BLOCK_INDEX_TIP_HASHINDEX_MARKER_MAGIC)
+        return true;
+    if (ReadRawLE32(p + 4) != BLOCK_INDEX_TIP_HASHINDEX_MARKER_VERSION)
+        return true;
+    *countOut = ReadRawLE64(p + 8);
+    *present = true;
+    return true;
+}
+
+// ---- Repair #3: reorg store streamer (RewriteStoresForReorg is defined
+// after the Impl definition so it can reach Impl members directly):
+// publishes the reorg-resulting stores WITHOUT materializing them in RAM --
+// records/derived: committed prefix copied BYTEWISE + branch appends encoded
+// at the end; active: the reorg-resulting dense active ids. Each store goes
+// through a complete tmp -> fsync -> rename -> dirsync CoW publication (same
+// R3 discipline; FP_DURING_TAIL_UPDATE is honoured at the same boundary) and
+// tip.meta is written LAST by the caller (the single commit point).
+// ---- Repair #3: TipSideIndex — LevelDB hash->RecordId side index -----------
+// DERIVED STATE ONLY: tip.meta remains the single durable commit point.
+// Open reconciles it against the committed authoritative stores:
+//   tip.meta.tipRecordCount N + first N records of tip-records.dat define the
+//   truth: the index must map exactly record[slot].hash -> id for slots
+//   [0,N). Missing / partially-written / stale / extra entries are REBUILT
+//   (index truncated back to the committed count, then repaired forward).
+//   Inconsistency NEVER changes the authoritative chain and NEVER silently
+//   corrupts validation result.
+class TipSideIndex
+{
+public:
+    TipSideIndex() {}
+    ~TipSideIndex() { Close(); }
+
+    // Open (or first-time create) the LevelDB gem under <tipDir>/"hashindex"
+    // (the BlockIndexHashIndex primitive fixes its own directory name; the
+    // tip namespace is what distinguishes it from other generations).
+    bool OpenOrCreate(const fs::path& tipDir, std::string* error)
+    {
+        Close();
+        tipDir_ = tipDir;
+        dirPath_ = tipDir / BLOCK_INDEX_HASHINDEX_DIR_NAME; // wrapper-fixed name
+        boost::system::error_code ec;
+        index_ = BlockIndexHashIndex(); // start from a clean state object
+        if (!fs::exists(dirPath_, ec))
+        {
+            BlockIndexHashIndex fresh;
+            const uint64_t nonce = (uint64_t)getpid() * 2654435761ULL + 0x9E37;
+            std::string cerr;
+            if (!BlockIndexHashIndex::Create(tipDir_.string(), nonce, &fresh, &cerr))
+                return SetError(error, "tip-hashindex create failed: " + cerr);
+            index_ = std::move(fresh);
+            return true;
+        }
+        {
+            BlockIndexHashIndex opened;
+            std::string oerr;
+            if (!BlockIndexHashIndex::Open(tipDir_.string(), 0, &opened, &oerr))
+                return SetError(error, "tip-hashindex open failed: " + oerr);
+            index_ = std::move(opened);
+        }
+        return true;
+    }
+
+    // Destroy the LevelDB dir on disk so a later OpenOrCreate recreates it.
+    bool DestroyDir(std::string* error)
+    {
+        Close();
+        boost::system::error_code ec;
+        fs::remove_all(dirPath_, ec);
+        if (ec)
+            return SetError(error, "remove stale tip-hashindex failed: " + ec.message());
+        boost::system::error_code ec2;
+        fs::remove(markerPath(), ec2);
+        return true;
+    }
+
+    void Close() { index_.Close(); }
+    bool IsOpen() const { return index_.IsOpen(); }
+
+    // Writable open for the REPAIR path: the plain Open() path above yields a
+    // logically read-only handle (BlockIndexHashIndex::Open enforces read-only),
+    // but reconciliation (forward repair / full rebuild) must be able to Put.
+    // Opens create-if-missing with a writable LevelDB dir. The open generation
+    // is NOT validated (wildcard) -- the reconcile logic below IS the check.
+    bool OpenOrCreateWritable(const fs::path& tipDir, std::string* error)
+    {
+        Close();
+        tipDir_ = tipDir;
+        dirPath_ = tipDir / BLOCK_INDEX_HASHINDEX_DIR_NAME;
+        boost::system::error_code ec;
+        BlockIndexHashIndex idx;
+        const bool create = !fs::exists(dirPath_, ec);
+        const uint64_t nonce = (uint64_t)getpid() * 2654435761ULL + 0x9E37;
+        std::string werr;
+        if (!idx.OpenInternal(tipDir_.string(), create ? nonce : 0, create, false, &werr))
+            return SetError(error, "tip-hashindex writable open failed: " + werr);
+        index_ = std::move(idx);
+        return true;
+    }
+
+    bool Put(const uint256& hash, BlockIndexId id, std::string* error)
+    {
+        return index_.Put(hash, id, error);
+    }
+
+    // Drop an UNCOMMITTED residue entry placed by an aborted commit: delete
+    // only when the stored id is exactly `expectedId` (never attacker- or
+    // crash-ambiguous). Best-effort: errors are reported through `error` but
+    // the caller treats residue as absent (bounded count check) anyway.
+    bool DeleteIfCommitted(const uint256& hash, BlockIndexId expectedId,
+                           std::string* error)
+    {
+        if (!IsOpen())
+            return SetError(error, "tip-hashindex not open");
+        return index_.Delete(hash, expectedId, error);
+    }
+    BlockIndexHashLookupStatus Lookup(const uint256& hash, BlockIndexId* outId,
+                                      std::string* error) const
+    {
+        return index_.Lookup(hash, outId, error);
+    }
+
+    fs::path markerPath() const { return tipDir_ / BLOCK_INDEX_TIP_HASHINDEX_MARKER_FILE; }
+
+private:
+    BlockIndexHashIndex index_;
+    fs::path tipDir_;
+    fs::path dirPath_;
+};
+
 } // namespace
 
 // R3 test-only failpoints (definitions; declared in blockindex_tip.h).
@@ -615,14 +936,17 @@ struct BlockIndexTipAuthority::Impl
     fs::path activePath;
     fs::path derivedPath;
     fs::path invalidPath;
+    fs::path hashIndexPath;
+    fs::path hashIndexMarkerPath;
 
     BlockIndexTipMeta meta;
 
-    // Committed authority state (bounded to tip blocks only).
-    std::vector<BlockIndexRecord> records;
-    std::vector<BlockIndexDerivedEntry> derived;
-    std::vector<BlockIndexId> activeIds; // dense: activeIds[h] = RecordId for height h
-    std::map<uint256, BlockIndexId> hashToId;
+    // Repair #3: bounded positional windows over the three fixed-record
+    // stores + the durable hash->RecordId LevelDB side index (all bounded).
+    TipStoreRecordsWindow recordsWin;
+    TipStoreDerivedWindow derivedWin;
+    TipStoreActiveWindow activeWin;
+    TipSideIndex sideIndex;
 
     // v2 durable operator-invalid authority (by-value; no CBlockIndex).
     std::vector<BlockIndexTipInvalidEntry> invalidEntries; // committed log prefix
@@ -637,7 +961,19 @@ struct BlockIndexTipAuthority::Impl
     unsigned char chainA[32];
     bool chainsValid;
 
-    Impl() : open(false), chainsValid(false) {}
+    Impl()
+        : recordsWin(fs::path(), BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE,
+                     BLOCK_INDEX_RECORD_SIZE_V1, BLOCK_INDEX_TIP_RING_CAP_ENTRIES,
+                     BLOCK_INDEX_TIP_LRU_BYTES_CAP, TipDecodeRecord),
+          derivedWin(fs::path(), BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE,
+                     BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2,
+                     BLOCK_INDEX_TIP_RING_CAP_ENTRIES,
+                     BLOCK_INDEX_TIP_LRU_BYTES_CAP, TipDecodeDerived),
+          activeWin(fs::path(), BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE,
+                    BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1,
+                    BLOCK_INDEX_TIP_RING_CAP_ENTRIES,
+                    BLOCK_INDEX_TIP_LRU_BYTES_CAP, TipDecodeActive),
+          open(false), chainsValid(false) {}
 
     // Rebuild the three index-order chains from a committed vector set.
     void BuildChainsFor(const std::vector<BlockIndexRecord>& recs,
@@ -659,8 +995,150 @@ struct BlockIndexTipAuthority::Impl
     void EnsureChains()
     {
         if (!chainsValid)
-            BuildChainsFor(records, derived, activeIds);
+            BuildChainsForStreaming();
     }
+
+    // Repair #3: reconcile the durable tip-hashindex against the committed
+    // truth at Open. Truth = slots [0, tipRecordCount) of the committed
+    // records store; expected id for slot s = baseRecordCount + s + 1.
+    // Marker (sidecar file) records how many entries are proven indexed.
+    // Crash cases handled:
+    //   (a) records appended + index not updated   -> marker < N: repair fwd
+    //   (b) index written + tip.meta not committed -> N < marker: truncate
+    //       (rebuild from 0 handles stale entries above/below)
+    //   (c) tip.meta committed + index update short -> marker/lookup mismatch
+    //   (d) partial index write -> lookup mismatch at some slot
+    //   (e) stale entries after truncation -> N < marker: rebuild
+    //   (f) restart after interrupted reorg -> same checks (counts + spot)
+    // (all cases converge to Repair #3 fix2: a FULL content verification of
+    // the [0,N) committed range against the bounded records window — O(N)
+    // time, O(1) auxiliary RAM, the same cost class as the mandatory
+    // streaming digest validation that Open already pays. Anything the
+    // verification cannot accept is deterministically rebuilt.)
+    bool ReconcileSideIndexOnOpen(std::string* error)
+    {
+        const uint64_t N = meta.tipRecordCount;
+        // Open WRITABLE from the start: only this authority owns the dir at
+        // Open time, and reconciliation (forward repair / rebuild / stale
+        // truncation) must be able to Put. The plain Open() wrapper is
+        // logically read-only by contract and cannot serve the repair path.
+        std::string idxerr;
+        if (!sideIndex.OpenOrCreateWritable(tipDir, &idxerr))
+            return SetError(error, "tip-hashindex open failed: " + idxerr);
+        uint64_t marker = 0;
+        bool markerPresent = false;
+        ReadHashIndexMarker(hashIndexMarkerPath, &marker, &markerPresent);
+        const bool countsAgree = markerPresent && marker == N;
+        bool needFullRebuild = !countsAgree;
+        // Repair #3 fix2: a marker==N count alone does not prove the index
+        // CONTENT. A torn/partial publication or a LevelDB-store defect can
+        // leave a middle hash MISSING or pointing at a WRONG RecordId while
+        // the count and BOTH boundary probes stay perfect — and the derived
+        // index would then silently return a wrong historical result (a
+        // LookupByHash miss reads as NOT_FOUND; a wrong id reads as a
+        // different block). Truncate/forward-repair cannot detect that
+        // deterministically, so reconcile verifies EVERY committed entry:
+        // slot-by-slot against the bounded records window (O(N) time, O(1)
+        // auxiliary RAM — the same cost class as the mandatory streaming
+        // digest validation that Open already pays). ANY mismatch (missing /
+        // wrong id) forces the deterministic full rebuild from the committed
+        // stores. The derived index stays exactly derived: tip.meta is
+        // untouched, not read, and never overridden by index content.
+        if (!needFullRebuild && N > 0)
+        {
+            std::string verr;
+            bool midOk = true;
+            const bool verified = recordsWin.StreamVisit(0, N,
+                [this, &midOk](uint64_t slot, const BlockIndexRecord& r) {
+                    BlockIndexId got = 0;
+                    if (sideIndex.Lookup(r.hash, &got, NULL) !=
+                            BLOCK_INDEX_HASH_LOOKUP_FOUND ||
+                        got != baseLocalToId(slot))
+                    {
+                        midOk = false;
+                        return false; // stop the stream at the first mismatch
+                    }
+                    return true;
+                }, &verr);
+            if (!verified && midOk)
+                return SetError(error, "tip-hashindex verify stream: " + verr);
+            if (!midOk)
+                needFullRebuild = true;
+        }
+        if (needFullRebuild)
+        {
+            // Deterministically rebuild from the committed records store.
+            std::string rerr;
+            if (!sideIndex.DestroyDir(&rerr))
+                return SetError(error, "tip-hashindex rebuild reset: " + rerr);
+            std::string oerr;
+            if (!sideIndex.OpenOrCreateWritable(tipDir, &oerr))
+                return SetError(error, "tip-hashindex recreate: " + oerr);
+            std::string perr;
+            const bool built = recordsWin.StreamVisit(0, N,
+                [this](uint64_t slot, const BlockIndexRecord& r) {
+                    BlockIndexId id = baseLocalToId(slot);
+                    return sideIndex.Put(r.hash, id, NULL);
+                }, &perr);
+            if (!built)
+                return SetError(error, "tip-hashindex rebuild: " + perr);
+            std::string merr;
+            if (!WriteHashIndexMarker(hashIndexMarkerPath, N, &merr))
+                return SetError(error, "tip-hashindex marker write: " + merr);
+        }
+        return true;
+    }
+
+    // Repair #3: streaming rebuild of the three index-order chains straight
+    // from the committed store files (O(N) time, O(1) auxiliary RAM; the
+    // ring/window caches are untouched -- cache-neutral). Used by Open and by
+    // any non-append mutation after its SetCount() calls (the stores already
+    // reflect the resulting committed state at that point).
+    bool BuildChainsForStreaming()
+    {
+        DigestChainInit(chainR, BLOCK_INDEX_TIP_V3_DOMAIN_R);
+        DigestChainInit(chainD, BLOCK_INDEX_TIP_V3_DOMAIN_D);
+        DigestChainInit(chainA, BLOCK_INDEX_TIP_V3_DOMAIN_A);
+        std::string werr;
+        lastStreamError.clear();
+        unsigned char b[68];
+        const uint64_t rc = recordsWin.Count();
+        const uint64_t dc = derivedWin.Count();
+        const uint64_t ac = activeWin.Count();
+        bool rok = recordsWin.StreamVisit(0, rc,
+            [&b, this](uint64_t, const BlockIndexRecord& r) {
+                size_t n = EncodeRecordDigestBytes(r, b);
+                DigestChainExtend(chainR, b, n);
+                return true;
+            }, &werr);
+        bool dok = derivedWin.StreamVisit(0, dc,
+            [&b, this](uint64_t, const BlockIndexDerivedEntry& d) {
+                size_t n = EncodeDerivedDigestBytes(d, b);
+                DigestChainExtend(chainD, b, n);
+                return true;
+            }, &werr);
+        bool aok = activeWin.StreamVisit(0, ac,
+            [&b, this](uint64_t, const BlockIndexId& id) {
+                EncodeActiveDigestBytes(id, b);
+                DigestChainExtend(chainA, b, 8);
+                return true;
+            }, &werr);
+        chainsValid = true;
+        if (!rok) lastStreamError = "records stream: " + werr;
+        else if (!dok) lastStreamError = "derived stream: " + werr;
+        else if (!aok) lastStreamError = "active stream: " + werr;
+        return rok && dok && aok;
+    }
+    std::string lastStreamError;
+
+    // Repair #3: helper accessors over the bounded windows. Every read is
+    // by-value; a miss streams ONE positional pread from the store file.
+    bool GetRecordBySlot(uint64_t slot, BlockIndexRecord* out, std::string* err) const
+    { return recordsWin.Get(slot, out, err); }
+    bool GetDerivedBySlot(uint64_t slot, BlockIndexDerivedEntry* out, std::string* err) const
+    { return derivedWin.Get(slot, out, err); }
+    bool GetActiveByRel(uint64_t rel, BlockIndexId* out, std::string* err) const
+    { return activeWin.Get(rel, out, err); }
 
     bool InitializePaths(const std::string& rootIn)
     {
@@ -671,7 +1149,30 @@ struct BlockIndexTipAuthority::Impl
         activePath = tipDir / BLOCK_INDEX_TIP_ACTIVE_FILE;
         derivedPath = tipDir / BLOCK_INDEX_TIP_DERIVED_FILE;
         invalidPath = tipDir / BLOCK_INDEX_TIP_INVALID_FILE;
+        hashIndexPath = tipDir / BLOCK_INDEX_TIP_HASHINDEX_DIR_NAME;
+        hashIndexMarkerPath = tipDir / BLOCK_INDEX_TIP_HASHINDEX_MARKER_FILE;
+        // Re-point the positional windows at the (possibly new) store paths.
+        ResetWindowPaths();
         return true;
+    }
+
+    // Re-construct the three bounded windows with the CURRENT store paths
+    // (paths are fixed at construction in TipStoreWindow, so InitializePaths
+    // swaps them via a full rebuild -- caps/decoders are identical).
+    void ResetWindowPaths()
+    {
+        recordsWin = TipStoreRecordsWindow(recordsPath,
+            BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE, BLOCK_INDEX_RECORD_SIZE_V1,
+            BLOCK_INDEX_TIP_RING_CAP_ENTRIES, BLOCK_INDEX_TIP_LRU_BYTES_CAP,
+            TipDecodeRecord);
+        derivedWin = TipStoreDerivedWindow(derivedPath,
+            BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2,
+            BLOCK_INDEX_TIP_RING_CAP_ENTRIES, BLOCK_INDEX_TIP_LRU_BYTES_CAP,
+            TipDecodeDerived);
+        activeWin = TipStoreActiveWindow(activePath,
+            BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE, BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1,
+            BLOCK_INDEX_TIP_RING_CAP_ENTRIES, BLOCK_INDEX_TIP_LRU_BYTES_CAP,
+            TipDecodeActive);
     }
 
     uint64_t baseLocalToId(size_t localIndex) const
@@ -679,6 +1180,14 @@ struct BlockIndexTipAuthority::Impl
         // localIndex 0-based into records; RecordId = baseRecordCount + local + 1
         return meta.baseRecordCount + (uint64_t)localIndex + 1;
     }
+
+    // Repair #3: stream the reorg-resulting stores (see definition after the
+    // struct; keeps ReorgActiveTo/ApplyOperatorInvalidAndReorg O(new) RAM).
+    bool RewriteStoresForReorg(uint64_t keepActive, uint64_t committedRecords,
+                               const std::vector<BlockIndexRecord>& appendRecords,
+                               const std::vector<BlockIndexDerivedEntry>& appendDerived,
+                               const std::vector<BlockIndexId>& newActive,
+                               std::string* error);
 
     bool WriteMeta(std::string* error)
     {
@@ -720,7 +1229,171 @@ struct BlockIndexTipAuthority::Impl
             return false;
         return true;
     }
-};
+}; // struct Impl
+
+// ---- Repair #3: reorg store streamer (Impl member) --------------------------
+bool BlockIndexTipAuthority::Impl::RewriteStoresForReorg(
+    uint64_t keepActive, uint64_t committedRecords,
+    const std::vector<BlockIndexRecord>& appendRecords,
+    const std::vector<BlockIndexDerivedEntry>& appendDerived,
+    const std::vector<BlockIndexId>& newActive, std::string* error)
+{
+    // ---- records: committed prefix bytewise + branch appends encoded ----
+    {
+        const std::string tmp = recordsPath.string() + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "wb");
+        if (!f) return SetError(error, "open reorg records tmp failed");
+        std::vector<unsigned char> hdr;
+        if (!SetupStoreHeader(&hdr, 0, committedRecords + appendRecords.size()) ||
+            fwrite(&hdr[0], 1, hdr.size(), f) != hdr.size())
+        { fclose(f); return SetError(error, "write reorg records hdr failed"); }
+        FILE* s = fopen(recordsPath.string().c_str(), "rb");
+        if (!s) { fclose(f); return SetError(error, "open reorg records src failed"); }
+        if (fseek(s, (long)BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE, SEEK_SET) != 0)
+        { fclose(s); fclose(f); return SetError(error, "seek reorg records src failed"); }
+        std::vector<char> buf(65536);
+        const uint64_t want = committedRecords * BLOCK_INDEX_RECORD_SIZE_V1;
+        uint64_t got = 0;
+        while (got < want)
+        {
+            size_t chunk = (size_t)std::min<uint64_t>(want - got, buf.size());
+            size_t r = fread(&buf[0], 1, chunk, s);
+            if (r == 0) break;
+            if (fwrite(&buf[0], 1, r, f) != r)
+            { fclose(s); fclose(f); return SetError(error, "write reorg records copy failed"); }
+            got += r;
+        }
+        fclose(s);
+        if (got != want)
+        { fclose(f); return SetError(error, "reorg records stream short"); }
+        for (size_t k = 0; k < appendRecords.size(); ++k)
+        {
+            std::vector<unsigned char> enc;
+            if (!EncodeBlockIndexRecordV1(appendRecords[k], &enc, NULL) ||
+                fwrite(&enc[0], 1, enc.size(), f) != enc.size())
+            { fclose(f); return SetError(error, "encode reorg records tail failed"); }
+        }
+        if (!FileCommitChecked(f, error)) { fclose(f); return false; }
+        if (fclose(f) != 0) return SetError(error, "close reorg records tmp failed");
+        if (BlockIndexTipFailpointHit("FP_DURING_TAIL_UPDATE"))
+            return SetError(error, "failpoint FP_DURING_TAIL_UPDATE");
+        if (!RenameOverChecked(fs::path(tmp), recordsPath, error)) return false;
+        if (!SyncDirectoryChecked(tipDir, error)) return false;
+        std::string cerr;
+        if (!UpdateStoreCount(recordsPath, BLOCK_INDEX_TIP_RECORDS_COUNT_OFFSET,
+                              committedRecords + appendRecords.size(), &cerr))
+            return SetError(error, "reorg records count update failed: " + cerr);
+    }
+    // ---- derived: committed prefix bytewise + branch appends encoded ----
+    {
+        const std::string tmp = derivedPath.string() + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "wb");
+        if (!f) return SetError(error, "open reorg derived tmp failed");
+        std::vector<unsigned char> hdr;
+        if (!SetupStoreHeader(&hdr, 1, committedRecords + appendDerived.size()) ||
+            fwrite(&hdr[0], 1, hdr.size(), f) != hdr.size())
+        { fclose(f); return SetError(error, "write reorg derived hdr failed"); }
+        FILE* s = fopen(derivedPath.string().c_str(), "rb");
+        if (!s) { fclose(f); return SetError(error, "open reorg derived src failed"); }
+        if (fseek(s, (long)BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE, SEEK_SET) != 0)
+        { fclose(s); fclose(f); return SetError(error, "seek reorg derived src failed"); }
+        std::vector<char> buf(65536);
+        const uint64_t want = committedRecords * BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2;
+        uint64_t got = 0;
+        while (got < want)
+        {
+            size_t chunk = (size_t)std::min<uint64_t>(want - got, buf.size());
+            size_t r = fread(&buf[0], 1, chunk, s);
+            if (r == 0) break;
+            if (fwrite(&buf[0], 1, r, f) != r)
+            { fclose(s); fclose(f); return SetError(error, "write reorg derived copy failed"); }
+            got += r;
+        }
+        fclose(s);
+        if (got != want)
+        { fclose(f); return SetError(error, "reorg derived stream short"); }
+        for (size_t k = 0; k < appendDerived.size(); ++k)
+        {
+            std::vector<unsigned char> enc;
+            if (!EncodeBlockIndexDerivedEntry(appendDerived[k], &enc, NULL) ||
+                fwrite(&enc[0], 1, enc.size(), f) != enc.size())
+            { fclose(f); return SetError(error, "encode reorg derived tail failed"); }
+        }
+        if (!FileCommitChecked(f, error)) { fclose(f); return false; }
+        if (fclose(f) != 0) return SetError(error, "close reorg derived tmp failed");
+        if (BlockIndexTipFailpointHit("FP_DURING_TAIL_UPDATE"))
+            return SetError(error, "failpoint FP_DURING_TAIL_UPDATE");
+        if (!RenameOverChecked(fs::path(tmp), derivedPath, error)) return false;
+        if (!SyncDirectoryChecked(tipDir, error)) return false;
+        std::string cerr;
+        if (!UpdateStoreCount(derivedPath, BLOCK_INDEX_TIP_DERIVED_COUNT_OFFSET,
+                              committedRecords + appendDerived.size(), &cerr))
+            return SetError(error, "reorg derived count update failed: " + cerr);
+    }
+    // ---- active: dense result ids (fork prefix copied when byte-identical,
+    //      branch ids encoded) ----
+    {
+        const std::string tmp = activePath.string() + ".tmp";
+        FILE* f = fopen(tmp.c_str(), "wb");
+        if (!f) return SetError(error, "open reorg active tmp failed");
+        std::vector<unsigned char> hdr;
+        if (!SetupStoreHeader(&hdr, 2, newActive.size()) ||
+            fwrite(&hdr[0], 1, hdr.size(), f) != hdr.size())
+        { fclose(f); return SetError(error, "write reorg active hdr failed"); }
+        const bool prefixCopyable =
+            keepActive > 0 && newActive.size() >= keepActive;
+        if (prefixCopyable)
+        {
+            FILE* s = fopen(activePath.string().c_str(), "rb");
+            if (!s) { fclose(f); return SetError(error, "open reorg active src failed"); }
+            if (fseek(s, (long)BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE, SEEK_SET) != 0)
+            { fclose(s); fclose(f); return SetError(error, "seek reorg active src failed"); }
+            std::vector<char> abuf(65536);
+            const uint64_t want = keepActive * BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1;
+            uint64_t got = 0;
+            while (got < want)
+            {
+                size_t chunk = (size_t)std::min<uint64_t>(want - got, abuf.size());
+                size_t r = fread(&abuf[0], 1, chunk, s);
+                if (r == 0) break;
+                if (fwrite(&abuf[0], 1, r, f) != r)
+                { fclose(s); fclose(f); return SetError(error, "write reorg active copy failed"); }
+                got += r;
+            }
+            fclose(s);
+            if (got != want)
+            { fclose(f); return SetError(error, "reorg active stream short"); }
+            for (size_t h = keepActive; h < newActive.size(); ++h)
+            {
+                std::string enc;
+                if (!EncodeBlockIndexActiveEntry(newActive[h], &enc, NULL) ||
+                    fwrite(enc.data(), 1, enc.size(), f) != enc.size())
+                { fclose(f); return SetError(error, "encode reorg active tail failed"); }
+            }
+        }
+        else
+        {
+            for (size_t h = 0; h < newActive.size(); ++h)
+            {
+                std::string enc;
+                if (!EncodeBlockIndexActiveEntry(newActive[h], &enc, NULL) ||
+                    fwrite(enc.data(), 1, enc.size(), f) != enc.size())
+                { fclose(f); return SetError(error, "encode reorg active failed"); }
+            }
+        }
+        if (!FileCommitChecked(f, error)) { fclose(f); return false; }
+        if (fclose(f) != 0) return SetError(error, "close reorg active tmp failed");
+        if (BlockIndexTipFailpointHit("FP_DURING_TAIL_UPDATE"))
+            return SetError(error, "failpoint FP_DURING_TAIL_UPDATE");
+        if (!RenameOverChecked(fs::path(tmp), activePath, error)) return false;
+        if (!SyncDirectoryChecked(tipDir, error)) return false;
+        std::string cerr;
+        if (!UpdateStoreCount(activePath, BLOCK_INDEX_TIP_ACTIVE_COUNT_OFFSET,
+                              newActive.size(), &cerr))
+            return SetError(error, "reorg active count update failed: " + cerr);
+    }
+    return true;
+}
 
 BlockIndexTipAuthority::BlockIndexTipAuthority()
     : impl(new Impl())
@@ -758,20 +1431,45 @@ bool BlockIndexTipAuthority::Create(const std::string& root,
     i->meta.baseTipHeight = baseTipHeight;
     i->meta.tipHeight = baseTipHeight; // empty tip == base tip S
     i->meta.tipRecordCount = 0;
-    // persist empty stores (headers only) via the write helpers with empty state
-    if (!WriteRecordsFile(i->recordsPath, i->records))
+    std::string sidxerr;
+    unsigned char digestEmpty[32];
+    // Persist the empty stores (headers only) as static empties.
+    const std::vector<BlockIndexRecord> emptyRecords;
+    const std::vector<BlockIndexDerivedEntry> emptyDerived;
+    const std::vector<BlockIndexId> emptyActive;
+    if (!WriteRecordsFile(i->recordsPath, emptyRecords))
         return SetError(error, "init tip-records failed");
-    if (!WriteActiveFile(i->activePath, i->activeIds))
+    if (!WriteActiveFile(i->activePath, emptyActive))
         return SetError(error, "init tip-active failed");
-    if (!WriteDerivedFile(i->derivedPath, i->derived))
+    if (!WriteDerivedFile(i->derivedPath, emptyDerived))
         return SetError(error, "init tip-derived failed");
     // v2: create the (empty) operator-invalid log so the store set is complete.
     if (!WriteInvalidFile(i->invalidPath, i->invalidEntries))
         return SetError(error, "init tip-invalid failed");
-    // compute the content digest over the (empty) committed region so that a
+    // Repair #3: create the (empty) hash-index side store + marker.
+    i->sideIndex.Close();
+    if (!i->sideIndex.OpenOrCreateWritable(i->tipDir, &sidxerr))
+        return SetError(error, "init tip-hashindex failed: " + sidxerr);
+    std::string errMarker;
+    if (!WriteHashIndexMarker(i->hashIndexMarkerPath, 0, &errMarker))
+        return SetError(error, "init tip-hashindex marker failed: " + errMarker);
+    // initialize the bounded windows over the fresh empty stores.
+    std::string werrA, werrB, werrC;
+    if (!i->recordsWin.InitializeCount(0, &werrA) ||
+        !i->derivedWin.InitializeCount(0, &werrB) ||
+        !i->activeWin.InitializeCount(0, &werrC))
+        return SetError(error, "init tip windows failed: " + werrA + werrB + werrC);
+    // Compute the content digest over the (empty) committed region so a
     // subsequent Open's recomputation matches (it must not be all-zero).
-    ComputeContentDigest(i->meta, i->records, i->derived, i->activeIds,
-                         i->meta.contentDigest);
+    // The freshly created meta is v2, so seed its digest in the v2 (streaming)
+    // flavour over the empty region -- identical to Open's v2 recompute path.
+    {
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        SHA256_Update(&ctx, &i->meta.activeFence, 1);
+        SHA256_Final(digestEmpty, &ctx);
+        memcpy(i->meta.contentDigest, digestEmpty, 32);
+    }
     ComputeInvalidDigest(i->invalidEntries, i->meta.invalidDigest);
     i->meta.invalidLogCount = 0;
     if (!i->WriteMeta(error))
@@ -808,92 +1506,36 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
         return SetError(error, "tip.meta base-generation mismatch");
     i->meta = meta;
 
-    // 2. Load tip-records.dat -> records vector.
-    std::string recData;
-    if (!ReadWholeFile(i->recordsPath, &recData))
-        return SetError(error, "read tip-records failed");
-    size_t recOff = BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE;
-    std::vector<BlockIndexRecord> records;
-    while (recOff + BLOCK_INDEX_RECORD_SIZE_V1 <= recData.size())
-    {
-        BlockIndexRecord r;
-        std::string rerr;
-        if (!DecodeBlockIndexRecordV1((const unsigned char*)recData.data() + recOff,
-                                      BLOCK_INDEX_RECORD_SIZE_V1, &r, &rerr))
-            return SetError(error, "decode tip-records entry: " + rerr);
-        records.push_back(r);
-        recOff += BLOCK_INDEX_RECORD_SIZE_V1;
-    }
-
-    // 3. Load tip-derived.dat -> derived vector.
-    std::string derData;
-    if (!ReadWholeFile(i->derivedPath, &derData))
-        return SetError(error, "read tip-derived failed");
-    size_t derOff = BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE;
-    std::vector<BlockIndexDerivedEntry> derived;
-    while (derOff + BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2 <= derData.size())
-    {
-        BlockIndexDerivedEntry d;
-        std::string derr;
-        if (!DecodeBlockIndexDerivedEntry((const unsigned char*)derData.data() + derOff,
-                                          BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, &d, &derr))
-            return SetError(error, "decode tip-derived entry: " + derr);
-        derived.push_back(d);
-        derOff += BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2;
-    }
-
-    // 4. Load tip-active.dat -> activeIds vector.
-    std::string actData;
-    if (!ReadWholeFile(i->activePath, &actData))
-        return SetError(error, "read tip-active failed");
-    size_t actOff = BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE;
-    std::vector<BlockIndexId> activeIds;
-    while (actOff + BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1 <= actData.size())
-    {
-        BlockIndexId id;
-        std::string aerr;
-        if (!DecodeBlockIndexActiveEntry(actData.data() + actOff,
-                                         BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, &id, &aerr))
-            return SetError(error, "decode tip-active entry: " + aerr);
-        activeIds.push_back(id);
-        actOff += BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1;
-    }
-
-    // 5. Reconcilce: the committed tip is meta.tipRecordCount records and
-    //    meta.tipHeight+1 active members. Any bytes beyond that are an
-    //    uncommitted tail (crash mid-append) and must be truncated to the
-    //    committed tip (fail-safe, deterministic, O(tail)).
-    bool repaired = false;
-    if (records.size() > meta.tipRecordCount)
-    {
-        records.resize(meta.tipRecordCount);
-        repaired = true;
-    }
-    if (derived.size() > meta.tipRecordCount)
-    {
-        derived.resize(meta.tipRecordCount);
-        repaired = true;
-    }
-    // activeIds is RELATIVE: committed count = tipHeight - baseTipHeight.
-    const int64_t expectedActive = (int64_t)meta.tipHeight - (int64_t)meta.baseTipHeight;
-    if (expectedActive < 0)
+    // 2-5 (Repair #3): reconcile the committed stores WITHOUT materializing
+    // them in RAM. File sizes give the PHYSICAL entry counts; any physical
+    // suffix beyond tip.meta's committed counts is an uncommitted tail and is
+    // physically truncated exactly as before (O(1) resize + header count
+    // fix). A store SHORTER than its committed region fails closed.
+    boost::system::error_code ecSize;
+    const uintmax_t recBytes = fs::file_size(i->recordsPath, ecSize);
+    if (ecSize) return SetError(error, "stat tip-records failed");
+    const uintmax_t derBytes = fs::file_size(i->derivedPath, ecSize);
+    if (ecSize) return SetError(error, "stat tip-derived failed");
+    const uintmax_t actBytes = fs::file_size(i->activePath, ecSize);
+    if (ecSize) return SetError(error, "stat tip-active failed");
+    const uint64_t expectedActive = ((int64_t)meta.tipHeight >= (int64_t)meta.baseTipHeight)
+        ? (uint64_t)((int64_t)meta.tipHeight - (int64_t)meta.baseTipHeight) : 0;
+    if ((int64_t)meta.tipHeight < (int64_t)meta.baseTipHeight)
         return SetError(error, "tip.meta tipHeight below baseTipHeight (corrupt)");
-    size_t expActiveSize = (size_t)expectedActive;
-    if (activeIds.size() > expActiveSize)
-    {
-        activeIds.resize(expActiveSize);
+    const uint64_t physRecords = (recBytes > BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE)
+        ? (uint64_t)(recBytes - BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE) / BLOCK_INDEX_RECORD_SIZE_V1 : 0;
+    const uint64_t physDerived = (derBytes > BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE)
+        ? (uint64_t)(derBytes - BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE) / BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2 : 0;
+    const uint64_t physActive = (actBytes > BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE)
+        ? (uint64_t)(actBytes - BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE) / BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1 : 0;
+    bool repaired = false;
+    if (physRecords > meta.tipRecordCount || physDerived > meta.tipRecordCount ||
+        physActive > expectedActive)
         repaired = true;
-    }
-    if (records.size() < meta.tipRecordCount ||
-        derived.size() < meta.tipRecordCount ||
-        activeIds.size() < expActiveSize)
+    if (physRecords < meta.tipRecordCount || physDerived < meta.tipRecordCount ||
+        physActive < expectedActive)
         return SetError(error, "tip stores short of committed tip.meta (corrupt)");
 
-    // R4: a suffix beyond tip.meta is uncommitted residue and must be PHYSICALLY
-    // removed, not merely dropped in memory: a later append lands at EOF, so a
-    // stale suffix left on disk would place new entries after the residue and
-    // make the sequential decode read the wrong records. Truncate exactly to the
-    // committed boundary (bytes beyond tip.meta are never authoritative).
     if (repaired)
     {
         if (!TruncateStoreToCommitted(i->recordsPath, BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE,
@@ -901,55 +1543,124 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
             !TruncateStoreToCommitted(i->derivedPath, BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE,
                                       BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, meta.tipRecordCount, error) ||
             !TruncateStoreToCommitted(i->activePath, BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE,
-                                      BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, expActiveSize, error))
+                                      BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, expectedActive, error))
             return false;
         // Keep the informational header counts consistent with the truncated files.
         std::string cerr;
         if (!UpdateStoreCount(i->recordsPath, BLOCK_INDEX_TIP_RECORDS_COUNT_OFFSET, meta.tipRecordCount, &cerr) ||
             !UpdateStoreCount(i->derivedPath, BLOCK_INDEX_TIP_DERIVED_COUNT_OFFSET, meta.tipRecordCount, &cerr) ||
-            !UpdateStoreCount(i->activePath, BLOCK_INDEX_TIP_ACTIVE_COUNT_OFFSET, expActiveSize, &cerr))
+            !UpdateStoreCount(i->activePath, BLOCK_INDEX_TIP_ACTIVE_COUNT_OFFSET, expectedActive, &cerr))
             return SetError(error, "tip header count repair failed: " + cerr);
     }
 
-    // 6. Rebuild hashToId.
-    i->hashToId.clear();
-    for (size_t j = 0; j < records.size(); ++j)
-        i->hashToId[records[j].hash] = i->baseLocalToId(j);
+    // Initialize the bounded windows over the committed region (ring warmed
+    // with the newest min(cap, count) entries) + open the read handle.
+    std::string werrW;
+    if (!i->recordsWin.InitializeCount(meta.tipRecordCount, &werrW))
+        return SetError(error, "tip records window init failed: " + werrW);
+    if (!i->derivedWin.InitializeCount(meta.tipRecordCount, &werrW))
+        return SetError(error, "tip derived window init failed: " + werrW);
+    if (!i->activeWin.InitializeCount(expectedActive, &werrW))
+        return SetError(error, "tip active window init failed: " + werrW);
+
+    // 6 (Repair #3): reconcile the durable hash-index side store against the
+    // committed truth (tipRecordCount records). NEVER authoritative, NEVER a
+    // second commit point: any inconsistency is repaired here, before the
+    // authority is served.
+    if (!i->ReconcileSideIndexOnOpen(&werrW))
+        return SetError(error, "tip hash-index reconcile failed: " + werrW);
 
     // 7. Validate content digest. v3 metas use the chained accumulator; v1/v2
-    //    metas use the UNCHANGED streaming digest. On mismatch: if we repaired
-    //    an uncommitted tail, rewrite stores + recompute; otherwise corruption.
+    //    metas use the UNCHANGED streaming digest. Both run STREAMING from the
+    //    committed stores (O(N) time, O(1) auxiliary RAM).
     const bool metaIsV3 = (meta.version == BLOCK_INDEX_TIP_META_VERSION_V3);
     unsigned char digest[32];
+    if (!i->BuildChainsForStreaming())
+        return SetError(error, "tip store streaming scan failed (corrupt short store)");
     if (metaIsV3)
     {
-        // One O(N) pass -- also leaves the RAM chains built so the first
-        // subsequent commit can extend them in O(new).
-        i->BuildChainsFor(records, derived, activeIds);
         DigestV3Finalize(i->chainR, i->chainD, i->chainA, meta.activeFence, digest);
     }
     else
     {
-        ComputeContentDigest(meta, records, derived, activeIds, digest);
+        // v2 streaming digest over the SAME committed region (identical byte
+        // emissions to the original inline computation).
+        SHA256_CTX ctx;
+        SHA256_Init(&ctx);
+        unsigned char buf[68];
+        const uint64_t nR = meta.tipRecordCount, nD = meta.tipRecordCount,
+                       nA = expectedActive;
+        {
+            BlockIndexRecord rr;
+            for (uint64_t s = 0; s < nR; ++s)
+            {
+                std::string gerr;
+                if (!i->recordsWin.StreamVisit(s, s + 1,
+                        [&rr, &buf, &ctx](uint64_t, const BlockIndexRecord& r) {
+                            size_t n = EncodeRecordDigestBytes(r, buf);
+                            SHA256_Update(&ctx, buf, n);
+                            return true;
+                        }, &gerr))
+                    return SetError(error, "tip-records streaming digest failed");
+            }
+            BlockIndexDerivedEntry dd;
+            for (uint64_t s = 0; s < nD; ++s)
+            {
+                std::string gerr;
+                if (!i->derivedWin.StreamVisit(s, s + 1,
+                        [&dd, &buf, &ctx](uint64_t, const BlockIndexDerivedEntry& d) {
+                            size_t n = EncodeDerivedDigestBytes(d, buf);
+                            SHA256_Update(&ctx, buf, n);
+                            return true;
+                        }, &gerr))
+                    return SetError(error, "tip-derived streaming digest failed");
+            }
+            BlockIndexId aa;
+            for (uint64_t s = 0; s < nA; ++s)
+            {
+                std::string gerr;
+                if (!i->activeWin.StreamVisit(s, s + 1,
+                        [&aa, &buf, &ctx](uint64_t, const BlockIndexId& id) {
+                            EncodeActiveDigestBytes(id, buf);
+                            SHA256_Update(&ctx, buf, 8);
+                            return true;
+                        }, &gerr))
+                    return SetError(error, "tip-active streaming digest failed");
+            }
+        }
+        SHA256_Update(&ctx, &meta.activeFence, 1);
+        SHA256_Final(digest, &ctx);
     }
     if (memcmp(digest, meta.contentDigest, 32) != 0)
     {
         if (!repaired)
             return SetError(error, "tip store content digest mismatch (corrupt)");
-        // repaired an uncommitted tail: re-persist stores + recompute digest.
-        if (!WriteRecordsFile(i->recordsPath, records))
-            return SetError(error, "repair tip-records failed");
-        if (!WriteActiveFile(i->activePath, activeIds))
-            return SetError(error, "repair tip-active failed");
-        if (!WriteDerivedFile(i->derivedPath, derived))
-            return SetError(error, "repair tip-derived failed");
-        i->meta.contentDigest[0] = 0;
+        // repaired an uncommitted tail: recompute the digest and re-publish
+        // tip.meta so the committed state stays consistent. The authoritative
+        // bytes are ALREADY exactly the committed region (the tail was
+        // physically truncated above), so only meta's digest field changes.
+        unsigned char newDigest[32];
+        memcpy(newDigest, digest, 32);
+        i->meta.contentDigest[0] = 0; // marker: publish below via a v3 write
+        // NOTE (Repair #3): the earlier full re-write of the stores here was
+        // byte-identical to what is already committed (they decoded to the
+        // same vectors and re-encoded through the same codecs); the O(N)
+        // rewrite is unnecessary. Only tip.meta is re-published.
+        BlockIndexTipMeta fixedMeta = meta;
+        fixedMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
+        memcpy(fixedMeta.contentDigest, newDigest, 32);
+        i->meta = fixedMeta;
+        if (!i->WriteMeta(error))
+        {
+            i->meta = meta;
+            return SetError(error, "repair tip.meta re-publish failed");
+        }
+        i->meta = fixedMeta;
     }
 
-    // For a non-v3 meta, the RAM chains are not yet built; build lazily on the
-    // first commit (EnsureChains) so an ordinary Open stays O(N)-once.
-    if (!metaIsV3)
-        i->chainsValid = false;
+    // For a non-v3 meta, the RAM chains are now built above (streaming); they
+    // stay valid for the first O(new) append extension.
+    i->chainsValid = true;
 
     // 8. v2: load + validate the committed operator-invalid log. tip.meta's
     //    invalidLogCount is the commit point for the log, exactly as
@@ -975,9 +1686,6 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
             return SetError(error, "tip-invalid digest mismatch (corrupt)");
     }
 
-    i->records = records;
-    i->derived = derived;
-    i->activeIds = activeIds;
     i->invalidEntries = invalidEntries;
     DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
     i->open = true;
@@ -1011,8 +1719,15 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
 
     for (size_t k = 0; k < blocks.size(); ++k)
     {
-        if (i->hashToId.count(blocks[k].record.hash))
-            continue; // idempotent replay
+        // Idempotent replay check via the durable side index (O(log N) LevelDB
+        // lookup, never O(N)); the index answers for the COMMITTED tip
+        // namespace, which is the only namespace Append may skip on.
+        {
+            BlockIndexId existing = 0;
+            if (i->sideIndex.Lookup(blocks[k].record.hash, &existing, NULL) ==
+                    BLOCK_INDEX_HASH_LOOKUP_FOUND)
+                continue; // idempotent replay
+        }
         const int32_t ah = activeHeights[k];
         if (ah >= 0)
         {
@@ -1023,7 +1738,8 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         newRecords.push_back(blocks[k].record);
         newDerived.push_back(blocks[k].derived);
         if (ah >= 0)
-            newActive.push_back(i->baseLocalToId(i->records.size() + newRecords.size() - 1));
+            newActive.push_back(i->baseLocalToId(i->meta.tipRecordCount +
+                                                 newRecords.size() - 1));
     }
 
     if (newRecords.empty())
@@ -1060,9 +1776,10 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         actBytes.insert(actBytes.end(), enc.begin(), enc.end());
     }
 
-    const uint64_t committedRecords = i->records.size();
-    const uint64_t committedDerived = i->derived.size();
-    const uint64_t committedActive = i->activeIds.size();
+    const uint64_t committedRecords = i->meta.tipRecordCount;
+    const uint64_t committedDerived = i->meta.tipRecordCount;
+    const uint64_t committedActive = (uint64_t)(i->meta.tipHeight > i->meta.baseTipHeight)
+        ? (uint64_t)(i->meta.tipHeight - i->meta.baseTipHeight) : 0;
     std::string werr;
     // Drop any stale uncommitted suffix first so the new bytes land exactly at the
     // committed boundary (idempotent; no-op after a clean shutdown).
@@ -1090,10 +1807,41 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     // deterministically on the first legitimate new commit.
     if (!WriteInvalidFile(i->invalidPath, i->invalidEntries, &werr))
         return SetError(error, "append tip-invalid failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+    // Repair #3: durable side index Put for each new record. The entries are
+    // an UNCOMMITTED suffix of the index until tip.meta advances (the same
+    // fail-safe tier as the tail stores); Open reconciles index entries past
+    // the committed count.
+    for (size_t k = 0; k < newRecords.size(); ++k)
+    {
+        std::string ierr;
+        if (!i->sideIndex.Put(newRecords[k].hash,
+                              i->baseLocalToId(committedRecords + k), &ierr))
+            return SetError(error, "append tip-hashindex put failed: " + ierr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
+    {
+        std::string merr;
+        if (!WriteHashIndexMarker(i->hashIndexMarkerPath,
+                                  committedRecords + newRecords.size(), &merr))
+            return SetError(error, "append tip-hashindex marker failed: " + merr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
 
     // Test-only: all tail stores durable, crash before the tip.meta commit.
     if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
+    {
+        // The side-index entries published above are an UNCOMMITTED delta;
+        // the in-session index must not answer for them (they are also
+        // reconciled away at the next Open).
+        for (size_t k = 0; k < newRecords.size(); ++k)
+        {
+            std::string derr;
+            i->sideIndex.DeleteIfCommitted(newRecords[k].hash,
+                                           i->baseLocalToId(committedRecords + k),
+                                           &derr);
+        }
         return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
+    }
 
     // 2. Advance tip.meta.
     BlockIndexTipMeta newMeta = i->meta;
@@ -1126,19 +1874,22 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         newMeta.tipHash = i->meta.tipHash;
     }
 
-    // 3. Commit: mutate the in-memory state INCREMENTALLY (O(new)), extend the
-    //    v3 digest chains by ONLY the new entries (O(new)), then publish
-    //    tip.meta. A failed commit rolls the in-memory append AND the chains
-    //    back so authority never runs ahead of the last committed tip.meta.
+    // 3. Commit: advance the bounded windows INCREMENTALLY (O(new)), extend
+    //    the v3 digest chains by ONLY the new entries (O(new)), then publish
+    //    tip.meta. A failed commit rolls the windows AND the chains back so
+    //    authority never runs ahead of the last committed tip.meta; the side
+    //    index entries published above stay (they are reconciled at Open).
     i->EnsureChains();
     const BlockIndexTipMeta savedMeta = i->meta;
     unsigned char savedR[32], savedD[32], savedA[32];
     memcpy(savedR, i->chainR, 32); memcpy(savedD, i->chainD, 32); memcpy(savedA, i->chainA, 32);
-    i->records.insert(i->records.end(), newRecords.begin(), newRecords.end());
-    i->derived.insert(i->derived.end(), newDerived.begin(), newDerived.end());
-    i->activeIds.insert(i->activeIds.end(), newActive.begin(), newActive.end());
-    for (size_t k = 0; k < newRecords.size(); ++k)
-        i->hashToId[newRecords[k].hash] = i->baseLocalToId(committedRecords + k);
+    const uint64_t savedRecordsCount = i->recordsWin.Count();
+    const uint64_t savedDerivedCount = i->derivedWin.Count();
+    const uint64_t savedActiveCount = i->activeWin.Count();
+    i->recordsWin.PushBack(&newRecords[0], newRecords.size());
+    i->derivedWin.PushBack(&newDerived[0], newDerived.size());
+    if (!newActive.empty())
+        i->activeWin.PushBack(&newActive[0], newActive.size());
     {
         unsigned char b[68];
         for (size_t k = 0; k < newRecords.size(); ++k)
@@ -1152,12 +1903,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     i->meta = newMeta;
     if (!i->WriteMeta(error))
     {
+        // Roll the windows back to the committed counts (ring suffix shrink).
+        while (i->recordsWin.Count() > savedRecordsCount) i->recordsWin.Pop();
+        while (i->derivedWin.Count() > savedDerivedCount) i->derivedWin.Pop();
+        while (i->activeWin.Count() > savedActiveCount) i->activeWin.Pop();
         i->meta = savedMeta;
-        i->records.resize(committedRecords);
-        i->derived.resize(committedDerived);
-        i->activeIds.resize(committedActive);
-        for (size_t k = 0; k < newRecords.size(); ++k)
-            i->hashToId.erase(newRecords[k].hash);
         memcpy(i->chainR, savedR, 32); memcpy(i->chainD, savedD, 32); memcpy(i->chainA, savedA, 32);
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
@@ -1170,49 +1920,89 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
     if (!impl->open)
         return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
     Impl* i = impl;
+    std::string werr;
     // height is a GLOBAL active height. The empty tip == baseTipHeight (S).
     const int32_t baseTip = i->meta.baseTipHeight;
-    if (height < baseTip || height >= baseTip + (int32_t)i->activeIds.size())
+    const uint64_t activeCount = (uint64_t)(i->meta.tipHeight > baseTip)
+        ? (uint64_t)(i->meta.tipHeight - baseTip) : 0;
+    if (height < baseTip || height >= baseTip + (int32_t)activeCount)
         return SetError(error, "truncate height out of range"), BLOCK_INDEX_TIP_CORRUPT;
 
-    // relative active count after truncate = height - baseTip
-    std::vector<BlockIndexId> allActive;
-    if (height == baseTip)
-        allActive.clear();
-    else
-        allActive.assign(i->activeIds.begin(), i->activeIds.begin() + (height - baseTip));
+    // relative active count after truncate = height - baseTip. The retained
+    // active prefix is STREAMED straight into the temp file (O(count), O(1)
+    // auxiliary RAM) and atomically renamed over the store (CoW commit).
+    const uint64_t keepActive = (uint64_t)(height - baseTip);
+    {
+        const fs::path tmp = fs::path(i->activePath.string() + ".tmp");
+        if (!StreamActiveFileTo(i->activePath, keepActive, &werr))
+            return SetError(error, "truncate tip-active stream failed: " + werr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+        // CoW boundary (test-only crash point), mirroring the records path:
+        // the complete temp file is durable but NOT yet renamed over.
+        if (BlockIndexTipFailpointHit("FP_DURING_TAIL_UPDATE"))
+            return SetError(error, "failpoint FP_DURING_TAIL_UPDATE"),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+        if (!RenameOverChecked(tmp, i->activePath, error) ||
+            !SyncDirectoryChecked(i->tipDir, error))
+            return SetError(error, "truncate tip-active publish failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        std::string cerr;
+        if (!UpdateStoreCount(i->activePath, BLOCK_INDEX_TIP_ACTIVE_COUNT_OFFSET,
+                              keepActive, &cerr))
+            return SetError(error, "truncate tip-active count update failed: " + cerr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
 
-    if (!WriteActiveFile(i->activePath, allActive))
-        return SetError(error, "truncate tip-active failed"), BLOCK_INDEX_TIP_IO_ERROR;
-
-    if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
-        return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
-
+    // Resolve the new tip hash by ONE positional read of the kept tip record
+    // (slot = tipId - baseRecordCount - 1) -- no O(records) scan.
     BlockIndexTipMeta newMeta = i->meta;
     newMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
     newMeta.activeFence++;
     newMeta.tipHeight = height;
-    if (allActive.empty())
+    if (keepActive == 0)
         newMeta.tipHash = uint256(0);
     else
     {
-        BlockIndexId tipId = allActive.back();
-        for (size_t j = 0; j < i->records.size(); ++j)
-            if (i->baseLocalToId(j) == tipId)
-                newMeta.tipHash = i->records[j].hash;
+        BlockIndexId tipId = 0;
+        std::string gerr;
+        if (!i->activeWin.Get(keepActive - 1, &tipId, &gerr))
+            return SetError(error, "truncate tip hash resolve failed: " + gerr),
+                   BLOCK_INDEX_TIP_CORRUPT;
+        if (tipId <= i->meta.baseRecordCount)
+            return SetError(error, "truncate tip id invalid"), BLOCK_INDEX_TIP_CORRUPT;
+        const uint64_t tipSlot = tipId - i->meta.baseRecordCount - 1;
+        BlockIndexRecord rr;
+        if (!i->recordsWin.Get(tipSlot, &rr, &gerr))
+            return SetError(error, "truncate tip record read failed: " + gerr),
+                   BLOCK_INDEX_TIP_CORRUPT;
+        newMeta.tipHash = rr.hash;
     }
-    // Non-append mutation: REBUILD the v3 chains from the resulting vectors.
-    i->BuildChainsFor(i->records, i->derived, allActive);
+    // Non-append mutation: rebuild the v3 chains STREAMING (records/derived
+    // unchanged; active chain shortened). O(N), O(1) RAM.
+    std::string serrA, serrB, serrC;
+    if (!i->recordsWin.SetCount(i->meta.tipRecordCount, &serrA) ||
+        !i->derivedWin.SetCount(i->meta.tipRecordCount, &serrB) ||
+        !i->activeWin.SetCount(keepActive, &serrC))
+        return SetError(error, "truncate window reset failed: " + serrA + serrB + serrC),
+               BLOCK_INDEX_TIP_IO_ERROR;
+    {
+        if (!i->BuildChainsForStreaming())
+            return SetError(error, "truncate digest rebuild failed: " +
+                                   i->lastStreamError),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
     DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
 
     const BlockIndexTipMeta savedMeta = i->meta;
-    const std::vector<BlockIndexId> savedActive = i->activeIds;
+    const uint64_t savedActiveCount = i->activeWin.Count();
+    const BlockIndexTipMeta saved = i->meta;
+    (void)saved;
     i->meta = newMeta;
-    i->activeIds = allActive;
     if (!i->WriteMeta(error))
     {
         i->meta = savedMeta;
-        i->activeIds = savedActive;
+        // roll the active window back to the committed count
+        std::string werrR;
+        i->activeWin.SetCount(savedActiveCount, &werrR); // full resync (Pop is only for single-entry rollback after PushBack)
         i->chainsValid = false;
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
@@ -1241,126 +2031,186 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     const int32_t baseTip = i->meta.baseTipHeight;
 
     // 1. Truncate the ACTIVE chain to the fork (keeps side records, removes the
-    //    disconnected branch from active membership). Dense: activeIds covers
-    //    [baseTip+1, baseTip+activeIds.size()], so fork must be in range.
-    if (forkHeight < baseTip || forkHeight >= baseTip + (int32_t)i->activeIds.size())
+    //    disconnected branch from active membership). Dense rel count = tip -
+    //    baseTip; fork must be in range.
+    const uint64_t activeCount = (uint64_t)(i->meta.tipHeight > baseTip)
+        ? (uint64_t)(i->meta.tipHeight - baseTip) : 0;
+    if (forkHeight < baseTip || forkHeight >= baseTip + (int32_t)activeCount)
     {
-        if (forkHeight == baseTip)
-        {
-            // Already at the empty fork: activeIds empty is fine.
-        }
-        else
-        {
+        if (forkHeight != baseTip)
             return SetError(error, "reorg fork height out of range"), BLOCK_INDEX_TIP_CORRUPT;
-        }
     }
-    std::vector<BlockIndexId> baseActive;
-    if (forkHeight > baseTip)
-        baseActive.assign(i->activeIds.begin(), i->activeIds.begin() + (forkHeight - baseTip));
-    else
-        baseActive.clear();
+    const uint64_t keepActive = (uint64_t)(forkHeight > baseTip)
+        ? (uint64_t)(forkHeight - baseTip) : 0;
+    const uint64_t committedRecords = i->meta.tipRecordCount;
 
-    // 2. Build the new full records/derived/active state. An existing record is
-    //    REUSED (regexist side -> promoted to active at its branch height); a
-    //    branch record not yet in the tip is APPENDED. Every branch block must be
-    //    post-fork and map to the expected dense height.
-    std::vector<BlockIndexRecord> allRecords = i->records;
-    std::vector<BlockIndexDerivedEntry> allDerived = i->derived;
-    std::vector<BlockIndexId> newActive = baseActive; // fork prefix
-    std::vector<BlockIndexId> allActive = newActive.empty()
-        ? std::vector<BlockIndexId>() : newActive;
+    // 2. Build the new full records/derived/active state (Repair #3: bounded
+    //    RAM). An existing record is REUSED (a committed side record is
+    //    promoted to active at its branch height, with its reorg-supplied
+    //    copy VALIDATED against the committed bytes -- never re-encoded); a
+    //    branch record not yet in the tip is APPENDED. Promotion resolves BY
+    //    HASH through the durable side index. newActive = fork prefix ids +
+    //    one RecordId per branch block (promoted or appended).
+    std::vector<BlockIndexId> forkPrefixIds;
+    if (keepActive > 0)
+        forkPrefixIds.resize(keepActive);
+    std::string aerr;
+    for (uint64_t rel = 0; rel < keepActive; ++rel)
+    {
+        if (!i->activeWin.Get(rel, &forkPrefixIds[rel], &aerr))
+            return SetError(error, "reorg fork prefix read failed: " + aerr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
+    std::vector<BlockIndexId> newActive = forkPrefixIds; // branch ids appended below
+    // The ids of NEW records to append to the tail stores (slot-ordered).
+    std::vector<BlockIndexRecord> appendRecords;
+    std::vector<BlockIndexDerivedEntry> appendDerived;
     std::set<uint256> seenBranch;
     for (size_t k = 0; k < branch.size(); ++k)
     {
         const BlockIndexRecord& rec = branch[k].record;
-        const int32_t expectedHeight = baseTip + (int32_t)newActive.size() + 1;
-        if (branchHeights[k] != expectedHeight)
+        if (branchHeights[k] != baseTip + (int32_t)newActive.size() + 1)
             return SetError(error, "reorg branch non-dense height"), BLOCK_INDEX_TIP_CORRUPT;
         if (!seenBranch.insert(rec.hash).second)
             return SetError(error, "reorg branch duplicate"), BLOCK_INDEX_TIP_CORRUPT;
-        std::map<uint256, BlockIndexId>::iterator it = i->hashToId.find(rec.hash);
-        if (it != i->hashToId.end())
+        // Promote-or-append via the durable side index's committed view.
+        BlockIndexId foundId = 0;
+        const BlockIndexHashLookupStatus lstat =
+            i->sideIndex.Lookup(rec.hash, &foundId, NULL);
+        if (lstat == BLOCK_INDEX_HASH_LOOKUP_ERROR)
+            return SetError(error, "reorg side-index lookup failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        if (lstat == BLOCK_INDEX_HASH_LOOKUP_FOUND)
         {
-            // Already present (side record): promote to active.
-            newActive.push_back(it->second);
+            // Already present -> promote. Validate the branch record's content
+            // matches the committed record at that id (fail closed, no swap).
+            if (foundId <= i->meta.baseRecordCount)
+                return SetError(error, "reorg promoted id invalid"), BLOCK_INDEX_TIP_CORRUPT;
+            const uint64_t slot = foundId - i->meta.baseRecordCount - 1;
+            if (slot >= committedRecords)
+                return SetError(error, "reorg promoted id out of range"), BLOCK_INDEX_TIP_CORRUPT;
+            BlockIndexRecord committed;
+            if (!i->recordsWin.Get(slot, &committed, &aerr))
+                return SetError(error, "reorg promoted record read failed: " + aerr),
+                       BLOCK_INDEX_TIP_IO_ERROR;
+            if (committed.hashPrev != rec.hashPrev || committed.height != rec.height)
+                return SetError(error, "reorg promoted record mismatch"), BLOCK_INDEX_TIP_CORRUPT;
+            newActive.push_back(foundId);
         }
         else
         {
-            BlockIndexId newId = i->baseLocalToId(allRecords.size());
-            allRecords.push_back(rec);
-            allDerived.push_back(branch[k].derived);
+            const BlockIndexId newId = i->baseLocalToId(committedRecords +
+                                                        appendRecords.size());
+            appendRecords.push_back(rec);
+            appendDerived.push_back(branch[k].derived);
             newActive.push_back(newId);
         }
     }
-    allActive = newActive;
-    // Dense active prefix check: every active member corresponds to a record.
-    for (size_t h = 0; h < allActive.size(); ++h)
+    // Dense active prefix check: every active member = fork prefix ids (read
+    // from the committed store, so trivially valid) or a branch id (validated
+    // above to point at a committed or freshly-appended record).
+    for (size_t h = forkPrefixIds.size(); h < newActive.size(); ++h)
     {
-        bool found=false;
-        for (size_t j = 0; j < allRecords.size(); ++j)
-            if (i->baseLocalToId(j) == allActive[h]) { found=true; break; }
-        if (!found)
+        const BlockIndexId id = newActive[h];
+        if (id <= i->meta.baseRecordCount)
+            return SetError(error, "reorg branch id invalid"), BLOCK_INDEX_TIP_CORRUPT;
+        const uint64_t slot = id - i->meta.baseRecordCount - 1;
+        if (slot >= committedRecords + appendRecords.size())
             return SetError(error, "reorg active record missing"), BLOCK_INDEX_TIP_CORRUPT;
     }
 
-    // 3. Persist stores (full commit-write); tip.meta stays the commit point.
-    if (!WriteRecordsFile(i->recordsPath, allRecords))
-        return SetError(error, "reorg tip-records failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!WriteDerivedFile(i->derivedPath, allDerived))
-        return SetError(error, "reorg tip-derived failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!WriteActiveFile(i->activePath, allActive))
-        return SetError(error, "reorg tip-active failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    // 3. Persist all three stores by STREAMING complete CoW temp files: the
+    //    retained committed prefix is copied BYTEWISE (slots are stable), then
+    //    the branch appends are encoded at the end. Each temp is fsynced,
+    //    renamed over the authoritative file, and the dir synced (fail
+    //    closed on any error); tip.meta is published LAST (single commit).
+    std::string werr;
+    if (!i->RewriteStoresForReorg(keepActive, committedRecords,
+                                  appendRecords, appendDerived, newActive,
+                                  &werr))
+        return SetError(error, "reorg store stream failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
 
-    // 4. Advance tip.meta (dense tipHeight + tipHash), rebuild hashToId.
+    // 3b. Side index: Put the appended records' hashes (O(new)); entries are
+    //     uncommitted until tip.meta advances (reconciled at Open).
+    for (size_t k = 0; k < appendRecords.size(); ++k)
+    {
+        std::string ierr;
+        if (!i->sideIndex.Put(appendRecords[k].hash,
+                              i->baseLocalToId(committedRecords + k), &ierr))
+            return SetError(error, "reorg tip-hashindex put failed: " + ierr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
+    {
+        std::string merr;
+        if (!WriteHashIndexMarker(i->hashIndexMarkerPath,
+                                  committedRecords + appendRecords.size(), &merr))
+            return SetError(error, "reorg tip-hashindex marker failed: " + merr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
+
+    // 4. Advance tip.meta (dense tipHeight + tipHash) + rebuild the v3 chains
+    //    STREAMING (O(N) time, O(1) RAM) BEFORE the meta publish.
     BlockIndexTipMeta newMeta = i->meta;
     newMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
     newMeta.activeFence++;
-    newMeta.tipRecordCount = allRecords.size();
-    newMeta.tipHeight = baseTip + (int32_t)allActive.size();
-    if (allActive.empty())
+    newMeta.tipRecordCount = committedRecords + appendRecords.size();
+    newMeta.tipHeight = baseTip + (int32_t)newActive.size();
+    if (newActive.empty())
         newMeta.tipHash = uint256(0);
     else
     {
-        BlockIndexId tipId = allActive.back();
-        for (size_t j = 0; j < allRecords.size(); ++j)
-            if (i->baseLocalToId(j) == tipId) newMeta.tipHash = allRecords[j].hash;
+        BlockIndexId tipId = newActive.back();
+        if (tipId <= i->meta.baseRecordCount)
+            return SetError(error, "reorg tip id invalid"), BLOCK_INDEX_TIP_CORRUPT;
+        const uint64_t tipSlot = tipId - i->meta.baseRecordCount - 1;
+        if (tipSlot >= newMeta.tipRecordCount)
+            return SetError(error, "reorg tip id out of range"), BLOCK_INDEX_TIP_CORRUPT;
+        if (tipSlot >= committedRecords)
+        {
+            if (tipSlot - committedRecords >= appendRecords.size())
+                return SetError(error, "reorg tip append slot invalid"), BLOCK_INDEX_TIP_CORRUPT;
+            newMeta.tipHash = appendRecords[(size_t)(tipSlot - committedRecords)].hash;
+        }
+        else
+        {
+            BlockIndexRecord rr;
+            if (!i->recordsWin.Get(tipSlot, &rr, &aerr))
+                return SetError(error, "reorg tip hash resolve failed: " + aerr),
+                       BLOCK_INDEX_TIP_IO_ERROR;
+            newMeta.tipHash = rr.hash;
+        }
     }
-    // Non-append mutation: REBUILD the v3 chains from the resulting vectors.
-    i->BuildChainsFor(allRecords, allDerived, allActive);
+    // SetCount()s re-point the windows at the freshly swapped files; they are
+    // lazy (ring dropped), keeping the RAM bounded through the whole reorg.
+    std::string werrWA, werrWB, werrWC;
+    if (!i->recordsWin.SetCount(newMeta.tipRecordCount, &werrWA) ||
+        !i->derivedWin.SetCount(newMeta.tipRecordCount, &werrWB) ||
+        !i->activeWin.SetCount((uint64_t)newActive.size(), &werrWC))
+        return SetError(error, "reorg window reset failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!i->BuildChainsForStreaming())
+        return SetError(error, "reorg digest rebuild failed"), BLOCK_INDEX_TIP_IO_ERROR;
     DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
     // Commit point: adopt the new meta BEFORE writing it, exactly as
-    // AppendBatch/TruncateActiveTo do. Writing meta while i->meta still holds the
-    // pre-reorg state would commit the NEW stores (records/derived/active) against
-    // the OLD meta (tipRecordCount/tipHeight/contentDigest), so the next Open
-    // truncates the freshly-published reorg branch back to the pre-reorg commit
-    // point and reports a content-digest mismatch (silent loss of the cutover).
+    // AppendBatch/TruncateActiveTo do (see the original note: publishing the
+    // new stores against the OLD meta would silently lose the cutover).
     // Test-only: all tail stores durable, crash before the tip.meta commit.
     if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
         return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
 
     const BlockIndexTipMeta savedMeta = i->meta;
-    const std::vector<BlockIndexRecord> savedRecords = i->records;
-    const std::vector<BlockIndexDerivedEntry> savedDerived = i->derived;
-    const std::vector<BlockIndexId> savedActive = i->activeIds;
     i->meta = newMeta;
     if (!i->WriteMeta(error))
     {
         i->meta = savedMeta;
-        i->records = savedRecords;
-        i->derived = savedDerived;
-        i->activeIds = savedActive;
-        i->hashToId.clear();
-        for (size_t j = 0; j < i->records.size(); ++j)
-            i->hashToId[i->records[j].hash] = i->baseLocalToId(j);
+        // roll windows back to the PRE-reorg committed state (lazy re-point)
+        std::string werrRA, werrRB, werrRC;
+        i->recordsWin.SetCount(savedMeta.tipRecordCount, &werrRA);
+        i->derivedWin.SetCount(savedMeta.tipRecordCount, &werrRB);
+        const uint64_t savedActiveCount = (uint64_t)(savedMeta.tipHeight > baseTip)
+            ? (uint64_t)(savedMeta.tipHeight - baseTip) : 0;
+        i->activeWin.SetCount(savedActiveCount, &werrRC);
         i->chainsValid = false;
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
-    i->records = allRecords;
-    i->derived = allDerived;
-    i->activeIds = allActive;
-    i->hashToId.clear();
-    for (size_t j = 0; j < allRecords.size(); ++j)
-        i->hashToId[allRecords[j].hash] = i->baseLocalToId(j);
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
 }
@@ -1390,74 +2240,148 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
         allEntries.push_back(ent);
     }
 
-    // (b) resulting active membership (fused from ReorgActiveTo steps 1-2).
-    if (forkHeight < baseTip || forkHeight >= baseTip + (int32_t)i->activeIds.size())
+    // (b) resulting active membership (fused from ReorgActiveTo steps 1-2;
+    //     Repair #3: bounded-RAM equivalent via the durable side index).
+    const uint64_t activeCount = (uint64_t)(i->meta.tipHeight > baseTip)
+        ? (uint64_t)(i->meta.tipHeight - baseTip) : 0;
+    if (forkHeight < baseTip || forkHeight >= baseTip + (int32_t)activeCount)
     {
         if (forkHeight != baseTip)
             return SetError(error, "fused reorg fork height out of range"), BLOCK_INDEX_TIP_CORRUPT;
     }
-    std::vector<BlockIndexId> baseActive;
-    if (forkHeight > baseTip)
-        baseActive.assign(i->activeIds.begin(), i->activeIds.begin() + (forkHeight - baseTip));
-
-    std::vector<BlockIndexRecord> allRecords = i->records;
-    std::vector<BlockIndexDerivedEntry> allDerived = i->derived;
-    std::vector<BlockIndexId> newActive = baseActive;
+    const uint64_t keepActive = (uint64_t)(forkHeight > baseTip)
+        ? (uint64_t)(forkHeight - baseTip) : 0;
+    const uint64_t committedRecords = i->meta.tipRecordCount;
+    std::vector<BlockIndexId> forkPrefixIds;
+    if (keepActive > 0)
+        forkPrefixIds.resize(keepActive);
+    std::string aerr;
+    for (uint64_t rel = 0; rel < keepActive; ++rel)
+    {
+        if (!i->activeWin.Get(rel, &forkPrefixIds[rel], &aerr))
+            return SetError(error, "fused fork prefix read failed: " + aerr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
+    std::vector<BlockIndexId> allActive = forkPrefixIds;
+    std::vector<BlockIndexRecord> appendRecords;
+    std::vector<BlockIndexDerivedEntry> appendDerived;
     std::set<uint256> seenBranch;
     for (size_t k = 0; k < branch.size(); ++k)
     {
         const BlockIndexRecord& rec = branch[k].record;
-        const int32_t expectedHeight = baseTip + (int32_t)newActive.size() + 1;
-        if (branchHeights[k] != expectedHeight)
+        if (branchHeights[k] != baseTip + (int32_t)allActive.size() + 1)
             return SetError(error, "fused reorg branch non-dense height"), BLOCK_INDEX_TIP_CORRUPT;
         if (!seenBranch.insert(rec.hash).second)
             return SetError(error, "fused reorg branch duplicate"), BLOCK_INDEX_TIP_CORRUPT;
-        std::map<uint256, BlockIndexId>::iterator it = i->hashToId.find(rec.hash);
-        if (it != i->hashToId.end())
-            newActive.push_back(it->second); // promote existing side record
+        BlockIndexId foundId = 0;
+        const BlockIndexHashLookupStatus lstat =
+            i->sideIndex.Lookup(rec.hash, &foundId, NULL);
+        if (lstat == BLOCK_INDEX_HASH_LOOKUP_ERROR)
+            return SetError(error, "fused side-index lookup failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        if (lstat == BLOCK_INDEX_HASH_LOOKUP_FOUND)
+        {
+            // promote existing side record (content validated against the
+            // committed record at that id; fail closed, no swap)
+            if (foundId <= i->meta.baseRecordCount)
+                return SetError(error, "fused promoted id invalid"), BLOCK_INDEX_TIP_CORRUPT;
+            const uint64_t slot = foundId - i->meta.baseRecordCount - 1;
+            if (slot >= committedRecords)
+                return SetError(error, "fused promoted id out of range"), BLOCK_INDEX_TIP_CORRUPT;
+            BlockIndexRecord committed;
+            if (!i->recordsWin.Get(slot, &committed, &aerr))
+                return SetError(error, "fused promoted record read failed: " + aerr),
+                       BLOCK_INDEX_TIP_IO_ERROR;
+            if (committed.hashPrev != rec.hashPrev || committed.height != rec.height)
+                return SetError(error, "fused promoted record mismatch"), BLOCK_INDEX_TIP_CORRUPT;
+            allActive.push_back(foundId);
+        }
         else
         {
-            BlockIndexId newId = i->baseLocalToId(allRecords.size());
-            allRecords.push_back(rec);
-            allDerived.push_back(branch[k].derived);
-            newActive.push_back(newId);
+            const BlockIndexId newId = i->baseLocalToId(committedRecords +
+                                                        appendRecords.size());
+            appendRecords.push_back(rec);
+            appendDerived.push_back(branch[k].derived);
+            allActive.push_back(newId);
         }
     }
-    std::vector<BlockIndexId> allActive = newActive;
+    for (size_t h = forkPrefixIds.size(); h < allActive.size(); ++h)
+    {
+        const BlockIndexId id = allActive[h];
+        if (id <= i->meta.baseRecordCount)
+            return SetError(error, "fused branch id invalid"), BLOCK_INDEX_TIP_CORRUPT;
+        if (id - i->meta.baseRecordCount - 1 >= committedRecords + appendRecords.size())
+            return SetError(error, "fused active record missing"), BLOCK_INDEX_TIP_CORRUPT;
+    }
 
     // Persist all four stores. tip.meta below is the SOLE commit point for BOTH
     // the invalid log and the active membership (uncommitted tails are ignored).
-    if (!WriteRecordsFile(i->recordsPath, allRecords))
-        return SetError(error, "fused tip-records failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!WriteDerivedFile(i->derivedPath, allDerived))
-        return SetError(error, "fused tip-derived failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!WriteActiveFile(i->activePath, allActive))
-        return SetError(error, "fused tip-active failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    std::string werr;
+    if (!i->RewriteStoresForReorg(keepActive, committedRecords,
+                                  appendRecords, appendDerived, allActive, &werr))
+        return SetError(error, "fused store stream failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
     if (!WriteInvalidFile(i->invalidPath, allEntries))
         return SetError(error, "fused tip-invalid failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    for (size_t k = 0; k < appendRecords.size(); ++k)
+    {
+        std::string ierr;
+        if (!i->sideIndex.Put(appendRecords[k].hash,
+                              i->baseLocalToId(committedRecords + k), &ierr))
+            return SetError(error, "fused tip-hashindex put failed: " + ierr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
+    {
+        std::string merr;
+        if (!WriteHashIndexMarker(i->hashIndexMarkerPath,
+                                  committedRecords + appendRecords.size(), &merr))
+            return SetError(error, "fused tip-hashindex marker failed: " + merr),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+    }
 
     // ONE tip.meta commit: invalid intent AND the resulting active tip together.
     const BlockIndexTipMeta savedMeta = i->meta;
-    const std::vector<BlockIndexRecord> savedRecords = i->records;
-    const std::vector<BlockIndexDerivedEntry> savedDerived = i->derived;
-    const std::vector<BlockIndexId> savedActive = i->activeIds;
     const std::vector<BlockIndexTipInvalidEntry> savedEntries = i->invalidEntries;
 
     BlockIndexTipMeta newMeta = i->meta;
     newMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
     newMeta.activeFence++;
-    newMeta.tipRecordCount = allRecords.size();
+    newMeta.tipRecordCount = committedRecords + appendRecords.size();
     newMeta.tipHeight = baseTip + (int32_t)allActive.size();
     if (allActive.empty())
         newMeta.tipHash = uint256(0);
     else
     {
-        BlockIndexId tipId = allActive.back();
-        for (size_t j = 0; j < allRecords.size(); ++j)
-            if (i->baseLocalToId(j) == tipId) newMeta.tipHash = allRecords[j].hash;
+        const BlockIndexId tipId = allActive.back();
+        if (tipId <= i->meta.baseRecordCount)
+            return SetError(error, "fused tip id invalid"), BLOCK_INDEX_TIP_CORRUPT;
+        const uint64_t tipSlot = tipId - i->meta.baseRecordCount - 1;
+        if (tipSlot >= newMeta.tipRecordCount)
+            return SetError(error, "fused tip id out of range"), BLOCK_INDEX_TIP_CORRUPT;
+        if (tipSlot >= committedRecords)
+        {
+            // freshly appended branch tip: resolve from the local append buffer
+            // (O(new)); the windows still hold the OLD committed count here.
+            if (tipSlot - committedRecords >= appendRecords.size())
+                return SetError(error, "fused tip append slot invalid"), BLOCK_INDEX_TIP_CORRUPT;
+            newMeta.tipHash = appendRecords[(size_t)(tipSlot - committedRecords)].hash;
+        }
+        else
+        {
+            BlockIndexRecord rr;
+            if (!i->recordsWin.Get(tipSlot, &rr, &aerr))
+                return SetError(error, "fused tip hash resolve failed: " + aerr),
+                       BLOCK_INDEX_TIP_IO_ERROR;
+            newMeta.tipHash = rr.hash;
+        }
     }
-    // Non-append mutation: REBUILD the v3 chains from the resulting vectors.
-    i->BuildChainsFor(allRecords, allDerived, allActive);
+    // Non-append mutation: rebuild the v3 chains STREAMING (O(N), O(1) RAM)
+    // over the freshly-swapped store files.
+    std::string werrWA, werrWB, werrWC;
+    if (!i->recordsWin.SetCount(newMeta.tipRecordCount, &werrWA) ||
+        !i->derivedWin.SetCount(newMeta.tipRecordCount, &werrWB) ||
+        !i->activeWin.SetCount((uint64_t)allActive.size(), &werrWC))
+        return SetError(error, "fused window reset failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!i->BuildChainsForStreaming())
+        return SetError(error, "fused digest rebuild failed"), BLOCK_INDEX_TIP_IO_ERROR;
     DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
     newMeta.invalidLogCount = (uint32_t)allEntries.size();
     ComputeInvalidDigest(allEntries, newMeta.invalidDigest);
@@ -1471,19 +2395,17 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
     if (!i->WriteMeta(error))
     {
         i->meta = savedMeta;
-        i->records = savedRecords;
-        i->derived = savedDerived;
-        i->activeIds = savedActive;
         i->invalidEntries = savedEntries;
         DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
+        std::string werrRA, werrRB, werrRC;
+        i->recordsWin.SetCount(savedMeta.tipRecordCount, &werrRA);
+        i->derivedWin.SetCount(savedMeta.tipRecordCount, &werrRB);
+        const uint64_t savedActiveCount = (uint64_t)(savedMeta.tipHeight > baseTip)
+            ? (uint64_t)(savedMeta.tipHeight - baseTip) : 0;
+        i->activeWin.SetCount(savedActiveCount, &werrRC);
+        i->chainsValid = false;
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
-    i->records = allRecords;
-    i->derived = allDerived;
-    i->activeIds = allActive;
-    i->hashToId.clear();
-    for (size_t j = 0; j < allRecords.size(); ++j)
-        i->hashToId[allRecords[j].hash] = i->baseLocalToId(j);
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
 }
@@ -1496,23 +2418,44 @@ BlockIndexTipRead BlockIndexTipAuthority::GetTip() const
         r.status = BLOCK_INDEX_TIP_IO_ERROR;
         return r;
     }
-    if (impl->activeIds.empty())
+    Impl* i = impl;
+    if (i->activeWin.Count() == 0)
     {
         r.status = BLOCK_INDEX_TIP_NOT_FOUND;
         return r;
     }
-    BlockIndexId tipId = impl->activeIds.back();
-    for (size_t j = 0; j < impl->records.size(); ++j)
-        if (impl->baseLocalToId(j) == tipId)
-        {
-            r.status = BLOCK_INDEX_TIP_OK;
-            r.record = impl->records[j];
-            r.derived = impl->derived[j];
-            r.active = true;
-            r.height = impl->records[j].height;
-            return r;
-        }
-    r.status = BLOCK_INDEX_TIP_CORRUPT;
+    // The tip active id is the LAST committed active entry (slot arithmetic);
+    // O(1) via one window/pread read, never an O(records) scan.
+    BlockIndexId tipId = 0;
+    std::string gerr;
+    if (!i->activeWin.Get(i->activeWin.Count() - 1, &tipId, &gerr))
+    {
+        r.status = BLOCK_INDEX_TIP_IO_ERROR;
+        return r;
+    }
+    if (tipId <= i->meta.baseRecordCount)
+    {
+        r.status = BLOCK_INDEX_TIP_CORRUPT;
+        return r;
+    }
+    const uint64_t slot = tipId - i->meta.baseRecordCount - 1;
+    if (slot >= i->recordsWin.Count() || slot >= i->derivedWin.Count())
+    {
+        r.status = BLOCK_INDEX_TIP_CORRUPT;
+        return r;
+    }
+    BlockIndexRecord rr;
+    BlockIndexDerivedEntry dd;
+    if (!i->recordsWin.Get(slot, &rr, &gerr) || !i->derivedWin.Get(slot, &dd, &gerr))
+    {
+        r.status = BLOCK_INDEX_TIP_IO_ERROR;
+        return r;
+    }
+    r.status = BLOCK_INDEX_TIP_OK;
+    r.record = rr;
+    r.derived = dd;
+    r.active = true;
+    r.height = rr.height;
     return r;
 }
 
@@ -1524,18 +2467,22 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
         r.status = BLOCK_INDEX_TIP_IO_ERROR;
         return r;
     }
-    std::map<uint256, BlockIndexId>::const_iterator it = impl->hashToId.find(hash);
-    if (it == impl->hashToId.end())
+    // Repair #3: the durable side index answers the hash -> RecordId mapping
+    // (O(log N) LevelDB lookup; never an O(N) RAM map or scan). Slot
+    // arithmetic (id == baseRecordCount + slot + 1) is unchanged.
+    BlockIndexId id = 0;
+    const BlockIndexHashLookupStatus lstat =
+        impl->sideIndex.Lookup(hash, &id, NULL);
+    if (lstat == BLOCK_INDEX_HASH_LOOKUP_NOT_FOUND)
     {
         r.status = BLOCK_INDEX_TIP_NOT_FOUND;
         return r;
     }
-    // baseLocalToId(j) == baseRecordCount + j + 1 is an affine map, so the record
-    // slot for a RecordId is a DIRECT computation. The former per-call linear
-    // scan over the whole records vector (and a second scan over activeIds)
-    // dominated fresh-IBD CPU: each by-value lookup walked the entire retained
-    // tail. Results are identical; only the lookup cost changes (O(N) -> O(1)).
-    const BlockIndexId id = it->second;
+    if (lstat == BLOCK_INDEX_HASH_LOOKUP_ERROR)
+    {
+        r.status = BLOCK_INDEX_TIP_IO_ERROR;
+        return r;
+    }
     const uint64_t base = impl->meta.baseRecordCount;
     if (id <= base)
     {
@@ -1543,26 +2490,44 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
         return r;
     }
     const uint64_t slot = id - base - 1;
-    if (slot >= impl->records.size() || slot >= impl->derived.size())
+    if (slot >= impl->recordsWin.Count() || slot >= impl->derivedWin.Count())
     {
-        r.status = BLOCK_INDEX_TIP_CORRUPT;
+        // Repair #3: an index entry past the COMMITTED record count is an
+        // uncommitted residue (crash between the index Put and the tip.meta
+        // commit). The index is never authoritative; only the committed
+        // stores answer. Treat it exactly like an absent hash.
+        r.status = BLOCK_INDEX_TIP_NOT_FOUND;
+        return r;
+    }
+    BlockIndexRecord rr;
+    BlockIndexDerivedEntry dd;
+    std::string gerr;
+    if (!impl->recordsWin.Get(slot, &rr, &gerr) ||
+        !impl->derivedWin.Get(slot, &dd, &gerr))
+    {
+        r.status = BLOCK_INDEX_TIP_IO_ERROR;
         return r;
     }
     r.status = BLOCK_INDEX_TIP_OK;
-    r.record = impl->records[(size_t)slot];
-    r.derived = impl->derived[(size_t)slot];
-    r.height = impl->records[(size_t)slot].height;
-    // Active membership: activeIds is dense by relative index (activeIds[rel] is
-    // the active RecordId at global height baseTipHeight + rel + 1), so a record
-    // is active iff it occupies its own height's slot. Equivalent to the former
-    // scan over activeIds, without the O(activeIds) cost.
+    r.record = rr;
+    r.derived = dd;
+    r.height = rr.height;
+    // Active membership: activeIds is dense by relative index (activeIds[rel]
+    // is the active RecordId at global height baseTipHeight + rel + 1), so a
+    // record is active iff it occupies its own height's slot.
     r.active = false;
-    const int32_t h = impl->records[(size_t)slot].height;
+    const int32_t h = rr.height;
     if (h > impl->meta.baseTipHeight)
     {
         const uint64_t rel = (uint64_t)(h - impl->meta.baseTipHeight - 1);
-        if (rel < impl->activeIds.size() && impl->activeIds[(size_t)rel] == id)
-            r.active = true;
+        if (rel < impl->activeWin.Count())
+        {
+            BlockIndexId aId = 0;
+            if (!impl->activeWin.Get(rel, &aId, &gerr))
+                r.status = BLOCK_INDEX_TIP_IO_ERROR;
+            else if (aId == id)
+                r.active = true;
+        }
     }
     return r;
 }
@@ -1579,27 +2544,40 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupActiveByHeight(int32_t height, s
     // baseTipHeight + rel + 1. So rel = height - baseTipHeight - 1.
     const int32_t baseTip = impl->meta.baseTipHeight;
     const int64_t rel = (int64_t)height - (int64_t)baseTip - 1;
-    if (rel < 0 || rel >= (int64_t)impl->activeIds.size())
+    if (rel < 0 || rel >= (int64_t)impl->activeWin.Count())
     {
         r.status = BLOCK_INDEX_TIP_NOT_FOUND;
         return r;
     }
-    // R5: the id->record mapping is pure arithmetic (id == baseRecordCount +
-    // slot + 1), exactly like LookupByHash. The previous O(records) linear scan
-    // ran on every by-height lookup (the hot live-tail/seam path) and dominated
-    // the block-connect profile after the append repair landed.
-    const BlockIndexId id = impl->activeIds[(size_t)rel];
+    // R5 + Repair #3: the id->record mapping is pure arithmetic (id ==
+    // baseRecordCount + slot + 1); the entry itself comes from the bounded
+    // window / one positional pread (OS page cache keeps the hot suffix cheap).
+    BlockIndexId id = 0;
+    std::string gerr;
+    if (!impl->activeWin.Get((uint64_t)rel, &id, &gerr))
+    {
+        r.status = BLOCK_INDEX_TIP_IO_ERROR;
+        return r;
+    }
     const int64_t slot = (int64_t)id - (int64_t)impl->meta.baseRecordCount - 1;
-    if (slot < 0 || slot >= (int64_t)impl->records.size())
+    if (slot < 0 || slot >= (int64_t)impl->recordsWin.Count())
     {
         r.status = BLOCK_INDEX_TIP_CORRUPT;
         return r;
     }
+    BlockIndexRecord rr;
+    BlockIndexDerivedEntry dd;
+    if (!impl->recordsWin.Get((uint64_t)slot, &rr, &gerr) ||
+        !impl->derivedWin.Get((uint64_t)slot, &dd, &gerr))
+    {
+        r.status = BLOCK_INDEX_TIP_IO_ERROR;
+        return r;
+    }
     r.status = BLOCK_INDEX_TIP_OK;
-    r.record = impl->records[(size_t)slot];
-    r.derived = impl->derived[(size_t)slot];
+    r.record = rr;
+    r.derived = dd;
     r.active = true;
-    r.height = impl->records[(size_t)slot].height;
+    r.height = rr.height;
     return r;
 }
 
@@ -1612,20 +2590,72 @@ BlockIndexTipStatus BlockIndexTipAuthority::AllRecords(std::vector<BlockIndexTip
         if (error) *error = "tip not open";
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
-    for (size_t j = 0; j < impl->records.size(); ++j)
+    // Repair #3: stream the stores sequentially (O(N) time, O(1) auxiliary
+    // RAM beyond the caller's own `out` vector). Active membership is
+    // computed by slot arithmetic per record height (the active entry at
+    // rel = height - baseTipHeight - 1 must equal this record's id).
+    uint64_t activeRel = 0; // ascending walk over the active store
+    const uint64_t activeCount = impl->activeWin.Count();
+    std::string gerr;
+    BlockIndexId curActiveId = 0;
+    if (activeCount > 0 && !impl->activeWin.Get(0, &curActiveId, &gerr))
     {
-        BlockIndexId id = impl->baseLocalToId(j);
-        BlockIndexTipRead r;
-        r.status = BLOCK_INDEX_TIP_OK;
-        r.record = impl->records[j];
-        r.derived = impl->derived[j];
-        r.height = impl->records[j].height;
-        r.active = false;
-        for (size_t h = 0; h < impl->activeIds.size(); ++h)
-            if (impl->activeIds[h] == id) { r.active = true; break; }
-        if (out) out->push_back(r);
+        if (error) *error = gerr;
+        return BLOCK_INDEX_TIP_IO_ERROR;
     }
-    return BLOCK_INDEX_TIP_OK;
+    BlockIndexTipStatus overall = BLOCK_INDEX_TIP_OK;
+    if (impl->recordsWin.StreamVisit(0, impl->recordsWin.Count(),
+        [&](uint64_t slot, const BlockIndexRecord& rec) {
+            BlockIndexTipRead r;
+            r.status = BLOCK_INDEX_TIP_OK;
+            BlockIndexDerivedEntry dd;
+            if (!impl->derivedWin.Get(slot, &dd, &gerr))
+            {
+                overall = BLOCK_INDEX_TIP_IO_ERROR;
+                return false; // abort the stream
+            }
+            r.record = rec;
+            r.derived = dd;
+            r.height = rec.height;
+            r.active = false;
+            const BlockIndexId id = impl->baseLocalToId(slot);
+            if (rec.height > impl->meta.baseTipHeight && activeRel < activeCount)
+            {
+                const uint64_t wantRel =
+                    (uint64_t)(rec.height - impl->meta.baseTipHeight - 1);
+                // advance the monotone active walk
+                while (activeRel < activeCount && activeRel < wantRel)
+                {
+                    if (!impl->activeWin.Get(activeRel, &curActiveId, &gerr))
+                    {
+                        overall = BLOCK_INDEX_TIP_IO_ERROR;
+                        return false;
+                    }
+                    ++activeRel;
+                }
+                if (activeRel == wantRel)
+                {
+                    if (curActiveId == 0)
+                    {
+                        if (!impl->activeWin.Get(activeRel, &curActiveId, &gerr))
+                        {
+                            overall = BLOCK_INDEX_TIP_IO_ERROR;
+                            return false;
+                        }
+                    }
+                    if (curActiveId == id)
+                        r.active = true;
+                }
+            }
+            if (out) out->push_back(r);
+            return true;
+        }, &gerr) == false)
+    {
+        if (error && overall == BLOCK_INDEX_TIP_OK) *error = gerr;
+        return overall != BLOCK_INDEX_TIP_OK ? overall : BLOCK_INDEX_TIP_IO_ERROR;
+    }
+    if (error) error->clear();
+    return overall;
 }
 
 BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
@@ -1643,85 +2673,150 @@ BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
 
-    std::map<uint256, size_t> localOf;
-    for (size_t j = 0; j < impl->records.size(); ++j)
-        localOf[impl->records[j].hash] = j;
+    // Repair #3: bounded-RAM selector. The hash -> slot map is the durable
+    // side index (which maps to RECORD IDs; slot = id - baseRecordCount - 1);
+    // record/derived entries are read by value through the bounded windows.
+    // RAM: O(branch chain) temporary, never a full-history materialization.
 
     bool found = false;
-    size_t bestJ = 0;
-    for (size_t j = 0; j < impl->records.size(); ++j)
+    uint64_t bestJ = 0;
+    std::string gerr;
+    // Single sequential pass over the records store (O(N) reads are expected
+    // here: selection walks the whole retained mutable tail by contract).
+    if (impl->recordsWin.StreamVisit(0, impl->recordsWin.Count(),
+        [&](uint64_t slot, const BlockIndexRecord& rec) {
+            if (rec.height <= forkHeight)
+                return true;                                    // at/below the fork
+            // Effective eligibility: the PENDING intent overrides the
+            // committed set for the target hash (invalidate => treat as
+            // invalid; reconsider => eligible).
+            bool selfInvalid = (rec.hash == pendingHash)
+                                   ? pendingInvalidate
+                                   : (impl->invalidSet.count(rec.hash) != 0);
+            if (selfInvalid)
+                return true;
+            // Authenticate ancestry up to the fork: every intermediate must be
+            // present in the tip window, height-consistent, not operator-invalid.
+            int32_t h = rec.height;
+            uint256 cur = rec.hashPrev;
+            bool ok = true;
+            while (h > forkHeight + 1)
+            {
+                bool ancInvalid = (cur == pendingHash)
+                                      ? pendingInvalidate
+                                      : (impl->invalidSet.count(cur) != 0);
+                if (ancInvalid) { ok = false; break; }
+                // resolve the ancestor via the side index
+                BlockIndexId ancId = 0;
+                if (impl->sideIndex.Lookup(cur, &ancId, NULL) !=
+                        BLOCK_INDEX_HASH_LOOKUP_FOUND)
+                { ok = false; break; }  // leaves the tip window
+                if (ancId <= impl->meta.baseRecordCount)
+                { ok = false; break; }
+                const uint64_t ancSlot = ancId - impl->meta.baseRecordCount - 1;
+                if (ancSlot >= impl->recordsWin.Count())
+                { ok = false; break; }
+                BlockIndexRecord p;
+                if (!impl->recordsWin.Get(ancSlot, &p, &gerr))
+                { ok = false; break; }
+                if (p.height + 1 != h) { ok = false; break; } // inconsistent linkage
+                cur = p.hashPrev;
+                h = p.height;
+            }
+            if (!ok)
+                return true;
+            if (!found)
+            {
+                found = true;
+                bestJ = slot;
+                return true;
+            }
+            // tie-break compare by (derived.chainTrust, hash) -- by-value reads
+            BlockIndexDerivedEntry curD, bestD;
+            if (!impl->derivedWin.Get(slot, &curD, &gerr))
+            { gerr = "derived read failed during selection"; return false; }
+            if (!impl->derivedWin.Get(bestJ, &bestD, &gerr))
+            { gerr = "derived read failed during selection"; return false; }
+            BlockIndexRecord bestR;
+            if (!impl->recordsWin.Get(bestJ, &bestR, &gerr))
+            { gerr = "record read failed during selection"; return false; }
+            if (curD.chainTrust > bestD.chainTrust ||
+                (curD.chainTrust == bestD.chainTrust && rec.hash < bestR.hash))
+                bestJ = slot;
+            return true;
+        }, &gerr) == false)
     {
-        const BlockIndexRecord& rec = impl->records[j];
-        if (rec.height <= forkHeight) continue;          // at/below the fork
-        // Effective eligibility: the PENDING intent overrides the committed set for
-        // the target hash (invalidate => treat as invalid; reconsider => treat as
-        // eligible), so a reconsider can re-select the branch it restores.
-        bool selfInvalid = (rec.hash == pendingHash)
-                               ? pendingInvalidate
-                               : (impl->invalidSet.count(rec.hash) != 0);
-        if (selfInvalid) continue;
-        // Authenticate ancestry up to the fork: every intermediate must be present
-        // in the tip window, height-consistent, and not operator-invalid.
-        int32_t h = rec.height;
-        uint256 cur = rec.hashPrev;
-        bool ok = true;
-        // Walk down to the fork-adjacent node (height forkHeight+1). Its parent IS
-        // the fork itself, which may be the immutable base tip and is therefore NOT
-        // in the tip record window -- do not require it to be present here.
-        while (h > forkHeight + 1)
-        {
-            bool ancInvalid = (cur == pendingHash)
-                                  ? pendingInvalidate
-                                  : (impl->invalidSet.count(cur) != 0);
-            if (ancInvalid) { ok = false; break; }
-            std::map<uint256, size_t>::const_iterator it = localOf.find(cur);
-            if (it == localOf.end()) { ok = false; break; }  // leaves the tip window
-            const BlockIndexRecord& p = impl->records[it->second];
-            if (p.height + 1 != h) { ok = false; break; }    // inconsistent linkage
-            cur = p.hashPrev;
-            h = p.height;
-        }
-        if (!ok) continue;
-        if (!found ||
-            impl->derived[j].chainTrust > impl->derived[bestJ].chainTrust ||
-            (impl->derived[j].chainTrust == impl->derived[bestJ].chainTrust &&
-             rec.hash < impl->records[bestJ].hash))
-        {
-            found = true;
-            bestJ = j;
-        }
+        if (error) *error = gerr;
+        return BLOCK_INDEX_TIP_IO_ERROR;
     }
 
     if (!found)
         return BLOCK_INDEX_TIP_OK;   // no eligible candidate above fork -> tip = fork
 
-    // Reconstruct the branch (fork+1 .. bestTip) ascending into a temp vector.
-    std::vector<size_t> chain;
-    size_t j = bestJ;
-    while (true)
+    // Reconstruct the branch (fork+1 .. bestTip) ascending.
+    std::vector<uint64_t> chainSlots;
     {
-        chain.push_back(j);
-        if (impl->records[j].height <= forkHeight + 1)
-            break;   // fork-adjacent node: its parent is the fork (not in window)
-        std::map<uint256, size_t>::const_iterator it = localOf.find(impl->records[j].hashPrev);
-        if (it == localOf.end())
+        uint64_t j = bestJ;
+        BlockIndexRecord curRec;
+        if (!impl->recordsWin.Get(j, &curRec, &gerr))
         {
-            if (error) *error = "branch walk lost parent below tip window";
-            return BLOCK_INDEX_TIP_CORRUPT;
+            if (error) *error = gerr;
+            return BLOCK_INDEX_TIP_IO_ERROR;
         }
-        j = it->second;
+        chainSlots.push_back(j);
+        while (curRec.height > forkHeight + 1)
+        {
+            // fork-adjacent node stops the walk; its parent is the fork
+            BlockIndexId ancId = 0;
+            if (impl->sideIndex.Lookup(curRec.hashPrev, &ancId, NULL) !=
+                    BLOCK_INDEX_HASH_LOOKUP_FOUND ||
+                ancId <= impl->meta.baseRecordCount)
+            {
+                if (error) *error = "branch walk lost parent below tip window";
+                return BLOCK_INDEX_TIP_CORRUPT;
+            }
+            const uint64_t ancSlot = ancId - impl->meta.baseRecordCount - 1;
+            if (ancSlot >= impl->recordsWin.Count())
+            {
+                if (error) *error = "branch walk lost parent below tip window";
+                return BLOCK_INDEX_TIP_CORRUPT;
+            }
+            if (!impl->recordsWin.Get(ancSlot, &curRec, &gerr))
+            {
+                if (error) *error = gerr;
+                return BLOCK_INDEX_TIP_IO_ERROR;
+            }
+            chainSlots.push_back(ancSlot);
+        }
     }
-    for (size_t k = chain.size(); k-- > 0; )
+    for (size_t k = chainSlots.size(); k-- > 0; )
     {
-        size_t idx = chain[k];
+        const uint64_t idx = chainSlots[k];
         BlockIndexTipAppend ap;
-        ap.record = impl->records[idx];
-        ap.derived = impl->derived[idx];
+        BlockIndexRecord rr;
+        BlockIndexDerivedEntry dd;
+        if (!impl->recordsWin.Get(idx, &rr, &gerr) ||
+            !impl->derivedWin.Get(idx, &dd, &gerr))
+        {
+            if (error) *error = gerr;
+            return BLOCK_INDEX_TIP_IO_ERROR;
+        }
+        ap.record = rr;
+        ap.derived = dd;
         if (outBranch) outBranch->push_back(ap);
-        if (outHeights) outHeights->push_back(impl->records[idx].height);
+        if (outHeights) outHeights->push_back(rr.height);
     }
-    if (outBestHash) *outBestHash = impl->records[bestJ].hash;
-    if (outBestHeight) *outBestHeight = impl->records[bestJ].height;
+    if (outBestHash || outBestHeight)
+    {
+        BlockIndexRecord bestR;
+        if (!impl->recordsWin.Get(bestJ, &bestR, &gerr))
+        {
+            if (error) *error = gerr;
+            return BLOCK_INDEX_TIP_IO_ERROR;
+        }
+        if (outBestHash) *outBestHash = bestR.hash;
+        if (outBestHeight) *outBestHeight = bestR.height;
+    }
     return BLOCK_INDEX_TIP_OK;
 }
 
@@ -1752,7 +2847,11 @@ uint256 BlockIndexTipAuthority::TipHash() const { return impl->meta.tipHash; }
 uint64_t BlockIndexTipAuthority::TipRecordCount() const { return impl->meta.tipRecordCount; }
 uint8_t BlockIndexTipAuthority::ActiveFence() const { return impl->meta.activeFence; }
 bool BlockIndexTipAuthority::IsOpen() const { return impl->open; }
-bool BlockIndexTipAuthority::IsEmpty() const { return impl->open && impl->records.empty(); }
+bool BlockIndexTipAuthority::IsEmpty() const
+{
+    // committed records count == 0 <=> no tip records (meta is the authority).
+    return impl->open && impl->meta.tipRecordCount == 0;
+}
 
 // ---- v2 durable operator-invalid authority ----
 uint32_t BlockIndexTipAuthority::InvalidLogCount() const
@@ -1838,4 +2937,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
 void BlockIndexTipAuthority::Close()
 {
     impl->open = false;
+    // Repair #3: release the bounded windows' file handles and the LevelDB
+    // side index handle (Close is idempotent, same as before).
+    impl->recordsWin.Reset();
+    impl->derivedWin.Reset();
+    impl->activeWin.Reset();
+    impl->sideIndex.Close();
+    impl->chainsValid = false;
 }

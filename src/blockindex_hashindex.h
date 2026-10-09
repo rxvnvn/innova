@@ -42,6 +42,10 @@ public:
     static bool Open(const std::string& generationDir, uint64_t expectedGeneration, BlockIndexHashIndex* out, std::string* error);
 
     bool Put(const uint256& hash, BlockIndexId id, std::string* error);
+    // Remove the hash->id mapping; returns true when the key is gone (or was
+    // absent). Used by the tip-authority reconcile/rollback paths to drop
+    // UNCOMMITTED residue entries; never authoritative by itself.
+    bool Delete(const uint256& hash, BlockIndexId expectedId, std::string* error);
     BlockIndexHashLookupStatus Lookup(const uint256& hash, BlockIndexId* outId, std::string* error) const;
 
     void Close();
@@ -53,9 +57,14 @@ private:
     struct SharedState;
     SharedState* state;
 
-    bool OpenInternal(const std::string& generationDir, uint64_t generation, bool create, bool logicalReadOnly, std::string* error);
     bool WriteMetadata(std::string* error);
     bool ReadAndValidateMetadata(uint64_t expectedGeneration, std::string* error);
+
+public:
+    // Exposed (like Create/Open) for the tip-authority reconcile path, which
+    // must open the same LevelDB dir WRITABLE (Open() above is logically
+    // read-only by contract; reconciliation legitimately repairs entries).
+    bool OpenInternal(const std::string& generationDir, uint64_t generation, bool create, bool logicalReadOnly, std::string* error);
 };
 
 class FixedBlockIndexShadowLookup

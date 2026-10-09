@@ -659,14 +659,14 @@ static void PrepareWakeEligiblePeer(CNode& peer, int nPeerHeight, int64_t nNow)
 static void MarkPeerWakeDedupBlocked(CNode& peer, CBlockIndex* pindexTip,
                                      int64_t nLastGetBlocksTime)
 {
-    peer.pindexLastGetBlocksBegin = pindexTip;
+    peer.hashLastGetBlocksBegin = pindexTip ? pindexTip->GetBlockHash() : uint256(0);
     peer.hashLastGetBlocksEnd = uint256(0);
     peer.nLastGetBlocksTime = nLastGetBlocksTime;
 }
 
 static void ResetPeerWakeDedupState(CNode& peer)
 {
-    peer.pindexLastGetBlocksBegin = NULL;
+    peer.hashLastGetBlocksBegin = uint256(0);
     peer.hashLastGetBlocksEnd = uint256(0);
     peer.nLastGetBlocksTime = 0;
 }
@@ -677,7 +677,7 @@ static void ResetPeerWakeDedupState(CNode& peer)
 static void MarkOutstandingForTest(CNode& peer,
                                    ibdmetrics::GetBlocksSource source)
 {
-    peer.SetOutstandingGetBlocks(source, NULL, uint256(0));
+    peer.SetOutstandingGetBlocks(source, uint256(0));
     ibdmetrics::GetBlocksOutstandingAdd(1);
 }
 
@@ -1650,7 +1650,7 @@ BOOST_AUTO_TEST_CASE(rpc_queries_do_not_mutate_block_download_state)
     peer.mapBlockInFlightSince[hashInFlight] = GetTime() - 60;
     peer.AddAskForEntry(std::make_pair(
         (GetTime() + 60) * 1000000, CInv(MSG_BLOCK, hashAskFor)));
-    peer.getBlocksIndex.push_back(pindexBest);
+    peer.getBlocksIndex.push_back(pindexBest ? pindexBest->GetBlockHash() : uint256(0));
     peer.getBlocksHash.push_back(uint256(0));
     peer.fStartSync = true;
     {
@@ -1807,7 +1807,7 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_uses_capped_exponential_cooldown)
     {
         peer.getBlocksIndex.clear();
         peer.getBlocksHash.clear();
-        peer.pindexLastGetBlocksBegin = NULL;
+        peer.hashLastGetBlocksBegin = uint256(0);
         peer.hashLastGetBlocksEnd = 0;
         peer.nLastGetBlocksTime = 0;
 
@@ -2099,7 +2099,7 @@ BOOST_AUTO_TEST_CASE(rejected_block_recovery_queues_one_cross_peer_askfor)
         (*it)->ClearAskFor();
         (*it)->getBlocksIndex.clear();
         (*it)->getBlocksHash.clear();
-        (*it)->pindexLastGetBlocksBegin = NULL;
+        (*it)->hashLastGetBlocksBegin = 0;
         (*it)->hashLastGetBlocksEnd = 0;
         (*it)->nLastGetBlocksTime = 0;
     }
@@ -2383,7 +2383,7 @@ BOOST_AUTO_TEST_CASE(orphan_capacity_release_allows_deferred_block_retry)
     peer.ClearAskFor();
     peer.getBlocksIndex.clear();
     peer.getBlocksHash.clear();
-    peer.pindexLastGetBlocksBegin = NULL;
+    peer.hashLastGetBlocksBegin = uint256(0);
     peer.hashLastGetBlocksEnd = 0;
     peer.nLastGetBlocksTime = 0;
     const int64_t nDeferredRetryTime =
@@ -4652,7 +4652,7 @@ BOOST_AUTO_TEST_CASE(disconnect_cleanup_queued_unsent_getblocks_signals_wake)
     PrepareWakeEligiblePeer(peer, nBestHeight + 100, nNow);
     std::vector<CNode*> peers(1, &peer);
 
-    peer.getBlocksIndex.push_back(pindexBest);
+    peer.getBlocksIndex.push_back(pindexBest ? pindexBest->GetBlockHash() : uint256(0));
     peer.getBlocksHash.push_back(uint256(0));
     peer.getBlocksSources.push_back(
         ibdmetrics::GETBLOCKS_SOURCE_EMPTY_PIPELINE_WAKE);
@@ -4907,7 +4907,7 @@ BOOST_AUTO_TEST_CASE(forced_cs_main_failure_keeps_generation_pending)
     BOOST_CHECK_EQUAL(peer.setAskForBlocks.size(), 0U);
     BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 0U);
     BOOST_CHECK(!peer.HasOutstandingGetBlocks());
-    BOOST_CHECK(peer.pindexLastGetBlocksBegin == NULL);
+    BOOST_CHECK(peer.hashLastGetBlocksBegin == uint256(0));
     CheckWakeGaugeBalance(peers);
 
     // The same pending generation is served by a normal call.
@@ -5561,7 +5561,7 @@ BOOST_AUTO_TEST_CASE(repeated_drain_refill_preserves_invariants)
         peer.ClearAskFor();
         ClearQueuedGetBlocks(peer);
         ResetPeerWakeDedupState(peer);
-        peer.pindexLastGetBlocksBegin = NULL;
+        peer.hashLastGetBlocksBegin = uint256(0);
         peer.hashLastGetBlocksEnd = 0;
         peer.nLastGetBlocksTime = 0;
 
@@ -7488,7 +7488,7 @@ BOOST_AUTO_TEST_CASE(timeout_expires_slot_and_wakes_repeat_cycle)
         BOOST_CHECK_EQUAL(
             MetricGet(ibdmetrics::Get().getblocks_outstanding_timeout),
             nTimeoutBefore + 1);
-        BOOST_CHECK(peer.pindexLastGetBlocksBegin == NULL);
+        BOOST_CHECK(peer.hashLastGetBlocksBegin == uint256(0));
         BOOST_CHECK(peer.hashLastGetBlocksEnd == uint256(0));
         BOOST_CHECK_EQUAL(peer.nLastGetBlocksTime, 0);
         uint32_t nCauseBits = 0;

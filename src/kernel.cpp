@@ -308,172 +308,87 @@ static bool CollectCandidatesResident(
 // returned: any navigation authority failure aborts (fail closed), so a
 // truncated candidate set can never silently yield a different modifier.
 // Appends to vOut in walk order; the caller sorts once for both providers.
+// Resolve a block's authoritative by-value snapshot WITHOUT any historical
+// pointer traversal. Source precedence (singleton-free except the legacy
+// fallback): (1) the pinned COLD generation; (2) the navigator's injected
+// by-value hot oracle (test or production), whose snapshots carry REAL parent
+// edges; (3) only when the hot side is the legacy pointer accessor, the
+// authoritative live snapshot (tip-first-then-base). A HOT result is never
+// treated as COLD; genesis is never inferred from a resident pprev==NULL
+// boundary; zero metadata is never substituted. Returns OK / NOT_FOUND /
+// AUTHORITY_FAILURE; callers fail closed on anything but OK.
+static ColdHotSeamResult ResolveAuthoritySnapshot(const ColdHotSeamNavigator* nav,
+    const uint256& hash, BlockIndexSnapshot* out, std::string* err)
+{
+    ColdHotSeamSnapshot cur;
+    const ColdHotSeamResult r = nav->ResolveLogicalR(BlockIndexLogicalId(hash), &cur, err);
+    if (r == COLD_HOT_SEAM_AUTHORITY_FAILURE)
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE;
+    const bool fByValueHot = (r == COLD_HOT_SEAM_OK) && !cur.ref.IsCold()
+                           && nav->HasByValueHotResolver();
+    if (r == COLD_HOT_SEAM_OK && (cur.ref.IsCold() || fByValueHot))
+    {
+        *out = cur.snapshot;      // cold generation, or authoritative by-value hot
+        return COLD_HOT_SEAM_OK;
+    }
+    // Legacy pointer hot side (or cold miss): the live snapshot is authoritative.
+    if (BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority())
+    {
+        std::string e2;
+        if (liveAuth->ResolveBlockSnapshot(hash, out, &e2) == BlockIndexHotStatus::OK)
+            return COLD_HOT_SEAM_OK;
+    }
+    if (err) *err = "authoritative ancestry: block not resolvable by value";
+    return COLD_HOT_SEAM_NOT_FOUND;
+}
+
 static bool CollectCandidatesByValue(const ColdHotSeamNavigator* nav,
     const uint256& hashStart, int64_t nSelectionIntervalStart,
     vector<StakeModifierCandidateValue>& vOut, int& nHeightFirstCandidate,
     std::string& err)
 {
-    ColdHotSeamSnapshot cur;
-    const ColdHotSeamResult r0 = nav->ResolveLogicalR(BlockIndexLogicalId(hashStart), &cur, &err);
-    if (r0 == COLD_HOT_SEAM_AUTHORITY_FAILURE)
-        return false; // stale/corrupt/divergent authority -> FAIL CLOSED
-    if (r0 != COLD_HOT_SEAM_OK)
-    {
-        // A genuine NOT_FOUND is fail-closed here too: without the record the
-        // completeness of the window cannot be proven.
-        err = "authoritative candidate collection: by-value ancestry not resolvable";
-        return false;
-    }
-    bool fFellOffChain = false;
+    uint256 curHash = hashStart;
     for (;;)
     {
-        // PROVENANCE GATE (F1 audit blocker 2). Every block of this by-value
-        // continuation - and therefore its parent edge - must be proven COLD
-        // (bound to the pinned authoritative V2 generation). A HOT snapshot is a
-        // pointer view: LegacyBlockIndexAccessor encodes pprev == NULL as
-        // hashPrev == 0 / hasParent == false (blockindex_accessor.cpp:74-78),
-        // i.e. "resident pointer ancestry ended", which is NOT "logical
-        // canonical chain ended". Accepting it would silently truncate the
-        // chain-time window (min(64, size) lowers the round count) and change
-        // the generated modifier, so a non-cold-proven snapshot FAILS CLOSED.
-        if (!cur.ref.IsCold())
+        BlockIndexSnapshot snap;
+        const ColdHotSeamResult r = ResolveAuthoritySnapshot(nav, curHash, &snap, &err);
+        if (r != COLD_HOT_SEAM_OK)
         {
-            err = "authoritative candidate collection: by-value ancestry provenance is not cold-authoritative";
-            return false; // FAIL CLOSED; never a truncated window
+            err = "authoritative candidate collection: by-value ancestry not resolvable";
+            return false; // FAIL CLOSED (authority failure OR genuine absence)
         }
-        if ((int64_t)cur.snapshot.nTime < nSelectionIntervalStart)
-            break; // first block BELOW the window: cur is the legacy post-loop pindex
+        if ((int64_t)snap.nTime < nSelectionIntervalStart)
+        {
+            // First block BELOW the chain-time window (legacy post-loop pindex).
+            nHeightFirstCandidate = snap.height + 1;
+            return true;
+        }
         StakeModifierCandidateValue c;
-        c.nTime = (int64_t)cur.snapshot.nTime;
-        c.hash = cur.snapshot.hash;
-        c.hashProof = cur.snapshot.hashProof;
-        c.nFlags = cur.snapshot.nFlags;
-        c.nHeight = cur.snapshot.height;
+        c.nTime = (int64_t)snap.nTime;
+        c.hash = snap.hash;
+        c.hashProof = snap.hashProof;
+        c.nFlags = snap.nFlags;
+        c.nHeight = snap.height;
         c.fHaveRecord = true; // authority-sourced: the record exists by construction
         vOut.push_back(c);
-        if (!cur.snapshot.hasParent)
+        if (!snap.hasParent || snap.hashPrev == 0)
         {
-            // Cold-proven parent edge: this IS the canonical start of the chain.
-            fFellOffChain = true; // legacy: pindex = pindex->pprev == NULL
-            break;
+            // Authoritative end of chain (never inferred from a resident boundary).
+            nHeightFirstCandidate = 0;
+            return true;
         }
-        ColdHotSeamSnapshot parent;
-        const ColdHotSeamResult pr = nav->GetParentR(cur.ref, &parent, &err);
-        if (pr == COLD_HOT_SEAM_AUTHORITY_FAILURE)
-            return false; // FAIL CLOSED; never a truncated window
-        if (pr != COLD_HOT_SEAM_OK)
-        {
-            err = "authoritative candidate collection: parent unresolvable at authority boundary";
-            return false;
-        }
-        cur = parent;
+        curHash = snap.hashPrev;
     }
-    // Legacy: nHeightFirstCandidate = pindex ? pindex->nHeight + 1 : 0, where
-    // pindex is the first block below the window (or NULL if the walk fell off).
-    nHeightFirstCandidate = fFellOffChain ? 0 : (cur.snapshot.height + 1);
-    return true;
 }
 
-// HYBRID AUTHORITATIVE CANDIDATE COLLECTOR (F1(b)).
-//
-// PHASE 1 walks the LIVE chain exactly as the legacy collector does (follow
-// pprev while the chain-time window holds), so a fully resident world is
-// byte-identical to legacy: same candidates, same order, same fields.
-//
-// PHASE 2 is entered only where PHASE 1 is exhausted at the retained window's
-// floor (pprev NULL) while the window is still open. The floor block is
-// resolvable BY VALUE (it lies at or below the frozen generation tip), so its
-// by-value parent edge continues the window in the authoritative by-value
-// domain through the EXISTING GetParentR primitive. The candidate set is then
-// complete regardless of residency depth: a truncated window (which would
-// change the generated modifier silently) is impossible, and an authority
-// failure FAILS CLOSED instead of producing a shorter list.
-//
-// FLOOR PROVENANCE CONTRACT (F1 audit blocker 2): ResolveLogicalR is cold-first
-// with a HOT FALLBACK, so a resolution result alone does not prove authority.
-// The floor's parent edge may only be interpreted once the snapshot is proven
-// COLD-authoritative (BlockIndexNavigationRef::IsCold - the EXISTING typed
-// provenance distinction of the navigator; no second authority is introduced).
-// A hot floor snapshot carries pprev == NULL as hashPrev == 0, which means
-// "resident pointer ancestry ended" and NOT "logical canonical chain ended":
-// inferring chain end from it would silently truncate the window. Therefore
-//   * cold-proven floor + hashPrev != 0 -> continue phase 2 by value;
-//   * cold-proven floor + hashPrev == 0 -> canonical end of chain, terminate;
-//   * provenance not proven (hot floor, cold miss, authority failure) ->
-//     FAIL CLOSED (no mapBlockIndex fallback, no deeper materialization).
-static bool CollectCandidatesHybrid(const ColdHotSeamNavigator* nav,
-    const CBlockIndex* pindexPrev, int64_t nSelectionIntervalStart,
-    vector<StakeModifierCandidateValue>& vOut, int& nHeightFirstCandidate,
-    std::string& err)
-{
-    vOut.clear();
-    nHeightFirstCandidate = 0;
-    const CBlockIndex* pindex = pindexPrev;
-    const CBlockIndex* pFloor = NULL;
-    while (pindex && pindex->GetBlockTime() >= nSelectionIntervalStart)
-    {
-        StakeModifierCandidateValue c;
-        c.nTime = pindex->GetBlockTime();
-        c.hash = pindex->GetBlockHash();
-        c.hashProof = pindex->hashProof;
-        c.nFlags = pindex->nFlags;
-        c.nHeight = pindex->nHeight;
-        c.fHaveRecord = true; // live chain: this record's fields are read directly
-        vOut.push_back(c);
-        if (pindex->pprev == NULL)
-        {
-            pFloor = pindex; // residency floor reached with the window still open
-            pindex = NULL;
-            break;
-        }
-        pindex = pindex->pprev;
-    }
-    if (pFloor != NULL)
-    {
-        ColdHotSeamSnapshot floorSnap;
-        const ColdHotSeamResult fr = nav->ResolveLogicalR(
-            BlockIndexLogicalId(pFloor->GetBlockHash()), &floorSnap, &err);
-        if (fr == COLD_HOT_SEAM_AUTHORITY_FAILURE)
-            return false; // FAIL CLOSED
-        if (fr != COLD_HOT_SEAM_OK)
-        {
-            err = "authoritative candidate collection: residency floor not resolvable by value";
-            return false; // completeness unprovable -> FAIL CLOSED
-        }
-        // FLOOR PROVENANCE GATE (F1 audit blocker 2): only a COLD-proven floor may
-        // have its parent edge interpreted. ResolveLogicalR falls back to the hot
-        // domain on a genuine cold miss, and a hot floor reports its own
-        // pprev == NULL as hashPrev == 0 - which would be read as "logical end of
-        // chain" and silently truncate the candidate set. A non-cold-proven floor
-        // is therefore not proof of genesis: FAIL CLOSED (never infer chain end
-        // from a hot pointer floor, never fall back to mapBlockIndex, never
-        // deepen the walk or materialize deeper ancestry).
-        if (!floorSnap.ref.IsCold())
-        {
-            err = "authoritative candidate collection: residency floor provenance is not cold-authoritative";
-            return false; // FAIL CLOSED
-        }
-        if (floorSnap.snapshot.hashPrev != 0)
-        {
-            if (!CollectCandidatesByValue(nav, floorSnap.snapshot.hashPrev,
-                                          nSelectionIntervalStart, vOut,
-                                          nHeightFirstCandidate, err))
-                return false; // FAIL CLOSED; never a truncated window
-        }
-        // else: cold-proven floor with no authoritative parent edge - the floor IS
-        // the logical start of the chain, so the window collected so far is already
-        // complete (nHeightFirstCandidate stays 0).
-    }
-    else
-    {
-        nHeightFirstCandidate = pindex ? (pindex->nHeight + 1) : 0;
-    }
-    // Reproduce the legacy reversal + sort so both providers emit the identical
-    // (time, hash)-ascending candidate sequence.
-    reverse(vOut.begin(), vOut.end());
-    sort(vOut.begin(), vOut.end(), StakeModifierCandidateLess());
-    return true;
-}
+// NOTE (Stage G final): CollectCandidatesHybrid (PHASE-1 resident pprev walk +
+// PHASE-2 by-value continuation) has been PHYSICALLY DELETED. The authoritative
+// candidate collection now runs the entire window through CollectCandidatesByValue
+// above, whose ancestry source is explicit and singleton-free: the cold
+// generation, the navigator's injected by-value hot oracle
+// (ColdHotSeamNavigator::HasByValueHotResolver), or - only on the legacy pointer
+// hot side - the authoritative live snapshot. No resident pprev traversal
+// remains in the authoritative candidate path.
 
 // F1(a): last generated stake modifier for `pindexPrev`.
 //
@@ -498,6 +413,12 @@ static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
     if (!pindexPrev)
         return 0; // legacy: "GetLastStakeModifier: null pindex"
     // PHASE 1 - live-chain walk, byte-identical to legacy semantics.
+    // (Stage G final: a pure by-value rewrite of this walk was attempted (A9) and
+    // REVERTED - it broke invalidate/reconsider block acceptance and the
+    // stale-authority fail-closed oracle, because the unified resolver cannot
+    // reproduce legacy's exact stop/fail-closed behavior for every fixture. The
+    // resident walk below is retained until a discriminated by-value contract can
+    // be proven for this specific consumer.)
     const CBlockIndex* p = pindexPrev;
     while (p->pprev && !p->GeneratedStakeModifier())
         p = p->pprev;
@@ -663,12 +584,23 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeMod
         // the whole computation (fail closed), so a short candidate set can never
         // silently yield a different modifier.
         std::string cErr;
-        if (!CollectCandidatesHybrid(navCandidates, pindexPrev, nSelectionIntervalStart,
-                                     vCandidates, nHeightFirstCandidate, cErr))
+        // Stage G final: collect the ENTIRE candidate window BY VALUE from
+        // pindexPrev's hash - no resident pprev traversal. Each ancestor resolves
+        // through the cold generation, the navigator's authoritative by-value hot
+        // oracle, or (legacy pointer hot side) the authoritative live snapshot -
+        // never a hidden pointer chain (see CollectCandidatesByValue). Fields and
+        // ordering are unchanged.
+        if (!CollectCandidatesByValue(navCandidates, pindexPrev->GetBlockHash(),
+                                      nSelectionIntervalStart, vCandidates,
+                                      nHeightFirstCandidate, cErr))
         {
             FailComputeNextStakeModifier(nStakeModifier, fGeneratedStakeModifier);
             return error("ComputeNextStakeModifier: authoritative candidate collection failed: %s", cErr.c_str());
         }
+        // Reproduce the legacy reversal + sort (identical (time,hash)-ascending
+        // candidate sequence; the by-value walker appends in descending order).
+        reverse(vCandidates.begin(), vCandidates.end());
+        sort(vCandidates.begin(), vCandidates.end(), StakeModifierCandidateLess());
     }
     else
     {

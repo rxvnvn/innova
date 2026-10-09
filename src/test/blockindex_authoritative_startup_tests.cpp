@@ -89,12 +89,16 @@ struct AuthNavFixture {
             rec.nFile = active[h].nFile; rec.nBlockPos = active[h].nBlockPos;
             rec.nFlags = 0;
             rec.nMoneySupply = 0;
+            rec.hashMerkleRoot = active[h].tx.GetHash();
             BlockIndexGenerationSourceRecord sr; sr.hash=rec.hash; sr.record=rec;
             src.records.push_back(sr);
         }
         src.hashBestChain = active[tipHeight].hash;
         src.foundBestChain = true;
-        src.blockDataDir.clear();
+        // Stage E: point the builder at this fixture's own blk0001.dat so derived
+        // nSize is materialized (nSize>0) and the generation is AUTHORITATIVE-
+        // capable. Previously cleared -> OLD_SHADOW -> bootstrap.Open fail-closed.
+        src.blockDataDir = root.string();
 
         boost::filesystem::path staging = root / "blockindex-build-000001.tmp";
         std::string error;

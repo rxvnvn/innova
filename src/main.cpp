@@ -33,6 +33,7 @@
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_authoritative_live.h"
 #include "blockindex_shadow_startup.h"
+#include "blockindex_manager.h"
 #include "blockrequesttrace.h"
 #include "hreg_registration.h"
 #include <boost/algorithm/string/replace.hpp>
@@ -5007,6 +5008,78 @@ unsigned int GetNextTargetRequired(const CBlockIndex* pindexLast, bool fProofOfS
     return bnNew.GetCompact();
 }
 
+// Stage G (S1): by-value difficulty read path (see main.h). Resolves the
+// proof-type ancestor(s) through the Block Index Manager, disk-backed and by
+// value; the arithmetic is byte-identical to GetNextTargetRequired().
+bool ResolveNextTargetRequiredByValue(const uint256& hashLast, bool fProofOfStake,
+                                      unsigned int* pBitsOut, std::string* error)
+{
+    if (pBitsOut == NULL)
+        return false;
+    CBigNum bnTargetLimit = fProofOfStake ? bnProofOfStakeLimit : bnProofOfWorkLimit;
+
+    BlockIndexManager& mgr = GetBlockIndexManager();
+    BlockIndexSnapshot last;
+    if (mgr.LookupByHash(hashLast, &last, error) != BLOCK_INDEX_MANAGER_OK)
+        return false; // authority failure -> fail closed
+
+    BlockIndexSnapshot prev;
+    if (mgr.GetLastBlockIndexByProofType(hashLast, fProofOfStake, &prev, error) != BLOCK_INDEX_MANAGER_OK)
+        return false;
+    if (!prev.hasParent)
+    {
+        *pBitsOut = bnTargetLimit.GetCompact(); // first block (legacy: pprev == NULL)
+        return true;
+    }
+    BlockIndexSnapshot prevPrev;
+    if (mgr.GetLastBlockIndexByProofType(prev.hashPrev, fProofOfStake, &prevPrev, error) != BLOCK_INDEX_MANAGER_OK)
+        return false;
+    if (!prevPrev.hasParent)
+    {
+        *pBitsOut = bnTargetLimit.GetCompact(); // second block
+        return true;
+    }
+
+    int64_t nActualSpacing = (int64_t)prev.nTime - (int64_t)prevPrev.nTime;
+    int nNextHeight = last.height + 1;
+    unsigned int nEffectiveSpacing = GetTargetSpacingForHeight(nNextHeight);
+
+    if (nNextHeight < FORK_HEIGHT_TIGHTER_DRIFT)
+    {
+        if (nActualSpacing < 0)
+            nActualSpacing = nEffectiveSpacing;
+    }
+    else
+    {
+        int nClampFactor = (nNextHeight >= FORK_HEIGHT_TIGHTER_DRIFT) ? 4 : 10;
+        int64_t nMinSpacing = (int64_t)nEffectiveSpacing / nClampFactor;
+        if (nMinSpacing < 1) nMinSpacing = 1;
+        int64_t nMaxSpacing = (int64_t)nEffectiveSpacing * nClampFactor;
+        if (nActualSpacing < nMinSpacing)
+        {
+            if (nActualSpacing < 0)
+                printf("WARNING: GetNextTargetRequired() : negative actual spacing %" PRId64 " (clamping to %" PRId64 ")\n",
+                       nActualSpacing, nMinSpacing);
+            nActualSpacing = nMinSpacing;
+        }
+        if (nActualSpacing > nMaxSpacing)
+            nActualSpacing = nMaxSpacing;
+    }
+
+    CBigNum bnNew;
+    bnNew.SetCompact(prev.nBits);
+    int64_t nSmoothTimespan = (nNextHeight >= FORK_HEIGHT_TIGHTER_DRIFT) ? 180 : nTargetTimespan;
+    int64_t nInterval = nSmoothTimespan / nEffectiveSpacing;
+    bnNew *= ((nInterval - 1) * nEffectiveSpacing + nActualSpacing + nActualSpacing);
+    bnNew /= ((nInterval + 1) * nEffectiveSpacing);
+
+    if (bnNew <= 0 || bnNew > bnTargetLimit)
+        bnNew = bnTargetLimit;
+
+    *pBitsOut = bnNew.GetCompact();
+    return true;
+}
+
 bool CheckProofOfWork(uint256 hash, unsigned int nBits)
 {
     CBigNum bnTarget;
@@ -7580,10 +7653,12 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     if (mapBlockIndex.count(hash))
         return error("AddToBlockIndex() : %s already exists", hash.ToString().substr(0,20).c_str());
 
-    // Construct new block index object
+    // Construct new block index object. Stage G p06 fix: own it through a scoped
+    // guard so EVERY failure return before the mapBlockIndex insert frees it —
+    // the ComputeNextStakeModifier failure path and the other pre-insert error
+    // returns previously leaked pindexNew.
     CBlockIndex* pindexNew = new CBlockIndex(nFile, nBlockPos, *this);
-    if (!pindexNew)
-        return error("AddToBlockIndex() : new CBlockIndex failed");
+    std::unique_ptr<CBlockIndex> pindexNewGuard(pindexNew);
     pindexNew->phashBlock = &hash;
     map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(hashPrevBlock);
     if (miPrev != mapBlockIndex.end())
@@ -7641,6 +7716,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
 
     // Add to mapBlockIndex
     map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.insert(make_pair(hash, pindexNew)).first;
+    pindexNewGuard.release(); // ownership transferred to mapBlockIndex
     if (pindexNew->IsProofOfStake())
         setStakeSeen.insert(make_pair(pindexNew->prevoutStake, pindexNew->nStakeTime));
     pindexNew->phashBlock = &((*mi).first);
@@ -8127,7 +8203,25 @@ bool CBlock::AcceptBlock()
     }
 
     // Check proof-of-work or proof-of-stake
-    unsigned int nComputedBits = GetNextTargetRequired(pindexPrev, IsProofOfStake());
+    unsigned int nComputedBits;
+    if (g_fAuthoritativeStartup)
+    {
+        // Stage G (S1): the authoritative difficulty read resolves the proof-type
+        // ancestor(s) through the Block Index Manager (disk-backed, by value) —
+        // no resident pprev walk. Fail closed if the authority cannot answer.
+        // The only remaining pointer use is identity extraction (pindexPrev's
+        // hash); the AcceptBlock pindexPrev parameter is the next removal target.
+        std::string tErr;
+        if (!ResolveNextTargetRequiredByValue(pindexPrev->GetBlockHash(), IsProofOfStake(), &nComputedBits, &tErr))
+        {
+            TraceAcceptBlockReject(*this, nHeight, ABREJECT_INCORRECT_BITS);
+            return error("AcceptBlock() : difficulty authority unavailable: %s", tErr.c_str());
+        }
+    }
+    else
+    {
+        nComputedBits = GetNextTargetRequired(pindexPrev, IsProofOfStake());
+    }
     if (nBits != nComputedBits)
     {
         TraceAcceptBlockReject(*this, nHeight, ABREJECT_INCORRECT_BITS);
@@ -13217,7 +13311,11 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
         if (!pto->HasOutstandingGetBlocks() &&
             !pto->getBlocksIndex.empty())
         {
-            CBlockIndex* pindexBegin = pto->getBlocksIndex[0];
+            // Stage F (L6c): the queued begin is a stable HASH, never a
+            // CBlockIndex*. The getblocks locator is reconstructed by the Block
+            // Index Manager through by-value ancestry — no mapBlockIndex, no
+            // pointer graph, no resident index.
+            const uint256 hashBegin = pto->getBlocksIndex[0];
             const uint256 hashStop = pto->getBlocksHash[0];
             const uint64_t nRecoveryId =
                 pto->getBlocksRecoveryIds.size() > 0
@@ -13226,32 +13324,66 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                 pto->getBlocksSources.size() > 0
                     ? pto->getBlocksSources[0]
                     : ibdmetrics::GETBLOCKS_SOURCE_OTHER;
+            int nBeginHeight = -1;
+            CBlockLocator getBlocksLocator;
+            {
+                BlockIndexManager& locatorManager = GetBlockIndexManager();
+                std::string locatorError;
+                if (hashBegin != uint256(0))
+                {
+                    BlockIndexSnapshot beginSnap;
+                    if (locatorManager.LookupByHash(hashBegin, &beginSnap, &locatorError) ==
+                        BLOCK_INDEX_MANAGER_OK)
+                        nBeginHeight = beginSnap.height;
+                }
+                std::vector<uint256> vLocatorHashes;
+                if (locatorManager.GetLocatorHashes(hashBegin, &vLocatorHashes, &locatorError) ==
+                    BLOCK_INDEX_MANAGER_OK)
+                {
+                    // Authoritative runtime: locator is manager-backed and fully
+                    // pointer-free (no mapBlockIndex, no CBlockIndex*).
+                    getBlocksLocator = CBlockLocator(vLocatorHashes);
+                }
+                else
+                {
+                    // Transitional non-authoritative fallback. This runtime is not
+                    // (yet) served by the authoritative manager, so the locator is
+                    // rebuilt from the begin HASH via the pre-existing
+                    // CBlockLocator(uint256) path (which consults mapBlockIndex).
+                    // The queue stores NO CBlockIndex*; this branch is physical-
+                    // deletion-gated on the manager answering for every begin
+                    // (Stage F ledger L6c: deletion gate = mapBlockIndex empty,
+                    // pindexBest NULL, authoritative V2 available).
+                    getBlocksLocator = CBlockLocator(hashBegin);
+                    if (getBlocksLocator.IsNull())
+                        return true; // unresolvable begin: benign deferral
+                }
+            }
             if (fDebugNet)
                 printf("Pushing getblocks %s to %s\n\n",
-                       pindexBegin->ToString().c_str(),
+                       hashBegin.ToString().c_str(),
                        hashStop.ToString().c_str());
             if (fDebug)
                 printf("GETBLOCKS_SEND peer=%d locator_height=%d locator_hash=%s stop=%s source=%s local_best_height=%d\n",
                        pto->GetId(),
-                       pindexBegin ? pindexBegin->nHeight : -1,
-                       pindexBegin ? pindexBegin->GetBlockHash().ToString().c_str() : "null",
+                       nBeginHeight,
+                       hashBegin != uint256(0) ? hashBegin.ToString().c_str() : "null",
                        hashStop.ToString().c_str(),
                        ibdexptrace::GetBlocksSourceName((int)getBlocksSource),
                        nBestHeight);
-            RecoveryTraceSend(pto, nRecoveryId, pindexBegin, hashStop, 1);
+            RecoveryTraceSend(pto, nRecoveryId, hashBegin, nBeginHeight, hashStop, 1);
             pto->PushMessage("getblocks",
-                             CBlockLocator(pindexBegin), hashStop);
+                             getBlocksLocator, hashStop);
             ibdmetrics::RecordGetBlocksWireSent(getBlocksSource);
             ibdactivepath::RecordGetBlocksWireSent();
-            pto->SetOutstandingGetBlocks(getBlocksSource,
-                                         pindexBegin, hashStop);
+            pto->SetOutstandingGetBlocks(getBlocksSource, hashStop);
             ibdmetrics::GetBlocksOutstandingAdd(1);
             // Arm the frontier response expectation when the flushed request
             // used the current active-tip locator (index == best and no stop
             // hash).  Its first unknown block inv may be admitted past a zero
             // deferred budget so the connectable frontier block can be
             // requested; the exemption is invalidated if the tip advances.
-            if (pindexBegin == pindexBest && hashStop == uint256(0))
+            if (hashBegin == (pindexBest ? pindexBest->GetBlockHash() : uint256(0)) && hashStop == uint256(0))
             {
                 if (!pto->fFrontierResponsePending)
                     ibdmetrics::FrontierResponsePendingAdd(1);

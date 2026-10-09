@@ -490,8 +490,8 @@ public:
     bool IsActive() const { return active; }
 };
 uint64_t RecoveryTraceTrigger(CNode* pnode, int nLocalHeight, int nPeerHeight, int64_t nStallAge, unsigned int nAttempt);
-void RecoveryTraceQueue(CNode* pnode, uint64_t nRecoveryId, CBlockIndex* pindexBegin, uint256 hashStop, size_t nQueueBefore, size_t nQueueAfter);
-void RecoveryTraceSend(CNode* pnode, uint64_t nRecoveryId, CBlockIndex* pindexBegin, uint256 hashStop, size_t nQueueBeforeClear);
+void RecoveryTraceQueue(CNode* pnode, uint64_t nRecoveryId, uint256 hashBegin, int nHeightBegin, uint256 hashStop, size_t nQueueBefore, size_t nQueueAfter);
+void RecoveryTraceSend(CNode* pnode, uint64_t nRecoveryId, uint256 hashBegin, int nHeightBegin, uint256 hashStop, size_t nQueueBeforeClear);
 const char* RecoveryResponseOutcomeName(RecoveryResponseOutcome outcome);
 std::string FormatRecoveryResponseSummary(int64_t peer_id, const RecoveryResponseResult& result);
 void LogGetInfoSyncProbe(const char* pszEvent, int64_t nRequestStartTime = 0,
@@ -1341,9 +1341,14 @@ public:
         CGetBlocksServedInvState();
     };
     CGetBlocksServedInvState getBlocksServedInv;
-    CBlockIndex* pindexLastGetBlocksBegin;
+    // Stage F (L6b): hash-native identity replaces the stored CBlockIndex*.
+    // uint256(0) == "unset" (the retired NULL); a real begin hash is non-zero.
+    uint256 hashLastGetBlocksBegin;
     RecoveryResponseWindowState recovery_response_window;
-    std::vector<CBlockIndex*> getBlocksIndex;
+    // Stage F (L6c): hash-native pending getblocks locator (begin block hash),
+    // replacing the historical std::vector<CBlockIndex*>. uint256(0) == the
+    // retired NULL begin. Locators are built at flush time by the manager.
+    std::vector<uint256> getBlocksIndex;
     std::vector<uint256> getBlocksHash;
     std::vector<uint64_t> getBlocksRecoveryIds;
     std::vector<ibdmetrics::GetBlocksSource> getBlocksSources;
@@ -1359,12 +1364,11 @@ public:
         bool active;
         ibdmetrics::GetBlocksSource source;
         int64_t sent_time_us;
-        CBlockIndex* locator_begin;
         uint256 hash_stop;
 
         GetBlocksOutstandingState()
             : active(false), source(ibdmetrics::GETBLOCKS_SOURCE_OTHER),
-              sent_time_us(0), locator_begin(NULL), hash_stop(0)
+              sent_time_us(0), hash_stop(0)
         {
         }
 
@@ -1373,7 +1377,6 @@ public:
             active = false;
             source = ibdmetrics::GETBLOCKS_SOURCE_OTHER;
             sent_time_us = 0;
-            locator_begin = NULL;
             hash_stop = 0;
         }
     };
@@ -1517,7 +1520,7 @@ public:
         nIbdPriorityScanOffset = 0;
         fNextHeadersResponsePriority = false;
         hashContinue = 0;
-        pindexLastGetBlocksBegin = 0;
+        hashLastGetBlocksBegin = 0;
         nRecoveryTracePendingId = 0;
         hashLastGetBlocksEnd = 0;
         nLastGetBlocksTime = 0;
@@ -2319,13 +2322,14 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     // Called from the SendMessages flush loop immediately after the getblocks
     // message is committed to the wire.  Assumes the caller already checked
     // HasOutstandingGetBlocks() == false.
-    void SetOutstandingGetBlocks(ibdmetrics::GetBlocksSource source,
-                                 CBlockIndex* pindexBegin, uint256 hashStop)
+    // Stage E: the stored locator-begin CBlockIndex* was written-never-read and is
+    // PHYSICALLY DELETED (removal ledger L6). Outstanding-cycle response matching
+    // is heuristic (no wire request id); it never needed the begin pointer.
+    void SetOutstandingGetBlocks(ibdmetrics::GetBlocksSource source, uint256 hashStop)
     {
         getBlocksOutstanding.active = true;
         getBlocksOutstanding.source = source;
         getBlocksOutstanding.sent_time_us = GetTimeMicros();
-        getBlocksOutstanding.locator_begin = pindexBegin;
         getBlocksOutstanding.hash_stop = hashStop;
     }
     // True while a single-flight getblocks cycle is active for this peer

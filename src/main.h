@@ -567,6 +567,12 @@ bool LoadExternalBlockFile(FILE* fileIn);
 
 bool CheckProofOfWork(uint256 hash, unsigned int nBits);
 unsigned int GetNextTargetRequired(const CBlockIndex* pindexLast, bool fProofOfStake);
+// Stage G (S1): by-value difficulty read path. Byte-identical arithmetic to
+// GetNextTargetRequired(), but the proof-type ancestor(s) are resolved THROUGH
+// the Block Index Manager (disk-backed, by value) — no resident pprev walk and
+// no CBlockIndex* traversal. Returns false on an authority failure (fail closed).
+bool ResolveNextTargetRequiredByValue(const uint256& hashLast, bool fProofOfStake,
+                                      unsigned int* pBitsOut, std::string* error);
 int64_t GetProofOfWorkReward(int nHeight, int64_t nFees);
 int64_t GetProofOfStakeReward(int64_t nCoinAge, int64_t nFees);
 unsigned int ComputeMinWork(unsigned int nBase, int64_t nTime);

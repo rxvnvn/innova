@@ -92,6 +92,13 @@ public:
     // NULL restores the default LegacyBlockIndexAccessor hot side.
     void SetProductionHotResolver(const ColdHotHotResolver* resolver);
 
+    /** True when a by-value hot oracle is installed (test or production). When
+     *  true, a HOT snapshot's hashPrev is a REAL authoritative parent edge from
+     *  the resolver, NOT the LegacyBlockIndexAccessor's pprev==NULL boundary
+     *  encoding (hashPrev==0). Callers that traverse ancestry may trust a hot
+     *  parent edge only when this is true (or when the node is cold-proven). */
+    bool HasByValueHotResolver() const;
+
     /** Require the pinned V2 generation to match CURRENT and the live active
      * chain at the generation tip. Does not auto-rebase. */
     bool VerifySeam(std::string* error) const;

@@ -45,6 +45,11 @@ void ColdHotSeamNavigator::SetProductionHotResolver(const ColdHotHotResolver* re
     testHotResolver = resolver; // same injection slot; production-safe usage documented
 }
 
+bool ColdHotSeamNavigator::HasByValueHotResolver() const
+{
+    return testHotResolver != NULL;
+}
+
 bool ColdHotSeamNavigator::Open(const std::string& v2Root,
                                  const BlockIndexV2ReaderOptions& options,
                                  std::string* error)

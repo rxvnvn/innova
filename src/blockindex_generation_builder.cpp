@@ -387,22 +387,37 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         // nStakeModifierChecksum: by logical parent topology
         // Reproduce GetStakeModifierChecksum semantics
         {
-            unsigned int parentChecksum = 0;
-            if (rec->hashPrev != uint256(0))
+            // The legacy recurrence (kernel.cpp GetStakeModifierChecksum) forces
+            // checksum 0 for a chain root whose hash is NOT the canonical genesis
+            // (a non-genesis-rooted / pruned generation). WITHOUT this guard the
+            // builder hashed the root into the recurrence, producing a value that
+            // diverged from the reader's canonical recurrence (Stage E defect:
+            // persisted derived 2540991004 vs canonical 1484507649). Apply the
+            // guard so persisted derived.dat matches GetStakingMetadata / legacy
+            // byte-for-byte.
+            if (rec->hashPrev == uint256(0) && rec->hash != GetGenesisBlockHash())
             {
-                std::map<uint256, DerivedComputed>::iterator pit = derivedByHash.find(rec->hashPrev);
-                if (pit != derivedByHash.end())
-                    parentChecksum = pit->second.stakeModifierChecksum;
+                dc.stakeModifierChecksum = 0;
             }
-            // Compute checksum: Hash(parentChecksum || nFlags || hashProof || nStakeModifier)
-            CDataStream ss(SER_GETHASH, 0);
-            if (rec->hashPrev != uint256(0))
-                ss << parentChecksum;
-            uint256 proof = (rec->nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) ? rec->hashProof : uint256(0);
-            ss << rec->nFlags << proof << rec->nStakeModifier;
-            uint256 hashChecksum = Hash(ss.begin(), ss.end());
-            hashChecksum >>= (256 - 32);
-            dc.stakeModifierChecksum = hashChecksum.Get64();
+            else
+            {
+                unsigned int parentChecksum = 0;
+                if (rec->hashPrev != uint256(0))
+                {
+                    std::map<uint256, DerivedComputed>::iterator pit = derivedByHash.find(rec->hashPrev);
+                    if (pit != derivedByHash.end())
+                        parentChecksum = pit->second.stakeModifierChecksum;
+                }
+                // Compute checksum: Hash(parentChecksum || nFlags || hashProof || nStakeModifier)
+                CDataStream ss(SER_GETHASH, 0);
+                if (rec->hashPrev != uint256(0))
+                    ss << parentChecksum;
+                uint256 proof = (rec->nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) ? rec->hashProof : uint256(0);
+                ss << rec->nFlags << proof << rec->nStakeModifier;
+                uint256 hashChecksum = Hash(ss.begin(), ss.end());
+                hashChecksum >>= (256 - 32);
+                dc.stakeModifierChecksum = hashChecksum.Get64();
+            }
         }
 
         // nStakeModifierTime: branch-local memo

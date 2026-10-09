@@ -13,6 +13,7 @@
 #include <boost/filesystem.hpp>
 #include <cstdio>
 #include <cstdlib>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -93,6 +94,72 @@ static void P06BuildRoot(const fs::path& root, std::string* error)
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
 }
 
+// Repair #4 / p06 shared-state isolation (the demonstrated cause of the suite's
+// cross-case heap corruption). The cases below mine REAL blocks into the shared
+// mapBlockIndex; in authoritative mode the production bounded-residency retirer
+// (RetireBlockIndexBelowFloor, main.cpp) frees every entry below the live floor
+// and detaches survivor links, which destroys the shared regtest chain and leaves
+// pindexBest dangling for the NEXT case. Move the shared chain aside for the
+// authoritative phase and restore it afterwards. This changes ONLY the harness's
+// shared-state handling; no assertion is relaxed.
+//
+// Ownership: objects created during the authoritative phase belong to the
+// authority (freed by ResetBlockIndexAuthoritativeStartupForTest) or to the test
+// (AddToBlockIndex; bounded leak, never double-freed because we never delete them
+// here). RAII restores the shared map even if a BOOST_REQUIRE throws mid-case.
+struct P06SharedIndexIsolation
+{
+    std::map<uint256, CBlockIndex*> shared;   // protected: shared regtest chain
+    std::map<uint256, CBlockIndex*> scratch;  // case-local: authority/mined entries
+    bool armed;
+    // Globals captured at detach() so an EARLY-THROW teardown still restores them
+    // (a BOOST_REQUIRE mid-case must not leave pindexBest NULL for the next case).
+    CBlockIndex* sBest;
+    CBlockIndex* sGenesis;
+    uint256 sBestChain;
+    int sHeight;
+    uint256 sTrust;
+    P06SharedIndexIsolation()
+        : armed(false), sBest(NULL), sGenesis(NULL), sHeight(-1) {}
+    ~P06SharedIndexIsolation() { if (armed) restore(); }
+
+    // Call AFTER base-chain mining + any pre-init hash capture, BEFORE
+    // InitBlockIndexAuthoritative().
+    void detach()
+    {
+        sBest = pindexBest; sGenesis = pindexGenesisBlock;
+        sBestChain = hashBestChain; sHeight = nBestHeight; sTrust = nBestChainTrust;
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
+        shared.swap(mapBlockIndex);
+        armed = true;
+    }
+    // Call in teardown INSTEAD OF ResetBlockIndexAuthoritativeStartupForTest().
+    void restore()
+    {
+        if (!armed) return;
+        armed = false;
+        scratch.swap(mapBlockIndex);                  // move case-local map out first
+        ResetBlockIndexAuthoritativeStartupForTest();  // frees authority-owned objects
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
+        shared.swap(mapBlockIndex);                    // put the protected chain back
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
+        pindexBest = sBest; pindexGenesisBlock = sGenesis;
+        hashBestChain = sBestChain; nBestHeight = sHeight; nBestChainTrust = sTrust;
+        // Free the CASE-LOCAL mapBlockIndex entries this case mined. They are NOT
+        // authority-owned: the authority retains its parents as SEPARATE by-value
+        // objects (ResolveAndRetainFullParent), so the
+        // ResetBlockIndexAuthoritativeStartupForTest() above freed those but NOT
+        // these. Leaving them was an accepted per-case leak (LSan: 33 CBlockIndex
+        // / ~7920 B per case), because 'scratch' destructs without deleting.
+        for (std::map<uint256, CBlockIndex*>::iterator d = scratch.begin(); d != scratch.end(); ++d)
+            delete d->second;
+        scratch.clear();
+    }
+};
+
 BOOST_AUTO_TEST_SUITE(blockindex_p06_a1b_residency_scaling_tests)
 
 BOOST_AUTO_TEST_CASE(p06_a1b_s4_connectable_plateau)
@@ -120,6 +187,12 @@ BOOST_AUTO_TEST_CASE(p06_a1b_s4_connectable_plateau)
     uint256 savedBestTrust = nBestChainTrust;
     const bool hadLivetail = mapArgs.count("-blockindexlivetail") != 0;
     const std::string savedLivetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
+
+    // Isolate the shared block index for the authoritative phase (see
+    // P06SharedIndexIsolation): the production retirer must not free the shared
+    // regtest chain that later cases depend on.
+    P06SharedIndexIsolation iso;
+    iso.detach();
 
     mapArgs["-blockindexlivetail"] = "32";
     BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
@@ -191,7 +264,7 @@ BOOST_AUTO_TEST_CASE(p06_a1b_s4_connectable_plateau)
         fprintf(stderr, "  i=%d tipH=%d floor=%d mapBlockIndex=%d fullResident=%zu fullResidentPeak=%zu\n",
                snaps[k].i, snaps[k].tipH, snaps[k].floor, snaps[k].mb, snaps[k].fr, snaps[k].frPeak);
 
-    ResetBlockIndexAuthoritativeStartupForTest();
+    iso.restore();
     pindexBest = savedBest; pindexGenesisBlock = savedGenesis;
     hashBestChain = savedBestChain; nBestHeight = savedBestHeight; nBestChainTrust = savedBestTrust;
     if (hadLivetail) mapArgs["-blockindexlivetail"] = savedLivetail; else mapArgs.erase("-blockindexlivetail");
@@ -231,9 +304,22 @@ BOOST_AUTO_TEST_CASE(p06_a1c_safety_after_turnover)
 
     CBlockIndex* tip = pindexBest;
     while (tip->nHeight < 40) tip = P06MineReal(tip, 0x6000u + (unsigned)tip->nHeight);
-    std::vector<uint256> hashes((size_t)target + 64);
-    for (int h = 0; h <= tip->nHeight; ++h) hashes[h] = uint256(0);
-    { LOCK(cs_main); for (std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.begin(); it != mapBlockIndex.end(); ++it) if (it->second->nHeight <= target + 63) hashes[it->second->nHeight] = it->first; }
+    // The p06 cases share ONE regtest datadir and mine REAL blocks, so the chain
+    // does NOT restart per case: a LATER case can begin far above height 40. Size
+    // the height-indexed capture vector from the ACTUAL start height + the blocks
+    // THIS case mines (+slack). A fixed (target+64) under-sized the vector once a
+    // PRIOR case had advanced the shared chain, and `hashes[tip->nHeight]` then
+    // wrote PAST THE END of the vector (the cross-case heap corruption).
+    const int startH = tip->nHeight;
+    // Height-indexed capture, GROWN ON DEMAND as the chain advances. The p06
+    // cases share ONE regtest datadir and mine REAL blocks, and mining can even
+    // adopt a longer candidate chain, so the maximum reached height is NOT
+    // bounded by startH + target. A fixed-size vector under-sized here and the
+    // `hashes[tip->nHeight]` write ran PAST THE END (the cross-case heap
+    // corruption). Grow-on-demand keeps it exactly sized and never writes OOB;
+    // below-floor probes stay indexed by absolute active height.
+    std::vector<uint256> hashes((size_t)startH + 1, uint256(0));
+    { LOCK(cs_main); for (std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.begin(); it != mapBlockIndex.end(); ++it) if (it->second->nHeight >= 0 && it->second->nHeight <= startH) hashes[it->second->nHeight] = it->first; }
 
     const fs::path root = fs::temp_directory_path() / fs::unique_path("p06-safety-%%%%-%%%%");
     std::string error;
@@ -243,6 +329,13 @@ BOOST_AUTO_TEST_CASE(p06_a1c_safety_after_turnover)
     uint256 savedBestTrust = nBestChainTrust;
     const bool hadLivetail = mapArgs.count("-blockindexlivetail") != 0;
     const std::string savedLivetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
+
+    // Isolate the shared block index for the authoritative phase (see
+    // P06SharedIndexIsolation): the production retirer must not free the shared
+    // regtest chain that later cases depend on.
+    P06SharedIndexIsolation iso;
+    iso.detach();
+
     mapArgs["-blockindexlivetail"] = "32";
     BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
     BOOST_REQUIRE(g_fAuthoritativeStartup);
@@ -253,6 +346,9 @@ BOOST_AUTO_TEST_CASE(p06_a1c_safety_after_turnover)
     for (int i = 0; i < target; ++i)
     {
         tip = P06MineReal(tip, 0x9000u + (unsigned)i);
+        BOOST_REQUIRE(tip->nHeight >= 0);
+        if ((size_t)tip->nHeight >= hashes.size())
+            hashes.resize((size_t)tip->nHeight + 1, uint256(0));
         hashes[tip->nHeight] = tip->GetBlockHash();
     }
     int tipH = 0, floor = 0, mbBefore = 0;
@@ -331,7 +427,7 @@ BOOST_AUTO_TEST_CASE(p06_a1c_safety_after_turnover)
             "fullResident before/afterDeep/after=%zu/%zu/%zu (bound=%d)\n",
             mbBefore, mbAfterDeep, mbAfter, frBefore, frAfterDeep, frAfter, horizon + 1);
 
-    ResetBlockIndexAuthoritativeStartupForTest();
+    iso.restore();
     pindexBest = savedBest; pindexGenesisBlock = savedGenesis;
     hashBestChain = savedBestChain; nBestHeight = savedBestHeight; nBestChainTrust = savedBestTrust;
     if (hadLivetail) mapArgs["-blockindexlivetail"] = savedLivetail; else mapArgs.erase("-blockindexlivetail");
@@ -361,15 +457,28 @@ BOOST_AUTO_TEST_CASE(p06_a1c_g1_below_floor_invalidation)
     uint256 savedBestTrust = nBestChainTrust;
     const bool hadLivetail = mapArgs.count("-blockindexlivetail") != 0;
     const std::string savedLivetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
+
+    // Isolate the shared block index for the authoritative phase (see
+    // P06SharedIndexIsolation): the production retirer must not free the shared
+    // regtest chain that later cases depend on.
+    P06SharedIndexIsolation iso;
+    iso.detach();
+
     mapArgs["-blockindexlivetail"] = "32";
     BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
     BOOST_REQUIRE(g_fAuthoritativeStartup);
 
     tip = pindexBest;
-    std::vector<uint256> hashes((size_t)target + 128);
+    // Height-indexed capture, GROWN ON DEMAND (see a1c_safety): the shared
+    // datadir accumulates real blocks across cases and mining may adopt a longer
+    // candidate chain, so the reached height is not bounded by start + target.
+    std::vector<uint256> hashes((size_t)tip->nHeight + 1, uint256(0));
     for (int i = 0; i < target; ++i)
     {
         tip = P06MineReal(tip, 0x4000u + (unsigned)i);
+        BOOST_REQUIRE(tip->nHeight >= 0);
+        if ((size_t)tip->nHeight >= hashes.size())
+            hashes.resize((size_t)tip->nHeight + 1, uint256(0));
         hashes[tip->nHeight] = tip->GetBlockHash();
     }
 
@@ -461,7 +570,7 @@ BOOST_AUTO_TEST_CASE(p06_a1c_g1_below_floor_invalidation)
     fprintf(stderr, "P06-A1C G1 RESULT: mapBlockIndex before/after=%d/%d fullResident before/after=%zu/%zu\n",
             mbBefore, mbAfter, frBefore2, frAfter);
 
-    ResetBlockIndexAuthoritativeStartupForTest();
+    iso.restore();
     pindexBest = savedBest; pindexGenesisBlock = savedGenesis;
     hashBestChain = savedBestChain; nBestHeight = savedBestHeight; nBestChainTrust = savedBestTrust;
     if (hadLivetail) mapArgs["-blockindexlivetail"] = savedLivetail; else mapArgs.erase("-blockindexlivetail");
@@ -499,6 +608,12 @@ BOOST_AUTO_TEST_CASE(p06_l3_below_floor_accept_no_uaf)
     uint256 savedBestTrust = nBestChainTrust;
     const bool hadLivetail = mapArgs.count("-blockindexlivetail") != 0;
     const std::string savedLivetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
+
+    // Isolate the shared block index for the authoritative phase (see
+    // P06SharedIndexIsolation): the production retirer must not free the shared
+    // regtest chain that later cases depend on.
+    P06SharedIndexIsolation iso;
+    iso.detach();
 
     mapArgs["-blockindexlivetail"] = "32";
     BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
@@ -556,7 +671,7 @@ BOOST_AUTO_TEST_CASE(p06_l3_below_floor_accept_no_uaf)
     BOOST_CHECK_LE(mb, horizon + 8);
     BOOST_CHECK_LE((int)live->ResidentCount(), horizon + 16);
 
-    ResetBlockIndexAuthoritativeStartupForTest();
+    iso.restore();
     pindexBest = savedBest; pindexGenesisBlock = savedGenesis;
     hashBestChain = savedBestChain; nBestHeight = savedBestHeight; nBestChainTrust = savedBestTrust;
     if (hadLivetail) mapArgs["-blockindexlivetail"] = savedLivetail; else mapArgs.erase("-blockindexlivetail");
@@ -607,6 +722,12 @@ BOOST_AUTO_TEST_CASE(p06_dr_known_block_not_rewritten)
     uint256 savedBestTrust = nBestChainTrust;
     const bool hadLivetail = mapArgs.count("-blockindexlivetail") != 0;
     const std::string savedLivetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
+
+    // Isolate the shared block index for the authoritative phase (see
+    // P06SharedIndexIsolation): the production retirer must not free the shared
+    // regtest chain that later cases depend on.
+    P06SharedIndexIsolation iso;
+    iso.detach();
 
     mapArgs["-blockindexlivetail"] = "32";
     BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
@@ -670,7 +791,7 @@ BOOST_AUTO_TEST_CASE(p06_dr_known_block_not_rewritten)
 
     delete pblock;
 
-    ResetBlockIndexAuthoritativeStartupForTest();
+    iso.restore();
     pindexBest = savedBest; pindexGenesisBlock = savedGenesis;
     hashBestChain = savedBestChain; nBestHeight = savedBestHeight; nBestChainTrust = savedBestTrust;
     if (hadLivetail) mapArgs["-blockindexlivetail"] = savedLivetail; else mapArgs.erase("-blockindexlivetail");
