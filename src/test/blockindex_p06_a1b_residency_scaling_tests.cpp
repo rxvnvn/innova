@@ -375,6 +375,34 @@ BOOST_AUTO_TEST_CASE(p06_a1c_safety_after_turnover)
     // the tip's ancestry must contain a generated modifier resolvable across the seam.
     BOOST_CHECK_MESSAGE(mod != 0 || !gen, "unexpected zero generated modifier");
 
+    // ---- K1 (kernel PHASE-1 elimination): the last stake modifier must resolve
+    // WITHOUT any resident pprev/pskip/pnext traversal. Destroy the whole
+    // historical pointer topology in the bounded hot window (keeping only the
+    // by-value hashPrevStable identity) and require the IDENTICAL modifier. The
+    // former resident pprev walk either stopped early or crashed here.
+    {
+        LOCK(cs_main);
+        std::vector<CBlockIndex*> kn; std::vector<CBlockIndex*> kp, ks, kx;
+        for (std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin(); mi != mapBlockIndex.end(); ++mi)
+        {
+            CBlockIndex* o = mi->second;
+            if (!o) continue;
+            kn.push_back(o); kp.push_back(o->pprev); ks.push_back(o->pskip); kx.push_back(o->pnext);
+            o->pprev = NULL; o->pskip = NULL; o->pnext = NULL;
+        }
+        uint64_t modD = 0; bool genD = false;
+        const bool okD = ComputeNextStakeModifier(tip, modD, genD);
+        for (size_t i = 0; i < kn.size(); ++i)
+        {
+            kn[i]->pprev = kp[i]; kn[i]->pskip = ks[i]; kn[i]->pnext = kx[i];
+        }
+        BOOST_CHECK_MESSAGE(okD, "K1: last-modifier resolution failed after the historical pointer topology was destroyed");
+        BOOST_CHECK_EQUAL(modD, mod);
+        BOOST_CHECK_EQUAL(genD, gen);
+        fprintf(stderr, "K1 PASS: last stake modifier resolves without resident pprev traversal (mod=0x%016llx nodes=%zu)\n",
+                (unsigned long long)modD, kn.size());
+    }
+
     // ---- C2/H3: deep historical access far below the floor, repeated ----
     for (int round = 0; round < 3; ++round)
     {

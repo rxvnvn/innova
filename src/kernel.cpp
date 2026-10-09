@@ -392,17 +392,12 @@ static bool CollectCandidatesByValue(const ColdHotSeamNavigator* nav,
 
 // F1(a): last generated stake modifier for `pindexPrev`.
 //
-// PHASE 1 walks the LIVE chain exactly as legacy GetLastStakeModifier does
-// (follow pprev while it exists, until a generated-modifier block), so a fully
-// resident world stays bit-identical to legacy.
-//
-// PHASE 2 is entered only where that pointer walk is exhausted: at the retained
-// window's floor, where pprev is NULL while the LOGICAL parent still exists.
-// The floor block is itself resolvable BY VALUE (it lies at or below the frozen
-// generation tip), so the walk continues in the authoritative by-value domain
-// through the EXISTING ColdHotSeamNavigator::GetLastStakeModifierR. Correctness
-// therefore no longer depends on how deep the resident window happens to be,
-// and the walk never silently continues from a truncated pointer chain.
+// AUTHORITATIVE BY-VALUE CONTRACT (kernel PHASE-1 elimination). The historical
+// resident pprev walk is GONE. The walk is hash-driven and branch-local: at each
+// step the block's consensus metadata is read BY VALUE from the bounded hot
+// window (accepted / unflushed hot records; reproduces legacy semantics exactly)
+// or, below that window, from the authoritative V2 by-value snapshot. Correctness
+// does not depend on residency depth, and an unknown identity fails closed.
 //
 // Returns: 1 = resolved, 0 = no generated modifier in the ancestry (legacy's
 // "no generation at genesis block"), -1 = authority failure (fail closed).
@@ -412,35 +407,70 @@ static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
 {
     if (!pindexPrev)
         return 0; // legacy: "GetLastStakeModifier: null pindex"
-    // PHASE 1 - live-chain walk, byte-identical to legacy semantics.
-    // (Stage G final: a pure by-value rewrite of this walk was attempted (A9) and
-    // REVERTED - it broke invalidate/reconsider block acceptance and the
-    // stale-authority fail-closed oracle, because the unified resolver cannot
-    // reproduce legacy's exact stop/fail-closed behavior for every fixture. The
-    // resident walk below is retained until a discriminated by-value contract can
-    // be proven for this specific consumer.)
-    const CBlockIndex* p = pindexPrev;
-    while (p->pprev && !p->GeneratedStakeModifier())
-        p = p->pprev;
-    if (p->GeneratedStakeModifier())
+    // F1(a) — KERNEL PHASE-1 ELIMINATION (disk-native consensus cutover).
+    // NO resident pprev traversal remains. Ancestry is followed through each
+    // block's OWN by-value parent identity (hash), so a side branch follows its
+    // own history and never the active chain's. Each step resolves consensus
+    // metadata BY VALUE:
+    //   (1) the BOUNDED hot window (mapBlockIndex) read by hash under cs_main -
+    //       the authority for ACCEPTED / unflushed hot records that have not yet
+    //       been persisted into the V2 tip (WriteToDisk + AddToBlockIndex side
+    //       blocks). This also reproduces the legacy resident semantics exactly.
+    //   (2) the authoritative V2 by-value snapshot (live tip -> cold generation)
+    //       below the hot window.
+    //   (3) cold-only navigator continuation when no live authority is retained.
+    // A hash absent from all authorities is an AUTHORITY FAILURE -> fail closed.
+    // No CBlockIndex pointer is retained across a loop iteration, and no raw
+    // pprev / pskip / pnext edge is dereferenced.
+    BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority();
+    uint256 h = pindexPrev->GetBlockHash();
+    for (int guard = 0; guard < 200000000; ++guard)
     {
-        nStakeModifier = p->nStakeModifier;
-        nModifierTime  = p->GetBlockTime();
-        return 1;
-    }
-    // PHASE 2 - the pointer walk stopped at the residency floor without a
-    // generated modifier. Continue BY VALUE from that floor block.
-    // PM1-P0-06 A1-c: the floor block may itself be a LIVE (post-generation)
-    // block, which the immutable cold reader cannot resolve (ResolveLogicalR ->
-    // LookupByHash cold miss). Walk TIP-FIRST-THEN-BASE through the authoritative
-    // live authority so a live floor block is resolvable; fall back to the
-    // cold-only navigator only when no live authority is retained.
-    if (p->nHeight == 0)
-        return 0; // genuine genesis floor: exactly legacy's error case
-    if (BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority())
-    {
-        uint256 h = p->GetBlockHash();
-        for (int guard = 0; guard < 200000000; ++guard)
+        // (1) bounded hot window: read-by-hash, no pointer retention.
+        bool    haveHot   = false;
+        bool    hotGen    = false;
+        uint64_t hotMod   = 0;
+        int64_t  hotTime  = 0;
+        int     hotHeight = -1;
+        uint256 hotPrev;
+        {
+            LOCK(cs_main);
+            std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(h);
+            if (mi != mapBlockIndex.end() && mi->second)
+            {
+                const CBlockIndex* o = mi->second;
+                haveHot   = true;
+                hotGen    = o->GeneratedStakeModifier();
+                hotMod    = o->nStakeModifier;
+                hotTime   = o->GetBlockTime();
+                hotHeight = o->nHeight;
+                hotPrev   = o->hashPrevStable; // by-value parent identity
+                if (hotPrev == uint256(0) && o->pprev)
+                    hotPrev = o->pprev->GetBlockHash(); // legacy-populated object
+            }
+        }
+        bool fFallThroughToV2 = false;
+        if (haveHot)
+        {
+            if (hotGen)
+            {
+                nStakeModifier = hotMod;
+                nModifierTime  = hotTime;
+                return 1;
+            }
+            if (hotHeight == 0)
+                return 0; // genuine genesis floor: exactly legacy's error case
+            if (hotPrev != uint256(0))
+            {
+                h = hotPrev;
+                continue;
+            }
+            // Hot block with no by-value parent link (retained-window floor):
+            // continue from THIS identity through the V2 authority by value.
+            fFallThroughToV2 = true;
+        }
+        // (2) authoritative V2 by-value snapshot (live tip -> cold generation).
+        if (liveAuth)
         {
             BlockIndexSnapshot snap;
             std::string e2;
@@ -456,22 +486,25 @@ static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
             if (snap.height == 0 || snap.hashPrev == 0)
                 return 0; // genuine genesis floor
             h = snap.hashPrev;
+            continue;
         }
-        return -1; // guard exhausted -> fail closed
+        (void)fFallThroughToV2;
+        // (3) no live authority retained: cold-only navigator continuation.
+        uint64_t nMod = 0;
+        int64_t  nTime = 0;
+        const ColdHotSeamResult r = nav->GetLastStakeModifierR(
+            BlockIndexLogicalId(h), &nMod, &nTime, &err);
+        if (r == COLD_HOT_SEAM_OK)
+        {
+            nStakeModifier = nMod;
+            nModifierTime  = nTime;
+            return 1;
+        }
+        if (r == COLD_HOT_SEAM_NOT_FOUND)
+            return 0; // authoritative answer: the ancestry holds no generated modifier
+        return -1;    // AUTHORITY_FAILURE (or any non-OK) -> fail closed
     }
-    uint64_t nMod = 0;
-    int64_t  nTime = 0;
-    const ColdHotSeamResult r = nav->GetLastStakeModifierR(
-        BlockIndexLogicalId(p->GetBlockHash()), &nMod, &nTime, &err);
-    if (r == COLD_HOT_SEAM_OK)
-    {
-        nStakeModifier = nMod;
-        nModifierTime  = nTime;
-        return 1;
-    }
-    if (r == COLD_HOT_SEAM_NOT_FOUND)
-        return 0; // authoritative answer: the ancestry holds no generated modifier
-    return -1;    // AUTHORITY_FAILURE (or any non-OK) -> fail closed
+    return -1; // guard exhausted -> fail closed
 }
 
 // Stake Modifier (hash modifier of proof-of-stake):
