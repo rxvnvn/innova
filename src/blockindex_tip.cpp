@@ -518,48 +518,6 @@ static bool TruncateStoreToCommitted(const fs::path& path, uint64_t headerSize,
     return true;
 }
 
-// Append bytes to the end of an existing store and fsync. b empty is a no-op.
-// After the bytes are durable, honour the FP_DURING_TAIL_UPDATE failpoint (the
-// append-path analogue of the copy-on-write "temp durable, not yet published"
-// crash boundary): the caller aborts with the appended bytes uncommitted, and
-// recovery truncates them.
-static bool AppendBytesDurable(const fs::path& path, const std::vector<unsigned char>& b,
-                               std::string* error)
-{
-    if (b.empty())
-        return true;
-    FILE* f = fopen(path.string().c_str(), "r+b");
-    if (!f)
-    {
-        if (error) *error = "open append failed: " + path.string();
-        return false;
-    }
-    if (fseek(f, 0, SEEK_END) != 0 ||
-        (!b.empty() && fwrite(&b[0], 1, b.size(), f) != b.size()))
-    {
-        fclose(f);
-        if (error) *error = "append write failed: " + path.string();
-        return false;
-    }
-    if (!FileCommitChecked(f, error))
-    {
-        fclose(f);
-        return false;
-    }
-    if (BlockIndexTipFailpointHit("FP_DURING_TAIL_UPDATE"))
-    {
-        fclose(f);
-        if (error) *error = "failpoint FP_DURING_TAIL_UPDATE";
-        return false;
-    }
-    if (fclose(f) != 0)
-    {
-        if (error) *error = "append close failed: " + path.string();
-        return false;
-    }
-    return true;
-}
-
 // Rewrite only the 8-byte committed-entry count field of a store header, then
 // fsync. The count is informational (Open bounds by tip.meta), but keeping it
 // accurate preserves the on-disk invariant.
@@ -589,6 +547,53 @@ static bool UpdateStoreCount(const fs::path& path, uint32_t countOffset, uint64_
     if (fclose(f) != 0)
     {
         if (error) *error = "count update close failed: " + path.string();
+        return false;
+    }
+    return true;
+}
+
+static bool AppendAndUpdateCountDurable(const fs::path& path,
+                                        const std::vector<unsigned char>& b,
+                                        uint32_t countOffset, uint64_t newCount,
+                                        std::string* error)
+{
+    if (b.empty())
+        return true; // nothing appended and the count for this store is unchanged
+    FILE* f = fopen(path.string().c_str(), "r+b");
+    if (!f)
+    {
+        if (error) *error = "open append failed: " + path.string();
+        return false;
+    }
+    if (fseek(f, 0, SEEK_END) != 0 || fwrite(&b[0], 1, b.size(), f) != b.size())
+    {
+        fclose(f);
+        if (error) *error = "append write failed: " + path.string();
+        return false;
+    }
+    unsigned char cb[8];
+    for (int j = 0; j < 8; ++j)
+        cb[j] = (unsigned char)((newCount >> (8 * j)) & 0xff);
+    if (fseek(f, (long)countOffset, SEEK_SET) != 0 || fwrite(cb, 1, 8, f) != 8)
+    {
+        fclose(f);
+        if (error) *error = "count update write failed: " + path.string();
+        return false;
+    }
+    if (!FileCommitChecked(f, error))
+    {
+        fclose(f);
+        return false;
+    }
+    if (BlockIndexTipFailpointHit("FP_DURING_TAIL_UPDATE"))
+    {
+        fclose(f);
+        if (error) *error = "failpoint FP_DURING_TAIL_UPDATE";
+        return false;
+    }
+    if (fclose(f) != 0)
+    {
+        if (error) *error = "append close failed: " + path.string();
         return false;
     }
     return true;
@@ -1816,19 +1821,14 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         !TruncateStoreToCommitted(i->activePath, BLOCK_INDEX_TIP_ACTIVE_HEADER_SIZE,
                                   BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, committedActive, &werr))
         return SetError(error, "append tip truncate failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!AppendBytesDurable(i->recordsPath, recBytes, &werr))
-        return SetError(error, "append tip-records failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!AppendBytesDurable(i->derivedPath, derBytes, &werr))
-        return SetError(error, "append tip-derived failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!AppendBytesDurable(i->activePath, actBytes, &werr))
-        return SetError(error, "append tip-active failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!UpdateStoreCount(i->recordsPath, BLOCK_INDEX_TIP_RECORDS_COUNT_OFFSET,
-                          committedRecords + newRecords.size(), &werr) ||
-        !UpdateStoreCount(i->derivedPath, BLOCK_INDEX_TIP_DERIVED_COUNT_OFFSET,
-                          committedDerived + newDerived.size(), &werr) ||
-        !UpdateStoreCount(i->activePath, BLOCK_INDEX_TIP_ACTIVE_COUNT_OFFSET,
-                          committedActive + newActive.size(), &werr))
-        return SetError(error, "append tip count update failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+    if (!AppendAndUpdateCountDurable(i->recordsPath, recBytes, BLOCK_INDEX_TIP_RECORDS_COUNT_OFFSET,
+                                     committedRecords + newRecords.size(), &werr) ||
+        !AppendAndUpdateCountDurable(i->derivedPath, derBytes, BLOCK_INDEX_TIP_DERIVED_COUNT_OFFSET,
+                                     committedDerived + newDerived.size(), &werr) ||
+        !AppendAndUpdateCountDurable(i->activePath, actBytes, BLOCK_INDEX_TIP_ACTIVE_COUNT_OFFSET,
+                                     committedActive + newActive.size(), &werr))
+        return SetError(error, "append tip records/derived/active + count failed: " + werr),
+               BLOCK_INDEX_TIP_IO_ERROR;
     // v2: keep the store set complete and upgrade an opened v1 tip
     // deterministically on the first legitimate new commit.
     if (!WriteInvalidFile(i->invalidPath, i->invalidEntries, &werr))
