@@ -158,6 +158,7 @@ void Shutdown(void* parg)
         // existing database, is inert compatibility data and is not rewritten.
 
         FlushIBDBatch();
+        FCloseBlockFile();
         IBDEfficiencyShutdownSummary();
         ibdblocklatency::Dump();
         ibdforensic::ShutdownAndDump();

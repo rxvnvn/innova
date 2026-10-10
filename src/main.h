@@ -438,6 +438,8 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock);
 bool CheckDiskSpace(uint64_t nAdditionalBytes=0);
 FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode="rb");
 FILE* AppendBlockFile(unsigned int& nFileRet);
+// Close (flush + fclose) the cached block-file append handle (C4). No-op when none open.
+void FCloseBlockFile();
 bool LoadBlockIndex(bool fAllowNew=true);
 // PM1-P0-07b (C2-A): the SINGLE canonical genesis-block construction for the
 // active network (mainnet/testnet/regtest). Extracted verbatim from the legacy
@@ -1322,26 +1324,34 @@ public:
 
     bool WriteToDisk(unsigned int& nFileRet, unsigned int& nBlockPosRet)
     {
-        // Open history file to append
-        CAutoFile fileout = CAutoFile(AppendBlockFile(nFileRet), SER_DISK, CLIENT_VERSION);
-        if (!fileout)
+        // Append to the cached block-file handle (kept open across blocks to avoid
+        // a per-block fopen/fclose/fseek on the blk file). The handle is owned by
+        // AppendBlockFile/FCloseBlockFile, NOT closed here.
+        FILE* fout = AppendBlockFile(nFileRet);
+        if (!fout)
             return error("CBlock::WriteToDisk() : AppendBlockFile failed");
 
-        // Write index header
-        unsigned int nSize = fileout.GetSerializeSize(*this);
-        fileout << FLATDATA(pchMessageStart) << nSize;
+        // Write index header (magic + size) then the block, identical byte layout
+        // to the previous CAutoFile path.
+        unsigned int nSize = ::GetSerializeSize(*this, SER_DISK, CLIENT_VERSION);
+        CDataStream hdr(SER_DISK, CLIENT_VERSION);
+        hdr << FLATDATA(pchMessageStart) << nSize;
+        CDataStream blk(SER_DISK, CLIENT_VERSION);
+        blk << *this;
 
-        // Write block
-        long fileOutPos = ftell(fileout);
+        long fileOutPos = ftell(fout);
         if (fileOutPos < 0)
             return error("CBlock::WriteToDisk() : ftell failed");
-        nBlockPosRet = fileOutPos;
-        fileout << *this;
+        nBlockPosRet = fileOutPos + (long)hdr.size();
+        if (fwrite(&hdr[0], 1, hdr.size(), fout) != hdr.size() ||
+            fwrite(&blk[0], 1, blk.size(), fout) != blk.size())
+            return error("CBlock::WriteToDisk() : block file write failed");
 
-        // Flush stdio buffers and commit to disk before returning
-        fflush(fileout);
+        // Flush stdio buffers and commit to disk before returning (unchanged
+        // durability: fflush per block, fsync every 500 blocks during IBD).
+        fflush(fout);
         if (!IsInitialBlockDownload() || (nBestHeight+1) % 500 == 0)
-            FileCommit(fileout);
+            FileCommit(fout);
 
         return true;
     }

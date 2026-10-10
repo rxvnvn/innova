@@ -9617,6 +9617,25 @@ bool CheckDiskSpace(uint64_t nAdditionalBytes)
 
 static unsigned int nCurrentBlockFile = 1;
 
+// Cached append handle to the currently active block file, reused across
+// accepted blocks to avoid a per-block fopen/fclose/fseek on the multi-GB
+// blk file (measured ~3.9 ms/block raw block write on the IBD accept path).
+static FILE* g_pBlockFileOut = NULL;
+static unsigned int g_nBlockFileOut = 0;
+
+// Close (and flush) the cached block-file append handle. A no-op when none is
+// open. Called on file roll and at controlled shutdown.
+void FCloseBlockFile()
+{
+    if (g_pBlockFileOut)
+    {
+        fflush(g_pBlockFileOut);
+        fclose(g_pBlockFileOut);
+        g_pBlockFileOut = NULL;
+        g_nBlockFileOut = 0;
+    }
+}
+
 static fs::path BlockFilePath(unsigned int nFile)
 {
     string strBlockFn = strprintf("blk%04u.dat", nFile);
@@ -9646,18 +9665,26 @@ FILE* AppendBlockFile(unsigned int& nFileRet)
     nFileRet = 0;
     while (true)
     {
-        FILE* file = OpenBlockFile(nCurrentBlockFile, 0, "ab");
-        if (!file)
-            return NULL;
-        if (fseek(file, 0, SEEK_END) != 0)
+        // Reuse the cached append handle while it still targets the current file.
+        if (g_pBlockFileOut != NULL && g_nBlockFileOut != nCurrentBlockFile)
+            FCloseBlockFile(); // the file rolled; drop the stale handle
+        if (g_pBlockFileOut == NULL)
+        {
+            g_pBlockFileOut = OpenBlockFile(nCurrentBlockFile, 0, "ab");
+            if (!g_pBlockFileOut)
+                return NULL;
+            g_nBlockFileOut = nCurrentBlockFile;
+        }
+        if (fseek(g_pBlockFileOut, 0, SEEK_END) != 0)
             return NULL;
         // FAT32 file size max 4GB, fseek and ftell max 2GB, so we must stay under 2GB
-        if (ftell(file) < (long)(0x7F000000 - MAX_SIZE))
+        if (ftell(g_pBlockFileOut) < (long)(0x7F000000 - MAX_SIZE))
         {
             nFileRet = nCurrentBlockFile;
-            return file;
+            return g_pBlockFileOut;
         }
-        fclose(file);
+        // Size limit reached: close the handle and roll to the next block file.
+        FCloseBlockFile();
         nCurrentBlockFile++;
     }
 }
