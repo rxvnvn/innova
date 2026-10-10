@@ -8269,7 +8269,30 @@ bool CBlock::AcceptBlock()
         return DoS(100, error("AcceptBlock() : incorrect %s", IsProofOfWork() ? "proof-of-work" : "proof-of-stake"));
     }
 
-    if (GetBlockTime() <= pindexPrev->GetPastTimeLimit() || FutureDrift(GetBlockTime(), nHeight) < pindexPrev->GetBlockTime())
+    // Check timestamp (median-time-past). R2-REPAIR (C1): in BY_VALUE_AUTHORITATIVE
+    // mode the pindexPrev handed to consensus is often a sparse-hot resident object
+    // with pprev==NULL, so pindexPrev->GetPastTimeLimit() (a pprev POINTER window
+    // walk) collapses to a 1-element window and wrongly rejects a block whose time
+    // equals/leads the fresh parent's (the fresh-mainnet-IBD stall at the
+    // 1.576.165.438/439 timestamp runs). Resolve the identical median-time window
+    // BY VALUE through the V2 authority (same seam as duplicate/difficulty/
+    // maturity/kernel). Legacy (non-authoritative) mode is byte-for-byte unchanged.
+    int64_t nMTPast = pindexPrev->GetPastTimeLimit();
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexAuthoritativeLive* liveMTP = GetAuthoritativeLiveAuthority();
+        std::string mtpErr;
+        if (!liveMTP || !liveMTP->IsOpen() ||
+            !liveMTP->ResolveMedianTimePastByValue(pindexPrev->GetBlockHash(), &nMTPast, &mtpErr))
+        {
+            // Authority unavailability is a local infrastructure failure, never
+            // peer-invalid input; fail closed without DoS (like the other
+            // authoritative failure paths above).
+            return error("AcceptBlock() : median-time-past authority unavailable (fail closed): %s",
+                         liveMTP ? mtpErr.c_str() : "authority closed");
+        }
+    }
+    if (GetBlockTime() <= nMTPast || FutureDrift(GetBlockTime(), nHeight) < pindexPrev->GetBlockTime())
     {
         TraceAcceptBlockReject(*this, nHeight, ABREJECT_TIMESTAMP_TOO_EARLY);
         return error("AcceptBlock() : block's timestamp is too early");

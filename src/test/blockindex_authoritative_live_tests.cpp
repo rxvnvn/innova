@@ -989,4 +989,92 @@ BOOST_AUTO_TEST_CASE(g11_historical_owner_structures_removed_from_source)
            "(%zu files scanned)\n", checked);
 }
 
+// R2-REPAIR (C1): fresh-IBD MedianTimePast collapse regression. Reproduces the
+// real mainnet early-chain timestamp SHAPE (a run of EQUAL block times above a
+// distinct earlier time) where a sparse-hot parent (pprev==NULL) collapses
+// CBlockIndex::GetMedianTimePast() to a 1-element window -> the next equal-time
+// block is wrongly rejected (the actual fresh-mainnet-IBD stall at timestamp
+// 1576165439). Asserts (a) PARITY: the by-value resolver reproduces the full
+// windowed median of a reference pprev-linked chain (the object the original
+// binary walks), and (b) DISCRIMINATION: it is strictly BELOW the collapsed
+// 1-element value, so an equal-timestamp next block (time == parent time) is
+// ACCEPTED, not rejected.
+BOOST_AUTO_TEST_CASE(c1_byvalue_mtp_beats_sparse_collapse)
+{
+    G1Fixture fx(4); // S=4 base: genesis..height 4
+    BlockIndexV2Reader reader;
+    BlockIndexV2ReaderOptions opts;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reader.Open(fx.rootStr, opts, &error), error);
+    BlockIndexAuthoritativeLive live;
+    BOOST_REQUIRE_MESSAGE(live.Open(fx.rootStr, &reader, 2048, &error), error);
+    const int baseTip = fx.baseTip;
+
+    // Extend the mutable tip with heights S+1..S+11 (11 blocks -> a full MTP
+    // window at the last parent). Mainnet shape: distinct earlier time, then a
+    // long EQUAL-timestamp run, then a final equal pair (blk4/blk5 analogue).
+    std::vector<uint256> hashes;
+    std::vector<int64_t> times;
+    uint256 prev = fx.baseActive[baseTip];
+    const uint32_t T_EARLY = 1700000050u;               // distinct earlier time
+    const uint32_t T_SAME  = 1700001000u;               // equal-timestamp run
+    for (int k = 1; k <= 11; ++k)
+    {
+        uint32_t t = (k == 1) ? T_EARLY
+                   : (k <= 9) ? T_SAME
+                   : (T_SAME + 1);                      // S+10, S+11 (blk4/blk5 analogue)
+        uint256 h = uint256(0xF1000000UL + k);
+        BlockIndexRecord r = G1Record(h, prev, baseTip + k, false);
+        r.nTime = t;
+        BlockIndexDerivedEntry d = G1Derived(uint256(0xAA000000UL + k), 9000u + (uint32_t)k);
+        BOOST_REQUIRE_MESSAGE(live.AcceptActive(r, d, baseTip + k, &error), error);
+        prev = h;
+        hashes.push_back(h);
+        times.push_back((int64_t)t);
+    }
+
+    // The parent whose MTP gates the NEXT accepted block.
+    const uint256 parentHash = hashes.back();
+
+    // REFERENCE: pprev-linked CBlockIndex chain over the SAME window (the exact
+    // object the original binary walks for GetMedianTimePast).
+    std::vector<CBlockIndex*> ref;
+    for (size_t i = 0; i < hashes.size(); ++i)
+    {
+        CBlockIndex* ci = new CBlockIndex();
+        ci->nHeight = baseTip + (int)i + 1;
+        ci->nTime = (unsigned)times[i];
+        if (!ref.empty()) ci->pprev = ref.back();
+        ref.push_back(ci);
+    }
+    int64_t refMtp = ref.back()->GetMedianTimePast();
+
+    int64_t got = -1;
+    BOOST_REQUIRE_MESSAGE(
+        live.ResolveMedianTimePastByValue(parentHash, &got, &error),
+        std::string("by-value MTP resolution failed: ") + error);
+
+    // PARITY: reproduces the original windowed median.
+    BOOST_CHECK_EQUAL(got, refMtp);
+
+    // DISCRIMINATION: a sparse-hot parent (pprev==NULL) collapses to the single
+    // parent time; the by-value result must be STRICTLY BELOW it, so the next
+    // EQUAL-timestamp block (time == parent time) passes the timestamp check.
+    int64_t collapsed = times.back();
+    BOOST_CHECK_MESSAGE(
+        got < collapsed,
+        "by-value MTP must be below the collapsed single-element (sparse pprev) value");
+    BOOST_CHECK_MESSAGE(
+        collapsed > got,
+        "an equal-timestamp next block must pass time > MTP under the by-value "
+        "median (this is the exact fresh-IBD rejection the fix removes)");
+
+    for (size_t i = 0; i < ref.size(); ++i) delete ref[i];
+    live.Close();
+    reader.Close();
+    printf("C1 PASS: by-value MTP==reference median (%lld) < collapsed single-element "
+           "(%lld); equal-timestamp next block accepted under by-value median\n",
+           (long long)got, (long long)collapsed);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

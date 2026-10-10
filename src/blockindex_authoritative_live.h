@@ -171,6 +171,23 @@ public:
                                              BlockIndexSnapshot* out,
                                              std::string* error) const;
 
+    // R2-REPAIR (C1): by-value MedianTimePast for the authoritative live
+    // timestamp-validity check (CBlock::AcceptBlock, main.cpp:8272).
+    // Replicates CBlockIndex::GetMedianTimePast() (main.h:1601) exactly -- up
+    // to nMedianTimeSpan=11 block-times from *hash* (the parent) backward,
+    // sorted, element [len/2] -- but resolves each ancestor BY VALUE (composite
+    // tip-then-base snapshot read, tip authority first then the immutable base
+    // generation) instead of walking pprev pointers. pprev is NULL on the
+    // sparse-hot resident objects V2 hands to consensus, so the pointer walk
+    // collapses to a 1-element window and wrongly rejects a block whose time
+    // equals/leads the fresh parent's (the fresh-mainnet-IBD stall). Same
+    // by-value seam as duplicate / difficulty / spend-maturity / kernel-stake
+    // ancestry; bounded (<=11 reads), no residency, no O(height), no pprev
+    // writes. Fails closed on authority error (never zero/genesis/immediate
+    // parent substitution). Caller must hold cs_main.
+    bool ResolveMedianTimePastByValue(const uint256& hash, int64_t* out,
+                                      std::string* error) const;
+
     // R2c.2/S6-repair-cycle-2 (B1): authoritative by-value verdict for the
     // legacy ConnectInputs coinbase/coinstake maturity predicate ("is the
     // source block, identified by its disk position nFile/nBlockPos, among

@@ -488,6 +488,48 @@ BlockIndexHotStatus BlockIndexAuthoritativeLive::ResolveBlockSnapshot(
     return (st == BlockIndexHotStatus::AUTHORITY_MISSING) ? st : BlockIndexHotStatus::CORRUPT_METADATA;
 }
 
+// R2-REPAIR (C1): by-value MedianTimePast (see header for the full rationale).
+bool BlockIndexAuthoritativeLive::ResolveMedianTimePastByValue(
+    const uint256& hash, int64_t* out, std::string* error) const
+{
+    if (error) error->clear();
+    if (!out)
+        return false;
+    if (!impl_->open || !impl_->baseReader || !impl_->tip)
+    {
+        if (error) *error = "authoritative-live: median-time-past authority closed (fail closed)";
+        return false;
+    }
+    // Byte-equivalent to CBlockIndex::GetMedianTimePast() (main.h:1601): up to
+    // nMedianTimeSpan=11 block-times walking backward from `hash` (the parent),
+    // packed from the back of the window, sorted, element [(filled)/2].
+    const int nSpan = CBlockIndex::nMedianTimeSpan; // 11
+    int64_t pmedian[128];
+    int64_t* pbegin = &pmedian[nSpan];
+    int64_t* pend = &pmedian[nSpan];
+    int filled = 0;
+    uint256 cur = hash;
+    while (filled < nSpan && cur != uint256(0))
+    {
+        BlockIndexSnapshot s;
+        std::string err2;
+        const BlockIndexHotStatus st = ResolveBlockSnapshot(cur, &s, &err2);
+        if (st != BlockIndexHotStatus::OK)
+        {
+            if (error)
+                *error = "median-time-past by-value: ancestor resolve failed for " +
+                         cur.ToString() + ": " + err2;
+            return false;
+        }
+        *(--pbegin) = (int64_t)s.nTime;
+        ++filled;
+        cur = s.hashPrev;
+    }
+    std::sort(const_cast<int64_t*>(pbegin), const_cast<int64_t*>(pend));
+    *out = pbegin[(pend - pbegin) / 2];
+    return true;
+}
+
 namespace {
 // Build a full-topology CBlockIndex from a by-value snapshot (scalar fields; the
 // caller links pprev/pnext/pskip).
