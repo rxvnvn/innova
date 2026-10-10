@@ -554,6 +554,7 @@ TEST_OBJS= \
     obj/test/headersservededup_tests.o \
     obj/test/getblocksservedinvzero_tests.o \
     obj/test/stakemodifieropt_tests.o \
+    obj/test/crc32c_sse_tests.o \
     obj/test/getdatablockbudget_tests.o \
     obj/test/cnpayment_guard_tests.o \
     obj/test/hreg_registration_tests.o \
@@ -641,7 +642,7 @@ release-check: innova-build
 #
 ifeq (${USE_LEVELDB}, 1)
 LIBS += $(CURDIR)/leveldb/libleveldb.a $(CURDIR)/leveldb/libmemenv.a
-DEFS += $(addprefix -I,$(CURDIR)/leveldb/include) -DUSE_LEVELDB
+DEFS += $(addprefix -I,$(CURDIR)/leveldb/include) $(addprefix -I,$(CURDIR)/leveldb) -DUSE_LEVELDB
 DEFS += $(addprefix -I,$(CURDIR)/leveldb/helpers)
 OBJS += obj/txdb-leveldb.o
 leveldb/libleveldb.a:

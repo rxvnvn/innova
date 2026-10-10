@@ -7737,9 +7737,38 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     pindexNew->nStakeModifierTime = fGeneratedStakeModifier
         ? pindexNew->GetBlockTime()
         : (pindexNew->pprev ? pindexNew->pprev->nStakeModifierTime : 0);
+    if (fAcceptBlockRejectTraceEnabled && pindexNew->nHeight == 100000)
+        printf("CS_PRE h=%d pprev=%s pprev_cs=%08x nFlags=%08x pos=%d proof=%s mod=%016llx genesiscs=%08x\n",
+               pindexNew->nHeight, pindexNew->pprev ? "set" : "NULL",
+               pindexNew->pprev ? (unsigned int)pindexNew->pprev->nStakeModifierChecksum : 0,
+               (unsigned int)pindexNew->nFlags, pindexNew->IsProofOfStake()?1:0,
+               pindexNew->hashProof.ToString().c_str(), (unsigned long long)pindexNew->nStakeModifier,
+               (unsigned int)(pindexNew->nHeight == 99999 ? 0 : 0));
     pindexNew->nStakeModifierChecksum = GetStakeModifierChecksum(pindexNew);
+    if (fAcceptBlockRejectTraceEnabled && pindexNew->nHeight <= 3)
+        printf("SMCHK_EARLY h=%d parent_id=%s parent_cs=%08x computed=%08x mod=%016llx pos=%d nFlags=%08x proof=%s\n",
+               pindexNew->nHeight,
+               (pindexNew->pprev && pindexNew->pprev == pindexGenesisBlock) ? "GENESIS-ANCHOR" : (pindexNew->pprev ? "other" : "none"),
+               pindexNew->pprev ? (unsigned int)pindexNew->pprev->nStakeModifierChecksum : 0,
+               (unsigned int)pindexNew->nStakeModifierChecksum,
+               (unsigned long long)nStakeModifier,
+               pindexNew->IsProofOfStake()?1:0,
+               (unsigned int)pindexNew->nFlags,
+               pindexNew->hashProof.ToString().substr(0,16).c_str());
     if (!CheckStakeModifierCheckpoints(pindexNew->nHeight, pindexNew->nStakeModifierChecksum))
+    {
+        if (fAcceptBlockRejectTraceEnabled)
+            printf("SMCHK_REJECT h=%d parent_cs=%08x computed=%08x pos=%d nFlags=%08x mod=%016llx proof=%s hash=%s\n",
+                   pindexNew->nHeight,
+                   pindexNew->pprev ? (unsigned int)pindexNew->pprev->nStakeModifierChecksum : 0,
+                   (unsigned int)pindexNew->nStakeModifierChecksum,
+                   pindexNew->IsProofOfStake()?1:0,
+                   (unsigned int)pindexNew->nFlags,
+                   (unsigned long long)nStakeModifier,
+                   pindexNew->hashProof.ToString().c_str(),
+                   hash.ToString().c_str());
         return error("AddToBlockIndex() : Rejected by stake modifier checkpoint height=%d, modifier=0x%016" PRIx64, pindexNew->nHeight, nStakeModifier);
+    }
 
     // Add to mapBlockIndex
     map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.insert(make_pair(hash, pindexNew)).first;

@@ -92,6 +92,8 @@ Counters::Counters()
       pipeline_drained_skip_not_ahead(0),
       pipeline_drained_skip_getblocks_10s_cooldown(0),
       pipeline_drained_skip_other_condition(0),
+      stake_source_ancestry_calls(0),
+      stake_source_ancestry_steps(0),
       pushgetblocks_dedup_5s_skips(0),
       askfor_skip_orphan_limit_cooldown(0),
       orphan_limit_cooldown_recorded(0),
@@ -740,6 +742,10 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.pipeline_drained_skip_getblocks_10s_cooldown.load(std::memory_order_relaxed);
     out.pipeline_drained_skip_other_condition =
         c.pipeline_drained_skip_other_condition.load(std::memory_order_relaxed);
+    out.stake_source_ancestry_calls =
+        c.stake_source_ancestry_calls.load(std::memory_order_relaxed);
+    out.stake_source_ancestry_steps =
+        c.stake_source_ancestry_steps.load(std::memory_order_relaxed);
     out.pushgetblocks_dedup_5s_skips =
         c.pushgetblocks_dedup_5s_skips.load(std::memory_order_relaxed);
 

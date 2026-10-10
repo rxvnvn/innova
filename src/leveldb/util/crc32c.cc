@@ -10,8 +10,48 @@
 #include <stdint.h>
 #include "util/coding.h"
 
+// ==== BLOCK-INDEX V2 IBD PERFORMANCE (2026-10-10) ====
+// leveldb::crc32c::Extend measured at ~56% of single-core CPU during IBD on this
+// build (perf: the dominant symbol). It was the portable table CRC-32C. The AMD
+// 9950X3D supports the SSE4.2 `crc32` instruction which computes the SAME
+// CRC-32C (Castagnoli, 0x1EDC6F41, reflected, init/final xor 0xffffffff) ~5-10x
+// faster. We add a runtime-CPUID-gated SSE4.2 path; output is bit-identical to
+// identical to the table so on-disk checksums and consensus are unchanged (pure compute accel).
+#include <cpuid.h>
+
 namespace leveldb {
 namespace crc32c {
+
+#if defined(__x86_64__) || defined(__i386__)
+#include <immintrin.h>
+
+static inline bool DetectSSE42(void) {
+#if defined(__x86_64__) || defined(__i386__)
+  unsigned int eax, ebx, ecx, edx;
+  if (__get_cpuid(1, &eax, &ebx, &ecx, &edx)) return (ecx & (1u << 20)) != 0;
+#endif
+  return false;
+}
+
+// Compiled with SSE4.2 target so the enclosing build need not pass -msse4.2.
+__attribute__((target("sse4.2")))
+uint32_t ExtendSSE42(uint32_t crc, const char* buf, size_t size) {
+  const uint8_t* p = reinterpret_cast<const uint8_t*>(buf);
+  const uint8_t* e = p + size;
+  uint32_t crc_ = crc ^ 0xffffffffu;
+  // byte-at-a-time until an 8-byte boundary for the wide loads
+  while (p != e && (reinterpret_cast<uintptr_t>(p) & 7)) crc_ = _mm_crc32_u8(crc_, *p++);
+#if defined(__x86_64__)
+  while ((e - p) >= 8) { crc_ = _mm_crc32_u64(crc_, *reinterpret_cast<const uint64_t*>(p)); p += 8; }
+#else
+  while ((e - p) >= 4) { crc_ = _mm_crc32_u32(crc_, *reinterpret_cast<const uint32_t*>(p)); p += 4; }
+#endif
+  while (p != e) crc_ = _mm_crc32_u8(crc_, *p++);
+  return crc_ ^ 0xffffffffu;
+}
+
+static const bool kUseSSE42 = DetectSSE42();
+#endif
 
 static const uint32_t table0_[256] = {
   0x00000000, 0xf26b8303, 0xe13b70f7, 0x1350f3f4,
@@ -284,6 +324,9 @@ static inline uint32_t LE_LOAD32(const uint8_t *p) {
 }
 
 uint32_t Extend(uint32_t crc, const char* buf, size_t size) {
+#if defined(__x86_64__) || defined(__i386__)
+  if (kUseSSE42) return ExtendSSE42(crc, buf, size);
+#endif
   const uint8_t *p = reinterpret_cast<const uint8_t *>(buf);
   const uint8_t *e = p + size;
   uint32_t l = crc ^ 0xffffffffu;

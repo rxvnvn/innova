@@ -13,6 +13,7 @@
 #include "blockindex_shadow_startup.h"
 #include "txdb.h"
 #include "main.h"
+#include "ibdmetrics.h"
 #include "wallet.h"
 #include "init.h"
 
@@ -479,8 +480,20 @@ static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
                 return -1; // authority failure -> fail closed
             if (snap.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
             {
+                // BLOCK-100000 ROOT CAUSE (2026-10-10): the last-modifier
+                // generation TIME must be the generation BLOCK's own header time
+                // (snap.nTime), exactly as legacy GetLastStakeModifier does
+                // (nModifierTime = pindex->GetBlockTime(); kernel.cpp). Returning
+                // snap.nStakeModifierTime here reads the derived-memo field, which
+                // is 0 for the bootstrap GENESIS, so block 1 resolves last_t=0,
+                // concludes "new modifier interval" vs block 1's time, and falsely
+                // REGENERATES the modifier (mod=1, BLOCK_STAKE_MODIFIER set) instead
+                // of inheriting genesis' mod=0. The whole checksum recurrence then
+                // diverges from block 1 (h1 checksum e1459c6b vs canonical
+                // bc4b99b6) and block 100000 fails the 0xcf12d0aa checkpoint.
+                // snap.nTime is the correct, always-populated block-header time.
                 nStakeModifier = snap.nStakeModifier;
-                nModifierTime  = (int64_t)snap.nStakeModifierTime;
+                nModifierTime  = (int64_t)snap.nTime;
                 return 1;
             }
             if (snap.height == 0 || snap.hashPrev == 0)
@@ -597,7 +610,19 @@ bool ComputeNextStakeModifier(const CBlockIndex* pindexPrev, uint64_t& nStakeMod
         printf("ComputeNextStakeModifier: prev modifier=0x%016" PRIx64" time=%s\n", nStakeModifier, DateTimeStrFormat(nModifierTime).c_str());
     }
     if (nModifierTime / nModifierInterval >= pindexPrev->GetBlockTime() / nModifierInterval)
+    {
+        if (AcceptBlockRejectTraceEnabled() &&
+            (pindexPrev->nHeight <= 3 || pindexPrev->nHeight >= 99995))
+            printf("SMOD h=%d last_mod=0x%016llx last_t=%lld cur_t=%lld SAME_INTERVAL inherits mod=0x%016llx gen=0\n",
+                   pindexPrev->nHeight+1, (unsigned long long)nStakeModifier, (long long)nModifierTime,
+                   (long long)pindexPrev->GetBlockTime(), (unsigned long long)nStakeModifier);
         return true;
+    }
+    if (AcceptBlockRejectTraceEnabled() &&
+        (pindexPrev->nHeight <= 3 || pindexPrev->nHeight >= 99995))
+        printf("SMOD h=%d last_mod=0x%016llx last_t=%lld cur_t=%lld NEW_INTERVAL -> candidates\n",
+               pindexPrev->nHeight+1, (unsigned long long)nStakeModifier, (long long)nModifierTime,
+               (long long)pindexPrev->GetBlockTime());
 
     // Candidate block collection. Bounded by CHAIN TIME (nSelectionIntervalStart)
     // in BOTH providers - never by a fixed height depth: the window can span
@@ -1133,20 +1158,42 @@ static int IsBlockInCandidateAncestryNavigated(const uint256& sourceHash,
     // or drop to a height at/below the source (a valid chain only extends
     // upward, so once we pass the source height without a match the source is
     // not on this branch).
+    // Walk is O(1): membership = (tip's ancestor at source.height == source).
+    // CORRECTION #2 (2026-10-10): previously this resolved the tip then walked DOWN
+    // ONE PARENT SNAPSHOT PER LOOKUP (GetParentR) until the source height -- an
+    // O(distance-from-tip) cost repeated on EVERY accepted PoS block. Instrumented
+    // counters measured ~4,181 GetParentR ancestry steps per accepted block
+    // (stake_source_ancestry_steps 32.6M vs calls 7.9k). GetAncestorR resolves the
+    // tip's ancestor at a given height in O(1) for the active chain (active.dat /
+    // GetActiveByHeight), giving bit-equivalent membership without the per-ancestor
+    // reads. Side branches fall back to the O(depth) walk inside GetAncestorR --
+    // identical result, moved to the rare side-chain case only. Consensus
+    // accepted/rejected is unchanged; every authority failure fails closed.
     const BlockIndexLogicalId tipLogical(pindexPrev->GetBlockHash());
-    ColdHotSeamSnapshot cur;
-    if (nav->ResolveLogicalR(tipLogical, &cur, &err) != COLD_HOT_SEAM_OK)
-        return -1;
-    for (;;)
+    ColdHotSeamSnapshot tip;
     {
-        if (cur.snapshot.hash == sourceHash && cur.snapshot.height == source.snapshot.height)
-            return 1;
-        if (!cur.snapshot.hasParent || cur.snapshot.height <= source.snapshot.height)
-            return 0;
-        const ColdHotSeamResult pr = nav->GetParentR(cur.ref, &cur, &err);
-        if (pr != COLD_HOT_SEAM_OK)
+        std::string errTip;
+        if (nav->ResolveLogicalR(tipLogical, &tip, &errTip) != COLD_HOT_SEAM_OK)
             return -1;
+        if (!tip.snapshot.found)
+            return -1; // FAIL CLOSED on unresolvable tip
     }
+    if (source.snapshot.height > tip.snapshot.height)
+        return 0; // source deeper than tip -> cannot be an ancestor
+    ibdmetrics::Get().stake_source_ancestry_calls.fetch_add(1, std::memory_order_relaxed);
+    ColdHotSeamSnapshot ancestor;
+    {
+        std::string errAnc;
+        const ColdHotSeamResult ar = nav->GetAncestorR(
+            BlockIndexNavigationRef::Hot(tipLogical), (int)source.snapshot.height,
+            &ancestor, &errAnc);
+        if (ar != COLD_HOT_SEAM_OK)
+            return -1; // authority failure / corrupt -> FAIL CLOSED
+    }
+    if (!ancestor.snapshot.found)
+        return 0;
+    return (ancestor.snapshot.hash == sourceHash &&
+            ancestor.snapshot.height == source.snapshot.height) ? 1 : 0;
 }
 
 StakingAncestorStatus GetStakingAncestorSnapshot(const CBlockIndex* pindexPrev, int targetHeight,
@@ -1500,6 +1547,11 @@ unsigned int GetStakeModifierChecksum(const CBlockIndex* pindex)
     if (pindex->pprev)
         ss << pindex->pprev->nStakeModifierChecksum;
     ss << pindex->nFlags << (pindex->IsProofOfStake() ? pindex->hashProof : 0) << pindex->nStakeModifier;
+    if (pindex->nHeight == 100000)
+        printf("KMK_STREAM h=%d nFlags=%08x pos=%d mod=%016llx ss_hex=%s\n",
+               pindex->nHeight, (unsigned int)pindex->nFlags, pindex->IsProofOfStake()?1:0,
+               (unsigned long long)pindex->nStakeModifier,
+               HexStr(ss.begin(), ss.end()).c_str());
     uint256 hashChecksum = Hash(ss.begin(), ss.end());
     hashChecksum >>= (256 - 32);
     return hashChecksum.Get64();

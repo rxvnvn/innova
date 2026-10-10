@@ -94,4 +94,55 @@ BOOST_AUTO_TEST_CASE(legacy_vs_optimized_equivalent)
     mapArgs["-stakemodifieropt"] = oldOpt;
 }
 
+BOOST_AUTO_TEST_CASE(block1_canonical_checksum_boundary_real_mainnet_anchors)
+{
+    // BLOCK-100000 FIRST-DIVERGENCE REGRESSION GATE (2026-10-10).
+    // The V2 by-value ResolveLastStakeModifierByValue used to surface genesis'
+    // nStakeModifierTime (= 0) as the last-modifier generation time, so block 1
+    // falsely "regenerated" the stake modifier: nStakeModifier=1 and
+    // nFlags=BLOCK_STAKE_MODIFIER(0x4)|ENTROPY(0x2)=0x6. That produces the
+    // DIVERGENT block-1 checksum 0xe1459c6b and poisons every later checksum,
+    // so block 100000 fails the 0xcf12d0aa checkpoint. The canonical chain has
+    // block 1 INHERIT genesis' modifier (nStakeModifier=0, nFlags=0x2 only),
+    // giving the canonical checksum 0xbc4b99b6. These are REAL-MAINNET anchor
+    // values (verified against the authoritative local reference node via
+    // getstakemodifiercheckpoints). If this test fails, modifier-generation
+    // provenance at the genesis boundary has regressed.
+    uint256 genesisHash = GetGenesisBlockHash();
+    CBlockIndex genesis;
+    genesis.phashBlock = &genesisHash;
+    genesis.nHeight = 0;
+    genesis.pprev = NULL;
+    genesis.nTime = 1576165389;                 // mainnet genesis time
+    genesis.nFlags = BLOCK_STAKE_ENTROPY | BLOCK_STAKE_MODIFIER; // 0x6, PoW
+    genesis.nStakeModifier = 0;
+    genesis.nStakeModifierChecksum = 0;
+    // Genesis (parentless, PoW, mod=0) must be the canonical seed.
+    const unsigned int csumGenesis = GetStakeModifierChecksum(&genesis);
+    BOOST_CHECK_EQUAL(csumGenesis, 0x0e00670bu);
+
+    // Canonical block 1: INHERITS genesis' modifier (mod=0), nFlags=ENTROPY only.
+    CBlockIndex b1;
+    b1.phashBlock = NULL;
+    b1.pprev = &genesis;
+    b1.nHeight = 1;
+    b1.nFlags = BLOCK_STAKE_ENTROPY;           // 0x2, PoW (no PROOF_OF_STAKE, no STAKE_MODIFIER)
+    b1.nStakeModifier = 0;                     // inherited, NOT regenerated
+    genesis.nStakeModifierChecksum = csumGenesis; // canonical parent seed
+    unsigned int cB1 = GetStakeModifierChecksum(&b1);
+    BOOST_CHECK_EQUAL(cB1, 0xbc4b99b6u);       // canonical block-1 checksum
+
+    // Guard: assert the divergent input (the pre-fix bug) does NOT equal canonical,
+    // so a future regression to false regeneration is caught as a checksum change.
+    CBlockIndex b1_div;
+    b1_div.phashBlock = NULL;
+    b1_div.pprev = &genesis;
+    b1_div.nHeight = 1;
+    b1_div.nFlags = BLOCK_STAKE_MODIFIER | BLOCK_STAKE_ENTROPY; // 0x6 (false regeneration)
+    b1_div.nStakeModifier = 1;                 // falsely regenerated
+    unsigned int cB1_div = GetStakeModifierChecksum(&b1_div);
+    BOOST_CHECK_EQUAL(cB1_div, 0xe1459c6bu);   // the known divergent value
+    BOOST_CHECK(cB1_div != cB1);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

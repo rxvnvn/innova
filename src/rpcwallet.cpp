@@ -447,6 +447,8 @@ Value getinfo(const Array& params, bool fHelp)
         ibd.push_back(Pair("pipeline_drained_skip_not_ahead", metrics.pipeline_drained_skip_not_ahead));
         ibd.push_back(Pair("pipeline_drained_skip_getblocks_10s_cooldown", metrics.pipeline_drained_skip_getblocks_10s_cooldown));
         ibd.push_back(Pair("pipeline_drained_skip_other_condition", metrics.pipeline_drained_skip_other_condition));
+        ibd.push_back(Pair("stake_source_ancestry_calls", metrics.stake_source_ancestry_calls));
+        ibd.push_back(Pair("stake_source_ancestry_steps", metrics.stake_source_ancestry_steps));
         ibd.push_back(Pair("pushgetblocks_dedup_5s_skips", metrics.pushgetblocks_dedup_5s_skips));
 
         ibd.push_back(Pair("getblocks_decision_attempts_other", metrics.getblocks_decision_attempts_other));

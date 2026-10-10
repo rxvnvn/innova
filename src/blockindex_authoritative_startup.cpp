@@ -64,6 +64,10 @@ bool PublishStartupGlobals(AuthoritativeStartupContext& ctx, std::string* error)
     // pindexBest / pindexGenesisBlock -> bootstrap-owned permanent anchors.
     pindexBest = best;
     pindexGenesisBlock = genesis;
+    printf("SMCHK_BOOT: genesis_cs=%08x hasPoS=%d hash=%s\n",
+           (unsigned int)genesis->nStakeModifierChecksum,
+           genesis->IsProofOfStake() ? 1 : 0,
+           genesis->GetBlockHash().ToString().substr(0,16).c_str());
     nBestHeight = best->nHeight;
     hashBestChain = best->GetBlockHash();
     nBestChainTrust = best->nChainTrust;

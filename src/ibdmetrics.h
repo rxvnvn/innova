@@ -102,6 +102,10 @@ struct IBDMetricsSnapshot
     int64_t pipeline_drained_skip_not_ahead;
     int64_t pipeline_drained_skip_getblocks_10s_cooldown;
     int64_t pipeline_drained_skip_other_condition;
+    // Per-block stake-source candidate-ancestry navigation (kernel.cpp
+    // IsBlockInCandidateAncestryNavigated): calls and total parent-walk steps.
+    int64_t stake_source_ancestry_calls;
+    int64_t stake_source_ancestry_steps;
     // Same event as getblocks_dedup_skips; retained for continuity with the
     // earlier PushGetBlocks-specific counter name.
     int64_t pushgetblocks_dedup_5s_skips;
@@ -440,6 +444,8 @@ struct Counters
     std::atomic<int64_t> pipeline_drained_skip_not_ahead;
     std::atomic<int64_t> pipeline_drained_skip_getblocks_10s_cooldown;
     std::atomic<int64_t> pipeline_drained_skip_other_condition;
+    std::atomic<int64_t> stake_source_ancestry_calls;
+    std::atomic<int64_t> stake_source_ancestry_steps;
     // Same event as getblocks_dedup_skips; retained for continuity with the
     // earlier PushGetBlocks-specific counter name.
     std::atomic<int64_t> pushgetblocks_dedup_5s_skips;

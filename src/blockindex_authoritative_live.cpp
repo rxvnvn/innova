@@ -7,6 +7,8 @@
 #include "blockindex_hot_owner.h"
 #include "blockindex_startup_bootstrap.h"
 #include "blockindex_accessor.h"
+#include "kernel.h"
+#include "main.h"
 
 #include <boost/filesystem.hpp>
 
@@ -570,6 +572,16 @@ CBlockIndex* FullFromSnapshot(const BlockIndexSnapshot& s, uint256* ownHash)
         p->nStakeModifierTime = s.nStakeModifierTime;
     if (s.hasStakeModifierChecksum)
         p->nStakeModifierChecksum = s.nStakeModifierChecksum;
+    // BLOCK-100000 RECURRENCE FIX: the live/tip materializer must ALWAYS surface
+    // the canonical genesis stake-modifier checksum. On a fresh datadir the
+    // genesis derived-checksum entry can be absent in the live/tip store, so
+    // hasStakeModifierChecksum==false leaves nStakeModifierChecksum=0 here and
+    // block 1 (and the whole live chain) computes a NON-canonical checksum
+    // recurrence -> the 100000 stake-modifier checkpoint rejects. Force the
+    // canonical value (GetStakeModifierChecksum(genesis)==0x0e00670b) whenever
+    // we materialize the canonical genesis block.
+    if (p->nHeight == 0 && p->GetBlockHash() == GetGenesisBlockHash())
+        p->nStakeModifierChecksum = GetStakeModifierChecksum(p);
     if (s.fProofOfStake)
         p->nFlags |= CBlockIndex::BLOCK_PROOF_OF_STAKE;
     return p;
