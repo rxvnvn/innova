@@ -296,4 +296,27 @@ BOOST_AUTO_TEST_CASE(u6_r3g_rejects_crc_valid_but_semantically_invalid_record)
       BOOST_CHECK(openErr.find("authoritative records integrity failure") != std::string::npos); }
 }
 
+BOOST_AUTO_TEST_CASE(c1_current_marker_cache_invalidates_on_selection_change)
+{
+    // R2-PERF (C1/LOCATOR): CurrentSelectionChanged must keep returning the
+    // cached verdict across repeated calls (no false change), yet MUST detect a
+    // real CURRENT rewrite (stat change) even with the cache populated. This
+    // guards the optimization that stops the per-lookup blockindex-current read.
+    boost::filesystem::path root=UniqueRoot();BuildSelected(root);BlockIndexV2Reader r;Open(root,&r);std::string e;
+    // fill + exercise cache hits: no selection change -> stable false
+    BOOST_CHECK(!r.CurrentSelectionChanged(&e));
+    BOOST_CHECK(!r.CurrentSelectionChanged(&e));
+    BOOST_CHECK(!r.CurrentSelectionChanged(&e));
+    // simulate a selection rewrite (mtime change) -> cache must invalidate+redetect
+    BlockIndexCurrentRecord rec; rec.generation = 2;
+    std::string out;
+    BOOST_REQUIRE_MESSAGE(EncodeBlockIndexCurrentRecord(rec,&out,&e),e);
+    {
+        std::ofstream f((root/"blockindex-current").c_str(), std::ios::binary|std::ios::trunc);
+        f.write(out.data(), (std::streamsize)out.size()); f.close();
+    }
+    BOOST_CHECK_MESSAGE(r.CurrentSelectionChanged(&e),
+        "current-marker rewrite must be detected despite the selection cache");
+}
+
 BOOST_AUTO_TEST_SUITE_END()

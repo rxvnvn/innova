@@ -465,4 +465,47 @@ BlockIndexV2ReadStatus BlockIndexV2Reader::GetStakeModifierChecksum(BlockIndexId
 
 BlockIndexV2ReadStatus BlockIndexV2Reader::FindFork(BlockIndexId a,BlockIndexId b,BlockIndexSnapshot*out,std::string*error)const { BlockIndexSnapshot x,y; BlockIndexV2ReadStatus r=GetRecordById(a,&x,error);if(r!=1)return r;r=GetRecordById(b,&y,error);if(r!=1)return r;while(x.height>y.height){r=GetParent(x.id,&x,error);if(r!=1)return r;}while(y.height>x.height){r=GetParent(y.id,&y,error);if(r!=1)return r;}while(x.hash!=y.hash){r=GetParent(x.id,&x,error);if(r!=1)return r;r=GetParent(y.id,&y,error);if(r!=1)return r;}*out=x;return BLOCK_INDEX_V2_READ_FOUND; }
 BlockIndexSnapshot BlockIndexV2Reader::GetTip() const { BlockIndexSnapshot s; std::string e; GetRecordById(manifest.committedTipId,&s,&e); if(s.found)s.fInMainChain=true; return s; }
-bool BlockIndexV2Reader::CurrentSelectionChanged(std::string* error) const { LOCK(cs); if(!open)return Fail(error,"reader is not open"); BlockIndexCurrentRecord c; BlockIndexLifecycleStatus st=BlockIndexGenerationManager::ReadCurrent(rootPath,&c,error); return st!=BLOCK_INDEX_LIFECYCLE_OK||c.generation!=generation; }
+bool BlockIndexV2Reader::CurrentSelectionChanged(std::string* error) const
+{
+    LOCK(cs);
+    if (!open)
+        return Fail(error, "reader is not open");
+    // R2-PERF (C1/LOCATOR): cache the CURRENT marker so we don't pay a per-call
+    // file open+fread+fclose on EVERY by-value logical resolve (the IBD hot path).
+    // CURRENT only changes via lifecycle Publish/Select (atomic temp+rename ->
+    // new inode/mtime), so a cheap lstat comparison each call detects any real
+    // transition and forces a re-read; a stat match returns the cached verdict
+    // without touching the file. Semantics unchanged (fail-closed; NEW/NOT_PUBLISHED
+    // still detected on the first post-change call).
+    const std::string markerPath = rootPath + "/" + BLOCK_INDEX_CURRENT_FILE_NAME;
+    struct stat st;
+    if (::lstat(markerPath.c_str(), &st) == 0)
+    {
+        const bool same =
+            currentSelectionCached_.valid &&
+            currentSelectionCached_.dev == st.st_dev &&
+            currentSelectionCached_.ino == st.st_ino &&
+            currentSelectionCached_.size == st.st_size &&
+            currentSelectionCached_.mtimeSec == st.st_mtim.tv_sec &&
+            currentSelectionCached_.mtimeNsec == st.st_mtim.tv_nsec;
+        if (same)
+            return currentSelectionCached_.changed;
+        BlockIndexCurrentRecord c;
+        BlockIndexLifecycleStatus st2 =
+            BlockIndexGenerationManager::ReadCurrent(rootPath, &c, error);
+        const bool changed = (st2 != BLOCK_INDEX_LIFECYCLE_OK) || c.generation != generation;
+        currentSelectionCached_.valid = true;
+        currentSelectionCached_.changed = changed;
+        currentSelectionCached_.dev = st.st_dev;
+        currentSelectionCached_.ino = st.st_ino;
+        currentSelectionCached_.size = st.st_size;
+        currentSelectionCached_.mtimeSec = st.st_mtim.tv_sec;
+        currentSelectionCached_.mtimeNsec = st.st_mtim.tv_nsec;
+        return changed;
+    }
+    // Marker absent -> never cache; always authoritative (NOT_PUBLISHED etc.).
+    BlockIndexCurrentRecord c;
+    BlockIndexLifecycleStatus st2 =
+        BlockIndexGenerationManager::ReadCurrent(rootPath, &c, error);
+    return (st2 != BLOCK_INDEX_LIFECYCLE_OK) || c.generation != generation;
+}

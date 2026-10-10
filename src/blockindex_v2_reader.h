@@ -11,6 +11,8 @@
 #include <functional>
 #include <string>
 #include <map>
+#include <sys/types.h>
+#include <sys/stat.h>
 
 // A.8: one immutable, CURRENT-selected generation; pointer-free historical API.
 // This reader is semantic/logical read-only. It does not publish/select/build,
@@ -130,6 +132,27 @@ private:
     mutable std::map<BlockIndexId, CacheEntry> cache;
     mutable std::list<BlockIndexId> lru;
     mutable BlockIndexV2ReaderCacheStats stats;
+    // R2-PERF (C1/LOCATOR): bounded cache of the CURRENT-selection marker so
+    // CurrentSelectionChanged stops re-reading <root>/blockindex-current (a
+    // per-call file open+fread+fclose) on EVERY by-value logical resolve — the
+    // IBD/P2P-locator hot path. CURRENT only changes via lifecycle Publish/Select
+    // (atomic temp+rename -> new inode/mtime), so a per-call lstat comparison
+    // detects any genuine rewrite and rebuilds the cache; a stat match returns
+    // the cached verdict without touching the file. Preserves exact semantics
+    // (fail-closed, NEW marker detection), adds no residency, O(1) memory.
+    struct CurrentSelectionCache {
+        bool valid;
+        bool changed;
+        dev_t dev;
+        ino_t ino;
+        off_t size;
+        long mtimeSec;
+        long mtimeNsec;
+        CurrentSelectionCache()
+            : valid(false), changed(true), dev(0), ino(0), size(0),
+              mtimeSec(0), mtimeNsec(0) {}
+    };
+    mutable CurrentSelectionCache currentSelectionCached_;
     BlockIndexSnapshot SnapshotFromRecord(BlockIndexId id, const BlockIndexRecord& record, bool activeRecord) const;
     void CachePut(const BlockIndexSnapshot& value) const;
 };
