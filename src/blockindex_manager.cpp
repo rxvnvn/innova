@@ -178,16 +178,47 @@ BlockIndexManagerStatus BlockIndexManager::GetAncestor(const uint256& hash, int 
         if (error) *error = "block index manager: not open";
         return BLOCK_INDEX_MANAGER_NOT_OPEN;
     }
-    // Composite: bounded by-value parent walk (bounded by |height - target|).
+    // Composite: ancestor resolution with an O(1) fast path. When `hash` denotes
+    // the ACTIVE chain (verified in O(1) via the active-height index: the active
+    // block at cur.height equals `cur`), the block at exactly targetHeight on the
+    // active chain is deterministically its ancestor -- resolve it directly by
+    // height instead of the O(|height-target|) by-value parent walk, which pays a
+    // LevelDB hash-index read (cache-miss + crc32c) on EVERY step. This is the
+    // P2P locator hot path (GetLocatorHashes).
+    // Returns byte-for-byte the identical snapshot the legacy walk would yield for
+    // the active chain; non-active (side-branch) hashes or a height-index failure
+    // fall back to the exact legacy walk, preserving equivalence and fail-closed
+    // semantics (targetHeight < 0 still resolves to NOT_FOUND).
     BlockIndexSnapshot cur;
     BlockIndexManagerStatus st = LookupByHash(hash, &cur, error);
     if (st != BLOCK_INDEX_MANAGER_OK)
         return st;
-    if (targetHeight < 0)
+    if (cur.height < targetHeight)
     {
-        if (error) *error = "block index manager: invalid target height";
+        if (error) *error = "block index manager: target height not an ancestor";
         return BLOCK_INDEX_MANAGER_NOT_FOUND;
     }
+    if (cur.height == targetHeight)
+    {
+        if (out) *out = cur;
+        return BLOCK_INDEX_MANAGER_OK;
+    }
+    if (targetHeight >= 0)
+    {
+        std::string fe;
+        BlockIndexSnapshot activeAtCur;
+        if (GetActiveByHeight(cur.height, &activeAtCur, &fe) == BLOCK_INDEX_MANAGER_OK &&
+            activeAtCur.hash == cur.hash)
+        {
+            BlockIndexSnapshot av;
+            if (GetActiveByHeight(targetHeight, &av, &fe) == BLOCK_INDEX_MANAGER_OK)
+            {
+                if (out) *out = av;
+                return BLOCK_INDEX_MANAGER_OK;
+            }
+        }
+    }
+    // Fallback: legacy by-value parent walk (side branch or height-index failure).
     while (cur.height > targetHeight)
     {
         BlockIndexSnapshot parent;
