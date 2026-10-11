@@ -562,6 +562,7 @@ TEST_OBJS= \
     obj/test/invalidate_reconsider_tests.o \
     obj/test/blockindex_accessor_tests.o \
     obj/test/blockindex_manager_tests.o \
+    obj/test/blockindex_committed_tip_snapshot_tests.o \
     obj/test/blockindex_startup_authority_tests.o \
     obj/test/blockindex_startup_seam_tests.o \
     obj/test/blockindex_startup_bootstrap_tests.o \

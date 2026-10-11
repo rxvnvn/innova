@@ -16,6 +16,8 @@
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
+#include <atomic>
+#include <memory>
 
 #include <algorithm>
 #include <cstdio>
@@ -977,6 +979,14 @@ struct BlockIndexTipAuthority::Impl
 
     bool open;
 
+    // C11: the atomically-published immutable committed-tip snapshot. Written
+    // ONLY by PublishCommittedSnapshot() via std::atomic_store (release) after a
+    // successful durable commit; read via std::atomic_load (acquire) WITHOUT
+    // cs_main. Every access goes through the atomic free functions (never a plain
+    // read/write of this shared_ptr), so the publication is race-free and each
+    // reader observes one whole committed state.
+    std::shared_ptr<const BlockIndexCommittedTipSnapshot> committedSnap;
+
     // C6 Fix B: digest of the operator-invalid log as last durably written to
     // tip-invalid.dat. While the in-memory log matches this, the per-block
     // AppendBatch skips the byte-identical WriteInvalidFile (pure redundant
@@ -1268,7 +1278,27 @@ struct BlockIndexTipAuthority::Impl
             return SetError(error, "injected meta directory sync failure");
         if (!SyncDirectoryChecked(tipDir, error))
             return false;
+        // C11: the durable commit has succeeded -- publish the coherent
+        // committed-tip snapshot now so unlocked readers observe the NEW
+        // committed tip. This is strictly AFTER the commit point (never before);
+        // a failed WriteMeta never publishes.
+        PublishCommittedSnapshot();
         return true;
+    }
+
+    // C11: build a fresh immutable committed-tip snapshot from the just-committed
+    // meta and swap it in with a release store. Readers acquire-load it and
+    // therefore synchronize-with this publication, observing one coherent
+    // committed state (never a torn hash/height across a concurrent append).
+    void PublishCommittedSnapshot()
+    {
+        std::shared_ptr<BlockIndexCommittedTipSnapshot> s(new BlockIndexCommittedTipSnapshot());
+        s->valid = (meta.tipHash != uint256(0));
+        s->tipHeight = s->valid ? meta.tipHeight : (int32_t)-1;
+        s->tipHash = meta.tipHash;
+        s->baseGeneration = meta.baseGeneration;
+        std::atomic_store(&committedSnap,
+                          std::shared_ptr<const BlockIndexCommittedTipSnapshot>(s));
     }
 }; // struct Impl
 
@@ -1743,6 +1773,9 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
     else
         i->invalidDiskDurable = false;
     i->open = true;
+    // C11: publish the initial committed-tip snapshot from the committed meta so
+    // the boot->first-append window never reports spurious unavailability.
+    i->PublishCommittedSnapshot();
     ClearError(error);
     return true;
 }
@@ -2525,6 +2558,19 @@ BlockIndexTipRead BlockIndexTipAuthority::GetTip() const
     r.active = true;
     r.height = rr.height;
     return r;
+}
+
+BlockIndexCommittedTipSnapshot BlockIndexTipAuthority::CommittedTipSnapshot() const
+{
+    // C11: atomic acquire load of the publication-swapped immutable snapshot.
+    // No cs_main required; this synchronizes-with the writer's release store in
+    // PublishCommittedSnapshot(), so the caller observes one whole committed
+    // state (never a torn hash/height across a concurrent AppendBatch).
+    std::shared_ptr<const BlockIndexCommittedTipSnapshot> s =
+        std::atomic_load(&impl->committedSnap);
+    if (!s)
+        return BlockIndexCommittedTipSnapshot(); // no committed tip yet (fail closed)
+    return *s;
 }
 
 BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std::string* error) const

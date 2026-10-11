@@ -294,6 +294,26 @@ BlockIndexManagerStatus BlockIndexManager::BestTipHash(uint256* out, std::string
 {
     if (!out)
         return BLOCK_INDEX_MANAGER_AUTHORITY_FAILURE;
+    if (UseComposite())
+    {
+        // C11: read the committed tip hash from the coherent immutable snapshot
+        // (no cs_main, no mutable-tip lookup -> no torn read). A concurrent
+        // append/reorg may be in flight; we observe only committed states.
+        const BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        const BlockIndexTipAuthority* tipAuth =
+            (live != NULL && live->IsOpen()) ? live->TipAuthority() : NULL;
+        if (tipAuth != NULL)
+        {
+            const BlockIndexCommittedTipSnapshot s = tipAuth->CommittedTipSnapshot();
+            if (s.valid)
+            {
+                *out = s.tipHash;
+                return BLOCK_INDEX_MANAGER_OK;
+            }
+        }
+        // No committed active tip yet (bootstrap/empty): fall through to the
+        // existing GetTip path, which preserves prior behavior.
+    }
     BlockIndexSnapshot tip;
     BlockIndexManagerStatus st = GetTip(&tip, error);
     if (st != BLOCK_INDEX_MANAGER_OK)
@@ -306,6 +326,26 @@ BlockIndexManagerStatus BlockIndexManager::ActiveTipHeight(int* out, std::string
 {
     if (!out)
         return BLOCK_INDEX_MANAGER_AUTHORITY_FAILURE;
+    if (UseComposite())
+    {
+        // C11: read the committed tip height from the coherent immutable snapshot
+        // DIRECTLY (no cs_main, no mutable-tip lookup, no height reconstruction
+        // via a concurrently-mutated record -> no torn read).
+        const BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        const BlockIndexTipAuthority* tipAuth =
+            (live != NULL && live->IsOpen()) ? live->TipAuthority() : NULL;
+        if (tipAuth != NULL)
+        {
+            const BlockIndexCommittedTipSnapshot s = tipAuth->CommittedTipSnapshot();
+            if (s.valid)
+            {
+                *out = s.tipHeight;
+                return BLOCK_INDEX_MANAGER_OK;
+            }
+        }
+        // No committed active tip yet (bootstrap/empty): fall through to the
+        // existing GetTip path, which preserves prior behavior.
+    }
     BlockIndexSnapshot tip;
     BlockIndexManagerStatus st = GetTip(&tip, error);
     if (st != BLOCK_INDEX_MANAGER_OK)

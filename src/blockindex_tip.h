@@ -153,6 +153,24 @@ struct BlockIndexTipRead
           height(-1) {}
 };
 
+// C11: an immutable, self-contained snapshot of the COMMITTED active tip. It is
+// published atomically at the durable tip.meta commit point (never before) and
+// read by-value WITHOUT holding cs_main, so unlocked RPC/P2P consumers (e.g.
+// getblockcount / getbestblockhash) observe EITHER the previous committed tip OR
+// the newly committed tip -- never a partially-updated combination. All fields
+// come from ONE tip.meta generation, so they are mutually consistent (no torn
+// hash/height across a concurrent AppendBatch).
+struct BlockIndexCommittedTipSnapshot
+{
+    bool     valid;          // a committed active tip exists
+    int32_t  tipHeight;      // committed active-chain tip height
+    uint256  tipHash;        // committed active-chain tip block hash
+    uint64_t baseGeneration; // immutable base generation this tip extends
+
+    BlockIndexCommittedTipSnapshot()
+        : valid(false), tipHeight(-1), tipHash(0), baseGeneration(0) {}
+};
+
 class BlockIndexTipAuthority
 {
 public:
@@ -231,6 +249,13 @@ public:
     uint64_t BaseRecordCount() const;
     int32_t  TipHeight() const;
     uint256  TipHash() const;
+    // C11: coherent committed-tip snapshot, safe to read WITHOUT cs_main.
+    // Returns the last durably-committed tip BY VALUE (an atomic acquire load of
+    // a publication-swapped immutable object). A concurrent append/reorg may be
+    // in flight; the caller observes only committed states. valid==false means no
+    // committed active tip yet (fail closed). Never re-derives height via a
+    // mutable-tip lookup.
+    BlockIndexCommittedTipSnapshot CommittedTipSnapshot() const;
     uint64_t TipRecordCount() const;
     uint8_t  ActiveFence() const;
     bool     IsOpen() const;
