@@ -773,6 +773,7 @@ bool CTxDB::LoadBlockIndex()
         // Construct block index object
         CBlockIndex* pindexNew    = InsertBlockIndex(blockHash);
         pindexNew->pprev          = InsertBlockIndex(diskindex.hashPrev);
+        pindexNew->hashPrevStable = diskindex.hashPrev;   // C12: pointer-free parent identity (survives edge release / restart)
         pindexNew->pnext          = InsertBlockIndex(diskindex.hashNext);
         g_res_pprev_links++;
         g_res_pnext_links++;

@@ -2850,6 +2850,84 @@ BOOST_AUTO_TEST_CASE(r2d_p09_real_s0_seam_deep_reorg_boundary)
     }
 }
 
+// C12 REGRESSION (RED on the pre-C12/C11 baseline, GREEN after the by-value fork
+// ancestry repair): a same-height COMPETING best-chain replacement whose
+// CBlockIndex is SPARSE-HOT (pprev/pskip released, exactly as AddToBlockIndex's
+// operation-scoped edge release leaves an accepted block, main.cpp:7961-7965)
+// must still cut over. The legacy GetAncestor-by-pointer common-ancestor search
+// returns NULL for the released pprev and fails closed with "no common ancestor";
+// the by-value resolution (hashPrevStable + V2 authority) must find the real
+// common ancestor and succeed, promoting the higher-work competing block. This
+// reproduces the live 0000000a5ba-vs-59cf33fe same-height cutover (trust 20 vs 10).
+BOOST_AUTO_TEST_CASE(c12_p09_sparse_hot_cutover_resolves_fork_by_value)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+
+    const uint256 actHash(0x0AC70AC7UL);   // published active block at S+1
+    const uint256 sideHash(0x5A1D5A1DUL);  // competing (HIGHER-work) block at S+1
+    R2DAppendActive(live, actHash, fx.active[S], S + 1, uint256(10));  // published active tip (lower work)
+    R2DAppendSide(live, sideHash, fx.active[S], S + 1, uint256(20));   // competing side record (higher work)
+
+    // SPARSE-HOT CBlockIndex objects: hash identity + pointer-free parent identity
+    // set, raw pprev/pskip released (the by-design V2 sparse-hot shape).
+    CBlockIndex newIdx; newIdx.nHeight = S + 1; newIdx.pprev = NULL; newIdx.pskip = NULL;
+    newIdx.phashBlock = &sideHash; newIdx.hashPrevStable = fx.active[S];
+    CBlockIndex oldIdx; oldIdx.nHeight = S + 1; oldIdx.pprev = NULL; oldIdx.pskip = NULL;
+    oldIdx.phashBlock = &actHash; oldIdx.hashPrevStable = fx.active[S];
+    { LOCK(cs_main); mapBlockIndex[sideHash] = &newIdx; mapBlockIndex[actHash] = &oldIdx; }
+    std::string e;
+    const bool r = PublishAuthoritativeLiveTailCutoverForTesting(live, &newIdx, actHash, &e);
+    { LOCK(cs_main); mapBlockIndex.erase(sideHash); mapBlockIndex.erase(actHash); }  // no dangling
+
+    BOOST_CHECK_MESSAGE(r,
+        "C12: a sparse-hot same-height cutover MUST resolve the fork point BY VALUE "
+        "(released pprev must not fail fork discovery); err=" << e);
+    BOOST_CHECK_MESSAGE(live->TipAuthority()->GetTip().record.hash == sideHash,
+        "C12: the competing candidate must become the published tip after the cutover "
+        "(the cutover promotes the passed candidate; higher-work selection happens in SetBestChain upstream)");
+    BOOST_TEST_MESSAGE("C12_SPARSE_HOT_CUTOVER ok=" << (r ? 1 : 0) << " err=" << e);
+}
+
+// C12 REGRESSION 2 (DEEPER competing branch): a 2-block sparse-hot competing
+// branch. The by-value fork walk must resolve the fork at S and the connect suffix
+// [S+1,S+2] must be built from REAL objects (the S+1 candidate object is registered
+// map-resident so it may enter the consensus connect list; the tip's pprev is
+// released). Exercises the depth>1 connect-suffix path that the depth-1 case does not.
+BOOST_AUTO_TEST_CASE(c12_p09_sparse_hot_cutover_deeper_branch)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+
+    const uint256 act1(0xA1A1A1UL), act2(0xA2A2A2UL);
+    R2DAppendActive(live, act1, fx.active[S], S + 1, uint256(10));
+    R2DAppendActive(live, act2, act1, S + 2, uint256(10));      // published active tip
+    const uint256 side1(0xB1B1B1UL), side2(0xB2B2B2UL);
+    R2DAppendSide(live, side1, fx.active[S], S + 1, uint256(20));
+    R2DAppendSide(live, side2, side1, S + 2, uint256(30));      // competing branch tip
+
+    // SPARSE-HOT objects: the branch tip (side2) has released pprev; its parent
+    // (side1) object is registered map-resident so it can enter the connect list.
+    CBlockIndex t2; t2.nHeight = S + 2; t2.pprev = NULL; t2.pskip = NULL; t2.phashBlock = &side2; t2.hashPrevStable = side1;
+    CBlockIndex t1; t1.nHeight = S + 1; t1.pprev = NULL; t1.pskip = NULL; t1.phashBlock = &side1; t1.hashPrevStable = fx.active[S];
+    CBlockIndex o2; o2.nHeight = S + 2; o2.pprev = NULL; o2.pskip = NULL; o2.phashBlock = &act2;  o2.hashPrevStable = act1;
+    { LOCK(cs_main); mapBlockIndex[side2] = &t2; mapBlockIndex[side1] = &t1; mapBlockIndex[act2] = &o2; }
+    std::string e;
+    const bool r = PublishAuthoritativeLiveTailCutoverForTesting(live, &t2, act2, &e);
+    { LOCK(cs_main); mapBlockIndex.erase(side2); mapBlockIndex.erase(side1); mapBlockIndex.erase(act2); }
+
+    BOOST_CHECK_MESSAGE(r,
+        "C12: a DEEPER sparse-hot cutover must resolve the fork point BY VALUE and build the "
+        "multi-block connect suffix from real objects; err=" << e);
+    BOOST_CHECK_MESSAGE(live->TipAuthority()->GetTip().record.hash == side2,
+        "C12: the deeper competing branch tip must become the published tip");
+    BOOST_TEST_MESSAGE("C12_DEEP_BRANCH ok=" << (r ? 1 : 0) << " err=" << e);
+}
+
 // ---------------------------------------------------------------------------
 // COHORT B: startup-level PM1-P0-01 N1 / N2 (drive the REAL production startup
 // entry). The durable mutable tip claims a post-S tip L>S but the committed

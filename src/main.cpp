@@ -6979,7 +6979,7 @@ bool MainFailpointHitForTesting(const std::string& name)
     return true;
 }
 
-static bool PublishAuthoritativeLiveTailReorg(CBlockIndex* pfork,
+static bool PublishAuthoritativeLiveTailReorg(int nForkHeight,
                                               const std::vector<CBlockIndex*>& vConnect,
                                               std::string* outErr)
 {
@@ -6999,7 +6999,7 @@ static bool PublishAuthoritativeLiveTailReorg(CBlockIndex* pfork,
         reorgHeights.push_back((int32_t)vConnect[i]->nHeight);
     }
     std::string reorgErr;
-    if (!liveAuth->ReorgTo(pfork->nHeight, reorgRecs, reorgDerived, reorgHeights, &reorgErr))
+    if (!liveAuth->ReorgTo(nForkHeight, reorgRecs, reorgDerived, reorgHeights, &reorgErr))
     {
         if (outErr) *outErr = reorgErr;
         return false;
@@ -7007,8 +7007,66 @@ static bool PublishAuthoritativeLiveTailReorg(CBlockIndex* pfork,
     return true;
 }
 
-bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
+// C12 (Reorganization Repair): resolve the parent identity of an index object
+// WITHOUT assuming a live pprev pointer. In BY_VALUE_AUTHORITATIVE mode a
+// resident index object may legitimately have pprev == NULL -- the retained-floor
+// detach (RetireBlockIndexBelowFloor) and the operation-scoped
+// "sparse-hot" edge release (AddToBlockIndex) both drop raw
+// parent edges BY DESIGN while the pointer-free parent identity survives in
+// hashPrevStable (main.h:1466-1474). Preference order:
+//   (1) the live pointer chain  -> REAL map-resident identity, zero copy;
+//   (2) hashPrevStable          -> pointer-free parent hash stamped at accept;
+//   (3) the V2 authority        -> by-value snapshot of PUBLISHED ancestry.
+// *parentObj is set to a REAL map-resident CBlockIndex* when one exists, else
+// NULL (the caller must never substitute a temporary twin in a consensus path).
+// Returns false when no parent identity exists (genesis or a navigation gap) so
+// callers fail closed with a precise diagnostic.
+static bool C12ResolveParentByValue(BlockIndexAuthoritativeLive* live,
+                                    const uint256& hash, int height, const CBlockIndex* obj,
+                                    uint256& parentHash, int& parentHeight, CBlockIndex*& parentObj)
 {
+    parentObj = NULL;
+    if (obj && obj->pprev)
+    {
+        parentHash = obj->pprev->GetBlockHash();
+        parentHeight = obj->pprev->nHeight;
+    }
+    else if (obj && obj->hashPrevStable != uint256(0))
+    {
+        parentHash = obj->hashPrevStable;
+        parentHeight = height - 1;
+    }
+    else if (live)
+    {
+        BlockIndexSnapshot s; std::string e;
+        if (live->ResolveBlockSnapshot(hash, &s, &e) != BlockIndexHotStatus::OK || !s.found || s.height <= 0)
+            return false;
+        parentHash = s.hashPrev;
+        parentHeight = height - 1;
+    }
+    else
+    {
+        return false;
+    }
+    if (parentHash == uint256(0))
+        return false; // genesis: no parent
+    // Attach ONLY a REAL map-resident object: the parent must be map-verified before it
+    // can enter a consensus DisconnectBlock/ConnectBlock list (never a temporary twin,
+    // even when a raw pprev pointer exists). Missing => NULL => the caller fails closed.
+    std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(parentHash);
+    if (it != mapBlockIndex.end())
+        parentObj = it->second;
+    return true;
+}
+
+bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew, bool* pfNavigationFailure)
+{
+    // C12 (operator requirement H): distinguish an infrastructure/navigation failure
+    // (sparse-hot/by-value ancestry not resolvable, or a fork below the representable
+    // window) from a genuine consensus-invalid block. A navigation failure must NEVER
+    // be recorded as invalid trust: callers read *pfNavigationFailure and skip
+    // InvalidChainFound. Both are fail-closed and precede any state mutation.
+    if (pfNavigationFailure) *pfNavigationFailure = false;
     printf("REORGANIZE\n");
 
     // Operator-invalidation gate (defense in depth; SetBestChain precedes every
@@ -7025,18 +7083,66 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     }
 
 
-    // Find the fork
-    CBlockIndex* pfork = pindexBest;
-    CBlockIndex* plonger = pindexNew;
-    while (pfork != plonger)
+    // ---- C12: fork discovery ACROSS the sparse-hot / by-value boundary ----
+    // Resolve the fork point BY HASH, never by raw pointer: a resident object may
+    // legitimately have pprev == NULL (retained-floor detach / operation-scoped
+    // edge release), which made the legacy pointer walk report a spurious
+    // "pfork->pprev is null" for a VALID higher-work cutover. Disconnect/connect
+    // lists are built from REAL map-resident objects so the consensus
+    // DisconnectBlock/ConnectBlock calls keep stable object identity (no twins).
+    int nForkHeight = -1;
+    uint256 forkHash(0);
     {
-        while (plonger->nHeight > pfork->nHeight)
-            if (!(plonger = plonger->pprev))
-                return error("Reorganize() : plonger->pprev is null");
-        if (pfork == plonger)
-            break;
-        if (!(pfork = pfork->pprev))
-            return error("Reorganize() : pfork->pprev is null");
+        BlockIndexAuthoritativeLive* liveAuth =
+            g_fAuthoritativeStartup ? GetAuthoritativeLiveAuthority() : NULL;
+        if (liveAuth && liveAuth->IsOpen())
+        {
+            uint256 nHash = pindexNew->GetBlockHash(); int nH = pindexNew->nHeight; CBlockIndex* nObj = pindexNew;
+            uint256 oHash = pindexBest->GetBlockHash(); int oH = pindexBest->nHeight; CBlockIndex* oObj = pindexBest;
+            const int horizon = liveAuth->Horizon();
+            const long long maxSteps = (long long)(horizon > 0 ? horizon : 2048) * 2 + 64;
+            long long steps = 0;
+            while (nHash != oHash)
+            {
+                if (++steps > maxSteps) { nHash = uint256(0); break; }
+                uint256 ph; int phh; CBlockIndex* pobj = NULL;
+                if (nH >= oH)
+                {
+                    if (!C12ResolveParentByValue(liveAuth, nHash, nH, nObj, ph, phh, pobj)) { nHash = uint256(0); break; }
+                    nHash = ph; nH = phh; nObj = pobj;
+                }
+                else
+                {
+                    if (!C12ResolveParentByValue(liveAuth, oHash, oH, oObj, ph, phh, pobj)) { nHash = uint256(0); break; }
+                    oHash = ph; oH = phh; oObj = pobj;
+                }
+            }
+            if (nHash == uint256(0))
+            {
+                if (pfNavigationFailure) *pfNavigationFailure = true;
+                return error("Reorganize() : authoritative fork discovery failed between best %s (h=%d) and candidate %s (h=%d): unresolvable ancestry or a fork below the representable window (fail closed; no consensus change)",
+                             pindexBest->GetBlockHash().ToString().substr(0,20).c_str(), pindexBest->nHeight,
+                             pindexNew->GetBlockHash().ToString().substr(0,20).c_str(), pindexNew->nHeight);
+            }
+            nForkHeight = nH; forkHash = nHash;
+        }
+        else
+        {
+            // Non-authoritative residual: chains are pointer-complete.
+            CBlockIndex* pfork = pindexBest;
+            CBlockIndex* plonger = pindexNew;
+            while (pfork != plonger)
+            {
+                while (plonger->nHeight > pfork->nHeight)
+                    if (!(plonger = plonger->pprev))
+                        return error("Reorganize() : plonger->pprev is null");
+                if (pfork == plonger)
+                    break;
+                if (!(pfork = pfork->pprev))
+                    return error("Reorganize() : pfork->pprev is null");
+            }
+            nForkHeight = pfork->nHeight; forkHash = pfork->GetBlockHash();
+        }
     }
 
     // V2-R2 (PM1-P0-09): explicit below-base contract. A reorg whose fork point
@@ -7049,25 +7155,53 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
     if (g_fAuthoritativeStartup)
     {
         const int32_t nBaseS = AuthoritativeBaseTipHeight();
-        if (nBaseS >= 0 && pfork->nHeight < nBaseS)
+        if (nBaseS >= 0 && nForkHeight < nBaseS)
             return error("Reorganize() : fork point %d is below the immutable base tip %d; "
                          "below-base reorg requires an explicit rebase/rebuild (V2-R2 fail-closed)",
-                         pfork->nHeight, nBaseS);
+                         nForkHeight, nBaseS);
     }
 
-    // List of what to disconnect
+    // List of what to disconnect (C12: REAL map-resident objects, hash/height
+    // stepped across any released edge; fail closed if an object is needed but not
+    // retained, so no temporary twin ever enters the consensus path).
     vector<CBlockIndex*> vDisconnect;
-    for (CBlockIndex* pindex = pindexBest; pindex != pfork; pindex = pindex->pprev)
+    for (CBlockIndex* pindex = pindexBest; pindex != NULL && pindex->nHeight > nForkHeight; )
+    {
         vDisconnect.push_back(pindex);
+        if (pindex->nHeight - 1 <= nForkHeight)
+            break; // reached the fork point; its object is not needed for disconnect
+        uint256 ph; int phh; CBlockIndex* pobj = NULL;
+        if (!C12ResolveParentByValue(GetAuthoritativeLiveAuthority(), pindex->GetBlockHash(), pindex->nHeight, pindex, ph, phh, pobj) || pobj == NULL)
+        {
+            if (pfNavigationFailure) *pfNavigationFailure = true;
+            return error("Reorganize() : disconnect walk cannot reach the fork point from %s (h=%d): parent not retained (navigation failure; fail closed)",
+                         pindex->GetBlockHash().ToString().substr(0,20).c_str(), pindex->nHeight);
+        }
+        pindex = pobj;
+    }
 
-    // List of what to connect
+    // List of what to connect (C12: real objects; the candidate is a
+    // freshly-accepted map-resident object, its ancestors resolve via pprev /
+    // hashPrevStable).
     vector<CBlockIndex*> vConnect;
-    for (CBlockIndex* pindex = pindexNew; pindex != pfork; pindex = pindex->pprev)
+    for (CBlockIndex* pindex = pindexNew; pindex != NULL && pindex->nHeight > nForkHeight; )
+    {
         vConnect.push_back(pindex);
+        if (pindex->nHeight - 1 <= nForkHeight)
+            break;
+        uint256 ph; int phh; CBlockIndex* pobj = NULL;
+        if (!C12ResolveParentByValue(GetAuthoritativeLiveAuthority(), pindex->GetBlockHash(), pindex->nHeight, pindex, ph, phh, pobj) || pobj == NULL)
+        {
+            if (pfNavigationFailure) *pfNavigationFailure = true;
+            return error("Reorganize() : connect walk cannot reach the fork point from %s (h=%d): parent not retained (navigation failure; fail closed)",
+                         pindex->GetBlockHash().ToString().substr(0,20).c_str(), pindex->nHeight);
+        }
+        pindex = pobj;
+    }
     reverse(vConnect.begin(), vConnect.end());
 
-    printf("REORGANIZE: Disconnect %" PRIszu" blocks; %s..%s\n", vDisconnect.size(), pfork->GetBlockHash().ToString().substr(0,20).c_str(), pindexBest->GetBlockHash().ToString().substr(0,20).c_str());
-    printf("REORGANIZE: Connect %" PRIszu" blocks; %s..%s\n", vConnect.size(), pfork->GetBlockHash().ToString().substr(0,20).c_str(), pindexNew->GetBlockHash().ToString().substr(0,20).c_str());
+    printf("REORGANIZE: Disconnect %" PRIszu" blocks; %s..%s\n", vDisconnect.size(), forkHash.ToString().substr(0,20).c_str(), pindexBest->GetBlockHash().ToString().substr(0,20).c_str());
+    printf("REORGANIZE: Connect %" PRIszu" blocks; %s..%s\n", vConnect.size(), forkHash.ToString().substr(0,20).c_str(), pindexNew->GetBlockHash().ToString().substr(0,20).c_str());
 
     if (SyncTraceEnabled())
     {
@@ -7081,7 +7215,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew)
             vConnectHashes.push_back(pindex->GetBlockHash());
         BlockRequestTraceReorg(
             g_nBlockTraceSourcePeer,
-            pfork->GetBlockHash(), pfork->nHeight,
+            forkHash, nForkHeight,
             pindexBest->GetBlockHash(), pindexBest->nHeight,
             pindexNew->GetBlockHash(), pindexNew->nHeight,
             vDisconnectHashes, vConnectHashes,
@@ -7304,9 +7438,12 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
             g_testS12LastPostponed = (int)vpindexSecondary.size();
 
         // Switch to new best branch
-        if (!Reorganize(txdb, pindexIntermediate))
+        bool fReorgNavFailure = false;
+        if (!Reorganize(txdb, pindexIntermediate, &fReorgNavFailure))
         {
             txdb.TxnAbort();
+            if (fReorgNavFailure)
+                return error("SetBestChain() : Reorganize could not navigate the V2 sparse-hot/by-value ancestry; the candidate is NOT marked consensus-invalid");
             InvalidChainFound(pindexNew);
             return error("SetBestChain() : Reorganize failed");
         }
@@ -7530,28 +7667,49 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
         if (outErr) *outErr = "authoritative-live cutover: published tip not in the block index";
         return false;
     }
-    // Last common ancestor of the published active tip and the new best chain.
-    // V2-R2 (PM1-P0-09): a NULL GetAncestor result (below the retained
-    // materialization floor) must NOT be treated as a common ancestor -- two NULLs
-    // compare equal and would select a bogus fork height, then dereference a NULL
-    // pfork. Require BOTH sides non-NULL for a real common ancestor.
+    // Last common ancestor of the published active tip and the new best chain,
+    // resolved BY HASH across the sparse-hot / by-value boundary (C12). The legacy
+    // GetAncestor-by-pointer walk returns NULL for a tip whose pprev/pskip were
+    // released (below-floor detach / operation-scoped edge release), so it could
+    // neither find the fork nor build the connect suffix for a same-height cutover.
+    // The candidate (pindexNew) is NOT yet published to the V2 authority, so its
+    // parent identity comes from hashPrevStable; already-published ancestry is
+    // resolved by value. Connect-list objects are the REAL index objects.
     int nForkHeight = -1;
-    int nH = pindexNew->nHeight < pOldTip->nHeight ? pindexNew->nHeight : pOldTip->nHeight;
-    while (nH >= 0)
+    uint256 forkHash(0);
     {
-        CBlockIndex* ancNew = pindexNew->GetAncestor(nH);
-        CBlockIndex* ancOld = pOldTip->GetAncestor(nH);
-        if (ancNew != NULL && ancOld != NULL && ancNew == ancOld)
+        const uint256 nHash0 = pindexNew->phashBlock ? pindexNew->GetBlockHash() : uint256(0);
+        if (nHash0 == uint256(0))
         {
-            nForkHeight = nH;
-            break;
+            if (outErr) *outErr = "authoritative-live cutover: no common ancestor with the published tip (new tip has no block hash)";
+            return false;
         }
-        --nH;
-    }
-    if (nForkHeight < 0)
-    {
-        if (outErr) *outErr = "authoritative-live cutover: no common ancestor with the published tip";
-        return false;
+        uint256 nHash = nHash0; int nH = pindexNew->nHeight; CBlockIndex* nObj = pindexNew;
+        uint256 oHash = oldPublishedTipHash; int oH = pOldTip->nHeight; CBlockIndex* oObj = pOldTip;
+        const int horizon = live->Horizon();
+        const long long maxSteps = (long long)(horizon > 0 ? horizon : 2048) * 2 + 64;
+        long long steps = 0;
+        while (nHash != oHash)
+        {
+            if (++steps > maxSteps) { nHash = uint256(0); break; }
+            uint256 ph; int phh; CBlockIndex* pobj = NULL;
+            if (nH >= oH)
+            {
+                if (!C12ResolveParentByValue(live, nHash, nH, nObj, ph, phh, pobj)) { nHash = uint256(0); break; }
+                nHash = ph; nH = phh; nObj = pobj;
+            }
+            else
+            {
+                if (!C12ResolveParentByValue(live, oHash, oH, oObj, ph, phh, pobj)) { nHash = uint256(0); break; }
+                oHash = ph; oH = phh; oObj = pobj;
+            }
+        }
+        if (nHash == uint256(0))
+        {
+            if (outErr) *outErr = "authoritative-live cutover: no common ancestor with the published tip (unresolvable ancestry)";
+            return false;
+        }
+        nForkHeight = nH; forkHash = nHash;
     }
     // V2-R2 (PM1-P0-09): the cutover fork must lie at or above the immutable base
     // tip S. A fork below S is a below-base reorg and is NOT served by the mutable
@@ -7566,11 +7724,24 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
             return false;
         }
     }
-    CBlockIndex* pfork = pindexNew->GetAncestor(nForkHeight);
+    // Build the new active suffix from REAL index objects (no temporary twins):
+    // the candidate is map-resident; its ancestors resolve via pprev/hashPrevStable.
     std::vector<CBlockIndex*> vConnect;
-    for (int h = nForkHeight + 1; h <= pindexNew->nHeight; ++h)
-        vConnect.push_back(pindexNew->GetAncestor(h));
-    return PublishAuthoritativeLiveTailReorg(pfork, vConnect, outErr);
+    for (CBlockIndex* p = pindexNew; p != NULL && p->nHeight > nForkHeight; )
+    {
+        vConnect.push_back(p);
+        if (p->nHeight - 1 <= nForkHeight)
+            break;
+        uint256 ph; int phh; CBlockIndex* pobj = NULL;
+        if (!C12ResolveParentByValue(live, p->GetBlockHash(), p->nHeight, p, ph, phh, pobj) || pobj == NULL)
+        {
+            if (outErr) *outErr = "authoritative-live cutover: connect suffix cannot reach the fork point (parent not retained)";
+            return false;
+        }
+        p = pobj;
+    }
+    reverse(vConnect.begin(), vConnect.end());
+    return PublishAuthoritativeLiveTailReorg(nForkHeight, vConnect, outErr);
 }
 
 // V2-R2D test seam (see main.h): forwards to the static cutover guard.
@@ -7924,9 +8095,15 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 const BlockIndexTipAuthority* tipAuth = live->TipAuthority();
                 BlockIndexTipRead tipRead = tipAuth ? tipAuth->GetTip() : BlockIndexTipRead();
                 const bool fTipPresent = (tipRead.status == BLOCK_INDEX_TIP_OK);
+                // C12: a wiped-edge direct extension (a sparse-hot accepted block whose
+                // pprev was released) must still be recognised as an extension; use the
+                // pointer-free parent identity hashPrevStable rather than requiring a
+                // live pprev pointer (which would misroute it into a cutover).
+                const uint256 c12ParentHash =
+                    pindexNew->pprev ? pindexNew->pprev->GetBlockHash() : pindexNew->hashPrevStable;
                 const bool fExtension =
-                    (pindexNew->pprev != NULL &&
-                     (!fTipPresent || tipRead.record.hash == pindexNew->pprev->GetBlockHash()));
+                    (c12ParentHash != uint256(0) &&
+                     (!fTipPresent || tipRead.record.hash == c12ParentHash));
                 if (MainFailpointHitForTesting("FP_BEFORE_V2_AUTHORITY_COMMIT"))
                 {
                     okP = false;

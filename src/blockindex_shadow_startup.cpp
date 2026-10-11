@@ -40,7 +40,7 @@ BlockIndexRecord BlockIndexRecordFromIndex(const CBlockIndex* pindex)
 {
     BlockIndexRecord rec;
     rec.hash = pindex->GetBlockHash();
-    rec.hashPrev = pindex->pprev ? pindex->pprev->GetBlockHash() : uint256(0);
+    rec.hashPrev = pindex->pprev ? pindex->pprev->GetBlockHash() : pindex->hashPrevStable;
     rec.hashMerkleRoot = pindex->hashMerkleRoot;
     rec.hashProof = pindex->hashProof;
     rec.height = pindex->nHeight;
@@ -74,7 +74,7 @@ BlockIndexSnapshot BlockIndexSnapshotFromIndex(const CBlockIndex* pindex)
     s.found = true;
     s.id = BLOCK_INDEX_ID_INVALID;
     s.hash = pindex->GetBlockHash();
-    s.hashPrev = pindex->pprev ? pindex->pprev->GetBlockHash() : uint256(0);
+    s.hashPrev = pindex->pprev ? pindex->pprev->GetBlockHash() : pindex->hashPrevStable;
     s.hashMerkleRoot = pindex->hashMerkleRoot;
     s.height = pindex->nHeight;
     s.nFile = pindex->nFile;
