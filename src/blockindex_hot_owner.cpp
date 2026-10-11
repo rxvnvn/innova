@@ -97,6 +97,7 @@ BlockIndexHotOwner::~BlockIndexHotOwner()
             delete kv.second.index;
     }
     resident.clear();
+    byHeight.clear();
 }
 
 void BlockIndexHotOwner::SetMaterializer(const BlockIndexHotMaterializer* m)
@@ -202,6 +203,7 @@ BlockIndexHotStatus BlockIndexHotOwner::PublishMaterializedLocked(const BlockInd
     e->materialized = true;
     e->pending = false;
     e->seq = 0;
+    IndexResidentLocked(*e);  // C9: record the resident height (Track A)
     ++metrics.materializationMisses;
     ++metrics.materializationRequests;
     ++metrics.residentCount;
@@ -452,7 +454,10 @@ BlockIndexHotStatus BlockIndexHotOwner::EvictResident(const BlockIndexLogicalId&
     if (!e.materialized)
         return BlockIndexHotStatus::NOT_RESIDENT;
     if (e.index)
+    {
+        UnindexResidentLocked(e);  // C9: drop from the height index (Track A)
         delete e.index;
+    }
     e.index = NULL;
     e.materialized = false;
     e.pending = false;
@@ -469,6 +474,63 @@ BlockIndexHotStatus BlockIndexHotOwner::EvictResident(const BlockIndexLogicalId&
     // (IsResident/GetResidentRaw -> absent => NOT_RESIDENT/NULL; Pin -> PENDING->OK).
     resident.erase(it);
     return BlockIndexHotStatus::OK;
+}
+
+void BlockIndexHotOwner::IndexResidentLocked(const Entry& e)
+{
+    // C9 (Track A): record a materialized resident under its immutable height.
+    if (e.materialized && e.index)
+        byHeight[e.index->nHeight].insert(e.id.GetHash());
+}
+
+void BlockIndexHotOwner::UnindexResidentLocked(const Entry& e)
+{
+    if (!e.index)
+        return;
+    std::map<int, std::set<uint256> >::iterator it = byHeight.find(e.index->nHeight);
+    if (it == byHeight.end())
+        return;
+    it->second.erase(e.id.GetHash());
+    if (it->second.empty())
+        byHeight.erase(it);
+}
+
+size_t BlockIndexHotOwner::EvictBelowHeight(int floor)
+{
+    LOCK(cs);  // recursive leaf lock (same order as every other owner method)
+    // Collect below-floor eligible hashes from the height index first (bounded by
+    // the number of residents actually below the horizon -- ~1 per accepted block
+    // in steady state on live IBD), then evict through the SAME EvictResident()
+    // path the old per-candidate trim used, so eviction semantics are identical.
+    std::vector<uint256> victims;
+    for (std::map<int, std::set<uint256> >::const_iterator it = byHeight.begin();
+         it != byHeight.end() && it->first < floor; ++it)
+    {
+        for (std::set<uint256>::const_iterator h = it->second.begin(); h != it->second.end(); ++h)
+        {
+            std::map<uint256, Entry>::const_iterator e = resident.find(*h);
+            if (e == resident.end() || !e->second.materialized || !e->second.index)
+                continue;
+            if (e->second.pins > 0 || e->second.anchor)
+                continue;   // identical eligibility to EvictEligible()
+            victims.push_back(*h);
+        }
+    }
+    size_t evicted = 0;
+    for (size_t i = 0; i < victims.size(); ++i)
+        if (EvictResident(BlockIndexLogicalId(victims[i])) == BlockIndexHotStatus::OK)
+            ++evicted;
+    return evicted;
+}
+
+bool BlockIndexHotOwner::HeightIndexConsistentForTesting() const
+{
+    LOCK(cs);
+    std::map<int, std::set<uint256> > expect;
+    for (std::map<uint256, Entry>::const_iterator it = resident.begin(); it != resident.end(); ++it)
+        if (it->second.materialized && it->second.index)
+            expect[it->second.index->nHeight].insert(it->second.id.GetHash());
+    return expect == byHeight;
 }
 
 BlockIndexHotStatus BlockIndexHotOwner::AdoptOwned(const BlockIndexLogicalId& id,
@@ -491,6 +553,7 @@ BlockIndexHotStatus BlockIndexHotOwner::AdoptOwned(const BlockIndexLogicalId& id
     e.materialized = true;
     e.pending = false;
     e.anchor = anchor;
+    IndexResidentLocked(e);       // C9: record the resident height (Track A)
     obj->phashBlock = &e.ownHash; // owner-stable identity (std::map node address)
     return BlockIndexHotStatus::OK;
 }
@@ -520,7 +583,10 @@ bool BlockIndexHotOwner::ReleaseOwned(const uint256& hash)
     if (it == resident.end())
         return false;
     if (it->second.index)
+    {
+        UnindexResidentLocked(it->second);  // C9: drop from the height index
         delete it->second.index;
+    }
     resident.erase(it);
     return true;
 }

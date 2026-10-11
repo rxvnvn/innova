@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <map>
+#include <set>
 #include <utility>
 #include <vector>
 #include <memory>
@@ -215,6 +216,15 @@ public:
     std::vector<std::pair<BlockIndexLogicalId, int> > EvictEligibleHeights() const;
     /** Attempt to evict one resident object. EVICTION_BLOCKED if pinned/anchor. */
     BlockIndexHotStatus EvictResident(const BlockIndexLogicalId& id);
+    /** C9 (Track A): evict every currently eviction-eligible resident whose cached
+     *  height is BELOW `floor`, in one locked pass, and return how many were
+     *  evicted. Eligibility is identical to EvictEligible()/EvictEligibleHeights()
+     *  (materialized, not pinned, not anchor); the resident height index makes the
+     *  pass O(evicted x log n) instead of O(resident), so a per-block residency
+     *  trim no longer scans the whole resident set. Semantics are exactly those of
+     *  dropping the below-floor entries from EvictEligibleHeights(): eviction is
+     *  residency-only and every evicted id stays re-materializable. */
+    size_t EvictBelowHeight(int floor);
 
     // --- counts / metrics ---
     size_t ResidentCount() const;
@@ -262,16 +272,30 @@ private:
 
     const BlockIndexHotMaterializer* materializer;
     std::map<uint256, Entry> resident;   // keyed by logical hash
+    // C9 (Track A): secondary height index over the MATERIALIZED resident set.
+    // byHeight[h] = set of resident hashes whose cached CBlockIndex::nHeight == h.
+    // Pure function of `resident` (materialized entries only); maintained under
+    // `cs` in exact lockstep with Entry::index transitions. A block's height is
+    // immutable for its logical hash, so the index never needs re-keying; it makes
+    // the per-block residency trim O(below-floor) instead of O(resident).
+    std::map<int, std::set<uint256> > byHeight;
     uint64_t currentGeneration;
     uint64_t nextTokenSeq;
     BlockIndexHotMetrics metrics;
     mutable CCriticalSection cs;         // LEAF lock: never acquires cs_main etc.
 
     Entry* EntryLocked(uint256 hash);                       // requires cs (recursive)
+    void IndexResidentLocked(const Entry& e);               // requires cs
+    void UnindexResidentLocked(const Entry& e);             // requires cs
     BlockIndexHotStatus RequestMaterializationLocked(const BlockIndexLogicalId& id,
                                                      BlockIndexHotToken* token); // requires cs
     BlockIndexHotStatus PublishMaterializedLocked(const BlockIndexHotToken& token,
                                                   const BlockIndexHotMaterialized& m); // requires cs
+public:
+    /** C9 TEST/OBSERVABILITY: true iff the height index exactly mirrors the set of
+     *  materialized residents (no missing entries -> no residency leak; no stale
+     *  entries -> no phantom eviction). */
+    bool HeightIndexConsistentForTesting() const;
 };
 
 #endif // INNOVA_BLOCKINDEX_HOT_OWNER_H

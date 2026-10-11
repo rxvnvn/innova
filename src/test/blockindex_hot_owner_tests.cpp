@@ -161,6 +161,66 @@ BOOST_AUTO_TEST_CASE(h2_release_makes_eligible)
     BOOST_CHECK(owner.IsResident(BlockIndexLogicalId(hs(1)))); // still resident
 }
 
+// --- H-idx (C9 Track A): the resident height index stays a perfect mirror of
+//     the materialized set, and EvictBelowHeight evicts EXACTLY the unpinned
+//     residents below the floor (identical eligibility to the old scan). ------
+BOOST_AUTO_TEST_CASE(hidx_height_index_consistency_and_evict_below)
+{
+    SnapshotHotMaterializer mat;
+    mat.Add(hs(10), hs(0),  uint256(1), 10);
+    mat.Add(hs(11), hs(10), uint256(2), 11);
+    mat.Add(hs(12), hs(11), uint256(3), 12);
+    mat.Add(hs(13), hs(12), uint256(4), 13);
+    BlockIndexHotOwner owner;
+    owner.SetCurrentGeneration(mat.currentGen);
+    owner.SetMaterializer(&mat);
+
+    // Materialize 10..13; keep 12 pinned, release the rest.
+    {
+        BlockIndexHotHandle h;
+        BOOST_CHECK(owner.Pin(BlockIndexLogicalId(hs(10)), &h) == BlockIndexHotStatus::OK);
+    }
+    {
+        BlockIndexHotHandle h;
+        BOOST_CHECK(owner.Pin(BlockIndexLogicalId(hs(11)), &h) == BlockIndexHotStatus::OK);
+    }
+    BlockIndexHotHandle h12;
+    BOOST_CHECK(owner.Pin(BlockIndexLogicalId(hs(12)), &h12) == BlockIndexHotStatus::OK);
+    {
+        BlockIndexHotHandle h;
+        BOOST_CHECK(owner.Pin(BlockIndexLogicalId(hs(13)), &h) == BlockIndexHotStatus::OK);
+    }
+    BOOST_CHECK_EQUAL(owner.ResidentCount(), (size_t)4);
+    BOOST_CHECK(owner.HeightIndexConsistentForTesting());
+
+    // floor 12: heights 10 and 11 are below + unpinned -> both evicted.
+    BOOST_CHECK_EQUAL(owner.EvictBelowHeight(12), (size_t)2);
+    BOOST_CHECK(owner.HeightIndexConsistentForTesting());
+    BOOST_CHECK(!owner.IsResident(BlockIndexLogicalId(hs(10))));
+    BOOST_CHECK(!owner.IsResident(BlockIndexLogicalId(hs(11))));
+    BOOST_CHECK(owner.IsResident(BlockIndexLogicalId(hs(12))));  // pinned: survives
+    BOOST_CHECK(owner.IsResident(BlockIndexLogicalId(hs(13))));  // above floor
+
+    // floor 14: 12 is below but pinned (skip), 13 is below + unpinned (evict).
+    BOOST_CHECK_EQUAL(owner.EvictBelowHeight(14), (size_t)1);
+    BOOST_CHECK(owner.HeightIndexConsistentForTesting());
+    BOOST_CHECK(owner.IsResident(BlockIndexLogicalId(hs(12))));  // still pinned
+    BOOST_CHECK(!owner.IsResident(BlockIndexLogicalId(hs(13))));
+
+    // Release the pin: 12 becomes eligible and is evicted; index still mirrors.
+    h12.Reset();
+    BOOST_CHECK_EQUAL(owner.EvictBelowHeight(14), (size_t)1);
+    BOOST_CHECK_EQUAL(owner.ResidentCount(), (size_t)0);
+    BOOST_CHECK(owner.HeightIndexConsistentForTesting());
+    BOOST_CHECK_EQUAL(owner.EntryCount(), (size_t)0);  // map dropped, not leaked
+
+    // Re-materialization after eviction still yields a consistent index.
+    BlockIndexHotHandle hAgain;
+    BOOST_CHECK(owner.Pin(BlockIndexLogicalId(hs(10)), &hAgain) == BlockIndexHotStatus::OK);
+    BOOST_CHECK(owner.HeightIndexConsistentForTesting());
+    BOOST_CHECK_EQUAL(owner.ResidentCount(), (size_t)1);
+}
+
 // --- H3: two pins same hash -> one object, PinCount==2 --------------------
 BOOST_AUTO_TEST_CASE(h3_two_pins_one_object)
 {

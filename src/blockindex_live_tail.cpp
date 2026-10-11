@@ -215,16 +215,12 @@ size_t BlockIndexLiveTail::TrimToHorizon()
     // immutable for its logical hash) and eviction is residency-only and always
     // re-materializable, so eviction semantics are unchanged -- this is pure
     // I/O avoidance.
-    std::vector<std::pair<BlockIndexLogicalId, int> > candidates = owner_.EvictEligibleHeights();
-    for (size_t i = 0; i < candidates.size(); ++i)
-    {
-        const int h = candidates[i].second;
-        if (h < floor)
-        {
-            BlockIndexHotStatus e = owner_.EvictResident(candidates[i].first);
-            if (e == BlockIndexHotStatus::OK)
-                ++evicted;
-        }
-    }
+    // C9 (Track A): the owner keeps a height index over the materialized resident
+    // set, so the trim evicts below-floor entries directly (O(evicted x log n))
+    // instead of scanning every resident and rebuilding a candidate vector on each
+    // accepted block. Eligibility and eviction semantics are identical:
+    // EvictBelowHeight() applies the same unpinned/non-anchor rule and drives the
+    // same EvictResident() path this loop used. Pure scan removal.
+    evicted = owner_.EvictBelowHeight(floor);
     return evicted;
 }
