@@ -10,6 +10,7 @@
 #include "blockindex_v2_reader.h"              // BlockIndexV2Reader
 #include "fixed_blockindex_store.h"            // capability enum
 #include "blockindex_authoritative_startup.h"  // g_fAuthoritativeStartup, composite seams
+#include "blockindex_authoritative_live.h"     // GetAuthoritativeLiveAuthority, TipAuthority
 
 namespace {
 
@@ -252,12 +253,33 @@ BlockIndexManagerStatus BlockIndexManager::GetTip(BlockIndexSnapshot* out,
         return BLOCK_INDEX_MANAGER_AUTHORITY_FAILURE;
     if (UseComposite())
     {
-        if (hashBestChain == uint256(0))
+        // C9 (Track B) coherent tip acquisition. The authoritative active tip is
+        // the V2 tip authority's COMMITTED (hash,height). The legacy mirror
+        // `hashBestChain` is written by SetBestChain BEFORE AddToBlockIndex
+        // performs the mandatory V2 publish, so resolving the mirror directly can
+        // observe a tip hash whose record is not yet committed -> the resolver
+        // classifies the miss as "genuinely absent" and the RPC returns a
+        // spurious "authoritative block resolver: block not found" under rapid
+        // IBD (getblockcount; net.cpp tip reads). Prefer the committed tip from
+        // the authority; fall back to the mirror only when the authority has no
+        // committed tip yet (early bootstrap). Never fabricates: a genuine
+        // authority failure or a genuinely absent record still fails closed.
+        uint256 tipHash = hashBestChain;
+        const BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        const BlockIndexTipAuthority* tipAuth =
+            (live != NULL && live->IsOpen()) ? live->TipAuthority() : NULL;
+        if (tipAuth != NULL)
+        {
+            const BlockIndexTipRead tr = tipAuth->GetTip();
+            if (tr.status == BLOCK_INDEX_TIP_OK)
+                tipHash = tr.record.hash;
+        }
+        if (tipHash == uint256(0))
         {
             if (error) *error = "block index manager: no active tip yet";
             return BLOCK_INDEX_MANAGER_NOT_FOUND;
         }
-        return LookupByHash(hashBestChain, out, error);
+        return LookupByHash(tipHash, out, error);
     }
     if (reader_ == NULL || !reader_->IsOpen())
     {

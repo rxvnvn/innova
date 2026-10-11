@@ -33,6 +33,7 @@
 #include "kernel.h"
 #include "blockindex_authoritative_live.h"
 #include "blockindex_authoritative_startup.h"
+#include "blockindex_manager.h"
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
 
@@ -192,6 +193,79 @@ BOOST_AUTO_TEST_CASE(active_snapshot_by_height_base_plus_live_tail)
     // ---- cleanup ----
     ResetBlockIndexAuthoritativeStartupForTest();
     // Restore the shared containers (drops the test's dangling mapBlockIndex entries).
+    mapBlockIndex = savedMapBlockIndex;
+    mapCandidateTips = savedCandidateTips;
+    setStakeSeen = savedStakeSeen;
+    pindexBest = savedBest;
+    pindexGenesisBlock = savedGenesis;
+    hashBestChain = savedBestChain;
+    nBestHeight = savedBestHeight;
+    nBestChainTrust = savedBestTrust;
+    if (hadLivetail) mapArgs["-blockindexlivetail"] = savedLivetail;
+    else mapArgs.erase("-blockindexlivetail");
+    try { fs::remove_all(root); } catch (...) {}
+}
+
+// --- C9 (Track B): the active-tip height must be COHERENT with the committed
+//     authoritative tip under legacy-mirror skew. SetBestChain publishes the
+//     mirror `hashBestChain` BEFORE AddToBlockIndex commits the V2 record, so a
+//     reader that resolves the mirror directly observed a hash whose record is
+//     not yet committed -> the resolver returned "authoritative block resolver:
+//     block not found" under rapid IBD (RPC getblockcount; net.cpp tip reads).
+//     GetTip/ActiveTipHeight now acquire the tip from the COMMITTED V2 authority,
+//     so a mirror that points ahead (or is empty) never yields a spurious
+//     failure, while a genuinely absent tip still fails closed.
+BOOST_AUTO_TEST_CASE(active_tip_height_coherent_with_committed_tip_not_mirror)
+{
+    const std::map<uint256, CBlockIndex*> savedMapBlockIndex = mapBlockIndex;
+    const std::map<uint256, CandidateTipRecord> savedCandidateTips = mapCandidateTips;
+    const std::set<std::pair<COutPoint, unsigned int> > savedStakeSeen = setStakeSeen;
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+
+    CBlockIndex* tip = pindexBest;
+    while (tip->nHeight < 6)
+        tip = AHRMine(tip, 0xB000u + (unsigned)tip->nHeight, true);
+
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("ahrb-%%%%-%%%%");
+    std::string error;
+    AHRBuildRoot(root, &error);
+    const bool hadLivetail = mapArgs.count("-blockindexlivetail") != 0;
+    const std::string savedLivetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
+    mapArgs["-blockindexlivetail"] = "32";
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+
+    const int S = pindexBest->nHeight;
+    CBlockIndex* n1 = AHRMine(pindexBest, 0xB100u, true);   // S+1, committed in V2
+    BOOST_REQUIRE_EQUAL(n1->nHeight, S + 1);
+
+    int h = -1;
+    std::string err;
+
+    // (a) baseline: mirror == committed tip -> coherent height.
+    hashBestChain = n1->GetBlockHash();
+    BOOST_REQUIRE(GetBlockIndexManager().ActiveTipHeight(&h, &err) == BLOCK_INDEX_MANAGER_OK);
+    BOOST_CHECK_EQUAL(h, S + 1);
+
+    // (b) mirror published AHEAD of the V2 commit (an unresolvable hash). PRE-FIX
+    //     this returned NOT_FOUND; POST-FIX the committed authority tip is used.
+    hashBestChain = uint256(0xdeadbeefUL);
+    err.clear(); h = -1;
+    BOOST_REQUIRE_MESSAGE(GetBlockIndexManager().ActiveTipHeight(&h, &err) == BLOCK_INDEX_MANAGER_OK,
+        std::string("coherent tip must resolve despite mirror skew: ") + err);
+    BOOST_CHECK_EQUAL(h, S + 1);
+
+    // (c) empty mirror with a live committed tip -> still coherent, never fabricated.
+    hashBestChain = uint256(0);
+    err.clear(); h = -1;
+    BOOST_REQUIRE(GetBlockIndexManager().ActiveTipHeight(&h, &err) == BLOCK_INDEX_MANAGER_OK);
+    BOOST_CHECK_EQUAL(h, S + 1);
+
+    ResetBlockIndexAuthoritativeStartupForTest();
     mapBlockIndex = savedMapBlockIndex;
     mapCandidateTips = savedCandidateTips;
     setStakeSeen = savedStakeSeen;
