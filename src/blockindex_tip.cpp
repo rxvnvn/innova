@@ -977,6 +977,16 @@ struct BlockIndexTipAuthority::Impl
 
     bool open;
 
+    // C6 Fix B: digest of the operator-invalid log as last durably written to
+    // tip-invalid.dat. While the in-memory log matches this, the per-block
+    // AppendBatch skips the byte-identical WriteInvalidFile (pure redundant
+    // CoW fsync+rename+dirsync of an unchanged file). Any mutation
+    // (reorg/operator-intent) changes the digest and re-arms the write; a
+    // v1/empty tip starts unarmed so the first commit still completes the
+    // store set exactly as before. tip.meta remains the sole commit point.
+    unsigned char invalidDiskDigest[32];
+    bool invalidDiskDurable;
+
     // Repair #2: v3 chained digest state. RAM-ONLY, never persisted, never an
     // independent authority -- rebuilt at Open and on any non-append mutation.
     unsigned char chainR[32];
@@ -996,7 +1006,7 @@ struct BlockIndexTipAuthority::Impl
                     BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1,
                     BLOCK_INDEX_TIP_RING_CAP_ENTRIES,
                     BLOCK_INDEX_TIP_LRU_BYTES_CAP, TipDecodeActive),
-          open(false), chainsValid(false) {}
+          open(false), invalidDiskDurable(false), chainsValid(false) {}
 
     // Rebuild the three index-order chains from a committed vector set.
     void BuildChainsFor(const std::vector<BlockIndexRecord>& recs,
@@ -1477,6 +1487,8 @@ bool BlockIndexTipAuthority::Create(const std::string& root,
     // v2: create the (empty) operator-invalid log so the store set is complete.
     if (!WriteInvalidFile(i->invalidPath, i->invalidEntries))
         return SetError(error, "init tip-invalid failed");
+    ComputeInvalidDigest(i->invalidEntries, i->invalidDiskDigest);
+    i->invalidDiskDurable = true;
     // Repair #3: create the (empty) hash-index side store + marker.
     i->sideIndex.Close();
     if (!i->sideIndex.OpenOrCreateWritable(i->tipDir, &sidxerr))
@@ -1719,6 +1731,17 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
 
     i->invalidEntries = invalidEntries;
     DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
+    // C6 Fix B: the on-disk log is a validated authority only when tip.meta
+    // carried a committed count (checked above). For a v1/empty tip the store
+    // set may not exist yet, so leave the elision unarmed and let the first
+    // commit write it exactly once (unchanged behaviour).
+    if (meta.invalidLogCount > 0)
+    {
+        ComputeInvalidDigest(i->invalidEntries, i->invalidDiskDigest);
+        i->invalidDiskDurable = true;
+    }
+    else
+        i->invalidDiskDurable = false;
     i->open = true;
     ClearError(error);
     return true;
@@ -1831,8 +1854,25 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
                BLOCK_INDEX_TIP_IO_ERROR;
     // v2: keep the store set complete and upgrade an opened v1 tip
     // deterministically on the first legitimate new commit.
-    if (!WriteInvalidFile(i->invalidPath, i->invalidEntries, &werr))
-        return SetError(error, "append tip-invalid failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+    //
+    // C6 Fix B: AppendBatch never mutates the operator-invalid log, so after the
+    // first commit writes it the per-block rewrite is byte-identical CoW churn
+    // (fsync+rename+dirsync of an unchanged file). Skip it while the in-memory
+    // log matches what is already durably on disk; any mutation (reorg/operator
+    // intent) changes the digest and re-arms the write. tip.meta stays the sole
+    // commit point and its trailing tipDir dir-fsync still orders this file.
+    {
+        unsigned char curDigest[32];
+        ComputeInvalidDigest(i->invalidEntries, curDigest);
+        if (!i->invalidDiskDurable ||
+            memcmp(curDigest, i->invalidDiskDigest, 32) != 0)
+        {
+            if (!WriteInvalidFile(i->invalidPath, i->invalidEntries, &werr))
+                return SetError(error, "append tip-invalid failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+            memcpy(i->invalidDiskDigest, curDigest, 32);
+            i->invalidDiskDurable = true;
+        }
+    }
     // Repair #3: durable side index Put for each new record. The entries are
     // an UNCOMMITTED suffix of the index until tip.meta advances (the same
     // fail-safe tier as the tail stores); Open reconciles index entries past
@@ -2347,6 +2387,8 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
         return SetError(error, "fused store stream failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
     if (!WriteInvalidFile(i->invalidPath, allEntries))
         return SetError(error, "fused tip-invalid failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    ComputeInvalidDigest(allEntries, i->invalidDiskDigest);
+    i->invalidDiskDurable = true;
     for (size_t k = 0; k < appendRecords.size(); ++k)
     {
         std::string ierr;
@@ -2935,6 +2977,8 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
     //    point: if the meta write below fails, Open truncates the extra entry.
     if (!WriteInvalidFile(i->invalidPath, allEntries))
         return SetError(error, "write tip-invalid failed"), BLOCK_INDEX_TIP_IO_ERROR;
+    ComputeInvalidDigest(allEntries, i->invalidDiskDigest);
+    i->invalidDiskDurable = true;
 
     // 2. Commit point: advance tip.meta with the new committed length + digest.
     //    The operator-invalid set is thereby part of the SAME mutable authority
