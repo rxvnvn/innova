@@ -10925,6 +10925,16 @@ void GetBlocksServedInvReconnectClearAll()
 
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, int64_t nTimeReceived)
 {
+    // C5: minimum seconds between getblocks "CONTINUE" refills on the IBD block-download
+    // path. This is pure pacing, NOT a safety mechanism: safety lives in fPipelineDrained
+    // (a CONTINUE is only sent once the pipeline is genuinely empty: setBlocksInFlight<=1 &&
+    // getBlocksIndex.empty()), the single-flight getblocks queue, and the server-side
+    // RepeatCooldownMillis exponential backoff. 1,578,291 of 1,618,981 pipeline-drained
+    // checks were gated only by this 10s cooldown (97.5%) => it was the binding receive
+    // limiter, capping sustain at ~batch(1000)/10s. Lowering to 2s lets a drained pipeline
+    // refill ~2s after drain without exceeding the inflight budget (bounded by the
+    // pipeline-drained gate). Revert to 10 restores prior pacing.
+    static const int64_t GETBLOCKS_CONTINUE_COOLDOWN_SECONDS = 2;
     RandAddSeedPerfmon();
     if (fDebugNet)
         printf("received: %s (%" PRIszu" bytes)\n", strCommand.c_str(), vRecv.size());
@@ -12718,7 +12728,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             const int64_t nNow = GetTime();
             const bool fPeerAhead = (pfrom->nBestKnownHeight > nBestHeight);
             const bool fPipelineDrained = (pfrom->setBlocksInFlight.size() <= 1 && pfrom->getBlocksIndex.empty());
-            const bool fCooldownExpired = (pfrom->nLastGetBlocksTime == 0 || (nNow - pfrom->nLastGetBlocksTime) >= 10);
+            const bool fCooldownExpired = (pfrom->nLastGetBlocksTime == 0 || (nNow - pfrom->nLastGetBlocksTime) >= GETBLOCKS_CONTINUE_COOLDOWN_SECONDS);
             ibdmetrics::Get().pipeline_drained_checks.fetch_add(
                 1, std::memory_order_relaxed);
             if (!fPeerAhead)
