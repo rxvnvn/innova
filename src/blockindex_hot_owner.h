@@ -12,6 +12,7 @@
 
 #include <cstddef>
 #include <map>
+#include <utility>
 #include <vector>
 #include <memory>
 
@@ -205,6 +206,13 @@ public:
     /** List of currently eviction-eligible resident ids (not pinned, not anchor).
      *  Order is unspecified; never a fixed height window. */
     std::vector<BlockIndexLogicalId> EvictEligible() const;
+    /** A.10 perf (C8): eviction-eligible ids WITH the height already cached on
+     *  each resident materialized CBlockIndex (nHeight). Eligibility is identical
+     *  to EvictEligible(); this exists so a residency trim can decide eviction
+     *  from the resident object instead of re-materializing it through the
+     *  composite materializer (a LevelDB lookup) just to read the height. Read
+     *  under the owner leaf lock; the height is immutable for a logical hash. */
+    std::vector<std::pair<BlockIndexLogicalId, int> > EvictEligibleHeights() const;
     /** Attempt to evict one resident object. EVICTION_BLOCKED if pinned/anchor. */
     BlockIndexHotStatus EvictResident(const BlockIndexLogicalId& id);
 

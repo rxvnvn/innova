@@ -419,6 +419,24 @@ std::vector<BlockIndexLogicalId> BlockIndexHotOwner::EvictEligible() const
     return out;
 }
 
+std::vector<std::pair<BlockIndexLogicalId, int> > BlockIndexHotOwner::EvictEligibleHeights() const
+{
+    LOCK(cs);
+    std::vector<std::pair<BlockIndexLogicalId, int> > out;
+    for (const auto& kv : resident)
+    {
+        const Entry& e = kv.second;
+        if (!e.materialized || !e.index) continue;
+        if (e.pins > 0) continue;      // pinned: not eligible
+        if (e.anchor) continue;        // permanent anchor: not eligible
+        // The resident object already carries nHeight (HotMaterializeToIndex /
+        // AdoptOwned). A block's height is immutable for its logical hash, so
+        // this equals a fresh materializer snapshot height; no I/O needed.
+        out.push_back(std::make_pair(BlockIndexLogicalId(e.id.GetHash()), e.index->nHeight));
+    }
+    return out;
+}
+
 BlockIndexHotStatus BlockIndexHotOwner::EvictResident(const BlockIndexLogicalId& id)
 {
     LOCK(cs);

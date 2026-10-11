@@ -205,18 +205,23 @@ size_t BlockIndexLiveTail::TrimToHorizon()
     const int tipHeight = tip.height;
     const int floor = tipHeight - horizon_ + 1;
     size_t evicted = 0;
-    std::vector<BlockIndexLogicalId> candidates = owner_.EvictEligible();
+    // A.10 perf (C8): decide eviction from each resident object's cached
+    // CBlockIndex::nHeight (EvictEligibleHeights) instead of re-materializing
+    // every evict-eligible candidate through the composite materializer. The
+    // previous form issued one LevelDB hashindex lookup (plus tip-store reads)
+    // per candidate on every accepted block (~2,050 candidates/block under live
+    // IBD), which dominated the accept thread's LevelDB read volume. The cached
+    // height is byte-equal to a fresh snapshot height (a block's height is
+    // immutable for its logical hash) and eviction is residency-only and always
+    // re-materializable, so eviction semantics are unchanged -- this is pure
+    // I/O avoidance.
+    std::vector<std::pair<BlockIndexLogicalId, int> > candidates = owner_.EvictEligibleHeights();
     for (size_t i = 0; i < candidates.size(); ++i)
     {
-        // peek height without pinning: query the materializer snapshot.
-        BlockIndexHotMaterialized m;
-        BlockIndexHotStatus st = mat_->Materialize(candidates[i], &m);
-        if (st != BlockIndexHotStatus::OK || !m.found)
-            continue;
-        const int h = m.snapshot.height;
+        const int h = candidates[i].second;
         if (h < floor)
         {
-            BlockIndexHotStatus e = owner_.EvictResident(candidates[i]);
+            BlockIndexHotStatus e = owner_.EvictResident(candidates[i].first);
             if (e == BlockIndexHotStatus::OK)
                 ++evicted;
         }
