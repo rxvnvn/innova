@@ -953,6 +953,8 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
 
         if (!fRegTest && (fNoNodes || IsInitialBlockDownload()))
         {
+            controller.NotePaused(fNoNodes ? CCPUMinerController::PAUSE_NO_PEERS
+                                           : CCPUMinerController::PAUSE_IBD);
             controller.WaitForStop(nSessionId, 1000);
             continue;
         }
@@ -965,6 +967,7 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
         }
         if (fChainStale)
         {
+            controller.NotePaused(CCPUMinerController::PAUSE_CHAIN_STALE);
             controller.WaitForStop(nSessionId, 5000);
             continue;
         }
@@ -973,6 +976,7 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
         {
             if (fDebug)
                 printf("CPUMiner: waiting for Collateral Node state\n");
+            controller.NotePaused(CCPUMinerController::PAUSE_COLLATERAL);
             controller.WaitForStop(nSessionId, 5000);
             continue;
         }
@@ -984,6 +988,7 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
         {
             reservekey.ReturnKey();
             printf("CPUMiner: CreateNewBlock failed, retrying...\n");
+            controller.NotePaused(CCPUMinerController::PAUSE_CREATEBLOCK_FAILED);
             controller.WaitForStop(nSessionId, 1000);
             continue;
         }
@@ -993,6 +998,7 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
             !CPUMiningBlockMatchesWorkIdentity(*pblock, identityAfter))
         {
             reservekey.ReturnKey();
+            controller.NotePaused(CCPUMinerController::PAUSE_WORK_REBUILD);
             controller.WaitForStop(nSessionId, 50);
             continue;
         }
@@ -1017,6 +1023,7 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
         if (!fPrepared || !IsCPUMiningWorkCurrent(workIdentity, false))
         {
             reservekey.ReturnKey();
+            controller.NotePaused(CCPUMinerController::PAUSE_WORK_REBUILD);
             controller.WaitForStop(nSessionId, 50);
             continue;
         }
@@ -1033,6 +1040,7 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
 
         int64_t nStart = GetTime();
         uint64_t nHashesDone = 0;
+        uint64_t nHashesSinceLastCall = 0;
         bool fBlockFound = false;
         while (!controller.ShouldStop(nSessionId))
         {
@@ -1055,6 +1063,10 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
                     printf("CPUMiner[%u]: %.0f H/s (height %d, %llu hashes)\n",
                            nWorkerId, (double)nHashesDone / nElapsed,
                            workIdentity.nHeight, (unsigned long long)nHashesDone);
+                // Out of the per-hash hot path: report truthful hashing
+                // progress at the same cadence as the H/s report.
+                controller.NoteHashing(nHashesDone - nHashesSinceLastCall);
+                nHashesSinceLastCall = nHashesDone;
             }
 
             if ((nHashesDone % 4096) == 0)
@@ -1170,6 +1182,54 @@ bool CPUMiningBlockMatchesWorkIdentity(const CBlock& block,
 
 const int CCPUMinerController::MAX_THREADS;
 
+static const char* const CPUMINING_PAUSE_REASON_STRINGS[] = {
+    "hashing",          // PAUSE_NONE
+    "no-peers",         // PAUSE_NO_PEERS
+    "ibd",              // PAUSE_IBD
+    "chain-stale",      // PAUSE_CHAIN_STALE
+    "collateral",       // PAUSE_COLLATERAL
+    "createblock-failed", // PAUSE_CREATEBLOCK_FAILED
+    "work-rebuild"      // PAUSE_WORK_REBUILD
+};
+
+const char* CCPUMinerController::PauseReasonString(int reason)
+{
+    if (reason < 0 ||
+        reason >= (int)(sizeof(CPUMINING_PAUSE_REASON_STRINGS) /
+                        sizeof(CPUMINING_PAUSE_REASON_STRINGS[0])))
+        return "unknown";
+    return CPUMINING_PAUSE_REASON_STRINGS[reason];
+}
+
+namespace {
+// Rate-limited, thread-safe pause/resume transition log shared by all workers.
+// The original defect was a SILENT park, so transitions are logged
+// unconditionally (not only under -debug) to stay observable, but bounded: at
+// most one line per reason change (>=10s apart) plus at most one repeat per
+// 60s, so 14 workers cannot flood the log.
+CCriticalSection cs_cpuMinerPauseLog;
+int64_t nLastCpuMinerPauseLogTime = 0;
+int nLastCpuMinerPauseLogReason = -1;
+
+void LogCPUMinerPauseTransition(int reason)
+{
+    LOCK(cs_cpuMinerPauseLog);
+    const int64_t nNow = GetTime();
+    if (nNow - nLastCpuMinerPauseLogTime < 10)
+        return;
+    if (reason == nLastCpuMinerPauseLogReason &&
+        nNow - nLastCpuMinerPauseLogTime < 60)
+        return;
+    nLastCpuMinerPauseLogReason = reason;
+    nLastCpuMinerPauseLogTime = nNow;
+    if (reason == CCPUMinerController::PAUSE_NONE)
+        printf("CPUMiner: workers hashing\n");
+    else
+        printf("CPUMiner: workers paused (reason=%s)\n",
+               CCPUMinerController::PauseReasonString(reason));
+}
+} // namespace
+
 CCPUMinerController::CCPUMinerController(const WorkerFunction& worker,
                                          const ThreadFactory& threadFactory)
     : m_worker(worker ? worker : WorkerFunction(RunCPUMinerWorker)),
@@ -1181,7 +1241,11 @@ CCPUMinerController::CCPUMinerController(const WorkerFunction& worker,
       m_startReleased(false),
       m_requestedThreads(0),
       m_activeThreads(0),
-      m_sessionId(0)
+      m_sessionId(0),
+      m_hashing(false),
+      m_pauseReason(CCPUMinerController::PAUSE_NONE),
+      m_lastHashProgress(0),
+      m_totalHashes(0)
 {
 }
 
@@ -1332,6 +1396,28 @@ void CCPUMinerController::Shutdown()
     StopAndJoinLocked(SHUTTING_DOWN);
 }
 
+void CCPUMinerController::NoteHashing(unsigned long long nHashes)
+{
+    const bool fWasHashing = m_hashing.load(std::memory_order_acquire);
+    m_hashing.store(true, std::memory_order_release);
+    m_pauseReason.store(CCPUMinerController::PAUSE_NONE,
+                        std::memory_order_release);
+    m_lastHashProgress.store(GetTime(), std::memory_order_release);
+    if (nHashes > 0)
+        m_totalHashes.fetch_add(nHashes, std::memory_order_relaxed);
+    if (!fWasHashing)
+        LogCPUMinerPauseTransition(CCPUMinerController::PAUSE_NONE);
+}
+
+void CCPUMinerController::NotePaused(int reason)
+{
+    const int nPrevReason = m_pauseReason.load(std::memory_order_acquire);
+    if (reason != nPrevReason)
+        m_pauseReason.store(reason, std::memory_order_release);
+    m_hashing.store(false, std::memory_order_release);
+    LogCPUMinerPauseTransition(reason);
+}
+
 CCPUMinerController::Status CCPUMinerController::GetStatus() const
 {
     std::lock_guard<std::mutex> stateLock(m_stateMutex);
@@ -1345,6 +1431,10 @@ CCPUMinerController::Status CCPUMinerController::GetStatus() const
                      !status.shutdown &&
                      !m_stopRequested.load(std::memory_order_acquire);
     status.sessionId = m_sessionId.load(std::memory_order_acquire);
+    status.hashing = m_hashing.load(std::memory_order_acquire);
+    status.pauseReason = m_pauseReason.load(std::memory_order_acquire);
+    status.lastHashProgress = m_lastHashProgress.load(std::memory_order_acquire);
+    status.totalHashes = m_totalHashes.load(std::memory_order_acquire);
     return status;
 }
 

@@ -98,6 +98,19 @@ public:
         SHUTTING_DOWN
     };
 
+    // Truthful hashing-status observability: why workers are parked at a gate
+    // (PAUSE_NONE means they are hashing). Ordering is stable API surface.
+    enum PauseReason
+    {
+        PAUSE_NONE = 0,
+        PAUSE_NO_PEERS,
+        PAUSE_IBD,
+        PAUSE_CHAIN_STALE,
+        PAUSE_COLLATERAL,
+        PAUSE_CREATEBLOCK_FAILED,
+        PAUSE_WORK_REBUILD
+    };
+
     struct Status
     {
         State state;
@@ -107,11 +120,19 @@ public:
         int requestedThreads;
         int activeThreads;
         uint64_t sessionId;
+        // Stage 1 additive fields (legacy fields above keep their semantics).
+        bool hashing;
+        int pauseReason;
+        int64_t lastHashProgress; // unix time of last hashing progress
+        unsigned long long totalHashes;
     };
 
     typedef std::function<void(CCPUMinerController&, CWallet*, unsigned int,
                                unsigned int, uint64_t)> WorkerFunction;
     typedef std::function<std::thread(const std::function<void()>&)> ThreadFactory;
+
+    // Stable short strings for RPC reporting (index by PauseReason).
+    static const char* PauseReasonString(int reason);
 
     explicit CCPUMinerController(const WorkerFunction& worker = WorkerFunction(),
                                  const ThreadFactory& threadFactory = ThreadFactory());
@@ -124,6 +145,12 @@ public:
     Status GetStatus() const;
     bool ShouldStop(uint64_t nSessionId) const;
     bool WaitForStop(uint64_t nSessionId, int nMilliseconds);
+
+    // Stage 1: truthful hashing/pause observability. Workers call
+    // NoteHashing(nHashes) when hashing makes progress (NOT per-hash) and
+    // NotePaused(reason) when parked at a gate. No automatic restarts.
+    void NoteHashing(unsigned long long nHashes);
+    void NotePaused(int reason);
 
 private:
     CCPUMinerController(const CCPUMinerController&);
@@ -150,6 +177,10 @@ private:
     std::atomic<int> m_requestedThreads;
     std::atomic<int> m_activeThreads;
     std::atomic<uint64_t> m_sessionId;
+    std::atomic<bool> m_hashing;
+    std::atomic<int> m_pauseReason;
+    std::atomic<int64_t> m_lastHashProgress;
+    std::atomic<unsigned long long> m_totalHashes;
 };
 
 CCPUMinerController& GetCPUMinerController();

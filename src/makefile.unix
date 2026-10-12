@@ -541,6 +541,7 @@ TEST_OBJS= \
     obj/test/blockindex_activeheight_resolver_tests.o \
     obj/test/Checkpoints_tests.o \
     obj/test/cpu_mining_tests.o \
+    obj/test/ibd_miner_recovery_tests.o \
     obj/test/build_metadata_tests.o \
     obj/test/p2p_sync_tests.o \
     obj/test/rpc_getinfo_tests.o \

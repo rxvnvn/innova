@@ -5128,7 +5128,12 @@ bool g_forceIbdPeerSnapshotUnavailableForTesting = false;
 bool IsInitialBlockDownload()
 {
     int nFreshPeerHeight = -1;
-    int nKnownPeerHeight = -1;
+    // Activity-corroborated ahead height: max advertised height over peers
+    // whose forward evidence is current (fresh height claim, recent block
+    // delivery, or in-flight work). A single stale height claim with no
+    // activity on the connection no longer holds initialblockdownload=true
+    // indefinitely.
+    int nCorroboratedAheadPeerHeight = -1;
     int64_t nFreshPeerLastBlockRecv = 0;
     int64_t nLocalLastBlockRecv = 0;
     const auto RecordAndReturn = [&](bool fInitialBlockDownload,
@@ -5163,14 +5168,21 @@ bool IsInitialBlockDownload()
                 if (!pnode || pnode->fClient)
                     continue;
 
-                nKnownPeerHeight = std::max(
-                    nKnownPeerHeight,
-                    std::max(pnode->nBestKnownHeight, pnode->nChainHeight));
+                int nPeerAdvertisedHeight = std::max(pnode->nBestKnownHeight,
+                                                     pnode->nChainHeight);
                 bool fFreshHeight = pnode->nBestKnownHeight > 0 &&
                                     pnode->nLastHeightUpdate > 0 &&
                                     nNow - pnode->nLastHeightUpdate <= 120;
                 if (fFreshHeight)
                     nFreshPeerHeight = std::max(nFreshPeerHeight, pnode->nBestKnownHeight);
+
+                bool fRecentBlockRecv = pnode->nLastBlockRecv > 0 &&
+                                        nNow - pnode->nLastBlockRecv <= 120;
+                bool fHasOutstandingWork =
+                    !pnode->setBlocksInFlight.empty() || !pnode->mapAskFor.empty();
+                if (fFreshHeight || fRecentBlockRecv || fHasOutstandingWork)
+                    nCorroboratedAheadPeerHeight = std::max(
+                        nCorroboratedAheadPeerHeight, nPeerAdvertisedHeight);
 
                 if (pnode->nLastBlockRecv > nFreshPeerLastBlockRecv)
                     nFreshPeerLastBlockRecv = pnode->nLastBlockRecv;
@@ -5188,8 +5200,7 @@ bool IsInitialBlockDownload()
 
     unsigned int nTargetSpacing = GetTargetSpacingForHeight(nBestHeight + 1);
     int nLagTolerance = (nTargetSpacing <= 1) ? (int)GetArg("-ibdheightlag", 8) : nCoinbaseMaturity * 2;
-    if (std::max(nFreshPeerHeight, nKnownPeerHeight) >
-        nBestHeight + nLagTolerance)
+    if (nCorroboratedAheadPeerHeight > nBestHeight + nLagTolerance)
         return RecordAndReturn(true, ibdactivepath::IBD_REASON_PEER_AHEAD_LAG);
 
     if (fActiveCatchup)
