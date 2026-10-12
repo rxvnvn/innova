@@ -5150,11 +5150,17 @@ bool g_forceIbdPeerSnapshotUnavailableForTesting = false;
 // ---------------------------------------------------------------------------
 CCriticalSection cs_ibdFreshPeerGrace;
 int64_t nIbdFreshPeerGraceFirstSeen = 0;
+// Stage 3: last time an uncorroborated ahead claim existed at all. The clock
+// fully resets only once no uncorroborated ahead claim has existed for a full
+// grace window, so a peer cannot restart the window by dropping its inflated
+// height claim for a single evaluation.
+int64_t nIbdFreshPeerGraceLastSeen = 0;
 
 void ResetIbdFreshPeerGraceForTesting()
 {
     LOCK(cs_ibdFreshPeerGrace);
     nIbdFreshPeerGraceFirstSeen = 0;
+    nIbdFreshPeerGraceLastSeen = 0;
 }
 
 int64_t IbdFreshPeerGraceFirstSeenForTesting()
@@ -5163,12 +5169,27 @@ int64_t IbdFreshPeerGraceFirstSeenForTesting()
     return nIbdFreshPeerGraceFirstSeen;
 }
 
+// Stage 3 test hook: exposes the idle/reset companion clock.
+int64_t IbdFreshPeerGraceLastSeenForTesting()
+{
+    LOCK(cs_ibdFreshPeerGrace);
+    return nIbdFreshPeerGraceLastSeen;
+}
+
 // Backdates ("primes") the grace clock start so tests can exercise the expiry
 // transition without sleeping for the whole window.
 void PrimeIbdFreshPeerGraceFirstSeenForTesting(int64_t nFirstSeen)
 {
     LOCK(cs_ibdFreshPeerGrace);
     nIbdFreshPeerGraceFirstSeen = nFirstSeen;
+}
+
+// Stage 3: backdates the idle companion clock so tests can exercise the full
+// idle+reset transition without sleeping for the whole window.
+void PrimeIbdFreshPeerGraceLastSeenForTestingForTesting(int64_t nLastSeen)
+{
+    LOCK(cs_ibdFreshPeerGrace);
+    nIbdFreshPeerGraceLastSeen = nLastSeen;
 }
 
 // The grace window is the same value the predicate already uses as its
@@ -5202,22 +5223,31 @@ static int ResolveCorroboratedAheadPeerHeight(int nEngagedAheadHeight,
     bool fGraceExpired = false;
     {
         LOCK(cs_ibdFreshPeerGrace);
-        if (fEngagedAhead || !fUncorroboratedAhead)
+        if (fUncorroboratedAhead)
         {
-            // Genuine catch-up, or nothing claiming to be ahead: idle the clock
-            // so a later (possibly different) fresh claim starts full.
-            nIbdFreshPeerGraceFirstSeen = 0;
-        }
-        else if (nIbdFreshPeerGraceFirstSeen == 0)
-        {
-            // Start of a continuous uncorroborated-ahead burst.
-            nIbdFreshPeerGraceFirstSeen = nNow;
-        }
-        else
-        {
+            // Some peer (fresh or stale) claims to be ahead without engaged
+            // activity. Keep the burst clock running.
+            nIbdFreshPeerGraceLastSeen = nNow;
+            if (nIbdFreshPeerGraceFirstSeen == 0)
+            {
+                // Start of an uncorroborated-ahead burst. The clock restarts
+                // only after a full window WITHOUT any uncorroborated ahead
+                // claim (below), so a hostile peer cannot repeatedly re-arm it.
+                nIbdFreshPeerGraceFirstSeen = nNow;
+            }
             fGraceExpired = (nNow - nIbdFreshPeerGraceFirstSeen) >
                             IbdStaleSecondsForTesting();
         }
+        else if (nIbdFreshPeerGraceLastSeen == 0 ||
+                 nNow - nIbdFreshPeerGraceLastSeen > IbdStaleSecondsForTesting())
+        {
+            // No uncorroborated ahead claim for a full window: idle/reset the
+            // clock so a much later (possibly different) claim starts full.
+            nIbdFreshPeerGraceFirstSeen = 0;
+            nIbdFreshPeerGraceLastSeen = 0;
+        }
+        // Otherwise a claim just disappeared: hold the clock so a peer cannot
+        // restart it by dropping the claim for a single evaluation tick.
     }
 
     if (fEngagedAhead)

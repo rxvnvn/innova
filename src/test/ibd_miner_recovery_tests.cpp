@@ -27,6 +27,14 @@
 extern void TxnDBShutdown();
 extern CWallet* pwalletMain;
 
+// main.cpp Stage 3 test hook (declared here because it was added after the
+// Stage 2 hooks in main.h, to avoid touching the shipped header surface).
+void PrimeIbdFreshPeerGraceLastSeenForTestingForTesting(int64_t nLastSeen);
+
+// main.cpp Stage 3 test hook (defined in main.cpp alongside the other IBD
+// grace-window test hooks; declared by including main.h for the others).
+void PrimeIbdFreshPeerGraceLastSeenForTestingForTesting(int64_t nLastSeen);
+
 namespace
 {
 
@@ -507,7 +515,8 @@ BOOST_AUTO_TEST_CASE(ibd_fresh_stale_flap_does_not_restart_grace_window)
     // Stale uncorroborated claim does not hold IBD ...
     BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
     // ... and the clock keeps running (claim still present, uncorroborated).
-    BOOST_CHECK_EQUAL(IbdFreshPeerGraceFirstSeenForTesting(), nPrimed);
+    const int64_t nFirstAfterStale = IbdFreshPeerGraceFirstSeenForTesting();
+    BOOST_CHECK_EQUAL(nFirstAfterStale, nPrimed);
 
     // Now the same peer sends a FRESH update for the same inflated height: the
     // window must NOT restart, so it still must not hold IBD.
@@ -515,26 +524,102 @@ BOOST_AUTO_TEST_CASE(ibd_fresh_stale_flap_does_not_restart_grace_window)
     BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
     BOOST_CHECK_EQUAL(IbdFreshPeerGraceFirstSeenForTesting(), nPrimed);
 
-    // Once the ahead claim disappears the clock idles; a later fresh claim then
-    // gets a full window again.
+    // Stage 3: once the ahead claim disappears the clock IDLES (firstSeen is
+    // retained) and only fully resets after a FULL grace window without any
+    // uncorroborated ahead claim. A fresh claim that reappears quickly must
+    // therefore resume the expired burst, not restart it.
     {
         LOCK(cs_vNodes);
         vNodes.clear();
     }
     BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
-    BOOST_CHECK_EQUAL(IbdFreshPeerGraceFirstSeenForTesting(), (int64_t)0);
+    BOOST_CHECK_EQUAL(IbdFreshPeerGraceFirstSeenForTesting(), nPrimed);
 
     InstallPeer(peer);
-    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), true);
-    BOOST_CHECK(IbdFreshPeerGraceFirstSeenForTesting() > 0);
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false); // burst resumes, expired
+    BOOST_CHECK(IbdFreshPeerGraceLastSeenForTesting() >= nPrimed);
+
+    // Fully idle+reset (a much later genuinely new burst) is covered in
+    // ibd_grace_reset_by_brief_claim_drop_is_refused below.
 
     nTimeBestReceived = nLocalRecvSaved;
     ResetIbdFreshPeerGraceForTesting();
 }
 
-// ---------------------------------------------------------------------------
-// Stage 2 (b): multithreaded status aggregation (per-worker OR, untorn reads).
-// ---------------------------------------------------------------------------
+// Stage 3 regression: the DOCUMENTED grace-window reset evasion. A peer drops
+// its inflated height claim for one evaluation (the node re-evaluates IBD every
+// second), the idle clock resets, and the next fresh claim re-arms a FULL
+// window. Under Stage 3 the reset requires a FULL window without any
+// uncorroborated ahead claim, so rapid claim dropping cannot extend mining
+// suppression beyond BURST + GAP, both bounded by the same grace window.
+BOOST_AUTO_TEST_CASE(ibd_grace_reset_by_brief_claim_drop_is_refused)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedIBDRecoveryState scope;
+    ResetIbdFreshPeerGraceForTesting();
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress_ibd_rec(195),
+               "ibd-rec-grace-reset-evasion", true);
+    ConfigurePeer(peer, /*nHeightDelta=*/+100000,
+                  /*nAgeHeightUpdate=*/0, /*nAgeBlockRecv=*/1000);
+    InstallPeer(peer);
+
+    int64_t nLocalRecvSaved = nTimeBestReceived;
+    nTimeBestReceived = GetTime(); // local chain progressing on its own
+
+    const int64_t nWindow = IbdStaleSecondsForTesting();
+    BOOST_CHECK(nWindow > 0);
+
+    // First burst: within grace the fresh inflated claim holds IBD ...
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), true);
+    // ... and the burst clock starts.
+    {
+        const bool fBurstClockStarted =
+            IbdFreshPeerGraceFirstSeenForTesting() > 0;
+        BOOST_CHECK(fBurstClockStarted);
+    }
+
+    // The claim disappears for a single evaluation: the fresh-only rule gives
+    // way, but the burst clock must NOT have been reset by this brief gap.
+    // The optimistic margin keeps this read robust against a local block
+    // confirmed between the two evaluations (claim never crosses the
+    // lag-tolerance floor).
+    const int nLocalHeightHop = nBestHeight;
+    ConfigurePeer(peer, const_cast<int&>(nLocalHeightHop) - nLocalHeightHop + 1,
+                  /*nAgeHeightUpdate=*/0, /*nAgeBlockRecv=*/1000);
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
+    BOOST_CHECK_MESSAGE(
+        IbdFreshPeerGraceFirstSeenForTesting() > 0,
+        "brief claim drop must NOT reset the burst clock");
+
+    // Claim returns: it must resume the SAME burst (not restart a full window).
+    // Prime the burst clock as expired so the resumed state is unambiguous.
+    PrimeIbdFreshPeerGraceFirstSeenForTesting(GetTime() - (nWindow + 5));
+    ConfigurePeer(peer, /*nHeightDelta=*/+100000, /*nAgeHeightUpdate=*/0,
+                  /*nAgeBlockRecv=*/1000);
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
+    BOOST_CHECK_MESSAGE(
+        IbdFreshPeerGraceFirstSeenForTesting() > 0 &&
+            IbdFreshPeerGraceLastSeenForTesting() > 0,
+        "returned claim must not have restarted the window");
+
+    // Idleness of a FULL window is required before the clock resets: prime the
+    // idle companion clock to the fully-idle branch, drop the claim once more,
+    // and confirm the reset now happens (fresh start for a genuinely new peer
+    // burst much later).
+    {
+        LOCK(cs_vNodes);
+        vNodes.clear();
+    }
+    PrimeIbdFreshPeerGraceLastSeenForTestingForTesting(
+        GetTime() - (nWindow + 5));
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
+    BOOST_CHECK_EQUAL(IbdFreshPeerGraceFirstSeenForTesting(), (int64_t)0);
+    BOOST_CHECK_EQUAL(IbdFreshPeerGraceLastSeenForTesting(), (int64_t)0);
+
+    nTimeBestReceived = nLocalRecvSaved;
+    ResetIbdFreshPeerGraceForTesting();
+}
 
 BOOST_AUTO_TEST_CASE(controller_multithread_status_aggregation_is_per_worker_or)
 {

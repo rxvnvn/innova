@@ -598,6 +598,8 @@ extern bool g_forceIbdPeerSnapshotUnavailableForTesting;
 // mirrors the g_forceIbdPeerSnapshotUnavailableForTesting test-reset pattern).
 void ResetIbdFreshPeerGraceForTesting();
 int64_t IbdFreshPeerGraceFirstSeenForTesting();
+// Stage 3 test hook: exposes the idle/reset companion clock.
+int64_t IbdFreshPeerGraceLastSeenForTesting();
 void PrimeIbdFreshPeerGraceFirstSeenForTesting(int64_t nFirstSeen);
 int64_t IbdStaleSecondsForTesting();
 std::string GetWarnings(std::string strFor);
