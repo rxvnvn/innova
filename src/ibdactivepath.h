@@ -51,6 +51,10 @@ enum IBDStateReason
     IBD_REASON_ACTIVE_CATCHUP,
     IBD_REASON_STALE_RECV,
     IBD_REASON_PEER_SNAPSHOT_UNAVAILABLE,
+    // Stage 2: a fresh-only peer-ahead claim whose bounded grace window expired
+    // without engaged corroboration. Recorded for observability; the predicate
+    // returns not-IBD in this case (falls through the remaining rules).
+    IBD_REASON_PEER_AHEAD_LAG_UNCORROBORATED,
     IBD_REASON_NOT_IBD
 };
 

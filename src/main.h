@@ -594,6 +594,12 @@ int64_t GetCNValidationLastGuardHeight();
 void ResetCNValidationCountersForTesting();
 bool ShouldValidateCollateralnodePayments(CBlockIndex* pindex, bool fJustCheck, bool fCollateralnodePaymentsEnabled);
 extern bool g_forceIbdPeerSnapshotUnavailableForTesting;
+// Stage 2 grace-window test hooks (function-static state inside main.cpp;
+// mirrors the g_forceIbdPeerSnapshotUnavailableForTesting test-reset pattern).
+void ResetIbdFreshPeerGraceForTesting();
+int64_t IbdFreshPeerGraceFirstSeenForTesting();
+void PrimeIbdFreshPeerGraceFirstSeenForTesting(int64_t nFirstSeen);
+int64_t IbdStaleSecondsForTesting();
 std::string GetWarnings(std::string strFor);
 bool GetTransaction(const uint256 &hash, CTransaction &tx, uint256 &hashBlock, bool s=false);
 bool GetKeyImage(CTxDB* ptxdb, ec_point& keyImage, CKeyImageSpent& keyImageSpent, bool& fInMempool);

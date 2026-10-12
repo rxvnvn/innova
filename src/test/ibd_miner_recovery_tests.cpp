@@ -252,7 +252,7 @@ BOOST_AUTO_TEST_CASE(controller_parked_worker_reports_running_but_not_hashing)
         [&nLive](CCPUMinerController& c, CWallet*, unsigned int, unsigned int,
                  uint64_t sessionId) {
             nLive++;
-            c.NotePaused(CCPUMinerController::PAUSE_IBD);
+            c.NotePaused(0, CCPUMinerController::PAUSE_IBD);
             while (!c.WaitForStop(sessionId, 10))
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             nLive--;
@@ -282,8 +282,8 @@ BOOST_AUTO_TEST_CASE(controller_hashing_worker_reports_hashing)
         [&nLive](CCPUMinerController& c, CWallet*, unsigned int, unsigned int,
                  uint64_t sessionId) {
             nLive++;
-            c.NotePaused(CCPUMinerController::PAUSE_NO_PEERS);
-            c.NoteHashing(100);
+            c.NotePaused(0, CCPUMinerController::PAUSE_NO_PEERS);
+            c.NoteHashing(0, 100);
             while (!c.WaitForStop(sessionId, 10))
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             nLive--;
@@ -312,9 +312,9 @@ BOOST_AUTO_TEST_CASE(controller_pause_then_resume_clears_pause_reason)
         [&nLive](CCPUMinerController& c, CWallet*, unsigned int, unsigned int,
                  uint64_t sessionId) {
             nLive++;
-            c.NotePaused(CCPUMinerController::PAUSE_CHAIN_STALE);
+            c.NotePaused(0, CCPUMinerController::PAUSE_CHAIN_STALE);
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            c.NoteHashing(1);
+            c.NoteHashing(0, 1);
             while (!c.WaitForStop(sessionId, 10))
                 std::this_thread::sleep_for(std::chrono::milliseconds(1));
             nLive--;
@@ -344,9 +344,9 @@ BOOST_AUTO_TEST_CASE(controller_status_consistency_parked_vs_hashing)
             nLive++;
             while (!c.WaitForStop(sessionId, 5))
             {
-                c.NotePaused(CCPUMinerController::PAUSE_WORK_REBUILD);
+                c.NotePaused(0, CCPUMinerController::PAUSE_WORK_REBUILD);
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
-                c.NoteHashing(1);
+                c.NoteHashing(0, 1);
                 std::this_thread::sleep_for(std::chrono::milliseconds(2));
                 std::atomic_thread_fence(std::memory_order_seq_cst);
                 nFlips.fetch_add(1);
@@ -367,6 +367,377 @@ BOOST_AUTO_TEST_CASE(controller_status_consistency_parked_vs_hashing)
 
     controller.Stop();
     nLive = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 (a): bounded grace window for FRESH-ONLY peer-ahead claims.
+// ---------------------------------------------------------------------------
+
+// (i) A peer that keeps sending fresh but FALSE height updates -- never
+// delivering blocks and never having work in flight -- holds IBD inside the
+// bounded grace window, but must NOT hold it once the continuous
+// uncorroborated-ahead burst persists beyond the window. ENGAGED corroboration
+// (work in flight) restores unbounded IBD.
+BOOST_AUTO_TEST_CASE(ibd_fresh_only_false_peer_holds_ibd_within_grace_then_expires)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedIBDRecoveryState scope;
+    ResetIbdFreshPeerGraceForTesting();
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress_ibd_rec(190),
+               "ibd-rec-fresh-false-grace", true);
+    ConfigurePeer(peer, /*nHeightDelta=*/+100000,
+                  /*nAgeHeightUpdate=*/0, /*nAgeBlockRecv=*/1000);
+    InstallPeer(peer);
+
+    int64_t nLocalRecvSaved = nTimeBestReceived;
+    nTimeBestReceived = GetTime(); // local chain progressing on its own
+
+    // Within grace: a fresh claim far ahead is still conservative.
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), true);
+    BOOST_CHECK(IbdFreshPeerGraceFirstSeenForTesting() > 0);
+
+    // Same continuous burst, now older than the bounded grace window.
+    const int64_t nWindow = IbdStaleSecondsForTesting();
+    BOOST_CHECK(nWindow > 0);
+    PrimeIbdFreshPeerGraceFirstSeenForTesting(GetTime() - (nWindow + 5));
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
+
+    // ENGAGED corroboration (outstanding/in-flight work) is unbounded and
+    // restores IBD even after the fresh-only window expired.
+    peer.setBlocksInFlight.insert(uint256(11));
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), true);
+
+    nTimeBestReceived = nLocalRecvSaved;
+    ResetIbdFreshPeerGraceForTesting();
+}
+
+// (ii) A genuinely catching-up peer WITH outstanding work stays IBD beyond the
+// grace window (engaged corroboration is unbounded).
+BOOST_AUTO_TEST_CASE(ibd_fresh_peer_with_outstanding_work_stays_ibd_beyond_grace)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedIBDRecoveryState scope;
+    ResetIbdFreshPeerGraceForTesting();
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress_ibd_rec(191),
+               "ibd-rec-fresh-work-beyond-grace", true);
+    ConfigurePeer(peer, /*nHeightDelta=*/+5000,
+                  /*nAgeHeightUpdate=*/0, /*nAgeBlockRecv=*/1000);
+    peer.setBlocksInFlight.insert(uint256(12));
+    InstallPeer(peer);
+
+    const int64_t nWindow = IbdStaleSecondsForTesting();
+    PrimeIbdFreshPeerGraceFirstSeenForTesting(GetTime() - (nWindow + 600));
+
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), true);
+    // The grace clock is idle while engaged corroboration exists.
+    BOOST_CHECK_EQUAL(IbdFreshPeerGraceFirstSeenForTesting(), (int64_t)0);
+
+    ResetIbdFreshPeerGraceForTesting();
+}
+
+// A peer with requested-but-not-yet-in-flight work (mapAskFor) is equally
+// engaged and therefore unbounded.
+BOOST_AUTO_TEST_CASE(ibd_fresh_peer_with_asked_work_stays_ibd_beyond_grace)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedIBDRecoveryState scope;
+    ResetIbdFreshPeerGraceForTesting();
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress_ibd_rec(192),
+               "ibd-rec-fresh-askfor-beyond-grace", true);
+    ConfigurePeer(peer, /*nHeightDelta=*/+5000,
+                  /*nAgeHeightUpdate=*/0, /*nAgeBlockRecv=*/1000);
+    CInv askInv(MSG_BLOCK, uint256(13));
+    peer.mapAskFor.insert(std::make_pair((int64_t)0, askInv));
+    InstallPeer(peer);
+
+    const int64_t nWindow = IbdStaleSecondsForTesting();
+    PrimeIbdFreshPeerGraceFirstSeenForTesting(GetTime() - (nWindow + 600));
+
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), true);
+    ResetIbdFreshPeerGraceForTesting();
+}
+
+// (iii) A peer that is actually DELIVERING blocks (fresh height claim plus
+// recent block receipt) stays IBD beyond the grace window.
+BOOST_AUTO_TEST_CASE(ibd_fresh_peer_with_recent_block_delivery_stays_ibd_beyond_grace)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedIBDRecoveryState scope;
+    ResetIbdFreshPeerGraceForTesting();
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress_ibd_rec(193),
+               "ibd-rec-fresh-delivery-beyond-grace", true);
+    ConfigurePeer(peer, /*nHeightDelta=*/+5000,
+                  /*nAgeHeightUpdate=*/0, /*nAgeBlockRecv=*/0);
+    InstallPeer(peer);
+
+    const int64_t nWindow = IbdStaleSecondsForTesting();
+    PrimeIbdFreshPeerGraceFirstSeenForTesting(GetTime() - (nWindow + 600));
+
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), true);
+    ResetIbdFreshPeerGraceForTesting();
+}
+
+// A stale/fresh FLAP must not restart the bounded window: the grace clock runs
+// for as long as some peer claims to be ahead without engaged activity,
+// regardless of whether that claim is currently fresh. Once the claim is gone
+// entirely the clock idles and a later fresh claim starts with a full window.
+BOOST_AUTO_TEST_CASE(ibd_fresh_stale_flap_does_not_restart_grace_window)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+    CScopedIBDRecoveryState scope;
+    ResetIbdFreshPeerGraceForTesting();
+
+    CNode peer(INVALID_SOCKET, TestPeerAddress_ibd_rec(194),
+               "ibd-rec-fresh-stale-flap", true);
+    ConfigurePeer(peer, /*nHeightDelta=*/+100000,
+                  /*nAgeHeightUpdate=*/121, /*nAgeBlockRecv=*/1000); // stale claim
+    InstallPeer(peer);
+
+    int64_t nLocalRecvSaved = nTimeBestReceived;
+    nTimeBestReceived = GetTime();
+
+    const int64_t nWindow = IbdStaleSecondsForTesting();
+    const int64_t nPrimed = GetTime() - (nWindow + 5);
+    PrimeIbdFreshPeerGraceFirstSeenForTesting(nPrimed);
+
+    // Stale uncorroborated claim does not hold IBD ...
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
+    // ... and the clock keeps running (claim still present, uncorroborated).
+    BOOST_CHECK_EQUAL(IbdFreshPeerGraceFirstSeenForTesting(), nPrimed);
+
+    // Now the same peer sends a FRESH update for the same inflated height: the
+    // window must NOT restart, so it still must not hold IBD.
+    peer.nLastHeightUpdate = GetTime();
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
+    BOOST_CHECK_EQUAL(IbdFreshPeerGraceFirstSeenForTesting(), nPrimed);
+
+    // Once the ahead claim disappears the clock idles; a later fresh claim then
+    // gets a full window again.
+    {
+        LOCK(cs_vNodes);
+        vNodes.clear();
+    }
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), false);
+    BOOST_CHECK_EQUAL(IbdFreshPeerGraceFirstSeenForTesting(), (int64_t)0);
+
+    InstallPeer(peer);
+    BOOST_CHECK_EQUAL(IsInitialBlockDownload(), true);
+    BOOST_CHECK(IbdFreshPeerGraceFirstSeenForTesting() > 0);
+
+    nTimeBestReceived = nLocalRecvSaved;
+    ResetIbdFreshPeerGraceForTesting();
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 (b): multithreaded status aggregation (per-worker OR, untorn reads).
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(controller_multithread_status_aggregation_is_per_worker_or)
+{
+    // Phase 0: every worker parked. Phase 1: worker 0 hashing, worker 1 parked.
+    // Phase 2: worker 0 parked again.
+    std::atomic<int> nPhase(0);
+    std::atomic<bool> fStopReaders(false);
+    std::atomic<int> nTornReads(0);
+    std::atomic<int> nReaders(0);
+    std::atomic<int> nLive(0);
+
+    CCPUMinerController controller(
+        [&](CCPUMinerController& c, CWallet*, unsigned int nWorkerId, unsigned int,
+            uint64_t sessionId) {
+            nLive++;
+            if (nWorkerId == 0)
+            {
+                while (!c.WaitForStop(sessionId, 2))
+                {
+                    const int n = nPhase.load();
+                    if (n == 1)
+                        c.NoteHashing(0, 10);
+                    else
+                        c.NotePaused(0, n == 0 ? CCPUMinerController::PAUSE_WORK_REBUILD
+                                               : CCPUMinerController::PAUSE_CHAIN_STALE);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                }
+            }
+            else
+            {
+                // A parked worker that keeps (re)announcing its pause reason must
+                // never clear another worker's hashing state.
+                c.NotePaused(nWorkerId, CCPUMinerController::PAUSE_IBD);
+                while (!c.WaitForStop(sessionId, 2))
+                {
+                    c.NotePaused(nWorkerId, CCPUMinerController::PAUSE_IBD);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                }
+            }
+            nLive--;
+        });
+
+    std::string strError;
+    BOOST_REQUIRE(controller.Start(pwalletMain, 2, strError));
+    for (int i = 0; i < 5000 && nLive.load() < 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    BOOST_REQUIRE_EQUAL(nLive.load(), 2);
+
+    // Concurrent readers: assert the snapshot is never internally torn, i.e.
+    // never "hashing with a pause reason" and never "hashing with zero hashing
+    // workers".
+    std::vector<std::thread> readers;
+    for (int r = 0; r < 4; ++r)
+    {
+        readers.push_back(std::thread([&]() {
+            nReaders++;
+            while (!fStopReaders.load())
+            {
+                CCPUMinerController::Status s = controller.GetStatus();
+                if ((s.hashing && s.pauseReason != (int)CCPUMinerController::PAUSE_NONE) ||
+                    (s.hashing && s.hashingWorkers <= 0) ||
+                    (s.hashingWorkers < 0))
+                    nTornReads.fetch_add(1);
+            }
+            nReaders--;
+        }));
+    }
+
+    // Phase 0: both workers parked.
+    bool fSawParked = false;
+    for (int i = 0; i < 5000 && !fSawParked; ++i)
+    {
+        CCPUMinerController::Status s = controller.GetStatus();
+        fSawParked = !s.hashing && s.pauseReason != (int)CCPUMinerController::PAUSE_NONE &&
+                     s.activeThreads == 2;
+        if (!fSawParked)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    BOOST_CHECK(fSawParked);
+    {
+        CCPUMinerController::Status s = controller.GetStatus();
+        BOOST_CHECK_EQUAL(s.activeThreads, 2);
+        BOOST_CHECK_EQUAL(s.requestedThreads, 2);
+        BOOST_CHECK(!s.hashing);
+        BOOST_CHECK_EQUAL(s.hashingWorkers, 0);
+    }
+
+    // Phase 1: worker 0 hashes while worker 1 keeps announcing a pause.
+    nPhase.store(1);
+    bool fSawHashing = false;
+    for (int i = 0; i < 5000 && !fSawHashing; ++i)
+    {
+        fSawHashing = controller.GetStatus().hashing;
+        if (!fSawHashing)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    BOOST_CHECK(fSawHashing);
+    {
+        CCPUMinerController::Status s = controller.GetStatus();
+        BOOST_CHECK(s.hashing);
+        BOOST_CHECK_EQUAL(s.hashingWorkers, 1);
+        BOOST_CHECK_EQUAL(s.pauseReason, (int)CCPUMinerController::PAUSE_NONE);
+        BOOST_CHECK_EQUAL(s.activeThreads, 2);
+        BOOST_CHECK_EQUAL(s.requestedThreads, 2);
+        BOOST_CHECK(s.running);
+    }
+
+    // Phase 2: worker 0 parks too; the aggregate must go to not-hashing with a
+    // real pause reason.
+    nPhase.store(2);
+    bool fSawPausedAgain = false;
+    for (int i = 0; i < 5000 && !fSawPausedAgain; ++i)
+    {
+        CCPUMinerController::Status s = controller.GetStatus();
+        fSawPausedAgain = !s.hashing;
+        if (!fSawPausedAgain)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    BOOST_CHECK(fSawPausedAgain);
+    {
+        CCPUMinerController::Status s = controller.GetStatus();
+        BOOST_CHECK(!s.hashing);
+        BOOST_CHECK_EQUAL(s.hashingWorkers, 0);
+        BOOST_CHECK(s.pauseReason != (int)CCPUMinerController::PAUSE_NONE);
+        BOOST_CHECK_EQUAL(s.activeThreads, 2);
+    }
+
+    fStopReaders.store(true);
+    for (std::thread& t : readers)
+        t.join();
+    BOOST_CHECK_EQUAL(nReaders.load(), 0);
+    BOOST_CHECK_EQUAL(nTornReads.load(), 0);
+
+    controller.Stop();
+    {
+        CCPUMinerController::Status s = controller.GetStatus();
+        BOOST_CHECK(!s.hashing);
+        BOOST_CHECK_EQUAL(s.hashingWorkers, 0);
+        BOOST_CHECK_EQUAL(s.activeThreads, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2 (c): totalHashes / lastHashProgress reliability.
+// ---------------------------------------------------------------------------
+
+BOOST_AUTO_TEST_CASE(controller_total_hashes_accumulate_and_progress_advances)
+{
+    std::atomic<bool> fGo(false);
+    std::atomic<bool> fDone(false);
+
+    CCPUMinerController controller(
+        [&](CCPUMinerController& c, CWallet*, unsigned int, unsigned int,
+            uint64_t sessionId) {
+            c.NotePaused(0, CCPUMinerController::PAUSE_IBD);
+            while (!fGo.load() && !c.WaitForStop(sessionId, 2))
+            {
+            }
+            // Three reported batches, one of them with zero new hashes.
+            c.NoteHashing(0, 1000);
+            c.NoteHashing(0, 500);
+            c.NoteHashing(0, 0);
+            // "No per-hash accumulation": many zero-progress calls must not
+            // inflate the counter, and the counter must not add a hidden +1.
+            for (int i = 0; i < 200; ++i)
+                c.NoteHashing(0, 0);
+            fDone.store(true);
+            while (!c.WaitForStop(sessionId, 5))
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        });
+
+    std::string strError;
+    BOOST_REQUIRE(controller.Start(pwalletMain, 1, strError));
+
+    // Wait until the worker has announced it is parked and has not yet hashed.
+    bool fParked = false;
+    for (int i = 0; i < 5000 && !fParked; ++i)
+    {
+        fParked = controller.GetStatus().pauseReason == (int)CCPUMinerController::PAUSE_IBD;
+        if (!fParked)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    BOOST_REQUIRE(fParked);
+
+    CCPUMinerController::Status before = controller.GetStatus();
+    BOOST_CHECK_EQUAL(before.totalHashes, (unsigned long long)0);
+    BOOST_CHECK_EQUAL(before.lastHashProgress, (int64_t)0);
+
+    fGo.store(true);
+    for (int i = 0; i < 5000 && !fDone.load(); ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    BOOST_REQUIRE(fDone.load());
+
+    CCPUMinerController::Status after = controller.GetStatus();
+    BOOST_CHECK_EQUAL(after.totalHashes, (unsigned long long)1500);
+    BOOST_CHECK(after.hashing);
+    BOOST_CHECK_EQUAL(after.hashingWorkers, 1);
+    BOOST_CHECK_EQUAL(after.pauseReason, (int)CCPUMinerController::PAUSE_NONE);
+    BOOST_CHECK(after.lastHashProgress > before.lastHashProgress);
+    BOOST_CHECK_GE(after.lastHashProgress, GetTime() - 5);
+    BOOST_CHECK_LE(after.lastHashProgress, GetTime());
+
+    controller.Stop();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

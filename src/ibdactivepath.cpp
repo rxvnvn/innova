@@ -420,6 +420,7 @@ static const char* IBDStateReasonName(int nReason)
     case IBD_REASON_ACTIVE_CATCHUP: return "active-catchup";
     case IBD_REASON_STALE_RECV: return "stale-recv";
     case IBD_REASON_PEER_SNAPSHOT_UNAVAILABLE: return "peer-snapshot-unavailable";
+    case IBD_REASON_PEER_AHEAD_LAG_UNCORROBORATED: return "peer-ahead-lag-uncorroborated";
     case IBD_REASON_NOT_IBD: return "not-ibd";
     }
     return "unknown";
