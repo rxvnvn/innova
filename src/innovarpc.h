@@ -238,6 +238,7 @@ extern json_spirit::Value encryptwallet(const json_spirit::Array& params, bool f
 extern json_spirit::Value walletstatus(const json_spirit::Array& params, bool fHelp); //Q0FSU0VOIEtMT0NL
 extern json_spirit::Value validateaddress(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getinfo(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getibdmetrics(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value reservebalance(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value checkwallet(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value repairwallet(const json_spirit::Array& params, bool fHelp);

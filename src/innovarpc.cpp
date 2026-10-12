@@ -323,6 +323,7 @@ static const CRPCCommand vRPCCommands[] =
     { "dumpbootstrap",          &dumpbootstrap,          false,  false },
     { "getdifficulty",          &getdifficulty,          true,   false },
     { "getinfo",                &getinfo,                true,   false },
+    { "getibdmetrics",          &getibdmetrics,          true,   false },
 	{ "walletstatus",           &walletstatus,           true,   false },
     { "getsubsidy",             &getsubsidy,             true,   false },
     { "getmininginfo",          &getmininginfo,          true,   false },
