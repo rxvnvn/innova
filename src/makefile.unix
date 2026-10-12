@@ -589,6 +589,7 @@ TEST_OBJS= \
     obj/test/blockindex_tip_tests.o \
     obj/test/blockindex_r3f_crossstore_tests.o \
     obj/test/blockindex_crash_corruption_tests.o \
+    obj/test/blockindex_stagea_crash_tests.o \
     obj/test/blockindex_live_tail_tests.o \
     obj/test/blockindex_live_tail_full_tests.o \
     obj/test/blockindex_live_acceptance_tests.o \

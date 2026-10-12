@@ -1240,6 +1240,32 @@ struct BlockIndexTipAuthority::Impl
                                const std::vector<BlockIndexId>& newActive,
                                std::string* error);
 
+    // Roll an already-published (renamed over) reorg store set BACK to the
+    // in-memory pre-reorg committed state, so the STILL-open authority never
+    // serves bytes that the last committed tip.meta does not describe. Used
+    // when a ReorgActiveTo aborts after the store swap is durable but before
+    // the (single) tip.meta commit point. The retained records/derived
+    // prefixes of the swapped files are bytewise identical to the committed
+    // ones (RewriteStoresForReorg copies them through the same codecs), so
+    // only the ACTIVE store must be trimmed back to its pre-reorg length;
+    // restart-of-the-same-image recovers the same state via Open's normal
+    // uncommitted-tail truncation + digest validation (no special journal).
+    bool RollBackPublishedReorgStores(uint64_t keepActive, std::string* error);
+
+    // Stage-A: write the UNDO BACKUP of the ACTIVE store (exact current
+    // bytes, CoW tmp + fsync + rename + dirsync) BEFORE the reorg store set
+    // is swapped over the authoritative paths. The ACTIVE store is the only
+    // reorg store whose post-swap content is NOT derivable from the last
+    // committed tip.meta (its reorg branch ids are not reconstructible), so
+    // an interrupted reorg cannot be repaired without these bytes.
+    bool WriteActiveUndoBackup(std::string* error);
+    // Stage-A: restore the ACTIVE store from the undo backup (atomic rename
+    // over the current file + dirsync). Returns false when no backup exists.
+    bool RestoreActiveFromUndoBackup(std::string* error);
+    std::string ActiveUndoBackupPath() const
+    { return (tipDir / "tip-active.dat.bak").string(); }
+    void RemoveActiveUndoBackup(std::string* error);
+
     bool WriteMeta(std::string* error)
     {
         std::string encoded;
@@ -1464,6 +1490,69 @@ bool BlockIndexTipAuthority::Impl::RewriteStoresForReorg(
             return SetError(error, "reorg active count update failed: " + cerr);
     }
     return true;
+}
+
+// Stage-A: undo backup of the ACTIVE store (exact bytes of the CURRENT
+// tip-active.dat, CoW tmp + fsync + rename + dirsync). Written by reorg
+// publications BEFORE any store is renamed over; consumed by Open when the
+// digest validation detects an interrupted reorg (see Open's recovery path).
+bool BlockIndexTipAuthority::Impl::WriteActiveUndoBackup(std::string* error)
+{
+    // Reading tip-active.dat here is safe: only this authority owns the dir,
+    // and the backup runs BEFORE any swap. The active window's own handle is
+    // not used (positional windows share the path, not a held FILE*).
+    std::string cur;
+    if (!ReadWholeFile(activePath, &cur))
+        return SetError(error, "reorg active undo backup read failed");
+    const fs::path tmp(activePath.string() + ".bak.tmp");
+    FILE* f = fopen(tmp.string().c_str(), "wb");
+    if (!f)
+        return SetError(error, "reorg active undo backup open failed");
+    if (!cur.empty() && fwrite(cur.data(), 1, cur.size(), f) != cur.size())
+    {
+        fclose(f);
+        return SetError(error, "reorg active undo backup write failed");
+    }
+    if (!FileCommitChecked(f, error))
+    {
+        fclose(f);
+        return false;
+    }
+    if (fclose(f) != 0)
+        return SetError(error, "reorg active undo backup close failed");
+    if (!RenameOverChecked(tmp, fs::path(ActiveUndoBackupPath()), error))
+        return false;
+    return SyncDirectoryChecked(tipDir, error);
+}
+
+// Stage-A: restore the ACTIVE store from its undo backup (atomic rename over
+// the current file). Concurrent reorgs are excluded by cs_main on the caller
+// side; a rename-move of the backup is correct even after restore (the
+// backup file is gone).
+bool BlockIndexTipAuthority::Impl::RestoreActiveFromUndoBackup(std::string* error)
+{
+    const std::string backupPath = ActiveUndoBackupPath();
+    boost::system::error_code ec;
+    if (!fs::exists(fs::path(backupPath), ec))
+        return false; // no backup -> not recoverable through this seam
+    if (!RenameOverChecked(fs::path(backupPath), activePath, error))
+        return false;
+    return SyncDirectoryChecked(tipDir, error);
+}
+
+void BlockIndexTipAuthority::Impl::RemoveActiveUndoBackup(std::string* error)
+{
+    boost::system::error_code ec;
+    fs::remove(fs::path(ActiveUndoBackupPath()), ec);
+    if (ec)
+    {
+        if (error) *error = "reorg active undo backup remove failed: " + ec.message();
+        return;
+    }
+    // Best-effort dirsync so the cleanup itself is durable.
+    std::string derr;
+    if (!SyncDirectoryChecked(tipDir, &derr) && error)
+        *error = derr;
 }
 
 BlockIndexTipAuthority::BlockIndexTipAuthority()
@@ -1704,31 +1793,120 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
         SHA256_Update(&ctx, &meta.activeFence, 1);
         SHA256_Final(digest, &ctx);
     }
+    bool bakPresent = false;
+    {
+        boost::system::error_code ecBak;
+        bakPresent = fs::exists(fs::path(i->ActiveUndoBackupPath().c_str()), ecBak);
+    }
     if (memcmp(digest, meta.contentDigest, 32) != 0)
     {
         if (!repaired)
-            return SetError(error, "tip store content digest mismatch (corrupt)");
-        // repaired an uncommitted tail: recompute the digest and re-publish
-        // tip.meta so the committed state stays consistent. The authoritative
-        // bytes are ALREADY exactly the committed region (the tail was
-        // physically truncated above), so only meta's digest field changes.
-        unsigned char newDigest[32];
-        memcpy(newDigest, digest, 32);
-        i->meta.contentDigest[0] = 0; // marker: publish below via a v3 write
-        // NOTE (Repair #3): the earlier full re-write of the stores here was
-        // byte-identical to what is already committed (they decoded to the
-        // same vectors and re-encoded through the same codecs); the O(N)
-        // rewrite is unnecessary. Only tip.meta is re-published.
-        BlockIndexTipMeta fixedMeta = meta;
-        fixedMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
-        memcpy(fixedMeta.contentDigest, newDigest, 32);
-        i->meta = fixedMeta;
-        if (!i->WriteMeta(error))
         {
-            i->meta = meta;
-            return SetError(error, "repair tip.meta re-publish failed");
+            // Stage-A interrupted-reorg recovery: an aborted reorg publication
+            // crashed between the ACTIVE store swap (RewriteStoresForReorg)
+            // and the tip.meta commit. The active store's post-swap content is
+            // NOT derivable from tip.meta, but its exact pre-swap bytes were
+            // durably snapshotted in tip-active.dat.bak (WriteActiveUndoBackup
+            // runs BEFORE any swap). Restore the backup (atomic rename), then
+            // re-run the whole validation on the restored files. Anything else
+            // -- real store corruption, a torn meta, a missing backup -- keeps
+            // the legacy fail-closed contract (never a silent rebuild).
+            std::string restErr;
+            bool recovered = false;
+            if (i->RestoreActiveFromUndoBackup(&restErr))
+            {
+                if (!i->recordsWin.InitializeCount(meta.tipRecordCount, &werrW) ||
+                    !i->derivedWin.InitializeCount(meta.tipRecordCount, &werrW) ||
+                    !i->activeWin.InitializeCount(expectedActive, &werrW))
+                    return SetError(error, "tip window init after undo-restore failed: " + werrW);
+                if (i->BuildChainsForStreaming())
+                {
+                    if (metaIsV3)
+                    {
+                        DigestV3Finalize(i->chainR, i->chainD, i->chainA, meta.activeFence, digest);
+                    }
+                    else
+                    {
+                        SHA256_CTX ctxR;
+                        SHA256_Init(&ctxR);
+                        unsigned char bufR[68];
+                        const uint64_t nR = meta.tipRecordCount, nD = meta.tipRecordCount,
+                                       nA = expectedActive;
+                        for (uint64_t s = 0; s < nR; ++s)
+                        {
+                            std::string gerrR;
+                            if (!i->recordsWin.StreamVisit(s, s + 1,
+                                    [&bufR, &ctxR](uint64_t, const BlockIndexRecord& r) {
+                                        size_t n = EncodeRecordDigestBytes(r, bufR);
+                                        SHA256_Update(&ctxR, bufR, n);
+                                        return true;
+                                    }, &gerrR))
+                                return SetError(error, "tip-records streaming digest failed (undo-restore)");
+                        }
+                        for (uint64_t s = 0; s < nD; ++s)
+                        {
+                            std::string gerrR;
+                            if (!i->derivedWin.StreamVisit(s, s + 1,
+                                    [&bufR, &ctxR](uint64_t, const BlockIndexDerivedEntry& d) {
+                                        size_t n = EncodeDerivedDigestBytes(d, bufR);
+                                        SHA256_Update(&ctxR, bufR, n);
+                                        return true;
+                                    }, &gerrR))
+                                return SetError(error, "tip-derived streaming digest failed (undo-restore)");
+                        }
+                        for (uint64_t s = 0; s < nA; ++s)
+                        {
+                            std::string gerrR;
+                            if (!i->activeWin.StreamVisit(s, s + 1,
+                                    [&bufR, &ctxR](uint64_t, const BlockIndexId& id) {
+                                        EncodeActiveDigestBytes(id, bufR);
+                                        SHA256_Update(&ctxR, bufR, 8);
+                                        return true;
+                                    }, &gerrR))
+                                return SetError(error, "tip-active streaming digest failed (undo-restore)");
+                        }
+                        SHA256_Update(&ctxR, &meta.activeFence, 1);
+                        SHA256_Final(digest, &ctxR);
+                    }
+                    recovered = (memcmp(digest, meta.contentDigest, 32) == 0);
+                }
+            }
+            if (!recovered)
+                return SetError(error, "tip store content digest mismatch (corrupt)");
+            // Restored state == last committed authority; continue.
         }
-        i->meta = fixedMeta;
+        else
+        {
+            // repaired an uncommitted tail: recompute the digest and re-publish
+            // tip.meta so the committed state stays consistent. The authoritative
+            // bytes are ALREADY exactly the committed region (the tail was
+            // physically truncated above), so only meta's digest field changes.
+            unsigned char newDigest[32];
+            memcpy(newDigest, digest, 32);
+            // NOTE (Repair #3): the earlier full re-write of the stores here was
+            // byte-identical to what is already committed (they decoded to the
+            // same vectors and re-encoded through the same codecs); the O(N)
+            // rewrite is unnecessary. Only tip.meta is re-published.
+            BlockIndexTipMeta preRepairMeta = meta; // for the rollback on failure
+            BlockIndexTipMeta fixedMeta = meta;
+            fixedMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
+            memcpy(fixedMeta.contentDigest, newDigest, 32);
+            i->meta = fixedMeta;
+            if (!i->WriteMeta(error))
+            {
+                i->meta = preRepairMeta;
+                return SetError(error, "repair tip.meta re-publish failed");
+            }
+            i->meta = fixedMeta;
+        }
+    }
+    else if (bakPresent)
+    {
+        // Stage-A: a clean open with a leftover undo backup (crash between the
+        // meta commit and the backup removal) is fully valid; drop the backup.
+        std::string bakErr;
+        i->RemoveActiveUndoBackup(&bakErr);
+        (void)bakErr;
     }
 
     // For a non-v3 meta, the RAM chains are now built above (streaming); they
@@ -2223,10 +2401,33 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     //    renamed over the authoritative file, and the dir synced (fail
     //    closed on any error); tip.meta is published LAST (single commit).
     std::string werr;
+    // Stage-A: the ACTIVE store is the only reorg store whose post-swap
+    // content is NOT derivable from the last committed tip.meta, so snapshot
+    // its exact current bytes into the undo backup BEFORE any swap. If this
+    // fails the reorg is refused (fail closed, nothing published, no
+    // unrecoverable state can be created).
+    if (!i->WriteActiveUndoBackup(&werr))
+        return SetError(error, "reorg active undo backup failed: " + werr),
+               BLOCK_INDEX_TIP_IO_ERROR;
     if (!i->RewriteStoresForReorg(keepActive, committedRecords,
                                   appendRecords, appendDerived, newActive,
                                   &werr))
         return SetError(error, "reorg store stream failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
+    // Test-only crash/abort point AFTER the stores were physically swapped over
+    // their authoritative paths (but before tip.meta advances): the undo
+    // backup of the ACTIVE store written above holds the exact pre-reorg
+    // bytes, so a RESTART fully recovers the committed authority (Open detects
+    // the digest mismatch and restores from the backup). The STILL-OPEN
+    // authority must NOT keep serving from the swapped (uncommitted) image;
+    // fail-stop: close it so subsequent calls return "tip not open" (the
+    // standard recovery contract is Close+Open -- a clean restart equivalent).
+    if (BlockIndexTipFailpointHit("FP_AFTER_REORG_TAIL_PUBLISHED"))
+    {
+        Close();
+        const std::string fpErr = "failpoint FP_AFTER_REORG_TAIL_PUBLISHED";
+        if (error) *error = fpErr;
+        return BLOCK_INDEX_TIP_IO_ERROR;
+    }
 
     // 3b. Side index: Put the appended records' hashes (O(new)); entries are
     //     uncommitted until tip.meta advances (reconciled at Open).
