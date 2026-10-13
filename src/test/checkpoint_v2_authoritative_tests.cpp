@@ -41,6 +41,8 @@
 #include "blockindex_manager.h"
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
+#include "blockindex_native_bootstrap.h"
+#include "blockindex_startup_ownership.h"
 #include "leveldb/db.h"
 
 namespace fs = boost::filesystem;
@@ -110,11 +112,23 @@ static void CkptAVBuildRoot(const fs::path& root, std::string* error)
 // from the live fixture chain. RAII: the destructor restores every touched
 // global even when a BOOST_REQUIRE aborts the case (the exception unwinds
 // through it), so one failing case cannot leave the authority initialized.
+//
+// Shared-chain isolation (P4): during the authoritative phase the production
+// bounded-residency retirer (RetireBlockIndexBelowFloor, main.cpp) FREES every
+// mapBlockIndex entry below the live floor and detaches survivor links. The
+// shared regtest chain (that later suites in the SAME process depend on, e.g.
+// checkpoint_v2_startup_tests' chain walk) would be destroyed and the saved
+// pointers would become DANGLING. So the shared chain is moved aside into a
+// protected member before InitBlockIndexAuthoritative and swapped back on
+// teardown, exactly as the p06_residency suite does (P06SharedIndexIsolation);
+// only case-local authoritative entries are freed. This is a TEST-fixture
+// concern only: a real daemon boots once and never restores pre-startup
+// pointers over freed authoritative objects.
 struct CkptAVFixture
 {
     fs::path root;
     bool started;
-    std::map<uint256, CBlockIndex*> mapBlockIndex;
+    std::map<uint256, CBlockIndex*> mapBlockIndex;  // protected shared chain (swapped out)
     std::map<uint256, CandidateTipRecord> mapCandidateTips;
     std::set<std::pair<COutPoint, unsigned int> > setStakeSeen;
     CBlockIndex* pindexBest;
@@ -134,7 +148,7 @@ struct CkptAVFixture
 
     void Start(int minBaseHeight)
     {
-        mapBlockIndex = ::mapBlockIndex;
+        mapBlockIndex.clear();
         mapCandidateTips = ::mapCandidateTips;
         setStakeSeen = ::setStakeSeen;
         pindexBest = ::pindexBest;
@@ -152,6 +166,14 @@ struct CkptAVFixture
         while (tip->nHeight < minBaseHeight)
             tip = CkptAVMine(tip, 0xF000u + (unsigned)tip->nHeight, true);
 
+        // The protected shared chain is swapped below, so the restored
+        // pindexBest / hashBestChain must reflect the chain AS MINED (the tip
+        // we just built), not the stale pre-mining value captured above.
+        pindexBest = tip;
+        hashBestChain = tip->GetBlockHash();
+        nBestHeight = tip->nHeight;
+        nBestChainTrust = tip->nChainTrust;
+
         // Capture hashes (values only, no pointers) of the base generation
         // chain BEFORE startup: below the residency floor these objects are
         // freed by RetireBlockIndexBelowFloor, so pointers must not be kept.
@@ -162,10 +184,14 @@ struct CkptAVFixture
         std::string error;
         CkptAVBuildRoot(root, &error);
         mapArgs["-blockindexlivetail"] = "32";
+        // Move the shared chain aside so the production retirer never frees it.
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
+        mapBlockIndex.swap(::mapBlockIndex);
+        started = true;   // armed now: any later throw still restores
         if (!InitBlockIndexAuthoritative(root.string(), &error))
             BOOST_FAIL("InitBlockIndexAuthoritative failed: " + error);
         BOOST_REQUIRE(g_fAuthoritativeStartup);
-        started = true;
     }
 
     int BaseTipHeight() const { return baseHashes.empty() ? -1 : baseHashes.rbegin()->first; }
@@ -182,9 +208,16 @@ struct CkptAVFixture
 
     void Restore()
     {
+        if (!started) return;
         started = false;
-        ResetBlockIndexAuthoritativeStartupForTest();
-        ::mapBlockIndex = mapBlockIndex;
+        std::map<uint256, CBlockIndex*> scratch;   // case-local authoritative entries
+        scratch.swap(::mapBlockIndex);
+        ResetBlockIndexAuthoritativeStartupForTest();  // frees authority-owned objects
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
+        mapBlockIndex.swap(::mapBlockIndex);   // restore the protected shared chain
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
         ::mapCandidateTips = mapCandidateTips;
         ::setStakeSeen = setStakeSeen;
         ::pindexBest = pindexBest;
@@ -197,6 +230,11 @@ struct CkptAVFixture
         Checkpoints::hashInvalidCheckpoint = hashInvalidCheckpoint;
         if (hadLivetail) mapArgs["-blockindexlivetail"] = livetail;
         else mapArgs.erase("-blockindexlivetail");
+        // Free case-local AddToBlockIndex objects (NOT authority-owned, so Reset
+        // above did not free them) -- mirrors P06SharedIndexIsolation::restore.
+        for (std::map<uint256, CBlockIndex*>::iterator d = scratch.begin(); d != scratch.end(); ++d)
+            delete d->second;
+        scratch.clear();
         try { fs::remove_all(root); } catch (...) {}
     }
 };
