@@ -306,6 +306,80 @@ namespace Checkpoints
 
     namespace {
 
+    // ---------------------------------------------------------------------
+    // ROUND-3 P2a: bounded, memoized checkpoint ancestry support.
+    //
+    // CheckSync runs for EVERY accepted candidate. Previously, a NOT_ACTIVE
+    // parent made CheckpointAncestorAtHeight issue one authoritative resolver
+    // call per height step down to the checkpoint height while holding
+    // cs_hashSyncCheckpoint -- O(depth) reads per candidate. Two memo tables
+    // bound that cost:
+    //   * SyncCheckpointMemoEntry: per-checkpoint-hash+height resolution of the
+    //     sync-checkpoint snapshot for the CURRENT hashSyncCheckpoint epoch
+    //     (invalidated when hashSyncCheckpoint itself changes);
+    //   * mapDescendantVerdict: per-parent-hash descendant-of-checkpoint
+    //     verdicts, INCLUDING memoized failure (a failed ancestry walk is not
+    //     retried until the epoch changes).
+    // Both structures are only touched under cs_hashSyncCheckpoint. The cache
+    // is plausibly bounded per epoch by the candidate frontier; the epoch tag
+    // ensures a checkpoint advance cannot ever serve stale verdicts.
+    // ---------------------------------------------------------------------
+    static const int CHECKPOINT_ANCESTRY_WALK_DEPTH_BUDGET = 4096;
+
+    struct SyncCheckpointMemoEntry
+    {
+        uint256 hashCheckpoint;   // epoch tag: hashSyncCheckpoint at fill time
+        BlockIndexSnapshot snapshot; // resolved checkpoint record
+        int syncHeight;           // resolved checkpoint height (-1 = memoized failure)
+        uint256 syncHash;
+        std::string failureDetail;
+        bool resolved;
+
+        SyncCheckpointMemoEntry()
+            : hashCheckpoint(0), syncHeight(-1), syncHash(0), resolved(false) {}
+    };
+
+    SyncCheckpointMemoEntry g_syncCheckpointMemo;
+    std::map<uint256, bool> mapDescendantVerdict;
+    uint256 g_descendantMemoEpoch; // hashSyncCheckpoint when verdicts were valid
+    int g_descendantMemoSteps = 0; // total resolver steps served from the walk (diagnostics)
+
+    // Memoized per-epoch authoritative resolution of the CURRENT synchronized
+    // checkpoint. Returns the resolver result; on FOUND/NOT_ACTIVE fills *out.
+    // Epoch tag = hashSyncCheckpoint, so a checkpoint advance never serves a
+    // stale snapshot. All callers hold cs_hashSyncCheckpoint.
+    AuthoritativeBlockResolutionResult ResolveSyncCheckpointSnapMemoized(
+        BlockIndexSnapshot* out, std::string* err)
+    {
+        if (!g_syncCheckpointMemo.resolved ||
+            g_syncCheckpointMemo.hashCheckpoint != hashSyncCheckpoint)
+        {
+            g_syncCheckpointMemo = SyncCheckpointMemoEntry();
+            std::string resolveErr;
+            const AuthoritativeBlockResolutionResult r =
+                ResolveAuthoritativeBlockSnapshotR(hashSyncCheckpoint,
+                                                   &g_syncCheckpointMemo.snapshot,
+                                                   &resolveErr);
+            g_syncCheckpointMemo.hashCheckpoint = hashSyncCheckpoint;
+            if (r == AUTHORITATIVE_BLOCK_FOUND || r == AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+                g_syncCheckpointMemo.syncHeight = g_syncCheckpointMemo.snapshot.height;
+            else
+            {
+                g_syncCheckpointMemo.syncHeight = -1;
+                g_syncCheckpointMemo.failureDetail = resolveErr;
+            }
+            g_syncCheckpointMemo.resolved = true;
+        }
+        if (g_syncCheckpointMemo.syncHeight < 0)
+        {
+            if (err)
+                *err = g_syncCheckpointMemo.failureDetail;
+            return AUTHORITATIVE_BLOCK_NOT_FOUND;
+        }
+        *out = g_syncCheckpointMemo.snapshot;
+        return AUTHORITATIVE_BLOCK_FOUND;
+    }
+
     // True when the hash is a KNOWN authoritative index record. Mirrors the
     // legacy mapBlockIndex.count() membership test, which counts ACTIVE and
     // non-active (side) records alike; FOUND and NOT_ACTIVE are both "known".
@@ -335,9 +409,18 @@ namespace Checkpoints
     bool CheckpointAncestorAtHeight(const BlockIndexSnapshot& start, int targetHeight,
                                     BlockIndexSnapshot* out, std::string* error)
     {
+        // ROUND-3 P2a: depth-bounded ancestry walk. Fail closed on exhaustion.
         BlockIndexSnapshot cur = start;
+        int steps = 0;
         while (cur.height > targetHeight)
         {
+            if (++steps > CHECKPOINT_ANCESTRY_WALK_DEPTH_BUDGET)
+            {
+                if (error) *error = "ancestry walk exceeded depth budget " +
+                                    itostr(CHECKPOINT_ANCESTRY_WALK_DEPTH_BUDGET) +
+                                    " from " + start.hash.GetHex();
+                return false;
+            }
             if (!cur.hasParent || cur.height <= 0)
             {
                 if (error) *error = "pprev null - block index structure failure";
@@ -422,6 +505,11 @@ namespace Checkpoints
     }
 
     // FIX B: by-value non-IBD CheckSync (legacy CheckSync else-branch).
+    // ROUND-3 P2a: O(1) on the common path where the candidate's parent is the
+    // already-verified known-good tip (descendant-by-induction: a block whose
+    // parent is a verified descendant of the sync-checkpoint is itself a
+    // descendant). The ancestry walk runs only for a new/side parent, bounded
+    // and memoized; failure is memoized per epoch and fails closed.
     bool CheckSyncByValue(const uint256& hashBlock, const CBlockIndex* pindexPrev)
     {
         LOCK(cs_hashSyncCheckpoint);
@@ -429,15 +517,24 @@ namespace Checkpoints
             return error("CheckSync: no previous block to evaluate against sync-checkpoint");
         const int nHeight = pindexPrev->nHeight + 1;
 
-        // Resolve the current synchronized checkpoint by value.
+        // Resolve the current synchronized checkpoint by value (memoized per
+        // hashSyncCheckpoint epoch).
         BlockIndexSnapshot syncSnap;
         std::string syncErr;
         const AuthoritativeBlockResolutionResult syncRes =
-            ResolveAuthoritativeBlockSnapshotR(hashSyncCheckpoint, &syncSnap, &syncErr);
+            ResolveSyncCheckpointSnapMemoized(&syncSnap, &syncErr);
         if (syncRes != AUTHORITATIVE_BLOCK_FOUND && syncRes != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
             return error("CheckSync: sync-checkpoint not in block index (%s)",
                          hashSyncCheckpoint.ToString().c_str());
         const int nSyncHeight = syncSnap.height;
+        // Checkpoint epoch for the descendant-verdict memo: invalidated whenever
+        // hashSyncCheckpoint changes.
+        if (g_descendantMemoEpoch != hashSyncCheckpoint)
+        {
+            mapDescendantVerdict.clear();
+            g_descendantMemoEpoch = hashSyncCheckpoint;
+            g_descendantMemoSteps = 0;
+        }
 
         if (nHeight < nSyncHeight)
             // lower height than sync-checkpoint: only a KNOWN index record passes
@@ -447,7 +544,25 @@ namespace Checkpoints
             return hashBlock == hashSyncCheckpoint;
 
         // nHeight > nSyncHeight: only a DESCENDANT of the sync-checkpoint may
-        // pass. Resolve the candidate's parent by value.
+        // pass.
+
+        // O(1) memo hit: a parent already proven to be (or rejected as NOT) a
+        // descendant keeps its verdict for this checkpoint epoch.
+        std::map<uint256, bool>::iterator mv = mapDescendantVerdict.find(pindexPrev->GetBlockHash());
+        if (mv != mapDescendantVerdict.end())
+            return mv->second;
+
+        // O(1) common path: the parent IS the already-verified known-good tip
+        // (hashBestChain). By induction that tip is a descendant of the
+        // sync-checkpoint (it was verified when it was accepted, and every
+        // later tip advanced only through CheckSync-passing children), so the
+        // candidate passes without any ancestry walk.
+        if (pindexPrev->GetBlockHash() == hashBestChain)
+        {
+            mapDescendantVerdict.insert(std::make_pair(pindexPrev->GetBlockHash(), true));
+            ++g_descendantMemoSteps; // 0 walk steps; keep the counter meaningful
+            return true;
+        }
 
         BlockIndexSnapshot prevSnap;
         std::string prevErr;
@@ -459,6 +574,7 @@ namespace Checkpoints
                          prevErr.empty() ? "(no detail)" : prevErr.c_str());
 
         BlockIndexSnapshot anc;
+        bool fDescendant;
         if (prevRes == AUTHORITATIVE_BLOCK_FOUND)
         {
             // The parent is the authoritative ACTIVE block at its height, so its
@@ -474,19 +590,20 @@ namespace Checkpoints
                 if (!AuthoritativeGetActiveSnapshotByHeight(nSyncHeight, &anc))
                     return error("CheckSync: active ancestor at height %d unavailable", nSyncHeight);
             }
+            fDescendant = (anc.height == nSyncHeight && anc.hash == hashSyncCheckpoint);
         }
         else
         {
             // Side-branch parent: walk the persisted ancestry down to the
-            // sync-checkpoint height (bounded by the height difference).
+            // sync-checkpoint height (depth-bounded, fail-closed).
             std::string aerr;
             if (!CheckpointAncestorAtHeight(prevSnap, nSyncHeight, &anc, &aerr))
                 return error("CheckSync: pprev null - block index structure failure");
+            fDescendant = (anc.height == nSyncHeight && anc.hash == hashSyncCheckpoint);
         }
-
-        if (anc.height != nSyncHeight || anc.hash != hashSyncCheckpoint)
-            return false; // only descendant of sync-checkpoint can pass check
-        return true;
+        // Memoize the verdict (including rejection) for this checkpoint epoch.
+        mapDescendantVerdict.insert(std::make_pair(pindexPrev->GetBlockHash(), fDescendant));
+        return fDescendant;
     }
 
     // FIX B: by-value anti-spam work-gate anchors (ProcessBlock weak-competitor
