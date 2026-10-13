@@ -96,6 +96,14 @@ static leveldb::Options MakeHashIndexOptions(bool create)
     options.block_cache = leveldb::NewLRUCache(8 * 1048576);
     options.filter_policy = leveldb::NewBloomFilterPolicy(10);
     options.write_buffer_size = 8 * 1048576;
+    // Scale-diagnostic A/B (env-gated; never set in production): tiny caches so
+    // the side-index LevelDB's own footprint contribution can be bounded out.
+    if (getenv("INNOVA_DIAG_SMALL_IDX") != NULL)
+    {
+        delete options.block_cache;
+        options.block_cache = leveldb::NewLRUCache(64 * 1024);
+        options.write_buffer_size = 256 * 1024;
+    }
     // M1 memory blocker: the vendored LevelDB CLAMPS max_open_files to
     // >= 64 + kNumNonTableCacheFiles (=74) in src/leveldb/db/db_impl.cc:97, and the
     // TableCache is sized max_open_files - kNumNonTableCacheFiles (db_impl.cc:141).
