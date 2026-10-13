@@ -595,17 +595,27 @@ namespace Checkpoints
     bool AcceptPendingSyncCheckpoint()
     {
         LOCK(cs_hashSyncCheckpoint);
-        // V2-R2B (FIX B): in authoritative startup the pending checkpoint's block
-        // may be a non-resident historical record; "known" is decided through the
-        // authoritative resolver (ACTIVE record = the checkpoint is accepted on
-        // this node's authoritative active chain). A record that exists but is
-        // NOT active keeps the checkpoint pending (no forced reorg is attempted
-        // here; the pending message is retained for a later activation).
+        // V2-R3 (ROUND-2 P1): RESTORED legacy "known" semantics under
+        // authoritative startup. Legacy treated a pending checkpoint as KNOWN
+        // when mapBlockIndex.count(hashPendingCheckpoint) — counting ACTIVE
+        // and non-active records alike — and then FORCED the active chain to
+        // the checkpoint via CBlock::SetBestChain when it was not already on
+        // the main chain. Fix B had narrowed this gate to ACTIVE-only rows,
+        // which left a NOT_ACTIVE checkpoint pending forever with no reorg
+        // ever attempted (a consensus-visible divergence). The by-value
+        // resolver reproduces the legacy count() exactly (FOUND = active,
+        // NOT_ACTIVE = known side record); the promotion then dispatches
+        // through the EXISTING CBlock::SetBestChain consensus path
+        // (AuthoritativeSyncCheckpointSwitchChainByValue, main.cpp) — no
+        // parallel reorg. Acceptance/rejection parity is preserved: a
+        // conflicting checkpoint is still rejected/invalidated first and a
+        // switch refusal fails the acceptance WITHOUT invalidating (matching
+        // legacy SetBestChain-failure behaviour).
         bool fPendingKnown = false;
         if (hashPendingCheckpoint != 0)
         {
             fPendingKnown = g_fAuthoritativeStartup
-                ? IsAuthoritativeActiveRecord(hashPendingCheckpoint)
+                ? IsAuthoritativeIndexedRecord(hashPendingCheckpoint)
                 : (mapBlockIndex.count(hashPendingCheckpoint) != 0);
         }
         if (fPendingKnown)
@@ -633,6 +643,29 @@ namespace Checkpoints
                         return error("AcceptPendingSyncCheckpoint: SetBestChain failed for sync checkpoint %s", hashPendingCheckpoint.ToString().c_str());
                     };
                 };
+            }
+            else
+            {
+                // ROUND-2 P1: KNOWN-but-NOT-ACTIVE checkpoint -> legacy forced
+                // promotion through the existing consensus engine. Guarded (the
+                // switch is all-or-nothing): on refusal the checkpoint stays
+                // pending (retained for a later attempt) and the pending
+                // message is NOT consumed, so acceptance is never lost — the
+                // checkpoint neither silently vanishes nor bypasses validation.
+                if (!IsAuthoritativeActiveRecord(hashPendingCheckpoint))
+                {
+                    std::string switchErr;
+                    {
+                        LOCK(cs_main);
+                        if (!AuthoritativeSyncCheckpointSwitchChainByValue(hashPendingCheckpoint, &switchErr))
+                        {
+                            printf("AcceptPendingSyncCheckpoint: authoritative forced promotion not completed for %s (%s); kept pending\n",
+                                   hashPendingCheckpoint.ToString().c_str(),
+                                   switchErr.c_str());
+                            return false; // parity with legacy SetBestChain failure path
+                        }
+                    }
+                }
             }
 
             if (!WriteSyncCheckpoint(hashPendingCheckpoint))
@@ -910,13 +943,23 @@ bool CSyncCheckpoint::ProcessSyncCheckpoint(CNode* pfrom)
         return false;
 
     LOCK(Checkpoints::cs_hashSyncCheckpoint);
-    // V2-R2B (FIX B): under authoritative startup the checkpoint's block may be a
-    // non-resident historical record; "we already know this checkpoint block" is
-    // decided by the authoritative resolver (ACTIVE record). A record that exists
-    // but is not ACTIVE keeps the checkpoint pending (no forced reorg here).
+    // V2-R3 (ROUND-2 P1): RESTORED legacy "known" semantics under
+    // authoritative startup. Legacy defined fCheckpointKnown as
+    // mapBlockIndex.count(hashCheckpoint) (ACTIVE and non-active records
+    // alike) and then FORCED the main chain to the checkpoint through
+    // SetBestChain when it was not on the main chain. Fix B had narrowed both
+    // gates to ACTIVE-only, so a NOT_ACTIVE checkpoint stayed pending forever
+    // (consensus-visible divergence from legacy). The by-value resolver
+    // reproduces the legacy count() exactly; the promotion dispatches through
+    // the EXISTING CBlock::SetBestChain consensus path
+    // (AuthoritativeSyncCheckpointSwitchChainByValue, main.cpp) — no parallel
+    // reorg. Acceptance/rejection parity: conflicting checkpoints are still
+    // rejected by ValidateSyncCheckpoint, and a switch refusal fails WITHOUT
+    // WriteSyncCheckpoint (the checkpoint stays pending, exactly like a legacy
+    // SetBestChain failure).
     const bool fCheckpointKnown =
         g_fAuthoritativeStartup
-            ? Checkpoints::IsAuthoritativeActiveRecord(hashCheckpoint)
+            ? Checkpoints::IsAuthoritativeIndexedRecord(hashCheckpoint)
             : (mapBlockIndex.count(hashCheckpoint) != 0);
     if (!fCheckpointKnown)
     {
@@ -960,6 +1003,23 @@ bool CSyncCheckpoint::ProcessSyncCheckpoint(CNode* pfrom)
                 return error("ProcessSyncCheckpoint: SetBestChain failed for sync checkpoint %s", hashCheckpoint.ToString().c_str());
             };
         };
+    }
+    else
+    {
+        // ROUND-2 P1: KNOWN-but-NOT-ACTIVE checkpoint -> legacy forced
+        // promotion through the existing consensus engine. On refusal the
+        // checkpoint is neither written (hashSyncCheckpoint unchanged) nor
+        // broadcast — the message is NOT consumed and stays valid for a re-send.
+        if (!Checkpoints::IsAuthoritativeActiveRecord(hashCheckpoint))
+        {
+            std::string switchErr;
+            {
+                LOCK(cs_main);
+                if (!AuthoritativeSyncCheckpointSwitchChainByValue(hashCheckpoint, &switchErr))
+                    return error("ProcessSyncCheckpoint: authoritative forced promotion failed for sync checkpoint %s: %s",
+                                 hashCheckpoint.ToString().c_str(), switchErr.c_str());
+            }
+        }
     }
 
     if (!Checkpoints::WriteSyncCheckpoint(hashCheckpoint))

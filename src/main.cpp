@@ -7753,6 +7753,78 @@ bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* 
     return PublishAuthoritativeLiveTailCutover(live, pindexNew, oldPublishedTipHash, outErr);
 }
 
+// V2-R3 (ROUND-2 P1): authoritative chain switch on behalf of the synchronized
+// checkpoint (LEGACY PARITY — the legacy AcceptPendingSyncCheckpoint /
+// ProcessSyncCheckpoint drove CBlock::SetBestChain when a KNOWN checkpoint
+// block was not on the main chain; see checkpoints.cpp). This is an entry
+// point for a switch the checkpoint authority has ALREADY validated through
+// the EXISTING consensus engine path — the very same CBlock::SetBestChain
+// (whose reorganize arm is Reorganize with C12 by-value fork discovery and the
+// V2 below-base fail-closed contract). It does NOT introduce a parallel reorg
+// path; it only materializes the checkpoint chain for the switch, exactly like
+// the legacy ReadFromDisk(pindexCheckpoint).
+//
+// Caller must hold cs_main. All-or-nothing: on failure the chain state is
+// unchanged (SetBestChain/Reorganize roll back their own transaction); the
+// checkpoint caller decides the rejection contract (hashInvalidCheckpoint).
+bool AuthoritativeSyncCheckpointSwitchChainByValue(const uint256& hashCheckpoint,
+                                                   std::string* outErr)
+{
+    AssertLockHeld(cs_main);
+    if (outErr) outErr->clear();
+    if (!g_fAuthoritativeStartup)
+    {
+        if (outErr) *outErr = "authoritative sync-checkpoint switch: not in authoritative mode";
+        return false;
+    }
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (!live || !live->IsOpen())
+    {
+        if (outErr) *outErr = "authoritative sync-checkpoint switch: live authority unavailable";
+        return false;
+    }
+
+    // Materialize the checkpoint chain (identity-checked by the live materializer)
+    // exactly like the legacy ReadFromDisk(pindexCheckpoint) first step. The
+    // resident fast path is the case legacy also hit; the non-resident case is
+    // what Fix B left unreachable. ScopedMaterializedChain keeps the
+    // objects alive for the duration of this switch (no pointer escapes).
+    ScopedMaterializedChain materialized;
+    CBlockIndex* pindexCheckpoint = materialized.Acquire(live, hashCheckpoint, outErr);
+    if (pindexCheckpoint == NULL)
+    {
+        if (outErr && outErr->empty())
+            *outErr = "authoritative sync-checkpoint switch: checkpoint chain cannot be materialized (fail-closed; the switch is NOT attempted)";
+        return false;
+    }
+    if (pindexCheckpoint->GetBlockHash() != hashCheckpoint)
+    {
+        if (outErr) *outErr = "authoritative sync-checkpoint switch: materialized hash identity mismatch";
+        return false;
+    }
+
+    // The legacy semantics was gated on `!pindexCheckpoint->IsInMainChain()`;
+    // here the caller has already established NOT_ACTIVE, so drive the switch.
+    CBlock block;
+    if (!block.ReadFromDisk(pindexCheckpoint))
+    {
+        if (outErr) *outErr = strprintf("authoritative sync-checkpoint switch: ReadFromDisk failed for sync checkpoint %s",
+                                        hashCheckpoint.ToString().c_str());
+        return false;
+    }
+    CTxDB txdb;
+    if (!block.SetBestChain(txdb, pindexCheckpoint))
+    {
+        if (outErr) *outErr = strprintf("authoritative sync-checkpoint switch: SetBestChain failed for sync checkpoint %s",
+                                       hashCheckpoint.ToString().c_str());
+        return false;
+    }
+    printf("AuthoritativeSyncCheckpointSwitchChainByValue: switched active chain to synchronized checkpoint %s (height %d)\n",
+           hashCheckpoint.ToString().c_str(), pindexCheckpoint->nHeight);
+    fflush(stdout);
+    return true;
+}
+
 // PM1-P0-06 A1-b S2: physically bound authoritative mapBlockIndex residency to
 // the live horizon. In BY_VALUE_AUTHORITATIVE mode mapBlockIndex is a bounded
 // hot compatibility index, not a process-lifetime O(chain) owner: entries that
