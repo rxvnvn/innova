@@ -137,9 +137,10 @@ struct CkptV2SavedState
     uint256 persistedCheckpoint;
     bool persistedWasAbsent;
     bool hadLivetail;
+    bool fRestored;
     std::string livetail;
 
-    CkptV2SavedState()
+    CkptV2SavedState() : fRestored(false)
     {
         mapBlockIndex = ::mapBlockIndex;
         mapCandidateTips = ::mapCandidateTips;
@@ -157,8 +158,11 @@ struct CkptV2SavedState
         livetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
     }
 
+    ~CkptV2SavedState() { if (!fRestored) Restore(true); }
+
     void Restore(bool fRestorePersisted)
     {
+        fRestored = true;
         ResetBlockIndexAuthoritativeStartupForTest();
         ::mapBlockIndex = mapBlockIndex;
         ::mapCandidateTips = mapCandidateTips;

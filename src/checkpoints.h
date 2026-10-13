@@ -70,6 +70,25 @@ namespace Checkpoints
     bool CheckSync(const uint256& hashBlock, const CBlockIndex* pindexPrev);
     const CBlockIndex* AutoSelectSyncCheckpoint();
 
+    // ---------------------------------------------------------------------
+    // V2-R2B (FIX B): synchronized-checkpoint compatibility with
+    // BY_VALUE_AUTHORITATIVE startup. mapBlockIndex holds only a bounded live
+    // tail + anchors, so the legacy predicates below must resolve the
+    // checkpoint and the candidate's ancestry by value instead of relying on
+    // residency. Acceptance / conflict-rejection semantics are preserved
+    // exactly; these are exposed for the deterministic compatibility tests.
+    // ---------------------------------------------------------------------
+    bool CheckSyncByValue(const uint256& hashBlock, const CBlockIndex* pindexPrev);
+    bool ValidateSyncCheckpointByValue(uint256 hashCheckpoint);
+
+    // FIX B: by-value anti-spam work-gate anchors for the synced checkpoint
+    // (the values ProcessBlock's weak-competitor gate previously read through a
+    // resident CBlockIndex*). pnBits is the nBits of the last block of the
+    // requested type at or below the checkpoint. Returns false when no
+    // checkpoint is established or the anchors cannot be resolved by value.
+    bool GetSyncCheckpointWorkGateByValue(bool fProofOfStake, int64_t* pnCheckpointTime,
+                                           unsigned int* pnBits, int* pnHeight);
+
     bool WantedByPendingSyncCheckpoint(uint256 hashBlock);
     bool ResetSyncCheckpoint();
     void AskForPendingSyncCheckpoint(CNode* pfrom);

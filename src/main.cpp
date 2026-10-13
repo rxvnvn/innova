@@ -9363,25 +9363,45 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     }
     int64_t nCheckMs = GetTimeMillis() - nCheckStart;
 
+    // V2-R2B (FIX B): under authoritative startup the synced checkpoint may be a
+    // non-resident historical record, so the anti-spam surplus-work gate is fed
+    // by-value anchors (checkpoint time + the last same-type block's nBits at or
+    // below the checkpoint) instead of silently skipping the gate.
     CBlockIndex* pcheckpoint = Checkpoints::GetLastSyncCheckpoint();
-    if (pcheckpoint && pblock->hashPrevBlock != hashBestChain && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
+    bool fCheckpointWorkGate = false;
+    int64_t nWorkGateTime = 0;
+    unsigned int nWorkGateBits = 0;
+    int nWorkGateHeight = -1;
+    if (pcheckpoint)
+    {
+        fCheckpointWorkGate = true;
+        nWorkGateTime = pcheckpoint->nTime;
+        nWorkGateHeight = pcheckpoint->nHeight;
+        nWorkGateBits = GetLastBlockIndex(pcheckpoint, pblock->IsProofOfStake())->nBits;
+    }
+    else if (g_fAuthoritativeStartup)
+    {
+        fCheckpointWorkGate = Checkpoints::GetSyncCheckpointWorkGateByValue(
+            pblock->IsProofOfStake(), &nWorkGateTime, &nWorkGateBits, &nWorkGateHeight);
+    }
+    if (fCheckpointWorkGate && pblock->hashPrevBlock != hashBestChain && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
     {
         // Extra checks to prevent "fill up memory by spamming with bogus blocks"
-        int64_t deltaTime = pblock->GetBlockTime() - pcheckpoint->nTime;
+        int64_t deltaTime = pblock->GetBlockTime() - nWorkGateTime;
         CBigNum bnNewBlock;
         bnNewBlock.SetCompact(pblock->nBits);
         CBigNum bnRequired;
 
         if (pblock->IsProofOfStake())
-            bnRequired.SetCompact(ComputeMinStake(GetLastBlockIndex(pcheckpoint, true)->nBits, deltaTime, pblock->nTime));
+            bnRequired.SetCompact(ComputeMinStake(nWorkGateBits, deltaTime, pblock->nTime));
         else
-            bnRequired.SetCompact(ComputeMinWork(GetLastBlockIndex(pcheckpoint, false)->nBits, deltaTime));
+            bnRequired.SetCompact(ComputeMinWork(nWorkGateBits, deltaTime));
 
         if (bnNewBlock > bnRequired)
         {
             if (pfrom)
                 pfrom->Misbehaving(100);
-            std::string strWeakExtra = strprintf("block_trust=%s required_trust=%s checkpoint_height=%d checkpoint_hash=%s local_best_height=%d local_best_hash=%s", bnNewBlock.ToString().c_str(), bnRequired.ToString().c_str(), pcheckpoint ? pcheckpoint->nHeight : -1, pcheckpoint ? pcheckpoint->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(), pindexBest ? pindexBest->nHeight : -1, pindexBest ? pindexBest->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str());
+            std::string strWeakExtra = strprintf("block_trust=%s required_trust=%s checkpoint_height=%d checkpoint_hash=%s local_best_height=%d local_best_hash=%s", bnNewBlock.ToString().c_str(), bnRequired.ToString().c_str(), nWorkGateHeight, Checkpoints::hashSyncCheckpoint.ToString().c_str(), pindexBest ? pindexBest->nHeight : -1, pindexBest ? pindexBest->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str());
             TraceProcessBlockReject(pfrom, pblock, PBREJECT_WEAK_CHECKPOINT, NULL, strWeakExtra);
             ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
             return error("ProcessBlock() : block with too little %s", pblock->IsProofOfStake()? "proof-of-stake" : "proof-of-work");

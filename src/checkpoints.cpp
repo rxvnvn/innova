@@ -7,6 +7,7 @@
 
 #include "checkpoints.h"
 
+#include "blockindex_authoritative_startup.h"   // V2-R2B: authoritative by-value resolver
 #include "txdb.h"
 #include "main.h"
 #include "uint256.h"
@@ -178,22 +179,26 @@ namespace Checkpoints
     }
 
     // ------------------------------------------------------------------
-    // V2-R2B (FIX A): restore the persisted synchronized checkpoint at V2
-    // authoritative startup.
+    // V2-R2B (FIX A + FIX B): synchronized checkpoint under
+    // BY_VALUE_AUTHORITATIVE startup.
     //
     // ROOT CAUSE (production incident): the V2 authoritative startup bypasses
-    // CTxDB::LoadBlockIndex -- the legacy boot path that read the persisted
-    // sync-checkpoint -- so Checkpoints::hashSyncCheckpoint stayed at its
-    // default 0. Once IsInitialBlockDownload() became false, CheckSync()'s
-    // non-IBD branch did mapBlockIndex.count(hashSyncCheckpoint) -> absent ->
-    // "CheckSync: sync-checkpoint not in block index" and rejected EVERY
-    // candidate block: the tip froze and all miner threads went idle.
+    // CTxDB::LoadBlockIndex (which is where the legacy boot read the persisted
+    // sync-checkpoint), so Checkpoints::hashSyncCheckpoint stayed 0; once
+    // IsInitialBlockDownload() became false, CheckSync()'s non-IBD branch did
+    // mapBlockIndex.count(hashSyncCheckpoint) -> absent -> "CheckSync:
+    // sync-checkpoint not in block index" -> EVERY candidate block was
+    // rejected, the tip froze and every miner thread went idle.
     //
-    // Semantics (documented, not a silent fallback):
-    //   * ABSENT key   -> hashOut stays 0 == "no synchronized checkpoint"
-    //                     established yet (canonical ppcoin). NEVER genesis.
-    //   * LOADED       -> hashOut is the persisted checkpoint.
-    //   * CORRUPT      -> durable authority inconsistency; caller fails startup.
+    // FIX A loads the persisted value. FIX B makes the checkpoint predicates
+    // resolve through the authoritative by-value resolver instead of
+    // mapBlockIndex residency (only a bounded live tail survives
+    // RetireBlockIndexBelowFloor). Semantics are preserved exactly:
+    //   * only a descendant of the current sync-checkpoint may pass;
+    //   * the same height requires hash equality;
+    //   * a lower height requires the block to be a KNOWN index record.
+    // The legacy resident path is used whenever authoritative startup is NOT
+    // active and is otherwise byte-for-byte unchanged.
     // ------------------------------------------------------------------
 
     // FIX A: typed load of the persisted synchronized checkpoint.
@@ -212,9 +217,237 @@ namespace Checkpoints
         return st;
     }
 
+    namespace {
+
+    // True when the hash is a KNOWN authoritative index record. Mirrors the
+    // legacy mapBlockIndex.count() membership test, which counts ACTIVE and
+    // non-active (side) records alike; FOUND and NOT_ACTIVE are both "known".
+    bool IsAuthoritativeIndexedRecord(const uint256& hash)
+    {
+        BlockIndexSnapshot snap;
+        std::string err;
+        const AuthoritativeBlockResolutionResult r =
+            ResolveAuthoritativeBlockSnapshotR(hash, &snap, &err);
+        return r == AUTHORITATIVE_BLOCK_FOUND || r == AUTHORITATIVE_BLOCK_NOT_ACTIVE;
+    }
+
+    // True when the hash is the authoritative ACTIVE record at its height (the
+    // checkpoint is accepted on this node's authoritative active chain).
+    bool IsAuthoritativeActiveRecord(const uint256& hash)
+    {
+        BlockIndexSnapshot snap;
+        std::string err;
+        return ResolveAuthoritativeBlockSnapshotR(hash, &snap, &err) ==
+               AUTHORITATIVE_BLOCK_FOUND;
+    }
+
+    // Walk the persisted authoritative ancestry (hashPrev links) of *start*
+    // down to targetHeight. Fail closed on a missing / inconsistent /
+    // unavailable step, exactly like the legacy NULL-pprev exhaustion. On
+    // success *out is the ancestry record at targetHeight.
+    bool CheckpointAncestorAtHeight(const BlockIndexSnapshot& start, int targetHeight,
+                                    BlockIndexSnapshot* out, std::string* error)
+    {
+        BlockIndexSnapshot cur = start;
+        while (cur.height > targetHeight)
+        {
+            if (!cur.hasParent || cur.height <= 0)
+            {
+                if (error) *error = "pprev null - block index structure failure";
+                return false;
+            }
+            BlockIndexSnapshot parent;
+            std::string perr;
+            const AuthoritativeBlockResolutionResult r =
+                ResolveAuthoritativeBlockSnapshotR(cur.hashPrev, &parent, &perr);
+            if (r != AUTHORITATIVE_BLOCK_FOUND && r != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+            {
+                if (error) *error = "ancestry step unavailable at " + cur.hash.GetHex() +
+                                    ": " + (perr.empty() ? std::string("(no detail)") : perr);
+                return false;
+            }
+            if (parent.height != cur.height - 1)
+            {
+                if (error) *error = "ancestry height inconsistency at " + cur.hash.GetHex();
+                return false;
+            }
+            cur = parent;
+        }
+        *out = cur;
+        return true;
+    }
+
+    } // namespace
+
+    // FIX B: by-value descendant/conflict validation (legacy ValidateSyncCheckpoint).
+    bool ValidateSyncCheckpointByValue(uint256 hashCheckpoint)
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        // Current synchronized checkpoint (may be a non-resident historical record).
+        BlockIndexSnapshot syncSnap;
+        std::string syncErr;
+        const AuthoritativeBlockResolutionResult syncRes =
+            ResolveAuthoritativeBlockSnapshotR(hashSyncCheckpoint, &syncSnap, &syncErr);
+        if (syncRes == AUTHORITATIVE_BLOCK_NOT_FOUND || syncRes == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
+            return error("ValidateSyncCheckpoint: block index missing for current sync-checkpoint %s",
+                         hashSyncCheckpoint.ToString().c_str());
+
+        // Received synchronized checkpoint.
+        BlockIndexSnapshot recvSnap;
+        std::string recvErr;
+        const AuthoritativeBlockResolutionResult recvRes =
+            ResolveAuthoritativeBlockSnapshotR(hashCheckpoint, &recvSnap, &recvErr);
+        if (recvRes == AUTHORITATIVE_BLOCK_NOT_FOUND || recvRes == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
+            return error("ValidateSyncCheckpoint: block index missing for received sync-checkpoint %s",
+                         hashCheckpoint.ToString().c_str());
+
+        if (recvSnap.height <= syncSnap.height)
+        {
+            // Received an older checkpoint, trace back from current checkpoint
+            // to the same height of the received checkpoint to verify that the
+            // current checkpoint is a descendant block.
+            BlockIndexSnapshot anc;
+            std::string aerr;
+            if (!CheckpointAncestorAtHeight(syncSnap, recvSnap.height, &anc, &aerr))
+                return error("ValidateSyncCheckpoint: pprev null - block index structure failure");
+            if (anc.hash != hashCheckpoint)
+            {
+                hashInvalidCheckpoint = hashCheckpoint;
+                return error("ValidateSyncCheckpoint: new sync-checkpoint %s is conflicting with current sync-checkpoint %s",
+                             hashCheckpoint.ToString().c_str(), hashSyncCheckpoint.ToString().c_str());
+            }
+            return false; // ignore older checkpoint
+        }
+
+        // Received checkpoint should be a descendant block of the current
+        // checkpoint. Trace back to the same height of current checkpoint.
+        BlockIndexSnapshot anc;
+        std::string aerr;
+        if (!CheckpointAncestorAtHeight(recvSnap, syncSnap.height, &anc, &aerr))
+            return error("ValidateSyncCheckpoint: pprev2 null - block index structure failure");
+        if (anc.hash != hashSyncCheckpoint)
+        {
+            hashInvalidCheckpoint = hashCheckpoint;
+            return error("ValidateSyncCheckpoint: new sync-checkpoint %s is not a descendant of current sync-checkpoint %s",
+                         hashCheckpoint.ToString().c_str(), hashSyncCheckpoint.ToString().c_str());
+        }
+        return true;
+    }
+
+    // FIX B: by-value non-IBD CheckSync (legacy CheckSync else-branch).
+    bool CheckSyncByValue(const uint256& hashBlock, const CBlockIndex* pindexPrev)
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        if (pindexPrev == NULL)
+            return error("CheckSync: no previous block to evaluate against sync-checkpoint");
+        const int nHeight = pindexPrev->nHeight + 1;
+
+        // Resolve the current synchronized checkpoint by value.
+        BlockIndexSnapshot syncSnap;
+        std::string syncErr;
+        const AuthoritativeBlockResolutionResult syncRes =
+            ResolveAuthoritativeBlockSnapshotR(hashSyncCheckpoint, &syncSnap, &syncErr);
+        if (syncRes != AUTHORITATIVE_BLOCK_FOUND && syncRes != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+            return error("CheckSync: sync-checkpoint not in block index (%s)",
+                         hashSyncCheckpoint.ToString().c_str());
+        const int nSyncHeight = syncSnap.height;
+
+        if (nHeight < nSyncHeight)
+            // lower height than sync-checkpoint: only a KNOWN index record passes
+            return IsAuthoritativeIndexedRecord(hashBlock);
+
+        if (nHeight == nSyncHeight)
+            return hashBlock == hashSyncCheckpoint;
+
+        // nHeight > nSyncHeight: only a DESCENDANT of the sync-checkpoint may
+        // pass. Resolve the candidate's parent by value.
+
+        BlockIndexSnapshot prevSnap;
+        std::string prevErr;
+        const AuthoritativeBlockResolutionResult prevRes =
+            ResolveAuthoritativeBlockSnapshotR(pindexPrev->GetBlockHash(), &prevSnap, &prevErr);
+        if (prevRes != AUTHORITATIVE_BLOCK_FOUND && prevRes != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+            return error("CheckSync: previous block %s not resolvable: %s",
+                         pindexPrev->GetBlockHash().ToString().c_str(),
+                         prevErr.empty() ? "(no detail)" : prevErr.c_str());
+
+        BlockIndexSnapshot anc;
+        if (prevRes == AUTHORITATIVE_BLOCK_FOUND)
+        {
+            // The parent is the authoritative ACTIVE block at its height, so its
+            // ancestor at nSyncHeight IS the active-chain block at that height:
+            // resolve it directly (bounded, no per-step ancestry walk).
+            if (prevSnap.height == nSyncHeight)
+            {
+                anc = prevSnap;
+            }
+            else
+            {
+                std::string aerr;
+                if (!AuthoritativeGetActiveSnapshotByHeight(nSyncHeight, &anc))
+                    return error("CheckSync: active ancestor at height %d unavailable", nSyncHeight);
+            }
+        }
+        else
+        {
+            // Side-branch parent: walk the persisted ancestry down to the
+            // sync-checkpoint height (bounded by the height difference).
+            std::string aerr;
+            if (!CheckpointAncestorAtHeight(prevSnap, nSyncHeight, &anc, &aerr))
+                return error("CheckSync: pprev null - block index structure failure");
+        }
+
+        if (anc.height != nSyncHeight || anc.hash != hashSyncCheckpoint)
+            return false; // only descendant of sync-checkpoint can pass check
+        return true;
+    }
+
+    // FIX B: by-value anti-spam work-gate anchors (ProcessBlock weak-competitor
+    // gate). pnBits is the nBits of the last block of the requested type at or
+    // below the sync-checkpoint; pnCheckpointTime is the checkpoint's time.
+    bool GetSyncCheckpointWorkGateByValue(bool fProofOfStake, int64_t* pnCheckpointTime,
+                                          unsigned int* pnBits, int* pnHeight)
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        if (hashSyncCheckpoint == uint256(0))
+            return false; // no established checkpoint: no anchor (legacy skips too)
+        BlockIndexSnapshot snap;
+        std::string err;
+        const AuthoritativeBlockResolutionResult r =
+            ResolveAuthoritativeBlockSnapshotR(hashSyncCheckpoint, &snap, &err);
+        if (r != AUTHORITATIVE_BLOCK_FOUND && r != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+            return false;
+        if (pnCheckpointTime) *pnCheckpointTime = snap.nTime;
+        if (pnHeight) *pnHeight = snap.height;
+        // Find the last block at or below the checkpoint of the requested type
+        // (mirrors CBlockIndex::GetLastBlockIndex).
+        BlockIndexSnapshot cur = snap;
+        int steps = 0;
+        while (cur.fProofOfStake != fProofOfStake && cur.hasParent && steps < 10000)
+        {
+            BlockIndexSnapshot parent;
+            std::string perr;
+            const AuthoritativeBlockResolutionResult pr =
+                ResolveAuthoritativeBlockSnapshotR(cur.hashPrev, &parent, &perr);
+            if (pr != AUTHORITATIVE_BLOCK_FOUND && pr != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+                return false; // fail closed: no anchor
+            cur = parent;
+            ++steps;
+        }
+        if (pnBits) *pnBits = cur.nBits;
+        return true;
+    }
+
     // ppcoin: only descendant of current sync-checkpoint is allowed
     bool ValidateSyncCheckpoint(uint256 hashCheckpoint)
     {
+        // V2-R2B (FIX B): under BY_VALUE_AUTHORITATIVE startup the historical
+        // CBlockIndex objects that this predicate walks (mapBlockIndex / pprev)
+        // are not resident, so delegate to the by-value authoritative validator
+        // with IDENTICAL acceptance / conflict-rejection semantics.
+        if (g_fAuthoritativeStartup)
+            return ValidateSyncCheckpointByValue(hashCheckpoint);
+
         if (!mapBlockIndex.count(hashSyncCheckpoint))
             return error("ValidateSyncCheckpoint: block index missing for current sync-checkpoint %s", hashSyncCheckpoint.ToString().c_str());
         if (!mapBlockIndex.count(hashCheckpoint))
@@ -275,7 +508,20 @@ namespace Checkpoints
     bool AcceptPendingSyncCheckpoint()
     {
         LOCK(cs_hashSyncCheckpoint);
-        if (hashPendingCheckpoint != 0 && mapBlockIndex.count(hashPendingCheckpoint))
+        // V2-R2B (FIX B): in authoritative startup the pending checkpoint's block
+        // may be a non-resident historical record; "known" is decided through the
+        // authoritative resolver (ACTIVE record = the checkpoint is accepted on
+        // this node's authoritative active chain). A record that exists but is
+        // NOT active keeps the checkpoint pending (no forced reorg is attempted
+        // here; the pending message is retained for a later activation).
+        bool fPendingKnown = false;
+        if (hashPendingCheckpoint != 0)
+        {
+            fPendingKnown = g_fAuthoritativeStartup
+                ? IsAuthoritativeActiveRecord(hashPendingCheckpoint)
+                : (mapBlockIndex.count(hashPendingCheckpoint) != 0);
+        }
+        if (fPendingKnown)
         {
             if (!ValidateSyncCheckpoint(hashPendingCheckpoint))
             {
@@ -284,20 +530,23 @@ namespace Checkpoints
                 return false;
             }
 
-            CTxDB txdb;
-            CBlockIndex* pindexCheckpoint = mapBlockIndex[hashPendingCheckpoint];
-            if (!pindexCheckpoint->IsInMainChain())
+            if (!g_fAuthoritativeStartup)
             {
-                CBlock block;
-                if (!block.ReadFromDisk(pindexCheckpoint))
-                    return error("AcceptPendingSyncCheckpoint: ReadFromDisk failed for sync checkpoint %s", hashPendingCheckpoint.ToString().c_str());
-
-                if (!block.SetBestChain(txdb, pindexCheckpoint))
+                CTxDB txdb;
+                CBlockIndex* pindexCheckpoint = mapBlockIndex[hashPendingCheckpoint];
+                if (!pindexCheckpoint->IsInMainChain())
                 {
-                    hashInvalidCheckpoint = hashPendingCheckpoint;
-                    return error("AcceptPendingSyncCheckpoint: SetBestChain failed for sync checkpoint %s", hashPendingCheckpoint.ToString().c_str());
+                    CBlock block;
+                    if (!block.ReadFromDisk(pindexCheckpoint))
+                        return error("AcceptPendingSyncCheckpoint: ReadFromDisk failed for sync checkpoint %s", hashPendingCheckpoint.ToString().c_str());
+
+                    if (!block.SetBestChain(txdb, pindexCheckpoint))
+                    {
+                        hashInvalidCheckpoint = hashPendingCheckpoint;
+                        return error("AcceptPendingSyncCheckpoint: SetBestChain failed for sync checkpoint %s", hashPendingCheckpoint.ToString().c_str());
+                    };
                 };
-            };
+            }
 
             if (!WriteSyncCheckpoint(hashPendingCheckpoint))
                 return error("AcceptPendingSyncCheckpoint(): failed to write sync checkpoint %s", hashPendingCheckpoint.ToString().c_str());
@@ -349,6 +598,10 @@ namespace Checkpoints
             // CheckHardened(). Synced protection below stays intact.
             return true;
         } else { // do a more thorough check when we are already synced
+            // V2-R2B (FIX B): authoritative mode resolves the sync-checkpoint and
+            // the candidate's ancestry by value (mapBlockIndex is trimmed).
+            if (g_fAuthoritativeStartup)
+                return CheckSyncByValue(hashBlock, pindexPrev);
             LOCK(cs_hashSyncCheckpoint);
             // sync-checkpoint should always be accepted block
             if (!mapBlockIndex.count(hashSyncCheckpoint))
@@ -433,7 +686,13 @@ namespace Checkpoints
     void AskForPendingSyncCheckpoint(CNode* pfrom)
     {
         LOCK(cs_hashSyncCheckpoint);
-        if (pfrom && hashPendingCheckpoint != 0 && (!mapBlockIndex.count(hashPendingCheckpoint)) && (!mapOrphanBlocks.count(hashPendingCheckpoint)))
+        // V2-R2B (FIX B): "we do not have the pending checkpoint record" is
+        // decided by the authoritative resolver under authoritative startup.
+        const bool fPendingMissing =
+            g_fAuthoritativeStartup
+                ? !IsAuthoritativeIndexedRecord(hashPendingCheckpoint)
+                : (mapBlockIndex.count(hashPendingCheckpoint) == 0);
+        if (pfrom && hashPendingCheckpoint != 0 && fPendingMissing && (!mapOrphanBlocks.count(hashPendingCheckpoint)))
             pfrom->AskFor(
                 CInv(MSG_BLOCK, hashPendingCheckpoint),
                 BLOCKREQ_SOURCE_CHECKPOINT);
@@ -500,6 +759,20 @@ namespace Checkpoints
     bool IsMatureSyncCheckpoint()
     {
         LOCK(cs_hashSyncCheckpoint);
+        // V2-R2B (FIX B): resolve the checkpoint by value under authoritative
+        // startup (a non-resident record previously fell into the "not in block
+        // index -> mature" default). The predicate itself is unchanged.
+        if (g_fAuthoritativeStartup)
+        {
+            BlockIndexSnapshot snap;
+            std::string err;
+            const AuthoritativeBlockResolutionResult r =
+                ResolveAuthoritativeBlockSnapshotR(hashSyncCheckpoint, &snap, &err);
+            if (r != AUTHORITATIVE_BLOCK_FOUND && r != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+                return true; // legacy "sync-checkpoint not in block index" -> true
+            return (nBestHeight >= snap.height + nCoinbaseMaturity ||
+                    (int64_t)snap.nTime + nStakeMinAge < GetAdjustedTime());
+        }
         // sync-checkpoint should always be accepted block
         if (!mapBlockIndex.count(hashSyncCheckpoint))
             return true;
@@ -550,7 +823,15 @@ bool CSyncCheckpoint::ProcessSyncCheckpoint(CNode* pfrom)
         return false;
 
     LOCK(Checkpoints::cs_hashSyncCheckpoint);
-    if (!mapBlockIndex.count(hashCheckpoint))
+    // V2-R2B (FIX B): under authoritative startup the checkpoint's block may be a
+    // non-resident historical record; "we already know this checkpoint block" is
+    // decided by the authoritative resolver (ACTIVE record). A record that exists
+    // but is not ACTIVE keeps the checkpoint pending (no forced reorg here).
+    const bool fCheckpointKnown =
+        g_fAuthoritativeStartup
+            ? Checkpoints::IsAuthoritativeActiveRecord(hashCheckpoint)
+            : (mapBlockIndex.count(hashCheckpoint) != 0);
+    if (!fCheckpointKnown)
     {
         // We haven't received the checkpoint chain, keep the checkpoint as pending
         Checkpoints::hashPendingCheckpoint = hashCheckpoint;
@@ -576,20 +857,23 @@ bool CSyncCheckpoint::ProcessSyncCheckpoint(CNode* pfrom)
     if (!Checkpoints::ValidateSyncCheckpoint(hashCheckpoint))
         return false;
 
-    CTxDB txdb;
-    CBlockIndex* pindexCheckpoint = mapBlockIndex[hashCheckpoint];
-    if (!pindexCheckpoint->IsInMainChain())
+    if (!g_fAuthoritativeStartup)
     {
-        // checkpoint chain received but not yet main chain
-        CBlock block;
-        if (!block.ReadFromDisk(pindexCheckpoint))
-            return error("ProcessSyncCheckpoint: ReadFromDisk failed for sync checkpoint %s", hashCheckpoint.ToString().c_str());
-        if (!block.SetBestChain(txdb, pindexCheckpoint))
+        CTxDB txdb;
+        CBlockIndex* pindexCheckpoint = mapBlockIndex[hashCheckpoint];
+        if (!pindexCheckpoint->IsInMainChain())
         {
-            Checkpoints::hashInvalidCheckpoint = hashCheckpoint;
-            return error("ProcessSyncCheckpoint: SetBestChain failed for sync checkpoint %s", hashCheckpoint.ToString().c_str());
+            // checkpoint chain received but not yet main chain
+            CBlock block;
+            if (!block.ReadFromDisk(pindexCheckpoint))
+                return error("ProcessSyncCheckpoint: ReadFromDisk failed for sync checkpoint %s", hashCheckpoint.ToString().c_str());
+            if (!block.SetBestChain(txdb, pindexCheckpoint))
+            {
+                Checkpoints::hashInvalidCheckpoint = hashCheckpoint;
+                return error("ProcessSyncCheckpoint: SetBestChain failed for sync checkpoint %s", hashCheckpoint.ToString().c_str());
+            };
         };
-    };
+    }
 
     if (!Checkpoints::WriteSyncCheckpoint(hashCheckpoint))
         return error("ProcessSyncCheckpoint(): failed to write sync checkpoint %s", hashCheckpoint.ToString().c_str());
