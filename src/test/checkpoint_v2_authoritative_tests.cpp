@@ -550,4 +550,86 @@ BOOST_AUTO_TEST_CASE(transient_anchor_failure_is_retryable_not_sticky)
     fx.Restore();
 }
 
+// ROUND-2 P1 PARITY REGRESSION — AcceptPendingSyncCheckpoint() legacy parity:
+//   (a) hashSyncCheckpoint == 0 (the canonical "no synchronized checkpoint"
+//       value): the current checkpoint resolves to AUTHORITATIVE_BLOCK_NOT_FOUND
+//       and ValidateSyncCheckpointByValue() errors -> AcceptPendingSyncCheckpoint()
+//       returns false and hashPendingCheckpoint is cleared. This is the exact
+//       legacy behaviour (legacy did mapBlockIndex.count(0) == 0 -> error),
+//       DOCUMENTED PARITY, NOT A DEFECT. On a real node P0 establishes the
+//       genesis checkpoint so hashSyncCheckpoint != 0.
+//   (b) With a VALID current sync checkpoint (the tip) and a DESCENDANT
+//       pending checkpoint, AcceptPendingSyncCheckpoint() returns TRUE,
+//       hashSyncCheckpoint advances to the pending hash, hashPendingCheckpoint
+//       becomes 0, and WriteSyncCheckpoint persisted the new value
+//       (LoadPersistedSyncCheckpoint == the new value).
+// All mutated globals are restored (CkptAVSavedState fixture below).
+//
+// NOTE on log visibility in this suite: the process runs with
+// fPrintToDebugger = true (test_innova.cpp), so checkpointing's
+// error()/printf diagnostics are NOT expected on the test console; parity is
+// asserted purely through the returned values and global state.
+BOOST_AUTO_TEST_CASE(accept_pending_sync_checkpoint_zero_and_descendant_parity)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+
+    CBlockIndex* tip = pindexBest;
+
+    // ---- (a) hashSyncCheckpoint == 0 with a KNOWN pending record: the current
+    // checkpoint 0 resolves to NOT_FOUND -> ValidateSyncCheckpointByValue errors
+    // -> AcceptPendingSyncCheckpoint returns false AND clears the pending.
+    // Documented legacy parity, NOT a defect (legacy did mapBlockIndex.count(0)==0
+    // -> error -> false; on a real node P0 establishes genesis so it is never 0).
+    Checkpoints::hashSyncCheckpoint = uint256(0);
+    Checkpoints::hashPendingCheckpoint = tip->GetBlockHash();
+    BOOST_CHECK_MESSAGE(!Checkpoints::AcceptPendingSyncCheckpoint(),
+                        "parity: acceptance must be refused while the current "
+                        "sync-checkpoint is the canonical 0");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == uint256(0),
+                        "parity: the pending checkpoint hash must be cleared");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashSyncCheckpoint == uint256(0),
+                        "parity: the current sync-checkpoint stays 0 (no genesis substitution)");
+
+    // ---- (a') an UNKNOWN pending record (not a known index record): legacy's
+    // early-return retains the pending for a later attempt and still returns
+    // false (pending-clearing happens only on the Validate-failure path above).
+    Checkpoints::hashSyncCheckpoint = uint256(0);
+    Checkpoints::hashPendingCheckpoint = uint256(0xF800);
+    BOOST_CHECK_MESSAGE(!Checkpoints::AcceptPendingSyncCheckpoint(),
+                        "parity: an unknown pending is refused");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == uint256(0xF800),
+                        "parity: an UNKNOWN pending is retained, not cleared");
+    BOOST_CHECK_MESSAGE(Checkpoints::WantedByPendingSyncCheckpoint(uint256(0xF800)),
+                        "parity: the retained unknown pending remains armed (still wanted)");
+
+    // ---- (b) VALID current checkpoint + DESCENDANT pending: accepted & persisted.
+    // The tip is a real ACTIVE authoritative record, so resolving the current
+    // checkpoint succeeds and the pending child validates as its descendant.
+    const uint256 hashTip = tip->GetBlockHash();
+    Checkpoints::hashSyncCheckpoint = hashTip;
+    CBlockIndex* child = CkptAVMine(tip, 0xF801u, true);
+    BOOST_REQUIRE(child != NULL);
+    BOOST_CHECK(pindexBest == child);          // the tip advanced; child is the best
+    BOOST_CHECK(child->GetBlockHash() != hashTip);
+    const uint256 hashPending = child->GetBlockHash();
+    Checkpoints::hashSyncCheckpoint = hashTip;
+    Checkpoints::hashPendingCheckpoint = hashPending;
+    BOOST_CHECK_MESSAGE(Checkpoints::AcceptPendingSyncCheckpoint(),
+                        "parity: a valid descendant pending checkpoint must be accepted");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashSyncCheckpoint == hashPending,
+        "parity: hashSyncCheckpoint must advance to the pending hash");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == uint256(0),
+                        "parity: hashPendingCheckpoint must be cleared after acceptance");
+    {
+        uint256 persisted = uint256(0);
+        BOOST_REQUIRE_EQUAL((int)Checkpoints::LoadPersistedSyncCheckpoint(persisted, NULL),
+                            (int)SYNC_CHECKPOINT_LOADED);
+        BOOST_CHECK_MESSAGE(persisted == hashPending,
+                            "parity: WriteSyncCheckpoint must have persisted the new value");
+    }
+
+    fx.Restore();
+}
+
 BOOST_AUTO_TEST_SUITE_END()
