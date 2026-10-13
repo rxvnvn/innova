@@ -9439,7 +9439,13 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     // non-resident historical record, so the anti-spam surplus-work gate is fed
     // by-value anchors (checkpoint time + the last same-type block's nBits at or
     // below the checkpoint) instead of silently skipping the gate.
-    CBlockIndex* pcheckpoint = Checkpoints::GetLastSyncCheckpoint();
+    // ROUND-3 P3a: under authoritative mode ALWAYS prefer the by-value path.
+    // The resident GetLastBlockIndex walk uses pprev, which
+    // RetireBlockIndexBelowFloor may have detached on a NOT_ACTIVE checkpoint
+    // record; a detached pprev makes the anchor read unsafe. The by-value
+    // resolver reads exactly the same persisted fields. The resident path is
+    // kept verbatim for non-authoritative (legacy) mode.
+    CBlockIndex* pcheckpoint = g_fAuthoritativeStartup ? NULL : Checkpoints::GetLastSyncCheckpoint();
     bool fCheckpointWorkGate = false;
     int64_t nWorkGateTime = 0;
     unsigned int nWorkGateBits = 0;
