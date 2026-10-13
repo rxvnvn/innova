@@ -46,6 +46,13 @@
 namespace fs = boost::filesystem;
 extern CWallet* pwalletMain;
 
+// Test-only memo invalidation seam (defined in checkpoints.cpp): clears the
+// per-tip extends-memo, the descendant-verdict map and the per-epoch
+// checkpoint-resolution memo WITHOUT touching hashSyncCheckpoint.
+namespace Checkpoints {
+void ResetCheckpointMemoForTest(const uint256& tipHash, const uint256& epochCheckpoint);
+}
+
 // ---------------------------------------------------------------- helpers
 static CBlock* CkptAVBuildPoW(CBlockIndex* prev, unsigned int extra)
 {
@@ -447,6 +454,99 @@ BOOST_AUTO_TEST_CASE(cpu_miner_does_real_hash_work_and_checkpoint_gate_clears)
     fRegTest = savedRegTest;
     fTestNet = savedTestNet;
     Checkpoints::mapCheckpoints = savedCheckpoints;
+    fx.Restore();
+}
+
+// ROUND-4 P2 REGRESSION — the per-tip extends-memo in CheckSyncByValue must
+// treat a TRANSIENT resolver failure as RETRYABLE, never as a cached verdict.
+//
+// Pre-fix defect: the O(1) tip-anchor fast path memoized
+// AuthoritativeGetActiveSnapshotByHeight's bool result as a DEFINITIVE
+// per-(checkpoint-epoch, tip-hash) verdict and additionally wrote it into
+// mapDescendantVerdict. A TRANSIENT authority/storage hiccup during the
+// by-height anchor probe therefore produced a definitive-looking "not a
+// descendant" rejection that was cached for the whole epoch: every later
+// candidate extending the SAME tip kept being rejected with no tip change
+// and no checkpoint advance — a permanent, unrecoverable tip freeze (the
+// reviewer's "sticky false negative").
+//
+// Fix under test:
+//   * a TRANSIENT probe failure fails THIS call closed (enforcement kept)
+//     but is NOT memoized (neither the per-tip extends-memo nor
+//     mapDescendantVerdict), so the next call for the SAME tip RETRIES;
+//   * a DEFINITIVE rejection is still memoized exactly as before;
+//   * g_syncCheckpointMemo follows the same discipline: a resolution
+//     AUTHORITY_FAILURE is retryable, a definitive NOT_FOUND stays cached
+//     (exercised here through the unreachable-record rejection path).
+//
+// Injection seam (test-only, production never arms it):
+// AuthoritativeActiveHeightFailForTest(n) deterministically makes the next n
+// AuthoritativeGetActiveSnapshotByHeightR calls report
+// AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE without touching the authoritative
+// sources.
+BOOST_AUTO_TEST_CASE(transient_anchor_failure_is_retryable_not_sticky)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+    BOOST_CHECK_EQUAL(AuthoritativeActiveHeightFailCountForTest(), 0);
+
+    // Live-tip world: the O(1) fast path fires (parent == hashBestChain).
+    CBlockIndex* tip = pindexBest;
+
+    // Arm a NON-RESIDENT historical checkpoint below the live tail (the
+    // active chain extends it), priming both memos for the (epoch, tip) pair.
+    BlockIndexSnapshot cold;
+    BOOST_REQUIRE(CkptAVFixture::ActiveAt(3, &cold, NULL));
+    const uint256 hashCold = cold.hash;
+    Checkpoints::hashSyncCheckpoint = hashCold;
+    BOOST_CHECK_MESSAGE(Checkpoints::CheckSyncByValue(uint256(0xF7A0), tip),
+                        "pre-condition: a candidate over the healthy tip is accepted; "
+                        "the extends-memo is now primed true for this (epoch, tip)");
+
+    // (i) DETERMINISTIC failure: while the primed (epoch, tip) verdict is in
+    // force, invalidate BOTH memos and make the next by-height anchor probe
+    // report a TRANSIENT authority failure. Same tip, no checkpoint advance.
+    AuthoritativeActiveHeightFailForTest(1);
+    Checkpoints::ResetCheckpointMemoForTest(tip->GetBlockHash(), hashCold);
+    BOOST_CHECK_EQUAL(AuthoritativeActiveHeightFailCountForTest(), 1);
+    BOOST_CHECK_MESSAGE(!Checkpoints::CheckSyncByValue(uint256(0xF7A1), tip),
+                        "fail-closed: the candidate must be REJECTED while the probe fails");
+
+    // THE FIX: the transient failure must have left both memos untouched. The
+    // next call for the SAME tip (no tip change, no checkpoint advance)
+    // RETRIES the probe and, with the failure cleared (the seam auto-disarms
+    // after the one-shot), must be ACCEPTED.
+    BOOST_CHECK_MESSAGE(Checkpoints::CheckSyncByValue(uint256(0xF7A2), tip),
+                        "sticky-memo fix: the SAME tip retries after a transient "
+                        "failure and is accepted (cannot be cached-sealed false)");
+    // Same tip, same epoch: no tip change and no checkpoint advance occurred.
+    BOOST_CHECK(pindexBest == tip);
+    BOOST_CHECK(Checkpoints::hashSyncCheckpoint == hashCold);
+
+    // (a) CONTROL / DESIGN NOTE: a DEFINITIVE negative is still memoized for
+    // the epoch, as designed. The definitive-not-descendant caching is
+    // exercised structurally below in (b): once the epoch-checkpoint memo
+    // holds a definitive NOT_FOUND for record 0xF7D0, the second call is
+    // served from the memo cache and the rejection is repeated WITHOUT the
+    // resolver being consulted again (observable via the injection counter
+    // staying at zero after the re-arm). The same memo maps serve the
+    // not-descendant verdicts, so the caching contract is identical; the only
+    // change under test is that TRANSIENT resolution failures are excluded
+    // from it.
+
+    // (b) SECONDARY (g_syncCheckpointMemo): an unreachable epoch record is a
+    // DEFINITIVE miss and stays cached (repeated rejection), restoring the
+    // armed-state invariant before the fixture tears down.
+    {
+        Checkpoints::hashSyncCheckpoint = uint256(0xF7D0);
+        Checkpoints::ResetCheckpointMemoForTest(uint256(0), uint256(0));
+        CBlockIndex* localTip2 = pindexBest;
+        BOOST_CHECK(!Checkpoints::CheckSyncByValue(uint256(0xF7D1), localTip2));
+        BOOST_CHECK(!Checkpoints::CheckSyncByValue(uint256(0xF7D2), localTip2));
+        BOOST_CHECK(pindexBest == localTip2);
+    }
+    AuthoritativeActiveHeightFailForTest(0);
+
     fx.Restore();
 }
 

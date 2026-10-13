@@ -527,6 +527,25 @@ namespace Checkpoints
 
     } // namespace
 
+    // ROUND-4 P2: test-only memo invalidation seam (see checkpoints.h; used by
+    // checkpoint_v2_authoritative_tests.cpp). Clears the per-tip extends-memo,
+    // the per-parent descendant-verdict map and the per-epoch checkpoint
+    // resolution memo WITHOUT touching hashSyncCheckpoint, so a test can
+    // replay the memo's RETRY path from a known-EMPTY state. All three live in
+    // the anonymous namespace above and are only ever mutated under
+    // cs_hashSyncCheckpoint; this debug/test-only writer honours the same
+    // locking discipline. Production startup never calls it.
+    void ResetCheckpointMemoForTest(const uint256& tipHash, const uint256& epochCheckpoint)
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        g_bestExtendsMemo = BestExtendsCheckpointMemo();
+        mapDescendantVerdict.clear();
+        g_descendantMemoEpoch = epochCheckpoint;
+        g_descendantMemoSteps = 0;
+        g_syncCheckpointMemo = SyncCheckpointMemoEntry();
+        (void)tipHash; // tip hash documents the intended (epoch, tip) replay target
+    }
+
     // FIX B: by-value descendant/conflict validation (legacy ValidateSyncCheckpoint).
     bool ValidateSyncCheckpointByValue(uint256 hashCheckpoint)
     {

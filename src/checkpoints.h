@@ -113,6 +113,13 @@ namespace Checkpoints
     bool CheckSyncByValue(const uint256& hashBlock, const CBlockIndex* pindexPrev);
     bool ValidateSyncCheckpointByValue(uint256 hashCheckpoint);
 
+    // Test-only memo invalidation seam (ROUND-4 P2; production never calls
+    // it). Clears the per-tip extends-memo, the per-parent descendant-verdict
+    // map and the per-epoch checkpoint resolution memo WITHOUT touching
+    // hashSyncCheckpoint, so a test can replay the memo's RETRY path from a
+    // known-EMPTY state. Defined in checkpoints.cpp.
+    void ResetCheckpointMemoForTest(const uint256& tipHash, const uint256& epochCheckpoint);
+
     // FIX B: by-value anti-spam work-gate anchors for the synced checkpoint
     // (the values ProcessBlock's weak-competitor gate previously read through a
     // resident CBlockIndex*). pnBits is the nBits of the last block of the
