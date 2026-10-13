@@ -50,6 +50,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error);
 // Read-only authoritative historical lookup used by legacy startup consumers that
 // need one by-value active-chain record; never materializes historical CBlockIndex.
 bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out);
+
 enum AuthoritativeBlockResolutionResult
 {
     AUTHORITATIVE_BLOCK_FOUND = 0,
@@ -62,6 +63,20 @@ enum AuthoritativeBlockResolutionResult
 // non-active history, and authority failure. Never materializes CBlockIndex.
 AuthoritativeBlockResolutionResult ResolveAuthoritativeBlockSnapshotR(
     const uint256& hash, BlockIndexSnapshot* out, std::string* error);
+
+// Typed by-HEIGHT variant of the active-chain lookup (ROUND-4 P2). Returns:
+//   AUTHORITATIVE_BLOCK_FOUND           - the ACTIVE authoritative block at
+//                                         `height` (in *out);
+//   AUTHORITATIVE_BLOCK_NOT_FOUND       - DEFINITIVE: both authoritative
+//                                         sources answered and no ACTIVE
+//                                         block exists at `height`;
+//   AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE - TRANSIENT / unavailable authority
+//                                         (storage hiccup, reader not open):
+//                                         fail closed and RETRY later; callers
+//                                         must never cache this as a
+//                                         definitive verdict.
+AuthoritativeBlockResolutionResult AuthoritativeGetActiveSnapshotByHeightR(
+    int height, BlockIndexSnapshot* out, std::string* error);
 
 bool ResolveAuthoritativeBlockSnapshot(const uint256& hash,
                                        BlockIndexSnapshot* out,
@@ -106,6 +121,14 @@ bool AuthorityReadyConsumerEnter(const char* consumer, std::string* error);
 
 // Test seams (never used on a production path).
 void AuthorityReadyResetForTest();
+// ROUND-4 P2: test-only failure injection on the by-HEIGHT active-chain
+// lookup (AuthoritativeGetActiveSnapshotByHeightR). When armed, every call
+// reports AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE WITHOUT touching the
+// authoritative sources, so callers observe a transient storage hiccup
+// deterministically. count==0 disarms and restores production behavior.
+// Mirrors the existing *ForTest seams; production code never calls these.
+void AuthoritativeActiveHeightFailForTest(int count);
+int AuthoritativeActiveHeightFailCountForTest();
 // Refusal detail of the last publication attempt (diagnostics only).
 std::string AuthorityReadyRefusalDetail();
 std::string AuthorityReadyStateName();

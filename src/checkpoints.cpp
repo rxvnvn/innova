@@ -360,9 +360,11 @@ namespace Checkpoints
         uint256 syncHash;
         std::string failureDetail;
         bool resolved;
+        bool transientFailure;    // failed lookup was TRANSIENT (retryable)
 
         SyncCheckpointMemoEntry()
-            : hashCheckpoint(0), syncHeight(-1), syncHash(0), resolved(false) {}
+            : hashCheckpoint(0), syncHeight(-1), syncHash(0), resolved(false),
+              transientFailure(false) {}
     };
 
     SyncCheckpointMemoEntry g_syncCheckpointMemo;
@@ -392,9 +394,27 @@ namespace Checkpoints
     // checkpoint. Returns the resolver result; on FOUND/NOT_ACTIVE fills *out.
     // Epoch tag = hashSyncCheckpoint, so a checkpoint advance never serves a
     // stale snapshot. All callers hold cs_hashSyncCheckpoint.
+    //
+    // ROUND-4 P2 (sticky-memo discipline): a resolver result is memoized ONLY
+    // when it is definitive — FOUND and NOT_ACTIVE (a valid snapshot), or
+    // NOT_FOUND where the by-hash resolver itself reports a genuine immutable
+    // miss. AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE is TRANSIENT (authority /
+    // storage hiccup): it fails this call closed but is NOT cached, so the
+    // next caller retries instead of inheriting a frozen negative verdict for
+    // the whole epoch.
     AuthoritativeBlockResolutionResult ResolveSyncCheckpointSnapMemoized(
         BlockIndexSnapshot* out, std::string* err)
     {
+        // A memoized failure is retryable iff it was transient. NOT_FOUND from
+        // the by-hash resolver is definitive absence (a completed authoritative
+        // lookup) and stays cached; AUTHORITY_FAILURE is never cached.
+        if (g_syncCheckpointMemo.resolved &&
+            g_syncCheckpointMemo.hashCheckpoint == hashSyncCheckpoint &&
+            g_syncCheckpointMemo.syncHeight < 0 &&
+            g_syncCheckpointMemo.transientFailure)
+        {
+            return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+        }
         if (!g_syncCheckpointMemo.resolved ||
             g_syncCheckpointMemo.hashCheckpoint != hashSyncCheckpoint)
         {
@@ -406,11 +426,23 @@ namespace Checkpoints
                                                    &resolveErr);
             g_syncCheckpointMemo.hashCheckpoint = hashSyncCheckpoint;
             if (r == AUTHORITATIVE_BLOCK_FOUND || r == AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+            {
                 g_syncCheckpointMemo.syncHeight = g_syncCheckpointMemo.snapshot.height;
+                g_syncCheckpointMemo.transientFailure = false;
+            }
+            else if (r == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
+            {
+                // Transient: record it so the CALLER can fail closed, but do
+                // not persist a definitive negative verdict for the epoch.
+                g_syncCheckpointMemo.syncHeight = -1;
+                g_syncCheckpointMemo.failureDetail = resolveErr;
+                g_syncCheckpointMemo.transientFailure = true;
+            }
             else
             {
                 g_syncCheckpointMemo.syncHeight = -1;
                 g_syncCheckpointMemo.failureDetail = resolveErr;
+                g_syncCheckpointMemo.transientFailure = false;
             }
             g_syncCheckpointMemo.resolved = true;
         }
@@ -418,7 +450,9 @@ namespace Checkpoints
         {
             if (err)
                 *err = g_syncCheckpointMemo.failureDetail;
-            return AUTHORITATIVE_BLOCK_NOT_FOUND;
+            return g_syncCheckpointMemo.transientFailure
+                ? AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE
+                : AUTHORITATIVE_BLOCK_NOT_FOUND;
         }
         *out = g_syncCheckpointMemo.snapshot;
         return AUTHORITATIVE_BLOCK_FOUND;
@@ -608,6 +642,16 @@ namespace Checkpoints
         // epoch the verdict only changes when the best chain forks (a different
         // tip may have a different anchor at the sync height), so the tip hash
         // is part of the memo key.
+        //
+        // ROUND-4 P2 (sticky-memo discipline): the probe result is memoized
+        // ONLY when it is DEFINITIVE. AuthoritativeGetActiveSnapshotByHeightR
+        // distinguishes a real miss (NOT_FOUND: the probed active chain does
+        // not anchor at the checkpoint) from a TRANSIENT authority failure
+        // (AUTHORITY_FAILURE: storage/resolver hiccup). Both fail closed for
+        // THIS call (enforcement is never weakened), but a transient failure
+        // leaves this memo invalid AND mapDescendantVerdict untouched, so the
+        // next caller for the same tip retries the probe instead of inheriting
+        // a frozen false verdict for the whole epoch.
         if (hashPrev == hashBestChain)
         {
             if (!g_bestExtendsMemo.fValid ||
@@ -615,9 +659,33 @@ namespace Checkpoints
                 g_bestExtendsMemo.bestTip != hashPrev)
             {
                 BlockIndexSnapshot anchor;
-                g_bestExtendsMemo.bestExtends =
-                    AuthoritativeGetActiveSnapshotByHeight(nSyncHeight, &anchor) &&
-                    anchor.height == nSyncHeight && anchor.hash == hashSyncCheckpoint;
+                std::string anchorErr;
+                const AuthoritativeBlockResolutionResult anchorRes =
+                    AuthoritativeGetActiveSnapshotByHeightR(nSyncHeight, &anchor, &anchorErr);
+                if (anchorRes == AUTHORITATIVE_BLOCK_FOUND &&
+                    anchor.height == nSyncHeight && anchor.hash == hashSyncCheckpoint)
+                {
+                    // DEFINITIVE: the active chain extends the checkpoint.
+                    g_bestExtendsMemo.bestExtends = true;
+                }
+                else if (anchorRes == AUTHORITATIVE_BLOCK_NOT_FOUND ||
+                         (anchorRes == AUTHORITATIVE_BLOCK_FOUND &&
+                          (anchor.height != nSyncHeight || anchor.hash != hashSyncCheckpoint)))
+                {
+                    // DEFINITIVE: not a descendant of the sync-checkpoint.
+                    g_bestExtendsMemo.bestExtends = false;
+                }
+                else
+                {
+                    // TRANSIENT authority failure: fail closed for THIS call
+                    // only. Do NOT memoize a verdict (neither in
+                    // g_bestExtendsMemo nor mapDescendantVerdict) so the same
+                    // tip's next candidate retries the probe.
+                    return error("CheckSync: active-chain anchor probe at height %d "
+                                 "unavailable (transient; not memoized): %s",
+                                 nSyncHeight,
+                                 anchorErr.empty() ? "(no detail)" : anchorErr.c_str());
+                }
                 g_bestExtendsMemo.epochCheckpoint = hashSyncCheckpoint;
                 g_bestExtendsMemo.bestTip = hashPrev;
                 g_bestExtendsMemo.fValid = true;
