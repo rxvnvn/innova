@@ -370,6 +370,24 @@ namespace Checkpoints
     uint256 g_descendantMemoEpoch; // hashSyncCheckpoint when verdicts were valid
     int g_descendantMemoSteps = 0; // total resolver steps served from the walk (diagnostics)
 
+    // Per (checkpoint epoch, best-tip identity) verdict of "the active best
+    // chain extends the synchronized checkpoint". Paid once per tip advance
+    // with a single O(1) resolver probe (active block at the sync height);
+    // obviously NOT a per-candidate walk. Keyed by the best-tip HASH because
+    // the active chain can fork within one checkpoint epoch, and a forked tip
+    // may have a different anchor at the sync height.
+    struct BestExtendsCheckpointMemo
+    {
+        bool fValid;
+        uint256 epochCheckpoint;
+        uint256 bestTip;
+        bool bestExtends;
+        BestExtendsCheckpointMemo()
+            : fValid(false), epochCheckpoint(0), bestTip(0), bestExtends(false) {}
+    };
+
+    BestExtendsCheckpointMemo g_bestExtendsMemo;
+
     // Memoized per-epoch authoritative resolution of the CURRENT synchronized
     // checkpoint. Returns the resolver result; on FOUND/NOT_ACTIVE fills *out.
     // Epoch tag = hashSyncCheckpoint, so a checkpoint advance never serves a
@@ -532,10 +550,12 @@ namespace Checkpoints
 
     // FIX B: by-value non-IBD CheckSync (legacy CheckSync else-branch).
     // ROUND-3 P2a: O(1) on the common path where the candidate's parent is the
-    // already-verified known-good tip (descendant-by-induction: a block whose
-    // parent is a verified descendant of the sync-checkpoint is itself a
-    // descendant). The ancestry walk runs only for a new/side parent, bounded
-    // and memoized; failure is memoized per epoch and fails closed.
+    // published active best tip: that chain extends the sync-checkpoint iff the
+    // ACTIVE authoritative block at the checkpoint height IS the checkpoint --
+    // one bounded resolver probe memoized per (checkpoint epoch, tip hash).
+    // Descendant verdicts (including rejection) are memoized per parent hash
+    // for the epoch. The bounded-fail-closed ancestry walk runs only for a
+    // new/side parent.
     bool CheckSyncByValue(const uint256& hashBlock, const CBlockIndex* pindexPrev)
     {
         LOCK(cs_hashSyncCheckpoint);
@@ -543,8 +563,8 @@ namespace Checkpoints
             return error("CheckSync: no previous block to evaluate against sync-checkpoint");
         const int nHeight = pindexPrev->nHeight + 1;
 
-        // Resolve the current synchronized checkpoint by value (memoized per
-        // hashSyncCheckpoint epoch).
+        // Memoized per-epoch authoritative resolution of the CURRENT synchronized
+        // checkpoint.
         BlockIndexSnapshot syncSnap;
         std::string syncErr;
         const AuthoritativeBlockResolutionResult syncRes =
@@ -553,11 +573,13 @@ namespace Checkpoints
             return error("CheckSync: sync-checkpoint not in block index (%s)",
                          hashSyncCheckpoint.ToString().c_str());
         const int nSyncHeight = syncSnap.height;
-        // Checkpoint epoch for the descendant-verdict memo: invalidated whenever
+
+        // Checkpoint epoch for both verdict memos: invalidated whenever
         // hashSyncCheckpoint changes.
         if (g_descendantMemoEpoch != hashSyncCheckpoint)
         {
             mapDescendantVerdict.clear();
+            g_bestExtendsMemo = BestExtendsCheckpointMemo();
             g_descendantMemoEpoch = hashSyncCheckpoint;
             g_descendantMemoSteps = 0;
         }
@@ -574,20 +596,34 @@ namespace Checkpoints
 
         // O(1) memo hit: a parent already proven to be (or rejected as NOT) a
         // descendant keeps its verdict for this checkpoint epoch.
-        std::map<uint256, bool>::iterator mv = mapDescendantVerdict.find(pindexPrev->GetBlockHash());
+        const uint256 hashPrev = pindexPrev->GetBlockHash();
+        std::map<uint256, bool>::iterator mv = mapDescendantVerdict.find(hashPrev);
         if (mv != mapDescendantVerdict.end())
             return mv->second;
 
-        // O(1) common path: the parent IS the already-verified known-good tip
-        // (hashBestChain). By induction that tip is a descendant of the
-        // sync-checkpoint (it was verified when it was accepted, and every
-        // later tip advanced only through CheckSync-passing children), so the
-        // candidate passes without any ancestry walk.
-        if (pindexPrev->GetBlockHash() == hashBestChain)
+        // O(1) common path: the parent IS the published active best tip. That
+        // chain extends the sync-checkpoint iff the ACTIVE authoritative block
+        // at nSyncHeight is the checkpoint itself -- one bounded resolver
+        // probe, memoized per (checkpoint epoch, tip identity): within one
+        // epoch the verdict only changes when the best chain forks (a different
+        // tip may have a different anchor at the sync height), so the tip hash
+        // is part of the memo key.
+        if (hashPrev == hashBestChain)
         {
-            mapDescendantVerdict.insert(std::make_pair(pindexPrev->GetBlockHash(), true));
-            ++g_descendantMemoSteps; // 0 walk steps; keep the counter meaningful
-            return true;
+            if (!g_bestExtendsMemo.fValid ||
+                g_bestExtendsMemo.epochCheckpoint != hashSyncCheckpoint ||
+                g_bestExtendsMemo.bestTip != hashPrev)
+            {
+                BlockIndexSnapshot anchor;
+                g_bestExtendsMemo.bestExtends =
+                    AuthoritativeGetActiveSnapshotByHeight(nSyncHeight, &anchor) &&
+                    anchor.height == nSyncHeight && anchor.hash == hashSyncCheckpoint;
+                g_bestExtendsMemo.epochCheckpoint = hashSyncCheckpoint;
+                g_bestExtendsMemo.bestTip = hashPrev;
+                g_bestExtendsMemo.fValid = true;
+            }
+            mapDescendantVerdict.insert(std::make_pair(hashPrev, g_bestExtendsMemo.bestExtends));
+            return g_bestExtendsMemo.bestExtends;
         }
 
         BlockIndexSnapshot prevSnap;
