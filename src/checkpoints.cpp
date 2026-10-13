@@ -177,6 +177,41 @@ namespace Checkpoints
         return NULL;
     }
 
+    // ------------------------------------------------------------------
+    // V2-R2B (FIX A): restore the persisted synchronized checkpoint at V2
+    // authoritative startup.
+    //
+    // ROOT CAUSE (production incident): the V2 authoritative startup bypasses
+    // CTxDB::LoadBlockIndex -- the legacy boot path that read the persisted
+    // sync-checkpoint -- so Checkpoints::hashSyncCheckpoint stayed at its
+    // default 0. Once IsInitialBlockDownload() became false, CheckSync()'s
+    // non-IBD branch did mapBlockIndex.count(hashSyncCheckpoint) -> absent ->
+    // "CheckSync: sync-checkpoint not in block index" and rejected EVERY
+    // candidate block: the tip froze and all miner threads went idle.
+    //
+    // Semantics (documented, not a silent fallback):
+    //   * ABSENT key   -> hashOut stays 0 == "no synchronized checkpoint"
+    //                     established yet (canonical ppcoin). NEVER genesis.
+    //   * LOADED       -> hashOut is the persisted checkpoint.
+    //   * CORRUPT      -> durable authority inconsistency; caller fails startup.
+    // ------------------------------------------------------------------
+
+    // FIX A: typed load of the persisted synchronized checkpoint.
+    SyncCheckpointLoadStatus LoadPersistedSyncCheckpoint(uint256& hashOut, std::string* error)
+    {
+        if (error) error->clear();
+        hashOut = uint256(0);
+        // Read-only handle on the legacy tx-leveldb (still an ACTIVE runtime
+        // database for its non-block-index namespaces). A fresh datadir has no
+        // such key -> SYNC_CHECKPOINT_ABSENT, which is the canonical ppcoin
+        // "no synchronized checkpoint" value and NOT a genesis substitution.
+        CTxDB txdb("r");
+        const SyncCheckpointLoadStatus st = txdb.LoadSyncCheckpoint(hashOut);
+        if (st == SYNC_CHECKPOINT_CORRUPT && error)
+            *error = "persisted hashSyncCheckpoint entry is present but not decodable";
+        return st;
+    }
+
     // ppcoin: only descendant of current sync-checkpoint is allowed
     bool ValidateSyncCheckpoint(uint256 hashCheckpoint)
     {

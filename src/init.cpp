@@ -1476,6 +1476,31 @@ bool AppInit2()
         if (!InitBlockIndexAuthoritative(v2Root, &authErr))
             return InitError(strprintf("Block Index V2 authoritative startup failed: %s", authErr.c_str()));
         printf(" block index (authoritative) %" PRId64"ms\n", GetTimeMillis() - nStart);
+
+        // V2-R2B (FIX A): load the persisted synchronized checkpoint into the
+        // process checkpoint authority. The legacy startup did this inside
+        // CTxDB::LoadBlockIndex (txdb-leveldb.cpp), which the V2 authoritative
+        // startup deliberately bypasses (blockindex_authoritative_startup.cpp);
+        // without it Checkpoints::hashSyncCheckpoint stayed 0 and, once
+        // IsInitialBlockDownload() became false, CheckSync() rejected EVERY
+        // candidate block (tip frozen, miner threads idle). Semantics:
+        //   * ABSENT key -> hashSyncCheckpoint stays 0 = "no synchronized
+        //     checkpoint" (canonical ppcoin). NEVER a genesis substitution.
+        //   * CORRUPT key -> fail startup (durable authority inconsistency).
+        {
+            uint256 hashSyncCheckpointLoaded = uint256(0);
+            std::string ckptErr;
+            const SyncCheckpointLoadStatus ckptStatus =
+                Checkpoints::LoadPersistedSyncCheckpoint(hashSyncCheckpointLoaded, &ckptErr);
+            if (ckptStatus == SYNC_CHECKPOINT_CORRUPT)
+                return InitError(strprintf("V2 startup: persisted synchronized checkpoint is corrupt: %s", ckptErr.c_str()));
+            Checkpoints::hashSyncCheckpoint = hashSyncCheckpointLoaded;
+            if (ckptStatus == SYNC_CHECKPOINT_ABSENT)
+                printf("V2 startup: no persisted synchronized checkpoint; hashSyncCheckpoint=0 (no synchronized checkpoint established)\n");
+            else
+                printf("V2 startup: synchronized checkpoint loaded %s\n",
+                       Checkpoints::hashSyncCheckpoint.ToString().c_str());
+        }
     }
 
 authoritative_startup_ready:

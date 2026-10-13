@@ -699,6 +699,22 @@ bool CTxDB::ReadSyncCheckpoint(uint256& hashCheckpoint)
     return Read(string("hashSyncCheckpoint"), hashCheckpoint);
 }
 
+// V2-R2B (FIX A): typed persisted sync-checkpoint read. ABSENT and CORRUPT are
+// distinct so the V2 authoritative startup can fail closed on a durable
+// inconsistency while treating a never-established checkpoint as the canonical
+// ppcoin 0 ("no synchronized checkpoint"). No genesis substitution.
+SyncCheckpointLoadStatus CTxDB::LoadSyncCheckpoint(uint256& hashCheckpoint)
+{
+    hashCheckpoint = uint256(0);
+    if (!Exists(string("hashSyncCheckpoint")))
+        return SYNC_CHECKPOINT_ABSENT;
+    uint256 valueRead = uint256(0);
+    if (!Read(string("hashSyncCheckpoint"), valueRead))
+        return SYNC_CHECKPOINT_CORRUPT;
+    hashCheckpoint = valueRead;
+    return SYNC_CHECKPOINT_LOADED;
+}
+
 bool CTxDB::WriteSyncCheckpoint(uint256 hashCheckpoint)
 {
     return Write(string("hashSyncCheckpoint"), hashCheckpoint);

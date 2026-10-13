@@ -7,6 +7,7 @@
 #include <map>
 #include "net.h"
 #include "util.h"
+#include "txdb.h"   // SyncCheckpointLoadStatus (V2-R2B FIX A typed seam)
 
 #ifdef WIN32
 #undef STRICT
@@ -56,6 +57,15 @@ namespace Checkpoints
     CBlockIndex* GetLastSyncCheckpoint();
     bool WriteSyncCheckpoint(const uint256& hashCheckpoint);
     bool AcceptPendingSyncCheckpoint();
+
+    // V2-R2B (FIX A): at V2 authoritative startup the persisted synchronized
+    // checkpoint (the value the legacy CTxDB::LoadBlockIndex read from key
+    // "hashSyncCheckpoint") must be restored into hashSyncCheckpoint. Returns
+    // SYNC_CHECKPOINT_LOADED / SYNC_CHECKPOINT_ABSENT / SYNC_CHECKPOINT_CORRUPT.
+    // ABSENT leaves hashOut == 0, the canonical ppcoin "no synchronized
+    // checkpoint" value -- NEVER a genesis substitution. CORRUPT is a durable
+    // authority inconsistency and must fail closed at startup.
+    SyncCheckpointLoadStatus LoadPersistedSyncCheckpoint(uint256& hashOut, std::string* error);
 
     bool CheckSync(const uint256& hashBlock, const CBlockIndex* pindexPrev);
     const CBlockIndex* AutoSelectSyncCheckpoint();

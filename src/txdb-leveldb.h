@@ -70,6 +70,21 @@
 // Result of a coverage-certificate verification (R3.6). NO_CERTIFICATE and
 // STORAGE_ERROR are fail-closed results, never "covered".
 
+#ifndef INNOVA_SYNC_CHECKPOINT_LOAD_STATUS_DEFINED
+#define INNOVA_SYNC_CHECKPOINT_LOAD_STATUS_DEFINED
+// V2-R2B (FIX A): typed result of reading the persisted synchronized checkpoint.
+// ABSENT and CORRUPT are deliberately distinct: an absent key is the canonical
+// ppcoin "no synchronized checkpoint" state (hashSyncCheckpoint stays 0), while a
+// present-but-undecodable value is a durable authority inconsistency and must
+// fail closed at startup.
+enum SyncCheckpointLoadStatus
+{
+    SYNC_CHECKPOINT_ABSENT  = 0,
+    SYNC_CHECKPOINT_LOADED  = 1,
+    SYNC_CHECKPOINT_CORRUPT = 2,
+};
+#endif
+
 class CTxDB
 {
 public:
@@ -272,6 +287,13 @@ bool ReadAddrIndex(uint160 addrHash, std::vector<uint256>& txHashes);
     bool WriteCandidateTips(const std::map<uint256, CandidateTipRecord>& tips);
     bool ReadSyncCheckpoint(uint256& hashCheckpoint);
     bool WriteSyncCheckpoint(uint256 hashCheckpoint);
+    // V2-R2B (FIX A): typed persisted sync-checkpoint read that distinguishes a
+    // key that is ABSENT (no synchronized checkpoint was ever established on
+    // this datadir -> the canonical ppcoin "none" value 0) from a key that is
+    // PRESENT but not decodable (corrupt -> the caller must fail closed).
+    // Read-only; ReadSyncCheckpoint() semantics are unchanged.
+    // NOTE: no genesis substitution is performed here.
+    SyncCheckpointLoadStatus LoadSyncCheckpoint(uint256& hashCheckpoint);
     bool ReadCheckpointPubKey(std::string& strPubKey);
     bool WriteCheckpointPubKey(const std::string& strPubKey);
     bool LoadBlockIndex();
