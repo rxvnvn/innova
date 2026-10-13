@@ -148,7 +148,13 @@ CTxDB::CTxDB(const char* pszMode)
         ReadVersion(nVersion);
         printf("Transaction index version is %d\n", nVersion);
 
-        if (nVersion < DATABASE_VERSION)
+        // ROUND-3 P3b: the version-mismatch backup/reset dance RENAMES the
+        // whole legacy store and recreates it. On a READ-ONLY handle (e.g. the
+        // Checkpoints::LoadPersistedSyncCheckpoint boot probe) that is a
+        // destructive write behind the caller's back; skip the dance entirely
+        // and let the caller proceed against the existing store (any
+        // incompatible read is reported through the typed read seam).
+        if (nVersion < DATABASE_VERSION && !fReadOnly)
         {
             printf("CTxDB() : database version %d is older than expected %d, creating backup\n",
                    nVersion, DATABASE_VERSION);

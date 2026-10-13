@@ -210,11 +210,37 @@ namespace Checkpoints
         // database for its non-block-index namespaces). A fresh datadir has no
         // such key -> SYNC_CHECKPOINT_ABSENT, which is the canonical ppcoin
         // "no synchronized checkpoint" value and NOT a genesis substitution.
-        CTxDB txdb("r");
-        const SyncCheckpointLoadStatus st = txdb.LoadSyncCheckpoint(hashOut);
-        if (st == SYNC_CHECKPOINT_CORRUPT && error)
-            *error = "persisted hashSyncCheckpoint entry is present but not decodable";
-        return st;
+        // ROUND-3 P3b: this is a READ-ONLY boot probe. The CTxDB constructor
+        // (init_blockindex) throws runtime_error on a leveldb open error and,
+        // inside the version-mismatch dance, can RENAME + RECREATE the whole
+        // legacy store -- neither is acceptable on this read-only path, where
+        // an uncaught exception aborted the process in the previous code.
+        // Catch ALL exceptions from the handle construction, do not trigger the
+        // backup/reset dance (no version key was written), and report the
+        // failure gracefully: the caller (init.cpp) turns it into an InitError
+        // and startup fails loudly but gracefully.
+        try
+        {
+            CTxDB txdb("r");
+            const SyncCheckpointLoadStatus st = txdb.LoadSyncCheckpoint(hashOut);
+            if (st == SYNC_CHECKPOINT_CORRUPT && error)
+                *error = "persisted hashSyncCheckpoint entry is present but not decodable";
+            return st;
+        }
+        catch (const std::exception& e)
+        {
+            hashOut = uint256(0);
+            if (error)
+                *error = std::string("legacy tx-leveldb open/read failed: ") + e.what();
+            return SYNC_CHECKPOINT_CORRUPT;
+        }
+        catch (...)
+        {
+            hashOut = uint256(0);
+            if (error)
+                *error = "legacy tx-leveldb open/read failed (unknown exception)";
+            return SYNC_CHECKPOINT_CORRUPT;
+        }
     }
 
     // ------------------------------------------------------------------
