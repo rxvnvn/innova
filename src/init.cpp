@@ -1487,6 +1487,45 @@ bool AppInit2()
         //   * ABSENT key -> hashSyncCheckpoint stays 0 = "no synchronized
         //     checkpoint" (canonical ppcoin). NEVER a genesis substitution.
         //   * CORRUPT key -> fail startup (durable authority inconsistency).
+        //
+        // V2-R3 (ROUND-2 P0, genesis-checkpoint establishment — LEGACY CREATION
+        // PARITY, NOT A FALLBACK): legacy LoadBlockIndex established the
+        // synchronized checkpoint ONCE at chain CREATION, in its
+        // mapBlockIndex.empty() branch, via WriteSyncCheckpoint(hashGenesis)
+        // right after the genesis was accepted (main.cpp:10101-10122). It was a
+        // durable, persisted write gated on FIRST BOOT ONLY; every later boot
+        // then LOADED the persisted value (or ABSENT left 0). The V2
+        // authoritative path invokes that same creation branch implicitly
+        // through the EMPTY_NEW native bootstrap, but never performed the
+        // checkpoint half, so a fresh datadir booted with
+        // hashSyncCheckpoint == 0 forever — and once IBD ended,
+        // CheckSync's "no synchronized checkpoint" rejection froze the tip
+        // again (the production freeze, in its fresh-boot form).
+        //
+        // The repair reproduces the legacy CREATION event exactly, one time,
+        // with an EXPLICIT persisted write + in-memory publish + log, and it
+        // fires ONLY on the one GENUINELY-NEW boot (fresh chain: active tip is
+        // the genesis anchor AND no durable checkpoint exists). It is
+        // structurally incapable of firing when a real checkpoint is persisted
+        // (the create branch requires LOADED==SYNC_CHECKPOINT_ABSENT) or on a
+        // non-empty chain (the create branch requires baseTipHeight == 0 and
+        // hashBestChain == genesis) — never a genesis substitution and never a
+        // re-creation over existing authority.
+        //
+        // RESIDUAL DEGENERATE STATE (documented, fail-closed): a persisted-DB
+        // ABSENT value paired with a NON-empty chain (active tip above genesis)
+        // is unreachable on any legacy-created chain, because legacy persisted
+        // the genesis checkpoint in the same commit as chain creation; on the
+        // V2 path the EMPTY_NEW bootstrap persists it through this block too.
+        // If it is nevertheless observed, authority consistency is questionable
+        // but the chain is NOT new, so re-creating is wrong and treating 0 as
+        // "no synchronized checkpoint" is post-FIX-A behavior. We boot with a
+        // LOUD warning (0 = canonical no-checkpoint) rather than an
+        // InitError: the canonical value is defined, CheckSync keeps enforcing
+        // its descendant rule against 0 through its error path, and refusing
+        // to boot could make an otherwise-recoverable operational mistake
+        // unrecoverable. If the operator disagrees, the documented remedy is a
+        // controlled restart with a repaired legacy DB — not our choice here.
         {
             uint256 hashSyncCheckpointLoaded = uint256(0);
             std::string ckptErr;
@@ -1500,6 +1539,28 @@ bool AppInit2()
             else
                 printf("V2 startup: synchronized checkpoint loaded %s\n",
                        Checkpoints::hashSyncCheckpoint.ToString().c_str());
+
+            // ROUND-2 P0: one-time genesis-checkpoint establishment on a
+            // GENUINELY NEW chain (legacy creation parity; see the block
+            // comment above). The helper re-verifies the persisted-status /
+            // base-tip / best-hash preconditions itself, so a real persisted
+            // checkpoint can never be overwritten and a non-empty chain can
+            // never be re-created over. Only REJECTED_PRECONDITION and
+            // ERROR fail startup; NOT_APPLICABLE (persisted checkpoint
+            // present) and RESIDUAL_ABSENT_ON_NONEMPTY (documented loud
+            // pass-through) proceed with the canonical value.
+            std::string estErr;
+            const Checkpoints::SyncCheckpointEstablishmentResult est =
+                Checkpoints::EstablishGenesisCheckpoint(
+                    ckptStatus,
+                    pindexGenesisBlock ? pindexGenesisBlock->GetBlockHash() : uint256(0),
+                    AuthoritativeBaseTipHeight(),
+                    hashBestChain,
+                    &estErr);
+            if (est == Checkpoints::SYNC_CHECKPOINT_ESTABLISHMENT_REJECTED_PRECONDITION ||
+                est == Checkpoints::SYNC_CHECKPOINT_ESTABLISHMENT_ERROR)
+                return InitError(strprintf("V2 startup: genesis checkpoint establishment failed: %s",
+                                           estErr.c_str()));
         }
     }
 

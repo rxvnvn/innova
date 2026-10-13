@@ -67,6 +67,38 @@ namespace Checkpoints
     // authority inconsistency and must fail closed at startup.
     SyncCheckpointLoadStatus LoadPersistedSyncCheckpoint(uint256& hashOut, std::string* error);
 
+    // ---------------------------------------------------------------------------
+    // V2-R3 (ROUND-2 P0): establishment result of the one-time chain-CREATION
+    // genesis synchronized checkpoint (LEGACY PARITY, NOT an unconditional
+    // fallback). Only CREATED performs a durable write.
+    // ---------------------------------------------------------------------------
+    enum SyncCheckpointEstablishmentResult
+    {
+        SYNC_CHECKPOINT_ESTABLISHMENT_CREATED = 0,           // fresh chain: genesis checkpoint persisted
+        SYNC_CHECKPOINT_ESTABLISHMENT_NOT_APPLICABLE,         // persisted checkpoint exists / out of scope
+        SYNC_CHECKPOINT_ESTABLISHMENT_RESIDUAL_ABSENT_ON_NONEMPTY, // loud-warning pass-through (documented)
+        SYNC_CHECKPOINT_ESTABLISHMENT_REJECTED_PRECONDITION,  // caller precondition violated (caller must fail)
+        SYNC_CHECKPOINT_ESTABLISHMENT_ERROR,                  // write failed (caller must fail startup)
+    };
+
+    // One-time genesis-checkpoint establishment for a GENUINELY NEW
+    // authoritative chain. Preconditions (independently re-verified here):
+    //   * `loadStatus` is the just-loaded persisted status and MUST be
+    //     SYNC_CHECKPOINT_ABSENT — a real persisted checkpoint is NEVER
+    //     overwritten (NOT_APPLICABLE otherwise);
+    //   * the immutable base tip is at height 0 (authoritative mode);
+    //   * the published active best IS the genesis anchor.
+    // A persisted checkpoint + non-empty chain is the documented RESIDUAL
+    // state -> RESIDUAL_ABSENT_ON_NONEMPTY (loud warning, canonical 0 kept,
+    // no genesis substitution, no re-creation). On CREATED the in-process
+    // Checkpoints::hashSyncCheckpoint is already published by WriteSyncCheckpoint.
+    SyncCheckpointEstablishmentResult EstablishGenesisCheckpoint(
+        const SyncCheckpointLoadStatus loadStatus,
+        const uint256& hashGenesis,
+        const int32_t baseTipHeight,
+        const uint256& currentBestHash,
+        std::string* error);
+
     bool CheckSync(const uint256& hashBlock, const CBlockIndex* pindexPrev);
     const CBlockIndex* AutoSelectSyncCheckpoint();
 

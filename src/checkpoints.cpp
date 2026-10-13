@@ -217,6 +217,93 @@ namespace Checkpoints
         return st;
     }
 
+    // ------------------------------------------------------------------
+    // V2-R3 (ROUND-2 P0): one-time chain-CREATION checkpoint establishment.
+    //
+    // LEGACY PARITY, NOT A FALLBACK. Legacy LoadBlockIndex established the
+    // synchronized checkpoint exactly ONCE, in its mapBlockIndex.empty()
+    // branch, right after the genesis was accepted:
+    //     WriteSyncCheckpoint(hashGenesis);   // main.cpp:10120-10121
+    // It was an explicit, DURABLE, persisted write gated on chain creation;
+    // every later boot LOADED the persisted value instead. The V2
+    // authoritative path performs the same creation work through the EMPTY_NEW
+    // native bootstrap but historically never performed the checkpoint half,
+    // so a fresh datadir booted with hashSyncCheckpoint == 0 forever (the
+    // fresh-boot freeze).
+    //
+    // EstablishGenesisCheckpoint reproduces the legacy CREATION event with
+    // strict, independently-verified preconditions. It can only WRITE when
+    // (a) the just-loaded persisted value is ABSENT (a real persisted
+    // checkpoint can never be overwritten), (b) the immutable base tip is the
+    // genesis anchor at height 0, and (c) the published active best is that
+    // SAME genesis anchor. Any other combination is a no-op: LOADED -> the
+    // persisted authority stands; a non-empty chain -> the RESIDUAL state is
+    // reported as RESIDUAL_ABSENT_ON_NONEMPTY and the caller boots with the
+    // canonical 0 under a LOUD warning (documented pass-through choice: see
+    // init.cpp block comment and the establishment commit message).
+    // ------------------------------------------------------------------
+    SyncCheckpointEstablishmentResult EstablishGenesisCheckpoint(
+        const SyncCheckpointLoadStatus loadStatus,
+        const uint256& hashGenesis,
+        const int32_t baseTipHeight,
+        const uint256& currentBestHash,
+        std::string* error)
+    {
+        if (error) error->clear();
+        if (hashGenesis == uint256(0))
+        {
+            if (error)
+                *error = "genesis checkpoint establishment: caller supplied a zero genesis hash";
+            return SYNC_CHECKPOINT_ESTABLISHMENT_REJECTED_PRECONDITION;
+        }
+        if (loadStatus != SYNC_CHECKPOINT_ABSENT)
+            // LOADED (or CORRUPT, which the caller fails on before calling):
+            // a persisted synchronized checkpoint exists; the creation event
+            // is structurally impossible and must not fire.
+            return SYNC_CHECKPOINT_ESTABLISHMENT_NOT_APPLICABLE;
+        if (baseTipHeight < 0)
+            // Not authoritative / base not bound: out of scope (defensive;
+            // the caller only invokes this on the V2 authoritative path).
+            return SYNC_CHECKPOINT_ESTABLISHMENT_NOT_APPLICABLE;
+
+        if (baseTipHeight > 0 || currentBestHash != hashGenesis)
+        {
+            // RESIDUAL STATE: a chain exists but no persisted checkpoint.
+            // Legacy created the persisted genesis checkpoint in the same
+            // step as chain creation, so this pairing is unreachable through
+            // either legacy or the round-2 creation path (it can only arise
+            // from an exotic out-of-band store loss). The DOCUMENTED choice
+            // is a loud-warning pass-through: hashSyncCheckpoint stays at the
+            // canonical 0 ("no synchronized checkpoint"), no genesis
+            // substitution, no re-creation. NEVER silently.
+            printf("ROUND2_P0 WARNING: chain at best height %d is non-empty but no persisted "
+                   "synchronized checkpoint exists; hashSyncCheckpoint stays 0 "
+                   "(canonical no synchronized checkpoint; NO genesis substitution, "
+                   "NO re-creation). This state must be repaired operationally -- "
+                   "it is not recoverable by this code path.\n",
+                   baseTipHeight);
+            fflush(stdout);
+            return SYNC_CHECKPOINT_ESTABLISHMENT_RESIDUAL_ABSENT_ON_NONEMPTY;
+        }
+
+        // GENUINELY NEW CHAIN: the immutable base tip is the genesis anchor
+        // (height 0) and the published active best is that same anchor. This
+        // is the exact legacy mapBlockIndex.empty() creation moment. Overlay
+        // the legacy creation semantics: an explicit, transactional, PERSISTED
+        // WriteSyncCheckpoint(hashGenesis) plus the in-process publication.
+        if (!WriteSyncCheckpoint(hashGenesis))
+        {
+            if (error)
+                *error = "genesis checkpoint establishment: failed to persist hashSyncCheckpoint";
+            return SYNC_CHECKPOINT_ESTABLISHMENT_ERROR;
+        }
+        printf("ROUND2_P0: fresh chain created; genesis synchronized checkpoint established "
+               "and persisted (legacy creation parity): %s\n",
+               hashGenesis.ToString().c_str());
+        fflush(stdout);
+        return SYNC_CHECKPOINT_ESTABLISHMENT_CREATED;
+    }
+
     namespace {
 
     // True when the hash is a KNOWN authoritative index record. Mirrors the
