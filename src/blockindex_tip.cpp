@@ -24,6 +24,11 @@
 #include <cstring>
 #include <map>
 
+// P3-R1: the Impl-level mutable-tail lock is declared in sync.h terms via
+// blockindex_tip.h; every mutation below takes it as the INNERMOST lock
+// (cs_main -> csTailLock). Reader entry points that may run WITHOUT cs_main
+// take it as cs_hashSyncCheckpoint -> csTailLock. No other order exists.
+
 namespace fs = boost::filesystem;
 
 namespace {
@@ -1004,6 +1009,44 @@ struct BlockIndexTipAuthority::Impl
     unsigned char chainA[32];
     bool chainsValid;
 
+    // P3-R1 CONCURRENCY GUARD (the audit's minimal fine-grained fix): a
+    // fine-grained mutex serialized over the MUTABLE TAIL's reader-visible
+    // state. It is taken (as the INNERMOST lock) by
+    //   * every public mutator that advances/cuts/rewrites the bounded
+    //     windows, the slot arithmetic or the wide invalid set
+    //     (AppendBatch / TruncateActiveTo / ReorgActiveTo /
+    //     ApplyOperatorInvalidAndReorg / SetOperatorInvalid), and
+    //   * by the by-value reader families that must observe a
+    //     race-free (never torn) view of that state:
+    //     GetTip / LookupByHash / LookupActiveByHeight (+ their
+    //     delegating wrappers) / IsOperatorInvalid / OperatorInvalidSet /
+    //     AllRecords / SelectBestEligibleBranch.
+    // It is deliberately NOT taken by:
+    //   * CommittedTipSnapshot(): the C11 atomic publication is
+    //     self-synchronizing and intentionally stays lock-free;
+    //   * IsOpen() / Close() (single-ownership lifecycle, unchanged);
+    //   * BaseGeneration()/BaseRecordCount(): immutable-after-Open values.
+    // LOCK ORDER (verified): the lock is INNERMOST everywhere.
+    //   writers:  cs_main -> csTailLock  (ProcessBlock -> AddToBlockIndex /
+    //             InvalidateBlock / ReconsiderBlock call sites)
+    //   readers without cs_main (authoritative checkpoint predicates):
+    //             cs_hashSyncCheckpoint -> csTailLock
+    //             (AskForPendingSyncCheckpoint from the version-message
+    //             handler; ValidateSyncCheckpointByValue from
+    //             AcceptPendingSyncCheckpoint / ProcessSyncCheckpoint)
+    //   CheckSync already holds BOTH cs_main and cs_hashSyncCheckpoint and
+    //   now also takes csTailLock -- the same innermost position.
+    // No path takes csTailLock and then an OUTER lock, so no lock cycle can
+    // form (also machine-checked by the runtime DEBUG_LOCKORDER detector
+    // during the suite runs below).
+    mutable CCriticalSection csTailLock;
+
+    // P3-R2: an EXTERNAL (tip-namespace) protected floor, registered by the
+    // live authority for the duration of one eviction pass so a torn
+    // CBlockIndex-free window can never race a (locked) checkpoint predicate
+    // read. Guarded by csTailLock; int32_t(-1) == none.
+    int32_t externalProtectedFloor = -1;
+
     Impl()
         : recordsWin(fs::path(), BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE,
                      BLOCK_INDEX_RECORD_SIZE_V1, BLOCK_INDEX_TIP_RING_CAP_ENTRIES,
@@ -1978,37 +2021,43 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     //    tip.meta. A failed commit rolls the windows AND the chains back so
     //    authority never runs ahead of the last committed tip.meta; the side
     //    index entries published above stay (they are reconciled at Open).
+    //    P3-R1: publish the window/meta advance under the impl-level
+    //    mutable-tail lock (innermost) so by-value readers coming in without
+    //    cs_main never see a torn half-committed advance.
     i->EnsureChains();
-    const BlockIndexTipMeta savedMeta = i->meta;
-    unsigned char savedR[32], savedD[32], savedA[32];
-    memcpy(savedR, i->chainR, 32); memcpy(savedD, i->chainD, 32); memcpy(savedA, i->chainA, 32);
-    const uint64_t savedRecordsCount = i->recordsWin.Count();
-    const uint64_t savedDerivedCount = i->derivedWin.Count();
-    const uint64_t savedActiveCount = i->activeWin.Count();
-    i->recordsWin.PushBack(&newRecords[0], newRecords.size());
-    i->derivedWin.PushBack(&newDerived[0], newDerived.size());
-    if (!newActive.empty())
-        i->activeWin.PushBack(&newActive[0], newActive.size());
     {
-        unsigned char b[68];
-        for (size_t k = 0; k < newRecords.size(); ++k)
-        { size_t n = EncodeRecordDigestBytes(newRecords[k], b); DigestChainExtend(i->chainR, b, n); }
-        for (size_t k = 0; k < newDerived.size(); ++k)
-        { size_t n = EncodeDerivedDigestBytes(newDerived[k], b); DigestChainExtend(i->chainD, b, n); }
-        for (size_t k = 0; k < newActive.size(); ++k)
-        { EncodeActiveDigestBytes(newActive[k], b); DigestChainExtend(i->chainA, b, 8); }
-        DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
-    }
-    i->meta = newMeta;
-    if (!i->WriteMeta(error))
-    {
-        // Roll the windows back to the committed counts (ring suffix shrink).
-        while (i->recordsWin.Count() > savedRecordsCount) i->recordsWin.Pop();
-        while (i->derivedWin.Count() > savedDerivedCount) i->derivedWin.Pop();
-        while (i->activeWin.Count() > savedActiveCount) i->activeWin.Pop();
-        i->meta = savedMeta;
-        memcpy(i->chainR, savedR, 32); memcpy(i->chainD, savedD, 32); memcpy(i->chainA, savedA, 32);
-        return BLOCK_INDEX_TIP_IO_ERROR;
+        LOCK(i->csTailLock);
+        const BlockIndexTipMeta savedMeta = i->meta;
+        unsigned char savedR[32], savedD[32], savedA[32];
+        memcpy(savedR, i->chainR, 32); memcpy(savedD, i->chainD, 32); memcpy(savedA, i->chainA, 32);
+        const uint64_t savedRecordsCount = i->recordsWin.Count();
+        const uint64_t savedDerivedCount = i->derivedWin.Count();
+        const uint64_t savedActiveCount = i->activeWin.Count();
+        i->recordsWin.PushBack(&newRecords[0], newRecords.size());
+        i->derivedWin.PushBack(&newDerived[0], newDerived.size());
+        if (!newActive.empty())
+            i->activeWin.PushBack(&newActive[0], newActive.size());
+        {
+            unsigned char b[68];
+            for (size_t k = 0; k < newRecords.size(); ++k)
+            { size_t n = EncodeRecordDigestBytes(newRecords[k], b); DigestChainExtend(i->chainR, b, n); }
+            for (size_t k = 0; k < newDerived.size(); ++k)
+            { size_t n = EncodeDerivedDigestBytes(newDerived[k], b); DigestChainExtend(i->chainD, b, n); }
+            for (size_t k = 0; k < newActive.size(); ++k)
+            { EncodeActiveDigestBytes(newActive[k], b); DigestChainExtend(i->chainA, b, 8); }
+            DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
+        }
+        i->meta = newMeta;
+        if (!i->WriteMeta(error))
+        {
+            // Roll the windows back to the committed counts (ring suffix shrink).
+            while (i->recordsWin.Count() > savedRecordsCount) i->recordsWin.Pop();
+            while (i->derivedWin.Count() > savedDerivedCount) i->derivedWin.Pop();
+            while (i->activeWin.Count() > savedActiveCount) i->activeWin.Pop();
+            i->meta = savedMeta;
+            memcpy(i->chainR, savedR, 32); memcpy(i->chainD, savedD, 32); memcpy(i->chainA, savedA, 32);
+            return BLOCK_INDEX_TIP_IO_ERROR;
+        }
     }
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
@@ -2053,6 +2102,9 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
 
     // Resolve the new tip hash by ONE positional read of the kept tip record
     // (slot = tipId - baseRecordCount - 1) -- no O(records) scan.
+    // P3-R1: the kept-ancestor probe reads activeWin/recordsWin against the
+    // still-committed meta while the windows are still quiescent; the meta
+    // advance below is then published under the impl-level mutable-tail lock.
     BlockIndexTipMeta newMeta = i->meta;
     newMeta.version = BLOCK_INDEX_TIP_META_VERSION_V3;
     newMeta.activeFence++;
@@ -2077,33 +2129,37 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
     }
     // Non-append mutation: rebuild the v3 chains STREAMING (records/derived
     // unchanged; active chain shortened). O(N), O(1) RAM.
-    std::string serrA, serrB, serrC;
-    if (!i->recordsWin.SetCount(i->meta.tipRecordCount, &serrA) ||
-        !i->derivedWin.SetCount(i->meta.tipRecordCount, &serrB) ||
-        !i->activeWin.SetCount(keepActive, &serrC))
-        return SetError(error, "truncate window reset failed: " + serrA + serrB + serrC),
-               BLOCK_INDEX_TIP_IO_ERROR;
-    {
-        if (!i->BuildChainsForStreaming())
-            return SetError(error, "truncate digest rebuild failed: " +
-                                   i->lastStreamError),
-                   BLOCK_INDEX_TIP_IO_ERROR;
-    }
-    DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
-
+    // P3-R1: the window SetCount()s + the streaming rebuild + the meta publish
+    // are one atomic transition of the reader-visible mutable tail: hold the
+    // impl-level lock across them.
     const BlockIndexTipMeta savedMeta = i->meta;
     const uint64_t savedActiveCount = i->activeWin.Count();
-    const BlockIndexTipMeta saved = i->meta;
-    (void)saved;
-    i->meta = newMeta;
-    if (!i->WriteMeta(error))
+    std::string serrA, serrB, serrC;
     {
-        i->meta = savedMeta;
-        // roll the active window back to the committed count
-        std::string werrR;
-        i->activeWin.SetCount(savedActiveCount, &werrR); // full resync (Pop is only for single-entry rollback after PushBack)
-        i->chainsValid = false;
-        return BLOCK_INDEX_TIP_IO_ERROR;
+        LOCK(i->csTailLock);
+        if (!i->recordsWin.SetCount(i->meta.tipRecordCount, &serrA) ||
+            !i->derivedWin.SetCount(i->meta.tipRecordCount, &serrB) ||
+            !i->activeWin.SetCount(keepActive, &serrC))
+            return SetError(error, "truncate window reset failed: " + serrA + serrB + serrC),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+        {
+            if (!i->BuildChainsForStreaming())
+                return SetError(error, "truncate digest rebuild failed: " +
+                                       i->lastStreamError),
+                       BLOCK_INDEX_TIP_IO_ERROR;
+        }
+        DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
+
+        i->meta = newMeta;
+        if (!i->WriteMeta(error))
+        {
+            i->meta = savedMeta;
+            // roll the active window back to the committed count
+            std::string werrR;
+            i->activeWin.SetCount(savedActiveCount, &werrR); // full resync (Pop is only for single-entry rollback after PushBack)
+            i->chainsValid = false;
+            return BLOCK_INDEX_TIP_IO_ERROR;
+        }
     }
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
@@ -2280,35 +2336,41 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     }
     // SetCount()s re-point the windows at the freshly swapped files; they are
     // lazy (ring dropped), keeping the RAM bounded through the whole reorg.
+    // P3-R1: the window re-point + the streaming rebuild + the meta publish are
+    // one atomic transition of the reader-visible mutable tail: hold the
+    // impl-level lock across them (innermost).
     std::string werrWA, werrWB, werrWC;
-    if (!i->recordsWin.SetCount(newMeta.tipRecordCount, &werrWA) ||
-        !i->derivedWin.SetCount(newMeta.tipRecordCount, &werrWB) ||
-        !i->activeWin.SetCount((uint64_t)newActive.size(), &werrWC))
-        return SetError(error, "reorg window reset failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!i->BuildChainsForStreaming())
-        return SetError(error, "reorg digest rebuild failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
-    // Commit point: adopt the new meta BEFORE writing it, exactly as
-    // AppendBatch/TruncateActiveTo do (see the original note: publishing the
-    // new stores against the OLD meta would silently lose the cutover).
-    // Test-only: all tail stores durable, crash before the tip.meta commit.
-    if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
-        return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
-
-    const BlockIndexTipMeta savedMeta = i->meta;
-    i->meta = newMeta;
-    if (!i->WriteMeta(error))
     {
-        i->meta = savedMeta;
-        // roll windows back to the PRE-reorg committed state (lazy re-point)
-        std::string werrRA, werrRB, werrRC;
-        i->recordsWin.SetCount(savedMeta.tipRecordCount, &werrRA);
-        i->derivedWin.SetCount(savedMeta.tipRecordCount, &werrRB);
-        const uint64_t savedActiveCount = (uint64_t)(savedMeta.tipHeight > baseTip)
-            ? (uint64_t)(savedMeta.tipHeight - baseTip) : 0;
-        i->activeWin.SetCount(savedActiveCount, &werrRC);
-        i->chainsValid = false;
-        return BLOCK_INDEX_TIP_IO_ERROR;
+        LOCK(i->csTailLock);
+        if (!i->recordsWin.SetCount(newMeta.tipRecordCount, &werrWA) ||
+            !i->derivedWin.SetCount(newMeta.tipRecordCount, &werrWB) ||
+            !i->activeWin.SetCount((uint64_t)newActive.size(), &werrWC))
+            return SetError(error, "reorg window reset failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        if (!i->BuildChainsForStreaming())
+            return SetError(error, "reorg digest rebuild failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
+        // Commit point: adopt the new meta BEFORE writing it, exactly as
+        // AppendBatch/TruncateActiveTo do (see the original note: publishing the
+        // new stores against the OLD meta would silently lose the cutover).
+        // Test-only: all tail stores durable, crash before the tip.meta commit.
+        if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
+            return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
+
+        const BlockIndexTipMeta savedMeta = i->meta;
+        i->meta = newMeta;
+        if (!i->WriteMeta(error))
+        {
+            i->meta = savedMeta;
+            // roll windows back to the PRE-reorg committed state (lazy re-point)
+            std::string werrRA, werrRB, werrRC;
+            i->recordsWin.SetCount(savedMeta.tipRecordCount, &werrRA);
+            i->derivedWin.SetCount(savedMeta.tipRecordCount, &werrRB);
+            const uint64_t savedActiveCount = (uint64_t)(savedMeta.tipHeight > baseTip)
+                ? (uint64_t)(savedMeta.tipHeight - baseTip) : 0;
+            i->activeWin.SetCount(savedActiveCount, &werrRC);
+            i->chainsValid = false;
+            return BLOCK_INDEX_TIP_IO_ERROR;
+        }
     }
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
@@ -2476,36 +2538,42 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
     }
     // Non-append mutation: rebuild the v3 chains STREAMING (O(N), O(1) RAM)
     // over the freshly-swapped store files.
+    // P3-R1: the window re-point + streaming rebuild + invalid-set swap + meta
+    // publish are one atomic transition of the reader-visible mutable tail:
+    // hold the impl-level lock across them (innermost).
     std::string werrWA, werrWB, werrWC;
-    if (!i->recordsWin.SetCount(newMeta.tipRecordCount, &werrWA) ||
-        !i->derivedWin.SetCount(newMeta.tipRecordCount, &werrWB) ||
-        !i->activeWin.SetCount((uint64_t)allActive.size(), &werrWC))
-        return SetError(error, "fused window reset failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    if (!i->BuildChainsForStreaming())
-        return SetError(error, "fused digest rebuild failed"), BLOCK_INDEX_TIP_IO_ERROR;
-    DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
-    newMeta.invalidLogCount = (uint32_t)allEntries.size();
-    ComputeInvalidDigest(allEntries, newMeta.invalidDigest);
-
-    if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
-        return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
-
-    i->meta = newMeta;
-    i->invalidEntries = allEntries;
-    DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
-    if (!i->WriteMeta(error))
     {
-        i->meta = savedMeta;
-        i->invalidEntries = savedEntries;
+        LOCK(i->csTailLock);
+        if (!i->recordsWin.SetCount(newMeta.tipRecordCount, &werrWA) ||
+            !i->derivedWin.SetCount(newMeta.tipRecordCount, &werrWB) ||
+            !i->activeWin.SetCount((uint64_t)allActive.size(), &werrWC))
+            return SetError(error, "fused window reset failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        if (!i->BuildChainsForStreaming())
+            return SetError(error, "fused digest rebuild failed"), BLOCK_INDEX_TIP_IO_ERROR;
+        DigestV3Finalize(i->chainR, i->chainD, i->chainA, newMeta.activeFence, newMeta.contentDigest);
+        newMeta.invalidLogCount = (uint32_t)allEntries.size();
+        ComputeInvalidDigest(allEntries, newMeta.invalidDigest);
+
+        if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
+            return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
+
+        i->meta = newMeta;
+        i->invalidEntries = allEntries;
         DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
-        std::string werrRA, werrRB, werrRC;
-        i->recordsWin.SetCount(savedMeta.tipRecordCount, &werrRA);
-        i->derivedWin.SetCount(savedMeta.tipRecordCount, &werrRB);
-        const uint64_t savedActiveCount = (uint64_t)(savedMeta.tipHeight > baseTip)
-            ? (uint64_t)(savedMeta.tipHeight - baseTip) : 0;
-        i->activeWin.SetCount(savedActiveCount, &werrRC);
-        i->chainsValid = false;
-        return BLOCK_INDEX_TIP_IO_ERROR;
+        if (!i->WriteMeta(error))
+        {
+            i->meta = savedMeta;
+            i->invalidEntries = savedEntries;
+            DeriveInvalidSet(i->invalidEntries, &i->invalidSet);
+            std::string werrRA, werrRB, werrRC;
+            i->recordsWin.SetCount(savedMeta.tipRecordCount, &werrRA);
+            i->derivedWin.SetCount(savedMeta.tipRecordCount, &werrRB);
+            const uint64_t savedActiveCount = (uint64_t)(savedMeta.tipHeight > baseTip)
+                ? (uint64_t)(savedMeta.tipHeight - baseTip) : 0;
+            i->activeWin.SetCount(savedActiveCount, &werrRC);
+            i->chainsValid = false;
+            return BLOCK_INDEX_TIP_IO_ERROR;
+        }
     }
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
@@ -2520,6 +2588,9 @@ BlockIndexTipRead BlockIndexTipAuthority::GetTip() const
         return r;
     }
     Impl* i = impl;
+    // P3-R1: race-free mutable-tail read for callers that hold NO cs_main
+    // (authoritative checkpoint resolver). Innermost lock; see class comment.
+    LOCK(i->csTailLock);
     if (i->activeWin.Count() == 0)
     {
         r.status = BLOCK_INDEX_TIP_NOT_FOUND;
@@ -2581,12 +2652,18 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
         r.status = BLOCK_INDEX_TIP_IO_ERROR;
         return r;
     }
+    // P3-R1: the side index answers under its own LevelDB handle, but the
+    // slot range checks below read the ConcurrencyGuarded committed counts +
+    // windows -- hold the innermost impl-level lock across the whole read for
+    // callers that hold NO cs_main (authoritative checkpoint resolver).
+    Impl* i = impl;
+    LOCK(i->csTailLock);
     // Repair #3: the durable side index answers the hash -> RecordId mapping
     // (O(log N) LevelDB lookup; never an O(N) RAM map or scan). Slot
     // arithmetic (id == baseRecordCount + slot + 1) is unchanged.
     BlockIndexId id = 0;
     const BlockIndexHashLookupStatus lstat =
-        impl->sideIndex.Lookup(hash, &id, NULL);
+        i->sideIndex.Lookup(hash, &id, NULL);
     if (lstat == BLOCK_INDEX_HASH_LOOKUP_NOT_FOUND)
     {
         r.status = BLOCK_INDEX_TIP_NOT_FOUND;
@@ -2597,14 +2674,14 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
         r.status = BLOCK_INDEX_TIP_IO_ERROR;
         return r;
     }
-    const uint64_t base = impl->meta.baseRecordCount;
+    const uint64_t base = i->meta.baseRecordCount;
     if (id <= base)
     {
         r.status = BLOCK_INDEX_TIP_CORRUPT;
         return r;
     }
     const uint64_t slot = id - base - 1;
-    if (slot >= impl->recordsWin.Count() || slot >= impl->derivedWin.Count())
+    if (slot >= i->recordsWin.Count() || slot >= i->derivedWin.Count())
     {
         // Repair #3: an index entry past the COMMITTED record count is an
         // uncommitted residue (crash between the index Put and the tip.meta
@@ -2616,8 +2693,8 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
     BlockIndexRecord rr;
     BlockIndexDerivedEntry dd;
     std::string gerr;
-    if (!impl->recordsWin.Get(slot, &rr, &gerr) ||
-        !impl->derivedWin.Get(slot, &dd, &gerr))
+    if (!i->recordsWin.Get(slot, &rr, &gerr) ||
+        !i->derivedWin.Get(slot, &dd, &gerr))
     {
         r.status = BLOCK_INDEX_TIP_IO_ERROR;
         return r;
@@ -2642,13 +2719,13 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
     // record is active iff it occupies its own height's slot.
     r.active = false;
     const int32_t h = rr.height;
-    if (h > impl->meta.baseTipHeight)
+    if (h > i->meta.baseTipHeight)
     {
-        const uint64_t rel = (uint64_t)(h - impl->meta.baseTipHeight - 1);
-        if (rel < impl->activeWin.Count())
+        const uint64_t rel = (uint64_t)(h - i->meta.baseTipHeight - 1);
+        if (rel < i->activeWin.Count())
         {
             BlockIndexId aId = 0;
-            if (!impl->activeWin.Get(rel, &aId, &gerr))
+            if (!i->activeWin.Get(rel, &aId, &gerr))
                 r.status = BLOCK_INDEX_TIP_IO_ERROR;
             else if (aId == id)
                 r.active = true;
@@ -2665,11 +2742,15 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupActiveByHeight(int32_t height, s
         r.status = BLOCK_INDEX_TIP_IO_ERROR;
         return r;
     }
+    // P3-R1: race-free mutable-tail read for callers that hold NO cs_main
+    // (authoritative checkpoint height anchors). Innermost lock.
+    Impl* i = impl;
+    LOCK(i->csTailLock);
     // height is a GLOBAL active height. activeIds[rel] == global height
     // baseTipHeight + rel + 1. So rel = height - baseTipHeight - 1.
-    const int32_t baseTip = impl->meta.baseTipHeight;
+    const int32_t baseTip = i->meta.baseTipHeight;
     const int64_t rel = (int64_t)height - (int64_t)baseTip - 1;
-    if (rel < 0 || rel >= (int64_t)impl->activeWin.Count())
+    if (rel < 0 || rel >= (int64_t)i->activeWin.Count())
     {
         r.status = BLOCK_INDEX_TIP_NOT_FOUND;
         return r;
@@ -2679,21 +2760,21 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupActiveByHeight(int32_t height, s
     // window / one positional pread (OS page cache keeps the hot suffix cheap).
     BlockIndexId id = 0;
     std::string gerr;
-    if (!impl->activeWin.Get((uint64_t)rel, &id, &gerr))
+    if (!i->activeWin.Get((uint64_t)rel, &id, &gerr))
     {
         r.status = BLOCK_INDEX_TIP_IO_ERROR;
         return r;
     }
-    const int64_t slot = (int64_t)id - (int64_t)impl->meta.baseRecordCount - 1;
-    if (slot < 0 || slot >= (int64_t)impl->recordsWin.Count())
+    const int64_t slot = (int64_t)id - (int64_t)i->meta.baseRecordCount - 1;
+    if (slot < 0 || slot >= (int64_t)i->recordsWin.Count())
     {
         r.status = BLOCK_INDEX_TIP_CORRUPT;
         return r;
     }
     BlockIndexRecord rr;
     BlockIndexDerivedEntry dd;
-    if (!impl->recordsWin.Get((uint64_t)slot, &rr, &gerr) ||
-        !impl->derivedWin.Get((uint64_t)slot, &dd, &gerr))
+    if (!i->recordsWin.Get((uint64_t)slot, &rr, &gerr) ||
+        !i->derivedWin.Get((uint64_t)slot, &dd, &gerr))
     {
         r.status = BLOCK_INDEX_TIP_IO_ERROR;
         return r;
@@ -2719,22 +2800,25 @@ BlockIndexTipStatus BlockIndexTipAuthority::AllRecords(std::vector<BlockIndexTip
     // RAM beyond the caller's own `out` vector). Active membership is
     // computed by slot arithmetic per record height (the active entry at
     // rel = height - baseTipHeight - 1 must equal this record's id).
+    // P3-R1: race-free mutable-tail read (innermost lock, see class comment).
+    Impl* i = impl;
+    LOCK(i->csTailLock);
     uint64_t activeRel = 0; // ascending walk over the active store
-    const uint64_t activeCount = impl->activeWin.Count();
+    const uint64_t activeCount = i->activeWin.Count();
     std::string gerr;
     BlockIndexId curActiveId = 0;
-    if (activeCount > 0 && !impl->activeWin.Get(0, &curActiveId, &gerr))
+    if (activeCount > 0 && !i->activeWin.Get(0, &curActiveId, &gerr))
     {
         if (error) *error = gerr;
         return BLOCK_INDEX_TIP_IO_ERROR;
     }
     BlockIndexTipStatus overall = BLOCK_INDEX_TIP_OK;
-    if (impl->recordsWin.StreamVisit(0, impl->recordsWin.Count(),
+    if (i->recordsWin.StreamVisit(0, i->recordsWin.Count(),
         [&](uint64_t slot, const BlockIndexRecord& rec) {
             BlockIndexTipRead r;
             r.status = BLOCK_INDEX_TIP_OK;
             BlockIndexDerivedEntry dd;
-            if (!impl->derivedWin.Get(slot, &dd, &gerr))
+            if (!i->derivedWin.Get(slot, &dd, &gerr))
             {
                 overall = BLOCK_INDEX_TIP_IO_ERROR;
                 return false; // abort the stream
@@ -2802,13 +2886,17 @@ BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
     // side index (which maps to RECORD IDs; slot = id - baseRecordCount - 1);
     // record/derived entries are read by value through the bounded windows.
     // RAM: O(branch chain) temporary, never a full-history materialization.
+    // P3-R1: race-free mutable-tail read for the whole selection + branch
+    // reconstruction (innermost lock, see class comment).
+    Impl* i = impl;
+    LOCK(i->csTailLock);
 
     bool found = false;
     uint64_t bestJ = 0;
     std::string gerr;
     // Single sequential pass over the records store (O(N) reads are expected
     // here: selection walks the whole retained mutable tail by contract).
-    if (impl->recordsWin.StreamVisit(0, impl->recordsWin.Count(),
+    if (i->recordsWin.StreamVisit(0, i->recordsWin.Count(),
         [&](uint64_t slot, const BlockIndexRecord& rec) {
             if (rec.height <= forkHeight)
                 return true;                                    // at/below the fork
@@ -2817,7 +2905,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
             // invalid; reconsider => eligible).
             bool selfInvalid = (rec.hash == pendingHash)
                                    ? pendingInvalidate
-                                   : (impl->invalidSet.count(rec.hash) != 0);
+                                   : (i->invalidSet.count(rec.hash) != 0);
             if (selfInvalid)
                 return true;
             // Authenticate ancestry up to the fork: every intermediate must be
@@ -2829,20 +2917,20 @@ BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
             {
                 bool ancInvalid = (cur == pendingHash)
                                       ? pendingInvalidate
-                                      : (impl->invalidSet.count(cur) != 0);
+                                      : (i->invalidSet.count(cur) != 0);
                 if (ancInvalid) { ok = false; break; }
                 // resolve the ancestor via the side index
                 BlockIndexId ancId = 0;
-                if (impl->sideIndex.Lookup(cur, &ancId, NULL) !=
+                if (i->sideIndex.Lookup(cur, &ancId, NULL) !=
                         BLOCK_INDEX_HASH_LOOKUP_FOUND)
                 { ok = false; break; }  // leaves the tip window
-                if (ancId <= impl->meta.baseRecordCount)
+                if (ancId <= i->meta.baseRecordCount)
                 { ok = false; break; }
-                const uint64_t ancSlot = ancId - impl->meta.baseRecordCount - 1;
-                if (ancSlot >= impl->recordsWin.Count())
+                const uint64_t ancSlot = ancId - i->meta.baseRecordCount - 1;
+                if (ancSlot >= i->recordsWin.Count())
                 { ok = false; break; }
                 BlockIndexRecord p;
-                if (!impl->recordsWin.Get(ancSlot, &p, &gerr))
+                if (!i->recordsWin.Get(ancSlot, &p, &gerr))
                 { ok = false; break; }
                 if (p.height + 1 != h) { ok = false; break; } // inconsistent linkage
                 cur = p.hashPrev;
@@ -2858,12 +2946,12 @@ BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
             }
             // tie-break compare by (derived.chainTrust, hash) -- by-value reads
             BlockIndexDerivedEntry curD, bestD;
-            if (!impl->derivedWin.Get(slot, &curD, &gerr))
+            if (!i->derivedWin.Get(slot, &curD, &gerr))
             { gerr = "derived read failed during selection"; return false; }
-            if (!impl->derivedWin.Get(bestJ, &bestD, &gerr))
+            if (!i->derivedWin.Get(bestJ, &bestD, &gerr))
             { gerr = "derived read failed during selection"; return false; }
             BlockIndexRecord bestR;
-            if (!impl->recordsWin.Get(bestJ, &bestR, &gerr))
+            if (!i->recordsWin.Get(bestJ, &bestR, &gerr))
             { gerr = "record read failed during selection"; return false; }
             if (curD.chainTrust > bestD.chainTrust ||
                 (curD.chainTrust == bestD.chainTrust && rec.hash < bestR.hash))
@@ -2883,7 +2971,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
     {
         uint64_t j = bestJ;
         BlockIndexRecord curRec;
-        if (!impl->recordsWin.Get(j, &curRec, &gerr))
+        if (!i->recordsWin.Get(j, &curRec, &gerr))
         {
             if (error) *error = gerr;
             return BLOCK_INDEX_TIP_IO_ERROR;
@@ -2893,20 +2981,20 @@ BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
         {
             // fork-adjacent node stops the walk; its parent is the fork
             BlockIndexId ancId = 0;
-            if (impl->sideIndex.Lookup(curRec.hashPrev, &ancId, NULL) !=
+            if (i->sideIndex.Lookup(curRec.hashPrev, &ancId, NULL) !=
                     BLOCK_INDEX_HASH_LOOKUP_FOUND ||
-                ancId <= impl->meta.baseRecordCount)
+                ancId <= i->meta.baseRecordCount)
             {
                 if (error) *error = "branch walk lost parent below tip window";
                 return BLOCK_INDEX_TIP_CORRUPT;
             }
-            const uint64_t ancSlot = ancId - impl->meta.baseRecordCount - 1;
-            if (ancSlot >= impl->recordsWin.Count())
+            const uint64_t ancSlot = ancId - i->meta.baseRecordCount - 1;
+            if (ancSlot >= i->recordsWin.Count())
             {
                 if (error) *error = "branch walk lost parent below tip window";
                 return BLOCK_INDEX_TIP_CORRUPT;
             }
-            if (!impl->recordsWin.Get(ancSlot, &curRec, &gerr))
+            if (!i->recordsWin.Get(ancSlot, &curRec, &gerr))
             {
                 if (error) *error = gerr;
                 return BLOCK_INDEX_TIP_IO_ERROR;
@@ -2920,8 +3008,8 @@ BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
         BlockIndexTipAppend ap;
         BlockIndexRecord rr;
         BlockIndexDerivedEntry dd;
-        if (!impl->recordsWin.Get(idx, &rr, &gerr) ||
-            !impl->derivedWin.Get(idx, &dd, &gerr))
+        if (!i->recordsWin.Get(idx, &rr, &gerr) ||
+            !i->derivedWin.Get(idx, &dd, &gerr))
         {
             if (error) *error = gerr;
             return BLOCK_INDEX_TIP_IO_ERROR;
@@ -2934,7 +3022,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::SelectBestEligibleBranch(
     if (outBestHash || outBestHeight)
     {
         BlockIndexRecord bestR;
-        if (!impl->recordsWin.Get(bestJ, &bestR, &gerr))
+        if (!i->recordsWin.Get(bestJ, &bestR, &gerr))
         {
             if (error) *error = gerr;
             return BLOCK_INDEX_TIP_IO_ERROR;
@@ -2967,16 +3055,52 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupNextActive(const uint256& curHas
 
 uint64_t BlockIndexTipAuthority::BaseGeneration() const { return impl->meta.baseGeneration; }
 uint64_t BlockIndexTipAuthority::BaseRecordCount() const { return impl->meta.baseRecordCount; }
-int32_t BlockIndexTipAuthority::TipHeight() const { return impl->meta.tipHeight; }
-uint256 BlockIndexTipAuthority::TipHash() const { return impl->meta.tipHash; }
-uint64_t BlockIndexTipAuthority::TipRecordCount() const { return impl->meta.tipRecordCount; }
-uint8_t BlockIndexTipAuthority::ActiveFence() const { return impl->meta.activeFence; }
+// P3-R1 protected identity readers. These mirror the CommittedTipSnapshot
+// values, but read them from the mutable meta under the impl-level
+// csTailLock, so an unlocked caller (the checkpoint hot resolver reached
+// only under cs_hashSyncCheckpoint) observes a race-free, self-consistent
+// (height, hash, count, fence) tuple against a concurrent
+// cs_main-serialized writer. IsOpen() stays unlocked: a closed authority
+// is detected by the single-owner lifecycle, never raced.
 bool BlockIndexTipAuthority::IsOpen() const { return impl->open; }
-bool BlockIndexTipAuthority::IsEmpty() const
+
+// P3-R1: exposes the impl-level mutable-tail mutex to cross-file users
+// (blockindex_authoritative_live.cpp) for lock-diagnostic reference.
+CCriticalSection& BlockIndexTipAuthority::GetTipTailLockForDiagnostics()
 {
-    // committed records count == 0 <=> no tip records (meta is the authority).
-    return impl->open && impl->meta.tipRecordCount == 0;
+    return impl->csTailLock;
 }
+
+// ---- P3-R2 CHECKPOINT FLOOR (registration into the mutable tip) -------------
+void BlockIndexTipAuthority::RegisterExternalProtectedFloorForResolve(int32_t floor)
+{
+    if (!impl)
+        return;
+    LOCK(impl->csTailLock);
+    impl->externalProtectedFloor = floor;
+}
+
+void BlockIndexTipAuthority::UnregisterExternalProtectedFloorForResolve()
+{
+    if (!impl)
+        return;
+    LOCK(impl->csTailLock);
+    impl->externalProtectedFloor = -1;
+}
+
+int32_t BlockIndexTipAuthority::GetExternalProtectedFloorForResolve(const BlockIndexTipAuthority& t)
+{
+    if (!t.impl)
+        return -1;
+    LOCK(t.impl->csTailLock);
+    return t.impl->externalProtectedFloor;
+}
+// -----------------------------------------------------------------------------
+bool BlockIndexTipAuthority::IsEmpty() const { LOCK(impl->csTailLock); return impl->open && impl->meta.tipRecordCount == 0; }
+int32_t BlockIndexTipAuthority::TipHeight() const { LOCK(impl->csTailLock); return impl->meta.tipHeight; }
+uint256 BlockIndexTipAuthority::TipHash() const { LOCK(impl->csTailLock); return impl->meta.tipHash; }
+uint64_t BlockIndexTipAuthority::TipRecordCount() const { LOCK(impl->csTailLock); return impl->meta.tipRecordCount; }
+uint8_t BlockIndexTipAuthority::ActiveFence() const { LOCK(impl->csTailLock); return impl->meta.activeFence; }
 
 // ---- v2 durable operator-invalid authority ----
 uint32_t BlockIndexTipAuthority::InvalidLogCount() const
@@ -2986,11 +3110,17 @@ uint32_t BlockIndexTipAuthority::InvalidLogCount() const
 
 bool BlockIndexTipAuthority::IsOperatorInvalid(const uint256& hash) const
 {
+    // P3-R1: the derived invalid set is mutable-tail state; read it under the
+    // innermost impl-level lock so an unlocked consumer sees a consistent set
+    // against a concurrent fused publish (see class comment for the lock order).
+    LOCK(impl->csTailLock);
     return impl->invalidSet.count(hash) != 0;
 }
 
 std::set<uint256> BlockIndexTipAuthority::OperatorInvalidSet() const
 {
+    // P3-R1: return a coherent copy of the (mutable) set.
+    LOCK(impl->csTailLock);
     return impl->invalidSet;
 }
 
@@ -3045,6 +3175,9 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
     if (BlockIndexTipFailpointHit("FP_AFTER_TAIL_DURABLE_BEFORE_META"))
         return SetError(error, "failpoint FP_AFTER_TAIL_DURABLE_BEFORE_META"), BLOCK_INDEX_TIP_IO_ERROR;
 
+    // P3-R1: the wide invalid set swap is part of the reader-visible mutable
+    // tail -- publish it (and roll it back) under the impl-level lock.
+    LOCK(i->csTailLock);
     i->meta = newMeta;
     i->invalidEntries = allEntries;
     DeriveInvalidSet(i->invalidEntries, &i->invalidSet);

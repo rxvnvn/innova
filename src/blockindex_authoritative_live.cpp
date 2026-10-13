@@ -138,6 +138,14 @@ static int32_t FullResidentKeepWindow(const BlockIndexAuthoritativeLive::Impl* s
     return (KEEP < 2048) ? 2048 : KEEP;
 }
 
+// P3-R2 (checkpoint floor): reorg-branch margin kept free alongside the KEEP
+// window. Mirrors FullResidentKeepWindow's WALK (nMedianTimeSpan + 2 = 13)
+// margin: the authoritative checkpoint predicates verify ancestry across a
+// bounded competing-branch window above the sync checkpoint, so every ACTIVE
+// committed member at or above (committed active tip - this margin) stays
+// free while the floor is registered. Never a consensus or reorg bound.
+static const int32_t P3_BRANCH_FLOOR_MARGIN = CBlockIndex::nMedianTimeSpan + 2;
+
 
 // REPAIR #4: compact topological-hold predicate, shared by the eviction scan
 // and the edge release. TRUE when `o` and `victim` are the same identity, or
@@ -260,6 +268,28 @@ static void RR4EvictBelowFloorInto(BlockIndexAuthoritativeLive::Impl* self)
             continue; // permanent global identity holders
         if (heldSet.count(victim))
             continue; // identity-held by the bounded mapBlockIndex topology
+        // P3-R2 CHECKPOINT FLOOR: an ACTIVE tip-namespace object at or above
+        // the mutable tip's COMMITTED active-chain floor blocks eviction.
+        // The V2 authoritative checkpoint predicates (AskForPendingSyncCheckpoint
+        // / ValidateSyncCheckpointByValue, reached under cs_hashSyncCheckpoint
+        // ONLY) resolve ancestry through the tip windows under the tip
+        // authority's impl-level lock; a torn (never freed-while-read) window
+        // would corrupt their by-value ancestry walk. The FREE/dangle-window
+        // contract is implemented the audit-recommended way: the checkpoint
+        // ACTIVE floor is registered into the MUTABLE TIP under its own lock
+        // (no epistemic split), and the tip authority Unregisters it
+        // EXPLICITLY at the end of the PublishAuthoritativeBestTip call body
+        // (single-threaded under cs_main). No other authority is extended.
+        if (self->tip)
+        {
+            const int32_t ckptFloor =
+                BlockIndexTipAuthority::GetExternalProtectedFloorForResolve(
+                    *const_cast<const BlockIndexTipAuthority*>(self->tip.get()));
+            if (ckptFloor > 0 && victim->nHeight >= ckptFloor &&
+                self->tip->LookupActiveByHeight(victim->nHeight, NULL).status ==
+                    BLOCK_INDEX_TIP_OK)
+                continue;
+        }
         evictIDs.push_back(h);
     }
     if (evictIDs.empty())
@@ -765,7 +795,19 @@ CBlockIndex* BlockIndexAuthoritativeLive::PublishAuthoritativeBestTip(
         CBlockIndex* top = impl_->tipWindow_.GetResidentRaw(parentHash);
         if (top && top->nHeight > impl_->tipWindowLiveTipHeight_)
             impl_->tipWindowLiveTipHeight_ = top->nHeight;
+        // P3-R2: the eviction pass must not free a CBlockIndex the checkpoint
+        // predicates may resolve by value. The ACTIVE committed floor is
+        // registered INTO the mutable tip under its own lock for exactly this
+        // pass, and unregistered after it: the reader that walks tip-window
+        // windows under the same impl-level lock can never see a dangled
+        // window (register/read-check/evict/Unregister all serialize on the
+        // tip impl lock; the epistemic split the audit rejected is closed).
+        impl_->tip->RegisterExternalProtectedFloorForResolve(
+            impl_->tip->LookupActiveByHeight(
+                std::max(0, impl_->tip->TipHeight() - P3_BRANCH_FLOOR_MARGIN), NULL).status == BLOCK_INDEX_TIP_OK
+                ? std::max(0, impl_->tip->TipHeight() - P3_BRANCH_FLOOR_MARGIN) : 0);
         RR4EvictBelowFloorInto(impl_);
+        impl_->tip->UnregisterExternalProtectedFloorForResolve();
     }
     return impl_->tipWindow_.GetResidentRaw(parentHash);
 }
