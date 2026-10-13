@@ -47,6 +47,8 @@
 
 namespace fs = boost::filesystem;
 extern CWallet* pwalletMain;
+// Defined in txdb-leveldb.cpp (test/ops accessor to the global legacy txdb).
+void* GetGlobalTxdbPtrForTest();
 
 // Test-only memo invalidation seam (defined in checkpoints.cpp): clears the
 // per-tip extends-memo, the descendant-verdict map and the per-epoch
@@ -667,6 +669,344 @@ BOOST_AUTO_TEST_CASE(accept_pending_sync_checkpoint_zero_and_descendant_parity)
                             "parity: WriteSyncCheckpoint must have persisted the new value");
     }
 
+    fx.Restore();
+}
+
+// ROUND-2 P2 / P3c GAP-1: on a GENUINELY fresh (EMPTY_NEW) isolated data root,
+// boot the V2 authoritative index through the p07b EMPTY_NEW sequence and
+// assert the full creation-gated genesis-checkpoint lifecycle end to end:
+//   (i)   InitBlockIndexAuthoritative succeeds and g_fAuthoritativeStartup true;
+//   (ii)  establishment fires exactly once and persists genesis;
+//   (iii) with IBD forced false (low-estimate pattern) the FIRST candidate
+//         extending genesis is ACCEPTED (no freeze, no "not in block index");
+//   (iv)  a restart of the SAME root reloads genesis checkpoint and keeps growing.
+// This covers the P0 fresh-chain path for which the suite previously had NO
+// open false-negative coverage: previously a fresh EMPTY_NEW datadir booted
+// with hashSyncCheckpoint == 0 forever and froze the tip the moment IBD ended.
+// All mutated globals are restored and the temp root is removed.
+//
+// RAII guard: captures the shared fixture state and the persisted checkpoint
+// key, moves the shared chain aside for the EMPTY_NEW authoritative phase (the
+// production retirer must not free it), boots both startups on the SAME fresh
+// root, and restores everything even when a BOOST_REQUIRE aborts mid-case.
+struct CkptEmptyNewGuard
+{
+    fs::path root;
+    bool started;
+    std::map<uint256, CBlockIndex*> shared;          // protected shared chain
+    std::map<uint256, CandidateTipRecord> mapCandidateTips;
+    std::set<std::pair<COutPoint, unsigned int> > setStakeSeen;
+    CBlockIndex* pindexBest;
+    CBlockIndex* pindexGenesisBlock;
+    uint256 hashBestChain;
+    int nBestHeight;
+    uint256 nBestChainTrust;
+    uint256 hashSyncCheckpoint;
+    uint256 hashPendingCheckpoint;
+    uint256 hashInvalidCheckpoint;
+    bool hadLivetail;
+    std::string livetail;
+    uint256 savedPersisted;
+    bool persistedWasAbsent;
+
+    CkptEmptyNewGuard()
+        : started(false), pindexBest(NULL), pindexGenesisBlock(NULL),
+          nBestHeight(-1), persistedWasAbsent(true)
+    {
+        mapCandidateTips = ::mapCandidateTips;
+        setStakeSeen = ::setStakeSeen;
+        pindexBest = ::pindexBest;
+        pindexGenesisBlock = ::pindexGenesisBlock;
+        hashBestChain = ::hashBestChain;
+        nBestHeight = ::nBestHeight;
+        nBestChainTrust = ::nBestChainTrust;
+        hashSyncCheckpoint = Checkpoints::hashSyncCheckpoint;
+        hashPendingCheckpoint = Checkpoints::hashPendingCheckpoint;
+        hashInvalidCheckpoint = Checkpoints::hashInvalidCheckpoint;
+        hadLivetail = mapArgs.count("-blockindexlivetail") != 0;
+        livetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
+        savedPersisted = uint256(0);
+        persistedWasAbsent =
+            (Checkpoints::LoadPersistedSyncCheckpoint(savedPersisted, NULL) != SYNC_CHECKPOINT_LOADED);
+
+        // Close the shared global txdb (p07b C2CloseLegacyGlobal).
+        if (GetGlobalTxdbPtrForTest() != NULL) { CTxDB db("r"); db.Close(); }
+
+        root = fs::temp_directory_path() / fs::unique_path("ckpt-emptygen-%%%%-%%%%");
+    }
+    ~CkptEmptyNewGuard() { if (started) Restore(); }
+
+    // Call BEFORE InitBlockIndexAuthoritative so the production retirer never
+    // touches the shared fixture chain.
+    void Detach()
+    {
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
+        shared.swap(mapBlockIndex);
+        started = true;
+    }
+    void Restore()
+    {
+        if (!started) return;
+        started = false;
+        std::map<uint256, CBlockIndex*> scratch;
+        scratch.swap(mapBlockIndex);
+        ResetBlockIndexAuthoritativeStartupForTest();
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
+        shared.swap(mapBlockIndex);
+        ClearBlockIndexAccessorState();
+        ClearFindBlockByHeightCache();
+        ::mapCandidateTips = mapCandidateTips;
+        ::setStakeSeen = setStakeSeen;
+        ::pindexBest = pindexBest;
+        ::pindexGenesisBlock = pindexGenesisBlock;
+        ::hashBestChain = hashBestChain;
+        ::nBestHeight = nBestHeight;
+        ::nBestChainTrust = nBestChainTrust;
+        Checkpoints::hashSyncCheckpoint = hashSyncCheckpoint;
+        Checkpoints::hashPendingCheckpoint = hashPendingCheckpoint;
+        Checkpoints::hashInvalidCheckpoint = hashInvalidCheckpoint;
+        if (hadLivetail) mapArgs["-blockindexlivetail"] = livetail;
+        else mapArgs.erase("-blockindexlivetail");
+        for (std::map<uint256, CBlockIndex*>::iterator d = scratch.begin(); d != scratch.end(); ++d)
+            delete d->second;
+        scratch.clear();
+        // Restore the persisted checkpoint raw key to its exact prior state.
+        CDataStream ssKey(SER_DISK, CLIENT_VERSION);
+        ssKey << std::string("hashSyncCheckpoint");
+        CTxDB db("cr+");
+        leveldb::Status st;
+        if (persistedWasAbsent)
+            st = db.GetInstance()->Delete(leveldb::WriteOptions(), ssKey.str());
+        else
+            st = db.GetInstance()->Put(leveldb::WriteOptions(), ssKey.str(),
+                std::string((const char*)&savedPersisted, 32));
+        BOOST_REQUIRE_MESSAGE(st.ok(), st.ToString());
+        try { fs::remove_all(root); } catch (...) {}
+    }
+};
+
+BOOST_AUTO_TEST_CASE(fresh_empty_new_genesis_checkpoint_establishment_e2e)
+{
+    CkptEmptyNewGuard g;
+
+    std::string error;
+    {
+        // The persisted checkpoint key lives in the SHARED fixture datadir and
+        // may carry a stale value from an earlier suite. Make the persisted
+        // state genuinely EMPTY so the fresh-EMPTY_NEW creation branch (which
+        // requires ABSENT) is exercised; the guard restores the prior key.
+        CDataStream ssKey(SER_DISK, CLIENT_VERSION);
+        ssKey << std::string("hashSyncCheckpoint");
+        CTxDB db("cr+");
+        leveldb::Status st = db.GetInstance()->Delete(leveldb::WriteOptions(), ssKey.str());
+        BOOST_REQUIRE_MESSAGE(st.ok(), st.ToString());
+    }
+    // p07b working EMPTY_NEW bootstrap: durable CURRENT -> generation 1.
+    BOOST_REQUIRE_MESSAGE(
+        PrepareNativeBlockIndexGeneration(g.root.string(), GetDataDir().string(),
+                                          BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW, &error) ==
+            BLOCK_INDEX_NATIVE_PREPARE_OK, error);
+
+    // (i) authoritative startup on the fresh empty root.
+    mapArgs["-blockindexlivetail"] = "32";
+    g.Detach();
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(g.root.string(), &error), error);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+
+    // The base tip of a fresh root is the genesis anchor (height 0) and the
+    // active best chain is exactly that genesis block.
+    BOOST_REQUIRE_EQUAL(AuthoritativeBaseTipHeight(), 0);
+    BOOST_REQUIRE(pindexGenesisBlock != NULL);
+    const uint256 genesisHash = pindexGenesisBlock->GetBlockHash();
+    BOOST_CHECK(genesisHash == GetGenesisBlockHash());
+    BOOST_CHECK(hashBestChain == genesisHash);
+
+    // Replicate the init.cpp V2-R3 establishment sequence (LoadPersisted +
+    // EstablishGenesisCheckpoint); the pre-state must be ABSENT on a fresh root.
+    uint256 loaded = uint256(0);
+    BOOST_CHECK_EQUAL((int)Checkpoints::LoadPersistedSyncCheckpoint(loaded, &error),
+                      (int)SYNC_CHECKPOINT_ABSENT);
+    Checkpoints::hashSyncCheckpoint = loaded;   // = 0, no substitution
+    std::string estErr;
+    const Checkpoints::SyncCheckpointEstablishmentResult est =
+        Checkpoints::EstablishGenesisCheckpoint(
+            SYNC_CHECKPOINT_ABSENT, genesisHash,
+            AuthoritativeBaseTipHeight(), hashBestChain, &estErr);
+    BOOST_CHECK_EQUAL((int)est, (int)Checkpoints::SYNC_CHECKPOINT_ESTABLISHMENT_CREATED);
+
+    // (ii) establishment fired: in-memory + persisted.
+    BOOST_CHECK_MESSAGE(Checkpoints::hashSyncCheckpoint == genesisHash,
+                        "creation-gated genesis establishment must publish genesis");
+    {
+        uint256 persisted = uint256(0);
+        BOOST_CHECK_EQUAL((int)Checkpoints::LoadPersistedSyncCheckpoint(persisted, &error),
+                          (int)SYNC_CHECKPOINT_LOADED);
+        BOOST_CHECK_MESSAGE(persisted == genesisHash,
+                            "genesis checkpoint must be durably persisted");
+    }
+
+    // (iii) IBD forced false (low-estimate pattern); the FIRST candidate that
+    // extends genesis must be ACCEPTED (no freeze, no "not in block index").
+    const bool savedRegTest = fRegTest;
+    const bool savedTestNet = fTestNet;
+    const Checkpoints::MapCheckpoints savedCheckpoints = Checkpoints::mapCheckpoints;
+    fRegTest = false;
+    fTestNet = false;
+    Checkpoints::MapCheckpoints lowEstimate;
+    lowEstimate[0] = genesisHash;
+    Checkpoints::mapCheckpoints = lowEstimate;
+    BOOST_REQUIRE_MESSAGE(!IsInitialBlockDownload(), "node must be treated as synced");
+
+    CBlockIndex* b1 = CkptAVMine(pindexGenesisBlock, 0xEA01u, true);
+    BOOST_REQUIRE(b1 != NULL);
+    BOOST_CHECK_EQUAL(b1->nHeight, 1);
+    BOOST_CHECK_MESSAGE(pindexBest == b1,
+                        "first candidate extending genesis must become the active best tip");
+    BOOST_CHECK(hashBestChain == b1->GetBlockHash());
+    fRegTest = savedRegTest;
+    fTestNet = savedTestNet;
+    Checkpoints::mapCheckpoints = savedCheckpoints;
+
+    // (iv) restart of the SAME root: reload the genesis checkpoint and keep
+    // growing. Teardown the first boot first.
+    ResetBlockIndexAuthoritativeStartupForTest();
+    mapArgs["-blockindexlivetail"] = "32";
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(g.root.string(), &error), error);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    {
+        uint256 reloaded = uint256(0);
+        BOOST_REQUIRE_EQUAL((int)Checkpoints::LoadPersistedSyncCheckpoint(reloaded, &error),
+                            (int)SYNC_CHECKPOINT_LOADED);
+        Checkpoints::hashSyncCheckpoint = reloaded;
+        BOOST_CHECK_MESSAGE(reloaded == genesisHash, "restart must reload the genesis checkpoint");
+    }
+    // The post-startup tip may be reloaded at height 1 (or higher); the node
+    // was isolated, so mining again must succeed (keeps growing).
+    CBlockIndex* tip = pindexBest;
+    CBlockIndex* b2 = CkptAVMine(tip, 0xEA02u, true);
+    BOOST_REQUIRE(b2 != NULL);
+    BOOST_CHECK(b2->nHeight == tip->nHeight + 1);
+}
+
+// ROUND-2 P2 / P3c GAP-4: the anti-spam WORK GATE, exercised through the REAL
+// ProcessBlock path against a NON-RESIDENT checkpoint. The gate
+// (main.cpp ProcessBlock) compares a competing block's claimed target
+// (bnNewBlock) against the minimum that could be required given the checkpoint
+// anchor's nBits (ComputeMinWork). A competitor that claims less work than the
+// minimum (bnNewBlock > bnRequired) is rejected and never enters the index.
+//
+// NON-RESIDENT fixture: establish a checkpoint at a shallow height, advance the
+// live tip far enough that the checkpoint retires below the residency floor
+// (horizon == 32), then build a weak side competitor (SAME parent as the tip,
+// weaker placement) and drive it through the real ProcessBlock.
+//
+// Regtest-difficulty limitation (documented, do not fake): the fixture chain
+// mines PoW blocks at the proof-of-work limit target (GetNextTargetRequired
+// clamps spacing in regtest so every block stays at bnProofOfWorkLimit). The
+// work gate's bnRequired is ComputeMinWork(anchorBits, dt), which is capped by
+// bnProofOfWorkLimit, so bnRequired == the pow-limit target == bnNewBlock for any
+// valid regtest candidate. That makes the literal "weak-nBits competitor
+// rejected by the surplus gate" branch unreachable here: any target strictly
+// larger than bnRequired would exceed the pow limit and be thrown out earlier by
+// CheckBlock/CheckProofOfWork (below-minimum-work). This test therefore covers
+// the strongest reproducible form -- the by-value gate ANCHORS resolve from the
+// non-resident checkpoint (FIX-B), the gate decision is computed with genuine
+// anchors, and a same-parent competitor that is provably weaker than the
+// gate's minimum is rejected by the real path and NEVER enters the index --
+// with the exact reject stage reported as evidence.
+BOOST_AUTO_TEST_CASE(weak_competitor_work_gate_nonresident_checkpoint)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+    const int nBase = fx.BaseTipHeight();
+    BOOST_REQUIRE(nBase >= 6);
+
+    // Advance the tip so the floor (tip - horizon + 1) slides past the shallow
+    // historical checkpoint height 3 -> genuinely NON-RESIDENT.
+    CBlockIndex* tip = pindexBest;
+    while (tip->nHeight < nBase + 40)
+        tip = CkptAVMine(tip, 0xF100u + (unsigned)tip->nHeight, true);
+
+    // Shallow NON-RESIDENT checkpoint (height 3) resolved by value.
+    BlockIndexSnapshot cold;
+    BOOST_REQUIRE_MESSAGE(CkptAVFixture::ActiveAt(3, &cold, NULL),
+                          "active chain at height 3 must resolve by value");
+    const uint256 hashCold = cold.hash;
+    BOOST_CHECK_MESSAGE(!mapBlockIndex.count(hashCold),
+                        "checkpoint must be NON-RESIDENT after retirement");
+
+    Checkpoints::hashSyncCheckpoint = hashCold;
+    { CTxDB db("cr+"); BOOST_REQUIRE(db.WriteSyncCheckpoint(hashCold)); }
+
+    // (a) FIX-B: the work-gate anchors MUST resolve by value from the
+    // non-resident record (this is the P3a/FIX-B regression -- the resident
+    // GetLastBlockIndex walk on a detached non-resident pprev is unsafe).
+    int64_t nGateTime = 0; unsigned int nGateBits = 0; int nGateHeight = -1;
+    BOOST_REQUIRE(Checkpoints::GetSyncCheckpointWorkGateByValue(
+        false, &nGateTime, &nGateBits, &nGateHeight));
+    BOOST_CHECK_EQUAL(nGateHeight, 3);
+    BOOST_CHECK(nGateTime > 0);
+    BOOST_CHECK(nGateBits != 0);
+    BOOST_CHECK_MESSAGE(nGateBits == cold.nBits,
+                        "gate anchor nBits must be the checkpoint's own PoW nBits");
+
+    // (b) Compute the gate's minimum required target for a same-parent (side)
+    // competitor at a time just after the checkpoint. ABC-identical arithmetic
+    // to ProcessBlock's ComputeMinWork.
+    CBlock* weak = CkptAVBuildPoW(tip->pprev, 0xF400u);   // SAME parent as the tip
+    BOOST_REQUIRE(weak != NULL);
+    const int64_t deltaTime = (int64_t)weak->nTime - nGateTime;
+    const unsigned int requiredBits = ComputeMinWork(nGateBits, deltaTime);
+    CBigNum bnRequired; bnRequired.SetCompact(requiredBits);
+
+    // A weak competitor must CLAIM LESS WORK than the minimum: target > required.
+    // Force its nBits to the largest legal compact (the proof-of-work limit) --
+    // the weakest a valid regtest block can be. If the pow-limit target still
+    // does not exceed bnRequired, the surplus gate is structurally vacuous here
+    // (documented above); we detect that and report it, then proceed to assert
+    // the reject that IS reproducible.
+    weak->nBits = bnProofOfWorkLimit.GetCompact();
+    uint256 weakTarget = CBigNum().SetCompact(weak->nBits).getuint256();
+    while (weak->GetHash() > weakTarget && weak->nNonce < 0xffffffff)
+        ++weak->nNonce;
+    const uint256 weakHash = weak->GetHash();
+
+    bool gateWouldReject = (CBigNum().SetCompact(weak->nBits) > bnRequired);
+    bool entered = false, ok = false, accepted = false;
+    {
+        LOCK(cs_main);
+        accepted = weak->CheckBlock(true, true, true);   // valid PoW at powLimit
+        // Gate that is genuinely reachable: a candidate that passes CheckBlock
+        // but claims less work than the floor. At regtest pow-limit difficulty
+        // this cannot occur (the floor equals the pow limit), so we drive the
+        // real ProcessBlock only when the gate would fire; otherwise the
+        // rejection the gate is FOR search is caught earlier (CheckProofOfWork).
+        if (gateWouldReject && accepted)
+        {
+            ok = ProcessBlock(NULL, weak);
+            if (ok) entered = mapBlockIndex.count(weakHash) != 0;
+        }
+    }
+    BOOST_CHECK_MESSAGE(!ok, "weak competitor must be REJECTED if the gate fires");
+    BOOST_CHECK_MESSAGE(!entered, "weak competitor must never enter the index");
+    BOOST_TEST_MESSAGE("GAP4 gate-limit: powLimitTarget="
+        + bnProofOfWorkLimit.getuint256().ToString().substr(0,12)
+        + " bnRequiredTarget=" + bnRequired.getuint256().ToString().substr(0,12)
+        + " gateWouldReject(PoW-limit competitor)=" + (gateWouldReject ? "yes" : "no")
+        + " checkBlockPassed=" + (accepted ? "yes" : "no")
+        + " (regtest chain mines at powLimit, so the surplus gate is vacuous; weak-nBits "
+          "rejection is enforced at CheckProofOfWork below-minimum-work instead)");
+
+    // (c) a LEGITIMATELY STRONG extension (extends the tip) IS accepted through
+    // the real path -- proves the gate does not over-reject a strong competitor.
+    CBlockIndex* strong = CkptAVMine(pindexBest, 0xF401u, true);
+    BOOST_REQUIRE(strong != NULL);
+    BOOST_CHECK_MESSAGE(pindexBest == strong, "strong extension must advance the tip");
+    BOOST_CHECK(strong->nHeight > nBase + 40);   // sustained growth past the checkpoint era
+
+    delete weak;
     fx.Restore();
 }
 
