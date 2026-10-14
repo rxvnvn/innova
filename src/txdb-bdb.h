@@ -7,6 +7,18 @@
 #define BITCOIN_TXDB_BDB_H
 
 
+#ifndef INNOVA_SYNC_CHECKPOINT_LOAD_STATUS_DEFINED
+#define INNOVA_SYNC_CHECKPOINT_LOAD_STATUS_DEFINED
+// V2-R2B (FIX A): typed result of reading the persisted synchronized checkpoint
+// (see txdb-leveldb.h for the semantics; identical in both impls).
+enum SyncCheckpointLoadStatus
+{
+    SYNC_CHECKPOINT_ABSENT  = 0,
+    SYNC_CHECKPOINT_LOADED  = 1,
+    SYNC_CHECKPOINT_CORRUPT = 2,
+};
+#endif
+
 /** Access to the transaction database (blkindex.dat) */
 class CTxDB : public CDB
 {
@@ -35,6 +47,9 @@ public:
     bool WriteInvalidBlockSet(const std::set<uint256>& setInvalidBlockHash);
     bool ReadSyncCheckpoint(uint256& hashCheckpoint);
     bool WriteSyncCheckpoint(uint256 hashCheckpoint);
+    // V2-R2B (FIX A): see txdb-leveldb.h — typed result distinguishing an ABSENT
+    // persisted synchronized checkpoint (ppcoin "none") from a CORRUPT one.
+    SyncCheckpointLoadStatus LoadSyncCheckpoint(uint256& hashCheckpoint);
     bool ReadCheckpointPubKey(std::string& strPubKey);
     bool WriteCheckpointPubKey(const std::string& strPubKey);
     bool ReadModifierUpgradeTime(unsigned int& nUpgradeTime);

@@ -7753,6 +7753,78 @@ bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* 
     return PublishAuthoritativeLiveTailCutover(live, pindexNew, oldPublishedTipHash, outErr);
 }
 
+// V2-R3 (ROUND-2 P1): authoritative chain switch on behalf of the synchronized
+// checkpoint (LEGACY PARITY — the legacy AcceptPendingSyncCheckpoint /
+// ProcessSyncCheckpoint drove CBlock::SetBestChain when a KNOWN checkpoint
+// block was not on the main chain; see checkpoints.cpp). This is an entry
+// point for a switch the checkpoint authority has ALREADY validated through
+// the EXISTING consensus engine path — the very same CBlock::SetBestChain
+// (whose reorganize arm is Reorganize with C12 by-value fork discovery and the
+// V2 below-base fail-closed contract). It does NOT introduce a parallel reorg
+// path; it only materializes the checkpoint chain for the switch, exactly like
+// the legacy ReadFromDisk(pindexCheckpoint).
+//
+// Caller must hold cs_main. All-or-nothing: on failure the chain state is
+// unchanged (SetBestChain/Reorganize roll back their own transaction); the
+// checkpoint caller decides the rejection contract (hashInvalidCheckpoint).
+bool AuthoritativeSyncCheckpointSwitchChainByValue(const uint256& hashCheckpoint,
+                                                   std::string* outErr)
+{
+    AssertLockHeld(cs_main);
+    if (outErr) outErr->clear();
+    if (!g_fAuthoritativeStartup)
+    {
+        if (outErr) *outErr = "authoritative sync-checkpoint switch: not in authoritative mode";
+        return false;
+    }
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (!live || !live->IsOpen())
+    {
+        if (outErr) *outErr = "authoritative sync-checkpoint switch: live authority unavailable";
+        return false;
+    }
+
+    // Materialize the checkpoint chain (identity-checked by the live materializer)
+    // exactly like the legacy ReadFromDisk(pindexCheckpoint) first step. The
+    // resident fast path is the case legacy also hit; the non-resident case is
+    // what Fix B left unreachable. ScopedMaterializedChain keeps the
+    // objects alive for the duration of this switch (no pointer escapes).
+    ScopedMaterializedChain materialized;
+    CBlockIndex* pindexCheckpoint = materialized.Acquire(live, hashCheckpoint, outErr);
+    if (pindexCheckpoint == NULL)
+    {
+        if (outErr && outErr->empty())
+            *outErr = "authoritative sync-checkpoint switch: checkpoint chain cannot be materialized (fail-closed; the switch is NOT attempted)";
+        return false;
+    }
+    if (pindexCheckpoint->GetBlockHash() != hashCheckpoint)
+    {
+        if (outErr) *outErr = "authoritative sync-checkpoint switch: materialized hash identity mismatch";
+        return false;
+    }
+
+    // The legacy semantics was gated on `!pindexCheckpoint->IsInMainChain()`;
+    // here the caller has already established NOT_ACTIVE, so drive the switch.
+    CBlock block;
+    if (!block.ReadFromDisk(pindexCheckpoint))
+    {
+        if (outErr) *outErr = strprintf("authoritative sync-checkpoint switch: ReadFromDisk failed for sync checkpoint %s",
+                                        hashCheckpoint.ToString().c_str());
+        return false;
+    }
+    CTxDB txdb;
+    if (!block.SetBestChain(txdb, pindexCheckpoint))
+    {
+        if (outErr) *outErr = strprintf("authoritative sync-checkpoint switch: SetBestChain failed for sync checkpoint %s",
+                                       hashCheckpoint.ToString().c_str());
+        return false;
+    }
+    printf("AuthoritativeSyncCheckpointSwitchChainByValue: switched active chain to synchronized checkpoint %s (height %d)\n",
+           hashCheckpoint.ToString().c_str(), pindexCheckpoint->nHeight);
+    fflush(stdout);
+    return true;
+}
+
 // PM1-P0-06 A1-b S2: physically bound authoritative mapBlockIndex residency to
 // the live horizon. In BY_VALUE_AUTHORITATIVE mode mapBlockIndex is a bounded
 // hot compatibility index, not a process-lifetime O(chain) owner: entries that
@@ -9363,25 +9435,51 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     }
     int64_t nCheckMs = GetTimeMillis() - nCheckStart;
 
-    CBlockIndex* pcheckpoint = Checkpoints::GetLastSyncCheckpoint();
-    if (pcheckpoint && pblock->hashPrevBlock != hashBestChain && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
+    // V2-R2B (FIX B): under authoritative startup the synced checkpoint may be a
+    // non-resident historical record, so the anti-spam surplus-work gate is fed
+    // by-value anchors (checkpoint time + the last same-type block's nBits at or
+    // below the checkpoint) instead of silently skipping the gate.
+    // ROUND-3 P3a: under authoritative mode ALWAYS prefer the by-value path.
+    // The resident GetLastBlockIndex walk uses pprev, which
+    // RetireBlockIndexBelowFloor may have detached on a NOT_ACTIVE checkpoint
+    // record; a detached pprev makes the anchor read unsafe. The by-value
+    // resolver reads exactly the same persisted fields. The resident path is
+    // kept verbatim for non-authoritative (legacy) mode.
+    CBlockIndex* pcheckpoint = g_fAuthoritativeStartup ? NULL : Checkpoints::GetLastSyncCheckpoint();
+    bool fCheckpointWorkGate = false;
+    int64_t nWorkGateTime = 0;
+    unsigned int nWorkGateBits = 0;
+    int nWorkGateHeight = -1;
+    if (pcheckpoint)
+    {
+        fCheckpointWorkGate = true;
+        nWorkGateTime = pcheckpoint->nTime;
+        nWorkGateHeight = pcheckpoint->nHeight;
+        nWorkGateBits = GetLastBlockIndex(pcheckpoint, pblock->IsProofOfStake())->nBits;
+    }
+    else if (g_fAuthoritativeStartup)
+    {
+        fCheckpointWorkGate = Checkpoints::GetSyncCheckpointWorkGateByValue(
+            pblock->IsProofOfStake(), &nWorkGateTime, &nWorkGateBits, &nWorkGateHeight);
+    }
+    if (fCheckpointWorkGate && pblock->hashPrevBlock != hashBestChain && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
     {
         // Extra checks to prevent "fill up memory by spamming with bogus blocks"
-        int64_t deltaTime = pblock->GetBlockTime() - pcheckpoint->nTime;
+        int64_t deltaTime = pblock->GetBlockTime() - nWorkGateTime;
         CBigNum bnNewBlock;
         bnNewBlock.SetCompact(pblock->nBits);
         CBigNum bnRequired;
 
         if (pblock->IsProofOfStake())
-            bnRequired.SetCompact(ComputeMinStake(GetLastBlockIndex(pcheckpoint, true)->nBits, deltaTime, pblock->nTime));
+            bnRequired.SetCompact(ComputeMinStake(nWorkGateBits, deltaTime, pblock->nTime));
         else
-            bnRequired.SetCompact(ComputeMinWork(GetLastBlockIndex(pcheckpoint, false)->nBits, deltaTime));
+            bnRequired.SetCompact(ComputeMinWork(nWorkGateBits, deltaTime));
 
         if (bnNewBlock > bnRequired)
         {
             if (pfrom)
                 pfrom->Misbehaving(100);
-            std::string strWeakExtra = strprintf("block_trust=%s required_trust=%s checkpoint_height=%d checkpoint_hash=%s local_best_height=%d local_best_hash=%s", bnNewBlock.ToString().c_str(), bnRequired.ToString().c_str(), pcheckpoint ? pcheckpoint->nHeight : -1, pcheckpoint ? pcheckpoint->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str(), pindexBest ? pindexBest->nHeight : -1, pindexBest ? pindexBest->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str());
+            std::string strWeakExtra = strprintf("block_trust=%s required_trust=%s checkpoint_height=%d checkpoint_hash=%s local_best_height=%d local_best_hash=%s", bnNewBlock.ToString().c_str(), bnRequired.ToString().c_str(), nWorkGateHeight, Checkpoints::hashSyncCheckpoint.ToString().c_str(), pindexBest ? pindexBest->nHeight : -1, pindexBest ? pindexBest->GetBlockHash().ToString().c_str() : uint256(0).ToString().c_str());
             TraceProcessBlockReject(pfrom, pblock, PBREJECT_WEAK_CHECKPOINT, NULL, strWeakExtra);
             ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
             return error("ProcessBlock() : block with too little %s", pblock->IsProofOfStake()? "proof-of-stake" : "proof-of-work");

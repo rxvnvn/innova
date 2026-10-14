@@ -9,6 +9,7 @@
 #include "blockindex_hashindex.h"
 #include "blockindex_navigation.h"
 #include "blockindex_startup_authority.h"
+#include "sync.h"                      // CCriticalSection (P3 concurrency guard)
 
 #include <boost/shared_ptr.hpp>
 #include <cstdint>
@@ -234,6 +235,19 @@ public:
                                       std::string* error);
 
     // ---- reads (by-value, composed as tip authority) ----
+    // P3-R1 CONCURRENCY GUARD: all MUTABLE-TAIL reads below (GetTip /
+    // LookupByHash / LookupActiveByHeight, and the delegating
+    // LookupParent / LookupNextActive / AllRecords / SelectBestEligibleBranch)
+    // take the INNERMOST impl-level csTailLock so a reader WITHOUT cs_main
+    // (the V2 authoritative checkpoint resolver reached from the
+    // version-message handler / AcceptPendingSyncCheckpoint /
+    // ProcessSyncCheckpoint under cs_hashSyncCheckpoint only) is race-free
+    // against a concurrent cs_main-serialized writer (ProcessBlock
+    // AppendBatch / TruncateActiveTo / ReorgActiveTo /
+    // ApplyOperatorInvalidAndReorg). The counters they read are mutable
+    // (locked, not atomic): the lock makes those refcounts authoritative.
+    // Lock ordering: csTailLock is INNERMOST (cs_main -> csTailLock and
+    // cs_hashSyncCheckpoint -> csTailLock) -- no new lock cycle.
     BlockIndexTipRead GetTip() const;
     // Lookup a block by hash within the tip namespace.
     BlockIndexTipRead LookupByHash(const uint256& hash, std::string* error) const;
@@ -243,6 +257,20 @@ public:
     BlockIndexTipRead LookupParent(const uint256& childHash, std::string* error) const;
     // Next active successor (active height+1 member whose record.hashPrev == current).
     BlockIndexTipRead LookupNextActive(const uint256& curHash, std::string* error) const;
+    // P3-R1 declaration of the impl-level mutex (defined in the Impl; see the
+    // .cpp guard comment). Kept as a free function at file scope in the .cpp
+    // because Impl is incomplete here.
+    CCriticalSection& GetTipTailLockForDiagnostics();
+
+    // P3-R2 CHECKPOINT FLOOR: registration into the MUTABLE TIP (the audit's
+    // reconciled FREE/dangle-window contract). A caller (the authoritative
+    // live authority, under cs_main) registering/checking/unregistering an
+    // external protected floor is serialized by the impl-level csTailLock, so
+    // an eviction decision racing a checkpoint(attribute) read can never mix
+    // a stale floor with a torn window. All three are O(1).
+    void RegisterExternalProtectedFloorForResolve(int32_t floor);
+    void UnregisterExternalProtectedFloorForResolve();
+    static int32_t GetExternalProtectedFloorForResolve(const BlockIndexTipAuthority& t);
 
     // ---- limits & identity ----
     uint64_t BaseGeneration() const;

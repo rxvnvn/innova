@@ -148,7 +148,13 @@ CTxDB::CTxDB(const char* pszMode)
         ReadVersion(nVersion);
         printf("Transaction index version is %d\n", nVersion);
 
-        if (nVersion < DATABASE_VERSION)
+        // ROUND-3 P3b: the version-mismatch backup/reset dance RENAMES the
+        // whole legacy store and recreates it. On a READ-ONLY handle (e.g. the
+        // Checkpoints::LoadPersistedSyncCheckpoint boot probe) that is a
+        // destructive write behind the caller's back; skip the dance entirely
+        // and let the caller proceed against the existing store (any
+        // incompatible read is reported through the typed read seam).
+        if (nVersion < DATABASE_VERSION && !fReadOnly)
         {
             printf("CTxDB() : database version %d is older than expected %d, creating backup\n",
                    nVersion, DATABASE_VERSION);
@@ -697,6 +703,22 @@ bool CTxDB::WriteCandidateTips(const std::map<uint256, CandidateTipRecord>& tips
 bool CTxDB::ReadSyncCheckpoint(uint256& hashCheckpoint)
 {
     return Read(string("hashSyncCheckpoint"), hashCheckpoint);
+}
+
+// V2-R2B (FIX A): typed persisted sync-checkpoint read. ABSENT and CORRUPT are
+// distinct so the V2 authoritative startup can fail closed on a durable
+// inconsistency while treating a never-established checkpoint as the canonical
+// ppcoin 0 ("no synchronized checkpoint"). No genesis substitution.
+SyncCheckpointLoadStatus CTxDB::LoadSyncCheckpoint(uint256& hashCheckpoint)
+{
+    hashCheckpoint = uint256(0);
+    if (!Exists(string("hashSyncCheckpoint")))
+        return SYNC_CHECKPOINT_ABSENT;
+    uint256 valueRead = uint256(0);
+    if (!Read(string("hashSyncCheckpoint"), valueRead))
+        return SYNC_CHECKPOINT_CORRUPT;
+    hashCheckpoint = valueRead;
+    return SYNC_CHECKPOINT_LOADED;
 }
 
 bool CTxDB::WriteSyncCheckpoint(uint256 hashCheckpoint)

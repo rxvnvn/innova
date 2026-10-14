@@ -538,6 +538,13 @@ bool ReconcileLegacyCompatibilityMirror(std::string& strError);
 void MainFailpointSetForTesting(const std::string& name, bool armed);
 bool MainFailpointHitForTesting(const std::string& name);
 
+// V2-R3 (ROUND-2 P1): authoritative chain switch on behalf of the
+// synchronized checkpoint (LEGACY PARITY). See main.cpp for the full
+// contract. Requires cs_main; dispatches through the EXISTING
+// CBlock::SetBestChain consensus path (no parallel reorg).
+bool AuthoritativeSyncCheckpointSwitchChainByValue(const uint256& hashCheckpoint,
+                                                   std::string* outErr);
+
 // V2-R2D (PM1-P0-09) test seam: expose the authoritative-live reorg cutover
 // guard to a runtime fixture so the NULL/NULL ancestor-alias elimination can be
 // asserted (two unresolved ancestors must NOT be treated as a common ancestor).

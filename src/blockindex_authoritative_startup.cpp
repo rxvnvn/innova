@@ -497,8 +497,34 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
 
 bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out)
 {
+    return AuthoritativeGetActiveSnapshotByHeightR(height, out, NULL) ==
+           AUTHORITATIVE_BLOCK_FOUND;
+}
+
+// ROUND-4 P2 (checkpoints.cpp sticky memo): test-only injection counter for
+// the by-HEIGHT active-chain lookup consumed by
+// AuthoritativeGetActiveSnapshotByHeightR below. Test seam only; the
+// production startup never arms it (0 = production behavior).
+static int g_activeHeightFailInjectionsForTest = 0;
+
+// ROUND-4 P2: typed by-HEIGHT lookup. Distinguishes a DEFINITIVE miss (both
+// authoritative sources completed and answered) from a TRANSIENT authority
+// failure, so a caller's memo (checkpoints.cpp CheckSyncByValue) can retry the
+// latter instead of freezing a sticky false verdict for the epoch. Acceptance
+// semantics of the bool wrapper are IDENTICAL (true iff FOUND); NOT_FOUND and
+// AUTHORITY_FAILURE both fail closed there.
+AuthoritativeBlockResolutionResult AuthoritativeGetActiveSnapshotByHeightR(
+    int height, BlockIndexSnapshot* out, std::string* error)
+{
+    if (g_activeHeightFailInjectionsForTest > 0)
+    {
+        --g_activeHeightFailInjectionsForTest;
+        if (error) *error = "test-injected by-height authority failure";
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+    }
+    if (error) error->clear();
     if (!out)
-        return false;
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
     // 1. Immutable base generation (active heights <= its committed tip).
     const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
     if (!reader)
@@ -506,11 +532,28 @@ bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out)
         const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
         reader = nav ? nav->GetColdReader() : NULL;
     }
+    bool fBaseResolvedDefinitively = false;
     if (reader && reader->IsOpen())
     {
         std::string baseErr;
-        if (reader->GetActiveByHeight(height, out, &baseErr) == BLOCK_INDEX_V2_READ_FOUND)
-            return true;
+        const BlockIndexV2ReadStatus baseStatus =
+            reader->GetActiveByHeight(height, out, &baseErr);
+        if (baseStatus == BLOCK_INDEX_V2_READ_FOUND)
+            return AUTHORITATIVE_BLOCK_FOUND;
+        if (baseStatus == BLOCK_INDEX_V2_READ_NOT_FOUND)
+        {
+            // Definitive: the immutable generation carries no ACTIVE block at
+            // this height. Fall through to the mutable tail per Astra R-1.
+            fBaseResolvedDefinitively = true;
+        }
+        else
+        {
+            // CORRUPT / IO_ERROR / NOT_OPEN: transient authority failure.
+            if (error) *error = baseErr.empty()
+                ? "authoritative by-height resolver: base authority failure"
+                : baseErr;
+            return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+        }
     }
     // 2. Mutable authoritative live tail (post-generation ACTIVE blocks). On a
     //    fresh node the immutable generation holds only genesis, while every
@@ -521,22 +564,58 @@ bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out)
     //    never selected. Fail closed when neither authoritative source resolves.
     BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
     if (!live || !live->IsOpen())
-        return false;
+    {
+        // A closed tail with a definitive base answer is a DEFINITIVE miss;
+        // a closed tail with NO base answer is an unavailable authority.
+        if (fBaseResolvedDefinitively)
+        {
+            if (error) *error = "authoritative by-height resolver: block not found";
+            return AUTHORITATIVE_BLOCK_NOT_FOUND;
+        }
+        if (error) *error = "authoritative by-height resolver: authority unavailable";
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+    }
     const BlockIndexTipAuthority* tip = live->TipAuthority();
     if (!tip || !tip->IsOpen())
-        return false;
+    {
+        if (fBaseResolvedDefinitively)
+        {
+            if (error) *error = "authoritative by-height resolver: block not found";
+            return AUTHORITATIVE_BLOCK_NOT_FOUND;
+        }
+        if (error) *error = "authoritative by-height resolver: authority unavailable";
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+    }
     std::string tipErr;
     const BlockIndexTipRead tr = tip->LookupActiveByHeight(height, &tipErr);
+    if (tr.status == BLOCK_INDEX_TIP_NOT_FOUND || tr.status == BLOCK_INDEX_TIP_NOT_ACTIVE)
+    {
+        // Definitive tail answer: no ACTIVE block at this height exists in the
+        // mutable tail either (a side record sharing the height is NOT_ACTIVE).
+        if (error) *error = "authoritative by-height resolver: block not found";
+        return AUTHORITATIVE_BLOCK_NOT_FOUND;
+    }
     if (tr.status != BLOCK_INDEX_TIP_OK)
-        return false;
+    {
+        // CORRUPT / IO_ERROR / UNAVAILABLE_DERIVED_STATE / ...: transient.
+        if (error) *error = tipErr.empty()
+            ? "authoritative by-height resolver: tail authority failure"
+            : tipErr;
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+    }
     BlockIndexSnapshot snap;
     std::string snapErr;
     if (live->ResolveBlockSnapshot(tr.record.hash, &snap, &snapErr) != BlockIndexHotStatus::OK)
-        return false;
+    {
+        if (error) *error = snapErr.empty()
+            ? "authoritative by-height resolver: tail snapshot authority failure"
+            : snapErr;
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+    }
     if (!snap.fInMainChain)
-        return false; // an active height must never resolve to a non-active record
+        return AUTHORITATIVE_BLOCK_NOT_FOUND; // an active height must never resolve to a non-active record
     *out = snap;
-    return true;
+    return AUTHORITATIVE_BLOCK_FOUND;
 }
 
 AuthoritativeBlockResolutionResult ResolveAuthoritativeBlockSnapshotR(
@@ -705,6 +784,16 @@ void SetAuthoritativeLiveForTesting(BlockIndexAuthoritativeLive* live)
 void ClearAuthoritativeLiveForTesting()
 {
     g_testLiveAuthority = NULL;
+}
+
+void AuthoritativeActiveHeightFailForTest(int count)
+{
+    g_activeHeightFailInjectionsForTest = (count > 0) ? count : 0;
+}
+
+int AuthoritativeActiveHeightFailCountForTest()
+{
+    return g_activeHeightFailInjectionsForTest;
 }
 
 // A.10.1q / Stage1: emit residency for the retained authoritative context,
