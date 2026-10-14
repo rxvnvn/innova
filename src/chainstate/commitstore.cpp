@@ -1,7 +1,9 @@
-// Isolated chainstate vertical slice - durable commit store implementation.
-// Reviewed design: MANIFEST rename = visibility boundary; parent-dir fsync =
-// durability boundary. CoW state files (one immutable file per generation) so a
-// recovery can always select exactly one committed state. Single writer via flock.
+// Isolated chainstate vertical slice - durable commit store implementation (Stage 2B).
+// Boundaries: MANIFEST rename = visibility; parent-dir fsync = durability; durable ACK
+// record = acknowledgment. CoW state files (one immutable file per generation).
+// Single writer via flock. Fallback is fail-loud when it would discard an acknowledged
+// generation (F01). Backup establishment is checked and aborts publish on failure (F02).
+// Undo is indexed by metadata only; record bodies are read from disk on demand (F03 RAM).
 #include "commitstore.h"
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -16,6 +18,9 @@
 #include <algorithm>
 
 namespace cs {
+
+static const size_t UNDO_HEADER_SIZE = 52;   // 8 magic + 4 len + 32 blockHash + 4 height + 4 opCount
+static const size_t ACK_SIZE = 12;           // 8 gen + 4 crc32
 
 static uint32_t csCrc32(const uint8_t* d, size_t n) {
     uint32_t c = 0xFFFFFFFFu;
@@ -35,6 +40,10 @@ static bool ensureDir(const std::string& path) {
     if (pos != std::string::npos && pos > 0) ensureDir(parent.substr(0, pos));
     if (mkdir(path.c_str(), 0755) == 0) return true;
     return errno == EEXIST;
+}
+
+static bool endsWith(const std::string& s, const std::string& suf) {
+    return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
 }
 
 bool csWriteFile(const std::string& path, const uint8_t* d, size_t n,
@@ -75,6 +84,20 @@ bool csReadFile(const std::string& path, std::vector<uint8_t>* out, bool* exists
     return true;
 }
 
+bool csReadRange(const std::string& path, uint64_t offset, uint64_t len, std::vector<uint8_t>* out, ChainError* e) {
+    out->clear(); out->resize((size_t)len);
+    int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) { setErr(e, ErrCode::IO, "open " + path); return false; }
+    uint64_t got = 0;
+    while (got < len) {
+        ssize_t r = ::pread(fd, out->data() + got, (size_t)(len - got), (off_t)(offset + got));
+        if (r <= 0) { ::close(fd); setErr(e, ErrCode::CORRUPT, "short read " + path); return false; }
+        got += (uint64_t)r;
+    }
+    ::close(fd);
+    return true;
+}
+
 bool csFsyncDir(const std::string& dir, ChainError* e) {
     int fd = ::open(dir.c_str(), O_RDONLY | O_DIRECTORY);
     if (fd < 0) { setErr(e, ErrCode::IO, "open dir " + dir); return false; }
@@ -84,6 +107,17 @@ bool csFsyncDir(const std::string& dir, ChainError* e) {
 }
 
 // ---- Manifest --------------------------------------------------------------
+bool Manifest::validStateName(const std::string& name) {
+    // must equal "state-<digits>.dat"
+    const std::string pre = "state-", suf = ".dat";
+    if (name.size() <= pre.size() + suf.size()) return false;
+    if (name.compare(0, pre.size(), pre) != 0) return false;
+    if (name.compare(name.size() - suf.size(), suf.size(), suf) != 0) return false;
+    for (size_t i = pre.size(); i < name.size() - suf.size(); ++i)
+        if (name[i] < '0' || name[i] > '9') return false;
+    return true;
+}
+
 std::vector<uint8_t> Manifest::encode() const {
     std::vector<uint8_t> o;
     const uint8_t magic[8] = {'I','N','N','C','S','M','N','T'};
@@ -122,6 +156,7 @@ bool Manifest::decode(const uint8_t* d, size_t n, Manifest* m, ChainError* e) {
     uint32_t hh = 0; if (!getU32(d, n, &off, &hh)) { setErr(e, ErrCode::BAD_SERIALIZE, "manifest height"); return false; }
     uint32_t crcStored = 0; if (!getU32(d, n, &off, &crcStored)) { setErr(e, ErrCode::BAD_SERIALIZE, "manifest crc"); return false; }
     if (csCrc32(d, off - 4) != crcStored) { setErr(e, ErrCode::CORRUPT, "manifest crc mismatch"); return false; }
+    if (!validStateName(name)) { setErr(e, ErrCode::CORRUPT, "manifest stateName invalid: " + name); return false; }
     m->formatVersion = ver; m->generation = gen; m->undoSize = us; m->stateName = name; m->tipHeight = (int32_t)hh;
     return true;
 }
@@ -150,22 +185,24 @@ std::vector<uint8_t> UndoRecord::encode() const {
 bool UndoRecord::decode(const uint8_t* d, size_t n, size_t* off, UndoRecord* r, ChainError* e) {
     const uint8_t magic[8] = {'I','N','N','U','N','D','O','1'};
     size_t start = *off;
-    if (start + 8 + 4 + 32 + 4 + 4 > n) { setErr(e, ErrCode::CORRUPT, "undo header truncated"); return false; }
+    if (start + UNDO_HEADER_SIZE > n) { setErr(e, ErrCode::CORRUPT, "undo header truncated"); return false; }
     if (memcmp(d + start, magic, 8) != 0) { setErr(e, ErrCode::CORRUPT, "undo magic"); return false; }
     size_t o = start + 8;
-    uint32_t len = 0; uint32_t t = 0; for (int i = 0; i < 4; ++i) t |= (uint32_t)d[o + i] << (8 * i); len = t; o += 4;
+    uint32_t len = 0; for (int i = 0; i < 4; ++i) len |= (uint32_t)d[o + i] << (8 * i); o += 4;
     memcpy(r->blockHash.data(), d + o, 32); o += 32;
     uint32_t hh = 0; for (int i = 0; i < 4; ++i) hh |= (uint32_t)d[o + i] << (8 * i); o += 4; r->height = (int32_t)hh;
     uint32_t cnt = 0; for (int i = 0; i < 4; ++i) cnt |= (uint32_t)d[o + i] << (8 * i); o += 4;
+    if (len < UNDO_HEADER_SIZE || start + len > n) { setErr(e, ErrCode::CORRUPT, "undo len out of range"); return false; }
     r->ops.clear();
     for (uint32_t i = 0; i < cnt; ++i) {
-        if (o + 36 + 1 > n) { setErr(e, ErrCode::CORRUPT, "undo op truncated"); return false; }
+        if (o + 36 + 1 > start + len) { setErr(e, ErrCode::CORRUPT, "undo op truncated"); return false; }
         Op op; std::array<uint8_t,36> k; memcpy(k.data(), d + o, 36); o += 36;
-        op.op.txid = Hash(); memcpy(op.op.txid.data(), k.data(), 32); op.op.n = (uint32_t)k[32] | ((uint32_t)k[33] << 8) | ((uint32_t)k[34] << 16) | ((uint32_t)k[35] << 24);
+        memcpy(op.op.txid.data(), k.data(), 32);
+        op.op.n = (uint32_t)k[32] | ((uint32_t)k[33] << 8) | ((uint32_t)k[34] << 16) | ((uint32_t)k[35] << 24);
         uint8_t b = d[o++]; op.beforePresent = (b != 0);
-        if (op.beforePresent) { size_t save = o; if (!op.before.decode(d, n, &o)) { setErr(e, ErrCode::CORRUPT, "undo before coin"); return false; } (void)save; }
+        if (op.beforePresent) { if (!op.before.decode(d, start + len, &o)) { setErr(e, ErrCode::CORRUPT, "undo before coin"); return false; } }
         uint8_t a = d[o++]; op.afterPresent = (a != 0);
-        if (op.afterPresent) { if (!op.after.decode(d, n, &o)) { setErr(e, ErrCode::CORRUPT, "undo after coin"); return false; } }
+        if (op.afterPresent) { if (!op.after.decode(d, start + len, &o)) { setErr(e, ErrCode::CORRUPT, "undo after coin"); return false; } }
         r->ops.push_back(op);
     }
     if (o != start + len) { setErr(e, ErrCode::CORRUPT, "undo record length mismatch"); return false; }
@@ -182,20 +219,28 @@ void CommitStore::close() {
     opened_ = false;
 }
 
-static bool endsWith(const std::string& s, const std::string& suf) {
-    return s.size() >= suf.size() && s.compare(s.size() - suf.size(), suf.size(), suf) == 0;
-}
-
-size_t CommitStore::stateFileCount() const {
+std::vector<uint64_t> CommitStore::stateFileGens() const {
+    std::vector<uint64_t> gens;
     DIR* d = opendir(dir_.c_str());
-    if (!d) return 0;
-    size_t c = 0; struct dirent* ent;
+    if (!d) return gens;
+    struct dirent* ent;
     while ((ent = readdir(d)) != NULL) {
         std::string nm = ent->d_name;
-        if (nm.size() > 0 && nm.rfind("state-", 0) == 0 && endsWith(nm, ".dat") && !endsWith(nm, ".tmp")) ++c;
+        if (nm.rfind("state-", 0) != 0 || !endsWith(nm, ".dat") || endsWith(nm, ".tmp")) continue;
+        std::string num = nm.substr(6, nm.size() > 10 ? nm.size() - 10 : 0);
+        bool numeric = !num.empty();
+        for (char ch : num) if (ch < '0' || ch > '9') numeric = false;
+        if (numeric) gens.push_back(strtoull(num.c_str(), NULL, 10));
     }
     closedir(d);
-    return c;
+    std::sort(gens.begin(), gens.end());
+    return gens;
+}
+
+void CommitStore::gcStateFiles() {
+    for (uint64_t g : stateFileGens())
+        if (generation_ == 0 || (g != generation_ && g != generation_ - 1))
+            ::unlink(p(stateNameFor(g)).c_str());
 }
 
 bool CommitStore::loadStateFor(const Manifest& m, ChainError* e) {
@@ -210,18 +255,28 @@ bool CommitStore::loadStateFor(const Manifest& m, ChainError* e) {
     return true;
 }
 
+// Build a metadata-only index of the committed undo prefix; bodies stay on disk.
 bool CommitStore::loadUndoFor(const Manifest& m, ChainError* e) {
-    undo_.clear();
+    undoIndex_.clear();
     undoCommittedBytes_ = 0;
     if (m.undoSize == 0) return true;
-    std::vector<uint8_t> bytes; bool ex = false;
-    if (!csReadFile(p("undo.dat"), &bytes, &ex, e)) return false;
-    if (!ex) { setErr(e, ErrCode::CORRUPT, "undo.dat missing but undoSize=" + std::to_string(m.undoSize)); return false; }
-    size_t off = 0;
+    struct stat st;
+    if (stat(p("undo.dat").c_str(), &st) != 0) { setErr(e, ErrCode::CORRUPT, "undo.dat missing but undoSize=" + std::to_string(m.undoSize)); return false; }
+    uint64_t off = 0;
+    const uint8_t magic[8] = {'I','N','N','U','N','D','O','1'};
     while (off < m.undoSize) {
-        UndoRecord r;
-        if (!UndoRecord::decode(bytes.data(), bytes.size(), &off, &r, e)) return false;
-        undo_.push_back(r);
+        if (off + UNDO_HEADER_SIZE > m.undoSize) { setErr(e, ErrCode::CORRUPT, "undo header crosses committed length"); return false; }
+        std::vector<uint8_t> hdr;
+        if (!csReadRange(p("undo.dat"), off, UNDO_HEADER_SIZE, &hdr, e)) return false;
+        if (memcmp(hdr.data(), magic, 8) != 0) { setErr(e, ErrCode::CORRUPT, "undo magic at offset " + std::to_string(off)); return false; }
+        uint32_t len = 0; for (int i = 0; i < 4; ++i) len |= (uint32_t)hdr[8 + i] << (8 * i);
+        UndoMeta meta;
+        memcpy(meta.blockHash.data(), hdr.data() + 12, 32);
+        uint32_t hh = 0; for (int i = 0; i < 4; ++i) hh |= (uint32_t)hdr[44 + i] << (8 * i); meta.height = (int32_t)hh;
+        if (len < UNDO_HEADER_SIZE || off + len > m.undoSize) { setErr(e, ErrCode::CORRUPT, "undo record length out of range"); return false; }
+        meta.offset = off; meta.len = len;
+        undoIndex_.push_back(meta);
+        off += len;
     }
     if (off != m.undoSize) { setErr(e, ErrCode::CORRUPT, "undo.dat committed length mismatch"); return false; }
     undoCommittedBytes_ = m.undoSize;
@@ -242,6 +297,31 @@ bool CommitStore::tryLoadManifest(const std::string& path, bool* exists, ChainEr
     return true;
 }
 
+bool CommitStore::readAck(bool* present, uint64_t* gen, ChainError* e) {
+    *present = false; *gen = 0;
+    std::vector<uint8_t> b; bool ex = false;
+    if (!csReadFile(p("ACK"), &b, &ex, e)) return false;
+    if (!ex) return true;
+    if (b.size() != ACK_SIZE) { setErr(e, ErrCode::CORRUPT, "ACK size"); return false; }
+    uint32_t crc = 0; for (int i = 0; i < 4; ++i) crc |= (uint32_t)b[8 + i] << (8 * i);
+    if (csCrc32(b.data(), 8) != crc) { setErr(e, ErrCode::CORRUPT, "ACK crc"); return false; }
+    uint64_t g = 0; for (int i = 0; i < 8; ++i) g |= (uint64_t)b[i] << (8 * i);
+    *present = true; *gen = g;
+    return true;
+}
+
+bool CommitStore::writeAck(uint64_t gen, ChainError* e) {
+    std::vector<uint8_t> b(ACK_SIZE, 0);
+    for (int i = 0; i < 8; ++i) b[i] = (uint8_t)((gen >> (8 * i)) & 0xff);
+    uint32_t crc = csCrc32(b.data(), 8);
+    for (int i = 0; i < 4; ++i) b[8 + i] = (uint8_t)((crc >> (8 * i)) & 0xff);
+    const std::string tmp = p("ACK.tmp");
+    if (!csWriteFile(tmp, b.data(), b.size(), ns(InjectStage::AckWrite), ff(InjectStage::AckWrite), e)) return false;
+    if (::rename(tmp.c_str(), p("ACK").c_str()) != 0) { setErr(e, ErrCode::FS, "rename ACK"); return false; }
+    if (!csFsyncDir(dir_, e)) return false;
+    return true;
+}
+
 bool CommitStore::open(const std::string& dir, ChainError* e) {
     clearErr(e);
     if (opened_) { setErr(e, ErrCode::ALREADY_OPEN, dir); return false; }
@@ -252,47 +332,47 @@ bool CommitStore::open(const std::string& dir, ChainError* e) {
     if (lockFd_ < 0) { setErr(e, ErrCode::IO, "open LOCK"); return false; }
     if (::flock(lockFd_, LOCK_EX | LOCK_NB) != 0) { ::close(lockFd_); lockFd_ = -1; setErr(e, ErrCode::LOCKED, "another writer holds LOCK"); return false; }
 
-    // recovery: primary MANIFEST, else MANIFEST.bak, else empty (NOT_PUBLISHED)
+    if (!readAck(&ackPresent_, &ackGen_, e)) { close(); return false; }
+
     ChainError e1; bool pEx = false;
-    if (tryLoadManifest(p("MANIFEST"), &pEx, &e1)) {
-        // loaded primary
-    } else {
-        ChainError e2; bool bEx = false;
-        if (tryLoadManifest(p("MANIFEST.bak"), &bEx, &e2)) {
-            hadRecoveryIssue_ = true;   // recovered to previous committed state
-        } else if (!pEx) {
-            // fresh / never committed -> empty
-            state_ = UtxoState(); undo_.clear(); generation_ = 0; undoCommittedBytes_ = 0; blockHash_ = Hash(); tipHeight_ = -1;
+    bool pOk = tryLoadManifest(p("MANIFEST"), &pEx, &e1);
+    if (pOk) {
+        uint64_t pg = generation_;
+        if (ackPresent_) {
+            if (pg < ackGen_) { close(); setErr(e, ErrCode::CORRUPT, "FAIL-CLOSED: primary generation " + std::to_string(pg) + " is OLDER than acknowledged generation " + std::to_string(ackGen_) + " (rollback of acknowledged state refused)"); return false; }
+            if (pg > ackGen_ + 1) { close(); setErr(e, ErrCode::CORRUPT, "primary generation " + std::to_string(pg) + " ahead of acknowledged generation " + std::to_string(ackGen_)); return false; }
         } else {
-            // primary present but corrupt and no valid previous -> fail closed
-            close(); if (e) *e = e1; return false;
+            if (pg != 0) { close(); setErr(e, ErrCode::CORRUPT, "acknowledgment evidence missing for generation " + std::to_string(pg)); return false; }
+        }
+        // Reconcile ACK to cover a recovered but previously-unacknowledged generation.
+        if (!ackPresent_ || pg > ackGen_) { if (!writeAck(pg, e)) { close(); return false; } ackGen_ = pg; ackPresent_ = true; }
+    } else if (!pEx) {
+        if (ackPresent_ && ackGen_ > 0) { close(); setErr(e, ErrCode::CORRUPT, "acknowledged MANIFEST (gen " + std::to_string(ackGen_) + ") is missing"); return false; }
+        state_ = UtxoState(); undoIndex_.clear(); generation_ = 0; undoCommittedBytes_ = 0; blockHash_ = Hash(); tipHeight_ = -1;
+    } else {
+        // Primary present but unloadable -> classify with the independent ACK evidence.
+        ChainError e2; bool bEx = false;
+        bool bOk = tryLoadManifest(p("MANIFEST.bak"), &bEx, &e2);
+        if (!bOk) { close(); setErr(e, e1.code == ErrCode::OK ? ErrCode::CORRUPT : e1.code, "primary corrupt and no valid backup: " + e1.msg); return false; }
+        uint64_t bg = generation_;
+        if (!ackPresent_) { close(); setErr(e, ErrCode::CORRUPT, "cannot classify corrupt primary: no acknowledgment evidence"); return false; }
+        if (ackGen_ > bg) { close(); setErr(e, ErrCode::CORRUPT, "FAIL-LOUD: acknowledged generation " + std::to_string(ackGen_) + " is corrupt/unloadable; refusing silent rollback to generation " + std::to_string(bg)); return false; }
+        if (ackGen_ < bg) { close(); setErr(e, ErrCode::CORRUPT, "inconsistent acknowledgment(" + std::to_string(ackGen_) + ") vs backup(" + std::to_string(bg) + ") generations"); return false; }
+        // ackGen_ == bg: the corrupt primary was an unacknowledged attempt; the acknowledged
+        // state (== backup) is preserved. Repair MANIFEST to the acknowledged generation.
+        hadRecoveryIssue_ = true;
+        std::vector<uint8_t> bakBytes; bool bkEx = false; ChainError e3;
+        if (csReadFile(p("MANIFEST.bak"), &bakBytes, &bkEx, &e3) && bkEx) {
+            if (!csWriteFile(p("MANIFEST"), bakBytes.data(), bakBytes.size(), false, false, &e3)) { close(); setErr(e, ErrCode::FS, "failed to repair MANIFEST from backup"); return false; }
+            if (!csFsyncDir(dir_, &e3)) { close(); setErr(e, ErrCode::FS, "failed to fsync repair of MANIFEST"); return false; }
         }
     }
 
-    // clean stray staging files
-    ::unlink(p("MANIFEST.tmp").c_str());
-    DIR* d = opendir(dir_.c_str());
-    if (d) { struct dirent* ent; while ((ent = readdir(d)) != NULL) { std::string nm = ent->d_name; if (endsWith(nm, ".tmp")) ::unlink(p(nm).c_str()); } closedir(d); }
+    // Clean staging and GC unreferenced CoW state files left by an interrupted publish.
+    { DIR* d = opendir(dir_.c_str()); if (d) { struct dirent* ent; while ((ent = readdir(d)) != NULL) { std::string nm = ent->d_name; if (endsWith(nm, ".tmp")) ::unlink(p(nm).c_str()); } closedir(d); } }
+    gcStateFiles();
 
-    // GC any unreferenced CoW state files left by an interrupted publish
-    {
-        DIR* d2 = opendir(dir_.c_str());
-        if (d2) {
-            struct dirent* ent;
-            while ((ent = readdir(d2)) != NULL) {
-                std::string nm = ent->d_name;
-                if (nm.rfind("state-", 0) != 0 || !endsWith(nm, ".dat") || endsWith(nm, ".tmp")) continue;
-                std::string num = nm.substr(6, nm.size() > 10 ? nm.size() - 10 : 0);
-                bool numeric = !num.empty();
-                for (char ch : num) if (ch < '0' || ch > '9') numeric = false;
-                if (!numeric) continue;
-                uint64_t g = strtoull(num.c_str(), NULL, 10);
-                if (generation_ == 0 || (g != generation_ && g != generation_ - 1)) ::unlink(p(nm).c_str());
-            }
-            closedir(d2);
-        }
-    }
-
+    needsReopen_ = false;
     opened_ = true;
     return true;
 }
@@ -303,27 +383,44 @@ void CommitStore::crashIf(CrashPoint at) {
 
 bool CommitStore::commitManifest(const Manifest& m, const std::vector<uint8_t>& stateBytes,
                                  const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e) {
+    renamePassed_ = false;
     const std::string stateFinal = p(m.stateName);
     const std::string stateTmp = stateFinal + ".tmp";
 
-    // 1) STAGE state (immutable CoW file) - durable before publication
-    if (!csWriteFile(stateTmp, stateBytes.data(), stateBytes.size(), injectNoSpace_, injectFsyncFail_, e)) return false;
-    // 2) STAGE undo append (durable) - only if there is a delta to record
+    // 1) STAGE state (immutable CoW file)
+    if (!csWriteFile(stateTmp, stateBytes.data(), stateBytes.size(), ns(InjectStage::StateStage), ff(InjectStage::StateStage), e)) return false;
+    // 2) STAGE undo append
     if (undoAppendLen > 0) {
-        if (!csAppendFile(p("undo.dat"), undoAppend, undoAppendLen, injectNoSpace_, injectFsyncFail_, e)) { ::unlink(stateTmp.c_str()); return false; }
+        if (!csAppendFile(p("undo.dat"), undoAppend, undoAppendLen, ns(InjectStage::UndoAppend), ff(InjectStage::UndoAppend), e)) { ::unlink(stateTmp.c_str()); return false; }
     }
-    // 3) STAGE manifest tmp (durable)
+    // 3) STAGE manifest tmp
     std::vector<uint8_t> mb = m.encode();
-    if (!csWriteFile(p("MANIFEST.tmp"), mb.data(), mb.size(), injectNoSpace_, injectFsyncFail_, e)) { ::unlink(stateTmp.c_str()); return false; }
-    // 4) keep the previous committed manifest for recovery fallback
-    { std::vector<uint8_t> cur; bool ex = false; ChainError e2; if (csReadFile(p("MANIFEST"), &cur, &ex, &e2) && ex) { ChainError e3; csWriteFile(p("MANIFEST.bak"), cur.data(), cur.size(), false, false, &e3); } }
-    // 5) move staged state into its final (unreferenced) name
+    if (!csWriteFile(p("MANIFEST.tmp"), mb.data(), mb.size(), ns(InjectStage::ManifestTmp), ff(InjectStage::ManifestTmp), e)) { ::unlink(stateTmp.c_str()); return false; }
+    // 4) ESTABLISH FALLBACK (F02): when a prior MANIFEST exists, durably establish MANIFEST.bak,
+    //    verify it decodes and references an existing state file; abort on any failure.
+    {
+        std::vector<uint8_t> cur; bool curEx = false; ChainError e2;
+        if (!csReadFile(p("MANIFEST"), &cur, &curEx, &e2)) { setErr(e, e2.code, "read prior MANIFEST for backup: " + e2.msg); ::unlink(stateTmp.c_str()); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+        if (curEx) {
+            if (!csWriteFile(p("MANIFEST.bak"), cur.data(), cur.size(), ns(InjectStage::BakWrite), ff(InjectStage::BakWrite), e)) { ::unlink(stateTmp.c_str()); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            std::vector<uint8_t> rb; bool rex = false; ChainError e3;
+            Manifest bman;
+            if (!csReadFile(p("MANIFEST.bak"), &rb, &rex, &e3) || !rex) { setErr(e, ErrCode::FS, "backup not readable after write"); ::unlink(stateTmp.c_str()); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            if (!Manifest::decode(rb.data(), rb.size(), &bman, &e3)) { setErr(e, ErrCode::FS, "backup not decodable after write: " + e3.msg); ::unlink(stateTmp.c_str()); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            struct stat st;
+            if (stat(p(bman.stateName).c_str(), &st) != 0) { setErr(e, ErrCode::FS, "backup references missing state " + bman.stateName); ::unlink(stateTmp.c_str()); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+        }
+    }
+    // 5) move staged state into its final (still unreferenced) name
     if (::rename(stateTmp.c_str(), stateFinal.c_str()) != 0) { setErr(e, ErrCode::FS, "rename state"); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
-    // 6) === VISIBILITY BOUNDARY === rename manifest into place
+    // 6) === VISIBILITY BOUNDARY ===
     crashIf(CrashPoint::BeforeRename);
+    if (inj(InjectStage::PrimaryRename)) { injErr(e, "primary rename"); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
     if (::rename(p("MANIFEST.tmp").c_str(), p("MANIFEST").c_str()) != 0) { setErr(e, ErrCode::FS, "rename MANIFEST"); return false; }
+    renamePassed_ = true;
     crashIf(CrashPoint::AfterRename);
-    // 7) === DURABILITY BOUNDARY === parent-dir fsync
+    // 7) === DURABILITY BOUNDARY ===
+    if (inj(InjectStage::DirFsync)) { injErr(e, "dir fsync"); return false; }
     if (!csFsyncDir(dir_, e)) return false;
     crashIf(CrashPoint::AfterDirSync);
     return true;
@@ -332,6 +429,7 @@ bool CommitStore::commitManifest(const Manifest& m, const std::vector<uint8_t>& 
 bool CommitStore::publish(const Delta& d, const Hash& blockHash, int32_t height, ChainError* e) {
     clearErr(e);
     if (!opened_) { setErr(e, ErrCode::NOT_OPEN, dir_); return false; }
+    if (needsReopen_) { setErr(e, ErrCode::NOT_OPEN, "store requires reopen after a post-rename failure"); return false; }
     uint64_t newGen = generation_ + 1;
     UtxoState newState = state_;
     applyDelta(newState, d);
@@ -343,54 +441,64 @@ bool CommitStore::publish(const Delta& d, const Hash& blockHash, int32_t height,
     m.generation = newGen; m.undoSize = undoCommittedBytes_ + recBytes.size();
     m.stateName = stateNameFor(newGen); m.stateDigest = newState.digest();
     m.blockHash = blockHash; m.tipHeight = height;
-
     std::vector<uint8_t> stateBytes = newState.serialize();
     m.fileHash = sha256(stateBytes);
-    if (!commitManifest(m, stateBytes, recBytes.data(), recBytes.size(), e)) return false;
 
-    // POST: durable commit succeeded -> publish to readers
-    state_ = newState; generation_ = newGen; undo_.push_back(rec);
-    undoCommittedBytes_ = m.undoSize; blockHash_ = blockHash; tipHeight_ = height;
-
-    // GC: keep current + previous generation only
-    DIR* dirp = opendir(dir_.c_str());
-    if (dirp) {
-        struct dirent* ent;
-        while ((ent = readdir(dirp)) != NULL) {
-            std::string nm = ent->d_name;
-            if (nm.rfind("state-", 0) == 0 && endsWith(nm, ".dat") && nm != stateNameFor(generation_) && nm != stateNameFor(generation_ ? generation_ - 1 : 0))
-                ::unlink(p(nm).c_str());
-        }
-        closedir(dirp);
+    if (!commitManifest(m, stateBytes, recBytes.data(), recBytes.size(), e)) {
+        if (renamePassed_) needsReopen_ = true;   // failure after visibility: state on disk may be NEW
+        return false;
     }
+    // === ACKNOWLEDGMENT BOUNDARY === durable ACK after durability
+    if (!writeAck(newGen, e)) { needsReopen_ = true; return false; }
+
+    // POST: publish to readers
+    UndoMeta meta; meta.blockHash = blockHash; meta.height = height;
+    meta.offset = undoCommittedBytes_; meta.len = (uint32_t)recBytes.size();
+    state_ = newState; generation_ = newGen;
+    undoIndex_.push_back(meta); undoCommittedBytes_ = m.undoSize;
+    ackGen_ = newGen; ackPresent_ = true;
+    blockHash_ = blockHash; tipHeight_ = height;
+    gcStateFiles();
     return true;
 }
 
 bool CommitStore::disconnect(const Hash& blockHash, ChainError* e) {
     clearErr(e);
     if (!opened_) { setErr(e, ErrCode::NOT_OPEN, dir_); return false; }
-    if (undo_.empty()) { setErr(e, ErrCode::NOT_FOUND, "no committed undo to disconnect"); return false; }
-    if (undo_.back().blockHash != blockHash) { setErr(e, ErrCode::NOT_FOUND, "only the most recent block can be disconnected"); return false; }
+    if (needsReopen_) { setErr(e, ErrCode::NOT_OPEN, "store requires reopen after a post-rename failure"); return false; }
+    if (undoIndex_.empty()) { setErr(e, ErrCode::NOT_FOUND, "no committed undo to disconnect"); return false; }
+    const UndoMeta meta = undoIndex_.back();
+    if (meta.blockHash != blockHash) { setErr(e, ErrCode::NOT_FOUND, "only the most recent block can be disconnected"); return false; }
 
-    UndoRecord last = undo_.back();
+    std::vector<uint8_t> body;
+    if (!csReadRange(p("undo.dat"), meta.offset, meta.len, &body, e)) return false;
+    size_t off = 0; UndoRecord rec;
+    if (!UndoRecord::decode(body.data(), body.size(), &off, &rec, e)) return false;
+
     UtxoState newState = state_;
-    Delta dd; dd.ops = last.ops;
+    Delta dd; dd.ops = rec.ops;
     revertDelta(newState, dd);
 
     uint64_t newGen = generation_ + 1;
-    uint64_t newUndoSize = undoCommittedBytes_ - last.encLen;
+    uint64_t newUndoSize = undoCommittedBytes_ - meta.len;
 
     Manifest m;
     m.generation = newGen; m.undoSize = newUndoSize;
     m.stateName = stateNameFor(newGen); m.stateDigest = newState.digest();
     m.blockHash = Hash(); m.tipHeight = tipHeight_ - 1;
-
     std::vector<uint8_t> stateBytes = newState.serialize();
     m.fileHash = sha256(stateBytes);
-    if (!commitManifest(m, stateBytes, NULL, 0, e)) return false;  // no undo append; MANIFEST truncates undo
 
-    state_ = newState; generation_ = newGen; undo_.pop_back();
-    undoCommittedBytes_ = newUndoSize; blockHash_ = Hash(); tipHeight_ = m.tipHeight;
+    if (!commitManifest(m, stateBytes, NULL, 0, e)) {
+        if (renamePassed_) needsReopen_ = true;
+        return false;
+    }
+    if (!writeAck(newGen, e)) { needsReopen_ = true; return false; }
+
+    state_ = newState; generation_ = newGen; undoIndex_.pop_back();
+    undoCommittedBytes_ = newUndoSize; ackGen_ = newGen; ackPresent_ = true;
+    blockHash_ = Hash(); tipHeight_ = m.tipHeight;
+    gcStateFiles();
     return true;
 }
 

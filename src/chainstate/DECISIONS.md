@@ -1,53 +1,74 @@
-# Chainstate slice - architecture decision log (Stage 2)
+# Chainstate slice - architecture decision log (Stage 2B)
 
-Scope: isolated prototype proving the core state-transition + durability mechanism.
-No production path is touched. Base: master `05c1b525`. Branch `feat/chainstate-vertical-slice`.
+Scope: isolated prototype proving the core state-transition + durability mechanism, with
+Stage-2A audit remediation F01..F07. No production path is touched. Base: master `05c1b525`.
+Branch `feat/chainstate-vertical-slice` (Stage-2 prototype at `734e8a82`; Stage 2B on top).
 
 ## D-1 Coin representation
 `Coin { value:i64; script:vector<u8>; height:i32; fCoinBase:bool; fCoinStake:bool }`.
 Each field maps to a named legacy consumer (value/script -> spend validation; height ->
 maturity; fCoinBase/fCoinStake -> maturity + PoS). stake modifier is a block/index attribute,
-not a coin field. Chosen as the minimal field set that preserves legacy semantics.
+not a coin field. Minimal field set that preserves legacy semantics.
 
 ## D-2 Ordered normalized delta
 `Op { key; beforePresent; before Coin; afterPresent; after Coin }`, applied in block order.
 Enables exact, order-sensitive reversal (create-then-spend within a block). `revertDelta`
-walks ops in reverse restoring `before` exactly. Sets-of-created/spent (v0.2 concern) are
-rejected because they lose order.
+walks ops in reverse restoring `before` exactly. Create/spent sets are rejected (they lose order).
 
 ## D-3 Canonical state digest
-SHA-256 over a domain tag plus entries in canonical key order. Deterministic and independent
-of in-memory map layout. Used to prove connect->disconnect equality (U2) and restart equality.
+SHA-256 over a domain tag plus entries in canonical key order. Deterministic, independent of
+in-memory map layout. Proves connect->disconnect equality and restart equality.
 
 ## D-4 Single commit pointer + CoW state files
-`MANIFEST` selects exactly one immutable `state-<gen>.dat`. Chosen as the **smallest correct**
-mechanism that never exposes a partially applied change: rather than mutate a visible file in
-place, each commit writes a new immutable file and publishes it by one atomic rename. Rejected:
-in-place mutation (unsafe visibility), full-copy-per-generation with frequent publication
-(quadratic IBD - not needed here, and not the production path).
+`MANIFEST` selects exactly one immutable `state-<gen>.dat`. The **smallest correct** mechanism
+that never exposes a partially applied change: each commit writes a new immutable file and
+publishes by one atomic rename. Rejected: in-place mutation (unsafe visibility), full-copy per
+generation with frequent publication (quadratic - not the production path).
 
-## D-5 Commit protocol / boundaries
-PREPARE (stage state + undo) -> PUBLISH (rename MANIFEST = **visibility**) -> DURABLE (parent-dir
-fsync) -> POST (in-memory publish + GC). All mandatory checks precede the rename. A failed
-staging (ENOSPC, fsync error) aborts before the rename, leaving the published state unchanged.
+## D-5 Commit protocol / boundaries (Stage 2B)
+STAGE (state + undo) -> ESTABLISH BACKUP (F02) -> rename state -> [VISIBILITY] rename MANIFEST
+-> [DURABILITY] parent-dir fsync -> [ACKNOWLEDGMENT] durable ACK -> POST (in-memory publish + GC).
+All mandatory checks precede the rename. A failure before the rename (staging or backup
+establishment) leaves the published state unchanged. A failure *after* the rename (dir fsync or
+ACK) may have published NEW on disk; `publish` returns failure and marks the store
+`needsReopen` so no caller treats it as acknowledged. "Failure after rename" is therefore not
+equivalent to "failure before rename".
 
-## D-6 Crash oracle
-- before MANIFEST rename: deterministically OLD.
-- after rename, before dir fsync: OLD **or** NEW depending on filesystem; asserted non-mixed
-  (recovery resolves one committed generation; never a blend).
-- after dir fsync: deterministically NEW.
-SIGKILL-style process crash is used (`fork` + `_exit` at the barrier); this proves crash
-consistency, NOT power-loss durability beyond the fsync contract.
+## D-6 Crash oracle (Stage 2B, F04)
+- before MANIFEST rename: deterministically OLD (exact digest AND generation asserted).
+- after rename, before dir fsync: OLD **or** NEW; asserted as EXACTLY (gen1,digestOLD) or
+  EXACTLY (gen2,digestNEW) - mixed/other combinations are rejected. Expected OLD and NEW digests
+  are precomputed, not merely `!=`.
+- after dir fsync: deterministically NEW (exact digest AND generation).
+Process crash (`fork` + `_exit` at the barrier) proves crash consistency, NOT power-loss
+durability beyond the fsync contract.
 
-## D-7 Single writer
-Advisory `flock(LOCK_EX|LOCK_NB)` on `LOCK`. A second `open()` on the same directory fails with
-`LOCKED`. No second authoritative storage path exists in the slice.
+## D-7 Single writer (Stage 2B, F07)
+Advisory `flock(LOCK_EX|LOCK_NB)` on `LOCK`. Verified with a real two-process test: a forked child
+holds the lock, the parent cannot acquire it (`LOCKED`), the parent acquires it after the child
+releases it, and the OS releases the lock on abnormal child exit (no explicit unlock).
 
-## D-8 Prototype (non-production) limitations
-- `publish` serializes the **entire** state per commit (O(state) I/O). This is a prototype
-  simplification to keep CoW trivially correct; the production O4 design uses a bounded delta
-  path. T13 is therefore NOT an IBD test.
-- `disconnect` supports only the most recent committed block (single-level). Arbitrary-depth
-  reorg / rebuild / checkpoint seeds are out of scope for Stage 2.
-- Maturity/PoS/BIP30 are modeled minimally (no script/signature verification, no coinstake
-  structure); consensus rules are NOT re-implemented here.
+## D-8 Acknowledgment boundary + fail-loud fallback (Stage 2B, F01)
+A durable `ACK` record (written after the durability fsync) is the independent evidence that
+distinguishes an *acknowledged* committed generation from an *unacknowledged* crash attempt.
+Corruption of an acknowledged generation (state, MANIFEST, referenced files, or undo tail) makes
+`open` FAIL LOUD; the store never silently rolls back to an older tip and never returns success
+with only a warning flag. When the evidence is insufficient to classify, `open` fails closed.
+Backups are established with checked read/write/fsync/rename and verified before publish aborts.
+
+## D-9 Undo memory/retention (Stage 2B, F03)
+In-RAM undo history is reduced to a metadata-only index (bodies read from disk on demand), so RAM
+is a small fixed struct per record rather than full op vectors. Disk `undo.dat` and the index still
+grow with history; bounded retention/reclaim is **NOT** implemented and is recorded as an OPEN,
+mandatory Stage 3 acceptance gate. F03 is not claimed closed while `undo.dat` can grow unbounded.
+
+## D-10 Prototype (non-production) limitations
+- `publish` serializes the **entire** state per commit (O(state) I/O) - a prototype simplification
+  for trivially-correct CoW; production O4 uses a bounded delta path. T13 is NOT an IBD test.
+- `disconnect` supports only the most recent committed block (single-level). Arbitrary-depth reorg
+  / rebuild / checkpoint seeds are out of scope (Stage 3).
+- Reader pinning of generations is not implemented; "no live reader pin invalidated" is NOT
+  APPLICABLE to this prototype and OPEN for Stage 3.
+- Maturity/PoS/BIP30 modeled minimally (no script/signature verification, no coinstake structure);
+  consensus rules are NOT re-implemented here. F08 (coinstake time semantics) remains a documented
+  production-integration requirement.
