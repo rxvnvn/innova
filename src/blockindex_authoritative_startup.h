@@ -129,6 +129,14 @@ void AuthorityReadyResetForTest();
 // Mirrors the existing *ForTest seams; production code never calls these.
 void AuthoritativeActiveHeightFailForTest(int count);
 int AuthoritativeActiveHeightFailCountForTest();
+// ROUND-5 TASK A: test-only failure injection on the BY-HASH active-chain
+// resolver (ResolveAuthoritativeBlockSnapshotR) consumed by the checkpoint
+// resolution memo. When armed, every call reports AUTHORITATIVE_BLOCK_
+// AUTHORITY_FAILURE without touching the authoritative sources, so a caller
+// observes a transient storage hiccup deterministically. count==0 disarms.
+// Production code never calls these.
+void AuthoritativeActiveHashFailForTest(int count);
+int AuthoritativeActiveHashFailCountForTest();
 // Refusal detail of the last publication attempt (diagnostics only).
 std::string AuthorityReadyRefusalDetail();
 std::string AuthorityReadyStateName();

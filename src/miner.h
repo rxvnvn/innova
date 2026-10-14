@@ -74,6 +74,13 @@ bool IsCPUMiningWorkCurrentForTest(const CPUMiningWorkIdentity& identity, bool f
 // R2c.2/S6-repair: call the real production attempt-prep consumer with a
 // test-scoped materialization token (released before return; no pointer
 // escapes to the caller).
+// R7-CPU-NBITS: difficulty source for the mining template (authoritative by-value
+// resolver in V2 mode, legacy helper otherwise; false => fail closed).
+bool ResolveTemplateNextTarget(const CBlockIndex* pindexPrev, bool fProofOfStake,
+                               unsigned int* pBitsOut);
+bool ResolveTemplateNextTargetForTest(const CBlockIndex* pindexPrev, bool fProofOfStake,
+                                      unsigned int* pBitsOut);
+
 bool PrepareCPUMiningAttemptForTest(CBlock* pblock,
                                     const CPUMiningWorkIdentity& workIdentity,
                                     unsigned int nExtraNonce,

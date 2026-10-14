@@ -344,13 +344,24 @@ namespace Checkpoints
     //     sync-checkpoint snapshot for the CURRENT hashSyncCheckpoint epoch
     //     (invalidated when hashSyncCheckpoint itself changes);
     //   * mapDescendantVerdict: per-parent-hash descendant-of-checkpoint
-    //     verdicts, INCLUDING memoized failure (a failed ancestry walk is not
-    //     retried until the epoch changes).
+    //     verdicts (VALID/DEFINITIVE). A failed ancestry walk returns
+    //     fail-closed BEFORE MemoizeDescendantVerdict, so it is deliberately
+    //     NOT memoized and is re-probed on the next attempt (a transient
+    //     authority failure must not be frozen into a verdict).
     // Both structures are only touched under cs_hashSyncCheckpoint. The cache
     // is plausibly bounded per epoch by the candidate frontier; the epoch tag
     // ensures a checkpoint advance cannot ever serve stale verdicts.
     // ---------------------------------------------------------------------
-    static const int CHECKPOINT_ANCESTRY_WALK_DEPTH_BUDGET = 4096;
+    // ROUND-5 TASK B: the ancestry walk is bounded by the START HEIGHT, never
+    // by an arbitrary maximum distance. A block's predecessor sits at height-1
+    // in the same authoritative record stream, so a VALID walk from `start`
+    // down to any target takes at most start.height steps; a step count above
+    // start.height can only come from a corrupt/looping structure. The walk
+    // keeps one snapshot at a time (O(1) auxiliary memory), so it needs no
+    // depth cap to bound memory. The previous fixed budget of 4096 could REJECT
+    // a valid descendant/checkpoint farther than 4096 blocks -- a divergence
+    // from legacy, whose pprev walk was unbounded (source: original legacy
+    // ValidateSyncCheckpoint / CheckSync pprev loops).
 
     struct SyncCheckpointMemoEntry
     {
@@ -371,6 +382,29 @@ namespace Checkpoints
     std::map<uint256, bool> mapDescendantVerdict;
     uint256 g_descendantMemoEpoch; // hashSyncCheckpoint when verdicts were valid
     int g_descendantMemoSteps = 0; // total resolver steps served from the walk (diagnostics)
+
+    // ROUND-5 TASK C: bound the per-epoch descendant-verdict cache. A verdict is
+    // a pure function of (epoch checkpoint, parent hash) and is always
+    // recomputable, so eviction is a PERFORMANCE-only event and can never change
+    // a consensus result. At the cap the map is cleared wholesale (no partial
+    // eviction ordering to reason about): memory is bounded to
+    // CHECKPOINT_DESCENDANT_VERDICT_CAP entries and the recompute cost is at
+    // most one re-probe per cleared verdict. The epoch tag still clears the map
+    // on every hashSyncCheckpoint change, so no stale verdict survives an epoch
+    // change. Worst-case memory: std::map<uint256,bool> node ~= 80-96 B
+    // (32-byte key + bool + RB-tree overhead) => 8192 entries ~= 0.8 MiB.
+    static const size_t CHECKPOINT_DESCENDANT_VERDICT_CAP = 8192;
+    size_t g_descendantVerdictCap = CHECKPOINT_DESCENDANT_VERDICT_CAP; // test-overridable
+
+    // The single insert point for the per-epoch descendant-verdict cache; it
+    // enforces the bounded-memory policy. Called only under cs_hashSyncCheckpoint.
+    void MemoizeDescendantVerdict(const uint256& parentHash, bool verdict)
+    {
+        if (g_descendantVerdictCap != 0 &&
+            mapDescendantVerdict.size() >= g_descendantVerdictCap)
+            mapDescendantVerdict.clear(); // performance-only; verdicts are recomputable
+        mapDescendantVerdict.insert(std::make_pair(parentHash, verdict));
+    }
 
     // Per (checkpoint epoch, best-tip identity) verdict of "the active best
     // chain extends the synchronized checkpoint". Paid once per tip advance
@@ -405,15 +439,25 @@ namespace Checkpoints
     AuthoritativeBlockResolutionResult ResolveSyncCheckpointSnapMemoized(
         BlockIndexSnapshot* out, std::string* err)
     {
-        // A memoized failure is retryable iff it was transient. NOT_FOUND from
-        // the by-hash resolver is definitive absence (a completed authoritative
-        // lookup) and stays cached; AUTHORITY_FAILURE is never cached.
+        // ROUND-5 TASK A: a memoized TRANSIENT failure must NOT be served as a
+        // verdict. The previous implementation returned the cached
+        // AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE from here (resolved=true,
+        // transientFailure=true, syncHeight<0), so after ONE transient resolver
+        // hiccup the SAME checkpoint never re-probed the resolver until
+        // hashSyncCheckpoint changed: a stale fail-closed FREEZE at an unchanged
+        // checkpoint/tip (the audit's sticky-transient defect on the BY-HASH
+        // path). A memoized transient failure is therefore treated as NOT
+        // memoized: the memo is cleared so the block below RETRIES the resolver
+        // on this very call. A DEFINITIVE outcome (FOUND / NOT_ACTIVE, or
+        // NOT_FOUND from a COMPLETED by-hash lookup) is still cached and is never
+        // re-probed; a repeated transient failure fails this call closed again
+        // (and remains retryable).
         if (g_syncCheckpointMemo.resolved &&
             g_syncCheckpointMemo.hashCheckpoint == hashSyncCheckpoint &&
             g_syncCheckpointMemo.syncHeight < 0 &&
             g_syncCheckpointMemo.transientFailure)
         {
-            return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+            g_syncCheckpointMemo = SyncCheckpointMemoEntry(); // force a fresh resolve
         }
         if (!g_syncCheckpointMemo.resolved ||
             g_syncCheckpointMemo.hashCheckpoint != hashSyncCheckpoint)
@@ -485,18 +529,27 @@ namespace Checkpoints
     // unavailable step, exactly like the legacy NULL-pprev exhaustion. On
     // success *out is the ancestry record at targetHeight.
     bool CheckpointAncestorAtHeight(const BlockIndexSnapshot& start, int targetHeight,
-                                    BlockIndexSnapshot* out, std::string* error)
+                                    BlockIndexSnapshot* out, std::string* error,
+                                    bool* pTransientFailure = NULL)
     {
-        // ROUND-3 P2a: depth-bounded ancestry walk. Fail closed on exhaustion.
+        if (pTransientFailure) *pTransientFailure = false;
+        // ROUND-5 TASK B: memory-bounded (one snapshot at a time) and
+        // distance-UNBOUNDED ancestry walk with an INVARIANT guard. Each step
+        // strictly decreases the height by one, so a valid walk can never take
+        // more than start.height steps; a larger count means the persisted
+        // structure is corrupt rather than a legitimate long-distance
+        // checkpoint. Missing / corrupt / transiently-unavailable / inconsistent
+        // steps still fail closed below, exactly as before.
         BlockIndexSnapshot cur = start;
-        int steps = 0;
+        const int64_t maxSteps = (int64_t)start.height;
+        int64_t steps = 0;
         while (cur.height > targetHeight)
         {
-            if (++steps > CHECKPOINT_ANCESTRY_WALK_DEPTH_BUDGET)
+            if (++steps > maxSteps)
             {
-                if (error) *error = "ancestry walk exceeded depth budget " +
-                                    itostr(CHECKPOINT_ANCESTRY_WALK_DEPTH_BUDGET) +
-                                    " from " + start.hash.GetHex();
+                if (error) *error = "ancestry walk exceeded the maximum possible depth " +
+                                    itostr(maxSteps) +
+                                    " from " + start.hash.GetHex() + " (corrupt ancestry)";
                 return false;
             }
             if (!cur.hasParent || cur.height <= 0)
@@ -508,6 +561,16 @@ namespace Checkpoints
             std::string perr;
             const AuthoritativeBlockResolutionResult r =
                 ResolveAuthoritativeBlockSnapshotR(cur.hashPrev, &parent, &perr);
+            if (r == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
+            {
+                // ROUND-6 TASK 3: a TRANSIENT authority/storage failure is not a
+                // verdict about the ancestry; report it so a caller can RETAIN a
+                // pending checkpoint instead of clearing it.
+                if (pTransientFailure) *pTransientFailure = true;
+                if (error) *error = "ancestry step transiently unavailable at " + cur.hash.GetHex() +
+                                    ": " + (perr.empty() ? std::string("(no detail)") : perr);
+                return false;
+            }
             if (r != AUTHORITATIVE_BLOCK_FOUND && r != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
             {
                 if (error) *error = "ancestry step unavailable at " + cur.hash.GetHex() +
@@ -546,27 +609,90 @@ namespace Checkpoints
         (void)tipHash; // tip hash documents the intended (epoch, tip) replay target
     }
 
-    // FIX B: by-value descendant/conflict validation (legacy ValidateSyncCheckpoint).
-    bool ValidateSyncCheckpointByValue(uint256 hashCheckpoint)
+    // ROUND-5 TASK C test seams (production never calls them): observe and
+    // override the bounded descendant-verdict cache so a test can exercise
+    // saturation / eviction / recomputation / epoch invalidation cheaply.
+    void SetCheckpointDescendantVerdictCapForTest(size_t cap)
     {
         LOCK(cs_hashSyncCheckpoint);
+        g_descendantVerdictCap = cap;
+    }
+    size_t GetCheckpointDescendantVerdictCapForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        return g_descendantVerdictCap;
+    }
+    size_t DescendantVerdictCacheSizeForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        return mapDescendantVerdict.size();
+    }
+
+    static int g_pendingValidationTransientFailForTest = 0;
+    void SetPendingValidationTransientFailForTest(int count)
+    {
+        g_pendingValidationTransientFailForTest = (count > 0) ? count : 0;
+    }
+    // ROUND-6 TASK 3: tri-state by-value descendant/conflict validation
+    // (legacy ValidateSyncCheckpoint). A DEFINITIVE verdict (unknown /
+    // conflicting / non-descendant / older) is distinguished from a TRANSIENT
+    // authority/storage failure, so the pending-checkpoint consumer never clears
+    // a known pending checkpoint because of a transient hiccup. The bool wrapper
+    // below preserves the original acceptance semantics for existing callers.
+    SyncCheckpointValidationOutcome ValidateSyncCheckpointDetailed(uint256 hashCheckpoint)
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        // The canonical zero checkpoint is never an index record: legacy did
+        // mapBlockIndex.count(0)==0 -> error -> false, which the pending-checkpoint
+        // consumer treats as DEFINITIVE (clear). Never classify it as transient.
+        if (hashSyncCheckpoint == uint256(0))
+        {
+            error("ValidateSyncCheckpoint: block index missing for current sync-checkpoint %s",
+                  hashSyncCheckpoint.ToString().c_str());
+            return SYNC_CHECKPOINT_DEFINITIVE_REJECT;
+        }
+        if (g_pendingValidationTransientFailForTest > 0)
+        {
+            --g_pendingValidationTransientFailForTest;              // ROUND-6 test seam
+            error("ValidateSyncCheckpoint: transient failure resolving current sync-checkpoint %s",
+                  hashSyncCheckpoint.ToString().c_str());
+            return SYNC_CHECKPOINT_TRANSIENT_FAILURE;
+        }
         // Current synchronized checkpoint (may be a non-resident historical record).
         BlockIndexSnapshot syncSnap;
         std::string syncErr;
         const AuthoritativeBlockResolutionResult syncRes =
             ResolveAuthoritativeBlockSnapshotR(hashSyncCheckpoint, &syncSnap, &syncErr);
-        if (syncRes == AUTHORITATIVE_BLOCK_NOT_FOUND || syncRes == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
-            return error("ValidateSyncCheckpoint: block index missing for current sync-checkpoint %s",
-                         hashSyncCheckpoint.ToString().c_str());
+        if (syncRes == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
+        {
+            error("ValidateSyncCheckpoint: transient failure resolving current sync-checkpoint %s",
+                  hashSyncCheckpoint.ToString().c_str());
+            return SYNC_CHECKPOINT_TRANSIENT_FAILURE;
+        }
+        if (syncRes == AUTHORITATIVE_BLOCK_NOT_FOUND)
+        {
+            error("ValidateSyncCheckpoint: block index missing for current sync-checkpoint %s",
+                  hashSyncCheckpoint.ToString().c_str());
+            return SYNC_CHECKPOINT_DEFINITIVE_REJECT;
+        }
 
         // Received synchronized checkpoint.
         BlockIndexSnapshot recvSnap;
         std::string recvErr;
         const AuthoritativeBlockResolutionResult recvRes =
             ResolveAuthoritativeBlockSnapshotR(hashCheckpoint, &recvSnap, &recvErr);
-        if (recvRes == AUTHORITATIVE_BLOCK_NOT_FOUND || recvRes == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
-            return error("ValidateSyncCheckpoint: block index missing for received sync-checkpoint %s",
-                         hashCheckpoint.ToString().c_str());
+        if (recvRes == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
+        {
+            error("ValidateSyncCheckpoint: transient failure resolving received sync-checkpoint %s",
+                  hashCheckpoint.ToString().c_str());
+            return SYNC_CHECKPOINT_TRANSIENT_FAILURE;
+        }
+        if (recvRes == AUTHORITATIVE_BLOCK_NOT_FOUND)
+        {
+            error("ValidateSyncCheckpoint: block index missing for received sync-checkpoint %s",
+                  hashCheckpoint.ToString().c_str());
+            return SYNC_CHECKPOINT_DEFINITIVE_REJECT;
+        }
 
         if (recvSnap.height <= syncSnap.height)
         {
@@ -575,30 +701,45 @@ namespace Checkpoints
             // current checkpoint is a descendant block.
             BlockIndexSnapshot anc;
             std::string aerr;
-            if (!CheckpointAncestorAtHeight(syncSnap, recvSnap.height, &anc, &aerr))
-                return error("ValidateSyncCheckpoint: pprev null - block index structure failure");
+            bool aTransient = false;
+            if (!CheckpointAncestorAtHeight(syncSnap, recvSnap.height, &anc, &aerr, &aTransient))
+            {
+                error("ValidateSyncCheckpoint: pprev null - block index structure failure");
+                return aTransient ? SYNC_CHECKPOINT_TRANSIENT_FAILURE : SYNC_CHECKPOINT_DEFINITIVE_REJECT;
+            }
             if (anc.hash != hashCheckpoint)
             {
                 hashInvalidCheckpoint = hashCheckpoint;
-                return error("ValidateSyncCheckpoint: new sync-checkpoint %s is conflicting with current sync-checkpoint %s",
-                             hashCheckpoint.ToString().c_str(), hashSyncCheckpoint.ToString().c_str());
+                error("ValidateSyncCheckpoint: new sync-checkpoint %s is conflicting with current sync-checkpoint %s",
+                      hashCheckpoint.ToString().c_str(), hashSyncCheckpoint.ToString().c_str());
+                return SYNC_CHECKPOINT_DEFINITIVE_REJECT;
             }
-            return false; // ignore older checkpoint
+            return SYNC_CHECKPOINT_DEFINITIVE_REJECT; // older checkpoint (legacy clears the pending)
         }
 
         // Received checkpoint should be a descendant block of the current
         // checkpoint. Trace back to the same height of current checkpoint.
         BlockIndexSnapshot anc;
         std::string aerr;
-        if (!CheckpointAncestorAtHeight(recvSnap, syncSnap.height, &anc, &aerr))
-            return error("ValidateSyncCheckpoint: pprev2 null - block index structure failure");
+        bool aTransient = false;
+        if (!CheckpointAncestorAtHeight(recvSnap, syncSnap.height, &anc, &aerr, &aTransient))
+        {
+            error("ValidateSyncCheckpoint: pprev2 null - block index structure failure");
+            return aTransient ? SYNC_CHECKPOINT_TRANSIENT_FAILURE : SYNC_CHECKPOINT_DEFINITIVE_REJECT;
+        }
         if (anc.hash != hashSyncCheckpoint)
         {
             hashInvalidCheckpoint = hashCheckpoint;
-            return error("ValidateSyncCheckpoint: new sync-checkpoint %s is not a descendant of current sync-checkpoint %s",
-                         hashCheckpoint.ToString().c_str(), hashSyncCheckpoint.ToString().c_str());
+            error("ValidateSyncCheckpoint: new sync-checkpoint %s is not a descendant of current sync-checkpoint %s",
+                  hashCheckpoint.ToString().c_str(), hashSyncCheckpoint.ToString().c_str());
+            return SYNC_CHECKPOINT_DEFINITIVE_REJECT;
         }
-        return true;
+        return SYNC_CHECKPOINT_VALID;
+    }
+
+    bool ValidateSyncCheckpointByValue(uint256 hashCheckpoint)
+    {
+        return ValidateSyncCheckpointDetailed(hashCheckpoint) == SYNC_CHECKPOINT_VALID;
     }
 
     // FIX B: by-value non-IBD CheckSync (legacy CheckSync else-branch).
@@ -709,7 +850,7 @@ namespace Checkpoints
                 g_bestExtendsMemo.bestTip = hashPrev;
                 g_bestExtendsMemo.fValid = true;
             }
-            mapDescendantVerdict.insert(std::make_pair(hashPrev, g_bestExtendsMemo.bestExtends));
+            MemoizeDescendantVerdict(hashPrev, g_bestExtendsMemo.bestExtends);
             return g_bestExtendsMemo.bestExtends;
         }
 
@@ -751,44 +892,235 @@ namespace Checkpoints
             fDescendant = (anc.height == nSyncHeight && anc.hash == hashSyncCheckpoint);
         }
         // Memoize the verdict (including rejection) for this checkpoint epoch.
-        mapDescendantVerdict.insert(std::make_pair(pindexPrev->GetBlockHash(), fDescendant));
+        MemoizeDescendantVerdict(pindexPrev->GetBlockHash(), fDescendant);
         return fDescendant;
+    }
+
+    // ROUND-6 test seams (production never calls them).
+    static int g_workGateAnchorTransientFailForTest = 0;
+    void SetWorkGateAnchorTransientFailForTest(int count)
+    {
+        g_workGateAnchorTransientFailForTest = (count > 0) ? count : 0;
+    }
+    int WorkGateAnchorTransientFailCountForTest()
+    {
+        return g_workGateAnchorTransientFailForTest;
+    }
+    void SetPendingCheckpointMessageForTest(const uint256& hashCheckpoint)
+    {
+        checkpointMessagePending = CSyncCheckpoint();
+        checkpointMessagePending.hashCheckpoint = hashCheckpoint;
+        checkpointMessagePending.vchMsg.assign(1, 0x42);
+        checkpointMessagePending.vchSig.assign(1, 0x42);
+    }
+    bool PendingCheckpointMessageIsNullForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        return checkpointMessagePending.IsNull();
+    }
+    uint256 PendingCheckpointMessageHashForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        return checkpointMessagePending.hashCheckpoint;
+    }
+    void ClearPendingCheckpointMessageForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        checkpointMessagePending.SetNull();
+    }
+
+    // ROUND-7 TASK 3: bounded memo for RESOLVED work-gate anchors.
+    // The anchor is a pure function of the sync-checkpoint EPOCH
+    // (hashSyncCheckpoint) and the requested proof type: the walk follows
+    // hash-fixed ancestry records (hashPrev links and each record's proof type
+    // are immutable properties of the block hash), so for a given
+    // (epoch, type) the resolved anchor height / nBits / checkpoint time are
+    // immutable facts. ONLY a VALID outcome is ever cached -- a TRANSIENT
+    // authority/storage failure and a definitive ABSENCE are never memoized, so
+    // a storage hiccup can never be frozen into a verdict (the round-5/6 rule).
+    // The epoch is part of the key, so a checkpoint advance can never serve a
+    // stale anchor; the map is additionally cleared when the epoch changes and
+    // capped (CHECKPOINT_WORKGATE_ANCHOR_CAP) so auxiliary memory is constant.
+    // Eviction/invalidation is performance-only and can never change a
+    // consensus outcome.
+    struct WorkGateAnchorMemoKey
+    {
+        uint256 hashCheckpoint;
+        bool fProofOfStake;
+        bool operator<(const WorkGateAnchorMemoKey& o) const
+        {
+            if (hashCheckpoint != o.hashCheckpoint)
+                return hashCheckpoint < o.hashCheckpoint;
+            return (fProofOfStake ? 1 : 0) < (o.fProofOfStake ? 1 : 0);
+        }
+    };
+    struct WorkGateAnchorMemoEntry
+    {
+        int64_t nCheckpointTime;
+        unsigned int nBits;
+        int nHeight;
+        int nAnchorHeight;
+    };
+    static const size_t CHECKPOINT_WORKGATE_ANCHOR_CAP = 16;
+    static std::map<WorkGateAnchorMemoKey, WorkGateAnchorMemoEntry> mapWorkGateAnchorMemo;
+    static uint256 hashWorkGateAnchorMemoEpoch = uint256(0);
+    // ROUND-7 test seams (production never calls them; the counters are
+    // observational only and cannot alter a consensus result).
+    static int g_workGateAnchorResolveCountForTest = 0;
+    // ROUND-7 TASK 1 test seam: lets a test drive CSyncCheckpoint::
+    // ProcessSyncCheckpoint past signature verification (a test cannot
+    // produce a signature for the hard-coded checkpoint keys). DELIBERATELY
+    // inert by default: with the flag clear (production, always) the
+    // original CheckSignature() gate is the first thing the function does.
+    static bool fProcessSyncCheckpointSkipSignatureForTest = false;
+    static int64_t g_workGateAnchorWalkStepsForTest = 0;
+    int GetWorkGateAnchorResolveCountForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        return g_workGateAnchorResolveCountForTest;
+    }
+    int64_t GetWorkGateAnchorWalkStepsForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        return g_workGateAnchorWalkStepsForTest;
+    }
+    void SetProcessSyncCheckpointSkipSignatureForTest(bool f)
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        fProcessSyncCheckpointSkipSignatureForTest = f;
+    }
+    bool ProcessSyncCheckpointSkipSignatureForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        return fProcessSyncCheckpointSkipSignatureForTest;
+    }
+    void ClearWorkGateAnchorMemoForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        mapWorkGateAnchorMemo.clear();
+    }
+    void ResetWorkGateAnchorCountersForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        g_workGateAnchorResolveCountForTest = 0;
+        g_workGateAnchorWalkStepsForTest = 0;
+    }
+    size_t WorkGateAnchorMemoSizeForTest()
+    {
+        LOCK(cs_hashSyncCheckpoint);
+        return mapWorkGateAnchorMemo.size();
     }
 
     // FIX B: by-value anti-spam work-gate anchors (ProcessBlock weak-competitor
     // gate). pnBits is the nBits of the last block of the requested type at or
     // below the sync-checkpoint; pnCheckpointTime is the checkpoint's time.
-    bool GetSyncCheckpointWorkGateByValue(bool fProofOfStake, int64_t* pnCheckpointTime,
-                                          unsigned int* pnBits, int* pnHeight)
+    // ROUND-6 TASKS 1/2: legacy GetLastBlockIndex(pcheckpoint, fProofOfStake)
+    // semantics BY VALUE: walk back until the proof type MATCHES or the walk
+    // reaches genesis (no parent); the anchor may then be genesis even when its
+    // proof type differs -- byte-for-byte the legacy behaviour. There is NO
+    // arbitrary step cutoff: the sole structural bound is the chain height
+    // itself (each step strictly decreases the height by one), so a valid
+    // long-distance anchor can never be rejected, and a block of the WRONG proof
+    // type is never returned as the anchor (the pre-round-6 fixed 10000-step
+    // cutoff did exactly that, silently anchoring a PoS candidate on a PoW
+    // block's nBits -- or vice versa -- past the cutoff).
+    SyncCheckpointWorkGateAnchor GetSyncCheckpointWorkGateAnchor(bool fProofOfStake, int64_t* pnCheckpointTime,
+                                                                 unsigned int* pnBits, int* pnHeight,
+                                                                 int* pnAnchorHeight)
     {
         LOCK(cs_hashSyncCheckpoint);
         if (hashSyncCheckpoint == uint256(0))
-            return false; // no established checkpoint: no anchor (legacy skips too)
+            return SYNC_CHECKPOINT_WORKGATE_ANCHOR_ABSENT; // no established checkpoint (legacy skips too)
+        // ROUND-6 test seam, checked FIRST so an armed seam always forces a
+        // TRANSIENT verdict regardless of any memoized anchor (test-only).
+        if (g_workGateAnchorTransientFailForTest > 0)
+        {
+            --g_workGateAnchorTransientFailForTest;
+            return SYNC_CHECKPOINT_WORKGATE_ANCHOR_TRANSIENT;
+        }
+        // ROUND-7 TASK 3: serve a memoized VALID anchor for this (epoch, type)
+        // instead of repeating the ancestry walk.
+        if (hashWorkGateAnchorMemoEpoch != hashSyncCheckpoint)
+        {
+            mapWorkGateAnchorMemo.clear();
+            hashWorkGateAnchorMemoEpoch = hashSyncCheckpoint;
+        }
+        WorkGateAnchorMemoKey memoKey;
+        memoKey.hashCheckpoint = hashSyncCheckpoint;
+        memoKey.fProofOfStake = fProofOfStake;
+        std::map<WorkGateAnchorMemoKey, WorkGateAnchorMemoEntry>::const_iterator memoIt =
+            mapWorkGateAnchorMemo.find(memoKey);
+        // A TEST-injected authority failure must stay observable even for an
+        // already-memoized epoch; production never arms injections (the count is
+        // always 0), so this guard never changes production behaviour.
+        const bool fMemoUsable = (AuthoritativeActiveHashFailCountForTest() == 0);
+        if (fMemoUsable && memoIt != mapWorkGateAnchorMemo.end())
+        {
+            const WorkGateAnchorMemoEntry& e = memoIt->second;
+            if (pnCheckpointTime) *pnCheckpointTime = e.nCheckpointTime;
+            if (pnBits) *pnBits = e.nBits;
+            if (pnHeight) *pnHeight = e.nHeight;
+            if (pnAnchorHeight) *pnAnchorHeight = e.nAnchorHeight;
+            return SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID;
+        }
+        ++g_workGateAnchorResolveCountForTest;   // ROUND-7 seam: a real (uncached) resolution
         BlockIndexSnapshot snap;
         std::string err;
-        const AuthoritativeBlockResolutionResult r =
+        AuthoritativeBlockResolutionResult r =
             ResolveAuthoritativeBlockSnapshotR(hashSyncCheckpoint, &snap, &err);
+        if (r == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
+            return SYNC_CHECKPOINT_WORKGATE_ANCHOR_TRANSIENT;
         if (r != AUTHORITATIVE_BLOCK_FOUND && r != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
-            return false;
+            return SYNC_CHECKPOINT_WORKGATE_ANCHOR_ABSENT; // legacy: count()==0 -> no anchor
         if (pnCheckpointTime) *pnCheckpointTime = snap.nTime;
         if (pnHeight) *pnHeight = snap.height;
         // Find the last block at or below the checkpoint of the requested type
-        // (mirrors CBlockIndex::GetLastBlockIndex).
+        // (mirrors CBlockIndex::GetLastBlockIndex). The invariant bound below can
+        // never reject a valid anchor: it only detects a corrupt/looping record.
         BlockIndexSnapshot cur = snap;
-        int steps = 0;
-        while (cur.fProofOfStake != fProofOfStake && cur.hasParent && steps < 10000)
+        const int64_t maxSteps = (int64_t)snap.height;
+        int64_t steps = 0;
+        while (cur.fProofOfStake != fProofOfStake && cur.hasParent)
         {
+            if (cur.height <= 0 || ++steps > maxSteps)
+                return SYNC_CHECKPOINT_WORKGATE_ANCHOR_ABSENT; // corrupt ancestry: no valid anchor
             BlockIndexSnapshot parent;
             std::string perr;
             const AuthoritativeBlockResolutionResult pr =
                 ResolveAuthoritativeBlockSnapshotR(cur.hashPrev, &parent, &perr);
+            if (pr == AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE)
+                return SYNC_CHECKPOINT_WORKGATE_ANCHOR_TRANSIENT; // transient: not a verdict
             if (pr != AUTHORITATIVE_BLOCK_FOUND && pr != AUTHORITATIVE_BLOCK_NOT_ACTIVE)
-                return false; // fail closed: no anchor
+                return SYNC_CHECKPOINT_WORKGATE_ANCHOR_ABSENT; // definitive: no valid anchor
+            if (parent.height != cur.height - 1)
+                return SYNC_CHECKPOINT_WORKGATE_ANCHOR_ABSENT; // corrupt ancestry
             cur = parent;
-            ++steps;
         }
         if (pnBits) *pnBits = cur.nBits;
-        return true;
+        if (pnAnchorHeight) *pnAnchorHeight = cur.height;
+        // ROUND-7 TASK 3: cache ONLY this proven-stable VALID outcome. Bounded:
+        // evict wholesale at the cap (performance-only, never consensus).
+        g_workGateAnchorWalkStepsForTest += steps;
+        if (mapWorkGateAnchorMemo.size() >= CHECKPOINT_WORKGATE_ANCHOR_CAP)
+            mapWorkGateAnchorMemo.clear();
+        WorkGateAnchorMemoEntry e;
+        e.nCheckpointTime = snap.nTime;
+        e.nBits = cur.nBits;
+        e.nHeight = snap.height;
+        e.nAnchorHeight = cur.height;
+        mapWorkGateAnchorMemo.insert(std::make_pair(memoKey, e));
+        return SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID;
+    }
+
+    // Back-compatible bool form (true iff a VALID anchor was resolved: the
+    // requested proof type, or the genesis fallback). Retained for callers and
+    // tests; ProcessBlock uses the tri-state form so a transient failure cannot
+    // silently disable the gate.
+    bool GetSyncCheckpointWorkGateByValue(bool fProofOfStake, int64_t* pnCheckpointTime,
+                                          unsigned int* pnBits, int* pnHeight)
+    {
+        return GetSyncCheckpointWorkGateAnchor(fProofOfStake, pnCheckpointTime, pnBits, pnHeight)
+               == SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID;
     }
 
     // ppcoin: only descendant of current sync-checkpoint is allowed
@@ -886,7 +1218,24 @@ namespace Checkpoints
         }
         if (fPendingKnown)
         {
-            if (!ValidateSyncCheckpoint(hashPendingCheckpoint))
+            // ROUND-6 TASK 3: distinguish a TRANSIENT authority/storage failure
+            // from a definitive verdict. On a transient failure the pending
+            // checkpoint AND its pending message are RETAINED, so a later attempt
+            // can still accept, persist and relay it; only a definitive
+            // unknown / invalid / conflicting / older verdict clears them (legacy
+            // parity for every state the legacy resident index could represent).
+            SyncCheckpointValidationOutcome pendingVerdict = SYNC_CHECKPOINT_VALID;
+            if (g_fAuthoritativeStartup)
+                pendingVerdict = ValidateSyncCheckpointDetailed(hashPendingCheckpoint);
+            else if (!ValidateSyncCheckpoint(hashPendingCheckpoint))
+                pendingVerdict = SYNC_CHECKPOINT_DEFINITIVE_REJECT;
+            if (pendingVerdict == SYNC_CHECKPOINT_TRANSIENT_FAILURE)
+            {
+                printf("AcceptPendingSyncCheckpoint: transient authority failure validating pending sync-checkpoint %s; kept pending\n",
+                       hashPendingCheckpoint.ToString().c_str());
+                return false;
+            }
+            if (pendingVerdict != SYNC_CHECKPOINT_VALID)
             {
                 hashPendingCheckpoint = 0;
                 checkpointMessagePending.SetNull();
@@ -1205,8 +1554,14 @@ bool CSyncCheckpoint::CheckSignature()
 // ppcoin: process synchronized checkpoint
 bool CSyncCheckpoint::ProcessSyncCheckpoint(CNode* pfrom)
 {
-    if (!CheckSignature())
-        return false;
+    // ROUND-7 TASK 1: the test seam is checked ONLY to bypass signature
+    // verification for a test; when the flag is clear (production, always) the
+    // original gate below is byte-for-byte in force.
+    if (!Checkpoints::ProcessSyncCheckpointSkipSignatureForTest())
+    {
+        if (!CheckSignature())
+            return false;
+    }
 
     LOCK(Checkpoints::cs_hashSyncCheckpoint);
     // V2-R3 (ROUND-2 P1): RESTORED legacy "known" semantics under
@@ -1250,8 +1605,47 @@ bool CSyncCheckpoint::ProcessSyncCheckpoint(CNode* pfrom)
         return false;
     };
 
-    if (!Checkpoints::ValidateSyncCheckpoint(hashCheckpoint))
+    // ROUND-7 TASK 1: a KNOWN incoming checkpoint whose validation fails
+    // TRANSIENTLY (authoritative storage/authority unavailable) must NOT lose the
+    // incoming message. Legacy could not represent this state (its block index
+    // was resident), so the message was simply dropped and recovery of storage
+    // did not guarantee a retry. Retain the incoming message as PENDING exactly
+    // as the UNKNOWN branch above does, so the next processing opportunity --
+    // AcceptPendingSyncCheckpoint(), driven from AcceptBlock -- retries it. A
+    // DEFINITIVE verdict (invalid / conflicting / older) keeps legacy behaviour
+    // and records nothing. An already-pending DIFFERENT candidate is never
+    // overwritten (do not silently replace a more appropriate pending
+    // checkpoint), and no queue is added: the pending state stays a single
+    // (hash, message) pair. Nothing is promoted, persisted or relayed here.
+    if (g_fAuthoritativeStartup)
+    {
+        const Checkpoints::SyncCheckpointValidationOutcome recvVerdict =
+            Checkpoints::ValidateSyncCheckpointDetailed(hashCheckpoint);
+        if (recvVerdict == Checkpoints::SYNC_CHECKPOINT_TRANSIENT_FAILURE)
+        {
+            if (Checkpoints::hashPendingCheckpoint == uint256(0) ||
+                Checkpoints::hashPendingCheckpoint == hashCheckpoint)
+            {
+                Checkpoints::hashPendingCheckpoint = hashCheckpoint;
+                Checkpoints::checkpointMessagePending = *this;
+                printf("ProcessSyncCheckpoint: transient validation failure for known sync-checkpoint %s; kept pending\n",
+                       hashCheckpoint.ToString().c_str());
+            }
+            else
+            {
+                printf("ProcessSyncCheckpoint: transient validation failure for known sync-checkpoint %s; a different pending checkpoint %s is retained\n",
+                       hashCheckpoint.ToString().c_str(),
+                       Checkpoints::hashPendingCheckpoint.ToString().c_str());
+            }
+            return false;
+        }
+        if (recvVerdict != Checkpoints::SYNC_CHECKPOINT_VALID)
+            return false;                       // definitive: legacy consume-and-drop
+    }
+    else if (!Checkpoints::ValidateSyncCheckpoint(hashCheckpoint))
+    {
         return false;
+    }
 
     if (!g_fAuthoritativeStartup)
     {

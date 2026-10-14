@@ -9615,6 +9615,7 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     // kept verbatim for non-authoritative (legacy) mode.
     CBlockIndex* pcheckpoint = g_fAuthoritativeStartup ? NULL : Checkpoints::GetLastSyncCheckpoint();
     bool fCheckpointWorkGate = false;
+    bool fWorkGateAnchorTransient = false;
     int64_t nWorkGateTime = 0;
     unsigned int nWorkGateBits = 0;
     int nWorkGateHeight = -1;
@@ -9627,8 +9628,45 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
     }
     else if (g_fAuthoritativeStartup)
     {
-        fCheckpointWorkGate = Checkpoints::GetSyncCheckpointWorkGateByValue(
-            pblock->IsProofOfStake(), &nWorkGateTime, &nWorkGateBits, &nWorkGateHeight);
+        // ROUND-6 TASKS 1/2: tri-state anchor. The anchor walk mirrors the legacy
+        // GetLastBlockIndex semantics (stop on a proof-type match or at genesis)
+        // with NO arbitrary step cutoff, so the anchor is never a block of the
+        // WRONG proof type. A TRANSIENT authority/storage failure is reported
+        // distinctly from a definitive absence and MUST NOT silently disable the
+        // weak-competitor gate (handled fail-closed immediately below).
+        //
+        // ROUND-7 TASK 2: the (potentially long) anchor is resolved ONLY when the
+        // gate can actually apply. Both consumer branches below require
+        // (non-tip parent) AND (not wanted by a pending checkpoint); when either
+        // is false the gate is skipped by definition, so walking the ancestry for
+        // such a block is pure waste. The eligibility predicate is exactly that
+        // condition, so the set of blocks the gate skips is UNCHANGED -- only the
+        // work done for them is removed.
+        const bool fWorkGateApplicable =
+            (pblock->hashPrevBlock != hashBestChain) &&
+            !Checkpoints::WantedByPendingSyncCheckpoint(hash);
+        if (fWorkGateApplicable)
+        {
+            const Checkpoints::SyncCheckpointWorkGateAnchor anchor =
+                Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                    pblock->IsProofOfStake(), &nWorkGateTime, &nWorkGateBits, &nWorkGateHeight);
+            fCheckpointWorkGate = (anchor == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+            fWorkGateAnchorTransient = (anchor == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_TRANSIENT);
+        }
+    }
+    if (fWorkGateAnchorTransient && pblock->hashPrevBlock != hashBestChain && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
+    {
+        // ROUND-6 TASK 2: the checkpoint anchor could not be resolved because of a
+        // TRANSIENT authority/storage failure. Do NOT silently bypass the
+        // weak-competitor protection: fail closed (no misbehaving penalty, no
+        // invalidation) so the block is re-evaluated once the authoritative
+        // anchor resolves again. A DEFINITIVE absence (no checkpoint / unknown
+        // record) still skips the gate exactly as legacy does, and a tip
+        // extension is exempt (this branch requires a non-tip parent).
+        TraceProcessBlockReject(pfrom, pblock, PBREJECT_WEAK_CHECKPOINT, NULL,
+                                "sync-checkpoint work-gate anchor unavailable (transient authority failure)");
+        ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
+        return error("ProcessBlock() : sync-checkpoint work-gate anchor unavailable (transient authority failure)");
     }
     if (fCheckpointWorkGate && pblock->hashPrevBlock != hashBestChain && !Checkpoints::WantedByPendingSyncCheckpoint(hash))
     {

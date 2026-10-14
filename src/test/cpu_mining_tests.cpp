@@ -5,6 +5,13 @@
 #include "miner.h"
 #include "main.h"
 #include "txdb.h"
+#include "blockindex_authoritative_startup.h"
+#include "blockindex_generation_builder.h"
+#include "blockindex_generation_lifecycle.h"
+#include "blockindex_manager.h"
+#include <boost/filesystem.hpp>
+
+namespace fs = boost::filesystem;
 
 #include <atomic>
 #include <chrono>
@@ -280,6 +287,219 @@ BOOST_AUTO_TEST_CASE(pow_hash_path_is_tribus_and_cn_split_remains_65_percent)
     BOOST_CHECK(block.GetPoWHash() == Tribus(BEGIN(block.nVersion), END(block.nNonce)));
     BOOST_CHECK_EQUAL(GetCollateralnodePayment(1, 25000000), 16250000);
     BOOST_CHECK_EQUAL(25000000 - GetCollateralnodePayment(1, 25000000), 8750000);
+}
+
+BOOST_AUTO_TEST_SUITE_END()
+
+// ---------------------------------------------------------------------------
+// R7-CPU-NBITS regression: the mining TEMPLATE must resolve its difficulty the
+// same way AcceptBlock enforces it.
+//
+// Defect (live, V2 authoritative, 2026-10-14): CreateNewBlock called the legacy
+// GetNextTargetRequired(), which walks pprev POINTERS. On a sparse-hot resident
+// parent (pprev == NULL) that walk collapses and the helper returns the
+// proof-type LIMIT (0x1e0fffff) instead of the retargeted target, so every mined
+// PoW block failed AcceptBlock's `nBits != nComputedBits` check (incorrect-bits)
+// and no local block was ever accepted, while hashing itself worked.
+//
+// Fix: ResolveTemplateNextTarget() resolves BY VALUE through the V2 authority in
+// authoritative mode (fail closed if the authority cannot answer); legacy mode is
+// unchanged. The fixture builds an isolated V2 generation whose PoW ancestors
+// carry nBits = 0x1d00ffff (HARDER than the 0x1e0fffff pow limit, so the retarget
+// cannot clamp to the limit) and passes a hand-built SPARSE-HOT parent
+// (pprev == NULL) — the exact shape that collapses the legacy walk.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_SUITE(cpu_mining_nbits_tests)
+
+namespace
+{
+const unsigned int NB_POW_BITS = 0x1d00ffffu;   // harder than the pow limit
+const unsigned int NB_LIVE_LIMIT_LITERAL = 0x1e0fffffu; // the value logged live
+
+// Loads the LIVE legacy index into a generation source (so every record carries a real
+// nSize computed from the real blk files — the authoritative builder REQUIRES it), then
+// overrides nBits on every non-genesis record so the last same-proof-type (PoW) ancestor
+// is HARDER than the pow limit (0x1d00ffff has exponent 0x1d < 0x1e). With that ancestor
+// the retarget cannot clamp to bnProofOfWorkLimit, so the authoritative answer is provably
+// NOT 0x1e0fffff while the legacy pointer walk still collapses to the limit.
+void NBLoadSourceWithHardAncestors(const fs::path& root, BlockIndexGenerationSource& src,
+                                  unsigned int nHardBits)
+{
+    fs::create_directories(root / "snapshot");
+    { CTxDB db; db.Close(); }
+    const fs::path live = GetDataDir() / "txleveldb";
+    for (fs::directory_iterator it(live), end; it != end; ++it)
+        if (fs::is_regular_file(it->path()))
+            fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &src, &error), error);
+    src.blockDataDir = GetDataDir().string();
+    BOOST_REQUIRE(src.foundBestChain);
+    for (std::size_t k = 0; k < src.records.size(); ++k)
+        if (src.records[k].record.height >= 1)
+            src.records[k].record.nBits = nHardBits;
+}
+
+// Mines and accepts a PoW block onto `prev` (the harness's own shape), so the live index
+// is guaranteed to hold >= 3 PoW records and the authoritative builder can compute a real
+// nSize for each from the blk files. Returns the accepted index or NULL.
+CBlockIndex* NBMine(CBlockIndex* prev, unsigned int extra)
+{
+    CBlock* b = CreateNewBlock(pwalletMain, false, NULL, NULL);
+    BOOST_REQUIRE(b != NULL);
+    BOOST_REQUIRE(!b->vtx.empty() && !b->vtx[0].vout.empty());
+    b->nVersion = 1;
+    b->nTime = std::max((unsigned int)GetTime(), (unsigned int)(prev->GetMedianTimePast() + 1));
+    b->hashPrevBlock = *prev->phashBlock;
+    b->vtx[0].vin[0].scriptSig = CScript() << (prev->nHeight + 1) << extra;
+    b->vtx[0].vout[0].scriptPubKey = CScript() << OP_TRUE;
+    b->hashMerkleRoot = b->BuildMerkleTree();
+    const uint256 target = CBigNum().SetCompact(b->nBits).getuint256();
+    while (b->GetHash() > target && b->nNonce < 0xffffffff) ++b->nNonce;
+    CBlockIndex* idx = NULL;
+    bool ok = false;
+    {
+        LOCK(cs_main);
+        const uint256 h = b->GetHash();
+        const bool c = b->CheckBlock(true, true, true);
+        const bool p = c && ProcessBlock(NULL, b);
+        if (p) { ok = true; idx = mapBlockIndex[h]; }
+    }
+    delete b;
+    BOOST_REQUIRE_MESSAGE(ok, "fixture block not accepted by ProcessBlock");
+    BOOST_REQUIRE(idx != NULL);
+    return idx;
+}
+
+// Counts records of one proof type (nFlags has no BLOCK_PROOF_OF_STAKE bit => PoW).
+int NBCountByProofType(const BlockIndexGenerationSource& src, bool fProofOfStake)
+{
+    int n = 0;
+    for (std::size_t k = 0; k < src.records.size(); ++k)
+    {
+        const bool isPos = (src.records[k].record.nFlags & 1u) != 0;
+        if (isPos == fProofOfStake) ++n;
+    }
+    return n;
+}
+
+} // namespace
+
+// The template difficulty resolver must return the AUTHORITATIVE required bits.
+BOOST_AUTO_TEST_CASE(template_nbits_uses_authoritative_resolver_on_sparse_hot_parent)
+{
+    const std::map<uint256, CBlockIndex*> savedMapBlockIndex = mapBlockIndex;
+    const std::map<uint256, CandidateTipRecord> savedCandidateTips = mapCandidateTips;
+    const std::set<std::pair<COutPoint, unsigned int> > savedStakeSeen = setStakeSeen;
+    CBlockIndex* savedBest = pindexBest;
+    CBlockIndex* savedGenesis = pindexGenesisBlock;
+    uint256 savedBestChain = hashBestChain;
+    int savedBestHeight = nBestHeight;
+    uint256 savedBestTrust = nBestChainTrust;
+    const bool savedAuth = g_fAuthoritativeStartup;
+
+    // Chain-anchored mock clock so this case is position-independent (an earlier suite may
+    // have left the shared chain future-stamped); RAII restores the process default.
+    struct NBMockTime
+    {
+        NBMockTime() { SetMockTime((int64_t)pindexBest->GetBlockTime() + 60); }
+        ~NBMockTime() { SetMockTime(0); }
+    } nbMockTime;
+
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("nb-%%%%-%%%%");
+    fs::create_directories(root);
+    std::string error;
+
+    // Guarantee >= 3 PoW records (genesis + 2 ancestors) so the retarget branch runs and the
+    // result is not the "first/second block" limit short-circuit.
+    while (pindexBest->nHeight < 6)
+        NBMine(pindexBest, 0xB7u + (unsigned)pindexBest->nHeight);
+
+    BlockIndexGenerationSource src;
+    NBLoadSourceWithHardAncestors(root, src, NB_POW_BITS);
+    const int nPowRecords = NBCountByProofType(src, false);
+    const int nPosRecords = NBCountByProofType(src, true);
+    BOOST_TEST_MESSAGE("NB fixture: records=" << src.records.size() << " pow=" << nPowRecords
+                       << " pos=" << nPosRecords << " tipHeight=" << pindexBest->nHeight);
+    BOOST_REQUIRE_MESSAGE(nPowRecords >= 3,
+        "fixture needs >= 3 PoW records (genesis + 2 ancestors) so the retarget branch runs");
+    const uint256 tipHash = src.hashBestChain;
+    int nTipHeight = 0;
+    for (std::size_t k = 0; k < src.records.size(); ++k)
+        if (src.records[k].hash == tipHash) nTipHeight = src.records[k].record.height;
+
+    BlockIndexGenerationBuilder builder;
+    BOOST_REQUIRE_MESSAGE(builder.Build(src, (root / "blockindex-build-000001.tmp").string(),
+                                        1, NULL, &error), error);
+    builder.Close();
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error),
+                        BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error),
+                        BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
+    BOOST_REQUIRE(g_fAuthoritativeStartup);
+    BOOST_REQUIRE(GetAuthoritativeLiveAuthority() != NULL);
+
+    // Hand-built SPARSE-HOT parent: pprev == NULL (the shape that collapses the legacy walk).
+    CBlockIndex sparse;
+    sparse.phashBlock = &tipHash;
+    sparse.pprev = NULL;
+    sparse.nHeight = nTipHeight;
+    sparse.nBits = NB_POW_BITS;
+    sparse.nTime = 0;
+    sparse.nFlags = 0;
+
+    // (1) the fixture really requires a NON-limit target
+    unsigned int acceptBits = 0;
+    std::string rerr;
+    BOOST_REQUIRE_MESSAGE(ResolveNextTargetRequiredByValue(tipHash, false, &acceptBits, &rerr), rerr);
+    BOOST_CHECK_MESSAGE(acceptBits != bnProofOfWorkLimit.GetCompact(),
+        "fixture must require a non-limit target: got 0x" << std::hex << acceptBits);
+    BOOST_CHECK_MESSAGE(acceptBits != NB_LIVE_LIMIT_LITERAL,
+        "fixture required bits must not equal the live defect value 0x1e0fffff: got 0x"
+        << std::hex << acceptBits);
+
+    // (2) the PRODUCTION template resolver must agree with the accept side
+    unsigned int tplBits = 0;
+    BOOST_REQUIRE_MESSAGE(ResolveTemplateNextTargetForTest(&sparse, false, &tplBits),
+        "authoritative template resolution must succeed");
+    BOOST_CHECK_MESSAGE(tplBits == acceptBits,
+        "template nBits (0x" << std::hex << tplBits << ") must equal the accept-side required bits (0x"
+        << acceptBits << ") or AcceptBlock rejects with incorrect-bits");
+    BOOST_CHECK_MESSAGE(tplBits != NB_LIVE_LIMIT_LITERAL,
+        "template nBits must NOT be the pow limit 0x1e0fffff (the live defect signature)");
+    BOOST_CHECK_MESSAGE(tplBits != bnProofOfWorkLimit.GetCompact(),
+        "template nBits must not be the pow limit");
+
+    ResetBlockIndexAuthoritativeStartupForTest();
+    mapBlockIndex = savedMapBlockIndex;
+    mapCandidateTips = savedCandidateTips;
+    setStakeSeen = savedStakeSeen;
+    pindexBest = savedBest;
+    pindexGenesisBlock = savedGenesis;
+    hashBestChain = savedBestChain;
+    nBestHeight = savedBestHeight;
+    nBestChainTrust = savedBestTrust;
+    g_fAuthoritativeStartup = savedAuth;
+    fs::remove_all(root);
+}
+
+// Documents the DEFECT MECHANISM: with the legacy pointer-walking helper and a
+// sparse-hot parent, the result IS the pow limit — the live 0x1e0fffff signature.
+BOOST_AUTO_TEST_CASE(legacy_pointer_path_yields_pow_limit_on_sparse_hot_parent)
+{
+    uint256 tipHash = uint256(13);
+    CBlockIndex sparse;
+    sparse.phashBlock = &tipHash;
+    sparse.pprev = NULL;          // sparse-hot resident parent
+    sparse.nHeight = 12;
+    sparse.nBits = NB_POW_BITS;   // even a harder ancestor cannot help the pointer walk
+    const unsigned int legacyBits = GetNextTargetRequired(&sparse, false);
+    BOOST_CHECK_MESSAGE(legacyBits == bnProofOfWorkLimit.GetCompact(),
+        "legacy walk on a pprev==NULL parent must collapse to the pow limit: got 0x"
+        << std::hex << legacyBits);
+    BOOST_CHECK_MESSAGE(legacyBits != NB_POW_BITS,
+        "legacy walk must NOT find the harder ancestor (that is the defect)");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

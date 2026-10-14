@@ -507,6 +507,12 @@ bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out)
 // production startup never arms it (0 = production behavior).
 static int g_activeHeightFailInjectionsForTest = 0;
 
+// ROUND-5 TASK A: test-only injection counter for the BY-HASH active-chain
+// resolver (ResolveAuthoritativeBlockSnapshotR) consumed by the checkpoint
+// resolution memo (checkpoints.cpp g_syncCheckpointMemo). Test seam only; the
+// production startup never arms it (0 = production behavior).
+static int g_activeHashFailInjectionsForTest = 0;
+
 // ROUND-4 P2: typed by-HEIGHT lookup. Distinguishes a DEFINITIVE miss (both
 // authoritative sources completed and answered) from a TRANSIENT authority
 // failure, so a caller's memo (checkpoints.cpp CheckSyncByValue) can retry the
@@ -622,6 +628,15 @@ AuthoritativeBlockResolutionResult ResolveAuthoritativeBlockSnapshotR(
     const uint256& hash, BlockIndexSnapshot* out, std::string* error)
 {
     if (error) error->clear();
+    // ROUND-5 TASK A seam: when armed, this call reports a TRANSIENT authority
+    // failure WITHOUT touching the authoritative sources (test only; production
+    // never arms it). Mirrors AuthoritativeActiveHeightFailForTest.
+    if (g_activeHashFailInjectionsForTest > 0)
+    {
+        --g_activeHashFailInjectionsForTest;
+        if (error) *error = "test-injected by-hash authority failure";
+        return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
+    }
     if (!out)
         return AUTHORITATIVE_BLOCK_AUTHORITY_FAILURE;
     const ColdHotSeamNavigator* nav = GetBlockIndexStakingNavigator();
@@ -794,6 +809,16 @@ void AuthoritativeActiveHeightFailForTest(int count)
 int AuthoritativeActiveHeightFailCountForTest()
 {
     return g_activeHeightFailInjectionsForTest;
+}
+
+void AuthoritativeActiveHashFailForTest(int count)
+{
+    g_activeHashFailInjectionsForTest = (count > 0) ? count : 0;
+}
+
+int AuthoritativeActiveHashFailCountForTest()
+{
+    return g_activeHashFailInjectionsForTest;
 }
 
 // A.10.1q / Stage1: emit residency for the retained authoritative context,

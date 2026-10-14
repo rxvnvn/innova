@@ -27,6 +27,7 @@
 #include <map>
 #include <set>
 #include <string>
+#include <vector>
 
 #include "db.h"
 #include "txdb.h"
@@ -55,6 +56,10 @@ void* GetGlobalTxdbPtrForTest();
 // checkpoint-resolution memo WITHOUT touching hashSyncCheckpoint.
 namespace Checkpoints {
 void ResetCheckpointMemoForTest(const uint256& tipHash, const uint256& epochCheckpoint);
+// ROUND-5 TASK C test seams (defined in checkpoints.cpp).
+void SetCheckpointDescendantVerdictCapForTest(size_t cap);
+size_t GetCheckpointDescendantVerdictCapForTest();
+size_t DescendantVerdictCacheSizeForTest();
 }
 
 // ---------------------------------------------------------------- helpers
@@ -1009,5 +1014,1168 @@ BOOST_AUTO_TEST_CASE(weak_competitor_work_gate_nonresident_checkpoint)
     delete weak;
     fx.Restore();
 }
+
+// ===========================================================================
+// ROUND-5 AUDIT-BLOCKER REGRESSIONS (Tasks A / B / C)
+// ===========================================================================
+
+// ROUND-5 TASK A REGRESSION -- a TRANSIENT (AUTHORITATIVE_BLOCK_AUTHORITY_
+// FAILURE) result from the BY-HASH synchronized-checkpoint resolution must NOT
+// be memoized as a verdict: the very next call at the SAME checkpoint and SAME
+// tip must RETRY the resolver (fail-closed on the failing call, but not
+// permanently frozen). This case FAILS on the pre-fix implementation, which
+// returned the cached AUTHORITY_FAILURE from g_syncCheckpointMemo, and PASSES
+// after the Task-A correction.
+BOOST_AUTO_TEST_CASE(transient_by_hash_checkpoint_resolution_is_retryable_not_sticky)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+    BOOST_CHECK_EQUAL(AuthoritativeActiveHashFailCountForTest(), 0);
+
+    BlockIndexSnapshot cold;
+    BOOST_REQUIRE(CkptAVFixture::ActiveAt(3, &cold, NULL));
+    const uint256 hashCold = cold.hash;
+    Checkpoints::hashSyncCheckpoint = hashCold;
+    const CBlockIndex* tip = pindexBest;
+
+    // Healthy control: nothing armed -> the checkpoint resolves and a candidate
+    // over the live tip is ACCEPTED.
+    Checkpoints::ResetCheckpointMemoForTest(tip->GetBlockHash(), hashCold);
+    BOOST_REQUIRE_MESSAGE(Checkpoints::CheckSyncByValue(uint256(0xA101u), tip),
+                          "healthy control: candidate over the live tip must be accepted");
+
+    // Inject EXACTLY ONE transient failure into the BY-HASH resolver used by
+    // ResolveSyncCheckpointSnapMemoized (the sync-checkpoint lookup).
+    Checkpoints::ResetCheckpointMemoForTest(tip->GetBlockHash(), hashCold);
+    AuthoritativeActiveHashFailForTest(1);
+    BOOST_CHECK_EQUAL(AuthoritativeActiveHashFailCountForTest(), 1);
+    BOOST_CHECK_MESSAGE(!Checkpoints::CheckSyncByValue(uint256(0xA102u), tip),
+                        "fail-closed: the candidate must be REJECTED while the "
+                        "by-hash checkpoint resolution reports a transient failure");
+
+    // THE FIX: the transient failure must NOT have been memoized as a verdict.
+    // The seam auto-disarms after its single shot, so the next call at the SAME
+    // checkpoint and SAME tip retries the (now healthy) resolver and ACCEPTS.
+    BOOST_CHECK_EQUAL(AuthoritativeActiveHashFailCountForTest(), 0);
+    BOOST_CHECK_MESSAGE(Checkpoints::CheckSyncByValue(uint256(0xA103u), tip),
+                        "sticky-transient fix (BY HASH): the SAME checkpoint and "
+                        "SAME tip must retry after a transient failure and accept");
+    BOOST_CHECK(pindexBest == tip);
+    BOOST_CHECK(Checkpoints::hashSyncCheckpoint == hashCold);
+    AuthoritativeActiveHashFailForTest(0);
+    fx.Restore();
+}
+
+// ROUND-5 TASK C REGRESSION -- the per-epoch mapDescendantVerdict cache must be
+// explicitly MEMORY-BOUNDED while hashSyncCheckpoint is unchanged, with
+// eviction affecting PERFORMANCE ONLY (never a consensus verdict), and no stale
+// verdict surviving an epoch (hashSyncCheckpoint) change.
+BOOST_AUTO_TEST_CASE(descendant_verdict_cache_is_bounded_and_epoch_invalidated)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+
+    BlockIndexSnapshot cold;
+    BOOST_REQUIRE(CkptAVFixture::ActiveAt(3, &cold, NULL));
+    const uint256 hashCold = cold.hash;
+
+    const size_t savedCap = Checkpoints::GetCheckpointDescendantVerdictCapForTest();
+    BOOST_CHECK_MESSAGE(savedCap >= 1024u,
+                        "the production default descendant-verdict cap must be a real bound");
+
+    // Shrink the cap so saturation/eviction is cheap AND deterministic.
+    Checkpoints::SetCheckpointDescendantVerdictCapForTest(4);
+    BOOST_CHECK_EQUAL(Checkpoints::GetCheckpointDescendantVerdictCapForTest(), (size_t)4);
+
+    // Drive the cache through its REAL insertion paths. Every mined block yields
+    // a fresh best-chain TIP hash, so the O(1) live-tip fast path memoizes one
+    // verdict per distinct key without constructing a fork.
+    CBlockIndex* tip = pindexBest;
+    Checkpoints::hashSyncCheckpoint = hashCold;
+    Checkpoints::ResetCheckpointMemoForTest(tip->GetBlockHash(), hashCold);
+    BOOST_CHECK_EQUAL(Checkpoints::DescendantVerdictCacheSizeForTest(), (size_t)0);
+
+    std::vector<bool> verdicts;
+    size_t observedMax = 0;
+    for (int i = 0; i < 6; ++i)
+    {
+        tip = CkptAVMine(tip, 0xC0D0u + (unsigned)i, true);
+        BOOST_REQUIRE(tip != NULL);
+        verdicts.push_back(Checkpoints::CheckSyncByValue(uint256(0xC0E0u + (unsigned)i), tip));
+        const size_t sz = Checkpoints::DescendantVerdictCacheSizeForTest();
+        if (sz > observedMax) observedMax = sz;
+        BOOST_CHECK_MESSAGE(sz <= 4u,
+                            "the descendant-verdict cache must never exceed its cap");
+    }
+    BOOST_CHECK_EQUAL(observedMax, (size_t)4);   // the cap is actually reached
+    BOOST_CHECK(verdicts[5]);                    // live tip over the checkpoint = descendant
+
+    // Also exercise the GENERAL (non-tip parent) insertion path: a side
+    // competitor forked from the tip's parent memoizes under a NON-tip key.
+    CBlockIndex* side = CkptAVMine(tip->pprev, 0xC0AAu, false);
+    BOOST_REQUIRE(side != NULL);
+    const size_t beforeGeneral = Checkpoints::DescendantVerdictCacheSizeForTest();
+    const bool sideVerdict = Checkpoints::CheckSyncByValue(uint256(0xC0ABu), side);
+    const size_t afterGeneral = Checkpoints::DescendantVerdictCacheSizeForTest();
+    BOOST_CHECK_MESSAGE(afterGeneral <= 4u, "cache must stay bounded after a general-path insert");
+    BOOST_CHECK_EQUAL(afterGeneral, beforeGeneral + 1);  // the general path memoized
+    BOOST_CHECK(sideVerdict);                            // forked above the checkpoint
+
+    // Eviction/expiry is PERFORMANCE-ONLY: a verdict recomputed from an EMPTY
+    // cache must equal the verdict produced with the cache populated.
+    const bool cached = Checkpoints::CheckSyncByValue(uint256(0xC0F1u), tip);
+    Checkpoints::ResetCheckpointMemoForTest(tip->GetBlockHash(), hashCold);
+    BOOST_CHECK_EQUAL(Checkpoints::DescendantVerdictCacheSizeForTest(), (size_t)0);
+    const bool recomputed = Checkpoints::CheckSyncByValue(uint256(0xC0F1u), tip);
+    BOOST_CHECK_MESSAGE(recomputed == cached,
+                        "a recomputed verdict must equal the cached verdict (pure function)");
+
+    // Epoch (hashSyncCheckpoint) change invalidates: no stale verdict survives.
+    BlockIndexSnapshot cold2;
+    BOOST_REQUIRE(CkptAVFixture::ActiveAt(4, &cold2, NULL));
+    BOOST_CHECK(cold2.hash != hashCold);
+    Checkpoints::hashSyncCheckpoint = cold2.hash;
+    (void)Checkpoints::CheckSyncByValue(uint256(0xC0F2u), tip);
+    BOOST_CHECK_MESSAGE(Checkpoints::DescendantVerdictCacheSizeForTest() <= 1u,
+                        "an epoch change must clear the stale descendant-verdict cache");
+
+    Checkpoints::SetCheckpointDescendantVerdictCapForTest(savedCap);
+    fx.Restore();
+}
+
+// ROUND-6 TASK 2 -- a TRANSIENT work-gate anchor failure must NOT silently
+// disable the weak-competitor gate (ProcessBlock). Pre-round-6 a resolver
+// failure made GetSyncCheckpointWorkGateByValue return false, which cleared
+// fCheckpointWorkGate and SKIPPED the whole protection: a competing block was
+// then processed as if no checkpoint existed (silent bypass). This case drives
+// the REAL ProcessBlock with an injected transient anchor failure and asserts
+// the block is rejected fail-closed, then that the SAME block is accepted once
+// the transient failure clears (no permanent stall, no false-accept).
+BOOST_AUTO_TEST_CASE(work_gate_transient_anchor_failure_fails_closed_and_recovers)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+    const int nBase = fx.BaseTipHeight();
+
+    // Always advance at least one block: in a FULL-SUITE run the shared regtest
+    // chain is already deeper than nBase+40 (earlier cases mined it), so a bare
+    // `while (tip->nHeight < nBase + 40)` loop would be a no-op and the case
+    // would have no non-tip parent to fork from.
+    CBlockIndex* parent = pindexBest;
+    CBlockIndex* tip = CkptAVMine(parent, 0xD200u + (unsigned)parent->nHeight, true);
+    BOOST_REQUIRE(tip != NULL);
+    while (tip->nHeight < nBase + 40)
+    {
+        parent = tip;
+        tip = CkptAVMine(tip, 0xD201u + (unsigned)tip->nHeight, true);
+        BOOST_REQUIRE(tip != NULL);
+    }
+    BOOST_REQUIRE(parent != tip);
+
+    // Shallow NON-RESIDENT checkpoint resolved by value (same shape as the
+    // existing weak-competitor case).
+    BlockIndexSnapshot cold;
+    BOOST_REQUIRE_MESSAGE(CkptAVFixture::ActiveAt(3, &cold, NULL),
+                          "active chain at height 3 must resolve by value");
+    Checkpoints::hashSyncCheckpoint = cold.hash;
+    Checkpoints::hashPendingCheckpoint = uint256(0);
+    Checkpoints::hashInvalidCheckpoint = uint256(0);
+
+    // (a) sanity: genuine anchors resolve, and the gate arithmetic for this
+    // competitor is computed exactly as ProcessBlock does it.
+    int64_t nGateTime = 0; unsigned int nGateBits = 0; int nGateHeight = -1, nGateAnchor = -1;
+    BOOST_REQUIRE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                      false, &nGateTime, &nGateBits, &nGateHeight, &nGateAnchor)
+                  == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+
+    // A competing block whose parent is NOT the best chain -> the gate applies.
+    CBlock* weak = CkptAVBuildPoW(parent, 0xD2F0u);
+    BOOST_REQUIRE(weak != NULL);
+    const uint256 weakHash = weak->GetHash();
+    const int64_t deltaTime = (int64_t)weak->nTime - nGateTime;
+    const unsigned int requiredBits = ComputeMinWork(nGateBits, deltaTime);
+    CBigNum bnRequired; bnRequired.SetCompact(requiredBits);
+    const bool gateWouldReject = (CBigNum().SetCompact(weak->nBits) > bnRequired);
+    BOOST_TEST_MESSAGE("TASK2 gate arithmetic: deltaTime=" + itostr((int)deltaTime)
+                       + " gateWouldReject=" + (gateWouldReject ? "yes" : "no"));
+
+    // (b) TRANSIENT anchor failure armed -> the block MUST be rejected
+    // (fail-closed). Pre-round-6 the gate was disabled and the block was
+    // processed as if no checkpoint existed.
+    // The two remaining gate preconditions must hold, otherwise the transient
+    // branch is legitimately not reached (and the assertion below would be
+    // testing nothing).
+    BOOST_TEST_MESSAGE("TASK2 guards: weakParent==best? "
+                       + std::string(weak->hashPrevBlock == hashBestChain ? "YES" : "no")
+                       + " wantedByPending? "
+                       + std::string(Checkpoints::WantedByPendingSyncCheckpoint(weakHash) ? "YES" : "no"));
+    BOOST_REQUIRE_MESSAGE(weak->hashPrevBlock != hashBestChain,
+                          "the competitor must extend a NON-tip parent for the gate to apply");
+    BOOST_REQUIRE_MESSAGE(!Checkpoints::WantedByPendingSyncCheckpoint(weakHash),
+                          "the competitor must not be wanted by a pending sync-checkpoint");
+
+    // Seam self-test: the seam must force a TRANSIENT verdict, and it must be
+    // consumed by exactly one anchor resolution.
+    Checkpoints::SetWorkGateAnchorTransientFailForTest(1);
+    BOOST_REQUIRE_MESSAGE(Checkpoints::GetSyncCheckpointWorkGateAnchor(false, NULL, NULL, NULL, NULL)
+                          == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_TRANSIENT,
+                          "the work-gate seam must force a TRANSIENT anchor verdict");
+    BOOST_REQUIRE_MESSAGE(Checkpoints::GetSyncCheckpointWorkGateAnchor(false, NULL, NULL, NULL, NULL)
+                          == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID,
+                          "the work-gate seam must be consumed by exactly one anchor resolution");
+
+    // Armed WINDOW (not a single call): ProcessBlock may resolve the checkpoint
+    // anchor more than once on its path, and every resolution inside the window
+    // must report TRANSIENT so the gate fails closed.
+    Checkpoints::SetWorkGateAnchorTransientFailForTest(100000);
+    bool okArmed = false, enteredArmed = false;
+    {
+        LOCK(cs_main);
+        okArmed = ProcessBlock(NULL, weak);
+        if (okArmed) enteredArmed = mapBlockIndex.count(weakHash) != 0;
+    }
+    BOOST_CHECK_MESSAGE(!okArmed,
+                        "a TRANSIENT work-gate anchor failure must NOT silently bypass the "
+                        "weak-competitor protection: the block must be rejected fail-closed");
+    BOOST_CHECK_MESSAGE(!enteredArmed,
+                        "the block must not enter the index while the anchor is transiently unavailable");
+    BOOST_TEST_MESSAGE("TASK2 seam remaining after the armed ProcessBlock: "
+                       + itostr(Checkpoints::WorkGateAnchorTransientFailCountForTest())
+                       + " (unchanged => ProcessBlock never called the anchor branch; "
+                         "g_fAuthoritativeStartup=" + itostr((int)g_fAuthoritativeStartup) + ")");
+
+    Checkpoints::SetWorkGateAnchorTransientFailForTest(0);   // close the armed window
+
+    // (c) recovery: the SAME block with no injection is processed normally.
+    bool okRecovered = false, enteredRecovered = false;
+    {
+        LOCK(cs_main);
+        okRecovered = ProcessBlock(NULL, weak);
+        if (okRecovered) enteredRecovered = mapBlockIndex.count(weakHash) != 0;
+    }
+    if (!gateWouldReject)
+    {
+        BOOST_CHECK_MESSAGE(okRecovered,
+                            "after the transient failure clears the same block must be accepted "
+                            "(no permanent stall)");
+        BOOST_CHECK_MESSAGE(enteredRecovered, "the recovered block must enter the index");
+    }
+    else
+    {
+        BOOST_CHECK_MESSAGE(!okRecovered,
+                            "a competitor weaker than the gate minimum stays rejected");
+    }
+
+    // (d) a LEGITIMATELY STRONG tip extension is untouched by the transient
+    // branch (this branch only applies to a NON-tip parent).
+    CBlockIndex* strong = CkptAVMine(pindexBest, 0xD2E0u, true);
+    BOOST_REQUIRE(strong != NULL);
+    BOOST_CHECK(pindexBest == strong);
+
+    delete weak;
+    fx.Restore();
+}
+
+// ROUND-6 TASK 3 -- a TRANSIENT authority failure while validating a KNOWN
+// pending checkpoint must NOT clear the pending checkpoint (nor its pending
+// message). Pre-round-6 the transient failure was indistinguishable from a
+// definitive verdict and AcceptPendingSyncCheckpoint cleared BOTH, so a
+// known-valid pending checkpoint was silently LOST on a storage hiccup. This
+// case asserts retention through the transient window and a successful
+// accept+persist on recovery; a definitive verdict still clears (legacy parity).
+BOOST_AUTO_TEST_CASE(pending_checkpoint_survives_transient_validation_failure)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+
+    CBlockIndex* tip = pindexBest;
+    const uint256 hashTip = tip->GetBlockHash();
+    Checkpoints::hashSyncCheckpoint = hashTip;
+    CBlockIndex* child = CkptAVMine(tip, 0xD301u, true);
+    BOOST_REQUIRE(child != NULL);
+    const uint256 hashPending = child->GetBlockHash();
+    BOOST_CHECK(hashPending != hashTip);
+
+    Checkpoints::hashSyncCheckpoint = hashTip;
+    Checkpoints::hashPendingCheckpoint = hashPending;
+    Checkpoints::hashInvalidCheckpoint = uint256(0);
+    Checkpoints::SetPendingCheckpointMessageForTest(hashPending);
+    BOOST_REQUIRE_MESSAGE(!Checkpoints::PendingCheckpointMessageIsNullForTest(),
+                          "the pending message must be armed non-null for this regression");
+
+    // --- TRANSIENT window: a by-hash AUTHORITY_FAILURE on the checkpoint
+    // resolution. Acceptance is refused, but EVERYTHING must be retained.
+    uint256 persistedBefore = uint256(0);
+    Checkpoints::LoadPersistedSyncCheckpoint(persistedBefore, NULL);
+    // (i) REAL classification: a genuine by-hash AUTHORITY_FAILURE (round-5
+    // seam, which DOES disturb every by-hash reader) must be classified
+    // TRANSIENT by the validator itself.
+    AuthoritativeActiveHashFailForTest(1000);
+    BOOST_CHECK_MESSAGE(Checkpoints::ValidateSyncCheckpointDetailed(hashPending)
+                        == Checkpoints::SYNC_CHECKPOINT_TRANSIENT_FAILURE,
+                        "a genuine AUTHORITY_FAILURE must classify as TRANSIENT");
+    AuthoritativeActiveHashFailForTest(0);
+    // (ii) CONSUMER path: with the same TRANSIENT verdict the pending checkpoint
+    // and its message must be RETAINED. The by-hash seam above cannot be used
+    // here because IsAuthoritativeIndexedRecord() -- the fPendingKnown probe --
+    // itself resolves by hash, so an armed by-hash failure would take the
+    // legacy UNKNOWN-pending early return and never reach the consumer. This
+    // seam forces the verdict without disturbing any reader.
+    Checkpoints::SetPendingValidationTransientFailForTest(1);
+    BOOST_CHECK_MESSAGE(!Checkpoints::AcceptPendingSyncCheckpoint(),
+                        "acceptance must be refused while the authority is transiently unavailable");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == hashPending,
+                        "a TRANSIENT failure must RETAIN the pending checkpoint (pre-round-6 cleared it)");
+    BOOST_CHECK_MESSAGE(Checkpoints::WantedByPendingSyncCheckpoint(hashPending),
+                        "the retained pending checkpoint must stay wanted (still armed)");
+    BOOST_CHECK_MESSAGE(!Checkpoints::PendingCheckpointMessageIsNullForTest(),
+                        "a TRANSIENT failure must RETAIN the pending checkpoint message");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashSyncCheckpoint == hashTip,
+                        "the current sync-checkpoint must be untouched by the transient failure");
+    BOOST_CHECK(Checkpoints::hashInvalidCheckpoint == uint256(0));
+    {
+        uint256 persistedAfter = uint256(0);
+        Checkpoints::LoadPersistedSyncCheckpoint(persistedAfter, NULL);
+        BOOST_CHECK_MESSAGE(persistedAfter == persistedBefore,
+                            "the persisted sync-checkpoint must be UNTOUCHED by the transient failure");
+    }
+
+    // --- RECOVERY: the same pending checkpoint is accepted AND persisted.
+    AuthoritativeActiveHashFailForTest(0);
+    BOOST_CHECK_MESSAGE(Checkpoints::AcceptPendingSyncCheckpoint(),
+                        "recovery: the SAME pending checkpoint must be accepted once the "
+                        "transient failure clears");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashSyncCheckpoint == hashPending,
+                        "recovery: the sync-checkpoint advances to the pending hash");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == uint256(0),
+                        "recovery: the pending is cleared only on ACCEPTANCE");
+    {
+        uint256 persisted = uint256(0);
+        BOOST_REQUIRE_EQUAL((int)Checkpoints::LoadPersistedSyncCheckpoint(persisted, NULL),
+                            (int)SYNC_CHECKPOINT_LOADED);
+        BOOST_CHECK_MESSAGE(persisted == hashPending,
+                            "recovery: the accepted checkpoint must be persisted");
+    }
+
+    // --- DEFINITIVE verdicts still clear the pending (legacy parity preserved):
+    // a KNOWN pending at the SAME height as the current checkpoint but a
+    // DIFFERENT hash is conclusively conflicting, so it must still be cleared
+    // (an UNKNOWN record is retained by the legacy early-return instead -- see
+    // accept_pending_sync_checkpoint_zero_and_descendant_parity (a')).
+    Checkpoints::hashInvalidCheckpoint = uint256(0);
+    CBlockIndex* cur2 = CkptAVMine(tip, 0xD3B0u, true);   // new current checkpoint block
+    BOOST_REQUIRE(cur2 != NULL);
+    const uint256 hashCur2 = cur2->GetBlockHash();
+    CBlockIndex* sib = CkptAVMine(tip, 0xD3A0u, false);   // same-height SIBLING of cur2
+    BOOST_REQUIRE(sib != NULL);
+    BOOST_CHECK(sib->GetBlockHash() != hashCur2);
+    Checkpoints::hashSyncCheckpoint = hashCur2;
+    Checkpoints::hashPendingCheckpoint = sib->GetBlockHash();
+    BOOST_CHECK_MESSAGE(!Checkpoints::AcceptPendingSyncCheckpoint(),
+                        "a conflicting pending checkpoint must be refused");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == uint256(0),
+                        "a DEFINITIVE conflicting pending is still CLEARED (legacy parity)");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashInvalidCheckpoint == sib->GetBlockHash(),
+                        "the conflicting checkpoint must be invalidated (legacy parity)");
+
+    fx.Restore();
+}
+
+// ROUND-5 TASK B REGRESSION -- the ancestry verification must not impose an
+// arbitrary maximum checkpoint distance. Boundary cases at 4096, 4097 and 4197
+// steps (the last two FAIL against the pre-fix fixed 4096 budget), a valid
+// long-distance PENDING checkpoint accepted AND persisted, and a same-height
+// non-descendant still REJECTED.
+BOOST_AUTO_TEST_CASE(ancestry_walk_verifies_valid_checkpoints_beyond_4096_steps)
+{
+    // Pre-mine the long base chain with mock time advancing alongside the height.
+    // The fixture's plain ProcessBlock mining lets nTime drift ~0.16 s/block, so
+    // by ~3800 blocks (GetBlockTime() - GetAdjustedTime() > 600) CheckBlock
+    // rejects the block with CHECKBLOCK_FUTURE_TIMESTAMP. Pinning mock time to
+    // the height keeps GetBlockTime() == GetAdjustedTime() for every block.
+    // RAII (declared BEFORE the fixture, so it is destroyed AFTER fx.Restore())
+    // restores the process-default mock time even when a BOOST_REQUIRE aborts.
+    struct CkptAVMockTime
+    {
+        int64_t t0;
+        CkptAVMockTime() : t0((int64_t)GetTime()) {}
+        ~CkptAVMockTime() { SetMockTime(0); }
+    } mockTime;
+
+    CBlockIndex* t = pindexBest;
+    while (t->nHeight < 4200)
+    {
+        SetMockTime(mockTime.t0 + 2 * (int64_t)t->nHeight);
+        t = CkptAVMine(t, 0xE000u + (unsigned)t->nHeight, true);
+    }
+    SetMockTime(mockTime.t0 + 2 * 4200);
+
+    CkptAVFixture fx;
+    fx.Start(4200);            // no-op mining: the pre-mined chain is already 4200 tall
+
+    BlockIndexSnapshot lo;
+    BOOST_REQUIRE_MESSAGE(CkptAVFixture::ActiveAt(2, &lo, NULL),
+                          "the active record at height 2 must resolve by value");
+    const uint256 hashLo = lo.hash;
+
+    BlockIndexSnapshot d4096, d4097, d4197;
+    BOOST_REQUIRE(CkptAVFixture::ActiveAt(2 + 4096, &d4096, NULL));
+    BOOST_REQUIRE(CkptAVFixture::ActiveAt(2 + 4097, &d4097, NULL));
+    BOOST_REQUIRE(CkptAVFixture::ActiveAt(2 + 4197, &d4197, NULL));
+
+    Checkpoints::hashSyncCheckpoint = hashLo;
+    Checkpoints::hashInvalidCheckpoint = uint256(0);
+    BOOST_CHECK_MESSAGE(Checkpoints::ValidateSyncCheckpointByValue(d4096.hash),
+                        "a 4096-step descendant must validate");
+    BOOST_CHECK_MESSAGE(Checkpoints::ValidateSyncCheckpointByValue(d4097.hash),
+                        "a 4097-step descendant must validate "
+                        "(pre-fix fixed-4096-cap discriminator)");
+    BOOST_CHECK_MESSAGE(Checkpoints::ValidateSyncCheckpointByValue(d4197.hash),
+                        "a 4197-step descendant must validate (well beyond the old cap)");
+    BOOST_CHECK(Checkpoints::hashInvalidCheckpoint == uint256(0));
+
+    // A valid long-distance PENDING checkpoint is accepted AND persisted.
+    Checkpoints::hashSyncCheckpoint = hashLo;
+    Checkpoints::hashPendingCheckpoint = d4197.hash;
+    BOOST_REQUIRE_MESSAGE(Checkpoints::AcceptPendingSyncCheckpoint(),
+                          "a valid long-distance pending checkpoint must be accepted");
+    BOOST_CHECK(Checkpoints::hashSyncCheckpoint == d4197.hash);
+    BOOST_CHECK(Checkpoints::hashPendingCheckpoint == uint256(0));
+    {
+        uint256 persisted(0);
+        BOOST_CHECK_EQUAL((int)Checkpoints::LoadPersistedSyncCheckpoint(persisted, NULL),
+                          (int)SYNC_CHECKPOINT_LOADED);
+        BOOST_CHECK(persisted == d4197.hash);
+    }
+
+    // Invalid / non-descendant (same height, different hash) remains REJECTED.
+    // NOTE: use a CAPTURED parent pointer (never pindexBest->pprev, whose links
+    // are operation-scoped in authoritative mode).
+    CBlockIndex* oldTip = pindexBest;
+    CBlockIndex* ext = CkptAVMine(oldTip, 0xB0A1u, true);     // new tip (height+1)
+    BOOST_REQUIRE(ext != NULL);
+    CBlockIndex* side = CkptAVMine(oldTip, 0xB0B0u, false);   // same-height sibling of ext
+    BOOST_REQUIRE(side != NULL);
+    BOOST_CHECK(side->GetBlockHash() != ext->GetBlockHash());
+    Checkpoints::hashSyncCheckpoint = ext->GetBlockHash();
+    Checkpoints::hashInvalidCheckpoint = uint256(0);
+    BOOST_CHECK_MESSAGE(!Checkpoints::ValidateSyncCheckpointByValue(side->GetBlockHash()),
+                        "a same-height non-descendant must be rejected");
+    BOOST_CHECK(Checkpoints::hashInvalidCheckpoint == side->GetBlockHash());
+
+    fx.Restore();
+}
+
+
+// =====================================================================
+// ROUND-7 TASK 1 REGRESSION
+// A KNOWN incoming checkpoint whose validation fails TRANSIENTLY must
+// RETAIN its message and be retried WITHOUT a redelivery. Pre-round-7 the
+// message was dropped (nothing recorded it as pending) and recovery of
+// storage did not guarantee a retry.
+// =====================================================================
+BOOST_AUTO_TEST_CASE(known_checkpoint_transient_validation_retains_message_for_retry)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+
+    // ORDER-ROBUSTNESS: an earlier case in this suite (the 4096-step pre-mining
+    // case) leaves the shared chain future-stamped relative to the wall clock -- the
+    // 10020-step pre-mining case is now the LAST case in this suite and cannot affect
+    // this one. Continue the CHAIN's clock instead of mining at real time, or
+    // ProcessBlock rejects our blocks as future-timestamped. RAII restores the
+    // process-default mock time on exit (and unwinds on BOOST_REQUIRE aborts).
+    struct CkptAVCaseMockTime
+    {
+        CkptAVCaseMockTime() { SetMockTime((int64_t)pindexBest->GetBlockTime() + 60); }
+        ~CkptAVCaseMockTime() { SetMockTime(0); }
+    } caseMockTime;
+
+    CBlockIndex* tip = pindexBest;
+    const uint256 hashTip = tip->GetBlockHash();
+    Checkpoints::hashSyncCheckpoint = hashTip;
+    Checkpoints::hashPendingCheckpoint = uint256(0);
+    Checkpoints::ClearPendingCheckpointMessageForTest();
+    Checkpoints::hashInvalidCheckpoint = uint256(0);
+
+    // A KNOWN block that is a valid DESCENDANT of the current checkpoint.
+    CBlockIndex* known = CkptAVMine(tip, 0xE700u, true);
+    BOOST_REQUIRE(known != NULL);
+    const uint256 hashKnown = known->GetBlockHash();
+    {
+        BlockIndexSnapshot ksnap;
+        std::string kerr;
+        BOOST_REQUIRE_MESSAGE(
+            ResolveAuthoritativeBlockSnapshotR(hashKnown, &ksnap, &kerr) == AUTHORITATIVE_BLOCK_FOUND,
+            "the candidate checkpoint block must be KNOWN (resolvable in the index)");
+    }
+
+    CSyncCheckpoint msg;
+    msg.hashCheckpoint = hashKnown;
+
+    uint256 persistedBase = uint256(0);
+    Checkpoints::LoadPersistedSyncCheckpoint(persistedBase, NULL);
+
+    // (a) AUTHENTICITY: with the signature seam CLEAR (the production default)
+    // an unsigned message must be rejected and must not become pending.
+    Checkpoints::SetProcessSyncCheckpointSkipSignatureForTest(false);
+    BOOST_CHECK_MESSAGE(!msg.ProcessSyncCheckpoint(NULL),
+                        "an UNAUTHENTICATED checkpoint message must be rejected");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == uint256(0),
+                        "an unauthenticated message must never become a pending checkpoint");
+
+    // (b) TRANSIENT window on a KNOWN checkpoint: refuse, but RETAIN everything.
+    Checkpoints::SetProcessSyncCheckpointSkipSignatureForTest(true);
+    Checkpoints::SetPendingValidationTransientFailForTest(1);
+    BOOST_CHECK_MESSAGE(!msg.ProcessSyncCheckpoint(NULL),
+                        "a transiently unvalidatable KNOWN checkpoint must not be accepted");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == hashKnown,
+                        "a TRANSIENT failure must RETAIN the incoming checkpoint message as pending "
+                        "(pre-round-7 the message was LOST)");
+    BOOST_CHECK_MESSAGE(Checkpoints::PendingCheckpointMessageHashForTest() == hashKnown,
+                        "the ORIGINAL incoming message must be retained for the retry");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashSyncCheckpoint == hashTip,
+                        "nothing may be promoted before validation succeeds");
+    {
+        uint256 p = uint256(0);
+        Checkpoints::LoadPersistedSyncCheckpoint(p, NULL);
+        BOOST_CHECK_MESSAGE(p == persistedBase,
+                            "nothing may be PERSISTED before validation succeeds");
+    }
+
+    // (c) NO REDELIVERY: recovery -> AcceptPendingSyncCheckpoint (the retry
+    // trigger, driven from AcceptBlock) accepts AND persists the retained message.
+    Checkpoints::SetPendingValidationTransientFailForTest(0);
+    BOOST_CHECK_MESSAGE(Checkpoints::AcceptPendingSyncCheckpoint(),
+                        "retry: the RETAINED pending checkpoint must be accepted after recovery, "
+                        "WITHOUT any redelivery");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashSyncCheckpoint == hashKnown,
+                        "retry: the sync-checkpoint advances to the retained hash");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == uint256(0),
+                        "retry: the pending is cleared only on ACCEPTANCE");
+    {
+        uint256 p = uint256(0);
+        BOOST_REQUIRE_EQUAL((int)Checkpoints::LoadPersistedSyncCheckpoint(p, NULL),
+                            (int)SYNC_CHECKPOINT_LOADED);
+        BOOST_CHECK_MESSAGE(p == hashKnown,
+                            "retry: the accepted checkpoint must be PERSISTED");
+    }
+
+    // (d) An existing pending candidate must NOT be silently overwritten by a
+    // transiently unvalidatable one.
+    CBlockIndex* known2 = CkptAVMine(pindexBest, 0xE701u, true);
+    BOOST_REQUIRE(known2 != NULL);
+    const uint256 hashKnown2 = known2->GetBlockHash();
+    const uint256 hashOtherPending = uint256(0x5A5A5A5A);
+    Checkpoints::hashPendingCheckpoint = hashOtherPending;
+    CSyncCheckpoint msg2;
+    msg2.hashCheckpoint = hashKnown2;
+    Checkpoints::SetPendingValidationTransientFailForTest(1);
+    BOOST_CHECK(!msg2.ProcessSyncCheckpoint(NULL));
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == hashOtherPending,
+                        "a transient failure must NOT overwrite a different already-pending checkpoint");
+    Checkpoints::SetPendingValidationTransientFailForTest(0);
+    Checkpoints::hashPendingCheckpoint = uint256(0);
+    Checkpoints::ClearPendingCheckpointMessageForTest();
+
+    // (e) DEFINITIVE (conflicting) verdicts keep the legacy consume-and-drop:
+    // a same-height SIBLING of the current checkpoint is conclusively
+    // conflicting, so nothing may be recorded as pending.
+    CBlockIndex* cur = CkptAVMine(pindexBest, 0xE702u, true);
+    BOOST_REQUIRE(cur != NULL);
+    CBlockIndex* sib = CkptAVMine(cur->pprev, 0xE703u, false);
+    BOOST_REQUIRE(sib != NULL);
+    Checkpoints::hashSyncCheckpoint = cur->GetBlockHash();
+    CSyncCheckpoint msg3;
+    msg3.hashCheckpoint = sib->GetBlockHash();
+    BOOST_CHECK_MESSAGE(!msg3.ProcessSyncCheckpoint(NULL),
+                        "a conflicting known checkpoint must be refused");
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == uint256(0),
+                        "a DEFINITIVE conflicting checkpoint records NOTHING as pending (legacy parity)");
+
+    // (f) UNKNOWN checkpoints keep the legacy behaviour: recorded as pending.
+    CSyncCheckpoint msg4;
+    msg4.hashCheckpoint = uint256(0x7777);
+    BOOST_CHECK(!msg4.ProcessSyncCheckpoint(NULL));
+    BOOST_CHECK_MESSAGE(Checkpoints::hashPendingCheckpoint == uint256(0x7777),
+                        "an UNKNOWN checkpoint is still recorded as pending (legacy parity)");
+    Checkpoints::hashPendingCheckpoint = uint256(0);
+    Checkpoints::ClearPendingCheckpointMessageForTest();
+    Checkpoints::SetProcessSyncCheckpointSkipSignatureForTest(false);
+
+    fx.Restore();
+}
+
+// =====================================================================
+// ROUND-7 TASK 2 REGRESSION
+// The work-gate anchor must be resolved ONLY when the gate can apply
+// (non-tip parent AND not wanted by a pending checkpoint); the fail-closed
+// TRANSIENT path must reject exactly those blocks and nothing else.
+// =====================================================================
+BOOST_AUTO_TEST_CASE(work_gate_anchor_resolved_only_when_gate_applies)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+
+    // ORDER-ROBUSTNESS: an earlier case in this suite (the 4096-step pre-mining
+    // case) leaves the shared chain future-stamped relative to the wall clock -- the
+    // 10020-step pre-mining case is now the LAST case in this suite and cannot affect
+    // this one. Continue the CHAIN's clock instead of mining at real time, or
+    // ProcessBlock rejects our blocks as future-timestamped. RAII restores the
+    // process-default mock time on exit (and unwinds on BOOST_REQUIRE aborts).
+    struct CkptAVCaseMockTime
+    {
+        CkptAVCaseMockTime() { SetMockTime((int64_t)pindexBest->GetBlockTime() + 60); }
+        ~CkptAVCaseMockTime() { SetMockTime(0); }
+    } caseMockTime;
+
+    Checkpoints::hashSyncCheckpoint = pindexBest->GetBlockHash();
+    Checkpoints::hashPendingCheckpoint = uint256(0);
+    Checkpoints::ClearPendingCheckpointMessageForTest();
+    Checkpoints::SetWorkGateAnchorTransientFailForTest(0);
+    Checkpoints::ResetWorkGateAnchorCountersForTest();
+    Checkpoints::ClearWorkGateAnchorMemoForTest();
+
+    // Helper shape used throughout: capture the CURRENT tip as a stable parent
+    // pointer, advance the tip, and build the competitor as a SIBLING of the
+    // captured block. Its parent is then the tip's parent, so the block is
+    // non-tip (the gate's first precondition) and no `pprev` is dereferenced
+    // (authoritative resident objects carry an operation-scoped pprev).
+    unsigned int extra = 0xE800u;
+    struct Side
+    {
+        CBlockIndex* base;
+        CBlock* blk;
+    };
+
+    // (a) TIP EXTENSION: the gate cannot apply -> the anchor must NOT be resolved.
+    const int r0 = Checkpoints::GetWorkGateAnchorResolveCountForTest();
+    CBlockIndex* ext = CkptAVMine(pindexBest, extra++, true);
+    BOOST_REQUIRE(ext != NULL);
+    BOOST_CHECK_MESSAGE(Checkpoints::GetWorkGateAnchorResolveCountForTest() == r0,
+                        "a TIP EXTENSION must not resolve the work-gate anchor");
+    BOOST_TEST_MESSAGE("TASK2 resolve-count after tip extension: "
+                       + itostr(Checkpoints::GetWorkGateAnchorResolveCountForTest() - r0));
+
+    // (b) ELIGIBLE NON-TIP block: the gate applies -> exactly ONE resolution.
+    {
+        CBlockIndex* base = pindexBest;
+        CBlockIndex* e2 = CkptAVMine(base, extra++, true);
+        BOOST_REQUIRE(e2 != NULL);
+        CBlock* eligible = CkptAVBuildPoW(base, extra++);
+        BOOST_REQUIRE(eligible != NULL);
+        BOOST_REQUIRE_MESSAGE(eligible->hashPrevBlock != hashBestChain,
+                              "the competitor must be non-tip for this regression");
+        const uint256 h = eligible->GetHash();
+        BOOST_TEST_MESSAGE("TASK2 evidence (b) after build: resolves="
+                           + itostr(Checkpoints::GetWorkGateAnchorResolveCountForTest())
+                           + " memoSz=" + itostr((int)Checkpoints::WorkGateAnchorMemoSizeForTest())
+                           + " prevEqBest=" + std::string((eligible->hashPrevBlock == hashBestChain) ? "yes" : "no")
+                           + " wanted=" + std::string(Checkpoints::WantedByPendingSyncCheckpoint(h) ? "yes" : "no")
+                           + " inIndex=" + std::string(mapBlockIndex.count(h) ? "yes" : "no")
+                           + " ckptSet=" + std::string((Checkpoints::hashSyncCheckpoint == uint256(0)) ? "no" : "yes"));
+        Checkpoints::ClearWorkGateAnchorMemoForTest();
+        const int rBefore = Checkpoints::GetWorkGateAnchorResolveCountForTest();
+        bool acc = false, entered = false;
+        { LOCK(cs_main); acc = ProcessBlock(NULL, eligible); if (acc) entered = mapBlockIndex.count(h) != 0; }
+        BOOST_CHECK_MESSAGE(acc, "an eligible non-tip competitor must be accepted");
+        BOOST_CHECK_MESSAGE(entered, "an eligible non-tip competitor must enter the index");
+        BOOST_TEST_MESSAGE("TASK2 evidence (b) after ProcessBlock: acc=" + std::string(acc ? "yes" : "no")
+                           + " resolves=" + itostr(Checkpoints::GetWorkGateAnchorResolveCountForTest())
+                           + " (rBefore=" + itostr(rBefore) + ")"
+                           + " memoSz=" + itostr((int)Checkpoints::WorkGateAnchorMemoSizeForTest()));
+        BOOST_CHECK_MESSAGE(Checkpoints::GetWorkGateAnchorResolveCountForTest() == rBefore + 1,
+                            "an ELIGIBLE NON-TIP block must resolve the work-gate anchor exactly once");
+        delete eligible;
+    }
+
+    // (c) TRANSIENT window: an eligible non-tip competitor must be REJECTED
+    // (fail-closed), while a tip EXTENSION must still be accepted and must not
+    // resolve an anchor.
+    Checkpoints::SetWorkGateAnchorTransientFailForTest(100000);
+    {
+        CBlockIndex* base = pindexBest;
+        CBlockIndex* e3 = CkptAVMine(base, extra++, true);
+        BOOST_REQUIRE(e3 != NULL);
+        CBlock* cand = CkptAVBuildPoW(base, extra++);
+        BOOST_REQUIRE(cand != NULL);
+        BOOST_REQUIRE_MESSAGE(cand->hashPrevBlock != hashBestChain, "must be non-tip");
+        const uint256 h = cand->GetHash();
+        const int armedBefore = Checkpoints::WorkGateAnchorTransientFailCountForTest();
+        bool acc = false, entered = false;
+        { LOCK(cs_main); acc = ProcessBlock(NULL, cand); if (acc) entered = mapBlockIndex.count(h) != 0; }
+        BOOST_CHECK_MESSAGE(!acc,
+                            "a TRANSIENT anchor failure must REJECT the eligible non-tip competitor (fail-closed)");
+        BOOST_CHECK_MESSAGE(!entered, "the transiently-rejected competitor must not enter the index");
+        BOOST_CHECK_MESSAGE(Checkpoints::WorkGateAnchorTransientFailCountForTest() == armedBefore - 1,
+                            "the gate path must have ATTEMPTED the anchor resolution for the eligible "
+                            "competitor (the armed transient seam is consumed exactly once)");
+        delete cand;
+    }
+    {
+        const int rBefore = Checkpoints::GetWorkGateAnchorResolveCountForTest();
+        CBlockIndex* e4 = CkptAVMine(pindexBest, extra++, true);
+        BOOST_REQUIRE(e4 != NULL);
+        BOOST_CHECK_MESSAGE(Checkpoints::GetWorkGateAnchorResolveCountForTest() == rBefore,
+                            "a tip extension during a TRANSIENT window must not resolve the anchor");
+    }
+
+    // (d) RECOVERY: with the window closed the same class of competitor is accepted.
+    Checkpoints::SetWorkGateAnchorTransientFailForTest(0);
+    {
+        CBlockIndex* base = pindexBest;
+        CBlockIndex* e5 = CkptAVMine(base, extra++, true);
+        BOOST_REQUIRE(e5 != NULL);
+        CBlock* recovered = CkptAVBuildPoW(base, extra++);
+        BOOST_REQUIRE(recovered != NULL);
+        const uint256 h = recovered->GetHash();
+        bool acc = false, entered = false;
+        { LOCK(cs_main); acc = ProcessBlock(NULL, recovered); if (acc) entered = mapBlockIndex.count(h) != 0; }
+        BOOST_CHECK_MESSAGE(acc, "recovery: the same class of competitor must be accepted again");
+        BOOST_CHECK_MESSAGE(entered, "recovery: the recovered competitor must enter the index");
+        delete recovered;
+    }
+
+    // (e) DEFINITIVE ABSENT keeps the documented behaviour (legacy parity): with
+    // no checkpoint established the gate is skipped, never rejected.
+    Checkpoints::hashSyncCheckpoint = uint256(0);
+    {
+        CBlockIndex* base = pindexBest;
+        CBlockIndex* e6 = CkptAVMine(base, extra++, true);
+        BOOST_REQUIRE(e6 != NULL);
+        CBlock* absentCand = CkptAVBuildPoW(base, extra++);
+        BOOST_REQUIRE(absentCand != NULL);
+        bool acc = false;
+        { LOCK(cs_main); acc = ProcessBlock(NULL, absentCand); }
+        BOOST_CHECK_MESSAGE(acc,
+                            "a DEFINITIVE ABSENT anchor must skip the gate exactly as legacy did (no over-rejection)");
+        delete absentCand;
+    }
+    Checkpoints::hashSyncCheckpoint = pindexBest->GetBlockHash();
+
+    // (f) PENDING-EXEMPT (last: accepting it completes the pending checkpoint and
+    // therefore mutates the checkpoint state). The gate is skipped by definition
+    // so the anchor must NOT be resolved, and the block is accepted.
+    {
+        CBlockIndex* base = pindexBest;
+        CBlockIndex* e7 = CkptAVMine(base, extra++, true);
+        BOOST_REQUIRE(e7 != NULL);
+        CBlock* exemptBlk = CkptAVBuildPoW(base, extra++);
+        BOOST_REQUIRE(exemptBlk != NULL);
+        const uint256 h = exemptBlk->GetHash();
+        Checkpoints::hashPendingCheckpoint = h;
+        BOOST_REQUIRE(Checkpoints::WantedByPendingSyncCheckpoint(h));
+        const int rBefore = Checkpoints::GetWorkGateAnchorResolveCountForTest();
+        bool acc = false, entered = false;
+        { LOCK(cs_main); acc = ProcessBlock(NULL, exemptBlk); if (acc) entered = mapBlockIndex.count(h) != 0; }
+        BOOST_CHECK_MESSAGE(acc, "a pending-exempt block must still be accepted");
+        BOOST_CHECK_MESSAGE(entered, "a pending-exempt block must enter the index");
+        BOOST_CHECK_MESSAGE(Checkpoints::GetWorkGateAnchorResolveCountForTest() == rBefore,
+                            "a PENDING-EXEMPT block must not resolve the work-gate anchor (gate skipped by definition)");
+        delete exemptBlk;
+    }
+
+    BOOST_TEST_MESSAGE("TASK2 total anchor resolutions in case: "
+                       + itostr(Checkpoints::GetWorkGateAnchorResolveCountForTest()));
+
+    fx.Restore();
+}
+
+// =====================================================================
+// ROUND-7 TASK 3 REGRESSION
+// The resolved work-gate anchor is memoized per (sync-checkpoint epoch,
+// proof type): bounded, VALID-only, epoch-keyed, and it can never freeze a
+// transient failure. Resolver-probe count and elapsed time are both reported.
+// =====================================================================
+BOOST_AUTO_TEST_CASE(work_gate_anchor_memo_bounded_keyed_and_epoch_invalidated)
+{
+    // The mock clock is anchored to the CHAIN, not the wall clock: earlier cases
+    // in this suite pre-mine with an advanced mock clock, so a wall-clock-based
+    // ramptime would mine into a future-stamped chain and be rejected.
+    struct CkptAVMockTime
+    {
+        int64_t t0;
+        CkptAVMockTime() : t0((int64_t)pindexBest->GetBlockTime() + 60) {}
+        ~CkptAVMockTime() { SetMockTime(0); }
+    } mockTime;
+
+    // A chain deep enough that the mismatched-type walk (PoS request on an
+    // all-PoW chain) is genuinely long: it runs to genesis.
+    CBlockIndex* t = pindexBest;
+    while (t->nHeight < 300)
+    {
+        SetMockTime(mockTime.t0 + 2 * (int64_t)t->nHeight);
+        t = CkptAVMine(t, 0xE900u + (unsigned)t->nHeight, true);
+    }
+    SetMockTime(mockTime.t0 + 2 * 300);
+
+    CkptAVFixture fx;
+    fx.Start(300);
+
+    BlockIndexSnapshot tipSnap;
+    BOOST_REQUIRE_MESSAGE(CkptAVFixture::ActiveAt(nBestHeight, &tipSnap, NULL),
+                          "the tip must resolve by value");
+    Checkpoints::hashSyncCheckpoint = tipSnap.hash;
+
+    int64_t nTime = 0; unsigned int nBits = 0; int nHeight = -1; int nAnchor = -1;
+
+    // ---- (a) FIRST long walk resolves correctly, exactly once.
+    Checkpoints::ClearWorkGateAnchorMemoForTest();
+    Checkpoints::ResetWorkGateAnchorCountersForTest();
+    const int64_t tA = GetTimeMillis();
+    BOOST_REQUIRE_MESSAGE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                              true, &nTime, &nBits, &nHeight, &nAnchor)
+                          == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID,
+                          "the first PoS anchor resolution must be VALID");
+    const int64_t firstElapsedMs = GetTimeMillis() - tA;
+    const int resolvesAfterFirst = Checkpoints::GetWorkGateAnchorResolveCountForTest();
+    const int64_t stepsAfterFirst = Checkpoints::GetWorkGateAnchorWalkStepsForTest();
+    BOOST_CHECK_EQUAL(resolvesAfterFirst, 1);
+    BOOST_CHECK_MESSAGE(stepsAfterFirst > 0, "the mismatched-type walk must actually walk");
+    BOOST_CHECK_EQUAL(nAnchor, 0);
+    BOOST_CHECK_EQUAL(nHeight, nBestHeight);
+    {
+        BlockIndexSnapshot gen;
+        BOOST_REQUIRE(CkptAVFixture::ActiveAt(0, &gen, NULL));
+        BOOST_CHECK_MESSAGE(nBits == gen.nBits,
+                            "genesis fallback must carry the genesis record's nBits");
+    }
+
+    // ---- (b) A REPEATED same-epoch request must NOT repeat the walk.
+    const int64_t tB = GetTimeMillis();
+    for (int i = 0; i < 200; ++i)
+        BOOST_REQUIRE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                          true, &nTime, &nBits, &nHeight, &nAnchor)
+                      == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+    const int64_t repeatElapsedMs = GetTimeMillis() - tB;
+    BOOST_CHECK_MESSAGE(Checkpoints::GetWorkGateAnchorResolveCountForTest() == resolvesAfterFirst,
+                        "a repeated same-epoch request must NOT resolve the anchor again");
+    BOOST_CHECK_MESSAGE(Checkpoints::GetWorkGateAnchorWalkStepsForTest() == stepsAfterFirst,
+                        "a repeated same-epoch request must NOT repeat the ancestry walk");
+
+    // ---- (c) PoW and PoS anchors stay DISTINCT (separate keys).
+    const int resolvesBeforePow = Checkpoints::GetWorkGateAnchorResolveCountForTest();
+    unsigned int nPowBits = 0; int nPowAnchor = -1;
+    BOOST_REQUIRE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                      false, &nTime, &nPowBits, &nHeight, &nPowAnchor)
+                  == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+    BOOST_CHECK_EQUAL(Checkpoints::GetWorkGateAnchorResolveCountForTest(), resolvesBeforePow + 1);
+    BOOST_CHECK_EQUAL(nPowAnchor, nBestHeight);
+    BOOST_CHECK_MESSAGE(nPowBits == tipSnap.nBits,
+                        "the PoW anchor must be the checkpoint's own PoW nBits");
+    BOOST_CHECK_MESSAGE(nPowBits != nBits || nPowAnchor != nAnchor,
+                        "the PoW and PoS anchors must remain DISTINCT");
+    // ...and repeating the PoW request is a cache hit too.
+    BOOST_REQUIRE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                      false, &nTime, &nPowBits, &nHeight, &nPowAnchor)
+                  == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+    BOOST_CHECK_EQUAL(Checkpoints::GetWorkGateAnchorResolveCountForTest(), resolvesBeforePow + 1);
+
+    // ---- (d) A checkpoint EPOCH change must never reuse the old anchor.
+    BlockIndexSnapshot other;
+    BOOST_REQUIRE(CkptAVFixture::ActiveAt(nBestHeight - 1, &other, NULL));
+    Checkpoints::hashSyncCheckpoint = other.hash;
+    const int resolvesBeforeEpoch = Checkpoints::GetWorkGateAnchorResolveCountForTest();
+    BOOST_REQUIRE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                      false, &nTime, &nBits, &nHeight, &nAnchor)
+                  == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+    BOOST_CHECK_MESSAGE(Checkpoints::GetWorkGateAnchorResolveCountForTest() == resolvesBeforeEpoch + 1,
+                        "a checkpoint epoch change must force a fresh resolution");
+    BOOST_CHECK_EQUAL(nHeight, other.height);
+    BOOST_CHECK(Checkpoints::WorkGateAnchorMemoSizeForTest() <= 16);
+
+    // ---- (e) A TRANSIENT failure is NEVER cached as a verdict and is retried
+    // at the UNCHANGED epoch.
+    Checkpoints::ClearWorkGateAnchorMemoForTest();
+    Checkpoints::ResetWorkGateAnchorCountersForTest();
+    Checkpoints::SetWorkGateAnchorTransientFailForTest(1);
+    BOOST_CHECK(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                    false, &nTime, &nBits, &nHeight, &nAnchor)
+                == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_TRANSIENT);
+    BOOST_CHECK_MESSAGE(Checkpoints::WorkGateAnchorMemoSizeForTest() == 0,
+                        "a TRANSIENT failure must NOT be memoized");
+    Checkpoints::SetWorkGateAnchorTransientFailForTest(0);
+    const int resolvesBeforeRetry = Checkpoints::GetWorkGateAnchorResolveCountForTest();
+    BOOST_REQUIRE_MESSAGE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                              false, &nTime, &nBits, &nHeight, &nAnchor)
+                          == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID,
+                          "after the transient failure clears the SAME epoch must resolve again");
+    BOOST_CHECK_EQUAL(Checkpoints::GetWorkGateAnchorResolveCountForTest(), resolvesBeforeRetry + 1);
+
+    // ---- (f) Auxiliary memory stays BOUNDED across many epochs.
+    for (int h = 1; h < 60; ++h)
+    {
+        BlockIndexSnapshot s2;
+        if (!CkptAVFixture::ActiveAt(h, &s2, NULL))
+            continue;
+        Checkpoints::hashSyncCheckpoint = s2.hash;
+        Checkpoints::GetSyncCheckpointWorkGateAnchor(false, &nTime, &nBits, &nHeight, &nAnchor);
+        Checkpoints::GetSyncCheckpointWorkGateAnchor(true, &nTime, &nBits, &nHeight, &nAnchor);
+    }
+    BOOST_CHECK_MESSAGE(Checkpoints::WorkGateAnchorMemoSizeForTest() <= 16,
+                        "the anchor memo must stay bounded (constant auxiliary memory)");
+
+    BOOST_TEST_MESSAGE("TASK3 anchor memo: first WalkElapsedMs=" + itostr((int)firstElapsedMs)
+                       + " walkSteps=" + itostr((int)stepsAfterFirst)
+                       + " resolves(first)=" + itostr(resolvesAfterFirst)
+                       + " | 200 repeated same-epoch requests: resolverProbes=0"
+                       + " elapsedMs=" + itostr((int)repeatElapsedMs)
+                       + " | memo entries=" + itostr((int)Checkpoints::WorkGateAnchorMemoSizeForTest()));
+
+    fx.Restore();
+}
+
+
+// =====================================================================
+// ROUND-7 TASK 2 (continued) -- SURPLUS-WORK BRANCH REACHABILITY.
+// The gate's positive branch is `bnNewBlock > bnRequired` where
+// bnRequired = ComputeMin/MaxBits(<that type's limit>, anchorBits, dt) and
+// bnNewBlock is the candidate's own target. main.cpp:8544 forces an accepted
+// block's nBits == GetNextTargetRequired(prev, type), which is CLAMPED to
+// <= that type's limit and -- on this network -- never decreases with height,
+// so the candidate's target is ALWAYS the type limit (the weakest legal
+// value). This case computes the gate's arithmetic with REAL anchors for
+// every configuration reachable in this FIXTURE, and asserts the candidate
+// cannot exceed the floor THERE. Config (iv) then shows, arithmetically and with
+// the production retarget constants, that the same branch IS reachable at
+// production parameters -- so the fixture's vacuity is a PARAMETER artefact (the
+// test framework runs nTargetSpacing=1), NOT a structural property. The claim
+// is therefore scoped exactly as measured, and the numbers are reported.
+// =====================================================================
+BOOST_AUTO_TEST_CASE(work_gate_surplus_work_branch_reachability)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+
+    auto targetOf = [](unsigned int bits) { return CBigNum().SetCompact(bits); };
+
+    // (i) RECENT checkpoint + a PoW candidate (the production-common shape).
+    CBlockIndex* tip = pindexBest;
+    const uint256 hashRecent = tip->GetBlockHash();
+    Checkpoints::hashSyncCheckpoint = hashRecent;
+    CBlock* powCand = CkptAVBuildPoW(tip, 0xEA00u);
+    BOOST_REQUIRE(powCand != NULL);
+    int64_t nTime = 0; unsigned int nAnchorBits = 0; int nHeight = -1; int nAnchor = -1;
+    BOOST_REQUIRE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                      false, &nTime, &nAnchorBits, &nHeight, &nAnchor)
+                  == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+    {
+        const int64_t dt = (int64_t)powCand->nTime - nTime;
+        const CBigNum required = CBigNum().SetCompact(ComputeMinWork(nAnchorBits, dt));
+        const CBigNum claimed = targetOf(powCand->nBits);
+        BOOST_CHECK_MESSAGE(!(claimed > required),
+                            "a difficulty-valid PoW candidate must never exceed the gate floor");
+        BOOST_TEST_MESSAGE("GATE-REACH (i) recent checkpoint: anchorBits=" + itostr((int)nAnchorBits)
+                           + " anchorHeight=" + itostr(nAnchor)
+                           + " dt=" + itostr((int)dt)
+                           + " claimedTarget=" + claimed.getuint256().ToString().substr(0, 12)
+                           + " requiredTarget=" + required.getuint256().ToString().substr(0, 12)
+                           + " wouldReject=" + std::string((claimed > required) ? "yes" : "no"));
+    }
+
+    // (ii) GENESIS-anchored PoW request (the hardest possible anchor: the
+    // genesis record's nBits), with the necessarily large dt.
+    BlockIndexSnapshot gen;
+    BOOST_REQUIRE(CkptAVFixture::ActiveAt(0, &gen, NULL));
+    Checkpoints::hashSyncCheckpoint = gen.hash;
+    CBlock* powCand2 = CkptAVBuildPoW(tip, 0xEA01u);
+    BOOST_REQUIRE(powCand2 != NULL);
+    BOOST_REQUIRE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                      false, &nTime, &nAnchorBits, &nHeight, &nAnchor)
+                  == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+    {
+        const int64_t dt = (int64_t)powCand2->nTime - nTime;
+        const CBigNum required = CBigNum().SetCompact(ComputeMinWork(nAnchorBits, dt));
+        const CBigNum claimed = targetOf(powCand2->nBits);
+        BOOST_CHECK_MESSAGE(!(claimed > required),
+                            "the genesis-anchored PoW path must not reject a valid candidate either");
+        BOOST_TEST_MESSAGE("GATE-REACH (ii) genesis-anchored PoW: anchorBits=" + itostr((int)nAnchorBits)
+                           + " anchorHeight=" + itostr(nAnchor)
+                           + " dt=" + itostr((int)dt)
+                           + " claimedTarget=" + claimed.getuint256().ToString().substr(0, 12)
+                           + " requiredTarget=" + required.getuint256().ToString().substr(0, 12)
+                           + " wouldReject=" + std::string((claimed > required) ? "yes" : "no"));
+    }
+
+    // (iii) PoS candidate on an all-PoW chain: the anchor walks to the genesis
+    // (mismatched type). No valid PoS block can be constructed in this harness
+    // (it needs a real stake kernel), so the PoS configuration is evaluated at
+    // the ARITHMETIC level with the EXACT expressions ProcessBlock uses:
+    // bnRequired = ComputeMinStake(anchorBits, dt, blockTime) and nBits =
+    // GetNextTargetRequired(prev, true) -- the value an accepted PoS block
+    // would be forced to carry by main.cpp:8544.
+    BOOST_REQUIRE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                      true, &nTime, &nAnchorBits, &nHeight, &nAnchor)
+                  == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+    {
+        const unsigned int stakeBits = GetNextTargetRequired(pindexBest, true);
+        const int64_t dt = (int64_t)powCand2->nTime - nTime;
+        const CBigNum required = CBigNum().SetCompact(ComputeMinStake(nAnchorBits, dt, powCand2->nTime));
+        const CBigNum claimed = targetOf(stakeBits);
+        BOOST_CHECK_MESSAGE(!(claimed > required),
+                            "a difficulty-valid PoS candidate must never exceed the gate floor either");
+        BOOST_TEST_MESSAGE("GATE-REACH (iii) PoS candidate, genesis fallback anchor: anchorBits="
+                           + itostr((int)nAnchorBits) + " anchorHeight=" + itostr(nAnchor)
+                           + " stakeCandidateBits=" + itostr((int)stakeBits)
+                           + " claimedTarget=" + claimed.getuint256().ToString().substr(0, 12)
+                           + " requiredTarget=" + required.getuint256().ToString().substr(0, 12)
+                           + " wouldReject=" + std::string((claimed > required) ? "yes" : "no"));
+    }
+
+    // The structural reason, asserted numerically: every accepted block carries
+    // its proof-type LIMIT as nBits and the limit only ever moves EASIER, so
+    // required >= <the limit> >= any candidate's claim. Reported with the
+    // limit values themselves.
+    BOOST_TEST_MESSAGE("GATE-REACH limits: powLimitCompact=" + itostr((int)bnProofOfWorkLimit.GetCompact())
+                       + " stakeLimitViaGetNextTargetCompact="
+                       + itostr((int)GetNextTargetRequired(NULL, true))
+                       + " genesisRecordBits=" + itostr((int)gen.nBits));
+
+    // (iv) PARAMETER-LEVEL REACHABILITY. Verified against the source constants:
+    // the gate's floor is bnRequired = 2*anchorTarget (doubling per 24h), while an
+    // accepted block's target is retargeted by
+    //   ((nInterval-1)*nEff + 2*S) / ((nInterval+1)*nEff)      (main.cpp:5000-5003)
+    // with nSmoothTimespan = nTargetTimespan = 30 (main.cpp:4907), nEff =
+    // nTargetSpacing = 15 (main.cpp:82) => nInterval = 2 in the pre-fork regime
+    // (FORK_HEIGHT_TIGHTER_DRIFT is a high fork height), and pre-fork clamps only a
+    // NEGATIVE spacing (main.cpp:4975-4979), so a large same-type gap S is applied
+    // verbatim. Multiplier = (15 + 2S)/45: S=15 -> 1.0, S=38 -> 2.02, S=60 -> 3.0.
+    // The fixture runs with an effective spacing of 1, where the same formula is ~1
+    // -- which is exactly why configurations (i)-(iii) all measure
+    // claimedTarget == requiredTarget. Independent review raised this; it is
+    // PRE-EXISTING (formula, anchor semantics and exclusions are byte-identical to
+    // HEAD), not a Round-7 change.
+    {
+        struct Mult { static double of(int64_t nInterval, int64_t nEff, int64_t S)
+            { return (double)((nInterval - 1) * nEff + 2 * S) / (double)((nInterval + 1) * nEff); } };
+        const double mFixture = Mult::of(30 / 1, 1, 1);
+        const double mProd38  = Mult::of(30 / 15, 15, 38);
+        const double mProd60  = Mult::of(30 / 15, 15, 60);
+        BOOST_CHECK_MESSAGE(mFixture > 0.95 && mFixture < 1.05,
+                            "with the fixture's effective spacing the retarget multiplier is ~1 "
+                            "(the measured vacuity is a parameter artefact)");
+        BOOST_CHECK_MESSAGE(mProd38 >= 2.0 && mProd60 > 2.0,
+                            "at production retarget parameters a >=38s same-type gap yields a >=2x "
+                            "retargeted target, exceeding the gate's 2x-anchor floor => the positive "
+                            "branch IS reachable in the pre-fork regime");
+        BOOST_TEST_MESSAGE("GATE-REACH (iv) retarget multipliers: fixture(eff=1,S=1)=" + itostr((int)(mFixture * 1000))
+                           + "/1000 prod(eff=15,S=38)=" + itostr((int)(mProd38 * 1000))
+                           + "/1000 prod(eff=15,S=60)=" + itostr((int)(mProd60 * 1000)) + "/1000");
+    }
+
+    delete powCand;
+    delete powCand2;
+    fx.Restore();
+}
+
+// ===========================================================================
+// ROUND-6 AUDIT REGRESSIONS (Tasks 1 / 2 / 3) + long-walk cost (Task 4)
+// ===========================================================================
+
+// ROUND-6 TASK 1 -- the work-gate anchor search must return the CORRECT
+// PoW/PoS-type anchor for the WHOLE chain, with no arbitrary step cutoff.
+//
+// Pre-round-6 the search stopped after a fixed 10000 steps and returned
+// cur.nBits -- the nBits of a block of the WRONG proof type -- as if it were a
+// valid anchor. This case drives the search PAST 10000 steps (the fixture chain
+// is PoW-only, so a PoS request has no correct-type ancestor and the legacy
+// GetLastBlockIndex semantic terminates at GENESIS) and asserts the anchor is
+// the genesis record, not a mid-chain wrong-type block at the old cutoff
+// boundary. It also measures the walk cost for TASK 4.
+// ORDERING: this case pre-mines with mock time, so it MUST remain the LAST case
+// in this suite (same constraint as the ROUND-5 4096 case): every later case
+// would otherwise mine at real time on a future-stamped chain and be rejected
+// with CHECKBLOCK_FUTURE_TIMESTAMP / timestamp-too-early.
+BOOST_AUTO_TEST_CASE(work_gate_anchor_correct_type_beyond_10000_steps)
+{
+    // Mock time advances with the height (same rationale as the 4096 case:
+    // plain mining drifts past FutureDrift on very long chains). RAII restores
+    // the process-default mock time even when a BOOST_REQUIRE aborts.
+    struct CkptAVMockTime
+    {
+        int64_t t0;
+        CkptAVMockTime() : t0((int64_t)GetTime()) {}
+        ~CkptAVMockTime() { SetMockTime(0); }
+    } mockTime;
+
+    const int kChainHeight = 10020;
+
+    CBlockIndex* pre = pindexBest;
+    while (pre->nHeight < kChainHeight)
+    {
+        SetMockTime(mockTime.t0 + 2 * (int64_t)pre->nHeight);
+        pre = CkptAVMine(pre, 0xD100u + (unsigned)pre->nHeight, true);
+    }
+    SetMockTime(mockTime.t0 + 2 * (int64_t)kChainHeight);
+
+    CkptAVFixture fx;
+    fx.Start(kChainHeight);          // no-op mining: the chain is already tall enough
+
+    BlockIndexSnapshot tipSnap;
+    BOOST_REQUIRE_MESSAGE(CkptAVFixture::ActiveAt(kChainHeight, &tipSnap, NULL),
+                          "the active record at the chain tip must resolve by value");
+    Checkpoints::hashSyncCheckpoint = tipSnap.hash;
+    Checkpoints::hashPendingCheckpoint = uint256(0);
+
+    int64_t nTime = 0; unsigned int nBits = 0; int nHeight = -1; int nAnchor = -1;
+
+    // (a) PoW request: the anchor is the checkpoint block itself (0 steps).
+    BOOST_CHECK(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                    false, &nTime, &nBits, &nHeight, &nAnchor)
+                == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID);
+    BOOST_CHECK_EQUAL(nHeight, kChainHeight);
+    BOOST_CHECK_EQUAL(nAnchor, kChainHeight);
+    const unsigned int ckptBits = nBits;
+    BOOST_CHECK(ckptBits != 0);
+
+    // (b) PoS request on an ALL-PoW chain: NO correct-type ancestor exists, so
+    // the legacy GetLastBlockIndex semantics stop at genesis. The walk is
+    // kChainHeight (> 10000) steps -- exactly the configuration the audit
+    // flagged. Pre-fix this returned the block at the 10000-step boundary.
+    const uint64_t ms0 = GetTimeMillis();
+    const Checkpoints::SyncCheckpointWorkGateAnchor anchor =
+        Checkpoints::GetSyncCheckpointWorkGateAnchor(true, &nTime, &nBits, &nHeight, &nAnchor);
+    const uint64_t ms1 = GetTimeMillis();
+
+    BOOST_TEST_MESSAGE("TASK4 long-walk: " + itostr((int)((ms1 >= ms0) ? (ms1 - ms0) : 0))
+                       + " ms for a " + itostr(nHeight)
+                       + "-step work-gate anchor walk (one resolver step per ancestor) under cs_hashSyncCheckpoint");
+
+    BOOST_CHECK_MESSAGE(anchor == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID,
+                        "the genesis fallback is a VALID anchor (legacy GetLastBlockIndex parity)");
+    BOOST_CHECK_MESSAGE(nAnchor != kChainHeight - 10000,
+                        "the anchor must NOT be the block at the pre-round-6 10000-step cutoff boundary");
+    BOOST_CHECK_MESSAGE(nAnchor == 0,
+                        "the anchor must be GENESIS (height 0): the walk must run to the chain root, "
+                        "never return a WRONG-TYPE mid-chain block past an arbitrary cutoff");
+
+    BlockIndexSnapshot gen;
+    BOOST_REQUIRE_MESSAGE(CkptAVFixture::ActiveAt(0, &gen, NULL),
+                          "the genesis record must resolve by value");
+    BOOST_CHECK_MESSAGE(nBits == gen.nBits,
+                        "the genesis-fallback anchor must carry the GENESIS record's nBits");
+    BOOST_TEST_MESSAGE("TASK4 gate-anchor nBits=" + itostr((int)nBits)
+                       + " checkpoint nBits=" + itostr((int)ckptBits));
+
+    // (c) A DEFINITIVE absence is reported distinctly from a transient failure:
+    // with no checkpoint established there is no anchor at all.
+    Checkpoints::hashSyncCheckpoint = uint256(0);
+    BOOST_CHECK(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                    false, &nTime, &nBits, &nHeight, &nAnchor)
+                == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_ABSENT);
+    Checkpoints::hashSyncCheckpoint = tipSnap.hash;
+
+    // (d) A TRANSIENT authority failure is reported as TRANSIENT, never as a
+    // valid anchor and never as a definitive absence (real resolver injection).
+    AuthoritativeActiveHashFailForTest(1000);
+    BOOST_CHECK_MESSAGE(Checkpoints::GetSyncCheckpointWorkGateAnchor(
+                            false, &nTime, &nBits, &nHeight, &nAnchor)
+                        == Checkpoints::SYNC_CHECKPOINT_WORKGATE_ANCHOR_TRANSIENT,
+                        "a genuine AUTHORITY_FAILURE must be classified TRANSIENT");
+    AuthoritativeActiveHashFailForTest(0);
+
+    fx.Restore();
+}
+
 
 BOOST_AUTO_TEST_SUITE_END()

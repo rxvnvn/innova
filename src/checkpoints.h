@@ -111,6 +111,19 @@ namespace Checkpoints
     // exactly; these are exposed for the deterministic compatibility tests.
     // ---------------------------------------------------------------------
     bool CheckSyncByValue(const uint256& hashBlock, const CBlockIndex* pindexPrev);
+
+    // ROUND-6 TASK 3: tri-state result of by-value synchronized-checkpoint
+    // validation. A TRANSIENT authority/storage failure is NOT a verdict on the
+    // checkpoint: the pending-checkpoint consumer must RETAIN a known pending
+    // checkpoint (and its message) and retry it, instead of clearing it as if it
+    // were definitively unknown / invalid / conflicting / older.
+    enum SyncCheckpointValidationOutcome
+    {
+        SYNC_CHECKPOINT_VALID = 0,
+        SYNC_CHECKPOINT_DEFINITIVE_REJECT,
+        SYNC_CHECKPOINT_TRANSIENT_FAILURE,
+    };
+    SyncCheckpointValidationOutcome ValidateSyncCheckpointDetailed(uint256 hashCheckpoint);
     bool ValidateSyncCheckpointByValue(uint256 hashCheckpoint);
 
     // Test-only memo invalidation seam (ROUND-4 P2; production never calls
@@ -120,6 +133,12 @@ namespace Checkpoints
     // known-EMPTY state. Defined in checkpoints.cpp.
     void ResetCheckpointMemoForTest(const uint256& tipHash, const uint256& epochCheckpoint);
 
+    // ROUND-5 TASK C test seams (production never calls them): observe and
+    // override the bounded per-epoch descendant-verdict cache.
+    void SetCheckpointDescendantVerdictCapForTest(size_t cap);
+    size_t GetCheckpointDescendantVerdictCapForTest();
+    size_t DescendantVerdictCacheSizeForTest();
+
     // FIX B: by-value anti-spam work-gate anchors for the synced checkpoint
     // (the values ProcessBlock's weak-competitor gate previously read through a
     // resident CBlockIndex*). pnBits is the nBits of the last block of the
@@ -127,6 +146,51 @@ namespace Checkpoints
     // checkpoint is established or the anchors cannot be resolved by value.
     bool GetSyncCheckpointWorkGateByValue(bool fProofOfStake, int64_t* pnCheckpointTime,
                                            unsigned int* pnBits, int* pnHeight);
+
+    // ROUND-6 TASKS 1/2: tri-state work-gate anchor search. The walk mirrors the
+    // legacy GetLastBlockIndex semantics (stop on a proof-type match or at the
+    // genesis) with NO arbitrary step cutoff, and reports a DEFINITIVE absence
+    // distinctly from a TRANSIENT authority/storage failure, so ProcessBlock's
+    // weak-competitor gate never silently disables the protection on uncertainty
+    // and never anchors on a block of the WRONG proof type.
+    enum SyncCheckpointWorkGateAnchor
+    {
+        SYNC_CHECKPOINT_WORKGATE_ANCHOR_VALID = 0,
+        SYNC_CHECKPOINT_WORKGATE_ANCHOR_ABSENT,
+        SYNC_CHECKPOINT_WORKGATE_ANCHOR_TRANSIENT,
+    };
+    SyncCheckpointWorkGateAnchor GetSyncCheckpointWorkGateAnchor(bool fProofOfStake, int64_t* pnCheckpointTime,
+                                                                 unsigned int* pnBits, int* pnHeight,
+                                                                 int* pnAnchorHeight = NULL);
+
+    // ROUND-6 TASKS 1/2/3 test seams (production never calls them).
+    //  - SetWorkGateAnchorTransientFailForTest: make the next `count` work-gate
+    //    ANCHOR resolutions observe a TRANSIENT authority failure, exercising
+    //    ProcessBlock's fail-closed work-gate branch deterministically without
+    //    disturbing any other authoritative reader in the same process.
+    //  - SetPendingCheckpointMessageForTest / PendingCheckpointMessageIsNullForTest:
+    //    arm and observe the file-private pending checkpoint MESSAGE state so a
+    //    regression can prove a transient validation failure preserves it.
+    void SetWorkGateAnchorTransientFailForTest(int count);
+    int WorkGateAnchorTransientFailCountForTest();
+    // ROUND-7 seams: observational only (never consulted by production).
+    int GetWorkGateAnchorResolveCountForTest();
+    int64_t GetWorkGateAnchorWalkStepsForTest();
+    void ResetWorkGateAnchorCountersForTest();
+    size_t WorkGateAnchorMemoSizeForTest();
+    void SetProcessSyncCheckpointSkipSignatureForTest(bool f);
+    bool ProcessSyncCheckpointSkipSignatureForTest();
+    void ClearWorkGateAnchorMemoForTest();
+    //  - SetPendingValidationTransientFailForTest: force the next
+    //    ValidateSyncCheckpointDetailed verdicts to TRANSIENT without touching
+    //    any authoritative reader, so the pending-checkpoint CONSUMER path is
+    //    exercised in isolation (the by-hash seam above would also break the
+    //    fPendingKnown membership probe and short-circuit the consumer).
+    void SetPendingValidationTransientFailForTest(int count);
+    void SetPendingCheckpointMessageForTest(const uint256& hashCheckpoint);
+    bool PendingCheckpointMessageIsNullForTest();
+    uint256 PendingCheckpointMessageHashForTest();
+    void ClearPendingCheckpointMessageForTest();
 
     bool WantedByPendingSyncCheckpoint(uint256 hashBlock);
     bool ResetSyncCheckpoint();

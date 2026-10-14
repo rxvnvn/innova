@@ -125,6 +125,27 @@ public:
 };
 
 // CreateNewBlock: create new block (without proof-of-work/proof-of-stake)
+// R7-CPU-NBITS: difficulty source for the mining template. Authoritative (V2) mode
+// resolves the required target BY VALUE through the Block Index Manager — the exact
+// function AcceptBlock uses (main.cpp ResolveNextTargetRequiredByValue) — so a mined
+// block's nBits always equals the accept-side nComputedBits. Returns false on an
+// authority failure so CreateNewBlock fails closed instead of emitting a bad template.
+// Legacy mode keeps GetNextTargetRequired() byte-for-byte. cs_main (recursive) is held
+// here to satisfy the authority's cs_main-serialization contract; callers may already
+// hold it, which is safe.
+bool ResolveTemplateNextTarget(const CBlockIndex* pindexPrev, bool fProofOfStake,
+                               unsigned int* pBitsOut)
+{
+    if (pindexPrev == NULL || pBitsOut == NULL)
+        return false;
+    LOCK(cs_main);
+    if (g_fAuthoritativeStartup)
+        return ResolveNextTargetRequiredByValue(pindexPrev->GetBlockHash(), fProofOfStake,
+                                                pBitsOut, NULL);
+    *pBitsOut = GetNextTargetRequired(pindexPrev, fProofOfStake);
+    return true;
+}
+
 CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
                        CReserveKey* pReserveKey)
 {
@@ -267,7 +288,21 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
     if (mapArgs.count("-mintxfee"))
         ParseMoney(mapArgs["-mintxfee"], nMinTxFee);
 
-    pblock->nBits = GetNextTargetRequired(pindexPrev, fProofOfStake);
+    // R7-CPU-NBITS: building the template MUST use the same difficulty source that
+    // AcceptBlock enforces. In authoritative (V2) mode the legacy helper walks pprev
+    // POINTERS (GetLastBlockIndex); on a sparse-hot resident parent (pprev == NULL)
+    // that walk collapses immediately and the helper returns the proof-type LIMIT
+    // (bnProofOfWorkLimit.GetCompact() == 0x1e0fffff) instead of the retargeted target,
+    // so every mined PoW block failed the accept-side `nBits != nComputedBits` check
+    // (incorrect-bits). Resolve by value through the V2 authority instead; fail closed
+    // (no template) when the authority cannot answer. Legacy mode is unchanged.
+    unsigned int nTemplateBits = 0;
+    if (!ResolveTemplateNextTarget(pindexPrev, fProofOfStake, &nTemplateBits))
+    {
+        printf("CreateNewBlock: ERROR: difficulty authority unavailable (fail closed)\n");
+        return NULL;
+    }
+    pblock->nBits = nTemplateBits;
 
     // Collect memory pool transactions into the block
     int64_t nFees = 0;
@@ -1139,6 +1174,13 @@ bool IsCPUMiningCollateralStateReadyForTest()
 bool IsCPUMiningWorkCurrentForTest(const CPUMiningWorkIdentity& identity, bool fCheckMempool)
 {
     return IsCPUMiningWorkCurrent(identity, fCheckMempool);
+}
+
+// R7-CPU-NBITS: test-facing export of the production template difficulty resolver.
+bool ResolveTemplateNextTargetForTest(const CBlockIndex* pindexPrev, bool fProofOfStake,
+                                      unsigned int* pBitsOut)
+{
+    return ResolveTemplateNextTarget(pindexPrev, fProofOfStake, pBitsOut);
 }
 
 bool PrepareCPUMiningAttemptForTest(CBlock* pblock,
