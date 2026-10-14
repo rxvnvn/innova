@@ -364,6 +364,7 @@ OBJS= \
     obj/blockindex_authoritative_restart.o \
     obj/blockindex_authoritative_live.o \
     obj/blockindex_catchup_tool.o \
+    obj/blockindex_recovery_tool.o \
     obj/blockindex_fold_tool.o \
     obj/blockindex_generation_writer.o \
     obj/blockindex_generation_builder_lm.o \
@@ -469,6 +470,7 @@ OBJS= \
     obj/blockindex_authoritative_restart.o \
     obj/blockindex_authoritative_live.o \
     obj/blockindex_catchup_tool.o \
+    obj/blockindex_recovery_tool.o \
     obj/blockindex_fold_tool.o \
     obj/blockindex_generation_writer.o \
     obj/blockindex_generation_builder_lm.o \
@@ -599,6 +601,7 @@ TEST_OBJS= \
     obj/test/blockindex_authoritative_live_tests.o \
     obj/test/blockindex_catchup_tool_tests.o \
     obj/test/blockindex_catchup_tool_cli_tests.o \
+    obj/test/blockindex_recovery_tool_tests.o \
     obj/test/blockindex_legacy_rollback_tests.o \
     obj/test/blockindex_window2_e2e_tests.o \
     obj/test/blockindex_fold_tool_tests.o \
@@ -640,6 +643,9 @@ check-ibdheaderscheduler: test_innova
 
 check-pinglifecycle: test_innova
 	./test_innova --run_test=pinglifecycle_tests
+
+check-blockindex-recovery-tool: test_innova blockindex-recovery-cli
+	./test_innova --run_test=blockindex_recovery_tool_tests
 
 release-check: innova-build
 
@@ -741,6 +747,13 @@ innova-blockindex-builder-lm: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/b
 
 blockindex-catchup-tool: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_catchup_tool_cli.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
+
+blockindex-recovery-tool: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_recovery_tool_cli.o
+	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
+
+blockindex-recovery-cli: blockindex-recovery-tool
+
+.PHONY: blockindex-recovery-cli
 
 innova-blockindex-navdiff: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_navigation_diff_tool.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)

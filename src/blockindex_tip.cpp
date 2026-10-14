@@ -60,6 +60,25 @@ static bool SetError(std::string* error, const std::string& message)
     return false;
 }
 
+// Scale-diagnostic splitter (same output contract as the recovery tool's mark).
+static void PhaseRssMark(const char* tag)
+{
+    long long rss = 0, hwm = 0;
+    FILE* f = fopen("/proc/self/status", "r");
+    if (f)
+    {
+        char line[256];
+        while (fgets(line, sizeof(line), f))
+        {
+            if (strncmp(line, "VmRSS:", 6) == 0) sscanf(line + 6, "%lld", &rss);
+            else if (strncmp(line, "VmHWM:", 6) == 0) sscanf(line + 6, "%lld", &hwm);
+        }
+        fclose(f);
+    }
+    fprintf(stderr, "phase-rss mark=%s rss_kib=%lld hwm_kib=%lld\n", tag, rss, hwm);
+    fflush(stderr);
+}
+
 static void ClearError(std::string* error)
 {
     if (error)
@@ -916,6 +935,10 @@ public:
 
     bool Put(const uint256& hash, BlockIndexId id, std::string* error)
     {
+        // Scale-diagnostic A/B kill switch (env-gated; never set in production):
+        // measures the side-index LevelDB's contribution to RSS growth.
+        if (getenv("INNOVA_DIAG_NO_SIDEINDEX") != NULL)
+            return true;
         return index_.Put(hash, id, error);
     }
 
@@ -1168,6 +1191,7 @@ struct BlockIndexTipAuthority::Impl
                     PeriodicStartupTrim(rebuildTrimCtr);
                     return sideIndex.Put(r.hash, id, NULL);
                 }, &perr);
+            { PhaseRssMark("hashindex-rebuild-done"); }
             if (!built)
                 return SetError(error, "tip-hashindex rebuild: " + perr);
             std::string merr;
@@ -2131,13 +2155,42 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     // an UNCOMMITTED suffix of the index until tip.meta advances (the same
     // fail-safe tier as the tail stores); Open reconciles index entries past
     // the committed count.
+    static uint64_t s_diagPutCntr = 0;
     for (size_t k = 0; k < newRecords.size(); ++k)
     {
         std::string ierr;
+        // Fine-grained memory probe (no-op unless env-gated): RSS delta over
+        // a WINDOW of 8192 puts (page-granularity-proof).
+        static bool s_probeOn = (getenv("INNOVA_DIAG_INNER_RSS") != NULL);
+        static long long s_winBaseRss = -1;
+        if (s_probeOn && ((s_diagPutCntr & 0x1FFF) == 0))
+        {
+            FILE* pf = fopen("/proc/self/statm", "r");
+            if (pf) { long long t = 0, r = 0; if (fscanf(pf, "%lld %lld", &t, &r) == 2) s_winBaseRss = r; fclose(pf); }
+        }
         if (!i->sideIndex.Put(newRecords[k].hash,
                               i->baseLocalToId(committedRecords + k), &ierr))
             return SetError(error, "append tip-hashindex put failed: " + ierr),
                    BLOCK_INDEX_TIP_IO_ERROR;
+        if (s_probeOn && s_winBaseRss >= 0 && ((s_diagPutCntr & 0x1FFF) == 0x1FFF))
+        {
+            FILE* pf = fopen("/proc/self/statm", "r");
+            if (pf)
+            {
+                long long t = 0, r = 0;
+                if (fscanf(pf, "%lld %lld", &t, &r) == 2)
+                {
+                    long pagesz = sysconf(_SC_PAGESIZE);
+                    fprintf(stderr, "inner-rss window_delta=%+lldk at put#%llu\n",
+                            (r - s_winBaseRss) * (long long)pagesz / 1024,
+                            (unsigned long long)(s_diagPutCntr + 1));
+                }
+                fclose(pf);
+            }
+        }
+        s_diagPutCntr += newRecords.size();
+        if ((s_diagPutCntr & 0x7FFF) == 0)
+            PhaseRssMark("sideindex-put-32k");
     }
     {
         std::string merr;
