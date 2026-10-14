@@ -5125,10 +5125,155 @@ bool IsSynchronized() {
 
 bool g_forceIbdPeerSnapshotUnavailableForTesting = false;
 
+// ---------------------------------------------------------------------------
+// Stage 2: bounded grace window for FRESH-ONLY peer-ahead claims.
+//
+// Stage 1 let any peer with a fresh height announcement (nLastHeightUpdate
+// within 120s) hold initialblockdownload=true via the PEER_AHEAD_LAG rule. A
+// peer that simply keeps repeating a fresh (but false) height claim -- never
+// delivering blocks and never having work requested from it -- would then
+// suppress mining indefinitely while the node makes no useful progress.
+//
+// Refinement: a claim that is corroborated by ENGAGED activity (a block was
+// actually received from the peer within 120s, or the node has outstanding
+// block requests / in-flight blocks toward that peer) is genuine catch-up
+// evidence and remains UNBOUNDED. A fresh-ONLY claim (no engaged activity) may
+// hold IBD only while a continuous uncorroborated-ahead burst has persisted for
+// at most the grace window; once the window is exceeded it stops holding IBD
+// and a distinct reason (IBD_REASON_PEER_AHEAD_LAG_UNCORROBORATED) is recorded
+// for observability while the usual rules are re-evaluated (fall-through).
+//
+// The grace clock is idle whenever no peer claims to be ahead without engaged
+// activity (so it restarts only after a real gap), and the window reuses the
+// existing stale-chain tolerance (-ibdstaleseconds, 30s for fast-spacing nets
+// and 300s otherwise) so no new operator knob is introduced.
+// ---------------------------------------------------------------------------
+CCriticalSection cs_ibdFreshPeerGrace;
+int64_t nIbdFreshPeerGraceFirstSeen = 0;
+// Stage 3: last time an uncorroborated ahead claim existed at all. The clock
+// fully resets only once no uncorroborated ahead claim has existed for a full
+// grace window, so a peer cannot restart the window by dropping its inflated
+// height claim for a single evaluation.
+int64_t nIbdFreshPeerGraceLastSeen = 0;
+
+void ResetIbdFreshPeerGraceForTesting()
+{
+    LOCK(cs_ibdFreshPeerGrace);
+    nIbdFreshPeerGraceFirstSeen = 0;
+    nIbdFreshPeerGraceLastSeen = 0;
+}
+
+int64_t IbdFreshPeerGraceFirstSeenForTesting()
+{
+    LOCK(cs_ibdFreshPeerGrace);
+    return nIbdFreshPeerGraceFirstSeen;
+}
+
+// Stage 3 test hook: exposes the idle/reset companion clock.
+int64_t IbdFreshPeerGraceLastSeenForTesting()
+{
+    LOCK(cs_ibdFreshPeerGrace);
+    return nIbdFreshPeerGraceLastSeen;
+}
+
+// Backdates ("primes") the grace clock start so tests can exercise the expiry
+// transition without sleeping for the whole window.
+void PrimeIbdFreshPeerGraceFirstSeenForTesting(int64_t nFirstSeen)
+{
+    LOCK(cs_ibdFreshPeerGrace);
+    nIbdFreshPeerGraceFirstSeen = nFirstSeen;
+}
+
+// Stage 3: backdates the idle companion clock so tests can exercise the full
+// idle+reset transition without sleeping for the whole window.
+void PrimeIbdFreshPeerGraceLastSeenForTestingForTesting(int64_t nLastSeen)
+{
+    LOCK(cs_ibdFreshPeerGrace);
+    nIbdFreshPeerGraceLastSeen = nLastSeen;
+}
+
+// The grace window is the same value the predicate already uses as its
+// stale-chain tolerance: -ibdstaleseconds (default 30) for fast-spacing nets,
+// 300 otherwise. Exposed so tests can drive the transition deterministically.
+int64_t IbdStaleSecondsForTesting()
+{
+    unsigned int nTargetSpacing = GetTargetSpacingForHeight(nBestHeight + 1);
+    return (nTargetSpacing <= 1) ? GetArg("-ibdstaleseconds", 30) : 300;
+}
+
+// Resolves the effective "ahead peer height" that may hold IBD. Engaged
+// corroboration is returned unbounded; a fresh-only claim is returned only
+// while the continuous uncorroborated-ahead burst is within the grace window.
+// When a fresh-only claim exists but its grace window has expired, the claim is
+// dropped and *pfFreshOnlyGraceExpired is set so the caller can record the
+// distinct uncorroborated reason while falling through to the other rules.
+static int ResolveCorroboratedAheadPeerHeight(int nEngagedAheadHeight,
+                                              int nFreshOnlyAheadHeight,
+                                              int nUncorroboratedAheadHeight,
+                                              int nLocalHeight,
+                                              int nLagTolerance,
+                                              int64_t nNow,
+                                              bool* pfFreshOnlyGraceExpired)
+{
+    *pfFreshOnlyGraceExpired = false;
+    const bool fEngagedAhead = nEngagedAheadHeight > nLocalHeight + nLagTolerance;
+    const bool fUncorroboratedAhead = nUncorroboratedAheadHeight > nLocalHeight + nLagTolerance;
+    const bool fFreshOnlyAhead = nFreshOnlyAheadHeight > nLocalHeight + nLagTolerance;
+
+    bool fGraceExpired = false;
+    {
+        LOCK(cs_ibdFreshPeerGrace);
+        if (fUncorroboratedAhead)
+        {
+            // Some peer (fresh or stale) claims to be ahead without engaged
+            // activity. Keep the burst clock running.
+            nIbdFreshPeerGraceLastSeen = nNow;
+            if (nIbdFreshPeerGraceFirstSeen == 0)
+            {
+                // Start of an uncorroborated-ahead burst. The clock restarts
+                // only after a full window WITHOUT any uncorroborated ahead
+                // claim (below), so a hostile peer cannot repeatedly re-arm it.
+                nIbdFreshPeerGraceFirstSeen = nNow;
+            }
+            fGraceExpired = (nNow - nIbdFreshPeerGraceFirstSeen) >
+                            IbdStaleSecondsForTesting();
+        }
+        else if (nIbdFreshPeerGraceLastSeen == 0 ||
+                 nNow - nIbdFreshPeerGraceLastSeen > IbdStaleSecondsForTesting())
+        {
+            // No uncorroborated ahead claim for a full window: idle/reset the
+            // clock so a much later (possibly different) claim starts full.
+            nIbdFreshPeerGraceFirstSeen = 0;
+            nIbdFreshPeerGraceLastSeen = 0;
+        }
+        // Otherwise a claim just disappeared: hold the clock so a peer cannot
+        // restart it by dropping the claim for a single evaluation tick.
+    }
+
+    if (fEngagedAhead)
+        return nEngagedAheadHeight; // ENGAGED corroboration: unbounded
+    if (fFreshOnlyAhead && !fGraceExpired)
+        return nFreshOnlyAheadHeight; // fresh-only claim still within grace
+    if (fFreshOnlyAhead && fGraceExpired)
+        *pfFreshOnlyGraceExpired = true; // distinct reason; fall through
+    return -1;
+}
+
 bool IsInitialBlockDownload()
 {
     int nFreshPeerHeight = -1;
-    int nKnownPeerHeight = -1;
+    // Stage 2 corroboration split:
+    //  - nEngagedAheadPeerHeight: ahead claims corroborated by engaged activity
+    //    (recent block delivery OR outstanding/in-flight work) => UNBOUNDED.
+    //  - nFreshOnlyAheadPeerHeight: ahead claims backed only by a fresh height
+    //    announcement => HOLDS IBD ONLY WITHIN THE GRACE WINDOW.
+    //  - nUncorroboratedAheadPeerHeight: any non-client peer claiming to be
+    //    ahead without engaged activity (fresh or stale) => keeps the grace
+    //    clock running across a stale/fresh flap so the window cannot be
+    //    restarted indefinitely by alternating stale and fresh announcements.
+    int nEngagedAheadPeerHeight = -1;
+    int nFreshOnlyAheadPeerHeight = -1;
+    int nUncorroboratedAheadPeerHeight = -1;
     int64_t nFreshPeerLastBlockRecv = 0;
     int64_t nLocalLastBlockRecv = 0;
     const auto RecordAndReturn = [&](bool fInitialBlockDownload,
@@ -5163,14 +5308,30 @@ bool IsInitialBlockDownload()
                 if (!pnode || pnode->fClient)
                     continue;
 
-                nKnownPeerHeight = std::max(
-                    nKnownPeerHeight,
-                    std::max(pnode->nBestKnownHeight, pnode->nChainHeight));
+                int nPeerAdvertisedHeight = std::max(pnode->nBestKnownHeight,
+                                                     pnode->nChainHeight);
                 bool fFreshHeight = pnode->nBestKnownHeight > 0 &&
                                     pnode->nLastHeightUpdate > 0 &&
                                     nNow - pnode->nLastHeightUpdate <= 120;
                 if (fFreshHeight)
                     nFreshPeerHeight = std::max(nFreshPeerHeight, pnode->nBestKnownHeight);
+
+                bool fRecentBlockRecv = pnode->nLastBlockRecv > 0 &&
+                                        nNow - pnode->nLastBlockRecv <= 120;
+                bool fHasOutstandingWork =
+                    !pnode->setBlocksInFlight.empty() || !pnode->mapAskFor.empty();
+                // ENGAGED corroboration = the node is actually exchanging blocks
+                // (or has requested work) toward this peer. It counts unboundedly.
+                bool fEngagedCorroboration = fRecentBlockRecv || fHasOutstandingWork;
+                if (fEngagedCorroboration)
+                    nEngagedAheadPeerHeight = std::max(
+                        nEngagedAheadPeerHeight, nPeerAdvertisedHeight);
+                else
+                    nUncorroboratedAheadPeerHeight = std::max(
+                        nUncorroboratedAheadPeerHeight, nPeerAdvertisedHeight);
+                if (fFreshHeight && !fEngagedCorroboration)
+                    nFreshOnlyAheadPeerHeight = std::max(
+                        nFreshOnlyAheadPeerHeight, nPeerAdvertisedHeight);
 
                 if (pnode->nLastBlockRecv > nFreshPeerLastBlockRecv)
                     nFreshPeerLastBlockRecv = pnode->nLastBlockRecv;
@@ -5188,8 +5349,12 @@ bool IsInitialBlockDownload()
 
     unsigned int nTargetSpacing = GetTargetSpacingForHeight(nBestHeight + 1);
     int nLagTolerance = (nTargetSpacing <= 1) ? (int)GetArg("-ibdheightlag", 8) : nCoinbaseMaturity * 2;
-    if (std::max(nFreshPeerHeight, nKnownPeerHeight) >
-        nBestHeight + nLagTolerance)
+    bool fFreshOnlyAheadGraceExpired = false;
+    int nCorroboratedAheadPeerHeight = ResolveCorroboratedAheadPeerHeight(
+        nEngagedAheadPeerHeight, nFreshOnlyAheadPeerHeight,
+        nUncorroboratedAheadPeerHeight, nBestHeight, nLagTolerance, nNow,
+        &fFreshOnlyAheadGraceExpired);
+    if (nCorroboratedAheadPeerHeight > nBestHeight + nLagTolerance)
         return RecordAndReturn(true, ibdactivepath::IBD_REASON_PEER_AHEAD_LAG);
 
     if (fActiveCatchup)
@@ -5202,6 +5367,9 @@ bool IsInitialBlockDownload()
         nNow - nLocalLastBlockRecv > nStaleSeconds)
         return RecordAndReturn(true, ibdactivepath::IBD_REASON_STALE_RECV);
 
+    if (fFreshOnlyAheadGraceExpired)
+        return RecordAndReturn(false,
+                              ibdactivepath::IBD_REASON_PEER_AHEAD_LAG_UNCORROBORATED);
     return RecordAndReturn(false, ibdactivepath::IBD_REASON_NOT_IBD);
 
 }

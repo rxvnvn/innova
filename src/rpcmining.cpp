@@ -137,6 +137,14 @@ Value getmininginfo(const Array& params, bool fHelp)
     obj.push_back(Pair("cpumining",     cpuMining.running));
     obj.push_back(Pair("cputhreads",    cpuMining.activeThreads));
     obj.push_back(Pair("requestedcputhreads", cpuMining.requestedThreads));
+    // Stage 1 additive observability: truthful hashing/pause state. Existing
+    // pairs above keep their exact semantics.
+    obj.push_back(Pair("cpuhashing",    cpuMining.hashing));
+    obj.push_back(Pair("cpupausereason",
+                        CCPUMinerController::PauseReasonString(cpuMining.pauseReason)));
+    obj.push_back(Pair("cpulastHashTime", cpuMining.lastHashProgress));
+    obj.push_back(Pair("cputotalhashes",
+                        (uint64_t)cpuMining.totalHashes));
 
     if (fRPCPerfTrace)
     {
