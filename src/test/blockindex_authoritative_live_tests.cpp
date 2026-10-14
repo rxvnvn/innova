@@ -30,6 +30,7 @@
 #include "blockindex_tip.h"
 #include "blockindex_live_tail.h"
 #include "main.h"
+#include "checkpoints.h"
 #include "blockrequesttrace.h"
 #include <memory>
 
@@ -486,11 +487,45 @@ static bool ProcessBlockOrphaned(CBlock* pblock)
     return fOrphanedAtEnd;
 }
 
+// Isolation guard for the authoritative ProcessBlock contract cases below.
+//
+// These cases build ISOLATED V2 generations and pin the parent / orphan /
+// AcceptBlock-closure contracts of ProcessBlock. A fresh datadir has NO
+// established sync checkpoint (hashSyncCheckpoint == 0); with no checkpoint the
+// anti-spam work-gate is skipped exactly as legacy does. This test process,
+// however, boots the REGTEST best chain, so the one-time V2 genesis-checkpoint
+// establishment leaves hashSyncCheckpoint == hashGenesisBlockRegTest, and the
+// COLD/HOT staking navigator that ResolveAuthoritativeBlockSnapshotR needs is
+// not installed here: resolving that checkpoint record reports
+// "authoritative block resolver: navigator unavailable" -> AUTHORITY_FAILURE ->
+// the (intended) TRANSIENT work-gate fail-closed branch rejects every non-tip
+// block BEFORE the parent gate and its observer emission can run. That masks
+// the very contracts these cases exist to pin.
+//
+// The guard restores the fresh-datadir premise ("no established sync
+// checkpoint") for the duration of the case and restores the previous value
+// afterwards. It changes no production behavior and weakens no assertion; the
+// TRANSIENT fail-closed branch itself remains covered by the armed-seam cases in
+// checkpoint_v2_authoritative_tests.
+struct NoEstablishedSyncCheckpoint
+{
+    uint256 saved;
+    NoEstablishedSyncCheckpoint() : saved(Checkpoints::hashSyncCheckpoint)
+    {
+        Checkpoints::hashSyncCheckpoint = uint256(0);
+    }
+    ~NoEstablishedSyncCheckpoint()
+    {
+        Checkpoints::hashSyncCheckpoint = saved;
+    }
+};
+
 // G1-FINAL-A: authoritative-parent block is NOT stranding-orphaned by the real
 // ProcessBlock gate (parent proven in V2 authority). G1-FINAL-B/C: control —
 // unknown parent in both authoritative and legacy mode IS orphaned normally.
 BOOST_AUTO_TEST_CASE(g1_final_processblock_orphan_gate)
 {
+    NoEstablishedSyncCheckpoint noEstablishedCkpt;
     G1Fixture fx(4);
     BlockIndexV2Reader reader;
     BlockIndexV2ReaderOptions opts;
@@ -569,6 +604,7 @@ static void CaptureParentEvent(const ProcessBlockParentObserverEvent& event)
 
 BOOST_AUTO_TEST_CASE(g1_processblock_parent_observer_open_and_closed_authority)
 {
+    NoEstablishedSyncCheckpoint noEstablishedCkpt;
     G1Fixture fx(4);
     BlockIndexV2Reader reader;
     BlockIndexV2ReaderOptions opts;
@@ -703,6 +739,7 @@ static void CloseBaseReaderAfterParentFound(const ProcessBlockParentObserverEven
 
 BOOST_AUTO_TEST_CASE(g1_acceptblock_second_lookup_authority_failure_no_dos)
 {
+    NoEstablishedSyncCheckpoint noEstablishedCkpt;
     G1Fixture fx(4);
     BlockIndexV2Reader reader;
     BlockIndexV2ReaderOptions opts;
