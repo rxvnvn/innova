@@ -260,3 +260,90 @@ Deliberately **not** done (belongs to the D1 retention step): reclaiming the ine
 truncation. Truncation/compaction of `undo.dat` needs the retention water marks, the seed floor and
 the whole-image maintenance protocol of DESIGN §9/§10 of the D1 report; the F0 fix is
 non-destructive and leaves those bytes in place.
+
+## 11. Stage 3B-F0-R1 — backup barrier ordering and fresh-open evidence
+
+Two MEDIUM findings from the independent F0 audit (`innova-v2-chainstate-stage3b-f0-audit-20261015.md`),
+neither of which lost an acknowledged generation, are closed here. No on-disk format changed, no second
+state authority was introduced, and no previously recoverable state was made unrecoverable.
+
+### 11.1 F0-1 — a retained backup must never reference an overwritten byte
+
+Vulnerable state (FACT, reproduced): after `disconnect`, the primary describes generation `N` with the
+*smaller* committed `undoSize`, while `MANIFEST.bak` is still the pre-disconnect generation `N-1` with the
+*larger* `undoSize` (it references the logically-discarded tail). The F0 write at the committed offset then
+rewrites bytes inside that referenced range ("vulnerable window"), and only afterwards was the backup
+replaced (old order: write → `MANIFEST.tmp` → backup). In a double fault (crash inside the window **and** a
+later primary corruption) the fallback could no longer be decoded: recovery failed closed, but with a
+*degraded* fallback ("no valid backup") instead of the intended, informative ACK-gate refusal.
+
+Evaluated candidates:
+
+- **A. Reorder within the existing protocol** (chosen). Establish the backup from the *current* primary
+  **before** the undo write. The backup then always carries `undoSize == off` — the exact write offset —
+  so `[0, undoSize)` is by construction below and disjoint from the written range.
+- B. Guard the pwrite against a backup that still references the region. Equivalent in effect to A (the
+  guard can only succeed by replacing the backup first), but leaves a check that can never fire on a
+  correct store, and a refusal path that would block a legitimate reconnect. Subsumed by A.
+- C. Crash-safe preservation without a new format (chosen as a *component* of A): write the replacement to
+  `MANIFEST.bak.tmp`, fsync, verify (decode + root reachability), then `rename()` over the live backup —
+  never an in-place truncate of the live backup, which would leave a torn backup if the write died.
+
+Rejected outright: deleting or invalidating `MANIFEST.bak`, and relaxing fail-closed behaviour.
+
+Durability barriers (exact order, one publish):
+
+1. page appends; 2. `tree_.fsync()`; 3. read current `MANIFEST` (decode + root reachable, else fail closed
+with **zero** mutation) — plus the invariant check `backup.undoSize == off` whenever a write follows, which
+fails closed if a foreign/legacy store contradicts it; 4. write `MANIFEST.bak.tmp` (+fsync) and verify it;
+5. `rename(MANIFEST.bak.tmp → MANIFEST.bak)`; 6. **directory fsync** — the replacement must be durable
+before the undo bytes change, otherwise a power loss could roll the rename back and re-expose the larger
+backup after the write; 7. undo write at the committed offset (+fsync); 8. `MANIFEST.tmp` (+fsync);
+9. `rename(MANIFEST.tmp → MANIFEST)` (visibility); 10. directory fsync; 11. `ACK` publish.
+
+Consequences per crash state (all tested by `R1-crash`; "OLD" = acknowledged generation `N` survives):
+
+| crash point | primary | backup | reopen | double fault (primary then corrupt) |
+|---|---|---|---|---|
+| before backup replacement | `N` | `N-1` (stale, larger) | OLD `N`, coherent | FAIL-CLOSED via the ACK gate (the stale backup cannot roll back an acknowledged generation) |
+| backup tmps written, not renamed | `N` | `N-1`; stray `.tmp` removed on open | OLD `N` | FAIL-CLOSED (same) |
+| after backup replace + dir fsync | `N` | `N` (usable copy) | OLD `N` | **RECOVERS `N`** from the backup |
+| after undo write/fsync | `N` | `N` | OLD `N` | **RECOVERS `N`** |
+| before / after rename, after dir fsync | `N` / `N+1` | `N` | OLD `N` / NEW `N+1`, ACK reconciled | NEW path: ACK gate protects `N+1` |
+| after ACK | `N+1` | `N` | NEW `N+1` | unchanged |
+
+The double-fault column is the measurable improvement: the F0-1 window no longer converts a recoverable
+state into a fail-closed one, and the informative ACK-gate refusal survives where rollback is genuinely
+forbidden. Cost: one extra directory fsync per publish (O(1), no page/byte change; measured in the R1
+report).
+
+### 11.2 F0-2 — an orphan `undo.dat` is prior-store evidence
+
+`undo.dat` was never classified at open, so a fresh store adopted a directory containing an orphan log and
+the first publish overwrote its leading bytes at offset 0. The fresh branch (no `MANIFEST`, no `ACK`, no
+`MANIFEST.bak`) now classifies `undo.dat` with `lstat` **before** any creation, and only then creates:
+
+| observed | decision |
+|---|---|
+| absent | fresh init proceeds; the first write uses `O_CREAT\|O_EXCL` |
+| regular, size 0 | adopted as an accepted residue (0 bytes can be destroyed); the first write must find it (`O_WRONLY`, no `O_CREAT`) |
+| regular, size > 0 | **refuse** — bytes without pointers are prior-store evidence |
+| not a regular file (directory, symlink, fifo, device) | **refuse** (never followed; `lstat`, not `stat`) |
+| stat error other than `ENOENT` | **refuse** (a stat failure is never read as absence) |
+| regular but not readable+writable | **refuse** |
+
+Refusal is pure: nothing is created, moved, deleted or quarantined, and the diagnostic is deterministic
+(the same message and the same bytes on every restart). The `O_EXCL`/no-`O_CREAT` policies close the
+classify→create TOCTOU window at the kernel level, so a file appearing (or vanishing) between
+classification and the first write fails closed instead of being overwritten (or invented).
+
+Empty-only is accepted because it is exactly the constructible-empty form, matching the R2 contract's
+acceptance of an empty sentinel page (`DESIGN §9`); every non-empty residue is refused, which is stricter
+than R2's tree rule and consistent with pre-existing refusals that inspect `MANIFEST.bak`, `ACK`, page
+alignment and root emptiness first. The same `lstat`+regular-file check is applied when loading the log of
+an acknowledged store, closing the LOW finding "non-regular `undo.dat` rejected only at first publish".
+`tree.dat` classification is deliberately unchanged (it would alter an already-audited R2 contract) and is
+recorded as a residual LOW in the R1 report.
+
+Deliberately **not** done (unchanged scope): no `UNDOINDEX`, no MANIFEST v2, no generation pinning, no
+checkpoint seeds, no retention pruning, no compaction/GC, no page reclamation, no consensus/DAG change.

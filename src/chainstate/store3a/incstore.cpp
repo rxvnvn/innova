@@ -32,6 +32,38 @@ static bool ensureDir(const std::string& path) {
 }
 static bool endsWith(const std::string& s, const std::string& suf) { return s.size() >= suf.size() && s.compare(s.size()-suf.size(), suf.size(), suf) == 0; }
 
+// R1 (F0-2): classify an on-disk undo.dat as evidence of a prior store BEFORE anything is created,
+// truncated or overwritten on the fresh-open path. lstat (never stat) so a symlink is reported as a
+// symlink instead of being silently followed to some other file.
+//   0 = absent, 1 = present and empty (no byte can be destroyed: accepted residue), 2 = present with
+//   bytes (prior-store evidence: REFUSE), 3 = present but not a regular file (REFUSE), -1 = lstat
+//   failed for any reason other than ENOENT (REFUSE: an unreadable path is not file absence).
+// Pure: no filesystem mutation, deterministic diagnostic in *detail.
+static int classifyUndoEvidence(const std::string& path, std::string* detail){
+    struct stat st;
+    if (::lstat(path.c_str(), &st) != 0){
+        if (errno == ENOENT){ *detail = "absent"; return 0; }
+        *detail = "lstat failed (errno=" + std::to_string(errno) + ")"; return -1;
+    }
+    if (S_ISLNK(st.st_mode)){ *detail = "symbolic link"; return 3; }
+    if (!S_ISREG(st.st_mode)){
+        *detail = S_ISDIR(st.st_mode) ? "directory" : (S_ISFIFO(st.st_mode) ? "fifo" : "non-regular file");
+        return 3;
+    }
+    if (st.st_size == 0){
+        // R1: a zero-length file can be adopted (nothing can be destroyed), but only if it is actually
+        // usable: an empty-yet-inaccessible log is an anomaly, not evidence of a clean store. R2 refuses
+        // an unreadable tree.dat at the same point, so this is the consistent fail-closed reading.
+        if (::access(path.c_str(), R_OK|W_OK) != 0){
+            *detail = "empty regular file that is not readable+writable (errno=" + std::to_string(errno) + ")";
+            return 3;
+        }
+        *detail = "empty regular file"; return 1;
+    }
+    *detail = std::to_string((long long)st.st_size) + " bytes";
+    return 2;
+}
+
 bool csWriteFile(const std::string& path, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e) {
     if (injNs) { setErr(e, ErrCode::NO_SPACE, "injected ENOSPC on " + path); return false; }
     int fd = ::open(path.c_str(), O_WRONLY|O_CREAT|O_TRUNC, 0644);
@@ -59,10 +91,27 @@ bool csAppendFile(const std::string& path, const uint8_t* d, size_t n, bool injN
 //   records logically discarded by an earlier disconnect, which no retained manifest references.
 // - Refuses to write past a hole (file shorter than off) instead of zero-extending into a
 //   descriptor whose record layout would no longer match the manifest.
-bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e) {
+bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e,
+                   UndoCreate create) {
     if (injNs) { setErr(e, ErrCode::NO_SPACE, "injected ENOSPC writing " + path); return false; }
-    int fd = ::open(path.c_str(), O_WRONLY|O_CREAT, 0644);
-    if (fd < 0) { setErr(e, ErrCode::IO, "open " + path); return false; }
+    // R1 (F0-2): the create policy is enforced by the OPEN, not by a preceding lstat, so a file that
+    // appears (or disappears) between the open-time classification and this write cannot slip through.
+    int flags = O_WRONLY;
+    if (create == UndoCreate::Any) flags |= O_CREAT;
+    else if (create == UndoCreate::RequireAbsent) flags |= O_CREAT | O_EXCL;
+    int fd = ::open(path.c_str(), flags, 0644);
+    if (fd < 0) {
+        if (create == UndoCreate::RequireAbsent && errno == EEXIST) {
+            setErr(e, ErrCode::CORRUPT, path + " appeared after the fresh-open classification; refusing to "
+                   "overwrite a file this store never created (prior-store evidence)");
+        } else if (create == UndoCreate::RequireExisting && errno == ENOENT) {
+            setErr(e, ErrCode::CORRUPT, path + " disappeared after the fresh-open classification; refusing to "
+                   "recreate an initialized log");
+        } else {
+            setErr(e, ErrCode::IO, "open " + path);
+        }
+        return false;
+    }
     off_t end = ::lseek(fd, 0, SEEK_END);
     if (end < 0) { ::close(fd); setErr(e, ErrCode::IO, "lseek " + path); return false; }
     if ((uint64_t)end < off) {
@@ -195,7 +244,10 @@ bool CommitStore3A::writeAck(uint64_t gen, ChainError* e){
 
 bool CommitStore3A::loadUndoFor(const Manifest& m, ChainError* e){
     undoIndex_.clear(); undoCommittedBytes_=0; if(m.undoSize==0) return true;
-    struct stat st; if(stat(p("undo.dat").c_str(),&st)!=0){ setErr(e,ErrCode::CORRUPT,"undo.dat missing but undoSize="+std::to_string(m.undoSize)); return false; }
+    // R1 (F0-4): the referenced log must be a regular file. lstat (not stat) so a symlink or any other
+    // non-regular object is refused here instead of being followed/read and only failing later.
+    struct stat st; if(::lstat(p("undo.dat").c_str(),&st)!=0){ setErr(e,ErrCode::CORRUPT,"undo.dat missing but undoSize="+std::to_string(m.undoSize)); return false; }
+    if(!S_ISREG(st.st_mode)){ setErr(e,ErrCode::CORRUPT,"undo.dat is not a regular file ("+(S_ISLNK(st.st_mode)?std::string("symbolic link"):(S_ISDIR(st.st_mode)?std::string("directory"):std::string("non-regular file")))+") but undoSize="+std::to_string(m.undoSize)+"; refusing to read it"); return false; }
     uint64_t off=0; const uint8_t magic[8]={'I','N','N','U','N','D','O','1'};
     while(off<m.undoSize){
         if(off+UNDO_HEADER_SIZE>m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo header crosses committed length"); return false; }
@@ -255,6 +307,14 @@ bool CommitStore3A::open(const std::string& dir, ChainError* e){
             if(!S_ISREG(st.st_mode)){ close(); setErr(e,ErrCode::IO,"existing tree.dat is not a regular file; refusing to recreate it"); return false; }
             if(st.st_size<=0 || (st.st_size % (off_t)PAGE_SIZE)!=0){ close(); setErr(e,ErrCode::CORRUPT,"existing tree.dat (size "+std::to_string((long long)st.st_size)+") without MANIFEST/ACK is not a whole-page image; refusing to truncate or recreate"); return false; }
         } else if(errno!=ENOENT){ close(); setErr(e,ErrCode::IO,"stat(tree.dat) failed (errno="+std::to_string(errno)+"); not treating a stat error as file absence"); return false; }
+        // R1 (F0-2): an orphan undo.dat is prior-store evidence exactly like tree.dat. Classify it BEFORE
+        // anything is created or written, and remember the policy the first undo write must enforce so no
+        // byte of an operator's or a crashed initialization's file is silently overwritten.
+        { std::string det; int uk=classifyUndoEvidence(p("undo.dat"),&det);
+          if(uk==-1){ close(); setErr(e,ErrCode::IO,"lstat(undo.dat) failed ("+det+"); not treating a stat error as file absence"); return false; }
+          if(uk==3){ close(); setErr(e,ErrCode::CORRUPT,"existing undo.dat is not a regular file ("+det+") and there is no MANIFEST/ACK; refusing to overwrite it"); return false; }
+          if(uk==2){ close(); setErr(e,ErrCode::CORRUPT,"existing undo.dat holds "+det+" of undo log without MANIFEST/ACK (prior-store evidence); refusing to overwrite the orphan log"); return false; }
+          freshUndoCreate_ = (uk==0) ? UndoCreate::RequireAbsent : UndoCreate::RequireExisting; }
         if(!hasTree){
             clearErr(e); if(!tree_.create(tp,e)){ close(); return false; }   // genuinely no prior store
         } else {
@@ -287,29 +347,59 @@ bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const
     // 1) durable tree pages
     if(inj(InjectStage::PageWrite)){ injErr(e,"tree fsync"); return false; }
     if(!tree_.fsync(e)) return false;
-    // 2) undo append, at the COMMITTED logical offset (F0: never O_APPEND, never truncate)
+    // 2) R1 (closes F0-1): establish MANIFEST.bak from the CURRENT primary BEFORE any byte of the undo
+    //    log is (re)written, atomically, and make that replacement durable BEFORE the write.
+    //    Why the ordering is load-bearing: after a disconnect, the retained MANIFEST.bak still describes
+    //    the pre-disconnect generation, whose undoSize is LARGER than the new committed logical end.
+    //    Writing the next undo record at that end reuses the disconnected (stale) tail -- bytes the
+    //    backup still references -- so a crash between the write and the backup replacement would leave
+    //    a manifest pointing at overwritten log bytes (F0-1). Replacing the backup first establishes the
+    //    invariant: every retained manifest (primary AND MANIFEST.bak) references only bytes below the
+    //    write offset, in every crash state. The replacement is atomic (tmp + rename; the live backup is
+    //    never truncated in place) and is followed by a directory fsync, because a non-durable rename
+    //    would be rolled back by a power loss and re-expose the older, larger backup mid-write.
+    crashIf(CrashPoint::BeforeBakReplace);
+    {
+        std::vector<uint8_t> cur; bool curEx=false; ChainError e2;
+        if(!csReadFile(p("MANIFEST"),&cur,&curEx,&e2)){ setErr(e,e2.code,"read prior MANIFEST: "+e2.msg); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+        if(curEx){
+            Manifest bman;
+            if(!Manifest::decode(cur.data(),cur.size(),&bman,&e2)){ setErr(e,e2.code,"prior MANIFEST is undecodable; refusing to publish over it: "+e2.msg); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            if(!tree_.checkRootHash(bman.rootPageId,bman.rootHash,&e2)){ setErr(e,e2.code,"prior MANIFEST references an unreadable root; refusing to publish: "+e2.msg); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            if(undoAppendLen>0 && bman.undoSize!=undoOffset){
+                setErr(e,ErrCode::CORRUPT,"prior MANIFEST undoSize="+std::to_string((unsigned long long)bman.undoSize)+
+                       " does not equal the committed write offset "+std::to_string((unsigned long long)undoOffset)+
+                       "; refusing to write undo bytes over/at a region the retained backup references");
+                ::unlink(p("MANIFEST.tmp").c_str()); return false;
+            }
+            const std::string bakTmp=p("MANIFEST.bak.tmp");
+            if(!csWriteFile(bakTmp,cur.data(),cur.size(),ns(InjectStage::BakWrite),ff(InjectStage::BakWrite),e)){ ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            std::vector<uint8_t> rb; bool rex=false; ChainError e3;
+            if(!csReadFile(bakTmp,&rb,&rex,&e3)||!rex){ setErr(e,ErrCode::FS,"backup not readable after write"); ::unlink(bakTmp.c_str()); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            if(!Manifest::decode(rb.data(),rb.size(),&bman,&e3)){ setErr(e,ErrCode::FS,"backup not decodable after write: "+e3.msg); ::unlink(bakTmp.c_str()); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            if(!tree_.checkRootHash(bman.rootPageId,bman.rootHash,&e3)){ setErr(e,ErrCode::FS,"backup references unreadable root: "+e3.msg); ::unlink(bakTmp.c_str()); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            crashIf(CrashPoint::BakPrepared);
+            if(::rename(bakTmp.c_str(),p("MANIFEST.bak").c_str())!=0){ setErr(e,ErrCode::FS,"rename MANIFEST.bak"); ::unlink(bakTmp.c_str()); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+            if(!csFsyncDir(dir_,e)){ ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+        }
+    }
+    crashIf(CrashPoint::AfterBakReplace);
+    // 3) undo write, at the COMMITTED logical offset (F0: never O_APPEND, never truncate)
     if(undoAppendLen>0){
+        // R1 (F0-2): the first undo write after a fresh open obeys the create policy fixed by the
+        // open-time classification (absent -> O_EXCL create; accepted empty residue -> never create).
+        UndoCreate cre=freshUndoCreate_; freshUndoCreate_=UndoCreate::Any;
         if(injectUndoShortOnce_>0 && injectUndoShortOnce_<undoAppendLen){   // F0 test hook: torn write
             size_t part=injectUndoShortOnce_; injectUndoShortOnce_=0;
-            if(!csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,part,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e)) return false;
+            if(!csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,part,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre)) return false;
             setErr(e,ErrCode::IO,"injected short undo write"); return false;
         }
-        if(!csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,undoAppendLen,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e)) return false;
+        if(!csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,undoAppendLen,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre)) return false;
     }
-    // 3) manifest tmp
+    crashIf(CrashPoint::AfterUndoWrite);
+    // 4) manifest tmp
     std::vector<uint8_t> mb=m.encode();
     if(!csWriteFile(p("MANIFEST.tmp"),mb.data(),mb.size(),ns(InjectStage::ManifestTmp),ff(InjectStage::ManifestTmp),e)) return false;
-    // 4) establish backup (checked)
-    { std::vector<uint8_t> cur; bool curEx=false; ChainError e2;
-      if(!csReadFile(p("MANIFEST"),&cur,&curEx,&e2)){ setErr(e,e2.code,"read prior MANIFEST: "+e2.msg); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
-      if(curEx){
-        if(!csWriteFile(p("MANIFEST.bak"),cur.data(),cur.size(),ns(InjectStage::BakWrite),ff(InjectStage::BakWrite),e)){ ::unlink(p("MANIFEST.tmp").c_str()); return false; }
-        std::vector<uint8_t> rb; bool rex=false; ChainError e3; Manifest bman;
-        if(!csReadFile(p("MANIFEST.bak"),&rb,&rex,&e3)||!rex){ setErr(e,ErrCode::FS,"backup not readable after write"); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
-        if(!Manifest::decode(rb.data(),rb.size(),&bman,&e3)){ setErr(e,ErrCode::FS,"backup not decodable after write: "+e3.msg); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
-        if(!tree_.checkRootHash(bman.rootPageId,bman.rootHash,&e3)){ setErr(e,ErrCode::FS,"backup references unreadable root: "+e3.msg); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
-      }
-    }
     // 5) VISIBILITY
     crashIf(CrashPoint::BeforeRename);
     if(inj(InjectStage::PrimaryRename)){ injErr(e,"primary rename"); ::unlink(p("MANIFEST.tmp").c_str()); return false; }

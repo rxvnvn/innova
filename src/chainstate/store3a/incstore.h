@@ -30,8 +30,16 @@ struct UndoRecord {
 
 struct UndoMeta { Hash blockHash{}; int32_t height = 0; uint64_t offset = 0; uint32_t len = 0; };
 
-enum class CrashPoint { None, BeforeRename, AfterRename, AfterDirSync };
+enum class CrashPoint { None, BeforeBakReplace, BakPrepared, AfterBakReplace, AfterUndoWrite, BeforeRename, AfterRename, AfterDirSync };
 enum class InjectStage { None, PageWrite, UndoAppend, ManifestTmp, BakWrite, PrimaryRename, DirFsync, AckWrite };
+// R1 (F0-2): creation policy for the first undo write after a fresh open. It closes the TOCTOU window
+// between the open-time classification of an orphan undo.dat and the first create/write of the log:
+//   Any             - create if missing (ordinary publish on an established store).
+//   RequireAbsent   - open O_CREAT|O_EXCL: fail closed if the path exists at all, i.e. if anything
+//                     appeared between classification and creation (kernel-atomic, no lstat race).
+//   RequireExisting - never create (no O_CREAT): fail closed if the file disappeared after it was
+//                     classified as an accepted empty residue.
+enum class UndoCreate { Any, RequireAbsent, RequireExisting };
 
 class CommitStore3A {
 public:
@@ -112,13 +120,20 @@ private:
     bool injectNoSpace_ = false;
     bool injectFsyncFail_ = false;
     size_t injectUndoShortOnce_ = 0;
+    // R1 (F0-2): the creation policy for the next undo write after a fresh open (consumed by it).
+    UndoCreate freshUndoCreate_ = UndoCreate::Any;
 };
 
+// R1 (F0-2): the create policy is documented on the UndoCreate enum above.
 bool csWriteFile(const std::string& path, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e);
 bool csAppendFile(const std::string& path, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e);
 // F0: write at an explicit offset. Never truncates; never moves the offset implicitly (no O_APPEND);
 // refuses to write past a hole (file shorter than off). Bytes < off are left byte-identical.
-bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e);
+// R1: the trailing `create` policy decides whether the file may be created, and fails closed on any
+// classification/creation race (see UndoCreate). Every failure path here is fail-closed: the caller
+// must not treat a false return as "nothing was written" without checking its own recovery contract.
+bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e,
+                   UndoCreate create = UndoCreate::Any);
 bool csReadFile(const std::string& path, std::vector<uint8_t>* out, bool* exists, ChainError* e);
 bool csReadRange(const std::string& path, uint64_t off, uint64_t len, std::vector<uint8_t>* out, ChainError* e);
 bool csFsyncDir(const std::string& dir, ChainError* e);

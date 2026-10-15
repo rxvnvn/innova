@@ -956,17 +956,29 @@ static void test_f0_undo(){
           CHECK(ok&&DG(r,&e)==dAfterH4,"F0-16 exact digest == dAfterH4 after disconnect/restart"); r.close(); }
     }
 
-    // ---- F0-17 orphan undo.dat with no MANIFEST/ACK/tree.dat must not poison the new log
+    // ---- F0-17 (R1-updated) orphan undo.dat with no MANIFEST/ACK/tree.dat is prior-store evidence:
+    //      R1 REFUSES the fresh open instead of adopting the directory and overwriting the orphan's
+    //      leading bytes on the first publish (that overwrite was F0-2). The pre-R1 expectation here
+    //      ("fresh open ... adopted") is the behaviour this pass fixes.
     {
-        std::string d=freshDir("f0_17"); std::string de=freshDir("f0_17_empty"); Hash dEmpty;
-        { CommitStore3A s; CHECK(s.open(de,&e),"F0-17 empty ref open"); dEmpty=DG(s,&e); s.close(); }
+        std::string d=freshDir("f0_17"); std::string de=freshDir("f0_17_empty");
         { FILE* f=fopen((d+"/undo.dat").c_str(),"wb"); if(f){ for(int i=0;i<200;i++) fputc(0x41,f); fclose(f); } }
         CHECK(FSZ(d+"/undo.dat")==200, "F0-17 orphan undo.dat planted (200 bytes)");
-        { CommitStore3A s; CHECK(s.open(d,&e),"F0-17 fresh open over orphan undo.dat: "+e.str());
-          CHECK(s.generation()==0 && s.undoCount()==0, "F0-17 fresh gen0 with empty undo index");
-          CHECK(PUB(s,1,0,0,3,&e),"F0-17 first publish");
-          CHECK(COH(d,&e),"F0-17 coherence after first publish"); s.close(); }
-        { CommitStore3A r; CHECK(r.open(d,&e),"F0-17 restart: "+e.str());
+        Hash orphan=fdig(d+"/undo.dat");
+        { CommitStore3A s; bool ok=s.open(d,&e);
+          CHECK(!ok, "F0-17/R1 (F0-2) orphan nonempty undo.dat -> FAIL CLOSED, no adoption: "+e.str());
+          CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK"), "F0-17/R1 no pointer files invented over the orphan");
+          CHECK(FSZ(d+"/undo.dat")==200 && fdig(d+"/undo.dat")==orphan, "F0-17/R1 orphan bytes preserved byte-for-byte");
+          if(ok) s.close(); }
+        // the accepted residue form: a zero-length undo.dat can be destroyed in no way, so it is adopted
+        { FILE* f=fopen((de+"/undo.dat").c_str(),"wb"); fclose(f); }
+        Hash dEmpty;
+        { CommitStore3A s; CHECK(s.open(de,&e),"F0-17 empty undo.dat residue accepted: "+e.str());
+          CHECK(s.generation()==0 && s.undoCount()==0, "F0-17 empty residue opens as gen0 with an empty index");
+          dEmpty=DG(s,&e);
+          CHECK(PUB(s,1,0,0,3,&e),"F0-17 first publish over the accepted empty residue");
+          CHECK(COH(de,&e),"F0-17 coherence after first publish"); s.close(); }
+        { CommitStore3A r; CHECK(r.open(de,&e),"F0-17 restart: "+e.str());
           CHECK(r.generation()==1 && r.undoCount()==1, "F0-17 restart reads exactly one coherent record");
           bool ok=r.disconnect(id32(0xB10C0000u,1),&e);
           CHECK(ok,"F0-17 disconnect(h1): "+e.str());
@@ -974,12 +986,336 @@ static void test_f0_undo(){
     }
 }
 
+// ==================== Stage 3B-F0-R1: durability + fresh-open hardening =======
+// F0-1: MANIFEST.bak could reference undo bytes overwritten by the next pwrite.
+// F0-2: an orphan undo.dat could be silently overwritten during fresh initialization.
+static uint64_t MFIELD(const std::string& p, size_t off){
+    FILE* f=fopen(p.c_str(),"rb"); if(!f) return 0; uint8_t b[8];
+    if(fseek(f,(long)off,SEEK_SET)!=0){ fclose(f); return 0; }
+    size_t n=fread(b,1,8,f); fclose(f); if(n<8) return 0;
+    uint64_t v=0; for(int i=0;i<8;i++) v|=(uint64_t)b[i]<<(8*i); return v; }
+static uint64_t MUU(const std::string& d){ return MFIELD(d+"/MANIFEST",24); }
+static uint64_t MBU(const std::string& d){ return MFIELD(d+"/MANIFEST.bak",24); }
+static Hash RNGD(const std::string& p, uint64_t off, uint64_t len){
+    FILE* f=fopen(p.c_str(),"rb"); if(!f) return Hash();
+    if(fseek(f,(long)off,SEEK_SET)!=0){ fclose(f); return Hash(); }
+    ChainedHash h; uint8_t b[4096]; uint64_t got=0;
+    while(got<len){ size_t want=(size_t)((len-got)<4096?(len-got):4096); size_t r=fread(b,1,want,f); if(!r) break; h.put(b,r); got+=r; }
+    fclose(f); return h.final(); }
+static bool CPFILE(const std::string& src,const std::string& dst){
+    FILE* in=fopen(src.c_str(),"rb"); if(!in) return false;
+    FILE* out=fopen(dst.c_str(),"wb"); if(!out){ fclose(in); return false; }
+    uint8_t b[65536]; size_t n; bool ok=true;
+    while((n=fread(b,1,sizeof(b),in))>0) if(fwrite(b,1,n,out)!=n){ ok=false; break; }
+    fclose(in); if(fclose(out)!=0) ok=false; return ok; }
+static bool LSTATM(const std::string& p, mode_t* m){ struct stat st; if(::lstat(p.c_str(),&st)!=0) return false; *m=st.st_mode; return true; }
+static Block mkBlockH(int32_t h,uint32_t lab,uint32_t txlab,size_t slen){
+    Block b; b.hash=id32(0xB10C0000u+lab,(uint32_t)h); b.height=h;
+    Tx cb; cb.txid=id32(0xCB000000u+txlab,(uint32_t)h); cb.coinbase=true; cb.coinstake=false;
+    TxOut o; o.value=50*COIN; o.script.assign(slen,7); cb.vout.push_back(o); b.txs.push_back(cb); return b; }
+static bool PUBH(CommitStore3A& s,int32_t h,uint32_t lab,uint32_t txlab,size_t slen,ChainError* e){
+    Block b=mkBlockH(h,lab,txlab,slen); return publishStore(s,b,e); }
+// the F0-1 vulnerable state: h1..h3 (h3 LONG) then disconnect h3 => bak.undoSize > primary.undoSize
+static bool r1SetupPostDisconnect(const std::string& d, Hash* dig, ChainError* e){
+    CommitStore3A s; if(!s.open(d,e)) return false;
+    if(!PUBH(s,1,0,0,3,e)||!PUBH(s,2,0,0,3,e)||!PUBH(s,3,0,0,2000,e)){ s.close(); return false; }
+    if(!s.disconnect(id32(0xB10C0000u,3),e)){ s.close(); return false; }
+    *dig=DG(s,e); s.close(); return true; }
+static bool r1PlantValidUndo(const std::string& dir,const std::string& tag,ChainError* e){
+    std::string src=freshDir("r1_src_"+tag); Hash dd;
+    if(!r1SetupPostDisconnect(src,&dd,e)) return false;
+    if(!CPFILE(src+"/undo.dat",dir+"/undo.dat")) return false;
+    return true; }
+
+static void test_r1_f01_backup_window(){
+    g_cur="R1-F0-1";
+    ChainError e;
+    // ---- R1-02/R1-03/R1-04: no retained manifest may reference a byte the reconnect write overwrites
+    {
+        std::string d=freshDir("r1_f01a"); Hash dDisc;
+        CHECK(r1SetupPostDisconnect(d,&dDisc,&e), "R1-01 setup (h1..h3, disconnect h3): "+e.str());
+        uint64_t mu=MUU(d), bu=MBU(d); long pb=FSZ(d+"/undo.dat");
+        printf("  R1-01 post-disconnect state: primary.undoSize=%llu bak.undoSize=%llu physical=%ld\n", (unsigned long long)mu,(unsigned long long)bu,pb);
+        CHECK(bu>mu, "R1-01 bak.undoSize ("+std::to_string(bu)+") > primary.undoSize ("+std::to_string(mu)+") = the F0-1 vulnerable state");
+        CHECK(pb==(long)bu, "R1-01 physical undo length == bak-referenced length (stale tail retained)");
+        Hash preP=RNGD(d+"/undo.dat",0,mu), preB=RNGD(d+"/undo.dat",0,bu);
+        CHECK(CPFILE(d+"/undo.dat",d+"/undo.pre"), "R1-01 snapshot undo.dat");
+        { CommitStore3A s; CHECK(s.open(d,&e), "R1-01 reopen: "+e.str());
+          s.setInjectStage(InjectStage::ManifestTmp); s.injectNoSpace(true);
+          bool ok=PUBH(s,4,0,0,3,&e); s.clearInjection();
+          CHECK(!ok, "R1-01 reconnect publish fails after the undo write (injected no-space at MANIFEST.tmp): "+e.str());
+          CHECK(s.generation()==4 && s.acknowledgedGeneration()==4, "R1-01 generation/ACK stay at the acknowledged 4");
+          s.close(); }
+        uint64_t mu2=MUU(d), bu2=MBU(d);
+        printf("  R1-01 after failed reconnect: primary.undoSize=%llu bak.undoSize=%llu physical=%ld\n", (unsigned long long)mu2,(unsigned long long)bu2,FSZ(d+"/undo.dat"));
+        CHECK(mu2==mu, "R1-04 committed MANIFEST.undoSize untouched by the failed publish");
+        CHECK(RNGD(d+"/undo.dat",0,mu)==preP, "R1-04 acknowledged undo prefix [0,primary.undoSize) byte-identical");
+        CHECK(bu2<=mu2, "R1-03 retained bak.undoSize "+std::to_string(bu2)+" <= primary.undoSize "+std::to_string(mu2));
+        CHECK(RNGD(d+"/undo.dat",0,bu2)==RNGD(d+"/undo.pre",0,bu2), "R1-03 MANIFEST.bak references only bytes below the write offset (F0-1 invariant)");
+        CHECK(RNGD(d+"/undo.dat",mu,(uint64_t)pb-mu)!=RNGD(d+"/undo.pre",mu,(uint64_t)pb-mu), "R1-01 evidence: the reconnect write DID modify the stale tail at/after the committed end");
+        (void)preB;
+    }
+    // ---- R1-16/R1-04: double fault inside/after the window must not degrade the fallback
+    {
+        std::string d=freshDir("r1_f01b"); Hash dDisc;
+        CHECK(r1SetupPostDisconnect(d,&dDisc,&e), "R1-16 setup: "+e.str());
+        { CommitStore3A s; CHECK(s.open(d,&e),"R1-16 reopen");
+          s.setInjectStage(InjectStage::ManifestTmp); s.injectNoSpace(true);
+          CHECK(!PUBH(s,4,0,0,3,&e), "R1-16 reconnect publish fails inside the window");
+          s.clearInjection(); s.close(); }
+        writeJunk(d+"/MANIFEST","GARBAGE-PRIMARY-MANIFEST-AFTER-THE-WINDOW");
+        CommitStore3A r; bool ok=r.open(d,&e);
+        printf("  R1-16 double fault: open=%d gen=%llu err=%s\n", (int)ok,(unsigned long long)(ok?r.generation():0),e.str().c_str());
+        CHECK(ok, "R1-16 double fault recovers from the intact backup (was: fail-closed 'no valid backup'): "+e.str());
+        if(ok){ CHECK(r.generation()==4, "R1-16 recovered generation == 4 (the acknowledged one)");
+          CHECK(DG(r,&e)==dDisc, "R1-16 recovered logical state == acknowledged post-disconnect state");
+          CHECK(r.undoCount()==2, "R1-16 recovered undo index == 2 records");
+          CHECK(MFIELD(d+"/MANIFEST",16)==4, "R1-16 MANIFEST repaired from the backup");
+          CHECK(r.acknowledgedGeneration()==4, "R1-16 ACK still 4 (no rollback of acknowledged state)");
+          r.close(); }
+    }
+    // ---- R1-19/R1-20: the invariant survives repeated disconnect/reconnect cycles (mixed lengths)
+    {
+        std::string d=freshDir("r1_f01c"); ChainError ce;
+        { CommitStore3A s; CHECK(s.open(d,&ce),"R1-19 open"); bool allok=true;
+          for(int c=0;c<3;c++){
+            int32_t h=1+2*c;
+            if(!PUBH(s,h,0,0,3,&ce)||!s.disconnect(id32(0xB10C0000u,(uint32_t)h),&ce)){ allok=false; break; }
+            if(!PUBH(s,h+1,(uint32_t)(10+c),(uint32_t)(10+c),(c==1?2000:3),&ce)){ allok=false; break; }
+          }
+          CHECK(allok, "R1-19 three disconnect/reconnect cycles with mixed record lengths: "+ce.str());
+          uint64_t pu=MUU(d), pbi=MBU(d);
+          CHECK(pbi<=pu, "R1-19 final bak.undoSize <= primary.undoSize");
+          CHECK(RNGD(d+"/undo.dat",0,pbi)==RNGD(d+"/undo.dat",0,pbi) && pbi<=pu, "R1-19 retained manifests reference in-range bytes only");
+          CHECK(COH(d,&ce),"R1-19 coherence"); s.close(); }
+    }
+    // ---- R1-17: backup corruption handling (valid primary ignores it; both corrupt fails closed)
+    {
+        std::string d=freshDir("r1_f01d"); Hash dA;
+        CHECK(r1SetupPostDisconnect(d,&dA,&e), "R1-17 setup: "+e.str());
+        writeJunk(d+"/MANIFEST.bak","CORRUPT-BACKUP-BYTES");
+        { CommitStore3A s; bool ok=s.open(d,&e);
+          CHECK(ok && s.generation()==4, "R1-17 corrupt backup with a valid primary: open succeeds, backup not consulted");
+          CHECK(ok && DG(s,&e)==dA, "R1-17 logical state unchanged");
+          if(ok) s.close(); }
+        writeJunk(d+"/MANIFEST","GARBAGE-PRIMARY-BYTES");
+        Hash pg=fdig(d+"/MANIFEST");
+        { CommitStore3A r; bool ok=r.open(d,&e);
+          CHECK(!ok, "R1-17 primary AND backup corrupt -> FAIL CLOSED (no silent rollback): "+e.str());
+          CHECK(fdig(d+"/MANIFEST")==pg, "R1-17 corrupt primary left exactly as found (no silent repair/rollback)");
+          if(ok) r.close(); }
+    }
+    // ---- R1-17b: the backup is re-established from the current primary by the next publish
+    {
+        std::string d=freshDir("r1_f01e"); Hash dA;
+        CHECK(r1SetupPostDisconnect(d,&dA,&e), "R1-17b setup: "+e.str());
+        writeJunk(d+"/MANIFEST.bak","CORRUPT-BACKUP-BYTES");
+        uint64_t mu0=MUU(d);
+        CHECK(CPFILE(d+"/undo.dat",d+"/undo.pre"), "R1-17b snapshot undo.dat");
+        { CommitStore3A s; CHECK(s.open(d,&e), "R1-17b open with a corrupt backup");
+          CHECK(PUBH(s,4,0,0,3,&e), "R1-17b publish with a corrupt backup");
+          s.close(); }
+        CHECK(MBU(d)==mu0, "R1-17b backup re-established from the acknowledged primary ("+std::to_string((unsigned long long)MBU(d))+"=="+std::to_string((unsigned long long)mu0)+")");
+        CHECK(RNGD(d+"/undo.dat",0,MBU(d))==RNGD(d+"/undo.pre",0,MBU(d)), "R1-17b re-established backup references only unmodified bytes");
+        { CommitStore3A r; CHECK(r.open(d,&e), "R1-17b reopen: "+e.str()); CHECK(r.generation()==5, "R1-17b generation 5"); r.close(); }
+    }
+}
+
+static void r1CrashChild(const std::string& dir,int mode){
+    ChainError e; CommitStore3A s; if(!s.open(dir,&e)) ::_exit(2);
+    Block b=mkBlockH(4,0,0,3); TreeReader tr(s.tree()); Delta d;
+    if(!buildDeltaI(tr,b,MAT,&d,&e)) ::_exit(3);
+    switch(mode){
+        case 0: s.setCrashPoint(CrashPoint::BeforeBakReplace); break;
+        case 1: s.setCrashPoint(CrashPoint::BakPrepared); break;
+        case 2: s.setCrashPoint(CrashPoint::AfterBakReplace); break;
+        case 3: s.setCrashPoint(CrashPoint::AfterUndoWrite); break;
+        case 4: s.setCrashPoint(CrashPoint::BeforeRename); break;
+        case 5: s.setCrashPoint(CrashPoint::AfterRename); break;
+        case 6: s.setCrashPoint(CrashPoint::AfterDirSync); break;
+        default: break;
+    }
+    bool ok=s.publish(d,b.hash,b.height,&e);
+    ::_exit(ok?0:1);
+}
+
+static void test_r1_crash_matrix(){
+    g_cur="R1-crash";
+    ChainError e;
+    const char* nm[8]={"BeforeBakReplace","BakPrepared","AfterBakReplace","AfterUndoWrite","BeforeRename","AfterRename","AfterDirSync","complete"};
+    for(int mode=0;mode<8;mode++){
+        std::string tag=std::string(nm[mode]);
+        std::string d=freshDir(std::string("r1_c")+std::to_string(mode)); Hash dDisc;
+        CHECK(r1SetupPostDisconnect(d,&dDisc,&e), tag+" setup: "+e.str());
+        long pb=FSZ(d+"/undo.dat"); uint64_t mu0=MUU(d);
+        CHECK(CPFILE(d+"/undo.dat",d+"/undo.pre"), tag+" snapshot undo.dat");
+        CHECK(CPFILE(d+"/MANIFEST.bak",d+"/bak.pre"), tag+" snapshot MANIFEST.bak");
+        // clean reference run for the NEW state
+        Hash newDig; uint64_t newGen=0;
+        { std::string dE=freshDir(std::string("r1_cref")+std::to_string(mode)); Hash x;
+          CHECK(r1SetupPostDisconnect(dE,&x,&e), tag+" reference setup");
+          CommitStore3A s; CHECK(s.open(dE,&e), tag+" reference open");
+          CHECK(PUBH(s,4,0,0,3,&e), tag+" reference publish");
+          newDig=DG(s,&e); newGen=s.generation(); s.close(); }
+        pid_t pid=fork();
+        if(pid==0){ r1CrashChild(d,mode); ::_exit(7); }
+        int st=0; waitpid(pid,&st,0);
+        int expect=(mode==7)?0:42;
+        CHECK(WIFEXITED(st)&&WEXITSTATUS(st)==expect, tag+" child exit expected "+std::to_string(expect)+" got "+std::to_string(WIFEXITED(st)?WEXITSTATUS(st):-1));
+        { CommitStore3A r; bool ok=r.open(d,&e);
+          CHECK(ok, tag+" reopen: "+e.str());
+          if(ok){
+            bool vis=(mode>=5);
+            CHECK(r.generation()==(vis?newGen:4), tag+" generation "+(vis?"NEW (5)":"OLD acknowledged (4)")+": "+std::to_string((long long)r.generation()));
+            CHECK(DG(r,&e)==(vis?newDig:dDisc), tag+" logical digest "+(vis?"== clean NEW":"== acknowledged OLD"));
+            CHECK(r.acknowledgedGeneration()==r.generation(), tag+" ACK reconciled to the recovered generation");
+            uint64_t pu=MUU(d), ba=MBU(d);
+            // Bytes below the write offset (the acknowledged prefix) must be byte-identical in every
+            // state. A NEW-generation primary legitimately extends the referenced range with its own
+            // freshly written record, so the invariant is stated against the write offset, not undoSize.
+            uint64_t lim=(pu<mu0)?pu:mu0;
+            CHECK(lim>0 && RNGD(d+"/undo.dat",0,lim)==RNGD(d+"/undo.pre",0,lim), tag+" bytes below the write offset are untouched in the primary's range");
+            CHECK(pu<=(uint64_t)pb || vis, tag+" primary undoSize within the physical length (or extended by the new record)");
+            if(ba>0) CHECK(ba<=(uint64_t)pb && RNGD(d+"/undo.dat",0,ba)==RNGD(d+"/undo.pre",0,ba), tag+" MANIFEST.bak references only unmodified bytes");
+            CHECK(COH(d,&e), tag+" coherence physical>=logical");
+            if(mode==1) CHECK(!fexists(d+"/MANIFEST.bak.tmp"), tag+" interrupted backup tmp removed by open");
+            r.close(); }
+        }
+        // double fault after the crash: recoverable exactly when the crash followed the backup replacement
+        if(mode<=3){
+            std::string dd=freshDir(std::string("r1_cd")+std::to_string(mode)); Hash dDisc2;
+            CHECK(r1SetupPostDisconnect(dd,&dDisc2,&e), tag+" double-fault setup");
+            pid_t p2=fork();
+            if(p2==0){ r1CrashChild(dd,mode); ::_exit(7); }
+            int st2=0; waitpid(p2,&st2,0);
+            writeJunk(dd+"/MANIFEST","GARBAGE-PRIMARY-AFTER-CRASH");
+            CommitStore3A r2; bool ok2=r2.open(dd,&e);
+            printf("  %s double fault: open=%d gen=%llu err=%s\n", nm[mode], (int)ok2, (unsigned long long)(ok2?r2.generation():0), e.str().c_str());
+            if(mode>=2){
+                CHECK(ok2, tag+" double fault recovers the acknowledged generation (backup replaced before the write): "+e.str());
+                if(ok2){ CHECK(r2.generation()==4 && DG(r2,&e)==dDisc2, tag+" double fault recovered gen4 with the acknowledged state"); r2.close(); }
+            } else {
+                CHECK(!ok2, tag+" double fault fail-closed (the retained backup predates the acknowledged generation): ");
+                if(ok2) r2.close();
+            }
+        }
+    }
+}
+
+static void test_r1_fresh_open_matrix(){
+    g_cur="R1-fresh";
+    ChainError e;
+    // D1 genuine fresh initialization still works
+    { std::string d=freshDir("r1_d1"); CommitStore3A s; CHECK(s.open(d,&e), "D1 fresh open: "+e.str());
+      CHECK(s.generation()==0, "D1 gen0");
+      CHECK(fexists(d+"/tree.dat") && !fexists(d+"/undo.dat"), "D1 sentinel page created, no undo.dat invented");
+      CHECK(PUBH(s,1,0,0,3,&e), "D1 first publish"); CHECK(COH(d,&e), "D1 coherence"); s.close();
+      CommitStore3A r; CHECK(r.open(d,&e), "D1 restart: "+e.str()); CHECK(r.generation()==1,"D1 restart gen1"); r.close(); }
+    // D2 empty undo.dat only -> accepted residue (0 bytes: nothing can be destroyed), then TOCTOU guard
+    { std::string d=freshDir("r1_d2"); { FILE* f=fopen((d+"/undo.dat").c_str(),"wb"); fclose(f); }
+      CommitStore3A s; CHECK(s.open(d,&e), "D2 empty undo.dat residue accepted: "+e.str());
+      CHECK(PUBH(s,1,0,0,3,&e), "D2 first publish over the accepted residue"); CHECK(COH(d,&e), "D2 coherence"); s.close();
+      CommitStore3A r; CHECK(r.open(d,&e), "D2 restart: "+e.str()); CHECK(r.generation()==1 && r.undoCount()==1, "D2 restart gen1/undoCount1");
+      CHECK(r.disconnect(id32(0xB10C0000u,1),&e), "D2 disconnect works"); r.close(); }
+    // D3 nonempty VALID undo.dat only -> FAIL CLOSED, bytes preserved
+    { std::string d=freshDir("r1_d3"); CHECK(r1PlantValidUndo(d,"d3",&e), "D3 plant a real nonempty undo.dat");
+      long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat"); CHECK(us>0, "D3 planted undo.dat is nonempty ("+std::to_string(us)+" bytes)");
+      CommitStore3A s; bool ok=s.open(d,&e);
+      CHECK(!ok, "D3 nonempty orphan undo.dat -> FAIL CLOSED (was: silently adopted then overwritten): "+e.str());
+      CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "D3 orphan bytes byte-identical");
+      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK") && !fexists(d+"/tree.dat"), "D3 no store files invented");
+      if(ok) s.close(); }
+    // D4 nonempty CORRUPT undo.dat only -> FAIL CLOSED, bytes preserved
+    { std::string d=freshDir("r1_d4"); writeJunk(d+"/undo.dat","NOT-A-RECORD-AT-ALL-0123456789");
+      long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "D4 nonempty corrupt orphan undo.dat -> FAIL CLOSED: "+e.str());
+      CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "D4 corrupt orphan preserved (not destroyed, not quarantined)");
+      if(ok) s.close(); }
+    // D5 directory named undo.dat -> FAIL CLOSED, still a directory
+    { std::string d=freshDir("r1_d5"); CHECK(mkdir((d+"/undo.dat").c_str(),0755)==0, "D5 create directory named undo.dat");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "D5 non-regular undo.dat (directory) -> FAIL CLOSED: "+e.str());
+      mode_t m=0; CHECK(LSTATM(d+"/undo.dat",&m)&&S_ISDIR(m), "D5 directory left in place (not moved/deleted)");
+      if(ok) s.close(); }
+    // D6 symlink named undo.dat -> FAIL CLOSED, link and target untouched
+    { std::string d=freshDir("r1_d6"); writeJunk(d+"/target.dat","SYMLINK-TARGET-CONTENT");
+      CHECK(::symlink((d+"/target.dat").c_str(),(d+"/undo.dat").c_str())==0, "D6 plant symlink undo.dat");
+      Hash tg=fdig(d+"/target.dat");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "D6 symlinked undo.dat -> FAIL CLOSED (never followed): "+e.str());
+      mode_t m=0; CHECK(LSTATM(d+"/undo.dat",&m)&&S_ISLNK(m), "D6 symlink not replaced by a regular file");
+      CHECK(fdig(d+"/target.dat")==tg, "D6 symlink target untouched");
+      if(ok) s.close(); }
+    // D7 unreadable/unwritable undo.dat -> FAIL CLOSED at open
+    { std::string d=freshDir("r1_d7"); { FILE* f=fopen((d+"/undo.dat").c_str(),"wb"); fclose(f); }
+      bool nonroot=(::geteuid()!=0);
+      if(nonroot){ CHECK(::chmod((d+"/undo.dat").c_str(),0000)==0, "D7 chmod 000 undo.dat");
+        CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "D7 unreadable undo.dat -> FAIL CLOSED: "+e.str());
+        ::chmod((d+"/undo.dat").c_str(),0644); CHECK(FSZ(d+"/undo.dat")==0, "D7 file untouched (still empty)"); }
+      else printf("  D7 note: running as root; EACCES path not exercised\n"); }
+    // D8 nonempty undo.dat beside an ACCEPTED empty sentinel tree.dat -> still FAIL CLOSED
+    { std::string d=freshDir("r1_d8"); { CommitStore3A s; CHECK(s.open(d,&e),"D8 sentinel open: "+e.str()); s.close(); }
+      CHECK(FSZ(d+"/tree.dat")==4096, "D8 empty sentinel tree.dat present");
+      CHECK(r1PlantValidUndo(d,"d8",&e), "D8 plant nonempty undo.dat");
+      long ts=FSZ(d+"/tree.dat"), us=FSZ(d+"/undo.dat"); Hash th=fdig(d+"/tree.dat"), uh=fdig(d+"/undo.dat");
+      CommitStore3A s; bool ok=s.open(d,&e);
+      CHECK(!ok, "D8 nonempty orphan undo.dat beside an accepted empty tree -> FAIL CLOSED: "+e.str());
+      CHECK(FSZ(d+"/tree.dat")==ts && fdig(d+"/tree.dat")==th && FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "D8 nothing modified");
+      if(ok) s.close(); }
+    // D9 undo.dat + MANIFEST.bak only / D10 undo.dat + ACK only -> the existing pointer rules fire
+    { std::string d=freshDir("r1_d9"); CHECK(mkStore6(d,&e),"D9 build"); CHECK(CPFILE(d+"/MANIFEST.bak",d+"/bak.keep"),"D9 keep bak copy");
+      unlink((d+"/MANIFEST").c_str()); unlink((d+"/ACK").c_str());
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "D9 backup-only + undo.dat -> FAIL CLOSED: "+e.str()); if(ok) s.close(); }
+    { std::string d=freshDir("r1_d10"); CHECK(mkStore6(d,&e),"D10 build");
+      unlink((d+"/MANIFEST").c_str()); unlink((d+"/MANIFEST.bak").c_str());
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "D10 ACK + undo.dat, MANIFEST missing -> FAIL CLOSED: "+e.str()); if(ok) s.close(); }
+    // D11 existing acknowledged store is unaffected
+    { std::string d=freshDir("r1_d11"); CHECK(mkStore6(d,&e),"D11 build");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(ok, "D11 acknowledged store still opens: "+e.str());
+      if(ok){ CHECK(s.generation()==6, "D11 generation 6 preserved");
+        CHECK(PUBH(s,7,0,0,3,&e), "D11 publish continues to work");
+        CHECK(s.disconnect(id32(0xB10C0000u,7),&e), "D11 disconnect continues to work"); CHECK(COH(d,&e),"D11 coherence"); s.close(); } }
+    // D12 missing undo.dat with committed undoSize>0 -> FAIL CLOSED
+    { std::string d=freshDir("r1_d12"); CHECK(mkStore6(d,&e),"D12 build");
+      CHECK(unlink((d+"/undo.dat").c_str())==0, "D12 remove the referenced undo.dat");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "D12 missing undo.dat with undoSize>0 -> FAIL CLOSED: "+e.str()); if(ok) s.close(); }
+    // D13 partial-initialization residue (tree pages + nonempty undo, no pointers) -> FAIL CLOSED, all bytes preserved
+    { std::string d=freshDir("r1_d13"); CHECK(mkStore6(d,&e),"D13 build");
+      unlink((d+"/MANIFEST").c_str()); unlink((d+"/ACK").c_str()); unlink((d+"/MANIFEST.bak").c_str());
+      long ts=FSZ(d+"/tree.dat"), us=FSZ(d+"/undo.dat"); Hash th=fdig(d+"/tree.dat"), uh=fdig(d+"/undo.dat");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "D13 residue (tree+undo, no pointers) -> FAIL CLOSED: "+e.str());
+      CHECK(FSZ(d+"/tree.dat")==ts && fdig(d+"/tree.dat")==th && FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "D13 every byte preserved");
+      if(ok) s.close(); }
+    // D14 repeated restart after a failed open: deterministic refusal, no mutation, no quarantine
+    { std::string d=freshDir("r1_d14"); writeJunk(d+"/undo.dat","ORPHAN-EVIDENCE-BYTES");
+      long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat"); std::string m0;
+      for(int i=0;i<3;i++){ CommitStore3A s; bool ok=s.open(d,&e); std::string m=e.msg;
+        CHECK(!ok, "D14 refusal "+std::to_string(i)+" identical: "+m);
+        if(i==0){ m0=m; CHECK(!m0.empty(), "D14 refusal is diagnostic and non-empty"); }
+        else CHECK(m==m0, "D14 deterministic diagnostic (same message, same files)");
+        if(ok) s.close(); }
+      CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "D14 orphan untouched after repeated refusals");
+      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK") && !fexists(d+"/tree.dat"), "D14 no file invented and nothing quarantined"); }
+    // R1-30 + TOCTOU: a file appearing/disappearing between classification and the first write fails closed
+    { std::string d=freshDir("r1_t1"); CommitStore3A s; CHECK(s.open(d,&e), "T1 fresh open (undo.dat classified absent)");
+      writeJunk(d+"/undo.dat","APPEARED-AFTER-CLASSIFICATION");
+      long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat");
+      bool ok=PUBH(s,1,0,0,3,&e);
+      CHECK(!ok, "T1 TOCTOU: first publish fails closed when undo.dat appears after classification: "+e.str());
+      CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "T1 the appeared file was NOT overwritten");
+      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK"), "T1 no pointer files written"); s.close(); }
+    { std::string d=freshDir("r1_t2"); { FILE* f=fopen((d+"/undo.dat").c_str(),"wb"); fclose(f); }
+      CommitStore3A s; CHECK(s.open(d,&e), "T2 fresh open over an accepted empty residue");
+      CHECK(unlink((d+"/undo.dat").c_str())==0, "T2 residue disappears after classification");
+      bool ok=PUBH(s,1,0,0,3,&e);
+      CHECK(!ok, "T2 TOCTOU: first publish fails closed when the accepted empty residue vanished: "+e.str());
+      CHECK(!fexists(d+"/undo.dat"), "T2 no undo.dat recreated"); s.close(); }
+}
+
 static long readVmHWM(){ FILE*f=fopen("/proc/self/status","r"); if(!f)return -1; char l[256]; long kb=-1; while(fgets(l,sizeof(l),f)){ if(strncmp(l,"VmHWM:",6)==0){ sscanf(l+6,"%ld",&kb); break; } } fclose(f); return kb; }
 
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){
