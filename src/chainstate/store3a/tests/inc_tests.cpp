@@ -335,6 +335,18 @@ static uint32_t findLeafWithKey(const std::string& path, uint32_t nextId, const 
             uint16_t vl=(uint16_t)(pg[off+36]|(pg[off+37]<<8)); off+=36+2+vl; } }
     return 0xFFFFFFFFu;
 }
+// descend the COMMITTED tree from rootId to the leaf the key belongs to (avoids stale CoW pages)
+static uint32_t committedLeafForKey(const std::string& path, uint32_t rootId, const Key& k){
+    uint32_t id=rootId; uint8_t pg[4096];
+    for(int g=0;g<64;g++){
+        if(!readRaw(path,(long)id*4096,pg,4096)) return 0xFFFFFFFFu;
+        if(pg[0]==1) return id;
+        uint16_t cnt=(uint16_t)(pg[1]|(pg[2]<<8)); size_t sepOff=4+(size_t)(cnt+1)*36;
+        size_t ci=0; while(ci<cnt){ Key s; memcpy(s.data(),pg+sepOff+ci*36,36); if(keyCmp(k,s)>=0) ci++; else break; }
+        id=rd32b(pg+4+ci*36);
+    }
+    return 0xFFFFFFFFu;
+}
 
 static void test_m1_path_verify(){
     g_cur="M1-pathverify";
@@ -465,12 +477,217 @@ static void test_p6_partial_append(){
     CHECK(dr2==dr&&gr2==gr, "p6f repeated recovery idempotent");
 }
 
+// ==================== R2 fresh-open contract regression ====================
+static bool fexists(const std::string& p){ struct stat st; return ::stat(p.c_str(),&st)==0; }
+static long fsz(const std::string& p){ struct stat st; return ::stat(p.c_str(),&st)==0?(long)st.st_size:-1; }
+static Hash fdig(const std::string& p){ FILE* f=fopen(p.c_str(),"rb"); if(!f) return Hash(); ChainedHash h; uint8_t b[65536]; size_t n; while((n=fread(b,1,sizeof(b),f))>0) h.put(b,n); fclose(f); return h.final(); }
+static bool publishCB(CommitStore3A& s, int h, ChainError* e){
+    Block b; b.hash=id32(0xB10C0000u,(uint32_t)h); b.height=h;
+    Tx cb; cb.txid=id32(0xCB000000u,(uint32_t)h); cb.coinbase=true; cb.coinstake=false;
+    TxOut o; o.value=50*COIN; o.script={1,2,3}; cb.vout.push_back(o); b.txs.push_back(cb);
+    TreeReader tr(s.tree()); Delta d; if(!buildDeltaI(tr,b,MAT,&d,e)) return false;
+    return s.publish(d,b.hash,h,e);
+}
+static bool mkStore6(const std::string& dir, ChainError* e){
+    CommitStore3A s; if(!s.open(dir,e)) return false;
+    for(int h=1;h<=6;h++) if(!publishCB(s,h,e)){ s.close(); return false; }
+    s.close(); return true;
+}
+
+static void test_r2_fresh_open(){
+    g_cur="R2-freshopen";
+    ChainError e;
+    const char* M="MANIFEST"; const char* A="ACK"; const char* B="MANIFEST.bak";
+
+    // R2-01 genuinely fresh empty directory creates correctly
+    std::string d1=freshDir("r2_01");
+    CHECK(!fexists(d1+"/tree.dat"), "R2-01 no tree.dat before first open");
+    { CommitStore3A s; bool ok=s.open(d1,&e); CHECK(ok, "R2-01 fresh open: "+e.str());
+      CHECK(s.generation()==0, "R2-01 fresh generation 0");
+      CHECK(fexists(d1+"/tree.dat") && fsz(d1+"/tree.dat")==4096, "R2-01 empty sentinel page created (4096 B)");
+      CHECK(!fexists(d1+"/MANIFEST"), "R2-01 no MANIFEST before first publish"); s.close(); }
+    // R2-02 fresh store restarts correctly (byte-identical)
+    { Hash dg=fdig(d1+"/tree.dat"); long sz=fsz(d1+"/tree.dat");
+      CommitStore3A s; bool ok=s.open(d1,&e); CHECK(ok,"R2-02 restart: "+e.str());
+      CHECK(s.generation()==0, "R2-02 restart generation 0");
+      CHECK(fdig(d1+"/tree.dat")==dg && fsz(d1+"/tree.dat")==sz, "R2-02 tree.dat byte-identical across restart"); s.close(); }
+
+    // R2-03 existing valid non-empty tree.dat with pointer files missing -> fail closed, unmodified
+    std::string d3=freshDir("r2_03"); CHECK(mkStore6(d3,&e), "R2-03 build gen6: "+e.str());
+    CHECK(fexists(d3+"/MANIFEST") && fexists(d3+"/ACK"), "R2-03 pointers present after commit");
+    unlink((d3+"/"+M).c_str()); unlink((d3+"/"+A).c_str()); unlink((d3+"/"+B).c_str());
+    { Hash dg=fdig(d3+"/tree.dat"); long sz=fsz(d3+"/tree.dat");
+      CommitStore3A s; bool ok=s.open(d3,&e);
+      CHECK(!ok, "R2-03 non-empty tree + no pointers -> FAIL CLOSED");
+      CHECK(!fexists(d3+"/MANIFEST") && !fexists(d3+"/ACK"), "R2-03 no pointer files invented");
+      CHECK(fdig(d3+"/tree.dat")==dg && fsz(d3+"/tree.dat")==sz, "R2-03 tree.dat byte-identical (no truncation)"); }
+
+    // R2-04 existing corrupt tree.dat with pointer files missing -> fail closed, no truncation
+    { std::string d=freshDir("r2_04a"); CHECK(mkStore6(d,&e),"R2-04a build");
+      unlink((d+"/"+M).c_str()); unlink((d+"/"+A).c_str()); unlink((d+"/"+B).c_str());
+      flipByte(d+"/tree.dat",0);
+      Hash dg=fdig(d+"/tree.dat"); long sz=fsz(d+"/tree.dat");
+      CommitStore3A s; bool ok=s.open(d,&e);
+      CHECK(!ok, "R2-04a corrupt aligned tree.dat + no pointers -> FAIL CLOSED");
+      CHECK(fdig(d+"/tree.dat")==dg && fsz(d+"/tree.dat")==sz, "R2-04a corrupt tree.dat untouched"); }
+    { std::string d=freshDir("r2_04b"); CHECK(mkStore6(d,&e),"R2-04b build");
+      unlink((d+"/"+M).c_str()); unlink((d+"/"+A).c_str()); unlink((d+"/"+B).c_str());
+      { FILE* f=fopen((d+"/tree.dat").c_str(),"ab"); std::vector<uint8_t> j(1000,0x5A); size_t w=fwrite(j.data(),1,j.size(),f); (void)w; fclose(f); }
+      Hash dg=fdig(d+"/tree.dat"); long sz=fsz(d+"/tree.dat"); CHECK(sz%4096!=0, "R2-04b tree.dat non-aligned");
+      CommitStore3A s; bool ok=s.open(d,&e);
+      CHECK(!ok, "R2-04b non-aligned tree.dat + no pointers -> FAIL CLOSED");
+      CHECK(fdig(d+"/tree.dat")==dg && fsz(d+"/tree.dat")==sz, "R2-04b no tail truncation on the no-pointer path"); }
+
+    // R2-05 / R2-06 unreadable or non-regular tree.dat must fail closed and must not create
+    { std::string d=freshDir("r2_05a"); CHECK(mkStore6(d,&e),"R2-05a build");
+      unlink((d+"/"+M).c_str()); unlink((d+"/"+A).c_str()); unlink((d+"/"+B).c_str());
+      unlink((d+"/tree.dat").c_str()); CHECK(mkdir((d+"/tree.dat").c_str(),0755)==0, "R2-05a tree.dat replaced by a directory");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-05a non-regular tree.dat -> FAIL CLOSED");
+      CHECK(fexists(d+"/tree.dat"), "R2-05a directory not deleted/replaced"); }
+    { std::string d=freshDir("r2_06"); CHECK(mkStore6(d,&e),"R2-06 build");
+      unlink((d+"/"+M).c_str()); unlink((d+"/"+A).c_str()); unlink((d+"/"+B).c_str());
+      Hash dg=fdig(d+"/tree.dat"); long sz=fsz(d+"/tree.dat");
+      bool nonroot=(::geteuid()!=0);
+      if(nonroot){ CHECK(::chmod((d+"/tree.dat").c_str(),0000)==0, "R2-06 chmod 000 tree.dat");
+        CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-06 unreadable tree.dat (EACCES) -> FAIL CLOSED");
+        ::chmod((d+"/tree.dat").c_str(),0644); }
+      else printf("  R2-06 note: running as root; EACCES path not exercised\n");
+      CHECK(fsz(d+"/tree.dat")==sz && fdig(d+"/tree.dat")==dg, "R2-06 stat/open error did not trigger creation or mutation"); }
+
+    // R2-07 MANIFEST.bak present (primary+ACK missing) must not be ignored as evidence
+    { std::string d=freshDir("r2_07"); CHECK(mkStore6(d,&e),"R2-07 build");
+      CHECK(fexists(d+"/MANIFEST.bak"), "R2-07 backup present after commits");
+      unlink((d+"/"+M).c_str()); unlink((d+"/"+A).c_str());
+      Hash bdg=fdig(d+"/MANIFEST.bak"); long sz=fsz(d+"/tree.dat");
+      CommitStore3A s; bool ok=s.open(d,&e);
+      CHECK(!ok, "R2-07 backup-only state -> FAIL CLOSED (not treated as fresh)");
+      CHECK(fdig(d+"/MANIFEST.bak")==bdg && fsz(d+"/tree.dat")==sz, "R2-07 backup and tree untouched"); }
+
+    // R2-08 missing MANIFEST with acknowledged ACK must fail closed
+    { std::string d=freshDir("r2_08"); CHECK(mkStore6(d,&e),"R2-08 build");
+      unlink((d+"/"+M).c_str());
+      Hash adg=fdig(d+"/ACK"); Hash tdg=fdig(d+"/tree.dat");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-08 ACK present, MANIFEST missing -> FAIL CLOSED");
+      CHECK(fdig(d+"/ACK")==adg && fdig(d+"/tree.dat")==tdg, "R2-08 ACK and tree untouched");
+      CHECK(!fexists(d+"/MANIFEST"), "R2-08 no MANIFEST invented"); }
+
+    // R2-09 corrupt / future ACK must fail closed
+    { std::string d=freshDir("r2_09a"); CHECK(mkStore6(d,&e),"R2-09a build");
+      flipByte(d+"/ACK",10); CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-09a corrupt ACK -> FAIL CLOSED"); }
+    { std::string d=freshDir("r2_09b"); CHECK(mkStore6(d,&e),"R2-09b build");
+      { FILE* f=fopen((d+"/ACK").c_str(),"wb"); uint8_t b[12]={0}; b[0]=99; uint32_t crc=csCrc32(b,8); for(int i=0;i<4;i++) b[8+i]=(uint8_t)((crc>>(8*i))&0xff); fwrite(b,1,12,f); fclose(f); }
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-09b future ACK -> FAIL CLOSED"); }
+
+    // R2-10 repeated restart after fail-closed preserves every file byte-for-byte
+    { std::string d=freshDir("r2_10"); CHECK(mkStore6(d,&e),"R2-10 build");
+      unlink((d+"/"+M).c_str()); unlink((d+"/"+A).c_str()); unlink((d+"/"+B).c_str());
+      Hash t=fdig(d+"/tree.dat"); long ts=fsz(d+"/tree.dat");
+      for(int i=0;i<3;i++){ CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-10 fail-closed restart "+std::to_string(i)); }
+      CHECK(fdig(d+"/tree.dat")==t && fsz(d+"/tree.dat")==ts, "R2-10 tree.dat byte-identical after repeated fail-closed opens"); }
+
+    // R2-11 partial-page-tail recovery still preserves the acknowledged generation
+    { std::string d=freshDir("r2_11"); CHECK(mkStore6(d,&e),"R2-11 build");
+      { CommitStore3A s; CHECK(s.open(d,&e),"R2-11 reopen"); UtxoState st; storeToState(s,&st,&e); Hash dig=st.digest();
+        s.close(); { FILE* f=fopen((d+"/tree.dat").c_str(),"ab"); std::vector<uint8_t> j(1200,0x33); size_t w=fwrite(j.data(),1,j.size(),f); (void)w; fclose(f); }
+        CommitStore3A r; bool ok=r.open(d,&e); CHECK(ok, "R2-11 tail recovery open: "+e.str());
+        if(ok){ CHECK(r.generation()==6, "R2-11 acknowledged generation preserved");
+          UtxoState st2; storeToState(r,&st2,&e); CHECK(st2.digest()==dig, "R2-11 logical state preserved");
+          CHECK(fsz(d+"/tree.dat")%4096==0, "R2-11 re-aligned"); r.close(); } } }
+
+    // R2-12 interrupted fresh initialization never destroys pre-existing data
+    { std::string d=freshDir("r2_12"); CHECK(mkStore6(d,&e),"R2-12 build");
+      unlink((d+"/"+M).c_str()); unlink((d+"/"+A).c_str()); unlink((d+"/"+B).c_str());
+      writeJunk(d+"/MANIFEST.tmp","PARTIAL-INIT-MARKER");
+      Hash t=fdig(d+"/tree.dat"); long ts=fsz(d+"/tree.dat"); Hash tmp=fdig(d+"/MANIFEST.tmp");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-12 interrupted init over existing data -> FAIL CLOSED");
+      CHECK(fdig(d+"/tree.dat")==t && fsz(d+"/tree.dat")==ts, "R2-12 existing tree data NOT destroyed");
+      CHECK(fexists(d+"/MANIFEST.tmp") && fdig(d+"/MANIFEST.tmp")==tmp, "R2-12 pre-existing tmp preserved"); }
+
+    // R2-13 successful creation followed by ordinary publish, disconnect, restart
+    { std::string d=freshDir("r2_13");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-13 fresh open: "+e.str());
+      CHECK(publishCB(s,1,&e) && publishCB(s,2,&e), "R2-13 publish 2 blocks");
+      CHECK(s.generation()==2, "R2-13 generation 2");
+      Hash tip=s.tipHash();
+      CHECK(s.disconnect(tip,&e), "R2-13 disconnect last: "+e.str());
+      CHECK(s.generation()==3 && s.tipHeight()==1, "R2-13 generation advanced, tip height 1");
+      UtxoState st; storeToState(s,&st,&e); Hash dig=st.digest(); uint64_t g=s.generation(); Hash rh=s.rootHash(); s.close();
+      CommitStore3A r; CHECK(r.open(d,&e), "R2-13 restart: "+e.str());
+      CHECK(r.generation()==g && r.rootHash()==rh, "R2-13 restart generation/root stable");
+      UtxoState st2; storeToState(r,&st2,&e); CHECK(st2.digest()==dig, "R2-13 restart logical state stable"); r.close(); }
+
+    // R2-14 existing empty generation-0 store with missing pointer files: explicit state contract
+    { std::string d=freshDir("r2_14"); 
+      { CommitStore3A s; CHECK(s.open(d,&e),"R2-14 create empty store: "+e.str()); s.close(); }
+      Hash dg=fdig(d+"/tree.dat"); long sz=fsz(d+"/tree.dat");
+      { CommitStore3A s; bool ok=s.open(d,&e); CHECK(ok, "R2-14 empty sentinel restart -> OPEN_EXISTING: "+e.str());
+        CHECK(ok && s.generation()==0 && s.tree().rootCount()==0, "R2-14 explicit empty contract (gen0, 0 entries)");
+        CHECK(fdig(d+"/tree.dat")==dg && fsz(d+"/tree.dat")==sz, "R2-14 sentinel untouched"); if(ok) s.close(); }
+      // crafted single-page NON-empty leaf must NOT be accepted as empty
+      std::string d2=freshDir("r2_14b");
+      { Node n; n.type=NT_LEAF; LeafEntry en; Hash h=id32(0x1u,42); memcpy(en.key.data(),h.data(),32); en.key[32]=0; en.val={1,2,3,4};
+        n.entries.push_back(en); uint8_t buf[4096]; CHECK(encodeNode(n,buf), "R2-14b encode one-entry leaf");
+        FILE* f=fopen((d2+"/tree.dat").c_str(),"wb"); if(f){ size_t w=fwrite(buf,1,4096,f); (void)w; fclose(f); } }
+      Hash dg2=fdig(d2+"/tree.dat");
+      CommitStore3A s2; bool ok2=s2.open(d2,&e);
+      CHECK(!ok2, "R2-14b single-page non-empty leaf without pointers -> FAIL CLOSED");
+      CHECK(fdig(d2+"/tree.dat")==dg2, "R2-14b crafted tree untouched"); }
+}
+
+static void test_r2_multi_key_atomic(){
+    g_cur="R2-atomic";
+    ChainError e;
+    std::string d=freshDir("r2_15");
+    CommitStore3A s; CHECK(s.open(d,&e), "R2-15 open: "+e.str());
+    const int N=120; bool pok=true;
+    for(int h=1;h<=N;h++) if(!publishCB(s,h,&e)){ pok=false; break; }
+    CHECK(pok, "R2-15 build "+std::to_string(N)+" blocks: "+e.str());
+    CHECK(!s.tree().rootIsLeaf(), "R2-15 store tree is multi-level (root internal)");
+    Hash rootOld=s.rootHash(); uint64_t genOld=s.generation(); uint32_t pagesOld=s.tree().nextPageId();
+    UtxoState st; storeToState(s,&st,&e); Hash digOld=st.digest();
+    Hash mdig=fdig(d+"/MANIFEST"); Hash adig=fdig(d+"/ACK"); long tsize=fsz(d+"/tree.dat");
+    Hash cb2=id32(0xCB000000u,2);
+    Key k2{}; memcpy(k2.data(),cb2.data(),32); k2[32]=0;
+    uint32_t rootIdOld=s.rootPageId();
+    uint32_t leafKb2=committedLeafForKey(d+"/tree.dat", rootIdOld, k2);
+    CHECK(leafKb2!=0xFFFFFFFFu && leafKb2!=rootIdOld, "R2-15 erase-target leaf located on the committed path (non-root)");
+    Hash cbNew=id32(0xCB000000u,5000); Key kNew{}; memcpy(kNew.data(),cbNew.data(),32); kNew[32]=0;
+    int32_t H=121;
+    Block b; b.hash=id32(0xB10C0000u,(uint32_t)H); b.height=H;
+    Tx sp; sp.txid=id32(0x5BE7D000u,(uint32_t)H); sp.coinbase=false; sp.coinstake=false; TxIn in; in.prev.txid=cb2; in.prev.n=0; sp.vin.push_back(in);
+    TxOut co; co.value=40*COIN; co.script={9,9}; sp.vout.push_back(co); b.txs.push_back(sp);        // op1 = erase kb2
+    Tx cb; cb.txid=cbNew; cb.coinbase=true; cb.coinstake=false; TxOut o; o.value=50*COIN; o.script={1,2,3}; cb.vout.push_back(o); b.txs.push_back(cb); // op3 = put kNew
+    TreeReader tr(s.tree()); Delta dl; CHECK(buildDeltaI(tr,b,MAT,&dl,&e), "R2-15 build multi-key delta: "+e.str());
+    CHECK(dl.ops.size()>=3, "R2-15 delta is multi-key (>=3 ops)");
+    // controlled failure on the 4th page append: earlier mutations stage pages, a later one fails
+    s.injectPartialAppendOn(4);
+    bool ok=s.publish(dl,b.hash,H,&e);
+    CHECK(!ok, "R2-15 publish fails mid-way (controlled later-op append failure)");
+    CHECK(s.generation()==genOld && s.rootHash()==rootOld, "R2-15 committed root/generation unchanged in memory");
+    CHECK(s.tree().nextPageId()>pagesOld, "R2-15 earlier mutations staged pages before the failure");
+    CHECK(fdig(d+"/MANIFEST")==mdig, "R2-15 MANIFEST bytes unchanged (no new generation durable)");
+    CHECK(fdig(d+"/ACK")==adig, "R2-15 ACK bytes unchanged (no false acknowledgment)");
+    CHECK(s.tree().verifyAll(&e), "R2-15 committed tree intact and verifies");
+    { OutPoint op; op.txid=cb2; op.n=0; Coin c; bool found=false; ChainError ge2;
+      CHECK(s.get(op,&c,&found,&ge2) && found, "R2-15 no op of the partial delta is visible"); }
+    { UtxoState stc; storeToState(s,&stc,&e); CHECK(stc.digest()==digOld, "R2-15 committed logical state unchanged"); }
+    uint32_t pagesAfter=s.tree().nextPageId(); s.close();
+    CHECK(fsz(d+"/tree.dat")>tsize, "R2-15 staged/orphan pages present on disk after the failure");
+    { CommitStore3A r; bool ok2=r.open(d,&e); CHECK(ok2, "R2-15 restart: "+e.str());
+      if(ok2){ CHECK(r.generation()==genOld && r.rootHash()==rootOld, "R2-15 restart returns OLD generation/root");
+        CHECK(r.rootPageId()==rootIdOld, "R2-15 committed root page unchanged across restart");
+        UtxoState st2; storeToState(r,&st2,&e); CHECK(st2.digest()==digOld, "R2-15 restart logical state == OLD digest");
+        CHECK(r.tree().verifyAll(&e), "R2-15 restart merkle verify (staged pages unreachable)");
+        CHECK(r.tree().nextPageId()==pagesAfter, "R2-15 staged pages persist but are unreferenced (append-only)");
+        r.close(); } }
+}
+
 static long readVmHWM(){ FILE*f=fopen("/proc/self/status","r"); if(!f)return -1; char l[256]; long kb=-1; while(fgets(l,sizeof(l),f)){ if(strncmp(l,"VmHWM:",6)==0){ sscanf(l+6,"%ld",&kb); break; } } fclose(f); return kb; }
 
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){

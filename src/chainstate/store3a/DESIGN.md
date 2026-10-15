@@ -191,3 +191,44 @@ does not. It is **not** the canonical logical UTXO digest (`UtxoState::digest()`
 order-independent digest of the key→coin set). R1 does not change this contract: verification
 authenticates pages against the committed physical root; correctness against the logical
 model is checked separately by the differential tests.
+
+## 9. Stage 3A-R2 — fresh-open contract (fail-closed)
+
+Closes R1-1 (destructive fresh-create: an existing `tree.dat` was `O_TRUNC`-recreated when
+`tree_.open`/`loadPage0AsRoot` failed with MANIFEST+ACK absent) and R1-2 (silent-empty
+presentation: an existing committed `tree.dat` was presented as an empty generation-0 store).
+Both were introduced/exposed by the R1 fall-open on the MANIFEST-absent, ACK-absent branch.
+
+Rule: **existing on-disk state is authoritative evidence of a prior store.** A new empty store
+is created only when the whole relevant on-disk state proves none exists — i.e. `stat(tree.dat)`
+returns `ENOENT` and no MANIFEST.bak is present. Never truncate, recreate, delete or quarantine
+an existing `tree.dat`; never treat a `stat` error (EACCES/EIO/…) as file absence.
+
+State matrix (MANIFEST absent):
+
+| # | On-disk state | Permitted result |
+|---|---|---|
+| 1 | no tree.dat, no MANIFEST/ACK/bak | CREATE_NEW |
+| 2 | existing valid empty `tree.dat` (single empty-sentinel page, `nextPageId==1`) | OPEN_EXISTING (empty gen-0) |
+| 3 | existing non-empty `tree.dat` (`nextPageId>1`) | FAIL_CLOSED |
+| 4a | existing corrupt `tree.dat`, whole-page aligned | FAIL_CLOSED |
+| 4b | existing `tree.dat` not page-aligned (partial page) | FAIL_CLOSED (no tail truncation on this path) |
+| 5 | `tree.dat` unreadable (EACCES/EIO) or not a regular file | FAIL_CLOSED |
+| 6 | `tree.dat` genuinely absent | CREATE_NEW |
+| 7 | MANIFEST missing, ACK present (any generation) | FAIL_CLOSED (inconsistent pointer evidence) |
+| 7b | MANIFEST missing, MANIFEST.bak present | FAIL_CLOSED (prior-store evidence) |
+| 8 | MANIFEST present, ACK missing | unchanged: fail closed unless gen 0 |
+| 9 | MANIFEST.bak present, primary missing, ACK present | unchanged: RECOVER_ACKNOWLEDGED (checked) |
+| 10 | interrupted fresh init (partial/zero-size file) | FAIL_CLOSED (no destruction; operator decides) |
+| 11 | interrupted page append with acknowledged root | RECOVER_ACKNOWLEDGED (S3A-3 tail drop, §8.2) |
+| 12 | repeated restart after failure | idempotent; files byte-for-byte unchanged |
+
+`BTree::open` may still drop an unreferenced trailing partial page on the acknowledged-recovery
+path (§8.2); the no-pointer fresh path rejects non-aligned sizes before opening, so it never
+modifies the file.
+
+Crash contract: the only file created on the fresh path is `tree.dat` (one empty sentinel page)
+via `O_CREAT|O_TRUNC` at a path proven absent; no MANIFEST/ACK is written before the first
+successful publish. A crash between the `stat` and `create` can therefore only leave a fresh
+empty store, never destroy prior data (the path was proven absent moments earlier, and any
+concurrent writer is excluded by the `LOCK` flock held across the check).

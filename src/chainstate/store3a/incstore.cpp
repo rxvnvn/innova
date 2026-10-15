@@ -214,11 +214,28 @@ bool CommitStore3A::open(const std::string& dir, ChainError* e){
         else { if(pg!=0){ close(); setErr(e,ErrCode::CORRUPT,"acknowledgment evidence missing for generation "+std::to_string(pg)); return false; } }
         if(!ackPresent_ || pg>ackGen_){ if(!writeAck(pg,e)){ close(); return false; } ackGen_=pg; ackPresent_=true; }
     } else if(!pEx){
-        if(ackPresent_ && ackGen_>0){ close(); setErr(e,ErrCode::CORRUPT,"acknowledged MANIFEST (gen "+std::to_string(ackGen_)+") is missing"); return false; }
-        struct stat st;
-        bool ok=false;
-        if(stat(p("tree.dat").c_str(),&st)==0){ if(tree_.open(p("tree.dat"),&e1)){ ChainError e0; if(tree_.loadPage0AsRoot(&e0)) ok=true; } }
-        if(!ok){ tree_.close(); clearErr(e); if(!tree_.create(p("tree.dat"),e)){ close(); return false; } }
+        // R2 (closes R1-1 destructive fresh-create, R1-2 silent-empty presentation).
+        // MANIFEST and ACK are both absent. Existing on-disk state is authoritative evidence of a
+        // prior store; a new empty store may be created ONLY when tree.dat is genuinely ABSENT
+        // (stat -> ENOENT). Never O_TRUNC/recreate an existing tree.dat, never treat a stat error
+        // as absence, and never present existing data as a clean genesis.
+        if(ackPresent_){ close(); setErr(e,ErrCode::CORRUPT,"ACK present (generation "+std::to_string(ackGen_)+") but MANIFEST is missing; refusing to infer a fresh store"); return false; }
+        { struct stat bst; if(::stat(p("MANIFEST.bak").c_str(),&bst)==0){ close(); setErr(e,ErrCode::CORRUPT,"MANIFEST is missing but MANIFEST.bak exists (prior store evidence); refusing to infer a fresh store"); return false; } }
+        const std::string tp=p("tree.dat");
+        struct stat st; bool hasTree=false;
+        if(::stat(tp.c_str(),&st)==0){
+            hasTree=true;
+            if(!S_ISREG(st.st_mode)){ close(); setErr(e,ErrCode::IO,"existing tree.dat is not a regular file; refusing to recreate it"); return false; }
+            if(st.st_size<=0 || (st.st_size % (off_t)PAGE_SIZE)!=0){ close(); setErr(e,ErrCode::CORRUPT,"existing tree.dat (size "+std::to_string((long long)st.st_size)+") without MANIFEST/ACK is not a whole-page image; refusing to truncate or recreate"); return false; }
+        } else if(errno!=ENOENT){ close(); setErr(e,ErrCode::IO,"stat(tree.dat) failed (errno="+std::to_string(errno)+"); not treating a stat error as file absence"); return false; }
+        if(!hasTree){
+            clearErr(e); if(!tree_.create(tp,e)){ close(); return false; }   // genuinely no prior store
+        } else {
+            ChainError et; if(!tree_.open(tp,&et)){ close(); setErr(e,ErrCode::CORRUPT,"existing tree.dat cannot be opened without MANIFEST/ACK; refusing to recreate it: "+et.msg); return false; }
+            if(tree_.nextPageId()!=1u){ close(); setErr(e,ErrCode::CORRUPT,"existing tree.dat holds "+std::to_string(tree_.nextPageId())+" pages (prior store data) while MANIFEST/ACK are absent; refusing to present it as fresh genesis"); return false; }
+            ChainError e0; if(!tree_.loadPage0AsRoot(&e0)){ close(); setErr(e,ErrCode::CORRUPT,"existing tree.dat page 0 is unusable: "+e0.msg); return false; }
+            if(!(tree_.rootIsLeaf() && tree_.rootCount()==0)){ close(); setErr(e,ErrCode::CORRUPT,"existing tree.dat is not an empty store; refusing to present it as fresh genesis"); return false; }
+        }
         generation_=0; undoIndex_.clear(); undoCommittedBytes_=0; blockHash_=Hash(); tipHeight_=-1;
     } else {
         ChainError e2; bool bEx=false; uint32_t bId=0; Hash bH;

@@ -75,6 +75,8 @@ public:
 
     // R1 test hook: the next page append writes only `bytes` (< PAGE_SIZE) bytes and fails (simulated short write).
     void injectPartialAppendOnce(size_t bytes) { partialAppendBytes_ = bytes; }
+    // R2 test hook: let the first (n-1) appends succeed, then fail the n-th with a short write.
+    void injectPartialAppendOn(size_t n) { partialAppendOn_ = n; }
 
 private:
     bool readPage(uint32_t id, uint8_t* buf, ChainError* e) const;
@@ -96,6 +98,7 @@ private:
     size_t rootCount_ = 0;
     bool truncatedTail_ = false;
     size_t partialAppendBytes_ = 0;
+    size_t partialAppendOn_ = 0;
     mutable uint64_t reads_ = 0;
     uint64_t writes_ = 0;
 };

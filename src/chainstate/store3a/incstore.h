@@ -68,6 +68,8 @@ public:
     void clearInjection() { injectStage_ = InjectStage::None; injectNoSpace_ = false; injectFsyncFail_ = false; }
     // R1 test hook: force the next tree page append to be a short/interrupted write.
     void injectPartialAppendOnce(size_t bytes) { tree_.injectPartialAppendOnce(bytes); }
+    // R2 test hook: fail the n-th page append (earlier appends succeed and stage pages).
+    void injectPartialAppendOn(size_t n) { tree_.injectPartialAppendOn(n); }
 
 private:
     bool ns(InjectStage s) const { return injectStage_ == s && injectNoSpace_; }

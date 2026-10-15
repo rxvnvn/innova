@@ -133,7 +133,8 @@ bool BTree::readNodeVerified(uint32_t id, const Hash& expect, Node* n, ChainErro
 bool BTree::appendPage(const uint8_t* buf, uint32_t* outId, ChainError* e){
     if (fd_<0){ setErr(e,ErrCode::NOT_OPEN,"btree"); return false; }
     uint32_t id=nextId_;
-    if (partialAppendBytes_>0){   // R1 test hook: simulated short/interrupted append
+    if (partialAppendOn_>0){ partialAppendOn_--; if(partialAppendOn_==0) partialAppendBytes_=PAGE_SIZE/3; }
+    if (partialAppendBytes_>0){   // R1/R2 test hook: simulated short/interrupted append
         size_t nb=partialAppendBytes_; partialAppendBytes_=0;
         if (nb>(size_t)PAGE_SIZE){ setErr(e,ErrCode::INTERNAL,"partial append size"); return false; }
         if (::pwrite(fd_,buf,nb,(off_t)id*PAGE_SIZE)!=(ssize_t)nb){ setErr(e,ErrCode::IO,"injected short append"); return false; }
