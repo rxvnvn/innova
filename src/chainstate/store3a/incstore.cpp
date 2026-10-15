@@ -50,6 +50,7 @@ static int classifyUndoEvidence(const std::string& path, std::string* detail){
         *detail = S_ISDIR(st.st_mode) ? "directory" : (S_ISFIFO(st.st_mode) ? "fifo" : "non-regular file");
         return 3;
     }
+    // R2 (F0-2-R1): the caller pins the classified object by descriptor; see csWriteAtFile.
     if (st.st_size == 0){
         // R1: a zero-length file can be adopted (nothing can be destroyed), but only if it is actually
         // usable: an empty-yet-inaccessible log is an anomaly, not evidence of a clean store. R2 refuses
@@ -92,39 +93,113 @@ bool csAppendFile(const std::string& path, const uint8_t* d, size_t n, bool injN
 // - Refuses to write past a hole (file shorter than off) instead of zero-extending into a
 //   descriptor whose record layout would no longer match the manifest.
 bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e,
-                   UndoCreate create) {
+                   UndoCreate create, int pinnedFd) {
     if (injNs) { setErr(e, ErrCode::NO_SPACE, "injected ENOSPC writing " + path); return false; }
     // R1 (F0-2): the create policy is enforced by the OPEN, not by a preceding lstat, so a file that
     // appears (or disappears) between the open-time classification and this write cannot slip through.
-    int flags = O_WRONLY;
-    if (create == UndoCreate::Any) flags |= O_CREAT;
-    else if (create == UndoCreate::RequireAbsent) flags |= O_CREAT | O_EXCL;
-    int fd = ::open(path.c_str(), flags, 0644);
-    if (fd < 0) {
-        if (create == UndoCreate::RequireAbsent && errno == EEXIST) {
-            setErr(e, ErrCode::CORRUPT, path + " appeared after the fresh-open classification; refusing to "
-                   "overwrite a file this store never created (prior-store evidence)");
-        } else if (create == UndoCreate::RequireExisting && errno == ENOENT) {
-            setErr(e, ErrCode::CORRUPT, path + " disappeared after the fresh-open classification; refusing to "
-                   "recreate an initialized log");
-        } else {
-            setErr(e, ErrCode::IO, "open " + path);
+    // R2 (F0-2-R1): a fresh-open policy additionally PINS the write to the object classified at open time
+    // (the empty residue) or to the object this call creates itself. That pin is enforced on the very
+    // descriptor used for the write, never on a second pathname lookup:
+    //   O_NOFOLLOW  - a symlink substituted at the pathname is never followed (ELOOP);
+    //   O_NONBLOCK  - a FIFO substituted at the pathname cannot block this process (ENXIO);
+    //   fstat(fd)   - the descriptor itself must be regular, still empty, and carry dev/ino/ctime equal to
+    //                 the classification record: no substituted inode is ever written;
+    //   lstat(name) - before the write and again after the fsync, the pathname must still denote that same
+    //                 descriptor, so the bytes that become durable are the bytes reachable under the name.
+    // Ordering note: the O_EXCL open for RequireAbsent and the fstat/lstat pair for RequireExisting are the
+    // last checks before pwrite. A concurrent swapper can therefore only cause a fail-closed refusal; it can
+    // never redirect or corrupt a write, because the write's target is the validated descriptor itself.
+    const bool pinned = (create != UndoCreate::Any);
+    int fd = -1; bool owned = false;
+    if (create == UndoCreate::RequireExisting) {
+        // R2 (F0-2-R1): the accepted empty residue was pinned by descriptor at fresh-open classification.
+        // The write therefore never resolves the pathname to find its target: it uses that descriptor.
+        if (pinnedFd < 0) {
+            setErr(e, ErrCode::CORRUPT, path + ": the fresh-open classification did not pin a descriptor for "
+                   "the accepted empty residue; refusing to write an unverified log (identity mismatch)");
+            return false;
         }
-        return false;
+        fd = pinnedFd; owned = false;                 // caller owns the pinned descriptor
+    } else {
+        int flags = O_WRONLY;
+        if (create == UndoCreate::Any) flags |= O_CREAT;
+        else flags |= O_CREAT | O_EXCL;               // RequireAbsent: kernel-atomic create, no lstat race
+        fd = ::open(path.c_str(), flags, 0644);
+        if (fd < 0) {
+            const int err = errno;
+            if (create == UndoCreate::RequireAbsent && err == EEXIST) {
+                setErr(e, ErrCode::CORRUPT, path + " appeared after the fresh-open classification; refusing to "
+                       "overwrite a file this store never created (prior-store evidence)");
+            } else {
+                setErr(e, ErrCode::IO, "open " + path + " (errno=" + std::to_string(err) + ")");
+            }
+            return false;
+        }
+        owned = true;
+    }
+    auto shut = [&](){ if (owned) ::close(fd); };
+    struct stat fst;
+    if (::fstat(fd, &fst) != 0) { int er=errno; shut(); setErr(e, ErrCode::IO, "fstat " + path + " (errno=" + std::to_string(er) + ")"); return false; }
+    if (pinned) {
+        if (!S_ISREG(fst.st_mode)) {
+            shut();
+            setErr(e, ErrCode::CORRUPT, path + " resolved to a non-regular file; refusing to write a "
+                   "substituted pathname (identity mismatch)");
+            return false;
+        }
+        if (fst.st_nlink < 1) {
+            shut();
+            setErr(e, ErrCode::CORRUPT, path + ": link count is 0, i.e. the inode classified at open time has "
+                   "been unlinked; refusing to write a log that no pathname can reach (identity mismatch)");
+            return false;
+        }
+        if (create == UndoCreate::RequireExisting && fst.st_size != 0) {
+            shut();
+            setErr(e, ErrCode::CORRUPT, path + " is no longer empty (size " + std::to_string((long long)fst.st_size) +
+                   "); refusing to overwrite bytes this store never wrote (identity mismatch)");
+            return false;
+        }
+        struct stat lst;
+        if (::lstat(path.c_str(), &lst) != 0) {
+            int er=errno; shut();
+            setErr(e, ErrCode::CORRUPT, path + " pathname no longer resolves before the write (errno=" +
+                   std::to_string(er) + "; identity mismatch)");
+            return false;
+        }
+        if (!S_ISREG(lst.st_mode) || lst.st_dev != fst.st_dev || lst.st_ino != fst.st_ino) {
+            shut();
+            setErr(e, ErrCode::CORRUPT, path + " pathname no longer denotes the inode validated for this write "
+                   "(identity mismatch); refusing to write a substituted file");
+            return false;
+        }
     }
     off_t end = ::lseek(fd, 0, SEEK_END);
-    if (end < 0) { ::close(fd); setErr(e, ErrCode::IO, "lseek " + path); return false; }
+    if (end < 0) { shut(); setErr(e, ErrCode::IO, "lseek " + path); return false; }
     if ((uint64_t)end < off) {
-        ::close(fd);
+        shut();
         setErr(e, ErrCode::CORRUPT, path + " is shorter than the committed length (end=" +
                std::to_string((long long)end) + " < off=" + std::to_string((unsigned long long)off) +
                "); refusing to zero-extend over a committed record region");
         return false;
     }
-    size_t done=0; while (done<n){ ssize_t w=::pwrite(fd,d+done,n-done,(off_t)(off+done)); if(w<=0){ ::close(fd); setErr(e,ErrCode::IO,"write "+path); return false; } done+=(size_t)w; }
-    if (injFs) { ::close(fd); setErr(e, ErrCode::FS, "injected fsync failure on " + path); return false; }
-    if (::fsync(fd)!=0){ ::close(fd); setErr(e,ErrCode::FS,"fsync "+path); return false; }
-    if (::close(fd)!=0){ setErr(e,ErrCode::FS,"close "+path); return false; }
+    size_t done=0; while (done<n){ ssize_t w=::pwrite(fd,d+done,n-done,(off_t)(off+done)); if(w<=0){ shut(); setErr(e,ErrCode::IO,"write "+path); return false; } done+=(size_t)w; }
+    if (injFs) { shut(); setErr(e, ErrCode::FS, "injected fsync failure on " + path); return false; }
+    if (::fsync(fd)!=0){ shut(); setErr(e,ErrCode::FS,"fsync "+path); return false; }
+    // R2 (F0-2-R1) durability binding: the record that just became durable must still be reachable under
+    // the committed pathname. If the name was moved away while the bytes were written, the publish is
+    // refused BEFORE any manifest can acknowledge a log that no reader could ever reach by name.
+    if (pinned) {
+        struct stat lst2;
+        if (::lstat(path.c_str(), &lst2) != 0 || !S_ISREG(lst2.st_mode) ||
+            lst2.st_dev != fst.st_dev || lst2.st_ino != fst.st_ino) {
+            shut();
+            setErr(e, ErrCode::CORRUPT, path + " pathname no longer denotes the inode whose log was just "
+                   "fsynced (identity mismatch); refusing to publish a manifest that references an "
+                   "unreachable log");
+            return false;
+        }
+    }
+    if (owned && ::close(fd)!=0){ setErr(e,ErrCode::FS,"close "+path); return false; }
     return true;
 }
 bool csReadFile(const std::string& path, std::vector<uint8_t>* out, bool* exists, ChainError* e) {
@@ -213,7 +288,11 @@ bool UndoRecord::decode(const uint8_t* d, size_t n, size_t* off, UndoRecord* r, 
 
 // ---- CommitStore3A ---------------------------------------------------------
 CommitStore3A::~CommitStore3A(){ close(); }
-void CommitStore3A::close(){ tree_.close(); if(lockFd_>=0){ ::flock(lockFd_,LOCK_UN); ::close(lockFd_); lockFd_=-1; } opened_=false; }
+void CommitStore3A::close(){ tree_.close(); if(lockFd_>=0){ ::flock(lockFd_,LOCK_UN); ::close(lockFd_); lockFd_=-1; } opened_=false;
+    // R2 (F0-2-R1): the fresh-open undo policy and the descriptor pinning the adopted empty residue die
+    // with the open that produced them.
+    if (freshUndoFd_ >= 0) { ::close(freshUndoFd_); freshUndoFd_ = -1; }
+    freshUndoCreate_=UndoCreate::Any; }
 void CommitStore3A::crashIf(CrashPoint at){ if(crashPoint_==at){ ::fflush(NULL); ::_exit(42); } }
 void CommitStore3A::cleanupTmp(){ DIR* d=opendir(dir_.c_str()); if(!d) return; struct dirent* ent; while((ent=readdir(d))!=NULL){ std::string nm=ent->d_name; if(endsWith(nm,".tmp")) ::unlink(p(nm).c_str()); } closedir(d); }
 
@@ -314,7 +393,28 @@ bool CommitStore3A::open(const std::string& dir, ChainError* e){
           if(uk==-1){ close(); setErr(e,ErrCode::IO,"lstat(undo.dat) failed ("+det+"); not treating a stat error as file absence"); return false; }
           if(uk==3){ close(); setErr(e,ErrCode::CORRUPT,"existing undo.dat is not a regular file ("+det+") and there is no MANIFEST/ACK; refusing to overwrite it"); return false; }
           if(uk==2){ close(); setErr(e,ErrCode::CORRUPT,"existing undo.dat holds "+det+" of undo log without MANIFEST/ACK (prior-store evidence); refusing to overwrite the orphan log"); return false; }
-          freshUndoCreate_ = (uk==0) ? UndoCreate::RequireAbsent : UndoCreate::RequireExisting; }
+          freshUndoCreate_ = (uk==0) ? UndoCreate::RequireAbsent : UndoCreate::RequireExisting;
+          freshUndoFd_ = -1;
+          // R2 (F0-2-R1): PIN the accepted EMPTY residue with an open descriptor and re-validate the object
+          // on the descriptor itself (the lstat above is only advisory: the pathname may already have been
+          // swapped). fstat on the pinned fd must still show a regular, still-empty file. From here the
+          // first record is written through THIS descriptor, so a later substitution at the pathname can
+          // neither receive the bytes nor block/follow the writer.
+          if (uk==1){
+              int pfd = ::open(p("undo.dat").c_str(), O_RDWR|O_NOFOLLOW|O_NONBLOCK);
+              if (pfd < 0){
+                  int er=errno; close();
+                  setErr(e,ErrCode::CORRUPT,"empty undo.dat could not be pinned by descriptor (open errno="+std::to_string(er)+"); refusing to adopt it");
+                  return false;
+              }
+              struct stat pst;
+              if (::fstat(pfd,&pst)!=0 || !S_ISREG(pst.st_mode) || pst.st_size!=0 || pst.st_nlink<1){
+                  int er=errno; ::close(pfd); close();
+                  setErr(e,ErrCode::CORRUPT,"empty undo.dat stopped being a live empty regular file while it was being adopted (fstat errno="+std::to_string(er)+"); refusing to adopt it");
+                  return false;
+              }
+              freshUndoFd_ = pfd;
+          } }
         if(!hasTree){
             clearErr(e); if(!tree_.create(tp,e)){ close(); return false; }   // genuinely no prior store
         } else {
@@ -388,13 +488,22 @@ bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const
     if(undoAppendLen>0){
         // R1 (F0-2): the first undo write after a fresh open obeys the create policy fixed by the
         // open-time classification (absent -> O_EXCL create; accepted empty residue -> never create).
+        // R2 (F0-2-R1): for an accepted empty residue it writes through the descriptor PINNED at open time,
+        // so a file substituted at undo.dat between open and this write can never receive a byte.
+        // The pinned descriptor's ownership moves to this write and is closed here on every path.
         UndoCreate cre=freshUndoCreate_; freshUndoCreate_=UndoCreate::Any;
+        int pfd=freshUndoFd_; freshUndoFd_=-1;
+        bool wok;
         if(injectUndoShortOnce_>0 && injectUndoShortOnce_<undoAppendLen){   // F0 test hook: torn write
             size_t part=injectUndoShortOnce_; injectUndoShortOnce_=0;
-            if(!csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,part,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre)) return false;
+            wok=csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,part,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre,pfd);
+            if(pfd>=0) ::close(pfd);
+            if(!wok) return false;
             setErr(e,ErrCode::IO,"injected short undo write"); return false;
         }
-        if(!csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,undoAppendLen,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre)) return false;
+        wok=csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,undoAppendLen,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre,pfd);
+        if(pfd>=0) ::close(pfd);
+        if(!wok) return false;
     }
     crashIf(CrashPoint::AfterUndoWrite);
     // 4) manifest tmp

@@ -41,6 +41,19 @@ enum class InjectStage { None, PageWrite, UndoAppend, ManifestTmp, BakWrite, Pri
 //                     classified as an accepted empty residue.
 enum class UndoCreate { Any, RequireAbsent, RequireExisting };
 
+// R2 (F0-2-R1): the accepted EMPTY undo.dat is pinned by an OPEN DESCRIPTOR, not by a pathname record.
+// The descriptor is opened and re-validated at fresh-open classification (O_RDWR|O_NOFOLLOW|O_NONBLOCK;
+// fstat must show a regular, still-empty file) and is the object the first record is written to, so:
+//   - no second pathname lookup can redirect the write: the target is fixed by the descriptor itself,
+//     which is why there is no window between "identity validated" and "first write";
+//   - while the descriptor is open the classified inode cannot be unlinked-then-recreated into the same
+//     dev/ino on the same filesystem, and an unlinked original is detected anyway through st_nlink==0;
+//   - the pathname must denote that same descriptor BEFORE the write and again AFTER the fsync, so a
+//     record that becomes durable is a record reachable under the committed name (durability binding).
+// (A pure dev/ino/ctime fingerprint is NOT sufficient on its own: this platform reuses an inode NUMBER
+// after unlink+create and its ctime granularity can alias within the same millisecond.)
+// Ownership: the descriptor belongs to the store and is closed either by its first writer or by close().
+
 class CommitStore3A {
 public:
     ~CommitStore3A();
@@ -122,6 +135,8 @@ private:
     size_t injectUndoShortOnce_ = 0;
     // R1 (F0-2): the creation policy for the next undo write after a fresh open (consumed by it).
     UndoCreate freshUndoCreate_ = UndoCreate::Any;
+    // R2 (F0-2-R1): descriptor pinning the EMPTY undo.dat accepted at fresh open (until its first write).
+    int freshUndoFd_ = -1;
 };
 
 // R1 (F0-2): the create policy is documented on the UndoCreate enum above.
@@ -133,7 +148,7 @@ bool csAppendFile(const std::string& path, const uint8_t* d, size_t n, bool injN
 // classification/creation race (see UndoCreate). Every failure path here is fail-closed: the caller
 // must not treat a false return as "nothing was written" without checking its own recovery contract.
 bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e,
-                   UndoCreate create = UndoCreate::Any);
+                   UndoCreate create = UndoCreate::Any, int pinnedFd = -1);
 bool csReadFile(const std::string& path, std::vector<uint8_t>* out, bool* exists, ChainError* e);
 bool csReadRange(const std::string& path, uint64_t off, uint64_t len, std::vector<uint8_t>* out, ChainError* e);
 bool csFsyncDir(const std::string& dir, ChainError* e);

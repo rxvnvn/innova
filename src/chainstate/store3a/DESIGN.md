@@ -347,3 +347,50 @@ recorded as a residual LOW in the R1 report.
 
 Deliberately **not** done (unchanged scope): no `UNDOINDEX`, no MANIFEST v2, no generation pinning, no
 checkpoint seeds, no retention pruning, no compaction/GC, no page reclamation, no consensus/DAG change.
+
+## 12. Stage 3B-F0-R2 — descriptor pinning of the adopted empty residue (TOCTOU closure)
+
+F0-2-R1 (residual MEDIUM): the accepted **empty** `undo.dat` was identified only by a pathname record.
+A substitution performed between the fresh-open classification and the first undo write was therefore
+invisible to the R1 `RequireExisting` writer, which re-resolved the pathname with a bare `O_WRONLY`:
+
+* E24 — the empty file was replaced by a nonempty one; the first publish succeeded and overwrote the
+  substitute's leading bytes;
+* E25a — the empty file was replaced by a symlink; the first publish followed it and overwrote the
+  link target's bytes.
+
+Both are confirmed pre-fix failures (report `innova-v2-chainstate-stage3b-f0-r2-20261015.md`, Phase B),
+including a live concurrent hammer that observed 76 substituted-file overwrites and a corrupted link
+target while the store kept reporting successful publishes.
+
+**Contract (implemented).** The accepted empty residue is pinned by an **open descriptor**, and the first
+record is written through that descriptor. No pathname lookup ever chooses the write target again.
+
+| step | mechanism | property |
+|---|---|---|
+| classification | `lstat` (unchanged R1 semantics: absent / empty / nonempty / non-regular / stat error) | policy decision |
+| pin | `open(O_RDWR\|O_NOFOLLOW\|O_NONBLOCK)` + `fstat`: regular, `st_size==0`, `st_nlink>=1` | the classified object is captured on the descriptor itself; the `lstat` result is advisory |
+| first write | `fstat` (regular, `st_nlink>=1`, still empty) | an unlinked original (`st_nlink==0`) is refused even if the filesystem reuses its inode number |
+| before write | `lstat(path)` — regular **and** same `st_dev`/`st_ino` as the descriptor | the name must denote the object being written |
+| write | `pwrite` on the pinned descriptor | the target is fixed by the descriptor: no window between validation and write |
+| after `fsync` | `lstat(path)` — regular and same `st_dev`/`st_ino` | durability binding: the bytes that became durable are reachable under the committed name |
+
+Absent residue (`RequireAbsent`) keeps the kernel-atomic `O_CREAT|O_EXCL` create and adds the same
+post-`fsync` pathname binding. `UndoCreate::Any` (established store) is byte-for-byte the R1 path: no
+extra syscalls, no new failure mode.
+
+Why a fingerprint (dev/ino/ctime) is *not* sufficient: this platform reuses an inode **number** after
+`unlink`+`create` at the same pathname (observed: `st_ino` identical for the original and the substitute),
+and its `st_ctim` granularity can alias within the same millisecond (observed: identical `ctime` for the
+original and the recreated file). An in-process fingerprint therefore both false-accepts a substitute and
+cannot be repaired by widening the tuple; holding the descriptor keeps the original inode allocated, so a
+substitute cannot reacquire its `dev`/`ino` at all, and `st_nlink==0` catches the unlinked case outright.
+
+Ownership and cost: the descriptor is opened only for an accepted empty residue, owned by the store, and
+closed by its first writer or by `close()` (including every `open()` error path). One descriptor and at
+most three extra metadata syscalls per fresh-open store; `O(delta)` commit cost is unchanged.
+
+Deliberately **not** done (unchanged scope): no on-disk format change, no MANIFEST/ACK protocol change, no
+change to the backup-before-undo ordering, no new storage authority or file type, no retention/compaction/
+GC, no generation pinning, no checkpoint seeds, no consensus/DAG change, no `tree.dat` classification
+change (still recorded as a residual LOW), and no identity pin on the established-store (`Any`) path.

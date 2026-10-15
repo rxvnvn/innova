@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <dirent.h>
 #include <time.h>
 #include <stdlib.h>
 
@@ -1310,12 +1311,385 @@ static void test_r1_fresh_open_matrix(){
       CHECK(!fexists(d+"/undo.dat"), "T2 no undo.dat recreated"); s.close(); }
 }
 
+// ==================== Stage 3B-F0-R2: empty-residue substitution TOCTOU ======
+// F0-2-R1 (residual MEDIUM): an adopted EMPTY undo.dat could be replaced between the fresh-open
+// classification and the first undo write. The R1 RequireExisting path then opened the substitute
+// with a bare O_WRONLY and overwrote its bytes (E24) or followed a symlink (E25a).
+// The whole suite is behavioural: it inspects sizes, inodes, hashes and diagnostics only, so the
+// same source runs against the pre-fix baseline (where the substitution cases must FAIL).
+static bool touchEmpty(const std::string& p){ FILE* f=fopen(p.c_str(),"wb"); if(!f) return false; fclose(f); return true; }
+static bool substFile(const std::string& p, const char* content){
+    ::unlink(p.c_str()); FILE* f=fopen(p.c_str(),"wb"); if(!f) return false;
+    size_t n=strlen(content); bool ok=(fwrite(content,1,n,f)==n); fclose(f); return ok; }
+static bool statTuple(const std::string& p, uint64_t* dev, uint64_t* ino, long long* size, long long* ctimeNs){
+    struct stat st; if(::lstat(p.c_str(),&st)!=0) return false;
+    *dev=(uint64_t)st.st_dev; *ino=(uint64_t)st.st_ino; *size=(long long)st.st_size;
+    *ctimeNs=(long long)st.st_ctim.tv_sec*1000000000LL+(long long)st.st_ctim.tv_nsec; return true; }
+static long long nowUs(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return (long long)ts.tv_sec*1000000LL+ts.tv_nsec/1000LL; }
+static int countOpenFds(){ DIR* d=opendir("/proc/self/fd"); if(!d) return -1; int n=0; struct dirent* en; while((en=readdir(d))!=NULL){ if(en->d_name[0]!='.') n++; } closedir(d); return n; }
+static std::string shortErr(const ChainError& e){ std::string s=e.str(); if(s.size()>150) s=s.substr(0,150)+"..."; return s; }
+
+static void r2AckChild(const std::string& dir){
+    ChainError e; CommitStore3A s; if(!s.open(dir,&e)) ::_exit(2);
+    Block b=mkBlockH(2,0,0,3); TreeReader tr(s.tree()); Delta d;
+    if(!buildDeltaI(tr,b,MAT,&d,&e)) ::_exit(3);
+    s.setCrashPoint(CrashPoint::AfterRename);           // rename durable, ACK not yet written
+    bool ok=s.publish(d,b.hash,b.height,&e);
+    ::_exit(ok?0:1); }
+
+static void r2HammerChild(const std::string& dir,int cycles){
+    const char* pat="HAMMER-SUBSTITUTE-PATTERN-0123456789-ABCDEFGHIJ"; size_t n=strlen(pat);
+    const char* can_txt="RACE-CANARY-KEEP-ME-UNTOUCHED"; size_t cn=strlen(can_txt);
+    int viol=0; std::string p=dir+"/undo.dat", can=dir+"/canary";
+    auto canaryOk=[&]()->bool{
+        struct stat st; if(::lstat(can.c_str(),&st)!=0 || (size_t)st.st_size!=cn) return false;
+        char buf[128]={0}; FILE* g=fopen(can.c_str(),"rb"); size_t r=g?fread(buf,1,sizeof(buf)-1,g):0; if(g) fclose(g);
+        return r==cn && memcmp(buf,can_txt,cn)==0; };
+    auto patOk=[&]()->bool{
+        struct stat st; if(::lstat(p.c_str(),&st)!=0) return true;        // gone: not attributable
+        if(!S_ISREG(st.st_mode)) return true;                            // no longer a regular file
+        if((size_t)st.st_size < n) return true;                          // nothing wrote a record here (no truncate exists)
+        char buf[256]={0}; FILE* g=fopen(p.c_str(),"rb"); size_t r=g?fread(buf,1,sizeof(buf)-1,g):0; if(g) fclose(g);
+        return r>=n && memcmp(buf,pat,n)==0; };
+    for(int i=0;i<cycles;i++){
+        ::unlink(p.c_str());                                   // A) a NONEMPTY substitute (E24 shape)
+        { FILE* f=fopen(p.c_str(),"wb"); if(f){ fwrite(pat,1,n,f); fclose(f); } }
+        usleep(4000);
+        if(!patOk()) viol++;                                   // the store must never write a substitute
+        ::unlink(p.c_str()); ::symlink(can.c_str(),p.c_str()); // C) a SYMLINK substitute (E25a shape)
+        usleep(4000);
+        if(!canaryOk()) viol++;                                // the store must never follow it
+        ::unlink(p.c_str());                                   // E) a genuinely EMPTY residue (legitimate)
+        { FILE* f=fopen(p.c_str(),"wb"); if(f) fclose(f); }
+        usleep(60000);                                         // long enough for a real publish to commit
+        ::unlink(p.c_str());                                   // F) absent (legitimate O_CREAT|O_EXCL)
+        usleep(15000);
+        // G) rapid swap churn: 1 ms empty windows separated by nonempty/symlink substitutes, so a store
+        //    that validated such a window and then writes (the pre-fix failure mode) lands in a substitute
+        //    microseconds later, while a fixed store can only refuse.
+        for(int j=0;j<3;j++){
+            ::unlink(p.c_str());
+            { FILE* f=fopen(p.c_str(),"wb"); if(f) fclose(f); }
+            usleep(1000);
+            ::unlink(p.c_str());
+            { FILE* f=fopen(p.c_str(),"wb"); if(f){ fwrite(pat,1,n,f); fclose(f); } }
+            usleep(2500);
+            if(!patOk()) viol++;
+            ::unlink(p.c_str()); ::symlink(can.c_str(),p.c_str());
+            usleep(2500);
+            if(!canaryOk()) viol++;
+        }
+    }
+    std::string vp=dir+"/hammer.violations";
+    FILE* o=fopen(vp.c_str(),"wb"); if(o){ char b[32]; snprintf(b,sizeof(b),"%d",viol); fwrite(b,1,strlen(b),o); fclose(o); }
+    ::_exit(viol==0?0:5); }
+
+static void test_r2_toctou(){
+    g_cur="F0-R2-toctou";
+    ChainError e;
+    // ---- R2-03: a genuinely empty regular residue is still accepted (policy preserved)
+    { std::string d=freshDir("r2_03"); CHECK(touchEmpty(d+"/undo.dat"), "R2-03 plant an empty undo.dat");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-03 empty residue still accepted: "+e.str());
+      CHECK(s.generation()==0 && s.undoCount()==0, "R2-03 opens as gen0 with an empty index");
+      CHECK(PUBH(s,1,0,0,3,&e), "R2-03 first publish into the untouched residue: "+e.str());
+      CHECK(COH(d,&e), "R2-03 coherence"); s.close();
+      CommitStore3A r; CHECK(r.open(d,&e), "R2-03 restart: "+e.str());
+      CHECK(r.generation()==1 && r.undoCount()==1, "R2-03 restart reads one coherent record"); r.close(); }
+    // ---- R2-04: absent undo.dat -> legitimate fresh initialization
+    { std::string d=freshDir("r2_04"); CommitStore3A s; CHECK(s.open(d,&e), "R2-04 fresh init: "+e.str());
+      CHECK(s.generation()==0 && !fexists(d+"/undo.dat"), "R2-04 gen0 with no undo.dat invented");
+      CHECK(PUBH(s,1,0,0,3,&e), "R2-04 first publish creates the log: "+e.str());
+      CHECK(COH(d,&e), "R2-04 coherence"); s.close(); }
+    // ---- R2-05/06/07: initial-open policy unchanged
+    { std::string d=freshDir("r2_05"); CHECK(writeJunk(d+"/undo.dat","NONEMPTY-ORPHAN"), "R2-05 plant a nonempty orphan");
+      long ss=FSZ(d+"/undo.dat"); Hash sh=fdig(d+"/undo.dat");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-05 nonempty orphan refused at open: "+shortErr(e));
+      CHECK(FSZ(d+"/undo.dat")==ss && fdig(d+"/undo.dat")==sh, "R2-05 orphan bytes preserved"); if(ok) s.close(); }
+    { std::string d=freshDir("r2_06"); CHECK(writeJunk(d+"/canary","CANARY-06"), "R2-06 plant the canary");
+      Hash cg=fdig(d+"/canary");
+      CHECK(::symlink((d+"/canary").c_str(),(d+"/undo.dat").c_str())==0, "R2-06 symlink undo.dat");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-06 symlink refused at open: "+shortErr(e));
+      CHECK(fdig(d+"/canary")==cg, "R2-06 symlink target untouched"); if(ok) s.close(); }
+    { std::string d=freshDir("r2_07a"); CHECK(mkdir((d+"/undo.dat").c_str(),0755)==0, "R2-07a directory undo.dat");
+      CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "R2-07a directory refused at open: "+shortErr(e)); if(ok) s.close(); }
+    { std::string d=freshDir("r2_07b"); CHECK(::mkfifo((d+"/undo.dat").c_str(),0644)==0, "R2-07b fifo undo.dat");
+      long long t0=nowUs(); CommitStore3A s; bool ok=s.open(d,&e); long long dt=nowUs()-t0;
+      CHECK(!ok, "R2-07b fifo refused at open: "+shortErr(e)); CHECK(dt<2000000, "R2-07b refusal did not block ("+std::to_string(dt)+" us)"); if(ok) s.close(); }
+    // ---- R2-01/R2-08 (E24): empty -> NONEMPTY regular substitution
+    { std::string d=freshDir("r2_08"); CHECK(touchEmpty(d+"/undo.dat"), "R2-08 plant an empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-08 fresh open over the empty residue: "+e.str());
+      CHECK(substFile(d+"/undo.dat","SUBSTITUTED-NONEMPTY-CONTENT-0123456789"), "R2-08 substitute a NONEMPTY regular file (unlink+create)");
+      uint64_t dv=0,ino=0; long long sz=0,ct=0; CHECK(statTuple(d+"/undo.dat",&dv,&ino,&sz,&ct), "R2-08 stat the substitute");
+      Hash sh=fdig(d+"/undo.dat");
+      bool ok=PUBH(s,1,0,0,3,&e);
+      printf("  R2-08 substitute dev=%llu ino=%llu size=%lld ctime=%lld -> %s\n",(unsigned long long)dv,(unsigned long long)ino,sz,ct,shortErr(e).c_str());
+      CHECK(!ok, "R2-08 (E24) nonempty substitution refused before any write: "+shortErr(e));
+      CHECK(FSZ(d+"/undo.dat")==sz && fdig(d+"/undo.dat")==sh, "R2-08 substituted bytes unchanged ("+std::to_string(sz)+" B)");
+      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK") && !fexists(d+"/MANIFEST.tmp"), "R2-08 no state published over the substitute");
+      s.close(); }
+    // ---- R2-02/R2-09 (E25a): empty -> SYMLINK substitution
+    { std::string d=freshDir("r2_09"); CHECK(touchEmpty(d+"/undo.dat"), "R2-09 plant an empty residue");
+      CHECK(writeJunk(d+"/canary","RACE-CANARY-KEEP-ME-UNTOUCHED"), "R2-09 plant the symlink target");
+      long cs=FSZ(d+"/canary"); Hash cg=fdig(d+"/canary");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-09 fresh open over the empty residue: "+e.str());
+      CHECK(::unlink((d+"/undo.dat").c_str())==0 && ::symlink((d+"/canary").c_str(),(d+"/undo.dat").c_str())==0, "R2-09 replace with a symlink");
+      bool ok=PUBH(s,1,0,0,3,&e);
+      printf("  R2-09 symlink substitute -> %s\n", shortErr(e).c_str());
+      CHECK(!ok, "R2-09 (E25a) symlink substitution refused (never followed): "+shortErr(e));
+      CHECK(FSZ(d+"/canary")==cs && fdig(d+"/canary")==cg, "R2-09 symlink TARGET bytes unchanged ("+std::to_string(cs)+" B)");
+      mode_t m=0; CHECK(LSTATM(d+"/undo.dat",&m)&&S_ISLNK(m), "R2-09 the symlink was not replaced by a regular file");
+      s.close(); }
+    // ---- R2-10/R2-11/R2-29: empty -> different EMPTY inode (recreate) ; identity is verified at the write
+    { std::string d=freshDir("r2_10"); CHECK(touchEmpty(d+"/undo.dat"), "R2-10 plant an empty residue");
+      uint64_t d0=0,i0=0; long long s0=0,c0=0; CHECK(statTuple(d+"/undo.dat",&d0,&i0,&s0,&c0), "R2-10 original identity");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-10 fresh open: "+e.str());
+      CHECK(substFile(d+"/undo.dat",""), "R2-10 recreate the pathname as another EMPTY file");
+      uint64_t d1=0,i1=0; long long s1=0,c1=0; CHECK(statTuple(d+"/undo.dat",&d1,&i1,&s1,&c1), "R2-10 substitute identity");
+      printf("  R2-10 original dev=%llu ino=%llu ctime=%lld -> substitute dev=%llu ino=%llu ctime=%lld (both 0 B)\n",
+             (unsigned long long)d0,(unsigned long long)i0,c0,(unsigned long long)d1,(unsigned long long)i1,c1);
+      bool ok=PUBH(s,1,0,0,3,&e);
+      CHECK(!ok, "R2-10 (C5) a different empty inode is refused at the write boundary: "+shortErr(e));
+      CHECK(e.str().find("identity")!=std::string::npos || e.str().find("inode")!=std::string::npos, "R2-10 diagnostic names the identity mismatch");
+      CHECK(FSZ(d+"/undo.dat")==0, "R2-10 the substituted empty file is still empty (not written)");
+      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK"), "R2-10 no state published"); s.close(); }
+    { std::string d=freshDir("r2_11"); CHECK(touchEmpty(d+"/undo.dat"), "R2-11 plant an empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-11 fresh open: "+e.str());
+      CHECK(::unlink((d+"/undo.dat").c_str())==0, "R2-11 unlink the classified residue");
+      CHECK(touchEmpty(d+"/undo.dat"), "R2-11 recreate the pathname empty");
+      bool ok=PUBH(s,1,0,0,3,&e);
+      CHECK(!ok, "R2-11 (C6) unlink/recreate of the pathname refused: "+shortErr(e));
+      CHECK(FSZ(d+"/undo.dat")==0 && !fexists(d+"/MANIFEST"), "R2-11 recreated file untouched, nothing published"); s.close(); }
+    // ---- R2-12/R2-13/R2-14/R2-15: other substitution kinds
+    { std::string d=freshDir("r2_12"); CHECK(touchEmpty(d+"/undo.dat"), "R2-12 plant an empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-12 fresh open: "+e.str());
+      CHECK(::unlink((d+"/undo.dat").c_str())==0 && mkdir((d+"/undo.dat").c_str(),0755)==0, "R2-12 replace with a directory");
+      bool ok=PUBH(s,1,0,0,3,&e); CHECK(!ok, "R2-12 directory substitution refused: "+shortErr(e));
+      mode_t m=0; CHECK(LSTATM(d+"/undo.dat",&m)&&S_ISDIR(m), "R2-12 directory left in place"); s.close(); }
+    { std::string d=freshDir("r2_13"); CHECK(touchEmpty(d+"/undo.dat"), "R2-13 plant an empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-13 fresh open: "+e.str());
+      CHECK(::unlink((d+"/undo.dat").c_str())==0 && ::mkfifo((d+"/undo.dat").c_str(),0644)==0, "R2-13 replace with a FIFO");
+      long long t0=nowUs(); bool ok=PUBH(s,1,0,0,3,&e); long long dt=nowUs()-t0;
+      printf("  R2-13 FIFO refusal elapsed=%lld us -> %s\n", dt, shortErr(e).c_str());
+      CHECK(!ok, "R2-13 FIFO substitution refused: "+shortErr(e));
+      CHECK(dt<2000000, "R2-13 refusal did not block on the FIFO ("+std::to_string(dt)+" us)");
+      mode_t m=0; CHECK(LSTATM(d+"/undo.dat",&m)&&S_ISFIFO(m), "R2-13 FIFO left in place"); s.close(); }
+    { std::string d=freshDir("r2_14"); CHECK(touchEmpty(d+"/undo.dat"), "R2-14 plant an empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-14 fresh open: "+e.str());
+      if(::geteuid()!=0){
+        CHECK(substFile(d+"/undo.dat","") && ::chmod((d+"/undo.dat").c_str(),0000)==0, "R2-14 substitute an unreadable empty file");
+        bool ok=PUBH(s,1,0,0,3,&e); CHECK(!ok, "R2-14 unreadable substitution refused: "+shortErr(e));
+        ::chmod((d+"/undo.dat").c_str(),0644); CHECK(FSZ(d+"/undo.dat")==0, "R2-14 file untouched (still empty)");
+      } else printf("  R2-14 note: running as root, EACCES path not exercised\n");
+      s.close(); }
+    { std::string d=freshDir("r2_15"); CHECK(touchEmpty(d+"/undo.dat"), "R2-15 plant an empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-15 fresh open: "+e.str());
+      CHECK(::unlink((d+"/undo.dat").c_str())==0, "R2-15 the residue disappears");
+      bool ok=PUBH(s,1,0,0,3,&e); CHECK(!ok, "R2-15 missing path refused (never recreated): "+shortErr(e));
+      CHECK(!fexists(d+"/undo.dat") && !fexists(d+"/MANIFEST") && !fexists(d+"/ACK"), "R2-15 no file created");
+      s.close();
+      // Pre-existing doctrine (R1/F0, unchanged by R2): a first publish that dies before the undo write
+      // leaves whole tree pages with no MANIFEST/ACK. That residue is prior-store evidence, so the store
+      // must keep refusing it deterministically instead of silently initialising a genesis over it.
+      long tb=FSZ(d+"/tree.dat"); Hash th=fdig(d+"/tree.dat");
+      CommitStore3A r; bool ok2=r.open(d,&e);
+      CHECK(!ok2, "R2-15 the partial-initialization residue is still refused deterministically: "+shortErr(e));
+      CHECK(FSZ(d+"/tree.dat")==tb && fdig(d+"/tree.dat")==th, "R2-15 the refused store's bytes are preserved ("+std::to_string(tb)+" B tree.dat)");
+      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK"), "R2-15 no pointers invented by the refusal");
+      if(ok2) r.close(); }
+    // ---- R2-16/R2-17: absent -> appeared file/symlink is refused by O_CREAT|O_EXCL
+    { std::string d=freshDir("r2_16"); CommitStore3A s; CHECK(s.open(d,&e), "R2-16 fresh open with undo.dat absent");
+      CHECK(substFile(d+"/undo.dat","APPEARED-AFTER-CLASSIFICATION"), "R2-16 a nonempty file appears");
+      long as=FSZ(d+"/undo.dat"); Hash ah=fdig(d+"/undo.dat");
+      bool ok=PUBH(s,1,0,0,3,&e); CHECK(!ok, "R2-16 O_CREAT|O_EXCL refuses the appeared file: "+shortErr(e));
+      CHECK(FSZ(d+"/undo.dat")==as && fdig(d+"/undo.dat")==ah, "R2-16 appeared file unchanged"); s.close(); }
+    { std::string d=freshDir("r2_17"); CHECK(writeJunk(d+"/canary","CANARY-17"), "R2-17 plant the canary");
+      long cs=FSZ(d+"/canary"); Hash cg=fdig(d+"/canary");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-17 fresh open with undo.dat absent");
+      CHECK(::symlink((d+"/canary").c_str(),(d+"/undo.dat").c_str())==0, "R2-17 a symlink appears");
+      bool ok=PUBH(s,1,0,0,3,&e); CHECK(!ok, "R2-17 O_CREAT|O_EXCL refuses the appeared symlink: "+shortErr(e));
+      CHECK(FSZ(d+"/canary")==cs && fdig(d+"/canary")==cg, "R2-17 symlink target unchanged");
+      mode_t m=0; CHECK(LSTATM(d+"/undo.dat",&m)&&S_ISLNK(m), "R2-17 symlink preserved"); s.close(); }
+    // ---- R2-18/R2-19: same inode stays empty (ok) / becomes nonempty (no overwrite)
+    { std::string d=freshDir("r2_19"); CHECK(touchEmpty(d+"/undo.dat"), "R2-19 plant an empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-19 fresh open: "+e.str());
+      { FILE* f=fopen((d+"/undo.dat").c_str(),"ab"); CHECK(f!=NULL, "R2-19 append to the SAME inode");
+        if(f){ fwrite("XYZ12",1,5,f); fclose(f); } }
+      uint64_t dv=0,ino=0; long long sz=0,ct=0; statTuple(d+"/undo.dat",&dv,&ino,&sz,&ct); Hash sh=fdig(d+"/undo.dat");
+      bool ok=PUBH(s,1,0,0,3,&e);
+      CHECK(!ok, "R2-19 same inode became nonempty -> refused before writing: "+shortErr(e));
+      CHECK(FSZ(d+"/undo.dat")==sz && fdig(d+"/undo.dat")==sh, "R2-19 the bytes written by the operator survive");
+      s.close(); }
+    // ---- R2-20/R2-21: original renamed away / unlinked without replacement
+    { std::string d=freshDir("r2_20"); CHECK(touchEmpty(d+"/undo.dat"), "R2-20 plant an empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R2-20 fresh open: "+e.str());
+      CHECK(::rename((d+"/undo.dat").c_str(),(d+"/undo.dat.moved").c_str())==0, "R2-20 rename the classified inode away");
+      CHECK(substFile(d+"/undo.dat","REPLACEMENT-AFTER-RENAME"), "R2-20 install a replacement");
+      long rs=FSZ(d+"/undo.dat"); Hash rh=fdig(d+"/undo.dat");
+      bool ok=PUBH(s,1,0,0,3,&e); CHECK(!ok, "R2-20 refusal when the classified inode moved away: "+shortErr(e));
+      CHECK(FSZ(d+"/undo.dat")==rs && fdig(d+"/undo.dat")==rh, "R2-20 replacement bytes unchanged");
+      CHECK(FSZ(d+"/undo.dat.moved")==0, "R2-20 the renamed original is still empty (no write landed on it)");
+      s.close(); }
+    // ---- R2-22: repeated restart after a refusal: deterministic, no silent genesis
+    { std::string d=freshDir("r2_22"); CHECK(touchEmpty(d+"/undo.dat"), "R2-22 plant an empty residue");
+      { CommitStore3A s; CHECK(s.open(d,&e), "R2-22 fresh open: "+e.str());
+        CHECK(substFile(d+"/undo.dat","SUBSTITUTED-KEEP-ME"), "R2-22 substitute a nonempty file");
+        CHECK(!PUBH(s,1,0,0,3,&e), "R2-22 refused"); s.close(); }
+      long ss=FSZ(d+"/undo.dat"); Hash sh=fdig(d+"/undo.dat"); std::string m0;
+      for(int i=0;i<3;i++){ CommitStore3A r; bool ok=r.open(d,&e); std::string m=e.str();
+        CHECK(!ok, "R2-22 restart "+std::to_string(i)+" refuses the substitution (no silent genesis): "+shortErr(e));
+        if(i==0){ m0=m; CHECK(!m0.empty(), "R2-22 diagnostic non-empty"); } else CHECK(m==m0, "R2-22 deterministic diagnostic");
+        if(ok) r.close(); }
+      CHECK(FSZ(d+"/undo.dat")==ss && fdig(d+"/undo.dat")==sh, "R2-22 substitute untouched after repeated refusals");
+      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK"), "R2-22 no pointers invented"); }
+    // ---- R2-23/R2-24: multi-key exact digest and disconnect/reconnect on a residue-initialised store
+    { std::string d=freshDir("r2_23"); CHECK(touchEmpty(d+"/undo.dat"), "R2-23 plant an empty residue");
+      auto mkMulti=[&](int32_t h,const Hash& bh,const Hash& cbtx,std::vector<Hash> spends)->Block{
+          Block b; b.hash=bh; b.height=h;
+          for (Hash sp: spends){ OutPoint prev; prev.txid=sp; prev.n=0; Tx t; t.txid=id32(0x77000000u,(uint32_t)(h*10+(int)sp.data()[0])); t.coinbase=false;
+              TxIn in; in.prev=prev; t.vin.push_back(in); TxOut o; o.value=10*COIN; o.script={5,5}; t.vout.push_back(o); b.txs.push_back(t); }
+          Tx cb; cb.txid=cbtx; cb.coinbase=true; cb.coinstake=false; TxOut o; o.value=50*COIN; o.script={1,2,3}; cb.vout.push_back(o); b.txs.push_back(cb);
+          return b; };
+      Hash dg;
+      { CommitStore3A s; CHECK(s.open(d,&e), "R2-23 fresh open: "+e.str());
+        CHECK(PUBH(s,1,0,0,3,&e), "R2-23 h1"); CHECK(PUBH(s,2,0,0,3,&e), "R2-23 h2");
+        dg=DG(s,&e);
+        Block b3=mkMulti(3,id32(0xB10C0000u,50),id32(0xCB000000u,50),{id32(0xCB000000u,1),id32(0xCB000000u,2)});
+        CHECK(publishStore(s,b3,&e), "R2-23 multi-key publish h3: "+e.str());
+        CHECK(s.disconnect(id32(0xB10C0000u,50),&e), "R2-23 disconnect h3");
+        CHECK(DG(s,&e)==dg, "R2-23 multi-key disconnect restores the exact digest");
+        CHECK(publishStore(s,b3,&e), "R2-23 re-publish h3");
+        CHECK(COH(d,&e), "R2-23 coherence after the residue-initialised multi-key commit"); s.close(); }
+      { CommitStore3A r; CHECK(r.open(d,&e), "R2-23 restart: "+e.str());
+        CHECK(r.tipHash()==id32(0xB10C0000u,50), "R2-23 tip == h3 after restart");
+        CHECK(r.disconnect(id32(0xB10C0000u,50),&e), "R2-23 restart disconnect");
+        CHECK(DG(r,&e)==dg, "R2-23 exact digest == the pre-h3 digest after disconnect/restart"); r.close(); } }
+    { std::string d=freshDir("r2_24"); CHECK(touchEmpty(d+"/undo.dat"), "R2-24 plant an empty residue");
+      Hash d1; ChainError ce;
+      { CommitStore3A s; CHECK(s.open(d,&ce), "R2-24 fresh open: "+ce.str());
+        CHECK(PUBH(s,1,0,0,3,&ce), "R2-24 h1"); d1=DG(s,&ce);
+        CHECK(PUBH(s,2,0,0,3,&ce), "R2-24 h2");
+        CHECK(s.disconnect(id32(0xB10C0000u,2),&ce), "R2-24 disconnect h2");
+        CHECK(DG(s,&ce)==d1, "R2-24 back to the h1 digest"); s.close(); }
+      { CommitStore3A r; CHECK(r.open(d,&ce), "R2-24 restart: "+ce.str());
+        CHECK(DG(r,&ce)==d1, "R2-24 digest preserved across restart");
+        CHECK(PUBH(r,2,0,0,3,&ce), "R2-24 reconnect publish");
+        CHECK(r.disconnect(id32(0xB10C0000u,2),&ce), "R2-24 disconnect again");
+        CHECK(DG(r,&ce)==d1, "R2-24 exact digest after the reconnect/restart cycle"); r.close(); } }
+    // ---- R2-25: the F0-1 durability invariant still holds on a residue-initialised store
+    { std::string d=freshDir("r2_25"); CHECK(touchEmpty(d+"/undo.dat"), "R2-25 plant an empty residue");
+      { CommitStore3A s; CHECK(s.open(d,&e), "R2-25 fresh open: "+e.str());
+        CHECK(PUBH(s,1,0,0,3,&e), "R2-25 h1"); CHECK(PUBH(s,2,0,0,3,&e), "R2-25 h2"); CHECK(PUBH(s,3,0,0,2000,&e), "R2-25 h3 (long)");
+        CHECK(s.disconnect(id32(0xB10C0000u,3),&e), "R2-25 disconnect h3"); s.close(); }
+      uint64_t mu=MUU(d), bu=MBU(d); long pb=FSZ(d+"/undo.dat");
+      printf("  R2-25 residue-init store: primary.undoSize=%llu bak.undoSize=%llu physical=%ld\n",(unsigned long long)mu,(unsigned long long)bu,pb);
+      CHECK(bu>mu && pb==(long)bu, "R2-25 vulnerable shape reproduced on the residue path");
+      CHECK(CPFILE(d+"/undo.dat",d+"/undo.pre"), "R2-25 snapshot undo.dat");
+      { CommitStore3A s; CHECK(s.open(d,&e), "R2-25 reopen");
+        s.setInjectStage(InjectStage::ManifestTmp); s.injectNoSpace(true);
+        CHECK(!PUBH(s,4,0,0,3,&e), "R2-25 reconnect publish fails after the undo write: "+shortErr(e));
+        s.clearInjection(); s.close(); }
+      uint64_t mu2=MUU(d), bu2=MBU(d);
+      CHECK(bu2<=mu2, "R2-25 F0-1 invariant: retained bak.undoSize "+std::to_string(bu2)+" <= primary.undoSize "+std::to_string(mu2));
+      CHECK(RNGD(d+"/undo.dat",0,bu2)==RNGD(d+"/undo.pre",0,bu2), "R2-25 the retained backup references only unmodified bytes");
+      writeJunk(d+"/MANIFEST","GARBAGE-PRIMARY-AFTER-THE-WINDOW");
+      { CommitStore3A r; bool ok=r.open(d,&e);
+        CHECK(ok, "R2-25 double fault recovers the acknowledged generation: "+shortErr(e));
+        if(ok){ CHECK(r.generation()==4, "R2-25 recovered generation 4"); CHECK(r.acknowledgedGeneration()==4, "R2-25 ACK still 4"); r.close(); } } }
+    // ---- R2-26: partial undo write (established store recovers; initial residue fails closed)
+    { std::string d=freshDir("r2_26"); CHECK(touchEmpty(d+"/undo.dat"), "R2-26 plant an empty residue");
+      { CommitStore3A s; CHECK(s.open(d,&e), "R2-26 fresh open: "+e.str());
+        s.injectUndoShortOnce(20);
+        bool ok=PUBH(s,1,0,0,3,&e); s.clearInjection();
+        CHECK(!ok, "R2-26 torn first undo write fails closed: "+shortErr(e)); s.close(); }
+      long us=FSZ(d+"/undo.dat");
+      printf("  R2-26 after the torn first write: undo.dat=%ld B, MANIFEST present=%d\n", us, (int)fexists(d+"/MANIFEST"));
+      CHECK(us>0 && us<200, "R2-26 the partial record residue is present in the log ("+std::to_string(us)+" B)");
+      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK"), "R2-26 nothing was acknowledged by the torn write");
+      { CommitStore3A r; bool ok=r.open(d,&e);
+        CHECK(!ok, "R2-26 reopen refuses the partial-initialization residue: "+shortErr(e));
+        CHECK(FSZ(d+"/undo.dat")==us, "R2-26 the residue bytes are preserved"); if(ok) r.close(); } }
+    // ---- R2-27: ACK lag reconciliation on a residue-initialised store
+    { std::string d=freshDir("r2_27"); CHECK(touchEmpty(d+"/undo.dat"), "R2-27 plant an empty residue");
+      { CommitStore3A s; CHECK(s.open(d,&e), "R2-27 fresh open: "+e.str()); CHECK(PUBH(s,1,0,0,3,&e), "R2-27 h1"); s.close(); }
+      pid_t pid=fork();
+      if(pid==0){ r2AckChild(d); ::_exit(9); }
+      int st=0; waitpid(pid,&st,0);
+      CHECK(WIFEXITED(st)&&WEXITSTATUS(st)==42, "R2-27 child crashed after the rename, before the ACK ("+std::to_string(WIFEXITED(st)?WEXITSTATUS(st):-1)+")");
+      { CommitStore3A r; bool ok=r.open(d,&e);
+        CHECK(ok, "R2-27 reopen after the ACK lag: "+shortErr(e));
+        if(ok){ CHECK(r.generation()==2, "R2-27 NEW generation 2 is durable");
+                CHECK(r.acknowledgedGeneration()==2, "R2-27 ACK reconciled 1->2");
+                CHECK(COH(d,&e), "R2-27 coherence"); r.close(); } } }
+    // ---- R2-28: no descriptor leak on refusal / write-failure paths
+    { std::string d=freshDir("r2_28"); CHECK(touchEmpty(d+"/undo.dat"), "R2-28 plant an empty residue");
+      int before=countOpenFds();
+      { CommitStore3A s; CHECK(s.open(d,&e), "R2-28 fresh open: "+e.str());
+        CHECK(substFile(d+"/undo.dat","SUBSTITUTE-FD-CHECK"), "R2-28 substitution (open must not leak)");
+        CHECK(!PUBH(s,1,0,0,3,&e), "R2-28 refused"); s.close(); }
+      int after=countOpenFds();
+      printf("  R2-28 open-fd count %d -> %d\n", before, after);
+      CHECK(before>0 && after>0 && after<=before, "R2-28 no descriptor leak on the substitution refusal path");
+      std::string d2=freshDir("r2_28b"); CHECK(touchEmpty(d2+"/undo.dat"), "R2-28b plant an empty residue");
+      int b2=countOpenFds();
+      { CommitStore3A s; CHECK(s.open(d2,&e), "R2-28b fresh open: "+e.str());
+        s.setInjectStage(InjectStage::UndoAppend); s.injectFsyncFail(true);
+        CHECK(!PUBH(s,1,0,0,3,&e), "R2-28b injected fsync failure refuses: "+shortErr(e));
+        s.clearInjection(); s.close(); }
+      int a2=countOpenFds();
+      printf("  R2-28b write+fsync-failure fd count %d -> %d\n", b2, a2);
+      CHECK(a2<=b2, "R2-28b no descriptor leak on the write/fsync failure path"); }
+}
+
+static void test_r2_toctou_race(){
+    g_cur="F0-R2-toctou-race";
+    ChainError e;
+    std::string d=freshDir("r2_race");
+    CHECK(touchEmpty(d+"/undo.dat"), "R2-race plant an empty residue");
+    CHECK(writeJunk(d+"/canary","RACE-CANARY-KEEP-ME-UNTOUCHED"), "R2-race plant the symlink canary");
+    long cs=FSZ(d+"/canary"); Hash cg=fdig(d+"/canary");
+    pid_t pid=fork();
+    if(pid==0){ r2HammerChild(d,30); ::_exit(9); }
+    int succ=0, openRef=0, pubRef=0; std::string firstErr; long long t0=nowUs();
+    for(int k=0;k<160;k++){
+        // Each attempt starts from a clean fresh-store state: an attempt that dies between the backup
+        // barrier and the primary publish would otherwise leave MANIFEST.bak without a primary and
+        // poison every later open. The hammer keeps owning undo.dat.
+        ::unlink((d+"/MANIFEST").c_str()); ::unlink((d+"/MANIFEST.bak").c_str()); ::unlink((d+"/MANIFEST.tmp").c_str());
+        ::unlink((d+"/ACK").c_str()); ::unlink((d+"/tree.dat").c_str());
+        if(k==0) touchEmpty(d+"/undo.dat");
+        CommitStore3A s; ChainError e2;
+        if(s.open(d,&e2)){
+            Block b=mkBlockH(1,0,0,3); TreeReader tr(s.tree()); Delta dd;
+            if(buildDeltaI(tr,b,MAT,&dd,&e2)){
+                if(s.publish(dd,b.hash,b.height,&e2)) succ++;
+                else { pubRef++; if(firstErr.empty()) firstErr="publish: "+shortErr(e2); }
+            } else { pubRef++; if(firstErr.empty()) firstErr="delta: "+shortErr(e2); }
+            s.close();
+        } else { openRef++; if(firstErr.empty()) firstErr="open: "+shortErr(e2); }
+        if(nowUs()-t0 > 6000000) break;                 // bounded: ~6 s of live hammering
+        usleep(2000);
+    }
+    int st=0; waitpid(pid,&st,0);
+    int cv=-1; { FILE* f=fopen((d+"/hammer.violations").c_str(),"rb"); if(f){ char b[32]={0}; if(fread(b,1,sizeof(b)-1,f)>0) cv=atoi(b); fclose(f); } }
+    printf("  R2-race (live substitution hammer): publishes_ok=%d open_refusals=%d publish_refusals=%d hammer_violations=%d child_exit=%d\n",
+           succ, openRef, pubRef, cv, WIFEXITED(st)?WEXITSTATUS(st):-1);
+    printf("  R2-race first refusal: %s\n", firstErr.c_str());
+    CHECK(FSZ(d+"/canary")==cs && fdig(d+"/canary")==cg, "R2-race symlink target never written under concurrency");
+    CHECK(cv==0, "R2-race concurrent hammer observed zero substituted-file overwrites");
+    CHECK(WIFEXITED(st)&&WEXITSTATUS(st)==0, "R2-race hammer exited clean (violations=0)");
+    // deterministic companion: after the race, a legitimate empty residue still initializes and publishes
+    { std::string d2=freshDir("r2_race_ok"); CHECK(touchEmpty(d2+"/undo.dat"), "R2-race_ok plant an empty residue");
+      CommitStore3A s; CHECK(s.open(d2,&e), "R2-race_ok empty residue accepted after the race: "+e.str());
+      CHECK(PUBH(s,1,0,0,3,&e), "R2-race_ok legitimate publish still works: "+e.str());
+      CHECK(COH(d2,&e), "R2-race_ok coherence"); s.close(); }
+}
+
 static long readVmHWM(){ FILE*f=fopen("/proc/self/status","r"); if(!f)return -1; char l[256]; long kb=-1; while(fgets(l,sizeof(l),f)){ if(strncmp(l,"VmHWM:",6)==0){ sscanf(l+6,"%ld",&kb); break; } } fclose(f); return kb; }
 
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){
