@@ -53,6 +53,18 @@ enum class UndoCreate { Any, RequireAbsent, RequireExisting };
 // (A pure dev/ino/ctime fingerprint is NOT sufficient on its own: this platform reuses an inode NUMBER
 // after unlink+create and its ctime granularity can alias within the same millisecond.)
 // Ownership: the descriptor belongs to the store and is closed either by its first writer or by close().
+//
+// R3 (F0-2-R2-1): the fresh-open policy -- and, for an accepted empty residue, the pinned descriptor -- is a
+// ONE-SHOT resource, spent by the first publication that enters the undo write phase. R2 left that
+// consumption invisible: a first publication that failed BEFORE the MANIFEST rename (renamePassed_ false)
+// left the instance retryable, and the retry then fell back to UndoCreate::Any, re-resolving undo.dat by
+// pathname -- re-exposing exactly the substitution TOCTOU the pin had just closed.
+// The instance therefore fails closed: when a publication that spent the one-shot does not complete, the
+// store becomes REOPEN_REQUIRED and refuses every later publish/disconnect before touching persistent state
+// (it never silently degrades to UndoCreate::Any). Reopening reclassifies the actual on-disk evidence and
+// never trusts this instance's in-memory descriptor state, so an ambiguous residue is refused rather than
+// re-initialized. A failure that happens BEFORE the undo write phase spends nothing, keeps the pin, and
+// remains safely retryable on the same instance; established-store retry semantics are unchanged.
 
 class CommitStore3A {
 public:
@@ -83,6 +95,11 @@ public:
 
     // test hooks
     void setCrashPoint(CrashPoint c) { crashPoint_ = c; }
+    // R3 test hook: bounded pause at a named point of the publication path, so a test can perform an
+    // external substitution inside one specific window (Phase F). Default None/0 is a no-op; production
+    // callers never set it. Same test-instrumentation contract as setCrashPoint / inject* / injectUndoShortOnce.
+    enum class PausePoint { None, BeforeUndoNameRecheck, BeforeAck };
+    void setPause(PausePoint p, int ms) { pausePoint_ = p; pauseMs_ = ms; }
     void setInjectStage(InjectStage s) { injectStage_ = s; }
     void injectNoSpace(bool v) { injectNoSpace_ = v; }
     void injectFsyncFail(bool v) { injectFsyncFail_ = v; }
@@ -111,6 +128,9 @@ private:
     bool readAck(bool* present, uint64_t* gen, ChainError* e);
     void crashIf(CrashPoint at);
     void cleanupTmp();
+    // R3 (F0-2-R2-1): mark this instance REOPEN_REQUIRED with the exact reason that closed it (fail-closed).
+    void requireReopen(const std::string& why);
+    void pauseAt(PausePoint p) const;
 
     std::string p(const std::string& name) const { return dir_ + "/" + name; }
 
@@ -137,6 +157,18 @@ private:
     UndoCreate freshUndoCreate_ = UndoCreate::Any;
     // R2 (F0-2-R1): descriptor pinning the EMPTY undo.dat accepted at fresh open (until its first write).
     int freshUndoFd_ = -1;
+    // R3 (F0-2-R2-1): true when the publication currently being attempted spent the fresh-open one-shot
+    // policy. A failure of such a publication must not be retried on this instance (see requireReopen).
+    bool freshOneShotTaken_ = false;
+    // R3: why this instance requires a reopen (surfaced by the publish/disconnect guards).
+    std::string reopenWhy_;
+    // R3 (F0-2-R2-2): descriptor of the undo log written by the in-flight commit, held OPEN until the
+    // generation is acknowledged (or the commit fails). Holding it is what makes the pre-ACK pathname
+    // recheck sound: the inode cannot be unlinked-and-number-reused while a descriptor refers to it.
+    int heldLogFd_ = -1;
+    // R3 test hook state (see setPause).
+    PausePoint pausePoint_ = PausePoint::None;
+    int pauseMs_ = 0;
 };
 
 // R1 (F0-2): the create policy is documented on the UndoCreate enum above.
@@ -147,8 +179,12 @@ bool csAppendFile(const std::string& path, const uint8_t* d, size_t n, bool injN
 // R1: the trailing `create` policy decides whether the file may be created, and fails closed on any
 // classification/creation race (see UndoCreate). Every failure path here is fail-closed: the caller
 // must not treat a false return as "nothing was written" without checking its own recovery contract.
+// R3 (F0-2-R2-2): holdFd (optional) receives the descriptor the record was written through and keeps it
+// OPEN (ownership transfers to the caller). The caller holds it until the generation is acknowledged, which
+// is what makes the pre-ACK pathname->object recheck sound: while a descriptor is open the inode cannot be
+// unlinked-and-number-reused, so a dev/ino mismatch is real evidence of substitution.
 bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e,
-                   UndoCreate create = UndoCreate::Any, int pinnedFd = -1);
+                   UndoCreate create = UndoCreate::Any, int pinnedFd = -1, int* holdFd = nullptr);
 bool csReadFile(const std::string& path, std::vector<uint8_t>* out, bool* exists, ChainError* e);
 bool csReadRange(const std::string& path, uint64_t off, uint64_t len, std::vector<uint8_t>* out, ChainError* e);
 bool csFsyncDir(const std::string& dir, ChainError* e);

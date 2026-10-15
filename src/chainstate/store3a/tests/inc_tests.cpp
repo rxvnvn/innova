@@ -25,7 +25,7 @@ static int g_pass=0,g_fail=0; static std::vector<std::string> g_failmsg; static 
 #define CHECK(c,m) do{ if(c) g_pass++; else { g_fail++; g_failmsg.push_back(g_cur+": "+(m)); } }while(0)
 static long readVmHWM();
 
-static std::string baseDir(){ return "/home/user/data/chainstate-3a-runtime/"; }
+static std::string baseDir(){ const char* o=getenv("STORE3A_BASE"); if(o&&*o){ std::string s=o; if(s[s.size()-1]!='/') s+="/"; return s; } return "/home/user/data/chainstate-3a-runtime/"; }
 static std::string rmTree(const std::string& d){ std::string c="rm -rf '"+d+"'"; int r=system(c.c_str()); (void)r; return d; }
 static std::string freshDir(const std::string& name){ std::string b=baseDir(); std::string d=b+name; rmTree(d); mkdir(b.c_str(),0755); mkdir(d.c_str(),0755); return d; }
 static long fileSize(const std::string& p){ struct stat st; return stat(p.c_str(),&st)==0?(long)st.st_size:-1; }
@@ -1684,12 +1684,464 @@ static void test_r2_toctou_race(){
       CHECK(COH(d2,&e), "R2-race_ok coherence"); s.close(); }
 }
 
+// ==================== Stage 3B-F0-R3: first-publication failure lifecycle ====================
+// One-shot failure injectors: each maps to exactly one point of the publication path (DESIGN.md 13.1), so the
+// failure/retry matrix can distinguish "before any undo mutation" from "after the undo write" and from the
+// post-rename phases -- failure classes that do NOT have identical durability consequences.
+enum R3Fail { R3F_NONE=0, R3F_PageWrite=1, R3F_UndoNoSpace=2, R3F_UndoFsync=3, R3F_BakWrite=4,
+              R3F_ManifestTmpWrite=5, R3F_ManifestTmpFsync=6, R3F_ManifestRename=7, R3F_DirFsync=8,
+              R3F_AckWrite=9, R3F_TornUndo=10 };
+static void r3Inject(CommitStore3A& s,int which,size_t tornBytes=0){
+    s.clearInjection();
+    switch(which){
+        case R3F_PageWrite:        s.setInjectStage(InjectStage::PageWrite);     s.injectNoSpace(true);   break;
+        case R3F_UndoNoSpace:      s.setInjectStage(InjectStage::UndoAppend);    s.injectNoSpace(true);   break;
+        case R3F_UndoFsync:        s.setInjectStage(InjectStage::UndoAppend);    s.injectFsyncFail(true); break;
+        case R3F_BakWrite:         s.setInjectStage(InjectStage::BakWrite);      s.injectNoSpace(true);   break;
+        case R3F_ManifestTmpWrite: s.setInjectStage(InjectStage::ManifestTmp);   s.injectNoSpace(true);   break;
+        case R3F_ManifestTmpFsync: s.setInjectStage(InjectStage::ManifestTmp);   s.injectFsyncFail(true); break;
+        case R3F_ManifestRename:   s.setInjectStage(InjectStage::PrimaryRename); s.injectNoSpace(true);   break;
+        case R3F_DirFsync:         s.setInjectStage(InjectStage::DirFsync);      s.injectNoSpace(true);   break;
+        case R3F_AckWrite:         s.setInjectStage(InjectStage::AckWrite);      s.injectNoSpace(true);   break;
+        case R3F_TornUndo:         s.injectUndoShortOnce(tornBytes? tornBytes : 20); break;
+        default: break;
+    }
+}
+static std::string r3hex(const Hash& h){ char b[65]; const uint8_t* p=h.data(); for(int i=0;i<32;i++) sprintf(b+2*i,"%02x",p[i]); b[64]=0; return std::string(b); }
+// Full persistent-state fingerprint (sizes + hashes of every artifact): proves a refused mutation wrote nothing.
+static std::string r3Snap(const std::string& d){
+    std::string s;
+    s+="undo:"+std::to_string(FSZ(d+"/undo.dat"))+":"+r3hex(fdig(d+"/undo.dat"));
+    s+="|man:"+std::to_string(FSZ(d+"/MANIFEST"))+":"+r3hex(fdig(d+"/MANIFEST"));
+    s+="|bak:"+std::to_string(FSZ(d+"/MANIFEST.bak"))+":"+r3hex(fdig(d+"/MANIFEST.bak"));
+    s+="|ack:"+std::to_string(FSZ(d+"/ACK"))+":"+r3hex(fdig(d+"/ACK"));
+    s+="|tree:"+std::to_string(FSZ(d+"/tree.dat"))+":"+r3hex(fdig(d+"/tree.dat"));
+    s+="|tmp:"+std::to_string((int)fexists(d+"/MANIFEST.tmp")+(int)fexists(d+"/ACK.tmp")+(int)fexists(d+"/MANIFEST.bak.tmp"));
+    return s;
+}
+static std::string r3wstatus(int st){
+    if(WIFSIGNALED(st)) return "signal "+std::to_string((int)WTERMSIG(st));
+    if(WIFEXITED(st))   return "exit "+std::to_string((int)WEXITSTATUS(st));
+    return "unknown"; }
+// Rewrite ACK to an arbitrary generation (test-only; ACK = 8B gen LE + 4B crc32).
+static bool r3WriteAckGen(const std::string& dir,uint64_t gen){
+    uint8_t b[12]={0}; for(int i=0;i<8;i++) b[i]=(uint8_t)((gen>>(8*i))&0xff);
+    uint32_t crc=csCrc32(b,8); for(int i=0;i<4;i++) b[8+i]=(uint8_t)((crc>>(8*i))&0xff);
+    std::string tmp=dir+"/ACK.r3tmp";
+    FILE* f=fopen(tmp.c_str(),"wb"); if(!f) return false;
+    bool ok=fwrite(b,1,12,f)==12; fclose(f); if(!ok){ ::unlink(tmp.c_str()); return false; }
+    return ::rename(tmp.c_str(),(dir+"/ACK").c_str())==0; }
+// The audit's E-A substitute shape: a small NONEMPTY regular file planted at undo.dat.
+static const char* R3_SUB="R3-SUBSTITUTED-NONEMPTY-REGULAR-PAYLOAD-41B";
+
+// ---- R3-01..R3-21: retry refusal, failure classes, entry points, resource hygiene
+static void test_r3_retry(){
+    g_cur="F0-R3-retry";
+    ChainError e;
+
+    // ---- R3-01/R3-02/R3-03/R3-34: the audited E-A corruption (pre-fix) vs the fail-closed refusal (post-fix)
+    { std::string d=freshDir("r3_01");
+      CHECK(touchEmpty(d+"/undo.dat"), "R3-01 plant an ACCEPTED empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R3-01 fresh open over the empty residue: "+e.str());
+      CHECK(s.generation()==0 && s.undoCount()==0, "R3-01 opens as gen0 with an empty undo index");
+      r3Inject(s,R3F_ManifestTmpWrite);                       // pre-MANIFEST-rename failure (the audited E-A)
+      ChainError e1; bool p1=PUBH(s,1,0,0,3,&e1); s.clearInjection();
+      printf("  R3-01 first publish: publish=%d gen=%llu undo=%ld MANIFEST=%d err=%s\n",(int)p1,
+             (unsigned long long)s.generation(),FSZ(d+"/undo.dat"),(int)fexists(d+"/MANIFEST"),shortErr(e1).c_str());
+      CHECK(!p1, "R3-01/R3-09 first publish fails before the MANIFEST rename: "+shortErr(e1));
+      CHECK(s.generation()==0, "R3-01 no generation committed in memory");
+      CHECK(FSZ(d+"/undo.dat")>0, "R3-01 the undo record was written+fsynced before the failure (size "+std::to_string(FSZ(d+"/undo.dat"))+")");
+      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK"), "R3-01 no MANIFEST/ACK published");
+      CHECK(substFile(d+"/undo.dat",R3_SUB), "R3-01 substitute a nonempty regular file at undo.dat");
+      long ss=FSZ(d+"/undo.dat"); Hash sh=fdig(d+"/undo.dat"); std::string snap=r3Snap(d);
+      printf("  R3-01 substitute: %ld bytes sha=%s\n", ss, r3hex(sh).c_str());
+      ChainError e2; bool p2=PUBH(s,1,0,0,3,&e2);             // retry: SAME instance, SAME block
+      printf("  R3-01 retry (same instance): publish=%d undo=%ld->%ld needsReopen=%d err=%s\n",(int)p2,ss,
+             FSZ(d+"/undo.dat"),(int)s.needsReopen(),shortErr(e2).c_str());
+      CHECK(!p2, "R3-01/R3-02 (F0-2-R2-1) retry refused before any write: "+shortErr(e2));
+      CHECK(s.needsReopen(), "R3-01 instance reports REOPEN_REQUIRED after the failed first publish");
+      CHECK(FSZ(d+"/undo.dat")==ss && fdig(d+"/undo.dat")==sh, "R3-01/R3-03 substituted file unchanged ("+std::to_string(ss)+" B, sha identical)");
+      // R3-16: every public mutation entry point enforces the state
+      ChainError e3; bool dok=s.disconnect(id32(0xBB000000u,1),&e3);
+      printf("  R3-16 disconnect on a REOPEN_REQUIRED instance: %d err=%s\n",(int)dok,shortErr(e3).c_str());
+      CHECK(!dok, "R3-16 disconnect refused too: "+shortErr(e3));
+      CHECK(s.generation()==0 && s.undoCount()==0, "R3-16/R3-34 no state changed by the refused mutations");
+      CHECK(r3Snap(d)==snap, "R3-34 no persistent mutation at all after REOPEN_REQUIRED (full datadir fingerprint)");
+      CHECK(!fexists(d+"/MANIFEST.tmp") && !fexists(d+"/ACK.tmp"), "R3-34 no temp file left behind");
+      s.close();
+      // R3-18/R3-26: reopen reclassifies disk evidence and refuses, deterministically, repeatedly
+      std::string first; int refused=0;
+      for(int i=0;i<3;i++){ CommitStore3A r; ChainError e4; if(!r.open(d,&e4)){ refused++; if(first.empty()) first=shortErr(e4); } else r.close(); }
+      printf("  R3-18 reopen after the failure: refused %d/3 first=%s\n", refused, first.c_str());
+      CHECK(refused==3, "R3-18/R3-26 three consecutive reopens all refuse ("+std::to_string(refused)+"/3)");
+      CHECK(FSZ(d+"/undo.dat")==ss && fdig(d+"/undo.dat")==sh, "R3-18 the substitute is still untouched after the refusals");
+    }
+
+    // ---- R3-04: symlink substitution after the failure -> target untouched, refusal must not follow it
+    { std::string d=freshDir("r3_04");
+      CHECK(touchEmpty(d+"/undo.dat"), "R3-04 plant an ACCEPTED empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R3-04 open: "+e.str());
+      r3Inject(s,R3F_ManifestTmpWrite); ChainError e1; CHECK(!PUBH(s,1,0,0,3,&e1), "R3-04 first publish fails: "+shortErr(e1)); s.clearInjection();
+      CHECK(writeJunk(d+"/canary","R3-CANARY-KEEP-ME-UNTOUCHED-0123456789"), "R3-04 plant the symlink target");
+      long cs=FSZ(d+"/canary"); Hash cg=fdig(d+"/canary");
+      CHECK(::rename((d+"/undo.dat").c_str(),(d+"/undo.dat.moved").c_str())==0, "R3-04 move the real log aside");
+      CHECK(::symlink((d+"/canary").c_str(),(d+"/undo.dat").c_str())==0, "R3-04 substitute a symlink at undo.dat");
+      ChainError e2; bool p2=PUBH(s,2,0,0,3,&e2);
+      printf("  R3-04 retry over a symlink: publish=%d canary=%ld->%ld err=%s\n",(int)p2,cs,FSZ(d+"/canary"),shortErr(e2).c_str());
+      CHECK(!p2, "R3-04 retry refused (no symlink follow): "+shortErr(e2));
+      CHECK(FSZ(d+"/canary")==cs && fdig(d+"/canary")==cg, "R3-04 symlink target untouched");
+      CHECK(FSZ(d+"/undo.dat.moved")>0, "R3-04 the moved original is preserved verbatim");
+      s.close(); }
+
+    // ---- R3-05: FIFO substitution must be refused without blocking (bounded: fork + alarm)
+    { std::string d=freshDir("r3_05");
+      pid_t pid=fork();
+      if(pid==0){
+          ChainError ce; CommitStore3A c; if(!c.open(d,&ce)) ::_exit(2);
+          r3Inject(c,R3F_ManifestTmpWrite); ChainError ce1; PUBH(c,1,0,0,3,&ce1); c.clearInjection();
+          ::unlink((d+"/undo.dat").c_str());
+          if(::mkfifo((d+"/undo.dat").c_str(),0644)!=0) ::_exit(3);
+          ::alarm(5);                                   // a blocking O_WRONLY open is killed here (pre-fix HANG)
+          ChainError ce2; bool r=PUBH(c,2,0,0,3,&ce2);
+          ::_exit(r?7:6);
+      }
+      int st=0; waitpid(pid,&st,0); std::string ws=r3wstatus(st);
+      mode_t m=0; bool isfifo=LSTATM(d+"/undo.dat",&m) && S_ISFIFO(m);
+      printf("  R3-05 FIFO retry: child=%s fifo_still_present=%d\n", ws.c_str(),(int)isfifo);
+      CHECK(WIFEXITED(st)&&WEXITSTATUS(st)==6, "R3-05 FIFO substitution refused without blocking (expected exit 6, got "+ws+")");
+      CHECK(isfifo, "R3-05 the FIFO substitute is untouched"); }
+
+    // ---- R3-06: a failure BEFORE the undo write leaves the pin intact -> retry stays safe AND pinned
+    { std::string d=freshDir("r3_06a");
+      CHECK(touchEmpty(d+"/undo.dat"), "R3-06a plant an ACCEPTED empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R3-06a open: "+e.str());
+      r3Inject(s,R3F_PageWrite); ChainError e1; CHECK(!PUBH(s,1,0,0,3,&e1), "R3-06a failure before any undo mutation: "+shortErr(e1)); s.clearInjection();
+      CHECK(!s.needsReopen(), "R3-06a instance is NOT reopen-required (the one-shot was not spent)");
+      ChainError e2; bool p2=PUBH(s,1,0,0,3,&e2);
+      printf("  R3-06a retry after a pre-undo failure: publish=%d gen=%llu err=%s\n",(int)p2,(unsigned long long)s.generation(),shortErr(e2).c_str());
+      CHECK(p2, "R3-06a retry still allowed (activation point is precise, not blanket): "+shortErr(e2));
+      CHECK(s.generation()==1 && COH(d,&e2), "R3-06a retry committed gen1 coherently"); s.close(); }
+    { std::string d=freshDir("r3_06b");
+      CHECK(touchEmpty(d+"/undo.dat"), "R3-06b plant an ACCEPTED empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R3-06b open: "+e.str());
+      r3Inject(s,R3F_PageWrite); ChainError e1; CHECK(!PUBH(s,1,0,0,3,&e1), "R3-06b failure before any undo mutation: "+shortErr(e1)); s.clearInjection();
+      CHECK(substFile(d+"/undo.dat",R3_SUB), "R3-06b substitute a nonempty file at undo.dat");
+      long ss=FSZ(d+"/undo.dat"); Hash sh=fdig(d+"/undo.dat");
+      ChainError e2; bool p2=PUBH(s,2,0,0,3,&e2);
+      printf("  R3-06b retry with a surviving pin over a substitute: publish=%d err=%s\n",(int)p2,shortErr(e2).c_str());
+      CHECK(!p2, "R3-06b the surviving pin refuses the substitute: "+shortErr(e2));
+      CHECK(FSZ(d+"/undo.dat")==ss && fdig(d+"/undo.dat")==sh, "R3-06b substitute unchanged");
+      s.close(); }
+
+    // ---- R3-07..R3-13: the failure classes (each must refuse the retry and preserve every byte)
+    struct R3Mode { const char* id; int fail; const char* cls; bool manifestDurable; };
+    R3Mode modes[]={
+        {"R3-07", R3F_TornUndo,          "partial undo write (torn, fsynced prefix)",      false},
+        {"R3-08", R3F_UndoFsync,         "complete undo write, fsync failed",              false},
+        {"R3-09", R3F_ManifestTmpWrite,  "undo durable, MANIFEST.tmp write failed",        false},
+        {"R3-10", R3F_ManifestTmpFsync,  "MANIFEST.tmp written, its fsync failed",         false},
+        {"R3-11", R3F_ManifestRename,    "MANIFEST rename failed",                         false},
+        {"R3-12", R3F_DirFsync,          "rename done, directory fsync failed",            true },
+        {"R3-13", R3F_AckWrite,          "rename+dirfsync done, ACK write failed",         true },
+    };
+    for (auto& md: modes){
+        std::string d=freshDir(std::string("r3_")+std::string(md.id+3));
+        CHECK(touchEmpty(d+"/undo.dat"), std::string(md.id)+" plant an ACCEPTED empty residue");
+        CommitStore3A s; ChainError e0; bool op=s.open(d,&e0);
+        CHECK(op, std::string(md.id)+" open: "+shortErr(e0));
+        if(!op) continue;
+        r3Inject(s,md.fail,20);
+        ChainError e1; bool p1=PUBH(s,1,0,0,3,&e1); s.clearInjection();
+        long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat"); std::string snap=r3Snap(d);
+        ChainError e2; bool p2=PUBH(s,1,0,0,3,&e2);
+        CommitStore3A r; ChainError e3; bool ro=r.open(d,&e3); if(ro) r.close();
+        printf("  %s [%s] publish1=%d undo=%ld reopen=%d retry=%d needsReopen=%d man=%d ack=%d | retry_err=%s\n",
+               md.id, md.cls, (int)p1, us, (int)ro, (int)p2, (int)s.needsReopen(),
+               (int)fexists(d+"/MANIFEST"), (int)fexists(d+"/ACK"), shortErr(e2).c_str());
+        CHECK(!p1, std::string(md.id)+" first publish fails: "+shortErr(e1));
+        CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, std::string(md.id)+" undo bytes are exactly the ones this commit wrote (preserved)");
+        CHECK(!p2, std::string(md.id)+" retry refused before any write: "+shortErr(e2));
+        CHECK(s.needsReopen(), std::string(md.id)+" instance requires reopen after the spent one-shot");
+        CHECK(r3Snap(d)==snap, std::string(md.id)+" the refused retry mutated nothing");
+        CHECK(fexists(d+"/MANIFEST")==md.manifestDurable, std::string(md.id)+" MANIFEST durability matches the failure class");
+        CHECK(!fexists(d+"/ACK"), std::string(md.id)+" no ACK was written for an incomplete publication");
+        CHECK(!ro, std::string(md.id)+" reopen refuses (never trusts in-memory state): "+shortErr(e3));
+        s.close();
+    }
+
+    // ---- R3-14/R3-15: the refusal does not depend on which block the retry carries
+    for (int variant=0; variant<2; variant++){
+        std::string d=freshDir(variant? "r3_15":"r3_14");
+        const char* id = variant? "R3-15" : "R3-14";
+        CHECK(touchEmpty(d+"/undo.dat"), std::string(id)+" plant an ACCEPTED empty residue");
+        CommitStore3A s; ChainError e0; CHECK(s.open(d,&e0), std::string(id)+" open: "+e0.str());
+        r3Inject(s,R3F_ManifestTmpWrite); ChainError e1; CHECK(!PUBH(s,1,0,0,3,&e1), std::string(id)+" first publish fails: "+shortErr(e1)); s.clearInjection();
+        ChainError e2; bool p2 = variant? PUBH(s,5,9,9,3,&e2) : PUBH(s,1,0,0,3,&e2);
+        printf("  %s retry holds %s block: publish=%d err=%s\n", id, variant?"a DIFFERENT":"the SAME", (int)p2, shortErr(e2).c_str());
+        CHECK(!p2, std::string(id)+" retry refused regardless of the block payload: "+shortErr(e2));
+        CHECK(s.generation()==0 && s.undoCount()==0, std::string(id)+" no generation/index entry created");
+        s.close();
+    }
+
+    // ---- R3-17/R3-33: descriptor accounting across open -> failure -> refusal -> close
+    { std::string d=freshDir("r3_17");
+      int fd0=countOpenFds();
+      CHECK(touchEmpty(d+"/undo.dat"), "R3-17 plant an ACCEPTED empty residue");
+      int fdPlanted=countOpenFds();
+      CommitStore3A s; ChainError e0; CHECK(s.open(d,&e0), "R3-17 open (adopts+pin a descriptor): "+e0.str());
+      int fdOpen=countOpenFds();
+      r3Inject(s,R3F_ManifestTmpWrite); ChainError e1; CHECK(!PUBH(s,1,0,0,3,&e1), "R3-17 first publish fails: "+shortErr(e1)); s.clearInjection();
+      int fdFail=countOpenFds();
+      ChainError e2; CHECK(!PUBH(s,1,0,0,3,&e2), "R3-17 retry refused: "+shortErr(e2));
+      int fdRef=countOpenFds();
+      s.close();
+      int fdClosed=countOpenFds();
+      printf("  R3-17 open fds: base=%d planted=%d open=%d after_failure=%d after_refusal=%d after_close=%d\n",
+             fd0,fdPlanted,fdOpen,fdFail,fdRef,fdClosed);
+      CHECK(fdPlanted==fd0, "R3-33 planting the residue leaks nothing");
+      CHECK(fdFail<=fdOpen, "R3-33 the failed first publish released its descriptors (pin consumed+closed)");
+      CHECK(fdRef<=fdFail, "R3-33 the refused retry opened nothing");
+      CHECK(fdClosed<=fd0, "R3-33 close() released everything including the adopted pin");
+    }
+}
+
+// ---- R3-19..R3-32, R3-35, R3-36: reopen/recovery semantics after the new state
+static void test_r3_reopen(){
+    g_cur="F0-R3-reopen";
+    ChainError e;
+
+    // ---- R3-29/R3-30/R3-32/R3-27: the normal lifecycle is untouched
+    { std::string d=freshDir("r3_29");
+      CHECK(touchEmpty(d+"/undo.dat"), "R3-29 plant an ACCEPTED empty residue");
+      CommitStore3A s; CHECK(s.open(d,&e), "R3-29 (R3-27) empty residue accepted: "+e.str());
+      CHECK(s.generation()==0 && s.undoCount()==0, "R3-29 gen0 with an empty undo index");
+      CHECK(PUBH(s,1,0,0,3,&e), "R3-29 first publish succeeds: "+e.str());
+      CHECK(s.generation()==1 && s.undoCount()==1, "R3-29 gen1 with exactly one undo record");
+      CHECK(!s.needsReopen(), "R3-29 a SUCCESSFUL first publish leaves the instance usable");
+      CHECK(COH(d,&e), "R3-29 coherence");
+      CHECK(fexists(d+"/MANIFEST") && fexists(d+"/ACK"), "R3-29 MANIFEST + ACK published");
+      Hash dig1=DG(s,&e); s.close();
+      CommitStore3A r; CHECK(r.open(d,&e), "R3-29 restart: "+e.str());
+      CHECK(r.generation()==1 && DG(r,&e)==dig1, "R3-32 exact digest after restart");
+      CHECK(PUBH(r,2,0,0,3,&e), "R3-30 second publish succeeds: "+e.str());
+      CHECK(r.generation()==2 && COH(d,&e), "R3-30 gen2 committed coherently");
+      Hash dig2=DG(r,&e); r.close();
+      CommitStore3A r2; CHECK(r2.open(d,&e), "R3-30 restart2: "+e.str());
+      CHECK(r2.generation()==2 && DG(r2,&e)==dig2, "R3-32 gen2 digest exact after restart (acknowledged state preserved)");
+      CHECK(r2.acknowledgedGeneration()==2, "R3-30 ACK tracks the committed generation");
+      r2.close(); }
+
+    // ---- R3-28: absent undo.dat still means legitimate fresh initialization
+    { std::string d=freshDir("r3_28"); CommitStore3A s; CHECK(s.open(d,&e), "R3-28 absent undo.dat accepted: "+e.str());
+      CHECK(s.generation()==0 && !fexists(d+"/undo.dat"), "R3-28 gen0 and no log invented");
+      CHECK(PUBH(s,1,0,0,3,&e), "R3-28 first publish creates the log: "+e.str());
+      CHECK(COH(d,&e), "R3-28 coherence"); s.close(); }
+
+    // ---- R3-19: reopen with a PARTIAL undo residue
+    { std::string d=freshDir("r3_19");
+      { FILE* f=fopen((d+"/undo.dat").c_str(),"wb"); if(f){ const char* h="INNUNDO1"; fwrite(h,1,8,f); uint8_t j[4]={0}; fwrite(j,1,4,f); fclose(f); } }
+      long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat");
+      CommitStore3A r; bool ok=r.open(d,&e);
+      printf("  R3-19 reopen with a %ld B partial residue: ok=%d err=%s\n", us,(int)ok,shortErr(e).c_str());
+      CHECK(!ok, "R3-19 partial residue refused, never presented as genesis: "+shortErr(e));
+      CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "R3-19 partial residue preserved byte-for-byte");
+      if(ok) r.close(); }
+
+    // ---- R3-20: reopen with a COMPLETE but UNACKNOWLEDGED undo record (real store bytes, no MANIFEST/ACK)
+    { std::string src=freshDir("r3_20_src");
+      { CommitStore3A s0; ChainError e0; CHECK(s0.open(src,&e0), "R3-20 src open: "+e0.str());
+        CHECK(PUBH(s0,1,0,0,3,&e0), "R3-20 src publish gen1: "+e0.str()); s0.close(); }
+      std::string d=freshDir("r3_20");
+      CHECK(CPFILE(src+"/undo.dat",d+"/undo.dat"), "R3-20 plant a complete unacknowledged undo record");
+      long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat");
+      CommitStore3A r; bool ok=r.open(d,&e);
+      printf("  R3-20 reopen with a complete unacknowledged record (%ld B): ok=%d err=%s\n", us,(int)ok,shortErr(e).c_str());
+      CHECK(!ok, "R3-20 complete unacknowledged record refused (no silent genesis, no trusting stale state): "+shortErr(e));
+      CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "R3-20 unacknowledged record preserved");
+      if(ok) r.close(); }
+
+    // ---- R3-21: established-store semantics are UNCHANGED (C11): a pre-rename failure there is still retryable
+    { std::string d=freshDir("r3_21");
+      CommitStore3A s; ChainError e0; CHECK(s.open(d,&e0), "R3-21 open (absent log): "+e0.str());
+      CHECK(PUBH(s,1,0,0,3,&e0), "R3-21 first publish succeeds and spends the one-shot: "+e0.str());
+      Hash d1=DG(s,&e0); uint64_t g1=s.generation();
+      r3Inject(s,R3F_ManifestTmpWrite); ChainError e1; bool q1=PUBH(s,2,0,0,3,&e1); s.clearInjection();
+      printf("  R3-21 later publish fails pre-rename: publish=%d needsReopen=%d err=%s\n",(int)q1,(int)s.needsReopen(),shortErr(e1).c_str());
+      CHECK(!q1, "R3-21 later publish fails pre-rename: "+shortErr(e1));
+      CHECK(!s.needsReopen(), "R3-21 established store is NOT reopen-required by an ordinary pre-rename failure (unchanged)");
+      ChainError e2; bool q2=PUBH(s,2,0,0,3,&e2);
+      CHECK(q2, "R3-21 retry on the established store still succeeds: "+shortErr(e2));
+      CHECK(s.generation()==g1+1 && COH(d,&e2), "R3-21 gen"+std::to_string(g1+1)+" committed coherently");
+      Hash da=DG(s,&e2); s.close();
+      CommitStore3A r; CHECK(r.open(d,&e), "R3-21 restart: "+e.str());
+      CHECK(r.generation()==g1+1 && DG(r,&e)==da, "R3-21/R3-32 acknowledged generation preserved with the exact digest");
+      CHECK(DG(r,&e)!=d1, "R3-21 the retried generation really advanced the state");
+      r.close(); }
+
+    // ---- R3-22/R3-23/R3-36: crash after the backup replacement + CORRUPT primary -> resolve from the backup
+    { std::string d=freshDir("r3_22");
+      CommitStore3A s; CHECK(s.open(d,&e), "R3-22 seed store: "+e.str());
+      CHECK(PUBH(s,1,0,0,3,&e), "R3-22 seed gen1: "+e.str());
+      Hash dig1=DG(s,&e); s.close();
+      { pid_t pid=fork(); if(pid==0){ r1CrashChild(d,2); ::_exit(9); }   // mode 2 = crash at AfterBakReplace
+        int st=0; waitpid(pid,&st,0);
+        CHECK(WIFEXITED(st)&&WEXITSTATUS(st)==42, "R3-36 crash at AfterBakReplace took the crash path ("+r3wstatus(st)+")"); }
+      CHECK(fexists(d+"/MANIFEST.bak"), "R3-36 MANIFEST.bak was established BEFORE the undo write");
+      CHECK(MBU(d)<=MUU(d), "R3-35 retained backup never references beyond the committed length (bak="+std::to_string(MBU(d))+", primary="+std::to_string(MUU(d))+")");
+      CHECK(flipByte(d+"/MANIFEST",40), "R3-22 corrupt the primary MANIFEST");
+      CommitStore3A r; bool ok=r.open(d,&e);
+      printf("  R3-22 double-fault recovery: open=%d hadRecoveryIssue=%d gen=%llu err=%s\n",(int)ok,(int)r.hadRecoveryIssue(),
+             (unsigned long long)r.generation(),shortErr(e).c_str());
+      CHECK(ok, "R3-22/R3-36 recover the acknowledged generation from the intact backup: "+shortErr(e));
+      if(ok){
+        CHECK(r.hadRecoveryIssue(), "R3-22 the recovery is reported, not hidden");
+        CHECK(r.generation()==1, "R3-22 recovered generation 1 (the acknowledged one)");
+        CHECK(DG(r,&e)==dig1, "R3-22 recovered digest == acknowledged digest");
+        CHECK(fdig(d+"/MANIFEST")==fdig(d+"/MANIFEST.bak"), "R3-23 MANIFEST repaired from the backup bytes");
+        r.close();
+        CommitStore3A r2; bool ok2=r2.open(d,&e);
+        CHECK(ok2, "R3-23 second reopen: "+shortErr(e));
+        if(ok2){ CHECK(!r2.hadRecoveryIssue() && r2.generation()==1 && DG(r2,&e)==dig1,
+                       "R3-23 second reopen is clean at gen1 with the exact digest"); r2.close(); }
+      } }
+
+    // ---- R3-24: ACK lag -> the open reconciles upward to the primary generation
+    { std::string d=freshDir("r3_24");
+      CommitStore3A s; ChainError e0; CHECK(s.open(d,&e0), "R3-24 open: "+e0.str());
+      CHECK(PUBH(s,1,0,0,3,&e0), "R3-24 gen1: "+e0.str());
+      CHECK(PUBH(s,2,0,0,3,&e0), "R3-24 gen2: "+e0.str());
+      Hash dig2=DG(s,&e0); s.close();
+      CHECK(r3WriteAckGen(d,1), "R3-24 force the ACK back to generation 1 (lag)");
+      CommitStore3A r; bool ok=r.open(d,&e);
+      printf("  R3-24 ACK lag: open=%d gen=%llu ack=%llu err=%s\n",(int)ok,(unsigned long long)r.generation(),
+             (unsigned long long)r.acknowledgedGeneration(),shortErr(e).c_str());
+      CHECK(ok, "R3-24 lagging ACK does not block the open: "+shortErr(e));
+      if(ok){ CHECK(r.generation()==2, "R3-24 primary generation preserved");
+        CHECK(r.acknowledgedGeneration()==2, "R3-24 ACK reconciled upward to the primary generation");
+        CHECK(DG(r,&e)==dig2, "R3-24 digest exact after the reconciliation"); r.close(); } }
+
+    // ---- R3-25: ACK mismatch (ACK newer than the primary) -> refuse; never roll acknowledged state back
+    { std::string d=freshDir("r3_25");
+      CommitStore3A s; ChainError e0; CHECK(s.open(d,&e0), "R3-25 open: "+e0.str());
+      CHECK(PUBH(s,1,0,0,3,&e0), "R3-25 gen1: "+e0.str()); s.close();
+      CHECK(r3WriteAckGen(d,5), "R3-25 force an ACK ahead of the primary");
+      CommitStore3A r; bool ok=r.open(d,&e);
+      printf("  R3-25 ACK mismatch: open=%d err=%s\n",(int)ok,shortErr(e).c_str());
+      CHECK(!ok, "R3-25 acknowledged-newer-than-primary refused (no silent rollback): "+shortErr(e));
+      if(ok) r.close(); }
+
+    // ---- R3-26: repeated restart after a refused first publish is deterministic and non-destructive
+    { std::string d=freshDir("r3_26");
+      CHECK(touchEmpty(d+"/undo.dat"), "R3-26 plant an ACCEPTED empty residue");
+      { CommitStore3A s; ChainError e0; CHECK(s.open(d,&e0), "R3-26 open: "+e0.str());
+        r3Inject(s,R3F_ManifestTmpWrite); ChainError e1; CHECK(!PUBH(s,1,0,0,3,&e1), "R3-26 first publish fails: "+shortErr(e1)); s.clearInjection();
+        ChainError e2; CHECK(!PUBH(s,1,0,0,3,&e2), "R3-26 retry refused: "+shortErr(e2));
+        s.close(); }
+      long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat"); std::string snap=r3Snap(d);
+      std::string first; int refused=0;
+      for(int i=0;i<3;i++){ CommitStore3A r; ChainError e2; if(!r.open(d,&e2)){ refused++; if(first.empty()) first=shortErr(e2); } else r.close(); usleep(2000); }
+      printf("  R3-26 restarts: refused=%d/3 datadir_unchanged=%d first=%s\n",refused,(int)(r3Snap(d)==snap),first.c_str());
+      CHECK(refused==3, "R3-26 all three restarts refuse identically ("+std::to_string(refused)+"/3)");
+      CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "R3-26 the residue is byte-identical after the restarts");
+      CHECK(r3Snap(d)==snap, "R3-26 no restart mutated the datadir"); }
+
+    // ---- R3-31: multi-key atomicity preserved (one record carrying erase + 3 puts), digest == reference
+    { std::string d=freshDir("r3_31");
+      CommitStore3A s; ChainError e0; CHECK(s.open(d,&e0), "R3-31 open: "+e0.str());
+      UtxoState ref; bool ok=true;
+      for(int h=1;h<=30 && ok;h++){ Block b=mkBlockH(h,0,0,3); if(!publishStore(s,b,&e0)||!publishRef(ref,b,&e0)) ok=false; }
+      CHECK(ok, "R3-31 build 30 coinbase blocks (store + reference): "+shortErr(e0));
+      Hash cb2=id32(0xCB000000u,2);
+      Block b; b.hash=id32(0xB10C0000u,31); b.height=31;
+      Tx sp; sp.txid=id32(0x5BE7D000u,31); sp.coinbase=false; sp.coinstake=false; TxIn in; in.prev.txid=cb2; in.prev.n=0; sp.vin.push_back(in);
+      TxOut o1; o1.value=20*COIN; o1.script={1,1}; sp.vout.push_back(o1);
+      TxOut o2; o2.value=15*COIN; o2.script={2,2}; sp.vout.push_back(o2);
+      TxOut o3; o3.value=15*COIN; o3.script={3,3}; sp.vout.push_back(o3);
+      b.txs.push_back(sp);
+      Tx cb; cb.txid=id32(0xCB000000u,3001); cb.coinbase=true; cb.coinstake=false; TxOut oc; oc.value=50*COIN; oc.script.assign(3,7); cb.vout.push_back(oc); b.txs.push_back(cb);
+      bool pok=publishStore(s,b,&e0); CHECK(pok, "R3-31 multi-key publish (erase + 3 puts + 1 put): "+shortErr(e0));
+      bool rok=publishRef(ref,b,&e0); CHECK(rok, "R3-31 reference applies the same block: "+shortErr(e0));
+      int found=0;
+      for(int i=0;i<3;i++){ OutPoint k; k.txid=sp.txid; k.n=(uint32_t)i; Coin c; bool f=false; if(s.get(k,&c,&f,&e0)&&f) found++; }
+      { OutPoint k; k.txid=cb.txid; k.n=0; Coin c; bool f=false; if(!(s.get(k,&c,&f,&e0)&&f)) found=-1; }
+      { OutPoint k; k.txid=cb2; k.n=0; Coin c; bool f=true; bool got=s.get(k,&c,&f,&e0); if(!got||f) found=-2; }
+      UtxoState st; storeToState(s,&st,&e0);
+      printf("  R3-31 multi-key atomic result: ops_visible=%d digest_match=%d (undo=%ld B)\n",
+             found, (int)(st.digest()==ref.digest()), FSZ(d+"/undo.dat"));
+      CHECK(found==3, "R3-31 exactly the 3 new outputs + the new coinbase are visible and the spent key is gone (found="+std::to_string(found)+")");
+      CHECK(st.digest()==ref.digest(), "R3-31 store digest == reference-model digest (atomic application)");
+      CHECK(COH(d,&e0), "R3-31 coherence");
+      s.close(); }
+}
+
+// ---- Phase F: the post-lstat publication window (F0-2-R2-2)
+static void r3PauseChild(const std::string& dir,int where,int ms){
+    ChainError e; CommitStore3A s;
+    if(!s.open(dir,&e)) ::_exit(2);
+    s.setPause(where==0? CommitStore3A::PausePoint::BeforeUndoNameRecheck
+                       : CommitStore3A::PausePoint::BeforeAck, ms);
+    ChainError e1; bool ok=PUBH(s,1,0,0,3,&e1);
+    s.close();
+    ::_exit(ok?0:1);
+}
+static void test_r3_postlstat(){
+    g_cur="F0-R3-postlstat";
+    ChainError e;
+    for (int where=0; where<2; where++){
+        const bool inside = (where==0);
+        std::string d=freshDir(inside? "r3_37a":"r3_37b");
+        const char* id = inside? "R3-37a":"R3-37b";
+        pid_t pid=fork();
+        if(pid==0){ r3PauseChild(d,where,1500); ::_exit(8); }
+        long long t0=nowUs(); while(!fexists(d+"/MANIFEST") && nowUs()-t0<3000000) usleep(2000);
+        CHECK(fexists(d+"/MANIFEST"), std::string(id)+" child reached the publication window (MANIFEST visible)");
+        usleep(200000);                                    // the child is inside its 1500 ms pause
+        ::unlink((d+"/undo.dat").c_str());
+        CHECK(writeJunk(d+"/undo.dat","R3-POST-LSTAT-SUBSTITUTE-PAYLOAD-INSIDE-THE-WINDOW"), std::string(id)+" substitute undo.dat inside the window");
+        int st=0; waitpid(pid,&st,0);
+        int rc=WIFEXITED(st)?WEXITSTATUS(st):-1; bool ack=fexists(d+"/ACK");
+        CommitStore3A r; ChainError e2; bool ok=r.open(d,&e2);
+        printf("  %s (window=%s): child=%s ack_written=%d reopen=%d reopen_err=%s\n", id,
+               inside?"after the undo fsync, before the pre-ACK recheck":"after the pre-ACK recheck, before the ACK write",
+               rc==0?"publish=SUCCESS":(rc==1?"publish=FAILED":("exit "+std::to_string(rc)).c_str()),(int)ack,(int)ok,shortErr(e2).c_str());
+        if(inside){
+            CHECK(rc==1, std::string(id)+": the publish FAILS instead of reporting a silent success");
+            CHECK(!ack, std::string(id)+": NO ACK is written for a generation whose log is unreachable");
+            CHECK(!ok, std::string(id)+": reopen still refuses (fail-closed, no fabrication)");
+        } else {
+            CHECK(rc==0, std::string(id)+": the publish still reports SUCCESS in the residual window (not closed)");
+            CHECK(ack, std::string(id)+": the ACK is written -> the remaining window is [recheck -> ACK write]");
+            CHECK(!ok, std::string(id)+": reopen refuses -> acknowledged-but-unreachable generation = F0-2-R2-2 OPEN");
+        }
+        if(ok) r.close();
+    }
+    // R3-38: the LOCK excludes a second STORE INSTANCE, not a non-cooperating file mutation (threat model)
+    { std::string d=freshDir("r3_38");
+      CommitStore3A s; CHECK(s.open(d,&e), "R3-38 first instance opens and holds LOCK: "+e.str());
+      CommitStore3A t; ChainError e2; bool ok2=t.open(d,&e2);
+      CHECK(!ok2, "R3-38 a second store instance on the same datadir is refused (LOCK): "+shortErr(e2)); if(ok2) t.close();
+      CHECK(substFile(d+"/undo.dat",R3_SUB), "R3-38 an external write to undo.dat is NOT excluded by LOCK (documented threat model)");
+      s.close(); }
+    // R3-39: a crash inside the same window -> the generation was never acknowledged (SAFE REFUSAL, no false ACK)
+    { std::string d=freshDir("r3_39");
+      pid_t pid=fork(); if(pid==0){ r1CrashChild(d,6); ::_exit(9); }    // mode 6 = crash at AfterDirSync
+      int st=0; waitpid(pid,&st,0);
+      CHECK(WIFEXITED(st)&&WEXITSTATUS(st)==42, "R3-39 child crashed after the rename ("+r3wstatus(st)+")");
+      ::unlink((d+"/undo.dat").c_str());
+      CHECK(writeJunk(d+"/undo.dat","R3-CRASH-WINDOW-SUBSTITUTE-PAYLOAD-INSIDE"), "R3-39 substitute inside the crashed window");
+      CommitStore3A r; bool ok=r.open(d,&e);
+      printf("  R3-39 crash-window substitution: ack_written=%d reopen=%d err=%s\n",(int)fexists(d+"/ACK"),(int)ok,shortErr(e).c_str());
+      CHECK(!fexists(d+"/ACK"), "R3-39 the crashed publication never acknowledged a generation");
+      CHECK(!ok, "R3-39 reopen refuses the unreachable log (SAFE REFUSAL, never a false ACK): "+shortErr(e));
+      if(ok) r.close(); }
+}
+
 static long readVmHWM(){ FILE*f=fopen("/proc/self/status","r"); if(!f)return -1; char l[256]; long kb=-1; while(fgets(l,sizeof(l),f)){ if(strncmp(l,"VmHWM:",6)==0){ sscanf(l+6,"%ld",&kb); break; } } fclose(f); return kb; }
 
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){

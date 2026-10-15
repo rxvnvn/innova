@@ -9,6 +9,7 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <time.h>
 #include <cerrno>
 #include <cstring>
 #include <algorithm>
@@ -93,7 +94,7 @@ bool csAppendFile(const std::string& path, const uint8_t* d, size_t n, bool injN
 // - Refuses to write past a hole (file shorter than off) instead of zero-extending into a
 //   descriptor whose record layout would no longer match the manifest.
 bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e,
-                   UndoCreate create, int pinnedFd) {
+                   UndoCreate create, int pinnedFd, int* holdFd) {
     if (injNs) { setErr(e, ErrCode::NO_SPACE, "injected ENOSPC writing " + path); return false; }
     // R1 (F0-2): the create policy is enforced by the OPEN, not by a preceding lstat, so a file that
     // appears (or disappears) between the open-time classification and this write cannot slip through.
@@ -199,7 +200,10 @@ bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size
             return false;
         }
     }
-    if (owned && ::close(fd)!=0){ setErr(e,ErrCode::FS,"close "+path); return false; }
+    // R3 (F0-2-R2-2): hand the (still open) descriptor to the caller on request, so it can hold the object
+    // across the rename/fsync/ACK window and recheck the pathname binding before acknowledging.
+    if (holdFd) *holdFd = fd;
+    if (owned && !holdFd && ::close(fd)!=0){ setErr(e,ErrCode::FS,"close "+path); return false; }
     return true;
 }
 bool csReadFile(const std::string& path, std::vector<uint8_t>* out, bool* exists, ChainError* e) {
@@ -292,8 +296,22 @@ void CommitStore3A::close(){ tree_.close(); if(lockFd_>=0){ ::flock(lockFd_,LOCK
     // R2 (F0-2-R1): the fresh-open undo policy and the descriptor pinning the adopted empty residue die
     // with the open that produced them.
     if (freshUndoFd_ >= 0) { ::close(freshUndoFd_); freshUndoFd_ = -1; }
-    freshUndoCreate_=UndoCreate::Any; }
+    if (heldLogFd_ >= 0) { ::close(heldLogFd_); heldLogFd_ = -1; }
+    freshUndoCreate_=UndoCreate::Any;
+    // R3 (F0-2-R2-1): the one-shot bookkeeping dies with the open that produced it; a reopen reclassifies the
+    // actual filesystem evidence and starts from a clean state.
+    freshOneShotTaken_=false; reopenWhy_.clear(); pausePoint_=PausePoint::None; pauseMs_=0; }
 void CommitStore3A::crashIf(CrashPoint at){ if(crashPoint_==at){ ::fflush(NULL); ::_exit(42); } }
+// R3 (F0-2-R2-1): the single fail-closed transition of this stage: the instance is closed for mutation and
+// records why, so every later publish/disconnect is refused with a truthful diagnostic instead of silently
+// degrading (e.g. to an unpinned write). Reopening is the only way out, and it reclassifies disk evidence.
+void CommitStore3A::requireReopen(const std::string& why){ needsReopen_=true; reopenWhy_=why; }
+// R3 test hook (see incstore.h setPause). Inert unless a test armed it.
+void CommitStore3A::pauseAt(PausePoint p) const {
+    if (pausePoint_!=p || pauseMs_<=0) return;
+    struct timespec ts; ts.tv_sec=(time_t)(pauseMs_/1000); ts.tv_nsec=(long)(pauseMs_%1000)*1000000L;
+    ::nanosleep(&ts,NULL);
+}
 void CommitStore3A::cleanupTmp(){ DIR* d=opendir(dir_.c_str()); if(!d) return; struct dirent* ent; while((ent=readdir(d))!=NULL){ std::string nm=ent->d_name; if(endsWith(nm,".tmp")) ::unlink(p(nm).c_str()); } closedir(d); }
 
 bool CommitStore3A::get(const OutPoint& k, Coin* c, bool* found, ChainError* e) const {
@@ -439,11 +457,11 @@ bool CommitStore3A::open(const std::string& dir, ChainError* e){
             if(!csFsyncDir(dir_,&e3)){ close(); setErr(e,ErrCode::FS,"failed to fsync repair of MANIFEST"); return false; }
         }
     }
-    cleanupTmp(); needsReopen_=false; opened_=true; return true;
+    cleanupTmp(); needsReopen_=false; reopenWhy_.clear(); freshOneShotTaken_=false; heldLogFd_=-1; opened_=true; return true;
 }
 
 bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e){
-    renamePassed_=false;
+    renamePassed_=false; freshOneShotTaken_=false;
     // 1) durable tree pages
     if(inj(InjectStage::PageWrite)){ injErr(e,"tree fsync"); return false; }
     if(!tree_.fsync(e)) return false;
@@ -485,6 +503,7 @@ bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const
     }
     crashIf(CrashPoint::AfterBakReplace);
     // 3) undo write, at the COMMITTED logical offset (F0: never O_APPEND, never truncate)
+    heldLogFd_ = -1;
     if(undoAppendLen>0){
         // R1 (F0-2): the first undo write after a fresh open obeys the create policy fixed by the
         // open-time classification (absent -> O_EXCL create; accepted empty residue -> never create).
@@ -493,16 +512,19 @@ bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const
         // The pinned descriptor's ownership moves to this write and is closed here on every path.
         UndoCreate cre=freshUndoCreate_; freshUndoCreate_=UndoCreate::Any;
         int pfd=freshUndoFd_; freshUndoFd_=-1;
-        bool wok;
+        // R3 (F0-2-R2-1): this write SPENDS the fresh-open one-shot. Record it, so a failure below makes the
+        // caller require a reopen instead of silently retrying with UndoCreate::Any (unpinned, pathname-based).
+        if (cre != UndoCreate::Any) freshOneShotTaken_=true;
+        bool wok; int outFd=-1;
         if(injectUndoShortOnce_>0 && injectUndoShortOnce_<undoAppendLen){   // F0 test hook: torn write
             size_t part=injectUndoShortOnce_; injectUndoShortOnce_=0;
-            wok=csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,part,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre,pfd);
-            if(pfd>=0) ::close(pfd);
+            wok=csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,part,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre,pfd,&outFd);
+            if(pfd>=0) heldLogFd_=pfd; else if(wok) heldLogFd_=outFd;
             if(!wok) return false;
             setErr(e,ErrCode::IO,"injected short undo write"); return false;
         }
-        wok=csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,undoAppendLen,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre,pfd);
-        if(pfd>=0) ::close(pfd);
+        wok=csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,undoAppendLen,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e,cre,pfd,&outFd);
+        if(pfd>=0) heldLogFd_=pfd; else if(wok) heldLogFd_=outFd;
         if(!wok) return false;
     }
     crashIf(CrashPoint::AfterUndoWrite);
@@ -519,13 +541,37 @@ bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const
     if(inj(InjectStage::DirFsync)){ injErr(e,"dir fsync"); return false; }
     if(!csFsyncDir(dir_,e)) return false;
     crashIf(CrashPoint::AfterDirSync);
+    // R3 (F0-2-R2-2): the generation must not be acknowledged while the committed pathname no longer denotes
+    // the log whose bytes this commit just made durable. Every other check is already behind us (the
+    // write-time binding, the manifest rename); this is the LAST point at which refusing can still prevent
+    // `MANIFEST(gen N) + ACK(gen N)` from being written over a log that no reader could reach by name.
+    // Soundness argument for the comparison: heldLogFd_ is still OPEN, so the log inode cannot have been
+    // freed and its NUMBER cannot have been reused (this filesystem does reuse inode numbers after
+    // unlink+create -- measured in R2); a dev/ino difference here is therefore real substitution, not
+    // aliasing. One fstat + one lstat, no new state, no O(state) work. It NARROWS the window (from the
+    // write-time binding down to just before the ACK write) and removes the silent-success case, but it
+    // cannot close an interval that ends with the name-based ACK write itself: a swap after this check stays
+    // undetectable. See DESIGN.md 13.3 -- F0-2-R2-2 remains OPEN with an external-actor threat model.
+    if (heldLogFd_ >= 0) {
+        pauseAt(PausePoint::BeforeUndoNameRecheck);
+        struct stat hst; struct stat lst;
+        if (::fstat(heldLogFd_,&hst)!=0 || !S_ISREG(hst.st_mode) || hst.st_nlink<1 ||
+            ::lstat(p("undo.dat").c_str(),&lst)!=0 || !S_ISREG(lst.st_mode) ||
+            lst.st_dev!=hst.st_dev || lst.st_ino!=hst.st_ino) {
+            setErr(e, ErrCode::CORRUPT, "undo.dat pathname no longer denotes the log this generation made "
+                   "durable (identity mismatch); refusing to acknowledge generation "+
+                   std::to_string((unsigned long long)m.generation)+" and requiring a reopen before any "
+                   "further mutation");
+            return false;
+        }
+    }
     return true;
 }
 
 bool CommitStore3A::publish(const Delta& d, const Hash& blockHash, int32_t height, ChainError* e){
     clearErr(e);
     if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
-    if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen after a post-rename failure"); return false; }
+    if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen before any further mutation: "+reopenWhy_); return false; }
     uint32_t oldRoot=tree_.rootId(); Hash oldHash=tree_.rootHash(); ChainError er;
     // apply delta (CoW; new pages only)
     for (const Op& op: d.ops){
@@ -537,8 +583,21 @@ bool CommitStore3A::publish(const Delta& d, const Hash& blockHash, int32_t heigh
     std::vector<uint8_t> recBytes=rec.encode();
     uint64_t newGen=generation_+1; uint64_t newUndoSize=undoCommittedBytes_+recBytes.size();
     Manifest m; m.generation=newGen; m.undoSize=newUndoSize; m.rootPageId=tree_.rootId(); m.rootHash=tree_.rootHash(); m.blockHash=blockHash; m.tipHeight=height;
-    if(!commitBarriers(m,undoCommittedBytes_,recBytes.data(),recBytes.size(),e)){ if(renamePassed_) needsReopen_=true; else tree_.setRoot(oldRoot,oldHash,&er); return false; }
-    if(!writeAck(newGen,e)){ needsReopen_=true; return false; }
+    if(!commitBarriers(m,undoCommittedBytes_,recBytes.data(),recBytes.size(),e)){
+        if(!renamePassed_) tree_.setRoot(oldRoot,oldHash,&er);      // no new generation became authoritative
+        if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }   // R3: release the held log descriptor
+        // R3 (F0-2-R2-1): a post-rename failure was already fatal (the new MANIFEST may be visible); a
+        // failure AFTER the undo write phase is now fatal too, because the fresh-open one-shot is spent and
+        // a retry on this instance would write the log WITHOUT the pin/identity checks.
+        if(renamePassed_) requireReopen("the new MANIFEST may be visible while its durability barrier failed");
+        else if(freshOneShotTaken_) requireReopen("the fresh-open undo policy was spent by a failed first publication (a retry would write unpinned)");
+        return false;
+    }
+    pauseAt(PausePoint::BeforeAck);
+    bool ackOk=writeAck(newGen,e);
+    // R3 (F0-2-R2-2): the log descriptor is held until the acknowledgment has actually been attempted.
+    if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }
+    if(!ackOk){ requireReopen("the generation was published but its acknowledgment failed"); return false; }
     UndoMeta meta; meta.blockHash=blockHash; meta.height=height; meta.offset=undoCommittedBytes_; meta.len=(uint32_t)recBytes.size();
     generation_=newGen; undoCommittedBytes_=newUndoSize; undoIndex_.push_back(meta);
     ackGen_=newGen; ackPresent_=true; blockHash_=blockHash; tipHeight_=height;
@@ -548,7 +607,7 @@ bool CommitStore3A::publish(const Delta& d, const Hash& blockHash, int32_t heigh
 bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
     clearErr(e);
     if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
-    if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen after a post-rename failure"); return false; }
+    if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen before any further mutation: "+reopenWhy_); return false; }
     if(undoIndex_.empty()){ setErr(e,ErrCode::NOT_FOUND,"no committed undo to disconnect"); return false; }
     const UndoMeta meta=undoIndex_.back();
     if(meta.blockHash!=blockHash){ setErr(e,ErrCode::NOT_FOUND,"only the most recent block can be disconnected"); return false; }
@@ -560,8 +619,17 @@ bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
         else { if(!tree_.erase(k,e)){ ChainError x; tree_.setRoot(oldRoot,oldHash,&x); return false; } } }
     uint64_t newGen=generation_+1; uint64_t newUndoSize=undoCommittedBytes_-meta.len;
     Manifest m; m.generation=newGen; m.undoSize=newUndoSize; m.rootPageId=tree_.rootId(); m.rootHash=tree_.rootHash(); m.blockHash=Hash(); m.tipHeight=tipHeight_-1;
-    if(!commitBarriers(m,0,NULL,0,e)){ if(renamePassed_) needsReopen_=true; else tree_.setRoot(oldRoot,oldHash,&er); return false; }
-    if(!writeAck(newGen,e)){ needsReopen_=true; return false; }
+    if(!commitBarriers(m,0,NULL,0,e)){
+        if(!renamePassed_) tree_.setRoot(oldRoot,oldHash,&er);      // no new generation became authoritative
+        if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }   // R3: release the held log descriptor
+        if(renamePassed_) requireReopen("the new MANIFEST may be visible while its durability barrier failed");
+        else if(freshOneShotTaken_) requireReopen("the fresh-open undo policy was spent by a failed first publication (a retry would write unpinned)");
+        return false;
+    }
+    pauseAt(PausePoint::BeforeAck);
+    bool ackOk=writeAck(newGen,e);
+    if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }
+    if(!ackOk){ requireReopen("the generation was published but its acknowledgment failed"); return false; }
     generation_=newGen; undoCommittedBytes_=newUndoSize; undoIndex_.pop_back();
     ackGen_=newGen; ackPresent_=true; blockHash_=Hash(); tipHeight_=m.tipHeight;
     return true;

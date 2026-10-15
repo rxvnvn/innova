@@ -394,3 +394,121 @@ Deliberately **not** done (unchanged scope): no on-disk format change, no MANIFE
 change to the backup-before-undo ordering, no new storage authority or file type, no retention/compaction/
 GC, no generation pinning, no checkpoint seeds, no consensus/DAG change, no `tree.dat` classification
 change (still recorded as a residual LOW), and no identity pin on the established-store (`Any`) path.
+
+## 13. Stage 3B-F0-R3 — first-publication failure lifecycle (one-shot policy) and the post-`lstat` window
+
+### 13.1 The publication path, its failure classes, and their durability consequences
+
+```
+ FRESH_OPEN  (classification: absent | accepted empty residue | refuse)
+     |        the fresh-open undo policy is ARMED here (RequireAbsent or RequireExisting + pinned fd)
+     v
+ FIRST_PUBLISH_STARTED        guard: opened_ && !needsReopen_   (every public mutation entry point)
+     |
+     | (A) tree pages staged; tree.fsync                        failure: nothing authoritative changed,
+     |                                                            one-shot INTACT -> retry stays safe
+     | (A2) backup barrier (MANIFEST.bak := current primary, atomic + dir fsync)
+     v
+ UNDO_WRITE  <-- THE ONE-SHOT IS SPENT HERE (policy != Any)
+     |        (B) failure here, or anything below: the policy/pin is gone
+     |
+     | (C) MANIFEST.tmp write / fsync
+     | (D) MANIFEST rename -> renamePassed_ = true
+     | (E) directory fsync
+     v
+ UNDO_NAME_RECHECK   pathname->inode binding, log fd still held  (R3; F0-2-R2-2)
+     |                                                          failure: not acknowledged, reopen required
+     v
+ ACK -> ESTABLISHED   (a successful first publication ends the one-shot; later failures behave as before)
+```
+
+| class | example | on-disk consequence of the failure | retry on the same instance |
+|---|---|---|---|
+| A | `tree.fsync` fails | staged unreferenced pages only | **allowed** (one-shot intact, pin still held) |
+| A2 | backup replacement fails | backup either old or new, never partial | allowed |
+| B | torn/partial undo write, undo fsync fails | partial or unfsynced log bytes | **refused** (one-shot spent) |
+| C | `MANIFEST.tmp` write/fsync fails | log durable, no new MANIFEST | **refused** (one-shot spent) |
+| D | rename fails | ditto | refused (pre-R3 rule: `renamePassed_`) |
+| E | dir fsync fails | MANIFEST visible, not durable | refused (pre-R3 rule) |
+| F | name binding broken | MANIFEST durable, log unreachable by name | refused (post-rename rule) |
+| G | ACK write fails | generation published, not acknowledged | refused (pre-R3 rule) |
+
+### 13.2 R3 fix — the fresh-open policy is one-shot, and failing it closes the instance (F0-2-R2-1)
+
+R2 pinned the accepted empty residue but left the *consumption* of that policy invisible: a first
+publication that failed with `renamePassed_ == false` stayed retryable, and the retry then reverted to
+`UndoCreate::Any` — reopening `undo.dat` by pathname with no `O_NOFOLLOW`, no `O_EXCL` and no identity
+check, i.e. exactly the substitution TOCTOU the pin had just closed (audited E-A: a 41-byte substitute
+grew to 114 bytes; the same shape as E24/E25a, and measured again pre-fix in R3-01/R3-04).
+
+Rule: **when a publication enters the undo write phase it spends the one-shot; if that publication does
+not complete, the instance becomes `REOPEN_REQUIRED`** (`freshOneShotTaken_` -> `requireReopen(reason)`),
+and every later `publish()`/`disconnect()` is refused with that reason *before* touching any persistent
+state. Exit is only through `close()`/`open()`, and `open()` reclassifies the actual filesystem evidence
+(it never trusts the closed instance's in-memory descriptor state): an unacknowledged or partial residue is
+refused outright.
+
+Why this activation point and not "any publish failure": a failure that happens *before* the undo write
+leaves the policy and the pin intact, and a retry then re-enters the write with the same pin — safe, and
+required for progress (R3-06a commits on retry; R3-06b proves the surviving pin still refuses a substitute
+planted before that retry). "Any failure" would have been simpler, but it would also have made an ordinary
+pre-undo I/O error fatal, and it would have hidden whether the pin really survives that class. The rule is
+therefore keyed on the one-shot, which is exactly the resource whose loss makes a retry unsafe.
+
+Established-store semantics are deliberately **unchanged** (C11): once a first publication succeeds, later
+publish failures keep their pre-R3 behaviour (`Any` path, pre-rename failures retryable) — R3-21 pins that
+down by retrying and committing gen2 after an injected pre-rename failure. No format, protocol, ordering or
+`O(delta)` change; the new state costs one bool and one string.
+
+### 13.3 F0-2-R2-2 — the post-`lstat` publication window: narrowed, NOT closed (OPEN)
+
+Window (source): the last write-time binding check is inside `csWriteAtFile` (after the log `fsync`, before
+the descriptor is released); between it and the ACK write sit the `MANIFEST.tmp` write, the rename and the
+directory fsync, and the ACK is written in `publish()`/`disconnect()` after `commitBarriers` returns. A
+substitution inside that interval leaves `MANIFEST(gen N)` and `ACK(gen N)` durable while the committed
+name no longer denotes the log: the publish *reports success*, and the next `open()` refuses the generation
+(`loadUndoFor` fails inside `tryLoadManifest` -> "primary corrupt and no valid backup"). Measured
+pre-fix in this harness (R3-37a/R3-37b, 2 variants) and independently by the R2 auditor at 3 pause points x
+6 substitution variants.
+
+Threat model (explicit): the actor must write into the datadir while the store is publishing. The `LOCK`
+file excludes a second *store instance* (R3-38 measures that a second instance is refused) but it is not a
+file-integrity barrier: a non-cooperating process can replace `undo.dat` at any time (R3-38 measures that
+the substitution succeeds while the store holds `LOCK`). The model assumed by this design is an
+**exclusive datadir** owned by one store instance, with no non-cooperating writer -- the same assumption the
+Stage-2B/3A protocol already makes for `MANIFEST`, `ACK` and `tree.dat`.
+
+R3 adds one barrier: immediately before the ACK (after the rename and the dir fsync) the log descriptor is
+still held open, so `fstat(fd)` (regular, `st_nlink>=1`) can be compared against `lstat(undo.dat)`
+(regular, same `dev`/`ino`). Holding the descriptor is what makes the comparison meaningful on this
+platform, which reuses inode numbers after `unlink`+`create`: while a descriptor refers to the inode, the
+inode cannot be freed, so a `dev`/`ino` difference is real evidence of substitution rather than aliasing.
+Effect: the interval that can produce a *silently acknowledged* unreachable generation shrinks from the
+write-time check down to the single ACK write, and the false-success case is removed (measured: post-fix
+R3-37a -> publish FAILS, no ACK written; pre-fix the same sequence reports SUCCESS with `ACK(gen1)`).
+
+What this does **not** do, and why the finding stays OPEN: a substitution after that check (R3-37b: the
+pause is moved after the comparison) still yields a reported success, an ACK, and an unrecoverable
+generation. No name-based check can close an interval that ends with the name-based ACK write itself, so a
+second `lstat` is explicitly not claimed to eliminate the race. Closing it would require an
+at-open/descriptor-pinned publication path or directory-level locking, which is out of scope for R3
+(no new publication architecture, no directory locking, no cross-platform filesystem redesign). Operational
+assumption retained: exclusive datadir; if that is violated, the failure mode is fail-closed (refusal),
+never silent corruption of unrelated bytes; the acknowledged generation may become unrecoverable and
+requires operator intervention.
+
+### 13.4 R3 test surface (focused, deterministic)
+
+`F0-R3-retry` (R3-01..R3-18, R3-33, R3-34), `F0-R3-reopen` (R3-19..R3-32, R3-35, R3-36),
+`F0-R3-postlstat` (R3-37a/R3-37b, R3-38, R3-39); each asserts sizes+hashes of every artifact before/after
+(`r3Snap`) so "refused" always means "no byte was written". Failure classes are injected one point at a
+time (`r3Inject`), the post-`lstat` window is exercised with a bounded pause hook (`setPause`, test-only,
+default inert) so the substitution is deterministic rather than probabilistic, and the FIFO case is bounded
+by `fork` + `alarm`. `STORE3A_BASE` (test-only env var, default unchanged) isolates the runtime dir per
+stage. The control build for the pre-fix evidence is the R2 (`aec10e0c`) `incstore.{h,cpp}` compiled with
+the same tests plus the pause hook, so pre/post differ only by the fix.
+
+Deliberately **not** done in R3 (unchanged scope): no retention/compaction/GC or D1 work, no generation
+pinning, no checkpoint seeds, no `tree.dat` classification change, no format/protocol change, no
+directory-level locking, no change to the established-store (`Any`) write path, no new production
+mutation entry point.
