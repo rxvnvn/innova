@@ -436,6 +436,18 @@ void UnregisterWallet(CWallet* pwalletIn);
 void SyncWithWallets(const CTransaction& tx, const CBlock* pblock = NULL, bool fUpdate = false, bool fConnect = true);
 bool ProcessBlock(CNode* pfrom, CBlock* pblock);
 bool CheckDiskSpace(uint64_t nAdditionalBytes=0);
+// ---------------------------------------------------------------------------
+// ARCHIVE-1 invariant (Stage 3B-D1-S0) — the block archive is permanent.
+//
+// blk%04u.dat under GetDataDir() hold every historical block payload from genesis
+// onward. They are ARCHIVE data, not index data: the block/transaction index is
+// rebuildable from them, they are not rebuildable from the index. Nothing in the
+// startup, version-mismatch, index-reset, migration or recovery path may unlink,
+// truncate, overwrite or rename-away a blk*.dat file; only AppendBlockFile()
+// (append + rollover) and OpenBlockFile() (read) may touch them. The one place
+// that used to delete them was the index reset in txdb-leveldb.cpp — see the
+// ARCHIVE-1 note there and src/test/d1_s0_archive_guard_tests.cpp.
+// ---------------------------------------------------------------------------
 FILE* OpenBlockFile(unsigned int nFile, unsigned int nBlockPos, const char* pszMode="rb");
 FILE* AppendBlockFile(unsigned int& nFileRet);
 // Close (flush + fclose) the cached block-file append handle (C4). No-op when none open.

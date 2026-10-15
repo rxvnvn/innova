@@ -87,26 +87,62 @@ static leveldb::Options GetOptions() {
     return options;
 }
 
-void init_blockindex(leveldb::Options& options, bool fRemoveOld = false) {
+// ---------------------------------------------------------------------------
+// ARCHIVE-1 invariant (Stage 3B-D1-S0) — the block archive is permanent.
+//
+// blk%04u.dat hold every historical block payload from genesis onward. They are
+// ARCHIVE data, not index data: the transaction/block INDEX in `txleveldb` is
+// reconstructable (a fresh index can be rebuilt from the archive), while a
+// deleted block payload is not reconstructable locally. Therefore:
+//   * no initialization, version-mismatch, index-reset, migration or recovery
+//     path may unlink, truncate, overwrite or rename-away a blk*.dat file;
+//   * an index reset removes INDEX STATE ONLY;
+//   * losing an archive file during a reset is a fail-closed condition, never a
+//     silently ignored side effect.
+//
+// History: this reset path used to delete every blk*.dat (a prefix scan from
+// blk0001.dat up to the first gap) whenever a DATABASE_VERSION mismatch armed
+// the reset, turning an index upgrade into a full re-download. S0 removed that
+// deletion and added the post-reset verification below. See the S0 report
+// (innova-v2-chainstate-stage3b-d1-s0-20261016.md) and
+// src/test/d1_s0_archive_guard_tests.cpp.
+// ---------------------------------------------------------------------------
+
+// Names of the block-archive files present in the data directory (read-only).
+// Bounded by the NUMBER of block files, never by their size. Used by the reset
+// path to prove that resetting the index removed no archive data.
+static std::vector<std::string> ListBlockArchiveFiles()
+{
+    std::vector<std::string> names;
+    fs::path dir = GetDataDir();
+    if (!fs::is_directory(dir))
+        return names;
+    for (fs::directory_iterator it(dir); it != fs::directory_iterator(); ++it)
+    {
+        const std::string name = it->path().filename().string();
+        // blk%04u.dat — 11 characters, "blk" + 4 digits + ".dat"
+        if (name.size() == 11 &&
+            name.compare(0, 3, "blk") == 0 &&
+            name.compare(7, 4, ".dat") == 0 &&
+            name[3] >= '0' && name[3] <= '9' && name[4] >= '0' && name[4] <= '9' &&
+            name[5] >= '0' && name[5] <= '9' && name[6] >= '0' && name[6] <= '9')
+            names.push_back(name);
+    }
+    return names;
+}
+
+void init_blockindex(leveldb::Options& options, bool fResetIndex = false) {
     // First time init.
     fs::path directory = GetDataDir() / "txleveldb";
 
-    if (fRemoveOld) {
+    // ARCHIVE-1 (S0-A): an index reset resets the INDEX ONLY. The block archive is
+    // deliberately NOT touched here — it used to be deleted by this function.
+    std::vector<std::string> archiveBefore;
+    if (fResetIndex) {
+        archiveBefore = ListBlockArchiveFiles();
+        printf("Index reset: index state only, %u block-archive file(s) under %s are preserved\n",
+               (unsigned int)archiveBefore.size(), GetDataDir().string().c_str());
         fs::remove_all(directory);
-        unsigned int nFile = 1;
-
-        while (true)
-        {
-            fs::path strBlockFile = GetDataDir() / strprintf("blk%04u.dat", nFile);
-
-            // Break if no such file
-            if( !fs::exists( strBlockFile ) )
-                break;
-
-            fs::remove(strBlockFile);
-
-            nFile++;
-        }
     }
 
     fs::create_directory(directory);
@@ -114,6 +150,24 @@ void init_blockindex(leveldb::Options& options, bool fRemoveOld = false) {
     leveldb::Status status = leveldb::DB::Open(options, directory.string(), &txdb);
     if (!status.ok()) {
         throw runtime_error(strprintf("init_blockindex(): error opening database environment %s", status.ToString().c_str()));
+    }
+
+    // ARCHIVE-1 guard (S0-B): verify that the reset destroyed nothing. Read-only, runs only on the
+    // reset path, and fails CLOSED: a missing archive entry is a loud startup error with a clear
+    // diagnostic, never a silently ignored side effect.
+    if (fResetIndex) {
+        boost::system::error_code ec;
+        for (size_t i = 0; i < archiveBefore.size(); ++i) {
+            fs::path f = GetDataDir() / archiveBefore[i];
+            if (!fs::exists(f, ec))
+                throw runtime_error(strprintf(
+                    "ARCHIVE-1 VIOLATION: block-archive file %s disappeared while the index in %s was "
+                    "reset. Block data is permanent and must never be removed by index/version logic; "
+                    "refusing to continue. Restore the file before restarting.",
+                    archiveBefore[i].c_str(), directory.string().c_str()));
+        }
+        printf("Index reset verified non-destructive: %u block-archive file(s) intact\n",
+               (unsigned int)archiveBefore.size());
     }
 }
 
@@ -186,7 +240,7 @@ CTxDB::CTxDB(const char* pszMode)
             delete activeBatch;
             activeBatch = NULL;
 
-            init_blockindex(options, true); // Remove directory and create new database
+            init_blockindex(options, true); // Reset index state ONLY (ARCHIVE-1: block files preserved)
             pdb = txdb;
 
             bool fTmp = fReadOnly;

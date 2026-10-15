@@ -317,6 +317,13 @@ bool DurabilityFailpointConsumeForTesting(const std::string& name);
 
 boost::filesystem::path GetDefaultDataDir();
 const boost::filesystem::path &GetDataDir(bool fNetSpecific = true);
+
+// D1-S0 test-only seam: redirect the cached GetDataDir() value to an isolated scratch directory so a
+// test case can exercise datadir-consuming code paths (index reset, block-file naming) without touching
+// the shared test datadir. Production code never calls these; ClearDataDirForTest() restores the cached
+// value exactly, because Boost suites share one process.
+void SetDataDirForTest(const boost::filesystem::path& dir);
+void ClearDataDirForTest();
 boost::filesystem::path GetConfigFile();
 boost::filesystem::path GetPidFile();
 #ifndef WIN32
