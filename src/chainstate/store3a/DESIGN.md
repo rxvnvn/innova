@@ -232,3 +232,31 @@ via `O_CREAT|O_TRUNC` at a path proven absent; no MANIFEST/ACK is written before
 successful publish. A crash between the `stat` and `create` can therefore only leave a fresh
 empty store, never destroy prior data (the path was proven absent moments earlier, and any
 concurrent writer is excluded by the `LOCK` flock held across the check).
+
+## 10. Stage 3B-F0 — undo offset coherence (physical layout vs committed length)
+
+Defect (pre-F0): undo records were appended with `O_APPEND` (physical EOF) while the store's
+offsets (`UndoMeta.offset`, `Manifest.undoSize`) were logical: `disconnect` shrinks
+`undoCommittedBytes_` without touching the file. After `disconnect` + `publish`, the new record
+landed *past* the stale record, so the durable `undoSize` described a region whose last record was
+the stale one. On restart the rebuilt index pointed at the discarded block: the tip could no
+longer be disconnected, and a later disconnect could revert a different block's ops.
+
+Fix: the undo record is written at the **committed logical offset** (`csWriteAtFile`), never with
+`O_APPEND`, and never by truncating:
+
+- bytes `[0, off)` are left byte-identical ⇒ no manifest (current primary **or** the
+  `MANIFEST.bak` fallback) can lose a record region it references;
+- only bytes at or beyond the committed logical end are ever rewritten — exactly the records
+  logically discarded by an earlier `disconnect`, which no retained manifest references;
+- the write is refused if the file is shorter than `off` (no zero-extended hole), and a torn/short
+  write leaves only inert bytes beyond the committed end.
+
+Resulting invariants (tested by `F0-undo`): `physical >= logical` always; `[0, undoSize)` is exactly
+the committed record sequence; bytes beyond `undoSize` are inert garbage that is never read and may
+be overwritten by the next record; a restart reconstructs the same index the live process had.
+
+Deliberately **not** done (belongs to the D1 retention step): reclaiming the inert stale tail by
+truncation. Truncation/compaction of `undo.dat` needs the retention water marks, the seed floor and
+the whole-image maintenance protocol of DESIGN §9/§10 of the D1 report; the F0 fix is
+non-destructive and leaves those bytes in place.

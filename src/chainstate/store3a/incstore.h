@@ -70,6 +70,8 @@ public:
     void injectPartialAppendOnce(size_t bytes) { tree_.injectPartialAppendOnce(bytes); }
     // R2 test hook: fail the n-th page append (earlier appends succeed and stage pages).
     void injectPartialAppendOn(size_t n) { tree_.injectPartialAppendOn(n); }
+    // F0 test hook: write only the first `bytes` bytes of the next undo record, then fail (torn write).
+    void injectUndoShortOnce(size_t bytes) { injectUndoShortOnce_ = bytes; }
 
 private:
     bool ns(InjectStage s) const { return injectStage_ == s && injectNoSpace_; }
@@ -83,7 +85,7 @@ private:
 
     bool tryLoadManifest(const std::string& path, bool* exists, uint32_t* rootId, Hash* rootHash, ChainError* e);
     bool loadUndoFor(const Manifest& m, ChainError* e);
-    bool commitBarriers(const Manifest& m, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e);
+    bool commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e);
     bool writeAck(uint64_t gen, ChainError* e);
     bool readAck(bool* present, uint64_t* gen, ChainError* e);
     void crashIf(CrashPoint at);
@@ -109,10 +111,14 @@ private:
     InjectStage injectStage_ = InjectStage::None;
     bool injectNoSpace_ = false;
     bool injectFsyncFail_ = false;
+    size_t injectUndoShortOnce_ = 0;
 };
 
 bool csWriteFile(const std::string& path, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e);
 bool csAppendFile(const std::string& path, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e);
+// F0: write at an explicit offset. Never truncates; never moves the offset implicitly (no O_APPEND);
+// refuses to write past a hole (file shorter than off). Bytes < off are left byte-identical.
+bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e);
 bool csReadFile(const std::string& path, std::vector<uint8_t>* out, bool* exists, ChainError* e);
 bool csReadRange(const std::string& path, uint64_t off, uint64_t len, std::vector<uint8_t>* out, ChainError* e);
 bool csFsyncDir(const std::string& dir, ChainError* e);

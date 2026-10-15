@@ -51,6 +51,33 @@ bool csAppendFile(const std::string& path, const uint8_t* d, size_t n, bool injN
     if (::fsync(fd)!=0){ ::close(fd); setErr(e,ErrCode::FS,"fsync append "+path); return false; }
     ::close(fd); return true;
 }
+// F0 (undo offset coherence): write the undo record at the COMMITTED logical offset.
+// - Never truncates and never moves the write offset implicitly (no O_APPEND): the durable bytes
+//   [0, off) are left byte-identical, so no manifest (current primary or MANIFEST.bak fallback) can
+//   lose record bytes it references.
+// - Only bytes at or beyond the committed logical end are ever (re)written: those are exactly the
+//   records logically discarded by an earlier disconnect, which no retained manifest references.
+// - Refuses to write past a hole (file shorter than off) instead of zero-extending into a
+//   descriptor whose record layout would no longer match the manifest.
+bool csWriteAtFile(const std::string& path, uint64_t off, const uint8_t* d, size_t n, bool injNs, bool injFs, ChainError* e) {
+    if (injNs) { setErr(e, ErrCode::NO_SPACE, "injected ENOSPC writing " + path); return false; }
+    int fd = ::open(path.c_str(), O_WRONLY|O_CREAT, 0644);
+    if (fd < 0) { setErr(e, ErrCode::IO, "open " + path); return false; }
+    off_t end = ::lseek(fd, 0, SEEK_END);
+    if (end < 0) { ::close(fd); setErr(e, ErrCode::IO, "lseek " + path); return false; }
+    if ((uint64_t)end < off) {
+        ::close(fd);
+        setErr(e, ErrCode::CORRUPT, path + " is shorter than the committed length (end=" +
+               std::to_string((long long)end) + " < off=" + std::to_string((unsigned long long)off) +
+               "); refusing to zero-extend over a committed record region");
+        return false;
+    }
+    size_t done=0; while (done<n){ ssize_t w=::pwrite(fd,d+done,n-done,(off_t)(off+done)); if(w<=0){ ::close(fd); setErr(e,ErrCode::IO,"write "+path); return false; } done+=(size_t)w; }
+    if (injFs) { ::close(fd); setErr(e, ErrCode::FS, "injected fsync failure on " + path); return false; }
+    if (::fsync(fd)!=0){ ::close(fd); setErr(e,ErrCode::FS,"fsync "+path); return false; }
+    if (::close(fd)!=0){ setErr(e,ErrCode::FS,"close "+path); return false; }
+    return true;
+}
 bool csReadFile(const std::string& path, std::vector<uint8_t>* out, bool* exists, ChainError* e) {
     *exists=false; int fd=::open(path.c_str(),O_RDONLY);
     if (fd<0){ if(errno==ENOENT) return true; setErr(e,ErrCode::IO,"open "+path); return false; }
@@ -255,13 +282,20 @@ bool CommitStore3A::open(const std::string& dir, ChainError* e){
     cleanupTmp(); needsReopen_=false; opened_=true; return true;
 }
 
-bool CommitStore3A::commitBarriers(const Manifest& m, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e){
+bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e){
     renamePassed_=false;
     // 1) durable tree pages
     if(inj(InjectStage::PageWrite)){ injErr(e,"tree fsync"); return false; }
     if(!tree_.fsync(e)) return false;
-    // 2) undo append
-    if(undoAppendLen>0){ if(!csAppendFile(p("undo.dat"),undoAppend,undoAppendLen,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e)) return false; }
+    // 2) undo append, at the COMMITTED logical offset (F0: never O_APPEND, never truncate)
+    if(undoAppendLen>0){
+        if(injectUndoShortOnce_>0 && injectUndoShortOnce_<undoAppendLen){   // F0 test hook: torn write
+            size_t part=injectUndoShortOnce_; injectUndoShortOnce_=0;
+            if(!csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,part,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e)) return false;
+            setErr(e,ErrCode::IO,"injected short undo write"); return false;
+        }
+        if(!csWriteAtFile(p("undo.dat"),undoOffset,undoAppend,undoAppendLen,ns(InjectStage::UndoAppend),ff(InjectStage::UndoAppend),e)) return false;
+    }
     // 3) manifest tmp
     std::vector<uint8_t> mb=m.encode();
     if(!csWriteFile(p("MANIFEST.tmp"),mb.data(),mb.size(),ns(InjectStage::ManifestTmp),ff(InjectStage::ManifestTmp),e)) return false;
@@ -304,7 +338,7 @@ bool CommitStore3A::publish(const Delta& d, const Hash& blockHash, int32_t heigh
     std::vector<uint8_t> recBytes=rec.encode();
     uint64_t newGen=generation_+1; uint64_t newUndoSize=undoCommittedBytes_+recBytes.size();
     Manifest m; m.generation=newGen; m.undoSize=newUndoSize; m.rootPageId=tree_.rootId(); m.rootHash=tree_.rootHash(); m.blockHash=blockHash; m.tipHeight=height;
-    if(!commitBarriers(m,recBytes.data(),recBytes.size(),e)){ if(renamePassed_) needsReopen_=true; else tree_.setRoot(oldRoot,oldHash,&er); return false; }
+    if(!commitBarriers(m,undoCommittedBytes_,recBytes.data(),recBytes.size(),e)){ if(renamePassed_) needsReopen_=true; else tree_.setRoot(oldRoot,oldHash,&er); return false; }
     if(!writeAck(newGen,e)){ needsReopen_=true; return false; }
     UndoMeta meta; meta.blockHash=blockHash; meta.height=height; meta.offset=undoCommittedBytes_; meta.len=(uint32_t)recBytes.size();
     generation_=newGen; undoCommittedBytes_=newUndoSize; undoIndex_.push_back(meta);
@@ -327,7 +361,7 @@ bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
         else { if(!tree_.erase(k,e)){ ChainError x; tree_.setRoot(oldRoot,oldHash,&x); return false; } } }
     uint64_t newGen=generation_+1; uint64_t newUndoSize=undoCommittedBytes_-meta.len;
     Manifest m; m.generation=newGen; m.undoSize=newUndoSize; m.rootPageId=tree_.rootId(); m.rootHash=tree_.rootHash(); m.blockHash=Hash(); m.tipHeight=tipHeight_-1;
-    if(!commitBarriers(m,NULL,0,e)){ if(renamePassed_) needsReopen_=true; else tree_.setRoot(oldRoot,oldHash,&er); return false; }
+    if(!commitBarriers(m,0,NULL,0,e)){ if(renamePassed_) needsReopen_=true; else tree_.setRoot(oldRoot,oldHash,&er); return false; }
     if(!writeAck(newGen,e)){ needsReopen_=true; return false; }
     generation_=newGen; undoCommittedBytes_=newUndoSize; undoIndex_.pop_back();
     ackGen_=newGen; ackPresent_=true; blockHash_=Hash(); tipHeight_=m.tipHeight;

@@ -682,12 +682,304 @@ static void test_r2_multi_key_atomic(){
         r.close(); } }
 }
 
+// ==================== Stage 3B-F0: undo offset coherence ====================
+static uint64_t MAN(const std::string& dir){
+    FILE* f=fopen((dir+"/MANIFEST").c_str(),"rb"); if(!f) return 0; uint8_t b[32]; size_t n=fread(b,1,32,f); fclose(f); if(n<32) return 0;
+    uint64_t v=0; for(int i=0;i<8;i++) v|=(uint64_t)b[24+i]<<(8*i); return v; }
+static long FSZ(const std::string& p){ struct stat st; return stat(p.c_str(),&st)==0?(long)st.st_size:-1; }
+static Hash DG(CommitStore3A& s, ChainError* e){ UtxoState st; storeToState(s,&st,e); return st.digest(); }
+static bool PUB(CommitStore3A& s, int32_t h, uint32_t lab, uint32_t txlab, size_t slen, ChainError* e){
+    Block b; b.hash=id32(0xB10C0000u+lab,(uint32_t)h); b.height=h;
+    Tx cb; cb.txid=id32(0xCB000000u+txlab,(uint32_t)h); cb.coinbase=true; cb.coinstake=false;
+    TxOut o; o.value=50*COIN; o.script.assign(slen,7); cb.vout.push_back(o); b.txs.push_back(cb);
+    return publishStore(s,b,e); }
+static void JUNK(const std::string& p,long from,long len){
+    FILE* f=fopen(p.c_str(),"r+b"); if(!f) return; if(fseek(f,from,SEEK_SET)!=0){ fclose(f); return; }
+    for(long i=0;i<len;i++) fputc(0x5A,f); fclose(f); }
+static bool COH(const std::string& d, ChainError* e){
+    uint64_t m=MAN(d); long p=FSZ(d+"/undo.dat");
+    if(!(p>=(long)m)){ setErr(e,ErrCode::CORRUPT,"physical "+std::to_string(p)+" < logical "+std::to_string((long long)m)); return false; }
+    return true; }
+static void f0Child(const std::string& dir, int mode, int32_t h, uint32_t lab, uint32_t txlab){
+    ChainError e; CommitStore3A s; if(!s.open(dir,&e)) ::_exit(2);
+    Block b; b.hash=id32(0xB10C0000u+lab,(uint32_t)h); b.height=h;
+    Tx cb; cb.txid=id32(0xCB000000u+txlab,(uint32_t)h); cb.coinbase=true; cb.coinstake=false;
+    TxOut o; o.value=50*COIN; o.script.assign(3,7); cb.vout.push_back(o); b.txs.push_back(cb);
+    TreeReader tr(s.tree()); Delta d; if(!buildDeltaI(tr,b,MAT,&d,&e)) ::_exit(3);
+    if(mode==0) s.setCrashPoint(CrashPoint::BeforeRename);
+    if(mode==1) s.setCrashPoint(CrashPoint::AfterRename);
+    if(mode==2) s.setCrashPoint(CrashPoint::AfterDirSync);
+    bool ok=s.publish(d,b.hash,h,&e);
+    if(mode==3) ::_exit(ok?0:1);
+    ::_exit(42); }
+
+static void test_f0_undo(){
+    g_cur="F0-undo";
+    ChainError e;
+
+    // ---- F0-01 original sequence: publish h1..h3, disconnect h3, publish h4, restart, disconnect h4
+    {
+        std::string d=freshDir("f0_01"); Hash dAfterH2;
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-01 open: "+e.str());
+          CHECK(PUB(s,1,0,0,3,&e)&&PUB(s,2,0,0,3,&e)&&PUB(s,3,0,0,3,&e), "F0-01 publish h1..h3");
+          CHECK(MAN(d)==(uint64_t)FSZ(d+"/undo.dat"), "F0-01 pre-disconnect physical==logical ("+std::to_string(FSZ(d+"/undo.dat"))+"=="+std::to_string((long long)MAN(d))+")");
+          CHECK(s.disconnect(id32(0xB10C0000u,3),&e), "F0-01 disconnect h3: "+e.str());
+          dAfterH2=DG(s,&e);
+          CHECK(MAN(d)<(uint64_t)FSZ(d+"/undo.dat"), "F0-01 disconnect shrinks logical while physical keeps the stale tail");
+          CHECK(PUB(s,4,0,0,3,&e), "F0-01 publish h4");
+          CHECK(MAN(d)==(uint64_t)FSZ(d+"/undo.dat"), "F0-01 post-republish physical==logical ("+std::to_string(FSZ(d+"/undo.dat"))+"=="+std::to_string((long long)MAN(d))+")");
+          CHECK(s.undoCount()==3, "F0-01 undoCount==3");
+          CHECK(s.generation()==5, "F0-01 generation==5"); s.close(); }
+        { CommitStore3A r; CHECK(r.open(d,&e), "F0-01 restart: "+e.str());
+          CHECK(r.generation()==5 && r.undoCount()==3, "F0-01 restart gen5/undoCount3");
+          CHECK(r.tipHash()==id32(0xB10C0000u,4) && r.tipHeight()==4, "F0-01 restart tip == h4");
+          bool ok=r.disconnect(id32(0xB10C0000u,4),&e);
+          CHECK(ok, "F0-01 restart disconnect(tip h4) succeeds: "+e.str());
+          CHECK(ok && DG(r,&e)==dAfterH2, "F0-01 state after disconnect == state after h2");
+          r.close(); }
+    }
+
+    // ---- F0-02 repeated disconnect/connect cycles with restart
+    {
+        std::string d=freshDir("f0_02"); Hash base;
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-02 open"); CHECK(PUB(s,1,0,0,3,&e),"F0-02 h1"); base=DG(s,&e); s.close(); }
+        for(int cyc=0;cyc<3;cyc++){
+            int32_t h=2+cyc*2; uint32_t lab=(uint32_t)(1+cyc), tx=(uint32_t)(1+cyc), lab2=(uint32_t)(10+cyc), tx2=(uint32_t)(10+cyc);
+            { CommitStore3A s; std::string t="F0-02 c"+std::to_string(cyc);
+              CHECK(s.open(d,&e),t+" open"); CHECK(PUB(s,h,lab,tx,3,&e),t+" publish");
+              CHECK(s.disconnect(id32(0xB10C0000u+lab,(uint32_t)h),&e),t+" disconnect"); CHECK(DG(s,&e)==base,t+" back to base");
+              CHECK(PUB(s,h+1,lab2,tx2,3,&e),t+" republish"); CHECK(DG(s,&e)!=base,t+" advanced");
+              CHECK(MAN(d)==(uint64_t)FSZ(d+"/undo.dat"),t+" physical==logical"); s.close(); }
+            { CommitStore3A r; std::string t="F0-02 c"+std::to_string(cyc)+" restart";
+              CHECK(r.open(d,&e),t+" open");
+              bool ok=r.disconnect(id32(0xB10C0000u+lab2,(uint32_t)(h+1)),&e);
+              CHECK(ok,t+" disconnect(tip): "+e.str()); CHECK(ok&&DG(r,&e)==base,t+" restores base");
+              CHECK(COH(d,&e),t+" coherence"); r.close(); }
+        }
+    }
+
+    // ---- F0-03 consecutive disconnects then a different branch
+    {
+        std::string d=freshDir("f0_03"); Hash dAfterH2;
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-03 open");
+          for(int h=1;h<=4;h++) CHECK(PUB(s,h,0,0,3,&e), "F0-03 publish "+std::to_string(h));
+          CHECK(s.disconnect(id32(0xB10C0000u,4),&e),"F0-03 disconnect h4");
+          CHECK(s.disconnect(id32(0xB10C0000u,3),&e),"F0-03 disconnect h3");
+          dAfterH2=DG(s,&e);
+          CHECK(PUB(s,5,7,7,3,&e),"F0-03 publish different branch h5");
+          CHECK(COH(d,&e),"F0-03 physical>=logical (stale discarded records remain inert)"); s.close(); }
+        { CommitStore3A r; CHECK(r.open(d,&e),"F0-03 restart: "+e.str());
+          bool ok=r.disconnect(id32(0xB10C0000u+7,5),&e);
+          CHECK(ok,"F0-03 restart disconnect(h5): "+e.str());
+          CHECK(ok&&DG(r,&e)==dAfterH2,"F0-03 state == after h2"); r.close(); }
+    }
+
+    // ---- F0-04 records of unequal length (long/short alternating, incl. shorter record over longer stale)
+    {
+        std::string d=freshDir("f0_04"); Hash dAfterH4;
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-04 open");
+          CHECK(PUB(s,1,0,0,3,&e)&&PUB(s,2,0,0,3,&e),"F0-04 h1,h2");
+          CHECK(PUB(s,3,0,0,2000,&e),"F0-04 h3 (long record)");
+          CHECK(s.disconnect(id32(0xB10C0000u,3),&e),"F0-04 disconnect h3 (long)");
+          CHECK(PUB(s,4,0,0,3,&e),"F0-04 h4 (short over long stale)");
+          CHECK(COH(d,&e),"F0-04 coherence"); CHECK(s.undoCount()==3,"F0-04 undoCount==3");
+          CHECK(PUB(s,5,0,0,2000,&e),"F0-04 h5 (long)");
+          CHECK(s.disconnect(id32(0xB10C0000u,5),&e),"F0-04 disconnect h5 (long)");
+          dAfterH4=DG(s,&e);
+          CHECK(PUB(s,6,0,0,3,&e),"F0-04 h6 (short over long stale)");
+          CHECK(COH(d,&e),"F0-04 coherence after mixed lengths"); s.close(); }
+        { CommitStore3A r; CHECK(r.open(d,&e),"F0-04 restart: "+e.str());
+          CHECK(r.undoCount()==4,"F0-04 restart undoCount==4");
+          bool ok=r.disconnect(id32(0xB10C0000u,6),&e);
+          CHECK(ok,"F0-04 restart disconnect(tip h6): "+e.str());
+          CHECK(ok&&DG(r,&e)==dAfterH4,"F0-04 state == after h4"); r.close(); }
+    }
+
+    // ---- F0-05 / F0-15 equal-length records, different hashes+ops; stale record must never be the tip
+    {
+        std::string d=freshDir("f0_05"); Hash dAfterH2; uint64_t l3=0,lx=0;
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-05 open");
+          CHECK(PUB(s,1,0,0,3,&e)&&PUB(s,2,0,0,3,&e),"F0-05 h1,h2");
+          uint64_t s2=MAN(d); dAfterH2=DG(s,&e);
+          CHECK(PUB(s,3,0,0,3,&e),"F0-05 h3"); l3=MAN(d)-s2;
+          CHECK(s.disconnect(id32(0xB10C0000u,3),&e),"F0-05 disconnect h3");
+          CHECK(PUB(s,4,20,20,3,&e),"F0-05 publish h4' (different hash/txid, same length)");
+          lx=MAN(d)-s2;
+          CHECK(l3==lx && l3>0, "F0-05 record lengths equal ("+std::to_string((long long)l3)+"=="+std::to_string((long long)lx)+")");
+          CHECK(MAN(d)==(uint64_t)FSZ(d+"/undo.dat"),"F0-05 physical==logical"); s.close(); }
+        { CommitStore3A r; CHECK(r.open(d,&e),"F0-05 restart: "+e.str());
+          CHECK(r.tipHash()==id32(0xB10C0000u+20,4),"F0-05 tip == h4'");
+          ChainError estale; bool sta=r.disconnect(id32(0xB10C0000u,3),&estale);
+          CHECK(!sta,"F0-05 stale h3 undo is NOT mistaken for the tip (disconnect refused: "+estale.str()+")");
+          bool ok=r.disconnect(id32(0xB10C0000u+20,4),&e);
+          CHECK(ok,"F0-05 disconnect(h4'): "+e.str());
+          CHECK(ok&&DG(r,&e)==dAfterH2,"F0-05 state == after h2 (correct block reverted)"); r.close(); }
+    }
+
+    // ---- F0-06 crash/failure before the undo write; F0-07 short (torn) undo write
+    for (int mode=0; mode<2; ++mode){
+        std::string d=freshDir(mode? "f0_07":"f0_06"); std::string t=mode? "F0-07":"F0-06";
+        { CommitStore3A s; CHECK(s.open(d,&e),t+" open"); CHECK(PUB(s,1,0,0,3,&e),t+" h1");
+          uint64_t g=s.generation(), a=s.acknowledgedGeneration(), m=MAN(d); long p=FSZ(d+"/undo.dat"); Hash dg=DG(s,&e);
+          if(!mode){ s.setInjectStage(InjectStage::UndoAppend); s.injectNoSpace(true); }
+          else { s.injectUndoShortOnce(20); }
+          bool ok=PUB(s,2,0,0,3,&e);
+          s.clearInjection();
+          CHECK(!ok,t+" publish fails ("+(mode?"torn undo write":"no space")+"); "+e.str());
+          CHECK(s.generation()==g && s.acknowledgedGeneration()==a, t+" generation/ACK unchanged");
+          CHECK(MAN(d)==m, t+" committed undoSize unchanged");
+          CHECK(!mode || FSZ(d+"/undo.dat")>=(long)m, t+" physical >= logical (never shorter)");
+          CHECK(DG(s,&e)==dg, t+" committed logical state unchanged");
+          if(!mode) CHECK(FSZ(d+"/undo.dat")==p, t+" failed-before-write leaves undo.dat byte-length unchanged");
+          CHECK(s.disconnect(id32(0xB10C0000u,1),&e), t+" old acknowledged generation still disconnectable");
+          CHECK(PUB(s,3,0,0,3,&e), t+" subsequent publish succeeds");
+          CHECK(COH(d,&e), t+" coherence after recovery"); s.close(); }
+        { CommitStore3A r; CHECK(r.open(d,&e),t+" restart: "+e.str());
+          CHECK(r.undoCount()==1,t+" restart undoCount==1 (h1 disconnected, h3 published)");
+          CHECK(COH(d,&e),t+" restart coherence"); r.close(); }
+    }
+
+    // ---- F0-08 / F0-09 / F0-10 crash barriers; F0-11 repeated restart (read-only, then one disconnect)
+    for (int mode=0; mode<4; ++mode){
+        std::string d=freshDir(std::string("f0_0")+std::to_string(8+mode));
+        std::string t=std::string("F0-0")+std::to_string(8+mode);
+        const char* kind = mode==0?"crash before MANIFEST rename (OLD)":(mode==1?"crash after rename before dir-fsync (NEW)":(mode==2?"crash after dir-fsync before ACK (NEW)":"normal completion incl. ACK (NEW)"));
+        Hash dOld; { CommitStore3A s; CHECK(s.open(d,&e),t+" open"); CHECK(PUB(s,1,0,0,3,&e),t+" h1"); dOld=DG(s,&e); s.close(); }
+        pid_t pid=fork();
+        if(pid==0){ f0Child(d,mode,2,0,0); ::_exit(7); }
+        int st=0; waitpid(pid,&st,0);
+        CHECK(WIFEXITED(st), t+" child terminated normally");
+        CHECK(WIFEXITED(st) && WEXITSTATUS(st)==(mode==3?0:42), t+" child exit "+(mode==3?"0 (publish completed)":"42 (crash)")+" got "+std::to_string(WIFEXITED(st)?WEXITSTATUS(st):-1));
+        uint64_t g0=0,u0=0; Hash d0;
+        for(int rep=0; rep<3; ++rep){                       // read-only repeated restarts (no mutation)
+            CommitStore3A r; bool ok=r.open(d,&e);
+            CHECK(ok, t+" restart "+std::to_string(rep)+" ["+kind+"]: "+e.str());
+            if(!ok) break;
+            Hash dg=DG(r,&e); uint64_t g=r.generation(); uint64_t uc=(uint64_t)r.undoCount();
+            if(rep==0){ g0=g; d0=dg; u0=uc;
+                CHECK(g==(mode==0?1:2), t+" recovered generation "+(mode==0?"OLD (1)":"NEW (2)")+": "+std::to_string((long long)g));
+                if(mode==0) CHECK(dg==dOld, t+" OLD logical state preserved at gen1");
+                CHECK(r.acknowledgedGeneration()==g, t+" ACK reconciled to the recovered generation");
+            } else CHECK(g==g0 && dg==d0 && uc==u0, t+" repeated restart deterministic (gen/digest/undoCount)");
+            CHECK(COH(d,&e), t+" coherence on restart "+std::to_string(rep)); r.close(); }
+        { CommitStore3A r; CHECK(r.open(d,&e), t+" final open");   // separate: disconnecting mutates generation
+          Hash tip=r.tipHash(); bool okd=r.disconnect(tip,&e);
+          CHECK(okd, t+" tip disconnect after recovery: "+e.str());
+          r.close(); }
+    }
+
+    // ---- F0-12 corrupt stale-tail bytes (bytes >= committed logical length) must be inert
+    {
+        std::string d=freshDir("f0_12"); Hash dAfterH2;
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-12 open");
+          CHECK(PUB(s,1,0,0,3,&e)&&PUB(s,2,0,0,3,&e)&&PUB(s,3,0,0,2000,&e),"F0-12 h1..h3");
+          CHECK(s.disconnect(id32(0xB10C0000u,3),&e),"F0-12 disconnect h3");
+          dAfterH2=DG(s,&e); s.close(); }
+        uint64_t m=MAN(d); long p=FSZ(d+"/undo.dat");
+        CHECK(p>(long)m, "F0-12 stale tail present (physical "+std::to_string(p)+" > logical "+std::to_string((long long)m)+")");
+        JUNK(d+"/undo.dat",(long)m,p-(long)m);
+        { CommitStore3A r; CHECK(r.open(d,&e),"F0-12 reopen with corrupt stale tail: "+e.str());
+          CHECK(r.generation()==4 && r.undoCount()==2, "F0-12 generation/undoCount intact");
+          CHECK(DG(r,&e)==dAfterH2, "F0-12 logical state intact");
+          CHECK(r.disconnect(id32(0xB10C0000u,2),&e), "F0-12 tip disconnect works"); r.close(); }
+    }
+
+    // ---- F0-13 truncated undo.dat: (a) committed header unreadable -> FAIL CLOSED;
+    //      (b) CRC-tail loss -> header-only index still loads, but use fails closed (no wrong revert)
+    {
+        std::string d=freshDir("f0_13a");
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-13a open"); CHECK(PUB(s,1,0,0,3,&e)&&PUB(s,2,0,0,3,&e),"F0-13a h1,h2"); s.close(); }
+        uint64_t m=MAN(d);
+        CHECK(::truncate((d+"/undo.dat").c_str(),(off_t)(m-100))==0, "F0-13a truncate 100 B below the committed length");
+        { CommitStore3A r; bool ok=r.open(d,&e);
+          CHECK(!ok, "F0-13a open FAIL-CLOSED (committed undo header unreadable): "+e.str());
+          if(ok) r.close(); }
+        CHECK(MAN(d)==m, "F0-13a MANIFEST untouched by the failed open");
+    }
+    {
+        std::string d=freshDir("f0_13b");
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-13b open"); CHECK(PUB(s,1,0,0,3,&e)&&PUB(s,2,0,0,3,&e),"F0-13b h1,h2"); s.close(); }
+        uint64_t m=MAN(d);
+        CHECK(::truncate((d+"/undo.dat").c_str(),(off_t)(m-10))==0, "F0-13b truncate only the last record's CRC tail");
+        { CommitStore3A r; bool ok=r.open(d,&e);
+          CHECK(ok, "F0-13b header-only undo index still loads: "+e.str());
+          if(ok){
+            ChainError e2; bool dok=r.disconnect(id32(0xB10C0000u,2),&e2);
+            CHECK(!dok, "F0-13b disconnect of the damaged record FAIL-CLOSED (never a wrong revert): "+e2.str());
+            CHECK(r.generation()==2, "F0-13b generation unchanged by the refused disconnect");
+            ChainError e3; bool pok=PUB(r,3,0,0,3,&e3);
+            CHECK(!pok, "F0-13b publish refuses to zero-extend over the short file: "+e3.str());
+            CHECK(r.generation()==2 && MAN(d)==m, "F0-13b nothing committed by the refused publish");
+            r.close(); }
+        }
+    }
+
+    // ---- F0-14 old acknowledged generation remains recoverable when a new publish fails
+    {
+        std::string d=freshDir("f0_14"); Hash dg2;
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-14 open"); CHECK(PUB(s,1,0,0,3,&e)&&PUB(s,2,0,0,3,&e),"F0-14 h1,h2");
+          dg2=DG(s,&e);
+          s.setInjectStage(InjectStage::ManifestTmp); s.injectNoSpace(true);
+          CHECK(!PUB(s,3,0,0,3,&e), "F0-14 publish h3 fails (no space at MANIFEST.tmp)");
+          s.clearInjection();
+          CHECK(s.generation()==2 && s.acknowledgedGeneration()==2, "F0-14 gen2/ACK2 preserved");
+          CHECK(DG(s,&e)==dg2, "F0-14 acknowledged state preserved in memory");
+          CHECK(s.disconnect(id32(0xB10C0000u,2),&e), "F0-14 acknowledged generation still disconnectable"); s.close(); }
+        { CommitStore3A r; CHECK(r.open(d,&e),"F0-14 restart: "+e.str());
+          CHECK(r.generation()==3 && r.acknowledgedGeneration()==3, "F0-14 restart reads the acknowledged line");
+          CHECK(COH(d,&e),"F0-14 coherence"); r.close(); }
+    }
+
+    // ---- F0-16 multi-key block delta: disconnect, reconnect, restart, exact digest comparison
+    {
+        std::string d=freshDir("f0_16"); Hash dAfterH4;
+        auto mkMulti=[&](int32_t h,const Hash& bh,const Hash& cbtx,std::vector<Hash> spends)->Block{
+            Block b; b.hash=bh; b.height=h;
+            for (Hash sp: spends){ OutPoint prev; prev.txid=sp; prev.n=0; Tx t; t.txid=id32(0x77000000u,(uint32_t)(h*10+(int)sp.data()[0])); t.coinbase=false;
+                TxIn in; in.prev=prev; t.vin.push_back(in); TxOut o; o.value=10*COIN; o.script={5,5}; t.vout.push_back(o); b.txs.push_back(t); }
+            Tx cb; cb.txid=cbtx; cb.coinbase=true; cb.coinstake=false; TxOut o; o.value=50*COIN; o.script={1,2,3}; cb.vout.push_back(o); b.txs.push_back(cb);
+            return b; };
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-16 open");
+          for(int h=1;h<=4;h++) CHECK(PUB(s,h,0,0,3,&e),"F0-16 publish "+std::to_string(h));
+          dAfterH4=DG(s,&e);
+          Block b5=mkMulti(5,id32(0xB10C0000u,50),id32(0xCB000000u,50),{id32(0xCB000000u,1),id32(0xCB000000u,2)});
+          CHECK(publishStore(s,b5,&e), "F0-16 multi-key publish h5: "+e.str());
+          CHECK(s.disconnect(id32(0xB10C0000u,50),&e), "F0-16 disconnect h5");
+          CHECK(DG(s,&e)==dAfterH4, "F0-16 multi-key disconnect restores dAfterH4");
+          Block b6=mkMulti(6,id32(0xB10C0000u,51),id32(0xCB000000u,51),{id32(0xCB000000u,1),id32(0xCB000000u,3)});
+          CHECK(publishStore(s,b6,&e), "F0-16 multi-key publish h6: "+e.str());
+          CHECK(COH(d,&e),"F0-16 coherence"); s.close(); }
+        { CommitStore3A r; CHECK(r.open(d,&e),"F0-16 restart: "+e.str());
+          CHECK(r.tipHash()==id32(0xB10C0000u,51),"F0-16 tip == h6");
+          bool ok=r.disconnect(id32(0xB10C0000u,51),&e);
+          CHECK(ok,"F0-16 restart disconnect(h6): "+e.str());
+          CHECK(ok&&DG(r,&e)==dAfterH4,"F0-16 exact digest == dAfterH4 after disconnect/restart"); r.close(); }
+    }
+
+    // ---- F0-17 orphan undo.dat with no MANIFEST/ACK/tree.dat must not poison the new log
+    {
+        std::string d=freshDir("f0_17"); std::string de=freshDir("f0_17_empty"); Hash dEmpty;
+        { CommitStore3A s; CHECK(s.open(de,&e),"F0-17 empty ref open"); dEmpty=DG(s,&e); s.close(); }
+        { FILE* f=fopen((d+"/undo.dat").c_str(),"wb"); if(f){ for(int i=0;i<200;i++) fputc(0x41,f); fclose(f); } }
+        CHECK(FSZ(d+"/undo.dat")==200, "F0-17 orphan undo.dat planted (200 bytes)");
+        { CommitStore3A s; CHECK(s.open(d,&e),"F0-17 fresh open over orphan undo.dat: "+e.str());
+          CHECK(s.generation()==0 && s.undoCount()==0, "F0-17 fresh gen0 with empty undo index");
+          CHECK(PUB(s,1,0,0,3,&e),"F0-17 first publish");
+          CHECK(COH(d,&e),"F0-17 coherence after first publish"); s.close(); }
+        { CommitStore3A r; CHECK(r.open(d,&e),"F0-17 restart: "+e.str());
+          CHECK(r.generation()==1 && r.undoCount()==1, "F0-17 restart reads exactly one coherent record");
+          bool ok=r.disconnect(id32(0xB10C0000u,1),&e);
+          CHECK(ok,"F0-17 disconnect(h1): "+e.str());
+          CHECK(ok&&DG(r,&e)==dEmpty,"F0-17 back to the empty state"); r.close(); }
+    }
+}
+
 static long readVmHWM(){ FILE*f=fopen("/proc/self/status","r"); if(!f)return -1; char l[256]; long kb=-1; while(fgets(l,sizeof(l),f)){ if(strncmp(l,"VmHWM:",6)==0){ sscanf(l+6,"%ld",&kb); break; } } fclose(f); return kb; }
 
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){
