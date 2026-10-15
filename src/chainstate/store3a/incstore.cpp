@@ -216,8 +216,9 @@ bool CommitStore3A::open(const std::string& dir, ChainError* e){
     } else if(!pEx){
         if(ackPresent_ && ackGen_>0){ close(); setErr(e,ErrCode::CORRUPT,"acknowledged MANIFEST (gen "+std::to_string(ackGen_)+") is missing"); return false; }
         struct stat st;
-        if(stat(p("tree.dat").c_str(),&st)==0){ if(!tree_.open(p("tree.dat"),e)){ close(); return false; } if(!tree_.loadPage0AsRoot(e)){ close(); return false; } }
-        else { if(!tree_.create(p("tree.dat"),e)){ close(); return false; } }
+        bool ok=false;
+        if(stat(p("tree.dat").c_str(),&st)==0){ if(tree_.open(p("tree.dat"),&e1)){ ChainError e0; if(tree_.loadPage0AsRoot(&e0)) ok=true; } }
+        if(!ok){ tree_.close(); clearErr(e); if(!tree_.create(p("tree.dat"),e)){ close(); return false; } }
         generation_=0; undoIndex_.clear(); undoCommittedBytes_=0; blockHash_=Hash(); tipHeight_=-1;
     } else {
         ChainError e2; bool bEx=false; uint32_t bId=0; Hash bH;

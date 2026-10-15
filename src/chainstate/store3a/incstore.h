@@ -49,8 +49,10 @@ public:
     size_t undoCount() const { return undoIndex_.size(); }
     bool hadRecoveryIssue() const { return hadRecoveryIssue_; }
     const BTree& tree() const { return tree_; }
+    BTree& tree() { return tree_; }
     uint32_t rootPageId() const { return tree_.rootId(); }
     const Hash& rootHash() const { return tree_.rootHash(); }
+    bool truncatedTreeTail() const { return tree_.truncatedTail(); }
 
     bool get(const OutPoint& k, Coin* c, bool* found, ChainError* e) const;
     bool existsUnspentTxid(const Hash& txid, bool* found, ChainError* e) const;
@@ -64,6 +66,8 @@ public:
     void injectNoSpace(bool v) { injectNoSpace_ = v; }
     void injectFsyncFail(bool v) { injectFsyncFail_ = v; }
     void clearInjection() { injectStage_ = InjectStage::None; injectNoSpace_ = false; injectFsyncFail_ = false; }
+    // R1 test hook: force the next tree page append to be a short/interrupted write.
+    void injectPartialAppendOnce(size_t bytes) { tree_.injectPartialAppendOnce(bytes); }
 
 private:
     bool ns(InjectStage s) const { return injectStage_ == s && injectNoSpace_; }

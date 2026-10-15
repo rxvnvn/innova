@@ -33,8 +33,10 @@ committed tree is never mutated and remains fully readable for fallback.
 - **Write amplification:** O(K x depth) pages per commit, depth ~ log_100(N), typically 3-5
   for mainnet scale -> a bounded constant factor, independent of N. No per-commit O(state)
   write. (Depth grows logarithmically, documented.)
-- **Read amplification:** one page read per tree level (O(depth)); no page cache is used in
-  the slice, so RAM is bounded to O(depth) pages per operation.
+- **Read amplification:** one page read per tree level (O(depth)); each page is
+  authenticated against its expected Merkle hash before use (R1, §8.1), so verification adds
+  one O(page-size) SHA-256 per level and no extra reads. No page cache is used in the slice,
+  so RAM is bounded to O(depth) pages per operation.
 - **Crash consistency:** new pages are written and fsynced *before* the MANIFEST that
   references them; the rename is the visibility boundary and the directory fsync the
   durability boundary, exactly as Stage-2B. A crash never exposes a partially applied block
@@ -141,3 +143,51 @@ unacknowledged recovery still succeeds.
 - Immutable pages + a free-list enable online compaction without changing node format.
 - Checkpoint/seed = publish a MANIFEST whose root references a fully-materialized tree; the
   same commit path applies.
+
+## 8. Stage 3A-R1 — targeted integrity & recovery remediation
+
+### 8.1 S3A-1 — authenticated traversal (path verification)
+
+Correction of the Stage-3A record: non-root page corruption was **not** detected during
+normal access in Stage 3A. `setRoot` verified only the root page (O(1)) and `get`/`modRec`
+consumed child pages without checking them against the parent's stored child hash; a bit
+flip in a non-root leaf or internal page was therefore returned/spent/rewritten silently.
+
+R1 makes every normal traversal authenticated:
+
+- `readNodeVerified(id, expect, ...)` reads + decodes a page and recomputes its node hash,
+  rejecting it unless it equals `expect` (the parent's stored `chashes[i]`; for the root, the
+  committed root hash from the MANIFEST).
+- `get`, `existsTxidPrefix` (BIP30), `put`, `erase`, `keysWithTxidPrefix` (prefix scan),
+  `collectAll` and `verifyAll` all descend through `readNodeVerified`; each page is verified
+  **before** its contents are consumed, so a corrupt page fails closed and is never used to
+  produce a value or to derive a new authenticated root.
+- Cost is still O(depth): one page read + one O(page-size) SHA-256 per level on the traversed
+  path. No O(state) work is added per operation.
+
+### 8.2 S3A-3 — interrupted-append recovery (unreferenced trailing page)
+
+Stage 3A refused to open a `tree.dat` whose size was not a multiple of PAGE_SIZE, so an
+append interrupted mid-page (short write / ENOSPC / power loss) made an otherwise intact
+acknowledged generation unopenable.
+
+Pages are only ever written at whole-page offsets, and a page is fully written + fsynced
+**before** any MANIFEST that references it becomes durable (the tree is fsynced before the
+rename). Therefore bytes past the last whole page belong to a page that was never completed
+and cannot be referenced by the committed root **or** by the retained fallback root.
+
+R1 `BTree::open` drops exactly that footer: if `size % PAGE_SIZE != 0`, it `ftruncate`s to
+`size - size % PAGE_SIZE` and fsyncs. Only the partial trailing page is removed — never a
+whole page — so committed pages, the fallback (MANIFEST.bak) root and any page a future
+generation could reference are preserved. The drop is reported via `truncatedTail()` and is
+idempotent across repeated restarts. This is the minimal format-compatible change; no
+on-disk format change is required.
+
+### 8.3 Commitment contract (unchanged, restated)
+
+The Merkle `rootHash` is a **physical, history-dependent** commitment over the page tree: it
+depends on node layout/allocation and changes on every commit even when the logical UTXO set
+does not. It is **not** the canonical logical UTXO digest (`UtxoState::digest()`, an
+order-independent digest of the key→coin set). R1 does not change this contract: verification
+authenticates pages against the committed physical root; correctness against the logical
+model is checked separately by the differential tests.

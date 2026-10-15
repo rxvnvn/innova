@@ -290,8 +290,9 @@ static void test_s1_scaling(){
         perCommit[si]=(after-before)/N;
         msPerCommit[si]=((t1.tv_sec-t0.tv_sec)*1000.0+(t1.tv_nsec-t0.tv_nsec)/1e6)/N;
         size_t nstate=s.tree().rootCount();
+        uint64_t writesPerCommit = s.tree().pageWrites()/(uint64_t)N;
         s.close();
-        printf("  S1 N=%d treeBytes=%ld bytesPerCommit=%ld msPerCommit=%.3f peakRSS_KB=%ld\n", N, after, perCommit[si], msPerCommit[si], readVmHWM());
+        printf("  S1 N=%d treeBytes=%ld bytesPerCommit=%ld pageWritesPerCommit=%llu msPerCommit=%.3f peakRSS_KB=%ld\n", N, after, perCommit[si], (unsigned long long)writesPerCommit, msPerCommit[si], readVmHWM());
         (void)nstate;
     }
     // O(delta) criterion: per-commit write volume must NOT grow ~linearly with state size (4x from N=200..800)
@@ -299,12 +300,177 @@ static void test_s1_scaling(){
     printf("  S1 perCommit: 200=%ld 400=%ld 800=%ld bytes\n", perCommit[0], perCommit[1], perCommit[2]);
 }
 
+// ==================== R1 remediation regression ============================
+static uint32_t rd32b(const uint8_t*p){ uint32_t v=0; for(int i=0;i<4;i++) v|=(uint32_t)p[i]<<(8*i); return v; }
+static bool readRaw(const std::string& p, long off, uint8_t* buf, size_t n){ FILE*f=fopen(p.c_str(),"rb"); if(!f)return false; if(fseek(f,off,SEEK_SET)!=0){fclose(f);return false;} size_t r=fread(buf,1,n,f); fclose(f); return r==n; }
+// walk the leftmost path; returns the first (non-root) leaf page id and sets depth
+static uint32_t walkFirstLeaf(const std::string& path, uint32_t rootId, int* depth){
+    uint32_t id=rootId; uint8_t pg[4096]; int d=1;
+    for(int g=0;g<64;g++){ if(!readRaw(path,(long)id*4096,pg,4096)) return 0; if(pg[0]==1){ *depth=d; return id; } id=rd32b(pg+4); d++; }
+    *depth=d; return id;
+}
+static uint32_t firstNonRootInternal(const std::string& path, uint32_t rootId){
+    uint8_t pg[4096]; if(!readRaw(path,(long)rootId*4096,pg,4096)) return 0; if(pg[0]!=2) return 0;
+    uint32_t c=rd32b(pg+4); if(!readRaw(path,(long)c*4096,pg,4096)) return 0; return pg[0]==2? c : 0;
+}
+static Block mkBlock2(){
+    Block b; b.hash=id32(0xAAAA0000u,2); b.height=2; OutPoint prev; prev.txid=id32(0xCB000000u,1); prev.n=0;
+    Tx sp; sp.txid=id32(0x55000000u,1); sp.coinbase=false; sp.coinstake=false; TxIn in; in.prev=prev; sp.vin.push_back(in);
+    TxOut o; o.value=40*COIN; o.script={9,9}; sp.vout.push_back(o); b.txs.push_back(sp); return b;
+}
+static bool buildTreeDeep(const std::string& dir, int N, size_t valsz, BTree* t, ChainError* e){
+    if(!t->create(dir+"/tree.dat",e)) return false;
+    for(int i=0;i<N;i++){ Key k{}; Hash h=id32(0x1u,(uint32_t)i); memcpy(k.data(),h.data(),32); k[32]=(uint8_t)i;
+        std::vector<uint8_t> v(valsz,(uint8_t)(i&0xff)); v[0]=(uint8_t)i; v[1]=(uint8_t)(i>>8);
+        if(!t->put(k,v,e)) return false; }
+    return true;
+}
+// locate the leaf page whose entries contain key k (test-only linear page scan)
+static uint32_t findLeafWithKey(const std::string& path, uint32_t nextId, const Key& k){
+    uint8_t pg[4096];
+    for(uint32_t id=0; id<nextId; ++id){ if(!readRaw(path,(long)id*4096,pg,4096)) continue; if(pg[0]!=1) continue;
+        uint16_t cnt=(uint16_t)(pg[1]|(pg[2]<<8)); size_t off=4;
+        for(uint16_t i=0;i<cnt;i++){ if(off+38>4096) break; Key ek; memcpy(ek.data(),pg+off,36);
+            if(keyCmp(ek,k)==0) return id;
+            uint16_t vl=(uint16_t)(pg[off+36]|(pg[off+37]<<8)); off+=36+2+vl; } }
+    return 0xFFFFFFFFu;
+}
+
+static void test_m1_path_verify(){
+    g_cur="M1-pathverify";
+    ChainError e;
+    // ---- (a) non-root LEAF corruption must fail closed for every traversal
+    std::string dir=freshDir("m1a");
+    BTree t; CHECK(buildTreeDeep(dir,3000,120,&t,&e), "m1a deep build: "+e.str());
+    uint32_t root=t.rootId(); int depth=0; uint32_t leafId=walkFirstLeaf(dir+"/tree.dat",root,&depth);
+    CHECK(depth>=3, "m1a tree has depth >= 3 (non-root internal present)");
+    uint8_t lp[4096]; readRaw(dir+"/tree.dat",(long)leafId*4096,lp,4096);
+    Key kk; memcpy(kk.data(),lp+4,36); Hash kkTxid; memcpy(kkTxid.data(),lp+4,32);
+    std::vector<uint8_t> v; bool f=false; CHECK(t.get(kk,&v,&f,&e)&&f, "m1a get before corruption ok");
+    uint64_t r0=t.pageReads(); t.get(kk,&v,&f,&e); uint64_t r1=t.pageReads();
+    CHECK((r1-r0)==(uint64_t)depth, "m1a page reads per lookup == depth (O(depth), no O(state))");
+    // flip one byte in the non-root leaf value area
+    CHECK(flipByte(dir+"/tree.dat",(long)leafId*4096+42), "m1a flip non-root leaf byte");
+    ChainError ge; bool gok=t.get(kk,&v,&f,&ge);
+    CHECK(!gok && ge.code==ErrCode::CORRUPT, "m1a get on corrupt non-root leaf fails closed");
+    Hash rootBefore=t.rootHash();
+    ChainError pe; std::vector<uint8_t> nv(2,7);
+    CHECK(!t.put(kk,nv,&pe), "m1a put on corrupt non-root leaf fails closed");
+    CHECK(t.rootHash()==rootBefore, "m1a corrupt data did not yield a new authenticated root");
+    ChainError ee; Key anyk{}; memcpy(anyk.data(),kkTxid.data(),32);
+    CHECK(!t.erase(kk,&ee), "m1a erase on corrupt non-root leaf fails closed");
+    ChainError be; bool bf=true; CHECK(!t.existsTxidPrefix(kkTxid.data(),&bf,&be), "m1a BIP30 lookup on corrupt leaf fails closed");
+    ChainError se; std::vector<Key> ks; CHECK(!t.keysWithTxidPrefix(kkTxid.data(),&ks,&se), "m1a prefix scan on corrupt leaf fails closed");
+    CHECK(t.truncatedTail()==false, "m1a no tail truncation (aligned file)");
+    t.close();
+    // ---- (b) non-root INTERNAL page corruption must also fail closed
+    std::string dir2=freshDir("m1b");
+    BTree t2; CHECK(buildTreeDeep(dir2,3000,120,&t2,&e), "m1b deep build: "+e.str());
+    uint32_t iid=firstNonRootInternal(dir2+"/tree.dat",t2.rootId());
+    CHECK(iid!=0, "m1b found a non-root internal page");
+    if(iid){
+        int dep2=0; uint32_t lf2=walkFirstLeaf(dir2+"/tree.dat",iid,&dep2);
+        uint8_t lp2[4096]; readRaw(dir2+"/tree.dat",(long)lf2*4096,lp2,4096);
+        Key kk2; memcpy(kk2.data(),lp2+4,36);   // first key of the leftmost leaf under that internal page
+        std::vector<uint8_t> v2; bool f2=false; ChainError oe; CHECK(t2.get(kk2,&v2,&f2,&oe), "m1b get ok before corruption");
+        CHECK(flipByte(dir2+"/tree.dat",(long)iid*4096+8), "m1b flip non-root internal child hash byte");
+        ChainError ge2; bool gok2=t2.get(kk2,&v2,&f2,&ge2);
+        CHECK(!gok2 && ge2.code==ErrCode::CORRUPT, "m1b get under corrupt non-root internal fails closed");
+        ChainError pe2; CHECK(!t2.put(kk2,v2,&pe2), "m1b put under corrupt internal fails closed");
+    }
+    t2.close();
+    // ---- (c) store level: corrupt a non-root leaf in a multi-level store tree
+    std::string dir3=freshDir("m1c");
+    Hash lastcb; Hash lastTip; uint32_t lleaf=0xFFFFFFFFu; uint32_t lroot=0;
+    { CommitStore3A s; CHECK(s.open(dir3,&e), "m1c open: "+e.str()); Gen g; bool okb=true;
+      for(int h=1;h<=300;h++){ Block b=g.make(h); if(!publishStore(s,b,&e)){ CHECK(false,"m1c publish h="+std::to_string(h)+": "+e.str()); okb=false; break; } }
+      if(okb){ lastcb=g.coinbaseTxids.back(); lastTip=id32(0xB10C0000u,300); lroot=s.rootPageId(); uint32_t nid=s.tree().nextPageId();
+        int dep=0; uint32_t rl=walkFirstLeaf(dir3+"/tree.dat",lroot,&dep); (void)rl;
+        CHECK(dep>=2, "m1c store tree has a non-root leaf");
+        Key lk{}; memcpy(lk.data(),lastcb.data(),32);
+        lleaf=findLeafWithKey(dir3+"/tree.dat",nid,lk);
+        CHECK(lleaf!=0xFFFFFFFFu, "m1c located leaf holding the last coinbase key");
+        CHECK(lleaf!=lroot, "m1c target leaf is not the root page (non-root corruption)");
+      }
+      s.close(); }
+    if(lleaf!=0xFFFFFFFFu && lleaf!=lroot){
+        CHECK(flipByte(dir3+"/tree.dat",(long)lleaf*4096+42), "m1c flip non-root leaf in store");
+        OutPoint op; op.txid=lastcb; op.n=0;
+        { CommitStore3A r; bool ok=r.open(dir3,&e); CHECK(ok, "m1c open ok (root intact): "+e.str());
+          if(ok){ ChainError fe; Coin c; bool found=false;
+            bool gok=r.get(op,&c,&found,&fe); CHECK(!gok, "m1c store get on corrupt non-root leaf fails closed");
+            ChainError de; bool dok=r.disconnect(lastTip,&de); CHECK(!dok, "m1c disconnect touching corrupt leaf fails closed");
+            r.close(); } }
+        // ---- (d) restart over corruption: root verifies at open, corruption detected on access
+        { CommitStore3A r; bool ok=r.open(dir3,&e); CHECK(ok, "m1d restart open ok (root hash verified O(1))");
+          if(ok){ ChainError fe; Coin c; bool found=false;
+            CHECK(!r.get(op,&c,&found,&fe), "m1d after restart corrupt non-root leaf still fails closed"); r.close(); } }
+    }
+}
+
+static void test_p6_partial_append(){
+    g_cur="P6-partialappend";
+    ChainError e;
+    // expected NEW digest from a clean clone
+    std::string dirE=freshDir("p6e"); Hash d1e; CHECK(setupOne3A(dirE,&d1e,&e), "p6e setup: "+e.str());
+    uint64_t gNew=0; Hash dNew=expectedBlock2(dirE,&gNew,&e);
+    // in-process interrupted append (real short write, before any fsync)
+    for (size_t cut : { (size_t)1, (size_t)1500, (size_t)4095 }){
+        std::string tag="p6_"+std::to_string(cut); std::string dir=freshDir(tag); Hash d1; CHECK(setupOne3A(dir,&d1,&e), tag+" setup: "+e.str());
+        { CommitStore3A s; s.open(dir,&e); Block b=mkBlock2(); TreeReader tr(s.tree()); Delta d; buildDeltaI(tr,b,MAT,&d,&e);
+          s.injectPartialAppendOnce(cut);
+          struct timespec a,c2; clock_gettime(CLOCK_MONOTONIC,&a);
+          bool ok=s.publish(d,b.hash,2,&e); clock_gettime(CLOCK_MONOTONIC,&c2);
+          double ms=((c2.tv_sec-a.tv_sec)*1000.0+(c2.tv_nsec-a.tv_nsec)/1e6);
+          CHECK(!ok, tag+" publish fails on interrupted append");
+          if(cut==1500) printf("  P6 inject=%zu publishLatencyMs=%.3f\n", cut, ms);
+          s.close(); }
+        long sz=fileSize(dir+"/tree.dat");
+        CHECK(sz%4096!=(long)0, tag+" tree.dat left non-aligned by the interrupted append");
+        struct timespec a,c2; clock_gettime(CLOCK_MONOTONIC,&a);
+        CommitStore3A r; bool ok=r.open(dir,&e); clock_gettime(CLOCK_MONOTONIC,&c2);
+        double rms=((c2.tv_sec-a.tv_sec)*1000.0+(c2.tv_nsec-a.tv_nsec)/1e6);
+        CHECK(ok, tag+" recovers intact acknowledged generation: "+e.str());
+        if(ok){
+            CHECK(r.generation()==1, tag+" recovered generation == 1 (OLD retained)");
+            UtxoState st; storeToState(r,&st,&e); CHECK(st.digest()==d1, tag+" recovered digest == committed OLD");
+            CHECK(r.truncatedTreeTail(), tag+" reported unreferenced tail drop");
+            long sz2=fileSize(dir+"/tree.dat"); CHECK(sz2%4096==0 && sz2<=sz, tag+" tree aligned after recovery, no whole page lost");
+            CHECK(r.tree().verifyAll(&e), tag+" merkle verify after recovery");
+            if(cut==1500) printf("  P6 recoveryLatencyMs=%.3f\n", rms);
+            r.close();
+            CommitStore3A r2; CHECK(r2.open(dir,&e), tag+" repeated restart ok");
+            CHECK(r2.generation()==1 && !r2.truncatedTreeTail(), tag+" repeated restart idempotent (no further truncation)");
+            r2.tree().verifyAll(&e); r2.close();
+            // clean publish now reaches the NEW state identically to the clean clone
+            CommitStore3A s; s.open(dir,&e); Block b=mkBlock2(); TreeReader tr(s.tree()); Delta d; buildDeltaI(tr,b,MAT,&d,&e);
+            CHECK(s.publish(d,b.hash,2,&e), tag+" clean publish after recovery");
+            UtxoState st2; storeToState(s,&st2,&e); CHECK(st2.digest()==dNew, tag+" post-recovery state == clean NEW digest");
+            uint64_t g2=s.generation(); CHECK(g2==2, tag+" generation back to 2");
+            s.close();
+        }
+    }
+    // fork-crash variant: process dies right after the partial page hit the file
+    std::string dirF=freshDir("p6f"); Hash dF; CHECK(setupOne3A(dirF,&dF,&e), "p6f setup");
+    pid_t pid=fork();
+    if(pid==0){ ChainError ce; CommitStore3A s; if(!s.open(dirF,&ce)) ::_exit(2);
+        Block b=mkBlock2(); TreeReader tr(s.tree()); Delta d; if(!buildDeltaI(tr,b,MAT,&d,&ce)) ::_exit(3);
+        s.injectPartialAppendOnce(2000); s.publish(d,b.hash,2,&ce); ::_exit(42); }
+    int stt=0; waitpid(pid,&stt,0);
+    CHECK(WIFEXITED(stt)&&WEXITSTATUS(stt)==42, "p6f child died mid-append");
+    Hash dr; uint64_t gr; CHECK(recover3A(dirF,&dr,&gr,&e), "p6f reopen: "+e.str());
+    CHECK(gr==1 && dr==dF, "p6f fork-crash recovers committed gen1 intact");
+    CHECK(fileSize(dirF+"/tree.dat")%4096==0, "p6f tree aligned after fork-crash recovery");
+    Hash dr2; uint64_t gr2; CHECK(recover3A(dirF,&dr2,&gr2,&e), "p6f reopen2");
+    CHECK(dr2==dr&&gr2==gr, "p6f repeated recovery idempotent");
+}
+
 static long readVmHWM(){ FILE*f=fopen("/proc/self/status","r"); if(!f)return -1; char l[256]; long kb=-1; while(fgets(l,sizeof(l),f)){ if(strncmp(l,"VmHWM:",6)==0){ sscanf(l+6,"%ld",&kb); break; } } fclose(f); return kb; }
 
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"S1-scale",test_s1_scaling} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){

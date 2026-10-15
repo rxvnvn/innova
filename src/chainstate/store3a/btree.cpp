@@ -1,9 +1,11 @@
 // Stage 3A - copy-on-write paged B+tree implementation.
+// R1: authenticated (Merkle) traversal verification + unreferenced trailing-page recovery.
 #include "btree.h"
 #include <fcntl.h>
 #include <unistd.h>
 #include <cerrno>
 #include <cstring>
+#include <cstdio>
 
 namespace cs { namespace store3a {
 
@@ -75,7 +77,7 @@ bool decodeNode(const uint8_t* buf, Node* n, ChainError* e){
 void BTree::close(){ if (fd_>=0){ ::close(fd_); fd_=-1; } }
 
 bool BTree::create(const std::string& path, ChainError* e){
-    close(); path_=path; nextId_=0;
+    close(); path_=path; nextId_=0; truncatedTail_=false;
     fd_ = ::open(path.c_str(), O_RDWR|O_CREAT|O_TRUNC, 0644);
     if (fd_<0){ setErr(e,ErrCode::IO,"create tree "+path); return false; }
     Node root; root.type=NT_LEAF;
@@ -85,11 +87,24 @@ bool BTree::create(const std::string& path, ChainError* e){
     return true;
 }
 bool BTree::open(const std::string& path, ChainError* e){
-    close(); path_=path;
+    close(); path_=path; truncatedTail_=false;
     fd_ = ::open(path.c_str(), O_RDWR);
     if (fd_<0){ setErr(e,ErrCode::IO,"open tree "+path); return false; }
     off_t sz = ::lseek(fd_,0,SEEK_END);
-    if (sz<=0 || sz % (off_t)PAGE_SIZE != 0){ setErr(e,ErrCode::CORRUPT,"tree file size invalid"); return false; }
+    if (sz<0){ setErr(e,ErrCode::IO,"lseek tree"); return false; }
+    // R1 (S3A-3): a partial trailing page means an append was interrupted before its
+    // full PAGE_SIZE was written. Pages are only ever written at whole-page offsets and
+    // a referenced page is always fully written+fsynced before any MANIFEST that points
+    // to it becomes durable, so bytes past the last whole page are provably unreachable
+    // (never referenced by the committed root nor by the retained fallback root). Drop
+    // exactly that footer; never truncate a whole page.
+    if (sz % (off_t)PAGE_SIZE != 0){
+        off_t aligned = sz - (sz % (off_t)PAGE_SIZE);
+        if (::ftruncate(fd_, aligned)!=0){ setErr(e,ErrCode::FS,"truncate partial tree tail"); return false; }
+        if (::fsync(fd_)!=0){ setErr(e,ErrCode::FS,"fsync after tail truncate"); return false; }
+        truncatedTail_=true; sz=aligned;
+    }
+    if (sz<=0){ setErr(e,ErrCode::CORRUPT,"tree file empty/invalid"); return false; }
     nextId_ = (uint32_t)(sz/(off_t)PAGE_SIZE);
     return true;
 }
@@ -100,31 +115,42 @@ bool BTree::readPage(uint32_t id, uint8_t* buf, ChainError* e) const {
     if (fd_<0){ setErr(e,ErrCode::NOT_OPEN,"btree"); return false; }
     if (id>=nextId_){ setErr(e,ErrCode::CORRUPT,"page id out of range "+std::to_string(id)); return false; }
     ssize_t r = ::pread(fd_, buf, PAGE_SIZE, (off_t)id*PAGE_SIZE);
+    reads_++;
     if (r!=(ssize_t)PAGE_SIZE){ setErr(e,ErrCode::CORRUPT,"short page read "+std::to_string(id)); return false; }
+    return true;
+}
+// R1: read + decode + authenticate a page against its expected Merkle node hash.
+bool BTree::readNodeVerified(uint32_t id, const Hash& expect, Node* n, ChainError* e) const {
+    uint8_t buf[PAGE_SIZE]; if (!readPage(id,buf,e)) return false;
+    if (!decodeNode(buf,n,e)) return false;
+    Hash calc = (n->type==NT_LEAF)? leafHash(*n) : internalHash(*n);
+    if (memcmp(calc.data(),expect.data(),32)!=0){
+        setErr(e,ErrCode::CORRUPT,"node hash mismatch at page "+std::to_string(id)+" (corrupt/unauthenticated page)")
+        ; return false;
+    }
     return true;
 }
 bool BTree::appendPage(const uint8_t* buf, uint32_t* outId, ChainError* e){
     if (fd_<0){ setErr(e,ErrCode::NOT_OPEN,"btree"); return false; }
     uint32_t id=nextId_;
+    if (partialAppendBytes_>0){   // R1 test hook: simulated short/interrupted append
+        size_t nb=partialAppendBytes_; partialAppendBytes_=0;
+        if (nb>(size_t)PAGE_SIZE){ setErr(e,ErrCode::INTERNAL,"partial append size"); return false; }
+        if (::pwrite(fd_,buf,nb,(off_t)id*PAGE_SIZE)!=(ssize_t)nb){ setErr(e,ErrCode::IO,"injected short append"); return false; }
+        setErr(e,ErrCode::IO,"injected interrupted page append (short write)"); return false;
+    }
     if (::pwrite(fd_,buf,PAGE_SIZE,(off_t)id*PAGE_SIZE)!=(ssize_t)PAGE_SIZE){ setErr(e,ErrCode::IO,"append page"); return false; }
-    nextId_++; *outId=id; return true;
+    nextId_++; writes_++; *outId=id; return true;
 }
 
 bool BTree::setRoot(uint32_t id, const Hash& h, ChainError* e){
-    uint8_t buf[PAGE_SIZE]; if (!readPage(id,buf,e)) return false;
-    Node n; if (!decodeNode(buf,&n,e)) return false;
-    Hash calc = (n.type==NT_LEAF)? leafHash(n) : internalHash(n);
-    if (memcmp(calc.data(),h.data(),32)!=0){ setErr(e,ErrCode::CORRUPT,"root hash mismatch"); return false; }
+    Node n; if (!readNodeVerified(id,h,&n,e)) return false;
     rootId_=id; rootHash_=h; rootIsLeaf_=(n.type==NT_LEAF);
     rootCount_ = n.type==NT_LEAF ? n.entries.size() : (size_t)-1;
     return true;
 }
 bool BTree::checkRootHash(uint32_t id, const Hash& h, ChainError* e) const {
-    uint8_t buf[PAGE_SIZE]; if (!readPage(id,buf,e)) return false;
-    Node n; if (!decodeNode(buf,&n,e)) return false;
-    Hash calc = (n.type==NT_LEAF)? leafHash(n) : internalHash(n);
-    if (memcmp(calc.data(),h.data(),32)!=0){ setErr(e,ErrCode::CORRUPT,"root hash mismatch"); return false; }
-    return true;
+    Node n; return readNodeVerified(id,h,&n,e);
 }
 bool BTree::loadPage0AsRoot(ChainError* e){
     uint8_t buf[PAGE_SIZE]; if (!readPage(0,buf,e)) return false;
@@ -135,40 +161,36 @@ bool BTree::loadPage0AsRoot(ChainError* e){
 }
 
 bool BTree::get(const Key& k, std::vector<uint8_t>* val, bool* found, ChainError* e) const {
-    *found=false; uint32_t id=rootId_; uint8_t buf[PAGE_SIZE];
+    *found=false; uint32_t id=rootId_; Hash expect=rootHash_; Node n;
     for (int guard=0; guard<64; ++guard){
-        if (!readPage(id,buf,e)) return false;
-        Node n; if (!decodeNode(buf,&n,e)) return false;
+        if (!readNodeVerified(id,expect,&n,e)) return false;
         if (n.type==NT_LEAF){
             for (const LeafEntry& en: n.entries){ int c=keyCmp(en.key,k); if (c==0){ *val=en.val; *found=true; return true; } if (c>0) return true; }
             return true;
         }
-        size_t ci=0; while (ci<n.keys.size() && keyCmp(k,n.keys[ci])>=0) ++ci; id=n.children[ci];
+        size_t ci=0; while (ci<n.keys.size() && keyCmp(k,n.keys[ci])>=0) ++ci; id=n.children[ci]; expect=n.chashes[ci];
     }
     setErr(e,ErrCode::CORRUPT,"tree depth exceeded"); return false;
 }
 
 bool BTree::existsTxidPrefix(const uint8_t* txid32, bool* found, ChainError* e) const {
-    *found=false; uint32_t id=rootId_; uint8_t buf[PAGE_SIZE];
+    *found=false; uint32_t id=rootId_; Hash expect=rootHash_; Node n;
     for (int guard=0; guard<64; ++guard){
-        if (!readPage(id,buf,e)) return false;
-        Node n; if (!decodeNode(buf,&n,e)) return false;
+        if (!readNodeVerified(id,expect,&n,e)) return false;
         if (n.type==NT_LEAF){
             for (const LeafEntry& en: n.entries){ if (memcmp(en.key.data(),txid32,32)==0){ *found=true; return true; } }
             return true;
         }
-        // descend to the first subtree that may contain keys with prefix >= txid32||0
         size_t ci=0;
         for (size_t i=0;i<n.keys.size();++i){ if (memcmp(txid32,n.keys[i].data(),32) >= 0) ci=i+1; else break; }
-        id=n.children[ci];
+        id=n.children[ci]; expect=n.chashes[ci];
     }
     setErr(e,ErrCode::CORRUPT,"tree depth exceeded"); return false;
 }
 
-bool BTree::modRec(uint32_t id, const Key& k, const std::vector<uint8_t>* val,
+bool BTree::modRec(uint32_t id, const Hash& expect, const Key& k, const std::vector<uint8_t>* val,
                    uint32_t* outId, Hash* outHash, SplitResult* split, ChainError* e){
-    uint8_t buf[PAGE_SIZE]; if (!readPage(id,buf,e)) return false;
-    Node n; if (!decodeNode(buf,&n,e)) return false;
+    Node n; if (!readNodeVerified(id,expect,&n,e)) return false;
     split->split=false; split->rightId=0;
 
     if (n.type==NT_LEAF){
@@ -194,7 +216,7 @@ bool BTree::modRec(uint32_t id, const Key& k, const std::vector<uint8_t>* val,
     // internal
     size_t ci=0; while (ci<n.keys.size() && keyCmp(k,n.keys[ci])>=0) ++ci;
     uint32_t ncid; Hash nch; SplitResult csr;
-    if (!modRec(n.children[ci], k, val, &ncid, &nch, &csr, e)) return false;
+    if (!modRec(n.children[ci], n.chashes[ci], k, val, &ncid, &nch, &csr, e)) return false;
     n.children[ci]=ncid; n.chashes[ci]=nch;
     if (csr.split){ n.keys.insert(n.keys.begin()+ci, csr.sep); n.children.insert(n.children.begin()+ci+1, csr.rightId); n.chashes.insert(n.chashes.begin()+ci+1, csr.rightHash); }
     if (internalSize(n)<=PAGE_SIZE){
@@ -218,7 +240,7 @@ bool BTree::modRec(uint32_t id, const Key& k, const std::vector<uint8_t>* val,
 
 bool BTree::put(const Key& k, const std::vector<uint8_t>& val, ChainError* e){
     uint32_t nid; Hash nh; SplitResult sr;
-    if (!modRec(rootId_, k, &val, &nid, &nh, &sr, e)) return false;
+    if (!modRec(rootId_, rootHash_, k, &val, &nid, &nh, &sr, e)) return false;
     if (sr.split){
         Node r; r.type=NT_INTERNAL; r.children={nid, sr.rightId}; r.chashes={nh, sr.rightHash}; r.keys={sr.sep};
         uint8_t ob[PAGE_SIZE]; if(!encodeNode(r,ob)){ setErr(e,ErrCode::INTERNAL,"root overflow"); return false; }
@@ -229,50 +251,40 @@ bool BTree::put(const Key& k, const std::vector<uint8_t>& val, ChainError* e){
 }
 bool BTree::erase(const Key& k, ChainError* e){
     uint32_t nid; Hash nh; SplitResult sr;
-    if (!modRec(rootId_, k, NULL, &nid, &nh, &sr, e)) return false;
+    if (!modRec(rootId_, rootHash_, k, NULL, &nid, &nh, &sr, e)) return false;
     if (sr.split){ setErr(e,ErrCode::INTERNAL,"erase produced split"); return false; }
     rootId_=nid; rootHash_=nh; return true;
 }
 
-bool BTree::collectRec(uint32_t id, std::vector<LeafEntry>* out, ChainError* e) const {
-    uint8_t buf[PAGE_SIZE]; if (!readPage(id,buf,e)) return false;
-    Node n; if (!decodeNode(buf,&n,e)) return false;
+bool BTree::collectRec(uint32_t id, const Hash& expect, std::vector<LeafEntry>* out, ChainError* e) const {
+    Node n; if (!readNodeVerified(id,expect,&n,e)) return false;
     if (n.type==NT_LEAF){ for (const LeafEntry& en: n.entries) out->push_back(en); return true; }
-    for (uint32_t cid: n.children) if (!collectRec(cid,out,e)) return false;
+    for (size_t i=0;i<n.children.size();++i) if (!collectRec(n.children[i],n.chashes[i],out,e)) return false;
     return true;
 }
 bool BTree::collectAll(std::vector<LeafEntry>* out, ChainError* e) const {
     out->clear();
-    if (rootIsLeaf_){ // root may be leaf; read it directly
-        uint8_t buf[PAGE_SIZE]; if(!readPage(rootId_,buf,e)) return false; Node n; if(!decodeNode(buf,&n,e)) return false;
-        for (const LeafEntry& en: n.entries) out->push_back(en); return true;
-    }
-    return collectRec(rootId_, out, e);
+    return collectRec(rootId_, rootHash_, out, e);
 }
 bool BTree::verifyRec(uint32_t id, const Hash& expect, ChainError* e) const {
-    uint8_t buf[PAGE_SIZE]; if (!readPage(id,buf,e)) return false;
-    Node n; if (!decodeNode(buf,&n,e)) return false;
-    Hash calc = (n.type==NT_LEAF)? leafHash(n) : internalHash(n);
-    if (memcmp(calc.data(),expect.data(),32)!=0){ setErr(e,ErrCode::CORRUPT,"node hash mismatch at page "+std::to_string(id)); return false; }
+    Node n; if (!readNodeVerified(id,expect,&n,e)) return false;
     if (n.type==NT_INTERNAL){ for (size_t i=0;i<n.children.size();++i) if(!verifyRec(n.children[i], n.chashes[i], e)) return false; }
     return true;
 }
 bool BTree::verifyAll(ChainError* e) const { return verifyRec(rootId_, rootHash_, e); }
 
-bool BTree::keysPrefixRec(uint32_t id, const Key& lo, const Key& hi, std::vector<Key>* out, ChainError* e) const {
-    uint8_t buf[PAGE_SIZE]; if (!readPage(id,buf,e)) return false;
-    Node n; if (!decodeNode(buf,&n,e)) return false;
+bool BTree::keysPrefixRec(uint32_t id, const Hash& expect, const Key& lo, const Key& hi, std::vector<Key>* out, ChainError* e) const {
+    Node n; if (!readNodeVerified(id,expect,&n,e)) return false;
     if (n.type==NT_LEAF){
         for (const LeafEntry& en: n.entries){ if (keyCmp(en.key,lo)>=0 && keyCmp(en.key,hi)<=0) out->push_back(en.key); }
         return true;
     }
     size_t count=n.keys.size();
     for (size_t i=0;i<count+1;++i){
-        // child i holds keys in [ (i==0 ? -inf : keys[i-1]) , (i==count ? +inf : keys[i]) )
         bool overlap = true;
-        if (i>0 && keyCmp(n.keys[i-1], hi) > 0) overlap=false;   // child lower bound beyond hi
-        if (i<count && keyCmp(n.keys[i], lo) < 0) overlap=false;  // child upper bound below lo
-        if (overlap) if (!keysPrefixRec(n.children[i], lo, hi, out, e)) return false;
+        if (i>0 && keyCmp(n.keys[i-1], hi) > 0) overlap=false;
+        if (i<count && keyCmp(n.keys[i], lo) < 0) overlap=false;
+        if (overlap) if (!keysPrefixRec(n.children[i], n.chashes[i], lo, hi, out, e)) return false;
     }
     return true;
 }
@@ -280,8 +292,7 @@ bool BTree::keysWithTxidPrefix(const uint8_t* txid32, std::vector<Key>* out, Cha
     out->clear();
     Key lo{}, hi{}; memcpy(lo.data(),txid32,32); memcpy(hi.data(),txid32,32);
     for (int i=0;i<4;i++){ lo[32+i]=0x00; hi[32+i]=0xff; }
-    return keysPrefixRec(rootId_, lo, hi, out, e);
+    return keysPrefixRec(rootId_, rootHash_, lo, hi, out, e);
 }
 
 }} // namespace cs::store3a
-
