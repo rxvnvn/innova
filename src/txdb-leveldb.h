@@ -16,6 +16,48 @@
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 
+// ---------------------------------------------------------------------------
+// ARCHIVE-1 archive enumeration (Stage 3B-D1-S0-F1) — read-only, internal.
+//
+// The reset-path guard has to answer one question truthfully: "is the set of block-archive files
+// still the set that was there before the index was reset?". That needs an enumeration which
+// (a) cannot mistake a near-miss name for a block file, (b) classifies symlinks and other
+// non-regular entries explicitly instead of following them blindly, and (c) fails CLOSED when the
+// directory cannot be read at all: an unverifiable archive is never reported as a verified one.
+//
+// Declared here (rather than static in the .cpp) only so the regression suite can exercise the
+// classification directly on synthetic directories; production reaches it through init_blockindex.
+// ---------------------------------------------------------------------------
+enum ArchiveScanStatus {
+    ARCHIVE_SCAN_OK = 0,           // every archive-named entry is a usable (regular-file) payload
+    ARCHIVE_SCAN_DATADIR_INVALID,  // datadir missing, not a directory, or not examinable at all
+    ARCHIVE_SCAN_UNREADABLE,       // datadir exists but could not be enumerated (permissions / I/O)
+    ARCHIVE_SCAN_ENTRY_BAD         // an archive-named entry is not a usable payload (non-regular
+                                   // file, dangling symlink, or its type could not be determined)
+};
+
+// One archive enumeration. `payloads` = the archive-named entries that ARE usable payloads (regular
+// files, or symlinks resolving to a regular file); these are what a reset must leave untouched.
+// `notes` = explicit classification lines for entries accepted with a caveat; `detail` explains a
+// non-OK status.
+struct ArchiveScan {
+    ArchiveScanStatus status;
+    std::string detail;
+    std::vector<std::string> payloads;
+    std::vector<std::string> notes;
+};
+
+// Name grammar of a block-archive file: "blk" + 4..10 decimal digits + ".dat" (the writer emits
+// strprintf("blk%04u.dat", nFile) with an unsigned int nFile, so 4 digits is the minimum and 10 the
+// maximum). Everything else — near-misses such as "blk1.dat", "blk0001.DAT", "blk0001.dat.bak",
+// "xblk0001.dat", "blk 0001.dat" — is NOT archive data and must never be counted as a block file.
+bool IsBlockArchiveName(const std::string& name);
+
+// Read-only enumeration of the block archive in `dir`. Never creates, renames, truncates or removes
+// anything, and never reads block payloads (the cost is bounded by the NUMBER of entries, never by
+// their size — a 2 GB blk file costs one directory entry).
+ArchiveScan ScanBlockArchive(const boost::filesystem::path& dir);
+
 // Class that provides access to a LevelDB. Note that this class is frequently
 // instantiated on the stack and then destroyed again, so instantiation has to
 // be very cheap. Unfortunately that means, a CTxDB instance is actually just a
