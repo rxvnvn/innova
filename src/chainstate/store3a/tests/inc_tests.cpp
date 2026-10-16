@@ -2138,10 +2138,447 @@ static void test_r3_postlstat(){
 
 static long readVmHWM(){ FILE*f=fopen("/proc/self/status","r"); if(!f)return -1; char l[256]; long kb=-1; while(fgets(l,sizeof(l),f)){ if(strncmp(l,"VmHWM:",6)==0){ sscanf(l+6,"%ld",&kb); break; } } fclose(f); return kb; }
 
+
+// ===========================================================================
+// S1.1 -- UNDOIDX: durable segmented undo index (format, validation, states, cost)
+// ===========================================================================
+static std::string slurp(const std::string& p){ FILE* f=fopen(p.c_str(),"rb"); if(!f) return std::string(); std::string s; char b[8192]; size_t n; while((n=fread(b,1,sizeof(b),f))>0) s.append(b,n); fclose(f); return s; }
+static bool spill(const std::string& p, const std::string& d){ FILE* f=fopen(p.c_str(),"wb"); if(!f) return false; bool ok=(d.empty()||fwrite(d.data(),1,d.size(),f)==d.size()); fclose(f); return ok; }
+static bool appendRaw(const std::string& p, size_t n, uint8_t v){ FILE* f=fopen(p.c_str(),"ab"); if(!f) return false; bool ok=true; for(size_t i=0;i<n;i++) if(fputc((int)v,f)==EOF){ ok=false; break; } fclose(f); return ok; }
+static std::string ixp(const std::string& d){ return d+"/UNDOINDEX"; }
+static const char* ixName(UndoIndexState s){
+    switch(s){ case UndoIndexState::None: return "None"; case UndoIndexState::Current: return "Current";
+               case UndoIndexState::Absent: return "Absent"; case UndoIndexState::Stale: return "Stale";
+               case UndoIndexState::Ahead: return "Ahead"; case UndoIndexState::Corrupt: return "Corrupt"; }
+    return "?"; }
+static uint64_t ixExpectedBytes(uint32_t S, size_t segments){ (void)S; uint64_t t=0; for(size_t i=1;i<=segments;i++) t += 48u + 24u*(uint64_t)i; return t; }
+static void ixSetU64(std::string& m, size_t off, uint64_t v){ for(int k=0;k<8;k++) m[off+k]=(char)((v>>(8*k))&0xFF); }
+static void ixSetU32(std::string& m, size_t off, uint32_t v){ for(int k=0;k<4;k++) m[off+k]=(char)((v>>(8*k))&0xFF); }
+static uint64_t ixGetU64(const std::string& m, size_t off){ uint64_t v=0; for(int k=0;k<8;k++) v|=(uint64_t)(uint8_t)m[off+k]<<(8*k); return v; }
+static void ixFixSegCrc(std::string& m, size_t i){ uint32_t c=csCrc32((const uint8_t*)&m[48+24*i],20); ixSetU32(m,48+24*i+20,c); }
+static void ixFixHdrCrc(std::string& m){ uint32_t c=csCrc32((const uint8_t*)&m[0],44); ixSetU32(m,44,c); }
+
+// (1) format round-trip + structural rejection
+static void test_undoidx_format(){
+    g_cur="UNDOIDX-format";
+    UndoIndex a; a.formatVersion=UNDOINDEX_FORMAT_VERSION; a.segmentSize=4;
+    for(int i=1;i<=3;i++){ UndoSegment s; s.startOffset=(uint64_t)(i-1)*1365; s.endOffset=(uint64_t)i*1365; s.recordCount=4; a.segments.push_back(s); }
+    a.committedBytes=a.segments.back().endOffset;
+    std::vector<uint8_t> b1=a.encode(), b2=a.encode();
+    CHECK(b1.size()==48+24*3, "format: encoded size is 48+24*N");
+    CHECK(b1==b2, "format: encode is deterministic");
+    CHECK(b1.size()>=8 && memcmp(b1.data(),"INNUIDX1",8)==0, "format: magic is INNUIDX1");
+    ChainError e; UndoIndex c;
+    CHECK(UndoIndex::decode(b1.data(),b1.size(),&c,&e), "format: round-trip decode: "+e.str());
+    CHECK(c.formatVersion==1 && c.segmentSize==4 && c.segments.size()==3, "format: header + count round-trip");
+    CHECK(c.committedBytes==a.committedBytes && c.baseOffset==0 && c.baseGeneration==0, "format: metadata round-trip");
+    CHECK(c.segments[2].startOffset==a.segments[2].startOffset && c.segments[2].endOffset==a.segments[2].endOffset && c.segments[2].recordCount==4, "format: last segment round-trip");
+    CHECK(c.encode()==b1, "format: re-encode is byte-identical");
+    std::string g((const char*)b1.data(), b1.size());
+    { std::string m=g; m[0]=(char)0x00; UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: bad magic rejected"); CHECK(e2.str().find("magic")!=std::string::npos,"format: bad magic diagnostic"); }
+    { std::string m=g; ixSetU32(m,8,9); ixFixHdrCrc(m); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: unsupported version rejected"); }
+    { std::string m=g; ixSetU32(m,12,0); ixFixHdrCrc(m); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: segment size 0 rejected"); }
+    { std::string m=g; m[46]=(char)(m[46]^0xFF); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: header crc mismatch rejected"); }
+    { std::string m=g; m[48+2]=(char)(m[48+2]^0xFF); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: segment crc mismatch rejected"); }
+    { std::string m=g; ixSetU32(m,40,4); ixFixHdrCrc(m); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: declared segment count vs length rejected"); }
+    { std::string m=g.substr(0,60); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: truncated index rejected"); }
+    { std::string m=g; m.append(8,(char)0); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: trailing bytes rejected"); }
+    { std::string m=g; ixSetU32(m,48+16,0); ixFixSegCrc(m,0); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: recordCount 0 rejected"); }
+    { std::string m=g; ixSetU32(m,48+16,5); ixFixSegCrc(m,0); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: recordCount > segmentSize rejected"); }
+    { std::string m=g; ixSetU64(m,48+8,ixGetU64(m,48)); ixFixSegCrc(m,0); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: non-positive segment length rejected"); }
+    { std::string m=g; ixSetU64(m,48+0,7); ixFixSegCrc(m,0); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: first segment not at baseOffset rejected"); }
+    { std::string m=g; ixSetU64(m,48+24+0,999999); ixFixSegCrc(m,1); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: non-contiguous segments rejected"); }
+    { std::string m=g; ixSetU64(m,16,4242); ixFixHdrCrc(m); UndoIndex t; ChainError e2; CHECK(!UndoIndex::decode((const uint8_t*)m.data(),m.size(),&t,&e2),"format: committedBytes != last segment end rejected"); }
+}
+
+// (2) segment boundary behaviour (test segment size 4; the 4095/4096/4097 run is UNDOIDX-real_boundary)
+static void test_undoidx_boundary_small(){
+    g_cur="UNDOIDX-boundary";
+    ChainError e; std::string d=freshDir("undoidx_boundary");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4);
+      CHECK(s.open(d,&e), "boundary open: "+e.str());
+      CHECK(s.undoIndexSegmentSize()==4, "boundary: test segment size applied");
+      for(int i=1;i<=3;i++) CHECK(PUB(s,i,1,1,3,&e), "boundary: publish 3");
+      CHECK(!fexists(ixp(d)), "boundary: 3/4 records -> no closed segment -> no UNDOINDEX");
+      CHECK(s.undoIndexPublications()==0, "boundary: zero publications at 3 records");
+      CHECK(PUB(s,4,1,1,3,&e), "boundary: publish 4");
+      CHECK(fexists(ixp(d)), "boundary: 4/4 records -> segment closed -> UNDOINDEX published");
+      CHECK(s.undoIndexPublications()==1, "boundary: exactly one publication at 4 records");
+      uint64_t man4=MAN(d);
+      UndoIndex ix; CHECK(s.readUndoIndexForTest(&ix,&e), "boundary: index readable: "+e.str());
+      CHECK(ix.segmentSize==4 && ix.segments.size()==1 && ix.segments[0].recordCount==4, "boundary: one 4-record segment");
+      CHECK(ix.segments[0].startOffset==0, "boundary: first segment starts at baseOffset 0");
+      CHECK(ix.committedBytes==man4, "boundary: committedBytes == MANIFEST.undoSize at a closed boundary");
+      for(int i=5;i<=7;i++) CHECK(PUB(s,i,1,1,3,&e), "boundary: publish 7");
+      CHECK(s.undoIndexPublications()==1, "boundary: 7 records -> still one closed segment");
+      CHECK(PUB(s,8,1,1,3,&e), "boundary: publish 8");
+      CHECK(s.undoIndexPublications()==2, "boundary: second publication at 8 records");
+      UndoIndex ix2; CHECK(s.readUndoIndexForTest(&ix2,&e) && ix2.segments.size()==2, "boundary: two segments at 8 records");
+      CHECK(ix2.segments[1].startOffset==ix2.segments[0].endOffset, "boundary: segments are contiguous");
+      CHECK(ix2.committedBytes==MAN(d) && MAN(d)>man4, "boundary: committedBytes tracked the second boundary");
+      CHECK(s.undoCount()==8, "boundary: undoCount unchanged by index construction");
+      s.close(); }
+    uint64_t bytes8=(uint64_t)fsz(ixp(d));
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4);
+      CHECK(s.open(d,&e), "boundary reopen: "+e.str());
+      CHECK(s.undoIndexState()==UndoIndexState::Current, "boundary reopen: Current (no normalisation)");
+      CHECK(s.undoIndexPublications()==0, "boundary reopen: no publication for a current index");
+      CHECK((uint64_t)fsz(ixp(d))==bytes8, "boundary reopen: index bytes untouched");
+      CHECK(s.undoCount()==8, "boundary reopen: undoCount preserved");
+      s.close(); }
+}
+
+// (3) corruption / structural damage -> fail closed, and the store itself is untouched
+static void test_undoidx_corruption(){
+    g_cur="UNDOIDX-corrupt";
+    ChainError e; std::string d=freshDir("undoidx_corrupt");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4);
+      CHECK(s.open(d,&e), "corrupt open: "+e.str());
+      for(int i=1;i<=5;i++) CHECK(PUB(s,i,1,1,3,&e), "corrupt: publish 5");
+      CHECK(s.undoIndexPublications()==1, "corrupt: one closed segment published");
+      s.close(); }
+    std::string good=slurp(ixp(d));
+    Hash f0dig=fdig(ixp(d));
+    CHECK(good.size()==48+24, "corrupt: index is 72 bytes for one closed segment");
+    struct Variant{ const char* name; int kind; };
+    const Variant vs[]={ {"bad magic",0},{"bad version",1},{"header crc",2},{"segment crc",3},
+                         {"truncated",4},{"trailing bytes",5},{"count>segmentSize",6},{"recordCount 0",7},
+                         {"first segment off base",8},{"committedBytes mismatch",9} };
+    for(size_t v=0; v<sizeof(vs)/sizeof(vs[0]); ++v){
+        std::string m=good;
+        switch(vs[v].kind){
+            case 0: m[0]=(char)0x7F; break;
+            case 1: ixSetU32(m,8,7); ixFixHdrCrc(m); break;
+            case 2: m[45]=(char)(m[45]^0x01); break;
+            case 3: m[48+3]=(char)(m[48+3]^0x01); break;
+            case 4: m=m.substr(0,60); break;
+            case 5: m.append(4,(char)0); break;
+            case 6: ixSetU32(m,48+16,9); ixFixSegCrc(m,0); break;
+            case 7: ixSetU32(m,48+16,0); ixFixSegCrc(m,0); break;
+            case 8: ixSetU64(m,48+0,11); ixFixSegCrc(m,0); break;
+            case 9: ixSetU64(m,16,77); ixFixHdrCrc(m); break;
+        }
+        CHECK(spill(ixp(d),m), "corrupt: variant written");
+        CommitStore3A s; ChainError e2; bool ok=s.open(d,&e2);
+        CHECK(!ok, std::string("corrupt: ")+vs[v].name+" refused");
+        CHECK(e2.str().find("UNDOINDEX")!=std::string::npos, std::string("corrupt: ")+vs[v].name+" diagnostic names UNDOINDEX");
+        if(ok) s.close();
+        CHECK(spill(ixp(d),good), "corrupt: good index restored");
+        CommitStore3A s2; s2.setUndoIndexSegmentSizeForTest(4); ChainError e3; bool ok2=s2.open(d,&e3);
+        CHECK(ok2, std::string("corrupt: store unaffected after ")+vs[v].name+": "+e3.str());
+        if(ok2){ CHECK(s2.undoIndexState()==UndoIndexState::Current, std::string("corrupt: Current after restoring from ")+vs[v].name);
+                 CHECK(s2.undoCount()==5, std::string("corrupt: undoCount 5 after ")+vs[v].name); s2.close(); }
+    }
+    CHECK(!fexists(ixp(d)+".tmp"), "corrupt: no UNDOINDEX.tmp left behind");
+    // (b) a torn/unfinished publication residue must have no effect and must be swept at open
+    { std::string junk="INNUIDX1partial-write-residue"; CHECK(spill(ixp(d)+".tmp",junk), "corrupt: torn tmp residue written");
+      CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); ChainError e4; bool ok=s.open(d,&e4);
+      CHECK(ok, "corrupt: open with a torn UNDOINDEX.tmp residue: "+e4.str());
+      CHECK(s.undoIndexState()==UndoIndexState::Current, "corrupt: valid index still Current despite the torn tmp");
+      CHECK(s.undoCount()==5, "corrupt: committed state unaffected by the torn tmp");
+      CHECK(fdig(ixp(d))==f0dig, "corrupt: index bytes unchanged by the torn tmp");
+      s.close();
+      CHECK(!fexists(ixp(d)+".tmp"), "corrupt: torn tmp residue swept by cleanupTmp at open"); }
+    // (c) a torn tmp residue with NO index file: rebuilt from the committed stream, residue swept
+    { CHECK(unlink(ixp(d).c_str())==0, "corrupt: index removed for the rebuild-with-residue case");
+      CHECK(spill(ixp(d)+".tmp","INNUIDX1partial"), "corrupt: residue written without an index");
+      CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); ChainError e5; bool ok=s.open(d,&e5);
+      CHECK(ok, "corrupt: open with residue and no index: "+e5.str());
+      CHECK(s.undoIndexState()==UndoIndexState::Absent, "corrupt: absent index classified Absent even with a residue");
+      CHECK(fdig(ixp(d))==f0dig, "corrupt: rebuilt index identical after a residue-only start");
+      CHECK(!fexists(ixp(d)+".tmp"), "corrupt: residue swept in the rebuild case");
+      s.close(); }
+}
+
+// (4) missing / stale / ahead / current states
+static void test_undoidx_states(){
+    g_cur="UNDOIDX-states";
+    ChainError e;
+    std::string d=freshDir("undoidx_states_a");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d,&e), "states a open: "+e.str());
+      for(int i=1;i<=5;i++) CHECK(PUB(s,i,1,1,3,&e), "states a publish 5"); s.close(); }
+    std::string good=slurp(ixp(d)); Hash h0=fdig(ixp(d));
+    CHECK(good.size()==48+24, "states a: one closed segment for 5 records");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d,&e), "states a reopen: "+e.str());
+      CHECK(s.undoIndexState()==UndoIndexState::Current, "states a: current index classified Current");
+      CHECK(s.undoIndexPublications()==0, "states a: no write for a current index");
+      CHECK(fdig(ixp(d))==h0, "states a: index bytes identical after reopen");
+      CHECK(s.undoCount()==5, "states a: undoCount 5"); s.close(); }
+    CHECK(unlink(ixp(d).c_str())==0, "states b: index removed to simulate a missing index");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d,&e), "states b reopen: "+e.str());
+      CHECK(s.undoIndexState()==UndoIndexState::Absent, "states b: missing index classified Absent");
+      CHECK(s.undoIndexPublications()==1, "states b: rebuilt exactly once");
+      CHECK(fdig(ixp(d))==h0, "states b: rebuilt bytes identical to the original");
+      CHECK(s.undoCount()==5, "states b: undoCount preserved"); s.close(); }
+    std::string d2=freshDir("undoidx_states_c");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d2,&e), "states c open: "+e.str());
+      for(int i=1;i<=4;i++) CHECK(PUB(s,i,1,1,3,&e), "states c publish 4");
+      CHECK(s.undoIndexPublications()==1, "states c: first close published");
+      s.injectUndoIndexSkipNextPublish();
+      for(int i=5;i<=8;i++) CHECK(PUB(s,i,1,1,3,&e), "states c publish 8");
+      CHECK(s.undoIndexPublications()==1, "states c: second close publication lost (simulated)");
+      s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d2,&e), "states c reopen: "+e.str());
+      CHECK(s.undoIndexState()==UndoIndexState::Stale, "states c: shortened prefix classified Stale");
+      CHECK(s.undoIndexPublications()==1, "states c: rebuilt once on open");
+      UndoIndex ix; CHECK(s.readUndoIndexForTest(&ix,&e) && ix.segments.size()==2, "states c: rebuilt to two segments");
+      CHECK(ix.committedBytes==MAN(d2), "states c: rebuilt committedBytes == MANIFEST.undoSize");
+      CHECK(s.undoCount()==8, "states c: no committed record lost (8)"); s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d2,&e), "states c reopen2: "+e.str());
+      CHECK(s.undoIndexState()==UndoIndexState::Current, "states c: Current after the rebuild");
+      CHECK(s.undoIndexPublications()==0, "states c: no repeated rebuild"); s.close(); }
+    std::string d3=freshDir("undoidx_states_d");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d3,&e), "states d open: "+e.str());
+      for(int i=1;i<=4;i++) CHECK(PUB(s,i,1,1,3,&e), "states d publish 4");
+      Hash tip=s.tipHash(); CHECK(s.disconnect(tip,&e), "states d: disconnect tip: "+e.str());
+      CHECK(s.undoCount()==3, "states d: undoCount 3 after disconnect"); s.close(); }
+    uint64_t manAfter=MAN(d3);
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d3,&e), "states d reopen: "+e.str());
+      CHECK(s.undoIndexState()==UndoIndexState::Ahead, "states d: index beyond the committed range classified Ahead (not corruption)");
+      CHECK(s.undoCount()==3, "states d: committed state is 3 records");
+      UndoIndex ix; CHECK(s.readUndoIndexForTest(&ix,&e), "states d: index readable: "+e.str());
+      CHECK(ix.segments.empty() && ix.committedBytes==0, "states d: uncommitted segment dropped by normalisation");
+      CHECK(MAN(d3)==manAfter, "states d: MANIFEST.undoSize untouched by the normalisation"); s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d3,&e), "states d reopen2: "+e.str());
+      CHECK(s.undoIndexState()==UndoIndexState::Current, "states d: Current after normalisation"); s.close(); }
+    // (e) OPEN-2: an UNDOINDEX in a store with no MANIFEST/ACK (fresh-open path) is neither trusted,
+    //     consumed, rewritten nor deleted by this slice.
+    std::string d4=freshDir("undoidx_states_e");
+    { UndoIndex ix; ix.segmentSize=4; UndoSegment sg; sg.startOffset=0; sg.endOffset=1365; sg.recordCount=4;
+      ix.segments.push_back(sg); ix.committedBytes=1365;
+      std::vector<uint8_t> b=ix.encode(); CHECK(spill(ixp(d4),std::string((const char*)b.data(),b.size())), "states e: orphan index written"); }
+    Hash h4=fdig(ixp(d4));
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); ChainError e6; bool ok=s.open(d4,&e6);
+      CHECK(ok, "states e: fresh-open with an orphan index succeeds (R2 fresh-open contract unchanged): "+e6.str());
+      CHECK(s.undoIndexState()==UndoIndexState::None, "states e: orphan index is not classified (fresh path never reads it)");
+      CHECK(fdig(ixp(d4))==h4, "states e: orphan index neither rewritten nor deleted");
+      CHECK(s.undoCount()==0, "states e: fresh store has no undo records");
+      s.close(); }
+}
+
+
+// (5) atomic publication: interruption points of the commit that closes a segment
+static void idxChild(const std::string& dir, int mode, int n, uint32_t S){
+    ChainError e; CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+    if(!s.open(dir,&e)) ::_exit(2);
+    // Publish exactly ONE fresh record: this is the record that closes the segment under test.
+    if(mode==0) s.setCrashPoint(CrashPoint::AfterUndoWrite);
+    if(mode==1) s.setCrashPoint(CrashPoint::BeforeRename);
+    if(mode==2) s.setCrashPoint(CrashPoint::AfterRename);
+    if(mode==3) s.setCrashPoint(CrashPoint::AfterDirSync);
+    bool ok=PUB(s,n,9,9,3,&e);
+    if(mode==4) ::_exit(ok?0:1);
+    ::_exit(42);
+}
+static void test_undoidx_crash_points(){
+    g_cur="UNDOIDX-crash";
+    ChainError e;
+    Hash ctlDig; uint64_t ctlGen=0, ctlMan=0;
+    { std::string dc=freshDir("undoidx_crash_ctl"); CommitStore3A s; s.injectUndoIndexDisabled(true);
+      CHECK(s.open(dc,&e), "crash control open: "+e.str());
+      for(int i=1;i<=3;i++) CHECK(PUB(s,i,1,1,3,&e), "crash control publish");
+      ctlDig=DG(s,&e); ctlGen=s.generation(); ctlMan=MAN(dc);
+      CHECK(!fexists(ixp(dc)), "crash control: index disabled -> no UNDOINDEX");
+      s.close(); }
+    const char* names[]={"AfterUndoWrite","BeforeRename","AfterRename","AfterDirSync"};
+    for(int mode=0; mode<4; ++mode){
+        std::string d=freshDir(std::string("undoidx_crash_")+names[mode]);
+        { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); CHECK(s.open(d,&e), "crash build open: "+e.str());
+          for(int i=1;i<=3;i++) CHECK(PUB(s,i,1,1,3,&e), "crash build publish 3");
+          CHECK(!fexists(ixp(d)), "crash build: no index before the boundary"); s.close(); }
+        int rc=-1;
+        { int pid=fork(); if(pid==0) idxChild(d,mode,4,4);
+          int st=0; if(pid>0) waitpid(pid,&st,0); rc=(pid>0 && WIFEXITED(st)) ? WEXITSTATUS(st) : -1; }
+        CHECK(rc==42, std::string("crash ")+names[mode]+": child terminated at the injected point");
+        CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4);
+        bool ok=s.open(d,&e);
+        CHECK(ok, std::string("crash ")+names[mode]+": reopen: "+e.str());
+        if(!ok) continue;
+        UndoIndexState stt=s.undoIndexState();
+        if(mode==0){
+            CHECK(stt==UndoIndexState::Absent, "crash AfterUndoWrite: index absent -> rebuilt (publication happens after the hook)");
+            CHECK(s.undoCount()==3, "crash AfterUndoWrite: 3 records committed");
+        } else if(mode==1){
+            CHECK(stt==UndoIndexState::Ahead, "crash BeforeRename: index ahead of the manifest -> Ahead, not corruption");
+            CHECK(s.undoCount()==3, "crash BeforeRename: the uncommitted 4th record is NOT authoritative");
+        } else {
+            CHECK(stt==UndoIndexState::Current, std::string("crash ")+names[mode]+": index matches the committed manifest");
+            CHECK(s.undoCount()==4, std::string("crash ")+names[mode]+": 4 records committed");
+        }
+        Hash dig=DG(s,&e);
+        if(mode<=1){
+            CHECK(dig==ctlDig, "crash: committed logical state equals the 3-record control");
+            CHECK(s.generation()==ctlGen, "crash: generation equals the control");
+            CHECK(MAN(d)==ctlMan, "crash: MANIFEST.undoSize equals the control");
+        }
+        s.close();
+        { CommitStore3A s2; s2.setUndoIndexSegmentSizeForTest(4); CHECK(s2.open(d,&e), "crash idempotent reopen: "+e.str());
+          // With fewer records than one segment there is nothing to index: the consistent states are
+          // Current (an empty index is present) or Absent (no index file at all).
+          const UndoIndexState s2st=s2.undoIndexState();
+          CHECK(s2st==UndoIndexState::Current || s2st==UndoIndexState::Absent,
+                std::string("crash: index consistent after the first reopen (")+ixName(s2st)+")");
+          CHECK(s2.undoIndexPublications()==0, "crash: second reopen performs no index write");
+          CHECK(s2.undoCount()==(mode<=1?3:4), "crash: undoCount stable across reopen");
+          s2.close(); }
+        if(mode==0){
+            CommitStore3A s3; s3.setUndoIndexSegmentSizeForTest(4); CHECK(s3.open(d,&e), "crash AfterUndoWrite: store usable");
+            CHECK(PUB(s3,4,1,1,3,&e), "crash AfterUndoWrite: a later publication succeeds");
+            CHECK(s3.undoCount()==4, "crash AfterUndoWrite: the recovered store commits normally");
+            CHECK(s3.undoIndexPublications()==1, "crash AfterUndoWrite: the boundary is published on the recovery publish");
+            s3.close(); }
+    }
+}
+
+// (6) no side effects: identical operation sequence, index enabled vs disabled
+struct IdxSnap { uint64_t gen=0, man=0; size_t n=0; Hash dig, undod, treed, manif, ackd; bool hasIdx=false; };
+static bool runSequence(const std::string& d, bool idxEnabled, std::vector<IdxSnap>* out, ChainError* e){
+    CommitStore3A s; s.setUndoIndexSegmentSizeForTest(4); s.injectUndoIndexDisabled(!idxEnabled);
+    if(!s.open(d,e)) return false;
+    auto snap=[&](){ IdxSnap x; x.gen=s.generation(); x.man=MAN(d); UtxoState st; storeToState(s,&st,e);
+                     x.dig=st.digest(); x.undod=fdig(d+"/undo.dat"); x.treed=fdig(d+"/tree.dat");
+                     x.manif=fdig(d+"/MANIFEST"); x.ackd=fexists(d+"/ACK")?fdig(d+"/ACK"):Hash();
+                     x.n=s.undoCount(); x.hasIdx=fexists(ixp(d)); out->push_back(x); };
+    for(int i=1;i<=6;i++) if(!PUB(s,i,1,1,3,e)) return false;
+    snap();
+    { Hash tip=s.tipHash(); if(!s.disconnect(tip,e)) return false; }
+    snap();
+    if(!PUB(s,7,1,1,3,e)) return false;
+    snap();
+    s.close();
+    s.injectUndoIndexDisabled(!idxEnabled); if(!s.open(d,e)) return false;
+    snap();
+    { Hash tip=s.tipHash(); if(!s.disconnect(tip,e)) return false; }
+    snap();
+    if(!PUB(s,8,1,1,3,e)) return false;
+    snap();
+    s.close();
+    if(!s.open(d,e)) return false;
+    snap();
+    s.close();
+    return true;
+}
+static void test_undoidx_no_side_effects(){
+    g_cur="UNDOIDX-behavior";
+    ChainError e;
+    std::string da=freshDir("undoidx_beh_on"), db=freshDir("undoidx_beh_off");
+    std::vector<IdxSnap> on, off;
+    CHECK(runSequence(da,true,&on,&e), "behavior: index-enabled sequence: "+e.str());
+    CHECK(runSequence(db,false,&off,&e), "behavior: index-disabled sequence: "+e.str());
+    CHECK(on.size()==off.size() && on.size()==7, "behavior: same number of observations");
+    bool undeIdentical=true, treeIdentical=true, manIdentical=true, ackIdentical=true, digIdentical=true, nIdentical=true;
+    bool anyIdx=false, ctlIdx=false;
+    for(size_t i=0;i<on.size() && i<off.size();++i){
+        if(!(on[i].undod==off[i].undod)) undeIdentical=false;
+        if(!(on[i].treed==off[i].treed)) treeIdentical=false;
+        if(!(on[i].manif==off[i].manif)) manIdentical=false;
+        if(!(on[i].ackd==off[i].ackd)) ackIdentical=false;
+        if(!(on[i].dig==off[i].dig)) digIdentical=false;
+        if(on[i].n!=off[i].n) nIdentical=false;
+        if(on[i].hasIdx) anyIdx=true;
+        if(off[i].hasIdx) ctlIdx=true;
+    }
+    CHECK(undeIdentical, "behavior: undo.dat byte-identical with and without index construction");
+    CHECK(treeIdentical, "behavior: tree.dat byte-identical with and without index construction");
+    CHECK(manIdentical, "behavior: MANIFEST byte-identical with and without index construction");
+    CHECK(ackIdentical, "behavior: ACK byte-identical with and without index construction");
+    CHECK(digIdentical, "behavior: logical digests identical at every step");
+    CHECK(nIdentical, "behavior: undoCount identical at every step");
+    CHECK(anyIdx, "behavior: the enabled run did publish an UNDOINDEX");
+    CHECK(!ctlIdx, "behavior: the disabled control never created an UNDOINDEX");
+    for(size_t i=0;i<on.size();++i) fprintf(stderr,"UNDOIDX-behavior[%zu]: gen=%llu undoSize=%llu undoCount=%zu hasIndex=%d\n",
+        i,(unsigned long long)on[i].gen,(unsigned long long)on[i].man,on[i].n,(int)on[i].hasIdx);
+}
+
+// (7) publication cost at increasing segment counts
+static void test_undoidx_cost(){
+    g_cur="UNDOIDX-cost";
+    ChainError e; const uint32_t S=4;
+    long rss0=readVmHWM();
+    const size_t recs[]={8,16,32,64};
+    fprintf(stderr,"UNDOIDX-cost: test segment size %u; per-publication bytes = 48 + 24*segments\n", S);
+    fprintf(stderr,"UNDOIDX-cost: %6s %6s %8s %7s %13s %12s %16s\n","records","pubs","bytes","fsyncs","idx ms/pub","bytes/pub","wall ms/group");
+    for(size_t k=0;k<sizeof(recs)/sizeof(recs[0]);++k){
+        std::string d=freshDir("undoidx_cost_"+std::to_string((unsigned long long)recs[k]));
+        CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+        CHECK(s.open(d,&e), "cost open: "+e.str());
+        struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+        bool okAll=true;
+        for(size_t i=1;i<=recs[k];++i) if(!PUB(s,(int32_t)i,1,1,3,&e)){ okAll=false; break; }
+        clock_gettime(CLOCK_MONOTONIC,&t1);
+        CHECK(okAll, "cost: publications succeeded");
+        double ms=((double)(t1.tv_sec-t0.tv_sec)*1e3+(double)(t1.tv_nsec-t0.tv_nsec)/1e6);
+        uint64_t pubs=s.undoIndexPublications(), bytes=s.undoIndexBytesWritten(), fsc=s.undoIndexFsyncs();
+        CHECK(pubs==recs[k]/S, "cost: one publication per closed segment");
+        CHECK(bytes==ixExpectedBytes(S,(size_t)pubs), "cost: bytes written match 48+24*segments per publication");
+        CHECK(fsc==pubs, "cost: exactly one index fsync per publication (dir fsync shared with MANIFEST)");
+        UndoIndex ix; CHECK(s.readUndoIndexForTest(&ix,&e), "cost: index readable: "+e.str());
+        CHECK(ix.segments.size()==pubs, "cost: every closed segment is indexed");
+        CHECK(ix.committedBytes==MAN(d), "cost: committedBytes == MANIFEST.undoSize");
+        double idxms = pubs ? (double)s.undoIndexNanos()/1e6/(double)pubs : 0.0;
+        // One fsync of a tiny file on this datadir measures ~30-40 ms (see the report); the index
+        // publication is exactly one such barrier, so the bound is deliberately generous.
+        CHECK(pubs==0 || idxms < 250.0, "cost: measured index publication latency below the commit's own barrier cost");
+        fprintf(stderr,"UNDOIDX-cost: %6zu %6llu %8llu %7llu %13.3f %12.1f %16.1f\n", recs[k],
+                (unsigned long long)pubs,(unsigned long long)bytes,(unsigned long long)fsc,
+                idxms, pubs?(double)bytes/(double)pubs:0.0, pubs?ms/(double)pubs:0.0);
+        s.close();
+    }
+    long rss1=readVmHWM();
+    fprintf(stderr,"UNDOIDX-cost: peak RSS %ld KB -> %ld KB during index construction/serialisation\n", rss0, rss1);
+    fprintf(stderr,"UNDOIDX-cost: extrapolation to the production segment size 4096 (INFERENCE):\n");
+    fprintf(stderr,"UNDOIDX-cost:   publications = floor(records/4096); bytes per publication = 48 + 24*segments;\n");
+    fprintf(stderr,"UNDOIDX-cost:   at 8,000,000 records -> 1953 publications, last index %.1f KB, total written %.1f MB, amortised %.1f B/record\n",
+        48.0/1024.0 + 24.0*1953.0/1024.0, ixExpectedBytes(4096,1953)/1048576.0, (double)ixExpectedBytes(4096,1953)/8.0e6);
+    CHECK(rss1-rss0 < 64*1024, "cost: index construction/serialisation RSS delta < 64 MiB");
+}
+
+// (8) production segment size: 4095 / 4096 / 4097 records (long-running)
+static void test_undoidx_real_boundary(){
+    g_cur="UNDOIDX-real_boundary";
+    ChainError e;
+    const uint32_t S=UNDOINDEX_DEFAULT_SEGMENT_SIZE;
+    std::string d=freshDir("undoidx_real");
+    CommitStore3A s; CHECK(s.open(d,&e), "real open: "+e.str());
+    CHECK(s.undoIndexSegmentSize()==S && S==4096, "real: production default segment size is 4096");
+    bool ok=true;
+    for(int i=1;i<=4095;i++) if(!PUB(s,i,1,1,3,&e)){ ok=false; break; }
+    CHECK(ok, "real: 4095 records published: "+e.str());
+    CHECK(s.undoCount()==4095, "real: undoCount 4095");
+    CHECK(!fexists(ixp(d)), "real: 4095/4096 records -> no closed segment -> no UNDOINDEX");
+    CHECK(s.undoIndexPublications()==0, "real: zero publications at 4095 records");
+    { struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);
+      bool ok4=PUB(s,4096,1,1,3,&e);
+      clock_gettime(CLOCK_MONOTONIC,&t1);
+      double ms=((double)(t1.tv_sec-t0.tv_sec)*1e3+(double)(t1.tv_nsec-t0.tv_nsec)/1e6);
+      CHECK(ok4, "real: 4096th record published");
+      CHECK(fexists(ixp(d)), "real: 4096/4096 records -> segment closed -> UNDOINDEX published");
+      CHECK(s.undoIndexPublications()==1, "real: exactly one publication at 4096 records");
+      CHECK(s.undoIndexBytesWritten()==48+24, "real: 72 bytes written for a one-segment index");
+      UndoIndex ix; CHECK(s.readUndoIndexForTest(&ix,&e), "real: index readable: "+e.str());
+      CHECK(ix.segmentSize==4096 && ix.segments.size()==1 && ix.segments[0].recordCount==4096, "real: one 4096-record segment");
+      CHECK(ix.segments[0].startOffset==0 && ix.committedBytes==MAN(d), "real: boundaries match MANIFEST.undoSize");
+      fprintf(stderr,"UNDOIDX-real: the 4096th commit (which published the index) took %.1f ms wall;"
+                     " measured index publication %.2f ms\n", ms, (double)s.undoIndexNanos()/1e6);
+    }
+    CHECK(PUB(s,4097,1,1,3,&e), "real: 4097th record published");
+    CHECK(s.undoCount()==4097, "real: undoCount 4097");
+    CHECK(s.undoIndexPublications()==1, "real: still one publication at 4097 records");
+    { UndoIndex ix; CHECK(s.readUndoIndexForTest(&ix,&e) && ix.segments.size()==1, "real: still one closed segment at 4097");
+      CHECK(ix.segments[0].endOffset==ix.committedBytes, "real: segment end == committedBytes"); }
+    CHECK(!fexists(ixp(d)+".tmp"), "real: no UNDOINDEX.tmp left behind");
+    s.close();
+    { CommitStore3A s2; CHECK(s2.open(d,&e), "real reopen: "+e.str());
+      CHECK(s2.undoIndexState()==UndoIndexState::Current, "real reopen: Current");
+      CHECK(s2.undoCount()==4097, "real reopen: undoCount 4097");
+      CHECK(s2.undoIndexPublications()==0, "real reopen: no index write");
+      s2.close(); }
+}
+
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){

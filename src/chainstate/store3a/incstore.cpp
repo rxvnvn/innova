@@ -360,6 +360,162 @@ bool CommitStore3A::loadUndoFor(const Manifest& m, ChainError* e){
     undoCommittedBytes_=m.undoSize; return true;
 }
 
+// ---------------------------------------------------------------------------------------------
+// S1.1 -- durable segmented undo index (derived metadata; MANIFEST.undoSize stays authoritative).
+// Everything below only READS undo.dat/tree.dat/MANIFEST/ACK and only WRITES the `UNDOINDEX` file
+// (via `UNDOINDEX.tmp`); it never truncates, recreates or deletes any other artifact.
+// ---------------------------------------------------------------------------------------------
+static void ixPutU32(std::vector<uint8_t>& o, uint32_t v){ for(int i=0;i<4;i++) o.push_back((uint8_t)((v>>(8*i))&0xff)); }
+static void ixPutU64(std::vector<uint8_t>& o, uint64_t v){ for(int i=0;i<8;i++) o.push_back((uint8_t)((v>>(8*i))&0xff)); }
+static bool ixGetU32(const uint8_t* d, size_t n, size_t* o, uint32_t* v){
+    if(*o+4>n) return false; uint32_t r=0; for(int i=0;i<4;i++) r|=(uint32_t)d[*o+i]<<(8*i); *o+=4; *v=r; return true; }
+static bool ixGetU64(const uint8_t* d, size_t n, size_t* o, uint64_t* v){
+    if(*o+8>n) return false; uint64_t r=0; for(int i=0;i<8;i++) r|=(uint64_t)d[*o+i]<<(8*i); *o+=8; *v=r; return true; }
+static const char UNDOINDEX_MAGIC[8] = {'I','N','N','U','I','D','X','1'};
+
+std::vector<uint8_t> UndoIndex::encode() const {
+    std::vector<uint8_t> out;
+    out.reserve(UNDOINDEX_HEADER_SIZE + UNDOINDEX_SEGMENT_SIZE*segments.size());
+    out.insert(out.end(), UNDOINDEX_MAGIC, UNDOINDEX_MAGIC+8);
+    ixPutU32(out, formatVersion); ixPutU32(out, segmentSize);
+    ixPutU64(out, committedBytes); ixPutU64(out, baseOffset); ixPutU64(out, baseGeneration);
+    ixPutU32(out, (uint32_t)segments.size());
+    ixPutU32(out, csCrc32(out.data(), out.size()));            // header crc over bytes [0,44)
+    for (size_t i=0;i<segments.size();++i){
+        const UndoSegment& s=segments[i];
+        size_t start=out.size();
+        ixPutU64(out, s.startOffset); ixPutU64(out, s.endOffset); ixPutU32(out, s.recordCount);
+        ixPutU32(out, csCrc32(out.data()+start, out.size()-start));   // per-segment crc
+    }
+    return out;
+}
+
+bool UndoIndex::decode(const uint8_t* d, size_t n, UndoIndex* ix, ChainError* e){
+    if (n < UNDOINDEX_HEADER_SIZE){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX shorter than its 48-byte header"); return false; }
+    if (memcmp(d, UNDOINDEX_MAGIC, 8)!=0){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX magic mismatch (not 'INNUIDX1')"); return false; }
+    size_t o=8; uint32_t ver=0,ssz=0,cnt=0,hc=0; uint64_t cb=0,bo=0,bg=0;
+    if(!ixGetU32(d,n,&o,&ver)||!ixGetU32(d,n,&o,&ssz)||!ixGetU64(d,n,&o,&cb)||!ixGetU64(d,n,&o,&bo)||
+       !ixGetU64(d,n,&o,&bg)||!ixGetU32(d,n,&o,&cnt)||!ixGetU32(d,n,&o,&hc)){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX header truncated"); return false; }
+    if (o != UNDOINDEX_HEADER_SIZE){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX header size mismatch"); return false; }
+    if (csCrc32(d, o-4) != hc){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX header crc mismatch"); return false; }
+    if (ver != UNDOINDEX_FORMAT_VERSION){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX format version "+std::to_string(ver)+" is not the supported version "+std::to_string(UNDOINDEX_FORMAT_VERSION)); return false; }
+    if (ssz == 0){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX declares segment size 0"); return false; }
+    if (n != UNDOINDEX_HEADER_SIZE + (size_t)UNDOINDEX_SEGMENT_SIZE*cnt){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX length does not match its segment count"); return false; }
+    ix->formatVersion=ver; ix->segmentSize=ssz; ix->committedBytes=cb; ix->baseOffset=bo; ix->baseGeneration=bg;
+    ix->segments.clear(); ix->segments.reserve(cnt);
+    size_t p=UNDOINDEX_HEADER_SIZE;
+    for (uint32_t i=0;i<cnt;++i){
+        size_t q=p; uint64_t s0=0,e0=0; uint32_t rc=0,crc=0;
+        if(!ixGetU64(d,n,&q,&s0)||!ixGetU64(d,n,&q,&e0)||!ixGetU32(d,n,&q,&rc)||!ixGetU32(d,n,&q,&crc)){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX segment "+std::to_string(i)+" truncated"); return false; }
+        if (csCrc32(d+p,20) != crc){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX segment "+std::to_string(i)+" crc mismatch"); return false; }
+        if (rc == 0){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX segment "+std::to_string(i)+" declares 0 records"); return false; }
+        if (rc > ssz){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX segment "+std::to_string(i)+" declares "+std::to_string(rc)+" records, more than the segment size "+std::to_string(ssz)); return false; }
+        if (e0 <= s0){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX segment "+std::to_string(i)+" has a non-positive byte range"); return false; }
+        const uint64_t expect = ix->segments.empty() ? bo : ix->segments.back().endOffset;
+        if (s0 != expect){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX segments are not contiguous at segment "+std::to_string(i)); return false; }
+        UndoSegment s; s.startOffset=s0; s.endOffset=e0; s.recordCount=rc; s.crc32=crc;
+        ix->segments.push_back(s); p += UNDOINDEX_SEGMENT_SIZE;
+    }
+    const uint64_t tail = ix->segments.empty() ? bo : ix->segments.back().endOffset;
+    if (cb != tail){ setErr(e,ErrCode::CORRUPT,"UNDOINDEX committedBytes does not equal the end of its last closed segment"); return false; }
+    return true;
+}
+
+bool CommitStore3A::buildUndoIndexFromMetas(const std::vector<UndoMeta>& metas, UndoIndex* out) const {
+    out->formatVersion = UNDOINDEX_FORMAT_VERSION;
+    out->segmentSize   = (ixSegmentSize_ ? ixSegmentSize_ : UNDOINDEX_DEFAULT_SEGMENT_SIZE);
+    out->committedBytes = 0; out->baseOffset = 0; out->baseGeneration = 0; out->segments.clear();
+    const size_t S = out->segmentSize;
+    for (size_t i=0; i+S<=metas.size(); i+=S){
+        UndoSegment s;
+        s.startOffset = metas[i].offset;
+        s.endOffset   = metas[i+S-1].offset + metas[i+S-1].len;
+        s.recordCount = (uint32_t)S; s.crc32 = 0;
+        out->segments.push_back(s);
+    }
+    if (!out->segments.empty()) out->committedBytes = out->segments.back().endOffset;
+    return true;
+}
+
+bool CommitStore3A::loadUndoIndexFromDisk(bool* exists, UndoIndex* ix, ChainError* e){
+    std::vector<uint8_t> bytes; bool ex=false;
+    if(!csReadFile(p("UNDOINDEX"),&bytes,&ex,e)) return false;
+    *exists = ex;
+    if(!ex) return true;
+    return UndoIndex::decode(bytes.data(), bytes.size(), ix, e);   // structural validation -> FAIL CLOSED
+}
+
+bool CommitStore3A::readUndoIndexForTest(UndoIndex* ix, ChainError* e){
+    std::vector<uint8_t> bytes; bool ex=false;
+    if(!csReadFile(p("UNDOINDEX"),&bytes,&ex,e)) return false;
+    if(!ex){ setErr(e,ErrCode::OK,"UNDOINDEX absent"); return false; }
+    return UndoIndex::decode(bytes.data(), bytes.size(), ix, e);
+}
+
+bool CommitStore3A::publishUndoIndex(const UndoIndex& ix, ChainError* e){
+    if (ixDisabledForTest_) return true;
+    if (ixSkipNextPublish_){ ixSkipNextPublish_=false; return true; }   // test hook: simulated lost publication
+    struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);          // measured publication latency
+    std::vector<uint8_t> bytes = ix.encode();
+    if(!csWriteFile(p("UNDOINDEX.tmp"), bytes.data(), bytes.size(), false, false, e)){
+        ::unlink(p("UNDOINDEX.tmp").c_str()); return false; }
+    ++ixFsyncs_;                                                        // csWriteFile fsyncs the file
+    if(::rename(p("UNDOINDEX.tmp").c_str(), p("UNDOINDEX").c_str())!=0){
+        setErr(e,ErrCode::FS,"rename UNDOINDEX"); ::unlink(p("UNDOINDEX.tmp").c_str()); return false; }
+    ++ixPublishes_; ixBytesWritten_ += (uint64_t)bytes.size();
+    clock_gettime(CLOCK_MONOTONIC,&t1);
+    ixNanos_ += (uint64_t)(t1.tv_sec-t0.tv_sec)*1000000000ull + (uint64_t)(t1.tv_nsec-t0.tv_nsec);
+    return true;
+}
+
+bool CommitStore3A::publishUndoIndexOnSegmentClose(uint64_t appendEndOffset, ChainError* e){
+    const size_t S = (ixSegmentSize_ ? ixSegmentSize_ : UNDOINDEX_DEFAULT_SEGMENT_SIZE);
+    if ((undoIndex_.size()+1) % S != 0) return true;   // no segment boundary crossed: publish nothing
+    std::vector<UndoMeta> metas = undoIndex_;
+    UndoMeta last;
+    last.offset = undoCommittedBytes_;
+    last.len    = (uint32_t)(appendEndOffset - undoCommittedBytes_);
+    metas.push_back(last);
+    UndoIndex ix; buildUndoIndexFromMetas(metas, &ix);
+    return publishUndoIndex(ix, e);
+}
+
+bool CommitStore3A::classifyAndNormalizeUndoIndex(ChainError* e){
+    if (ixDisabledForTest_){ undoIndexState_ = UndoIndexState::None; return true; }
+    UndoIndex onDisk; bool exists=false;
+    if(!loadUndoIndexFromDisk(&exists,&onDisk,e)){ undoIndexState_ = UndoIndexState::Corrupt; return false; }
+    UndoIndex expected; buildUndoIndexFromMetas(undoIndex_, &expected);
+    bool same = exists && onDisk.segmentSize==expected.segmentSize && onDisk.committedBytes==expected.committedBytes &&
+                onDisk.segments.size()==expected.segments.size();
+    if (same) for(size_t i=0;i<expected.segments.size();++i){
+        const UndoSegment&a=onDisk.segments[i]; const UndoSegment&b=expected.segments[i];
+        if(a.startOffset!=b.startOffset||a.endOffset!=b.endOffset||a.recordCount!=b.recordCount){ same=false; break; } }
+    if (same){ undoIndexState_ = UndoIndexState::Current; return true; }
+    if (!exists && expected.segments.empty()){ undoIndexState_ = UndoIndexState::Absent; return true; }
+    UndoIndexState cls = UndoIndexState::Absent;
+    if (exists) {
+        // Classified against the closed-segment prefix IMPLIED BY THE COMMITTED RANGE -- not against raw
+        // byte counts. A prefix reaching further than the committed range describes records the manifest
+        // has not committed (an interrupted publication: the tail is dropped, never authoritative); a
+        // prefix falling short of the committed range is missing closed segments (never trusted).
+        // Equal prefixes (including the normal "active tail not yet closed" state) are Current above.
+        const bool beyond = onDisk.segments.size() > expected.segments.size() ||
+                            onDisk.committedBytes > expected.committedBytes;
+        cls = beyond ? UndoIndexState::Ahead : UndoIndexState::Stale;
+    }
+    const char* why =
+        cls==UndoIndexState::Ahead ? "ahead of the manifest (uncommitted tail dropped, never authoritative)" :
+        cls==UndoIndexState::Stale ? "stale: behind the committed range (rebuilt, not trusted)" :
+                                     "absent (rebuilt from the committed stream)";
+    printf("UNDOINDEX: %s; rebuilding %zu closed segment(s) for committedBytes=%llu\n",
+           why, expected.segments.size(), (unsigned long long)expected.committedBytes);
+    if(!publishUndoIndex(expected, e)) return false;
+    if(!csFsyncDir(dir_, e)) return false;                              // normalisation is its own publication
+    ++ixFsyncs_;
+    undoIndexState_ = cls;
+    return true;
+}
+
 bool CommitStore3A::tryLoadManifest(const std::string& path, bool* exists, uint32_t* rootId, Hash* rootHash, ChainError* e){
     std::vector<uint8_t> bytes; bool ex=false;
     if(!csReadFile(path,&bytes,&ex,e)) return false;
@@ -382,6 +538,7 @@ bool CommitStore3A::open(const std::string& dir, ChainError* e){
     if(!readAck(&ackPresent_,&ackGen_,e)){ close(); return false; }
 
     ChainError e1; bool pEx=false; uint32_t rId=0; Hash rH;
+    ixFreshPath_ = false;
     bool pOk=tryLoadManifest(p("MANIFEST"),&pEx,&rId,&rH,&e1);
     if(pOk){
         uint64_t pg=generation_;
@@ -441,6 +598,7 @@ bool CommitStore3A::open(const std::string& dir, ChainError* e){
             ChainError e0; if(!tree_.loadPage0AsRoot(&e0)){ close(); setErr(e,ErrCode::CORRUPT,"existing tree.dat page 0 is unusable: "+e0.msg); return false; }
             if(!(tree_.rootIsLeaf() && tree_.rootCount()==0)){ close(); setErr(e,ErrCode::CORRUPT,"existing tree.dat is not an empty store; refusing to present it as fresh genesis"); return false; }
         }
+        ixFreshPath_ = true;   // S1.1: no MANIFEST -> nothing committed -> never touch UNDOINDEX
         generation_=0; undoIndex_.clear(); undoCommittedBytes_=0; blockHash_=Hash(); tipHeight_=-1;
     } else {
         ChainError e2; bool bEx=false; uint32_t bId=0; Hash bH;
@@ -457,6 +615,11 @@ bool CommitStore3A::open(const std::string& dir, ChainError* e){
             if(!csFsyncDir(dir_,&e3)){ close(); setErr(e,ErrCode::FS,"failed to fsync repair of MANIFEST"); return false; }
         }
     }
+    // S1.1: validate/normalise the derived UNDOINDEX against the committed state. The MANIFEST-absent
+    // (fresh / prior-store) paths never touch it: with no committed undo there is nothing to index, and
+    // an UNDOINDEX left over from another store is not treated as authority (documented as OPEN).
+    if (!ixFreshPath_ && !classifyAndNormalizeUndoIndex(e)){ close(); return false; }
+    undoIndexState_ = ixFreshPath_ ? UndoIndexState::None : undoIndexState_;
     cleanupTmp(); needsReopen_=false; reopenWhy_.clear(); freshOneShotTaken_=false; heldLogFd_=-1; opened_=true; return true;
 }
 
@@ -528,6 +691,12 @@ bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const
         if(!wok) return false;
     }
     crashIf(CrashPoint::AfterUndoWrite);
+    // 3b) S1.1: if this append closed a segment, publish the derived UNDOINDEX. Ordered AFTER the
+    //     durable undo write and BEFORE MANIFEST.tmp, so the index can only ever be AHEAD of the
+    //     manifest when a crash intervenes. It is derived metadata: nothing here is authoritative,
+    //     the manifest rename + dir fsync below (step 5/6) also make this rename durable, and a
+    //     failure fails the commit exactly like every other barrier (no partial authority).
+    if (undoAppendLen > 0 && !publishUndoIndexOnSegmentClose(undoOffset + undoAppendLen, e)) return false;
     // 4) manifest tmp
     std::vector<uint8_t> mb=m.encode();
     if(!csWriteFile(p("MANIFEST.tmp"),mb.data(),mb.size(),ns(InjectStage::ManifestTmp),ff(InjectStage::ManifestTmp),e)) return false;

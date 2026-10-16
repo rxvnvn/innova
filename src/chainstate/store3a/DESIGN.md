@@ -512,3 +512,128 @@ Deliberately **not** done in R3 (unchanged scope): no retention/compaction/GC or
 pinning, no checkpoint seeds, no `tree.dat` classification change, no format/protocol change, no
 directory-level locking, no change to the established-store (`Any`) write path, no new production
 mutation entry point.
+
+## 14. Stage 3B-D1-S1.1 — durable segmented UNDOINDEX (format, publication ordering, crash states)
+
+Slice scope: introduce the derived, rebuildable on-disk undo index. This slice does NOT change undo
+lookup, disconnect/reconnect semantics, the commit protocol, MANIFEST/ACK authority, or any consumer:
+`std::vector<UndoMeta>` + `loadUndoFor()` remain the authoritative in-RAM view and the only thing
+consumers read, and `MANIFEST.undoSize` remains the sole authority for the committed undo length. The
+index is written, validated and classified — it is NOT yet consumed as a lookup accelerator (a later
+slice must earn that).
+
+### 14.1 Format (v1, little-endian)
+
+  header (48 B)
+    0   magic[8]        'I','N','N','U','I','D','X','1'
+    8   formatVersion   u32 = 1
+    12  segmentSize     u32 (records per segment; production default 4096)
+    16  committedBytes  u64 (end offset of the last CLOSED segment described; 0 if none)
+    24  baseOffset      u64 (0 in this slice; reserved for the bounded retention window)
+    32  baseGeneration  u64 (0 in this slice; see OPEN-1)
+    40  segmentCount    u32
+    44  crc32           u32 over bytes [0,44)
+  segment descriptor, 24 B each (repeated segmentCount times)
+    +0  startOffset     u64
+    +8  endOffset       u64
+    +16 recordCount     u32 (== segmentSize for every closed segment)
+    +20 crc32           u32 over the descriptor's preceding 20 bytes
+
+Structural invariants enforced on decode: length == 48 + 24*segmentCount; segmentSize != 0;
+segments[i].startOffset == (i==0 ? baseOffset : segments[i-1].endOffset); startOffset < endOffset;
+1 <= recordCount <= segmentSize; committedBytes == (segments.empty() ? baseOffset : last.endOffset).
+The file is published atomically (`UNDOINDEX.tmp` + fsync + rename); the `.tmp` residue name is already
+covered by the existing `cleanupTmp()` sweep.
+
+### 14.2 What a segment is, and when the index is published
+
+A segment is a run of exactly `segmentSize` consecutive committed undo records (production 4096). Only
+*closed* (complete) segments are described; the active, not-yet-full tail is deliberately absent and is
+resolved from the committed stream (bounded by one segment). The index is therefore always a *prefix
+description*, never a partial-record description: committedBytes <= MANIFEST.undoSize and the undescribed
+remainder is less than one full segment.
+
+Publication happens in exactly two places:
+  (a) `commitBarriers()`, immediately AFTER the durable undo write and BEFORE `MANIFEST.tmp` is written,
+      and only when this append closed a segment: one small file write + one fsync + one rename per
+      `segmentSize` records. The directory fsync of the existing MANIFEST publication covers this rename
+      (same directory), so the publish path adds NO extra directory barrier.
+  (b) `open()`, as a normalisation (rebuild + publish + directory fsync) when the on-disk index is
+      absent, falls short of, or reaches beyond the committed range.
+
+### 14.3 Reconciliation of UNDOINDEX publication with MANIFEST publication
+
+The index is published strictly INSIDE the existing commit window — after the undo record that closes the
+segment is durable, before the MANIFEST rename. No new authority and no new barrier is introduced: the
+index describes only records already covered by the durability of the undo write, and `MANIFEST.undoSize`
+remains the only thing that decides what is committed. Because the index is derived and non-authoritative,
+the accepted crash protocol supports this ordering without modification (no STOP condition was reached).
+
+Five on-disk states are distinguished; the classification is logged at open and readable through
+`undoIndexState()`:
+
+  state              arises from                                  S1.1 response
+  -----------------  --------------------------------------------  --------------------------------------
+  absent             no UNDOINDEX (new store, operator deletion)  rebuild from the committed stream;
+                                                                   publish ONLY if >= 1 closed segment
+                                                                   exists (a store with no closed
+                                                                   segment never gains an index file)
+  current            index == the closed-segment prefix of the     accepted; no write at all
+                     committed range
+  ahead (legitimate) crash between the index rename and the       NOT corruption: classified Ahead, the
+                     MANIFEST rename; or a disconnect that         uncommitted tail is dropped, the index
+                     shrank undoSize below a boundary              is rewritten from the committed stream.
+                                                                   Uncommitted records never become
+                                                                   authoritative
+  stale              the committed range crossed a segment         NOT silently accepted: classified
+                     boundary whose publication was lost          Stale and rebuilt from the committed
+                     (power-loss metadata reordering: the          stream (MANIFEST/undo.dat only, so no
+                     MANIFEST rename became durable while the      history is replaced)
+                     index rename did not)
+  corrupt            magic/version/crc/structure/contiguity/       FAIL CLOSED at open with a diagnostic
+                     length damage                                 naming UNDOINDEX; nothing written,
+                                                                   nothing rebuilt, operator decides
+
+  - "Ahead" must not be mistaken for corruption, and the crash tests pin it: a crash at BeforeRename in
+    the commit that closes a segment leaves the index describing the 4th record while the MANIFEST still
+    commits 3 — the reopened store commits 3 records and the index is normalised.
+  - A changed `segmentSize` is a rebuild trigger (Stale), never corruption: the header records the
+    segment size the index was built with, and the index is derived metadata whose layout may evolve.
+  - Since the index carries no authority, a corrupt index can only refuse a startup — never change what
+    is committed. That fail-closed choice is deliberate and is why the slice must be reviewed before the
+    index is consumed.
+
+### 14.4 Cost model (measured in the S1.1 focused suite)
+
+  - bytes per publication = 48 + 24*segments; publications = floor(records / segmentSize)
+  - measured (test segmentSize 4): 84-252 bytes per publication, exactly 1 fsync per publication, 0 extra
+    directory fsyncs, measured publication latency 33-42 ms — the same as the freshly measured cost of a
+    single 72-byte write+fsync on this filesystem (40.3 ms): the publication is exactly one barrier.
+  - extrapolation (INFERENCE, production segmentSize 4096): 1953 publications over 8,000,000 records; the
+    last index is ~45.8 KB; total written ~43.8 MB over the whole chain (~5.7 bytes/record). A
+    full-index rewrite *per block* would be ~1000x larger and is NOT implemented — the rewrite happens
+    once per 4096 records.
+  - construction/serialisation memory: the encoded buffer (48 + 24*segments bytes) plus the in-RAM
+    segment vector; measured peak-RSS delta in the focused suite < 1 MB.
+
+### 14.5 Explicitly NOT in this slice
+
+  - The index is NOT consumed: undo lookup, disconnect and restart behaviour are unchanged, asserted by
+    byte-identical undo.dat/tree.dat/MANIFEST/ACK against an index-disabled control run.
+  - No pruning, retention floor, compaction or PRUNED_BELOW_WINDOW behaviour.
+  - No change to the MANIFEST format/version, the undo record format, the ACK protocol, the consensus
+    surface or the archive preservation logic.
+
+### 14.6 Open items
+
+  - OPEN-1: per-segment *generation* bounds are not representable from today's on-disk sources (the undo
+    record carries no generation; the MANIFEST carries only the tip generation). Validation therefore
+    covers byte boundaries, counts and ordering against the authoritative committed stream; generation
+    ordering is deferred to the slice that can recover it (versioned undo record or a persisted
+    generation at append time).
+  - OPEN-2: an UNDOINDEX present without MANIFEST/ACK on the fresh-open path is neither trusted nor
+    deleted by this slice (the fresh path never touches the index; the next publication of a real store
+    replaces it). Treating it as prior-store evidence is left to review.
+  - OPEN-3: the full rewrite grows linearly in the number of segments (total ~44 MB at 8M records) versus
+    a per-segment side file with O(1) publication cost. Documented for review; the single-artifact form
+    was chosen for this slice.
