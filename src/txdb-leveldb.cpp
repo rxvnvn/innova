@@ -232,36 +232,57 @@ ArchiveScan ScanBlockArchive(const fs::path& dir)
     return scan;
 }
 
+// ARCHIVE-1 (S0-F2): the ONE place that decides whether an archive enumeration is acceptable and the
+// ONE place that phrases the refusal, so the constructor preflight and the reset-path check can never
+// drift apart (same status -> same diagnostic line -> same exception wording).
+//
+// `phase` names where the check ran; it is the only difference between the call sites.
+static void RequireArchiveAccountedFor(const ArchiveScan& scan, const char* phase)
+{
+    if (scan.status == ARCHIVE_SCAN_OK) {
+        printf("Archive preflight (%s): %u block-archive file(s) accounted for\n",
+               phase, (unsigned int)scan.payloads.size());
+        for (size_t i = 0; i < scan.notes.size(); ++i)
+            printf("Archive preflight (%s): note: %s\n", phase, scan.notes[i].c_str());
+        return;
+    }
+
+    // Never print a count the enumeration could not establish: an archive that cannot be accounted for
+    // is reported as exactly that, before anything is removed. The failure is described as what was
+    // found, never as damage done by the reset (a pre-existing oddity is not the reset's doing).
+    printf("Index reset: index state only, but the block archive under %s cannot be accounted for: %s\n",
+           GetDataDir().string().c_str(), scan.detail.c_str());
+    for (size_t i = 0; i < scan.notes.size(); ++i)
+        printf("Archive preflight (%s): note: %s\n", phase, scan.notes[i].c_str());
+
+    throw runtime_error(strprintf(
+        "ARCHIVE-1 VIOLATION: refusing to reset the index in %s (%s): %s. The block archive cannot be "
+        "accounted for, so the reset cannot be proven non-destructive; refusing to continue. Fix or "
+        "remove the offending entry before restarting.",
+        (GetDataDir() / "txleveldb").string().c_str(), phase, scan.detail.c_str()));
+}
+
 void init_blockindex(leveldb::Options& options, bool fResetIndex = false) {
     // First time init.
     fs::path directory = GetDataDir() / "txleveldb";
 
     // ARCHIVE-1 (S0-A): an index reset resets the INDEX ONLY. The block archive is
     // deliberately NOT touched here — it used to be deleted by this function.
+    // Defensive validation (S0-F1, retained by S0-F2): the CONSTRUCTOR preflight has already refused
+    // an unaccountable archive before the index was moved aside, so on the normal path this scan sees a
+    // good archive. It is kept because it is the last line of defence if the reset is ever reached by
+    // another caller — and it shares the decision and the diagnostics with that preflight.
     ArchiveScan archiveBefore;
     if (fResetIndex) {
         archiveBefore = ScanBlockArchive(GetDataDir());
-        if (archiveBefore.status == ARCHIVE_SCAN_OK)
+        if (archiveBefore.status == ARCHIVE_SCAN_OK) {
             printf("Index reset: index state only, %u block-archive file(s) under %s are preserved\n",
                    (unsigned int)archiveBefore.payloads.size(), GetDataDir().string().c_str());
-        else
-            // Never print a count the enumeration could not establish: an archive that cannot be
-            // accounted for is reported as exactly that, before anything is removed.
-            printf("Index reset: index state only, but the block archive under %s cannot be accounted "
-                   "for: %s\n", GetDataDir().string().c_str(), archiveBefore.detail.c_str());
-        for (size_t i = 0; i < archiveBefore.notes.size(); ++i)
-            printf("Index reset: note: %s\n", archiveBefore.notes[i].c_str());
-
-        // ARCHIVE-1 (S0-F1): an archive the enumeration cannot account for is refused BEFORE
-        // anything is removed. The diagnostic describes what was actually found, so a pre-existing
-        // oddity is never reported as damage caused by the reset, and an invalid or unreadable
-        // datadir can never pass as a verified (empty) archive.
-        if (archiveBefore.status != ARCHIVE_SCAN_OK)
-            throw runtime_error(strprintf(
-                "ARCHIVE-1 VIOLATION: refusing to reset the index in %s: %s. The block archive "
-                "cannot be accounted for, so the reset cannot be proven non-destructive; refusing "
-                "to continue. Fix or remove the offending entry before restarting.",
-                directory.string().c_str(), archiveBefore.detail.c_str()));
+            for (size_t i = 0; i < archiveBefore.notes.size(); ++i)
+                printf("Index reset: note: %s\n", archiveBefore.notes[i].c_str());
+        } else {
+            RequireArchiveAccountedFor(archiveBefore, "at the index reset");
+        }
 
         fs::remove_all(directory);
     }
@@ -350,6 +371,16 @@ CTxDB::CTxDB(const char* pszMode)
         // incompatible read is reported through the typed read seam).
         if (nVersion < DATABASE_VERSION && !fReadOnly)
         {
+            // ARCHIVE-1 (S0-F2): the archive preflight runs BEFORE this branch moves anything. The
+            // incompatible-index reset renames `txleveldb` to `txleveldb_backup`; if that happened
+            // first, a refusal would leave no `txleveldb`, the next startup would silently create a
+            // fresh empty index and this guard would never run again (S0-F1 audit F1-1, HIGH). Running
+            // the same policy check here makes the refusal DURABLE: the original index stays exactly
+            // where it is, so every later startup re-enters this branch and refuses again, until the
+            // operator fixes the archive.
+            RequireArchiveAccountedFor(ScanBlockArchive(GetDataDir()),
+                                       "before the incompatible-index reset");
+
             printf("CTxDB() : database version %d is older than expected %d, creating backup\n",
                    nVersion, DATABASE_VERSION);
             bool fBackupOk = false;
