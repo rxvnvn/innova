@@ -90,6 +90,37 @@ struct UndoIndex {
 // diagnostics and tests; None = not evaluated (fresh-open path or index publication disabled).
 enum class UndoIndexState { None, Current, Absent, Stale, Ahead, Corrupt };
 
+// S1.1-F1 (finding S1.1-1): explicit, operator-authorized recovery of the DERIVED undo index.
+// The default path stays fail closed: nothing is quarantined, rebuilt or written because a caller
+// merely opened the store. Recovery is a deliberate, one-shot authorization supplied by the operator
+// through openWithOptions(); it never changes what is committed (MANIFEST.undoSize stays the only
+// authority) and it rebuilds exclusively from the committed stream already validated by the existing
+// MANIFEST/undo recovery path. There is no datadir flag, no RPC, no CLI option and no production wiring.
+struct OpenOptions {
+    bool authorizeUndoIndexRecovery = false;   // one-shot: consumed by the open() call it authorizes
+};
+// What an authorized recovery actually did (also populated (authorized=false) for every other open, so
+// a caller can see whether the index was present/current without asking for recovery).
+struct UndoIndexRecoveryReport {
+    bool     authorized = false;        // the caller requested recovery on this open
+    bool     indexPresent = false;      // an UNDOINDEX artifact existed on disk
+    bool     indexReadError = false;    // the artifact could not be read at all (I/O error, not corruption)
+    bool     indexCorrupt = false;      // the artifact was read but failed structural validation
+    std::string quarantinePath;         // where the corrupt artifact was preserved ("" => none)
+    uint64_t quarantinedBytes = 0;
+    bool     quarantineFallback = false;// hard links unavailable: an lstat-guarded rename was used
+    bool     rebuilt = false;           // the index was rebuilt from the committed stream
+    bool     nothingToIndex = false;    // the rebuild found no closed segment (no index file written)
+    size_t   rebuiltSegments = 0;
+    uint64_t rebuiltCommittedBytes = 0;
+    std::string resolution;             // "none" | "already-current" | "rebuilt" | "quarantined+rebuilt" | "refused"
+};
+
+// S1.1-F1 (finding S1.1-2): deterministic, one-shot test-only faults at the UNDOINDEX publication
+// barrier. The default is None, so no injection exists in a production run; the value is set only by
+// injectUndoIndexFault() from focused tests and is consumed (reset) by the first publication it affects.
+enum class UndoIndexFault { None, TmpCreate, TmpShortWrite, TmpFsync, Rename, DirFsync };
+
 enum class CrashPoint { None, BeforeBakReplace, BakPrepared, AfterBakReplace, AfterUndoWrite, BeforeRename, AfterRename, AfterDirSync };
 enum class InjectStage { None, PageWrite, UndoAppend, ManifestTmp, BakWrite, PrimaryRename, DirFsync, AckWrite };
 // R1 (F0-2): creation policy for the first undo write after a fresh open. It closes the TOCTOU window
@@ -130,6 +161,10 @@ class CommitStore3A {
 public:
     ~CommitStore3A();
     bool open(const std::string& dir, ChainError* e);
+    // S1.1-F1: the only way to authorize recovery of a corrupt derived index. open() above is exactly
+    // openWithOptions(dir, OpenOptions(), e) -- i.e. fail closed -- and remains the production entry point.
+    bool openWithOptions(const std::string& dir, const OpenOptions& o, ChainError* e);
+    const UndoIndexRecoveryReport& lastUndoIndexRecovery() const { return ixRecovery_; }
     void close();
 
     bool opened() const { return opened_; }
@@ -184,6 +219,9 @@ public:
     void setUndoIndexSegmentSizeForTest(uint32_t s) { ixSegmentSize_ = (s ? s : UNDOINDEX_DEFAULT_SEGMENT_SIZE); }
     void injectUndoIndexSkipNextPublish() { ixSkipNextPublish_ = true; }
     void injectUndoIndexDisabled(bool v) { ixDisabledForTest_ = v; }
+    void injectUndoIndexFault(UndoIndexFault f) { ixFault_ = (int)f; }   // S1.1-F1: one-shot
+    void clearUndoIndexFaults() { ixFault_ = (int)UndoIndexFault::None; }
+    bool undoIndexFaultPending() const { return ixFault_ != (int)UndoIndexFault::None; }
 
 private:
     bool ns(InjectStage s) const { return injectStage_ == s && injectNoSpace_; }
@@ -203,6 +241,9 @@ private:
     bool classifyAndNormalizeUndoIndex(ChainError* e);
     bool publishUndoIndex(const UndoIndex& ix, ChainError* e);
     bool publishUndoIndexOnSegmentClose(uint64_t appendEndOffset, ChainError* e);
+    // S1.1-F1: preserve a corrupt derived artifact under a collision-safe name, never overwriting an
+    // existing file; returns the quarantine path. Only ever called under explicit operator authorization.
+    bool quarantineCorruptUndoIndex(std::string* quarantinePath, uint64_t* bytes, bool* usedFallback, ChainError* e);
     bool commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e);
     bool writeAck(uint64_t gen, ChainError* e);
     bool readAck(bool* present, uint64_t* gen, ChainError* e);
@@ -235,6 +276,9 @@ private:
     bool ixFreshPath_ = false;          // set when open() took a MANIFEST-absent (fresh/prior-store) path
     bool ixSkipNextPublish_ = false;    // test hook: simulate one lost index publication (power-loss shape)
     bool ixDisabledForTest_ = false;    // test hook: control run -- never touch UNDOINDEX at all
+    int ixFault_ = 0;                   // S1.1-F1: one-shot injected publication-barrier fault (None by default)
+    bool ixAuthorizeRecovery_ = false;  // S1.1-F1: set only from openWithOptions(authorize=...)
+    UndoIndexRecoveryReport ixRecovery_;// S1.1-F1: what the last open did about the index artifact
     CrashPoint crashPoint_ = CrashPoint::None;
     InjectStage injectStage_ = InjectStage::None;
     bool injectNoSpace_ = false;

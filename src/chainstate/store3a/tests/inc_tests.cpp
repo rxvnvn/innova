@@ -2575,10 +2575,332 @@ static void test_undoidx_real_boundary(){
       s2.close(); }
 }
 
+
+// ===========================================================================
+// S1.1-F1 -- corrupt-index recovery (S1.1-1) and publication-barrier faults (S1.1-2)
+// ===========================================================================
+static Hash prefixHash(const std::string& path, long len){
+    FILE* f=fopen(path.c_str(),"rb"); if(!f) return Hash();
+    ChainedHash h; std::vector<uint8_t> buf(65536); long left=len;
+    while(left>0){ size_t want=(size_t)((left<65536)?left:65536); size_t r=fread(&buf[0],1,want,f);
+                   if(!r) break; h.put(&buf[0],r); left-=(long)r; }
+    fclose(f); return h.final(); }
+struct AuthSnap { uint64_t gen=0, man=0, treeSize=0; size_t n=0; Hash manif, ackd, dig, undoPrefix; };
+static bool authSnap(const std::string& d, CommitStore3A* s, AuthSnap* o, ChainError* e){
+    o->gen=s->generation(); o->man=MAN(d); o->n=s->undoCount();
+    o->manif=fdig(d+"/MANIFEST"); o->ackd=fexists(d+"/ACK")?fdig(d+"/ACK"):Hash();
+    o->treeSize=fsz(d+"/tree.dat"); if(o->treeSize<0) o->treeSize=0;
+    UtxoState st; if(!storeToState(*s,&st,e)) return false; o->dig=st.digest();
+    o->undoPrefix=prefixHash(d+"/undo.dat",(long)o->man); return true; }
+// Compares everything the committed protocol owns. tree.dat/undo.dat may carry an uncommitted physical
+// TAIL after a failed commit (CoW pages / a durable-but-uncommitted undo record) -- only the committed
+// PREFIX is required to match, which is exactly the mission's rule.
+static bool committedMatch(const std::string& dc, const AuthSnap& c, const std::string& dn, const AuthSnap& n, std::string* why){
+    if(c.gen!=n.gen){ *why="generation "+std::to_string((unsigned long long)c.gen)+" vs "+std::to_string((unsigned long long)n.gen); return false; }
+    if(c.man!=n.man){ *why="MANIFEST.undoSize "+std::to_string((unsigned long long)c.man)+" vs "+std::to_string((unsigned long long)n.man); return false; }
+    if(c.n!=n.n){ *why="undoCount "+std::to_string(c.n)+" vs "+std::to_string(n.n); return false; }
+    if(!(c.manif==n.manif)){ *why="MANIFEST bytes"; return false; }
+    if(!(c.ackd==n.ackd)){ *why="ACK bytes"; return false; }
+    if(!(c.dig==n.dig)){ *why="logical digest"; return false; }
+    if(!(c.undoPrefix==n.undoPrefix)){ *why="committed undo.dat prefix"; return false; }
+    long m=(c.treeSize<n.treeSize)?c.treeSize:n.treeSize;
+    if(prefixHash(dc+"/tree.dat",m)!=prefixHash(dn+"/tree.dat",m)){ *why="tree.dat committed prefix"; return false; }
+    return true; }
+// Cross-store comparison where the *committed logical* state must agree but the generation/MANIFEST bytes
+// legitimately differ (e.g. a disconnected tip consumes a generation in one store but not the other).
+static bool logicalMatch(const std::string& dc, const AuthSnap& c, const std::string& dn, const AuthSnap& n, std::string* why){
+    if(c.man!=n.man){ *why="MANIFEST.undoSize "+std::to_string((unsigned long long)c.man)+" vs "+std::to_string((unsigned long long)n.man); return false; }
+    if(c.n!=n.n){ *why="undoCount "+std::to_string(c.n)+" vs "+std::to_string(n.n); return false; }
+    if(!(c.dig==n.dig)){ *why="logical digest"; return false; }
+    if(!(c.undoPrefix==n.undoPrefix)){ *why="committed undo.dat prefix"; return false; }
+    long m=(c.treeSize<n.treeSize)?c.treeSize:n.treeSize;
+    if(prefixHash(dc+"/tree.dat",m)!=prefixHash(dn+"/tree.dat",m)){ *why="tree.dat committed prefix"; return false; }
+    return true; }
+static void quarantineList(const std::string& d, std::vector<std::string>* out){
+    out->clear(); DIR* dp=opendir(d.c_str()); if(!dp) return; struct dirent* ent;
+    while((ent=readdir(dp))!=NULL){ std::string nm=ent->d_name;
+        if(nm.compare(0,strlen("UNDOINDEX.corrupt."),"UNDOINDEX.corrupt.")==0) out->push_back(nm); }
+    closedir(dp); }
+static size_t quarantineCount(const std::string& d){ std::vector<std::string> v; quarantineList(d,&v); return v.size(); }
+static std::string qpath(const std::string& d, uint64_t gen, int suffix){
+    return d+"/UNDOINDEX.corrupt.g"+std::to_string((unsigned long long)gen)+(suffix? "."+std::to_string(suffix):""); }
+// a store with N committed records and a published (valid) index, plus its authority snapshot
+static bool buildIdxStore(const std::string& d, int n, uint32_t S, AuthSnap* snap, ChainError* e){
+    CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+    if(!s.open(d,e)) return false;
+    for(int i=1;i<=n;i++) if(!PUB(s,i,1,1,3,e)) return false;
+    bool ok=authSnap(d,&s,snap,e); s.close(); return ok; }
+static bool buildCtlStore(const std::string& d, int n, uint32_t S, AuthSnap* snap, ChainError* e){
+    CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); s.injectUndoIndexDisabled(true);
+    if(!s.open(d,e)) return false;
+    for(int i=1;i<=n;i++) if(!PUB(s,i,1,1,3,e)) return false;
+    bool ok=authSnap(d,&s,snap,e); s.close(); return ok; }
+static std::string corruptIndexBytes(const std::string& good, size_t off){
+    std::string m=good; if(off<m.size()) m[off]=(char)(m[off]^0xFF); return m; }
+
+// (F1-A) S1.1-1: explicit operator-authorized corrupt-index recovery
+static void test_undoidx_f1_recovery(){
+    g_cur="UNDOIDX-F1-recovery";
+    ChainError e; const uint32_t S=4;
+    std::string d=freshDir("undoidx_f1_rec"); AuthSnap ctl;
+    CHECK(buildIdxStore(d,5,S,&ctl,&e), "f1rec: build 5 records + index: "+e.str());
+    std::string good=slurp(ixp(d)); Hash goodH=fdig(ixp(d));
+    CHECK(good.size()==48+24, "f1rec: one closed segment (72 bytes)");
+    std::string corrupt=corruptIndexBytes(good,48+3);
+    CHECK(spill(ixp(d),corrupt), "f1rec: index corrupted");
+    Hash corruptH=fdig(ixp(d));
+
+    // (a) DEFAULT: still fail closed, no quarantine, nothing written
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e2; bool ok=s.open(d,&e2);
+      CHECK(!ok, "f1a: default open still refuses a corrupt index (fail closed unchanged)");
+      const UndoIndexRecoveryReport r=s.lastUndoIndexRecovery();
+      CHECK(!r.authorized && r.indexPresent && r.indexCorrupt, "f1a: report marks corruption, not authorization");
+      CHECK(r.quarantinePath.empty() && r.resolution=="refused", "f1a: nothing quarantined, resolution refused");
+      CHECK(fdig(ixp(d))==corruptH, "f1a: the corrupt artifact is untouched by the refusal");
+      CHECK(quarantineCount(d)==0, "f1a: no quarantine file created"); }
+
+    // (b) AUTHORIZED: quarantine + rebuild from the committed stream
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); OpenOptions o; o.authorizeUndoIndexRecovery=true;
+      ChainError e3; bool ok=s.openWithOptions(d,o,&e3);
+      CHECK(ok, "f1b: authorized recovery opens the store: "+e3.str());
+      const UndoIndexRecoveryReport r=s.lastUndoIndexRecovery();
+      CHECK(r.authorized && r.indexCorrupt && !r.quarantinePath.empty(), "f1b: report records the quarantine path");
+      CHECK(r.quarantinedBytes==corrupt.size(), "f1b: quarantined byte count reported");
+      CHECK(slurp(r.quarantinePath)==corrupt, "f1b: quarantined bytes are exactly the corrupt artifact");
+      CHECK(r.resolution=="quarantined+rebuilt" && r.rebuilt && r.rebuiltSegments==1,
+            "f1b: resolution quarantined+rebuilt with one segment ("+r.resolution+")");
+      CHECK(fdig(ixp(d))==goodH, "f1b: rebuilt index is byte-identical to the original valid index");
+      // undoIndexState() reports the classification of the artifact FOUND at this open (Absent here: the
+      // corrupt one was quarantined); correctness of the rebuilt bytes is asserted above, and the next
+      // open must be Current (see f1c / the follow-up assertion below).
+      CHECK(s.undoIndexState()==UndoIndexState::Absent || s.undoIndexState()==UndoIndexState::Current,
+            std::string("f1b: post-recovery classification is Absent/Current (")+ixName(s.undoIndexState())+")");
+      CHECK(s.undoCount()==5, "f1b: undoCount preserved");
+      AuthSnap now; CHECK(authSnap(d,&s,&now,&e3), "f1b: snapshot after recovery");
+      std::string why; CHECK(committedMatch(d,ctl,d,now,&why), "f1b: committed state unchanged by recovery ("+why+")");
+      s.close(); }
+    CHECK(quarantineCount(d)==1, "f1b: exactly one quarantine artifact");
+
+    // (c) repeated recovery request -> idempotent no-op
+    std::vector<std::string> qs; quarantineList(d,&qs); Hash qH=fdig(d+"/"+qs[0]);
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); OpenOptions o; o.authorizeUndoIndexRecovery=true;
+      ChainError e4; bool ok=s.openWithOptions(d,o,&e4);
+      CHECK(ok, "f1c: repeated authorized open succeeds");
+      CHECK(s.lastUndoIndexRecovery().resolution=="already-current", "f1c: nothing to recover -> already-current");
+      CHECK(s.undoIndexState()==UndoIndexState::Current, "f1c: rebuilt index is Current on the next open");
+      CHECK(s.undoIndexPublications()==0, "f1c: no index write on a repeated request");
+      CHECK(quarantineCount(d)==1, "f1c: no second quarantine artifact");
+      CHECK(fdig(d+"/"+qs[0])==qH, "f1c: existing quarantine artifact untouched");
+      CHECK(fdig(ixp(d))==goodH, "f1c: index unchanged"); s.close(); }
+
+    // (d) quarantine-name collision -> suffix, never overwrite
+    CHECK(spill(ixp(d),corrupt), "f1d: index corrupted again");
+    std::string base=qpath(d,ctl.gen,0);
+    CHECK(fexists(base), "f1d: the quarantine from f1b is still in place");
+    std::string pre=qpath(d,ctl.gen,1);     // the NEXT candidate the recovery would otherwise pick
+    CHECK(spill(pre,"PRE-EXISTING-QUARANTINE-EVIDENCE"), "f1d: pre-existing artifact at the next candidate name");
+    Hash preH=fdig(pre);
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); OpenOptions o; o.authorizeUndoIndexRecovery=true;
+      ChainError e5; bool ok=s.openWithOptions(d,o,&e5);
+      CHECK(ok, "f1d: authorized open succeeds: "+e5.str());
+      const UndoIndexRecoveryReport r=s.lastUndoIndexRecovery();
+      CHECK(r.quarantinePath==qpath(d,ctl.gen,2), "f1d: collision resolved by a suffix ("+r.quarantinePath+")");
+      CHECK(fdig(pre)==preH, "f1d: the pre-existing artifact was NOT overwritten");
+      CHECK(slurp(r.quarantinePath)==corrupt, "f1d: the new quarantine holds the corrupt bytes");
+      CHECK(fdig(ixp(d))==goodH, "f1d: rebuilt index correct");
+      AuthSnap now; CHECK(authSnap(d,&s,&now,&e5),"f1d: snapshot");
+      std::string why; CHECK(committedMatch(d,ctl,d,now,&why), "f1d: committed state unchanged ("+why+")");
+      s.close(); }
+    CHECK(quarantineCount(d)==3, "f1d: all three quarantine artifacts preserved");
+
+    // (e) interrupted quarantine: artifact already moved aside, index absent
+    std::string d2=freshDir("undoidx_f1_intq"); AuthSnap c2;
+    CHECK(buildIdxStore(d2,5,S,&c2,&e), "f1e: build store");
+    std::string q2=qpath(d2,c2.gen,0);
+    CHECK(spill(q2,slurp(ixp(d2))), "f1e: simulate an interrupted quarantine (artifact preserved, index gone)");
+    CHECK(unlink(ixp(d2).c_str())==0, "f1e: index path removed (interruption point)");
+    Hash q2H=fdig(q2);
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); OpenOptions o; o.authorizeUndoIndexRecovery=true;
+      ChainError e6; bool ok=s.openWithOptions(d2,o,&e6);
+      CHECK(ok, "f1e: open after an interrupted quarantine: "+e6.str());
+      CHECK(s.lastUndoIndexRecovery().resolution=="rebuilt", "f1e: index absent -> plain rebuild");
+      CHECK(slurp(ixp(d2))==good, "f1e: index rebuilt to the same bytes");
+      CHECK(fdig(q2)==q2H, "f1e: the quarantined evidence is untouched");
+      AuthSnap now; CHECK(authSnap(d2,&s,&now,&e6),"f1e: snapshot");
+      std::string why; CHECK(committedMatch(d2,c2,d2,now,&why), "f1e: committed state unchanged ("+why+")");
+      s.close(); }
+
+    // (f) interrupted rebuild: the recovery publication itself fails, then a clean retry completes
+    std::string d3=freshDir("undoidx_f1_intr"); AuthSnap c3;
+    CHECK(buildIdxStore(d3,5,S,&c3,&e), "f1f: build store");
+    CHECK(spill(ixp(d3),corrupt), "f1f: index corrupted");
+    Hash c3idx=corruptH;
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); OpenOptions o; o.authorizeUndoIndexRecovery=true;
+      s.injectUndoIndexFault(UndoIndexFault::TmpShortWrite);
+      ChainError e7; bool ok=s.openWithOptions(d3,o,&e7);
+      CHECK(!ok, "f1f: a failing recovery publication fails the open (fail closed)");
+      CHECK(quarantineCount(d3)==1, "f1f: the quarantine from this attempt is durable");
+      CHECK(slurp(qpath(d3,c3.gen,0))==corrupt, "f1f: quarantined bytes preserved across the failed rebuild");
+      CHECK(!fexists(ixp(d3)), "f1f: no index published by the failed rebuild"); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); OpenOptions o; o.authorizeUndoIndexRecovery=true;
+      ChainError e8; bool ok=s.openWithOptions(d3,o,&e8);
+      CHECK(ok, "f1f: clean retry completes the recovery: "+e8.str());
+      CHECK(quarantineCount(d3)==1, "f1f: the retry does not quarantine again (index is absent now)");
+      CHECK(slurp(ixp(d3))==good, "f1f: index rebuilt correctly on the retry");
+      CHECK(slurp(qpath(d3,c3.gen,0))==corrupt, "f1f: original quarantine evidence intact");
+      AuthSnap now; CHECK(authSnap(d3,&s,&now,&e8),"f1f: snapshot");
+      std::string why; CHECK(committedMatch(d3,c3,d3,now,&why), "f1f: committed state unchanged across the interruption ("+why+")");
+      s.close(); }
+    CHECK(c3idx==corruptH, "f1f: (invariant) corrupt artifact signature stable");
+}
+
+
+// (F1-B) S1.1-2: publication-barrier fault injection, synthetic one-shot faults (normal publication)
+static void test_undoidx_f1_faults(){
+    g_cur="UNDOIDX-F1-faults";
+    ChainError e; const uint32_t S=4;
+    struct F { const char* name; UndoIndexFault f; bool residue; };
+    const F fs[]={ {"TmpCreate",UndoIndexFault::TmpCreate,false},
+                   {"TmpShortWrite",UndoIndexFault::TmpShortWrite,false},
+                   {"TmpFsync",UndoIndexFault::TmpFsync,false},
+                   {"Rename",UndoIndexFault::Rename,false} };
+    for(size_t k=0;k<sizeof(fs)/sizeof(fs[0]);++k){
+        const std::string nm=fs[k].name;
+        std::string d=freshDir("undoidx_f1_f_"+nm), dc=freshDir("undoidx_f1_fc_"+nm);
+        AuthSnap ctl; CHECK(buildCtlStore(dc,3,S,&ctl,&e), "f1fault "+nm+": index-disabled control (3 records)");
+        CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+        CHECK(s.open(d,&e), "f1fault "+nm+": open: "+e.str());
+        for(int i=1;i<=3;i++) CHECK(PUB(s,i,1,1,3,&e), "f1fault "+nm+": publish 3");
+        CHECK(!fexists(ixp(d)), "f1fault "+nm+": no index before the boundary");
+        CHECK(s.undoIndexFaultPending()==false, "f1fault "+nm+": no fault pending in the default state");
+        s.injectUndoIndexFault(fs[k].f);
+        CHECK(s.undoIndexFaultPending(), "f1fault "+nm+": fault armed (one-shot)");
+        ChainError e2; bool ok=PUB(s,4,1,1,3,&e2);
+        CHECK(!ok, "f1fault "+nm+": the segment-closing publication FAILS");
+        CHECK(e2.str().find("injected")!=std::string::npos, "f1fault "+nm+": injected failure reported: "+e2.str());
+        CHECK(!s.undoIndexFaultPending(), "f1fault "+nm+": the injection was consumed (one-shot)");
+        CHECK(s.undoCount()==3, "f1fault "+nm+": the in-RAM undo view did not advance");
+        CHECK(!fexists(ixp(d)), "f1fault "+nm+": no index was published");
+        if(fs[k].residue) CHECK(fexists(ixp(d)+".tmp"), "f1fault "+nm+": tmp residue left as documented");
+        AuthSnap now; CHECK(authSnap(d,&s,&now,&e2), "f1fault "+nm+": snapshot after the failure");
+        std::string why; CHECK(committedMatch(dc,ctl,d,now,&why),
+              "f1fault "+nm+": committed state == index-disabled control ("+why+")");
+        CHECK(s.generation()==ctl.gen, "f1fault "+nm+": no new generation became authoritative");
+        // the same instance stays usable once the (one-shot) fault is gone
+        CHECK(PUB(s,4,1,1,3,&e2), "f1fault "+nm+": a same-instance retry with no fault succeeds");
+        CHECK(s.undoCount()==4, "f1fault "+nm+": the retry committed normally");
+        CHECK(fexists(ixp(d)), "f1fault "+nm+": the index is published by the successful retry");
+        s.close();
+        { CommitStore3A s2; s2.setUndoIndexSegmentSizeForTest(S); ChainError e3;
+          CHECK(s2.open(d,&e3), "f1fault "+nm+": clean restart: "+e3.str());
+          CHECK(s2.undoIndexState()==UndoIndexState::Current, "f1fault "+nm+": index Current after the restart");
+          CHECK(!fexists(ixp(d)+".tmp"), "f1fault "+nm+": tmp residue swept by cleanupTmp at open");
+          CHECK(s2.undoCount()==4, "f1fault "+nm+": 4 committed records");
+          s2.close(); }
+    }
+    // normalisation-path faults at open (ahead and stale), incl. the directory-fsync fault
+    const char* nms[]={"AheadTmpCreate","AheadDirFsync","StaleRename"};
+    for(size_t k=0;k<3;++k){
+        const std::string nm=nms[k];
+        std::string d=freshDir("undoidx_f1_n_"+nm), dc=freshDir("undoidx_f1_nc_"+nm);
+        const int ctlN = (k==2) ? 8 : 3;      // the stale shape commits 8 records forward; the ahead shape 3
+        AuthSnap ctl; CHECK(buildCtlStore(dc,ctlN,S,&ctl,&e), "f1norm "+nm+": index-disabled control ("+std::to_string(ctlN)+" records)");
+        AuthSnap before;
+        { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); CHECK(s.open(d,&e), "f1norm "+nm+": open");
+          for(int i=1;i<=4;i++) CHECK(PUB(s,i,1,1,3,&e), "f1norm "+nm+": publish 4 (index published)");
+          if(k==2) s.injectUndoIndexSkipNextPublish();                      // stale shape needs a lost close
+          if(k==2){ for(int i=5;i<=8;i++) CHECK(PUB(s,i,1,1,3,&e), "f1norm "+nm+": publish 8 (close lost)"); }
+          else { Hash tip=s.tipHash(); CHECK(s.disconnect(tip,&e), "f1norm "+nm+": disconnect -> index ahead"); }
+          CHECK(authSnap(d,&s,&before,&e), "f1norm "+nm+": snapshot of the committed state");
+          s.close(); }
+        { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+          if(k==0) s.injectUndoIndexFault(UndoIndexFault::TmpCreate);
+          if(k==1) s.injectUndoIndexFault(UndoIndexFault::DirFsync);
+          if(k==2) s.injectUndoIndexFault(UndoIndexFault::Rename);
+          ChainError e2; bool ok=s.open(d,&e2);
+          CHECK(!ok, "f1norm "+nm+": a failing normalisation fails the open (fail closed)");
+          CHECK(e2.str().find("injected")!=std::string::npos, "f1norm "+nm+": injected failure reported: "+e2.str());
+          CHECK(!s.undoIndexFaultPending(), "f1norm "+nm+": the injection was one-shot"); }
+        { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e3;
+          CHECK(s.open(d,&e3), "f1norm "+nm+": clean restart after the failed open: "+e3.str());
+          // The first successful open reports the classification of what it found (Ahead/Stale) and
+          // normalises it; the index is Current from the next open on.
+          const UndoIndexState nst=s.undoIndexState();
+          CHECK(nst==UndoIndexState::Ahead || nst==UndoIndexState::Stale || nst==UndoIndexState::Current,
+                std::string("f1norm ")+nm+": normalisation classification "+ixName(nst));
+          AuthSnap after; CHECK(authSnap(d,&s,&after,&e3), "f1norm "+nm+": snapshot after");
+          std::string why; CHECK(committedMatch(d,before,d,after,&why),
+                "f1norm "+nm+": committed state unchanged by the failed normalisation and the recovery ("+why+")");
+          std::string why2; CHECK(logicalMatch(dc,ctl,d,after,&why2),
+                "f1norm "+nm+": logical state matches the index-disabled control ("+why2+")");
+          CHECK(!fexists(ixp(d)+".tmp"), "f1norm "+nm+": no tmp residue left behind");
+          s.close(); }
+        { CommitStore3A s3; s3.setUndoIndexSegmentSizeForTest(S); ChainError e4;
+          CHECK(s3.open(d,&e4), "f1norm "+nm+": second restart: "+e4.str());
+          CHECK(s3.undoIndexState()==UndoIndexState::Current, "f1norm "+nm+": index Current from the next open on");
+          CHECK(s3.undoIndexPublications()==0, "f1norm "+nm+": no churn on the next open");
+          s3.close(); }
+    }
+}
+
+// (F1-B) real (non-injected) syscall failures at the same barrier
+static void test_undoidx_f1_real(){
+    g_cur="UNDOIDX-F1-real";
+    ChainError e; const uint32_t S=4;
+    // (r1) real write failure: UNDOINDEX.tmp is a symlink to /dev/full -> ENOSPC on write
+    if(fexists("/dev/full")){
+        std::string d=freshDir("undoidx_f1_real_full"), dc=freshDir("undoidx_f1_real_fullc");
+        AuthSnap ctl; CHECK(buildCtlStore(dc,3,S,&ctl,&e), "f1real: control (3 records, index disabled)");
+        CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+        CHECK(s.open(d,&e), "f1real: open: "+e.str());
+        for(int i=1;i<=3;i++) CHECK(PUB(s,i,1,1,3,&e), "f1real: publish 3");
+        AuthSnap before; CHECK(authSnap(d,&s,&before,&e), "f1real: snapshot before");
+        CHECK(symlink("/dev/full",(ixp(d)+".tmp").c_str())==0, "f1real: tmp path symlinked to /dev/full");
+        ChainError e2; bool ok=PUB(s,4,1,1,3,&e2);
+        CHECK(!ok, "f1real: publication fails on a genuine write error (ENOSPC-equivalent)");
+        CHECK(e2.str().find("injected")==std::string::npos,
+              "f1real: the failure is a REAL syscall error, not an injection: "+e2.str());
+        CHECK(!fexists(ixp(d)), "f1real: no index published");
+        CHECK(s.undoCount()==3, "f1real: committed undo view unchanged");
+        AuthSnap now; CHECK(authSnap(d,&s,&now,&e2), "f1real: snapshot after");
+        std::string why; CHECK(committedMatch(d,before,d,now,&why), "f1real: committed state unchanged ("+why+")");
+        s.close();
+        CommitStore3A s2; s2.setUndoIndexSegmentSizeForTest(S); ChainError e3;
+        CHECK(s2.open(d,&e3), "f1real: clean restart after the real failure: "+e3.str());
+        CHECK(s2.generation()==ctl.gen, "f1real: no new generation became authoritative");
+        CHECK(s2.undoCount()==3, "f1real: 3 committed records");
+        AuthSnap after; CHECK(authSnap(d,&s2,&after,&e3), "f1real: snapshot after the restart");
+        std::string why2; CHECK(committedMatch(dc,ctl,d,after,&why2),
+              "f1real: committed state matches the index-disabled control ("+why2+")");
+        CHECK(PUB(s2,4,1,1,3,&e3), "f1real: a later publication succeeds");
+        CHECK(fexists(ixp(d)), "f1real: the index is published afterwards");
+        s2.close();
+    } else { printf("UNDOIDX-F1-real: /dev/full unavailable -- real-ENOSPC case SKIPPED\n"); }
+    // (r2) real create failure: the tmp path is a directory -> open() fails with EISDIR
+    std::string d2=freshDir("undoidx_f1_real_dir");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); CHECK(s.open(d2,&e), "f1real2: open");
+      for(int i=1;i<=3;i++) CHECK(PUB(s,i,1,1,3,&e), "f1real2: publish 3");
+      s.close(); }
+    CHECK(mkdir((ixp(d2)+".tmp").c_str(),0755)==0, "f1real2: tmp path replaced by a directory");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e4; CHECK(s.open(d2,&e4), "f1real2: reopen: "+e4.str());
+      AuthSnap before; CHECK(authSnap(d2,&s,&before,&e4), "f1real2: snapshot");
+      ChainError e5; bool ok2=PUB(s,4,1,1,3,&e5);
+      CHECK(!ok2, "f1real2: publication fails when the tmp path cannot be created (real EISDIR)");
+      CHECK(e5.str().find("injected")==std::string::npos, "f1real2: real syscall error: "+e5.str());
+      CHECK(s.undoCount()==3, "f1real2: committed undo view unchanged");
+      AuthSnap now; CHECK(authSnap(d2,&s,&now,&e5), "f1real2: snapshot after");
+      std::string why; CHECK(committedMatch(d2,before,d2,now,&why), "f1real2: committed state unchanged ("+why+")");
+      s.close(); }
+    CHECK(rmdir((ixp(d2)+".tmp").c_str())==0, "f1real2: tmp directory removed");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e6; CHECK(s.open(d2,&e6), "f1real2: clean restart: "+e6.str());
+      CHECK(PUB(s,4,1,1,3,&e6), "f1real2: a later publication succeeds");
+      CHECK(fexists(ixp(d2)), "f1real2: the index is published afterwards"); s.close(); }
+}
+
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){

@@ -637,3 +637,111 @@ Five on-disk states are distinguished; the classification is logged at open and 
   - OPEN-3: the full rewrite grows linearly in the number of segments (total ~44 MB at 8M records) versus
     a per-segment side file with O(1) publication cost. Documented for review; the single-artifact form
     was chosen for this slice.
+
+## 15. Stage 3B-D1-S1.1-F1 — corrupt-index recovery (S1.1-1) and publication-barrier faults (S1.1-2)
+
+Corrective slice over the accepted S1.1 commit `82d42ed9`. Nothing in §14 changes: the index is still
+derived, still non-authoritative, still published only inside the commit window, and
+`MANIFEST.undoSize` is still the sole authority. F1 only defines (a) what an OPERATOR may do when the
+derived artifact is corrupt, and (b) how the new barrier is fault-injected for testing.
+
+### 15.1 Policy: fail closed by default, recovery only on explicit authorization
+
+`open()` is exactly `openWithOptions(dir, OpenOptions(), e)`, i.e. the accepted S1.1 behaviour, unchanged:
+a structurally corrupt `UNDOINDEX` refuses the open and nothing is written, quarantined or rebuilt.
+
+Recovery requires the caller to pass an explicit, one-shot authorization:
+
+    cs::store3a::OpenOptions o; o.authorizeUndoIndexRecovery = true;
+    CommitStore3A s; ChainError e;
+    bool ok = s.openWithOptions(dir, o, &e);          // operator-authorized recovery
+    const UndoIndexRecoveryReport& r = s.lastUndoIndexRecovery();
+
+There is no datadir flag, no environment variable, no RPC, no CLI option and no production wiring; the
+default value of the flag is `false` and only a caller that deliberately sets it can trigger recovery.
+
+What an authorized open does when the artifact is structurally corrupt (read successfully, then failed
+validation):
+
+1. preserves the corrupt artifact under a collision-safe quarantine name (§15.3) — the evidence is kept,
+   never deleted, never overwritten;
+2. rebuilds the index EXCLUSIVELY from the committed state that `tryLoadManifest()` + `loadUndoFor()` have
+   just validated in the same open (the existing Store3A recovery path, including its primary/backup
+   MANIFEST logic) — the corrupt artifact is never read for content;
+3. writes the rebuilt index through the normal atomic publication path;
+4. never touches `MANIFEST`, `ACK`, `tree.dat` or committed `undo.dat`. Rebuilding an index therefore
+   cannot change what is committed or which generation is authoritative.
+
+Failures inside recovery stay fail-closed: if the quarantine or the rebuild publication fails, the open
+fails, the committed state is untouched, and a later clean attempt completes the recovery. An I/O error
+*reading* the artifact is classified differently from corruption (`indexReadError`) and is never
+quarantined — a datadir-level read problem is not a corrupt artifact.
+
+The authorization is one-shot per call and idempotent across interruptions and repetitions:
+
+* repeat on a healthy index -> `resolution = "already-current"`, no quarantine, no write;
+* the artifact was already quarantined and the name is free -> `resolution = "rebuilt"` (the ordinary
+  absent path);
+* interrupted between quarantine and rebuild -> the next attempt rebuilds from the committed stream;
+* nothing left to index (no closed segment) -> `rebuilt` with `nothingToIndex = true` (no index file is
+  created; that is the correct rebuild for a store with no closed segment).
+
+### 15.2 Quarantine semantics
+
+Name: `UNDOINDEX.corrupt.g<manifestGeneration>` and, on collision, `.1`, `.2`, ... up to 999.
+
+* Created with `link()` + `unlink()`: atomic, fails with `EEXIST` when the name is taken, so an existing
+  quarantine artifact can never be overwritten or lost. Where a filesystem has no hard links
+  (`EPERM`/`EMLINK`) the code falls back to an `lstat`-guarded rename and reports
+  `quarantineFallback = true` (residual race recorded as OPEN-F1-1).
+* The path, byte count and whether the fallback was used are reported in `UndoIndexRecoveryReport` and
+  printed, together with the operator request and the rebuilding result, so the action is never silent.
+* Quarantined artifacts are never reused, pruned or cleaned up by the store: they are diagnostic evidence
+  for the operator. They are also outside the `*.tmp` residue sweep.
+
+### 15.3 Updated state table for the corrupt row
+
+| situation | default (no authorization) | with `authorizeUndoIndexRecovery` |
+|---|---|---|
+| artifact read fails (I/O) | fail closed, nothing quarantined | fail closed, nothing quarantined (`indexReadError`) |
+| artifact read, validation fails | fail closed (`resolution="refused"`) | quarantine + rebuild from committed state |
+| artifact healthy | normal S1.1 classification | normal classification + `resolution="already-current"` |
+| absent / stale / ahead | normal S1.1 paths (unchanged) | identical (no change; they never needed authorization) |
+
+### 15.4 Fault-injection contract (test-only, finding S1.1-2)
+
+`injectUndoIndexFault(UndoIndexFault)` arms exactly one deterministic, one-shot fault at the publication
+barrier; `clearUndoIndexFaults()` resets it; `undoIndexFaultPending()` shows whether one is armed. The
+default is `None`, so no injection exists in a production run, and the fault is consumed by the first
+publication it affects (a second publication proceeds normally). No successful production ordering,
+MANIFEST/ACK authority or publication condition changed.
+
+Covered faults and where each is placed:
+
+| fault | placement | shape it reproduces |
+|---|---|---|
+| `TmpCreate` | before writing the tmp | the tmp open/write cannot be created |
+| `TmpShortWrite` | writes `n-1` bytes of the encoded index into the tmp, then fails | a short/partial write (a truncated tmp is left) |
+| `TmpFsync` | after the tmp write, at the fsync | temporary-file fsync failure (the tmp survives) |
+| `Rename` | at the rename | index rename failure (the tmp is removed, as the real path does) |
+| `DirFsync` | after the normalisation publication's `rename`, at the directory fsync | directory fsync failure during an ahead/stale normalisation |
+
+Two distinct evidence classes are reported separately in the F1 report:
+
+* **synthetic one-shot faults** — the control-flow consequences above, deterministic and precisely placed;
+* **real syscall failures** — no injection involved: `UNDOINDEX.tmp` symlinked to `/dev/full` (a genuine
+  `ENOSPC` on write) and `UNDOINDEX.tmp` replaced by a directory (a genuine `EISDIR` at creation). These
+  prove the same failure paths are reachable with the kernel actually refusing the call.
+
+In every case the committed protocol is untouched: the failed commit does not become a generation, and
+MANIFEST/ACK/logical digest/`undoCount`/the committed `undo.dat` and `tree.dat` PREFIXES are identical to
+an index-disabled control (the physical tails may differ — an uncommitted undo record or unreferenced CoW
+pages — which is the accepted semantics of every other barrier in this store).
+
+### 15.5 Open items added by F1
+
+* OPEN-F1-1: the `lstat`-guarded rename fallback used when hard links are unavailable has the same
+  check-then-act shape as any pathname guard; it is only reachable on filesystems without `link()` support
+  and is reported in-band (`quarantineFallback`).
+* OPEN-F1-2: if the index path is a directory (not a file), the artifact is refused as unreadable rather
+  than quarantined; such a datadir is broken independently of the store and no index recovery is attempted.

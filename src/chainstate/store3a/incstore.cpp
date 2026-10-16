@@ -457,9 +457,27 @@ bool CommitStore3A::publishUndoIndex(const UndoIndex& ix, ChainError* e){
     if (ixSkipNextPublish_){ ixSkipNextPublish_=false; return true; }   // test hook: simulated lost publication
     struct timespec t0,t1; clock_gettime(CLOCK_MONOTONIC,&t0);          // measured publication latency
     std::vector<uint8_t> bytes = ix.encode();
+    // S1.1-F1: one-shot test-only faults, each placed where the real syscall failure occurs. Default None.
+    if(ixFault_ == (int)UndoIndexFault::TmpCreate){
+        ixFault_ = (int)UndoIndexFault::None;
+        setErr(e,ErrCode::IO,"injected UNDOINDEX.tmp creation failure"); return false; }
+    if(ixFault_ == (int)UndoIndexFault::TmpShortWrite){
+        ixFault_ = (int)UndoIndexFault::None;                            // real shape: a truncated copy is left
+        size_t shortLen = bytes.size() ? bytes.size()-1 : 0;
+        if(!csWriteFile(p("UNDOINDEX.tmp"), bytes.data(), shortLen, false, false, e)){
+            setErr(e,ErrCode::IO,"injected short write on UNDOINDEX.tmp"); return false; }
+        setErr(e,ErrCode::IO,"injected short write on UNDOINDEX.tmp ("+std::to_string((unsigned long long)shortLen)+
+               " of "+std::to_string((unsigned long long)bytes.size())+" bytes)"); return false; }
     if(!csWriteFile(p("UNDOINDEX.tmp"), bytes.data(), bytes.size(), false, false, e)){
         ::unlink(p("UNDOINDEX.tmp").c_str()); return false; }
     ++ixFsyncs_;                                                        // csWriteFile fsyncs the file
+    if(ixFault_ == (int)UndoIndexFault::TmpFsync){
+        ixFault_ = (int)UndoIndexFault::None;                            // real shape: the tmp survives on disk
+        setErr(e,ErrCode::FS,"injected UNDOINDEX.tmp fsync failure"); return false; }
+    if(ixFault_ == (int)UndoIndexFault::Rename){
+        ixFault_ = (int)UndoIndexFault::None;
+        ::unlink(p("UNDOINDEX.tmp").c_str());
+        setErr(e,ErrCode::FS,"injected UNDOINDEX rename failure"); return false; }
     if(::rename(p("UNDOINDEX.tmp").c_str(), p("UNDOINDEX").c_str())!=0){
         setErr(e,ErrCode::FS,"rename UNDOINDEX"); ::unlink(p("UNDOINDEX.tmp").c_str()); return false; }
     ++ixPublishes_; ixBytesWritten_ += (uint64_t)bytes.size();
@@ -480,18 +498,86 @@ bool CommitStore3A::publishUndoIndexOnSegmentClose(uint64_t appendEndOffset, Cha
     return publishUndoIndex(ix, e);
 }
 
+// S1.1-F1 (finding S1.1-1): preserve a structurally corrupt derived artifact so the operator keeps the
+// diagnostic evidence, then let the caller rebuild from authoritative state. Guarantees: never overwrite or
+// delete an existing quarantined artifact; collision-safe naming; deterministic for a given datadir state;
+// MANIFEST/ACK/tree.dat/undo.dat are never touched. Only ever reached under explicit authorization.
+bool CommitStore3A::quarantineCorruptUndoIndex(std::string* quarantinePath, uint64_t* bytesOut,
+                                               bool* usedFallback, ChainError* e){
+    const std::string src = p("UNDOINDEX");
+    struct stat st;
+    if(::lstat(src.c_str(),&st)!=0){ setErr(e,ErrCode::IO,"lstat "+src); return false; }
+    *bytesOut = S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0;
+    *usedFallback = false;
+    const std::string base = "UNDOINDEX.corrupt.g" + std::to_string((unsigned long long)generation_);
+    for(int n=0;n<1000;++n){
+        const std::string cand = p(n ? base+"."+std::to_string(n) : base);
+        if(::link(src.c_str(), cand.c_str())==0){                 // atomic; fails with EEXIST if the name is taken
+            if(::unlink(src.c_str())!=0){ setErr(e,ErrCode::IO,"unlink "+src+" after quarantine to "+cand);
+                                          return false; }
+            *quarantinePath = cand; return true;
+        }
+        if(errno==EEXIST) continue;
+        if(errno==EPERM || errno==EMLINK){                        // no hard links here: lstat-guarded rename
+            struct stat cst; if(::lstat(cand.c_str(),&cst)==0) continue;
+            if(::rename(src.c_str(), cand.c_str())==0){ *usedFallback=true; *quarantinePath=cand; return true; }
+            if(errno==EEXIST) continue;
+        }
+        setErr(e,ErrCode::IO,"link "+src+" -> "+cand); return false;
+    }
+    setErr(e,ErrCode::FS,"no free quarantine name for "+src); return false;
+}
+
 bool CommitStore3A::classifyAndNormalizeUndoIndex(ChainError* e){
     if (ixDisabledForTest_){ undoIndexState_ = UndoIndexState::None; return true; }
     UndoIndex onDisk; bool exists=false;
-    if(!loadUndoIndexFromDisk(&exists,&onDisk,e)){ undoIndexState_ = UndoIndexState::Corrupt; return false; }
+    // S1.1-F1: read and validate the artifact in two distinct steps, because the recovery decision must
+    // tell "the bytes could not be read at all" (an I/O problem with the datadir -- never quarantined)
+    // apart from "the bytes were read and are structurally invalid" (a corrupt derived artifact).
+    std::vector<uint8_t> raw;
+    if(!csReadFile(p("UNDOINDEX"),&raw,&exists,e)){
+        undoIndexState_ = UndoIndexState::Corrupt; ixRecovery_.indexReadError = true; ixRecovery_.resolution="refused";
+        return false; }
+    ixRecovery_.indexPresent = exists;
+    if(exists && !UndoIndex::decode(raw.data(), raw.size(), &onDisk, e)){
+        if(!ixAuthorizeRecovery_){
+            undoIndexState_ = UndoIndexState::Corrupt; ixRecovery_.indexCorrupt = true;
+            ixRecovery_.resolution = "refused";                                  // DEFAULT: fail closed
+            return false;
+        }
+        // Explicit operator authorization: preserve the corrupt artifact for diagnostics, then rebuild
+        // EXCLUSIVELY from the committed stream that tryLoadManifest/loadUndoFor already validated above.
+        ixRecovery_.indexCorrupt = true;
+        std::string qp; uint64_t qb=0; bool qf=false; ChainError qe;
+        if(!quarantineCorruptUndoIndex(&qp,&qb,&qf,&qe)){
+            setErr(e,ErrCode::FS,"operator-authorized UNDOINDEX recovery failed to quarantine the corrupt "
+                   "artifact ("+qe.str()+"); refusing to open: "+dir_);
+            ixRecovery_.resolution = "refused"; return false; }
+        ixRecovery_.quarantinePath = qp; ixRecovery_.quarantinedBytes = qb; ixRecovery_.quarantineFallback = qf;
+        printf("UNDOINDEX: operator-authorized recovery requested; quarantined corrupt artifact %s -> %s "
+               "(%llu bytes)%s; rebuilding exclusively from the committed stream (MANIFEST.undoSize=%llu)\n",
+               p("UNDOINDEX").c_str(), qp.c_str(), (unsigned long long)qb,
+               qf ? " [hard link unavailable: lstat-guarded rename]" : "",
+               (unsigned long long)undoCommittedBytes_);
+        exists = false;                       // the name is free again -> the rebuild path below publishes it
+        clearErr(e);                          // the artifact is preserved off to the side; the open continues
+    }
     UndoIndex expected; buildUndoIndexFromMetas(undoIndex_, &expected);
     bool same = exists && onDisk.segmentSize==expected.segmentSize && onDisk.committedBytes==expected.committedBytes &&
                 onDisk.segments.size()==expected.segments.size();
     if (same) for(size_t i=0;i<expected.segments.size();++i){
         const UndoSegment&a=onDisk.segments[i]; const UndoSegment&b=expected.segments[i];
         if(a.startOffset!=b.startOffset||a.endOffset!=b.endOffset||a.recordCount!=b.recordCount){ same=false; break; } }
-    if (same){ undoIndexState_ = UndoIndexState::Current; return true; }
-    if (!exists && expected.segments.empty()){ undoIndexState_ = UndoIndexState::Absent; return true; }
+    if (same){
+        undoIndexState_ = UndoIndexState::Current;
+        // S1.1-F1: a repeated recovery request on a healthy index must be a no-op.
+        ixRecovery_.resolution = ixAuthorizeRecovery_ ? "already-current" : "none";
+        return true; }
+    if (!exists && expected.segments.empty()){
+        undoIndexState_ = UndoIndexState::Absent;
+        ixRecovery_.rebuilt = true; ixRecovery_.nothingToIndex = true;     // nothing closed -> no file written
+        ixRecovery_.resolution = ixRecovery_.indexCorrupt ? "quarantined+rebuilt" : "already-current";
+        return true; }
     UndoIndexState cls = UndoIndexState::Absent;
     if (exists) {
         // Classified against the closed-segment prefix IMPLIED BY THE COMMITTED RANGE -- not against raw
@@ -510,9 +596,17 @@ bool CommitStore3A::classifyAndNormalizeUndoIndex(ChainError* e){
     printf("UNDOINDEX: %s; rebuilding %zu closed segment(s) for committedBytes=%llu\n",
            why, expected.segments.size(), (unsigned long long)expected.committedBytes);
     if(!publishUndoIndex(expected, e)) return false;
+    if(ixFault_ == (int)UndoIndexFault::DirFsync){                       // S1.1-F1: one-shot test-only fault
+        ixFault_ = (int)UndoIndexFault::None;
+        setErr(e,ErrCode::FS,"injected UNDOINDEX directory fsync failure");
+        ixRecovery_.resolution = "refused"; return false; }
     if(!csFsyncDir(dir_, e)) return false;                              // normalisation is its own publication
     ++ixFsyncs_;
     undoIndexState_ = cls;
+    ixRecovery_.rebuilt = true;
+    ixRecovery_.rebuiltSegments = expected.segments.size();
+    ixRecovery_.rebuiltCommittedBytes = expected.committedBytes;
+    ixRecovery_.resolution = ixRecovery_.indexCorrupt ? "quarantined+rebuilt" : "rebuilt";
     return true;
 }
 
@@ -528,7 +622,17 @@ bool CommitStore3A::tryLoadManifest(const std::string& path, bool* exists, uint3
     *rootId=m.rootPageId; *rootHash=m.rootHash; return true;
 }
 
+// S1.1-F1: open() is exactly the fail-closed default; recovery of a corrupt derived index requires the
+// explicit one-shot authorization carried by OpenOptions (see the header). No other behaviour differs.
 bool CommitStore3A::open(const std::string& dir, ChainError* e){
+    return openWithOptions(dir, OpenOptions(), e);
+}
+
+bool CommitStore3A::openWithOptions(const std::string& dir, const OpenOptions& opts, ChainError* e){
+    ixAuthorizeRecovery_ = opts.authorizeUndoIndexRecovery;
+    ixRecovery_ = UndoIndexRecoveryReport();
+    ixRecovery_.authorized = ixAuthorizeRecovery_;
+    ixRecovery_.resolution = "none";
     clearErr(e); if(opened_){ setErr(e,ErrCode::ALREADY_OPEN,dir); return false; }
     dir_=dir; if(!ensureDir(dir_)){ setErr(e,ErrCode::IO,"cannot create dir "+dir_); return false; }
     lockFd_=::open(p("LOCK").c_str(),O_RDWR|O_CREAT,0644);
