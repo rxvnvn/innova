@@ -691,9 +691,17 @@ The authorization is one-shot per call and idempotent across interruptions and r
 Name: `UNDOINDEX.corrupt.g<manifestGeneration>` and, on collision, `.1`, `.2`, ... up to 999.
 
 * Created with `link()` + `unlink()`: atomic, fails with `EEXIST` when the name is taken, so an existing
-  quarantine artifact can never be overwritten or lost. Where a filesystem has no hard links
-  (`EPERM`/`EMLINK`) the code falls back to an `lstat`-guarded rename and reports
-  `quarantineFallback = true` (residual race recorded as OPEN-F1-1).
+  quarantine artifact can never be overwritten or lost. There is deliberately **no rename fallback**: on Linux
+  `rename()` atomically REPLACES an existing destination and does not report `EEXIST`, so a check-then-rename
+  could destroy evidence. A hard link is the only move primitive here; if `link()` fails for any reason other
+  than a taken name (for example `EPERM`/`EMLINK` where hard links are denied, or another filesystem error) the
+  quarantine **fails closed**: the corrupt artifact stays exactly where it is, existing quarantine artifacts are
+  untouched, nothing is rebuilt or published, and the diagnostic carries the errno and tells the operator to
+  preserve/move the corrupt artifact manually before retrying.
+* The move is `link()` then `unlink()` of the source, which is not one atomic step. If the `unlink()` fails, the
+  open fails closed and the diagnostic states that the corrupt artifact is STILL IN PLACE and that a hard link to
+  it may remain at the candidate name. An unlink failure must never be treated as success: the rebuild would then
+  publish over the still-present corrupt artifact, destroying the very evidence the quarantine had just saved.
 * The path, byte count and whether the fallback was used are reported in `UndoIndexRecoveryReport` and
   printed, together with the operator request and the rebuilding result, so the action is never silent.
 * Quarantined artifacts are never reused, pruned or cleaned up by the store: they are diagnostic evidence
@@ -740,8 +748,9 @@ pages — which is the accepted semantics of every other barrier in this store).
 
 ### 15.5 Open items added by F1
 
-* OPEN-F1-1: the `lstat`-guarded rename fallback used when hard links are unavailable has the same
-  check-then-act shape as any pathname guard; it is only reachable on filesystems without `link()` support
-  and is reported in-band (`quarantineFallback`).
+* OPEN-F1-1 (**CLOSED** in S1.1-F2): the `lstat`-guarded rename fallback was deleted. Hard links are now the
+  only move primitive and every failure other than a taken name fails closed (see §15.2), so no
+  check-then-act path can overwrite quarantine evidence. `UndoIndexRecoveryReport.quarantineFallback` was
+  removed with it (it could no longer be true).
 * OPEN-F1-2: if the index path is a directory (not a file), the artifact is refused as unreadable rather
   than quarantined; such a datadir is broken independently of the store and no index recovery is attempted.

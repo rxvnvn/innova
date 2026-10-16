@@ -108,7 +108,6 @@ struct UndoIndexRecoveryReport {
     bool     indexCorrupt = false;      // the artifact was read but failed structural validation
     std::string quarantinePath;         // where the corrupt artifact was preserved ("" => none)
     uint64_t quarantinedBytes = 0;
-    bool     quarantineFallback = false;// hard links unavailable: an lstat-guarded rename was used
     bool     rebuilt = false;           // the index was rebuilt from the committed stream
     bool     nothingToIndex = false;    // the rebuild found no closed segment (no index file written)
     size_t   rebuiltSegments = 0;
@@ -222,6 +221,9 @@ public:
     void injectUndoIndexFault(UndoIndexFault f) { ixFault_ = (int)f; }   // S1.1-F1: one-shot
     void clearUndoIndexFaults() { ixFault_ = (int)UndoIndexFault::None; }
     bool undoIndexFaultPending() const { return ixFault_ != (int)UndoIndexFault::None; }
+    // S1.1-F2: one-shot test-only errno injection for the quarantine hard link (0 = off; never set outside
+    // tests). An injected failure is consumed by the first link() attempt, so a later retry uses the real path.
+    void injectQuarantineLinkErrnoForTest(int e){ ixQuarantineLinkErrno_ = e; }
 
 private:
     bool ns(InjectStage s) const { return injectStage_ == s && injectNoSpace_; }
@@ -243,7 +245,9 @@ private:
     bool publishUndoIndexOnSegmentClose(uint64_t appendEndOffset, ChainError* e);
     // S1.1-F1: preserve a corrupt derived artifact under a collision-safe name, never overwriting an
     // existing file; returns the quarantine path. Only ever called under explicit operator authorization.
-    bool quarantineCorruptUndoIndex(std::string* quarantinePath, uint64_t* bytes, bool* usedFallback, ChainError* e);
+    // S1.1-F2 (finding F1-1): link()+unlink() is the ONLY move primitive here -- there is deliberately no
+    // lstat+rename fallback (rename can atomically REPLACE an existing quarantine artifact on Linux).
+    bool quarantineCorruptUndoIndex(std::string* quarantinePath, uint64_t* bytes, ChainError* e);
     bool commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e);
     bool writeAck(uint64_t gen, ChainError* e);
     bool readAck(bool* present, uint64_t* gen, ChainError* e);
@@ -277,6 +281,7 @@ private:
     bool ixSkipNextPublish_ = false;    // test hook: simulate one lost index publication (power-loss shape)
     bool ixDisabledForTest_ = false;    // test hook: control run -- never touch UNDOINDEX at all
     int ixFault_ = 0;                   // S1.1-F1: one-shot injected publication-barrier fault (None by default)
+    int ixQuarantineLinkErrno_ = 0;     // S1.1-F2: one-shot injected errno for the quarantine link (0 = off)
     bool ixAuthorizeRecovery_ = false;  // S1.1-F1: set only from openWithOptions(authorize=...)
     UndoIndexRecoveryReport ixRecovery_;// S1.1-F1: what the last open did about the index artifact
     CrashPoint crashPoint_ = CrashPoint::None;

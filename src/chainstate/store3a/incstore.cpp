@@ -502,30 +502,44 @@ bool CommitStore3A::publishUndoIndexOnSegmentClose(uint64_t appendEndOffset, Cha
 // diagnostic evidence, then let the caller rebuild from authoritative state. Guarantees: never overwrite or
 // delete an existing quarantined artifact; collision-safe naming; deterministic for a given datadir state;
 // MANIFEST/ACK/tree.dat/undo.dat are never touched. Only ever reached under explicit authorization.
-bool CommitStore3A::quarantineCorruptUndoIndex(std::string* quarantinePath, uint64_t* bytesOut,
-                                               bool* usedFallback, ChainError* e){
+bool CommitStore3A::quarantineCorruptUndoIndex(std::string* quarantinePath, uint64_t* bytesOut, ChainError* e){
     const std::string src = p("UNDOINDEX");
     struct stat st;
     if(::lstat(src.c_str(),&st)!=0){ setErr(e,ErrCode::IO,"lstat "+src); return false; }
-    *bytesOut = S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0;
-    *usedFallback = false;
+    *bytesOut = S_ISREG(st.st_mode) ? (uint64_t)st.st_size : 0;   // report size only; no move decision uses it
     const std::string base = "UNDOINDEX.corrupt.g" + std::to_string((unsigned long long)generation_);
     for(int n=0;n<1000;++n){
         const std::string cand = p(n ? base+"."+std::to_string(n) : base);
-        if(::link(src.c_str(), cand.c_str())==0){                 // atomic; fails with EEXIST if the name is taken
-            if(::unlink(src.c_str())!=0){ setErr(e,ErrCode::IO,"unlink "+src+" after quarantine to "+cand);
-                                          return false; }
+        int lrc;
+        if(ixQuarantineLinkErrno_){                    // S1.1-F2: one-shot test-only injection (off by default)
+            errno = ixQuarantineLinkErrno_; ixQuarantineLinkErrno_ = 0; lrc = -1;
+        } else lrc = ::link(src.c_str(), cand.c_str());
+        if(lrc==0){                                    // atomic; EEXIST is the only recoverable outcome
+            if(::unlink(src.c_str())!=0){
+                // The link exists but the SOURCE could not be removed. Proceeding would let the rebuild publish
+                // over the still-present corrupt artifact and destroy the evidence just preserved, so this is a
+                // fail-closed abort (never a success), with the residue named for the operator.
+                const int ue=errno;
+                setErr(e,ErrCode::IO,"automatic quarantine of "+src+" could not be completed: link("+src+" -> "
+                       +cand+") succeeded but unlink("+src+") failed (errno="+std::to_string(ue)+"); the corrupt "
+                       "artifact is STILL IN PLACE and a hard link to it may remain at "+cand+
+                       " -- preserve/move it manually and retry");
+                return false; }
             *quarantinePath = cand; return true;
         }
-        if(errno==EEXIST) continue;
-        if(errno==EPERM || errno==EMLINK){                        // no hard links here: lstat-guarded rename
-            struct stat cst; if(::lstat(cand.c_str(),&cst)==0) continue;
-            if(::rename(src.c_str(), cand.c_str())==0){ *usedFallback=true; *quarantinePath=cand; return true; }
-            if(errno==EEXIST) continue;
-        }
-        setErr(e,ErrCode::IO,"link "+src+" -> "+cand); return false;
+        if(errno==EEXIST) continue;                    // name taken: try the next suffix
+        // S1.1-F2 (finding F1-1): hard links are the ONLY move primitive. There is deliberately NO
+        // lstat-then-rename fallback: on Linux rename() atomically REPLACES an existing regular-file
+        // destination and does not report EEXIST, so such a fallback could silently destroy an existing
+        // quarantine artifact. Any error other than "name taken" therefore fails closed and changes nothing.
+        const int le=errno;
+        setErr(e,ErrCode::IO,"automatic quarantine of "+src+" could not be completed: link("+src+" -> "+cand+
+               ") errno="+std::to_string(le)+" (hard links unavailable or denied); preserve/move the corrupt "
+               "artifact manually and retry");
+        return false;
     }
-    setErr(e,ErrCode::FS,"no free quarantine name for "+src); return false;
+    setErr(e,ErrCode::FS,"no free quarantine name for "+src+" -- preserve/move existing quarantine artifacts "
+           "manually and retry"); return false;
 }
 
 bool CommitStore3A::classifyAndNormalizeUndoIndex(ChainError* e){
@@ -548,16 +562,15 @@ bool CommitStore3A::classifyAndNormalizeUndoIndex(ChainError* e){
         // Explicit operator authorization: preserve the corrupt artifact for diagnostics, then rebuild
         // EXCLUSIVELY from the committed stream that tryLoadManifest/loadUndoFor already validated above.
         ixRecovery_.indexCorrupt = true;
-        std::string qp; uint64_t qb=0; bool qf=false; ChainError qe;
-        if(!quarantineCorruptUndoIndex(&qp,&qb,&qf,&qe)){
+        std::string qp; uint64_t qb=0; ChainError qe;
+        if(!quarantineCorruptUndoIndex(&qp,&qb,&qe)){
             setErr(e,ErrCode::FS,"operator-authorized UNDOINDEX recovery failed to quarantine the corrupt "
                    "artifact ("+qe.str()+"); refusing to open: "+dir_);
-            ixRecovery_.resolution = "refused"; return false; }
-        ixRecovery_.quarantinePath = qp; ixRecovery_.quarantinedBytes = qb; ixRecovery_.quarantineFallback = qf;
+            ixRecovery_.resolution = "quarantine-failed"; return false; }
+        ixRecovery_.quarantinePath = qp; ixRecovery_.quarantinedBytes = qb;
         printf("UNDOINDEX: operator-authorized recovery requested; quarantined corrupt artifact %s -> %s "
-               "(%llu bytes)%s; rebuilding exclusively from the committed stream (MANIFEST.undoSize=%llu)\n",
+               "(%llu bytes); rebuilding exclusively from the committed stream (MANIFEST.undoSize=%llu)\n",
                p("UNDOINDEX").c_str(), qp.c_str(), (unsigned long long)qb,
-               qf ? " [hard link unavailable: lstat-guarded rename]" : "",
                (unsigned long long)undoCommittedBytes_);
         exists = false;                       // the name is free again -> the rebuild path below publishes it
         clearErr(e);                          // the artifact is preserved off to the side; the open continues

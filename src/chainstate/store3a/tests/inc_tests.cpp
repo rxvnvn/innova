@@ -2897,10 +2897,84 @@ static void test_undoidx_f1_real(){
       CHECK(fexists(ixp(d2)), "f1real2: the index is published afterwards"); s.close(); }
 }
 
+
+// (F2) S1.1-F2 / finding F1-1: the quarantine move must be atomic or fail closed -- never an overwriting rename
+static void test_undoidx_f2_linkfail(){
+    g_cur="UNDOIDX-F2-linkfail";
+    ChainError e; const uint32_t S=4;
+    const int kErrn[2]={EPERM,EMLINK};
+    for(int k=0;k<2;++k){
+        const int inj=kErrn[k];
+        const std::string tag=(inj==EPERM)?"eperm":"emlink";
+        std::string d=freshDir("undoidx_f2_"+tag);
+        AuthSnap before; CHECK(buildIdxStore(d,5,S,&before,&e), "f2 "+tag+": build 5 records + valid index");
+        std::string good=slurp(ixp(d));
+        // pre-existing quarantine evidence at the FIRST candidate name: must survive untouched
+        std::string pre=qpath(d,before.gen,0);
+        CHECK(spill(pre,"PRE-EXISTING-QUARANTINE-EVIDENCE"), "f2 "+tag+": pre-existing artifact at the first candidate");
+        Hash preH=fdig(pre);
+        std::string corrupt=corruptIndexBytes(good,48+3);
+        CHECK(spill(ixp(d),corrupt), "f2 "+tag+": index corrupted");
+        Hash badH=fdig(ixp(d));
+
+        // (a) hard-link failure -> fail closed, nothing moved, nothing rebuilt, nothing published
+        { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+          s.injectQuarantineLinkErrnoForTest(inj);                       // test-only, one-shot
+          OpenOptions o; o.authorizeUndoIndexRecovery=true;
+          ChainError e2; bool ok=s.openWithOptions(d,o,&e2);
+          CHECK(!ok, "f2 "+tag+": authorized open FAILS CLOSED when the hard link cannot be created");
+          const UndoIndexRecoveryReport r=s.lastUndoIndexRecovery();
+          CHECK(r.quarantinePath.empty(), "f2 "+tag+": no quarantine artifact is reported as created");
+          CHECK(r.resolution=="quarantine-failed", "f2 "+tag+": resolution names the quarantine failure ("+r.resolution+")");
+          const std::string msg=e2.str();
+          printf("F2-LINKFAIL %s injected_errno=%d quarantinePath=%s resolution=%s\n            msg=%s\n",
+                 tag.c_str(), inj, r.quarantinePath.empty()?"(none)":r.quarantinePath.c_str(),
+                 r.resolution.c_str(), msg.c_str());           // raw failure-path evidence
+          CHECK(msg.find("automatic quarantine")!=std::string::npos,
+                "f2 "+tag+": diagnostic says automatic quarantine could not be completed: "+msg);
+          CHECK(msg.find("manually")!=std::string::npos, "f2 "+tag+": diagnostic tells the operator to act manually");
+          CHECK(msg.find("errno="+std::to_string(inj))!=std::string::npos,
+                "f2 "+tag+": diagnostic carries the hard-link errno "+std::to_string(inj));
+          CHECK(slurp(ixp(d))==corrupt && fdig(ixp(d))==badH,
+                "f2 "+tag+": the corrupt UNDOINDEX remains byte-identical");
+          CHECK(fdig(pre)==preH, "f2 "+tag+": the pre-existing quarantine artifact is untouched");
+          CHECK(quarantineCount(d)==1, "f2 "+tag+": no new quarantine artifact was created");
+          CHECK(!fexists(qpath(d,before.gen,1)), "f2 "+tag+": the next candidate suffix was not created either");
+          CHECK(!fexists(ixp(d)+".tmp"), "f2 "+tag+": no publication was attempted");
+          CHECK(s.undoIndexPublications()==0, "f2 "+tag+": no index publication happened");
+          // The failed attempt must not leave a healthy state behind, and the report must carry the
+          // corruption flag (the precise undoIndexState_ value on this abort path is a diagnostic nit
+          // reported as OPEN-F2-1: the authorized branch sets indexCorrupt but not undoIndexState_).
+          CHECK(r.indexCorrupt && s.undoIndexState()!=UndoIndexState::Current,
+                "f2 "+tag+": the store does not report a healthy index after the failed quarantine"); }
+
+        // (b) a subsequent clean authorized retry succeeds via the normal atomic hard-link path
+        { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); OpenOptions o; o.authorizeUndoIndexRecovery=true;
+          ChainError e3; bool ok=s.openWithOptions(d,o,&e3);
+          CHECK(ok, "f2 "+tag+": clean authorized retry succeeds: "+e3.str());
+          const UndoIndexRecoveryReport r=s.lastUndoIndexRecovery();
+          CHECK(r.quarantinePath==qpath(d,before.gen,1),
+                "f2 "+tag+": the retry quarantines to the next free suffix ("+r.quarantinePath+")");
+          CHECK(slurp(r.quarantinePath)==corrupt, "f2 "+tag+": quarantined bytes == the corrupt artifact");
+          CHECK(s.undoIndexPublications()==1, "f2 "+tag+": exactly one publication after the successful retry");
+          CHECK(slurp(ixp(d))==good, "f2 "+tag+": index rebuilt correctly");
+          CHECK(fdig(pre)==preH, "f2 "+tag+": pre-existing artifact still untouched");
+          AuthSnap now; CHECK(authSnap(d,&s,&now,&e3), "f2 "+tag+": snapshot after the retry");
+          std::string why; CHECK(committedMatch(d,before,d,now,&why),
+                "f2 "+tag+": committed authority unchanged ("+why+")");
+          s.close(); }
+        CHECK(quarantineCount(d)==2, "f2 "+tag+": exactly two artifacts (pre-existing + retry)");
+        { std::vector<std::string> ql; quarantineList(d,&ql);                       // bare names, no directory
+          const std::string n0="UNDOINDEX.corrupt.g"+std::to_string((unsigned long long)before.gen);
+          CHECK(ql.size()==2 && ql[0]==n0 && ql[1]==n0+".1",
+                "f2 "+tag+": artifact names are the expected deterministic pair"); }
+    }
+}
+
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){
