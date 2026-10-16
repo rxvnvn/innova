@@ -2484,7 +2484,6 @@ const char* ProcessBlockRejectReasonName(ProcessBlockRejectReason reason)
     case PBREJECT_DUPLICATE_INDEXED: return "DUPLICATE_INDEXED";
     case PBREJECT_DUPLICATE_ORPHAN: return "DUPLICATE_ORPHAN";
     case PBREJECT_DUPLICATE_INDEXED_STAKE: return "DUPLICATE_INDEXED_STAKE";
-    case PBREJECT_POS_AFTER_DAG: return "POS_AFTER_DAG";
     case PBREJECT_CHECKBLOCK_FALSE: return "CHECKBLOCK_FALSE";
     case PBREJECT_WEAK_CHECKPOINT: return "WEAK_CHECKPOINT";
     case PBREJECT_ORPHAN_LIMIT_IBD: return "ORPHAN_LIMIT_IBD";
@@ -2493,7 +2492,6 @@ const char* ProcessBlockRejectReasonName(ProcessBlockRejectReason reason)
     case PBREJECT_OPERATOR_INVALIDATED: return "OPERATOR_INVALIDATED";
     case PBREJECT_ACCEPTBLOCK_FALSE: return "ACCEPTBLOCK_FALSE";
     case PBREJECT_UNKNOWN_FALSE: return "UNKNOWN_FALSE";
-    case PBREJECT_DAG_PARENT_STRUCTURAL: return "DAG_PARENT_STRUCTURAL";
     case PBREJECT_AUTHORITY_UNAVAILABLE: return "AUTHORITY_UNAVAILABLE";
     }
     return "UNKNOWN_FALSE";
@@ -2631,7 +2629,6 @@ const char* AcceptBlockRejectReasonName(AcceptBlockRejectReason reason)
     case ABREJECT_PREV_NOT_FOUND: return "prev-not-found";
     case ABREJECT_OPERATOR_INVALIDATED: return "operator-invalidated";
     case ABREJECT_PREV_OPERATOR_INVALIDATED: return "prev-operator-invalidated";
-    case ABREJECT_POS_AFTER_DAG: return "pos-after-dag";
     case ABREJECT_BLOCK_SIZE: return "block-size";
     case ABREJECT_INCORRECT_BITS: return "incorrect-bits";
     case ABREJECT_TIMESTAMP_TOO_EARLY: return "timestamp-too-early";
@@ -2641,10 +2638,8 @@ const char* AcceptBlockRejectReasonName(AcceptBlockRejectReason reason)
     case ABREJECT_RINGSIG_DEPRECATION: return "ringsig-deprecation";
     case ABREJECT_SYNC_CHECKPOINT: return "sync-checkpoint";
     case ABREJECT_COINBASE_HEIGHT: return "coinbase-height";
-    case ABREJECT_DAG_PARENT: return "dag-parent";
     case ABREJECT_DISK_SPACE: return "disk-space";
     case ABREJECT_WRITE_TO_DISK: return "write-to-disk";
-    case ABREJECT_LEGACY_DAG_RETIRED_DOMAIN: return "legacy-dag-retired-domain";
     case ABREJECT_ADD_TO_BLOCK_INDEX: return "add-to-block-index";
     }
     return "unknown";
@@ -2658,7 +2653,6 @@ const char* AcceptBlockRejectStageName(AcceptBlockRejectReason reason)
     case ABREJECT_PREV_NOT_FOUND: return "prev";
     case ABREJECT_OPERATOR_INVALIDATED:
     case ABREJECT_PREV_OPERATOR_INVALIDATED: return "operator";
-    case ABREJECT_POS_AFTER_DAG:
     case ABREJECT_BLOCK_SIZE:
     case ABREJECT_INCORRECT_BITS: return "consensus";
     case ABREJECT_TIMESTAMP_TOO_EARLY: return "timestamp";
@@ -2668,10 +2662,8 @@ const char* AcceptBlockRejectStageName(AcceptBlockRejectReason reason)
     case ABREJECT_CHECK_POS_FAILED: return "pos";
     case ABREJECT_RINGSIG_DEPRECATION: return "ringsig";
     case ABREJECT_COINBASE_HEIGHT: return "coinbase";
-    case ABREJECT_DAG_PARENT: return "dag";
     case ABREJECT_DISK_SPACE:
     case ABREJECT_WRITE_TO_DISK: return "disk";
-    case ABREJECT_LEGACY_DAG_RETIRED_DOMAIN: return "legacy-dag-retired-domain";
     case ABREJECT_ADD_TO_BLOCK_INDEX: return "index";
     }
     return "unknown";
@@ -3660,9 +3652,6 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
         LOCK(cs);
         if (mapTx.count(hash))
             return false;
-        // IDAG Phase 3: Reject txids already included in a DAG sibling block
-        if (setDAGSeenTxids.count(hash))
-            return error("CTxMemPool::accept() : tx %s already in DAG sibling block", hash.ToString().substr(0, 20).c_str());
     }
 
     if (txdb.ContainsTx(hash))
@@ -4061,56 +4050,12 @@ bool CTxMemPool::removeConflicts(const CTransaction &tx)
     return true;
 }
 
-// IDAG Phase 3: Remove mempool transactions that appear in a DAG sibling block
-void CTxMemPool::RemoveDAGConflicts(const uint256& hashBlock)
-{
-    CBlock block;
-    std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashBlock);
-    if (mi == mapBlockIndex.end())
-        return;
-
-    if (!block.ReadFromDisk(mi->second))
-        return;
-
-    LOCK(cs);
-
-    // Cap setDAGSeenTxids to prevent unbounded memory growth
-    static const size_t MAX_DAG_SEEN_TXIDS = 100000;
-    if (setDAGSeenTxids.size() > MAX_DAG_SEEN_TXIDS)
-        setDAGSeenTxids.clear(); // periodic reset when cap exceeded
-
-    int nRemoved = 0;
-    for (const CTransaction& tx : block.vtx)
-    {
-        uint256 txHash = tx.GetHash();
-        setDAGSeenTxids.insert(txHash);
-
-        if (mapTx.count(txHash))
-        {
-            // Full cleanup: mapTx, mapNextTx
-            CTransaction txCopy = mapTx[txHash];
-
-            for (const CTxIn& txin : txCopy.vin)
-                mapNextTx.erase(txin.prevout);
-
-            mapTx.erase(txHash);
-            nRemoved++;
-            ++nTransactionsUpdated;
-        }
-    }
-
-    if (nRemoved > 0)
-        printf("RemoveDAGConflicts: removed %d txs from mempool (sibling block %s)\n",
-               nRemoved, hashBlock.ToString().substr(0, 20).c_str());
-}
-
 void CTxMemPool::clear()
 {
     LOCK(cs);
     mapTx.clear();
     mapNextTx.clear();
     mapKeyImage.clear();
-    setDAGSeenTxids.clear();
     ++nTransactionsUpdated;
 }
 
@@ -6359,9 +6304,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 
     std::set<uint256> setBlockNullifiers;
 
-    // IDAG: Collect spent outputs from DAG sibling blocks (lower hash = canonical earlier)
-    // Transactions conflicting with already-spent outputs from siblings are skipped
-
     int64_t nTransparentValidateMicros = 0;
     int64_t nAnonValidateMicros = 0;
     unsigned int nTransparentValidateCount = 0;
@@ -7456,8 +7398,6 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew, bool* pfNavigationFa
     }
 
 
-    // IDAG: Clean up DAG data for disconnected blocks
-    // Phase 1: Batch all LevelDB erasures atomically
     // LEGACY DAG RETIREMENT (Phase 1): the DAG-link erase / authoritative
     // full-field restaging / recolour lifecycle is retired authority and executes
     // only inside the explicitly scoped experimental profile. The retired path
@@ -8053,11 +7993,6 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         ibdactivepath::GetCounters().addtoblockindex_us_max,
         ibdactivepath::GetCounters().addtoblockindex_count,
         "addtoblockindex", nBestHeight + 1);
-    int64_t nAddStart = GetTimeMillis();
-    int64_t nDAGInitMs = 0;
-    int64_t nDAGColorMs = 0;
-    int64_t nDAGWriteMs = 0;
-
     // Check for duplicate
     uint256 hash = GetHash();
     ibdblocklatency::RecordAddToBlockIndexBegin(hash);
@@ -8302,10 +8237,6 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         }
     }
 
-    if (fDebug && GetBoolArg("-showtimers", false))
-        printf("AddToBlockIndex: height=%d total=%" PRId64"ms dag_init=%" PRId64"ms dag_color=%" PRId64"ms dag_write=%" PRId64"ms\n",
-               pindexNew->nHeight, GetTimeMillis() - nAddStart, nDAGInitMs, nDAGColorMs, nDAGWriteMs);
-
     // ---- G1: persist accepted authoritative blocks into the mutable tip ----
     // In BY_VALUE_AUTHORITATIVE mode the accepted block (pindexNew, fully
     // consensus-validated) must be recorded as permanent V2 authority in
@@ -8430,10 +8361,10 @@ bool CBlock::CheckBlock(bool fCheckPOW, bool fCheckMerkleRoot, bool fCheckSig, c
     if (IsProofOfStake())
     {
         // Coinbase output should be empty if proof-of-stake block
-        // Post-DAG: allow additional zero-value OP_RETURN outputs for DAG parent commitment
+        // Allow additional zero-value OP_RETURN outputs (data commitment) in PoS coinbase
         if (!vtx[0].vout[0].IsEmpty())
             { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : coinbase vout[0] not empty for proof-of-stake block")); }
-        // Cap extra outputs (1 empty + up to 2 OP_RETURN for DAG/data)
+        // Cap extra outputs (1 empty + up to 2 OP_RETURN data outputs)
         if (vtx[0].vout.size() > 3)
             { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : too many coinbase outputs (%d) for proof-of-stake block", (int)vtx[0].vout.size())); }
         if (vtx[0].vout.size() > 1)
@@ -8442,7 +8373,7 @@ bool CBlock::CheckBlock(bool fCheckPOW, bool fCheckMerkleRoot, bool fCheckSig, c
             {
                 if (vtx[0].vout[i].nValue != 0)
                     { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : non-zero coinbase output[%d] in proof-of-stake block", i)); }
-                // Must be OP_RETURN (DAG commitment or similar data-carrying output)
+                // Must be OP_RETURN (data-carrying output)
                 if (vtx[0].vout[i].scriptPubKey.size() < 1 || vtx[0].vout[i].scriptPubKey[0] != OP_RETURN)
                     { if (ppszRejectReason) *ppszRejectReason = "CHECKBLOCK_POS_STRUCTURE"; return DoS(100, error("CheckBlock() : non-OP_RETURN extra coinbase output[%d] in proof-of-stake block", i)); }
             }

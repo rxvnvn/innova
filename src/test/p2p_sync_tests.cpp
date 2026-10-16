@@ -3311,8 +3311,6 @@ BOOST_AUTO_TEST_CASE(processblock_false_paths_emit_specific_reason)
                       std::string("DUPLICATE_INDEXED"));
     BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_DUPLICATE_ORPHAN),
                       std::string("DUPLICATE_ORPHAN"));
-    BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_POS_AFTER_DAG),
-                      std::string("POS_AFTER_DAG"));
     BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_CHECKBLOCK_FALSE),
                       std::string("CHECKBLOCK_FALSE"));
     BOOST_CHECK_EQUAL(ProcessBlockRejectReasonName(PBREJECT_ORPHAN_LIMIT_IBD),
@@ -3349,8 +3347,6 @@ BOOST_AUTO_TEST_CASE(acceptblock_reject_trace_enable_and_reason_mapping)
                       std::string("operator-invalidated"));
     BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_PREV_OPERATOR_INVALIDATED),
                       std::string("prev-operator-invalidated"));
-    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_POS_AFTER_DAG),
-                      std::string("pos-after-dag"));
     BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_BLOCK_SIZE),
                       std::string("block-size"));
     BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_INCORRECT_BITS),
@@ -3369,8 +3365,6 @@ BOOST_AUTO_TEST_CASE(acceptblock_reject_trace_enable_and_reason_mapping)
                       std::string("sync-checkpoint"));
     BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_COINBASE_HEIGHT),
                       std::string("coinbase-height"));
-    BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_DAG_PARENT),
-                      std::string("dag-parent"));
     BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_DISK_SPACE),
                       std::string("disk-space"));
     BOOST_CHECK_EQUAL(AcceptBlockRejectReasonName(ABREJECT_WRITE_TO_DISK),
@@ -3396,8 +3390,6 @@ BOOST_AUTO_TEST_CASE(acceptblock_reject_trace_enable_and_reason_mapping)
                       std::string("checkpoint"));
     BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_COINBASE_HEIGHT),
                       std::string("coinbase"));
-    BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_DAG_PARENT),
-                      std::string("dag"));
     BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_WRITE_TO_DISK),
                       std::string("disk"));
     BOOST_CHECK_EQUAL(AcceptBlockRejectStageName(ABREJECT_ADD_TO_BLOCK_INDEX),

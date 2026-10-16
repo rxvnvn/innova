@@ -371,7 +371,6 @@ bool CTxDB::EraseAnonOutput(CPubKey& pkCoin)
 // certification scan). "The certificate verifies" is therefore a recomputation,
 // never a timestamp, a floor advancement or a final-state digest alone.
 // ---------------------------------------------------------------------------
-static bool g_dagCertDeepVerified = false;
 bool g_testSuppressDagCustodyWatermark = false;   // R3.9 case M (test-only; see header)
 
 static uint256 XorUint256(uint256 a, uint256 b)

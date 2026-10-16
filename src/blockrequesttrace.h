@@ -222,7 +222,6 @@ enum ProcessBlockRejectReason
     PBREJECT_DUPLICATE_INDEXED = 0,
     PBREJECT_DUPLICATE_ORPHAN,
     PBREJECT_DUPLICATE_INDEXED_STAKE,
-    PBREJECT_POS_AFTER_DAG,
     PBREJECT_CHECKBLOCK_FALSE,
     PBREJECT_WEAK_CHECKPOINT,
     PBREJECT_ORPHAN_LIMIT_IBD,
@@ -231,10 +230,7 @@ enum ProcessBlockRejectReason
     PBREJECT_OPERATOR_INVALIDATED,
     PBREJECT_ACCEPTBLOCK_FALSE,
     PBREJECT_UNKNOWN_FALSE,
-    PBREJECT_AUTHORITY_UNAVAILABLE,
-    // R5/C8: unconditional full-vector duplicate/zero DAG-parent structural reject,
-    // decided from the block's complete parent vector alone (never from state).
-    PBREJECT_DAG_PARENT_STRUCTURAL
+    PBREJECT_AUTHORITY_UNAVAILABLE
 };
 
 bool InitProcessBlockRejectTrace(bool fEnabled);
@@ -258,7 +254,6 @@ enum AcceptBlockRejectReason
     ABREJECT_PREV_NOT_FOUND,
     ABREJECT_OPERATOR_INVALIDATED,
     ABREJECT_PREV_OPERATOR_INVALIDATED,
-    ABREJECT_POS_AFTER_DAG,
     ABREJECT_BLOCK_SIZE,
     ABREJECT_INCORRECT_BITS,
     ABREJECT_TIMESTAMP_TOO_EARLY,
@@ -268,13 +263,9 @@ enum AcceptBlockRejectReason
     ABREJECT_RINGSIG_DEPRECATION,
     ABREJECT_SYNC_CHECKPOINT,
     ABREJECT_COINBASE_HEIGHT,
-    ABREJECT_DAG_PARENT,
     ABREJECT_DISK_SPACE,
     ABREJECT_WRITE_TO_DISK,
-    ABREJECT_ADD_TO_BLOCK_INDEX,
-    // LEGACY DAG RETIREMENT (Phase 1): a block entering the DAG-only
-    // consensus domain while the Legacy DAG engine is retired is refused.
-    ABREJECT_LEGACY_DAG_RETIRED_DOMAIN
+    ABREJECT_ADD_TO_BLOCK_INDEX
 };
 
 bool InitAcceptBlockRejectTrace(bool fEnabled);

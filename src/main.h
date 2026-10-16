@@ -19,7 +19,7 @@
 
 class CValidationState;
 
-#define BLOCK_START_COLLATERALNODE_PAYMENTS_TESTNET 999999 // Disabled for clean IDAG public testnet launch
+#define BLOCK_START_COLLATERALNODE_PAYMENTS_TESTNET 999999 // Disabled for clean public testnet launch
 #define BLOCK_START_COLLATERALNODE_PAYMENTS 800 // Mainnet Collateralnode payments not enabled until block 800
 #define BLOCK_START_COLLATERALNODE_DELAYPAY 2500 // Unused
 
@@ -203,13 +203,13 @@ inline int GetForkHeightRingSigDeprecation() {
 }
 #define FORK_HEIGHT_RINGSIG_DEPRECATION (GetForkHeightRingSigDeprecation())
 
-// IDAG Phase 1a: POEM entropy weighting
+// POEM entropy weighting
 inline int GetForkHeightPoem()
 {
     extern bool fRegTest;
     extern bool fTestNet;
     if (fRegTest) return 9;
-    if (fTestNet) return 9;         // clean public IDAG testnet
+    if (fTestNet) return 9;         // clean public testnet
     return MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;                  // mainnet maintenance build: keep experimental v5 fork gates inert
 }
 #define FORK_HEIGHT_POEM (GetForkHeightPoem())
@@ -347,9 +347,6 @@ extern int64_t nMinimumInputValue;
 extern bool fUseFastIndex;
 extern bool fImporting;
 
-// R5 / C8 — test-visible seam for the UNCONDITIONAL full-vector duplicate/zero DAG-parent
-// prepass and the state-free committed-parent extraction it consumes. These are the exact
-// production predicates used by ProcessBlock; tests exercise them through the real ingress.
 extern bool fReindex;
 extern unsigned int nDerivationMethodIndex;
 extern unsigned int nCoinCacheSize;
@@ -2044,10 +2041,6 @@ public:
     bool addUnchecked(const uint256& hash, CTransaction &tx);
     bool remove(const CTransaction &tx, bool fRecursive = false);
     bool removeConflicts(const CTransaction &tx);
-
-    // IDAG Phase 3: DAG-aware mempool coordination
-    std::set<uint256> setDAGSeenTxids;
-    void RemoveDAGConflicts(const uint256& hashBlock);
 
     void clear();
     void queryHashes(std::vector<uint256>& vtxid);

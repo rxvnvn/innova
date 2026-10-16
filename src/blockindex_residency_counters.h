@@ -25,7 +25,6 @@ extern volatile int64_t g_res_pskip_links;
 extern volatile int64_t g_res_anchors;
 extern volatile int64_t g_res_loadblockindex_calls;
 extern volatile int64_t g_res_rebuildcandidates_calls;
-extern volatile int64_t g_res_restoredagtrust_calls;
 extern volatile int64_t g_res_legacyaccessor_fallbacks;
 
 // Emit one compact key=value residency line for a given startup mode + HotOwner

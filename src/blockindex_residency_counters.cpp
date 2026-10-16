@@ -15,7 +15,6 @@ volatile int64_t g_res_pskip_links = 0;
 volatile int64_t g_res_anchors = 0;
 volatile int64_t g_res_loadblockindex_calls = 0;
 volatile int64_t g_res_rebuildcandidates_calls = 0;
-volatile int64_t g_res_restoredagtrust_calls = 0;
 volatile int64_t g_res_legacyaccessor_fallbacks = 0;
 
 void PrintBlockIndexResidency(const std::string& mode, int64_t generation,
@@ -28,7 +27,7 @@ void PrintBlockIndexResidency(const std::string& mode, int64_t generation,
            "pprev_links=%lld pnext_links=%lld pskip_links=%lld anchors=%lld "
            "hot_current=%lld hot_peak=%lld pins_current=%lld pins_peak=%lld "
            "loadblockindex_calls=%lld rebuildcandidates_calls=%lld "
-           "restoredagtrust_calls=%lld legacy_accessor_fallbacks=%lld\n",
+           "legacy_accessor_fallbacks=%lld\n",
            tag ? tag : "",
            mode.c_str(), (long long)generation,
            (long long)mapBlockIndex.size(),
@@ -42,7 +41,6 @@ void PrintBlockIndexResidency(const std::string& mode, int64_t generation,
            (long long)pins_current, (long long)pins_peak,
            (long long)g_res_loadblockindex_calls,
            (long long)g_res_rebuildcandidates_calls,
-           (long long)g_res_restoredagtrust_calls,
            (long long)g_res_legacyaccessor_fallbacks);
     fflush(stdout);
 }
