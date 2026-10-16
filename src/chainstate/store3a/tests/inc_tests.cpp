@@ -3352,13 +3352,72 @@ static void test_undoidx_bound_integrity(){
         bool ok=s.open(d,&e1);
         CHECK(!ok, "bound-i: truncated committed undo FAILS CLOSED at open ("+e1.str().substr(0,80)+")");
         s.close(); } }
+    // (d) PAYLOAD damage in an OLD segment (record 5, in segment 0): the header stays valid so the deep
+    //     reloadRecentFromStream serves the record; the corruption is caught only when disconnect DECODES
+    //     the payload, and it fails CLOSED there without corrupting the store. Reopen must still see all
+    //     100 records (a healthy payload is still not a load-time check -- S1.4 item 8, deep variant).
+    { std::string d=freshDir("bound_int_deeppay");
+      CHECK(buildFastIdxStore(d,N,S,&e),"bound-i: build (deeppay): "+e.str());
+      std::string raw=slurp(d+"/undo.dat");
+      size_t hit=raw.find(std::string("INNUNDO1",8));
+      for(int k=0;k<4 && hit!=std::string::npos;++k) hit=raw.find(std::string("INNUNDO1",8),hit+8);
+      CHECK(hit!=std::string::npos && hit+52<raw.size(), "bound-i: located old record 5 header (payload offset present)");
+      raw[hit+52]^=0xFF; CHECK(spill(d+"/undo.dat",raw), "bound-i: old payload damaged");
+      { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1;
+        bool ok=s.open(d,&e1);
+        CHECK(ok, "bound-i: OPEN still succeeds (payload is not a load-time check): "+e1.str());
+        if(ok){
+          int steps=0; ChainError de;
+          for(int kk=N;kk>=1;--kk){ if(!s.disconnect(id32(0xB10C0001u,(uint32_t)kk),&de)){ steps=-1; break; } steps++; }
+          CHECK(steps<0 && s.undoCount()==5,
+                "bound-i: deep rollback DECODED and FAILED CLOSED on the old payload, leaving records 1..5 committed");
+          s.close(); } }
+      { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e2;
+        bool ok2=s.open(d,&e2);
+        CHECK(ok2 && s.undoCount()==5,
+              "bound-i: reopen after the interrupted deep rollback reconstructs the committed 5-record state (no corruption/phantom)");
+        if(ok2){
+          ChainError de; bool dok=s.disconnect(s.tipHash(),&de);
+          CHECK(!dok, "bound-i: the corrupted old payload STILL fails closed on decode after reopen (consistently detected)");
+          s.close(); } }
+}
+}
+
+// S1.4 verification-only: bound and account the WORK of a full deep rollback. Every peel is one O(1)
+// recent-cache pop; a reloadRecentFromStream refill is a bounded O(<= one closed segment + tail) re-parse
+// tracked by undoRecentRefills(). Asserts the recent cache never exceeds its ceiling and that the deep
+// path (past the cache) is genuinely reached, and reports the per-step accounting.
+static void test_undoidx_bound_work(){
+    g_cur="UNDOIDX-BOUND-work";
+    ChainError e; const uint32_t S=16; const int N=100; const size_t CAP=3*(size_t)S;   // cache ceiling = 3 x S
+    std::string d=freshDir("bound_work");
+    CHECK(buildFastIdxStore(d,N,S,&e),"bound-w: build: "+e.str());
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1;
+      bool ok=s.open(d,&e1); CHECK(ok,"bound-w: open: "+e1.str());
+      if(!ok) return;
+      if(s.undoCount()!=(size_t)N) CHECK(false,"bound-w: expected "+std::to_string(N)+" records, got "+std::to_string(s.undoCount()));
+      size_t maxRecent=s.undoRecentCount(); uint64_t refills0=s.undoRecentRefills();
+      uint64_t refills=0; int steps=0; int refillEvents=0; uint64_t lastRefill=0;
+      for(int kk=N;kk>=1;--kk){
+          uint64_t rnow=s.undoRecentRefills();
+          if(rnow!=lastRefill){ refillEvents++; lastRefill=rnow; }
+          if(!s.disconnect(id32(0xB10C0001u,(uint32_t)kk),&e1)){ steps=-1; break; }
+          steps++; if(s.undoRecentCount()>maxRecent) maxRecent=s.undoRecentCount();
+      }
+      refills=s.undoRecentRefills()-refills0;
+      CHECK(steps==N, "bound-w: full deep rollback of all "+std::to_string(N)+" records");
+      CHECK(maxRecent<=CAP, "bound-w: recent cache never exceeded its ceiling (max="+std::to_string(maxRecent)+", cap="+std::to_string(CAP)+")");
+      if(refills==0) CHECK(false,"bound-w: deep path never refilled (cache held the whole history?)");
+      printf("BOUND-work N=%d S=%u steps=%d cacheCap=%zu maxRecent=%zu refills=%llu refillEvents=%d  => ~O(1)/peel + %llu bounded refills\n",
+             N,(unsigned)S,steps,CAP,maxRecent,(unsigned long long)refills,refillEvents,(unsigned long long)refills);
+      s.close(); }
 }
 
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
 
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail}, {"UNDOIDX-FASTIDX-equiv",test_undoidx_fastidx_equiv}, {"UNDOIDX-FASTIDX-fallback",test_undoidx_fastidx_fallback}, {"UNDOIDX-FASTIDX-damaged",test_undoidx_fastidx_damaged}, {"UNDOIDX-FASTIDX-recovery",test_undoidx_fastidx_recovery}, {"UNDOIDX-FASTIDX-measure",test_undoidx_fastidx_measure}, {"UNDOIDX-BOUND-basic",test_undoidx_bound_basic}, {"UNDOIDX-BOUND-deep",test_undoidx_bound_deep}, {"UNDOIDX-BOUND-integrity",test_undoidx_bound_integrity} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail}, {"UNDOIDX-FASTIDX-equiv",test_undoidx_fastidx_equiv}, {"UNDOIDX-FASTIDX-fallback",test_undoidx_fastidx_fallback}, {"UNDOIDX-FASTIDX-damaged",test_undoidx_fastidx_damaged}, {"UNDOIDX-FASTIDX-recovery",test_undoidx_fastidx_recovery}, {"UNDOIDX-FASTIDX-measure",test_undoidx_fastidx_measure}, {"UNDOIDX-BOUND-basic",test_undoidx_bound_basic}, {"UNDOIDX-BOUND-deep",test_undoidx_bound_deep}, {"UNDOIDX-BOUND-integrity",test_undoidx_bound_integrity}, {"UNDOIDX-BOUND-work",test_undoidx_bound_work} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){
