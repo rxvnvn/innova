@@ -115,6 +115,38 @@ struct UndoIndexRecoveryReport {
     std::string resolution;             // "none" | "already-current" | "rebuilt" | "quarantined+rebuilt" | "refused"
 };
 
+// ---------------------------------------------------------------------------------------------
+// S1.2 -- CONSUMING THE DERIVED INDEX AT STARTUP ("fast startup"), COUNTERS INCLUDED.
+//
+// What the S1.1 index can and cannot establish (the integrity question, answered explicitly):
+//   * segment descriptors carry {startOffset, endOffset, recordCount} and a crc32 OVER THOSE FIELDS
+//     ONLY -- the checksum never covers the undo bytes the descriptor points at;
+//   * therefore a valid, CURRENT index proves the BYTE BOUNDARIES of the closed segments and nothing
+//     about the record layout inside them: `UndoMeta` needs each record's offset, len, blockHash and
+//     height, which only exist in the record headers interleaved with payloads in `undo.dat`;
+//   * headers are NOT contiguous (records are variable length), so per-record metadata cannot be read
+//     without either seeking per record (the legacy scan) or reading whole segment spans (this slice).
+// The fast path below therefore CONSUMES the index only to replace one syscall per record with one
+// syscall per closed segment, and it re-parses every record it reads, with two extra cross-checks the
+// legacy scan does not have: the parse must land EXACTLY on each descriptor's endOffset and must yield
+// EXACTLY its recordCount. It is a pure optimisation layer: on ANY anomaly it declines and the
+// authoritative record scan below runs unchanged, after which the S1.1 classification repairs or
+// refuses the artifact -- nothing is ever accepted on trust, and no validation is relaxed.
+// A validation-free "trust the descriptors" startup is NOT possible with this format and is NOT done
+// here; see the S1.2 report for the smallest format/representation correction that would allow it.
+// ---------------------------------------------------------------------------------------------
+// Counters are diagnostic only: they never influence behaviour and exist so a startup profile can be
+// reported (records parsed, reads issued, bytes touched) instead of asserted.
+struct UndoLoadStats {
+    int      fastPath = 0;      // 1 = the derived index was consumed; 0 = the authoritative record scan
+    std::string fallback;       // non-empty => why the index was not consumed (diagnostic only)
+    uint64_t descriptors = 0;   // segment descriptors processed from the index
+    uint64_t segmentReads = 0;  // bulk reads issued for closed segments
+    uint64_t headerReads = 0;   // per-record header reads (legacy scan and/or the uncovered tail)
+    uint64_t records = 0;       // records parsed
+    uint64_t bytesRead = 0;     // bytes returned by those reads
+};
+
 // S1.1-F1 (finding S1.1-2): deterministic, one-shot test-only faults at the UNDOINDEX publication
 // barrier. The default is None, so no injection exists in a production run; the value is set only by
 // injectUndoIndexFault() from focused tests and is consumed (reset) by the first publication it affects.
@@ -164,6 +196,7 @@ public:
     // openWithOptions(dir, OpenOptions(), e) -- i.e. fail closed -- and remains the production entry point.
     bool openWithOptions(const std::string& dir, const OpenOptions& o, ChainError* e);
     const UndoIndexRecoveryReport& lastUndoIndexRecovery() const { return ixRecovery_; }
+    const UndoLoadStats& undoLoadStats() const { return undoLoadStats_; }   // S1.2: last open's startup profile
     void close();
 
     bool opened() const { return opened_; }
@@ -174,6 +207,7 @@ public:
     const Hash& tipHash() const { return blockHash_; }
     int32_t tipHeight() const { return tipHeight_; }
     size_t undoCount() const { return undoIndex_.size(); }
+    uint64_t undoCommittedBytes() const { return undoCommittedBytes_; }   // S1.2: committed undo length loaded
     bool hadRecoveryIssue() const { return hadRecoveryIssue_; }
     // S1.1: derived undo index -- classification at the last open/publication + cost counters.
     UndoIndexState undoIndexState() const { return undoIndexState_; }
@@ -237,6 +271,11 @@ private:
 
     bool tryLoadManifest(const std::string& path, bool* exists, uint32_t* rootId, Hash* rootHash, ChainError* e);
     bool loadUndoFor(const Manifest& m, ChainError* e);
+    // S1.2: does the on-disk index describe exactly the CLOSED segments of this committed stream, and is
+    // it structurally sound? (`usable` stays false when the artifact is absent, invalid, not current, or
+    // disabled for a control run -- the caller then simply runs the authoritative scan.)
+    bool tryLoadCurrentUndoIndex(const Manifest& m, UndoIndex* ix, bool* usable, ChainError* err);
+    bool loadUndoForIndexed(const Manifest& m, const UndoIndex& ix, ChainError* e);
     // S1.1: derived undo index (all of these are read-only w.r.t. undo.dat / tree.dat / MANIFEST / ACK)
     bool buildUndoIndexFromMetas(const std::vector<UndoMeta>& metas, UndoIndex* out) const;
     bool loadUndoIndexFromDisk(bool* exists, UndoIndex* ix, ChainError* e);
@@ -277,6 +316,7 @@ private:
     uint32_t ixSegmentSize_ = UNDOINDEX_DEFAULT_SEGMENT_SIZE;
     UndoIndexState undoIndexState_ = UndoIndexState::None;
     uint64_t ixPublishes_ = 0, ixBytesWritten_ = 0, ixFsyncs_ = 0, ixNanos_ = 0;
+    UndoLoadStats undoLoadStats_;       // S1.2: startup profile of the last loadUndoFor()
     bool ixFreshPath_ = false;          // set when open() took a MANIFEST-absent (fresh/prior-store) path
     bool ixSkipNextPublish_ = false;    // test hook: simulate one lost index publication (power-loss shape)
     bool ixDisabledForTest_ = false;    // test hook: control run -- never touch UNDOINDEX at all

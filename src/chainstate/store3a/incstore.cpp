@@ -339,22 +339,146 @@ bool CommitStore3A::writeAck(uint64_t gen, ChainError* e){
     if(!csFsyncDir(dir_,e)) return false; return true;
 }
 
+
+// S1.2: cap on the transient buffer used for one closed segment (bounded allocation; a descriptor whose
+// span exceeds this is walked with per-record header reads instead of one bulk read).
+static const uint64_t UNDOINDEX_MAX_BULK_SPAN = 4ull*1024*1024;
+
+// Decode one undo record header (52 bytes) at absolute offset `absOff`, requiring the whole record to fit
+// below `limit`. Mirrors the authoritative scan's validations exactly; duplicated deliberately so the
+// audited scan below stays byte-identical.
+static bool undoHeaderAt(const uint8_t* h, size_t hn, uint64_t absOff, uint64_t limit, UndoMeta* meta, ChainError* e){
+    static const uint8_t magic[8]={'I','N','N','U','N','D','O','1'};
+    if(hn<UNDO_HEADER_SIZE) { setErr(e,ErrCode::CORRUPT,"undo header truncated"); return false; }
+    if(memcmp(h,magic,8)!=0){ setErr(e,ErrCode::CORRUPT,"undo magic at offset "+std::to_string((unsigned long long)absOff)); return false; }
+    uint32_t len=0; for(int i=0;i<4;i++) len|=(uint32_t)h[8+i]<<(8*i);
+    uint32_t hh=0;  for(int i=0;i<4;i++) hh |=(uint32_t)h[44+i]<<(8*i);
+    if(len<UNDO_HEADER_SIZE+4 || absOff+len>limit){ setErr(e,ErrCode::CORRUPT,"undo record length out of range at offset "+std::to_string((unsigned long long)absOff)); return false; }
+    UndoMeta m; memcpy(m.blockHash.data(),h+12,32); m.height=(int32_t)hh; m.offset=absOff; m.len=len; *meta=m;
+    return true;
+}
+// Parse every record wholly contained in a segment buffer (bytes of undo.dat starting at `base`).
+static bool parseUndoRecords(const uint8_t* buf, size_t n, uint64_t base, std::vector<UndoMeta>* out, ChainError* e){
+    size_t off=0;
+    while(off<n){
+        UndoMeta meta;
+        if(!undoHeaderAt(buf+off,n-off,base+off,base+n,&meta,e)) return false;
+        out->push_back(meta); off+=meta.len;
+    }
+    return true;
+}
+// Is the on-disk derived index usable as a startup acceleration for THIS committed stream? It is consumed
+// only when it describes exactly the committed prefix: structurally valid, contiguous from offset 0, every
+// descriptor a CLOSED segment, and committedBytes (== the last descriptor's endOffset) not beyond
+// MANIFEST.undoSize. Anything else leaves `usable` false and the authoritative scan runs (the S1.1
+// classification then rebuilds/refuses the artifact exactly as before -- nothing is accepted on trust).
+bool CommitStore3A::tryLoadCurrentUndoIndex(const Manifest& m, UndoIndex* ix, bool* usable, ChainError* err){
+    *usable=false;
+    std::vector<uint8_t> bytes; bool ex=false;
+    if(!csReadFile(p("UNDOINDEX"),&bytes,&ex,err)) return false;      // I/O error: caller declines, scan reports
+    if(!ex) return true;
+    if(!UndoIndex::decode(bytes.data(),bytes.size(),ix,err)) return true;
+    if(ix->formatVersion!=UNDOINDEX_FORMAT_VERSION) return true;
+    if(ix->segmentSize!=ixSegmentSize_) return true;
+    if(ix->baseOffset!=0) return true;
+    if(ix->segments.empty()) return true;
+    if(ix->committedBytes>m.undoSize) return true;
+    if(ix->committedBytes!=ix->segments.back().endOffset) return true;
+    uint64_t cur=0;
+    for(size_t i=0;i<ix->segments.size();++i){
+        const UndoSegment& sg=ix->segments[i];
+        if(sg.startOffset!=cur || sg.endOffset<=sg.startOffset) return true;
+        if(sg.recordCount!=ix->segmentSize) return true;
+        cur=sg.endOffset;
+    }
+    *usable=true;
+    return true;
+}
+
+bool CommitStore3A::loadUndoForIndexed(const Manifest& m, const UndoIndex& ix, ChainError* e){
+    const size_t maxRecs=(size_t)(m.undoSize/(UNDO_HEADER_SIZE+4))+1;   // sound bound: every record >= 56 bytes
+    std::vector<UndoMeta> out; out.reserve(maxRecs<4096?maxRecs:4096);
+    undoLoadStats_.descriptors=ix.segments.size();
+    for(size_t i=0;i<ix.segments.size();++i){
+        const UndoSegment& sg=ix.segments[i];
+        const uint64_t span=sg.endOffset-sg.startOffset;
+        const size_t before=out.size();
+        if(span<=UNDOINDEX_MAX_BULK_SPAN){
+            std::vector<uint8_t> buf;
+            if(!csReadRange(p("undo.dat"),sg.startOffset,(size_t)span,&buf,e)) return false;
+            undoLoadStats_.segmentReads++; undoLoadStats_.bytesRead+=span;
+            if(!parseUndoRecords(buf.data(),buf.size(),sg.startOffset,&out,e)) return false;
+        } else {
+            uint64_t off=sg.startOffset;
+            while(off<sg.endOffset){
+                if(off+UNDO_HEADER_SIZE>sg.endOffset){ setErr(e,ErrCode::CORRUPT,"undo header crosses segment end"); return false; }
+                std::vector<uint8_t> hdr; if(!csReadRange(p("undo.dat"),off,UNDO_HEADER_SIZE,&hdr,e)) return false;
+                undoLoadStats_.headerReads++; undoLoadStats_.bytesRead+=UNDO_HEADER_SIZE;
+                UndoMeta meta;
+                if(!undoHeaderAt(hdr.data(),hdr.size(),off,sg.endOffset,&meta,e)) return false;
+                out.push_back(meta); off+=meta.len;
+            }
+        }
+        undoLoadStats_.records+=(uint64_t)(out.size()-before);
+        if((uint64_t)(out.size()-before)!=sg.recordCount){ setErr(e,ErrCode::CORRUPT,"segment record count mismatch"); return false; }
+    }
+    // The uncovered tail after the final indexed segment must be parsed as well, and must be shorter than
+    // one closed segment; a longer tail means the index is STALE, which the classification/normalisation
+    // pass repairs -- this loader declines instead of accepting it.
+    uint64_t off=ix.committedBytes; size_t tail=0;
+    while(off<m.undoSize){
+        if(off+UNDO_HEADER_SIZE>m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo header crosses committed length"); return false; }
+        std::vector<uint8_t> hdr; if(!csReadRange(p("undo.dat"),off,UNDO_HEADER_SIZE,&hdr,e)) return false;
+        undoLoadStats_.headerReads++; undoLoadStats_.bytesRead+=UNDO_HEADER_SIZE;
+        UndoMeta meta;
+        if(!undoHeaderAt(hdr.data(),hdr.size(),off,m.undoSize,&meta,e)) return false;
+        out.push_back(meta); off+=meta.len;
+        undoLoadStats_.records++;
+        // A CURRENT index leaves a tail SMALLER than one closed segment (reaching a full segment would
+        // have published another descriptor); a tail that reaches a full segment means the index missed a
+        // closure -> STALE, which the classification/normalisation pass repairs. Decline, never consume.
+        if(++tail>=ix.segmentSize){ setErr(e,ErrCode::CORRUPT,"index covers fewer records than committed (stale)"); return false; }
+    }
+    if(off!=m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo.dat committed length mismatch"); return false; }
+    undoIndex_.swap(out); undoCommittedBytes_=m.undoSize; return true;
+}
+
 bool CommitStore3A::loadUndoFor(const Manifest& m, ChainError* e){
-    undoIndex_.clear(); undoCommittedBytes_=0; if(m.undoSize==0) return true;
+    undoIndex_.clear(); undoCommittedBytes_=0; undoLoadStats_=UndoLoadStats(); if(m.undoSize==0) return true;
     // R1 (F0-4): the referenced log must be a regular file. lstat (not stat) so a symlink or any other
     // non-regular object is refused here instead of being followed/read and only failing later.
     struct stat st; if(::lstat(p("undo.dat").c_str(),&st)!=0){ setErr(e,ErrCode::CORRUPT,"undo.dat missing but undoSize="+std::to_string(m.undoSize)); return false; }
     if(!S_ISREG(st.st_mode)){ setErr(e,ErrCode::CORRUPT,"undo.dat is not a regular file ("+(S_ISLNK(st.st_mode)?std::string("symbolic link"):(S_ISDIR(st.st_mode)?std::string("directory"):std::string("non-regular file")))+") but undoSize="+std::to_string(m.undoSize)+"; refusing to read it"); return false; }
+    // S1.2: consume the derived index when (and only when) it is CURRENT for this manifest. The fast path
+    // re-parses every record it reads and adds two cross-checks the scan lacks (exact landing on each
+    // descriptor endOffset, exact recordCount per segment). On ANY anomaly it declines -- the counters
+    // record why and the authoritative scan below runs unchanged, so no failure mode is masked and no
+    // validation is relaxed.
+    if(!ixDisabledForTest_){
+        UndoIndex ix; bool usable=false; ChainError ixErr;
+        if(tryLoadCurrentUndoIndex(m,&ix,&usable,&ixErr) && usable){
+            if(loadUndoForIndexed(m,ix,e)){ undoLoadStats_.fastPath=1; return true; }
+            const std::string why=e?e->msg:std::string("unknown");
+            undoIndex_.clear(); undoCommittedBytes_=0; undoLoadStats_=UndoLoadStats();
+            undoLoadStats_.fallback=why;
+            clearErr(e);                       // a decline is not a failure: the scan decides the outcome
+        } else if(!ixErr.msg.empty() && ixErr.code!=ErrCode::OK){
+            undoLoadStats_.fallback="index unreadable: "+ixErr.msg;
+        } else if(!usable){
+            undoLoadStats_.fallback="index absent/invalid/not-current (scan + S1.1 classification own it)";
+        }
+    }
     uint64_t off=0; const uint8_t magic[8]={'I','N','N','U','N','D','O','1'};
     while(off<m.undoSize){
         if(off+UNDO_HEADER_SIZE>m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo header crosses committed length"); return false; }
         std::vector<uint8_t> hdr; if(!csReadRange(p("undo.dat"),off,UNDO_HEADER_SIZE,&hdr,e)) return false;
+        undoLoadStats_.headerReads++; undoLoadStats_.bytesRead+=UNDO_HEADER_SIZE;
         if(memcmp(hdr.data(),magic,8)!=0){ setErr(e,ErrCode::CORRUPT,"undo magic at offset "+std::to_string(off)); return false; }
         uint32_t len=0; for(int i=0;i<4;i++) len|=(uint32_t)hdr[8+i]<<(8*i);
         UndoMeta meta; memcpy(meta.blockHash.data(),hdr.data()+12,32);
         uint32_t hh=0; for(int i=0;i<4;i++) hh|=(uint32_t)hdr[44+i]<<(8*i); meta.height=(int32_t)hh;
         if(len<UNDO_HEADER_SIZE+4 || off+len>m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo record length out of range"); return false; }
-        meta.offset=off; meta.len=len; undoIndex_.push_back(meta); off+=len;
+        meta.offset=off; meta.len=len; undoIndex_.push_back(meta); undoLoadStats_.records++; off+=len;
     }
     if(off!=m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo.dat committed length mismatch"); return false; }
     undoCommittedBytes_=m.undoSize; return true;

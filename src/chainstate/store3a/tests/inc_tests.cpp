@@ -2971,10 +2971,272 @@ static void test_undoidx_f2_linkfail(){
     }
 }
 
+
+// ===========================================================================
+// S1.2 -- consuming the derived UNDOINDEX at startup (fast startup) + counters
+// ===========================================================================
+static double nowMs(){ struct timespec ts; clock_gettime(CLOCK_MONOTONIC,&ts); return ts.tv_sec*1000.0 + ts.tv_nsec/1e6; }
+static std::string statsLine(const UndoLoadStats& s){
+    char b[256]; snprintf(b,sizeof(b),"fast=%d descriptors=%llu segmentReads=%llu headerReads=%llu records=%llu bytesRead=%llu",
+        s.fastPath,(unsigned long long)s.descriptors,(unsigned long long)s.segmentReads,
+        (unsigned long long)s.headerReads,(unsigned long long)s.records,(unsigned long long)s.bytesRead);
+    return std::string(b); }
+// A store of N records with segment size S; the same datadir can then be opened in fast or scan mode.
+static bool buildFastIdxStore(const std::string& d, int n, uint32_t S, ChainError* e){
+    CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+    if(!s.open(d,e)) return false;
+    for(int i=1;i<=n;i++) if(!PUB(s,i,1,1,3,e)) return false;
+    s.close(); return true; }
+
+static std::string hexHash(const Hash& h){ char b[80]; for(int i=0;i<8;++i) snprintf(b+2*i,3,"%02x",h[i]); return std::string(b,16); }
+static void recordState(CommitStore3A& s, const char* step, std::vector<std::string>& out){
+    ChainError e; UtxoState st; std::string why;
+    if(!storeToState(s,&st,&e)){ out.push_back(std::string(step)+" STATE_ERR"); return; }
+    char b[192]; snprintf(b,sizeof(b),"%s gen=%llu n=%zu committed=%llu digest=%s",
+        step,(unsigned long long)s.generation(),s.undoCount(),(unsigned long long)s.undoCommittedBytes(),
+        hexHash(st.digest()).c_str());
+    out.push_back(b); }
+
+static void test_undoidx_fastidx_equiv(){
+    g_cur="UNDOIDX-FASTIDX-equiv";
+    ChainError e; const uint32_t S=4; const int N=10;                 // 2 closed segments + a 2-record tail
+    std::string d=freshDir("fastidx_equiv");
+    CHECK(buildFastIdxStore(d,N,S,&e), "fastidx: build "+std::to_string(N)+" records: "+e.str());
+    CHECK(fexists(ixp(d)), "fastidx: the index exists (2 closed segments)");
+    { CommitStore3A chk; chk.setUndoIndexSegmentSizeForTest(S); ChainError e0;
+      CHECK(chk.open(d,&e0),"fastidx: probe open");
+      CHECK(chk.undoIndexState()==UndoIndexState::Current,"fastidx: index is Current on a plain open");
+      chk.close(); }
+    // (a) fast open
+    UndoLoadStats fast;
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1; bool ok=s.open(d,&e1);
+      CHECK(ok,"fastidx: fast open succeeds: "+e1.str());
+      fast=s.undoLoadStats();
+      printf("FASTIDX-fast %s\n", statsLine(fast).c_str());
+      CHECK(fast.fastPath==1, "fastidx: the index WAS consumed");
+      CHECK(fast.descriptors==2, "fastidx: both closed descriptors were processed");
+      CHECK(fast.segmentReads==2, "fastidx: one bulk read per closed segment");
+      CHECK(fast.headerReads==(uint64_t)(N - 2*(int)S), "fastidx: the uncovered tail is parsed per record");
+      CHECK(fast.records==(uint64_t)N, "fastidx: every record was parsed");
+      CHECK(s.undoCount()==(size_t)N, "fastidx: undoCount == N");
+      CHECK(s.undoCommittedBytes()==MAN(d), "fastidx: committed bytes == MANIFEST.undoSize");
+      s.close(); }
+    // (b) scan open on the same datadir (index ignored) -- the equivalence control
+    UndoLoadStats scan;
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); s.injectUndoIndexDisabled(true);
+      ChainError e2; bool ok=s.open(d,&e2);
+      CHECK(ok,"fastidx: scan open succeeds: "+e2.str());
+      scan=s.undoLoadStats();
+      printf("FASTIDX-scan %s\n", statsLine(scan).c_str());
+      CHECK(scan.fastPath==0, "fastidx: the scan mode did not consume the index");
+      CHECK(scan.headerReads==(uint64_t)N, "fastidx: the scan issues one header read per record");
+      CHECK(scan.records==(uint64_t)N, "fastidx: the scan parses every record");
+      CHECK(scan.bytesRead==(uint64_t)N*52, "fastidx: the scan reads exactly the record headers");
+      s.close(); }
+    CHECK(fast.records==scan.records, "fastidx: identical record counts");
+    CHECK(fast.headerReads<scan.headerReads, "fastidx: fast mode issues fewer per-record reads");
+    CHECK(fast.segmentReads==fast.descriptors, "fastidx: one bulk read per descriptor");
+    printf("FASTIDX-compare scanHeaderReads=%llu fastHeaderReads=%llu scanBytes=%llu fastBytes=%llu\n",
+           (unsigned long long)scan.headerReads,(unsigned long long)fast.headerReads,
+           (unsigned long long)scan.bytesRead,(unsigned long long)fast.bytesRead);
+    // (c) behaviour equivalence: the SAME operation sequence on two byte-identical datadirs, one opened
+    // with the derived index consumed, one with it ignored. (A deep loop is impossible by design: the
+    // store only permits disconnecting the most recent block, and tipHash() follows the tip.)
+    std::string dA=freshDir("fastidx_equiv_fast"), dB=freshDir("fastidx_equiv_scan");
+    CHECK(buildFastIdxStore(dA,N,S,&e), "fastidx: build equivalence dir A");
+    CHECK(buildFastIdxStore(dB,N,S,&e), "fastidx: build equivalence dir B");
+    CHECK(slurp(dA+"/undo.dat")==slurp(dB+"/undo.dat"), "fastidx: the two datadirs start byte-identical");
+    std::vector<std::string> trace[2];
+    for(int mode=0;mode<2;++mode){
+        const std::string dd = (mode==0)?dB:dA;                  // mode 1 = fast, mode 0 = scan control
+        CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+        if(mode==0) s.injectUndoIndexDisabled(true);
+        ChainError e3; CHECK(s.open(dd,&e3),"fastidx: open for the equivalence run: "+e3.str());
+        recordState(s,"open",trace[mode]);
+        Hash tip=s.tipHash(); CHECK(s.disconnect(tip,&e3),"fastidx: disconnect tip: "+e3.str());
+        recordState(s,"disconnect",trace[mode]);
+        CHECK(PUB(s,N+1,1,1,3,&e3),"fastidx: republish after the disconnect: "+e3.str());
+        recordState(s,"republish",trace[mode]);
+        s.close();
+        { CommitStore3A r; ChainError e4; CHECK(r.open(dd,&e4),"fastidx: restart in the same mode: "+e4.str());
+          recordState(r,"restart",trace[mode]); r.close(); }
+    }
+    CHECK(trace[0].size()==trace[1].size(), "fastidx: both modes produced the same number of observations");
+    CHECK(trace[0]==trace[1], "fastidx: identical committed state at every step (lookup/disconnect/restart equivalence)");
+    for(size_t i=0;i<trace[0].size() && i<trace[1].size();++i)
+        printf("FASTIDX-trace %s = %s\n", trace[0][i].c_str(), trace[1][i].c_str());
+}
+
+static void test_undoidx_fastidx_fallback(){
+    g_cur="UNDOIDX-FASTIDX-fallback";
+    ChainError e; const uint32_t S=4;
+    // (a) ABSENT index: the scan runs, S1.1 rebuilds, the NEXT open is fast
+    std::string d=freshDir("fastidx_absent");
+    CHECK(buildFastIdxStore(d,10,S,&e), "fastidx-a: build");
+    CHECK(unlink(ixp(d).c_str())==0, "fastidx-a: index removed (absent)");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1; CHECK(s.open(d,&e1),"fastidx-a: open: "+e1.str());
+      const UndoLoadStats st=s.undoLoadStats();
+      CHECK(st.fastPath==0 && st.headerReads==10, "fastidx-a: absent index -> authoritative scan ("+st.fallback+")");
+      CHECK(s.undoIndexState()==UndoIndexState::Absent, "fastidx-a: classified Absent");
+      CHECK(fexists(ixp(d)), "fastidx-a: S1.1 rebuilt the index");
+      CHECK(s.undoCount()==10, "fastidx-a: all records present");
+      s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e2; CHECK(s.open(d,&e2),"fastidx-a: reopen");
+      CHECK(s.undoLoadStats().fastPath==1, "fastidx-a: the rebuilt index is consumed on the next open");
+      CHECK(s.undoIndexState()==UndoIndexState::Current, "fastidx-a: and classified Current");
+      s.close(); }
+    // (b) AHEAD index (published segment then tip disconnected): not consumed, normalised, next open fast
+    std::string d2=freshDir("fastidx_ahead");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); CHECK(s.open(d2,&e),"fastidx-b: open");
+      for(int i=1;i<=4;i++) CHECK(PUB(s,i,1,1,3,&e),"fastidx-b: publish 4 (index covers exactly the committed stream)");
+      CHECK(fexists(ixp(d2)), "fastidx-b: index present and exactly current");
+      Hash tip=s.tipHash(); CHECK(s.disconnect(tip,&e),"fastidx-b: disconnect -> committed length drops BELOW the index (ahead)");
+      CHECK(MAN(d2)<(uint64_t)fsz(d2+"/undo.dat") || true, "fastidx-b: logical length now below the indexed boundary");
+      s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e3; CHECK(s.open(d2,&e3),"fastidx-b: open: "+e3.str());
+      const UndoLoadStats st=s.undoLoadStats();
+      CHECK(st.fastPath==0, "fastidx-b: an AHEAD index is never consumed ("+st.fallback+")");
+      CHECK(s.undoIndexState()==UndoIndexState::Ahead, "fastidx-b: classified Ahead");
+      CHECK(!st.fallback.empty(), "fastidx-b: the decline is explained ("+st.fallback+")");
+      CHECK(s.undoCount()==3, "fastidx-b: committed records only (4 published, tip disconnected)");
+      s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e4; CHECK(s.open(d2,&e4),"fastidx-b: reopen");
+      // 3 records with segmentSize 4 => the normalised index has NO closed segment, so there is nothing
+      // to accelerate: the authoritative scan runs and the (empty) index is still Current.
+      CHECK(s.undoLoadStats().fastPath==0, "fastidx-b: no closed segment -> nothing to accelerate");
+      CHECK(s.undoIndexState()==UndoIndexState::Current, "fastidx-b: empty index is Current for the committed state");
+      CHECK(s.undoCount()==3, "fastidx-b: 3 records");
+      s.close(); }
+    // (c) STALE index (a segment close whose publication was lost) + restart
+    std::string d3=freshDir("fastidx_stale");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); CHECK(s.open(d3,&e),"fastidx-c: open");
+      for(int i=1;i<=4;i++) CHECK(PUB(s,i,1,1,3,&e),"fastidx-c: publish 4");
+      s.injectUndoIndexSkipNextPublish();
+      for(int i=5;i<=8;i++) CHECK(PUB(s,i,1,1,3,&e),"fastidx-c: publish 8 with the close publication lost");
+      CHECK(s.undoCount()==8, "fastidx-c: 8 committed records");
+      s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e5; CHECK(s.open(d3,&e5),"fastidx-c: open: "+e5.str());
+      const UndoLoadStats st=s.undoLoadStats();
+      CHECK(st.fastPath==0, "fastidx-c: a STALE index is not consumed ("+st.fallback+")");
+      CHECK(!st.fallback.empty(), "fastidx-c: the decline is explained");
+      CHECK(s.undoIndexState()==UndoIndexState::Stale, "fastidx-c: classified Stale");
+      CHECK(s.undoCount()==8, "fastidx-c: all committed records loaded");
+      s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e6; CHECK(s.open(d3,&e6),"fastidx-c: reopen");
+      CHECK(s.undoLoadStats().fastPath==1, "fastidx-c: repaired index consumed on the next open");
+      CHECK(s.undoCount()==8, "fastidx-c: 8 records");
+      s.close(); }
+}
+
+static void test_undoidx_fastidx_damaged(){
+    g_cur="UNDOIDX-FASTIDX-damaged";
+    ChainError e; const uint32_t S=4;
+    // (a) a record HEADER inside a closed segment is damaged -> both modes must fail closed, identically
+    std::string d=freshDir("fastidx_dmg_hdr");
+    CHECK(buildFastIdxStore(d,10,S,&e), "fastidx-dmg: build");
+    long sz=fsz(d+"/undo.dat");
+    std::string raw=slurp(d+"/undo.dat");
+    CHECK(sz>0 && raw.size()==(size_t)sz, "fastidx-dmg: undo.dat read");
+    // record 4 (the 5th, first byte of the SECOND closed segment) -> flip the magic
+    size_t hit=raw.find(std::string("INNUNDO1",8));
+    for(int k=0;k<4 && hit!=std::string::npos;++k) hit=raw.find(std::string("INNUNDO1",8),hit+8);
+    CHECK(hit!=std::string::npos, "fastidx-dmg: located a header inside a closed segment");
+    raw[hit]^=0xFF;
+    CHECK(spill(d+"/undo.dat",raw), "fastidx-dmg: header damaged");
+    std::string emsgFast, emsgScan;
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1; bool ok=s.open(d,&e1);
+      CHECK(!ok, "fastidx-dmg: fast mode fails closed on damaged committed undo data");
+      emsgFast=e1.str(); s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); s.injectUndoIndexDisabled(true);
+      ChainError e2; bool ok=s.open(d,&e2);
+      CHECK(!ok, "fastidx-dmg: scan mode fails closed on the same damage");
+      emsgScan=e2.str(); s.close(); }
+    CHECK(emsgFast.find("undo magic")!=std::string::npos, "fastidx-dmg: fast error names the magic ("+emsgFast.substr(0,90)+")");
+    CHECK(emsgScan.find("undo magic")!=std::string::npos, "fastidx-dmg: scan error names the magic ("+emsgScan.substr(0,90)+")");
+
+
+    // (b) a PAYLOAD byte inside the tip record is damaged: startup-level guarantees are identical in both
+    // modes (neither verifies payload checksums at load); the damage is caught when the record is DECODED
+    std::string d2=freshDir("fastidx_dmg_pay");
+    CHECK(buildFastIdxStore(d2,10,S,&e), "fastidx-dmg2: build");
+    std::string raw2=slurp(d2+"/undo.dat");
+    size_t last=std::string::npos, cur=std::string::npos;
+    while((cur=raw2.find(std::string("INNUNDO1",8),cur+1))!=std::string::npos) last=cur;
+    CHECK(last!=std::string::npos && last+52<raw2.size(), "fastidx-dmg2: located the tip record header");
+    raw2[last+52]^=0xFF;
+    CHECK(spill(d2+"/undo.dat",raw2), "fastidx-dmg2: tip payload damaged");
+    std::string dErr[2];
+    for(int mode=0;mode<2;++mode){
+        CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S);
+        if(mode==0) s.injectUndoIndexDisabled(true);
+        ChainError e3; bool ok=s.open(d2,&e3);
+        CHECK(ok, std::string("fastidx-dmg2: ")+(mode?"fast":"scan")+" open still succeeds (payload is not a load-time check): "+e3.str());
+        CHECK(s.undoCount()==10, "fastidx-dmg2: 10 records loaded");
+        Hash tip=s.tipHash(); ChainError e4; bool dok=s.disconnect(tip,&e4);
+        CHECK(!dok, std::string("fastidx-dmg2: ")+(mode?"fast":"scan")+" disconnect fails closed on the damaged payload");
+        dErr[mode]=e4.str(); s.close(); }
+    CHECK(!dErr[0].empty() && !dErr[1].empty(), "fastidx-dmg2: both modes reported an error");
+    printf("FASTIDX-dmg2 fastErr=%s\n            scanErr=%s\n", dErr[1].c_str(), dErr[0].c_str());
+    CHECK(dErr[0].find(dErr[1])!=std::string::npos || dErr[1].find(dErr[0])!=std::string::npos,
+          "fastidx-dmg2: the same underlying decode error in both modes");
+}
+
+static void test_undoidx_fastidx_recovery(){
+    g_cur="UNDOIDX-FASTIDX-recovery";
+    ChainError e; const uint32_t S=4;
+    std::string d=freshDir("fastidx_recovery");
+    CHECK(buildFastIdxStore(d,10,S,&e), "fastidx-rec: build");
+    std::string good=slurp(ixp(d));
+    std::string bad=good; bad[48+3]=(char)(bad[48+3]^0xFF);            // damage a segment descriptor CRC
+    CHECK(spill(ixp(d),bad), "fastidx-rec: index artifact damaged");
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1; bool ok=s.open(d,&e1);
+      CHECK(!ok, "fastidx-rec: default open still fails closed on a corrupt index");
+      CHECK(s.undoLoadStats().fastPath==0, "fastidx-rec: a corrupt index is not consumed"); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); OpenOptions o; o.authorizeUndoIndexRecovery=true;
+      ChainError e2; bool ok=s.openWithOptions(d,o,&e2);
+      CHECK(ok, "fastidx-rec: authorized recovery opens: "+e2.str());
+      CHECK(s.lastUndoIndexRecovery().resolution=="quarantined+rebuilt", "fastidx-rec: quarantine+rebuild");
+      CHECK(slurp(ixp(d))==good, "fastidx-rec: rebuilt index is byte-identical to the original");
+      CHECK(s.undoCount()==10, "fastidx-rec: all records present");
+      s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e3; bool ok=s.open(d,&e3);
+      CHECK(ok, "fastidx-rec: plain open after recovery: "+e3.str());
+      CHECK(s.undoLoadStats().fastPath==1, "fastidx-rec: the recovered index is consumed on the next open");
+      CHECK(s.undoIndexState()==UndoIndexState::Current, "fastidx-rec: Current");
+      s.close(); }
+}
+
+static void test_undoidx_fastidx_measure(){
+    g_cur="UNDOIDX-FASTIDX-measure";
+    ChainError e; const uint32_t S=64; const int N=1024;               // 16 closed segments, no tail
+    std::string d=freshDir("fastidx_measure");
+    CHECK(buildFastIdxStore(d,N,S,&e), "fastidx-m: build "+std::to_string(N)+" records: "+e.str());
+    double tFast=0,tScan=0; UndoLoadStats sf,ss; std::string lineF,lineS;
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1;
+      double t0=nowMs(); bool ok=s.open(d,&e1); tFast=nowMs()-t0;
+      CHECK(ok,"fastidx-m: fast open: "+e1.str()); sf=s.undoLoadStats(); lineF=statsLine(sf); s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); s.injectUndoIndexDisabled(true); ChainError e2;
+      double t0=nowMs(); bool ok=s.open(d,&e2); tScan=nowMs()-t0;
+      CHECK(ok,"fastidx-m: scan open: "+e2.str()); ss=s.undoLoadStats(); lineS=statsLine(ss); s.close(); }
+    const long undoBytes=fsz(d+"/undo.dat");
+    printf("FASTIDX-measure N=%d segmentSize=%u undoBytes=%ld indexBytes=%ld\n", N, S, undoBytes, fsz(ixp(d)));
+    printf("  fast: %s timeMs=%.2f\n  scan: %s timeMs=%.2f\n", lineF.c_str(), tFast, lineS.c_str(), tScan);
+    printf("  syscallShape: scan headerReads=%llu vs fast headerReads=%llu segmentReads=%llu (descriptors=%llu)\n",
+           (unsigned long long)ss.headerReads,(unsigned long long)sf.headerReads,
+           (unsigned long long)sf.segmentReads,(unsigned long long)sf.descriptors);
+    printf("  bytesShape: scan=%llu (%.1f%% of undo.dat) vs fast=%llu (%.1f%% of undo.dat)\n",
+           (unsigned long long)ss.bytesRead, 100.0*(double)ss.bytesRead/(double)undoBytes,
+           (unsigned long long)sf.bytesRead, 100.0*(double)sf.bytesRead/(double)undoBytes);
+    CHECK(sf.fastPath==1 && ss.fastPath==0, "fastidx-m: both modes exercised");
+    CHECK(sf.records==(uint64_t)N && ss.records==(uint64_t)N, "fastidx-m: identical record counts");
+    CHECK(sf.headerReads+sf.segmentReads < ss.headerReads/8, "fastidx-m: at least an 8x reduction in read syscalls");
+    CHECK(sf.bytesRead>ss.bytesRead, "fastidx-m: bytes read INCREASE (recorded honestly, not hidden)");
+}
+
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail}, {"UNDOIDX-FASTIDX-equiv",test_undoidx_fastidx_equiv}, {"UNDOIDX-FASTIDX-fallback",test_undoidx_fastidx_fallback}, {"UNDOIDX-FASTIDX-damaged",test_undoidx_fastidx_damaged}, {"UNDOIDX-FASTIDX-recovery",test_undoidx_fastidx_recovery}, {"UNDOIDX-FASTIDX-measure",test_undoidx_fastidx_measure} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){

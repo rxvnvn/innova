@@ -754,3 +754,95 @@ pages — which is the accepted semantics of every other barrier in this store).
   removed with it (it could no longer be true).
 * OPEN-F1-2: if the index path is a directory (not a file), the artifact is refused as unreadable rather
   than quarantined; such a datadir is broken independently of the store and no index recovery is attempted.
+
+## 16. Stage 3B-D1-S1.2 — consuming the derived index at startup (fast startup)
+
+S1.2 loads `undoIndex_` (the in-RAM `std::vector<UndoMeta>`) through the derived `UNDOINDEX` when that
+artifact is CURRENT for the committed state, instead of always issuing one read per record. It is a pure
+optimisation layer over the accepted S1.1/F2 machinery: nothing about authority, publication, recovery or
+classification changes, and no failure mode is masked.
+
+### 16.1 What the index can and cannot establish (the integrity question)
+
+FACT, from the format in §14 and the record layout in `undo.dat`:
+
+* a segment descriptor is `{startOffset, endOffset, recordCount, crc32}` and its `crc32` covers THOSE
+  FIELDS ONLY — never the undo bytes it points at;
+* `UndoMeta` needs per-record `offset`, `len`, `blockHash` and `height`, which live in the record headers
+  inside `undo.dat` and nowhere else;
+* record headers are NOT contiguous — records are variable length, so the header of record *k* is only
+  reachable by walking from the start of its segment.
+
+Therefore a valid, CURRENT index proves the BYTE BOUNDARIES of the closed segments and nothing about the
+records inside them, and **no validation-free startup is possible with this format**: per-record metadata
+cannot be produced without reading record bytes. What the index CAN safely buy is to replace one syscall
+per record with one syscall per closed segment. That is what S1.2 does, and the report quantifies it
+honestly (fewer read syscalls, MORE bytes, the per-record parse unchanged).
+
+### 16.2 When the index is consumed
+
+`loadUndoFor()` first asks `tryLoadCurrentUndoIndex()`: the artifact must exist, decode
+(magic/version/CRC/length/bounds as in §14), carry the configured `segmentSize`, have `baseOffset == 0`,
+have descriptors contiguous from offset 0 with `recordCount == segmentSize` and
+`committedBytes == last.endOffset <= MANIFEST.undoSize`. Only then is it consumed, and only after
+`undo.dat` passes the existing regular-file guards. Anything else — absent, invalid, ahead, different
+segment size, disabled for a control run — leaves `fastPath = 0` and the authoritative record scan runs,
+with the S1.1 classification/normalisation pass afterwards repairing or refusing the artifact exactly as
+before. `MANIFEST.undoSize` remains the sole authority: the fast path never reads the index for it.
+
+### 16.3 The fast path, and why a decline is always safe
+
+For each closed descriptor the loader issues ONE bounded read of the segment's byte span (a span above
+`UNDOINDEX_MAX_BULK_SPAN`, 4 MiB, falls back to per-record header reads so the transient buffer stays
+bounded), then re-parses every record in that buffer with the SAME validations as the scan (magic, length
+range, bounds) plus two cross-checks the scan cannot make:
+
+* the parse must land EXACTLY on the descriptor's `endOffset` (no slack, no overrun);
+* it must yield EXACTLY `recordCount` records.
+
+The uncovered tail after the final descriptor is then parsed with per-record header reads, and it must be
+strictly shorter than one closed segment: a tail that reaches a full segment means the index missed a
+closure (STALE) and the fast path declines instead of consuming it.
+
+On ANY anomaly — mismatch, damaged data, I/O error, stale shape — the loader discards its partial result,
+records the reason in `UndoLoadStats::fallback`, clears the error and runs the authoritative scan, whose
+outcome is then exactly the pre-S1.2 outcome (same error codes, same classification, same rebuild or
+fail-closed refusal). Because a declined index is still inspected by the S1.1 classifier, a *wrong but
+well-formed* index is repaired through the normal Stale/Ahead normalisation rather than silently accepted.
+Nothing is ever accepted on trust.
+
+Kinds of damage, and where each is detected (unchanged from S1.1, stated because the mission asks):
+
+| damage | detected by | when |
+|---|---|---|
+| index artifact structurally invalid | `UndoIndex::decode` | open (fail closed; authorised recovery available) |
+| index boundaries disagree with the stream | the fast path's exact-landing/recordCount cross-checks, then classification | open (decline + rebuild) |
+| `undo.dat` record header damaged (magic/length) | both the fast path and the scan | open (fail closed, same error in both modes) |
+| `undo.dat` record PAYLOAD damaged | `UndoRecord::decode`'s trailing crc32 | when the record is actually decoded (disconnect/rollback) — identical in both modes |
+
+### 16.4 Counters and cost model
+
+`undoLoadStats()` reports the startup profile of the last open: `fastPath`, `fallback`, `descriptors`,
+`segmentReads`, `headerReads`, `records`, `bytesRead`. Diagnostics only — they never influence behaviour.
+Measured numbers (records scanned, reads, bytes, time, RSS, and the comparison against the scan path at
+the same state) are in the S1.2 report; the model is:
+
+* read syscalls: `R` (scan) -> `#closedSegments + tailRecords` (fast);
+* bytes: `R x 52` (scan, headers only) -> `sum(segment spans) + tail x 52` (fast, headers + payloads);
+* parse work: `R` records in both cases — this is the part that the format cannot remove while the full
+  in-RAM `UndoMeta` vector is kept (see §16.5).
+
+### 16.5 What a genuinely O(#segments) startup still needs (S1.3+)
+
+Not available in this slice, by construction:
+
+1. the in-RAM representation is a full `std::vector<UndoMeta>` (its replacement by a segment map is
+   explicitly S1.3), so every record must still be parsed to fill it; and
+2. the index carries no per-record metadata, so the parse cannot be avoided by reading the index instead.
+
+A true fast startup therefore needs either the S1.3 representation change (start from the index alone and
+read individual records on demand, with the existing fail-closed per-record decode) or a format addition
+that lets the committed stream be validated without reading it (for example a per-segment CRC over the
+segment's BYTES, so "the indexed range is intact" becomes checkable from metadata). Until then the honest
+statement is: S1.2 reduces startup READ SYSCALLS by replacing per-record reads with per-segment reads, at
+the cost of reading payload bytes it previously skipped — it does not make startup O(#segments).
