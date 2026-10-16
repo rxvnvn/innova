@@ -159,7 +159,7 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
                                           int32_t committedTipHeight,
                                           uint64_t recordCount,
                                           uint32_t generationCapability,
-                                          const unsigned char* dagInputDigest,
+                                          const unsigned char* generationInputDigest,
                                           std::string* error)
 {
     if (!Flush(error))
@@ -180,9 +180,9 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
     if (generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE ||
         generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER)
     {
-        unsigned char dagDigest[32];
-        memset(dagDigest, 0, 32);
-        const unsigned char* usedDag = dagInputDigest ? dagInputDigest : dagDigest;
+        unsigned char emptyGenerationInputDigest[32];
+        memset(emptyGenerationInputDigest, 0, 32);
+        const unsigned char* usedGenerationInput = generationInputDigest ? generationInputDigest : emptyGenerationInputDigest;
         // Materialize candidate leaves before root computation so the writer and
         // validator bind the same immutable sidecar.
         FixedBlockIndexManifest preManifest = store_.GetManifest();
@@ -201,7 +201,7 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
         // RecomputeGenerationRootFromFiles applies the canonical mix itself.
         boost::filesystem::path sdir(stagingDir_);
         if (!RecomputeGenerationRootFromFiles(sdir, generation, committedTipHash,
-                                              recordCount, usedDag,
+                                              recordCount, usedGenerationInput,
                                               generationCapability ==
                                                   BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER,
                                               binding, error))
@@ -231,9 +231,9 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
     if (generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE ||
         generationCapability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER)
     {
-        unsigned char dagDigest[32];
-        memset(dagDigest, 0, 32);
-        memcpy(man.dagInputDigest, dagInputDigest ? dagInputDigest : dagDigest, 32);
+        unsigned char emptyGenerationInputDigest[32];
+        memset(emptyGenerationInputDigest, 0, 32);
+        memcpy(man.generationInputDigest, generationInputDigest ? generationInputDigest : emptyGenerationInputDigest, 32);
     }
     if (!store_.WriteManifest(man, error))
         return false;
@@ -249,9 +249,9 @@ bool BlockIndexGenerationWriter::ComputeGenerationRootFromFiles(
     const std::string& stagingDir, uint64_t generation, unsigned char root[32],
     std::string* error)
 {
-    // A full recompute needs the persisted dagInputDigest. We require the caller
+    // A full recompute needs the persisted generationInputDigest. We require the caller
     // to have set it; simplest is to recompute from the current manifest's
-    // dagInputDigest. For migration/migration-builder use the derived binding
+    // generationInputDigest. For migration/migration-builder use the derived binding
     // path (Shadow) unless a true AUTHORITATIVE root is required (M6).
     (void)generation;
     (void)root;

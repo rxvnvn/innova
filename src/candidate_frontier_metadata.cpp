@@ -11,6 +11,12 @@
 #include <cstring>
 #include <algorithm>
 
+// On-disk generation-binding compatibility constant. Its VALUE must never change:
+// older generations were bound with it. Only the symbol is neutral.
+static const char kGenerationBindingDomain[] = "INNOVA_GENERATION_DAG_BINDING_V2";
+// On-disk candidate-leaves binding compatibility constant. Value must never change.
+static const char kCandidateLeavesBindingDomain[] = "INNOVA_CANDIDATE_LEAVES_BINDING_V1";
+
 namespace fs = boost::filesystem;
 
 // V2-R1 test-only fault-injection seam (default false; NEVER set by production
@@ -59,13 +65,13 @@ bool ComputeCandidateLeavesBinding(const std::string& dir,uint64_t generation,un
 {
  std::vector<uint256> leaves; if(!ReadCandidateLeafMetadata(dir,generation,&leaves,error)) return false;
  unsigned char leafDigest[32]; HashLeaves(leaves,leafDigest); SHA256_CTX c; SHA256_Init(&c);
- static const char domain[]="INNOVA_CANDIDATE_LEAVES_BINDING_V1"; SHA256_Update(&c,domain,sizeof(domain)-1);
+ SHA256_Update(&c,kCandidateLeavesBindingDomain,sizeof(kCandidateLeavesBindingDomain)-1);
  unsigned char gen[8]; U64(gen,generation); SHA256_Update(&c,gen,8); SHA256_Update(&c,leafDigest,32); SHA256_Final(out,&c); return true;
 }
 
-bool MixCandidateLeavesIntoDagDigest(const unsigned char dag[32],const unsigned char candidate[32],unsigned char out[32])
+bool MixCandidateLeavesIntoGenerationDigest(const unsigned char generationInputDigest[32],const unsigned char candidate[32],unsigned char out[32])
 {
- if(!dag||!candidate||!out) return false; SHA256_CTX c; SHA256_Init(&c);
- static const char domain[]="INNOVA_GENERATION_DAG_BINDING_V2"; SHA256_Update(&c,domain,sizeof(domain)-1);
- SHA256_Update(&c,dag,32); SHA256_Update(&c,candidate,32); SHA256_Final(out,&c); return true;
+ if(!generationInputDigest||!candidate||!out) return false; SHA256_CTX c; SHA256_Init(&c);
+ SHA256_Update(&c,kGenerationBindingDomain,sizeof(kGenerationBindingDomain)-1);
+ SHA256_Update(&c,generationInputDigest,32); SHA256_Update(&c,candidate,32); SHA256_Final(out,&c); return true;
 }

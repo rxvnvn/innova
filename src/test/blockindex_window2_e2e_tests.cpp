@@ -61,15 +61,9 @@ static const int kFixtureDepth = 11;
 namespace fs = boost::filesystem;
 
 extern CWallet* pwalletMain;
-extern bool g_testFailSetBestChainAfterDagInit;
-extern bool g_testFailInitialDagLinksCommit;
-extern bool g_testFailFailedAddDagLinksCleanupCommit;
-extern bool g_testFailReorganizeDagLinksEraseCommit;
-extern bool g_testForceDagPruneInAdd;
+extern bool g_testFailSetBestChainAfterCommit;
 extern int g_testDagPruneDepth;
 extern bool g_testFailDagPruneCommit;
-extern bool g_testSuppressDagSourceAbort;
-extern bool g_dagSourceUnhealthy;
 extern bool CorruptDagTipDeltaSpillForTest(int);
 extern int g_testDagPruneFailStage;
 extern bool g_testFailDagTipDeltaSpillWrite;
@@ -175,7 +169,7 @@ static CBlockIndex* AddSidePoWBlock(CBlockIndex* pindexPrev, unsigned int nExtra
 
 
 
-static CBlockIndex* MineRealDag(CBlockIndex* pindexPrev, unsigned int nExtra)
+static CBlockIndex* MineRealBlock(CBlockIndex* pindexPrev, unsigned int nExtra)
 {
     const bool fSavedAbtrace = AcceptBlockRejectTraceEnabled();
     InitAcceptBlockRejectTrace(true);
@@ -1016,10 +1010,6 @@ BOOST_AUTO_TEST_CASE(f2_byvalue_hot_parent_matches_cold_parent)
 // (DAGRowObjectivelyPrunedForTest) and custody/certificate/seal state through the SAME
 // production methods the startup/shutdown lifecycle calls.
 // ---------------------------------------------------------------------------
-// NOTE: g_testSuppressDagCustodyWatermark is declared at GLOBAL scope in
-// txdb-leveldb.h; inside this test namespace it must be referenced as ::global (the
-// declaration itself must not be repeated here, or the extern would bind to a
-// namespace-local symbol that no translation unit defines).
 
 
 
@@ -1497,8 +1487,7 @@ BOOST_AUTO_TEST_CASE(f2_byvalue_provider_failure_matrix)
 // "hot" resolver (AuthoritativeBlockIndexHotResolver) read only the SAME
 // immutable selected generation; a retained block created AFTER that generation
 // snapshot could never resolve through ResolveAuthoritativeBlockSnapshot, so
-// EnumerateAuthoritativeStagedScope (which resolves every merged daglinks key)
-// could not enumerate a post-generation retained canvas. The fix consults the
+// it could not enumerate a post-generation retained canvas. The fix consults the
 // CURRENT mutable retained tail (BlockIndexAuthoritativeLive, the production
 // live authority: tip-then-base composite) on a genuine immutable NOT_FOUND.
 //
@@ -1514,7 +1503,7 @@ BOOST_AUTO_TEST_CASE(f2_byvalue_provider_failure_matrix)
 
 // ---------------------------------------------------------------------------
 // S3 authoritative ordinary ADD: FINAL-COMMIT FAILURE (mandatory Phase 8 point).
-// Inject a failure at the physical source TxnCommit boundary (g_testFailInitialDagLinksCommit).
+// Inject a failure at the physical source TxnCommit boundary.
 // Verify: NO mixed durable state; on reopen the source is ALL-OLD (token unchanged,
 // new block daglinks absent, no score/child cert bound to a new/mismatched token,
 // no external live publication of the failed ADD). The S3 ADD stages topology +
@@ -1822,7 +1811,7 @@ static bool g_s4BoundaryRuntime=false;
 // builder burns the reward to an unspendable script; this one keeps the output
 // spendable so the fixture can construct a real signed spend of it.
 
-// MineRealDag equivalent for a spendable coinbase; returns the block index and
+// MineRealBlock equivalent for a spendable coinbase; returns the block index and
 // copies the coinbase transaction out for later spending.
 
 
@@ -1849,7 +1838,7 @@ static bool g_s4BoundaryRuntime=false;
 // ReadMergeCandidate was ever reached.
 //
 // The repair (a) attests canonical ROW PRESENCE separately from frontier
-// membership (CTxDB::ReadDAGFrontierMembershipAttested) and (b) fails the WHOLE
+// membership and (b) fails the WHOLE
 // external CLEAN enumeration when an enumerated authoritative tip has no
 // canonical row (new reason DAG_TIP_SELECTION_REASON_FRONTIER_ROW_ABSENT +
 // DagMergeParentStats::frontierRowAbsent). Legitimate non-members (row present,
@@ -1885,12 +1874,10 @@ namespace {
 // F2-B1-R-A5 — REAL ACCEPT-PATH: a de-materialized canonical row that is still
 // validated as a declared DAG parent by a LATER accepted block.
 //
-// The binding re-audit proved soundness only for the resolver called directly
-// (with g_testSuppressDagSourceAbort=true), so it never observed the ACCEPT-PATH
+// The binding re-audit proved soundness only for the resolver called directly,
+// so it never observed the ACCEPT-PATH
 // consequence. This case drives the real storage/accept path
-//   CBlock::AddToBlockIndex -> (retired DAG colouring, removed) ->
-//   ResolveDagParentScore(FAILURE) -> AbortDagSourcePersistence
-// (main.cpp:9380-9393) over a lifecycle the node itself creates:
+// over a lifecycle the node itself creates:
 //   (1) canonical post-DAG chain fork -> a1 -> a2 (real rows);
 //   (2) real SetBestChain -> Reorganize to a competing branch: a2's DURABLE row
 //       is erased (main.cpp:8695) and a REORGANIZE provenance record is written;
@@ -1898,11 +1885,6 @@ namespace {
 //       a legitimate extension of a known, valid branch;
 //   (4) reorg BACK so a2 is canonical again (Reorganize does not re-materialize
 //       the reconnect branch's rows) and accept a child of a2.
-//
-// Process safety only: g_testSuppressDagSourceAbort is set so a failure does not
-// kill the shared process. It does NOT hide the result: AbortDagSourcePersistence
-// latches g_dagSourceUnhealthy BEFORE consulting the suppression flag
-// (main.cpp:163-171), so every abort is still observed and asserted below.
 // ---------------------------------------------------------------------------
 
 
@@ -1919,8 +1901,7 @@ namespace {
 //
 // Reorganize erases the disconnected branch's canonical rows (main.cpp:8695) and
 // stages the authoritative full-field ONLY for vertices present in the merged
-// persisted canvas (EnumerateAuthoritativeStagedScope reads persisted rows:
-// blockindex_authoritative_startup.cpp:1373-1387), so an erased row is not in the
+// persisted canvas, so an erased row is not in the
 // scope and is not rewritten. This case measures the consequence on the real
 // storage/accept path with a report-style loop (no assertion inside the loop).
 // ---------------------------------------------------------------------------
@@ -1957,7 +1938,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
     SetMockTime(1700001950);
     CBlockIndex* fork=pindexBest;
     while(fork->nHeight<kFixtureDepth) fork=MineReal(fork,0xE500+fork->nHeight);
-    fork=MineRealDag(fork,0xE510);
+    fork=MineRealBlock(fork,0xE510);
     const fs::path root=fs::temp_directory_path()/fs::unique_path("p1retired-%%%%-%%%%");
     fs::create_directories(root/"snapshot");
     struct Cleanup { fs::path root; CBlockIndex* best; CBlockIndex* genesis;
@@ -1965,7 +1946,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
         ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest();
             pindexBest=best; pindexGenesisBlock=genesis;
             if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
-            g_testSuppressDagSourceAbort=false; SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
+            SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
     } cleanup(root);
     { CTxDB db; db.Close(); }
     const auto liveDir=GetDataDir()/"txleveldb";
@@ -1980,7 +1961,6 @@ BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
     AuthorityReadyResetForTest();
     BOOST_REQUIRE(!AuthorityReadyIsSet());
-    g_testSuppressDagSourceAbort=true;
     // LEGACY DAG RETIREMENT (Phase 2 / H9 FINAL): the retired profile is the only profile.
     BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(),&aerr),aerr);
     BOOST_REQUIRE(g_fAuthoritativeStartup);
@@ -2021,13 +2001,13 @@ BOOST_AUTO_TEST_CASE(p1_retirement_cpu_mining_consumers_use_linear_head)
     BOOST_CHECK_MESSAGE(id.nHeight == head->nHeight + 1,
         "retired profile: the identity height must follow the authoritative linear head ("
         << id.nHeight << " vs " << (head->nHeight + 1) << ")");
-    BOOST_CHECK_MESSAGE(id.vDAGTips.empty(),
-        "retired profile: no DAG frontier tip set may be collected (size=" << id.vDAGTips.size() << ")");
+    BOOST_CHECK_MESSAGE(id.vFrontierTips.empty(),
+        "retired profile: no DAG frontier tip set may be collected (size=" << id.vFrontierTips.size() << ")");
     BOOST_CHECK_MESSAGE(fCollateralReady,
         "retired profile: collateral readiness must be computed without the DAG tip selector");
     BOOST_CHECK_MESSAGE(fWorkCurrent,
         "retired profile: a freshly captured identity must be current without any DAG-state dependency");
-    BOOST_TEST_MESSAGE("P1_CPUMINING primary_parent=linear selection_unavailable=0 dag_tips=" << id.vDAGTips.size()
+    BOOST_TEST_MESSAGE("P1_CPUMINING primary_parent=linear selection_unavailable=0 dag_tips=" << id.vFrontierTips.size()
                        << " collateral_ready=" << (fCollateralReady ? 1 : 0)
                        << " work_current=" << (fWorkCurrent ? 1 : 0));
 }
@@ -2054,7 +2034,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
         ~Cleanup(){ ResetBlockIndexAuthoritativeStartupForTest();
             pindexBest=best; pindexGenesisBlock=genesis;
             if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
-            g_testSuppressDagSourceAbort=false; SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
+            SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
     } cleanup(root);
     { CTxDB db; db.Close(); }
     const auto liveDir = GetDataDir() / "txleveldb";
@@ -2122,7 +2102,6 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
     const int nRefusalsAfter = 0;
     BOOST_CHECK_MESSAGE(nRefusalsAfter == nRefusalsBefore,
         "no retirement firewall refusal may be involved in a legitimate linear reorg");
-    BOOST_CHECK_MESSAGE(!g_dagSourceUnhealthy, "the retired-profile reorg must not latch any DAG-source failure");
     // Mechanism probe: the live authority's own recorded tip, in-process, right
     // after the reorg (before any restart), and the derived by-value record.
     {

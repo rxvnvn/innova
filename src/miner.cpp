@@ -1209,7 +1209,7 @@ bool CPUMiningWorkIdentityMatches(const CPUMiningWorkIdentity& a,
         return false;
     if (a.hashBestChain != b.hashBestChain ||
         a.hashPrimaryParent != b.hashPrimaryParent ||
-        a.vDAGTips != b.vDAGTips ||
+        a.vFrontierTips != b.vFrontierTips ||
         a.hashDAGSourceState != b.hashDAGSourceState)
         return false;
     return !fCheckMempool || a.nTransactionsUpdated == b.nTransactionsUpdated;

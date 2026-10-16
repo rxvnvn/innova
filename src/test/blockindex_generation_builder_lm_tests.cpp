@@ -688,7 +688,7 @@ BOOST_AUTO_TEST_CASE(v2r1_regular_vs_lm_byte_parity)
             << " (reg " << a.size() << " vs lm " << b.size() << ")");
     }
     // MANIFEST: the OLD_SHADOW generation root/content-binding lives in the first
-    // 92 bytes and must be identical. The trailing 32-byte dagInputDigest field is
+    // 92 bytes and must be identical. The trailing 32-byte generationInputDigest field is
     // informational for OLD_SHADOW (the writer persists the passed DAG digest only
     // on the AUTHORITATIVE path); the regular builder writes SHA256(empty)
     // unconditionally while the LM OLD_SHADOW manifest keeps zeros. That field is
@@ -704,9 +704,9 @@ BOOST_AUTO_TEST_CASE(v2r1_regular_vs_lm_byte_parity)
         // Deterministic record of the shadow-only informational divergence:
         const std::string zeros(32, '\0');
         BOOST_CHECK_MESSAGE(ml.substr(92) == zeros,
-            "LM OLD_SHADOW MANIFEST dagInputDigest tail expected zeros");
+            "LM OLD_SHADOW MANIFEST generationInputDigest tail expected zeros");
         BOOST_CHECK_MESSAGE(mr.substr(92) != zeros,
-            "regular OLD_SHADOW MANIFEST writes SHA256(empty) dagInputDigest (non-zero)");
+            "regular OLD_SHADOW MANIFEST writes SHA256(empty) generationInputDigest (non-zero)");
     }
     fRegTest = frSaved; fTestNet = ftSaved;
 }

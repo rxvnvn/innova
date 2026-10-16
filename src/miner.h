@@ -37,7 +37,7 @@ struct CPUMiningWorkIdentity
 {
     uint256 hashBestChain;
     uint256 hashPrimaryParent;
-    std::vector<uint256> vDAGTips;
+    std::vector<uint256> vFrontierTips;
     unsigned int nTransactionsUpdated;
     int nHeight;
     // R2c.2/S7 / audit-D (OPEN D): authoritative canonical DAG source-state
@@ -47,7 +47,7 @@ struct CPUMiningWorkIdentity
     // disagree on this token are NOT the same work: a source-only (e.g.
     // persisted recolor) transition can reorder the template's capped
     // merge-parent vector without moving hashBestChain / hashPrimaryParent /
-    // vDAGTips. Authoritative mode fills it under cs_main and fails closed if
+    // vFrontierTips. Authoritative mode fills it under cs_main and fails closed if
     // it is unreadable; legacy mode leaves it 0 on both sides, so the legacy
     // comparison is unchanged.
     uint256 hashDAGSourceState;

@@ -28,14 +28,14 @@
 // together when too many files stack up.
 //
 // Learn more: http://code.google.com/p/leveldb/
-// F2-B1-R (erase lifecycle): WHY a canonical daglinks row was erased. The prune's
+// F2-B1-R (erase lifecycle): WHY a canonical row was erased. The prune's
 // erase is the only origin whose semantics allow Option-R boundary reconstruction,
 // so every erase call site states its origin EXPLICITLY and the origin is bound
-// durably in the SAME atomic batch as the erase (see CTxDB::EraseDAGLinks). A
+// durably in the SAME atomic batch as the erase. A
 // height floor alone can only prove that SOME prune passed a height; it cannot
 // attribute a PARTICULAR row's absence to that prune.
 
-// R3 / C6 section 1 — typed DAG-row read outcome. A bare absence NEVER proves a
+// R3 / C6 section 1 — typed row read outcome. A bare absence NEVER proves a
 // protocol prune; a malformed present row is never "missing"; an I/O failure is
 // never "missing". Only positive, incarnation-bound and continuity-bound
 // evidence may produce ROW_OBJECTIVELY_PRUNED.
@@ -298,121 +298,6 @@ bool ReadAddrIndex(uint160 addrHash, std::vector<uint256>& txHashes);
     bool WriteCheckpointPubKey(const std::string& strPubKey);
     bool LoadBlockIndex();
 
-    // IDAG Phase 2: DAG link persistence. SourceStateId names the exact
-    // logical daglinks state and must be queued in the SAME TxnBegin/Commit
-    // batch as every mutation of this relation.
-    // G6 authoritative row-level attestation. Identical membership contract to
-    // ReadDAGFrontierMembership (row present AND childCount == 0), but it ALSO
-    // attests canonical ROW PRESENCE SEPARATELY, so an authoritative consumer
-    // can distinguish "legitimately not a frontier member" (row present, has
-    // children / durable row absent by semantics) from "an enumerated
-    // authoritative frontier tip whose canonical row is MISSING" (incomplete
-    // canonical source - must fail closed, never a reduced valid vector).
-    // Returns false fail-closed on any IO error, malformed/unreadable canonical
-    // row, or revoked/unreadable child-count projection. On true:
-    //   *rowPresent = canonical daglinks postimage exists (active-batch staged
-    //                 tombstone honoured exactly like ReadDAGFrontierMembership);
-    //   *member     = *rowPresent && childCount == 0.
-    // Read-only attestation: never writes, never revokes, never mutates the
-    // child-count or score certificates. The legacy reader above is unchanged.
-    // Erases the canonical row of `hash` and records, in the same batch, whether
-    // this erase is prune-attributed (PRUNE) or a non-prune de-materialization
-    // (REORGANIZE / FAILED_ADD_CLEANUP) in the row-erase provenance record. A
-    // no-op erase (row already absent) records NOTHING: it materializes no
-    // absence, so it must never (re)attribute one.
-    // (declaration of EraseDAGLinks, see below for the R3 height-carrying overload)
-    // R3 / C6 section 3: the prune-event journal entry binds height(X) and the
-    // post-prune floor, neither of which is carried by the row payload
-    // (the legacy daglinks row has no height field) and both of which are ALREADY known at
-    // the prune site (dag.cpp resolves height by value at :1619 and owns
-    // nPruneBelow). This overload lets that caller pass them; the erase semantics
-    // are otherwise identical. With DAGROW_HEIGHT_UNKNOWN for either value a PRUNE
-    // erase records NO event (fail closed: no positive attribution without a
-    // complete binding). Non-prune origins never record an event.
-    // S3 staged-view enumeration: return the staged daglinks writes/tombstones
-    // held in the active WriteBatch (daglinks prefix only). Fail closed on any
-    // batch scan error or when no active transaction is open.
-    // Canonical bounded reverse-edge projection: number of retained child
-    // records whose canonical vDAGParents contains this parent exactly once.
-    // R2c.2s: authoritative mutable DAG score authority. The persisted
-    // nDAGScore/fBlue/nInferredK fields are freshly derived from CURRENT ancestor
-    // coloring, not frozen at first coloring, so a separate durable certificate
-    // is required to bind the retained canonical score set to one SourceStateId.
-    // A pre-cutover or stale score set must never be accepted as certified-current.
-    //
-    // Healthy predicate (this layer only): supported marker version, marker
-    // bound to the CURRENT SourceStateId, no revocation poison, child-count
-    // authority also healthy. It never claims that a recolor was performed;
-    // that is EnsureDAGScoreAuthority's contract.
-    // Typed form of the predicate above (B-1). IsDAGScoreAuthorityHealthy()
-    // collapses every non-healthy state into `false`; an absent certificate
-    // marker is NOT the same fact as a revoked/corrupt/mismatched one. The
-    // accepted S3/S5 prune-reorg lifecycle requires that distinction: a scored
-    // set that is merely NOT CERTIFIED IN THIS SESSION must not be reported as
-    // an unhealthy authority. This accessor is strictly a refinement: the
-    // healthy/not-healthy verdict and the error strings are unchanged.
-    // Atomic production publish: write the supported-version certificate marker
-    // bound to the CURRENT SourceStateId AND clear the revocation poison in one
-    // durable LevelDB batch. Callers must first complete the authoritative
-    // recolor (retired) at a stable source; this method only seals it.
-    // Test-only: persistently revoke the score authority certificate against the
-    // shared live source handle (simulates detection at a chosen point).
-    // Test-only: persistently revoke the child-count projection against the
-    // shared live source handle (simulates detection at a chosen point). Not
-    // called by production paths.
-    // Test-only: stage a raw daglinks write/erase directly into the active
-    // WriteBatch (no child-count maintenance), matching the serialized daglinks
-    // records ScanBatchDAGLinks observes. Used by the S3 staged-readback tests to
-    // exercise pure batch-view precedence. Requires an open transaction.
-    // Lenient legacy enumeration (skips malformed records) for legacy/recovery
-    // callers. Do NOT use for authoritative source construction.
-    // STRICT persisted daglinks enumeration for authoritative source construction.
-    // Unlike IterateDAGLinks this does NOT skip malformed records: a malformed
-    // key, malformed value, trailing bytes, or an iterator/read error returns
-    // false and reports the reason, so an incomplete/malformed retained canvas
-    // can never be silently certified (fail-closed authority).
-    // S3 batch-only: stage the DAG-score certificate marker bound to `source`
-    // (SCORE_STATE_KEY = {version 1, source}) and clear the score revocation key,
-    // all INSIDE the active WriteBatch. Requires an open transaction. This is the
-    // in-batch analog of the standalone quiesced-only PublishDAGScoreCertificateAtomic.
-    // S3 batch-only: stage the child-count certificate marker bound to `source`
-    // and clear the child-count revocation key, all INSIDE the active WriteBatch.
-    // S3 rollback support: capture the DURABLE pre-operation score-certificate
-    // state (raw marker bytes + presence, revocation poison presence) so a failed
-    // mutation can restore it EXACTLY. Reads the durable store directly; call
-    // BEFORE the mutation batch opens. A rollback must return to THIS state and
-    // must never fabricate a healthy certificate.
-    // S3 rollback support: stage the EXACT captured score-certificate state into
-    // the active WriteBatch (marker write-or-erase + revocation set-or-clear).
-    // Unlike StageDAGScoreCertificateInBatch this never fabricates a healthy
-    // marker: an uncertified or revoked pre-operation state stays uncertified or
-    // revoked after the rollback. Requires an open transaction.
-    // Production CSPRNG mint with explicit failure status; bootstrap/source
-    // mutation callers must not use a token when this returns false.
-    // Zero-delta legacy upgrade: creates a token only when the key is absent.
-    // A present-but-undecodable token is corruption, never treated as missing.
-
-    // F2 erase provenance. `dagcleanheight` above is written by THREE sites with
-    // TWO meanings (the prune path stores the erase floor, Shutdown stores the
-    // current tip, and the prune rollback restores a prior value), so it cannot
-    // prove that a missing canonical daglinks row was erased by the accepted
-    // prune lifecycle. This marker has exactly ONE writer - the prune/erase
-    // lifecycle (the retired prune path) - and stores exactly the line
-    // (nHeight - DAG_PRUNE_DEPTH) below which that same atomic commit erased the
-    // persisted vertices. It is consumed only as ERASE provenance.
-
-    // F2-B1-R row-erase provenance. ONE record per canonical daglinks row whose
-    // absence was caused by a NON-prune erase lifecycle (Reorganize disconnect
-    // erase, failed-ADD cleanup). `dagprunefloor` above proves only that the prune
-    // later passed a height; this record proves that THIS row's absence was NOT
-    // caused by the prune, so no floor advance can ever explain (launder) it.
-    // Written/erased ONLY from inside CTxDB::EraseDAGLinks, in the same atomic
-    // batch as the erase it describes: absence and provenance cannot commit
-    // separately. Value = (int)DAGRowEraseOrigin.
-    // Bounded: one record per rare non-prune de-materialization event - never per
-    // pruned row, never per chain height. It is erased when the prune physically
-    // erases that same row; a de-materialized row is invisible to the prune, so
-    // the record survives exactly as long as its absence stays un-prune-attributed.
 
     // R3 / C6 continuity substrate (READ-ONLY, additive). The storage engine's
     // monotone write-sequence watermark. Every durable provenance field that only

@@ -603,26 +603,26 @@ BOOST_AUTO_TEST_CASE(generation_root_commits_to_content)
     std::string error;
 
     // Compute two generation roots with same metadata but different component digests
-    unsigned char recordsA[32], activeA[32], hashA[32], derivedA[32], dagA[32];
-    unsigned char recordsB[32], activeB[32], hashB[32], derivedB[32], dagB[32];
+    unsigned char recordsA[32], activeA[32], hashA[32], derivedA[32], genA[32];
+    unsigned char recordsB[32], activeB[32], hashB[32], derivedB[32], genB[32];
     memset(recordsA, 0x11, 32); memset(activeA, 0x22, 32);
-    memset(hashA, 0x33, 32); memset(derivedA, 0x44, 32); memset(dagA, 0x55, 32);
+    memset(hashA, 0x33, 32); memset(derivedA, 0x44, 32); memset(genA, 0x55, 32);
     memset(recordsB, 0x11, 32); memset(activeB, 0x22, 32);
-    memset(hashB, 0x33, 32); memset(derivedB, 0x44, 32); memset(dagB, 0x55, 32);
+    memset(hashB, 0x33, 32); memset(derivedB, 0x44, 32); memset(genB, 0x55, 32);
 
     // Same metadata, same digests -> same root
     unsigned char root1[32], root2[32];
     BOOST_CHECK(ComputeGenerationRoot(42, uint256(0xAAAA), 10,
-                                      recordsA, activeA, hashA, derivedA, dagA, root1));
+                                      recordsA, activeA, hashA, derivedA, genA, root1));
     BOOST_CHECK(ComputeGenerationRoot(42, uint256(0xAAAA), 10,
-                                      recordsB, activeB, hashB, derivedB, dagB, root2));
+                                      recordsB, activeB, hashB, derivedB, genB, root2));
     BOOST_CHECK(memcmp(root1, root2, 32) == 0);
 
     // Same metadata, different derived digest -> different root
     derivedB[0] = 0xFF;
     unsigned char root3[32];
     BOOST_CHECK(ComputeGenerationRoot(42, uint256(0xAAAA), 10,
-                                      recordsB, activeB, hashB, derivedB, dagB, root3));
+                                      recordsB, activeB, hashB, derivedB, genB, root3));
     BOOST_CHECK(memcmp(root1, root3, 32) != 0);
 
     // Same metadata, different records digest -> different root
@@ -630,21 +630,21 @@ BOOST_AUTO_TEST_CASE(generation_root_commits_to_content)
     recordsB[0] = 0xFF;
     unsigned char root4[32];
     BOOST_CHECK(ComputeGenerationRoot(42, uint256(0xAAAA), 10,
-                                      recordsB, activeB, hashB, derivedB, dagB, root4));
+                                      recordsB, activeB, hashB, derivedB, genB, root4));
     BOOST_CHECK(memcmp(root1, root4, 32) != 0);
 
     // Same metadata, different DAG digest -> different root
     recordsB[0] = 0x11; // restore
-    dagB[0] = 0xFF;
+    genB[0] = 0xFF;
     unsigned char root5[32];
     BOOST_CHECK(ComputeGenerationRoot(42, uint256(0xAAAA), 10,
-                                      recordsB, activeB, hashB, derivedB, dagB, root5));
+                                      recordsB, activeB, hashB, derivedB, genB, root5));
     BOOST_CHECK(memcmp(root1, root5, 32) != 0);
 
     // Different generation -> different root
     unsigned char root6[32];
     BOOST_CHECK(ComputeGenerationRoot(43, uint256(0xAAAA), 10,
-                                      recordsA, activeA, hashA, derivedA, dagA, root6));
+                                      recordsA, activeA, hashA, derivedA, genA, root6));
     BOOST_CHECK(memcmp(root1, root6, 32) != 0);
 
     // Root is non-zero

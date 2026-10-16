@@ -153,13 +153,13 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
     // Hoisted: becomes false if any derived entry lacks a live nSize -> gates
     // whether M6 may claim AUTHORITATIVE capability.
     bool allHasBlockSize = true;
-    // Empty DAG input digest (SHA256 of zero bytes) — the retired DAG input set is
-    // permanently empty, exactly as the old builder produced. Cache it once for the
+    // Empty generation input digest (SHA256 of zero bytes) — the retired consensus-graph
+    // input set is permanently empty, exactly as the old builder produced. Cache it once for the
     // AUTHORITATIVE binding.
-    unsigned char emptyDagDigest[32];
-    SHA256_CTX dagCtx;
-    SHA256_Init(&dagCtx);
-    SHA256_Final(emptyDagDigest, &dagCtx);
+    unsigned char emptyGenerationInputDigest[32];
+    SHA256_CTX shaCtx;
+    SHA256_Init(&shaCtx);
+    SHA256_Final(emptyGenerationInputDigest, &shaCtx);
 
     // M2: Open snapshot read-only (dedicated copy, never the live datadir).
     // CRITICAL (M8 RSS fix): the snapshot is a ~3GB / 8M-entry DB; opening it
@@ -990,11 +990,11 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
     const uint64_t totalRecords = writer_.RecordCount(); // before Finalize closes
     // The retired DAG input set is permanently empty, so its digest is
     // SHA256(zero bytes) == e3b0c442..., byte-matching the old builder's manifested
-    // dagInputDigest. (See function-scope emptyDagDigest.)
+    // generation input digest. (See function-scope emptyGenerationInputDigest.)
     if (!writer_.Finalize(generation, hashBestChain, outTipId,
                           (int32_t)outTipHeight,
                           totalRecords, finalCap,
-                          emptyDagDigest, error))
+                          emptyGenerationInputDigest, error))
         return false;
 
     // COHORT M: drop the builder's scratch directory. The external-sort runs,

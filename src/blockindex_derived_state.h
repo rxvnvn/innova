@@ -174,7 +174,7 @@ bool ComputeDerivedContentBinding(const uint256& tipHash,
 //   activeDigest (32 bytes) ||
 //   hashIndexDigest (32 bytes) ||
 //   derivedEntriesDigest (32 bytes) ||
-//   dagInputDigest (32 bytes)
+//   generationInputDigest (32 bytes)
 // )
 //
 // Component digests are SHA256 of the canonical byte representation of each
@@ -186,7 +186,7 @@ bool ComputeGenerationRoot(uint64_t generation,
                            const unsigned char activeDigest[32],
                            const unsigned char hashIndexDigest[32],
                            const unsigned char derivedEntriesDigest[32],
-                           const unsigned char dagInputDigest[32],
+                           const unsigned char generationInputDigest[32],
                            unsigned char root[32]);
 
 class BlockIndexDerivedStateStore

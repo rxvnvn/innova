@@ -240,7 +240,7 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
                                               uint64_t generation,
                                               const uint256& tipHash,
                                               uint64_t recordCount,
-                                              const unsigned char persistedDagInputDigest[32],
+                                              const unsigned char persistedGenerationInputDigest[32],
                                               bool bindFrontier,
                                               unsigned char recomputedRoot[32],
                                               std::string* error)
@@ -362,7 +362,7 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
     if (!ComputeCandidateLeavesBinding(dir.string(), generation, candidateBinding, error))
         return false;
     unsigned char mixedDagInputDigest[32];
-    if (!MixCandidateLeavesIntoDagDigest(persistedDagInputDigest, candidateBinding,
+    if (!MixCandidateLeavesIntoGenerationDigest(persistedGenerationInputDigest, candidateBinding,
                                          mixedDagInputDigest))
         return SetError(error, "candidate leaves root binding failed");
 
@@ -529,7 +529,7 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
             return BLOCK_INDEX_LIFECYCLE_ERROR;
         }
         // Independently recompute the generation root from actual component files.
-        // dagInputDigest is read from V3 MANIFEST (persisted by builder).
+        // generationInputDigest is read from V3 MANIFEST (persisted by builder).
         // R2c.1c: bindFrontier=true for frontier-capable generations, which also
         // requires dag-tip-frontier.dat present + valid (fails closed otherwise).
         // fullRootRecompute=false is used ONLY by the startup-ownership
@@ -541,7 +541,7 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
             unsigned char recomputedRoot[32];
             if (!RecomputeGenerationRootFromFiles(dir, expectedGeneration,
                                                   m.committedTipHash, m.recordCount,
-                                                  m.dagInputDigest, isFrontierCapable,
+                                                  m.generationInputDigest, isFrontierCapable,
                                                   recomputedRoot, error))
             {
                 return BLOCK_INDEX_LIFECYCLE_ERROR;

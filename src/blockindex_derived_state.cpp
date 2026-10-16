@@ -252,7 +252,7 @@ bool ComputeGenerationRoot(uint64_t generation,
                            const unsigned char activeDigest[32],
                            const unsigned char hashIndexDigest[32],
                            const unsigned char derivedEntriesDigest[32],
-                           const unsigned char dagInputDigest[32],
+                           const unsigned char generationInputDigest[32],
                            unsigned char root[32])
 {
     // SHA256(domain || version || generation || tip || count || component digests)
@@ -288,7 +288,7 @@ bool ComputeGenerationRoot(uint64_t generation,
     SHA256_Update(&ctx, activeDigest, 32);
     SHA256_Update(&ctx, hashIndexDigest, 32);
     SHA256_Update(&ctx, derivedEntriesDigest, 32);
-    SHA256_Update(&ctx, dagInputDigest, 32);
+    SHA256_Update(&ctx, generationInputDigest, 32);
 
     SHA256_Final(root, &ctx);
     return true;

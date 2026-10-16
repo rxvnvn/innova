@@ -309,8 +309,7 @@ bool CTxDB::EraseAnonOutput(CPubKey& pkCoin)
 // Bounded keyed source authority, never a resident DAG or overlay query.
 
 
-// G6 authoritative row-level attestation. Same membership postimage as
-// ReadDAGFrontierMembership, but canonical ROW PRESENCE is attested
+// G6 authoritative row-level attestation. Canonical ROW PRESENCE is attested
 // separately so an authoritative enumeration can distinguish a legitimate
 // non-member (row present, has children) from an enumerated frontier tip whose
 // canonical row is MISSING (incomplete canonical source => fail closed; never
@@ -371,7 +370,6 @@ bool CTxDB::EraseAnonOutput(CPubKey& pkCoin)
 // certification scan). "The certificate verifies" is therefore a recomputation,
 // never a timestamp, a floor advancement or a final-state digest alone.
 // ---------------------------------------------------------------------------
-bool g_testSuppressDagCustodyWatermark = false;   // R3.9 case M (test-only; see header)
 
 static uint256 XorUint256(uint256 a, uint256 b)
 {
@@ -511,8 +509,8 @@ static uint256 HashKnownVertex(const uint256& hash)
 // nDAGOrder, then optional nInferredK for Phase-4/Phase-5 records). Duplicate
 // canonical identity (same hash twice) is rejected. After reading every
 // well-formed record the iterator status is checked and a read error yields
-// false. This is the fail-closed drain for EnumerateAuthoritativeStagedScope:
-// an incomplete/malformed retained canvas can never be silently certified.
+// false. Fail closed: an incomplete/malformed retained canvas can never be
+// silently certified.
 
 // S3 staged-view enumeration: scan the active WriteBatch for daglinks
 // writes/tombstones (prefix "daglinks"), so the authoritative staged view can be

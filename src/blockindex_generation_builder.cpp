@@ -507,11 +507,11 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
     // (dagLinks/dagScores snapshot reader) that used to feed this digest has been
     // removed; on every supported (DAG-inert) chain the input set was already
     // empty, so the digest is the fixed empty-input digest.
-    unsigned char dagInputDigest[32];
+    unsigned char generationInputDigest[32];
     {
         SHA256_CTX ctx;
         SHA256_Init(&ctx);
-        SHA256_Final(dagInputDigest, &ctx);
+        SHA256_Final(generationInputDigest, &ctx);
     }
 
     // A.10.1b-fix3 C1: capability decided inside derived block, used below
@@ -660,7 +660,7 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
             SHA256_Final(hashIndexDigest, &ctx);
         }
 
-        // Compute generation root (dagInputDigest from outer scope)
+        // Compute generation root (generationInputDigest from outer scope)
         // The content binding depends on capability:
         // - AUTHORITATIVE: full generation root (requires block data)
         // - OLD_SHADOW: simple metadata binding
@@ -691,7 +691,7 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         if (!ComputeCandidateLeavesBinding(generationDir, generation, candidateBinding, error))
             return false;
         unsigned char mixedDagInputDigest[32];
-        if (!MixCandidateLeavesIntoDagDigest(dagInputDigest, candidateBinding,
+        if (!MixCandidateLeavesIntoGenerationDigest(generationInputDigest, candidateBinding,
                                              mixedDagInputDigest))
             return SetError(error, "candidate leaves root mix failed");
         // AUTHORITATIVE: use full generation root as content binding
@@ -735,8 +735,8 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
     manifest.committedTipHeight = tipHeight;
     manifest.committedTipHash = tipHash;
     manifest.capability = generationCapability;
-    // A.10.1b-fix3: Persist dagInputDigest for validation recomputation
-    memcpy(manifest.dagInputDigest, dagInputDigest, 32);
+    // A.10.1b-fix3: Persist generationInputDigest for validation recomputation
+    memcpy(manifest.generationInputDigest, generationInputDigest, 32);
     if (!store.WriteManifest(manifest, error))
         return false;
 

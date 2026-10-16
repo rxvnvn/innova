@@ -118,16 +118,10 @@ bool fSPVMode = false;
 bool fIbdHeadersObserve = false;
 bool fIbdHeaderScheduler = false;
 bool fRegTestIbd = false;
-// R2c.1d1/R2c.1d2a test-only default-off failpoints. They are never set by
-// production configuration; the DAG-link failures exercise local DB-failure
-// semantics without changing consensus or peer policy when disabled.
-bool g_testFailSetBestChainAfterDagInit = false;
-bool g_testFailInitialDagLinksCommit = false;
-bool g_testFailFailedAddDagLinksCleanupCommit = false;
-bool g_testFailReorganizeDagLinksEraseCommit = false;
-bool g_testForceDagPruneInAdd = false;
-bool g_testSuppressDagSourceAbort = false;
-bool g_dagSourceUnhealthy = false;
+// R2c.1d1/R2c.1d2a test-only default-off failpoint. It is never set by
+// production configuration; it exercises local DB-failure semantics without
+// changing consensus or peer policy when disabled.
+bool g_testFailSetBestChainAfterCommit = false;
 // LEGACY DAG RETIREMENT (Phase 2 / H9 FINAL): the Legacy DAG activation
 // capability, its retired-domain firewall predicate and their test-only seams are
 // removed. There is no longer an engine to enable or a DAG-only domain to guard.
@@ -148,15 +142,6 @@ int g_testS12SeenCloseCount = 0;
 int g_testS12SeenOpenCount = 0;
 int g_testS12SeenDeliveredEvents = 0;
 
-static bool AbortDagSourcePersistence(const char* message)
-{
-    fprintf(stderr, "AbortDagSourcePersistence: %s\n", message);
-    fflush(stderr);
-    g_dagSourceUnhealthy = true;
-    if (g_testSuppressDagSourceAbort)
-        return false;
-    return AbortNode(message);
-}
 static CIbdHeadersObserver g_ibdHeadersObserver(512); // OBSERVATION WINDOW, not policy
 
 namespace
@@ -2585,22 +2570,6 @@ static void ObserveProcessBlockParent(const CBlock& block, int kind,
         {
             e.diagnosticTailSampled = true;
             e.diagnosticTailResident = live->Tail().IsResident(BlockIndexLogicalId(e.prev));
-        }
-    }
-    if (txdb)
-    {
-        CDataStream key(SER_DISK, CLIENT_VERSION);
-        key << std::make_pair(std::string("dagsourcestate"), uint8_t(0));
-        std::string value;
-        if (txdb->Get(leveldb::ReadOptions(), key.str(), &value).ok())
-        {
-            try
-            {
-                CDataStream bytes(value.data(), value.data() + value.size(), SER_DISK, CLIENT_VERSION);
-                bytes >> e.diagnosticSourceState;
-                e.diagnosticSourceRead = true;
-            }
-            catch (const std::exception&) {} // diagnostic failure, no production output
         }
     }
     g_processBlockParentObserver(e);
@@ -7501,7 +7470,7 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
             return error("SetBestChain() : block %s (or an ancestor) is invalidated by the operator",
                          pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
     }
-    if (g_testFailSetBestChainAfterDagInit)
+    if (g_testFailSetBestChainAfterCommit)
         return false;
     uint256 hash = GetHash();
     ibdblocklatency::RecordSetBestChainBegin(hash);

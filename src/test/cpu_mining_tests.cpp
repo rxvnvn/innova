@@ -212,7 +212,7 @@ BOOST_AUTO_TEST_CASE(work_identity_detects_same_height_reorg_and_dag_tip_change)
     original.hashPrimaryParent = uint256(1);
     original.nHeight = 101;
     original.nTransactionsUpdated = 5;
-    original.vDAGTips.push_back(uint256(2));
+    original.vFrontierTips.push_back(uint256(2));
 
     CPUMiningWorkIdentity current = original;
     BOOST_CHECK(CPUMiningWorkIdentityMatches(original, current, true));
@@ -222,7 +222,7 @@ BOOST_AUTO_TEST_CASE(work_identity_detects_same_height_reorg_and_dag_tip_change)
     BOOST_CHECK(!CPUMiningWorkIdentityMatches(original, current, false));
 
     current = original;
-    current.vDAGTips.push_back(uint256(4));
+    current.vFrontierTips.push_back(uint256(4));
     BOOST_CHECK(!CPUMiningWorkIdentityMatches(original, current, false));
 
     current = original;
@@ -240,7 +240,7 @@ BOOST_AUTO_TEST_CASE(work_identity_detects_authoritative_source_only_change)
     original.hashBestChain = uint256(1);
     original.hashPrimaryParent = uint256(1);
     original.nHeight = 12;
-    original.vDAGTips.push_back(uint256(2));
+    original.vFrontierTips.push_back(uint256(2));
     original.hashDAGSourceState = uint256(0xAA);
 
     CPUMiningWorkIdentity current = original;
@@ -255,8 +255,8 @@ BOOST_AUTO_TEST_CASE(work_identity_detects_authoritative_source_only_change)
     CPUMiningWorkIdentity legacyA, legacyB;
     legacyA.hashBestChain = legacyB.hashBestChain = uint256(1);
     legacyA.hashPrimaryParent = legacyB.hashPrimaryParent = uint256(1);
-    legacyA.vDAGTips.push_back(uint256(2));
-    legacyB.vDAGTips.push_back(uint256(2));
+    legacyA.vFrontierTips.push_back(uint256(2));
+    legacyB.vFrontierTips.push_back(uint256(2));
     BOOST_CHECK(CPUMiningWorkIdentityMatches(legacyA, legacyB, false));
     BOOST_CHECK(!CPUMiningWorkIdentityMatches(legacyA, original, false));
 }

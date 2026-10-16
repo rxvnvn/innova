@@ -143,7 +143,7 @@ bool RecomputeGenerationRootFromFiles(const boost::filesystem::path& dir,
                                        uint64_t generation,
                                        const uint256& tipHash,
                                        uint64_t recordCount,
-                                       const unsigned char persistedDagInputDigest[32],
+                                       const unsigned char persistedGenerationInputDigest[32],
                                        bool bindFrontier,
                                        unsigned char recomputedRoot[32],
                                        std::string* error);

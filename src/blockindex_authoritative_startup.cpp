@@ -436,7 +436,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         // is REPORTED (never normalized to VERIFIED) and gates nothing.
         custodyState = 3;
         custodyStageComplete = true;
-        custodyDetail = "Legacy DAG retired: provenance/custody certification not required";
+        custodyDetail = "Legacy multi-parent trust retired: provenance/custody certification not required";
         std::string custodyMsg = std::string("BLOCKINDEX_V2_AUTHORITATIVE custody_state=") +
                                  std::to_string(custodyState) + " custody_epoch=" +
                                  std::to_string((unsigned long long)custodyEpoch);

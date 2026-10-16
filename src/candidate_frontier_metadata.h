@@ -22,7 +22,7 @@ bool ComputeCandidateLeavesBinding(const std::string& generationDir,
                                    unsigned char out[32],
                                    std::string* error);
 
-bool MixCandidateLeavesIntoDagDigest(const unsigned char dagInputDigest[32],
+bool MixCandidateLeavesIntoGenerationDigest(const unsigned char generationInputDigest[32],
                                      const unsigned char candidateLeavesBinding[32],
                                      unsigned char mixedDigest[32]);
 

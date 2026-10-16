@@ -298,8 +298,8 @@ static bool EncodeManifestV1(const FixedBlockIndexManifest& manifest, std::vecto
     WriteHashBytes(*out, manifest.committedTipHash);
     // A.10.1b-fix2: capability field (V2 manifest)
     WriteU32LE(*out, manifest.capability);
-    // A.10.1b-fix3: dagInputDigest (V3 manifest)
-    WriteRawDigest(*out, manifest.dagInputDigest);
+    // A.10.1b-fix3: generationInputDigest (V3 manifest)
+    WriteRawDigest(*out, manifest.generationInputDigest);
     if (out->size() != BLOCK_INDEX_MANIFEST_SIZE_V3)
         return SetError(error, "manifest size mismatch during encode");
     ClearError(error);
@@ -308,7 +308,7 @@ static bool EncodeManifestV1(const FixedBlockIndexManifest& manifest, std::vecto
 
 static bool DecodeManifestV1(const unsigned char* data, size_t size, FixedBlockIndexManifest* manifest, std::string* error)
 {
-    // Accept V1 (88 bytes), V2 (92 bytes, with capability), and V3 (124 bytes, with dagInputDigest)
+    // Accept V1 (88 bytes), V2 (92 bytes, with capability), and V3 (124 bytes, with generationInputDigest)
     if (size != BLOCK_INDEX_MANIFEST_SIZE_V1 && size != BLOCK_INDEX_MANIFEST_SIZE_V2 &&
         size != BLOCK_INDEX_MANIFEST_SIZE_V3)
         return SetError(error, "manifest size mismatch");
@@ -337,11 +337,11 @@ static bool DecodeManifestV1(const unsigned char* data, size_t size, FixedBlockI
         // V1 manifest: no capability field -> OLD_SHADOW
         manifest->capability = BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
     }
-    memset(manifest->dagInputDigest, 0, 32);
-    // A.10.1b-fix3: dagInputDigest (present in V3 manifest)
+    memset(manifest->generationInputDigest, 0, 32);
+    // A.10.1b-fix3: generationInputDigest (present in V3 manifest)
     if (size >= BLOCK_INDEX_MANIFEST_SIZE_V3)
     {
-        if (!ReadRawDigest(data, size, &offset, manifest->dagInputDigest, error))
+        if (!ReadRawDigest(data, size, &offset, manifest->generationInputDigest, error))
             return false;
     }
     if (offset != size)

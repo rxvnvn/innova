@@ -17,7 +17,7 @@ static const uint32_t BLOCK_INDEX_RECORD_SIZE_V1 = 228;
 static const uint32_t BLOCK_INDEX_RECORDS_HEADER_SIZE_V1 = 40;
 static const uint32_t BLOCK_INDEX_MANIFEST_SIZE_V1 = 88;
 static const uint32_t BLOCK_INDEX_MANIFEST_SIZE_V2 = 92; // +4 for capability field
-static const uint32_t BLOCK_INDEX_MANIFEST_SIZE_V3 = 124; // V2 + 32 for dagInputDigest
+static const uint32_t BLOCK_INDEX_MANIFEST_SIZE_V3 = 124; // V2 + 32 for generationInputDigest
 
 static const char* const BLOCK_INDEX_RECORDS_FILE_NAME = "records.dat";
 static const char* const BLOCK_INDEX_MANIFEST_FILE_NAME = "MANIFEST";
@@ -104,7 +104,7 @@ struct FixedBlockIndexManifest
     uint32_t state;
     uint256 committedTipHash;
     uint32_t capability; // A.10.1b-fix2: explicit generation capability
-    unsigned char dagInputDigest[32]; // A.10.1b-fix3: committed DAG input digest for root recomputation
+    unsigned char generationInputDigest[32]; // A.10.1b-fix3: committed generation input digest for root recomputation
 
     FixedBlockIndexManifest()
         : formatVersion(BLOCK_INDEX_FORMAT_VERSION),
@@ -119,7 +119,7 @@ struct FixedBlockIndexManifest
           committedTipHash(0),
           capability(BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW)
     {
-        memset(dagInputDigest, 0, 32);
+        memset(generationInputDigest, 0, 32);
     }
 };
 
