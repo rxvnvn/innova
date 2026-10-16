@@ -1329,6 +1329,11 @@ void WriteConfigFile(FILE* configFile)
     ReadConfigFile(mapArgs, mapMultiArgs);
 }
 
+// D1-S0 test-only: file-scope so that GetDataDir() and its setters share one override slot.
+// Never set outside tests; while unset, GetDataDir() behaves exactly as before.
+static boost::filesystem::path g_dataDirOverrideForTest[2];
+static bool g_dataDirOverrideSetForTest[2] = {false, false};
+
 const boost::filesystem::path &GetDataDir(bool fNetSpecific)
 {
     namespace fs = boost::filesystem;
@@ -1336,6 +1341,9 @@ const boost::filesystem::path &GetDataDir(bool fNetSpecific)
     static fs::path pathCached[2];
     static CCriticalSection csPathCached;
     static bool cachedPath[2] = {false, false};
+
+    if (g_dataDirOverrideSetForTest[fNetSpecific])
+        return g_dataDirOverrideForTest[fNetSpecific];
 
     fs::path &path = pathCached[fNetSpecific];
 
@@ -1366,6 +1374,22 @@ const boost::filesystem::path &GetDataDir(bool fNetSpecific)
 
     cachedPath[fNetSpecific]=true;
     return path;
+}
+
+// D1-S0 test-only datadir redirection (see util.h). Both variants resolve to `dir` so that
+// GetDataDir(false) (config paths) and GetDataDir(true) (block files, index) agree inside a case.
+void SetDataDirForTest(const boost::filesystem::path& dir)
+{
+    g_dataDirOverrideForTest[0] = dir;
+    g_dataDirOverrideForTest[1] = dir;
+    g_dataDirOverrideSetForTest[0] = true;
+    g_dataDirOverrideSetForTest[1] = true;
+}
+
+void ClearDataDirForTest()
+{
+    g_dataDirOverrideSetForTest[0] = false;
+    g_dataDirOverrideSetForTest[1] = false;
 }
 
 boost::filesystem::path GetConfigFile()

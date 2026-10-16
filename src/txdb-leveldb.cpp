@@ -3,6 +3,7 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file license.txt or http://www.opensource.org/licenses/mit-license.php.
 
+#include <algorithm>
 #include <atomic>
 #include <map>
 #include <set>
@@ -87,26 +88,203 @@ static leveldb::Options GetOptions() {
     return options;
 }
 
-void init_blockindex(leveldb::Options& options, bool fRemoveOld = false) {
+// ---------------------------------------------------------------------------
+// ARCHIVE-1 invariant (Stage 3B-D1-S0) — the block archive is permanent.
+//
+// blk%04u.dat hold every historical block payload from genesis onward. They are
+// ARCHIVE data, not index data: the transaction/block INDEX in `txleveldb` is
+// reconstructable (a fresh index can be rebuilt from the archive), while a
+// deleted block payload is not reconstructable locally. Therefore:
+//   * no initialization, version-mismatch, index-reset, migration or recovery
+//     path may unlink, truncate, overwrite or rename-away a blk*.dat file;
+//   * an index reset removes INDEX STATE ONLY;
+//   * losing an archive file during a reset is a fail-closed condition, never a
+//     silently ignored side effect.
+//
+// History: this reset path used to delete every blk*.dat (a prefix scan from
+// blk0001.dat up to the first gap) whenever a DATABASE_VERSION mismatch armed
+// the reset, turning an index upgrade into a full re-download. S0 removed that
+// deletion and added the post-reset verification below. See the S0 report
+// (innova-v2-chainstate-stage3b-d1-s0-20261016.md) and
+// src/test/d1_s0_archive_guard_tests.cpp.
+// ---------------------------------------------------------------------------
+
+// Name grammar of a block-archive file: "blk" + 4..10 decimal digits + ".dat" (the writer emits
+// strprintf("blk%04u.dat", nFile) with an unsigned int nFile, so 4 digits is the minimum and 10 is
+// the maximum). Everything else — near-misses such as "blk1.dat", "blk0001.DAT", "blk0001.dat.bak",
+// "xblk0001.dat", "blk 0001.dat" — is NOT archive data and must never be counted as a block file.
+bool IsBlockArchiveName(const std::string& name)
+{
+    if (name.size() < 11 || name.size() > 17)   // "blk" + 4..10 digits + ".dat"
+        return false;
+    if (name.compare(0, 3, "blk") != 0)
+        return false;
+    if (name.compare(name.size() - 4, 4, ".dat") != 0)
+        return false;
+    for (std::string::size_type i = 3; i + 4 < name.size(); ++i)
+        if (name[i] < '0' || name[i] > '9')
+            return false;
+    return true;
+}
+
+// Read-only enumeration of the block archive in `dir` (never creates, renames, truncates or removes
+// anything; never reads block payloads — the cost is one directory entry per file, never its size).
+//
+// Every outcome that leaves the archive set unknowable is reported as such: an unreadable or
+// non-directory datadir, an enumeration failure, and an archive-named entry that is not a usable
+// payload (non-regular file, dangling symlink, or an entry whose type cannot be determined). Only
+// the entries returned in `payloads` may be treated as verified block data, and only ARCHIVE_SCAN_OK
+// means the enumeration itself is trustworthy.
+ArchiveScan ScanBlockArchive(const fs::path& dir)
+{
+    ArchiveScan scan;
+    scan.status = ARCHIVE_SCAN_OK;
+
+    boost::system::error_code ec;
+    const fs::file_status dirStatus = fs::status(dir, ec);   // the datadir itself may be a symlink
+    if (ec) {
+        // In this boost version status(p, ec) reports a missing path through ec rather than through
+        // the returned not-found status, so classify that case explicitly: "the datadir is not there
+        // yet" is a different operator situation from "the datadir cannot be examined".
+        scan.status = ARCHIVE_SCAN_DATADIR_INVALID;
+        scan.detail = (ec == boost::system::errc::no_such_file_or_directory)
+            ? strprintf("data directory %s does not exist", dir.string().c_str())
+            : strprintf("data directory %s cannot be examined: %s",
+                        dir.string().c_str(), ec.message().c_str());
+        return scan;
+    }
+    if (!fs::is_directory(dirStatus)) {
+        scan.status = ARCHIVE_SCAN_DATADIR_INVALID;
+        scan.detail = fs::exists(dirStatus)
+            ? strprintf("data directory %s is not a directory", dir.string().c_str())
+            : strprintf("data directory %s does not exist", dir.string().c_str());
+        return scan;
+    }
+
+    fs::directory_iterator it(dir, ec);
+    if (ec) {
+        scan.status = ARCHIVE_SCAN_UNREADABLE;
+        scan.detail = strprintf("data directory %s cannot be enumerated: %s",
+                                dir.string().c_str(), ec.message().c_str());
+        return scan;
+    }
+
+    const fs::directory_iterator end;
+    for (; it != end; it.increment(ec)) {
+        if (ec) {
+            // An enumeration error mid-scan leaves the set unknowable: a partial list is never
+            // reported as a verified one.
+            scan.status = ARCHIVE_SCAN_UNREADABLE;
+            scan.detail = strprintf("enumeration of data directory %s failed: %s",
+                                    dir.string().c_str(), ec.message().c_str());
+            return scan;
+        }
+
+        const fs::path entry = it->path();
+        const std::string name = entry.filename().string();
+        if (!IsBlockArchiveName(name))
+            continue;   // not archive data: never counted, never verified, never touched
+
+        // Classify with lstat FIRST (symlink_status does not follow links). The question is not
+        // "does this path resolve?" but "is this path a usable block payload?".
+        boost::system::error_code lec;
+        const fs::file_status linkStatus = fs::symlink_status(entry, lec);
+        if (lec) {
+            scan.status = ARCHIVE_SCAN_ENTRY_BAD;
+            scan.detail = strprintf("block-archive entry %s cannot be examined: %s",
+                                    name.c_str(), lec.message().c_str());
+            return scan;
+        }
+
+        if (fs::is_symlink(linkStatus)) {
+            // A symlink is followed EXPLICITLY: it counts as a payload only while it resolves to a
+            // regular file. A dangling link is an entry the archive cannot account for — neither
+            // "missing" (nothing was removed) nor "intact" (no payload is reachable through it).
+            boost::system::error_code tec;
+            const fs::file_status targetStatus = fs::status(entry, tec);
+            if (tec || !fs::is_regular_file(targetStatus)) {
+                scan.status = ARCHIVE_SCAN_ENTRY_BAD;
+                scan.detail = tec
+                    ? strprintf("block-archive entry %s is a symlink whose target cannot be resolved: %s",
+                                name.c_str(), tec.message().c_str())
+                    : strprintf("block-archive entry %s is a symlink to a %s, not to a regular file",
+                                name.c_str(),
+                                fs::is_directory(targetStatus) ? "directory" : "special file");
+                return scan;
+            }
+            scan.notes.push_back(strprintf(
+                "%s is a symlink to a regular file: presence is verified, payload identity is not",
+                name.c_str()));
+        } else if (!fs::is_regular_file(linkStatus)) {
+            scan.status = ARCHIVE_SCAN_ENTRY_BAD;
+            scan.detail = strprintf("block-archive entry %s is not a regular file (it is a %s)",
+                                    name.c_str(),
+                                    fs::is_directory(linkStatus) ? "directory"
+                                                                 : "special file (fifo/socket/device)");
+            return scan;
+        }
+
+        scan.payloads.push_back(name);
+    }
+
+    std::sort(scan.payloads.begin(), scan.payloads.end());
+    std::sort(scan.notes.begin(), scan.notes.end());
+    return scan;
+}
+
+// ARCHIVE-1 (S0-F2): the ONE place that decides whether an archive enumeration is acceptable and the
+// ONE place that phrases the refusal, so the constructor preflight and the reset-path check can never
+// drift apart (same status -> same diagnostic line -> same exception wording).
+//
+// `phase` names where the check ran; it is the only difference between the call sites.
+static void RequireArchiveAccountedFor(const ArchiveScan& scan, const char* phase)
+{
+    if (scan.status == ARCHIVE_SCAN_OK) {
+        printf("Archive preflight (%s): %u block-archive file(s) accounted for\n",
+               phase, (unsigned int)scan.payloads.size());
+        for (size_t i = 0; i < scan.notes.size(); ++i)
+            printf("Archive preflight (%s): note: %s\n", phase, scan.notes[i].c_str());
+        return;
+    }
+
+    // Never print a count the enumeration could not establish: an archive that cannot be accounted for
+    // is reported as exactly that, before anything is removed. The failure is described as what was
+    // found, never as damage done by the reset (a pre-existing oddity is not the reset's doing).
+    printf("Index reset: index state only, but the block archive under %s cannot be accounted for: %s\n",
+           GetDataDir().string().c_str(), scan.detail.c_str());
+    for (size_t i = 0; i < scan.notes.size(); ++i)
+        printf("Archive preflight (%s): note: %s\n", phase, scan.notes[i].c_str());
+
+    throw runtime_error(strprintf(
+        "ARCHIVE-1 VIOLATION: refusing to reset the index in %s (%s): %s. The block archive cannot be "
+        "accounted for, so the reset cannot be proven non-destructive; refusing to continue. Fix or "
+        "remove the offending entry before restarting.",
+        (GetDataDir() / "txleveldb").string().c_str(), phase, scan.detail.c_str()));
+}
+
+void init_blockindex(leveldb::Options& options, bool fResetIndex = false) {
     // First time init.
     fs::path directory = GetDataDir() / "txleveldb";
 
-    if (fRemoveOld) {
-        fs::remove_all(directory);
-        unsigned int nFile = 1;
-
-        while (true)
-        {
-            fs::path strBlockFile = GetDataDir() / strprintf("blk%04u.dat", nFile);
-
-            // Break if no such file
-            if( !fs::exists( strBlockFile ) )
-                break;
-
-            fs::remove(strBlockFile);
-
-            nFile++;
+    // ARCHIVE-1 (S0-A): an index reset resets the INDEX ONLY. The block archive is
+    // deliberately NOT touched here — it used to be deleted by this function.
+    // Defensive validation (S0-F1, retained by S0-F2): the CONSTRUCTOR preflight has already refused
+    // an unaccountable archive before the index was moved aside, so on the normal path this scan sees a
+    // good archive. It is kept because it is the last line of defence if the reset is ever reached by
+    // another caller — and it shares the decision and the diagnostics with that preflight.
+    ArchiveScan archiveBefore;
+    if (fResetIndex) {
+        archiveBefore = ScanBlockArchive(GetDataDir());
+        if (archiveBefore.status == ARCHIVE_SCAN_OK) {
+            printf("Index reset: index state only, %u block-archive file(s) under %s are preserved\n",
+                   (unsigned int)archiveBefore.payloads.size(), GetDataDir().string().c_str());
+            for (size_t i = 0; i < archiveBefore.notes.size(); ++i)
+                printf("Index reset: note: %s\n", archiveBefore.notes[i].c_str());
+        } else {
+            RequireArchiveAccountedFor(archiveBefore, "at the index reset");
         }
+
+        fs::remove_all(directory);
     }
 
     fs::create_directory(directory);
@@ -114,6 +292,43 @@ void init_blockindex(leveldb::Options& options, bool fRemoveOld = false) {
     leveldb::Status status = leveldb::DB::Open(options, directory.string(), &txdb);
     if (!status.ok()) {
         throw runtime_error(strprintf("init_blockindex(): error opening database environment %s", status.ToString().c_str()));
+    }
+
+    // ARCHIVE-1 guard (S0-B): verify that the reset destroyed nothing. Read-only, runs only on the
+    // reset path, and fails CLOSED: a missing archive entry is a loud startup error with a clear
+    // diagnostic, never a silently ignored side effect.
+    if (fResetIndex) {
+        ArchiveScan archiveAfter = ScanBlockArchive(GetDataDir());
+        for (size_t i = 0; i < archiveAfter.notes.size(); ++i)
+            printf("Index reset: note: %s\n", archiveAfter.notes[i].c_str());
+        if (archiveAfter.status != ARCHIVE_SCAN_OK)
+            throw runtime_error(strprintf(
+                "ARCHIVE-1 VIOLATION: the block archive in %s could not be accounted for after the "
+                "index was reset: %s. Block data is permanent and must never be changed by "
+                "index/version logic; refusing to continue. Inspect the archive before restarting.",
+                GetDataDir().string().c_str(), archiveAfter.detail.c_str()));
+
+        // Set comparison against the pre-reset enumeration: a payload that is gone, or that stopped
+        // being a regular file, is a hard failure. (Byte identity is proven by the regression suite;
+        // this guard is the runtime tripwire, deliberately bounded by the entry count.)
+        std::vector<std::string> missing;
+        for (size_t i = 0; i < archiveBefore.payloads.size(); ++i)
+            if (!std::binary_search(archiveAfter.payloads.begin(), archiveAfter.payloads.end(),
+                                    archiveBefore.payloads[i]))
+                missing.push_back(archiveBefore.payloads[i]);
+        if (!missing.empty()) {
+            std::string list;
+            for (size_t i = 0; i < missing.size(); ++i)
+                list += (i ? ", " : "") + missing[i];
+            throw runtime_error(strprintf(
+                "ARCHIVE-1 VIOLATION: block-archive file(s) %s disappeared or stopped being a "
+                "regular file while the index in %s was reset. Block data is permanent and must "
+                "never be removed by index/version logic; refusing to continue. Restore the file(s) "
+                "before restarting.",
+                list.c_str(), directory.string().c_str()));
+        }
+        printf("Index reset verified non-destructive: %u block-archive file(s) intact\n",
+               (unsigned int)archiveAfter.payloads.size());
     }
 }
 
@@ -156,6 +371,16 @@ CTxDB::CTxDB(const char* pszMode)
         // incompatible read is reported through the typed read seam).
         if (nVersion < DATABASE_VERSION && !fReadOnly)
         {
+            // ARCHIVE-1 (S0-F2): the archive preflight runs BEFORE this branch moves anything. The
+            // incompatible-index reset renames `txleveldb` to `txleveldb_backup`; if that happened
+            // first, a refusal would leave no `txleveldb`, the next startup would silently create a
+            // fresh empty index and this guard would never run again (S0-F1 audit F1-1, HIGH). Running
+            // the same policy check here makes the refusal DURABLE: the original index stays exactly
+            // where it is, so every later startup re-enters this branch and refuses again, until the
+            // operator fixes the archive.
+            RequireArchiveAccountedFor(ScanBlockArchive(GetDataDir()),
+                                       "before the incompatible-index reset");
+
             printf("CTxDB() : database version %d is older than expected %d, creating backup\n",
                    nVersion, DATABASE_VERSION);
             bool fBackupOk = false;
@@ -186,7 +411,7 @@ CTxDB::CTxDB(const char* pszMode)
             delete activeBatch;
             activeBatch = NULL;
 
-            init_blockindex(options, true); // Remove directory and create new database
+            init_blockindex(options, true); // Reset index state ONLY (ARCHIVE-1: block files preserved)
             pdb = txdb;
 
             bool fTmp = fReadOnly;
