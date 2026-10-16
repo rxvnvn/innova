@@ -4,6 +4,7 @@
 #include "store3a/incstore.h"
 #include "store3a/incdelta.h"
 #include "store3a/btree.h"
+#include "observe.h"             // S1.6-2 authoritative observation adapter
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -3413,11 +3414,153 @@ static void test_undoidx_bound_work(){
       s.close(); }
 }
 
+// ===========================================================================
+// S1.6-2 -- authoritative observation adapter (observeDelta + authority gate)
+// ---------------------------------------------------------------------------
+static bool opEq(const Op& a, const Op& b){
+    if (a.op.keyBytes()!=b.op.keyBytes()) return false;
+    if (a.beforePresent!=b.beforePresent || a.afterPresent!=a.afterPresent) return false;
+    if (a.beforePresent){ if(a.before.value!=b.before.value)return false;
+        if(a.before.height!=b.before.height)return false;
+        if(a.before.fCoinBase!=b.before.fCoinBase)return false;
+        if(a.before.fCoinStake!=b.before.fCoinStake)return false;
+        if(a.before.script!=b.before.script)return false; }
+    if (a.afterPresent){ if(a.after.value!=b.after.value)return false;
+        if(a.after.height!=b.after.height)return false;
+        if(a.after.fCoinBase!=b.after.fCoinBase)return false;
+        if(a.after.fCoinStake!=b.after.fCoinStake)return false;
+        if(a.after.script!=b.after.script)return false; }
+    return true;
+}
+static bool deltaEq(const Delta& a, const Delta& b){
+    if(a.ops.size()!=b.ops.size()) return false;
+    for(size_t i=0;i<a.ops.size();++i) if(!opEq(a.ops[i],b.ops[i])) return false;
+    return true;
+}
+static ObservedBlock toObserved(const Block& b){
+    ObservedBlock o; o.height=b.height;
+    for (const Tx& tx : b.txs){
+        ObservedTx t; t.txid=tx.txid; t.coinbase=tx.coinbase; t.coinstake=tx.coinstake;
+        for (const TxIn& in: tx.vin) t.vin.push_back(in.prev);
+        t.vout=tx.vout; o.txs.push_back(t);
+    }
+    return o;
+}
+static void collectAuthority(const Delta& d, ObservedAuthority* a){
+    a->spent.clear();
+    for (size_t i=0;i<d.ops.size();++i)
+        if(d.ops[i].beforePresent && !d.ops[i].afterPresent) a->spent.push_back(d.ops[i].op);
+}
+
+static void test_obs2_adapter(){
+    g_cur="OBS2-adapter";
+    std::string dir=freshDir("obs2"); ChainError e;
+
+    // b1: coinbase (created)                    height1
+    Block b1; b1.hash=id32(0xB3010000u,1); b1.height=1;
+    Tx cb1; cb1.txid=id32(0xCB010000u,1); cb1.coinbase=true;
+    TxOut o1; o1.value=50*COIN; o1.script={1,2,3}; cb1.vout.push_back(o1); b1.txs.push_back(cb1);
+
+    // b2: coinbase (created)                    height2
+    Block b2; b2.hash=id32(0xB3010000u,2); b2.height=2;
+    Tx cb2; cb2.txid=id32(0xCB020000u,1); cb2.coinbase=true;
+    TxOut o2; o2.value=50*COIN; o2.script={5}; cb2.vout.push_back(o2); b2.txs.push_back(cb2);
+
+    // b3: external spend (cb1.out0) + intra-block create->spend (t1.out1 by t2) + coinbase  height3
+    Block b3; b3.hash=id32(0xB3010000u,3); b3.height=3;
+    Tx t1; t1.txid=id32(0x5B010000u,1); t1.coinbase=false; t1.coinstake=false;
+    TxIn in1; in1.prev.txid=cb1.txid; in1.prev.n=0; t1.vin.push_back(in1);
+    TxOut c1; c1.value=30*COIN; c1.script={6}; t1.vout.push_back(c1);
+    TxOut i1; i1.value=20*COIN; i1.script={7}; t1.vout.push_back(i1);   // spent intra-block
+    b3.txs.push_back(t1);
+    Tx t2; t2.txid=id32(0x5B010000u,2); t2.coinbase=false; t2.coinstake=false;
+    TxIn in2; in2.prev.txid=t1.txid; in2.prev.n=1; t2.vin.push_back(in2); // intra-block spend of t1.out1
+    TxOut c2; c2.value=19*COIN; c2.script={8}; t2.vout.push_back(c2);
+    b3.txs.push_back(t2);
+    Tx cb3; cb3.txid=id32(0xCB030000u,1); cb3.coinbase=true;
+    TxOut o3; o3.value=50*COIN; o3.script={8,9}; cb3.vout.push_back(o3); b3.txs.push_back(cb3);
+
+    // b4: coinstake (spend cb2.out0, fCoinStake created) + burn/unspendable output, no separate coinbase  height4
+    Block b4; b4.hash=id32(0xB3010000u,4); b4.height=4;
+    Tx cs; cs.txid=id32(0x5B020000u,1); cs.coinbase=false; cs.coinstake=true;
+    TxIn in3; in3.prev.txid=cb2.txid; in3.prev.n=0; cs.vin.push_back(in3);
+    TxOut oc; oc.value=50*COIN; oc.script={9,9}; cs.vout.push_back(oc);          // coinstake output (fCoinStake)
+    TxOut ob; ob.value=0; ob.script={0x6a, 0x04, 1,2,3,4}; ob.unspendable=true; cs.vout.push_back(ob); // burn
+    b4.txs.push_back(cs);
+
+    Block chain[4]={b1,b2,b3,b4};
+    Hash dg[8];                            // reference digests after each height
+    CommitStore3A s; CHECK(s.open(dir,&e), "open: "+e.str());
+    UtxoState ref;
+    Hash prevLastHash; int32_t prevLastH=-1; Delta prevLastD;
+    for (int hi=0; hi<4; ++hi){
+        const Block& b=chain[hi];
+        Delta rd; UtxoState ns;
+        if(!cs::buildDelta(ref,b,MAT,&rd,&ns,&e)){ CHECK(false,"ref buildDelta h"+std::to_string(b.height)+": "+e.str()); s.close(); return; }
+        ObservedBlock ob=toObserved(b);
+        GetPrevCoinFn gp=[&](const OutPoint& p, Coin* c)->bool{ return ref.get(p,c); };
+        Delta od; if(!observeDelta(ob,gp,&od,&e)){ CHECK(false,"observeDelta h"+std::to_string(b.height)+": "+e.str()); s.close(); return; }
+        CHECK(deltaEq(od,rd), "adapter delta == reference delta (h"+std::to_string(b.height)+")");
+        ObservedAuthority auth; collectAuthority(rd,&auth);
+        std::string mis; CHECK(authoritySpendsMatch(od,auth,&mis), "authority spends match (h"+std::to_string(b.height)+"): "+mis);
+        if(!s.publish(od,b.hash,b.height,&e)){ CHECK(false,"publish h"+std::to_string(b.height)+": "+e.str()); s.close(); return; }
+        UtxoState ss; if(!storeToState(s,&ss,&e)){ CHECK(false,"storeToState h"+std::to_string(b.height)); s.close(); return; }
+        CHECK(ss.digest()==ns.digest(), "store==ref digest (h"+std::to_string(b.height)+")");
+        dg[b.height]=ns.digest();
+        ref=ns; prevLastD=od; prevLastHash=b.hash; prevLastH=b.height;
+    }
+    // --- disconnect last block (b4) ---
+    if(!s.disconnect(prevLastHash,&e)){ CHECK(false,"disconnect: "+e.str()); s.close(); return; }
+    UtxoState s4; if(!storeToState(s,&s4,&e)){ CHECK(false,"storeToState after disconnect"); s.close(); return; }
+    // ref after b3 => rebuild: run buildDelta for b1..b3 only
+    { UtxoState r2; Delta rd; UtxoState ns;
+      for(int hi=0; hi<3; ++hi){ cs::buildDelta(r2,chain[hi],MAT,&rd,&ns,&e); r2=ns; }
+      CHECK(s4.digest()==r2.digest(), "store after disconnect == ref pre-b4"); }
+    // --- reconnect b4 (re-observe) ---
+    { ObservedBlock ob=toObserved(b4);
+      GetPrevCoinFn gp=[&](const OutPoint& p, Coin* c)->bool{ return s4.get(p,c); };
+      Delta od; CHECK(observeDelta(ob,gp,&od,&e), "reobserve b4: "+e.str());
+      if(!s.publish(od,b4.hash,b4.height,&e)){ CHECK(false,"reconnect publish: "+e.str()); s.close(); return; }
+      UtxoState s5; storeToState(s,&s5,&e);
+      CHECK(s5.digest()==dg[4], "store after reconnect == ref after b4"); }
+    s.close();
+
+    // --- restart persistence ---
+    { CommitStore3A s2; CHECK(s2.open(dir,&e), "reopen: "+e.str());
+      UtxoState s6; if(storeToState(s2,&s6,&e)) CHECK(s6.digest()==dg[4], "after reopen == ref after b4"); s2.close(); }
+
+    // --- authority gate catches a DROPPED spend ---
+    { ObservedAuthority auth; collectAuthority(prevLastD,&auth);
+      if(!auth.spent.empty()){ auth.spent.pop_back(); std::string mis;
+        CHECK(!authoritySpendsMatch(prevLastD,auth,&mis), "gate rejects dropped spend"); }
+    }
+    // --- authority gate catches SURPLUS spend (anon-input wrongly projected) ---
+    { ObservedBlock ob=toObserved(b3);
+      ObservedTx rogue=ob.txs[0]; rogue.coinbase=false;
+      OutPoint anonLike; anonLike.txid=id32(0xA0000000u, 0x0A); anonLike.n=0;
+      rogue.vin.push_back(anonLike);        // simulate wrongly projecting a ring-nullifier input
+      ob.txs[0]=rogue;
+      GetPrevCoinFn gp=[&](const OutPoint& p, Coin* c)->bool{ (void)p;(void)c; return true; };
+      Delta od; CHECK(observeDelta(ob,gp,&od,&e), "rogue observe build: "+e.str());
+      Delta rd; UtxoState ns; UtxoState ref2; // re-derive authority for b1..b3
+      for(int hi=0; hi<3; ++hi){ cs::buildDelta(ref2,chain[hi],MAT,&rd,&ns,&e); ref2=ns; }
+      ObservedAuthority auth; collectAuthority(rd,&auth);
+      std::string mis; CHECK(!authoritySpendsMatch(od,auth,&mis), "gate rejects surplus/anonymous input");
+    }
+    // --- fail closed when an external prevout is not observable ---
+    { ObservedBlock ob=toObserved(b3);
+      GetPrevCoinFn none=[&](const OutPoint& p, Coin* c)->bool{ (void)p;(void)c; return false; };
+      Delta od; ChainError fe;
+      CHECK(!observeDelta(ob,none,&od,&fe), "observeDelta fails closed when mirror lacks external prev");
+      CHECK(od.ops.empty(), "fail-closed leaves no partial delta");
+    }
+}
+
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
 
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail}, {"UNDOIDX-FASTIDX-equiv",test_undoidx_fastidx_equiv}, {"UNDOIDX-FASTIDX-fallback",test_undoidx_fastidx_fallback}, {"UNDOIDX-FASTIDX-damaged",test_undoidx_fastidx_damaged}, {"UNDOIDX-FASTIDX-recovery",test_undoidx_fastidx_recovery}, {"UNDOIDX-FASTIDX-measure",test_undoidx_fastidx_measure}, {"UNDOIDX-BOUND-basic",test_undoidx_bound_basic}, {"UNDOIDX-BOUND-deep",test_undoidx_bound_deep}, {"UNDOIDX-BOUND-integrity",test_undoidx_bound_integrity}, {"UNDOIDX-BOUND-work",test_undoidx_bound_work} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail}, {"UNDOIDX-FASTIDX-equiv",test_undoidx_fastidx_equiv}, {"UNDOIDX-FASTIDX-fallback",test_undoidx_fastidx_fallback}, {"UNDOIDX-FASTIDX-damaged",test_undoidx_fastidx_damaged}, {"UNDOIDX-FASTIDX-recovery",test_undoidx_fastidx_recovery}, {"UNDOIDX-FASTIDX-measure",test_undoidx_fastidx_measure}, {"UNDOIDX-BOUND-basic",test_undoidx_bound_basic}, {"UNDOIDX-BOUND-deep",test_undoidx_bound_deep}, {"UNDOIDX-BOUND-integrity",test_undoidx_bound_integrity}, {"UNDOIDX-BOUND-work",test_undoidx_bound_work}, {"OBS2-adapter",test_obs2_adapter} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){

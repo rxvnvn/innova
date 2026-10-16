@@ -36,6 +36,8 @@
 #include "blockindex_manager.h"
 #include "blockrequesttrace.h"
 #include "hreg_registration.h"
+#include "chainstate/observe.h"            // S1.6-2 authoritative observation adapter
+#include "chainstate/observe_hook.h"       // S1.6-2 guarded read-only ConnectBlock hook
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -6215,6 +6217,94 @@ void ResetCNValidationCountersForTesting()
     nCNLastGuardHeight.store(0, std::memory_order_relaxed);
 }
 
+// ---------------------------------------------------------------------------
+// S1.6-2 -- guarded READ-ONLY observation hook for ConnectBlock's persist point.
+// The body below projects the LIVE in-scope authority (vtx + mapQueuedChanges)
+// into the observation adapter and /publishes to a pilot-owned store3a mirror.
+// It NEVER changes ConnectBlock's return value (production parity): on any
+// failure the block still connects as before and the failure is recorded in
+// s16::g_chainObserve for the pilot to assert on. Production default disabled.
+namespace s16 { ChainObserveState g_chainObserve; }
+
+static void s16_ObserveConnectBlock(const CBlock& blk,
+                                    const std::map<uint256,CTxIndex>& mqc,
+                                    const CBlockIndex* pindex)
+{
+    s16::ChainObserveState& st = s16::g_chainObserve;
+    if (!st.enabled || !st.store || !st.store->opened() || pindex == NULL)
+        return;
+    ++st.blocks;
+
+    // Project the block's real transactions -> neutral observed block.
+    // Transparent vin only: anon-input prevouts are consumed by the
+    // nullifier/CAnonOutput store, NEVER by CTxIndex::vSpent (main.cpp:5717-5878).
+    cs::ObservedBlock ob;
+    ob.height = pindex->nHeight;
+    ob.txs.reserve(blk.vtx.size());
+    for (size_t ti = 0; ti < blk.vtx.size(); ++ti) {
+        const CTransaction& tx = blk.vtx[ti];
+        cs::ObservedTx o;
+        memcpy(o.txid.data(), tx.GetHash().begin(), 32);
+        o.coinbase  = tx.IsCoinBase();
+        o.coinstake = tx.IsCoinStake();
+        for (size_t i = 0; i < tx.vin.size(); ++i) {
+            const CTxIn& in = tx.vin[i];
+            if (in.IsAnonInput()) continue;
+            cs::OutPoint p;
+            memcpy(p.txid.data(), in.prevout.hash.begin(), 32);
+            p.n = in.prevout.n;
+            o.vin.push_back(p);
+        }
+        o.vout.reserve(tx.vout.size());
+        for (size_t j = 0; j < tx.vout.size(); ++j) {
+            const CTxOut& tv = tx.vout[j];
+            cs::TxOut to;
+            to.value = tv.nValue;
+            to.script.assign(tv.scriptPubKey.begin(), tv.scriptPubKey.end());
+            to.unspendable = tv.scriptPubKey.IsUnspendable();
+            o.vout.push_back(to);
+        }
+        ob.txs.push_back(o);
+    }
+
+    // Observed pre-state for external spends = the mirror's authoritative coin.
+    cs::GetPrevCoinFn gp = [&st](const cs::OutPoint& k, cs::Coin* c)->bool {
+        bool found = false; cs::ChainError e;
+        if (!st.store->get(k, c, &found, &e)) return false;
+        return found;
+    };
+
+    cs::Delta d; cs::ChainError ce;
+    if (!cs::observeDelta(ob, gp, &d, &ce)) {
+        ++st.fails; st.lastOpError = ce.str(); st.lastHeight = pindex->nHeight; return;
+    }
+
+    // Authority equivalence gate: adapter spends == mapQueuedChanges/vSpent spends.
+    if (st.checkAuthority) {
+        cs::ObservedAuthority auth;
+        for (std::map<uint256,CTxIndex>::const_iterator mi = mqc.begin(); mi != mqc.end(); ++mi) {
+            const CTxIndex& ti = mi->second;
+            for (size_t i = 0; i < ti.vSpent.size(); ++i) {
+                if (!ti.vSpent[i].IsNull()) {
+                    cs::OutPoint op; memcpy(op.txid.data(), mi->first.begin(), 32); op.n = (uint32_t)i;
+                    auth.spent.push_back(op);
+                }
+            }
+        }
+        std::string mm;
+        if (!cs::authoritySpendsMatch(d, auth, &mm)) {
+            ++st.mismatch; st.lastAuthorityMismatch = mm; st.lastHeight = pindex->nHeight;
+        }
+    }
+
+    cs::Hash bh; memcpy(bh.data(), pindex->GetBlockHash().begin(), 32);
+    cs::ChainError pe;
+    if (!st.store->publish(d, bh, pindex->nHeight, &pe)) {
+        ++st.fails; st.lastOpError = ce.ok()? pe.str() : ce.str(); st.lastHeight = pindex->nHeight; return;
+    }
+    ++st.published; st.lastOps = d.ops.size(); st.lastHeight = pindex->nHeight;
+}
+
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 {
     ibdactivepath::ActivePathTimer ibdConnectTimer(
@@ -6950,6 +7040,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     }
 
     // Write queued txindex changes
+    s16_ObserveConnectBlock(*this, mapQueuedChanges, pindex);   // S1.6-2: read-only observation (no-op unless enabled)
     for (map<uint256, CTxIndex>::iterator mi = mapQueuedChanges.begin(); mi != mapQueuedChanges.end(); ++mi)
     {
         if (!txdb.UpdateTxIndex((*mi).first, (*mi).second))
