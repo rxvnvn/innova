@@ -344,6 +344,51 @@ bool CommitStore3A::writeAck(uint64_t gen, ChainError* e){
 // span exceeds this is walked with per-record header reads instead of one bulk read).
 static const uint64_t UNDOINDEX_MAX_BULK_SPAN = 4ull*1024*1024;
 
+// Defined below (after this S1.3 helper block).
+static bool undoHeaderAt(const uint8_t* h, size_t hn, uint64_t absOff, uint64_t limit, UndoMeta* meta, ChainError* e);
+
+// S1.3: bounded append to the most-recent record cache (drops from the front when it exceeds its bound).
+void CommitStore3A::recentPush(const UndoMeta& m){
+    undoRecent_.push_back(m);
+    const size_t S = ixSegmentSize_?ixSegmentSize_:UNDOINDEX_DEFAULT_SEGMENT_SIZE;
+    const size_t cap = UNDO_RECENT_CACHE_SEGMENTS * S;
+    if(undoRecent_.size()>cap) undoRecent_.pop_front();
+}
+// S1.3: drop any segment whose committed range rollback has uncovered; keeps undoSegments_ == the closed
+// segments at or below undoCommittedBytes_, which is what keeps subsequent appends non-overlapping.
+void CommitStore3A::trimUncommittedSegments(){
+    while(!undoSegments_.empty() && undoSegments_.back().endOffset > undoCommittedBytes_)
+        undoSegments_.pop_back();
+}
+// S1.3: rebuild the bounded most-recent cache by parsing forward from the start of the most recent committed
+// region (the last closed segment's end, or 0) to undoCommittedBytes_. This is the on-demand path for a
+// disconnect deeper than the cache: it validates each record it walks (fail closed on any anomaly) and is
+// bounded to at most one closed segment plus the tail (< 2 x segmentSize records).
+bool CommitStore3A::reloadRecentFromStream(ChainError* e){
+    undoRecent_.clear(); undoRecentRefills_++;
+    if(undoCommittedBytes_==0) return true;
+    // Locate the segment CONTAINING the last committed record (the tip we must re-serve). Starting at a
+    // closed segment's END is wrong when the tip lands exactly on a segment boundary (that end ==
+    // committedBytes -> nothing to parse). Use the record count: record #(undoRecordCount_-1) lies in
+    // closed segment `seg`, or in the unindexed tail when `seg` equals undoSegments_.size().
+    const size_t S=ixSegmentSize_?ixSegmentSize_:UNDOINDEX_DEFAULT_SEGMENT_SIZE;
+    uint64_t start=0;
+    if(undoRecordCount_>0){
+        const size_t seg=(size_t)((undoRecordCount_-1)/S);
+        if(seg<undoSegments_.size()) start=undoSegments_[seg].startOffset;
+        else start = undoSegments_.empty()?0:undoSegments_.back().endOffset;
+    }
+    uint64_t off=start;
+    while(off<undoCommittedBytes_){
+        if(off+UNDO_HEADER_SIZE>undoCommittedBytes_){ setErr(e,ErrCode::CORRUPT,"undo header crosses committed length"); return false; }
+        std::vector<uint8_t> hdr; if(!csReadRange(p("undo.dat"),off,UNDO_HEADER_SIZE,&hdr,e)) return false;
+        UndoMeta meta; if(!undoHeaderAt(hdr.data(),hdr.size(),off,undoCommittedBytes_,&meta,e)) return false;
+        recentPush(meta); off+=meta.len;
+    }
+    if(off!=undoCommittedBytes_){ setErr(e,ErrCode::CORRUPT,"undo.dat committed length mismatch"); return false; }
+    return true;
+}
+
 // Decode one undo record header (52 bytes) at absolute offset `absOff`, requiring the whole record to fit
 // below `limit`. Mirrors the authoritative scan's validations exactly; duplicated deliberately so the
 // audited scan below stays byte-identical.
@@ -396,55 +441,70 @@ bool CommitStore3A::tryLoadCurrentUndoIndex(const Manifest& m, UndoIndex* ix, bo
 }
 
 bool CommitStore3A::loadUndoForIndexed(const Manifest& m, const UndoIndex& ix, ChainError* e){
-    const size_t maxRecs=(size_t)(m.undoSize/(UNDO_HEADER_SIZE+4))+1;   // sound bound: every record >= 56 bytes
-    std::vector<UndoMeta> out; out.reserve(maxRecs<4096?maxRecs:4096);
+    const size_t S = ix.segmentSize;
+    undoSegments_.clear(); undoRecent_.clear(); undoRecordCount_=0;
     undoLoadStats_.descriptors=ix.segments.size();
-    for(size_t i=0;i<ix.segments.size();++i){
-        const UndoSegment& sg=ix.segments[i];
-        const uint64_t span=sg.endOffset-sg.startOffset;
-        const size_t before=out.size();
-        if(span<=UNDOINDEX_MAX_BULK_SPAN){
-            std::vector<uint8_t> buf;
-            if(!csReadRange(p("undo.dat"),sg.startOffset,(size_t)span,&buf,e)) return false;
-            undoLoadStats_.segmentReads++; undoLoadStats_.bytesRead+=span;
-            if(!parseUndoRecords(buf.data(),buf.size(),sg.startOffset,&out,e)) return false;
-        } else {
-            uint64_t off=sg.startOffset;
-            while(off<sg.endOffset){
-                if(off+UNDO_HEADER_SIZE>sg.endOffset){ setErr(e,ErrCode::CORRUPT,"undo header crosses segment end"); return false; }
-                std::vector<uint8_t> hdr; if(!csReadRange(p("undo.dat"),off,UNDO_HEADER_SIZE,&hdr,e)) return false;
-                undoLoadStats_.headerReads++; undoLoadStats_.bytesRead+=UNDO_HEADER_SIZE;
-                UndoMeta meta;
-                if(!undoHeaderAt(hdr.data(),hdr.size(),off,sg.endOffset,&meta,e)) return false;
-                out.push_back(meta); off+=meta.len;
-            }
-        }
-        undoLoadStats_.records+=(uint64_t)(out.size()-before);
-        if((uint64_t)(out.size()-before)!=sg.recordCount){ setErr(e,ErrCode::CORRUPT,"segment record count mismatch"); return false; }
-    }
-    // The uncovered tail after the final indexed segment must be parsed as well, and must be shorter than
-    // one closed segment; a longer tail means the index is STALE, which the classification/normalisation
-    // pass repairs -- this loader declines instead of accepting it.
+    // Build the committed segment directory from the (already validated, CURRENT) index descriptors.
+    // Every descriptor is a CLOSED segment, so the map mirrors the committed stream 1:1 (consistent with
+    // what the authoritative scan would derive -- S1.3 parity requirement).
+    for(size_t i=0;i<ix.segments.size();++i)
+        undoSegments_.push_back(CommittedSegment{ix.segments[i].startOffset, ix.segments[i].endOffset});
+    undoRecordCount_ = (uint64_t)ix.segments.size() * (uint64_t)S;
+    // Bounded startup: parse EXACTLY the uncovered tail plus enough trailing CLOSED segments to fill the
+    // recent cache. This validates the tail and the recent window at load; undoLoadStats_.records stays a
+    // function of the recent window, NOT of undoCount() (acceptance evidence that startup no longer parses
+    // every historical record). Older segments are validated on demand when (and only when) they are read.
+    std::vector<UndoMeta> tailMetas;
     uint64_t off=ix.committedBytes; size_t tail=0;
     while(off<m.undoSize){
         if(off+UNDO_HEADER_SIZE>m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo header crosses committed length"); return false; }
         std::vector<uint8_t> hdr; if(!csReadRange(p("undo.dat"),off,UNDO_HEADER_SIZE,&hdr,e)) return false;
         undoLoadStats_.headerReads++; undoLoadStats_.bytesRead+=UNDO_HEADER_SIZE;
-        UndoMeta meta;
-        if(!undoHeaderAt(hdr.data(),hdr.size(),off,m.undoSize,&meta,e)) return false;
-        out.push_back(meta); off+=meta.len;
-        undoLoadStats_.records++;
-        // A CURRENT index leaves a tail SMALLER than one closed segment (reaching a full segment would
-        // have published another descriptor); a tail that reaches a full segment means the index missed a
-        // closure -> STALE, which the classification/normalisation pass repairs. Decline, never consume.
-        if(++tail>=ix.segmentSize){ setErr(e,ErrCode::CORRUPT,"index covers fewer records than committed (stale)"); return false; }
+        UndoMeta meta; if(!undoHeaderAt(hdr.data(),hdr.size(),off,m.undoSize,&meta,e)) return false;
+        tailMetas.push_back(meta); off+=meta.len; undoLoadStats_.records++;
+        // A CURRENT index leaves a tail SMALLER than one closed segment; reaching a full segment means the
+        // index missed a closure -> STALE, which the classification/normalisation pass repairs. Decline.
+        if(++tail>=S){ setErr(e,ErrCode::CORRUPT,"index covers fewer records than committed (stale)"); return false; }
     }
     if(off!=m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo.dat committed length mismatch"); return false; }
-    undoIndex_.swap(out); undoCommittedBytes_=m.undoSize; return true;
+    undoRecordCount_ += (uint64_t)tailMetas.size();          // closed segments x S + the uncovered tail
+    // trailing CLOSED segments, oldest first, until the recent cache is full or the history is exhausted.
+    const size_t avail = undoSegments_.size();
+    if(avail>0){
+        const size_t cap = UNDO_RECENT_CACHE_SEGMENTS*S;
+        size_t want = (cap > tailMetas.size()) ? (cap - tailMetas.size() + S - 1)/S : 0;
+        size_t s0 = (want>=avail) ? 0 : avail-want;
+        std::vector<UndoMeta> scratch;
+        for(size_t i=s0;i<avail;++i){
+            const CommittedSegment& cs=undoSegments_[i];
+            scratch.clear();
+            if(cs.endOffset-cs.startOffset<=UNDOINDEX_MAX_BULK_SPAN){
+                std::vector<uint8_t> buf;
+                if(!csReadRange(p("undo.dat"),cs.startOffset,(size_t)(cs.endOffset-cs.startOffset),&buf,e)) return false;
+                undoLoadStats_.segmentReads++; undoLoadStats_.bytesRead+=cs.endOffset-cs.startOffset;
+                if(!parseUndoRecords(buf.data(),buf.size(),cs.startOffset,&scratch,e)) return false;
+            } else {
+                uint64_t q=cs.startOffset;
+                while(q<cs.endOffset){
+                    if(q+UNDO_HEADER_SIZE>cs.endOffset){ setErr(e,ErrCode::CORRUPT,"undo header crosses segment end"); return false; }
+                    std::vector<uint8_t> hdr; if(!csReadRange(p("undo.dat"),q,UNDO_HEADER_SIZE,&hdr,e)) return false;
+                    undoLoadStats_.headerReads++; undoLoadStats_.bytesRead+=UNDO_HEADER_SIZE;
+                    UndoMeta meta; if(!undoHeaderAt(hdr.data(),hdr.size(),q,cs.endOffset,&meta,e)) return false;
+                    scratch.push_back(meta); q+=meta.len;
+                }
+            }
+            if(scratch.size()!=S){ setErr(e,ErrCode::CORRUPT,"segment record count mismatch"); return false; }
+            for(const UndoMeta& mm: scratch) recentPush(mm);
+            undoLoadStats_.records += (uint64_t)scratch.size();
+        }
+    }
+    for(const UndoMeta& mm: tailMetas) recentPush(mm);   // the tail is the MOST recent committed records
+    undoCommittedBytes_=m.undoSize; return true;
 }
 
 bool CommitStore3A::loadUndoFor(const Manifest& m, ChainError* e){
-    undoIndex_.clear(); undoCommittedBytes_=0; undoLoadStats_=UndoLoadStats(); if(m.undoSize==0) return true;
+    undoSegments_.clear(); undoRecent_.clear(); undoRecordCount_=0;
+    undoCommittedBytes_=0; undoLoadStats_=UndoLoadStats(); if(m.undoSize==0) return true;
     // R1 (F0-4): the referenced log must be a regular file. lstat (not stat) so a symlink or any other
     // non-regular object is refused here instead of being followed/read and only failing later.
     struct stat st; if(::lstat(p("undo.dat").c_str(),&st)!=0){ setErr(e,ErrCode::CORRUPT,"undo.dat missing but undoSize="+std::to_string(m.undoSize)); return false; }
@@ -459,7 +519,8 @@ bool CommitStore3A::loadUndoFor(const Manifest& m, ChainError* e){
         if(tryLoadCurrentUndoIndex(m,&ix,&usable,&ixErr) && usable){
             if(loadUndoForIndexed(m,ix,e)){ undoLoadStats_.fastPath=1; return true; }
             const std::string why=e?e->msg:std::string("unknown");
-            undoIndex_.clear(); undoCommittedBytes_=0; undoLoadStats_=UndoLoadStats();
+            undoSegments_.clear(); undoRecent_.clear(); undoRecordCount_=0;
+            undoCommittedBytes_=0; undoLoadStats_=UndoLoadStats();
             undoLoadStats_.fallback=why;
             clearErr(e);                       // a decline is not a failure: the scan decides the outcome
         } else if(!ixErr.msg.empty() && ixErr.code!=ErrCode::OK){
@@ -468,6 +529,11 @@ bool CommitStore3A::loadUndoFor(const Manifest& m, ChainError* e){
             undoLoadStats_.fallback="index absent/invalid/not-current (scan + S1.1 classification own it)";
         }
     }
+    // S1.3: the authoritative scan is also the ONLY full-history parse, and it runs only when the derived
+    // index is absent/invalid/stale/ahead (the documented S1.1 repair path). It builds the committed
+    // segment directory (O(1) per record) and fills the bounded recent cache instead of a full vector.
+    const size_t S=ixSegmentSize_?ixSegmentSize_:UNDOINDEX_DEFAULT_SEGMENT_SIZE;
+    uint64_t blockStart=0;
     uint64_t off=0; const uint8_t magic[8]={'I','N','N','U','N','D','O','1'};
     while(off<m.undoSize){
         if(off+UNDO_HEADER_SIZE>m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo header crosses committed length"); return false; }
@@ -478,7 +544,10 @@ bool CommitStore3A::loadUndoFor(const Manifest& m, ChainError* e){
         UndoMeta meta; memcpy(meta.blockHash.data(),hdr.data()+12,32);
         uint32_t hh=0; for(int i=0;i<4;i++) hh|=(uint32_t)hdr[44+i]<<(8*i); meta.height=(int32_t)hh;
         if(len<UNDO_HEADER_SIZE+4 || off+len>m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo record length out of range"); return false; }
-        meta.offset=off; meta.len=len; undoIndex_.push_back(meta); undoLoadStats_.records++; off+=len;
+        meta.offset=off; meta.len=len; recentPush(meta); undoLoadStats_.records++;
+        off+=len; undoRecordCount_++;
+        if(undoRecordCount_ % S == 0){ undoLoadStats_.descriptors++;
+            undoSegments_.push_back(CommittedSegment{blockStart,off}); blockStart=off; }
     }
     if(off!=m.undoSize){ setErr(e,ErrCode::CORRUPT,"undo.dat committed length mismatch"); return false; }
     undoCommittedBytes_=m.undoSize; return true;
@@ -545,19 +614,21 @@ bool UndoIndex::decode(const uint8_t* d, size_t n, UndoIndex* ix, ChainError* e)
     return true;
 }
 
-bool CommitStore3A::buildUndoIndexFromMetas(const std::vector<UndoMeta>& metas, UndoIndex* out) const {
+// S1.3: derive the expected UNDOINDEX from the committed segment directory (O(#segments), no per-record
+// history). Every map entry is a CLOSED segment; encode() fills the real per-descriptor crc32.
+bool CommitStore3A::buildUndoIndexFromSegments(UndoIndex* out) const {
     out->formatVersion = UNDOINDEX_FORMAT_VERSION;
     out->segmentSize   = (ixSegmentSize_ ? ixSegmentSize_ : UNDOINDEX_DEFAULT_SEGMENT_SIZE);
-    out->committedBytes = 0; out->baseOffset = 0; out->baseGeneration = 0; out->segments.clear();
-    const size_t S = out->segmentSize;
-    for (size_t i=0; i+S<=metas.size(); i+=S){
+    out->baseOffset = 0; out->baseGeneration = 0; out->segments.clear();
+    for (size_t i=0;i<undoSegments_.size();++i){
         UndoSegment s;
-        s.startOffset = metas[i].offset;
-        s.endOffset   = metas[i+S-1].offset + metas[i+S-1].len;
-        s.recordCount = (uint32_t)S; s.crc32 = 0;
+        s.startOffset = undoSegments_[i].startOffset;
+        s.endOffset   = undoSegments_[i].endOffset;
+        s.recordCount = (uint32_t)out->segmentSize;
+        s.crc32 = 0;
         out->segments.push_back(s);
     }
-    if (!out->segments.empty()) out->committedBytes = out->segments.back().endOffset;
+    if (!undoSegments_.empty()) out->committedBytes = undoSegments_.back().endOffset;
     return true;
 }
 
@@ -612,14 +683,20 @@ bool CommitStore3A::publishUndoIndex(const UndoIndex& ix, ChainError* e){
 
 bool CommitStore3A::publishUndoIndexOnSegmentClose(uint64_t appendEndOffset, ChainError* e){
     const size_t S = (ixSegmentSize_ ? ixSegmentSize_ : UNDOINDEX_DEFAULT_SEGMENT_SIZE);
-    if ((undoIndex_.size()+1) % S != 0) return true;   // no segment boundary crossed: publish nothing
-    std::vector<UndoMeta> metas = undoIndex_;
-    UndoMeta last;
-    last.offset = undoCommittedBytes_;
-    last.len    = (uint32_t)(appendEndOffset - undoCommittedBytes_);
-    metas.push_back(last);
-    UndoIndex ix; buildUndoIndexFromMetas(metas, &ix);
-    return publishUndoIndex(ix, e);
+    if (undoRecordCount_+1 == 0 || (undoRecordCount_ + 1) % S != 0) return true;   // no boundary crossed
+    // The record being committed closes segment #undoSegments_.size(), whose byte range is [previous closed
+    // end, appendEndOffset]. The committed directory must reflect ONLY committed segments, so it is NOT
+    // mutated here: if the publication (or the enclosing commit) fails, nothing was committed and the map
+    // is left exactly as it was (a spurious entry here made a one-shot fault double-push the segment on the
+    // retry, writing a non-positive byte range -- see S1.3 report).
+    const uint64_t segStart = undoSegments_.empty() ? 0 : undoSegments_.back().endOffset;
+    UndoIndex ix; buildUndoIndexFromSegments(&ix);                 // existing closed segments only
+    { UndoSegment ns; ns.startOffset = segStart; ns.endOffset = appendEndOffset;
+      ns.recordCount = (uint32_t)ix.segmentSize; ns.crc32 = 0;
+      ix.segments.push_back(ns); ix.committedBytes = appendEndOffset; }   // + the closing segment
+    if(!publishUndoIndex(ix, e)) return false;
+    undoSegments_.push_back(CommittedSegment{segStart, appendEndOffset});  // committed ONLY on success
+    return true;
 }
 
 // S1.1-F1 (finding S1.1-1): preserve a structurally corrupt derived artifact so the operator keeps the
@@ -699,7 +776,7 @@ bool CommitStore3A::classifyAndNormalizeUndoIndex(ChainError* e){
         exists = false;                       // the name is free again -> the rebuild path below publishes it
         clearErr(e);                          // the artifact is preserved off to the side; the open continues
     }
-    UndoIndex expected; buildUndoIndexFromMetas(undoIndex_, &expected);
+    UndoIndex expected; buildUndoIndexFromSegments(&expected);
     bool same = exists && onDisk.segmentSize==expected.segmentSize && onDisk.committedBytes==expected.committedBytes &&
                 onDisk.segments.size()==expected.segments.size();
     if (same) for(size_t i=0;i<expected.segments.size();++i){
@@ -840,7 +917,8 @@ bool CommitStore3A::openWithOptions(const std::string& dir, const OpenOptions& o
             if(!(tree_.rootIsLeaf() && tree_.rootCount()==0)){ close(); setErr(e,ErrCode::CORRUPT,"existing tree.dat is not an empty store; refusing to present it as fresh genesis"); return false; }
         }
         ixFreshPath_ = true;   // S1.1: no MANIFEST -> nothing committed -> never touch UNDOINDEX
-        generation_=0; undoIndex_.clear(); undoCommittedBytes_=0; blockHash_=Hash(); tipHeight_=-1;
+        generation_=0; undoSegments_.clear(); undoRecent_.clear(); undoRecordCount_=0;
+        undoCommittedBytes_=0; blockHash_=Hash(); tipHeight_=-1;
     } else {
         ChainError e2; bool bEx=false; uint32_t bId=0; Hash bH;
         bool bOk=tryLoadManifest(p("MANIFEST.bak"),&bEx,&bId,&bH,&e2);
@@ -1009,7 +1087,7 @@ bool CommitStore3A::publish(const Delta& d, const Hash& blockHash, int32_t heigh
     if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }
     if(!ackOk){ requireReopen("the generation was published but its acknowledgment failed"); return false; }
     UndoMeta meta; meta.blockHash=blockHash; meta.height=height; meta.offset=undoCommittedBytes_; meta.len=(uint32_t)recBytes.size();
-    generation_=newGen; undoCommittedBytes_=newUndoSize; undoIndex_.push_back(meta);
+    generation_=newGen; undoCommittedBytes_=newUndoSize; recentPush(meta); undoRecordCount_++;
     ackGen_=newGen; ackPresent_=true; blockHash_=blockHash; tipHeight_=height;
     return true;
 }
@@ -1018,8 +1096,11 @@ bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
     clearErr(e);
     if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
     if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen before any further mutation: "+reopenWhy_); return false; }
-    if(undoIndex_.empty()){ setErr(e,ErrCode::NOT_FOUND,"no committed undo to disconnect"); return false; }
-    const UndoMeta meta=undoIndex_.back();
+    if(undoRecent_.empty()){            // deep peel beyond the bounded recent window: refill on demand
+        if(!reloadRecentFromStream(e)) return false;
+        if(undoRecent_.empty() || undoRecent_.back().offset + undoRecent_.back().len != undoCommittedBytes_){
+            setErr(e,ErrCode::NOT_FOUND,"no committed undo to disconnect"); return false; } }
+    const UndoMeta meta=undoRecent_.back();
     if(meta.blockHash!=blockHash){ setErr(e,ErrCode::NOT_FOUND,"only the most recent block can be disconnected"); return false; }
     std::vector<uint8_t> body; if(!csReadRange(p("undo.dat"),meta.offset,meta.len,&body,e)) return false;
     size_t off=0; UndoRecord rec; if(!UndoRecord::decode(body.data(),body.size(),&off,&rec,e)) return false;
@@ -1040,7 +1121,8 @@ bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
     bool ackOk=writeAck(newGen,e);
     if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }
     if(!ackOk){ requireReopen("the generation was published but its acknowledgment failed"); return false; }
-    generation_=newGen; undoCommittedBytes_=newUndoSize; undoIndex_.pop_back();
+    generation_=newGen; undoCommittedBytes_=newUndoSize; undoRecent_.pop_back(); undoRecordCount_--;
+    trimUncommittedSegments();
     ackGen_=newGen; ackPresent_=true; blockHash_=Hash(); tipHeight_=m.tipHeight;
     return true;
 }

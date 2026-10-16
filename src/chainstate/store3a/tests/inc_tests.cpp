@@ -3228,15 +3228,137 @@ static void test_undoidx_fastidx_measure(){
            (unsigned long long)ss.bytesRead, 100.0*(double)ss.bytesRead/(double)undoBytes,
            (unsigned long long)sf.bytesRead, 100.0*(double)sf.bytesRead/(double)undoBytes);
     CHECK(sf.fastPath==1 && ss.fastPath==0, "fastidx-m: both modes exercised");
-    CHECK(sf.records==(uint64_t)N && ss.records==(uint64_t)N, "fastidx-m: identical record counts");
+    CHECK(ss.records==(uint64_t)N, "fastidx-m: the scan still parses every record");
+    // S1.3: the derived-index path parses ONLY the bounded recent window (UNDO_RECENT_CACHE_SEGMENTS x S);
+    // it no longer parses the full history, so records parsed and bytes read are now SMALLER than the scan.
+    CHECK(sf.records==(uint64_t)(3u*S), "fastidx-m: fast path parses only the bounded recent window (192 of 1024)");
     CHECK(sf.headerReads+sf.segmentReads < ss.headerReads/8, "fastidx-m: at least an 8x reduction in read syscalls");
-    CHECK(sf.bytesRead>ss.bytesRead, "fastidx-m: bytes read INCREASE (recorded honestly, not hidden)");
+    CHECK(sf.bytesRead<ss.bytesRead, "fastidx-m: bytes read now DECREASE (S1.3 reads only the recent window)");
+}
+
+// ===========================================================================
+// S1.3 -- bounded undo metadata: segment directory + recent cache + on-demand access
+// ===========================================================================
+// BOUND-basic: memory scales with SEGMENTS, the recent cache is fixed-bounded, and startup parses only a
+// bounded recent window -- the two-N comparison proves resident metadata does not grow with record count.
+static void test_undoidx_bound_basic(){
+    g_cur="UNDOIDX-BOUND-basic";
+    ChainError e; const uint32_t S=16;
+    const int N1=100, N2=200;                       // both >> the recent cache (3*S=48)
+    std::string d1=freshDir("bound_scale_a"), d2=freshDir("bound_scale_b");
+    CHECK(buildFastIdxStore(d1,N1,S,&e),"bound-b: build L: "+e.str());
+    CHECK(buildFastIdxStore(d2,N2,S,&e),"bound-b: build H: "+e.str());
+    uint64_t rec1=0,rec2=0,parsed1=0,parsed2=0; size_t seg1=0,seg2=0,cache1=0,cache2=0;
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1;
+      CHECK(s.open(d1,&e1),"bound-b: open L: "+e1.str());
+      CHECK(s.undoLoadStats().fastPath==1,"bound-b: L consumed the CURRENT index");
+      rec1=s.undoCount(); seg1=s.undoSegmentCount(); cache1=s.undoRecentCount(); parsed1=s.undoLoadStats().records; s.close(); }
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1;
+      CHECK(s.open(d2,&e1),"bound-b: open H: "+e1.str());
+      CHECK(s.undoLoadStats().fastPath==1,"bound-b: H consumed the CURRENT index");
+      rec2=s.undoCount(); seg2=s.undoSegmentCount(); cache2=s.undoRecentCount(); parsed2=s.undoLoadStats().records; s.close(); }
+    CHECK(rec1==(uint64_t)N1 && rec2==(uint64_t)N2, "bound-b: record counts match");
+    CHECK(seg1>=5 && seg2==seg1*2, "bound-b: the segment directory scales N/S (2x records -> 2x segments)");
+    CHECK(cache1==cache2 && cache1<=3u*S, "bound-b: the recent cache is FIXED-BOUNDED, independent of record count");
+    CHECK(parsed1<=4u*S && parsed2<=4u*S && parsed1<(uint64_t)N1 && parsed2<(uint64_t)N2,
+          "bound-b: startup parses a bounded window, never the full history");
+    printf("BOUND-basic N1=%d N2=%d S=%u segments=%zu/%zu cache=%zu/%zu parsed=%llu/%llu (records=%llu/%llu)\n",
+           N1,N2,S,seg1,seg2,cache1,cache2,(unsigned long long)parsed1,(unsigned long long)parsed2,
+           (unsigned long long)rec1,(unsigned long long)rec2);
+}
+
+// BOUND-deep: rollback across every segment boundary AND beyond the recent cache relies on on-demand
+// segment reparse; repeated rollback/append + restart cycles stay deterministic and come back Current.
+static void test_undoidx_bound_deep(){
+    g_cur="UNDOIDX-BOUND-deep";
+    ChainError e; const uint32_t S=16; const int N=100;    // 6 segments + tail 4; cache 48 < N
+    std::string d=freshDir("bound_deep");
+    CHECK(buildFastIdxStore(d,N,S,&e),"bound-d: build: "+e.str());
+    { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1;
+      CHECK(s.open(d,&e1),"bound-d: open: "+e1.str()); const uint64_t r0=s.undoRecentRefills();
+      // peel by explicit committed block hash: tipHash() returns the zero hash after a disconnect, so the
+      // store's tip-only rule is driven with the sequence id32(0xB10C0000u, N..1) the generator produced.
+      int steps=0; ChainError de;
+      for(int kk=N;kk>=1;--kk){
+        if(!s.disconnect(id32(0xB10C0001u,(uint32_t)kk),&de)){ printf("BOUND-deep stopped at step %d: %s\n",steps,de.str().c_str()); break; }
+        steps++; }
+      CHECK(steps==N, "bound-d: disconnected ALL "+std::to_string(N)+" records (crossed every boundary, past the cache)");
+      CHECK(s.undoCount()==0 && s.undoCommittedBytes()==0, "bound-d: rolled back to an empty committed state");
+      CHECK(s.undoRecentRefills()>r0, "bound-d: the on-demand reparse path was actually exercised");
+      s.close(); }
+    // repeated rollback/append cycles + restart -- deterministic Current each time (crash/restart parity)
+    for(int cyc=0;cyc<3;++cyc){
+        const int T= (int)(2*S+3);                       // 2 full segments + partial tail
+        const uint32_t baseL=(uint32_t)(10000+cyc*100);
+        // A full rollback leaves the on-disk index AHEAD (disconnect never rewinds it); the next open
+        // repairs it (Ahead is the honest post-repair report) and a FRESH open is then Current.
+        { CommitStore3A r; r.setUndoIndexSegmentSizeForTest(S); ChainError ee;
+          CHECK(r.open(d,&ee),"bound-d: cycle "+std::to_string(cyc)+" open (empty): "+ee.str());
+          CHECK(r.undoCount()==0,"bound-d: empty after full rollback (deterministic restart)");
+          for(int i=1;i<=T;++i) CHECK(PUB(r, (int32_t)(baseL+i), 1,1,3, &ee), "bound-d: republish "+std::to_string(i));
+          CHECK(r.undoCount()==(uint64_t)T,"bound-d: republished "+std::to_string(T));
+          r.close(); }
+        { CommitStore3A r; r.setUndoIndexSegmentSizeForTest(S); ChainError ee;
+          CHECK(r.open(d,&ee),"bound-d: cycle "+std::to_string(cyc)+" reopen: "+ee.str());
+          CHECK(r.undoIndexState()==UndoIndexState::Current, "bound-d: a fresh reopen is Current after the repaired+extended index");
+          CHECK(r.undoCount()==(uint64_t)T, "bound-d: T records after reopen (cache invalidated and rebuilt)");
+          int steps=0; ChainError de;
+          for(int kk=T;kk>=1;--kk){ if(!r.disconnect(id32(0xB10C0001u,(uint32_t)(baseL+kk)),&de)) break; steps++; }
+          CHECK(steps==T && r.undoCount()==0, "bound-d: rolled the republished batch back to empty");
+          r.close(); }
+    }
+}
+
+// BOUND-integrity: startup validations that REMAIN vs those DEFERRED to on-demand access, each proven.
+static void test_undoidx_bound_integrity(){
+    g_cur="UNDOIDX-BOUND-integrity";
+    ChainError e; const uint32_t S=16; const int N=100;
+    // (a) header damage in an OLD segment (record 10, in segment 0) -- NOT read at startup (deferred); the
+    //     same damage FAILS CLOSED the moment a deep rollback touches segment 0.
+    { std::string d=freshDir("bound_int_old");
+      CHECK(buildFastIdxStore(d,N,S,&e),"bound-i: build (old): "+e.str());
+      std::string raw=slurp(d+"/undo.dat");
+      size_t hit=raw.find(std::string("INNUNDO1",8));
+      for(int k=0;k<10 && hit!=std::string::npos;++k) hit=raw.find(std::string("INNUNDO1",8),hit+8);
+      CHECK(hit!=std::string::npos, "bound-i: located record 10 header (deep old segment)");
+      raw[hit]^=0xFF; CHECK(spill(d+"/undo.dat",raw), "bound-i: old header damaged");
+      { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1;
+        bool ok=s.open(d,&e1);
+        CHECK(ok, "bound-i: an OLD-segment header is not a load-time failure (integrity deferred): "+e1.str());
+        if(ok){
+          int steps=0; ChainError de;
+          for(int kk=N;kk>=1;--kk){ if(!s.disconnect(id32(0xB10C0001u,(uint32_t)kk),&de)){ steps=-1; break; } steps++; }
+          CHECK(steps<0 && s.undoCount()>0,
+                "bound-i: the old-segment corruption stopped the deep rollback (fail closed on demand)");
+          s.close(); } } }
+    // (b) header damage in the RECENT window (the tip record's header IS parsed at startup) -> FAIL CLOSED.
+    { std::string d=freshDir("bound_int_recent");
+      CHECK(buildFastIdxStore(d,N,S,&e),"bound-i: build (recent): "+e.str());
+      std::string raw=slurp(d+"/undo.dat");
+      size_t last=std::string::npos, cur=std::string::npos;
+      while((cur=raw.find(std::string("INNUNDO1",8),cur+1))!=std::string::npos) last=cur;
+      CHECK(last!=std::string::npos, "bound-i: located the tip header (in the startup-parsed window)");
+      raw[last]^=0xFF; CHECK(spill(d+"/undo.dat",raw), "bound-i: tip header damaged");
+      { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1;
+        bool ok=s.open(d,&e1);
+        CHECK(!ok && e1.code==ErrCode::CORRUPT,
+              "bound-i: recent/tip header corruption FAILS CLOSED at startup ("+e1.str().substr(0,80)+")");
+        s.close(); } }
+    // (c) TRUNCATED committed undo (undo.dat cut so committed records beyond the truncation vanish) -> fail closed.
+    { std::string d=freshDir("bound_int_trunc");
+      CHECK(buildFastIdxStore(d,N,S,&e),"bound-i: build (trunc): "+e.str());
+      std::string raw=slurp(d+"/undo.dat"); raw.resize(raw.size()/2); CHECK(spill(d+"/undo.dat",raw),"bound-i: truncated");
+      { CommitStore3A s; s.setUndoIndexSegmentSizeForTest(S); ChainError e1;
+        bool ok=s.open(d,&e1);
+        CHECK(!ok, "bound-i: truncated committed undo FAILS CLOSED at open ("+e1.str().substr(0,80)+")");
+        s.close(); } }
 }
 
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail}, {"UNDOIDX-FASTIDX-equiv",test_undoidx_fastidx_equiv}, {"UNDOIDX-FASTIDX-fallback",test_undoidx_fastidx_fallback}, {"UNDOIDX-FASTIDX-damaged",test_undoidx_fastidx_damaged}, {"UNDOIDX-FASTIDX-recovery",test_undoidx_fastidx_recovery}, {"UNDOIDX-FASTIDX-measure",test_undoidx_fastidx_measure} };
+
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail}, {"UNDOIDX-FASTIDX-equiv",test_undoidx_fastidx_equiv}, {"UNDOIDX-FASTIDX-fallback",test_undoidx_fastidx_fallback}, {"UNDOIDX-FASTIDX-damaged",test_undoidx_fastidx_damaged}, {"UNDOIDX-FASTIDX-recovery",test_undoidx_fastidx_recovery}, {"UNDOIDX-FASTIDX-measure",test_undoidx_fastidx_measure}, {"UNDOIDX-BOUND-basic",test_undoidx_bound_basic}, {"UNDOIDX-BOUND-deep",test_undoidx_bound_deep}, {"UNDOIDX-BOUND-integrity",test_undoidx_bound_integrity} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){

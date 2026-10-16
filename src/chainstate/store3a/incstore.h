@@ -5,6 +5,7 @@
 #include "btree.h"
 #include <string>
 #include <vector>
+#include <deque>
 
 namespace cs { namespace store3a {
 
@@ -30,13 +31,26 @@ struct UndoRecord {
 
 struct UndoMeta { Hash blockHash{}; int32_t height = 0; uint64_t offset = 0; uint32_t len = 0; };
 
+// S1.3: the in-RAM undo metadata is no longer one entry per record. A CommittedSegment records the byte
+// range of one CLOSED undo segment (fixed recordCount == segmentSize); the recent-record cache holds at
+// most UNDO_RECENT_CACHE_SEGMENTS x segmentSize entries so both disconnect (tip peek/pop) and segment
+// publication (last segmentSize metas) are O(1) in the common case without retaining every record.
+// S1.1 C++11 note: aggregate brace-init is unavailable once members carry default initializers, so this
+// carries an explicit ctor; the directory is rebuilt from a validated index (or the authoritative scan) on
+// every load, so CRCs are not retained in RAM (re-derived by encode() when the index is (re)written).
+struct CommittedSegment {
+    uint64_t startOffset; uint64_t endOffset;
+    CommittedSegment() = default;
+    CommittedSegment(uint64_t s, uint64_t e) : startOffset(s), endOffset(e) {}
+};
+
 // ---------------------------------------------------------------------------------------------
 // S1.1 -- DURABLE SEGMENTED UNDO INDEX (`UNDOINDEX`), DERIVED METADATA ONLY.
 //
 // Authority: MANIFEST.undoSize remains the SOLE authority for the committed undo length. `UNDOINDEX`
-// is a rebuildable cache of the boundaries of CLOSED segments of the committed undo stream; it is
-// never consulted for authority in this slice (lookup/disconnect still use `undoIndex_`, built by
-// `loadUndoFor`, unchanged).
+// is a rebuildable cache of the boundaries of CLOSED segments of the committed undo stream; it is never
+// consulted for authority. Since S1.3, lookup/disconnect use the bounded recent cache and, past it,
+// on-demand parsing of the committed stream (see DESIGN 17).
 //
 // Publication ordering (the reconciliation with the MANIFEST publication -- S1.1 section 4):
 //   the index is published INSIDE `commitBarriers`, AFTER the durable undo write and BEFORE
@@ -206,7 +220,14 @@ public:
     const std::string& dir() const { return dir_; }
     const Hash& tipHash() const { return blockHash_; }
     int32_t tipHeight() const { return tipHeight_; }
-    size_t undoCount() const { return undoIndex_.size(); }
+    size_t undoCount() const { return (size_t)undoRecordCount_; }
+    // S1.3: number of CLOSED segments currently in memory (diagnostic; memory scales with this, not
+    // undoCount()). Clamped to true closed bounds by trimUncommittedSegments() on every mutation.
+    size_t undoSegmentCount() const { return undoSegments_.size(); }
+    // S1.3 diagnostics (memory-scaling evidence): the recent cache is bounded independent of undoCount();
+    // the refill counter rises only when a disconnect had to re-read the stream past the cache.
+    size_t undoRecentCount() const { return undoRecent_.size(); }
+    uint64_t undoRecentRefills() const { return undoRecentRefills_; }
     uint64_t undoCommittedBytes() const { return undoCommittedBytes_; }   // S1.2: committed undo length loaded
     bool hadRecoveryIssue() const { return hadRecoveryIssue_; }
     // S1.1: derived undo index -- classification at the last open/publication + cost counters.
@@ -277,7 +298,12 @@ private:
     bool tryLoadCurrentUndoIndex(const Manifest& m, UndoIndex* ix, bool* usable, ChainError* err);
     bool loadUndoForIndexed(const Manifest& m, const UndoIndex& ix, ChainError* e);
     // S1.1: derived undo index (all of these are read-only w.r.t. undo.dat / tree.dat / MANIFEST / ACK)
-    bool buildUndoIndexFromMetas(const std::vector<UndoMeta>& metas, UndoIndex* out) const;
+    bool buildUndoIndexFromSegments(UndoIndex* out) const;
+    void trimUncommittedSegments();                 // drop map entries uncovered by rollback (S1.3)
+    bool reloadRecentFromStream(ChainError* e);     // on-demand reparse of the most recent segment region
+    uint64_t undoRecentRefills_ = 0;                     // reloadRecentFromStream() invocations (on-demand reads)
+    void recentPush(const UndoMeta& m);             // bounded append to undoRecent_
+    static const size_t UNDO_RECENT_CACHE_SEGMENTS = 3;  // undoRecent_ holds <= ~3 segments of metas
     bool loadUndoIndexFromDisk(bool* exists, UndoIndex* ix, ChainError* e);
     bool classifyAndNormalizeUndoIndex(ChainError* e);
     bool publishUndoIndex(const UndoIndex& ix, ChainError* e);
@@ -311,7 +337,9 @@ private:
     int32_t tipHeight_ = -1;
     bool hadRecoveryIssue_ = false;
     bool renamePassed_ = false;
-    std::vector<UndoMeta> undoIndex_;
+    std::vector<CommittedSegment> undoSegments_;   // CLOSED undo segments in commit order (16 B/segment)
+    std::deque<UndoMeta> undoRecent_;              // most recent committed records, bounded (S1.3)
+    uint64_t undoRecordCount_ = 0;                 // total committed records (== undoCount()); O(1) count
     // S1.1: derived undo index state/hooks/counters (production defaults: 4096 records/segment).
     uint32_t ixSegmentSize_ = UNDOINDEX_DEFAULT_SEGMENT_SIZE;
     UndoIndexState undoIndexState_ = UndoIndexState::None;

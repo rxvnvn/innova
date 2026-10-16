@@ -846,3 +846,70 @@ that lets the committed stream be validated without reading it (for example a pe
 segment's BYTES, so "the indexed range is intact" becomes checkable from metadata). Until then the honest
 statement is: S1.2 reduces startup READ SYSCALLS by replacing per-record reads with per-segment reads, at
 the cost of reading payload bytes it previously skipped — it does not make startup O(#segments).
+
+## 17. Stage 3B-D1-S1.3 -- bounded undo metadata (segment map + recent cache + on-demand access)
+
+S1.3 removes the full-chain `std::vector<UndoMeta>` from the Store3A steady state. MANIFEST.undoSize stays
+the sole committed authority; UNDOINDEX remains a DERIVED acceleration copy. This section records the
+dependency map, the chosen representation, the integrity contract, and the alternatives rejected.
+
+### 17.1 Consumer/dependency map for `undoIndex_` (the vector being removed)
+
+Every in-repo consumer and the S1.3 replacement:
+
+| consumer | what it needed from the vector | full history? | S1.3 replacement |
+|---|---|---|---|
+| load (derived-index fast path) | per-record metas to serve lookups/rollback | no | segment directory from the CURRENT index + a bounded recent cache (tail + recent segments parsed) |
+| load (authoritative scan, repair path) | per-record metas | yes, transiently | the scan builds the segment directory O(1)/record and the bounded cache; nothing retained per-record |
+| append / commit | push + the segment-boundary count | no | O(1) recent-cache push + `undoRecordCount_` (the boundary test) |
+| disconnect / rollback | `back()` = the most recent record's meta (offset/len/height/blockHash), `pop_back()` | no | recent-cache `back()/pop`; on cache exhaustion, reloadRecentFromStream() reparses one committed region on demand (bounded, fail-closed) |
+| index publication (segment close) | a full vector copy + `buildUndoIndexFromMetas` (O(N)) | no | the just-closed segment's byte range is appended to the directory (O(1)); the whole (small) index is re-derived from the directory (O(#segments)) |
+| classification (expected index) | `buildUndoIndexFromMetas(undoIndex_)` (O(N)) | no | `buildUndoIndexFromSegments(undoSegments_)` (O(#segments)) |
+| diagnostics/tests | `undoCount()`, state digests | no | `undoCount()` = `undoRecordCount_` (O(1)); `undoSegmentCount()`/`undoRecentCount()`/`undoRecentRefills()` |
+
+FINDING (O(N) removed unconditionally): publication previously copied the WHOLE vector and re-derived every
+segment on every close -- O(N) per close. S1.3 makes it O(#segments) via the map. This is a real algorithmic
+improvement, not just a RAM one.
+
+### 17.2 Steady-state representation (FACT)
+
+* `undoSegments_` : `std::vector<CommittedSegment{startOffset,endOffset}>` -- one 16-byte entry per CLOSED
+  segment (8M blocks @ 4096/seg => ~1953 entries ~ 31 KB). O(#segments), not O(records).
+* `undoRecent_` : a bounded `std::deque<UndoMeta>` capped at `UNDO_RECENT_CACHE_SEGMENTS (3) x segmentSize`
+  entries (e.g. 12288 x 48 B ~ 590 KB at the default 4096). Fixed ceiling, independent of history.
+* `undoCommittedBytes_` (== MANIFEST.undoSize) and `undoRecordCount_` (O(1) committed record count).
+
+Invariant maintained on every mutation (`trimUncommittedSegments` on rollback): `undoSegments_` holds exactly
+the closed segments at or below `undoCommittedBytes_`, so subsequent appends never overlap a stale segment.
+
+### 17.3 Startup
+
+When UNDOINDEX is CURRENT and valid: read the index, build the directory from its descriptors, then parse
+ONLY the uncovered tail plus enough trailing closed segments to fill the recent cache. `undoLoadStats_.records`
+therefore stays O(UNDO_RECENT_CACHE_SEGMENTS x segmentSize) -- independent of `undoCount()` (the S1.3
+acceptance property). The authoritative scan (which parses every record) runs ONLY when the index is
+absent/invalid/stale/ahead -- the S1.1/F2 documented repair path, not a disguised rescan.
+
+### 17.4 Integrity contract and format decision (answering the §5 gate)
+
+* checks that REMAIN at every startup (CURRENT path): UNDOINDEX decode (magic/version/header+d descriptor
+  CRC/length/bounds), segment contiguity + `recordCount == segmentSize`, `committedBytes <= MANIFEST.undoSize`,
+  MANIFEST.undoSize authority, and FULL header/magic/length validation of the tail + recent-window records.
+* checks that MOVE to on-demand access: header/magic/length of CLOSED segments OLDER than the recent window.
+  They run, unchanged and fail-closed, exactly when that segment is actually read (a deep disconnect). The
+  COMMON case (tip + recent rollback) is still validated at startup. This is an explicit, reviewed replacement
+  for the old full-stream load-time header check, and the only path that cannot keep that check is the one the
+  memory mission forces (skip the O(N) parse).
+* corruption detectable only on use: a header/payload defect in a cold closed segment never touched. Payload
+  defects were ALREADY only-on-use in S1.2 (load never decodes payloads); header defects of cold segments are
+  the NEW deferral and are caught fail-closed on access.
+* authoritative digest: MANIFEST carries only `undoSize` (committed length), no content hash -- so no existing
+  digest supplies the missing assurance; the replacement is authoritative-length + index-metadata CRC +
+  on-demand fail-closed decode + the recent-window startup parse.
+* per-segment DATA CRC: sufficient to restore SEGMENT-granularity payload integrity without a startup scan
+  (established at close time, verified on demand) but requires a v2 UNDOINDEX (an extra per-descriptor field)
+  + a rebuild path. NOT required for the memory contract; NOT introduced (avoids a silent format change);
+  documented as the smallest follow-on in the S1.3 report.
+* format decision: NO UNDOINDEX format revision in S1.3 (the §5 "don't silently introduce v2" constraint).
+  The deferral is made explicit and tested, and the memory mission's sole protection -- the full-vector drop --
+  is delivered.
