@@ -6553,6 +6553,23 @@ void ResetCNValidationCountersForTesting()
 // s16::g_chainObserve for the pilot to assert on. Production default disabled.
 namespace s16 { ChainObserveState g_chainObserve; }
 
+// S2.0 BI-V2 authoritative startup: legacy-index-open guard state (see
+// observe_hook.h). Armed only when -s16openstore is requested, by
+// ArmV2LegacyIndexGuardIfRequested(). Non-V2 sessions leave it disarmed, so
+// legacy opens are unaffected. All guard declarations live in namespace s16
+// (observe_hook.h); these are the single definitions.
+namespace s16 {
+bool g_V2LegacyIndexGuardArmed = false;
+int  g_V2LegacyIndexProbeDepth = 0;
+}
+
+void s16::ArmV2LegacyIndexGuardIfRequested()
+{
+    g_V2LegacyIndexGuardArmed = !GetArg("-s16openstore", "").empty();
+    if (g_V2LegacyIndexGuardArmed)
+        printf("S2.0 BI-V2 authoritative startup: legacy LevelDB index-open guard ARMED (refusing legacy txleveldb opens; block index from Block Index V2 only)\n");
+}
+
 static void s16_ObserveConnectBlock(const CBlock& blk,
                                     const std::map<uint256,CTxIndex>& mqc,
                                     const CBlockIndex* pindex)
@@ -9639,6 +9656,14 @@ static bool PersistInvalidBlockSet()
 // -----------------------------------------------------------------------------
 bool ReconcileLegacyCompatibilityMirror(std::string& strError)
 {
+    // S2.0 BI-V2 authoritative startup: in V2 store mode the legacy LevelDB
+    // must NOT be opened even for reading (and this mirror WRITES it). The
+    // R3 legacy compatibility mirror is a legacy-view helper that V2 store
+    // startup explicitly does not maintain — the Store3A/BI-V2 authority needs
+    // no legacy mirror. Fail-closed policy: never open legacy; return success
+    // trivially (V2 is self-consistent). Non-V2 behavior is unchanged.
+    if (s16::V2LegacyIndexGuardActive())
+        return true;
     if (!g_fAuthoritativeStartup)
         return true; // legacy mode: legacy is the authority; nothing to reconcile
     BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();

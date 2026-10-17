@@ -9,6 +9,7 @@
 #include "blockindex_stake_seen_builder.h"
 #include "blockindex_candidate_startup_builder.h"
 #include "blockindex_shadow_startup.h"   // RetainBlockIndexAuthoritativeNavigator
+#include "chainstate/observe_hook.h"      // S2.0: V2 store legacy-index guard
 #include "blockindex_v2_reader.h"
 #include "candidate_frontier.h"
 #include "main.h"
@@ -72,13 +73,25 @@ bool PublishStartupGlobals(AuthoritativeStartupContext& ctx, std::string* error)
     hashBestChain = best->GetBlockHash();
     nBestChainTrust = best->nChainTrust;
     // nBestInvalidTrust is a diagnostic scalar; load from DB (default 0).
+    // S2.0 BI-V2 authoritative startup: in V2 store mode the legacy LevelDB
+    // must NOT be opened even for reading (guard armed) — the operator-invalid
+    // dimension is restored from the authoritative V2 mutable tip elsewhere.
+    // nBestInvalidTrust is a legacy-only diagnostic scalar, not block-index
+    // authority; leave it at the canonical default 0 and never open legacy.
     {
         CBigNum bn = 0;
-        CTxDB txdb("r");
-        if (txdb.ReadBestInvalidTrust(bn))
-            nBestInvalidTrust = bn.getuint256();
+        if (s16::V2LegacyIndexGuardActive())
+        {
+            nBestInvalidTrust = uint256(0);   // V2 store mode: legacy read prohibited
+        }
         else
-            nBestInvalidTrust = uint256(0);
+        {
+            CTxDB txdb("r");
+            if (txdb.ReadBestInvalidTrust(bn))
+                nBestInvalidTrust = bn.getuint256();
+            else
+                nBestInvalidTrust = uint256(0);
+        }
     }
 
     if (error) error->clear();

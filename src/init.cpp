@@ -1435,6 +1435,15 @@ bool AppInit2()
     printf("Loading block index...\n");
     nStart = GetTimeMillis();
 
+    // S2.0 BI-V2 AUTHORITATIVE STARTUP: arm the legacy-index-open guard here, at
+    // the true start of the production authoritative block-index load (after the
+    // developer-only -loadblockindextest / -stakemodifierverify early-exit
+    // diagnostics, which are not part of production startup). In V2 store mode
+    // (-s16openstore) the block index must come exclusively from Block Index V2,
+    // so the guard FAILS CLOSED on any legacy LevelDB (txleveldb) open during the
+    // V2 startup path. Non-V2 startup leaves the guard disarmed (byte-for-byte).
+    s16::ArmV2LegacyIndexGuardIfRequested();
+
     // ---- PM1-P0-07b (C2/C4): SINGLE normal production startup ownership ----
     // The durable ownership commit point is the existing logical CURRENT marker.
     // Normal production authority is Block Index V2 ONLY: the startup ownership
@@ -1458,6 +1467,21 @@ bool AppInit2()
                BlockIndexStartupOwnershipStateName(own.state),
                own.legacyPresent ? 1 : 0, own.legacyReadable ? 1 : 0,
                own.unpublishedArtifacts ? 1 : 0, (int)own.v2CurrentStatus, v2Root.c_str());
+
+        // S2.0 BI-V2 AUTHORITATIVE STARTUP: in V2 store mode (-s16openstore) the
+        // block index MUST come from an EXISTING authoritative Block Index V2 —
+        // never from a legacy migration or a from-scratch native build, because
+        // both would READ the legacy LevelDB txindex/blockindex (prohibited, and
+        // the guard rejects the open). Refuse startup unless the ownership is
+        // already V2_AUTHORITATIVE. Non-V2 startup is unaffected.
+        if (s16::V2LegacyIndexGuardActive() &&
+            own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE)
+            return InitError(strprintf(
+                "Store3A V2 authoritative FAIL-CLOSED: Block Index V2 ownership is %s, not "
+                "V2_AUTHORITATIVE. In V2 store mode (-s16openstore) the block index must already "
+                "exist as an authoritative Block Index V2 built offline; the legacy txindex must not "
+                "be migrated or replayed at startup. No legacy fallback.",
+                BlockIndexStartupOwnershipStateName(own.state)));
 
         if (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW ||
             own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED)
@@ -1665,6 +1689,15 @@ authoritative_startup_ready:
     };
 
     // ********************************************************* Step 8: load wallet
+
+    // S2.0 BI-V2 authoritative startup: the block-index startup (Step 7) is
+    // complete. In V2 store mode the proven guarantee is that NO legacy LevelDB
+    // (txindex/blockindex) open occurred during that window — the guard refuted
+    // it fail-closed. Now release the guard so the legitimate non-block-index
+    // post-startup consumers (wallet, RPC, mempool, reindex) are unaffected;
+    // their legacy reads, if any, are not block-index startup. (Consensus input
+    // sourcing in V2 mode is already Store3A-only via s16_V2Armed().)
+    s16::g_V2LegacyIndexGuardArmed = false;
 
     if (GetBoolArg("-zapwallettxes", false)) {
         uiInterface.InitMessage(_("Zapping all transactions from INN wallet..."));
@@ -1920,6 +1953,57 @@ authoritative_startup_ready:
             if (stHash != chHash)
                 return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: tip hash mismatch at h=%d (store=%s chain=%s). Refusing to switch chain state.",
                                            (int)stH, stHash.GetHex(), chHash.GetHex()));
+
+            // ------------------------------------------------------------------
+            // S2.0 BI-V2 AUTHORITATIVE STARTUP: verify the Block Index V2 active
+            // tip BY VALUE equals the Store3A tip AND equals the expected seed tip.
+            // The block index on the V2 store path must come exclusively from BI-V2;
+            // the three-way agreement (BI-V2 == Store3A == expected seed) is the
+            // fail-closed authoritative-startup gate. On ANY mismatch we InitError —
+            // never fall through to legacy and never continue on divergent state.
+            // ------------------------------------------------------------------
+            {
+                const BlockIndexV2Reader* biReader = GetAuthoritativeNavigatorReader();
+                BlockIndexSnapshot biSnap;
+                std::string biErr;
+                int32_t biTipHeight = -1;
+                uint256 biTipHash = uint256(0);
+                if (!biReader || !biReader->IsOpen())
+                    return InitError("Store3A V2 authoritative FAIL-CLOSED: authoritative Block Index V2 reader is not open (block index must come from BI-V2 in V2 store mode; legacy fallback is prohibited)");
+                // The active-chain tip by value at the Store3A tip height; a definitive
+                // miss or authority failure is a divergence -> fail closed.
+                BlockIndexV2ReadStatus bis = biReader->GetActiveByHeight((int)stH, &biSnap, &biErr);
+                if (bis == BLOCK_INDEX_V2_READ_FOUND)
+                {
+                    biTipHeight = biSnap.height;
+                    biTipHash = biSnap.hash;
+                }
+                else
+                {
+                    return InitError(strprintf(
+                        "Store3A V2 authoritative FAIL-CLOSED: Block Index V2 cannot resolve the active block at height %d (status=%d %s). BI-V2 must agree with Store3A; no legacy fallback.",
+                        (int)stH, (int)bis, biErr.c_str()));
+                }
+                // Expected seed tip constant.
+                const int32_t kExpectedSeedHeight = 8170668;
+                const uint256 kExpectedSeedHash("f3d089eaa241ac54e3fcf4827987bb94cb71f774b1f9efd68c03d4e00713d784");
+                if (stH != kExpectedSeedHeight)
+                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: store tip height %d != expected seed height %d. Refusing to start on a divergent chain.",
+                                               (int)stH, (int)kExpectedSeedHeight));
+                if (biTipHeight != kExpectedSeedHeight)
+                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: BI-V2 tip height %d != expected seed height %d. Refusing to start on a divergent chain.",
+                                               (int)biTipHeight, (int)kExpectedSeedHeight));
+                if (biTipHash != kExpectedSeedHash)
+                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: BI-V2 tip hash %s != expected seed hash %s.", biTipHash.GetHex().c_str(), kExpectedSeedHash.GetHex().c_str()));
+                if (stHash != kExpectedSeedHash)
+                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: store tip hash %s != expected seed hash %s.", stHash.GetHex().c_str(), kExpectedSeedHash.GetHex().c_str()));
+                if (biTipHash != stHash)
+                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: BI-V2 tip hash %s != Store3A tip hash %s at height %d. BI-V2 and Store3A must agree.",
+                                               biTipHash.GetHex().c_str(), stHash.GetHex().c_str(), (int)stH));
+                printf("S2.0 BI-V2 authoritative startup VERIFIED: BI-V2 tip (h=%d %s) == Store3A tip (h=%d %s) == expected seed\n",
+                       (int)biTipHeight, biTipHash.GetHex().c_str(), (int)stH, stHash.GetHex().c_str());
+                fflush(stdout);
+            }
             s16::g_chainObserve.store = g_s3aAuthoritative.get();
             s16::g_chainObserve.enabled = true;
             s16::g_chainObserve.checkAuthority = true;

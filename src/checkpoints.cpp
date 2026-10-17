@@ -8,6 +8,7 @@
 #include "checkpoints.h"
 
 #include "blockindex_authoritative_startup.h"   // V2-R2B: authoritative by-value resolver
+#include "chainstate/observe_hook.h"             // S2.0: V2 store legacy-index guard
 #include "txdb.h"
 #include "main.h"
 #include "uint256.h"
@@ -221,6 +222,11 @@ namespace Checkpoints
         // and startup fails loudly but gracefully.
         try
         {
+            // S2.0 BI-V2 authoritative startup: this single consensus-critical,
+            // EXPLICITLY-JUSTIFIED non-index read (the persisted synced-checkpoint
+            // scalar) is authorized to open the legacy LevelDB on the V2 store path.
+            // It is NOT a block/tx index read; the block index comes from BI-V2.
+            s16::V2LegacyIndexProbeScope probe;
             CTxDB txdb("r");
             const SyncCheckpointLoadStatus st = txdb.LoadSyncCheckpoint(hashOut);
             if (st == SYNC_CHECKPOINT_CORRUPT && error)

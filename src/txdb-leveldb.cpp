@@ -23,6 +23,7 @@
 #include "kernel.h"
 #include "checkpoints.h"
 #include "txdb-leveldb.h"
+#include "chainstate/observe_hook.h"   // S2.0: legacy-index-open guard in V2 store mode
 #include <set>
 #include "util.h"
 #include "hash.h"   // R3: event/journal hash chaining (C6 section 3)
@@ -288,6 +289,24 @@ void init_blockindex(leveldb::Options& options, bool fResetIndex = false) {
     }
 
     fs::create_directory(directory);
+
+    // S2.0 BI-V2 AUTHORITATIVE STARTUP — FAIL-CLOSED legacy-index-open guard.
+    // In V2 store mode (-s16openstore) the block/tx index must come exclusively
+    // from the authoritative Block Index V2, so the legacy LevelDB index must
+    // NOT be opened even for reading. This is the SINGLE Legacy LevelDB open
+    // choke point; if the guard is armed and no authorized non-index probe is
+    // in scope, refuse loudly instead of opening. The only authorized legacy
+    // open is the consensus-critical persisted synced-checkpoint read
+    // (LoadPersistedSyncCheckpoint), marked by s16::V2LegacyIndexProbeScope.
+    // Non-V2 startup never arms the guard, so this branch is inert there.
+    if (s16::V2LegacyIndexGuardActive() && !s16::V2LegacyIndexProbeActive())
+        throw runtime_error(strprintf(
+            "S2.0 BI-V2 authoritative startup FAIL-CLOSED: refusing to open the legacy "
+            "LevelDB block/tx index at %s even for reading; the block index must come "
+            "exclusively from Block Index V2 in V2 store mode (-s16openstore). No legacy "
+            "index read is permitted in the V2 startup path.",
+            directory.string().c_str()));
+
     printf("Opening LevelDB in %s\n", directory.string().c_str());
     leveldb::Status status = leveldb::DB::Open(options, directory.string(), &txdb);
     if (!status.ok()) {
