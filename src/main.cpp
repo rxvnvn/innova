@@ -6572,7 +6572,8 @@ void s16::ArmV2LegacyIndexGuardIfRequested()
 
 static void s16_ObserveConnectBlock(const CBlock& blk,
                                     const std::map<uint256,CTxIndex>& mqc,
-                                    const CBlockIndex* pindex)
+                                    const CBlockIndex* pindex,
+                                    const s16_V2InputView* v2View)
 {
     s16::ChainObserveState& st = s16::g_chainObserve;
     if (!st.enabled || !st.store || !st.store->opened() || pindex == NULL)
@@ -6663,24 +6664,44 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
     // ANON_TXN and they are consumed via the CAnonOutput/nullifier store), so they stay out of
     // the transparent-UTXO authority by construction.
     if (st.checkAuthority) {
-        std::vector<CDiskTxPos> blockPos;
-        for (size_t ti = 0; ti < blk.vtx.size(); ++ti) {
-            uint256 htx = blk.vtx[ti].GetHash();
-            std::map<uint256,CTxIndex>::const_iterator hit = mqc.find(htx);
-            if (hit != mqc.end())
-                blockPos.push_back(hit->second.pos);
-        }
         cs::ObservedAuthority auth;
-        for (std::map<uint256,CTxIndex>::const_iterator mi = mqc.begin(); mi != mqc.end(); ++mi) {
-            const CTxIndex& ti = mi->second;
-            for (size_t i = 0; i < ti.vSpent.size(); ++i) {
-                if (ti.vSpent[i].IsNull()) continue;
-                bool inThisBlock = false;
-                for (size_t b = 0; b < blockPos.size(); ++b)
-                    if (ti.vSpent[i] == blockPos[b]) { inThisBlock = true; break; }
-                if (!inThisBlock) continue;   // prior-block spend -> NOT a current-block spend
-                cs::OutPoint op; memcpy(op.txid.data(), mi->first.begin(), 32); op.n = (uint32_t)i;
-                auth.spent.push_back(op);
+        // S2.0-S1.7-G (V2 authority source): when the Store3A-backed V2 input view is ARMED (the
+        // authoritative `-s16openstore` instance, s16_V2Armed()), `v2View->consumed` holds EXACTLY
+        // THIS block's transparent spends -- ConnectInputs marks every non-anon vin via markSpent
+        // (main.cpp:6145); coinbase txs have no vin so nothing is marked for them. Unlike the legacy
+        // mqc.vSpent source it is per-ConnectBlock-lifetime (already restricted to this block, no
+        // cumulative prior-block spends) so no position filter is needed, and anon-input prevouts
+        // never enter it (ConnectInputs skips IsAnonInput for ANON_TXN) exactly as the legacy
+        // authority excludes them. This branch performs ZERO legacy vSpent / txindex reads. The
+        // non-armed pilot/mirror instance (`-s16store3a` only, hardFail=false) keeps the legacy
+        // mqc.vSpent source below byte-identical.
+        if (v2View != NULL && v2View->armed())
+        {
+            for (std::map<cs::OutPoint, cs::Coin>::const_iterator it = v2View->consumed.begin();
+                 it != v2View->consumed.end(); ++it)
+                auth.spent.push_back(it->first);
+        }
+        else
+        {
+            // ---- legacy (non-V2) authority source, unchanged semantics ----
+            std::vector<CDiskTxPos> blockPos;
+            for (size_t ti = 0; ti < blk.vtx.size(); ++ti) {
+                uint256 htx = blk.vtx[ti].GetHash();
+                std::map<uint256,CTxIndex>::const_iterator hit = mqc.find(htx);
+                if (hit != mqc.end())
+                    blockPos.push_back(hit->second.pos);
+            }
+            for (std::map<uint256,CTxIndex>::const_iterator mi = mqc.begin(); mi != mqc.end(); ++mi) {
+                const CTxIndex& ti = mi->second;
+                for (size_t i = 0; i < ti.vSpent.size(); ++i) {
+                    if (ti.vSpent[i].IsNull()) continue;
+                    bool inThisBlock = false;
+                    for (size_t b = 0; b < blockPos.size(); ++b)
+                        if (ti.vSpent[i] == blockPos[b]) { inThisBlock = true; break; }
+                    if (!inThisBlock) continue;   // prior-block spend -> NOT a current-block spend
+                    cs::OutPoint op; memcpy(op.txid.data(), mi->first.begin(), 32); op.n = (uint32_t)i;
+                    auth.spent.push_back(op);
+                }
             }
         }
         std::vector<cs::OutPoint> dsOnly, asOnly;
@@ -7589,7 +7610,9 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     }
 
     // Write queued txindex changes
-    s16_ObserveConnectBlock(*this, mapQueuedChanges, pindex);   // S1.6-2: read-only observation (no-op unless enabled)
+    // S2.0-S1.7-G: pass the V2 input view so the authority gate can source this block's spends from
+    // `consumed` when armed (V2), instead of the file-empty mqc.vSpent. Unarmed (legacy/mirror) -> NULL.
+    s16_ObserveConnectBlock(*this, mapQueuedChanges, pindex, &v2View);   // S1.6-2: read-only observation (no-op unless enabled)
     // S1.9: when armed as V2 AUTHORITATIVE chainstate (hardFail), a Store3A authority-gate
     // failure (needsRecovery at THIS block) MUST refuse the block — fail-closed, no silent
     // legacy fallback. This is the authoritative property: Store3A divergence halts the node
