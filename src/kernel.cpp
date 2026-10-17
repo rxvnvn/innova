@@ -1399,10 +1399,30 @@ static int ReadStakeSourceTransactionV2(const CBlockIndex* pindexPrev,
     const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
     if (reader && reader->IsOpen())
     {
+        // S2.0-S1.7G: resolve the coinstake-source block against the FULL
+        // authoritative domain (immutable base generation FIRST, then the
+        // retained authoritative live tail) so a coin created in the retained
+        // live chain (creation height > base committed tip, e.g. a UTXO created
+        // after the seed was promoted) resolves to its correct source block.
+        // The base-generation-ONLY reader could not see any height above the
+        // seed committedTipHeight (8170668), so it returned NOT_FOUND for every
+        // coin that lived in the live tail and wrongly rejected a valid
+        // best-chain block. AuthoritativeGetActiveSnapshotByHeightR is the same
+        // composite base-then-live-tail by-height resolver the rest of the
+        // authoritative surface already uses (RPC/checkpoints/HReg); it matches
+        // ACTIVE members only, exactly like the base GetActiveByHeight it
+        // replaces. NOT_FOUND / NOT_ACTIVE / AUTHORITY_FAILURE now mean a
+        // genuine miss across BOTH authoritative sources (source beyond the
+        // live tip, or divergent chain) and still FAIL CLOSED. Safe under the
+        // caller's cs_main: this resolver and the live tail are self-locked and
+        // never re-enter cs_main.
         BlockIndexSnapshot snap; std::string err;
-        const BlockIndexV2ReadStatus st = reader->GetActiveByHeight((int)coin.height, &snap, &err);
-        if (st != BLOCK_INDEX_V2_READ_FOUND)
-            return -1;    // corrupt / io / not-found -> FAIL CLOSED
+        const AuthoritativeBlockResolutionResult res =
+            AuthoritativeGetActiveSnapshotByHeightR((int)coin.height, &snap, &err);
+        if (res != AUTHORITATIVE_BLOCK_FOUND)
+            return -1;    // authoritative base+tail cannot resolve -> FAIL CLOSED
+        if (!snap.found || snap.height != (int)coin.height)
+            return -1;    // active height/record mismatch -> FAIL CLOSED
         blockHash = snap.hash;
         nFile = snap.nFile;
         nBlockPos = snap.nBlockPos;

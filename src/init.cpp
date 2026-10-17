@@ -1970,37 +1970,56 @@ authoritative_startup_ready:
                 uint256 biTipHash = uint256(0);
                 if (!biReader || !biReader->IsOpen())
                     return InitError("Store3A V2 authoritative FAIL-CLOSED: authoritative Block Index V2 reader is not open (block index must come from BI-V2 in V2 store mode; legacy fallback is prohibited)");
-                // The active-chain tip by value at the Store3A tip height; a definitive
-                // miss or authority failure is a divergence -> fail closed.
-                BlockIndexV2ReadStatus bis = biReader->GetActiveByHeight((int)stH, &biSnap, &biErr);
-                if (bis == BLOCK_INDEX_V2_READ_FOUND)
-                {
-                    biTipHeight = biSnap.height;
-                    biTipHash = biSnap.hash;
-                }
-                else
-                {
+                // S2.0-S1.7G: resolve the active-chain tip BY VALUE against the FULL
+                // authoritative domain (immutable base generation FIRST, then the
+                // retained authoritative live tail), not just the base generation.
+                // On a node that has already promoted past the written seed (live tail
+                // retained in blockindex_tip, store tip == live tip, e.g. height 8170898),
+                // the base-generation-ONLY reader returns NOT_FOUND for stH above its
+                // committedTipHeight (8170668) and wrongly fails the restart gate. Using
+                // the same composite base-then-live-tail resolver as the kernel coinstake
+                // path serves every height within [baseGenTip, liveTip] and still FAILS
+                // CLOSED on a genuine miss (NOT_FOUND / NOT_ACTIVE / AUTHORITY_FAILURE).
+                const AuthoritativeBlockResolutionResult biRes =
+                    AuthoritativeGetActiveSnapshotByHeightR((int)stH, &biSnap, &biErr);
+                if (biRes != AUTHORITATIVE_BLOCK_FOUND)
                     return InitError(strprintf(
-                        "Store3A V2 authoritative FAIL-CLOSED: Block Index V2 cannot resolve the active block at height %d (status=%d %s). BI-V2 must agree with Store3A; no legacy fallback.",
-                        (int)stH, (int)bis, biErr.c_str()));
-                }
-                // Expected seed tip constant.
+                        "Store3A V2 authoritative FAIL-CLOSED: Block Index V2 cannot resolve the active block at height %d (resolution=%d %s). BI-V2 must agree with Store3A; no legacy fallback.",
+                        (int)stH, (int)biRes, biErr.c_str()));
+                if (!biSnap.found || biSnap.height != stH)
+                    return InitError("Store3A V2 authoritative FAIL-CLOSED: Block Index V2 active tip height/record mismatch.");
+                biTipHeight = biSnap.height;
+                biTipHash = biSnap.hash;
+                // Expected seed tip constant (the written seed snapshot boundary).
                 const int32_t kExpectedSeedHeight = 8170668;
                 const uint256 kExpectedSeedHash("f3d089eaa241ac54e3fcf4827987bb94cb71f774b1f9efd68c03d4e00713d784");
-                if (stH != kExpectedSeedHeight)
-                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: store tip height %d != expected seed height %d. Refusing to start on a divergent chain.",
+                // The Store3A tip must never regress below the trusted seed: a tip lower
+                // than the written seed is a fork/older chain and is refused.
+                if (stH < kExpectedSeedHeight)
+                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: store tip height %d is below the trusted seed height %d. Refusing to start on a divergent chain.",
                                                (int)stH, (int)kExpectedSeedHeight));
-                if (biTipHeight != kExpectedSeedHeight)
-                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: BI-V2 tip height %d != expected seed height %d. Refusing to start on a divergent chain.",
-                                               (int)biTipHeight, (int)kExpectedSeedHeight));
-                if (biTipHash != kExpectedSeedHash)
-                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: BI-V2 tip hash %s != expected seed hash %s.", biTipHash.GetHex().c_str(), kExpectedSeedHash.GetHex().c_str()));
-                if (stHash != kExpectedSeedHash)
-                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: store tip hash %s != expected seed hash %s.", stHash.GetHex().c_str(), kExpectedSeedHash.GetHex().c_str()));
-                if (biTipHash != stHash)
+                // Trusted-seed anchor, PROMOTION-AWARE: the ACTIVE chain at the seed height
+                // must resolve within the authoritative domain to the written seed block.
+                // This proves the current (possibly promoted) tip descends from the trusted
+                // seed. For a freshly-seeded store (stH == seed) this is exactly the old
+                // tip==seed equality; for a promoted store (stH > seed, e.g. 8170898) it
+                // binds the retained live tail back to the seed - replacing the old
+                // tip==seed equality, which could never hold once the node had promoted
+                // past the seed and therefore blocked auto-continue on restart.
+                {
+                    BlockIndexSnapshot seedSnap;
+                    std::string seedErr;
+                    const AuthoritativeBlockResolutionResult seedRes =
+                        AuthoritativeGetActiveSnapshotByHeightR(kExpectedSeedHeight, &seedSnap, &seedErr);
+                    if (seedRes != AUTHORITATIVE_BLOCK_FOUND || !seedSnap.found ||
+                        seedSnap.height != kExpectedSeedHeight || seedSnap.hash != kExpectedSeedHash)
+                        return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: authoritative chain does not descend from the trusted seed block at height %d (resolution=%d). Block index authority diverged.",
+                                         (int)kExpectedSeedHeight, (int)seedRes));
+                }
+                if (biTipHeight != stH || biTipHash != stHash)
                     return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: BI-V2 tip hash %s != Store3A tip hash %s at height %d. BI-V2 and Store3A must agree.",
                                                biTipHash.GetHex().c_str(), stHash.GetHex().c_str(), (int)stH));
-                printf("S2.0 BI-V2 authoritative startup VERIFIED: BI-V2 tip (h=%d %s) == Store3A tip (h=%d %s) == expected seed\n",
+                printf("S2.0 BI-V2 authoritative startup VERIFIED: BI-V2 tip (h=%d %s) == Store3A tip (h=%d %s), descends from trusted seed\n",
                        (int)biTipHeight, biTipHash.GetHex().c_str(), (int)stH, stHash.GetHex().c_str());
                 fflush(stdout);
             }
