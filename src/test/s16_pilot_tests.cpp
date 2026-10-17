@@ -206,6 +206,104 @@ std::string S16TxidHex(const std::array<uint8_t,32>& a) {
     uint256 h; memcpy(h.begin(), a.data(), 32); return h.GetHex();
 }
 
+// ---- S1.6-4: arbitrary real spend blocks (multi-spend chains + intra-block) ----
+struct SpendTx {            // one spend transaction to inject into a real block
+    std::array<uint8_t,32> inputTxid;  // input txid (external/fund) unless intraFrom set
+    uint32_t               inputN;
+    int64_t                outValue;   // created OP_TRUE output value
+    int                    intraFrom;  // >=0: input == spend[intraFrom]'s created output (same block)
+    SpendTx() : inputN(0), outValue(0), intraFrom(-1) {}
+};
+struct SpendOut {           // a spend tx's created output (captured from the accepted block)
+    std::array<uint8_t,32> txid;
+    int64_t value;
+};
+struct BlockRec {           // full record of one mined real block (for undo / reconnect reconstruction)
+    uint256    blockHash;
+    int32_t    height = -1;
+    S16Coin    cb;
+    std::vector<SpendOut>   spouts;   // spouts[i] = spend tx i's created output
+    std::vector<OutPoint>   inputs;   // inputs[i] = spend tx i's ACTUAL input outpoint (post intra-resolution)
+};
+
+// Mine and connect a REAL block: [coinbase, spend0, spend1, ... ]. Each spend tx
+// consumes one input (external outpoint or an in-block created output) and pays
+// a fixed 0.001 INNOVA fee, producing one OP_TRUE output. Official path:
+// CreateNewBlock -> CheckBlock -> ProcessBlock -> ConnectBlock.
+BlockRec S16MineBlock(const std::vector<SpendTx>& txs, uint32_t extra)
+{
+    CBlock* b = CreateNewBlock(pwalletMain, false, NULL, NULL);
+    BOOST_REQUIRE(b != NULL);
+    BOOST_REQUIRE(!b->vtx.empty() && !b->vtx[0].vout.empty());
+    b->nVersion = 1;
+    b->nTime = std::max((unsigned int)GetTime(),
+                        (unsigned int)(pindexBest->GetMedianTimePast() + 1));
+    b->hashPrevBlock = *pindexBest->phashBlock;
+    b->vtx[0].vin[0].scriptSig = CScript() << (pindexBest->nHeight + 1) << extra;
+    b->vtx[0].vout[0].scriptPubKey = CScript() << OP_TRUE;
+    const unsigned int blkTime = b->nTime;
+
+    std::vector<CTransaction> spTxs;
+    spTxs.reserve(txs.size());
+    for (size_t i = 0; i < txs.size(); ++i) {
+        CTransaction sp; sp.nVersion = 1;
+        CTxIn in;
+        in.prevout.n = txs[i].inputN;
+        if (txs[i].intraFrom < 0) { uint256 h; memcpy(h.begin(), txs[i].inputTxid.data(), 32); in.prevout.hash = h; }
+        else                        in.prevout.hash = uint256(0);   // resolved below
+        in.scriptSig.clear();
+        sp.vin.push_back(in);
+        CTxOut out; out.nValue = txs[i].outValue; out.scriptPubKey = CScript() << OP_TRUE;
+        sp.vout.push_back(out);
+        sp.nTime = blkTime;
+        spTxs.push_back(sp);
+    }
+    for (size_t i = 0; i < txs.size(); ++i)
+        if (txs[i].intraFrom >= 0)
+            spTxs[i].vin[0].prevout.hash = spTxs[(size_t)txs[i].intraFrom].GetHash();
+    for (size_t i = 0; i < spTxs.size(); ++i) b->vtx.push_back(spTxs[i]);
+    b->hashMerkleRoot = b->BuildMerkleTree();
+    const uint256 target = CBigNum().SetCompact(b->nBits).getuint256();
+    while (b->GetHash() > target && b->nNonce < 0xffffffff) ++b->nNonce;
+
+    BlockRec res;
+    CBlockIndex* idx = NULL; bool ok = false; uint256 h;
+    {
+        LOCK(cs_main);
+        h = b->GetHash();
+        const bool c = b->CheckBlock(true, true, true);
+        ok = c && ProcessBlock(NULL, b);
+        if (ok) idx = mapBlockIndex[h];
+    }
+    BOOST_REQUIRE_MESSAGE(ok, "pilot multi-tx block not accepted by ProcessBlock");
+    BOOST_REQUIRE(idx != NULL);
+
+    memcpy(res.cb.txid.data(), b->vtx[0].GetHash().begin(), 32);
+    res.cb.n = 0;
+    res.cb.value = b->vtx[0].vout[0].nValue;
+    res.cb.script.assign(b->vtx[0].vout[0].scriptPubKey.begin(), b->vtx[0].vout[0].scriptPubKey.end());
+    res.cb.height = idx->nHeight;
+    res.cb.blockHash = h;
+
+    for (size_t i = 0; i < spTxs.size(); ++i) {
+        SpendOut so; memcpy(so.txid.data(), b->vtx[1 + i].GetHash().begin(), 32); so.value = b->vtx[1 + i].vout[0].nValue;
+        res.spouts.push_back(so);
+        OutPoint op;
+        if (txs[i].intraFrom < 0) { memcpy(op.txid.data(), txs[i].inputTxid.data(), 32); op.n = txs[i].inputN; }
+        else { memcpy(op.txid.data(), res.spouts[(size_t)txs[i].intraFrom].txid.data(), 32); op.n = 0; }
+        res.inputs.push_back(op);
+    }
+    res.blockHash = h;
+    res.height = idx->nHeight;
+    delete b;
+    return res;
+}
+
+// Whole key-set / membership helpers.
+std::array<uint8_t,36> KeyOfTx(const std::array<uint8_t,32>& txid, uint32_t n) {
+    OutPoint o; memcpy(o.txid.data(), txid.data(), 32); o.n = n; return o.keyBytes();
+}
+
 bool StoreHas(const CommitStore3A& s, const OutPoint& k, Coin* out) {
     bool found = false; ChainError e;
     return s.get(k, out, &found, &e) && found;
@@ -215,6 +313,36 @@ int32_t StoreSize(const CommitStore3A& s) {
     std::vector<LeafEntry> ents; ChainError e;
     if (!const_cast<BTree&>(s.tree()).collectAll(&ents, &e)) return -1;
     return (int32_t)ents.size();
+}
+
+// Reconnect a mined real block into the store via the observation adapter:
+// reconstruct its ObservedBlock, observeDelta against the CURRENT store state,
+// and publish. Used for the reconnect leg of publish/restart/undo/reconnect.
+void ReconnectBlock(CommitStore3A& store, const BlockRec& r)
+{
+    ObservedBlock ob; ob.height = r.height;
+    ObservedTx cb; memcpy(cb.txid.data(), r.cb.txid.data(), 32);
+    cb.coinbase = true; cb.coinstake = false;
+    TxOut co; co.value = r.cb.value; co.script = r.cb.script; co.unspendable = false;
+    cb.vout.push_back(co);
+    ob.txs.push_back(cb);
+    for (size_t i = 0; i < r.spouts.size(); ++i) {
+        ObservedTx t; memcpy(t.txid.data(), r.spouts[i].txid.data(), 32);
+        t.coinbase = false; t.coinstake = false;
+        t.vin.push_back(r.inputs[i]);            // actual input outpoint (external or in-block)
+        TxOut to; to.value = r.spouts[i].value; to.script = r.cb.script; to.unspendable = false;
+        t.vout.push_back(to);
+        ob.txs.push_back(t);
+    }
+    GetPrevCoinFn gp = [&store](const OutPoint& p, Coin* c)->bool {
+        bool found = false; ChainError ce;
+        return store.get(p, c, &found, &ce) && found;
+    };
+    Delta d; ChainError de;
+    BOOST_REQUIRE_MESSAGE(observeDelta(ob, gp, &d, &de), "reobserve: " << de.str());
+    cs::Hash bh; memcpy(bh.data(), r.blockHash.begin(), 32);
+    ChainError pe;
+    BOOST_REQUIRE_MESSAGE(store.publish(d, bh, r.height, &pe), "reconnect publish: " << pe.str());
 }
 
 } // namespace
@@ -490,6 +618,152 @@ BOOST_AUTO_TEST_CASE(real_connectblock_spend_cycle)
     }
 
     // Restore global hook state (do not leak into other suites).
+    s16::g_chainObserve = old;
+}
+
+BOOST_AUTO_TEST_CASE(real_connectblock_multi_spend_chain)
+{
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("s16chain-%%%%-%%%%");
+    fs::create_directories(root);
+    const std::string dir = root.string();
+    CommitStore3A store; ChainError e;
+    BOOST_REQUIRE_MESSAGE(store.open(dir, &e), "store open: " << e.str());
+    s16::ChainObserveState old = s16::g_chainObserve;
+    s16::g_chainObserve.enabled = true; s16::g_chainObserve.store = &store;
+    s16::g_chainObserve.checkAuthority = true;
+    s16::g_chainObserve.fails = 0; s16::g_chainObserve.mismatch = 0;
+    const int64_t FEE = 100000;
+    try {
+        S16Coin c1 = S16Mine(0x8100u);                          // block 1: fund coinbase
+        std::vector<SpendTx> tx2; SpendTx t2; memcpy(t2.inputTxid.data(), c1.txid.data(), 32); t2.outValue = c1.value - FEE; tx2.push_back(t2);
+        BlockRec r2 = S16MineBlock(tx2, 0x8101u);               // block 2: spend c1 -> O1
+        std::vector<SpendTx> tx3; SpendTx t3; memcpy(t3.inputTxid.data(), r2.spouts[0].txid.data(), 32); t3.outValue = r2.spouts[0].value - FEE; tx3.push_back(t3);
+        BlockRec r3 = S16MineBlock(tx3, 0x8102u);               // block 3: spend O1 -> O2
+        std::vector<SpendTx> tx4; SpendTx t4; memcpy(t4.inputTxid.data(), r3.spouts[0].txid.data(), 32); t4.outValue = r3.spouts[0].value - FEE; tx4.push_back(t4);
+        BlockRec r4 = S16MineBlock(tx4, 0x8103u);               // block 4: spend O2 -> O3
+
+        // hook clean; adapter matches authority (spent = {c1, O1, O2})
+        BOOST_CHECK(s16::g_chainObserve.mismatch == 0);
+        BOOST_CHECK(s16::g_chainObserve.fails == 0);
+        BOOST_CHECK(s16::g_chainObserve.published == (uint64_t)4);
+        BOOST_CHECK(s16::g_chainObserve.lastOpError.empty());
+        BOOST_CHECK(s16::g_chainObserve.lastAuthorityMismatch.empty());
+
+        // final keys: {cb2, cb3, cb4, O3}
+        std::set<std::array<uint8_t,36> > k = StoreKeySet(store);
+        std::set<std::array<uint8_t,36> > exp;
+        exp.insert(KeyOf(r2.cb)); exp.insert(KeyOf(r3.cb)); exp.insert(KeyOf(r4.cb));
+        exp.insert(KeyOfTx(r4.spouts[0].txid, 0));
+        BOOST_CHECK_MESSAGE(k == exp, "chain final UTXO set (all intermediate spent+chained)");
+        BOOST_CHECK(StoreSize(store) == 4);
+        OutPoint pc1; memcpy(pc1.txid.data(), c1.txid.data(), 32); pc1.n = 0; Coin tmp; bool f;
+        BOOST_CHECK(store.get(pc1, &tmp, &f, &e) && !f);   // c1 spent
+        OutPoint po1; memcpy(po1.txid.data(), r2.spouts[0].txid.data(), 32); po1.n = 0;
+        BOOST_CHECK(store.get(po1, &tmp, &f, &e) && !f);   // O1 spent
+        OutPoint po2; memcpy(po2.txid.data(), r3.spouts[0].txid.data(), 32); po2.n = 0;
+        BOOST_CHECK(store.get(po2, &tmp, &f, &e) && !f);   // O2 spent
+        OutPoint po3; memcpy(po3.txid.data(), r4.spouts[0].txid.data(), 32); po3.n = 0; Coin o3;
+        BOOST_CHECK(store.get(po3, &o3, &f, &e) && f && o3.value == c1.value - 3 * FEE && o3.height == r4.height);
+        BOOST_TEST_MESSAGE("pilot-evidence chain: b2=" << r2.blockHash.GetHex() << " b3=" << r3.blockHash.GetHex()
+                           << " b4=" << r4.blockHash.GetHex() << " spent c1=" << S16TxidHex(c1.txid) << ":0->"
+                           << S16TxidHex(r2.spouts[0].txid) << "->" << S16TxidHex(r3.spouts[0].txid) << "->"
+                           << S16TxidHex(r4.spouts[0].txid) << " O3value=" << o3.value << " finalset=" << StoreSize(store));
+
+        // restart persistence
+        s16::g_chainObserve.enabled = false; store.close();
+        CommitStore3A s2; BOOST_REQUIRE_MESSAGE(s2.open(dir, &e), "reopen");
+        BOOST_CHECK(StoreKeySet(s2) == k);
+        s2.close();
+        BOOST_TEST_MESSAGE("pilot: chain close+reopen preserves post-chain set");
+
+        // disconnect reverse order r4, r3, r2
+        CommitStore3A s3; BOOST_REQUIRE_MESSAGE(s3.open(dir, &e), "undo open");
+        cs::Hash h4; memcpy(h4.data(), r4.blockHash.begin(), 32);
+        BOOST_REQUIRE_MESSAGE(s3.disconnect(h4, &e), "disconnect block4");
+        std::set<std::array<uint8_t,36> > e3; e3.insert(KeyOf(r2.cb)); e3.insert(KeyOf(r3.cb)); e3.insert(KeyOfTx(r3.spouts[0].txid, 0));
+        BOOST_CHECK(StoreKeySet(s3) == e3);   // {cb2, cb3, O2}
+        cs::Hash h3; memcpy(h3.data(), r3.blockHash.begin(), 32);
+        BOOST_REQUIRE_MESSAGE(s3.disconnect(h3, &e), "disconnect block3");
+        std::set<std::array<uint8_t,36> > e2; e2.insert(KeyOf(r2.cb)); e2.insert(KeyOfTx(r2.spouts[0].txid, 0));
+        BOOST_CHECK(StoreKeySet(s3) == e2);   // {cb2, O1}
+        cs::Hash h2; memcpy(h2.data(), r2.blockHash.begin(), 32);
+        BOOST_REQUIRE_MESSAGE(s3.disconnect(h2, &e), "disconnect block2");
+        std::set<std::array<uint8_t,36> > e1; e1.insert(KeyOf(c1));
+        BOOST_CHECK(StoreKeySet(s3) == e1);   // {c1}
+        BOOST_TEST_MESSAGE("pilot: chain reverse-disconnect (4,3,2) -> exactly {c1} (pre-fund spend state)");
+
+        // reconnect forward r2, r3, r4 -> identical final set
+        ReconnectBlock(s3, r2); BOOST_CHECK(StoreKeySet(s3) == e2);
+        ReconnectBlock(s3, r3); BOOST_CHECK(StoreKeySet(s3) == e3);
+        ReconnectBlock(s3, r4); BOOST_CHECK(StoreKeySet(s3) == k);
+        BOOST_TEST_MESSAGE("pilot: chain reconnect (2,3,4) -> identical final set");
+        s3.close();
+    } catch (const std::exception& ex) { store.close(); s16::g_chainObserve = old; BOOST_FAIL(std::string("chain pilot: ") + ex.what()); }
+    s16::g_chainObserve = old;
+}
+
+BOOST_AUTO_TEST_CASE(real_connectblock_intrablock_create_spend)
+{
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("s16intra-%%%%-%%%%");
+    fs::create_directories(root);
+    const std::string dir = root.string();
+    CommitStore3A store; ChainError e;
+    BOOST_REQUIRE_MESSAGE(store.open(dir, &e), "store open: " << e.str());
+    s16::ChainObserveState old = s16::g_chainObserve;
+    s16::g_chainObserve.enabled = true; s16::g_chainObserve.store = &store;
+    s16::g_chainObserve.checkAuthority = true;
+    s16::g_chainObserve.fails = 0; s16::g_chainObserve.mismatch = 0;
+    const int64_t FEE = 100000;
+    try {
+        S16Coin f = S16Mine(0x8200u);                          // block 1: fund coinbase
+        std::vector<SpendTx> btx;
+        SpendTx t1; memcpy(t1.inputTxid.data(), f.txid.data(), 32); t1.inputN = 0; t1.outValue = f.value - FEE; t1.intraFrom = -1; btx.push_back(t1); // TX1: spend f -> O
+        SpendTx t2; t2.intraFrom = 0; t2.inputN = 0; t2.outValue = (f.value - FEE) - FEE; btx.push_back(t2);                                        // TX2: spend O (intra) -> P
+        BlockRec r = S16MineBlock(btx, 0x8201u);               // block 2: [cb, TX1, TX2]
+
+        // hook clean; adapter matches authority (spent = {f, O})
+        BOOST_CHECK(s16::g_chainObserve.mismatch == 0);
+        BOOST_CHECK(s16::g_chainObserve.fails == 0);
+        BOOST_CHECK(s16::g_chainObserve.published == (uint64_t)2);
+        BOOST_CHECK(s16::g_chainObserve.lastOpError.empty());
+        BOOST_CHECK(s16::g_chainObserve.lastAuthorityMismatch.empty());
+
+        // final keys: {cb, P}; the intra-created O must NOT survive (net churn)
+        std::set<std::array<uint8_t,36> > k = StoreKeySet(store);
+        std::set<std::array<uint8_t,36> > exp; exp.insert(KeyOf(r.cb)); exp.insert(KeyOfTx(r.spouts[1].txid, 0));
+        BOOST_CHECK_MESSAGE(k == exp, "intra-block final set: no leftover O");
+        BOOST_CHECK(StoreSize(store) == 2);
+        OutPoint of; memcpy(of.txid.data(), f.txid.data(), 32); of.n = 0; Coin tmp; bool fnd;
+        BOOST_CHECK(store.get(of, &tmp, &fnd, &e) && !fnd);               // fund spent
+        OutPoint oo; memcpy(oo.txid.data(), r.spouts[0].txid.data(), 32); oo.n = 0;
+        BOOST_CHECK(store.get(oo, &tmp, &fnd, &e) && !fnd);               // intra-created O absent from final UTXO
+        OutPoint op; memcpy(op.txid.data(), r.spouts[1].txid.data(), 32); op.n = 0; Coin P;
+        BOOST_CHECK(store.get(op, &P, &fnd, &e) && fnd && P.value == f.value - 2 * FEE && P.height == r.height);
+        BOOST_TEST_MESSAGE("pilot-evidence intra: block=" << r.blockHash.GetHex() << " height=" << r.height
+                           << " fund=" << S16TxidHex(f.txid) << ":0 -> TX1O=" << S16TxidHex(r.spouts[0].txid)
+                           << " (spent same block) -> P=" << S16TxidHex(r.spouts[1].txid) << " value=" << P.value
+                           << " finalset=" << StoreSize(store) << " (O NOT present)");
+
+        // restart persistence
+        s16::g_chainObserve.enabled = false; store.close();
+        CommitStore3A s2; BOOST_REQUIRE_MESSAGE(s2.open(dir, &e), "reopen");
+        BOOST_CHECK(StoreKeySet(s2) == k);
+        s2.close();
+        BOOST_TEST_MESSAGE("pilot: intra close+reopen preserves post-block set (no leftover O)");
+
+        // disconnect -> exact pre-block state {f}
+        CommitStore3A s3; BOOST_REQUIRE_MESSAGE(s3.open(dir, &e), "undo open");
+        cs::Hash bh; memcpy(bh.data(), r.blockHash.begin(), 32);
+        BOOST_REQUIRE_MESSAGE(s3.disconnect(bh, &e), "intra disconnect");
+        std::set<std::array<uint8_t,36> > ef; ef.insert(KeyOf(f));
+        BOOST_CHECK(StoreKeySet(s3) == ef);
+        BOOST_CHECK(StoreSize(s3) == 1);
+        BOOST_TEST_MESSAGE("pilot: intra disconnect -> exactly {f} (pre-block state; O,P,stake all removed)");
+
+        // reconnect -> identical final {cb,P}
+        ReconnectBlock(s3, r); BOOST_CHECK(StoreKeySet(s3) == k);
+        s3.close();
+    } catch (const std::exception& ex) { store.close(); s16::g_chainObserve = old; BOOST_FAIL(std::string("intra pilot: ") + ex.what()); }
     s16::g_chainObserve = old;
 }
 
