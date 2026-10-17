@@ -36,6 +36,9 @@
 #include <string>
 #include <vector>
 #include <functional>
+#include <map>
+#include <cstring>
+#include <mutex>
 
 namespace txloc {
 
@@ -94,14 +97,49 @@ public:
     bool get(const unsigned char* txid /*32B*/, Loc* out, bool* found, ChainError* e) const;
     uint64_t count() const { return recordCount_; }
     bool opened() const { return fd_ >= 0; }
+
+    // ---- incremental IBD ingest (Item 1 slice 2) ---------------------------
+    // openDir manages a component directory: <dir>/txloc.dat (sorted merged main)
+    // + <dir>/txloc.dat.wal (durable pending tail). On open it loads the main
+    // file (validating) and REPLAYS the WAL into the bounded recent memtable, so
+    // a crash/restart recovers the tail WITHOUT full index rebuild. A stray
+    // <dir>/txloc.dat.tmp from an interrupted compaction is orphaned and removed.
+    bool openDir(const std::string& dir, bool* absent, ChainError* e);
+
+    // O(1) location side of the ingest:
+    bool add(const unsigned char* txid /*32B*/, const Loc& loc, ChainError* e);
+    // fsync the WAL (call once per committed block, under cs_main).
+    bool sync(ChainError* e);
+    // Merge the memtable into the sorted main file (atomic tmp+rename), then
+    // clear the memtable and truncate/re-create the WAL. Auto-invoked on add()
+    // when the memtable exceeds MEMTABLE_MAX; also call at clean shutdown.
+    bool compact(ChainError* e);
+    uint64_t memCount() const;   // for tests / RSS-bound assertions
+    size_t memTableBytes() const;
+
+    const std::string& dir() const { return dir_; }
 private:
     bool readHeader(ChainError* e);
     bool readRecord(uint64_t idx, unsigned char* txidOut, Loc* locOut, ChainError* e) const;
-    int fd_ = -1;
-    uint64_t recordCount_ = 0;
+    bool readMain(ChainError* e);                 // open+validate txloc.dat
+    bool writeMergedTrimWAL(ChainError* e);        // compact core
+    bool hadMain_ = false;                          // a merged main file existed at open
+    // map key = 32-byte txid; value = 48-byte Loc (keep-first).
+    struct Key { unsigned char b[32]; };
+    struct KeyCmp { bool operator()(const Key& a, const Key& b) const { return memcmp(a.b, b.b, 32) < 0; } };
+    std::map<Key, Loc, KeyCmp>* mem_ = nullptr;    // lazily allocated
+
+    std::string dir_;
+    std::string mainPath_, walPath_, tmpPath_;
+    mutable std::mutex mtx_;     // guards mem_/wal/add/compact/get
+    int fd_ = -1;              // main file (sorted, read-only after build)
+    int walFd_ = -1;           // WAL (append)
+    uint64_t recordCount_ = 0; // main-file record count (merged prefix only)
     uint32_t recordWidth_ = 0;
-    std::string indexPath_;
     std::vector<unsigned char> dirKeys_;   // boundary txid[32] every DIR_STEP
 };
+
+// Bounded recent-cache size for the ingested tail before a synchronous merge.
+const size_t MEMTABLE_MAX = (size_t)1u << 18;   // 262144 entries (~12 MiB of Loc)
 
 } // namespace txloc
