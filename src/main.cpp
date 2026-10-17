@@ -56,6 +56,10 @@ namespace fs = boost::filesystem;
 
 static bool AlreadyHave(CTxDB& txdb, const CInv& inv);
 
+// S2.0-M2b: Store3A-backed V2 transparent-input coin view; full definition near
+// s16_StoreAuthoritativeInputGate. ConnectInputs uses it only in the armed V2 mode.
+struct s16_V2InputView;
+
 //
 // Global state
 //
@@ -5716,9 +5720,82 @@ unsigned int CTransaction::GetP2SHSigOpCount(const MapPrevTx& inputs) const
     return nSigOps;
 }
 
-bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTxIndex>& mapTestPool, const CDiskTxPos& posThisTx,
-    const CBlockIndex* pindexBlock, bool fBlock, bool fMiner, unsigned int flags, bool fValidateSig)
+// ---------------------------------------------------------------------------
+// S2.0-M2b: STORE3A-BACKED V2 TRANSPARENT-INPUT VIEW (one per block connect).
+//
+// In the armed authoritative V2 instance ConnectInputs must source EVERY transparent input's
+// coin from this view -- never from the legacy txindex. `created` holds the outputs of the txs
+// EARLIER in this same block (a tx may spend only an output of a prior in-block tx; ordering is
+// enforced because addTxOutputs is called only after a tx's own validation finishes). Every other
+// coin resolves on demand from the authoritative CommitStore3A via store->get(). A coin found in
+// NEITHER `created` nor the store is a MISSING input and is REFUSED (fail-closed; no legacy
+// fallback), exactly as the M1 existence gate demands.
+//
+// `consumed` records outpoints already spent by earlier txs of THIS block so two in-block txs
+// cannot both spend the same coin: Store3A's tip does not advance until this block's Delta is
+// published by the observe hook, so on its own the store would return the unspent coin for a
+// second, in-block spend. The legacy path catches this through CTxIndex::vSpent inside
+// mapQueuedChanges; here the view's `consumed` set is the equivalent.
+struct s16_V2InputView
 {
+    const cs::store3a::CommitStore3A* store;
+    int32_t blockHeight;
+    std::map<cs::OutPoint, cs::Coin> created;    // outputs of EARLIER in-block txs (spendable)
+    std::map<cs::OutPoint, cs::Coin> consumed;   // outpoints already spent by earlier in-block txs
+
+    s16_V2InputView() : store(NULL), blockHeight(-1) {}
+    bool armed() const { return store != NULL; }
+    void arm(const cs::store3a::CommitStore3A* s, int32_t h) { store = s; blockHeight = h; }
+
+    // Resolve the coin backing one transparent prevout. `*local` = true when the coin was created
+    // earlier in this same block (from `created`); false when it comes from the authoritative store.
+    // Returns false when the coin is absent from both (=> REFUSE) or the store authority errors
+    // (=> fail-closed). Never consults the legacy txindex, and never falls back to it.
+    bool resolve(const cs::OutPoint& k, cs::Coin* out, bool* local) const
+    {
+        std::map<cs::OutPoint, cs::Coin>::const_iterator it = created.find(k);
+        if (it != created.end()) { if (out) *out = it->second; if (local) *local = true; return true; }
+        bool found = false; cs::ChainError e;
+        if (!store->get(k, out, &found, &e)) return false;  // store authority read error: fail-closed
+        if (!found) return false;                           // Store3A does not hold the coin: REFUSE
+        if (local) *local = false;
+        return true;
+    }
+
+    bool alreadyConsumed(const cs::OutPoint& k) const { return consumed.count(k) != 0; }
+    void markSpent(const cs::OutPoint& k) { consumed[k] = cs::Coin(); }
+
+    // Register a just-connected tx's outputs so a LATER tx of this block can spend them. Created
+    // coins carry THIS block's height, so a same-block spend is depth 0 and fails maturity exactly
+    // as the legacy path does. fCoinBase/fCoinStake mirror the creator tx so maturity + PoS
+    // classification are preserved.
+    void addTxOutputs(const CTransaction& tx)
+    {
+        const uint256 h = tx.GetHash();
+        for (size_t j = 0; j < tx.vout.size(); ++j) {
+            cs::OutPoint k; memcpy(k.txid.data(), h.begin(), 32); k.n = (uint32_t)j;
+            cs::Coin c;
+            c.value = tx.vout[j].nValue;
+            c.script.assign(tx.vout[j].scriptPubKey.begin(), tx.vout[j].scriptPubKey.end());
+            c.height = blockHeight;
+            c.fCoinBase = tx.IsCoinBase();
+            c.fCoinStake = tx.IsCoinStake();
+            created[k] = c;
+        }
+    }
+};
+
+bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTxIndex>& mapTestPool, const CDiskTxPos& posThisTx,
+    const CBlockIndex* pindexBlock, bool fBlock, bool fMiner, unsigned int flags, bool fValidateSig, s16_V2InputView* v2View /* = NULL */)
+{
+    // S2.0-M2b: the V2 (Store3A-authoritative) transparent-input path.
+    // When ConnectBlock passes an ARMED v2View, this transaction's TRANSPARENT inputs are validated
+    // EXCLUSIVELY from the Store3A coin view: presence, value/range, maturity, double-spend and the
+    // script all come from the store coin / intra-block view. The legacy `inputs` map (populated by
+    // FetchInputs from the legacy txindex) is NOT read for transparent coins in this mode, and NO
+    // legacy vSpent / mapTestPool change is written back -- the store is the writer via the observe
+    // hook's block Delta. The non-V2 legacy path below is byte-for-byte unchanged.
+    const bool fV2 = (v2View != NULL && v2View->armed());
     // Take over previous transactions' spent pointers
     // fBlock is true when this is called from AcceptBlock when a new best-block is added to the blockchain
     // fMiner is true when called from the internal bitcoin miner
@@ -5729,11 +5806,48 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
         // vector<CTxIndex> vTxindex;
         int64_t nValueIn = 0;
         int64_t nFees = 0;
+        std::map<unsigned int, cs::Coin> mapV2Coin;  // Store3A coin per transparent vin index (V2)
         for (unsigned int i = 0; i < vin.size(); i++)
         {
             if (nVersion == ANON_TXN_VERSION && vin[i].IsAnonInput())
                 continue;
             COutPoint prevout = vin[i].prevout;
+            if (fV2)
+            {
+                // ----- V2 (Store3A-authoritative) transparent-input presence / value / maturity -----
+                cs::OutPoint k; memcpy(k.txid.data(), prevout.hash.begin(), 32); k.n = prevout.n;
+                cs::Coin coin; bool local = false;
+                if (!v2View->resolve(k, &coin, &local))
+                {
+                    s16::ChainObserveState& st = s16::g_chainObserve;
+                    st.needsRecovery = true; ++st.fails;
+                    st.lastOpError = "V2 ConnectInputs: Store3A cannot supply transparent prevout";
+                    st.lastHeight = pindexBlock ? (int32_t)pindexBlock->nHeight : -1;
+                    return DoS(100, error("ConnectInputs() : V2 missing input %s (Store3A authority; no legacy fallback)", prevout.hash.ToString().substr(0,10).c_str()));
+                }
+                // Maturity: the store coin carries its creation height and coinbase/coinstake flags.
+                if (coin.fCoinBase || coin.fCoinStake)
+                {
+                    if (pindexBlock == NULL)
+                        return error("ConnectInputs() : maturity authority unavailable for %s (V2 Store3A)", coin.fCoinBase ? "coinbase" : "coinstake");
+                    int64_t nDepth = (int64_t)pindexBlock->nHeight - (int64_t)coin.height;
+                    if (nDepth < nCoinbaseMaturity)
+                        return error("ConnectInputs() : tried to spend %s at depth %d (V2 Store3A)", coin.fCoinBase ? "coinbase" : "coinstake", (int)nDepth);
+                }
+                // V2 TIMESTAMP: intentionally OMITTED -- Store3A coins carry no nTime. A block-time proxy
+                // would be STRICTER than the legacy tx-level rule (block time >= tx time is NOT guaranteed)
+                // and could reject a block the legacy path accepts, so it cannot be used. See the M2-b
+                // report (TIMESTAMP decision); this is the one documented consensus-parity gap.
+                //
+                // Value / range: from the store coin.
+                nValueIn += coin.value;
+                if (!MoneyRange(coin.value) || !MoneyRange(nValueIn))
+                    return DoS(100, error("ConnectInputs() : txin values out of range (V2 Store3A)"));
+                mapV2Coin[i] = coin;
+            }
+            else
+            {
+            // ----- legacy (non-V2), unchanged -----
             if (inputs.count(prevout.hash) == 0)
                 return DoS(100, error("ConnectInputs() : missing input %s", prevout.hash.ToString().c_str()));
             CTxIndex& txindex = inputs[prevout.hash].first;
@@ -5811,6 +5925,8 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
             if (!MoneyRange(txPrev.vout[prevout.n].nValue) || !MoneyRange(nValueIn))
                 return DoS(100, error("ConnectInputs() : txin values out of range"));
 
+            }   // end legacy (non-V2) else -> loop 1
+
         }
         // The first loop above does all the inexpensive checks.
         // Only if ALL inputs pass do we perform expensive ECDSA signature checks.
@@ -5821,6 +5937,55 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
                 && vin[i].IsAnonInput())
                 continue;
             COutPoint prevout = vin[i].prevout;
+            if (fV2)
+            {
+                // ----- V2 (Store3A-authoritative) double-spend + signature + mark spent -----
+                cs::OutPoint k; memcpy(k.txid.data(), prevout.hash.begin(), 32); k.n = prevout.n;
+
+                // Double-spend: a coin present in the store is unspent at tip by construction, but the
+                // store does not ADVANCE until this block's Delta is published, so a second in-block tx
+                // would resolve the same coin. The view's `consumed` set catches it (this is the V2
+                // equivalent of vSpent inside mapQueuedChanges in the legacy path).
+                if (v2View->alreadyConsumed(k))
+                {
+                    printf("WARNING: ConnectInputs() : %s V2 in-block double-spend attempt at %s\n",
+                           GetHash().ToString().substr(0,10).c_str(), prevout.ToString().c_str());
+                    return DoS(100, error("ConnectInputs() : %s prev tx already used (V2 in-block double-spend)", GetHash().ToString().substr(0,10).c_str()));
+                }
+                std::map<unsigned int, cs::Coin>::const_iterator ci = mapV2Coin.find(i);
+                if (ci == mapV2Coin.end())
+                    return DoS(100, error("ConnectInputs() : V2 internal: transparent coin for %s not resolved", prevout.ToString().c_str()));
+                const cs::Coin& coin = ci->second;
+                {
+                if (!(fBlock && (nBestHeight < Checkpoints::GetTotalBlocksEstimate())))
+                {
+                    // Verify the input against the STORE coin's script with exactly the same engine,
+                    // flags and sighash as the legacy VerifySignature(txPrev,...): VerifyScript(...)
+                    // computes the sighash over txTo (`*this`) and uses the prevout script. The task
+                    // initially suggested a synthetic prev-tx fed to VerifySignature; that is NOT used
+                    // because VerifySignature (script.cpp:2287) also requires txFrom.GetHash()==prevout.hash,
+                    // which is unsatisfiable from a store coin (the store holds only value/script/height/
+                    // flags, not the full prev-tx serialization). Store3A already binds the coin to
+                    // (txid,n) authoritatively, so that redundant re-binding is omitted -- script
+                    // semantics are otherwise identical to the legacy path.
+                    const CScript coinScript(coin.script.begin(), coin.script.end());
+                    if (!VerifyScript(vin[i].scriptSig, coinScript, *this, i, flags, 0))
+                    {
+                        if (flags & STANDARD_NOT_MANDATORY_VERIFY_FLAGS) {
+                            if (VerifyScript(vin[i].scriptSig, coinScript, *this, i, flags & ~STANDARD_NOT_MANDATORY_VERIFY_FLAGS, 0))
+                                return error("ConnectInputs() : %s non-mandatory VerifyScript failed (V2 Store3A)", GetHash().ToString().c_str());
+                        }
+                        return DoS(100, error("ConnectInputs() : %s VerifyScript failed (V2 Store3A)", GetHash().ToString().substr(0,10).c_str()));
+                    }
+                }
+                }
+                // Mark the outpoint spent in-block (V2). NO legacy vSpent / mapTestPool write (req 7):
+                // the store is the writer via the observe hook's block Delta.
+                v2View->markSpent(k);
+            }
+            else
+            {
+            // ----- legacy (non-V2), unchanged -----
             if (inputs.count(prevout.hash) == 0)
                 return DoS(100, error("ConnectInputs() : missing input %s", prevout.hash.ToString().c_str()));
             CTxIndex& txindex = inputs[prevout.hash].first;
@@ -5877,6 +6042,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
             //Push txPrev and txindex to vTxPrev and VTxIndex
             // vTxPrev.push_back(txPrev);
             // vTxindex.push_back(txindex);
+            }   // end legacy (non-V2) else -> loop 2
         }
         if (nVersion == ANON_TXN_VERSION)
         {
@@ -6423,6 +6589,16 @@ bool s16_StoreAuthoritativeInputGate(const CBlock& blk, int32_t height, std::str
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// S2.0-M2b: Store3A-backed V2 transparent-input view. The `s16_V2InputView` struct is defined just
+// before CTransaction::ConnectInputs (it must be a complete type there). This helper simply reports
+// whether the armed authoritative V2 instance is active -- identical to the M1/M2a gating condition.
+static inline bool s16_V2Armed()
+{
+    return s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+           s16::g_chainObserve.store && s16::g_chainObserve.store->opened();
+}
+
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 {
     ibdactivepath::ActivePathTimer ibdConnectTimer(
@@ -6500,6 +6676,15 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             return error("ConnectBlock() : Store3A V2 AUTHORITATIVE input gate FAILED at height %d (%s) — refused, no legacy fallback",
                          (int)pindex->nHeight, why.c_str());
     }
+
+    // S2.0-M2b: Store3A-backed transparent-input view for THIS block (V2 only). When armed,
+    // ConnectInputs below validates every transparent coin from the store / intra-block view and
+    // never from the legacy txindex. `created` grows as each tx connects (addTxOutputs below), so a
+    // tx may only spend outputs of EARLIER in-block txs -- a same-block spend is depth 0 -> immaturity,
+    // exactly as the legacy path behaves.
+    s16_V2InputView v2View;
+    if (s16_V2Armed())
+        v2View.arm(s16::g_chainObserve.store, (int32_t)pindex->nHeight);
 
     for (CTransaction& tx : vtx)
     {
@@ -6614,7 +6799,8 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             if (tx.IsCoinStake())
                 nStakeReward = nTxValueOut - nTxValueIn;
 
-            if (!tx.ConnectInputs(txdb, mapInputs, mapQueuedChanges, posThisTx, pindex, true, false, flags, true))
+            if (!tx.ConnectInputs(txdb, mapInputs, mapQueuedChanges, posThisTx, pindex, true, false, flags, true,
+                                  (v2View.armed() ? &v2View : NULL)))
                 return false;
 
             if (fHRegActive)
@@ -6642,6 +6828,12 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         vPos.push_back(std::make_pair(tx.GetHash(), pos));
         // pos.nTxOffset += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
         pos.nTxPos += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
+
+        // S2.0-M2b: after a tx validates, publish its outputs into the V2 view so a LATER tx in this
+        // block may spend them (Store3A-only; the observe hook advances the store with the whole block
+        // Delta after the loop).
+        if (v2View.armed())
+            v2View.addTxOutputs(tx);
     }
 
     //int64_t nTime1 = GetTimeMicros(); nTimeConnect += nTime1 - nTimeStart;
