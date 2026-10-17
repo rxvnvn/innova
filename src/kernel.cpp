@@ -16,6 +16,7 @@
 #include "ibdmetrics.h"
 #include "wallet.h"
 #include "init.h"
+#include "chainstate/observe_hook.h"   // S2.0-V2 kernel-source: V2 armed gate + Store3A authority
 
 using namespace std;
 
@@ -1302,35 +1303,16 @@ static bool SearchCandidateSuffixNavigated(const ColdHotSeamNavigator* nav,
     return false;
 }
 
-static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
+// S2.0-V2 kernel-source: candidate (side-)branch suffix search for the coinstake
+// source tx. Reads the side branch's BLOCK FILES by-value (never the legacy
+// LevelDB txindex): via the BI-V2 staking navigator when retained, else a
+// resident pprev walk. Mirrors the legacy suffix search that used to live inline
+// in ReadStakeSourceTransactionInternal -- same semantics, now shared so the V2
+// branch can reach it WITHOUT ever touching the legacy txindex.
+static bool SearchCandidateSuffix(const CBlockIndex* pindexPrev,
     const COutPoint& prevout, CTransaction& txPrev, CTxIndex& txindex,
     CBlock& blockFrom, const std::map<uint256, CBlock>* candidateBlocksForTesting)
 {
-    CTxDB txdb("r");
-    if (txPrev.ReadFromDisk(txdb, prevout, txindex) &&
-        blockFrom.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
-    {
-        // A.9a.3c: when a production navigator is retained, the source-ancestry
-        // authority is resolved by-value (no resident mapBlockIndex/CBlockIndex* /
-        // continuous pprev topology). A navigator authority failure FAILS CLOSED
-        // (never a residency fallback, never a mis-validation). Only when NO
-        // production navigator exists (pre-A.10, everything materialized) do we
-        // use the legacy pointer check.
-        const ColdHotSeamNavigator* pNav = GetBlockIndexStakingNavigator();
-        if (pNav)
-        {
-            const int navAncestry = IsBlockInCandidateAncestryNavigated(blockFrom.GetHash(), pindexPrev);
-            if (navAncestry < 0)
-                return false; // authority failure -> fail closed
-            return navAncestry == 1;
-        }
-        std::map<uint256, CBlockIndex*>::const_iterator mi =
-            mapBlockIndex.find(blockFrom.GetHash());
-        if (mi != mapBlockIndex.end() &&
-            IsBlockInCandidateAncestry(mi->second, pindexPrev))
-            return true;
-    }
-
     // Transactions from an unconnected side branch are deliberately absent
     // from the connected-chain tx index. Search only the candidate suffix.
     // A.9a.3d: when a production navigator is retained, walk the candidate
@@ -1369,7 +1351,6 @@ static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
             GetSizeOfCompactSize(block.vtx.size());
         for (std::vector<CTransaction>::const_iterator it = block.vtx.begin();
              it != block.vtx.end(); ++it)
-
         {
             if (it->GetHash() == prevout.hash)
             {
@@ -1384,6 +1365,172 @@ static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
         }
     }
     return false;
+}
+
+// S2.0-V2 kernel-source: MAIN-CHAIN coinstake-source resolution in the armed
+// authoritative Store3A instance. The staked UTXO is resolved from Store3A
+// (Coin.value/script/nTime/height) -- NEVER the legacy txindex; its source block
+// (hash, time, disk position) is resolved BY VALUE from Block-Index-V2
+// GetActiveByHeight at the coin's creation height, with a resident pprev-walk
+// fallback ONLY when no authoritative by-value reader exists. Returns:
+//    1  -> source fully resolved (txPrev/txindex/blockFrom populated);
+//    0  -> coin is genuinely NOT in Store3A -> the source may live on a candidate
+//          (as-yet-unconnected) side branch; caller should run SearchCandidateSuffix;
+//   -1  -> Store3A / BI-V2 authority failure, or any divergence -> FAIL CLOSED
+//          (caller must reject; never a legacy-txindex read, never a proxy).
+static int ReadStakeSourceTransactionV2(const CBlockIndex* pindexPrev,
+    const COutPoint& prevout, CTransaction& txPrev, CTxIndex& txindex,
+    CBlock& blockFrom)
+{
+    if (!pindexPrev)
+        return -1;
+    AssertLockHeld(cs_main);
+
+    // 1. Authoritative Store3A coin for the staked UTXO.
+    cs::OutPoint k; memcpy(k.txid.data(), prevout.hash.begin(), 32); k.n = prevout.n;
+    cs::Coin coin; bool found = false; cs::ChainError ce;
+    if (!s16::g_chainObserve.store->get(k, &coin, &found, &ce))
+        return -1;    // Store3A authority read error -> FAIL CLOSED
+    if (!found)
+        return 0;     // coin absent from the committed V2 chain
+
+    // 2. Source block by-value from BI-V2 at the coin's creation height.
+    uint256 blockHash(0); unsigned int nFile = 0, nBlockPos = 0;
+    const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
+    if (reader && reader->IsOpen())
+    {
+        BlockIndexSnapshot snap; std::string err;
+        const BlockIndexV2ReadStatus st = reader->GetActiveByHeight((int)coin.height, &snap, &err);
+        if (st != BLOCK_INDEX_V2_READ_FOUND)
+            return -1;    // corrupt / io / not-found -> FAIL CLOSED
+        blockHash = snap.hash;
+        nFile = snap.nFile;
+        nBlockPos = snap.nBlockPos;
+    }
+    else
+    {
+        // No authoritative by-value reader: resident pprev-walk fallback ONLY
+        // (matching s16_V2PrevBlockTime); never the legacy txindex.
+        const CBlockIndex* p = pindexBest;
+        while (p && p->nHeight > (int)coin.height)
+            p = p->pprev;
+        if (!p || p->nHeight != (int)coin.height)
+            return -1;    // in range but not on the active chain -> FAIL CLOSED
+        blockHash = p->GetBlockHash();
+        nFile = p->nFile;
+        nBlockPos = p->nBlockPos;
+    }
+
+    // 3. Read the source block from disk to locate the source tx and compute its
+    //    exact byte offset within the block (the legacy txindex's
+    //    nTxPos - nBlockPos, required BYTE-FOR-BYTE by the kernel hash).
+    if (!blockFrom.ReadFromDisk(nFile, nBlockPos, true))
+        return -1;    // source block not on disk -> FAIL CLOSED
+    if (blockFrom.GetHash() != blockHash)
+        return -1;    // on-disk block diverges from the BI-V2 authority
+
+    unsigned int nTxPos = nBlockPos +
+        ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
+        (2 * GetSizeOfCompactSize(0)) +
+        GetSizeOfCompactSize(blockFrom.vtx.size());
+    bool fFound = false;
+    for (std::vector<CTransaction>::const_iterator it = blockFrom.vtx.begin();
+         it != blockFrom.vtx.end(); ++it)
+    {
+        if (it->GetHash() == prevout.hash)
+        {
+            txPrev = *it;
+            txindex = CTxIndex(CDiskTxPos(nFile, nBlockPos, nTxPos), txPrev.vout.size());
+            fFound = true;
+            break;
+        }
+        nTxPos += ::GetSerializeSize(*it, SER_DISK, CLIENT_VERSION);
+    }
+    if (!fFound)
+        return -1;    // creator tx not in its resolved source block -> FAIL CLOSED
+
+    // 4. Divergence guard: the Store3A coin (the consensus authority for the
+    //    staked commitment) must agree with the source tx prevout read from disk.
+    if ((unsigned int)prevout.n >= txPrev.vout.size())
+        return -1;
+    if (txPrev.vout[prevout.n].nValue != coin.value)
+        return -1;
+    if (txPrev.vout[prevout.n].scriptPubKey != CScript(coin.script.begin(), coin.script.end()))
+        return -1;
+    if ((int64_t)txPrev.nTime != (int64_t)coin.nTime)
+        return -1;
+
+    // 5. Ancestry: the source block must be an ancestor of pindexPrev. The coin
+    //    is already known to be on the committed V2 chain (it came from Store3A),
+    //    so a non-ancestor is DIVERGENT state (pindexPrev not derived from this
+    //    chain) and FAILS CLOSED -- it is NEVER treated as a candidate side-branch
+    //    (the legacy navigator path also rejects in this case; we never accept a
+    //    divergent coinstake). Resolved by-value via the BI-V2 staking navigator;
+    //    a resident pointer check runs only when no authoritative navigator exists.
+    const ColdHotSeamNavigator* pNav = GetBlockIndexStakingNavigator();
+    if (pNav)
+    {
+        const int navAncestry = IsBlockInCandidateAncestryNavigated(blockHash, pindexPrev);
+        if (navAncestry <= 0)
+            return -1;    // authority failure OR source-not-ancestor -> FAIL CLOSED
+        return 1;
+    }
+    std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(blockHash);
+    if (mi == mapBlockIndex.end() ||
+        !IsBlockInCandidateAncestry(mi->second, pindexPrev))
+        return -1;    // resident authority cannot confirm ancestry -> FAIL CLOSED
+    return 1;
+}
+
+static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
+    const COutPoint& prevout, CTransaction& txPrev, CTxIndex& txindex,
+    CBlock& blockFrom, const std::map<uint256, CBlock>* candidateBlocksForTesting)
+{
+    // S2.0-V2 kernel-source: in the armed authoritative Store3A instance the
+    // coinstake-source prevout is resolved from Store3A + by-value BI-V2, NEVER
+    // from the legacy txindex. The gate is byte-for-byte the V2 mode predicate
+    // (s16_V2Armed: enabled && hardFail && store opened). A Store3A/BI-V2
+    // authority failure or any divergence FAILS CLOSED (rejects) -- never a
+    // legacy fallback, never a proxy. Non-V2 keeps the legacy path unchanged.
+    if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+        s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
+    {
+        const int rc = ReadStakeSourceTransactionV2(pindexPrev, prevout, txPrev, txindex, blockFrom);
+        if (rc == 1) return true;    // resolved from Store3A + BI-V2
+        if (rc < 0)  return false;   // authority failure / divergence -> FAIL CLOSED (reject)
+        // rc == 0: coin not on the committed V2 chain -> the source may be on a
+        // candidate side-branch; resolve it by-value (block files only, never txindex).
+        return SearchCandidateSuffix(pindexPrev, prevout, txPrev, txindex, blockFrom, candidateBlocksForTesting);
+    }
+
+    CTxDB txdb("r");
+    if (txPrev.ReadFromDisk(txdb, prevout, txindex) &&
+        blockFrom.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+    {
+        // A.9a.3c: when a production navigator is retained, the source-ancestry
+        // authority is resolved by-value (no resident mapBlockIndex/CBlockIndex* /
+        // continuous pprev topology). A navigator authority failure FAILS CLOSED
+        // (never a residency fallback, never a mis-validation). Only when NO
+        // production navigator exists (pre-A.10, everything materialized) do we
+        // use the legacy pointer check.
+        const ColdHotSeamNavigator* pNav = GetBlockIndexStakingNavigator();
+        if (pNav)
+        {
+            const int navAncestry = IsBlockInCandidateAncestryNavigated(blockFrom.GetHash(), pindexPrev);
+            if (navAncestry < 0)
+                return false; // authority failure -> fail closed
+            return navAncestry == 1;
+        }
+        std::map<uint256, CBlockIndex*>::const_iterator mi =
+            mapBlockIndex.find(blockFrom.GetHash());
+        if (mi != mapBlockIndex.end() &&
+            IsBlockInCandidateAncestry(mi->second, pindexPrev))
+            return true;
+    }
+
+    // Transactions from an unconnected side branch are deliberately absent
+    // from the connected-chain tx index. Search only the candidate suffix.
+    return SearchCandidateSuffix(pindexPrev, prevout, txPrev, txindex, blockFrom, candidateBlocksForTesting);
 }
 bool ReadStakeSourceTransaction(const CBlockIndex* pindexPrev,
     const COutPoint& prevout, CTransaction& txPrev, CTxIndex& txindex,
