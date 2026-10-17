@@ -6363,6 +6363,66 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
     ++st.published; st.lastOps = d.ops.size(); st.lastHeight = pindex->nHeight;
 }
 
+// ---------------------------------------------------------------------------
+// S2.0-M1: Store3A-AUTHORITATIVE TRANSPARENT-INPUT EXISTENCE GATE.
+//
+// In the armed V2 instance every transparent spend prevout must exist as an unspent
+// coin in the authoritative Store3A (or be created earlier in this same block). A spend
+// of a coin Store3A does not hold is REFUSED (fail-closed) and is NEVER resolved from the
+// legacy txindex: missing UTXO in Store3A is a consensus error by the V2 authority.
+// Built on the battle-tested observeDelta adapter (intra-block visibility, maturity/BIP30
+// posture, fail-closed on an unobservable external prevout). This is the first increment
+// (input EXISTENCE) of the zero-legacy consensus read-path cutover; value/script/maturity
+// sourced from Store3A coins is the following increment (M2).
+bool s16_StoreAuthoritativeInputGate(const CBlock& blk, int32_t height, std::string* reason)
+{
+    s16::ChainObserveState& st = s16::g_chainObserve;
+    if (!st.enabled || !st.hardFail || !st.store || !st.store->opened())
+        return true;   // not the armed authoritative V2 instance
+
+    cs::ObservedBlock ob;
+    ob.height = height;
+    ob.txs.reserve(blk.vtx.size());
+    for (size_t ti = 0; ti < blk.vtx.size(); ++ti) {
+        const CTransaction& tx = blk.vtx[ti];
+        cs::ObservedTx o;
+        memcpy(o.txid.data(), tx.GetHash().begin(), 32);
+        o.coinbase  = tx.IsCoinBase();
+        o.coinstake = tx.IsCoinStake();
+        for (size_t i = 0; i < tx.vin.size(); ++i) {
+            const CTxIn& in = tx.vin[i];
+            if (in.IsAnonInput()) continue;
+            cs::OutPoint p;
+            memcpy(p.txid.data(), in.prevout.hash.begin(), 32);
+            p.n = in.prevout.n;
+            o.vin.push_back(p);
+        }
+        for (size_t j = 0; j < tx.vout.size(); ++j) {
+            const CTxOut& tv = tx.vout[j];
+            cs::TxOut to;
+            to.value = tv.nValue;
+            to.script.assign(tv.scriptPubKey.begin(), tv.scriptPubKey.end());
+            to.unspendable = tv.scriptPubKey.IsUnspendable();
+            o.vout.push_back(to);
+        }
+        ob.txs.push_back(o);
+    }
+
+    cs::GetPrevCoinFn gp = [&st](const cs::OutPoint& k, cs::Coin* c)->bool {
+        bool found = false; cs::ChainError e;
+        if (!st.store->get(k, c, &found, &e)) return false;
+        return found;
+    };
+    cs::Delta d; cs::ChainError ce;
+    if (!cs::observeDelta(ob, gp, &d, &ce)) {
+        st.needsRecovery = true; ++st.fails;
+        st.lastOpError = ce.str(); st.lastHeight = height;
+        if (reason) *reason = ce.str();
+        return false;   // spends a coin Store3A does not hold: REFUSE, no legacy read
+    }
+    return true;
+}
+
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 {
     ibdactivepath::ActivePathTimer ibdConnectTimer(
@@ -6430,6 +6490,16 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     hreg::RegistryState hregShadowState;
     if (fHRegActive)
         hregShadowState = hreg::g_registry;
+
+    // S2.0-M1: Store3A-authoritative transparent-input existence gate (V2 mode only).
+    // Runs BEFORE any legacy input resolution so a spend of a coin Store3A does not hold
+    // is refused here, never resolved from the legacy txindex.
+    {
+        std::string why;
+        if (!s16_StoreAuthoritativeInputGate(*this, (int32_t)pindex->nHeight, &why))
+            return error("ConnectBlock() : Store3A V2 AUTHORITATIVE input gate FAILED at height %d (%s) — refused, no legacy fallback",
+                         (int)pindex->nHeight, why.c_str());
+    }
 
     for (CTransaction& tx : vtx)
     {
