@@ -6519,11 +6519,29 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         // Now that the whole chain is irreversibly beyond that time it is applied to all blocks except the
         // two in the chain that violate it. This prevents exploiting the issue against nodes in their
         // initial block download.
-        CTxIndex txindexOld;
-        if (txdb.ReadTxIndex(hashTx, txindexOld)) {
-            for (CDiskTxPos &pos : txindexOld.vSpent)
-                if (pos.IsNull())
-                    return false;
+        // S2.0-M2a: BIP30 duplicate-txid check.
+        // V2 mode: authority is Store3A (zero legacy read). A txid that already has an
+        // UNSPENT output in the authoritative store is refused. Non-V2 keeps legacy behavior.
+        if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail && s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
+        {
+            bool found = false; cs::ChainError be;
+            cs::Hash htx; memcpy(htx.data(), hashTx.begin(), 32);
+            if (!s16::g_chainObserve.store->existsUnspentTxid(htx, &found, &be)) {
+                s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+                return error("ConnectBlock() : Store3A existsUnspentTxid failed for %s (%s) — BIP30 authority unavailable, fail-closed",
+                             hashTx.ToString().substr(0,10).c_str(), be.str().c_str());
+            }
+            if (found)
+                return false;   // txid already present with an unspent output in Store3A (BIP30)
+        }
+        else
+        {
+            CTxIndex txindexOld;
+            if (txdb.ReadTxIndex(hashTx, txindexOld)) {
+                for (CDiskTxPos &pos : txindexOld.vSpent)
+                    if (pos.IsNull())
+                        return false;
+            }
         }
 
         nSigOps += tx.GetLegacySigOpCount();
