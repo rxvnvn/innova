@@ -238,7 +238,7 @@ bool Manifest::decode(const uint8_t* d, size_t n, Manifest* m, ChainError* e) {
     if (n<108 || memcmp(d,magic,8)!=0){ setErr(e,ErrCode::BAD_SERIALIZE,"manifest magic/size"); return false; }
     size_t off=8; uint32_t ver=0,sz=0;
     if(!getU32(d,n,&off,&ver)||!getU32(d,n,&off,&sz)){ setErr(e,ErrCode::BAD_SERIALIZE,"manifest hdr"); return false; }
-    if(ver!=1u){ setErr(e,ErrCode::UNKNOWN_VERSION,"manifest version "+std::to_string(ver)); return false; }
+    if(ver!=2u){ setErr(e,ErrCode::UNKNOWN_VERSION,"store format version "+std::to_string(ver)+" (expected 2; version <2 predates the Coin.nTime field and CANNOT be opened by this build - reconvert the store, do not reinterpret)"); return false; }
     if((size_t)sz!=n){ setErr(e,ErrCode::CORRUPT,"manifest size mismatch"); return false; }
     uint64_t gen=0,us=0; uint32_t rp=0;
     if(!getU64(d,n,&off,&gen)||!getU64(d,n,&off,&us)||!getU32(d,n,&off,&rp)){ setErr(e,ErrCode::BAD_SERIALIZE,"manifest gen"); return false; }

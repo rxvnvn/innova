@@ -10,7 +10,7 @@
 namespace cs { namespace store3a {
 
 struct Manifest {
-    uint32_t formatVersion = 1;
+    uint32_t formatVersion = 2;
     uint64_t generation = 0;
     uint64_t undoSize = 0;
     uint32_t rootPageId = 0;
