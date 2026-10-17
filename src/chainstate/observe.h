@@ -45,6 +45,7 @@ struct ObservedTx {
     Hash txid;
     bool coinbase  = false;   // tx.IsCoinBase()
     bool coinstake = false;   // tx.IsCoinStake()
+    int32_t nTime  = 0;       // S2.0-M2-c: tx.nTime (carried into created coins' Coin.nTime)
     std::vector<OutPoint> vin;   // TRANSPARENT (non-anon-input) prevouts, in order
     std::vector<TxOut>    vout;  // the block's real outputs (value + script bytes)
 };

@@ -222,7 +222,7 @@ int main(int argc, char** argv)
                     if(o.IsAnonOutput()){ ++anon; continue; }        // transparent-projection boundary
                     cs::OutPoint op; memcpy(op.txid.data(),txid.begin(),32); op.n=(uint32_t)j;
                     Coin c; c.value=o.nValue; c.script.assign(o.scriptPubKey.begin(),o.scriptPubKey.end());
-                    c.height=v[k].height; c.fCoinBase=fcb; c.fCoinStake=fcs;
+                    c.height=v[k].height; c.nTime=tx.nTime; c.fCoinBase=fcb; c.fCoinStake=fcs;
                     std::vector<uint8_t> enc=c.encode();
                     ChainError se; if(!store.tree().seedPut(op.keyBytes(),enc,&se)){ ++seedErr; if(seedErr>100000) break; }
                     else ++live;

@@ -16,6 +16,7 @@ Coin coinFor(const ObservedTx& tx, uint32_t j, int32_t height) {
         c.script = tx.vout[j].script;
     }
     c.height     = height;
+    c.nTime      = tx.nTime;   // S2.0-M2-c: creator tx nTime -> restored ppcoin timestamp rule
     c.fCoinBase  = tx.coinbase;
     c.fCoinStake = tx.coinstake;
     return c;

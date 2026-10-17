@@ -5736,6 +5736,38 @@ unsigned int CTransaction::GetP2SHSigOpCount(const MapPrevTx& inputs) const
 // published by the observe hook, so on its own the store would return the unspent coin for a
 // second, in-block spend. The legacy path catches this through CTxIndex::vSpent inside
 // mapQueuedChanges; here the view's `consumed` set is the equivalent.
+// S2.0-M2-c helper: resolve the header time of the block that CREATED a spent
+// coin (its Store3A creation height) BY VALUE -- Block-Index-V2 GetActiveByHeight
+// when the authoritative by-value reader is open, else a resident pprev walk from
+// pindexBest. NEVER the legacy txindex, and NEVER a block-time proxy. Fail-closed:
+// an unresolvable authority returns false (the caller must reject, never substitute
+// zero or the spending block's own time -- that would change coin-age semantics).
+static bool s16_V2PrevBlockTime(int32_t coinHeight, int64_t* outTime)
+{
+    const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
+    if (reader && reader->IsOpen())
+    {
+        BlockIndexSnapshot snap;
+        std::string err;
+        if (reader->GetActiveByHeight((int)coinHeight, &snap, &err) == BLOCK_INDEX_V2_READ_FOUND)
+        {
+            *outTime = (int64_t)snap.nTime;
+            return true;
+        }
+    }
+    for (const CBlockIndex* p = pindexBest; p; p = p->pprev)
+    {
+        if (p->nHeight == (int)coinHeight)
+        {
+            *outTime = (int64_t)p->nTime;
+            return true;
+        }
+        if (p->nHeight < (int)coinHeight)
+            break;   // walked past the target: not on the active chain -> fail closed
+    }
+    return false;
+}
+
 struct s16_V2InputView
 {
     const cs::store3a::CommitStore3A* store;
@@ -5778,10 +5810,136 @@ struct s16_V2InputView
             c.value = tx.vout[j].nValue;
             c.script.assign(tx.vout[j].scriptPubKey.begin(), tx.vout[j].scriptPubKey.end());
             c.height = blockHeight;
+            c.nTime = tx.nTime;             // S2.0-M2-c: creator tx nTime -> ppcoin timestamp rule
             c.fCoinBase = tx.IsCoinBase();
             c.fCoinStake = tx.IsCoinStake();
             created[k] = c;
         }
+    }
+
+    // ---------------------------------------------------------------------------
+    // S2.0-M2-c: STORE3A-BACKED PREV-TX MAP FOR THE LEGACY mapInputs CONSUMERS.
+    //
+    // In the armed V2 path ConnectBlock must NOT call FetchInputs (no legacy
+    // txindex read). The per-input data the four in-V2 consumers read --
+    // GetValueIn(), GetP2SHSigOpCount(), hreg::ApplyConnectedTx(), and the
+    // cold-stake P2CS checks -- all reduce to the resolved prevout's
+    // value/script and, for HREG, its creator coinbase/coinstake flag and its
+    // spent status. This method materialises those EXACTLY from the Store3A
+    // coin view (resolve(): `created` intra-block map, else the authoritative
+    // store) into a MapPrevTx so every consumer runs unchanged, with ZERO
+    // legacy txindex reads.
+    //
+    // The synthesised prev-tx/CTxIndex are sized and flagged to mirror the
+    // legacy FetchInputs producer for the RESOLVED vins:
+    //   * vout[prevout.n]  = {value=coin.value, script=CScript(coin.script)}
+    //   * txPrev.IsCoinBase()/IsCoinStake() encode the coin's fCoinBase/fCoinStake
+    //     structurally (coinbase: single null input + >=1 vout; coinstake: first
+    //     output empty + a non-null input), exactly as the real creator tx reads.
+    //     For a coinbase creator prevout.n is always 0 (one reward output); for a
+    //     coinstake creator prevout.n >= 1 (vout[0] is the empty marker), so the
+    //     structural markers never mask a real referenced output.
+    //   * vSpent[prevout.n].IsNull() == true for every resolved vin: ConnectInputs has
+    //     already rejected any true double spend (a prior in-block tx spending the same
+    //     outpoint fails the block first), and it marks a tx's OWN inputs on a BY-VALUE
+    //     copy of mapInputs, so the caller's legacy map is frozen at the pre-connect spent
+    //     state -- exactly where these consumers read it.
+    // Unresolved prevouts fail closed (returns false): the M1 gate / ConnectInputs
+    // have already refused such a tx, so reaching here with a missing coin is a
+    // store authority error, never a repairable miss.
+    bool v2MapPrevTx(const CTransaction& tx, MapPrevTx* out) const
+    {
+        out->clear();
+        for (unsigned int i = 0; i < tx.vin.size(); ++i)
+        {
+            if (tx.nVersion == ANON_TXN_VERSION && tx.vin[i].IsAnonInput())
+                continue;   // anon inputs are consumed via the nullifier/CAnonOutput store, never CTxIndex
+            const COutPoint prevout = tx.vin[i].prevout;
+            cs::OutPoint k; memcpy(k.txid.data(), prevout.hash.begin(), 32); k.n = prevout.n;
+            cs::Coin coin; bool local = false;
+            if (!resolve(k, &coin, &local))
+                return false;   // fail-closed (Store3A authority cannot supply the prevout)
+            MapPrevTx::iterator mi = out->find(prevout.hash);
+            if (mi == out->end())
+            {
+                CTransaction txPrev;
+                CTxIndex txindex(CDiskTxPos(0, 0, 0), (unsigned int)prevout.n + 1);
+                for (unsigned int j = 0; j < txindex.vSpent.size(); ++j)
+                    txindex.vSpent[j] = CDiskTxPos(1, 1, 1);   // spent by default; resolved indices flipped below
+                txPrev.vout.resize(prevout.n + 1);
+                if (coin.fCoinBase)
+                    txPrev.vin.push_back(CTxIn());                          // null prevout -> IsCoinBase()==true
+                else if (coin.fCoinStake)
+                {
+                    txPrev.vin.push_back(CTxIn(COutPoint(uint256(0), 0)));  // non-null -> IsCoinStake()==true
+                    txPrev.vout[0] = CTxOut();                              // empty first output (creator coinstake marker)
+                }
+                std::pair<MapPrevTx::iterator, bool> ins = out->insert(std::make_pair(prevout.hash,
+                    std::make_pair(txindex, txPrev)));
+                mi = ins.first;
+            }
+            CTransaction& txPrev = mi->second.second;
+            CTxIndex& txindex = mi->second.first;
+            if ((unsigned int)prevout.n >= txindex.vSpent.size())
+            {
+                // a later vin of this tx references a higher index of the same prev tx
+                txindex.vSpent.resize(prevout.n + 1, CDiskTxPos(1, 1, 1));
+                txPrev.vout.resize(prevout.n + 1);
+            }
+            // A resolved vin is UNSPENT here. ConnectInputs has already rejected any true
+            // double spend (a prior in-block tx spending the same outpoint fails the block
+            // before HREG/cold-stake run), and ConnectInputs marks a tx's own inputs on a
+            // BY-VALUE copy of mapInputs, so the caller's legacy mapInputs is frozen at the
+            // pre-connect spent state -- exactly elided here: every resolved vin reads unspent.
+            txindex.vSpent[prevout.n] = CDiskTxPos();
+            txPrev.vout[prevout.n].nValue = coin.value;
+            txPrev.vout[prevout.n].scriptPubKey = CScript(coin.script.begin(), coin.script.end());
+        }
+        return true;
+    }
+
+    // ---------------------------------------------------------------------------
+    // S2.0-M2-c: STORE3A-BACKED COIN-AGE (ppcoin CTransaction::GetCoinAge V2 twin).
+    //
+    // Legacy GetCoinAge reads, per transparent vin: the prev tx + its nTime and
+    // value (txindex/txPrev) and the prev tx's BLOCK header time (block()). The
+    // first two are now the Store3A coin's value/nTime; the prev BLOCK header time
+    // is resolved BY VALUE at the coin's creation height (block () -- Block-Index-V2
+    // GetActiveByHeight, else a resident pprev walk), NEVER the legacy txindex.
+    // Consensus semantics byte-for-byte: ttimestamp-violation refusal, min-age
+    // (stakeModifier nStakeMinAge), the 365-day post-fork age cap, and the
+    // cent-second accumulation are all preserved against the coin view.
+    bool v2CoinAge(const CTransaction& tx, uint64_t& nCoinAge) const
+    {
+        CBigNum bnCentSecond = 0;   // coin age in cent-seconds
+        nCoinAge = 0;
+        if (tx.IsCoinBase())
+            return true;
+        for (const CTxIn& txin : tx.vin)
+        {
+            if (tx.nVersion == ANON_TXN_VERSION && txin.IsAnonInput())
+                continue;
+            COutPoint prevout = txin.prevout;
+            cs::OutPoint k; memcpy(k.txid.data(), prevout.hash.begin(), 32); k.n = prevout.n;
+            cs::Coin coin; bool local = false;
+            if (!resolve(k, &coin, &local))
+                return false;   // fail-closed: prevout not observable in Store3A
+            if (tx.nTime < coin.nTime)
+                return false;   // ppcoin: transaction timestamp violation (legacy GetCoinAge: if (nTime < txPrev.nTime))
+            int64_t nPrevBlockTime = 0;
+            if (!s16_V2PrevBlockTime(coin.height, &nPrevBlockTime))
+                return false;   // fail-closed: block authority unavailable (never zero/genesis substitution)
+            if (nPrevBlockTime + nStakeMinAge > tx.nTime)
+                continue;       // only count coins meeting min age requirement
+            int64_t nValueIn = coin.value;
+            int64_t nTimeDiff = (int64_t)tx.nTime - (int64_t)coin.nTime;
+            if (nBestHeight >= FORK_HEIGHT_TIGHTER_DRIFT && nTimeDiff > 365 * 24 * 60 * 60)
+                nTimeDiff = 365 * 24 * 60 * 60;   // cap coin age to 1 year (post-fork)
+            bnCentSecond += CBigNum(nValueIn) * nTimeDiff / CENT;
+        }
+        CBigNum bnCoinDay = bnCentSecond * CENT / COIN / (24 * 60 * 60);
+        nCoinAge = bnCoinDay.getuint64();
+        return true;
     }
 };
 
@@ -5834,11 +5992,14 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
                     if (nDepth < nCoinbaseMaturity)
                         return error("ConnectInputs() : tried to spend %s at depth %d (V2 Store3A)", coin.fCoinBase ? "coinbase" : "coinstake", (int)nDepth);
                 }
-                // V2 TIMESTAMP: intentionally OMITTED -- Store3A coins carry no nTime. A block-time proxy
-                // would be STRICTER than the legacy tx-level rule (block time >= tx time is NOT guaranteed)
-                // and could reject a block the legacy path accepts, so it cannot be used. See the M2-b
-                // report (TIMESTAMP decision); this is the one documented consensus-parity gap.
-                //
+                // ppcoin timestamp rule, RESTORED in S2.0-M2-c. Store3A coins now carry the
+                // creator tx's nTime (Coin.nTime: from addTxOutputs / observeDelta coinFor / the
+                // converter). Legacy uses `if (txPrev.nTime > nTime)` (main.cpp legacy branch);
+                // `*this` is the spending tx so `nTime == this->nTime` and `txPrev.nTime == coin.nTime`
+                // -> byte-for-byte the same predicate. Fail-closed: an absent/zero coin nTime is
+                // treated as 0 (ancient), which never REFUSES -- only a real forward-time mismatch.
+                if ((int64_t)coin.nTime > nTime)
+                    return DoS(100, error("ConnectInputs() : transaction timestamp earlier than input transaction (V2 Store3A)"));
                 // Value / range: from the store coin.
                 nValueIn += coin.value;
                 if (!MoneyRange(coin.value) || !MoneyRange(nValueIn))
@@ -6416,6 +6577,7 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
         memcpy(o.txid.data(), tx.GetHash().begin(), 32);
         o.coinbase  = tx.IsCoinBase();
         o.coinstake = tx.IsCoinStake();
+        o.nTime     = tx.nTime;   // S2.0-M2-c: carry into Store3A created coins (Coin.nTime)
         for (size_t i = 0; i < tx.vin.size(); ++i) {
             const CTxIn& in = tx.vin[i];
             if (in.IsAnonInput()) continue;
@@ -6555,6 +6717,7 @@ bool s16_StoreAuthoritativeInputGate(const CBlock& blk, int32_t height, std::str
         memcpy(o.txid.data(), tx.GetHash().begin(), 32);
         o.coinbase  = tx.IsCoinBase();
         o.coinstake = tx.IsCoinStake();
+        o.nTime     = tx.nTime;   // S2.0-M2-c: carry into Store3A created coins (Coin.nTime)
         for (size_t i = 0; i < tx.vin.size(); ++i) {
             const CTxIn& in = tx.vin[i];
             if (in.IsAnonInput()) continue;
@@ -6752,7 +6915,18 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         {
 
             bool fInvalid;
-            if (!tx.FetchInputs(txdb, mapQueuedChanges, true, false, mapInputs, fInvalid))
+            // S2.0-M2-c: in the armed V2 path the prevout data for every legacy mapInputs
+            // consumer (GetP2SHSigOpCount, GetValueIn, HREG ApplyConnectedTx, and later the
+            // cold-stake P2CS checks) is sourced EXCLUSIVELY from the Store3A coin view via
+            // v2View.v2MapPrevTx -- FetchInputs (legacy txindex reads) is NOT called for any
+            // non-coinbase tx. The consumer call sites below are unmodified.
+            if (v2View.armed())
+            {
+                if (!v2View.v2MapPrevTx(tx, &mapInputs))
+                    return error("ConnectBlock() : V2 Store3A cannot supply prevout data for %s (no legacy fallback)",
+                                 tx.GetHash().ToString().substr(0,10).c_str());
+            }
+            else if (!tx.FetchInputs(txdb, mapQueuedChanges, true, false, mapInputs, fInvalid))
                 return false;
 
             // Add in sigops done by pay-to-script-hash inputs;
@@ -6875,7 +7049,11 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 
         {
             uint64_t nCoinAge;
-            if (!vtx[1].GetCoinAge(txdb, nCoinAge))
+            // S2.0-M2-c: V2 sources coin-age per-input value/nTime from Store3A coins and the
+            // prev block header time by value (s16_V2PrevBlockTime) -- zero legacy txindex.
+            bool fCoinAgeOk = v2View.armed() ? v2View.v2CoinAge(vtx[1], nCoinAge)
+                                              : vtx[1].GetCoinAge(txdb, nCoinAge);
+            if (!fCoinAgeOk)
                 return error("ConnectBlock() : %s unable to get coin age for coinstake", vtx[1].GetHash().ToString().substr(0,10).c_str());
 
             int64_t nCalculatedStakeReward = GetProofOfStakeReward(nCoinAge, nFees);
@@ -6894,7 +7072,20 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 
             MapPrevTx mapColdInputs;
             bool fInvalid = false;
-            if (coinstake.FetchInputs(txdb, mapQueuedChanges, true, false, mapColdInputs, fInvalid))
+            // S2.0-M2-c: V2 sources the coinstake's P2CS prevout scripts/values from Store3A
+            // coins (zero legacy txindex). v2MapPrevTx failure is fail-CLOSED (reject), unlike
+            // the legacy FetchInputs-false path which merely skips the P2CS restriction.
+            bool fColdInputsOk;
+            if (v2View.armed())
+            {
+                fColdInputsOk = v2View.v2MapPrevTx(coinstake, &mapColdInputs);
+                if (!fColdInputsOk)
+                    return error("ConnectBlock() : V2 Store3A cannot supply cold-stake prevout data for %s (no legacy fallback)",
+                                 coinstake.GetHash().ToString().substr(0,10).c_str());
+            }
+            else
+                fColdInputsOk = coinstake.FetchInputs(txdb, mapQueuedChanges, true, false, mapColdInputs, fInvalid);
+            if (fColdInputsOk)
             {
                 for (unsigned int j = 0; j < coinstake.vin.size(); j++)
                 {
@@ -7055,7 +7246,10 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
                 GetCollateralnodeRanks(pindexBest);
                 // Calculate Coin Age for Collateralnode Reward Calculation
                 uint64_t nCoinAge;
-                if (!vtx[1].GetCoinAge(txdb, nCoinAge))
+                // S2.0-M2-c: V2 sources coin-age from Store3A coins + by-value prev block time.
+                bool fCNCoinAgeOk = v2View.armed() ? v2View.v2CoinAge(vtx[1], nCoinAge)
+                                                    : vtx[1].GetCoinAge(txdb, nCoinAge);
+                if (!fCNCoinAgeOk)
                     return error("CheckBlock-POS : %s unable to get coin age for coinstake, Can't Calculate Collateralnode Reward\n", vtx[1].GetHash().ToString().substr(0,10).c_str());
                 int64_t nCalculatedStakeReward = GetProofOfStakeReward(nCoinAge, nFees);
 
@@ -7399,7 +7593,12 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         {
             uint256 hashTx = tx.GetHash();
         // inputs
-        if(!tx.IsCoinBase())
+        // S2.0-M2-c: in the armed V2 path the input-side -addrindex population is SKIPPED
+        // (no legacy FetchInputs / txindex read). The Store3A coin view exposes only the spent
+        // output's script, not the prev tx's full output set, so the auxiliary address index
+        // (non-consensus, -addrindex opt-in) is not populated for inputs in V2; the output-side
+        // index below is unchanged.
+        if(!tx.IsCoinBase() && !v2View.armed())
         {
                 MapPrevTx mapInputs;
             map<uint256, CTxIndex> mapQueuedChangesT;

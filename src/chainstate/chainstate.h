@@ -87,12 +87,13 @@ struct Coin {
     int64_t value = 0;
     std::vector<uint8_t> script;
     int32_t height = 0;
+    int32_t nTime = 0;       // S2.0-M2-c: creator tx's nTime (ppcoin timestamp rule). ON-DISK FORMAT CHANGE.
     bool fCoinBase = false;
     bool fCoinStake = false;
 
     std::vector<uint8_t> encode() const {
         std::vector<uint8_t> o; o.reserve(17 + script.size());
-        putI64(o, value); putI32(o, height);
+        putI64(o, value); putI32(o, height); putI32(o, nTime);
         uint8_t flags = (fCoinBase?1:0) | (fCoinStake?2:0);
         o.push_back(flags);
         putU32(o, (uint32_t)script.size());
@@ -102,6 +103,7 @@ struct Coin {
     bool decode(const uint8_t* d, size_t n, size_t* off) {
         uint64_t v64; if (!getU64(d,n,off,&v64)) return false; value=(int64_t)v64;
         uint32_t h; if (!getU32(d,n,off,&h)) return false; height=(int32_t)h;
+        int32_t nt; { uint32_t t; if (!getU32(d,n,off,&t)) return false; nt=(int32_t)t; } nTime=nt;
         if (*off + 1 > n) return false; uint8_t flags=d[(*off)++];
         fCoinBase = (flags&1)!=0; fCoinStake=(flags&2)!=0;
         uint32_t sl; if (!getU32(d,n,off,&sl)) return false;
