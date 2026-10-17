@@ -13,6 +13,7 @@
 #include "kernel.h"
 #include "miner.h"
 #include "txdb.h"
+#include "chainstate/txloc/txloc.h"
 #include "walletdb.h"
 #include "innovarpc.h"
 #include "net.h"
@@ -2027,6 +2028,25 @@ authoritative_startup_ready:
             s16::g_chainObserve.enabled = true;
             s16::g_chainObserve.checkAuthority = true;
             s16::g_chainObserve.hardFail = true;   // authoritative: gate failure REFUSES the block
+            // V2-Item1: open the historical TX-LOC location index under the approved
+            // datadir contract (GetDataDir()/chainstate/txloc, auto-created). Built
+            // incrementally during IBD (per-block feed in ConnectBlock) + on restart by
+            // WAL replay; serves GetTransaction/getrawtransaction/gettransaction. This is
+            // a derived location index (txid -> blk*.dat position), NOT a consensus
+            // authority (Store3A owns UTXO, BI-V2 owns the block index). Fail-closed on
+            // a present-but-inconsistent index; a fresh dir is produced automatically.
+            {
+                txloc::ChainError txe; bool txa = false;
+                fs::path txlocDir = GetDataDir() / "chainstate" / "txloc";
+                if (!txloc::g_txloc.openDir(txlocDir.string(), &txa, &txe))
+                    return InitError(strprintf("TX-LOC V2 location index open failed at %s: %s (fail-closed, no legacy txindex fallback)", txlocDir.string(), txe.str()));
+                printf("TX-LOC: %s location index at %s (%llu merged records, %llu pending recent)\n",
+                       txa ? "created new" : "reopened",
+                       txlocDir.string().c_str(),
+                       (unsigned long long)txloc::g_txloc.count(),
+                       (unsigned long long)txloc::g_txloc.memCount());
+                fflush(stdout);
+            }
             printf("S1.9 Store3A V2 authoritative armed at %s tip=%d matches chain; new blocks will be published to Store3A (fail-closed on gate error)\n",
                    s3aDir.c_str(), (int)stH);
         }

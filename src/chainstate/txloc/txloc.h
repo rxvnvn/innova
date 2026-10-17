@@ -142,4 +142,9 @@ private:
 // Bounded recent-cache size for the ingested tail before a synchronous merge.
 const size_t MEMTABLE_MAX = (size_t)1u << 18;   // 262144 entries (~12 MiB of Loc)
 
+// Global production locator, opened by the V2 startup path (init.cpp) at
+// GetDataDir()/chainstate/txloc and consumed by GetTransaction and the V2
+// ConnectBlock feed. Non-V2 nodes never touch it (opened()==false).
+extern TxLocator g_txloc;
+
 } // namespace txloc

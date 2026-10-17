@@ -334,6 +334,7 @@ OBJS= \
     obj/observe.o \
     obj/chainstate.o \
     obj/incstore.o \
+    obj/txloc.o \
     obj/incdelta.o \
     obj/btree.o \
     obj/net.o \
@@ -445,6 +446,7 @@ OBJS= \
     obj/observe.o \
     obj/chainstate.o \
     obj/incstore.o \
+    obj/txloc.o \
     obj/incdelta.o \
     obj/btree.o \
     obj/net.o \
@@ -750,6 +752,9 @@ obj/chainstate.o: chainstate/chainstate.cpp
 	@$(CXX) -c $(xCXXFLAGS) -fpermissive -MMD -MF $(@:%.o=%.d) -o $@ $<
 	@rm -f $(@:%.o=%.d)
 obj/incstore.o: chainstate/store3a/incstore.cpp
+	@$(CXX) -c $(xCXXFLAGS) -fpermissive -MMD -MF $(@:%.o=%.d) -o $@ $<
+	@rm -f $(@:%.o=%.d)
+obj/txloc.o: chainstate/txloc/txloc.cpp
 	@$(CXX) -c $(xCXXFLAGS) -fpermissive -MMD -MF $(@:%.o=%.d) -o $@ $<
 	@rm -f $(@:%.o=%.d)
 obj/incdelta.o: chainstate/store3a/incdelta.cpp

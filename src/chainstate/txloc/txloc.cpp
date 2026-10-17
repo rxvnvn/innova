@@ -101,6 +101,9 @@ bool buildIndex(const std::string& indexPath,
 
 TxLocator::~TxLocator() { close(); delete mem_; }
 
+// Global production locator handle (defined here; opened by init.cpp V2 arm).
+TxLocator g_txloc;
+
 bool TxLocator::readHeader(ChainError* e) {
     unsigned char h[20];
     ssize_t r = ::pread(fd_, h, 20, 0);
@@ -194,7 +197,7 @@ bool TxLocator::openDir(const std::string& dir, bool* absent, ChainError* e) {
             ::close(rf);
         }
     }
-    if (absent) *absent = false;
+    if (absent) *absent = (!hadMain_ && mem_->empty());
     return true;
 }
 

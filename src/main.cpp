@@ -24,6 +24,7 @@
 #include "headersservededup.h"
 #include "getblocksservedinvzero.h"
 #include "kernel.h"
+#include "chainstate/txloc/txloc.h"
 #include "collateral.h"
 #include "collateralnode.h"
 #include "dandelion.h"
@@ -4179,6 +4180,26 @@ bool GetTransaction(const uint256 &hash, CTransaction &tx, uint256 &hashBlock, b
             }
           }
         }
+        // V2 (Item 1): historical lookup via the TX-LOC location index — no legacy
+        // txindex. The locator yields the blk*.dat position (nFile/nBlockPos/nTxPos)
+        // of the FIRST on-chain occurrence of this txid; the tx bytes are read from
+        // the authoritative archive. Not a UTXO/active-chain authority (Store3A/BI-V2
+        // own those); confirmation status is derived by callers from the block.
+        if (txloc::g_txloc.opened())
+        {
+            cs::Hash th; memcpy(th.data(), hash.begin(), 32);
+            txloc::Loc tl; bool found = false; txloc::ChainError txe;
+            if (!txloc::g_txloc.get(th.data(), &tl, &found, &txe))
+                return error("GetTransaction() : TX-LOC lookup failed (%s)", txe.str().c_str());
+            if (!found)
+                return false;
+            if (!tx.ReadFromDisk(CDiskTxPos(tl.nFile, tl.nBlockPos, tl.nTxPos)))
+                return false;
+            CBlock block;
+            if (block.ReadFromDisk(tl.nFile, tl.nBlockPos, false))
+                hashBlock = block.GetHash();
+            return true;
+        }
         CTxDB txdb("r");
         CTxIndex txindex;
         if (tx.ReadFromDisk(txdb, COutPoint(hash, 0), txindex))
@@ -7646,6 +7667,37 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         return error("ConnectBlock() : Store3A V2 AUTHORITATIVE gate FAILED at height %d (mismatch=%llu fails=%llu needsRecovery=%d). Block REFUSED — fail-closed, no legacy fallback.",
                      (int)pindex->nHeight, (unsigned long long)s16::g_chainObserve.mismatch,
                      (unsigned long long)s16::g_chainObserve.fails, (int)(s16::g_chainObserve.needsRecovery ? 1 : 0));
+
+    // V2-Item1: feed every located tx of this block into the historical TX-LOC location
+    // index. vPos holds (txid, CDiskTxPos) for all txs in the block (computed above at
+    // connect time). Keep-first: a re-connect (reorg) re-adds the same txid and is ignored;
+    // a disconnected branch's unique txids remain indexed at their physical (first) archive
+    // location, which is exactly first-on-chain-occurrence semantics. Active-chain status
+    // is BI-V2's domain, never derived from the locator. fsync the WAL once per committed
+    // block for durable crash recovery. Fail-closed: an ingest write/sync error refuses the
+    // block.
+    if (txloc::g_txloc.opened())
+    {
+        txloc::ChainError txe;
+        for (const auto& pr : vPos)
+        {
+            cs::Hash th; memcpy(th.data(), pr.first.begin(), 32);
+            txloc::Loc tl; tl.nFile = pr.second.nFile; tl.nBlockPos = pr.second.nBlockPos;
+            tl.nTxPos = pr.second.nTxPos; tl.nHeight = (int32_t)pindex->nHeight;
+            if (!txloc::g_txloc.add(th.data(), tl, &txe))
+            {
+                s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+                return error("ConnectBlock() : TX-LOC ingest FAILED for %s at height %d (%s) — fail-closed, no legacy fallback",
+                             pr.first.ToString().substr(0,10).c_str(), (int)pindex->nHeight, txe.str().c_str());
+            }
+        }
+        if (!txloc::g_txloc.sync(&txe))
+        {
+            s16::g_chainObserve.needsRecovery = true;
+            return error("ConnectBlock() : TX-LOC WAL sync FAILED at height %d (%s) — fail-closed", (int)pindex->nHeight, txe.str().c_str());
+        }
+    }
+
     for (map<uint256, CTxIndex>::iterator mi = mapQueuedChanges.begin(); mi != mapQueuedChanges.end(); ++mi)
     {
         if (!txdb.UpdateTxIndex((*mi).first, (*mi).second))
