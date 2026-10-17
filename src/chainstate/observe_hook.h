@@ -19,6 +19,9 @@ struct ChainObserveState {
     bool enabled = false;                  // pilot sets this to observe real blocks
     cs::store3a::CommitStore3A* store = nullptr;  // pilot-owned mirror (must be open())
     bool checkAuthority = true;            // cross-check Delta spends vs mapQueuedChanges vSpent
+    bool hardFail = false;                 // S1.9: when armed as V2 AUTHORITATIVE chainstate,
+                                           // a gate failure REFUSES the block (ConnectBlock returns
+                                           // error) instead of the read-only "block still connects".
 
     uint64_t blocks = 0;                   // blocks handled by the hook
     uint64_t published = 0;                // successful observeDelta+publish

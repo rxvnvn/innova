@@ -7099,6 +7099,14 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 
     // Write queued txindex changes
     s16_ObserveConnectBlock(*this, mapQueuedChanges, pindex);   // S1.6-2: read-only observation (no-op unless enabled)
+    // S1.9: when armed as V2 AUTHORITATIVE chainstate (hardFail), a Store3A authority-gate
+    // failure (needsRecovery at THIS block) MUST refuse the block — fail-closed, no silent
+    // legacy fallback. This is the authoritative property: Store3A divergence halts the node
+    // rather than continuing to trust legacy txindex for consensus UTXO.
+    if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail && s16::g_chainObserve.needsRecovery)
+        return error("ConnectBlock() : Store3A V2 AUTHORITATIVE gate FAILED at height %d (mismatch=%llu fails=%llu needsRecovery=%d). Block REFUSED — fail-closed, no legacy fallback.",
+                     (int)pindex->nHeight, (unsigned long long)s16::g_chainObserve.mismatch,
+                     (unsigned long long)s16::g_chainObserve.fails, (int)(s16::g_chainObserve.needsRecovery ? 1 : 0));
     for (map<uint256, CTxIndex>::iterator mi = mapQueuedChanges.begin(); mi != mapQueuedChanges.end(); ++mi)
     {
         if (!txdb.UpdateTxIndex((*mi).first, (*mi).second))
@@ -11453,6 +11461,61 @@ void GetBlocksServedInvReconnectClearAll()
         0, std::memory_order_relaxed);
 }
 
+//
+// P2P user-agent ban filter.
+//
+// Peers whose slash-delimited P2P subver, AFTER stripping the surrounding slashes,
+// EXACTLY matches (case-sensitive) one of the banned inner strings are refused on
+// that single connection (clean disconnect of this peer only: no misbehave score,
+// no IP ban). Covers inbound and outbound connections alike because both arrive
+// through the "version" message. This has NO effect on consensus or block processing.
+//
+
+// Static diagnostic counter: rejections performed by this filter.
+static int64_t g_rejectedUABanCount = 0;
+
+// Strip one leading and one trailing '/' from a slash-delimited subversion,
+// e.g. "/Innovai:5.1.0/" -> "Innovai:5.1.0". Interior '/' are left untouched so the
+// later comparison stays exact; nothing here performs partial/substring matching.
+static std::string StripSlashSubver(const std::string& subver)
+{
+    std::string out = subver;
+    if (out.size() >= 1 && out[0] == '/')
+        out.erase(0, 1);
+    if (out.size() >= 1 && out[out.size() - 1] == '/')
+        out.erase(out.size() - 1, 1);
+    return out;
+}
+
+// Resolve the enforced banned user-agent set. Combines the three hardcoded defaults
+// with every exact value supplied via the repeatable -banuseragent option. Resolved
+// once per process into a function-local static; the option is re-read fresh on each
+// startup because mapMultiArgs is rebuilt at every launch.
+static const std::set<std::string>& BannedUserAgents()
+{
+    static std::set<std::string> banned;
+    static bool initialized = false;
+    if (!initialized)
+    {
+        initialized = true;
+        banned.insert("Innovai:5.1.0");
+        banned.insert("Innovai:5.0.0.8");
+        banned.insert("Innovai:5.0.0.6");
+        const std::vector<std::string>& extra = mapMultiArgs["-banuseragent"];
+        for (size_t i = 0; i < extra.size(); ++i)
+            banned.insert(extra[i]);
+    }
+    return banned;
+}
+
+// Startup diagnostic: report how many user-agent entries are enforced.
+void LogEnforcedUABanFilterCount()
+{
+    const std::set<std::string>& banned = BannedUserAgents();
+    printf("banuseragent: enforcing %u banned user-agent entr%s\n",
+           (unsigned)banned.size(), banned.size() == 1 ? "y" : "ies");
+}
+
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, int64_t nTimeReceived)
 {
     // C5: minimum seconds between getblocks "CONTINUE" refills on the IBD block-download
@@ -11518,6 +11581,23 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         {
             vRecv >> pfrom->nChainHeight;
             pfrom->UpdateBestKnownBlock(pfrom->nChainHeight, uint256(0));
+        }
+
+        // P2P user-agent ban filter: strip surrounding slashes then compare EXACTLY
+        // (case-sensitive, whole string) against the enforced banned set. On a match,
+        // refuse THIS connection only (pfrom->fDisconnect clean close) - no misbehave
+        // score, no IP ban. Covers inbound and outbound peers via the version message.
+        {
+            const std::string innerUA = StripSlashSubver(pfrom->strSubVer);
+            if (BannedUserAgents().count(innerUA))
+            {
+                g_rejectedUABanCount++;
+                printf("banuseragent: rejecting peer %s, subver=\"%s\" (inner=\"%s\"), rejected_ua_total=%lld\n",
+                       pfrom->addr.ToString().c_str(), pfrom->strSubVer.c_str(),
+                       innerUA.c_str(), (long long)g_rejectedUABanCount);
+                pfrom->fDisconnect = true;
+                return false;
+            }
         }
 
         // Disconnect if the peer's subversion is < /Innovai:3.3.9.14/

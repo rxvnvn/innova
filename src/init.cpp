@@ -758,6 +758,9 @@ bool AppInit2()
     nMinStakeInterval = std::max((int64_t)0, std::min((int64_t)600, GetArg("-minstakeinterval", 30)));
     nMinerSleep = std::max((int64_t)100, std::min((int64_t)60000, GetArg("-minersleep", 5000)));
 
+    // P2P user-agent ban filter: log how many entries are enforced this startup.
+    LogEnforcedUABanFilterCount();
+
     // Largest block you're willing to create (adaptive post-DAG, default half of ceiling)
     nBlockMaxSize = GetArg("-blockmaxsize", ADAPTIVE_BLOCK_CEILING / 2);
     nBlockMaxSize = std::max((unsigned int)1000, std::min((unsigned int)(ADAPTIVE_BLOCK_CEILING - 1000), nBlockMaxSize));
@@ -1885,6 +1888,44 @@ authoritative_startup_ready:
             fs::path pathBootstrapOld = GetDataDir() / "bootstrap.dat.old";
             LoadExternalBlockFile(file);
             RenameOver(pathBootstrap, pathBootstrapOld);
+        }
+    }
+
+    // S1.9 — V2 AUTHORITATIVE chainstate: arm the Store3A ConsumeBlock hook at NORMAL
+    // (non -loadblock) startup. Given -s16openstore=<dir> pointing at a PREBUILT Store3A
+    // (e.g. the S1.8 direct-converter output, tip 8170668), OPEN it and VERIFY its persisted
+    // tip (height+hash) exactly matches the loaded best chain at that height. Any mismatch =>
+    // InitError (FAIL-CLOSED): never silently continue on a divergent state. On match, arm the
+    // contract so every subsequently connected block (IBD catch-up & live sync) is published to
+    // Store3A through the strict two-sided authority gate (observeDelta + authoritySpendDiff).
+    // If the gate ever fails the store goes NEEDS_RECOVERY and no further delta is published.
+    // Store lives for the process lifetime (heap-owned).
+    {
+        static std::unique_ptr<cs::store3a::CommitStore3A> g_s3aAuthoritative;
+        const std::string s3aDir = GetArg("-s16openstore", "");
+        if (!s3aDir.empty())
+        {
+            cs::ChainError be;
+            g_s3aAuthoritative.reset(new cs::store3a::CommitStore3A());
+            if (!g_s3aAuthoritative->open(s3aDir, &be))
+                return InitError(strprintf("Store3A V2 authoritative open failed at %s: %s", s3aDir, be.str()));
+            if (pindexBest == NULL)
+                return InitError("Store3A V2 authoritative: no best chain loaded");
+            int32_t stH = g_s3aAuthoritative->tipHeight();
+            CBlockIndex* tipAt = (stH >= 0) ? pindexBest->GetAncestor(stH) : NULL;
+            if (tipAt == NULL)
+                return InitError(strprintf("Store3A V2 authoritative: tipHeight=%d absent from loaded best chain", (int)stH));
+            uint256 stHash; memcpy(stHash.begin(), g_s3aAuthoritative->tipHash().data(), 32);
+            uint256 chHash = tipAt->GetBlockHash();
+            if (stHash != chHash)
+                return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: tip hash mismatch at h=%d (store=%s chain=%s). Refusing to switch chain state.",
+                                           (int)stH, stHash.GetHex(), chHash.GetHex()));
+            s16::g_chainObserve.store = g_s3aAuthoritative.get();
+            s16::g_chainObserve.enabled = true;
+            s16::g_chainObserve.checkAuthority = true;
+            s16::g_chainObserve.hardFail = true;   // authoritative: gate failure REFUSES the block
+            printf("S1.9 Store3A V2 authoritative armed at %s tip=%d matches chain; new blocks will be published to Store3A (fail-closed on gate error)\n",
+                   s3aDir.c_str(), (int)stH);
         }
     }
 

@@ -294,6 +294,8 @@ extern std::set<std::pair<COutPoint, unsigned int> > setStakeSeenOrphan;
 // the same block (PBREJECT_DUPLICATE_STAKE_ORPHAN), and a kernel shared by a
 // duplicate orphan is not dropped while that orphan is still stored.
 void EraseStakeSeenOrphanIfUnreferenced(const std::pair<COutPoint, unsigned int>& stake);
+// P2P user-agent ban filter: startup diagnostic (count of enforced banned entries).
+void LogEnforcedUABanFilterCount();
 
 // Randomly evict one orphan (plus any selected descendants) once the orphan
 // table exceeds -maxorphanblocks.
