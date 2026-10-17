@@ -71,6 +71,13 @@ public:
     bool keysWithTxidPrefix(const uint8_t* txid32, std::vector<Key>* out, ChainError* e) const;
     bool put(const Key& k, const std::vector<uint8_t>& val, ChainError* e);
     bool erase(const Key& k, ChainError* e);
+    // S1.8 bulk-seed: put() for a single un-acknowledged generation, then immediately
+    // reclaim the retired pages (bounded tree.dat during a seed) except page 0, which
+    // stays referenced by the MANIFEST.bak gen-0 root until the seed is acknowledged.
+    // The caller finalizes the seed with one atomic publish; a crash before it leaves the
+    // store at its (empty) gen-0 state, so the seed is simply re-run. Root hash remains
+    // authenticated on every write, so an incomplete seed is never mistaken for complete.
+    bool seedPut(const Key& k, const std::vector<uint8_t>& val, ChainError* e);
     // Free-page reuse (S1.7-G): pages retired by CoW commits are reclaimed and reused once
     // their generation is acknowledged, so the append-only file stops growing unboundedly
     // (no on-disk format change). Call retireMovedToFree() after each acknowledged commit.

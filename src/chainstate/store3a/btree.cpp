@@ -284,6 +284,23 @@ void BTree::retireMovedToFree(){
 
 void BTree::clearRetired(){ commitRetired_.clear(); }
 
+bool BTree::seedPut(const Key& k, const std::vector<uint8_t>& val, ChainError* e){
+    // put() appends every CoW-retired page of this op to commitRetired_.
+    std::vector<uint32_t> retired; retired.swap(commitRetired_);   // snapshot prior leftovers separately
+    if (!put(k, val, e)){ commitRetired_.insert(commitRetired_.begin(), retired.begin(), retired.end()); return false; }
+    // Reclaim this op's retired pages immediately (bounded tree.dat during a seed) EXCEPT
+    // page 0, which is still referenced by the MANIFEST.bak gen-0 root until the seed is
+    // acknowledged. Dropping page 0 from tracking is safe: it is never reused, never
+    // removed, and keeps its original empty-leaf bytes for gen-0 crash recovery.
+    std::vector<uint32_t> merge = retired;
+    merge.insert(merge.end(), commitRetired_.begin(), commitRetired_.end());
+    commitRetired_.clear();
+    std::sort(merge.begin(), merge.end());
+    merge.erase(std::unique(merge.begin(), merge.end()), merge.end());
+    for (uint32_t id : merge) if (id != 0) freeList_.push_back(id);
+    return true;
+}
+
 bool BTree::collectRec(uint32_t id, const Hash& expect, std::vector<LeafEntry>* out, ChainError* e) const {
     Node n; if (!readNodeVerified(id,expect,&n,e)) return false;
     if (n.type==NT_LEAF){ for (const LeafEntry& en: n.entries) out->push_back(en); return true; }
