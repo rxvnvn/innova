@@ -6,6 +6,9 @@
 #include <cerrno>
 #include <cstring>
 #include <cstdio>
+#include <deque>
+#include <algorithm>
+#include <functional>
 
 namespace cs { namespace store3a {
 
@@ -106,6 +109,7 @@ bool BTree::open(const std::string& path, ChainError* e){
     }
     if (sz<=0){ setErr(e,ErrCode::CORRUPT,"tree file empty/invalid"); return false; }
     nextId_ = (uint32_t)(sz/(off_t)PAGE_SIZE);
+    freeList_.clear(); commitRetired_.clear();   // conservative: reuse resumes after the 1st ack
     return true;
 }
 bool BTree::fsync(ChainError* e){ if (fd_<0){ setErr(e,ErrCode::NOT_OPEN,"btree"); return false; }
@@ -132,6 +136,15 @@ bool BTree::readNodeVerified(uint32_t id, const Hash& expect, Node* n, ChainErro
 }
 bool BTree::appendPage(const uint8_t* buf, uint32_t* outId, ChainError* e){
     if (fd_<0){ setErr(e,ErrCode::NOT_OPEN,"btree"); return false; }
+    // S1.7-G free-page reuse: prefer an unreachable (retired+acked) page so the append-only
+    // file stops growing unboundedly. The reused page is overwritten in full (encodeNode
+    // zero-fills the buffer) with the new node's content before its parent MANIFEST/root can
+    // reference it (same durability ordering as a fresh tail append).
+    if (!freeList_.empty()){
+        uint32_t id = freeList_.front(); freeList_.pop_front();
+        if (::pwrite(fd_, buf, PAGE_SIZE, (off_t)id*PAGE_SIZE) != (ssize_t)PAGE_SIZE){ setErr(e,ErrCode::IO,"reuse page"); return false; }
+        writes_++; *outId=id; return true;
+    }
     uint32_t id=nextId_;
     if (partialAppendOn_>0){ partialAppendOn_--; if(partialAppendOn_==0) partialAppendBytes_=PAGE_SIZE/3; }
     if (partialAppendBytes_>0){   // R1/R2 test hook: simulated short/interrupted append
@@ -200,6 +213,7 @@ bool BTree::modRec(uint32_t id, const Hash& expect, const Key& k, const std::vec
                   else { LeafEntry en; en.key=k; en.val=*val; n.entries.insert(n.entries.begin()+pos,en); } }
         else { if (pos<n.entries.size() && keyCmp(n.entries[pos].key,k)==0) n.entries.erase(n.entries.begin()+pos); }
         if (leafSize(n)<=PAGE_SIZE){
+            commitRetired_.push_back(id);   // CoW: old leaf page is no longer referenced by the new root
             uint8_t ob[PAGE_SIZE]; encodeNode(n,ob); uint32_t nid; if(!appendPage(ob,&nid,e)) return false;
             *outId=nid; *outHash=leafHash(n); return true;
         }
@@ -209,6 +223,7 @@ bool BTree::modRec(uint32_t id, const Hash& expect, const Key& k, const std::vec
         R.entries.assign(n.entries.begin()+half, n.entries.end());
         if (R.entries.empty()){ setErr(e,ErrCode::INTERNAL,"leaf split empty right"); return false; }
         uint8_t lb[PAGE_SIZE], rb[PAGE_SIZE]; if(!encodeNode(L,lb)||!encodeNode(R,rb)){ setErr(e,ErrCode::INTERNAL,"leaf split overflow"); return false; }
+        commitRetired_.push_back(id);   // CoW: full pre-split leaf page is retired
         uint32_t lid,rid; if(!appendPage(lb,&lid,e)) return false; if(!appendPage(rb,&rid,e)) return false;
         *outId=lid; *outHash=leafHash(L); split->split=true; split->sep=R.entries.front().key; split->rightId=rid; split->rightHash=leafHash(R);
         return true;
@@ -221,6 +236,7 @@ bool BTree::modRec(uint32_t id, const Hash& expect, const Key& k, const std::vec
     n.children[ci]=ncid; n.chashes[ci]=nch;
     if (csr.split){ n.keys.insert(n.keys.begin()+ci, csr.sep); n.children.insert(n.children.begin()+ci+1, csr.rightId); n.chashes.insert(n.chashes.begin()+ci+1, csr.rightHash); }
     if (internalSize(n)<=PAGE_SIZE){
+        commitRetired_.push_back(id);   // CoW: old internal page is retired
         uint8_t ob[PAGE_SIZE]; encodeNode(n,ob); uint32_t nid; if(!appendPage(ob,&nid,e)) return false;
         *outId=nid; *outHash=internalHash(n); return true;
     }
@@ -234,6 +250,7 @@ bool BTree::modRec(uint32_t id, const Hash& expect, const Key& k, const std::vec
     R.children.assign(n.children.begin()+half+1, n.children.end());
     R.chashes.assign(n.chashes.begin()+half+1, n.chashes.end());
     uint8_t lb[PAGE_SIZE], rb[PAGE_SIZE]; if(!encodeNode(L,lb)||!encodeNode(R,rb)){ setErr(e,ErrCode::INTERNAL,"internal split overflow"); return false; }
+    commitRetired_.push_back(id);   // CoW: full pre-split internal page is retired
     uint32_t lid,rid; if(!appendPage(lb,&lid,e)) return false; if(!appendPage(rb,&rid,e)) return false;
     *outId=lid; *outHash=internalHash(L); split->split=true; split->sep=sep; split->rightId=rid; split->rightHash=internalHash(R);
     return true;
@@ -256,6 +273,16 @@ bool BTree::erase(const Key& k, ChainError* e){
     if (sr.split){ setErr(e,ErrCode::INTERNAL,"erase produced split"); return false; }
     rootId_=nid; rootHash_=nh; return true;
 }
+
+void BTree::retireMovedToFree(){
+    if (commitRetired_.empty()) return;
+    std::sort(commitRetired_.begin(), commitRetired_.end());
+    commitRetired_.erase(std::unique(commitRetired_.begin(), commitRetired_.end()), commitRetired_.end());
+    for (uint32_t id : commitRetired_) freeList_.push_back(id);
+    commitRetired_.clear();
+}
+
+void BTree::clearRetired(){ commitRetired_.clear(); }
 
 bool BTree::collectRec(uint32_t id, const Hash& expect, std::vector<LeafEntry>* out, ChainError* e) const {
     Node n; if (!readNodeVerified(id,expect,&n,e)) return false;

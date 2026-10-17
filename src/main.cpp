@@ -6233,6 +6233,9 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
     s16::ChainObserveState& st = s16::g_chainObserve;
     if (!st.enabled || !st.store || !st.store->opened() || pindex == NULL)
         return;
+    if (st.needsRecovery) {   // fail-closed: no further Delta published after a hard error
+        ++st.fails; return;
+    }
     ++st.blocks;
 
     // Project the block's real transactions -> neutral observed block.
@@ -6275,32 +6278,87 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
     };
 
     cs::Delta d; cs::ChainError ce;
-    if (!cs::observeDelta(ob, gp, &d, &ce)) {
-        ++st.fails; st.lastOpError = ce.str(); st.lastHeight = pindex->nHeight; return;
+    bool okObs = cs::observeDelta(ob, gp, &d, &ce);
+    if (!okObs) {
+        ++st.fails; st.needsRecovery = true;   // store missing a 'before' coin: mirror out of sync
+        st.lastOpError = ce.str(); st.lastHeight = pindex->nHeight; return;
     }
 
-    // Authority equivalence gate: adapter spends == mapQueuedChanges/vSpent spends.
+    // S1.7-G negative-test fault injection (test harness ONLY). S16_FAULT env:
+    //   S16_FAULT=surplus-at<N> : append a spurious transparent spend to the Delta (an outpoint
+    //                             the current-block authority never records) -> must fail closed dsOnly.
+    //   S16_FAULT=dropped-at<N> : remove one real spend from the Delta -> the authority has the spend
+    //                             but the Delta does not -> must fail closed asOnly.
+    if (const char* f = getenv("S16_FAULT")) {
+        std::string ff(f); size_t at = ff.find("-at");
+        if (at != std::string::npos) {
+            std::string name = ff.substr(0, at); int fh = atoi(ff.substr(at + 3).c_str());
+            if ((int)pindex->nHeight == fh && !d.ops.empty()) {
+                size_t spendIdx = d.ops.size();
+                for (size_t i = 0; i < d.ops.size(); ++i)
+                    if (d.ops[i].beforePresent && !d.ops[i].afterPresent) { spendIdx = i; break; }
+                if (name == "surplus" && spendIdx < d.ops.size()) {
+                    cs::Op SPARE; memset(SPARE.op.txid.data(), 0xEE, 32); SPARE.op.n = 0x42;
+                    SPARE.beforePresent = true; SPARE.afterPresent = false;
+                    d.ops.push_back(SPARE);   // Delta gains a spend the authority never recorded
+                } else if (name == "dropped" && spendIdx < d.ops.size()) {
+                    d.ops.erase(d.ops.begin() + spendIdx);   // Delta loses a spend the authority has
+                }
+            }
+        }
+    }
+
+    // Authority equivalence gate (S1.7-G): EXACT current-block spend set == adapter Delta
+    // spend set (strict two-sided equality). The authority is the set of outpoints whose
+    // vSpent position points at THIS block's own transaction positions: ConnectBlock records
+    // CTxIndex(posThisTx,..) for every block tx and ConnectInputs sets vSpent[prevout] =
+    // posThisTx of the SPENDING tx. vSpent is cumulative (carries prior-block spends), so we
+    // include only outpoints whose position equals a position of THIS block's txs. Anonym/
+    // nullifier spends never enter vSpent (ConnectInputs skips IsAnonInput for nVersion
+    // ANON_TXN and they are consumed via the CAnonOutput/nullifier store), so they stay out of
+    // the transparent-UTXO authority by construction.
     if (st.checkAuthority) {
+        std::vector<CDiskTxPos> blockPos;
+        for (size_t ti = 0; ti < blk.vtx.size(); ++ti) {
+            uint256 htx = blk.vtx[ti].GetHash();
+            std::map<uint256,CTxIndex>::const_iterator hit = mqc.find(htx);
+            if (hit != mqc.end())
+                blockPos.push_back(hit->second.pos);
+        }
         cs::ObservedAuthority auth;
         for (std::map<uint256,CTxIndex>::const_iterator mi = mqc.begin(); mi != mqc.end(); ++mi) {
             const CTxIndex& ti = mi->second;
             for (size_t i = 0; i < ti.vSpent.size(); ++i) {
-                if (!ti.vSpent[i].IsNull()) {
-                    cs::OutPoint op; memcpy(op.txid.data(), mi->first.begin(), 32); op.n = (uint32_t)i;
-                    auth.spent.push_back(op);
-                }
+                if (ti.vSpent[i].IsNull()) continue;
+                bool inThisBlock = false;
+                for (size_t b = 0; b < blockPos.size(); ++b)
+                    if (ti.vSpent[i] == blockPos[b]) { inThisBlock = true; break; }
+                if (!inThisBlock) continue;   // prior-block spend -> NOT a current-block spend
+                cs::OutPoint op; memcpy(op.txid.data(), mi->first.begin(), 32); op.n = (uint32_t)i;
+                auth.spent.push_back(op);
             }
         }
-        std::string mm;
-        if (!cs::authoritySpendsMatch(d, auth, &mm)) {
-            ++st.mismatch; st.lastAuthorityMismatch = mm; st.lastHeight = pindex->nHeight;
+        std::vector<cs::OutPoint> dsOnly, asOnly;
+        cs::authoritySpendDiff(d, auth, &dsOnly, &asOnly);
+        if (!dsOnly.empty() || !asOnly.empty()) {
+            // STRICT divergence (either direction) => Store3A is NOT synchronized with the
+            // authoritative block. FAIL-CLOSED: do not publish an invalid Delta; mark the
+            // observer ERROR/NEEDS_RECOVERY and stop publishing subsequent blocks.
+            st.mismatch++; st.needsRecovery = true; st.lastHeight = pindex->nHeight;
+            st.lastAuthorityMismatch = !dsOnly.empty()
+                ? "current-block authority lacks a Store3A-Delta spend (surplus in Delta)"
+                : "current-block authority has a spend absent from Store3A-Delta (dropped)";
+            printf("S1.7G_AUTHFAIL h=%d surpluses=%zu dropped=%zu needsRecovery=true (Delta NOT published; observer ERROR/NEEDS_RECOVERY)\n",
+                   (int)pindex->nHeight, (size_t)dsOnly.size(), (size_t)asOnly.size());
+            return;
         }
     }
 
     cs::Hash bh; memcpy(bh.data(), pindex->GetBlockHash().begin(), 32);
     cs::ChainError pe;
     if (!st.store->publish(d, bh, pindex->nHeight, &pe)) {
-        ++st.fails; st.lastOpError = ce.ok()? pe.str() : ce.str(); st.lastHeight = pindex->nHeight; return;
+        ++st.fails; st.needsRecovery = true;   // publish/open/disconnect/position inconsistency
+        st.lastOpError = pe.str(); st.lastHeight = pindex->nHeight; return;
     }
     ++st.published; st.lastOps = d.ops.size(); st.lastHeight = pindex->nHeight;
 }

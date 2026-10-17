@@ -9,6 +9,7 @@
 #include <memory>     // A.13.4-R3 bounded CTxDB lifetime
 #include "init.h"
 #include "main.h"
+#include "chainstate/observe_hook.h"   // S1.7 off-by-default Store3A mirror during -loadblock replay
 #include "kernel.h"
 #include "miner.h"
 #include "txdb.h"
@@ -1822,11 +1823,49 @@ authoritative_startup_ready:
     {
         uiInterface.InitMessage(_("Importing blockchain data file."));
 
+        // S1.7 — off-by-default Store3A mirror during -loadblock replay. When
+        // -s16store3a=<dir> is given, arm the guarded ConnectBlock hook against a
+        // fresh CommitStore3A at that directory so every replayed block's real
+        // coin transitions are observed and published (fail-closed on mismatch).
+        // Absent the flag, behavior is byte-for-byte the stock -loadblock path.
+        s16::ChainObserveState* armed = NULL;
+        cs::store3a::CommitStore3A s3aStore;
+        const std::string s3aDir = GetArg("-s16store3a", "");
+        bool s3aOk = false;
+        if (!s3aDir.empty())
+        {
+            cs::ChainError s3aErr;
+            s3aOk = s3aStore.open(s3aDir, &s3aErr);
+            if (!s3aOk)
+                return InitError(strprintf("Store3A mirror open failed at %s: %s", s3aDir, s3aErr.str()));
+            s16::g_chainObserve.store = &s3aStore;
+            s16::g_chainObserve.enabled = true;
+            s16::g_chainObserve.checkAuthority = true;
+            armed = &s16::g_chainObserve;
+            printf("S1.7 store3a mirror armed at %s\n", s3aDir.c_str());
+        }
+
         for (string strFile : mapMultiArgs["-loadblock"])
         {
             FILE *file = fopen(strFile.c_str(), "rb");
             if (file)
                 LoadExternalBlockFile(file);
+        }
+
+        if (armed)
+        {
+            unsigned long long keys = 0;
+            {
+                std::vector<cs::store3a::LeafEntry> lents; cs::ChainError ceCnt;
+                if (const_cast<cs::store3a::BTree&>(s3aStore.tree()).collectAll(&lents, &ceCnt)) keys = lents.size();
+            }
+            printf("S1.7 [store3a] blocks=%llu published=%llu fails=%llu mismatch=%llu lastHeight=%d lastOpErr=%s storeKeys=%llu needsRecovery=%d lastMismatch=%s\n",
+                   (unsigned long long)armed->blocks, (unsigned long long)armed->published,
+                   (unsigned long long)armed->fails, (unsigned long long)armed->mismatch,
+                   (int)armed->lastHeight, armed->lastOpError.c_str(), keys,
+                   (int)(armed->needsRecovery ? 1 : 0), armed->lastAuthorityMismatch.c_str());
+            armed->enabled = false;
+            s3aStore.close();
         }
         exit(0);
     }

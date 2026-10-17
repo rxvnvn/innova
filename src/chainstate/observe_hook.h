@@ -24,6 +24,9 @@ struct ChainObserveState {
     uint64_t published = 0;                // successful observeDelta+publish
     uint64_t fails = 0;                    // hook failures (block still connects)
     uint64_t mismatch = 0;                 // authority cross-check mismatches
+    bool needsRecovery = false;            // ERROR/NEEDS_RECOVERY: a hard divergence (or
+                                           // publish/open/disconnect/position error) was seen;
+                                           // no further Delta is published until explicitly reset
     std::string lastOpError;               // last observeDelta/publish error
     std::string lastAuthorityMismatch;     // last authority-gate divergence
     uint64_t lastOps = 0;                  // ops in the last published Delta

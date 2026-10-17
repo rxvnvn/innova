@@ -8,6 +8,7 @@
 #pragma once
 #include "chainstate.h"
 #include <array>
+#include <deque>
 #include <vector>
 #include <string>
 
@@ -70,6 +71,12 @@ public:
     bool keysWithTxidPrefix(const uint8_t* txid32, std::vector<Key>* out, ChainError* e) const;
     bool put(const Key& k, const std::vector<uint8_t>& val, ChainError* e);
     bool erase(const Key& k, ChainError* e);
+    // Free-page reuse (S1.7-G): pages retired by CoW commits are reclaimed and reused once
+    // their generation is acknowledged, so the append-only file stops growing unboundedly
+    // (no on-disk format change). Call retireMovedToFree() after each acknowledged commit.
+    void retireMovedToFree();                      // move this commit's retired pages into the free-list
+    void clearRetired();                          // drop any staged retired set (used on commit rollback)
+    size_t freeListSize() const { return freeList_.size(); }
     bool collectAll(std::vector<LeafEntry>* out, ChainError* e) const;
     bool verifyAll(ChainError* e) const;                     // full traversal (test only)
 
@@ -101,6 +108,8 @@ private:
     size_t partialAppendOn_ = 0;
     mutable uint64_t reads_ = 0;
     uint64_t writes_ = 0;
+    std::vector<uint32_t> commitRetired_;   // pages retired by the current commit (CoW rewrites)
+    std::deque<uint32_t> freeList_;          // reusable pages unreachable from ev. current root
 };
 
 }} // namespace cs::store3a

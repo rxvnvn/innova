@@ -111,23 +111,26 @@ bool observeDelta(const ObservedBlock& b, const GetPrevCoinFn& getPrevCoin,
     return true;
 }
 
-bool authoritySpendsMatch(const Delta& d, const ObservedAuthority& auth,
-                          std::string* mismatch) {
-    // delta spend outpoints
-    std::vector<OutPoint> ds;
+void authoritySpendDiff(const Delta& d, const ObservedAuthority& auth,
+                        std::vector<OutPoint>* dsOnly,
+                        std::vector<OutPoint>* asOnly) {
+    std::vector<OutPoint> ds, as;
     for (size_t i = 0; i < d.ops.size(); ++i)
         if (d.ops[i].afterPresent == false && d.ops[i].beforePresent == true)
             ds.push_back(d.ops[i].op);
+    as = auth.spent;
     std::sort(ds.begin(), ds.end());
-    std::vector<OutPoint> as = auth.spent;
     std::sort(as.begin(), as.end());
+    if (dsOnly) std::set_difference(ds.begin(), ds.end(), as.begin(), as.end(),
+                                    std::back_inserter(*dsOnly));
+    if (asOnly) std::set_difference(as.begin(), as.end(), ds.begin(), ds.end(),
+                                    std::back_inserter(*asOnly));
+}
 
+bool authoritySpendsMatch(const Delta& d, const ObservedAuthority& auth,
+                          std::string* mismatch) {
     std::vector<OutPoint> dsOnly, asOnly;
-    std::set_difference(ds.begin(), ds.end(), as.begin(), as.end(),
-                        std::back_inserter(dsOnly));
-    std::set_difference(as.begin(), as.end(), ds.begin(), ds.end(),
-                        std::back_inserter(asOnly));
-
+    authoritySpendDiff(d, auth, &dsOnly, &asOnly);
     if (!dsOnly.empty() || !asOnly.empty()) {
         if (mismatch) {
             if (!dsOnly.empty())

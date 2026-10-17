@@ -939,7 +939,11 @@ bool CommitStore3A::openWithOptions(const std::string& dir, const OpenOptions& o
     // an UNDOINDEX left over from another store is not treated as authority (documented as OPEN).
     if (!ixFreshPath_ && !classifyAndNormalizeUndoIndex(e)){ close(); return false; }
     undoIndexState_ = ixFreshPath_ ? UndoIndexState::None : undoIndexState_;
-    cleanupTmp(); needsReopen_=false; reopenWhy_.clear(); freshOneShotTaken_=false; heldLogFd_=-1; opened_=true; return true;
+    cleanupTmp(); needsReopen_=false; reopenWhy_.clear(); freshOneShotTaken_=false; heldLogFd_=-1;
+    // S1.7-G: open stays O(1) root-hash verification (non-root corruption is detected lazily, fail-closed
+    // on read — see M1-pathverify). Free-page reuse is done WITHIN a run (commitRetired + retire-after-ACK +
+    // appendPage reuse), which bounds tree.dat for fresh stores without an open-time full-tree walk.
+    opened_=true; return true;
 }
 
 bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e){
@@ -1061,6 +1065,8 @@ bool CommitStore3A::publish(const Delta& d, const Hash& blockHash, int32_t heigh
     if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
     if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen before any further mutation: "+reopenWhy_); return false; }
     uint32_t oldRoot=tree_.rootId(); Hash oldHash=tree_.rootHash(); ChainError er;
+    tree_.clearRetired();   // S1.7-G: drop any staged retired set from a prior aborted commit (a
+                            // rolled-back root may still reference those pages -> never free them)
     // apply delta (CoW; new pages only)
     for (const Op& op: d.ops){
         Key k=op.op.keyBytes();
@@ -1089,6 +1095,7 @@ bool CommitStore3A::publish(const Delta& d, const Hash& blockHash, int32_t heigh
     UndoMeta meta; meta.blockHash=blockHash; meta.height=height; meta.offset=undoCommittedBytes_; meta.len=(uint32_t)recBytes.size();
     generation_=newGen; undoCommittedBytes_=newUndoSize; recentPush(meta); undoRecordCount_++;
     ackGen_=newGen; ackPresent_=true; blockHash_=blockHash; tipHeight_=height;
+    tree_.retireMovedToFree();   // S1.7-G: acked generation -> its CoW-retired pages become reusable
     return true;
 }
 
@@ -1096,6 +1103,7 @@ bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
     clearErr(e);
     if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
     if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen before any further mutation: "+reopenWhy_); return false; }
+    tree_.clearRetired();
     if(undoRecent_.empty()){            // deep peel beyond the bounded recent window: refill on demand
         if(!reloadRecentFromStream(e)) return false;
         if(undoRecent_.empty() || undoRecent_.back().offset + undoRecent_.back().len != undoCommittedBytes_){
@@ -1124,6 +1132,7 @@ bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
     generation_=newGen; undoCommittedBytes_=newUndoSize; undoRecent_.pop_back(); undoRecordCount_--;
     trimUncommittedSegments();
     ackGen_=newGen; ackPresent_=true; blockHash_=Hash(); tipHeight_=m.tipHeight;
+    tree_.retireMovedToFree();   // S1.7-G: acked disconnect gen -> retired pages reusable
     return true;
 }
 

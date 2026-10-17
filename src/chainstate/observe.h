@@ -82,4 +82,15 @@ bool observeDelta(const ObservedBlock& b, const GetPrevCoinFn& getPrevCoin,
 bool authoritySpendsMatch(const Delta& d, const ObservedAuthority& auth,
                           std::string* mismatch);
 
+// Two-sided spend-set diff. dsOnly = delta spends the authority does NOT list
+// (a real adapter/authority disagreement -> hard divergence). asOnly =
+// authority spends the delta does NOT list (BENIGN here: the authority's
+// mapQueuedChanges vSpent vector carries PRIOR blocks' spent indices too, so a
+// touched prev-tx can over-report earlier spends; and anon-input spends are
+// intentionally excluded from the ordinary-coin delta). The hook hard-fails on
+// dsOnly non-empty and treats asOnly-only as informational.
+void authoritySpendDiff(const Delta& d, const ObservedAuthority& auth,
+                        std::vector<OutPoint>* dsOnly,
+                        std::vector<OutPoint>* asOnly);
+
 } // namespace cs
