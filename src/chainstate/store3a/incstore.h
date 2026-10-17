@@ -248,7 +248,10 @@ public:
     bool existsUnspentTxid(const Hash& txid, bool* found, ChainError* e) const;
 
     bool publish(const Delta& d, const Hash& blockHash, int32_t height, ChainError* e);
-    bool disconnect(const Hash& blockHash, ChainError* e);
+    bool disconnect(const Hash& blockHash, const Hash& parentTipHash, ChainError* e);
+    bool disconnect(const Hash& blockHash, ChainError* e) {
+        return disconnect(blockHash, Hash(), e);
+    }
 
     // test hooks
     void setCrashPoint(CrashPoint c) { crashPoint_ = c; }

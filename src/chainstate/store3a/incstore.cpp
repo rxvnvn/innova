@@ -1099,7 +1099,7 @@ bool CommitStore3A::publish(const Delta& d, const Hash& blockHash, int32_t heigh
     return true;
 }
 
-bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
+bool CommitStore3A::disconnect(const Hash& blockHash, const Hash& parentTipHash, ChainError* e){
     clearErr(e);
     if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
     if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen before any further mutation: "+reopenWhy_); return false; }
@@ -1117,7 +1117,7 @@ bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
         if(o.beforePresent){ std::vector<uint8_t> v=o.before.encode(); if(!tree_.put(k,v,e)){ ChainError x; tree_.setRoot(oldRoot,oldHash,&x); return false; } }
         else { if(!tree_.erase(k,e)){ ChainError x; tree_.setRoot(oldRoot,oldHash,&x); return false; } } }
     uint64_t newGen=generation_+1; uint64_t newUndoSize=undoCommittedBytes_-meta.len;
-    Manifest m; m.generation=newGen; m.undoSize=newUndoSize; m.rootPageId=tree_.rootId(); m.rootHash=tree_.rootHash(); m.blockHash=Hash(); m.tipHeight=tipHeight_-1;
+    Manifest m; m.generation=newGen; m.undoSize=newUndoSize; m.rootPageId=tree_.rootId(); m.rootHash=tree_.rootHash(); m.blockHash=parentTipHash; m.tipHeight=tipHeight_-1;
     if(!commitBarriers(m,0,NULL,0,e)){
         if(!renamePassed_) tree_.setRoot(oldRoot,oldHash,&er);      // no new generation became authoritative
         if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }   // R3: release the held log descriptor
@@ -1131,7 +1131,7 @@ bool CommitStore3A::disconnect(const Hash& blockHash, ChainError* e){
     if(!ackOk){ requireReopen("the generation was published but its acknowledgment failed"); return false; }
     generation_=newGen; undoCommittedBytes_=newUndoSize; undoRecent_.pop_back(); undoRecordCount_--;
     trimUncommittedSegments();
-    ackGen_=newGen; ackPresent_=true; blockHash_=Hash(); tipHeight_=m.tipHeight;
+    ackGen_=newGen; ackPresent_=true; blockHash_=parentTipHash; tipHeight_=m.tipHeight;
     tree_.retireMovedToFree();   // S1.7-G: acked disconnect gen -> retired pages reusable
     return true;
 }

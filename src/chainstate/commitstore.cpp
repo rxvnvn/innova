@@ -462,7 +462,7 @@ bool CommitStore::publish(const Delta& d, const Hash& blockHash, int32_t height,
     return true;
 }
 
-bool CommitStore::disconnect(const Hash& blockHash, ChainError* e) {
+bool CommitStore::disconnect(const Hash& blockHash, const Hash& parentTipHash, ChainError* e) {
     clearErr(e);
     if (!opened_) { setErr(e, ErrCode::NOT_OPEN, dir_); return false; }
     if (needsReopen_) { setErr(e, ErrCode::NOT_OPEN, "store requires reopen after a post-rename failure"); return false; }
@@ -485,7 +485,7 @@ bool CommitStore::disconnect(const Hash& blockHash, ChainError* e) {
     Manifest m;
     m.generation = newGen; m.undoSize = newUndoSize;
     m.stateName = stateNameFor(newGen); m.stateDigest = newState.digest();
-    m.blockHash = Hash(); m.tipHeight = tipHeight_ - 1;
+    m.blockHash = parentTipHash; m.tipHeight = tipHeight_ - 1;
     std::vector<uint8_t> stateBytes = newState.serialize();
     m.fileHash = sha256(stateBytes);
 
@@ -497,7 +497,7 @@ bool CommitStore::disconnect(const Hash& blockHash, ChainError* e) {
 
     state_ = newState; generation_ = newGen; undoIndex_.pop_back();
     undoCommittedBytes_ = newUndoSize; ackGen_ = newGen; ackPresent_ = true;
-    blockHash_ = Hash(); tipHeight_ = m.tipHeight;
+    blockHash_ = parentTipHash; tipHeight_ = m.tipHeight;
     gcStateFiles();
     return true;
 }

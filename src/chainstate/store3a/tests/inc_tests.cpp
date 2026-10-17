@@ -3556,11 +3556,57 @@ static void test_obs2_adapter(){
     }
 }
 
+// M3-PARENTTIP: Store3A disconnect must publish the DISCONNECTED block's PARENT as
+// the new tip identity (not a zeroed hash), so Store3A tip == BI-V2 tip through a
+// reorg down to the fork point, and that identity must persist across restart.
+// Regression for v0.3 contradiction #4 (disconnect published a zeroed parent blockHash).
+static void test_m3_parent_tip_identity(){
+    g_cur="M3-PARENTTIP";
+    std::string dir=freshDir("m3-ptip");
+    ChainError e;
+    {
+        CommitStore3A s; CHECK(s.open(dir,&e),"open: "+e.str());
+        CHECK(PUBH(s,1,0,0,3,&e),"publish h1: "+e.str());
+        CHECK(PUBH(s,2,0,0,3,&e),"publish h2: "+e.str());
+        CHECK(PUBH(s,3,0,0,2000,&e),"publish h3: "+e.str());
+        CHECK(s.tipHash()==id32(0xB10C0000u,3), "tip is h3 after publish");
+        CHECK(s.tipHeight()==3, "tip height 3 after publish");
+        // disconnect h3 -> tip must become h2 (parent), not zero
+        CHECK(s.disconnect(id32(0xB10C0000u,3), id32(0xB10C0000u,2), &e), "disconnect h3 w/ parent h2: "+e.str());
+        CHECK(s.tipHash()==id32(0xB10C0000u,2), "tip identity is PARENT h2 after disconnect h3");
+        CHECK(s.tipHeight()==2, "tip height 2 after disconnect h3");
+        // disconnect h2 -> tip must become h1
+        CHECK(s.disconnect(id32(0xB10C0000u,2), id32(0xB10C0000u,1), &e), "disconnect h2 w/ parent h1: "+e.str());
+        CHECK(s.tipHash()==id32(0xB10C0000u,1), "tip identity is PARENT h1 after disconnect h2");
+        CHECK(s.tipHeight()==1, "tip height 1 after disconnect h2");
+        // PERSISTENCE: close at the reorg fork point (tip h1) and reopen
+        s.close();
+    }
+    {
+        CommitStore3A r; CHECK(r.open(dir,&e),"reopen: "+e.str());
+        CHECK(r.tipHash()==id32(0xB10C0000u,1), "parent tip identity persists across restart (tip h1)");
+        CHECK(r.tipHeight()==1, "parent tip height persists across restart");
+        // disconnect the fork-point block with a genesis parent (zero) -> empty tip
+        CHECK(r.disconnect(id32(0xB10C0000u,1), Hash(), &e), "disconnect h1 w/ genesis parent (zero): "+e.str());
+        CHECK(r.tipHash()==Hash(), "empty store tip is zero after full unwind");
+        CHECK(r.tipHeight()==0, "empty store tip height 0 after full unwind");
+        r.close();
+    }
+    {
+        CommitStore3A q; CHECK(q.open(dir,&e),"reopen2: "+e.str());
+        CHECK(q.tipHash()==Hash() && q.tipHeight()==0, "unwound-to-empty tip identity persists across restart");
+        // a fresh re-publish after the full unwind must roll a NEW generation from a consistent base
+        CHECK(PUBH(q,1,0,0,3,&e),"republish h1 after unwind: "+e.str());
+        CHECK(q.tipHash()==id32(0xB10C0000u,1), "re-publish after unwind sets tip h1");
+        q.close();
+    }
+}
+
 int main(){
     setvbuf(stdout,NULL,_IONBF,0);
     struct Case{ const char* n; void(*fn)(); };
 
-    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail}, {"UNDOIDX-FASTIDX-equiv",test_undoidx_fastidx_equiv}, {"UNDOIDX-FASTIDX-fallback",test_undoidx_fastidx_fallback}, {"UNDOIDX-FASTIDX-damaged",test_undoidx_fastidx_damaged}, {"UNDOIDX-FASTIDX-recovery",test_undoidx_fastidx_recovery}, {"UNDOIDX-FASTIDX-measure",test_undoidx_fastidx_measure}, {"UNDOIDX-BOUND-basic",test_undoidx_bound_basic}, {"UNDOIDX-BOUND-deep",test_undoidx_bound_deep}, {"UNDOIDX-BOUND-integrity",test_undoidx_bound_integrity}, {"UNDOIDX-BOUND-work",test_undoidx_bound_work}, {"OBS2-adapter",test_obs2_adapter} };
+    Case cases[]={ {"B0-btree",test_b0_btree}, {"D1-diff",test_d1_differential}, {"C1-crash",test_c1_crash}, {"K1-corrupt",test_k1_corruption}, {"M1-pathverify",test_m1_path_verify}, {"P6-partialappend",test_p6_partial_append}, {"S1-scale",test_s1_scaling}, {"R2-freshopen",test_r2_fresh_open}, {"R2-atomic",test_r2_multi_key_atomic}, {"F0-undo",test_f0_undo}, {"R1-F0-1",test_r1_f01_backup_window}, {"R1-crash",test_r1_crash_matrix}, {"R1-fresh",test_r1_fresh_open_matrix}, {"F0-R2-toctou",test_r2_toctou}, {"F0-R2-race",test_r2_toctou_race}, {"F0-R3-retry",test_r3_retry}, {"F0-R3-reopen",test_r3_reopen}, {"F0-R3-postlstat",test_r3_postlstat}, {"UNDOIDX-format",test_undoidx_format}, {"UNDOIDX-boundary",test_undoidx_boundary_small}, {"UNDOIDX-corrupt",test_undoidx_corruption}, {"UNDOIDX-states",test_undoidx_states}, {"UNDOIDX-crash",test_undoidx_crash_points}, {"UNDOIDX-behavior",test_undoidx_no_side_effects}, {"UNDOIDX-cost",test_undoidx_cost}, {"UNDOIDX-real_boundary",test_undoidx_real_boundary}, {"UNDOIDX-F1-recovery",test_undoidx_f1_recovery}, {"UNDOIDX-F1-faults",test_undoidx_f1_faults}, {"UNDOIDX-F1-real",test_undoidx_f1_real}, {"UNDOIDX-F2-linkfail",test_undoidx_f2_linkfail}, {"UNDOIDX-FASTIDX-equiv",test_undoidx_fastidx_equiv}, {"UNDOIDX-FASTIDX-fallback",test_undoidx_fastidx_fallback}, {"UNDOIDX-FASTIDX-damaged",test_undoidx_fastidx_damaged}, {"UNDOIDX-FASTIDX-recovery",test_undoidx_fastidx_recovery}, {"UNDOIDX-FASTIDX-measure",test_undoidx_fastidx_measure}, {"UNDOIDX-BOUND-basic",test_undoidx_bound_basic}, {"UNDOIDX-BOUND-deep",test_undoidx_bound_deep}, {"UNDOIDX-BOUND-integrity",test_undoidx_bound_integrity}, {"UNDOIDX-BOUND-work",test_undoidx_bound_work}, {"OBS2-adapter",test_obs2_adapter}, {"M3-PARENTTIP-disconnect",test_m3_parent_tip_identity} };
     printf("== Stage 3A incremental chainstate test suite ==\n");
     const char* only=getenv("STORE3A_ONLY");
     for (auto& c: cases){

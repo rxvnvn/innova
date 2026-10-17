@@ -6249,6 +6249,31 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
 
 bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 {
+    // S2.0-M3: Store3A-authoritative undo disconnect (V2 mode). ConnectBlock's
+    // Store3A publish recorded this block's ordered undo; disconnecting here
+    // reverses it (spent coins restored, created coins erased) and publishes a
+    // new MANIFEST whose tip identity is THIS block's parent (not zeroed), so
+    // Store3A tip == BI-V2 tip through a reorg down to the fork point. The
+    // legacy txindex reversal below is RETAINED for the consumers that have not
+    // yet cut over (mempool M4, wallet M5) and is removed with those in the
+    // legacy-writer sweep (M8); in V2 mode Store3A remains the consensus UTXO
+    // authority. Fail-closed: a Store3A undo failure refuses the disconnect.
+    if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+        s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
+    {
+        cs::Hash bh; memcpy(bh.data(), pindex->GetBlockHash().begin(), 32);
+        cs::Hash parentH;
+        if (pindex->pprev)
+            memcpy(parentH.data(), pindex->pprev->GetBlockHash().begin(), 32);
+        cs::ChainError se;
+        if (!s16::g_chainObserve.store->disconnect(bh, parentH, &se))
+        {
+            s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+            return error("DisconnectBlock() : Store3A V2 AUTHORITATIVE undo disconnect FAILED at height %d for %s (%s) — fail-closed, no legacy fallback",
+                         (int)pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,20).c_str(), se.str().c_str());
+        }
+    }
+
     // Disconnect in reverse order. HREG reverse-state replay must happen
     // immediately after each tx's inputs are disconnected, while earlier same-
     // block parent tx indices still exist in txdb.
