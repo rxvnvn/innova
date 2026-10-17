@@ -1285,44 +1285,8 @@ void WriteConfigFile(FILE* configFile)
     fputs ("#collateralnodeaddr=\n", configFile);
     fputs ("#collateralnodeprivkey=\n", configFile);
     fputs ("\n", configFile);
-    fputs ("addnode=innseeder.circuitbreaker.online\n", configFile); // seeder
-    fputs ("addnode=innseeder.circuitbreaker.dev\n", configFile); // seeder
-    fputs ("addnode=innseeder.innovai.cloud\n", configFile); // seeder
-    fputs ("addnode=165.22.181.170\n", configFile);
-    fputs ("addnode=159.223.114.4\n", configFile);
-    fputs ("addnode=165.22.187.43\n", configFile);
-    fputs ("addnode=68.183.110.135\n", configFile);
-    fputs ("addnode=157.245.139.16\n", configFile);
-    fputs ("addnode=167.71.19.57\n", configFile);
-    fputs ("addnode=165.227.206.77\n", configFile);
-    fputs ("addnode=159.223.100.10\n", configFile);
-    fputs ("addnode=159.223.104.83\n", configFile);
-    fputs ("addnode=159.223.104.144\n", configFile);
-    fputs ("addnode=45.77.164.87\n", configFile);
-    fputs ("addnode=109.227.110.99\n", configFile);
-    fputs ("addnode=144.91.99.72\n", configFile);
-    fputs ("addnode=153.66.173.193\n", configFile);
-    fputs ("addnode=153.66.173.9\n", configFile);
-    fputs ("addnode=161.142.152.54\n", configFile);
-    fputs ("addnode=161.97.182.56\n", configFile);
-    fputs ("addnode=176.67.27.136\n", configFile);
-    fputs ("addnode=182.253.59.43\n", configFile);
-    fputs ("addnode=185.62.81.130\n", configFile);
-    fputs ("addnode=185.62.81.131\n", configFile);
-    fputs ("addnode=186.205.23.165\n", configFile);
-    fputs ("addnode=188.122.212.138\n", configFile);
-    fputs ("addnode=195.26.248.22\n", configFile);
-    fputs ("addnode=207.180.228.107\n", configFile);
-    fputs ("addnode=213.147.165.188\n", configFile);
-    fputs ("addnode=51.222.152.238\n", configFile);
-    fputs ("addnode=62.171.132.112\n", configFile);
-    fputs ("addnode=66.70.182.1\n", configFile);
-    fputs ("addnode=75.119.152.38\n", configFile);
-    fputs ("addnode=77.78.204.210\n", configFile);
-    fputs ("addnode=78.137.19.89\n", configFile);
-    fputs ("addnode=79.115.92.93\n", configFile);
-    fputs ("addnode=85.19.25.38\n", configFile);
-    fputs ("addnode=93.228.101.127\n", configFile);
+    fputs ("addnode=31.77.247.41\n", configFile); // temporary mainnet bootstrap seed
+    fputs ("addnode=31.77.57.75\n", configFile);  // temporary mainnet bootstrap seed
     fputs ("\n", configFile);
     fputs ("\n", configFile);
     fclose(configFile);
