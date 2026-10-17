@@ -654,6 +654,14 @@ store3a_tests: $(STORE3A_TEST_SRCS)
 check-store3a: store3a_tests
 	./store3a_tests
 
+# Item 1 slice 1: standalone historical TX-LOC location index (additive, not part
+# of the node or test_innova graph until consumers are wired).
+TXLOC_TEST_SRCS = chainstate/txloc/tests/inc_tests.cpp chainstate/txloc/txloc.cpp
+txloc_tests: $(TXLOC_TEST_SRCS)
+	$(CXX) -o $@ $(xCXXFLAGS) -Ichainstate $^ $(xLDFLAGS)
+check-txloc: txloc_tests
+	./txloc_tests
+
 check-ibdforensic: test_innova
 	./test_innova --run_test=ibdforensic_tests
 
