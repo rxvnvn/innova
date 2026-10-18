@@ -7,6 +7,8 @@
 #include "script.h"
 #include "txdb.h"
 #include "blockindex_authoritative_startup.h"
+#include "chainstate/observe_hook.h"
+#include "chainstate/txloc/txloc.h"
 
 #include <map>
 #include <set>
@@ -277,7 +279,23 @@ bool BuildReplayInputsForTx(CTxDB& txdb,
         }
 
         CTxIndex txindex;
-        if (!txdb.ReadTxIndex(prevout.hash, txindex))
+        const bool fV2HREG = (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+                              s16::g_chainObserve.store && s16::g_chainObserve.store->opened());
+        if (fV2HREG)
+        {
+            // M6: resolve the prev tx's historical location via TX-LOC (no legacy txindex).
+            txloc::Loc tl; bool locFound = false; txloc::ChainError te;
+            cs::Hash th; memcpy(th.data(), prevout.hash.begin(), 32);
+            if (txloc::g_txloc.opened())
+                txloc::g_txloc.get(th.data(), &tl, &locFound, &te);
+            if (!locFound)
+            {
+                strError = strprintf("HREG rebuild: missing prev tx location (TX-LOC) %s", prevout.hash.ToString().c_str());
+                return false;
+            }
+            txindex = CTxIndex(CDiskTxPos(tl.nFile, tl.nBlockPos, tl.nTxPos), 0);
+        }
+        else if (!txdb.ReadTxIndex(prevout.hash, txindex))
         {
             strError = strprintf("HREG rebuild: missing prev tx index %s", prevout.hash.ToString().c_str());
             return false;
@@ -292,6 +310,20 @@ bool BuildReplayInputsForTx(CTxDB& txdb,
         {
             strError = strprintf("HREG rebuild: ReadFromDisk failed for %s", prevout.hash.ToString().c_str());
             return false;
+        }
+        if (fV2HREG)
+        {
+            // M6: synthesize vSpent from Store3A coin presence (an output is unspent iff its
+            // coin is present in the active-chain Store3A). Fail-closed: on an authority
+            // error the output is left spent (non-null vSpent).
+            txindex.vSpent.resize(txPrev.vout.size(), CDiskTxPos(1,1,1));
+            for (unsigned int n = 0; n < txPrev.vout.size(); ++n)
+            {
+                cs::OutPoint k; memcpy(k.txid.data(), prevout.hash.begin(), 32); k.n = n;
+                bool found = false; cs::Coin coin; cs::ChainError ce;
+                if (s16::g_chainObserve.store->get(k, &coin, &found, &ce) && found)
+                    txindex.vSpent[n] = CDiskTxPos();   // unspent on the active chain
+            }
         }
         mapInputs[prevout.hash] = std::make_pair(txindex, txPrev);
     }

@@ -149,11 +149,26 @@ static bool GetStakingTxIndex(const CWallet& wallet, CTxDB& txdb,
     if (!txindexOut)
         return false;
     AssertLockHeld(cs_main);
-    if (txdb.ReadTxIndex(wtx.GetHash(), *txindexOut))
-        return true;
-    if (!fHybridSPV || wtx.hashBlock == uint256(0))
-        return false;
-
+    // M6: in the armed-V2 mode the staking tx source position is resolved BY VALUE
+    // from the authoritative block (COLD_HOT_SEAM/BI-V2), never from the legacy
+    // txindex. Non-V2 keeps the legacy fast path.
+    const bool fV2Stake = (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+                           s16::g_chainObserve.store && s16::g_chainObserve.store->opened());
+    if (fV2Stake)
+    {
+        // V2: a stake source must be confirmed on-chain (hashBlock set) for its
+        // position to be derivable from the authoritative block; no legacy read.
+        if (wtx.hashBlock == uint256(0))
+            return false;
+    }
+    else
+    {
+        if (txdb.ReadTxIndex(wtx.GetHash(), *txindexOut))
+            return true;
+        if (!fHybridSPV || wtx.hashBlock == uint256(0))
+            return false;
+    }
+    // By-value authority path (the V2 staking source; non-V2 only when fHybridSPV).
     unsigned int nFile = 0, nBlockPos = 0;
     bool available = false;
     if (GetStakingSourceDiskPositionR(wallet, wtx.hashBlock,
