@@ -67,6 +67,10 @@ struct s16_V2InputView;
 // declared here because DisconnectBlock (~6548) precedes their definitions (~7096).
 bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash);
 static bool s16_AnonDisconnectBlock(const cs::Hash& blockHash, const cs::Hash& parentTipHash);
+// M8.3: resolve one anon-output read. Authoritative ANON store when opened (V2); legacy
+// CTxDB only when not opened (migrate bridge). Fills the legacy CAnonOutput so the
+// ring-sig/amount/depth checks downstream are unchanged.
+static bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao);
 
 //
 // Global state
@@ -4336,11 +4340,26 @@ bool GetKeyImage(CTxDB* ptxdb, ec_point& keyImage, CKeyImageSpent& keyImageSpent
 {
     AssertLockHeld(cs_main);
 
-
-    // -- check txdb first
+    // -- check authoritative ANON store first (V2); legacy txdb only when not opened.
     fInMempool = false;
-    if (ptxdb->ReadKeyImage(keyImage, keyImageSpent))
-        return true;
+    if (cs::anon::g_anon.opened()) {
+        if (keyImage.size() >= 33) {
+            cs::ChainError ane; bool found = false; cs::anon::CKeyImageSpent aki;
+            if (cs::anon::g_anon.getKi(keyImage.data(), &aki, &found, &ane)) {
+                if (found) {
+                    memcpy(keyImageSpent.txnHash.begin(), aki.txnHash.data(), 32);
+                    keyImageSpent.inputNo = aki.inputNo;
+                    keyImageSpent.nValue = aki.nValue;
+                    return true;
+                }
+            } else {
+                return false;   // authority read error (fail-closed, no legacy fallback)
+            }
+        }
+    } else {
+        if (ptxdb->ReadKeyImage(keyImage, keyImageSpent))
+            return true;
+    }
 
     if (mempool.lookupKeyImage(keyImage, keyImageSpent))
     {
@@ -5613,7 +5632,7 @@ static bool CheckAnonInputAB(CTxDB &txdb, const CTxIn &txin, int i, int nRingSiz
     for (int ri = 0; ri < nRingSize; ++ri)
     {
         pkRingCoin = CPubKey(&pPubkeys[ri * ec_compressed_size], ec_compressed_size);
-        if (!txdb.ReadAnonOutput(pkRingCoin, ao))
+        if (!s16_AnonReadAo(txdb, pkRingCoin, ao))
         {
             printf("CheckAnonInputsAB(): Error input %d, element %d AnonOutput %s not found.\n", i, ri);
             return false;
@@ -5739,7 +5758,7 @@ bool CTransaction::CheckAnonInputs(CTxDB& txdb, int64_t& nSumValue, bool& fInval
         for (int ri = 0; ri < nRingSize; ++ri)
         {
             pkRingCoin = CPubKey(&pPubkeys[ri * ec_compressed_size], ec_compressed_size);
-            if (!txdb.ReadAnonOutput(pkRingCoin, ao))
+            if (!s16_AnonReadAo(txdb, pkRingCoin, ao))
             {
                 printf("CheckAnonInputs(): Error input %d, element %d AnonOutput %s not found.\n", i, ri);
                 fInvalid = true; return false;
@@ -7192,6 +7211,22 @@ static bool s16_AnonDisconnectBlock(const cs::Hash& blockHash, const cs::Hash& p
         return error("DisconnectBlock() : ANON store undo disconnect FAILED for %s (%s) — fail-closed, no legacy fallback",
                      HexStr(blockHash.data(), blockHash.data()+32).substr(0,20).c_str(), e.str().c_str());
     return true;
+}
+static bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao)
+{
+    if (cs::anon::g_anon.opened()) {
+        cs::ChainError ane; bool found = false; cs::anon::CAnonOutput aao;
+        if (!cs::anon::g_anon.getAo(pkRingCoin.begin(), &aao, &found, &ane)) return false; // authority error (fail-closed)
+        if (!found) return false;
+        uint256 txnHash; memcpy(txnHash.begin(), aao.txid.data(), 32);
+        ao.outpoint = COutPoint(txnHash, aao.n);
+        ao.nValue = aao.nValue;
+        ao.nBlockHeight = aao.nBlockHeight;
+        ao.nCompromised = aao.nCompromised;
+        return true;
+    }
+    CPubKey pk = pkRingCoin;   // legacy ReadAnonOutput takes non-const CPubKey&
+    return txdb.ReadAnonOutput(pk, ao);
 }
 
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
