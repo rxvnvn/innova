@@ -566,6 +566,25 @@ static void test_feed_failclosed(){
       CHECK(ok || e.code==ErrCode::DUP_OUTPOINT, "t16c error = DUP_OUTPOINT: "+e.str()); }
 }
 
+static void test_classify_consistency(){
+    g_cur="T17-consistency";
+    std::string d=freshDir("t17"); ChainError e;
+    AnonStore s; CHECK(s.open(d,&e), "t17 open: "+e.str());
+    std::string det;
+    CHECK(s.classifyConsistency(id32(0x700000,5),5,&det)==AnonStore::StoreConsistency::Empty, "t17 fresh gen-0 store => Empty");
+    // connect one block (h1)
+    std::array<uint8_t,33> k=key33(1);
+    std::vector<Mutation> b; b.push_back(putAoMut(k,mkAo(1,1,100,1,0)));
+    Hash H1=id32(0x700000,1);
+    CHECK(s.connect(H1,1,b,&e), "t17 connect b1 at h1: "+e.str());
+    CHECK(s.classifyConsistency(H1,1,&det)==AnonStore::StoreConsistency::Current, "t17 current (matching store3a tip)");
+    CHECK(s.classifyConsistency(id32(0x700000,2),2,&det)==AnonStore::StoreConsistency::Behind, "t17 behind store3a by 1");
+    CHECK(s.classifyConsistency(id32(0x700000,0),0,&det)==AnonStore::StoreConsistency::Ahead, "t17 ahead-within-undo (rollback)");
+    CHECK(s.classifyConsistency(id32(0x700000,0),-1,&det)==AnonStore::StoreConsistency::Irreconcilable, "t17 ahead beyond retained undo => Irreconcilable");
+    CHECK(s.classifyConsistency(id32(0x800000,1),1,&det)==AnonStore::StoreConsistency::Irreconcilable, "t17 same-height different hash (fork) => Irreconcilable");
+    s.close();
+}
+
 // ============================ main =============================================
 int main(){
     printf("ANONSTATE isolated slice test suite\n");
@@ -586,6 +605,7 @@ int main(){
     test_feed_intrablock_visibility();
     test_feed_committed_ring();
     test_feed_failclosed();
+    test_classify_consistency();
     printf("---\n");
     if (g_fail==0) printf("ALL PASS (%d)\nPASS shown above\n", g_pass);
     else {

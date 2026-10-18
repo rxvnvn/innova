@@ -514,6 +514,37 @@ bool AnonStore::disconnect(const Hash& blockHash, const Hash& parentTipHash, Cha
     return true;
 }
 
+AnonStore::StoreConsistency AnonStore::classifyConsistency(const Hash& sHash, int32_t sHeight,
+                                                            std::string* detail) const
+{
+    std::string d;
+    if (!opened_) { d = "store not open"; if (detail) *detail = d; return StoreConsistency::NotOpen; }
+    const bool empty = (generation_ == 0 && tipHeight_ < 0 && undoCommittedBytes_ == 0 && valueCount_ == 0);
+    if (empty) {
+        d = "empty gen-0 store (full seed/feed required vs store3a tip h" + std::to_string((long long)sHeight) + ")";
+        if (detail) *detail = d; return StoreConsistency::Empty;
+    }
+    if (blockHash_ == sHash && tipHeight_ == sHeight) {
+        d = "current (anonstore tip == store3a tip)"; if (detail) *detail = d; return StoreConsistency::Current;
+    }
+    if (tipHeight_ < sHeight) {
+        d = "behind store3a by " + std::to_string((long long)(sHeight - tipHeight_)) + " blocks (rebuild-from-authority)";
+        if (detail) *detail = d; return StoreConsistency::Behind;
+    }
+    if (tipHeight_ > sHeight) {
+        const int64_t need = (int64_t)tipHeight_ - sHeight;
+        if (need <= (int64_t)undoMetas_.size()) {
+            d = "ahead by " + std::to_string((long long)need) + " (rollback via disconnect)";
+            if (detail) *detail = d; return StoreConsistency::Ahead;
+        }
+        d = "ahead beyond retained undo window by " + std::to_string((long long)need) + " (irreconcilable)";
+        if (detail) *detail = d; return StoreConsistency::Irreconcilable;
+    }
+    // tipHeight_ == sHeight but blockHash_ != sHash => same-height fork
+    d = "same height, different tip hash (fork)"; if (detail) *detail = d;
+    return StoreConsistency::Irreconcilable;
+}
+
 // Daemon-global authoritative ANON/key-image store (see anonstore.h).
 AnonStore g_anon;
 

@@ -100,6 +100,24 @@ public:
     bool finalizeSeed(const Hash& tipBlockHash, int32_t height, ChainError* e);
     bool seeded() const { return seeded_; }
 
+    // ---- Store3A-consistency classification (mandatory cutover condition #3) -------
+    // Before the ANON reads become authoritative, the anonstore must be reconciled with
+    // Store3A's committed tip (the sole authority). This classifies this store against a
+    // supplied Store3A tip so the daemon can decide: current (proceed), behind/empty
+    // (rebuild-from-authority via deterministic feed), ahead-with-undo (roll back by
+    // disconnect), or IRRECONCILABLE (fail-closed — never silently trust/rebuild a
+    // present-but-divergent store). Pure read query; no mutation.
+    enum class StoreConsistency {
+        NotOpen,        // store not opened
+        Empty,          // gen-0 empty store (needs full seed/feed)
+        Current,        // tip identical to Store3A tip
+        Behind,         // anonstore tip height < Store3A tip (rebuild-from-authority)
+        Ahead,          // anonstore tip height > Store3A tip and within retained undo (rollback)
+        Irreconcilable  // same-height-fork or ahead beyond the retained undo window
+    };
+    StoreConsistency classifyConsistency(const Hash& store3aTipHash, int32_t store3aTipHeight,
+                                         std::string* detail) const;
+
     // diagnostics
     uint64_t generation() const { return generation_; }
     const Hash& tipHash() const { return blockHash_; }
