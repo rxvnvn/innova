@@ -6611,41 +6611,45 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
                          (int)pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,20).c_str(), se.str().c_str());
         }
     }
-
-    // Disconnect in reverse order. HREG reverse-state replay must happen
-    // immediately after each tx's inputs are disconnected, while earlier same-
-    // block parent tx indices still exist in txdb.
-    for (int i = vtx.size()-1; i >= 0; i--)
+    else
     {
-        if (!vtx[i].DisconnectInputs(txdb))
-            return false;
-        if (hreg::IsHRegRecognitionActive(pindex->nHeight))
+        // M8: the legacy txindex reversal + block-index write below is the NON-V2 path
+        // only. In the armed-V2 mode Store3A undo (above) reverts the UTXO and BI-V2
+        // owns the block index, so no legacy txleveldb read/write happens here.
+        // Disconnect in reverse order. HREG reverse-state replay must happen
+        // immediately after each tx's inputs are disconnected, while earlier same-
+        // block parent tx indices still exist in txdb.
+        for (int i = vtx.size()-1; i >= 0; i--)
         {
-            CTransaction tx = vtx[i];
-            bool fInvalid = false;
-            MapPrevTx mapInputs;
-            std::map<uint256, CTxIndex> mapEmpty;
-            if (!tx.FetchInputs(txdb, mapEmpty, true, false, mapInputs, fInvalid))
-                return error("DisconnectBlock() : HREG FetchInputs failed");
-            std::string strHRegError;
-            if (!hreg::DisconnectHRegTx(tx, mapInputs, pindex->nHeight, strHRegError))
-                return error("DisconnectBlock() : HREG disconnect invalid: %s", strHRegError.c_str());
+            if (!vtx[i].DisconnectInputs(txdb))
+                return false;
+            if (hreg::IsHRegRecognitionActive(pindex->nHeight))
+            {
+                CTransaction tx = vtx[i];
+                bool fInvalid = false;
+                MapPrevTx mapInputs;
+                std::map<uint256, CTxIndex> mapEmpty;
+                if (!tx.FetchInputs(txdb, mapEmpty, true, false, mapInputs, fInvalid))
+                    return error("DisconnectBlock() : HREG FetchInputs failed");
+                std::string strHRegError;
+                if (!hreg::DisconnectHRegTx(tx, mapInputs, pindex->nHeight, strHRegError))
+                    return error("DisconnectBlock() : HREG disconnect invalid: %s", strHRegError.c_str());
+            }
+        }
+
+        // Update block index on disk without changing it in memory.
+        // The memory index structure will be changed after the db commits.
+        if (pindex->pprev)
+        {
+            CDiskBlockIndex blockindexPrev(pindex->pprev);
+            blockindexPrev.hashNext = 0;
+            if (!txdb.WriteBlockIndex(blockindexPrev))
+                return error("DisconnectBlock() : WriteBlockIndex failed");
         }
     }
 
-
-
-    // Update block index on disk without changing it in memory.
-    // The memory index structure will be changed after the db commits.
-    if (pindex->pprev)
-    {
-        CDiskBlockIndex blockindexPrev(pindex->pprev);
-        blockindexPrev.hashNext = 0;
-        if (!txdb.WriteBlockIndex(blockindexPrev))
-            return error("DisconnectBlock() : WriteBlockIndex failed");
-    }
-
-    // ppcoin: clean up wallet after disconnecting coinstake
+    // ppcoin: clean up wallet after disconnecting coinstake (runs in BOTH modes;
+    // it is a wallet update, not a legacy-txindex operation).
     for (CTransaction& tx : vtx)
         SyncWithWallets(tx, this, false, false);
 
@@ -7959,8 +7963,13 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 
     // innova: collect valid name tx
     // NOTE: tx.UpdateCoins should not affect this loop, probably...
-    if (!txdb.WriteBlockIndex(CDiskBlockIndex(pindex)))
-        return error("Connect() : WriteBlockIndex for pindex failed");
+    // M8: in armed-V2 BI-V2 owns the block index (AddToBlockIndex append); skip the
+    // legacy block-index write (no txleveldb write).
+    if (!s16_V2Armed())
+    {
+        if (!txdb.WriteBlockIndex(CDiskBlockIndex(pindex)))
+            return error("Connect() : WriteBlockIndex for pindex failed");
+    }
 
     if (fJustCheck)
     {
@@ -8015,10 +8024,17 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         }
     }
 
-    for (map<uint256, CTxIndex>::iterator mi = mapQueuedChanges.begin(); mi != mapQueuedChanges.end(); ++mi)
+    //
+    // M8: in the armed-V2 mode Store3A owns the UTXO and TX-LOC the historical location,
+    // so the legacy txindex queue write is redundant and is SKIPPED (no txleveldb write).
+    // Non-V2 writes the queued txindex changes as before.
+    if (!s16_V2Armed())
     {
-        if (!txdb.UpdateTxIndex((*mi).first, (*mi).second))
-            return error("ConnectBlock() : UpdateTxIndex failed");
+        for (map<uint256, CTxIndex>::iterator mi = mapQueuedChanges.begin(); mi != mapQueuedChanges.end(); ++mi)
+        {
+            if (!txdb.UpdateTxIndex((*mi).first, (*mi).second))
+                return error("ConnectBlock() : UpdateTxIndex failed");
+        }
     }
     if(GetBoolArg("-addrindex", false))
     {
@@ -8080,8 +8096,12 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     {
         CDiskBlockIndex blockindexPrev(pindex->pprev);
         blockindexPrev.hashNext = pindex->GetBlockHash();
-        if (!txdb.WriteBlockIndex(blockindexPrev))
-            return error("ConnectBlock() : WriteBlockIndex failed");
+        // M8: armed-V2 skips the legacy block-index write (BI-V2 owns the index).
+        if (!s16_V2Armed())
+        {
+            if (!txdb.WriteBlockIndex(blockindexPrev))
+                return error("ConnectBlock() : WriteBlockIndex failed");
+        }
     }
 
     if (fHRegActive)
@@ -9189,7 +9209,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         return false;
     {
         CSyncLockPhase phase("ProcessMessage(block)", "blockindex_db");
-        txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
+        if (!s16_V2Armed())
+            txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
     }
     {
         CSyncLockPhase phase("ProcessMessage(block)", "blockindex_db_commit");
@@ -9239,7 +9260,8 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         {
 
             CTxDB txdbIndexClean;
-            txdbIndexClean.EraseBlockIndex(hash);
+            if (!s16_V2Armed())
+                txdbIndexClean.EraseBlockIndex(hash);
             mapBlockIndex.erase(hash);
             if (pindexNew->IsProofOfStake())
                 setStakeSeen.erase(make_pair(pindexNew->prevoutStake, pindexNew->nStakeTime));
