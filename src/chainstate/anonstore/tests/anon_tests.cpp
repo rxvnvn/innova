@@ -4,6 +4,7 @@
 // revert, two-connect/two-disconnect reorg, crash-injection matrix (process crash + fault
 // injection), duplicate-anon fail-closed, key-image overwrite, valueCount accounting.
 #include "anonstore.h"
+#include "anonfeed.h"
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -471,6 +472,100 @@ static void test_seed_feed(){
     s.close();
 }
 
+// ======================= deterministic anon feed (slice-b-feed) tests ==============
+// Mock committed (pre-block) anon-output view.
+struct MockCommitted : public cs::anon::CommittedAoView {
+    std::map<std::array<uint8_t,33>, CAnonOutput> map;
+    bool getAo(const uint8_t key33[33], CAnonOutput* out) const override {
+        std::array<uint8_t,33> k{}; memcpy(k.data(), key33, 33);
+        std::map<std::array<uint8_t,33>, CAnonOutput>::const_iterator it = map.find(k);
+        if (it == map.end()) return false;
+        *out = it->second; return true;
+    }
+};
+static FeedOutput fOut(uint32_t txlabel, uint32_t n, const std::array<uint8_t,33>& pk, int64_t v){
+    FeedOutput o; o.txid=id32(0xA0000000,txlabel); o.n=n; o.pkCoin=pk; o.nValue=v; return o;
+}
+static FeedInput fIn(uint32_t txlabel, uint32_t no, const std::array<uint8_t,33>& ki,
+                     const std::vector<std::array<uint8_t,33>>& ring){
+    FeedInput i; i.txid=id32(0xB0000000,txlabel); i.inputNo=no; i.keyImage=ki; i.ring=ring; return i;
+}
+static void decodeAo(const Mutation& m, CAnonOutput* ao){
+    size_t off=0; ao->decode(m.after.data(), m.after.size(), &off); (void)off;
+}
+static void decodeKi(const Mutation& m, CKeyImageSpent* ki){
+    size_t off=0; ki->decode(m.after.data(), m.after.size(), &off); (void)off;
+}
+
+static void test_feed_deterministic(){
+    g_cur="T13-feeddet";
+    BlockFeed f; f.height=7; ChainError e;
+    BlockFeed::FeedTx t0; t0.outputs.push_back(fOut(1,0,key33(1),100)); t0.outputs.push_back(fOut(2,1,key33(2),200));
+    f.txs.push_back(t0);
+    MockCommitted cm;
+    std::vector<Mutation> m;
+    CHECK(deriveAnonMutations(f,cm,&m,&e), "t13 derive: "+e.str());
+    CHECK(m.size()==2, "t13 2 putAo for 2 outputs");
+    CHECK(m[0].ns==ANON_OUTPUT_NS && m[0].afterPresent && !m[0].beforePresent, "t13 m0 fresh putAo");
+    CHECK(m[1].ns==ANON_OUTPUT_NS && m[1].afterPresent && m[1].key==key33(2), "t13 m1 putAo key=key33(2)");
+    CAnonOutput ao0; decodeAo(m[0], &ao0);
+    CHECK(ao0.nValue==100 && ao0.nBlockHeight==7 && ao0.n==0 && ao0.nCompromised==0
+          && ao0.txid==id32(0xA0000000,1), "t13 ao0 value/height/n/txid deterministic");
+    CAnonOutput ao1; decodeAo(m[1], &ao1);
+    CHECK(ao1.nValue==200 && ao1.nBlockHeight==7 && ao1.n==1, "t13 ao1 deterministic");
+}
+static void test_feed_intrablock_visibility(){
+    g_cur="T14-feedintra";
+    BlockFeed f; f.height=8; ChainError e;
+    // earlier tx creates key33(1) (val100); later tx spends with ring {key33(1), key33(5)}
+    BlockFeed::FeedTx t0; t0.outputs.push_back(fOut(1,0,key33(1),100)); f.txs.push_back(t0);
+    BlockFeed::FeedTx t1; t1.inputs.push_back(fIn(2,0,key33(9), {key33(1), key33(5)})); f.txs.push_back(t1);
+    MockCommitted cm; cm.map[key33(5)] = mkAo(0xCC000000,5,100,3,0);   // committed decoy, equal value
+    std::vector<Mutation> m;
+    CHECK(deriveAnonMutations(f,cm,&m,&e), "t14 derive: "+e.str());
+    CHECK(m.size()==2, "t14 2 mutations (putAo key33(1) + putKi key33(9))");
+    CHECK(m[0].ns==ANON_OUTPUT_NS && m[0].key==key33(1), "t14 m0 = putAo for earlier-tx output");
+    CHECK(m[1].ns==KEY_IMAGE_NS && m[1].key==key33(9), "t14 m1 = putKi for spend");
+    CKeyImageSpent ki; decodeKi(m[1], &ki);
+    CHECK(ki.nValue==100 && ki.inputNo==0 && ki.txnHash==id32(0xB0000000,2),
+          "t14 spawn nValue resolved from in-block-created ring member (=100)");
+}
+static void test_feed_committed_ring(){
+    g_cur="T15-feedcommitted";
+    BlockFeed f; f.height=9; ChainError e;
+    BlockFeed::FeedTx t0; t0.inputs.push_back(fIn(5,2,key33(8), {key33(3), key33(4)})); f.txs.push_back(t0);
+    MockCommitted cm; cm.map[key33(3)] = mkAo(0x03000000,0,77,5,0); cm.map[key33(4)] = mkAo(0x04000000,1,77,6,0);
+    std::vector<Mutation> m;
+    CHECK(deriveAnonMutations(f,cm,&m,&e), "t15 derive: "+e.str());
+    CHECK(m.size()==1 && m[0].ns==KEY_IMAGE_NS, "t15 one putKi");
+    CKeyImageSpent ki; decodeKi(m[0], &ki);
+    CHECK(ki.nValue==77 && ki.inputNo==2 && ki.txnHash==id32(0xB0000000,5), "t15 spawned nValue from committed ring (=77)");
+}
+static void test_feed_failclosed(){
+    g_cur="T16-feedfail";
+    // (1) missing ring member
+    { BlockFeed f; f.height=9; ChainError e;
+      BlockFeed::FeedTx t0; t0.inputs.push_back(fIn(5,0,key33(8), {key33(3), key33(99)})); f.txs.push_back(t0);
+      MockCommitted cm; cm.map[key33(3)] = mkAo(0x03000000,0,77,5,0);
+      std::vector<Mutation> m; bool ok=deriveAnonMutations(f,cm,&m,&e);
+      CHECK(!ok, "t16a missing ring member fails closed");
+      CHECK(ok || e.code==ErrCode::MISSING_INPUT, "t16a error = MISSING_INPUT: "+e.str()); }
+    // (2) ring amount mismatch
+    { BlockFeed f; f.height=9; ChainError e;
+      BlockFeed::FeedTx t0; t0.inputs.push_back(fIn(5,0,key33(8), {key33(3), key33(4)})); f.txs.push_back(t0);
+      MockCommitted cm; cm.map[key33(3)] = mkAo(0x03000000,0,77,5,0); cm.map[key33(4)] = mkAo(0x04000000,1,99,6,0);
+      std::vector<Mutation> m; bool ok=deriveAnonMutations(f,cm,&m,&e);
+      CHECK(!ok, "t16b ring amount mismatch fails closed");
+      CHECK(ok || e.code==ErrCode::CORRUPT, "t16b error = CORRUPT (amount): "+e.str()); }
+    // (3) duplicate anon output created twice in one block
+    { BlockFeed f; f.height=9; ChainError e;
+      BlockFeed::FeedTx t0; t0.outputs.push_back(fOut(1,0,key33(1),100)); f.txs.push_back(t0);
+      BlockFeed::FeedTx t1; t1.outputs.push_back(fOut(2,0,key33(1),100)); f.txs.push_back(t1);
+      MockCommitted cm; std::vector<Mutation> m; bool ok=deriveAnonMutations(f,cm,&m,&e);
+      CHECK(!ok, "t16c duplicate in-block anon output fails closed");
+      CHECK(ok || e.code==ErrCode::DUP_OUTPOINT, "t16c error = DUP_OUTPOINT: "+e.str()); }
+}
+
 // ============================ main =============================================
 int main(){
     printf("ANONSTATE isolated slice test suite\n");
@@ -487,6 +582,10 @@ int main(){
     test_seed_crash();
     test_seed_dup();
     test_seed_feed();
+    test_feed_deterministic();
+    test_feed_intrablock_visibility();
+    test_feed_committed_ring();
+    test_feed_failclosed();
     printf("---\n");
     if (g_fail==0) printf("ALL PASS (%d)\nPASS shown above\n", g_pass);
     else {

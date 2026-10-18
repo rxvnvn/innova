@@ -148,3 +148,34 @@ Cases (RED-GREEN proven, crash-injected, restart-equivalence):
 - Genesis-to-tip migration feed for the `ao`/`ki` legacy keys (slice-c).
 - Bounded / segmented undo (deep-reorg beyond retained window).
 - Format version bump discipline for the anon MANIFEST on later field adds.
+
+## slice-c-prep (fc971c61) — bulk-seed migration base
+`seedAo`/`seedKi` (BTree `seedPut`: CoW append + free-page reclaim, root-hash
+authenticated per write) + `finalizeSeed` (ONE atomic publish, `undoSize=0` base;
+crash-before-finalize -> gen0 empty & re-seed re-runs; crash into/after the MANIFEST
+rename -> committed-previous or fully-seeded, never torn; disconnect below the seeded
+base -> fail-closed NOT_FOUND). Duplicate anon-output during seed -> DUP_OUTPOINT.
+Post-seed connect()/disconnect() add/revert their own undo records.
+
+## slice-b-feed — DETERMINISTIC, wallet-INDEPENDENT mutation derivation (anonfeed.h/.cpp)
+Mandatory cutover condition #2: ANON consensus-state must be formed deterministically
+from blocks and their transactions, INDEPENDENT of wallet ownership, wallet scan, or
+pwalletMain — wallet-specific handling must NOT be the sole mutation source. `anonfeed`
+owns this: a daemon adapter (main.cpp, later slice) extracts `FeedOutput`/`FeedInput`
+records from a CBlock (core.h IsAnonInput/ExtractKeyImage/ExtractRingSize, IsAnonOutput),
+and `deriveAnonMutations(BlockFeed, CommittedAoView, out, e)` emits the ordered
+`Mutation` vector a block connect must apply (putAo for created anon outputs, putKi for
+spent key images) and a disconnect must revert. Semantics:
+- PER-TX sequence (BlockFeed::FeedTx) preserved: intra-block visibility matches legacy
+  sequential processing — a later tx's inputs resolve against committed store + anon
+  outputs of STRICTLY EARLIER txs, never its own/later txs' outputs.
+- Key-image nValue = ring's common value (resolved from ring[0] + all members re-checked
+  equal). Missing ring member or amount mismatch -> FAIL CLOSED (MISSING_INPUT / CORRUPT).
+- All putAo/putKi are fresh: before-absent, after-present (anon output created once;
+  key image written once). Disconnect erases. In-block duplicate anon-output key ->
+  DUP_OUTPOINT fail-closed.
+- Isolated-linkable (no core.h, no wallet); verified in the anonstore harness (T13-T16).
+OPEN (still before authoritative read-switch, mandatory conditions #1 and #3): feed
+wiring into ConnectBlock/DisconnectBlock + Store3A-consistent atomicity + rebuild/
+fail-closed recovery + historical migration of non-empty state + undo; do NOT degrade
+these because a probed mainnet datadir (.innova txleveldb, 8.75M keys) had 0 ao / 0 ki.
