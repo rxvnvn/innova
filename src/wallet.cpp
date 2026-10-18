@@ -11,6 +11,7 @@
 #include "txdb.h"
 #include "wallet.h"
 #include "walletdb.h"
+#include "chainstate/observe_hook.h"
 #include "innovarpc.h"
 #include "crypter.h"
 #include "ui_interface.h"
@@ -1781,6 +1782,8 @@ void CWallet::ReacceptWalletTransactions()
 void CWallet::ReacceptWalletTransactions()
 {
     CTxDB txdb("r");
+    const bool fV2Wallet = (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+                            s16::g_chainObserve.store && s16::g_chainObserve.store->opened());
     bool fRepeat = true;
     while (fRepeat)
     {
@@ -1797,7 +1800,54 @@ void CWallet::ReacceptWalletTransactions()
 
             CTxIndex txindex;
             bool fUpdated = false;
-            if (txdb.ReadTxIndex(wtx.GetHash(), txindex))
+            if (fV2Wallet)
+            {
+                // M5: V2 reconstruction from Store3A + TX-LOC (no legacy txindex).
+                // A confirmed-on-chain tx (TX-LOC/Store3A present) gets any MINE output whose
+                // coin is ABSENT from Store3A marked spent (it was spent on-chain), exactly as
+                // legacy txindex.vSpent did. A not-yet-confirmed tx is re-accepted (routed via
+                // the V2 mempool from M4). Fail-closed: on a Store3A authority error we do NOT
+                // mark spent (never stale a coin on an authority hiccup).
+                if (s16::V2WalletTxidKnown(wtx.GetHash()))
+                {
+                    for (unsigned int i = 0; i < wtx.vout.size(); i++)
+                    {
+                        if (wtx.IsSpent(i))
+                            continue;
+                        cs::OutPoint k; memcpy(k.txid.data(), wtx.GetHash().begin(), 32); k.n = i;
+                        bool found = false; cs::Coin coin; cs::ChainError ce;
+                        if (!s16::g_chainObserve.store->get(k, &coin, &found, &ce))
+                        {
+                            printf("ERROR: ReacceptWalletTransactions() : Store3A read failed (V2); not marking %s\n",
+                                   wtx.GetHash().ToString().substr(0,10).c_str());
+                            continue;   // fail-closed: no authority -> do not change spent state
+                        }
+                        if (!found && IsMine(wtx.vout[i]))
+                        {
+                            wtx.MarkSpent(i);
+                            fUpdated = true;
+                            if (fHybridSPV)
+                            {
+                                COutPoint outpoint(wtx.GetHash(), i);
+                                MarkSPVUtxoSpent(outpoint);
+                            }
+                        }
+                    }
+                    if (fUpdated)
+                    {
+                        printf("ReacceptWalletTransactions found spent coins (V2 Store3A)\n");
+                        wtx.MarkDirty();
+                        wtx.WriteToDisk();
+                    }
+                }
+                else
+                {
+                    // Not confirmed on-chain yet: (re-)accept to the pool (V2 mempool).
+                    if (!(wtx.IsCoinBase() || wtx.IsCoinStake()))
+                        wtx.AcceptWalletTransaction(txdb);
+                }
+            }
+            else if (txdb.ReadTxIndex(wtx.GetHash(), txindex))
             {
                 // Update fSpent if a tx got spent somewhere else by a copy of wallet.dat
                 if (txindex.vSpent.size() != wtx.vout.size())
@@ -1847,19 +1897,21 @@ void CWallet::ReacceptWalletTransactions()
 
 void CWalletTx::RelayWalletTransaction(CTxDB& txdb)
 {
+    const bool fV2Wallet = (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+                            s16::g_chainObserve.store && s16::g_chainObserve.store->opened());
     BOOST_FOREACH(const CMerkleTx& tx, vtxPrev)
     {
         if (!(tx.IsCoinBase() || tx.IsCoinStake()))
         {
             uint256 hash = tx.GetHash();
-            if (!txdb.ContainsTx(hash))
+            if (!(fV2Wallet ? s16::V2WalletTxidKnown(hash) : txdb.ContainsTx(hash)))
                 RelayTransaction((CTransaction)tx, hash);
         }
     }
     if (!(IsCoinBase() || IsCoinStake()))
     {
         uint256 hash = GetHash();
-        if (!txdb.ContainsTx(hash))
+        if (!(fV2Wallet ? s16::V2WalletTxidKnown(hash) : txdb.ContainsTx(hash)))
         {
             printf("Relaying wtx %s\n", hash.ToString().substr(0,10).c_str());
             RelayTransaction((CTransaction)*this, hash);

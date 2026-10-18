@@ -53,6 +53,13 @@ extern ChainObserveState g_chainObserve;
 extern bool g_V2LegacyIndexGuardArmed;      // true while the V2 store startup must refuse legacy index opens
 extern int  g_V2LegacyIndexProbeDepth;      // >0 inside an authorized non-index probe (sync-checkpoint)
 
+// M5: cross-TU V2 transaction-presence helper for the WALLET (defined in main.cpp).
+// "Known" = the txid has a historical location in TX-LOC or an unspent output in
+// Store3A, i.e. it has been seen on-chain. Used by the V2 wallet cutover for
+// ReacceptWalletTransactions / RelayWalletTransaction instead of txdb.ContainsTx.
+// Presence is a KNOWN/DUPLICATE gate only, never a spend/confirmation authority.
+bool V2WalletTxidKnown(const uint256& hash);
+
 inline bool V2LegacyIndexGuardActive() { return g_V2LegacyIndexGuardArmed; }
 inline bool V2LegacyIndexProbeActive()
 {

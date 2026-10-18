@@ -3630,6 +3630,13 @@ static bool s16_ContainsTxV2OrLegacy(const uint256& hash, CTxDB* txdb)
     return txdb && txdb->ContainsTx(hash);
 }
 
+// M5 wallet cross-TU bridge: txid known on-chain (TX-LOC location or Store3A
+// unspent). Declared in chainstate/observe_hook.h.
+bool s16::V2WalletTxidKnown(const uint256& hash)
+{
+    return s16_V2TxidKnown(hash);
+}
+
 // --------------------------------------------------------------------------
 // M4: V2 mempool platform — forward declarations (definitions live after
 // s16_V2InputView, main.cpp ~5760).  Resolves every transparent input of `tx`
