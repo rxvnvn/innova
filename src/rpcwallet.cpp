@@ -3690,7 +3690,7 @@ Value getanonoutputinfo(const Array& params, bool fHelp)
         CTxDB txdb("r");
         CAnonOutput ao;
 
-        if (!txdb.ReadAnonOutput(pkCoin, ao))
+        if (!s16_AnonReadAo(txdb, pkCoin, ao))
         {
             result.push_back(Pair("found", false));
             result.push_back(Pair("error", "Anonymous output not found in database."));
@@ -3865,7 +3865,7 @@ Value listcompromisedoutputs(const Array& params, bool fHelp)
                             continue;
 
                         CAnonOutput ao;
-                        if (!txdb.ReadAnonOutput(pkCoin, ao))
+                        if (!s16_AnonReadAo(txdb, pkCoin, ao))
                             continue;
 
                         if (ao.nCompromised > 0)

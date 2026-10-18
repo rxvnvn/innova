@@ -5514,7 +5514,7 @@ bool CWallet::UpdateAnonTransaction(CTxDB* ptxdb, const CTransaction& tx, const 
         CTxIndex txindex;
         const unsigned char* pPubkeys = &s[2];
         pkRingCoin = CPubKey(&pPubkeys[0 * ec_compressed_size], ec_compressed_size);
-        if (!ptxdb->ReadAnonOutput(pkRingCoin, ao))
+        if (!s16_AnonReadAo(*ptxdb, pkRingCoin, ao))
         {
             printf("UpdateAnonTransaction(): Error input %u AnonOutput %s not found.\n", i, HexStr(pkRingCoin.Raw()).c_str());
             return false;
@@ -5546,7 +5546,7 @@ bool CWallet::UpdateAnonTransaction(CTxDB* ptxdb, const CTransaction& tx, const 
 
         CPubKey pkCoin    = CPubKey(&s[2+1], ec_compressed_size);
         CAnonOutput ao;
-        if (!ptxdb->ReadAnonOutput(pkCoin, ao))
+        if (!s16_AnonReadAo(*ptxdb, pkCoin, ao))
         {
             printf("ReadAnonOutput %d failed.\n", i);
             return false;
@@ -5673,7 +5673,7 @@ bool CWallet::UndoAnonTransaction(const CTransaction& tx)
         CKeyID  ckCoinId  = pkCoin.GetID();
 
         CAnonOutput ao;
-        if (!txdb.ReadAnonOutput(pkCoin, ao)) // read only to update mapAnonOutputStats
+        if (!s16_AnonReadAo(txdb, pkCoin, ao)) // read only to update mapAnonOutputStats
         {
             printf("ReadAnonOutput(): %u failed.\n", i);
             return false;
@@ -5838,7 +5838,7 @@ bool CWallet::ProcessAnonTransaction(CWalletDB* pwdb, CTxDB* ptxdb, const CTrans
         for (uint32_t ri = 0; ri < (uint32_t)nRingSize; ++ri)
         {
             pkRingCoin = CPubKey(&pPubkeys[ri * ec_compressed_size], ec_compressed_size);
-            if (!ptxdb->ReadAnonOutput(pkRingCoin, ao))
+            if (!s16_AnonReadAo(*ptxdb, pkRingCoin, ao))
             {
                 printf("ProcessAnonTransaction(): Error input %u AnonOutput %s not found.\n", i, HexStr(pkRingCoin.Raw()).c_str());
                 return false;
@@ -5923,7 +5923,7 @@ bool CWallet::ProcessAnonTransaction(CWalletDB* pwdb, CTxDB* ptxdb, const CTrans
         // -- add all anon outputs to txdb
         CAnonOutput ao;
 
-        if (ptxdb->ReadAnonOutput(pkCoin, ao)) // check if exists
+        if (s16_AnonReadAo(*ptxdb, pkCoin, ao)) // check if exists
         {
             if (blockHash != 0)
             {
@@ -6780,7 +6780,7 @@ bool CWallet::AreOutputsUnique(CWalletTx& wtxNew)
         CPubKey pkCoin = CPubKey(&s[2+1], ec_compressed_size);
         CAnonOutput ao;
 
-        if (txdb.ReadAnonOutput(pkCoin, ao))
+        if (s16_AnonReadAo(txdb, pkCoin, ao))
         {
             //printf("AreOutputsUnique() pk %s is not unique.\n", pkCoin);
             return false;
@@ -7990,7 +7990,7 @@ bool CWallet::ExpandLockedAnonOutput(CWalletDB *pwdb, CKeyID &ckeyId, CLockedAno
 
         bool fInMemPool;
         CAnonOutput ao;
-        txdb.ReadAnonOutput(pkCoin, ao);
+        s16_AnonReadAo(txdb, pkCoin, ao);
         if ((GetKeyImage(&txdb, pkImage, kis, fInMemPool) && !fInMemPool)
           ||(GetKeyImage(&txdb, pkOldImage, kis, fInMemPool) && !fInMemPool)) // shouldn't be possible for kis to be in mempool here
         {

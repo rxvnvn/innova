@@ -83,6 +83,12 @@ bool PosClassificationConsistent(uint32_t nFlags, const uint256& prevoutStakeHas
 // M8.3: deterministic ANON feed entry point (defined in main.cpp). Inert (returns true)
 // unless cs::anon::g_anon.opened() — then fail-closed on a feed/store error.
 bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash);
+// M8.3: resolve one anon-output read. Authoritative cs::anon::g_anon when opened (V2);
+// legacy CTxDB only when not opened (migrate bridge). Fills the legacy CAnonOutput so the
+// ring-sig/amount/depth checks downstream are unchanged. Shared by consensus (main.cpp)
+// and wallet/RPC read sites.
+class CTxDB;   // forward decl for s16_AnonReadAo below (full decl at txdb-leveldb.h:34)
+bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao);
 
 class CBlockIndex;
 class CKeyItem;

@@ -69,8 +69,8 @@ bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& bloc
 static bool s16_AnonDisconnectBlock(const cs::Hash& blockHash, const cs::Hash& parentTipHash);
 // M8.3: resolve one anon-output read. Authoritative ANON store when opened (V2); legacy
 // CTxDB only when not opened (migrate bridge). Fills the legacy CAnonOutput so the
-// ring-sig/amount/depth checks downstream are unchanged.
-static bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao);
+// ring-sig/amount/depth checks downstream are unchanged. Shared with wallet/rpc TU.
+bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao);
 
 //
 // Global state
@@ -7212,7 +7212,7 @@ static bool s16_AnonDisconnectBlock(const cs::Hash& blockHash, const cs::Hash& p
                      HexStr(blockHash.data(), blockHash.data()+32).substr(0,20).c_str(), e.str().c_str());
     return true;
 }
-static bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao)
+bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao)
 {
     if (cs::anon::g_anon.opened()) {
         cs::ChainError ane; bool found = false; cs::anon::CAnonOutput aao;
