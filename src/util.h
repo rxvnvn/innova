@@ -223,7 +223,6 @@ extern bool fDebug;
 extern bool fDebugNet;
 extern bool fDebugCN;
 extern bool fDebugChain;
-extern bool fDebugRingSig;
 extern bool fDisableStealth;
 extern bool fPrintToConsole;
 extern bool fPrintToDebugger;

@@ -80,15 +80,6 @@ uint256 GetAuthoritativeBlockTrustValue(uint32_t nBits, int32_t nHeight,
  * authority. Returns true iff the classifications are consistent.
  */
 bool PosClassificationConsistent(uint32_t nFlags, const uint256& prevoutStakeHash);
-// M8.3: deterministic ANON feed entry point (defined in main.cpp). Inert (returns true)
-// unless cs::anon::g_anon.opened() — then fail-closed on a feed/store error.
-bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash);
-// M8.3: resolve one anon-output read. Authoritative cs::anon::g_anon when opened (V2);
-// legacy CTxDB only when not opened (migrate bridge). Fills the legacy CAnonOutput so the
-// ring-sig/amount/depth checks downstream are unchanged. Shared by consensus (main.cpp)
-// and wallet/RPC read sites.
-class CTxDB;   // forward decl for s16_AnonReadAo below (full decl at txdb-leveldb.h:34)
-bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao);
 
 class CBlockIndex;
 class CKeyItem;
@@ -204,14 +195,19 @@ inline int GetForkHeightColdStaking() {
 }
 #define FORK_HEIGHT_COLD_STAKING (GetForkHeightColdStaking())
 
-// Hard fork height for ring signature deprecation
-// ANON_TXN_VERSION (1000) rejected after this height
+// Hard fork height for ring signature deprecation (kept; rpcwallet.cpp still reads it)
 inline int GetForkHeightRingSigDeprecation() {
     extern bool fRegTest;
     extern bool fTestNet;
     return (fRegTest || fTestNet) ? 1 : MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT;
 }
 #define FORK_HEIGHT_RINGSIG_DEPRECATION (GetForkHeightRingSigDeprecation())
+
+// ANON (ring-signature) transaction version. The ring-signature consensus mechanism was
+// removed (mainnet proof: zero ANON transactions). New ANON_TXN_VERSION transactions are
+// rejected unconditionally at AcceptBlock / CTxMemPool::accept. Constant kept so the
+// unconditional reject and surviving wallet/rpc version checks still compile.
+const int ANON_TXN_VERSION = 1000;
 
 // POEM entropy weighting
 inline int GetForkHeightPoem()
@@ -310,7 +306,6 @@ void LogEnforcedUABanFilterCount();
 // Randomly evict one orphan (plus any selected descendants) once the orphan
 // table exceeds -maxorphanblocks.
 void PruneOrphanBlocks();
-extern std::map<int64_t, CAnonOutputCount> mapAnonOutputStats;
 
 bool ShouldSkipBlockInvForOrphanPressure(CNode* pfrom, const CInv& inv,
                                           bool fAlreadyHave,
@@ -632,7 +627,6 @@ void PrimeIbdFreshPeerGraceFirstSeenForTesting(int64_t nFirstSeen);
 int64_t IbdStaleSecondsForTesting();
 std::string GetWarnings(std::string strFor);
 bool GetTransaction(const uint256 &hash, CTransaction &tx, uint256 &hashBlock, bool s=false);
-bool GetKeyImage(CTxDB* ptxdb, ec_point& keyImage, CKeyImageSpent& keyImageSpent, bool& fInMempool);
 bool TxnHashInSystem(CTxDB* ptxdb, uint256& txnHash);
 uint256 WantedByOrphan(const CBlock* pblockOrphan);
 const CBlockIndex* GetLastBlockIndex(const CBlockIndex* pindex, bool fProofOfStake);
@@ -971,8 +965,6 @@ public:
      */
     bool FetchInputs(CTxDB& txdb, const std::map<uint256, CTxIndex>& mapTestPool,
                      bool fBlock, bool fMiner, MapPrevTx& inputsRet, bool& fInvalid);
-
-    bool CheckAnonInputs(CTxDB& txdb, int64_t& nSumValue, bool& fInvalid, bool fCheckExists);
 
     /** Sanity check previous transactions, then, if all checks succeed,
         mark them as spent by this transaction.
@@ -2056,8 +2048,6 @@ public:
     std::map<uint256, CTransaction> mapTx;
     std::map<COutPoint, CInPoint> mapNextTx;
 
-    std::map<std::vector<uint8_t>, CKeyImageSpent> mapKeyImage;
-
     bool accept(CTxDB& txdb, CTransaction &tx,
                 bool fCheckInputs, bool* pfMissingInputs, bool fOnlyCheckWithoutAdding=false);
     bool addUnchecked(const uint256& hash, CTransaction &tx);
@@ -2096,27 +2086,6 @@ public:
         std::map<uint256, CTransaction>::const_iterator i = mapTx.find(hash);
         if (i == mapTx.end()) return false;
         result = i->second;
-        return true;
-    }
-
-    bool insertKeyImage(const std::vector<uint8_t>& vchImage, CKeyImageSpent& kis)
-    {
-        LOCK(cs);
-
-        mapKeyImage[vchImage] = kis;
-
-        return true;
-    }
-    bool lookupKeyImage(const std::vector<uint8_t>& vchImage, CKeyImageSpent& result) const
-    {
-        LOCK(cs);
-
-        std::map<std::vector<uint8_t>, CKeyImageSpent>::const_iterator it = mapKeyImage.find(vchImage);
-        if (it == mapKeyImage.end())
-            return false;
-
-        result = it->second;
-
         return true;
     }
 

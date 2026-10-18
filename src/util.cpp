@@ -96,7 +96,6 @@ bool fDebug = false;
 bool fDebugNet = false;
 bool fDebugCN = false;
 bool fDebugChain = false;
-bool fDebugRingSig = false;
 bool fDisableStealth = false;
 bool fPrintToConsole = false;
 bool fPrintToDebugger = false;

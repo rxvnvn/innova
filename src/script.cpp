@@ -326,7 +326,6 @@ const char* GetOpName(opcodetype opcode)
     case OP_NOP7                   : return "OP_NOP7";
     case OP_NOP8                   : return "OP_NOP8";
     case OP_NOP9                   : return "OP_NOP9";
-    case OP_ANON_MARKER            : return "OP_ANON_MARKER"; // Ring Sigs
     case OP_SHIELDED_MARKER        : return "OP_SHIELDED_MARKER"; // Shielded Txs
 
     // cold staking
@@ -618,7 +617,6 @@ bool EvalScript(vector<vector<unsigned char> >& stack, const CScript& script, co
                 }
                 break;
 
-                case OP_ANON_MARKER:
                 case OP_SHIELDED_MARKER:
                 {
                     return false;

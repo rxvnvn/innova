@@ -352,7 +352,7 @@ RegistrationParseResult EvaluateHRegRegistrationTx(const CTransaction& tx,
         return result;
     }
 
-    if (tx.IsCoinBase() || tx.IsCoinStake() || tx.nVersion == ANON_TXN_VERSION)
+    if (tx.IsCoinBase() || tx.IsCoinStake())
         return result;
 
     COutPoint oldCollateral;

@@ -17,7 +17,6 @@
 #include "keystore.h"
 #include "bignum.h"
 #include "stealth.h"
-#include "ringsig.h"
 
 typedef std::vector<unsigned char> valtype;
 
@@ -324,7 +323,6 @@ enum opcodetype
     OP_NOP7 = 0xb6,
     OP_NOP8 = 0xb7,
     OP_NOP9 = 0xb8,
-    OP_ANON_MARKER = 0xb9, //OP_NOP10
     OP_SHIELDED_MARKER = 0xba,
 
     // cold staking

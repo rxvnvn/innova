@@ -39,8 +39,6 @@
 #include "hreg_registration.h"
 #include "chainstate/observe.h"            // S1.6-2 authoritative observation adapter
 #include "chainstate/observe_hook.h"       // S1.6-2 guarded read-only ConnectBlock hook
-#include "chainstate/anonstore/anonstore.h" // M8.3: ANON/key-image store (cs::anon)
-#include "chainstate/anonstore/anonfeed.h"  // M8.3: deterministic wallet-independent feed
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -62,15 +60,6 @@ static bool AlreadyHave(CTxDB& txdb, const CInv& inv);
 // S2.0-M2b: Store3A-backed V2 transparent-input coin view; full definition near
 // s16_StoreAuthoritativeInputGate. ConnectInputs uses it only in the armed V2 mode.
 struct s16_V2InputView;
-
-// M8.3: deterministic ANON feed helpers (full definitions near s16_V2Armed). Forward
-// declared here because DisconnectBlock (~6548) precedes their definitions (~7096).
-bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash);
-static bool s16_AnonDisconnectBlock(const cs::Hash& blockHash, const cs::Hash& parentTipHash);
-// M8.3: resolve one anon-output read. Authoritative ANON store when opened (V2); legacy
-// CTxDB only when not opened (migrate bridge). Fills the legacy CAnonOutput so the
-// ring-sig/amount/depth checks downstream are unchanged. Shared with wallet/rpc TU.
-bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao);
 
 //
 // Global state
@@ -566,8 +555,6 @@ uint256 hashLastFinalized = 0;
 
 CMedianFilter<int> cPeerBlockCounts(5, 0); // Amount of blocks that other nodes claim to have
 
-std::map<int64_t, CAnonOutputCount> mapAnonOutputStats;
-//map<int64_t, CAnonOutputCount> mapAnonOutputStats; // display only, not 100% accurate, height could become inaccurate due to undos
 map<uint256, CBlock*> mapOrphanBlocks;
 multimap<uint256, CBlock*> mapOrphanBlocksByPrev;
 map<uint256, NodeId> mapOrphanBlocksByNode;
@@ -2886,11 +2873,6 @@ void SyncWithWallets(const CTransaction& tx, const CBlock* pblock, bool fUpdate,
             };
         };
 
-        if (tx.nVersion == ANON_TXN_VERSION)
-        {
-            for (CWallet* pwallet : setpwalletRegistered)
-                pwallet->UndoAnonTransaction(tx);
-        };
         return;
     };
 
@@ -2948,8 +2930,6 @@ bool Finalise()
     fs::remove(GetPidFile());
     UnregisterWallet(pwalletMain);
     delete pwalletMain;
-
-    finaliseRingSigs();
 
     CTxDB().Close();
 
@@ -3151,7 +3131,7 @@ bool CTransaction::ReadFromDisk(COutPoint prevout)
 
 bool IsStandardTx(const CTransaction& tx, string& reason)
 {
-    if (tx.nVersion > CTransaction::CURRENT_VERSION && tx.nVersion != ANON_TXN_VERSION) { //WIP
+    if (tx.nVersion > CTransaction::CURRENT_VERSION) { //WIP
         reason = "version";
         return false;
     }
@@ -3196,20 +3176,6 @@ bool IsStandardTx(const CTransaction& tx, string& reason)
 
     for (const CTxIn& txin : tx.vin)
     {
-        if (txin.IsAnonInput())
-        {
-            int nRingSize = txin.ExtractRingSize();
-
-            if (tx.nVersion != ANON_TXN_VERSION
-                || nRingSize < (int)MIN_RING_SIZE
-                || nRingSize > (int)MAX_RING_SIZE
-                || txin.scriptSig.size() > sizeof(COutPoint) + 2 + (33 + 32 + 32) * nRingSize)
-            {
-                printf("IsStandard() anon txin failed.\n");
-                return false;
-            };
-            continue;
-        };
         // Biggest 'standard' txin is a 15-of-15 P2SH multisig with compressed
         // keys. (remember the 520 byte limit on redeemScript size) That works
         // out to a (15*(33+1))+3=513 byte redeemScript, 513+1+15*(73+1)+3=1627
@@ -3236,20 +3202,7 @@ bool IsStandardTx(const CTransaction& tx, string& reason)
 
     txnouttype whichType;
     for (const CTxOut& txout : tx.vout) {
-        if (txout.IsAnonOutput())
-        {
-            if (tx.nVersion != ANON_TXN_VERSION
-                || txout.nValue < 1
-                || txout.scriptPubKey.size() > MIN_ANON_OUT_SIZE + MAX_ANON_NARRATION_SIZE)
-            {
-                printf("IsStandard() anon txout failed.\n");
-                return false;
-            }
-            //nTxnOut++; anon outputs don't count (narrations are embedded in scriptPubKey)
-            continue;
-        };
-
-         if (!::IsStandard(txout.scriptPubKey, whichType)) {
+        if (!::IsStandard(txout.scriptPubKey, whichType)) {
              reason = "scriptpubkey";
              return false;
          }
@@ -3313,10 +3266,6 @@ bool AreInputsStandard(const CTransaction& tx, const MapPrevTx& mapInputs)
 
     for (unsigned int i = 0; i < tx.vin.size(); i++)
     {
-        if (tx.nVersion == ANON_TXN_VERSION
-            && tx.vin[i].IsAnonInput())
-            continue;
-
         const CTxOut& prev = tx.GetOutputFor(tx.vin[i], mapInputs);
 
         vector<vector<unsigned char> > vSolutions;
@@ -3378,10 +3327,6 @@ bool CTransaction::HasStealthOutput() const
 
     for (vector<CTxOut>::const_iterator it = vout.begin(); it != vout.end(); ++it)
     {
-        if (nVersion == ANON_TXN_VERSION
-            && it->IsAnonOutput())
-            continue;
-
         CScript::const_iterator itScript = it->scriptPubKey.begin();
 
         if (!it->scriptPubKey.GetOp(itScript, opCode, vchEphemPK)
@@ -3499,46 +3444,10 @@ bool CTransaction::CheckTransaction() const
     set<COutPoint> vInOutPoints;
     for (const CTxIn& txin : vin)
     {
-        if (nVersion == ANON_TXN_VERSION
-            && txin.IsAnonInput())
-        {
-            // -- blank the upper 3 bytes of n to prevent the same keyimage passing with different ring sizes
-            COutPoint opTest = txin.prevout;
-            opTest.n &= 0xFF;
-            if (vInOutPoints.count(opTest))
-            {
-                if (fDebugRingSig)
-                    printf("CheckTransaction() failed - found duplicate keyimage in txn %s\n", GetHash().ToString().c_str());
-                return false;
-            };
-            vInOutPoints.insert(opTest);
-            continue;
-        };
-
         if (vInOutPoints.count(txin.prevout))
             return false;
         vInOutPoints.insert(txin.prevout);
     };
-
-    if (nVersion == ANON_TXN_VERSION)
-    {
-        // -- Check for duplicate anon outputs
-        // NOTE: is this necessary, duplicate coins would not be spendable anyway?
-        set<CPubKey> vAnonOutPubkeys;
-        CPubKey pkTest;
-        for (const CTxOut& txout : vout)
-        {
-            if (!txout.IsAnonOutput())
-                continue;
-
-            const CScript &s = txout.scriptPubKey;
-            pkTest = CPubKey(&s[2+1], 33);
-            if (vAnonOutPubkeys.count(pkTest))
-                return false;
-            vAnonOutPubkeys.insert(pkTest);
-        };
-    };
-
 
     if (IsCoinBase())
     {
@@ -3567,9 +3476,6 @@ bool CTransaction::CheckTransaction() const
 int64_t CTransaction::GetMinFee(unsigned int nBlockSize, enum GetMinFee_mode mode, unsigned int nBytes) const
 {
     // Base fee is either MIN_TX_FEE or MIN_RELAY_TX_FEE for standard txns, and MIN_TX_FEE_ANON for anon txns
-
-    if (nVersion == ANON_TXN_VERSION)
-        mode = GMF_ANON;
 
     int64_t nBaseFee;
     switch (mode)
@@ -3673,8 +3579,6 @@ int s16::V2OutpointUnspent(const uint256& txid, uint32_t n, bool* unspent)
 //       or the Store3A authority errored — fail-closed, never orphan, no legacy);
 //   2 = MISSING INPUTS (a required prevout is not yet known to Store3A or TX-LOC;
 //       *pfMissingInputs set => orphan candidate, as the legacy FetchInputs did).
-// ANON inputs are skipped here (consumed via the anon-output store, a separate
-// M6 subsystem); the caller applies the ring-signature deprecation + CheckAnonInputs.
 // --------------------------------------------------------------------------
 struct s16_V2InputView;
 static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& tx,
@@ -3805,26 +3709,9 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
 
             GetMinFee_mode feeMode = GMF_RELAY;
 
+            // ANON (ring-signature) mechanism removed; reject any such tx unconditionally.
             if (tx.nVersion == ANON_TXN_VERSION)
-            {
-                if (nBestHeight >= FORK_HEIGHT_RINGSIG_DEPRECATION)
-                    return error("CTxMemPool::accept() : ring signature transactions (ANON_TXN_VERSION) deprecated after height %d.", FORK_HEIGHT_RINGSIG_DEPRECATION);
-
-                int64_t nSumAnon;
-                if (!tx.CheckAnonInputs(txdb, nSumAnon, fInvalid, true))
-                {
-                    if (fInvalid)
-                        return error("CTxMemPool::accept() : CheckAnonInputs found invalid tx %s", hash.ToString().substr(0,10).c_str());
-                    if (pfMissingInputs)
-                        *pfMissingInputs = true;
-                    return false;
-                };
-
-                nFees += nSumAnon;
-
-                feeMode = GMF_ANON;
-            };
-
+                return error("CTxMemPool::accept() : ring signature transactions (ANON_TXN_VERSION) rejected (mechanism removed)");
 
             // Note: if you modify this code to accept non-standard transactions, then
             // you should add code here to check that the transaction does a
@@ -4108,24 +3995,6 @@ bool CTxMemPool::remove(const CTransaction &tx, bool fRecursive)
                 mapNextTx.erase(txin.prevout);
             mapTx.erase(hash);
 
-            if (tx.nVersion == ANON_TXN_VERSION)
-            {
-                // -- remove key images
-                for (unsigned int i = 0; i < tx.vin.size(); ++i)
-                {
-                    const CTxIn& txin = tx.vin[i];
-
-                    if (!txin.IsAnonInput())
-                        continue;
-
-                    ec_point vchImage;
-                    txin.ExtractKeyImage(vchImage);
-
-                    mapKeyImage.erase(vchImage);
-                };
-            };
-
-
             nTransactionsUpdated++;
         };
     }
@@ -4154,7 +4023,6 @@ void CTxMemPool::clear()
     LOCK(cs);
     mapTx.clear();
     mapNextTx.clear();
-    mapKeyImage.clear();
     ++nTransactionsUpdated;
 }
 
@@ -4335,40 +4203,6 @@ bool GetTransaction(const uint256 &hash, CTransaction &tx, uint256 &hashBlock, b
     }
     return false;
 }
-
-bool GetKeyImage(CTxDB* ptxdb, ec_point& keyImage, CKeyImageSpent& keyImageSpent, bool& fInMempool)
-{
-    AssertLockHeld(cs_main);
-
-    // -- check authoritative ANON store first (V2); legacy txdb only when not opened.
-    fInMempool = false;
-    if (cs::anon::g_anon.opened()) {
-        if (keyImage.size() >= 33) {
-            cs::ChainError ane; bool found = false; cs::anon::CKeyImageSpent aki;
-            if (cs::anon::g_anon.getKi(keyImage.data(), &aki, &found, &ane)) {
-                if (found) {
-                    memcpy(keyImageSpent.txnHash.begin(), aki.txnHash.data(), 32);
-                    keyImageSpent.inputNo = aki.inputNo;
-                    keyImageSpent.nValue = aki.nValue;
-                    return true;
-                }
-            } else {
-                return false;   // authority read error (fail-closed, no legacy fallback)
-            }
-        }
-    } else {
-        if (ptxdb->ReadKeyImage(keyImage, keyImageSpent))
-            return true;
-    }
-
-    if (mempool.lookupKeyImage(keyImage, keyImageSpent))
-    {
-        fInMempool = true;
-        return true;
-    };
-
-    return false;
-};
 
 bool TxnHashInSystem(CTxDB* ptxdb, uint256& txnHash)
 {
@@ -5546,10 +5380,6 @@ bool CTransaction::FetchInputs(CTxDB& txdb, const map<uint256, CTxIndex>& mapTes
 
     for (unsigned int i = 0; i < vin.size(); i++)
     {
-        if (nVersion == ANON_TXN_VERSION
-            && vin[i].IsAnonInput())
-            continue;
-
         COutPoint prevout = vin[i].prevout;
         if (inputsRet.count(prevout.hash))
             continue; // Got it already
@@ -5591,10 +5421,6 @@ bool CTransaction::FetchInputs(CTxDB& txdb, const map<uint256, CTxIndex>& mapTes
     // Make sure all prevout.n indexes are valid:
     for (unsigned int i = 0; i < vin.size(); i++)
     {
-        if (nVersion == ANON_TXN_VERSION
-            && vin[i].IsAnonInput())
-            continue;
-
         const COutPoint prevout = vin[i].prevout;
         if (inputsRet.count(prevout.hash) == 0)
             return DoS(100, error("ConnectInputs() : missing input %s", prevout.hash.ToString().substr(0,10).c_str()));
@@ -5614,185 +5440,6 @@ bool CTransaction::FetchInputs(CTxDB& txdb, const map<uint256, CTxIndex>& mapTes
 
     return true;
 }
-
-// Ring Signatures - I n n o v a
-static bool CheckAnonInputAB(CTxDB &txdb, const CTxIn &txin, int i, int nRingSize, std::vector<uint8_t> &vchImage, uint256 &preimage, int64_t &nCoinValue)
-{
-    const CScript &s = txin.scriptSig;
-
-    CPubKey pkRingCoin;
-    CAnonOutput ao;
-    CTxIndex txindex;
-
-    ec_point pSigC;
-    pSigC.resize(ec_secret_size);
-    memcpy(&pSigC[0], &s[2], ec_secret_size);
-    const unsigned char *pSigS    = &s[2 + ec_secret_size];
-    const unsigned char *pPubkeys = &s[2 + ec_secret_size + ec_secret_size * nRingSize];
-    for (int ri = 0; ri < nRingSize; ++ri)
-    {
-        pkRingCoin = CPubKey(&pPubkeys[ri * ec_compressed_size], ec_compressed_size);
-        if (!s16_AnonReadAo(txdb, pkRingCoin, ao))
-        {
-            printf("CheckAnonInputsAB(): Error input %d, element %d AnonOutput %s not found.\n", i, ri);
-            return false;
-        };
-
-        if (nCoinValue == -1)
-        {
-            nCoinValue = ao.nValue;
-        } else
-        if (nCoinValue != ao.nValue)
-        {
-            printf("CheckAnonInputsAB(): Error input %d, element %d ring amount mismatch %d, %d.\n", i, ri, nCoinValue, ao.nValue);
-            return false;
-        };
-
-        if (ao.nBlockHeight == 0
-            || nBestHeight - ao.nBlockHeight < MIN_ANON_SPEND_DEPTH)
-        {
-            printf("CheckAnonInputsAB(): Error input %d, element %d depth < MIN_ANON_SPEND_DEPTH.\n", i, ri);
-            return false;
-        };
-    };
-
-    if (verifyRingSignatureAB(vchImage, preimage, nRingSize, pPubkeys, pSigC, pSigS) != 0)
-    {
-        printf("CheckAnonInputsAB(): Error input %d verifyRingSignatureAB() failed.\n", i);
-        return false;
-    };
-
-    return true;
-};
-
-bool CTransaction::CheckAnonInputs(CTxDB& txdb, int64_t& nSumValue, bool& fInvalid, bool fCheckExists)
-{
-    AssertLockHeld(cs_main);
-    // - fCheckExists should only run for anonInputs entering this node
-
-    fInvalid = false;
-
-    nSumValue = 0;
-
-    uint256 preimage;
-    if (pwalletMain->GetTxnPreImage(*this, preimage) != 0)
-    {
-        printf("CheckAnonInputs(): Error GetTxnPreImage() failed.\n");
-        fInvalid = true; return false;
-    };
-
-    uint256 txnHash = GetHash();
-
-    for (uint32_t i = 0; i < vin.size(); i++)
-    {
-        const CTxIn &txin = vin[i];
-
-        if (!txin.IsAnonInput())
-            continue;
-
-        const CScript &s = txin.scriptSig;
-
-        std::vector<uint8_t> vchImage;
-        txin.ExtractKeyImage(vchImage);
-
-        CKeyImageSpent spentKeyImage;
-        bool fInMemPool;
-        if (GetKeyImage(&txdb, vchImage, spentKeyImage, fInMemPool))
-        {
-            // -- this can happen for transactions created by the local node
-            if (spentKeyImage.txnHash == txnHash)
-            {
-                if (fDebugRingSig)
-                    printf("Input %d keyimage %s matches txn %s.\n", i, HexStr(vchImage).c_str(), txnHash.ToString().c_str());
-            } else
-            {
-                if (fCheckExists
-                    && !TxnHashInSystem(&txdb, spentKeyImage.txnHash))
-                {
-                    printf("CheckAnonInputs(): Warning input %d keyimage %s spent by unknown txn %s - rejecting for safety.\n",
-                           i, HexStr(vchImage).c_str(), spentKeyImage.txnHash.ToString().c_str());
-                    fInvalid = true; return false;
-                } else
-                {
-                    printf("CheckAnonInputs(): Error input %d keyimage %s already spent.\n", i, HexStr(vchImage).c_str());
-                    fInvalid = true; return false;
-                };
-            };
-        };
-
-        int64_t nCoinValue = -1;
-        int nRingSize = txin.ExtractRingSize();
-        if (nRingSize < (int)MIN_RING_SIZE
-          ||nRingSize > (pindexBest->nHeight ? (int)MAX_RING_SIZE : (int)MAX_RING_SIZE_OLD))
-        {
-            printf("CheckAnonInputs(): Error input %d ringsize %d not in range [%d, %d].\n", i, nRingSize, MIN_RING_SIZE, MAX_RING_SIZE);
-            fInvalid = true; return false;
-        };
-
-
-        if (nRingSize > 1 && s.size() == 2 + ec_secret_size + (ec_secret_size + ec_compressed_size) * nRingSize)
-        {
-            // ringsig AB
-            if (!CheckAnonInputAB(txdb, txin, i, nRingSize, vchImage, preimage, nCoinValue))
-            {
-                fInvalid = true; return false;
-            };
-
-            nSumValue += nCoinValue;
-            continue;
-        };
-
-        if (s.size() < 2 + (ec_compressed_size + ec_secret_size + ec_secret_size) * nRingSize)
-        {
-            printf("CheckAnonInputs(): Error input %d scriptSig too small.\n", i);
-            fInvalid = true; return false;
-        };
-
-
-        CPubKey pkRingCoin;
-        CAnonOutput ao;
-        CTxIndex txindex;
-        const unsigned char* pPubkeys = &s[2];
-        const unsigned char* pSigc    = &s[2 + ec_compressed_size * nRingSize];
-        const unsigned char* pSigr    = &s[2 + (ec_compressed_size + ec_secret_size) * nRingSize];
-        for (int ri = 0; ri < nRingSize; ++ri)
-        {
-            pkRingCoin = CPubKey(&pPubkeys[ri * ec_compressed_size], ec_compressed_size);
-            if (!s16_AnonReadAo(txdb, pkRingCoin, ao))
-            {
-                printf("CheckAnonInputs(): Error input %d, element %d AnonOutput %s not found.\n", i, ri);
-                fInvalid = true; return false;
-            };
-
-            if (nCoinValue == -1)
-            {
-                nCoinValue = ao.nValue;
-            } else
-            if (nCoinValue != ao.nValue)
-            {
-                printf("CheckAnonInputs(): Error input %d, element %d ring amount mismatch %d, %d.\n", i, ri, nCoinValue, ao.nValue);
-                fInvalid = true; return false;
-            };
-
-            if (ao.nBlockHeight == 0
-                || nBestHeight - ao.nBlockHeight < MIN_ANON_SPEND_DEPTH)
-            {
-                printf("CheckAnonInputs(): Error input %d, element %d depth < MIN_ANON_SPEND_DEPTH.\n", i, ri);
-                fInvalid = true; return false;
-            };
-        };
-
-        if (verifyRingSignature(vchImage, preimage, nRingSize, pPubkeys, pSigc, pSigr) != 0)
-        {
-            printf("CheckAnonInputs(): Error input %d verifyRingSignature() failed.\n", i);
-            fInvalid = true; return false;
-        };
-
-        nSumValue += nCoinValue;
-    };
-
-    return true;
-};
 
 const CTxOut& CTransaction::GetOutputFor(const CTxIn& input, const MapPrevTx& inputs) const
 {
@@ -5815,11 +5462,6 @@ int64_t CTransaction::GetValueIn(const MapPrevTx& inputs) const
     int64_t nResult = 0;
     for (unsigned int i = 0; i < vin.size(); i++)
     {
-        if (nVersion == ANON_TXN_VERSION
-            && vin[i].IsAnonInput())
-        {
-            continue;
-        };
         nResult += GetOutputFor(vin[i], inputs).nValue;
     };
 
@@ -5834,9 +5476,6 @@ unsigned int CTransaction::GetP2SHSigOpCount(const MapPrevTx& inputs) const
     unsigned int nSigOps = 0;
     for (unsigned int i = 0; i < vin.size(); i++)
     {
-        if (nVersion == ANON_TXN_VERSION
-            && vin[i].IsAnonInput())
-            continue;
         const CTxOut& prevout = GetOutputFor(vin[i], inputs);
         if (prevout.scriptPubKey.IsPayToScriptHash())
             nSigOps += prevout.scriptPubKey.GetSigOpCount(vin[i].scriptSig);
@@ -5977,8 +5616,6 @@ struct s16_V2InputView
         out->clear();
         for (unsigned int i = 0; i < tx.vin.size(); ++i)
         {
-            if (tx.nVersion == ANON_TXN_VERSION && tx.vin[i].IsAnonInput())
-                continue;   // anon inputs are consumed via the nullifier/CAnonOutput store, never CTxIndex
             const COutPoint prevout = tx.vin[i].prevout;
             cs::OutPoint k; memcpy(k.txid.data(), prevout.hash.begin(), 32); k.n = prevout.n;
             cs::Coin coin; bool local = false;
@@ -6042,8 +5679,6 @@ struct s16_V2InputView
             return true;
         for (const CTxIn& txin : tx.vin)
         {
-            if (tx.nVersion == ANON_TXN_VERSION && txin.IsAnonInput())
-                continue;
             COutPoint prevout = txin.prevout;
             cs::OutPoint k; memcpy(k.txid.data(), prevout.hash.begin(), 32); k.n = prevout.n;
             cs::Coin coin; bool local = false;
@@ -6075,8 +5710,7 @@ struct s16_V2InputView
 // (unconfirmed ancestor), distinguishes a spent-on-chain prevout (reject) from
 // a never-seen one (orphan) via the TX-LOC location index, and materialises a
 // Store3A/pool-backed prev-tx map for GetValueIn / P2SH sigops / AreInputsStandard.
-// ANON inputs are skipped (they flow through the anon-output store; the caller
-// keeps the ring-signature deprecation + CheckAnonInputs).  No legacy txindex read.
+// No legacy txindex read.
 // ---------------------------------------------------------------------------
 static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& tx,
                                     MapPrevTx& mapInputs, bool* pfMissingInputs)
@@ -6093,7 +5727,6 @@ static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& t
         LOCK(mempool.cs);
         for (const CTxIn& tin : tx.vin)
         {
-            if (tx.nVersion == ANON_TXN_VERSION && tin.IsAnonInput()) continue;
             std::map<uint256, CTransaction>::const_iterator it = mempool.mapTx.find(tin.prevout.hash);
             if (it == mempool.mapTx.end()) continue;
             const CTransaction& ptx = it->second;
@@ -6110,7 +5743,6 @@ static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& t
     // (2) Presence / spent-vs-missing classification for every transparent prevout.
     for (const CTxIn& tin : tx.vin)
     {
-        if (tx.nVersion == ANON_TXN_VERSION && tin.IsAnonInput()) continue;
         cs::OutPoint k; memcpy(k.txid.data(), tin.prevout.hash.begin(), 32); k.n = tin.prevout.n;
         if (view->created.count(k)) continue;                               // pool ancestor -> ok
         bool found = false; cs::Coin coin; cs::ChainError e;
@@ -6140,8 +5772,7 @@ static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& t
 
 // ---------------------------------------------------------------------------
 // M4: full V2 mempool accept.  Replicates the legacy accept policy
-// (non-standard P2SH, ANON deprecation per consensus + CheckAnonInputs on the
-// anon-output store, min-fee, free-tx rate limit) against the Store3A/TX-LOC/
+// (non-standard P2SH, min-fee, free-tx rate limit) against the Store3A/TX-LOC/
 // pool-overlay input set, runs the Store3A-authoritative ConnectInputs, and on
 // success adds to the pool.  NO legacy txindex read or fallback.  Active-chain
 // heights/maturity come from Store3A coins + pindexBest (BI-V2-backed).
@@ -6164,23 +5795,10 @@ static bool s16_V2MempoolAccept(CTxDB& txdb, CTransaction& tx, uint256& hash,
 
     int64_t nFees = tx.GetValueIn(mapInputs) - tx.GetValueOut();
     GetMinFee_mode feeMode = GMF_RELAY;
+
+    // ANON (ring-signature) mechanism removed; reject any such tx unconditionally (V2 path).
     if (tx.nVersion == ANON_TXN_VERSION)
-    {
-        // ANON: preserve the actual consensus rule — ring-signature transactions are
-        // DEPRECATED past FORK_HEIGHT_RINGSIG_DEPRECATION (rejected here, as legacy).
-        if (nBestHeight >= FORK_HEIGHT_RINGSIG_DEPRECATION)
-            return error("CTxMemPool::accept() : ring signature transactions (ANON_TXN_VERSION) deprecated after height %d.", FORK_HEIGHT_RINGSIG_DEPRECATION);
-        int64_t nSumAnon; bool fInvalid = false;
-        if (!tx.CheckAnonInputs(txdb, nSumAnon, fInvalid, true))
-        {
-            if (fInvalid)
-                return error("CTxMemPool::accept() : CheckAnonInputs found invalid tx %s", hash.ToString().substr(0,10).c_str());
-            if (pfMissingInputs) *pfMissingInputs = true;
-            return false;
-        }
-        nFees += nSumAnon;
-        feeMode = GMF_ANON;
-    }
+        return error("CTxMemPool::accept() : ring signature transactions (ANON_TXN_VERSION) rejected (mechanism removed)");
 
     unsigned int nSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
     int64_t txMinFee = tx.GetMinFee(1000, feeMode, nSize);
@@ -6291,8 +5909,6 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
         std::map<unsigned int, cs::Coin> mapV2Coin;  // Store3A coin per transparent vin index (V2)
         for (unsigned int i = 0; i < vin.size(); i++)
         {
-            if (nVersion == ANON_TXN_VERSION && vin[i].IsAnonInput())
-                continue;
             COutPoint prevout = vin[i].prevout;
             if (fV2)
             {
@@ -6418,9 +6034,6 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
         // Helps prevent CPU exhaustion attacks.
         for (unsigned int i = 0; i < vin.size(); i++)
         {
-            if (nVersion == ANON_TXN_VERSION
-                && vin[i].IsAnonInput())
-                continue;
             COutPoint prevout = vin[i].prevout;
             if (fV2)
             {
@@ -6529,21 +6142,6 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
             // vTxindex.push_back(txindex);
             }   // end legacy (non-V2) else -> loop 2
         }
-        if (nVersion == ANON_TXN_VERSION)
-        {
-            if (pindexBlock && pindexBlock->nHeight >= FORK_HEIGHT_RINGSIG_DEPRECATION)
-                return DoS(100, error("ConnectInputs() : ring signature transactions deprecated after height %d", FORK_HEIGHT_RINGSIG_DEPRECATION));
-
-            int64_t nSumAnon;
-            bool fInvalid;
-            if (!CheckAnonInputs(txdb, nSumAnon, fInvalid, true))
-            {
-                //if (fInvalid)
-                DoS(100, error("ConnectInputs() : CheckAnonInputs found invalid tx %s", GetHash().ToString().substr(0,10).c_str()));
-            };
-
-            nValueIn += nSumAnon;
-        };
 
 
         if (!IsCoinStake())
@@ -6603,15 +6201,6 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 
     // ppcoin: clean up wallet after disconnecting coinstake (a wallet update, not a
     // legacy-txindex operation).
-    // M8.3: deterministic ANON undo (wallet-independent), fail-closed when g_anon opened.
-    if (cs::anon::g_anon.opened()) {
-        cs::Hash abh; memcpy(abh.data(), pindex->GetBlockHash().begin(), 32);
-        cs::Hash aparent;
-        if (pindex->pprev) memcpy(aparent.data(), pindex->pprev->GetBlockHash().begin(), 32);
-        if (!s16_AnonDisconnectBlock(abh, aparent))
-            return error("DisconnectBlock() : ANON store undo disconnect FAILED for %s — fail-closed, no legacy fallback",
-                         pindex->GetBlockHash().ToString().substr(0,20).c_str());
-    }
     for (CTransaction& tx : vtx)
         SyncWithWallets(tx, this, false, false);
 
@@ -6913,8 +6502,6 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
     ++st.blocks;
 
     // Project the block's real transactions -> neutral observed block.
-    // Transparent vin only: anon-input prevouts are consumed by the
-    // nullifier/CAnonOutput store, NEVER by CTxIndex::vSpent (main.cpp:5717-5878).
     cs::ObservedBlock ob;
     ob.height = pindex->nHeight;
     ob.txs.reserve(blk.vtx.size());
@@ -6927,7 +6514,6 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
         o.nTime     = tx.nTime;   // S2.0-M2-c: carry into Store3A created coins (Coin.nTime)
         for (size_t i = 0; i < tx.vin.size(); ++i) {
             const CTxIn& in = tx.vin[i];
-            if (in.IsAnonInput()) continue;
             cs::OutPoint p;
             memcpy(p.txid.data(), in.prevout.hash.begin(), 32);
             p.n = in.prevout.n;
@@ -6988,20 +6574,16 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
     // vSpent position points at THIS block's own transaction positions: ConnectBlock records
     // CTxIndex(posThisTx,..) for every block tx and ConnectInputs sets vSpent[prevout] =
     // posThisTx of the SPENDING tx. vSpent is cumulative (carries prior-block spends), so we
-    // include only outpoints whose position equals a position of THIS block's txs. Anonym/
-    // nullifier spends never enter vSpent (ConnectInputs skips IsAnonInput for nVersion
-    // ANON_TXN and they are consumed via the CAnonOutput/nullifier store), so they stay out of
-    // the transparent-UTXO authority by construction.
+    // include only outpoints whose position equals a position of THIS block's txs.
     if (st.checkAuthority) {
         cs::ObservedAuthority auth;
         // S2.0-S1.7-G (V2 authority source): when the Store3A-backed V2 input view is ARMED (the
         // authoritative `-s16openstore` instance, s16_V2Armed()), `v2View->consumed` holds EXACTLY
-        // THIS block's transparent spends -- ConnectInputs marks every non-anon vin via markSpent
+        // THIS block's transparent spends -- ConnectInputs marks every vin via markSpent
         // (main.cpp:6145); coinbase txs have no vin so nothing is marked for them. Unlike the legacy
         // mqc.vSpent source it is per-ConnectBlock-lifetime (already restricted to this block, no
-        // cumulative prior-block spends) so no position filter is needed, and anon-input prevouts
-        // never enter it (ConnectInputs skips IsAnonInput for ANON_TXN) exactly as the legacy
-        // authority excludes them. This branch performs ZERO legacy vSpent / txindex reads. The
+        // cumulative prior-block spends) so no position filter is needed. This branch performs ZERO
+        // legacy vSpent / txindex reads. The
         // non-armed pilot/mirror instance (`-s16store3a` only, hardFail=false) keeps the legacy
         // mqc.vSpent source below byte-identical.
         if (v2View != NULL && v2View->armed())
@@ -7087,7 +6669,6 @@ bool s16_StoreAuthoritativeInputGate(const CBlock& blk, int32_t height, std::str
         o.nTime     = tx.nTime;   // S2.0-M2-c: carry into Store3A created coins (Coin.nTime)
         for (size_t i = 0; i < tx.vin.size(); ++i) {
             const CTxIn& in = tx.vin[i];
-            if (in.IsAnonInput()) continue;
             cs::OutPoint p;
             memcpy(p.txid.data(), in.prevout.hash.begin(), 32);
             p.n = in.prevout.n;
@@ -7119,7 +6700,7 @@ bool s16_StoreAuthoritativeInputGate(const CBlock& blk, int32_t height, std::str
     return true;
 }
 
-// ---------------------------------------------------------------------------
+// -----------------------------------------------------------------------------
 // S2.0-M2b: Store3A-backed V2 transparent-input view. The `s16_V2InputView` struct is defined just
 // before CTransaction::ConnectInputs (it must be a complete type there). This helper simply reports
 // whether the armed authoritative V2 instance is active -- identical to the M1/M2a gating condition.
@@ -7127,106 +6708,6 @@ static inline bool s16_V2Armed()
 {
     return s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
            s16::g_chainObserve.store && s16::g_chainObserve.store->opened();
-}
-
-// -----------------------------------------------------------------------------
-// M8.3 production cutover: DETERMINISTIC ANON feed, wired into the block path
-// (condition #2 — wallet-INDEPENDENT). The anon-output/key-image mutations are
-// derived strictly from the block's own transactions (never from the wallet scan
-// / pwalletMain) via cs::anon::anonfeed, and committed atomically into g_anon.
-// INERT unless cs::anon::g_anon.opened() (default). Once g_anon is opened in V2
-// store mode, errors FAIL CLOSED (refuse the block / refuse disconnect) — the
-// store is an authoritative consensus-state participant, never a best-effort mirror.
-// -----------------------------------------------------------------------------
-// Bridge: resolve a committed (pre-block) anon-output value for the feed from the
-// authoritative anonstore itself.
-struct s16_AnonCommittedView : public cs::anon::CommittedAoView {
-    bool getAo(const uint8_t key33[33], cs::anon::CAnonOutput* out) const override {
-        if (!cs::anon::g_anon.opened()) return false;
-        bool found = false; cs::ChainError e;
-        if (!cs::anon::g_anon.getAo(key33, out, &found, &e)) return false;
-        return found;
-    }
-};
-static void s16_FeedFromBlock(const CBlock& blk, int32_t height, cs::anon::BlockFeed& feed)
-{
-    feed.height = height; feed.txs.clear();
-    for (size_t ti = 0; ti < blk.vtx.size(); ++ti) {
-        const CTransaction& tx = blk.vtx[ti];
-        uint256 h = tx.GetHash();
-        cs::anon::BlockFeed::FeedTx ft;
-        for (uint32_t i = 0; i < tx.vin.size(); ++i) {
-            const CTxIn& in = tx.vin[i];
-            if (!in.IsAnonInput()) continue;
-            cs::anon::FeedInput fi;
-            memcpy(fi.txid.data(), h.begin(), 32); fi.inputNo = i;
-            ec_point ki; in.ExtractKeyImage(ki);
-            if (ki.size() >= 33) memcpy(fi.keyImage.data(), ki.data(), 33);
-            const int nRing = in.ExtractRingSize();
-            const CScript& s = in.scriptSig;
-            if (nRing > 0 && s.size() >= 2 + (size_t)nRing * 33) {
-                for (int r = 0; r < nRing; ++r) {
-                    std::array<uint8_t,33> pk{};
-                    memcpy(pk.data(), &s[2 + (size_t)r * 33], 33);
-                    fi.ring.push_back(pk);
-                }
-            }
-            if (!fi.ring.empty()) ft.inputs.push_back(fi);
-        }
-        for (uint32_t j = 0; j < tx.vout.size(); ++j) {
-            const CTxOut& o = tx.vout[j];
-            if (!o.IsAnonOutput()) continue;
-            if (o.scriptPubKey.size() < 2 + 1 + 33) continue;
-            cs::anon::FeedOutput fo;
-            memcpy(fo.txid.data(), h.begin(), 32); fo.n = j; fo.nValue = o.nValue;
-            memcpy(fo.pkCoin.data(), &o.scriptPubKey[2 + 1], 33);
-            ft.outputs.push_back(fo);
-        }
-        if (!ft.inputs.empty() || !ft.outputs.empty()) feed.txs.push_back(ft);
-    }
-}
-// Connect a block's ANON state. Returns true unless g_anon is opened AND the feed/
-// store rejects (fail-closed). Inert (true) when g_anon is not opened (legacy bridge).
-bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash)
-{
-    if (!cs::anon::g_anon.opened()) return true;
-    cs::anon::BlockFeed feed; s16_FeedFromBlock(blk, height, feed);
-    if (feed.txs.empty()) return true;   // no anon content in this block
-    std::vector<cs::anon::Mutation> muts; cs::ChainError e;
-    s16_AnonCommittedView view;
-    if (!cs::anon::deriveAnonMutations(feed, view, &muts, &e))
-        return error("ConnectBlock() : ANON feed derive FAILED at height %d (%s) — fail-closed, no legacy fallback",
-                     (int)height, e.str().c_str());
-    cs::Hash bh; memcpy(bh.data(), blockHash.begin(), 32);
-    if (!cs::anon::g_anon.connect(bh, height, muts, &e))
-        return error("ConnectBlock() : ANON store connect FAILED at height %d (%s) — fail-closed, no legacy fallback",
-                     (int)height, e.str().c_str());
-    return true;
-}
-static bool s16_AnonDisconnectBlock(const cs::Hash& blockHash, const cs::Hash& parentTipHash)
-{
-    if (!cs::anon::g_anon.opened()) return true;
-    cs::ChainError e;
-    if (!cs::anon::g_anon.disconnect(blockHash, parentTipHash, &e))
-        return error("DisconnectBlock() : ANON store undo disconnect FAILED for %s (%s) — fail-closed, no legacy fallback",
-                     HexStr(blockHash.data(), blockHash.data()+32).substr(0,20).c_str(), e.str().c_str());
-    return true;
-}
-bool s16_AnonReadAo(CTxDB& txdb, const CPubKey& pkRingCoin, CAnonOutput& ao)
-{
-    if (cs::anon::g_anon.opened()) {
-        cs::ChainError ane; bool found = false; cs::anon::CAnonOutput aao;
-        if (!cs::anon::g_anon.getAo(pkRingCoin.begin(), &aao, &found, &ane)) return false; // authority error (fail-closed)
-        if (!found) return false;
-        uint256 txnHash; memcpy(txnHash.begin(), aao.txid.data(), 32);
-        ao.outpoint = COutPoint(txnHash, aao.n);
-        ao.nValue = aao.nValue;
-        ao.nBlockHeight = aao.nBlockHeight;
-        ao.nCompromised = aao.nCompromised;
-        return true;
-    }
-    CPubKey pk = pkRingCoin;   // legacy ReadAnonOutput takes non-const CPubKey&
-    return txdb.ReadAnonOutput(pk, ao);
 }
 
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
@@ -7288,9 +6769,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     std::set<uint256> setBlockNullifiers;
 
     int64_t nTransparentValidateMicros = 0;
-    int64_t nAnonValidateMicros = 0;
     unsigned int nTransparentValidateCount = 0;
-    unsigned int nAnonValidateCount = 0;
 
     const bool fHRegActive = hreg::IsHRegRecognitionActive(pindex->nHeight);
     hreg::RegistryState hregShadowState;
@@ -7406,23 +6885,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             int64_t nTxValueIn = tx.GetValueIn(mapInputs);
             int64_t nTxValueOut = tx.GetValueOut();
 
-            if (tx.nVersion == ANON_TXN_VERSION)
-            {
-                // reject ring sig txs in blocks after deprecation fork
-                if (pindex->nHeight >= FORK_HEIGHT_RINGSIG_DEPRECATION)
-                    return DoS(100, error("ConnectBlock() : ring signature transactions deprecated after height %d", FORK_HEIGHT_RINGSIG_DEPRECATION));
-
-                int64_t nSumAnon;
-                if (!tx.CheckAnonInputs(txdb, nSumAnon, fInvalid, true))
-                {
-                    if (fInvalid)
-                        return error("ConnectBlock() : CheckAnonInputs found invalid tx %s", tx.GetHash().ToString().substr(0,10).c_str());
-                    return false;
-                };
-
-                nTxValueIn += nSumAnon;
-            };
-
 
             if (nTxValueIn > std::numeric_limits<int64_t>::max() - nValueIn)
                 return DoS(100, error("ConnectBlock() : block value-in overflow"));
@@ -7452,16 +6914,8 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             }
 
             int64_t nTxValidateMicros = GetTimeMicros() - nTxValidateStart;
-            if (tx.nVersion == ANON_TXN_VERSION)
-            {
-                nAnonValidateMicros += nTxValidateMicros;
-                nAnonValidateCount++;
-            }
-            else
-            {
-                nTransparentValidateMicros += nTxValidateMicros;
-                nTransparentValidateCount++;
-            }
+            nTransparentValidateMicros += nTxValidateMicros;
+            nTransparentValidateCount++;
         }
 
         mapQueuedChanges[hashTx] = CTxIndex(posThisTx, tx.vout.size());
@@ -8031,10 +7485,9 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     if (fJustCheck)
     {
         if (fDebug && GetBoolArg("-showtimers", false))
-            printf("ConnectBlock: height=%d justcheck total=%" PRId64"ms check=%" PRId64"ms tx_transparent=%u/%" PRId64"us tx_anon=%u/%" PRId64"us\n",
+            printf("ConnectBlock: height=%d justcheck total=%" PRId64"ms check=%" PRId64"ms tx_transparent=%u/%" PRId64"us\n",
                    pindex->nHeight, GetTimeMillis() - nConnectBlockStart, nConnectCheckMs,
-                   nTransparentValidateCount, nTransparentValidateMicros,
-                   nAnonValidateCount, nAnonValidateMicros);
+                   nTransparentValidateCount, nTransparentValidateMicros);
         return true;
     }
 
@@ -8042,11 +7495,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     // S2.0-S1.7-G: pass the V2 input view so the authority gate can source this block's spends from
     // `consumed` when armed (V2), instead of the file-empty mqc.vSpent. Unarmed (legacy/mirror) -> NULL.
     s16_ObserveConnectBlock(*this, mapQueuedChanges, pindex, &v2View);   // S1.6-2: read-only observation (no-op unless enabled)
-    // M8.3: deterministic ANON feed (wallet-independent), committed in the same window as the
-    // Store3A delta publish. INERT unless cs::anon::g_anon.opened(); when opened, a feed/store
-    // error FAILS CLOSED (refuse the block, no legacy fallback). Never a best-effort mirror.
-    if (!s16_AnonConnectBlock(*this, (int32_t)pindex->nHeight, GetHash()))
-        return false;
     // S1.9: when armed as V2 AUTHORITATIVE chainstate (hardFail), a Store3A authority-gate
     // failure (needsRecovery at THIS block) MUST refuse the block — fail-closed, no silent
     // legacy fallback. This is the authoritative property: Store3A divergence halts the node
@@ -8155,10 +7603,9 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     uiInterface.NotifyRanksUpdated();
 
     if (fDebug && GetBoolArg("-showtimers", false))
-        printf("ConnectBlock: height=%d total=%" PRId64"ms check=%" PRId64"ms tx_transparent=%u/%" PRId64"us tx_anon=%u/%" PRId64"us\n",
+        printf("ConnectBlock: height=%d total=%" PRId64"ms check=%" PRId64"ms tx_transparent=%u/%" PRId64"us\n",
                pindex->nHeight, GetTimeMillis() - nConnectBlockStart, nConnectCheckMs,
-               nTransparentValidateCount, nTransparentValidateMicros,
-               nAnonValidateCount, nAnonValidateMicros);
+               nTransparentValidateCount, nTransparentValidateMicros);
 
     return true;
 }
@@ -9802,8 +9249,7 @@ bool CBlock::AcceptBlock()
         hashProof = GetPoWHash();
     }
 
-    // Reject ring signature transactions after deprecation height
-    if (nHeight >= FORK_HEIGHT_RINGSIG_DEPRECATION)
+    // Reject ring signature (ANON) transactions unconditionally — mechanism removed.
     {
         for (unsigned int i = 0; i < vtx.size(); i++)
         {
@@ -9811,8 +9257,7 @@ bool CBlock::AcceptBlock()
             {
                 TraceAcceptBlockReject(*this, nHeight,
                                        ABREJECT_RINGSIG_DEPRECATION);
-                return DoS(100, error("AcceptBlock() : ring signature transaction (ANON_TXN_VERSION) in block at height %d after deprecation height %d",
-                                       nHeight, FORK_HEIGHT_RINGSIG_DEPRECATION));
+                return DoS(100, error("AcceptBlock() : ring signature transaction (ANON_TXN_VERSION) in block rejected (mechanism removed)"));
             }
         }
     }
@@ -11398,8 +10843,6 @@ bool LoadBlockIndex(bool fAllowNew)
     CTxDB txdb("cr+");
     if (!txdb.LoadBlockIndex())
         return false;
-    if (!pwalletMain->CacheAnonStats())
-        printf("CacheAnonStats() failed.\n");
 
     //
     // Init with genesis block

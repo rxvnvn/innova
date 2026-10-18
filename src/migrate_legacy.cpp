@@ -219,7 +219,6 @@ int main(int argc, char** argv)
                 int j=v[k].j;
                 if(j<(int)tx.vout.size()){
                     const CTxOut& o=tx.vout[j];
-                    if(o.IsAnonOutput()){ ++anon; continue; }        // transparent-projection boundary
                     cs::OutPoint op; memcpy(op.txid.data(),txid.begin(),32); op.n=(uint32_t)j;
                     Coin c; c.value=o.nValue; c.script.assign(o.scriptPubKey.begin(),o.scriptPubKey.end());
                     c.height=v[k].height; c.nTime=tx.nTime; c.fCoinBase=fcb; c.fCoinStake=fcs;
