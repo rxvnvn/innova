@@ -1463,19 +1463,32 @@ bool AppInit2()
                own.legacyPresent ? 1 : 0, own.legacyReadable ? 1 : 0,
                own.unpublishedArtifacts ? 1 : 0, (int)own.v2CurrentStatus, v2Root.c_str());
 
-        // S2.0 BI-V2 AUTHORITATIVE STARTUP: in V2 store mode (-s16openstore) the
-        // block index MUST come from an EXISTING authoritative Block Index V2 —
-        // never from a legacy migration or a from-scratch native build, because
-        // both would READ the legacy LevelDB txindex/blockindex (prohibited, and
-        // the guard rejects the open). Refuse startup unless the ownership is
-        // already V2_AUTHORITATIVE. Non-V2 startup is unaffected.
+        // S2.0 BI-V2 AUTHORITATIVE STARTUP + P2 EMPTY_DATADIR: in V2 store mode
+        // (-s16openstore) the block index MUST come exclusively from Block Index
+        // V2 — never from a legacy migration (LEGACY_MIGRATION_REQUIRED), a
+        // present-but-corrupt V2 generation (FATAL_CORRUPTION / V2_RECOVERY), or
+        // any replay that would READ the legacy LevelDB txindex/blockindex
+        // (prohibited; the guard rejects the open). Two ownership states are
+        // permissible:
+        //   * V2_AUTHORITATIVE  — an existing, validated BI-V2 generation (normal
+        //     restart / continuation);
+        //   * EMPTY_NEW         — a clean empty datadir: the native genesis
+        //     bootstrap below (PrepareNativeBlockIndexGeneration) builds the very
+        //     first generation from the SINGLE canonical genesis record WITHOUT
+        //     reading any legacy store (blockindex_native_bootstrap.cpp EMPTY_NEW
+        //     path is legacy-free), so it is safe and is the P2 target scenario
+        //     (empty datadir -> genesis-to-tip IBD).
+        // Everything else refuses startup. Non-V2 startup is unaffected.
         if (s16::V2LegacyIndexGuardActive() &&
-            own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE)
+            own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE &&
+            own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW)
             return InitError(strprintf(
                 "Store3A V2 authoritative FAIL-CLOSED: Block Index V2 ownership is %s, not "
-                "V2_AUTHORITATIVE. In V2 store mode (-s16openstore) the block index must already "
-                "exist as an authoritative Block Index V2 built offline; the legacy txindex must not "
-                "be migrated or replayed at startup. No legacy fallback.",
+                "V2_AUTHORITATIVE or EMPTY_NEW. In V2 store mode (-s16openstore) the block index "
+                "must already exist as an authoritative Block Index V2, or the datadir must be "
+                "clean so the native genesis bootstrap builds the first generation (no legacy "
+                "migration/import permitted in V2). The legacy txindex must not be migrated or "
+                "replayed at startup. No legacy fallback.",
                 BlockIndexStartupOwnershipStateName(own.state)));
 
         if (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW ||
@@ -1940,7 +1953,41 @@ authoritative_startup_ready:
             if (pindexBest == NULL)
                 return InitError("Store3A V2 authoritative: no best chain loaded");
             int32_t stH = g_s3aAuthoritative->tipHeight();
-            CBlockIndex* tipAt = (stH >= 0) ? pindexBest->GetAncestor(stH) : NULL;
+            // ------------------------------------------------------------------
+            // P2 EMPTY_DATADIR: a fresh, EMPTY Store3A (tipHeight < 0) paired with a
+            // genesis-only best chain is the clean genesis->tip IBD start. There is
+            // deliberately nothing yet in the store to agree with: genesis itself is
+            // never "connected" to the UTXO store (its outputs are the initial supply,
+            // spent only by later blocks the feed will publish). The authoritative
+            // start is therefore confirmed by (a) the loaded best chain being EXACTLY
+            // genesis (height 0) and (b) Block Index V2 resolving genesis at height 0.
+            // Store3A/TX-LOC/undo/BL-V2 are then all formed from blocks during IBD.
+            // Fail-closed if the store is empty but the chain is NOT at genesis: an
+            // empty store cannot silently adopt an already-nonempty chain.
+            // ------------------------------------------------------------------
+            if (stH < 0)
+            {
+                if (pindexGenesisBlock == NULL || pindexBest->nHeight != 0 ||
+                    pindexBest->GetBlockHash() != pindexGenesisBlock->GetBlockHash())
+                    return InitError("Store3A V2 authoritative FAIL-CLOSED: fresh/empty Store3A opened but the loaded best chain is not the genesis block (h=0). Refusing to start on an ambiguous empty store.\n");
+                {
+                    const BlockIndexV2Reader* biReader = GetAuthoritativeNavigatorReader();
+                    if (!biReader || !biReader->IsOpen())
+                        return InitError("Store3A V2 authoritative FAIL-CLOSED: authoritative Block Index V2 reader is not open (block index must come from BI-V2 in V2 store mode; legacy fallback is prohibited)");
+                    BlockIndexSnapshot gSnap; std::string gErr;
+                    const AuthoritativeBlockResolutionResult gRes =
+                        AuthoritativeGetActiveSnapshotByHeightR(0, &gSnap, &gErr);
+                    if (gRes != AUTHORITATIVE_BLOCK_FOUND || !gSnap.found || gSnap.height != 0 ||
+                        gSnap.hash != pindexGenesisBlock->GetBlockHash())
+                        return InitError("Store3A V2 authoritative FAIL-CLOSED: fresh empty store requires Block Index V2 to resolve the genesis block at height 0. BI-V2 must provide genesis in V2 store mode; no legacy fallback.");
+                    printf("Store3A V2 authoritative: FRESH EMPTY STORE at genesis (P2 empty-datadir IBD). BI-V2 genesis resolved (h=0 %s); Store3A/TX-LOC/undo formed from blocks during IBD.\n",
+                           gSnap.hash.GetHex().c_str());
+                    fflush(stdout);
+                }
+            }
+            else
+            {
+            CBlockIndex* tipAt = pindexBest->GetAncestor(stH);
             if (tipAt == NULL)
                 return InitError(strprintf("Store3A V2 authoritative: tipHeight=%d absent from loaded best chain", (int)stH));
             uint256 stHash; memcpy(stHash.begin(), g_s3aAuthoritative->tipHash().data(), 32);
@@ -2018,6 +2065,7 @@ authoritative_startup_ready:
                        (int)biTipHeight, biTipHash.GetHex().c_str(), (int)stH, stHash.GetHex().c_str());
                 fflush(stdout);
             }
+            }   // else: non-empty (seeded/promoted) Store3A verification
             s16::g_chainObserve.store = g_s3aAuthoritative.get();
             s16::g_chainObserve.enabled = true;
             s16::g_chainObserve.checkAuthority = true;
