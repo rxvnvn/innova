@@ -490,11 +490,14 @@ BOOST_AUTO_TEST_CASE(real_connectblock_spend_cycle)
     ChainError e;
     BOOST_REQUIRE_MESSAGE(store.open(dir, &e), "store open: " << e.str());
 
-    // Arm the real ConnectBlock observation hook.
+    // Arm the real ConnectBlock observation hook, V2-AUTHORITATIVE (hardFail): the
+    // spend's prevout resolves from Store3A via the V2 input view — not the retired
+    // legacy txindex. M8.1b: no legacy txindex/block-index writes exist anymore.
     s16::ChainObserveState old = s16::g_chainObserve;
     s16::g_chainObserve.enabled = true;
     s16::g_chainObserve.store = &store;
     s16::g_chainObserve.checkAuthority = true;
+    s16::g_chainObserve.hardFail = true;
     s16::g_chainObserve.fails = 0;
     s16::g_chainObserve.mismatch = 0;
 
@@ -632,6 +635,7 @@ BOOST_AUTO_TEST_CASE(real_connectblock_multi_spend_chain)
     s16::ChainObserveState old = s16::g_chainObserve;
     s16::g_chainObserve.enabled = true; s16::g_chainObserve.store = &store;
     s16::g_chainObserve.checkAuthority = true;
+    s16::g_chainObserve.hardFail = true;
     s16::g_chainObserve.fails = 0; s16::g_chainObserve.mismatch = 0;
     const int64_t FEE = 100000;
     try {
@@ -713,6 +717,7 @@ BOOST_AUTO_TEST_CASE(real_connectblock_intrablock_create_spend)
     s16::ChainObserveState old = s16::g_chainObserve;
     s16::g_chainObserve.enabled = true; s16::g_chainObserve.store = &store;
     s16::g_chainObserve.checkAuthority = true;
+    s16::g_chainObserve.hardFail = true;
     s16::g_chainObserve.fails = 0; s16::g_chainObserve.mismatch = 0;
     const int64_t FEE = 100000;
     try {

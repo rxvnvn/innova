@@ -12,6 +12,7 @@
 #include "../blockindex_generation_lifecycle.h"
 #include "../blockindex_shadow_startup.h"
 #include "../txdb-leveldb.h"
+#include "../chainstate/txloc/txloc.h"
 
 using namespace hreg;
 
@@ -158,9 +159,18 @@ struct RealHRegDiskFixture
             GetSizeOfCompactSize(block.vtx.size());
         const unsigned int prevTxPos = firstTxPos +
             ::GetSerializeSize(coinbase, SER_DISK, CLIENT_VERSION);
-        { CTxDB db("rw");
-          BOOST_REQUIRE(db.AddTxIndex(prev, CDiskTxPos(blockFile, blockPos, prevTxPos), 0));
-          db.Close(); }
+        // M8.1b: seed the V2 historical TX-LOC locator (the GetTransaction source when
+        // TX-LOC is opened) instead of the removed legacy txindex AddTxIndex. The block
+        // bytes were written to blk*.dat by WriteToDisk above; TX-LOC maps prev's txid to
+        // that physical position, preserving the historical-lookup round-trip coverage.
+        { txloc::ChainError txE; bool txlocAbsent = false;
+          BOOST_REQUIRE_MESSAGE(txloc::g_txloc.openDir((root / "txloc").string(), &txlocAbsent, &txE),
+                                "hreg txloc open: " << txE.str());
+          txloc::Loc loc; loc.nFile = blockFile; loc.nBlockPos = blockPos;
+          loc.nTxPos = prevTxPos; loc.nHeight = 0;
+          BOOST_REQUIRE_MESSAGE(txloc::g_txloc.add(prev.GetHash().begin(), loc, &txE),
+                                "hreg txloc add: " << txE.str());
+          BOOST_REQUIRE_MESSAGE(txloc::g_txloc.sync(&txE), "hreg txloc sync: " << txE.str()); }
 
         BlockIndexGenerationSource source;
         BlockIndexRecord record;
@@ -205,6 +215,7 @@ struct RealHRegDiskFixture
 
     ~RealHRegDiskFixture()
     {
+        txloc::g_txloc.close();   // M8.1b: release the fixture-seeded TX-LOC handle
         ClearBlockIndexStakingNavigator();
         g_fAuthoritativeStartup = oldAuthoritative;
         if (hadDataDir) mapArgs["-datadir"] = oldDataDir;

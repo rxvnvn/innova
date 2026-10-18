@@ -5506,46 +5506,6 @@ void Misbehaving(NodeId pnode, int howmuch)
 }
 
 
-
-
-
-bool CTransaction::DisconnectInputs(CTxDB& txdb)
-{
-
-    // Relinquish previous transactions' spent pointers
-    if (!IsCoinBase())
-    {
-        for (const CTxIn& txin : vin)
-        {
-            COutPoint prevout = txin.prevout;
-
-            // Get prev txindex from disk
-            CTxIndex txindex;
-            if (!txdb.ReadTxIndex(prevout.hash, txindex))
-                return error("DisconnectInputs() : ReadTxIndex failed");
-
-            if (prevout.n >= txindex.vSpent.size())
-                return error("DisconnectInputs() : prevout.n out of range");
-
-            // Mark outpoint as not spent
-            txindex.vSpent[prevout.n].SetNull();
-
-            // Write back
-            if (!txdb.UpdateTxIndex(prevout.hash, txindex))
-                return error("DisconnectInputs() : UpdateTxIndex failed");
-        }
-    }
-
-    // Remove transaction from index
-    // This can fail if a duplicate of this transaction was in a chain that got
-    // reorganized away. This is only possible if this transaction was completely
-    // spent, so erasing it would be a no-op anyway.
-    txdb.EraseTxIndex(*this);
-
-    return true;
-}
-
-
 bool CTransaction::FetchInputs(CTxDB& txdb, const map<uint256, CTxIndex>& mapTestPool,
                                bool fBlock, bool fMiner, MapPrevTx& inputsRet, bool& fInvalid)
 {
@@ -6611,45 +6571,12 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
                          (int)pindex->nHeight, pindex->GetBlockHash().ToString().substr(0,20).c_str(), se.str().c_str());
         }
     }
-    else
-    {
-        // M8: the legacy txindex reversal + block-index write below is the NON-V2 path
-        // only. In the armed-V2 mode Store3A undo (above) reverts the UTXO and BI-V2
-        // owns the block index, so no legacy txleveldb read/write happens here.
-        // Disconnect in reverse order. HREG reverse-state replay must happen
-        // immediately after each tx's inputs are disconnected, while earlier same-
-        // block parent tx indices still exist in txdb.
-        for (int i = vtx.size()-1; i >= 0; i--)
-        {
-            if (!vtx[i].DisconnectInputs(txdb))
-                return false;
-            if (hreg::IsHRegRecognitionActive(pindex->nHeight))
-            {
-                CTransaction tx = vtx[i];
-                bool fInvalid = false;
-                MapPrevTx mapInputs;
-                std::map<uint256, CTxIndex> mapEmpty;
-                if (!tx.FetchInputs(txdb, mapEmpty, true, false, mapInputs, fInvalid))
-                    return error("DisconnectBlock() : HREG FetchInputs failed");
-                std::string strHRegError;
-                if (!hreg::DisconnectHRegTx(tx, mapInputs, pindex->nHeight, strHRegError))
-                    return error("DisconnectBlock() : HREG disconnect invalid: %s", strHRegError.c_str());
-            }
-        }
+    // M8.1b: the legacy txindex/block-index reversal branch is removed — armed-V2 is
+    // the single production path (Store3A undo above reverts the UTXO; BI-V2 owns the
+    // block index). No legacy txleveldb read/write happens on disconnect.
 
-        // Update block index on disk without changing it in memory.
-        // The memory index structure will be changed after the db commits.
-        if (pindex->pprev)
-        {
-            CDiskBlockIndex blockindexPrev(pindex->pprev);
-            blockindexPrev.hashNext = 0;
-            if (!txdb.WriteBlockIndex(blockindexPrev))
-                return error("DisconnectBlock() : WriteBlockIndex failed");
-        }
-    }
-
-    // ppcoin: clean up wallet after disconnecting coinstake (runs in BOTH modes;
-    // it is a wallet update, not a legacy-txindex operation).
+    // ppcoin: clean up wallet after disconnecting coinstake (a wallet update, not a
+    // legacy-txindex operation).
     for (CTransaction& tx : vtx)
         SyncWithWallets(tx, this, false, false);
 
@@ -7963,13 +7890,8 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 
     // innova: collect valid name tx
     // NOTE: tx.UpdateCoins should not affect this loop, probably...
-    // M8: in armed-V2 BI-V2 owns the block index (AddToBlockIndex append); skip the
-    // legacy block-index write (no txleveldb write).
-    if (!s16_V2Armed())
-    {
-        if (!txdb.WriteBlockIndex(CDiskBlockIndex(pindex)))
-            return error("Connect() : WriteBlockIndex for pindex failed");
-    }
+    // M8.1b: the legacy block-index write is removed — in armed-V2 BI-V2 owns the block
+    // index (AddToBlockIndex append). No txleveldb write happens here.
 
     if (fJustCheck)
     {
@@ -8024,18 +7946,8 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         }
     }
 
-    //
-    // M8: in the armed-V2 mode Store3A owns the UTXO and TX-LOC the historical location,
-    // so the legacy txindex queue write is redundant and is SKIPPED (no txleveldb write).
-    // Non-V2 writes the queued txindex changes as before.
-    if (!s16_V2Armed())
-    {
-        for (map<uint256, CTxIndex>::iterator mi = mapQueuedChanges.begin(); mi != mapQueuedChanges.end(); ++mi)
-        {
-            if (!txdb.UpdateTxIndex((*mi).first, (*mi).second))
-                return error("ConnectBlock() : UpdateTxIndex failed");
-        }
-    }
+    // M8.1b: the legacy txindex queue write is removed — armed-V2 Store3A owns the
+    // UTXO and TX-LOC the historical location. No txleveldb write happens here.
     if(GetBoolArg("-addrindex", false))
     {
         // Write Address Index
@@ -8090,19 +8002,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
         }
     }
 
-    // Update block index on disk without changing it in memory.
-    // The memory index structure will be changed after the db commits.
-    if (pindex->pprev)
-    {
-        CDiskBlockIndex blockindexPrev(pindex->pprev);
-        blockindexPrev.hashNext = pindex->GetBlockHash();
-        // M8: armed-V2 skips the legacy block-index write (BI-V2 owns the index).
-        if (!s16_V2Armed())
-        {
-            if (!txdb.WriteBlockIndex(blockindexPrev))
-                return error("ConnectBlock() : WriteBlockIndex failed");
-        }
-    }
+    // M8.1b: the legacy block-index write is removed — armed-V2 BI-V2 owns the index.
 
     if (fHRegActive)
         hreg::g_registry = hregShadowState;
@@ -9203,25 +9103,10 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     // itself now happens after every use of the retained topology.
     const int nAcceptFloorTipHeight = nBestHeight;
 
-    // Write to disk block index
+    // M8.1b: the legacy block-index write transaction is removed — armed-V2 BI-V2 owns
+    // the block index on the AddToBlockIndex append. `txdb` remains for the SetBestChain
+    // call below (which opens its own transaction).
     CTxDB txdb;
-    if (!txdb.TxnBegin())
-        return false;
-    {
-        CSyncLockPhase phase("ProcessMessage(block)", "blockindex_db");
-        if (!s16_V2Armed())
-            txdb.WriteBlockIndex(CDiskBlockIndex(pindexNew));
-    }
-    {
-        CSyncLockPhase phase("ProcessMessage(block)", "blockindex_db_commit");
-        ibdactivepath::ActivePathTimer ibdBlockIndexCommitTimer(
-            ibdactivepath::GetCounters().blockindex_commit_us_total,
-            ibdactivepath::GetCounters().blockindex_commit_us_max,
-            ibdactivepath::GetCounters().blockindex_commit_count,
-            "blockindex_commit", pindexNew->nHeight);
-        if (!txdb.TxnCommit())
-            return false;
-    }
 
     // R2c.2s/S5: root-scoped owned transaction preview (NULL in legacy mode).
     // S3 rollback coherence (authoritative): durable pre-operation score-certificate
@@ -9258,10 +9143,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         CSyncLockPhase phase("ProcessMessage(block)", "set_best_chain");
         if (!SetBestChain(txdb, pindexNew))
         {
-
-            CTxDB txdbIndexClean;
-            if (!s16_V2Armed())
-                txdbIndexClean.EraseBlockIndex(hash);
+            // M8.1b: the legacy block-index erase is removed — armed-V2 BI-V2 owns the index.
             mapBlockIndex.erase(hash);
             if (pindexNew->IsProofOfStake())
                 setStakeSeen.erase(make_pair(pindexNew->prevoutStake, pindexNew->nStakeTime));

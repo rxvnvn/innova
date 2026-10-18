@@ -97,17 +97,46 @@ static CBlockIndex* CkptAVMine(CBlockIndex* prev, unsigned int extra, bool mustA
     return ok ? idx : NULL;
 }
 
+static bool BuildLiveChainSource(BlockIndexGenerationSource* source, std::string* error)
+{
+    source->records.clear();
+    for (std::map<uint256, CBlockIndex*>::const_iterator it = ::mapBlockIndex.begin(); it != ::mapBlockIndex.end(); ++it)
+    {
+        const CBlockIndex* p = it->second;
+        if (!p) continue;
+        BlockIndexGenerationSourceRecord rec;
+        rec.hash = p->GetBlockHash();
+        rec.record.hash = p->GetBlockHash();
+        rec.record.hashPrev = (p->pprev ? p->pprev->GetBlockHash() : uint256(0));
+        rec.record.hashMerkleRoot = p->hashMerkleRoot;
+        rec.record.hashProof = p->hashProof;
+        rec.record.prevoutStake = p->prevoutStake;
+        rec.record.height = p->nHeight;
+        rec.record.nFile = p->nFile;
+        rec.record.nBlockPos = p->nBlockPos;
+        rec.record.nFlags = p->nFlags;
+        rec.record.nVersion = p->nVersion;
+        rec.record.nTime = p->nTime;
+        rec.record.nBits = p->nBits;
+        rec.record.nNonce = p->nNonce;
+        rec.record.nMint = p->nMint;
+        rec.record.nMoneySupply = p->nMoneySupply;
+        rec.record.nStakeModifier = p->nStakeModifier;
+        rec.record.nStakeTime = p->nStakeTime;
+        source->records.push_back(rec);
+    }
+    source->hashBestChain = (pindexBest ? pindexBest->GetBlockHash() : uint256(0));
+    source->foundBestChain = (pindexBest != NULL);
+    source->blockDataDir = GetDataDir().string();
+    if (source->records.empty())
+    { if (error) *error = "live chain source: empty mapBlockIndex"; return false; }
+    return true;
+}
+
 static void CkptAVBuildRoot(const fs::path& root, std::string* error)
 {
-    fs::create_directories(root / "snapshot");
-    { CTxDB db; db.Close(); }
-    const auto live = GetDataDir() / "txleveldb";
-    for (fs::directory_iterator it(live), end; it != end; ++it)
-        if (fs::is_regular_file(it->path()))
-            fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
     BlockIndexGenerationSource source;
-    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, error), *error);
-    source.blockDataDir = GetDataDir().string();
+    BOOST_REQUIRE_MESSAGE(BuildLiveChainSource(&source, error), *error);
     BlockIndexGenerationBuilder builder;
     BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "blockindex-build-000001.tmp").string(), 1, NULL, error), *error);
     builder.Close();

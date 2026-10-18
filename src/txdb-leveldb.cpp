@@ -839,25 +839,7 @@ bool CTxDB::ReadTxIndex(uint256 hash, CTxIndex& txindex)
     return Read(make_pair(string("tx"), hash), txindex);
 }
 
-bool CTxDB::UpdateTxIndex(uint256 hash, const CTxIndex& txindex)
-{
-    return Write(make_pair(string("tx"), hash), txindex);
-}
 
-bool CTxDB::AddTxIndex(const CTransaction& tx, const CDiskTxPos& pos, int nHeight)
-{
-    // Add to tx index
-    uint256 hash = tx.GetHash();
-    CTxIndex txindex(pos, tx.vout.size());
-    return Write(make_pair(string("tx"), hash), txindex);
-}
-
-bool CTxDB::EraseTxIndex(const CTransaction& tx)
-{
-    uint256 hash = tx.GetHash();
-
-    return Erase(make_pair(string("tx"), hash));
-}
 
 bool CTxDB::ContainsTx(uint256 hash)
 {
@@ -889,15 +871,7 @@ bool CTxDB::ReadDiskTx(COutPoint outpoint, CTransaction& tx)
     return ReadDiskTx(outpoint.hash, tx, txindex);
 }
 
-bool CTxDB::WriteBlockIndex(const CDiskBlockIndex& blockindex)
-{
-    return Write(make_pair(string("blockindex"), blockindex.GetBlockHash()), blockindex);
-}
 
-bool CTxDB::EraseBlockIndex(const uint256& blockhash)
-{
-    return Erase(make_pair(string("blockindex"), blockhash));
-}
 
 bool CTxDB::ReadHashBestChain(uint256& hashBestChain)
 {
