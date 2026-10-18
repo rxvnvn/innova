@@ -429,7 +429,6 @@ public:
     void ReacceptWalletTransactions();
     void ResendWalletTransactions(bool fForce = false);
     int64_t GetBalance() const;
-    int64_t GetAnonBalance() const;
     int64_t GetLockedBalance() const;
     int64_t GetUnlockedBalance() const;
     int64_t GetUnconfirmedBalance() const;
@@ -462,38 +461,6 @@ public:
     bool UpdateStealthAddress(std::string &addr, std::string &label, bool addIfNotExist);
 
     bool FindStealthTransactions(const CTransaction& tx, mapValue_t& mapNarr);
-
-    // Ring Sigs - v3 I n n o v a
-    bool UpdateAnonTransaction(CTxDB* ptxdb, const CTransaction& tx, const uint256& blockHash);
-    bool UndoAnonTransaction(const CTransaction& tx);
-    bool ProcessAnonTransaction(CWalletDB* pwdb, CTxDB* ptxdb, const CTransaction& tx, const uint256& blockHash, bool& fIsMine, mapValue_t& mapNarr, std::vector<std::map<uint256, CWalletTx>::iterator>& vUpdatedTxns);
-
-    bool GetAnonChangeAddress(CStealthAddress& sxAddress);
-    bool CreateStealthOutput(CStealthAddress* sxAddress, int64_t nValue, std::string& sNarr, std::vector<std::pair<CScript, int64_t> >& vecSend, std::map<int, std::string>& mapNarr, std::string& sError);
-    bool CreateAnonOutputs(CStealthAddress* sxAddress, int64_t nValue, std::string& sNarr, std::vector<std::pair<CScript, int64_t> >& vecSend, CScript& scriptNarration);
-    int PickAnonInputs(int rsType, int64_t nValue, int64_t& nFee, int nRingSize, CWalletTx& wtxNew, int nOutputs, int nSizeOutputs, int& nExpectChangeOuts, std::list<COwnedAnonOutput>& lAvailableCoins, std::vector<COwnedAnonOutput*>& vPickedCoins, std::vector<std::pair<CScript, int64_t> >& vecChange, bool fTest, std::string& sError);
-    int GetTxnPreImage(CTransaction& txn, uint256& hash);
-    int PickHidingOutputs(int64_t nValue, int nRingSize, CPubKey& pkCoin, int skip, uint8_t* p);
-    bool AreOutputsUnique(CWalletTx& wtxNew);
-
-    bool AddAnonInputs(int rsType, int64_t nTotalOut, int nRingSize, std::vector<std::pair<CScript, int64_t> >&vecSend, std::vector<std::pair<CScript, int64_t> >&vecChange, CWalletTx& wtxNew, int64_t& nFeeRequired, bool fTestOnly, std::string& sError);
-    bool SendINNToAnon(CStealthAddress& sxAddress, int64_t nValue, std::string& sNarr, CWalletTx& wtxNew, std::string& sError, bool fAskFee=false);
-    bool SendAnonToAnon(CStealthAddress& sxAddress, int64_t nValue, int nRingSize, std::string& sNarr, CWalletTx& wtxNew, std::string& sError, bool fAskFee=false);
-    bool SendAnonToINN(CStealthAddress& sxAddress, int64_t nValue, int nRingSize, std::string& sNarr, CWalletTx& wtxNew, std::string& sError, bool fAskFee=false);
-
-    bool ExpandLockedAnonOutput(CWalletDB *pdb, CKeyID &ckeyId, CLockedAnonOutput &lao, std::set<uint256> &setUpdated);
-    bool ProcessLockedAnonOutputs();
-
-    bool EstimateAnonFee(int64_t nValue, int nRingSize, std::string& sNarr, CWalletTx& wtxNew, int64_t& nFeeRet, std::string& sError);
-
-    int ListUnspentAnonOutputs(std::list<COwnedAnonOutput>& lUAnonOutputs, bool fMatureOnly);
-    int CountAnonOutputs(std::map<int64_t, int>& mOutputCounts, bool fMatureOnly);
-    int CountAllAnonOutputs(std::list<CAnonOutputCount>& lOutputCounts, bool fMatureOnly);
-    int CountOwnedAnonOutputs(std::map<int64_t, int>& mOwnedOutputCounts, bool fMatureOnly);
-
-    bool EraseAllAnonData();
-
-    bool CacheAnonStats();
 
     bool CreateCollateralTransaction(CTransaction& txCollateral, std::string strReason);
     bool ConvertList(std::vector<CTxIn> vCoins, std::vector<int64_t>& vecAmounts);
@@ -532,8 +499,6 @@ public:
 
     isminetype IsMine(const CTxIn& txin) const;
     int64_t GetDebit(const CTxIn& txin, const isminefilter& filter) const;
-    int64_t GetAnonDebit(const CTxIn& txin) const;
-    int64_t GetAnonCredit(const CTxOut& txout) const;
     isminetype IsMine(const CTxOut& txout) const
     {
         return ::IsMine(*this, txout.scriptPubKey);
@@ -567,13 +532,7 @@ public:
         int64_t nDebit = 0;
         BOOST_FOREACH(const CTxIn& txin, tx.vin)
         {
-            if (tx.nVersion == ANON_TXN_VERSION
-                && txin.IsAnonInput())
-            {
-                nDebit += GetAnonDebit(txin);
-            } else
-                nDebit += GetDebit(txin, filter);
-            //nDebit += GetDebit(txin, filter);
+            nDebit += GetDebit(txin, filter);
             if (!MoneyRange(nDebit))
                 throw std::runtime_error("CWallet::GetDebit() : value out of range");
         }
@@ -584,37 +543,12 @@ public:
         int64_t nCredit = 0;
         BOOST_FOREACH(const CTxOut& txout, tx.vout)
         {
-            if (tx.nVersion == ANON_TXN_VERSION
-                && txout.IsAnonOutput())
-            {
-                nCredit += GetAnonCredit(txout);
-            } else
-                nCredit += GetCredit(txout, filter);
-            //nCredit += GetCredit(txout, filter);
+            nCredit += GetCredit(txout, filter);
             if (!MoneyRange(nCredit))
                 throw std::runtime_error("CWallet::GetCredit() : value out of range");
         }
         return nCredit;
     }
-
-    bool GetCredit(const CTransaction& tx, int64_t& nD, int64_t& nAnon, const isminefilter& filter) const
-    {
-        nD = 0;
-        nAnon = 0;
-        BOOST_FOREACH(const CTxOut& txout, tx.vout)
-        {
-            if (tx.nVersion == ANON_TXN_VERSION
-                && txout.IsAnonOutput())
-            {
-                nAnon += GetAnonCredit(txout);
-            } else
-                nD += GetCredit(txout, filter);
-            if (!MoneyRange(nD)
-                || !MoneyRange(nAnon))
-                throw std::runtime_error("CWallet::GetCredit() : value out of range");
-        }
-        return true;
-    };
 
     int64_t GetChange(const CTransaction& tx) const
     {
@@ -766,7 +700,6 @@ public:
     mutable bool fImmatureWatchCreditCached;
     mutable bool fAvailableWatchCreditCached;
     mutable bool fChangeCached;
-    mutable bool fAvailableAnonCreditCached;
     mutable bool fCreditSplitCached;
     mutable int64_t nDebitCached;
     mutable int64_t nCreditCached;
@@ -777,9 +710,7 @@ public:
     mutable int64_t nChangeCached;
     mutable int64_t nImmatureWatchCreditCached;
     mutable int64_t nAvailableWatchCreditCached;
-    mutable int64_t nAvailableAnonCreditCached;
     mutable int64_t nCredDCached;
-    mutable int64_t nCredAnonCached;
 
     std::vector<COutPoint> vReservedCoins;
 
@@ -824,10 +755,7 @@ public:
         fImmatureWatchCreditCached = false;
         fAvailableWatchCreditCached = false;
         fChangeCached = false;
-        fAvailableAnonCreditCached = false;
         nCredDCached = 0;
-        nCredAnonCached = 0;
-        nAvailableAnonCreditCached = 0;
         fCreditSplitCached = false;
         nDebitCached = 0;
         nCreditCached = 0;
@@ -929,7 +857,6 @@ public:
         fImmatureWatchCreditCached = false;
         fDebitCached = false;
         fChangeCached = false;
-        fAvailableAnonCreditCached = false;
         fCreditSplitCached = false;
     }
 
@@ -1031,29 +958,6 @@ public:
             return credit;
     }
 
-    bool GetCredit(int64_t& nCredD, int64_t& nCredAnon, bool fUseCache=true) const
-    {
-        // Must wait until coinbase is safely deep enough in the chain before valuing it
-        if ((IsCoinBase() || IsCoinStake()) && GetBlocksToMaturity() > 0)
-        {
-            nCredD = nCredAnon = 0;
-            return true;
-        }
-
-        // GetBalance can assume transactions in mapWallet won't change
-        if (!fUseCache || !fCreditSplitCached)
-        {
-            nCredDCached = 0;
-            nCredAnonCached = 0;
-            pwallet->GetCredit(*this, nCredDCached, nCredAnonCached, ISMINE_SPENDABLE);
-            fCreditSplitCached = true;
-        };
-
-        nCredD = nCredDCached;
-        nCredAnon = nCredAnonCached;
-        return true;
-    }
-
     int64_t GetImmatureCredit(bool fUseCache=true) const
     {
         if (fUseCache && fImmatureCreditCached)
@@ -1110,44 +1014,6 @@ public:
         fAvailableCreditCached = true;
         return nCredit;
     }
-
-    int64_t GetAvailableAnonCredit(bool fUseCache=true) const
-    {
-        // Must wait until coinbase is safely deep enough in the chain before valuing it
-        if ((IsCoinBase() || IsCoinStake()) && GetBlocksToMaturity() > 0)
-            return 0;
-
-        if (fUseCache && fAvailableAnonCreditCached)
-            return nAvailableAnonCreditCached;
-
-        int64_t nCredit = 0;
-
-        for (unsigned int i = 0; i < vout.size(); i++)
-        {
-            if (!IsSpent(i))
-            {
-                const CTxOut &txout = vout[i];
-
-                if (!txout.IsAnonOutput())
-                    continue;
-                const CScript &s = txout.scriptPubKey;
-
-                CKeyID ckidD = CPubKey(&s[2+1], 33).GetID();
-
-                if (pwallet->HaveKey(ckidD))
-                {
-                    nCredit += txout.nValue;
-                };
-
-                if (!MoneyRange(nCredit))
-                    throw std::runtime_error("CWalletTx::GetAvailableAnonCredit() : value out of range");
-            };
-        };
-
-        nAvailableAnonCreditCached = nCredit;
-        fAvailableAnonCreditCached = true;
-        return nCredit;
-    };
 
     // Return sum of unlocked coins
     int64_t GetUnlockedCredit() const
