@@ -10,6 +10,7 @@
 #include <array>
 #include <vector>
 #include <string>
+#include <set>
 
 namespace cs { namespace anon {
 
@@ -87,6 +88,18 @@ public:
                  const std::vector<Mutation>& muts, ChainError* e);                 // atomic
     bool disconnect(const Hash& blockHash, const Hash& parentTipHash, ChainError* e); // atomic revert
 
+    // ---- bulk-seed (migration) path ----------------------------------------------
+    // Seed the HISTORIC anon-output/key-image base state (slice-c): each entry via
+    // seedPut (CoW append with free-page reclaim, root hash authenticated on every
+    // write so an incomplete seed is never mistaken for complete). finalizeSeed does
+    // ONE atomic publish (undoSize = 0 base: historic blocks carry no per-block undo;
+    // post-seed connect()/disconnect() add/revert their own undo records). A crash
+    // before finalize leaves the store at its empty gen-0 state -> re-run the seed.
+    bool seedAo(const uint8_t key33[33], const CAnonOutput& v, ChainError* e);
+    bool seedKi(const uint8_t key33[33], const CKeyImageSpent& v, ChainError* e);
+    bool finalizeSeed(const Hash& tipBlockHash, int32_t height, ChainError* e);
+    bool seeded() const { return seeded_; }
+
     // diagnostics
     uint64_t generation() const { return generation_; }
     const Hash& tipHash() const { return blockHash_; }
@@ -113,6 +126,7 @@ private:
     void crashIf(CrashPoint at);
     bool loadUndoMeta(ChainError* e);   // scan undo.dat over committed undoSize; fill undoMetas_
     bool recomputeValueCount(ChainError* e);  // O(state): exact distinct-entry count (test-scale)
+    bool seedPutBoth(uint8_t ns, const uint8_t key33[33], const std::vector<uint8_t>& val, ChainError* e);
     std::string p(const std::string& name) const { return dir_ + "/" + name; }
     bool ns(InjectStage s) const { return injectStage_ == s && injectNoSpace_; }
     bool ff(InjectStage s) const { return injectStage_ == s && injectFsyncFail_; }
@@ -141,6 +155,8 @@ private:
     int32_t tipHeight_ = -1;
     size_t valueCount_ = 0;            // distinct key->value entries in the tree
     std::vector<UndoMeta> undoMetas_;  // committed undo records in commit order (offset,len,hash,height)
+    bool seeded_ = false;              // a bulk base seed has been finalized (migration complete)
+    std::set<store3a::Key> seedSeen_;   // keys already seeded in the current seed batch (dup detection)
 
     CrashPoint crashPoint_ = CrashPoint::None;
     InjectStage injectStage_ = InjectStage::None;

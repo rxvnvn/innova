@@ -163,6 +163,8 @@ void AnonStore::close() {
     tipHeight_ = -1;
     valueCount_ = 0;
     undoMetas_.clear();
+    seeded_ = false;
+    seedSeen_.clear();
     crashPoint_ = CrashPoint::None;
     injectStage_ = InjectStage::None;
     injectNoSpace_ = false;
@@ -200,6 +202,9 @@ bool AnonStore::open(const std::string& dir, ChainError* e) {
         blockHash_ = m.blockHash;
         tipHeight_ = m.tipHeight;
         if (!loadUndoMeta(e)) { close(); return false; }
+        // a finalized base seed (gen>=1 with no per-block undo) is a migration-complete store:
+        // further seedPut is rejected; post-seed feed blocks carry their own undo records.
+        seeded_ = (m.generation >= 1 && m.undoSize == 0);
     } else {
         // fresh store (genesis): empty tree.
         if (!tree_.create(p("tree.dat"), e)) return false;
@@ -289,6 +294,68 @@ bool AnonStore::getKi(const uint8_t key33[33], CKeyImageSpent* out, bool* found,
     size_t off = 0;
     if (!out->decode(v.data(), v.size(), &off)) { setErr(e, ErrCode::CORRUPT, "bad key image value"); return false; }
     (void)off;
+    return true;
+}
+
+// ---- bulk-seed (migration) ---------------------------------------------------------
+bool AnonStore::seedPutBoth(uint8_t ns, const uint8_t key33[33],
+                            const std::vector<uint8_t>& val, ChainError* e)
+{
+    clearErr(e);
+    if (!opened_) { setErr(e, ErrCode::NOT_OPEN, dir_); return false; }
+    if (needsReopen_) { setErr(e, ErrCode::NOT_OPEN, "store requires reopen before further mutation"); return false; }
+    if (seeded_) { setErr(e, ErrCode::INTERNAL, "seed already finalized; only connect() feeds forward"); return false; }
+    if (undoCommittedBytes_ != 0 || !undoMetas_.empty()) {
+        setErr(e, ErrCode::INTERNAL, "cannot seed over an undo-bearing store"); return false;
+    }
+    if (ns != ANON_OUTPUT_NS && ns != KEY_IMAGE_NS) { setErr(e, ErrCode::INTERNAL, "unknown seed namespace"); return false; }
+    store3a::Key k = makeKey(ns, key33);
+    if (ns == ANON_OUTPUT_NS && !seedSeen_.insert(k).second) {
+        setErr(e, ErrCode::DUP_OUTPOINT, "duplicate anon-output key during seed (fail-closed)");
+        return false;
+    }
+    if (ns == KEY_IMAGE_NS) seedSeen_.insert(k);   // key-image overwrite allowed (last-wins, mirror connect)
+    uint32_t oldRoot = tree_.rootId(); Hash oldHash = tree_.rootHash();
+    if (!tree_.seedPut(k, val, e)) {
+        seedSeen_.erase(k);
+        ChainError x; tree_.setRoot(oldRoot, oldHash, &x);
+        return false;
+    }
+    return true;
+}
+bool AnonStore::seedAo(const uint8_t key33[33], const CAnonOutput& v, ChainError* e){
+    std::vector<uint8_t> val = v.encode(); return seedPutBoth(ANON_OUTPUT_NS, key33, val, e);
+}
+bool AnonStore::seedKi(const uint8_t key33[33], const CKeyImageSpent& v, ChainError* e){
+    std::vector<uint8_t> val = v.encode(); return seedPutBoth(KEY_IMAGE_NS, key33, val, e);
+}
+bool AnonStore::finalizeSeed(const Hash& tipBlockHash, int32_t height, ChainError* e)
+{
+    clearErr(e);
+    if (!opened_) { setErr(e, ErrCode::NOT_OPEN, dir_); return false; }
+    if (needsReopen_) { setErr(e, ErrCode::NOT_OPEN, "store requires reopen before further mutation"); return false; }
+    if (seeded_) { setErr(e, ErrCode::INTERNAL, "seed already finalized"); return false; }
+    if (undoCommittedBytes_ != 0 || !undoMetas_.empty()) {
+        setErr(e, ErrCode::INTERNAL, "cannot finalize over an undo-bearing store"); return false;
+    }
+    uint32_t oldRoot = tree_.rootId(); Hash oldHash = tree_.rootHash();
+    uint64_t newGen = generation_ + 1;
+    store3a::Manifest m;
+    m.generation = newGen; m.undoSize = 0;   // base seed: historic blocks carry no per-block undo
+    m.rootPageId = tree_.rootId(); m.rootHash = tree_.rootHash();
+    m.blockHash = tipBlockHash; m.tipHeight = height;
+    if (!commitBarriers(m, 0, nullptr, 0, e)) {
+        if (!renamePassed_) { ChainError x; tree_.setRoot(oldRoot, oldHash, &x); }
+        else needsReopen_ = true;
+        return false;
+    }
+    bool ackOk = writeAck(newGen, e);
+    if (!ackOk) { needsReopen_ = true; return false; }
+    generation_ = newGen; undoCommittedBytes_ = 0;
+    blockHash_ = tipBlockHash; tipHeight_ = height;
+    seeded_ = true; seedSeen_.clear();
+    if (!recomputeValueCount(e)) { needsReopen_ = true; return false; }
+    tree_.retireMovedToFree();
     return true;
 }
 

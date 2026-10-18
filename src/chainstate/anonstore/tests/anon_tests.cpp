@@ -363,6 +363,114 @@ static void test_crash_matrix(){
     }
 }
 
+// ======================= seed (slice-c migration base) tests =======================
+static void test_seed_roundtrip(){
+    g_cur="T9-seed";
+    std::string d=freshDir("t9"); ChainError e;
+    Hash tip=id32(0x900000,100);
+    { AnonStore s; CHECK(s.open(d,&e), "t9 open: "+e.str());
+      std::array<uint8_t,33> k1=key33(9), k2=key33(10), k3=key33(11);
+      CHECK(!s.seeded(), "t9 not seeded before finalize");
+      CHECK(s.seedAo(k1.data(),mkAo(1,1,100,3,0),&e), "t9 seedAo k1: "+e.str());
+      CHECK(s.seedAo(k2.data(),mkAo(2,2,200,4,1),&e), "t9 seedAo k2: "+e.str());
+      CHECK(s.seedKi(k3.data(),mkKi(5,1,50),&e), "t9 seedKi k3: "+e.str());
+      CHECK(s.finalizeSeed(tip,100,&e), "t9 finalize: "+e.str());
+      CHECK(s.seeded(), "t9 seeded after finalize");
+      CHECK(s.generation()==1 && s.tipHash()==tip && s.tipHeight()==100, "t9 gen/tip/height after finalize");
+      CHECK(s.valueCount()==3, "t9 valueCount==3");
+      ChainError e2; bool ok=s.seedAo(k1.data(),mkAo(1,1,100,3,0),&e2);
+      CHECK(!ok, "t9 seed after finalize rejected: "+e2.str());
+      s.close(); }
+    { AnonStore r; CHECK(r.open(d,&e), "t9 reopen: "+e.str());
+      CHECK(r.seeded(), "t9 reopen seeded()==true");
+      bool f=false; CAnonOutput ao; std::array<uint8_t,33> k1=key33(9);
+      CHECK(r.getAo(k1.data(),&ao,&f,&e)&&f && ao.nValue==100 && ao.nBlockHeight==3, "t9 k1 persisted after reopen");
+      CHECK(r.valueCount()==3, "t9 valueCount persisted");
+      CHECK(r.tree().verifyAll(&e), "t9 merkle verify: "+e.str());
+      r.close(); }
+}
+static void seedCrashChild(const std::string& d, int mode){
+    ChainError e; AnonStore s; if(!s.open(d,&e)) ::_exit(2);
+    bool ok=s.seedAo(key33(9).data(),mkAo(1,1,100,3,0),&e);
+    ok=ok && s.seedKi(key33(11).data(),mkKi(5,1,50),&e);
+    if(!ok) ::_exit(1);
+    if(mode==1){ ::_exit(42); }                       // crash after seeding, before finalize
+    if(mode==2){ s.setCrashPoint(CrashPoint::BeforeRename);  s.finalizeSeed(id32(0x900000,100),100,&e); ::_exit(42); }
+    if(mode==3){ s.setCrashPoint(CrashPoint::AfterRename);   s.finalizeSeed(id32(0x900000,100),100,&e); ::_exit(42); }
+    ::_exit(0);
+}
+static void test_seed_crash(){
+    g_cur="T10-seedcrash"; ChainError e;
+    { // crash before finalize: store stays empty gen0; re-run completes
+      std::string d=freshDir("t10a");
+      pid_t pid=fork(); if(pid==0){ seedCrashChild(d,1); ::_exit(7); }
+      int st; waitpid(pid,&st,0);
+      { AnonStore r; CHECK(r.open(d,&e), "t10a reopen: "+e.str());
+        CHECK(r.generation()==0 && r.valueCount()==0 && !r.seeded(), "t10a crash-before-finalize => empty gen0");
+        bool f=false; CAnonOutput ao;
+        CHECK((!r.getAo(key33(9).data(),&ao,&f,&e)) || !f, "t10a k1 absent after crash-before-finalize");
+        r.close(); }
+      { AnonStore s; CHECK(s.open(d,&e), "t10a reseed open: "+e.str());
+        CHECK(s.seedAo(key33(9).data(),mkAo(1,1,100,3,0),&e), "t10a reseedAo: "+e.str());
+        CHECK(s.seedKi(key33(11).data(),mkKi(5,1,50),&e), "t10a reseedKi: "+e.str());
+        CHECK(s.finalizeSeed(id32(0x900000,100),100,&e), "t10a refinalize: "+e.str());
+        s.close(); }
+      { AnonStore r; CHECK(r.open(d,&e), "t10a final reopen: "+e.str());
+        CHECK(r.seeded() && r.valueCount()==2, "t10a re-run seed+finalize completes (2 entries)");
+        r.close(); }
+    }
+    { // crash during finalize before rename: seed NOT committed (gen0 empty)
+      std::string d=freshDir("t10b");
+      pid_t pid=fork(); if(pid==0){ seedCrashChild(d,2); ::_exit(7); }
+      int st; waitpid(pid,&st,0);
+      { AnonStore r; CHECK(r.open(d,&e), "t10b reopen: "+e.str());
+        CHECK(r.generation()==0 && r.valueCount()==0, "t10b crash-before-rename => seed not committed (gen0)");
+        r.close(); }
+    }
+    { // crash during finalize after rename: fully seeded (committed)
+      std::string d=freshDir("t10c");
+      pid_t pid=fork(); if(pid==0){ seedCrashChild(d,3); ::_exit(7); }
+      int st; waitpid(pid,&st,0);
+      { AnonStore r; CHECK(r.open(d,&e), "t10c reopen: "+e.str());
+        CHECK(r.seeded() && r.generation()==1 && r.valueCount()==2, "t10c crash-after-rename => seed committed (gen1)");
+        r.close(); }
+    }
+}
+static void test_seed_dup(){
+    g_cur="T11-seeddup"; std::string d=freshDir("t11"); ChainError e;
+    AnonStore s; CHECK(s.open(d,&e), "t11 open: "+e.str());
+    std::array<uint8_t,33> k=key33(9);
+    CHECK(s.seedAo(k.data(),mkAo(1,1,100,3,0),&e), "t11 seedAo k: "+e.str());
+    ChainError e2; bool ok=s.seedAo(k.data(),mkAo(1,1,200,3,0),&e2);
+    CHECK(!ok && e2.code==ErrCode::DUP_OUTPOINT, "t11 duplicate anon-output seed rejected (DUP_OUTPOINT): "+e2.str());
+    bool f=false; CAnonOutput ao; CHECK(s.getAo(k.data(),&ao,&f,&e)&&f && ao.nValue==100, "t11 rejected dup left original");
+    s.close();
+}
+static void test_seed_feed(){
+    g_cur="T12-seedfeed"; std::string d=freshDir("t12"); ChainError e;
+    Hash tip=id32(0x900000,100);
+    AnonStore s; CHECK(s.open(d,&e), "t12 open: "+e.str());
+    CHECK(s.seedAo(key33(9).data(),mkAo(1,1,100,3,0),&e), "t12 seedAo: "+e.str());
+    CHECK(s.seedKi(key33(11).data(),mkKi(4,2,25),&e), "t12 seedKi: "+e.str());
+    CHECK(s.finalizeSeed(tip,100,&e), "t12 finalize: "+e.str());
+    // feed one forward block (101)
+    std::vector<Mutation> b; b.push_back(putAoMut(key33(10),mkAo(2,2,200,101,0)));
+    Hash fh=id32(0x900000,101);
+    CHECK(s.connect(fh,101,b,&e), "t12 feed connect: "+e.str());
+    CHECK(s.valueCount()==3 && s.tipHeight()==101, "t12 feed adds 1 => 3, tip=101");
+    // pop it back to the seeded base
+    CHECK(s.disconnect(fh, tip, &e), "t12 feed disconnect: "+e.str());
+    CHECK(s.valueCount()==2 && s.tipHeight()==100, "t12 after feed disconnect => seeded base (2)");
+    bool f=false; CAnonOutput ao;
+    CHECK(s.getAo(key33(9).data(),&ao,&f,&e)&&f && ao.nValue==100, "t12 seeded k1 retained under feed/disconnect");
+    CHECK((!s.getAo(key33(10).data(),&ao,&f,&e)) || !f, "t12 feed-only k2 gone after disconnect");
+    // cannot disconnect below the seeded base (no undo for historic pre-migration blocks)
+    ChainError e3; bool ok2=s.disconnect(tip, Hash{}, &e3);
+    CHECK(!ok2 && e3.code==ErrCode::NOT_FOUND, "t12 cannot disconnect below seeded base (NOT_FOUND): "+e3.str());
+    CHECK(s.tree().verifyAll(&e), "t12 merkle verify: "+e.str());
+    s.close();
+}
+
 // ============================ main =============================================
 int main(){
     printf("ANONSTATE isolated slice test suite\n");
@@ -375,6 +483,10 @@ int main(){
     test_dup_and_overwrite();
     test_ki_overwrite();
     test_crash_matrix();
+    test_seed_roundtrip();
+    test_seed_crash();
+    test_seed_dup();
+    test_seed_feed();
     printf("---\n");
     if (g_fail==0) printf("ALL PASS (%d)\nPASS shown above\n", g_pass);
     else {
