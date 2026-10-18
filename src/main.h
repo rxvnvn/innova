@@ -80,6 +80,9 @@ uint256 GetAuthoritativeBlockTrustValue(uint32_t nBits, int32_t nHeight,
  * authority. Returns true iff the classifications are consistent.
  */
 bool PosClassificationConsistent(uint32_t nFlags, const uint256& prevoutStakeHash);
+// M8.3: deterministic ANON feed entry point (defined in main.cpp). Inert (returns true)
+// unless cs::anon::g_anon.opened() — then fail-closed on a feed/store error.
+bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash);
 
 class CBlockIndex;
 class CKeyItem;

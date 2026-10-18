@@ -566,6 +566,7 @@ TEST_OBJS= \
     obj/test/p2p_sync_tests.o \
     obj/test/rpc_getinfo_tests.o \
     obj/test/coincontrol_lock_tests.o \
+    obj/test/anonfeed_cutover_tests.o \
     obj/test/ibdforensic_tests.o \
     obj/test/ibdblocklatency_tests.o \
     obj/test/ibdsemantic_tests.o \

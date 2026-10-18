@@ -65,7 +65,7 @@ struct s16_V2InputView;
 
 // M8.3: deterministic ANON feed helpers (full definitions near s16_V2Armed). Forward
 // declared here because DisconnectBlock (~6548) precedes their definitions (~7096).
-static bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash);
+bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash);
 static bool s16_AnonDisconnectBlock(const cs::Hash& blockHash, const cs::Hash& parentTipHash);
 
 //
@@ -7168,7 +7168,7 @@ static void s16_FeedFromBlock(const CBlock& blk, int32_t height, cs::anon::Block
 }
 // Connect a block's ANON state. Returns true unless g_anon is opened AND the feed/
 // store rejects (fail-closed). Inert (true) when g_anon is not opened (legacy bridge).
-static bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash)
+bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash)
 {
     if (!cs::anon::g_anon.opened()) return true;
     cs::anon::BlockFeed feed; s16_FeedFromBlock(blk, height, feed);
