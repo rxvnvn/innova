@@ -815,6 +815,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
                             << " storeSize=" << StoreSize(store) << " txloc=" << txloc::g_txloc.count());
 
         CTxDB txdb;   // fresh (unused) handle; armed-V2 mempool reads Store3A/TX-LOC, not txdb
+        SpendBlockResult spendBlock;   // the real spend-block that consumes coins[1] (for reorg/undo scenarios)
         auto BuildSpend = [&](const S16Coin& src, int64_t pay = 100000) -> CTransaction {
             CTransaction t; t.nVersion = 1;
             CTxIn in; uint256 cbHash; memcpy(cbHash.begin(), src.txid.data(), 32);
@@ -890,7 +891,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
         //     spent-on-chain from never-seen; NOT orphan).
         {
             LOCK(cs_main);
-            SpendBlockResult sr = S16MineSpend(coins[1], 0x7100u);   // asserts success internally
+            spendBlock = S16MineSpend(coins[1], 0x7100u);   // asserts success internally
             CTransaction sp6 = BuildSpend(coins[1]);
             bool missing = true;
             BOOST_CHECK_MESSAGE(!sp6.AcceptToMemoryPool(txdb, true, &missing), "v2mp already-spent input must reject");
@@ -898,7 +899,51 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             BOOST_TEST_MESSAGE("v2mp: PASS already-spent input rejected (TX-LOC spent-vs-orphan)");
         }
 
-        BOOST_TEST_MESSAGE("v2mp: armed-V2 mempool execution OK: accept/reject/double-spend/orphan/maturity/chain/spent-via-TX-LOC");
+        // (7) M4 reorg: disconnect the spend block -> Store3A undo RESTORES coins[1]
+        //     -> a mempool spend of coins[1] is ACCEPTED again.
+        {
+            ChainError ue;
+            cs::Hash ubh; memcpy(ubh.data(), spendBlock.blockHash.begin(), 32);
+            BOOST_REQUIRE_MESSAGE(store.disconnect(ubh, &ue), "v2mp disconnect spend block: " << ue.str());
+            LOCK(cs_main);
+            CTransaction sp7 = BuildSpend(coins[1]);
+            bool missing = false;
+            BOOST_CHECK_MESSAGE(sp7.AcceptToMemoryPool(txdb, true, &missing), "v2mp reaccept after disconnect (UTXO restored)");
+            BOOST_CHECK(!missing);
+            BOOST_TEST_MESSAGE("v2mp: PASS disconnect -> Store3A undo restores coin -> reaccept");
+        }
+
+        // (8) M4 reorg edge: a TXID from the DISCONNECTED branch is in the locator but
+        //     NOT in the active chain — it must NOT be treated as a spendable/confirmed
+        //     coin (Store3A absence is the spend authority; locator is location only).
+        {
+            LOCK(cs_main);
+            CTransaction sp8; sp8.nVersion = 1;
+            CTxIn in8; uint256 spHash; memcpy(spHash.begin(), spendBlock.sp.txid.data(), 32);
+            in8.prevout.hash = spHash; in8.prevout.n = 0; in8.scriptSig.clear();
+            sp8.vin.push_back(in8);
+            CTxOut o8; o8.nValue = spendBlock.sp.value - 100000; o8.scriptPubKey = CScript() << OP_TRUE;
+            sp8.vout.push_back(o8); sp8.nTime = (unsigned int)GetTime();
+            bool m8 = true;
+            BOOST_CHECK_MESSAGE(!sp8.AcceptToMemoryPool(txdb, true, &m8), "v2mp disconnected-branch coin must NOT be spent");
+            BOOST_TEST_MESSAGE("v2mp: PASS TXID in locator but absent from active-chain Store3A -> not spendable");
+        }
+
+        // (9) M4 reorg with conflicting spends on the restored coin: first accepted,
+        //     the second (double-spend) rejected.
+        {
+            LOCK(cs_main);
+            mempool.clear();   // clean slate
+            CTransaction sA = BuildSpend(coins[1], 150000);
+            bool mA = false;
+            BOOST_REQUIRE_MESSAGE(sA.AcceptToMemoryPool(txdb, true, &mA), "v2mp accept first spend of restored coin");
+            CTransaction sB = BuildSpend(coins[1], 250000);
+            bool mB = true;
+            BOOST_CHECK_MESSAGE(!sB.AcceptToMemoryPool(txdb, true, &mB), "v2mp conflicting spend rejected");
+            BOOST_TEST_MESSAGE("v2mp: PASS conflicting spends on restored coin: 1st accepted, 2nd rejected");
+        }
+
+        BOOST_TEST_MESSAGE("v2mp: armed-V2 mempool execution OK: accept/reject/double-spend/orphan/maturity/chain/spent-via-TX-LOC/reorg-restore/disconnected-branch");
         // no legacy txindex is required: the armed-V2 path resolved everything from
         // Store3A (coins) + TX-LOC (spent-vs-orphan) + the pool overlay.
     } catch (const std::exception& ex) {
