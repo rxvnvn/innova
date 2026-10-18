@@ -53,8 +53,6 @@ void TxToJSON(const CTransaction& tx, const uint256 hashBlock, Object& entry)
     entry.push_back(Pair("time", (int64_t)tx.nTime));
     entry.push_back(Pair("locktime", (int64_t)tx.nLockTime));
 
-    std::vector<uint8_t> vchImage;
-
     Array vin;
     BOOST_FOREACH(const CTxIn& txin, tx.vin)
     {
@@ -64,20 +62,8 @@ void TxToJSON(const CTransaction& tx, const uint256 hashBlock, Object& entry)
             in.push_back(Pair("coinbase", HexStr(txin.scriptSig.begin(), txin.scriptSig.end())));
         } else
         {
-            if (tx.nVersion == ANON_TXN_VERSION
-                && txin.IsAnonInput())
-            {
-                txin.ExtractKeyImage(vchImage);
-
-                int nRingSize = txin.ExtractRingSize();
-
-                in.push_back(Pair("keyimage", HexStr(vchImage)));
-                in.push_back(Pair("ringsize", nRingSize));
-            } else
-            {
-                in.push_back(Pair("txid", txin.prevout.hash.GetHex()));
-                in.push_back(Pair("vout", (int64_t)txin.prevout.n));
-            };
+            in.push_back(Pair("txid", txin.prevout.hash.GetHex()));
+            in.push_back(Pair("vout", (int64_t)txin.prevout.n));
             Object o;
             o.push_back(Pair("asm", txin.scriptSig.ToString()));
             o.push_back(Pair("hex", HexStr(txin.scriptSig.begin(), txin.scriptSig.end())));

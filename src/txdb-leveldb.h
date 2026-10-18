@@ -7,7 +7,6 @@
 #define BITCOIN_LEVELDB_H
 
 #include "main.h"
-#include "ringsig.h"
 
 #include <map>
 #include <string>
@@ -297,14 +296,6 @@ public:
     {
         return Write(std::string("version"), nVersion);
     }
-
-    bool WriteKeyImage(ec_point& keyImage, CKeyImageSpent& keyImageSpent);
-    bool ReadKeyImage(ec_point& keyImage, CKeyImageSpent& keyImageSpent);
-    bool EraseKeyImage(ec_point& keyImage);
-
-    bool WriteAnonOutput(CPubKey& pkCoin, CAnonOutput& ao);
-    bool ReadAnonOutput(CPubKey& pkCoin, CAnonOutput& ao);
-    bool EraseAnonOutput(CPubKey& pkCoin);
 
 bool ReadAddrIndex(uint160 addrHash, std::vector<uint256>& txHashes);
     bool WriteAddrIndex(uint160 addrHash, uint256 txHash);

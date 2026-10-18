@@ -386,9 +386,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
             bool fMissingInputs = false;
             BOOST_FOREACH(const CTxIn& txin, tx.vin)
             {
-                if (tx.nVersion == ANON_TXN_VERSION
-                    && txin.IsAnonInput()) // anon inputs are verified later in CheckAnonInputs()
-                    continue;
                 // Read prev transaction
                 CTransaction txPrev;
                 CTxIndex txindex;
@@ -423,21 +420,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
 
                 int nConf = txindex.GetDepthInMainChain();
                 dPriority += (double)nValueIn * nConf;
-            };
-
-            if (tx.nVersion == ANON_TXN_VERSION)
-            {
-                int64_t nSumAnon;
-                bool fInvalid;
-                if (!tx.CheckAnonInputs(txdb, nSumAnon, fInvalid, false))
-                {
-                    if (fInvalid)
-                        printf("CreateNewBlock() : CheckAnonInputs found invalid tx %s\n", tx.GetHash().ToString().substr(0,10).c_str());
-                    fMissingInputs = true;
-                    continue;
-                };
-
-                nTotalIn += nSumAnon;
             };
 
             if (fMissingInputs)
@@ -498,7 +480,7 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
                 continue;
 
             // Transaction fee
-            int64_t nMinFee = tx.GetMinFee(nBlockSize, GMF_BLOCK); // will get GMF_ANON if tx.nVersion == ANON_TXN_VERSION
+            int64_t nMinFee = tx.GetMinFee(nBlockSize, GMF_BLOCK);
 
             // Skip free transactions if we're past the minimum block size:
             if (fSortedByFee && (dFeePerKb < nMinTxFee) && (nBlockSize + nTxSize >= nBlockMinSize))
@@ -527,20 +509,6 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
             if (nFee == 0) // tx came from COrphan
             {
                 int64_t nTxFees = tx.GetValueIn(mapInputs)-tx.GetValueOut();
-
-                if (tx.nVersion == ANON_TXN_VERSION)
-                {
-                    int64_t nSumAnon;
-                    bool fInvalid;
-                    if (!tx.CheckAnonInputs(txdb, nSumAnon, fInvalid, false))
-                    {
-                        if (fInvalid)
-                            printf("CreateNewBlock() : CheckAnonInputs found invalid tx %s\n", tx.GetHash().ToString().substr(0,10).c_str());
-                        continue;
-                    };
-
-                    nTxFees += nSumAnon;
-                };
                 nFee = nTxFees;
             };
             // TODO: must this be done twice!?

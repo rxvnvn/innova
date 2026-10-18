@@ -207,10 +207,6 @@ vector<unsigned char> ParseHexO(const Object& o, string strKey)
 
 string CRPCTable::help(string strCommand) const
 {
-    //Ring Sigs - I n n o v a - Q0lSQ1VJVEJSRUFLRVI=
-    bool fAllAnon = strCommand == "anon" ? true : false;
-    printf("fAllAnon %d %s\n", fAllAnon, strCommand.c_str());
-
     string strRet;
     set<rpcfn_type> setDone;
     for (map<string, const CRPCCommand*>::const_iterator mi = mapCommands.begin(); mi != mapCommands.end(); ++mi)
@@ -221,13 +217,6 @@ string CRPCTable::help(string strCommand) const
         if (strMethod.find("label") != string::npos)
             continue;
 
-        if (fAllAnon)
-        {
-                if(strMethod != "anonoutputs"
-                && strMethod != "anoninfo"
-                && strMethod != "reloadanondata")
-            continue;
-        } else
         if (strCommand != "" && strMethod != strCommand)
             continue;
 
@@ -241,7 +230,7 @@ string CRPCTable::help(string strCommand) const
         {
             // Help text is returned in an exception
             string strHelp = string(e.what());
-            if (fAllAnon || strCommand == "")
+            if (strCommand == "")
                 if (strHelp.find('\n') != string::npos)
                     strHelp = strHelp.substr(0, strHelp.find('\n'));
             strRet += strHelp + "\n";
@@ -407,19 +396,6 @@ static const CRPCCommand vRPCCommands[] =
     { "importstealthaddress",   &importstealthaddress,   false,  false},
     { "clearwallettransactions",&clearwallettransactions,false,  false},
     { "scanforalltxns",         &scanforalltxns,         false,  false},
-
-    // Ring Signatures - I n n o v a - v3.1.0
-    { "sendinntoanon",          	&sendinntoanon,          	 false,  false},
-    { "sendanontoanon",         &sendanontoanon,         false,  false},
-    { "sendanontoinn",          	&sendanontoinn,         	 false,  false},
-    { "estimateanonfee",        &estimateanonfee,        false,  false},
-    { "checkanonbalance",       &checkanonbalance,       true,   false},
-    { "txnreport",              &txnreport,              false,  false},
-    { "anonoutputs",            &anonoutputs,            false,  false},
-    { "anoninfo",               &anoninfo,               false,  false},
-    { "reloadanondata",         &reloadanondata,         false,  false},
-    { "getanonoutputinfo",      &getanonoutputinfo,      false,  false},
-    { "listcompromisedoutputs", &listcompromisedoutputs, false,  false},
 
     /* Cold Staking */
     { "getnewstakingaddress",   &getnewstakingaddress,   false,  false},
@@ -1676,15 +1652,6 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     if (strMethod == "setban"                 && n > 2) ConvertTo<int64_t>(params[2]);
     if (strMethod == "setban"                 && n == 4) ConvertTo<bool>(params[3]);
 
-    if (strMethod == "sendinntoanon"         	  && n > 1) ConvertTo<double>(params[1]);
-    if (strMethod == "sendanontoanon"         && n > 1) ConvertTo<double>(params[1]);
-    if (strMethod == "sendanontoanon"         && n > 2) ConvertTo<int64_t>(params[2]);
-    if (strMethod == "sendanontoinn"        	  && n > 1) ConvertTo<double>(params[1]);
-    if (strMethod == "sendanontoinn"        	  && n > 2) ConvertTo<int64_t>(params[2]);
-	if (strMethod == "estimateanonfee"        && n > 0) ConvertTo<double>(params[0]);
-	if (strMethod == "estimateanonfee"        && n > 1) ConvertTo<int64_t>(params[1]);
-    if (strMethod == "checkanonbalance"       && n > 0) ConvertTo<double>(params[0]);
-    if (strMethod == "checkanonbalance"       && n > 1) ConvertTo<int64_t>(params[1]);
 
     if (strMethod == "getpoolinfo"            && n > 0) ConvertTo<int64_t>(params[0]);
 

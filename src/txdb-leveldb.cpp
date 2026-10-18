@@ -513,38 +513,6 @@ bool CTxDB::TxnCommit()
     return true;
 }
 
-bool CTxDB::WriteKeyImage(ec_point& keyImage, CKeyImageSpent& keyImageSpent)
-{
-    return Write(make_pair(string("ki"), keyImage), keyImageSpent);
-};
-
-bool CTxDB::ReadKeyImage(ec_point& keyImage, CKeyImageSpent& keyImageSpent)
-{
-    return Read(make_pair(string("ki"), keyImage), keyImageSpent);
-};
-
-bool CTxDB::EraseKeyImage(ec_point& keyImage)
-{
-    return Erase(make_pair(string("ki"), keyImage));
-}
-
-bool CTxDB::WriteAnonOutput(CPubKey& pkCoin, CAnonOutput& ao)
-{
-    return Write(make_pair(string("ao"), pkCoin), ao);
-};
-
-bool CTxDB::ReadAnonOutput(CPubKey& pkCoin, CAnonOutput& ao)
-{
-    return Read(make_pair(string("ao"), pkCoin), ao);
-};
-
-bool CTxDB::EraseAnonOutput(CPubKey& pkCoin)
-{
-    return Erase(make_pair(string("ao"), pkCoin));
-}
-
-
-
 
 // IDAG Phase 2: DAG link persistence. vDAGParents is canonical; the
 // child-count projection is updated in this same active WriteBatch.
