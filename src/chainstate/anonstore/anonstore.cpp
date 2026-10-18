@@ -514,4 +514,7 @@ bool AnonStore::disconnect(const Hash& blockHash, const Hash& parentTipHash, Cha
     return true;
 }
 
+// Daemon-global authoritative ANON/key-image store (see anonstore.h).
+AnonStore g_anon;
+
 }} // namespace cs::anon

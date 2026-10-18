@@ -337,6 +337,8 @@ OBJS= \
     obj/txloc.o \
     obj/incdelta.o \
     obj/btree.o \
+    obj/anonstore.o \
+    obj/anonfeed.o \
     obj/net.o \
     obj/ibdefficiency.o \
     obj/ibdmetrics.o \
@@ -449,6 +451,8 @@ OBJS= \
     obj/txloc.o \
     obj/incdelta.o \
     obj/btree.o \
+    obj/anonstore.o \
+    obj/anonfeed.o \
     obj/net.o \
     obj/ibdefficiency.o \
     obj/ibdmetrics.o \
@@ -762,6 +766,12 @@ obj/incdelta.o: chainstate/store3a/incdelta.cpp
 	@rm -f $(@:%.o=%.d)
 obj/btree.o: chainstate/store3a/btree.cpp
 	@$(CXX) -c $(xCXXFLAGS) -fpermissive -MMD -MF $(@:%.o=%.d) -o $@ $<
+	@rm -f $(@:%.o=%.d)
+obj/anonstore.o: chainstate/anonstore/anonstore.cpp
+	@$(CXX) -c $(xCXXFLAGS) -Ichainstate/anonstore -fpermissive -MMD -MF $(@:%.o=%.d) -o $@ $<
+	@rm -f $(@:%.o=%.d)
+obj/anonfeed.o: chainstate/anonstore/anonfeed.cpp
+	@$(CXX) -c $(xCXXFLAGS) -Ichainstate/anonstore -fpermissive -MMD -MF $(@:%.o=%.d) -o $@ $<
 	@rm -f $(@:%.o=%.d)
 
 obj/%.o: json/%.cpp

@@ -165,4 +165,10 @@ private:
     size_t injectUndoShort_ = 0;
 };
 
+// Daemon-global authoritative ANON/key-image store. Defined in anonstore.cpp; opened in
+// V2 store mode (init.cpp) before the authoritative read-switch. Until opened(),
+// `opened()` is false and the legacy CTxDB path remains the source of truth (the
+// migrate-then-delete bridge).
+extern AnonStore g_anon;
+
 }} // namespace cs::anon
