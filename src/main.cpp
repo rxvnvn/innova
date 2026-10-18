@@ -3637,6 +3637,20 @@ bool s16::V2WalletTxidKnown(const uint256& hash)
     return s16_V2TxidKnown(hash);
 }
 
+// M6 collateral spent-state bridge: Store3A coin presence on the armed-V2 path.
+int s16::V2OutpointUnspent(const uint256& txid, uint32_t n, bool* unspent)
+{
+    if (!(s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+          s16::g_chainObserve.store && s16::g_chainObserve.store->opened()))
+        return 0;                                   // V2 not armed -> caller uses legacy
+    cs::OutPoint k; memcpy(k.txid.data(), txid.begin(), 32); k.n = n;
+    bool found = false; cs::Coin coin; cs::ChainError ce;
+    if (!s16::g_chainObserve.store->get(k, &coin, &found, &ce))
+        return -1;                                   // authority error -> FAIL CLOSED (reject)
+    if (unspent) *unspent = found;                   // present = unspent on the active chain
+    return 1;                                        // authoritative
+}
+
 // --------------------------------------------------------------------------
 // M4: V2 mempool platform — forward declarations (definitions live after
 // s16_V2InputView, main.cpp ~5760).  Resolves every transparent input of `tx`
@@ -3656,6 +3670,8 @@ static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& t
                                     MapPrevTx& mapInputs, bool* pfMissingInputs);
 static bool s16_V2MempoolAccept(CTxDB& txdb, CTransaction& tx, uint256& hash,
                                 bool* pfMissingInputs, bool fOnlyCheckWithoutAdding);
+static bool s16_V2MempoolAcceptableInputs(CTransaction& tx, bool fLimitFree,
+                                          bool* pfMissingInputs);
 
 bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
                         bool* pfMissingInputs, bool fOnlyCheckWithoutAdding)
@@ -3924,6 +3940,12 @@ bool AcceptableInputs(CTxMemPool& pool, const CTransaction &txo, bool fLimitFree
     }
 
     {
+        // M6: armed-V2 collateral pre-check via Store3A + TX-LOC + pool overlay
+        // (no legacy txindex, no fallback). Non-V2 keeps the legacy slow path.
+        if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+            s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
+            return s16_V2MempoolAcceptableInputs(tx, fLimitFree, pfMissingInputs);
+
         CTxDB txdb("r");
 
         // do we already have it?
@@ -6207,6 +6229,55 @@ static bool s16_V2MempoolAccept(CTxDB& txdb, CTransaction& tx, uint256& hash,
         mempool.addUnchecked(hash, tx);
         printf("CTxMemPool::accept() : accepted %s (poolsz %" PRIszu", V2)\n", hash.ToString().substr(0,10).c_str(), mempool.mapTx.size());
     }
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// M6: V2 AcceptableInputs (collateral pre-check).  Mirrors the legacy slow path
+// (sigops / value-in / min-fee / free-rate / ConnectInputs) but resolves inputs
+// from Store3A + TX-LOC + the pool overlay and runs ConnectInputs with the armed
+// v2View — no legacy txindex.  Returns true when the collateral inputs are
+// acceptable.  Used by collateral / collateralnode in the armed-V2 path.
+// ---------------------------------------------------------------------------
+static bool s16_V2MempoolAcceptableInputs(CTransaction& tx, bool fLimitFree,
+                                          bool* pfMissingInputs)
+{
+    std::map<uint256, CTxIndex> mapUnused;
+    MapPrevTx mapInputs;
+    s16_V2InputView v2View;
+    v2View.arm(s16::g_chainObserve.store, (int32_t)(pindexBest ? pindexBest->nHeight : -1));
+    int rc = s16_V2MempoolCheckInputs(&v2View, tx, mapInputs, pfMissingInputs);
+    if (rc == 2) return false;                                             // orphan (missing input)
+    if (rc == 1) return tx.DoS(100, error("AcceptableInputs : V2 input invalid/already-spent %s (Store3A/TX-LOC; no legacy fallback)", tx.GetHash().ToString().substr(0,10).c_str()));
+
+    unsigned int nSigOps = tx.GetLegacySigOpCount();
+    nSigOps += tx.GetP2SHSigOpCount(mapInputs);
+    if (nSigOps > MAX_TX_SIGOPS)
+        return tx.DoS(0, error("AcceptableInputs : too many sigops %s, %d > %d", tx.GetHash().ToString().c_str(), nSigOps, MAX_TX_SIGOPS));
+
+    int64_t nFees = tx.GetValueIn(mapInputs) - tx.GetValueOut();
+    unsigned int nSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
+    int64_t txMinFee = tx.GetMinFee(1000, GMF_RELAY, nSize);
+    if ((fLimitFree && nFees < txMinFee) || (!fLimitFree && nFees < MIN_TX_FEE))
+        return tx.DoS(0, error("AcceptableInputs : not enough fees %s, %" PRId64" < %" PRId64, tx.GetHash().ToString().c_str(), nFees, txMinFee));
+    if (fLimitFree && nFees < MIN_RELAY_TX_FEE)
+    {
+        static CCriticalSection csFreeLimiter;
+        static double dFreeCount;
+        static int64_t nLastTime;
+        int64_t nNow = GetTime();
+        LOCK(csFreeLimiter);
+        dFreeCount *= pow(1.0 - 1.0/600.0, (double)(nNow - nLastTime));
+        nLastTime = nNow;
+        if (dFreeCount > GetArg("-limitfreerelay", 15)*10*1000)
+            return error("AcceptableInputs : free transaction rejected by rate limiter");
+        dFreeCount += nSize;
+    }
+
+    CTxDB txdb;
+    if (!tx.ConnectInputs(txdb, mapInputs, mapUnused, CDiskTxPos(1,1,1), pindexBest,
+                          true, false, STANDARD_SCRIPT_VERIFY_FLAGS, false, &v2View))
+        return error("AcceptableInputs : ConnectInputs failed %s (V2 Store3A)", tx.GetHash().ToString().c_str());
     return true;
 }
 

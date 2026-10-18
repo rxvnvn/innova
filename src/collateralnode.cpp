@@ -13,6 +13,7 @@
 #include "addrman.h"
 #include "sync.h"
 #include "core.h"
+#include "chainstate/observe_hook.h"
 #include "hash.h"
 #include <deque>
 #include <boost/lexical_cast.hpp>
@@ -1287,6 +1288,24 @@ bool CheckCollateralnodeVin(CTxIn& vin, std::string& errorMessage, CBlockIndex* 
     {
         errorMessage = "specified vin was not a collateralnode capable transaction";
         return false;
+    }
+
+    // M6: collateral spent-state from Store3A (active-chain coin presence) when V2
+    // is armed; fail-closed on an authority error (no legacy fallback); non-V2 keeps
+    // the legacy txindex check.
+    {
+        bool v2unspent = false;
+        int v2u = s16::V2OutpointUnspent(vin.prevout.hash, vin.prevout.n, &v2unspent);
+        if (v2u == 1)
+        {
+            if (!v2unspent) { errorMessage = "vin was spent (Store3A active-chain)"; return false; }
+            return true;
+        }
+        if (v2u == -1)
+        {
+            errorMessage = "Store3A authority error; collateral refused (fail-closed, no legacy fallback)";
+            return false;
+        }
     }
 
     if (txdb.ReadTxIndex(vin.prevout.hash, txindex))

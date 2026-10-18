@@ -10,6 +10,7 @@
 #include "collateralnode.h"
 #include "ui_interface.h"
 #include "txdb.h"
+#include "chainstate/observe_hook.h"
 
 #include <openssl/rand.h>
 
@@ -877,7 +878,30 @@ bool CCollaTeralSigner::IsVinAssociatedWithPubkey(CTxIn& vin, CPubKey& pubkey){
         CTxOut out = txVin.vout[vin.prevout.n];
         if ((out.nValue == GetMNCollateral()*COIN) && (out.scriptPubKey == payee2))
         {
-            // Verify the UTXO is actually unspent via the tx index
+            // M6: verify the collateral UTXO is actually unspent — V2 via Store3A
+            // (active-chain coin presence), else the legacy txindex. Fail-closed: a
+            // Store3A authority error rejects (never fall back to the txindex).
+            bool v2unspent = false;
+            int v2u = s16::V2OutpointUnspent(vin.prevout.hash, vin.prevout.n, &v2unspent);
+            if (v2u == 1)
+            {
+                if (!v2unspent)
+                {
+                    if (fDebug)
+                        printf("IsVinAssociatedWithPubKey:: collateral UTXO %s:%u is already spent (Store3A)\n",
+                               vin.prevout.hash.ToString().c_str(), vin.prevout.n);
+                    return false;
+                }
+                return true;
+            }
+            if (v2u == -1)
+            {
+                if (fDebug)
+                    printf("IsVinAssociatedWithPubKey:: Store3A authority error; refusing collateral %s:%u (fail-closed)\n",
+                           vin.prevout.hash.ToString().c_str(), vin.prevout.n);
+                return false;
+            }
+            // V2 not armed: legacy txindex spent check (unchanged for non-V2).
             CTxDB txdb("r");
             CTxIndex txindex;
             if (txdb.ReadTxIndex(vin.prevout.hash, txindex))

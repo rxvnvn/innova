@@ -60,6 +60,14 @@ extern int  g_V2LegacyIndexProbeDepth;      // >0 inside an authorized non-index
 // Presence is a KNOWN/DUPLICATE gate only, never a spend/confirmation authority.
 bool V2WalletTxidKnown(const uint256& hash);
 
+// M6: cross-TU collateral spent-state (Store3A coin presence — the V2 spend
+// authority). Returns 1 = authoritative (spent = !coin-present in the active-chain
+// Store3A; *spent set), 0 = V2 not armed (caller should use its legacy path), and
+// -1 = Store3A authority error (FAIL CLOSED: the caller must reject, never fall
+// back to the legacy txindex). Used by collateral / collateralnode instead of
+// txindex.vSpent.
+int V2OutpointUnspent(const uint256& txid, uint32_t n, bool* unspent);
+
 inline bool V2LegacyIndexGuardActive() { return g_V2LegacyIndexGuardArmed; }
 inline bool V2LegacyIndexProbeActive()
 {
