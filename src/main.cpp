@@ -3592,6 +3592,64 @@ int64_t CTransaction::GetMinFee(unsigned int nBlockSize, enum GetMinFee_mode mod
     return nMinFee;
 }
 
+// ---------------------------------------------------------------------------
+// M4: V2 transaction-presence helper (replaces the legacy txdb.ContainsTx /
+// TxnHashInSystem "is this tx known" checks in the armed V2 mempool / inventory
+// / wallet paths).  "Known" = already in TX-LOC (seen on-chain, historical
+// location) OR holding an unspent output in Store3A.  Presence is a DUPLICATE /
+// known-in-system gate ONLY — it is NOT a spend/confirmation/UTXO authority
+// (Store3A owns UTXO state, BI-V2 owns the active chain, and spendable-ness is
+// decided by ConnectInputs against the coin view).  No legacy txindex access.
+// ---------------------------------------------------------------------------
+static bool s16_V2TxidKnown(const uint256& hash)
+{
+    cs::Hash th; memcpy(th.data(), hash.begin(), 32);
+    if (txloc::g_txloc.opened())
+    {
+        txloc::Loc tl; bool found = false; txloc::ChainError te;
+        txloc::g_txloc.get(th.data(), &tl, &found, &te);
+        if (found) return true;
+    }
+    if (s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
+    {
+        bool st = false; cs::ChainError be;
+        s16::g_chainObserve.store->existsUnspentTxid(th, &st, &be);
+        if (st) return true;
+    }
+    return false;
+}
+
+// M4: "has this txid been seen" for the V2 armed path (TX-LOC/Store3A) else the
+// legacy txdb.ContainsTx — so non-V2 is unchanged and no new legacy read is
+// introduced in V2.
+static bool s16_ContainsTxV2OrLegacy(const uint256& hash, CTxDB* txdb)
+{
+    if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+        s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
+        return s16_V2TxidKnown(hash);
+    return txdb && txdb->ContainsTx(hash);
+}
+
+// --------------------------------------------------------------------------
+// M4: V2 mempool platform — forward declarations (definitions live after
+// s16_V2InputView, main.cpp ~5760).  Resolves every transparent input of `tx`
+// from the armed Store3A-backed view (plus the mempool's unconfirmed-ancestor
+// overlay), and returns:
+//   0 = eligible (all inputs resolve; mapInputs holds Store3A/pool-backed prev
+//       txs for GetValueIn / P2SH sigops / AreInputsStandard);
+//   1 = INVALID (a required prevout was seen on-chain but is spent / malformed,
+//       or the Store3A authority errored — fail-closed, never orphan, no legacy);
+//   2 = MISSING INPUTS (a required prevout is not yet known to Store3A or TX-LOC;
+//       *pfMissingInputs set => orphan candidate, as the legacy FetchInputs did).
+// ANON inputs are skipped here (consumed via the anon-output store, a separate
+// M6 subsystem); the caller applies the ring-signature deprecation + CheckAnonInputs.
+// --------------------------------------------------------------------------
+struct s16_V2InputView;
+static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& tx,
+                                    MapPrevTx& mapInputs, bool* pfMissingInputs);
+static bool s16_V2MempoolAccept(CTxDB& txdb, CTransaction& tx, uint256& hash,
+                                bool* pfMissingInputs, bool fOnlyCheckWithoutAdding);
+
 bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
                         bool* pfMissingInputs, bool fOnlyCheckWithoutAdding)
 {
@@ -3630,7 +3688,26 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
             return false;
     }
 
-    if (txdb.ContainsTx(hash))
+    if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail && s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
+    {
+        // M4: V2 duplicate presence — no legacy txindex. A txid already in the pool
+        // (handled above) or seen on-chain (TX-LOC) or holding an unspent output in
+        // Store3A is rejected, exactly as legacy txdb.ContainsTx did. Presence in the
+        // locator is a DUPLICATE gate, not a spend/confirmation authority (Store3A/
+        // BI-V2 own those).
+        cs::Hash th; memcpy(th.data(), hash.begin(), 32);
+        bool locFound = false;
+        if (txloc::g_txloc.opened())
+        {
+            txloc::Loc tl; txloc::ChainError te;
+            txloc::g_txloc.get(th.data(), &tl, &locFound, &te);
+        }
+        if (locFound) return false;
+        bool stFound = false; cs::ChainError be;
+        s16::g_chainObserve.store->existsUnspentTxid(th, &stFound, &be);
+        if (stFound) return false;
+    }
+    else if (txdb.ContainsTx(hash))
         return false;
 
     // Check for conflicts with in-memory transactions
@@ -3662,6 +3739,12 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
     }
 
     {
+        // M4: in the armed V2 authoritative mode, run the WHOLE mempool accept
+        // against Store3A / TX-LOC / the pool overlay (no legacy txindex reads or
+        // fallback).  The legacy block below is otherwise byte-identical.
+        if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail && s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
+            return s16_V2MempoolAccept(txdb, tx, hash, pfMissingInputs, fOnlyCheckWithoutAdding);
+
         MapPrevTx mapInputs;
         //map<uint256, CTxIndex> mapUnused;
 		std::map<uint256, CTxIndex> mapUnused;
@@ -4127,7 +4210,7 @@ bool CWalletTx::AcceptWalletTransaction(CTxDB& txdb)
             if (!(tx.IsCoinBase() || tx.IsCoinStake()))
             {
                 uint256 hash = tx.GetHash();
-                if (!mempool.exists(hash) && !txdb.ContainsTx(hash))
+                if (!mempool.exists(hash) && !s16_ContainsTxV2OrLegacy(hash, &txdb))
                     tx.AcceptToMemoryPool(txdb);
             }
         }
@@ -4242,6 +4325,12 @@ bool TxnHashInSystem(CTxDB* ptxdb, uint256& txnHash)
 
     if (mempool.exists(txnHash))
         return true;
+
+    // M4: V2 — presence via TX-LOC/Store3A (no legacy txindex). A txid with a
+    // historical location or an unspent output is "in the system".
+    if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
+        s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
+        return s16_V2TxidKnown(txnHash);
 
     CTxIndex txnIndex;
     if (ptxdb->ReadTxIndex(txnHash, txnIndex))
@@ -5963,6 +6052,156 @@ struct s16_V2InputView
         return true;
     }
 };
+
+// ---------------------------------------------------------------------------
+// M4: V2 mempool input platform.  See the forward declaration above for the
+// return contract (0=eligible, 1=invalid, 2=missing-inputs/orphan).  Resolves
+// every TRANSPARENT input from Store3A (confirmed coin) or the mempool overlay
+// (unconfirmed ancestor), distinguishes a spent-on-chain prevout (reject) from
+// a never-seen one (orphan) via the TX-LOC location index, and materialises a
+// Store3A/pool-backed prev-tx map for GetValueIn / P2SH sigops / AreInputsStandard.
+// ANON inputs are skipped (they flow through the anon-output store; the caller
+// keeps the ring-signature deprecation + CheckAnonInputs).  No legacy txindex read.
+// ---------------------------------------------------------------------------
+static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& tx,
+                                    MapPrevTx& mapInputs, bool* pfMissingInputs)
+{
+    mapInputs.clear();
+    if (pfMissingInputs) *pfMissingInputs = false;
+    if (!view || !view->armed() || !s16::g_chainObserve.store)
+        return 1;   // caller only invokes this on the armed V2 path
+
+    // (1) Overlay: seed `created` from the pool's unconfirmed-ancestor outputs so a
+    //     chained mempool parent resolves as a local (spendable) coin, like a
+    //     same-block output in ConnectBlock.
+    {
+        LOCK(mempool.cs);
+        for (const CTxIn& tin : tx.vin)
+        {
+            if (tx.nVersion == ANON_TXN_VERSION && tin.IsAnonInput()) continue;
+            std::map<uint256, CTransaction>::const_iterator it = mempool.mapTx.find(tin.prevout.hash);
+            if (it == mempool.mapTx.end()) continue;
+            const CTransaction& ptx = it->second;
+            if (tin.prevout.n >= ptx.vout.size()) return 1;   // parent output index out of range => malformed
+            cs::OutPoint k; memcpy(k.txid.data(), tin.prevout.hash.begin(), 32); k.n = tin.prevout.n;
+            cs::Coin c;
+            c.value = ptx.vout[tin.prevout.n].nValue;
+            c.script.assign(ptx.vout[tin.prevout.n].scriptPubKey.begin(), ptx.vout[tin.prevout.n].scriptPubKey.end());
+            c.height = 0; c.nTime = (int32_t)ptx.nTime; c.fCoinBase = false; c.fCoinStake = false;
+            view->created[k] = c;
+        }
+    }
+
+    // (2) Presence / spent-vs-missing classification for every transparent prevout.
+    for (const CTxIn& tin : tx.vin)
+    {
+        if (tx.nVersion == ANON_TXN_VERSION && tin.IsAnonInput()) continue;
+        cs::OutPoint k; memcpy(k.txid.data(), tin.prevout.hash.begin(), 32); k.n = tin.prevout.n;
+        if (view->created.count(k)) continue;                               // pool ancestor -> ok
+        bool found = false; cs::Coin coin; cs::ChainError e;
+        if (!view->store->get(k, &coin, &found, &e)) return 1;              // Store3A authority error -> fail-closed
+        if (found) continue;                                                // confirmed unspent coin -> ok
+        // Store miss: the coin is absent (spent) OR not yet seen.  Distinguish via TX-LOC:
+        // a prev txid indexed on-chain with no unspent coin is an ALREADY-SPENT input -> reject;
+        // an unknown txid -> the tx may be an orphan (missing parent), set pfMissingInputs.
+        cs::Hash th; memcpy(th.data(), tin.prevout.hash.begin(), 32);
+        bool locFound = false;
+        if (txloc::g_txloc.opened())
+        {
+            txloc::Loc tl; txloc::ChainError te;
+            txloc::g_txloc.get(th.data(), &tl, &locFound, &te);
+        }
+        if (locFound) return 1;                                             // seen on-chain but not unspent => already spent => reject
+        if (pfMissingInputs) *pfMissingInputs = true;
+        return 2;                                                           // never seen => orphan candidate
+    }
+
+    // (3) Materialise the prev-tx map for the legacy-style consumers. All coins now
+    //     resolve, so v2MapPrevTx succeeds (fail-closed on any residual authority miss).
+    if (!view->v2MapPrevTx(tx, &mapInputs))
+        return 1;
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// M4: full V2 mempool accept.  Replicates the legacy accept policy
+// (non-standard P2SH, ANON deprecation per consensus + CheckAnonInputs on the
+// anon-output store, min-fee, free-tx rate limit) against the Store3A/TX-LOC/
+// pool-overlay input set, runs the Store3A-authoritative ConnectInputs, and on
+// success adds to the pool.  NO legacy txindex read or fallback.  Active-chain
+// heights/maturity come from Store3A coins + pindexBest (BI-V2-backed).
+// ---------------------------------------------------------------------------
+static bool s16_V2MempoolAccept(CTxDB& txdb, CTransaction& tx, uint256& hash,
+                                bool* pfMissingInputs, bool fOnlyCheckWithoutAdding)
+{
+    std::map<uint256, CTxIndex> mapUnused;
+    MapPrevTx mapInputs;
+    s16_V2InputView v2View;
+    v2View.arm(s16::g_chainObserve.store, (int32_t)(pindexBest ? pindexBest->nHeight : -1));
+    int rc = s16_V2MempoolCheckInputs(&v2View, tx, mapInputs, pfMissingInputs);
+    if (rc == 2) return false;                                             // orphan candidate (pfMissingInputs set)
+    if (rc == 1) return error("CTxMemPool::accept() : V2 input invalid/already-spent %s (Store3A/TX-LOC authority; no legacy fallback)", hash.ToString().substr(0,10).c_str());
+    // (duplicate presence was checked by the caller before routing here)
+
+    // Check for non-standard pay-to-script-hash in inputs (Store3A-backed mapInputs).
+    if (!AreInputsStandard(tx, mapInputs) && !fTestNet)
+        return error("CTxMemPool::accept() : nonstandard transaction input");
+
+    int64_t nFees = tx.GetValueIn(mapInputs) - tx.GetValueOut();
+    GetMinFee_mode feeMode = GMF_RELAY;
+    if (tx.nVersion == ANON_TXN_VERSION)
+    {
+        // ANON: preserve the actual consensus rule — ring-signature transactions are
+        // DEPRECATED past FORK_HEIGHT_RINGSIG_DEPRECATION (rejected here, as legacy).
+        if (nBestHeight >= FORK_HEIGHT_RINGSIG_DEPRECATION)
+            return error("CTxMemPool::accept() : ring signature transactions (ANON_TXN_VERSION) deprecated after height %d.", FORK_HEIGHT_RINGSIG_DEPRECATION);
+        int64_t nSumAnon; bool fInvalid = false;
+        if (!tx.CheckAnonInputs(txdb, nSumAnon, fInvalid, true))
+        {
+            if (fInvalid)
+                return error("CTxMemPool::accept() : CheckAnonInputs found invalid tx %s", hash.ToString().substr(0,10).c_str());
+            if (pfMissingInputs) *pfMissingInputs = true;
+            return false;
+        }
+        nFees += nSumAnon;
+        feeMode = GMF_ANON;
+    }
+
+    unsigned int nSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
+    int64_t txMinFee = tx.GetMinFee(1000, feeMode, nSize);
+    if (nFees < txMinFee)
+        return error("CTxMemPool::accept() : not enough fees %s, %" PRId64" < %" PRId64, hash.ToString().c_str(), nFees, txMinFee);
+    if (nFees < MIN_RELAY_TX_FEE)
+    {
+        static CCriticalSection csFreeLimiter;
+        static double dFreeCount;
+        static int64_t nLastTime;
+        int64_t nNow = GetTime();
+        {
+            LOCK(csFreeLimiter);
+            dFreeCount *= pow(1.0 - 1.0/600.0, (double)(nNow - nLastTime));
+            nLastTime = nNow;
+            if (dFreeCount > GetArg("-limitfreerelay", 15)*10*1000 && !IsFromMe(tx))
+                return error("CTxMemPool::accept() : free transaction rejected by rate limiter");
+            if (fDebug)
+                printf("Rate limit dFreeCount: %g => %g\n", dFreeCount, dFreeCount+nSize);
+            dFreeCount += nSize;
+        }
+    }
+
+    // Consensus input validation — Store3A-authoritative transparent path (V2).
+    if (!tx.ConnectInputs(txdb, mapInputs, mapUnused, CDiskTxPos(1,1,1), pindexBest,
+                          false, false, STANDARD_SCRIPT_VERIFY_FLAGS, true, &v2View))
+        return error("CTxMemPool::accept() : ConnectInputs failed %s (V2 Store3A)", hash.ToString().substr(0,10).c_str());
+
+    if (!fOnlyCheckWithoutAdding)
+    {
+        LOCK(mempool.cs);
+        mempool.addUnchecked(hash, tx);
+        printf("CTxMemPool::accept() : accepted %s (poolsz %" PRIszu", V2)\n", hash.ToString().substr(0,10).c_str(), mempool.mapTx.size());
+    }
+    return true;
+}
 
 bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTxIndex>& mapTestPool, const CDiskTxPos& posThisTx,
     const CBlockIndex* pindexBlock, bool fBlock, bool fMiner, unsigned int flags, bool fValidateSig, s16_V2InputView* v2View /* = NULL */)
@@ -11304,7 +11543,7 @@ bool static AlreadyHave(CTxDB& txdb, const CInv& inv)
         txInMap = mempool.exists(inv.hash);
         return txInMap ||
                mapOrphanTransactions.count(inv.hash) ||
-               txdb.ContainsTx(inv.hash);
+               s16_ContainsTxV2OrLegacy(inv.hash, &txdb);
         }
 
     case MSG_BLOCK:
