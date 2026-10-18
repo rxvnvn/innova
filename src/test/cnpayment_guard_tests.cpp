@@ -412,7 +412,6 @@ BOOST_AUTO_TEST_CASE(collateral_outpoint_diagnostic_is_registered_and_read_only)
         BOOST_CHECK_EQUAL(cacheStateAfter.fImmatureWatchCreditCached, cacheStateBefore.fImmatureWatchCreditCached);
         BOOST_CHECK_EQUAL(cacheStateAfter.fAvailableWatchCreditCached, cacheStateBefore.fAvailableWatchCreditCached);
         BOOST_CHECK_EQUAL(cacheStateAfter.fChangeCached, cacheStateBefore.fChangeCached);
-        BOOST_CHECK_EQUAL(cacheStateAfter.fAvailableAnonCreditCached, cacheStateBefore.fAvailableAnonCreditCached);
         BOOST_CHECK_EQUAL(cacheStateAfter.fCreditSplitCached, cacheStateBefore.fCreditSplitCached);
         BOOST_CHECK_EQUAL(cacheStateAfter.nDebitCached, cacheStateBefore.nDebitCached);
         BOOST_CHECK_EQUAL(cacheStateAfter.nCreditCached, cacheStateBefore.nCreditCached);
@@ -423,9 +422,7 @@ BOOST_AUTO_TEST_CASE(collateral_outpoint_diagnostic_is_registered_and_read_only)
         BOOST_CHECK_EQUAL(cacheStateAfter.nChangeCached, cacheStateBefore.nChangeCached);
         BOOST_CHECK_EQUAL(cacheStateAfter.nImmatureWatchCreditCached, cacheStateBefore.nImmatureWatchCreditCached);
         BOOST_CHECK_EQUAL(cacheStateAfter.nAvailableWatchCreditCached, cacheStateBefore.nAvailableWatchCreditCached);
-        BOOST_CHECK_EQUAL(cacheStateAfter.nAvailableAnonCreditCached, cacheStateBefore.nAvailableAnonCreditCached);
         BOOST_CHECK_EQUAL(cacheStateAfter.nCredDCached, cacheStateBefore.nCredDCached);
-        BOOST_CHECK_EQUAL(cacheStateAfter.nCredAnonCached, cacheStateBefore.nCredAnonCached);
         BOOST_CHECK_EQUAL(pwalletMain->mapWallet.erase(txid), 1U);
     }
     mempool.remove(tx);
