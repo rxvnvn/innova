@@ -10,6 +10,7 @@
 #include "init.h"
 #include "main.h"
 #include "chainstate/observe_hook.h"   // S1.7 off-by-default Store3A mirror during -loadblock replay
+#include "chainstate/anonstore/anonstore.h" // M8.3: ANON/key-image authoritative store (cs::anon)
 #include "kernel.h"
 #include "miner.h"
 #include "txdb.h"
@@ -2045,6 +2046,45 @@ authoritative_startup_ready:
                        txlocDir.string().c_str(),
                        (unsigned long long)txloc::g_txloc.count(),
                        (unsigned long long)txloc::g_txloc.memCount());
+                fflush(stdout);
+            }
+            // ------------------------------------------------------------------
+            // M8.3: ANON/key-image authoritative store open + Store3A reconcile
+            // (mandatory cutover conditions #1/#3). The anon-output/key-image state is
+            // DERIVED deterministically from blocks (condition #2) and must agree with
+            // Store3A's committed tip before any ANON read is authoritative. The
+            // ConnectBlock/DisconnectBlock feed (wired in c7a623ed) only RAN once g_anon
+            // is opened here; on any inconsistency the daemon FAILS CLOSED.
+            // ------------------------------------------------------------------
+            {
+                cs::ChainError ae;
+                fs::path anonDir = GetDataDir() / "chainstate" / "anonstore";
+                if (!cs::anon::g_anon.open(anonDir.string(), &ae))
+                    return InitError(strprintf("ANON V2 store open failed at %s: %s (fail-closed, no legacy fallback)", anonDir.string(), ae.str()));
+                cs::Hash sHash; memcpy(sHash.data(), stHash.begin(), 32);
+                std::string detail;
+                cs::anon::AnonStore::StoreConsistency cl =
+                    cs::anon::g_anon.classifyConsistency(sHash, stH, &detail);
+                if (cl == cs::anon::AnonStore::StoreConsistency::Current) {
+                    printf("ANON V2 authoritative store at %s VERIFIED consistent with Store3A tip (h=%d): %s\n",
+                           anonDir.string().c_str(), (int)stH, detail.c_str());
+                } else if (cl == cs::anon::AnonStore::StoreConsistency::Empty) {
+                    // Fresh/empty store. The real mainnet ANON state is provably EMPTY
+                    // (legacy txindex ao=0, ki=0; RING_SIG deprecated post-fork). Promote
+                    // the empty base to the Store3A tip (g_anon.tip == Store3A.tip), then
+                    // the deterministic feed captures any future anon and an absent anon
+                    // output on this chain is a genuine absence, not an authority gap.
+                    // CAUTION (condition #1, do not degrade): this empty-promotion is only
+                    // consistent when the chain's HISTORICAL anon state is empty. On a
+                    // chain with non-empty historical ao/ki, run the migration/rebuild
+                    // (bulk-seed from txleveldb) into chainstate/anonstore first instead.
+                    cs::ChainError fe;
+                    if (!cs::anon::g_anon.finalizeSeed(sHash, stH, &fe))
+                        return InitError(strprintf("ANON V2 store reconcile EMPTY->finalize failed at %s: %s (fail-closed)", anonDir.string(), fe.str()));
+                    printf("ANON V2 store (empty) base promoted to Store3A tip h=%d; deterministic feed populates forward. [empty-promotion valid only for empty-historical-anon chain]\n", (int)stH);
+                } else {
+                    return InitError(strprintf("ANON V2 store reconcile FAIL-CLOSED at %s: %s. Build/migrate chainstate/anonstore to the Store3A tip before authoritative ANON startup.", anonDir.string(), detail.c_str()));
+                }
                 fflush(stdout);
             }
             printf("S1.9 Store3A V2 authoritative armed at %s tip=%d matches chain; new blocks will be published to Store3A (fail-closed on gate error)\n",
