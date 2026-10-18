@@ -96,7 +96,7 @@ public:
     void close();
     bool get(const unsigned char* txid /*32B*/, Loc* out, bool* found, ChainError* e) const;
     uint64_t count() const { return recordCount_; }
-    bool opened() const { return fd_ >= 0; }
+    bool opened() const { return fd_ >= 0 || mem_ != NULL; }
 
     // ---- incremental IBD ingest (Item 1 slice 2) ---------------------------
     // openDir manages a component directory: <dir>/txloc.dat (sorted merged main)

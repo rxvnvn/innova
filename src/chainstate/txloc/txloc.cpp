@@ -306,8 +306,7 @@ bool TxLocator::readRecord(uint64_t idx, unsigned char* txidOut, Loc* locOut, Ch
 
 bool TxLocator::get(const unsigned char* txid, Loc* out, bool* found, ChainError* e) const {
     if (found) *found = false;
-    bool hasAny = (mem_ && !mem_->empty()) || fd_ >= 0;
-    if (!hasAny) { setErr(e, ERR_NOT_OPEN, "txloc: not open"); return false; }
+    if (fd_ < 0 && mem_ == NULL) { setErr(e, ERR_NOT_OPEN, "txloc: not open"); return false; }   // truly unopened
     std::lock_guard<std::mutex> lk(mtx_);
     if (mem_) {
         Key k; memcpy(k.b, txid, 32);

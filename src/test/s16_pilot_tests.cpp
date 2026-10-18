@@ -26,6 +26,7 @@
 #include "util.h"
 #include "chainstate/observe.h"
 #include "chainstate/observe_hook.h"
+#include "chainstate/txloc/txloc.h"
 
 #include <boost/test/unit_test.hpp>
 #include <boost/filesystem.hpp>
@@ -765,6 +766,150 @@ BOOST_AUTO_TEST_CASE(real_connectblock_intrablock_create_spend)
         s3.close();
     } catch (const std::exception& ex) { store.close(); s16::g_chainObserve = old; BOOST_FAIL(std::string("intra pilot: ") + ex.what()); }
     s16::g_chainObserve = old;
+}
+
+// ---------------------------------------------------------------------------
+// M4 FINALIZATION: real production AcceptToMemoryPool driven with Store3A +
+// BI-V2 + TXID locator ARMED (hardFail). A real mined coinbase chain funds
+// Store3A coins (OP_TRUE anyone-can-spend, empty scriptSig verifies) and feeds
+// the TX-LOC locator through the V2 ConnectBlock path. Mempool accept/reject
+// semantics are then exercised against the Store3A/TX-LOC sources — no legacy
+// txindex is consulted by the armed-V2 mempool, and the spent-vs-never-seen
+// distinction is proven via TX-LOC. State is restored (pool cleared, hook
+// restored, locator closed) so nothing leaks into other suites.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(v2_mempool_execution)
+{
+    const fs::path root = fs::temp_directory_path() / fs::unique_path("s16mp-%%%%-%%%%");
+    fs::create_directories(root);
+    const std::string dir = root.string();
+    const std::string txlocDir = (root / "txloc").string();
+
+    CommitStore3A store; ChainError e;
+    BOOST_REQUIRE_MESSAGE(store.open(dir, &e), "v2mp store open: " << e.str());
+    txloc::ChainError txe; bool txlocAbsent = false;
+    BOOST_REQUIRE_MESSAGE(txloc::g_txloc.openDir(txlocDir, &txlocAbsent, &txe), "v2mp txloc open: " << txe.str());
+
+    s16::ChainObserveState old = s16::g_chainObserve;
+    s16::g_chainObserve.enabled = true;
+    s16::g_chainObserve.store = &store;
+    s16::g_chainObserve.checkAuthority = true;
+    s16::g_chainObserve.hardFail = true;   // arm the V2 mempool / ConnectBlock feed
+    s16::g_chainObserve.fails = 0; s16::g_chainObserve.mismatch = 0;
+
+    // Non-standard gate: use fTestNet so the mempool's IsStandardTx / AreInputsStandard
+    // non-standard rejection is skipped (the mined coinbase + our spend outputs are
+    // OP_TRUE anyone-can-spend; no key-derived signature is needed).  Scoped + restored.
+    const bool savedTestNet = fTestNet;
+    const int savedMaturity = nCoinbaseMaturity;
+    fTestNet = true;
+    nCoinbaseMaturity = 10;   // coins[0..] (deep) mature; the tip coinbase immature
+
+    mempool.clear();
+    std::vector<S16Coin> coins;
+    try {
+        const int N = 80;
+        for (int i = 0; i < N; ++i)
+            coins.push_back(S16Mine(0x7000u + (unsigned)i));
+        BOOST_TEST_MESSAGE("v2mp: mined " << N << " blocks tip=" << pindexBest->nHeight
+                            << " storeSize=" << StoreSize(store) << " txloc=" << txloc::g_txloc.count());
+
+        CTxDB txdb;   // fresh (unused) handle; armed-V2 mempool reads Store3A/TX-LOC, not txdb
+        auto BuildSpend = [&](const S16Coin& src, int64_t pay = 100000) -> CTransaction {
+            CTransaction t; t.nVersion = 1;
+            CTxIn in; uint256 cbHash; memcpy(cbHash.begin(), src.txid.data(), 32);
+            in.prevout.hash = cbHash; in.prevout.n = src.n; in.scriptSig.clear();   // OP_TRUE
+            t.vin.push_back(in);
+            CTxOut out; out.nValue = src.value - pay; out.scriptPubKey = CScript() << OP_TRUE;
+            t.vout.push_back(out);
+            t.nTime = (unsigned int)GetTime();
+            return t;
+        };
+
+        // (1) accept a VALID mature confirmed input (coins[0], deep, mature).
+        {
+            LOCK(cs_main);
+            CTransaction sp = BuildSpend(coins[0]);
+            bool missing = false;
+            BOOST_REQUIRE_MESSAGE(sp.AcceptToMemoryPool(txdb, true, &missing), "v2mp accept mature spend");
+            BOOST_CHECK(!missing && mempool.exists(sp.GetHash()));
+            BOOST_TEST_MESSAGE("v2mp: PASS accept valid mature confirmed input");
+        }
+
+        // (2) double-spend of coins[0].out0 (different tx, same prevout) -> reject.
+        {
+            LOCK(cs_main);
+            CTransaction sp2 = BuildSpend(coins[0], 200000);
+            bool missing = true;
+            BOOST_CHECK_MESSAGE(!sp2.AcceptToMemoryPool(txdb, true, &missing), "v2mp double-spend must reject");
+            BOOST_CHECK(!mempool.exists(sp2.GetHash()));
+            BOOST_TEST_MESSAGE("v2mp: PASS double-spend rejected");
+        }
+
+        // (3) MISSING input (never-seen prev txid) -> orphan classification.
+        {
+            LOCK(cs_main);
+            S16Coin ghost; ghost.n = 0; ghost.value = 1 * COIN;
+            memset(ghost.txid.data(), 0xFF, 32);
+            CTransaction sp3 = BuildSpend(ghost);
+            bool missing = false;
+            BOOST_CHECK_MESSAGE(!sp3.AcceptToMemoryPool(txdb, true, &missing), "v2mp missing input must not accept");
+            BOOST_CHECK_MESSAGE(missing, "v2mp missing input must set pfMissingInputs (orphan)");
+            BOOST_TEST_MESSAGE("v2mp: PASS missing input -> orphan");
+        }
+
+        // (4) IMMATURE coinbase spend (coins[N-1], the tip at depth 0) -> reject.
+        {
+            LOCK(cs_main);
+            CTransaction im = BuildSpend(coins[N-1]);
+            bool missing = true;
+            BOOST_CHECK_MESSAGE(!im.AcceptToMemoryPool(txdb, true, &missing), "v2mp immature coinbase must reject");
+            BOOST_CHECK(!mempool.exists(im.GetHash()));
+            BOOST_TEST_MESSAGE("v2mp: PASS immature coinbase spend rejected (maturity " << nCoinbaseMaturity << ")");
+        }
+
+        // (5) chained UNCONFIRMED parent + child: A spends coins[2] (confirmed), B spends A.vout[0].
+        {
+            LOCK(cs_main);
+            CTransaction A = BuildSpend(coins[2]);
+            bool m1 = false;
+            BOOST_REQUIRE_MESSAGE(A.AcceptToMemoryPool(txdb, true, &m1), "v2mp accept unconfirmed parent A");
+            CTransaction B; B.nVersion = 1;
+            CTxIn cin; uint256 aHash = A.GetHash(); cin.prevout.hash = aHash; cin.prevout.n = 0; cin.scriptSig.clear();
+            B.vin.push_back(cin);
+            CTxOut cout; cout.nValue = (coins[2].value - 100000) - 100000; cout.scriptPubKey = CScript() << OP_TRUE;
+            B.vout.push_back(cout); B.nTime = (unsigned int)GetTime();
+            bool m2 = false;
+            BOOST_CHECK_MESSAGE(B.AcceptToMemoryPool(txdb, true, &m2), "v2mp accept child of unconfirmed parent");
+            BOOST_CHECK(mempool.exists(A.GetHash()) && mempool.exists(B.GetHash()));
+            BOOST_TEST_MESSAGE("v2mp: PASS chained unconfirmed parent+child accepted");
+        }
+
+        // (6) ALREADY-SPENT on-chain input: mine a REAL spend block consuming coins[1],
+        //     then a mempool tx spending coins[1].out0 -> reject (TX-LOC distinguishes
+        //     spent-on-chain from never-seen; NOT orphan).
+        {
+            LOCK(cs_main);
+            SpendBlockResult sr = S16MineSpend(coins[1], 0x7100u);   // asserts success internally
+            CTransaction sp6 = BuildSpend(coins[1]);
+            bool missing = true;
+            BOOST_CHECK_MESSAGE(!sp6.AcceptToMemoryPool(txdb, true, &missing), "v2mp already-spent input must reject");
+            BOOST_CHECK_MESSAGE(!missing, "v2mp already-spent input must NOT be orphan");
+            BOOST_TEST_MESSAGE("v2mp: PASS already-spent input rejected (TX-LOC spent-vs-orphan)");
+        }
+
+        BOOST_TEST_MESSAGE("v2mp: armed-V2 mempool execution OK: accept/reject/double-spend/orphan/maturity/chain/spent-via-TX-LOC");
+        // no legacy txindex is required: the armed-V2 path resolved everything from
+        // Store3A (coins) + TX-LOC (spent-vs-orphan) + the pool overlay.
+    } catch (const std::exception& ex) {
+        store.close(); txloc::g_txloc.close(); s16::g_chainObserve = old; mempool.clear();
+        fTestNet = savedTestNet; nCoinbaseMaturity = savedMaturity;
+        BOOST_FAIL(std::string("v2mp exception: ") + ex.what());
+    }
+    mempool.clear();
+    txloc::g_txloc.close();
+    s16::g_chainObserve = old;
+    fTestNet = savedTestNet; nCoinbaseMaturity = savedMaturity;
 }
 
 BOOST_AUTO_TEST_SUITE_END()
