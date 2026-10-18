@@ -52,6 +52,10 @@ extern ChainObserveState g_chainObserve;
 // ---------------------------------------------------------------------------
 extern bool g_V2LegacyIndexGuardArmed;      // true while the V2 store startup must refuse legacy index opens
 extern int  g_V2LegacyIndexProbeDepth;      // >0 inside an authorized non-index probe (sync-checkpoint)
+// P2 (S4): true while V2 store mode (-s16openstore) is active and never disarmed.
+// Makes legacy CTxDB construction inert (no legacy txleveldb open/create/read/write
+// at any point in V2 runtime); all index reads/writes route via Store3A/TX-LOC/BI-V2.
+extern bool g_V2LegacyIndexInert;
 
 // M5: cross-TU V2 transaction-presence helper for the WALLET (defined in main.cpp).
 // "Known" = the txid has a historical location in TX-LOC or an unspent output in

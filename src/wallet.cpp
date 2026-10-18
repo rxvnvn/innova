@@ -1658,9 +1658,14 @@ void CWallet::ReacceptWalletTransactions()
 
 void CWallet::ReacceptWalletTransactions()
 {
-    CTxDB txdb("r");
     const bool fV2Wallet = (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
                             s16::g_chainObserve.store && s16::g_chainObserve.store->opened());
+    // P2 (S4): in V2 wallet mode the Store3A branch below NEVER touches the legacy
+    // txdb (all reads/writes route via Store3A + TX-LOC). Constructing it here would
+    // resurrect the removed txleveldb. The legacy handle is only needed on the non-V2
+    // legacy migration path; pass a V2-inert placeholder in V2 mode (its methods are
+    // no-ops, so it is safe to construct unconditionally at a single gate below).
+    CTxDB txdb("r");
     bool fRepeat = true;
     while (fRepeat)
     {

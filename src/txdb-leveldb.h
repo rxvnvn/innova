@@ -148,6 +148,7 @@ private:
     leveldb::WriteBatch *activeBatch;
     leveldb::Options options;
     bool fReadOnly;
+    bool fInertV2;   // P2 (S4): true when V2 store mode made legacy access inert (never touches txleveldb)
     int nVersion;
 
 protected:
@@ -159,6 +160,10 @@ protected:
     template<typename K, typename T>
     bool Read(const K& key, T& value)
     {
+        // P2 (S4): V2-inert legacy access is a no-op (index routed via
+        // Store3A/TX-LOC/BI-V2). Never touch the NULL pdb.
+        if (fInertV2)
+            return false;
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(1000);
         ssKey << key;
@@ -202,6 +207,8 @@ protected:
     template<typename K, typename T>
     bool Write(const K& key, const T& value)
     {
+        if (fInertV2)   // P2 (S4): V2-inert; legacy write is a no-op
+            return true;
         if (fReadOnly)
         {
             printf("ERROR: Write called on database in read-only mode\n");
@@ -230,6 +237,8 @@ protected:
     template<typename K>
     bool Erase(const K& key)
     {
+        if (fInertV2)   // P2 (S4): V2-inert; legacy erase is a no-op
+            return true;
         if (!pdb)
             return false;
         if (fReadOnly)
@@ -252,6 +261,8 @@ protected:
     template<typename K>
     bool Exists(const K& key)
     {
+        if (fInertV2)   // P2 (S4): V2-inert; legacy existence is a no-op
+            return false;
         CDataStream ssKey(SER_DISK, CLIENT_VERSION);
         ssKey.reserve(1000);
         ssKey << key;

@@ -358,8 +358,23 @@ CTxDB::CTxDB(const char* pszMode)
     assert(pszMode);
     activeBatch = NULL;
     fReadOnly = (!strchr(pszMode, '+') && !strchr(pszMode, 'w'));
+    fInertV2 = false;
 
     LOCK(cs_txdb);
+
+    // P2 (S4): in V2 store mode legacy txleveldb is prohibited for the whole
+    // process. Construction is INERT: no directory create, no leveldb open, and
+    // all primitive reads/writes become no-ops (see template guards). This is the
+    // single choke-point that removes txleveldb creation/read/write from V2 for
+    // wallet, mempool, miner, RPC, network and collateral — all of which route
+    // their index access via Store3A/TX-LOC/BI-V2 in V2 mode.
+    if (s16::g_V2LegacyIndexInert)
+    {
+        fInertV2 = true;
+        pdb = NULL;
+        ++g_testTxdbOpenCount;
+        return;
+    }
 
     if (txdb) {
         pdb = txdb;

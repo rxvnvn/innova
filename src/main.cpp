@@ -6479,13 +6479,23 @@ namespace s16 { ChainObserveState g_chainObserve; }
 namespace s16 {
 bool g_V2LegacyIndexGuardArmed = false;
 int  g_V2LegacyIndexProbeDepth = 0;
+// P2 (S4): set TRUE whenever V2 store mode (-s16openstore) is requested, and NEVER
+// disarmed. Gate that makes legacy CTxDB construction inert in V2 store mode: the
+// transaction/block index must come exclusively from Store3A/TX-LOC/BI-V2, so no
+// legacy txleveldb open/create/read/write may occur at any point in V2 runtime.
+// Distinct from the startup-window guard (g_V2LegacyIndexGuardArmed) which is
+// released after block-index startup; the inert gate persists for the process.
+bool g_V2LegacyIndexInert = false;
 }
 
 void s16::ArmV2LegacyIndexGuardIfRequested()
 {
     g_V2LegacyIndexGuardArmed = !GetArg("-s16openstore", "").empty();
+    g_V2LegacyIndexInert = (g_V2LegacyIndexGuardArmed || !GetArg("-s16openstore", "").empty());
     if (g_V2LegacyIndexGuardArmed)
         printf("S2.0 BI-V2 authoritative startup: legacy LevelDB index-open guard ARMED (refusing legacy txleveldb opens; block index from Block Index V2 only)\n");
+    if (g_V2LegacyIndexInert)
+        printf("P2 (S4): legacy CTxDB made V2-INERT (txleveldb open/create/read/write disabled in V2 store mode; store/routing via Store3A+TX-LOC+BI-V2)\n");
 }
 
 static void s16_ObserveConnectBlock(const CBlock& blk,

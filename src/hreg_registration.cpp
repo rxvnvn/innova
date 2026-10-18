@@ -252,7 +252,8 @@ RegistrationState ComputePreSpendState(int registrationHeight, int spendingBlock
 
 
 
-bool BuildReplayInputsForTx(CTxDB& txdb,
+bool BuildReplayInputsForTx(CTxDB* txdb,                // NULL in V2 authoritative mode (TX-LOC/Store3A resolve prev-txs);
+                                                        // non-NULL only on the legacy residence path
                             const CTransaction& tx,
                             const std::map<uint256, CTransaction>& mapLocalTx,
                             const std::set<COutPoint>& setLocalSpent,
@@ -279,6 +280,11 @@ bool BuildReplayInputsForTx(CTxDB& txdb,
         }
 
         CTxIndex txindex;
+        // P2 (V3): V2-authenticated HREG rebuild never opens the legacy store. The
+        // prev-tx location is resolved from TX-LOC (txid -> blk pos) and the spent
+        // state synthesized from Store3A. A NULL txdb with fV2HREG false is a
+        // contradiction (V2-mode rebuild before the store/TX-LOC are armed) and is
+        // fail-closed — never a silent legacy deref, never a null-deref.
         const bool fV2HREG = (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
                               s16::g_chainObserve.store && s16::g_chainObserve.store->opened());
         if (fV2HREG)
@@ -295,9 +301,17 @@ bool BuildReplayInputsForTx(CTxDB& txdb,
             }
             txindex = CTxIndex(CDiskTxPos(tl.nFile, tl.nBlockPos, tl.nTxPos), 0);
         }
-        else if (!txdb.ReadTxIndex(prevout.hash, txindex))
+        else if (txdb != NULL && !txdb->ReadTxIndex(prevout.hash, txindex))
         {
             strError = strprintf("HREG rebuild: missing prev tx index %s", prevout.hash.ToString().c_str());
+            return false;
+        }
+        else if (txdb == NULL)
+        {
+            // P2: V2-authoritative HREG rebuild with the authoritative store not yet
+            // armed is a contradiction (see header comment). Fail closed: never target
+            // a null legacy handle.
+            strError = strprintf("HREG rebuild: V2 authoritative prev-tx resolution unavailable for %s (store/TX-LOC not armed)", prevout.hash.ToString().c_str());
             return false;
         }
         CTransaction txPrev;
@@ -570,7 +584,7 @@ bool RebuildHRegStateFromActiveChain(std::string& strError)
         {
             CTransaction tx = block.vtx[i];
             MapPrevTx mapInputs;
-            if (!BuildReplayInputsForTx(txdb, tx, mapLocalTx, setLocalSpent, mapInputs, strError))
+            if (!BuildReplayInputsForTx(&txdb, tx, mapLocalTx, setLocalSpent, mapInputs, strError))
                 return false;
             if (!g_registry.ApplyConnectedTx(tx, mapInputs, pindex->nHeight, strError))
                 return false;
@@ -610,7 +624,10 @@ bool RebuildHRegStateFromActiveChainByValue(const BlockIndexActiveChainReader& r
     const int32_t begin = (startHeight <= 0) ? 0 : startHeight;
     const int32_t end = (heightLimit < 0) ? activeHeight : std::min(heightLimit, activeHeight);
 
-    CTxDB txdb("r");
+    CTxDB* txdb = NULL;   // P2 (S4): V2 authoritative by-value rebuild never opens legacy.
+                          // A NULL handle is correct: prev-tx location is resolved from
+                          // TX-LOC + blk*.dat and spent state from Store3A (fV2HREG branch).
+                          // Legacy-path callers (non-authoritative) construct their own.
     for (int32_t h = begin; h <= end; ++h)
     {
         if (!IsHRegRecognitionActive(h))

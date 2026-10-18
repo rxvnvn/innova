@@ -9,6 +9,7 @@
 
 #include "blockindex_authoritative_startup.h"   // V2-R2B: authoritative by-value resolver
 #include "chainstate/observe_hook.h"             // S2.0: V2 store legacy-index guard
+#include "chainstate/store3a/incstore.h"          // P2(S4): csReadFile/csWriteFile/ChainError (V2 scalar home)
 #include "txdb.h"
 #include "main.h"
 #include "uint256.h"
@@ -18,6 +19,86 @@ static const int nCheckpointSpan = nCoinbaseMaturity * 2; // twice of coin matur
 
 namespace Checkpoints
 {
+    // ------------------------------------------------------------------
+    // P2 (S4): V2-native synchronized-checkpoint scalar home.
+    //
+    // The persisted hashSyncCheckpoint is ONE tiny scalar, consensus-critical
+    // (CheckSync' descendant rule needs it across restarts; its ABSENT value is
+    // the canonical ppcoin "no synchronized checkpoint"). It historically lived
+    // in the legacy LevelDB (CTxDB "hashSyncCheckpoint" key). In V2 store mode
+    // we must NOT create/open/read/write the legacy txleveldb at all, so the
+    // scalar gets a dedicated V2 home under the approved chainstate/ directory
+    // (a sibling of Store3A + TX-LOC). Format: a small self-describing record
+    // written atomically (temp file + fsync + rename), crash-safe:
+    //     [4-byte magic "V2CK"] [1 byte version=1] [32-byte uint256 hash]
+    // Absent file / bad magic / bad version / short read all fail CLOSED to
+    // SYNC_CHECKPOINT_ABSENT or CORRUPT (never a silent genesis substitution).
+    // ------------------------------------------------------------------
+    const std::string V2SyncCheckpointScalarPath()
+    {
+        return (GetDataDir() / "chainstate" / "sync-checkpoint").string();
+    }
+
+    // Returns true+LOADED on a vaild persisted scalar; true+ABSENT on a missing
+    // file (fresh/empty chainstate) or a wrong-record; true+CORRUPT on an
+    // unreadable/undecodable present file; false on filesystem error (fan to
+    // caller, which fails startup fail-closed).
+    SyncCheckpointLoadStatus ReadV2SyncCheckpointScalar(uint256& hashOut, std::string* error)
+    {
+        hashOut = uint256(0);
+        cs::ChainError e;
+        std::vector<uint8_t> buf; bool exists = false;
+        if (!cs::store3a::csReadFile(V2SyncCheckpointScalarPath(), &buf, &exists, &e))
+        {
+            if (error) *error = "V2 sync-checkpoint scalar read failed: " + e.str();
+            return SYNC_CHECKPOINT_CORRUPT;   // present-but-unreadable => corrupt/fail-closed
+        }
+        if (!exists)
+        {
+            if (error) error->clear();
+            return SYNC_CHECKPOINT_ABSENT;    // canonical, not an error
+        }
+        const unsigned char magic[4] = { 'V', '2', 'C', 'K' };
+        if (buf.size() != 1 + 4 + 32 || buf[4] != 1 ||
+            !std::equal(buf.begin(), buf.begin() + 4, magic))
+        {
+            if (error) *error = "V2 sync-checkpoint scalar record invalid (wrong size/magic/version)";
+            return SYNC_CHECKPOINT_CORRUPT;
+        }
+        memcpy(hashOut.begin(), &buf[5], 32);
+        if (error) error->clear();
+        return SYNC_CHECKPOINT_LOADED;
+    }
+
+    bool WriteV2SyncCheckpointScalar(const uint256& hashCheckpoint)
+    {
+        // Ensure the chainstate/ home exists before the first genesis-establishment
+        // write (the authoritative Store3A opens later, so the scalar must create it).
+        try
+        {
+            boost::filesystem::path p = V2SyncCheckpointScalarPath();
+            if (!p.parent_path().empty() && !boost::filesystem::exists(p.parent_path()))
+                boost::filesystem::create_directories(p.parent_path());
+        }
+        catch (const std::exception& ex)
+        {
+            printf("V2 sync-checkpoint scalar mkdir failed: %s\n", ex.what());
+            return false;
+        }
+        std::vector<uint8_t> rec;
+        rec.reserve(1 + 4 + 32);
+        const unsigned char magic[4] = { 'V', '2', 'C', 'K' };
+        rec.insert(rec.end(), magic, magic + 4);   // 0..3
+        rec.push_back(1);                           // 4: version
+        rec.insert(rec.end(), hashCheckpoint.begin(), hashCheckpoint.end()); // 5..36
+        cs::ChainError e;
+        if (!cs::store3a::csWriteFile(V2SyncCheckpointScalarPath(), rec.data(), rec.size(), false, false, &e))
+        {
+            printf("V2 sync-checkpoint scalar write failed at %s: %s\n", V2SyncCheckpointScalarPath().c_str(), e.str().c_str());
+            return false;
+        }
+        return true;
+    }
     //typedef std::map<int, uint256> MapCheckpoints;
 
     // How many times we expect transactions after the last checkpoint to
@@ -222,10 +303,19 @@ namespace Checkpoints
         // and startup fails loudly but gracefully.
         try
         {
-            // S2.0 BI-V2 authoritative startup: this single consensus-critical,
-            // EXPLICITLY-JUSTIFIED non-index read (the persisted synced-checkpoint
-            // scalar) is authorized to open the legacy LevelDB on the V2 store path.
-            // It is NOT a block/tx index read; the block index comes from BI-V2.
+            // S2.0 BI-V2 authoritative startup: the persisted synced-checkpoint
+            // scalar is consensus-critical and must survive restart. P2 (S4):
+            // in V2 store mode it is served from the V2-native scalar home
+            // (chainstate/sync-checkpoint), so this boot probe NEVER opens the
+            // legacy LevelDB — a clean V2 datadir gets NO txleveldb created. In
+            // legacy (non-V2) mode keep the old behavior.
+            if (g_fAuthoritativeStartup)
+            {
+                const SyncCheckpointLoadStatus vs = ReadV2SyncCheckpointScalar(hashOut, error);
+                if (vs == SYNC_CHECKPOINT_CORRUPT && error)
+                    *error = "V2 persisted hashSyncCheckpoint scalar is present but not decodable";
+                return vs;
+            }
             s16::V2LegacyIndexProbeScope probe;
             CTxDB txdb("r");
             const SyncCheckpointLoadStatus st = txdb.LoadSyncCheckpoint(hashOut);
@@ -1182,6 +1272,18 @@ namespace Checkpoints
 
     bool WriteSyncCheckpoint(const uint256& hashCheckpoint)
     {
+        // P2 (S4): in V2 store mode persist to the V2-native scalar home
+        // (chainstate/sync-checkpoint) instead of the legacy LevelDB — no
+        // txleveldb write on a V2 datadir. Legacy (non-V2) mode keeps the old
+        // transactional store write.
+        if (g_fAuthoritativeStartup)
+        {
+            if (!WriteV2SyncCheckpointScalar(hashCheckpoint))
+                return error("WriteSyncCheckpoint(): failed to persist V2 sync-checkpoint scalar %s", hashCheckpoint.ToString().c_str());
+            Checkpoints::hashSyncCheckpoint = hashCheckpoint;
+            printf("WriteSyncCheckpoint(): V2 scalar persisted %s\n", hashCheckpoint.ToString().c_str());
+            return true;
+        }
         CTxDB txdb;
         txdb.TxnBegin();
         if (!txdb.WriteSyncCheckpoint(hashCheckpoint))
