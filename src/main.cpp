@@ -39,6 +39,8 @@
 #include "hreg_registration.h"
 #include "chainstate/observe.h"            // S1.6-2 authoritative observation adapter
 #include "chainstate/observe_hook.h"       // S1.6-2 guarded read-only ConnectBlock hook
+#include "chainstate/anonstore/anonstore.h" // M8.3: ANON/key-image store (cs::anon)
+#include "chainstate/anonstore/anonfeed.h"  // M8.3: deterministic wallet-independent feed
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -60,6 +62,11 @@ static bool AlreadyHave(CTxDB& txdb, const CInv& inv);
 // S2.0-M2b: Store3A-backed V2 transparent-input coin view; full definition near
 // s16_StoreAuthoritativeInputGate. ConnectInputs uses it only in the armed V2 mode.
 struct s16_V2InputView;
+
+// M8.3: deterministic ANON feed helpers (full definitions near s16_V2Armed). Forward
+// declared here because DisconnectBlock (~6548) precedes their definitions (~7096).
+static bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash);
+static bool s16_AnonDisconnectBlock(const cs::Hash& blockHash, const cs::Hash& parentTipHash);
 
 //
 // Global state
@@ -6577,6 +6584,15 @@ bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
 
     // ppcoin: clean up wallet after disconnecting coinstake (a wallet update, not a
     // legacy-txindex operation).
+    // M8.3: deterministic ANON undo (wallet-independent), fail-closed when g_anon opened.
+    if (cs::anon::g_anon.opened()) {
+        cs::Hash abh; memcpy(abh.data(), pindex->GetBlockHash().begin(), 32);
+        cs::Hash aparent;
+        if (pindex->pprev) memcpy(aparent.data(), pindex->pprev->GetBlockHash().begin(), 32);
+        if (!s16_AnonDisconnectBlock(abh, aparent))
+            return error("DisconnectBlock() : ANON store undo disconnect FAILED for %s — fail-closed, no legacy fallback",
+                         pindex->GetBlockHash().ToString().substr(0,20).c_str());
+    }
     for (CTransaction& tx : vtx)
         SyncWithWallets(tx, this, false, false);
 
@@ -7092,6 +7108,90 @@ static inline bool s16_V2Armed()
 {
     return s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
            s16::g_chainObserve.store && s16::g_chainObserve.store->opened();
+}
+
+// -----------------------------------------------------------------------------
+// M8.3 production cutover: DETERMINISTIC ANON feed, wired into the block path
+// (condition #2 — wallet-INDEPENDENT). The anon-output/key-image mutations are
+// derived strictly from the block's own transactions (never from the wallet scan
+// / pwalletMain) via cs::anon::anonfeed, and committed atomically into g_anon.
+// INERT unless cs::anon::g_anon.opened() (default). Once g_anon is opened in V2
+// store mode, errors FAIL CLOSED (refuse the block / refuse disconnect) — the
+// store is an authoritative consensus-state participant, never a best-effort mirror.
+// -----------------------------------------------------------------------------
+// Bridge: resolve a committed (pre-block) anon-output value for the feed from the
+// authoritative anonstore itself.
+struct s16_AnonCommittedView : public cs::anon::CommittedAoView {
+    bool getAo(const uint8_t key33[33], cs::anon::CAnonOutput* out) const override {
+        if (!cs::anon::g_anon.opened()) return false;
+        bool found = false; cs::ChainError e;
+        if (!cs::anon::g_anon.getAo(key33, out, &found, &e)) return false;
+        return found;
+    }
+};
+static void s16_FeedFromBlock(const CBlock& blk, int32_t height, cs::anon::BlockFeed& feed)
+{
+    feed.height = height; feed.txs.clear();
+    for (size_t ti = 0; ti < blk.vtx.size(); ++ti) {
+        const CTransaction& tx = blk.vtx[ti];
+        uint256 h = tx.GetHash();
+        cs::anon::BlockFeed::FeedTx ft;
+        for (uint32_t i = 0; i < tx.vin.size(); ++i) {
+            const CTxIn& in = tx.vin[i];
+            if (!in.IsAnonInput()) continue;
+            cs::anon::FeedInput fi;
+            memcpy(fi.txid.data(), h.begin(), 32); fi.inputNo = i;
+            ec_point ki; in.ExtractKeyImage(ki);
+            if (ki.size() >= 33) memcpy(fi.keyImage.data(), ki.data(), 33);
+            const int nRing = in.ExtractRingSize();
+            const CScript& s = in.scriptSig;
+            if (nRing > 0 && s.size() >= 2 + (size_t)nRing * 33) {
+                for (int r = 0; r < nRing; ++r) {
+                    std::array<uint8_t,33> pk{};
+                    memcpy(pk.data(), &s[2 + (size_t)r * 33], 33);
+                    fi.ring.push_back(pk);
+                }
+            }
+            if (!fi.ring.empty()) ft.inputs.push_back(fi);
+        }
+        for (uint32_t j = 0; j < tx.vout.size(); ++j) {
+            const CTxOut& o = tx.vout[j];
+            if (!o.IsAnonOutput()) continue;
+            if (o.scriptPubKey.size() < 2 + 1 + 33) continue;
+            cs::anon::FeedOutput fo;
+            memcpy(fo.txid.data(), h.begin(), 32); fo.n = j; fo.nValue = o.nValue;
+            memcpy(fo.pkCoin.data(), &o.scriptPubKey[2 + 1], 33);
+            ft.outputs.push_back(fo);
+        }
+        if (!ft.inputs.empty() || !ft.outputs.empty()) feed.txs.push_back(ft);
+    }
+}
+// Connect a block's ANON state. Returns true unless g_anon is opened AND the feed/
+// store rejects (fail-closed). Inert (true) when g_anon is not opened (legacy bridge).
+static bool s16_AnonConnectBlock(const CBlock& blk, int32_t height, const uint256& blockHash)
+{
+    if (!cs::anon::g_anon.opened()) return true;
+    cs::anon::BlockFeed feed; s16_FeedFromBlock(blk, height, feed);
+    if (feed.txs.empty()) return true;   // no anon content in this block
+    std::vector<cs::anon::Mutation> muts; cs::ChainError e;
+    s16_AnonCommittedView view;
+    if (!cs::anon::deriveAnonMutations(feed, view, &muts, &e))
+        return error("ConnectBlock() : ANON feed derive FAILED at height %d (%s) — fail-closed, no legacy fallback",
+                     (int)height, e.str().c_str());
+    cs::Hash bh; memcpy(bh.data(), blockHash.begin(), 32);
+    if (!cs::anon::g_anon.connect(bh, height, muts, &e))
+        return error("ConnectBlock() : ANON store connect FAILED at height %d (%s) — fail-closed, no legacy fallback",
+                     (int)height, e.str().c_str());
+    return true;
+}
+static bool s16_AnonDisconnectBlock(const cs::Hash& blockHash, const cs::Hash& parentTipHash)
+{
+    if (!cs::anon::g_anon.opened()) return true;
+    cs::ChainError e;
+    if (!cs::anon::g_anon.disconnect(blockHash, parentTipHash, &e))
+        return error("DisconnectBlock() : ANON store undo disconnect FAILED for %s (%s) — fail-closed, no legacy fallback",
+                     HexStr(blockHash.data(), blockHash.data()+32).substr(0,20).c_str(), e.str().c_str());
+    return true;
 }
 
 bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
@@ -7907,6 +8007,11 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
     // S2.0-S1.7-G: pass the V2 input view so the authority gate can source this block's spends from
     // `consumed` when armed (V2), instead of the file-empty mqc.vSpent. Unarmed (legacy/mirror) -> NULL.
     s16_ObserveConnectBlock(*this, mapQueuedChanges, pindex, &v2View);   // S1.6-2: read-only observation (no-op unless enabled)
+    // M8.3: deterministic ANON feed (wallet-independent), committed in the same window as the
+    // Store3A delta publish. INERT unless cs::anon::g_anon.opened(); when opened, a feed/store
+    // error FAILS CLOSED (refuse the block, no legacy fallback). Never a best-effort mirror.
+    if (!s16_AnonConnectBlock(*this, (int32_t)pindex->nHeight, GetHash()))
+        return false;
     // S1.9: when armed as V2 AUTHORITATIVE chainstate (hardFail), a Store3A authority-gate
     // failure (needsRecovery at THIS block) MUST refuse the block — fail-closed, no silent
     // legacy fallback. This is the authoritative property: Store3A divergence halts the node
