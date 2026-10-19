@@ -180,7 +180,7 @@ static std::string BuildGenerationS(const std::vector<uint256>& hashes, int S,
     BlockIndexGenerationBuilder b;
     BlockIndexGenerationStats stats;
     std::string error;
-    fs::path staging = fs::path(rootDir) / "blockindex-build-000001.tmp";
+    fs::path staging = fs::path(rootDir) / "build-000001.tmp";
     BOOST_REQUIRE_MESSAGE(b.Build(src, staging.string(), 1, &stats, &error), error);
     b.Close();
     BOOST_REQUIRE_MESSAGE(
@@ -240,7 +240,7 @@ BOOST_AUTO_TEST_CASE(g2_catchup_exact_L_restart)
         BOOST_CHECK(restart.EffectiveTipHash() == hashes[L]);
     }
 
-    // G2-D: now the blockindex_tip contains the post-S authority; historical
+    // G2-D: now the tip contains the post-S authority; historical
     // mapBlockIndex not reconstructed (the tool never touches it). We assert the
     // tip's active chain height == L via the tip store directly.
     {

@@ -21,7 +21,6 @@
 #include "wallet.h"
 #include "ui_interface.h"
 #include "checkpoints.h"
-#include "txdb.h"
 
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>
@@ -133,7 +132,7 @@ static std::string BuildGenerationS(const std::vector<uint256>& hashes, int S,
     BlockIndexGenerationBuilder b;
     BlockIndexGenerationStats stats;
     std::string error;
-    fs::path staging = fs::path(rootDir) / "blockindex-build-000001.tmp";
+    fs::path staging = fs::path(rootDir) / "build-000001.tmp";
     BOOST_REQUIRE_MESSAGE(b.Build(src, staging.string(), 1, &stats, &error), error);
     b.Close();
     BOOST_REQUIRE(BlockIndexGenerationManager::PublishGeneration(rootDir, 1, &error) ==

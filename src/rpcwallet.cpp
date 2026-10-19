@@ -15,7 +15,6 @@
 #include "ibdsemantic.h"
 #include "stealth.h"
 #include "collateral.h"
-#include "txdb.h"
 #include "blockindex_manager.h"
 
 #include <openssl/crypto.h>
@@ -224,6 +223,11 @@ static Object BuildIBDMetricsJson(int nHeight)
     ibd.push_back(Pair("block_result_rejected_total", metrics.block_result_rejected_total));
     ibd.push_back(Pair("setbestchain_commits", metrics.setbestchain_commits));
     ibd.push_back(Pair("stalled_recovery_attempts", metrics.stalled_recovery_attempts));
+    ibd.push_back(Pair("stall_watchdog_ticks", metrics.stall_watchdog_ticks));
+    ibd.push_back(Pair("stall_watchdog_liveness_bypass", metrics.stall_watchdog_liveness_bypass));
+    ibd.push_back(Pair("stall_watchdog_peer_rotations", metrics.stall_watchdog_peer_rotations));
+    ibd.push_back(Pair("stall_watchdog_solo_recycles", metrics.stall_watchdog_solo_recycles));
+    ibd.push_back(Pair("stall_watchdog_forced_reissues", metrics.stall_watchdog_forced_reissues));
 
     ibd.push_back(Pair("active_decrement_receive_clear_inflight", metrics.active_decrement_receive_clear_inflight));
     ibd.push_back(Pair("active_decrement_inflight_timeout", metrics.active_decrement_inflight_timeout));

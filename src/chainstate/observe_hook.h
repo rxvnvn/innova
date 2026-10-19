@@ -38,24 +38,6 @@ struct ChainObserveState {
 
 extern ChainObserveState g_chainObserve;
 
-// ---------------------------------------------------------------------------
-// S2.0 BI-V2 AUTHORITATIVE STARTUP: legacy-index-open guard.
-//
-// In V2 store mode (-s16openstore=<dir>), the legacy LevelDB block/tx index
-// (GetDataDir()/txleveldb) MUST NOT be opened even for reading in the startup
-// path: the block index comes exclusively from the authoritative Block Index
-// V2. These flags let the single legacy LevelDB open choke point
-// (init_blockindex, txdb-leveldb.cpp) refuse such an open FAIL-CLOSED while a
-// narrow, explicitly-authorized probe scope (the one consensus-critical
-// non-index read, the persisted sync-checkpoint) is allowed through. Non-V2
-// startup never arms the guard, so its behavior is untouched.
-// ---------------------------------------------------------------------------
-extern bool g_V2LegacyIndexGuardArmed;      // true while the V2 store startup must refuse legacy index opens
-extern int  g_V2LegacyIndexProbeDepth;      // >0 inside an authorized non-index probe (sync-checkpoint)
-// P2 (S4): true while V2 store mode (-s16openstore) is active and never disarmed.
-// Makes legacy CTxDB construction inert (no legacy txleveldb open/create/read/write
-// at any point in V2 runtime); all index reads/writes route via Store3A/TX-LOC/BI-V2.
-extern bool g_V2LegacyIndexInert;
 
 // M5: cross-TU V2 transaction-presence helper for the WALLET (defined in main.cpp).
 // "Known" = the txid has a historical location in TX-LOC or an unspent output in
@@ -72,25 +54,5 @@ bool V2WalletTxidKnown(const uint256& hash);
 // txindex.vSpent.
 int V2OutpointUnspent(const uint256& txid, uint32_t n, bool* unspent);
 
-inline bool V2LegacyIndexGuardActive() { return g_V2LegacyIndexGuardArmed; }
-inline bool V2LegacyIndexProbeActive()
-{
-    return g_V2LegacyIndexGuardArmed && g_V2LegacyIndexProbeDepth > 0;
-}
-
-// RAII: marks the enclosing scope as the explicitly-justified, consensus-critical
-// non-index legacy read (the persisted synced-checkpoint boot probe). Only this
-// scope may open the legacy LevelDB in V2 store mode.
-class V2LegacyIndexProbeScope
-{
-public:
-    V2LegacyIndexProbeScope() { ++g_V2LegacyIndexProbeDepth; }
-    ~V2LegacyIndexProbeScope() { --g_V2LegacyIndexProbeDepth; }
-};
-
-// Arms the guard when -s16openstore is requested. Call ONCE at the start of the
-// V2 store startup path (before any legacy LevelDB open could occur). No-op in
-// non-V2 session (guard stays disarmed -> legacy behavior byte-for-byte).
-void ArmV2LegacyIndexGuardIfRequested();
 
 } // namespace s16

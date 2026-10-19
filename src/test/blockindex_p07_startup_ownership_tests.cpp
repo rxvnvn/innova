@@ -119,7 +119,7 @@ BOOST_AUTO_TEST_CASE(p07_10c_unpublished_artifacts_no_legacy_is_empty_new)
     fs::path v2Root = t.path / "bzindexv2";
     fs::path dataDir = t.path / "data";
     fs::create_directories(dataDir);              // no txleveldb
-    fs::create_directories(v2Root / "blockindex-build-000002.tmp"); // interrupted build artifact
+    fs::create_directories(v2Root / "build-000002.tmp"); // interrupted build artifact
 
     BlockIndexStartupOwnershipDecision d;
     std::string err;
@@ -135,7 +135,7 @@ BOOST_AUTO_TEST_CASE(p07_10d_unpublished_artifacts_with_legacy_retries_migration
     fs::path v2Root = t.path / "bzindexv2";
     fs::path dataDir = t.path / "data";
     fs::create_directories(dataDir / "txleveldb");
-    fs::create_directories(v2Root / "blockindex-build-000002.tmp");
+    fs::create_directories(v2Root / "build-000002.tmp");
 
     BlockIndexStartupOwnershipDecision d;
     std::string err;
@@ -153,27 +153,34 @@ BOOST_AUTO_TEST_CASE(p07_11_canonical_default_root_is_effective_datadir)
     // GetDataDir() is network-specific: for regtest it resolves <base>/regtest.
     const std::string effectiveDatadir = (t.path / "regtest").string();
     fs::create_directories(effectiveDatadir);
+    const fs::path datadir(effectiveDatadir);
 
-    // (a) default root == effective network datadir (NOT <datadir>/blockindex-v2).
-    BOOST_CHECK_EQUAL(GetDefaultBlockIndexV2Root(effectiveDatadir), effectiveDatadir);
+    // (a) default root == <datadir>/blockindex container (NOT the datadir root,
+    //     NOT blockindex-v2).
+    BOOST_CHECK_EQUAL(GetDefaultBlockIndexV2Root(effectiveDatadir),
+                      (datadir / "blockindex").string());
+    BOOST_CHECK(GetDefaultBlockIndexV2Root(effectiveDatadir) != effectiveDatadir);
     BOOST_CHECK(GetDefaultBlockIndexV2Root(effectiveDatadir) !=
-                (fs::path(effectiveDatadir) / "blockindex-v2").string());
+                (datadir / "blockindex-v2").string());
 
-    // (b) resolver: no override -> effective datadir; explicit override wins.
-    BOOST_CHECK_EQUAL(ResolveBlockIndexV2Root("", effectiveDatadir), effectiveDatadir);
+    // (b) resolver: no override -> default container root; explicit override wins.
+    BOOST_CHECK_EQUAL(ResolveBlockIndexV2Root("", effectiveDatadir),
+                      (datadir / "blockindex").string());
     BOOST_CHECK_EQUAL(ResolveBlockIndexV2Root("/custom/root", effectiveDatadir), "/custom/root");
 
-    // (c) the C1 physical lifecycle names appear DIRECTLY under that root, with
-    //     NO blockindex-v2/ and NO blockindex/ container.
+    // (c) the C1 physical lifecycle names are the CONTAINER-RELATIVE leaves:
+    //     current, gen-N, build-N.tmp (no blockindex-* prefix, no extra container).
     const std::string root = ResolveBlockIndexV2Root("", effectiveDatadir);
     WriteValidCurrent(root, 1);
-    fs::create_directories(fs::path(root) / "blockindex-gen-000001");
-    fs::create_directories(fs::path(root) / "blockindex-build-000002.tmp");
-    BOOST_CHECK(fs::exists(fs::path(root) / "blockindex-current"));
-    BOOST_CHECK(fs::exists(fs::path(root) / "blockindex-gen-000001"));
-    BOOST_CHECK(fs::exists(fs::path(root) / "blockindex-build-000002.tmp"));
+    fs::create_directories(fs::path(root) / "gen-000001");
+    fs::create_directories(fs::path(root) / "build-000002.tmp");
+    BOOST_CHECK(fs::exists(fs::path(root) / "current"));
+    BOOST_CHECK(fs::exists(fs::path(root) / "gen-000001"));
+    BOOST_CHECK(fs::exists(fs::path(root) / "build-000002.tmp"));
+    BOOST_CHECK(!fs::exists(fs::path(root) / "blockindex-current"));
+    BOOST_CHECK(!fs::exists(fs::path(effectiveDatadir) / "blockindex-current"));
     BOOST_CHECK(!fs::exists(fs::path(root) / "blockindex-v2"));
-    BOOST_CHECK(!fs::exists(fs::path(root) / "blockindex"));
+    BOOST_CHECK(!fs::is_regular_file(fs::path(effectiveDatadir) / "blockindex"));
 }
 
 // T1 (Cohort T): a generation directory that EXISTS but is missing required
@@ -185,7 +192,7 @@ BOOST_AUTO_TEST_CASE(p07_12_present_but_structurally_broken_generation_is_fatal)
     fs::path v2Root = t.path / "bzindexv2";
     fs::path dataDir = t.path / "data";
     fs::create_directories(dataDir / "txleveldb"); // valid legacy also present
-    fs::create_directories(v2Root / "blockindex-gen-000001"); // dir present, empty
+    fs::create_directories(v2Root / "gen-000001"); // dir present, empty
     WriteValidCurrent(v2Root.string(), 1);
 
     BlockIndexStartupOwnershipDecision d;

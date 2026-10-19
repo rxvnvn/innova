@@ -47,3 +47,11 @@ dist
 # python caches
 __pycache__/
 *.py[cod]
+
+# build artifacts (never commit binaries)
+src/innovad
+src/innova-blockindex-builder-lm
+src/innova-store3a-conv
+src/store3a_tests
+src/txloc_tests
+src/obj/

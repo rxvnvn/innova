@@ -57,6 +57,11 @@ Counters::Counters()
       block_result_rejected_total(0),
       setbestchain_commits(0),
       stalled_recovery_attempts(0),
+      stall_watchdog_ticks(0),
+      stall_watchdog_liveness_bypass(0),
+      stall_watchdog_peer_rotations(0),
+      stall_watchdog_solo_recycles(0),
+      stall_watchdog_forced_reissues(0),
       active_decrement_receive_clear_inflight(0),
       active_decrement_inflight_timeout(0),
       active_decrement_askfor_sent_transition(0),
@@ -680,6 +685,16 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.setbestchain_commits.load(std::memory_order_relaxed);
     out.stalled_recovery_attempts =
         c.stalled_recovery_attempts.load(std::memory_order_relaxed);
+    out.stall_watchdog_ticks =
+        c.stall_watchdog_ticks.load(std::memory_order_relaxed);
+    out.stall_watchdog_liveness_bypass =
+        c.stall_watchdog_liveness_bypass.load(std::memory_order_relaxed);
+    out.stall_watchdog_peer_rotations =
+        c.stall_watchdog_peer_rotations.load(std::memory_order_relaxed);
+    out.stall_watchdog_solo_recycles =
+        c.stall_watchdog_solo_recycles.load(std::memory_order_relaxed);
+    out.stall_watchdog_forced_reissues =
+        c.stall_watchdog_forced_reissues.load(std::memory_order_relaxed);
 
     out.active_decrement_receive_clear_inflight =
         c.active_decrement_receive_clear_inflight.load(std::memory_order_relaxed);

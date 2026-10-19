@@ -31,7 +31,7 @@ static bool HasUnpublishedGenerationArtifacts(const std::string& v2Root)
     for (fs::directory_iterator it(root, ec), end; !ec && it != end; it.increment(ec))
     {
         std::string name = it->path().filename().string();
-        if (name.compare(0, 15, "blockindex-gen-") == 0 || name.compare(0, 17, "blockindex-build-") == 0)
+        if (name.compare(0, 4, "gen-") == 0 || name.compare(0, 6, "build-") == 0)
             return true;
     }
     return false;
@@ -157,14 +157,15 @@ bool ClassifyBlockIndexStartupOwnership(const std::string& v2Root,
 
 std::string GetDefaultBlockIndexV2Root(const std::string& dataDir)
 {
-    // PM1-P0-07b (C1 filesystem contract): the authoritative block-index state
-    // lives DIRECTLY under the effective Innova network datadir. The C1 lifecycle
-    // files are already namespace-safe (blockindex-current, blockindex-gen-%06llu,
-    // blockindex-build-%06llu.tmp), so the default root IS the effective network
-    // datadir. It MUST NOT append a blockindex-v2/ (or blockindex/) container.
+    // PM1-P0-07b/V2-datadir-contract: the authoritative block-index state lives
+    // under a dedicated "blockindex/" container inside the effective Innova
+    // network datadir. The C1 lifecycle files are the container-relative leaves
+    // (current, gen-%06llu, build-%06llu.tmp, tip) so the default root is
+    // <datadir>/blockindex. It MUST NOT return the datadir root itself (that
+    // would scatter blockindex-* artifacts across the datadir).
     if (dataDir.empty())
         return std::string();
-    return dataDir;
+    return (fs::path(dataDir) / "blockindex").string();
 }
 
 std::string ResolveBlockIndexV2Root(const std::string& overrideRoot,

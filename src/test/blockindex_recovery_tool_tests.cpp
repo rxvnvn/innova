@@ -150,7 +150,7 @@ static std::string BuildGenerationS(const std::vector<uint256>& hashes, int S,
     BlockIndexGenerationBuilder b;
     BlockIndexGenerationStats stats;
     std::string error;
-    fs::path staging = fs::path(rootDir) / "blockindex-build-000001.tmp";
+    fs::path staging = fs::path(rootDir) / "build-000001.tmp";
     BOOST_REQUIRE_MESSAGE(b.Build(src, staging.string(), 1, &stats, &error), error);
     b.Close();
     BOOST_REQUIRE_MESSAGE(
@@ -310,14 +310,14 @@ BOOST_AUTO_TEST_CASE(recovery_abandon_preserves_rollback_evidence)
     BOOST_REQUIRE_EQUAL(first.targetHeight, L);
 
     // --abandon: the tip (already at L) is preserved as
-    // blockindex_tip.pre-recovery-0 (rollback evidence, never deleted) and
+    // tip.pre-recovery-0 (rollback evidence, never deleted) and
     // the recovery starts fresh from the base S, converging to L again.
     BlockIndexRecoveryStats res;
     BOOST_REQUIRE_MESSAGE(RunBlockIndexRecovery(v2Root, legacyDir, "", true, &res),
                           res.error);
     BOOST_CHECK(res.ok);
     BOOST_CHECK_EQUAL(res.targetHeight, L);
-    BOOST_CHECK_MESSAGE(fs::exists(fs::path(v2Root) / "blockindex_tip.pre-recovery-0"),
+    BOOST_CHECK_MESSAGE(fs::exists(fs::path(v2Root) / "tip.pre-recovery-0"),
                         "rollback evidence (pre-recovery dir) must be preserved");
     printf("R-E PASS: --abandon preserved rollback evidence and re-converged to L.\n");
 }
@@ -337,7 +337,7 @@ BOOST_AUTO_TEST_CASE(recovery_legacy_tip_below_base_fails_closed)
     BOOST_CHECK(!res.ok);
     BOOST_CHECK_MESSAGE(res.error.find("below/mismatched") != std::string::npos, res.error);
     // The tip must be untouched (absent here).
-    BOOST_CHECK(!fs::exists(fs::path(v2Root) / "blockindex_tip" / "tip.meta"));
+    BOOST_CHECK(!fs::exists(fs::path(v2Root) / "tip" / "tip.meta"));
     printf("R-F1 PASS: legacy tip below base -> fail closed.\n");
 }
 
@@ -389,7 +389,7 @@ BOOST_AUTO_TEST_CASE(recovery_noop_when_already_at_L)
                           res.error);
     BOOST_CHECK(res.ok);
     BOOST_CHECK_EQUAL(res.recordsAppended, 0u);
-    BOOST_CHECK(!fs::exists(fs::path(v2Root) / "blockindex_tip" / "tip.meta"));
+    BOOST_CHECK(!fs::exists(fs::path(v2Root) / "tip" / "tip.meta"));
     printf("R-G PASS: S == L -> NO-OP (no tip materialized).\n");
 }
 

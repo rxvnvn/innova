@@ -4,7 +4,6 @@
 #include "innovarpc.h"
 #include "miner.h"
 #include "main.h"
-#include "txdb.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
@@ -429,7 +428,7 @@ BOOST_AUTO_TEST_CASE(template_nbits_uses_authoritative_resolver_on_sparse_hot_pa
         if (src.records[k].hash == tipHash) nTipHeight = src.records[k].record.height;
 
     BlockIndexGenerationBuilder builder;
-    BOOST_REQUIRE_MESSAGE(builder.Build(src, (root / "blockindex-build-000001.tmp").string(),
+    BOOST_REQUIRE_MESSAGE(builder.Build(src, (root / "build-000001.tmp").string(),
                                         1, NULL, &error), error);
     builder.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error),

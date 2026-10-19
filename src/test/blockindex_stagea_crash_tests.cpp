@@ -19,20 +19,20 @@
 
 // =====================================================================
 // Stage A — crash-injection tests at the ACTUAL persistence boundaries of
-// the Block Index V2 mutable tip authority (blockindex_tip/).
+// the Block Index V2 mutable tip authority (tip/).
 //
-// Protocol under test (src/blockindex_tip.cpp):
+// Protocol under test (src/tip.cpp):
 //   tip.meta is the SINGLE commit point (WriteMeta: tmp + fsync + rename +
-//   dir-sync; the rename IS the commit, blockindex_tip.cpp:1270).
+//   dir-sync; the rename IS the commit, tip.cpp:1270).
 //   Records/derived/active are appended / CoW-published BEFORE the commit and
 //   remain UNCOMMITTED SUFFIXES until it (Open truncates them,
-//   blockindex_tip.cpp:1605-1627). The LevelDB hashindex + marker are derived
+//   tip.cpp:1605-1627). The LevelDB hashindex + marker are derived
 //   state, reconciled at Open (ReconcileSideIndexOnOpen,
-//   blockindex_tip.cpp:1092-1135). For a reorg publication the store set is
-//   CoW-renamed over by RewriteStoresForReorg (blockindex_tip.cpp:1306) and
+//   tip.cpp:1092-1135). For a reorg publication the store set is
+//   CoW-renamed over by RewriteStoresForReorg (tip.cpp:1306) and
 //   tip.meta is advanced LAST.
 //
-// Failpoints (blockindex_tip.h:89-90; armed ONLY by tests):
+// Failpoints (tip.h:89-90; armed ONLY by tests):
 //   FP_DURING_TAIL_UPDATE                tail CoW tmp durable, pre-rename
 //   FP_AFTER_TAIL_DURABLE_BEFORE_META    tail stores durable, pre-commit
 //   FP_BEFORE_META_RENAME                meta tmp durable, pre-rename
@@ -128,11 +128,11 @@ static uint256 SA_BuildChain(BlockIndexTipAuthority& tip, uint32_t n,
 
 static std::string SA_RecordsPath(const std::string& d)
 {
-    return d + "/blockindex_tip/tip-records.dat";
+    return d + "/tip/tip-records.dat";
 }
 static std::string SA_MetaPath(const std::string& d)
 {
-    return d + "/blockindex_tip/tip.meta";
+    return d + "/tip/tip.meta";
 }
 static bool SA_Exists(const std::string& p)
 {
@@ -247,12 +247,12 @@ BOOST_AUTO_TEST_CASE(sa1_tmp_presence_is_not_corruption_oracle_A)
         BOOST_CHECK_MESSAGE(err.find("injected file sync failure") != std::string::npos,
                             "SA1: error must carry the injected reason: " << err);
         tip.Close();
-        // The snapshot shape (incremental append path, blockindex_tip.cpp:557):
+        // The snapshot shape (incremental append path, tip.cpp:557):
         // the abort torn NOTHING (the in-place append failed before it became
         // durable); the authoritative tip.meta is untouched. Whether or not
         // partial bytes landed, ONLY tip.meta decides, and any tail on the
         // records/derived/active stores is an UNCOMMITTED suffix (Open
-        // bounds-truncates it against tipRecordCount at blockindex_tip.cpp:1605).
+        // bounds-truncates it against tipRecordCount at tip.cpp:1605).
         BOOST_CHECK_MESSAGE(boost::filesystem::file_size(
                                 boost::filesystem::path(SA_MetaPath(dir))) > 0,
                             "SA1: tip.meta must exist and be untouched");

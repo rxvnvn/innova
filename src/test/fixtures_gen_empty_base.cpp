@@ -31,7 +31,7 @@ int main(int argc, char** argv)
     BlockIndexGenerationBuilder b;
     BlockIndexGenerationStats stats;
     std::string error;
-    boost::filesystem::path staging = boost::filesystem::path(root) / "blockindex-build-000001.tmp";
+    boost::filesystem::path staging = boost::filesystem::path(root) / "build-000001.tmp";
     if (!b.Build(src, staging.string(), 1, &stats, &error))
     { fprintf(stderr, "build fail: %s\n", error.c_str()); return 1; }
     b.Close();

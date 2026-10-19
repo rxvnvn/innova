@@ -32,7 +32,7 @@ bool BlockIndexAuthoritativeRestart::OpenBaseAndTip(
     if (!tip_)
         tip_.reset(new BlockIndexTipAuthority());
 
-    boost::filesystem::path tipDir = boost::filesystem::path(v2Root) / "blockindex_tip";
+    boost::filesystem::path tipDir = boost::filesystem::path(v2Root) / "tip";
     if (!boost::filesystem::exists(tipDir / "tip.meta"))
     {
         // no mutable tip: node boots purely from the base generation (tip = S).

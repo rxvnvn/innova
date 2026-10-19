@@ -48,7 +48,7 @@ static BlockIndexGenerationSource MgrSource()
 static void MgrBuildSelected(const boost::filesystem::path& root)
 {
     BlockIndexGenerationBuilder b; BlockIndexGenerationStats st; std::string e;
-    BOOST_REQUIRE_MESSAGE(b.Build(MgrSource(), (root / "blockindex-gen-000001").string(), 1, &st, &e), e);
+    BOOST_REQUIRE_MESSAGE(b.Build(MgrSource(), (root / "gen-000001").string(), 1, &st, &e), e);
     b.Close();
     BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &e) == BLOCK_INDEX_LIFECYCLE_OK, e);
 }
@@ -271,7 +271,7 @@ static void MgrBuildGen(const boost::filesystem::path& root, uint64_t gen, int c
     if (withBlocks) src.blockDataDir = bdir.string();
     if (withBlocks && posHeight >= 0 && posHeight < count) g_dSizePresent = bs[posHeight].nSize;
     BlockIndexGenerationBuilder b; BlockIndexGenerationStats st; std::string e;
-    char gd[64]; snprintf(gd, sizeof(gd), "blockindex-gen-%06llu", (unsigned long long)gen);
+    char gd[64]; snprintf(gd, sizeof(gd), "gen-%06llu", (unsigned long long)gen);
     BOOST_REQUIRE_MESSAGE(b.Build(src, (root / gd).string(), gen, &st, &e), e);
     b.Close();
     BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(), gen, &e) == BLOCK_INDEX_LIFECYCLE_OK, e);
@@ -484,7 +484,7 @@ static void MgrBuildTipMetaGen(const boost::filesystem::path& root, uint64_t gen
     }
     src.hashBestChain = prev; src.foundBestChain = true;
     BlockIndexGenerationBuilder b; BlockIndexGenerationStats st; std::string e;
-    char gd[64]; snprintf(gd, sizeof(gd), "blockindex-gen-%06llu", (unsigned long long)gen);
+    char gd[64]; snprintf(gd, sizeof(gd), "gen-%06llu", (unsigned long long)gen);
     BOOST_REQUIRE_MESSAGE(b.Build(src, (root / gd).string(), gen, &st, &e), e);
     b.Close();
     BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(), gen, &e) == BLOCK_INDEX_LIFECYCLE_OK, e);

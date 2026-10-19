@@ -1,7 +1,6 @@
 #include "blockindex_generation_builder.h"
 #include "candidate_frontier_metadata.h"
 
-#include "txdb-leveldb.h"
 #include "main.h"
 #include "kernel.h"
 

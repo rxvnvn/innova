@@ -5,7 +5,6 @@
 #include "checkpoints.h"
 #include "db.h"
 #include "main.h"
-#include "txdb.h"
 #include "wallet.h"
 
 #include <boost/filesystem.hpp>

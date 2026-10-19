@@ -50,7 +50,6 @@
 #include <vector>
 
 #include "main.h"
-#include "txdb-leveldb.h"
 #include "uint256.h"
 #include "util.h"
 #include "version.h"

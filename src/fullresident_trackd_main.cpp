@@ -40,7 +40,6 @@
 #include "blockindex_generation_lifecycle.h"
 #include "checkpoints.h"
 #include "main.h"
-#include "txdb.h"
 #include "db.h"
 #include "wallet.h"
 #include "blockrequesttrace.h"
@@ -127,7 +126,7 @@ struct TrackDFixture
         BlockIndexGenerationBuilder b;
         BlockIndexGenerationStats stats;
         std::string error;
-        fs::path tmp = root / "blockindex-build-000001.tmp";
+        fs::path tmp = root / "build-000001.tmp";
         if (!b.Build(src, tmp.string(), baseGen, &stats, &error))
         { fprintf(stderr, "builder: %s\n", error.c_str()); exit(1); }
         b.Close();

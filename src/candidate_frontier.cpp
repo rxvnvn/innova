@@ -20,7 +20,6 @@
 
 #include "candidate_frontier.h"
 #include "main.h"
-#include "txdb.h"
 
 #include <set>
 #include <map>
@@ -104,30 +103,8 @@ CandidateFrontierAuthorityRecord EvaluateCandidateFrontierByValue(
 // dead CTxDB candidate-tips members. Persistence is available for a bounded
 // O(F) startup load and is deliberately NOT loaded blindly across generations.
 // ---------------------------------------------------------------------------
-bool WriteCandidateTips(CTxDB& txdb)
-{
-    return txdb.WriteCandidateTips(mapCandidateTips);
-}
+// Candidate-tip persistence lived in the retired transaction database. The V2
+// block index owns candidate leaves in its own generation (candidate-leaves.dat),
+// so this legacy keyed store has no reader and is removed.
 
-bool ReadCandidateTips(CTxDB& txdb)
-{
-    std::map<uint256, CandidateTipRecord> loaded;
-    if (!txdb.ReadCandidateTips(loaded) || loaded.empty())
-        return false; // FAIL CLOSED: no set or unreadable
 
-    // RECORDS carry the generation identity; all records in a persisted set
-    // must share one generation and it must equal the CURRENT expected
-    // generation. Otherwise the set is stale/corrupt and is not consumed.
-    uint64_t setGen = loaded.begin()->second.nGeneration;
-    if (setGen == 0)
-        return false;
-    for (const auto& entry : loaded)
-        if (entry.second.nGeneration != setGen)
-            return false; // mixed generations: corrupt
-
-    if (setGen != nCandidateTipGeneration)
-        return false; // GENERATION MISMATCH: do not consume stale tips
-
-    mapCandidateTips.swap(loaded);
-    return true;
-}

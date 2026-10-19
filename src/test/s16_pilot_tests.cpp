@@ -21,7 +21,6 @@
 // this suite focuses on real ConnectBlock coverage of the create/commit/undo cycle.
 #include "main.h"
 #include "miner.h"
-#include "txdb.h"
 #include "init.h"
 #include "util.h"
 #include "chainstate/observe.h"
@@ -38,6 +37,7 @@
 namespace fs = boost::filesystem;
 
 extern void* GetGlobalTxdbPtrForTest();   // txdb-leveldb.cpp test accessor
+extern int g_testTxdbOpenCount;           // txdb-leveldb.cpp test counter (global scope)
 
 using namespace cs;
 using namespace cs::store3a;
@@ -962,4 +962,9 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
     fTestNet = savedTestNet; nCoinbaseMaturity = savedMaturity;
 }
 
+// ---------------------------------------------------------------------------
+// S5 REGRESSION (P2/S4 V2-INERT CTxDB): the transaction primitives must never
+// dereference the (NULL) legacy leveldb handle.
+//
+// Defect proven on the REAL sync path with block #1 in an isolated scratch
 BOOST_AUTO_TEST_SUITE_END()

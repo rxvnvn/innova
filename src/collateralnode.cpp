@@ -7,7 +7,6 @@
 #include "collateralnode.h"
 #include "activecollateralnode.h"
 #include "collateral.h"
-#include "txdb.h"
 #include "main.h"
 #include "util.h"
 #include "addrman.h"
@@ -1257,8 +1256,6 @@ void CCollateralNode::Check(bool forceCheck)
 }
 
 bool CheckCollateralnodeVin(CTxIn& vin, std::string& errorMessage, CBlockIndex* pindex) {
-    CTxDB txdb("r");
-    CTxIndex txindex;
     CTransaction ctx;
     uint256 hashBlock;
 
@@ -1308,21 +1305,11 @@ bool CheckCollateralnodeVin(CTxIn& vin, std::string& errorMessage, CBlockIndex* 
         }
     }
 
-    if (txdb.ReadTxIndex(vin.prevout.hash, txindex))
-    {
-        if (vin.prevout.n >= txindex.vSpent.size())
-        {
-            errorMessage = "vin output index out of range for spent tracking";
-            return false;
-        }
-        if (txindex.vSpent[vin.prevout.n].nTxPos != 0) {
-            errorMessage = "vin was spent";
-            return false;
-        }
-        return true;
-    } else {
-        errorMessage = "specified vin transaction was not found in the txindex\n";
-    }
+    // CTxDB demolition: there is no legacy txindex fallback any more.  Store3A
+    // did not decide this outpoint (it is not on the authoritative active
+    // chain), so the collateral cannot be proven unspent -- refuse it instead
+    // of trusting a second storage path.
+    errorMessage = "vin is not an unspent output on the Store3A active chain (fail-closed)";
     return false;
 }
 
@@ -1740,7 +1727,6 @@ bool CCollateralNPayments::initialize(const CBlockIndex *pindex)
 {
     if (vCollaterals.size() > 0) return 0; //return should return value here
     printf("Setting up CN payment validation...\n");
-    CTxDB txdb("r");
     const CBlockIndex *BlockReading = pindex;
     int blocksFound = 0;
     int nHeight = 0;
@@ -1877,7 +1863,6 @@ bool CCollateralNPayments::initialize(const CBlockIndex *pindex)
 bool FindCNPayment(CScript& payee, CBlockIndex* pindex)
 {
     if (fDebug) printf("Searching for CN collateral...\n");
-    CTxDB txdb("r");
     const CBlockIndex *BlockReading = pindex;
     int blocksFound = 0;
     int nHeight = 0;
@@ -1934,7 +1919,6 @@ bool FindCNPayment(CScript& payee, CBlockIndex* pindex)
 bool FindCNPayments(CScript& payee, CBlockIndex* pindex)
 {
     printf("CNPayment:");
-    CTxDB txdb("r");
     const CBlockIndex *BlockReading = pindex;
     int blocksFound = 0;
     int nHeight = 0;

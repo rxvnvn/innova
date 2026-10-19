@@ -8,8 +8,8 @@
 #include "alert.h"
 #include "bloom.h"
 #include "checkpoints.h"
+#include "blockindex_startup_ownership.h"
 #include "db.h"
-#include "txdb.h"
 #include "net.h"
 #include "init.h"
 #include "wallet.h"
@@ -55,7 +55,7 @@ using boost::placeholders::_2;
 using namespace std;
 namespace fs = boost::filesystem;
 
-static bool AlreadyHave(CTxDB& txdb, const CInv& inv);
+static bool AlreadyHave(const CInv& inv);
 
 // S2.0-M2b: Store3A-backed V2 transparent-input coin view; full definition near
 // s16_StoreAuthoritativeInputGate. ConnectInputs uses it only in the armed V2 mode.
@@ -1241,7 +1241,6 @@ static size_t RecoverOrderedReleasedBlocks(
     const IbdHeaderSchedulerActiveAncestorEvidence evidence =
         IbdHeaderSchedulerBuildActiveAncestorEvidence(window);
 
-    CTxDB txdb("r");
     for (size_t i = 0; i < nBound; ++i)
     {
         const uint256& hash = window[i];
@@ -1249,7 +1248,7 @@ static size_t RecoverOrderedReleasedBlocks(
             continue;
         if (IbdHeaderSchedulerHashIsQueuedOnAnyPeer(hash, vNodesCopy))
             continue;
-        if (AlreadyHave(txdb, CInv(MSG_BLOCK, hash)))
+        if (AlreadyHave(CInv(MSG_BLOCK, hash)))
             continue;
         if (nBudget <= 0)
         {
@@ -1735,7 +1734,6 @@ static size_t RefillOrderedHeaderBlockRequests(
     BlockRequestOwnerState frontOwnerState = BLOCK_REQUEST_OWNER_QUEUED;
     int64_t frontAssignedUs = 0;
     size_t frontAlternatives = 0;
-    CTxDB txdb("r");
     const std::vector<uint256>& evidenceWindow = incremental ?
         g_ibdHeaderSchedulerState.cursorWindow : window;
     const IbdHeaderSchedulerActiveAncestorEvidence evidence =
@@ -1749,7 +1747,7 @@ static size_t RefillOrderedHeaderBlockRequests(
         const uint256& hash = *it;
         const CIbdHeaderNode* node = g_ibdHeadersObserver.Graph().Lookup(hash);
         const int nHeight = node ? node->height : -1;
-        if (AlreadyHave(txdb, CInv(MSG_BLOCK, hash)))
+        if (AlreadyHave(CInv(MSG_BLOCK, hash)))
         {
             ++nHave;
             fIncrementalHeadResolved = true;
@@ -2318,8 +2316,6 @@ size_t RefillDeferredBlockRequests(
         return 0;
     }
 
-    CTxDB txdb("r");
-    ibdmetrics::Get().refill_txdb_opens.fetch_add(1, std::memory_order_relaxed);
     size_t nAdmitted = 0;
     size_t nDropped = 0;
     size_t nExamined = 0;
@@ -2344,7 +2340,7 @@ size_t RefillDeferredBlockRequests(
         ibdmetrics::Get().refill_alreadyhave_checks.fetch_add(
             1, std::memory_order_relaxed);
 
-        if (AlreadyHave(txdb, inv))
+        if (AlreadyHave(inv))
         {
             ibdmetrics::Get().refill_items_already_have.fetch_add(
                 1, std::memory_order_relaxed);
@@ -2528,10 +2524,8 @@ ScopedProcessBlockParentObserver::~ScopedProcessBlockParentObserver()
     g_processBlockParentObserver = previous_;
 }
 
-// Borrow the already-open database under the caller's cs_main, just as the
-// block path does. Never construct CTxDB here: its constructor can open/create
-// a database. This diagnostic reads the committed source token, not a batch.
-extern leveldb::DB* txdb;
+// Diagnostic below reads only the authoritative V2 tip state under cs_main;
+// there is no legacy database handle to borrow.
 static void ObserveProcessBlockParent(const CBlock& block, int kind,
     bool attempted = false, bool result = false, const std::string* boolError = NULL,
     int acceptResult = -1)
@@ -2931,7 +2925,6 @@ bool Finalise()
     UnregisterWallet(pwalletMain);
     delete pwalletMain;
 
-    CTxDB().Close();
 
 
     return true;
@@ -3053,10 +3046,24 @@ unsigned int LimitOrphanTxSize(unsigned int nMaxOrphans)
 
 
 
-bool CTransaction::ReadFromDisk(CTxDB& txdb, COutPoint prevout, CTxIndex& txindexRet)
+// V2-native transaction location authority: TX-LOC stores the exact on-disk
+// position of every historical transaction (legacy txdb.ReadTxIndex replacement).
+bool s16_V2ReadTxIndex(const uint256& hash, CTxIndex& txindexRet)
+{
+    txindexRet.SetNull();
+    if (!txloc::g_txloc.opened())
+        return false;
+    txloc::Loc loc; bool found = false; txloc::ChainError te;
+    if (!txloc::g_txloc.get(hash.begin(), &loc, &found, &te) || !found)
+        return false;
+    txindexRet.pos = CDiskTxPos(loc.nFile, loc.nBlockPos, loc.nTxPos);
+    return true;
+}
+
+bool CTransaction::ReadFromDisk(COutPoint prevout, CTxIndex& txindexRet)
 {
     SetNull();
-    if (!txdb.ReadTxIndex(prevout.hash, txindexRet))
+    if (!s16_V2ReadTxIndex(prevout.hash, txindexRet))
         return false;
     if (!ReadFromDisk(txindexRet.pos))
         return false;
@@ -3068,17 +3075,10 @@ bool CTransaction::ReadFromDisk(CTxDB& txdb, COutPoint prevout, CTxIndex& txinde
     return true;
 }
 
-bool CTransaction::ReadFromDisk(CTxDB& txdb, COutPoint prevout)
-{
-    CTxIndex txindex;
-    return ReadFromDisk(txdb, prevout, txindex);
-}
-
 bool CTransaction::ReadFromDisk(COutPoint prevout)
 {
-    CTxDB txdb("r");
     CTxIndex txindex;
-    return ReadFromDisk(txdb, prevout, txindex);
+    return ReadFromDisk(prevout, txindex);
 }
 
 // bool CTransaction::IsStandard() const
@@ -3365,7 +3365,7 @@ int CMerkleTx::SetMerkleBranch(const CBlock* pblock)
     {
         // Load the block this tx is in
         CTxIndex txindex;
-        if (!CTxDB("r").ReadTxIndex(GetHash(), txindex))
+        if (!s16_V2ReadTxIndex(GetHash(), txindex))
             return 0;
         if (!blockTmp.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos))
             return 0;
@@ -3539,12 +3539,9 @@ static bool s16_V2TxidKnown(const uint256& hash)
 // M4: "has this txid been seen" for the V2 armed path (TX-LOC/Store3A) else the
 // legacy txdb.ContainsTx — so non-V2 is unchanged and no new legacy read is
 // introduced in V2.
-static bool s16_ContainsTxV2OrLegacy(const uint256& hash, CTxDB* txdb)
+static bool s16_TxidKnownV2(const uint256& hash)
 {
-    if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
-        s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
-        return s16_V2TxidKnown(hash);
-    return txdb && txdb->ContainsTx(hash);
+    return s16_V2TxidKnown(hash);
 }
 
 // M5 wallet cross-TU bridge: txid known on-chain (TX-LOC location or Store3A
@@ -3583,12 +3580,12 @@ int s16::V2OutpointUnspent(const uint256& txid, uint32_t n, bool* unspent)
 struct s16_V2InputView;
 static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& tx,
                                     MapPrevTx& mapInputs, bool* pfMissingInputs);
-static bool s16_V2MempoolAccept(CTxDB& txdb, CTransaction& tx, uint256& hash,
+static bool s16_V2MempoolAccept(CTransaction& tx, uint256& hash,
                                 bool* pfMissingInputs, bool fOnlyCheckWithoutAdding);
 static bool s16_V2MempoolAcceptableInputs(CTransaction& tx, bool fLimitFree,
                                           bool* pfMissingInputs);
 
-bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
+bool CTxMemPool::accept(CTransaction &tx, bool fCheckInputs,
                         bool* pfMissingInputs, bool fOnlyCheckWithoutAdding)
 {
     AssertLockHeld(cs_main);
@@ -3645,7 +3642,7 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
         s16::g_chainObserve.store->existsUnspentTxid(th, &stFound, &be);
         if (stFound) return false;
     }
-    else if (txdb.ContainsTx(hash))
+    else if (s16_V2TxidKnown(hash))
         return false;
 
     // Check for conflicts with in-memory transactions
@@ -3677,91 +3674,10 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
     }
 
     {
-        // M4: in the armed V2 authoritative mode, run the WHOLE mempool accept
-        // against Store3A / TX-LOC / the pool overlay (no legacy txindex reads or
-        // fallback).  The legacy block below is otherwise byte-identical.
-        if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail && s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
-            return s16_V2MempoolAccept(txdb, tx, hash, pfMissingInputs, fOnlyCheckWithoutAdding);
-
-        MapPrevTx mapInputs;
-        //map<uint256, CTxIndex> mapUnused;
-		std::map<uint256, CTxIndex> mapUnused;
-        bool fInvalid = false;
-        int64_t nFees;
-        if (!tx.FetchInputs(txdb, mapUnused, false, false, mapInputs, fInvalid))
-        {
-            if (fInvalid)
-            {
-                if (fDebug)
-                    return error("CTxMemPool::accept() : FetchInputs found invalid tx %s", hash.ToString().substr(0,10).c_str());
-                else return false;
-            }
-
-            if (pfMissingInputs)
-                *pfMissingInputs = true;
-            return false;
-        }
-            // Check for non-standard pay-to-script-hash in inputs
-            if (!AreInputsStandard(tx, mapInputs) && !fTestNet)
-                return error("CTxMemPool::accept() : nonstandard transaction input");
-
-            nFees = tx.GetValueIn(mapInputs) - tx.GetValueOut();
-
-            GetMinFee_mode feeMode = GMF_RELAY;
-
-            // ANON (ring-signature) mechanism removed; reject any such tx unconditionally.
-            if (tx.nVersion == ANON_TXN_VERSION)
-                return error("CTxMemPool::accept() : ring signature transactions (ANON_TXN_VERSION) rejected (mechanism removed)");
-
-            // Note: if you modify this code to accept non-standard transactions, then
-            // you should add code here to check that the transaction does a
-            // reasonable number of ECDSA signature verifications.
-
-            unsigned int nSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
-            // Don't accept it if it can't get into a block
-
-            int64_t txMinFee = tx.GetMinFee(1000, feeMode, nSize);
-
-            if (nFees < txMinFee)
-            {
-                return error("CTxMemPool::accept() : not enough fees %s, %" PRId64" < %" PRId64,
-                             hash.ToString().c_str(),
-                             nFees, txMinFee);
-            };
-
-            // Continuously rate-limit free transactions
-            // This mitigates 'penny-flooding' -- sending thousands of free transactions just to
-            // be annoying or make others' transactions take longer to confirm.
-            if (nFees < MIN_RELAY_TX_FEE)
-            {
-                static CCriticalSection cs;
-                static double dFreeCount;
-                static int64_t nLastTime;
-                int64_t nNow = GetTime();
-
-                {
-                    LOCK(cs);
-                    // Use an exponentially decaying ~10-minute window:
-                    dFreeCount *= pow(1.0 - 1.0/600.0, (double)(nNow - nLastTime));
-                    nLastTime = nNow;
-                    // -limitfreerelay unit is thousand-bytes-per-minute
-                    // At default rate it would take over a month to fill 1GB
-                    if (dFreeCount > GetArg("-limitfreerelay", 15)*10*1000 && !IsFromMe(tx))
-                        return error("CTxMemPool::accept() : free transaction rejected by rate limiter");
-                    if (fDebug)
-                        printf("Rate limit dFreeCount: %g => %g\n", dFreeCount, dFreeCount+nSize);
-                    dFreeCount += nSize;
-                }
-            };
-
-            // Check against previous transactions
-            // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-            printf("CTxMemPool::accept() : calling ConnectInputs for %s\n", hash.ToString().substr(0,10).c_str());
-            if (!tx.ConnectInputs(txdb, mapInputs, mapUnused, CDiskTxPos(1,1,1), pindexBest, false, false))
-            {
-                return error("CTxMemPool::accept() : ConnectInputs failed %s", hash.ToString().substr(0,10).c_str());
-            };
-        };
+        // V2 authoritative: the whole accept runs against Store3A / TX-LOC /
+        // the pool overlay. There is no legacy txindex path.
+        return s16_V2MempoolAccept(tx, hash, pfMissingInputs, fOnlyCheckWithoutAdding);
+    }
 
     // Do not write to memory if read only mode.
     if(!fOnlyCheckWithoutAdding)
@@ -3788,9 +3704,9 @@ bool CTxMemPool::accept(CTxDB& txdb, CTransaction &tx, bool fCheckInputs,
     return true;
 }
 
-bool CTransaction::AcceptToMemoryPool(CTxDB& txdb,  bool fCheckInputs, bool* pfMissingInputs, bool fOnlyCheckWithoutAdding)
+bool CTransaction::AcceptToMemoryPool(bool fCheckInputs, bool* pfMissingInputs, bool fOnlyCheckWithoutAdding)
 {
-    return mempool.accept(txdb, *this, fCheckInputs, pfMissingInputs, fOnlyCheckWithoutAdding);
+    return mempool.accept(*this, fCheckInputs, pfMissingInputs, fOnlyCheckWithoutAdding);
 }
 
 bool AcceptableInputs(CTxMemPool& pool, const CTransaction &txo, bool fLimitFree,
@@ -3799,134 +3715,8 @@ bool AcceptableInputs(CTxMemPool& pool, const CTransaction &txo, bool fLimitFree
     AssertLockHeld(cs_main);
     if (pfMissingInputs)
         *pfMissingInputs = false;
-
     CTransaction tx(txo);
-
-    if (!tx.CheckTransaction())
-        return error("AcceptableInputs : CheckTransaction failed");
-
-    // Coinbase is only valid in a block, not as a loose transaction
-    if (tx.IsCoinBase())
-        return tx.DoS(100, error("AcceptableInputs : coinbase as individual tx"));
-
-    // ppcoin: coinstake is also only valid in a block, not as a loose transaction
-    if (tx.IsCoinStake())
-        return tx.DoS(100, error("AcceptableInputs : coinstake as individual tx"));
-
-    // Rather not work on nonstandard transactions (unless -testnet)
-    string reason;
-    if (false && !fTestNet && !IsStandardTx(tx, reason))
-        return error("AcceptableInputs : nonstandard transaction");
-
-    // is it already in the memory pool?
-    uint256 hash = tx.GetHash();
-    if (pool.exists(hash))
-        return false;
-
-    // Check for conflicts with in-memory transactions
-    {
-    LOCK(pool.cs); // protect pool.mapNextTx
-    for (unsigned int i = 0; i < tx.vin.size(); i++)
-    {
-        COutPoint outpoint = tx.vin[i].prevout;
-        if (pool.mapNextTx.count(outpoint))
-        {
-            // Disable replacement feature for now
-            return false;
-        }
-    }
-    }
-
-    {
-        // M6: armed-V2 collateral pre-check via Store3A + TX-LOC + pool overlay
-        // (no legacy txindex, no fallback). Non-V2 keeps the legacy slow path.
-        if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
-            s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
-            return s16_V2MempoolAcceptableInputs(tx, fLimitFree, pfMissingInputs);
-
-        CTxDB txdb("r");
-
-        // do we already have it?
-        if (txdb.ContainsTx(hash))
-            return false;
-
-        MapPrevTx mapInputs;
-        map<uint256, CTxIndex> mapUnused;
-        bool fInvalid = false;
-        if (!tx.FetchInputs(txdb, mapUnused, false, false, mapInputs, fInvalid))
-        {
-            if (fInvalid)
-                if (fDebugNet) return error("AcceptableInputs : FetchInputs found invalid tx %s", hash.ToString().substr(0,10).c_str());
-                return false;
-            if (pfMissingInputs)
-                *pfMissingInputs = true;
-            return false;
-        }
-
-        // Check for non-standard pay-to-script-hash in inputs
-        //if (!fTestNet() && !tx.AreInputsStandard(mapInputs))
-          //  return error("AcceptToMemoryPool : nonstandard transaction input");
-
-	    // Check that the transaction doesn't have an excessive number of
-        // sigops, making it impossible to mine. Since the coinbase transaction
-        // itself can contain sigops MAX_TX_SIGOPS is less than
-        // MAX_BLOCK_SIGOPS; we still consider this an invalid rather than
-        // merely non-standard transaction.
-	    unsigned int nSigOps = tx.GetLegacySigOpCount();
-	    nSigOps += tx.GetP2SHSigOpCount(mapInputs);
-        if (nSigOps > MAX_TX_SIGOPS)
-            return tx.DoS(0,
-                          error("AcceptToMemoryPool : too many sigops %s, %d > %d",
-                                hash.ToString().c_str(), nSigOps, MAX_TX_SIGOPS));
-
-        int64_t nFees = tx.GetValueIn(mapInputs)-tx.GetValueOut();
-        unsigned int nSize = ::GetSerializeSize(tx, SER_NETWORK, PROTOCOL_VERSION);
-
-        // Don't accept it if it can't get into a block
-        int64_t txMinFee = tx.GetMinFee(1000, GMF_RELAY, nSize);
-        if ((fLimitFree && nFees < txMinFee) || (!fLimitFree && nFees < MIN_TX_FEE))
-            return error("AcceptableInputs : not enough fees %s, %ld < %ld",
-                         hash.ToString().c_str(),
-                         nFees, txMinFee);
-
-        // Continuously rate-limit free transactions
-        // This mitigates 'penny-flooding' -- sending thousands of free transactions just to
-        // be annoying or make others' transactions take longer to confirm.
-        if (fLimitFree && nFees < MIN_RELAY_TX_FEE)
-        {
-            static CCriticalSection csFreeLimiter;
-            static double dFreeCount;
-            static int64_t nLastTime;
-            int64_t nNow = GetTime();
-
-            LOCK(csFreeLimiter);
-
-            // Use an exponentially decaying ~10-minute window:
-            dFreeCount *= pow(1.0 - 1.0/600.0, (double)(nNow - nLastTime));
-            nLastTime = nNow;
-            // -limitfreerelay unit is thousand-bytes-per-minute
-            // At default rate it would take over a month to fill 1GB
-            if (dFreeCount > GetArg("-limitfreerelay", 15)*10*1000)
-                return error("AcceptableInputs : free transaction rejected by rate limiter");
-            printf("mempool: Rate limit dFreeCount: %g => %g\n", dFreeCount, dFreeCount+nSize);
-            dFreeCount += nSize;
-        }
-
-        // Check against previous transactions
-        // This is done last to help prevent CPU exhaustion denial-of-service attacks.
-        if (!tx.ConnectInputs(txdb, mapInputs, mapUnused, CDiskTxPos(1,1,1), pindexBest, true, false, STANDARD_SCRIPT_VERIFY_FLAGS, false))
-        {
-            return error("AcceptableInputs : ConnectInputs failed %s", hash.ToString().c_str());
-        }
-    }
-
-	//Minimize debug spam
-    if (fDebug) {
-        printf("mempool: AcceptableInputs : accepted %s (poolsz %lu)\n",
-               hash.ToString().substr(0,10).c_str(),
-               pool.mapTx.size());
-    }
-    return true;
+    return s16_V2MempoolAcceptableInputs(tx, fLimitFree, pfMissingInputs);
 }
 
 int GetInputAge(CTxIn& vin, CBlockIndex* pindex)
@@ -4097,18 +3887,12 @@ int CMerkleTx::GetBlocksToMaturity() const
 }
 
 
-bool CMerkleTx::AcceptToMemoryPool(CTxDB& txdb)
-{
-    return CTransaction::AcceptToMemoryPool(txdb);
-}
-
 bool CMerkleTx::AcceptToMemoryPool()
 {
-    CTxDB txdb("r");
-    return AcceptToMemoryPool(txdb);
+    return CTransaction::AcceptToMemoryPool();
 }
 
-bool CWalletTx::AcceptWalletTransaction(CTxDB& txdb)
+bool CWalletTx::AcceptWalletTransaction()
 {
 
     {
@@ -4118,19 +3902,13 @@ bool CWalletTx::AcceptWalletTransaction(CTxDB& txdb)
             if (!(tx.IsCoinBase() || tx.IsCoinStake()))
             {
                 uint256 hash = tx.GetHash();
-                if (!mempool.exists(hash) && !s16_ContainsTxV2OrLegacy(hash, &txdb))
-                    tx.AcceptToMemoryPool(txdb);
+                if (!mempool.exists(hash) && !s16_TxidKnownV2(hash))
+                    tx.AcceptToMemoryPool();
             }
         }
-        return AcceptToMemoryPool(txdb);
+        return AcceptToMemoryPool();
     }
     return false;
-}
-
-bool CWalletTx::AcceptWalletTransaction()
-{
-    CTxDB txdb("r");
-    return AcceptWalletTransaction(txdb);
 }
 
 int CTxIndex::GetDepthInMainChain() const
@@ -4191,44 +3969,19 @@ bool GetTransaction(const uint256 &hash, CTransaction &tx, uint256 &hashBlock, b
                 hashBlock = block.GetHash();
             return true;
         }
-        CTxDB txdb("r");
-        CTxIndex txindex;
-        if (tx.ReadFromDisk(txdb, COutPoint(hash, 0), txindex))
-        {
-            CBlock block;
-            if (block.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
-                hashBlock = block.GetHash();
-            return true;
-        }
     }
     return false;
 }
 
-bool TxnHashInSystem(CTxDB* ptxdb, uint256& txnHash)
+bool TxnHashInSystem(uint256& txnHash)
 {
-    // -- is the transaction hash known in the system
-
     AssertLockHeld(cs_main);
-
-    // TODO: thin mode
 
     if (mempool.exists(txnHash))
         return true;
 
-    // M4: V2 — presence via TX-LOC/Store3A (no legacy txindex). A txid with a
-    // historical location or an unspent output is "in the system".
-    if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
-        s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
-        return s16_V2TxidKnown(txnHash);
-
-    CTxIndex txnIndex;
-    if (ptxdb->ReadTxIndex(txnHash, txnIndex))
-    {
-        if (txnIndex.GetDepthInMainChain() > 0)
-            return true;
-    };
-
-    return false;
+    // V2 presence: TX-LOC historical location or an unspent Store3A output.
+    return s16_V2TxidKnown(txnHash);
 };
 
 //////////////////////////////////////////////////////////////////////////////
@@ -5298,7 +5051,6 @@ void static InvalidChainFound(CBlockIndex* pindexNew)
     if (pindexNew->nChainTrust > nBestInvalidTrust)
     {
         nBestInvalidTrust = pindexNew->nChainTrust;
-        CTxDB().WriteBestInvalidTrust(CBigNum(nBestInvalidTrust));
         if (pindexBest)
         {
             static int64_t nLastInvalidChainNotify = 0;
@@ -5366,7 +5118,7 @@ void Misbehaving(NodeId pnode, int howmuch)
 }
 
 
-bool CTransaction::FetchInputs(CTxDB& txdb, const map<uint256, CTxIndex>& mapTestPool,
+bool CTransaction::FetchInputs(const map<uint256, CTxIndex>& mapTestPool,
                                bool fBlock, bool fMiner, MapPrevTx& inputsRet, bool& fInvalid)
 {
     // FetchInputs can return false either because we just haven't seen some inputs
@@ -5395,7 +5147,7 @@ bool CTransaction::FetchInputs(CTxDB& txdb, const map<uint256, CTxIndex>& mapTes
         else
         {
             // Read txindex from txdb
-            fFound = txdb.ReadTxIndex(prevout.hash, txindex);
+            fFound = s16_V2ReadTxIndex(prevout.hash, txindex);
         }
         if (!fFound && (fBlock || fMiner))
             return fMiner ? false : error("FetchInputs() : %s prev tx %s index entry not found", GetHash().ToString().substr(0,10).c_str(),  prevout.hash.ToString().substr(0,10).c_str());
@@ -5508,12 +5260,27 @@ unsigned int CTransaction::GetP2SHSigOpCount(const MapPrevTx& inputs) const
 // zero or the spending block's own time -- that would change coin-age semantics).
 static bool s16_V2PrevBlockTime(int32_t coinHeight, int64_t* outTime)
 {
-    const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
-    if (reader && reader->IsOpen())
+    // S2.0-S5-2640: resolve the coin's creation-block time against the FULL
+    // authoritative domain (immutable base generation FIRST, then the retained
+    // authoritative live tail) -- the same composite by-height resolver the
+    // kernel coinstake path already uses (kernel.cpp AuthoritativeGetActiveSnapshotByHeightR).
+    // The base-generation-ONLY cold reader cannot see any height above its
+    // committedTipHeight (on a fresh P2 store that is genesis, h=0), so it
+    // returns NOT_FOUND for every coin created in the live chain. The resident
+    // pprev walk is NOT a sufficient fallback: RetireBlockIndexBelowFloor
+    // detaches pprev below floor = tip - horizon + 1 (-blockindexlivetail,
+    // default 2048), so a coin created below that floor (e.g. h=522 at tip
+    // 2639 => floor 592) is unreachable and the whole block is wrongly
+    // rejected with "unable to get coin age for coinstake". This is a
+    // READ-PATH defect only: no consensus rule, no PoS check and no legacy
+    // txindex is involved. Fail-closed is preserved -- a genuine miss across
+    // BOTH authoritative sources still returns false.
     {
         BlockIndexSnapshot snap;
         std::string err;
-        if (reader->GetActiveByHeight((int)coinHeight, &snap, &err) == BLOCK_INDEX_V2_READ_FOUND)
+        const AuthoritativeBlockResolutionResult res =
+            AuthoritativeGetActiveSnapshotByHeightR((int)coinHeight, &snap, &err);
+        if (res == AUTHORITATIVE_BLOCK_FOUND && snap.found && snap.height == (int)coinHeight)
         {
             *outTime = (int64_t)snap.nTime;
             return true;
@@ -5777,7 +5544,7 @@ static int s16_V2MempoolCheckInputs(s16_V2InputView* view, const CTransaction& t
 // success adds to the pool.  NO legacy txindex read or fallback.  Active-chain
 // heights/maturity come from Store3A coins + pindexBest (BI-V2-backed).
 // ---------------------------------------------------------------------------
-static bool s16_V2MempoolAccept(CTxDB& txdb, CTransaction& tx, uint256& hash,
+static bool s16_V2MempoolAccept(CTransaction& tx, uint256& hash,
                                 bool* pfMissingInputs, bool fOnlyCheckWithoutAdding)
 {
     std::map<uint256, CTxIndex> mapUnused;
@@ -5823,7 +5590,7 @@ static bool s16_V2MempoolAccept(CTxDB& txdb, CTransaction& tx, uint256& hash,
     }
 
     // Consensus input validation — Store3A-authoritative transparent path (V2).
-    if (!tx.ConnectInputs(txdb, mapInputs, mapUnused, CDiskTxPos(1,1,1), pindexBest,
+    if (!tx.ConnectInputs(mapInputs, mapUnused, CDiskTxPos(1,1,1), pindexBest,
                           false, false, STANDARD_SCRIPT_VERIFY_FLAGS, true, &v2View))
         return error("CTxMemPool::accept() : ConnectInputs failed %s (V2 Store3A)", hash.ToString().substr(0,10).c_str());
 
@@ -5878,14 +5645,13 @@ static bool s16_V2MempoolAcceptableInputs(CTransaction& tx, bool fLimitFree,
         dFreeCount += nSize;
     }
 
-    CTxDB txdb;
-    if (!tx.ConnectInputs(txdb, mapInputs, mapUnused, CDiskTxPos(1,1,1), pindexBest,
+    if (!tx.ConnectInputs(mapInputs, mapUnused, CDiskTxPos(1,1,1), pindexBest,
                           true, false, STANDARD_SCRIPT_VERIFY_FLAGS, false, &v2View))
         return error("AcceptableInputs : ConnectInputs failed %s (V2 Store3A)", tx.GetHash().ToString().c_str());
     return true;
 }
 
-bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTxIndex>& mapTestPool, const CDiskTxPos& posThisTx,
+bool CTransaction::ConnectInputs(MapPrevTx inputs, map<uint256, CTxIndex>& mapTestPool, const CDiskTxPos& posThisTx,
     const CBlockIndex* pindexBlock, bool fBlock, bool fMiner, unsigned int flags, bool fValidateSig, s16_V2InputView* v2View /* = NULL */)
 {
     // S2.0-M2b: the V2 (Store3A-authoritative) transparent-input path.
@@ -6169,7 +5935,7 @@ bool CTransaction::ConnectInputs(CTxDB& txdb, MapPrevTx inputs, map<uint256, CTx
     return true;
 }
 
-bool CBlock::DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex)
+bool CBlock::DisconnectBlock(CBlockIndex* pindex)
 {
     // S2.0-M3: Store3A-authoritative undo disconnect (V2 mode). ConnectBlock's
     // Store3A publish recorded this block's ordered undo; disconnecting here
@@ -6241,78 +6007,9 @@ bool static BuildAddrIndex(const CScript &script, std::vector<uint160>& addrIds)
     }
 }
 
-bool FindTransactionsByDestination(const CTxDestination &dest, std::vector<uint256> &vtxhash) {
-    uint160 addrid = 0;
-    const CKeyID *pkeyid = boost::get<CKeyID>(&dest);
-    if (pkeyid)
-        addrid = static_cast<uint160>(*pkeyid);
-    if (!addrid) {
-        const CScriptID *pscriptid = boost::get<CScriptID>(&dest);
-        if (pscriptid)
-            addrid = static_cast<uint160>(*pscriptid);
-    }
-    if (!addrid)
-    {
-        printf("FindTransactionsByDestination(): Couldn't parse dest into addrid\n");
-        return false;
-    }
-
-    LOCK(cs_main);
-    CTxDB txdb("r");
-    if(!txdb.ReadAddrIndex(addrid, vtxhash))
-    {
-	printf("FindTransactionsByDestination(): txdb.ReadAddrIndex failed\n");
-	return false;
-    }
-    return true;
-}
-
-void CBlock::RebuildAddressIndex(CTxDB& txdb)
-{
-    for (CTransaction& tx : vtx)
-    {
-        uint256 hashTx = tx.GetHash();
-	// inputs
-	if(!tx.IsCoinBase())
-	{
-            MapPrevTx mapInputs;
-	    map<uint256, CTxIndex> mapQueuedChangesT;
-	    bool fInvalid;
-            if (!tx.FetchInputs(txdb, mapQueuedChangesT, true, false, mapInputs, fInvalid))
-                return;
-
-	    MapPrevTx::const_iterator mi;
-	    for(MapPrevTx::const_iterator mi = mapInputs.begin(); mi != mapInputs.end(); ++mi)
-	    {
-		    for (const CTxOut &atxout : (*mi).second.second.vout)
-		    {
-			std::vector<uint160> addrIds;
-			if(BuildAddrIndex(atxout.scriptPubKey, addrIds))
-			{
-                    for (uint160 addrId : addrIds)
-		            {
-			            if(!txdb.WriteAddrIndex(addrId, hashTx))
-				            printf("RebuildAddressIndex(): txins WriteAddrIndex failed addrId: %s txhash: %s\n", addrId.ToString().c_str(), hashTx.ToString().c_str());
-                    }
-			}
-		    }
-	    }
-
-        }
-	// outputs
-	for (const CTxOut &atxout : tx.vout) {
-	    std::vector<uint160> addrIds;
-        if(BuildAddrIndex(atxout.scriptPubKey, addrIds))
-	    {
-		for (uint160 addrId : addrIds)
-		{
-		    if(!txdb.WriteAddrIndex(addrId, hashTx))
-		        printf("RebuildAddressIndex(): txouts WriteAddrIndex failed addrId: %s txhash: %s\n", addrId.ToString().c_str(), hashTx.ToString().c_str());
-        }
-	    }
-	}
-    }
-}
+// The legacy address index (address -> txids) was stored in the retired
+// transaction database and has no V2 counterpart: TX-LOC maps txid -> on-disk
+// position only. The feature is removed rather than emulated (no second path).
 
 static int64_t nTimeVerify = 0;
 static int64_t nTimeConnect = 0;
@@ -6473,31 +6170,8 @@ namespace s16 { ChainObserveState g_chainObserve; }
 
 // S2.0 BI-V2 authoritative startup: legacy-index-open guard state (see
 // observe_hook.h). Armed only when -s16openstore is requested, by
-// ArmV2LegacyIndexGuardIfRequested(). Non-V2 sessions leave it disarmed, so
 // legacy opens are unaffected. All guard declarations live in namespace s16
 // (observe_hook.h); these are the single definitions.
-namespace s16 {
-bool g_V2LegacyIndexGuardArmed = false;
-int  g_V2LegacyIndexProbeDepth = 0;
-// P2 (S4): set TRUE whenever V2 store mode (-s16openstore) is requested, and NEVER
-// disarmed. Gate that makes legacy CTxDB construction inert in V2 store mode: the
-// transaction/block index must come exclusively from Store3A/TX-LOC/BI-V2, so no
-// legacy txleveldb open/create/read/write may occur at any point in V2 runtime.
-// Distinct from the startup-window guard (g_V2LegacyIndexGuardArmed) which is
-// released after block-index startup; the inert gate persists for the process.
-bool g_V2LegacyIndexInert = false;
-}
-
-void s16::ArmV2LegacyIndexGuardIfRequested()
-{
-    g_V2LegacyIndexGuardArmed = !GetArg("-s16openstore", "").empty();
-    g_V2LegacyIndexInert = (g_V2LegacyIndexGuardArmed || !GetArg("-s16openstore", "").empty());
-    if (g_V2LegacyIndexGuardArmed)
-        printf("S2.0 BI-V2 authoritative startup: legacy LevelDB index-open guard ARMED (refusing legacy txleveldb opens; block index from Block Index V2 only)\n");
-    if (g_V2LegacyIndexInert)
-        printf("P2 (S4): legacy CTxDB made V2-INERT (txleveldb open/create/read/write disabled in V2 store mode; store/routing via Store3A+TX-LOC+BI-V2)\n");
-}
-
 static void s16_ObserveConnectBlock(const CBlock& blk,
                                     const std::map<uint256,CTxIndex>& mqc,
                                     const CBlockIndex* pindex,
@@ -6720,7 +6394,7 @@ static inline bool s16_V2Armed()
            s16::g_chainObserve.store && s16::g_chainObserve.store->opened();
 }
 
-bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
+bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
 {
     ibdactivepath::ActivePathTimer ibdConnectTimer(
         ibdactivepath::GetCounters().connectblock_us_total,
@@ -6838,15 +6512,6 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             if (found)
                 return false;   // txid already present with an unspent output in Store3A (BIP30)
         }
-        else
-        {
-            CTxIndex txindexOld;
-            if (txdb.ReadTxIndex(hashTx, txindexOld)) {
-                for (CDiskTxPos &pos : txindexOld.vSpent)
-                    if (pos.IsNull())
-                        return false;
-            }
-        }
 
         nSigOps += tx.GetLegacySigOpCount();
         if (nSigOps > MAX_BLOCK_SIGOPS)
@@ -6882,7 +6547,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
                     return error("ConnectBlock() : V2 Store3A cannot supply prevout data for %s (no legacy fallback)",
                                  tx.GetHash().ToString().substr(0,10).c_str());
             }
-            else if (!tx.FetchInputs(txdb, mapQueuedChanges, true, false, mapInputs, fInvalid))
+            else if (!tx.FetchInputs(mapQueuedChanges, true, false, mapInputs, fInvalid))
                 return false;
 
             // Add in sigops done by pay-to-script-hash inputs;
@@ -6912,7 +6577,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             if (tx.IsCoinStake())
                 nStakeReward = nTxValueOut - nTxValueIn;
 
-            if (!tx.ConnectInputs(txdb, mapInputs, mapQueuedChanges, posThisTx, pindex, true, false, flags, true,
+            if (!tx.ConnectInputs(mapInputs, mapQueuedChanges, posThisTx, pindex, true, false, flags, true,
                                   (v2View.armed() ? &v2View : NULL)))
                 return false;
 
@@ -6983,7 +6648,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
             // S2.0-M2-c: V2 sources coin-age per-input value/nTime from Store3A coins and the
             // prev block header time by value (s16_V2PrevBlockTime) -- zero legacy txindex.
             bool fCoinAgeOk = v2View.armed() ? v2View.v2CoinAge(vtx[1], nCoinAge)
-                                              : vtx[1].GetCoinAge(txdb, nCoinAge);
+                                              : vtx[1].GetCoinAge(nCoinAge);
             if (!fCoinAgeOk)
                 return error("ConnectBlock() : %s unable to get coin age for coinstake", vtx[1].GetHash().ToString().substr(0,10).c_str());
 
@@ -7015,7 +6680,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
                                  coinstake.GetHash().ToString().substr(0,10).c_str());
             }
             else
-                fColdInputsOk = coinstake.FetchInputs(txdb, mapQueuedChanges, true, false, mapColdInputs, fInvalid);
+                fColdInputsOk = coinstake.FetchInputs(mapQueuedChanges, true, false, mapColdInputs, fInvalid);
             if (fColdInputsOk)
             {
                 for (unsigned int j = 0; j < coinstake.vin.size(); j++)
@@ -7179,7 +6844,7 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
                 uint64_t nCoinAge;
                 // S2.0-M2-c: V2 sources coin-age from Store3A coins + by-value prev block time.
                 bool fCNCoinAgeOk = v2View.armed() ? v2View.v2CoinAge(vtx[1], nCoinAge)
-                                                    : vtx[1].GetCoinAge(txdb, nCoinAge);
+                                                    : vtx[1].GetCoinAge(nCoinAge);
                 if (!fCNCoinAgeOk)
                     return error("CheckBlock-POS : %s unable to get coin age for coinstake, Can't Calculate Collateralnode Reward\n", vtx[1].GetHash().ToString().substr(0,10).c_str());
                 int64_t nCalculatedStakeReward = GetProofOfStakeReward(nCoinAge, nFees);
@@ -7546,59 +7211,8 @@ bool CBlock::ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck)
 
     // M8.1b: the legacy txindex queue write is removed — armed-V2 Store3A owns the
     // UTXO and TX-LOC the historical location. No txleveldb write happens here.
-    if(GetBoolArg("-addrindex", false))
-    {
-        // Write Address Index
-        for (CTransaction& tx : vtx)
-        {
-            uint256 hashTx = tx.GetHash();
-        // inputs
-        // S2.0-M2-c: in the armed V2 path the input-side -addrindex population is SKIPPED
-        // (no legacy FetchInputs / txindex read). The Store3A coin view exposes only the spent
-        // output's script, not the prev tx's full output set, so the auxiliary address index
-        // (non-consensus, -addrindex opt-in) is not populated for inputs in V2; the output-side
-        // index below is unchanged.
-        if(!tx.IsCoinBase() && !v2View.armed())
-        {
-                MapPrevTx mapInputs;
-            map<uint256, CTxIndex> mapQueuedChangesT;
-            bool fInvalid;
-                if (!tx.FetchInputs(txdb, mapQueuedChangesT, true, false, mapInputs, fInvalid))
-                    return false;
-
-            MapPrevTx::const_iterator mi;
-            for(MapPrevTx::const_iterator mi = mapInputs.begin(); mi != mapInputs.end(); ++mi)
-            {
-                for (const CTxOut &atxout : (*mi).second.second.vout)
-                {
-                std::vector<uint160> addrIds;
-                if(BuildAddrIndex(atxout.scriptPubKey, addrIds))
-                {
-                        for (uint160 addrId : addrIds)
-                        {
-                        if(!txdb.WriteAddrIndex(addrId, hashTx))
-                            printf("ConnectBlock(): txins WriteAddrIndex failed addrId: %s txhash: %s\n", addrId.ToString().c_str(), hashTx.ToString().c_str());
-                        }
-                }
-                }
-            }
-
-            }
-
-        // outputs
-        for (const CTxOut &atxout : tx.vout) {
-            std::vector<uint160> addrIds;
-                if(BuildAddrIndex(atxout.scriptPubKey, addrIds))
-            {
-            for (uint160 addrId : addrIds)
-            {
-                if(!txdb.WriteAddrIndex(addrId, hashTx))
-                    printf("ConnectBlock(): txouts WriteAddrIndex failed addrId: %s txhash: %s\n", addrId.ToString().c_str(), hashTx.ToString().c_str());
-                    }
-            }
-        }
-        }
-    }
+    // The opt-in -addrindex auxiliary index lived in the retired transaction
+    // database; it has no V2 home and is not populated.
 
     // M8.1b: the legacy block-index write is removed — armed-V2 BI-V2 owns the index.
 
@@ -7725,7 +7339,7 @@ static bool C12ResolveParentByValue(BlockIndexAuthoritativeLive* live,
     return true;
 }
 
-bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew, bool* pfNavigationFailure)
+bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
 {
     // C12 (operator requirement H): distinguish an infrastructure/navigation failure
     // (sparse-hot/by-value ancestry not resolvable, or a fork below the representable
@@ -7899,7 +7513,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew, bool* pfNavigationFa
                     {
                         return error("Reorganize() : ReadFromDisk for disconnect failed");
                     }
-                    if (!block.DisconnectBlock(txdb, pindex))
+                    if (!block.DisconnectBlock(pindex))
                     {
                         return error("Reorganize() : DisconnectBlock %s failed", pindex->GetBlockHash().ToString().substr(0,20).c_str());
                     }
@@ -7925,7 +7539,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew, bool* pfNavigationFa
 
         if (!IsInitialBlockDownload()) GetCollateralnodeRanks(pindex); // recalculate ranks for the this block hash if required
 
-        if (!block.ConnectBlock(txdb, pindex))
+        if (!block.ConnectBlock(pindex))
         {
             // Invalid block
             return error("Reorganize() : ConnectBlock %s failed", pindex->GetBlockHash().ToString().substr(0,20).c_str());
@@ -7935,16 +7549,8 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew, bool* pfNavigationFa
         for (const CTransaction& tx : block.vtx)
             vDelete.push_back(tx);
     }
-    if (!txdb.WriteHashBestChain(pindexNew->GetBlockHash()))
-    {
-        return error("Reorganize() : WriteHashBestChain failed");
-    }
-
-    // Make sure it's successfully written to disk before changing memory structure
-    if (!txdb.TxnCommit())
-    {
-        return error("Reorganize() : TxnCommit failed");
-    }
+    // BI-V2 owns the published tip and Store3A committed each connected block
+    // atomically inside ConnectBlock; nothing separate to persist here.
 
     // Clear setStakeSeen so disconnected stakes don't block the new branch
     for (CBlockIndex* pindex : vDisconnect)
@@ -7975,7 +7581,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew, bool* pfNavigationFa
     // Resurrect memory transactions
     for (CTransaction& tx : vResurrect)
     {
-        tx.AcceptToMemoryPool(txdb);
+        tx.AcceptToMemoryPool();
     }
 
     // Delete redundant memory transactions that are in the connected branch
@@ -7993,7 +7599,7 @@ bool static Reorganize(CTxDB& txdb, CBlockIndex* pindexNew, bool* pfNavigationFa
 
 
 // Called from inside SetBestChain: attaches a block to the new best chain being built
-bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
+bool CBlock::SetBestChainInner(CBlockIndex *pindexNew)
 {
     uint256 hash = GetHash();
 
@@ -8010,21 +7616,20 @@ bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
                          pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
     }
 
-    // Adding to current best branch
-    if (!ConnectBlock(txdb, pindexNew) || !txdb.WriteHashBestChain(hash))
-    {
-        txdb.TxnAbort();
-        InvalidChainFound(pindexNew);
-        return false;
-    }
+    // Adding to current best branch. Store3A commits the block's chainstate
+    // atomically inside ConnectBlock; BI-V2 owns the tip, so there is no
+    // separate best-chain write and no transaction to commit here.
     {
         ibdactivepath::ActivePathTimer ibdChainStateCommitTimer(
             ibdactivepath::GetCounters().chainstate_commit_us_total,
             ibdactivepath::GetCounters().chainstate_commit_us_max,
             ibdactivepath::GetCounters().chainstate_commit_count,
             "chainstate_commit", pindexNew->nHeight);
-        if (!txdb.TxnCommit())
-            return error("SetBestChain() : TxnCommit failed");
+        if (!ConnectBlock(pindexNew))
+        {
+            InvalidChainFound(pindexNew);
+            return false;
+        }
     }
 
     if (pindexNew->pprev)
@@ -8038,7 +7643,7 @@ bool CBlock::SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew)
     return true;
 }
 
-bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
+bool CBlock::SetBestChain(CBlockIndex* pindexNew)
 {
     ibdactivepath::ActivePathTimer ibdSetBestChainTimer(
         ibdactivepath::GetCounters().setbestchain_us_total,
@@ -8064,19 +7669,13 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
     const uint256 hashOldBest = hashBestChain;
     const int nOldBestHeight = nBestHeight;
     const bool fReorgPath = (hashPrevBlock != hashOldBest);
-    if (!txdb.TxnBegin())
-        return error("SetBestChain() : TxnBegin failed");
-
     if (pindexGenesisBlock == NULL && hash == GetGenesisBlockHash())
     {
-        txdb.WriteHashBestChain(hash);
-        if (!txdb.TxnCommit())
-            return error("SetBestChain() : TxnCommit failed");
         pindexGenesisBlock = pindexNew;
     }
     else if (hashPrevBlock == hashBestChain)
     {
-        if (!SetBestChainInner(txdb, pindexNew))
+        if (!SetBestChainInner(pindexNew))
             return error("SetBestChain() : SetBestChainInner failed");
     }
     else
@@ -8103,36 +7702,12 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
 
         // Switch to new best branch
         bool fReorgNavFailure = false;
-        if (!Reorganize(txdb, pindexIntermediate, &fReorgNavFailure))
+        if (!Reorganize(pindexIntermediate, &fReorgNavFailure))
         {
-            txdb.TxnAbort();
             if (fReorgNavFailure)
                 return error("SetBestChain() : Reorganize could not navigate the V2 sparse-hot/by-value ancestry; the candidate is NOT marked consensus-invalid");
             InvalidChainFound(pindexNew);
             return error("SetBestChain() : Reorganize failed");
-        }
-
-        // S12 test-only lifetime identity probe: after Reorganize (whose root
-        // delta commit may have delivered to the runtime consumer and closed
-        // the shared handle), record whether THIS txdb's pdb is now stale.
-        if (g_testS12LifetimeProbe)
-        {
-            g_testS12SeenTxdbAddr = (void*)&txdb;
-            g_testS12SeenPdb = (void*)txdb.GetInstance();
-            g_testS12SeenGlobal = GetGlobalTxdbPtrForTest();
-            g_testS12SeenPdbWasClosed =
-                (g_testS12SeenPdb != NULL && g_testS12SeenPdb == g_testTxdbLastClosedPtr);
-            g_testS12SeenCloseCount = g_testTxdbCloseCount;
-            g_testS12SeenOpenCount = g_testTxdbOpenCount;
-            g_testS12SeenDeliveredEvents = 0;
-            fprintf(stderr,
-                "S12_LIFETIME_SEAM postponed=%d txdb=%p pdb=%p global=%p pdb_was_closed=%d"
-                " close_count=%d open_count=%d delivered=%d last_kind=%d last_origin=%d\n",
-                g_testS12LastPostponed, g_testS12SeenTxdbAddr, g_testS12SeenPdb,
-                g_testS12SeenGlobal, (int)g_testS12SeenPdbWasClosed,
-                g_testS12SeenCloseCount, g_testS12SeenOpenCount,
-                g_testS12SeenDeliveredEvents, 0,
-                0);
         }
 
         // Connect further blocks
@@ -8144,12 +7719,8 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
                 printf("SetBestChain() : ReadFromDisk failed\n");
                 break;
             }
-            if (!txdb.TxnBegin()) {
-                printf("SetBestChain() : TxnBegin 2 failed\n");
-                break;
-            }
             // errors now are not fatal, we still did a reorganisation to a new chain in a valid way
-            if (!block.SetBestChainInner(txdb, pindex))
+            if (!block.SetBestChainInner(pindex))
                 break;
         }
 
@@ -8240,7 +7811,7 @@ bool CBlock::SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew)
 // guaranteed to be in main chain by sync-checkpoint. This rule is
 // introduced to help nodes establish a consistent view of the coin
 // age (trust score) of competing branches.
-bool CTransaction::GetCoinAge(CTxDB& txdb, uint64_t& nCoinAge) const
+bool CTransaction::GetCoinAge(uint64_t& nCoinAge) const
 {
     CBigNum bnCentSecond = 0;  // coin age in the unit of cent-seconds
     nCoinAge = 0;
@@ -8253,7 +7824,7 @@ bool CTransaction::GetCoinAge(CTxDB& txdb, uint64_t& nCoinAge) const
         // First try finding the previous transaction in database
         CTransaction txPrev;
         CTxIndex txindex;
-        if (!txPrev.ReadFromDisk(txdb, txin.prevout, txindex))
+        if (!txPrev.ReadFromDisk(txin.prevout, txindex))
             continue;  // previous transaction not in main chain
         if (nTime < txPrev.nTime)
             return false;  // Transaction timestamp violation
@@ -8288,11 +7859,10 @@ bool CBlock::GetCoinAge(uint64_t& nCoinAge) const
 {
     nCoinAge = 0;
 
-    CTxDB txdb("r");
     for (const CTransaction& tx : vtx)
     {
         uint64_t nTxCoinAge;
-        if (tx.GetCoinAge(txdb, nTxCoinAge))
+        if (tx.GetCoinAge(nTxCoinAge))
             nCoinAge += nTxCoinAge;
         else
             return false;
@@ -8476,8 +8046,7 @@ bool AuthoritativeSyncCheckpointSwitchChainByValue(const uint256& hashCheckpoint
                                         hashCheckpoint.ToString().c_str());
         return false;
     }
-    CTxDB txdb;
-    if (!block.SetBestChain(txdb, pindexCheckpoint))
+    if (!block.SetBestChain(pindexCheckpoint))
     {
         if (outErr) *outErr = strprintf("authoritative sync-checkpoint switch: SetBestChain failed for sync checkpoint %s",
                                        hashCheckpoint.ToString().c_str());
@@ -8700,11 +8269,6 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     // itself now happens after every use of the retained topology.
     const int nAcceptFloorTipHeight = nBestHeight;
 
-    // M8.1b: the legacy block-index write transaction is removed — armed-V2 BI-V2 owns
-    // the block index on the AddToBlockIndex append. `txdb` remains for the SetBestChain
-    // call below (which opens its own transaction).
-    CTxDB txdb;
-
     // R2c.2s/S5: root-scoped owned transaction preview (NULL in legacy mode).
     // S3 rollback coherence (authoritative): durable pre-operation score-certificate
     // state captured before the ADD's source batch opens, so a failed SetBestChain
@@ -8738,7 +8302,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     if (pindexNew->nChainTrust > nBestChainTrust)
     {
         CSyncLockPhase phase("ProcessMessage(block)", "set_best_chain");
-        if (!SetBestChain(txdb, pindexNew))
+        if (!SetBestChain(pindexNew))
         {
             // M8.1b: the legacy block-index erase is removed — armed-V2 BI-V2 owns the index.
             mapBlockIndex.erase(hash);
@@ -9464,7 +9028,7 @@ bool CBlockIndex::IsSuperMajority(int minVersion, const CBlockIndex* pstart, uns
 //  * setInvalidBlockHash holds ONLY explicitly invalidated hashes. A block is
 //    treated as invalid if it or any ancestor is in the set, so descendants of
 //    an entry are implicitly invalid.
-//  * The set is persisted (txdb, both backends) BEFORE any active-chain
+//  * The set is persisted (both backends) BEFORE any active-chain
 //    rollback. If a crash separates the two, startup re-runs the rollback (see
 //    RecoverFromInvalidatedBestChain) so the database never settles with an
 //    active tip descending from an operator-invalidated block.
@@ -9553,11 +9117,25 @@ BlockIndexOperatorInvalidResult IsBlockOperatorInvalidTyped(const CBlockIndex* p
 
 static bool PersistInvalidBlockSet()
 {
-    CTxDB txdb;
-    if (!txdb.TxnBegin())
+    // V2 tip authority owns the durable operator-invalid log (tip-invalid.dat,
+    // committed by tip.meta). Apply the in-memory set as intents so both
+    // invalidate and reconsider survive restart.
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (!live || !live->IsOpen())
         return false;
-    txdb.WriteInvalidBlockSet(setInvalidBlockHash);
-    return txdb.TxnCommit();
+    BlockIndexTipAuthority* tip = live->TipAuthorityMutable();
+    if (!tip)
+        return false;
+    const std::set<uint256> current = tip->OperatorInvalidSet();
+    std::string err;
+    for (const std::set<uint256>::const_iterator it = setInvalidBlockHash.begin();
+         it != setInvalidBlockHash.end(); ++it)
+        if (!current.count(*it) && tip->SetOperatorInvalid(*it, true, &err) != BLOCK_INDEX_TIP_OK)
+            return false;
+    for (const std::set<uint256>::const_iterator it = current.begin(); it != current.end(); ++it)
+        if (!setInvalidBlockHash.count(*it) && tip->SetOperatorInvalid(*it, false, &err) != BLOCK_INDEX_TIP_OK)
+            return false;
+    return true;
 }
 
 // -----------------------------------------------------------------------------
@@ -9570,18 +9148,11 @@ static bool PersistInvalidBlockSet()
 // never override valid V2 authority, and this path never reopens legacy
 // read-open/create behavior (PM1-P0-07 stays out of scope).
 // -----------------------------------------------------------------------------
-bool ReconcileLegacyCompatibilityMirror(std::string& strError)
+bool ReconcileOperatorInvalidSetFromV2(std::string& strError)
 {
-    // S2.0 BI-V2 authoritative startup: in V2 store mode the legacy LevelDB
-    // must NOT be opened even for reading (and this mirror WRITES it). The
-    // R3 legacy compatibility mirror is a legacy-view helper that V2 store
-    // startup explicitly does not maintain — the Store3A/BI-V2 authority needs
-    // no legacy mirror. Fail-closed policy: never open legacy; return success
-    // trivially (V2 is self-consistent). Non-V2 behavior is unchanged.
-    if (s16::V2LegacyIndexGuardActive())
-        return true;
-    if (!g_fAuthoritativeStartup)
-        return true; // legacy mode: legacy is the authority; nothing to reconcile
+    // V2 tip authority is the single durable owner of the operator-invalid
+    // set; mirror it into the in-memory set at startup. There is no legacy view.
+    (void)strError;
     BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
     if (!live || !live->IsOpen())
         return true;
@@ -9590,48 +9161,8 @@ bool ReconcileLegacyCompatibilityMirror(std::string& strError)
         return true;
     const BlockIndexTipRead t = tip->GetTip();
     if (t.status != BLOCK_INDEX_TIP_OK)
-        return true; // no committed post-S tip yet: nothing to mirror
-
-    uint256 legacyBest(0);
-    {
-        CTxDB txdb;
-        txdb.ReadHashBestChain(legacyBest);
-    }
-    const std::set<uint256> v2Invalid = tip->OperatorInvalidSet();
-    const bool invalidMirrorChanged = (v2Invalid != setInvalidBlockHash);
-    const bool bestMirrorChanged = (legacyBest != t.record.hash);
-
-    if (!bestMirrorChanged && !invalidMirrorChanged)
-        return true; // mirror already agrees with V2 authority
-
-    CTxDB txdb;
-    if (!txdb.TxnBegin())
-    {
-        strError = "legacy mirror reconciliation: TxnBegin failed";
-        return false;
-    }
-    if (bestMirrorChanged && !txdb.WriteHashBestChain(t.record.hash))
-    {
-        txdb.TxnAbort();
-        strError = "legacy mirror reconciliation: WriteHashBestChain failed";
-        return false;
-    }
-    if (invalidMirrorChanged)
-        txdb.WriteInvalidBlockSet(v2Invalid);
-    if (!txdb.TxnCommit())
-    {
-        strError = "legacy mirror reconciliation: TxnCommit failed";
-        return false;
-    }
-
-    if (bestMirrorChanged)
-    {
-        printf("BLOCKINDEX_V2_R3_RECONCILE legacy hashBestChain %s -> V2 tip %s (mirror was stale)\n",
-               legacyBest.ToString().substr(0, 20).c_str(), t.record.hash.ToString().substr(0, 20).c_str());
-        hashBestChain = t.record.hash;
-    }
-    if (invalidMirrorChanged)
-        setInvalidBlockHash = v2Invalid;
+        return true;
+    setInvalidBlockHash = tip->OperatorInvalidSet();
     return true;
 }
 
@@ -9659,8 +9190,7 @@ static bool RollbackActiveChainTo(CBlockIndex* pindexTarget)
     CBlock block;
     if (!block.ReadFromDisk(pindexTarget))
         return error("RollbackActiveChainTo() : ReadFromDisk failed");
-    CTxDB txdb;
-    if (!block.SetBestChain(txdb, pindexTarget))
+    if (!block.SetBestChain(pindexTarget))
         return error("RollbackActiveChainTo() : SetBestChain failed");
     return true;
 }
@@ -9712,8 +9242,7 @@ static bool ActivateBestEligibleChain()
     CBlock block;
     if (!block.ReadFromDisk(pindexCandidate))
         return true;
-    CTxDB txdb;
-    if (!block.SetBestChain(txdb, pindexCandidate))
+    if (!block.SetBestChain(pindexCandidate))
         return error("ActivateBestEligibleChain() : SetBestChain failed");
 
     ShadowCompareCandidateSelection();
@@ -10848,53 +10377,17 @@ bool LoadBlockIndex(bool fAllowNew)
     };
 
     //
-    // Load block index
+    // Load block index: V2 authoritative startup (native genesis bootstrap on a
+    // fresh datadir, incl. the persisted genesis sync-checkpoint).
     //
-    CTxDB txdb("cr+");
-    if (!txdb.LoadBlockIndex())
+    const std::string v2Root = ResolveBlockIndexV2Root(
+        GetArg("-blockindexv2authoritative", ""), GetDataDir().string());
+    std::string v2Err;
+    if (!InitBlockIndexAuthoritative(v2Root, &v2Err))
+        return error("LoadBlockIndex() : Block Index V2 authoritative startup failed: %s", v2Err.c_str());
+
+    if (mapBlockIndex.empty() && !fAllowNew)
         return false;
-
-    //
-    // Init with genesis block
-    //
-    if (mapBlockIndex.empty())
-    {
-        if (!fAllowNew)
-            return false;
-
-        CBlock block;
-        if (!CreateBlockIndexGenesisBlock(block))
-            return error("LoadBlockIndex() : genesis block construction failed");
-
-        // Start new block file
-        unsigned int nFile;
-        unsigned int nBlockPos;
-        if (!block.WriteToDisk(nFile, nBlockPos))
-            return error("LoadBlockIndex() : writing genesis block to disk failed");
-        uint256 hashGenesis = block.GetHash();
-        if (!block.AddToBlockIndex(nFile, nBlockPos, hashGenesis))
-            return error("LoadBlockIndex() : genesis block not accepted");
-
-        // ppcoin: initialize synchronized checkpoint
-        if (!Checkpoints::WriteSyncCheckpoint(hashGenesis))
-            return error("LoadBlockIndex() : failed to init sync checkpoint");
-        printf("Genesis block initialized: %s\n", hashGenesis.ToString().c_str());
-    }
-
-    string strPubKey = "";
-
-    // if checkpoint master key changed must reset sync-checkpoint
-    if (!txdb.ReadCheckpointPubKey(strPubKey) || strPubKey != CSyncCheckpoint::strMasterPubKey)
-    {
-        // write checkpoint master key to db
-        txdb.TxnBegin();
-        if (!txdb.WriteCheckpointPubKey(CSyncCheckpoint::strMasterPubKey))
-            return error("LoadBlockIndex() : failed to write new checkpoint master key to db");
-        if (!txdb.TxnCommit())
-            return error("LoadBlockIndex() : failed to commit new checkpoint master key to db");
-        if ((!fTestNet) && (!fRegTest) && !Checkpoints::ResetSyncCheckpoint())
-            return error("LoadBlockIndex() : failed to reset sync-checkpoint");
-    }
 
     std::string strHRegRebuildError;
     if (!hreg::RebuildHRegStateFromActiveChain(strHRegRebuildError))
@@ -11108,7 +10601,7 @@ string GetWarnings(string strFor)
 //
 
 
-bool static AlreadyHave(CTxDB& txdb, const CInv& inv)
+bool static AlreadyHave(const CInv& inv)
 {
     switch (inv.type)
     {
@@ -11118,7 +10611,7 @@ bool static AlreadyHave(CTxDB& txdb, const CInv& inv)
         txInMap = mempool.exists(inv.hash);
         return txInMap ||
                mapOrphanTransactions.count(inv.hash) ||
-               s16_ContainsTxV2OrLegacy(inv.hash, &txdb);
+               s16_TxidKnownV2(inv.hash);
         }
 
     case MSG_BLOCK:
@@ -12303,7 +11796,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
 
         LOCK(cs_main);
-        CTxDB txdb("r");
         RecoveryResponseObservation recoveryObservation;
         const bool fObserveRecovery =
             pfrom->HasActiveRecoveryResponseWindow();
@@ -12369,7 +11861,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             boost::this_thread::interruption_point();
             pfrom->AddInventoryKnown(inv);
 
-            bool fAlreadyHave = AlreadyHave(txdb, inv);
+            bool fAlreadyHave = AlreadyHave(inv);
             if (fGetBlocksResponse && inv.type == MSG_BLOCK)
                 ++nGetBlocksResponseBlockInv;
             if (fObserveRecovery && inv.type == MSG_BLOCK)
@@ -13320,7 +12812,6 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     {
         vector<uint256> vWorkQueue;
         vector<uint256> vEraseQueue;
-        CTxDB txdb("r");
         CTransaction tx;
         vRecv >> tx;
 
@@ -13328,7 +12819,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         pfrom->AddInventoryKnown(inv);
 
         bool fMissingInputs = false;
-        if (tx.AcceptToMemoryPool(txdb, &fMissingInputs))
+        if (tx.AcceptToMemoryPool(&fMissingInputs))
         {
             SyncWithWallets(tx, NULL, true);
             RelayTransaction(tx, inv.hash);
@@ -13351,7 +12842,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     CTransaction& orphanTx = mapOrphanTransactions[orphanTxHash];
                     bool fMissingInputs2 = false;
 
-                    if (orphanTx.AcceptToMemoryPool(txdb, &fMissingInputs2))
+                    if (orphanTx.AcceptToMemoryPool(&fMissingInputs2))
                     {
                         printf("   accepted orphan tx %s\n", orphanTxHash.ToString().substr(0,10).c_str());
                         SyncWithWallets(orphanTx, NULL, true);
@@ -14929,8 +14420,7 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                         BlockRequestTraceUpdateBlockContextLocked(
                             inv.hash, hashParent, uint256(0));
                     }
-                    CTxDB txdb("r");
-                    fSkip = AlreadyHave(txdb, inv);
+                    fSkip = AlreadyHave(inv);
                     fCsMainCheckResult = fSkip;
                 }
             }

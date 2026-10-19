@@ -21,7 +21,6 @@
 #include "candidate_frontier.h"
 #include "blockindex_residency_counters.h"
 #include "main.h"
-#include "txdb.h"
 
 #include <set>
 #include <map>

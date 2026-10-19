@@ -437,7 +437,7 @@ bool RunBlockIndexRecovery(const std::string& v2Root,
     //    the tool never deletes).
     if (abandon)
     {
-        const fs::path tipDir = fs::path(v2Root) / "blockindex_tip";
+        const fs::path tipDir = fs::path(v2Root) / "tip";
         boost::system::error_code ec;
         if (fs::exists(tipDir, ec))
         {
@@ -445,7 +445,7 @@ bool RunBlockIndexRecovery(const std::string& v2Root,
             for (int n = 0; n < 1000000 && !preserved; ++n)
             {
                 const fs::path dest = fs::path(v2Root) /
-                    ("blockindex_tip.pre-recovery-" + std::to_string(n));
+                    ("tip.pre-recovery-" + std::to_string(n));
                 if (fs::exists(dest, ec))
                     continue;
                 fs::rename(tipDir, dest, ec);
@@ -544,7 +544,7 @@ bool RunBlockIndexRecovery(const std::string& v2Root,
     const uint64_t gen = reader.Generation();
     const uint64_t baseRec = reader.RecordCount();
     BlockIndexTipAuthority tip;
-    const fs::path tipMeta = fs::path(v2Root) / "blockindex_tip" / "tip.meta";
+    const fs::path tipMeta = fs::path(v2Root) / "tip" / "tip.meta";
     if (fs::exists(tipMeta))
     {
         if (!BlockIndexTipAuthority::Open(v2Root, gen, &tip, &err))
@@ -603,7 +603,7 @@ bool RunBlockIndexRecovery(const std::string& v2Root,
     }
 
     // 4. Spill dir + recovery.meta.
-    const fs::path tipDir = fs::path(v2Root) / "blockindex_tip";
+    const fs::path tipDir = fs::path(v2Root) / "tip";
     const fs::path spillDir = tipDir / "recovery-path";
     // Cross-spill: a past ACCEPTED recovery.meta with a stale spill dir is
     // cleanup (the forward pass restarts from the CURRENT committed tip);
@@ -1021,8 +1021,8 @@ bool RunBlockIndexRecovery(const std::string& v2Root,
     //    input of record.
     {
         boost::system::error_code rec;
-        fs::remove_all(fs::path(v2Root) / "blockindex_tip" / "recovery-path", rec);
-        const fs::path tipDir = fs::path(v2Root) / "blockindex_tip";
+        fs::remove_all(fs::path(v2Root) / "tip" / "recovery-path", rec);
+        const fs::path tipDir = fs::path(v2Root) / "tip";
         if (!WriteRecoveryMeta(tipDir, RECOVERY_META_PHASE_ACCEPTED,
                                out->targetHeight, out->targetHash, &err))
         {

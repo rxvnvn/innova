@@ -273,6 +273,7 @@ struct PipelineWakeSnapshot
     size_t nQueuedGetBlocks;
     size_t nOutstandingGetBlocks;
     size_t nDeferredInv;
+    bool fRecentBlockRecv; // some peer delivered a block within the stall window
     uint256 hashTip;       // R1 cutover: by-value tip identity (no CBlockIndex*)
     int nTipHeight;
     int nLocalHeight;
@@ -281,8 +282,8 @@ struct PipelineWakeSnapshot
 
     PipelineWakeSnapshot()
         : nQueuedBlocks(0), nInflightBlocks(0), nQueuedGetBlocks(0),
-          nOutstandingGetBlocks(0), nDeferredInv(0), hashTip(0), nTipHeight(-1),
-          nLocalHeight(-1) {}
+          nOutstandingGetBlocks(0), nDeferredInv(0), fRecentBlockRecv(false),
+          hashTip(0), nTipHeight(-1), nLocalHeight(-1) {}
 };
 
 static void RecordPipelineWakeOutcome(PipelineWakeOutcome outcome)
@@ -1006,8 +1007,11 @@ bool CStalledSyncRecoveryState::ShouldRecover(
         ibdsemantic::RecordRecoverySkipPipelineActiveAfterTimeout();
     }
 
+    // Cap the exponent at 3 (max 8x, 120 s at the 15 s default): the point of
+    // the backoff is to avoid hammering a peer, not to let a genuine stall
+    // decay to one retry every eight minutes.
     const unsigned int nBackoffShift =
-        std::min<unsigned int>(nRecoveryAttempts, 5);
+        std::min<unsigned int>(nRecoveryAttempts, 3);
     const int64_t nEffectiveCooldown =
         nCooldown * ((int64_t)1 << nBackoffShift);
     const int64_t nSinceProgress =
@@ -1064,6 +1068,212 @@ void ResetStalledSyncRecoveryStateForTesting()
 {
     LOCK(cs_stalledSyncRecovery);
     stalledSyncRecoveryState = CStalledSyncRecoveryState();
+}
+
+// ---------------------------------------------------------------------------
+// IBD stalled-pipeline watchdog
+//
+// Problem it solves: an IBD pipeline can hold queued/in-flight block requests
+// that no peer will ever answer (peer went silent, path blackholed, socket left
+// established by the TCP keepalive).  Several independent gates then treat the
+// pipeline as "busy" and refuse to issue any new work, so the node stays frozen
+// until the process is restarted:
+//   * the pipeline-wake handler classifies ANY non-empty pipeline as terminal
+//     (net.cpp PIPELINE_WAKE_TERMINAL_PIPELINE_NOT_EMPTY), and
+//   * expired per-hash requests are not re-requested individually; the only
+//     retry is a coarse locator getblocks, which is itself gated on the same
+//     wake path.
+//
+// The watchdog adds no new request path: it only (a) lets the existing wake
+// path run when the pipeline is provably dead (no block received from any peer
+// for the whole window) and (b) rotates at most ONE silent peer per window so
+// the node re-selects from addrman instead of waiting for the ~1200 s TCP
+// send timeout.  All existing bounds still apply: request window W, per-peer
+// and global budgets, single-flight per hash, locator dedup, orphan limits.
+// Consensus is untouched: nothing here validates, orders or accepts blocks.
+static CCriticalSection cs_ibdStallWatchdog;
+static int g_nIbdWdLastHeight = -1;
+static int64_t g_nIbdWdHeightSince = 0;
+static int64_t g_nIbdWdLastAction = 0;
+static unsigned int g_nIbdWdActions = 0;
+
+static const int64_t IBD_STALL_WATCHDOG_DEFAULT_WINDOW = 90;
+
+bool IbdStallWatchdogEnabled()
+{
+    return GetBoolArg("-ibdstallwatchdog", true);
+}
+
+int64_t IbdStallWatchdogWindow()
+{
+    int64_t nWindow = IBD_STALL_WATCHDOG_DEFAULT_WINDOW;
+    if (mapArgs.count("-ibdstallwindow"))
+    {
+        int64_t nParsed = nWindow;
+        if (ParseInt64(mapArgs["-ibdstallwindow"], &nParsed))
+            nWindow = nParsed;
+    }
+    if (nWindow < 30)
+        nWindow = 30;
+    return nWindow;
+}
+
+// Pure decision: no locks, no side effects -- unit-testable.
+IbdStallWatchdogAction DecideIbdStallWatchdogAction(
+    bool fIbd, bool fTipKnown, int64_t nNow, int64_t nHeightSince,
+    int64_t nLastAction, int nEligiblePeers, int nRecentRecvPeers,
+    bool fHungWork, int64_t nWindow, unsigned int nConsecutiveActions)
+{
+    if (!fIbd || !fTipKnown)
+        return IBD_STALL_WATCHDOG_NONE;
+    if (nHeightSince == 0 || nNow < nHeightSince)
+        return IBD_STALL_WATCHDOG_NONE;
+    // Exponential backoff on repeated actions without progress, capped at 8x.
+    const unsigned int nShift =
+        std::min<unsigned int>(nConsecutiveActions, 3);
+    const int64_t nEffective = nWindow * ((int64_t)1 << nShift);
+    if (nNow - nHeightSince < nEffective)
+        return IBD_STALL_WATCHDOG_NONE;
+    if (nLastAction != 0 && nNow - nLastAction < nEffective)
+        return IBD_STALL_WATCHDOG_NONE;
+    if (nEligiblePeers <= 0)
+        return IBD_STALL_WATCHDOG_NONE;
+    if (nRecentRecvPeers > 0)
+        return IBD_STALL_WATCHDOG_NONE;   // somebody is delivering: not stalled
+    if (!fHungWork)
+        return IBD_STALL_WATCHDOG_NONE;   // nothing hung: normal path resumes work
+    if (nEligiblePeers >= 2)
+        return IBD_STALL_WATCHDOG_ROTATE_PEER;
+    // A single eligible peer that has already ignored one forced reissue is not
+    // making progress: recycle the connection so addrman can pick a working
+    // peer.  Without this the node reissues to the same silent peer forever
+    // (observed: 3 reissues, 1268 s at one height, zero blocks) and only a
+    // process restart recovered the download.
+    if (nConsecutiveActions >= 2)
+        return IBD_STALL_WATCHDOG_RECYCLE_PEER;
+    return IBD_STALL_WATCHDOG_REISSUE;
+}
+
+// Called once per message-handler pass with the peer list and the tip identity.
+void IbdStallWatchdogStep(const std::vector<CNode*>& vNodesIn,
+                          int nLocalHeight, int64_t nNow,
+                          const uint256& hashTip)
+{
+    if (!IbdStallWatchdogEnabled() || !IsInitialBlockDownload() ||
+        hashTip == uint256(0))
+        return;
+
+    const int64_t nWindow = IbdStallWatchdogWindow();
+    CNode* pVictim = NULL;
+    int nEligible = 0;
+    int nRecentRecv = 0;
+    bool fHungWork = false;
+    int64_t nVictimRecv = 0;
+    IbdStallWatchdogAction action = IBD_STALL_WATCHDOG_NONE;
+
+    {
+        LOCK(cs_ibdStallWatchdog);
+        if (nLocalHeight != g_nIbdWdLastHeight)
+        {
+            g_nIbdWdLastHeight = nLocalHeight;
+            g_nIbdWdHeightSince = nNow;
+            g_nIbdWdActions = 0;
+            return;
+        }
+        if (g_nIbdWdHeightSince == 0)
+            g_nIbdWdHeightSince = nNow;
+
+        BOOST_FOREACH(CNode* pnode, vNodesIn)
+        {
+            if (pnode == NULL || pnode->fDisconnect ||
+                !pnode->fSuccessfullyConnected || pnode->fClient ||
+                pnode->fOneShot || !IsBlockSyncPeerVersion(pnode->nVersion) ||
+                !pnode->CanAdvanceBlockSync(nLocalHeight))
+                continue;
+            ++nEligible;
+            const int64_t nRecv = pnode->nLastBlockRecv;
+            if (nRecv > 0 && nNow - nRecv <= nWindow)
+            {
+                ++nRecentRecv;
+                continue;
+            }
+            const bool fPeerHoldsWork =
+                !pnode->setBlocksInFlight.empty() ||
+                pnode->HasOutstandingGetBlocks() ||
+                !pnode->setAskForBlocks.empty();
+            if (fPeerHoldsWork)
+            {
+                fHungWork = true;
+                if (pVictim == NULL || nRecv < nVictimRecv)
+                {
+                    pVictim = pnode;
+                    nVictimRecv = nRecv;
+                }
+            }
+        }
+
+        action = DecideIbdStallWatchdogAction(
+            IsInitialBlockDownload(), true, nNow, g_nIbdWdHeightSince,
+            g_nIbdWdLastAction, nEligible, nRecentRecv, fHungWork, nWindow,
+            g_nIbdWdActions);
+        if (action == IBD_STALL_WATCHDOG_NONE)
+            return;
+        g_nIbdWdLastAction = nNow;
+        ++g_nIbdWdActions;
+    }
+
+    ibdmetrics::Get().stall_watchdog_ticks.fetch_add(
+        1, std::memory_order_relaxed);
+
+    if (action == IBD_STALL_WATCHDOG_ROTATE_PEER && pVictim != NULL)
+    {
+        // Bounded rotation: drop the peer that has delivered nothing for the
+        // whole window while holding work.  The node re-selects from addrman;
+        // at most one peer per window, so the pipeline cannot be drained by
+        // rotation storms.
+        pVictim->fDisconnect = true;
+        ibdmetrics::Get().stall_watchdog_peer_rotations.fetch_add(
+            1, std::memory_order_relaxed);
+        printf("IBD_STALL_WATCHDOG action=rotate peer=%d silent_for=%lld "
+               "eligible=%d local_height=%d actions=%u\n",
+               pVictim->GetId(), (long long)(nNow - nVictimRecv), nEligible,
+               nLocalHeight, g_nIbdWdActions);
+        return;
+    }
+
+    if (action == IBD_STALL_WATCHDOG_RECYCLE_PEER && pVictim != NULL)
+    {
+        // Last resort with exactly one eligible peer: it has already had a
+        // forced reissue and still delivered nothing, so keep the connection
+        // would only guarantee another silent window.  Dropping it lets the
+        // addrman reconnect (possibly to the same peer, possibly better);
+        // bounded by the same window/backoff as every other action.
+        pVictim->fDisconnect = true;
+        ibdmetrics::Get().stall_watchdog_solo_recycles.fetch_add(
+            1, std::memory_order_relaxed);
+        printf("IBD_STALL_WATCHDOG action=recycle peer=%d silent_for=%lld "
+               "eligible=%d local_height=%d actions=%u\n",
+               pVictim->GetId(), (long long)(nNow - nVictimRecv), nEligible,
+               nLocalHeight, g_nIbdWdActions);
+        return;
+    }
+
+    // Single eligible peer: rotating would leave zero peers.  Release the hung
+    // locator cycle instead (this also clears the per-peer dedup identity and
+    // the one-shot wake cooldown) and wake the pipeline; the coalesced wake
+    // handler then re-issues through the ordinary budgeted path.
+    if (pVictim != NULL)
+    {
+        pVictim->ExpireGetBlocksOutstanding(
+            GetTimeMicros() + (GETBLOCKS_RESPONSE_TIMEOUT + 5) * 1000000LL);
+        ibdmetrics::Get().stall_watchdog_forced_reissues.fetch_add(
+            1, std::memory_order_relaxed);
+        RequestBlockPipelineWake(WAKE_CAUSE_INFLIGHT_TIMEOUT);
+        printf("IBD_STALL_WATCHDOG action=reissue peer=%d silent_for=%lld "
+               "eligible=%d local_height=%d actions=%u\n",
+               pVictim->GetId(), (long long)(nNow - nVictimRecv), nEligible,
+               nLocalHeight, g_nIbdWdActions);
+    }
 }
 
 namespace {
@@ -2354,6 +2564,15 @@ void CStalledSyncRecoveryState::MarkSyncRequestSent(int64_t nNow)
     }
 }
 
+void CStalledSyncRecoveryState::NoteRecoveryPushDropped(int64_t nNow)
+{
+    // Undo the attempt charge taken in ShouldRecover: the request was never
+    // transmitted, so the cooldown must not grow as if a peer had ignored it.
+    if (nRecoveryAttempts > 0)
+        --nRecoveryAttempts;
+    nLastRecoveryTime = nNow;
+}
+
 void CStalledSyncRecoveryState::RecordRejectedBlock(
     const uint256& hashBlock, int64_t nNow, bool fRetryEligible)
 {
@@ -2711,7 +2930,7 @@ CNode* MaybeQueueStalledSyncRecovery(
     const int64_t nStallAgeBefore = nStallStartBefore == 0
         ? -1 : std::max<int64_t>(0, nNow - nStallStartBefore);
     const unsigned int nBackoffShift =
-        std::min<unsigned int>(nRecoveryAttemptsBefore, 5);
+        std::min<unsigned int>(nRecoveryAttemptsBefore, 3);
     const int64_t nEffectiveCooldown =
         nCooldown * ((int64_t)1 << nBackoffShift);
     const int64_t nSinceRecovery = nLastRecoveryBefore == 0
@@ -2748,12 +2967,15 @@ CNode* MaybeQueueStalledSyncRecovery(
             pszFinalSkipReason = "clock_reversal";
         else if (nMaxPeerHeight <= nLocalHeight)
             pszFinalSkipReason = "peer_not_ahead";
-        else if (fPipelineActive)
-            pszFinalSkipReason = "pipeline_active";
         else if (nStallAgeBefore < nStallTimeout)
             pszFinalSkipReason = "stall_timeout_not_reached";
         else if (nCooldownRemaining > 0)
             pszFinalSkipReason = "cooldown_active";
+        else if (fPipelineActive)
+            // Reported last: the pipeline is non-empty, but after a full
+            // stall timeout that is an observation, not the binding
+            // constraint.  Reporting it earlier masked cooldown_active.
+            pszFinalSkipReason = "pipeline_active";
         else
             pszFinalSkipReason = "should_recover_false_unclassified";
     }
@@ -2824,8 +3046,21 @@ CNode* MaybeQueueStalledSyncRecovery(
     pnodeRecovery->nRecoveryTracePendingId = RecoveryTraceTrigger(
         pnodeRecovery, nLocalHeight, (int)nMaxPeerHeight, nStallAgeBefore,
         state.RecoveryAttempts());
-    pnodeRecovery->PushGetBlocks(
+    const bool fRecoveryGetBlocksQueued = pnodeRecovery->PushGetBlocks(
         hashTip, nTipHeight, uint256(0), ibdmetrics::GETBLOCKS_SOURCE_RECOVERY);
+    if (!fRecoveryGetBlocksQueued)
+    {
+        // PushGetBlocks refused (dedup / pending-slot coalescing): nothing
+        // was transmitted, so this is not a recovery attempt.  Undo the
+        // charge and the metric, or the next retry is delayed for nothing.
+        state.NoteRecoveryPushDropped(nNow);
+        ibdmetrics::Get().stalled_recovery_attempts.fetch_sub(
+            1, std::memory_order_relaxed);
+        if (SyncTraceEnabled())
+            printf("SYNC_EVENT time_us=%lld event=RECOVERY_PUSH_DROPPED peer=%d local_height=%d attempts=%u\n",
+                   (long long)GetTimeMicros(), pnodeRecovery->GetId(),
+                   nLocalHeight, state.RecoveryAttempts());
+    }
 
     uint256 hashRejected;
     if (state.TakeRejectedBlockForRetry(hashRejected))
@@ -4511,6 +4746,9 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
                 snapshot.nOutstandingGetBlocks +=
                     pnode->HasOutstandingGetBlocks() ? 1 : 0;
                 snapshot.nDeferredInv += pnode->deferredBlockInv.size();
+                if (pnode->nLastBlockRecv > 0 &&
+                    nNow - pnode->nLastBlockRecv <= IbdStallWatchdogWindow())
+                    snapshot.fRecentBlockRecv = true;
                 if (!pnode->fDisconnect && pnode->fSuccessfullyConnected &&
                     IsBlockSyncPeerVersion(pnode->nVersion) &&
                     !pnode->fClient && !pnode->fOneShot &&
@@ -4540,7 +4778,24 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
 
     if (outcome == PIPELINE_WAKE_OUTCOME_NONE)
     {
-        if (snapshot.nQueuedBlocks != 0 || snapshot.nInflightBlocks != 0)
+        const bool fPipelineNonEmpty =
+            (snapshot.nQueuedBlocks != 0 || snapshot.nInflightBlocks != 0);
+        // A non-empty pipeline is only healthy evidence while somebody is
+        // actually delivering.  When no peer has produced a block for the whole
+        // stall window the pipeline is full of dead requests: classifying it as
+        // terminal here is what froze IBD for 30+ minutes with inflight>0 and
+        // nothing arriving.  In that case fall through to the ordinary refill /
+        // locator-getblocks path; its cooldowns, budgets, single-flight-per-hash
+        // and orphan limits still bound the resulting work.
+        const bool fDeadPipeline =
+            fPipelineNonEmpty && !snapshot.fRecentBlockRecv &&
+            IbdStallWatchdogEnabled();
+        if (fDeadPipeline)
+        {
+            ibdmetrics::Get().stall_watchdog_liveness_bypass.fetch_add(
+                1, std::memory_order_relaxed);
+        }
+        else if (fPipelineNonEmpty)
             outcome = PIPELINE_WAKE_TERMINAL_PIPELINE_NOT_EMPTY;
         else if (snapshot.nQueuedGetBlocks != 0)
             outcome = PIPELINE_WAKE_TERMINAL_EXISTING_QUEUED_GETBLOCKS;
@@ -9397,6 +9652,10 @@ void ThreadMessageHandler2(void* parg)
                 }
                 if (pnodeRecovery != NULL)
                     AssignSyncPeer(vNodesCopy, pnodeRecovery, false);
+                // Stalled-pipeline watchdog: bounded peer rotation / locator
+                // re-issue when the pipeline holds work but no peer delivered a
+                // block for the whole window.  Never restarts the process.
+                IbdStallWatchdogStep(vNodesCopy, nLocalHeight, nNow, hashTip);
             }
         }
         UpdateGetInfoSyncProbeSnapshot(vNodesCopy);

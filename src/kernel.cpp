@@ -11,7 +11,6 @@
 #include "blockindex_authoritative_live.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_shadow_startup.h"
-#include "txdb.h"
 #include "main.h"
 #include "ibdmetrics.h"
 #include "wallet.h"
@@ -1523,33 +1522,10 @@ static bool ReadStakeSourceTransactionInternal(const CBlockIndex* pindexPrev,
         return SearchCandidateSuffix(pindexPrev, prevout, txPrev, txindex, blockFrom, candidateBlocksForTesting);
     }
 
-    CTxDB txdb("r");
-    if (txPrev.ReadFromDisk(txdb, prevout, txindex) &&
-        blockFrom.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
-    {
-        // A.9a.3c: when a production navigator is retained, the source-ancestry
-        // authority is resolved by-value (no resident mapBlockIndex/CBlockIndex* /
-        // continuous pprev topology). A navigator authority failure FAILS CLOSED
-        // (never a residency fallback, never a mis-validation). Only when NO
-        // production navigator exists (pre-A.10, everything materialized) do we
-        // use the legacy pointer check.
-        const ColdHotSeamNavigator* pNav = GetBlockIndexStakingNavigator();
-        if (pNav)
-        {
-            const int navAncestry = IsBlockInCandidateAncestryNavigated(blockFrom.GetHash(), pindexPrev);
-            if (navAncestry < 0)
-                return false; // authority failure -> fail closed
-            return navAncestry == 1;
-        }
-        std::map<uint256, CBlockIndex*>::const_iterator mi =
-            mapBlockIndex.find(blockFrom.GetHash());
-        if (mi != mapBlockIndex.end() &&
-            IsBlockInCandidateAncestry(mi->second, pindexPrev))
-            return true;
-    }
-
-    // Transactions from an unconnected side branch are deliberately absent
-    // from the connected-chain tx index. Search only the candidate suffix.
+    // CTxDB demolition: the legacy connected-chain txindex read is gone.
+    // Without an armed Store3A/BI-V2 authority the coinstake source cannot
+    // be resolved from the committed chain; only the by-value candidate
+    // suffix remains (never a second storage path).
     return SearchCandidateSuffix(pindexPrev, prevout, txPrev, txindex, blockFrom, candidateBlocksForTesting);
 }
 bool ReadStakeSourceTransaction(const CBlockIndex* pindexPrev,

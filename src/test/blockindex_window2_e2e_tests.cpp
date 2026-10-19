@@ -35,7 +35,6 @@
 static const int kFixtureDepth = 11;
 
 #include "db.h"
-#include "txdb.h"
 #include "main.h"
 #include "blockrequesttrace.h"
 #include <cstdlib>
@@ -420,7 +419,7 @@ BOOST_AUTO_TEST_CASE(f2_parent_score_resolver_parity_and_contract)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, &error), error);
     source.blockDataDir = GetDataDir().string();
     BlockIndexGenerationBuilder builder;
-    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "blockindex-build-000001.tmp").string(), 1, NULL, &error), error);
+    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, &error), error);
     builder.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
@@ -460,7 +459,7 @@ static void F2BuildAuthoritativeGenerationAndInit(const fs::path& root, std::str
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, error), *error);
     source.blockDataDir = GetDataDir().string();
     BlockIndexGenerationBuilder builder;
-    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "blockindex-build-000001.tmp").string(), 1, NULL, error), *error);
+    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, error), *error);
     builder.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
@@ -1232,7 +1231,7 @@ BOOST_AUTO_TEST_CASE(r4_authority_ready_published_by_real_authoritative_startup)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
     src.blockDataDir=GetDataDir().string();
     BlockIndexGenerationBuilder ab;
-    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"blockindex-build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
     AuthorityReadyResetForTest();                       // prove the startup itself publishes it
@@ -1373,7 +1372,7 @@ BOOST_AUTO_TEST_CASE(f2_byvalue_provider_failure_matrix)
         brokenSource.blockDataDir = GetDataDir().string();
         BlockIndexGenerationBuilder badBuilder;
         std::string badError;
-        const bool builtBad = badBuilder.Build(brokenSource, (root / "blockindex-build-broken.tmp").string(), 1, NULL, &badError);
+        const bool builtBad = badBuilder.Build(brokenSource, (root / "build-broken.tmp").string(), 1, NULL, &badError);
         BOOST_CHECK_MESSAGE(!builtBad,
             "a generation containing a child with an ABSENT claimed parent must be REJECTED at build time");
         BOOST_TEST_MESSAGE("F2 FM claimed-parent-absent child=" << childOfLostHash.GetHex()
@@ -1387,7 +1386,7 @@ BOOST_AUTO_TEST_CASE(f2_byvalue_provider_failure_matrix)
         BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, &error), error);
         source.blockDataDir = GetDataDir().string();
         BlockIndexGenerationBuilder builder;
-        BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "blockindex-build-000001.tmp").string(), 1, NULL, &error), error);
+        BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, &error), error);
         builder.Close();
     }
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error), BLOCK_INDEX_LIFECYCLE_OK);
@@ -1956,7 +1955,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root/"snapshot").string(),&src,&aerr),aerr);
     src.blockDataDir=GetDataDir().string();
     BlockIndexGenerationBuilder ab;
-    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"blockindex-build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
+    BOOST_REQUIRE_MESSAGE(ab.Build(src,(root/"build-000001.tmp").string(),1,NULL,&aerr),aerr); ab.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&aerr),BLOCK_INDEX_LIFECYCLE_OK);
     AuthorityReadyResetForTest();
@@ -2044,7 +2043,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &src, &aerr), aerr);
     src.blockDataDir = GetDataDir().string();
     BlockIndexGenerationBuilder ab;
-    BOOST_REQUIRE_MESSAGE(ab.Build(src, (root / "blockindex-build-000001.tmp").string(), 1, NULL, &aerr), aerr); ab.Close();
+    BOOST_REQUIRE_MESSAGE(ab.Build(src, (root / "build-000001.tmp").string(), 1, NULL, &aerr), aerr); ab.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &aerr), BLOCK_INDEX_LIFECYCLE_OK);
     AuthorityReadyResetForTest();
@@ -2138,7 +2137,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
     // ---------------------------------------------------------------------
     // (a) V2 AUTHORITATIVE RESTART RECONSTRUCTION (production component P5):
     //     base generation S + the persisted mutable post-S tip authority under
-    //     <root>/blockindex_tip. The live acceptance path persisted the reorged
+    //     <root>/tip. The live acceptance path persisted the reorged
     //     active tip there (BlockIndexTipAuthority Append / ReorgActiveTo).
     // ---------------------------------------------------------------------
     std::string rerr;
@@ -2305,7 +2304,7 @@ BOOST_AUTO_TEST_CASE(r2b_p01_negative_corrupt_tip_fails_closed)
     BOOST_REQUIRE(S >= 0);
 
     // Corrupt tip.meta's mutable protocol version to an unknown value.
-    const std::string metaPath = (root / "blockindex_tip" / "tip.meta").string();
+    const std::string metaPath = (root / "tip" / "tip.meta").string();
     unsigned char buf[160];
     size_t n = 0;
     {
@@ -2423,7 +2422,7 @@ static bool R2DBuildSyntheticGenerationAndInit(const fs::path& root, int S,
     src.foundBestChain = true;
     src.blockDataDir = (root / "blocks").string();
     BlockIndexGenerationBuilder b;
-    if (!b.Build(src, (root / "blockindex-build-000001.tmp").string(), 1, NULL, error)) return false;
+    if (!b.Build(src, (root / "build-000001.tmp").string(), 1, NULL, error)) return false;
     b.Close();
     if (BlockIndexGenerationManager::PublishGeneration(root.string(), 1, error) != BLOCK_INDEX_LIFECYCLE_OK) return false;
     if (BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error) != BLOCK_INDEX_LIFECYCLE_OK) return false;
@@ -2926,7 +2925,7 @@ BOOST_AUTO_TEST_CASE(r2d_p01_startup_n1_missing_post_s_record_fails_closed)
 
     // Corrupt: truncate tip-records.dat below the tip.meta-committed record count
     // while the durable tip still CLAIMS height S+1 (required record missing).
-    const std::string rp = (fx.root / "blockindex_tip" / "tip-records.dat").string();
+    const std::string rp = (fx.root / "tip" / "tip-records.dat").string();
     BOOST_REQUIRE(R2DTruncateFileTo(rp, 0));
 
     std::string err;
@@ -2950,7 +2949,7 @@ BOOST_AUTO_TEST_CASE(r2d_p01_startup_n2_inconsistent_post_s_record_fails_closed)
 
     // Corrupt: flip a byte inside the committed record region so the committed
     // post-S record no longer matches the tip.meta content digest (inconsistent).
-    const std::string rp = (fx.root / "blockindex_tip" / "tip-records.dat").string();
+    const std::string rp = (fx.root / "tip" / "tip-records.dat").string();
     std::vector<unsigned char> rec = R2DReadFile(rp);
     BOOST_REQUIRE(rec.size() > 64);
     rec[64] ^= 0xFF;

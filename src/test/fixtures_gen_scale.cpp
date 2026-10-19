@@ -9,7 +9,6 @@
 #include "uint256.h"
 #include "main.h"
 #include "serialize.h"
-#include "txdb.h"
 #include "ui_interface.h"
 #include "checkpoints.h"
 #include "wallet.h"

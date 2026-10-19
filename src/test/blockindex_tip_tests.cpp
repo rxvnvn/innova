@@ -19,7 +19,7 @@
 namespace fs = boost::filesystem;
 
 // =====================================================================
-// P1 — blockindex_tip: dedicated persistent mutable tip authority.
+// P1 — tip: dedicated persistent mutable tip authority.
 //
 // Causal gates:
 //   T1  create empty + reopen -> empty, base-binding correct
@@ -99,7 +99,7 @@ static int32_t BuildChain(BlockIndexTipAuthority& tip, uint32_t n,
     return (int32_t)n;
 }
 
-BOOST_AUTO_TEST_SUITE(blockindex_tip_tests)
+BOOST_AUTO_TEST_SUITE(tip_tests)
 
 BOOST_AUTO_TEST_CASE(t1_create_empty_reopen)
 {
@@ -315,14 +315,14 @@ BOOST_AUTO_TEST_CASE(t8_crash_mid_append_recovery)
         BlockIndexRecord bogus = MakeRecord(uint256(0xDEADUL), uint256(0xBEEDUL), 204, false);
         std::vector<unsigned char> enc;
         BOOST_REQUIRE(EncodeBlockIndexRecordV1(bogus, &enc, NULL));
-        FILE* f = fopen((dir + "/blockindex_tip/tip-records.dat").c_str(), "ab");
+        FILE* f = fopen((dir + "/tip/tip-records.dat").c_str(), "ab");
         BOOST_REQUIRE(f != NULL);
         BOOST_REQUIRE(fwrite(&enc[0], 1, enc.size(), f) == enc.size());
         fclose(f);
 
         std::string aenc;
         BOOST_REQUIRE(EncodeBlockIndexActiveEntry(300u + 3 + 1, &aenc, NULL)); // id=304
-        FILE* fa = fopen((dir + "/blockindex_tip/tip-active.dat").c_str(), "ab");
+        FILE* fa = fopen((dir + "/tip/tip-active.dat").c_str(), "ab");
         BOOST_REQUIRE(fa != NULL);
         BOOST_REQUIRE(fwrite(aenc.data(), 1, aenc.size(), fa) == aenc.size());
         fclose(fa);
@@ -330,7 +330,7 @@ BOOST_AUTO_TEST_CASE(t8_crash_mid_append_recovery)
         BlockIndexDerivedEntry bogusD = MakeDerived(uint256(0xFFFFUL), 777);
         std::vector<unsigned char> denc;
         BOOST_REQUIRE(EncodeBlockIndexDerivedEntry(bogusD, &denc, NULL));
-        FILE* fd = fopen((dir + "/blockindex_tip/tip-derived.dat").c_str(), "ab");
+        FILE* fd = fopen((dir + "/tip/tip-derived.dat").c_str(), "ab");
         BOOST_REQUIRE(fd != NULL);
         BOOST_REQUIRE(fwrite(&denc[0], 1, denc.size(), fd) == denc.size());
         fclose(fd);
@@ -513,9 +513,9 @@ BOOST_AUTO_TEST_CASE(r4_incremental_append_writes_constant_bytes)
         uint256 tipHash;
         BuildChain(tip, (uint32_t)n, &tipHash, uint256(0x7000UL + (unsigned long)(t + 1)), baseTip);
         BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), n);
-        const fs::path rp = fs::path(dir) / "blockindex_tip" / "tip-records.dat";
-        const fs::path dp = fs::path(dir) / "blockindex_tip" / "tip-derived.dat";
-        const fs::path ap = fs::path(dir) / "blockindex_tip" / "tip-active.dat";
+        const fs::path rp = fs::path(dir) / "tip" / "tip-records.dat";
+        const fs::path dp = fs::path(dir) / "tip" / "tip-derived.dat";
+        const fs::path ap = fs::path(dir) / "tip" / "tip-active.dat";
         const uint64_t r0 = fs::file_size(rp), d0 = fs::file_size(dp), a0 = fs::file_size(ap);
         BlockIndexTipAppend a;
         a.record = MakeRecord(uint256(0x8000UL + (unsigned long)(t + 1)), tipHash, baseTip + (int)n + 1, true);
@@ -680,7 +680,7 @@ static void WriteRawFile(const std::string& path, const std::vector<unsigned cha
 
 static std::string TipInvalidPath(const std::string& dir)
 {
-    return dir + "/blockindex_tip/tip-invalid.dat";
+    return dir + "/tip/tip-invalid.dat";
 }
 
 BOOST_AUTO_TEST_CASE(t11_invalidate_persists_reopen)
@@ -758,11 +758,11 @@ BOOST_AUTO_TEST_CASE(t14_v1_meta_backward_compatible_empty)
         BOOST_REQUIRE(tip.SetOperatorInvalid(hA, true, NULL) == BLOCK_INDEX_TIP_OK);
     }
     // Rewrite tip.meta as the previous supported (v1) 104-byte layout.
-    std::vector<unsigned char> meta = ReadRawFile(dir + "/blockindex_tip/tip.meta");
+    std::vector<unsigned char> meta = ReadRawFile(dir + "/tip/tip.meta");
     BOOST_REQUIRE(meta.size() >= 104);
     meta.resize(104);
     meta[0] = 1; meta[1] = 0; meta[2] = 0; meta[3] = 0; // version = 1 (LE32)
-    WriteRawFile(dir + "/blockindex_tip/tip.meta", meta);
+    WriteRawFile(dir + "/tip/tip.meta", meta);
     {
         BlockIndexTipAuthority tip;
         BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 5, &tip, NULL),
@@ -811,10 +811,10 @@ BOOST_AUTO_TEST_CASE(t16_unknown_version_fail_closed)
         BlockIndexTipAuthority tip;
         BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 5, 900, 800, &tip, NULL));
     }
-    std::vector<unsigned char> meta = ReadRawFile(dir + "/blockindex_tip/tip.meta");
+    std::vector<unsigned char> meta = ReadRawFile(dir + "/tip/tip.meta");
     BOOST_REQUIRE(meta.size() >= 104);
     meta[0] = 99; meta[1] = 0; meta[2] = 0; meta[3] = 0; // unknown future version
-    WriteRawFile(dir + "/blockindex_tip/tip.meta", meta);
+    WriteRawFile(dir + "/tip/tip.meta", meta);
     {
         BlockIndexTipAuthority tip;
         std::string err;
@@ -1025,7 +1025,7 @@ BOOST_AUTO_TEST_CASE(t21_operator_idempotence)
 // ---- V2-R2D P0-01 N1/N2: authoritative tip corruption -> FAIL CLOSED ----
 static std::string TipRecordsPath(const std::string& dir)
 {
-    return dir + "/blockindex_tip/tip-records.dat";
+    return dir + "/tip/tip-records.dat";
 }
 
 static bool TruncateFileTo(const std::string& path, size_t newLen)
@@ -1112,7 +1112,7 @@ BOOST_AUTO_TEST_CASE(n2_inconsistent_committed_record_fails_closed)
 // =====================================================================
 // Repair #2 (v3 chained digest) — Gate A regressions.
 // Independent ORACLE: recompute digest_v3 = SHA256(Rch||Dch||Ach||fence) over the
-// SAME committed vectors with OpenSSL, entirely outside blockindex_tip.cpp, and
+// SAME committed vectors with OpenSSL, entirely outside tip.cpp, and
 // compare against the PERSISTED tip.meta contentDigest. This proves live
 // incremental == independent rebuild, not merely that Open accepts its own value.
 // =====================================================================
@@ -1160,7 +1160,7 @@ static void OracleDigestV3(const std::vector<BlockIndexRecord>& recs,
 
 static void ReadMetaDigest(const std::string& dir, unsigned char out[32], uint32_t* ver)
 {
-    std::vector<unsigned char> m = ReadRawFile(dir + "/blockindex_tip/tip.meta");
+    std::vector<unsigned char> m = ReadRawFile(dir + "/tip/tip.meta");
     BOOST_REQUIRE(m.size() >= 104);
     if (ver) *ver = (uint32_t)m[0] | ((uint32_t)m[1] << 8) | ((uint32_t)m[2] << 16) | ((uint32_t)m[3] << 24);
     memcpy(out, &m[72], 32);
@@ -1292,10 +1292,10 @@ BOOST_AUTO_TEST_CASE(r2e_v3_truncated_meta_fail_closed)
         BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 25, 10, baseTip, &tip, NULL));
         uint256 fin; BuildChain(tip, 2, &fin, uint256(0x03UL), baseTip);
     }
-    std::vector<unsigned char> m = ReadRawFile(dir + "/blockindex_tip/tip.meta");
+    std::vector<unsigned char> m = ReadRawFile(dir + "/tip/tip.meta");
     BOOST_REQUIRE(m.size() >= 140);
     m.resize(104); // keep version=3 header but drop the v2/v3 tail -> must fail closed
-    WriteRawFile(dir + "/blockindex_tip/tip.meta", m);
+    WriteRawFile(dir + "/tip/tip.meta", m);
     BlockIndexTipAuthority re; std::string err;
     BOOST_REQUIRE_MESSAGE(!BlockIndexTipAuthority::Open(dir, 25, &re, &err),
                           "R2E: truncated v3 meta MUST fail closed");
@@ -1462,8 +1462,8 @@ BOOST_AUTO_TEST_CASE(r3d_index_reconcile_missing)
         tip.Close();
     }
     boost::system::error_code ec;
-    boost::filesystem::remove_all((dir + "/blockindex_tip/tip-hashindex").c_str(), ec);
-    boost::filesystem::remove((dir + "/blockindex_tip/tip-hashindex.marker").c_str(), ec);
+    boost::filesystem::remove_all((dir + "/tip/tip-hashindex").c_str(), ec);
+    boost::filesystem::remove((dir + "/tip/tip-hashindex.marker").c_str(), ec);
     BlockIndexTipAuthority re; std::string err;
     BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 33, &re, &err),
                           "R3D: reconcile after index deletion failed: " << err);
@@ -1506,11 +1506,11 @@ static std::string TipHashIndexPath(const std::string& dir)
 {
     // The BlockIndexHashIndex wrapper takes the PARENT dir and appends
     // "hashindex" itself; this returns that parent (the tip dir).
-    return dir + "/blockindex_tip";
+    return dir + "/tip";
 }
 static std::string TipHashIndexMarkerPath(const std::string& dir)
 {
-    return dir + "/blockindex_tip/tip-hashindex.marker";
+    return dir + "/tip/tip-hashindex.marker";
 }
 
 // Repair #3 marker helper: rewrite ONLY the indexedCount field of an existing

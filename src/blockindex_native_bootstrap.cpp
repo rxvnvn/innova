@@ -45,8 +45,8 @@ uint64_t NextGenerationId(const std::string& root)
     {
         const std::string name = it->path().filename().string();
         uint64_t id = 0;
-        if (sscanf(name.c_str(), "blockindex-gen-%llu", (unsigned long long*)&id) == 1 ||
-            sscanf(name.c_str(), "blockindex-build-%llu", (unsigned long long*)&id) == 1)
+        if (sscanf(name.c_str(), "gen-%llu", (unsigned long long*)&id) == 1 ||
+            sscanf(name.c_str(), "build-%llu", (unsigned long long*)&id) == 1)
         {
             if (id > maxId)
                 maxId = id;
@@ -64,11 +64,9 @@ bool SnapshotLegacyBlockIndexDb(const std::string& dataDir,
     if (dataDir.empty() || snapshotDir.empty())
         return SetError(error, "snapshot: empty dataDir/snapshotDir");
 
-    // Quiescence guard: a copy taken while the process-global legacy LevelDB is
-    // open is not guaranteed to be a consistent point-in-time snapshot. Fail
-    // closed rather than produce a torn migration source.
-    if (GetGlobalTxdbPtrForTest() != NULL)
-        return SetError(error, "snapshot: legacy LevelDB is open; refusing non-consistent migration source");
+    // CTxDB demolition: the process-global legacy LevelDB no longer exists in
+    // this binary, so there is no writer that could tear the snapshot.  The
+    // legacy directory is only read here as a migration source.
 
     fs::path src = fs::path(dataDir) / "txleveldb";
     boost::system::error_code ec;

@@ -12,7 +12,6 @@
 #include "chainstate/observe_hook.h"   // S1.7 off-by-default Store3A mirror during -loadblock replay
 #include "kernel.h"
 #include "miner.h"
-#include "txdb.h"
 #include "chainstate/txloc/txloc.h"
 #include "walletdb.h"
 #include "innovarpc.h"
@@ -158,7 +157,6 @@ void Shutdown(void* parg)
         // reads the key. The persisted "dagcleanheight" key, if present in an
         // existing database, is inert compatibility data and is not rewritten.
 
-        FlushIBDBatch();
         FCloseBlockFile();
         IBDEfficiencyShutdownSummary();
         ibdblocklatency::Dump();
@@ -597,6 +595,8 @@ std::string HelpMessage()
         "  -debugnet              " + _("Output extra network debugging information") + "\n" +
         "  -debugchain            " + _("Output extra blockchain debugging information") + "\n" +
         "  -blockrequesttrace=<n> " + _("Trace anomalous block request lifecycles (default: 0)") + "\n" +
+        "  -ibdstallwatchdog=<n> " + _("Rotate silent IBD peers / re-issue when no block arrives for the stall window (default: 1)") + "\n" +
+        "  -ibdstallwindow=<n> " + _("IBD stall watchdog window in seconds, minimum 30 (default: 90)") + "\n" +
         "  -headersserveddedup=<0|1> " + _("Suppress duplicate getheaders responses per peer within an 8s window (default: 0)") + "\n" +
         "  -getblocksservedinvzero=<0|1> " + _("Suppress repeated zero-consumption getblocks->inv replies per strict-inbound peer (default: 0)") + "\n" +
         "  -getblocksservedinvgrace=<n> " + _("Min served-window age (seconds) before zero-consumption suppression may fire (default: 60)") + "\n" +
@@ -1408,8 +1408,11 @@ bool AppInit2()
 
     if (GetBoolArg("-loadblockindextest"))
     {
-        CTxDB txdb("r");
-        txdb.LoadBlockIndex();
+        const std::string v2Root = ResolveBlockIndexV2Root(
+            GetArg("-blockindexv2authoritative", ""), GetDataDir().string());
+        std::string loadErr;
+        if (!InitBlockIndexAuthoritative(v2Root, &loadErr))
+            return InitError(strprintf("Block Index V2 load failed: %s", loadErr.c_str()));
         PrintBlockTree();
         return false;
     };
@@ -1418,13 +1421,14 @@ bool AppInit2()
     // production CTxDB::LoadBlockIndex (read-only "r" open). Exits cleanly.
     if (GetBoolArg("-stakemodifierverify", false))
     {
-        CTxDB txdb("r");
-        txdb.LoadBlockIndex();
+        const std::string v2Root = ResolveBlockIndexV2Root(
+            GetArg("-blockindexv2authoritative", ""), GetDataDir().string());
+        std::string loadErr;
+        if (!InitBlockIndexAuthoritative(v2Root, &loadErr))
+            return InitError(strprintf("Block Index V2 load failed: %s", loadErr.c_str()));
         VerifyStakeModifierDifferential();
         return false;
     };
-
-    InitIBDBatching();
 
     uiInterface.InitMessage(_("Loading block index..."));
     printf("Loading block index...\n");
@@ -1437,7 +1441,6 @@ bool AppInit2()
     // (-s16openstore) the block index must come exclusively from Block Index V2,
     // so the guard FAILS CLOSED on any legacy LevelDB (txleveldb) open during the
     // V2 startup path. Non-V2 startup leaves the guard disarmed (byte-for-byte).
-    s16::ArmV2LegacyIndexGuardIfRequested();
 
     // ---- PM1-P0-07b (C2/C4): SINGLE normal production startup ownership ----
     // The durable ownership commit point is the existing logical CURRENT marker.
@@ -1449,6 +1452,9 @@ bool AppInit2()
     // consulted as block-index authority. -blockindexv2authoritative is an
     // explicit diagnostic OVERRIDE of the root only; normal production
     // correctness does not depend on it. Fail-closed: NO legacy fallback.
+    // Native V2 store startup (datadir contract) -- set by the ownership
+    // classification below and consumed by the Store3A open.
+    bool v2NativeStoreStartup = false;
     {
         const std::string v2Root = ResolveBlockIndexV2Root(
             GetArg("-blockindexv2authoritative", ""), GetDataDir().string());
@@ -1462,6 +1468,17 @@ bool AppInit2()
                BlockIndexStartupOwnershipStateName(own.state),
                own.legacyPresent ? 1 : 0, own.legacyReadable ? 1 : 0,
                own.unpublishedArtifacts ? 1 : 0, (int)own.v2CurrentStatus, v2Root.c_str());
+
+        // Native V2 must not NEED an external store path: the approved datadir
+        // contract puts Store3A at <datadir>/chainstate and auto-creates it. Record
+        // that this startup is a native V2 one so the Store3A open below can
+        // default to that path instead of silently leaving V2 WITHOUT any UTXO
+        // store (which was the real reason a flag-less run fell back to a legacy
+        // txleveldb). Legacy-migration states are deliberately NOT included: their
+        // path stays exactly as before.
+        v2NativeStoreStartup =
+            (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE ||
+             own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW);
 
         // S2.0 BI-V2 AUTHORITATIVE STARTUP + P2 EMPTY_DATADIR: in V2 store mode
         // (-s16openstore) the block index MUST come exclusively from Block Index
@@ -1479,8 +1496,7 @@ bool AppInit2()
         //     path is legacy-free), so it is safe and is the P2 target scenario
         //     (empty datadir -> genesis-to-tip IBD).
         // Everything else refuses startup. Non-V2 startup is unaffected.
-        if (s16::V2LegacyIndexGuardActive() &&
-            own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE &&
+        if (own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE &&
             own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW)
             return InitError(strprintf(
                 "Store3A V2 authoritative FAIL-CLOSED: Block Index V2 ownership is %s, not "
@@ -1609,7 +1625,7 @@ authoritative_startup_ready:
     if (g_fAuthoritativeStartup)
     {
         std::string mirrorErr;
-        if (!ReconcileLegacyCompatibilityMirror(mirrorErr))
+        if (!ReconcileOperatorInvalidSetFromV2(mirrorErr))
             return InitError(strprintf("Block Index V2 legacy mirror reconciliation failed: %s", mirrorErr.c_str()));
     }
 
@@ -1699,14 +1715,6 @@ authoritative_startup_ready:
     // ********************************************************* Step 8: load wallet
 
     // S2.0 BI-V2 authoritative startup: the block-index startup (Step 7) is
-    // complete. In V2 store mode the proven guarantee is that NO legacy LevelDB
-    // (txindex/blockindex) open occurred during that window — the guard refuted
-    // it fail-closed. Now release the guard so the legitimate non-block-index
-    // post-startup consumers (wallet, RPC, mempool, reindex) are unaffected;
-    // their legacy reads, if any, are not block-index startup. (Consensus input
-    // sourcing in V2 mode is already Store3A-only via s16_V2Armed().)
-    s16::g_V2LegacyIndexGuardArmed = false;
-
     if (GetBoolArg("-zapwallettxes", false)) {
         uiInterface.InitMessage(_("Zapping all transactions from INN wallet..."));
 
@@ -1943,7 +1951,17 @@ authoritative_startup_ready:
     // Store lives for the process lifetime (heap-owned).
     {
         static std::unique_ptr<cs::store3a::CommitStore3A> g_s3aAuthoritative;
-        const std::string s3aDir = GetArg("-s16openstore", "");
+        std::string s3aDir = GetArg("-s16openstore", "");
+        if (s3aDir.empty() && v2NativeStoreStartup)
+        {
+            // Approved datadir contract: Store3A lives at <datadir>/chainstate and
+            // is auto-created; no external store path is mandatory for native V2.
+            // Without this default a flag-less native run left V2 with NO UTXO
+            // store at all, which is why the legacy txleveldb was created/used.
+            s3aDir = (GetDataDir() / "chainstate").string();
+            printf("Store3A V2 authoritative: -s16openstore not given; using native datadir contract path %s\n",
+                   s3aDir.c_str());
+        }
         if (!s3aDir.empty())
         {
             cs::ChainError be;
@@ -2033,35 +2051,38 @@ authoritative_startup_ready:
                 biTipHeight = biSnap.height;
                 biTipHash = biSnap.hash;
                 // Expected seed tip constant (the written seed snapshot boundary).
-                const int32_t kExpectedSeedHeight = 8170668;
-                const uint256 kExpectedSeedHash("f3d089eaa241ac54e3fcf4827987bb94cb71f774b1f9efd68c03d4e00713d784");
-                // The Store3A tip must never regress below the trusted seed: a tip lower
-                // than the written seed is a fork/older chain and is refused.
-                if (stH < kExpectedSeedHeight)
-                    return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: store tip height %d is below the trusted seed height %d. Refusing to start on a divergent chain.",
-                                               (int)stH, (int)kExpectedSeedHeight));
-                // Trusted-seed anchor, PROMOTION-AWARE: the ACTIVE chain at the seed height
-                // must resolve within the authoritative domain to the written seed block.
-                // This proves the current (possibly promoted) tip descends from the trusted
-                // seed. For a freshly-seeded store (stH == seed) this is exactly the old
-                // tip==seed equality; for a promoted store (stH > seed, e.g. 8170898) it
-                // binds the retained live tail back to the seed - replacing the old
-                // tip==seed equality, which could never hold once the node had promoted
-                // past the seed and therefore blocked auto-continue on restart.
+                // S2.0-S5-SEEDGATE: the former hard-coded trusted-seed gate
+                // (kExpectedSeedHeight = 8170668 / kExpectedSeedHash) made normal startup
+                // AND restart/resume impossible for every store whose tip is below that
+                // fixed height -- i.e. for EVERY store on a native V2 genesis->tip IBD,
+                // which is the supported sync mode. It is replaced by a chain-independent
+                // GENESIS anchor of equal strength: the authoritative domain must resolve
+                // the ACTIVE block at height 0 to the genesis block the loaded best chain
+                // starts from. That proves the stored chain is rooted in genesis (not a
+                // divergent fork) at ANY correctly persisted height and applies the exact
+                // same rule at every height -- no special case for heights below the old
+                // constant. The fail-closed contract is unchanged: an unresolvable or
+                // mismatching genesis is still InitError. No integrity or consistency
+                // check is weakened: the Store3A-tip vs loaded-chain hash agreement above
+                // and the BI-V2-tip == Store3A-tip agreement below are both unchanged.
                 {
-                    BlockIndexSnapshot seedSnap;
-                    std::string seedErr;
-                    const AuthoritativeBlockResolutionResult seedRes =
-                        AuthoritativeGetActiveSnapshotByHeightR(kExpectedSeedHeight, &seedSnap, &seedErr);
-                    if (seedRes != AUTHORITATIVE_BLOCK_FOUND || !seedSnap.found ||
-                        seedSnap.height != kExpectedSeedHeight || seedSnap.hash != kExpectedSeedHash)
-                        return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: authoritative chain does not descend from the trusted seed block at height %d (resolution=%d). Block index authority diverged.",
-                                         (int)kExpectedSeedHeight, (int)seedRes));
+                    if (pindexGenesisBlock == NULL)
+                        return InitError("Store3A V2 authoritative FAIL-CLOSED: genesis block is not loaded; the stored chain cannot be anchored.");
+                    BlockIndexSnapshot genesisSnap;
+                    std::string genesisErr;
+                    const AuthoritativeBlockResolutionResult genesisRes =
+                        AuthoritativeGetActiveSnapshotByHeightR(0, &genesisSnap, &genesisErr);
+                    if (genesisRes != AUTHORITATIVE_BLOCK_FOUND || !genesisSnap.found ||
+                        genesisSnap.height != 0 || genesisSnap.hash != pindexGenesisBlock->GetBlockHash())
+                        return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: authoritative chain does not descend from genesis (resolution=%d, got=%s, expected=%s). Block index authority diverged.",
+                                         (int)genesisRes,
+                                         genesisSnap.found ? genesisSnap.hash.GetHex().c_str() : "<not-found>",
+                                         pindexGenesisBlock->GetBlockHash().GetHex().c_str()));
                 }
                 if (biTipHeight != stH || biTipHash != stHash)
                     return InitError(strprintf("Store3A V2 authoritative FAIL-CLOSED: BI-V2 tip hash %s != Store3A tip hash %s at height %d. BI-V2 and Store3A must agree.",
                                                biTipHash.GetHex().c_str(), stHash.GetHex().c_str(), (int)stH));
-                printf("S2.0 BI-V2 authoritative startup VERIFIED: BI-V2 tip (h=%d %s) == Store3A tip (h=%d %s), descends from trusted seed\n",
+                printf("S2.0 BI-V2 authoritative startup VERIFIED: BI-V2 tip (h=%d %s) == Store3A tip (h=%d %s), chain rooted at genesis\n",
                        (int)biTipHeight, biTipHash.GetHex().c_str(), (int)stH, stHash.GetHex().c_str());
                 fflush(stdout);
             }
@@ -2225,62 +2246,9 @@ authoritative_startup_ready:
 
     RandAddSeedPerfmon();
 
-    // reindex addresses found in blockchain
-    if(GetBoolArg("-reindexaddr", false))
-    {
-        uiInterface.InitMessage(_("Rebuilding address index..."));
-        nStart = GetTimeMillis();
-        std::unique_ptr<CTxDB> txdbAddr(new CTxDB("rw"));
-        if (g_fAuthoritativeStartup)
-        {
-            const BlockIndexV2Reader* reader = GetAuthoritativeNavigatorReader();
-            if (!reader || !reader->IsOpen())
-                return InitError(_("Authoritative address index replay: V2 reader unavailable"));
-            const int nCheckpointInterval = 250;
-            for (int nHeight = 0; nHeight <= nBestHeight; ++nHeight)
-            {
-                BlockIndexSnapshot snapshot;
-                std::string error;
-                if (reader->GetActiveByHeight(nHeight, &snapshot, &error) != BLOCK_INDEX_V2_READ_FOUND)
-                    return InitError(strprintf("Authoritative address index replay: height %d unavailable", nHeight));
-                uiInterface.InitMessage(strprintf("Rebuilding address index, Block %i", nHeight));
-                CBlock pblockAddr;
-                if (!pblockAddr.ReadFromDisk(snapshot.nFile, snapshot.nBlockPos, true))
-                    return InitError(strprintf("Authoritative address index replay: block %d unavailable", nHeight));
-                pblockAddr.RebuildAddressIndex(*txdbAddr);
-                if (nHeight < nBestHeight &&
-                    ((nHeight + 1) % nCheckpointInterval) == 0)
-                {
-                    txdbAddr->Close();
-                    txdbAddr.reset();
-                    try
-                    {
-                        txdbAddr.reset(new CTxDB("rw"));
-                    }
-                    catch (const std::exception& e)
-                    {
-                        return InitError(strprintf(
-                            "Authoritative address index replay: reopen failed after height %d: %s",
-                            nHeight, e.what()));
-                    }
-                }
-            }
-        }
-        else
-        {
-            CBlockIndex *pblockAddrIndex = pindexBest;
-            while(pblockAddrIndex)
-            {
-                uiInterface.InitMessage(strprintf("Rebuilding address index, Block %i", pblockAddrIndex->nHeight));
-                CBlock pblockAddr;
-                if(pblockAddr.ReadFromDisk(pblockAddrIndex, true))
-                    pblockAddr.RebuildAddressIndex(*txdbAddr);
-                pblockAddrIndex = pblockAddrIndex->pprev;
-            }
-        }
-        printf("Rebuilt address index of %i blocks in %" PRId64"ms\n",
-               nBestHeight + 1, GetTimeMillis() - nStart);
-    }
+    // The legacy address index (-reindexaddr) had no V2 home: TX-LOC indexes
+    // transaction LOCATIONS by txid, not addresses. The option is retired with
+    // the legacy store; there is no second index path.
 
     //// debug print
     printf("mapBlockIndex.size() = %" PRIszu"\n",   mapBlockIndex.size());

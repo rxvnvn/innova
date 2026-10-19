@@ -13,7 +13,6 @@
 #include "blockindex_v2_reader.h"
 #include "candidate_frontier.h"
 #include "main.h"
-#include "txdb.h"
 #include <mutex>              // R4 AUTHORITY_READY barrier
 #include <condition_variable> // R4 AUTHORITY_READY barrier
 #include <chrono>             // R4 AUTHORITY_READY barrier
@@ -79,19 +78,9 @@ bool PublishStartupGlobals(AuthoritativeStartupContext& ctx, std::string* error)
     // nBestInvalidTrust is a legacy-only diagnostic scalar, not block-index
     // authority; leave it at the canonical default 0 and never open legacy.
     {
-        CBigNum bn = 0;
-        if (s16::V2LegacyIndexGuardActive())
-        {
-            nBestInvalidTrust = uint256(0);   // V2 store mode: legacy read prohibited
-        }
-        else
-        {
-            CTxDB txdb("r");
-            if (txdb.ReadBestInvalidTrust(bn))
-                nBestInvalidTrust = bn.getuint256();
-            else
-                nBestInvalidTrust = uint256(0);
-        }
+        // nBestInvalidTrust is a legacy-only diagnostic scalar with no V2 home;
+        // the canonical default is 0.
+        nBestInvalidTrust = uint256(0);
     }
 
     if (error) error->clear();

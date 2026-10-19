@@ -39,10 +39,15 @@ namespace fs = boost::filesystem;
 
 static std::string MakeTempDir()
 {
-    char tmpl[] = "/tmp/innova-p7-XXXXXX";
-    char* d = mkdtemp(tmpl);
-    BOOST_REQUIRE(d != NULL);
-    return std::string(d);
+    // Use the SAME temp root as BuildBaseGeneration (fs::temp_directory_path,
+    // which honours TMPDIR). Hard-coding "/tmp" here made root and the built
+    // generation land on DIFFERENT filesystems whenever TMPDIR pointed elsewhere
+    // (e.g. a scratch dir on another mount), so the final fs::rename(tmp, target)
+    // failed with "Invalid cross-device link" -- a harness defect, not a store bug.
+    namespace bfs = boost::filesystem;
+    const bfs::path d = bfs::temp_directory_path() / bfs::unique_path("innova-p7-%%%%-%%%%");
+    bfs::create_directories(d);
+    return d.string();
 }
 
 static BlockIndexRecord MakeRecord(uint256 hash, uint256 hashPrev, int height,
@@ -120,7 +125,7 @@ static void BuildBaseGeneration(const std::string& root, uint64_t gen,
     fs::path tmp = fs::temp_directory_path() / fs::unique_path("innova-p7-%%%%-%%%%");
     BOOST_REQUIRE_MESSAGE(b.Build(src, tmp.string(), gen, &stats, &error), error);
     b.Close();
-    fs::path target = fs::path(root) / (strprintf("blockindex-gen-%06llu", (unsigned long long)gen));
+    fs::path target = fs::path(root) / (strprintf("gen-%06llu", (unsigned long long)gen));
     fs::create_directories(root);
     BOOST_REQUIRE(!fs::exists(target));
     fs::rename(tmp, target);
@@ -193,10 +198,15 @@ BOOST_AUTO_TEST_CASE(e2e_full_lifecycle)
     BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 4); // unchanged
 
     // ---- STEP 1: restart (kill drop) -> effective tip == S+k ----
+    // A kill-drop restart means the previous PROCESS is gone, so the in-process
+    // tip authority must release its LevelDB LOCK before the restart re-opens the
+    // same directory. Leaving it open made the restart fail with
+    // "tip-hashindex ... LOCK: already held by process" -- a harness defect.
+    tip.Close();
     {
         BlockIndexAuthoritativeRestart restart;
         std::string err;
-        BOOST_REQUIRE(restart.OpenBaseAndTip(root, true, baseGen, NULL, &err));
+        BOOST_REQUIRE_MESSAGE(restart.OpenBaseAndTip(root, true, baseGen, NULL, &err), err);
         BOOST_REQUIRE(restart.HasPostSTip());
         BOOST_REQUIRE_EQUAL(restart.EffectiveTipHeight(), baseTip + 4);
         BOOST_REQUIRE(restart.EffectiveTipHash() == prev); // S+4 tip

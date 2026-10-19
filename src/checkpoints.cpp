@@ -10,7 +10,6 @@
 #include "blockindex_authoritative_startup.h"   // V2-R2B: authoritative by-value resolver
 #include "chainstate/observe_hook.h"             // S2.0: V2 store legacy-index guard
 #include "chainstate/store3a/incstore.h"          // P2(S4): csReadFile/csWriteFile/ChainError (V2 scalar home)
-#include "txdb.h"
 #include "main.h"
 #include "uint256.h"
 
@@ -309,32 +308,23 @@ namespace Checkpoints
             // (chainstate/sync-checkpoint), so this boot probe NEVER opens the
             // legacy LevelDB — a clean V2 datadir gets NO txleveldb created. In
             // legacy (non-V2) mode keep the old behavior.
-            if (g_fAuthoritativeStartup)
-            {
-                const SyncCheckpointLoadStatus vs = ReadV2SyncCheckpointScalar(hashOut, error);
-                if (vs == SYNC_CHECKPOINT_CORRUPT && error)
-                    *error = "V2 persisted hashSyncCheckpoint scalar is present but not decodable";
-                return vs;
-            }
-            s16::V2LegacyIndexProbeScope probe;
-            CTxDB txdb("r");
-            const SyncCheckpointLoadStatus st = txdb.LoadSyncCheckpoint(hashOut);
-            if (st == SYNC_CHECKPOINT_CORRUPT && error)
-                *error = "persisted hashSyncCheckpoint entry is present but not decodable";
-            return st;
+            const SyncCheckpointLoadStatus vs = ReadV2SyncCheckpointScalar(hashOut, error);
+            if (vs == SYNC_CHECKPOINT_CORRUPT && error)
+                *error = "V2 persisted hashSyncCheckpoint scalar is present but not decodable";
+            return vs;
         }
         catch (const std::exception& e)
         {
             hashOut = uint256(0);
             if (error)
-                *error = std::string("legacy tx-leveldb open/read failed: ") + e.what();
+                *error = std::string("V2 sync-checkpoint scalar read failed: ") + e.what();
             return SYNC_CHECKPOINT_CORRUPT;
         }
         catch (...)
         {
             hashOut = uint256(0);
             if (error)
-                *error = "legacy tx-leveldb open/read failed (unknown exception)";
+                *error = "V2 sync-checkpoint scalar read failed (unknown exception)";
             return SYNC_CHECKPOINT_CORRUPT;
         }
     }
@@ -1284,16 +1274,6 @@ namespace Checkpoints
             printf("WriteSyncCheckpoint(): V2 scalar persisted %s\n", hashCheckpoint.ToString().c_str());
             return true;
         }
-        CTxDB txdb;
-        txdb.TxnBegin();
-        if (!txdb.WriteSyncCheckpoint(hashCheckpoint))
-        {
-            txdb.TxnAbort();
-            return error("WriteSyncCheckpoint(): failed to write to db sync checkpoint %s", hashCheckpoint.ToString().c_str());
-        }
-        if (!txdb.TxnCommit())
-            return error("WriteSyncCheckpoint(): failed to commit to db sync checkpoint %s", hashCheckpoint.ToString().c_str());
-
         Checkpoints::hashSyncCheckpoint = hashCheckpoint;
         return true;
     }
@@ -1350,24 +1330,6 @@ namespace Checkpoints
                 return false;
             }
 
-            if (!g_fAuthoritativeStartup)
-            {
-                CTxDB txdb;
-                CBlockIndex* pindexCheckpoint = mapBlockIndex[hashPendingCheckpoint];
-                if (!pindexCheckpoint->IsInMainChain())
-                {
-                    CBlock block;
-                    if (!block.ReadFromDisk(pindexCheckpoint))
-                        return error("AcceptPendingSyncCheckpoint: ReadFromDisk failed for sync checkpoint %s", hashPendingCheckpoint.ToString().c_str());
-
-                    if (!block.SetBestChain(txdb, pindexCheckpoint))
-                    {
-                        hashInvalidCheckpoint = hashPendingCheckpoint;
-                        return error("AcceptPendingSyncCheckpoint: SetBestChain failed for sync checkpoint %s", hashPendingCheckpoint.ToString().c_str());
-                    };
-                };
-            }
-            else
             {
                 // ROUND-2 P1: KNOWN-but-NOT-ACTIVE checkpoint -> legacy forced
                 // promotion through the existing consensus engine. Guarded (the
@@ -1493,11 +1455,10 @@ namespace Checkpoints
         {
             // checkpoint block accepted but not yet in main chain
             printf("ResetSyncCheckpoint: SetBestChain to hardened checkpoint %s\n", hash.ToString().c_str());
-            CTxDB txdb;
             CBlock block;
             if (!block.ReadFromDisk(mi->second))
                 return error("ResetSyncCheckpoint: ReadFromDisk failed for hardened checkpoint %s", hash.ToString().c_str());
-            if (!block.SetBestChain(txdb, mi->second))
+            if (!block.SetBestChain(mi->second))
             {
                 return error("ResetSyncCheckpoint: SetBestChain failed for hardened checkpoint %s", hash.ToString().c_str());
             };
@@ -1755,24 +1716,6 @@ bool CSyncCheckpoint::ProcessSyncCheckpoint(CNode* pfrom)
         return false;
     }
 
-    if (!g_fAuthoritativeStartup)
-    {
-        CTxDB txdb;
-        CBlockIndex* pindexCheckpoint = mapBlockIndex[hashCheckpoint];
-        if (!pindexCheckpoint->IsInMainChain())
-        {
-            // checkpoint chain received but not yet main chain
-            CBlock block;
-            if (!block.ReadFromDisk(pindexCheckpoint))
-                return error("ProcessSyncCheckpoint: ReadFromDisk failed for sync checkpoint %s", hashCheckpoint.ToString().c_str());
-            if (!block.SetBestChain(txdb, pindexCheckpoint))
-            {
-                Checkpoints::hashInvalidCheckpoint = hashCheckpoint;
-                return error("ProcessSyncCheckpoint: SetBestChain failed for sync checkpoint %s", hashCheckpoint.ToString().c_str());
-            };
-        };
-    }
-    else
     {
         // ROUND-2 P1: KNOWN-but-NOT-ACTIVE checkpoint -> legacy forced
         // promotion through the existing consensus engine. On refusal the

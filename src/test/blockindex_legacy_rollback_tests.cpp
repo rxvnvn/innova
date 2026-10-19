@@ -31,7 +31,6 @@
 #include <boost/test/unit_test.hpp>
 
 #include "db.h"
-#include "txdb.h"
 #include "main.h"
 
 #include <leveldb/db.h>

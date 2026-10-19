@@ -1211,12 +1211,10 @@ public:
     int64_t GetTxTime() const;
     int GetRequestCount() const;
 
-    void AddSupportingTransactions(CTxDB& txdb);
+    void AddSupportingTransactions();
 
-    bool AcceptWalletTransaction(CTxDB& txdb);
     bool AcceptWalletTransaction();
 
-    void RelayWalletTransaction(CTxDB& txdb);
     void RelayWalletTransaction();
 };
 

@@ -135,8 +135,35 @@ public:
     int64_t RejectedBlockTime() const { return nRejectedBlockTime; }
     unsigned int RecoveryAttempts() const { return nRecoveryAttempts; }
     void MarkSyncRequestSent(int64_t nNow);
+    // A recovery attempt was recorded by ShouldRecover, but the getblocks
+    // that was supposed to carry it never reached the wire (PushGetBlocks
+    // refused it: identical-locator dedup, pending-slot coalescing/drop).
+    // That is a LOCAL failure, not a peer that failed to answer: undo the
+    // attempt charge so a dropped request cannot inflate the exponential
+    // cooldown and starve the next real retry.
+    void NoteRecoveryPushDropped(int64_t nNow);
     bool SyncRequestSent() const { return fSyncRequestSent; }
 };
+
+// IBD stalled-pipeline watchdog (see net.cpp).  Named so that the decision
+// logic can be unit-tested without sockets or a live chain.
+enum IbdStallWatchdogAction
+{
+    IBD_STALL_WATCHDOG_NONE = 0,
+    IBD_STALL_WATCHDOG_ROTATE_PEER,
+    IBD_STALL_WATCHDOG_REISSUE,
+    IBD_STALL_WATCHDOG_RECYCLE_PEER
+};
+
+bool IbdStallWatchdogEnabled();
+int64_t IbdStallWatchdogWindow();
+IbdStallWatchdogAction DecideIbdStallWatchdogAction(
+    bool fIbd, bool fTipKnown, int64_t nNow, int64_t nHeightSince,
+    int64_t nLastAction, int nEligiblePeers, int nRecentRecvPeers,
+    bool fHungWork, int64_t nWindow, unsigned int nConsecutiveActions);
+void IbdStallWatchdogStep(const std::vector<CNode*>& vNodesIn,
+                          int nLocalHeight, int64_t nNow,
+                          const uint256& hashTip);
 
 enum GetBlocksServerAction
 {

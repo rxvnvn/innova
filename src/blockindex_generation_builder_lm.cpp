@@ -2,8 +2,8 @@
 // Distributed under the MIT/X11 software license.
 
 #include "blockindex_generation_builder_lm.h"
+#include <leveldb/write_batch.h>
 
-#include "txdb-leveldb.h"
 #include "main.h"
 #include "kernel.h"
 

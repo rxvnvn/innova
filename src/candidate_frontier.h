@@ -6,7 +6,6 @@
 #define BITCOIN_CANDIDATE_FRONTIER_H
 
 #include "main.h"
-#include "txdb.h"
 
 #include <vector>
 
@@ -147,7 +146,5 @@ CBlockIndex* EvaluateCandidateFrontier();
 void ShadowCompareCandidateSelection();
 
 // --- persistence (A.10.1c: generation-bound, fail-closed) ---
-bool WriteCandidateTips(CTxDB& txdb);
-bool ReadCandidateTips(CTxDB& txdb);
 
 #endif // BITCOIN_CANDIDATE_FRONTIER_H

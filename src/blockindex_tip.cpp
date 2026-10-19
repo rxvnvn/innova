@@ -33,7 +33,7 @@ namespace fs = boost::filesystem;
 
 namespace {
 
-static const char* const BLOCK_INDEX_TIP_DIR_NAME = "blockindex_tip";
+static const char* const BLOCK_INDEX_TIP_DIR_NAME = "tip";
 static const char* const BLOCK_INDEX_TIP_META_FILE = "tip.meta";
 static const char* const BLOCK_INDEX_TIP_RECORDS_FILE = "tip-records.dat";
 static const char* const BLOCK_INDEX_TIP_ACTIVE_FILE = "tip-active.dat";
@@ -1645,11 +1645,11 @@ bool BlockIndexTipAuthority::Create(const std::string& root,
     if (!i->InitializePaths(root))
         return SetError(error, "init tip paths failed");
     if (fs::exists(i->tipDir))
-        return SetError(error, "blockindex_tip already exists");
+        return SetError(error, "tip authority already exists");
 
     boost::system::error_code ec;
     if (!fs::create_directories(i->tipDir, ec) && ec)
-        return SetError(error, "create blockindex_tip failed");
+        return SetError(error, "create tip authority failed");
 
     i->meta = BlockIndexTipMeta();
     i->meta.version = BLOCK_INDEX_TIP_META_VERSION;
@@ -1719,10 +1719,10 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
     if (!i->InitializePaths(root))
         return SetError(error, "init tip paths failed");
     if (!fs::exists(i->metaPath))
-        return SetError(error, "tip.meta absent (no blockindex_tip to open)");
+        return SetError(error, "tip.meta absent (no tip authority to open)");
     if (!fs::exists(i->recordsPath) || !fs::exists(i->activePath) ||
         !fs::exists(i->derivedPath))
-        return SetError(error, "blockindex_tip incomplete store set");
+        return SetError(error, "tip authority incomplete store set");
 
     // 1. Load tip.meta.
     std::string metadat;

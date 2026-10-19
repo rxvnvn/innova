@@ -28,7 +28,6 @@
 #include <vector>
 
 #include "db.h"
-#include "txdb.h"
 #include "main.h"
 #include "miner.h"
 #include "wallet.h"
@@ -99,7 +98,7 @@ static void B94BuildRoot(const fs::path& root, std::string* error)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, error), *error);
     source.blockDataDir = GetDataDir().string();
     BlockIndexGenerationBuilder builder;
-    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "blockindex-build-000001.tmp").string(), 1, NULL, error), *error);
+    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, error), *error);
     builder.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);

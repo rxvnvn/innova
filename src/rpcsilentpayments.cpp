@@ -8,7 +8,6 @@
 
 #include "main.h"
 #include "innovarpc.h"
-#include "txdb-leveldb.h"
 #include "wallet.h"
 #include "walletdb.h"
 #include "silentpayments.h"
@@ -94,8 +93,6 @@ Value sp_send(const Array& params, bool fHelp)
 
     {
         LOCK2(cs_main, pwalletMain->cs_wallet);
-        CTxDB txdb("r");
-
         int64_t nFeeRet = nTransactionFee;
         static const int MAX_FEE_RETRIES = 20;
         for (int nFeeRetry = 0; nFeeRetry < MAX_FEE_RETRIES; nFeeRetry++)
@@ -196,7 +193,7 @@ Value sp_send(const Array& params, bool fHelp)
                 continue;
             }
 
-            wtxNew.AddSupportingTransactions(txdb);
+            wtxNew.AddSupportingTransactions();
             wtxNew.fTimeReceivedIsTxTime = true;
 
             if (!pwalletMain->CommitTransaction(wtxNew, reservekey))

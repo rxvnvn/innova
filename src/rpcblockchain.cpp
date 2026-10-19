@@ -6,7 +6,6 @@
 #include "main.h"
 #include "innovarpc.h"
 #include "init.h"
-#include "txdb.h"
 #include "bootstrap.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_manager.h"
@@ -898,14 +897,13 @@ Value setbestblockbyheight(const Array& params, bool fHelp)
 
     Object result;
 
-    CTxDB txdb;
     {
         LOCK(cs_main);
 
         printf("setbestblockbyheight: rolling back from %d to %d (regtest mode)\n",
                nBestHeight, nHeight);
 
-        if (!block.SetBestChain(txdb, pblockindex))
+        if (!block.SetBestChain(pblockindex))
             result.push_back(Pair("result", "failure"));
         else
             result.push_back(Pair("result", "success"));

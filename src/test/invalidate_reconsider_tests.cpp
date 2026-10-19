@@ -27,7 +27,6 @@
 
 #include "main.h"
 #include "miner.h"
-#include "txdb.h"
 #include "wallet.h"
 
 #include <algorithm>

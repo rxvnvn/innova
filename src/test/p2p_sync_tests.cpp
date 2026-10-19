@@ -29,7 +29,6 @@
 #include "main.h"
 #include "net.h"
 #include "protocol.h"
-#include "txdb.h"
 #include "util.h"
 #include "version.h"
 
@@ -1717,6 +1716,79 @@ BOOST_AUTO_TEST_CASE(stalled_sync_recovery_queues_exactly_one_getblocks)
     BOOST_REQUIRE(owner != NULL);
     BOOST_CHECK_EQUAL(QueuedGetBlocksCount(peers), 1U);
     BOOST_CHECK_EQUAL(owner->getBlocksIndex.size(), 1U);
+}
+
+// ---------------------------------------------------------------------------
+// IBD stalled-pipeline watchdog decision table (pure function, no sockets).
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(ibd_stall_watchdog_decision_table)
+{
+    const int64_t W = 90;
+    const int64_t T0 = 1000000;
+
+    // Not in IBD / no tip identity -> never act.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        false, true, T0 + W + 1, T0, 0, 3, 0, true, W, 0), IBD_STALL_WATCHDOG_NONE);
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, false, T0 + W + 1, T0, 0, 3, 0, true, W, 0), IBD_STALL_WATCHDOG_NONE);
+
+    // Height still progressing inside the window -> no action.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + W - 1, T0, 0, 3, 0, true, W, 0), IBD_STALL_WATCHDOG_NONE);
+
+    // Window elapsed but a peer delivered a block recently -> healthy.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + W + 1, T0, 0, 3, 1, true, W, 0), IBD_STALL_WATCHDOG_NONE);
+
+    // Window elapsed, nothing received, but no hung work -> normal path works.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + W + 1, T0, 0, 3, 0, false, W, 0), IBD_STALL_WATCHDOG_NONE);
+
+    // No eligible peers -> nothing to rotate or re-issue.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + W + 1, T0, 0, 0, 0, true, W, 0), IBD_STALL_WATCHDOG_NONE);
+
+    // The stall signature: frozen height, no receives, hung work, alternatives.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + W + 1, T0, 0, 2, 0, true, W, 0),
+        IBD_STALL_WATCHDOG_ROTATE_PEER);
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + W + 1, T0, 0, 5, 0, true, W, 0),
+        IBD_STALL_WATCHDOG_ROTATE_PEER);
+
+    // Only one eligible peer: rotate would leave zero peers -> re-issue.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + W + 1, T0, 0, 1, 0, true, W, 0),
+        IBD_STALL_WATCHDOG_REISSUE);
+
+    // Single peer that already ignored one forced reissue: escalate to a
+    // connection recycle instead of reissuing to the same silent peer forever.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + 3 * W + 1, T0, T0 + W + 1, 1, 0, true, W, 1),
+        IBD_STALL_WATCHDOG_REISSUE);
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + 6 * W + 1, T0, T0 + 2 * W + 1, 1, 0, true, W, 2),
+        IBD_STALL_WATCHDOG_RECYCLE_PEER);
+    // ...while two eligible peers keep using bounded rotation.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + 6 * W + 1, T0, T0 + 2 * W + 1, 2, 0, true, W, 2),
+        IBD_STALL_WATCHDOG_ROTATE_PEER);
+
+    // Rate limit: one action per effective window.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + W + 5, T0, T0 + W + 1, 3, 0, true, W, 1),
+        IBD_STALL_WATCHDOG_NONE);
+
+    // Backoff: 3 consecutive actions without progress -> 8x window.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + 4 * W, T0, 0, 3, 0, true, W, 3), IBD_STALL_WATCHDOG_NONE);
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 + 8 * W + 1, T0, 0, 3, 0, true, W, 3),
+        IBD_STALL_WATCHDOG_ROTATE_PEER);
+
+    // Clock reversal must never trigger an action.
+    BOOST_CHECK_EQUAL(DecideIbdStallWatchdogAction(
+        true, true, T0 - 1, T0, 0, 3, 0, true, W, 0), IBD_STALL_WATCHDOG_NONE);
 }
 
 BOOST_AUTO_TEST_CASE(stalled_sync_recovery_ignores_fstartsync_without_block_requests)

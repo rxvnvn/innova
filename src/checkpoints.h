@@ -7,7 +7,14 @@
 #include <map>
 #include "net.h"
 #include "util.h"
-#include "txdb.h"   // SyncCheckpointLoadStatus (V2-R2B FIX A typed seam)
+// SyncCheckpointLoadStatus (V2-R2B FIX A typed seam) -- was declared in the
+// retired legacy txdb header; checkpoints own this status now.
+enum SyncCheckpointLoadStatus
+{
+    SYNC_CHECKPOINT_ABSENT  = 0,
+    SYNC_CHECKPOINT_LOADED  = 1,
+    SYNC_CHECKPOINT_CORRUPT = 2,
+};
 
 #ifdef WIN32
 #undef STRICT

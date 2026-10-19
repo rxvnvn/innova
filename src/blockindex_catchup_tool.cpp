@@ -178,7 +178,7 @@ bool RunBlockIndexCatchup(const std::string& v2Root,
     const uint64_t gen = reader.Generation();
     const uint64_t baseRec = reader.RecordCount();
     BlockIndexTipAuthority tip;
-    fs::path tipMeta = fs::path(v2Root) / "blockindex_tip" / "tip.meta";
+    fs::path tipMeta = fs::path(v2Root) / "tip" / "tip.meta";
     if (fs::exists(tipMeta))
     {
         if (!BlockIndexTipAuthority::Open(v2Root, gen, &tip, &err))

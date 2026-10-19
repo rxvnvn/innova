@@ -17,10 +17,10 @@
 namespace fs = boost::filesystem;
 
 // =====================================================================
-// P5 — authoritative restart reconstruction from base + blockindex_tip.
+// P5 — authoritative restart reconstruction from base + tip.
 //
 // Causal gate (mandatory end-state #7):
-//   Accept S+1..S+k live (persisted to blockindex_tip/), then "kill" (drop all
+//   Accept S+1..S+k live (persisted to tip/), then "kill" (drop all
 //   in-memory state), then authoritative restart = reopen base+tip, then
 //   effective tip MUST equal the exact post-S tip S+k (NOT regress to S).
 //
@@ -224,21 +224,21 @@ BOOST_AUTO_TEST_CASE(r4_crash_tail_truncated_on_restart)
         BlockIndexRecord bogus = MakeRecord(uint256(0x5152UL), uint256(0x5151UL), 52, false);
         std::vector<unsigned char> enc;
         BOOST_REQUIRE(EncodeBlockIndexRecordV1(bogus, &enc, NULL));
-        FILE* f = fopen((dir + "/blockindex_tip/tip-records.dat").c_str(), "ab");
+        FILE* f = fopen((dir + "/tip/tip-records.dat").c_str(), "ab");
         BOOST_REQUIRE(f != NULL);
         BOOST_REQUIRE(fwrite(&enc[0], 1, enc.size(), f) == enc.size());
         fclose(f);
         std::string aenc;
         bool aok = EncodeBlockIndexActiveEntry(500u + 1u + 1u, &aenc, NULL); // id = base500+1+1
         BOOST_REQUIRE(aok);
-        FILE* fa = fopen((dir + "/blockindex_tip/tip-active.dat").c_str(), "ab");
+        FILE* fa = fopen((dir + "/tip/tip-active.dat").c_str(), "ab");
         BOOST_REQUIRE(fa != NULL);
         BOOST_REQUIRE(fwrite(aenc.data(), 1, aenc.size(), fa) == aenc.size());
         fclose(fa);
         BlockIndexDerivedEntry bogusD = MakeDerived(uint256(0x22UL), 22);
         std::vector<unsigned char> denc;
         BOOST_REQUIRE(EncodeBlockIndexDerivedEntry(bogusD, &denc, NULL));
-        FILE* fd = fopen((dir + "/blockindex_tip/tip-derived.dat").c_str(), "ab");
+        FILE* fd = fopen((dir + "/tip/tip-derived.dat").c_str(), "ab");
         BOOST_REQUIRE(fd != NULL);
         BOOST_REQUIRE(fwrite(&denc[0], 1, denc.size(), fd) == denc.size());
         fclose(fd);

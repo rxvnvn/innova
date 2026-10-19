@@ -432,7 +432,6 @@ extern int64_t nMinTxFee;
 static const uint64_t nMinDiskSpace = 524288000; // 500 MB Minimum (temporary for regtest/testing)
 
 class CReserveKey;
-class CTxDB;
 class CTxIndex;
 class CIncrementalMerkleTree;
 void RegisterWallet(CWallet* pwalletIn);
@@ -545,7 +544,7 @@ bool ReconsiderBlock(const uint256& hash, std::string& strError);
 
 // R3 (PM1-P0-03): startup reconciliation of the legacy compatibility mirror
 // against committed V2 authority (V2 wins). No-op in legacy mode.
-bool ReconcileLegacyCompatibilityMirror(std::string& strError);
+bool ReconcileOperatorInvalidSetFromV2(std::string& strError);
 
 // R3F test-only fault injection for the PRODUCTION authority transition path.
 // Inert unless armed by a test; one-shot. Names:
@@ -570,7 +569,7 @@ bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* 
                                                    CBlockIndex* pindexNew,
                                                    const uint256& oldPublishedTipHash,
                                                    std::string* outErr);
-// Called from CTxDB::LoadBlockIndex (both backends) after setInvalidBlockHash is
+// Called from the V2 block-index load after setInvalidBlockHash is
 // loaded and the naive pindexBest reconstructed: rolls the best chain back to
 // the highest valid ancestor if it descends from an operator-invalidated block.
 bool RecoverFromInvalidatedBestChain();
@@ -627,7 +626,7 @@ void PrimeIbdFreshPeerGraceFirstSeenForTesting(int64_t nFirstSeen);
 int64_t IbdStaleSecondsForTesting();
 std::string GetWarnings(std::string strFor);
 bool GetTransaction(const uint256 &hash, CTransaction &tx, uint256 &hashBlock, bool s=false);
-bool TxnHashInSystem(CTxDB* ptxdb, uint256& txnHash);
+bool TxnHashInSystem(uint256& txnHash);
 uint256 WantedByOrphan(const CBlock* pblockOrphan);
 const CBlockIndex* GetLastBlockIndex(const CBlockIndex* pindex, bool fProofOfStake);
 void StakeMiner(CWallet *pwallet);
@@ -636,7 +635,6 @@ void ResendWalletTransactions(bool fForce = false);
 
 bool Finalise();
 
-bool FindTransactionsByDestination(const CTxDestination &dest, std::vector<uint256> &vtxhash);
 
 
 int GetInputAge(CTxIn& vin, CBlockIndex* pindex);
@@ -949,8 +947,7 @@ public:
     }
 
 
-    bool ReadFromDisk(CTxDB& txdb, COutPoint prevout, CTxIndex& txindexRet);
-    bool ReadFromDisk(CTxDB& txdb, COutPoint prevout);
+    bool ReadFromDisk(COutPoint prevout, CTxIndex& txindexRet);
     bool ReadFromDisk(COutPoint prevout);
 
     /** Fetch from memory and/or disk. inputsRet keys are transaction hashes.
@@ -963,7 +960,7 @@ public:
      @param[out] fInvalid	returns true if transaction is invalid
      @return    Returns true if all inputs are in txdb or mapTestPool
      */
-    bool FetchInputs(CTxDB& txdb, const std::map<uint256, CTxIndex>& mapTestPool,
+    bool FetchInputs(const std::map<uint256, CTxIndex>& mapTestPool,
                      bool fBlock, bool fMiner, MapPrevTx& inputsRet, bool& fInvalid);
 
     /** Sanity check previous transactions, then, if all checks succeed,
@@ -977,12 +974,12 @@ public:
         @param[in] fMiner	true if called from CreateNewBlock
         @return Returns true if all checks succeed
      */
-    bool ConnectInputs(CTxDB& txdb, MapPrevTx inputs,
+    bool ConnectInputs(MapPrevTx inputs,
                        std::map<uint256, CTxIndex>& mapTestPool, const CDiskTxPos& posThisTx,
                        const CBlockIndex* pindexBlock, bool fBlock, bool fMiner, unsigned int flags = STANDARD_SCRIPT_VERIFY_FLAGS, bool fValidateSig = true, s16_V2InputView* v2View = NULL);
     bool CheckTransaction() const;
-    bool AcceptToMemoryPool(CTxDB& txdb, bool fCheckInputs=true, bool* pfMissingInputs=NULL, bool fOnlyCheckWithoutAdding=false);
-    bool GetCoinAge(CTxDB& txdb, uint64_t& nCoinAge) const;  // ppcoin: get transaction coin age
+    bool AcceptToMemoryPool(bool fCheckInputs=true, bool* pfMissingInputs=NULL, bool fOnlyCheckWithoutAdding=false);
+    bool GetCoinAge(uint64_t& nCoinAge) const;  // ppcoin: get transaction coin age
 
     const CTxOut& GetOutputFor(const CTxIn& input, const MapPrevTx& inputs) const;
 };
@@ -1085,7 +1082,6 @@ public:
     int GetDepthInMainChain() const { CBlockIndex *pindexRet; return GetDepthInMainChain(pindexRet); }
     bool IsInMainChain() const { CBlockIndex *pindexRet; return GetDepthInMainChainINTERNAL(pindexRet) > 0; }
     int GetBlocksToMaturity() const;
-    bool AcceptToMemoryPool(CTxDB& txdb);
     bool AcceptToMemoryPool();
     bool isAbandoned() const { return (hashBlock == ABANDON_HASH); }
     void setAbandoned() { hashBlock = ABANDON_HASH; }
@@ -1098,6 +1094,10 @@ public:
  * locations of transactions that spend its outputs.  vSpent is really only
  * used as a flag, but having the location is very helpful for debugging.
  */
+// V2-native historical transaction location (TX-LOC). Replaces the retired
+// transaction database lookup for "where on disk is this txid".
+bool s16_V2ReadTxIndex(const uint256& hash, CTxIndex& txindexRet);
+
 class CTxIndex
 {
 public:
@@ -1432,20 +1432,20 @@ public:
     }
 
 
-    bool DisconnectBlock(CTxDB& txdb, CBlockIndex* pindex);
-    bool ConnectBlock(CTxDB& txdb, CBlockIndex* pindex, bool fJustCheck=false);
+    bool DisconnectBlock(CBlockIndex* pindex);
+    bool ConnectBlock(CBlockIndex* pindex, bool fJustCheck=false);
     bool ReadFromDisk(const CBlockIndex* pindex, bool fReadTransactions=true);
-    bool SetBestChain(CTxDB& txdb, CBlockIndex* pindexNew);
+    bool SetBestChain(CBlockIndex* pindexNew);
     bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const uint256& hashProof);
     bool CheckBlock(bool fCheckPOW=true, bool fCheckMerkleRoot=true, bool fCheckSig=true, const char** ppszRejectReason=NULL) const;
     bool AcceptBlock();
     bool GetCoinAge(uint64_t& nCoinAge) const; // ppcoin: calculate total coin age spent in block
     bool SignBlock(CWallet& keystore, int64_t nFees);
     bool CheckBlockSignature() const;
-	void RebuildAddressIndex(CTxDB& txdb);
+	void RebuildAddressIndex();
 
 private:
-    bool SetBestChainInner(CTxDB& txdb, CBlockIndex *pindexNew);
+    bool SetBestChainInner(CBlockIndex *pindexNew);
 };
 
 
@@ -2048,7 +2048,7 @@ public:
     std::map<uint256, CTransaction> mapTx;
     std::map<COutPoint, CInPoint> mapNextTx;
 
-    bool accept(CTxDB& txdb, CTransaction &tx,
+    bool accept(CTransaction &tx,
                 bool fCheckInputs, bool* pfMissingInputs, bool fOnlyCheckWithoutAdding=false);
     bool addUnchecked(const uint256& hash, CTransaction &tx);
     bool remove(const CTransaction &tx, bool fRecursive = false);
@@ -2146,10 +2146,8 @@ bool RebuildCandidateTips();
 void UpdateCandidateTips(CBlockIndex* pindexOldTip, CBlockIndex* pindexNewTip);
 
 /** Persist current candidate tip set to txdb. */
-bool WriteCandidateTips(CTxDB& txdb);
 
 /** Load candidate tip set from txdb. Returns false if not found. */
-bool ReadCandidateTips(CTxDB& txdb);
 
 /** Evaluate the bounded candidate frontier and return the best eligible tip
  *  using the EXACT same predicate as ActivateBestEligibleChain but operating

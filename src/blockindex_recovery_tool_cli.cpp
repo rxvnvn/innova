@@ -70,7 +70,7 @@ static void PrintUsage(const char* argv0)
             "  legacy_leveldb_copy: consistent READ-ONLY copy of legacy LevelDB\n"
             "  block_data_dir:     dir with blk%%04u.dat (or empty \"\")\n"
             "  --abandon:          discard partial recovery (preserve prior tip as\n"
-            "                      blockindex_tip.pre-recovery-N/, rollback evidence)\n"
+            "                      tip.pre-recovery-N/, rollback evidence)\n"
             "  --report <path>:    additionally write a machine-readable report there\n",
             argv0);
 }

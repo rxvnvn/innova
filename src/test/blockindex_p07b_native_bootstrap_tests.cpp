@@ -17,7 +17,6 @@
 #include <boost/test/unit_test.hpp>
 
 #include "main.h"
-#include "txdb.h"
 #include "blockindex_native_bootstrap.h"
 #include "blockindex_startup_ownership.h"
 #include "blockindex_generation_builder.h"
@@ -36,7 +35,7 @@ namespace fs = boost::filesystem;
 
 extern void* GetGlobalTxdbPtrForTest();
 
-static const char* kCurrentName = "blockindex-current";
+static const char* kCurrentName = "current";
 
 // ---------------------------------------------------------------------------
 // helpers

@@ -14,6 +14,7 @@
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>
 #include <unistd.h>
+#include <leveldb/write_batch.h>
 
 BlockIndexCandidateStartupBuilder::BlockIndexCandidateStartupBuilder()
 {

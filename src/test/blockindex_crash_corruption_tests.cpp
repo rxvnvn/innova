@@ -18,7 +18,7 @@
 
 // =====================================================================
 // V2-R3 — crash-durability & corruption fail-closed contracts for the
-// mutable Block Index tip authority (blockindex_tip/).
+// mutable Block Index tip authority (tip/).
 //
 // Every injected failure is judged by a CRASH ORACLE: after the failure,
 // Close()+re-Open() must recover EXACTLY one of
@@ -106,15 +106,15 @@ static void R3_CC_BuildChain(BlockIndexTipAuthority& tip, uint32_t n,
 
 static std::string R3_CC_MetaPath(const std::string& dir)
 {
-    return dir + "/blockindex_tip/tip.meta";
+    return dir + "/tip/tip.meta";
 }
 static std::string R3_CC_RecordsPath(const std::string& dir)
 {
-    return dir + "/blockindex_tip/tip-records.dat";
+    return dir + "/tip/tip-records.dat";
 }
 static std::string R3_CC_InvalidPath(const std::string& dir)
 {
-    return dir + "/blockindex_tip/tip-invalid.dat";
+    return dir + "/tip/tip-invalid.dat";
 }
 
 static std::vector<unsigned char> R3_CC_ReadFile(const std::string& path)
@@ -845,7 +845,7 @@ struct R3G_GenFixture
         BlockIndexGenerationBuilder b;
         BlockIndexGenerationStats st;
         std::string error;
-        BOOST_REQUIRE_MESSAGE(b.Build(src, (root / "blockindex-build-000001.tmp").string(), 1, &st, &error), error);
+        BOOST_REQUIRE_MESSAGE(b.Build(src, (root / "build-000001.tmp").string(), 1, &st, &error), error);
         b.Close();
         BOOST_REQUIRE_MESSAGE(
             BlockIndexGenerationManager::PublishGeneration(root.string(), 1, &error) ==

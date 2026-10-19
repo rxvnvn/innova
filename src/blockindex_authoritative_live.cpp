@@ -349,7 +349,7 @@ bool BlockIndexAuthoritativeLive::Open(const std::string& v2Root,
 
     // Open (or create) the mutable tip store under <v2Root>/blockindex_tip.
     impl_->tip.reset(new BlockIndexTipAuthority());
-    fs::path tipMeta = fs::path(v2Root) / "blockindex_tip" / "tip.meta";
+    fs::path tipMeta = fs::path(v2Root) / "tip" / "tip.meta";
     if (fs::exists(tipMeta))
     {
         if (!BlockIndexTipAuthority::Open(v2Root, gen, impl_->tip.get(), error))

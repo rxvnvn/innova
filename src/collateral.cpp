@@ -9,7 +9,6 @@
 #include "util.h"
 #include "collateralnode.h"
 #include "ui_interface.h"
-#include "txdb.h"
 #include "chainstate/observe_hook.h"
 
 #include <openssl/rand.h>
@@ -901,20 +900,13 @@ bool CCollaTeralSigner::IsVinAssociatedWithPubkey(CTxIn& vin, CPubKey& pubkey){
                            vin.prevout.hash.ToString().c_str(), vin.prevout.n);
                 return false;
             }
-            // V2 not armed: legacy txindex spent check (unchanged for non-V2).
-            CTxDB txdb("r");
-            CTxIndex txindex;
-            if (txdb.ReadTxIndex(vin.prevout.hash, txindex))
-            {
-                if (vin.prevout.n < txindex.vSpent.size() && !txindex.vSpent[vin.prevout.n].IsNull())
-                {
-                    if (fDebug)
-                        printf("IsVinAssociatedWithPubKey:: collateral UTXO %s:%u is already spent\n",
-                               vin.prevout.hash.ToString().c_str(), vin.prevout.n);
-                    return false;
-                }
-            }
-            return true;
+            // CTxDB demolition: no legacy txindex spent check.  Store3A did not
+            // decide this outpoint, so its spent state cannot be proven -- refuse
+            // the collateral claim (fail-closed, never a second storage path).
+            if (fDebug)
+                printf("IsVinAssociatedWithPubKey:: collateral UTXO %s:%u not on the Store3A active chain (fail-closed)\n",
+                       vin.prevout.hash.ToString().c_str(), vin.prevout.n);
+            return false;
         }
     } else {
         if (fDebug) {

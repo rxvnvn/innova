@@ -18,7 +18,6 @@
 #include <vector>
 
 #include "db.h"
-#include "txdb.h"
 #include "main.h"
 #include "miner.h"
 #include "wallet.h"
@@ -88,7 +87,7 @@ static void P06BuildRoot(const fs::path& root, std::string* error)
     BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, error), *error);
     source.blockDataDir = GetDataDir().string();
     BlockIndexGenerationBuilder builder;
-    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "blockindex-build-000001.tmp").string(), 1, NULL, error), *error);
+    BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, error), *error);
     builder.Close();
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::PublishGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, error), BLOCK_INDEX_LIFECYCLE_OK);
@@ -743,7 +742,7 @@ BOOST_AUTO_TEST_CASE(p06_dr_known_block_not_rewritten)
     const fs::path root = fs::temp_directory_path() / fs::unique_path("p06-dr-%%%%-%%%%");
     std::string error;
     P06BuildRoot(root, &error);
-    const fs::path tipRecords = root / "blockindex_tip" / "tip-records.dat";
+    const fs::path tipRecords = root / "tip" / "tip-records.dat";
 
     CBlockIndex* savedBest = pindexBest; CBlockIndex* savedGenesis = pindexGenesisBlock;
     uint256 savedBestChain = hashBestChain; int savedBestHeight = nBestHeight;
@@ -785,7 +784,7 @@ BOOST_AUTO_TEST_CASE(p06_dr_known_block_not_rewritten)
     const int64_t tipAfterFirst = (int64_t)fs::file_size(tipRecords);
     BOOST_CHECK_MESSAGE(fFirst, "control: genuinely new below-floor child was not accepted");
     BOOST_CHECK_MESSAGE(blkAfterFirst > blkBefore, "control: new block was not written to blk*.dat");
-    BOOST_CHECK_MESSAGE(tipAfterFirst > tipBefore, "control: new block was not appended to blockindex_tip");
+    BOOST_CHECK_MESSAGE(tipAfterFirst > tipBefore, "control: new block was not appended to tip");
 
     // It is now authoritative-KNOWN and NON-RESIDENT.
     BlockIndexSnapshot snap; std::string serr;
@@ -814,7 +813,7 @@ BOOST_AUTO_TEST_CASE(p06_dr_known_block_not_rewritten)
     { LOCK(cs_main); fNew = pnew->CheckBlock(true, true, true) && ProcessBlock(NULL, pnew); }
     const int64_t tipAfterNew = (int64_t)fs::file_size(tipRecords);
     BOOST_CHECK_MESSAGE(fNew, "control: a genuinely new tip block was not accepted");
-    BOOST_CHECK_MESSAGE(tipAfterNew > tipAfterSecond, "control: genuinely new block was not appended to blockindex_tip");
+    BOOST_CHECK_MESSAGE(tipAfterNew > tipAfterSecond, "control: genuinely new block was not appended to tip");
     delete pnew;
 
     delete pblock;

@@ -70,6 +70,15 @@ struct IBDMetricsSnapshot
     int64_t block_result_rejected_total;
     int64_t setbestchain_commits;
     int64_t stalled_recovery_attempts;
+    // Stalled-pipeline watchdog (see net.cpp IbdStallWatchdogStep): ticks that
+    // reached the decision, wake classifications that bypassed the terminal
+    // "pipeline not empty" gate, silent peers rotated, and forced locator
+    // re-issues when only one eligible peer remained.
+    int64_t stall_watchdog_ticks;
+    int64_t stall_watchdog_liveness_bypass;
+    int64_t stall_watchdog_peer_rotations;
+    int64_t stall_watchdog_solo_recycles;
+    int64_t stall_watchdog_forced_reissues;
 
     int64_t active_decrement_receive_clear_inflight;
     int64_t active_decrement_inflight_timeout;
@@ -404,6 +413,11 @@ struct Counters
     std::atomic<int64_t> block_result_rejected_total;
     std::atomic<int64_t> setbestchain_commits;
     std::atomic<int64_t> stalled_recovery_attempts;
+    std::atomic<int64_t> stall_watchdog_ticks;
+    std::atomic<int64_t> stall_watchdog_liveness_bypass;
+    std::atomic<int64_t> stall_watchdog_peer_rotations;
+    std::atomic<int64_t> stall_watchdog_solo_recycles;
+    std::atomic<int64_t> stall_watchdog_forced_reissues;
 
     std::atomic<int64_t> active_decrement_receive_clear_inflight;
     std::atomic<int64_t> active_decrement_inflight_timeout;

@@ -29,7 +29,7 @@ static BlockIndexGenerationSource Source()
 static void BuildSelected(const boost::filesystem::path& root)
 {
     BlockIndexGenerationBuilder b; BlockIndexGenerationStats st; std::string e;
-    BOOST_REQUIRE_MESSAGE(b.Build(Source(), (root/"blockindex-gen-000001").string(), 1, &st, &e),e); b.Close();
+    BOOST_REQUIRE_MESSAGE(b.Build(Source(), (root/"gen-000001").string(), 1, &st, &e),e); b.Close();
     BOOST_REQUIRE_MESSAGE(BlockIndexGenerationManager::SelectGeneration(root.string(),1,&e)==BLOCK_INDEX_LIFECYCLE_OK,e);
 }
 static void Open(const boost::filesystem::path& root, BlockIndexV2Reader* r, uint64_t cap=64ULL*1024*1024)
@@ -301,7 +301,7 @@ BOOST_AUTO_TEST_CASE(c1_current_marker_cache_invalidates_on_selection_change)
     // R2-PERF (C1/LOCATOR): CurrentSelectionChanged must keep returning the
     // cached verdict across repeated calls (no false change), yet MUST detect a
     // real CURRENT rewrite (stat change) even with the cache populated. This
-    // guards the optimization that stops the per-lookup blockindex-current read.
+    // guards the optimization that stops the per-lookup current read.
     boost::filesystem::path root=UniqueRoot();BuildSelected(root);BlockIndexV2Reader r;Open(root,&r);std::string e;
     // fill + exercise cache hits: no selection change -> stable false
     BOOST_CHECK(!r.CurrentSelectionChanged(&e));
@@ -312,7 +312,7 @@ BOOST_AUTO_TEST_CASE(c1_current_marker_cache_invalidates_on_selection_change)
     std::string out;
     BOOST_REQUIRE_MESSAGE(EncodeBlockIndexCurrentRecord(rec,&out,&e),e);
     {
-        std::ofstream f((root/"blockindex-current").c_str(), std::ios::binary|std::ios::trunc);
+        std::ofstream f((root/"current").c_str(), std::ios::binary|std::ios::trunc);
         f.write(out.data(), (std::streamsize)out.size()); f.close();
     }
     BOOST_CHECK_MESSAGE(r.CurrentSelectionChanged(&e),
