@@ -1902,7 +1902,17 @@ authoritative_startup_ready:
         // Absent the flag, behavior is byte-for-byte the stock -loadblock path.
         s16::ChainObserveState* armed = NULL;
         cs::store3a::CommitStore3A s3aStore;
-        const std::string s3aDir = GetArg("-s16store3a", "");
+        std::string s3aDir = GetArg("-s16store3a", "");
+        if (s3aDir.empty())
+        {
+            // A bootstrap replay must build exactly the state a normal P2P IBD
+            // builds.  The authoritative Store3A lives at <datadir>/chainstate,
+            // so default the replay mirror there; without it the import produces
+            // a block index and TX-LOC but an EMPTY chainstate, and the next
+            // startup refuses to run ("fresh/empty Store3A opened but the loaded
+            // best chain is not the genesis block").
+            s3aDir = (GetDataDir() / "chainstate").string();
+        }
         bool s3aOk = false;
         if (!s3aDir.empty())
         {
@@ -1914,7 +1924,7 @@ authoritative_startup_ready:
             s16::g_chainObserve.enabled = true;
             s16::g_chainObserve.checkAuthority = true;
             armed = &s16::g_chainObserve;
-            printf("S1.7 store3a mirror armed at %s\n", s3aDir.c_str());
+            printf("store3a replay publication armed at %s\n", s3aDir.c_str());
         }
 
         // Batched durability for the replay: see SetBulkImportMode().  A final

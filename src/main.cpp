@@ -7259,14 +7259,12 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
     return true;
 }
 
-// LEGACY DAG RETIREMENT (Phase 1): the ordinary authoritative live-tail reorg
-// publication, extracted verbatim (semantically unchanged) from the DAG-cleanup
-// scope where it was nested. It re-wires the CURRENT mutable retained tail
+// Authoritative live-tail reorg publication (see PublishAuthoritativeLiveTailReorg
+// below).  It re-wires the current mutable retained tail
 // (BlockIndexAuthoritativeLive / blockindex_tip) to the post-reorg ACTIVE chain
-// and is required by the LINEAR path too: the retired Legacy DAG erase/recolour
-// lifecycle is no longer its owner. It is the only path that updates the external
-// live tail across a reorg, and it records the consensus outcome that Reorganize
-// (already durably committed) selected.
+// and records the consensus outcome that Reorganize already committed durably.
+// It is the only path that updates the external live tail across a reorg, and it
+// is required on the linear path as well, so both callers keep it wired.
 // R3F test-only fault injection for the production authority transition path
 // (declared main.h). Inert unless armed by a test; one-shot.
 static std::set<std::string> g_mainFailpoints;
@@ -7585,13 +7583,11 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     }
 
 
-    // LEGACY DAG RETIREMENT (Phase 1): the DAG-link erase / authoritative
-    // full-field restaging / recolour lifecycle is retired authority and executes
-    // only inside the explicitly scoped experimental profile. The retired path
-    // still publishes the ordinary authoritative live tail (else branch below).
-    // LEGACY DAG RETIREMENT (Phase 2 / Slice 1): the reorg-time DAG recolour
-    // consumer (RebuildDAGOrderIncremental) was retired and physically removed
-    // with its implementation.  Ordinary linear reorg publication is unaffected.
+    // Reorg publication.  The former DAG-link erase / full-field restaging /
+    // recolour lifecycle is no longer authoritative and is not invoked here; the
+    // reorg publishes only the ordinary authoritative live tail (below).  The
+    // former reorg-time recolour consumer (RebuildDAGOrderIncremental) has been
+    // physically removed.  Ordinary linear reorg publication is unaffected.
 
     // Disconnect shorter branch
     for (CBlockIndex* pindex : vDisconnect)
