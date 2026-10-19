@@ -46,6 +46,7 @@ struct IBDMetricsSnapshot
     // 3. Global/peer pressure high-water marks
     int64_t global_active_current;
     int64_t global_active_max;
+    int64_t global_active_floor_clamps;
     int64_t peer_pressure_max;
     int64_t orphan_pressure_max;
     int64_t peers_at_zero_budget_current;
@@ -381,6 +382,7 @@ struct Counters
 
     std::atomic<int64_t> global_active_current;
     std::atomic<int64_t> global_active_max;
+    std::atomic<int64_t> global_active_floor_clamps;
     std::atomic<int64_t> peer_pressure_max;
     std::atomic<int64_t> orphan_pressure_max;
     std::atomic<int64_t> peers_at_zero_budget_current;

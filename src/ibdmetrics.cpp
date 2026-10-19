@@ -34,6 +34,7 @@ Counters::Counters()
       frontier_exemption_admitted(0),
       global_active_current(0),
       global_active_max(0),
+      global_active_floor_clamps(0),
       peer_pressure_max(0),
       orphan_pressure_max(0),
       peers_at_zero_budget_current(0),
@@ -327,9 +328,41 @@ static void IncrementDecrementCause(Counters& c, ActiveDecrementCause cause,
 void GlobalActiveAdd(int64_t delta, ActiveDecrementCause cause)
 {
     Counters& c = Get();
-    const int64_t nOld = c.global_active_current.fetch_add(
-                             delta, std::memory_order_relaxed);
-    const int64_t nNew = nOld + delta;
+    int64_t nOld;
+    int64_t nNew;
+    if (delta < 0)
+    {
+        // A disconnecting peer releases whole set sizes in Cleanup(), and the
+        // same units may already have been released by the askfor->sent
+        // transition or the expiry path (the per-node guard is not per-unit).
+        // The double decrement drove the gauge to -1 on 31.77.247.41, and a
+        // negative gauge permanently starves the refill path: 4000 deferred
+        // block INVs, refill_items_admitted=0, zero_duration_current 63 min.
+        // Floor at zero; the clamp is counted so the accounting bug stays
+        // visible instead of silently corrupting the gauge.
+        bool fClamped = false;
+        nOld = c.global_active_current.load(std::memory_order_relaxed);
+        for (;;)
+        {
+            nNew = nOld + delta;
+            if (nNew < 0)
+            {
+                nNew = 0;
+                fClamped = true;
+            }
+            if (c.global_active_current.compare_exchange_weak(
+                    nOld, nNew, std::memory_order_relaxed))
+                break;
+        }
+        if (fClamped)
+            c.global_active_floor_clamps.fetch_add(1, std::memory_order_relaxed);
+    }
+    else
+    {
+        nOld = c.global_active_current.fetch_add(
+                   delta, std::memory_order_relaxed);
+        nNew = nOld + delta;
+    }
     if (delta < 0)
     {
         const int64_t nUnits = -delta;
@@ -644,6 +677,8 @@ void SnapshotAll(IBDMetricsSnapshot& out)
         c.global_active_current.load(std::memory_order_relaxed);
     out.global_active_max =
         c.global_active_max.load(std::memory_order_relaxed);
+    out.global_active_floor_clamps =
+        c.global_active_floor_clamps.load(std::memory_order_relaxed);
     out.peer_pressure_max =
         c.peer_pressure_max.load(std::memory_order_relaxed);
     out.orphan_pressure_max =

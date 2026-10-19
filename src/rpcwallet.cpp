@@ -200,6 +200,7 @@ static Object BuildIBDMetricsJson(int nHeight)
     ibd.push_back(Pair("frontier_exemption_admitted", metrics.frontier_exemption_admitted));
 
     ibd.push_back(Pair("global_active_current", metrics.global_active_current));
+    ibd.push_back(Pair("global_active_floor_clamps", metrics.global_active_floor_clamps));
     ibd.push_back(Pair("global_active_max", metrics.global_active_max));
     ibd.push_back(Pair("peer_pressure_max", metrics.peer_pressure_max));
     ibd.push_back(Pair("orphan_pressure_max", metrics.orphan_pressure_max));
