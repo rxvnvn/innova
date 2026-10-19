@@ -66,6 +66,7 @@ namespace boost {
 #include <unistd.h>
 #endif
 #include <set>
+#include <atomic>
 
 using namespace std;
 
@@ -1441,6 +1442,28 @@ bool RenameOver(boost::filesystem::path src, boost::filesystem::path dest)
 #endif /* WIN32 */
 }
 
+static std::atomic<bool> g_fBulkImportMode(false);
+static std::atomic<uint64_t> g_nBulkImportSyncCounter(0);
+static std::atomic<uint64_t> g_nBulkImportSyncEvery(5000);
+
+void SetBulkImportMode(bool fOn, uint64_t nSyncEvery)
+{
+    if (nSyncEvery == 0) nSyncEvery = 1;
+    g_nBulkImportSyncEvery.store(nSyncEvery);
+    g_nBulkImportSyncCounter.store(0);
+    g_fBulkImportMode.store(fOn);
+}
+
+bool IsBulkImportMode() { return g_fBulkImportMode.load(); }
+
+bool BulkImportSyncDue()
+{
+    if (!g_fBulkImportMode.load())
+        return true;
+    const uint64_t n = g_nBulkImportSyncCounter.fetch_add(1) + 1;
+    return (n % g_nBulkImportSyncEvery.load()) == 0;
+}
+
 void FileCommit(FILE *fileout)
 {
     ibdactivepath::ActivePathTimer ibdFileCommitTimer(
@@ -1449,6 +1472,8 @@ void FileCommit(FILE *fileout)
         ibdactivepath::GetCounters().filecommit_count,
         "filecommit", nBestHeight);
     fflush(fileout);                // harmless if redundantly called
+    if (!BulkImportSyncDue())
+        return;                     // batched during a bulk import
 #ifdef WIN32
     _commit(_fileno(fileout));
 #else
@@ -1491,6 +1516,8 @@ bool FileCommitChecked(FILE* fileout, std::string* error)
         if (error) *error = "file commit: fflush failed";
         return false;
     }
+    if (!BulkImportSyncDue())
+        return true;               // batched during a bulk import
 #ifdef WIN32
     if (_commit(_fileno(fileout)) != 0)
     {
@@ -1529,6 +1556,8 @@ bool SyncDirectoryChecked(const boost::filesystem::path& dir, std::string* error
         if (error) *error = "injected directory sync failure";
         return false;
     }
+    if (!BulkImportSyncDue())
+        return true;               // batched during a bulk import
 #ifdef WIN32
     (void)dir;
     (void)error;

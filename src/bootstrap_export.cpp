@@ -107,8 +107,10 @@ static std::vector<BlkFile> ListBlkFiles(const std::string& datadir)
 struct Stats {
     uint64_t records = 0, written = 0, duplicates = 0, unlinked = 0;
     uint64_t resync_events = 0, resync_bytes = 0;
+    uint32_t unlinked_time_min = 0, unlinked_time_max = 0;
     uint64_t bytes_written = 0;
     std::string first_hash, last_hash, prev_of_first;
+    uint32_t last_time = 0;
     std::string stop_reason = "end-of-archive";
     double elapsed = 0;
 };
@@ -151,6 +153,8 @@ int main(int argc, char** argv)
         st.bytes_written += r.raw.size();
         tip = r.hash;
         have_tip = true;
+        st.last_time = (uint32_t)r.raw[8 + 68] | ((uint32_t)r.raw[8 + 69] << 8) |
+                       ((uint32_t)r.raw[8 + 70] << 16) | ((uint32_t)r.raw[8 + 71] << 24);
         st.last_hash = r.hash.ToString();
         if (st.first_hash.empty()) st.first_hash = st.last_hash;
     };
@@ -236,6 +240,24 @@ int main(int argc, char** argv)
         if (rc) break;
     }
 
+    // Classify what could not be linked: the nTime range of the orphaned records
+    // distinguishes a truncated top-of-chain segment from scattered side branches.
+    {
+        uint32_t tmin = 0xffffffffu, tmax = 0;
+        bool any = false;
+        for (auto& kv : pending) {
+            for (const Record& r : kv.second) {
+                const unsigned char* body = &r.raw[8];
+                uint32_t t = (uint32_t)body[68] | ((uint32_t)body[69] << 8) |
+                             ((uint32_t)body[70] << 16) | ((uint32_t)body[71] << 24);
+                if (!any) { tmin = tmax = t; any = true; }
+                if (t < tmin) tmin = t;
+                if (t > tmax) tmax = t;
+            }
+        }
+        st.unlinked_time_min = any ? tmin : 0;
+        st.unlinked_time_max = any ? tmax : 0;
+    }
     for (auto& kv : pending) st.unlinked += kv.second.size();
     st.duplicates = 0;
     fflush(out);
@@ -254,6 +276,9 @@ int main(int argc, char** argv)
     printf("  \"resync_events\": %llu,\n", (unsigned long long)st.resync_events);
     printf("  \"resync_bytes\": %llu,\n", (unsigned long long)st.resync_bytes);
     printf("  \"pending_missing_parents\": %zu,\n", pending_order.size());
+    printf("  \"unlinked_time_min\": %u,\n", st.unlinked_time_min);
+    printf("  \"unlinked_time_max\": %u,\n", st.unlinked_time_max);
+    printf("  \"last_written_time\": %u,\n", st.last_time);
     printf("  \"stop_reason\": \"%s\",\n", st.stop_reason.c_str());
     printf("  \"continuous\": %s\n", (st.unlinked == 0 && st.written > 0 && rc == 0) ? "true" : "false");
     printf("}\n");

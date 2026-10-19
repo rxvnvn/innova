@@ -1873,6 +1873,26 @@ authoritative_startup_ready:
     }
     if (mapArgs.count("-loadblock"))
     {
+        // TX-LOC must be open BEFORE the replay starts.  FetchInputs() resolves
+        // every non-coinbase input through s16_V2ReadTxIndex(), and that returns
+        // false while the locator is closed -- the import then dies at the first
+        // block that spends a prior output (observed at height 94 on a fresh
+        // datadir), which makes bootstrapping a new node from bootstrap.dat
+        // impossible.  The locator is a derived index: a fresh directory is
+        // created here and fed per block by ConnectBlock during the replay.
+        if (!txloc::g_txloc.opened())
+        {
+            txloc::ChainError txlocErr; bool txlocCreated = false;
+            const fs::path txlocDir = GetDataDir() / "chainstate" / "txloc";
+            if (!txloc::g_txloc.openDir(txlocDir.string(), &txlocCreated, &txlocErr))
+                return InitError(strprintf("TX-LOC V2 location index open failed before -loadblock import at %s: %s (fail-closed, no legacy txindex fallback)",
+                                           txlocDir.string(), txlocErr.str()));
+            printf("TX-LOC: %s location index at %s before -loadblock import (%llu merged records)\n",
+                   txlocCreated ? "created new" : "reopened",
+                   txlocDir.string().c_str(),
+                   (unsigned long long)txloc::g_txloc.count());
+            fflush(stdout);
+        }
         uiInterface.InitMessage(_("Importing blockchain data file."));
 
         // S1.7 — off-by-default Store3A mirror during -loadblock replay. When
@@ -1897,11 +1917,26 @@ authoritative_startup_ready:
             printf("S1.7 store3a mirror armed at %s\n", s3aDir.c_str());
         }
 
+        // Batched durability for the replay: see SetBulkImportMode().  A final
+        // sync after the loop still guarantees that everything replayed is on
+        // disk before the node starts serving.
+        SetBulkImportMode(true);
         for (string strFile : mapMultiArgs["-loadblock"])
         {
             FILE *file = fopen(strFile.c_str(), "rb");
             if (file)
                 LoadExternalBlockFile(file);
+        }
+        SetBulkImportMode(false);
+        {
+            // Force the durability points once more now that batching is off.
+            FileCommit(stdout);
+            if (txloc::g_txloc.opened())
+            {
+                txloc::ChainError endErr;
+                if (!txloc::g_txloc.sync(&endErr))
+                    return InitError(strprintf("TX-LOC final sync after -loadblock import failed: %s", endErr.str()));
+            }
         }
 
         if (armed)
@@ -2098,6 +2133,7 @@ authoritative_startup_ready:
             // a derived location index (txid -> blk*.dat position), NOT a consensus
             // authority (Store3A owns UTXO, BI-V2 owns the block index). Fail-closed on
             // a present-but-inconsistent index; a fresh dir is produced automatically.
+            if (!txloc::g_txloc.opened())
             {
                 txloc::ChainError txe; bool txa = false;
                 fs::path txlocDir = GetDataDir() / "chainstate" / "txloc";

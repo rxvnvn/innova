@@ -5167,6 +5167,15 @@ bool CTransaction::FetchInputs(const map<uint256, CTxIndex>& mapTestPool,
             // Get prev tx from disk
             if (!txPrev.ReadFromDisk(txindex.pos))
                 return error("FetchInputs() : %s ReadFromDisk prev tx %s failed", GetHash().ToString().substr(0,10).c_str(),  prevout.hash.ToString().substr(0,10).c_str());
+            // vSpent is a legacy txdb field: s16_V2ReadTxIndex() supplies only the
+            // on-disk location, so a TX-LOC-derived index arrives with an empty
+            // vSpent.  The prevout.n range check below compares against
+            // txindex.vSpent.size(), which made every spending input look out of
+            // range and returned DoS(100, false) silently (the message is only
+            // printed when fDebugNet).  Size the marker array from the
+            // transaction we just read so the check keeps its real meaning.
+            if (txindex.vSpent.size() < txPrev.vout.size())
+                txindex.vSpent.resize(txPrev.vout.size());
         }
     }
 
@@ -5185,7 +5194,10 @@ bool CTransaction::FetchInputs(const map<uint256, CTxIndex>& mapTestPool,
             fInvalid = true;
             if (fDebugNet)
                 return DoS(100, error("FetchInputs() : %s prevout.n out of range %d %" PRIszu" %" PRIszu" prev tx %s\n%s", GetHash().ToString().substr(0,10).c_str(), prevout.n, txPrev.vout.size(), txindex.vSpent.size(), prevout.hash.ToString().substr(0,10).c_str(), txPrev.ToString().c_str()));
-            return DoS(100, false);
+            return DoS(100, error("FetchInputs() : %s prevout.n out of range %d (prev tx %s outputs=%u vspent=%u)",
+                                  GetHash().ToString().substr(0,10).c_str(), prevout.n,
+                                  prevout.hash.ToString().substr(0,10).c_str(),
+                                  (unsigned)txPrev.vout.size(), (unsigned)txindex.vSpent.size()));
 
         }
     }
@@ -6509,8 +6521,13 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
                 return error("ConnectBlock() : Store3A existsUnspentTxid failed for %s (%s) — BIP30 authority unavailable, fail-closed",
                              hashTx.ToString().substr(0,10).c_str(), be.str().c_str());
             }
-            if (found)
-                return false;   // txid already present with an unspent output in Store3A (BIP30)
+            if (found) {
+                // Silent failure made a BIP30 refusal indistinguishable from a
+                // validation bug; always name the tx and the height.
+                printf("ConnectBlock() : BIP30 duplicate txid %s at height %d already has an unspent output in Store3A\n",
+                       hashTx.ToString().substr(0,10).c_str(), (int)pindex->nHeight);
+                return false;
+            }
         }
 
         nSigOps += tx.GetLegacySigOpCount();
@@ -6579,7 +6596,12 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
 
             if (!tx.ConnectInputs(mapInputs, mapQueuedChanges, posThisTx, pindex, true, false, flags, true,
                                   (v2View.armed() ? &v2View : NULL)))
+            {
+                printf("ConnectBlock() : ConnectInputs failed for tx %s at height %d (armed=%d inputs=%u)\n",
+                       tx.GetHash().ToString().substr(0,10).c_str(), (int)pindex->nHeight,
+                       (int)(v2View.armed() ? 1 : 0), (unsigned)mapInputs.size());
                 return false;
+            }
 
             if (fHRegActive)
             {
@@ -7202,10 +7224,13 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
                              pr.first.ToString().substr(0,10).c_str(), (int)pindex->nHeight, txe.str().c_str());
             }
         }
-        if (!txloc::g_txloc.sync(&txe))
+        if (BulkImportSyncDue())
         {
-            s16::g_chainObserve.needsRecovery = true;
-            return error("ConnectBlock() : TX-LOC WAL sync FAILED at height %d (%s) — fail-closed", (int)pindex->nHeight, txe.str().c_str());
+            if (!txloc::g_txloc.sync(&txe))
+            {
+                s16::g_chainObserve.needsRecovery = true;
+                return error("ConnectBlock() : TX-LOC WAL sync FAILED at height %d (%s) — fail-closed", (int)pindex->nHeight, txe.str().c_str());
+            }
         }
     }
 

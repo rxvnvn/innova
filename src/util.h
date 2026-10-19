@@ -293,6 +293,18 @@ bool WildcardMatch(const char* psz, const char* mask);
 bool WildcardMatch(const std::string& str, const std::string& mask);
 
 void FileCommit(FILE *fileout);
+
+// Bulk block import (-loadblock) durability batching.
+// Replaying millions of blocks with a per-block fsync costs ~500 ms per block on
+// ordinary disks (measured), which makes bootstrap import impractical.  During a
+// bulk import the durability points are batched: they commit every N blocks and
+// once more at the end of the import.  A crash mid-import can lose the tail of a
+// derived index, but every block payload is still in the bootstrap file and in
+// blk*.dat, so the import is repeatable; normal operation keeps per-block
+// durability.
+void SetBulkImportMode(bool fOn, uint64_t nSyncEvery = 5000);
+bool IsBulkImportMode();
+bool BulkImportSyncDue();
 bool RenameOver(boost::filesystem::path src, boost::filesystem::path dest);
 
 // R3 (PM1-P1-02): checked durability primitives. Same effect as FileCommit /
