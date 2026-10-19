@@ -1805,6 +1805,10 @@ public:
 
     void AddAskForEntry(int64_t nRequestTime, const CInv& inv)
     {
+        // The queue + its accounting are a single ledger: mutate and account
+        // under the ledger lock so a concurrent disconnect cleanup (socket
+        // thread) can never release a unit that this thread is still adding.
+        LOCK(cs_mapAlreadyAskedFor);
         mapAskFor.insert(std::make_pair(nRequestTime, inv));
         if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
         {
@@ -1829,6 +1833,7 @@ public:
                               ibdmetrics::ACTIVE_DECREMENT_OTHER,
                           const char* pszOwnerReleaseReason = "queue-removal")
     {
+        LOCK(cs_mapAlreadyAskedFor);
         if (it == mapAskFor.end())
             return;
         const CInv inv = it->second;
@@ -1868,6 +1873,7 @@ public:
 
     void ClearAskFor()
     {
+        LOCK(cs_mapAlreadyAskedFor);
         for (std::multimap<int64_t, CInv>::const_iterator it = mapAskFor.begin();
              it != mapAskFor.end(); ++it)
         {
@@ -2509,6 +2515,10 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                 // a peer that was cleaned up while a stale CNode snapshot still
                 // iterates it) must not release peer pressure / IBD gauges a
                 // second time -- cleanup already accounted for the request.
+                // Erase + accounting under the ledger lock (see
+                // AddAskForEntry/ClearBlockInFlight): a concurrent Cleanup must
+                // not observe this hash after the decrement.
+                LOCK(cs_mapAlreadyAskedFor);
                 if (setBlocksInFlight.erase(hashExpired))
                 {
                     peerLiveActivePressure.fetch_sub(
@@ -2604,6 +2614,7 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
     void MarkBlockInFlight(const uint256& hashBlock)
     {
         ExpireBlockInFlight();
+        LOCK(cs_mapAlreadyAskedFor);
         if (setBlocksInFlight.insert(hashBlock).second)
         {
             peerLiveActivePressure.fetch_add(
@@ -2637,6 +2648,7 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
 
     void ClearBlockInFlight(const uint256& hashBlock)
     {
+        LOCK(cs_mapAlreadyAskedFor);
         if (setBlocksInFlight.erase(hashBlock))
         {
             peerLiveActivePressure.fetch_sub(

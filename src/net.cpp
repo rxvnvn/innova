@@ -7466,6 +7466,12 @@ void CNode::Cleanup(NodeCleanupMode mode)
     RemoveBlockAlternateAnnouncersForPeer(GetId());
     if (!fIbdMetricsCleanupAccounted)
     {
+        // Size read, decrement and clear must be atomic with respect to the
+        // message thread: an erase landing between the size read and the clear
+        // would decrement the same unit twice (observed global_active_current
+        // = -1 on 31.77.247.41).  cs_mapAlreadyAskedFor is the ledger lock for
+        // exactly these sets (net.cpp:1643-1655).
+        LOCK(cs_mapAlreadyAskedFor);
         const bool fHadQueuedGetBlocks = !getBlocksIndex.empty();
         const bool fHadActiveBlockWork =
             !setAskForBlocks.empty() ||
