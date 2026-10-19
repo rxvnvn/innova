@@ -1377,7 +1377,20 @@ int GetMaxActiveBlockRequestsPerPeer()
     const int64_t nShare = (nWindow + nDenom - 1) / nDenom;
     const int64_t nBudget = std::max((int64_t)g_nIBDMaxActivePerPeerConfigured,
                                      nShare);
-    return (int)std::min(nBudget, (int64_t)MAX_IBD_ACTIVE_BUDGET_CAP);
+    // Peer-capacity clamp.  The ordered window (W, default 8192) divided by the
+    // serving peers yields a per-peer budget of up to 2048 blocks.  A legacy
+    // peer buffers what it has queued for us in a bounded socket send buffer
+    // (1 MB by default); 2048 pipelined blocks overflow it and the peer resets
+    // the connection.  Observed on 31.77.57.75: 33 ECONNRESET events from
+    // 161.97.182.56 (:14), 207.180.228.107 (:11) and 91.121.45.149 (:8) while
+    // the node held ~2000 requests in flight, leaving it with only behind
+    // peers at height 1017650.  256 in flight still saturates any realistic
+    // RTT/bandwidth product (16x the historical 16-block window) while staying
+    // within a peer's default send buffer.
+    const int64_t nPeerCapacityCap = std::max<int64_t>(
+        16, GetArg("-ibdmaxactiveperpeercap", 256));
+    return (int)std::min(std::min(nBudget, nPeerCapacityCap),
+                         (int64_t)MAX_IBD_ACTIVE_BUDGET_CAP);
 }
 
 int GetMaxActiveBlockRequestsGlobal()
