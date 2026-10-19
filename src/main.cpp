@@ -10512,7 +10512,7 @@ bool LoadExternalBlockFile(FILE* fileIn)
                 fseek(blkdat, nPos, SEEK_SET);
                 unsigned int nSize;
                 blkdat >> nSize;
-                if (nSize > 0 && nSize <= MAX_BLOCK_SIZE)
+                if (nSize > 0 && nSize <= ADAPTIVE_BLOCK_CEILING)
                 {
                     CBlock block;
                     blkdat >> block;
@@ -10521,6 +10521,15 @@ bool LoadExternalBlockFile(FILE* fileIn)
                         nLoaded++;
                         nPos += 4 + nSize;
                     }
+                }
+                else if (nSize > ADAPTIVE_BLOCK_CEILING)
+                {
+                    // Blocks above the adaptive ceiling can never be imported.
+                    // Skipping them silently would truncate a bootstrap at an
+                    // arbitrary height, so report each one loudly.
+                    printf("%s() : record of %u bytes at offset %u exceeds the adaptive ceiling (%u) and cannot be imported\n",
+                           __PRETTY_FUNCTION__, nSize, nPos, ADAPTIVE_BLOCK_CEILING);
+                    nPos += 4 + nSize;
                 }
             }
         }
