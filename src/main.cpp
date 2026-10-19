@@ -11409,9 +11409,14 @@ static const std::set<std::string>& BannedUserAgents()
     if (!initialized)
     {
         initialized = true;
-        banned.insert("Innovai:5.1.0");
-        banned.insert("Innovai:5.0.0.8");
-        banned.insert("Innovai:5.0.0.6");
+        // No hardcoded defaults.  The former set {Innovai:5.1.0,
+        // Innovai:5.0.0.8, Innovai:5.0.0.6} was added because those clients
+        // advertised a chain far ahead of ours.  An advertised height is not
+        // evidence of misbehaviour, it cannot be validated before the handshake
+        // completes, and banning on it shrinks the very peer pool IBD needs.
+        // Consensus is unaffected: every block still passes PoW/PoS, header and
+        // block validation independently of the peer's user-agent.
+        // Only an explicit operator policy survives, via -banuseragent.
         const std::vector<std::string>& extra = mapMultiArgs["-banuseragent"];
         for (size_t i = 0; i < extra.size(); ++i)
             banned.insert(extra[i]);
