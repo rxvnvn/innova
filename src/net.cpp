@@ -2448,7 +2448,19 @@ CNode* ChooseIbdBlockRequestTarget(CNode* pfrom, const uint256& hash,
     const bool fDominant =
         nGlobal >= IBD_CONCENTRATION_SAMPLE_MIN &&
         nSharePermille >= IBD_CONCENTRATION_THRESHOLD_PERMILLE;
-    if (snap.tier != IBD_PEER_QUALITY_DEGRADED && !fHadTimeout && !fDominant)
+    // Null-block guard: a peer that served a null-shaped block is demoted for
+    // a bounded window (fresh, direct evidence -- see
+    // CNode::MarkServeBrokenBlocksWindows) even when its aggregate quality
+    // tier still looks fine.  The demotion routes the request through the
+    // alternate-announcer slow path below, so the ask re-dispatches to another
+    // peer exactly once per admission, under the existing single-flight and
+    // budget caps.  No Misbehaving, no disconnect, no per-hash guess.
+    const bool fServeBroken = pfrom->IsServeBrokenBlocks();
+    if (fServeBroken)
+        ibdmetrics::Get().null_shape_serve_broken_demote.fetch_add(
+            1, std::memory_order_relaxed);
+    if (snap.tier != IBD_PEER_QUALITY_DEGRADED && !fHadTimeout && !fDominant &&
+        !fServeBroken)
         return NULL;
 
     // Slow path: decide whether to redirect, and to whom.  Every redirect

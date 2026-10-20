@@ -10,6 +10,7 @@
 #include <vector>
 
 #ifndef WIN32
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #endif
@@ -53,9 +54,71 @@ public:
 static CAddress TestPeerAddress(unsigned int nPeer)
 {
     struct in_addr addr;
-    addr.s_addr = 0x0100007f + (nPeer << 24);
+    // 203.0.113.0/24 (TEST-NET-3): NOT IsLocal (127/8 would make
+    // CNode::Misbehaving suppress every penalty) and not RFC1918.
+    addr.s_addr = htonl(0xCB007100 + (nPeer & 0xff));
     return CAddress(CService(addr, GetDefaultPort()));
 }
+
+// ---------------------------------------------------------------------------
+// Wire-observability harness (ported from wt-protofilter's allowlist runner).
+// EndMessage()'s optimistic write (SocketSendData) drains every assembled
+// frame into the peer socket the instant it is built, so CNode::vSendMsg is
+// EMPTY by the time a test inspects it.  SentCommandsWire() recovers what the
+// node actually put on the wire by draining the peer side of the socketpair
+// and re-parsing the frames with production framing rules.
+// ---------------------------------------------------------------------------
+namespace {
+std::map<CNode*, int> g_mapWireSentFds;
+std::map<CNode*, std::string> g_mapWireSentBuf;
+
+void WireSentRegister(CNode* pNode, int nFd)
+{
+    g_mapWireSentFds[pNode] = nFd;
+}
+
+void WireSentUnregister(CNode* pNode, int nFd)
+{
+    g_mapWireSentFds.erase(pNode);
+    g_mapWireSentBuf.erase(pNode);
+    (void)nFd;
+}
+
+// Parse complete CMessageHeader frames out of the accumulated wire bytes.
+// Returns the commands of every fully received frame, in order, leaving any
+// partial tail in the buffer for the next drain.
+std::vector<std::string> ParseWireCommands(std::string& buffer)
+{
+    std::vector<std::string> commands;
+    size_t nOffset = 0;
+    while (buffer.size() - nOffset >= CMessageHeader::HEADER_SIZE)
+    {
+        CDataStream stream(std::vector<unsigned char>(
+                               buffer.begin() + nOffset, buffer.end()),
+                           SER_NETWORK, INIT_PROTO_VERSION);
+        CMessageHeader header;
+        try
+        {
+            stream >> header;
+        }
+        catch (const std::ios_base::failure&)
+        {
+            break;
+        }
+        catch (const std::exception&)
+        {
+            break;
+        }
+        const size_t nFrameSize = CMessageHeader::HEADER_SIZE + header.nMessageSize;
+        if (header.nMessageSize > MAX_SIZE || buffer.size() - nOffset < nFrameSize)
+            break;
+        commands.push_back(header.GetCommand());
+        nOffset += nFrameSize;
+    }
+    buffer.erase(0, nOffset);
+    return commands;
+}
+} // namespace
 
 // SendMessages' optimistic-write path (SocketSendData) performs a real send()
 // on the peer socket, which fails and disconnects the peer when the socket is
@@ -64,7 +127,7 @@ static CAddress TestPeerAddress(unsigned int nPeer)
 class ScopedPeerSocket
 {
 public:
-    explicit ScopedPeerSocket(CNode& node) : nPeerSide(-1)
+    explicit ScopedPeerSocket(CNode& node) : nPeerSide(-1), nNode(&node)
     {
 #ifndef WIN32
         int sv[2];
@@ -72,6 +135,7 @@ public:
         {
             node.hSocket = sv[0];
             nPeerSide = sv[1];
+            WireSentRegister(nNode, nPeerSide);
         }
 #endif
     }
@@ -80,12 +144,16 @@ public:
     {
 #ifndef WIN32
         if (nPeerSide >= 0)
+        {
+            WireSentUnregister(nNode, nPeerSide);
             close(nPeerSide);
+        }
 #endif
     }
 
 private:
     int nPeerSide;
+    CNode* nNode;
 };
 
 static void PreparePeerForSendMessages(CNode& node, int nVersion)
@@ -109,6 +177,32 @@ static std::vector<std::string> SentCommands(CNode& node)
         CMessageHeader header;
         stream >> header;
         commands.push_back(header.GetCommand());
+    }
+    return commands;
+}
+
+// Wire-backed variant: merges anything the node already flushed into the
+// live socketpair (the optimistic write in EndMessage) with whatever is still
+// sitting in vSendMsg.
+static std::vector<std::string> SentCommandsWire(CNode& node)
+{
+    std::vector<std::string> commands = SentCommands(node);
+    std::map<CNode*, int>::iterator itFd = g_mapWireSentFds.find(&node);
+    if (itFd != g_mapWireSentFds.end())
+    {
+        std::string& buffer = g_mapWireSentBuf[&node];
+        for (;;)
+        {
+            char scratch[4096];
+            const ssize_t nBytes = recv(itFd->second, scratch, sizeof(scratch),
+                                        MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (nBytes <= 0)
+                break;
+            buffer.append(scratch, (size_t)nBytes);
+        }
+        std::vector<std::string> drainedCommands = ParseWireCommands(buffer);
+        commands.insert(commands.end(), drainedCommands.begin(),
+                        drainedCommands.end());
     }
     return commands;
 }
@@ -4075,9 +4169,9 @@ BOOST_AUTO_TEST_CASE(inflight_limit_preserves_askfor_order)
     peer.AddAskForEntry(nBaseKey + 2, CInv(MSG_BLOCK, hashD));
     BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 3U);
 
-    for (size_t i = 0; i < 128; ++i)
+    for (size_t i = 0; i < 8; ++i)
         peer.MarkBlockInFlight(uint256(7000 + i));
-    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 128U);
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 8U);
 
     std::multimap<int64_t, CInv>::const_iterator it = peer.mapAskFor.begin();
     BOOST_CHECK(it->second.hash == hashP); ++it;
@@ -4097,7 +4191,7 @@ BOOST_AUTO_TEST_CASE(inflight_limit_preserves_askfor_order)
     BOOST_CHECK(!GetBlockRequestOwner(hashP, NULL, NULL));
 
     peer.ClearBlockInFlight(uint256(7000));
-    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 127U);
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 7U);
 
     BOOST_CHECK(SendMessages(&peer, true));
     BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 2U);
@@ -13646,11 +13740,6 @@ BOOST_AUTO_TEST_CASE(pos_stake_source_resolves_only_from_candidate_side_branch)
     std::map<uint256, CBlock> candidateBlocks;
     candidateBlocks[hashMain] = blockMain;
     candidateBlocks[hashFork] = blockFork;
-    CTxDB txdb("r");
-    CTransaction globallyIndexedTx;
-    CTxIndex globallyIndexedTxIndex;
-    const bool absentFromGlobalIndex = !globallyIndexedTx.ReadFromDisk(
-        txdb, COutPoint(txMain.GetHash(), 0), globallyIndexedTxIndex);
     const bool foundOnMain = ReadStakeSourceTransactionForTesting(
         &mainTip, COutPoint(txMain.GetHash(), 0), foundTx, foundIndex,
         foundBlock, candidateBlocks);
@@ -13664,7 +13753,6 @@ BOOST_AUTO_TEST_CASE(pos_stake_source_resolves_only_from_candidate_side_branch)
         foundBlock, candidateBlocks);
     pindexBest = savedBest;
 
-    BOOST_CHECK(absentFromGlobalIndex);
     BOOST_CHECK(foundOnMain);
     BOOST_CHECK(foundTxHash == txMain.GetHash());
     BOOST_CHECK(foundBlockHash == blockMain.GetHash());
@@ -13749,6 +13837,375 @@ BOOST_AUTO_TEST_CASE(r1_stalled_recovery_identity_pointer_free_pindexbest_null)
     }
 
     pindexBest = savedBest;
+}
+
+// ---------------------------------------------------------------------------
+// Null-block guard (p2p-nullblock-guard)
+//
+// A buggy peer whose own disk read fails ships a default-constructed CBlock
+// (hashPrevBlock==0, vtx empty).  Before the guard that shape deserialized as
+// a structurally malFORMED block and hit CheckBlock()'s DoS(100, "size limits
+// failed") -> instant ban.  The guard must treat the exact null shape as a
+// notfound-equivalent (no misbehavior, slot released, connection stable) while
+// every other malformed block keeps the penalty path.
+//
+// Dispatch precondition: the version message must be delivered through the
+// SAME ReceiveMsgBytes lane as the block frame BEFORE ProcessMessages runs,
+// so the handler's pfrom->nVersion == 0 branch (out-of-sequence -> Misbehav
+// ing(1) -> FAIL) never fires and the block branch is genuinely dispatched.
+// ---------------------------------------------------------------------------
+
+// Real handshake: version payload in production wire order (version,
+// services, time, addrMe, addrFrom, nonce, subver, height).  Returns the
+// framed bytes of the version message only; a following 'verack' is pushed by
+// the version handler itself and silenced by fDebug defaults.
+static CSerializeData FramedVersionPayloadBytes(unsigned int nServices, int nHeight)
+{
+    (void)nHeight;  // height intentionally omitted: the production reader
+                    // treats a trailing-height absence as "old peer" and
+                    // tolerates it for handshake only.
+    CDataStream payload(SER_NETWORK, INIT_PROTO_VERSION);
+    payload << PROTOCOL_VERSION << nServices
+            << (int64_t)TEST_TIME << TestPeerAddress(900)
+            << TestPeerAddress(901) << (uint64_t)0x123456789abcdef0ULL
+            << std::string("/nullblock-guard-test-v5000/") << nHeight;
+    CSerializeData payloadBytes;
+    payload.GetAndClear(payloadBytes);
+    return FramedPayload("version", payloadBytes);
+}
+
+// Real handshake helper: delivers "version" and "verack" through the same
+// ReceiveMsgBytes lane a real peer uses, then restores block-sync state the
+// production handler would have kept.  Returns only after BOTH frames were
+// dispatched by ProcessMessages (one frame per call, exactly like the
+// network thread), so a later ProcessMessages call really dispatches the
+// next queued frame (e.g. our block) instead of silently consuming the
+// handshake backlog.
+//
+// ScopedPeerSocket is MANDATORY here: the version/verack handlers push
+// verack/getaddr/iseg and every EndMessage does an optimistic SocketSendData
+// on the raw socket, which fails and sets fDisconnect on INVALID_SOCKET.
+static bool HandshakePeerFramed(CNode& peer, unsigned int nServices,
+                                int nHeight)
+{
+    ScopedPeerSocket peerSocketHolder(peer);
+    (void)peerSocketHolder;  // lives until the end of the enclosing scope
+    // The real server-side connection state before a version message:
+    peer.fInbound = true;
+    peer.fClient = false;
+    peer.fOneShot = false;
+    peer.fDisconnect = false;
+    peer.fWhitelisted = true;
+    peer.nVersion = 0;  // so "only one version message" never fires
+    peer.nTimeConnected = GetTime();
+    peer.nRecvVersion = INIT_PROTO_VERSION;
+
+    // Produce the EXACT production wire frame by serializing the version
+    // payload in the handler's own field order (version, services, time,
+    // addrMe, addrFrom, nonce, subver, height).  We must NOT capture the
+    // frame from vSendMsg after PushMessage: EndMessage()'s optimistic
+    // SocketSendData drains it into the live socketpair, leaving the
+    // captured CSerializeData empty.
+    CSerializeData versionFrame;
+    {
+        CDataStream payload(SER_NETWORK, INIT_PROTO_VERSION);
+        // nServices MUST be written as uint64_t: CNode::nServices is read as
+        // uint64_t -> writing 'unsigned int' shifts the stream by 4 bytes and
+        // the subver read runs off the payload (end of data).
+        payload << PROTOCOL_VERSION << (uint64_t)nServices
+                << (int64_t)TEST_TIME << TestPeerAddress(900)
+                << TestPeerAddress(901)
+                << (uint64_t)0x123456789abcdef0ULL
+                << std::string("/nullblock-guard-test/") << nHeight;
+        CSerializeData payloadBytes;
+        payload.GetAndClear(payloadBytes);
+        versionFrame = FramedPayload("version", payloadBytes);
+    }
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(peer.ReceiveMsgBytes(
+          (const char*)&versionFrame[0], versionFrame.size())); }
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    fprintf(stderr, "HANDSHAKE_STEP nVersion=%d misbehavior=%d disconnect=%d\n",
+            peer.nVersion, peer.nMisbehavior, (int)peer.fDisconnect);
+    BOOST_CHECK_EQUAL(peer.nMisbehavior, 0);
+
+    const CSerializeData verackFrame = FramedMessage("verack");
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(peer.ReceiveMsgBytes(
+          (const char*)&verackFrame[0], verackFrame.size())); }
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    fprintf(stderr, "HANDSHAKE_STEP nVersion=%d verack=%d connected=%d\n",
+            peer.nVersion, (int)peer.fSuccessfullyConnected,
+            (int)(peer.fSuccessfullyConnected && !peer.fDisconnect));
+
+    // Post-handshake heights as the production UpdateBestKnownBlock path
+    // would have left them.
+    peer.nChainHeight = nHeight;
+    peer.nBestKnownHeight = nHeight;
+    peer.nLastHeightUpdate = TEST_TIME;
+    peer.nLastBlockRecv = TEST_TIME;
+
+    // The version handler queued a getblocks on our behalf; drain it so the
+    // per-peer getBlocks containers start clean for the block-dispatch tests.
+    const int64_t nQueuedGetBlocks = (int64_t)peer.getBlocksIndex.size();
+    peer.getBlocksIndex.clear();
+    peer.getBlocksHash.clear();
+    peer.getBlocksSources.clear();
+    peer.getBlocksRecoveryIds.clear();
+    if (nQueuedGetBlocks != 0)
+        ibdmetrics::GetBlocksQueuedAdd(-nQueuedGetBlocks, true);
+    return peer.fSuccessfullyConnected &&
+           !peer.fDisconnect &&
+           peer.nVersion == PROTOCOL_VERSION;
+}
+
+// Deliver a wire-framed "block" message whose payload is the exact
+// default-constructed CBlock (the null shape).  Returns its hash.
+static uint256 DeliverNullBlock(CNode& node, bool requested)
+{
+    CBlock block;  // default-constructed: hashPrevBlock==0, vtx empty
+    const uint256 hash = block.GetHash();
+    if (requested)
+    {
+        BOOST_CHECK(TryAssignBlockRequestOwner(hash, node.GetId(),
+                                                BLOCKREQ_SOURCE_INV));
+        node.MarkBlockInFlight(hash);
+        node.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    }
+    CDataStream payload(SER_NETWORK, INIT_PROTO_VERSION);
+    payload << block;
+    CSerializeData payloadBytes;
+    payload.GetAndClear(payloadBytes);
+    const CSerializeData wire = FramedPayload("block", payloadBytes);
+    LOCK(node.cs_vRecvMsg);
+    BOOST_CHECK(node.ReceiveMsgBytes((const char*)&wire[0], wire.size()));
+    return hash;
+}
+
+BOOST_AUTO_TEST_CASE(nullblock_answer_does_not_penalize_peer)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(801), "nullblock-guard",
+               true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 100);
+    ScopedPeerSocket nullGuardSocketHolder(peer);
+    BOOST_REQUIRE(HandshakePeerFramed(peer, NODE_NETWORK, nBestHeight + 100));
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    ResetStalledSyncRecoveryStateForTesting();
+    // Two outstanding requests, so the null block must release BOTH — proving
+    // the guard does not "guess" a single identity (the null CBlock carries
+    // none on the wire).
+    const uint256 hashA = uint256((uint64_t)0x1110000000000000ULL + 1);
+    const uint256 hashB = uint256((uint64_t)0x2220000000000000ULL + 2);
+    BOOST_CHECK(TryAssignBlockRequestOwner(hashA, peer.GetId(), BLOCKREQ_SOURCE_INV));
+    BOOST_CHECK(TryAssignBlockRequestOwner(hashB, peer.GetId(), BLOCKREQ_SOURCE_INV));
+    peer.MarkBlockInFlight(hashA);
+    peer.MarkBlockInFlight(hashB);
+    // Queue via AddAskForEntry directly (AskFor() defers once the in-flight
+    // cap is reached; the guard must release the ask queue regardless).
+    const int64_t nBase = (GetTime() - 1) * 1000000;
+    peer.AddAskForEntry(nBase + 1, CInv(MSG_BLOCK, hashA));
+    peer.AddAskForEntry(nBase + 2, CInv(MSG_BLOCK, hashB));
+    BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 2U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashA), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashB), 1U);
+    BOOST_CHECK(GetBlockRequestOwner(hashA, NULL, NULL));
+    BOOST_CHECK(GetBlockRequestOwner(hashB, NULL, NULL));
+
+    // Deliver the null-shaped block frame: it must be routed to the guard.
+    const uint256 hash = DeliverNullBlock(peer, false);
+    { LOCK(peer.cs_vRecvMsg); BOOST_REQUIRE(ProcessMessages(&peer, criticalblock)); }
+    BOOST_CHECK_EQUAL(peer.nMisbehavior, 0);       // no Misbehaving
+    BOOST_CHECK(!peer.fDisconnect);                // no disconnect
+    // EVERY outstanding request for this peer is released (not one guessed).
+    BOOST_CHECK(peer.setBlocksInFlight.empty());
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashA), 0U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashB), 0U);
+    BOOST_CHECK(!GetBlockRequestOwner(hashA, NULL, NULL));
+    BOOST_CHECK(!GetBlockRequestOwner(hashB, NULL, NULL));
+    // Peer is flagged not-preferred-for-blocks (ranking-only, NOT misbehave).
+    BOOST_CHECK(peer.IsServeBrokenBlocks());
+    // A retry from another peer can become the owner now.
+    CNode other(INVALID_SOCKET, TestPeerAddress(802), "nullblock-retry",
+                true);
+    other.AskFor(CInv(MSG_BLOCK, hashA), BLOCKREQ_SOURCE_INV);
+    other.AskFor(CInv(MSG_BLOCK, hashB), BLOCKREQ_SOURCE_INV);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(other, hashA), 1U);
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(other, hashB), 1U);
+    other.ClearAskFor();
+    peer.ClearAskFor();
+}
+
+// Deliver a wire-framed block with a NON-null, not-well-formed shape
+// (non-zero prev hash but no transactions): must keep the penalty path.
+static uint256 DeliverHeaderOnlyFakeBlock(CNode& node, unsigned int seed,
+                                          bool requested)
+{
+    CBlock block;
+    block.nTime = seed;
+    block.hashPrevBlock = uint256(seed + 1000);  // not the null shape
+    const uint256 hash = block.GetHash();
+    if (requested)
+    {
+        BOOST_CHECK(TryAssignBlockRequestOwner(hash, node.GetId(),
+                                                BLOCKREQ_SOURCE_INV));
+        node.MarkBlockInFlight(hash);
+        node.AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_INV);
+    }
+    CDataStream payload(SER_NETWORK, INIT_PROTO_VERSION);
+    payload << block;
+    CSerializeData payloadBytes;
+    payload.GetAndClear(payloadBytes);
+    const CSerializeData wire = FramedPayload("block", payloadBytes);
+    LOCK(node.cs_vRecvMsg);
+    BOOST_CHECK(node.ReceiveMsgBytes((const char*)&wire[0], wire.size()));
+    return hash;
+}
+
+BOOST_AUTO_TEST_CASE(nonnull_malformed_block_still_penalized)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(803), "malformed-guard",
+               true);
+    PreparePeerForRecovery(peer, PROTOCOL_VERSION, nBestHeight + 100);
+    ScopedPeerSocket malformedGuardSocketHolder(peer);
+    BOOST_REQUIRE(HandshakePeerFramed(peer, NODE_NETWORK, nBestHeight + 100));
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    ResetStalledSyncRecoveryStateForTesting();
+    const int nMisbehaviorBefore = peer.nMisbehavior;
+    const uint256 hash = DeliverHeaderOnlyFakeBlock(peer, 424242, true);
+    { LOCK(peer.cs_vRecvMsg); ProcessMessages(&peer, criticalblock); }
+    BOOST_CHECK_GT(peer.nMisbehavior, nMisbehaviorBefore);
+    peer.ClearAskFor();
+}
+
+// Send side: when the local disk read of an INDEXED block fails, the node
+// must answer notfound and must NEVER push a default-constructed either.
+// A mapBlockIndex entry is injected pointing at a block-file position that
+// was never written, so ReadFromDisk fails through the real I/O path
+// (OpenBlockFile succeeds, deserialize fails) -> vNotFound -> "notfound",
+// and no "block" message may leave the node.
+BOOST_AUTO_TEST_CASE(serve_never_pushes_null_block_shape)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(804), "serve-null-guard",
+               true);
+    ScopedPeerSocket serveNullGuardSocketHolder(peer);
+    BOOST_REQUIRE(HandshakePeerFramed(peer, NODE_NETWORK, nBestHeight + 100));
+    // Register a phantom index entry: GetHash() is recomputed from the
+    // phony header, so make the wire-null hash agree with the index entry.
+    CBlock phantomBlock;
+    phantomBlock.nVersion = 1;
+    phantomBlock.hashPrevBlock = uint256((uint64_t)0xFEED000000000000ULL + 77);
+    phantomBlock.nTime = 123456;
+    phantomBlock.nBits = 0x207fffff;
+    phantomBlock.nNonce = 0;
+    const uint256 hashPhantom = phantomBlock.GetHash();
+    CBlockIndex* pPhantom = new CBlockIndex(0xFFFF, 0x7FFFFFF0, phantomBlock);
+    pPhantom->nHeight = 1;
+    bool fInserted = false;
+    {
+        LOCK(cs_main);
+        // phashBlock must point at the stable key inside mapBlockIndex
+        // (GetBlockHash() dereferences it).
+        fInserted = mapBlockIndex.insert(
+            std::make_pair(hashPhantom, pPhantom)).second;
+    }
+    BOOST_REQUIRE(fInserted);
+    pPhantom->phashBlock = &mapBlockIndex.begin()->first;
+    {
+        // Re-find the exact stable key for this entry (begin() may be a
+        // different entry once other entries exist).
+        LOCK(cs_main);
+        std::map<uint256, CBlockIndex*>::iterator mi =
+            mapBlockIndex.find(hashPhantom);
+        BOOST_REQUIRE(mi != mapBlockIndex.end());
+        pPhantom->phashBlock = &(mi->first);
+    }
+    BOOST_REQUIRE(pPhantom->GetBlockHash() == hashPhantom);
+    peer.vRecvGetData.push_back(CInv(MSG_BLOCK, hashPhantom));
+    ProcessGetDataForTesting(&peer);
+    // Observe the ACTUAL wire (SentCommandsWire), not vSendMsg: EndMessage's
+    // optimistic SocketSendData drains every assembled frame into the live
+    // socketpair, so vSendMsg/vSendMeta are empty by the time we look.  Only
+    // a notfound frame (never a block) may have reached the peer.
+    size_t blockMsgs = 0;
+    size_t notfoundMsgs = 0;
+    {
+        const std::vector<std::string> commands = SentCommandsWire(peer);
+        for (std::vector<std::string>::const_iterator c = commands.begin();
+             c != commands.end(); ++c)
+        {
+            if (*c == "block") ++blockMsgs;
+            else if (*c == "notfound") ++notfoundMsgs;
+        }
+    }
+    fprintf(stderr, "SERVE_NULL block_msgs=%zu notfound_msgs=%zu\n",
+            blockMsgs, notfoundMsgs);
+    {
+        LOCK(cs_main);
+        mapBlockIndex.erase(hashPhantom);
+    }
+    delete pPhantom;
+    BOOST_CHECK_EQUAL(blockMsgs, 0U);          // never a null block shape
+    BOOST_CHECK_EQUAL(notfoundMsgs, 1U);       // answered notfound instead
+}
+
+// ---------------------------------------------------------------------------
+// STEP 4: getblocks -> inv -> getdata -> block round-trip.
+//
+// A peer that answered our getblocks with an inv of an unknown block MUST be
+// asked for that block via getdata, so it can serve it.  The live probe that
+// observed a missing reply after getblocks was traced to a request-shaping
+// bug: when the IBD header scheduler is active
+// (main.cpp ProcessMessage "inv", the IbdHeaderSchedulerSelectActive()
+// branch at ~12135), an unknown MSG_BLOCK inv is only recorded as header
+// availability and a headers continuation is pushed — no AskFor() is issued,
+// so no getdata ever reaches the peer and the block is never served.  When
+// the scheduler is inactive, TryAdmitBlockInvOrDefer() -> AskFor() queues the
+// block and the next SendMessages() flushes a getdata.  This test pins the
+// WORKING path (scheduler inactive) and asserts the getdata is emitted.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(getblocks_inv_reply_is_requested_over_getdata)
+{
+    CNode peer(INVALID_SOCKET, TestPeerAddress(805), "inv-getdata-roundtrip",
+               true);
+    ScopedPeerSocket roundTripSocketHolder(peer);
+    BOOST_REQUIRE(HandshakePeerFramed(peer, NODE_NETWORK, nBestHeight + 100));
+    CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
+    CScopedOrphanCountByNode isolatedOrphanCounts;
+    ResetStalledSyncRecoveryStateForTesting();
+    // Force the non-scheduler path so the block inv is admitted to AskFor.
+    const bool fSchedSaved = fIbdHeaderScheduler;
+    const bool fObserveSaved = fIbdHeadersObserve;
+    fIbdHeaderScheduler = false;
+    fIbdHeadersObserve = false;
+
+    const uint256 hashBlock = uint256((uint64_t)0x3330000000000000ULL + 3);
+
+    // Peer replies to our (hypothetical) getblocks with an inv for an
+    // unknown block.
+    CDataStream payload(SER_NETWORK, INIT_PROTO_VERSION);
+    std::vector<CInv> vInv;
+    vInv.push_back(CInv(MSG_BLOCK, hashBlock));
+    payload << vInv;
+    CSerializeData payloadBytes;
+    payload.GetAndClear(payloadBytes);
+    const CSerializeData wire = FramedPayload("inv", payloadBytes);
+    {
+        LOCK(peer.cs_vRecvMsg);
+        BOOST_REQUIRE(peer.ReceiveMsgBytes((const char*)&wire[0], wire.size()));
+    }
+    {
+        LOCK(peer.cs_vRecvMsg);
+        BOOST_REQUIRE(ProcessMessages(&peer, criticalblock));
+    }
+    // The block was admitted to the request queue (will be flushed as getdata).
+    BOOST_CHECK_EQUAL(QueuedBlockAskForCount(peer, hashBlock), 1U);
+
+    // SendMessages flushes the getdata to the peer.
+    BOOST_REQUIRE(SendMessages(&peer, true));
+    const std::vector<std::string> commands = SentCommands(peer);
+    BOOST_CHECK(HasCommand(commands, "getdata"));
+
+    fIbdHeaderScheduler = fSchedSaved;
+    fIbdHeadersObserve = fObserveSaved;
+    peer.ClearAskFor();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

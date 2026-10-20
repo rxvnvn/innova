@@ -54,4 +54,5 @@ src/innova-blockindex-builder-lm
 src/innova-store3a-conv
 src/store3a_tests
 src/txloc_tests
+src/nullblock_guard_tests
 src/obj/

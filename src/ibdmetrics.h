@@ -651,6 +651,9 @@ struct Counters
     std::atomic<int64_t> same_peer_reissue_after_timeout;
     std::atomic<int64_t> cross_peer_reissue_after_timeout;
     std::atomic<int64_t> timeout_reissue_no_alternative;
+    // Null-block guard: counter of requests routed away from a peer currently
+    // flagged serve-broken (it answered a getdata with a null CBlock shape).
+    std::atomic<int64_t> null_shape_serve_broken_demote{0};
     // Tier of the peer that was actually asked.
     std::atomic<int64_t> quality_unknown_selected;
     std::atomic<int64_t> quality_good_selected;

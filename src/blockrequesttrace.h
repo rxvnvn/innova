@@ -38,7 +38,8 @@ enum BlockRequestTraceResult
     BLOCKREQ_RESULT_REJECTED,
     BLOCKREQ_RESULT_ORPHAN_LIMIT_IBD,
     BLOCKREQ_RESULT_ACCEPT_FAILED,
-    BLOCKREQ_RESULT_TRUE_UNINDEXED
+    BLOCKREQ_RESULT_TRUE_UNINDEXED,
+    BLOCKREQ_RESULT_NULL_SHAPE
 };
 
 bool InitBlockRequestTrace(bool fEnabled, const std::string& strHashFilter);

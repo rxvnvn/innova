@@ -490,7 +490,7 @@ bool error(const char *format, ...)
     va_start(arg_ptr, format);
     std::string str = vstrprintf(format, arg_ptr);
     va_end(arg_ptr);
-    printf("ERROR: %s\n", str.c_str());
+    fprintf(stderr, "ERROR: %s\n", str.c_str());
     return false;
 }
 

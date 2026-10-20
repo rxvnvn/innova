@@ -662,6 +662,19 @@ txloc_tests: $(TXLOC_TEST_SRCS)
 check-txloc: txloc_tests
 	./txloc_tests
 
+# p2p-nullblock-guard: standalone runner for the p2p_sync null-block guard
+# regression cases.  test_innova is unbuildable on this tip (test_innova.cpp
+# and several legacy suites still reference the CTxDB retired in e0ee4121 --
+# pre-existing breakage, not fixed here), so the suite links against the node
+# objects plus a CTxDB-free global fixture (test/nullblock_guard_fixture.cpp).
+NULLBLOCK_TEST_OBJS = $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/test/nullblock_guard_fixture.o obj/test/p2p_sync_tests.o
+nullblock_guard_tests: obj/build.h $(NULLBLOCK_TEST_OBJS)
+	$(LINK) $(xCXXFLAGS) -o $@ $(NULLBLOCK_TEST_OBJS) $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
+check-nullblock-guard: nullblock_guard_tests
+	./nullblock_guard_tests --run_test=p2p_sync_tests/nullblock_answer_does_not_penalize_peer
+	./nullblock_guard_tests --run_test=p2p_sync_tests/nonnull_malformed_block_still_penalized
+	./nullblock_guard_tests --run_test=p2p_sync_tests/serve_never_pushes_null_block_shape
+
 check-ibdforensic: test_innova
 	./test_innova --run_test=ibdforensic_tests
 
