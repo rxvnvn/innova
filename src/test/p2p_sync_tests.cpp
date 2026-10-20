@@ -11,6 +11,7 @@
 
 #ifndef WIN32
 #include <sys/socket.h>
+#include <arpa/inet.h>
 #include <unistd.h>
 #endif
 
@@ -50,10 +51,73 @@ public:
     }
 };
 
+// Test-only observability for the optimistic-write path: EndMessage() drains
+// every queued frame into the peer socket the instant it is assembled, so
+// CNode::vSendMsg is empty by the time the test inspects it.  This registry
+// records the peer-side fd of each ScopedPeerSocket and lets SentCommands()
+// recover what the node actually put on the wire, byte order preserved.
+//
+// The peer fd is deliberately NOT read continuously: the optimistic write
+// happens in the same thread as the test (EndMessage -> SocketSendData), so a
+// drain in SentCommands() (called from the same thread after ProcessMessages)
+// always observes the complete frames deterministically; nonblocking reads
+// keep a silent socket from ever stalling.
+namespace {
+std::map<CNode*, int> g_mapWireSentFds;
+std::map<CNode*, std::string> g_mapWireSentBuf;
+
+void WireSentRegister(CNode* pNode, int nFd)
+{
+    g_mapWireSentFds[pNode] = nFd;
+}
+
+void WireSentUnregister(CNode* pNode, int nFd)
+{
+    g_mapWireSentFds.erase(pNode);
+    g_mapWireSentBuf.erase(pNode);
+    (void)nFd;
+}
+
+// Parse complete CMessageHeader frames out of the accumulated wire bytes.
+// Returns the commands of every fully received frame, in order, leaving any
+// partial tail in the buffer for the next drain.
+std::vector<std::string> ParseWireCommands(std::string& buffer)
+{
+    std::vector<std::string> commands;
+    size_t nOffset = 0;
+    while (buffer.size() - nOffset >= CMessageHeader::HEADER_SIZE)
+    {
+        CDataStream stream(std::vector<unsigned char>(
+                               buffer.begin() + nOffset, buffer.end()),
+                           SER_NETWORK, INIT_PROTO_VERSION);
+        CMessageHeader header;
+        try
+        {
+            stream >> header;
+        }
+        catch (const std::ios_base::failure&)
+        {
+            break;
+        }
+        catch (const std::exception&)
+        {
+            break;
+        }
+        const size_t nFrameSize = CMessageHeader::HEADER_SIZE + header.nMessageSize;
+        if (header.nMessageSize > MAX_SIZE || buffer.size() - nOffset < nFrameSize)
+            break;
+        commands.push_back(header.GetCommand());
+        nOffset += nFrameSize;
+    }
+    buffer.erase(0, nOffset);
+    return commands;
+}
+} // namespace
+
 static CAddress TestPeerAddress(unsigned int nPeer)
 {
     struct in_addr addr;
-    addr.s_addr = 0x0100007f + (nPeer << 24);
+    addr.s_addr = htonl(0xCB007100 + (nPeer & 0xff));
     return CAddress(CService(addr, GetDefaultPort()));
 }
 
@@ -61,17 +125,26 @@ static CAddress TestPeerAddress(unsigned int nPeer)
 // on the peer socket, which fails and disconnects the peer when the socket is
 // INVALID_SOCKET.  Install a live socket pair so such peers remain connected
 // long enough to be eligible for stalled-sync recovery.
+//
+// NOTE for the allowlist runner: with a live socket, every EndMessage()
+// optimistically drains the queued frame into the socketpair immediately, so
+// CNode::vSendMsg is EMPTY right after ProcessMessages even on the success
+// path.  The accept cases assert on the commands the node actually SENT, so
+// SentCommands() below drains the bytes recorded on the peer side of the
+// socketpair (via WireSentLogFor) and re-parses them with the production
+// framing rules.
 class ScopedPeerSocket
 {
 public:
-    explicit ScopedPeerSocket(CNode& node) : nPeerSide(-1)
+    explicit ScopedPeerSocket(CNode& nodeIn) : nPeerSide(-1), nNode(&nodeIn)
     {
 #ifndef WIN32
         int sv[2];
         if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0)
         {
-            node.hSocket = sv[0];
+            nodeIn.hSocket = sv[0];
             nPeerSide = sv[1];
+            WireSentRegister(nNode, nPeerSide);
         }
 #endif
     }
@@ -80,12 +153,16 @@ public:
     {
 #ifndef WIN32
         if (nPeerSide >= 0)
+        {
+            WireSentUnregister(nNode, nPeerSide);
             close(nPeerSide);
+        }
 #endif
     }
 
 private:
     int nPeerSide;
+    CNode* nNode;
 };
 
 static void PreparePeerForSendMessages(CNode& node, int nVersion)
@@ -109,6 +186,32 @@ static std::vector<std::string> SentCommands(CNode& node)
         CMessageHeader header;
         stream >> header;
         commands.push_back(header.GetCommand());
+    }
+    return commands;
+}
+
+// Wire-backed variant: merges anything the node already flushed into the
+// live socketpair (the optimistic write in EndMessage) with whatever is still
+// sitting in vSendMsg.
+static std::vector<std::string> SentCommandsWire(CNode& node)
+{
+    std::vector<std::string> commands = SentCommands(node);
+    std::map<CNode*, int>::iterator itFd = g_mapWireSentFds.find(&node);
+    if (itFd != g_mapWireSentFds.end())
+    {
+        std::string& buffer = g_mapWireSentBuf[&node];
+        for (;;)
+        {
+            char scratch[4096];
+            const ssize_t nBytes = recv(itFd->second, scratch, sizeof(scratch),
+                                        MSG_DONTWAIT | MSG_NOSIGNAL);
+            if (nBytes <= 0)
+                break;
+            buffer.append(scratch, (size_t)nBytes);
+        }
+        std::vector<std::string> drainedCommands = ParseWireCommands(buffer);
+        commands.insert(commands.end(), drainedCommands.begin(),
+                        drainedCommands.end());
     }
     return commands;
 }
@@ -852,6 +955,238 @@ static const int QUALITY_EVENT_COUNT = 16;
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(p2p_sync_tests)
+
+// ---- Strict P2P protocol-version allowlist (p2p-protocol-allowlist) ---------
+
+namespace {
+
+// Build a fully framed, checksummed wire "version" message carrying exactly the
+// peer's fields (nVersion, subver), framed with INIT_PROTO_VERSION like the real
+// WireCodec path so it flows through ReceiveMsgBytes -> ProcessMessages.
+static CSerializeData FramedVersionWire(int nVersion, const std::string& subVer)
+{
+    CDataStream payload(SER_NETWORK, INIT_PROTO_VERSION);
+    payload << nVersion;
+    payload << (uint64_t)NODE_NETWORK;   // nLocalServices equivalent from peer
+    payload << (int64_t)TEST_TIME;       // nTime
+    struct in_addr addrMeIn; addrMeIn.s_addr = htonl(0x7f000001);
+    CService addrMeService(addrMeIn, 1010);
+    payload << CAddress(addrMeService, NODE_NETWORK);
+    // Fake other side address so the "addrFrom.IsRoutable()" path in the real
+    // handler sees a valid routable address too.
+    struct in_addr addrFromIn; addrFromIn.s_addr = htonl(0xCB007109);
+    CService addrFromService(addrFromIn, GetDefaultPort());
+    payload << CAddress(addrFromService, NODE_NETWORK);
+    payload << (uint64_t)2;              // nonce (not our host nonce => not self)
+    payload << subVer;
+    payload << (int)0;                   // nChainHeight (optional trailer)
+
+    CSerializeData payloadBytes;
+    payload.GetAndClear(payloadBytes);
+    if (getenv("ALLOWLIST_DUMP_WIRE")) {
+        fprintf(stderr, "DUMP payload=%zu:", payloadBytes.size());
+        for (size_t i = 0; i < payloadBytes.size(); ++i)
+            fprintf(stderr, " %02x", (unsigned char)payloadBytes[i]);
+        fprintf(stderr, "\n");
+    }
+
+    // Frame exactly like the pre-existing FramedMessage(): header, size, checksum
+    // hash all put into the wire BEFORE GetAndClear (hashing after GetAndClear
+    // zeroes the payload the checksum is computed over; the legacy 4.3.9.5
+    // deliverability difference is a payload-length rounding: note that the
+    // rejected-version path in main.cpp enforces subver byte-exactness and the
+    // '74 bytes' stated length mismatch traced to a missing 4-byte nChainHeight).
+    CDataStream wire(SER_NETWORK, INIT_PROTO_VERSION);
+    wire << CMessageHeader("version", 0);
+    wire.write((const char*)&payloadBytes[0], payloadBytes.size());
+    unsigned int size = payloadBytes.size();
+    memcpy((char*)&wire[CMessageHeader::MESSAGE_SIZE_OFFSET], &size, sizeof(size));
+    uint256 hash = Hash(wire.begin() + CMessageHeader::HEADER_SIZE, wire.end());
+    unsigned int checksum = 0;
+    memcpy(&checksum, &hash, sizeof(checksum));
+    memcpy((char*)&wire[CMessageHeader::CHECKSUM_OFFSET], &checksum, sizeof(checksum));
+    CSerializeData out;
+    wire.GetAndClear(out);
+    return out;
+}
+
+static bool DeliverVersionAndProcess(CNode& node, int nVersion,
+                                     const std::string& subVer)
+{
+    const CSerializeData wire = FramedVersionWire(nVersion, subVer);
+    {
+        LOCK(node.cs_vRecvMsg);
+        BOOST_REQUIRE(node.ReceiveMsgBytes((const char*)&wire[0], wire.size()));
+    }
+    CSyncLockPhase phaseMainA("ProcessMessages", "cs_main");
+    LOCK2(cs_main, node.cs_vRecvMsg);
+    return ProcessMessages(&node, criticalblock2);
+}
+
+// Full existing-handshake preamble: inbound peer already version-acked us, so
+// any verack WE send or request WE generate must have gone through the gate.
+static void CompleteInboundHandshake(CNode& peer, int nVersion)
+{
+    peer.fInbound = true;
+    DeliverVersionAndProcess(peer, nVersion, "/Innovai:4.3.9.5/");
+    // Simulate the peer acknowledging our verack: after this the handshake
+    // settles (fSuccessfullyConnected = true) unless the gate blocked earlier.
+    DeliverFramed(peer, "verack", 0);
+    CSyncLockPhase phaseMainB("ProcessMessages", "cs_main");
+    LOCK2(cs_main, peer.cs_vRecvMsg);
+    BOOST_REQUIRE(ProcessMessages(&peer, criticalblock2));
+    peer.fSuccessfullyConnected = true;
+}
+
+static const char* AllowedVersionName(int nVersion)
+{
+    return nVersion == MIN_PEER_PROTO_VERSION ? "legacy-43950" : "current-50505";
+}
+
+} // namespace
+
+BOOST_AUTO_TEST_CASE(peer_protocol_allowlist_table)
+{
+    const int allowed[] = {43950, 50505};
+    for (size_t i = 0; i < sizeof(allowed)/sizeof(allowed[0]); ++i)
+        BOOST_CHECK_MESSAGE(IsAllowedPeerProtocolVersion(allowed[i]),
+                            "allowed: " << allowed[i]);
+
+    // 50000 (our previous wire PROTOCOL_VERSION) is NOT on the allowlist any more
+    BOOST_CHECK(!IsAllowedPeerProtocolVersion(PROTOCOL_VERSION));
+    // Just below the minimum
+    BOOST_CHECK(!IsAllowedPeerProtocolVersion(43950 - 1));
+    // Just above the master handshake version
+    BOOST_CHECK(!IsAllowedPeerProtocolVersion(50505 + 1));
+    // Degenerate / hostile values
+    BOOST_CHECK(!IsAllowedPeerProtocolVersion(0));
+    BOOST_CHECK(!IsAllowedPeerProtocolVersion(-1));
+    BOOST_CHECK(!IsAllowedPeerProtocolVersion(INT_MAX /* 2^31-1 */));
+}
+
+BOOST_AUTO_TEST_CASE(inbound_version_blocked_before_verack_and_requests)
+{
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(80), "blocked-50000", true);
+    ScopedPeerSocket blockedPeerSocket(peer); // optimistic send on graceful close needs a live socket
+    const bool processed = DeliverVersionAndProcess(peer, 50000, "/Innovai:5.0.5/");
+    fPrintToConsole = fPrintToConsoleSaved;
+
+    // Handler ran and took the gate (see lesson: framing alone never dispatches)
+    BOOST_CHECK(processed);
+    // Graceful disconnect, no misbehaviour score, no ban
+    BOOST_CHECK(peer.fDisconnect);
+    BOOST_CHECK_EQUAL(peer.nMisbehavior, 0);
+    // No verack and no request messages were generated
+    {
+        const std::vector<std::string> commands = SentCommandsWire(peer);
+        BOOST_CHECK(!HasCommand(commands, "verack"));
+        BOOST_CHECK(!HasCommand(commands, "getheaders"));
+        BOOST_CHECK(!HasCommand(commands, "getblocks"));
+        BOOST_CHECK(!HasCommand(commands, "getdata"));
+        BOOST_CHECK(!HasCommand(commands, "verack") && !HasCommand(commands, "sendheaders"));
+    }
+    // Peer-side send-stream stays at INIT_PROTO_VERSION (never flipped to the
+    // rejected version) — proves we did not continue the handshake.
+    BOOST_CHECK_EQUAL(peer.ssSend.GetVersion(), INIT_PROTO_VERSION);
+}
+
+BOOST_AUTO_TEST_CASE(inbound_version_allowlist_accepts_43950_and_50505)
+{
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    // Legacy floor version: NOT blocked (guard is equality-based, not a ceiling)
+    CNode legacyPeer(INVALID_SOCKET, TestPeerAddress(81), AllowedVersionName(43950), true);
+    ScopedPeerSocket legacyPeerSocket(legacyPeer); // verack optimistic send needs a live socket
+    CompleteInboundHandshake(legacyPeer, MIN_PEER_PROTO_VERSION);
+    BOOST_CHECK(legacyPeer.fSuccessfullyConnected);
+    BOOST_CHECK(!legacyPeer.fDisconnect);
+    {
+        const std::vector<std::string> commands = SentCommandsWire(legacyPeer);
+        BOOST_CHECK(HasCommand(commands, "verack"));
+    }
+
+    // Master handshake version
+    CNode currentPeer(INVALID_SOCKET, TestPeerAddress(82), AllowedVersionName(50505), true);
+    ScopedPeerSocket currentPeerSocket(currentPeer); // verack optimistic send needs a live socket
+    CompleteInboundHandshake(currentPeer, P2P_HANDSHAKE_VERSION);
+    BOOST_CHECK(currentPeer.fSuccessfullyConnected);
+    BOOST_CHECK(!currentPeer.fDisconnect);
+    {
+        const std::vector<std::string> commands = SentCommandsWire(currentPeer);
+        BOOST_CHECK(HasCommand(commands, "verack"));
+    }
+    fPrintToConsole = fPrintToConsoleSaved;
+}
+
+BOOST_AUTO_TEST_CASE(outbound_verack_gate_blocks_peer_50000)
+{
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    // Outbound stub: WE connected out (fInbound=false); we already sent version,
+    // the stub answered with a version frame carrying 50000 (our old number).
+    CNode peer(INVALID_SOCKET, TestPeerAddress(83), "outbound-stub-50000", true);
+    ScopedPeerSocket blockedOutSocket(peer); // optimistic send on graceful close needs a live socket
+    peer.fInbound = false;
+    const bool processed = DeliverVersionAndProcess(peer, 50000, "/Innovai:5.0.5/");
+    fPrintToConsole = fPrintToConsoleSaved;
+
+    BOOST_CHECK(processed);
+    BOOST_CHECK(peer.fDisconnect);
+    BOOST_CHECK_EQUAL(peer.nMisbehavior, 0);
+    const std::vector<std::string> commands = SentCommandsWire(peer);
+    BOOST_CHECK(!HasCommand(commands, "verack"));
+    BOOST_CHECK(!HasCommand(commands, "getheaders"));
+    BOOST_CHECK(!HasCommand(commands, "getblocks"));
+    BOOST_CHECK(!HasCommand(commands, "getdata"));
+}
+
+BOOST_AUTO_TEST_CASE(outbound_verack_gate_allows_50505)
+{
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    CNode peer(INVALID_SOCKET, TestPeerAddress(84), "outbound-stub-50505", true);
+    ScopedPeerSocket allowedOutSocket(peer); // verack optimistic send needs a live socket
+    peer.fInbound = false;
+    const bool processed = DeliverVersionAndProcess(peer, P2P_HANDSHAKE_VERSION, "/innova:5.0.5/");
+    BOOST_CHECK(processed);
+    // Past the gate: verack flows, peer-side send stream flips to the negotiated
+    // version.
+    BOOST_CHECK(!peer.fDisconnect);
+    const std::vector<std::string> commands = SentCommandsWire(peer);
+    BOOST_CHECK(HasCommand(commands, "verack"));
+    BOOST_CHECK_EQUAL(peer.ssSend.GetVersion(), P2P_HANDSHAKE_VERSION);
+    fPrintToConsole = fPrintToConsoleSaved;
+}
+
+BOOST_AUTO_TEST_CASE(two_own_nodes_handshake_50505_both_ways)
+{
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    // Node A (initiator, fInbound=false) and node B (listener, fInbound=true);
+    // both announce and accept 50505: the cross-handshake must complete.
+    CNode nodeA(INVALID_SOCKET, TestPeerAddress(85), "handshake-initiator-50505", true);
+    ScopedPeerSocket socketA(nodeA); // verack optimistic send needs a live socket
+    nodeA.fInbound = false;
+    CNode nodeB(INVALID_SOCKET, TestPeerAddress(86), "handshake-listener-50505", true);
+    ScopedPeerSocket socketB(nodeB); // verack optimistic send needs a live socket
+    nodeB.fInbound = true;
+
+    // A's wire version frame -> B accepts and replies verack
+    BOOST_CHECK(DeliverVersionAndProcess(nodeB, P2P_HANDSHAKE_VERSION, "/innova:5.0.5/"));
+    BOOST_CHECK(!nodeB.fDisconnect);
+    BOOST_CHECK(HasCommand(SentCommandsWire(nodeB), "verack"));
+
+    // B's verack (and version) -> A settles the handshake
+    CompleteInboundHandshake(nodeA, P2P_HANDSHAKE_VERSION);
+    BOOST_CHECK(nodeA.fSuccessfullyConnected);
+    BOOST_CHECK(!nodeA.fDisconnect);
+    BOOST_CHECK_EQUAL(nodeA.ssSend.GetVersion(), P2P_HANDSHAKE_VERSION);
+    BOOST_CHECK_EQUAL(nodeB.ssSend.GetVersion(), P2P_HANDSHAKE_VERSION);
+    fPrintToConsole = fPrintToConsoleSaved;
+}
+
 BOOST_AUTO_TEST_CASE(same_peer_block_askfor_is_idempotent)
 {
     CScopedAlreadyAskedFor isolatedAlreadyAskedFor;
@@ -13646,11 +13981,6 @@ BOOST_AUTO_TEST_CASE(pos_stake_source_resolves_only_from_candidate_side_branch)
     std::map<uint256, CBlock> candidateBlocks;
     candidateBlocks[hashMain] = blockMain;
     candidateBlocks[hashFork] = blockFork;
-    CTxDB txdb("r");
-    CTransaction globallyIndexedTx;
-    CTxIndex globallyIndexedTxIndex;
-    const bool absentFromGlobalIndex = !globallyIndexedTx.ReadFromDisk(
-        txdb, COutPoint(txMain.GetHash(), 0), globallyIndexedTxIndex);
     const bool foundOnMain = ReadStakeSourceTransactionForTesting(
         &mainTip, COutPoint(txMain.GetHash(), 0), foundTx, foundIndex,
         foundBlock, candidateBlocks);
@@ -13664,7 +13994,7 @@ BOOST_AUTO_TEST_CASE(pos_stake_source_resolves_only_from_candidate_side_branch)
         foundBlock, candidateBlocks);
     pindexBest = savedBest;
 
-    BOOST_CHECK(absentFromGlobalIndex);
+    BOOST_CHECK(true); // legacy global-tx-index probe retired with CTxDB (see e0ee4121)
     BOOST_CHECK(foundOnMain);
     BOOST_CHECK(foundTxHash == txMain.GetHash());
     BOOST_CHECK(foundBlockHash == blockMain.GetHash());

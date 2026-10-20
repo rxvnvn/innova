@@ -664,6 +664,23 @@ txloc_tests: $(TXLOC_TEST_SRCS)
 check-txloc: txloc_tests
 	./txloc_tests
 
+# p2p-proto-allowlist: standalone runner for the p2p_sync protocol-version
+# allowlist regression cases.  test_innova is unbuildable on this tip
+# (test/test_innova.cpp and several legacy suites still reference the CTxDB
+# retired in e0ee4121 -- pre-existing breakage, not fixed here), so the suite
+# links against the node objects plus a CTxDB-free global fixture
+# (test/allowlist_guard_fixture.cpp).
+ALLOWLIST_TEST_OBJS = $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/test/allowlist_guard_fixture.o obj/test/p2p_sync_tests.o
+proto_allowlist_tests: obj/build.h $(ALLOWLIST_TEST_OBJS)
+	$(LINK) $(xCXXFLAGS) -o $@ $(ALLOWLIST_TEST_OBJS) $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
+check-proto-allowlist: proto_allowlist_tests
+	./proto_allowlist_tests --run_test=p2p_sync_tests/peer_protocol_allowlist_table
+	./proto_allowlist_tests --run_test=p2p_sync_tests/inbound_version_blocked_before_verack_and_requests
+	./proto_allowlist_tests --run_test=p2p_sync_tests/inbound_version_allowlist_accepts_43950_and_50505
+	./proto_allowlist_tests --run_test=p2p_sync_tests/outbound_verack_gate_blocks_peer_50000
+	./proto_allowlist_tests --run_test=p2p_sync_tests/outbound_verack_gate_allows_50505
+	./proto_allowlist_tests --run_test=p2p_sync_tests/two_own_nodes_handshake_50505_both_ways
+
 check-ibdforensic: test_innova
 	./test_innova --run_test=ibdforensic_tests
 
