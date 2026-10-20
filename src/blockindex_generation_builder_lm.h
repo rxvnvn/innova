@@ -60,6 +60,13 @@ public:
                std::string* error);
 
 private:
+    // Reference implementation of the former staged pipeline (sort runs +
+    // actidx/deridx side indexes); no production caller paths through it.
+    bool BuildStagedPipeline(const std::string& snapshotLevelDbDir,
+                             const std::string& blockDataDir,
+                             uint64_t generation,
+                             const std::string& stagingDir,
+                             std::string* error);
     BlockIndexGenerationWriter writer_;
 };
 

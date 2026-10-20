@@ -374,6 +374,7 @@ OBJS= \
     obj/blockindex_fold_tool.o \
     obj/blockindex_generation_writer.o \
     obj/blockindex_generation_builder_lm.o \
+    obj/lm_stream_builder.o \
     obj/script.o \
     obj/sync.o \
     obj/util.o \
@@ -485,6 +486,7 @@ OBJS= \
     obj/blockindex_fold_tool.o \
     obj/blockindex_generation_writer.o \
     obj/blockindex_generation_builder_lm.o \
+    obj/lm_stream_builder.o \
     obj/script.o \
     obj/sync.o \
     obj/util.o \

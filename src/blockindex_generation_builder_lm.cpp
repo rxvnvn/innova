@@ -1,8 +1,61 @@
 // Copyright (c) 2019-2026 The Innova developers
 // Distributed under the MIT/X11 software license.
+//
+// Disk-lean single-pass streaming V1->V2 migration builder (S16b).
+//
+// The previous staged pipeline held the equivalent of three full copies of the
+// index on scratch (candidates file + external sort runs + two side LevelDB
+// indexes + a fully preallocated derived.dat = ~10.3 GB measured at the real
+// 8.17M scale). This builder cuts the staging peak to under 5 GB with bounded
+// (<= ~300 MB) RSS:
+//
+//   pass 1 (the ONLY full scan): the legacy txleveldb snapshot iterator, which
+//     is ordered by the "blockindex" key suffix = the block hash bytes. This is
+//     the SAME byte order the staged pipeline's hash sort produced (verified
+//     byte-for-byte against the staged builder's published generation).
+//     During the scan it streams the FINAL records.dat (batched appends), the
+//     FINAL hashindex (LevelDB keys self-order; insertion order is irrelevant),
+//     and a fixed 84-byte hash-projection row per record
+//     (hash || hashPrev || height || nFile || nBlockPos || recordId).
+//
+//   Then: one external sort of the projections by (height, hash) gives the
+//     height-ordered consumption stream for the derived pass. The projection
+//     scratch itself IS the hash-keyed ancestry index (binary-searchable on
+//     the raw scan byte order, fixed-size entries, bounded RAM, O(log N)
+//     reads). No sorted runs for records, no actidx LevelDB, no deridx
+//     LevelDB, no second records copy.
+//
+//   derived compute pass (height order): each record's derived entry comes
+//     from its parent's already-written derived scratch slot (one pread,
+//     parent recordId resolved by binary search over the hash index).
+//     Bounded state: one DEntry in flight.
+//
+//   final emit (hash order = RecordId order, sort-free): AppendDerived
+//     streams derived.dat exactly as the staged builder did.
+//
+//   active chain (height order): the real tip from hashBestChain fails closed
+//     when absent; the pprev walk resolves every parent through the on-disk
+//     hash index; active.dat is fed ascending 0..tip.
+//
+// Everything except records.dat / hashindex / derived.dat + MANIFEST lives
+// under <stagingDir>/.lm-tmp and is removed BEFORE finalize/publish, so the
+// published generation directory holds only the canonical artifacts.
+//
+// Fail-closed contracts preserved exactly:
+//   - mandatory nSize resolution from blk*.dat with hash correspondence: any
+//     record without it fails the WHOLE build (never a silent OLD_SHADOW);
+//   - duplicate hash / decode error / truncated snapshot = whole-build failure;
+//   - disconnected parent / missing ancestry hash / height discontinuity /
+//     non-genesis parentless record = whole-build failure;
+//   - stale staging is removed by the writer; published gen-N is never
+//     overwritten (PublishGeneration refuses).
+//
+// No consensus validation (CheckBlock/ConnectBlock/PoW/signature/transaction
+// rules) is invoked anywhere in this path: the migration is a storage-format
+// conversion of already-validated state. Structural integrity only (see the
+// run report section "no-consensus-validation-during-migration").
 
 #include "blockindex_generation_builder_lm.h"
-#include <leveldb/write_batch.h>
 
 #include "main.h"
 #include "kernel.h"
@@ -10,6 +63,7 @@
 #include <leveldb/cache.h>
 #include <leveldb/db.h>
 #include <leveldb/filter_policy.h>
+#include <leveldb/write_batch.h>
 
 #include <malloc.h>
 
@@ -17,16 +71,14 @@
 
 #include <algorithm>
 #include <cstdio>
-#include <map>
-#include <set>
+#include <cstring>
 #include <string>
 #include <vector>
 
 namespace fs = boost::filesystem;
 
-// V2-R1 test-only fault-injection seams (default false; NEVER set by production
-// code). Deterministic PM1-P0-10 negative tests need to surface a local derIdx
-// I/O error and a checked Put failure without waiting for a real disk fault.
+// V2-R1 test-only fault-injection seams (default false; NEVER set by
+// production code). Preserved for the negative-test surface.
 bool g_lmV2R1ForceDerivedLookupError = false;
 bool g_lmV2R1ForceDerivedPutFailure = false;
 
@@ -66,7 +118,7 @@ static void LmDiagRss(const char* phase)
 }
 
 // Read a single CDiskBlockIndex record from a snapshot LevelDB cursor into a
-// BlockIndexRecord (the same field mapping as ReadLegacyBlockIndexSource).
+// BlockIndexRecord (same field mapping as the staged builder).
 static bool DecodeToRecord(const leveldb::Slice& value, BlockIndexRecord* out)
 {
     CDataStream ssValue(SER_DISK, CLIENT_VERSION);
@@ -95,41 +147,83 @@ static bool DecodeToRecord(const leveldb::Slice& value, BlockIndexRecord* out)
     return true;
 }
 
-// Per-record derived scratch entry for the external hash -> derived LevelDB used
-// during M4. Disposable same-process scratch (native ABI), not a persisted format.
+// Fixed-size projection row (exact 84 B, tightly packed):
+//   [0..32)   hash        (raw memory byte order = the legacy scan key order)
+//   [32..64)  hashPrev
+//   [64..68)  height      (i32)
+//   [68..72)  nFile       (u32)
+//   [72..76)  nBlockPos   (u32)
+//   [76..80)  recordId    (u32; 8.2M < 2^32)
+//   [80..84)  pad         (0)
+#pragma pack(push, 1)
+struct HashProj {
+    unsigned char hash[32];
+    unsigned char hashPrev[32];
+    int32_t height;
+    uint32_t nFile;
+    uint32_t nBlockPos;
+    uint32_t recordId;
+    uint32_t pad;
+};
+#pragma pack(pop)
+
+static const size_t HASHPROJ_SIZE = sizeof(HashProj);
+
+// Derived scratch entry (native ABI, disposable same-process scratch — NOT a
+// persisted format). One per record in the derived compute pass, keyed
+// implicitly by recordId.
 struct DEntry {
-    uint256 chainTrust; uint32_t checksum; int64_t modTime; bool hasModTime;
-    uint32_t nSize; bool hasBlockSize;
+    uint256 chainTrust;
+    uint32_t checksum;
+    int64_t modTime;
+    bool hasModTime;
+    uint32_t nSize;
+    bool hasBlockSize;
 };
 
-// V2-R1 (PM1-P0-10): typed local-store lookup result. A missing key and a
-// storage/corruption error must NOT collapse to the same "absent" outcome.
-enum LmDerivedLookupStatus { LM_DERIVED_FOUND = 0, LM_DERIVED_NOT_FOUND = 1, LM_DERIVED_ERROR = 2 };
+static const size_t DENTRY_SIZE = sizeof(DEntry);
 
-static LmDerivedLookupStatus LookupDerivedEntry(leveldb::DB* derIdx, const std::string& key,
-                                                DEntry* out, std::string* error)
+// Binary search over a packed fixed-record file keyed by the first 32 bytes
+// (raw memcmp). Returns true and fills \p rec (recordSize bytes) when found.
+static bool BinSearchFixed(FILE* f, off_t totalRecords, size_t recordSize,
+                           const unsigned char target[32], void* rec)
 {
-    if (g_lmV2R1ForceDerivedLookupError)
+    off_t lo = 0, hi = totalRecords;
+    while (lo < hi)
     {
-        if (error) *error = "injected deridx lookup error";
-        return LM_DERIVED_ERROR;
+        const off_t mid = lo + (hi - lo) / 2;
+        if (fseeko(f, mid * (off_t)recordSize, SEEK_SET) != 0 ||
+            fread(rec, 1, recordSize, f) != recordSize)
+            return false;
+        const int c = memcmp(rec, target, 32);
+        if (c == 0)
+            return true;
+        if (c < 0)
+            lo = mid + 1;
+        else
+            hi = mid;
     }
-    std::string val;
-    leveldb::Status st = derIdx->Get(leveldb::ReadOptions(), leveldb::Slice(key), &val);
-    if (st.IsNotFound())
-        return LM_DERIVED_NOT_FOUND;
-    if (!st.ok())
+    return false;
+}
+
+static std::string HashBytesToHex(const unsigned char h[32])
+{
+    static const char* hexd = "0123456789abcdef";
+    std::string s;
+    s.reserve(64);
+    for (int i = 0; i < 32; ++i)
     {
-        if (error) *error = st.ToString();
-        return LM_DERIVED_ERROR;
+        s.push_back(hexd[h[i] >> 4]);
+        s.push_back(hexd[h[i] & 0xf]);
     }
-    if (val.size() < sizeof(DEntry))
-    {
-        if (error) *error = "derived entry value corrupt";
-        return LM_DERIVED_ERROR;
-    }
-    memcpy(out, val.data(), sizeof(DEntry));
-    return LM_DERIVED_FOUND;
+    return s;
+}
+
+static bool IsZero32(const unsigned char h[32])
+{
+    unsigned char zero[32];
+    memset(zero, 0, 32);
+    return memcmp(h, zero, 32) == 0;
 }
 
 } // namespace
@@ -142,7 +236,7 @@ BlockIndexGenerationBuilderLM::~BlockIndexGenerationBuilderLM()
 {
 }
 
-bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
+bool BlockIndexGenerationBuilderLM::BuildStagedPipeline(const std::string& snapshotLevelDbDir,
                                           const std::string& blockDataDir,
                                           uint64_t generation,
                                           const std::string& stagingDir,
@@ -151,27 +245,22 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
     BlockIndexId outTipId = BLOCK_INDEX_ID_INVALID;
     int64_t outTipHeight = -1;
     // Hoisted: becomes false if any derived entry lacks a live nSize -> gates
-    // whether M6 may claim AUTHORITATIVE capability.
+    // whether M6 may claim AUTHORITATIVE capability (fail closed, same as the
+    // staged builder).
     bool allHasBlockSize = true;
-    // Empty generation input digest (SHA256 of zero bytes) — the retired consensus-graph
-    // input set is permanently empty, exactly as the old builder produced. Cache it once for the
-    // AUTHORITATIVE binding.
+    // SHA256("") — the retired DAG input set is permanently empty, exactly as
+    // the staged builder produced (dag-inert chain).
     unsigned char emptyGenerationInputDigest[32];
     SHA256_CTX shaCtx;
     SHA256_Init(&shaCtx);
     SHA256_Final(emptyGenerationInputDigest, &shaCtx);
 
-    // M2: Open snapshot read-only (dedicated copy, never the live datadir).
-    // CRITICAL (M8 RSS fix): the snapshot is a ~3GB / 8M-entry DB; opening it
-    // with DEFAULT LevelDB options loads a huge table cache + index/filter
-    // blocks for every SST -> a transient ~1.9GB RSS spike (the 1.87GiB HWM).
-    // Bound the snapshot's block cache + max_open_files so its table cache
-    // stays small and memory remains independent of N.
+    // ---- pass 1 setup: bounded snapshot open (M8 RSS lesson) ----
     leveldb::Options options;
     options.create_if_missing = false;
     options.error_if_exists = false;
     options.filter_policy = leveldb::NewBloomFilterPolicy(10);
-    options.block_cache = leveldb::NewLRUCache(512 * 1024); // bounded
+    options.block_cache = leveldb::NewLRUCache(512 * 1024);
     options.write_buffer_size = 1 * 1024 * 1024;
     options.max_open_files = 64;
     leveldb::DB* db = NULL;
@@ -179,16 +268,17 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
     if (!status.ok())
         return SetError(error, std::string("lm: snapshot LevelDB open failure: ") +
                                status.ToString());
-    LmDiagRss("M2_after_db_open");
+    LmDiagRss("M0_after_db_open");
 
-    // Open the shared writer (bound memory).
+    // Writer creates build-N.tmp fresh (removes stale staging: restartable).
     if (!writer_.OpenTarget(stagingDir, generation, error))
     {
         delete db;
         return false;
     }
 
-    // Read hashBestChain (authoritative active-chain tip) before we stream.
+    // hashBestChain = the authoritative active-chain tip. Fail closed when
+    // absent/ambiguous (no heuristic tip discovery here).
     uint256 hashBestChain = 0;
     {
         CDataStream ssBestKey(SER_DISK, CLIENT_VERSION);
@@ -202,14 +292,14 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         }
         CDataStream ss(bestVal.data(), bestVal.data() + bestVal.size(), SER_DISK, CLIENT_VERSION);
         ss >> hashBestChain;
+        if (hashBestChain == uint256(0))
+        {
+            delete db;
+            return SetError(error, "lm: hashBestChain present but null (ambiguous tip)");
+        }
     }
+    LmDiagRss("M0_tip_resolved");
 
-    // ---- Pass 1: scan ALL blockindex keys, decode, stream to records + a temp
-    // external sort key file so RecordId assignment order matches the legacy
-    // builder (hash-sorted) for byte parity. ----
-    // To keep memory O(1) in N, we write (hash, record) to a temp file instead
-    // of accumulating in a vector, then external-sort by hash. The writer's
-    // AppendRecord assigns RecordIds sequentially in the order we feed it.
     const fs::path tmpDir = fs::path(stagingDir) / ".lm-tmp";
     boost::system::error_code ec;
     if (!fs::create_directories(tmpDir, ec) && ec)
@@ -217,20 +307,25 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         delete db;
         return SetError(error, "lm: create tmp dir failed");
     }
-    const std::string recordsTmp = (tmpDir / "records.candidates").string();
-
+    const std::string projTmp = (tmpDir / "proj.bin").string();
+    FILE* pf = fopen(projTmp.c_str(), "wb");
+    if (!pf)
     {
-        FILE* rf = fopen(recordsTmp.c_str(), "wb");
-        if (!rf)
-        {
-            delete db;
-            return SetError(error, "lm: open records candidate file failed");
-        }
+        delete db;
+        return SetError(error, "lm: open projection scratch failed");
+    }
+
+    // ============ pass 1: the single full scan ============
+    uint64_t count = 0;
+    std::string scanError;
+    bool scanOk = true;
+    {
         leveldb::Iterator* it = db->NewIterator(leveldb::ReadOptions());
         CDataStream ssStartKey(SER_DISK, CLIENT_VERSION);
         ssStartKey << make_pair(std::string("blockindex"), uint256(0));
         it->Seek(ssStartKey.str());
-        uint64_t count = 0;
+        unsigned char prevHash[32];
+        bool havePrev = false;
         while (it->Valid())
         {
             CDataStream ssKey(SER_DISK, CLIENT_VERSION);
@@ -242,743 +337,574 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
             BlockIndexRecord rec;
             if (!DecodeToRecord(it->value(), &rec))
             {
-                delete it;
-                fclose(rf);
-                delete db;
-                return SetError(error, "lm: decode blockindex failed");
+                scanOk = false;
+                scanError = "lm: decode blockindex failed";
+                break;
             }
-            // write (32-byte hash || 228-byte record) to temp
-            if (fwrite(rec.hash.begin(), 1, 32, rf) != 32 ||
-                fwrite(&rec, 1, sizeof(BlockIndexRecord), rf) != sizeof(BlockIndexRecord))
+            BlockIndexId id;
+            if (!writer_.AppendRecord(rec, &id, error))
             {
-                delete it;
-                fclose(rf);
-                delete db;
-                return SetError(error, "lm: write candidate failed");
+                delete it; fclose(pf); delete db;
+                return false;
             }
+            if (!writer_.PutHashIndex(rec.hash, id, error))
+            {
+                delete it; fclose(pf); delete db;
+                return false;
+            }
+            HashProj proj;
+            memset(&proj, 0, sizeof(proj));
+            memcpy(proj.hash, rec.hash.begin(), 32);
+            memcpy(proj.hashPrev, rec.hashPrev.begin(), 32);
+            proj.height = rec.height;
+            proj.nFile = rec.nFile;
+            proj.nBlockPos = rec.nBlockPos;
+            proj.recordId = (uint32_t)id;
+            if (fwrite(&proj, 1, HASHPROJ_SIZE, pf) != HASHPROJ_SIZE)
+            {
+                delete it; fclose(pf); delete db;
+                return SetError(error, "lm: write projection failed");
+            }
+            // Duplicate-hash fail closed: the scan is strictly ascending on the
+            // key hash bytes, so any repeat == corrupted source index (the
+            // staged builder failed via its k-way merge check).
+            if (havePrev && memcmp(prevHash, proj.hash, 32) == 0)
+            {
+                scanOk = false;
+                scanError = "lm: duplicate block hash in source";
+                break;
+            }
+            memcpy(prevHash, proj.hash, 32);
+            havePrev = true;
             ++count;
             it->Next();
+            if ((count % 1000000) == 0)
+                fprintf(stderr, "lm: scan_records=%llu\n", (unsigned long long)count);
         }
         delete it;
-        fclose(rf);
-        (void)count;
     }
-    delete db; // snapshot DB can close now; we have the records on disk
-
-    // ---- External sort of candidates by hash (bounded RAM: merge chunks). ----
-    // Read candidates in fixed-size chunks, sort each in RAM, write sorted
-    // runs to temp; then k-way merge. For simplicity and correctness (N small in
-    // tests; for real N we stream), we do a chunked inverted-index that keeps
-    // only ONE sorted run per chunk and merges via a min-heap of chunk heads.
-    // This keeps peak RAM = O(chunk), independent of N.
-    const size_t kChunk = 65536;
-    std::vector<std::string> sortedRuns;
+    fclose(pf);
+    delete db;
+    if (!scanOk)
     {
-        FILE* rf = fopen(recordsTmp.c_str(), "rb");
+        fs::remove_all(tmpDir, ec);
+        return SetError(error, scanError);
+    }
+    LmDiagRss("M1_pass_done");
+
+    // ============ external height sort of the projections ============
+    // Bounded RAM: 64k-row chunks (~5.4 MB), sorted runs, k-way merge with one
+    // 84-byte head per run.
+    const size_t kChunk = 65536;
+    std::vector<std::string> heightRuns;
+    {
+        FILE* rf = fopen(projTmp.c_str(), "rb");
         if (!rf)
-            return SetError(error, "lm: reopen candidates for sort failed");
-        std::vector<std::pair<uint256, BlockIndexRecord> > chunk;
+            return SetError(error, "lm: reopen projection scratch failed");
+        std::vector<HashProj> chunk;
         chunk.reserve(kChunk);
         for (;;)
         {
-            BlockIndexRecord rec;
-            uint256 h;
-            size_t n = fread(h.begin(), 1, 32, rf);
-            if (n != 32)
+            HashProj hp;
+            const size_t n = fread(&hp, 1, HASHPROJ_SIZE, rf);
+            if (n == 0)
                 break;
-            if (fread(&rec, 1, sizeof(BlockIndexRecord), rf) != sizeof(BlockIndexRecord))
+            if (n != HASHPROJ_SIZE)
             {
                 fclose(rf);
-                return SetError(error, "lm: truncated candidate (record)");
+                return SetError(error, "lm: truncated projection (sort)");
             }
-            chunk.push_back(std::make_pair(h, rec));
+            chunk.push_back(hp);
             if (chunk.size() >= kChunk)
             {
                 std::sort(chunk.begin(), chunk.end(),
-                          [](const std::pair<uint256,BlockIndexRecord>& a,
-                             const std::pair<uint256,BlockIndexRecord>& b) { return a.first < b.first; });
-                std::string runPath = (tmpDir / (strprintf("run-%zu.bin", sortedRuns.size()))).string();
-                FILE* wf = fopen(runPath.c_str(), "wb");
+                          [](const HashProj& a, const HashProj& b) {
+                              if (a.height != b.height) return a.height < b.height;
+                              return memcmp(a.hash, b.hash, 32) < 0;
+                          });
+                std::string rp = (tmpDir / (strprintf("hrun-%zu.bin", heightRuns.size()))).string();
+                FILE* wf = fopen(rp.c_str(), "wb");
                 if (!wf)
                 {
                     fclose(rf);
-                    return SetError(error, "lm: open run file failed");
+                    return SetError(error, "lm: open hrun failed");
                 }
                 for (size_t i = 0; i < chunk.size(); ++i)
-                    if (fwrite(&chunk[i], 1, sizeof(chunk[i]), wf) != sizeof(chunk[i]))
+                    if (fwrite(&chunk[i], 1, HASHPROJ_SIZE, wf) != HASHPROJ_SIZE)
                     {
-                        fclose(wf);
-                        fclose(rf);
-                        return SetError(error, "lm: write run failed");
+                        fclose(wf); fclose(rf);
+                        return SetError(error, "lm: write hrun failed");
                     }
                 fclose(wf);
-                sortedRuns.push_back(runPath);
+                heightRuns.push_back(rp);
                 chunk.clear();
             }
         }
         if (!chunk.empty())
         {
             std::sort(chunk.begin(), chunk.end(),
-                      [](const std::pair<uint256,BlockIndexRecord>& a,
-                         const std::pair<uint256,BlockIndexRecord>& b) { return a.first < b.first; });
-            std::string runPath = (tmpDir / (strprintf("run-%zu.bin", sortedRuns.size()))).string();
-            FILE* wf = fopen(runPath.c_str(), "wb");
+                      [](const HashProj& a, const HashProj& b) {
+                          if (a.height != b.height) return a.height < b.height;
+                          return memcmp(a.hash, b.hash, 32) < 0;
+                      });
+            std::string rp = (tmpDir / (strprintf("hrun-%zu.bin", heightRuns.size()))).string();
+            FILE* wf = fopen(rp.c_str(), "wb");
             if (!wf)
             {
                 fclose(rf);
-                return SetError(error, "lm: open run file failed");
+                return SetError(error, "lm: open hrun (tail) failed");
             }
             for (size_t i = 0; i < chunk.size(); ++i)
-                if (fwrite(&chunk[i], 1, sizeof(chunk[i]), wf) != sizeof(chunk[i]))
+                if (fwrite(&chunk[i], 1, HASHPROJ_SIZE, wf) != HASHPROJ_SIZE)
                 {
-                    fclose(wf);
-                    fclose(rf);
-                    return SetError(error, "lm: write run failed");
+                    fclose(wf); fclose(rf);
+                    return SetError(error, "lm: write hrun (tail) failed");
                 }
             fclose(wf);
-            sortedRuns.push_back(runPath);
+            heightRuns.push_back(rp);
         }
         fclose(rf);
     }
-    LmDiagRss("M2_runs_sorted");
+    LmDiagRss("M2_height_runs");
 
-    // ---- k-way merge of sorted runs, feeding records+hashindex to writer. ----
-    // Buffer one record per run head; repeatedly pick min hash, append.
-    // (Records must be unique by hash; duplicates => fail.)
-    // Also build an EXTERNAL disk-backed LevelDB index hash -> (RecordId +
-    // record) so active-chain (M3) and derived (M4) can look up any block by
-    // hash in O(1) with bounded RAM (externalized, class C).
-    // Use BOUNDED LevelDB cache/buffer: an 8M-entry external index must not
-    // retain a large block cache or write buffer -> keep RAM independent of N.
-    leveldb::Options lopt;
-    lopt.create_if_missing = true;
-    lopt.error_if_exists = true;
-    lopt.filter_policy = leveldb::NewBloomFilterPolicy(10);
-    lopt.block_cache = leveldb::NewLRUCache(512 * 1024);   // 512KB, bounded
-    lopt.write_buffer_size = 1 * 1024 * 1024;              // 1MB, bounded
-    lopt.max_open_files = 64;
-    const std::string actIdxPath = (tmpDir / "actidx").string();
-    std::string airr;
-    if (!boost::filesystem::exists(actIdxPath))
-        boost::filesystem::create_directories(actIdxPath, ec);
-    leveldb::DB* actIdx = NULL;
-    leveldb::Status as_ = leveldb::DB::Open(lopt, actIdxPath, &actIdx);
-    if (!as_.ok())
-        return SetError(error, "lm: create actidx failed: " + as_.ToString());
+    const std::string hSortedPath = (tmpDir / "hsorted.bin").string();
     {
-        std::vector<FILE*> runFiles(sortedRuns.size());
-        std::vector<std::pair<uint256, BlockIndexRecord>*> heads(sortedRuns.size());
-        std::vector<std::pair<uint256, BlockIndexRecord> > headStorage(sortedRuns.size());
-        for (size_t r = 0; r < sortedRuns.size(); ++r)
+        FILE* out = fopen(hSortedPath.c_str(), "wb");
+        if (!out)
+            return SetError(error, "lm: open hsorted failed");
+        std::vector<FILE*> rfs(heightRuns.size());
+        std::vector<HashProj> heads(heightRuns.size());
+        std::vector<bool> alive(heightRuns.size(), false);
+        for (size_t r = 0; r < heightRuns.size(); ++r)
         {
-            runFiles[r] = fopen(sortedRuns[r].c_str(), "rb");
-            if (!runFiles[r])
+            rfs[r] = fopen(heightRuns[r].c_str(), "rb");
+            if (!rfs[r])
             {
-                for (size_t j = 0; j < r; ++j) if (runFiles[j]) fclose(runFiles[j]);
-                delete actIdx;
-                return SetError(error, "lm: open run for merge failed");
+                fclose(out);
+                return SetError(error, "lm: open hrun for merge failed");
             }
-            // read one head
-            size_t got = fread(&headStorage[r], 1, sizeof(headStorage[r]), runFiles[r]);
-            heads[r] = (got == sizeof(headStorage[r])) ? &headStorage[r] : NULL;
-        }
-        uint64_t total = 0;
-        uint256 lastHash = 0;
-        leveldb::WriteBatch actBatch;
-        int actBatchCount = 0;
-        // RecordId-hash temp file so M4 can emit derived in RecordId order
-        // (RecordId order == merge order == uint256-sorted, NOT LevelDB byte
-        // order). Disk-backed, O(N) on disk, O(1) RAM.
-        const std::string idhashPath = (tmpDir / "idhash.bin").string();
-        FILE* idf = fopen(idhashPath.c_str(), "wb");
-        if (!idf)
-        {
-            delete actIdx;
-            return SetError(error, "lm: open idhash file failed");
+            if (fread(&heads[r], 1, HASHPROJ_SIZE, rfs[r]) == HASHPROJ_SIZE)
+                alive[r] = true;
         }
         for (;;)
         {
-            // find min head
             int best = -1;
-            for (size_t r = 0; r < heads.size(); ++r)
-                if (heads[r] && (best < 0 || heads[r]->first < heads[best]->first))
+            for (size_t r = 0; r < alive.size(); ++r)
+            {
+                if (!alive[r]) continue;
+                if (best < 0 ||
+                    heads[r].height < heads[best].height ||
+                    (heads[r].height == heads[best].height &&
+                     memcmp(heads[r].hash, heads[best].hash, 32) < 0))
                     best = (int)r;
+            }
             if (best < 0)
                 break;
-            if (heads[best]->first == lastHash && lastHash != 0)
+            if (fwrite(&heads[best], 1, HASHPROJ_SIZE, out) != HASHPROJ_SIZE)
             {
-                // duplicate hash -> fail closed
-                for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
-                delete actIdx;
-                return SetError(error, "lm: duplicate block hash in source");
+                for (size_t r = 0; r < rfs.size(); ++r) if (rfs[r]) fclose(rfs[r]);
+                fclose(out);
+                return SetError(error, "lm: write hsorted failed");
             }
-            // stream to writer (AppendRecord + PutHashIndex; writer batches)
-            BlockIndexId id;
-            if (!writer_.AppendRecord(heads[best]->second, &id, error) ||
-                !writer_.PutHashIndex(heads[best]->first, id, error))
+            if (fread(&heads[best], 1, HASHPROJ_SIZE, rfs[best]) != HASHPROJ_SIZE)
             {
-                for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
-                fclose(idf);
-                delete actIdx;
+                alive[best] = false;
+                fclose(rfs[best]);
+                rfs[best] = NULL;
+            }
+        }
+        for (size_t r = 0; r < rfs.size(); ++r) if (rfs[r]) fclose(rfs[r]);
+        fclose(out);
+        for (size_t r = 0; r < heightRuns.size(); ++r)
+            fs::remove(heightRuns[r], ec);
+        std::vector<std::string>().swap(heightRuns);
+    }
+    LmDiagRss("M2_hsorted_done");
+
+    // Open the canonical artifacts for the derived/ancestry passes:
+    //   pfIdxRead : proj.bin (hash-ordered ancestry index, binary search)
+    //   recF      : records.dat (committed random reads at 40+(id-1)*228)
+    // Both are files this process itself wrote during pass 1; committed slots
+    // only.
+    FILE* pfIdxRead = fopen(projTmp.c_str(), "rb");
+    if (!pfIdxRead)
+        return SetError(error, "lm: open projection index (read) failed");
+    fseeko(pfIdxRead, 0, SEEK_END);
+    const off_t projBytesTotal = ftello(pfIdxRead);
+    if (projBytesTotal != (off_t)count * (off_t)HASHPROJ_SIZE)
+    {
+        fclose(pfIdxRead);
+        return SetError(error, "lm: projection size mismatch");
+    }
+    const off_t projN = projBytesTotal / (off_t)HASHPROJ_SIZE;
+    FILE* recF = fopen((fs::path(stagingDir) / "records.dat").string().c_str(), "rb");
+    if (!recF)
+    {
+        fclose(pfIdxRead);
+        return SetError(error, "lm: records.dat open (derive) failed");
+    }
+
+    // ============ derived compute pass (height order) ============
+    const std::string derScratch = (tmpDir / "der-scratch.bin").string();
+    {
+        FILE* df = fopen(derScratch.c_str(), "wb+");
+        if (!df)
+        {
+            fclose(recF); fclose(pfIdxRead);
+            return SetError(error, "lm: open derived scratch failed");
+        }
+        FILE* rf = fopen(hSortedPath.c_str(), "rb");
+        if (!rf)
+        {
+            fclose(df); fclose(recF); fclose(pfIdxRead);
+            return SetError(error, "lm: open hsorted for derive failed");
+        }
+        uint64_t derived = 0;
+        for (;;)
+        {
+            HashProj hp;
+            if (fread(&hp, 1, HASHPROJ_SIZE, rf) != HASHPROJ_SIZE)
+                break;
+
+            BlockIndexRecord rec;
+            {
+                const off_t slot = (off_t)(40 + ((off_t)hp.recordId - 1) * 228);
+                unsigned char raw[228];
+                if (fseeko(recF, slot, SEEK_SET) != 0 ||
+                    fread(raw, 1, 228, recF) != 228)
+                {
+                    fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                    return SetError(error, "lm: derive: records.dat read failed");
+                }
+                // decode (CRC-checked, fail closed)
+                if (!DecodeBlockIndexRecordV1(raw, sizeof(raw), &rec, error))
+                {
+                    std::string msg = error ? *error : std::string();
+                    fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                    return SetError(error, "lm: record decode failure during derive: " + msg);
+                }
+                if (memcmp(rec.hash.begin(), hp.hash, 32) != 0 ||
+                    rec.height != hp.height)
+                {
+                    fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                    return SetError(error, "lm: records/projection mismatch");
+                }
+            }
+            // PM1-P0-08: refuse ambiguous PoS classification BEFORE deriving.
+            if (!PosClassificationConsistent(rec.nFlags, rec.prevoutStake.hash))
+            {
+                fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                return SetError(error, "lm: record " + rec.hash.GetHex() +
+                                " has ambiguous PoS classification (nFlags vs prevoutStake)");
+            }
+            const bool fPos = (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) != 0;
+
+            DEntry de;
+            memset(&de, 0, sizeof(de));
+            if (IsZero32(hp.hashPrev))
+            {
+                if (hp.height != 0)
+                {
+                    fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                    return SetError(error, "lm: parentless record at height != 0");
+                }
+                de.chainTrust = GetAuthoritativeBlockTrustValue(rec.nBits, rec.height, fPos,
+                                                                rec.hashProof, rec.hash);
+                CDataStream ss(SER_GETHASH, 0);
+                const uint256 proof = fPos ? rec.hashProof : uint256(0);
+                ss << rec.nFlags << proof << rec.nStakeModifier;
+                uint256 hc = Hash(ss.begin(), ss.end());
+                hc >>= (256 - 32);
+                de.checksum = hc.Get64();
+                if (rec.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
+                {
+                    de.modTime = (int64_t)rec.nTime;
+                    de.hasModTime = true;
+                }
+            }
+            else
+            {
+                HashProj pp;
+                if (!BinSearchFixed(pfIdxRead, projN, HASHPROJ_SIZE, hp.hashPrev, &pp))
+                {
+                    fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                    return SetError(error, "lm: record " + rec.hash.GetHex() + " has disconnected parent " +
+                                    HashBytesToHex(hp.hashPrev));
+                }
+                DEntry pd;
+                if (g_lmV2R1ForceDerivedLookupError)
+                {
+                    fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                    return SetError(error, "injected deridx lookup error");
+                }
+                const off_t pslot = (off_t)(((off_t)pp.recordId - 1) * DENTRY_SIZE);
+                if (fseeko(df, pslot, SEEK_SET) != 0 ||
+                    fread(&pd, 1, DENTRY_SIZE, df) != DENTRY_SIZE)
+                {
+                    fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                    return SetError(error, "lm: parent derived scratch missing/corrupt");
+                }
+                de.chainTrust = pd.chainTrust +
+                    GetAuthoritativeBlockTrustValue(rec.nBits, rec.height, fPos,
+                                                    rec.hashProof, rec.hash);
+                CDataStream ss(SER_GETHASH, 0);
+                ss << pd.checksum;
+                const uint256 proof = fPos ? rec.hashProof : uint256(0);
+                ss << rec.nFlags << proof << rec.nStakeModifier;
+                uint256 hc = Hash(ss.begin(), ss.end());
+                hc >>= (256 - 32);
+                de.checksum = hc.Get64();
+                if (rec.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
+                {
+                    de.modTime = (int64_t)rec.nTime;
+                    de.hasModTime = true;
+                }
+                else if (pd.hasModTime)
+                {
+                    de.modTime = pd.modTime;
+                    de.hasModTime = true;
+                }
+            }
+            // nSize: mandatory from blk*.dat, hash-correspondent, fail closed.
+            de.nSize = 0;
+            de.hasBlockSize = false;
+            if (!blockDataDir.empty() && rec.nFile > 0)
+            {
+                std::string blockFn = strprintf("blk%04u.dat", rec.nFile);
+                fs::path blockPath = fs::path(blockDataDir) / blockFn;
+                FILE* blockFile = fopen(blockPath.string().c_str(), "rb");
+                if (blockFile)
+                {
+                    if (fseeko(blockFile, (off_t)rec.nBlockPos, SEEK_SET) == 0)
+                    {
+                        try {
+                            CBlock block;
+                            CAutoFile filein(blockFile, SER_DISK, CLIENT_VERSION);
+                            filein >> block;
+                            if (block.GetHash() == rec.hash)
+                            {
+                                de.nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
+                                de.hasBlockSize = (de.nSize > 0);
+                            }
+                        } catch (...) { /* CAutoFile closed the FILE* */ }
+                    }
+                    else
+                        fclose(blockFile); // CAutoFile never constructed
+                }
+            }
+            if (g_lmV2R1ForceDerivedPutFailure)
+            {
+                fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                return SetError(error, "lm: injected deridx put failure");
+            }
+
+            // RecordId-implicit slot write.
+            const off_t dslot = (off_t)(((off_t)hp.recordId - 1) * DENTRY_SIZE);
+            if (fseeko(df, dslot, SEEK_SET) != 0 ||
+                fwrite(&de, 1, DENTRY_SIZE, df) != DENTRY_SIZE)
+            {
+                fclose(rf); fclose(df); fclose(recF); fclose(pfIdxRead);
+                return SetError(error, "lm: derived scratch write failed");
+            }
+            ++derived;
+            if ((derived % 1000000) == 0)
+                fprintf(stderr, "lm: derive_records=%llu\n", (unsigned long long)derived);
+        }
+        fclose(rf);
+        fflush(df);
+        fclose(df);
+        if (derived != count)
+        {
+            fclose(recF); fclose(pfIdxRead);
+            return SetError(error, strprintf("lm: derived rows %llu != source %llu",
+                (unsigned long long)derived, (unsigned long long)count));
+        }
+    }
+    LmDiagRss("M4_derive_compute_done");
+
+    // ============ final emit: derived.dat in hash (RecordId) order ============
+    {
+        FILE* pfSeq = fopen(projTmp.c_str(), "rb");
+        if (!pfSeq)
+        {
+            fclose(recF); fclose(pfIdxRead);
+            return SetError(error, "lm: open proj for emit failed");
+        }
+        FILE* dsf = fopen(derScratch.c_str(), "rb");
+        if (!dsf)
+        {
+            fclose(pfSeq); fclose(recF); fclose(pfIdxRead);
+            return SetError(error, "lm: open derived scratch for emit failed");
+        }
+        uint64_t emitted = 0;
+        for (;;)
+        {
+            HashProj hp;
+            if (fread(&hp, 1, HASHPROJ_SIZE, pfSeq) != HASHPROJ_SIZE)
+                break;
+            const off_t dslot = (off_t)(((off_t)hp.recordId - 1) * DENTRY_SIZE);
+            DEntry de;
+            if (fseeko(dsf, dslot, SEEK_SET) != 0 ||
+                fread(&de, 1, DENTRY_SIZE, dsf) != DENTRY_SIZE)
+            {
+                fclose(dsf); fclose(pfSeq); fclose(recF); fclose(pfIdxRead);
+                return SetError(error, "lm: derived entry lookup failed during emit");
+            }
+            if (!de.hasBlockSize)
+                allHasBlockSize = false;
+            BlockIndexDerivedEntry e;
+            e.chainTrust = de.chainTrust;
+            e.stakeModifierChecksum = de.checksum;
+            e.SetHasStakeModifierTime(de.hasModTime);
+            e.stakeModifierTime = de.modTime;
+            e.nSize = de.nSize;
+            e.SetHasBlockSize(de.hasBlockSize);
+            if (!writer_.AppendDerived(e, error))
+            {
+                fclose(dsf); fclose(pfSeq); fclose(recF); fclose(pfIdxRead);
                 return false;
             }
-            // record id -> hash for M4 RecordId-order derived emission
-            if (fwrite(&id, 1, sizeof(id), idf) != sizeof(id) ||
-                fwrite(heads[best]->first.begin(), 1, 32, idf) != 32)
-            {
-                for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
-                fclose(idf);
-                delete actIdx;
-                return SetError(error, "lm: write idhash failed");
-            }
-            // external index: key = 32-byte hash, value = (RecordId || record)
-            std::string key(heads[best]->first.begin(), heads[best]->first.end());
-            std::string val;
-            val.resize(sizeof(BlockIndexId) + sizeof(BlockIndexRecord));
-            memcpy(&val[0], &id, sizeof(id));
-            memcpy(&val[sizeof(BlockIndexId)], &heads[best]->second, sizeof(BlockIndexRecord));
-            actBatch.Put(leveldb::Slice(key), leveldb::Slice(val));
-            ++actBatchCount;
-            // Write the actIdx external index in larger batches. This DB is opened
-            // with a BOUNDED 1MB write_buffer (RAM independent of N). A ~1MB batch
-            // (4096 records) equalled that buffer, so every Write produced a full
-            // memtable flush and L0 file, and the resulting flush/compaction churn
-            // dominated the merge phase (measured: 195 flushes, ~45% of the merge
-            // wall time at K=13). ~4MB batches (16384 records) cut the flush count
-            // (195 -> 48) and the merge time ~45%, with bounded extra RAM (~4MB
-            // batch buffer; measured peak +~12MB, still well within the bounded
-            // migration footprint). No change to indexed content or ordering.
-            if (actBatchCount >= 16384)
-            {
-                leveldb::Status ws = actIdx->Write(leveldb::WriteOptions(), &actBatch);
-                if (!ws.ok())
-                {
-                    for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
-                    delete actIdx;
-                    return SetError(error, "lm: actidx write failed: " + ws.ToString());
-                }
-                actBatch.Clear();
-                actBatchCount = 0;
-            }
-            lastHash = heads[best]->first;
-            ++total;
-            if ((total % 1000000) == 0)
-            {
-                long hw = -1;
-                FILE* sf = fopen("/proc/self/status", "r");
-                if (sf)
-                {
-                    char ln[256];
-                    while (fgets(ln, sizeof(ln), sf))
-                        if (strncmp(ln, "VmHWM:", 6) == 0) { hw = atol(ln + 6); break; }
-                    fclose(sf);
-                }
-                fprintf(stderr, "LM_RSS merge_records=%llu hwm_kb=%ld\n",
-                        (unsigned long long)total, hw);
-            }
-            // advance this run head
-            size_t got = fread(&headStorage[best], 1, sizeof(headStorage[best]), runFiles[best]);
-            heads[best] = (got == sizeof(headStorage[best])) ? &headStorage[best] : NULL;
+            ++emitted;
+            if ((emitted % 1000000) == 0)
+                fprintf(stderr, "lm: emit_derived=%llu\n", (unsigned long long)emitted);
         }
-        if (actBatchCount > 0)
+        fclose(dsf);
+        fclose(pfSeq);
+        if (emitted != count)
         {
-            leveldb::Status ws = actIdx->Write(leveldb::WriteOptions(), &actBatch);
-            if (!ws.ok())
-            {
-                for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
-                delete actIdx;
-                return SetError(error, "lm: actidx final write failed: " + ws.ToString());
-            }
-            actBatch.Clear();
-            actBatchCount = 0;
+            fclose(recF); fclose(pfIdxRead);
+            return SetError(error, strprintf("lm: derived emitted %llu != source %llu",
+                (unsigned long long)emitted, (unsigned long long)count));
         }
-        for (size_t r = 0; r < runFiles.size(); ++r) if (runFiles[r]) fclose(runFiles[r]);
-        fclose(idf);
-        // NOTE: actIdx stays open for M3 (active walk) and M4 (derived).
-        // writer_ also open; its records/hashindex handles are separate files.
     }
-    (void)as_;
-    const std::string idhashTmp = (tmpDir / "idhash.bin").string();
-    LmDiagRss("M2_merge_done");
+    LmDiagRss("M4_emit_done");
 
-    // ---- M3: streamed active-chain construction ----
-    // Walk hashBestChain -> hashPrev down to genesis using the external actIdx
-    // (O(1) per step, bounded RAM). Write (height, RecordId) pairs tip-first to
-    // a temp file; then read backward (ascending height) and feed active.dat
-    // via the writer. Peak RAM O(1): only the active-pair temp file is O(N) and
-    // it is disk-backed.
+    // ============ active chain (height order, tip -> genesis) ============
     const std::string activeTmp = (tmpDir / "active.pairs").string();
     {
         FILE* af = fopen(activeTmp.c_str(), "wb");
         if (!af)
         {
-            delete actIdx;
+            fclose(recF); fclose(pfIdxRead);
             return SetError(error, "lm: open active pair file failed");
         }
         uint256 cur = hashBestChain;
         bool reachedGen = false;
         for (;;)
         {
-            std::string key(cur.begin(), cur.end());
-            std::string val;
-            leveldb::Status gs = actIdx->Get(leveldb::ReadOptions(),
-                                             leveldb::Slice(key), &val);
-            if (!gs.ok())
+            HashProj hp;
+            if (!BinSearchFixed(pfIdxRead, projN, HASHPROJ_SIZE,
+                                (const unsigned char*)cur.begin(), &hp))
             {
-                fclose(af);
-                delete actIdx;
-                return SetError(error, "lm: active chain hash missing from index");
+                fclose(af); fclose(recF); fclose(pfIdxRead);
+                return SetError(error, "lm: active chain hash missing from index: " +
+                                HashBytesToHex(hp.hash));
             }
-            if (val.size() < sizeof(BlockIndexId) + sizeof(BlockIndexRecord))
+            if (fwrite(&hp.height, 1, sizeof(hp.height), af) != sizeof(hp.height) ||
+                fwrite(&hp.recordId, 1, sizeof(hp.recordId), af) != sizeof(hp.recordId))
             {
-                fclose(af);
-                delete actIdx;
-                return SetError(error, "lm: active index value corrupt");
-            }
-            BlockIndexId id;
-            memcpy(&id, &val[0], sizeof(BlockIndexId));
-            BlockIndexRecord rec;
-            memcpy(&rec, &val[sizeof(BlockIndexId)], sizeof(BlockIndexRecord));
-            // write (height, RecordId) tip-first: height int32 + id 8 bytes
-            if (fwrite(&rec.height, 1, sizeof(rec.height), af) != sizeof(rec.height) ||
-                fwrite(&id, 1, sizeof(id), af) != sizeof(id))
-            {
-                fclose(af);
-                delete actIdx;
+                fclose(af); fclose(recF); fclose(pfIdxRead);
                 return SetError(error, "lm: write active pair failed");
             }
-            if (rec.hashPrev == 0)
+            if (IsZero32(hp.hashPrev))
             {
-                if (rec.height != 0)
+                if (hp.height != 0)
                 {
-                    fclose(af);
-                    delete actIdx;
+                    fclose(af); fclose(recF); fclose(pfIdxRead);
                     return SetError(error, "lm: active genesis height != 0");
                 }
                 reachedGen = true;
                 break;
             }
-            cur = rec.hashPrev;
+            cur = *(uint256*)hp.hashPrev;
         }
         fclose(af);
         if (!reachedGen)
         {
-            delete actIdx;
+            fclose(recF); fclose(pfIdxRead);
             return SetError(error, "lm: active chain did not reach genesis");
         }
 
-        // Read backward (ascending height): file has height-descending pairs.
-        // Validate height continuity 0..tip and feed active.dat ascending.
+        // Ascending emit (the file is tip-first): validate continuity 0..tip.
         FILE* rf = fopen(activeTmp.c_str(), "rb");
         if (!rf)
         {
-            delete actIdx;
+            fclose(recF); fclose(pfIdxRead);
             return SetError(error, "lm: reopen active pair file failed");
         }
         fseek(rf, 0, SEEK_END);
-        long fsz = ftell(rf);
-        long pairBytes = 12; // int32 height + 8-byte BlockIndexId
-        long pairCount = fsz / pairBytes;
+        const long fsz = ftell(rf);
+        const long pairBytes = 12; // i32 height + u32 recordId + pad... actual 8; use packed pairs
+        // Actual pair layout on disk: 4 B height + 4 B id = 8 B.
+        const long pairReal = 8;
+        if (fsz % pairReal != 0)
+        {
+            fclose(rf); fclose(recF); fclose(pfIdxRead);
+            return SetError(error, "lm: active pair file size not multiple of 8");
+        }
+        const long pairCount = fsz / pairReal;
         int64_t expectedH = 0;
         for (long idx = pairCount - 1; idx >= 0; --idx)
         {
-            fseek(rf, idx * pairBytes, SEEK_SET);
-            int32_t h; BlockIndexId id;
-            if (fread(&h, 1, sizeof(h), rf) != sizeof(h) ||
-                fread(&id, 1, sizeof(id), rf) != sizeof(id))
+            unsigned char pair[8];
+            if (fseek(rf, idx * pairReal, SEEK_SET) != 0 ||
+                fread(pair, 1, 8, rf) != 8)
             {
-                fclose(rf);
-                delete actIdx;
-                return SetError(error, "lm: read active pair (backward) failed");
+                fclose(rf); fclose(recF); fclose(pfIdxRead);
+                return SetError(error, "lm: read active pair (ascending) failed");
             }
+            int32_t h;
+            uint32_t rid;
+            memcpy(&h, pair, 4);
+            memcpy(&rid, pair + 4, 4);
             if (h != expectedH)
             {
-                fclose(rf);
-                delete actIdx;
+                fclose(rf); fclose(recF); fclose(pfIdxRead);
                 return SetError(error, "lm: active chain height discontinuity at " +
                                 strprintf("%lld", (long long)expectedH));
             }
             if (idx == 0)
             {
-                outTipId = id;
+                // The final ascending pair is the tip (file is tip-first).
+                outTipId = (BlockIndexId)rid;
                 outTipHeight = h;
             }
-            if (!writer_.AppendActive(id, h, error))
+            if (!writer_.AppendActive((BlockIndexId)rid, h, error))
             {
-                fclose(rf);
-                delete actIdx;
+                fclose(rf); fclose(recF); fclose(pfIdxRead);
                 return false;
             }
             ++expectedH;
         }
         fclose(rf);
+        if (expectedH != (int64_t)outTipHeight + 1)
+        {
+            fclose(recF); fclose(pfIdxRead);
+            return SetError(error, "lm: active chain heights inconsistent with tip");
+        }
     }
+    fs::remove(activeTmp, ec);
     LmDiagRss("M3_active_done");
 
-    // ---- M4: streamed derived-state construction ----
-    // Derived values (chainTrust/checksum/memo) must be computed in HEIGHT
-    // order (child after parent). All records (main + side) have derived.
-    // Steps (bounded RAM, external disk):
-    //   a. Iterate actIdx (all records by hash) -> write (height | hash) to a
-    //      temp file, external-sort by height.
-    //   b. In height order, for each record: compute chainTrust (parent trust +
-    //      block trust), checksum, modifier-time memo against a temp
-    //      hash->derived LevelDB (external).
-    //   c. Emit derived.dat in RecordId order (hash-sorted) by reading each
-    //      record's derived from the temp map.
+    fclose(recF);
+    fclose(pfIdxRead);
+
+    // ============ scratch removal BEFORE finalize/publish ============
     {
-        // a. height-sorted hash list (external sort)
-        const std::string hSortTmp = (tmpDir / "hsort.bin").string();
-        std::vector<std::string> heightRuns;
-        {
-            leveldb::Iterator* it = actIdx->NewIterator(leveldb::ReadOptions());
-            it->SeekToFirst();
-            std::vector<std::pair<int32_t, std::string> > chunk;
-            chunk.reserve(kChunk);
-            for (; it->Valid(); it->Next())
-            {
-                std::string hash = it->key().ToString();
-                if (it->value().size() < sizeof(BlockIndexId))
-                    continue;
-                int32_t h = 0;
-                memcpy(&h, it->value().data() + sizeof(BlockIndexId) +
-                           offsetof(BlockIndexRecord, height), sizeof(h));
-                chunk.push_back(std::make_pair(h, hash));
-                if (chunk.size() >= kChunk)
-                {
-                    std::sort(chunk.begin(), chunk.end());
-                    std::string rp = (tmpDir / (strprintf("hrun-%zu.bin", heightRuns.size()))).string();
-                    FILE* wf = fopen(rp.c_str(), "wb");
-                    if (!wf) { delete it; return SetError(error, "lm: open hrun failed"); }
-                    for (size_t i = 0; i < chunk.size(); ++i)
-                        if (fwrite(&chunk[i].first, 1, sizeof(chunk[i].first), wf) != sizeof(chunk[i].first) ||
-                            fwrite(chunk[i].second.data(), 1, chunk[i].second.size(), wf) != chunk[i].second.size())
-                        {
-                            fclose(wf); delete it;
-                            return SetError(error, "lm: write hrun failed");
-                        }
-                    fclose(wf);
-                    heightRuns.push_back(rp);
-                    chunk.clear();
-                }
-            }
-            if (!chunk.empty())
-            {
-                std::sort(chunk.begin(), chunk.end());
-                std::string rp = (tmpDir / (strprintf("hrun-%zu.bin", heightRuns.size()))).string();
-                FILE* wf = fopen(rp.c_str(), "wb");
-                if (!wf) { delete it; return SetError(error, "lm: open hrun failed"); }
-                for (size_t i = 0; i < chunk.size(); ++i)
-                    if (fwrite(&chunk[i].first, 1, sizeof(chunk[i].first), wf) != sizeof(chunk[i].first) ||
-                        fwrite(chunk[i].second.data(), 1, chunk[i].second.size(), wf) != chunk[i].second.size())
-                    {
-                        fclose(wf); delete it;
-                        return SetError(error, "lm: write hrun failed");
-                    }
-                fclose(wf);
-                heightRuns.push_back(rp);
-            }
-            delete it;
-            // save hash size (32)
-            (void)hSortTmp;
-        }
-
-        // k-way merge of height runs (ascending height) into hsort.bin
-        std::string hSortedPath = hSortTmp;
-        {
-            FILE* out = fopen(hSortedPath.c_str(), "wb");
-            if (!out) return SetError(error, "lm: open hsort out failed");
-            std::vector<FILE*> rfs(heightRuns.size());
-            std::vector<std::pair<int32_t, std::string> > heads(heightRuns.size());
-            std::vector<bool> alive(heightRuns.size(), false);
-            for (size_t r = 0; r < heightRuns.size(); ++r)
-            {
-                rfs[r] = fopen(heightRuns[r].c_str(), "rb");
-                if (!rfs[r]) { fclose(out); return SetError(error, "lm: open hrun for merge failed"); }
-                int32_t h; char hashBuf[32];
-                if (fread(&h, 1, 4, rfs[r]) == 4 && fread(hashBuf, 1, 32, rfs[r]) == 32)
-                {
-                    heads[r].first = h;
-                    heads[r].second.assign(hashBuf, 32);
-                    alive[r] = true;
-                }
-            }
-            for (;;)
-            {
-                int best = -1;
-                for (size_t r = 0; r < alive.size(); ++r)
-                    if (alive[r] && (best < 0 || heads[r].first < heads[best].first))
-                        best = (int)r;
-                if (best < 0) break;
-                if (fwrite(&heads[best].first, 1, 4, out) != 4 ||
-                    fwrite(heads[best].second.data(), 1, 32, out) != 32)
-                {
-                    for (size_t r = 0; r < rfs.size(); ++r) if (rfs[r]) fclose(rfs[r]);
-                    fclose(out);
-                    return SetError(error, "lm: write hsort failed");
-                }
-                int32_t h; char hashBuf[32];
-                if (fread(&h, 1, 4, rfs[best]) == 4 && fread(hashBuf, 1, 32, rfs[best]) == 32)
-                {
-                    heads[best].first = h;
-                    heads[best].second.assign(hashBuf, 32);
-                }
-                else
-                {
-                    alive[best] = false;
-                    fclose(rfs[best]);
-                    rfs[best] = NULL; // avoid double-fclose in the cleanup loop
-                }
-            }
-            for (size_t r = 0; r < rfs.size(); ++r) if (rfs[r]) fclose(rfs[r]);
-            fclose(out);
-        }
-
-        // b. compute derived in height order via temp hash->derived LevelDB
-        const std::string derIdxPath = (tmpDir / "deridx").string();
-        if (!boost::filesystem::exists(derIdxPath))
-            boost::filesystem::create_directories(derIdxPath, ec);
-        leveldb::Options dopts;
-        dopts.create_if_missing = true;
-        dopts.error_if_exists = true;
-        dopts.filter_policy = leveldb::NewBloomFilterPolicy(10);
-        dopts.block_cache = leveldb::NewLRUCache(512 * 1024); // bounded
-        dopts.write_buffer_size = 1 * 1024 * 1024;
-        dopts.max_open_files = 64;
-        leveldb::DB* derIdx = NULL;
-        leveldb::Status ds = leveldb::DB::Open(dopts, derIdxPath, &derIdx);
-        if (!ds.ok())
-            return SetError(error, "lm: open deridx failed: " + ds.ToString());
-        {
-            FILE* rf = fopen(hSortedPath.c_str(), "rb");
-            if (!rf) { delete derIdx; return SetError(error, "lm: open hsort for derive failed"); }
-            for (;;)
-            {
-                int32_t h; char hashBuf[32];
-                if (fread(&h, 1, 4, rf) != 4) break;
-                if (fread(hashBuf, 1, 32, rf) != 32) { fclose(rf); delete derIdx; return SetError(error, "lm: hsort short read"); }
-                std::string key(hashBuf, 32);
-                std::string val;
-                if (!actIdx->Get(leveldb::ReadOptions(), leveldb::Slice(key), &val).ok())
-                {
-                    fclose(rf); delete derIdx;
-                    return SetError(error, "lm: record missing in actIdx during derive");
-                }
-                if (val.size() < sizeof(BlockIndexId) + sizeof(BlockIndexRecord))
-                {
-                    fclose(rf); delete derIdx;
-                    return SetError(error, "lm: deridx value corrupt");
-                }
-                BlockIndexRecord rec;
-                memcpy(&rec, &val[sizeof(BlockIndexId)], sizeof(BlockIndexRecord));
-
-                // PM1-P0-08: refuse ambiguous PoS classification BEFORE deriving
-                // trust (legacy nFlags classification vs V2 prevoutStake inference).
-                if (!PosClassificationConsistent(rec.nFlags, rec.prevoutStake.hash))
-                {
-                    fclose(rf); delete derIdx;
-                    return SetError(error, "lm: record " + rec.hash.GetHex() +
-                                    " has ambiguous PoS classification (nFlags vs prevoutStake)");
-                }
-                const bool fPos = (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) != 0;
-
-                // ONE surviving trust rule (identical to CBlockIndex::GetBlockTrust
-                // and GetAuthoritativeBlockTrust: POEM entropy + post-DAG PoS zero).
-                const uint256 blockTrust =
-                    GetAuthoritativeBlockTrustValue(rec.nBits, rec.height, fPos, rec.hashProof, rec.hash);
-
-                // Required parent derived state. In height order a nonzero-hashPrev
-                // parent MUST already be derived; absence == disconnected topology
-                // (rejected by the regular builder too). A local storage ERROR is
-                // distinct from NOT_FOUND and always fails closed.
-                uint256 parentTrust = 0;
-                uint32_t parentChecksum = 0;
-                int64_t parentModTime = 0;
-                bool parentHasModTime = false;
-                if (rec.hashPrev != uint256(0))
-                {
-                    DEntry pd;
-                    std::string perr;
-                    std::string pk(rec.hashPrev.begin(), rec.hashPrev.end());
-                    LmDerivedLookupStatus ps = LookupDerivedEntry(derIdx, pk, &pd, &perr);
-                    if (ps == LM_DERIVED_NOT_FOUND)
-                    {
-                        fclose(rf); delete derIdx;
-                        return SetError(error, "lm: record " + rec.hash.GetHex() +
-                                        " has disconnected parent " + rec.hashPrev.GetHex());
-                    }
-                    if (ps == LM_DERIVED_ERROR)
-                    {
-                        fclose(rf); delete derIdx;
-                        return SetError(error, "lm: parent derived lookup failed: " + perr);
-                    }
-                    parentTrust = pd.chainTrust;
-                    parentChecksum = pd.checksum;
-                    parentModTime = pd.modTime;
-                    parentHasModTime = pd.hasModTime;
-                }
-
-                DEntry de;
-                de.chainTrust = parentTrust + blockTrust;
-                // checksum (parent checksum comes from the single checked lookup above)
-                CDataStream ss(SER_GETHASH, 0);
-                if (rec.hashPrev != uint256(0)) ss << parentChecksum;
-                uint256 proof = (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE) ? rec.hashProof : uint256(0);
-                ss << rec.nFlags << proof << rec.nStakeModifier;
-                uint256 hc = Hash(ss.begin(), ss.end());
-                hc >>= (256 - 32);
-                de.checksum = hc.Get64();
-                // memo (parent memo from the single checked lookup; genesis/no-parent
-                // -> deterministic 0/false, matching the regular builder)
-                if (rec.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
-                {
-                    de.modTime = (int64_t)rec.nTime;
-                    de.hasModTime = true;
-                }
-                else if (rec.hashPrev != uint256(0))
-                {
-                    de.modTime = parentModTime;
-                    de.hasModTime = parentHasModTime;
-                }
-                else
-                {
-                    de.modTime = 0;
-                    de.hasModTime = false;
-                }
-                de.nSize = 0; de.hasBlockSize = false;
-                // A.10.1b-fix2 C1 (authoritative parity): compute exact nSize
-                // from block files, identical to the old trusted builder.
-                // Read the block from blk{file}.dat using nFile/nBlockPos,
-                // deserialize and compute GetSerializeSize(SER_NETWORK).
-                if (!blockDataDir.empty() && rec.nFile > 0)
-                {
-                    std::string blockFn = strprintf("blk%04u.dat", rec.nFile);
-                    boost::filesystem::path blockPath =
-                        boost::filesystem::path(blockDataDir) / blockFn;
-                    FILE* blockFile = fopen(blockPath.string().c_str(), "rb");
-                    if (blockFile)
-                    {
-                        if (fseeko(blockFile, (off_t)rec.nBlockPos, SEEK_SET) == 0)
-                        {
-                            // CAutoFile OWNS blockFile and closes it on scope exit
-                            // (success or exception). Never fclose() here.
-                            try {
-                                CBlock block;
-                                CAutoFile filein(blockFile, SER_DISK, CLIENT_VERSION);
-                                filein >> block;
-                                if (block.GetHash() == rec.hash)
-                                {
-                                    de.nSize = ::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION);
-                                    de.hasBlockSize = (de.nSize > 0);
-                                }
-                            } catch (...) { de.nSize = 0; de.hasBlockSize = false; }
-                        }
-                        else
-                        {
-                            fclose(blockFile); // CAutoFile never constructed
-                            de.nSize = 0; de.hasBlockSize = false;
-                        }
-                    }
-                    else { de.nSize = 0; de.hasBlockSize = false; }
-                }
-                if (g_lmV2R1ForceDerivedPutFailure ||
-                    !derIdx->Put(leveldb::WriteOptions(), leveldb::Slice(key),
-                                 leveldb::Slice((const char*)&de, sizeof(de))).ok())
-                {
-                    fclose(rf); delete derIdx;
-                    return SetError(error, "lm: deridx write failed");
-                }
-            }
-            fclose(rf);
-        }
-        LmDiagRss("M4_derive_compute_done");
-        // Release actIdx now: step-c (emit) and M6 (finalize) do NOT need it.
-        // This removes the simultaneous actIdx+derIdx LevelDB cache footprint.
-        delete actIdx;
-        actIdx = NULL;
-        // Release the height-sorted + hrun temp files' in-RAM handles (FILE*
-        // already closed by the merge block; drop the path strings too).
-        {
-            std::vector<std::string>().swap(heightRuns);
-            // also free the hsrort.bin FILE handle? it's a path-only read; no
-            // retained FILE*. The defragged derIdx below is the main cost.
-        }
-        // c. emit derived.dat in RecordId order (id 1..N), using idhash.bin
-//    (id -> hash, written during the merge in RecordId/merge order). This
-//    guarantees derived entry i corresponds to the same record as RecordId i.
-        {
-            FILE* idf = fopen(idhashTmp.c_str(), "rb");
-            if (!idf)
-            {
-                delete derIdx;
-                return SetError(error, "lm: open idhash for derived emit failed");
-            }
-            for (;;)
-            {
-                BlockIndexId id;
-                char hashBuf[32];
-                if (fread(&id, 1, sizeof(id), idf) != sizeof(id))
-                    break;
-                if (fread(hashBuf, 1, 32, idf) != 32)
-                {
-                    fclose(idf); delete derIdx;
-                    return SetError(error, "lm: idhash short read");
-                }
-                std::string hash(hashBuf, 32);
-                DEntry de;
-                std::string derr;
-                LmDerivedLookupStatus es = LookupDerivedEntry(derIdx, hash, &de, &derr);
-                if (es != LM_DERIVED_FOUND)
-                {
-                    fclose(idf); delete derIdx;
-                    return SetError(error, std::string("lm: derived entry ") +
-                                    (es == LM_DERIVED_NOT_FOUND ? "missing" : "lookup failed") +
-                                    " during emit" +
-                                    (derr.empty() ? std::string() : (" " + derr)));
-                }
-                if (!de.hasBlockSize)
-                    allHasBlockSize = false;
-                BlockIndexDerivedEntry e;
-                e.chainTrust = de.chainTrust;
-                e.stakeModifierChecksum = de.checksum;
-                e.SetHasStakeModifierTime(de.hasModTime);
-                e.stakeModifierTime = de.modTime;
-                e.nSize = de.nSize;
-                e.SetHasBlockSize(de.hasBlockSize);
-                if (!writer_.AppendDerived(e, error))
-                {
-                    fclose(idf); delete derIdx;
-                    return false;
-                }
-                (void)id;
-            }
-            fclose(idf);
-        }
-        delete derIdx;
-        LmDiagRss("M4_emit_done");
+        boost::system::error_code rmec;
+        fs::remove_all(tmpDir, rmec);
     }
 
-    delete actIdx;  // already NULL (released after M4 compute); no-op
-    LmDiagRss("M6_finalize_about");
-
-    // Flush any remaining buffered active/derived batches to disk.
     if (!writer_.Flush(error))
         return false;
 
-    // ---- M6: finalize (content binding + MANIFEST COMPLETE) ----
-    // The writer.Finalize sets the derived content binding (shadow or root) and
-    // writes the COMPLETE MANIFEST with the committed tip. Capability is
-    // OLD_SHADOW unless exact nSize (AUTHORITATIVE) was provided via blockDataDir
-    // (the nSize path is externalized; here we mark OLD_SHADOW if no block data).
+    // ============ M6: finalize ============
     if (outTipId == BLOCK_INDEX_ID_INVALID || outTipHeight < 0 || hashBestChain == 0)
     {
         ClearError(error);
         return SetError(error, "lm: no active tip resolved during build");
     }
     const bool authoritativeWanted = (!blockDataDir.empty());
-    // AUTHORITATIVE is only valid when every derived entry has a real nSize.
-    // Fail closed otherwise (must not silently downgrade an authoritative build,
-    // matching the old builder's requirement).
     if (authoritativeWanted && !allHasBlockSize)
     {
         ClearError(error);
@@ -988,25 +914,11 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         ? BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE
         : BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;
     const uint64_t totalRecords = writer_.RecordCount(); // before Finalize closes
-    // The retired DAG input set is permanently empty, so its digest is
-    // SHA256(zero bytes) == e3b0c442..., byte-matching the old builder's manifested
-    // generation input digest. (See function-scope emptyGenerationInputDigest.)
     if (!writer_.Finalize(generation, hashBestChain, outTipId,
                           (int32_t)outTipHeight,
                           totalRecords, finalCap,
                           emptyGenerationInputDigest, error))
         return false;
-
-    // COHORT M: drop the builder's scratch directory. The external-sort runs,
-    // the temporary actidx/deridx LevelDBs and the idhash/hsort files all live
-    // under <stagingDir>/.lm-tmp, and <stagingDir> is renamed into the immutable
-    // generation on publish. Leaving it would ship O(N) scratch INSIDE the
-    // published generation (measured ~3x the canonical generation size), so it
-    // must be removed once the generation is finalized.
-    {
-        boost::system::error_code rmec;
-        fs::remove_all(tmpDir, rmec);
-    }
 
     ClearError(error);
     return true;
