@@ -333,22 +333,24 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                 delete it; fclose(pf); delete db;
                 return false;
             }
-            // projection: hash || hashPrev (32+32)
+            // projection row: hash || hashPrev || height || nFile ||
+            // nBlockPos || recordId || pad (84 B, packed) -- ONE fixed row per
+            // record; the packed struct keeps every field adjacent.
             HashProj proj;
+            memset(&proj, 0, sizeof(proj));
             memcpy(proj.hash, rec.hash.begin(), 32);
             memcpy(proj.hashPrev, rec.hashPrev.begin(), 32);
-            // height, nFile, nBlockPos appended by separate columns so the
-            // projection stays fixed-size AND keeps the chain fields adjacent
-            // (the ancestor lookup needs only hashPrev + height).
-            if (fwrite(&proj, 1, HASHPROJ_SIZE, pf) != HASHPROJ_SIZE ||
-                fwrite(&rec.height, 1, sizeof(rec.height), pf) != sizeof(rec.height) ||
-                fwrite(&rec.nFile, 1, sizeof(rec.nFile), pf) != sizeof(rec.nFile) ||
-                fwrite(&rec.nBlockPos, 1, sizeof(rec.nBlockPos), pf) != sizeof(rec.nBlockPos) ||
-                fwrite(&id, 1, sizeof(id), pf) != sizeof(id))
+            proj.height = rec.height;
+            proj.nFile = rec.nFile;
+            proj.nBlockPos = rec.nBlockPos;
+            proj.recordId = (uint32_t)id;
+            proj.pad = 0;
+            if (fwrite(&proj, 1, HASHPROJ_SIZE, pf) != HASHPROJ_SIZE)
             {
                 delete it; fclose(pf); delete db;
                 return SetError(error, "lm: write projection failed");
             }
+            (void)dupChecked;
             // duplicate-hash check: scan is strictly ascending; a repeat ==
             // corrupted source index (fail closed like the staged builder).
             if (havePrev && memcmp(prevHash, rec.hash.begin(), 32) == 0)
