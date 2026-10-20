@@ -10885,10 +10885,12 @@ void static ProcessGetData(CNode* pfrom)
             if (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK)
             {
                 bool send = false;
+                unsigned int nServedBlockTime = 0; // legacy nTime | V2 snapshot nTime
                 // Send block from disk
                 map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(inv.hash);
                 if (mi != mapBlockIndex.end())
                 {
+                    nServedBlockTime = (unsigned int)(*mi).second->nTime;
                     pfrom->getBlocksServer.NoteBlockGetData(
                         inv.hash, mi->second->nHeight, GetTimeMillis());
                     GetBlocksServedInvNoteGetData(
@@ -10948,12 +10950,76 @@ void static ProcessGetData(CNode* pfrom)
                         pfrom->hashContinue = 0;
                     }
                 }
+                else if (g_fAuthoritativeStartup)
+                {
+                    // V2-authoritative block serving: mapBlockIndex is empty
+                    // (historical residency O(0)), so resolve the block BY VALUE
+                    // and read it from disk via its by-value (nFile,nBlockPos).
+                    BlockIndexSnapshot snap;
+                    if (GetBlockIndexManager().LookupByHash(inv.hash, &snap, NULL)
+                            == BLOCK_INDEX_MANAGER_OK && snap.found)
+                    {
+                        nServedBlockTime = snap.nTime;
+                        pfrom->getBlocksServer.NoteBlockGetData(
+                            inv.hash, snap.height, GetTimeMillis());
+                        GetBlocksServedInvNoteGetData(
+                            pfrom->getBlocksServedInv, inv.hash, snap.height,
+                            GetTimeMicros());
+                        // Real consumption clears any IP-keyed reconnect debt.
+                        GetBlocksServedInvReconnectClearedByConsumption(
+                            static_cast<const CNetAddr&>(pfrom->addr),
+                            GetTimeMicros());
+                        send = true;
+                        CBlock block;
+                        if (!block.ReadFromDisk(snap.nFile, snap.nBlockPos, true))
+                        {
+                            printf("BLOCK_SERVE_NULL_SELF inv=%s reason=read-failed\n",
+                                   inv.hash.ToString().c_str());
+                            vNotFound.push_back(inv);
+                            send = false;
+                            ++gBlocksServeReadFailed;
+                            continue;
+                        }
+                        if (inv.type == MSG_FILTERED_BLOCK)
+                        {
+                            LOCK(pfrom->cs_filter);
+                            if (pfrom->pfilter)
+                            {
+                                CMerkleBlock merkleBlock(block, *pfrom->pfilter);
+                                pfrom->PushMessage("merkleblock", merkleBlock);
+                                typedef std::pair<unsigned int, uint256> PairType;
+                                for (const PairType& pair : merkleBlock.vMatchedTxn)
+                                    if (!pfrom->setInventoryKnown.count(CInv(MSG_TX, pair.second)))
+                                        pfrom->PushMessage("tx", block.vtx[pair.first]);
+                            }
+                        }
+                        else
+                        {
+                            pfrom->PushMessage("block", block);
+                            ++gDbBlockServed;
+                        }
+
+                        // Trigger them to send a getblocks request for the next
+                        // batch of inventory.
+                        if (inv.hash == pfrom->hashContinue)
+                        {
+                            vector<CInv> vInv;
+                            vInv.push_back(CInv(MSG_BLOCK, hashBestChain));
+                            pfrom->PushMessage("inv", vInv);
+                            pfrom->hashContinue = 0;
+                        }
+                    }
+                    else
+                    {
+                        vNotFound.push_back(inv);
+                    }
+                }
                 // disconnect node in case we have reached the outbound limit for serving historical blocks
                 static const int nOneWeek = 7 * 24 * 60 * 60; // assume > 1 week = historical
                 if (send && CNode::OutboundTargetReached(true) &&
                 (
                     ((pindexBest != NULL) &&
-                    (pindexBest->GetBlockTime() - mi->second->GetBlockTime() > nOneWeek)) ||
+                    (pindexBest->GetBlockTime() - (int64_t)nServedBlockTime > nOneWeek)) ||
                     inv.type == MSG_BLOCK
                     ) && !pfrom->fWhitelisted)
                 {
@@ -11646,6 +11712,386 @@ bool IsBlockWireNullShape(const CBlock& block)
     return block.hashPrevBlock == 0 && block.vtx.empty();
 }
 
+// ---------------------------------------------------------------------------
+// V2-authoritative P2P serving (Block Index V2 by value).
+//
+// When the node boots through the authoritative BI-V2 startup, the legacy RAM
+// mapBlockIndex is deliberately empty (historical residency O(0)), so the
+// reference getblocks / getheaders / getdata->block serving paths would resolve
+// every locator to -1 and serve nothing. These handlers resolve a received
+// locator against the ACTIVE chain via the BlockIndexManager and walk it BY
+// HEIGHT, so P2P block serving never repopulates mapBlockIndex and never
+// materializes historical CBlockIndex (RAM stays bounded). Consensus is
+// untouched: only the serving-side read path changes.
+//
+// All helpers are called with cs_main held (the enclosing handlers already hold
+// it), matching the legacy serving paths.
+// ---------------------------------------------------------------------------
+
+// V2 by-value equivalent of the legacy CBlockLocator::GetBlockIndex() walk
+// (main.h): the FIRST locator hash (priority order) that is on our ACTIVE
+// chain, or found=false when nothing is active.
+static bool AuthoritativeResolveLocator(const CBlockLocator& locator,
+                                        BlockIndexSnapshot* out)
+{
+    for (const uint256& h : locator.GetHashesVector())
+    {
+        BlockIndexSnapshot s;
+        if (GetBlockIndexManager().LookupByHash(h, &s, NULL) ==
+                BLOCK_INDEX_MANAGER_OK && s.found && s.fInMainChain)
+        {
+            *out = s;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Authoritative getblocks serving. Mirrors the legacy getblocks handler but
+// walks the active chain BY HEIGHT. Returns the legacy handler's "handled"
+// value so the caller returns true (message consumed).
+static bool AuthoritativeServeGetBlocks(CNode* pfrom,
+                                        const CBlockLocator& locator,
+                                        const uint256& hashStop)
+{
+    BlockIndexManager& mgr = GetBlockIndexManager();
+    std::string e;
+
+    BlockIndexSnapshot locatorSnap;
+    const bool haveLocator = AuthoritativeResolveLocator(locator, &locatorSnap);
+    const int nResolvedHeight = haveLocator ? locatorSnap.height : -1;
+
+    BlockIndexSnapshot tip;
+    uint256 hashChainTip;
+    int nTipHeight = -1;
+    if (mgr.GetTip(&tip, &e) == BLOCK_INDEX_MANAGER_OK)
+    {
+        hashChainTip = tip.hash;
+        nTipHeight = tip.height;
+    }
+
+    BlockIndexSnapshot stopSnap;
+    bool haveStop = false;
+    if (mgr.LookupByHash(hashStop, &stopSnap, NULL) == BLOCK_INDEX_MANAGER_OK
+        && stopSnap.found && stopSnap.fInMainChain)
+    {
+        haveStop = true;
+    }
+    const int nStopHeight = haveStop ? stopSnap.height : -1;
+
+    CGetBlocksRequestInfo request;
+    uint256 hashLocatorTail;
+    locator.GetHashes(request.hashLocatorTip, hashLocatorTail);
+    request.nResolvedHeight = nResolvedHeight;
+    request.hashStop = hashStop;
+    request.nStopHeight = nStopHeight;
+    request.hashChainTip = hashChainTip;
+    request.nRequestTimeMillis = GetTimeMillis();
+
+    const bool fHaveFirst = haveLocator && (nResolvedHeight + 1 <= nTipHeight);
+    int nPredictedMainItems = fHaveFirst
+        ? std::min(1000, std::max(0, nTipHeight - nResolvedHeight)) : 0;
+    bool fPredictedTipInventory = false;
+    if (haveStop && nStopHeight > nResolvedHeight
+        && nStopHeight - nResolvedHeight <= 1000)
+    {
+        nPredictedMainItems = std::max(0, nStopHeight - nResolvedHeight - 1);
+        fPredictedTipInventory = (hashStop != hashChainTip)
+            && (stopSnap.nTime + nStakeMinAge > tip.nTime);
+    }
+    if (fHaveFirst)
+    {
+        BlockIndexSnapshot first;
+        if (mgr.GetActiveByHeight(nResolvedHeight + 1, &first, NULL)
+                == BLOCK_INDEX_MANAGER_OK && first.found)
+        {
+            request.hashPredictedFirst = first.hash;
+            if (nPredictedMainItems > 0)
+            {
+                BlockIndexSnapshot last;
+                if (mgr.GetActiveByHeight(nResolvedHeight + nPredictedMainItems,
+                                          &last, NULL) == BLOCK_INDEX_MANAGER_OK
+                    && last.found)
+                {
+                    request.hashPredictedLast = last.hash;
+                }
+            }
+        }
+    }
+    if (fPredictedTipInventory)
+    {
+        if (nPredictedMainItems == 0)
+            request.hashPredictedFirst = hashChainTip;
+        request.hashPredictedLast = hashChainTip;
+    }
+    request.nPredictedResponseCount =
+        nPredictedMainItems + (fPredictedTipInventory ? 1 : 0);
+
+    const bool fStrictInbound = pfrom->fInbound && !pfrom->fWhitelisted;
+    const bool fDiagnostic = BlockRequestTraceEnabled()
+        || GetBoolArg("-getblocksdiag", false);
+    CGetBlocksServerDecision decision =
+        pfrom->getBlocksServer.Evaluate(request, fStrictInbound);
+    const bool fRepeatedRange = !decision.fProgress
+        && (decision.fIdenticalRequest || decision.fSameResponse);
+    const uint64_t nAbuseCount = std::max<uint64_t>(
+        pfrom->getBlocksServer.nConsecutiveNonProgressingRequests,
+        pfrom->getBlocksServer.nRequestsRateLimited);
+    const bool fLogAbuse = fDiagnostic
+        || (BlockRequestTraceEnabled()
+            && ShouldLogGetBlocksAbuse(nAbuseCount));
+
+    if (fDiagnostic)
+        LogGetBlocksServerEvent("GETBLOCKS_REQUEST", pfrom, request, NULL,
+                                decision);
+    if (fRepeatedRange && fLogAbuse)
+        LogGetBlocksServerEvent("GETBLOCKS_REPEAT", pfrom, request, NULL,
+                                decision);
+
+    if (decision.fPenalize)
+        pfrom->Misbehaving(decision.nPenalty);
+
+    if (decision.action != GETBLOCKS_SERVER_ALLOW)
+    {
+        if (decision.action == GETBLOCKS_SERVER_RATE_LIMIT)
+            ibdforensic::CountGetBlocksRateLimitInbound();
+        if (decision.action == GETBLOCKS_SERVER_SUPPRESS && fLogAbuse)
+            LogGetBlocksServerEvent("GETBLOCKS_SUPPRESS", pfrom, request, NULL,
+                                    decision);
+        else if (decision.action == GETBLOCKS_SERVER_RATE_LIMIT && fLogAbuse)
+            LogGetBlocksServerEvent("GETBLOCKS_RATE_LIMIT", pfrom, request,
+                                    NULL, decision);
+        else if (decision.action == GETBLOCKS_SERVER_DISCONNECT)
+        {
+            LogGetBlocksServerEvent("GETBLOCKS_DISCONNECT", pfrom, request,
+                                    NULL, decision);
+            pfrom->fDisconnect = true;
+        }
+        return true;
+    }
+
+    // Zero-consumption served-inv suppression (only when
+    // -getblocksservedinvzero is enabled): mirror of the legacy path.
+    if (GetBlocksServedInvZeroEnabled())
+    {
+        if (!pfrom->getBlocksServedInv.fGbHaveWindow)
+        {
+            bool fPrimed = false;
+            GetBlocksServedInvReconnectPrime(
+                pfrom->getBlocksServedInv,
+                static_cast<const CNetAddr&>(pfrom->addr),
+                GetTimeMicros(), fPrimed);
+        }
+        GetBlocksServedInvDecision servedInvDecision =
+            GetBlocksServedInvEvaluate(
+                pfrom->getBlocksServedInv, request, fStrictInbound,
+                GetTimeMicros(), request.nPredictedResponseCount);
+        if (servedInvDecision.fSuppress)
+        {
+            CNode::CGetBlocksServedInvState& servedInv =
+                pfrom->getBlocksServedInv;
+            servedInv.nGbZeroConsumeStreak++;
+            servedInv.fGbSuppressInv = true;
+            servedInv.fGbPriorZeroConsume = true;
+            ibdmetrics::Get().getblocks_suppressed_inv_replies.fetch_add(
+                1, std::memory_order_relaxed);
+            ibdmetrics::Get().getblocks_suppressed_inv_items.fetch_add(
+                servedInvDecision.nItemsAvoided, std::memory_order_relaxed);
+            ibdmetrics::Get().getblocks_suppressed_inv_bytes_avoided.fetch_add(
+                servedInvDecision.nBytesAvoided, std::memory_order_relaxed);
+            return true;
+        }
+        if (servedInvDecision.fQualify)
+            pfrom->getBlocksServedInv.nGbZeroConsumeStreak++;
+    }
+
+    // Build the inv reply by walking the ACTIVE chain by height from the
+    // locator fork forward (legacy: pindex=pindexLocator->pnext; pindex=pnext).
+    CGetBlocksResponseInfo response;
+    int nLimit = 1000;
+    if (fDebugNet)
+        printf("getblocks %d to %s limit %d\n", nResolvedHeight,
+               hashStop.ToString().substr(0,20).c_str(), nLimit);
+    if (haveLocator)
+    {
+        for (int h = nResolvedHeight + 1; h <= nTipHeight; ++h)
+        {
+            BlockIndexSnapshot s;
+            if (mgr.GetActiveByHeight(h, &s, NULL) != BLOCK_INDEX_MANAGER_OK
+                || !s.found)
+                break;
+            const uint256 hashBlock = s.hash;
+            if (hashBlock == hashStop)
+            {
+                if (hashStop != hashChainTip
+                    && s.nTime + nStakeMinAge > tip.nTime
+                    && pfrom->PushGetBlocksInventory(
+                        CInv(MSG_BLOCK, hashChainTip)))
+                {
+                    response.Add(hashChainTip, nTipHeight);
+                    GetBlocksServedInvRecordItem(pfrom->getBlocksServedInv,
+                                                 GetTimeMicros());
+                }
+                break;
+            }
+            if (pfrom->PushGetBlocksInventory(CInv(MSG_BLOCK, hashBlock)))
+            {
+                response.Add(hashBlock, s.height);
+                GetBlocksServedInvRecordItem(pfrom->getBlocksServedInv,
+                                             GetTimeMicros());
+            }
+            if (--nLimit <= 0)
+            {
+                pfrom->hashContinue = hashBlock;
+                break;
+            }
+        }
+    }
+
+    pfrom->getBlocksServer.RecordResponse(request, response);
+    GetBlocksServedInvRecordResponse(pfrom->getBlocksServedInv, response,
+                                     request.hashChainTip, GetTimeMicros());
+    if (fDiagnostic || (fRepeatedRange && fLogAbuse))
+        LogGetBlocksServerEvent("GETBLOCKS_RESPONSE", pfrom, request,
+                                &response, decision);
+    return true;
+}
+
+// Authoritative getheaders serving. Mirrors the legacy getheaders handler
+// (locator fork -> walk -> headers vector) but resolves the fork and walks the
+// active chain BY HEIGHT, reading each header from disk via its by-value
+// (nFile,nBlockPos). Keeping the same served-header dedup posture so repeated
+// identical requests under an unchanged tip still collapse.
+static bool AuthoritativeServeGetHeaders(CNode* pfrom,
+                                         const CBlockLocator& locator,
+                                         const uint256& hashStop)
+{
+    BlockIndexManager& mgr = GetBlockIndexManager();
+    std::string e;
+
+    BlockIndexSnapshot tip;
+    uint256 hashTip;
+    int nTipHeight = -1;
+    if (mgr.GetTip(&tip, &e) == BLOCK_INDEX_MANAGER_OK)
+    {
+        hashTip = tip.hash;
+        nTipHeight = tip.height;
+    }
+
+    const bool fHeadersDedupActive = HeadersServedDedupEnabled();
+    uint256 headersDedupFp;
+    if (fHeadersDedupActive)
+        headersDedupFp = HeaderServedDedupFingerprint(locator, hashStop,
+                                                      hashTip);
+
+    // Resolve the fork: for a null locator, return the hashStop block itself
+    // (legacy); otherwise the last locator hash we have on the active chain.
+    BlockIndexSnapshot fork;
+    bool haveFork = false;
+    if (locator.Size() == 0)
+    {
+        if (mgr.LookupByHash(hashStop, &fork, NULL) == BLOCK_INDEX_MANAGER_OK
+            && fork.found)
+            haveFork = true;
+    }
+    else
+    {
+        haveFork = AuthoritativeResolveLocator(locator, &fork);
+    }
+    if (!haveFork)
+        return true; // nothing to serve (legacy: no fork in main chain)
+
+    if (fHeadersDedupActive)
+    {
+        uint32_t nPrevRepeat = 0;
+        uint32_t nPrevCount = 0;
+        uint64_t nPrevBytes = 0;
+        int64_t nPrevUs = 0;
+        bool fSuppress = false;
+        {
+            LOCK(pfrom->cs_mapHeadersServedDedup);
+            std::map<uint256, CNode::CHeadersServedDedupEntry>::const_iterator
+                itDedup = pfrom->mapHeadersServedDedup.find(headersDedupFp);
+            if (itDedup != pfrom->mapHeadersServedDedup.end()
+                && HeaderServedDedupEntryFresh(itDedup->second,
+                                               GetTimeMicros()))
+            {
+                fSuppress = true;
+                nPrevRepeat = itDedup->second.nRepeat;
+                nPrevCount = itDedup->second.nHeadersCount;
+                nPrevBytes = itDedup->second.nBytes;
+                nPrevUs = itDedup->second.nServedUs;
+            }
+        }
+        if (fSuppress)
+        {
+            if (BlockRequestTraceEnabled())
+                printf("GETHEADERS_DEDUP: peer=%s fp=%s repeat=%u age=%lld "
+                       "suppressed_count=%u suppressed_bytes=%llu\n",
+                       pfrom->addr.ToString().c_str(),
+                       headersDedupFp.ToString().substr(0, 16).c_str(),
+                       (unsigned int)(nPrevRepeat + 1),
+                       (long long)((GetTimeMicros() - nPrevUs) / 1000),
+                       nPrevCount,
+                       (unsigned long long)nPrevBytes);
+            return true;
+        }
+    }
+
+    std::vector<CBlock> vHeaders;
+    int nLimit = 2000;
+    BlockIndexSnapshot firstSent;
+    bool haveFirstSent = false;
+    BlockIndexSnapshot lastSent;
+    bool haveLastSent = false;
+
+    const int startH = fork.height + 1;
+    for (int h = startH; h <= nTipHeight; ++h)
+    {
+        BlockIndexSnapshot s;
+        if (mgr.GetActiveByHeight(h, &s, NULL) != BLOCK_INDEX_MANAGER_OK
+            || !s.found)
+            break;
+        // Read header-only (SER_BLOCKHEADERONLY): vtx stays empty, so the
+        // serialized "headers" wire payload matches the legacy CBlockIndex::
+        // GetBlockHeader() exactly.
+        CBlock header;
+        if (!header.ReadFromDisk(s.nFile, s.nBlockPos, false))
+            break;
+        if (!haveFirstSent) { firstSent = s; haveFirstSent = true; }
+        lastSent = s; haveLastSent = true;
+        vHeaders.push_back(header);
+        if (--nLimit <= 0 || s.hash == hashStop)
+            break;
+    }
+
+    unsigned int nHeadersBytes = ::GetSerializeSize(vHeaders, SER_NETWORK,
+                                                    PROTOCOL_VERSION);
+    if (fHeadersDedupActive)
+    {
+        LOCK(pfrom->cs_mapHeadersServedDedup);
+        HeaderServedDedupUpsert(pfrom->mapHeadersServedDedup, headersDedupFp,
+                                GetTimeMicros(), (uint32_t)vHeaders.size(),
+                                nHeadersBytes);
+    }
+    if (BlockRequestTraceEnabled())
+    {
+        printf("GETHEADERS_SEND: peer=%s headers=%zu bytes=%u first_hash=%s "
+               "first_height=%d last_hash=%s last_height=%d fork_height=%d "
+               "hashStop=%s\n",
+               pfrom->addr.ToString().c_str(), vHeaders.size(), nHeadersBytes,
+               haveFirstSent ? firstSent.hash.ToString().c_str() : "none",
+               haveFirstSent ? firstSent.height : -1,
+               haveLastSent ? lastSent.hash.ToString().c_str() : "none",
+               haveLastSent ? lastSent.height : -1,
+               fork.height, hashStop.ToString().c_str());
+    }
+
+    pfrom->fNextHeadersResponsePriority = true;
+    pfrom->PushMessage("headers", vHeaders);
+    return true;
+}
+
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, int64_t nTimeReceived)
 {
     // C5: minimum seconds between getblocks "CONTINUE" refills on the IBD block-download
@@ -12309,6 +12755,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         LOCK(cs_main);
 
+        // V2-authoritative: mapBlockIndex is empty (historical residency O(0)),
+        // so resolve the locator and walk the active chain BY VALUE.
+        if (g_fAuthoritativeStartup)
+            return AuthoritativeServeGetBlocks(pfrom, locator, hashStop);
+
         CBlockIndex* pindexLocator = locator.GetBlockIndex();
         CBlockIndex* pindexStop = NULL;
         std::map<uint256, CBlockIndex*>::iterator miStop =
@@ -12578,6 +13029,11 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
 
         LOCK(cs_main);
+
+        // V2-authoritative: mapBlockIndex is empty (historical residency O(0)),
+        // so resolve the fork and walk the active chain BY VALUE.
+        if (g_fAuthoritativeStartup)
+            return AuthoritativeServeGetHeaders(pfrom, locator, hashStop);
 
         // Serving-side dedup (only when -headersservededup is enabled):
         // fingerprint the FULL (locator, hashStop) request PLUS the active

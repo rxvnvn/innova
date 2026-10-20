@@ -1885,6 +1885,11 @@ public:
         return true;
     }
 
+    // Priority-ordered locator hashes (tip->ancestors with 10-then-doubling
+    // step, trailing genesis). Exposed so the by-value V2 serving path can
+    // resolve a received locator without touching mapBlockIndex.
+    const std::vector<uint256>& GetHashesVector() const { return vHave; }
+
     void Set(const CBlockIndex* pindex)
     {
         vHave.clear();
