@@ -1120,6 +1120,31 @@ BOOST_AUTO_TEST_CASE(inbound_version_allowlist_accepts_43950_and_50505)
     fPrintToConsole = fPrintToConsoleSaved;
 }
 
+BOOST_AUTO_TEST_CASE(recv_version_matches_announced_peer_version)
+{
+    const bool fPrintToConsoleSaved = fPrintToConsole;
+    fPrintToConsole = true;
+    // A peer announcing an allowed version must settle nRecvVersion at that
+    // exact version: recvVersion floors the receive-stream deserializer, so a
+    // 50505 peer clamped to 50000 would mis-decode anything the 50505 peer
+    // serialises above 50000 semantics.
+    {
+        CNode legacyPeer(INVALID_SOCKET, TestPeerAddress(87), "recv-ver-43950", true);
+        ScopedPeerSocket socketLegacy(legacyPeer);
+        CompleteInboundHandshake(legacyPeer, MIN_PEER_PROTO_VERSION);
+        BOOST_CHECK_EQUAL(legacyPeer.nVersion, MIN_PEER_PROTO_VERSION);
+        BOOST_CHECK_EQUAL(legacyPeer.nRecvVersion, MIN_PEER_PROTO_VERSION);
+    }
+    {
+        CNode currentPeer(INVALID_SOCKET, TestPeerAddress(88), "recv-ver-50505", true);
+        ScopedPeerSocket socketCurrent(currentPeer);
+        CompleteInboundHandshake(currentPeer, P2P_HANDSHAKE_VERSION);
+        BOOST_CHECK_EQUAL(currentPeer.nVersion, P2P_HANDSHAKE_VERSION);
+        BOOST_CHECK_EQUAL(currentPeer.nRecvVersion, P2P_HANDSHAKE_VERSION);
+    }
+    fPrintToConsole = fPrintToConsoleSaved;
+}
+
 BOOST_AUTO_TEST_CASE(outbound_verack_gate_blocks_peer_50000)
 {
     const bool fPrintToConsoleSaved = fPrintToConsole;
