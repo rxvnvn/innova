@@ -3,6 +3,8 @@ Innova
 src/*.exe
 src/innova
 src/innovad
+src/innova-undo-replay
+src/innova-probe-verify
 src/test_innova
 src/build.h
 src/leveldb/*.a
