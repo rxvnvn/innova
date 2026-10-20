@@ -116,6 +116,16 @@ bool RunInnovaTxLocBuild(const std::string& datadir, TxLocBuildStats* outStats, 
         uint64_t txsFed = 0;
         // Read buffer reuse (one block at a time; never the whole archive).
         std::vector<unsigned char> buf;
+        // Feed cursor across polls: the CURRENT block's deserialized txs plus
+        // per-block loc constants. buildIndex polls feed() once per record, so we
+        // must remember where we are inside a block between calls (a `return true`
+        // after vtx[0] once dropped every non-coinbase tx).
+        std::vector<CTransaction> curVtx;
+        size_t curIdx = 0;
+        unsigned int curHeight = 0;
+        unsigned int curNFile = 0;
+        unsigned int curNBlockPos = 0;
+        unsigned int curNTxPos = 0;
     } fs;
     fs.reader = &reader;
     fs.blockData = &blockData;
@@ -124,6 +134,23 @@ bool RunInnovaTxLocBuild(const std::string& datadir, TxLocBuildStats* outStats, 
     auto feed = [&fs](unsigned char* txidOut, txloc::Loc* locOut) -> bool {
         for (;;)
         {
+            // Emit the next tx of the current block (one record per poll). If a
+            // block still has un-fed txs, serve them BEFORE loading the next height.
+            if (fs.curIdx < fs.curVtx.size())
+            {
+                const CTransaction& tx = fs.curVtx[fs.curIdx];
+                uint256 htx = tx.GetHash();
+                memcpy(txidOut, htx.begin(), 32);
+                locOut->nFile = fs.curNFile;
+                locOut->nBlockPos = fs.curNBlockPos;
+                locOut->nTxPos = fs.curNTxPos;
+                locOut->nHeight = fs.curHeight;
+                fs.txsFed++;
+                // advance, matching ConnectBlock line ~6697
+                fs.curNTxPos += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
+                fs.curIdx++;
+                return true; // one tx record per callback
+            }
             if (fs.heightsWalked > (uint64_t)fs.tipHeight) return false;
             const int h = (int)fs.heightsWalked;
             BlockIndexSnapshot snap;
@@ -217,20 +244,17 @@ bool RunInnovaTxLocBuild(const std::string& datadir, TxLocBuildStats* outStats, 
                      + ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION)
                      - (2 * GetSizeOfCompactSize(0))
                      + GetSizeOfCompactSize(b.vtx.size());
+            // Publish the just-loaded block into the feed cursor. On the next poll
+            // the emit block above serves vtx[0..] one at a time (ALL txs of the
+            // block, same height/nFile/nBlockPos, per-tx nTxPos offsets), then this
+            // cursor is reset for the following height.
             fs.heightsWalked++;
-            for (const CTransaction& tx : b.vtx)
-            {
-                uint256 htx = tx.GetHash();
-                memcpy(txidOut, htx.begin(), 32);
-                locOut->nFile = snap.nFile;
-                locOut->nBlockPos = snap.nBlockPos;
-                locOut->nTxPos = nTxPos;
-                locOut->nHeight = h;
-                fs.txsFed++;
-                // advance, matching ConnectBlock line ~6697
-                nTxPos += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
-                return true; // one tx record per callback
-            }
+            fs.curVtx = std::move(b.vtx);
+            fs.curIdx = 0;
+            fs.curHeight = h;
+            fs.curNFile = snap.nFile;
+            fs.curNBlockPos = snap.nBlockPos;
+            fs.curNTxPos = nTxPos;
             // Perl tx-vtx could be empty (shouldn't happen on valid chain) -> walk next height.
             continue;
         }
