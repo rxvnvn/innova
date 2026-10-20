@@ -9493,6 +9493,52 @@ static void RefreshAuthoritativeTransientProjection()
     // projects the best tip; leave pindexBest unchanged rather than truncate it.
 }
 
+// S2.1-OP: operator-driven Store3A unwind. Consumes the AUTHORITATIVE Store3A undo
+// (the DisconnectBlock-equivalent path) so that after a blockindex-side operator
+// invalidate truncates the mutable tip, the store tip and UTXO state follow the
+// blockindex tip exactly. Unwinds from the store's current tip down to (stopping
+// AT) targetHeight. The blockindex tip authority still holds the full mutable-tail
+// records at call time (truncation only rewrites the ACTIVE member array; the
+// RECORDS store keeps the committed tail), so each store tip block's parent hash
+// resolves through the tip authority's record. Fail-closed: a failed pop aborts
+// before any blockindex commit, leaving the store rolled back and the restart
+// reconcile able to replay forward (no broken "store ahead" state).
+static bool s16_OperatorUnwindStoreTo(cs::store3a::CommitStore3A* store,
+                                      const BlockIndexTipAuthority* tip,
+                                      int32_t targetHeight, std::string* err)
+{
+    if (err) err->clear();
+    if (!store || !store->opened()) { if (err) *err = "store not open"; return false; }
+    while (store->tipHeight() > targetHeight)
+    {
+        const int32_t cur = store->tipHeight();
+        cs::Hash top; memcpy(top.data(), store->tipHash().data(), 32);
+        uint256 topHash; memcpy(topHash.begin(), top.data(), 32);
+        cs::Hash parent;
+        // Direct parent hash = the current store tip block's record.hashPrev. Read
+        // from the blockindex tip BY HASH (records still full before any commit),
+        // stored in the child record so it is correct at every layer including the
+        // boundary pop (block S+1's hashPrev is the immutable base tip S hash).
+        if (tip)
+        {
+            BlockIndexTipRead rec = tip->LookupByHash(topHash, NULL);
+            if (rec.status == BLOCK_INDEX_TIP_OK && !(rec.record.hashPrev == uint256(0)))
+                memcpy(parent.data(), rec.record.hashPrev.begin(), 32);
+        }
+        cs::ChainError se;
+        if (!store->disconnect(top, parent, &se))
+        {
+            if (err) *err = strprintf("store undo at h=%d (%s): %s",
+                                      (int)cur, topHash.GetHex().substr(0,20).c_str(), se.str().c_str());
+            return false;
+        }
+        printf("Store3A operator unwind: disconnected %s (h=%d) via undo -> store tip %d\n",
+               topHash.GetHex().substr(0,20).c_str(), (int)cur, (int)store->tipHeight());
+        fflush(stdout);
+    }
+    return true;
+}
+
 bool InvalidateBlock(const uint256& hash, std::string& strError)
 {
     LOCK(cs_main);
@@ -9539,8 +9585,34 @@ bool InvalidateBlock(const uint256& hash, std::string& strError)
         { strError = "authoritative selection failed: " + ferr; return false; }
         if (MainFailpointHitForTesting("FP_BEFORE_V2_AUTHORITY_COMMIT"))
         { strError = "failpoint FP_BEFORE_V2_AUTHORITY_COMMIT"; return false; }
+
+        // S2.1-OP: consume the authoritative Store3A undo FIRST -- unwind the store
+        // to the fork point -- so the store tip and UTXO state follow the blockindex
+        // truncate below. Done BEFORE the single blockindex tip.meta commit so every
+        // crash window reconciles cleanly at startup (a crash beforehand leaves both
+        // authorities full; a crash afterward leaves the store behind, which
+        // ReconcileStore3AToChain replays forward). The blockindex still holds the
+        // full mutable-tail records here, so each popped block's parent resolves.
+        if (s16_V2Armed())
+        {
+            std::string uwErr;
+            if (!s16_OperatorUnwindStoreTo(s16::g_chainObserve.store, tip, fork, &uwErr))
+            {
+                s16::g_chainObserve.needsRecovery = true;
+                strError = "authoritative invalidate: store undo unwind failed: " + uwErr;
+                return false;   // fail closed; store rolled back, restart reconciles
+            }
+        }
+
         if (tip->ApplyOperatorInvalidAndReorg(hash, true, fork, branch, bheights, &ferr) != BLOCK_INDEX_TIP_OK)
-        { strError = "authoritative invalidate failed: " + ferr; return false; }
+        {
+            // Blockindex unchanged (still full) but the store was unwound behind it:
+            // replay the store forward so the two authorities converge before we
+            // report the failure (fail closed, no store-ahead residue).
+            if (s16_V2Armed())
+                s16::ReconcileStore3AToChain(s16::g_chainObserve.store, NULL);
+            strError = "authoritative invalidate failed: " + ferr; return false;
+        }
         if (MainFailpointHitForTesting("FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"))
         { strError = "failpoint FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"; return false; }
         setInvalidBlockHash.insert(hash); // non-authoritative compatibility mirror
@@ -9642,6 +9714,28 @@ bool ReconsiderBlock(const uint256& hash, std::string& strError)
         { strError = "authoritative reconsider failed: " + ferr; return false; }
         setInvalidBlockHash.erase(hash); // non-authoritative compatibility mirror
         RefreshAuthoritativeTransientProjection();
+        // S2.1-OP: reconnect the authoritative Store3A to the restored chain tip. The
+        // corresponding invalidate already unwound the store to fork (a residual
+        // store-ahead is handled first by the unwind below -- the records store keeps
+        // the full mutable tail, so parent hashes resolve), then ReconcileStore3AToChain
+        // case B replays fork+1..newTip's connect deltas against the store, appending
+        // fresh undo, so store tip == blockindex tip == the reconsidered hash.
+        if (s16_V2Armed())
+        {
+            std::string uwErr, rcErr;
+            if (!s16_OperatorUnwindStoreTo(s16::g_chainObserve.store, tip, fork, &uwErr))
+            {
+                s16::g_chainObserve.needsRecovery = true;
+                strError = "authoritative reconsider: store unwind failed: " + uwErr;
+                return false;   // fail closed; store behind, restart reconciles forward
+            }
+            if (!s16::ReconcileStore3AToChain(s16::g_chainObserve.store, &rcErr))
+            {
+                s16::g_chainObserve.needsRecovery = true;
+                strError = "authoritative reconsider: store reconnect failed: " + rcErr;
+                return false;   // fail closed; restart reconcile will finish the replay
+            }
+        }
         printf("ReconsiderBlock(auth-v2): reconsidered %s height=%d\n",
                hash.ToString().substr(0, 20).c_str(), (int)targetHeight);
         fflush(stdout);

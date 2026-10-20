@@ -2657,9 +2657,14 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
 
     // (b) resulting active membership (fused from ReorgActiveTo steps 1-2;
     //     Repair #3: bounded-RAM equivalent via the durable side index).
+    // Legal fork range is [baseTip, current tipHeight]. The upper bound is
+    // INCLUSIVE: a mid-tail reconnect can re-promote a branch whose fork is the
+    // CURRENT tip (fork == tip, a pure append) -- previously rejected by the
+    // `>=` boundary as "fused reorg fork height out of range". Now only a fork
+    // strictly ABOVE the current tip is refused.
     const uint64_t activeCount = (uint64_t)(i->meta.tipHeight > baseTip)
         ? (uint64_t)(i->meta.tipHeight - baseTip) : 0;
-    if (forkHeight < baseTip || forkHeight >= baseTip + (int32_t)activeCount)
+    if (forkHeight < baseTip || forkHeight > baseTip + (int32_t)activeCount)
     {
         if (forkHeight != baseTip)
             return SetError(error, "fused reorg fork height out of range"), BLOCK_INDEX_TIP_CORRUPT;
