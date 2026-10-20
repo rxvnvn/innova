@@ -40,6 +40,22 @@ static const int INIT_PROTO_VERSION = 21212;
 // disconnect from peers older than this proto version
 static const int MIN_PEER_PROTO_VERSION = 43950; // Allow min v4.3.9.5
 
+// Strict P2P handshake allowlist: only peers whose announced (wire) protocol
+// version is exactly one of the values in the allowlist are permitted past the
+// version => verack handshake. Structural note: the two allowed slots are
+// min-version (43950) and master-version (50505); the values are disjoint, so
+// a range/slot check would be equivalent here, but an explicit allowlist keeps
+// the acceptance set auditable. Header-level so both the test suite and the
+// version-message handler share one definition. 2026-10-20 p2p protocol
+// allowlist: this is a connection policy only — no consensus change.
+static const int P2P_HANDSHAKE_VERSION = 50505;
+
+inline bool IsAllowedPeerProtocolVersion(int v) { return v == MIN_PEER_PROTO_VERSION || v == P2P_HANDSHAKE_VERSION; }
+
+// helper for tests / logging parity: name the allowed boundary explicitly
+static const int P2P_PROTOCOL_BLOCKED_MIN_ALLOWED = MIN_PEER_PROTO_VERSION;
+static const int P2P_PROTOCOL_BLOCKED_LOG_MAX_ALLOWED = P2P_HANDSHAKE_VERSION;
+
 // Don't forget to change proto in COLLATERAL.h as well!! On Block 1.5m this will be 31005
 extern int MIN_MN_PROTO_VERSION;
 

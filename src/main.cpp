@@ -11681,6 +11681,25 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             if (pfrom->strSubVer.size() > 256)
                 pfrom->strSubVer.resize(256);
         }
+
+        // Strict P2P protocol-version allowlist (replaces the retired user-agent
+        // ban filter as the handshake gate; subversion matching is intentionally
+        // NOT a policy signal here). Applies to inbound and outbound alike: the
+        // peer's announced nVersion must equal an allowlisted value before verack
+        // and before any getheaders/getblocks/getdata request is generated.
+        // Graceful close (fDisconnect), no Misbehaving, no Ban, no addrman entry.
+        // Subversion is only carried on the one-line log; never compared.
+        if (!IsAllowedPeerProtocolVersion(pfrom->nVersion))
+        {
+            printf("%s dir=%s nVersion=%d subver=%s allowed=43950,50505\n",
+                   "PEER_PROTOCOL_BLOCKED",
+                   pfrom->fInbound ? "in" : "out",
+                   pfrom->nVersion,
+                   pfrom->strSubVer.c_str());
+            pfrom->fDisconnect = true;
+            return false;
+        }
+
         if (!vRecv.empty())
         {
             vRecv >> pfrom->nChainHeight;
@@ -11755,7 +11774,12 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
         // Change version
         pfrom->PushMessage("verack");
-        pfrom->ssSend.SetVersion(min(pfrom->nVersion, PROTOCOL_VERSION));
+        // Send-stream version flips to the negotiated value: the allowlist
+        // guarantees nVersion is exactly 43950 or 50505, so clamp against the
+        // master handshake version (50505), not the retired wire PROTOCOL_VERSION
+        // (50000) — clamping to 50000 would silently downgrade an allowed
+        // master-version peer's send stream below the negotiated handshake.
+        pfrom->ssSend.SetVersion(min(pfrom->nVersion, P2P_HANDSHAKE_VERSION));
 
         if (!pfrom->fInbound)
         {
@@ -11837,7 +11861,24 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
 
     else if (strCommand == "verack")
     {
-        pfrom->SetRecvVersion(min(pfrom->nVersion, PROTOCOL_VERSION));
+        // Outbound-path counterpart of the inbound strict allowlist: when we are
+        // the connecting side, the peer's nVersion only becomes visible here on
+        // the verack reply — re-check the allowlist before verack-driven actions
+        // (sendheaders/getheaders/getblocks) and before pfrom->ssSend is flipped
+        // to the peer's version. Same graceful fDisconnect close; no Misbehaving,
+        // no Ban. Inbound connections already exited in the "version" handler.
+        if (!IsAllowedPeerProtocolVersion(pfrom->nVersion))
+        {
+            printf("%s dir=%s nVersion=%d subver=%s allowed=43950,50505\n",
+                   "PEER_PROTOCOL_BLOCKED",
+                   pfrom->fInbound ? "in" : "out",
+                   pfrom->nVersion,
+                   pfrom->strSubVer.c_str());
+            pfrom->fDisconnect = true;
+            return false;
+        }
+
+        pfrom->SetRecvVersion(min(pfrom->nVersion, P2P_HANDSHAKE_VERSION));
         printf("net: received verack from peer version %d (recvVersion: %d) at %s\n", pfrom->nVersion, pfrom->nRecvVersion, pfrom->addr.ToString().c_str());
 
         if (fSPVMode)
