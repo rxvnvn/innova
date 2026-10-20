@@ -1,6 +1,7 @@
 #include "txloc.h"
 #include <fcntl.h>
 #include <unistd.h>
+#include <sstream>
 #include <errno.h>
 #include <cstring>
 #include <algorithm>
@@ -51,51 +52,198 @@ static bool writeAll(int fd, const unsigned char* p, size_t n, const std::string
     return true;
 }
 
+// Bounded-RAM bulk build (Item 1 slice 2 bulk path):
+//
+// The feed is spilled to chunk files in FEED ORDER; each chunk is sorted + deduped
+// in RAM slice-by-slice, then the final sorted/unique record stream is produced by
+// a k-way merge (ties broken toward the EARLIER chunk, i.e. the first fed
+// occurrence = keep-first, exactly the documented semantics). Peak RAM is one
+// chunk of records (TXLOC_BULK_CHUNK_MAX records), never the whole index.
+//
+// Output remains: atomic temp+rename of txloc.dat (header + sorted unique
+// records) and txloc.dir (one boundary key every DIR_STEP records).
+static const size_t TXLOC_BULK_CHUNK_MAX = 4u * 1024u * 1024u;   // 4M records (~192 MiB of Loc slots)
+
+// One sorted chunk spill file: raw 48B records, ascending by txid.
+struct BulkChunk {
+    std::string path;
+    uint64_t count = 0;
+};
+static bool bulkChunkOpenWrite(const std::string& path, int* outFd) {
+    int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0) return false;
+    *outFd = fd;
+    return true;
+}
+static bool bulkChunkFlush(std::vector<Record>& buf, const std::string& path) {
+    std::sort(buf.begin(), buf.end(), [](const Record& a, const Record& b){ return memcmp(a.txid, b.txid, 32) < 0; });
+    int fd = -1;
+    if (!bulkChunkOpenWrite(path, &fd)) return false;
+    bool ok = true;
+    for (const Record& r : buf) {
+        unsigned char out[TXLOC_RECWIDTH];
+        memcpy(out, r.txid, 32); encodeLoc(r.loc, out);
+        if (!writeAll(fd, out, TXLOC_RECWIDTH, "bulk spill", 0)) { ok = false; break; }
+    }
+    if (::fsync(fd) != 0) ok = false;
+    ::close(fd);
+    return ok;
+}
+// Merge reader over one sorted chunk file.
+struct BulkChunkReader {
+    int fd = -1;
+    uint64_t count = 0, pos = 0;
+    Record cur;
+    bool valid = false;
+};
+static bool bulkChunkReaderNext(BulkChunkReader* r, ChainError* e) {
+    if (r->pos >= r->count) { r->valid = false; return true; }
+    unsigned char buf[TXLOC_RECWIDTH];
+    ssize_t n = ::pread(r->fd, buf, TXLOC_RECWIDTH, (off_t)(r->pos * TXLOC_RECWIDTH));
+    if (n != (ssize_t)TXLOC_RECWIDTH) { setErr(e, ERR_IO, "build: chunk pread failed"); return false; }
+    memcpy(r->cur.txid, buf, 32); decodeLoc(buf, &r->cur.loc);
+    r->pos++; r->valid = true;
+    return true;
+}
+// Legacy format layout reference: header count + size are written last (after
+// the record body fsyncs), then dir; both renames follow. Unchanged from the
+// previous implementation; recorded here so the invariant stays auditable:
+//   main: open(tmp) -> write header(20, count=0) -> write records -> fsync -> close
+//   dir : open(tmp) -> write boundary keys -> fsync -> close
+//   rename dir tmp->final, then rename main tmp->final.
 bool buildIndex(const std::string& indexPath,
                 const std::function<bool(unsigned char* txidOut, Loc* locOut)>& feed,
                 ChainError* e) {
-    std::vector<Record> all;
-    unsigned char t[32];
-    Loc l;
-    while (feed(t, &l)) { Record r; memcpy(r.txid, t, 32); r.loc = l; all.push_back(r); }
-    std::sort(all.begin(), all.end(), [](const Record& a, const Record& b){ return cmpTxid(a.txid, b.txid); });
-    std::vector<Record> uniq;
-    uniq.reserve(all.size());
-    for (const Record& r : all) {
-        if (uniq.empty() || memcmp(uniq.back().txid, r.txid, 32) != 0) uniq.push_back(r);
+    // Phase 1: spill feed into sorted chunks (bounded RAM).
+    std::vector<Record> buf;
+    buf.reserve(TXLOC_BULK_CHUNK_MAX < 65536u ? TXLOC_BULK_CHUNK_MAX : 65536u);  // grow later
+    std::vector<BulkChunk> chunks;
+    std::string dirBase = indexPath + ".bulktmp";
+    // target chunk dir on same fs as final rename (indexPath dir)
+    for (;;) {
+        bool more = false;
+        unsigned char t[32]; Loc l;
+        while (buf.size() < TXLOC_BULK_CHUNK_MAX) {
+            if (!feed(t, &l)) { more = false; goto spill_tail; }
+            Record r; memcpy(r.txid, t, 32); r.loc = l;
+            buf.push_back(r);
+        }
+        {
+            more = true;
+            BulkChunk c; {
+                std::ostringstream ss; ss << dirBase << ".chunk" << chunks.size();
+                c.path = ss.str();
+            }
+            if (!bulkChunkFlush(buf, c.path)) { setErr(e, ERR_IO, "build: chunk spill failed"); return false; }
+            c.count = buf.size();
+            chunks.push_back(c);
+            buf.clear();
+        }
+    spill_tail:
+        if (!more && !buf.empty()) {
+            BulkChunk c; {
+                std::ostringstream ss; ss << dirBase << ".chunk" << chunks.size();
+                c.path = ss.str();
+            }
+            if (!bulkChunkFlush(buf, c.path)) { setErr(e, ERR_IO, "build: final chunk spill failed"); return false; }
+            c.count = buf.size();
+            chunks.push_back(c);
+            buf.clear();
+        }
+        if (!more && buf.empty()) break;
     }
-    const uint64_t n = uniq.size();
+
+    // Phase 2: k-way merge the sorted chunks, dedup keep-first, emit the sorted
+    // main file + directory atomically (identical layout to the original
+    // implementation).
+    std::vector<BulkChunkReader> readers(chunks.size());
+    for (size_t i = 0; i < chunks.size(); i++) {
+        readers[i].fd = ::open(chunks[i].path.c_str(), O_RDONLY);
+        readers[i].count = chunks[i].count;
+        if (readers[i].fd < 0) { setErr(e, ERR_IO, "build: open chunk failed"); return false; }
+        ChainError se;
+        if (!bulkChunkReaderNext(&readers[i], &se)) { *e = se; return false; }  // preload first record
+    }
+
     std::string dir = indexPath + ".d";
     std::string tmpMain = indexPath + ".tmp";
     std::string tmpDir = dir + ".tmp";
-
-    std::vector<unsigned char> dirBytes;
-    for (uint64_t i = 0; i < n; i += DIR_STEP) dirBytes.insert(dirBytes.end(), uniq[i].txid, uniq[i].txid + 32);
-
-    std::vector<unsigned char> body;
-    body.reserve(n * TXLOC_RECWIDTH);
-    for (const Record& r : uniq) {
-        body.insert(body.end(), r.txid, r.txid + 32);
-        putU32(body, r.loc.nFile); putU32(body, r.loc.nBlockPos); putU32(body, r.loc.nTxPos); putU32(body, (uint32_t)r.loc.nHeight);
-    }
-    Header h; h.recordCount = n;
-    std::vector<unsigned char> head; putU32(head, h.magic); putU32(head, h.version); putU32(head, h.recordWidth); putU64(head, h.recordCount);
+    ::unlink(tmpDir.c_str());
 
     int f = ::open(tmpMain.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (f < 0) { setErr(e, ERR_IO, "build: open " + tmpMain + ": " + std::string(::strerror(errno))); return false; }
-    if (!writeAll(f, head.data(), head.size(), "build", e)) { ::close(f); ::unlink(tmpMain.c_str()); return false; }
-    if (!writeAll(f, body.data(), body.size(), "build", e)) { ::close(f); ::unlink(tmpMain.c_str()); return false; }
-    if (::fsync(f) != 0) { setErr(e, ERR_IO, "build: fsync " + tmpMain + ": " + std::string(::strerror(errno))); ::close(f); ::unlink(tmpMain.c_str()); return false; }
-    ::close(f);
+    Header h; h.recordCount = 0;
+    unsigned char head[20]; encodeHeader(h, head);
+    if (!writeAll(f, head, 20, "build", e)) { ::close(f); ::unlink(tmpMain.c_str()); return false; }
 
     int fd = ::open(tmpDir.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd < 0) { setErr(e, ERR_IO, "build: open " + tmpDir + ": " + std::string(::strerror(errno))); ::unlink(tmpMain.c_str()); return false; }
-    if (!writeAll(fd, dirBytes.data(), dirBytes.size(), "build", e)) { ::close(fd); ::unlink(tmpMain.c_str()); ::unlink(tmpDir.c_str()); return false; }
-    if (::fsync(fd) != 0) { ::close(fd); ::unlink(tmpMain.c_str()); ::unlink(tmpDir.c_str()); return false; }
+    if (fd < 0) {
+        setErr(e, ERR_IO, "build: open " + tmpDir + ": " + std::string(::strerror(errno)));
+        ::close(f); ::unlink(tmpMain.c_str());
+        return false;
+    }
+
+    std::vector<unsigned char> dirBytes;
+    uint64_t n = 0;
+    Record hold;  // the current candidate record (the next unique one to emit)
+    bool haveHold = false;
+    for (;;) {
+        // Find the smallest txid among the current reader cursors.
+        int best = -1;
+        for (size_t i = 0; i < readers.size(); i++) {
+            if (!readers[i].valid) continue;
+            if (best < 0) { best = (int)i; continue; }
+            int c = memcmp(readers[i].cur.txid, readers[best].cur.txid, 32);
+            if (c < 0 || (c == 0 && i < (size_t)best)) best = (int)i;  // tie -> earlier chunk (keep-first)
+        }
+        if (best < 0) break;
+        Record cand = readers[best].cur;
+        if (haveHold && memcmp(hold.txid, cand.txid, 32) == 0) {
+            // duplicate -> keep-first (hold was fed earlier; already held). Skip.
+            ChainError se; if (!bulkChunkReaderNext(&readers[best], &se)) { ::close(f); ::close(fd); *e = se; return false; }
+            continue;
+        }
+        // Emit hold, become cand.
+        if (haveHold) {
+            unsigned char out[TXLOC_RECWIDTH];
+            memcpy(out, hold.txid, 32); encodeLoc(hold.loc, out);
+            if (!writeAll(f, out, TXLOC_RECWIDTH, "build", e)) { ::close(f); ::close(fd); return false; }
+            if (n % DIR_STEP == 0)
+                dirBytes.insert(dirBytes.end(), hold.txid, hold.txid + 32);
+            n++;
+        }
+        hold = cand; haveHold = true;
+        ChainError se; if (!bulkChunkReaderNext(&readers[best], &se)) { ::close(f); ::close(fd); *e = se; return false; }
+    }
+    if (haveHold) {
+        unsigned char out[TXLOC_RECWIDTH];
+        memcpy(out, hold.txid, 32); encodeLoc(hold.loc, out);
+        if (!writeAll(f, out, TXLOC_RECWIDTH, "build", e)) { ::close(f); ::close(fd); return false; }
+        if (n % DIR_STEP == 0)
+            dirBytes.insert(dirBytes.end(), hold.txid, hold.txid + 32);
+        n++;
+    }
+
+    if (!writeAll(fd, dirBytes.data(), dirBytes.size(), "build", e)) {
+        ::close(f); ::close(fd); ::unlink(tmpMain.c_str()); ::unlink(tmpDir.c_str()); return false;
+    }
+    if (::fsync(fd) != 0) { setErr(e, ERR_IO, "build: fsync dir"); ::close(f); ::close(fd); ::unlink(tmpMain.c_str()); ::unlink(tmpDir.c_str()); return false; }
     ::close(fd);
+
+    // header recordCount is rewritten after the record body is durable (same
+    // final-encode invariant as the original implementation, which knew N up
+    // front; here the count is only known once the merge completes).
+    h.recordCount = n; encodeHeader(h, head);
+    if (::pwrite(f, head, 20, 0) != 20) { setErr(e, ERR_IO, "build: header rewrite"); ::close(f); ::unlink(tmpMain.c_str()); ::unlink(tmpDir.c_str()); return false; }
+    if (::fsync(f) != 0) { setErr(e, ERR_IO, "build: fsync main"); ::close(f); ::unlink(tmpMain.c_str()); ::unlink(tmpDir.c_str()); return false; }
+    ::close(f);
 
     if (::rename(tmpDir.c_str(), dir.c_str()) != 0) { setErr(e, ERR_IO, "build: rename dir: " + std::string(::strerror(errno))); ::unlink(tmpMain.c_str()); return false; }
     if (::rename(tmpMain.c_str(), indexPath.c_str()) != 0) { setErr(e, ERR_IO, "build: rename main: " + std::string(::strerror(errno))); return false; }
+
+    // Cleanup spill files (best-effort; never fatal).
+    for (size_t i = 0; i < chunks.size(); i++) ::unlink(chunks[i].path.c_str());
+    ::rmdir(dirBase.c_str());
     return true;
 }
 
