@@ -1381,17 +1381,20 @@ static int ReadStakeSourceTransactionV2(const CBlockIndex* pindexPrev,
     const COutPoint& prevout, CTransaction& txPrev, CTxIndex& txindex,
     CBlock& blockFrom)
 {
-    if (!pindexPrev)
-        return -1;
+    // S2.1 diagnostic (opt-in via S16_DBG_STAKE=1): name the exact step that fails, so a rejected
+    // coinstake can be attributed to the store, the block index, the disk read or the ancestor gate
+    // instead of the generic "read txPrev failed" catch-all.
+    const bool dbgStake = (getenv("S16_DBG_STAKE") != NULL);
+    #define STAKE_DBG(why) do { if (dbgStake) { printf("S16_STAKE_MISS why=%s prev=%s:%u pindexPrev=%d storeTip=%d\n", why, prevout.hash.GetHex().c_str(), (unsigned)prevout.n, pindexPrev ? (int)pindexPrev->nHeight : -1, (int)s16::g_chainObserve.store->tipHeight()); fflush(stdout); } } while(0)
+    if (!pindexPrev) { STAKE_DBG("no-pindexprev"); return -1; }
     AssertLockHeld(cs_main);
 
     // 1. Authoritative Store3A coin for the staked UTXO.
     cs::OutPoint k; memcpy(k.txid.data(), prevout.hash.begin(), 32); k.n = prevout.n;
     cs::Coin coin; bool found = false; cs::ChainError ce;
-    if (!s16::g_chainObserve.store->get(k, &coin, &found, &ce))
-        return -1;    // Store3A authority read error -> FAIL CLOSED
-    if (!found)
-        return 0;     // coin absent from the committed V2 chain
+    if (!s16::g_chainObserve.store->get(k, &coin, &found, &ce)) { STAKE_DBG("store-read-error"); return -1; }
+    if (!found) { STAKE_DBG("coin-absent"); return 0; }
+    if (dbgStake) { printf("S16_STAKE_COIN found=%s:%u height=%u value=%lld\n", prevout.hash.GetHex().c_str(), (unsigned)prevout.n, (unsigned)coin.height, (long long)coin.value); fflush(stdout); }
 
     // 2. Source block by-value from BI-V2 at the coin's creation height.
     uint256 blockHash(0); unsigned int nFile = 0, nBlockPos = 0;
@@ -1418,10 +1421,8 @@ static int ReadStakeSourceTransactionV2(const CBlockIndex* pindexPrev,
         BlockIndexSnapshot snap; std::string err;
         const AuthoritativeBlockResolutionResult res =
             AuthoritativeGetActiveSnapshotByHeightR((int)coin.height, &snap, &err);
-        if (res != AUTHORITATIVE_BLOCK_FOUND)
-            return -1;    // authoritative base+tail cannot resolve -> FAIL CLOSED
-        if (!snap.found || snap.height != (int)coin.height)
-            return -1;    // active height/record mismatch -> FAIL CLOSED
+        if (res != AUTHORITATIVE_BLOCK_FOUND) { STAKE_DBG("snapshot-not-found"); return -1; }
+        if (!snap.found || snap.height != (int)coin.height) { STAKE_DBG("snapshot-mismatch"); return -1; }
         blockHash = snap.hash;
         nFile = snap.nFile;
         nBlockPos = snap.nBlockPos;
@@ -1443,10 +1444,8 @@ static int ReadStakeSourceTransactionV2(const CBlockIndex* pindexPrev,
     // 3. Read the source block from disk to locate the source tx and compute its
     //    exact byte offset within the block (the legacy txindex's
     //    nTxPos - nBlockPos, required BYTE-FOR-BYTE by the kernel hash).
-    if (!blockFrom.ReadFromDisk(nFile, nBlockPos, true))
-        return -1;    // source block not on disk -> FAIL CLOSED
-    if (blockFrom.GetHash() != blockHash)
-        return -1;    // on-disk block diverges from the BI-V2 authority
+    if (!blockFrom.ReadFromDisk(nFile, nBlockPos, true)) { STAKE_DBG("source-block-unreadable"); return -1; }
+    if (blockFrom.GetHash() != blockHash) { STAKE_DBG("source-block-diverges"); return -1; }
 
     unsigned int nTxPos = nBlockPos +
         ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION) -
@@ -1465,8 +1464,7 @@ static int ReadStakeSourceTransactionV2(const CBlockIndex* pindexPrev,
         }
         nTxPos += ::GetSerializeSize(*it, SER_DISK, CLIENT_VERSION);
     }
-    if (!fFound)
-        return -1;    // creator tx not in its resolved source block -> FAIL CLOSED
+    if (!fFound) { STAKE_DBG("tx-not-in-source-block"); return -1; }
 
     // 4. Divergence guard: the Store3A coin (the consensus authority for the
     //    staked commitment) must agree with the source tx prevout read from disk.
@@ -1490,8 +1488,7 @@ static int ReadStakeSourceTransactionV2(const CBlockIndex* pindexPrev,
     if (pNav)
     {
         const int navAncestry = IsBlockInCandidateAncestryNavigated(blockHash, pindexPrev);
-        if (navAncestry <= 0)
-            return -1;    // authority failure OR source-not-ancestor -> FAIL CLOSED
+        if (navAncestry <= 0) { STAKE_DBG("source-not-ancestor"); return -1; }
         return 1;
     }
     std::map<uint256, CBlockIndex*>::const_iterator mi = mapBlockIndex.find(blockHash);

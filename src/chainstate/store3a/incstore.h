@@ -248,6 +248,30 @@ public:
     bool existsUnspentTxid(const Hash& txid, bool* found, ChainError* e) const;
 
     bool publish(const Delta& d, const Hash& blockHash, int32_t height, ChainError* e);
+
+    // S2.1 -- MULTI-BLOCK PUBLISH. Applies the deltas of several CONSECUTIVE blocks and pays ONE set of
+    // durability barriers per batch instead of one per block. Semantics are identical to calling publish()
+    // for each entry in order: the same CoW pages are written, one undo record per block is appended (so
+    // disconnect and the undo index keep working block by block), and only the final MANIFEST becomes
+    // authoritative. The batch therefore commits ALL entries or NONE of them: on any failure the root is
+    // restored and no byte of the batch is committed. A crash between batches leaves the committed tip at
+    // the previous batch boundary -- the caller reconciles that on open (replay forward / undo back).
+    struct BatchBlock { Delta d; Hash blockHash; int32_t height; };
+    // Apply ONE block's delta to the CoW pages without paying any durability barrier. The pages are
+    // written exactly as publish() would write them, so every subsequent read (the next block's prevout
+    // lookup, the authority gate) sees the coins this block created. Nothing becomes authoritative
+    // until publishBatch() below; the pre-batch root is captured by the first call and restored on any
+    // failure, so a batch that cannot be completed leaves the store exactly where it started.
+    bool applyBatchBlock(const Delta& d, ChainError* e);
+    // Publish the accumulated blocks. If applyBatchBlock() was used, the deltas are already applied and
+    // only the durable part runs; otherwise the deltas are applied here first (self-contained mode).
+    bool publishBatch(const std::vector<BatchBlock>& batch, ChainError* e);
+    bool batchOpen() const { return batchOpen_; }
+    // S2.1 profiling: monotonic nanoseconds spent applying deltas to the CoW pages vs paying the
+    // durability barriers. Lets a bulk run attribute its cost without guesswork.
+    uint64_t applyNanos() const { return applyNanos_; }
+    uint64_t commitNanos() const { return commitNanos_; }
+    void resetProfile() { applyNanos_ = 0; commitNanos_ = 0; }
     bool disconnect(const Hash& blockHash, const Hash& parentTipHash, ChainError* e);
     bool disconnect(const Hash& blockHash, ChainError* e) {
         return disconnect(blockHash, Hash(), e);
@@ -316,7 +340,16 @@ private:
     // S1.1-F2 (finding F1-1): link()+unlink() is the ONLY move primitive here -- there is deliberately no
     // lstat+rename fallback (rename can atomically REPLACE an existing quarantine artifact on Linux).
     bool quarantineCorruptUndoIndex(std::string* quarantinePath, uint64_t* bytes, ChainError* e);
-    bool commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e);
+    bool commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e,
+                        const std::vector<uint64_t>* recEnds = NULL);
+    // S2.1: close EVERY undo-index segment boundary crossed by this append (a batch may cross several).
+    // recEnds holds the absolute end offset of each appended record; NULL means "one record, legacy path".
+    bool publishUndoIndexCrossings(uint64_t appendStart, const std::vector<uint64_t>* recEnds, ChainError* e);
+    bool applyOps(const Delta& d, ChainError* e);          // S2.1: shared by publish()/publishBatch()
+    uint64_t applyNanos_ = 0, commitNanos_ = 0;              // S2.1 profiling counters
+    bool batchOpen_ = false;                                // S2.1: deltas applied, barrier not yet paid
+    uint32_t batchOldRoot_ = 0;
+    Hash batchOldHash_{};
     bool writeAck(uint64_t gen, ChainError* e);
     bool readAck(bool* present, uint64_t* gen, ChainError* e);
     void crashIf(CrashPoint at);

@@ -1923,8 +1923,23 @@ authoritative_startup_ready:
             s16::g_chainObserve.store = &s3aStore;
             s16::g_chainObserve.enabled = true;
             s16::g_chainObserve.checkAuthority = true;
+            // S2.1: the replayed store IS the node's authoritative chainstate (it is opened at the
+            // path the node itself uses), so arm it as authoritative (hardFail) exactly like the
+            // normal startup does. Without this the V2 kernel/input paths keep their legacy gate
+            // OFF, and the FIRST proof-of-stake block dies in CheckProofOfStake with
+            // "read txPrev failed" because the coinstake source is only resolvable through
+            // Store3A + BI-V2. A gate failure now refuses the block instead of silently building
+            // a store the node will later reject.
+            s16::g_chainObserve.hardFail = true;
+            // S2.1: publish the replay in batches (one durability barrier per N blocks) instead of
+            // one per block. 1 disables batching; the default is tuned for bulk replay.
+            {
+                int nb = (int)GetArg("-s16store3abatch", 1000);
+                s16::g_chainObserve.batchSize = (size_t)(nb > 0 ? nb : 1);
+            }
             armed = &s16::g_chainObserve;
-            printf("store3a replay publication armed at %s\n", s3aDir.c_str());
+            printf("store3a replay publication armed at %s (batch=%llu)\n", s3aDir.c_str(),
+                   (unsigned long long)s16::g_chainObserve.batchSize);
         }
 
         // Batched durability for the replay: see SetBulkImportMode().  A final
@@ -1939,6 +1954,19 @@ authoritative_startup_ready:
         }
         SetBulkImportMode(false);
         {
+            // S2.1: flush the trailing store batch before anything else claims the import is done.
+            if (armed && !armed->pending.empty())
+            {
+                if (!armed->FlushPending())
+                    return InitError(strprintf("Store3A batch flush after -loadblock failed: %s", armed->lastOpError.c_str()));
+                printf("S2.1 replay: final store batch flushed (flushes=%llu blocks=%llu tipHeight=%d)\n",
+                       (unsigned long long)armed->batchFlushes, (unsigned long long)armed->batchBlocks,
+                       (int)armed->lastFlushedHeight);
+            }
+            if (armed)
+                printf("S2.1 profile: delta-apply=%.1fs barriers=%.1fs over %llu block(s)\n",
+                       (double)armed->store->applyNanos()/1e9, (double)armed->store->commitNanos()/1e9,
+                       (unsigned long long)armed->published);
             // Force the durability points once more now that batching is off.
             FileCommit(stdout);
             if (txloc::g_txloc.opened())
@@ -2016,6 +2044,20 @@ authoritative_startup_ready:
             if (pindexBest == NULL)
                 return InitError("Store3A V2 authoritative: no best chain loaded");
             int32_t stH = g_s3aAuthoritative->tipHeight();
+            // S2.1: a crash in the middle of a store batch leaves the store BEHIND the chain, and a
+            // chain that lost its tail leaves it AHEAD. Both are reconciled here, deterministically,
+            // BEFORE the fail-closed tip comparison below: replay forward (already-validated blocks)
+            // or unwind back with the undo log. A run that stopped cleanly does nothing.
+            if (pindexBest->nHeight != stH)
+            {
+                std::string rerr;
+                printf("S2.1 store reconcile: store h=%d, chain h=%d -- reconciling before startup checks\n",
+                       (int)stH, (int)pindexBest->nHeight);
+                fflush(stdout);
+                if (!s16::ReconcileStore3AToChain(g_s3aAuthoritative.get(), &rerr))
+                    return InitError(strprintf("Store3A V2 authoritative: reconcile to the chain tip FAILED: %s", rerr.c_str()));
+                stH = g_s3aAuthoritative->tipHeight();
+            }
             // ------------------------------------------------------------------
             // P2 EMPTY_DATADIR: a fresh, EMPTY Store3A (tipHeight < 0) paired with a
             // genesis-only best chain is the clean genesis->tip IBD start. There is
@@ -2136,6 +2178,16 @@ authoritative_startup_ready:
             s16::g_chainObserve.enabled = true;
             s16::g_chainObserve.checkAuthority = true;
             s16::g_chainObserve.hardFail = true;   // authoritative: gate failure REFUSES the block
+            // S2.1: batch the durability barriers. The batch is all-or-nothing per boundary and a
+            // crash is repaired by ReconcileStore3AToChain on the next start, so this is safe for
+            // both P2P IBD and -loadblock replay. -s16store3abatch=1 restores per-block publication.
+            {
+                int nb = (int)GetArg("-s16store3abatch", 1000);
+                s16::g_chainObserve.batchSize = (size_t)(nb > 0 ? nb : 1);
+                printf("S2.1 Store3A publication batching: %llu block(s) per durability barrier\n",
+                       (unsigned long long)s16::g_chainObserve.batchSize);
+                fflush(stdout);
+            }
             // V2-Item1: open the historical TX-LOC location index under the approved
             // datadir contract (GetDataDir()/chainstate/txloc, auto-created). Built
             // incrementally during IBD (per-block feed in ConnectBlock) + on restart by

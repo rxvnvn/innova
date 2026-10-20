@@ -11,6 +11,7 @@
 #pragma once
 #include "chainstate/store3a/incstore.h"
 #include <string>
+#include <vector>
 #include <stdint.h>
 
 namespace s16 {
@@ -34,9 +35,28 @@ struct ChainObserveState {
     std::string lastAuthorityMismatch;     // last authority-gate divergence
     uint64_t lastOps = 0;                  // ops in the last published Delta
     int32_t lastHeight = -1;               // last block height handled
+
+    // S2.1 -- MULTI-BLOCK PUBLICATION. batchSize == 1 keeps the per-block path exactly as before.
+    // Deltas are applied to the store's CoW pages as they arrive (so later blocks in the batch read
+    // the coins earlier ones created) and become durable together at the batch boundary. A crash
+    // therefore leaves the store at most batchSize-1 blocks behind the chain; startup reconciles it
+    // by replaying the already-validated blocks (see ReconcileStore3AToChain).
+    size_t   batchSize = 1;
+    std::vector<cs::store3a::CommitStore3A::BatchBlock> pending;
+    uint64_t batchFlushes = 0;             // successful publishBatch() calls
+    uint64_t batchBlocks = 0;              // blocks made durable by those flushes
+    int32_t  lastFlushedHeight = -1;       // height made durable by the last successful flush
+    bool FlushPending();                   // defined in main.cpp; false => fail-closed
 };
 
 extern ChainObserveState g_chainObserve;
+
+// S2.1: make the chain-load path agree with the store after a crash in the middle of a batch.
+// Unwinds blocks the chain does not have (store ahead) and replays blocks the store is missing
+// (store behind), rebuilding each Delta with the SAME projection the live connect hook uses.
+// Deterministic and idempotent: with store == chain it does nothing. Returns false with a reason
+// on any inconsistency it must not paper over (missing block, delta failure, final mismatch).
+bool ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string* err);
 
 
 // M5: cross-TU V2 transaction-presence helper for the WALLET (defined in main.cpp).

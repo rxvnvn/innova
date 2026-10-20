@@ -5961,6 +5961,15 @@ bool CBlock::DisconnectBlock(CBlockIndex* pindex)
     if (s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail &&
         s16::g_chainObserve.store && s16::g_chainObserve.store->opened())
     {
+        // S2.1: pending batch entries are blocks ABOVE this one; undo must start from the durable
+        // tip, so flush first. A flush failure is fatal: disconnecting over an uncommitted batch
+        // would apply the wrong undo record.
+        if (!s16::g_chainObserve.pending.empty() && !s16::g_chainObserve.FlushPending())
+        {
+            s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+            return error("DisconnectBlock() : Store3A batch flush before undo FAILED at height %d (%s) — fail-closed",
+                         (int)pindex->nHeight, s16::g_chainObserve.lastOpError.c_str());
+        }
         cs::Hash bh; memcpy(bh.data(), pindex->GetBlockHash().begin(), 32);
         cs::Hash parentH;
         if (pindex->pprev)
@@ -6184,22 +6193,25 @@ namespace s16 { ChainObserveState g_chainObserve; }
 // observe_hook.h). Armed only when -s16openstore is requested, by
 // legacy opens are unaffected. All guard declarations live in namespace s16
 // (observe_hook.h); these are the single definitions.
-static void s16_ObserveConnectBlock(const CBlock& blk,
-                                    const std::map<uint256,CTxIndex>& mqc,
-                                    const CBlockIndex* pindex,
-                                    const s16_V2InputView* v2View)
-{
-    s16::ChainObserveState& st = s16::g_chainObserve;
-    if (!st.enabled || !st.store || !st.store->opened() || pindex == NULL)
-        return;
-    if (st.needsRecovery) {   // fail-closed: no further Delta published after a hard error
-        ++st.fails; return;
-    }
-    ++st.blocks;
+// S2.1: the block -> Delta projection, extracted so the SAME code builds a delta during the live
+// connect hook and during crash recovery (replaying already-validated blocks into a store that a
+// crash left behind the chain tip). Deterministic: it depends only on the block and on the store's
+// pre-state, which is exactly the state the per-block publish sequence produced.
+// S2.1 crash-reconcile overlay: prevouts created EARLIER in the reconciliation
+// window are not yet in the store (the store lags the chain by up to one batch),
+// so they are resolved from the blocks already replayed in this pass.
+struct s16_ReplayCoin { CTransaction tx; int32_t height; };
+typedef std::map<uint256, s16_ReplayCoin> s16_ReplayOverlay;
 
+static bool s16_BuildDeltaForBlock(const CBlock& blk, int32_t height,
+                                   cs::store3a::CommitStore3A* store,
+                                   cs::Delta* dOut, cs::ChainError* eOut,
+                                   const s16_ReplayOverlay* overlay = NULL)
+{
+    if (store == NULL) { setErr(eOut, cs::ErrCode::NOT_OPEN, "store"); return false; }
     // Project the block's real transactions -> neutral observed block.
     cs::ObservedBlock ob;
-    ob.height = pindex->nHeight;
+    ob.height = height;
     ob.txs.reserve(blk.vtx.size());
     for (size_t ti = 0; ti < blk.vtx.size(); ++ti) {
         const CTransaction& tx = blk.vtx[ti];
@@ -6226,17 +6238,43 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
         }
         ob.txs.push_back(o);
     }
-
-    // Observed pre-state for external spends = the mirror's authoritative coin.
-    cs::GetPrevCoinFn gp = [&st](const cs::OutPoint& k, cs::Coin* c)->bool {
+    // Observed pre-state for external spends = the store's authoritative coin.
+    cs::GetPrevCoinFn gp = [store, overlay](const cs::OutPoint& k, cs::Coin* c)->bool {
         bool found = false; cs::ChainError e;
-        if (!st.store->get(k, c, &found, &e)) return false;
-        return found;
+        if (!store->get(k, c, &found, &e)) return false;
+        if (found) return true;
+        if (overlay == NULL) return false;
+        uint256 id; memcpy(id.begin(), k.txid.data(), 32);
+        s16_ReplayOverlay::const_iterator it = overlay->find(id);
+        if (it == overlay->end()) return false;
+        if (k.n >= it->second.tx.vout.size()) return false;
+        const CTxOut& tv = it->second.tx.vout[k.n];
+        c->value   = tv.nValue;
+        c->script.assign(tv.scriptPubKey.begin(), tv.scriptPubKey.end());
+        c->height  = it->second.height;
+        c->nTime   = it->second.tx.nTime;
+        c->fCoinBase  = it->second.tx.IsCoinBase();
+        c->fCoinStake = it->second.tx.IsCoinStake();
+        return true;
     };
+    return cs::observeDelta(ob, gp, dOut, eOut);
+}
+
+static void s16_ObserveConnectBlock(const CBlock& blk,
+                                    const std::map<uint256,CTxIndex>& mqc,
+                                    const CBlockIndex* pindex,
+                                    const s16_V2InputView* v2View)
+{
+    s16::ChainObserveState& st = s16::g_chainObserve;
+    if (!st.enabled || !st.store || !st.store->opened() || pindex == NULL)
+        return;
+    if (st.needsRecovery) {   // fail-closed: no further Delta published after a hard error
+        ++st.fails; return;
+    }
+    ++st.blocks;
 
     cs::Delta d; cs::ChainError ce;
-    bool okObs = cs::observeDelta(ob, gp, &d, &ce);
-    if (!okObs) {
+    if (!s16_BuildDeltaForBlock(blk, pindex->nHeight, st.store, &d, &ce)) {
         ++st.fails; st.needsRecovery = true;   // store missing a 'before' coin: mirror out of sync
         st.lastOpError = ce.str(); st.lastHeight = pindex->nHeight; return;
     }
@@ -6328,12 +6366,132 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
     }
 
     cs::Hash bh; memcpy(bh.data(), pindex->GetBlockHash().begin(), 32);
+    if (st.batchSize > 1) {
+        // S2.1: apply now, become durable at the boundary. The delta is already applied to the
+        // store's CoW pages, so the NEXT block in the batch reads the coins this one created.
+        cs::store3a::CommitStore3A::BatchBlock bb;
+        bb.d = d; bb.blockHash = bh; bb.height = pindex->nHeight;
+        // Apply NOW (no barrier): the next block in the batch must read the coins this one created.
+        cs::ChainError ae;
+        if (!st.store->applyBatchBlock(d, &ae)) {
+            ++st.fails; st.needsRecovery = true;
+            st.lastOpError = ae.str(); st.lastHeight = pindex->nHeight; return;
+        }
+        st.pending.push_back(bb);
+        if (st.pending.size() >= st.batchSize && !st.FlushPending()) {
+            ++st.fails; st.needsRecovery = true;   // a failed batch publish is fatal for the observer
+            if (st.lastOpError.empty()) st.lastOpError = "batch publish failed";
+            st.lastHeight = pindex->nHeight; return;
+        }
+        ++st.published; st.lastOps = d.ops.size(); st.lastHeight = pindex->nHeight;
+        return;
+    }
     cs::ChainError pe;
     if (!st.store->publish(d, bh, pindex->nHeight, &pe)) {
         ++st.fails; st.needsRecovery = true;   // publish/open/disconnect/position inconsistency
         st.lastOpError = pe.str(); st.lastHeight = pindex->nHeight; return;
     }
     ++st.published; st.lastOps = d.ops.size(); st.lastHeight = pindex->nHeight;
+}
+
+// S2.1: publish the accumulated batch. Called at the batch boundary, at the end of a bulk import,
+// before a reorg disconnect and at shutdown, so nothing is ever left uncommitted on a clean stop.
+bool s16::ChainObserveState::FlushPending()
+{
+    if (pending.empty()) return true;
+    if (!store || !store->opened()) { lastOpError = "flush: store is not open"; pending.clear(); return false; }
+    const size_t n = pending.size();
+    const int32_t h = pending.back().height;
+    cs::ChainError e;
+    if (!store->publishBatch(pending, &e)) {
+        lastOpError = e.str();
+        pending.clear();          // the store requires a reopen; keeping them would be misleading
+        return false;
+    }
+    ++batchFlushes; batchBlocks += (uint64_t)n; lastFlushedHeight = h;
+    pending.clear();
+    return true;
+}
+
+// S2.1: crash reconciliation between the loaded chain and the store.
+bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string* err)
+{
+    if (err) err->clear();
+    if (store == NULL || !store->opened()) { if (err) *err = "store is not open"; return false; }
+    if (pindexBest == NULL) { if (err) *err = "no best chain loaded"; return false; }
+    const int32_t chainH = pindexBest->nHeight;
+    int32_t sh = store->tipHeight();
+    if (sh == chainH) {
+        uint256 th; memcpy(th.begin(), store->tipHash().data(), 32);
+        if (th == pindexBest->GetBlockHash()) return true;
+    }
+    // A) store AHEAD of the chain (the chain lost its last blocks): unwind with the undo log.
+    while (sh > chainH) {
+        uint256 bhash; memcpy(bhash.begin(), store->tipHash().data(), 32);
+        std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(bhash);
+        if (it == mapBlockIndex.end()) {
+            if (err) *err = strprintf("store tip %s at h=%d is not in the block index", bhash.GetHex(), (int)sh);
+            return false;
+        }
+        CBlockIndex* bi = it->second;
+        if (bi->pprev == NULL) { if (err) *err = "cannot unwind the genesis block"; return false; }
+        cs::Hash bh, ph;
+        memcpy(bh.data(), bhash.begin(), 32);
+        memcpy(ph.data(), bi->pprev->GetBlockHash().begin(), 32);
+        cs::ChainError se;
+        if (!store->disconnect(bh, ph, &se)) { if (err) *err = "disconnect h=" + strprintf("%d", (int)sh) + ": " + se.str().c_str(); return false; }
+        printf("S2.1 store reconcile: unwound block %s (h=%d) absent from the chain\n", bhash.GetHex().c_str(), (int)sh);
+        sh = store->tipHeight();
+    }
+    // B) store BEHIND the chain (a crash inside a batch): replay the already-validated blocks.
+    if (sh < chainH) {
+        const int32_t from = sh + 1;
+        std::vector<cs::store3a::CommitStore3A::BatchBlock> batch;
+        const size_t kReplayBatch = 2000;
+        s16_ReplayOverlay overlay;   // prevouts created inside this window
+        for (int32_t h = from; h <= chainH; ++h) {
+            CBlockIndex* bi = pindexBest->GetAncestor(h);
+            if (bi == NULL) { if (err) *err = strprintf("block index has no ancestor at h=%d", (int)h); return false; }
+            CBlock blk;
+            if (!blk.ReadFromDisk(bi)) {
+                if (err) *err = strprintf("cannot read block %s at h=%d", bi->GetBlockHash().GetHex(), (int)h);
+                return false;
+            }
+            cs::Delta d; cs::ChainError de;
+            if (!s16_BuildDeltaForBlock(blk, h, store, &d, &de, &overlay)) {
+                if (err) *err = strprintf("delta at h=%d: %s", (int)h, de.str().c_str());
+                return false;
+            }
+            for (size_t ti = 0; ti < blk.vtx.size(); ++ti) {
+                s16_ReplayCoin rc; rc.tx = blk.vtx[ti]; rc.height = h;
+                overlay[blk.vtx[ti].GetHash()] = rc;
+            }
+            cs::store3a::CommitStore3A::BatchBlock bb;
+            bb.d = d; bb.height = h;
+            memcpy(bb.blockHash.data(), bi->GetBlockHash().begin(), 32);
+            batch.push_back(bb);
+            if (batch.size() >= kReplayBatch) {
+                cs::ChainError pe;
+                if (!store->publishBatch(batch, &pe)) { if (err) *err = strprintf("replay publish at h=%d: %s", (int)h, pe.str().c_str()); return false; }
+                batch.clear();
+            }
+        }
+        if (!batch.empty()) {
+            cs::ChainError pe;
+            if (!store->publishBatch(batch, &pe)) { if (err) *err = std::string("replay publish: ") + pe.str(); return false; }
+        }
+        printf("S2.1 store reconcile: replayed %d block(s) (%d..%d) to reach the chain tip\n",
+               (int)(chainH - from + 1), (int)from, (int)chainH);
+        fflush(stdout);
+    }
+    // C) final agreement -- never leave the caller with a silently divergent store.
+    uint256 th; memcpy(th.begin(), store->tipHash().data(), 32);
+    if (store->tipHeight() != chainH || th != pindexBest->GetBlockHash()) {
+        if (err) *err = strprintf("after reconcile store h=%d %s != chain h=%d %s",
+                                  (int)store->tipHeight(), th.GetHex(), (int)chainH, pindexBest->GetBlockHash().GetHex());
+        return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------

@@ -681,6 +681,32 @@ bool CommitStore3A::publishUndoIndex(const UndoIndex& ix, ChainError* e){
     return true;
 }
 
+// S2.1: a batch append can cross SEVERAL segment boundaries at once. Closing them one call at a time would
+// describe only the last one (and with the wrong recordCount/byte range for the earlier ones), so all
+// boundaries crossed by this single append are closed together and the index is rewritten ONCE.
+// recEnds == NULL keeps the legacy single-record contract byte-identical to publishUndoIndexOnSegmentClose.
+bool CommitStore3A::publishUndoIndexCrossings(uint64_t appendEnd, const std::vector<uint64_t>* recEnds, ChainError* e){
+    if (recEnds == NULL) return publishUndoIndexOnSegmentClose(appendEnd, e);
+    const size_t S = (ixSegmentSize_ ? ixSegmentSize_ : UNDOINDEX_DEFAULT_SEGMENT_SIZE);
+    uint64_t segStart = undoSegments_.empty() ? 0 : undoSegments_.back().endOffset;
+    std::vector<UndoSegment> fresh;
+    for (size_t i = 0; i < recEnds->size(); ++i){
+        const uint64_t recNo = undoRecordCount_ + i + 1;
+        if (recNo % S != 0) continue;
+        UndoSegment ns; ns.startOffset = segStart; ns.endOffset = (*recEnds)[i];
+        ns.recordCount = (uint32_t)S; ns.crc32 = 0;
+        fresh.push_back(ns); segStart = ns.endOffset;
+    }
+    if (fresh.empty()) return true;
+    UndoIndex ix; buildUndoIndexFromSegments(&ix);
+    for (size_t i = 0; i < fresh.size(); ++i) ix.segments.push_back(fresh[i]);
+    ix.committedBytes = fresh.back().endOffset;
+    if (!publishUndoIndex(ix, e)) return false;                 // nothing is pushed until it lands
+    for (size_t i = 0; i < fresh.size(); ++i)
+        undoSegments_.push_back(CommittedSegment{fresh[i].startOffset, fresh[i].endOffset});
+    return true;
+}
+
 bool CommitStore3A::publishUndoIndexOnSegmentClose(uint64_t appendEndOffset, ChainError* e){
     const size_t S = (ixSegmentSize_ ? ixSegmentSize_ : UNDOINDEX_DEFAULT_SEGMENT_SIZE);
     if (undoRecordCount_+1 == 0 || (undoRecordCount_ + 1) % S != 0) return true;   // no boundary crossed
@@ -946,7 +972,8 @@ bool CommitStore3A::openWithOptions(const std::string& dir, const OpenOptions& o
     opened_=true; return true;
 }
 
-bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e){
+bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e,
+                                   const std::vector<uint64_t>* recEnds){
     renamePassed_=false; freshOneShotTaken_=false;
     // 1) durable tree pages
     if(inj(InjectStage::PageWrite)){ injErr(e,"tree fsync"); return false; }
@@ -1019,7 +1046,7 @@ bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const
     //     manifest when a crash intervenes. It is derived metadata: nothing here is authoritative,
     //     the manifest rename + dir fsync below (step 5/6) also make this rename durable, and a
     //     failure fails the commit exactly like every other barrier (no partial authority).
-    if (undoAppendLen > 0 && !publishUndoIndexOnSegmentClose(undoOffset + undoAppendLen, e)) return false;
+    if (undoAppendLen > 0 && !publishUndoIndexCrossings(undoOffset + undoAppendLen, recEnds, e)) return false;
     // 4) manifest tmp
     std::vector<uint8_t> mb=m.encode();
     if(!csWriteFile(p("MANIFEST.tmp"),mb.data(),mb.size(),ns(InjectStage::ManifestTmp),ff(InjectStage::ManifestTmp),e)) return false;
@@ -1096,6 +1123,110 @@ bool CommitStore3A::publish(const Delta& d, const Hash& blockHash, int32_t heigh
     generation_=newGen; undoCommittedBytes_=newUndoSize; recentPush(meta); undoRecordCount_++;
     ackGen_=newGen; ackPresent_=true; blockHash_=blockHash; tipHeight_=height;
     tree_.retireMovedToFree();   // S1.7-G: acked generation -> its CoW-retired pages become reusable
+    return true;
+}
+
+// S2.1 -- MULTI-BLOCK PUBLISH. One set of barriers for N consecutive blocks.
+//
+// Why this is equivalent to N sequential publish() calls, and where it is not:
+//   * the CoW page writes are IDENTICAL (each delta's puts/erases land in freshly appended or reused
+//     pages, exactly as publish() would write them), so reads issued BETWEEN the deltas in a batch see
+//     the same state a per-block commit would expose -- the caller can keep validating block N+1 against
+//     the coins block N created;
+//   * one undo record per block is appended, in order, so undo/disconnect and the derived undo index keep
+//     operating per block, and undo sizes stay per-block;
+//   * the MANIFEST is published ONCE at the end, describing the batch's LAST block. The batch is therefore
+//     atomic: either every delta in it is committed or none is, and a failure restores the pre-batch root.
+// The resulting crash contract is the one the caller must honour: after a crash the committed tip is at
+// the last batch boundary, and recovery reconciles chain <-> store before serving (replay forward or undo
+// back). That is strictly weaker than per-block durability and strictly stronger than "no state at all",
+// which is why the caller only batches where a lagging store can be replayed deterministically.
+static uint64_t s21_now_ns(){ struct timespec t; clock_gettime(CLOCK_MONOTONIC,&t); return (uint64_t)t.tv_sec*1000000000ull + (uint64_t)t.tv_nsec; }
+
+bool CommitStore3A::publishBatch(const std::vector<BatchBlock>& batch, ChainError* e){
+    clearErr(e);
+    if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
+    if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen before any further mutation: "+reopenWhy_); return false; }
+    if(batch.empty()) return true;
+    // S2.1: two modes. If the caller already applied the deltas with applyBatchBlock() (the streaming
+    // path, needed so block N+1 reads the coins block N created), only the durable part runs here and
+    // the rollback target is the root captured at the start of the batch. Otherwise this call applies
+    // everything itself (one-shot mode, used by the startup replay).
+    const uint64_t ct0 = s21_now_ns();
+    const bool preApplied = batchOpen_;
+    ChainError er;
+    uint32_t oldRoot = preApplied ? batchOldRoot_ : tree_.rootId();
+    Hash oldHash     = preApplied ? batchOldHash_ : tree_.rootHash();
+    if(!preApplied) tree_.clearRetired();
+    std::vector<uint8_t> undoBuf; undoBuf.reserve(batch.size()*256);
+    std::vector<uint64_t> recEnds; recEnds.reserve(batch.size());
+    for(size_t bi=0; bi<batch.size(); ++bi){
+        const Delta& d=batch[bi].d;
+        if(!preApplied){
+            if(!applyOps(d,e)){ tree_.setRoot(oldRoot,oldHash,&er); return false; }
+        }
+        UndoRecord rec; rec.blockHash=batch[bi].blockHash; rec.height=batch[bi].height; rec.ops=d.ops;
+        std::vector<uint8_t> rb=rec.encode();
+        undoBuf.insert(undoBuf.end(), rb.begin(), rb.end());
+        recEnds.push_back(undoCommittedBytes_+undoBuf.size());
+    }
+    const BatchBlock& last=batch.back();
+    uint64_t newGen=generation_+1; uint64_t newUndoSize=undoCommittedBytes_+undoBuf.size();
+    Manifest m; m.generation=newGen; m.undoSize=newUndoSize; m.rootPageId=tree_.rootId();
+    m.rootHash=tree_.rootHash(); m.blockHash=last.blockHash; m.tipHeight=last.height;
+    if(!commitBarriers(m,undoCommittedBytes_,undoBuf.data(),undoBuf.size(),e,&recEnds)){
+        if(!renamePassed_) tree_.setRoot(oldRoot,oldHash,&er);
+        if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }
+        if(renamePassed_) requireReopen("the new MANIFEST may be visible while its durability barrier failed");
+        else if(freshOneShotTaken_) requireReopen("the fresh-open undo policy was spent by a failed first publication (a retry would write unpinned)");
+        return false;
+    }
+    pauseAt(PausePoint::BeforeAck);
+    bool ackOk=writeAck(newGen,e);
+    if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }
+    if(!ackOk){ requireReopen("the generation was published but its acknowledgment failed"); return false; }
+    uint64_t off=undoCommittedBytes_;
+    for(size_t bi=0; bi<batch.size(); ++bi){
+        UndoMeta meta; meta.blockHash=batch[bi].blockHash; meta.height=batch[bi].height;
+        meta.offset=off; meta.len=(uint32_t)(recEnds[bi]-off); off=recEnds[bi];
+        recentPush(meta); undoRecordCount_++;
+    }
+    generation_=newGen; undoCommittedBytes_=newUndoSize;
+    ackGen_=newGen; ackPresent_=true; blockHash_=last.blockHash; tipHeight_=last.height;
+    batchOpen_=false;                 // the batch is durable: the next one starts from this root
+    tree_.retireMovedToFree();
+    commitNanos_ += s21_now_ns() - ct0;
+    return true;
+}
+
+// S2.1: apply one block's delta to the CoW pages. No durability barrier, no MANIFEST, no undo record:
+// this only moves the in-memory root over freshly written pages, which is exactly what makes the NEXT
+// block's prevout reads see this block's outputs. All-or-nothing per call (the pre-batch root is kept
+// for the enclosing publishBatch()).
+bool CommitStore3A::applyBatchBlock(const Delta& d, ChainError* e){
+    const uint64_t t0 = s21_now_ns();
+    struct Guard { uint64_t* acc; uint64_t t0; ~Guard(){ *acc += s21_now_ns() - t0; } } guard{&applyNanos_, t0};
+    clearErr(e);
+    if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
+    if(needsReopen_){ setErr(e,ErrCode::NOT_OPEN,"store requires reopen before any further mutation: "+reopenWhy_); return false; }
+    if(!batchOpen_){
+        batchOldRoot_=tree_.rootId(); batchOldHash_=tree_.rootHash();
+        tree_.clearRetired(); batchOpen_=true;
+    }
+    if(!applyOps(d,e)){
+        ChainError x; tree_.setRoot(batchOldRoot_,batchOldHash_,&x); batchOpen_=false;
+        return false;
+    }
+    return true;
+}
+
+bool CommitStore3A::applyOps(const Delta& d, ChainError* e){
+    for(size_t oi=0; oi<d.ops.size(); ++oi){
+        const Op& op=d.ops[oi];
+        Key k=op.op.keyBytes();
+        if(op.afterPresent){ std::vector<uint8_t> v=op.after.encode(); if(!tree_.put(k,v,e)) return false; }
+        else { if(!tree_.erase(k,e)) return false; }
+    }
     return true;
 }
 
