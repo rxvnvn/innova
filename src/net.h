@@ -1505,6 +1505,20 @@ public:
     // the IbdPeerDeliveryQuality / IbdPeerQualityTier documentation above.
     IbdPeerDeliveryQuality ibdQuality;
 
+    // Null-block serve-broken flag (p2p-nullblock-guard).  Set when this peer
+    // answered a getdata with a default-constructed (null) CBlock — the
+    // signature of a sender whose own disk read failed.  A null block carries
+    // NO request identifier, so no clean per-hash release is possible; the
+    // peer is demoted from block-service preference by an explicit ranking
+    // penalty for a bounded window instead of a Misbehaving score (this is a
+    // server-side fault, never misbehaviour).  Ranking-only: connection stays
+    // open, and honest recovery (fresh reads) wins the score back naturally --
+    // receive-side deliveries clear this penalty.
+    std::atomic<bool> fServeBrokenBlocks{false};
+    std::atomic<int64_t> nServeBrokenUntilUs{0};
+    std::atomic<int64_t> nServeBrokenWindowUs{120000000};
+    static const int64_t SERVE_BROKEN_RANKING_PENALTY = 1LL << 40;
+
     // Ping time measurement:
     // The pong reply we're expecting, or 0 if no pong expected.
     uint64_t nPingNonceSent;
@@ -1869,6 +1883,29 @@ public:
             (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK))
             ReleaseBlockRequestOwner(inv.hash, GetId(),
                                      pszOwnerReleaseReason);
+    }
+
+    // Null-block guard (receive side): remove every queued ask entry for a
+    // hash, releasing its owner slot with the given reason (used when a peer
+    // answers a request with the identifiable null-block shape, which is
+    // treated like a notfound).  Mirrors EraseAskForEntry's bookkeeping.
+    void EraseAskForEntryByHash(const uint256& hashBlock,
+                                const char* pszOwnerReleaseReason)
+    {
+        LOCK(cs_mapAlreadyAskedFor);
+        std::vector<std::multimap<int64_t, CInv>::iterator> vErase;
+        for (std::multimap<int64_t, CInv>::iterator it = mapAskFor.begin();
+             it != mapAskFor.end(); ++it)
+        {
+            if ((it->second.type == MSG_BLOCK ||
+                 it->second.type == MSG_FILTERED_BLOCK) &&
+                it->second.hash == hashBlock)
+                vErase.push_back(it);
+        }
+        for (size_t i = 0; i < vErase.size(); ++i)
+            EraseAskForEntry(vErase[i], true,
+                             ibdmetrics::ACTIVE_DECREMENT_OTHER,
+                             pszOwnerReleaseReason);
     }
 
     void ClearAskFor()
@@ -2804,6 +2841,37 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
         snap.releases_by_receive =
             ibdQuality.releases_by_receive.load(std::memory_order_relaxed);
         return snap;
+    }
+    // ------------------------------------------------------------------
+    // Null-block serve-broken tracking (p2p-nullblock-guard).
+    // ------------------------------------------------------------------
+    // Flag the peer as currently unable to serve block data (its getdata
+    // answer was a null CBlock).  Ranking-only: no Misbehaving score, no
+    // disconnect.  Bounded window, refreshed by repeat offences.
+    void MarkServeBrokenBlocksWindows(int64_t nNowUs = GetTimeMicros())
+    {
+        nServeBrokenUntilUs.store(nNowUs + nServeBrokenWindowUs.load(
+                                      std::memory_order_relaxed),
+                                  std::memory_order_relaxed);
+        fServeBrokenBlocks.store(true, std::memory_order_relaxed);
+    }
+    // Clear the flag early: a healthy (non-null) block delivery proves the
+    // peer's disk reads work again, ending the prefer-not-serve demotion.
+    void NoteServeBrokenRecovery(int64_t nNowUs = GetTimeMicros())
+    {
+        if (fServeBrokenBlocks.load(std::memory_order_relaxed) &&
+            nNowUs < nServeBrokenUntilUs.load(std::memory_order_relaxed))
+        {
+            fServeBrokenBlocks.store(false, std::memory_order_relaxed);
+            nServeBrokenUntilUs.store(0, std::memory_order_relaxed);
+        }
+    }
+    // A peer past its broken window is simply not currently broken (each new
+    // offence re-arms the window; persistence is per-connection state).
+    bool IsServeBrokenBlocks(int64_t nNowUs = GetTimeMicros()) const
+    {
+        return fServeBrokenBlocks.load(std::memory_order_relaxed) &&
+               nNowUs < nServeBrokenUntilUs.load(std::memory_order_relaxed);
     }
     // Deterministic decayed-score step: each completed outcome halves the
     // influence of every earlier outcome roughly every ~11 events, giving a

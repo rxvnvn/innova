@@ -671,7 +671,7 @@ check-txloc: txloc_tests
 # links against the node objects plus a CTxDB-free global fixture
 # (test/allowlist_guard_fixture.cpp).
 ALLOWLIST_TEST_OBJS = $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/test/allowlist_guard_fixture.o obj/test/p2p_sync_tests.o
-proto_allowlist_tests: obj/build.h $(ALLOWLIST_TEST_OBJS)
+proto_allowlist_tests: obj/build.h $(ALLOWLIST_TEST_OBJS) $(LVLLIBS)
 	$(LINK) $(xCXXFLAGS) -o $@ $(ALLOWLIST_TEST_OBJS) $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
 check-proto-allowlist: proto_allowlist_tests
 	./proto_allowlist_tests --run_test=p2p_sync_tests/peer_protocol_allowlist_table
@@ -680,6 +680,19 @@ check-proto-allowlist: proto_allowlist_tests
 	./proto_allowlist_tests --run_test=p2p_sync_tests/outbound_verack_gate_blocks_peer_50000
 	./proto_allowlist_tests --run_test=p2p_sync_tests/outbound_verack_gate_allows_50505
 	./proto_allowlist_tests --run_test=p2p_sync_tests/two_own_nodes_handshake_50505_both_ways
+
+# p2p-nullblock-guard: standalone runner for the p2p_sync null-block guard
+# regression cases.  test_innova is unbuildable on this tip (test_innova.cpp
+# and several legacy suites still reference the CTxDB retired in e0ee4121 --
+# pre-existing breakage, not fixed here), so the suite links against the node
+# objects plus a CTxDB-free global fixture (test/nullblock_guard_fixture.cpp).
+NULLBLOCK_TEST_OBJS = $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/test/nullblock_guard_fixture.o obj/test/p2p_sync_tests.o
+nullblock_guard_tests: obj/build.h $(NULLBLOCK_TEST_OBJS) $(LVLLIBS)
+	$(LINK) $(xCXXFLAGS) -o $@ $(NULLBLOCK_TEST_OBJS) $(xLDFLAGS) $(LIBS) -lboost_unit_test_framework
+check-nullblock-guard: nullblock_guard_tests
+	./nullblock_guard_tests --run_test=p2p_sync_tests/nullblock_answer_does_not_penalize_peer
+	./nullblock_guard_tests --run_test=p2p_sync_tests/nonnull_malformed_block_still_penalized
+	./nullblock_guard_tests --run_test=p2p_sync_tests/serve_never_pushes_null_block_shape
 
 check-ibdforensic: test_innova
 	./test_innova --run_test=ibdforensic_tests
@@ -703,12 +716,13 @@ release-check: innova-build
 #
 ifeq (${USE_LEVELDB}, 1)
 LIBS += $(CURDIR)/leveldb/libleveldb.a $(CURDIR)/leveldb/libmemenv.a
+LVLLIBS = leveldb/libleveldb.a
 DEFS += $(addprefix -I,$(CURDIR)/leveldb/include) $(addprefix -I,$(CURDIR)/leveldb) -DUSE_LEVELDB
 DEFS += $(addprefix -I,$(CURDIR)/leveldb/helpers)
 leveldb/libleveldb.a:
 	@echo "Building LevelDB ..."; cd leveldb; CC=$(CC) CXX=$(CXX) make libleveldb.a libmemenv.a; cd ..;
-endif
-ifneq (${USE_LEVELDB}, 1)
+else
+LVLLIBS =
 endif
 
 # auto-generated dependencies:
@@ -807,7 +821,7 @@ obj/%.o: %.cc
 	sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
 	-e '/^$$/ d' -e 's/$$/ :/' < $(@:%.o=%.d) >> $(@:%.o=%.P); \
 	rm -f $(@:%.o=%.d)
-innovad: $(OBJS:obj/%=obj/%)
+innovad: $(OBJS:obj/%=obj/%) $(LVLLIBS)
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
 innova-blockindex-builder: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_generation_builder_tool.o
@@ -821,7 +835,7 @@ innova-blockindex-builder-lm: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/b
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
 # Item 1 slice 2: bulk TX-LOC construction from BI-V2 + blk*.dat (no legacy, no IBD).
-innova-txloc-build: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/txloc_build_tool.o
+innova-txloc-build: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/txloc_build_tool.o $(LVLLIBS)
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
 innova-lm-verify: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/lm_verify_tool.o
@@ -829,7 +843,7 @@ innova-lm-verify: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/lm_verify_too
 
 # undo-history-replay: full historical undo reconstruction by genesis -> tip
 # delta replay through the real CommitStore3A batch path.
-innova-undo-replay: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/undo_replay_tool.o
+innova-undo-replay: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/undo_replay_tool.o $(LVLLIBS)
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
 innova-lm-fixture: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/lm_fixture_tool.o

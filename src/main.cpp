@@ -10829,6 +10829,9 @@ int GetDataBlockBudget() { return nGetDataBlockBudget; }
 // Lightweight diagnostic counters (single-writer: msghand thread only).
 // DataBlockBudgetCounters struct is declared in net.h.
 static uint64_t gDbCalls = 0, gDbBlockServed = 0, gDbBudgetHit = 0;
+// Null-block guard (send side): count of getdata items we answered with
+// notfound because the local disk read failed (never a null block).
+static uint64_t gBlocksServeReadFailed = 0;
 static uint64_t gDbSendBufferBreak = 0, gDbQueueRemaining = 0, gDbMaxServedPerCall = 0;
 
 DataBlockBudgetCounters GetDataBlockBudgetCounters()
@@ -10899,7 +10902,21 @@ void static ProcessGetData(CNode* pfrom)
                         GetTimeMicros());
                     send = true;
                     CBlock block;
-                    block.ReadFromDisk((*mi).second);
+                    if (!block.ReadFromDisk((*mi).second))
+                    {
+                        // Null-block guard (send-side mirror): a failed disk
+                        // read must never push a default-constructed (null)
+                        // CBlock onto the wire; peers treat that shape as a
+                        // malformed block and ban us.  Answer with notfound
+                        // so the requester can retry with another peer.
+                        printf("BLOCK_SERVE_NULL_SELF inv=%s reason=read-failed\n",
+                               inv.hash.ToString().c_str());
+                        vNotFound.push_back(inv);
+                        send = false;
+                        ++gBlocksServeReadFailed;
+                        // `it` was already advanced past this inv above.
+                        continue;
+                    }
                     if (inv.type == MSG_FILTERED_BLOCK)
                     {
                         LOCK(pfrom->cs_filter);
@@ -11620,6 +11637,15 @@ void LogEnforcedUABanFilterCount()
            (unsigned)banned.size(), banned.size() == 1 ? "y" : "ies");
 }
 
+// Null-block guard (receive side): strict identifier of the default-constructed
+// CBlock wire shape a peer ships when its own disk read fails
+// (hashPrevBlock==0 and no transactions).  Deliberately strict so any other
+// malformed block keeps the ordinary CheckBlock/DoS treatment.
+bool IsBlockWireNullShape(const CBlock& block)
+{
+    return block.hashPrevBlock == 0 && block.vtx.empty();
+}
+
 bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, int64_t nTimeReceived)
 {
     // C5: minimum seconds between getblocks "CONTINUE" refills on the IBD block-download
@@ -11639,9 +11665,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
     {
         printf("dropmessagestest DROPPING RECV MESSAGE\n");
         return true;
-    }
-
-    if (strCommand == "version")
+    }    if (strCommand == "version")
     {
         // Each connection can only send one version message
         if (pfrom->nVersion != 0)
@@ -13146,6 +13170,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                     std::max<int64_t>(0, GetTime() - miInFlight->second);
         }
         pfrom->ClearBlockInFlight(hashBlock);
+        // A real (non-null) block delivery proves the peer's own disk reads
+        // work again: clear the null-block serve-broken demotion early.
+        pfrom->NoteServeBrokenRecovery();
         ibdforensic::RecordReceived(
             pfrom->GetId(), hashBlock, GetTimeMicros(),
             nTimeReceived);
@@ -13228,6 +13255,76 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
         ibdmetrics::Get().block_receive_total.fetch_add(
             1, std::memory_order_relaxed);
+
+        // Null-block guard (receive side).  A peer whose own disk read fails
+        // ships a default-constructed CBlock (hashPrevBlock==0, vtx empty;
+        // see the send-side ReadFromDisk bug this mirrors).  The shape is
+        // identifiable and carries no consensus data: punishing it bans
+        // innocent peers on a server-side fault.  Any OTHER invalid block
+        // keeps today's DoS/ban behaviour below.
+        if (IsBlockWireNullShape(block))
+        {
+            // NULL-BLOCK IDENTITY PRINCIPLE: a null CBlock carries NO request
+            // identifier on the wire.  hashBlock is the cryptographic hash of
+            // the EMPTY serialization, so it can never name the block we asked
+            // for, and the message has no fields the sender could have set
+            // from our getdata.  Guessing which outstanding ask this response
+            // "answers" is inference, not attribution; over-inference risks
+            // cancelling the wrong download.  The only state we hold for THIS
+            // peer that is provably connected to the event is "this peer was
+            // asked for blocks": so treat the response exactly like the
+            // disconnect cleanup — release ALL of the sender's outstanding
+            // block-request bookkeeping (askfor queue, in-flight set, owner
+            // slots, global anti-duplicate entries), flag the peer as
+            // unable-to-serve for block fetches (never touching Misbehaving),
+            // and let the bounded re-dispatch machinery (inflight expiry,
+            // scheduler retry/backoff) hand the hashes to another peer.  The
+            // connection stays open; the peer keeps the live chance to
+            // recover once its ServeBrokenBlocksWindows decay.
+            {
+                LOCK(cs_vNodes);
+                // Snapshot the in-flight set FIRST: ClearBlockInFlight() below
+                // erases from setBlocksInFlight, so iterating it while
+                // releasing would invalidate the loop iterator (live crash).
+                std::vector<uint256> vInFlightSnapshot;
+                vInFlightSnapshot.reserve(pfrom->setBlocksInFlight.size());
+                for (std::set<uint256>::const_iterator itInFlight =
+                         pfrom->setBlocksInFlight.begin();
+                     itInFlight != pfrom->setBlocksInFlight.end();
+                     ++itInFlight)
+                    vInFlightSnapshot.push_back(*itInFlight);
+                std::vector<uint256> vReleased;
+                for (std::vector<uint256>::const_iterator itSnap =
+                         vInFlightSnapshot.begin();
+                     itSnap != vInFlightSnapshot.end(); ++itSnap)
+                {
+                    const uint256 hashOutstanding = *itSnap;
+                    CInv invOutstanding(MSG_BLOCK, hashOutstanding);
+                    pfrom->EraseAskForEntryByHash(hashOutstanding,
+                                                  "null-shape");
+                    pfrom->ClearBlockInFlight(hashOutstanding);
+                    ReleaseBlockRequestOwner(hashOutstanding,
+                                             pfrom->GetId(), "notfound");
+                    EraseAlreadyAskedForIfUnowned(invOutstanding);
+                    vReleased.push_back(hashOutstanding);
+                }
+                const size_t nReleased = vReleased.size();
+                for (size_t i = 0; i < nReleased; ++i)
+                    printf("BLOCK_SERVE_NULL_RELEASE peer=%d req=%s wire=%s\n",
+                           pfrom->GetId(),
+                           vReleased[i].ToString().c_str(),
+                           hashBlock.ToString().c_str());
+                printf("BLOCK_SERVE_NULL peer=%d released=%zu wire=%s reason=peer-could-not-read identity=none\n",
+                       pfrom->GetId(), nReleased, hashBlock.ToString().c_str());
+                if (nReleased != 0)
+                    pfrom->MarkServeBrokenBlocksWindows();
+                if (fTraceBlockRequest)
+                    BlockRequestTraceBlockResult(
+                        pfrom, hashBlock, BLOCKREQ_RESULT_NULL_SHAPE,
+                        false, fKnownBefore, false, false, -1);
+            }
+            return true;
+        }
 
         // A.9a.3h: a staking fetch may target an active cold source whose
         // historical parent/index is intentionally non-resident. Validate and

@@ -1,1 +1,12 @@
 obj/
+innova-txloc-build
+innova-undo-replay
+innova-lm-fixture
+innova-lm-verify
+innovad
+innova-store3a-conv
+store3a_tests
+txloc_tests
+proto_allowlist_tests
+nullblock_guard_tests
+test_innova
