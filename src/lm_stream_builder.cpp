@@ -358,6 +358,12 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
                 delete it; fclose(pf); delete db;
                 return SetError(error, "lm: duplicate block hash in source");
             }
+            if (count < 3)
+            {
+                fprintf(stderr, "lm: scan_key[%llu]=", (unsigned long long)count);
+                const std::string khex = rec.hash.GetHex();
+                fprintf(stderr, "%s\n", khex.c_str());
+            }
             memcpy(prevHash, rec.hash.begin(), 32); havePrev = true;
             ++count; ++dupChecked;
             it->Next();
@@ -368,6 +374,11 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
         fclose(pf);
     }
     delete db;
+    // Commit the buffered record appends BEFORE the derived pass reads
+    // records.dat directly (the writer batches at 65536 entries; below that
+    // the records only reach disk here).
+    if (!writer_.Flush(error))
+        return false;
     LmDiagRss("M1_pass_done");
 
     // ============ M2a: hash-sorted ancestry index (proj-sorted.bin) ========
@@ -648,6 +659,8 @@ bool BlockIndexGenerationBuilderLM::Build(const std::string& snapshotLevelDbDir,
             if (!BinSearchFixed(sfSorted, projN, HASHPROJ_SIZE,
                                 (const unsigned char*)cur.begin(), &hp))
             {
+                fprintf(stderr, "lm: walk missing hash=%s (projN=%lld)\n",
+                        cur.GetHex().c_str(), (long long)projN);
                 fclose(af); fclose(sfSorted);
                 return SetError(error, "lm: active chain hash missing from index");
             }

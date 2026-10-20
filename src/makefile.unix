@@ -803,6 +803,12 @@ innova-store3a-conv: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/migrate_le
 innova-blockindex-builder-lm: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_generation_builder_lm_tool.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
+innova-lm-verify: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/lm_verify_tool.o
+	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
+
+innova-lm-fixture: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/lm_fixture_tool.o
+	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
+
 blockindex-catchup-tool: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_catchup_tool_cli.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
