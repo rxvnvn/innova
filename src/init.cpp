@@ -1495,23 +1495,39 @@ bool AppInit2()
         //     reading any legacy store (blockindex_native_bootstrap.cpp EMPTY_NEW
         //     path is legacy-free), so it is safe and is the P2 target scenario
         //     (empty datadir -> genesis-to-tip IBD).
-        // Everything else refuses startup. Non-V2 startup is unaffected.
+        // Everything else refuses startup — EXCEPT LEGACY_MIGRATION_REQUIRED with
+        // the explicit operator opt-in -blockindexv2migrate=1: then the EXISTING
+        // migration substrate (PrepareNativeBlockIndexGeneration ->
+        // SnapshotLegacyBlockIndexDb + BlockIndexGenerationBuilderLM -> publish ->
+        // select) runs below, and the ownership state is RE-CLASSIFIED: startup
+        // requires V2_AUTHORITATIVE after the migration. Default remains
+        // fail-closed byte-for-byte (today's behaviour).
+        const bool fOptInMigration = GetBoolArg("-blockindexv2migrate", false);
+        printf("BLOCK_INDEX_STARTUP_MIGRATE_OPTIN flag=%d state=%s\n",
+               fOptInMigration ? 1 : 0,
+               BlockIndexStartupOwnershipStateName(own.state));
         if (own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE &&
-            own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW)
+            own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW &&
+            !(own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED && fOptInMigration))
             return InitError(strprintf(
                 "Store3A V2 authoritative FAIL-CLOSED: Block Index V2 ownership is %s, not "
                 "V2_AUTHORITATIVE or EMPTY_NEW. In V2 store mode (-s16openstore) the block index "
                 "must already exist as an authoritative Block Index V2, or the datadir must be "
                 "clean so the native genesis bootstrap builds the first generation (no legacy "
                 "migration/import permitted in V2). The legacy txindex must not be migrated or "
-                "replayed at startup. No legacy fallback.",
+                "replayed at startup. For an EXISTING legacy datadir run ONCE with "
+                "-blockindexv2migrate=1 (and -blockindexmigratesrc=<abs path> if the legacy "
+                "LevelDB is not at <datadir>/txleveldb). The migration is a one-shot operator "
+                "action: after it completes, restart WITHOUT the flag and the node runs on "
+                "Block Index V2 only. No legacy fallback.",
                 BlockIndexStartupOwnershipStateName(own.state)));
 
         if (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW ||
-            own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED)
+            (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED && fOptInMigration))
         {
             std::string prepErr;
-            if (PrepareNativeBlockIndexGeneration(v2Root, GetDataDir().string(), own.state, &prepErr)
+            if (PrepareNativeBlockIndexGeneration(v2Root, GetDataDir().string(), own.state, &prepErr,
+                                                  GetArg("-blockindexmigratesrc", ""))
                 != BLOCK_INDEX_NATIVE_PREPARE_OK)
                 return InitError(strprintf("Block index V2 native bootstrap failed (%s): %s",
                                            BlockIndexStartupOwnershipStateName(own.state), prepErr.c_str()));
@@ -1522,6 +1538,27 @@ bool AppInit2()
         {
             return InitError(strprintf("Block index startup ownership state %s is fatal; refusing startup (no legacy fallback)",
                                        BlockIndexStartupOwnershipStateName(own.state)));
+        }
+        // For the migration path: RE-CLASSIFY and REQUIRE V2_AUTHORITATIVE.
+        if (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED)
+        {
+            BlockIndexStartupOwnershipDecision own2;
+            std::string own2Err;
+            if (!ClassifyBlockIndexStartupOwnership(v2Root, GetDataDir().string(), &own2, &own2Err))
+                return InitError(strprintf("Block index post-migration classification failed: %s", own2Err.c_str()));
+            printf("BLOCK_INDEX_STARTUP_MIGRATION_RESULT pre_migration=%s post_migration=%s "
+                   "unpublished=%d v2Current=%d generation=%llu detail=%s\n",
+                   BlockIndexStartupOwnershipStateName(own.state),
+                   BlockIndexStartupOwnershipStateName(own2.state),
+                   own2.unpublishedArtifacts ? 1 : 0, (int)own2.v2CurrentStatus,
+                   (unsigned long long)own2.v2Generation, own2.detail.c_str());
+            if (own2.state != BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE)
+                return InitError(strprintf(
+                    "Block index V2 migration did not reach V2_AUTHORITATIVE (post-migration state is %s: %s). Failing closed: no legacy fallback.",
+                    BlockIndexStartupOwnershipStateName(own2.state), own2.detail.c_str()));
+            printf("BLOCK_INDEX_STARTUP_MIGRATION_OK legacy -> V2_AUTHORITATIVE (gen=%llu)\n",
+                   (unsigned long long)own2.v2Generation);
+            v2NativeStoreStartup = true; // migration result is a native V2 startup
         }
 
         std::string authErr;

@@ -9,6 +9,7 @@
 #include "fixed_blockindex_store.h"
 
 #include "main.h"
+#include "util.h"
 #include "kernel.h"
 // GetGlobalTxdbPtrForTest is a test/ops accessor defined in txdb-leveldb.cpp
 // (declared extern at its other call sites, not in a public header).
@@ -59,19 +60,81 @@ uint64_t NextGenerationId(const std::string& root)
 
 bool SnapshotLegacyBlockIndexDb(const std::string& dataDir,
                                 const std::string& snapshotDir,
-                                std::string* error)
+                                std::string* error,
+                                const std::string& sourceOverride,
+                                bool allowInPlace,
+                                std::string* effectiveSource)
 {
     if (dataDir.empty() || snapshotDir.empty())
         return SetError(error, "snapshot: empty dataDir/snapshotDir");
+
+    boost::system::error_code ec;
 
     // CTxDB demolition: the process-global legacy LevelDB no longer exists in
     // this binary, so there is no writer that could tear the snapshot.  The
     // legacy directory is only read here as a migration source.
 
-    fs::path src = fs::path(dataDir) / "txleveldb";
-    boost::system::error_code ec;
-    if (!fs::is_directory(src, ec) || ec)
+    // S16: default source stays <datadir>/txleveldb (existing fixtures/tests);
+    // an explicit non-empty sourceOverride migrates from an arbitrary absolute
+    // path instead (e.g. a quarantined legacy LevelDB moved one level deeper:
+    // <datadir>/txleveldb/legacy-txleveldb.quarantine-* with the REAL store,
+    // while the datadir's own txleveldb is a fresh near-empty replacement).
+    // Validate the override strictly: absolute path, existing directory with
+    // CURRENT + MANIFEST-* (a real, non-empty LevelDB).
+    fs::path src;
+    if (!sourceOverride.empty())
+    {
+        fs::path given(sourceOverride);
+        if (given.empty() || !given.is_absolute())
+            return SetError(error, "snapshot: -blockindexmigratesrc must be an ABSOLUTE path to the legacy LevelDB directory");
+        if (!fs::is_directory(given, ec) || ec)
+            return SetError(error, "snapshot: -blockindexmigratesrc is not an existing directory: " + sourceOverride);
+        if (!fs::exists(given / "CURRENT", ec) || ec)
+            return SetError(error, "snapshot: -blockindexmigratesrc has no CURRENT: not a legacy LevelDB: " + sourceOverride);
+        bool haveManifest = false;
+        for (fs::directory_iterator it(given, ec), end; !ec && it != end; it.increment(ec))
+        {
+            const std::string name = it->path().filename().string();
+            if (name.compare(0, 9, "MANIFEST-") == 0)
+            {
+                haveManifest = true;
+                break;
+            }
+        }
+        if (!haveManifest)
+            return SetError(error, "snapshot: -blockindexmigratesrc has no MANIFEST-*: not a legacy LevelDB: " + sourceOverride);
+        src = given;
+    }
+    else
+    {
+        src = fs::path(dataDir) / "txleveldb";
+    }
+    boost::system::error_code ec2;
+    if (!fs::is_directory(src, ec2) || ec2)
         return SetError(error, "snapshot: legacy txleveldb directory absent");
+
+    // S16: in-place migration source. When the operator explicitly passes
+    // -blockindexmigrateinplace=1 the (quiescent, already quarantined) legacy
+    // LevelDB is read directly instead of being copied to
+    // <v2Root>/blockindex-migsrc.tmp. A 3.2 GB copy is a hard ENOSPC risk on a
+    // small VPS; correctness is unchanged because the builder opens the source
+    // strictly read-only (bounded cache) and no other process may write it.
+    if (allowInPlace)
+    {
+        if (effectiveSource)
+            *effectiveSource = src.string();
+        uint64_t bytes = 0;
+        int files = 0;
+        for (fs::directory_iterator it(src, ec2), end; !ec2 && it != end; it.increment(ec2))
+            if (fs::is_regular_file(it->path()))
+            {
+                bytes += (uint64_t)fs::file_size(it->path());
+                files++;
+            }
+        printf("BLOCK_INDEX_MIGRATION_SNAPSHOT_INPLACE source=%s files=%d bytes=%llu (no copy; source must be quiescent)\n",
+               src.string().c_str(), files, (unsigned long long)bytes);
+        return true;
+    }
 
     fs::path dst(snapshotDir);
     try
@@ -189,7 +252,8 @@ BlockIndexNativePrepareStatus PrepareNativeBlockIndexGeneration(
     const std::string& v2Root,
     const std::string& dataDir,
     BlockIndexStartupOwnershipState state,
-    std::string* error)
+    std::string* error,
+    const std::string& migrateSource)
 {
     if (v2Root.empty() || dataDir.empty())
     {
@@ -199,6 +263,27 @@ BlockIndexNativePrepareStatus PrepareNativeBlockIndexGeneration(
 
     boost::system::error_code ec;
     fs::create_directories(v2Root, ec);
+
+    // S16 RESUMABILITY: a previous migration attempt killed mid-build can leave
+    // a stale build-*.tmp staging dir (never published -> never authoritative).
+    // Remove ONLY those staging dirs so the LM builder's OpenTarget (which
+    // requires an absent/non-stale staging path) always starts clean. Stable
+    // gen-N dirs are never touched (PublishGeneration refuses existing gen) and
+    // CURRENT is never present in this state anyway (ownership classifier only
+    // routes here when CURRENT is absent).
+    if (state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED)
+    {
+        for (fs::directory_iterator it(fs::path(v2Root), ec), end; !ec && it != end; it.increment(ec))
+        {
+            const std::string name = it->path().filename().string();
+            if (name.compare(0, 6, "build-") == 0 &&
+                name.size() > 4 && name.compare(name.size() - 4, 4, ".tmp") == 0)
+            {
+                printf("BLOCK_INDEX_MIGRATION_CLEANUP removing stale staging %s\n", it->path().string().c_str());
+                fs::remove_all(it->path(), ec);
+            }
+        }
+    }
 
     const uint64_t gen = NextGenerationId(v2Root);
     const std::string staging = BlockIndexGenerationManager::StagingPath(v2Root, gen);
@@ -211,6 +296,10 @@ BlockIndexNativePrepareStatus PrepareNativeBlockIndexGeneration(
     // record (and ~10 O(N) work maps) in RAM. Genesis (EMPTY_NEW) keeps the
     // direct in-memory source: it is a single canonical record.
     bool streamFromSnapshot = false;
+    // S16: when -blockindexmigrateinplace=1 is set the legacy LevelDB is read in
+    // place (no multi-GB copy). readDir then points at the live source instead of
+    // the throwaway snapshot directory.
+    std::string inPlaceSrc;
 
     if (state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW)
     {
@@ -219,10 +308,28 @@ BlockIndexNativePrepareStatus PrepareNativeBlockIndexGeneration(
     }
     else if (state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED)
     {
-        if (!SnapshotLegacyBlockIndexDb(dataDir, snapDir, error))
+        const bool inPlace = GetBoolArg("-blockindexmigrateinplace", false);
+        if (!SnapshotLegacyBlockIndexDb(dataDir, snapDir, error, migrateSource, inPlace, &inPlaceSrc))
             return BLOCK_INDEX_NATIVE_PREPARE_FAILED;
-        haveSnap = true;
+        // Never delete an in-place source: it IS the operator's legacy backup.
+        haveSnap = !inPlace;
         streamFromSnapshot = true;
+        // S16: report migration scale so the operator sees what was migrated.
+        {
+            uint64_t snapBytes = 0;
+            int snapFiles = 0;
+            const std::string viewDir = inPlaceSrc.empty() ? snapDir : inPlaceSrc;
+            for (fs::recursive_directory_iterator sit(fs::path(viewDir), ec), send; sit != send; sit.increment(ec))
+                if (fs::is_regular_file(sit->path()))
+                {
+                    snapBytes += (uint64_t)fs::file_size(sit->path());
+                    snapFiles++;
+                }
+            printf("BLOCK_INDEX_MIGRATION_SNAPSHOT source=%s files=%d bytes=%llu\n",
+                   migrateSource.empty() ? (fs::path(dataDir) / "txleveldb").string().c_str()
+                                         : migrateSource.c_str(),
+                   snapFiles, (unsigned long long)snapBytes);
+        }
     }
     else
     {
@@ -244,7 +351,8 @@ BlockIndexNativePrepareStatus PrepareNativeBlockIndexGeneration(
             // block size) is read from the live blk*.dat files, read-only, via
             // blockDataDir. It fails closed if any record lacks an exact nSize.
             BlockIndexGenerationBuilderLM lm;
-            ok = lm.Build(snapDir, dataDir, gen, staging, error);
+            const std::string readDir = inPlaceSrc.empty() ? snapDir : inPlaceSrc;
+            ok = lm.Build(readDir, dataDir, gen, staging, error);
         }
         else
         {
