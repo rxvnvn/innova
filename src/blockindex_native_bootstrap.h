@@ -27,13 +27,20 @@
 struct BlockIndexGenerationSource;
 
 // C2-C: snapshot the migration source. Copies ONLY <dataDir>/txleveldb into
-// snapshotDir (no blk*.dat, wallet.dat, peers.dat or any other datadir content).
+// snapshotDir (no blk*.dat, wallet.dat, peers.dat or any other datadir content)
+// by default; when sourceOverride (== -blockindexmigratesrc) is non-empty, copies
+// that ABSOLUTE directory instead after validating it as a real LevelDB
+// (CURRENT + MANIFEST-* present). This supports the quarantined/nested legacy
+// store layout (<datadir>/txleveldb/legacy-txleveldb.quarantine-*).
 // The source must be quiescent: this fails closed when the process-global legacy
 // LevelDB handle is open (a copy taken under an open handle is not guaranteed
 // consistent). Returns false + error otherwise.
 bool SnapshotLegacyBlockIndexDb(const std::string& dataDir,
                                 const std::string& snapshotDir,
-                                std::string* error);
+                                std::string* error,
+                                const std::string& sourceOverride = std::string(),
+                                bool allowInPlace = false,
+                                std::string* effectiveSource = NULL);
 
 // C2-A: build the MINIMUM canonical EMPTY_NEW genesis source using the SINGLE
 // shared genesis primitive (CreateBlockIndexGenesisBlock) plus its REAL on-disk
@@ -57,11 +64,15 @@ enum BlockIndexNativePrepareStatus
 // before SelectGeneration leaves no authority transfer (CURRENT is the Rubicon).
 //   EMPTY_NEW                 -> canonical genesis source
 //   LEGACY_MIGRATION_REQUIRED -> bounded txleveldb migration source
+//                                (default <datadir>/txleveldb; overridden by
+//                                `migrateSource` = -blockindexmigratesrc, which
+//                                must be an absolute dir with CURRENT+MANIFEST-*)
 // Any other state is rejected.
 BlockIndexNativePrepareStatus PrepareNativeBlockIndexGeneration(
     const std::string& v2Root,
     const std::string& dataDir,
     BlockIndexStartupOwnershipState state,
-    std::string* error);
+    std::string* error,
+    const std::string& migrateSource = std::string());
 
 #endif // INNOVA_BLOCKINDEX_NATIVE_BOOTSTRAP_H
