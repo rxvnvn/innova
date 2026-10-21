@@ -959,19 +959,13 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
             controller.WaitForStop(nSessionId, 1000);
             continue;
         }
-
-        bool fChainStale = false;
-        {
-            LOCK(cs_main);
-            fChainStale = !fRegTest && !fTestNet && pindexBest && pindexBest->nHeight > 10 &&
-                          pindexBest->GetBlockTime() < GetTime() - 300;
-        }
-        if (fChainStale)
-        {
-            controller.NotePaused(nWorkerId, CCPUMinerController::PAUSE_CHAIN_STALE);
-            controller.WaitForStop(nSessionId, 5000);
-            continue;
-        }
+        // No age-based pause: on a quiet canonical network the best block may
+        // legitimately stand for longer than the former 300s heuristic (e.g.
+        // block 8180388, 19.10.2026). A purely-aged but authoritative tip must
+        // NOT halt PoW mining (regression: pow_chainstale/stale_canonical_chain_
+        // does_not_reject_new_pow_child). Chain-state back-off remains covered by
+        // the IBD / no-peers gate above and the work-identity/collateral gates
+        // below.
 
         if (!IsCPUMiningCollateralStateReady())
         {
