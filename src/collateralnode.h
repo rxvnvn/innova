@@ -22,6 +22,23 @@ class CCollateralNode;
 class CCollateralnodePayments;
 class uint256;
 
+// Pure collateralnode-declaration time policy (no globals, no chain state) so it
+// is unit-testable in isolation from the network/chain. CN signing timestamps are
+// validated against the RECEIVING node's network-adjusted clock (GetAdjustedTime),
+// NOT the best-block time: on a quiet canonical network the tip may legitimately
+// stand for days (observed live: tip 8180388 frozen 19.10.2026, wall clock 21.10),
+// and tying declaration acceptance to the stale tip time would permanently reject
+// every fresh CN declaration -- the PoW <-> CN production deadlock. See the
+// pow_cn_deadlock regression for the boundary being pinned here.
+static inline bool CNTimeTooFarFuture(int64_t sigTime, int64_t nReference, int64_t nTolerance)
+{
+    return sigTime > nReference + nTolerance;
+}
+static inline bool CNTimeTooFarPast(int64_t sigTime, int64_t nReference, int64_t nTolerance)
+{
+    return sigTime <= nReference - nTolerance;
+}
+
 #define COLLATERALNODE_NOT_PROCESSED               0 // initial state
 #define COLLATERALNODE_IS_CAPABLE                  1
 #define COLLATERALNODE_NOT_CAPABLE                 2

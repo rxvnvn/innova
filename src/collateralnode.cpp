@@ -26,6 +26,7 @@ static CCriticalSection cs_pingReplay;
 static std::map<uint256, int64_t> mapSeenPingSigs;  // sig hash -> timestamp
 static const int64_t PING_REPLAY_WINDOW = 180;  // 3 minutes
 static const int64_t PING_SIG_TOLERANCE = 180;  // 3 minutes
+static const int64_t ISEE_SIG_TOLERANCE  = 120;  // 2 minutes (isee declaration future tolerance)
 
 static CCriticalSection cs_iseeReplay;
 static std::map<uint256, int64_t> mapSeenIseeSigs;  // sig hash -> timestamp
@@ -102,8 +103,12 @@ void ProcessMessageCollateralnode(CNode* pfrom, std::string& strCommand, CDataSt
         // 70047 and greater
         vRecv >> vin >> addr >> vchSig >> sigTime >> pubkey >> pubkey2 >> count >> current >> lastUpdated >> protocolVersion;
 
-        // 2-minute future timestamp tolerance
-        if (sigTime > pindexBest->GetBlockTime() + 120) {
+        // 2-minute future timestamp tolerance, relative to the network-adjusted
+        // clock, NOT the best-block time: a quiet canonical network may stand for
+        // days with its tip (observed: 8180388 frozen 19.10) while CN declarations
+        // are signed at the current wall clock. Tying acceptance to the stale tip
+        // time would reject every fresh declaration (PoW <-> CN deadlock).
+        if (CNTimeTooFarFuture(sigTime, GetAdjustedTime(), ISEE_SIG_TOLERANCE)) {
             if (fDebugCN) printf("isee - Signature rejected, too far into the future %s\n", vin.ToString().c_str());
             return;
         }
@@ -297,13 +302,13 @@ void ProcessMessageCollateralnode(CNode* pfrom, std::string& strCommand, CDataSt
         vRecv >> vin >> vchSig >> sigTime >> stop;
 
         if (fDebugCN) printf("iseep - Received: vin: %s sigTime: %lld stop: %s\n", vin.ToString().c_str(), sigTime, stop ? "true" : "false");
-        // 3-minute future timestamp tolerance
-        if (sigTime > pindexBest->GetBlockTime() + PING_SIG_TOLERANCE) {
+        // 3-minute future timestamp tolerance (network-adjusted clock, see isee)
+        if (CNTimeTooFarFuture(sigTime, GetAdjustedTime(), PING_SIG_TOLERANCE)) {
             if (fDebugCN) printf("iseep - Signature rejected, too far into the future %s, sig %d local %d \n", vin.ToString().c_str(), sigTime, GetAdjustedTime());
             return;
         }
 
-        if (sigTime <= pindexBest->GetBlockTime() - PING_SIG_TOLERANCE) {
+        if (CNTimeTooFarPast(sigTime, GetAdjustedTime(), PING_SIG_TOLERANCE)) {
             if (fDebugCN) printf("iseep - Signature rejected, too far into the past %s - sig %d local %d \n", vin.ToString().c_str(), sigTime, GetAdjustedTime());
             return;
         }

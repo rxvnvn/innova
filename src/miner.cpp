@@ -871,8 +871,16 @@ bool IsCPUMiningCollateralStateReady()
     if (!fPaymentsRequired || nNextHeight < nEnforcementHeight)
         return true;
 
-    LOCK(cs_collateralnodes);
-    return !vecCollateralnodes.empty();
+    // An EMPTY collateralnode pool must NOT permanently halt PoW production.
+    // When no CN is currently known, CreateNewBlock() routes the CN reward to
+    // the canonical burn address (INNXXXX...ZeeDTw) and CheckBlock-POW explicitly
+    // accepts that burn payee (main.cpp), so a freshly mined block remains fully
+    // consensus-valid independent of the local pool contents. The pool is
+    // in-memory only and re-synced from peer CN declarations (iseg/isee), so this
+    // cannot reintroduce the deadlock on restart either. This is purely a mining
+    // launch-policy gate (not consensus acceptance); the real arbiter of template
+    // viability is CreateNewBlock(), which returns NULL on an impossible template.
+    return true;
 }
 
 bool IsCPUMiningWorkCurrent(const CPUMiningWorkIdentity& identity, bool fCheckMempool)
