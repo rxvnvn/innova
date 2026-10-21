@@ -445,7 +445,19 @@ CGetHeadersSyncState::StartResult CGetHeadersSyncState::Start(
     }
 
     if (!fTimedOut && fHasCompleted && strRequestKey == strLastCompletedRequestKey)
-        return SUPPRESSED_COMPLETED;
+    {
+        // A completed request suppresses the identical locator only until the
+        // GETHEADERS_REQUEST_TIMEOUT budget (measured from nLastCompletedTime)
+        // elapses. The preceding peer may have advanced its head; without this
+        // a restarted, slightly-behind node could never re-request headers, so
+        // it freezes a few blocks below the live tip (SUPPRESSED_COMPLETED deadlock).
+        // Mirrors SUPPRESSED_ACTIVE: still gated before timeout, becomes a fresh
+        // request (re-inflight) after timeout, bounding the poll cadence to at
+        // most one message per timeout window.
+        const int64_t nAge = nNow >= nLastCompletedTime ? nNow - nLastCompletedTime : 0;
+        if (nAge < nTimeout)
+            return SUPPRESSED_COMPLETED;
+    }
 
     fInFlight = true;
     strActiveRequestKey = strRequestKey;

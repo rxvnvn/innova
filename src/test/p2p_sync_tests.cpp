@@ -1645,6 +1645,36 @@ BOOST_AUTO_TEST_CASE(empty_response_completes_without_tight_loop)
     BOOST_CHECK_EQUAL(state.RequestSequence(), 1U);
 }
 
+BOOST_AUTO_TEST_CASE(completed_request_retryable_after_timeout)
+{
+    CGetHeadersSyncState state;
+    const std::string requestKey = "tip-1000|middle-a|genesis|stop-0";
+    BOOST_CHECK_EQUAL(state.Start(requestKey, TEST_TIME),
+                      CGetHeadersSyncState::STARTED);
+    BOOST_CHECK(state.Complete(TEST_TIME + 1));
+
+    // Before the GETHEADERS_REQUEST_TIMEOUT budget since the last completed
+    // response, the identical locator remains suppressed: no tight re-request
+    // loop after an empty / non-advancing headers response.
+    BOOST_CHECK_EQUAL(state.Start(requestKey, TEST_TIME + GETHEADERS_REQUEST_TIMEOUT - 1),
+                      CGetHeadersSyncState::SUPPRESSED_COMPLETED);
+    BOOST_CHECK_EQUAL(state.Start(requestKey, TEST_TIME + GETHEADERS_REQUEST_TIMEOUT),
+                      CGetHeadersSyncState::SUPPRESSED_COMPLETED);
+
+    // Once GETHEADERS_REQUEST_TIMEOUT has elapsed since nLastCompletedTime, the
+    // same locator may be requested again: a fresh getheaders is emitted rather
+    // than suppressed forever (fixes the restart-then-behind deadlock).
+    BOOST_CHECK_EQUAL(state.Start(requestKey, TEST_TIME + GETHEADERS_REQUEST_TIMEOUT + 1),
+                      CGetHeadersSyncState::STARTED);
+    BOOST_CHECK(state.IsInFlight());
+    BOOST_CHECK_EQUAL(state.RequestSequence(), 2U);
+
+    // An identical re-request immediately after is gated by SUPPRESSED_ACTIVE,
+    // bounding the poll cadence to at most one message per timeout window.
+    BOOST_CHECK_EQUAL(state.Start(requestKey, TEST_TIME + GETHEADERS_REQUEST_TIMEOUT + 2),
+                      CGetHeadersSyncState::SUPPRESSED_ACTIVE);
+}
+
 BOOST_AUTO_TEST_CASE(missing_response_can_retry_after_timeout)
 {
     CGetHeadersSyncState state;
