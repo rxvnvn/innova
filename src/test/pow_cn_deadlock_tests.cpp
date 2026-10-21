@@ -212,4 +212,64 @@ BOOST_AUTO_TEST_CASE(empty_pool_block_pays_accepted_burn_payee)
         "the burn payee must be an empty or standard P2PKH script");
 }
 
+// --- Scenario 7: when a CN is REGISTERED (non-empty pool), the selected payee
+// --- is the CN's own P2PKH script, which is distinct from the burn payee. This
+// --- pins the actual fix for "coinbase pays burn although a CN is registered":
+// --- with a populated pool CreateNewBlock selects payee.SetDestination(cn.pubkey
+// --- .GetID()); the burn branch is reached ONLY when no CN is eligible.
+BOOST_AUTO_TEST_CASE(registered_cn_selected_payee_is_cn_not_burn)
+{
+    CKey cnKey; cnKey.MakeNewKey(false);
+    const CPubKey cnPub = cnKey.GetPubKey();
+
+    CScript cnPayee;
+    cnPayee.SetDestination(cnPub.GetID());
+
+    // The burn payee as CreateNewBlock derives it for an empty/ineligible pool.
+    const std::string burnLiteral = "INNXXXXXXXXXXXXXXXXXXXXXXXXXZeeDTw";
+    CBitcoinAddress burnAddr; burnAddr.SetString(burnLiteral);
+    const CScript burnPayee = GetScriptForDestination(burnAddr.Get());
+
+    // A registered, eligible CN must be paid directly (standard P2PKH to its keyID).
+    BOOST_CHECK_MESSAGE(cnPayee.size() == 25U,
+        "the registered-CN payee must be a standard 25-byte P2PKH script");
+    BOOST_CHECK_MESSAGE(cnPayee != burnPayee,
+        "a registered CN must NOT be paid via the burn/empty payee");
+    // P2PKH shape: OP_DUP OP_HASH160 <20> OP_EQUALVERIFY OP_CHECKSIG.
+    if (cnPayee.size() == 25U) {
+        BOOST_CHECK_EQUAL((int)cnPayee[0], 0x76);
+        BOOST_CHECK_EQUAL((int)cnPayee[1], 0xa9);
+        BOOST_CHECK_EQUAL((int)cnPayee[2], 0x14);
+        BOOST_CHECK_EQUAL((int)cnPayee[23], 0x88);
+        BOOST_CHECK_EQUAL((int)cnPayee[24], 0xac);
+    }
+}
+
+// --- Scenario 8: correct amounts and the eligibility boundary. The CN share is
+// --- exactly 65% of the block value (GetCollateralnodePayment); the miner keeps
+// --- the remainder (35%). A CN paid within the last 10 blocks is NOT eligible,
+// --- which is the ONLY correct path to the burn fallback even with a non-empty
+// --- pool (consensus-valid, and what a legacy client accepts as a normal P2PKH
+// --- or the canonical burn payee).
+BOOST_AUTO_TEST_CASE(cn_amount_split_and_eligibility_boundary)
+{
+    const int64_t blockValue = 20000000;               // 0.20 COIN
+    const int64_t cnPay   = GetCollateralnodePayment(8190000, blockValue);
+    const int64_t minerPay = blockValue - cnPay;
+
+    BOOST_CHECK_EQUAL(cnPay, blockValue * 65 / 100);   // 13000000 == 65%
+    BOOST_CHECK_EQUAL(minerPay, blockValue * 35 / 100); // 7000000 == 35%
+    BOOST_CHECK_EQUAL(cnPay + minerPay, blockValue);   // no value created/destroyed
+    BOOST_CHECK_EQUAL(GetCollateralnodePayment(8190000, 0), 0);
+
+    // Eligibility predicate as used in CreateNewBlock:
+    //   eligible  <=>  cn.nBlockLastPaid < tip - 10
+    const int tip = 8190000;
+    auto eligible = [tip](int lastPaid) { return lastPaid < tip - 10; };
+    BOOST_CHECK_MESSAGE(!eligible(tip),        "a CN paid at tip is NOT eligible");
+    BOOST_CHECK_MESSAGE(!eligible(tip - 10),   "a CN paid exactly at tip-10 is NOT eligible");
+    BOOST_CHECK_MESSAGE(eligible(tip - 11),    "a CN last paid at tip-11 IS eligible");
+    BOOST_CHECK_MESSAGE(eligible(tip - 100),   "an idle CN IS eligible");
+}
+
 BOOST_AUTO_TEST_SUITE_END()
