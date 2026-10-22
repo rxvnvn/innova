@@ -167,12 +167,9 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
         LOCK(cs_main);
         if (g_fAuthoritativeStartup)
         {
-            // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is
-            // retired with the engine. The current consensus head is the
-            // authoritative ACTIVE CHAIN HEAD (hashBestChain), served by value from
-            // the live authority — no DAG selector, no sibling precedence and no
-            // nDAGOrder semantics are consulted, and the absence of DAG state never
-            // returns NULL.
+            // The current consensus head is the authoritative ACTIVE CHAIN
+            // HEAD (hashBestChain), served by value from the live authority;
+            // it never returns NULL.
             std::map<uint256, CBlockIndex*>::iterator miTip = mapBlockIndex.find(hashBestChain);
             if (miTip != mapBlockIndex.end() && miTip->second)
             {
@@ -192,9 +189,7 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
         }
         else
         {
-            // LEGACY DAG RETIREMENT (Phase 1): the Legacy DAG tip selector is
-            // retired authority; the ordinary linear head is the current consensus
-            // head when the DAG engine is not the (scoped) authority.
+            // The ordinary linear head is the current consensus head.
             pindexPrev = pindexBest;
             if (!pindexPrev)
                 pindexPrev = pindexBest;
@@ -362,9 +357,9 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
         list<COrphan> vOrphan; // list memory doesn't move
         map<uint256, vector<COrphan*> > mapDependers;
 
-        // IDAG Phase 2: Collect txids and spent inputs from DAG sibling
+        // Collect txids and spent inputs from side-branch sibling
         // blocks to avoid duplicates and fee accounting drift. ConnectBlock
-        // skips transactions whose inputs were already spent by earlier DAG
+        // skips transactions whose inputs were already spent by earlier
         // siblings, so CreateNewBlock must exclude them before adding their
         // fees to the coinbase value.
 
@@ -626,7 +621,7 @@ bool CheckStake(CBlock* pblock, CWallet& wallet)
     if(!pblock->IsProofOfStake())
         return error("CheckStake() : %s is not a proof-of-stake block", hashBlock.GetHex().c_str());
 
-    // A.9a.3j: hold cs_main across the DAG-fork check, safe non-inserting
+    // A.9a.3j: hold cs_main across the fork-point check, safe non-inserting
     // parent lookup, and initial CheckProofOfStake.  The validation consumer
     // (CheckProofOfStake -> GetHybridSvmMaturityAuthorityR / ResolveLogicalR /
     // VerifySeam / GetStakingSourceDiskPositionR) requires caller-held
@@ -827,11 +822,8 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
     identity.hashBestChain = hashBestChain;
     if (true)
     {
-        // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is retired
-        // with the engine, so the CPU-mining work identity's primary parent is the
-        // authoritative ACTIVE CHAIN HEAD (hashBestChain). No DAG selector, sibling
-        // precedence or nDAGOrder state is consulted, and the absence of DAG state
-        // is never treated as unavailable authority.
+        // The CPU-mining work identity's primary parent is the authoritative
+        // ACTIVE CHAIN HEAD (hashBestChain).
         CBlockIndex* pindexParent = pindexBest;
         if (mapBlockIndex.count(hashBestChain)) pindexParent = mapBlockIndex[hashBestChain];
         if (pindexParent)
@@ -851,8 +843,7 @@ bool IsCPUMiningCollateralStateReady()
         LOCK(cs_main);
         if (true)
         {
-            // LEGACY DAG RETIREMENT (Phase 1): the DAG tip selector runtime is
-            // retired; readiness is computed from the authoritative linear head.
+            // Readiness is computed from the authoritative linear head.
             CBlockIndex* pindexParent = pindexBest;
             if (mapBlockIndex.count(hashBestChain)) pindexParent = mapBlockIndex[hashBestChain];
             if (!pindexParent)

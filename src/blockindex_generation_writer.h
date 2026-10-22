@@ -62,8 +62,8 @@ public:
     // committed tip.
     // If generationCapability == AUTHORITATIVE, the content binding is recomputed
     // from the on-disk generation files (RecomputeGenerationRootFromFiles) using
-    // generationInputDigest (may be the empty generation input digest on a dag-inert
-    // chain), and
+    // generationInputDigest (may be the empty generation input digest on
+    // every supported chain), and
     // generationInputDigest is persisted in the MANIFEST for validation. Otherwise
     // the legacy shadow (metadata-only) binding is used.
     bool Finalize(uint64_t generation,

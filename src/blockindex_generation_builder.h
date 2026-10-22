@@ -79,7 +79,7 @@ struct BlockIndexGenerationStats
 // Reads every legacy "blockindex" record from a static LevelDB snapshot
 // directory (NOT the live datadir) and reconstructs the full source required to
 // build a generation. Uses the exact legacy CDiskBlockIndex serialization.
-// Also reads DAG links if present.
+// The legacy source contains no engine-specific link records.
 bool ReadLegacyBlockIndexSource(const std::string& snapshotLevelDbDir,
                                 BlockIndexGenerationSource* out,
                                 std::string* error);

@@ -167,10 +167,10 @@ bool BlockIndexGenerationWriter::Finalize(uint64_t generation,
 
     // content binding depends on capability:
     // - AUTHORITATIVE: full generation root recomputed from on-disk files
-    //   (commits to records+active+hashindex+derived+DAG inputs), with the
-    //   DAG input digest persisted in the MANIFEST for validation.
+    //   (commits to records+active+hashindex+derived + fixed empty-input
+    //   digest), which is persisted in the MANIFEST for validation.
     // - AUTHORITATIVE_FRONTIER (R2c.1c): same authoritative full root AND the
-    //   mandatory bound dag-tip-frontier.dat folded by RecomputeGenerationRootFromFiles
+    //   mandatory bound frontier artifact folded by RecomputeGenerationRootFromFiles
     //   (bindFrontier=true). A caller that declares this capability MUST have
     //   materialized the artifact in the staging dir first; otherwise the
     //   recompute fails closed and the writer never finalizes a frontier-capable

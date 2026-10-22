@@ -37,7 +37,7 @@ void ComputeDerivedFromParent(const BlockIndexRecord& rec,
                               BlockIndexDerivedEntry* out)
 {
     // chainTrust = parentTrust + blockTrust, using the ONE authoritative
-    // surviving trust rule (POEM entropy + post-DAG PoS zero), identical to the
+    // surviving trust rule (POEM entropy + PoS zero trust), identical to the
     // regular builder, the LM builder and the live authoritative path.
     // PM1-P0-08: legacy nFlags PoS classification; the caller validates that it
     // is consistent with prevoutStake before this is reached.

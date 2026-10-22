@@ -129,9 +129,6 @@ bool fRegTestIbd = false;
 // production configuration; it exercises local DB-failure semantics without
 // changing consensus or peer policy when disabled.
 bool g_testFailSetBestChainAfterCommit = false;
-// LEGACY DAG RETIREMENT (Phase 2 / H9 FINAL): the Legacy DAG activation
-// capability, its retired-domain firewall predicate and their test-only seams are
-// removed. There is no longer an engine to enable or a DAG-only domain to guard.
 
 // S12 test-only CTxDB lifetime discriminator probes (inert when unset).
 extern int g_testTxdbCloseCount;
@@ -7754,10 +7751,8 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     }
 
 
-    // Reorg publication.  The former DAG-link erase / full-field restaging /
-    // recolour lifecycle is no longer authoritative and is not invoked here; the
-    // reorg publishes only the ordinary authoritative live tail (below).  The
-    // former reorg-time recolour consumer (RebuildDAGOrderIncremental) has been
+    // Reorg publication. The reorg publishes only the ordinary authoritative
+    // live tail (below).  The former reorg-time recolour consumer has been
     // physically removed.  Ordinary linear reorg publication is unaffected.
 
     // Disconnect shorter branch
@@ -8067,7 +8062,7 @@ bool CBlock::GetCoinAge(uint64_t& nCoinAge) const
     return true;
 }
 
-// H6E (Legacy DAG retirement, Phase 2): the CURRENT V2 owner of a best-chain
+// H6E: the CURRENT V2 owner of a best-chain
 // CUTOVER. A newly-best block that is not a direct child of the currently
 // published live tip is not an append: it replaces (part of) the published
 // active chain. BlockIndexTipAuthority::Append is extension-only and correctly
@@ -8076,7 +8071,7 @@ bool CBlock::GetCoinAge(uint64_t& nCoinAge) const
 // (BlockIndexAuthoritativeLive::ReorgTo) with the fork point of the old published
 // active tip and the new active suffix. Reuses the single existing reorg
 // construction helper (PublishAuthoritativeLiveTailReorg); no second
-// implementation, no DAG-specific logic.
+// implementation.
 static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* live,
                                                 CBlockIndex* pindexNew,
                                                 const uint256& oldPublishedTipHash,
@@ -8470,11 +8465,6 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     // deleted durable records + clean-height marker are captured here so a
     // failed SetBestChain rollback restores the exact pre-envelope source in
     // ONE batch. Envelope-scoped (plain local); never a global.
-    // LEGACY DAG RETIREMENT (FINAL): the Legacy DAG authority block (graph
-    // initialization, colouring, the DAG score OVERWRITE of nChainTrust, DAG
-    // sibling removal, epoch/prune side effects and the DAG-source envelope) is
-    // permanently removed. The ordinary linear trust recurrence assigned above
-    // stands; no DAG state is written and no DAG authority is required.
 
     LOCK(cs_main);
 
@@ -9395,8 +9385,8 @@ static bool IsAncestorOfBest(const CBlockIndex* pindex)
 }
 
 // Roll the active chain back so its tip becomes pindexTarget (an ancestor of
-// the current best). Reuses SetBestChain/Reorganize, so DAG and
-// stake-seen cleanup are handled by the existing machinery. The wallet and
+// the current best). Reuses SetBestChain/Reorganize, so stake-seen cleanup is
+// handled by the existing machinery. The wallet and
 // collateral callbacks inside that machinery are safe with no wallet /
 // collateral nodes registered (startup healing).
 static bool RollbackActiveChainTo(CBlockIndex* pindexTarget)

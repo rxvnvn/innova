@@ -29,7 +29,7 @@
 //
 // The mutable tip is NOT a temporary compatibility patch. Its job is to make
 // blocks accepted live above the immutable base generation tip S persistent
-// V2 authority (with active + side-branch representation, derived/DAG state,
+// V2 authority (with active + side-branch representation, derived state,
 // and crash-consistent append), while keeping the base generation byte-immutable
 // so its digest / capability / offline-build contract is untouched.
 //

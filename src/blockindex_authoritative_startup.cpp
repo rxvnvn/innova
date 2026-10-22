@@ -305,7 +305,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
                (unsigned long long)nCandidateTipGeneration);
     }
 
-    // Readiness binds to the selected generation, not a DAG capability.
+    // Readiness binds to the selected generation, not a declared capability.
     const uint64_t selectedGeneration = ctx->bootstrap.ReaderPtr()->Generation();
 
     // 5. Install the authoritative by-value staking navigator (A.10.1p) so
@@ -431,9 +431,8 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         int custodyState = 2;
         uint64_t custodyEpoch = 0;
         std::string custodyDetail;
-        // LEGACY DAG RETIREMENT (Phase 1, updated Phase 2 / Slice 3): the dormant Legacy DAG
-        // engine owns no durable authority, so provenance/custody certification is not a
-        // prerequisite of current consensus startup. Its startup-time establishment was the
+        // No engine-owned durable authority exists, so provenance/custody
+        // certification is not a prerequisite of consensus startup. Its startup-time establishment was the
         // retired engine's executable implementation and has been physically removed; the state
         // is REPORTED (never normalized to VERIFIED) and gates nothing.
         custodyState = 3;
@@ -473,18 +472,16 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         }
         {
             // R2 readiness invariant (linear profile): the authoritative domain must resolve
-            // the current best chain. The retired DAG-era trust-projection reconciliation — an
-            // O(chain) ancestry walk whose only purpose was to distinguish the pre-DAG composite
-            // trust provider from the (now removed) DAG trust path — is deleted. The accumulated
-            // chain trust is still established O(1) from the authoritative tip record
+            // the current best chain. The accumulated
+            // chain trust is established O(1) from the authoritative tip record
             // (nBestChainTrust = tipObj->nChainTrust) and is not recomputed here.
             BlockIndexSnapshot bestSnap;
             std::string bestSnapErr;
             pre.trustProjectionReconciled =
                 ResolveAuthoritativeBlockSnapshot(hashBestChain, &bestSnap, &bestSnapErr);
         }
-        // Lifecycle readiness belongs to the current immutable/live authority.
-        // No DAG runtime, custody or certificate is a current prerequisite.
+        // Lifecycle readiness belongs to the current immutable/live authority;
+        // no custody certificate is a current prerequisite.
         std::string readyDetail;
         const bool authorityReady = AuthorityReadyMarkIfSatisfied(pre, &readyDetail);
         printf("BLOCKINDEX_V2_AUTHORITATIVE authority_ready=%d detail=%s\n",
@@ -919,10 +916,10 @@ bool GetAuthoritativeAccumulatedChainTrust(const uint256& hash,
     if (!out) { if (error) *error = "trust accumulator: null output"; return false; }
     *out = 0;
     // R2 / C2 — ONE RESOLUTION DOMAIN, ONE AUTHORITY.
-    // The pre-DAG accumulated-trust authority resolves over the SAME complete
+    // The accumulated-trust authority resolves over the SAME complete
     // committed hot+cold domain the authoritative resolver uses
     // (BlockIndexAuthoritativeLive::ResolveBlockSnapshot — the single current-tail
-    // snapshot seam consumed by ResolveParentScoreAuthoritative). A pre-DAG parent
+    // snapshot seam consumed by ResolveParentScoreAuthoritative). A side-branch parent
     // retained only in the MUTABLE HOT TAIL (accepted after the immutable
     // generation was selected) therefore resolves exactly like a cold parent;
     // residency of the parent CBlockIndex is never consulted and never decides

@@ -17,7 +17,7 @@
 // The immutable base generation (CURRENT-selected) holds the validated chain up
 // to its committed tip S. Blocks accepted live above S were persisted by the
 // BlockIndexTipAuthority (P1) into blockindex_tip/ (active + side branches +
-// derived + DAG, crash-consistent via tip.meta). On restart the authoritative
+// derived, crash-consistent via tip.meta). On restart the authoritative
 // startup must land at the persisted post-S tip, NOT silently regress to S.
 //
 // This module:

@@ -151,11 +151,9 @@ void Shutdown(void* parg)
             pwalletMain->SaveSPVUtxoCache();
         }
 
-        // LEGACY DAG RETIREMENT (Phase 2 / H7): the DAG clean-height shutdown
-        // writer is retired. Its only startup consumer (the incremental DAG
-        // rebuild seeding) was removed in H3, and no current production path
-        // reads the key. The persisted "dagcleanheight" key, if present in an
-        // existing database, is inert compatibility data and is not rewritten.
+        // The persisted "dagcleanheight" key, if present in an existing
+        // database, has no writer, no startup consumer and no current production
+        // reader; it is inert compatibility data and is not rewritten.
 
         FCloseBlockFile();
         IBDEfficiencyShutdownSummary();
@@ -761,7 +759,7 @@ bool AppInit2()
     // P2P user-agent ban filter: log how many entries are enforced this startup.
     LogEnforcedUABanFilterCount();
 
-    // Largest block you're willing to create (adaptive post-DAG, default half of ceiling)
+    // Largest block you're willing to create (adaptive sizing, default half of ceiling)
     nBlockMaxSize = GetArg("-blockmaxsize", ADAPTIVE_BLOCK_CEILING / 2);
     nBlockMaxSize = std::max((unsigned int)1000, std::min((unsigned int)(ADAPTIVE_BLOCK_CEILING - 1000), nBlockMaxSize));
 

@@ -114,7 +114,7 @@ public:
                        std::string* error) const;
 
     // Resolve cold immutable V2 or bounded mutable-hot block metadata by value.
-    // requireActive is intentionally false: DAG merge parents and sibling blocks
+    // requireActive is intentionally false: side-branch (non-active-chain) parents
     // may be legitimate side records. nFile/nBlockPos are materialization
     // coordinates only; their presence does not establish logical authority.
     BlockIndexAuthoritativeParentStatus ResolveParentInfo(

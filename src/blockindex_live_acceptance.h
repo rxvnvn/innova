@@ -31,7 +31,7 @@
 // by-value from the base. Subsequent S+2.. resolve via the tip as they append.
 //
 // This is a CACHE/AUTHORITY seam, not a consensus change: it never alters how a
-// block is validated (PoW/PoS/DAG/checkpoints all stay in the legacy live
+// block is validated (PoW/PoS/checkpoint rules all stay in the legacy live
 // path). It only supplies the parent resolution + post-S persistence that the
 // live path was missing in authoritative mode.
 //
@@ -81,7 +81,7 @@ public:
 
     // Persist an accepted ACTIVE block into the tip authority (advance tip) and
     // refresh live-tail residency. The caller (live path) has ALREADY validated
-    // the block (PoW/PoS/DAG/checkpoints). Returns the new tip height.
+    // the block (PoW/PoS/checkpoints). Returns the new tip height.
     int AcceptActive(const BlockIndexTipAppend& blk, int activeHeight,
                      std::string* error);
 

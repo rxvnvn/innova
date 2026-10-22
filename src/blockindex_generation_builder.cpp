@@ -288,8 +288,8 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
     // ---- derived.dat: compute derived state by height order, emit by RecordId ----
     // Build height-sorted index for trust/checksum computation.
     // The builder computes exact derived values using the same semantics as
-    // the live runtime: linear trust replay + DAG score for post-DAG PoW,
-    // logical-parent checksum, branch-local modifier-time memo.
+    // the live runtime: linear trust replay, logical-parent checksum,
+    // branch-local modifier-time memo.
     std::map<uint256, const BlockIndexRecord*> recordByHash;
     for (size_t i = 0; i < ordered.size(); ++i)
         recordByHash[ordered[i].hash] = &ordered[i].record;
@@ -351,7 +351,6 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         DerivedComputed dc;
 
         // nChainTrust: linear replay (parent.trust + GetBlockTrust)
-        // For post-DAG PoW blocks, the DAG score overwrites this.
         uint256 parentTrust = 0;
         if (rec->hashPrev != uint256(0))
         {
@@ -375,8 +374,8 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         derivedByHash[hash] = dc;
     }
 
-    // Current trust is the linear ancestry sum above; retired DAG scores must
-    // not overwrite it. Remaining derived fields use the same logical parent.
+    // Current trust is the linear ancestry sum above. Remaining derived
+    // fields use the same logical parent.
     for (size_t i = 0; i < heightSorted.size(); ++i)
     {
         const uint256& hash = heightSorted[i].second;
@@ -500,12 +499,10 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         derivedByHash[hash] = dc;
     }
 
-    // A.10.1b-fix3: DAG input digest, kept ONLY as the fixed V3 manifest field /
-    // generation-root component so the persisted manifest format and root
-    // composition are unchanged. H9CLOSURE: the Legacy DAG source intake
-    // (dagLinks/dagScores snapshot reader) that used to feed this digest has been
-    // removed; on every supported (DAG-inert) chain the input set was already
-    // empty, so the digest is the fixed empty-input digest.
+    // A.10.1b-fix3: empty-input generation digest, kept ONLY as the fixed V3
+    // manifest field / generation-root component so the persisted manifest
+    // format and root composition are unchanged; the input set is empty on
+    // every supported chain, so the digest is the fixed empty-input digest.
     unsigned char generationInputDigest[32];
     {
         SHA256_CTX ctx;
@@ -711,13 +708,10 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         if (!derivedStore.Finalize(error))
             return false;
 
-        // Remember capability for manifest below. R2c.1c: when the build is
-        // authoritative-capable AND a DAG tip frontier was produced, declare the
-        // frontier-capable capability (artifact mandatory + bound in the root).
+        // Remember capability for manifest below. No build declares the
+        // frontier-capable capability.
         const bool builderAuthoritative =
             (!source.blockDataDir.empty() && allBlockSizeAvailable);
-        // LEGACY DAG RETIREMENT (Phase 2 / H9 FINAL): the DAG tip frontier is
-        // removed, so no build declares the frontier-capable capability.
         generationCapability = builderAuthoritative
             ? BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE
             : BLOCK_INDEX_GENERATION_CAPABILITY_OLD_SHADOW;

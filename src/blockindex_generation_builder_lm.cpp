@@ -248,8 +248,8 @@ bool BlockIndexGenerationBuilderLM::BuildStagedPipeline(const std::string& snaps
     // whether M6 may claim AUTHORITATIVE capability (fail closed, same as the
     // staged builder).
     bool allHasBlockSize = true;
-    // SHA256("") — the retired DAG input set is permanently empty, exactly as
-    // the staged builder produced (dag-inert chain).
+    // SHA256("") — the empty generation input set, matching the fixed
+    // empty-input digest the staged builder produces.
     unsigned char emptyGenerationInputDigest[32];
     SHA256_CTX shaCtx;
     SHA256_Init(&shaCtx);

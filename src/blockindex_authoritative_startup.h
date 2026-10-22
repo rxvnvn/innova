@@ -37,8 +37,8 @@
 class BlockIndexAuthoritativeLive; // fwd (G1 production live-authority accessor)
 
 // Set to true (by InitBlockIndexAuthoritative) while an authoritative by-value
-// startup is active. init.cpp uses it to skip the legacy DAG-rebuild /
-// candidate-tip mapBlockIndex scans that are replaced by by-value providers.
+// startup is active. init.cpp uses it to skip the legacy candidate-tip
+// mapBlockIndex scans that are replaced by by-value providers.
 extern bool g_fAuthoritativeStartup;
 
 // Perform the authoritative by-value startup cutover for a validated V2
@@ -194,12 +194,12 @@ void ResetBlockIndexAuthoritativeStartupForTest();
 uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap);
 
 // R2c.2s/S2 (repaired): bounded authoritative accumulated chainTrust for the
-// REQUESTED HASH'S OWN PRE-DAG ANCESTRY. Returns in *out the exact accumulated
-// legacy nChainTrust value that the real ColorBlock pre-DAG parent fallback
+// REQUESTED HASH'S OWN FULL ANCESTRY. Returns in *out the exact accumulated
+// legacy nChainTrust value that the real ColorBlock parent fallback
 // consumes, computed as SUM GetAuthoritativeBlockTrust(X) over the hash-driven
 // ancestry genesis -> ... -> hash resolved through the authoritative store's
 // persisted hashPrev links (BlockIndexV2Reader::LookupByHash + GetParent).
-// It is NOT the active chain at the same height: `PRE-DAG TRUST TRUTH !=
+// It is NOT the active chain at the same height: `ANCESTRY TRUST TRUTH !=
 // ACTIVE CHAIN AT SAME HEIGHT`, so a side-branch parent resolves to its own
 // branch trust. No all-history cache, no resident mapBlockIndex, no residency
 // and no score cache; O(depth) time bounded by the requested height and O(1)

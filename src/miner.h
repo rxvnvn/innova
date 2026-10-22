@@ -40,7 +40,7 @@ struct CPUMiningWorkIdentity
     std::vector<uint256> vFrontierTips;
     unsigned int nTransactionsUpdated;
     int nHeight;
-    // R2c.2/S7 / audit-D (OPEN D): authoritative canonical DAG source-state
+    // R2c.2/S7 / audit-D (OPEN D): authoritative canonical source-state
     // token at capture time. Every in-tree topology / child-count / persisted
     // score mutation stages its new token inside the same authoritative
     // envelope, so two identities that agree on every structural field but

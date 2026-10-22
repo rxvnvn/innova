@@ -132,7 +132,7 @@ static const int64_t MIN_TX_FEE_ANON = 10000;
 static const int64_t MIN_RELAY_TX_FEE = MIN_TX_FEE;
 static const int64_t MAX_MONEY = 18000000 * COIN; // 18,000,000 INN Innova Max
 
-// Mainnet maintenance builds intentionally keep the experimental v5/IDAG/finality
+// Mainnet maintenance builds intentionally keep the experimental v5/finality
 // fork series inert until the network explicitly opts in to a future release.
 #ifndef MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT
 #define MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT 999999999
@@ -220,12 +220,9 @@ inline int GetForkHeightPoem()
 }
 #define FORK_HEIGHT_POEM (GetForkHeightPoem())
 
-// LEGACY DAG RETIREMENT (FINAL): the Legacy DAG engine, its activation
-// capability, its retired-domain firewall and the DAG activation boundary
-// itself are permanently removed. The supported Innova profile is linear/V2:
-// there is no DAG fork height and no post-DAG rule set. A future DAG, if ever
-// implemented, will be a NEW design and must not rely on any activation
-// semantics removed here.
+// The supported Innova consensus profile is linear/V2. Any future
+// non-linear consensus design, if ever implemented, will be a NEW design
+// introduced by its own activation semantics.
 
 // Supported (linear) block time.
 inline unsigned int GetTargetSpacingForHeight(int nHeight)

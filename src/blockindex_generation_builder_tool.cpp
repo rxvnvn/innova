@@ -321,8 +321,6 @@ int main(int argc, char** argv)
         fprintf(stderr, "ERROR reading snapshot: %s\n", error.c_str());
         return 4;
     }
-    // H9CLOSURE: the Legacy DAG source intake (daglinks snapshot reader) is
-    // physically removed; the builder no longer loads DAG links/scores.
     // A.10.1b-fix3 C1: Wire block data directory for exact nSize
     if (!blockDataDir.empty())
     {

@@ -17,7 +17,7 @@
 // Rebuilds an immutable V2 generation from a static legacy txleveldb snapshot
 // with peak memory bounded INDEPENDENTLY of historical block count N. Replaces
 // the current builder's approach (materialize all source records in RAM + copy
-// into `ordered` + three hash maps + full DAG CBlockIndex graph) with a
+// into `ordered` + three hash maps) with a
 // streamed, shared-writer pipeline:
 //
 //   legacy txleveldb iterator
@@ -27,8 +27,8 @@
 //     -> active.dat ascending (streamed)
 //   derived state: height-ordered computation against the temp index
 //     -> derived.dat (streamed)
-//   DAG scores: height-ordered incremental coloring keeping only the
-//     DAG_MERGE_DEPTH window + a transient CBlockIndex per block (NO N-object
+//   trust scores: height-ordered incremental computation keeping only a
+//     bounded window + a transient CBlockIndex per block (NO N-object
 //     graph) -> exact same linear block-trust scores
 //   digests: file-based (streamed stores) -> generation root -> MANIFEST
 //   lifecycle: Publish -> Validate -> atomic Select (old CURRENT untouched)
