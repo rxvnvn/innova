@@ -61,7 +61,7 @@ struct CPUMiningWorkIdentity
     }
 };
 
-/** Compare the chain/DAG portion of two mining-work snapshots. */
+/** Compare the chain-work portion of two mining-work snapshots. */
 bool CPUMiningWorkIdentityMatches(const CPUMiningWorkIdentity& a,
                                   const CPUMiningWorkIdentity& b,
                                   bool fCheckMempool);
@@ -87,7 +87,7 @@ bool PrepareCPUMiningAttemptForTest(CBlock* pblock,
                                     int* outParentHeight,
                                     uint256* outTarget);
 
-/** Check that a built block commits to the chain/DAG work snapshot. */
+/** Check that a built block commits to the chain work snapshot. */
 bool CPUMiningBlockMatchesWorkIdentity(const CBlock& block,
                                        const CPUMiningWorkIdentity& identity);
 

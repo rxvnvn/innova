@@ -531,7 +531,7 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationDir(
         // Independently recompute the generation root from actual component files.
         // generationInputDigest is read from V3 MANIFEST (persisted by builder).
         // R2c.1c: bindFrontier=true for frontier-capable generations, which also
-        // requires dag-tip-frontier.dat present + valid (fails closed otherwise).
+        // requires the frontier artifact present + valid (fails closed otherwise).
         // fullRootRecompute=false is used ONLY by the startup-ownership
         // classification probe (T1): structural checks above are identical, the
         // expensive immutable-byte re-derivation is deferred to the authoritative

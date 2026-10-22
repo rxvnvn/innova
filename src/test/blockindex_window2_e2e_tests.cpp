@@ -861,7 +861,7 @@ BOOST_AUTO_TEST_CASE(f2_byvalue_hot_parent_matches_cold_parent)
     uint256 accCold = 0; std::string eCold;
     BOOST_REQUIRE_MESSAGE(GetAuthoritativeAccumulatedChainTrust(coldHash, &accCold, &eCold), eCold);
     BOOST_CHECK_MESSAGE(accCold == coldTrust,
-        "R2: cold pre-DAG parent accumulated trust != its own branch resident nChainTrust");
+        "R2: cold side-branch parent accumulated trust != its own branch resident nChainTrust");
 
     // 4. A pre-DAG vertex that exists ONLY in the mutable hot tail: its record is
     //    persisted through the REAL production live authority (AcceptSide) after
