@@ -28,6 +28,8 @@
 #include "main.h"
 #include "miner.h"
 #include "wallet.h"
+#include "blockindex_authoritative_live.h"
+#include "blockindex_tip.h"
 
 #include <algorithm>
 
@@ -256,11 +258,18 @@ BOOST_AUTO_TEST_CASE(restart_persistence_and_crash_window_heal)
     BOOST_CHECK(InvalidateBlock(*pA1->phashBlock, strError));
     BOOST_CHECK_EQUAL(setInvalidBlockHash.count(*pA1->phashBlock), (size_t)1);
 
-    // Persistence round-trip through a fresh DB handle (simulated restart).
+    // M-port: the legacy CTxDB invalid-set / hashBestChain round-trip is replaced
+    // by the V2 authoritative surfaces. The durable operator-invalid authority is
+    // the tip authority (tip-invalid.dat, committed by tip.meta) and the durable
+    // best-chain pointer is the committed V2 tip; both are read AFTER the same
+    // invalidate transition that previously wrote them through txdb round-trips.
+    BlockIndexAuthoritativeLive* liveInvalid = GetAuthoritativeLiveAuthority();
+    BlockIndexTipAuthority* tipInvalid = liveInvalid ? liveInvalid->TipAuthorityMutable() : NULL;
+    BOOST_CHECK_MESSAGE(tipInvalid != NULL,
+        "restart_persistence: the TestingSetup live authority must be available for the durable invalid-set check");
+    if (tipInvalid != NULL)
     {
-        CTxDB txdb;
-        std::set<uint256> setLoaded;
-        BOOST_CHECK(txdb.ReadInvalidBlockSet(setLoaded));
+        const std::set<uint256> setLoaded = tipInvalid->OperatorInvalidSet();
         BOOST_CHECK_EQUAL(setLoaded.count(*pA1->phashBlock), (size_t)1);
     }
 
@@ -268,37 +277,45 @@ BOOST_AUTO_TEST_CASE(restart_persistence_and_crash_window_heal)
     BOOST_CHECK(setInvalidBlockHash.empty());
     BOOST_CHECK_EQUAL(HashStr(BestChainHash()), HashStr(hashA4));
 
-    // Craft the crash window directly: the invalid set is persisted but the
-    // active chain still descends from the invalidated block (a crash between
-    // persisting the set and rolling back the chain).  InvalidateBlock's own
-    // rollback is deliberately not used here so the side chain stays untouched.
+    // Craft the crash window directly: the invalid intent is committed to the V2
+    // tip authority but the in-memory active chain still descends from the
+    // invalidated block (a crash between the tip.meta commit and the chain
+    // rollback). InvalidateBlock's own rollback is deliberately not used here so
+    // the side chain stays untouched.
     {
         LOCK(cs_main);
         setInvalidBlockHash.clear();
         setInvalidBlockHash.insert(*pA1->phashBlock);
-        CTxDB txdb;
-        txdb.WriteInvalidBlockSet(setInvalidBlockHash);
-        txdb.WriteHashBestChain(hashA4);
+        BlockIndexAuthoritativeLive* liveCrash = GetAuthoritativeLiveAuthority();
+        BlockIndexTipAuthority* tipCrash = liveCrash ? liveCrash->TipAuthorityMutable() : NULL;
+        BOOST_REQUIRE_MESSAGE(tipCrash != NULL,
+            "crash window: the TestingSetup live authority must be available (til-invalid.dat persist point)");
+        std::string setErr;
+        BOOST_REQUIRE_MESSAGE(tipCrash->SetOperatorInvalid(*pA1->phashBlock, true, &setErr) == BLOCK_INDEX_TIP_OK, setErr);
+        hashBestChain = hashA4;   // in-memory mirror of the stale pre-crash tip
         pindexBest = mapBlockIndex[hashA4];
         nBestHeight = pindexBest->nHeight;
         nBestChainTrust = pindexBest->nChainTrust;
     }
 
-    // The set is readable from a fresh handle.
+    // The set is readable back from the V2 authority (the durable post-crash view).
     {
-        CTxDB txdb;
-        std::set<uint256> setLoaded;
-        BOOST_CHECK(txdb.ReadInvalidBlockSet(setLoaded));
+        BlockIndexAuthoritativeLive* liveRead = GetAuthoritativeLiveAuthority();
+        BlockIndexTipAuthority* tipRead = liveRead ? liveRead->TipAuthorityMutable() : NULL;
+        BOOST_REQUIRE_MESSAGE(tipRead != NULL, "crash window: tip authority must remain open");
+        const std::set<uint256> setLoaded = tipRead->OperatorInvalidSet();
         BOOST_CHECK_EQUAL(setLoaded.count(*pA1->phashBlock), (size_t)1);
     }
 
     // Healing rolls the stale best chain back to the highest valid ancestor and
-    // re-persists the corrected best-chain pointer.
+    // re-persists the corrected committed tip (the V2 best-chain pointer).
     BOOST_CHECK(RecoverFromInvalidatedBestChain());
     {
-        CTxDB txdb;
-        uint256 hashStored;
-        BOOST_CHECK(txdb.ReadHashBestChain(hashStored));
+        BlockIndexAuthoritativeLive* liveHeal = GetAuthoritativeLiveAuthority();
+        BlockIndexTipAuthority* tipHeal = liveHeal ? liveHeal->TipAuthorityMutable() : NULL;
+        BOOST_REQUIRE_MESSAGE(tipHeal != NULL, "heal: tip authority must remain open");
+        uint256 hashStored = tipHeal->GetTip().record.hash;
+        BOOST_CHECK_MESSAGE(tipHeal->GetTip().status == BLOCK_INDEX_TIP_OK, "heal: no committed V2 tip");
         BOOST_CHECK_EQUAL(HashStr(hashStored), HashStr(pP2));
     }
     BOOST_CHECK_EQUAL(HashStr(BestChainHash()), HashStr(pP2));

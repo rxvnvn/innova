@@ -230,14 +230,12 @@ static void R3FXSRestart(const fs::path& root)
         "R3F XS restart: authoritative mode must be re-entered");
 }
 
-// Read the legacy compatibility mirror through the REAL txdb API (the exact
-// source ReconcileLegacyCompatibilityMirror compares against).
+// M-port: the legacy CTxDB hashBestChain mirror was removed with txdb-leveldb.
+// The best-chain pointer the reconciliation projects is the in-memory mirror
+// global (V2 wins over it); read that instead of the retired store.
 static uint256 R3FXSLegacyBest()
 {
-    uint256 best(0);
-    CTxDB txdb;
-    txdb.ReadHashBestChain(best);
-    return best;
+    return hashBestChain;
 }
 
 static bool R3FXSCorruptInitDone = false;
@@ -318,7 +316,7 @@ BOOST_AUTO_TEST_CASE(r3f_xs_s1_crash_after_v2_commit_before_mirror)
 
     // ---- PRODUCTION startup reconciliation repairs the stale mirror (V2 wins) ----
     std::string rerr;
-    BOOST_REQUIRE_MESSAGE(ReconcileLegacyCompatibilityMirror(rerr), rerr);
+    BOOST_REQUIRE_MESSAGE(ReconcileOperatorInvalidSetFromV2(rerr), rerr);
     // Repaired legacy hashBestChain == V2 authority tip (explicit hash equality).
     const uint256 legacyRepaired = R3FXSLegacyBest();
     BOOST_CHECK_MESSAGE(legacyRepaired == B2,
@@ -404,7 +402,7 @@ BOOST_AUTO_TEST_CASE(r3f_xs_s2_failure_before_v2_commit_keeps_old_authority)
         "S2: restart must show NO legacy-only successful transition (A1 not invalidated)");
     // Startup reconciliation on the untouched state must be a no-op success.
     std::string rerr;
-    BOOST_REQUIRE_MESSAGE(ReconcileLegacyCompatibilityMirror(rerr), rerr);
+    BOOST_REQUIRE_MESSAGE(ReconcileOperatorInvalidSetFromV2(rerr), rerr);
     BOOST_CHECK_MESSAGE(tipR->GetTip().record.hash == A2,
         "S2: no hybrid state after reconciliation — V2 tip still A2");
     BOOST_TEST_MESSAGE("R3F_XS S2 restart recovered_tip=" << v2Restart.record.hash.ToString()
@@ -478,7 +476,7 @@ BOOST_AUTO_TEST_CASE(r3f_xs_s3_v2_commit_failure_propagates)
         BOOST_CHECK_MESSAGE(tip3->IsOperatorInvalid(A2),
             "S3: committed invalid intent for A2 must survive the restart");
         std::string rerr3;
-        BOOST_REQUIRE_MESSAGE(ReconcileLegacyCompatibilityMirror(rerr3), rerr3);
+        BOOST_REQUIRE_MESSAGE(ReconcileOperatorInvalidSetFromV2(rerr3), rerr3);
         BOOST_CHECK_MESSAGE(R3FXSLegacyBest() == v2Tip3,
             "S3: reconciliation must restore legacy mirror to the committed V2 tip ("
             << v2Tip3.ToString() << ", legacy=" << R3FXSLegacyBest().ToString() << ")");
@@ -525,7 +523,7 @@ BOOST_AUTO_TEST_CASE(r3f_xs_s4_operator_invalid_v2_first_ordering)
     // Mirror lag + repair via the production reconciliation (V2 wins).
     {
         std::string rerr;
-        BOOST_REQUIRE_MESSAGE(ReconcileLegacyCompatibilityMirror(rerr), rerr);
+        BOOST_REQUIRE_MESSAGE(ReconcileOperatorInvalidSetFromV2(rerr), rerr);
         BlockIndexTipAuthority* tip = GetAuthoritativeLiveAuthority()->TipAuthorityMutable();
         BOOST_CHECK_MESSAGE(R3FXSLegacyBest() == tip->GetTip().record.hash,
             "S4 invalidate: reconciliation must re-mirror legacy best to the V2 tip");
@@ -559,7 +557,7 @@ BOOST_AUTO_TEST_CASE(r3f_xs_s4_operator_invalid_v2_first_ordering)
             "S4 reconsider: restart must keep the restored V2 authority (expected A2, got "
             << tipR->GetTip().record.hash.ToString() << ")");
         std::string rerr;
-        BOOST_REQUIRE_MESSAGE(ReconcileLegacyCompatibilityMirror(rerr), rerr);
+        BOOST_REQUIRE_MESSAGE(ReconcileOperatorInvalidSetFromV2(rerr), rerr);
         BOOST_CHECK_MESSAGE(R3FXSLegacyBest() == tipR->GetTip().record.hash,
             "S4 reconsider: legacy mirror must agree with the (restored) V2 tip");
         BOOST_TEST_MESSAGE("R3F_XS S4 restart+reconcile v2_tip=" << tipR->GetTip().record.hash.ToString()

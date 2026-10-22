@@ -36,8 +36,7 @@
 
 namespace fs = boost::filesystem;
 
-extern void* GetGlobalTxdbPtrForTest();   // txdb-leveldb.cpp test accessor
-extern int g_testTxdbOpenCount;           // txdb-leveldb.cpp test counter (global scope)
+extern int g_testTxdbOpenCount;           // REMOVED with txdb-leveldb (kept as documented label only)
 
 using namespace cs;
 using namespace cs::store3a;
@@ -396,34 +395,16 @@ BOOST_AUTO_TEST_CASE(real_connectblock_coinbase_cycle)
         BOOST_CHECK_MESSAGE(allCoinOk, "store3a coin == real coinbase output for all blocks");
         BOOST_TEST_MESSAGE("pilot: store3a holds exactly the N=real mined coinbase outputs (height match, fCoinBase set)");
 
-        // (4) Independent legacy oracle: each coinbase output is UNSPENT in the legacy
-        //     txindex after ConnectBlock. Read via the LIVE process-global txdb (a fresh
-        //     CTxDB("r") handle early-returns while the global handle is open). A leveldb
-        //     WriteBatch hiccup in this in-process harness is a test-infra quirk, so this
-        //     extra cross-check is best-effort: it is reported, and the PRIMARY equality
-        //     gate is step (3) (store3a coin == the real block's authoritative coin).
-        bool oracleOk = true;
-        std::string oracleErr;
-        {
-            try {
-                CTxDB* gdb = static_cast<CTxDB*>(GetGlobalTxdbPtrForTest());
-                for (const S16Coin& c : coins) {
-                    CTxIndex txi;
-                    if (!gdb->ReadTxIndex(uint256(c.txid.data()), txi) ||
-                        txi.vSpent.size() != 1 || !txi.vSpent[0].IsNull())
-                        oracleOk = false;
-                }
-            } catch (const std::exception& ex) {
-                oracleOk = false; oracleErr = ex.what();
-            }
-        }
-        BOOST_CHECK_MESSAGE(oracleOk || !oracleErr.empty(),
-                            "legacy txindex oracle agrees (or reported: " << oracleErr << ")");
-        if (oracleErr.empty())
-            BOOST_TEST_MESSAGE("pilot: legacy txindex independently confirms each mined output is unspent");
-        else
-            BOOST_TEST_MESSAGE("pilot: legacy-txindex in-process read unreliable (" << oracleErr
-                               << "); primary equality is the real-coin comparison above");
+        // (4) INDEPENDENT ORACLE — re-homed (M-port). The legacy oracle read each mined
+//     output's spend state from the retired CTxDB txindex ("unspent in legacy
+//     txindex"). txdb-leveldb was physically removed and that spend-state oracle
+//     has NO V2 storage form: TX-LOC maps txid -> position only, and Store3A's
+//     presence IS the unspent state, so an "independent" store would just re-read
+//     the primary source. The unspent invariant remains covered by step (3)
+//     (store3a coin == the real block's authoritative coin) and by the
+//     ConnectBlock observation hook gate (checkAuthority=true above). Nothing was
+//     silently turned into a no-op: the legacy branch is gone by design.
+        BOOST_TEST_MESSAGE("pilot: legacy txindex oracle removed with txdb-leveldb (no V2 counterpart); primary equality gate is step (3)");
 
         // (5) Restart persistence: close + reopen -> identical coin set.
         s16::g_chainObserve.enabled = false;   // stop observing during reopen
@@ -837,7 +818,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             LOCK(cs_main);
             CTransaction sp = BuildSpend(coins[0]);
             bool missing = false;
-            BOOST_REQUIRE_MESSAGE(sp.AcceptToMemoryPool(txdb, true, &missing), "v2mp accept mature spend");
+            BOOST_REQUIRE_MESSAGE(sp.AcceptToMemoryPool(true, &missing), "v2mp accept mature spend");
             BOOST_CHECK(!missing && mempool.exists(sp.GetHash()));
             BOOST_TEST_MESSAGE("v2mp: PASS accept valid mature confirmed input");
         }
@@ -847,7 +828,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             LOCK(cs_main);
             CTransaction sp2 = BuildSpend(coins[0], 200000);
             bool missing = true;
-            BOOST_CHECK_MESSAGE(!sp2.AcceptToMemoryPool(txdb, true, &missing), "v2mp double-spend must reject");
+            BOOST_CHECK_MESSAGE(!sp2.AcceptToMemoryPool(true, &missing), "v2mp double-spend must reject");
             BOOST_CHECK(!mempool.exists(sp2.GetHash()));
             BOOST_TEST_MESSAGE("v2mp: PASS double-spend rejected");
         }
@@ -859,7 +840,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             memset(ghost.txid.data(), 0xFF, 32);
             CTransaction sp3 = BuildSpend(ghost);
             bool missing = false;
-            BOOST_CHECK_MESSAGE(!sp3.AcceptToMemoryPool(txdb, true, &missing), "v2mp missing input must not accept");
+            BOOST_CHECK_MESSAGE(!sp3.AcceptToMemoryPool(true, &missing), "v2mp missing input must not accept");
             BOOST_CHECK_MESSAGE(missing, "v2mp missing input must set pfMissingInputs (orphan)");
             BOOST_TEST_MESSAGE("v2mp: PASS missing input -> orphan");
         }
@@ -869,7 +850,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             LOCK(cs_main);
             CTransaction im = BuildSpend(coins[N-1]);
             bool missing = true;
-            BOOST_CHECK_MESSAGE(!im.AcceptToMemoryPool(txdb, true, &missing), "v2mp immature coinbase must reject");
+            BOOST_CHECK_MESSAGE(!im.AcceptToMemoryPool(true, &missing), "v2mp immature coinbase must reject");
             BOOST_CHECK(!mempool.exists(im.GetHash()));
             BOOST_TEST_MESSAGE("v2mp: PASS immature coinbase spend rejected (maturity " << nCoinbaseMaturity << ")");
         }
@@ -879,14 +860,14 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             LOCK(cs_main);
             CTransaction A = BuildSpend(coins[2]);
             bool m1 = false;
-            BOOST_REQUIRE_MESSAGE(A.AcceptToMemoryPool(txdb, true, &m1), "v2mp accept unconfirmed parent A");
+            BOOST_REQUIRE_MESSAGE(A.AcceptToMemoryPool(true, &m1), "v2mp accept unconfirmed parent A");
             CTransaction B; B.nVersion = 1;
             CTxIn cin; uint256 aHash = A.GetHash(); cin.prevout.hash = aHash; cin.prevout.n = 0; cin.scriptSig.clear();
             B.vin.push_back(cin);
             CTxOut cout; cout.nValue = (coins[2].value - 100000) - 100000; cout.scriptPubKey = CScript() << OP_TRUE;
             B.vout.push_back(cout); B.nTime = (unsigned int)GetTime();
             bool m2 = false;
-            BOOST_CHECK_MESSAGE(B.AcceptToMemoryPool(txdb, true, &m2), "v2mp accept child of unconfirmed parent");
+            BOOST_CHECK_MESSAGE(B.AcceptToMemoryPool(true, &m2), "v2mp accept child of unconfirmed parent");
             BOOST_CHECK(mempool.exists(A.GetHash()) && mempool.exists(B.GetHash()));
             BOOST_TEST_MESSAGE("v2mp: PASS chained unconfirmed parent+child accepted");
         }
@@ -899,7 +880,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             spendBlock = S16MineSpend(coins[1], 0x7100u);   // asserts success internally
             CTransaction sp6 = BuildSpend(coins[1]);
             bool missing = true;
-            BOOST_CHECK_MESSAGE(!sp6.AcceptToMemoryPool(txdb, true, &missing), "v2mp already-spent input must reject");
+            BOOST_CHECK_MESSAGE(!sp6.AcceptToMemoryPool(true, &missing), "v2mp already-spent input must reject");
             BOOST_CHECK_MESSAGE(!missing, "v2mp already-spent input must NOT be orphan");
             BOOST_TEST_MESSAGE("v2mp: PASS already-spent input rejected (TX-LOC spent-vs-orphan)");
         }
@@ -913,7 +894,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             LOCK(cs_main);
             CTransaction sp7 = BuildSpend(coins[1]);
             bool missing = false;
-            BOOST_CHECK_MESSAGE(sp7.AcceptToMemoryPool(txdb, true, &missing), "v2mp reaccept after disconnect (UTXO restored)");
+            BOOST_CHECK_MESSAGE(sp7.AcceptToMemoryPool(true, &missing), "v2mp reaccept after disconnect (UTXO restored)");
             BOOST_CHECK(!missing);
             BOOST_TEST_MESSAGE("v2mp: PASS disconnect -> Store3A undo restores coin -> reaccept");
         }
@@ -930,7 +911,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             CTxOut o8; o8.nValue = spendBlock.sp.value - 100000; o8.scriptPubKey = CScript() << OP_TRUE;
             sp8.vout.push_back(o8); sp8.nTime = (unsigned int)GetTime();
             bool m8 = true;
-            BOOST_CHECK_MESSAGE(!sp8.AcceptToMemoryPool(txdb, true, &m8), "v2mp disconnected-branch coin must NOT be spent");
+            BOOST_CHECK_MESSAGE(!sp8.AcceptToMemoryPool(true, &m8), "v2mp disconnected-branch coin must NOT be spent");
             BOOST_TEST_MESSAGE("v2mp: PASS TXID in locator but absent from active-chain Store3A -> not spendable");
         }
 
@@ -941,10 +922,10 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
             mempool.clear();   // clean slate
             CTransaction sA = BuildSpend(coins[1], 150000);
             bool mA = false;
-            BOOST_REQUIRE_MESSAGE(sA.AcceptToMemoryPool(txdb, true, &mA), "v2mp accept first spend of restored coin");
+            BOOST_REQUIRE_MESSAGE(sA.AcceptToMemoryPool(true, &mA), "v2mp accept first spend of restored coin");
             CTransaction sB = BuildSpend(coins[1], 250000);
             bool mB = true;
-            BOOST_CHECK_MESSAGE(!sB.AcceptToMemoryPool(txdb, true, &mB), "v2mp conflicting spend rejected");
+            BOOST_CHECK_MESSAGE(!sB.AcceptToMemoryPool(true, &mB), "v2mp conflicting spend rejected");
             BOOST_TEST_MESSAGE("v2mp: PASS conflicting spends on restored coin: 1st accepted, 2nd rejected");
         }
 

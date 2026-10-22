@@ -11,7 +11,9 @@
 #include "../blockindex_generation_builder.h"
 #include "../blockindex_generation_lifecycle.h"
 #include "../blockindex_shadow_startup.h"
-#include "../txdb-leveldb.h"
+// M-port: the legacy txdb-leveldb header was removed from this tree. This suite's
+// assertions run entirely through the V2 surfaces (TX-LOC seeded by the fixture,
+// the authoritative BI-V2 block snapshot resolver); no legacy CTxDB call remains.
 #include "../chainstate/txloc/txloc.h"
 
 using namespace hreg;
