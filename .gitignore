@@ -58,3 +58,8 @@ src/store3a_tests
 src/txloc_tests
 src/nullblock_guard_tests
 src/obj/
+src/innova-txloc-build
+src/atlas-sidebranch-probe
+src/txleveldb/
+src/*.o
+obj/
