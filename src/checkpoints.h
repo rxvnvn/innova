@@ -74,6 +74,17 @@ namespace Checkpoints
     // authority inconsistency and must fail closed at startup.
     SyncCheckpointLoadStatus LoadPersistedSyncCheckpoint(uint256& hashOut, std::string* error);
 
+    // TEST-ONLY (no production caller): establish a genuinely ABSENT or restored
+    // persisted sync-checkpoint state without a legacy CTxDB key. The V2 scalar
+    // lives at <datadir>/chainstate/sync-checkpoint; Clear removes that record
+    // (the exact equivalent of the removed CTxDB Delete of "hashSyncCheckpoint"),
+    // Persist writes it through the same V2 encoder used by WriteSyncCheckpoint.
+    bool ClearPersistedSyncCheckpointForTest(std::string* error);
+    bool PersistSyncCheckpointForTest(const uint256& hashCheckpoint);
+    // Raw byte write, so the loader's CORRUPT branch (wrong size/magic/version)
+    // stays reachable after the legacy txdb raw-key API was removed.
+    bool WriteRawPersistedSyncCheckpointForTest(const std::vector<unsigned char>& raw, std::string* error);
+
     // ---------------------------------------------------------------------------
     // V2-R3 (ROUND-2 P0): establishment result of the one-time chain-CREATION
     // genesis synchronized checkpoint (LEGACY PARITY, NOT an unconditional

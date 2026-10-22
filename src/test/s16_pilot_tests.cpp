@@ -819,7 +819,7 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
         BOOST_TEST_MESSAGE("v2mp: mined " << N << " blocks tip=" << pindexBest->nHeight
                             << " storeSize=" << StoreSize(store) << " txloc=" << txloc::g_txloc.count());
 
-        CTxDB txdb;   // fresh (unused) handle; armed-V2 mempool reads Store3A/TX-LOC, not txdb
+        // (no legacy txdb handle: armed-V2 mempool reads Store3A/TX-LOC)
         SpendBlockResult spendBlock;   // the real spend-block that consumes coins[1] (for reorg/undo scenarios)
         auto BuildSpend = [&](const S16Coin& src, int64_t pay = 100000) -> CTransaction {
             CTransaction t; t.nVersion = 1;

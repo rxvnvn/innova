@@ -89,7 +89,7 @@ static CBlockIndex* B94Mine(CBlockIndex* prev, unsigned int extra)
 static void B94BuildRoot(const fs::path& root, std::string* error)
 {
     fs::create_directories(root / "snapshot");
-    { CTxDB db; db.Close(); }
+    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
     const auto live = GetDataDir() / "txleveldb";
     for (fs::directory_iterator it(live), end; it != end; ++it)
         if (fs::is_regular_file(it->path()))

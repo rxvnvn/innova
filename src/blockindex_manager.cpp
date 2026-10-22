@@ -452,6 +452,68 @@ BlockIndexManagerStatus BlockIndexManager::GetLastBlockIndexByProofType(const ui
     return BLOCK_INDEX_MANAGER_OK;
 }
 
+// Difficulty-path reads: identical to the active-only readers above, except
+// that a composite "record exists, not on the active chain" answer is a SUCCESS.
+// The by-value snapshot (hash/height/nTime/nBits/nFile/nBlockPos) is what the
+// DGW requirement needs; main-chain membership is a different question, answered
+// by GetActiveByHeight / GetTip / chain selection, which stay untouched.
+BlockIndexManagerStatus BlockIndexManager::LookupByHashForDifficulty(const uint256& hash,
+                                                                    BlockIndexSnapshot* out,
+                                                                    std::string* error) const
+{
+    if (!out)
+        return BLOCK_INDEX_MANAGER_AUTHORITY_FAILURE;
+    if (UseComposite())
+    {
+        out->found = false;
+        const AuthoritativeBlockResolutionResult r =
+            ResolveAuthoritativeBlockSnapshotR(hash, out, error);
+        if (r == AUTHORITATIVE_BLOCK_NOT_ACTIVE)
+        {
+            // out was filled from the live tail before the activeness verdict.
+            if (error) error->clear();
+            return BLOCK_INDEX_MANAGER_OK;
+        }
+        return MapCompositeResult(r);
+    }
+    return LookupByHash(hash, out, error);
+}
+
+BlockIndexManagerStatus BlockIndexManager::GetParentForDifficulty(const uint256& hash,
+                                                                 BlockIndexSnapshot* out,
+                                                                 std::string* error) const
+{
+    BlockIndexSnapshot child;
+    BlockIndexManagerStatus st = LookupByHashForDifficulty(hash, &child, error);
+    if (st != BLOCK_INDEX_MANAGER_OK)
+        return st;
+    if (child.hashPrev == uint256(0))
+    {
+        if (error) *error = "block index manager: block has no persisted parent";
+        return BLOCK_INDEX_MANAGER_NOT_FOUND;
+    }
+    return LookupByHashForDifficulty(child.hashPrev, out, error);
+}
+
+BlockIndexManagerStatus BlockIndexManager::GetLastBlockIndexByProofTypeForDifficulty(
+    const uint256& fromHash, bool fProofOfStake, BlockIndexSnapshot* out, std::string* error) const
+{
+    BlockIndexSnapshot s;
+    BlockIndexManagerStatus st = LookupByHashForDifficulty(fromHash, &s, error);
+    if (st != BLOCK_INDEX_MANAGER_OK)
+        return st;
+    // Legacy GetLastBlockIndex semantics: stop when the proof type matches OR the
+    // walk reaches genesis (no parent).
+    while (s.hasParent && (s.fProofOfStake != fProofOfStake))
+    {
+        st = GetParentForDifficulty(s.hash, &s, error);
+        if (st != BLOCK_INDEX_MANAGER_OK)
+            return st;
+    }
+    *out = s;
+    return BLOCK_INDEX_MANAGER_OK;
+}
+
 // Stage F (L6c): hash-native getblocks locator. Byte-for-byte equivalent to the
 // legacy CBlockLocator(const CBlockIndex*) Set() walk, but parent navigation is
 // BY VALUE through the manager (no CBlockIndex*, no mapBlockIndex).

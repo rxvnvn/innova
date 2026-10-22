@@ -64,8 +64,9 @@ struct TestingSetup {
         JoinTrackedThreads();
         delete pwalletMain;
         pwalletMain = NULL;
-        CTxDB txdb;
-        txdb.Close();
+        // No legacy txdb teardown: txdb-leveldb (and CTxDB) was physically
+        // removed from this tree. The V2 stores are closed by each suite's own
+        // authoritative-startup reset before this global fixture runs.
         bitdb.Flush(true);
         fRegTest = fRegTestSaved;
         fTestNet = fTestNetSaved;

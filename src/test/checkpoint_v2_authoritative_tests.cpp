@@ -47,8 +47,6 @@
 
 namespace fs = boost::filesystem;
 extern CWallet* pwalletMain;
-// Defined in txdb-leveldb.cpp (test/ops accessor to the global legacy txdb).
-void* GetGlobalTxdbPtrForTest();
 
 // Test-only memo invalidation seam (defined in checkpoints.cpp): clears the
 // per-tip extends-memo, the descendant-verdict map and the per-epoch
@@ -307,7 +305,7 @@ BOOST_AUTO_TEST_CASE(nonresident_checkpoint_ancestry_is_resolved_by_value)
     // Arm the NON-RESIDENT historical checkpoint and validate an extension of
     // the live tip (a descendant of height 3).
     Checkpoints::hashSyncCheckpoint = hashCold;
-    { CTxDB db("cr+"); BOOST_REQUIRE(db.WriteSyncCheckpoint(hashCold)); }
+    BOOST_REQUIRE(Checkpoints::WriteSyncCheckpoint(hashCold));
     BOOST_CHECK_MESSAGE(Checkpoints::CheckSyncByValue(uint256(0xF1A0), tip),
                         "descendant of a non-resident sync-checkpoint must pass");
 
@@ -381,7 +379,7 @@ BOOST_AUTO_TEST_CASE(ibd_false_transition_does_not_reject_candidates)
 
     // (b) FIX A + FIX B: the persisted NON-RESIDENT checkpoint is restored and
     //     the candidate extending a healthy tip is accepted.
-    { CTxDB db("cr+"); BOOST_REQUIRE(db.WriteSyncCheckpoint(hashCold)); }
+    BOOST_REQUIRE(Checkpoints::WriteSyncCheckpoint(hashCold));
     uint256 loaded = uint256(0);
     BOOST_REQUIRE_EQUAL((int)Checkpoints::LoadPersistedSyncCheckpoint(loaded, NULL), (int)SYNC_CHECKPOINT_LOADED);
     Checkpoints::hashSyncCheckpoint = loaded;
@@ -463,13 +461,143 @@ BOOST_AUTO_TEST_CASE(fork_below_checkpoint_rejected_extension_accepted)
     BOOST_CHECK(side->GetBlockHash() != n2->GetBlockHash());
 
     Checkpoints::hashSyncCheckpoint = n2->GetBlockHash();
-    { CTxDB db("cr+"); BOOST_REQUIRE(db.WriteSyncCheckpoint(n2->GetBlockHash())); }
+    BOOST_REQUIRE(Checkpoints::WriteSyncCheckpoint(n2->GetBlockHash()));
 
     BOOST_CHECK_MESSAGE(Checkpoints::CheckSyncByValue(uint256(0xF4A0), n2),
                         "extension of the checkpoint lineage must pass");
     BOOST_CHECK_MESSAGE(!Checkpoints::CheckSyncByValue(uint256(0xF4B0), side),
                         "fork below the sync-checkpoint must be rejected");
 
+    fx.Restore();
+}
+
+// Size of the blk*.dat payloads, used to prove that a re-delivered (duplicate)
+// block does NOT cause another body write (no write amplification).
+static uint64_t CkptAVBlocksDirSize()
+{
+    uint64_t total = 0;
+    for (int i = 0; i < 1000; ++i)
+    {
+        char name[32];
+        snprintf(name, sizeof(name), "blk%04d.dat", i);
+        fs::path p = GetDataDir() / name;
+        if (fs::exists(p)) total += (uint64_t)fs::file_size(p);
+    }
+    return total;
+}
+
+// ---------------------------------------------------------------------------
+// Side-branch acceptance: a VALID competing block at the same height as the
+// active tip must be accepted, and each branch's next difficulty must be
+// resolved INDEPENDENTLY from ITS OWN parent (never from the active branch).
+// This is the regression for the production rejection of 8180513' (a valid
+// sibling of our 8180513 whose requirement differs because its parent's nTime
+// differs). Runs in authoritative mode (CkptAVFixture.Start), so it exercises
+// the real AcceptBlock -> ResolveNextTargetRequiredByValue seam.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_CASE(sidebranch_two_parents_same_height_independent_difficulty)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+
+    CBlockIndex* oldTip = pindexBest;
+    BOOST_REQUIRE(oldTip != NULL);
+    const uint256 oldTrust = oldTip->nChainTrust;
+
+    struct CkptAVSideMockTime
+    {
+        ~CkptAVSideMockTime() { SetMockTime(0); }
+    } mockTimeGuard;
+
+    const int64_t t0 = (int64_t)GetTime() + 60;
+    SetMockTime(t0);
+    CBlockIndex* ext = CkptAVMine(oldTip, 0x5101u, true);     // branch A child
+    SetMockTime(t0 + 30);
+    CBlockIndex* side = CkptAVMine(oldTip, 0x5102u, true);    // branch B child (valid sibling)
+    SetMockTime(0);
+
+    BOOST_REQUIRE(ext != NULL);
+    BOOST_REQUIRE_MESSAGE(side != NULL,
+                          "a valid competing block at the same height must be accepted");
+    BOOST_CHECK_EQUAL(ext->nHeight, side->nHeight);
+    BOOST_CHECK_MESSAGE(ext->GetBlockHash() != side->GetBlockHash(),
+                        "the two children must be distinct blocks");
+    BOOST_CHECK_EQUAL(ext->pprev->GetBlockHash().ToString(), oldTip->GetBlockHash().ToString());
+    BOOST_CHECK_EQUAL(side->pprev->GetBlockHash().ToString(), oldTip->GetBlockHash().ToString());
+
+    // Trust accumulates per branch from the shared parent; it never leaks
+    // sideways between competing branches.
+    BOOST_CHECK_MESSAGE(ext->nChainTrust > oldTrust, "extension must add work");
+    BOOST_CHECK_MESSAGE(side->nChainTrust > oldTrust, "side branch must add work");
+    BOOST_CHECK_EQUAL(ext->nChainTrust.ToString(), side->nChainTrust.ToString());
+
+    // Independent difficulty per branch, and parity with the legacy resolver.
+    unsigned int bitsA = 0, bitsB = 0;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(ResolveNextTargetRequiredByValue(ext->GetBlockHash(), false, &bitsA, &err), err);
+    BOOST_REQUIRE_MESSAGE(ResolveNextTargetRequiredByValue(side->GetBlockHash(), false, &bitsB, &err), err);
+    BOOST_CHECK_EQUAL(bitsA, GetNextTargetRequired(ext, false));
+    BOOST_CHECK_EQUAL(bitsB, GetNextTargetRequired(side, false));
+    BOOST_CHECK_MESSAGE(bitsA != bitsB,
+                        "branches with different parent times must require different bits");
+
+    fx.Restore();
+}
+
+// A block whose nBits is genuinely wrong (easier than the branch requires) must
+// still be rejected: the difficulty check is never weakened to accept it.
+BOOST_AUTO_TEST_CASE(wrong_nbits_block_rejected)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+
+    CBlock* b = CkptAVBuildPoW(pindexBest, 0x5201u);
+    BOOST_REQUIRE(b != NULL);
+    b->nBits = 0x1d0fffff;   // easier than the required target
+    const uint256 target = CBigNum().SetCompact(b->nBits).getuint256();
+    b->nNonce = 0;
+    while (b->GetHash() > target && b->nNonce < 0xffffffff) ++b->nNonce;
+
+    bool ok = false;
+    {
+        LOCK(cs_main);
+        ok = b->CheckBlock(true, true, true) && ProcessBlock(NULL, b);
+    }
+    delete b;
+
+    BOOST_CHECK_MESSAGE(!ok, "block with truly incorrect nBits must be rejected");
+    fx.Restore();
+}
+
+// Re-delivering a block we already have must be a no-op: rejected as duplicate
+// AND without appending the body a second time.
+BOOST_AUTO_TEST_CASE(duplicate_block_rejected_without_body_rewrite)
+{
+    CkptAVFixture fx;
+    fx.Start(6);
+
+    CBlock* b = CkptAVBuildPoW(pindexBest, 0x5301u);
+    BOOST_REQUIRE(b != NULL);
+
+    bool first = false;
+    {
+        LOCK(cs_main);
+        first = ProcessBlock(NULL, b);
+    }
+    BOOST_REQUIRE(first);
+
+    const uint64_t sizeBefore = CkptAVBlocksDirSize();
+    bool second = false;
+    {
+        LOCK(cs_main);
+        second = ProcessBlock(NULL, b);
+    }
+    const uint64_t sizeAfter = CkptAVBlocksDirSize();
+    delete b;
+
+    BOOST_CHECK_MESSAGE(!second, "an already-known block must be rejected as duplicate");
+    BOOST_CHECK_MESSAGE(sizeAfter == sizeBefore,
+                        "duplicate delivery must not write the block body again");
     fx.Restore();
 }
 
@@ -762,8 +890,11 @@ struct CkptEmptyNewGuard
         persistedWasAbsent =
             (Checkpoints::LoadPersistedSyncCheckpoint(savedPersisted, NULL) != SYNC_CHECKPOINT_LOADED);
 
-        // Close the shared global txdb (p07b C2CloseLegacyGlobal).
-        if (GetGlobalTxdbPtrForTest() != NULL) { CTxDB db("r"); db.Close(); }
+        // (p07b C2CloseLegacyGlobal) The shared global txdb no longer exists:
+        // txdb-leveldb was physically removed from this tree (no CTxDB symbol,
+        // no GetGlobalTxdbPtrForTest). The invariant "no legacy store is open
+        // during EMPTY_NEW bootstrap" therefore holds by construction; the close
+        // step is unnecessary rather than skipped.
 
         root = fs::temp_directory_path() / fs::unique_path("ckpt-emptygen-%%%%-%%%%");
     }
@@ -805,17 +936,13 @@ struct CkptEmptyNewGuard
         for (std::map<uint256, CBlockIndex*>::iterator d = scratch.begin(); d != scratch.end(); ++d)
             delete d->second;
         scratch.clear();
-        // Restore the persisted checkpoint raw key to its exact prior state.
-        CDataStream ssKey(SER_DISK, CLIENT_VERSION);
-        ssKey << std::string("hashSyncCheckpoint");
-        CTxDB db("cr+");
-        leveldb::Status st;
+        // Restore the persisted checkpoint to its exact prior state through the
+        // V2 scalar home (the legacy raw LevelDB key no longer exists).
+        std::string persErr;
         if (persistedWasAbsent)
-            st = db.GetInstance()->Delete(leveldb::WriteOptions(), ssKey.str());
+            BOOST_REQUIRE_MESSAGE(Checkpoints::ClearPersistedSyncCheckpointForTest(&persErr), persErr);
         else
-            st = db.GetInstance()->Put(leveldb::WriteOptions(), ssKey.str(),
-                std::string((const char*)&savedPersisted, 32));
-        BOOST_REQUIRE_MESSAGE(st.ok(), st.ToString());
+            BOOST_REQUIRE_MESSAGE(Checkpoints::PersistSyncCheckpointForTest(savedPersisted), persErr);
         try { fs::remove_all(root); } catch (...) {}
     }
 };
@@ -830,11 +957,8 @@ BOOST_AUTO_TEST_CASE(fresh_empty_new_genesis_checkpoint_establishment_e2e)
         // may carry a stale value from an earlier suite. Make the persisted
         // state genuinely EMPTY so the fresh-EMPTY_NEW creation branch (which
         // requires ABSENT) is exercised; the guard restores the prior key.
-        CDataStream ssKey(SER_DISK, CLIENT_VERSION);
-        ssKey << std::string("hashSyncCheckpoint");
-        CTxDB db("cr+");
-        leveldb::Status st = db.GetInstance()->Delete(leveldb::WriteOptions(), ssKey.str());
-        BOOST_REQUIRE_MESSAGE(st.ok(), st.ToString());
+        std::string persErr;
+        BOOST_REQUIRE_MESSAGE(Checkpoints::ClearPersistedSyncCheckpointForTest(&persErr), persErr);
     }
     // p07b working EMPTY_NEW bootstrap: durable CURRENT -> generation 1.
     BOOST_REQUIRE_MESSAGE(
@@ -971,7 +1095,7 @@ BOOST_AUTO_TEST_CASE(weak_competitor_work_gate_nonresident_checkpoint)
                         "checkpoint must be NON-RESIDENT after retirement");
 
     Checkpoints::hashSyncCheckpoint = hashCold;
-    { CTxDB db("cr+"); BOOST_REQUIRE(db.WriteSyncCheckpoint(hashCold)); }
+    BOOST_REQUIRE(Checkpoints::WriteSyncCheckpoint(hashCold));
 
     // (a) FIX-B: the work-gate anchors MUST resolve by value from the
     // non-resident record (this is the P3a/FIX-B regression -- the resident

@@ -828,6 +828,10 @@ innovad: $(OBJS:obj/%=obj/%) $(LVLLIBS)
 innova-blockindex-builder: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/blockindex_generation_builder_tool.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
 
+# Pass 8 Stage 1: side-branch difficulty probe (real manager + real DGW, own main).
+atlas-sidebranch-probe: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/atlas_sidebranch_probe.o
+	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)
+
 # S1.8: offline DIRECT legacy->Store3A converter (read-only source, no consensus revalidation).
 innova-store3a-conv: $(filter-out obj/init.o,$(OBJS:obj/%=obj/%)) obj/migrate_legacy.o
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)

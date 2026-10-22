@@ -411,7 +411,7 @@ BOOST_AUTO_TEST_CASE(f2_parent_score_resolver_parity_and_contract)
         }
     } cleanup(root, savedBest, savedGenesis, savedBestChain, savedBestHeight, savedBestTrust);
 
-    { CTxDB db; db.Close(); }
+    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
     const auto live = GetDataDir() / "txleveldb";
     for (fs::directory_iterator it(live), end; it != end; ++it)
         if (fs::is_regular_file(it->path())) fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
@@ -451,7 +451,7 @@ BOOST_AUTO_TEST_CASE(f2_parent_score_resolver_parity_and_contract)
 static void F2BuildAuthoritativeGenerationAndInit(const fs::path& root, std::string* error)
 {
     fs::create_directories(root / "snapshot");
-    { CTxDB db; db.Close(); }
+    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
     const auto live = GetDataDir() / "txleveldb";
     for (fs::directory_iterator it(live), end; it != end; ++it)
         if (fs::is_regular_file(it->path())) fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
@@ -1223,7 +1223,7 @@ BOOST_AUTO_TEST_CASE(r4_authority_ready_published_by_real_authoritative_startup)
             if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
             SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
     } cleanup(root);
-    { CTxDB db; db.Close(); }
+    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
     const auto liveDir=GetDataDir()/"txleveldb";
     for(fs::directory_iterator it(liveDir),end;it!=end;++it)
         if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
@@ -1345,7 +1345,7 @@ BOOST_AUTO_TEST_CASE(f2_byvalue_provider_failure_matrix)
     // parent's blockindex record DELETED (the injected inconsistency).
     fs::create_directories(root / "snapshot");
     fs::create_directories(root / "snapshot-broken");
-    { CTxDB db; db.Close(); }
+    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
     const auto live = GetDataDir() / "txleveldb";
     for (fs::directory_iterator it(live), end; it != end; ++it)
         if (fs::is_regular_file(it->path())) {
@@ -1947,7 +1947,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
             if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
             SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
     } cleanup(root);
-    { CTxDB db; db.Close(); }
+    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
     const auto liveDir=GetDataDir()/"txleveldb";
     for(fs::directory_iterator it(liveDir),end;it!=end;++it)
         if(fs::is_regular_file(it->path())) fs::copy_file(it->path(),root/"snapshot"/it->path().filename());
@@ -2035,7 +2035,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
             if(best){nBestHeight=best->nHeight;hashBestChain=best->GetBlockHash();nBestChainTrust=best->nChainTrust;}
             SetMockTime(0); try{fs::remove_all(root);}catch(...){} }
     } cleanup(root);
-    { CTxDB db; db.Close(); }
+    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
     const auto liveDir = GetDataDir() / "txleveldb";
     for (fs::directory_iterator it(liveDir), end; it != end; ++it)
         if (fs::is_regular_file(it->path())) fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
@@ -2130,7 +2130,7 @@ BOOST_AUTO_TEST_CASE(p1_retirement_linear_reorg_and_restart_parity)
         BlockIndexAuthoritativeLive* shuttingDown = GetAuthoritativeLiveAuthority();
         if (shuttingDown && shuttingDown->IsOpen()) shuttingDown->Close();
     }
-    { CTxDB db; db.Close(); }
+    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
     ResetBlockIndexAuthoritativeStartupForTest();
     AuthorityReadyResetForTest();
     BOOST_REQUIRE(!AuthorityReadyIsSet());

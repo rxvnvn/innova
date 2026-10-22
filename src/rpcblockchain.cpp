@@ -1445,16 +1445,55 @@ static int GetDepthInMainChainReadOnly(const CWalletTx& tx)
     if (tx.hashBlock == 0 || tx.nIndex == -1)
         return mempool.exists(tx.GetHash()) ? 0 : -1;
 
+    // Resolve the confirming block and its active-chain membership.
+    // Fast path: the legacy in-memory index, when it still holds the block.
+    int nHeight = -1;
+    uint256 hashMerkleRoot;
     map<uint256, CBlockIndex*>::const_iterator it = mapBlockIndex.find(tx.hashBlock);
-    if (it == mapBlockIndex.end() || !it->second || !it->second->IsInMainChain())
-        return mempool.exists(tx.GetHash()) ? 0 : -1;
-    if (!tx.fMerkleVerified &&
-        CBlock::CheckMerkleBranch(tx.GetHash(), tx.vMerkleBranch, tx.nIndex) !=
-            it->second->hashMerkleRoot)
-        return mempool.exists(tx.GetHash()) ? 0 : -1;
+    if (it != mapBlockIndex.end() && it->second && it->second->IsInMainChain())
+    {
+        nHeight = it->second->nHeight;
+        hashMerkleRoot = it->second->hashMerkleRoot;
+    }
+    else
+    {
+        // Authoritative Block Index V2: the legacy map is not authoritative (and,
+        // for blocks outside its resident window, not populated at all). Resolve
+        // the block through BI-V2 and require main-chain membership there.
+        BlockIndexSnapshot snap;
+        CBlock probe;
+        std::string resolveError;
+        if (!ReadAuthoritativeBlockByHash(tx.hashBlock, &snap, &probe, &resolveError))
+            return mempool.exists(tx.GetHash()) ? 0 : -1;
+        if (!snap.fInMainChain)
+            return mempool.exists(tx.GetHash()) ? 0 : -1;
+        nHeight = snap.height;
+        hashMerkleRoot = snap.hashMerkleRoot;
+    }
+
+    // Merkle membership proof. Wallet transactions loaded from disk carry no
+    // vMerkleBranch, so a stored-branch-only check rejects every such tx; prove
+    // membership by recomputing the merkle root from the block body instead.
+    bool fProven = false;
+    if (!tx.vMerkleBranch.empty() &&
+        CBlock::CheckMerkleBranch(tx.GetHash(), tx.vMerkleBranch, tx.nIndex) == hashMerkleRoot)
+        fProven = true;
+    if (!fProven)
+    {
+        BlockIndexSnapshot snap;
+        CBlock block;
+        std::string readError;
+        if (!ReadAuthoritativeBlockByHash(tx.hashBlock, &snap, &block, &readError))
+            return mempool.exists(tx.GetHash()) ? 0 : -1;
+        if (tx.nIndex < 0 || tx.nIndex >= (int)block.vtx.size() ||
+            block.vtx[tx.nIndex].GetHash() != tx.GetHash() ||
+            block.BuildMerkleTree() != hashMerkleRoot)
+            return -1;
+    }
+
     if (!pindexBest)
         return 0;
-    return pindexBest->nHeight - it->second->nHeight + 1;
+    return pindexBest->nHeight - nHeight + 1;
 }
 
 static int GetBlocksToMaturityReadOnly(const CWalletTx& tx, int depth)

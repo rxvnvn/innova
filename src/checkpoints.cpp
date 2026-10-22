@@ -2,6 +2,8 @@
 // Distributed under the MIT/X11 software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
+#include <fstream>   // TEST-ONLY raw sync-checkpoint write helper
+#include <vector>
 #include <boost/assign/list_of.hpp> // for 'map_list_of()'
 #include <boost/foreach.hpp>
 
@@ -326,6 +328,68 @@ namespace Checkpoints
             if (error)
                 *error = "V2 sync-checkpoint scalar read failed (unknown exception)";
             return SYNC_CHECKPOINT_CORRUPT;
+        }
+    }
+
+    // TEST-ONLY helpers (declared in checkpoints.h): no production caller.
+    // They exist so tests can establish ABSENT / restored persisted state after
+    // the legacy CTxDB key API was removed; they act on the SAME V2 scalar home
+    // that WriteSyncCheckpoint/ReadV2SyncCheckpointScalar use.
+    bool ClearPersistedSyncCheckpointForTest(std::string* error)
+    {
+        try
+        {
+            boost::filesystem::path p = V2SyncCheckpointScalarPath();
+            boost::system::error_code ec;
+            boost::filesystem::remove(p, ec);   // absent is success: post-state is what matters
+            if (ec)
+            {
+                if (error) *error = "clear persisted sync-checkpoint failed: " + ec.message();
+                return false;
+            }
+            if (error) error->clear();
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            if (error) *error = std::string("clear persisted sync-checkpoint failed: ") + e.what();
+            return false;
+        }
+    }
+
+    bool PersistSyncCheckpointForTest(const uint256& hashCheckpoint)
+    {
+        return WriteV2SyncCheckpointScalar(hashCheckpoint);
+    }
+
+    bool WriteRawPersistedSyncCheckpointForTest(const std::vector<unsigned char>& raw, std::string* error)
+    {
+        try
+        {
+            boost::filesystem::path p = V2SyncCheckpointScalarPath();
+            if (!p.parent_path().empty() && !boost::filesystem::exists(p.parent_path()))
+                boost::filesystem::create_directories(p.parent_path());
+            std::ofstream f(p.string().c_str(), std::ios::binary | std::ios::trunc);
+            if (!f.good())
+            {
+                if (error) *error = "raw test write: cannot open persisted sync-checkpoint";
+                return false;
+            }
+            if (!raw.empty())
+                f.write((const char*)&raw[0], (std::streamsize)raw.size());
+            f.flush();
+            if (!f.good())
+            {
+                if (error) *error = "raw test write: persisted sync-checkpoint write failed";
+                return false;
+            }
+            if (error) error->clear();
+            return true;
+        }
+        catch (const std::exception& e)
+        {
+            if (error) *error = std::string("raw test write failed: ") + e.what();
+            return false;
         }
     }
 

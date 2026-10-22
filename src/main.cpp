@@ -4692,11 +4692,14 @@ bool ResolveNextTargetRequiredByValue(const uint256& hashLast, bool fProofOfStak
 
     BlockIndexManager& mgr = GetBlockIndexManager();
     BlockIndexSnapshot last;
-    if (mgr.LookupByHash(hashLast, &last, error) != BLOCK_INDEX_MANAGER_OK)
+    // Difficulty-path reads are side-branch safe: the parent of a competing
+    // block must resolve even when it is NOT on the active chain. The active-only
+    // readers keep their semantics for chain selection and every other consumer.
+    if (mgr.LookupByHashForDifficulty(hashLast, &last, error) != BLOCK_INDEX_MANAGER_OK)
         return false; // authority failure -> fail closed
 
     BlockIndexSnapshot prev;
-    if (mgr.GetLastBlockIndexByProofType(hashLast, fProofOfStake, &prev, error) != BLOCK_INDEX_MANAGER_OK)
+    if (mgr.GetLastBlockIndexByProofTypeForDifficulty(hashLast, fProofOfStake, &prev, error) != BLOCK_INDEX_MANAGER_OK)
         return false;
     if (!prev.hasParent)
     {
@@ -4704,7 +4707,7 @@ bool ResolveNextTargetRequiredByValue(const uint256& hashLast, bool fProofOfStak
         return true;
     }
     BlockIndexSnapshot prevPrev;
-    if (mgr.GetLastBlockIndexByProofType(prev.hashPrev, fProofOfStake, &prevPrev, error) != BLOCK_INDEX_MANAGER_OK)
+    if (mgr.GetLastBlockIndexByProofTypeForDifficulty(prev.hashPrev, fProofOfStake, &prevPrev, error) != BLOCK_INDEX_MANAGER_OK)
         return false;
     if (!prevPrev.hasParent)
     {
@@ -4749,6 +4752,16 @@ bool ResolveNextTargetRequiredByValue(const uint256& hashLast, bool fProofOfStak
         bnNew = bnTargetLimit;
 
     *pBitsOut = bnNew.GetCompact();
+    // TEMPORARY DIAGNOSTIC (operator-requested, -dgwtrace): log the exact
+    // by-value parent chain the difficulty requirement was computed from, so a
+    // side-branch rejection can be attributed to concrete (hash,nTime,bits)
+    // inputs rather than inferred. No effect unless the flag is set.
+    if (GetBoolArg("-dgwtrace", false))
+        LogPrintf("DGW_TRACE last=%s h=%d prev=%s t=%u bits=%08x prevprev=%s t=%u spacing=%" PRId64 " nextH=%d effSpacing=%u nInterval=%" PRId64 " computed=%08x\n",
+                  hashLast.ToString().c_str(), last.height,
+                  prev.hash.ToString().c_str(), prev.nTime, prev.nBits,
+                  prevPrev.hash.ToString().c_str(), prevPrev.nTime,
+                  nActualSpacing, nNextHeight, nEffectiveSpacing, nInterval, *pBitsOut);
     return true;
 }
 
@@ -8771,9 +8784,24 @@ bool CBlock::AcceptBlock()
             liveDup->ResolveBlockSnapshot(hash, &dupSnapshot, &dupErr);
         if (dupStatus == BlockIndexHotStatus::OK)
         {
-            TraceAcceptBlockReject(*this, dupSnapshot.height, ABREJECT_DUPLICATE);
-            return error("AcceptBlock() : block already in authoritative V2 index at height %d (%s)",
-                         dupSnapshot.height, hash.ToString().substr(0,20).c_str());
+            // Index presence alone does NOT prove the block BODY is on disk: a
+            // by-value V2 record can exist while the body was never written.
+            // Treat as duplicate ONLY when the body is provably readable at the
+            // recorded (nFile,nBlockPos); otherwise fall through so the normal
+            // path writes the body. Probe is HEADER-ONLY (no full-body read, no
+            // write) so the re-delivery path stays cheap and the L5
+            // write-amplification guard is preserved: a genuinely present block
+            // still short-circuits here and is never re-written.
+            CBlock dupProbe;
+            if (dupProbe.ReadFromDisk(dupSnapshot.nFile, dupSnapshot.nBlockPos, false) &&
+                dupProbe.GetHash() == hash)
+            {
+                TraceAcceptBlockReject(*this, dupSnapshot.height, ABREJECT_DUPLICATE);
+                return error("AcceptBlock() : block already in authoritative V2 index at height %d (%s)",
+                             dupSnapshot.height, hash.ToString().substr(0,20).c_str());
+            }
+            // else: record without a provable body -> DO NOT short-circuit; fall
+            // through so WriteToDisk persists the body exactly once.
         }
         if (dupStatus != BlockIndexHotStatus::AUTHORITY_MISSING)
         {
@@ -8912,9 +8940,19 @@ bool CBlock::AcceptBlock()
         // no resident pprev walk. Fail closed if the authority cannot answer.
         // The only remaining pointer use is identity extraction (pindexPrev's
         // hash); the AcceptBlock pindexPrev parameter is the next removal target.
+        const uint256 prevHashFromPointer = pindexPrev->GetBlockHash();
+        if (GetBoolArg("-dgwtrace", false))
+            LogPrintf("DGW_TRACE_PARENT block=%s h=%d headerPrev=%s pointerPrev=%s identityMatch=%d\n",
+                      hash.ToString().c_str(), nHeight, hashPrevBlock.ToString().c_str(),
+                      prevHashFromPointer.ToString().c_str(),
+                      prevHashFromPointer == hashPrevBlock ? 1 : 0);
         std::string tErr;
-        if (!ResolveNextTargetRequiredByValue(pindexPrev->GetBlockHash(), IsProofOfStake(), &nComputedBits, &tErr))
+        if (!ResolveNextTargetRequiredByValue(prevHashFromPointer, IsProofOfStake(), &nComputedBits, &tErr))
         {
+            if (GetBoolArg("-dgwtrace", false))
+                LogPrintf("DGW_TRACE_FAIL block=%s h=%d lookupHash=%s err=%s\n",
+                          hash.ToString().c_str(), nHeight,
+                          prevHashFromPointer.ToString().c_str(), tErr.c_str());
             TraceAcceptBlockReject(*this, nHeight, ABREJECT_INCORRECT_BITS);
             return error("AcceptBlock() : difficulty authority unavailable: %s", tErr.c_str());
         }
@@ -8925,6 +8963,9 @@ bool CBlock::AcceptBlock()
     }
     if (nBits != nComputedBits)
     {
+        if (GetBoolArg("-dgwtrace", false))
+            LogPrintf("DGW_TRACE_MISMATCH block=%s h=%d blockBits=%08x computedBits=%08x\n",
+                      hash.ToString().c_str(), nHeight, nBits, nComputedBits);
         TraceAcceptBlockReject(*this, nHeight, ABREJECT_INCORRECT_BITS);
         return DoS(100, error("AcceptBlock() : incorrect %s", IsProofOfWork() ? "proof-of-work" : "proof-of-stake"));
     }

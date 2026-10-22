@@ -42,29 +42,21 @@ namespace fs = boost::filesystem;
 extern CWallet* pwalletMain;
 
 // ---------------------------------------------------------------- raw key I/O
-// The persisted checkpoint lives under the legacy tx-leveldb key
-// "hashSyncCheckpoint". These helpers write/erase/poison the RAW entry so the
-// loader's ABSENT / CORRUPT branches can be exercised deterministically (the
-// public WriteSyncCheckpoint can only ever write a well-formed uint256).
-static std::string CkptV2Key()
-{
-    CDataStream ssKey(SER_DISK, CLIENT_VERSION);
-    ssKey << std::string("hashSyncCheckpoint");
-    return ssKey.str();
-}
-
+// The persisted checkpoint lives in the V2-native scalar home
+// (<datadir>/chainstate/sync-checkpoint). These helpers write/erase/poison that
+// record so the loader's ABSENT / CORRUPT branches stay deterministically
+// reachable (the public WriteSyncCheckpoint can only write a well-formed uint256).
 static void CkptV2RawPut(const std::string& rawValue)
 {
-    CTxDB db("cr+");
-    leveldb::Status st = db.GetInstance()->Put(leveldb::WriteOptions(), CkptV2Key(), rawValue);
-    BOOST_REQUIRE_MESSAGE(st.ok(), st.ToString());
+    std::vector<unsigned char> raw(rawValue.begin(), rawValue.end());
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(Checkpoints::WriteRawPersistedSyncCheckpointForTest(raw, &err), err);
 }
 
 static void CkptV2RawDelete()
 {
-    CTxDB db("cr+");
-    leveldb::Status st = db.GetInstance()->Delete(leveldb::WriteOptions(), CkptV2Key());
-    BOOST_REQUIRE_MESSAGE(st.ok(), st.ToString());
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(Checkpoints::ClearPersistedSyncCheckpointForTest(&err), err);
 }
 
 // ---------------------------------------------------------------- mine helpers
@@ -206,7 +198,7 @@ struct CkptV2SavedState
         if (fRestorePersisted)
         {
             if (persistedWasAbsent) CkptV2RawDelete();
-            else { CTxDB db("cr+"); db.WriteSyncCheckpoint(persistedCheckpoint); }
+            else BOOST_REQUIRE(Checkpoints::WriteSyncCheckpoint(persistedCheckpoint));
         }
     }
 };
@@ -237,7 +229,7 @@ BOOST_AUTO_TEST_CASE(valid_persisted_checkpoint_loads_exactly)
 {
     CkptV2SavedState saved;
     const uint256 sentinel = uint256("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
-    { CTxDB db("cr+"); BOOST_REQUIRE(db.WriteSyncCheckpoint(sentinel)); }
+    BOOST_REQUIRE(Checkpoints::WriteSyncCheckpoint(sentinel));
 
     uint256 out = uint256(0);
     std::string err;
@@ -289,7 +281,7 @@ BOOST_AUTO_TEST_CASE(v2_authoritative_startup_and_restart_reload_checkpoint)
     BOOST_REQUIRE(at3 != NULL);
     const uint256 sentinel = at3->GetBlockHash();
     BOOST_REQUIRE(sentinel != pindexGenesisBlock->GetBlockHash());
-    { CTxDB db("cr+"); BOOST_REQUIRE(db.WriteSyncCheckpoint(sentinel)); }
+    BOOST_REQUIRE(Checkpoints::WriteSyncCheckpoint(sentinel));
 
     const fs::path root = fs::temp_directory_path() / fs::unique_path("ckptv2-%%%%-%%%%");
     std::string error;

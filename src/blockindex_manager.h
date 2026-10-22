@@ -128,6 +128,24 @@ public:
                                                          BlockIndexSnapshot* out,
                                                          std::string* error) const;
 
+    // ---- difficulty-path reads (side-branch safe) -------------------------
+    // A consensus parent must be resolvable by hash even when the record is NOT
+    // on the active chain: a competing branch's parent is a legitimate ancestor
+    // of the block under validation. These wrappers translate the composite
+    // "record exists but is not active" answer into a successful by-value read
+    // and nothing else: LookupByHash / GetActiveByHeight / GetTip and every
+    // chain-selection consumer keep their active-only semantics.
+    BlockIndexManagerStatus LookupByHashForDifficulty(const uint256& hash,
+                                                      BlockIndexSnapshot* out,
+                                                      std::string* error) const;
+    BlockIndexManagerStatus GetParentForDifficulty(const uint256& hash,
+                                                   BlockIndexSnapshot* out,
+                                                   std::string* error) const;
+    BlockIndexManagerStatus GetLastBlockIndexByProofTypeForDifficulty(const uint256& fromHash,
+                                                                      bool fProofOfStake,
+                                                                      BlockIndexSnapshot* out,
+                                                                      std::string* error) const;
+
     // Hash-native getblocks locator (Stage F, L6c). Builds the locator vHave list
     // from a begin HASH by walking parents BY VALUE — the by-value equivalent of
     // the legacy CBlockLocator(const CBlockIndex*): active-chain membership, the

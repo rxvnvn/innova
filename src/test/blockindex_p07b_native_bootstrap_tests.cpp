@@ -33,7 +33,7 @@
 
 namespace fs = boost::filesystem;
 
-extern void* GetGlobalTxdbPtrForTest();
+// (GetGlobalTxdbPtrForTest removed with txdb-leveldb)
 
 static const char* kCurrentName = "current";
 
@@ -48,14 +48,10 @@ static fs::path C2TempDir(const char* tag)
     return p;
 }
 
-static void C2CloseLegacyGlobal()
-{
-    if (GetGlobalTxdbPtrForTest() != NULL)
-    {
-        CTxDB db("r");
-        db.Close();
-    }
-}
+// No legacy global txdb exists in this tree (txdb-leveldb was physically
+// removed), so the pre-bootstrap "close the global store" step is a no-op. The
+// function and its call sites are kept to preserve ordering intent.
+static void C2CloseLegacyGlobal() {}
 
 // Deterministic synthetic block; mirrors the proven R2D/R3F writer.
 struct C2BlockInfo { uint256 hash; unsigned int nFile, nBlockPos; };
