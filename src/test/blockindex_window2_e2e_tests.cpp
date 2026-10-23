@@ -2869,7 +2869,84 @@ BOOST_AUTO_TEST_CASE(c12_p09_sparse_hot_cutover_resolves_fork_by_value)
     BOOST_TEST_MESSAGE("C12_SPARSE_HOT_CUTOVER ok=" << (r ? 1 : 0) << " err=" << e);
 }
 
-// C12 REGRESSION 2 (DEEPER competing branch): a 2-block sparse-hot competing
+// C12 REGRESSION-3 (reproduces the on-node regression after a REAL reorg): a same-height
+// cutover whose OLD published tip is NO LONGER a mapBlockIndex resident (a just-completed
+// reorg disconnected it into a side branch whose raw edges were released by bounded
+// residency), but which is still known BY VALUE to the live authority. MUST NOT fail with
+// "published tip not in the block index" -- the old ancestry must resolve by value. The
+// candidate is the map-resident competing block. Pre-fix this hard-failed every post-reorg
+// AddToBlockIndex and wedged the node (observed: "V2 authoritative persist failed at height
+// 8182675: authoritative-live cutover: published tip not in the block index").
+BOOST_AUTO_TEST_CASE(c12_p09_cutover_old_tip_nonresident_by_value)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+
+    const uint256 actHash(0x0E110E11UL);   // published active block at S+1 (NOT resident)
+    const uint256 sideHash(0x0E220E22UL);  // competing (HIGHER-work) block at S+1 (candidate)
+    R2DAppendActive(live, actHash, fx.active[S], S + 1, uint256(10)); // published tip known BY VALUE only
+    R2DAppendSide(live, sideHash, fx.active[S], S + 1, uint256(20));  // competing record
+
+    // Sparse-hot candidate object is map-resident; the OLD tip is deliberately NOT
+    // registered in mapBlockIndex (post-reorg side-branch with released edges).
+    CBlockIndex newIdx; newIdx.nHeight = S + 1; newIdx.pprev = NULL; newIdx.pskip = NULL;
+    newIdx.phashBlock = &sideHash; newIdx.hashPrevStable = fx.active[S];
+    { LOCK(cs_main); mapBlockIndex[sideHash] = &newIdx; }
+    std::string e;
+    const bool r = PublishAuthoritativeLiveTailCutoverForTesting(live, &newIdx, actHash, &e);
+    { LOCK(cs_main); mapBlockIndex.erase(sideHash); }
+
+    BOOST_CHECK_MESSAGE(r,
+        "C12-regression-3: a cutover whose OLD published tip is non-resident must resolve it BY VALUE "
+        "(must NOT fail with 'published tip not in the block index' after a real reorg); err=" << e);
+    BOOST_CHECK_MESSAGE(live->TipAuthority()->GetTip().record.hash == sideHash,
+        "C12-regression-3: the competing candidate must become the published tip");
+    BOOST_TEST_MESSAGE("C12_REGR3_OK=" << (r ? 1 : 0) << " err=" << e);
+}
+
+// C12 REGRESSION-4 (reproduces the live-node chain-stall blocker): in BY_VALUE
+// authoritative mode mapBlockIndex is EMPTY, so a cutover's connect-suffix
+// ancestors are known ONLY by value (never map-resident). The suffix walk must
+// materialize them by value; pre-fix it fail-closed with "connect suffix ...
+// parent not retained" and the V2 tip was never advanced after a REAL reorg,
+// leaving legacy on branch B (8182675) but V2 on branch A (8182797) forever
+// (observed: "V2 authoritative persist failed at height 8182675:
+// authoritative-live cutover: connect suffix ..."). Candidate tip is map-resident
+// only; its suffix ancestors are deliberately absent from mapBlockIndex.
+BOOST_AUTO_TEST_CASE(c12_p09_cutover_connect_suffix_materializes_nonresident_parent)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+
+    // Branch A (ACTIVE, published lower-trust): A1@S+1, A2@S+2.
+    const uint256 a1(0x11A1UL), a2(0x11A2UL);
+    R2DAppendActive(live, a1, fx.active[S], S + 1, uint256(10));
+    R2DAppendActive(live, a2, a1, S + 2, uint256(20));
+    // Branch B (competing, candidate higher-trust): B1..B3 (3-deep suffix).
+    const uint256 b1(0x11B1UL), b2(0x11B2UL), b3(0x11B3UL);
+    R2DAppendSide(live, b1, fx.active[S], S + 1, uint256(30));
+    R2DAppendSide(live, b2, b1, S + 2, uint256(40));
+    R2DAppendSide(live, b3, b2, S + 3, uint256(50));
+
+    // mapBlockIndex is EMPTY (BY_VALUE mode); register ONLY the candidate tip.
+    CBlockIndex tip; tip.nHeight = S + 3; tip.pprev = NULL; tip.pskip = NULL;
+    tip.phashBlock = &b3; tip.hashPrevStable = b2;
+    { LOCK(cs_main); mapBlockIndex[b3] = &tip; }
+    std::string e;
+    const bool r = PublishAuthoritativeLiveTailCutoverForTesting(live, &tip, a2, &e);
+    { LOCK(cs_main); mapBlockIndex.erase(b3); }
+
+    BOOST_CHECK_MESSAGE(r,
+        "C12-regression-4: cutover connect-suffix must materialize non-resident (by-value) parents "
+        "so V2 can publish the new tip after a real reorg; err=" << e);
+    BOOST_CHECK_MESSAGE(live->TipAuthority()->GetTip().record.hash == b3,
+        "C12-regression-4: the competing branch tip must become the published V2 tip");
+    BOOST_TEST_MESSAGE("C12_REGR4_OK=" << (r ? 1 : 0) << " err=" << e);
+}
 // branch. The by-value fork walk must resolve the fork at S and the connect suffix
 // [S+1,S+2] must be built from REAL objects (the S+1 candidate object is registered
 // map-resident so it may enter the consensus connect list; the tip's pprev is

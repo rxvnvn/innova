@@ -139,6 +139,9 @@ bool IsLogOpen();
 bool LogAcceptCategory(const char* category);
 /* Send a string to the log output */
 int LogPrintStr(const std::string &str);
+/* Send an ERROR line unconditionally to debug.log (never gated by -debug or
+ * console mode) and mirror it to stderr. Used by all error()/errorN() overloads. */
+int LogErrorAlways(const std::string &str);
 
 #define LogPrintf(...) LogPrint(NULL, __VA_ARGS__)
 
@@ -157,14 +160,14 @@ int LogPrintStr(const std::string &str);
     template<TINYFORMAT_ARGTYPES(n)>                                                 \
     static inline bool error(const char* format, TINYFORMAT_VARARGS(n))              \
     {                                                                                \
-        LogPrintStr("ERROR: " + tfm::format(format, TINYFORMAT_PASSARGS(n)) + "\n"); \
+        LogErrorAlways("ERROR: " + tfm::format(format, TINYFORMAT_PASSARGS(n)) + "\n"); \
         return false;                                                                \
     }                                                                                \
     /*   Log error and return n */                                                   \
     template<TINYFORMAT_ARGTYPES(n)>                                                 \
     static inline int errorN(int rv, const char* format, TINYFORMAT_VARARGS(n))      \
     {                                                                                \
-        LogPrintStr("ERROR: " + tfm::format(format, TINYFORMAT_PASSARGS(n)) + "\n"); \
+        LogErrorAlways("ERROR: " + tfm::format(format, TINYFORMAT_PASSARGS(n)) + "\n"); \
         return rv;                                                                   \
     }
 
@@ -187,7 +190,7 @@ static inline int LogPrint(const char* category, const char* format)
 // }
 static inline int errorN(int n, const char* format)
 {
-    LogPrintStr(std::string("ERROR: ") + format + "\n");
+    LogErrorAlways(std::string("ERROR: ") + format + "\n");
     return n;
 }
 

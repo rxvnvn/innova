@@ -484,13 +484,59 @@ string real_strprintf(const std::string &format, int dummy, ...)
     return str;
 }
 
+// ---------------------------------------------------------------------------
+// Unconditional ERROR logger. Routes an ERROR line to exactly ONE sink so the
+// durable debug.log stays authoritative under normal file logging, while the
+// ERROR is always observable:
+//   - normal file logging (no -printtoconsole): write ONLY to debug.log (never
+//     duplicated to the terminal);
+//   - explicit -printtoconsole: write to the terminal (stderr), no file duplicate;
+//   - durable debug.log unavailable (fopen failed): emergency fallback to stderr.
+// Unlike LogPrintStr/LogPrintf this is NEVER gated by -debug, so a consensus /
+// validation ERROR is always persisted even when the operator runs without -debug.
+// It reuses the same thread-safe machinery (call_once-init'd fileout + mutex).
+int LogErrorAlways(const std::string &str)
+{
+    int ret = 0;
+    boost::call_once(&DebugPrintInit, debugPrintInitFlag);
+    const bool fFileAvail = (fileout != NULL);
+    if (fPrintToConsole)
+    {
+        // Explicit console mode: ERROR goes to the terminal (stderr), preserving the
+        // historical error() console identity; the durable file is not duplicated.
+        ret = (int)fwrite(str.data(), 1, str.size(), stderr);
+    }
+    else if (fFileAvail)
+    {
+        // Normal file logging: write ONLY to the durable debug.log (not the terminal).
+        boost::mutex::scoped_lock scoped_lock(*mutexDebugLog);
+        // reopen the log file, if requested
+        if (fReopenDebugLog) {
+            fReopenDebugLog = false;
+            boost::filesystem::path pathDebug = GetDataDir() / "debug.log";
+            if (freopen(pathDebug.string().c_str(), "a", fileout) != NULL)
+                setbuf(fileout, NULL); // unbuffered
+        }
+        if (fLogTimestamps)
+            ret += fprintf(fileout, "%s ", DateTimeStrFormat("%Y-%m-%d %H:%M:%S", GetTime()).c_str());
+        ret += fwrite(str.data(), 1, str.size(), fileout);
+    }
+    else
+    {
+        // Emergency fallback: the durable file logger is unavailable (e.g. datadir
+        // unwritable), so surface the ERROR on stderr rather than suppress it.
+        ret = (int)fwrite(str.data(), 1, str.size(), stderr);
+    }
+    return ret;
+}
+
 bool error(const char *format, ...)
 {
     va_list arg_ptr;
     va_start(arg_ptr, format);
     std::string str = vstrprintf(format, arg_ptr);
     va_end(arg_ptr);
-    fprintf(stderr, "ERROR: %s\n", str.c_str());
+    LogErrorAlways("ERROR: " + str + "\n");
     return false;
 }
 

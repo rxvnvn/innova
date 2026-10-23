@@ -43,6 +43,7 @@
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
 #include <algorithm>
+#include <memory>
 
 #if BOOST_VERSION >= 107300
 #include <boost/bind/bind.hpp>
@@ -7530,6 +7531,46 @@ static bool C12ResolveParentByValue(BlockIndexAuthoritativeLive* live,
     return true;
 }
 
+// Materialize a full-topology CBlockIndex from an authoritative by-value snapshot
+// (mirrors blockindex_authoritative_live.cpp FullFromSnapshot). Used by Reorganize
+// when a DEEP reorg crosses the bounded-residency floor: the ancestor is
+// V2-authoritative (resolvable by value) but not resident in mapBlockIndex, so no
+// real map object exists to walk/disconnect through. The returned object carries
+// the consensus fields needed by ReadFromDisk / DisconnectBlock / ConnectBlock and
+// its pprev is linked as the walk progresses. Ownership is operation-scoped: the
+// caller collects it in a reorg-local container and frees it on return.
+CBlockIndex* MaterializeCBlockIndexByValue(const BlockIndexSnapshot& s, uint256* ownHash)
+{
+    CBlockIndex* p = new CBlockIndex();
+    *ownHash = s.hash;
+    p->phashBlock = ownHash;
+    p->pprev = NULL; p->pnext = NULL; p->pskip = NULL;
+    p->nHeight = s.height;
+    p->nFile = s.nFile;
+    p->nBlockPos = s.nBlockPos;
+    p->hashPrevStable = s.hashPrev;
+    p->nChainTrust = s.nChainTrust;
+    p->hashProof = s.hashProof;
+    p->hashMerkleRoot = s.hashMerkleRoot;
+    p->prevoutStake = s.prevoutStake;
+    p->nStakeTime = s.nStakeTime;
+    p->nVersion = s.nVersion;
+    p->nTime = s.nTime;
+    p->nBits = s.nBits;
+    p->nNonce = s.nNonce;
+    p->nMint = s.nMint;
+    p->nMoneySupply = s.nMoneySupply;
+    p->nStakeModifier = s.nStakeModifier;
+    p->nFlags = s.nFlags;
+    if (s.hasStakeModifierTime)
+        p->nStakeModifierTime = s.nStakeModifierTime;
+    if (s.hasStakeModifierChecksum)
+        p->nStakeModifierChecksum = s.nStakeModifierChecksum;
+    if (s.fProofOfStake)
+        p->nFlags |= CBlockIndex::BLOCK_PROOF_OF_STAKE;
+    return p;
+}
+
 bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
 {
     // C12 (operator requirement H): distinguish an infrastructure/navigation failure
@@ -7570,8 +7611,14 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
         {
             uint256 nHash = pindexNew->GetBlockHash(); int nH = pindexNew->nHeight; CBlockIndex* nObj = pindexNew;
             uint256 oHash = pindexBest->GetBlockHash(); int oH = pindexBest->nHeight; CBlockIndex* oObj = pindexBest;
-            const int horizon = liveAuth->Horizon();
-            const long long maxSteps = (long long)(horizon > 0 ? horizon : 2048) * 2 + 64;
+            // Bound the by-value fork walk by the REAL reach of both heritage chains,
+            // not by the live-tail residency horizon. Each iteration decrements the
+            // taller side's height by exactly one, so the walk converges within
+            // bestHeight + candidateHeight parents; a horizon-derived cap would
+            // artificially forbid a legitimate DEEP reorg (a fork below the retained
+            // window is reachable by value even though those ancestors are not in RAM).
+            const long long maxSteps =
+                (long long)std::max(pindexBest->nHeight, pindexNew->nHeight) * 2LL + 64;
             long long steps = 0;
             while (nHash != oHash)
             {
@@ -7633,19 +7680,68 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     }
 
     // List of what to disconnect (C12: REAL map-resident objects, hash/height
-    // stepped across any released edge; fail closed if an object is needed but not
-    // retained, so no temporary twin ever enters the consensus path).
+    // stepped across any released edge; fail closed only if an ancestor is
+    // genuinely unresolvable by value. For a DEEP reorg below the bounded-residency
+    // floor an ancestor is V2-authoritative but not a mapBlockIndex resident, so it
+    // is materialized by value into an operation-scoped object (never a twin of a
+    // live entry) and linked so Store3A undo receives the true parent hash).
     vector<CBlockIndex*> vDisconnect;
+    // Operation-scoped ownership for by-value-materialized CBlockIndex objects used
+    // to traverse ancestors below the live-tail residency floor. Freed on return.
+    std::vector<std::unique_ptr<CBlockIndex> > vMaterializedIdx;
+    std::vector<std::unique_ptr<uint256> > vMaterializedHash;
+    // C12 ownership contract (step 6): a RESIDENT index object may be temporarily
+    // linked (pprev) to an operation-scoped by-value parent for Store3A undo/connect.
+    // Before the temporaries are freed, thoose resident children must be edge-released
+    // (pprev/pskip = NULL) exactly as RetireBlockIndexBelowFloor does for aged entries,
+    // so no resident object is left dangling into operation-scoped storage. Identity
+    // survives in hashPrevStable for by-value navigation. Declared AFTER the scoped
+    // containers so it destructs FIRST (reverse declaration order), while the temporaries
+    // are still alive.
+    std::vector<CBlockIndex*> vWireReleasedResident;
+    struct ReorgEdgeReleaseGuard {
+        std::vector<CBlockIndex*>& rel;
+        explicit ReorgEdgeReleaseGuard(std::vector<CBlockIndex*>& r) : rel(r) {}
+        ~ReorgEdgeReleaseGuard() { for (CBlockIndex* p : rel) { if (p) { p->pprev = NULL; p->pskip = NULL; } } }
+    } reorgEdgeReleaseGuard_(vWireReleasedResident);
+    BlockIndexAuthoritativeLive* reorgLive = GetAuthoritativeLiveAuthority();
+    const auto resolveWalkParent = [&](CBlockIndex* cur, uint256 &ph, int &phh, CBlockIndex* &pobj) -> bool {
+        pobj = NULL;
+        if (!C12ResolveParentByValue(reorgLive, cur->GetBlockHash(), cur->nHeight, cur, ph, phh, pobj))
+            return false;
+        if (pobj != NULL)
+            return true;
+        if (ph == uint256(0))
+            return false; // genesis: no parent
+        // Parent is V2-authoritative but not resident (below the retention floor).
+        // Materialize a real full-topology object from the by-value snapshot so the
+        // deep reorg can disconnect/connect across the boundary; wire cur->pprev so
+        // Store3A undo/connect sees the true parent hash. Ownership is operation-scoped,
+        // and any RESIDENT child linked to a scoped parent is edge-released on exit by
+        // ReorgEdgeReleaseGuard (never a dangling pprev past this frame).
+        BlockIndexSnapshot snap; std::string serr;
+        if (reorgLive == NULL || reorgLive->ResolveBlockSnapshot(ph, &snap, &serr) != BlockIndexHotStatus::OK || !snap.found)
+            return false;
+        std::unique_ptr<uint256> ownHash(new uint256(snap.hash));
+        std::unique_ptr<CBlockIndex> made(MaterializeCBlockIndexByValue(snap, ownHash.get()));
+        pobj = made.get();
+        cur->pprev = pobj; // link the walked child to its by-value parent
+        if (mapBlockIndex.count(cur->GetBlockHash())) // only actual residents must be released
+            vWireReleasedResident.push_back(cur);
+        vMaterializedHash.push_back(std::move(ownHash));
+        vMaterializedIdx.push_back(std::move(made));
+        return true;
+    };
     for (CBlockIndex* pindex = pindexBest; pindex != NULL && pindex->nHeight > nForkHeight; )
     {
         vDisconnect.push_back(pindex);
         if (pindex->nHeight - 1 <= nForkHeight)
             break; // reached the fork point; its object is not needed for disconnect
         uint256 ph; int phh; CBlockIndex* pobj = NULL;
-        if (!C12ResolveParentByValue(GetAuthoritativeLiveAuthority(), pindex->GetBlockHash(), pindex->nHeight, pindex, ph, phh, pobj) || pobj == NULL)
+        if (!resolveWalkParent(pindex, ph, phh, pobj))
         {
             if (pfNavigationFailure) *pfNavigationFailure = true;
-            return error("Reorganize() : disconnect walk cannot reach the fork point from %s (h=%d): parent not retained (navigation failure; fail closed)",
+            return error("Reorganize() : disconnect walk cannot reach the fork point from %s (h=%d): parent unresolvable or not retained (navigation failure; fail closed)",
                          pindex->GetBlockHash().ToString().substr(0,20).c_str(), pindex->nHeight);
         }
         pindex = pobj;
@@ -7653,7 +7749,7 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
 
     // List of what to connect (C12: real objects; the candidate is a
     // freshly-accepted map-resident object, its ancestors resolve via pprev /
-    // hashPrevStable).
+    // hashPrevStable, materialized by value below the residency floor).
     vector<CBlockIndex*> vConnect;
     for (CBlockIndex* pindex = pindexNew; pindex != NULL && pindex->nHeight > nForkHeight; )
     {
@@ -7661,10 +7757,10 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
         if (pindex->nHeight - 1 <= nForkHeight)
             break;
         uint256 ph; int phh; CBlockIndex* pobj = NULL;
-        if (!C12ResolveParentByValue(GetAuthoritativeLiveAuthority(), pindex->GetBlockHash(), pindex->nHeight, pindex, ph, phh, pobj) || pobj == NULL)
+        if (!resolveWalkParent(pindex, ph, phh, pobj))
         {
             if (pfNavigationFailure) *pfNavigationFailure = true;
-            return error("Reorganize() : connect walk cannot reach the fork point from %s (h=%d): parent not retained (navigation failure; fail closed)",
+            return error("Reorganize() : connect walk cannot reach the fork point from %s (h=%d): parent unresolvable or not retained (navigation failure; fail closed)",
                          pindex->GetBlockHash().ToString().substr(0,20).c_str(), pindex->nHeight);
         }
         pindex = pobj;
@@ -8077,16 +8173,34 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
                                                 const uint256& oldPublishedTipHash,
                                                 std::string* outErr)
 {
+    // Resolve the height of the hard published tip. It may no longer be a
+    // map-resident object: the block that just became best may have reached a new
+    // tip through a REAL reorganisation, and the PREVIOUSLY published tip was then
+    // disconnected into a side branch whose raw edges were released by bounded
+    // residency (RetireBlockIndexBelowFloor / operation-scoped edge release).
+    // The fork walk below resolves the OLD side BY VALUE (C12ResolveParentByValue
+    // falls back to live->ResolveBlockSnapshot for a NULL object), so only the
+    // starting height is required here. Requiring a live map object would wrongly
+    // fail-closed every post-reorg extension/cutover and wedge the node for good.
     CBlockIndex* pOldTip = NULL;
+    int oH = -1;
     {
         std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(oldPublishedTipHash);
         if (it != mapBlockIndex.end())
+        {
             pOldTip = it->second;
+            oH = pOldTip->nHeight;
+        }
     }
-    if (!pOldTip)
+    if (oH < 0)
     {
-        if (outErr) *outErr = "authoritative-live cutover: published tip not in the block index";
-        return false;
+        BlockIndexSnapshot s; std::string e;
+        if (!live || live->ResolveBlockSnapshot(oldPublishedTipHash, &s, &e) != BlockIndexHotStatus::OK || !s.found)
+        {
+            if (outErr) *outErr = "authoritative-live cutover: published tip not resolvable in the block index";
+            return false;
+        }
+        oH = s.height;
     }
     // Last common ancestor of the published active tip and the new best chain,
     // resolved BY HASH across the sparse-hot / by-value boundary (C12). The legacy
@@ -8106,7 +8220,9 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
             return false;
         }
         uint256 nHash = nHash0; int nH = pindexNew->nHeight; CBlockIndex* nObj = pindexNew;
-        uint256 oHash = oldPublishedTipHash; int oH = pOldTip->nHeight; CBlockIndex* oObj = pOldTip;
+        uint256 oHash = oldPublishedTipHash; CBlockIndex* oObj = pOldTip;
+        // oH is the by-value resolved height of the old published tip (may be a
+        // non-resident side branch after a real reorg).
         const int horizon = live->Horizon();
         const long long maxSteps = (long long)(horizon > 0 ? horizon : 2048) * 2 + 64;
         long long steps = 0;
@@ -8145,19 +8261,55 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
             return false;
         }
     }
-    // Build the new active suffix from REAL index objects (no temporary twins):
-    // the candidate is map-resident; its ancestors resolve via pprev/hashPrevStable.
+    // Build the new active suffix. The candidate is map-resident; in BY_VALUE
+    // authoritative mode (mapBlockIndex is typically EMPTY) its ancestors are
+    // known ONLY by value to the V2 authority and are NOT resident, so they are
+    // materialized by value (operation-scoped). PublishAuthoritativeLiveTailReorg
+    // only serializes the by-value fields (hash/height/derived, via
+    // BlockIndexRecordFromIndex/BlockIndexDerivedEntryFromIndex) and never
+    // dereferences pprev/pskip, so by-value materialized objects are valid members
+    // of vConnect. Pre-fix this walked ONLY the real pprev chain and fail-closed
+    // with "connect suffix ... parent not retained" whenever the authoritively
+    // known suffix ancestor was not map-resident -- so after a successful legacy
+    // reorg the V2 tip was never advanced and the node diverged legacy(B) vs V2(A).
     std::vector<CBlockIndex*> vConnect;
+    // Operation-scoped ownership for by-value materialized suffix objects.
+    std::vector<std::unique_ptr<CBlockIndex> > vMatIdx;
+    std::vector<std::unique_ptr<uint256> > vMatHash;
     for (CBlockIndex* p = pindexNew; p != NULL && p->nHeight > nForkHeight; )
     {
         vConnect.push_back(p);
         if (p->nHeight - 1 <= nForkHeight)
             break;
         uint256 ph; int phh; CBlockIndex* pobj = NULL;
-        if (!C12ResolveParentByValue(live, p->GetBlockHash(), p->nHeight, p, ph, phh, pobj) || pobj == NULL)
+        if (!C12ResolveParentByValue(live, p->GetBlockHash(), p->nHeight, p, ph, phh, pobj))
         {
-            if (outErr) *outErr = "authoritative-live cutover: connect suffix cannot reach the fork point (parent not retained)";
+            if (outErr) *outErr = "authoritative-live cutover: connect suffix cannot reach the fork point (parent unresolvable)";
             return false;
+        }
+        if (pobj == NULL)
+        {
+            // Parent identity is known BY VALUE but is not a map-resident object
+            // (BY_VALUE authoritative / bounded residency). Materialize a real
+            // full-topology object from the authoritative snapshot so the suffix
+            // can still be published. Ownership is operation-scoped (freed here).
+            if (ph == uint256(0))
+            {
+                if (outErr) *outErr = "authoritative-live cutover: connect suffix hit genesis before the fork (parent identity missing)";
+                return false;
+            }
+            BlockIndexSnapshot snap; std::string serr;
+            if (live == NULL || live->ResolveBlockSnapshot(ph, &snap, &serr) != BlockIndexHotStatus::OK || !snap.found)
+            {
+                if (outErr) *outErr = "authoritative-live cutover: connect suffix parent not resolvable by value";
+                return false;
+            }
+            std::unique_ptr<uint256> ownHash(new uint256(snap.hash));
+            std::unique_ptr<CBlockIndex> made(MaterializeCBlockIndexByValue(snap, ownHash.get()));
+            p = made.get();
+            vMatHash.push_back(std::move(ownHash));
+            vMatIdx.push_back(std::move(made));
+            continue;
         }
         p = pobj;
     }
