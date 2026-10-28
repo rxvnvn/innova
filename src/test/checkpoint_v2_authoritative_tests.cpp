@@ -36,7 +36,7 @@
 #include "kernel.h"
 #include "checkpoints.h"
 #include "blockindex_accessor.h"
-#include "blockindex_authoritative_live.h"
+#include "blockindex_test_generation.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_manager.h"
 #include "blockindex_generation_builder.h"
@@ -96,38 +96,9 @@ static CBlockIndex* CkptAVMine(CBlockIndex* prev, unsigned int extra, bool mustA
 
 static bool BuildLiveChainSource(BlockIndexGenerationSource* source, std::string* error)
 {
-    source->records.clear();
-    for (std::map<uint256, CBlockIndex*>::const_iterator it = ::mapBlockIndex.begin(); it != ::mapBlockIndex.end(); ++it)
-    {
-        const CBlockIndex* p = it->second;
-        if (!p) continue;
-        BlockIndexGenerationSourceRecord rec;
-        rec.hash = p->GetBlockHash();
-        rec.record.hash = p->GetBlockHash();
-        rec.record.hashPrev = (p->pprev ? p->pprev->GetBlockHash() : uint256(0));
-        rec.record.hashMerkleRoot = p->hashMerkleRoot;
-        rec.record.hashProof = p->hashProof;
-        rec.record.prevoutStake = p->prevoutStake;
-        rec.record.height = p->nHeight;
-        rec.record.nFile = p->nFile;
-        rec.record.nBlockPos = p->nBlockPos;
-        rec.record.nFlags = p->nFlags;
-        rec.record.nVersion = p->nVersion;
-        rec.record.nTime = p->nTime;
-        rec.record.nBits = p->nBits;
-        rec.record.nNonce = p->nNonce;
-        rec.record.nMint = p->nMint;
-        rec.record.nMoneySupply = p->nMoneySupply;
-        rec.record.nStakeModifier = p->nStakeModifier;
-        rec.record.nStakeTime = p->nStakeTime;
-        source->records.push_back(rec);
-    }
-    source->hashBestChain = (pindexBest ? pindexBest->GetBlockHash() : uint256(0));
-    source->foundBestChain = (pindexBest != NULL);
-    source->blockDataDir = GetDataDir().string();
-    if (source->records.empty())
-    { if (error) *error = "live chain source: empty mapBlockIndex"; return false; }
-    return true;
+    // Authoritative BI-V2: mapBlockIndex is intentionally not fully resident;
+    // the active chain lineage (pindexBest->pprev) is the contiguous source.
+    return innova_test_gen::BuildLiveChainSourceAuthoritative(source, error);
 }
 
 static void CkptAVBuildRoot(const fs::path& root, std::string* error)
@@ -179,6 +150,9 @@ struct CkptAVFixture
     CkptAVFixture() : started(false) {}
     ~CkptAVFixture() { if (started) Restore(); }
 
+    // The harness commits the fixture's OWN authoritative chain before Start
+    // (CommitFixtureBaseline), so Start no longer mines on the PRE-CHECKPOINT
+    // branch: it mines on the fixture's COMMITTED (checkpointed) mapBlockIndex.
     void Start(int minBaseHeight)
     {
         mapBlockIndex.clear();
@@ -195,11 +169,13 @@ struct CkptAVFixture
         hadLivetail = mapArgs.count("-blockindexlivetail") != 0;
         livetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
 
+        // Mine EXTRA case-local blocks on the ALREADY-COMMITTED shared live
+        // branch (extra>>4, no checkpoint flip). A base of 6 would sit BELOW
+        // the fork point of the now-abandoned pre-checkpoint branch, whose
+        // history is no longer connected to the fixture chain.
         CBlockIndex* tip = pindexBest;
         while (tip->nHeight < minBaseHeight)
             tip = CkptAVMine(tip, 0xF000u + (unsigned)tip->nHeight, true);
-
-        // The protected shared chain is swapped below, so the restored
         // pindexBest / hashBestChain must reflect the chain AS MINED (the tip
         // we just built), not the stale pre-mining value captured above.
         pindexBest = tip;

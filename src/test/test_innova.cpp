@@ -6,6 +6,9 @@
 #include "db.h"
 #include "main.h"
 #include "wallet.h"
+#include "blockindex_authoritative_startup.h"
+#include "blockindex_native_bootstrap.h"
+#include "blockindex_startup_ownership.h"
 
 #include <boost/filesystem.hpp>
 
@@ -47,7 +50,46 @@ struct TestingSetup {
         fPrintToDebugger = true; // don't want to write to debug.log file
         noui_connect();
         bitdb.MakeMock();
-        LoadBlockIndex(true);
+
+        // Mirror the production startup sequence (init.cpp) so the fixture does
+        // NOT bypass authority: classify the datadir's block-index ownership
+        // (a fresh temp datadir classifies as EMPTY_NEW), build+publish+select
+        // the first V2 generation through the REAL daemon-native primitive
+        // (PrepareNativeBlockIndexGeneration), then load through the REAL
+        // InitBlockIndexAuthoritative via LoadBlockIndex. No legacy fallback,
+        // no synthetic CBlockIndex; any failure must fail the suite loudly.
+        const std::string v2Root = ResolveBlockIndexV2Root(
+            GetArg("-blockindexv2authoritative", ""), GetDataDir().string());
+        BlockIndexStartupOwnershipDecision ownership;
+        std::string ownershipErr;
+        if (!ClassifyBlockIndexStartupOwnership(v2Root, GetDataDir().string(),
+                                                &ownership, &ownershipErr))
+            BOOST_FAIL(std::string("TestingSetup: block index startup ownership "
+                                   "classification failed: ") + ownershipErr);
+        if (ownership.state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW)
+        {
+            std::string prepErr;
+            if (PrepareNativeBlockIndexGeneration(v2Root, GetDataDir().string(),
+                                                  ownership.state, &prepErr)
+                != BLOCK_INDEX_NATIVE_PREPARE_OK)
+                BOOST_FAIL(std::string("TestingSetup: block index V2 native "
+                                       "bootstrap failed (EMPTY_NEW): ") + prepErr);
+        }
+        else if (ownership.state != BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE)
+        {
+            BOOST_FAIL(std::string("TestingSetup: block index ownership state is ") +
+                       BlockIndexStartupOwnershipStateName(ownership.state) +
+                       " (fatal; no legacy fallback) detail=" + ownership.detail);
+        }
+
+        const bool fLoaded = LoadBlockIndex(true);
+        if (!fLoaded || pindexBest == NULL || pindexGenesisBlock == NULL ||
+            nBestHeight < 0)
+            BOOST_FAIL(strprintf(
+                "TestingSetup: authoritative regtest bootstrap failed: "
+                "LoadBlockIndex=%d pindexBest=%p pindexGenesisBlock=%p "
+                "nBestHeight=%d", (int)fLoaded, (void*)pindexBest,
+                (void*)pindexGenesisBlock, (int)nBestHeight));
         bool fFirstRun;
         pwalletMain = new CWallet("wallet.dat");
         pwalletMain->LoadWallet(fFirstRun);
