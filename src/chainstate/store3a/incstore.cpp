@@ -3,6 +3,7 @@
 // backed by the paged CoW B+tree (O(delta) commit instead of a full-state rewrite).
 #include "incstore.h"
 #include "incdelta.h"
+#include "util.h"
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/file.h>
@@ -795,7 +796,7 @@ bool CommitStore3A::classifyAndNormalizeUndoIndex(ChainError* e){
                    "artifact ("+qe.str()+"); refusing to open: "+dir_);
             ixRecovery_.resolution = "quarantine-failed"; return false; }
         ixRecovery_.quarantinePath = qp; ixRecovery_.quarantinedBytes = qb;
-        printf("UNDOINDEX: operator-authorized recovery requested; quarantined corrupt artifact %s -> %s "
+        LogPrintf("UNDOINDEX: operator-authorized recovery requested; quarantined corrupt artifact %s -> %s "
                "(%llu bytes); rebuilding exclusively from the committed stream (MANIFEST.undoSize=%llu)\n",
                p("UNDOINDEX").c_str(), qp.c_str(), (unsigned long long)qb,
                (unsigned long long)undoCommittedBytes_);
@@ -833,7 +834,7 @@ bool CommitStore3A::classifyAndNormalizeUndoIndex(ChainError* e){
         cls==UndoIndexState::Ahead ? "ahead of the manifest (uncommitted tail dropped, never authoritative)" :
         cls==UndoIndexState::Stale ? "stale: behind the committed range (rebuilt, not trusted)" :
                                      "absent (rebuilt from the committed stream)";
-    printf("UNDOINDEX: %s; rebuilding %zu closed segment(s) for committedBytes=%llu\n",
+    LogPrintf("UNDOINDEX: %s; rebuilding %zu closed segment(s) for committedBytes=%llu\n",
            why, expected.segments.size(), (unsigned long long)expected.committedBytes);
     if(!publishUndoIndex(expected, e)) return false;
     if(ixFault_ == (int)UndoIndexFault::DirFsync){                       // S1.1-F1: one-shot test-only fault
