@@ -566,6 +566,19 @@ bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* 
                                                    CBlockIndex* pindexNew,
                                                    const uint256& oldPublishedTipHash,
                                                    std::string* outErr);
+// V2 CPU-MINING timestamp-sync test seam: expose the header/coinbase time
+// lockstep helper so a regression can assert that after a long grind the
+// coinbase nTime is refreshed to match the header (and the merkle root rebuilt),
+// restoring CheckBlock's FutureDrift gate. Inert in production (called only by
+// the CPU miner); never invoked by the daemon outside mining.
+class CBlock;
+void KeepCoinbaseTimeInSyncForTesting(CBlock* pblock);
+// V2 MS-FIX test seam: emulate an already-connected reorg supply/mint trail so the
+// cutover's money-supply override can be unit-tested without running a full
+// ConnectBlock reorg. Inert in production (the daemon populates the trail via
+// Reorganize's connect loop). Never called by the daemon.
+void SetAuthoritativeConnectSupplyForTesting(int32_t height, int64_t supply, int64_t mint);
+void ClearAuthoritativeConnectSupplyForTesting();
 // Called from the V2 block-index load after setInvalidBlockHash is
 // loaded and the naive pindexBest reconstructed: rolls the best chain back to
 // the highest valid ancestor if it descends from an operator-invalidated block.

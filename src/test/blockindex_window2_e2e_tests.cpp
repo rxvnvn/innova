@@ -2947,6 +2947,71 @@ BOOST_AUTO_TEST_CASE(c12_p09_cutover_connect_suffix_materializes_nonresident_par
         "C12-regression-4: the competing branch tip must become the published V2 tip");
     BOOST_TEST_MESSAGE("C12_REGR4_OK=" << (r ? 1 : 0) << " err=" << e);
 }
+
+// V2 MS-FIX REGRESSION-5 (reproduces the live-node money-supply collapse): a cutover
+// that promotes a never-connected side branch must persist the AUTHORITATIVE active-chain
+// nMoneySupply/nMint computed by ConnectBlock during the reorg connect, NOT the side
+// snapshot's zero values. Pre-fix: PublishAuthoritativeLiveTailCutover re-materialized the
+// newly-active suffix from by-value SIDE records whose nMoneySupply = 0 (never connected),
+// and ReorgTo persisted those zeros, collapsing the active-chain supply accumulator
+// (observed LOCAL active tip = 138 INN vs the correct ~11.06M retained on the disconnected
+// A branch). The cutover now overrides each suffix record from the reorg-connect supply
+// trail (production source: Reorganize's ConnectBlock loop; here emulated via the seam).
+BOOST_AUTO_TEST_CASE(c12_p09_cutover_preserves_active_moneysupply)
+{
+    R2DGenFixture fx(12);
+    const int S = fx.S;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live && live->IsOpen());
+    ClearAuthoritativeConnectSupplyForTesting();
+
+    // Branch A (ACTIVE, published lower-trust): A1@S+1, A2@S+2.
+    const uint256 a1(0x21A1UL), a2(0x21A2UL);
+    R2DAppendActive(live, a1, fx.active[S], S + 1, uint256(10));
+    R2DAppendActive(live, a2, a1, S + 2, uint256(20));
+    // Branch B (competing candidate, higher trust): B1..B3. Side records default
+    // nMoneySupply = 0 / nMint = 0 (never-connected) — exactly the corruption condition.
+    const uint256 b1(0x21B1UL), b2(0x21B2UL), b3(0x21B3UL);
+    R2DAppendSide(live, b1, fx.active[S], S + 1, uint256(30));
+    R2DAppendSide(live, b2, b1, S + 2, uint256(40));
+    R2DAppendSide(live, b3, b2, S + 3, uint256(50));
+
+    // Emulate a real reorg connect: ConnectBlock computed the authoritative active-chain
+    // cumulative supply/mint for B1..B3 (production captures this in Reorganize).
+    const int64_t SUPPLY1 = 1000LL, SUPPLY2 = 1200LL, SUPPLY3 = 1400LL;
+    SetAuthoritativeConnectSupplyForTesting(S + 1, SUPPLY1, 200LL);
+    SetAuthoritativeConnectSupplyForTesting(S + 2, SUPPLY2, 200LL);
+    SetAuthoritativeConnectSupplyForTesting(S + 3, SUPPLY3, 200LL);
+
+    // mapBlockIndex EMPTY (BY_VALUE); register only the candidate tip.
+    CBlockIndex tip; tip.nHeight = S + 3; tip.pprev = NULL; tip.pskip = NULL;
+    tip.phashBlock = &b3; tip.hashPrevStable = b2;
+    { LOCK(cs_main); mapBlockIndex[b3] = &tip; }
+    std::string e;
+    const bool r = PublishAuthoritativeLiveTailCutoverForTesting(live, &tip, a2, &e);
+    { LOCK(cs_main); mapBlockIndex.erase(b3); }
+
+    BOOST_CHECK_MESSAGE(r, "C12-regression-5: cutover must succeed; err=" << e);
+    // WITHOUT the fix the persisted suffix records carry the side snapshots' ZERO supply.
+    // The fix overrides them from the connect trail. Verify the persisted supply.
+    BlockIndexSnapshot s1, s2, s3; std::string e1, e2, e3;
+    const bool ok1 = live->ResolveBlockSnapshot(b1, &s1, &e1) == BlockIndexHotStatus::OK && s1.found;
+    const bool ok2 = live->ResolveBlockSnapshot(b2, &s2, &e2) == BlockIndexHotStatus::OK && s2.found;
+    const bool ok3 = live->ResolveBlockSnapshot(b3, &s3, &e3) == BlockIndexHotStatus::OK && s3.found;
+    BOOST_CHECK_MESSAGE(ok1 && ok2 && ok3,
+        "C12-regression-5: persisted suffix records resolvable by value; e1=" << e1 << " e2=" << e2 << " e3=" << e3);
+    BOOST_CHECK_MESSAGE(ok1 && s1.nMoneySupply == SUPPLY1,
+        "C12-regression-5: B1 persisted money supply must be the ConnectBlock cumulative ("
+        << SUPPLY1 << "), not the side snapshot's 0; got " << (ok1 ? s1.nMoneySupply : -1));
+    BOOST_CHECK_MESSAGE(ok2 && s2.nMoneySupply == SUPPLY2,
+        "C12-regression-5: B2 persisted money supply must be the ConnectBlock cumulative ("
+        << SUPPLY2 << "); got " << (ok2 ? s2.nMoneySupply : -1));
+    BOOST_CHECK_MESSAGE(ok3 && s3.nMoneySupply == SUPPLY3,
+        "C12-regression-5: B3 persisted money supply must be the ConnectBlock cumulative ("
+        << SUPPLY3 << "); got " << (ok3 ? s3.nMoneySupply : -1));
+    BOOST_TEST_MESSAGE("C12_REGR5_OK=" << (r ? 1 : 0) << " err=" << e);
+    ClearAuthoritativeConnectSupplyForTesting();
+}
 // branch. The by-value fork walk must resolve the fork at S and the connect suffix
 // [S+1,S+2] must be built from REAL objects (the S+1 candidate object is registered
 // map-resident so it may enter the consensus connect list; the tip's pprev is

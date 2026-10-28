@@ -7572,6 +7572,17 @@ CBlockIndex* MaterializeCBlockIndexByValue(const BlockIndexSnapshot& s, uint256*
     return p;
 }
 
+// V2 MS-FIX: active-chain money-supply/mint accumulated by ConnectBlock for the
+// CURRENT reorg connect. The cutover re-materializes the newly-active suffix from
+// by-value SIDE snapshots whose nMoneySupply/nMint are zero for never-connected
+// side blocks; ReorgTo would persist those zeros and collapse the active chain's
+// supply accumulator (observed LOCAL active tip = 138 INN vs the correct ~11.06M
+// retained on the disconnected A branch). Populated in Reorganize's connect loop
+// (the authoritative ConnectBlock result) and consumed by the same call's
+// PublishAuthoritativeLiveTailCutover before ReorgTo. Reorg/connect runs under
+// cs_main (single-threaded), so no separate lock is required.
+static std::map<int32_t, std::pair<int64_t, int64_t> > g_reorgConnectSupply;
+
 bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
 {
     // C12 (operator requirement H): distinguish an infrastructure/navigation failure
@@ -7816,6 +7827,10 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
 
     // Connect longer branch
     vector<CTransaction> vDelete;
+    // V2 MS-FIX: (re)start the connect supply/mint trail for THIS connect; the
+    // cutover that follows a reorg overwrites side-materialized nMoneySupply/nMint
+    // (zero) with these authoritative ConnectBlock values.
+    g_reorgConnectSupply.clear();
     for (unsigned int i = 0; i < vConnect.size(); i++)
     {
         CBlockIndex* pindex = vConnect[i];
@@ -7832,6 +7847,10 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
             // Invalid block
             return error("Reorganize() : ConnectBlock %s failed", pindex->GetBlockHash().ToString().substr(0,20).c_str());
         }
+        // V2 MS-FIX: capture the authoritative active-chain supply/mint from the
+        // ConnectBlock result for this suffix block (used by the cutover publish).
+        g_reorgConnectSupply[pindex->nHeight] =
+            std::make_pair(pindex->nMoneySupply, pindex->nMint);
 
         // Queue memory transactions to delete
         for (const CTransaction& tx : block.vtx)
@@ -8315,6 +8334,29 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
         p = pobj;
     }
     reverse(vConnect.begin(), vConnect.end());
+
+    // V2 MS-FIX: the cutover suffix was (re)materialized from by-value SIDE snapshots
+    // whose nMoneySupply/nMint are zero for never-connected side blocks; ReorgTo
+    // would otherwise persist those zeros and collapse the active-chain supply
+    // accumulator. Override each suffix record's supply/mint with the value ConnectBlock
+    // computed for the SAME height during the just-completed reorg connect (captured in
+    // Reorganize). Persisting the authoritative active-chain cumulative, not the side
+    // snapshot, keeps the published V2 tip consistent with forward-sync. Every cutover
+    // suffix height was connected by Reorganize, so a missing trail entry is anomalous;
+    // we conservatively leave it as-is rather than propagate a wrong absolute value.
+    if (!g_reorgConnectSupply.empty())
+    {
+        for (std::vector<CBlockIndex*>::iterator it = vConnect.begin(); it != vConnect.end(); ++it)
+        {
+            std::map<int32_t, std::pair<int64_t, int64_t> >::const_iterator s =
+                g_reorgConnectSupply.find((*it)->nHeight);
+            if (s != g_reorgConnectSupply.end())
+            {
+                (*it)->nMoneySupply = s->second.first;
+                (*it)->nMint        = s->second.second;
+            }
+        }
+    }
     return PublishAuthoritativeLiveTailReorg(nForkHeight, vConnect, outErr);
 }
 
@@ -8325,6 +8367,16 @@ bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* 
                                                    std::string* outErr)
 {
     return PublishAuthoritativeLiveTailCutover(live, pindexNew, oldPublishedTipHash, outErr);
+}
+
+// V2 MS-FIX test seam (see main.h). Emulate an already-connected reorg supply trail.
+void SetAuthoritativeConnectSupplyForTesting(int32_t height, int64_t supply, int64_t mint)
+{
+    g_reorgConnectSupply[height] = std::make_pair(supply, mint);
+}
+void ClearAuthoritativeConnectSupplyForTesting()
+{
+    g_reorgConnectSupply.clear();
 }
 
 // V2-R3 (ROUND-2 P1): authoritative chain switch on behalf of the synchronized

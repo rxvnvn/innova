@@ -1370,6 +1370,9 @@ struct BlockIndexTipAuthority::Impl
                                const std::vector<BlockIndexRecord>& appendRecords,
                                const std::vector<BlockIndexDerivedEntry>& appendDerived,
                                const std::vector<BlockIndexId>& newActive,
+                               const std::vector<uint64_t>& fixSlots,
+                               const std::vector<BlockIndexRecord>& fixRecords,
+                               const std::vector<BlockIndexDerivedEntry>& fixDerived,
                                std::string* error);
 
     // Roll an already-published (renamed over) reorg store set BACK to the
@@ -1465,9 +1468,28 @@ bool BlockIndexTipAuthority::Impl::RewriteStoresForReorg(
     uint64_t keepActive, uint64_t committedRecords,
     const std::vector<BlockIndexRecord>& appendRecords,
     const std::vector<BlockIndexDerivedEntry>& appendDerived,
-    const std::vector<BlockIndexId>& newActive, std::string* error)
+    const std::vector<BlockIndexId>& newActive,
+    const std::vector<uint64_t>& fixSlots,
+    const std::vector<BlockIndexRecord>& fixRecords,
+    const std::vector<BlockIndexDerivedEntry>& fixDerived,
+    std::string* error)
 {
-    // ---- records: committed prefix bytewise + branch appends encoded ----
+    // V2 MS-FIX validation: corrected slots must point at committed (prefix)
+    // records and be non-overlapping; the re-encoded replacement carries the
+    // authoritative active-chain nMoneySupply/nMint for a promoted side record.
+    if (fixSlots.size() != fixRecords.size() || fixSlots.size() != fixDerived.size())
+        return SetError(error, "reorg fix-vector size mismatch");
+    {
+        std::set<uint64_t> seenSlot;
+        for (size_t fi = 0; fi < fixSlots.size(); ++fi)
+        {
+            if (fixSlots[fi] >= committedRecords ||
+                !seenSlot.insert(fixSlots[fi]).second)
+                return SetError(error, "reorg fix slot out of range / duplicate");
+        }
+    }
+    // ---- records: committed prefix bytewise (+ corrected slots) +
+    //      branch appends encoded ----
     {
         const std::string tmp = recordsPath.string() + ".tmp";
         FILE* f = fopen(tmp.c_str(), "wb");
@@ -1480,21 +1502,30 @@ bool BlockIndexTipAuthority::Impl::RewriteStoresForReorg(
         if (!s) { fclose(f); return SetError(error, "open reorg records src failed"); }
         if (fseek(s, (long)BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE, SEEK_SET) != 0)
         { fclose(s); fclose(f); return SetError(error, "seek reorg records src failed"); }
-        std::vector<char> buf(65536);
-        const uint64_t want = committedRecords * BLOCK_INDEX_RECORD_SIZE_V1;
-        uint64_t got = 0;
-        while (got < want)
+        // +BLOCK_INDEX_TIP_RECORDS_HEADER_SIZE
+        std::vector<unsigned char> reccbuf(BLOCK_INDEX_RECORD_SIZE_V1);
+        // slot -> fix vector index
+        std::map<uint64_t, size_t> recFix;
+        for (size_t fi = 0; fi < fixSlots.size(); ++fi) recFix[fixSlots[fi]] = fi;
+        for (uint64_t slot = 0; slot < committedRecords; ++slot)
         {
-            size_t chunk = (size_t)std::min<uint64_t>(want - got, buf.size());
-            size_t r = fread(&buf[0], 1, chunk, s);
-            if (r == 0) break;
-            if (fwrite(&buf[0], 1, r, f) != r)
-            { fclose(s); fclose(f); return SetError(error, "write reorg records copy failed"); }
-            got += r;
+            std::map<uint64_t, size_t>::const_iterator fxp = recFix.find(slot);
+            if (fxp != recFix.end())
+            {
+                if (!EncodeBlockIndexRecordV1(fixRecords[fxp->second], &reccbuf, NULL))
+                { fclose(s); fclose(f); return SetError(error, "encode reorg records fix failed"); }
+                if (fwrite(&reccbuf[0], 1, reccbuf.size(), f) != reccbuf.size())
+                { fclose(s); fclose(f); return SetError(error, "write reorg records fix failed"); }
+            }
+            else
+            {
+                if (fread(&reccbuf[0], 1, BLOCK_INDEX_RECORD_SIZE_V1, s) != BLOCK_INDEX_RECORD_SIZE_V1)
+                { fclose(s); fclose(f); return SetError(error, "reorg records stream short"); }
+                if (fwrite(&reccbuf[0], 1, BLOCK_INDEX_RECORD_SIZE_V1, f) != BLOCK_INDEX_RECORD_SIZE_V1)
+                { fclose(s); fclose(f); return SetError(error, "write reorg records copy failed"); }
+            }
         }
         fclose(s);
-        if (got != want)
-        { fclose(f); return SetError(error, "reorg records stream short"); }
         for (size_t k = 0; k < appendRecords.size(); ++k)
         {
             std::vector<unsigned char> enc;
@@ -1526,21 +1557,29 @@ bool BlockIndexTipAuthority::Impl::RewriteStoresForReorg(
         if (!s) { fclose(f); return SetError(error, "open reorg derived src failed"); }
         if (fseek(s, (long)BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE, SEEK_SET) != 0)
         { fclose(s); fclose(f); return SetError(error, "seek reorg derived src failed"); }
-        std::vector<char> buf(65536);
-        const uint64_t want = committedRecords * BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2;
-        uint64_t got = 0;
-        while (got < want)
+        // +BLOCK_INDEX_TIP_DERIVED_HEADER_SIZE
+        std::vector<unsigned char> dercbuf(BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2);
+        std::map<uint64_t, size_t> derFix;
+        for (size_t fi = 0; fi < fixSlots.size(); ++fi) derFix[fixSlots[fi]] = fi;
+        for (uint64_t slot = 0; slot < committedRecords; ++slot)
         {
-            size_t chunk = (size_t)std::min<uint64_t>(want - got, buf.size());
-            size_t r = fread(&buf[0], 1, chunk, s);
-            if (r == 0) break;
-            if (fwrite(&buf[0], 1, r, f) != r)
-            { fclose(s); fclose(f); return SetError(error, "write reorg derived copy failed"); }
-            got += r;
+            std::map<uint64_t, size_t>::const_iterator fxp = derFix.find(slot);
+            if (fxp != derFix.end())
+            {
+                if (!EncodeBlockIndexDerivedEntry(fixDerived[fxp->second], &dercbuf, NULL))
+                { fclose(s); fclose(f); return SetError(error, "encode reorg derived fix failed"); }
+                if (fwrite(&dercbuf[0], 1, dercbuf.size(), f) != dercbuf.size())
+                { fclose(s); fclose(f); return SetError(error, "write reorg derived fix failed"); }
+            }
+            else
+            {
+                if (fread(&dercbuf[0], 1, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, s) != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2)
+                { fclose(s); fclose(f); return SetError(error, "reorg derived stream short"); }
+                if (fwrite(&dercbuf[0], 1, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, f) != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2)
+                { fclose(s); fclose(f); return SetError(error, "write reorg derived copy failed"); }
+            }
         }
         fclose(s);
-        if (got != want)
-        { fclose(f); return SetError(error, "reorg derived stream short"); }
         for (size_t k = 0; k < appendDerived.size(); ++k)
         {
             std::vector<unsigned char> enc;
@@ -2516,6 +2555,12 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     // The ids of NEW records to append to the tail stores (slot-ordered).
     std::vector<BlockIndexRecord> appendRecords;
     std::vector<BlockIndexDerivedEntry> appendDerived;
+    // V2 MS-FIX: corrected (rewritten) slots for promoted side records whose
+    // committed nMoneySupply/nMint must be replaced with the reorg-supplied
+    // authoritative active-chain cumulative (see the promotion branch below).
+    std::vector<uint64_t> fixSlots;
+    std::vector<BlockIndexRecord> fixRecords;
+    std::vector<BlockIndexDerivedEntry> fixDerived;
     std::set<uint256> seenBranch;
     for (size_t k = 0; k < branch.size(); ++k)
     {
@@ -2545,6 +2590,24 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
                        BLOCK_INDEX_TIP_IO_ERROR;
             if (committed.hashPrev != rec.hashPrev || committed.height != rec.height)
                 return SetError(error, "reorg promoted record mismatch"), BLOCK_INDEX_TIP_CORRUPT;
+            // V2 MS-FIX: a promoted side record carries the STALE committed
+            // nMoneySupply/nMint (0 for a never-connected side block). The
+            // reorg-supplied branch record `rec` holds the authoritative
+            // active-chain cumulative computed by ConnectBlock for this SAME
+            // block during the reorg connect. When they differ, the committed
+            // slot must be REWRITTEN so the promoted record persists the correct
+            // supply/mint (otherwise ReorgTo collapses the active-chain money
+            // supply accumulator -- observed LOCAL active tip = 138 INN vs the
+            // correct ~11.06M). Corrected slots are re-encoded by
+            // RewriteStoresForReorg at stable ids (slot addresses unchanged;
+            // the side index and active ids stay valid).
+            if (committed.nMoneySupply != rec.nMoneySupply ||
+                committed.nMint != rec.nMint)
+            {
+                fixSlots.push_back(slot);
+                fixRecords.push_back(rec);
+                fixDerived.push_back(branch[k].derived);
+            }
             newActive.push_back(foundId);
         }
         else
@@ -2585,6 +2648,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
                BLOCK_INDEX_TIP_IO_ERROR;
     if (!i->RewriteStoresForReorg(keepActive, committedRecords,
                                   appendRecords, appendDerived, newActive,
+                                  fixSlots, fixRecords, fixDerived,
                                   &werr))
         return SetError(error, "reorg store stream failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
     // Test-only crash/abort point AFTER the stores were physically swapped over
@@ -2801,8 +2865,15 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
     // Persist all four stores. tip.meta below is the SOLE commit point for BOTH
     // the invalid log and the active membership (uncommitted tails are ignored).
     std::string werr;
+    // (V2 MS-FIX: this operator-invalid rollout path performs no active-chain
+    // money-supply promotion, so it passes empty correction vectors; the money-
+    // supply correction is applied only by the reorg-connect promotion path.)
+    static const std::vector<uint64_t> sEmptyFixSlots;
+    static const std::vector<BlockIndexRecord> sEmptyFixRecords;
+    static const std::vector<BlockIndexDerivedEntry> sEmptyFixDerived;
     if (!i->RewriteStoresForReorg(keepActive, committedRecords,
-                                  appendRecords, appendDerived, allActive, &werr))
+                                  appendRecords, appendDerived, allActive,
+                                  sEmptyFixSlots, sEmptyFixRecords, sEmptyFixDerived, &werr))
         return SetError(error, "fused store stream failed: " + werr), BLOCK_INDEX_TIP_IO_ERROR;
     if (!WriteInvalidFile(i->invalidPath, allEntries))
         return SetError(error, "fused tip-invalid failed"), BLOCK_INDEX_TIP_IO_ERROR;
