@@ -4639,36 +4639,18 @@ unsigned int GetNextTargetRequired(const CBlockIndex* pindexLast, bool fProofOfS
 
     int64_t nActualSpacing = pindexPrev->GetBlockTime() - pindexPrevPrev->GetBlockTime();
 
-    // Clamp nActualSpacing (tighter bounds post-fork, negative-only pre-fork)
-    int nNextHeight = pindexLast->nHeight + 1;
-    unsigned int nEffectiveSpacing = GetTargetSpacingForHeight(nNextHeight);
+    // Intermediate consensus normalization: the (retired) TIGHTER_DRIFT fork gate
+    // never fires on mainnet (FORK_HEIGHT_TIGHTER_DRIFT = 999999999), so the
+    // pre-fork retarget is the sole live implementation. Preserved byte-identical.
+    // Clamp nActualSpacing: negative-only (pre-fork behavior).
+    unsigned int nEffectiveSpacing = GetTargetSpacingForHeight(pindexLast->nHeight + 1);
 
-    if (nNextHeight < FORK_HEIGHT_TIGHTER_DRIFT)
-    {
-        if (nActualSpacing < 0)
-            nActualSpacing = nEffectiveSpacing;
-    }
-    else
-    {
-        int nClampFactor = (nNextHeight >= FORK_HEIGHT_TIGHTER_DRIFT) ? 4 : 10;
-        int64_t nMinSpacing = (int64_t)nEffectiveSpacing / nClampFactor;
-        if (nMinSpacing < 1) nMinSpacing = 1;
-        int64_t nMaxSpacing = (int64_t)nEffectiveSpacing * nClampFactor;
-
-        if (nActualSpacing < nMinSpacing)
-        {
-            if (nActualSpacing < 0)
-                printf("WARNING: GetNextTargetRequired() : negative actual spacing %" PRId64 " (clamping to %" PRId64 ")\n",
-                       nActualSpacing, nMinSpacing);
-            nActualSpacing = nMinSpacing;
-        }
-        if (nActualSpacing > nMaxSpacing)
-            nActualSpacing = nMaxSpacing;
-    }
+    if (nActualSpacing < 0)
+        nActualSpacing = nEffectiveSpacing;
 
     CBigNum bnNew;
     bnNew.SetCompact(pindexPrev->nBits);
-    int64_t nSmoothTimespan = (nNextHeight >= FORK_HEIGHT_TIGHTER_DRIFT) ? 180 : nTargetTimespan;
+    int64_t nSmoothTimespan = nTargetTimespan;
     int64_t nInterval = nSmoothTimespan / nEffectiveSpacing;
     bnNew *= ((nInterval - 1) * nEffectiveSpacing + nActualSpacing + nActualSpacing);
     bnNew /= ((nInterval + 1) * nEffectiveSpacing);
@@ -4715,34 +4697,17 @@ bool ResolveNextTargetRequiredByValue(const uint256& hashLast, bool fProofOfStak
     }
 
     int64_t nActualSpacing = (int64_t)prev.nTime - (int64_t)prevPrev.nTime;
-    int nNextHeight = last.height + 1;
-    unsigned int nEffectiveSpacing = GetTargetSpacingForHeight(nNextHeight);
+    unsigned int nEffectiveSpacing = GetTargetSpacingForHeight(last.height + 1);
 
-    if (nNextHeight < FORK_HEIGHT_TIGHTER_DRIFT)
-    {
-        if (nActualSpacing < 0)
-            nActualSpacing = nEffectiveSpacing;
-    }
-    else
-    {
-        int nClampFactor = (nNextHeight >= FORK_HEIGHT_TIGHTER_DRIFT) ? 4 : 10;
-        int64_t nMinSpacing = (int64_t)nEffectiveSpacing / nClampFactor;
-        if (nMinSpacing < 1) nMinSpacing = 1;
-        int64_t nMaxSpacing = (int64_t)nEffectiveSpacing * nClampFactor;
-        if (nActualSpacing < nMinSpacing)
-        {
-            if (nActualSpacing < 0)
-                printf("WARNING: GetNextTargetRequired() : negative actual spacing %" PRId64 " (clamping to %" PRId64 ")\n",
-                       nActualSpacing, nMinSpacing);
-            nActualSpacing = nMinSpacing;
-        }
-        if (nActualSpacing > nMaxSpacing)
-            nActualSpacing = nMaxSpacing;
-    }
+    // Intermediate consensus normalization: the (retired) TIGHTER_DRIFT fork gate
+    // never fires on mainnet (FORK_HEIGHT_TIGHTER_DRIFT = 999999999), so the
+    // pre-fork retarget is the sole live implementation. Preserved byte-identical.
+    if (nActualSpacing < 0)
+        nActualSpacing = nEffectiveSpacing;
 
     CBigNum bnNew;
     bnNew.SetCompact(prev.nBits);
-    int64_t nSmoothTimespan = (nNextHeight >= FORK_HEIGHT_TIGHTER_DRIFT) ? 180 : nTargetTimespan;
+    int64_t nSmoothTimespan = nTargetTimespan;
     int64_t nInterval = nSmoothTimespan / nEffectiveSpacing;
     bnNew *= ((nInterval - 1) * nEffectiveSpacing + nActualSpacing + nActualSpacing);
     bnNew /= ((nInterval + 1) * nEffectiveSpacing);
@@ -4760,7 +4725,7 @@ bool ResolveNextTargetRequiredByValue(const uint256& hashLast, bool fProofOfStak
                   hashLast.ToString().c_str(), last.height,
                   prev.hash.ToString().c_str(), prev.nTime, prev.nBits,
                   prevPrev.hash.ToString().c_str(), prevPrev.nTime,
-                  nActualSpacing, nNextHeight, nEffectiveSpacing, nInterval, *pBitsOut);
+                  nActualSpacing, last.height + 1, nEffectiveSpacing, nInterval, *pBitsOut);
     return true;
 }
 
