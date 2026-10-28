@@ -29,6 +29,12 @@ Tribus Algo PoW/PoS Hybrid Cryptocurrency
 
 [Links](#links)
 
+## Current development priority — 25 October 2026
+
+The owner’s priority is recovery and stabilization of the legacy network after the recent hard fork. ASERT is deferred indefinitely. Completed Stage C/D remain historical research only; their results are preserved, but no Stage D.1, parameter selection, ASERT activation, DGW change, new hard fork, or mandatory client upgrade is planned. Parameters and activation remain unset. Resuming ASERT requires a new explicit owner decision.
+
+Active work continues on P2P-01 block propagation, Block Index V2/Store3A stability and compatibility, and outstanding recovery (REC) tasks under their existing approval and verification requirements. Completed research and the accepted REC-03 operational recovery do not establish overall release readiness; the release verdict remains HOLD.
+
 ## Intro
 
 Innova is a true optionally anonymous, untraceable, and secure hybrid cryptocurrency.
@@ -54,10 +60,10 @@ Innova [INN] is an anonymous, untraceable, energy efficient, Proof-of-Work (Trib
 ## Specifications
 
 * Total number of coins: 18,000,000 INN
-* Ideal block time: ~15 seconds
-* Stake interest: 6% annual static inflation
+* Stake interest: 6% annual static inflation (source-verified: `COIN_YEAR_REWARD = 0.06 * COIN` = 6%, src/main.h:140)
+* Ideal block time: ~15 seconds (source-verified: `nTargetSpacing = 15`, src/main.cpp:91)
 * Confirmations: 10 blocks
-* Maturity: 75 blocks
+* Maturity: 65 blocks (`nCoinbaseMaturity = 65`, src/main.cpp:96; the historically documented value 75 corresponds to the wallet spend-maturity heuristic `nCoinbaseMaturity + 10`, src/main.cpp:3884; verify against the reference release)
 * Min stake age: 10 hours
 
 * Cost of Hybrid Collateral Nodes: 25,000 INN
@@ -67,6 +73,7 @@ Innova [INN] is an anonymous, untraceable, energy efficient, Proof-of-Work (Trib
 * Collateral Node Port: 14539, Testnet Port: 15539
 
 * INN Magic Number: 0xb73ff4fa
+* P2P user-agent (subversion): `/innova:5.0.5/` (CLIENT_NAME `innova` [src/version.cpp:11] + FormatSubVersion [src/util.cpp:1806] + CLIENT_VERSION 5.0.5 [src/clientversion.h])
 * BIP44 CoinType: 116
 * Base58 Pubkey Decimal: 102
 * Base58 Scriptkey Decimal: 137
@@ -76,11 +83,11 @@ Innova [INN] is an anonymous, untraceable, energy efficient, Proof-of-Work (Trib
 
 * Hybrid PoW/PoS Collateral Nodes
 * Stealth addresses
-* Ring Signatures (16 Recommended, deprecated at IIP-0003)
+* Ring Signature / ANON transactions: consensus mechanism **removed** in this source (ANON transactions rejected unconditionally; the ring-sig deprecation fork gate is inert on mainnet)
 * Native Optional Tor Onion Node (-nativetor=1)
 * Multi-Signature Addresses & TXs
 * Atomic Swaps using UTXOs (BIP65 CLTV)
-* BIP39 Support (Coin Type 116)
+* BIP39 Support (Coin Type 116) (documented historical claim; no BIP39/HD-derivation code path was found in this source tree at this HEAD — treat as unverified against source)
 * Fast ~15 Second Block Times
 * Tribus PoW Algorithm comprising of 3 NIST5 algorithms
 * Tribus PoW/PoS Hybrid
@@ -95,20 +102,31 @@ commands, thread limits, reward distribution, and safety notes.
 
 ## Privacy & Protocol Innovations (IIPs)
 
-Innova Improvement Proposals (IIPs) formalize all protocol innovations. See [IIP_INDEX.md](IIP_INDEX.md) for full specifications.
+Innova Improvement Proposals (IIPs) formalize protocol innovations.
+The authoritative historical specifications are in [docs/proposals/IIP_INDEX.md](docs/proposals/IIP_INDEX.md).
 
-| IIP | Title | Status | Fork Height |
-|-----|-------|--------|-------------|
-| [IIP-0001](IIP_INDEX.md#iip-0001-cold-staking-p2cs) | Cold Staking (P2CS) | Active | 7,100,000 |
-| [IIP-0002](IIP_INDEX.md#iip-0002-shielded-transactions) | Shielded Transactions (Pedersen + Bulletproofs + Lelantus) | Active | 8,000,000 |
-| [IIP-0003](IIP_INDEX.md#iip-0003-ring-signature-deprecation) | Ring Signature Deprecation | Active | 8,500,000 |
-| [IIP-0004](IIP_INDEX.md#iip-0004-dynamic-selective-privacy) | Dynamic Selective Privacy (8 modes) | Active | 8,600,000 |
-| [IIP-0005](IIP_INDEX.md#iip-0005-confidential-coinjoin) | Confidential CoinJoin | Active | 8,700,000 |
-| [IIP-0006](IIP_INDEX.md#iip-0006-fcmp-full-chain-membership-proofs) | FCMP++ Full-Chain Membership Proofs | Active | 9,000,000 |
-| [IIP-0007](IIP_INDEX.md#iip-0007-silent-payments-and-silent-shielding) | Silent Payments + Silent Shielding | Active | 8,000,000 |
-| [IIP-0008](IIP_INDEX.md#iip-0008-dandelion-network-privacy) | Dandelion++ Network Privacy | Active | 8,000,000 |
-| [IIP-0009](IIP_INDEX.md#iip-0009-nullstake-v1) | NullStake V1 (ZK Private Staking) | Active | 9,500,000 |
-| [IIP-0010](IIP_INDEX.md#iip-0010-nullstake-v2) | NullStake V2 (Poseidon2 + Bulletproof AC) | Proposed | 10,000,000 |
+> **Status note (source-verified, 2026-10-25).** The table below documents the historical IIP
+> proposals from IIP_INDEX.md. **None of them is active on the current mainnet build.** Every
+> consensus fork gate — cold staking, CN payment validation, tighter timestamp drift, ring-sig
+> deprecation, POEM — resolves to `MAINNET_EXPERIMENTAL_V5_DISABLED_HEIGHT = 999999999`
+> (`src/main.h:138–221`), i.e. is inert on mainnet. IIP-0002/0004–0010 have **no corresponding
+> consensus gate in this source at all** (not implemented). The ANON/ring-signature mechanism is
+> **removed** (transactions rejected unconditionally). Fork heights below are the historical
+> documented values from the spec and do **not** imply current activation. Do not treat a README
+> or IIP_INDEX status as an activation authority; verify against source consensus gates.
+
+| IIP | Title | Status vs current source | Fork Height (documented) |
+|-----|-------|--------------------------|--------------------------|
+| [IIP-0001](docs/proposals/IIP_INDEX.md#iip-0001-cold-staking-p2cs) | Cold Staking (P2CS) | Historical proposal; fork gate inert on mainnet (=999999999), not active | 7,100,000 |
+| [IIP-0002](docs/proposals/IIP_INDEX.md#iip-0002-shielded-transactions) | Shielded Transactions (Pedersen + Bulletproofs + Lelantus) | Historical proposal; no consensus gate in source, not implemented | 8,000,000 |
+| [IIP-0003](docs/proposals/IIP_INDEX.md#iip-0003-ring-signature-deprecation) | Ring Signature Deprecation | ANON/ring-sig consensus removed (unconditional reject); deprecation gate inert | 8,500,000 |
+| [IIP-0004](docs/proposals/IIP_INDEX.md#iip-0004-dynamic-selective-privacy) | Dynamic Selective Privacy (8 modes) | Historical proposal; no consensus gate, not implemented | 8,600,000 |
+| [IIP-0005](docs/proposals/IIP_INDEX.md#iip-0005-confidential-coinjoin) | Confidential CoinJoin | Historical proposal; no consensus gate, not implemented | 8,700,000 |
+| [IIP-0006](docs/proposals/IIP_INDEX.md#iip-0006-fcmp-full-chain-membership-proofs) | FCMP++ Full-Chain Membership Proofs | Historical proposal; no consensus gate, not implemented | 9,000,000 |
+| [IIP-0007](docs/proposals/IIP_INDEX.md#iip-0007-silent-payments-and-silent-shielding) | Silent Payments + Silent Shielding | Historical proposal; no consensus gate, not implemented | 8,000,000 |
+| [IIP-0008](docs/proposals/IIP_INDEX.md#iip-0008-dandelion-network-privacy) | Dandelion++ Network Privacy | Historical proposal; no consensus gate, not implemented | 8,000,000 |
+| [IIP-0009](docs/proposals/IIP_INDEX.md#iip-0009-nullstake-v1) | NullStake V1 (ZK Private Staking) | Historical proposal; no consensus gate, not implemented | 9,500,000 |
+| [IIP-0010](docs/proposals/IIP_INDEX.md#iip-0010-nullstake-v2) | NullStake V2 (Poseidon2 + Bulletproof AC) | Historical proposal; no consensus gate, not implemented | 10,000,000 |
 
 ## Collateral Nodes
 
@@ -161,7 +179,7 @@ they think their feature or bug fix is ready.
 
 The patch will be accepted if there is broad consensus that it is a
 good thing.  Developers should expect to rework and resubmit patches
-if they don't match the project's coding conventions (see coding.txt)
+if they don't match the project's coding conventions (see [coding.txt](doc/coding.txt))
 or are controversial.
 
 The master branch is regularly built and tested, but is not guaranteed
