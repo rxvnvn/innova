@@ -63,3 +63,9 @@ src/atlas-sidebranch-probe
 src/txleveldb/
 src/*.o
 obj/
+
+# runtime logs / committed test binaries (removed from the index 2026-10-29)
+src/debug.log
+src/anonstore_tests
+*.pkl
+.verdicts_audits.json
