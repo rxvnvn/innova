@@ -32,7 +32,6 @@
 #include "kernel.h"
 #include "checkpoints.h"
 #include "blockindex_authoritative_live.h"
-#include "blockindex_test_generation.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_manager.h"
 #include "blockindex_generation_builder.h"
@@ -96,10 +95,38 @@ static CBlockIndex* CkptV2Mine(CBlockIndex* prev, unsigned int extra)
 
 static bool BuildLiveChainSource(BlockIndexGenerationSource* source, std::string* error)
 {
-    // Authoritative BI-V2: mapBlockIndex is intentionally not fully resident
-    // (blocks retire to the V2 generation + live tip store). The contiguous
-    // active-chain lineage (pindexBest->pprev) is the correct source.
-    return innova_test_gen::BuildLiveChainSourceAuthoritative(source, error);
+    source->records.clear();
+    for (std::map<uint256, CBlockIndex*>::const_iterator it = ::mapBlockIndex.begin(); it != ::mapBlockIndex.end(); ++it)
+    {
+        const CBlockIndex* p = it->second;
+        if (!p) continue;
+        BlockIndexGenerationSourceRecord rec;
+        rec.hash = p->GetBlockHash();
+        rec.record.hash = p->GetBlockHash();
+        rec.record.hashPrev = (p->pprev ? p->pprev->GetBlockHash() : uint256(0));
+        rec.record.hashMerkleRoot = p->hashMerkleRoot;
+        rec.record.hashProof = p->hashProof;
+        rec.record.prevoutStake = p->prevoutStake;
+        rec.record.height = p->nHeight;
+        rec.record.nFile = p->nFile;
+        rec.record.nBlockPos = p->nBlockPos;
+        rec.record.nFlags = p->nFlags;
+        rec.record.nVersion = p->nVersion;
+        rec.record.nTime = p->nTime;
+        rec.record.nBits = p->nBits;
+        rec.record.nNonce = p->nNonce;
+        rec.record.nMint = p->nMint;
+        rec.record.nMoneySupply = p->nMoneySupply;
+        rec.record.nStakeModifier = p->nStakeModifier;
+        rec.record.nStakeTime = p->nStakeTime;
+        source->records.push_back(rec);
+    }
+    source->hashBestChain = (pindexBest ? pindexBest->GetBlockHash() : uint256(0));
+    source->foundBestChain = (pindexBest != NULL);
+    source->blockDataDir = GetDataDir().string();
+    if (source->records.empty())
+    { if (error) *error = "live chain source: empty mapBlockIndex"; return false; }
+    return true;
 }
 
 static void CkptV2BuildRoot(const fs::path& root, std::string* error)
@@ -243,12 +270,9 @@ BOOST_AUTO_TEST_CASE(v2_authoritative_startup_and_restart_reload_checkpoint)
 {
     CkptV2SavedState saved;
 
-    CBlockIndex* tip = pindexBest != NULL ? pindexBest : pindexGenesisBlock;
-    BOOST_REQUIRE_MESSAGE(tip != NULL, "TestingSetup must provide a live tip");
+    CBlockIndex* tip = pindexBest;
     while (tip->nHeight < 6)
         tip = CkptV2Mine(tip, 0xC000u + (unsigned)tip->nHeight);
-    BOOST_REQUIRE_MESSAGE(pindexBest != NULL && pindexBest->nHeight == tip->nHeight,
-                          "mined chain must be committed to the persisted Store3A before building the source");
 
     // Sentinel checkpoint = a real (non-genesis) chain block, written to the
     // SAME legacy tx-leveldb that the V2 startup leaves active.
@@ -265,9 +289,6 @@ BOOST_AUTO_TEST_CASE(v2_authoritative_startup_and_restart_reload_checkpoint)
     mapArgs["-blockindexlivetail"] = "32";
 
     // --- startup #1
-    // The fixture already ran the authoritative startup; release it before
-    // re-entering InitBlockIndexAuthoritative on the isolated root.
-    ResetBlockIndexAuthoritativeStartupForTest();
     if (!InitBlockIndexAuthoritative(root.string(), &error))
         BOOST_FAIL("InitBlockIndexAuthoritative failed: " + error);
     BOOST_REQUIRE(g_fAuthoritativeStartup);

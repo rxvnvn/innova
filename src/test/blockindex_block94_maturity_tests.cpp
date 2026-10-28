@@ -33,9 +33,7 @@
 #include "wallet.h"
 #include "kernel.h"
 #include "blockindex_authoritative_live.h"
-#include "chainstate/txloc/txloc.h"
 #include "blockindex_authoritative_startup.h"
-#include "blockindex_native_bootstrap.h"
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
 
@@ -87,16 +85,17 @@ static CBlockIndex* B94Mine(CBlockIndex* prev, unsigned int extra)
     return idx;
 }
 
-// Build + publish + select an isolated V2 generation capturing the fixture's
-// current live chain, through the REAL shared builder. The legacy txleveldb
-// copy is gone (txdb-leveldb was physically removed), so source the generation
-// from CreateGenesisBlockIndexSource (canonical genesis records read live from
-// the resident index) augmented with the current live chain tip record.
+// Build + publish + select an isolated V2 generation from the current live txleveldb.
 static void B94BuildRoot(const fs::path& root, std::string* error)
 {
     fs::create_directories(root / "snapshot");
+    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
+    const auto live = GetDataDir() / "txleveldb";
+    for (fs::directory_iterator it(live), end; it != end; ++it)
+        if (fs::is_regular_file(it->path()))
+            fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
     BlockIndexGenerationSource source;
-    BOOST_REQUIRE_MESSAGE(CreateGenesisBlockIndexSource(GetDataDir().string(), &source, error), *error);
+    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &source, error), *error);
     source.blockDataDir = GetDataDir().string();
     BlockIndexGenerationBuilder builder;
     BOOST_REQUIRE_MESSAGE(builder.Build(source, (root / "build-000001.tmp").string(), 1, NULL, error), *error);
@@ -161,19 +160,6 @@ BOOST_AUTO_TEST_CASE(coinbase_spend_mature_accepted_under_authority)
     const std::string savedLivetail = hadLivetail ? mapArgs["-blockindexlivetail"] : std::string();
 
     mapArgs["-blockindexlivetail"] = "32";
-    // The -loadblock replay contract (init.cpp): TX-LOC must be open BEFORE the
-    // first block connects, because FetchInputs() resolves every non-coinbase
-    // input through s16_V2ReadTxIndex(), which returns false while the locator
-    // is closed (the fresh-IBD block-94 stall). A fresh directory is created
-    // and fed per block by ConnectBlock.
-    {
-        const fs::path txlocDir = GetDataDir() / "chainstate" / "txloc";
-        txloc::ChainError txe; bool txa = false;
-        BOOST_REQUIRE_MESSAGE(txloc::g_txloc.openDir(txlocDir.string(), &txa, &txe), txe.str());
-    }
-    // The fixture already ran the authoritative startup; release it before
-    // re-entering InitBlockIndexAuthoritative on the isolated root.
-    ResetBlockIndexAuthoritativeStartupForTest();
     BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
     BOOST_REQUIRE(g_fAuthoritativeStartup);
     BOOST_REQUIRE(GetAuthoritativeLiveAuthority() != NULL);
