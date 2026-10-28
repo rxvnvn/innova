@@ -200,8 +200,16 @@ public:
     // ascending order, O(1) auxiliary memory, cache-neutral (does not touch
     // the ring or the LRU). `visit` returning false stops early (not an
     // error). Fails closed on any short/undecodable read.
+    //
+    // `stoppedEarly` (optional) disambiguates the two success shapes: true
+    // means the range was NOT fully visited because the callback asked to
+    // stop. Callbacks that return false to signal a FAILURE must therefore be
+    // wrapped by the caller (with this flag or by capturing their own error),
+    // never passed straight through -- a silent partial pass is
+    // indistinguishable from a requested stop otherwise.
     bool StreamVisit(uint64_t beginSlot, uint64_t endSlotExclusive,
-                     const VisitFn& visit, std::string* error) const;
+                     const VisitFn& visit, std::string* error,
+                     bool* stoppedEarly = NULL) const;
 
     TipWindowStats Stats() const;
 
@@ -477,15 +485,17 @@ bool TipStoreWindow<T>::Get(uint64_t slot, T* out, std::string* error) const
 
 template <class T>
 bool TipStoreWindow<T>::StreamVisit(uint64_t beginSlot, uint64_t endSlotExclusive,
-                                    const VisitFn& visit, std::string* error) const
+                                    const VisitFn& visit, std::string* error,
+                                    bool* stoppedEarly) const
 {
+    if (stoppedEarly) *stoppedEarly = false;
     if (endSlotExclusive > count_)
     {
         if (error) *error = "stream range exceeds committed count";
         return false;
     }
-    if (!RefreshHandle(error))
-        return false;
+    if (RefreshHandle(error))
+        ; else return false;
     for (uint64_t s = beginSlot; s < endSlotExclusive; ++s)
     {
         const unsigned long off = headerSize_ + (unsigned long)s * entrySize_;
@@ -511,7 +521,12 @@ bool TipStoreWindow<T>::StreamVisit(uint64_t beginSlot, uint64_t endSlotExclusiv
             return false;
         }
         if (!visit(s, v))
-            return true; // caller-requested early stop
+        {
+            // Caller-requested early stop. This is NOT a full pass: report it
+            // so a caller that needs completeness cannot mistake it for one.
+            if (stoppedEarly) *stoppedEarly = true;
+            return true;
+        }
     }
     return true;
 }

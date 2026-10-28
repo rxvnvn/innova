@@ -1161,11 +1161,31 @@ struct BlockIndexTipAuthority::Impl
                 [this, &midOk](uint64_t slot, const BlockIndexRecord& r) {
                     BlockIndexId got = 0;
                     if (sideIndex.Lookup(r.hash, &got, NULL) !=
-                            BLOCK_INDEX_HASH_LOOKUP_FOUND ||
-                        got != baseLocalToId(slot))
+                            BLOCK_INDEX_HASH_LOOKUP_FOUND)
                     {
                         midOk = false;
                         return false; // stop the stream at the first mismatch
+                    }
+                    const BlockIndexId want = baseLocalToId(slot);
+                    if (got == want)
+                        return true;
+                    // A hash that occurs at more than one committed slot maps to
+                    // its FIRST slot by construction (Put() rejects a second id
+                    // for an already mapped hash). That is a deterministic
+                    // duplicate mapping, not index corruption -- accepting it
+                    // keeps a store with repeated records from forcing a full
+                    // rebuild on EVERY Open. Anything else is corruption.
+                    if (got <= meta.baseRecordCount || got > want)
+                    {
+                        midOk = false;
+                        return false;
+                    }
+                    BlockIndexRecord prev;
+                    if (!recordsWin.Get(got - meta.baseRecordCount - 1, &prev, NULL) ||
+                        prev.hash != r.hash)
+                    {
+                        midOk = false;
+                        return false;
                     }
                     return true;
                 }, &verr);
@@ -1185,15 +1205,60 @@ struct BlockIndexTipAuthority::Impl
                 return SetError(error, "tip-hashindex recreate: " + oerr);
             std::string perr;
             uint64_t rebuildTrimCtr = 0;
+            std::string putErr;
+            bool putFailed = false;
+            bool stoppedEarly = false;
+            uint64_t dupSlots = 0;
+            uint64_t indexedSlots = 0;
             const bool built = recordsWin.StreamVisit(0, N,
-                [this, &rebuildTrimCtr](uint64_t slot, const BlockIndexRecord& r) {
+                [this, &rebuildTrimCtr, &putErr, &putFailed, &dupSlots, &indexedSlots](
+                    uint64_t slot, const BlockIndexRecord& r) {
                     BlockIndexId id = baseLocalToId(slot);
                     PeriodicStartupTrim(rebuildTrimCtr);
-                    return sideIndex.Put(r.hash, id, NULL);
-                }, &perr);
+                    // Two committed slots may carry the SAME block (a repeated
+                    // record). That is not a new mapping: the first slot wins so
+                    // the rebuild still completes and every slot's hash stays
+                    // resolvable. Letting Put() report the conflict would abort
+                    // the pass and (before this fix) be mistaken for a
+                    // caller-requested stop, leaving the newest tip unindexed.
+                    BlockIndexId have = 0;
+                    const BlockIndexHashLookupStatus ls = sideIndex.Lookup(r.hash, &have, NULL);
+                    if (ls == BLOCK_INDEX_HASH_LOOKUP_FOUND) {
+                        if (have != id) ++dupSlots;
+                        ++indexedSlots;
+                        return true;
+                    }
+                    if (ls == BLOCK_INDEX_HASH_LOOKUP_ERROR) {
+                        putFailed = true;
+                        putErr = "hashindex lookup failed during rebuild";
+                        return false;
+                    }
+                    if (!sideIndex.Put(r.hash, id, &putErr)) {
+                        putFailed = true;
+                        return false;
+                    }
+                    ++indexedSlots;
+                    return true;
+                }, &perr, &stoppedEarly);
             { PhaseRssMark("hashindex-rebuild-done"); }
             if (!built)
                 return SetError(error, "tip-hashindex rebuild: " + perr);
+            // A callback stop is NOT a completed rebuild: without this the index
+            // can be silently truncated while the marker claims N entries.
+            if (stoppedEarly || putFailed)
+                return SetError(error, "tip-hashindex rebuild incomplete: " +
+                                (putErr.empty() ? std::string("aborted by sink") : putErr));
+            if (indexedSlots != N)
+                return SetError(error, "tip-hashindex rebuild incomplete: indexed " +
+                                std::to_string(indexedSlots) + " of " + std::to_string(N));
+            {
+                BlockIndexId tipId = 0;
+                if (sideIndex.Lookup(meta.tipHash, &tipId, NULL) != BLOCK_INDEX_HASH_LOOKUP_FOUND)
+                    return SetError(error, "tip-hashindex rebuild incomplete: tip hash not indexed");
+            }
+            if (dupSlots)
+                LogPrintf("Block Index V2: tip hash index rebuild resolved %llu duplicate "
+                          "record slot(s) to their first occurrence\n", (unsigned long long)dupSlots);
             std::string merr;
             if (!WriteHashIndexMarker(hashIndexMarkerPath, N, &merr))
                 return SetError(error, "tip-hashindex marker write: " + merr);

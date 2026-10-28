@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <set>
 #include <cstring>
 #include <openssl/sha.h>
 #include <boost/filesystem.hpp>
@@ -15,6 +16,7 @@
 
 #include "blockindex_tip.h"
 #include "blockindex_tip_bounded_window.h"
+#include "blockindex_hashindex.h"
 
 namespace fs = boost::filesystem;
 
@@ -1790,3 +1792,87 @@ BOOST_AUTO_TEST_CASE(r3i_index_stale_samecount_marker_rebuild_matrix)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// =====================================================================
+// R3-G/H — node 57.75 outage regression (2026-10-28).
+//
+// Symptom: after a tip-hashindex rebuild the authoritative startup walk failed
+// at the NEWEST tip hash with "walk lookup failed", twice, on an unchanged
+// store whose record was provably present.
+//
+// Cause chain (measured on the real store): the committed window contained two
+// slots carrying the SAME block hash; the rebuild passed BlockIndexHashIndex::
+// Put's boolean straight back to StreamVisit, the sink rejected the second
+// mapping ("conflicting"), StreamVisit interpreted the callback-false as a
+// caller-requested early stop and returned SUCCESS, and the marker was written
+// as if all N slots had been indexed. The index then held only the slots
+// before the first duplicate, so the tip hash was unindexed and the walk
+// failed closed.
+//
+// R3-G pins the sink contract the rebuild must handle. R3-H replays a real
+// store copy (set INNOVA_TIP_TEST_STORE_DIR to the directory CONTAINING tip/)
+// and emulates the walk the startup could not complete.
+// =====================================================================
+BOOST_AUTO_TEST_CASE(r3g_duplicate_hash_sink_conflict)
+{
+    const std::string dir = MakeTempDir();
+    BlockIndexHashIndex idx;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(BlockIndexHashIndex::Create(dir, 1, &idx, &err), "R3G create: " << err);
+    const uint256 h(0xD00DUL);
+    BOOST_REQUIRE_MESSAGE(idx.Put(h, 101, &err), "R3G first put: " << err);
+    BlockIndexId got = 0;
+    BOOST_CHECK(idx.Lookup(h, &got, NULL) == BLOCK_INDEX_HASH_LOOKUP_FOUND);
+    BOOST_CHECK_EQUAL(got, (BlockIndexId)101);
+    std::string cerr;
+    BOOST_CHECK_MESSAGE(!idx.Put(h, 102, &cerr),
+                        "R3G: the sink MUST reject a second id for an already mapped hash");
+    BOOST_CHECK(!cerr.empty());
+    BOOST_CHECK(idx.Lookup(h, &got, NULL) == BLOCK_INDEX_HASH_LOOKUP_FOUND);
+    BOOST_CHECK_EQUAL(got, (BlockIndexId)101);   // first mapping survives
+    BOOST_CHECK_MESSAGE(idx.Put(h, 101, NULL),
+                        "R3G: re-putting the SAME mapping (duplicate slot) must be accepted");
+    idx.Close();
+    printf("R3G PASS duplicate hash sink conflict\n");
+}
+
+BOOST_AUTO_TEST_CASE(r3h_real_tip_store_walk_after_rebuild)
+{
+    const char* dirp = getenv("INNOVA_TIP_TEST_STORE_DIR");
+    if (!dirp || !*dirp)
+    {
+        printf("R3H SKIP (INNOVA_TIP_TEST_STORE_DIR not set)\n");
+        return;
+    }
+    const char* genp = getenv("INNOVA_TIP_TEST_GEN");
+    const uint64_t gen = (genp && *genp) ? strtoull(genp, NULL, 10) : 1;
+    BlockIndexTipAuthority tip;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dirp, gen, &tip, &err),
+                          "R3H: Open of the real store copy failed: " << err);
+    const BlockIndexTipRead gotTip = tip.GetTip();
+    BOOST_REQUIRE(gotTip.status == BLOCK_INDEX_TIP_OK);
+    printf("R3H store: tipHeight=%d N=%llu\n", gotTip.height,
+           (unsigned long long)tip.TipRecordCount());
+    // The walk the authoritative startup could not complete: from the tip
+    // backwards through hashPrev, resolving every hash via the index.
+    uint256 cur = gotTip.record.hash;
+    int steps = 0;
+    std::string werr;
+    while (steps < 2048)
+    {
+        BlockIndexTipRead rd = tip.LookupByHash(cur, &werr);
+        if (rd.status != BLOCK_INDEX_TIP_OK)
+        {
+            BOOST_ERROR("R3H: walk lookup failed at " << cur.GetHex() << " after "
+                        << steps << " step(s): status=" << (int)rd.status << " " << werr);
+            break;
+        }
+        cur = rd.record.hashPrev;
+        ++steps;
+    }
+    BOOST_CHECK_MESSAGE(steps > 0, "R3H: walk did not advance");
+    BOOST_CHECK(tip.LookupByHash(gotTip.record.hash, NULL).status == BLOCK_INDEX_TIP_OK);
+    printf("R3H PASS real store: tip hash resolvable, walked %d step(s)\n", steps);
+    tip.Close();
+}
