@@ -502,3 +502,107 @@ BOOST_AUTO_TEST_CASE(legacy_pointer_path_yields_pow_limit_on_sparse_hot_parent)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// ---------------------------------------------------------------------------
+// R8-CPU-TIMESTAMP regression: a long CPU grind must keep the header time and
+// the coinbase time in lockstep, otherwise every mined PoW block is rejected by
+// CheckBlock's "coinbase timestamp is too early" (header.nTime exceeds
+// coinbase.nTime by more than FutureDrift = 10 minutes).
+//
+// Defect (live, 2026-10-23): the CPU miner advanced only block.nTime while the
+// coinbase nTime stayed at template-build time; a grind > 600 s (or a chain
+// stall) produced blocks that always failed CheckBlock. Fix: KeepCoinbaseTimeInSync
+// refreshes coinbase.nTime to the header time and rebuilds the merkle root at
+// template preparation and at every header-time advance (nonce overflow and the
+// periodic UpdateTime). No difficulty/consensus change; FutureDrift untouched.
+// ---------------------------------------------------------------------------
+BOOST_AUTO_TEST_SUITE(cpu_mining_timestamp_tests)
+
+namespace
+{
+// Minimal PoW block with a single coinbase tx whose nTime can be set independently.
+static CBlock BuildTimestampBlock(unsigned int nTime, unsigned int coinbaseNTime)
+{
+    CBlock block;
+    block.nVersion = CBlock::CURRENT_VERSION;
+    block.hashPrevBlock = uint256(1);
+    block.hashMerkleRoot = uint256(2);
+    block.nBits = 0x1d00ffff;
+    block.nNonce = 1;
+    block.nTime = nTime;
+
+    CTransaction coinbase;
+    coinbase.vin.resize(1);
+    coinbase.vin[0].prevout.SetNull();
+    coinbase.vin[0].scriptSig = CScript();
+    coinbase.vout.resize(1);
+    coinbase.vout[0].scriptPubKey = CScript() << OP_TRUE;
+    coinbase.vout[0].nValue = COIN;
+    coinbase.nTime = coinbaseNTime;
+    block.vtx.push_back(coinbase);
+    block.hashMerkleRoot = block.BuildMerkleTree();
+    return block;
+}
+
+// The exact FutureDrift gate that CheckBlock applies (main.cpp: "coinbase
+// timestamp is too early"). Rejected when true.
+static bool CoinbaseTooEarlyGate(const CBlock& b)
+{
+    return b.GetBlockTime() > FutureDrift((int64_t)b.vtx[0].nTime);
+}
+}
+
+BOOST_AUTO_TEST_CASE(stale_coinbase_from_long_grind_is_rejected_then_synced)
+{
+    const unsigned int T = 2000000000u;
+    // coinbase 700 s older than the header: simulates mining a single template
+    // longer than FutureDrift (600 s) without any coinbase refresh.
+    CBlock b = BuildTimestampBlock(T, T - 700u);
+
+    // Reproduces the live rejection: gate must hold (block is invalid).
+    BOOST_CHECK_EQUAL(CoinbaseTooEarlyGate(b), true);
+
+    // Before sync the header and coinbase are out of lockstep.
+    BOOST_CHECK(b.vtx[0].nTime != b.nTime);
+
+    // Apply the fix's helper (as the miner does on every header-time advance).
+    KeepCoinbaseTimeInSyncForTesting(&b);
+
+    // Lockstep restored and the merkle root rebuilt to commit the new coinbase.
+    BOOST_CHECK_EQUAL(b.vtx[0].nTime, b.nTime);
+    BOOST_CHECK(b.hashMerkleRoot == b.BuildMerkleTree());
+
+    // The FutureDrift gate now passes: the block is no longer timestamp-rejected.
+    BOOST_CHECK_EQUAL(CoinbaseTooEarlyGate(b), false);
+}
+
+BOOST_AUTO_TEST_CASE(time_updates_and_nonce_overflow_keep_lockstep)
+{
+    const unsigned int T = 2000000000u;
+    CBlock b = BuildTimestampBlock(T, T);
+    // header and coinbase already agree at template build/attempt prep.
+    BOOST_CHECK_EQUAL(b.vtx[0].nTime, b.nTime);
+
+    // (a) periodic UpdateTime-like advance: header drifts 1 s ahead -> helper
+    // snaps the coinbase back.
+    ++b.nTime;
+    KeepCoinbaseTimeInSyncForTesting(&b);
+    BOOST_CHECK_EQUAL(b.vtx[0].nTime, b.nTime);
+
+    // (b) nonce overflow path: header advances by a large jump (as the loop does
+    // on nNonce wrap) -> helper must restore lockstep and rebuild the root.
+    b.nTime += 100000u; // 100000 s jump, far past FutureDrift if left alone
+    KeepCoinbaseTimeInSyncForTesting(&b);
+    BOOST_CHECK_EQUAL(b.vtx[0].nTime, b.nTime);
+    BOOST_CHECK_EQUAL(CoinbaseTooEarlyGate(b), false);
+    BOOST_CHECK(b.hashMerkleRoot == b.BuildMerkleTree());
+
+    // (c) even an arbitrarily long grind (days) cannot produce a stale coinbase
+    // once the helper is applied after each header advance.
+    b.nTime += 7u * 24u * 3600u; // +7 days
+    KeepCoinbaseTimeInSyncForTesting(&b);
+    BOOST_CHECK_EQUAL(b.vtx[0].nTime, b.nTime);
+    BOOST_CHECK_EQUAL(CoinbaseTooEarlyGate(b), false);
+}
+
+BOOST_AUTO_TEST_SUITE_END()

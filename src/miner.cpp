@@ -612,6 +612,30 @@ void SetExtraNonce(CBlock* pblock, CBlockIndex* pindexPrev, unsigned int nExtraN
     pblock->hashMerkleRoot = pblock->BuildMerkleTree();
 }
 
+// Innova: the block header time and the coinbase transaction time must move in
+// lockstep. CheckBlock rejects a mined block when header.nTime exceeds
+// coinbase.nTime by more than FutureDrift (10 minutes). CreateNewBlock fixes
+// the coinbase nTime at template-build time, so a long grind that advances the
+// header time (nonce overflow / UpdateTime) would otherwise produce blocks that
+// fail CheckBlock with "coinbase timestamp is too early". Refreshing the
+// coinbase time commits it to the merkle root, so the root is rebuilt here.
+// This is NOT a consensus change: it only keeps the template internally
+// consistent and never relaxes FutureDrift or the difficulty.
+static void KeepCoinbaseTimeInSync(CBlock* pblock)
+{
+    if (!pblock || pblock->vtx.empty())
+        return;
+    pblock->vtx[0].nTime = pblock->nTime;
+    pblock->hashMerkleRoot = pblock->BuildMerkleTree();
+}
+
+// Test seam: expose the header/coinbase lockstep helper (main.h). Inert in
+// production; used by cpu_mining_tests to assert the FutureDrift restore.
+void KeepCoinbaseTimeInSyncForTesting(CBlock* pblock)
+{
+    KeepCoinbaseTimeInSync(pblock);
+}
+
 
 bool CheckStake(CBlock* pblock, CWallet& wallet)
 {
@@ -923,6 +947,7 @@ static bool PrepareCPUMiningAttempt(CBlock* pblock,
     {
         CBigNum bnTarget;
         SetExtraNonce(pblock, *outPrev, nExtraNonce);
+        KeepCoinbaseTimeInSync(pblock); // header time and coinbase start in lockstep
         bnTarget.SetCompact(pblock->nBits);
         *outTarget = bnTarget.getuint256();
         return true;
@@ -1048,7 +1073,10 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
             ++nHashesDone;
             ++pblock->nNonce;
             if (pblock->nNonce == 0)
+            {
                 ++pblock->nTime;
+                KeepCoinbaseTimeInSync(pblock.get()); // header time advanced
+            }
 
             if ((nHashesDone % 500000) == 0)
             {
@@ -1065,9 +1093,15 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
 
             if ((nHashesDone % 4096) == 0)
             {
-                // Keep the timestamp current without changing the coinbase or
-                // merkle root. GetNextTargetRequired is timestamp-independent.
+                // Keep header and coinbase timestamp in lockstep: when the
+                // header time advances, refresh the coinbase time and rebuild
+                // the merkle root, so a long grind can never produce a block
+                // whose coinbase is too old for CheckBlock's FutureDrift gate.
+                // GetNextTargetRequired is timestamp-independent (unchanged).
+                unsigned int nTimeBefore = pblock->nTime;
                 pblock->UpdateTime(pindexBlockPrev);
+                if (pblock->nTime != nTimeBefore)
+                    KeepCoinbaseTimeInSync(pblock.get());
                 bool fCheckMempool = GetTime() - nStart >= 5;
                 if (!IsCPUMiningWorkCurrent(workIdentity, fCheckMempool))
                     break;
