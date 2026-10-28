@@ -22,6 +22,8 @@
 #include "checkpoints.h"
 #include "ibdefficiency.h"
 #include "ibdactivepath.h"
+#include "p2pprop.h"
+#include "txlat.h"
 #include "ibdblocklatency.h"
 #include "ibdsemantic.h"
 #include "ibdforensic.h"
@@ -989,6 +991,8 @@ bool AppInit2()
     InitAcceptBlockRejectTrace(GetBoolArg("-acceptblockrejecttrace", false));
     ibdactivepath::InitIBDActivePathTrace(
         GetBoolArg("-ibdactivepathtrace", false));
+    p2pprop::SetEnabled(GetBoolArg("-p2pprop", false));
+    txlat::SetEnabled(GetBoolArg("-txlat", false));
     ibdblocklatency::SetEnabled(
         GetBoolArg("-ibdblocklatency", false),
         GetArg("-ibdblocklatencycsv", ""));

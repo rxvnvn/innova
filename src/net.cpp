@@ -14,6 +14,7 @@
 #include "pinglifecycletrace.h"
 #include "ibdblocklatency.h"
 #include "ibdforensic.h"
+#include "p2pprop.h"
 #include "init.h"
 #include "innovarpc.h"
 #include "strlcpy.h"
@@ -8087,6 +8088,16 @@ void SocketSendData(CNode *pnode)
                                 mit->firstSendUs;
                     }
                 }
+                // Stage-5 wire marker: confirm the getdata frame's first byte
+                // actually returned from ::send() (>0 bytes) — i.e. the bytes
+                // carrying these block hashes left the socket, not just the
+                // send queue. Fired once per carried block hash, in the same
+                // fStampPending first-write branch. Correlates with
+                // getdata_sent (enqueue) on the same node (skew-free).
+                if (p2pprop::Enabled() && mit->command == "getdata" &&
+                    !mit->vBlockHashes.empty())
+                    for (const uint256& wh : mit->vBlockHashes)
+                        p2pprop::RecordGetDataWire(wh, pnode->GetId());
             }
 
             pnode->nSendBytes += nBytes;

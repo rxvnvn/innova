@@ -11,6 +11,7 @@
 #include "init.h"
 #include "base58.h"
 #include "main.h"
+#include "txlat.h"
 #include "ibdmetrics.h"
 #include "ibdsemantic.h"
 #include "stealth.h"
@@ -1002,6 +1003,7 @@ Value sendtoaddress(const Array& params, bool fHelp)
         throw JSONRPCError(RPC_WALLET_UNLOCK_NEEDED, "Error: Please enter the wallet passphrase with walletpassphrase first.");
 
     string strError = pwalletMain->SendMoneyToDestination(address.Get(), nAmount, sNarr, wtx);
+    txlat::Mark("rpc_done");
     if (strError != "")
         throw JSONRPCError(RPC_WALLET_ERROR, strError);
 

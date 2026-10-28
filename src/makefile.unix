@@ -343,6 +343,8 @@ OBJS= \
     obj/ibdactivepath.o \
     obj/ibdsemantic.o \
     obj/ibdheaderscheduler.o \
+    obj/p2pprop.o \
+    obj/txlat.o \
     obj/ibdblocklatency.o \
     obj/ibdforensic.o \
     obj/pinglifecycletrace.o \
@@ -455,6 +457,8 @@ OBJS= \
     obj/ibdactivepath.o \
     obj/ibdsemantic.o \
     obj/ibdheaderscheduler.o \
+    obj/p2pprop.o \
+    obj/txlat.o \
     obj/ibdblocklatency.o \
     obj/ibdforensic.o \
     obj/pinglifecycletrace.o \

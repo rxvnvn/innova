@@ -17,6 +17,7 @@
 #include "ibdefficiency.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "p2pprop.h"
 #include "ibdblocklatency.h"
 #include "pinglifecycletrace.h"
 #include "ibdforensic.h"
@@ -9254,6 +9255,8 @@ bool CBlock::AcceptBlock()
     }
     int64_t nAddIndexMs = GetTimeMillis() - nAddIndexStart;
 
+    p2pprop::RecordBlockAccepted(hash, nHeight, nWriteDiskMs, nAddIndexMs);
+
     // Relay inventory, but don't relay old inventory during initial block download
     int nBlockEstimate = Checkpoints::GetTotalBlocksEstimate();
     if (hashBestChain == hash)
@@ -9263,7 +9266,10 @@ bool CBlock::AcceptBlock()
         {
             int nPeerHeight = pnode->nBestKnownHeight >= 0 ? pnode->nBestKnownHeight : pnode->nChainHeight;
             if (nBestHeight > (nPeerHeight != -1 ? nPeerHeight - 2000 : nBlockEstimate))
+            {
                 pnode->PushInventory(CInv(MSG_BLOCK, hash));
+                p2pprop::RecordAnnounce(hash, pnode->GetId());
+            }
         }
     }
 
@@ -11212,6 +11218,7 @@ void static ProcessGetData(CNode* pfrom)
                     else
                     {
                         pfrom->PushMessage("block", block);
+                        p2pprop::RecordBlockServed(inv.hash, pfrom->GetId());
                         ++gDbBlockServed;
                     }
 
@@ -11273,6 +11280,7 @@ void static ProcessGetData(CNode* pfrom)
                         else
                         {
                             pfrom->PushMessage("block", block);
+                            p2pprop::RecordBlockServed(inv.hash, pfrom->GetId());
                             ++gDbBlockServed;
                         }
 
@@ -12842,6 +12850,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             boost::this_thread::interruption_point();
             pfrom->AddInventoryKnown(inv);
 
+            if (inv.type == MSG_BLOCK)
+                p2pprop::RecordInvReceived(inv.hash, pfrom->GetId());
+
             bool fAlreadyHave = AlreadyHave(inv);
             if (fGetBlocksResponse && inv.type == MSG_BLOCK)
                 ++nGetBlocksResponseBlockInv;
@@ -13020,6 +13031,10 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         }
 
         pfrom->vRecvGetData.insert(pfrom->vRecvGetData.end(), vInv.begin(), vInv.end());
+        if (p2pprop::Enabled())
+            for (const CInv& invN : vInv)
+                if (invN.type == MSG_BLOCK)
+                    p2pprop::RecordGetDataReceived(invN.hash, pfrom->GetId());
         ProcessGetData(pfrom);
     }
 
@@ -13916,6 +13931,8 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         ibdblocklatency::RecordBlockReceived(
             hashBlock, pfrom->GetId(), (int64_t)nBlockPayloadBytes,
             nTimeReceived, pfrom->nPingUsecTime);
+        p2pprop::RecordBlockReceived(hashBlock, pfrom->GetId(),
+                                     nBlockPayloadBytes);
 
         CSyncLockDiagnostics blockLockDiagnostics(
             "ProcessMessage(block)", "cs_main");
@@ -15519,9 +15536,11 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
                     ibdactivepath::RecordAskForToGetData(
                         std::max<int64_t>(0, nNow - (*pto->mapAskFor.begin()).first));
                     ++nIBDPassSent;
+                    const bool fGetDataRetry = (pto->setBlocksInFlight.count(inv.hash) != 0);
                     pto->MarkBlockInFlight(inv.hash);
                     ibdactivepath::RecordBlockRequestSent(inv.hash);
                     ibdblocklatency::RecordGetDataSent(inv.hash, pto->GetId());
+                    p2pprop::RecordGetDataSent(inv.hash, pto->GetId(), fGetDataRetry);
                     if (IbdHeadersControlPlaneEnabled())
                         TraceIbdHeadersObserverEvent("request", pto, inv.hash, -1);
                     if (fTraceBlockRequest)

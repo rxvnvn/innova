@@ -9,6 +9,7 @@
 //   cs_spvutxos is always acquired last when needed.
 
 #include "wallet.h"
+#include "txlat.h"
 #include "walletdb.h"
 #include "chainstate/observe_hook.h"
 #include "innovarpc.h"
@@ -2801,6 +2802,7 @@ bool CWallet::SelectCoins(int64_t nTargetValue, unsigned int nSpendTime, set<pai
 {
     vector<COutput> vCoins;
     AvailableCoins(vCoins, true, coinControl);
+    txlat::Mark("coinspool", (int64_t)vCoins.size());
 
     // coin control -> return all selected outputs (we want all selected to go into the transaction for sure)
     if (coinControl && coinControl->HasSelected())
@@ -3167,6 +3169,7 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
                     strFailReason = _("Insufficient funds");
                     return false;
                 }
+                txlat::Mark("selectcoins", (int64_t)setCoins.size());
 
                 BOOST_FOREACH(PAIRTYPE(const CWalletTx*, unsigned int) pcoin, setCoins)
                 {
@@ -3282,9 +3285,11 @@ bool CWallet::CreateTransaction(const vector<pair<CScript, int64_t> >& vecSend, 
                         return false;
                     }
                 }
+                txlat::Mark("sign", nIn);
 
                 // Limit size
                 unsigned int nBytes = ::GetSerializeSize(*(CTransaction*)&wtxNew, SER_NETWORK, PROTOCOL_VERSION);
+                txlat::Mark("txsize", (int64_t)nBytes, (int64_t)nIn);
                 if (nBytes >= MAX_BLOCK_SIZE_GEN/5)
                 {
                     strFailReason = _("Transaction too large");
@@ -4531,6 +4536,7 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
             if (fFileBacked)
                 delete pwalletdb;
         }
+        txlat::Mark("persisted", (int64_t)wtxNew.vin.size());
 
         // Track how many getdata requests our transaction gets
         mapRequestCount[wtxNew.GetHash()] = 0;
@@ -4548,13 +4554,16 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
             wtxNew.vReservedCoins.clear();
             return false;
         }
+        txlat::Mark("acceptmp");
         wtxNew.RelayWalletTransaction();
+        txlat::Mark("relay");
     }
     return true;
 }
 
 string CWallet::SendMoney(CScript scriptPubKey, int64_t nValue, std::string& sNarr, CWalletTx& wtxNew, bool fAskFee)
 {
+    txlat::Begin("send");
     CReserveKey reservekey(this);
     int64_t nFeeRequired;
 
@@ -4584,9 +4593,11 @@ string CWallet::SendMoney(CScript scriptPubKey, int64_t nValue, std::string& sNa
     if (fAskFee && !uiInterface.ThreadSafeAskFee(nFeeRequired, _("Sending...")))
         return "ABORTED";
 
+    txlat::Mark("create_done", nFeeRequired);
     if (!CommitTransaction(wtxNew, reservekey))
         return _("Error: The transaction was rejected.  This might happen if some of the coins in your wallet were already spent, such as if you used a copy of wallet.dat and coins were spent in the copy but not marked as spent here.");
 
+    txlat::Mark("commit_done");
     return "";
 }
 
