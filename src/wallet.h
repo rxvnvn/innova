@@ -429,6 +429,24 @@ public:
     void ReacceptWalletTransactions();
     void ResendWalletTransactions(bool fForce = false);
     int64_t GetBalance() const;
+
+    // Single-pass wallet aggregates. Each value is identical to the matching
+    // individual getter (GetBalance/GetUnconfirmedBalance/GetImmatureBalance/
+    // GetStake/GetNewMint) but all five are computed in ONE walk of mapWallet,
+    // so the per-transaction block-index work (IsTrusted ->
+    // GetDepthInMainChain -> LookupByHash -> TipStoreWindow::Get) is paid once
+    // per transaction instead of once per aggregate. getinfo used to walk the
+    // whole wallet six times per call.
+    struct Aggregates
+    {
+        int64_t balance;      // == GetBalance()
+        int64_t unconfirmed;  // == GetUnconfirmedBalance()
+        int64_t immature;     // == GetImmatureBalance()
+        int64_t stake;        // == GetStake()
+        int64_t newmint;      // == GetNewMint()
+        Aggregates() : balance(0), unconfirmed(0), immature(0), stake(0), newmint(0) {}
+    };
+    Aggregates GetAggregates() const;
     int64_t GetLockedBalance() const;
     int64_t GetUnlockedBalance() const;
     int64_t GetUnconfirmedBalance() const;

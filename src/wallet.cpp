@@ -1873,6 +1873,73 @@ int64_t CWallet::GetBalance() const
     return nTotal;
 }
 
+// Single-pass replacement for the five aggregate walks above. Predicates are
+// copied verbatim from GetBalance/GetUnconfirmedBalance/GetImmatureBalance/
+// GetStake/GetNewMint so the returned values are identical; the only change is
+// that IsTrusted()/GetDepthInMainChain()/GetBlocksToMaturity() are evaluated
+// ONCE per transaction and shared by every aggregate. That removes five
+// redundant wallet walks -- and with them five redundant rounds of block-index
+// tip lookups (each of which seeks into tip-records.dat / blk*.dat) -- per
+// getinfo call.
+CWallet::Aggregates CWallet::GetAggregates() const
+{
+    Aggregates out;
+    const int64_t kMax = std::numeric_limits<int64_t>::max();
+    bool balanceOverflow = false;
+    {
+        LOCK2(cs_main, cs_wallet);
+        for (map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+        {
+            const CWalletTx* pcoin = &(*it).second;
+
+            const bool fTrusted = pcoin->IsTrusted();
+            const int nDepth = pcoin->GetDepthInMainChain();
+            const int64_t nToMaturity = pcoin->GetBlocksToMaturity();
+
+            // GetBalance()
+            if (fTrusted)
+            {
+                int64_t nCredit = pcoin->GetAvailableCredit();
+                if (nCredit > 0 && out.balance > kMax - nCredit)
+                    balanceOverflow = true;
+                else if (!balanceOverflow)
+                    out.balance += nCredit;
+            }
+            // GetUnconfirmedBalance()
+            if (!pcoin->IsFinal() || (!fTrusted && nDepth == 0))
+            {
+                int64_t nCredit = pcoin->GetAvailableCredit();
+                if (nCredit > 0 && out.unconfirmed > kMax - nCredit)
+                    out.unconfirmed = kMax;
+                else if (out.unconfirmed != kMax)
+                    out.unconfirmed += nCredit;
+            }
+            // GetImmatureBalance()
+            if ((pcoin->IsCoinBase() || pcoin->IsCoinStake()) && nToMaturity > 0 &&
+                pcoin->IsInMainChain())
+            {
+                int64_t nCredit = pcoin->GetImmatureCredit();
+                if (nCredit > 0 && out.immature > kMax - nCredit)
+                    out.immature = kMax;
+                else if (out.immature != kMax)
+                    out.immature += nCredit;
+            }
+            // GetStake()
+            if (pcoin->IsCoinStake() && nToMaturity > 0 && nDepth > 0)
+                out.stake += pcoin->GetCredit(ISMINE_SPENDABLE);
+            // GetNewMint()
+            if (pcoin->IsCoinBase() && nToMaturity > 0 && nDepth > 0)
+                out.newmint += pcoin->GetCredit(ISMINE_SPENDABLE);
+        }
+    }
+    if (balanceOverflow)
+    {
+        printf("ERROR: GetBalance() : balance overflow detected\n");
+        out.balance = kMax;
+    }
+    return out;
+}
+
 
 int64_t CWallet::GetUnlockedBalance() const
 {

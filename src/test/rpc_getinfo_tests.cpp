@@ -3,6 +3,9 @@
 #include <string>
 
 #include "innovarpc.h"
+#include "wallet.h"
+#include "core.h"
+#include "init.h"
 #include "main.h"
 #include "util.h"
 
@@ -213,3 +216,42 @@ BOOST_AUTO_TEST_CASE(contract_holds_in_ibd_state)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// P1 (getinfo I/O amplification): getinfo now derives its five wallet
+// aggregates from ONE pass over mapWallet (CWallet::GetAggregates) instead of
+// five separate walks. This test pins the contract: the RPC fields must still
+// equal the individual getters exactly, and the aggregate struct must agree
+// with them value-by-value.
+BOOST_AUTO_TEST_CASE(getinfo_wallet_aggregates_match_individual_getters)
+{
+    BOOST_REQUIRE(pwalletMain != NULL);
+    const CWallet::Aggregates agg = pwalletMain->GetAggregates();
+    const int64_t nBalance = pwalletMain->GetBalance();
+    const int64_t nUnconfirmed = pwalletMain->GetUnconfirmedBalance();
+    const int64_t nImmature = pwalletMain->GetImmatureBalance();
+    const int64_t nStake = pwalletMain->GetStake();
+    const int64_t nNewMint = pwalletMain->GetNewMint();
+
+    // Aggregates == individual getters (identical predicates, single pass).
+    BOOST_CHECK_EQUAL(agg.balance, nBalance);
+    BOOST_CHECK_EQUAL(agg.unconfirmed, nUnconfirmed);
+    BOOST_CHECK_EQUAL(agg.immature, nImmature);
+    BOOST_CHECK_EQUAL(agg.stake, nStake);
+    BOOST_CHECK_EQUAL(agg.newmint, nNewMint);
+
+    // ... and the RPC response carries exactly those values under the same keys.
+    const json_spirit::Object o = tableRPC.execute("getinfo", json_spirit::Array()).get_obj();
+    struct FieldCheck { const char* key; int64_t value; };
+    const FieldCheck fields[] = {
+        { "balance", nBalance }, { "unconfirmed", nUnconfirmed },
+        { "immature", nImmature }, { "stake", nStake },
+        { "newmint", nNewMint },
+    };
+    for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); ++i)
+    {
+        const json_spirit::Value* v = ObjFind(o, fields[i].key);
+        BOOST_REQUIRE_MESSAGE(v != NULL, "getinfo missing wallet field " << fields[i].key);
+        BOOST_CHECK_MESSAGE(*v == ValueFromAmount(fields[i].value),
+                            "getinfo field " << fields[i].key << " does not match the getter");
+    }
+}

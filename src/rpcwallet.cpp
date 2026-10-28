@@ -606,46 +606,34 @@ Value getinfo(const Array& params, bool fHelp)
     obj.push_back(Pair("protocolversion",(int)PROTOCOL_VERSION));
     obj.push_back(Pair("walletversion", pwalletMain->GetVersion()));
 
+    // P1 (getinfo I/O amplification): ONE wallet walk for all five aggregates.
+    // Previously each aggregate (balance/newmint/stake/unconfirmed/immature)
+    // walked mapWallet separately, so every transaction's IsTrusted ->
+    // GetDepthInMainChain -> block-index LookupByHash chain was repeated six
+    // times per getinfo call (~467 MB of store reads per call measured on
+    // 31.77.247.41). Values are byte-identical: same predicates, single pass.
     nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
-    int64_t nBalance = pwalletMain->GetBalance();
+    const CWallet::Aggregates walletAgg = pwalletMain->GetAggregates();
     nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
     nMeasuredMicros += nSectionMicros;
     if (fRPCPerfTrace)
-        RPCPERF_LOG("RPCPERF rpc=getinfo section=balance duration_us=%lld\n", (long long)nSectionMicros);
+        RPCPERF_LOG("RPCPERF rpc=getinfo section=wallet_aggregates duration_us=%lld\n",
+               (long long)nSectionMicros);
+    const int64_t nBalance = walletAgg.balance;
     obj.push_back(Pair("balance", ValueFromAmount(nBalance)));
 
     obj.push_back(Pair("reserve", ValueFromAmount(nReserveBalance)));
 
-    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
-    int64_t nNewMint = pwalletMain->GetNewMint();
-    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
-    nMeasuredMicros += nSectionMicros;
-    if (fRPCPerfTrace)
-        RPCPERF_LOG("RPCPERF rpc=getinfo section=newmint duration_us=%lld\n", (long long)nSectionMicros);
+    const int64_t nNewMint = walletAgg.newmint;
     obj.push_back(Pair("newmint", ValueFromAmount(nNewMint)));
 
-    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
-    int64_t nStake = pwalletMain->GetStake();
-    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
-    nMeasuredMicros += nSectionMicros;
-    if (fRPCPerfTrace)
-        RPCPERF_LOG("RPCPERF rpc=getinfo section=stake duration_us=%lld\n", (long long)nSectionMicros);
+    const int64_t nStake = walletAgg.stake;
     obj.push_back(Pair("stake", ValueFromAmount(nStake)));
 
-    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
-    int64_t nUnconfirmed = pwalletMain->GetUnconfirmedBalance();
-    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
-    nMeasuredMicros += nSectionMicros;
-    if (fRPCPerfTrace)
-        RPCPERF_LOG("RPCPERF rpc=getinfo section=unconfirmed duration_us=%lld\n", (long long)nSectionMicros);
+    const int64_t nUnconfirmed = walletAgg.unconfirmed;
     obj.push_back(Pair("unconfirmed", ValueFromAmount(nUnconfirmed)));
 
-    nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
-    int64_t nImmature = pwalletMain->GetImmatureBalance();
-    nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
-    nMeasuredMicros += nSectionMicros;
-    if (fRPCPerfTrace)
-        RPCPERF_LOG("RPCPERF rpc=getinfo section=immature duration_us=%lld\n", (long long)nSectionMicros);
+    const int64_t nImmature = walletAgg.immature;
     obj.push_back(Pair("immature", ValueFromAmount(nImmature)));
 
     obj.push_back(Pair("blocks",        (int)nBestHeight));
