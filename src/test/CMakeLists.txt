@@ -26,3 +26,23 @@ foreach(_suite IN LISTS INNOVA_CTEST_SUITES)
            COMMAND test_innova --run_test=${_suite} --log_level=error)
   set_tests_properties(${_suite} PROPERTIES TIMEOUT 900)
 endforeach()
+
+# ---------------------------------------------------------------------------
+# Standalone test modules with their own main() and their own global fixture.
+# They must not be linked into test_innova (duplicate mains and globals).
+# ---------------------------------------------------------------------------
+add_executable(proto_allowlist_tests
+    "${CMAKE_SOURCE_DIR}/src/test/allowlist_guard_fixture.cpp"
+    "${CMAKE_SOURCE_DIR}/src/test/p2p_sync_tests.cpp")
+target_link_libraries(proto_allowlist_tests PRIVATE innova_core Boost::unit_test_framework)
+innova_apply_common_options(proto_allowlist_tests)
+innova_apply_platform_definitions(proto_allowlist_tests)
+
+add_executable(nullblock_guard_tests
+    "${CMAKE_SOURCE_DIR}/src/test/nullblock_guard_fixture.cpp"
+    "${CMAKE_SOURCE_DIR}/src/test/p2p_sync_tests.cpp"
+    "${CMAKE_SOURCE_DIR}/src/test/pow_chainstale_tests.cpp"
+    "${CMAKE_SOURCE_DIR}/src/test/pow_cn_deadlock_tests.cpp")
+target_link_libraries(nullblock_guard_tests PRIVATE innova_core Boost::unit_test_framework)
+innova_apply_common_options(nullblock_guard_tests)
+innova_apply_platform_definitions(nullblock_guard_tests)
