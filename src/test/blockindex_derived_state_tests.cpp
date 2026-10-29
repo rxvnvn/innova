@@ -633,7 +633,7 @@ BOOST_AUTO_TEST_CASE(generation_root_commits_to_content)
                                       recordsB, activeB, hashB, derivedB, genB, root4));
     BOOST_CHECK(memcmp(root1, root4, 32) != 0);
 
-    // Same metadata, different DAG digest -> different root
+    // Same metadata, different generation-input digest -> different root
     recordsB[0] = 0x11; // restore
     genB[0] = 0xFF;
     unsigned char root5[32];

@@ -122,6 +122,19 @@ public:
                                                                  uint64_t generation,
                                                                  std::string* error);
 
+    // One-shot, deterministic re-derivation of a generation's content root. Used
+    // ONLY when the V2 generation-binding domain changed: the root is a pure
+    // function of the persisted components, so it is recomputed from the
+    // generation's own canonical files (which are derived from the validated
+    // chain) and republished into the 32-byte derived-header content binding.
+    // Requires EVERY structural check except the root itself, is idempotent,
+    // never runs implicitly, and finishes by running the full ValidateGeneration
+    // so a generation that still does not validate is refused at startup.
+    static BlockIndexLifecycleStatus RebindGenerationContentBinding(
+        const std::string& root, uint64_t generation,
+        unsigned char oldBinding[32], unsigned char newBinding[32],
+        std::string* error);
+
 private:
     // Structural validation against a concrete generation directory (used for
     // both build-N.tmp and gen-N by the public wrappers).

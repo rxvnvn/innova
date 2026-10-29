@@ -34,7 +34,7 @@
 
 namespace fs = boost::filesystem;
 
-// V2-R1: network flags are process globals; the POEM/DAG boundary test toggles
+// V2-R1: network flags are process globals; the POEM boundary test toggles
 // regtest and restores them.
 extern bool fRegTest;
 extern bool fTestNet;
@@ -341,13 +341,13 @@ BOOST_AUTO_TEST_CASE(g2_catchup_wrong_base_fails_closed)
     printf("G2-F PASS: mismatched/absent base authority fails closed (no partial tip).\n");
 }
 
-// V2-R1 (PM1-P0-08 / section 18): catch-up trust continuity across the POEM/DAG
+// V2-R1 (PM1-P0-08 / section 18): catch-up trust continuity across the POEM
 // boundary. The migration base trust + catch-up tail trust must equal the
 // continuous authoritative derivation (the ONE surviving rule) at every height.
 BOOST_AUTO_TEST_CASE(v2r1_catchup_trust_continuity_poem_boundary)
 {
     bool frSaved = fRegTest, ftSaved = fTestNet;
-    fRegTest = true; fTestNet = false; // POEM=9, DAG=11
+    fRegTest = true; fTestNet = false; // POEM=9
 
     const std::string dir = MakeTempDir();
     const std::string legacyDir = dir + "/legacy";

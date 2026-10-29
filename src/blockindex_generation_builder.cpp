@@ -686,15 +686,15 @@ bool BlockIndexGenerationBuilder::Build(const BlockIndexGenerationSource& source
         unsigned char candidateBinding[32];
         if (!ComputeCandidateLeavesBinding(generationDir, generation, candidateBinding, error))
             return false;
-        unsigned char mixedDagInputDigest[32];
+        unsigned char candidateMixedInputDigest[32];
         if (!MixCandidateLeavesIntoGenerationDigest(generationInputDigest, candidateBinding,
-                                             mixedDagInputDigest))
+                                             candidateMixedInputDigest))
             return SetError(error, "candidate leaves root mix failed");
         // AUTHORITATIVE: use full generation root as content binding
         unsigned char generationRoot[32];
         ComputeGenerationRoot(generation, tipHash, totalRecords,
                               recordsDigest, activeDigest, hashIndexDigest,
-                              derivedEntriesDigest, mixedDagInputDigest, generationRoot);
+                              derivedEntriesDigest, candidateMixedInputDigest, generationRoot);
             derivedStore.SetContentBinding(generationRoot);
         }
         else

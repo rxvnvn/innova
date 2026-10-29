@@ -305,8 +305,8 @@ BOOST_AUTO_TEST_CASE(h4_pos_metadata_derived)
     }
 }
 
-// H5 — DAG-era metadata (pre-DAG h<<FORK; property asserted, not full DAG).
-BOOST_AUTO_TEST_CASE(h5_dag_era_metadata)
+// H5 — historical-era metadata (h << first fork; property asserted, not full history).
+BOOST_AUTO_TEST_CASE(h5_historical_era_metadata)
 {
     SeamFixture fx(3);
     std::string error;
@@ -314,7 +314,7 @@ BOOST_AUTO_TEST_CASE(h5_dag_era_metadata)
         BlockIndexStartupFactory::CreateAuthority(BlockIndexStartupMode::BY_VALUE_SHADOW,
                                                   fx.root.string(), &error);
     BOOST_REQUIRE_MESSAGE(v2 != nullptr, error);
-    // The synthetic fixture is pre-DAG. Assert the tip decodes and that block-size
+    // The synthetic fixture is historical-era. Assert the tip decodes and that block-size
     // derived evidence is present (AUTHORITATIVE manifest) — the era-agnostic
     // property that matters for bounded decode.
     BlockIndexStartupResult r = v2->LookupByHash(BlockIndexLogicalId(fx.tip.hash));
@@ -323,8 +323,8 @@ BOOST_AUTO_TEST_CASE(h5_dag_era_metadata)
     BOOST_CHECK(r.record.derived.blockSize > 0);
 }
 
-// H6 — pre-DAG metadata (legacy regime; exact trust via GetBlockTrust semantics).
-BOOST_AUTO_TEST_CASE(h6_predag_metadata)
+// H6 — pre-fork metadata (legacy regime; exact trust via GetBlockTrust semantics).
+BOOST_AUTO_TEST_CASE(h6_pre_fork_metadata)
 {
     SeamFixture fx(3);
     std::string error;
@@ -334,7 +334,7 @@ BOOST_AUTO_TEST_CASE(h6_predag_metadata)
     BOOST_REQUIRE_MESSAGE(v2 != nullptr, error);
     BlockIndexStartupResult r = v2->LookupByHash(BlockIndexLogicalId(fx.tip.hash));
     BOOST_REQUIRE_MESSAGE(r.HasRecord(), "tip must decode");
-    // Pre-DAG: nChainTrust is cumulative; height is the primary monotonic bound.
+    // Pre-fork: nChainTrust is cumulative; height is the primary monotonic bound.
     BOOST_CHECK_EQUAL(r.record.height, fx.tipHeight);
 }
 

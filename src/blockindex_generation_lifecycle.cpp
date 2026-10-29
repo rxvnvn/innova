@@ -361,15 +361,15 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
     unsigned char candidateBinding[32];
     if (!ComputeCandidateLeavesBinding(dir.string(), generation, candidateBinding, error))
         return false;
-    unsigned char mixedDagInputDigest[32];
+    unsigned char candidateMixedInputDigest[32];
     if (!MixCandidateLeavesIntoGenerationDigest(persistedGenerationInputDigest, candidateBinding,
-                                         mixedDagInputDigest))
+                                         candidateMixedInputDigest))
         return SetError(error, "candidate leaves root binding failed");
 
     // 6. Compute generation root from recomputed digests
     if (!ComputeGenerationRoot(generation, tipHash, recordCount,
                                recordsDigest, activeDigest, hashIndexDigest,
-                               derivedEntriesDigest, mixedDagInputDigest,
+                               derivedEntriesDigest, candidateMixedInputDigest,
                                recomputedRoot))
         return SetError(error, "ComputeGenerationRoot failed during recomputation");
     return true;
@@ -593,6 +593,115 @@ BlockIndexLifecycleStatus BlockIndexGenerationManager::ValidateGenerationStructu
     return ValidateGenerationDir(GenerationPath(root, generation), generation,
                                  /*requireStableName=*/true, generation,
                                  /*fullRootRecompute=*/false, error);
+}
+
+BlockIndexLifecycleStatus BlockIndexGenerationManager::RebindGenerationContentBinding(
+    const std::string& root, uint64_t generation,
+    unsigned char oldBinding[32], unsigned char newBinding[32],
+    std::string* error)
+{
+    if (oldBinding) memset(oldBinding, 0, 32);
+    if (newBinding) memset(newBinding, 0, 32);
+    if (generation == 0)
+    {
+        SetError(error, "rebind: generation 0 is invalid");
+        return BLOCK_INDEX_LIFECYCLE_ERROR;
+    }
+    const std::string genDir = GenerationPath(root, generation);
+
+    // 1. EVERY structural check except the content root itself: directory/naming,
+    //    MANIFEST COMPLETE + generation binding, active.dat binding + committed-tip
+    //    coherence, hashindex binding, derived.dat presence/entry count/non-zero
+    //    binding. The root is excluded because re-deriving it is the point here.
+    BlockIndexLifecycleStatus st = ValidateGenerationDir(
+        genDir, generation, /*requireStableName=*/true, generation,
+        /*fullRootRecompute=*/false, error);
+    if (st != BLOCK_INDEX_LIFECYCLE_OK)
+        return st;
+
+    FixedBlockIndexManifest manifest;
+    {
+        FixedBlockIndexOpenOptions opts;
+        opts.requireCompleteManifest = true;
+        FixedBlockIndexStore store;
+        if (!FixedBlockIndexStore::OpenReadOnly(genDir, opts, &store, error))
+            return BLOCK_INDEX_LIFECYCLE_ERROR;
+        manifest = store.GetManifest();
+    }
+    const bool isFrontierCapable =
+        (manifest.capability == BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE_FRONTIER);
+    if (manifest.capability != BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE &&
+        !isFrontierCapable)
+    {
+        SetError(error, "rebind: generation is not AUTHORITATIVE-capable");
+        return BLOCK_INDEX_LIFECYCLE_ERROR;
+    }
+    {
+        BlockIndexDerivedStateStore derived;
+        if (!BlockIndexDerivedStateStore::OpenReadOnly(genDir, generation, &derived, error))
+            return BLOCK_INDEX_LIFECYCLE_ERROR;
+        if (derived.EntryCount() != manifest.recordCount)
+        {
+            SetError(error, "rebind: derived.dat entry count does not match MANIFEST record count");
+            return BLOCK_INDEX_LIFECYCLE_ERROR;
+        }
+        if (oldBinding)
+            derived.GetContentBinding(oldBinding);
+    }
+
+    // 2. Deterministic re-derivation of the derived metadata from canonical data:
+    //    every component digest is re-computed from the generation's own files
+    //    (records.dat / active.dat / hashindex / derived.dat), which are themselves
+    //    derived from the validated chain, and mixed under the CURRENT V2 domain.
+    unsigned char recomputed[32];
+    if (!RecomputeGenerationRootFromFiles(fs::path(genDir), generation,
+                                          manifest.committedTipHash, manifest.recordCount,
+                                          manifest.generationInputDigest, isFrontierCapable,
+                                          recomputed, error))
+        return BLOCK_INDEX_LIFECYCLE_ERROR;
+
+    // 3. Publish the re-derived binding into the derived header. The content
+    //    binding occupies a fixed offset (header minus the trailing reserved u64
+    //    and the 32-byte binding itself); entries are untouched.
+    const fs::path derivedPath = fs::path(genDir) / BLOCK_INDEX_DERIVED_FILE_NAME;
+    const off_t bindingOffset =
+        (off_t)(BLOCK_INDEX_DERIVED_HEADER_SIZE_V2 - 8 - 32);
+    FILE* bindingFile = fopen(derivedPath.string().c_str(), "r+b");
+    if (!bindingFile)
+    {
+        SetError(error, "rebind: derived.dat open for write failed");
+        return BLOCK_INDEX_LIFECYCLE_ERROR;
+    }
+    bool wrote = (fseeko(bindingFile, bindingOffset, SEEK_SET) == 0) &&
+                 (fwrite(recomputed, 1, 32, bindingFile) == 32);
+    std::string commitErr;
+    if (wrote && !FileCommitChecked(bindingFile, &commitErr))
+    {
+        wrote = false;
+        SetError(error, "rebind: content binding commit failed: " + commitErr);
+    }
+    fclose(bindingFile);
+    if (!wrote)
+    {
+        if (!error || error->empty())
+            SetError(error, "rebind: content binding write failed");
+        return BLOCK_INDEX_LIFECYCLE_ERROR;
+    }
+    std::string dirErr;
+    if (!SyncDirectoryChecked(derivedPath.parent_path(), &dirErr))
+    {
+        SetError(error, "rebind: directory sync failed: " + dirErr);
+        return BLOCK_INDEX_LIFECYCLE_ERROR;
+    }
+
+    // 4. Prove the generation now validates end-to-end (full root recomputation).
+    st = ValidateGeneration(root, generation, error);
+    if (st != BLOCK_INDEX_LIFECYCLE_OK)
+        return st;
+    if (newBinding)
+        memcpy(newBinding, recomputed, 32);
+    ClearError(error);
+    return BLOCK_INDEX_LIFECYCLE_OK;
 }
 
 BlockIndexLifecycleStatus BlockIndexGenerationManager::PublishGeneration(const std::string& root,

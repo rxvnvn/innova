@@ -153,10 +153,6 @@ void Shutdown(void* parg)
             pwalletMain->SaveSPVUtxoCache();
         }
 
-        // The persisted "dagcleanheight" key, if present in an existing
-        // database, has no writer, no startup consumer and no current production
-        // reader; it is inert compatibility data and is not rewritten.
-
         FCloseBlockFile();
         IBDEfficiencyShutdownSummary();
         ibdblocklatency::Dump();
@@ -1563,9 +1559,47 @@ bool AppInit2()
             v2NativeStoreStartup = true; // migration result is a native V2 startup
         }
 
+        // One-shot deterministic re-derivation of the generation content root.
+        // The V2 generation-binding domain belongs to V2; a datadir whose
+        // generation was bound under a different domain fails the full root
+        // check below ("authoritative generation root mismatch"). This explicit
+        // operator action recomputes the root from the generation's own canonical
+        // files and republishes it. It is idempotent, refuses a generation that
+        // fails any structural check, and re-validates end-to-end; the normal
+        // startup validation below still decides whether the node may start.
+        if (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_V2_AUTHORITATIVE &&
+            GetBoolArg("-blockindexrebindbinding", false))
+        {
+            BlockIndexCurrentRecord rebindCur;
+            std::string rebindErr;
+            if (BlockIndexGenerationManager::ReadCurrent(v2Root, &rebindCur, &rebindErr) !=
+                BLOCK_INDEX_LIFECYCLE_OK)
+                return InitError(strprintf("-blockindexrebindbinding: CURRENT unreadable: %s",
+                                           rebindErr.c_str()));
+            unsigned char oldBinding[32];
+            unsigned char newBinding[32];
+            if (BlockIndexGenerationManager::RebindGenerationContentBinding(
+                    v2Root, rebindCur.generation, oldBinding, newBinding, &rebindErr) !=
+                BLOCK_INDEX_LIFECYCLE_OK)
+                return InitError(strprintf(
+                    "-blockindexrebindbinding: generation %llu content-root re-derivation FAILED: %s",
+                    (unsigned long long)rebindCur.generation, rebindErr.c_str()));
+            printf("BLOCK_INDEX_REBIND generation=%llu old_root=%s new_root=%s status=REBOUND\n",
+                   (unsigned long long)rebindCur.generation,
+                   HexStr(oldBinding, oldBinding + 32).c_str(),
+                   HexStr(newBinding, newBinding + 32).c_str());
+        }
+
         std::string authErr;
         if (!InitBlockIndexAuthoritative(v2Root, &authErr))
-            return InitError(strprintf("Block Index V2 authoritative startup failed: %s", authErr.c_str()));
+            return InitError(strprintf(
+                "Block Index V2 authoritative startup failed: %s%s", authErr.c_str(),
+                authErr.find("generation root mismatch") != std::string::npos
+                    ? " (the generation content root does not match the V2 generation-binding "
+                      "domain: run ONCE with -blockindexrebindbinding=1 to deterministically "
+                      "re-derive the derived metadata from the generation's canonical files, "
+                      "then restart without the flag)"
+                    : ""));
         printf(" block index (authoritative) %" PRId64"ms\n", GetTimeMillis() - nStart);
 
         // V2-R2B (FIX A): load the persisted synchronized checkpoint into the
@@ -2087,7 +2121,11 @@ authoritative_startup_ready:
             // chain that lost its tail leaves it AHEAD. Both are reconciled here, deterministically,
             // BEFORE the fail-closed tip comparison below: replay forward (already-validated blocks)
             // or unwind back with the undo log. A run that stopped cleanly does nothing.
-            if (pindexBest->nHeight != stH)
+            // An EMPTY store (stH < 0) has nothing to reconcile: it is the fresh-datadir case
+            // owned by the P2 EMPTY_DATADIR block below, which fails closed unless the loaded
+            // best chain is exactly genesis. Reconciling an empty store instead walks the chain
+            // backwards to a height it does not have ("cannot read block at h=0").
+            if (pindexBest->nHeight != stH && stH >= 0)
             {
                 std::string rerr;
                 printf("S2.1 store reconcile: store h=%d, chain h=%d -- reconciling before startup checks\n",

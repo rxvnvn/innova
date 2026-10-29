@@ -346,7 +346,7 @@ an acknowledged store, closing the LOW finding "non-regular `undo.dat` rejected 
 recorded as a residual LOW in the R1 report.
 
 Deliberately **not** done (unchanged scope): no `UNDOINDEX`, no MANIFEST v2, no generation pinning, no
-checkpoint seeds, no retention pruning, no compaction/GC, no page reclamation, no consensus/DAG change.
+checkpoint seeds, no retention pruning, no compaction/GC, no page reclamation, no consensus change.
 
 ## 12. Stage 3B-F0-R2 — descriptor pinning of the adopted empty residue (TOCTOU closure)
 
@@ -392,7 +392,7 @@ most three extra metadata syscalls per fresh-open store; `O(delta)` commit cost 
 
 Deliberately **not** done (unchanged scope): no on-disk format change, no MANIFEST/ACK protocol change, no
 change to the backup-before-undo ordering, no new storage authority or file type, no retention/compaction/
-GC, no generation pinning, no checkpoint seeds, no consensus/DAG change, no `tree.dat` classification
+GC, no generation pinning, no checkpoint seeds, no consensus change, no `tree.dat` classification
 change (still recorded as a residual LOW), and no identity pin on the established-store (`Any`) path.
 
 ## 13. Stage 3B-F0-R3 — first-publication failure lifecycle (one-shot policy) and the post-`lstat` window

@@ -175,9 +175,6 @@ ActivePathCounters::ActivePathCounters()
       chainstate_commit_us_total(0),
       chainstate_commit_us_max(0),
       chainstate_commit_count(0),
-      dag_epoch_commit_us_total(0),
-      dag_epoch_commit_us_max(0),
-      dag_epoch_commit_count(0),
       wallet_callback_us_total(0),
       wallet_callback_us_max(0),
       wallet_callback_count(0),
@@ -599,7 +596,7 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
            "pass_interval_avg_us=%lld pass_interval_max_us=%lld sleep_us=%lld "
            "dispatch_delay_avg_us=%lld dispatch_delay_max_us=%lld cs_main_wait_avg_us=%lld cs_main_wait_max_us=%lld "
            "processblock_avg_us=%lld acceptblock_avg_us=%lld addtoblockindex_avg_us=%lld setbestchain_avg_us=%lld connectblock_avg_us=%lld "
-           "raw_write_avg_us=%lld filecommit_avg_us=%lld blockindex_commit_avg_us=%lld chainstate_commit_avg_us=%lld dag_commit_avg_us=%lld wallet_cb_avg_us=%lld "
+           "raw_write_avg_us=%lld filecommit_avg_us=%lld blockindex_commit_avg_us=%lld chainstate_commit_avg_us=%lld wallet_cb_avg_us=%lld "
            "peers_inflight_gt0=%lld peers_queued_gt0=%lld inflight_peer_max=%lld queued_peer_max=%lld "
            "dominant_peer_inflight_share_pct=%lld global_free_active_slots=%lld global_free_slots_with_deferred=%lld "
            "global_active_current=%lld global_inflight_current=%lld global_queued_current=%lld global_deferred_current=%lld "
@@ -649,8 +646,6 @@ void EmitIBDActive1s(const std::vector<CNode*>& vNodesCopy)
                           c.blockindex_commit_count.load(std::memory_order_relaxed)),
            (long long)Avg(c.chainstate_commit_us_total.load(std::memory_order_relaxed),
                           c.chainstate_commit_count.load(std::memory_order_relaxed)),
-            (long long)Avg(c.dag_epoch_commit_us_total.load(std::memory_order_relaxed),
-                           c.dag_epoch_commit_count.load(std::memory_order_relaxed)),
             (long long)Avg(c.wallet_callback_us_total.load(std::memory_order_relaxed),
                            c.wallet_callback_count.load(std::memory_order_relaxed)),
             (long long)c.peers_inflight_gt0.load(std::memory_order_relaxed),

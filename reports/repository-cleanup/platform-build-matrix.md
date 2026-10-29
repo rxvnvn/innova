@@ -44,3 +44,28 @@ fixes above are prerequisites for any future `.pro` repair and are kept.
 | `src/makefile.arm` | 23 (42 entries) | 0 | balanced | rc=0 |
 | `src/makefile.bsd` | 23 (21 entries) + 2 orphan `endif` | 0 | balanced | rc=0 |
 | `src/makefile.mingw` | 23 (21 entries) | 0 | balanced | rc=0 |
+
+
+## Update — Qt GUI repaired and built
+
+The Qt project was repaired in this pass (commit `innova-qt.pro`):
+
+- removed 43 entries whose sources/headers no longer exist (9 DAG files, the
+  shielded/lelantus/ringsig/zkproof/idns/ipa/curvetree family, txdb-*);
+- added the two chainstate include roots (`src/chainstate`, `src/chainstate/store3a`)
+  that `makefile.unix` already used;
+- added the 112 Block Index V2 / Store3A / txloc / txlat sources that the daemon
+  links and the GUI needs;
+- removed 90 duplicate entries (per-category) and the duplicated minizip units.
+
+**Real build (shadow build in scratch, `-j4`, `nice 19`, `ionice -c3`):**
+
+```
+qmake6 innova-qt.pro USE_UPNP=1 USE_QRCODE=1 USE_NATIVETOR=-
+make -j4
+rc=0   errors=0   undefined=0   duplicate definitions=0
+-rwxrwxr-x innova-qt  13,253,880 B
+```
+
+Qt GUI status is now **PASS** (real compile + link). `innova-qt` was not launched
+(no display; launching is not needed to verify the build).

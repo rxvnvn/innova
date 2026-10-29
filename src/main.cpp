@@ -10750,7 +10750,7 @@ bool CreateBlockIndexGenesisBlock(CBlock& block)
     }
     else if(fTestNet)
     {
-        const char* pszTimestampTestNet = "Innova Public IDAG Hidden Finality Testnet | May 26 2026 | Epoch-Root FCMP";
+        const char* pszTimestampTestNet = "Innova Public Testnet | Neutral Genesis | V2 Store3A";
         CTransaction txNewTestNet;
 
         txNewTestNet.nTime = 1779753600;
@@ -10765,23 +10765,8 @@ bool CreateBlockIndexGenesisBlock(CBlock& block)
         block.nTime    = 1779753600;
         block.nVersion = 1;
         block.nBits    = bnProofOfWorkLimit.GetCompact();
-        block.nNonce   = 127761;
+        block.nNonce   = 709855;
 
-        if (false && (block.GetHash() != hashGenesisBlockTestNet))
-        {
-        // This will figure out a valid hash and Nonce if you're
-        // creating a different genesis block:
-            uint256 hashTarget = CBigNum().SetCompact(block.nBits).getuint256();
-            while (block.GetHash() > hashTarget)
-            {
-                ++block.nNonce;
-                if (block.nNonce == 0)
-                {
-                    printf("NONCE WRAPPED, incrementing time");
-                    ++block.nTime;
-                }
-            }
-        }
         block.print();
         printf("TestNet blocktest.GetHash() == %s\n", block.GetHash().ToString().c_str());
         printf("TestNet blocktest.hashMerkleRoot == %s\n", block.hashMerkleRoot.ToString().c_str());
@@ -10789,8 +10774,10 @@ bool CreateBlockIndexGenesisBlock(CBlock& block)
         printf("TestNet blocktest.nNonce = %u \n", block.nNonce);
 
 
-        //// debug print
-        if (block.hashMerkleRoot != uint256("0xa18a28c4cde90e5c637c63715018a466511dd22eccd8f371512eec3074b1b19d"))
+        // Genesis identity is FIXED by the merkle root and hash checked below.
+        // (To target a different genesis: set nNonce = 0, temporarily disable both
+        // checks, and let a proof-of-work search pick the nonce; then re-fix them.)
+        if (block.hashMerkleRoot != uint256("0x4f81629a20ba468a5b3ee3dcdd37d7b29373575ce08387c59ec7a649b3d6da3e"))
             return error("TestNetLoadBlockIndex() : invalid testnet genesis merkle root %s", block.hashMerkleRoot.ToString().c_str());
         block.print();
         if (block.GetHash() != hashGenesisBlockTestNet)

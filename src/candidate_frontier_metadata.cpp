@@ -11,9 +11,14 @@
 #include <cstring>
 #include <algorithm>
 
-// On-disk generation-binding compatibility constant. Its VALUE must never change:
-// older generations were bound with it. Only the symbol is neutral.
-static const char kGenerationBindingDomain[] = "INNOVA_GENERATION_DAG_BINDING_V2";
+// V2 generation-binding domain separator. V2 owns its digest format: this is the
+// ONLY domain string mixed into a generation's content root, and it names no
+// retired consensus mechanism. Changing its VALUE changes every generation root,
+// so the change is paired with a deterministic, operator-gated re-derivation of
+// the affected derived metadata (BlockIndexGenerationManager::
+// RebindGenerationContentBinding), whose source of truth is the generation's own
+// canonical component files, themselves derived from the valid chain.
+static const char kGenerationBindingDomain[] = "INNOVA_GENERATION_BINDING_V2";
 // On-disk candidate-leaves binding compatibility constant. Value must never change.
 static const char kCandidateLeavesBindingDomain[] = "INNOVA_CANDIDATE_LEAVES_BINDING_V1";
 

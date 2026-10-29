@@ -750,7 +750,7 @@ BOOST_AUTO_TEST_CASE(d4_meta_dir_sync_failure_after_rename_oracle_B)
     }
 }
 
-// Fixtures for the R3G block (below): mainnet fork-gate inertness (POEM/DAG
+// Fixtures for the R3G block (below): mainnet fork-gate inertness (POEM
 // inert at any usable test height) + block identity derivation.
 static bool& R3G_FRegTest() { return ::fRegTest; }
 static bool& R3G_FTestNet() { return ::fTestNet; }
@@ -785,7 +785,7 @@ struct R3G_GenFixture
     explicit R3G_GenFixture(int t) : tip(t)
     {
         frSaved = R3G_FRegTest(); ftSaved = R3G_FTestNet();
-        R3G_FRegTest() = false; R3G_FTestNet() = false; // mainnet: POEM/DAG inert
+        R3G_FRegTest() = false; R3G_FTestNet() = false; // mainnet: POEM inert
         root = boost::filesystem::temp_directory_path() /
                boost::filesystem::unique_path("r3g-gen-%%%%-%%%%");
         boost::filesystem::create_directories(root / "blocks");

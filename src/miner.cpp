@@ -1201,8 +1201,7 @@ bool CPUMiningWorkIdentityMatches(const CPUMiningWorkIdentity& a,
         return false;
     if (a.hashBestChain != b.hashBestChain ||
         a.hashPrimaryParent != b.hashPrimaryParent ||
-        a.vFrontierTips != b.vFrontierTips ||
-        a.hashDAGSourceState != b.hashDAGSourceState)
+        a.vFrontierTips != b.vFrontierTips)
         return false;
     return !fCheckMempool || a.nTransactionsUpdated == b.nTransactionsUpdated;
 }
