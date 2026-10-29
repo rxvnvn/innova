@@ -87,3 +87,7 @@ innovabootstrap*
 .deps/
 *.Po
 /src/.cache/
+
+# Atlas work reports live outside the repository (~/data/reports/innova)
+/reports/
+/doc/reports/
