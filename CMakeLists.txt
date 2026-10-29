@@ -38,8 +38,7 @@ add_custom_command(
   VERBATIM)
 add_custom_target(build_h DEPENDS "${BUILD_H_DIR}/build.h")
 
-add_subdirectory(src)
-
 enable_testing()
+add_subdirectory(src)
 
 install(TARGETS innovad RUNTIME DESTINATION bin OPTIONAL)
