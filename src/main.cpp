@@ -9548,11 +9548,11 @@ static bool PersistInvalidBlockSet()
         return false;
     const std::set<uint256> current = tip->OperatorInvalidSet();
     std::string err;
-    for (const std::set<uint256>::const_iterator it = setInvalidBlockHash.begin();
+    for (std::set<uint256>::const_iterator it = setInvalidBlockHash.begin();
          it != setInvalidBlockHash.end(); ++it)
         if (!current.count(*it) && tip->SetOperatorInvalid(*it, true, &err) != BLOCK_INDEX_TIP_OK)
             return false;
-    for (const std::set<uint256>::const_iterator it = current.begin(); it != current.end(); ++it)
+    for (std::set<uint256>::const_iterator it = current.begin(); it != current.end(); ++it)
         if (!setInvalidBlockHash.count(*it) && tip->SetOperatorInvalid(*it, false, &err) != BLOCK_INDEX_TIP_OK)
             return false;
     return true;

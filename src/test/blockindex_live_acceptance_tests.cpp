@@ -554,7 +554,7 @@ BOOST_AUTO_TEST_CASE(h6e1_append_same_height_nonchild_rejected)
     bad.record = MakeRecord(repl, h1, baseTip + 2, false);
     bad.derived = MakeDerived(uint256(0x73UL), 73);
     std::string err2;
-    BlockIndexTipStatus st = seam.AcceptActive(bad, baseTip + 2, &err2);
+    BlockIndexTipStatus st = (BlockIndexTipStatus)seam.AcceptActive(bad, baseTip + 2, &err2);
     BOOST_REQUIRE(st != BLOCK_INDEX_TIP_OK);
     BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 2);
     BlockIndexTipRead t = tip.GetTip();

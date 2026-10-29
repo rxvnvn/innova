@@ -1,0 +1,66 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 20, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "linux-release",
+      "displayName": "Linux x86_64 (Release, daemon + CLI)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/cmake-linux-release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "INNOVA_BUILD_DAEMON": "ON",
+        "INNOVA_BUILD_TOOLS": "ON",
+        "INNOVA_BUILD_TESTS": "ON",
+        "INNOVA_BUILD_QT": "OFF"
+      }
+    },
+    {
+      "name": "linux-qt",
+      "displayName": "Linux x86_64 (Release, daemon + CLI + Qt GUI + tests)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/cmake-linux-qt",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "INNOVA_BUILD_DAEMON": "ON",
+        "INNOVA_BUILD_TOOLS": "ON",
+        "INNOVA_BUILD_TESTS": "ON",
+        "INNOVA_BUILD_QT": "ON"
+      }
+    },
+    {
+      "name": "mingw-w64",
+      "displayName": "Windows x86_64 (MinGW-w64 cross)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/cmake-mingw",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/mingw-w64.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "INNOVA_BUILD_QT": "OFF", "INNOVA_BUILD_TESTS": "OFF" }
+    },
+    {
+      "name": "armhf",
+      "displayName": "ARM 32-bit hard-float (cross)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/cmake-armhf",
+      "toolchainFile": "${sourceDir}/cmake/toolchains/armhf.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "INNOVA_BUILD_QT": "OFF", "INNOVA_BUILD_TESTS": "OFF" }
+    },
+    {
+      "name": "bsd",
+      "displayName": "BSD (native build on the BSD host)",
+      "generator": "Unix Makefiles",
+      "binaryDir": "${sourceDir}/build/cmake-bsd",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "INNOVA_BUILD_QT": "OFF", "INNOVA_BUILD_TESTS": "OFF" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "linux-release", "configurePreset": "linux-release", "jobs": 4 },
+    { "name": "linux-qt", "configurePreset": "linux-qt", "jobs": 4 },
+    { "name": "mingw-w64", "configurePreset": "mingw-w64", "jobs": 4 },
+    { "name": "armhf", "configurePreset": "armhf", "jobs": 4 },
+    { "name": "bsd", "configurePreset": "bsd", "jobs": 4 }
+  ],
+  "testPresets": [
+    { "name": "linux-release", "configurePreset": "linux-release", "output": { "outputOnFailure": true } },
+    { "name": "linux-qt", "configurePreset": "linux-qt", "output": { "outputOnFailure": true } }
+  ]
+}
