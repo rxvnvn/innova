@@ -129,9 +129,6 @@ struct ActivePathCounters
     std::atomic<int64_t> chainstate_commit_us_total;
     std::atomic<int64_t> chainstate_commit_us_max;
     std::atomic<int64_t> chainstate_commit_count;
-    std::atomic<int64_t> dag_epoch_commit_us_total;
-    std::atomic<int64_t> dag_epoch_commit_us_max;
-    std::atomic<int64_t> dag_epoch_commit_count;
     std::atomic<int64_t> wallet_callback_us_total;
     std::atomic<int64_t> wallet_callback_us_max;
     std::atomic<int64_t> wallet_callback_count;

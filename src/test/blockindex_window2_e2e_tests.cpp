@@ -61,12 +61,6 @@ namespace fs = boost::filesystem;
 
 extern CWallet* pwalletMain;
 extern bool g_testFailSetBestChainAfterCommit;
-extern int g_testDagPruneDepth;
-extern bool g_testFailDagPruneCommit;
-extern bool CorruptDagTipDeltaSpillForTest(int);
-extern int g_testDagPruneFailStage;
-extern bool g_testFailDagTipDeltaSpillWrite;
-extern bool g_testFailDagTipDeltaSpillClose;
 extern bool g_testS12LifetimeProbe;
 extern int g_testS12LastPostponed;
 extern void* g_testS12SeenTxdbAddr;
@@ -81,11 +75,7 @@ extern void* g_testTxdbLastClosedPtr;
 extern int g_testTxdbOpenCount;
 extern void* g_testTxdbLastOpenedPtr;
 extern void* GetGlobalTxdbPtrForTest();
-extern int g_testDagDeltaDeliveredEvents;
-extern int g_testDagDeltaLastDeliveredKind;
-extern int g_testDagDeltaLastDeliveredOrigin;
 extern uint256 GetBlockEntropy(const uint256& hashValue);
-extern bool g_testFailDAGChildCountRebuild; // S4-F12 child-count untrusted refusal
 
 // Production runtime/consumer, real mutable txleveldb, disposable overlay only.
 // Full scans here are test setup/oracles, NEVER ordinary mutation delivery.
@@ -781,7 +771,7 @@ BOOST_AUTO_TEST_CASE(f2_byvalue_nonresident_side_branch)
             << " expectedSideResidentTrust=" << expectedSide[i].GetHex()
             << " activePeer=" << peerHash[i].GetHex()
             << " activePeerTrust=" << expectedPeer[i].GetHex()
-            << " mapBlockIndexHasSide=0 mapDAGDataHasSide=0");
+            << " mapBlockIndexHasSide=0 mapHistoryDataHasSide=0");
     }
 }
 
@@ -1927,7 +1917,7 @@ namespace {
 
 
 
-BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_dag_custody)
+BOOST_AUTO_TEST_CASE(p1_retirement_authoritative_startup_without_legacy_custody)
 {
     // LEGACY DAG RETIREMENT (Phase 1): in the RETIRED profile the real
     // authoritative startup must still succeed and publish AUTHORITY_READY without

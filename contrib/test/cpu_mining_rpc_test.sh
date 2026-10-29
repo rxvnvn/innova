@@ -722,7 +722,7 @@ test_same_height_tip_replacement() {
     local log_file
     local log_start
 
-    log "Checking same-height competing DAG tip while a worker is active"
+    log "Checking same-height competing tip while a worker is active"
     rpc 1 setgenerate false >/dev/null 2>&1 || true
     rpc 2 setgenerate false >/dev/null 2>&1 || true
 
@@ -776,15 +776,15 @@ test_same_height_tip_replacement() {
         return
     fi
     if wait_for_known_block 1 "$sibling_2" && wait_for_known_block 2 "$sibling_1"; then
-        pass "both nodes accepted the competing same-height DAG sibling"
+        pass "both nodes accepted the competing same-height sibling"
     else
         fail "same-height sibling was not exchanged over P2P"
     fi
 
     if wait_for_worker_identity_tip 1 "$log_start" "$sibling_2" 10; then
-        pass "worker rebuilt work after the competing DAG tip arrived"
+        pass "worker rebuilt work after the competing tip arrived"
     else
-        fail "worker did not log rebuilt work containing the competing DAG tip"
+        fail "worker did not log rebuilt work containing the competing tip"
     fi
 
     stop_and_assert 1 "same-height tip replacement"

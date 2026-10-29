@@ -14,7 +14,7 @@
 // The test suite shares one global TestingSetup (mock BDB, regtest, genesis-only
 // chain when these tests run).  Blocks are mined at the regtest PoW limit
 // ~50% of hashes valid), so a nonce search is trivial.  All mining stays below
-// the regtest DAG (11) fork height.
+// the regtest historical fork height.
 //
 // Side-chain blocks cannot be delivered through ProcessBlock in this client: the
 // sync-checkpoint weak-work gate (main.cpp ProcessBlock) rejects any block whose

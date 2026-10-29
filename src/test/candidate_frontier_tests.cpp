@@ -648,17 +648,17 @@ BOOST_AUTO_TEST_CASE(t9_missing_materialization)
     BOOST_CHECK(s.Lookup(byvalue_hash(2)).chainTrust == uint256(9));
 }
 
-// T10 — DAG canonical-trust candidate: a tip whose supplied trust is the
-// canonical (DAG-reconstructed) value is compared by that exact value.
-BOOST_AUTO_TEST_CASE(t10_dag_canonical_trust)
+// T10 — canonical-trust candidate: a tip whose supplied trust is the
+// canonical (authoritative) value is compared by that exact value.
+BOOST_AUTO_TEST_CASE(t10_canonical_trust)
 {
     SnapshotCandidateFrontierStore s;
-    // best chain linear trust 13; side DAG tip canonical trust 14 > 13.
+    // best chain linear trust 13; side tip canonical trust 14 > 13.
     s.AddBlock(byvalue_hash(0), uint256(0), uint256(2), 0);
     s.AddBlock(byvalue_hash(1), byvalue_hash(0), uint256(4), 1);
     s.AddBlock(byvalue_hash(2), byvalue_hash(1), uint256(6), 2);
     s.AddBlock(byvalue_hash(3), byvalue_hash(2), uint256(13), 3); // best, linear 13
-    s.AddBlock(byvalue_hash(4), byvalue_hash(1), uint256(14), 3); // DAG side, canonical 14
+    s.AddBlock(byvalue_hash(4), byvalue_hash(1), uint256(14), 3); // side tip, canonical 14
     s.SetBest(byvalue_hash(3), uint256(13));
     s.tipHashes.push_back(byvalue_hash(4));
     s.hasData.insert(byvalue_hash(4));

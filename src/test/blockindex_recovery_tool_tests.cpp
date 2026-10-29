@@ -39,7 +39,7 @@
 
 namespace fs = boost::filesystem;
 
-// V2-R1: network flags are process globals; the POEM/DAG boundary test
+// V2-R1: network flags are process globals; the POEM boundary test
 // toggles regtest and restores them.
 extern bool fRegTest;
 extern bool fTestNet;
@@ -168,7 +168,7 @@ BOOST_AUTO_TEST_SUITE(blockindex_recovery_tool_tests)
 BOOST_AUTO_TEST_CASE(recovery_exact_L_and_derived_parity)
 {
     bool frSaved = fRegTest, ftSaved = fTestNet;
-    fRegTest = true; fTestNet = false; // POEM=9, DAG=11 (stable trust rule)
+    fRegTest = true; fTestNet = false; // POEM=9 (stable trust rule)
 
     const std::string dir = MakeTempDir();
     const std::string legacyDir = dir + "/legacy";

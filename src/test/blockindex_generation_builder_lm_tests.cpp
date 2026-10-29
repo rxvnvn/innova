@@ -402,7 +402,7 @@ BOOST_AUTO_TEST_CASE(m7_snapshot_to_live_tip_catchup)
 BOOST_AUTO_TEST_CASE(v2r1_mainnet_pre_poem_trust_parity)
 {
     bool frSaved = fRegTest, ftSaved = fTestNet;
-    fRegTest = false; fTestNet = false; // mainnet: POEM/DAG inert
+    fRegTest = false; fTestNet = false; // mainnet: POEM inert
     const std::string dir = MakeTempDir();
     const std::string snapDir = dir + "/snapshot";
     leveldb::DB* db = OpenSnapshot(snapDir);
@@ -439,7 +439,7 @@ BOOST_AUTO_TEST_CASE(v2r1_mainnet_pre_poem_trust_parity)
 }
 
 // T3-T8: regtest POEM(9) boundary. PoW below POEM; admissible PoS at/after POEM
-// -> entropy(hashProof); post-POEM PoW -> entropy(hash). (No DAG fork height.)
+// -> entropy(hashProof); post-POEM PoW -> entropy(hash). (No historical multi-parent fork height.)
 BOOST_AUTO_TEST_CASE(v2r1_poem_boundary_trust_parity)
 {
     bool frSaved = fRegTest, ftSaved = fTestNet;
@@ -479,7 +479,7 @@ BOOST_AUTO_TEST_CASE(v2r1_poem_boundary_trust_parity)
         BOOST_CHECK_MESSAGE(snap.nChainTrust == ExpectedCumulative(chain, flags, h), "LM chainTrust mismatch at h=" << h);
     }
     // Linear profile: a PoS block at/after POEM is admissible and is never zeroed
-    // by a (removed) DAG-era rule.
+    // by a (removed) historical-era rule.
     BOOST_CHECK(GetAuthoritativeBlockTrustValue(0x1d00ffff, 11, true, uint256(1), uint256(2)) != uint256(0));
     fRegTest = frSaved; fTestNet = ftSaved;
 }
@@ -689,7 +689,7 @@ BOOST_AUTO_TEST_CASE(v2r1_regular_vs_lm_byte_parity)
     }
     // MANIFEST: the OLD_SHADOW generation root/content-binding lives in the first
     // 92 bytes and must be identical. The trailing 32-byte generationInputDigest field is
-    // informational for OLD_SHADOW (the writer persists the passed DAG digest only
+    // informational for OLD_SHADOW (the writer persists the passed generation-input digest only
     // on the AUTHORITATIVE path); the regular builder writes SHA256(empty)
     // unconditionally while the LM OLD_SHADOW manifest keeps zeros. That field is
     // NOT part of the OLD_SHADOW root, so we assert the root region and record the
