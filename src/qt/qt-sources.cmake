@@ -1,5 +1,6 @@
 # Generated from innova-qt.pro (repaired, DAG-free).
 set(INNOVA_QT_SOURCES
+    "${CMAKE_SOURCE_DIR}/src/qt/bitcoin.cpp" "${CMAKE_SOURCE_DIR}/src/qt/bitcoingui.cpp" "${CMAKE_SOURCE_DIR}/src/qt/qrcodedialog.cpp"
     "${CMAKE_SOURCE_DIR}/src/qt/aboutdialog.cpp"
     "${CMAKE_SOURCE_DIR}/src/qt/addeditadrenalinenode.cpp"
     "${CMAKE_SOURCE_DIR}/src/qt/addressbookpage.cpp"
@@ -44,8 +45,6 @@ set(INNOVA_QT_SOURCES
     "${CMAKE_SOURCE_DIR}/src/qt/sendcoinsentry.cpp"
     "${CMAKE_SOURCE_DIR}/src/qt/signverifymessagedialog.cpp"
     "${CMAKE_SOURCE_DIR}/src/qt/stakingpage.cpp"
-    "${CMAKE_SOURCE_DIR}/src/qt/test/transactionrecord_tests.cpp"
-    "${CMAKE_SOURCE_DIR}/src/qt/test/uritests.cpp"
     "${CMAKE_SOURCE_DIR}/src/qt/trafficgraphwidget.cpp"
     "${CMAKE_SOURCE_DIR}/src/qt/transactiondesc.cpp"
     "${CMAKE_SOURCE_DIR}/src/qt/transactiondescdialog.cpp"
@@ -57,6 +56,7 @@ set(INNOVA_QT_SOURCES
     "${CMAKE_SOURCE_DIR}/src/qt/walletworker.cpp"
 )
 set(INNOVA_QT_HEADERS
+    "${CMAKE_SOURCE_DIR}/src/qt/bitcoingui.h" "${CMAKE_SOURCE_DIR}/src/qt/qrcodedialog.h"
     "${CMAKE_SOURCE_DIR}/src/qt/aboutdialog.h"
     "${CMAKE_SOURCE_DIR}/src/qt/addeditadrenalinenode.h"
     "${CMAKE_SOURCE_DIR}/src/qt/addressbookpage.h"
@@ -101,7 +101,6 @@ set(INNOVA_QT_HEADERS
     "${CMAKE_SOURCE_DIR}/src/qt/sendcoinsentry.h"
     "${CMAKE_SOURCE_DIR}/src/qt/signverifymessagedialog.h"
     "${CMAKE_SOURCE_DIR}/src/qt/stakingpage.h"
-    "${CMAKE_SOURCE_DIR}/src/qt/test/uritests.h"
     "${CMAKE_SOURCE_DIR}/src/qt/trafficgraphwidget.h"
     "${CMAKE_SOURCE_DIR}/src/qt/transactiondesc.h"
     "${CMAKE_SOURCE_DIR}/src/qt/transactiondescdialog.h"
@@ -113,6 +112,7 @@ set(INNOVA_QT_HEADERS
     "${CMAKE_SOURCE_DIR}/src/qt/walletworker.h"
 )
 set(INNOVA_QT_FORMS
+    "${CMAKE_SOURCE_DIR}/src/qt/forms/qrcodedialog.ui"
     "${CMAKE_SOURCE_DIR}/src/qt/forms/aboutdialog.ui"
     "${CMAKE_SOURCE_DIR}/src/qt/forms/addeditadrenalinenode.ui"
     "${CMAKE_SOURCE_DIR}/src/qt/forms/addressbookpage.ui"
@@ -149,7 +149,6 @@ set(INNOVA_QT_TRANSLATIONS
     "${CMAKE_SOURCE_DIR}/src/qt/locale/bitcoin_el_GR.ts"
     "${CMAKE_SOURCE_DIR}/src/qt/locale/bitcoin_en.ts"
     "${CMAKE_SOURCE_DIR}/src/qt/locale/bitcoin_eo.ts"
-    "${CMAKE_SOURCE_DIR}/src/qt/locale/bitcoin_es(1).ts"
     "${CMAKE_SOURCE_DIR}/src/qt/locale/bitcoin_es.ts"
     "${CMAKE_SOURCE_DIR}/src/qt/locale/bitcoin_es_CL.ts"
     "${CMAKE_SOURCE_DIR}/src/qt/locale/bitcoin_es_DO.ts"

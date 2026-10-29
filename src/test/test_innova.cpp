@@ -62,17 +62,21 @@ struct TestingSetup {
                 GetArg("-blockindexv2authoritative", ""), GetDataDir().string());
             BlockIndexStartupOwnershipDecision own;
             std::string ownErr;
-            BOOST_REQUIRE_MESSAGE(
-                ClassifyBlockIndexStartupOwnership(v2Root, GetDataDir().string(), &own, &ownErr),
-                "TestingSetup ownership classification failed: " << ownErr);
+            // Boost.Test 1.83: any assertion executed inside a BOOST_GLOBAL_FIXTURE
+            // constructor is recorded by the framework init observer and makes the
+            // whole run end with "Test setup error:" and exit 200 - even when the
+            // assertion passes. Fixture setup therefore uses plain exceptions: a
+            // real failure still aborts the setup (fail-closed), a success is silent.
+            if (!ClassifyBlockIndexStartupOwnership(v2Root, GetDataDir().string(), &own, &ownErr))
+                throw std::runtime_error("TestingSetup ownership classification failed: " + ownErr);
             if (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW)
             {
                 std::string prepErr;
                 const BlockIndexNativePrepareStatus prep =
                     PrepareNativeBlockIndexGeneration(v2Root, GetDataDir().string(), own.state,
                                                       &prepErr, "");
-                BOOST_REQUIRE_MESSAGE(prep == BLOCK_INDEX_NATIVE_PREPARE_OK,
-                                      "TestingSetup native genesis bootstrap failed: " << prepErr);
+                if (prep != BLOCK_INDEX_NATIVE_PREPARE_OK)
+                    throw std::runtime_error("TestingSetup native genesis bootstrap failed: " + prepErr);
             }
         }
         LoadBlockIndex(true);
