@@ -108,7 +108,6 @@ bool fCommandLine = false;
 string strMiscWarning;
 bool fTestNet = false;
 bool fRegTest = false;
-bool fNativeTor = false;
 bool fCNLock = false;
 bool fNoListen = false;
 bool fLogTimestamps = false;

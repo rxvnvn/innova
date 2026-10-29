@@ -78,12 +78,6 @@ ifneq (${USE_UPNP}, -)
  DEFS += -DSTATICLIB -DMINIUPNP_STATICLIB -DUSE_UPNP=$(USE_UPNP)
 endif
 
-ifndef USE_NATIVETOR
-    override USE_NATIVETOR = -
-endif
-ifneq (${USE_NATIVETOR}, -)
-    DEFS += $(addprefix -I,$(CURDIR)/tor) -DUSE_NATIVETOR=$(USE_NATIVETOR)
-endif
 
 
 

@@ -655,18 +655,10 @@ Value getinfo(const Array& params, bool fHelp)
     obj.push_back(Pair("datareceived",  bytesReadable(CNode::GetTotalBytesRecv())));
     obj.push_back(Pair("datasent",      bytesReadable(CNode::GetTotalBytesSent())));
     obj.push_back(Pair("proxy",         (proxy.first.IsValid() ? proxy.first.ToStringIPPort() : string())));
-    if(fNativeTor)
-    {
-        string automatic_onion;
-        fs::path const hostname_path = GetDefaultDataDir() / "onion" / "hostname";
-        if (!fs::exists(hostname_path))
-            printf("No external address found.");
-        ifstream file(hostname_path.string().c_str());
-        file >> automatic_onion;
-        obj.push_back(Pair("ip", automatic_onion));
-    }
-    if(!fNativeTor)
-        obj.push_back(Pair("ip", addrSeenByPeer.ToStringIP()));
+    // No embedded Tor: there is no locally generated onion hostname to report.
+    // A hidden service is configured by the operator and announced with
+    // -externalip, which feeds addrSeenByPeer like any other external address.
+    obj.push_back(Pair("ip", addrSeenByPeer.ToStringIP()));
 
     extern bool ManagerDifficultyPair(double* dPoW, double* dPoS);
     double dPoWsi, dPoSsi;
@@ -699,7 +691,6 @@ Value getinfo(const Array& params, bool fHelp)
     obj.push_back(Pair("testnet",       fTestNet));
     obj.push_back(Pair("collateralnode",  fCollateralNode));
     obj.push_back(Pair("cnlock",        fCNLock));
-    obj.push_back(Pair("nativetor",     fNativeTor));
 
     nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
     int64_t nKeyPoolOldest = pwalletMain->GetOldestKeyPoolTime();

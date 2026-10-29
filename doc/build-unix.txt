@@ -30,8 +30,6 @@ Dependencies
  libcurl      IPFS API Support  C Library
  miniupnpc    UPnP Support      Optional firewall-jumping support
  libqrencode  QRCode generation Optional QRCode generation
- libevent-dev Libevent Support  Optional Libevent Library required for building with USE_NATIVETOR=1
- obfs4proxy   obfs4 Support     Optional pluggable transport proxy for Native Tor
 
 Note that libexecinfo should be installed, if you building under *BSD systems.
 This library provides backtrace facility.
@@ -49,17 +47,18 @@ your package manager. Set USE_QRCODE to control this:
  USE_QRCODE=0   (the default) No QRCode support - libqrcode not required
  USE_QRCODE=1   QRCode support enabled
 
-The included Tor C Library may be used to build with Innova for Native Tor support
-USE_NATIVETOR=- Build with no Native Tor Support
-USE_NATIVETOR=1 Build with Native Tor Support
-(e.g. make "USE_NATIVETOR=-" -f makefile.unix) To build without Tor support
+Innova has no embedded Tor. Route traffic through an external Tor daemon with its
+SOCKS5 port instead:
+ -proxy=127.0.0.1:9050        send IPv4/IPv6 traffic through the SOCKS5 proxy
+ -tor=127.0.0.1:9050          use this SOCKS5 endpoint for .onion peers (defaults
+                              to -proxy when omitted); -notor disables onion use
+.onion names are handed to the proxy verbatim: there is no local DNS lookup for them.
 
 Licenses of statically linked libraries:
  Berkeley DB   New BSD license with additional requirement that linked
                software must be free open source
  Boost         MIT-like license
  miniupnpc     New (3-clause) BSD license
- Tor           MIT License
 
 Versions used in this release:
  GCC           4.9.0
@@ -88,10 +87,6 @@ Libcurl is only required if you are building with IPFS API Support
 sudo apt-get install libcurl4-openssl-dev
 
 
-Libevent-dev and obfs4proxy is only required if you are building with USE_NATIVETOR=1 support
-----------------------------------------------
-sudo apt-get install libevent-dev
-sudo apt-get install obfs4proxy
 
 If using Boost 1.37, append -mt to the boost libraries in the makefile.
 

@@ -51,12 +51,6 @@ using namespace boost;
 
 namespace fs = boost::filesystem;
 
-#ifdef USE_NATIVETOR
-extern "C" {
-    int tor_main(int argc, char *argv[]);
-}
-#endif
-
 // Dump data of peers.dat and banlist.dat every 15 minutes (900s)
 #define DUMP_DATA_INTERVAL 900
 
@@ -8805,10 +8799,14 @@ static const char *strTestNetOnionSeed[][1] = {
     {NULL}
 };
 
-#ifdef USE_NATIVETOR
+// .onion address seeding. Onion peers are reached through the SOCKS5 proxy, so
+// this thread runs whenever an onion proxy is configured (-tor / -proxy) and
+// seeding is enabled. It performs no local DNS resolution: the .onion names are
+// handed to the proxy verbatim.
 void ThreadOnionSeed(void* parg)
 {
-    if(fNativeTor)
+    proxyType onionProxy;
+    if (GetProxy(NET_TOR, onionProxy) && !IsLimited(NET_TOR) && GetBoolArg("-onionseed", true))
     {
         // Make this thread recognisable as the Tor Onion Thread
         RenameThread("toronion");
@@ -8833,11 +8831,7 @@ void ThreadOnionSeed(void* parg)
 
         printf("%d addresses found from .onion seeds\n", found);
     }
-};
-#endif
-
-
-
+}
 
 // DNS seeds
 // Each pair gives a source name and a seed name.
@@ -8860,7 +8854,6 @@ static const char *strDNSSeedTestnet[][2] = {
 
 void ThreadDNSAddressSeed(void* parg)
 {
-    if(!fNativeTor)
     {
         // Make this thread recognisable as the DNS seeding thread
         RenameThread("innova-dnsseed");
@@ -8884,7 +8877,6 @@ void ThreadDNSAddressSeed(void* parg)
 
 void ThreadDNSAddressSeed2(void* parg)
 {
-    if(!fNativeTor)
     {
         printf("ThreadDNSAddressSeed started\n");
         int found = 0;
@@ -9888,7 +9880,7 @@ bool BindListenPort(const CService &addrBind, string& strError, bool fWhiteliste
 
 void static Discover()
 {
-    if (!fDiscover || fNativeTor)
+    if (!fDiscover)
         return;
 
 #ifdef WIN32
@@ -9948,75 +9940,6 @@ static char *convert_str(const std::string &s) {
     return pc;
 }
 
-#ifdef USE_NATIVETOR
-// Start Tor Threads
-static void run_tor() {
-  if(fNativeTor)
-  {
-      printf("Tor Onion Thread Started!\n");
-
-      std::string logDecl = "notice file " + GetDataDir().string() + "/tor/tor.log";
-      char *argvLogDecl = (char*) logDecl.c_str();
-      std::string rc = GetDataDir().string() + "/tor/torrc";
-      char *rc_c = (char*) rc.c_str();
-
-      char * clientTransportPlugin = NULL;
-
-      struct stat sb;
-
-      if ((stat("obfs4proxy", &sb) == 0 && sb.st_mode & S_IXUSR) || !std::system("which obfs4proxy")) {
-          clientTransportPlugin = "obfs4 exec /usr/bin/obfs4proxy";
-      } else if (stat("obfs4proxy.exe", &sb) == 0 && sb.st_mode & S_IXUSR) {
-          clientTransportPlugin = "obfs4 exec obfs4proxy.exe";
-      }
-
-      if (clientTransportPlugin != NULL) {
-          printf("Using OBFS4.\n");
-          char* argv[] = {
-            "tor",
-            "--Log", argvLogDecl,
-            "--SocksPort", "9089",
-            "--ClientTransportPlugin", clientTransportPlugin,
-            "--UseBridges", "1",
-            "--Bridge", "38.229.33.135:443 8CF38F8AC7CA1ACF6051CACE5C84F3E5B3832CD1",
-            "--Bridge", "obfs4 94.242.249.2:44939 E53EEA7DE6E170328F0A2C4338EE4E4DC2398218 cert=VpistQqdnS5zgkARR3he8rt03OrKhk2oobUUhLmFWAWK27pYMvjrBi6zAn1ebIcPH2xbcQ iat-mode=0",
-            "--Bridge", "178.63.238.40:456 8E9B0C1B87837FF6CA730CDFB2A59DAB2D85DF08",
-            "--ignore-missing-torrc",
-            "-f", rc_c,
-          };
-          tor_main(16, argv);
-      }
-      else {
-          printf("No OBFS4 found, not using it.\n");
-          char* argv[] = {
-            "tor",
-            "--Log", argvLogDecl,
-            "--SocksPort", "9089",
-            "--ignore-missing-torrc",
-            "-f", rc_c,
-          };
-          tor_main(6, argv);
-      }
-  }
-}
-
-void StartTor(void* parg)
-{
-  if(fNativeTor)
-  {
-      // Make this thread recognisable as the onion thread
-      RenameThread("onion");
-      try
-      {
-        run_tor();
-      }
-      catch (std::exception& e) {
-        PrintException(&e, "StartTor()");
-      }
-      printf("Onion thread exited.");
-  }
-}
-#endif
 
 void StartNode(void* parg)
 {
@@ -10057,24 +9980,19 @@ void StartNode(void* parg)
     // Start threads
     //
 
-    if(!fNativeTor)
-    {
-        if (!GetBoolArg("-dnsseed", true))
-            printf("DNS seeding disabled\n");
-        else
-            if (!NewThread(ThreadDNSAddressSeed, NULL))
-                printf("Error: NewThread(ThreadDNSAddressSeed) failed\n");
-    } else
-    {
-#ifdef USE_NATIVETOR
-        // start the onion seeder
-        if (!GetBoolArg("-onionseed", true))
-            printf(".onion seeding disabled\n");
-        else
-            if (!NewThread(ThreadOnionSeed, NULL))
-				printf("Error: could not start .onion seeding\n");
-#endif
-    };
+    if (!GetBoolArg("-dnsseed", true))
+        printf("DNS seeding disabled\n");
+    else
+        if (!NewThread(ThreadDNSAddressSeed, NULL))
+            printf("Error: NewThread(ThreadDNSAddressSeed) failed\n");
+
+    // .onion seeding is only meaningful with an onion proxy configured; the
+    // thread itself re-checks the onion proxy and reachability.
+    proxyType onionProxy;
+    if (GetProxy(NET_TOR, onionProxy) && !IsLimited(NET_TOR) && GetBoolArg("-onionseed", true)) {
+        if (!NewThread(ThreadOnionSeed, NULL))
+            printf("Error: could not start .onion seeding\n");
+    }
 
     // Map ports with UPnP
     if (fUseUPnP)

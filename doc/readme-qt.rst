@@ -28,7 +28,6 @@ Optional qmake flags:
 "USE_UPNP=-"
 "USE_QRCODE=-"
 "USE_LEVELDB=-"
-"USE_NATIVETOR=-"
 
 Alternatively, install Qt Creator and open the `innova-qt.pro` file.
 
@@ -72,19 +71,20 @@ Mac OS X
 Build configuration options
 ============================
 
-Build with Native Tor Support in Innova
------------------------
+Tor support
+-----------
 
-libevent-dev and obfs4proxy are required to be installed if you are building with the Native Tor Library
-The native Tor C Library is located in src/tor and is compiled into Innova by default to allow the nativetor=1 flag in your innova.conf
-Use the USE_NATIVETOR=- flag to disable building Innova with the Tor library
+Innova has no embedded Tor runtime. To use Tor, run the Tor daemon separately and
+point Innova at its SOCKS5 port:
 
-+--------------+--------------------------------------------------------------------------+
-| USE_NATIVETOR=- | No Native Tor Support - libevent-dev and obfs4proxy are not required  |
-+--------------+--------------------------------------------------------------------------+
-| USE_NATIVETOR=1 | Native Tor Library enabled to be compiled with Innova (default)     |
-+--------------+--------------------------------------------------------------------------+
++-----------------------------+--------------------------------------------------+
+| ``-proxy=127.0.0.1:9050``   | send IPv4/IPv6 traffic through a SOCKS5 proxy     |
++-----------------------------+--------------------------------------------------+
+| ``-tor=127.0.0.1:9050``     | SOCKS5 endpoint used for .onion peers (falls back |
+|                             | to -proxy when omitted); ``-notor`` disables it   |
++-----------------------------+--------------------------------------------------+
 
+``.onion`` host names are passed to the proxy without any local DNS resolution.
 
 UPNnP port forwarding
 ---------------------

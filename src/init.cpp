@@ -46,9 +46,6 @@
 #include "dandelion.h"
 #include "candidate_frontier.h"
 
-#ifdef USE_NATIVETOR
-#include "tor/anonymize.h" //Tor native optional integration (Flag -nativetor=1)
-#endif
 
 #include <boost/filesystem.hpp>
 #include <boost/filesystem/fstream.hpp>
@@ -812,7 +809,6 @@ bool AppInit2()
     }
 
     fCNLock = GetBoolArg("-cnconflock");
-    fNativeTor = GetBoolArg("-nativetor");
 
 
 
@@ -1142,22 +1138,6 @@ bool AppInit2()
     if (nSocksVersion != 4 && nSocksVersion != 5)
         return InitError(strprintf(_("Unknown -socks proxy version requested: %i"), nSocksVersion));
 
-    // Native Tor Onion Relay Integration
-    if(fNativeTor)
-    {
-        do {
-            std::set<enum Network> nets;
-            nets.insert(NET_TOR);
-
-            for (int n = 0; n < NET_MAX; n++) {
-                enum Network net = (enum Network)n;
-                if (!nets.count(net))
-                    SetLimited(net);
-            }
-        } while (false);
-    };
-
-    if(!fNativeTor)
     {
         if (mapArgs.count("-onlynet"))
         {
@@ -1213,26 +1193,7 @@ bool AppInit2()
 
     };
 
-    // Native Tor Onion and -tor flag integration
-    if(fNativeTor)
-    {
-        if (mapArgs.count("-tor") && mapArgs["-tor"] != "0")
-        {
-            CService addrOnion;
-            if (mapArgs.count("-tor"))
-                addrOnion = CService(mapArgs["-tor"], onion_port);
-            else
-                addrOnion = CService("127.0.0.1", onion_port);
-
-            if (!addrOnion.IsValid())
-                return InitError(strprintf(_("Invalid -tor address: '%s'"), mapArgs["-tor"].c_str()));
-            SetProxy(NET_TOR, addrOnion);
-            SetReachable(NET_TOR);
-        };
-    };
-
     // see Step 2: parameter interactions for more information about these
-    if(!fNativeTor) // Available if nativetor is disabled
     {
         fNoListen = !GetBoolArg("-listen", true);
         fDiscover = GetBoolArg("-discover", true);
@@ -1244,7 +1205,6 @@ bool AppInit2()
 #endif
 
     bool fBound = false;
-    if(!fNativeTor)
     {
         if (!fNoListen)
         {
@@ -1271,37 +1231,6 @@ bool AppInit2()
         };
     };
 
-#ifdef USE_NATIVETOR
-    // Native Tor Integration Continued - I n n o v a v3
-    if(fNativeTor)
-    {
-        CService addrBind;
-        if (!Lookup("127.0.0.1", addrBind, GetListenPort(), false))
-            return InitError(strprintf(_("Cannot resolve binding address: '%s'"), "127.0.0.1"));
-
-        fBound |= Bind(addrBind);
-
-        if (!fBound)
-            return InitError(_("Failed to listen on any port."));
-
-        if (!(mapArgs.count("-tor") && mapArgs["-tor"] != "0")) {
-              if (!NewThread(StartTor, NULL))
-                      return InitError(_("Error: Could Not Start Tor Onion Node"));
-        }
-        wait_initialized();
-
-        string automatic_onion;
-        fs::path const hostname_path = GetDefaultDataDir() / "onion" / "hostname";
-
-        if (!fs::exists(hostname_path)) {
-            return InitError(_("No external address found."));
-        }
-
-        ifstream file(hostname_path.string().c_str());
-        file >> automatic_onion;
-        AddLocal(CService(automatic_onion, GetListenPort(), fNameLookup), LOCAL_MANUAL);
-    };
-#endif
 
     if (mapArgs.count("-externalip"))
     {
@@ -2431,11 +2360,6 @@ authoritative_startup_ready:
     printf("setKeyPool.size() = %" PRIszu"\n",      pwalletMain->setKeyPool.size());
     printf("mapWallet.size() = %" PRIszu"\n",       pwalletMain->mapWallet.size());
     printf("mapAddressBook.size() = %" PRIszu"\n",  pwalletMain->mapAddressBook.size());
-
-    if(fNativeTor)
-        printf("Native Tor Onion Relay Node Enabled\n");
-    else
-        printf("Native Tor Onion Relay Disabled, Using Regular Peers...\n");
 
     if (fDebug)
         printf("Debugging is Enabled.\n");

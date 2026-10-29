@@ -4,7 +4,6 @@
 
 USE_LEVELDB:=1
 USE_UPNP:=0
-USE_NATIVETOR:=-
 
 LINK:=$(CXX)
 
@@ -45,12 +44,6 @@ ifneq (${USE_UPNP}, -)
 	DEFS += -DUSE_UPNP=$(USE_UPNP)
 endif
 
-ifndef USE_NATIVETOR
-    override USE_NATIVETOR = -
-endif
-ifneq (${USE_NATIVETOR}, -)
-    DEFS += $(addprefix -I,$(CURDIR)/tor) -DUSE_NATIVETOR=$(USE_NATIVETOR)
-endif
 
 
 
@@ -261,21 +254,6 @@ obj/minizip/%.o: minizip/%.c
 	-e '/^$$/ d' -e 's/$$/ :/' < $(@:%.o=%.d) >> $(@:%.o=%.P); \
 	rm -f $(@:%.o=%.d)
 
-ifeq (${USE_NATIVETOR}, 1)
-obj/%.o: tor/%.c
-	$(CC) -c $(xCFLAGS) -MMD -MF $(@:%.o=%.d) -o $@ $<
-	@cp $(@:%.o=%.d) $(@:%.o=%.P); \
-	sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
-	-e '/^$$/ d' -e 's/$$/ :/' < $(@:%.o=%.d) >> $(@:%.o=%.P); \
-	rm -f $(@:%.o=%.d)
-
-obj/anonymize.o: tor/anonymize.cpp
-	$(CXX) -c $(xCXXFLAGS) -MMD -MF $(@:%.o=%.d) -o $@ $<
-	@cp $(@:%.o=%.d) $(@:%.o=%.P); \
-	sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
-	-e '/^$$/ d' -e 's/$$/ :/' < $(@:%.o=%.d) >> $(@:%.o=%.P); \
-	rm -f $(@:%.o=%.d)
-endif
 
 obj/%.o: %.cc
 	$(CXX) -c $(xCXXFLAGS) -MMD -MF $(@:%.o=%.d) -o $@ $<

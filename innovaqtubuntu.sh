@@ -144,7 +144,7 @@ echo "Fix Qt in Ubuntu 20.04 WSLv1"
 sudo strip --remove-section=.note.ABI-tag /usr/lib/x86_64-linux-gnu/libQt5Core.so.5
 
 echo "Building Qt Wallet"
-qmake "USE_UPNP=1" "USE_QRCODE=1" "USE_NATIVETOR=-" innova-qt.pro
+qmake "USE_UPNP=1" "USE_QRCODE=1" innova-qt.pro
 make
 
 echo "Get Chaindata"
@@ -171,7 +171,7 @@ echo "Fix Qt in Ubuntu 20.04 WSLv1"
 sudo strip --remove-section=.note.ABI-tag /usr/lib/x86_64-linux-gnu/libQt5Core.so.5
 
 echo "Building Qt Wallet"
-qmake "USE_UPNP=1" "USE_QRCODE=1" "USE_NATIVETOR=-" innova-qt.pro
+qmake "USE_UPNP=1" "USE_QRCODE=1" innova-qt.pro
 make
 
 echo "Back to Compiled QT Binary Folder"

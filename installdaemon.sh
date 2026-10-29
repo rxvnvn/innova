@@ -168,7 +168,7 @@ cd innova
 git checkout secp256k1
 git pull
 cd src
-make "USE_NATIVETOR=-" -f makefile.unix
+make -f makefile.unix
 
 sudo cp -f innovad /usr/bin/
 
@@ -188,7 +188,7 @@ cd ~/innova || exit
 git checkout secp256k1
 git pull
 cd src
-make "USE_NATIVETOR=-" -f makefile.unix
+make -f makefile.unix
 
 sudo cp -f innovad /usr/bin/
 

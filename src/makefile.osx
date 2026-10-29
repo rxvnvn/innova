@@ -22,7 +22,6 @@ DEPSDIR=$(HOMEBREW_PREFIX)
 # Feature flags - disable Native Tor by default for OpenSSL 3 compatibility
 USE_LEVELDB:=1
 USE_UPNP:=1
-USE_NATIVETOR:=-
 
 INCLUDEPATHS= \
  -I"$(CURDIR)" \
@@ -93,12 +92,6 @@ CXXFLAGS = $(OPT_FLAGS) -std=c++11 -stdlib=libc++ $(WARN_FLAGS) $(HARDENING_FLAG
 LDFLAGS = -stdlib=libc++ -pie $(LIBPATHS)
 
 # Native Tor support (disabled by default for OpenSSL 3)
-ifndef USE_NATIVETOR
-  override USE_NATIVETOR = -
-endif
-ifneq (${USE_NATIVETOR}, -)
-  DEFS += $(addprefix -I,$(CURDIR)/tor) -DUSE_NATIVETOR=$(USE_NATIVETOR)
-endif
 
 
 

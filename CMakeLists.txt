@@ -21,7 +21,6 @@ option(INNOVA_BUILD_QT     "Build the Qt GUI (requires Qt6 Widgets)" OFF)
 option(INNOVA_BUILD_TESTS  "Build test_innova and register CTest suites" ON)
 option(INNOVA_BUILD_TOOLS  "Build the supported CLI tools" ON)
 option(INNOVA_USE_UPNP     "Enable UPnP support" ON)
-option(INNOVA_USE_NATIVETOR "Enable the bundled NativeTor integration" OFF)
 
 include(CompilerOptions)
 include(PlatformOptions)

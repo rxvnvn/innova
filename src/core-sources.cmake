@@ -1,5 +1,5 @@
 # Generated from the authoritative innovad link line (src/makefile.unix -n).
-# NativeTor (src/tor, src/ed25519) is gated behind INNOVA_USE_NATIVETOR.
+# Embedded Tor was removed; external Tor is reached through the SOCKS5 proxy.
 # Sources: 114 (explicit list, no GLOB).
 set(INNOVA_CORE_SOURCES
     "${CMAKE_SOURCE_DIR}/src/activecollateralnode.cpp"

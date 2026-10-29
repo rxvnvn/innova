@@ -31,7 +31,10 @@ BOOST_AUTO_TEST_CASE(fixture_asserts_authoritative_regtest_baseline)
     // 2. The tip chain IS the regtest genesis chain (byte-identical genesis:
     //    produced through the shared genesis primitive, not hand-rolled).
     BOOST_REQUIRE_MESSAGE(pindexBest->GetBlockHash() == GetGenesisBlockHash(),
-                          "regtest tip must be the canonical regtest genesis block");
+                          "regtest tip must be the canonical regtest genesis block: tip="
+                          << pindexBest->GetBlockHash().ToString()
+                          << " expected=" << GetGenesisBlockHash().ToString()
+                          << " height=" << pindexBest->nHeight);
     BOOST_REQUIRE_MESSAGE(pindexGenesisBlock->GetBlockHash() == GetGenesisBlockHash(),
                           "regtest genesis pointer must carry the canonical regtest genesis hash");
     BOOST_REQUIRE_EQUAL(pindexBest->nHeight, 0);

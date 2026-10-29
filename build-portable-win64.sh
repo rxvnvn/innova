@@ -115,8 +115,7 @@ if [[ $BUILD_DAEMON -eq 1 ]]; then
         BDB_LIB_SUFFIX="-6.0" \
         STATIC=1 \
         LDFLAGS="-static -Wl,--dynamicbase -Wl,--nxcompat -Wl,--high-entropy-va" \
-        USE_NATIVETOR=- \
-        INNOVA_SPINNER=0 \
+                INNOVA_SPINNER=0 \
         -j"$JOBS"
 
     echo "   innovad.exe built."
@@ -145,8 +144,7 @@ if [[ $BUILD_WALLET -eq 1 ]]; then
         "BDB_LIB_SUFFIX=-6.0" \
         "STATIC_LINK=1" \
         "USE_UPNP=1" \
-        "USE_NATIVETOR=-" \
-        innova-qt.pro
+                innova-qt.pro
 
     make -j"$JOBS"
 

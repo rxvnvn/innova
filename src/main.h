@@ -153,7 +153,15 @@ static const unsigned int MAX_P2SH_SIGOPS = 15;
 
 static const uint256 hashGenesisBlock("0x000009bd42d259eb7031ae4f634aede1a690da795e5529786a72c3cd6d989995");
 static const uint256 hashGenesisBlockTestNet("0x0000080f968fca05dbcc5105271122949b6ca32da02b50850bac203f4094e26b");
-static const uint256 hashGenesisBlockRegTest("0x7d9f2da2e66d3ee806dce8231f5854a526a32db9c8b509410f652a101089c7d5");
+// Regtest genesis hash MUST equal the block produced by the single shared
+// primitive CreateBlockIndexGenesisBlock() (main.cpp:10725): version 1,
+// nTime 1296688602, nonce 2, nBits = powLimit, timestamp "Innova RegTest Mode".
+// The previous value (7d9f2da2...) did not match the block the node actually
+// writes, so GetGenesisBlockHash() disagreed with the chain on regtest: the
+// genesis locator entry (main.h:1908/1927) and the genesis detection in
+// SetBestChain (main.cpp:7975) could never match. Mainnet ("0x000009bd42...")
+// and testnet genesis are untouched.
+static const uint256 hashGenesisBlockRegTest("0x151e40200e0c48b0bfa01cd4c7adaef53f29f19c40e369a8eac6860091bc85bb");
 
 inline const uint256& GetGenesisBlockHash()
 {

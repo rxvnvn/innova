@@ -159,7 +159,10 @@ bool ClientModel::isTestNet() const
 
 bool ClientModel::isNativeTor() const
 {
-    return fNativeTor;
+    // No embedded Tor any more; report whether traffic is routed through an
+    // external Tor SOCKS5 proxy instead.
+    proxyType torProxy;
+    return GetProxy(NET_TOR, torProxy);
 }
 
 bool ClientModel::isCNLock() const

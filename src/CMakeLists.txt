@@ -41,14 +41,6 @@ if(INNOVA_USE_UPNP)
   target_link_libraries(innova_core PUBLIC innova::miniupnpc)
 endif()
 
-if(INNOVA_USE_NATIVETOR)
-  target_sources(innova_core PRIVATE
-      "${CMAKE_SOURCE_DIR}/src/tor/tor_main.c"
-      "${CMAKE_SOURCE_DIR}/src/ed25519/donna/ed25519_tor.c")
-  target_compile_definitions(innova_core PUBLIC USE_NATIVETOR=1)
-  target_include_directories(innova_core PUBLIC "${CMAKE_SOURCE_DIR}/src/tor")
-endif()
-
 innova_apply_common_options(innova_core)
 innova_apply_platform_definitions(innova_core)
 add_dependencies(innova_core build_h)

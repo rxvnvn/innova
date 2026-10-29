@@ -275,7 +275,6 @@ BitcoinGUI::BitcoinGUI(QWidget *parent):
     createTrayIcon();
 
     fCNLock = GetBoolArg("-cnconflock");
-    fNativeTor = GetBoolArg("-nativetor");
     // Create tabs
     overviewPage = new OverviewPage();
 	multisigPage = new MultisigDialog(this);
@@ -797,24 +796,17 @@ void BitcoinGUI::setNumConnections(int count)
     labelConnectionsIcon->setPixmap(MakeStatusIcon(icon, statusBar()->palette().color(QPalette::WindowText)));
     labelConnectionsIcon->setToolTip(tr("%n active connection(s) to Innova network", "", count));
 
-    if(fNativeTor)
+    // Innova has no embedded Tor. The indicator reflects whether traffic is
+    // routed through an external Tor daemon's SOCKS5 port (-proxy / -tor).
+    proxyType torProxy;
+    if (GetProxy(NET_TOR, torProxy))
     {
         labelConnectTypeIcon->setPixmap(MakeStatusIcon(":/icons/tor", statusBar()->palette().color(QPalette::Highlight)));
-
-        string automatic_onion;
-        fs::path const hostname_path = GetDefaultDataDir() / "onion" / "hostname";
-        if (!fs::exists(hostname_path)) {
-            printf("No external address found.");
-        }
-        ifstream file(hostname_path.string().c_str());
-        file >> automatic_onion;
-
-        QString onionauto;
-        onionauto = tr("Connected via the Tor Network - ") + QString::fromStdString(automatic_onion);
-        labelConnectTypeIcon->setToolTip(onionauto);
+        labelConnectTypeIcon->setToolTip(tr("Connected through an external Tor SOCKS5 proxy (%1)")
+                                         .arg(QString::fromStdString(torProxy.first.ToStringIPPort())));
     } else {
         labelConnectTypeIcon->setPixmap(MakeStatusIcon(":/icons/toroff", statusBar()->palette().color(QPalette::WindowText)));
-        labelConnectTypeIcon->setToolTip(tr("Not Connected via the Tor Network, Start Innova with the flag nativetor=1"));
+        labelConnectTypeIcon->setToolTip(tr("Not using Tor. Start Innova with -proxy=127.0.0.1:9050 (-tor=...) to route through Tor"));
     }
     if (fCNLock == true) {
         labelCNLockIcon->setPixmap(MakeStatusIcon(":/icons/cn", statusBar()->palette().color(QPalette::Highlight)));
