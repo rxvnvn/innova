@@ -424,25 +424,18 @@ void MultisigDialog::on_signTransactionButton_clicked()
     }
     CTransaction mergedTx(tx);
 
-    // Fetch previous transactions (inputs)
+    // Fetch previous transactions (inputs) through the current chain accessor.
+    // The legacy CTxDB index is gone from this tree; GetTransaction() reads the
+    // same information from the authoritative stores.
     std::map<COutPoint, CScript> mapPrevOut;
-    for(int i = 0; i < mergedTx.vin.size(); i++)
+    for(size_t i = 0; i < mergedTx.vin.size(); i++)
     {
-        CTransaction tempTx;
-        MapPrevTx mapPrevTx;
-        CTxDB txdb("r");
-        std::map<uint256, CTxIndex> unused;
-        bool fInvalid;
-
-        tempTx.vin.push_back(mergedTx.vin[i]);
-        tempTx.FetchInputs(txdb, unused, false, false, mapPrevTx, fInvalid);
-
-        BOOST_FOREACH(const CTxIn& txin, tempTx.vin)
-        {
-            const uint256& prevHash = txin.prevout.hash;
-            if(mapPrevTx.count(prevHash) && mapPrevTx[prevHash].second.vout.size() > txin.prevout.n)
-                mapPrevOut[txin.prevout] = mapPrevTx[prevHash].second.vout[txin.prevout.n].scriptPubKey;
-        }
+        const COutPoint& prevout = mergedTx.vin[i].prevout;
+        CTransaction prevTx;
+        uint256 hashBlock;
+        if(GetTransaction(prevout.hash, prevTx, hashBlock) &&
+           prevTx.vout.size() > prevout.n)
+            mapPrevOut[prevout] = prevTx.vout[prevout.n].scriptPubKey;
     }
 
     // Add the redeem scripts to the wallet keystore
@@ -554,10 +547,8 @@ void MultisigDialog::on_sendTransactionButton_clicked()
     }
 
     // Send the transaction to the local node
-  CTxDB txdb("r");
-  if(!tx.AcceptToMemoryPool(txdb))
-	//if (!AcceptToMemoryPool(mempool, tx, true, NULL))
-    return;
+    if(!tx.AcceptToMemoryPool())
+        return;
     SyncWithWallets(tx, NULL, true);
     //(CInv(MSG_TX, txHash), tx);
     RelayTransaction(tx, txHash);

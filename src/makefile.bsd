@@ -140,7 +140,6 @@ OBJS= \
     obj/main.o \
     obj/net.o \
     obj/ibdefficiency.o \
-	obj/core.o \
     obj/protocol.o \
     obj/innovarpc.o \
     obj/rpcdump.o \
@@ -149,24 +148,9 @@ OBJS= \
     obj/rpcwallet.o \
     obj/rpcblockchain.o \
     obj/rpcrawtransaction.o \
-    obj/rpcsmessage.o \
-    obj/rpcnyx.o \
-    obj/rpcshielded.o \
-    obj/nullsend.o \
-    obj/shieldedcoinjoin.o \
-    obj/shielded.o \
-    obj/zkproof.o \
-    obj/lelantus.o \
-    obj/curvetree.o \
-    obj/ipa.o \
-    obj/ed25519_zk.o \
-    obj/nullstake.o \
     obj/poseidon2.o \
-    obj/bulletproof_ac.o \
     obj/silentpayments.o \
     obj/dandelion.o \
-    obj/finality.o \
-    obj/dag.o \
     obj/script.o \
     obj/sync.o \
     obj/util.o \
@@ -176,27 +160,21 @@ OBJS= \
     obj/kernel.o \
     obj/pbkdf2.o \
     obj/scrypt.o \
-    obj/smessage.o \
     obj/stealth.o \
     obj/activecollateralnode.o \
     obj/collateralnodeconfig.o \
     obj/collateralnode.o \
     obj/rpccollateral.o \
-    obj/spork.o \
     obj/collateral.o \
     obj/eccryptoverify.o \
-    obj/ringsig.o \
     obj/bloom.o \
     obj/state.o \
-    obj/idns.o \
-    obj/namecoin.o \
     obj/utiltime.o \
     obj/stun.o \
     obj/bootstrap.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
 
-endif
 
 # Scrypt assembly - architecture-conditional (FreeBSD uses amd64 not x86_64)
 ifeq ($(UNAME_M),amd64)
@@ -232,13 +210,8 @@ ifeq (${USE_LEVELDB}, 1)
 LIBS += $(CURDIR)/leveldb/libleveldb.a $(CURDIR)/leveldb/libmemenv.a
 DEFS += $(addprefix -I,$(CURDIR)/leveldb/include) -DUSE_LEVELDB
 DEFS += $(addprefix -I,$(CURDIR)/leveldb/helpers)
-OBJS += obj/txdb-leveldb.o
 leveldb/libleveldb.a:
 	@echo "Building LevelDB ..."; cd leveldb; CC=$(CC) CXX=$(CXX) make libleveldb.a libmemenv.a; cd ..;
-obj/txdb-leveldb.o: leveldb/libleveldb.a
-endif
-ifneq (${USE_LEVELDB}, 1)
-OBJS += obj/txdb-bdb.o
 endif
 
 # auto-generated dependencies:
@@ -310,7 +283,6 @@ obj/%.o: %.cc
 	sed -e 's/#.*//' -e 's/^[^:]*: *//' -e 's/ *\\$$//' \
 	-e '/^$$/ d' -e 's/$$/ :/' < $(@:%.o=%.d) >> $(@:%.o=%.P); \
 	rm -f $(@:%.o=%.d)
-endif
 
 innovad: $(OBJS:obj/%=obj/%)
 	$(LINK) $(xCXXFLAGS) -o $@ $^ $(xLDFLAGS) $(LIBS)

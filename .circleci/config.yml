@@ -11,18 +11,11 @@ jobs:
     resource_class: large
     steps:
       - run:
-          name: 'Checkout via HTTPS'
-          command: |
-            git clone --filter=blob:none https://github.com/innova-foundation/innova.git .
-            if [ -n "$CIRCLE_BRANCH" ]; then
-              git checkout "$CIRCLE_BRANCH"
-            fi
-      - run:
           name: 'Install Dependencies'
           command: |
             sudo apt-get update -y
             sudo apt-get install -y git unzip build-essential libdb++-dev libboost-all-dev \
-              libqrencode-dev libminiupnpc-dev libevent-dev autogen automake libtool \
+              libqrencode-dev libminiupnpc-dev libevent-dev \
               libqt5gui5 libqt5core5a libqt5dbus5 qttools5-dev qttools5-dev-tools \
               qtbase5-dev qtbase5-dev-tools libcurl4-openssl-dev libssl-dev \
               ufw make libminizip-dev
