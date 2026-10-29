@@ -75,3 +75,42 @@ exits; no exception escapes the fixture constructor or destructor (both are wrap
 and print nothing). Deleting the temp datadir was disabled and did not change it.
 
 Therefore: **cases PASS / harness exit 200 — reported as UNRESOLVED, not as PASS.**
+
+
+## Update — Boost exit 200: exact localization
+
+Lifecycle instrumentation (markers printed by the fixture itself, then removed):
+
+```
+FIXA ctor-in
+FIXA ctor-out
+FIXA dtor-in
+FIXA dtor-out
+Test setup error:
+rc=200
+```
+
+Both the constructor and the destructor run to completion and no exception escapes
+either (both bodies are wrapped in try/catch that would print the message).
+`gdb -ex 'catch throw'` shows the only throw inside
+`libboost_unit_test_framework.so` (`unit_test_main` → framework internals), raised
+**after** every case has run and after a production worker thread exits.
+
+Conclusion: the nonzero exit is a Boost.Test 1.83 global-fixture lifecycle
+interaction with threads started by the V2 bootstrap, **not** an assertion
+failure and **not** our fixture throwing. All cases pass in every suite.
+It is reported as an OPEN harness defect, not as PASS, and the exit code is not
+suppressed.
+
+## New regression suite: `qt_tx_semantics_tests`
+
+`src/test/qt_tx_semantics_tests.cpp` (added to `TEST_OBJS`) pins the API contract
+the Qt GUI now depends on:
+
+| case | property |
+|---|---|
+| `gettransaction_unknown_hash_is_read_only` | unknown txid → `false`; mempool size and best height unchanged; no containing block reported |
+| `check_only_accept_does_not_add_to_mempool` | `AcceptToMemoryPool(..., fOnlyCheckWithoutAdding=true)` never inserts; `mempool.exists()` false |
+
+Result: built into `test_innova` (build rc=0); the suite executes with no case
+failures; the process exit remains 200 for the reason above.

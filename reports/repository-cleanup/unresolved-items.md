@@ -106,3 +106,37 @@ sequence). All previously failing suites execute their cases successfully.
 **Open:** Boost returns exit code 200 on teardown with an empty setup error, so the
 suites are reported as "cases PASS / harness exit 200" rather than PASS. The throw
 is inside `libboost_unit_test_framework` after the case list completes.
+
+
+## Update — Boost harness for the V2 fixture
+
+Localized, still OPEN: constructor and destructor both complete (instrumented),
+no exception leaves the fixture, all cases pass, yet Boost raises inside its own
+framework after a worker thread exits and returns 200. Next step for whoever picks
+this up: run `test_innova` under `gdb` with a breakpoint on
+`boost::unit_test::framework::shutdown` and on `std::terminate`, and compare the
+thread set at teardown with a run at base commit `014eb2e2` (which exits 0).
+
+## Update — 24 auxiliary .cpp
+
+Classification stands (repro / fixture / fuzz / selftest, none part of the daemon).
+A `standalone-tools` make target group was drafted and **withdrawn**: the graph
+resolved (`make -n` rc=0) but `p2pprop-selftest` failed to link (102 errors), so
+shipping the target would have added a broken build. Recipes per file remain in
+§1; integration is OPEN.
+
+## Update — NativeTor / OpenSSL 3
+
+Precise incompatibilities (not fixed):
+- `src/tor/tortls.h:140` redeclares `SSL_SESSION_get_master_key` with a
+  non-const `SSL_SESSION*`, conflicting with OpenSSL 3's declaration;
+- `src/tor/tortls.c:1516` reads `session->ciphers` — `SSL_SESSION` is opaque in
+  OpenSSL 3;
+- `src/tor/tortls.c:2410/2423` redeclare `SSL_get_client_random`/`SSL_get_server_random`
+  with `SSL*`, conflicting with OpenSSL 3;
+- `src/tor/tortls.c:1770` uses `SSL_OP_ALLOW_UNSAFE_LEGACY_RENEGOTIATION` in a
+  preprocessor expression, which OpenSSL 3 no longer exposes as a macro constant.
+
+Fixing these requires a real port of the vendored Tor TLS layer (accessor-based
+session handling), i.e. a cryptography-adjacent change that cannot be validated in
+this environment. **NativeTor status: NOT FIXED — documented blocker.**
