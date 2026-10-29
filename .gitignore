@@ -69,3 +69,16 @@ src/debug.log
 src/anonstore_tests
 *.pkl
 .verdicts_audits.json
+
+# local/generated artifacts (removed from the root 2026-10-29)
+/.vs/
+/.cache/
+/.codegraph/
+/build_prod/
+/build_test/
+/compile_commands.json
+/compile_commands.json.*
+/Makefile.perf
+/innova-qt
+*.rar
+innovabootstrap*
