@@ -7,11 +7,14 @@
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
+#include "blockindex_shadow_startup.h"
 #include "blockindex_manager.h"
+#include "test/blockindex_test_generation.h"
 #include <boost/filesystem.hpp>
 
 namespace fs = boost::filesystem;
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <set>
@@ -300,15 +303,39 @@ void NBLoadSourceWithHardAncestors(const fs::path& root, BlockIndexGenerationSou
                                   unsigned int nHardBits)
 {
     fs::create_directories(root / "snapshot");
-    /* no legacy txdb teardown: txdb-leveldb was physically removed from this tree */
-    const fs::path live = GetDataDir() / "txleveldb";
-    for (fs::directory_iterator it(live), end; it != end; ++it)
-        if (fs::is_regular_file(it->path()))
-            fs::copy_file(it->path(), root / "snapshot" / it->path().filename());
+    // The legacy txleveldb store no longer exists in this tree, so there is no
+    // on-disk "legacy snapshot" to copy and none is recreated. This fixture's
+    // chain is genesis..tip and every block is resident, so the source is built
+    // with the production record converter (BlockIndexRecordFromIndex) over the
+    // resident pprev chain.
     std::string error;
-    BOOST_REQUIRE_MESSAGE(ReadLegacyBlockIndexSource((root / "snapshot").string(), &src, &error), error);
+    src.records.clear();
+    BOOST_REQUIRE_MESSAGE(pindexBest != NULL && pindexGenesisBlock != NULL, "fixture chain missing");
+    for (CBlockIndex* p = pindexBest; p != NULL; p = p->pprev)
+    {
+        BlockIndexGenerationSourceRecord r;
+        r.hash = p->GetBlockHash();
+        r.record = BlockIndexRecordFromIndex(p);
+        src.records.push_back(r);
+        if (p == pindexGenesisBlock) break;
+    }
+    // The bounded-residency floor detaches pprev links below the retained tail,
+    // so the walk above may stop before height 0. Genesis is the chain anchor the
+    // builder follows hashPrev down to; take it from ::pindexGenesisBlock.
+    bool haveGenesis = false;
+    for (std::size_t k = 0; k < src.records.size(); ++k)
+        if (src.records[k].record.height == 0) haveGenesis = true;
+    if (!haveGenesis && pindexGenesisBlock != NULL)
+    {
+        BlockIndexGenerationSourceRecord g;
+        g.hash = pindexGenesisBlock->GetBlockHash();
+        g.record = BlockIndexRecordFromIndex(pindexGenesisBlock);
+        src.records.push_back(g);
+    }
+    std::reverse(src.records.begin(), src.records.end()); // ascending heights
+    src.hashBestChain = pindexBest->GetBlockHash();
+    src.foundBestChain = true;
     src.blockDataDir = GetDataDir().string();
-    BOOST_REQUIRE(src.foundBestChain);
     for (std::size_t k = 0; k < src.records.size(); ++k)
         if (src.records[k].record.height >= 1)
             src.records[k].record.nBits = nHardBits;
@@ -410,6 +437,9 @@ BOOST_AUTO_TEST_CASE(template_nbits_uses_authoritative_resolver_on_sparse_hot_pa
                         BLOCK_INDEX_LIFECYCLE_OK);
     BOOST_REQUIRE_EQUAL(BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error),
                         BLOCK_INDEX_LIFECYCLE_OK);
+    // The global fixture already opened the shared authority; this case opens an
+    // ISOLATED one, so the process authority is reset first (test-only seam).
+    ResetBlockIndexAuthoritativeStartupForTest();
     BOOST_REQUIRE_MESSAGE(InitBlockIndexAuthoritative(root.string(), &error), error);
     BOOST_REQUIRE(g_fAuthoritativeStartup);
     BOOST_REQUIRE(GetAuthoritativeLiveAuthority() != NULL);

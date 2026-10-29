@@ -46,3 +46,31 @@ add_executable(nullblock_guard_tests
 target_link_libraries(nullblock_guard_tests PRIVATE innova_core Boost::unit_test_framework)
 innova_apply_common_options(nullblock_guard_tests)
 innova_apply_platform_definitions(nullblock_guard_tests)
+
+# ---------------------------------------------------------------------------
+# Standalone regression runners (same invocations as the makefile check-*
+# targets). The full suites of these binaries contain the known pre-existing
+# p2p_sync inflight_limit_preserves_askfor_order UB hang, so each regression
+# case is registered individually, exactly like `make check-proto-allowlist`.
+# ---------------------------------------------------------------------------
+set(_allowlist_cases
+    p2p_sync_tests/peer_protocol_allowlist_table
+    p2p_sync_tests/inbound_version_blocked_before_verack_and_requests
+    p2p_sync_tests/inbound_version_allowlist_accepts_43950_and_50505
+    p2p_sync_tests/outbound_verack_gate_blocks_peer_50000
+    p2p_sync_tests/outbound_verack_gate_allows_50505
+    p2p_sync_tests/two_own_nodes_handshake_50505_both_ways)
+foreach(_c IN LISTS _allowlist_cases)
+    string(REPLACE "/" "_" _n "${_c}")
+    add_test(NAME "p2p_allowlist_${_n}" COMMAND proto_allowlist_tests --run_test=${_c} --log_level=error)
+endforeach()
+
+set(_nullblock_cases
+    p2p_sync_tests/nullblock_answer_does_not_penalize_peer
+    p2p_sync_tests/nonnull_malformed_block_still_penalized
+    p2p_sync_tests/serve_never_pushes_null_block_shape
+    pow_cn_deadlock)
+foreach(_c IN LISTS _nullblock_cases)
+    string(REPLACE "/" "_" _n "${_c}")
+    add_test(NAME "p2p_nullblock_${_n}" COMMAND nullblock_guard_tests --run_test=${_c} --log_level=error)
+endforeach()

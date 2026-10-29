@@ -2,6 +2,7 @@
 #include "../blockindex_hashindex.h"
 #include "../fixed_blockindex_store.h"
 #include "../blockindex_accessor.h"
+#include "../blockindex_shadow_startup.h"
 #include "../main.h"
 #include "../util.h"
 
@@ -374,7 +375,6 @@ BOOST_AUTO_TEST_CASE(real_legacy_to_hashindex_to_record_shadow_lookup_matches_ad
     boost::filesystem::path dir = UniqueGenDir("legacy-diff");
     FixedBlockIndexStore store = CreateStore(dir, 1);
     std::string error;
-    LegacyBlockIndexAccessor accessor;
 
     std::vector<const CBlockIndex*> chosen;
     {
@@ -434,7 +434,8 @@ BOOST_AUTO_TEST_CASE(real_legacy_to_hashindex_to_record_shadow_lookup_matches_ad
             BlockIndexSnapshot snap;
             {
                 LOCK(cs_main);
-                snap = accessor.LookupByHash(hashes[i]);
+                // legacy txleveldb accessor retired -> production by-value snapshot
+                snap = BlockIndexSnapshotFromIndex(uniqueChosen[i]);
                 BOOST_REQUIRE(snap.found);
             }
             BOOST_CHECK_EQUAL(out.hash.ToString(), snap.hash.ToString());

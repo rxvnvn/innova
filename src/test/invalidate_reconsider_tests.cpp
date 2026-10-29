@@ -347,7 +347,15 @@ BOOST_AUTO_TEST_CASE(multi_invalidate_and_error_cases)
     BOOST_CHECK(!InvalidateBlock(uint256("00"), strError));
     BOOST_CHECK_EQUAL(strError, "Block not found");
     BOOST_CHECK(!InvalidateBlock(*pindexGenesisBlock->phashBlock, strError));
-    BOOST_CHECK_EQUAL(strError, "The genesis block cannot be invalidated");
+    // In BI-V2 authoritative mode genesis is at/below the immutable base tip, so
+    // the fail-closed authority refuses it with the V2-R2D message instead of the
+    // legacy "genesis block" wording. The BEHAVIOUR under test (refusal, no state
+    // change) is identical; both messages are accepted so the check is about the
+    // refusal, not about the string.
+    BOOST_CHECK_MESSAGE(strError == "The genesis block cannot be invalidated" ||
+                        strError == "Cannot invalidate a block at or below the immutable base tip: "
+                                     "rebase/rebuild required (V2-R2D fail-closed)",
+                        "unexpected refusal message: " << strError);
     BOOST_CHECK(!ReconsiderBlock(uint256("00"), strError));
     BOOST_CHECK(setInvalidBlockHash.empty());
 
