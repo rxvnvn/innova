@@ -19,7 +19,9 @@ set(INNOVA_CTEST_SUITES
     qt_tx_semantics_tests
     blockindex_hashindex_tests
     cpu_mining_nbits_tests
-    invalidate_reconsider_tests)
+    invalidate_reconsider_tests
+    reorg_314_chain_tests
+    reorg_314_store_tests)
 
 foreach(_suite IN LISTS INNOVA_CTEST_SUITES)
   add_test(NAME ${_suite}

@@ -77,6 +77,8 @@ set(INNOVA_TEST_SOURCES
     "${CMAKE_SOURCE_DIR}/src/test/ibdheadersobserver_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/ibdsemantic_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/invalidate_reconsider_tests.cpp"
+    "${CMAKE_SOURCE_DIR}/src/test/reorg_314_chain_tests.cpp"
+    "${CMAKE_SOURCE_DIR}/src/test/reorg_314_store_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/p2p_sync_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/pinglifecycle_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/pow_chainstale_tests.cpp"
