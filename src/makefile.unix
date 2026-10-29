@@ -576,6 +576,7 @@ TEST_OBJS= \
     obj/test/headersservededup_tests.o \
     obj/test/getblocksservedinvzero_tests.o \
     obj/test/stakemodifieropt_tests.o \
+    obj/test/qt_tx_semantics_tests.o \
     obj/test/crc32c_sse_tests.o \
     obj/test/getdatablockbudget_tests.o \
     obj/test/cnpayment_guard_tests.o \
