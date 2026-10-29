@@ -91,3 +91,18 @@ proven green.
 
 The governance document (untracked in this repo) mentions `README`, which this pass moved to
 `doc/project-status.md`. Governance files were not edited.
+
+
+## Update — Qt GUI (was FAIL)
+
+**CLOSED**: `innova-qt.pro` repaired and the GUI really builds (`rc=0`,
+`innova-qt` 13,253,880 B, 0 undefined references, 0 duplicate definitions).
+See `platform-build-matrix.md` §Update.
+
+## Update — V2 fixture (was BASELINE FAIL)
+
+Root cause fixed (fixture now runs the production ownership → native bootstrap
+sequence). All previously failing suites execute their cases successfully.
+**Open:** Boost returns exit code 200 on teardown with an empty setup error, so the
+suites are reported as "cases PASS / harness exit 200" rather than PASS. The throw
+is inside `libboost_unit_test_framework` after the case list completes.

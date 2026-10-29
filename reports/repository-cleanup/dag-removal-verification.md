@@ -42,3 +42,23 @@ was changed by this branch. The only consensus-adjacent constant touched anywher
 `DAG/IDAG = NOT COMPLETED`. The executable residue above still exists on `master`; the paused branch holds
 the work that removes it and is **not** proven green (its test fixture was mid-repair). See
 `unresolved-items.md` §DAG.
+
+
+## Update — DAG/IDAG removal LANDED
+
+Commit `d35cd97f`. Executable residue closed:
+
+| item | before | after |
+|---|---|---|
+| generation-binding domain | `INNOVA_GENERATION_DAG_BINDING_V2` | `INNOVA_GENERATION_BINDING_V2` (V2-owned) |
+| derived-data handling | old root unusable after the domain change | `-blockindexrebindbinding=1`: deterministic re-derivation from the generation's canonical files, structural validation before and after, idempotent |
+| `mixedDagInputDigest` | builder + lifecycle | `candidateMixedInputDigest` |
+| `hashDAGSourceState` | field + comparison | removed (never written in production) |
+| `dag_epoch_commit_*` | 3 counters + log field | removed (never incremented) |
+| `dagcleanheight` | comment/mechanism | removed |
+| testnet genesis | `Innova Public IDAG Hidden Finality Testnet …` | `Innova Public Testnet | Neutral Genesis | V2 Store3A`, merkle `4f81629a…d6da3e`, nonce 709855, hash `0000080f…94e26b` |
+| mainnet genesis/consensus | — | **unchanged** |
+| fixture-triggered DAG refs | `g_testDag*`, DAG-named cases | removed / renamed |
+
+Remaining `DAG`-token hits in `src/` are historical comments in test narratives and
+one Swedish locale string (`dag` = "day"); no executable mechanism remains.

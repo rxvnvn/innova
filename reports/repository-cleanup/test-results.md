@@ -50,3 +50,28 @@ skipped or removed.
 | Qt GUI | `qmake6 innova-qt.pro && make -j4` | **FAIL** — see `platform-build-matrix.md` |
 
 All builds ran with `-j4`, `nice -n 19`, `ionice -c3`; no full-core build was issued.
+
+
+## Update — V2 bootstrap fixture
+
+`src/test/test_innova.cpp` now performs the production startup sequence
+(ownership classification → `PrepareNativeBlockIndexGeneration` → `LoadBlockIndex(true)`).
+
+Observed after the fix, per suite in its own process:
+
+| suite | case results | harness exit |
+|---|---|---|
+| `blockindex_authoritative_regtest_bootstrap_tests` | **all cases pass** (pindexBest/genesis/BI-V2 assertions satisfied) | 200 |
+| `blockindex_hashindex_tests` | **all cases pass** | 200 |
+| `cpu_mining_nbits_tests` | **all cases pass** | 200 |
+| `blockindex_derived_state_tests` | **all cases pass** | 200 |
+
+The NULL-tip failures (the actual BASELINE FAIL) are gone. What remains is a
+**harness teardown defect**: Boost prints `Test is aborted` twice before the case
+list and returns exit 200 with an empty `Test setup error:`, while reporting
+`*** No errors detected`. `gdb -ex 'catch throw'` shows the throw originates inside
+`libboost_unit_test_framework` *after* every case has run and after a worker thread
+exits; no exception escapes the fixture constructor or destructor (both are wrapped
+and print nothing). Deleting the temp datadir was disabled and did not change it.
+
+Therefore: **cases PASS / harness exit 200 — reported as UNRESOLVED, not as PASS.**
