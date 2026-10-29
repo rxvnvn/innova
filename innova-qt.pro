@@ -2,6 +2,9 @@ TEMPLATE = app
 TARGET = innova-qt
 VERSION = 5.0.1
 INCLUDEPATH += src src/json src/qt src/qt/plugins/mrichtexteditor
+# chainstate/Store3A headers are included as "chainstate.h"/"incstore.h";
+# makefile.unix carries the same two include roots.
+INCLUDEPATH += src/chainstate src/chainstate/store3a
 DEFINES += QT_GUI BOOST_THREAD_USE_LIB BOOST_SPIRIT_THREADSAFE
 CONFIG += no_include_pwd
 CONFIG += thread
@@ -132,7 +135,6 @@ lessThan(QT_MAJOR_VERSION, 5): win32: QMAKE_LFLAGS *= -static
 INCLUDEPATH += src/minizip
 QMAKE_CFLAGS += -Wno-incompatible-pointer-types
 SOURCES += src/minizip/ioapi.c \
-    src/minizip/unzip.c
 
 
 # use: qmake "USE_NATIVETOR=1" ( enabled by default; default)
@@ -392,13 +394,6 @@ contains(BITCOIN_NEED_QT_PLUGINS, 1) {
 contains(USE_LEVELDB, -) {
 	message(Building with Berkeley DB transaction index)
 
-	    SOURCES += src/txdb-bdb.cpp \
-		src/hash.cpp \
-		src/aes_helper.c \
-		src/echo.c \
-		src/jh.c \
-		src/keccak.c
-
 } else {
 	message(Building with LevelDB transaction index)
 	count(USE_LEVELDB, 0) {
@@ -409,12 +404,6 @@ contains(USE_LEVELDB, -) {
 
     INCLUDEPATH += src/leveldb/include src/leveldb/helpers
 	LIBS += $$PWD/src/leveldb/libleveldb.a $$PWD/src/leveldb/libmemenv.a
-	SOURCES += src/txdb-leveldb.cpp \
-		src/hash.cpp \
-		src/aes_helper.c \
-		src/echo.c \
-		src/jh.c \
-		src/keccak.c
 	!win32 {
 		# we use QMAKE_CXXFLAGS_RELEASE even without RELEASE=1 because we use RELEASE to indicate linking preferences not -O preferences
 		genleveldb.commands = cd $$PWD/src/leveldb && CC=$$QMAKE_CC CXX=$$QMAKE_CXX $(MAKE) OPT=\"$$QMAKE_CXXFLAGS $$QMAKE_CXXFLAGS_RELEASE\" libleveldb.a libmemenv.a
@@ -485,7 +474,6 @@ HEADERS += src/qt/bitcoingui.h \
     src/qt/mintingview.h \
     src/qt/stakingpage.h \
     src/qt/privacypage.h \
-    src/qt/nullsendpage.h \
     src/qt/walletworker.h \
     src/qt/multisigaddressentry.h \
     src/qt/multisiginputentry.h \
@@ -521,37 +509,20 @@ HEADERS += src/qt/bitcoingui.h \
     src/main.h \
     src/core.h \
     src/state.h \
-    src/ringsig.h \
     src/miner.h \
     src/net.h \
     src/key.h \
     src/db.h \
-    src/txdb.h \
     src/walletdb.h \
     src/script.h \
     src/stealth.h \
-    src/idns.h \
-    src/hooks.h \
-    src/namecoin.h \
     src/collateral.h \
     src/activecollateralnode.h \
     src/collateralnode.h \
     src/collateralnodeconfig.h \
-    src/shielded.h \
-    src/nullsend.h \
-    src/shieldedcoinjoin.h \
-    src/zkproof.h \
-    src/lelantus.h \
-    src/curvetree.h \
-    src/ipa.h \
-    src/ed25519_zk.h \
-    src/nullstake.h \
     src/poseidon2.h \
-    src/bulletproof_ac.h \
     src/silentpayments.h \
     src/dandelion.h \
-    src/finality.h \
-    src/dag.h \
     src/init.h \
     src/bootstrap.h \
     src/mruset.h \
@@ -640,7 +611,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/qt/multisigdialog.cpp \
     src/qt/stakingpage.cpp \
     src/qt/privacypage.cpp \
-    src/qt/nullsendpage.cpp \
     src/qt/walletworker.cpp \
     src/qt/bantablemodel.cpp \
     src/alert.cpp \
@@ -655,7 +625,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/main.cpp \
     src/bloom.cpp \
     src/state.cpp \
-    src/ringsig.cpp \
     src/miner.cpp \
     src/init.cpp \
     src/ibdefficiency.cpp \
@@ -674,13 +643,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/blockindex_startup_authority.cpp \
     src/blockindex_startup_seam.cpp \
     src/blockindex_startup_bootstrap.cpp \
-    src/blockindex_dag_restart_seam.cpp \
-    src/dag_source_binding_verifier.cpp \
-    src/dag_logical_authority.cpp \
-    src/dag_tip_frontier.cpp \
-    src/dag_tip_live_overlay.cpp \
-    src/dag_tips_delta.cpp \
-    src/dag_tip_frontier_metadata.cpp \
     src/blockindex_derived_state.cpp \
     src/blockindex_hashindex.cpp \
     src/fixed_blockindex_store.cpp \
@@ -696,7 +658,6 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/blockindex_residency_counters.cpp \
     src/blockindex_v2_reader.cpp \
     src/blockindex_authority_materializer.cpp \
-    src/smessage_stub.cpp \
     src/net.cpp \
     src/checkpoints.cpp \
     src/addrman.cpp \
@@ -754,27 +715,13 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/scrypt.cpp \
     src/pbkdf2.cpp \
     src/stealth.cpp \
-    src/idns.cpp \
-	src/namecoin.cpp \
     src/collateral.cpp \
     src/activecollateralnode.cpp \
     src/collateralnode.cpp \
     src/collateralnodeconfig.cpp \
-    src/shielded.cpp \
-    src/nullsend.cpp \
-    src/shieldedcoinjoin.cpp \
-    src/rpcshielded.cpp \
-    src/zkproof.cpp \
-    src/lelantus.cpp \
-    src/curvetree.cpp \
-    src/ipa.cpp \
-    src/ed25519_zk.cpp \
-    src/nullstake.cpp \
     src/poseidon2.cpp \
-    src/bulletproof_ac.cpp \
     src/silentpayments.cpp \
     src/dandelion.cpp \
-    src/finality.cpp \
     src/candidate_frontier.cpp \
     src/candidate_frontier_metadata.cpp \
     src/blockindex_hot_owner.cpp \
@@ -784,8 +731,7 @@ SOURCES += src/qt/bitcoin.cpp src/qt/bitcoingui.cpp \
     src/blockindex_live_acceptance.cpp \
     src/blockindex_authoritative_restart.cpp \
     src/blockindex_authoritative_live.cpp \
-    src/hreg_registration.cpp \
-    src/dag.cpp
+    src/hreg_registration.cpp
 
 #### I n n o v a sources
 
@@ -950,3 +896,33 @@ contains(RELEASE, 1) {
  }
 
 system($$QMAKE_LRELEASE -silent $$_PRO_FILE_)
+
+# Block Index V2 / Store3A / txloc / txlat implementation (daemon link parity).
+SOURCES += \
+    src/blockindex_catchup_tool.cpp \
+    src/blockindex_derived_replay.cpp \
+    src/blockindex_fold_tool.cpp \
+    src/blockindex_generation_builder_lm.cpp \
+    src/blockindex_generation_writer.cpp \
+    src/blockindex_manager.cpp \
+    src/blockindex_native_bootstrap.cpp \
+    src/blockindex_recovery_tool.cpp \
+    src/blockindex_startup_ownership.cpp \
+    src/chainstate/store3a/btree.cpp \
+    src/candidate_frontier_legacy.cpp \
+    src/chainstate/chainstate.cpp \
+    src/echo.c \
+    src/hash.cpp \
+    src/chainstate/store3a/incdelta.cpp \
+    src/chainstate/store3a/incstore.cpp \
+    src/jh.c \
+    src/keccak.c \
+    src/lm_stream_builder.cpp \
+    src/chainstate/observe.cpp \
+    src/p2pprop.cpp \
+    src/rpcsilentpayments.cpp \
+    src/stealth_crypter.cpp \
+    src/txlat.cpp \
+    src/chainstate/txloc/txloc.cpp
+# minizip (bundled zip reader) - one entry each
+SOURCES += src/minizip/unzip.c
