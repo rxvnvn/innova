@@ -82,3 +82,8 @@ src/anonstore_tests
 /innova-qt
 *.rar
 innovabootstrap*
+
+# generated dependency indexes and local tool caches
+.deps/
+*.Po
+/src/.cache/

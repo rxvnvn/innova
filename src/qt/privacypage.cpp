@@ -58,6 +58,13 @@ void PrivacyPage::setupUI()
     connect(copySPAddressButton, SIGNAL(clicked()), this, SLOT(onCopySPAddressClicked()));
 }
 
+void PrivacyPage::onRefreshClicked()
+{
+    refreshSPAddresses();
+    if (statusLabel)
+        statusLabel->setText(tr("Refreshed"));
+}
+
 void PrivacyPage::setModel(WalletModel *model)
 {
     this->model = model;
