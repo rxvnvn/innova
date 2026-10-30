@@ -32,6 +32,7 @@
 #include "blockindex_tip.h"
 
 #include <algorithm>
+#include <boost/filesystem.hpp>
 
 extern CWallet* pwalletMain;
 
@@ -446,6 +447,123 @@ BOOST_AUTO_TEST_CASE(multi_invalidate_and_error_cases)
         BOOST_CHECK(setInvalidBlockHash.empty());
         BOOST_CHECK_EQUAL(HashStr(BestChainHash()), HashStr(pA4));
     }
+}
+
+
+// ---------------------------------------------------------------------------
+// IFCN#9 S4 helpers: a BARE BlockIndexTipAuthority on a disposable directory.
+// These records are synthetic (no block data), so the case exercises ONLY the
+// durable tip authority's commit invariants -- no mining, no global state.
+static BlockIndexRecord S4MakeRecord(uint256 hash, uint256 hashPrev, int32_t height)
+{
+    BlockIndexRecord r;
+    r.hash = hash;
+    r.hashPrev = hashPrev;
+    r.height = height;
+    r.nFile = 1;
+    r.nBlockPos = (unsigned)(height * 100);
+    r.nFlags = 0;
+    r.nVersion = 5;
+    r.nTime = 1600000000u + (unsigned)height;
+    r.nBits = 0x1d00ffff;
+    r.nNonce = (unsigned)height;
+    return r;
+}
+
+static BlockIndexDerivedEntry S4MakeDerived(int32_t height)
+{
+    BlockIndexDerivedEntry d;
+    d.chainTrust = uint256((unsigned)height);
+    d.stakeModifierChecksum = 1000u + (uint32_t)height;
+    d.SetHasStakeModifierTime(true);
+    d.stakeModifierTime = 1600000000;
+    d.SetHasBlockSize(true);
+    d.nSize = 1200;
+    return d;
+}
+
+// IFCN#9 S4 -- open risk B: a branch that attaches AT THE IMMUTABLE BASE TIP.
+// fork == baseTip is the only fork height where the retained active prefix is
+// EMPTY, so the fork block's hash cannot be read from the tip store itself. The
+// invariant is nevertheless identical: the first branch record's hashPrev MUST
+// be the base tip's hash. A branch whose root is a SIBLING of the base tip must
+// be refused fail-closed with NO state change; a correctly attached branch must
+// be accepted (no false refusal).
+BOOST_AUTO_TEST_CASE(fork_at_base_tip_attaches_by_hash)
+{
+    BOOST_TEST_MESSAGE("S4: live authority "
+                       << (GetAuthoritativeLiveAuthority() ? "present" : "absent"));
+
+    boost::filesystem::path root = boost::filesystem::temp_directory_path() /
+        boost::filesystem::unique_path("innova-basetip-%%%%-%%%%");
+    boost::filesystem::create_directories(root);
+    const std::string dir = root.string();
+
+    const int32_t baseTip = 800;
+    const uint256 baseHash(0xBA5E01UL);    // base generation's committed tip hash
+    const uint256 siblingAtBase(0xBAD001UL); // a DIFFERENT block at the same height
+    const uint256 A1(0xA101UL), A2(0xA202UL), GOOD(0xC101UL), BAD(0xB101UL);
+
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 9, 500, baseTip, &tip, NULL));
+    // Exactly what BlockIndexAuthoritativeLive::Open supplies in production.
+    tip.SetBaseTipHash(baseHash);
+
+    {
+        BlockIndexTipAppend a;
+        a.record = S4MakeRecord(A1, baseHash, baseTip + 1);
+        a.derived = S4MakeDerived(baseTip + 1);
+        BOOST_REQUIRE(tip.Append(a, baseTip + 1, NULL) == BLOCK_INDEX_TIP_OK);
+    }
+    {
+        BlockIndexTipAppend a;
+        a.record = S4MakeRecord(A2, A1, baseTip + 2);
+        a.derived = S4MakeDerived(baseTip + 2);
+        BOOST_REQUIRE(tip.Append(a, baseTip + 2, NULL) == BLOCK_INDEX_TIP_OK);
+    }
+    BOOST_REQUIRE(tip.TipHash() == A2);
+
+    std::string err;
+    // NEGATIVE: branch root is a SIBLING of the base tip; splicing it would make
+    // the active chain start at a block whose parent is not the base tip.
+    std::vector<BlockIndexTipAppend> bad(1);
+    bad[0].record = S4MakeRecord(BAD, siblingAtBase, baseTip + 1);
+    bad[0].derived = S4MakeDerived(9901);
+    std::vector<int32_t> badH(1, baseTip + 1);
+
+    const BlockIndexTipStatus stBad =
+        tip.ApplyOperatorInvalidAndReorg(A2, true, baseTip, bad, badH, &err);
+    BOOST_CHECK_MESSAGE(stBad == BLOCK_INDEX_TIP_CORRUPT,
+        "fork==baseTip: a branch whose root is NOT a child of the base tip must be "
+        "refused (got status " << (int)stBad << ", err=" << err << ")");
+    BOOST_CHECK_MESSAGE(tip.TipHash() == A2,
+        "negative case must leave the committed tip untouched");
+    BOOST_CHECK_EQUAL(tip.TipHeight(), baseTip + 2);
+    BOOST_CHECK(!tip.IsOperatorInvalid(A2));
+
+    err.clear();
+    const BlockIndexTipStatus stBadR = tip.ReorgActiveTo(baseTip, bad, badH, &err);
+    BOOST_CHECK_MESSAGE(stBadR == BLOCK_INDEX_TIP_CORRUPT,
+        "ReorgActiveTo at fork==baseTip must refuse an unattached branch (got "
+        << (int)stBadR << ", err=" << err << ")");
+    BOOST_CHECK_MESSAGE(tip.TipHash() == A2,
+        "ReorgActiveTo negative case must leave the tip untouched");
+
+    // POSITIVE: branch root's hashPrev IS the base tip hash -> must be accepted.
+    std::vector<BlockIndexTipAppend> good(1);
+    good[0].record = S4MakeRecord(GOOD, baseHash, baseTip + 1);
+    good[0].derived = S4MakeDerived(9902);
+    std::vector<int32_t> goodH(1, baseTip + 1);
+    err.clear();
+    const BlockIndexTipStatus stGood =
+        tip.ApplyOperatorInvalidAndReorg(A2, true, baseTip, good, goodH, &err);
+    BOOST_CHECK_MESSAGE(stGood == BLOCK_INDEX_TIP_OK,
+        "fork==baseTip: a correctly attached branch must be ACCEPTED, no false refusal "
+        "(got status " << (int)stGood << ", err=" << err << ")");
+    BOOST_CHECK(tip.TipHash() == GOOD);
+    BOOST_CHECK_EQUAL(tip.TipHeight(), baseTip + 1);
+    BOOST_CHECK(tip.IsOperatorInvalid(A2));
+    tip.Close();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

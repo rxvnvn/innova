@@ -274,6 +274,13 @@ public:
 
     // ---- limits & identity ----
     uint64_t BaseGeneration() const;
+    // IFCN#9 S4: the IMMUTABLE base tip's block hash. The active prefix is empty
+    // at fork == baseTipHeight, so a branch committed there can only be validated
+    // against the base generation's own tip hash. BlockIndexAuthoritativeLive::Open
+    // supplies it from the base reader's tip snapshot (production); a bare authority
+    // that leaves it null skips the check (synthetic fixtures only).
+    void SetBaseTipHash(const uint256& hash);
+    uint256 BaseTipHash() const;
     uint64_t BaseRecordCount() const;
     int32_t  TipHeight() const;
     uint256  TipHash() const;

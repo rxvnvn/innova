@@ -9517,7 +9517,27 @@ BlockIndexOperatorInvalidResult IsBlockOperatorInvalidTyped(const CBlockIndex* p
     // Walk the candidate's ancestry by value (tip-then-base), checking each
     // logical hash against the invalid set; stop once below the lowest invalid
     // height (no invalid can lie further down).
-    uint256 cur = pindex->GetBlockHash();
+    //
+    // IFCN#9 S4: the candidate's OWN hash is only tested for membership; the
+    // by-value walk starts at its PARENT. A block being connected for the first
+    // time is by definition not a durable tip record yet, so resolving the
+    // candidate itself returned UNAVAILABLE and every post-invalidation block was
+    // refused ("SetBestChain() : operator-invalid authority unavailable"), freezing
+    // the chain as soon as the operator-invalid set was non-empty. Invalidity is
+    // inherited, so testing the candidate for membership and then walking from the
+    // parent is equivalent for verdicts and no longer depends on a record that
+    // cannot exist yet.
+    if (invalidSet.count(pindex->GetBlockHash()))
+        return BLOCK_INDEX_OPERATOR_INVALID;
+    // Start the by-value walk at the in-memory PARENT when there is one. A block
+    // being connected for the first time is by definition not a durable record yet,
+    // and resolving the candidate itself returned UNAVAILABLE, which refused every
+    // post-invalidation block ("SetBestChain() : operator-invalid authority
+    // unavailable") and froze the chain. Without a parent pointer (synthetic or
+    // parentless descriptors) the historical by-value walk from the candidate is
+    // kept unchanged, so no verdict is loosened.
+    uint256 cur = (pindex->pprev != NULL) ? pindex->pprev->GetBlockHash()
+                                          : pindex->GetBlockHash();
     for (;;)
     {
         if (invalidSet.count(cur))
@@ -9816,6 +9836,19 @@ static bool LowerForkToBranchAttachment(BlockIndexTipAuthority* tip, int32_t* fo
     {
         if (err) *err = "branch does not attach above the immutable base tip";
         return false;
+    }
+    // IFCN#9 S4: reaching the base HEIGHT is not enough -- the hash at that height
+    // must be the immutable base tip itself. Otherwise the branch roots at a SIBLING
+    // of the base tip and the commit would splice a foreign parent under the chain
+    // (the same defect class as D1, at the one fork height where the tip store has
+    // no retained prefix to check). Unknown base hash = bare fixture: skip.
+    {
+        const uint256 baseHash = tip->BaseTipHash();
+        if (baseHash != uint256(0) && parent != baseHash)
+        {
+            if (err) *err = "branch does not attach to the immutable base tip";
+            return false;
+        }
     }
     *fork = base;
     return true;

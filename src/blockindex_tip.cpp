@@ -985,6 +985,8 @@ struct BlockIndexTipAuthority::Impl
     fs::path root;
     fs::path tipDir;
     fs::path metaPath;
+    // IFCN#9 S4: immutable base tip hash (see SetBaseTipHash); zero => unknown.
+    uint256 expectedBaseTipHash;
     fs::path recordsPath;
     fs::path activePath;
     fs::path derivedPath;
@@ -2507,6 +2509,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std
 // the branch the Reorganize committed. Idempotent Append/AppendBatch cannot do
 // this (they skip existing hashes). Fail closed on any inconsistency: the tip is
 // left at forkHeight (TruncateActiveTo committed), recoverable by re-running.
+
 BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     int32_t forkHeight,
     const std::vector<BlockIndexTipAppend>& branch,
@@ -2552,18 +2555,36 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
                    BLOCK_INDEX_TIP_IO_ERROR;
     }
     std::vector<BlockIndexId> newActive = forkPrefixIds; // branch ids appended below
-    // ATTACHMENT (fail-closed): same invariant as ApplyOperatorInvalidAndReorg --
-    // a branch whose root is not a child of the fork block must never be spliced.
-    if (!branch.empty() && keepActive > 0)
+    // ATTACHMENT (fail-closed): the same invariant applies at EVERY fork height.
+    // At fork == baseTipHeight the retained prefix is EMPTY, so the reference hash
+    // comes from the immutable base tip (ICFN#9 S4) instead of a prefix record;
+    // without it a branch rooting at a SIBLING of the base tip is spliced at the
+    // bottom of the chain while every store still reports OK.
+    if (!branch.empty())
     {
-        BlockIndexRecord forkRec;
-        const BlockIndexId forkId = forkPrefixIds.back();
-        if (forkId <= i->meta.baseRecordCount ||
-            !i->recordsWin.Get(forkId - i->meta.baseRecordCount - 1, &forkRec, &aerr))
-            return SetError(error, "reorg fork prefix record unreadable"),
-                   BLOCK_INDEX_TIP_IO_ERROR;
-        if (branch.front().record.hashPrev != forkRec.hash)
-            return SetError(error, "reorg branch not attached to the fork block"),
+        std::string aerrAtt;
+        uint256 forkHash;
+        bool haveForkHash = false;
+        if (keepActive > 0)
+        {
+            BlockIndexRecord forkRec;
+            const BlockIndexId forkId = forkPrefixIds.back();
+            if (forkId <= i->meta.baseRecordCount ||
+                !i->recordsWin.Get(forkId - i->meta.baseRecordCount - 1, &forkRec, &aerrAtt))
+                return SetError(error, "reorg fork prefix record unreadable"),
+                       BLOCK_INDEX_TIP_IO_ERROR;
+            forkHash = forkRec.hash;
+            haveForkHash = true;
+        }
+        else if (i->expectedBaseTipHash != uint256(0))
+        {
+            forkHash = i->expectedBaseTipHash;
+            haveForkHash = true;
+        }
+        if (haveForkHash && branch.front().record.hashPrev != forkHash)
+            return SetError(error, keepActive > 0
+                                       ? "reorg branch not attached to the fork block"
+                                       : "reorg branch not attached to the base tip"),
                    BLOCK_INDEX_TIP_CORRUPT;
     }
     // The ids of NEW records to append to the tail stores (slot-ordered).
@@ -2827,20 +2848,36 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
     }
     std::vector<BlockIndexId> allActive = forkPrefixIds;
     // ATTACHMENT (fail-closed): the first branch record MUST be a child of the
-    // active block at forkHeight. A competing branch can fork BELOW the requested
-    // fork (a sibling of the target at the target's own height); without this
-    // check such a branch is spliced onto an unrelated active block and every
-    // store still reports OK while the active chain's hashPrev linkage is broken.
-    if (!branch.empty() && keepActive > 0)
+    // active block at forkHeight -- or, when fork == baseTipHeight and the prefix
+    // is empty, of the immutable base tip. A competing branch can fork BELOW the
+    // requested fork (a sibling of the target at the target's own height); without
+    // this check such a branch is spliced onto an unrelated active block and every
+    // store still reports OK while the chain's hashPrev linkage is broken.
+    if (!branch.empty())
     {
-        BlockIndexRecord forkRec;
-        const BlockIndexId forkId = forkPrefixIds.back();
-        if (forkId <= i->meta.baseRecordCount ||
-            !i->recordsWin.Get(forkId - i->meta.baseRecordCount - 1, &forkRec, &aerr))
-            return SetError(error, "fused fork prefix record unreadable"),
-                   BLOCK_INDEX_TIP_IO_ERROR;
-        if (branch.front().record.hashPrev != forkRec.hash)
-            return SetError(error, "fused reorg branch not attached to the fork block"),
+        std::string aerrAtt;
+        uint256 forkHash;
+        bool haveForkHash = false;
+        if (keepActive > 0)
+        {
+            BlockIndexRecord forkRec;
+            const BlockIndexId forkId = forkPrefixIds.back();
+            if (forkId <= i->meta.baseRecordCount ||
+                !i->recordsWin.Get(forkId - i->meta.baseRecordCount - 1, &forkRec, &aerrAtt))
+                return SetError(error, "fused fork prefix record unreadable"),
+                       BLOCK_INDEX_TIP_IO_ERROR;
+            forkHash = forkRec.hash;
+            haveForkHash = true;
+        }
+        else if (i->expectedBaseTipHash != uint256(0))
+        {
+            forkHash = i->expectedBaseTipHash;
+            haveForkHash = true;
+        }
+        if (haveForkHash && branch.front().record.hashPrev != forkHash)
+            return SetError(error, keepActive > 0
+                                       ? "fused reorg branch not attached to the fork block"
+                                       : "fused reorg branch not attached to the base tip"),
                    BLOCK_INDEX_TIP_CORRUPT;
     }
     std::vector<BlockIndexRecord> appendRecords;
@@ -3480,6 +3517,16 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupNextActive(const uint256& curHas
 }
 
 uint64_t BlockIndexTipAuthority::BaseGeneration() const { return impl->meta.baseGeneration; }
+
+void BlockIndexTipAuthority::SetBaseTipHash(const uint256& hash)
+{
+    if (impl) impl->expectedBaseTipHash = hash;
+}
+
+uint256 BlockIndexTipAuthority::BaseTipHash() const
+{
+    return impl ? impl->expectedBaseTipHash : uint256(0);
+}
 uint64_t BlockIndexTipAuthority::BaseRecordCount() const { return impl->meta.baseRecordCount; }
 // P3-R1 protected identity readers. These mirror the CommittedTipSnapshot
 // values, but read them from the mutable meta under the impl-level
