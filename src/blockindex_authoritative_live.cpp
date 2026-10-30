@@ -368,6 +368,11 @@ bool BlockIndexAuthoritativeLive::Open(const std::string& v2Root,
         }
     }
 
+    // IFCN#9 S4: hand the immutable base tip hash to the tip authority so a branch
+    // committed at fork == baseTipHeight (empty retained prefix) can be validated
+    // against the block it must descend from.
+    impl_->tip->SetBaseTipHash(impl_->baseTipHash);
+
     // Tail composite materializer: base reader (<=S) + tip (> S).
     impl_->tail.reset(new BlockIndexLiveTail());
     impl_->tail->SetSources(impl_->baseReader, impl_->tip.get());

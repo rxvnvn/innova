@@ -9517,7 +9517,27 @@ BlockIndexOperatorInvalidResult IsBlockOperatorInvalidTyped(const CBlockIndex* p
     // Walk the candidate's ancestry by value (tip-then-base), checking each
     // logical hash against the invalid set; stop once below the lowest invalid
     // height (no invalid can lie further down).
-    uint256 cur = pindex->GetBlockHash();
+    //
+    // IFCN#9 S4: the candidate's OWN hash is only tested for membership; the
+    // by-value walk starts at its PARENT. A block being connected for the first
+    // time is by definition not a durable tip record yet, so resolving the
+    // candidate itself returned UNAVAILABLE and every post-invalidation block was
+    // refused ("SetBestChain() : operator-invalid authority unavailable"), freezing
+    // the chain as soon as the operator-invalid set was non-empty. Invalidity is
+    // inherited, so testing the candidate for membership and then walking from the
+    // parent is equivalent for verdicts and no longer depends on a record that
+    // cannot exist yet.
+    if (invalidSet.count(pindex->GetBlockHash()))
+        return BLOCK_INDEX_OPERATOR_INVALID;
+    // Start the by-value walk at the in-memory PARENT when there is one. A block
+    // being connected for the first time is by definition not a durable record yet,
+    // and resolving the candidate itself returned UNAVAILABLE, which refused every
+    // post-invalidation block ("SetBestChain() : operator-invalid authority
+    // unavailable") and froze the chain. Without a parent pointer (synthetic or
+    // parentless descriptors) the historical by-value walk from the candidate is
+    // kept unchanged, so no verdict is loosened.
+    uint256 cur = (pindex->pprev != NULL) ? pindex->pprev->GetBlockHash()
+                                          : pindex->GetBlockHash();
     for (;;)
     {
         if (invalidSet.count(cur))
@@ -9780,6 +9800,94 @@ static bool s16_OperatorUnwindStoreTo(cs::store3a::CommitStore3A* store,
     return true;
 }
 
+// Fork attachment for an operator reorg: the caller's fork is the invalidated
+// block's parent, but a competing branch may fork BELOW that point (its root is a
+// sibling of the target at the target's own height). Splicing such a branch onto
+// the requested fork produces an active chain whose hashPrev linkage is broken
+// while every store still reports OK, so lower the fork to the deepest active
+// ancestor actually shared with the branch before the authority commit.
+static bool LowerForkToBranchAttachment(BlockIndexTipAuthority* tip, int32_t* fork,
+                                        const std::vector<BlockIndexTipAppend>& branch,
+                                        std::string* err)
+{
+    if (tip == NULL || branch.empty())
+        return true;
+    int32_t h = branch.front().record.height - 1;
+    uint256 parent = branch.front().record.hashPrev;
+    const int32_t base = AuthoritativeBaseTipHeight();
+    while (h > base)
+    {
+        BlockIndexTipRead ar = tip->LookupActiveByHeight(h, NULL);
+        if (ar.status == BLOCK_INDEX_TIP_OK && ar.record.hash == parent)
+        {
+            *fork = h;
+            return true;
+        }
+        BlockIndexTipRead pr = tip->LookupByHash(parent, NULL);
+        if (pr.status != BLOCK_INDEX_TIP_OK || pr.height - 1 >= h)
+        {
+            if (err) *err = "branch ancestry is not resolvable above the base tip";
+            return false;
+        }
+        h = pr.height - 1;
+        parent = pr.record.hashPrev;
+    }
+    if (h != base)
+    {
+        if (err) *err = "branch does not attach above the immutable base tip";
+        return false;
+    }
+    // IFCN#9 S4: reaching the base HEIGHT is not enough -- the hash at that height
+    // must be the immutable base tip itself. Otherwise the branch roots at a SIBLING
+    // of the base tip and the commit would splice a foreign parent under the chain
+    // (the same defect class as D1, at the one fork height where the tip store has
+    // no retained prefix to check). Unknown base hash = bare fixture: skip.
+    {
+        const uint256 baseHash = tip->BaseTipHash();
+        if (baseHash != uint256(0) && parent != baseHash)
+        {
+            if (err) *err = "branch does not attach to the immutable base tip";
+            return false;
+        }
+    }
+    *fork = base;
+    return true;
+}
+
+// Select the best eligible branch AND make sure its root is attached to the fork
+// used by the commit. If the selection forks below the requested fork, lower the
+// fork and re-select once; refuse (fail closed) if it still does not attach.
+static bool SelectAttachedBranch(BlockIndexTipAuthority* tip, int32_t* fork,
+                                 const uint256& pendingHash, bool pendingInvalidate,
+                                 std::vector<BlockIndexTipAppend>* branch,
+                                 std::vector<int32_t>* heights, std::string* err)
+{
+    if (tip->SelectBestEligibleBranch(*fork, pendingHash, pendingInvalidate,
+                                      branch, heights, NULL, NULL, err) != BLOCK_INDEX_TIP_OK)
+        return false;
+    if (branch->empty())
+        return true; // no eligible alternative: the tip rests at the fork
+    int32_t attach = *fork;
+    if (!LowerForkToBranchAttachment(tip, &attach, *branch, err))
+        return false;
+    if (attach == *fork)
+        return true;
+    *fork = attach;
+    branch->clear();
+    heights->clear();
+    if (tip->SelectBestEligibleBranch(*fork, pendingHash, pendingInvalidate,
+                                      branch, heights, NULL, NULL, err) != BLOCK_INDEX_TIP_OK)
+        return false;
+    int32_t again = *fork;
+    if (!branch->empty() &&
+        (!LowerForkToBranchAttachment(tip, &again, *branch, err) || again != *fork))
+    {
+        if (err) *err = "re-selected branch is not attached to the lowered fork";
+        return false;
+    }
+    return true;
+}
+
 bool InvalidateBlock(const uint256& hash, std::string& strError)
 {
     LOCK(cs_main);
@@ -9822,7 +9930,7 @@ bool InvalidateBlock(const uint256& hash, std::string& strError)
         std::string ferr;
         // Bounded V2 eligible-tip selection: with the target treated as invalid, pick
         // the best remaining eligible branch above the fork by canonical trust (R1).
-        if (tip->SelectBestEligibleBranch(fork, hash, true, &branch, &bheights, NULL, NULL, &ferr) != BLOCK_INDEX_TIP_OK)
+        if (!SelectAttachedBranch(tip, &fork, hash, true, &branch, &bheights, &ferr))
         { strError = "authoritative selection failed: " + ferr; return false; }
         if (MainFailpointHitForTesting("FP_BEFORE_V2_AUTHORITY_COMMIT"))
         { strError = "failpoint FP_BEFORE_V2_AUTHORITY_COMMIT"; return false; }
@@ -9949,7 +10057,7 @@ bool ReconsiderBlock(const uint256& hash, std::string& strError)
         std::vector<BlockIndexTipAppend> branch;
         std::vector<int32_t> bheights;
         std::string ferr;
-        if (tip->SelectBestEligibleBranch(fork, hash, false, &branch, &bheights, NULL, NULL, &ferr) != BLOCK_INDEX_TIP_OK)
+        if (!SelectAttachedBranch(tip, &fork, hash, false, &branch, &bheights, &ferr))
         { strError = "authoritative selection failed: " + ferr; return false; }
         if (tip->ApplyOperatorInvalidAndReorg(hash, false, fork, branch, bheights, &ferr) != BLOCK_INDEX_TIP_OK)
         { strError = "authoritative reconsider failed: " + ferr; return false; }
@@ -10052,7 +10160,26 @@ bool RecoverFromInvalidatedBestChain()
            pindexBest->GetBlockHash().ToString().substr(0, 20).c_str(), pindexBest->nHeight,
            pHeal->GetBlockHash().ToString().substr(0, 20).c_str(), pHeal->nHeight);
 
-    return RollbackActiveChainTo(pHeal);
+    if (!RollbackActiveChainTo(pHeal))
+        return false;
+
+    // Commit the corrected tip to the durable V2 authority. The authority OWNS the
+    // best-chain pointer: healing only the in-memory projection leaves tip.meta on
+    // the operator-invalidated block, so the next startup (or any by-value consumer)
+    // would reload the very chain this function just healed. ReorgActiveTo truncates
+    // the committed active membership to pHeal without touching the invalid log.
+    BlockIndexAuthoritativeLive* liveHeal = GetAuthoritativeLiveAuthority();
+    BlockIndexTipAuthority* tipHeal = liveHeal ? liveHeal->TipAuthorityMutable() : NULL;
+    if (tipHeal != NULL && tipHeal->TipHeight() > pHeal->nHeight)
+    {
+        const std::vector<BlockIndexTipAppend> noBranch;
+        const std::vector<int32_t> noHeights;
+        std::string terr;
+        if (tipHeal->ReorgActiveTo(pHeal->nHeight, noBranch, noHeights, &terr) != BLOCK_INDEX_TIP_OK)
+            return error("RecoverFromInvalidatedBestChain() : durable tip heal failed: %s", terr.c_str());
+        RefreshAuthoritativeTransientProjection();
+    }
+    return true;
 }
 
 bool ProcessBlock(CNode* pfrom, CBlock* pblock)
