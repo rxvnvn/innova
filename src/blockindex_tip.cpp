@@ -2552,6 +2552,20 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
                    BLOCK_INDEX_TIP_IO_ERROR;
     }
     std::vector<BlockIndexId> newActive = forkPrefixIds; // branch ids appended below
+    // ATTACHMENT (fail-closed): same invariant as ApplyOperatorInvalidAndReorg --
+    // a branch whose root is not a child of the fork block must never be spliced.
+    if (!branch.empty() && keepActive > 0)
+    {
+        BlockIndexRecord forkRec;
+        const BlockIndexId forkId = forkPrefixIds.back();
+        if (forkId <= i->meta.baseRecordCount ||
+            !i->recordsWin.Get(forkId - i->meta.baseRecordCount - 1, &forkRec, &aerr))
+            return SetError(error, "reorg fork prefix record unreadable"),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+        if (branch.front().record.hashPrev != forkRec.hash)
+            return SetError(error, "reorg branch not attached to the fork block"),
+                   BLOCK_INDEX_TIP_CORRUPT;
+    }
     // The ids of NEW records to append to the tail stores (slot-ordered).
     std::vector<BlockIndexRecord> appendRecords;
     std::vector<BlockIndexDerivedEntry> appendDerived;
@@ -2812,6 +2826,23 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
                    BLOCK_INDEX_TIP_IO_ERROR;
     }
     std::vector<BlockIndexId> allActive = forkPrefixIds;
+    // ATTACHMENT (fail-closed): the first branch record MUST be a child of the
+    // active block at forkHeight. A competing branch can fork BELOW the requested
+    // fork (a sibling of the target at the target's own height); without this
+    // check such a branch is spliced onto an unrelated active block and every
+    // store still reports OK while the active chain's hashPrev linkage is broken.
+    if (!branch.empty() && keepActive > 0)
+    {
+        BlockIndexRecord forkRec;
+        const BlockIndexId forkId = forkPrefixIds.back();
+        if (forkId <= i->meta.baseRecordCount ||
+            !i->recordsWin.Get(forkId - i->meta.baseRecordCount - 1, &forkRec, &aerr))
+            return SetError(error, "fused fork prefix record unreadable"),
+                   BLOCK_INDEX_TIP_IO_ERROR;
+        if (branch.front().record.hashPrev != forkRec.hash)
+            return SetError(error, "fused reorg branch not attached to the fork block"),
+                   BLOCK_INDEX_TIP_CORRUPT;
+    }
     std::vector<BlockIndexRecord> appendRecords;
     std::vector<BlockIndexDerivedEntry> appendDerived;
     std::set<uint256> seenBranch;

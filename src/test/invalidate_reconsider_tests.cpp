@@ -122,10 +122,16 @@ static bool TryAcceptPoWBlock(CBlockIndex* pindexPrev, unsigned int nExtra)
     return fOk;
 }
 
+// Ancestry is compared BY HASH, not by pointer: the authoritative-V2 projection
+// may materialize separate CBlockIndex instances for the same block, so pointer
+// identity against a mapBlockIndex object is not a reliable ancestry test.
 static bool IsAncestorOfTip(const CBlockIndex* pindex)
 {
+    if (pindex == NULL)
+        return false;
+    const uint256 hash = pindex->GetBlockHash();
     for (const CBlockIndex* p = pindexBest; p != NULL; p = p->pprev)
-        if (p == pindex)
+        if (p->GetBlockHash() == hash)
             return true;
     return false;
 }
@@ -145,15 +151,41 @@ static std::string HashStr(const uint256& hash)
     return hash.ToString();
 }
 
-// The block at nHeight that is NOT an ancestor of the current best chain
-// (i.e. a side-chain block at that height).
-static CBlockIndex* FindSideChainBlockAtHeight(int nHeight)
+// The block at nHeight that IS an ancestor of the current best chain (the
+// A-branch block). Deterministic: FindBlockByHeight() returns whichever block at
+// that height comes first in mapBlockIndex hash order, which alternates between
+// the A and B branches from run to run (block hashes are mined per run), making
+// the whole suite flaky.
+static CBlockIndex* FindActiveBlockAtHeight(int nHeight)
 {
     for (std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin();
          mi != mapBlockIndex.end(); ++mi)
     {
         CBlockIndex* pindex = mi->second;
-        if (pindex->nHeight == nHeight && !IsAncestorOfTip(pindex))
+        if (pindex->nHeight == nHeight && IsAncestorOfTip(pindex))
+            return pindex;
+    }
+    return NULL;
+}
+
+// The unique side-chain block at nHeight whose ancestry reaches pForkParent
+// (e.g. the B-branch tip under the fork parent P2). Deterministic by ancestry,
+// not by hash order.
+static CBlockIndex* FindSideChainDescendantAtHeight(CBlockIndex* pForkParent, int nHeight)
+{
+    if (pForkParent == NULL)
+        return NULL;
+    for (std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.begin();
+         mi != mapBlockIndex.end(); ++mi)
+    {
+        CBlockIndex* pindex = mi->second;
+        if (pindex->nHeight != nHeight || IsAncestorOfTip(pindex))
+            continue;
+        const uint256 forkHash = pForkParent->GetBlockHash();
+        CBlockIndex* p = pindex;
+        while (p != NULL && p->nHeight > pForkParent->nHeight)
+            p = p->pprev;
+        if (p != NULL && p->GetBlockHash() == forkHash)
             return pindex;
     }
     return NULL;
@@ -212,13 +244,15 @@ BOOST_AUTO_TEST_CASE(active_chain_rollback_and_best_alternative)
 {
     // Reuse the fork built by inactive_side_chain_invalidation: best = A4,
     // side chain B1..B3 (lower trust) still present.
-    CBlockIndex* pA1 = FindBlockByHeight(3);
-    CBlockIndex* pA4 = FindBlockByHeight(6);
-    CBlockIndex* pB3 = FindSideChainBlockAtHeight(5);
+    CBlockIndex* pA1 = FindActiveBlockAtHeight(3);
+    CBlockIndex* pA4 = FindActiveBlockAtHeight(6);
+    BOOST_REQUIRE(pA1 != NULL);
+    CBlockIndex* pB3 = FindSideChainDescendantAtHeight(pA1->pprev, 5);
     BOOST_REQUIRE(pA1 != NULL);
     BOOST_REQUIRE(pA4 != NULL);
     BOOST_REQUIRE(pB3 != NULL);
     BOOST_CHECK(IsAncestorOfTip(pA1));
+
 
     std::string strError;
     BOOST_CHECK(InvalidateBlock(*pA1->phashBlock, strError));
@@ -241,9 +275,10 @@ BOOST_AUTO_TEST_CASE(active_chain_rollback_and_best_alternative)
 BOOST_AUTO_TEST_CASE(restart_persistence_and_crash_window_heal)
 {
     // State: best = A4, side chain B1..B3.  Invalidate A1 -> consistent rollback.
-    CBlockIndex* pA1 = FindBlockByHeight(3);
+    CBlockIndex* pA1 = FindActiveBlockAtHeight(3);
+    BOOST_REQUIRE(pA1 != NULL);
     CBlockIndex* pP2 = pA1->pprev;
-    CBlockIndex* pA4 = FindBlockByHeight(6);
+    CBlockIndex* pA4 = FindActiveBlockAtHeight(6);
     uint256 hashA4 = *pA4->phashBlock;
     BOOST_REQUIRE(pA1 != NULL);
     BOOST_REQUIRE(pP2 != NULL);
@@ -332,16 +367,18 @@ BOOST_AUTO_TEST_CASE(restart_persistence_and_crash_window_heal)
 // invalidating both competing chains leaves the chain resting at the fork.
 BOOST_AUTO_TEST_CASE(multi_invalidate_and_error_cases)
 {
-    CBlockIndex* pA1 = FindBlockByHeight(3);
-    CBlockIndex* pA2 = FindBlockByHeight(4);
-    CBlockIndex* pA4 = FindBlockByHeight(6);
-    CBlockIndex* pB1 = FindSideChainBlockAtHeight(3);
+    CBlockIndex* pA1 = FindActiveBlockAtHeight(3);
+    BOOST_REQUIRE(pA1 != NULL);
+    CBlockIndex* pA2 = FindActiveBlockAtHeight(4);
+    CBlockIndex* pA4 = FindActiveBlockAtHeight(6);
+    CBlockIndex* pB1 = FindSideChainDescendantAtHeight(pA1->pprev, 3);
     BOOST_REQUIRE(pA1 != NULL);
     BOOST_REQUIRE(pA2 != NULL);
     BOOST_REQUIRE(pA4 != NULL);
     BOOST_REQUIRE(pB1 != NULL);
 
     std::string strError;
+
 
     // Error cases first (no state change).
     BOOST_CHECK(!InvalidateBlock(uint256("00"), strError));
@@ -359,15 +396,19 @@ BOOST_AUTO_TEST_CASE(multi_invalidate_and_error_cases)
     BOOST_CHECK(!ReconsiderBlock(uint256("00"), strError));
     BOOST_CHECK(setInvalidBlockHash.empty());
 
-    // Invalidate the active branch (A2) then the other branch (B1).  With both
-    // branches invalidated the best eligible set is empty and the chain rests at
-    // the fork parent (P2 -> best block at height 2).
+    // Invalidate the active block A2, then the other branch's root B1.
+    // A2's invalidation makes the B branch best (B3).  Invalidating B1 removes the
+    // B branch, and A1 (A2's parent, NOT invalidated) is still eligible, so the
+    // best eligible chain is A1 -- the same contract the whole suite asserts
+    // ("activates the best eligible alternative chain").  The fork parent is
+    // reached only when nothing at all is eligible above it; that case is checked
+    // at the end of this test.
     BOOST_CHECK(InvalidateBlock(*pA2->phashBlock, strError));
     BOOST_CHECK(InvalidateBlock(*pB1->phashBlock, strError));
     BOOST_CHECK_EQUAL(setInvalidBlockHash.count(*pA2->phashBlock), (size_t)1);
     BOOST_CHECK_EQUAL(setInvalidBlockHash.count(*pB1->phashBlock), (size_t)1);
     BOOST_CHECK(IsBlockOperatorInvalid(pA4));  // via A2
-    BOOST_CHECK_EQUAL(HashStr(BestChainHash()), HashStr(pA1->pprev));
+    BOOST_CHECK_EQUAL(HashStr(BestChainHash()), HashStr(pA1));
 
     // Reconsidering A2 alone leaves B1 invalid; A becomes best eligible again.
     BOOST_CHECK(ReconsiderBlock(*pA2->phashBlock, strError));
@@ -385,6 +426,26 @@ BOOST_AUTO_TEST_CASE(multi_invalidate_and_error_cases)
     // Idempotency: reconsidering a block that is not invalidated succeeds.
     BOOST_CHECK(ReconsiderBlock(*pA4->phashBlock, strError));
     BOOST_CHECK(setInvalidBlockHash.empty());
+
+    // Empty eligible set: invalidate BOTH branch roots (A1 and B1).  With no
+    // eligible record above the fork P2, the active chain must rest exactly at the
+    // fork parent -- this is the only situation in which "rest at the fork" is the
+    // correct answer, and it also proves the branch-attachment invariant never
+    // splices a branch onto an unrelated active block.
+    {
+        CBlockIndex* pB3 = FindSideChainDescendantAtHeight(pA1->pprev, 5);
+        BOOST_REQUIRE(pB3 != NULL);
+        BOOST_CHECK(InvalidateBlock(*pA1->phashBlock, strError));   // A branch dies -> B best
+        BOOST_CHECK_EQUAL(HashStr(BestChainHash()), HashStr(pB3));
+        BOOST_CHECK(InvalidateBlock(*pB1->phashBlock, strError));   // B dies -> nothing eligible
+        BOOST_CHECK_EQUAL(HashStr(BestChainHash()), HashStr(pA1->pprev));  // rests at P2
+        BOOST_CHECK_EQUAL(pindexBest->nHeight, 2);
+        // Restore a fully consistent, invalid-free state.
+        BOOST_CHECK(ReconsiderBlock(*pA1->phashBlock, strError));
+        BOOST_CHECK(ReconsiderBlock(*pB1->phashBlock, strError));
+        BOOST_CHECK(setInvalidBlockHash.empty());
+        BOOST_CHECK_EQUAL(HashStr(BestChainHash()), HashStr(pA4));
+    }
 }
 
 BOOST_AUTO_TEST_SUITE_END()
