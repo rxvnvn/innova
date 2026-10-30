@@ -169,7 +169,11 @@ BOOST_AUTO_TEST_CASE(g1_base_snapshot_and_materialized_expose_derived_stake_modi
     for (fs::directory_iterator it(fx.root), end; it != end; ++it)
     {
         const std::string name = it->path().filename().string();
-        if (name.compare(0, 14, "blockindex-gen") == 0) { genDir = it->path().string(); break; }
+        // IFCN#9 S6: the published generation directory is `gen-%06llu` (see
+        // BlockIndexGenerationManager::GenerationPath). The old prefix belonged to a superseded
+        // layout, so this anchor could never be found and the invariant was never evaluated.
+        if (name.compare(0, 4, "gen-") == 0 || name.compare(0, 14, "blockindex-gen") == 0)
+        { genDir = it->path().string(); break; }
     }
     BOOST_REQUIRE_MESSAGE(!genDir.empty(), "generation dir not found");
     BlockIndexDerivedStateStore dstore;
@@ -397,7 +401,14 @@ BOOST_AUTO_TEST_CASE(g1_corrupt_base_fails_closed)
 // and the accessor is NULL (legacy behavior unchanged).
 BOOST_AUTO_TEST_CASE(g1_legacy_mode_unchanged)
 {
+    // IFCN#9 S6: the authoritative context is process-lifetime (installed by this binary's
+    // global fixture) and has no non-destructive teardown, so "legacy mode" cannot be assumed
+    // here -- the old bare assertion simply observed whatever an earlier case left behind.
+    // Exercise the same contract through the explicit absence switch (accessor must answer
+    // NULL), and restore, so later cases keep the fixture state they rely on.
+    SetAuthoritativeAuthorityAbsentForTesting(true);
     BOOST_CHECK(GetAuthoritativeLiveAuthority() == NULL);
+    SetAuthoritativeAuthorityAbsentForTesting(false);
     printf("G1 PASS: legacy mode (no authoritative live authority) unchanged.\n");
 }
 
@@ -980,13 +991,33 @@ BOOST_AUTO_TEST_CASE(g1_traversal_floor_skip_topology_and_getancestor)
 // cosmetic-retention failure mode).
 static std::string ReadSourceForGate(const char* name)
 {
-    const char* prefixes[] = { "", "../", "../../innova-r1r2-cutover/src/" };
-    for (size_t i = 0; i < sizeof(prefixes)/sizeof(prefixes[0]); ++i)
+    // IFCN#9 S6: the gate must be evaluable from ANY cwd (build dir, src/test, repo root).
+    // Walk up from the current directory until the repository marker is found, then look in the
+    // usual source locations. The gate itself is unchanged: it still scans real production
+    // sources for forbidden symbols -- it just stops silently finding nothing.
+    std::vector<std::string> roots;
     {
-        std::ifstream in((std::string(prefixes[i]) + name).c_str());
-        if (in.good())
+        fs::path p = fs::current_path();
+        for (int up = 0; up < 6 && !p.empty(); ++up)
         {
-            std::ostringstream ss; ss << in.rdbuf(); return ss.str();
+            roots.push_back(p.string());
+            if (fs::exists(p / "src" / "test" / "test-sources.cmake"))
+                break;
+            if (!p.has_parent_path() || p.parent_path() == p) break;
+            p = p.parent_path();
+        }
+    }
+    for (size_t r = 0; r < roots.size(); ++r)
+    {
+        const std::string cand[] = { roots[r] + "/src/" + name, roots[r] + "/" + name,
+                                     roots[r] + "/src/test/" + name };
+        for (size_t i = 0; i < sizeof(cand)/sizeof(cand[0]); ++i)
+        {
+            std::ifstream in(cand[i].c_str());
+            if (in.good())
+            {
+                std::ostringstream ss; ss << in.rdbuf(); return ss.str();
+            }
         }
     }
     return std::string();

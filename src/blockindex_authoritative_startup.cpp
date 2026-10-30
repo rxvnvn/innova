@@ -789,8 +789,14 @@ uint64_t AuthoritativeGeneration()
 // Prefers the G1 test-only handle while set so a causal test can arm the real
 // ProcessBlock path against an isolated authoritative generation.
 static BlockIndexAuthoritativeLive* g_testLiveAuthority = NULL;
+// IFCN#9 S6 (test-only): simulate "no authority at all". Clearing only g_testLiveAuthority is
+// NOT enough once a process-lifetime context exists (it has no teardown), which made the
+// fail-closed branch unreachable from tests and their expectation unprovable.
+static bool g_testAuthorityAbsent = false;
 BlockIndexAuthoritativeLive* GetAuthoritativeLiveAuthority()
 {
+    if (g_testAuthorityAbsent)
+        return NULL;
     if (g_testLiveAuthority)
         return g_testLiveAuthority;
     if (!g_authoritativeContext) return NULL;
@@ -805,6 +811,10 @@ void SetAuthoritativeLiveForTesting(BlockIndexAuthoritativeLive* live)
 void ClearAuthoritativeLiveForTesting()
 {
     g_testLiveAuthority = NULL;
+}
+void SetAuthoritativeAuthorityAbsentForTesting(bool absent)
+{
+    g_testAuthorityAbsent = absent;
 }
 
 void AuthoritativeActiveHeightFailForTest(int count)

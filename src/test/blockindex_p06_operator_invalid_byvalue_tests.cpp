@@ -160,9 +160,16 @@ BOOST_AUTO_TEST_CASE(p06_a1_parity_and_failclosed)
     BOOST_CHECK_EQUAL((int)IsBlockOperatorInvalidTyped(&cAbove), (int)BLOCK_INDEX_OPERATOR_VALID);
     BOOST_CHECK_EQUAL((int)IsBlockOperatorInvalidTyped(&cGen), (int)BLOCK_INDEX_OPERATOR_VALID);
 
-    // ---- fail-closed: authority closed ----
+    // ---- fail-closed: authority ABSENT ----
+    // IFCN#9 S6: clearing only the TEST handle does not make the authority absent -- once the
+    // process-lifetime authoritative context is installed (no teardown exists) it keeps
+    // answering, so this check silently exercised the EMPTY-SET fast path of a LIVE authority
+    // and demanded a verdict the code could not produce (observed: VALID where UNAVAILABLE was
+    // expected). The expectation is unchanged; the state it talks about is now established.
     SetAuthoritativeLiveForTesting(NULL);
+    SetAuthoritativeAuthorityAbsentForTesting(true);
     BOOST_CHECK_EQUAL((int)IsBlockOperatorInvalidTyped(&cDesc), (int)BLOCK_INDEX_OPERATOR_UNAVAILABLE);
+    SetAuthoritativeAuthorityAbsentForTesting(false);
 
     // ---- fail-closed: required authoritative record unresolvable ----
     SetAuthoritativeLiveForTesting(&live);
@@ -188,6 +195,54 @@ BOOST_AUTO_TEST_CASE(p06_a1_parity_and_failclosed)
     printf("P06-A1 PASS: operator-invalid by-value parity vs complete raw chain "
            "(deep ancestor 2300 blocks below horizon), fail-closed on closed "
            "authority / unresolvable invalid id, empty-set fast path VALID.\n");
+}
+
+BOOST_AUTO_TEST_CASE(p06_a1g_unknown_invalid_id_fails_closed)
+{
+    // IFCN#9 S6 regression (explicit RED/GREEN for the GHOST-ID contract): an operator-invalid
+    // id that cannot be placed in the chain (no height/hashPrev) must make the by-value verdict
+    // UNAVAILABLE -- never VALID. "VALID" here would silently re-accept an ancestry whose
+    // invalid set contains an id the authority cannot resolve, i.e. exactly the fail-closed
+    // breach this case exists to prevent.
+    P06Fixture fx(300);
+    BlockIndexV2Reader reader;
+    BlockIndexV2ReaderOptions opts;
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(reader.Open(fx.rootStr, opts, &error), error);
+    BlockIndexAuthoritativeLive live;
+    BOOST_REQUIRE_MESSAGE(live.Open(fx.rootStr, &reader, 2048, &error), error);
+
+    const bool savedAuth = g_fAuthoritativeStartup;
+    SetAuthoritativeLiveForTesting(&live);
+    ::g_fAuthoritativeStartup = true;
+
+    std::string serr;
+    const uint256 hReal = fx.baseActive[10];
+    const uint256 hGhost = uint256(0x0BADF00DUL);
+
+    // (1) resolvable invalid id -> INVALID for a descendant
+    BOOST_REQUIRE_EQUAL((int)live.TipAuthorityMutable()->SetOperatorInvalid(hReal, true, &serr),
+                        (int)BLOCK_INDEX_TIP_OK);
+    CBlockIndex cDesc; uint256 hDesc = fx.baseActive[250]; cDesc.phashBlock = &hDesc; cDesc.nHeight = 250;
+    BOOST_CHECK_EQUAL((int)IsBlockOperatorInvalidTyped(&cDesc), (int)BLOCK_INDEX_OPERATOR_INVALID);
+
+    // (2) add an UNRESOLVABLE invalid id -> fail closed (UNAVAILABLE, not VALID/INVALID)
+    BOOST_REQUIRE_EQUAL((int)live.TipAuthorityMutable()->SetOperatorInvalid(hGhost, true, &serr),
+                        (int)BLOCK_INDEX_TIP_OK);
+    BOOST_CHECK_EQUAL((int)IsBlockOperatorInvalidTyped(&cDesc), (int)BLOCK_INDEX_OPERATOR_UNAVAILABLE);
+    CBlockIndex cOther; uint256 hOther = fx.baseActive[20]; cOther.phashBlock = &hOther; cOther.nHeight = 20;
+    BOOST_CHECK_EQUAL((int)IsBlockOperatorInvalidTyped(&cOther), (int)BLOCK_INDEX_OPERATOR_UNAVAILABLE);
+
+    // (3) remove the ghost id -> the resolvable verdict comes back
+    BOOST_REQUIRE_EQUAL((int)live.TipAuthorityMutable()->SetOperatorInvalid(hGhost, false, &serr),
+                        (int)BLOCK_INDEX_TIP_OK);
+    BOOST_CHECK_EQUAL((int)IsBlockOperatorInvalidTyped(&cDesc), (int)BLOCK_INDEX_OPERATOR_INVALID);
+
+    ::g_fAuthoritativeStartup = savedAuth;
+    ClearAuthoritativeLiveForTesting();
+    live.Close();
+    reader.Close();
+    printf("P06-A1G PASS: unknown invalid id -> UNAVAILABLE (fail closed), resolvable -> INVALID.\n");
 }
 
 BOOST_AUTO_TEST_CASE(p06_a1d_tip_ancestor_peer_parity_and_failclosed)

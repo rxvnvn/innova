@@ -213,6 +213,11 @@ uint256 GetAuthoritativeBlockTrust(const BlockIndexSnapshot& snap);
 // contradicts the child's hash/height. A true chain start is recognised ONLY
 // from the persisted authoritative `hashPrev == 0`; absence is never
 // reinterpreted as canonical genesis.
+// IFCN#9 S6 (test-only): force `GetAuthoritativeLiveAuthority()` to answer NULL even when a
+// process-lifetime authoritative context is installed, so tests can exercise the genuine
+// "authority absent" fail-closed branch. Inert (false) in production; no product path sets it.
+void SetAuthoritativeAuthorityAbsentForTesting(bool absent);
+
 bool GetAuthoritativeAccumulatedChainTrust(const uint256& hash,
                                            uint256* out, std::string* error);
 
