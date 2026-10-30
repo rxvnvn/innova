@@ -87,3 +87,39 @@ endif()
 if(INNOVA_BUILD_TESTS AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
   add_subdirectory(test)
 endif()
+
+# ---------------------------------------------------------------------------
+# Auxiliary standalone harnesses. Opt-in (EXCLUDE_FROM_ALL): they are real,
+# reproducible targets but must not bloat a default build, and they are not part
+# of the daemon. Each has its own main(); none is linked into innova_core.
+# ---------------------------------------------------------------------------
+add_executable(innova-crc32c-verify EXCLUDE_FROM_ALL
+    "${CMAKE_SOURCE_DIR}/src/leveldb/util/crc32c_verify.cpp")
+# crc32c lives in the bundled LevelDB static library; the harness only needs its
+# public-ish header, so it links the library instead of recompiling the util TU
+# with LevelDB's internal platform defines.
+target_include_directories(innova-crc32c-verify PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/leveldb" "${CMAKE_SOURCE_DIR}/src/leveldb/include")
+target_link_libraries(innova-crc32c-verify PRIVATE innova::leveldb)
+innova_apply_common_options(innova-crc32c-verify)
+innova_apply_platform_definitions(innova-crc32c-verify)
+
+# Stage-2B chainstate vertical slice harness (T0..T17), isolated runtime dir.
+add_executable(innova-chainstate-slice-tests EXCLUDE_FROM_ALL
+    "${CMAKE_SOURCE_DIR}/src/chainstate/tests/chainstate_slice_tests.cpp"
+    "${CMAKE_SOURCE_DIR}/src/chainstate/chainstate.cpp"
+    "${CMAKE_SOURCE_DIR}/src/chainstate/commitstore.cpp"
+    "${CMAKE_SOURCE_DIR}/src/chainstate/observe.cpp")
+target_include_directories(innova-chainstate-slice-tests PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/chainstate")
+innova_apply_common_options(innova-chainstate-slice-tests)
+innova_apply_platform_definitions(innova-chainstate-slice-tests)
+
+# TX-LOC standalone harness (build/lookup/restart/corruption fail-closed).
+add_executable(innova-txloc-harness EXCLUDE_FROM_ALL
+    "${CMAKE_SOURCE_DIR}/src/chainstate/txloc/tests/inc_tests.cpp"
+    "${CMAKE_SOURCE_DIR}/src/chainstate/txloc/txloc.cpp")
+target_include_directories(innova-txloc-harness PRIVATE
+    "${CMAKE_SOURCE_DIR}/src/chainstate" "${CMAKE_SOURCE_DIR}/src/chainstate/txloc")
+innova_apply_common_options(innova-txloc-harness)
+innova_apply_platform_definitions(innova-txloc-harness)
