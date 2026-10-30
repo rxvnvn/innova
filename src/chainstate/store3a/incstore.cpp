@@ -946,6 +946,13 @@ bool CommitStore3A::openWithOptions(const std::string& dir, const OpenOptions& o
         ixFreshPath_ = true;   // S1.1: no MANIFEST -> nothing committed -> never touch UNDOINDEX
         generation_=0; undoSegments_.clear(); undoRecent_.clear(); undoRecordCount_=0;
         undoCommittedBytes_=0; blockHash_=Hash(); tipHeight_=-1;
+        // IFCN#9 S5 (F-7/F-4): publish the empty state as generation 0 BEFORE handing the store
+        // to the caller, so every store has a durable commit point from birth. A later batch
+        // (applied pages, no barrier yet) or a crash inside the first commit then leaves residue
+        // that is provably UNCOMMITTED -- open() rolls the root back to this generation and the
+        // startup reconcile replays the chain. Without this the datadir was unopenable and the
+        // only documented policy was "refuse" (see DESIGN.md 9, updated by this change).
+        if(!publishInitialGeneration(e)){ close(); return false; }
     } else {
         ChainError e2; bool bEx=false; uint32_t bId=0; Hash bH;
         bool bOk=tryLoadManifest(p("MANIFEST.bak"),&bEx,&bId,&bH,&e2);
@@ -971,6 +978,29 @@ bool CommitStore3A::openWithOptions(const std::string& dir, const OpenOptions& o
     // on read — see M1-pathverify). Free-page reuse is done WITHIN a run (commitRetired + retire-after-ACK +
     // appendPage reuse), which bounds tree.dat for fresh stores without an open-time full-tree walk.
     opened_=true; return true;
+}
+
+// IFCN#9 S5: write the generation-0 MANIFEST + ACK for a store that is known to be EMPTY and
+// whose tree holds only the empty sentinel page. Same durable order as every other commit
+// (page fsync -> MANIFEST.tmp -> rename -> dir fsync -> ACK), so the generation-0 record is
+// exactly as durable as any later one and no new authority is introduced.
+bool CommitStore3A::publishInitialGeneration(ChainError* e){
+    if(!tree_.fsync(e)) return false;                       // sentinel page durable before it is referenced
+    Manifest m0;
+    m0.generation = 0;
+    m0.undoSize = 0;
+    m0.rootPageId = tree_.rootId();
+    m0.rootHash = tree_.rootHash();
+    m0.blockHash = Hash();
+    m0.tipHeight = -1;
+    std::vector<uint8_t> mb = m0.encode();
+    if(!csWriteFile(p("MANIFEST.tmp"), mb.data(), mb.size(), false, false, e)){ ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+    if(::rename(p("MANIFEST.tmp").c_str(), p("MANIFEST").c_str())!=0){
+        setErr(e, ErrCode::FS, "rename initial MANIFEST"); ::unlink(p("MANIFEST.tmp").c_str()); return false; }
+    if(!csFsyncDir(dir_, e)) return false;
+    if(!writeAck(0, e)) return false;
+    generation_ = 0; ackGen_ = 0; ackPresent_ = true;
+    return true;
 }
 
 bool CommitStore3A::commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e,
