@@ -212,6 +212,54 @@ using namespace reorg314;
 
 BOOST_AUTO_TEST_SUITE(reorg_314_chain_tests)
 
+// PHASE4 (1)(3): the mode-dependent chain parameters must be identical on both
+// startup paths. This case verifies the LEGACY path (the fixture ran
+// LoadBlockIndex(true) with fRegTest) and that applying the shared initializer
+// with fRegTest=false is a strict no-op (mainnet inertness). The V2-authoritative
+// path is verified on the real daemon in PHASE4-DAEMON-E2E.md (getmininginfo
+// difficulty == 1 and acceptance of 0x207fffff blocks).
+BOOST_AUTO_TEST_CASE(mode_params_legacy_path_and_mainnet_inertness)
+{
+    BOOST_REQUIRE(fRegTest);
+    const CBigNum regtestPowLimit = CBigNum(~uint256(0) >> 1);
+
+    // (a) legacy path values applied by the fixture's LoadBlockIndex()
+    BOOST_CHECK(bnProofOfWorkLimit == regtestPowLimit);
+    BOOST_CHECK_EQUAL(nCoinbaseMaturity, 1);
+    BOOST_CHECK_EQUAL(nTargetSpacing, 1);
+    BOOST_CHECK_EQUAL((int)nStakeMinAge, 0);
+    BOOST_CHECK_EQUAL(GetNextTargetRequired(pindexBest, false), regtestPowLimit.GetCompact());
+
+    // (b) mainnet inertness: with the regtest/testnet flags off, the shared
+    // initializer must not touch any consensus parameter.
+    const CBigNum savedPow = bnProofOfWorkLimit;
+    const unsigned int savedMaturity = nCoinbaseMaturity;
+    const unsigned int savedSpacing = nTargetSpacing;
+    const int64_t savedStakeAge = nStakeMinAge;
+    const char savedMsg[4] = {pchMessageStart[0], pchMessageStart[1],
+                              pchMessageStart[2], pchMessageStart[3]};
+    const bool savedReg = fRegTest, savedTest = fTestNet;
+    fRegTest = false;
+    fTestNet = false;
+    ApplyModeDependentChainParams();
+    BOOST_CHECK(bnProofOfWorkLimit == savedPow);
+    BOOST_CHECK_EQUAL(nCoinbaseMaturity, savedMaturity);
+    BOOST_CHECK_EQUAL(nTargetSpacing, savedSpacing);
+    BOOST_CHECK_EQUAL(nStakeMinAge, savedStakeAge);
+    BOOST_CHECK_EQUAL(pchMessageStart[0], (unsigned char)savedMsg[0]);
+    BOOST_CHECK_EQUAL(pchMessageStart[3], (unsigned char)savedMsg[3]);
+
+    // (c) idempotence: re-applying in regtest mode keeps the same values
+    fRegTest = savedReg;
+    fTestNet = savedTest;
+    ApplyModeDependentChainParams();
+    ApplyModeDependentChainParams();
+    BOOST_CHECK(bnProofOfWorkLimit == regtestPowLimit);
+    BOOST_CHECK_EQUAL(nCoinbaseMaturity, 1);
+    BOOST_CHECK_EQUAL(GetNextTargetRequired(pindexBest, false), regtestPowLimit.GetCompact());
+}
+
+
 // Diagnostic: how does a non-tip-parent block travel in this regtest client?
 // Records which delivery path accepts a side block (ProcessBlock vs AcceptBlock)
 // so the deep-reorg case below is explicit about what was exercised.

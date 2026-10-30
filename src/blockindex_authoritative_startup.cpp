@@ -204,6 +204,13 @@ int32_t AuthoritativeBaseTipHeight()
 
 bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
 {
+    // PHASE4: this entry point deliberately bypasses legacy LoadBlockIndex(), so
+    // the mode-dependent chain parameters (regtest/testnet PoW limit, stake age,
+    // coinbase maturity, target spacing) must be applied here as well. Without
+    // this call a regtest daemon ran with the MAINNET PoW limit while the test
+    // harness (LoadBlockIndex path) used the regtest limit. Mainnet: no-op.
+    ApplyModeDependentChainParams();
+
     if (g_authoritativeContext)
     {
         if (error) *error = "authoritative startup: already initialized";

@@ -461,6 +461,13 @@ FILE* AppendBlockFile(unsigned int& nFileRet);
 // Close (flush + fclose) the cached block-file append handle (C4). No-op when none open.
 void FCloseBlockFile();
 bool LoadBlockIndex(bool fAllowNew=true);
+
+// PHASE4: mode-dependent chain parameters (regtest/testnet) applied in ONE place
+// so that BOTH startup paths (legacy LoadBlockIndex and V2 authoritative startup
+// via InitBlockIndexAuthoritative) observe identical values. Mainnet is a no-op:
+// the body only acts when fRegTest/fTestNet is set, so mainnet consensus,
+// difficulty limits and chaintrust are untouched. Idempotent.
+void ApplyModeDependentChainParams();
 // PM1-P0-07b (C2-A): the SINGLE canonical genesis-block construction for the
 // active network (mainnet/testnet/regtest). Extracted verbatim from the legacy
 // LoadBlockIndex() genesis-materialisation branch so the native V2 bootstrap and

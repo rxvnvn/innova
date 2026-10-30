@@ -10848,10 +10848,15 @@ bool CreateBlockIndexGenesisBlock(CBlock& block)
     }
 }
 
-bool LoadBlockIndex(bool fAllowNew)
+// PHASE4: single authoritative place for mode-dependent chain parameters.
+// Body is byte-for-byte the block that used to live inline in LoadBlockIndex().
+// It is now also called by InitBlockIndexAuthoritative(), because that path
+// deliberately bypasses LoadBlockIndex() — which is exactly why a regtest daemon
+// used to keep the MAINNET proof-of-work limit (difficulty 0.00024414) while the
+// in-process test harness (which calls LoadBlockIndex directly) mined at the
+// regtest limit (0x207fffff). Mainnet: fRegTest/fTestNet are false -> no-op.
+void ApplyModeDependentChainParams()
 {
-    LOCK(cs_main);
-
     if (fRegTest)
     {
         pchMessageStart[0] = 0xfa;
@@ -10876,6 +10881,13 @@ bool LoadBlockIndex(bool fAllowNew)
         nStakeMinAge = 1 * 60; // test net min age is 1 minute
         nCoinbaseMaturity = 15; // test maturity is 15 blocks
     };
+}
+
+bool LoadBlockIndex(bool fAllowNew)
+{
+    LOCK(cs_main);
+
+    ApplyModeDependentChainParams();
 
     //
     // Load block index: V2 authoritative startup (native genesis bootstrap on a
