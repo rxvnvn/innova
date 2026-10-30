@@ -1791,6 +1791,141 @@ BOOST_AUTO_TEST_CASE(r3i_index_stale_samecount_marker_rebuild_matrix)
     printf("R3-I PASS reconcile matrix (stale/same-count/malformed-marker/torn/restart-equivalence)\n");
 }
 
+
+// =====================================================================
+// IFCN#9 perf — IBD durable-commit batching (-tipcommitbatch)
+//
+// P1  appends inside the window advance the LOGICAL tip and are resolvable
+//     (LookupByHash) while the DURABLE tip.meta stays at the last boundary
+// P2  Close() publishes a residual window (clean shutdown loses nothing)
+// P3  idempotent replay inside the window does not duplicate
+// P4  a crash image taken mid-window reopens at the last committed tip
+//     (nothing torn: the window is RAM-only until the boundary)
+// =====================================================================
+namespace {
+struct TipBatchArgs
+{
+    TipBatchArgs(const char* n, const char* always)
+    {
+        mapArgs["-tipcommitbatch"] = n;
+        if (always) mapArgs["-tipcommitbatchalways"] = always;
+    }
+    ~TipBatchArgs()
+    {
+        mapArgs.erase("-tipcommitbatch");
+        mapArgs.erase("-tipcommitbatchalways");
+    }
+};
+static void AppendExplicit(BlockIndexTipAuthority& tip, uint256 h, uint256 prev,
+                           int height, bool pos)
+{
+    BlockIndexRecord r = MakeRecord(h, prev, height, pos);
+    BlockIndexDerivedEntry d = MakeDerived(h, 2000 + height);
+    BlockIndexTipAppend a; a.record = r; a.derived = d;
+    std::string err;
+    BOOST_REQUIRE(tip.Append(a, height, &err) == BLOCK_INDEX_TIP_OK);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(p_tipbatch_buffers_then_publishes_at_boundary)
+{
+    const std::string dir = MakeTempDir();
+    const std::string crashImage = dir + "-crashimg";
+    const int baseTip = 499;
+    TipBatchArgs args("4", "1");
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 9, 900, baseTip, &tip, NULL));
+        uint256 prev = uint256(0xAA01UL);
+        AppendExplicit(tip, uint256(0xAA02UL), prev, baseTip + 1, true);
+        AppendExplicit(tip, uint256(0xAA03UL), uint256(0xAA02UL), baseTip + 2, false);
+        AppendExplicit(tip, uint256(0xAA04UL), uint256(0xAA03UL), baseTip + 3, true);
+        // logical authority already sees all three...
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 3);
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 3u);
+        BlockIndexTipRead rd = tip.LookupByHash(uint256(0xAA04UL), NULL);
+        BOOST_REQUIRE(rd.status == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE_EQUAL(rd.height, baseTip + 3);
+        // ...while the durable commit point has not moved: copy the datadir as a crash image
+        fs::remove_all(crashImage);
+        fs::copy(dir, crashImage, fs::copy_options::recursive);
+        // the 4th append reaches the boundary and publishes ONE durable batch
+        AppendExplicit(tip, uint256(0xAA05UL), uint256(0xAA04UL), baseTip + 4, false);
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 4);
+    }
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 9, &tip, NULL));
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 4);
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 4u);
+        BOOST_REQUIRE(tip.TipHash() == uint256(0xAA05UL));
+    }
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Open(crashImage, 9, &tip, NULL));
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip);   // last committed boundary only
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 0u);
+        BOOST_REQUIRE(tip.LookupByHash(uint256(0xAA04UL), NULL).status ==
+                      BLOCK_INDEX_TIP_NOT_FOUND);
+    }
+    printf("P1 PASS batched window: logical tip advances, durable boundary moves once per N\n");
+}
+
+BOOST_AUTO_TEST_CASE(p_tipbatch_close_flushes_window)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 20;
+    {
+        TipBatchArgs args("1000", "1");
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 3, 40, baseTip, &tip, NULL));
+        AppendExplicit(tip, uint256(0xBB01UL), uint256(0xBB00UL), baseTip + 1, true);
+        AppendExplicit(tip, uint256(0xBB02UL), uint256(0xBB01UL), baseTip + 2, false);
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 2);
+        // window still open: nothing durable yet; Close() must publish it
+        tip.Close();
+    }
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 3, &tip, NULL));
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 2);   // Close() flushed it
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 2u);
+    }
+    printf("P2 PASS close publishes the residual window\n");
+}
+
+BOOST_AUTO_TEST_CASE(p_tipbatch_idempotent_replay_inside_window)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 60;
+    TipBatchArgs args("8", "1");
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 4, 80, baseTip, &tip, NULL));
+    AppendExplicit(tip, uint256(0xCC01UL), uint256(0xCC00UL), baseTip + 1, true);
+    AppendExplicit(tip, uint256(0xCC01UL), uint256(0xCC00UL), baseTip + 1, true); // replay
+    BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 1u);
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 1);
+    printf("P3 PASS replay inside the window is a no-op\n");
+}
+
+BOOST_AUTO_TEST_CASE(p_tipbatch_rejects_nondense_inside_window)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 80;
+    TipBatchArgs args("8", "1");
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 4, 100, baseTip, &tip, NULL));
+    AppendExplicit(tip, uint256(0xDD01UL), uint256(0xDD00UL), baseTip + 1, true);
+    // a gap must be refused exactly like the per-block path
+    BlockIndexRecord r = MakeRecord(uint256(0xDD03UL), uint256(0xDD02UL), baseTip + 3, false);
+    BlockIndexDerivedEntry d = MakeDerived(uint256(0xDD03UL), 1);
+    BlockIndexTipAppend a; a.record = r; a.derived = d;
+    std::string err;
+    BOOST_REQUIRE(tip.Append(a, baseTip + 3, &err) == BLOCK_INDEX_TIP_CORRUPT);
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 1);
+    printf("P4 PASS non-dense append rejected inside the window\n");
+}
+
 BOOST_AUTO_TEST_SUITE_END()
 
 // =====================================================================

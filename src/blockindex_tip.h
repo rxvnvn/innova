@@ -212,6 +212,11 @@ public:
 
     // Atomic batch append (multiple blocks, single fsync per store). Used by
     // deep reorg catch-up / restart replay. activeHeights[i] -1 means side.
+    // IFCN#9 perf: publish the IBD in-memory append window with ONE durable
+    // batch (idempotent; no-op when empty). Called at the batch boundary, before
+    // any authority transition, and on Close().
+    BlockIndexTipStatus FlushPendingAppends(std::string* error);
+
     BlockIndexTipStatus AppendBatch(const std::vector<BlockIndexTipAppend>& blocks,
                                     const std::vector<int32_t>& activeHeights,
                                     std::string* error);

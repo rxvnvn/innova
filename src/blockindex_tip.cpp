@@ -7,6 +7,7 @@
 #include "blockindex_hashindex.h"
 
 #include "util.h"
+#include "main.h"
 
 #include <boost/filesystem.hpp>
 #include <fcntl.h>
@@ -1009,6 +1010,27 @@ struct BlockIndexTipAuthority::Impl
 
     bool open;
 
+    // ---- IFCN#9 perf: IBD durable-commit batching (in-memory window) --------
+    // During IBD the per-block durable commit costs ~10 fsync/rename on the tip
+    // stores, which on a spinning disk dominates the whole block pipeline. With
+    // -tipcommitbatch=N (>1) appends are accumulated IN RAM and published with a
+    // single AppendBatch(N) every N blocks: the files are only touched at the
+    // boundary, so a crash mid-window leaves the on-disk state exactly at the
+    // last durable commit (no torn suffix to repair) and at most N blocks of
+    // index progress are re-fetched from blk*.dat. Default 1 = unchanged
+    // per-block publication. Never weakens consensus: validation and the
+    // in-memory authority still see every block immediately (the pending window
+    // answers LookupByHash/TipHeight/TipHash), and the batch path refuses to
+    // advertise durability it has not written.
+    std::vector<BlockIndexTipAppend> pendBlocks;
+    std::vector<int32_t>             pendHeights;
+    std::map<uint256, size_t>        pendIndex;   // hash -> pendBlocks slot
+    int32_t  pendTipHeight = -1;
+    uint256  pendTipHash;
+    uint64_t pendCount = 0;
+    bool     HasPending() const { return !pendBlocks.empty(); }
+    void     DropPending() { pendBlocks.clear(); pendHeights.clear(); pendIndex.clear(); pendTipHeight = -1; pendTipHash = uint256(0); pendCount = 0; }
+
     // C11: the atomically-published immutable committed-tip snapshot. Written
     // ONLY by PublishCommittedSnapshot() via std::atomic_store (release) after a
     // successful durable commit; read via std::atomic_load (acquire) WITHOUT
@@ -1453,6 +1475,24 @@ struct BlockIndexTipAuthority::Impl
     // meta and swap it in with a release store. Readers acquire-load it and
     // therefore synchronize-with this publication, observing one coherent
     // committed state (never a torn hash/height across a concurrent append).
+    // IFCN#9 perf: publish the LOGICAL tip (durable boundary + in-memory pending
+    // window). Consumers of CommittedTipSnapshot() (manager/network sync) must see
+    // the height the node has actually validated, otherwise a lagging snapshot
+    // makes the pipeline re-request and stall. The snapshot is RAM-only: after a
+    // crash it is rebuilt from tip.meta (the durable boundary) at the next Open.
+    void PublishLogicalSnapshot()
+    {
+        std::shared_ptr<BlockIndexCommittedTipSnapshot> s(new BlockIndexCommittedTipSnapshot());
+        const bool hasTip = (pendTipHeight >= 0);
+        s->valid = hasTip ? true : (meta.tipHash != uint256(0));
+        s->tipHeight = hasTip ? pendTipHeight
+                              : (s->valid ? meta.tipHeight : (int32_t)-1);
+        s->tipHash = hasTip ? pendTipHash : meta.tipHash;
+        s->baseGeneration = meta.baseGeneration;
+        std::atomic_store(&committedSnap,
+                          std::shared_ptr<const BlockIndexCommittedTipSnapshot>(s));
+    }
+
     void PublishCommittedSnapshot()
     {
         std::shared_ptr<BlockIndexCommittedTipSnapshot> s(new BlockIndexCommittedTipSnapshot());
@@ -2135,8 +2175,68 @@ BlockIndexTipStatus BlockIndexTipAuthority::Append(const BlockIndexTipAppend& bl
                                                    int32_t activeHeight,
                                                    std::string* error)
 {
+    Impl* i = impl;
+    // IFCN#9 perf: during IBD buffer appends in RAM and publish them with one
+    // durable batch every -tipcommitbatch blocks (default 1 -> unchanged path).
+    int64_t batchN = 1;
+    if (mapArgs.count("-tipcommitbatch"))
+    {
+        int64_t parsed = 1;
+        if (ParseInt64(mapArgs["-tipcommitbatch"], &parsed) && parsed > 1)
+            batchN = parsed;
+    }
+    if (batchN > 1 &&
+        (IsInitialBlockDownload() || GetBoolArg("-tipcommitbatchalways", false)))
+    {
+        if (!i->open)
+            return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
+        // Idempotent replay: an already-buffered or already-durable hash is a no-op.
+        if (i->pendIndex.count(blk.record.hash))
+            return BLOCK_INDEX_TIP_OK;
+        BlockIndexId alreadyId = 0;
+        if (i->sideIndex.Lookup(blk.record.hash, &alreadyId, NULL) ==
+                BLOCK_INDEX_HASH_LOOKUP_FOUND &&
+            alreadyId > i->meta.baseRecordCount &&
+            (alreadyId - i->meta.baseRecordCount - 1) < i->recordsWin.Count())
+            return BLOCK_INDEX_TIP_OK;
+        const int32_t logicalTip = i->HasPending() ? i->pendTipHeight : i->meta.tipHeight;
+        if (activeHeight >= 0 && activeHeight != logicalTip + 1)
+            return SetError(error, "non-dense active append (pending)"), BLOCK_INDEX_TIP_CORRUPT;
+        i->pendIndex[blk.record.hash] = i->pendBlocks.size();
+        i->pendBlocks.push_back(blk);
+        i->pendHeights.push_back(activeHeight);
+        if (activeHeight >= 0)
+        {
+            i->pendTipHeight = activeHeight;
+            i->pendTipHash = blk.record.hash;
+        }
+        i->pendCount = (i->HasPending() ? i->pendBlocks.size() : 0);
+        i->PublishLogicalSnapshot();
+        if ((int64_t)i->pendBlocks.size() >= batchN)
+            return FlushPendingAppends(error);
+        return BLOCK_INDEX_TIP_OK;
+    }
     std::vector<BlockIndexTipAppend> blocks(1, blk);
     std::vector<int32_t> heights(1, activeHeight);
+    return AppendBatch(blocks, heights, error);
+}
+
+// Publish the buffered IBD window with ONE durable AppendBatch. Called at the
+// batch boundary, before any authority transition (reorg/truncate/operator
+// intent), on shutdown, and on leaving IBD.
+BlockIndexTipStatus BlockIndexTipAuthority::FlushPendingAppends(std::string* error)
+{
+    Impl* i = impl;
+    if (!i->HasPending())
+    {
+        ClearError(error);
+        return BLOCK_INDEX_TIP_OK;
+    }
+    std::vector<BlockIndexTipAppend> blocks;
+    std::vector<int32_t> heights;
+    blocks.swap(i->pendBlocks);
+    heights.swap(i->pendHeights);
+    i->DropPending();
     return AppendBatch(blocks, heights, error);
 }
 
@@ -2155,6 +2255,13 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     std::vector<BlockIndexDerivedEntry> newDerived;
     std::vector<BlockIndexId> newActive;
 
+    // IFCN#9 perf: the density contract is "each active append is exactly one
+    // above the previous ACTIVE height of this batch". The old check compared
+    // every element against the unchanged committed meta.tipHeight, which made a
+    // batch of more than one active block impossible (it was only ever called
+    // with a single block). Track the expected height locally instead: the
+    // sequence is still strictly dense and any gap/reorder is refused.
+    int32_t expectedActive = i->meta.tipHeight;
     for (size_t k = 0; k < blocks.size(); ++k)
     {
         // Idempotent replay check via the durable side index (O(log N) LevelDB
@@ -2169,9 +2276,10 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         const int32_t ah = activeHeights[k];
         if (ah >= 0)
         {
-            // must be dense next active height +1 over committed tip
-            if (ah != i->meta.tipHeight + 1)
+            // must be the dense next active height within this batch
+            if (ah != expectedActive + 1)
                 return SetError(error, "non-dense active append"), BLOCK_INDEX_TIP_CORRUPT;
+            expectedActive = ah;
         }
         newRecords.push_back(blocks[k].record);
         newDerived.push_back(blocks[k].derived);
@@ -2402,6 +2510,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
 
 BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std::string* error)
 {
+    if (impl->HasPending())
+    {
+        BlockIndexTipStatus fst = FlushPendingAppends(error);
+        if (fst != BLOCK_INDEX_TIP_OK) return fst;
+    }
     if (!impl->open)
         return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
     Impl* i = impl;
@@ -2516,6 +2629,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     const std::vector<int32_t>& branchHeights,
     std::string* error)
 {
+    if (impl->HasPending())
+    {
+        BlockIndexTipStatus fst = FlushPendingAppends(error);
+        if (fst != BLOCK_INDEX_TIP_OK) return fst;
+    }
     if (!impl->open)
         return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
     if (branch.size() != branchHeights.size())
@@ -2801,6 +2919,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
     const std::vector<int32_t>& branchHeights,
     std::string* error)
 {
+    if (impl->HasPending())
+    {
+        BlockIndexTipStatus fst = FlushPendingAppends(error);
+        if (fst != BLOCK_INDEX_TIP_OK) return fst;
+    }
     if (!impl->open)
         return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
     if (branch.size() != branchHeights.size())
@@ -3121,6 +3244,22 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
     // callers that hold NO cs_main (authoritative checkpoint resolver).
     Impl* i = impl;
     LOCK(i->csTailLock);
+    // IFCN#9 perf: the IBD pending window answers BEFORE the durable stores, so
+    // parent/residency resolution sees accepted-but-not-yet-published blocks.
+    {
+        std::map<uint256, size_t>::const_iterator pit = i->pendIndex.find(hash);
+        if (pit != i->pendIndex.end())
+        {
+            const BlockIndexTipAppend& pa = i->pendBlocks[pit->second];
+            r.status  = BLOCK_INDEX_TIP_OK;
+            r.record  = pa.record;
+            r.derived = pa.derived;
+            r.active  = (i->pendHeights[pit->second] >= 0);
+            r.height  = i->pendHeights[pit->second];
+            if (error) error->clear();
+            return r;
+        }
+    }
     // Repair #3: the durable side index answers the hash -> RecordId mapping
     // (O(log N) LevelDB lookup; never an O(N) RAM map or scan). Slot
     // arithmetic (id == baseRecordCount + slot + 1) is unchanged.
@@ -3569,10 +3708,24 @@ int32_t BlockIndexTipAuthority::GetExternalProtectedFloorForResolve(const BlockI
     return t.impl->externalProtectedFloor;
 }
 // -----------------------------------------------------------------------------
-bool BlockIndexTipAuthority::IsEmpty() const { LOCK(impl->csTailLock); return impl->open && impl->meta.tipRecordCount == 0; }
-int32_t BlockIndexTipAuthority::TipHeight() const { LOCK(impl->csTailLock); return impl->meta.tipHeight; }
-uint256 BlockIndexTipAuthority::TipHash() const { LOCK(impl->csTailLock); return impl->meta.tipHash; }
-uint64_t BlockIndexTipAuthority::TipRecordCount() const { LOCK(impl->csTailLock); return impl->meta.tipRecordCount; }
+bool BlockIndexTipAuthority::IsEmpty() const { LOCK(impl->csTailLock); return impl->open && impl->meta.tipRecordCount == 0 && !impl->HasPending(); }
+int32_t BlockIndexTipAuthority::TipHeight() const
+{
+    LOCK(impl->csTailLock);
+    if (impl->HasPending() && impl->pendTipHeight >= 0) return impl->pendTipHeight;
+    return impl->meta.tipHeight;
+}
+uint256 BlockIndexTipAuthority::TipHash() const
+{
+    LOCK(impl->csTailLock);
+    if (impl->HasPending() && impl->pendTipHeight >= 0) return impl->pendTipHash;
+    return impl->meta.tipHash;
+}
+uint64_t BlockIndexTipAuthority::TipRecordCount() const
+{
+    LOCK(impl->csTailLock);
+    return impl->meta.tipRecordCount + (impl->HasPending() ? (uint64_t)impl->pendBlocks.size() : 0);
+}
 uint8_t BlockIndexTipAuthority::ActiveFence() const { LOCK(impl->csTailLock); return impl->meta.activeFence; }
 
 // ---- v2 durable operator-invalid authority ----
@@ -3601,6 +3754,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
                                                                bool invalidate,
                                                                std::string* error)
 {
+    if (impl->HasPending())
+    {
+        BlockIndexTipStatus fst = FlushPendingAppends(error);
+        if (fst != BLOCK_INDEX_TIP_OK) return fst;
+    }
     if (!impl->open)
         return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
     Impl* i = impl;
@@ -3669,6 +3827,15 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
 
 void BlockIndexTipAuthority::Close()
 {
+    // IFCN#9 perf: publish a residual IBD window before closing. Best effort by
+    // design: if it fails, the durable state stays at the last committed batch
+    // and the missing blocks are re-fetched on the next start (they are already
+    // in blk*.dat).
+    if (impl->HasPending())
+    {
+        std::string ferr;
+        FlushPendingAppends(&ferr);
+    }
     impl->open = false;
     // Repair #3: release the bounded windows' file handles and the LevelDB
     // side index handle (Close is idempotent, same as before).
