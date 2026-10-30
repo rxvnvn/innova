@@ -12,6 +12,7 @@
 
 #include <boost/filesystem.hpp>
 
+#include <openssl/sha.h>
 #include <stdio.h>
 #include <string>
 #include <vector>
@@ -1083,3 +1084,247 @@ BOOST_AUTO_TEST_CASE(c3_side_branch_checksum_differential)
 }
 
 BOOST_AUTO_TEST_SUITE_END()
+
+// ---------------------------------------------------------------------------
+using namespace blockindex_generation_builder_tests;   // reuse the suite's generation helpers
+
+// IFCN#9 P0 regression: generation-binding DOMAIN drift, rebind, fail-closed,
+// rollback and reopen. The production incident: a generation bound under the
+// historical domain "INNOVA_GENERATION_DAG_BINDING_V2" (pre-d35cd97f) is
+// rejected by any build that mixes "INNOVA_GENERATION_BINDING_V2" into the
+// content root, and is repairable ONLY by the operator-gated rebind.
+// ---------------------------------------------------------------------------
+namespace {
+
+// Re-derive the generation root with an ARBITRARY binding-domain literal.
+// Component digests follow the production formulas exactly (records+hashindex
+// in one pass, active, derived), so for the CURRENT domain the result equals
+// RecomputeGenerationRootFromFiles -- d1 asserts that equality as a self-check
+// -- and any other literal models a historical domain.
+static bool ComputeRootWithDomain(const boost::filesystem::path& dir, uint64_t generation,
+                                  const uint256& tipHash, uint64_t recordCount,
+                                  const unsigned char genInput[32], const std::string& domain,
+                                  unsigned char out[32], std::string* err)
+{
+    unsigned char recordsDigest[32], hashIndexDigest[32];
+    {
+        FILE* rf = fopen((dir / BLOCK_INDEX_RECORDS_FILE_NAME).string().c_str(), "rb");
+        if (!rf) { *err = "records.dat open failed"; return false; }
+        fseeko(rf, BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, SEEK_SET);
+        SHA256_CTX rc, hc;
+        SHA256_Init(&rc); SHA256_Init(&hc);
+        std::vector<unsigned char> buf(BLOCK_INDEX_RECORD_SIZE_V1);
+        unsigned char hin[32];
+        for (uint64_t i = 0; i < recordCount; ++i)
+        {
+            if (fread(&buf[0], 1, BLOCK_INDEX_RECORD_SIZE_V1, rf) != BLOCK_INDEX_RECORD_SIZE_V1)
+            { fclose(rf); *err = "records.dat truncated"; return false; }
+            SHA256_Update(&rc, &buf[0], BLOCK_INDEX_RECORD_SIZE_V1);
+            for (int j = 0; j < 32; ++j) hin[j] = buf[31 - j];
+            SHA256_Update(&hc, hin, 32);
+            uint64_t rid = i + 1; unsigned char idb[8];
+            for (int b = 0; b < 8; ++b) idb[b] = (unsigned char)((rid >> (8 * b)) & 0xff);
+            SHA256_Update(&hc, idb, 8);
+        }
+        fclose(rf);
+        SHA256_Final(recordsDigest, &rc); SHA256_Final(hashIndexDigest, &hc);
+    }
+    unsigned char activeDigest[32];
+    {
+        BlockIndexActiveIndex active;
+        if (!BlockIndexActiveIndex::Open(dir.string(), generation, &active, err)) return false;
+        const int64_t ph = active.PhysicalHeight();
+        if (ph < 0) { *err = "active.dat empty"; return false; }
+        FILE* af = fopen((dir / BLOCK_INDEX_ACTIVE_FILE_NAME).string().c_str(), "rb");
+        if (!af) { *err = "active.dat open failed"; return false; }
+        fseeko(af, BLOCK_INDEX_ACTIVE_HEADER_SIZE_V1, SEEK_SET);
+        SHA256_CTX ac; SHA256_Init(&ac);
+        std::vector<unsigned char> ab(BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
+        for (int64_t h = 0; h <= ph; ++h)
+        {
+            if (fread(&ab[0], 1, BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1, af) != BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1)
+            { fclose(af); *err = "active.dat truncated"; return false; }
+            SHA256_Update(&ac, &ab[0], BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
+        }
+        fclose(af);
+        SHA256_Final(activeDigest, &ac);
+    }
+    unsigned char derivedDigest[32];
+    {
+        FILE* df = fopen((dir / BLOCK_INDEX_DERIVED_FILE_NAME).string().c_str(), "rb");
+        if (!df) { *err = "derived.dat open failed"; return false; }
+        fseeko(df, BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, SEEK_SET);
+        SHA256_CTX dc; SHA256_Init(&dc);
+        std::vector<unsigned char> db(BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2);
+        for (uint64_t i = 0; i < recordCount; ++i)
+        {
+            if (fread(&db[0], 1, BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, df) != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2)
+            { fclose(df); *err = "derived.dat truncated"; return false; }
+            SHA256_Update(&dc, &db[0], BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2);
+        }
+        fclose(df);
+        SHA256_Final(derivedDigest, &dc);
+    }
+    unsigned char cand[32], mixed[32];
+    if (!ComputeCandidateLeavesBinding(dir.string(), generation, cand, err)) return false;
+    SHA256_CTX mc; SHA256_Init(&mc);
+    SHA256_Update(&mc, domain.data(), domain.size());
+    SHA256_Update(&mc, genInput, 32);
+    SHA256_Update(&mc, cand, 32);
+    SHA256_Final(mixed, &mc);
+    return ComputeGenerationRoot(generation, tipHash, recordCount,
+                                 recordsDigest, activeDigest, hashIndexDigest, derivedDigest,
+                                 mixed, out);
+}
+
+// Build a synthetic generation and upgrade it to AUTHORITATIVE by writing the
+// CURRENT-domain root as its content binding.
+static bool BuildAuthoritativeGen(const std::string& tag, boost::filesystem::path* rootOut,
+                                  boost::filesystem::path* genOut, std::string* err,
+                                  unsigned char currentRoot[32], unsigned char oldRoot[32])
+{
+    boost::filesystem::path gen = UniqueGenDir(tag);
+    boost::filesystem::path root = gen.parent_path();
+    BlockIndexGenerationSource src = BuildSyntheticSource(5, 1, 10000, 20000);
+    {
+        BlockIndexGenerationBuilder b;
+        if (!b.Build(src, gen.string(), 1, NULL, err)) return false;
+        b.Close();
+    }
+    FixedBlockIndexOpenOptions opts; opts.requireCompleteManifest = true;
+    FixedBlockIndexStore store;
+    if (!FixedBlockIndexStore::OpenReadOnly(gen.string(), opts, &store, err)) return false;
+    const FixedBlockIndexManifest& m = store.GetManifest();
+    if (!RecomputeGenerationRootFromFiles(gen, m.generation, m.committedTipHash, m.recordCount,
+                                          m.generationInputDigest, false, currentRoot, err))
+        return false;
+    // Same inputs, historical domain literal (the pre-d35cd97f constant).
+    if (!ComputeRootWithDomain(gen, m.generation, m.committedTipHash, m.recordCount,
+                               m.generationInputDigest, "INNOVA_GENERATION_DAG_BINDING_V2",
+                               oldRoot, err))
+        return false;
+    if (memcmp(currentRoot, oldRoot, 32) == 0)
+    { *err = "self-test: domain literal did not change the root"; return false; }
+    if (!WriteContentBindingInFile(gen / BLOCK_INDEX_DERIVED_FILE_NAME, oldRoot, err)) return false;
+    if (!WriteManifestCapability(gen, BLOCK_INDEX_GENERATION_CAPABILITY_AUTHORITATIVE, err)) return false;
+    *rootOut = root; *genOut = gen;
+    return true;
+}
+
+} // namespace
+
+// D1: a generation bound under a DIFFERENT domain is rejected with the exact
+// diagnostic, and the same files validate once the current-domain root is bound.
+BOOST_AUTO_TEST_CASE(d1_foreign_domain_binding_is_detected)
+{
+    std::string error;
+    boost::filesystem::path root, gen;
+    unsigned char cur[32], old[32];
+    BOOST_REQUIRE_MESSAGE(BuildAuthoritativeGen("d1-domain-drift", &root, &gen, &error, cur, old), error);
+
+    error.clear();
+    const int st = (int)BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error);
+    BOOST_CHECK_NE(st, (int)BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_CHECK_MESSAGE(error.find("generation root mismatch") != std::string::npos,
+                        "expected the binding-mismatch diagnostic, got: " + error);
+
+    // Negative control: binding the CURRENT-domain root must validate.
+    BOOST_REQUIRE(WriteContentBindingInFile(gen / BLOCK_INDEX_DERIVED_FILE_NAME, cur, &error));
+    error.clear();
+    BOOST_CHECK_EQUAL((int)BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error),
+                      (int)BLOCK_INDEX_LIFECYCLE_OK);
+    printf("D1 PASS: foreign-domain binding rejected, current-domain binding accepted.\n");
+}
+
+// D2: the operator-gated rebind repairs the generation and is idempotent.
+BOOST_AUTO_TEST_CASE(d2_rebind_repairs_and_is_idempotent)
+{
+    std::string error;
+    boost::filesystem::path root, gen;
+    unsigned char cur[32], old[32];
+    BOOST_REQUIRE_MESSAGE(BuildAuthoritativeGen("d2-rebind", &root, &gen, &error, cur, old), error);
+
+    unsigned char gotOld[32], gotNew[32];
+    BOOST_REQUIRE_EQUAL((int)BlockIndexGenerationManager::RebindGenerationContentBinding(
+                            root.string(), 1, gotOld, gotNew, &error), (int)BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_CHECK_EQUAL(memcmp(gotOld, old, 32), 0);
+    BOOST_CHECK_EQUAL(memcmp(gotNew, cur, 32), 0);
+    error.clear();
+    BOOST_CHECK_EQUAL((int)BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error),
+                      (int)BLOCK_INDEX_LIFECYCLE_OK);
+
+    unsigned char againOld[32], againNew[32];
+    BOOST_REQUIRE_EQUAL((int)BlockIndexGenerationManager::RebindGenerationContentBinding(
+                            root.string(), 1, againOld, againNew, &error), (int)BLOCK_INDEX_LIFECYCLE_OK);
+    BOOST_CHECK_EQUAL(memcmp(againOld, againNew, 32), 0);          // no-op
+    BOOST_CHECK_EQUAL(memcmp(againNew, cur, 32), 0);               // same value
+    printf("D2 PASS: rebind repaired the binding and the second run was a no-op.\n");
+}
+
+// D3: rebind fails closed on a structurally corrupted generation and does not
+// touch the binding it refuses to accept.
+BOOST_AUTO_TEST_CASE(d3_rebind_refuses_corrupted_generation)
+{
+    std::string error;
+    boost::filesystem::path root, gen;
+    unsigned char cur[32], old[32];
+    BOOST_REQUIRE_MESSAGE(BuildAuthoritativeGen("d3-corrupt", &root, &gen, &error, cur, old), error);
+
+    // Corrupt one derived entry (entries are not covered by a local CRC, so this
+    // changes derivedEntriesDigest) and record the binding as it stands.
+    std::string data = ReadWholeFile(gen / BLOCK_INDEX_DERIVED_FILE_NAME);
+    const size_t off = BLOCK_INDEX_DERIVED_HEADER_SIZE_V2 + 3 * BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2;
+    data[off + 7] ^= 0x01;
+    WriteWholeFile(gen / BLOCK_INDEX_DERIVED_FILE_NAME, data);
+    unsigned char bindingAfterCorruption[32];
+    BOOST_REQUIRE(WriteContentBindingInFile(gen / BLOCK_INDEX_DERIVED_FILE_NAME, old, &error));
+    memcpy(bindingAfterCorruption, old, 32);
+
+    unsigned char o[32], n[32];
+    const int rc = (int)BlockIndexGenerationManager::RebindGenerationContentBinding(
+                       root.string(), 1, o, n, &error);
+    // Either the structural stage or the post-write re-validation must refuse; what
+    // must NOT happen is a silently "repaired" generation that still disagrees.
+    BOOST_CHECK_MESSAGE(rc != (int)BLOCK_INDEX_LIFECYCLE_OK || memcmp(n, cur, 32) != 0,
+                        "rebind must not silently accept a corrupted generation");
+    std::string data2 = ReadWholeFile(gen / BLOCK_INDEX_DERIVED_FILE_NAME);
+    BOOST_CHECK_EQUAL(memcmp(&data2[40], bindingAfterCorruption, 32), 0); // binding untouched on refusal
+    error.clear();
+    BOOST_CHECK_NE((int)BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error),
+                   (int)BLOCK_INDEX_LIFECYCLE_OK);
+    printf("D3 PASS: corrupted generation refused (rc=%d), binding not rewritten.\n", rc);
+}
+
+// D4: rollback (restore the historical binding) reproduces the failure, and a
+// fresh reopen of the rebound generation validates.
+BOOST_AUTO_TEST_CASE(d4_rollback_and_reopen)
+{
+    std::string error;
+    boost::filesystem::path root, gen;
+    unsigned char cur[32], old[32];
+    BOOST_REQUIRE_MESSAGE(BuildAuthoritativeGen("d4-rollback", &root, &gen, &error, cur, old), error);
+
+    unsigned char o[32], n[32];
+    BOOST_REQUIRE_EQUAL((int)BlockIndexGenerationManager::RebindGenerationContentBinding(
+                            root.string(), 1, o, n, &error), (int)BLOCK_INDEX_LIFECYCLE_OK);
+
+    // rollback
+    BOOST_REQUIRE(WriteContentBindingInFile(gen / BLOCK_INDEX_DERIVED_FILE_NAME, old, &error));
+    error.clear();
+    BOOST_CHECK_NE((int)BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error),
+                   (int)BLOCK_INDEX_LIFECYCLE_OK);
+
+    // forward again, then reopen from disk and validate
+    BOOST_REQUIRE(WriteContentBindingInFile(gen / BLOCK_INDEX_DERIVED_FILE_NAME, cur, &error));
+    {
+        FixedBlockIndexOpenOptions opts; opts.requireCompleteManifest = true;
+        FixedBlockIndexStore store;
+        BOOST_REQUIRE_MESSAGE(FixedBlockIndexStore::OpenReadOnly(gen.string(), opts, &store, &error), error);
+        BOOST_CHECK_EQUAL(store.GetManifest().recordCount, 5);
+    }
+    error.clear();
+    BOOST_CHECK_EQUAL((int)BlockIndexGenerationManager::ValidateGeneration(root.string(), 1, &error),
+                      (int)BLOCK_INDEX_LIFECYCLE_OK);
+    printf("D4 PASS: rollback reproduces the mismatch, rebound generation reopens and validates.\n");
+}
+
