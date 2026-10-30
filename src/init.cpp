@@ -144,6 +144,31 @@ void Shutdown(void* parg)
         fShutdown = true;
         ShutdownCPUMining();
 
+        // IFCN#9 S5 (F-7): commit a pending Store3A batch before the process leaves. Without this
+        // a GRACEFUL stop left the pages of an applied-but-uncommitted batch behind with no
+        // MANIFEST, and the next start had to recover from generation 0 (and, before the S5 fix,
+        // could not open the datadir at all). cs_main excludes a concurrent ConnectBlock /
+        // Disconnect from mutating the batch while it is published. A failure is reported, never
+        // hidden: the next start rolls back to the committed generation and replays the chain.
+        {
+            LOCK(cs_main);
+            if (s16::g_chainObserve.store != NULL && s16::g_chainObserve.store->opened() &&
+                !s16::g_chainObserve.pending.empty())
+            {
+                const size_t nPending = s16::g_chainObserve.pending.size();
+                if (s16::g_chainObserve.FlushPending())
+                {
+                    printf("Shutdown: Store3A pending batch committed (%d block(s))\n", (int)nPending);
+                }
+                else
+                {
+                    printf("Shutdown: Store3A pending-batch flush FAILED after %d block(s): %s\n",
+                           (int)nPending, s16::g_chainObserve.lastOpError.c_str());
+                }
+                fflush(stdout);
+            }
+        }
+
         if (fHybridSPV && pwalletMain)
         {
             printf("Saving SPV UTXO cache...\n");
@@ -2054,7 +2079,11 @@ authoritative_startup_ready:
             // owned by the P2 EMPTY_DATADIR block below, which fails closed unless the loaded
             // best chain is exactly genesis. Reconciling an empty store instead walks the chain
             // backwards to a height it does not have ("cannot read block at h=0").
-            if (pindexBest->nHeight != stH && stH >= 0)
+            // IFCN#9 S5: an EMPTY store (stH < 0) paired with a NON-genesis chain is recoverable
+            // by replay from height 1 (see ReconcileStore3AToChain case B); a genesis-only chain
+            // keeps the P2 empty-datadir path below unchanged. Before this, the only outcome for
+            // such a datadir was "refusing to start on an ambiguous empty store".
+            if (pindexBest->nHeight != stH && (stH >= 0 || pindexBest->nHeight > 0))
             {
                 std::string rerr;
                 printf("S2.1 store reconcile: store h=%d, chain h=%d -- reconciling before startup checks\n",

@@ -6457,7 +6457,12 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
     }
     // B) store BEHIND the chain (a crash inside a batch): replay the already-validated blocks.
     if (sh < chainH) {
-        const int32_t from = sh + 1;
+        // IFCN#9 S5: an EMPTY store (tip < 0) is replayed from height 1. Genesis is never a UTXO
+        // event in this model (its outputs are the initial supply, spent only by later blocks) and
+        // it has no block file to read, so starting at height 0 failed with "cannot read block at
+        // h=0" -- which is exactly why an empty store could never be reconciled after a crash that
+        // rolled the store back to generation 0.
+        const int32_t from = (sh < 0) ? 1 : sh + 1;
         std::vector<cs::store3a::CommitStore3A::BatchBlock> batch;
         const size_t kReplayBatch = 2000;
         s16_ReplayOverlay overlay;   // prevouts created inside this window

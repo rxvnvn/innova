@@ -507,7 +507,13 @@ static void test_r2_fresh_open(){
     { CommitStore3A s; bool ok=s.open(d1,&e); CHECK(ok, "R2-01 fresh open: "+e.str());
       CHECK(s.generation()==0, "R2-01 fresh generation 0");
       CHECK(fexists(d1+"/tree.dat") && fsz(d1+"/tree.dat")==4096, "R2-01 empty sentinel page created (4096 B)");
-      CHECK(!fexists(d1+"/MANIFEST"), "R2-01 no MANIFEST before first publish"); s.close(); }
+      // IFCN#9 S5 (F-7/F-4): a fresh store is BORN COMMITTED. Generation 0 records the
+      // known-empty state, so residue written later (a pending batch that never paid a barrier,
+      // or a crash inside the very first commit) is provably UNCOMMITTED: it can be rolled back
+      // to this generation and replayed instead of making the datadir permanently unopenable.
+      // A directory with NO pointer at all but WITH prior-store evidence still fails closed.
+      CHECK(fexists(d1+"/MANIFEST") && fexists(d1+"/ACK"), "R2-01 generation-0 MANIFEST+ACK written at creation");
+      CHECK(s.tipHeight()==-1 && s.undoCommittedBytes()==0, "R2-01 generation 0 describes the empty state"); s.close(); }
     // R2-02 fresh store restarts correctly (byte-identical)
     { Hash dg=fdig(d1+"/tree.dat"); long sz=fsz(d1+"/tree.dat");
       CommitStore3A s; bool ok=s.open(d1,&e); CHECK(ok,"R2-02 restart: "+e.str());
@@ -1253,14 +1259,30 @@ static void test_r1_fresh_open_matrix(){
         CommitStore3A s; bool ok=s.open(d,&e); CHECK(!ok, "D7 unreadable undo.dat -> FAIL CLOSED: "+e.str());
         ::chmod((d+"/undo.dat").c_str(),0644); CHECK(FSZ(d+"/undo.dat")==0, "D7 file untouched (still empty)"); }
       else printf("  D7 note: running as root; EACCES path not exercised\n"); }
-    // D8 nonempty undo.dat beside an ACCEPTED empty sentinel tree.dat -> still FAIL CLOSED
+    // D8 nonempty undo.dat beside an EMPTY sentinel tree.dat with NO POINTER AT ALL -> still FAIL
+    // CLOSED. Since S5 a fresh store is born with a generation-0 pointer, so the pointer-less
+    // shape is constructed explicitly here (it is the shape an older build, or a store whose
+    // pointer was lost, leaves behind): prior-store evidence with no pointer must never be
+    // presented as fresh genesis.
     { std::string d=freshDir("r1_d8"); { CommitStore3A s; CHECK(s.open(d,&e),"D8 sentinel open: "+e.str()); s.close(); }
       CHECK(FSZ(d+"/tree.dat")==4096, "D8 empty sentinel tree.dat present");
+      CHECK(unlink((d+"/MANIFEST").c_str())==0 && unlink((d+"/ACK").c_str())==0, "D8 drop the generation-0 pointer");
       CHECK(r1PlantValidUndo(d,"d8",&e), "D8 plant nonempty undo.dat");
       long ts=FSZ(d+"/tree.dat"), us=FSZ(d+"/undo.dat"); Hash th=fdig(d+"/tree.dat"), uh=fdig(d+"/undo.dat");
       CommitStore3A s; bool ok=s.open(d,&e);
       CHECK(!ok, "D8 nonempty orphan undo.dat beside an accepted empty tree -> FAIL CLOSED: "+e.str());
       CHECK(FSZ(d+"/tree.dat")==ts && fdig(d+"/tree.dat")==th && FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "D8 nothing modified");
+      if(ok) s.close(); }
+    // D8b with the generation-0 pointer PRESENT an orphan undo tail is INERT (S5 recovery
+    // contract: MANIFEST.undoSize stays the sole authority, the tail is never interpreted and
+    // never rewritten). This is the exact F-4 residue shape seen on disk after a SIGKILL.
+    { std::string d=freshDir("r1_d8b"); { CommitStore3A s; CHECK(s.open(d,&e),"D8b sentinel open: "+e.str()); s.close(); }
+      CHECK(r1PlantValidUndo(d,"d8b",&e), "D8b plant nonempty undo.dat beside the gen-0 pointer");
+      long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat");
+      CommitStore3A s; bool ok=s.open(d,&e);
+      CHECK(ok, "D8b orphan undo tail beside generation 0 is INERT (opens): "+e.str());
+      CHECK(ok && s.generation()==0 && s.tipHeight()==-1 && s.undoCommittedBytes()==0, "D8b store still the empty committed generation");
+      CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "D8b orphan tail preserved byte-identically (nothing deleted, nothing overwritten)");
       if(ok) s.close(); }
     // D9 undo.dat + MANIFEST.bak only / D10 undo.dat + ACK only -> the existing pointer rules fire
     { std::string d=freshDir("r1_d9"); CHECK(mkStore6(d,&e),"D9 build"); CHECK(CPFILE(d+"/MANIFEST.bak",d+"/bak.keep"),"D9 keep bak copy");
@@ -1298,12 +1320,13 @@ static void test_r1_fresh_open_matrix(){
       CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK") && !fexists(d+"/tree.dat"), "D14 no file invented and nothing quarantined"); }
     // R1-30 + TOCTOU: a file appearing/disappearing between classification and the first write fails closed
     { std::string d=freshDir("r1_t1"); CommitStore3A s; CHECK(s.open(d,&e), "T1 fresh open (undo.dat classified absent)");
+      Hash mGen0=fdig(d+"/MANIFEST"), aGen0=fdig(d+"/ACK");
       writeJunk(d+"/undo.dat","APPEARED-AFTER-CLASSIFICATION");
       long us=FSZ(d+"/undo.dat"); Hash uh=fdig(d+"/undo.dat");
       bool ok=PUBH(s,1,0,0,3,&e);
       CHECK(!ok, "T1 TOCTOU: first publish fails closed when undo.dat appears after classification: "+e.str());
       CHECK(FSZ(d+"/undo.dat")==us && fdig(d+"/undo.dat")==uh, "T1 the appeared file was NOT overwritten");
-      CHECK(!fexists(d+"/MANIFEST") && !fexists(d+"/ACK"), "T1 no pointer files written"); s.close(); }
+      CHECK(fdig(d+"/MANIFEST")==mGen0 && fdig(d+"/ACK")==aGen0, "T1 no pointer advance (still generation 0)"); s.close(); }
     { std::string d=freshDir("r1_t2"); { FILE* f=fopen((d+"/undo.dat").c_str(),"wb"); fclose(f); }
       CommitStore3A s; CHECK(s.open(d,&e), "T2 fresh open over an accepted empty residue");
       CHECK(unlink((d+"/undo.dat").c_str())==0, "T2 residue disappears after classification");

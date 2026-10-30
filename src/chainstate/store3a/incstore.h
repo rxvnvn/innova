@@ -340,6 +340,14 @@ private:
     // S1.1-F2 (finding F1-1): link()+unlink() is the ONLY move primitive here -- there is deliberately no
     // lstat+rename fallback (rename can atomically REPLACE an existing quarantine artifact on Linux).
     bool quarantineCorruptUndoIndex(std::string* quarantinePath, uint64_t* bytes, ChainError* e);
+    // IFCN#9 S5 (F-7/F-4): publish the KNOWN-EMPTY initial state as generation 0. Until this
+    // existed a store that had applied pages but had not yet paid its first durability barrier
+    // carried NO pointer at all, so open() could not tell "nothing was ever committed" from "a
+    // committed store lost its pointer" and refused the datadir forever (clean stop before the
+    // first batch barrier, and a crash inside the first commit). With a generation-0 MANIFEST +
+    // ACK the empty state is itself a commit point: later residue is attributable and rolls back
+    // to the empty root, while a state with NO pointer at all still fails closed unchanged.
+    bool publishInitialGeneration(ChainError* e);
     bool commitBarriers(const Manifest& m, uint64_t undoOffset, const uint8_t* undoAppend, size_t undoAppendLen, ChainError* e,
                         const std::vector<uint64_t>* recEnds = NULL);
     // S2.1: close EVERY undo-index segment boundary crossed by this append (a batch may cross several).

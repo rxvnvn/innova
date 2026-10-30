@@ -227,11 +227,47 @@ State matrix (MANIFEST absent):
 path (§8.2); the no-pointer fresh path rejects non-aligned sizes before opening, so it never
 modifies the file.
 
-Crash contract: the only file created on the fresh path is `tree.dat` (one empty sentinel page)
-via `O_CREAT|O_TRUNC` at a path proven absent; no MANIFEST/ACK is written before the first
-successful publish. A crash between the `stat` and `create` can therefore only leave a fresh
-empty store, never destroy prior data (the path was proven absent moments earlier, and any
-concurrent writer is excluded by the `LOCK` flock held across the check).
+Crash contract (updated by IFCN#9 S5 — see §12): the fresh path creates `tree.dat` (one empty
+sentinel page) via `O_CREAT|O_TRUNC` at a path proven absent and then **immediately publishes
+generation 0** (empty root, `undoSize=0`, `tipHeight=-1`) with the ordinary durable order
+(page fsync → `MANIFEST.tmp` → rename → dir fsync → `ACK`). An empty store therefore always has
+a commit point; the previous contract ("no MANIFEST/ACK before the first successful publish")
+left the store with no pointer at all, which made any later residue unattributable (defects F-7
+and F-4). A crash between the `stat` and `create` can still only leave a fresh empty store, never
+destroy prior data (the path was proven absent moments earlier, and any concurrent writer is
+excluded by the `LOCK` flock held across the check).
+
+## 12. IFCN#9 S5 — durable birth of the store + shutdown flush
+
+Two recovery failures had the same shape: a store that had applied work but had not yet paid its
+first durability barrier carried **no pointer**, so `open` could not distinguish "nothing was ever
+committed" from "a committed store lost its pointer" and refused the datadir permanently.
+
+- **F-7 (graceful stop before the first barrier).** With `-s16store3abatch=N` the deltas of up to
+  N blocks live only in memory until a barrier; `Shutdown()` never flushed them, so a clean stop
+  left `tree.dat` pages with no `MANIFEST`/`ACK` and the next start refused the datadir.
+- **F-4 (SIGKILL inside a reorg commit).** The commit sequence is
+  `pages → undo append → MANIFEST.bak → rename MANIFEST → dir fsync → ACK`; a kill after the undo
+  append but before the rename left a non-empty `undo.dat` with no pointer, and the same refusal
+  fired.
+
+Fix (three minimal parts, no new authority, no format change):
+
+1. `CommitStore3A::publishInitialGeneration` — a fresh store publishes **generation 0** (the
+   known-empty state) before `open` returns, using the same durable order as every commit.
+2. `Shutdown()` flushes a pending batch under `cs_main` before the process leaves, so a graceful
+   stop is durable (and reports the failure if it cannot commit).
+3. `ReconcileStore3AToChain` replays an **empty** store from height 1 (genesis is never a UTXO
+   event and has no block file), and `init` now runs the reconcile when the store is empty but the
+   chain is past genesis. Recovery is therefore: roll the root back to the last committed
+   generation (0 if nothing was ever committed), replay the already-validated blocks, then the
+   existing fail-closed tip comparison (`BI-V2 tip == Store3A tip`).
+
+Unchanged and explicitly preserved: `MANIFEST.undoSize` remains the sole authority for the
+committed undo length (an orphan tail beyond it is inert and never rewritten); a store with
+**no** pointer but with prior-store evidence still fails closed (matrix rows 7/7b, R1-fresh D8);
+corruption of an acknowledged generation still fails loud (R1-crash), never silently rolling back.
+
 
 ## 10. Stage 3B-F0 — undo offset coherence (physical layout vs committed length)
 
