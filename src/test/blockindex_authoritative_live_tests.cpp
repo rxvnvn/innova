@@ -991,11 +991,21 @@ BOOST_AUTO_TEST_CASE(g1_traversal_floor_skip_topology_and_getancestor)
 // cosmetic-retention failure mode).
 static std::string ReadSourceForGate(const char* name)
 {
-    // IFCN#9 S6: the gate must be evaluable from ANY cwd (build dir, src/test, repo root).
-    // Walk up from the current directory until the repository marker is found, then look in the
-    // usual source locations. The gate itself is unchanged: it still scans real production
-    // sources for forbidden symbols -- it just stops silently finding nothing.
+    // IFCN#9 C1: the gate must be evaluable from ANY cwd, INCLUDING a build directory that lives
+    // outside the repository. Walk-up-from-cwd alone cannot see the sources there, which made the
+    // gate report "could not locate any production source file" (a false FAIL of a security-ish
+    // check, not a code defect). The compile-time path of THIS file is a cwd-independent anchor:
+    // CMake passes absolute source paths, so the repository root is everything before /src/test/.
+    // A relative compile path is handled too (root == the directory the build ran from).
     std::vector<std::string> roots;
+    {
+        const std::string self = __FILE__;
+        size_t cut = self.rfind("/src/test/");
+        if (cut != std::string::npos)
+            roots.push_back(self.substr(0, cut));
+        else if (self.compare(0, 9, "src/test/") == 0)
+            roots.push_back(std::string("."));
+    }
     {
         fs::path p = fs::current_path();
         for (int up = 0; up < 6 && !p.empty(); ++up)
