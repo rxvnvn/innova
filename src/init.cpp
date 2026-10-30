@@ -2042,7 +2042,7 @@ authoritative_startup_ready:
             cs::ChainError be;
             g_s3aAuthoritative.reset(new cs::store3a::CommitStore3A());
             if (!g_s3aAuthoritative->open(s3aDir, &be))
-                return InitError(strprintf("Store3A V2 authoritative open failed at %s: %s", s3aDir, be.str()));
+                return InitError(strprintf("Store3A V2 authoritative open failed at %s: %s", s3aDir.c_str(), be.str().c_str()));
             if (pindexBest == NULL)
                 return InitError("Store3A V2 authoritative: no best chain loaded");
             int32_t stH = g_s3aAuthoritative->tipHeight();

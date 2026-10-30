@@ -29,7 +29,25 @@ using namespace cs::store3a;
 
 namespace reorg314store {
 
-static const char* kArtifactDir = "/home/user/data/reports/innova/reorg-314-reproduction/artifacts";
+// Hermetic artifact directory: the default keeps the historical location (so the
+// recorded artifacts stay reproducible), but RX_ARTIFACT_DIR redirects every write
+// to a caller-owned directory. Without this the suites write into the shared
+// report corpus of whatever checkout runs them.
+static std::string ArtifactDir()
+{
+    const char* env = getenv("RX_ARTIFACT_DIR");
+    if (env != NULL && env[0] != '\0')
+        return std::string(env);
+    return std::string("/home/user/data/reports/innova/reorg-314-reproduction/artifacts");
+}
+
+static void EnsureArtifactDir()
+{
+    const std::string dir = ArtifactDir();
+    // Create the leaf only: do not manufacture parent directories of a
+    // caller-supplied absolute path.
+    mkdir(dir.c_str(), 0775);
+}
 
 static Hash Id32(uint32_t label, uint32_t i)
 {
@@ -98,10 +116,8 @@ static bool Publish(CommitStore3A& s, uint32_t tag, int height, int64_t value, C
 
 static void WriteJson(const char* name, const std::string& body)
 {
-    mkdir("/home/user/data/reports/innova", 0775);
-    mkdir("/home/user/data/reports/innova/reorg-314-reproduction", 0775);
-    mkdir(kArtifactDir, 0775);
-    std::ofstream f((std::string(kArtifactDir) + "/" + name).c_str());
+    EnsureArtifactDir();
+    std::ofstream f((ArtifactDir() + "/" + name).c_str());
     f << body;
 }
 
