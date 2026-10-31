@@ -6421,15 +6421,28 @@ bool s16::ChainObserveState::FlushPending()
 {
     if (pending.empty()) return true;
     if (!store || !store->opened()) { lastOpError = "flush: store is not open"; pending.clear(); return false; }
-    const size_t n = pending.size();
-    const int32_t h = pending.back().height;
-    cs::ChainError e;
-    if (!store->publishBatch(pending, &e)) {
-        lastOpError = e.str();
-        pending.clear();          // the store requires a reopen; keeping them would be misleading
-        return false;
+    // BOUNDED DURABILITY BARRIER. One barrier over the whole batch pays the
+    // write+fsync of every undo record in it while the caller holds cs_main, so
+    // the stall window grows with batchSize. batchChunk caps how many blocks one
+    // barrier may cover, keeping the ordering and the all-or-nothing contract
+    // per barrier; a crash between chunks leaves the store at a chunk boundary,
+    // which startup reconciles exactly as it already does for a batch boundary.
+    size_t off = 0;
+    while (off < pending.size())
+    {
+        const size_t left = pending.size() - off;
+        const size_t take = (batchChunk == 0 || batchChunk >= left) ? left : batchChunk;
+        std::vector<cs::store3a::CommitStore3A::BatchBlock> chunk(
+            pending.begin() + off, pending.begin() + off + take);
+        cs::ChainError e;
+        if (!store->publishBatch(chunk, &e)) {
+            lastOpError = e.str();
+            pending.clear();          // the store requires a reopen; keeping them would be misleading
+            return false;
+        }
+        ++batchFlushes; batchBlocks += (uint64_t)take; lastFlushedHeight = chunk.back().height;
+        off += take;
     }
-    ++batchFlushes; batchBlocks += (uint64_t)n; lastFlushedHeight = h;
     pending.clear();
     return true;
 }

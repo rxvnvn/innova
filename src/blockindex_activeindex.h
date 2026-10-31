@@ -84,9 +84,12 @@ class FixedBlockIndexShadowActiveLookup
 public:
     FixedBlockIndexShadowActiveLookup();
 
-    // Open binds records.dat + MANIFEST generation to active.dat generation,
-    // validates dense non-sparse entries across the committed region, enforces
-    // the committed-record boundary and MANIFEST committed-tip coherence.
+    // Open binds records.dat + MANIFEST generation to active.dat generation and
+    // enforces the committed-record boundary + MANIFEST committed-tip coherence.
+    // The committed-tip coherence check is O(1); the historical O(tipHeight)
+    // dense-region visitation is gone (it cost tipHeight+1 synchronous reads on
+    // every open -- 8,202,815 on mainnet -- which turned any caller that opens
+    // this lookup into a multi-minute disk storm while holding cs_main).
     static bool Open(const std::string& generationDir, FixedBlockIndexShadowActiveLookup* out, std::string* error);
 
     // height -> hashindex-free path: active.dat RecordId -> records.dat record,
@@ -98,11 +101,15 @@ public:
     int32_t CommittedTipHeight() const;
     // Committed active-chain tip hash (zero uint256 when unset).
     uint256 CommittedTipHash() const;
+    // Number of active-entry reads performed by the last successful/attempted Open.
+    // Bounded-open contract: must stay O(1) regardless of chain height.
+    uint64_t OpenEntryReads() const { return openEntryReads; }
 
 private:
     FixedBlockIndexStore store;
     BlockIndexActiveIndex active;
     bool open;
+    uint64_t openEntryReads = 0;
 };
 
 #endif

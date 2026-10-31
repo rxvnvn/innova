@@ -2370,14 +2370,25 @@ authoritative_startup_ready:
                 int64_t tipBatch = 1;
                 if (mapArgs.count("-tipcommitbatch"))
                     ParseInt64(mapArgs["-tipcommitbatch"], &tipBatch);
-                if (!IsTipBatchCompatibleWithStoreBarrier(tipBatch, nb))
+                int nc = (int)GetArg("-s16store3abatchchunk", 0);
+                s16::g_chainObserve.batchChunk = (size_t)(nc > 0 ? nc : 0);
+                // The durability barrier that actually bounds the store is the
+                // SMALLER of the batch and its chunk, so the tip/barrier safety
+                // gate must judge THAT, not the nominal batch size.
+                const int64_t effectiveBarrier = (int64_t)(
+                    s16::g_chainObserve.batchChunk && s16::g_chainObserve.batchChunk < s16::g_chainObserve.batchSize
+                        ? s16::g_chainObserve.batchChunk : s16::g_chainObserve.batchSize);
+                if (!IsTipBatchCompatibleWithStoreBarrier(tipBatch, effectiveBarrier))
                     return InitError(strprintf("unsafe batching: -tipcommitbatch=%d is coarser than the "
-                                               "Store3A durability barrier (-s16store3abatch=%d); the store "
+                                               "Store3A durability barrier (batch=%llu chunk=%llu -> %d); the store "
                                                "would run ahead of the block index and a crash would leave a "
                                                "state the startup reconcile refuses (fail closed)",
-                                               (int)tipBatch, nb));
-                printf("S2.1 Store3A publication batching: %llu block(s) per durability barrier\n",
-                       (unsigned long long)s16::g_chainObserve.batchSize);
+                                               (int)tipBatch,
+                                               (unsigned long long)s16::g_chainObserve.batchSize,
+                                               (unsigned long long)s16::g_chainObserve.batchChunk,
+                                               (int)effectiveBarrier));
+                printf("S2.1 Store3A publication batching: %llu block(s) per batch, %d block(s) per durability barrier\n",
+                       (unsigned long long)s16::g_chainObserve.batchSize, (int)effectiveBarrier);
                 fflush(stdout);
             }
             // V2-Item1: open the historical TX-LOC location index under the approved

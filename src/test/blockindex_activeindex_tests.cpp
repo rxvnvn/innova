@@ -516,6 +516,73 @@ BOOST_AUTO_TEST_CASE(shadow_open_fails_closed_on_sparse_zero_and_over_boundary_e
     BOOST_CHECK(!error.empty());
 }
 
+BOOST_AUTO_TEST_CASE(shadow_open_cost_is_bounded_and_independent_of_chain_height)
+{
+    // Regression (consensus-incident 2026-10-30): Open() used to visit EVERY
+    // committed active entry (tipHeight+1 synchronous reads = 8,202,815 at
+    // mainnet height) on every call. Any caller that opened this shadow lookup
+    // (wallet rescan / hreg rebuild / deep by-value walks) therefore paid an
+    // O(chain) read burst, which is a production latency hazard under cs_main.
+    // Contract asserted here: the open cost is O(1) and independent of height,
+    // while the committed-tip coherence and truncation gates still fail closed.
+    struct Fixture
+    {
+        boost::filesystem::path dir;
+        BlockIndexRecord tipRec;
+        BlockIndexId tipId;
+    };
+    const int32_t kTips[2] = {3, 300};
+    uint64_t reads[2] = {0, 0};
+    for (int i = 0; i < 2; ++i)
+    {
+        const int32_t tip = kTips[i];
+        Fixture f;
+        f.dir = UniqueGenDir(i == 0 ? "bounded-small" : "bounded-large");
+        FixedBlockIndexStore store = CreateStore(f.dir, 1);
+        BlockIndexActiveIndex act = CreateActive(f.dir, 1);
+        std::string error;
+        std::vector<std::pair<int32_t, BlockIndexId> > chain;
+        for (int32_t h = 0; h <= tip; ++h)
+        {
+            BlockIndexRecord r = MakeRecord(7000 + (uint64_t)h, h, (h % 2) == 0);
+            AppendBlock(&store, r, &chain);
+            BOOST_REQUIRE(act.Append(chain.back().second, h, &error));
+            f.tipRec = r;
+            f.tipId = chain.back().second;
+        }
+        FinalizeManifest(&store, (uint64_t)(tip + 1), f.tipId, tip, f.tipRec.hash);
+        act = BlockIndexActiveIndex();
+
+        FixedBlockIndexShadowActiveLookup lookup = OpenShadowActive(f.dir);
+        reads[i] = lookup.OpenEntryReads();
+        BOOST_CHECK_MESSAGE(reads[i] <= 2u,
+                            "shadow open must be O(1): " << reads[i] << " entry reads at tip " << tip);
+        // Still serves the committed tip and rejects the uncommitted boundary.
+        BlockIndexRecord out;
+        BlockIndexId id = BLOCK_INDEX_ID_INVALID;
+        error.clear();
+        BOOST_CHECK_EQUAL(lookup.LookupByHeight(tip, &out, &id, &error), BLOCK_INDEX_ACTIVE_LOOKUP_FOUND);
+        ExpectRecordsEqual(out, f.tipRec);
+        error.clear();
+        BOOST_CHECK_EQUAL(lookup.LookupByHeight(tip + 1, &out, &id, &error), BLOCK_INDEX_ACTIVE_LOOKUP_NOT_FOUND);
+
+        if (i == 0)
+        {
+            // truncation inside the committed region still fails closed
+            std::string bytes = ReadWholeFile(f.dir / BLOCK_INDEX_ACTIVE_FILE_NAME);
+            BOOST_REQUIRE_GT(bytes.size(), BLOCK_INDEX_ACTIVE_HEADER_SIZE_V1);
+            bytes.resize(BLOCK_INDEX_ACTIVE_HEADER_SIZE_V1 +
+                         (size_t)tip * BLOCK_INDEX_ACTIVE_ENTRY_SIZE_V1);
+            WriteWholeFile(f.dir / BLOCK_INDEX_ACTIVE_FILE_NAME, bytes);
+            FixedBlockIndexShadowActiveLookup broken;
+            error.clear();
+            BOOST_CHECK(!FixedBlockIndexShadowActiveLookup::Open(f.dir.string(), &broken, &error));
+            BOOST_CHECK(!error.empty());
+        }
+    }
+    BOOST_CHECK_EQUAL(reads[0], reads[1]);
+}
+
 BOOST_AUTO_TEST_CASE(shadow_open_enforces_manifest_generation_and_committed_tip_coherence)
 {
     // generation mismatch: store gen 1, active.dat gen 2

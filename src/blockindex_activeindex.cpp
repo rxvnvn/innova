@@ -550,27 +550,31 @@ bool FixedBlockIndexShadowActiveLookup::Open(const std::string& generationDir, F
     if (tmp.active.Generation() != generation)
         return SetError(error, "shadow active lookup generation mismatch");
 
+    tmp.openEntryReads = 0;
     const FixedBlockIndexManifest& manifest = tmp.store.GetManifest();
     const int32_t tipHeight = manifest.committedTipHeight;
     if (tipHeight >= 0)
     {
         if (tmp.active.PhysicalHeight() < tipHeight)
             return SetError(error, "active.dat truncated within committed region");
-        for (int32_t h = 0; h <= tipHeight; ++h)
-        {
-            BlockIndexId id = BLOCK_INDEX_ID_INVALID;
-            if (!tmp.active.ReadEntry(h, &id, error))
-                return false;
-            if (id == BLOCK_INDEX_ID_INVALID)
-                return SetError(error, "sparse zero active entry within committed region");
-            if (id > manifest.recordCount)
-                return SetError(error, "active entry exceeds committed record count");
-        }
+        // BOUNDED OPEN (O(1)). The committed-region contract is carried by the
+        // physical extent above plus the committed-tip entry below. The removed
+        // loop visited every entry in the committed region (tipHeight+1 reads --
+        // 8,202,815 at mainnet height), so EVERY open of this shadow lookup was
+        // an O(chain) synchronous read burst. A sparse/zero entry that is not the
+        // committed tip is still surfaced fail-closed where it is consumed:
+        // LookupByHeight returns NOT_FOUND for an INVALID id and the caller must
+        // treat a missing ancestor as unresolvable (never as a shorter chain).
         if (manifest.committedTipId != BLOCK_INDEX_ID_INVALID)
         {
             BlockIndexId tipEntry = BLOCK_INDEX_ID_INVALID;
+            ++tmp.openEntryReads;
             if (!tmp.active.ReadEntry(tipHeight, &tipEntry, error))
                 return false;
+            if (tipEntry == BLOCK_INDEX_ID_INVALID)
+                return SetError(error, "sparse zero active entry within committed region");
+            if (tipEntry > manifest.recordCount)
+                return SetError(error, "active entry exceeds committed record count");
             if (tipEntry != manifest.committedTipId)
                 return SetError(error, "active.dat committed-tip not coherent with MANIFEST");
         }

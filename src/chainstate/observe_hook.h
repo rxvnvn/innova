@@ -42,6 +42,16 @@ struct ChainObserveState {
     // therefore leaves the store at most batchSize-1 blocks behind the chain; startup reconciles it
     // by replaying the already-validated blocks (see ReconcileStore3AToChain).
     size_t   batchSize = 1;
+    // Maximum number of blocks covered by ONE durability barrier inside a flush.
+    // 0 (default) = no chunking (publish the whole pending batch in a single
+    // barrier) — preserves the -tipcommitbatch <= store-barrier invariant that
+    // startup enforces for every existing deployment. When set, the startup gate
+    // is evaluated against min(batchSize, batchChunk), i.e. the barrier that
+    // actually bounds the store.
+    // A barrier's cost grows with its block count and is paid under cs_main, so
+    // chunking bounds the worst-case block-acceptance stall without changing
+    // ordering or the per-barrier all-or-nothing contract.
+    size_t   batchChunk = 0;
     std::vector<cs::store3a::CommitStore3A::BatchBlock> pending;
     uint64_t batchFlushes = 0;             // successful publishBatch() calls
     uint64_t batchBlocks = 0;              // blocks made durable by those flushes
