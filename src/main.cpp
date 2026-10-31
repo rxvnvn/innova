@@ -14451,7 +14451,19 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
         {
             pfrom->nBlocksReceivedInBatch++;
 
-            int nPrefetchThreshold = (pfrom->nExpectedBatchSize * 3) / 4;
+            // IFCN#9 perf: the next batch was only requested at 75% of the current
+            // one, so a single getblocks/inv round trip (server side refills its
+            // token bucket at 1 token/s, >=2 tokens per response) idled the
+            // pipeline for seconds at every batch boundary. -ibdprefetchpct=N
+            // (1..100, default 75 = unchanged) decides how early the next batch is
+            // requested; it changes request pacing only, never validation.
+            int64_t nPrefetchPctRaw = 75;
+            if (mapArgs.count("-ibdprefetchpct") &&
+                !ParseInt64(mapArgs["-ibdprefetchpct"], &nPrefetchPctRaw))
+                nPrefetchPctRaw = 75;
+            if (nPrefetchPctRaw < 1) nPrefetchPctRaw = 1;
+            if (nPrefetchPctRaw > 100) nPrefetchPctRaw = 100;
+            int nPrefetchThreshold = (int)(((int64_t)pfrom->nExpectedBatchSize * nPrefetchPctRaw) / 100);
 
             if (!IbdHeaderSchedulerSelectActive() &&
                 !pfrom->fPrefetchSent && pfrom->nBlocksReceivedInBatch >= nPrefetchThreshold)
