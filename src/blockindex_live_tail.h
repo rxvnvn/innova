@@ -70,6 +70,11 @@ private:
                                        BlockIndexHotMaterialized* out) const;
 };
 
+// IFCN#9 PHASE 1: build a BlockIndexSnapshot from a tip-read (record+derived)
+// with NO hash lookup. Used by the height-addressed active-chain path so a
+// navigation step never re-resolves a record it already holds.
+BlockIndexSnapshot BlockIndexSnapshotFromTipRead(const BlockIndexTipRead& tr);
+
 // Bounded residency live-tail wrapper around a HotOwner, applying the config
 // horizon (residency-only) as eviction policy.
 class BlockIndexLiveTail

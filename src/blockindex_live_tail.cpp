@@ -19,13 +19,11 @@ BlockIndexLiveTailMaterializer::BlockIndexLiveTailMaterializer(
 {
 }
 
-bool BlockIndexLiveTailMaterializer::TipToSnapshot(const BlockIndexTipRead& tr,
-                                                   BlockIndexSnapshot* out) const
+BlockIndexSnapshot BlockIndexSnapshotFromTipRead(const BlockIndexTipRead& tr)
 {
+    BlockIndexSnapshot s;
     const BlockIndexRecord& r = tr.record;
     const BlockIndexDerivedEntry& d = tr.derived;
-    // Reuse the same field mapping as BlockIndexV2Reader::SnapshotFromRecord.
-    BlockIndexSnapshot s;
     s.found = true;
     s.id = (tr.status == BLOCK_INDEX_TIP_OK) ? ((uint64_t)0) : BLOCK_INDEX_ID_INVALID;
     s.hash = r.hash;
@@ -48,15 +46,22 @@ bool BlockIndexLiveTailMaterializer::TipToSnapshot(const BlockIndexTipRead& tr,
     s.fProofOfStake = (r.prevoutStake.hash != uint256(0));
     s.fInMainChain = tr.active;
     s.hasParent = (r.hashPrev != uint256(0));
-    // derived
     s.nChainTrust = d.chainTrust;
     s.nStakeModifierChecksum = d.stakeModifierChecksum;
     s.hasStakeModifierChecksum = true;
     s.nStakeModifierTime = d.stakeModifierTime;
     s.hasStakeModifierTime = d.HasStakeModifierTime();
-    *out = s;
+    return s;
+}
+
+bool BlockIndexLiveTailMaterializer::TipToSnapshot(const BlockIndexTipRead& tr,
+                                                   BlockIndexSnapshot* out) const
+{
+    *out = BlockIndexSnapshotFromTipRead(tr);
     return true;
 }
+
+
 
 BlockIndexHotStatus BlockIndexLiveTailMaterializer::BaseToSnapshot(
     const BlockIndexLogicalId& id, BlockIndexHotMaterialized* out) const
@@ -78,9 +83,21 @@ BlockIndexHotStatus BlockIndexLiveTailMaterializer::BaseToSnapshot(
     return BlockIndexHotStatus::OK;
 }
 
+#include <map>
+#include <mutex>
+#include <cstdio>
+std::mutex g_matMu;
+std::map<void*, unsigned long long> g_matSites;
+void BlockIndexMaterializeSiteDump()
+{
+    std::lock_guard<std::mutex> lg(g_matMu);
+    for (std::map<void*, unsigned long long>::const_iterator it = g_matSites.begin(); it != g_matSites.end(); ++it)
+        if (it->second > 100) printf("MATSITE n=%llu addr=%p\n", it->second, it->first);
+}
 BlockIndexHotStatus BlockIndexLiveTailMaterializer::Materialize(
     const BlockIndexLogicalId& id, BlockIndexHotMaterialized* out) const
 {
+    { void* site = __builtin_return_address(0); std::lock_guard<std::mutex> lg(g_matMu); ++g_matSites[site]; }
     out->found = false;
     // 1. tip authority first (blocks above S / any tip-namespace hash).
     if (tip_ && tip_->IsOpen())

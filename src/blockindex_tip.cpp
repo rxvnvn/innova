@@ -2,6 +2,8 @@
 // Distributed under the MIT/X11 software license.
 
 #include "blockindex_tip.h"
+#include "cold_hot_seam.h"
+void BlockIndexMaterializeSiteDump();
 
 #include "blockindex_tip_bounded_window.h"
 #include "blockindex_hashindex.h"
@@ -18,6 +20,9 @@
 #include <malloc.h>
 #endif
 #include <atomic>
+#include <functional>
+#include <vector>
+#include <mutex>
 #include <memory>
 
 #include <algorithm>
@@ -52,6 +57,13 @@ void BlockIndexCutTrace(const char* fmt, ...)
 // ---------------------------------------------------------------------------
 
 namespace {
+
+// IFCN#9 PHASE 1: durable hash->id resolution counter (diagnostic only).
+std::atomic<uint64_t> g_tipHashLookups(0);
+// PHASE 1 attribution: which call sites perform durable hash->id resolutions.
+std::mutex g_hlMu;
+std::map<void*, uint64_t> g_hlSites;
+
 
 static const char* const BLOCK_INDEX_TIP_DIR_NAME = "tip";
 static const char* const BLOCK_INDEX_TIP_META_FILE = "tip.meta";
@@ -1044,15 +1056,6 @@ struct BlockIndexTipAuthority::Impl
     std::vector<BlockIndexTipAppend> pendBlocks;
     std::vector<int32_t>             pendHeights;
     std::map<uint256, size_t>        pendIndex;   // hash -> pendBlocks slot
-    // IFCN#9 V2 lookup reduction: bounded hash -> durable BlockIndexId cache.
-    // The side index (LevelDB) answered ~3 677 lookups per accepted block; the
-    // mapping is APPEND-ONLY stable (a record's id never changes), so it may be
-    // cached until a truncate/reorg/close invalidates the id space. Cleared at
-    // every mutating transition; never used for the pending window (that path
-    // answers first, from pendIndex).
-    std::map<uint256, BlockIndexId>  hashIdCache;
-    std::deque<uint256>              hashIdOrder;
-    static const size_t              kHashIdCacheMax = 262144;
     int32_t  pendTipHeight = -1;
     uint256  pendTipHash;
     uint64_t pendCount = 0;
@@ -2199,6 +2202,11 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
     return true;
 }
 
+uint64_t BlockIndexTipHashLookupCount()
+{
+    return g_tipHashLookups.load();
+}
+
 BlockIndexTipStatus BlockIndexTipAuthority::Append(const BlockIndexTipAppend& blk,
                                                    int32_t activeHeight,
                                                    std::string* error)
@@ -2614,8 +2622,6 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
 
 BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std::string* error)
 {
-    // IFCN#9: the id space is about to change; drop the hash->id cache.
-    impl->hashIdCache.clear(); impl->hashIdOrder.clear();
     if (impl->HasPending())
     {
         BlockIndexTipStatus fst = FlushPendingAppends(error);
@@ -2735,8 +2741,6 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     const std::vector<int32_t>& branchHeights,
     std::string* error)
 {
-    // IFCN#9: the id space is about to change; drop the hash->id cache.
-    impl->hashIdCache.clear(); impl->hashIdOrder.clear();
     if (BlockIndexCutTraceEnabled())
         BlockIndexCutTrace("REORGACT-ENTER fork=%d branch=%llu pend=%llu durH=%d durHash=%s logH=%d",
                            forkHeight, (unsigned long long)branch.size(),
@@ -3390,35 +3394,25 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
     // record), and every mutating transition (truncate/reorg/close) clears the
     // cache, so a stale id can never outlive the id space it belongs to. The
     // pending window still answers first, above.
-    BlockIndexId id = 0;
+    // IFCN#9 PHASE 1 instrument: how many DURABLE hash->id resolutions still happen.
+    ++g_tipHashLookups;
     {
-        std::map<uint256, BlockIndexId>::const_iterator cit = i->hashIdCache.find(hash);
-        if (cit != i->hashIdCache.end())
-        {
-            id = cit->second;
-        }
-        else
-        {
-            const BlockIndexHashLookupStatus lstat =
-                i->sideIndex.Lookup(hash, &id, NULL);
-            if (lstat == BLOCK_INDEX_HASH_LOOKUP_NOT_FOUND)
-            {
-                r.status = BLOCK_INDEX_TIP_NOT_FOUND;
-                return r;
-            }
-            if (lstat == BLOCK_INDEX_HASH_LOOKUP_ERROR)
-            {
-                r.status = BLOCK_INDEX_TIP_IO_ERROR;
-                return r;
-            }
-            i->hashIdCache[hash] = id;
-            i->hashIdOrder.push_back(hash);
-            while (i->hashIdOrder.size() > Impl::kHashIdCacheMax)
-            {
-                i->hashIdCache.erase(i->hashIdOrder.front());
-                i->hashIdOrder.pop_front();
-            }
-        }
+        void* site = __builtin_return_address(0);
+        std::lock_guard<std::mutex> lg(g_hlMu);
+        ++g_hlSites[site];
+    }
+    BlockIndexId id = 0;
+    const BlockIndexHashLookupStatus lstat =
+        i->sideIndex.Lookup(hash, &id, NULL);
+    if (lstat == BLOCK_INDEX_HASH_LOOKUP_NOT_FOUND)
+    {
+        r.status = BLOCK_INDEX_TIP_NOT_FOUND;
+        return r;
+    }
+    if (lstat == BLOCK_INDEX_HASH_LOOKUP_ERROR)
+    {
+        r.status = BLOCK_INDEX_TIP_IO_ERROR;
+        return r;
     }
     const uint64_t base = i->meta.baseRecordCount;
     if (id <= base)
@@ -3491,23 +3485,31 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupActiveByHeightLogical(int32_t he
     Impl* i = impl;
     {
         LOCK(i->csTailLock);
-        // 1. The BUFFERED window: accepted-and-validated ACTIVE appends that are
-        // not yet durably published. Active heights are dense inside the window.
-        for (size_t k = 0; k < i->pendBlocks.size(); ++k)
+        // IFCN#9 PHASE 1: the buffer can only answer heights ABOVE the durable tip.
+        // A PoS modifier walk walks historical heights, i.e. the durable range, so
+        // checking the durable boundary FIRST keeps the (linear) window scan off the
+        // hot path entirely: one comparison instead of O(pending) per step.
+        const bool aboveDurable = (height > i->meta.tipHeight);
+        if (aboveDurable)
         {
-            if (k < i->pendHeights.size() && i->pendHeights[k] == height)
+            // The BUFFERED window: accepted-and-validated ACTIVE appends that are
+            // not yet durably published. Active heights are dense inside the window.
+            for (size_t k = 0; k < i->pendBlocks.size(); ++k)
             {
-                r.status = BLOCK_INDEX_TIP_OK;
-                r.record = i->pendBlocks[k].record;
-                r.derived = i->pendBlocks[k].derived;
-                r.active = true;
-                r.height = height;
-                if (error) error->clear();
-                return r;
+                if (k < i->pendHeights.size() && i->pendHeights[k] == height)
+                {
+                    r.status = BLOCK_INDEX_TIP_OK;
+                    r.record = i->pendBlocks[k].record;
+                    r.derived = i->pendBlocks[k].derived;
+                    r.active = true;
+                    r.height = height;
+                    if (error) error->clear();
+                    return r;
+                }
             }
         }
     }
-    // 2. The durable boundary (the only committed active chain).
+    // The durable boundary (the only committed active chain): pure slot arithmetic.
     return LookupActiveByHeight(height, error);
 }
 
@@ -3912,6 +3914,27 @@ void BlockIndexTipAuthority::DumpWindowStats() const
     const TipWindowStats rs = i->recordsWin.Stats();
     const TipWindowStats ds = i->derivedWin.Stats();
     const TipWindowStats as = i->activeWin.Stats();
+    printf("WINSTAT navsteps=%llu navfallbacks=%llu\n",
+           (unsigned long long)ColdHotSeamNavStepCount(),
+           (unsigned long long)ColdHotSeamNavFallbackCount());
+    {
+        std::lock_guard<std::mutex> lg(g_hlMu);
+        {
+            FILE* m = fopen("/proc/self/maps", "r");
+            char line[256] = {0};
+            if (m) { if (fgets(line, sizeof(line), m)) { char* dash = strchr(line, '-'); if (dash) { unsigned long base = strtoul(line, NULL, 16); (void)dash; printf("WINSTAT exebase=0x%lx\n", base); } } fclose(m); }
+        }
+        BlockIndexMaterializeSiteDump();
+        printf("WINSTAT hashlookup-sites=%zu\n", g_hlSites.size());
+        std::vector<std::pair<uint64_t, void*> > v;
+        for (std::map<void*, uint64_t>::const_iterator it = g_hlSites.begin(); it != g_hlSites.end(); ++it)
+            v.push_back(std::make_pair(it->second, it->first));
+        std::sort(v.begin(), v.end(), std::greater<std::pair<uint64_t, void*> >());
+        for (size_t k = 0; k < v.size() && k < 6; ++k)
+            printf("WINSTAT hashlookup-site n=%llu addr=%p\n", (unsigned long long)v[k].first, v[k].second);
+    }
+    printf("WINSTAT hashlookups=%llu (durable hash->id resolutions)\n",
+           (unsigned long long)g_tipHashLookups.load());
     printf("WINSTAT records gets=%llu ring=%llu lru=%llu pread=%llu lruEntries=%zu lruMB=%.1f\n",
            (unsigned long long)rs.gets, (unsigned long long)rs.ringHits,
            (unsigned long long)rs.lruHits, (unsigned long long)rs.preadMisses,
@@ -4033,8 +4056,6 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
 
 void BlockIndexTipAuthority::Close()
 {
-    // IFCN#9: never carry cached ids across a close/reopen cycle.
-    if (impl) { impl->hashIdCache.clear(); impl->hashIdOrder.clear(); }
     // IFCN#9 perf: publish a residual IBD window before closing. Best effort by
     // design: if it fails, the durable state stays at the last committed batch
     // and the missing blocks are re-fetched on the next start (they are already

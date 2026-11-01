@@ -2,7 +2,8 @@
 // Distributed under the MIT/X11 software license.
 
 #include "authoritative_blockindex_hot_resolver.h"
-#include "blockindex_authoritative_live.h"   // GetAuthoritativeLiveAuthority (post-generation tail)
+#include "blockindex_authoritative_live.h"
+#include "blockindex_live_tail.h"   // GetAuthoritativeLiveAuthority (post-generation tail)
 
 #include <string>
 
@@ -61,12 +62,22 @@ BlockIndexSnapshot AuthoritativeBlockIndexHotResolver::LookupByHash(const uint25
 BlockIndexSnapshot AuthoritativeBlockIndexHotResolver::GetActiveByHeight(int height) const
 {
     BlockIndexSnapshot out;
+    // IFCN#9 PHASE 1: the IMMUTABLE generation only covers heights up to its
+    // committed tip. A PoS modifier walk at the live tail asks for heights far
+    // above S, and the generation answered those with a full LevelDB read that
+    // could never hit. Ask the generation only inside its own height range.
+    bool genCovers = false;
     if (reader_ && reader_->IsOpen())
     {
-        std::string err;
-        BlockIndexV2ReadStatus st = reader_->GetActiveByHeight(height, &out, &err);
-        if (st == BLOCK_INDEX_V2_READ_FOUND)
-            return out;
+        const FixedBlockIndexManifest& man = reader_->Manifest();
+        genCovers = (height <= man.committedTipHeight);
+        if (genCovers)
+        {
+            std::string err;
+            BlockIndexV2ReadStatus st = reader_->GetActiveByHeight(height, &out, &err);
+            if (st == BLOCK_INDEX_V2_READ_FOUND)
+                return out;
+        }
     }
     // Post-generation fallback: heights above the frozen generation's committed
     // tip are ACTIVE-only members of the mutable tip. LookupActiveByHeight
@@ -85,10 +96,12 @@ BlockIndexSnapshot AuthoritativeBlockIndexHotResolver::GetActiveByHeight(int hei
             const BlockIndexTipRead tr = tip->LookupActiveByHeightLogical(height, &tipErr);
             if (tr.status == BLOCK_INDEX_TIP_OK)
             {
-                BlockIndexSnapshot snap;
-                std::string snapErr;
-                if (live->ResolveBlockSnapshot(tr.record.hash, &snap, &snapErr) == BlockIndexHotStatus::OK)
-                    return snap;
+                // IFCN#9 PHASE 1: the height lookup already returned the record AND
+                // its derived entry for this exact slot -- build the snapshot from
+                // them directly. The previous `ResolveBlockSnapshot(tr.record.hash)`
+                // re-resolved the SAME record by hash (a second LevelDB lookup with
+                // the full materializer chain) for data we are holding in hand.
+                return BlockIndexSnapshotFromTipRead(tr);
             }
         }
     }

@@ -255,3 +255,7 @@ private:
 };
 
 #endif // INNOVA_COLD_HOT_SEAM_H
+
+// IFCN#9 PHASE 1 diagnostics (read-only counters).
+uint64_t ColdHotSeamNavStepCount();
+uint64_t ColdHotSeamNavFallbackCount();

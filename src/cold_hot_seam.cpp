@@ -1,5 +1,12 @@
 #include "cold_hot_seam.h"
 
+#include <atomic>
+// IFCN#9 PHASE 1 diagnostics: navigation steps vs hash-path fallbacks.
+static std::atomic<uint64_t> g_navSteps(0);
+static std::atomic<uint64_t> g_navFallbacks(0);
+uint64_t ColdHotSeamNavStepCount()  { return g_navSteps.load(); }
+uint64_t ColdHotSeamNavFallbackCount() { return g_navFallbacks.load(); }
+
 // IFCN#9 diagnostics (-kerneltrace): record the exact kernel-modifier walk so a
 // pending-window divergence can be compared with the durable state on one block.
 static bool KernelTraceEnabled()
@@ -375,7 +382,23 @@ ColdHotSeamResult ColdHotSeamNavigator::GetNextActiveR(const BlockIndexNavigatio
         return MakeHot(next, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
     }
 
-    BlockIndexSnapshot next = testHotResolver ? testHotResolver->GetNextActiveByHash(current.snapshot.hash) : hotAccessor.GetNextActive(current.snapshot.id);
+    // IFCN#9 PHASE 1: an ACTIVE block's successor is height+1 on the SAME active
+    // chain, so resolve it directly instead of (a) re-resolving `current` by hash
+    // and (b) resolving its successor -- two hash->id lookups per walk step, and a
+    // PoS modifier walk takes hundreds of steps per block. Identity is verified
+    // (hashPrev MUST equal the current hash); any mismatch or absence falls back to
+    // the hash path, which is the single place that still needs a hash lookup.
+    ++g_navSteps;
+    BlockIndexSnapshot next;
+    if (current.snapshot.fInMainChain)
+        next = testHotResolver ? testHotResolver->GetActiveByHeight(current.snapshot.height + 1)
+                               : hotAccessor.GetActiveByHeight(current.snapshot.height + 1);
+    if (!next.found || next.hashPrev != current.snapshot.hash)
+    {
+        ++g_navFallbacks;
+        next = testHotResolver ? testHotResolver->GetNextActiveByHash(current.snapshot.hash)
+                               : hotAccessor.GetNextActive(current.snapshot.id);
+    }
     if (!next.found)
     {
         // IFCN#9 BUGFIX (pending-window consensus dependence): a raw `pnext`
@@ -406,11 +429,17 @@ ColdHotSeamResult ColdHotSeamNavigator::GetNextActiveR(const BlockIndexNavigatio
         // DOMAIN SAFETY: the successor MUST be PROVEN COLD before MakeCold; a
         // cold miss here is a seam divergence and fails closed (never rebind a
         // hot snapshot's process-local id as a cold generation RecordId).
-        ColdHotSeamSnapshot coldNext;
-        const ColdHotSeamResult cr = ResolveColdLogicalR(BlockIndexLogicalId(next.hash), &coldNext, error);
-        if (cr != COLD_HOT_SEAM_OK)
+        // IFCN#9 PHASE 1: the successor's cold identity is its ACTIVE HEIGHT, so
+        // resolve it by height (slot arithmetic in the base generation) instead of
+        // by hash. The domain proof is preserved and strengthened: the cold record
+        // MUST carry the same hash as the hot snapshot we are stepping from, else
+        // this is a seam divergence and we fail closed exactly as before.
+        BlockIndexSnapshot coldSnap;
+        std::string cErr;
+        if (coldReader.GetActiveByHeight(next.height, &coldSnap, &cErr) != BLOCK_INDEX_V2_READ_FOUND ||
+            !coldSnap.found || coldSnap.hash != next.hash)
             return COLD_HOT_SEAM_AUTHORITY_FAILURE; // cold miss/divergence -> fail closed
-        return MakeCold(coldNext.snapshot, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
+        return MakeCold(coldSnap, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
     }
     return MakeHot(next, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
 }
