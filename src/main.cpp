@@ -6433,31 +6433,151 @@ bool s16::ChainObserveState::FlushPending()
     return true;
 }
 
+// S2.1 replay/unwind block resolution.
+//
+// The authoritative V2 domain is a BY-VALUE block index: mapBlockIndex is empty
+// and the materialized CBlockIndex projection is bounded to a retained window
+// (BlockIndexAuthoritativeLive::PublishAuthoritativeBestTip stops after
+// `horizon` records, and CBlockIndex::GetAncestor reports NULL below that
+// floor -- see blockindex_authoritative_live_tests "GetAncestor exact
+// in-window, NULL below the floor"). Reconciling a Store3A that fell behind the
+// chain by MORE than that window therefore cannot use the pprev walk: the walk
+// bottoms out and the node refuses to start with "block index has no ancestor
+// at h=...". That is exactly the state a deep invalidate/reconsider leaves
+// behind (the store unwind is durable before the single tip commit, so a crash
+// or a failed forward replay leaves the store thousands of blocks behind).
+//
+// The ACTIVE block is resolved BY VALUE at the requested height instead, which
+// is the same authority the consensus read paths use and is independent of
+// residency. Legacy (non-authoritative) operation keeps the pprev walk.
+static bool s16_ResolveReplayBlock(int32_t height, uint256* outHash, CBlock* outBlock,
+                                   std::string* err)
+{
+    if (outHash == NULL || outBlock == NULL) return false;
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexSnapshot snap;
+        std::string rerr;
+        const AuthoritativeBlockResolutionResult res =
+            AuthoritativeGetActiveSnapshotByHeightR((int)height, &snap, &rerr);
+        if (res != AUTHORITATIVE_BLOCK_FOUND || !snap.found || snap.height != height)
+        {
+            if (err) *err = strprintf("authoritative replay resolve failed at h=%d (%s)",
+                                      (int)height,
+                                      rerr.empty() ? "no active block at this height" : rerr.c_str());
+            return false;
+        }
+        if (!outBlock->ReadFromDisk(snap.nFile, snap.nBlockPos, true))
+        {
+            if (err) *err = strprintf("cannot read the active block %s at h=%d (file=%u pos=%u)",
+                                      snap.hash.GetHex().c_str(), (int)height,
+                                      (unsigned)snap.nFile, (unsigned)snap.nBlockPos);
+            return false;
+        }
+        if (outBlock->GetHash() != snap.hash)
+        {
+            if (err) *err = strprintf("active block hash mismatch at h=%d (index=%s read=%s)",
+                                      (int)height, snap.hash.GetHex().c_str(),
+                                      outBlock->GetHash().GetHex().c_str());
+            return false;
+        }
+        *outHash = snap.hash;
+        return true;
+    }
+    CBlockIndex* bi = pindexBest->GetAncestor(height);
+    if (bi == NULL) { if (err) *err = strprintf("block index has no ancestor at h=%d", (int)height); return false; }
+    if (!outBlock->ReadFromDisk(bi))
+    {
+        if (err) *err = strprintf("cannot read block %s at h=%d", bi->GetBlockHash().GetHex(), (int)height);
+        return false;
+    }
+    *outHash = bi->GetBlockHash();
+    return true;
+}
+
+// S2.1 unwind parent resolution. The store-ahead unwind needs the parent hash of
+// the store's tip block. Same reasoning as above: resolve the RECORD by value
+// (tail records first, immutable generation on a genuine tail miss) instead of
+// through the empty mapBlockIndex / bounded pprev projection.
+static bool s16_ResolveReplayParent(const uint256& hash, int32_t height,
+                                    uint256* outParentHash, std::string* err)
+{
+    if (outParentHash == NULL) return false;
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexSnapshot snap;
+        std::string rerr;
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        const BlockIndexHotStatus st = (live != NULL && live->IsOpen())
+            ? live->ResolveBlockSnapshot(hash, &snap, &rerr)
+            : BlockIndexHotStatus::AUTHORITY_MISSING;
+        if (st != BlockIndexHotStatus::OK || !snap.found)
+        {
+            std::string berr;
+            if (!ResolveAuthoritativeBlockSnapshot(hash, &snap, &berr) || !snap.found)
+            {
+                if (err) *err = strprintf("store tip %s at h=%d cannot be resolved by value (%s)",
+                                          hash.GetHex().c_str(), (int)height,
+                                          !rerr.empty() ? rerr.c_str() : berr.c_str());
+                return false;
+            }
+        }
+        if (snap.height != height)
+        {
+            if (err) *err = strprintf("store tip %s resolved at h=%d, not at the store height h=%d",
+                                      hash.GetHex().c_str(), (int)snap.height, (int)height);
+            return false;
+        }
+        if (snap.hashPrev == uint256(0)) { if (err) *err = "cannot unwind the genesis block"; return false; }
+        *outParentHash = snap.hashPrev;
+        return true;
+    }
+    std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(hash);
+    if (it == mapBlockIndex.end()) {
+        if (err) *err = strprintf("store tip %s at h=%d is not in the block index", hash.GetHex().c_str(), (int)height);
+        return false;
+    }
+    CBlockIndex* bi = it->second;
+    if (bi->pprev == NULL) { if (err) *err = "cannot unwind the genesis block"; return false; }
+    *outParentHash = bi->pprev->GetBlockHash();
+    return true;
+}
+
 // S2.1: crash reconciliation between the loaded chain and the store.
 bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string* err)
 {
     if (err) err->clear();
     if (store == NULL || !store->opened()) { if (err) *err = "store is not open"; return false; }
     if (pindexBest == NULL) { if (err) *err = "no best chain loaded"; return false; }
-    const int32_t chainH = pindexBest->nHeight;
+    // The chain side of the reconciliation is the AUTHORITATIVE active tip, never
+    // the transient CBlockIndex projection: the projection is materialized FROM
+    // the tip, so a reconcile decision taken against it would compare the store
+    // with a derivative instead of with the owner.
+    int32_t chainH = pindexBest->nHeight;
+    uint256 chainTip = pindexBest->GetBlockHash();
+    if (g_fAuthoritativeStartup)
+    {
+        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+        const BlockIndexTipAuthority* tipAuth = (live != NULL && live->IsOpen()) ? live->TipAuthority() : NULL;
+        if (tipAuth == NULL) { if (err) *err = "authoritative tip authority absent"; return false; }
+        const BlockIndexCommittedTipSnapshot cts = tipAuth->CommittedTipSnapshot();
+        if (!cts.valid) { if (err) *err = "authoritative committed tip is not published"; return false; }
+        chainH = cts.tipHeight;
+        chainTip = cts.tipHash;
+    }
     int32_t sh = store->tipHeight();
     if (sh == chainH) {
         uint256 th; memcpy(th.begin(), store->tipHash().data(), 32);
-        if (th == pindexBest->GetBlockHash()) return true;
+        if (th == chainTip) return true;
     }
     // A) store AHEAD of the chain (the chain lost its last blocks): unwind with the undo log.
     while (sh > chainH) {
         uint256 bhash; memcpy(bhash.begin(), store->tipHash().data(), 32);
-        std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(bhash);
-        if (it == mapBlockIndex.end()) {
-            if (err) *err = strprintf("store tip %s at h=%d is not in the block index", bhash.GetHex(), (int)sh);
-            return false;
-        }
-        CBlockIndex* bi = it->second;
-        if (bi->pprev == NULL) { if (err) *err = "cannot unwind the genesis block"; return false; }
+        uint256 bparent;
+        if (!s16_ResolveReplayParent(bhash, sh, &bparent, err)) return false;
         cs::Hash bh, ph;
         memcpy(bh.data(), bhash.begin(), 32);
-        memcpy(ph.data(), bi->pprev->GetBlockHash().begin(), 32);
+        memcpy(ph.data(), bparent.begin(), 32);
         cs::ChainError se;
         if (!store->disconnect(bh, ph, &se)) { if (err) *err = "disconnect h=" + strprintf("%d", (int)sh) + ": " + se.str().c_str(); return false; }
         printf("S2.1 store reconcile: unwound block %s (h=%d) absent from the chain\n", bhash.GetHex().c_str(), (int)sh);
@@ -6474,14 +6594,23 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
         std::vector<cs::store3a::CommitStore3A::BatchBlock> batch;
         const size_t kReplayBatch = 2000;
         s16_ReplayOverlay overlay;   // prevouts created inside this window
+        uint256 prevApplied;
+        bool havePrev = (sh >= 0);
+        if (havePrev) memcpy(prevApplied.begin(), store->tipHash().data(), 32);
         for (int32_t h = from; h <= chainH; ++h) {
-            CBlockIndex* bi = pindexBest->GetAncestor(h);
-            if (bi == NULL) { if (err) *err = strprintf("block index has no ancestor at h=%d", (int)h); return false; }
+            uint256 bhash;
             CBlock blk;
-            if (!blk.ReadFromDisk(bi)) {
-                if (err) *err = strprintf("cannot read block %s at h=%d", bi->GetBlockHash().GetHex(), (int)h);
+            if (!s16_ResolveReplayBlock(h, &bhash, &blk, err))
+                return false;
+            // Contiguity gate: a replay is only valid as a strict extension of the
+            // store's current tip. A resolver that answered a different branch (or a
+            // torn read) must never be applied as a UTXO delta.
+            if (havePrev && blk.hashPrevBlock != prevApplied) {
+                if (err) *err = strprintf("replay discontinuity at h=%d: store tip %s is not the parent of %s",
+                                          (int)h, prevApplied.GetHex().c_str(), bhash.GetHex().c_str());
                 return false;
             }
+            prevApplied = bhash; havePrev = true;
             cs::Delta d; cs::ChainError de;
             if (!s16_BuildDeltaForBlock(blk, h, store, &d, &de, &overlay)) {
                 if (err) *err = strprintf("delta at h=%d: %s", (int)h, de.str().c_str());
@@ -6493,7 +6622,7 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
             }
             cs::store3a::CommitStore3A::BatchBlock bb;
             bb.d = d; bb.height = h;
-            memcpy(bb.blockHash.data(), bi->GetBlockHash().begin(), 32);
+            memcpy(bb.blockHash.data(), bhash.begin(), 32);
             batch.push_back(bb);
             if (batch.size() >= kReplayBatch) {
                 cs::ChainError pe;
@@ -6511,9 +6640,9 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
     }
     // C) final agreement -- never leave the caller with a silently divergent store.
     uint256 th; memcpy(th.begin(), store->tipHash().data(), 32);
-    if (store->tipHeight() != chainH || th != pindexBest->GetBlockHash()) {
+    if (store->tipHeight() != chainH || th != chainTip) {
         if (err) *err = strprintf("after reconcile store h=%d %s != chain h=%d %s",
-                                  (int)store->tipHeight(), th.GetHex(), (int)chainH, pindexBest->GetBlockHash().GetHex());
+                                  (int)store->tipHeight(), th.GetHex().c_str(), (int)chainH, chainTip.GetHex().c_str());
         return false;
     }
     return true;
