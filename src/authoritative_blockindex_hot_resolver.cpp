@@ -78,7 +78,11 @@ BlockIndexSnapshot AuthoritativeBlockIndexHotResolver::GetActiveByHeight(int hei
         if (tip && tip->IsOpen())
         {
             std::string tipErr;
-            const BlockIndexTipRead tr = tip->LookupActiveByHeight(height, &tipErr);
+            // LOGICAL (pending-aware) height lookup: a consensus walk that needs
+            // the successor of the durable tip must be able to cross into the
+            // buffered window; a durable-only read made the stake-kernel modifier
+            // depend on the publication state (h=50488 rejected with pending=487).
+            const BlockIndexTipRead tr = tip->LookupActiveByHeightLogical(height, &tipErr);
             if (tr.status == BLOCK_INDEX_TIP_OK)
             {
                 BlockIndexSnapshot snap;

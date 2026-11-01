@@ -137,14 +137,46 @@ BlockIndexSnapshot LegacyBlockIndexAccessor::GetAncestor(BlockIndexId id, int ta
     return SnapshotFromIndex(pancestor);
 }
 
+// IFCN#9 diagnostics (-kerneltrace): distinguish "not found by height" from
+// "found but not in the main chain" for the active-successor step.
+static bool AccKernelTrace()
+{
+    // NOT cached: the first call may happen before the argument map is final.
+    return GetBoolArg("-kerneltrace", false);
+}
 BlockIndexSnapshot LegacyBlockIndexAccessor::GetActiveByHeight(int height) const
 {
     AssertLockHeld(cs_main);
+    const bool kt = AccKernelTrace();
     if (height < 0 || pindexBest == NULL || height > pindexBest->nHeight)
+    {
+        if (kt) { printf("ACCTRACE GetActiveByHeight h=%d -> OUT_OF_RANGE best=%d\n", height, pindexBest ? pindexBest->nHeight : -1); fflush(stdout); }
         return BlockIndexSnapshot();
+    }
     CBlockIndex* pindex = FindBlockByHeight(height);
-    if (pindex == NULL || !pindex->IsInMainChain())
+    // IFCN#9 BUGFIX: active-chain membership must NOT be decided by
+    // CBlockIndex::IsInMainChain(), which is `(pnext || this == pindexBest)`.
+    // A raw pnext edge is legitimately absent on a retained/evicted/materialized
+    // object, so that predicate reports "not in main chain" for a block that IS
+    // on the active chain -- and that flipped a consensus input (the stake-kernel
+    // modifier walk stopped at the durable tip instead of crossing the buffered
+    // window). Membership is decided by identity along the ACTIVE chain instead:
+    // the block must be the best chain's own ancestor at that height (pprev/pskip
+    // based, which bounded residency keeps).
+    CBlockIndex* pbest = (pindexBest && height <= pindexBest->nHeight)
+                             ? pindexBest->GetAncestor(height) : NULL;
+    if (pindex == NULL || pbest == NULL || pbest != pindex ||
+        pbest->nHeight != height || pindex->nHeight != height)
+    {
+        if (kt) { printf("ACCTRACE GetActiveByHeight h=%d -> found=%d ancestor=%d match=%d best=%d"
+                         " pHash=%s aHash=%s\n", height,
+                         pindex ? 1 : 0, pbest ? 1 : 0, (pindex && pbest == pindex) ? 1 : 0,
+                         pindexBest->nHeight,
+                         pindex ? pindex->GetBlockHash().ToString().substr(0,16).c_str() : "-",
+                         pbest ? pbest->GetBlockHash().ToString().substr(0,16).c_str() : "-"); fflush(stdout); }
         return BlockIndexSnapshot();
+    }
+    if (kt) { printf("ACCTRACE GetActiveByHeight h=%d -> OK hash=%s\n", height, pindex->GetBlockHash().ToString().substr(0,16).c_str()); fflush(stdout); }
     return SnapshotFromIndex(pindex);
 }
 
@@ -152,6 +184,13 @@ BlockIndexSnapshot LegacyBlockIndexAccessor::GetNextActive(BlockIndexId id) cons
 {
     AssertLockHeld(cs_main);
     const CBlockIndex* pindex = ResolveIdLocked(id);
+    if (AccKernelTrace())
+    {
+        printf("ACCTRACE GetNextActive id=%llu -> pindex=%d h=%d pnext=%d\n",
+               (unsigned long long)id, pindex ? 1 : 0, pindex ? pindex->nHeight : -1,
+               (pindex && pindex->pnext) ? 1 : 0);
+        fflush(stdout);
+    }
     if (pindex == NULL || pindex->pnext == NULL)
         return BlockIndexSnapshot();
     return SnapshotFromIndex(pindex->pnext);

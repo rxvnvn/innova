@@ -1,6 +1,8 @@
 #include <boost/test/unit_test.hpp>
 
 #include "blockindex_tip.h"
+#include "main.h"
+#include "blockindex_authoritative_startup.h"
 #include "util.h"
 
 #include <boost/filesystem.hpp>
@@ -491,6 +493,93 @@ BOOST_AUTO_TEST_CASE(t10c_active_by_height_slot_equiv)
     BOOST_CHECK(tip.LookupActiveByHeight(baseTip + (int)n + 1, NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
     printf("t10c PASS LookupActiveByHeight slot-equivalent for %zu heights\n", n);
     tip.Close();
+}
+
+// IFCN#9 — PENDING-WINDOW CONSENSUS CONTRACT.
+// While -tipcommitbatch>1 the authority holds an in-memory append window that is
+// NOT yet durably published (state A of the h=50488 reproducer). The durable
+// height lookup must stay blind to it, and the LOGICAL one must see it: the
+// stake-kernel modifier walk resolves the active successor by height, so a
+// durable-only view stopped it at the durable tip and the kernel input then
+// depended on the publication state.
+BOOST_AUTO_TEST_CASE(t10d_logical_active_by_height_sees_pending_window)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 4000;
+    // Enable the IBD append window exactly as -tipcommitbatch does in production.
+    const bool hadBatch = mapArgs.count("-tipcommitbatch") != 0;
+    const bool hadAlways = mapArgs.count("-tipcommitbatchalways") != 0;
+    const std::string oldBatch = hadBatch ? mapArgs["-tipcommitbatch"] : std::string();
+    const std::string oldAlways = hadAlways ? mapArgs["-tipcommitbatchalways"] : std::string();
+    mapArgs["-tipcommitbatch"] = "16";
+    mapArgs["-tipcommitbatchalways"] = "1";
+
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 41, 900, baseTip, &tip, NULL));
+
+        const size_t n = 3;   // < batch, so the window stays UNPUBLISHED
+        std::vector<uint256> hsh(n);
+        uint256 prev = uint256(0x7a1aUL);
+        for (size_t i = 0; i < n; ++i)
+        {
+            BlockIndexTipAppend a;
+            a.record = MakeRecord(uint256(0x6100UL + i), prev, baseTip + (int)i + 1, true);
+            a.derived = MakeDerived(uint256(9), 4001 + i);
+            std::string err;
+            BOOST_REQUIRE(tip.Append(a, baseTip + (int)i + 1, &err) == BLOCK_INDEX_TIP_OK);
+            hsh[i] = a.record.hash;
+            prev = a.record.hash;
+        }
+        const uint64_t pend = tip.PendingCount();
+        printf("T10D pending_window=%llu logical_tip=%d durable_tip=%d\n",
+               (unsigned long long)pend, tip.TipHeight(), tip.GetTip().height);
+        BOOST_REQUIRE_EQUAL(pend, (uint64_t)n);
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + (int)n);      // logical
+        BOOST_REQUIRE(tip.GetTip().status == BLOCK_INDEX_TIP_NOT_FOUND); // durable: nothing published
+
+        // DURABLE contract: the unpublished window is invisible.
+        for (size_t i = 0; i < n; ++i)
+        {
+            const BlockIndexTipRead d = tip.LookupActiveByHeight(baseTip + (int)i + 1, NULL);
+            BOOST_CHECK_MESSAGE(d.status == BLOCK_INDEX_TIP_NOT_FOUND,
+                                "durable lookup leaked an unpublished active height "
+                                    << baseTip + (int)i + 1);
+        }
+        // LOGICAL contract (the fix): same heights resolve, active, exact identity.
+        for (size_t i = 0; i < n; ++i)
+        {
+            std::string lerr;
+            const BlockIndexTipRead l = tip.LookupActiveByHeightLogical(baseTip + (int)i + 1, &lerr);
+            BOOST_REQUIRE_MESSAGE(l.status == BLOCK_INDEX_TIP_OK,
+                                  "logical lookup missed buffered height "
+                                      << baseTip + (int)i + 1 << ": " << lerr);
+            BOOST_CHECK(l.active);
+            BOOST_CHECK_EQUAL(l.height, baseTip + (int)i + 1);
+            BOOST_CHECK(l.record.hash == hsh[i]);
+        }
+        BOOST_CHECK(tip.LookupActiveByHeightLogical(baseTip, NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
+        BOOST_CHECK(tip.LookupActiveByHeightLogical(baseTip + (int)n + 1, NULL).status == BLOCK_INDEX_TIP_NOT_FOUND);
+
+        // Publication: both views converge on the same active chain.
+        std::string ferr;
+        BOOST_REQUIRE(tip.FlushPendingAppends(&ferr) == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE_EQUAL(tip.PendingCount(), (uint64_t)0);
+        for (size_t i = 0; i < n; ++i)
+        {
+            const BlockIndexTipRead d = tip.LookupActiveByHeight(baseTip + (int)i + 1, NULL);
+            const BlockIndexTipRead l = tip.LookupActiveByHeightLogical(baseTip + (int)i + 1, NULL);
+            BOOST_REQUIRE(d.status == BLOCK_INDEX_TIP_OK);
+            BOOST_REQUIRE(l.status == BLOCK_INDEX_TIP_OK);
+            BOOST_CHECK(d.record.hash == l.record.hash);
+            BOOST_CHECK(d.record.hash == hsh[i]);
+        }
+        printf("T10D PASS logical-height-lookup crosses the pending window\n");
+        tip.Close();
+    }
+
+    if (hadBatch) mapArgs["-tipcommitbatch"] = oldBatch; else mapArgs.erase("-tipcommitbatch");
+    if (hadAlways) mapArgs["-tipcommitbatchalways"] = oldAlways; else mapArgs.erase("-tipcommitbatchalways");
 }
 
 // =====================================================================
@@ -1924,6 +2013,564 @@ BOOST_AUTO_TEST_CASE(p_tipbatch_rejects_nondense_inside_window)
     BOOST_REQUIRE(tip.Append(a, baseTip + 3, &err) == BLOCK_INDEX_TIP_CORRUPT);
     BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 1);
     printf("P4 PASS non-dense append rejected inside the window\n");
+}
+
+
+// =====================================================================
+// IFCN#9 perf — CUTOVER PUBLICATION CONTRACT (T1–T6)
+//
+// Observed production defect (real -cutstate trace, heights 500–503):
+//   h=500  DECIDE durStatus=NOT_FOUND durH=-1  logH=499 pend=499 ext=1  -> append, boundary commit -> dur=500
+//   h=501  DECIDE durH=500 logH=500 pend=0 ext=1                        -> append (pend=1)
+//   h=502  DECIDE durH=500 logH=501 pend=1 ext=0  <-- CUTOVER against the DURABLE tip
+//          CUT-ENTER oldPubH=500 / CUT-FORK fork=500 / REORGACT branch=2 (firstH=501)
+//   h=503  DECIDE durH=502 ...
+// The cutover branch starts at a block that is already logically active, so the
+// publication is an O(tip) truncate+re-attach for a plain extension.
+//
+// Contract pinned here:
+//   T1 progress    a published cutover/extension advances the DURABLE tip
+//   T2 convergence logical == durable ONLY at a confirmed durable boundary
+//   T3 publication the durable tip survives Close()/Open()
+//   T4 no duplicate the new block resolves to exactly one record id
+//   T5 continuation the next height is still accepted afterwards
+//   T6 detector    the "publish the branch with AppendBatch" substitution must
+//                  fail the T1/T5 contract instead of silently stalling
+// =====================================================================
+namespace {
+static bool DurableTipIs(const BlockIndexTipAuthority& tip, int32_t h, const uint256& hash)
+{
+    const BlockIndexTipRead d = tip.GetTip();
+    return d.status == BLOCK_INDEX_TIP_OK && d.height == h && d.record.hash == hash;
+}
+// T2: convergence is mandatory ONLY when the window is empty (confirmed durable
+// boundary). Mid-window divergence is the designed batching contract.
+static bool DurableBoundaryConverged(const BlockIndexTipAuthority& tip, std::string* why)
+{
+    if (tip.PendingCount() != 0)
+    {
+        *why = "not a durable boundary (pending window non-empty)";
+        return false;
+    }
+    const BlockIndexTipRead d = tip.GetTip();
+    if (d.status != BLOCK_INDEX_TIP_OK) { *why = "no durable tip"; return false; }
+    if (d.height != tip.TipHeight())
+    {
+        *why = "height divergence at durable boundary";
+        return false;
+    }
+    if (d.record.hash != tip.TipHash())
+    {
+        *why = "hash divergence at durable boundary";
+        return false;
+    }
+    return true;
+}
+// Mirror of the PRODUCTION caller's expected-parent rule (main.cpp): the logical
+// tip when the authority holds one, else the immutable base tip S.
+static uint256 ExpectedParentForTest(const BlockIndexTipAuthority& tip)
+{
+    const uint256 logical = tip.TipHash();
+    return logical != uint256(0) ? logical : tip.BaseTipHash();
+}
+static bool ExtensionDecisionForTest(const BlockIndexTipAuthority& tip, const uint256& parent)
+{
+    return IsAuthoritativeActiveExtension(parent, ExpectedParentForTest(tip));
+}
+static void AppendAt(BlockIndexTipAuthority& tip, uint256 h, uint256 prev, int height)
+{
+    BlockIndexRecord r = MakeRecord(h, prev, height, false);
+    BlockIndexDerivedEntry d = MakeDerived(h, 3000 + height);
+    BlockIndexTipAppend a; a.record = r; a.derived = d;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(tip.Append(a, height, &err) == BLOCK_INDEX_TIP_OK,
+                          "append h=" << height << " failed: " << err);
+}
+} // namespace
+
+BOOST_AUTO_TEST_CASE(p_cutover_contract_extension_publish_t1_t5)
+{
+    const std::string dir = MakeTempDir();
+    const int32_t baseTip = 499;
+    TipBatchArgs args("500", "1");
+    const uint256 h0(0xE000UL);   // base tip hash
+    const uint256 h500(0xE500UL), h501(0xE501UL), h502(0xE502UL), h503(0xE503UL);
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 11, 120, baseTip, &tip, NULL));
+        tip.SetBaseTipHash(h0);
+
+        // durable boundary at 500 (the real batch boundary)
+        AppendAt(tip, h500, h0, 500);
+        std::string err;
+        BOOST_REQUIRE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE(DurableTipIs(tip, 500, h500));
+
+        // 501 buffered: this is exactly the observed pre-cutover state
+        AppendAt(tip, h501, h500, 501);
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), 501);
+        BOOST_REQUIRE_EQUAL(tip.PendingCount(), 1u);
+        BOOST_REQUIRE_MESSAGE(DurableTipIs(tip, 500, h500),
+                              "durable tip must still be 500 while 501 is buffered");
+
+        // DECISION for 502: parent IS the logical tip -> EXTENSION, not a cutover
+        const BlockIndexTipRead d = tip.GetTip();
+        BOOST_REQUIRE_MESSAGE(ExtensionDecisionForTest(tip, h501),
+                              "T-decision: 502 must publish as an extension of the logical tip");
+        // the old durable-based rule would have said CUTOVER:
+        BOOST_CHECK_MESSAGE(!IsAuthoritativeActiveExtension(h501, d.record.hash),
+                            "T6: the durable-tip reference must reproduce the misrouting");
+
+        AppendAt(tip, h502, h501, 502);
+        BOOST_REQUIRE_EQUAL(tip.TipHeight(), 502);
+        BOOST_REQUIRE_MESSAGE(DurableTipIs(tip, 500, h500),
+                              "mid-window divergence is allowed (batch contract)");
+
+        std::string why;
+        BOOST_REQUIRE_MESSAGE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK, "flush: " << err);
+        BOOST_REQUIRE_MESSAGE(DurableTipIs(tip, 502, h502), "T1: durable progress to 502");
+        BOOST_REQUIRE_MESSAGE(DurableBoundaryConverged(tip, &why), "T2: " << why);
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 3u);                 // T4: 500,501,502 only
+        BOOST_REQUIRE(tip.LookupByHash(h501, NULL).status == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE(tip.LookupByHash(h502, NULL).status == BLOCK_INDEX_TIP_OK);
+
+        // T5 continuation
+        AppendAt(tip, h503, h502, 503);
+        BOOST_REQUIRE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK);
+        BOOST_REQUIRE_MESSAGE(DurableTipIs(tip, 503, h503), "T5: 503 accepted after 501+502");
+        BOOST_REQUIRE_MESSAGE(DurableBoundaryConverged(tip, &why), "T2(503): " << why);
+        tip.Close();
+    }
+    {
+        // T3 publication survives restart
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 11, &tip, NULL));
+        BOOST_REQUIRE_MESSAGE(DurableTipIs(tip, 503, h503), "T3: restart returns the published tip");
+        BOOST_REQUIRE_EQUAL(tip.TipRecordCount(), 4u);
+        tip.Close();
+    }
+    printf("CUTOVER-T1..T5 PASS extension publish: no cutover, durable boundary at 502/503, restart exact\n");
+}
+
+BOOST_AUTO_TEST_CASE(p_cutover_stall_detector_appendbatch_substitute)
+{
+    // T6 — DETECTOR for the reproduced silent stall (real run: -cutstate with the
+    // pre-fix durable-based decision + the AppendBatch substitution reached only
+    // h=502 in 151 s; see reports/innova/ifcn9-perf/logs/cutstate-defectlegacy.log).
+    //
+    // Measured mechanism (FACT, not inference):
+    //   h=502 decision: durable=500, logical=501, pending=1, ext=0 -> CUTOVER
+    //   the substituted publish calls AppendBatch([501,502]) WITHOUT the
+    //   ReorgActiveTo entry flush, so the branch is committed durably
+    //   (TIPCOMMIT durH=502) while the RAM window still holds {501} and
+    //   pendTipHeight stays 501;
+    //   h=503: Append validates against the STALE pending tip (503 != 502) and
+    //   fails closed with CORRUPT -> the chain is frozen at the published 501
+    //   even though the durable store advanced to 502.
+    //
+    // The detector asserts the contract violations. It FAILS if a future change
+    // makes this defective path look healthy (e.g. AppendBatch silently flushing
+    // the window), which is exactly the regression it must catch.
+    const std::string dir = MakeTempDir();
+    const int32_t baseTip = 499;
+    TipBatchArgs args("500", "1");
+    const uint256 h0(0xE000UL), h500(0xE500UL), h501(0xE501UL), h502(0xE502UL), h503(0xE503UL);
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 12, 140, baseTip, &tip, NULL));
+    tip.SetBaseTipHash(h0);
+    AppendAt(tip, h500, h0, 500);
+    std::string err;
+    BOOST_REQUIRE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK);
+    AppendAt(tip, h501, h500, 501);            // buffered: durable 500, logical 501
+    BOOST_REQUIRE_EQUAL(tip.PendingCount(), 1u);
+    BOOST_REQUIRE(tip.CommittedTipSnapshot().tipHeight == 501);   // published tip
+
+    // the substitution: publish the cutover branch with AppendBatch, NO flush
+    std::vector<BlockIndexTipAppend> branch;
+    std::vector<int32_t> heights;
+    for (int32_t h = 501; h <= 502; ++h)
+    {
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(h == 501 ? h501 : h502, h == 501 ? h500 : h501, h, false);
+        a.derived = MakeDerived(uint256(h), 4000 + h);
+        branch.push_back(a);
+        heights.push_back(h);
+    }
+    const BlockIndexTipStatus sub = tip.AppendBatch(branch, heights, &err);
+    BOOST_REQUIRE_MESSAGE(sub == BLOCK_INDEX_TIP_OK,
+                          "the substitute itself succeeds (that is why the stall is silent), got=" << (int)sub);
+
+    // The durable side looks HEALTHY (that is why the stall is silent): the
+    // commit landed and the committed snapshot advanced.
+    BOOST_REQUIRE_EQUAL(tip.GetTip().height, 502);
+    BOOST_REQUIRE(tip.CommittedTipSnapshot().tipHeight == 502);
+    // T1 VIOLATED: the LOGICAL tip (the one every subsequent Append validates
+    // against) never advanced -- it is frozen at the buffered 501.
+    BOOST_CHECK_MESSAGE(tip.TipHeight() != 502,
+                        "T6/T1: the defective path must leave the logical tip behind");
+    BOOST_CHECK_EQUAL(tip.TipHeight(), 501);
+    // T2 VIOLATED: a durable commit left the RAM window dirty, and the logical
+    // tip now sits BELOW the durable tip (illegal inversion).
+    BOOST_CHECK_MESSAGE(tip.PendingCount() == 1u,
+                        "T6/T2: the stale window is the causal state");
+    BOOST_CHECK_MESSAGE(tip.TipHeight() < tip.GetTip().height,
+                        "T6/T2: logical tip must be below durable to reproduce the freeze");
+    std::string why;
+    BOOST_CHECK_MESSAGE(!DurableBoundaryConverged(tip, &why),
+                        "T6/T2: logical/durable convergence must be violated here");
+    // T5 VIOLATED: the next block can never be accepted
+    BlockIndexRecord r503 = MakeRecord(h503, h502, 503, false);
+    BlockIndexDerivedEntry d503 = MakeDerived(h503, 4503);
+    BlockIndexTipAppend a503; a503.record = r503; a503.derived = d503;
+    const BlockIndexTipStatus cont = tip.Append(a503, 503, &err);
+    BOOST_CHECK_MESSAGE(cont == BLOCK_INDEX_TIP_CORRUPT,
+                        "T6/T5: 503 must be refused (lost progress), got=" << (int)cont);
+    printf("STALL DETECTED: published tip frozen at 501, durable=502, stale window=1, 503 rejected (%s)\n",
+           err.c_str());
+    tip.Close();
+}
+
+BOOST_AUTO_TEST_CASE(p_cutover_integration_501_502_503)
+{
+    // Integration: drive the PRODUCTION decision for 501,502,503 and require
+    // that 503 is accepted after 501+502 with no lost progress.
+    const std::string dir = MakeTempDir();
+    const int32_t baseTip = 499;
+    TipBatchArgs args("500", "1");
+    const uint256 h0(0xE000UL);
+    uint256 hashOf[504];
+    hashOf[500] = uint256(0xE500UL);
+    hashOf[501] = uint256(0xE501UL);
+    hashOf[502] = uint256(0xE502UL);
+    hashOf[503] = uint256(0xE503UL);
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 13, 160, baseTip, &tip, NULL));
+    tip.SetBaseTipHash(h0);
+    AppendAt(tip, hashOf[500], h0, 500);
+    std::string err;
+    BOOST_REQUIRE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK);
+
+    for (int32_t h = 501; h <= 503; ++h)
+    {
+        const bool ext = ExtensionDecisionForTest(tip, hashOf[h - 1]);
+        BOOST_REQUIRE_MESSAGE(ext, "h=" << h << ": linear IBD block must publish as an extension");
+        AppendAt(tip, hashOf[h], hashOf[h - 1], h);
+        BOOST_REQUIRE_MESSAGE(tip.TipHeight() == h, "h=" << h << ": logical tip must advance immediately");
+    }
+    BOOST_REQUIRE_MESSAGE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK, "flush: " << err);
+    BOOST_REQUIRE_MESSAGE(DurableTipIs(tip, 503, hashOf[503]),
+                          "integration: 503 must be published and not lost after 501+502");
+    std::string why;
+    BOOST_REQUIRE_MESSAGE(DurableBoundaryConverged(tip, &why), "integration T2: " << why);
+    tip.Close();
+    {
+        BlockIndexTipAuthority re;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 13, &re, NULL));
+        BOOST_REQUIRE_MESSAGE(DurableTipIs(re, 503, hashOf[503]), "integration: restart exact at 503");
+        re.Close();
+    }
+    printf("CUTOVER-INTEGRATION PASS 501->502->503 accepted, durable 503, restart exact\n");
+}
+
+BOOST_AUTO_TEST_CASE(p_cutover_decision_true_reorg_is_still_cutover)
+{
+    // The pending-aware rule must NOT swallow a genuine best-chain replacement:
+    // a side branch block that becomes best has a parent != logical tip, so the
+    // decision must stay CUTOVER and ReorgActiveTo must promote the side record.
+    const std::string dir = MakeTempDir();
+    const int32_t baseTip = 499;
+    TipBatchArgs args("500", "1");
+    const uint256 h0(0xE000UL), h500(0xE500UL);
+    const uint256 s1(0xF501UL), s2(0xF502UL);
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 14, 180, baseTip, &tip, NULL));
+    tip.SetBaseTipHash(h0);
+    AppendAt(tip, h500, h0, 500);
+    AppendAt(tip, uint256(0xE501UL), h500, 501);   // durable 501: the block the reorg replaces
+    std::string err;
+    BOOST_REQUIRE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE(DurableTipIs(tip, 501, uint256(0xE501UL)));
+
+    // side records (activeHeight = -1): a competing branch at fork 500
+    {
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(s1, h500, 501, false);
+        a.derived = MakeDerived(s1, 5001);
+        BOOST_REQUIRE(tip.Append(a, -1, &err) == BLOCK_INDEX_TIP_OK);
+        a.record = MakeRecord(s2, s1, 502, false);
+        a.derived = MakeDerived(s2, 5002);
+        BOOST_REQUIRE(tip.Append(a, -1, &err) == BLOCK_INDEX_TIP_OK);
+    }
+    BOOST_REQUIRE_MESSAGE(!ExtensionDecisionForTest(tip, s1),
+                          "a side-branch parent is not an extension of the active tip");
+    // publish the cutover exactly as the caller does (fork = durable tip)
+    std::vector<BlockIndexTipAppend> branch;
+    std::vector<int32_t> heights;
+    for (int32_t h = 501; h <= 502; ++h)
+    {
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(h == 501 ? s1 : s2, h == 501 ? h500 : s1, h, false);
+        a.derived = MakeDerived(uint256(h), 5100 + h);
+        branch.push_back(a); heights.push_back(h);
+    }
+    BOOST_REQUIRE_MESSAGE(tip.ReorgActiveTo(500, branch, heights, &err) == BLOCK_INDEX_TIP_OK,
+                          "true-reorg publish failed: " << err);
+    BOOST_REQUIRE_MESSAGE(DurableTipIs(tip, 502, s2), "the promoted side branch must become the durable tip");
+    BOOST_REQUIRE(tip.LookupByHash(s1, NULL).status == BLOCK_INDEX_TIP_OK);
+    printf("CUTOVER-DECISION PASS true reorg still routes through ReorgActiveTo (side promotion)\n");
+    tip.Close();
+}
+
+
+// =====================================================================
+// HARDENING PASS — first pending window, flush failure, publication contract
+// =====================================================================
+
+BOOST_AUTO_TEST_CASE(p_first_window_extension_requires_parent_identity)
+{
+    // A fresh IBD has NO durable tip. That must NOT mean "any block is an
+    // extension": the expected parent is the immutable base tip S, and after the
+    // first append the logical (buffered) tip. Consensus/chainwork are untouched:
+    // the authority only refuses to splice a block that does not attach.
+    const std::string dir = MakeTempDir();
+    const int32_t baseTip = 0;
+    TipBatchArgs args("500", "1");
+    const uint256 g(0xB000UL);        // base tip S hash
+    const uint256 h1(0xB001UL), h2(0xB002UL), h2bad(0xB0F2UL), other(0xB0FFUL);
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 21, 10, baseTip, &tip, NULL));
+    tip.SetBaseTipHash(g);
+
+    // (a) empty authority: only the child of S is an extension
+    BOOST_CHECK_MESSAGE(ExtensionDecisionForTest(tip, g), "the child of the base tip IS an extension");
+    BOOST_CHECK_MESSAGE(!ExtensionDecisionForTest(tip, other), "a non-child of the base tip is NOT");
+
+    // (b) the authority itself refuses a first block that does not attach to S
+    std::string err;
+    {
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(h1, other, 1, false);
+        a.derived = MakeDerived(h1, 7001);
+        BOOST_CHECK_MESSAGE(tip.Append(a, 1, &err) == BLOCK_INDEX_TIP_CORRUPT,
+                            "misparented first active block must be refused: " << err);
+        BOOST_CHECK_EQUAL(tip.TipHeight(), baseTip);
+        BOOST_CHECK_EQUAL(tip.PendingCount(), 0u);
+    }
+    // (c) the true child is accepted and becomes the logical tip
+    AppendAt(tip, h1, g, 1);
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), 1);
+    BOOST_REQUIRE(tip.TipHash() == h1);
+
+    // (d) after the first append the expected parent is the LOGICAL tip, not S
+    BOOST_CHECK_MESSAGE(ExtensionDecisionForTest(tip, h1), "child of the buffered tip is an extension");
+    BOOST_CHECK_MESSAGE(!ExtensionDecisionForTest(tip, g), "S is no longer the tip once h1 is buffered");
+    {
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(h2bad, other, 2, false);
+        a.derived = MakeDerived(h2bad, 7002);
+        BOOST_CHECK_MESSAGE(tip.Append(a, 2, &err) == BLOCK_INDEX_TIP_CORRUPT,
+                            "misparented continuation must be refused inside the window: " << err);
+        BOOST_CHECK_EQUAL(tip.TipHeight(), 1);
+        BOOST_CHECK(tip.TipHash() == h1);          // active chain identity unchanged
+        BOOST_CHECK_EQUAL(tip.PendingCount(), 1u); // no phantom record buffered
+    }
+    // (e) the true continuation still works and survives the boundary
+    AppendAt(tip, h2, h1, 2);
+    BOOST_REQUIRE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE(DurableTipIs(tip, 2, h2));
+    printf("FIRST-WINDOW PASS extension needs parent identity (S, then logical tip); misparented refused\n");
+    tip.Close();
+}
+
+BOOST_AUTO_TEST_CASE(p_first_window_competing_branch_is_reorg_not_extension)
+{
+    // A competing branch that becomes best BEFORE the first batch boundary must
+    // be published as a real cutover (side promotion), never spliced in as an
+    // extension of the active chain.
+    const std::string dir = MakeTempDir();
+    const int32_t baseTip = 0;
+    TipBatchArgs args("500", "1");
+    const uint256 g(0xB000UL), h1(0xB101UL), h2(0xB102UL);
+    const uint256 s2(0xB1F2UL);       // competing block at height 2 on parent h1
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 22, 10, baseTip, &tip, NULL));
+    tip.SetBaseTipHash(g);
+    AppendAt(tip, h1, g, 1);
+    AppendAt(tip, h2, h1, 2);
+    BOOST_REQUIRE_EQUAL(tip.PendingCount(), 2u);   // still inside the first window
+
+    // the competitor's parent is h1, the logical tip is h2 -> NOT an extension
+    BOOST_REQUIRE_MESSAGE(!ExtensionDecisionForTest(tip, h1),
+                          "same-height competitor must not take the extension fast path");
+    // it is accepted as a SIDE record (as AddToBlockIndex does for a non-best block)
+    std::string err;
+    {
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(s2, h1, 2, false);
+        a.derived = MakeDerived(s2, 7102);
+        BOOST_REQUIRE_MESSAGE(tip.Append(a, -1, &err) == BLOCK_INDEX_TIP_OK, err);
+    }
+    // and when it becomes best it is published through the reorg operation:
+    // fork = 1 (h1), branch = [s2]
+    std::vector<BlockIndexTipAppend> branch;
+    std::vector<int32_t> heights;
+    {
+        BlockIndexTipAppend a;
+        a.record = MakeRecord(s2, h1, 2, false);
+        a.derived = MakeDerived(s2, 7102);
+        branch.push_back(a); heights.push_back(2);
+    }
+    BOOST_REQUIRE_MESSAGE(tip.ReorgActiveTo(1, branch, heights, &err) == BLOCK_INDEX_TIP_OK, err);
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), 2);
+    BOOST_REQUIRE(tip.TipHash() == s2);
+    BOOST_REQUIRE_MESSAGE(DurableTipIs(tip, 2, s2), "reorg flushed and committed the competitor");
+    BOOST_REQUIRE(tip.LookupByHash(h2, NULL).status == BLOCK_INDEX_TIP_OK); // old branch kept as record
+    printf("FIRST-WINDOW-REORG PASS competitor published via ReorgActiveTo (side promotion), not spliced\n");
+    tip.Close();
+}
+
+BOOST_AUTO_TEST_CASE(p_flush_failure_keeps_window_and_no_false_commit)
+{
+    // A failed durable publication must NOT be reported as success and must NOT
+    // roll the logical tip back: the window stays answerable and a retry commits.
+    const std::string dir = MakeTempDir();
+    const int32_t baseTip = 499;
+    TipBatchArgs args("500", "1");
+    const uint256 h0(0xB000UL), h500(0xB500UL);
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 23, 10, baseTip, &tip, NULL));
+    tip.SetBaseTipHash(h0);
+    AppendAt(tip, h500, h0, 500);
+    BOOST_REQUIRE_EQUAL(tip.PendingCount(), 1u);
+
+    BlockIndexTipSetFailpointForTesting("FP_FLUSH_PENDING_APPENDS", true);
+    std::string err;
+    const BlockIndexTipStatus st = tip.FlushPendingAppends(&err);
+    BlockIndexTipSetFailpointForTesting("FP_FLUSH_PENDING_APPENDS", false);
+    BOOST_REQUIRE_MESSAGE(st == BLOCK_INDEX_TIP_IO_ERROR, "flush must fail, got " << (int)st);
+    BOOST_CHECK_MESSAGE(err.find("FP_FLUSH_PENDING_APPENDS") != std::string::npos,
+                        "the failure reason must be legible: " << err);
+    // no false durable confirmation
+    BOOST_CHECK_MESSAGE(tip.GetTip().status != BLOCK_INDEX_TIP_OK,
+                        "a failed flush must not publish a durable tip");
+    // the window survives: logical progress is not silently lost
+    BOOST_CHECK_EQUAL(tip.PendingCount(), 1u);
+    BOOST_CHECK_EQUAL(tip.TipHeight(), 500);
+    BOOST_CHECK(tip.TipHash() == h500);
+    BOOST_CHECK(tip.CommittedTipSnapshot().tipHeight == 500);   // logical snapshot kept
+    // retry publishes for real
+    BOOST_REQUIRE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK);
+    BOOST_REQUIRE(DurableTipIs(tip, 500, h500));
+    BOOST_CHECK_EQUAL(tip.PendingCount(), 0u);
+    printf("FLUSH-FAILURE PASS no false commit, window preserved, retry commits\n");
+    tip.Close();
+}
+
+BOOST_AUTO_TEST_CASE(p_publication_contract_logical_vs_durable)
+{
+    // Pins the whole publication surface: logical (TipHeight/TipHash), durable
+    // (GetTip = last committed active entry), the coherent snapshot, the RAM
+    // window and the on-disk tip.meta.
+    const std::string dir = MakeTempDir();
+    const int32_t baseTip = 499;
+    TipBatchArgs args("500", "1");
+    const uint256 h0(0xB000UL), h500(0xB500UL), s(0xB5F0UL);
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 24, 10, baseTip, &tip, NULL));
+        tip.SetBaseTipHash(h0);
+
+        // S0: empty authority -> no durable tip, logical tip == base tip S
+        BOOST_REQUIRE(tip.GetTip().status == BLOCK_INDEX_TIP_NOT_FOUND);
+        BOOST_CHECK_EQUAL(tip.TipHeight(), baseTip);
+        BOOST_CHECK(tip.TipHash() == uint256(0));
+        BOOST_CHECK_EQUAL(tip.PendingCount(), 0u);
+
+        // S1: buffered append -> LOGICAL advances, DURABLE does not, the snapshot
+        // is logical (that is what the sync pipeline consumes)
+        AppendAt(tip, h500, h0, 500);
+        BOOST_CHECK_EQUAL(tip.TipHeight(), 500);
+        BOOST_CHECK(tip.TipHash() == h500);
+        BOOST_CHECK(tip.GetTip().status == BLOCK_INDEX_TIP_NOT_FOUND);
+        BOOST_CHECK_EQUAL(tip.PendingCount(), 1u);
+        const BlockIndexCommittedTipSnapshot snap1 = tip.CommittedTipSnapshot();
+        BOOST_CHECK_MESSAGE(snap1.valid && snap1.tipHeight == 500 && snap1.tipHash == h500,
+                            "snapshot must publish the LOGICAL tip inside the window");
+
+        // S2: durable boundary -> everything converges
+        std::string err;
+        BOOST_REQUIRE(tip.FlushPendingAppends(&err) == BLOCK_INDEX_TIP_OK);
+        BOOST_CHECK(DurableTipIs(tip, 500, h500));
+        BOOST_CHECK_EQUAL(tip.TipHeight(), 500);
+        BOOST_CHECK(tip.TipHash() == h500);
+        BOOST_CHECK_EQUAL(tip.PendingCount(), 0u);
+        const BlockIndexCommittedTipSnapshot snap2 = tip.CommittedTipSnapshot();
+        BOOST_CHECK_MESSAGE(snap2.valid && snap2.tipHeight == 500 && snap2.tipHash == h500,
+                            "snapshot converges at the durable boundary");
+        tip.Close();
+    }
+    {
+        // S3: tip.meta on disk carries exactly that state
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Open(dir, 24, &tip, NULL));
+        BOOST_CHECK(DurableTipIs(tip, 500, h500));
+        BOOST_CHECK_EQUAL(tip.PendingCount(), 0u);
+        const BlockIndexCommittedTipSnapshot snap3 = tip.CommittedTipSnapshot();
+        BOOST_CHECK(snap3.valid && snap3.tipHeight == 500 && snap3.tipHash == h500);
+
+        // S4: a reorg publishes through the same surface (fork == base tip S)
+        std::string err;
+        {
+            BlockIndexTipAppend a;
+            a.record = MakeRecord(s, h0, 500, false);
+            a.derived = MakeDerived(s, 7500);
+            BOOST_REQUIRE(tip.Append(a, -1, &err) == BLOCK_INDEX_TIP_OK);
+        }
+        std::vector<BlockIndexTipAppend> branch; std::vector<int32_t> heights;
+        {
+            BlockIndexTipAppend a;
+            a.record = MakeRecord(s, h0, 500, false);
+            a.derived = MakeDerived(s, 7500);
+            branch.push_back(a); heights.push_back(500);
+        }
+        BOOST_REQUIRE_MESSAGE(tip.ReorgActiveTo(baseTip, branch, heights, &err) == BLOCK_INDEX_TIP_OK, err);
+        BOOST_CHECK(DurableTipIs(tip, 500, s));
+        BOOST_CHECK_EQUAL(tip.TipHeight(), 500);
+        BOOST_CHECK(tip.TipHash() == s);
+        const BlockIndexCommittedTipSnapshot snap4 = tip.CommittedTipSnapshot();
+        BOOST_CHECK_MESSAGE(snap4.valid && snap4.tipHash == s,
+                            "snapshot must follow a durable reorg");
+        tip.Close();
+    }
+    printf("CONTRACT PASS logical/durable/snapshot/window/tip.meta separated and convergent at boundaries\n");
+}
+
+BOOST_AUTO_TEST_CASE(p_tipbatch_boundary_must_not_exceed_store_barrier)
+{
+    // Store3A commits at the barrier and the tip publishes the same height right
+    // after ConnectBlock returns; a coarser tip boundary would let the store run
+    // ahead of the block index, a state the startup reconcile refuses.
+    BOOST_CHECK(IsTipBatchCompatibleWithStoreBarrier(1, 1000));    // default: unchanged
+    BOOST_CHECK(IsTipBatchCompatibleWithStoreBarrier(500, 1000));  // our IBD setting
+    BOOST_CHECK(IsTipBatchCompatibleWithStoreBarrier(1000, 1000)); // exactly aligned
+    BOOST_CHECK_MESSAGE(!IsTipBatchCompatibleWithStoreBarrier(2000, 1000),
+                        "a tip boundary coarser than the store barrier must be refused");
+    BOOST_CHECK_MESSAGE(!IsTipBatchCompatibleWithStoreBarrier(500, 1),
+                        "a single-block store barrier cannot absorb a coarse tip boundary");
+    BOOST_CHECK_MESSAGE(!IsTipBatchCompatibleWithStoreBarrier(500, 0),
+                        "no barrier => no bound => refuse");
+    printf("BATCH-BOUNDARY PASS tip boundary must not exceed the Store3A barrier\n");
+}
+
+BOOST_AUTO_TEST_CASE(p_shutdown_flush_helper_inert_without_authority)
+{
+    // The shutdown hook must be inert (and claim nothing) when authoritative mode
+    // is not armed -- it must never report a publication it did not perform.
+    BOOST_CHECK(FlushAuthoritativeTipWindowAtShutdown());
+    BlockIndexTipSetFailpointForTesting("FP_FLUSH_PENDING_APPENDS", true);
+    BOOST_CHECK(FlushAuthoritativeTipWindowAtShutdown());
+    BlockIndexTipSetFailpointForTesting("FP_FLUSH_PENDING_APPENDS", false);
+    printf("SHUTDOWN-HELPER PASS inert without an authoritative live authority\n");
 }
 
 BOOST_AUTO_TEST_SUITE_END()

@@ -172,6 +172,13 @@ struct BlockIndexCommittedTipSnapshot
         : valid(false), tipHeight(-1), tipHash(0), baseGeneration(0) {}
 };
 
+// IFCN#9 perf cutover-state trace, enabled by -cutstate. DIAGNOSTIC ONLY:
+// prints one line per publication decision / durable commit so the cutover
+// contract (logical vs durable tip, pending window, fork, branch) can be
+// reconstructed from a real run. Behaviour is identical when disabled.
+bool BlockIndexCutTraceEnabled();
+void BlockIndexCutTrace(const char* fmt, ...);
+
 class BlockIndexTipAuthority
 {
 public:
@@ -258,6 +265,13 @@ public:
     BlockIndexTipRead LookupByHash(const uint256& hash, std::string* error) const;
     // Lookup a block by active height. Only matches active members.
     BlockIndexTipRead LookupActiveByHeight(int32_t height, std::string* error) const;
+    // IFCN#9 BUGFIX (pending-window consensus dependence): the SAME lookup over
+    // the LOGICAL active chain -- the buffered window first, then the durable
+    // boundary. Consensus reads (the stake-kernel modifier walk) must see the
+    // chain the node has validated, not only its last durable commit point;
+    // otherwise a by-value successor step stops at the durable tip and the kernel
+    // input changes with the publication state.
+    BlockIndexTipRead LookupActiveByHeightLogical(int32_t height, std::string* error) const;
     // Parent lookup by hash (record.hashPrev).
     BlockIndexTipRead LookupParent(const uint256& childHash, std::string* error) const;
     // Next active successor (active height+1 member whose record.hashPrev == current).
@@ -297,6 +311,9 @@ public:
     // mutable-tip lookup.
     BlockIndexCommittedTipSnapshot CommittedTipSnapshot() const;
     uint64_t TipRecordCount() const;
+    // IFCN#9 perf diagnostics (-cutstate): number of appends buffered in the
+    // RAM window and not yet durably published. Read-only, O(1).
+    uint64_t PendingCount() const;
     uint8_t  ActiveFence() const;
     bool     IsOpen() const;
     bool     IsEmpty() const;          // no tip records committed

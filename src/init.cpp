@@ -144,19 +144,47 @@ void Shutdown(void* parg)
         fShutdown = true;
         ShutdownCPUMining();
 
+        // IFCN#9 perf (-tipcommitbatch): DURABILITY ORDER, block index first. The
+        // mutable tip IS the authority for the accepted chain, so its residual RAM
+        // window is published before anything else; Store3A is committed only when
+        // this succeeded (see the gated block below). Without this flush a clean
+        // stop left tip.meta at the last batch boundary while legacy/Store3A sat at
+        // the real tip, and the next start failed the reconcile.
+        bool fIndexDurable = true;
+        if (g_fAuthoritativeStartup)
+        {
+            LOCK(cs_main);
+            fIndexDurable = FlushAuthoritativeTipWindowAtShutdown();
+            if (!fIndexDurable)
+            {
+                printf("Shutdown: DURABILITY FAILURE -- authoritative tip window was NOT published; "
+                       "the durable tip stays at the last batch boundary\n");
+                fflush(stdout);
+            }
+        }
+
         // IFCN#9 S5 (F-7): commit a pending Store3A batch before the process leaves. Without this
         // a GRACEFUL stop left the pages of an applied-but-uncommitted batch behind with no
         // MANIFEST, and the next start had to recover from generation 0 (and, before the S5 fix,
         // could not open the datadir at all). cs_main excludes a concurrent ConnectBlock /
         // Disconnect from mutating the batch while it is published. A failure is reported, never
         // hidden: the next start rolls back to the committed generation and replays the chain.
+        // DURABILITY ORDER (IFCN#9 perf): the commit is SKIPPED when the block index could not be
+        // published -- a Store3A state AHEAD of the block index is unrecoverable at startup
+        // (reconcile fails closed), while a store BEHIND the index is safely replayed.
         {
             LOCK(cs_main);
             if (s16::g_chainObserve.store != NULL && s16::g_chainObserve.store->opened() &&
                 !s16::g_chainObserve.pending.empty())
             {
                 const size_t nPending = s16::g_chainObserve.pending.size();
-                if (s16::g_chainObserve.FlushPending())
+                if (!fIndexDurable)
+                {
+                    printf("Shutdown: Store3A pending batch NOT committed (%d block(s)): "
+                           "block index durability failed (the store must never run ahead of the "
+                           "block index; the next start replays it)\n", (int)nPending);
+                }
+                else if (s16::g_chainObserve.FlushPending())
                 {
                     printf("Shutdown: Store3A pending batch committed (%d block(s))\n", (int)nPending);
                 }
@@ -1963,6 +1991,15 @@ authoritative_startup_ready:
             {
                 int nb = (int)GetArg("-s16store3abatch", 1000);
                 s16::g_chainObserve.batchSize = (size_t)(nb > 0 ? nb : 1);
+                int64_t tipBatch = 1;
+                if (mapArgs.count("-tipcommitbatch"))
+                    ParseInt64(mapArgs["-tipcommitbatch"], &tipBatch);
+                if (!IsTipBatchCompatibleWithStoreBarrier(tipBatch, nb))
+                    return InitError(strprintf("unsafe batching: -tipcommitbatch=%d is coarser than the "
+                                               "Store3A durability barrier (-s16store3abatch=%d); the store "
+                                               "would run ahead of the block index and a crash would leave a "
+                                               "state the startup reconcile refuses (fail closed)",
+                                               (int)tipBatch, nb));
             }
             armed = &s16::g_chainObserve;
             printf("store3a replay publication armed at %s (batch=%llu)\n", s3aDir.c_str(),
@@ -1981,6 +2018,16 @@ authoritative_startup_ready:
         }
         SetBulkImportMode(false);
         {
+            // IFCN#9 durability order: this one-shot import path ends with exit(0)
+            // and NEVER reaches Shutdown(), so the residual mutable-tip window must
+            // be published HERE -- before the Store3A trailing batch, exactly like
+            // the shutdown path. Without it a -tipcommitbatch>1 import left tip.meta
+            // at the last batch boundary while the store/legacy chain sat at the
+            // real tip (observed: index 50 000 vs store 50 487), i.e. a store AHEAD
+            // of the block index that the next startup reconcile refuses.
+            if (!FlushAuthoritativeTipWindowAtShutdown())
+                return InitError("authoritative tip window flush after -loadblock failed "
+                                 "(durability; the import is NOT complete)");
             // S2.1: flush the trailing store batch before anything else claims the import is done.
             if (armed && !armed->pending.empty())
             {
@@ -2219,6 +2266,15 @@ authoritative_startup_ready:
             {
                 int nb = (int)GetArg("-s16store3abatch", 1000);
                 s16::g_chainObserve.batchSize = (size_t)(nb > 0 ? nb : 1);
+                int64_t tipBatch = 1;
+                if (mapArgs.count("-tipcommitbatch"))
+                    ParseInt64(mapArgs["-tipcommitbatch"], &tipBatch);
+                if (!IsTipBatchCompatibleWithStoreBarrier(tipBatch, nb))
+                    return InitError(strprintf("unsafe batching: -tipcommitbatch=%d is coarser than the "
+                                               "Store3A durability barrier (-s16store3abatch=%d); the store "
+                                               "would run ahead of the block index and a crash would leave a "
+                                               "state the startup reconcile refuses (fail closed)",
+                                               (int)tipBatch, nb));
                 printf("S2.1 Store3A publication batching: %llu block(s) per durability barrier\n",
                        (unsigned long long)s16::g_chainObserve.batchSize);
                 fflush(stdout);

@@ -1,4 +1,14 @@
 #include "cold_hot_seam.h"
+
+// IFCN#9 diagnostics (-kerneltrace): record the exact kernel-modifier walk so a
+// pending-window divergence can be compared with the durable state on one block.
+static bool KernelTraceEnabled()
+{
+    static const bool e = GetBoolArg("-kerneltrace", false);
+    return e;
+}
+#define KT(...) do { if (KernelTraceEnabled()) { printf(__VA_ARGS__); fflush(stdout); } } while (0)
+
 #include "kernel.h" // GetStakeModifierSelectionInterval, nModifierInterval
 
 namespace {
@@ -365,9 +375,31 @@ ColdHotSeamResult ColdHotSeamNavigator::GetNextActiveR(const BlockIndexNavigatio
         return MakeHot(next, out, error) ? COLD_HOT_SEAM_OK : COLD_HOT_SEAM_AUTHORITY_FAILURE;
     }
 
-    const BlockIndexSnapshot next = testHotResolver ? testHotResolver->GetNextActiveByHash(current.snapshot.hash) : hotAccessor.GetNextActive(current.snapshot.id);
+    BlockIndexSnapshot next = testHotResolver ? testHotResolver->GetNextActiveByHash(current.snapshot.hash) : hotAccessor.GetNextActive(current.snapshot.id);
     if (!next.found)
-        return COLD_HOT_SEAM_END_OF_ACTIVE_CHAIN; // genuine successor absence
+    {
+        // IFCN#9 BUGFIX (pending-window consensus dependence): a raw `pnext`
+        // edge can be ABSENT on a retained / by-value-materialized object even
+        // though the block IS on the active chain -- and whether that edge is
+        // present must never change a consensus input. Resolve the successor BY
+        // HEIGHT from the active chain instead (the chain being extended, not the
+        // published tip) and verify the identity: `hashPrev` MUST equal the
+        // current hash, so this step can never cross to another branch.
+        const BlockIndexSnapshot byHeight =
+            testHotResolver ? testHotResolver->GetActiveByHeight(current.snapshot.height + 1)
+                            : hotAccessor.GetActiveByHeight(current.snapshot.height + 1);
+        if (!byHeight.found || byHeight.hashPrev != current.snapshot.hash)
+        {
+            KT("KT3-next-END h=%d hash=%s pnext=absent byHeightFound=%d byHeightPrevMatch=%d",
+               current.snapshot.height, current.snapshot.hash.ToString().substr(0,16).c_str(),
+               byHeight.found ? 1 : 0,
+               (byHeight.found && byHeight.hashPrev == current.snapshot.hash) ? 1 : 0);
+            return COLD_HOT_SEAM_END_OF_ACTIVE_CHAIN; // genuine successor absence
+        }
+        KT("KT3-next-byHeight h=%d -> h=%d hash=%s",
+           current.snapshot.height, byHeight.height, byHeight.hash.ToString().substr(0,16).c_str());
+        next = byHeight;
+    }
     const BlockIndexSnapshot coldTip = coldReader.GetTip();
     if (next.fInMainChain && next.height <= coldTip.height)
     {
@@ -729,6 +761,13 @@ ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndex
     *nStakeModifierHeight = from.snapshot.height;
     *nStakeModifierTime = (int64_t)from.snapshot.nTime;
     const int64_t nStakeModifierSelectionInterval = GetStakeModifierSelectionInterval();
+    KT("KT src=%s h=%d time=%lld cold=%d inMain=%d mod=%016llx interval=%lld target=%lld",
+       from.snapshot.hash.ToString().substr(0,16).c_str(), from.snapshot.height,
+       (long long)from.snapshot.nTime, from.ref.IsCold() ? 1 : 0,
+       from.snapshot.fInMainChain ? 1 : 0,
+       (unsigned long long)from.snapshot.nStakeModifier,
+       (long long)nStakeModifierSelectionInterval,
+       (long long)((int64_t)from.snapshot.nTime + nStakeModifierSelectionInterval));
 
     // Forward active-chain walk from the source until the modifier is selected
     // a selection-interval later. Mirrors kernel.cpp GetKernelStakeModifier
@@ -768,11 +807,21 @@ ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndex
             *nStakeModifierHeight = pindex.snapshot.height;
             *nStakeModifierTime = (int64_t)pindex.snapshot.nTime;
         }
+        KT("KT step h=%d hash=%s cold=%d inMain=%d genMod=%d time=%lld mod=%016llx runTime=%lld",
+           pindex.snapshot.height, pindex.snapshot.hash.ToString().substr(0,16).c_str(),
+           pindex.ref.IsCold() ? 1 : 0, pindex.snapshot.fInMainChain ? 1 : 0,
+           (pindex.snapshot.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER) ? 1 : 0,
+           (long long)pindex.snapshot.nTime,
+           (unsigned long long)pindex.snapshot.nStakeModifier,
+           (long long)*nStakeModifierTime);
     }
 
     *nStakeModifier = pindex.snapshot.nStakeModifier;
     if (outFinalWalkHeight)
         *outFinalWalkHeight = pindex.snapshot.height;
+    KT("KT done mod=%016llx h=%d time=%lld finalWalk=%d",
+       (unsigned long long)*nStakeModifier, *nStakeModifierHeight,
+       (long long)*nStakeModifierTime, pindex.snapshot.height);
     SeamClear(error);
     return COLD_HOT_SEAM_OK;
 }
@@ -842,6 +891,13 @@ ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndex
         return rt;
 
     const int64_t nTargetTime = (int64_t)from.snapshot.nTime + GetStakeModifierSelectionInterval();
+    KT("KT3 src=%s h=%d t=%lld cold=%d inMain=%d | tip=%s h=%d t=%lld cold=%d inMain=%d | target=%lld path=%s",
+       from.snapshot.hash.ToString().substr(0,16).c_str(), from.snapshot.height, (long long)from.snapshot.nTime,
+       from.ref.IsCold() ? 1 : 0, from.snapshot.fInMainChain ? 1 : 0,
+       tip.snapshot.hash.ToString().substr(0,16).c_str(), tip.snapshot.height, (long long)tip.snapshot.nTime,
+       tip.ref.IsCold() ? 1 : 0, tip.snapshot.fInMainChain ? 1 : 0,
+       (long long)nTargetTime,
+       (from.snapshot.fInMainChain && tip.snapshot.fInMainChain && from.snapshot.height <= tip.snapshot.height) ? "ACTIVE" : "SIDE");
 
     // --- ACTIVE-CHAIN fast path -------------------------------------------
     // Both source and tip are on the single active chain with source not above
@@ -863,7 +919,13 @@ ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndex
             if (nr == COLD_HOT_SEAM_AUTHORITY_FAILURE)
                 return COLD_HOT_SEAM_AUTHORITY_FAILURE; // fail closed
             if (nr != COLD_HOT_SEAM_OK)
+            {
+                KT("KT3-ACTIVE-END at h=%d hash=%s cold=%d inMain=%d runTime=%lld target=%lld nr=%d",
+                   cur.snapshot.height, cur.snapshot.hash.ToString().substr(0,16).c_str(),
+                   cur.ref.IsCold() ? 1 : 0, cur.snapshot.fInMainChain ? 1 : 0,
+                   (long long)runTime, (long long)nTargetTime, (int)nr);
                 break; // end of active chain before target
+            }
             cur = next;
             // Mirror legacy: update running modifier time/height only at a
             // generated-modifier block, then test against the target. This
@@ -875,6 +937,7 @@ ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndex
             }
             if (runTime >= nTargetTime)
             {
+                KT("KT3-ACTIVE-hit h=%d mod=%016llx", runHeight, (unsigned long long)cur.snapshot.nStakeModifier);
                 *nStakeModifier = cur.snapshot.nStakeModifier;
                 *nStakeModifierHeight = runHeight;
                 *nStakeModifierTime = runTime;
@@ -930,6 +993,8 @@ ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndex
     if (!foundSource)
         return SeamFail(error, "GetKernelStakeModifier() : stake source is not an ancestor of candidate branch") ? COLD_HOT_SEAM_NOT_FOUND : COLD_HOT_SEAM_NOT_FOUND;
 
+    KT("KT3-SIDE-walk foundSource=%d hasBest=%d bestH=%d tipH=%d",
+       foundSource ? 1 : 0, hasBest ? 1 : 0, hasBest ? best.snapshot.height : -1, tip.snapshot.height);
     if (hasBest)
     {
         *nStakeModifier = best.snapshot.nStakeModifier;
@@ -943,6 +1008,7 @@ ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndex
     // reached the target, its inherited modifier is authoritative.
     if ((int64_t)tip.snapshot.nTime >= nTargetTime)
     {
+        KT("KT3-SIDE-tipfallback h=%d mod=%016llx", tip.snapshot.height, (unsigned long long)tip.snapshot.nStakeModifier);
         *nStakeModifier = tip.snapshot.nStakeModifier;
         *nStakeModifierHeight = tip.snapshot.height;
         *nStakeModifierTime = (int64_t)tip.snapshot.nTime;

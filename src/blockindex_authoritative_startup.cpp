@@ -803,6 +803,32 @@ BlockIndexAuthoritativeLive* GetAuthoritativeLiveAuthority()
     return g_authoritativeContext->live.get();
 }
 
+bool FlushAuthoritativeTipWindowAtShutdown()
+{
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (!live || !live->IsOpen())
+        return true;
+    BlockIndexTipAuthority* tip = live->TipAuthorityMutable();
+    if (!tip || !tip->IsOpen())
+        return true;
+    const uint64_t nPend = tip->PendingCount();
+    if (nPend == 0)
+        return true;
+    std::string err;
+    const BlockIndexTipStatus st = tip->FlushPendingAppends(&err);
+    if (st != BLOCK_INDEX_TIP_OK)
+    {
+        printf("Shutdown: DURABILITY FAILURE -- authoritative tip window flush NOT published after %llu block(s): status=%d %s\n",
+               (unsigned long long)nPend, (int)st, err.c_str());
+        fflush(stdout);
+        return false;
+    }
+    printf("Shutdown: authoritative tip window flushed (%llu block(s), durable tip height %d)\n",
+           (unsigned long long)nPend, (int)tip->GetTip().height);
+    fflush(stdout);
+    return true;
+}
+
 // G1 test-only arms (see header). Pair set/clear; inert when unset.
 void SetAuthoritativeLiveForTesting(BlockIndexAuthoritativeLive* live)
 {

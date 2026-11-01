@@ -159,6 +159,16 @@ int32_t AuthoritativeBaseTipHeight();
 // authoritative context, including the bootstrap HotOwner live metrics.
 void PrintAuthoritativeResidency(const char* tag);
 
+// IFCN#9 perf: flush the mutable tip's residual IBD window at a CLEAN shutdown.
+// The live-authority context is retained process-lifetime and has no teardown,
+// so without this call a clean stop abandoned every append buffered since the
+// last -tipcommitbatch boundary: tip.meta stayed at the boundary while legacy /
+// Store3A sat at the real tip, and the next start failed the Store3A reconcile
+// ("store tip ... is not in the block index"). Best effort by contract: a
+// failure leaves the durable state at the last boundary (the blocks are already
+// in blk*.dat) and the next start re-fetches them. Caller holds cs_main.
+bool FlushAuthoritativeTipWindowAtShutdown();
+
 // G1: production live-authority accessor. NULL when NOT in authoritative mode.
 // The returned object (if any) is retained process-lifetime by the authoritative
 // startup context and bound to the single process-open base reader + the mutable

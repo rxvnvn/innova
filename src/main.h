@@ -577,6 +577,16 @@ bool AuthoritativeSyncCheckpointSwitchChainByValue(const uint256& hashCheckpoint
 // asserted (two unresolved ancestors must NOT be treated as a common ancestor).
 // Inert in production; never called by the daemon.
 class BlockIndexAuthoritativeLive;
+// IFCN#9 perf: authoritative publication decision (extension vs cutover) for a
+// block that became best. Extension is decided against the LOGICAL (pending-aware)
+// tip; see the definition in main.cpp for the contract.
+bool IsAuthoritativeActiveExtension(const uint256& parentHash,
+                                    const uint256& expectedParentHash);
+
+// IFCN#9 durability order (see main.cpp): the mutable-tip commit boundary must
+// not be coarser than the Store3A durability barrier.
+bool IsTipBatchCompatibleWithStoreBarrier(int64_t tipBatch, int64_t storeBatch);
+
 bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* live,
                                                    CBlockIndex* pindexNew,
                                                    const uint256& oldPublishedTipHash,

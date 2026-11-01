@@ -21,6 +21,7 @@
 #include <memory>
 
 #include <algorithm>
+#include <cstdarg>
 #include <cstdio>
 #include <cstring>
 #include <map>
@@ -31,6 +32,24 @@
 // take it as cs_hashSyncCheckpoint -> csTailLock. No other order exists.
 
 namespace fs = boost::filesystem;
+
+// ---- IFCN#9 perf: cutover-state trace (-cutstate) --------------------------
+// Enabled once per process; every call site is a single bool test when off.
+bool BlockIndexCutTraceEnabled()
+{
+    static const bool enabled = GetBoolArg("-cutstate", false);
+    return enabled;
+}
+void BlockIndexCutTrace(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+// ---------------------------------------------------------------------------
 
 namespace {
 
@@ -2202,6 +2221,21 @@ BlockIndexTipStatus BlockIndexTipAuthority::Append(const BlockIndexTipAppend& bl
         const int32_t logicalTip = i->HasPending() ? i->pendTipHeight : i->meta.tipHeight;
         if (activeHeight >= 0 && activeHeight != logicalTip + 1)
             return SetError(error, "non-dense active append (pending)"), BLOCK_INDEX_TIP_CORRUPT;
+        // Active-chain ATTACHMENT: the buffered block must extend the identity the
+        // window (or the committed tip / the immutable base tip) currently ends
+        // with. A dense height alone cannot detect a competing branch of the same
+        // height, and buffering it would advance the logical tip onto a block that
+        // can never attach at flush time.
+        if (activeHeight >= 0)
+        {
+            const uint256 expectPrev =
+                i->HasPending() ? i->pendTipHash
+                                : ((i->meta.tipHeight > i->meta.baseTipHeight)
+                                       ? i->meta.tipHash : i->expectedBaseTipHash);
+            if (expectPrev != uint256(0) && blk.record.hashPrev != expectPrev)
+                return SetError(error, "active append parent mismatch (pending)"),
+                       BLOCK_INDEX_TIP_CORRUPT;
+        }
         i->pendIndex[blk.record.hash] = i->pendBlocks.size();
         i->pendBlocks.push_back(blk);
         i->pendHeights.push_back(activeHeight);
@@ -2212,6 +2246,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::Append(const BlockIndexTipAppend& bl
         }
         i->pendCount = (i->HasPending() ? i->pendBlocks.size() : 0);
         i->PublishLogicalSnapshot();
+        if (BlockIndexCutTraceEnabled())
+            BlockIndexCutTrace("APPEND-WIN h=%d hash=%s pend=%llu durH=%d durHash=%s",
+                               activeHeight, blk.record.hash.ToString().substr(0,16).c_str(),
+                               (unsigned long long)i->pendBlocks.size(),
+                               i->meta.tipHeight, i->meta.tipHash.ToString().substr(0,16).c_str());
         if ((int64_t)i->pendBlocks.size() >= batchN)
             return FlushPendingAppends(error);
         return BLOCK_INDEX_TIP_OK;
@@ -2232,12 +2271,49 @@ BlockIndexTipStatus BlockIndexTipAuthority::FlushPendingAppends(std::string* err
         ClearError(error);
         return BLOCK_INDEX_TIP_OK;
     }
+    // Test-only: force the durable commit of the window to fail (durability
+    // regression: the window must survive, the logical tip must NOT roll back and
+    // no commit may be reported).
+    if (BlockIndexTipFailpointHit("FP_FLUSH_PENDING_APPENDS"))
+        return SetError(error, "failpoint FP_FLUSH_PENDING_APPENDS"), BLOCK_INDEX_TIP_IO_ERROR;
     std::vector<BlockIndexTipAppend> blocks;
     std::vector<int32_t> heights;
+    const size_t nPend = i->pendBlocks.size();
+    const int32_t nLogH = i->HasPending() ? i->pendTipHeight : i->meta.tipHeight;
     blocks.swap(i->pendBlocks);
     heights.swap(i->pendHeights);
     i->DropPending();
-    return AppendBatch(blocks, heights, error);
+    const BlockIndexTipStatus fst = AppendBatch(blocks, heights, error);
+    if (fst != BLOCK_INDEX_TIP_OK)
+    {
+        // Durability failure. AppendBatch is atomic at tip.meta: nothing was
+        // committed, so the RAM window is answerable state and MUST be restored
+        // (otherwise a failed flush silently rolled the logical tip back to the
+        // last boundary while the caller believes the blocks are published).
+        i->pendBlocks.swap(blocks);
+        i->pendHeights.swap(heights);
+        int32_t lastActiveH = -1;
+        uint256 lastActiveHash(0);
+        i->pendIndex.clear();
+        for (size_t k = 0; k < i->pendBlocks.size(); ++k)
+        {
+            i->pendIndex[i->pendBlocks[k].record.hash] = k;
+            if (k < i->pendHeights.size() && i->pendHeights[k] >= 0)
+            {
+                lastActiveH = i->pendHeights[k];
+                lastActiveHash = i->pendBlocks[k].record.hash;
+            }
+        }
+        i->pendTipHeight = lastActiveH;
+        i->pendTipHash = lastActiveHash;
+        i->pendCount = i->pendBlocks.size();
+        i->PublishLogicalSnapshot();
+    }
+    if (BlockIndexCutTraceEnabled())
+        BlockIndexCutTrace("FLUSH n=%llu logH=%d status=%d durH=%d durHash=%s",
+                           (unsigned long long)nPend, nLogH, (int)fst,
+                           i->meta.tipHeight, i->meta.tipHash.ToString().substr(0,16).c_str());
+    return fst;
 }
 
 BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
@@ -2262,6 +2338,16 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     // with a single block). Track the expected height locally instead: the
     // sequence is still strictly dense and any gap/reorder is refused.
     int32_t expectedActive = i->meta.tipHeight;
+    // Active-chain ATTACHMENT (fail closed). A dense height alone does not prove
+    // the block extends THIS chain: a competing branch block at the same height
+    // has a different hashPrev but a perfectly dense height, and splicing it in
+    // would silently replace the active predecessor's identity. The expected
+    // parent is the committed tip hash, or -- while the tip is still empty -- the
+    // immutable base tip S. A zero reference means "unknown" (synthetic fixture
+    // without base binding) and keeps the historical behaviour. Side records
+    // (activeHeight < 0) are exempt: they are not part of the active chain.
+    uint256 expectPrev = (i->meta.tipHeight > i->meta.baseTipHeight)
+                             ? i->meta.tipHash : i->expectedBaseTipHash;
     for (size_t k = 0; k < blocks.size(); ++k)
     {
         // Idempotent replay check via the durable side index (O(log N) LevelDB
@@ -2279,7 +2365,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
             // must be the dense next active height within this batch
             if (ah != expectedActive + 1)
                 return SetError(error, "non-dense active append"), BLOCK_INDEX_TIP_CORRUPT;
+            // ...and must attach to the identity the chain currently ends with
+            if (expectPrev != uint256(0) && blocks[k].record.hashPrev != expectPrev)
+                return SetError(error, "active append parent mismatch"), BLOCK_INDEX_TIP_CORRUPT;
             expectedActive = ah;
+            expectPrev = blocks[k].record.hash;
         }
         newRecords.push_back(blocks[k].record);
         newDerived.push_back(blocks[k].derived);
@@ -2504,6 +2594,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
             return BLOCK_INDEX_TIP_IO_ERROR;
         }
     }
+    if (BlockIndexCutTraceEnabled())
+        BlockIndexCutTrace("TIPCOMMIT recs=%llu durH=%d durHash=%s fence=%u",
+                           (unsigned long long)i->meta.tipRecordCount,
+                           i->meta.tipHeight, i->meta.tipHash.ToString().substr(0,16).c_str(),
+                           (unsigned)i->meta.activeFence);
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
 }
@@ -2629,10 +2724,19 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     const std::vector<int32_t>& branchHeights,
     std::string* error)
 {
+    if (BlockIndexCutTraceEnabled())
+        BlockIndexCutTrace("REORGACT-ENTER fork=%d branch=%llu pend=%llu durH=%d durHash=%s logH=%d",
+                           forkHeight, (unsigned long long)branch.size(),
+                           (unsigned long long)(impl->HasPending() ? impl->pendBlocks.size() : 0),
+                           impl->meta.tipHeight, impl->meta.tipHash.ToString().substr(0,16).c_str(),
+                           impl->HasPending() ? impl->pendTipHeight : impl->meta.tipHeight);
     if (impl->HasPending())
     {
         BlockIndexTipStatus fst = FlushPendingAppends(error);
         if (fst != BLOCK_INDEX_TIP_OK) return fst;
+        if (BlockIndexCutTraceEnabled())
+            BlockIndexCutTrace("REORGACT-AFTER-FLUSH durH=%d durHash=%s",
+                               impl->meta.tipHeight, impl->meta.tipHash.ToString().substr(0,16).c_str());
     }
     if (!impl->open)
         return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
@@ -2908,6 +3012,10 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
             return BLOCK_INDEX_TIP_IO_ERROR;
         }
     }
+    if (BlockIndexCutTraceEnabled())
+        BlockIndexCutTrace("REORGACT-COMMIT durH=%d durHash=%s recs=%llu fence=%u",
+                           i->meta.tipHeight, i->meta.tipHash.ToString().substr(0,16).c_str(),
+                           (unsigned long long)i->meta.tipRecordCount, (unsigned)i->meta.activeFence);
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
 }
@@ -3336,6 +3444,37 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupByHash(const uint256& hash, std:
     return r;
 }
 
+BlockIndexTipRead BlockIndexTipAuthority::LookupActiveByHeightLogical(int32_t height, std::string* error) const
+{
+    BlockIndexTipRead r;
+    if (!impl->open)
+    {
+        r.status = BLOCK_INDEX_TIP_IO_ERROR;
+        return r;
+    }
+    Impl* i = impl;
+    {
+        LOCK(i->csTailLock);
+        // 1. The BUFFERED window: accepted-and-validated ACTIVE appends that are
+        // not yet durably published. Active heights are dense inside the window.
+        for (size_t k = 0; k < i->pendBlocks.size(); ++k)
+        {
+            if (k < i->pendHeights.size() && i->pendHeights[k] == height)
+            {
+                r.status = BLOCK_INDEX_TIP_OK;
+                r.record = i->pendBlocks[k].record;
+                r.derived = i->pendBlocks[k].derived;
+                r.active = true;
+                r.height = height;
+                if (error) error->clear();
+                return r;
+            }
+        }
+    }
+    // 2. The durable boundary (the only committed active chain).
+    return LookupActiveByHeight(height, error);
+}
+
 BlockIndexTipRead BlockIndexTipAuthority::LookupActiveByHeight(int32_t height, std::string* error) const
 {
     BlockIndexTipRead r;
@@ -3725,6 +3864,12 @@ uint64_t BlockIndexTipAuthority::TipRecordCount() const
 {
     LOCK(impl->csTailLock);
     return impl->meta.tipRecordCount + (impl->HasPending() ? (uint64_t)impl->pendBlocks.size() : 0);
+}
+
+uint64_t BlockIndexTipAuthority::PendingCount() const
+{
+    LOCK(impl->csTailLock);
+    return impl->HasPending() ? (uint64_t)impl->pendBlocks.size() : 0;
 }
 uint8_t BlockIndexTipAuthority::ActiveFence() const { LOCK(impl->csTailLock); return impl->meta.activeFence; }
 

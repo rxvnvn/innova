@@ -6384,17 +6384,25 @@ static void s16_ObserveConnectBlock(const CBlock& blk,
         cs::store3a::CommitStore3A::BatchBlock bb;
         bb.d = d; bb.blockHash = bh; bb.height = pindex->nHeight;
         // Apply NOW (no barrier): the next block in the batch must read the coins this one created.
+        // IFCN#9 durability order: publish the PREVIOUS batch BEFORE this block is
+        // applied, so Store3A never becomes durable at a height whose mutable-tip
+        // publication has not happened yet. The tip for height H is published in
+        // AddToBlockIndex(H) after ConnectBlock(H) returns; flushing H inside
+        // ConnectBlock(H) kept the store exactly one block AHEAD of the block index
+        // for the duration of the call, and a crash in that window left a store
+        // whose tip is not in the block index -- which the startup reconcile
+        // refuses (the node could not start).
+        if (st.pending.size() >= st.batchSize && !st.FlushPending()) {
+            ++st.fails; st.needsRecovery = true;   // a failed batch publish is fatal for the observer
+            if (st.lastOpError.empty()) st.lastOpError = "batch publish failed";
+            st.lastHeight = pindex->nHeight; return;
+        }
         cs::ChainError ae;
         if (!st.store->applyBatchBlock(d, &ae)) {
             ++st.fails; st.needsRecovery = true;
             st.lastOpError = ae.str(); st.lastHeight = pindex->nHeight; return;
         }
         st.pending.push_back(bb);
-        if (st.pending.size() >= st.batchSize && !st.FlushPending()) {
-            ++st.fails; st.needsRecovery = true;   // a failed batch publish is fatal for the observer
-            if (st.lastOpError.empty()) st.lastOpError = "batch publish failed";
-            st.lastHeight = pindex->nHeight; return;
-        }
         ++st.published; st.lastOps = d.ops.size(); st.lastHeight = pindex->nHeight;
         return;
     }
@@ -8183,6 +8191,66 @@ bool CBlock::GetCoinAge(uint64_t& nCoinAge) const
     return true;
 }
 
+// IFCN#9 perf (cutover publication contract): the authoritative publication
+// decision for a block that became best.
+//
+// EXTENSION means the accepted block's parent IS the parent identity the
+// authority has already validated:
+//   * the LOGICAL tip (durable boundary + buffered window) when the authority
+//     holds one, or
+//   * the immutable base tip S while the FIRST pending window is still empty
+//     (no durable tip yet, nothing buffered).
+//
+// It is NOT enough for the durable tip to be absent: "no tip yet" is the state
+// of every fresh IBD, and treating it as a blanket extension would splice a
+// competing branch (same height, different parent) onto the active chain -- the
+// dense-height check alone cannot see a parent mismatch. When the caller cannot
+// name the expected parent (zero hash) the decision must fall through to the
+// cutover path, which validates attachment against the fork block and fails
+// closed if the branch does not attach.
+//
+// During IBD with -tipcommitbatch=N the DURABLE published tip lags the logical
+// tip by up to N buffered appends, so a decision taken against the durable tip
+// misroutes every block that follows a buffered append into the CUTOVER path:
+// the publish then presents a branch whose first block is already active
+// (fork = durable tip, branch = [pending_tip, new]) and ReorgActiveTo has to
+// truncate and re-attach the whole active prefix for a plain extension -- an
+// O(tip) store walk per accepted block (the IFCN#9 seek storm).
+//
+// The durable tip stays the reference for a REAL cutover (a same-height
+// replacement or a fork below the logical tip) and remains the argument the
+// cutover publishes against; logical/durable convergence is required only at a
+// confirmed durable boundary (batch flush / authority transition / Close).
+bool IsAuthoritativeActiveExtension(const uint256& parentHash,
+                                    const uint256& expectedParentHash)
+{
+    if (parentHash == uint256(0) || expectedParentHash == uint256(0))
+        return false; // no identity to compare -> never a fast-path extension
+    return parentHash == expectedParentHash;
+}
+
+// IFCN#9 durability order: is the mutable-tip commit boundary compatible with the
+// Store3A durability barrier?
+//
+// Store3A commits a batch at the barrier; the block index publishes the SAME
+// height in AddToBlockIndex(H), i.e. AFTER ConnectBlock(H) has returned. The
+// barrier is therefore moved to the NEXT block's connect (see the observe hook),
+// so the store never commits a height the index has not published. That works
+// only while the tip boundary is not COARSER than the store barrier: with
+// tipBatch > storeBatch the store would get up to (tipBatch - storeBatch) blocks
+// ahead of the index, and a crash there leaves a state the startup reconcile
+// rejects (the store tip is not in the block index -> fail closed, node cannot
+// start). A combination that violates this is REFUSED at startup rather than
+// silently producing an unrestartable node.
+bool IsTipBatchCompatibleWithStoreBarrier(int64_t tipBatch, int64_t storeBatch)
+{
+    if (tipBatch <= 1)
+        return true;                 // per-block publication: the pre-existing contract
+    if (storeBatch <= 0)
+        return false;                // no barrier configured -> cannot bound the lead
+    return tipBatch <= storeBatch;
+}
+
 // H6E: the CURRENT V2 owner of a best-chain
 // CUTOVER. A newly-best block that is not a direct child of the currently
 // published live tip is not an append: it replaces (part of) the published
@@ -8217,6 +8285,7 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
             oH = pOldTip->nHeight;
         }
     }
+    const bool fOldResident = (pOldTip != NULL);
     if (oH < 0)
     {
         BlockIndexSnapshot s; std::string e;
@@ -8227,6 +8296,15 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
         }
         oH = s.height;
     }
+    if (BlockIndexCutTraceEnabled())
+        BlockIndexCutTrace("CUT-ENTER newH=%d newHash=%s oldPubH=%d oldPubHash=%s src=%s logH=%d logHash=%s durH=%d pend=%llu",
+                           pindexNew->nHeight, pindexNew->GetBlockHash().ToString().substr(0,16).c_str(),
+                           oH, oldPublishedTipHash.ToString().substr(0,16).c_str(),
+                           fOldResident ? "map-resident" : "by-value",
+                           live->TipAuthority() ? live->TipAuthority()->TipHeight() : -1,
+                           live->TipAuthority() ? live->TipAuthority()->TipHash().ToString().substr(0,16).c_str() : "-",
+                           live->TipAuthority() ? live->TipAuthority()->GetTip().height : -1,
+                           (unsigned long long)(live->TipAuthority() ? live->TipAuthority()->PendingCount() : 0));
     // Last common ancestor of the published active tip and the new best chain,
     // resolved BY HASH across the sparse-hot / by-value boundary (C12). The legacy
     // GetAncestor-by-pointer walk returns NULL for a tip whose pprev/pskip were
@@ -8273,6 +8351,9 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
         }
         nForkHeight = nH; forkHash = nHash;
     }
+    if (BlockIndexCutTraceEnabled())
+        BlockIndexCutTrace("CUT-FORK fork=%d forkHash=%s newH=%d",
+                           nForkHeight, forkHash.ToString().substr(0,16).c_str(), pindexNew->nHeight);
     // V2-R2 (PM1-P0-09): the cutover fork must lie at or above the immutable base
     // tip S. A fork below S is a below-base reorg and is NOT served by the mutable
     // tail; fail closed explicitly rather than driving ReorgTo with a fork the tip
@@ -8362,7 +8443,14 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
             }
         }
     }
-    return PublishAuthoritativeLiveTailReorg(nForkHeight, vConnect, outErr);
+    const bool fOkCut = PublishAuthoritativeLiveTailReorg(nForkHeight, vConnect, outErr);
+    if (BlockIndexCutTraceEnabled())
+        BlockIndexCutTrace("CUT-PUBLISH fork=%d branch=%llu firstH=%d lastH=%d ok=%d err=%s",
+                           nForkHeight, (unsigned long long)vConnect.size(),
+                           vConnect.empty() ? -1 : (int)vConnect.front()->nHeight,
+                           vConnect.empty() ? -1 : (int)vConnect.back()->nHeight,
+                           fOkCut ? 1 : 0, (outErr && !outErr->empty()) ? outErr->c_str() : "-");
+    return fOkCut;
 }
 
 // V2-R2D test seam (see main.h): forwards to the static cutover guard.
@@ -8768,9 +8856,28 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 // live pprev pointer (which would misroute it into a cutover).
                 const uint256 c12ParentHash =
                     pindexNew->pprev ? pindexNew->pprev->GetBlockHash() : pindexNew->hashPrevStable;
+                const uint256 logicalTipHash = tipAuth ? tipAuth->TipHash() : uint256(0);
+                // Parent identity the authority has validated: the logical tip if
+                // it holds one, else the immutable base tip S (first window).
+                const uint256 expectedParentHash =
+                    (logicalTipHash != uint256(0))
+                        ? logicalTipHash
+                        : (tipAuth ? tipAuth->BaseTipHash() : uint256(0));
                 const bool fExtension =
-                    (c12ParentHash != uint256(0) &&
-                     (!fTipPresent || tipRead.record.hash == c12ParentHash));
+                    IsAuthoritativeActiveExtension(c12ParentHash, expectedParentHash);
+                if (BlockIndexCutTraceEnabled())
+                    BlockIndexCutTrace("DECIDE newH=%d newHash=%s parent=%s durStatus=%d durH=%d durHash=%s logH=%d logHash=%s expParent=%s pend=%llu ext=%d",
+                                       pindexNew->nHeight,
+                                       hash.ToString().substr(0,16).c_str(),
+                                       c12ParentHash.ToString().substr(0,16).c_str(),
+                                       (int)tipRead.status,
+                                       fTipPresent ? tipRead.height : -1,
+                                       fTipPresent ? tipRead.record.hash.ToString().substr(0,16).c_str() : "-",
+                                       tipAuth ? tipAuth->TipHeight() : -1,
+                                       logicalTipHash.ToString().substr(0,16).c_str(),
+                                       expectedParentHash.ToString().substr(0,16).c_str(),
+                                       (unsigned long long)(tipAuth ? tipAuth->PendingCount() : 0),
+                                       fExtension ? 1 : 0);
                 if (MainFailpointHitForTesting("FP_BEFORE_V2_AUTHORITY_COMMIT"))
                 {
                     okP = false;

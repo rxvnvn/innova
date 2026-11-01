@@ -1069,6 +1069,22 @@ bool CheckStakeKernelHash(const CBlockIndex* pindexPrev, unsigned int nBits, con
 
     ss << nTimeBlockFrom << nTxPrevOffset << txPrev.nTime << prevout.n << nTimeTx;
     hashProofOfStake = Hash(ss.begin(), ss.end());
+    {
+        // IFCN#9 diagnostics (-kerneltrace): the exact consensus input tuple.
+        static const bool kt = GetBoolArg("-kerneltrace", false);
+        if (kt)
+        {
+            printf("KT kernel blockFrom=%s h=%d time=%u offset=%u txPrev=%s txPrevTime=%u prevoutN=%u nTimeTx=%u "
+                   "mod=%016llx modH=%d modT=%lld hashProof=%s target=%s\n",
+                   hashBlockFrom.ToString().substr(0,16).c_str(), GetStakeSourceHeightForDebug(hashBlockFrom),
+                   nTimeBlockFrom, nTxPrevOffset, txPrev.GetHash().ToString().substr(0,16).c_str(),
+                   txPrev.nTime, prevout.n, nTimeTx,
+                   (unsigned long long)nStakeModifier, nStakeModifierHeight, (long long)nStakeModifierTime,
+                   hashProofOfStake.ToString().substr(0,16).c_str(),
+                   targetProofOfStake.ToString().substr(0,16).c_str());
+            fflush(stdout);
+        }
+    }
 
     if (fPrintProofOfStake)
     {
