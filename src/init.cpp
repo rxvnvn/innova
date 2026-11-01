@@ -8,6 +8,7 @@
 #include <malloc.h>   // Block Index V2: malloc_trim for authoritative arena release (Linux/glibc)
 #include <memory>     // A.13.4-R3 bounded CTxDB lifetime
 #include "init.h"
+#include "blockindex_authoritative_live.h"
 #include "main.h"
 #include "chainstate/observe_hook.h"   // S1.7 off-by-default Store3A mirror during -loadblock replay
 #include "kernel.h"
@@ -2063,6 +2064,12 @@ authoritative_startup_ready:
                    (unsigned long long)armed->fails, (unsigned long long)armed->mismatch,
                    (int)armed->lastHeight, armed->lastOpError.c_str(), keys,
                    (int)(armed->needsRecovery ? 1 : 0), armed->lastAuthorityMismatch.c_str());
+            if (getenv("INNOVA_WINSTAT") != NULL)
+            {
+                BlockIndexAuthoritativeLive* lv = GetAuthoritativeLiveAuthority();
+                if (lv && lv->IsOpen() && lv->TipAuthority())
+                    lv->TipAuthority()->DumpWindowStats();
+            }
             armed->enabled = false;
             s3aStore.close();
         }

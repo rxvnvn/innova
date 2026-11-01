@@ -314,6 +314,8 @@ public:
     // IFCN#9 perf diagnostics (-cutstate): number of appends buffered in the
     // RAM window and not yet durably published. Read-only, O(1).
     uint64_t PendingCount() const;
+    // IFCN#9: print per-window cache counters (ring / decoded LRU / pread).
+    void DumpWindowStats() const;
     uint8_t  ActiveFence() const;
     bool     IsOpen() const;
     bool     IsEmpty() const;          // no tip records committed
