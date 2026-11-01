@@ -1185,27 +1185,35 @@ bool CommitStore3A::publishBatch(const std::vector<BatchBlock>& batch, ChainErro
     // everything itself (one-shot mode, used by the startup replay).
     const uint64_t ct0 = s21_now_ns();
     const bool preApplied = batchOpen_;
+    if(preApplied && tree_.overlayActive()){
+        if(!tree_.finalizeOverlay(e)){ tree_.abortOverlay(); batchOpen_=false; return false; }
+    }
     ChainError er;
     uint32_t oldRoot = preApplied ? batchOldRoot_ : tree_.rootId();
     Hash oldHash     = preApplied ? batchOldHash_ : tree_.rootHash();
     if(!preApplied) tree_.clearRetired();
     std::vector<uint8_t> undoBuf; undoBuf.reserve(batch.size()*256);
     std::vector<uint64_t> recEnds; recEnds.reserve(batch.size());
+    if(!preApplied) tree_.beginOverlay();   // IFCN#9: one overlay for the whole batch
     for(size_t bi=0; bi<batch.size(); ++bi){
         const Delta& d=batch[bi].d;
         if(!preApplied){
-            if(!applyOps(d,e)){ tree_.setRoot(oldRoot,oldHash,&er); return false; }
+            if(!applyOps(d,e)){ tree_.abortOverlay(); tree_.setRoot(oldRoot,oldHash,&er); return false; }
         }
         UndoRecord rec; rec.blockHash=batch[bi].blockHash; rec.height=batch[bi].height; rec.ops=d.ops;
         std::vector<uint8_t> rb=rec.encode();
         undoBuf.insert(undoBuf.end(), rb.begin(), rb.end());
         recEnds.push_back(undoCommittedBytes_+undoBuf.size());
     }
+    if(!preApplied && tree_.overlayActive()){
+        if(!tree_.finalizeOverlay(e)){ tree_.abortOverlay(); return false; }
+    }
     const BatchBlock& last=batch.back();
     uint64_t newGen=generation_+1; uint64_t newUndoSize=undoCommittedBytes_+undoBuf.size();
     Manifest m; m.generation=newGen; m.undoSize=newUndoSize; m.rootPageId=tree_.rootId();
     m.rootHash=tree_.rootHash(); m.blockHash=last.blockHash; m.tipHeight=last.height;
     if(!commitBarriers(m,undoCommittedBytes_,undoBuf.data(),undoBuf.size(),e,&recEnds)){
+        tree_.abortOverlay();
         if(!renamePassed_) tree_.setRoot(oldRoot,oldHash,&er);
         if(heldLogFd_>=0){ ::close(heldLogFd_); heldLogFd_=-1; }
         if(renamePassed_) requireReopen("the new MANIFEST may be visible while its durability barrier failed");
@@ -1243,9 +1251,11 @@ bool CommitStore3A::applyBatchBlock(const Delta& d, ChainError* e){
     if(!batchOpen_){
         batchOldRoot_=tree_.rootId(); batchOldHash_=tree_.rootHash();
         tree_.clearRetired(); batchOpen_=true;
+        tree_.beginOverlay();       // IFCN#9: collapse the COW path across the whole flush
     }
     if(!applyOps(d,e)){
-        ChainError x; tree_.setRoot(batchOldRoot_,batchOldHash_,&x); batchOpen_=false;
+        ChainError x; tree_.abortOverlay();
+        tree_.setRoot(batchOldRoot_,batchOldHash_,&x); batchOpen_=false;
         return false;
     }
     return true;
@@ -1255,8 +1265,24 @@ bool CommitStore3A::applyOps(const Delta& d, ChainError* e){
     for(size_t oi=0; oi<d.ops.size(); ++oi){
         const Op& op=d.ops[oi];
         Key k=op.op.keyBytes();
-        if(op.afterPresent){ std::vector<uint8_t> v=op.after.encode(); if(!tree_.put(k,v,e)) return false; }
-        else { if(!tree_.erase(k,e)) return false; }
+        std::vector<uint8_t> v;
+        if(op.afterPresent) v=op.after.encode();
+        if(!tree_.overlayActive()){
+            if(op.afterPresent){ if(!tree_.put(k,v,e)) return false; }
+            else { if(!tree_.erase(k,e)) return false; }
+            continue;
+        }
+        // IFCN#9: accumulate into the batch overlay; a split (or the RAM cap) forces a
+        // finalize, after which the op is replayed through the normal structural path.
+        bool needFin=false;
+        if(op.afterPresent){ if(!tree_.overlayPut(k,v,&needFin,e)) return false; }
+        else { if(!tree_.overlayErase(k,&needFin,e)) return false; }
+        if(needFin || tree_.overlayOverflow()){
+            if(!tree_.finalizeOverlay(e)) return false;
+            tree_.beginOverlay();
+            if(op.afterPresent){ if(!tree_.put(k,v,e)) return false; }
+            else { if(!tree_.erase(k,e)) return false; }
+        }
     }
     return true;
 }

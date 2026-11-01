@@ -125,6 +125,14 @@ bool BTree::readPage(uint32_t id, uint8_t* buf, ChainError* e) const {
 }
 // R1: read + decode + authenticate a page against its expected Merkle node hash.
 bool BTree::readNodeVerified(uint32_t id, const Hash& expect, Node* n, ChainError* e) const {
+    // IFCN#9 overlay: a node edited in this batch is newer than its on-disk page and
+    // its hash changes when it is published; serve the in-memory node. Authentication
+    // is not weakened -- every page was verified when first loaded into the overlay,
+    // and the parent/child hashes are recomputed at finalize time.
+    if (overlayOn_){
+        std::map<uint32_t, OverlayEnt>::const_iterator it = ov_.find(id);
+        if (it != ov_.end() && it->second.n.type != 0){ *n = it->second.n; return true; }
+    }
     uint8_t buf[PAGE_SIZE]; if (!readPage(id,buf,e)) return false;
     if (!decodeNode(buf,n,e)) return false;
     Hash calc = (n->type==NT_LEAF)? leafHash(*n) : internalHash(*n);
@@ -253,6 +261,168 @@ bool BTree::modRec(uint32_t id, const Hash& expect, const Key& k, const std::vec
     commitRetired_.push_back(id);   // CoW: full pre-split internal page is retired
     uint32_t lid,rid; if(!appendPage(lb,&lid,e)) return false; if(!appendPage(rb,&rid,e)) return false;
     *outId=lid; *outHash=internalHash(L); split->split=true; split->sep=sep; split->rightId=rid; split->rightHash=internalHash(R);
+    return true;
+}
+
+// ---------------------------------------------------------------- IFCN#9 overlay
+bool BTree::overlayPut(const Key& k, const std::vector<uint8_t>& val, bool* needFinalize, ChainError* e){
+    *needFinalize = false;
+    std::vector<uint32_t> path;
+    uint32_t id = rootId_; Hash expect = rootHash_;
+    for (int guard = 0; guard < 64; ++guard){
+        OverlayEnt& ent = ov_[id];
+        if (ent.n.type == 0){
+            uint8_t buf[PAGE_SIZE];
+            if (!readPage(id, buf, e)) return false;
+            if (!decodeNode(buf, &ent.n, e)) return false;
+            Hash calc = (ent.n.type == NT_LEAF) ? leafHash(ent.n) : internalHash(ent.n);
+            if (memcmp(calc.data(), expect.data(), 32) != 0){
+                setErr(e, ErrCode::CORRUPT, "overlay: page " + std::to_string(id) + " fails authentication");
+                return false;
+            }
+        }
+        path.push_back(id);
+        if (ent.n.type == NT_LEAF){
+            size_t pos = 0;
+            while (pos < ent.n.entries.size() && keyCmp(ent.n.entries[pos].key, k) < 0) ++pos;
+            const bool present = (pos < ent.n.entries.size() && keyCmp(ent.n.entries[pos].key, k) == 0);
+            // Decide the split BEFORE mutating: the leaf may already carry earlier edits
+            // of this same batch, and those must never be dropped by a re-dispatch.
+            size_t prospective = 4;
+            for (size_t i = 0; i < ent.n.entries.size(); ++i)
+                prospective += 38 + ent.n.entries[i].val.size();
+            if (!present) prospective += 38 + val.size();
+            if (prospective > PAGE_SIZE){
+                *needFinalize = true;   // caller publishes the overlay, then applies this op normally
+                return true;
+            }
+            if (present) ent.n.entries[pos].val = val;
+            else { LeafEntry le; le.key = k; le.val = val; ent.n.entries.insert(ent.n.entries.begin() + pos, le); }
+            if (leafSize(ent.n) > PAGE_SIZE){
+                setErr(e, ErrCode::INTERNAL, "overlay: leaf overflow after pre-check");
+                return false;
+            }
+            ent.dirty = true;
+            for (size_t i = 0; i + 1 < path.size(); ++i) ov_[path[i]].dirty = true;
+            return true;
+        }
+        size_t ci = 0;
+        while (ci < ent.n.keys.size() && keyCmp(k, ent.n.keys[ci]) >= 0) ++ci;
+        expect = ent.n.chashes[ci];
+        id = ent.n.children[ci];
+    }
+    setErr(e, ErrCode::CORRUPT, "overlay: tree depth exceeded");
+    return false;
+}
+
+bool BTree::overlayErase(const Key& k, bool* needFinalize, ChainError* e){
+    *needFinalize = false;
+    std::vector<uint32_t> path;
+    uint32_t id = rootId_; Hash expect = rootHash_;
+    for (int guard = 0; guard < 64; ++guard){
+        OverlayEnt& ent = ov_[id];
+        if (ent.n.type == 0){
+            uint8_t buf[PAGE_SIZE];
+            if (!readPage(id, buf, e)) return false;
+            if (!decodeNode(buf, &ent.n, e)) return false;
+            Hash calc = (ent.n.type == NT_LEAF) ? leafHash(ent.n) : internalHash(ent.n);
+            if (memcmp(calc.data(), expect.data(), 32) != 0){
+                setErr(e, ErrCode::CORRUPT, "overlay: page " + std::to_string(id) + " fails authentication");
+                return false;
+            }
+        }
+        path.push_back(id);
+        if (ent.n.type == NT_LEAF){
+            size_t pos = 0;
+            while (pos < ent.n.entries.size() && keyCmp(ent.n.entries[pos].key, k) < 0) ++pos;
+            if (pos >= ent.n.entries.size() || keyCmp(ent.n.entries[pos].key, k) != 0) return true; // absent: no-op
+            ent.n.entries.erase(ent.n.entries.begin() + pos);
+            ent.dirty = true;
+            for (size_t i = 0; i + 1 < path.size(); ++i) ov_[path[i]].dirty = true;
+            return true;
+        }
+        size_t ci = 0;
+        while (ci < ent.n.keys.size() && keyCmp(k, ent.n.keys[ci]) >= 0) ++ci;
+        expect = ent.n.chashes[ci];
+        id = ent.n.children[ci];
+    }
+    setErr(e, ErrCode::CORRUPT, "overlay: tree depth exceeded");
+    return false;
+}
+
+// Publish every dirty overlay node EXACTLY once, children before parents: the new
+// page id is allocated at finalize time in post-order, so a parent encodes the FINAL
+// ids and hashes of its children. On any error the overlay is discarded and the
+// on-disk root still points at the last published generation (no orphan visibility).
+bool BTree::finalizeOverlay(ChainError* e){
+    if (!overlayOn_) return true;
+    const uint32_t oldRoot = rootId_;
+    std::map<uint32_t, OverlayEnt>::iterator rt = ov_.find(oldRoot);
+    if (rt == ov_.end() || !rt->second.dirty){
+        // Nothing was modified in this batch (all ops were no-ops / absent keys):
+        // there is nothing to publish, and the root keeps pointing at the last
+        // generation. This is a normal outcome, not an error.
+        ov_.clear(); overlayOn_ = false; return true;
+    }
+
+    std::vector<uint32_t> order;            // children-first emission order
+    std::map<uint32_t, int> state;          // 0=new 1=visiting 2=done
+    std::vector<std::pair<uint32_t,size_t>> stack;   // (node, next child idx)
+    if (rt != ov_.end()){
+        stack.push_back(std::make_pair(oldRoot, (size_t)0));
+        state[oldRoot] = 1;
+        while (!stack.empty()){
+            uint32_t id = stack.back().first;
+            size_t ci = stack.back().second;
+            std::map<uint32_t, OverlayEnt>::iterator it = ov_.find(id);
+            if (it == ov_.end()){ stack.pop_back(); continue; }
+            Node& n = it->second.n;
+            if (n.type == NT_INTERNAL && ci < n.children.size()){
+                stack.back().second++;
+                uint32_t cid = n.children[ci];
+                std::map<uint32_t, OverlayEnt>::iterator cit = ov_.find(cid);
+                if (cit != ov_.end() && cit->second.dirty && state[cid] != 2 && state[cid] != 1){
+                    state[cid] = 1;
+                    stack.push_back(std::make_pair(cid, (size_t)0));
+                }
+                continue;
+            }
+            stack.pop_back();
+            if (state[id] == 2) continue;
+            order.push_back(id);
+            state[id] = 2;
+        }
+    }
+
+    // Emit in post-order: children already carry newId/newHash.
+    for (size_t oi = 0; oi < order.size(); ++oi){
+        OverlayEnt& ent = ov_[order[oi]];
+        if (!ent.dirty || ent.done) continue;
+        if (ent.n.type == NT_INTERNAL){
+            for (size_t i = 0; i < ent.n.children.size(); ++i){
+                std::map<uint32_t, OverlayEnt>::iterator cit = ov_.find(ent.n.children[i]);
+                if (cit != ov_.end() && cit->second.done){
+                    ent.n.children[i] = cit->second.newId;
+                    ent.n.chashes[i]   = cit->second.newHash;
+                }
+            }
+        }
+        uint8_t ob[PAGE_SIZE];
+        if (!encodeNode(ent.n, ob)){ setErr(e, ErrCode::INTERNAL, "overlay: page overflow"); abortOverlay(); return false; }
+        uint32_t nid = 0;
+        if (!appendPage(ob, &nid, e)){ abortOverlay(); return false; }   // fresh id or free-list reuse
+        commitRetired_.push_back(order[oi]);
+        ent.newId = nid;
+        ent.newHash = (ent.n.type == NT_LEAF) ? leafHash(ent.n) : internalHash(ent.n);
+        ent.done = true;
+        ent.n = Node();
+    }
+    std::map<uint32_t, OverlayEnt>::iterator fit = ov_.find(oldRoot);
+    if (fit == ov_.end() || !fit->second.done){ abortOverlay(); setErr(e, ErrCode::INTERNAL, "overlay: root not finalized"); return false; }
+    rootId_ = fit->second.newId;
+    rootHash_ = fit->second.newHash;
+    ov_.clear();
+    overlayOn_ = false;
     return true;
 }
 

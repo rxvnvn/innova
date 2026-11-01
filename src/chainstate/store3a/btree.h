@@ -9,6 +9,7 @@
 #include "chainstate.h"
 #include <array>
 #include <deque>
+#include <map>
 #include <vector>
 #include <string>
 
@@ -46,6 +47,23 @@ struct SplitResult { bool split = false; Key sep{}; uint32_t rightId = 0; Hash r
 
 class BTree {
 public:
+    // IFCN#9 STORE3A COW BATCH OVERLAY.
+    // A flush applies thousands of key operations sharing the same internal path;
+    // the per-op COW rewrote that path once per operation. The overlay keeps the
+    // touched nodes in memory keyed by their ORIGINAL page id, edits them in
+    // place, and assigns NEW page ids only in finalizeOverlay() -- strictly
+    // post-order (children first), so every parent's children[]/chashes[] is
+    // encoded from FINAL child ids/hashes. Published pages are never overwritten,
+    // and nothing becomes visible before the caller's MANIFEST/ACK.
+    struct OverlayEnt { Node n; bool dirty = false; bool done = false; uint32_t newId = 0; Hash newHash{}; };
+    void beginOverlay() { overlayOn_ = true; }
+    bool overlayActive() const { return overlayOn_; }
+    size_t overlaySize() const { return ov_.size(); }
+    bool overlayOverflow() const { return ov_.size() >= overlayMax_; }
+    bool overlayPut(const Key& k, const std::vector<uint8_t>& val, bool* needFinalize, ChainError* e);
+    bool overlayErase(const Key& k, bool* needFinalize, ChainError* e);
+    bool finalizeOverlay(ChainError* e);
+    void abortOverlay() { ov_.clear(); overlayOn_ = false; }
     ~BTree() { close(); }
     void close();
     bool create(const std::string& path, ChainError* e);   // new empty tree (page 0 = empty leaf)
@@ -104,6 +122,10 @@ private:
     bool keysPrefixRec(uint32_t id, const Hash& expect, const Key& lo, const Key& hi, std::vector<Key>* out, ChainError* e) const;
 
     int fd_ = -1;
+    // COW batch overlay (see OverlayEnt above): ~4 KiB per touched node, capped.
+    bool overlayOn_ = false;
+    size_t overlayMax_ = 8192;                 // strict RAM bound (~33 MiB of pages)
+    std::map<uint32_t, OverlayEnt> ov_;
     std::string path_;
     uint32_t nextId_ = 0;
     uint32_t rootId_ = 0;
