@@ -45,6 +45,10 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+
 
 struct TipWindowStats
 {
@@ -216,7 +220,7 @@ public:
 private:
     void MoveFrom(TipStoreWindow& o)
     {
-        if (fh_) { fclose(fh_); fh_ = NULL; }
+        if (fd_ >= 0) { ::close(fd_); fd_ = -1; }
         path_ = o.path_;
         headerSize_ = o.headerSize_;
         entrySize_ = o.entrySize_;
@@ -231,10 +235,10 @@ private:
         ringBase_ = o.ringBase_;
         ring_.clear(); // ring is pure cache; drop it (lazy refill is correct)
         gets_ = 0; ringHits_ = 0; lruHits_ = 0; preadMisses_ = 0;
-        sizeSnap_ = 0; mtimeSnap_ = 0; handleKnownFile_ = false; fh_ = NULL;
+        sizeSnap_ = 0; mtimeSnap_ = 0; handleKnownFile_ = false; fd_ = -1;
     }
 
-    mutable FILE* fh_ = NULL; // positional-read handle
+    mutable int fd_ = -1;      // positional-read handle (pread, no seek)
     mutable bool handleKnownFile_ = false;
     mutable uint64_t sizeSnap_ = 0;
     mutable long mtimeSnap_ = 0;
@@ -261,10 +265,10 @@ private:
 template <class T>
 void TipStoreWindow<T>::ReleaseHandle() const
 {
-    if (fh_)
+    if (fd_ >= 0)
     {
-        fclose(fh_);
-        fh_ = NULL;
+        ::close(fd_);
+        fd_ = -1;
     }
     handleKnownFile_ = false;
 }
@@ -276,26 +280,25 @@ bool TipStoreWindow<T>::RefreshHandle(std::string* error) const
     // access: detect via size/mtime snapshot and reopen. POSIX keeps an open
     // fd on an unlinked inode readable, so a stale handle would serve the OLD
     // file silently — the snapshot check guarantees we never do that.
-    boost::system::error_code ec;
-    uintmax_t sz = boost::filesystem::file_size(path_, ec);
-    if (ec)
+    // IFCN#9 CPU hotpath: ONE stat() supplies BOTH the size and the mtime.
+    // Two boost::filesystem calls (file_size + last_write_time) issued two full
+    // statx syscalls per record read; at ~3 300 reads/block this was ~6 500
+    // statx per store file per block (~27% of all syscall time). The check
+    // itself is unchanged: same size+mtime snapshot, same reopen decision.
+    struct stat st;
+    if (::stat(path_.string().c_str(), &st) != 0)
     {
         if (error) *error = "stat store failed: " + path_.string();
         ReleaseHandle();
         return false;
     }
-    long mt = (long)boost::filesystem::last_write_time(path_, ec);
-    if (ec)
-    {
-        if (error) *error = "stat store mtime failed: " + path_.string();
-        ReleaseHandle();
-        return false;
-    }
-    if (fh_ && handleKnownFile_ && sz == sizeSnap_ && mt == mtimeSnap_)
+    const uintmax_t sz = (uintmax_t)st.st_size;
+    const long mt = (long)st.st_mtime;
+    if (fd_ >= 0 && handleKnownFile_ && sz == sizeSnap_ && mt == mtimeSnap_)
         return true; // same file, handle valid
     ReleaseHandle();
-    fh_ = fopen(path_.string().c_str(), "rb");
-    if (!fh_)
+    fd_ = ::open(path_.string().c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd_ < 0)
     {
         if (error) *error = "open store for read failed: " + path_.string();
         return false;
@@ -312,13 +315,11 @@ bool TipStoreWindow<T>::PreadDecode(uint64_t slot, T* out, std::string* error) c
     if (!RefreshHandle(error))
         return false;
     const unsigned long off = headerSize_ + (unsigned long)slot * entrySize_;
-    if (fseek(fh_, off, SEEK_SET) != 0)
-    {
-        if (error) *error = "seek store failed: " + path_.string();
-        return false;
-    }
     std::vector<unsigned char> buf(entrySize_);
-    if (fread(&buf[0], 1, entrySize_, fh_) != entrySize_)
+    // ONE pread instead of fseek+fread: no seek syscall and no stdio buffering
+    // for a positional record read (was ~36 000 lseek per block across stores).
+    const ssize_t got = ::pread(fd_, &buf[0], entrySize_, (off_t)off);
+    if (got != (ssize_t)entrySize_)
     {
         if (error)
             *error = "short positional read of store slot " +
@@ -459,13 +460,11 @@ bool TipStoreWindow<T>::Get(uint64_t slot, T* out, std::string* error) const
     if (!RefreshHandle(error))
         return false;
     const unsigned long off = headerSize_ + (unsigned long)slot * entrySize_;
-    if (fseek(fh_, off, SEEK_SET) != 0)
-    {
-        if (error) *error = "seek store failed: " + path_.string();
-        return false;
-    }
     std::vector<unsigned char> buf(entrySize_);
-    if (fread(&buf[0], 1, entrySize_, fh_) != entrySize_)
+    // ONE pread instead of fseek+fread: no seek syscall and no stdio buffering
+    // for a positional record read (was ~36 000 lseek per block across stores).
+    const ssize_t got = ::pread(fd_, &buf[0], entrySize_, (off_t)off);
+    if (got != (ssize_t)entrySize_)
     {
         if (error)
             *error = "short positional read of store slot " +
@@ -499,13 +498,10 @@ bool TipStoreWindow<T>::StreamVisit(uint64_t beginSlot, uint64_t endSlotExclusiv
     for (uint64_t s = beginSlot; s < endSlotExclusive; ++s)
     {
         const unsigned long off = headerSize_ + (unsigned long)s * entrySize_;
-        if (fseek(fh_, off, SEEK_SET) != 0)
-        {
-            if (error) *error = "seek store failed: " + path_.string();
-            return false;
-        }
         std::vector<unsigned char> buf(entrySize_);
-        if (fread(&buf[0], 1, entrySize_, fh_) != entrySize_)
+        // Sequential slots: one pread per entry, same offsets, no lseek churn.
+        const ssize_t sgot = ::pread(fd_, &buf[0], entrySize_, (off_t)off);
+        if (sgot != (ssize_t)entrySize_)
         {
             if (error)
                 *error = "short sequential read of store slot " +

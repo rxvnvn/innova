@@ -202,7 +202,7 @@ static bool DecodeTipMeta(const char* data, size_t size, BlockIndexTipMeta* out)
 // across entries. Both are compile-time ABI constants so tip-authority RAM
 // is provably bounded: O(ring + lru + new appends), never O(chain height).
 static const size_t BLOCK_INDEX_TIP_RING_CAP_ENTRIES = 65536;
-static const size_t BLOCK_INDEX_TIP_LRU_BYTES_CAP = 2 * 1048576; // 2 MB
+static const size_t BLOCK_INDEX_TIP_LRU_BYTES_CAP = 32 * 1048576; // 32 MB (RAM cap respected)
 
 // Concrete window instantiations (decode via the existing store codecs).
 typedef TipStoreWindow<BlockIndexRecord> TipStoreRecordsWindow;
