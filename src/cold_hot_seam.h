@@ -103,6 +103,13 @@ public:
      * chain at the generation tip. Does not auto-rebase. */
     bool VerifySeam(std::string* error) const;
 
+    /** IFCN#9 PHASE 1b: height-addressed read of the ACTIVE chain (pending window
+     * first, then the durable tip; generation only inside its own height range).
+     * Used to step a PROVEN-ACTIVE ancestry without a hash->id resolution. Callers
+     * MUST verify the returned hash against the expected parent identity; a
+     * not-found result means "not on the active chain", never a guess. */
+    BlockIndexSnapshot GetActiveByHeight(int height) const;
+
     bool LookupCold(const BlockIndexLogicalId& logical, ColdHotSeamSnapshot* out,
                     std::string* error) const;
     bool LookupHot(const BlockIndexLogicalId& logical, ColdHotSeamSnapshot* out,
@@ -127,6 +134,12 @@ public:
                                  ColdHotSeamSnapshot* out, std::string* error) const;
     ColdHotSeamResult GetAncestorR(const BlockIndexNavigationRef& ref, int targetHeight,
                                    ColdHotSeamSnapshot* out, std::string* error) const;
+    /** IFCN#9 PHASE 1b: identical to GetNextActiveR but for a caller that ALREADY
+     * holds the current snapshot (a walk step). Avoids re-resolving the block it
+     * is stepping from by hash -- one hash->id resolution per walk step otherwise.
+     * The step itself is identity-checked, so this cannot cross to another branch. */
+    ColdHotSeamResult GetNextActiveFromSnapshotR(const ColdHotSeamSnapshot& current,
+                                                 ColdHotSeamSnapshot* out, std::string* error) const;
     ColdHotSeamResult GetNextActiveR(const BlockIndexNavigationRef& ref,
                                      ColdHotSeamSnapshot* out, std::string* error) const;
     /** By-value HybridSPV maturity/active-chain/merkle authority. Replaces the

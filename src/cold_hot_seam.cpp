@@ -120,6 +120,15 @@ BlockIndexSnapshot ColdHotSeamNavigator::GetHotTip() const
     return testHotResolver ? testHotResolver->GetTip() : hotAccessor.GetTip();
 }
 
+BlockIndexSnapshot ColdHotSeamNavigator::GetActiveByHeight(int height) const
+{
+    AssertLockHeld(cs_main);
+    if (!IsOpen() || height < 0)
+        return BlockIndexSnapshot();
+    return testHotResolver ? testHotResolver->GetActiveByHeight(height)
+                           : hotAccessor.GetActiveByHeight(height);
+}
+
 bool ColdHotSeamNavigator::VerifySeam(std::string* error) const
 {
     AssertLockHeld(cs_main);
@@ -353,6 +362,19 @@ ColdHotSeamResult ColdHotSeamNavigator::GetNextActiveR(const BlockIndexNavigatio
         if (r != COLD_HOT_SEAM_OK)
             return r;
     }
+    return GetNextActiveFromSnapshotR(current, out, error);
+}
+
+ColdHotSeamResult ColdHotSeamNavigator::GetNextActiveFromSnapshotR(const ColdHotSeamSnapshot& currentIn,
+                                                                  ColdHotSeamSnapshot* out,
+                                                                  std::string* error) const
+{
+    // IFCN#9 PHASE 1b: a walk step must not re-resolve the block it already holds.
+    // The identity comes from the caller's snapshot; every downstream check (seam
+    // verification, hashPrev identity, cold domain proof) is unchanged.
+    if (!currentIn.ref.IsValid() || !currentIn.snapshot.found)
+        return COLD_HOT_SEAM_AUTHORITY_FAILURE; // fail closed: nothing to step from
+    const ColdHotSeamSnapshot current = currentIn;
 
     if (current.ref.IsCold())
     {
@@ -944,7 +966,9 @@ ColdHotSeamResult ColdHotSeamNavigator::GetKernelStakeModifierR(const BlockIndex
             if (cur.snapshot.height >= tip.snapshot.height)
                 break;
             ColdHotSeamSnapshot next;
-            const ColdHotSeamResult nr = GetNextActiveR(cur.ref, &next, error);
+            // PHASE 1b: step from the snapshot we already hold -- the old call
+            // re-resolved `cur` by hash on every single step.
+            const ColdHotSeamResult nr = GetNextActiveFromSnapshotR(cur, &next, error);
             if (nr == COLD_HOT_SEAM_AUTHORITY_FAILURE)
                 return COLD_HOT_SEAM_AUTHORITY_FAILURE; // fail closed
             if (nr != COLD_HOT_SEAM_OK)

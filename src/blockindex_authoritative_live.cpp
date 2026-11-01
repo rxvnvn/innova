@@ -495,9 +495,20 @@ BlockIndexHotStatus BlockIndexAuthoritativeLive::Materialize(
     return impl_->tail->Pin(BlockIndexLogicalId(hash), out);
 }
 
+#include <map>
+#include <mutex>
+static std::mutex g_rbsMu;
+static std::map<void*, unsigned long long> g_rbsSites;
+void BlockIndexResolveSnapshotSiteDump()
+{
+    std::lock_guard<std::mutex> lg(g_rbsMu);
+    for (std::map<void*, unsigned long long>::const_iterator it = g_rbsSites.begin(); it != g_rbsSites.end(); ++it)
+        if (it->second > 50) printf("RBSSITE n=%llu addr=%p\n", it->second, it->first);
+}
 BlockIndexHotStatus BlockIndexAuthoritativeLive::ResolveBlockSnapshot(
     const uint256& hash, BlockIndexSnapshot* out, std::string* error) const
 {
+    { void* site = __builtin_return_address(0); std::lock_guard<std::mutex> lg(g_rbsMu); ++g_rbsSites[site]; }
     if (error) error->clear();
     if (!impl_->open || !impl_->baseReader || !impl_->tip)
         return BlockIndexHotStatus::AUTHORITY_MISSING;

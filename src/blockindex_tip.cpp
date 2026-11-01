@@ -4,6 +4,12 @@
 #include "blockindex_tip.h"
 #include "cold_hot_seam.h"
 void BlockIndexMaterializeSiteDump();
+void BlockIndexResolveSnapshotSiteDump();
+void BlockIndexResolverLookupSiteDump();
+uint64_t KernelWalkSteps();
+uint64_t KernelWalkHeightSteps();
+uint64_t KernelWalkHashSteps();
+uint64_t KernelWalkFallbacks();
 
 #include "blockindex_tip_bounded_window.h"
 #include "blockindex_hashindex.h"
@@ -3914,6 +3920,9 @@ void BlockIndexTipAuthority::DumpWindowStats() const
     const TipWindowStats rs = i->recordsWin.Stats();
     const TipWindowStats ds = i->derivedWin.Stats();
     const TipWindowStats as = i->activeWin.Stats();
+    printf("WINSTAT kernelwalk steps=%llu heightSteps=%llu hashSteps=%llu fallbacks=%llu\n",
+           (unsigned long long)KernelWalkSteps(), (unsigned long long)KernelWalkHeightSteps(),
+           (unsigned long long)KernelWalkHashSteps(), (unsigned long long)KernelWalkFallbacks());
     printf("WINSTAT navsteps=%llu navfallbacks=%llu\n",
            (unsigned long long)ColdHotSeamNavStepCount(),
            (unsigned long long)ColdHotSeamNavFallbackCount());
@@ -3925,6 +3934,8 @@ void BlockIndexTipAuthority::DumpWindowStats() const
             if (m) { if (fgets(line, sizeof(line), m)) { char* dash = strchr(line, '-'); if (dash) { unsigned long base = strtoul(line, NULL, 16); (void)dash; printf("WINSTAT exebase=0x%lx\n", base); } } fclose(m); }
         }
         BlockIndexMaterializeSiteDump();
+        BlockIndexResolveSnapshotSiteDump();
+        BlockIndexResolverLookupSiteDump();
         printf("WINSTAT hashlookup-sites=%zu\n", g_hlSites.size());
         std::vector<std::pair<uint64_t, void*> > v;
         for (std::map<void*, uint64_t>::const_iterator it = g_hlSites.begin(); it != g_hlSites.end(); ++it)

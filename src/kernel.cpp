@@ -7,6 +7,7 @@
 #include <boost/assign/list_of.hpp>
 
 #include "kernel.h"
+#include <atomic>
 #include "cold_hot_seam.h"
 #include "blockindex_authoritative_live.h"
 #include "blockindex_authoritative_startup.h"
@@ -402,6 +403,13 @@ static bool CollectCandidatesByValue(const ColdHotSeamNavigator* nav,
 //
 // Returns: 1 = resolved, 0 = no generated modifier in the ancestry (legacy's
 // "no generation at genesis block"), -1 = authority failure (fail closed).
+// IFCN#9 PHASE 1b diagnostics: backward stake-modifier walk.
+std::atomic<uint64_t> g_kwSteps(0), g_kwHeightSteps(0), g_kwHashSteps(0), g_kwFallbacks(0);
+uint64_t KernelWalkSteps()        { return g_kwSteps.load(); }
+uint64_t KernelWalkHeightSteps()  { return g_kwHeightSteps.load(); }
+uint64_t KernelWalkHashSteps()    { return g_kwHashSteps.load(); }
+uint64_t KernelWalkFallbacks()    { return g_kwFallbacks.load(); }
+
 static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
     const CBlockIndex* pindexPrev, uint64_t& nStakeModifier, int64_t& nModifierTime,
     std::string& err)
@@ -425,8 +433,27 @@ static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
     // pprev / pskip / pnext edge is dereferenced.
     BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority();
     uint256 h = pindexPrev->GetBlockHash();
+    // IFCN#9 PHASE 1b: on a PROVEN-ACTIVE block the parent is height-1 on the same
+    // active chain. Resolve it by slot arithmetic and carry it into the next
+    // iteration, instead of re-resolving the parent by hash (a LevelDB lookup per
+    // step). Identity is verified (parent.hash MUST equal hashPrev); a side branch
+    // or any mismatch falls back to the hash walk, which stays the only path that
+    // needs a hash->id resolution.
+    BlockIndexSnapshot carried;
+    bool haveCarried = false;
     for (int guard = 0; guard < 200000000; ++guard)
     {
+        ++g_kwSteps;
+        BlockIndexSnapshot snap;
+        bool haveSnap = false;
+        if (haveCarried)
+        {
+            snap = carried;
+            carried = BlockIndexSnapshot();
+            haveCarried = false;
+            haveSnap = true;
+            ++g_kwHeightSteps;
+        }
         // (1) bounded hot window: read-by-hash, no pointer retention.
         bool    haveHot   = false;
         bool    hotGen    = false;
@@ -434,6 +461,7 @@ static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
         int64_t  hotTime  = 0;
         int     hotHeight = -1;
         uint256 hotPrev;
+        if (!haveSnap)
         {
             LOCK(cs_main);
             std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(h);
@@ -471,13 +499,17 @@ static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
             fFallThroughToV2 = true;
         }
         // (2) authoritative V2 by-value snapshot (live tip -> cold generation).
-        if (liveAuth)
+        if (!haveSnap && liveAuth)
         {
-            BlockIndexSnapshot snap;
             std::string e2;
             const BlockIndexHotStatus st = liveAuth->ResolveBlockSnapshot(h, &snap, &e2);
             if (st != BlockIndexHotStatus::OK)
                 return -1; // authority failure -> fail closed
+            haveSnap = true;
+            ++g_kwHashSteps;
+        }
+        if (haveSnap)
+        {
             if (snap.nFlags & CBlockIndex::BLOCK_STAKE_MODIFIER)
             {
                 // BLOCK-100000 ROOT CAUSE (2026-10-10): the last-modifier
@@ -498,6 +530,22 @@ static int ResolveLastStakeModifierByValue(const ColdHotSeamNavigator* nav,
             }
             if (snap.height == 0 || snap.hashPrev == 0)
                 return 0; // genuine genesis floor
+            // IFCN#9 PHASE 1b: step to the parent by HEIGHT when this block is on the
+            // active chain. The identity check makes this provably equivalent to the
+            // hash walk: a side branch, a reorg between steps, or any seam divergence
+            // fails the check and falls back to resolving hashPrev by hash.
+            if (snap.fInMainChain && snap.height > 0 && nav)
+            {
+                const BlockIndexSnapshot parent = nav->GetActiveByHeight(snap.height - 1);
+                if (parent.found && parent.hash == snap.hashPrev)
+                {
+                    carried = parent;
+                    haveCarried = true;
+                    h = snap.hashPrev;
+                    continue;
+                }
+                ++g_kwFallbacks;
+            }
             h = snap.hashPrev;
             continue;
         }

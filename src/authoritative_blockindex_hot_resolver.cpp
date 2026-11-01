@@ -32,8 +32,19 @@ uint64_t AuthoritativeBlockIndexHotResolver::Generation() const
     return (reader_ && reader_->IsOpen()) ? reader_->Generation() : 0;
 }
 
+#include <map>
+#include <mutex>
+static std::mutex g_rhMu;
+static std::map<void*, unsigned long long> g_rhSites;
+void BlockIndexResolverLookupSiteDump()
+{
+    std::lock_guard<std::mutex> lg(g_rhMu);
+    for (std::map<void*, unsigned long long>::const_iterator it = g_rhSites.begin(); it != g_rhSites.end(); ++it)
+        if (it->second > 50) printf("RHSITE n=%llu addr=%p\n", it->second, it->first);
+}
 BlockIndexSnapshot AuthoritativeBlockIndexHotResolver::LookupByHash(const uint256& hash) const
 {
+    { void* site = __builtin_return_address(0); std::lock_guard<std::mutex> lg(g_rhMu); ++g_rhSites[site]; }
     BlockIndexSnapshot out;
     if (reader_ && reader_->IsOpen())
     {
