@@ -242,9 +242,85 @@ public:
     }
 };
 
+// P2 (walletdb): decode a plain "key"/"wkey" record WITHOUT touching any
+// CWallet state, so the expensive per-key EC work (CKey::Load re-derives and
+// verifies the public key for legacy records that carry no accelerator hash
+// — ~1.7 ms per key on production wallets) can run BEFORE pwallet->cs_wallet
+// is taken. Callers fall back to the canonical ReadKeyValue path whenever
+// this returns false, so error semantics are identical (ReadKeyValue is the
+// authority for error strings; this helper only mirrors the success path).
+class CPreparedKeyRecord
+{
+public:
+    CKey key;
+    CPubKey vchPubKey;
+};
+
+static bool PrepareKeyRecord(const CDataStream& ssKeyIn, const CDataStream& ssValueIn,
+                             bool fWKey, CPreparedKeyRecord& rec)
+{
+    try
+    {
+        // Parse from copies: the caller's streams must stay untouched, because
+        // ReadKeyValue re-parses the same records canonically on fallback.
+        CDataStream ssKey(ssKeyIn);
+        CDataStream ssValue(ssValueIn);
+        string probeType;
+        ssKey >> probeType; // consume the record type (as canonical path does)
+        ssKey >> rec.vchPubKey;
+        if (!rec.vchPubKey.IsValid())
+            return false;
+
+        CPrivKey pkey;
+        uint256 hash = 0;
+
+        if (!fWKey)
+        {
+            ssValue >> pkey;
+        }
+        else
+        {
+            CWalletKey wkey;
+            ssValue >> wkey;
+            pkey = wkey.vchPrivKey;
+        }
+
+        try
+        {
+            ssValue >> hash;
+        }
+        catch(...){}
+
+        bool fSkipCheck = false;
+        if (hash != 0)
+        {
+            // hash pubkey/privkey to accelerate wallet load
+            std::vector<unsigned char> vchKey;
+            vchKey.reserve(rec.vchPubKey.size() + pkey.size());
+            vchKey.insert(vchKey.end(), rec.vchPubKey.begin(), rec.vchPubKey.end());
+            vchKey.insert(vchKey.end(), pkey.begin(), pkey.end());
+
+            if (Hash(vchKey.begin(), vchKey.end()) != hash)
+                return false; // canonical path will report the exact error
+
+            fSkipCheck = true;
+        }
+
+        if (!rec.key.Load(pkey, rec.vchPubKey, fSkipCheck))
+            return false; // canonical path will report "CPrivKey corrupt"
+
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
 bool
 ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
-             CWalletScanState &wss, string& strType, string& strErr)
+             CWalletScanState &wss, string& strType, string& strErr,
+             const CPreparedKeyRecord* pPrepared)
 {
     try {
         // Unserialize
@@ -343,6 +419,20 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
         }
         else if (strType == "key" || strType == "wkey")
         {
+            if (pPrepared)
+            {
+                // P2 (walletdb): the record was already decoded (and EC
+                // verified) by PrepareKeyRecord outside the cs_wallet critical
+                // section; only the wallet-state mutation stays under the lock.
+                if (strType == "key")
+                    wss.nKeys++;
+                if (!pwallet->LoadKey(pPrepared->key, pPrepared->vchPubKey))
+                {
+                    strErr = "Error reading wallet database: LoadKey failed";
+                    return false;
+                }
+                return true;
+            }
             CPubKey vchPubKey;
             ssKey >> vchPubKey;
             if (!vchPubKey.IsValid())
@@ -532,13 +622,23 @@ DBErrors CWalletDB::LoadWallet(CWallet* pwallet)
     DBErrors result = DB_LOAD_OK;
 
     try {
-        LOCK(pwallet->cs_wallet);
-        int nMinVersion = 0;
-        if (Read((string)"minversion", nMinVersion))
+        // P2 (walletdb): do NOT hold cs_wallet across the whole cursor walk.
+        // The scan of a large wallet.dat performs ~27k per-key EC verifications
+        // (43.0 s hold measured in production LOCKTRACE at the former
+        // walletdb.cpp:535 LOCK). Only version inspection and the per-record
+        // wallet mutations stay under the lock; BDB cursor reads and the
+        // stateless key decode+EC verification run unlocked (see
+        // PrepareKeyRecord). Lock order is unchanged: cs_wallet only, and
+        // cs_main is never involved here.
         {
-            if (nMinVersion > CLIENT_VERSION)
-                return DB_TOO_NEW;
-            pwallet->LoadMinVersion(nMinVersion);
+            int nMinVersion = 0;
+            LOCK(pwallet->cs_wallet);
+            if (Read((string)"minversion", nMinVersion))
+            {
+                if (nMinVersion > CLIENT_VERSION)
+                    return DB_TOO_NEW;
+                pwallet->LoadMinVersion(nMinVersion);
+            }
         }
 
         // Get cursor
@@ -551,7 +651,7 @@ DBErrors CWalletDB::LoadWallet(CWallet* pwallet)
 
         while (true)
         {
-            // Read next record
+            // Read next record (BDB cursor read: no wallet state touched)
             CDataStream ssKey(SER_DISK, CLIENT_VERSION);
             CDataStream ssValue(SER_DISK, CLIENT_VERSION);
             int ret = ReadAtCursor(pcursor, ssKey, ssValue);
@@ -563,9 +663,29 @@ DBErrors CWalletDB::LoadWallet(CWallet* pwallet)
                 return DB_CORRUPT;
             }
 
+            // P2 (walletdb): decode plain "key"/"wkey" records while unlocked
+            // (pure serialization + EC verification, no wallet state). Probe
+            // the record type from a copy of the key stream; ReadKeyValue
+            // still parses the original stream itself.
+            CPreparedKeyRecord prepared;
+            bool fPreparedOk = false;
+            {
+                CDataStream ssProbe(ssKey);
+                string probeType;
+                try
+                {
+                    ssProbe >> probeType;
+                }
+                catch (...) { probeType.clear(); }
+                if (probeType == "key" || probeType == "wkey")
+                    fPreparedOk = PrepareKeyRecord(ssKey, ssValue, probeType == "wkey", prepared);
+            }
+
             // Try to be tolerant of single corrupt records:
             string strType, strErr;
-            if (!ReadKeyValue(pwallet, ssKey, ssValue, wss, strType, strErr))
+            LOCK(pwallet->cs_wallet);
+            if (!ReadKeyValue(pwallet, ssKey, ssValue, wss, strType, strErr,
+                              fPreparedOk ? &prepared : NULL))
             {
                 // losing keys is considered a catastrophic error, anything else
                 // we assume the user can live with:
@@ -892,7 +1012,7 @@ bool CWalletDB::Recover(CDBEnv& dbenv, std::string filename, bool fOnlyKeys)
             CDataStream ssValue(row.second, SER_DISK, CLIENT_VERSION);
             string strType, strErr;
             bool fReadOK = ReadKeyValue(&dummyWallet, ssKey, ssValue,
-                                        wss, strType, strErr);
+                                        wss, strType, strErr, NULL);
             if (!IsKeyType(strType))
                 continue;
             if (!fReadOK)
