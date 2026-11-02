@@ -7479,8 +7479,42 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
 
 
     // ppcoin: track money supply and mint amount info
+    // V2 MS-FIX2 (reorg-connect money-supply carry): when the block's own
+    // pprev edge was released (armed-V2 by-value residency: retenu-floor
+    // detach / operation-scoped sparse-hot edge release in AddToBlockIndex),
+    // the ancestor cumulative must be resolved from the V2 authority BY VALUE
+    // instead of being silently assumed zero. Otherwise every connect that
+    // starts at a reorg fork point re-bases the active-chain supply
+    // accumulator at THIS block's own increment: observed on mainnet
+    // (2026-11-03 diagnosis of build 609cd8639d88) the persisted active-chain
+    // tip carried 11070869.73003118 INN at height 8207222 (fork point) and the
+    // first block of a trust-based 515-disconnect/23-connect reorganize wrote
+    // 0.20000000 INN at height 8207223; the tip then grew ~one PoW subsidy per
+    // block (0.2) and getinfo 'moneysupply' reported the re-based value.
+    // The V2 MS-FIX cutover promotion (g_reorgConnectSupply) faithfully
+    // captured these ConnectBlock outputs, so the fix belongs exactly here,
+    // where the delta is computed. Administrative only: no consensus rule
+    // validates nMoneySupply; failing the read fails the connect without ever
+    // persisting a re-based accumulator.
+    int64_t nParentSupply = 0;
+    if (pindex->pprev != NULL)
+        nParentSupply = pindex->pprev->nMoneySupply;
+    else if (g_fAuthoritativeStartup && pindex->nHeight > 0 &&
+             pindex->hashPrevStable != uint256(0))
+    {
+        BlockIndexAuthoritativeLive* msLive = GetAuthoritativeLiveAuthority();
+        BlockIndexSnapshot msParentSnap; std::string msParentErr;
+        if (msLive == NULL || !msLive->IsOpen() ||
+            msLive->ResolveBlockSnapshot(pindex->hashPrevStable, &msParentSnap, &msParentErr)
+                != BlockIndexHotStatus::OK || !msParentSnap.found)
+            return error("ConnectBlock() : cannot resolve released-edge ancestor money supply for %s at height %d (%s) (fail closed, no rebase)",
+                         pindex->GetBlockHash().ToString().substr(0, 20).c_str(),
+                         pindex->nHeight,
+                         msParentErr.empty() ? "authoritative live authority unavailable" : msParentErr.c_str());
+        nParentSupply = msParentSnap.nMoneySupply;
+    }
     pindex->nMint = nValueOut - nValueIn + nFees;
-    pindex->nMoneySupply = (pindex->pprev? pindex->pprev->nMoneySupply : 0) + nValueOut - nValueIn;
+    pindex->nMoneySupply = nParentSupply + nValueOut - nValueIn;
     pindex->nMoneySupply -= nAmountBurned;
     if (pindex->nMoneySupply < 0)
         return error("ConnectBlock() : negative money supply at height %d", pindex->nHeight);
