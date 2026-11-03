@@ -143,7 +143,8 @@ BlockIndexTipStatus BlockIndexLiveAcceptance::ReorgTo(
     int32_t forkHeight,
     const std::vector<BlockIndexTipAppend>& newBranch,
     const std::vector<int32_t>& newHeights,
-    std::string* error)
+    std::string* error,
+    const std::map<int32_t, BlockIndexConnectSupplyEntry>* connectSupplyTrail)
 {
     if (!tip_ || !tip_->IsOpen())
     {
@@ -162,5 +163,5 @@ BlockIndexTipStatus BlockIndexLiveAcceptance::ReorgTo(
     // of skipping them (idempotent Append cannot reclassify a side record), and
     // appends any branch record not yet present. Fail closed on any inconsistency;
     // on partial application the tip is left at forkHeight, recoverable by rerun.
-    return tip_->ReorgActiveTo(forkHeight, newBranch, newHeights, error);
+    return tip_->ReorgActiveTo(forkHeight, newBranch, newHeights, error, connectSupplyTrail);
 }

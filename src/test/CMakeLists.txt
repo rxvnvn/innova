@@ -21,7 +21,8 @@ set(INNOVA_CTEST_SUITES
     cpu_mining_nbits_tests
     invalidate_reconsider_tests
     reorg_314_chain_tests
-    reorg_314_store_tests)
+    reorg_314_store_tests
+    supply_invariant_tests)
 
 foreach(_suite IN LISTS INNOVA_CTEST_SUITES)
   add_test(NAME ${_suite}

@@ -13,6 +13,7 @@
 
 #include <boost/shared_ptr.hpp>
 #include <cstdint>
+#include <map>
 #include <set>
 #include <string>
 #include <vector>
@@ -113,6 +114,34 @@ struct BlockIndexTipMeta
         memset(contentDigest, 0, 32);
         memset(invalidDigest, 0, 32);
     }
+};
+
+// V2 MS-FIX3 PHASE 1 (supply invariant at publication): per-height ConnectBlock
+// accounting carried by the reorg CONNECT loop through the publication calls
+// (main.cpp g_reorgConnectSupply -> BlockIndexLiveAcceptance::ReorgTo ->
+// BlockIndexTipAuthority::ReorgActiveTo). The exact per-block identity checked
+// at publication is
+//     supply(h) - supply(h-1) == mint(h) - fees(h) - burned(h)
+// which is exactly what ConnectBlock computes (nMint = nValueOut - nValueIn +
+// nFees; nMoneySupply = parent supply + nValueOut - nValueIn - nAmountBurned).
+// values are accounting-only; NO consensus rule validates them (never a
+// consensus change), and LEGITIMATE ZEROS exist (never-connected side records
+// carry mint == supply == 0) — zero values are never a violation by themselves;
+// an ACTIVE block with mint == 0 is legal exactly when the identity holds
+// (supply == parent supply when fees == burned == 0).
+// `hash` is the by-hash binding of the entry to the block it accounts for (the
+// connected block itself for branch entries; the fork block for the anchor).
+// It is height-bound only when zero (legacy/test seams that predate binding).
+struct BlockIndexConnectSupplyEntry
+{
+    int64_t supply;   // nMoneySupply (active-chain cumulative) at height h
+    int64_t mint;     // nMint at height h
+    int64_t fees;     // nFees at height h
+    int64_t burned;   // nAmountBurned at height h
+    uint256 hash;     // connected block this entry accounts for (0 = height-only)
+
+    BlockIndexConnectSupplyEntry()
+        : supply(0), mint(0), fees(0), burned(0), hash(0) {}
 };
 
 enum BlockIndexTipStatus
@@ -244,7 +273,13 @@ public:
     BlockIndexTipStatus ReorgActiveTo(int32_t forkHeight,
                                       const std::vector<BlockIndexTipAppend>& branch,
                                       const std::vector<int32_t>& branchHeights,
-                                      std::string* error);
+                                      std::string* error,
+                                      // V2 MS-FIX3: connect-trail snapshot (by
+                                      // value at the caller; read-only here). NULL
+                                      // (default) skips the supply-invariant gate
+                                      // for direct/test callers that were built
+                                      // outside a reorg connect loop.
+                                      const std::map<int32_t, BlockIndexConnectSupplyEntry>* connectSupplyTrail = NULL);
 
     // ---- reads (by-value, composed as tip authority) ----
     // P3-R1 CONCURRENCY GUARD: all MUTABLE-TAIL reads below (GetTip /

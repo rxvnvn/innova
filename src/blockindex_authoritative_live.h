@@ -229,7 +229,10 @@ public:
                  const std::vector<BlockIndexRecord>& newBranchRecs,
                  const std::vector<BlockIndexDerivedEntry>& newBranchDerived,
                  const std::vector<int32_t>& newHeights,
-                 std::string* error);
+                 std::string* error,
+                 // V2 MS-FIX3: publish-time connect trail (see blockindex_tip.h);
+                 // NULL keeps the legacy (unvalidated) path.
+                 const std::map<int32_t, BlockIndexConnectSupplyEntry>* connectSupplyTrail = NULL);
 
     // G1-A: resolve and RETAIN the full-topology parent chain for `parentHash`
     // in a PERSISTENT residency store that survives the single-block-operation

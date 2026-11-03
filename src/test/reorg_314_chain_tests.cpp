@@ -582,4 +582,177 @@ BOOST_AUTO_TEST_CASE(deep_reorg_314)
     }
 }
 
+// V2 MS-FIX2 regression: the active-chain money-supply accumulator must
+// survive a deep, NATURAL, trust-based reorganize at the fork point.
+//
+// Production event reproduced by this case (diagnosed 2026-11-03 against
+// build 609cd8639d88, datadir /home/user/data/.innova):
+//   * the persisted active chain carried the correct cumulative
+//     11070869.73003118 INN at height 8207222 (the fork block
+//     0000007756ff4f9a0c67...),
+//   * a trust-based REORGANIZE disconnected 515 blocks (tip
+//     0000015046a7d182bc19 at 8207737) and connected 23 (new tip
+//     000000003b1da4d8abf4 at 8207245),
+//   * the first CONNECTED block (height 8207223) persisted nMoneySupply =
+//     0.20000000 INN — its own increment only — because its pprev edge had
+//     been released by the armed-V2 residency model and ConnectBlock assumed
+//     parent supply 0,
+//   * every later block then added one subsidy (PoW 0.2 INN at those heights)
+//     on top of the re-based value: the tip grew 0.2/block with
+//     moneysupply 96.82619171 @8207713, 100.22619171 @8207730.
+//
+// This case mines a prefix so the fork ancestor carries a non-zero
+// cumulative, mines branch A (active), then mines branch B from the SAME LCA
+// and lets the PRODUCTION trust rule reorganize (no invalidateblock, no
+// reconsiderblock, no manual tip assignment). The assertion: after the
+// reorganize, the tip's active-chain nMoneySupply must read
+//     supply(fork record) + sum of the fork-relative per-block deltas,
+// i.e. the accumulator must carry through the fork by the by-value parent +
+// ConnectBlock delta algebra. Pre-fix the re-organize re-based the value to
+// the sum of the connected suffix alone and the gap equals the fork
+// ancestor's cumulative, one full subsidy per prefix block step here.
+BOOST_AUTO_TEST_CASE(deep_reorg_money_supply_carry)
+{
+    BOOST_REQUIRE(pindexBest != NULL);
+
+    // Tip supply read the same way the suite reads the authoritative index
+    // (GetActiveByHeight; GetTip does not resolve in the boost fixture).
+    struct TipSupply {
+        static int64_t Read(const char* what, int height)
+        {
+            BlockIndexSnapshot snap; std::string err;
+            const BlockIndexManagerStatus st =
+                GetBlockIndexManager().GetActiveByHeight(height, &snap, &err);
+            BOOST_REQUIRE_MESSAGE(st == BLOCK_INDEX_MANAGER_OK,
+                                  "active height must resolve (" << what <<
+                                  ", h=" << height << "): " << err);
+            BOOST_REQUIRE_MESSAGE(snap.height == height,
+                                  "active height " << snap.height << " != " << height);
+            return snap.nMoneySupply;
+        }
+    };
+
+    // ---- PREFIX: give the fork ancestor a non-zero cumulative -------------
+    const int kPrefix = 40;
+    CBlockIndex* pPrefixTip = pindexBest;
+        for (int i = 1; i <= kPrefix; ++i)
+    {
+        CBlock* pblock = MakeCoinbaseBlock(pPrefixTip, 0x4000 + i);
+        BOOST_REQUIRE(pblock != NULL);
+        uint256 hash;
+        const Delivery d = Deliver(pblock, &hash);
+        delete pblock;
+        BOOST_REQUIRE_MESSAGE(d != DELIVERY_REJECTED,
+                              "prefix block " << i << " rejected");
+        { LOCK(cs_main); pPrefixTip = mapBlockIndex[hash]; }
+        BOOST_REQUIRE(pPrefixTip != NULL);
+    }
+    const int supplyPrefixHeight = pPrefixTip->nHeight;
+    const int64_t supplyPrefix = TipSupply::Read("prefix", supplyPrefixHeight);
+    BOOST_CHECK_GT(supplyPrefix, 0);   // the fork ancestor must carry value
+
+    // ---- BRANCH A: becomes the active chain --------------------------------
+    const int kBranchA = 200;
+    std::vector<CBlockIndex*> branchA;
+    branchA.push_back(pPrefixTip);
+    std::vector<int64_t> supplyAfterA;   // [i] = tip supply after A-block i
+    for (int i = 1; i <= kBranchA; ++i)
+    {
+        CBlock* pblock = MakeCoinbaseBlock(branchA.back(), 0x1000 + i);
+        BOOST_REQUIRE(pblock != NULL);
+        uint256 hash;
+        const Delivery d = Deliver(pblock, &hash);
+        delete pblock;
+        BOOST_REQUIRE_MESSAGE(d != DELIVERY_REJECTED,
+                              "branch A block " << i << " rejected");
+        CBlockIndex* pindex = NULL;
+        { LOCK(cs_main); pindex = mapBlockIndex[hash]; }
+        BOOST_REQUIRE(pindex != NULL);
+        branchA.push_back(pindex);
+        BOOST_REQUIRE(hashBestChain == hash);
+        supplyAfterA.push_back(TipSupply::Read("afterA", pindex->nHeight));
+    }
+    const int64_t supplyAfterATip = supplyAfterA.back();
+    (void)supplyAfterATip;
+
+    const int lcaHeight = pPrefixTip->nHeight;
+
+    // ---- BRANCH B: competing branch, natural trust switch ------------------
+    const int kBranchBMax = kBranchA + 120;
+    std::vector<CBlockIndex*> branchB;
+    branchB.push_back(pPrefixTip);
+    int crossedAt = -1;
+    for (int i = 1; i <= kBranchBMax; ++i)
+    {
+        CBlock* pblock = MakeCoinbaseBlock(branchB.back(), 0x2000 + i);
+        BOOST_REQUIRE(pblock != NULL);
+        uint256 hash;
+        const Delivery d = Deliver(pblock, &hash);
+        delete pblock;
+        BOOST_REQUIRE_MESSAGE(d != DELIVERY_REJECTED,
+                              "branch B block " << i << " rejected");
+        CBlockIndex* pindex = NULL;
+        { LOCK(cs_main); pindex = mapBlockIndex[hash]; }
+        BOOST_REQUIRE(pindex != NULL);
+        branchB.push_back(pindex);
+        if (hashBestChain == hash)
+        {
+            crossedAt = i;
+            BOOST_CHECK_MESSAGE(pindex->nChainTrust > branchA.back()->nChainTrust,
+                                "the winning block must be strictly heavier");
+            break;
+        }
+    }
+    BOOST_REQUIRE_MESSAGE(crossedAt > 0, "the natural reorg must happen");
+
+    CBlockIndex* pNewTip = branchB.back();
+    BOOST_REQUIRE(hashBestChain == pNewTip->GetBlockHash());
+
+    // ---- THE REGRESSION ASSERTION -----------------------------------------
+    // supply(B tip) must equal supply(fork, prefix tip) continued through the
+    // fork-relative deltas measured on branch A (branch B occupies the very
+    // same heights lcaBase+1..lcaBase+crossed, so its per-block deltas are
+    // identical to A's at those heights for coinbase-only regtest blocks).
+    // Telescoping the measured A deltas: sum over B-highest 1..min(crossed,kA)
+    // == supplyAfterA[min(crossed,kA)-1] - supplyPrefix; heights beyond A (if
+    // any) reuse the last measured per-block delta (constant regtest subsidy).
+    const int kUpTo = (crossedAt < kBranchA) ? crossedAt : kBranchA;
+    int64_t expected = supplyAfterA[kUpTo - 1];
+    if (crossedAt > kBranchA)
+    {
+        const int64_t lastDelta = supplyAfterA[kBranchA - 1] - supplyAfterA[kBranchA - 2];
+        expected += (int64_t)(crossedAt - kBranchA) * lastDelta;
+    }
+    const int64_t supplyAfterReorg = TipSupply::Read("post-reorg", pNewTip->nHeight);
+    BOOST_TEST_MESSAGE("measured: supplyPrefix=" << supplyPrefix
+                       << " supplyAfterATip=" << supplyAfterATip
+                       << " crossed=" << crossedAt
+                       << " supplyAfterReorg=" << supplyAfterReorg
+                       << " supplyAfterA[0]=" << supplyAfterA.front()
+                       << " supplyAfterA[last]=" << supplyAfterA.back());
+    BOOST_CHECK_EQUAL(supplyAfterReorg, expected);
+
+    // The fork ancestor's persisted record still carries the pre-reorg value.
+    {
+        BlockIndexSnapshot snap; std::string err;
+        BOOST_REQUIRE_MESSAGE(GetBlockIndexManager().GetActiveByHeight(lcaHeight, &snap, &err)
+                              == BLOCK_INDEX_MANAGER_OK,
+                              "fork height must resolve after the reorg: " << err);
+        BOOST_CHECK_EQUAL(snap.nMoneySupply, supplyPrefix);
+    }
+
+    // ---- continuity continuation: the next block adds exactly one delta ----
+    CBlock* pNext = MakeCoinbaseBlock(pindexBest, 0x3001);
+    BOOST_REQUIRE(pNext != NULL);
+    uint256 hNext;
+    const Delivery dNext = Deliver(pNext, &hNext);
+    delete pNext;
+    BOOST_REQUIRE(dNext != DELIVERY_REJECTED);
+    BOOST_REQUIRE_MESSAGE(hashBestChain == hNext, "post-reorg block must become active");
+    const int64_t supplyContinued = TipSupply::Read("post-reorg+1", pNewTip->nHeight + 1);
+    const int64_t contDelta = (crossedAt >= 2) ?
+        (supplyAfterA[kBranchA-1] - supplyAfterA[kBranchA-2]) : 0;
+    BOOST_CHECK_EQUAL(supplyContinued - supplyAfterReorg, contDelta);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

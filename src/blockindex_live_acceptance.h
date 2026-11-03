@@ -112,7 +112,10 @@ public:
     BlockIndexTipStatus ReorgTo(int32_t forkHeight,
                                 const std::vector<BlockIndexTipAppend>& newBranch,
                                 const std::vector<int32_t>& newHeights,
-                                std::string* error);
+                                std::string* error,
+                                // V2 MS-FIX3: publish-time connect trail (see
+                                // blockindex_tip.h); NULL keeps the legacy path.
+                                const std::map<int32_t, BlockIndexConnectSupplyEntry>* connectSupplyTrail = NULL);
 
 private:
     BaseKnownFn baseKnown_;
