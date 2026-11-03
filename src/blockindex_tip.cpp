@@ -2745,7 +2745,8 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     int32_t forkHeight,
     const std::vector<BlockIndexTipAppend>& branch,
     const std::vector<int32_t>& branchHeights,
-    std::string* error)
+    std::string* error,
+    const std::map<int32_t, BlockIndexConnectSupplyEntry>* connectSupplyTrail)
 {
     if (BlockIndexCutTraceEnabled())
         BlockIndexCutTrace("REORGACT-ENTER fork=%d branch=%llu pend=%llu durH=%d durHash=%s logH=%d",
@@ -2765,6 +2766,10 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
         return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
     if (branch.size() != branchHeights.size())
         return SetError(error, "reorg branch size mismatch"), BLOCK_INDEX_TIP_CORRUPT;
+    // V2 MS-FIX3 PHASE 1: the connect-trail snapshot (scoped at the caller, see
+    // blockindex_tip.h) travels with the branch; the supply-invariant gate itself
+    // is armed in commit 2 (validation added in front of the store swap).
+    (void)connectSupplyTrail;
     Impl* i = impl;
     const int32_t baseTip = i->meta.baseTipHeight;
 
@@ -2842,11 +2847,18 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     std::vector<BlockIndexRecord> fixRecords;
     std::vector<BlockIndexDerivedEntry> fixDerived;
     std::set<uint256> seenBranch;
+    // V2 MS-FIX3 PHASE 1: per-branch classification (PROMOTE vs APPEND); the
+    // supply-invariant gate below uses it to distinguish healable stale
+    // promotions from anomalous freshly-connected records.
+    std::vector<bool> branchPromoted(branch.size(), false);
     for (size_t k = 0; k < branch.size(); ++k)
     {
         const BlockIndexRecord& rec = branch[k].record;
         if (branchHeights[k] != baseTip + (int32_t)newActive.size() + 1)
             return SetError(error, "reorg branch non-dense height"), BLOCK_INDEX_TIP_CORRUPT;
+        if (rec.height != branchHeights[k])
+            return SetError(error, "reorg branch record height mismatch"),
+                   BLOCK_INDEX_TIP_CORRUPT;
         if (!seenBranch.insert(rec.hash).second)
             return SetError(error, "reorg branch duplicate"), BLOCK_INDEX_TIP_CORRUPT;
         // Promote-or-append via the durable side index's committed view.
@@ -2881,14 +2893,39 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
             // correct ~11.06M). Corrected slots are re-encoded by
             // RewriteStoresForReorg at stable ids (slot addresses unchanged;
             // the side index and active ids stay valid).
-            if (committed.nMoneySupply != rec.nMoneySupply ||
-                committed.nMint != rec.nMint)
+            //
+            // V2 MS-FIX3 PHASE 1 (trail application, PROMOTE): the effective record
+            // is bound to the connect trail's audited accounting for THIS height (an
+            // entry exists only after a SUCCESSFUL ConnectBlock, main.cpp). Where
+            // the branch copy disagrees with it (e.g. a cutover suffix rebuilt from
+            // stale side snapshots), the audited values OVERRIDE the record and the
+            // committed slot below is rewritten to them -- exactly like the cutover
+            // override in main.cpp (PublishAuthoritativeLiveTailCutover). The
+            // publication-time gate further down validates the accounting identity
+            // BEFORE any store is touched, so a failed reorg never persists the
+            // override.
+            BlockIndexRecord effRec = rec;
+            if (connectSupplyTrail != NULL)
+            {
+                const std::map<int32_t, BlockIndexConnectSupplyEntry>::const_iterator tr =
+                    connectSupplyTrail->find(branchHeights[k]);
+                if (tr != connectSupplyTrail->end() &&
+                    (effRec.nMoneySupply != tr->second.supply ||
+                     effRec.nMint != tr->second.mint))
+                {
+                    effRec.nMoneySupply = tr->second.supply;
+                    effRec.nMint        = tr->second.mint;
+                }
+            }
+            if (committed.nMoneySupply != effRec.nMoneySupply ||
+                committed.nMint != effRec.nMint)
             {
                 fixSlots.push_back(slot);
-                fixRecords.push_back(rec);
+                fixRecords.push_back(effRec);
                 fixDerived.push_back(branch[k].derived);
             }
             newActive.push_back(foundId);
+            branchPromoted[k] = true;
         }
         else
         {
@@ -2910,6 +2947,191 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
         const uint64_t slot = id - i->meta.baseRecordCount - 1;
         if (slot >= committedRecords + appendRecords.size())
             return SetError(error, "reorg active record missing"), BLOCK_INDEX_TIP_CORRUPT;
+    }
+
+    // V2 MS-FIX3 PHASE 1: SUPPLY INVARIANT GATE (accounting only, no consensus rule).
+    // The exact ConnectBlock identity is enforced for EVERY branch record that is
+    // about to become ACTIVE, against the authoritative parent supply:
+    //     supply(h) == supply(parent) + mint(h) - fees(h) - burned(h)
+    // Parent resolution, in order:
+    //   1. the connect trail's ANCHOR entry keyed at the fork height — the
+    //      committed/authoritative fork-record supply resolved BY VALUE by the
+    //      connect loop at publication (PublishAuthoritativeLiveTailReorg),
+    //   2. the committed fork-prefix record in this store,
+    //   3. afterwards each VALIDATED trail element supplies the successor height
+    //      (the previously validated element of the new active suffix).
+    // Every to-be-active height MUST have an accounting entry (an entry exists
+    // only after a SUCCESSFUL ConnectBlock; the publication caller passes NULL
+    // when the connect loop produced no accounting at all, so a non-NULL trail
+    // here always carries branch accounting — nothing is skipped). Entries bind
+    // by height AND, when the entry carries the connected block's hash, by hash —
+    // the latter makes a stale entry left over from a failed reorg unusable for
+    // a different block at the same height.
+    // Record binding: PROMOTED records carry their stale committed values and
+    // are healed in the branch loop above (fixRecords rewritten to the audited
+    // values); a freshly connected (APPEND) record that disagrees with its own
+    // ConnectBlock accounting is anomalous and fails closed. Legitimate ZEROS
+    // are never a violation by themselves: mint == 0 on an ACTIVE block is legal
+    // exactly when the identity holds (supply == parent supply when fees ==
+    // burned == 0), and side records that never become active are never
+    // examined. Nothing is persisted on any violation (fail closed, tip stays
+    // at the fork).
+    if (connectSupplyTrail != NULL && !branch.empty())
+    {
+        int64_t parentSupply = 0;
+        bool haveParentSupply = false;
+        const std::map<int32_t, BlockIndexConnectSupplyEntry>::const_iterator anchor =
+            connectSupplyTrail->find(forkHeight);
+        if (anchor != connectSupplyTrail->end())
+        {
+            parentSupply = anchor->second.supply;
+            haveParentSupply = true;
+        }
+        else if (keepActive > 0)
+        {
+            BlockIndexRecord gateForkRec;
+            const BlockIndexId gateForkId = forkPrefixIds.back();
+            if (gateForkId <= i->meta.baseRecordCount ||
+                !i->recordsWin.Get(gateForkId - i->meta.baseRecordCount - 1, &gateForkRec, &aerr))
+                return SetError(error, "supply invariant: fork prefix record unreadable"),
+                       BLOCK_INDEX_TIP_IO_ERROR;
+            parentSupply = gateForkRec.nMoneySupply;
+            haveParentSupply = true;
+        }
+        for (size_t k = 0; k < branch.size(); ++k)
+        {
+            const int32_t gateHeight = branchHeights[k];
+            const BlockIndexRecord& gateRec = branch[k].record;
+            const std::map<int32_t, BlockIndexConnectSupplyEntry>::const_iterator tr =
+                connectSupplyTrail->find(gateHeight);
+            if (tr == connectSupplyTrail->end())
+            {
+                LogPrintf("SUPPLY_INVARIANT_VIOLATION height=%d hash=%s "
+                          "actual_supply=%lld expected_supply=%lld actual_mint=%lld "
+                          "expected_mint=%lld parent_supply=%lld fees=%lld burned=%lld "
+                          "reason=no_connect_accounting source=ReorgActiveTo\n",
+                          gateHeight, gateRec.hash.ToString().c_str(),
+                          (long long)gateRec.nMoneySupply, -1LL,
+                          (long long)gateRec.nMint, -1LL,
+                          (long long)(haveParentSupply ? parentSupply : -1LL),
+                          -1LL, -1LL);
+                SetError(error, strprintf("SUPPLY_INVARIANT_VIOLATION (SUPPLY-INVARIANT): "
+                                          "no connect accounting for active height %d "
+                                          "hash=%s parent_supply=%lld "
+                                          "source=ReorgActiveTo (fail closed)",
+                                          gateHeight, gateRec.hash.ToString().c_str(),
+                                          (long long)(haveParentSupply ? parentSupply : -1LL)));
+                return BLOCK_INDEX_TIP_CORRUPT;
+            }
+            const BlockIndexConnectSupplyEntry& acc = tr->second;
+            // Hash binding of the accounting entry to the block it accounts for.
+            if (acc.hash != uint256(0) && acc.hash != gateRec.hash)
+            {
+                LogPrintf("SUPPLY_INVARIANT_VIOLATION height=%d hash=%s "
+                          "entry_hash=%s actual_supply=%lld expected_supply=%lld "
+                          "actual_mint=%lld expected_mint=%lld parent_supply=%lld "
+                          "fees=%lld burned=%lld reason=accounting_hash_mismatch "
+                          "source=ReorgActiveTo\n",
+                          gateHeight, gateRec.hash.ToString().c_str(),
+                          acc.hash.ToString().c_str(),
+                          (long long)acc.supply, (long long)acc.supply,
+                          (long long)acc.mint, (long long)acc.mint,
+                          (long long)(haveParentSupply ? parentSupply : -1LL),
+                          (long long)acc.fees, (long long)acc.burned);
+                SetError(error, strprintf("SUPPLY_INVARIANT_VIOLATION (SUPPLY-INVARIANT): "
+                                          "connect accounting at height %d hash=%s was "
+                                          "captured for a different block (entry_hash=%s) "
+                                          "— stale trail reuse refused, node accounting "
+                                          "inconsistent — source=ReorgActiveTo (fail closed)",
+                                          gateHeight, gateRec.hash.ToString().c_str(),
+                                          acc.hash.ToString().c_str()));
+                return BLOCK_INDEX_TIP_CORRUPT;
+            }
+            if (haveParentSupply)
+            {
+                const int64_t expectedSupply =
+                    parentSupply + acc.mint - acc.fees - acc.burned;
+                if (acc.supply != expectedSupply)
+                {
+                    LogPrintf("SUPPLY_INVARIANT_VIOLATION height=%d hash=%s "
+                              "actual_supply=%lld expected_supply=%lld actual_mint=%lld "
+                              "expected_mint=%lld parent_supply=%lld fees=%lld burned=%lld "
+                              "reason=accounting_identity_violated source=ReorgActiveTo\n",
+                              gateHeight, gateRec.hash.ToString().c_str(),
+                              (long long)acc.supply, (long long)expectedSupply,
+                              (long long)acc.mint, (long long)acc.mint,
+                              (long long)parentSupply, (long long)acc.fees,
+                              (long long)acc.burned);
+                    SetError(error, strprintf("SUPPLY_INVARIANT_VIOLATION (SUPPLY-INVARIANT): "
+                                              "supply invariant violated at height %d hash=%s "
+                                              "actual_supply=%lld expected_supply=%lld "
+                                              "actual_mint=%lld expected_mint=%lld "
+                                              "parent_supply=%lld fees=%lld burned=%lld "
+                                              "source=ReorgActiveTo (fail closed)",
+                                              gateHeight, gateRec.hash.ToString().c_str(),
+                                              (long long)acc.supply, (long long)expectedSupply,
+                                              (long long)acc.mint, (long long)acc.mint,
+                                              (long long)parentSupply, (long long)acc.fees,
+                                              (long long)acc.burned));
+                    return BLOCK_INDEX_TIP_CORRUPT;
+                }
+                // This element is now the validated supply of the next height's parent.
+                parentSupply = expectedSupply;
+                if (!branchPromoted[k] &&
+                    (gateRec.nMoneySupply != acc.supply || gateRec.nMint != acc.mint))
+                {
+                    LogPrintf("SUPPLY_INVARIANT_VIOLATION height=%d hash=%s "
+                              "actual_supply=%lld expected_supply=%lld actual_mint=%lld "
+                              "expected_mint=%lld parent_supply=%lld fees=%lld burned=%lld "
+                              "reason=record_inconsistent_with_connect_accounting "
+                              "source=ReorgActiveTo\n",
+                              gateHeight, gateRec.hash.ToString().c_str(),
+                              (long long)gateRec.nMoneySupply, (long long)acc.supply,
+                              (long long)gateRec.nMint, (long long)acc.mint,
+                              (long long)parentSupply, (long long)acc.fees,
+                              (long long)acc.burned);
+                    SetError(error, strprintf("SUPPLY_INVARIANT_VIOLATION (SUPPLY-INVARIANT): "
+                                              "active record inconsistent with the connect "
+                                              "accounting at height %d hash=%s "
+                                              "actual_supply=%lld expected_supply=%lld "
+                                              "actual_mint=%lld expected_mint=%lld "
+                                              "parent_supply=%lld fees=%lld burned=%lld "
+                                              "source=ReorgActiveTo (fail closed)",
+                                              gateHeight, gateRec.hash.ToString().c_str(),
+                                              (long long)gateRec.nMoneySupply,
+                                              (long long)acc.supply,
+                                              (long long)gateRec.nMint, (long long)acc.mint,
+                                              (long long)parentSupply, (long long)acc.fees,
+                                              (long long)acc.burned));
+                    return BLOCK_INDEX_TIP_CORRUPT;
+                }
+            }
+            else
+            {
+                // Fork at the immutable base tip: no parent supply is readable
+                // here, so only the per-block mint binding can be checked.
+                if (gateRec.nMint != acc.mint)
+                {
+                    LogPrintf("SUPPLY_INVARIANT_VIOLATION height=%d hash=%s "
+                              "actual_supply=%lld expected_supply=%lld actual_mint=%lld "
+                              "expected_mint=%lld parent_supply=%lld fees=%lld burned=%lld "
+                              "reason=mint_inconsistent_with_connect_accounting "
+                              "source=ReorgActiveTo (no parent supply available)\n",
+                              gateHeight, gateRec.hash.ToString().c_str(),
+                              (long long)-1LL, (long long)-1LL,
+                              (long long)gateRec.nMint, (long long)acc.mint,
+                              (long long)-1LL, (long long)acc.fees, (long long)acc.burned);
+                    SetError(error, strprintf("SUPPLY_INVARIANT_VIOLATION (SUPPLY-INVARIANT): "
+                                              "supply invariant violated at height %d hash=%s "
+                                              "(mint inconsistent with the connect accounting, "
+                                              "parent supply unavailable) actual_mint=%lld "
+                                              "expected_mint=%lld source=ReorgActiveTo (fail closed)",
+                                              gateHeight, gateRec.hash.ToString().c_str(),
+                                              (long long)gateRec.nMint, (long long)acc.mint));
+                    return BLOCK_INDEX_TIP_CORRUPT;
+                }
+            }
+        }
     }
 
     // 3. Persist all three stores by STREAMING complete CoW temp files: the

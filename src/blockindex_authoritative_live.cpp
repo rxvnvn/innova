@@ -1188,7 +1188,8 @@ bool BlockIndexAuthoritativeLive::ReorgTo(
     const std::vector<BlockIndexRecord>& newBranchRecs,
     const std::vector<BlockIndexDerivedEntry>& newBranchDerived,
     const std::vector<int32_t>& newHeights,
-    std::string* error)
+    std::string* error,
+    const std::map<int32_t, BlockIndexConnectSupplyEntry>* connectSupplyTrail)
 {
     if (!impl_->open || !impl_->seam)
         return SetError(error, "authoritative-live: not open");
@@ -1201,7 +1202,7 @@ bool BlockIndexAuthoritativeLive::ReorgTo(
         branch[i].record = newBranchRecs[i];
         branch[i].derived = newBranchDerived[i];
     }
-    BlockIndexTipStatus st = impl_->seam->ReorgTo(forkHeight, branch, newHeights, error);
+    BlockIndexTipStatus st = impl_->seam->ReorgTo(forkHeight, branch, newHeights, error, connectSupplyTrail);
     if (st != BLOCK_INDEX_TIP_OK)
         return false;
     ClearError(error);

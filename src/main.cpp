@@ -6718,6 +6718,77 @@ static inline bool s16_V2Armed()
            s16::g_chainObserve.store && s16::g_chainObserve.store->opened();
 }
 
+// -----------------------------------------------------------------------------
+// V2 MS-FIX3 PHASE 1 (reorg-connect supply trail): per-height ConnectBlock
+// accounting {nMoneySupply, nMint, nFees, nAmountBurned} captured for the
+// CURRENT reorg connect loop and consumed by PublishAuthoritativeLiveTailCutover
+// to (a) override the materialized connect-suffix values and (b) arm the
+// publication-time supply-invariant gate (BlockIndexTipAuthority::ReorgActiveTo).
+// Written ONLY while g_reorgConnectTrailArmed (armed by Reorganize around its
+// connect loop exactly as this map's lifetime always was: cleared at reorg
+// start, consumed after the successfu cutover publish), so ordinary forward
+// ConnectBlock calls never grow the map. Reorg/connect runs under cs_main
+// (single-threaded), no separate lock, no lock-order change.
+static std::map<int32_t, BlockIndexConnectSupplyEntry> g_reorgConnectSupply;
+static bool g_reorgConnectTrailArmed = false;
+
+// V2 MS-FIX2 CONNECT PARENT CARRY (extracted so tests can exercise the exact
+// carry path ResolveConnectParentSupplyContract): resolves the cumulative
+// nMoneySupply ConnectBlock must base a non-genesis block's own accumulator on.
+// Preference: (1) a REAL map-resident pprev object; (2) in armed-V2, the
+// pointer-free parent identity hashPrevStable resolved BY VALUE from the
+// authoritative live store (released-edge reconnect). FAILS CLOSED (returns
+// false with outErr set) whenever no authoritative ancestor snapshot can be
+// resolved for a released edge with a parent identity, or when an armed-V2
+// non-genesis released edge carries NO parent identity at all: a re-based
+// accumulator must never be persisted. Returns true with outSupply = 0 only
+// for legacy mode or an identity-less released edge that is NOT armed-V2
+// (unchanged legacy semantics).
+static bool ConnectBlockResolveParentSupply(CBlockIndex* pindex,
+                                            int64_t& outSupply,
+                                            std::string& outErr)
+{
+    outSupply = 0;
+    outErr.clear();
+    if (pindex->pprev != NULL)
+    {
+        outSupply = pindex->pprev->nMoneySupply;
+        return true;
+    }
+    if (pindex->nHeight <= 0)
+        return true; // genesis: no parent
+    if (!g_fAuthoritativeStartup)
+        return true; // legacy mode keeps its previous semantics
+    if (pindex->hashPrevStable == uint256(0))
+    {
+        outErr = "released-edge reconnect without parent identity (hashPrevStable missing); refusing to re-base the money supply";
+        return false;
+    }
+    BlockIndexAuthoritativeLive* msLive = GetAuthoritativeLiveAuthority();
+    std::string msParentErr;
+    BlockIndexSnapshot msParentSnap;
+    if (msLive == NULL || !msLive->IsOpen() ||
+        msLive->ResolveBlockSnapshot(pindex->hashPrevStable, &msParentSnap, &msParentErr)
+            != BlockIndexHotStatus::OK || !msParentSnap.found)
+    {
+        outErr = msParentErr.empty()
+                     ? "authoritative live authority unavailable"
+                     : msParentErr;
+        return false;
+    }
+    outSupply = msParentSnap.nMoneySupply;
+    return true;
+}
+
+// Test seam: expose the exact carry contract used by ConnectBlock (declared
+// main.h; see supply_invariant tests).
+bool ResolveConnectParentSupplyForTesting(CBlockIndex* pindex,
+                                          int64_t& outSupply,
+                                          std::string& outErr)
+{
+    return ConnectBlockResolveParentSupply(pindex, outSupply, outErr);
+}
+
 bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
 {
     ibdactivepath::ActivePathTimer ibdConnectTimer(
@@ -7497,27 +7568,35 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
     // validates nMoneySupply; failing the read fails the connect without ever
     // persisting a re-based accumulator.
     int64_t nParentSupply = 0;
-    if (pindex->pprev != NULL)
-        nParentSupply = pindex->pprev->nMoneySupply;
-    else if (g_fAuthoritativeStartup && pindex->nHeight > 0 &&
-             pindex->hashPrevStable != uint256(0))
     {
-        BlockIndexAuthoritativeLive* msLive = GetAuthoritativeLiveAuthority();
-        BlockIndexSnapshot msParentSnap; std::string msParentErr;
-        if (msLive == NULL || !msLive->IsOpen() ||
-            msLive->ResolveBlockSnapshot(pindex->hashPrevStable, &msParentSnap, &msParentErr)
-                != BlockIndexHotStatus::OK || !msParentSnap.found)
+        std::string msParentErr;
+        if (!ConnectBlockResolveParentSupply(pindex, nParentSupply, msParentErr))
             return error("ConnectBlock() : cannot resolve released-edge ancestor money supply for %s at height %d (%s) (fail closed, no rebase)",
                          pindex->GetBlockHash().ToString().substr(0, 20).c_str(),
                          pindex->nHeight,
-                         msParentErr.empty() ? "authoritative live authority unavailable" : msParentErr.c_str());
-        nParentSupply = msParentSnap.nMoneySupply;
+                         msParentErr.c_str());
     }
     pindex->nMint = nValueOut - nValueIn + nFees;
     pindex->nMoneySupply = nParentSupply + nValueOut - nValueIn;
     pindex->nMoneySupply -= nAmountBurned;
     if (pindex->nMoneySupply < 0)
         return error("ConnectBlock() : negative money supply at height %d", pindex->nHeight);
+    // V2 MS-FIX3: capture the full per-height accounting for the publication-time
+    // supply-invariant gate. Written ONLY while the reorg connect loop has armed
+    // the trail (g_reorgConnectTrailArmed): the map's lifetime is not changed by
+    // this write. The exact per-block identity this entry describes is
+    //     nMoneySupply(h) - nParentSupply == nMint(h) - nFees - nAmountBurned
+    // anchored at the parent supply ConnectBlock resolved ABOVE.
+    if (g_reorgConnectTrailArmed)
+    {
+        BlockIndexConnectSupplyEntry msEntry;
+        msEntry.supply = pindex->nMoneySupply;
+        msEntry.mint   = pindex->nMint;
+        msEntry.fees   = nFees;
+        msEntry.burned = nAmountBurned;
+        msEntry.hash   = pindex->GetBlockHash(); // by-hash binding (V2 MS-FIX3)
+        g_reorgConnectSupply[pindex->nHeight] = msEntry;
+    }
 
 
     // innova: collect valid name tx
@@ -7635,6 +7714,72 @@ static bool PublishAuthoritativeLiveTailReorg(int nForkHeight,
     BlockIndexAuthoritativeLive* liveAuth = GetAuthoritativeLiveAuthority();
     if (!liveAuth || !liveAuth->IsOpen())
         return true;
+    // V2 MS-FIX3 PHASE 1: build the publish-time connect trail for the
+    // supply-invariant gate. ANCHOR: the fork block's cumulative supply resolved
+    // BY VALUE from the authoritative live store (the parent of the first connect
+    // block, by pointer-free identity — never a released pprev object). BRANCH
+    // ENTRIES: the ConnectBlock accounting captured during the reorg connect loop
+    // (g_reorgConnectSupply, armed by Reorganize). The trail is a by-value
+    // snapshot; the gate in ReorgActiveTo reads it without any lock and every
+    // entry corresponds to a block the consensus engine just connected.
+    std::map<int32_t, BlockIndexConnectSupplyEntry> supplyTrail;
+    // V2 MS-FIX3 PHASE 1: publish the see-below trail only when the reorg connect
+    // loop actually produced branch accounting (computed below).
+    bool fConnectAccounted = false;
+    if (!vConnect.empty())
+    {
+        const CBlockIndex* pFirst = vConnect.front();
+        uint256 forkHash(0);
+        if (pFirst->pprev != NULL)
+            forkHash = pFirst->pprev->GetBlockHash();
+        else
+            forkHash = pFirst->hashPrevStable;
+        if (forkHash == uint256(0))
+        {
+            if (outErr) *outErr = "supply-invariant connect trail: fork anchor identity missing (first connect block has no parent identity)";
+            return false;
+        }
+        BlockIndexSnapshot msForkSnap; std::string msForkErr;
+        if (liveAuth->ResolveBlockSnapshot(forkHash, &msForkSnap, &msForkErr)
+                != BlockIndexHotStatus::OK || !msForkSnap.found)
+        {
+            if (outErr) *outErr = strprintf("supply-invariant connect trail: fork supply anchor for %s at fork height %d cannot be resolved from the authoritative store (%s) (fail closed)",
+                                            forkHash.ToString().substr(0, 16).c_str(),
+                                            nForkHeight,
+                                            msForkErr.c_str());
+            return false;
+        }
+        BlockIndexConnectSupplyEntry msAnchor;
+        msAnchor.supply = msForkSnap.nMoneySupply; // the committed/authoritative parent supply
+        msAnchor.hash   = forkHash;                // by-hash binding of the anchor identity
+        supplyTrail[nForkHeight] = msAnchor;
+        for (size_t i = 0; i < vConnect.size(); ++i)
+        {
+            std::map<int32_t, BlockIndexConnectSupplyEntry>::const_iterator s =
+                g_reorgConnectSupply.find((int32_t)vConnect[i]->nHeight);
+            if (s != g_reorgConnectSupply.end())
+                supplyTrail[(int32_t)vConnect[i]->nHeight] = s->second;
+        }
+        // V2 MS-FIX3 PHASE 1: the trail is published ONLY when the reorg connect
+        // loop actually produced branch accounting (the Reorganize connect loop
+        // runs with the trail armed, so every connected height is present here). A
+        // publication whose suffix was connected OUTSIDE an armed reorg connect
+        // (e.g. an unarmed cutover of already-published blocks) carries no
+        // accounting and must NOT be gated: pass NULL so ReorgActiveTo treats it
+        // exactly like the pre-gate publications instead of flagging absent
+        // entries that were never produced. A partially armed trail (some branch
+        // heights accounted, some missing) is anomalous and stays fail-closed in
+        // the gate.
+        for (std::map<int32_t, BlockIndexConnectSupplyEntry>::const_iterator st =
+                 supplyTrail.begin(); st != supplyTrail.end(); ++st)
+        {
+            if (st->first != nForkHeight)
+            {
+                fConnectAccounted = true;
+                break;
+            }
+        }
+    }
     std::vector<BlockIndexRecord> reorgRecs;
     std::vector<BlockIndexDerivedEntry> reorgDerived;
     std::vector<int32_t> reorgHeights;
@@ -7648,7 +7793,8 @@ static bool PublishAuthoritativeLiveTailReorg(int nForkHeight,
         reorgHeights.push_back((int32_t)vConnect[i]->nHeight);
     }
     std::string reorgErr;
-    if (!liveAuth->ReorgTo(nForkHeight, reorgRecs, reorgDerived, reorgHeights, &reorgErr))
+    if (!liveAuth->ReorgTo(nForkHeight, reorgRecs, reorgDerived, reorgHeights, &reorgErr,
+                           vConnect.empty() || !fConnectAccounted ? NULL : &supplyTrail))
     {
         if (outErr) *outErr = reorgErr;
         return false;
@@ -7748,16 +7894,16 @@ CBlockIndex* MaterializeCBlockIndexByValue(const BlockIndexSnapshot& s, uint256*
     return p;
 }
 
-// V2 MS-FIX: active-chain money-supply/mint accumulated by ConnectBlock for the
-// CURRENT reorg connect. The cutover re-materializes the newly-active suffix from
-// by-value SIDE snapshots whose nMoneySupply/nMint are zero for never-connected
+// V2 MS-FIX: active-chain money-supply/mint trail SEEDED ABOVE ConnectBlock
+// (struct BlockIndexConnectSupplyEntry, blockindex_tip.h). The cutover
+// re-materializes the newly-active suffix from by-value SIDE snapshots whose
+// nMoneySupply/nMint are zero for never-connected
 // side blocks; ReorgTo would persist those zeros and collapse the active chain's
 // supply accumulator (observed LOCAL active tip = 138 INN vs the correct ~11.06M
 // retained on the disconnected A branch). Populated in Reorganize's connect loop
 // (the authoritative ConnectBlock result) and consumed by the same call's
 // PublishAuthoritativeLiveTailCutover before ReorgTo. Reorg/connect runs under
 // cs_main (single-threaded), so no separate lock is required.
-static std::map<int32_t, std::pair<int64_t, int64_t> > g_reorgConnectSupply;
 
 bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
 {
@@ -8006,31 +8152,43 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     // V2 MS-FIX: (re)start the connect supply/mint trail for THIS connect; the
     // cutover that follows a reorg overwrites side-materialized nMoneySupply/nMint
     // (zero) with these authoritative ConnectBlock values.
+    // V2 MS-FIX3: ConnectBlock itself writes the full per-height entry
+    // {supply, mint, fees, burned} while the trail is armed; the trail is armed
+    // ONLY for this connect loop (RAII: disarmed on every exit from Reorganize,
+    // success or failure), so ordinary forward ConnectBlock calls never grow
+    // the map (no lifetime/lock-order change).
     g_reorgConnectSupply.clear();
-    for (unsigned int i = 0; i < vConnect.size(); i++)
     {
-        CBlockIndex* pindex = vConnect[i];
-        CBlock block;
-        if (!block.ReadFromDisk(pindex))
+        struct ReorgConnectTrailArm {
+            ReorgConnectTrailArm() { g_reorgConnectTrailArmed = true; }
+            ~ReorgConnectTrailArm() { g_reorgConnectTrailArmed = false; }
+        } reorgConnectTrailArm_;
+        for (unsigned int i = 0; i < vConnect.size(); i++)
         {
-            return error("Reorganize() : ReadFromDisk for connect failed");
+            CBlockIndex* pindex = vConnect[i];
+            CBlock block;
+            if (!block.ReadFromDisk(pindex))
+            {
+                return error("Reorganize() : ReadFromDisk for connect failed");
+            }
+
+            if (!IsInitialBlockDownload()) GetCollateralnodeRanks(pindex); // recalculate ranks for the this block hash if required
+
+            if (!block.ConnectBlock(pindex))
+            {
+                // Invalid block
+                return error("Reorganize() : ConnectBlock %s failed", pindex->GetBlockHash().ToString().substr(0,20).c_str());
+            }
+            // V2 MS-FIX3: the entry for pindex->nHeight was written by
+            // ConnectBlock itself inside this armed window (full accounting).
+            // (The MS-FIX fill of {supply, mint} from the ConnectBlock result
+            // is preserved by that write; ConnectBlock is the single
+            // authoritative computation.)
+
+            // Queue memory transactions to delete
+            for (const CTransaction& tx : block.vtx)
+                vDelete.push_back(tx);
         }
-
-        if (!IsInitialBlockDownload()) GetCollateralnodeRanks(pindex); // recalculate ranks for the this block hash if required
-
-        if (!block.ConnectBlock(pindex))
-        {
-            // Invalid block
-            return error("Reorganize() : ConnectBlock %s failed", pindex->GetBlockHash().ToString().substr(0,20).c_str());
-        }
-        // V2 MS-FIX: capture the authoritative active-chain supply/mint from the
-        // ConnectBlock result for this suffix block (used by the cutover publish).
-        g_reorgConnectSupply[pindex->nHeight] =
-            std::make_pair(pindex->nMoneySupply, pindex->nMint);
-
-        // Queue memory transactions to delete
-        for (const CTransaction& tx : block.vtx)
-            vDelete.push_back(tx);
     }
     // BI-V2 owns the published tip and Store3A committed each connected block
     // atomically inside ConnectBlock; nothing separate to persist here.
@@ -8592,21 +8750,32 @@ static bool PublishAuthoritativeLiveTailCutover(BlockIndexAuthoritativeLive* liv
     // Reorganize). Persisting the authoritative active-chain cumulative, not the side
     // snapshot, keeps the published V2 tip consistent with forward-sync. Every cutover
     // suffix height was connected by Reorganize, so a missing trail entry is anomalous;
-    // we conservatively leave it as-is rather than propagate a wrong absolute value.
+    // the publication-time supply-invariant gate in ReorgActiveTo now fails closed on
+    // such an anomalous suffix instead of propagating unchecked values.
     if (!g_reorgConnectSupply.empty())
     {
         for (std::vector<CBlockIndex*>::iterator it = vConnect.begin(); it != vConnect.end(); ++it)
         {
-            std::map<int32_t, std::pair<int64_t, int64_t> >::const_iterator s =
-                g_reorgConnectSupply.find((*it)->nHeight);
+            std::map<int32_t, BlockIndexConnectSupplyEntry>::const_iterator s =
+                g_reorgConnectSupply.find((int32_t)(*it)->nHeight);
             if (s != g_reorgConnectSupply.end())
             {
-                (*it)->nMoneySupply = s->second.first;
-                (*it)->nMint        = s->second.second;
+                (*it)->nMoneySupply = s->second.supply;
+                (*it)->nMint        = s->second.mint;
             }
         }
     }
     const bool fOkCut = PublishAuthoritativeLiveTailReorg(nForkHeight, vConnect, outErr);
+    if (fOkCut)
+    {
+        // V2 MS-FIX3: the connect trail was consumed by this successful
+        // publication (ReorgActiveTo validated the active suffix against it).
+        // Clear it so entries can never outlive the reorg that produced them
+        // (a later cutover without its own reorg connect must never see a
+        // stale height's accounting). Failure paths keep the entries for
+        // post-mortem; the next reorg connect clears them anyway.
+        g_reorgConnectSupply.clear();
+    }
     if (BlockIndexCutTraceEnabled())
         BlockIndexCutTrace("CUT-PUBLISH fork=%d branch=%llu firstH=%d lastH=%d ok=%d err=%s",
                            nForkHeight, (unsigned long long)vConnect.size(),
@@ -8625,10 +8794,18 @@ bool PublishAuthoritativeLiveTailCutoverForTesting(BlockIndexAuthoritativeLive* 
     return PublishAuthoritativeLiveTailCutover(live, pindexNew, oldPublishedTipHash, outErr);
 }
 
-// V2 MS-FIX test seam (see main.h). Emulate an already-connected reorg supply trail.
-void SetAuthoritativeConnectSupplyForTesting(int32_t height, int64_t supply, int64_t mint)
+// V2 MS-FIX test seam (see main.h). Emulate an already-connected reorg supply
+// trail (full ConnectBlock accounting; fees/burned default to 0 for the legacy
+// seam shape).
+void SetAuthoritativeConnectSupplyForTesting(int32_t height, int64_t supply, int64_t mint,
+                                             int64_t fees, int64_t burned)
 {
-    g_reorgConnectSupply[height] = std::make_pair(supply, mint);
+    BlockIndexConnectSupplyEntry e;
+    e.supply = supply;
+    e.mint   = mint;
+    e.fees   = fees;
+    e.burned = burned;
+    g_reorgConnectSupply[height] = e;
 }
 void ClearAuthoritativeConnectSupplyForTesting()
 {

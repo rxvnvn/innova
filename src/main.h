@@ -602,8 +602,17 @@ void KeepCoinbaseTimeInSyncForTesting(CBlock* pblock);
 // cutover's money-supply override can be unit-tested without running a full
 // ConnectBlock reorg. Inert in production (the daemon populates the trail via
 // Reorganize's connect loop). Never called by the daemon.
-void SetAuthoritativeConnectSupplyForTesting(int32_t height, int64_t supply, int64_t mint);
+// V2 MS-FIX3: fees/burned carry the full per-height ConnectBlock accounting for
+// the publication-time supply-invariant gate (defaults keep the old seam shape).
+void SetAuthoritativeConnectSupplyForTesting(int32_t height, int64_t supply, int64_t mint,
+                                             int64_t fees = 0, int64_t burned = 0);
 void ClearAuthoritativeConnectSupplyForTesting();
+// V2 MS-FIX3 test seam: the exact released-edge parent-supply carry contract
+// ConnectBlock uses (ConnectBlockResolveParentSupply). Test-only wrapper; never
+// called by the daemon.
+bool ResolveConnectParentSupplyForTesting(CBlockIndex* pindex,
+                                          int64_t& outSupply,
+                                          std::string& outErr);
 // Called from the V2 block-index load after setInvalidBlockHash is
 // loaded and the naive pindexBest reconstructed: rolls the best chain back to
 // the highest valid ancestor if it descends from an operator-invalidated block.
