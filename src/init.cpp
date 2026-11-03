@@ -8,6 +8,7 @@
 #include <malloc.h>   // Block Index V2: malloc_trim for authoritative arena release (Linux/glibc)
 #include <memory>     // A.13.4-R3 bounded CTxDB lifetime
 #include "init.h"
+#include "blockacctrace.h"
 #include "blockindex_authoritative_live.h"
 #include "main.h"
 #include "supply_anchor.h"
@@ -1064,6 +1065,26 @@ bool AppInit2()
     InitAcceptBlockRejectTrace(GetBoolArg("-acceptblockrejecttrace", false));
     ibdactivepath::InitIBDActivePathTrace(
         GetBoolArg("-ibdactivepathtrace", false));
+
+    // -blockaccepttrace (default OFF): opt-in block-acceptance diagnostics.
+    // It reuses the existing named SYNC_LOCK phase timers, adds the record-store
+    // read counters and starts the stall ticker, so a long acceptance hold names
+    // its own stage and records.dat read volume instead of needing perf/gdb.
+    if (GetBoolArg("-blockaccepttrace", false))
+    {
+        blockacctrace::SetEnabled(true);
+        mapArgs["-synclockdiagnostics"] = "1";
+        if (!mapArgs.count("-synclockphasethresholdms"))
+            mapArgs["-synclockphasethresholdms"] = "250";
+        blockacctrace::StartTicker(2000, 5000, 30000);
+        printf("BLOCKACCTRACE enabled: phase diagnostics (threshold=%s ms) + record-read counters + stall ticker\n",
+               mapArgs["-synclockphasethresholdms"].c_str());
+        fflush(stdout);
+    }
+    else
+    {
+        blockacctrace::SetEnabled(false);
+    }
     p2pprop::SetEnabled(GetBoolArg("-p2pprop", false));
     txlat::SetEnabled(GetBoolArg("-txlat", false));
     ibdblocklatency::SetEnabled(

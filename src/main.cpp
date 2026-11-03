@@ -17,6 +17,7 @@
 #include "ibdefficiency.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
+#include "blockacctrace.h"
 #include "p2pprop.h"
 #include "ibdblocklatency.h"
 #include "pinglifecycletrace.h"
@@ -6421,6 +6422,7 @@ bool s16::ChainObserveState::FlushPending()
 {
     if (pending.empty()) return true;
     if (!store || !store->opened()) { lastOpError = "flush: store is not open"; pending.clear(); return false; }
+    if (blockacctrace::Enabled()) blockacctrace::SetStage(6);
     // BOUNDED DURABILITY BARRIER. One barrier over the whole batch pays the
     // write+fsync of every undo record in it while the caller holds cs_main, so
     // the stall window grows with batchSize. batchChunk caps how many blocks one
@@ -8105,6 +8107,7 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     // be recorded as invalid trust: callers read *pfNavigationFailure and skip
     // InvalidChainFound. Both are fail-closed and precede any state mutation.
     if (pfNavigationFailure) *pfNavigationFailure = false;
+    if (blockacctrace::Enabled()) blockacctrace::SetStage(5);
     printf("REORGANIZE\n");
 
     // Operator-invalidation gate (defense in depth; SetBestChain precedes every
@@ -9314,6 +9317,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     if (pindexNew->nChainTrust > nBestChainTrust)
     {
         CSyncLockPhase phase("ProcessMessage(block)", "set_best_chain");
+        if (blockacctrace::Enabled()) blockacctrace::SetStage(4);
         if (!SetBestChain(pindexNew))
         {
             // M8.1b: the legacy block-index erase is removed — armed-V2 BI-V2 owns the index.
@@ -9347,6 +9351,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         if (fNotify)
         {
             CSyncLockPhase phase("ProcessMessage(block)", "wallet_ui_notification");
+        if (blockacctrace::Enabled()) blockacctrace::SetStage(7);
             uiInterface.NotifyBlocksChanged(nHeight, GetNumBlocksOfPeers());
             nLastNotifyTime = nNow;
             nLastNotifyHeight = nHeight;
@@ -9878,6 +9883,7 @@ bool CBlock::AcceptBlock()
     if (IsProofOfStake())
     {
         CSyncLockPhase phase("ProcessMessage(block)", "pos_validation");
+        if (blockacctrace::Enabled()) blockacctrace::SetStage(2);
         uint256 targetProofOfStake;
         //if (!CheckProofOfStake(pindexPrev, vtx[1], nBits, hashProof, targetProofOfStake))
 		if (!CheckProofOfStake(pindexPrev, vtx[1], nBits, hashProof, targetProofOfStake))
@@ -9898,6 +9904,7 @@ bool CBlock::AcceptBlock()
     if (IsProofOfWork())
     {
         CSyncLockPhase phase("ProcessMessage(block)", "pow_validation");
+        if (blockacctrace::Enabled()) blockacctrace::SetStage(2);
         hashProof = GetPoWHash();
     }
 
@@ -9952,6 +9959,7 @@ bool CBlock::AcceptBlock()
         "raw_block_write", nBestHeight + 1);
     {
         CSyncLockPhase phase("ProcessMessage(block)", "write_to_disk");
+        if (blockacctrace::Enabled()) blockacctrace::SetStage(3);
         if (!WriteToDisk(nFile, nBlockPos))
         {
             TraceAcceptBlockReject(*this, nHeight, ABREJECT_WRITE_TO_DISK);
@@ -9962,6 +9970,7 @@ bool CBlock::AcceptBlock()
     int64_t nAddIndexStart = GetTimeMillis();
     {
         CSyncLockPhase phase("ProcessMessage(block)", "add_to_block_index");
+        if (blockacctrace::Enabled()) blockacctrace::SetStage(3);
         if (!AddToBlockIndex(nFile, nBlockPos, hashProof))
         {
             TraceAcceptBlockReject(*this, nHeight, ABREJECT_ADD_TO_BLOCK_INDEX);
@@ -10856,6 +10865,17 @@ bool ProcessBlock(CNode* pfrom, CBlock* pblock)
         ibdactivepath::GetCounters().processblock_count,
         "processblock", nBestHeight);
     g_nBlockTraceSourcePeer = pfrom ? pfrom->GetId() : -1;
+    // -blockaccepttrace: mark this block in flight so a multi-minute hold can be
+    // named (hash/height/stage/record reads) by the tracer ticker while it lasts.
+    struct BlockAcceptTraceGuard {
+        bool on;
+        BlockAcceptTraceGuard(bool onIn, const uint256& h, int ht) : on(onIn)
+        {
+            if (on) blockacctrace::BeginBlock(h.ToString(), ht);
+        }
+        ~BlockAcceptTraceGuard() { if (on) blockacctrace::EndBlock(); }
+    } blockAcceptTraceGuard(blockacctrace::Enabled(), pblock->GetHash(),
+                            DecodeCoinbaseHeightForTrace(*pblock));
     int64_t nStartTime = GetTimeMillis();
     // Check for duplicate
     uint256 hash = pblock->GetHash();

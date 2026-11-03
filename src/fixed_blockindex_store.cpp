@@ -1,6 +1,7 @@
 #include "fixed_blockindex_store.h"
 
 #include "util.h"
+#include "blockacctrace.h"
 
 #include <zlib.h>
 
@@ -740,12 +741,18 @@ bool FixedBlockIndexStore::Read(BlockIndexId id, BlockIndexRecord* out, std::str
         return SetError(error, "truncated record bytes");
 
     LOCK(readHandle->cs);
+    // -blockaccepttrace: one relaxed load when off; when on, this is where a
+    // "records.dat storm" becomes countable per stage (ops/bytes/slowest read).
+    const bool btrace = blockacctrace::Enabled();
+    const uint64_t btraceT0 = btrace ? GetTimeMicros() : 0;
     if (fseeko(readHandle->file, (off_t)offset, SEEK_SET) != 0)
         return SetError(error, "seek failed for record read");
     std::vector<unsigned char> bytes(BLOCK_INDEX_RECORD_SIZE_V1, 0);
     const size_t n = fread(&bytes[0], 1, bytes.size(), readHandle->file);
     if (n != bytes.size())
         return SetError(error, "short record read");
+    if (btrace)
+        blockacctrace::NoteRead((uint64_t)n, GetTimeMicros() - btraceT0);
     return DecodeBlockIndexRecordV1(&bytes[0], bytes.size(), out, error);
 }
 
@@ -790,6 +797,8 @@ bool FixedBlockIndexStore::ReadAllSequential(const std::function<bool(BlockIndex
     }
 
     std::vector<unsigned char> bytes(BLOCK_INDEX_RECORD_SIZE_V1, 0);
+    const bool strace = blockacctrace::Enabled();
+    const uint64_t straceT0 = strace ? GetTimeMicros() : 0;
     for (uint64_t i = 0; i < manifest.recordCount; ++i)
     {
         const size_t n = fread(&bytes[0], 1, bytes.size(), f);
@@ -813,6 +822,9 @@ bool FixedBlockIndexStore::ReadAllSequential(const std::function<bool(BlockIndex
             return true;
         }
     }
+    if (strace)
+        blockacctrace::NoteRead(manifest.recordCount * (uint64_t)BLOCK_INDEX_RECORD_SIZE_V1,
+                                GetTimeMicros() - straceT0);
     fclose(f);
     ClearError(error);
     return true;

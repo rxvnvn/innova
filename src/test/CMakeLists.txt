@@ -11,6 +11,9 @@ innova_apply_platform_definitions(test_innova)
 # Makefile-based workflow does; the exit code is reported as-is (no
 # PASS_REGULAR_EXPRESSION masking).
 set(INNOVA_CTEST_SUITES
+    blockindex_activeindex_tests
+    store3a_batch_chunk_tests
+    blockacctrace_tests
     blockindex_authoritative_regtest_bootstrap_tests
     blockindex_derived_state_tests
     blockindex_startup_seam_tests
