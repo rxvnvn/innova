@@ -212,4 +212,37 @@ BOOST_AUTO_TEST_CASE(m10_no_pprev_causal)
     BOOST_CHECK(mapBlockIndex.find(fx.side.hash) == mapBlockIndex.end());
 }
 
+// The records-integrity scan in BlockIndexV2Reader::Open walks every record of
+// records.dat. A published generation is immutable, so the scan must happen once
+// per generation identity, not once per open: a second open in the same process
+// must not read records.dat again. This is the 2026-11-04 storm contract.
+BOOST_AUTO_TEST_CASE(integrity_scan_runs_once_per_generation_identity)
+{
+    BlockIndexV2ReaderResetIntegrityMemoForTesting();
+    const uint64_t before = BlockIndexV2ReaderIntegrityScansForTesting();
+    {
+        CandFixture fx(5);                       // first open of the generation
+        const uint64_t afterFirst = BlockIndexV2ReaderIntegrityScansForTesting();
+        BOOST_CHECK_EQUAL(afterFirst - before, 1u);
+
+        // Second open of the SAME generation: no further record scan.
+        // LevelDB holds an exclusive LOCK per generation, so the first reader
+        // must be closed first — this is exactly the generation-rotation path.
+        fx.reader.Close();
+        BlockIndexV2Reader second;
+        BlockIndexV2ReaderOptions opts;
+        std::string err;
+        BOOST_REQUIRE_MESSAGE(second.Open(fx.root.string(), opts, &err), err);
+        BOOST_CHECK_EQUAL(BlockIndexV2ReaderIntegrityScansForTesting(), afterFirst);
+
+        // Dropping the memo re-arms the fail-closed scan.
+        second.Close();
+        BlockIndexV2ReaderResetIntegrityMemoForTesting();
+        BlockIndexV2Reader third;
+        BOOST_REQUIRE_MESSAGE(third.Open(fx.root.string(), opts, &err), err);
+        BOOST_CHECK_EQUAL(BlockIndexV2ReaderIntegrityScansForTesting(), afterFirst + 1);
+    }
+    BlockIndexV2ReaderResetIntegrityMemoForTesting();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

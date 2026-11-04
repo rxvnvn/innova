@@ -157,4 +157,9 @@ private:
     void CachePut(const BlockIndexSnapshot& value) const;
 };
 
+// Verify-once integrity memo (see blockindex_v2_reader.cpp Open): the number
+// of full record scans actually performed, and a reset for tests.
+uint64_t BlockIndexV2ReaderIntegrityScansForTesting();
+void BlockIndexV2ReaderResetIntegrityMemoForTesting();
+
 #endif

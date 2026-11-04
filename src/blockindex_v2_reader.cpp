@@ -1,5 +1,11 @@
 #include "blockindex_v2_reader.h"
 #include "blockindex_derived_state.h"
+#include "blockacctrace.h"
+
+#include <atomic>
+#include <mutex>
+#include <set>
+#include <string>
 
 namespace {
 static bool Fail(std::string* error, const std::string& text) { if (error) *error = text; return false; }
@@ -49,6 +55,81 @@ BlockIndexV2Reader& BlockIndexV2Reader::operator=(BlockIndexV2Reader&& other) no
     return *this;
 }
 
+// ---- verify-once memo for the immutable generation -------------------------
+// The integrity scan below walks every record of records.dat. A published
+// generation never changes, so the verdict is memoised per generation identity
+// for the life of the process. See the call site for why this is safe.
+namespace {
+std::mutex& IntegrityMu()
+{
+    static std::mutex m;
+    return m;
+}
+std::set<std::string>& IntegrityVerified()
+{
+    static std::set<std::string> s;
+    return s;
+}
+std::atomic<uint64_t>& IntegrityScanCount()
+{
+    static std::atomic<uint64_t> n(0);
+    return n;
+}
+std::string HexOf(const unsigned char* p, size_t n)
+{
+    static const char* k = "0123456789abcdef";
+    std::string out;
+    out.reserve(n * 2);
+    for (size_t i = 0; i < n; ++i)
+    {
+        out.push_back(k[(p[i] >> 4) & 0xf]);
+        out.push_back(k[p[i] & 0xf]);
+    }
+    return out;
+}
+std::string MakeIntegrityKey(const std::string& root, const FixedBlockIndexManifest& m)
+{
+    // Every field that defines the CONTENT of the generation is in the key, so a
+    // new generation (or a re-published one) re-arms the scan automatically.
+    return root + "|" + std::to_string(m.generation) + "|" +
+           HexOf(m.generationInputDigest, 32) + "|" +
+           std::to_string(m.recordCount) + "|" +
+           std::to_string(m.committedTipHeight) + "|" +
+           HexOf(m.committedTipHash.begin(), 32);
+}
+bool IntegrityAlreadyVerified(const std::string& key)
+{
+    std::lock_guard<std::mutex> lg(IntegrityMu());
+    return IntegrityVerified().count(key) != 0;
+}
+void MarkIntegrityVerified(const std::string& key)
+{
+    {
+        std::lock_guard<std::mutex> lg(IntegrityMu());
+        IntegrityVerified().insert(key);
+    }
+    // Counted unconditionally (cheap), printed only when the tracer is on: this
+    // is the number that says whether full record scans can explain a storm.
+    const uint64_t n = IntegrityScanCount().fetch_add(1, std::memory_order_relaxed) + 1;
+    if (blockacctrace::Enabled())
+    {
+        fprintf(stderr, "BLOCKACCTRACE_INTEGRITY scan=%llu key=%s\n",
+                (unsigned long long)n, key.c_str());
+        fflush(stderr);
+    }
+}
+} // namespace
+
+uint64_t BlockIndexV2ReaderIntegrityScansForTesting()
+{
+    return IntegrityScanCount().load(std::memory_order_relaxed);
+}
+void BlockIndexV2ReaderResetIntegrityMemoForTesting()
+{
+    std::lock_guard<std::mutex> lg(IntegrityMu());
+    IntegrityVerified().clear();
+}
+
 bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderOptions& options, std::string* error)
 {
     Close();
@@ -71,6 +152,19 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
     // store is fully validated here: ANY unreadable/corrupt record fails the
     // open (authoritative corruption is never rebuildable). Bounded O(records)
     // by-value; no materialization.
+    //
+    // VERIFY-ONCE (2026-11-04): a generation is IMMUTABLE — no file inside it is
+    // ever rewritten after publication. Re-scanning every record on EVERY open
+    // therefore re-proves a fact that cannot have changed, and costs one full
+    // sequential pass over records.dat (1.74 GB at mainnet size; ~70 s at the
+    // 25 MB/s observed on a 2 GB VPS). That pass is the records.dat storm seen
+    // on 2026-11-04. The verdict is memoised per (root, generation, manifest
+    // digest, record count, committed tip) for the life of the process: the
+    // first open of a generation still performs the full fail-closed scan, and
+    // any change to the generation identity re-arms it. No file is written, no
+    // on-disk format changes, and a failed scan is never memoised.
+    const std::string integrityKey = MakeIntegrityKey(root, nextManifest);
+    if (!IntegrityAlreadyVerified(integrityKey))
     {
         // U4 (Cohort U): the per-record bounds+decode+CRC check is unchanged, but
         // it is performed through ONE bounded forward-only stream instead of a
@@ -84,6 +178,7 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
         if (!nextStore.ReadAllSequential(
                 [](BlockIndexId, const BlockIndexRecord&) -> bool { return true; }, &vErr))
             return Fail(error, "authoritative records integrity failure: " + vErr);
+        MarkIntegrityVerified(integrityKey);
     }
     if (nextManifest.committedTipHeight >= 0) {
         BlockIndexId tipId = BLOCK_INDEX_ID_INVALID;
