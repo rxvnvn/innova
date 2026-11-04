@@ -752,7 +752,13 @@ bool FixedBlockIndexStore::Read(BlockIndexId id, BlockIndexRecord* out, std::str
     if (n != bytes.size())
         return SetError(error, "short record read");
     if (btrace)
+    {
         blockacctrace::NoteRead((uint64_t)n, GetTimeMicros() - btraceT0);
+        // Attribute the read to the code that asked for it: the storm's entry
+        // point is otherwise invisible without a stack. Resolved offline with
+        // addr2line against the same build.
+        blockacctrace::NoteReadSite(__builtin_return_address(0), (uint64_t)n);
+    }
     return DecodeBlockIndexRecordV1(&bytes[0], bytes.size(), out, error);
 }
 

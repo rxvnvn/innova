@@ -12880,16 +12880,23 @@ bool IsBlockWireNullShape(const CBlock& block)
 static bool AuthoritativeResolveLocator(const CBlockLocator& locator,
                                         BlockIndexSnapshot* out)
 {
+    const uint64_t nStartUs = blockacctrace::NowUs();
+    uint64_t nLookups = 0;
     for (const uint256& h : locator.GetHashesVector())
     {
         BlockIndexSnapshot s;
+        ++nLookups;
         if (GetBlockIndexManager().LookupByHash(h, &s, NULL) ==
                 BLOCK_INDEX_MANAGER_OK && s.found && s.fInMainChain)
         {
             *out = s;
+            blockacctrace::NoteSite(blockacctrace::SITE_RESOLVE_LOCATOR, nLookups, 0,
+                                    blockacctrace::NowUs() - nStartUs);
             return true;
         }
     }
+    blockacctrace::NoteSite(blockacctrace::SITE_RESOLVE_LOCATOR, nLookups, 0,
+                            blockacctrace::NowUs() - nStartUs);
     return false;
 }
 
@@ -13192,12 +13199,16 @@ static bool AuthoritativeServeGetHeaders(CNode* pfrom,
     bool haveLastSent = false;
 
     const int startH = fork.height + 1;
+    const uint64_t nSiteStartUs = blockacctrace::NowUs();
+    uint64_t nSiteHeights = 0;
     for (int h = startH; h <= nTipHeight; ++h)
     {
         BlockIndexSnapshot s;
         if (mgr.GetActiveByHeight(h, &s, NULL) != BLOCK_INDEX_MANAGER_OK
             || !s.found)
             break;
+        ++nSiteHeights;
+
         // Read header-only (SER_BLOCKHEADERONLY): vtx stays empty, so the
         // serialized "headers" wire payload matches the legacy CBlockIndex::
         // GetBlockHeader() exactly.
@@ -13210,6 +13221,8 @@ static bool AuthoritativeServeGetHeaders(CNode* pfrom,
         if (--nLimit <= 0 || s.hash == hashStop)
             break;
     }
+    blockacctrace::NoteSite(blockacctrace::SITE_SERVE_GETHEADERS, nSiteHeights, 0,
+                            blockacctrace::NowUs() - nSiteStartUs);
 
     unsigned int nHeadersBytes = ::GetSerializeSize(vHeaders, SER_NETWORK,
                                                     PROTOCOL_VERSION);

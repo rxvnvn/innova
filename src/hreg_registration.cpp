@@ -3,6 +3,7 @@
 
 #include "hreg_registration.h"
 
+#include "blockacctrace.h"
 #include "checkpoints.h"
 #include "script.h"
 #include "blockindex_authoritative_startup.h"
@@ -620,9 +621,12 @@ bool RebuildHRegStateFromActiveChainByValue(const BlockIndexActiveChainReader& r
 
     const int32_t begin = (startHeight <= 0) ? 0 : startHeight;
     const int32_t end = (heightLimit < 0) ? activeHeight : std::min(heightLimit, activeHeight);
+    const uint64_t nSiteStartUs = blockacctrace::NowUs();
+    uint64_t nSiteHeights = 0;
 
     for (int32_t h = begin; h <= end; ++h)
     {
+        ++nSiteHeights;
         if (!IsHRegRecognitionActive(h))
             continue;
 
@@ -656,6 +660,8 @@ bool RebuildHRegStateFromActiveChainByValue(const BlockIndexActiveChainReader& r
             mapLocalTx[tx.GetHash()] = tx;
         }
     }
+    blockacctrace::NoteSite(blockacctrace::SITE_HREG_REBUILD, nSiteHeights, 0,
+                            blockacctrace::NowUs() - nSiteStartUs);
     return true;
 }
 

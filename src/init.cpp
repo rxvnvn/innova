@@ -1085,6 +1085,10 @@ bool AppInit2()
     {
         blockacctrace::SetEnabled(false);
     }
+    // -p2pstallwatch (default OFF): progress-based P2P watchdog (see net.cpp).
+    if (GetBoolArg("-p2pstallwatch", false))
+        printf("P2PSTALLWATCH enabled: progress-based peer retry (progress=%llds, max_attempts=%d)\n",
+               (long long)pp2p::STALL_PROGRESS_SEC, pp2p::STALL_MAX_ATTEMPTS);
     p2pprop::SetEnabled(GetBoolArg("-p2pprop", false));
     txlat::SetEnabled(GetBoolArg("-txlat", false));
     ibdblocklatency::SetEnabled(

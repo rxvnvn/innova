@@ -88,6 +88,26 @@ void RecordOrdinaryGetBlocksCommitted(int64_t nNow, uint64_t nRecoveryId,
 CStalledSyncRecoveryState& GetStalledSyncRecoveryStateForTesting();
 void ResetStalledSyncRecoveryStateForTesting();
 void StartSyncForTesting(const std::vector<CNode*>& vNodesIn);
+
+// ---- -p2pstallwatch (off by default) --------------------------------------
+// Decision function is pure so it can be unit-tested without sockets.
+namespace pp2p
+{
+struct StallWatchDecision
+{
+    bool requestHeaders;
+    bool disconnect;
+    int64_t backoffSec;
+};
+static const int STALL_MAX_ATTEMPTS = 5;
+static const int64_t STALL_PROGRESS_SEC = 90;
+
+StallWatchDecision DecideStallAction(int64_t now, int64_t lastProgress,
+                                     int64_t lastAttempt, int attempts,
+                                     int peerBestHeight, int ourHeight);
+}
+
+void P2PStallWatch(const std::vector<CNode*>& vNodesCopy);
 void ResetSyncPeerForTesting();
 
 // Test-only accessors for the pipeline-wake state machine.  Declared here

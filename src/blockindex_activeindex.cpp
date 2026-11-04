@@ -1,5 +1,6 @@
 #include "blockindex_activeindex.h"
 
+#include "blockacctrace.h"
 #include "util.h"
 
 #include <boost/filesystem.hpp>
@@ -580,6 +581,10 @@ bool FixedBlockIndexShadowActiveLookup::Open(const std::string& generationDir, F
         }
     }
     tmp.open = true;
+    // Bounded-open proof at runtime: on the fixed build this is 1; on the
+    // pre-fix loop it would be tipHeight+1 (8.2 M on mainnet), which is exactly
+    // what the storm trace needs to distinguish.
+    blockacctrace::NoteSite(blockacctrace::SITE_ACTIVE_OPEN, (uint64_t)tmp.openEntryReads, 0, 0);
     *out = std::move(tmp);
     ClearError(error);
     return true;

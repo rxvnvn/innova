@@ -20,6 +20,7 @@
 #include <atomic>
 #include <string>
 #include <mutex>
+#include <map>
 #include <ctime>
 #include <thread>
 #include <stdio.h>
@@ -84,6 +85,135 @@ inline void NoteRead(uint64_t bytes, uint64_t us)
     c.readBytes.fetch_add(bytes, std::memory_order_relaxed);
     uint64_t prev = c.slowReadUs.load(std::memory_order_relaxed);
     while (us > prev && !c.slowReadUs.compare_exchange_weak(prev, us, std::memory_order_relaxed)) {
+    }
+}
+
+// ---- Call-site attribution for index resolution walks ----------------------
+//
+// A full-height resolution walk is invisible in a stall trace: the stall line
+// reports which block is held, never which resolver asked for thousands of
+// records. These counters answer "which entry point" on the next occurrence.
+// Nothing is recorded while the flag is off (one relaxed load + branch).
+enum ResolveSite
+{
+    SITE_SERVE_GETHEADERS = 0,
+    SITE_SERVE_GETBLOCKS,
+    SITE_RESOLVE_LOCATOR,
+    SITE_ACTIVE_OPEN,
+    SITE_HREG_REBUILD,
+    SITE_COUNT
+};
+
+struct SiteCounters
+{
+    std::atomic<uint64_t> calls;
+    std::atomic<uint64_t> heights;
+    std::atomic<uint64_t> bytes;
+    std::atomic<uint64_t> slowUs;
+    SiteCounters() : calls(0), heights(0), bytes(0), slowUs(0) {}
+};
+
+inline SiteCounters& Sites(int site)
+{
+    static SiteCounters table[SITE_COUNT];
+    return table[(site >= 0 && site < SITE_COUNT) ? site : 0];
+}
+
+inline const char* SiteName(int site)
+{
+    switch (site)
+    {
+    case SITE_SERVE_GETHEADERS: return "serve_getheaders";
+    case SITE_SERVE_GETBLOCKS:  return "serve_getblocks";
+    case SITE_RESOLVE_LOCATOR:  return "resolve_locator";
+    case SITE_ACTIVE_OPEN:      return "active_open";
+    case SITE_HREG_REBUILD:     return "hreg_rebuild";
+    default:                    return "?";
+    }
+}
+
+// heights = number of heights resolved by this call; bytes = record bytes it
+// caused (0 when unknown); us = wall time of the call. A call that resolves a
+// lot or takes long is reported immediately, so the entry point of a storm is
+// visible in the log even if the process is later killed.
+inline void NoteSite(int site, uint64_t heights, uint64_t bytes, uint64_t us)
+{
+    if (!Enabled())
+        return;
+    SiteCounters& c = Sites(site);
+    c.calls.fetch_add(1, std::memory_order_relaxed);
+    c.heights.fetch_add(heights, std::memory_order_relaxed);
+    c.bytes.fetch_add(bytes, std::memory_order_relaxed);
+    uint64_t prev = c.slowUs.load(std::memory_order_relaxed);
+    while (us > prev && !c.slowUs.compare_exchange_weak(prev, us, std::memory_order_relaxed)) {
+    }
+    if (heights >= 2000 || us >= 250000)
+    {
+        fprintf(stderr,
+                "BLOCKACCTRACE_SITE site=%s heights=%llu bytes=%llu us=%llu "
+                "totals(calls=%llu heights=%llu bytes=%llu slow_us=%llu)\n",
+                SiteName(site),
+                (unsigned long long)heights,
+                (unsigned long long)bytes,
+                (unsigned long long)us,
+                (unsigned long long)c.calls.load(std::memory_order_relaxed),
+                (unsigned long long)c.heights.load(std::memory_order_relaxed),
+                (unsigned long long)c.bytes.load(std::memory_order_relaxed),
+                (unsigned long long)c.slowUs.load(std::memory_order_relaxed));
+        fflush(stderr);
+    }
+}
+
+inline void DumpSites(const char* why)
+{
+    if (!Enabled())
+        return;
+    for (int i = 0; i < SITE_COUNT; ++i)
+    {
+        SiteCounters& c = Sites(i);
+        uint64_t calls = c.calls.load(std::memory_order_relaxed);
+        if (!calls)
+            continue;
+        fprintf(stderr,
+                "BLOCKACCTRACE_SITES why=%s site=%s calls=%llu heights=%llu bytes=%llu slow_us=%llu\n",
+                why ? why : "-", SiteName(i),
+                (unsigned long long)calls,
+                (unsigned long long)c.heights.load(std::memory_order_relaxed),
+                (unsigned long long)c.bytes.load(std::memory_order_relaxed),
+                (unsigned long long)c.slowUs.load(std::memory_order_relaxed));
+    }
+    fflush(stderr);
+}
+
+// ---- Per-call-site read attribution ---------------------------------------
+//
+// The stall trace says a block is held; it cannot say WHICH resolver asked for
+// the records. When the caller is unknown (a full-height walk can be entered
+// from several places), record the read volume per return address and report a
+// site as soon as it crosses a step. Addresses are resolved offline against the
+// build with addr2line; no gdb/perf is required on the node.
+inline void NoteReadSite(const void* addr, uint64_t bytes)
+{
+    if (!Enabled())
+        return;
+    struct Entry { uint64_t bytes; uint64_t ops; };
+    static std::mutex m;
+    static std::map<const void*, Entry> table;
+    const uint64_t kStepBytes = 64ull * 1024 * 1024;
+    std::lock_guard<std::mutex> lg(m);
+    Entry& e = table[addr];
+    const uint64_t before = e.bytes;
+    e.bytes += bytes;
+    e.ops += 1;
+    if (before / kStepBytes != e.bytes / kStepBytes)
+    {
+        fprintf(stderr,
+                "BLOCKACCTRACE_READSITE site=%p ops=%llu bytes=%llu step=%llu\n",
+                addr,
+                (unsigned long long)e.ops,
+                (unsigned long long)e.bytes,
+                (unsigned long long)(e.bytes / kStepBytes));
+        fflush(stderr);
     }
 }
 

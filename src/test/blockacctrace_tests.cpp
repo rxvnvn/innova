@@ -55,4 +55,34 @@ BOOST_AUTO_TEST_CASE(in_flight_block_carries_hash_height_and_stage)
     blockacctrace::SetEnabled(false);
 }
 
+BOOST_AUTO_TEST_CASE(site_counters_attribute_a_walk_and_are_inert_when_disabled)
+{
+    using namespace blockacctrace;
+    SetEnabled(false);
+    uint64_t callsBefore = Sites(SITE_SERVE_GETHEADERS).calls.load();
+    uint64_t heightsBefore = Sites(SITE_SERVE_GETHEADERS).heights.load();
+    NoteSite(SITE_SERVE_GETHEADERS, 8000000ull, 0, 1200000ull); // must be ignored
+    NoteReadSite((const void*)0x1234, 4096);
+    BOOST_CHECK_EQUAL(Sites(SITE_SERVE_GETHEADERS).calls.load(), callsBefore);
+    BOOST_CHECK_EQUAL(Sites(SITE_SERVE_GETHEADERS).heights.load(), heightsBefore);
+
+    SetEnabled(true);
+    NoteSite(SITE_SERVE_GETHEADERS, 2000, 0, 1000);
+    NoteSite(SITE_SERVE_GETHEADERS, 1, 0, 500000); // long call, few heights
+    NoteSite(SITE_HREG_REBUILD, 8200000ull, 0, 60000000ull);
+    const SiteCounters& gh = Sites(SITE_SERVE_GETHEADERS);
+    BOOST_CHECK_EQUAL(gh.calls.load() - callsBefore, 2u);
+    BOOST_CHECK_EQUAL(gh.heights.load() - heightsBefore, 2001u);
+    BOOST_CHECK(gh.slowUs.load() >= 500000u);
+    BOOST_CHECK_EQUAL(Sites(SITE_HREG_REBUILD).calls.load(), 1u);
+    BOOST_CHECK_EQUAL(Sites(SITE_HREG_REBUILD).heights.load(), 8200000u);
+    BOOST_CHECK_EQUAL(std::string(SiteName(SITE_HREG_REBUILD)), std::string("hreg_rebuild"));
+    // An out-of-range site must fold into slot 0 instead of touching memory.
+    const uint64_t ghCallsBeforeBad = gh.calls.load();
+    NoteSite(-1, 1, 0, 1);
+    NoteSite(SITE_COUNT + 7, 1, 0, 1);
+    BOOST_CHECK_EQUAL(gh.calls.load() - ghCallsBeforeBad, 2u);
+    SetEnabled(false);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

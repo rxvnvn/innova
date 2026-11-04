@@ -9540,6 +9540,96 @@ void StartSyncForTesting(const vector<CNode*>& vNodesIn)
     StartSync(vNodesIn);
 }
 
+// ---- -p2pstallwatch -------------------------------------------------------
+//
+// The 2026-11-04 incident had nodes whose TCP connections were alive while no
+// block was exchanged (blocksinflight=0, bestknownheight ahead, ping unanswered).
+// "Number of peers" is not progress. This watchdog keys on real progress and on
+// a bounded retry ladder, so a silent peer is retried a few times with backoff
+// and then dropped, letting the addrman hand us another one. Default OFF.
+namespace pp2p {
+StallWatchDecision DecideStallAction(int64_t now, int64_t lastProgress,
+                                     int64_t lastAttempt, int attempts,
+                                     int peerBestHeight, int ourHeight)
+{
+    pp2p::StallWatchDecision d;
+    d.requestHeaders = false;
+    d.disconnect = false;
+    d.backoffSec = 0;
+    if (peerBestHeight <= ourHeight + 1)
+        return d;                      // nothing advertised above us
+    if (attempts >= pp2p::STALL_MAX_ATTEMPTS)
+    {
+        d.disconnect = true;           // bounded: stop the reconnect treadmill
+        return d;
+    }
+    if (lastProgress != 0 && now - lastProgress < pp2p::STALL_PROGRESS_SEC)
+        return d;                      // peer is still delivering -> leave it
+    static const int64_t kBackoff[pp2p::STALL_MAX_ATTEMPTS] = { 60, 120, 240, 480, 900 };
+    // The wait that must elapse BEFORE the next request is the backoff granted by
+    // the previous attempt (60 s after the first, 120 s after the second, ...);
+    // the value reported now is the wait that will follow this request.
+    const int idxWait = attempts > 0 ? attempts - 1 : 0;
+    const int64_t nWait = kBackoff[idxWait < pp2p::STALL_MAX_ATTEMPTS ? idxWait : 0];
+    if (lastAttempt != 0 && now - lastAttempt < nWait)
+        return d;                      // still inside the current backoff window
+    d.requestHeaders = true;
+    d.backoffSec = kBackoff[attempts < pp2p::STALL_MAX_ATTEMPTS ? attempts : 0];
+    return d;
+}
+} // namespace pp2p
+
+void P2PStallWatch(const vector<CNode*>& vNodesCopy)
+{
+    const int64_t now = GetTime();
+    int nOurHeight = -1;
+    uint256 hashOurTip;
+    {
+        BlockIndexSnapshot tip;
+        if (GetBlockIndexManager().GetTip(&tip, NULL) == BLOCK_INDEX_MANAGER_OK && tip.found)
+        {
+            nOurHeight = tip.height;
+            hashOurTip = tip.hash;
+        }
+    }
+    if (nOurHeight < 0)
+        return;
+    struct WatchState { int64_t lastAttempt; int attempts; };
+    static std::mutex m;
+    static std::map<NodeId, WatchState> state;
+    std::lock_guard<std::mutex> lg(m);
+    for (CNode* pnode : vNodesCopy)
+    {
+        if (!pnode || pnode->fDisconnect || !pnode->fSuccessfullyConnected)
+            continue;
+        const int64_t nLastProgress = std::max(std::max(pnode->nLastRecv, pnode->nLastBlockRecv),
+                                               (int64_t)pnode->nTimeConnected);
+        WatchState& w = state[pnode->GetId()];
+        const pp2p::StallWatchDecision d =
+            pp2p::DecideStallAction(now, nLastProgress, w.lastAttempt, w.attempts,
+                                    pnode->nBestKnownHeight, nOurHeight);
+        if (d.disconnect)
+        {
+            printf("P2PSTALL peer=%s action=disconnect attempts=%d bestknown=%d our=%d age=%llds\n",
+                   pnode->addr.ToString().c_str(), w.attempts, pnode->nBestKnownHeight, nOurHeight,
+                   (long long)(now - nLastProgress));
+            pnode->fDisconnect = true;
+            state.erase(pnode->GetId());
+            continue;
+        }
+        if (d.requestHeaders)
+        {
+            w.lastAttempt = now;
+            ++w.attempts;
+            printf("P2PSTALL peer=%s action=request_headers attempt=%d backoff=%llds "
+                   "bestknown=%d our=%d age=%llds\n",
+                   pnode->addr.ToString().c_str(), w.attempts, (long long)d.backoffSec,
+                   pnode->nBestKnownHeight, nOurHeight, (long long)(now - nLastProgress));
+            pnode->PushGetHeaders(CBlockLocator(hashOurTip), uint256(0), "stallwatch");
+        }
+    }
+}
+
 void ThreadMessageHandler(void* parg)
 {
     // Make this thread recognisable as the message handling thread
@@ -9589,6 +9679,14 @@ void ThreadMessageHandler2(void* parg)
 
         if (!fHaveSyncNode)
             StartSync(vNodesCopy);
+
+        // -p2pstallwatch: progress-based watchdog. A peer whose TCP is alive but
+        // that stops delivering headers/blocks must not stall the node silently;
+        // bounded retries with backoff, then drop the silent peer so the addrman
+        // can supply another one. Off by default; never changes consensus.
+        if (GetBoolArg("-p2pstallwatch", false))
+            P2PStallWatch(vNodesCopy);
+
         bool fSleep = true;
 
         // Poll the connected nodes for messages
