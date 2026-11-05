@@ -1287,6 +1287,49 @@ bool CommitStore3A::applyOps(const Delta& d, ChainError* e){
     return true;
 }
 
+// S1-c: READ-ONLY undo lookup. Decodes the committed undo record for `blockHash` without mutating
+// any store state (tree, undoRecent_, tip, generation, MANIFEST, barriers, files). The record header
+// framing is the same one loadUndoFor() validates: magic(8) | len(4 LE) | blockHash(32) | height(4 LE).
+// The bounded recent cache is tried first; otherwise the committed region is scanned by headers, so
+// arbitrary HISTORICAL blocks are reachable (deep-reorg V-phase), not just the current tip.
+bool CommitStore3A::peekUndo(const Hash& blockHash, UndoRecord* out, ChainError* e) const{
+    clearErr(e);
+    if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
+    if(out==NULL){ setErr(e,ErrCode::IO,"peekUndo: null output"); return false; }
+    const uint64_t committed=undoCommittedBytes_;
+    // Decode one record body and bind it to the requested hash. A decoded record whose embedded hash
+    // differs from the header we followed is a corrupt stream, never a silent mismatch.
+    struct Reader {
+        const CommitStore3A* s; const Hash& want; UndoRecord* out; ChainError* e;
+        bool operator()(uint64_t off,uint32_t len) const{
+            std::vector<uint8_t> body; if(!csReadRange(s->p("undo.dat"),off,len,&body,e)) return false;
+            size_t o=0; UndoRecord rec;
+            if(!UndoRecord::decode(body.data(),body.size(),&o,&rec,e)) return false;
+            if(!(rec.blockHash==want)){ setErr(e,ErrCode::CORRUPT,"undo record hash mismatch at offset "+std::to_string(off)); return false; }
+            *out=rec; return true;
+        }
+    } rd{this,blockHash,out,e};
+    for(size_t i=undoRecent_.size(); i-->0; ){
+        const UndoMeta& m=undoRecent_[i];
+        if(m.blockHash==blockHash) return rd(m.offset,m.len);
+    }
+    const uint8_t magic[8]={'I','N','N','U','N','D','O','1'};
+    uint64_t off=0;
+    while(off<committed){
+        if(off+UNDO_HEADER_SIZE>committed){ setErr(e,ErrCode::CORRUPT,"undo header crosses committed length"); return false; }
+        std::vector<uint8_t> hdr;
+        if(!csReadRange(p("undo.dat"),off,UNDO_HEADER_SIZE,&hdr,e)) return false;
+        if(memcmp(hdr.data(),magic,8)!=0){ setErr(e,ErrCode::CORRUPT,"undo magic at offset "+std::to_string(off)); return false; }
+        uint32_t len=0; for(int i=0;i<4;i++) len|=(uint32_t)hdr[8+i]<<(8*i);
+        Hash bh; memcpy(bh.data(),hdr.data()+12,32);
+        if(len<UNDO_HEADER_SIZE+4 || off+len>committed){ setErr(e,ErrCode::CORRUPT,"undo record length out of range"); return false; }
+        if(bh==blockHash) return rd(off,len);
+        off+=len;
+    }
+    setErr(e,ErrCode::NOT_FOUND,"no committed undo record for the requested block");
+    return false;
+}
+
 bool CommitStore3A::disconnect(const Hash& blockHash, const Hash& parentTipHash, ChainError* e){
     clearErr(e);
     if(!opened_){ setErr(e,ErrCode::NOT_OPEN,dir_); return false; }
@@ -1298,8 +1341,9 @@ bool CommitStore3A::disconnect(const Hash& blockHash, const Hash& parentTipHash,
             setErr(e,ErrCode::NOT_FOUND,"no committed undo to disconnect"); return false; } }
     const UndoMeta meta=undoRecent_.back();
     if(meta.blockHash!=blockHash){ setErr(e,ErrCode::NOT_FOUND,"only the most recent block can be disconnected"); return false; }
-    std::vector<uint8_t> body; if(!csReadRange(p("undo.dat"),meta.offset,meta.len,&body,e)) return false;
-    size_t off=0; UndoRecord rec; if(!UndoRecord::decode(body.data(),body.size(),&off,&rec,e)) return false;
+    // S1-c: the record is read through the shared read-only path (identical framing + CRC checks);
+    // this function is the only one that APPLIES it.
+    UndoRecord rec; if(!peekUndo(blockHash,&rec,e)) return false;
     uint32_t oldRoot=tree_.rootId(); Hash oldHash=tree_.rootHash(); ChainError er;
     for (size_t i=rec.ops.size(); i-->0; ){ const Op& o=rec.ops[i]; Key k=o.op.keyBytes();
         if(o.beforePresent){ std::vector<uint8_t> v=o.before.encode(); if(!tree_.put(k,v,e)){ ChainError x; tree_.setRoot(oldRoot,oldHash,&x); return false; } }

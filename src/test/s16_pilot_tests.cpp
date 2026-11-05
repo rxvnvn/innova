@@ -24,6 +24,9 @@
 #include "init.h"
 #include "util.h"
 #include "chainstate/observe.h"
+#include "chainstate/store3a/incstore.h"
+#include "chainstate/store3a/incdelta.h"
+#include "chainstate/store3a/btree.h"
 #include "chainstate/observe_hook.h"
 #include "chainstate/txloc/txloc.h"
 
@@ -948,4 +951,99 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
 // dereference the (NULL) legacy leveldb handle.
 //
 // Defect proven on the REAL sync path with block #1 in an isolated scratch
+// S1-c: peekUndo is read-only and reaches arbitrary HISTORICAL records, so the atomic-reorg V-phase
+// can rebuild the fork-state overlay without mutating Store3A.
+BOOST_AUTO_TEST_CASE(store3a_peekundo_read_only_and_historical)
+{
+    namespace bfs = boost::filesystem;
+    const bfs::path dir = bfs::temp_directory_path() / bfs::unique_path("peekundo-%%%%-%%%%");
+    bfs::create_directories(dir);
+    ChainError e;
+    CommitStore3A s;
+    BOOST_REQUIRE_MESSAGE(s.open(dir.string(), &e), "open: " << e.str());
+
+    struct H { static cs::Hash mk(uint32_t v){ uint8_t b[32]={0}; memcpy(b,&v,4); return cs::sha256(b,32); } };
+    auto publishCB = [&](int h) -> bool {
+        Block b; b.hash=H::mk((uint32_t)h); b.height=h;
+        Tx cb; cb.txid=H::mk(0x1000u+(uint32_t)h); cb.coinbase=true; cb.coinstake=false;
+        TxOut o; o.value=50LL*100000000LL; o.script={1,2,3}; cb.vout.push_back(o); b.txs.push_back(cb);
+        e=ChainError(); TreeReader tr(s.tree()); Delta d;
+        if (!buildDeltaI(tr,b,1,&d,&e)) return false;
+        return s.publish(d,b.hash,h,&e);
+    };
+    for (int h=1; h<=3; ++h) BOOST_REQUIRE_MESSAGE(publishCB(h), "publish h=" << h << ": " << e.str());
+
+    const uint64_t gen0 = s.generation();
+    const cs::Hash root0 = s.rootHash();
+    const int32_t tipH0 = s.tipHeight();
+    const cs::Hash tip0 = s.tipHash();
+
+    UndoRecord r;
+    BOOST_REQUIRE_MESSAGE(s.peekUndo(H::mk(3), &r, &e), "peek tip: " << e.str());
+    BOOST_CHECK_EQUAL(r.height, 3);
+    BOOST_CHECK(r.blockHash == H::mk(3));
+    BOOST_CHECK_MESSAGE(!r.ops.empty(), "the tip undo record must carry ops");
+
+    // historical record (NOT the tip) must be reachable
+    BOOST_REQUIRE_MESSAGE(s.peekUndo(H::mk(1), &r, &e), "peek historical h=1: " << e.str());
+    BOOST_CHECK_EQUAL(r.height, 1);
+
+    // unknown block: NOT_FOUND, and still no state change
+    cs::Hash missing = H::mk(9999);
+    BOOST_CHECK(!s.peekUndo(missing, &r, &e));
+    BOOST_CHECK(e.code == ErrCode::NOT_FOUND);
+
+    // read-only invariants
+    BOOST_CHECK_EQUAL(s.generation(), gen0);
+    BOOST_CHECK(s.rootHash() == root0);
+    BOOST_CHECK_EQUAL(s.tipHeight(), tipH0);
+    BOOST_CHECK(s.tipHash() == tip0);
+
+    // disconnect still works after peeking (shared read path), and the tip advances back
+    BOOST_REQUIRE_MESSAGE(s.disconnect(H::mk(3), &e), "disconnect after peek: " << e.str());
+    BOOST_CHECK_EQUAL(s.tipHeight(), 2);
+
+    // restart: historical peek survives, the disconnected block's record is gone
+    s.close();
+    BOOST_REQUIRE_MESSAGE(s.open(dir.string(), &e), "reopen: " << e.str());
+    BOOST_REQUIRE_MESSAGE(s.peekUndo(H::mk(1), &r, &e), "peek after restart: " << e.str());
+    BOOST_CHECK(!s.peekUndo(H::mk(3), &r, &e));
+    s.close();
+    bfs::remove_all(dir);
+
+    // corrupted undo body: the header scan still opens, but peek must refuse (CRC/decode)
+    const bfs::path dir2 = bfs::temp_directory_path() / bfs::unique_path("peekundo-bad-%%%%-%%%%");
+    bfs::create_directories(dir2);
+    CommitStore3A s2;
+    BOOST_REQUIRE_MESSAGE(s2.open(dir2.string(), &e), "open2: " << e.str());
+    auto publishCB2 = [&](int h) -> bool {
+        Block b; b.hash=H::mk((uint32_t)h); b.height=h;
+        Tx cb; cb.txid=H::mk(0x2000u+(uint32_t)h); cb.coinbase=true; cb.coinstake=false;
+        TxOut o; o.value=50LL*100000000LL; o.script={1,2,3}; cb.vout.push_back(o); b.txs.push_back(cb);
+        e=ChainError(); TreeReader tr(s2.tree()); Delta d;
+        if (!buildDeltaI(tr,b,1,&d,&e)) return false;
+        return s2.publish(d,b.hash,h,&e);
+    };
+    BOOST_REQUIRE(publishCB2(1));
+    BOOST_REQUIRE(publishCB2(2));
+    const bfs::path undoPath = dir2 / "undo.dat";
+    s2.close();
+    {
+        FILE* f = fopen(undoPath.string().c_str(), "r+b");
+        BOOST_REQUIRE(f != NULL);
+        BOOST_REQUIRE(fseek(f, 55, SEEK_SET) == 0);   // inside the first record body (header is 48B)
+        int c = fgetc(f);
+        BOOST_REQUIRE(c != EOF);
+        BOOST_REQUIRE(fseek(f, 55, SEEK_SET) == 0);
+        fputc(c ^ 0xFF, f);
+        fclose(f);
+    }
+    BOOST_REQUIRE_MESSAGE(s2.open(dir2.string(), &e), "open after corruption: " << e.str());
+    UndoRecord bad;
+    BOOST_CHECK_MESSAGE(!s2.peekUndo(H::mk(1), &bad, &e), "a corrupted undo body must not decode");
+    BOOST_CHECK(e.code == ErrCode::CORRUPT);
+    s2.close();
+    bfs::remove_all(dir2);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

@@ -273,6 +273,12 @@ public:
     uint64_t commitNanos() const { return commitNanos_; }
     void resetProfile() { applyNanos_ = 0; commitNanos_ = 0; }
     bool disconnect(const Hash& blockHash, const Hash& parentTipHash, ChainError* e);
+    // S1-c: READ-ONLY undo access. Locates the committed undo record for `blockHash` and decodes it
+    // WITHOUT touching the tree, undoRecent_, tip, generation or MANIFEST. Used by the atomic-reorg
+    // V-phase to rebuild the fork-state UTXO overlay. Arbitrary HISTORICAL blocks are supported (a
+    // header scan over the committed undo region); the most recent records are served from the
+    // bounded cache. The caller must hold the same external serialization as disconnect().
+    bool peekUndo(const Hash& blockHash, UndoRecord* out, ChainError* e) const;
     bool disconnect(const Hash& blockHash, ChainError* e) {
         return disconnect(blockHash, Hash(), e);
     }
