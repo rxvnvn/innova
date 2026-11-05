@@ -1509,57 +1509,13 @@ namespace Checkpoints
         return false;
     }
 
-    // ppcoin: reset synchronized checkpoint to last hardened checkpoint
-    bool ResetSyncCheckpoint()
-    {
-        LOCK(cs_hashSyncCheckpoint);
-        const uint256& hash = mapCheckpoints.rbegin()->second;
-        std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
-        if (mi != mapBlockIndex.end() && !mi->second->IsInMainChain())
-        {
-            // checkpoint block accepted but not yet in main chain
-            printf("ResetSyncCheckpoint: SetBestChain to hardened checkpoint %s\n", hash.ToString().c_str());
-            CBlock block;
-            if (!block.ReadFromDisk(mi->second))
-                return error("ResetSyncCheckpoint: ReadFromDisk failed for hardened checkpoint %s", hash.ToString().c_str());
-            if (!block.SetBestChain(mi->second))
-            {
-                return error("ResetSyncCheckpoint: SetBestChain failed for hardened checkpoint %s", hash.ToString().c_str());
-            };
-        } else
-        if (mi == mapBlockIndex.end())
-        {
-            // checkpoint block not yet accepted
-            hashPendingCheckpoint = hash;
-            checkpointMessagePending.SetNull();
-            printf("ResetSyncCheckpoint: pending for sync-checkpoint %s\n", hashPendingCheckpoint.ToString().c_str());
-        };
-
-        BOOST_REVERSE_FOREACH(const MapCheckpoints::value_type& i, mapCheckpoints)
-        {
-            const uint256& hash = i.second;
-            std::map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(hash);
-            if (it != mapBlockIndex.end() && it->second->IsInMainChain())
-            {
-                if (!WriteSyncCheckpoint(hash))
-                    return error("ResetSyncCheckpoint: failed to write sync checkpoint %s", hash.ToString().c_str());
-                printf("ResetSyncCheckpoint: sync-checkpoint reset to %s\n", hashSyncCheckpoint.ToString().c_str());
-                return true;
-            };
-        };
-
-        return false;
-    }
-
     void AskForPendingSyncCheckpoint(CNode* pfrom)
     {
         LOCK(cs_hashSyncCheckpoint);
         // V2-R2B (FIX B): "we do not have the pending checkpoint record" is
         // decided by the authoritative resolver under authoritative startup.
-        const bool fPendingMissing =
-            g_fAuthoritativeStartup
-                ? !IsAuthoritativeIndexedRecord(hashPendingCheckpoint)
-                : (mapBlockIndex.count(hashPendingCheckpoint) == 0);
+        // The legacy mapBlockIndex test was removed with S0 (single authority).
+        const bool fPendingMissing = !IsAuthoritativeIndexedRecord(hashPendingCheckpoint);
         if (pfrom && hashPendingCheckpoint != 0 && fPendingMissing && (!mapOrphanBlocks.count(hashPendingCheckpoint)))
             pfrom->AskFor(
                 CInv(MSG_BLOCK, hashPendingCheckpoint),

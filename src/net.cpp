@@ -4746,11 +4746,6 @@ PipelineWakeOutcome MaybeProcessPipelineWake(
             {
                 // authoritative by-value identity (no pointer)
             }
-            else if (!g_fAuthoritativeStartup && pindexBest)
-            {
-                hashTip = pindexBest->GetBlockHash();
-                nTipHeight = pindexBest->nHeight;
-            }
             else
             {
                 hashTip = uint256(0);
@@ -9767,12 +9762,6 @@ void ThreadMessageHandler2(void* parg)
                         GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) == BLOCK_INDEX_MANAGER_OK)
                     {
                         nLocalHeight = nTipHeight;
-                    }
-                    else if (!g_fAuthoritativeStartup && pindexBest)
-                    {
-                        hashTip = pindexBest->GetBlockHash();
-                        nTipHeight = pindexBest->nHeight;
-                        nLocalHeight = nBestHeight;
                     }
                     else
                     {

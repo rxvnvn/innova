@@ -9692,12 +9692,7 @@ bool CBlock::AcceptBlock()
         // mapBlockIndex. Resolve + materialize it authoritatively (bounded
         // full-topology CBlockIndex chain, pinned for the operation lifetime)
         // instead of weakening PREV_NOT_FOUND or repopulating historical
-        // mapBlockIndex. Legacy mode (g_fAuthoritativeStartup false) is unchanged.
-        if (!g_fAuthoritativeStartup)
-        {
-            TraceAcceptBlockReject(*this, nBestHeight + 1, ABREJECT_PREV_NOT_FOUND);
-            return DoS(10, error("AcceptBlock() : prev block not found"));
-        }
+        // mapBlockIndex. (S0: the legacy non-authoritative branch was removed.)
         BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
         if (!live || !live->IsOpen())
         {
@@ -9752,8 +9747,6 @@ bool CBlock::AcceptBlock()
     {
         nHeight = pindexPrev->nHeight + 1;
     }
-    if (!g_fAuthoritativeStartup && pindexPrev && pindexPrev->nHeight < 0)
-        return error("AcceptBlock() : pprev has invalid height");
 
     if (pindexPrev && nHeight == 0)
         nHeight = pindexPrev->nHeight + 1;
@@ -10148,18 +10141,8 @@ BlockIndexOperatorInvalidResult IsBlockOperatorInvalidTyped(const CBlockIndex* p
     if (pindex == NULL)
         return BLOCK_INDEX_OPERATOR_VALID;
 
-    if (!g_fAuthoritativeStartup)
-    {
-        // Legacy/raw path: byte-identical semantics to the bool form.
-        if (setInvalidBlockHash.empty())
-            return BLOCK_INDEX_OPERATOR_VALID;
-        for (const CBlockIndex* p = pindex; p != NULL; p = p->pprev)
-            if (setInvalidBlockHash.count(*p->phashBlock))
-                return BLOCK_INDEX_OPERATOR_INVALID;
-        return BLOCK_INDEX_OPERATOR_VALID;
-    }
-
-    // BY_VALUE_AUTHORITATIVE.
+    // BY_VALUE_AUTHORITATIVE (single mode since S0; the legacy raw pprev walk
+    // was removed with the non-authoritative branches).
     BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
     if (live == NULL || !live->IsOpen())
         return BLOCK_INDEX_OPERATOR_UNAVAILABLE; // fail closed
