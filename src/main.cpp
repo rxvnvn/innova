@@ -6467,7 +6467,8 @@ bool s16::ChainObserveState::FlushPending()
 // is the same authority the consensus read paths use and is independent of
 // residency. Legacy (non-authoritative) operation keeps the pprev walk.
 static bool s16_ResolveReplayBlock(int32_t height, uint256* outHash, CBlock* outBlock,
-                                   std::string* err)
+                                   std::string* err, uint32_t* outFile = NULL,
+                                   uint32_t* outBlockPos = NULL)
 {
     if (outHash == NULL || outBlock == NULL) return false;
     if (g_fAuthoritativeStartup)
@@ -6498,6 +6499,8 @@ static bool s16_ResolveReplayBlock(int32_t height, uint256* outHash, CBlock* out
             return false;
         }
         *outHash = snap.hash;
+        if (outFile) *outFile = (uint32_t)snap.nFile;
+        if (outBlockPos) *outBlockPos = (uint32_t)snap.nBlockPos;
         return true;
     }
     CBlockIndex* bi = pindexBest->GetAncestor(height);
@@ -6508,6 +6511,8 @@ static bool s16_ResolveReplayBlock(int32_t height, uint256* outHash, CBlock* out
         return false;
     }
     *outHash = bi->GetBlockHash();
+    if (outFile) *outFile = (uint32_t)bi->nFile;
+    if (outBlockPos) *outBlockPos = (uint32_t)bi->nBlockPos;
     return true;
 }
 
@@ -6601,6 +6606,21 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
     }
     // B) store BEHIND the chain (a crash inside a batch): replay the already-validated blocks.
     if (sh < chainH) {
+        // C4: the replay below is the only writer that can restore TX-LOC entries for a block
+        // that was committed to BI-V2 but never connected (crash between commit and apply).
+        // The locator is therefore opened HERE, before the replay, rather than later in init:
+        // a restart must repair the index instead of silently leaving it behind.
+        if (!txloc::g_txloc.opened())
+        {
+            txloc::ChainError te; bool created = false;
+            const fs::path txlocDir = GetDataDir() / "chainstate" / "txloc";
+            if (!txloc::g_txloc.openDir(txlocDir.string(), &created, &te))
+            { if (err) *err = std::string("txloc open before replay: ") + te.str(); return false; }
+            printf("TX-LOC: %s location index at %s before store replay (%llu merged records)\n",
+                   created ? "created new" : "reopened", txlocDir.string().c_str(),
+                   (unsigned long long)txloc::g_txloc.count());
+            fflush(stdout);
+        }
         // IFCN#9 S5: an EMPTY store (tip < 0) is replayed from height 1. Genesis is never a UTXO
         // event in this model (its outputs are the initial supply, spent only by later blocks) and
         // it has no block file to read, so starting at height 0 failed with "cannot read block at
@@ -6616,7 +6636,8 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
         for (int32_t h = from; h <= chainH; ++h) {
             uint256 bhash;
             CBlock blk;
-            if (!s16_ResolveReplayBlock(h, &bhash, &blk, err))
+            uint32_t nBlkFile = 0, nBlkPos = 0;
+            if (!s16_ResolveReplayBlock(h, &bhash, &blk, err, &nBlkFile, &nBlkPos))
                 return false;
             // Contiguity gate: a replay is only valid as a strict extension of the
             // store's current tip. A resolver that answered a different branch (or a
@@ -6636,6 +6657,30 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
                 s16_ReplayCoin rc; rc.tx = blk.vtx[ti]; rc.height = h;
                 overlay[blk.vtx[ti].GetHash()] = rc;
             }
+            // C4: TX-LOC feed. A crash between the V2 commit and the Store3A apply leaves the
+            // block committed but never connected, so this replay is the ONLY place that can
+            // restore its TX-LOC entries. Same locator arithmetic as ConnectBlock: the first
+            // tx offset inside the block, then cumulative serialized tx sizes. add() is
+            // keep-first, so replaying again after another crash is idempotent.
+            if (txloc::g_txloc.opened())
+            {
+                txloc::ChainError txe;
+                uint32_t nTxPos = nBlkPos + ::GetSerializeSize(CBlock(), SER_DISK, CLIENT_VERSION)
+                                - (2 * GetSizeOfCompactSize(0)) + GetSizeOfCompactSize(blk.vtx.size());
+                for (size_t ti = 0; ti < blk.vtx.size(); ++ti)
+                {
+                    const CTransaction& tx = blk.vtx[ti];
+                    cs::Hash th; memcpy(th.data(), tx.GetHash().begin(), 32);
+                    txloc::Loc tl; tl.nFile = nBlkFile; tl.nBlockPos = nBlkPos;
+                    tl.nTxPos = nTxPos; tl.nHeight = h;
+                    if (!txloc::g_txloc.add(th.data(), tl, &txe))
+                    {
+                        if (err) *err = strprintf("txloc replay at h=%d: %s", (int)h, txe.str().c_str());
+                        return false;
+                    }
+                    nTxPos += ::GetSerializeSize(tx, SER_DISK, CLIENT_VERSION);
+                }
+            }
             cs::store3a::CommitStore3A::BatchBlock bb;
             bb.d = d; bb.height = h;
             memcpy(bb.blockHash.data(), bhash.begin(), 32);
@@ -6644,11 +6689,19 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
                 cs::ChainError pe;
                 if (!store->publishBatch(batch, &pe)) { if (err) *err = strprintf("replay publish at h=%d: %s", (int)h, pe.str().c_str()); return false; }
                 batch.clear();
+                if (txloc::g_txloc.opened()) {
+                    txloc::ChainError te;
+                    if (!txloc::g_txloc.sync(&te)) { if (err) *err = std::string("txloc replay sync: ") + te.str(); return false; }
+                }
             }
         }
         if (!batch.empty()) {
             cs::ChainError pe;
             if (!store->publishBatch(batch, &pe)) { if (err) *err = std::string("replay publish: ") + pe.str(); return false; }
+        }
+        if (txloc::g_txloc.opened()) {
+            txloc::ChainError te;
+            if (!txloc::g_txloc.sync(&te)) { if (err) *err = std::string("txloc replay sync: ") + te.str(); return false; }
         }
         printf("S2.1 store reconcile: replayed %d block(s) (%d..%d) to reach the chain tip\n",
                (int)(chainH - from + 1), (int)from, (int)chainH);
