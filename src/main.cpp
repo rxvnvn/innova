@@ -5284,6 +5284,23 @@ unsigned int CTransaction::GetP2SHSigOpCount(const MapPrevTx& inputs) const
 // pindexBest. NEVER the legacy txindex, and NEVER a block-time proxy. Fail-closed:
 // an unresolvable authority returns false (the caller must reject, never substitute
 // zero or the spending block's own time -- that would change coin-age semantics).
+// ---------------------------------------------------------------------------
+// ATOMIC-REORG (S1-d): READ-ONLY FORK-STATE BRANCH OVERLAY (the V-phase view).
+// The fork-state overlay class lives in chainstate/reorg_overlay.h (pure cs::
+// layer, unit-testable without main.cpp statics). main.cpp owns the single
+// V-phase instance below and delegates from the existing coin sources: the
+// s16_V2InputView adapter, the M1 existence gate prev-coin provider, the BIP30
+// duplicate-txid gate and s16_V2PrevBlockTime (see the adapter call sites).
+// ---------------------------------------------------------------------------
+#include "chainstate/reorg_overlay.h"
+typedef cs::ReorgBranchView CReorgBranchView;
+
+// Armed ONLY between the V-phase entry and exit of one atomic reorg (cs_main
+// serialises the whole operation; no other reader runs concurrently). NULL
+// everywhere else — every consumer's behaviour is byte-identical to the
+// pre-change code path when this is NULL (adapter contract, C2).
+static CReorgBranchView* g_reorgBranchOverlay = NULL;
+
 static bool s16_V2PrevBlockTime(int32_t coinHeight, int64_t* outTime)
 {
     // S2.0-S5-2640: resolve the coin's creation-block time against the FULL
@@ -5302,6 +5319,20 @@ static bool s16_V2PrevBlockTime(int32_t coinHeight, int64_t* outTime)
     // txindex is involved. Fail-closed is preserved -- a genuine miss across
     // BOTH authoritative sources still returns false.
     {
+        // ATOMIC-REORG (S1-d) ADAPTER: a coin created by an already-validated
+        // BRANCH block carries a height above the fork that the committed
+        // active chain does not contain yet. The V-phase overlay records the
+        // Connect-branch heights' header times and answers for exactly those
+        // heights; everything else falls through to the committed authorities.
+        if (g_reorgBranchOverlay != NULL)
+        {
+            int64_t tBranch = 0;
+            if (g_reorgBranchOverlay->prevBlockTimeFor(coinHeight, &tBranch))
+            {
+                *outTime = tBranch;
+                return true;
+            }
+        }
         BlockIndexSnapshot snap;
         std::string err;
         const AuthoritativeBlockResolutionResult res =
@@ -5344,6 +5375,23 @@ struct s16_V2InputView
     {
         std::map<cs::OutPoint, cs::Coin>::const_iterator it = created.find(k);
         if (it != created.end()) { if (out) *out = it->second; if (local) *local = true; return true; }
+        // ATOMIC-REORG (S1-d) ADAPTER: when the atomic-reorg V-phase has armed
+        // the fork-state overlay, the coin truth is (added -> removed -> spent
+        // -> Store3A). Store3A still holds the OLD tip-state UTXO set during the
+        // entire V-phase, so a plain store read here would validate against the
+        // WRONG (pre-disconnect) state; the overlay rewrites exactly the coins
+        // the disconnected branch created/restored. Intra-block `created`
+        // (checked above) stays the first authority. A Store3A read error under
+        // the overlay is fatal (fail-closed).
+        if (g_reorgBranchOverlay != NULL)
+        {
+            cs::ChainError oe;
+            const int ov = g_reorgBranchOverlay->observed(k, out, &oe);
+            if (ov < 0) return false;   // Store3A authority read error: fail-closed
+            if (ov == 0) return false;  // absent at the fork state: REFUSE
+            if (local) *local = false;
+            return true;
+        }
         bool found = false; cs::ChainError e;
         if (!store->get(k, out, &found, &e)) return false;  // store authority read error: fail-closed
         if (!found) return false;                           // Store3A does not hold the coin: REFUSE
@@ -6763,6 +6811,17 @@ bool s16_StoreAuthoritativeInputGate(const CBlock& blk, int32_t height, std::str
     }
 
     cs::GetPrevCoinFn gp = [&st](const cs::OutPoint& k, cs::Coin* c)->bool {
+        // ATOMIC-REORG (S1-d) ADAPTER: the M1 existence gate must check the
+        // fork-state overlay first during a V-phase (Store3A still holds the
+        // old-tip state). An overlay authority error is surfaced as a failed
+        // lookup, which refuses the block (fail-closed) — the block cannot be
+        // accepted on a misread authority either way.
+        if (g_reorgBranchOverlay != NULL)
+        {
+            cs::ChainError oe;
+            const int ov = g_reorgBranchOverlay->observed(k, c, &oe);
+            return ov == 1;
+        }
         bool found = false; cs::ChainError e;
         if (!st.store->get(k, c, &found, &e)) return false;
         return found;
@@ -7157,7 +7216,20 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck, CConnectSupplyAc
         {
             bool found = false; cs::ChainError be;
             cs::Hash htx; memcpy(htx.data(), hashTx.begin(), 32);
-            if (!s16::g_chainObserve.store->existsUnspentTxid(htx, &found, &be)) {
+            if (g_reorgBranchOverlay != NULL)
+            {
+                // ATOMIC-REORG (S1-d) ADAPTER: during the V-phase the BIP30 gate
+                // must answer against the fork-state UTXO view, not the old-tip
+                // store state (a disconnected branch's txid must not shadow a
+                // re-created branch txid). Fail closed identically on errors.
+                if (!g_reorgBranchOverlay->unspentTxidKnown(htx, &found, &be))
+                {
+                    s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+                    return error("ConnectBlock() : V-phase BIP30 overlay authority read failed for %s (%s) — fail-closed",
+                                 hashTx.ToString().substr(0,10).c_str(), be.str().c_str());
+                }
+            }
+            else if (!s16::g_chainObserve.store->existsUnspentTxid(htx, &found, &be)) {
                 s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
                 return error("ConnectBlock() : Store3A existsUnspentTxid failed for %s (%s) — BIP30 authority unavailable, fail-closed",
                              hashTx.ToString().substr(0,10).c_str(), be.str().c_str());

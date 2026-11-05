@@ -28,6 +28,7 @@
 #include "chainstate/store3a/incdelta.h"
 #include "chainstate/store3a/btree.h"
 #include "chainstate/observe_hook.h"
+#include "chainstate/reorg_overlay.h"
 #include "chainstate/txloc/txloc.h"
 
 #include <boost/test/unit_test.hpp>
@@ -1045,5 +1046,151 @@ BOOST_AUTO_TEST_CASE(store3a_peekundo_read_only_and_historical)
     s2.close();
     bfs::remove_all(dir2);
 }
+
+// ---------------------------------------------------------------------------
+// S1-d (ATOMIC REORG): the fork-state branch overlay component semantics.
+//
+// A real CommitStore3A is built as the OLD-branch tip (fork=1; h2..h3(h4)
+// disconnected), and cs::ReorgBranchView must reproduce the EXACT post-disconnect
+// UTXO truth from peekUndo alone: restored coins present, disconnected-branch
+// creations absent (including a restore-then-remove collision and a
+// created-then-spent-pair), BIP30 existence answered overlay-first, header
+// times of the CONNECT branch answered above the fork only — all WITHOUT
+// mutating the store (generation/root/tip byte-identical afterwards).
+BOOST_AUTO_TEST_CASE(reorg_overlay_branch_view_semantics)
+{
+    namespace bfs = boost::filesystem;
+    const bfs::path dir = bfs::temp_directory_path() / bfs::unique_path("reorgov-%%%%-%%%%");
+    bfs::create_directories(dir);
+    ChainError e;
+    CommitStore3A s;
+    BOOST_REQUIRE_MESSAGE(s.open(dir.string(), &e), "open: " << e.str());
+
+    struct H { static cs::Hash mk(uint32_t v){ uint8_t b[32]={0}; memcpy(b,&v,4); return cs::sha256(b,32); } };
+
+    // Old branch (A): h1 coinbase C1; h2 spends C1 -> Oa + Ob; h3 spends Oa -> Oc;
+    // h4 spends Ob -> Od. Store tip = h4 (Od unspent; C1/Oa/Ob spent; Oc unspent).
+    struct TxRec { cs::Hash txid; std::vector<cs::TxIn> vin; std::vector<cs::TxOut> vout; bool coinbase; };
+    auto mkOut = [](const cs::Hash& txid, uint32_t n) {
+        cs::OutPoint k; memcpy(k.txid.data(), txid.data(), 32); k.n = n; return k;
+    };
+    auto publishTx = [&](int h, const TxRec& cb, const std::vector<TxRec>& txs) -> bool {
+        Block b; b.hash=H::mk((uint32_t)h); b.height=h;
+        Tx t0; t0.txid=H::mk(0x9999u+(uint32_t)h);   // unique coinbase txid per block (BIP30)
+        t0.coinbase=true; t0.coinstake=false; t0.vout=cb.vout;
+        b.txs.push_back(t0);
+        for (size_t i=0;i<txs.size();++i) {
+            Tx t; t.txid=txs[i].txid; t.coinbase=false; t.coinstake=false;
+            t.vin=txs[i].vin; t.vout=txs[i].vout; b.txs.push_back(t);
+        }
+        e=ChainError(); TreeReader tr(s.tree()); Delta d;
+        if (!buildDeltaI(tr,b,1,&d,&e)) return false;
+        return s.publish(d,b.hash,h,&e);
+    };
+    const int64_t COIN = 50LL*100000000LL;
+    const cs::Hash idS1 = H::mk(0x3002u), idS2 = H::mk(0x3003u), idS3 = H::mk(0x3004u);
+    TxRec cb1;  cb1.coinbase=true;  { TxOut o; o.value=COIN; o.script={1,2,3}; cb1.vout.push_back(o); }
+    TxRec s1;   s1.txid=idS1;   { TxIn i; i.prev=mkOut(H::mk(0x999Au),0); s1.vin.push_back(i);
+                                  TxOut oa; oa.value=COIN-100000; oa.script={4}; TxOut ob; ob.value=100000; ob.script={5};
+                                  s1.vout.push_back(oa); s1.vout.push_back(ob); }
+    TxRec s2;   s2.txid=idS2;   { TxIn i; i.prev=mkOut(idS1,0); s2.vin.push_back(i);
+                                  TxOut oc; oc.value=COIN-200000; oc.script={6}; s2.vout.push_back(oc); }
+    TxRec s3;   s3.txid=idS3;   { TxIn i; i.prev=mkOut(idS1,1); s3.vin.push_back(i);
+                                  TxOut od; od.value=100000-50000; od.script={7}; s3.vout.push_back(od); }
+    BOOST_REQUIRE_MESSAGE(publishTx(1,cb1,std::vector<TxRec>()), "publish h1: " << e.str());
+    BOOST_REQUIRE_MESSAGE(publishTx(2,cb1,std::vector<TxRec>(1,s1)), "publish h2: " << e.str());
+    BOOST_REQUIRE_MESSAGE(publishTx(3,cb1,std::vector<TxRec>(1,s2)), "publish h3: " << e.str());
+    BOOST_REQUIRE_MESSAGE(publishTx(4,cb1,std::vector<TxRec>(1,s3)), "publish h4: " << e.str());
+
+    const cs::OutPoint kC1 = mkOut(H::mk(0x999Au),0), kOa = mkOut(idS1,0), kOb = mkOut(idS1,1),
+                        kOc = mkOut(idS2,0), kOd = mkOut(idS3,0);
+    cs::Coin cOut;
+
+    // store truth at the OLD tip: C1/Oa/Ob spent, Oc/Od unspent.
+    bool found = false;
+    BOOST_REQUIRE(s.get(kOc,&cOut,&found,&e) && found);
+    BOOST_REQUIRE(s.get(kOd,&cOut,&found,&e) && found);
+    BOOST_REQUIRE(s.get(kC1,&cOut,&found,&e) && !found);
+
+    const uint64_t gen0 = s.generation();
+    const cs::Hash root0 = s.rootHash();
+    const int32_t tipH0 = s.tipHeight();
+
+    // V-phase fork-state reconstruction: unwind h4,h3,h2 (tip-down order -> fork=1).
+    cs::ReorgBranchView view(&s, 1);
+    UndoRecord rec;
+    BOOST_REQUIRE_MESSAGE(s.peekUndo(H::mk(4),&rec,&e),"peek h4 "<<e.str());
+    {   // h4: Ob restored, Od removed
+        view.applyUndo(rec);
+        BOOST_CHECK_EQUAL(view.observed(kOb,&cOut,&e), 1);
+        BOOST_CHECK_EQUAL(view.observed(kOd,&cOut,&e), 0);
+    }
+    BOOST_REQUIRE_MESSAGE(s.peekUndo(H::mk(3),&rec,&e),"peek h3 "<<e.str());
+    {   // h3: Oa restored (then re-hidden), Oc removed
+        view.applyUndo(rec);
+        BOOST_CHECK_EQUAL(view.observed(kOa,&cOut,&e), 1);
+        BOOST_CHECK_EQUAL(view.observed(kOc,&cOut,&e), 0);
+    }
+    BOOST_REQUIRE_MESSAGE(s.peekUndo(H::mk(2),&rec,&e),"peek h2 "<<e.str());
+    view.applyUndo(rec);
+    // fork-state truth: C1 present; Oa/Ob/Oc/Od absent (Oa/Ob creations erode the
+    // restores below their creating height; Oc/Od created above the fork).
+    BOOST_CHECK_EQUAL(view.observed(kC1,&cOut,&e), 1);
+    BOOST_CHECK_EQUAL(cOut.value, COIN);
+    BOOST_CHECK_EQUAL(view.observed(kOa,&cOut,&e), 0);
+    BOOST_CHECK_EQUAL(view.observed(kOb,&cOut,&e), 0);
+    BOOST_CHECK_EQUAL(view.observed(kOc,&cOut,&e), 0);
+    BOOST_CHECK_EQUAL(view.observed(kOd,&cOut,&e), 0);
+
+    // BIP30 existence agains the fork state: C1 spendable, disconnected-branch
+    // creations (S2jd... each distinct) invisible.
+    bool known = false;
+    cs::Hash th; 
+    memcpy(th.data(), H::mk(0x999Au).begin(), 32);
+    BOOST_REQUIRE(view.unspentTxidKnown(th,&known,&e));
+    BOOST_CHECK(known);
+    memcpy(th.data(), idS2.begin(), 32);
+    BOOST_REQUIRE(view.unspentTxidKnown(th,&known,&e));
+    BOOST_CHECK(!known);   // Oc created above the fork -> hidden
+    memcpy(th.data(), idS3.begin(), 32);
+    BOOST_REQUIRE(view.unspentTxidKnown(th,&known,&e));
+    BOOST_CHECK(!known);
+
+    // header times: fork prefix NOT overlay-authoritative; connect branch only.
+    int64_t tOut = 0;
+    BOOST_CHECK(!view.prevBlockTimeFor(1,&tOut));
+    view.branchTime[2] = 11111; view.branchTime[3] = 22222;
+    BOOST_REQUIRE(view.prevBlockTimeFor(3,&tOut));
+    BOOST_CHECK_EQUAL(tOut, 22222);
+
+    // cross-block spend guard (component contract): a branch block's validated
+    // spend must hide its coin for LATER branch blocks, whether the coin was
+    // restored (added) or resolves from the store untouched by the branch.
+    cs::OutPoint kBr = mkOut(H::mk(0x3099u),0);
+    cs::Coin cBr; cBr.value=123456; cBr.script={8}; cBr.height=2;
+    view.addCreated(kBr, cBr);
+    BOOST_CHECK_EQUAL(view.observed(kBr,&cOut,&e), 1);
+    memcpy(th.data(), H::mk(0x3099u).begin(), 32);
+    BOOST_REQUIRE(view.unspentTxidKnown(th,&known,&e));
+    BOOST_CHECK(known);          // branch creation is a branch-time "unspent txid"
+    view.markSpent(kBr);
+    BOOST_CHECK_EQUAL(view.observed(kBr,&cOut,&e), 0);
+    BOOST_REQUIRE(view.unspentTxidKnown(th,&known,&e));
+    BOOST_CHECK(!known);         // and its txid is no longer unspent
+    // a branch spend of a coin that resolves from the STORE itself (untouched
+    // so far by the branch) must also hide it afterwards.
+    cs::ReorgBranchView view2(&s, 1);
+    cs::OutPoint kStore = kOc;   // valid store coin at the old tip
+    view2.markSpent(kStore);
+    BOOST_CHECK_EQUAL(view2.observed(kStore,&cOut,&e), 0);
+
+    // read-only invariants: the store is untouched by the whole V-phase walk.
+    BOOST_CHECK_EQUAL(s.generation(), gen0);
+    BOOST_CHECK(s.rootHash() == root0);
+    BOOST_CHECK_EQUAL(s.tipHeight(), tipH0);
+    UndoRecord after;
+    BOOST_CHECK_MESSAGE(s.peekUndo(H::mk(2),&after,&e), "peek still works: " << e.str());
+    s.close();
+    bfs::remove_all(dir);}
 
 BOOST_AUTO_TEST_SUITE_END()
