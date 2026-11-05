@@ -583,6 +583,7 @@ bool ReconcileOperatorInvalidSetFromV2(std::string& strError);
 //   "FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"
 void MainFailpointSetForTesting(const std::string& name, bool armed);
 bool MainFailpointHitForTesting(const std::string& name);
+bool MainFailpointArmedForTesting(const std::string& name);
 
 // V2-R3 (ROUND-2 P1): authoritative chain switch on behalf of the
 // synchronized checkpoint (LEGACY PARITY). See main.cpp for the full
@@ -626,6 +627,23 @@ void KeepCoinbaseTimeInSyncForTesting(CBlock* pblock);
 void SetAuthoritativeConnectSupplyForTesting(int32_t height, int64_t supply, int64_t mint,
                                              int64_t fees = 0, int64_t burned = 0);
 void ClearAuthoritativeConnectSupplyForTesting();
+// ATOMIC-REORG (S1-d) test/diagnostic seam: per-operation counters of the V->C->A
+// path (branch sizes, bounded overlay entries + undo ops, RSS at the commit
+// point). Read-only; never called by the daemon.
+struct ReorgAtomicStats
+{
+    bool overlayArmed;          // must be false on every return path (invariant 8)
+    bool trailArmed;            // must be false on every return path (invariant 8)
+    int32_t trailEntries;       // must drain to 0 after each operation
+    int32_t count;              // atomic reorgs completed
+    int32_t lastForkHeight;
+    int32_t lastDisconnect;
+    int32_t lastConnect;
+    uint64_t lastOverlayEntries;
+    uint64_t lastUndoOps;
+    int64_t lastRssKb;
+};
+void GetReorgAtomicStatsForTesting(ReorgAtomicStats* out);
 // V2 MS-FIX3 test seam: the exact released-edge parent-supply carry contract
 // ConnectBlock uses (ConnectBlockResolveParentSupply). Test-only wrapper; never
 // called by the daemon.

@@ -6652,6 +6652,69 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
         printf("S2.1 store reconcile: unwound block %s (h=%d) absent from the chain\n", bhash.GetHex().c_str(), (int)sh);
         sh = store->tipHeight();
     }
+    // A2) ATOMIC-REORG (S1-d): BRANCH-ALIGNMENT UNWIND.
+    // The atomic C publication can leave Store3A on the OLD branch (a crash after
+    // ReorgActiveTo committed the new branch, before/during the A-phase). The old
+    // branch's own height may be equal to or below the committed tip, so the
+    // existing "store ahead" unwind does not fire and a forward replay would be a
+    // BRANCH SPLICE (correctly refused by the contiguity gate below, which would
+    // then leave the node unstartable). Recovery must therefore unwind the store
+    // along its OWN undo log until its tip is a genuine PREFIX of the committed
+    // active chain, and only then replay forward. Deterministic and idempotent;
+    // bounded by the undo horizon (a miss fails closed — never a silent splice).
+    {
+        long long guard = 0;
+        const long long guardMax = (long long)chainH + 1048576;   // hard bound: one step per height + slack
+        while (sh >= 0 && guard++ < guardMax)
+        {
+            uint256 committedAt(0);
+            bool have = false;
+            if (g_fAuthoritativeStartup)
+            {
+                BlockIndexSnapshot csnap; std::string cerr2;
+                if (AuthoritativeGetActiveSnapshotByHeightR((int)sh, &csnap, &cerr2) == AUTHORITATIVE_BLOCK_FOUND &&
+                    csnap.found && csnap.height == (int)sh)
+                {
+                    committedAt = csnap.hash;
+                    have = true;
+                }
+            }
+            else
+            {
+                for (CBlockIndex* p = pindexBest; p != NULL; p = p->pprev)
+                {
+                    if (p->nHeight == sh) { committedAt = p->GetBlockHash(); have = true; break; }
+                    if (p->nHeight < sh) break;
+                }
+            }
+            uint256 stNow; memcpy(stNow.begin(), store->tipHash().data(), 32);
+            if (have && committedAt == stNow)
+                break;   // the store tip IS a prefix of the committed chain
+            uint256 bparent;
+            if (!s16_ResolveReplayParent(stNow, sh, &bparent, err))
+                return false;
+            cs::Hash bh, ph;
+            memcpy(bh.data(), stNow.begin(), 32);
+            memcpy(ph.data(), bparent.begin(), 32);
+            cs::ChainError se;
+            if (!store->disconnect(bh, ph, &se))
+            {
+                if (err) *err = strprintf("branch unwind at h=%d: %s (store tip is not on the committed chain and the undo log cannot reach a common prefix — fail closed)",
+                                          (int)sh, se.str().c_str());
+                return false;
+            }
+            printf("S2.1 store reconcile: branch unwind %s (h=%d) — store tip is not on the committed chain\n",
+                   stNow.GetHex().c_str(), (int)sh);
+            fflush(stdout);
+            sh = store->tipHeight();
+        }
+        if (guard >= guardMax)
+        {
+            if (err) *err = "branch unwind exceeded its bound (fail closed)";
+            return false;
+        }
+    }
+
     // B) store BEHIND the chain (a crash inside a batch): replay the already-validated blocks.
     if (sh < chainH) {
         // C4: the replay below is the only writer that can restore TX-LOC entries for a block
@@ -8052,6 +8115,13 @@ bool MainFailpointHitForTesting(const std::string& name)
     g_mainFailpoints.erase(it);
     return true;
 }
+// ATOMIC-REORG test seam: NON-consuming query so a caller can tell whether a
+// one-shot failpoint is still armed (distinguishes a side-block fallback from a
+// tripped reorg boundary).
+bool MainFailpointArmedForTesting(const std::string& name)
+{
+    return g_mainFailpoints.count(name) != 0;
+}
 
 static bool PublishAuthoritativeLiveTailReorg(int nForkHeight,
                                               const std::vector<CBlockIndex*>& vConnect,
@@ -8265,31 +8335,44 @@ CBlockIndex* MaterializeCBlockIndexByValue(const BlockIndexSnapshot& s, uint256*
 // PublishAuthoritativeLiveTailCutover before ReorgTo. Reorg/connect runs under
 // cs_main (single-threaded), so no separate lock is required.
 
-bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
+// ---------------------------------------------------------------------------
+// ATOMIC-REORG (S1-d): navigation shared by the legacy Reorganize() and the new
+// atomic (V->C->A) reorg path. Byte-identical semantics for both callers: C12
+// by-value fork discovery across the sparse-hot / bounded-residency boundary,
+// the V2-R2 below-base fail-closed contract, and disconnect/connect lists built
+// from REAL map-resident objects (operation-scoped by-value materialization
+// below the retention floor, edge-released on exit exactly as Reorganize did).
+// Navigation failures set *pfNavigationFailure and never mutate any state.
+// ---------------------------------------------------------------------------
+static std::string ReorgErrPrefix(const char* label){ return std::string(label) + "() : "; }
+
+struct CReorgWalk
 {
-    // C12 (operator requirement H): distinguish an infrastructure/navigation failure
-    // (sparse-hot/by-value ancestry not resolvable, or a fork below the representable
-    // window) from a genuine consensus-invalid block. A navigation failure must NEVER
-    // be recorded as invalid trust: callers read *pfNavigationFailure and skip
-    // InvalidChainFound. Both are fail-closed and precede any state mutation.
-    if (pfNavigationFailure) *pfNavigationFailure = false;
-    if (blockacctrace::Enabled()) blockacctrace::SetStage(5);
-    printf("REORGANIZE\n");
+    int nForkHeight;
+    uint256 forkHash;
+    vector<CBlockIndex*> vDisconnect;   // tip -> fork
+    vector<CBlockIndex*> vConnect;      // fork+1 -> newTip (ascending)
+    std::vector<std::unique_ptr<CBlockIndex> > vMaterializedIdx;
+    std::vector<std::unique_ptr<uint256> > vMaterializedHash;
+    // C12 ownership contract (step 6): a RESIDENT index object may be temporarily
+    // linked (pprev) to an operation-scoped by-value parent for Store3A undo/connect.
+    // Before the temporaries are freed, thoose resident children must be edge-released
+    // (pprev/pskip = NULL) exactly as RetireBlockIndexBelowFloor does for aged entries,
+    // so no resident object is left dangling into operation-scoped storage. Identity
+    // survives in hashPrevStable for by-value navigation.
+    std::vector<CBlockIndex*> vWireReleasedResident;
+    struct ReorgEdgeReleaseGuard {
+        std::vector<CBlockIndex*>& rel;
+        explicit ReorgEdgeReleaseGuard(std::vector<CBlockIndex*>& r) : rel(r) {}
+        ~ReorgEdgeReleaseGuard() { for (CBlockIndex* p : rel) { if (p) { p->pprev = NULL; p->pskip = NULL; } } }
+    } reorgEdgeReleaseGuard_;
+    CReorgWalk() : nForkHeight(-1), forkHash(0), reorgEdgeReleaseGuard_(vWireReleasedResident) {}
+};
 
-    // Operator-invalidation gate (defense in depth; SetBestChain precedes every
-    // Reorganize call, but guard here too for direct callers).
-    // PM1-P0-06 A1: authoritative by-value verdict; fail closed if unavailable.
-    {
-        BlockIndexOperatorInvalidResult oir = IsBlockOperatorInvalidTyped(pindexNew);
-        if (oir == BLOCK_INDEX_OPERATOR_UNAVAILABLE)
-            return error("Reorganize() : operator-invalid authority unavailable for %s (fail closed)",
-                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
-        if (oir == BLOCK_INDEX_OPERATOR_INVALID)
-            return error("Reorganize() : block %s (or an ancestor) is invalidated by the operator",
-                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
-    }
-
-
+static bool ReorgResolveBranches(CBlockIndex* pindexBest, CBlockIndex* pindexNew,
+                                 CReorgWalk& w, const char* label,
+                                 bool* pfNavigationFailure)
+{
     // ---- C12: fork discovery ACROSS the sparse-hot / by-value boundary ----
     // Resolve the fork point BY HASH, never by raw pointer: a resident object may
     // legitimately have pprev == NULL (retained-floor detach / operation-scoped
@@ -8297,8 +8380,6 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     // "pfork->pprev is null" for a VALID higher-work cutover. Disconnect/connect
     // lists are built from REAL map-resident objects so the consensus
     // DisconnectBlock/ConnectBlock calls keep stable object identity (no twins).
-    int nForkHeight = -1;
-    uint256 forkHash(0);
     {
         BlockIndexAuthoritativeLive* liveAuth =
             g_fAuthoritativeStartup ? GetAuthoritativeLiveAuthority() : NULL;
@@ -8333,11 +8414,11 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
             if (nHash == uint256(0))
             {
                 if (pfNavigationFailure) *pfNavigationFailure = true;
-                return error("Reorganize() : authoritative fork discovery failed between best %s (h=%d) and candidate %s (h=%d): unresolvable ancestry or a fork below the representable window (fail closed; no consensus change)",
+                return error((ReorgErrPrefix(label)+"authoritative fork discovery failed between best %s (h=%d) and candidate %s (h=%d): unresolvable ancestry or a fork below the representable window (fail closed; no consensus change)").c_str(),
                              pindexBest->GetBlockHash().ToString().substr(0,20).c_str(), pindexBest->nHeight,
                              pindexNew->GetBlockHash().ToString().substr(0,20).c_str(), pindexNew->nHeight);
             }
-            nForkHeight = nH; forkHash = nHash;
+            w.nForkHeight = nH; w.forkHash = nHash;
         }
         else
         {
@@ -8348,13 +8429,13 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
             {
                 while (plonger->nHeight > pfork->nHeight)
                     if (!(plonger = plonger->pprev))
-                        return error("Reorganize() : plonger->pprev is null");
+                        return error((ReorgErrPrefix(label)+"plonger->pprev is null").c_str());
                 if (pfork == plonger)
                     break;
                 if (!(pfork = pfork->pprev))
-                    return error("Reorganize() : pfork->pprev is null");
+                    return error((ReorgErrPrefix(label)+"pfork->pprev is null").c_str());
             }
-            nForkHeight = pfork->nHeight; forkHash = pfork->GetBlockHash();
+            w.nForkHeight = pfork->nHeight; w.forkHash = pfork->GetBlockHash();
         }
     }
 
@@ -8368,10 +8449,10 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     if (g_fAuthoritativeStartup)
     {
         const int32_t nBaseS = AuthoritativeBaseTipHeight();
-        if (nBaseS >= 0 && nForkHeight < nBaseS)
-            return error("Reorganize() : fork point %d is below the immutable base tip %d; "
-                         "below-base reorg requires an explicit rebase/rebuild (V2-R2 fail-closed)",
-                         nForkHeight, nBaseS);
+        if (nBaseS >= 0 && w.nForkHeight < nBaseS)
+            return error((ReorgErrPrefix(label)+"fork point %d is below the immutable base tip %d; "
+                         "below-base reorg requires an explicit rebase/rebuild (V2-R2 fail-closed)").c_str(),
+                         w.nForkHeight, nBaseS);
     }
 
     // List of what to disconnect (C12: REAL map-resident objects, hash/height
@@ -8380,25 +8461,6 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     // floor an ancestor is V2-authoritative but not a mapBlockIndex resident, so it
     // is materialized by value into an operation-scoped object (never a twin of a
     // live entry) and linked so Store3A undo receives the true parent hash).
-    vector<CBlockIndex*> vDisconnect;
-    // Operation-scoped ownership for by-value-materialized CBlockIndex objects used
-    // to traverse ancestors below the live-tail residency floor. Freed on return.
-    std::vector<std::unique_ptr<CBlockIndex> > vMaterializedIdx;
-    std::vector<std::unique_ptr<uint256> > vMaterializedHash;
-    // C12 ownership contract (step 6): a RESIDENT index object may be temporarily
-    // linked (pprev) to an operation-scoped by-value parent for Store3A undo/connect.
-    // Before the temporaries are freed, thoose resident children must be edge-released
-    // (pprev/pskip = NULL) exactly as RetireBlockIndexBelowFloor does for aged entries,
-    // so no resident object is left dangling into operation-scoped storage. Identity
-    // survives in hashPrevStable for by-value navigation. Declared AFTER the scoped
-    // containers so it destructs FIRST (reverse declaration order), while the temporaries
-    // are still alive.
-    std::vector<CBlockIndex*> vWireReleasedResident;
-    struct ReorgEdgeReleaseGuard {
-        std::vector<CBlockIndex*>& rel;
-        explicit ReorgEdgeReleaseGuard(std::vector<CBlockIndex*>& r) : rel(r) {}
-        ~ReorgEdgeReleaseGuard() { for (CBlockIndex* p : rel) { if (p) { p->pprev = NULL; p->pskip = NULL; } } }
-    } reorgEdgeReleaseGuard_(vWireReleasedResident);
     BlockIndexAuthoritativeLive* reorgLive = GetAuthoritativeLiveAuthority();
     const auto resolveWalkParent = [&](CBlockIndex* cur, uint256 &ph, int &phh, CBlockIndex* &pobj) -> bool {
         pobj = NULL;
@@ -8422,21 +8484,21 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
         pobj = made.get();
         cur->pprev = pobj; // link the walked child to its by-value parent
         if (mapBlockIndex.count(cur->GetBlockHash())) // only actual residents must be released
-            vWireReleasedResident.push_back(cur);
-        vMaterializedHash.push_back(std::move(ownHash));
-        vMaterializedIdx.push_back(std::move(made));
+            w.vWireReleasedResident.push_back(cur);
+        w.vMaterializedHash.push_back(std::move(ownHash));
+        w.vMaterializedIdx.push_back(std::move(made));
         return true;
     };
-    for (CBlockIndex* pindex = pindexBest; pindex != NULL && pindex->nHeight > nForkHeight; )
+    for (CBlockIndex* pindex = pindexBest; pindex != NULL && pindex->nHeight > w.nForkHeight; )
     {
-        vDisconnect.push_back(pindex);
-        if (pindex->nHeight - 1 <= nForkHeight)
+        w.vDisconnect.push_back(pindex);
+        if (pindex->nHeight - 1 <= w.nForkHeight)
             break; // reached the fork point; its object is not needed for disconnect
         uint256 ph; int phh; CBlockIndex* pobj = NULL;
         if (!resolveWalkParent(pindex, ph, phh, pobj))
         {
             if (pfNavigationFailure) *pfNavigationFailure = true;
-            return error("Reorganize() : disconnect walk cannot reach the fork point from %s (h=%d): parent unresolvable or not retained (navigation failure; fail closed)",
+            return error((ReorgErrPrefix(label)+"disconnect walk cannot reach the fork point from %s (h=%d): parent unresolvable or not retained (navigation failure; fail closed)").c_str(),
                          pindex->GetBlockHash().ToString().substr(0,20).c_str(), pindex->nHeight);
         }
         pindex = pobj;
@@ -8445,39 +8507,38 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     // List of what to connect (C12: real objects; the candidate is a
     // freshly-accepted map-resident object, its ancestors resolve via pprev /
     // hashPrevStable, materialized by value below the residency floor).
-    vector<CBlockIndex*> vConnect;
-    for (CBlockIndex* pindex = pindexNew; pindex != NULL && pindex->nHeight > nForkHeight; )
+    for (CBlockIndex* pindex = pindexNew; pindex != NULL && pindex->nHeight > w.nForkHeight; )
     {
-        vConnect.push_back(pindex);
-        if (pindex->nHeight - 1 <= nForkHeight)
+        w.vConnect.push_back(pindex);
+        if (pindex->nHeight - 1 <= w.nForkHeight)
             break;
         uint256 ph; int phh; CBlockIndex* pobj = NULL;
         if (!resolveWalkParent(pindex, ph, phh, pobj))
         {
             if (pfNavigationFailure) *pfNavigationFailure = true;
-            return error("Reorganize() : connect walk cannot reach the fork point from %s (h=%d): parent unresolvable or not retained (navigation failure; fail closed)",
+            return error((ReorgErrPrefix(label)+"connect walk cannot reach the fork point from %s (h=%d): parent unresolvable or not retained (navigation failure; fail closed)").c_str(),
                          pindex->GetBlockHash().ToString().substr(0,20).c_str(), pindex->nHeight);
         }
         pindex = pobj;
     }
-    reverse(vConnect.begin(), vConnect.end());
+    reverse(w.vConnect.begin(), w.vConnect.end());
 
-    printf("REORGANIZE: Disconnect %" PRIszu" blocks; %s..%s\n", vDisconnect.size(), forkHash.ToString().substr(0,20).c_str(), pindexBest->GetBlockHash().ToString().substr(0,20).c_str());
-    printf("REORGANIZE: Connect %" PRIszu" blocks; %s..%s\n", vConnect.size(), forkHash.ToString().substr(0,20).c_str(), pindexNew->GetBlockHash().ToString().substr(0,20).c_str());
+    printf("%s: Disconnect %" PRIszu" blocks; %s..%s\n", label, w.vDisconnect.size(), w.forkHash.ToString().substr(0,20).c_str(), pindexBest->GetBlockHash().ToString().substr(0,20).c_str());
+    printf("%s: Connect %" PRIszu" blocks; %s..%s\n", label, w.vConnect.size(), w.forkHash.ToString().substr(0,20).c_str(), pindexNew->GetBlockHash().ToString().substr(0,20).c_str());
 
     if (SyncTraceEnabled())
     {
         std::vector<uint256> vDisconnectHashes;
-        vDisconnectHashes.reserve(vDisconnect.size());
-        for (CBlockIndex* pindex : vDisconnect)
+        vDisconnectHashes.reserve(w.vDisconnect.size());
+        for (CBlockIndex* pindex : w.vDisconnect)
             vDisconnectHashes.push_back(pindex->GetBlockHash());
         std::vector<uint256> vConnectHashes;
-        vConnectHashes.reserve(vConnect.size());
-        for (CBlockIndex* pindex : vConnect)
+        vConnectHashes.reserve(w.vConnect.size());
+        for (CBlockIndex* pindex : w.vConnect)
             vConnectHashes.push_back(pindex->GetBlockHash());
         BlockRequestTraceReorg(
             g_nBlockTraceSourcePeer,
-            forkHash, nForkHeight,
+            w.forkHash, w.nForkHeight,
             pindexBest->GetBlockHash(), pindexBest->nHeight,
             pindexNew->GetBlockHash(), pindexNew->nHeight,
             vDisconnectHashes, vConnectHashes,
@@ -8485,10 +8546,43 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
             CBigNum(pindexNew->nChainTrust).ToString());
     }
 
+    return true;
+}
+
+
+bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
+{
+    // C12 (operator requirement H): distinguish an infrastructure/navigation failure
+    // (sparse-hot/by-value ancestry not resolvable, or a fork below the representable
+    // window) from a genuine consensus-invalid block. A navigation failure must NEVER
+    // be recorded as invalid trust: callers read *pfNavigationFailure and skip
+    // InvalidChainFound. Both are fail-closed and precede any state mutation.
+    if (pfNavigationFailure) *pfNavigationFailure = false;
+    if (blockacctrace::Enabled()) blockacctrace::SetStage(5);
+    printf("REORGANIZE\n");
+
+    // Operator-invalidation gate (defense in depth; SetBestChain precedes every
+    // Reorganize call, but guard here too for direct callers).
+    // PM1-P0-06 A1: authoritative by-value verdict; fail closed if unavailable.
+    {
+        BlockIndexOperatorInvalidResult oir = IsBlockOperatorInvalidTyped(pindexNew);
+        if (oir == BLOCK_INDEX_OPERATOR_UNAVAILABLE)
+            return error("Reorganize() : operator-invalid authority unavailable for %s (fail closed)",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+        if (oir == BLOCK_INDEX_OPERATOR_INVALID)
+            return error("Reorganize() : block %s (or an ancestor) is invalidated by the operator",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+    }
+
+
+    CReorgWalk walk;
+    if (!ReorgResolveBranches(pindexBest, pindexNew, walk, "Reorganize", pfNavigationFailure))
+        return false;   // navigation error already raised; state untouched (fail closed)
+
 
     // Disconnect shorter branch
     list<CTransaction> vResurrect;
-    for (CBlockIndex* pindex : vDisconnect)
+    for (CBlockIndex* pindex : walk.vDisconnect)
     {
         CBlock block;
         if (!block.ReadFromDisk(pindex))
@@ -8524,9 +8618,9 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
             ReorgConnectTrailArm() { g_reorgConnectTrailArmed = true; }
             ~ReorgConnectTrailArm() { g_reorgConnectTrailArmed = false; }
         } reorgConnectTrailArm_;
-        for (unsigned int i = 0; i < vConnect.size(); i++)
+        for (unsigned int i = 0; i < walk.vConnect.size(); i++)
         {
-            CBlockIndex* pindex = vConnect[i];
+            CBlockIndex* pindex = walk.vConnect[i];
             CBlock block;
             if (!block.ReadFromDisk(pindex))
             {
@@ -8555,7 +8649,7 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     // atomically inside ConnectBlock; nothing separate to persist here.
 
     // Clear setStakeSeen so disconnected stakes don't block the new branch
-    for (CBlockIndex* pindex : vDisconnect)
+    for (CBlockIndex* pindex : walk.vDisconnect)
     {
         if (pindex->IsProofOfStake())
             setStakeSeen.erase(make_pair(pindex->prevoutStake, pindex->nStakeTime));
@@ -8567,12 +8661,12 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     // physically removed.  Ordinary linear reorg publication is unaffected.
 
     // Disconnect shorter branch
-    for (CBlockIndex* pindex : vDisconnect)
+    for (CBlockIndex* pindex : walk.vDisconnect)
         if (pindex->pprev)
             pindex->pprev->pnext = NULL;
 
     // Connect longer branch
-    for (CBlockIndex* pindex : vConnect)
+    for (CBlockIndex* pindex : walk.vConnect)
         if (pindex->pprev)
             pindex->pprev->pnext = pindex;
 
@@ -8592,6 +8686,445 @@ bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
     printf("REORGANIZE: done\n");
 
 
+    return true;
+}
+
+
+// ---------------------------------------------------------------------------
+// ATOMIC-REORG (S1-d2): the PRODUCTION reorg path — one cs_main critical
+// section (SetBestChain is called under cs_main by every entry point):
+//
+//   V  Validate the ENTIRE candidate branch (fork+1 .. newTip) with the SAME
+//      consensus engine (ConnectBlock justCheck=true) against a bounded,
+//      READ-ONLY fork-state overlay rebuilt from Store3A undo records via
+//      peekUndo. Zero durable mutations (C2): no store publish, no txloc,
+//      no block-index write, no mempool/wallet effect, no collateral rank
+//      cache. Every next block sees the UTXO changes of the previous ones
+//      through the overlay (cross-block spends/creations).
+//   C  ONE atomic publication of the whole branch: PublishAuthoritativeLiveTailReorg
+//      -> BlockIndexTipAuthority::ReorgActiveTo (single tip.meta commit,
+//      activeFence++, dense-branch validation, per-block supply invariant
+//      gate from the V-phase ConnectBlock accounting, attachment check).
+//      No intermediate prefix is ever committed.
+//   A  Apply the committed branch to Store3A (disconnect list, then connect
+//      list). A failure after C is NEVER reported as success: the store is
+//      driven to the committed tip by the SAME deterministic
+//      ReconcileStore3AToChain used at startup (run/unwind, TX-LOC via C4);
+//      if that cannot complete, the node enters explicit fail-stop
+//      (needsRecovery) and the caller must not treat the block as rejected —
+//      restart reconciles deterministically.
+//
+// Barrier (invariant 6): V/C/A and the legacy-global settlement all execute
+// under the single cs_main critical section held by AddToBlockIndex before
+// SetBestChain; every RPC/P2P/miner/wallet reader of the tip/UTXO state takes
+// cs_main, so the C->A window (V2 tip committed, store still applying) is not
+// observable outside this section. The legacy view (nBestHeight/hashBestChain)
+// is advanced only AFTER A completes, inside the same section.
+//
+// Reachability: this function is called ONLY in authoritative startup mode.
+// The non-authoritative residual in SetBestChain cannot occur in production:
+// init.cpp refuses any non-authoritative start (InitError), so the legacy
+// A-before-C Reorganize() is not a second production reorg path.
+// ---------------------------------------------------------------------------
+static bool g_v2ActivePublishedByReorg = false;   // consumed by the G1 seam
+static bool g_reorgAtomicFailStop = false;        // set on unrecoverable post-C A failure
+// Bounded diagnostics (measured once per atomic reorg; test-visible).
+static int32_t g_reorgAtomicCount = 0;
+static int32_t g_reorgAtomicLastFork = -1;
+static int32_t g_reorgAtomicLastDisc = 0;
+static int32_t g_reorgAtomicLastConn = 0;
+static uint64_t g_reorgAtomicLastOverlayEntries = 0;
+static uint64_t g_reorgAtomicLastUndoOps = 0;
+static int64_t g_reorgAtomicLastRssKb = 0;
+
+static int64_t ReadVmRssKb()
+{
+    FILE* f = fopen("/proc/self/status", "r");
+    if (f == NULL) return -1;
+    char line[256]; int64_t kb = -1;
+    while (fgets(line, sizeof(line), f) != NULL)
+        if (strncmp(line, "VmRSS:", 6) == 0) { kb = strtoll(line + 6, NULL, 10); break; }
+    fclose(f);
+    return kb;
+}
+
+static bool ConsumeV2ActivePublishedByReorg()
+{
+    const bool v = g_v2ActivePublishedByReorg;
+    g_v2ActivePublishedByReorg = false;
+    return v;
+}
+
+void GetReorgAtomicStatsForTesting(ReorgAtomicStats* out)
+{
+    if (out == NULL) return;
+    out->overlayArmed = (g_reorgBranchOverlay != NULL);
+    out->trailArmed = g_reorgConnectTrailArmed;
+    out->trailEntries = (int32_t)g_reorgConnectSupply.size();
+    out->count = g_reorgAtomicCount;
+    out->lastForkHeight = g_reorgAtomicLastFork;
+    out->lastDisconnect = g_reorgAtomicLastDisc;
+    out->lastConnect = g_reorgAtomicLastConn;
+    out->lastOverlayEntries = g_reorgAtomicLastOverlayEntries;
+    out->lastUndoOps = g_reorgAtomicLastUndoOps;
+    out->lastRssKb = g_reorgAtomicLastRssKb;
+}
+
+// RAII: the fork-state overlay pointer must be NULL on EVERY exit path
+// (success, validation failure, exception) — invariant 8.
+struct ReorgOverlayScope
+{
+    explicit ReorgOverlayScope(CReorgBranchView* v)  { g_reorgBranchOverlay = v; }
+    ~ReorgOverlayScope()                             { g_reorgBranchOverlay = NULL; }
+};
+
+// RAII: the ConnectBlock supply trail is armed ONLY for the V-phase loop and
+// disarmed before C (the publication consumes a by-value snapshot).
+struct ReorgVTrailScope
+{
+    ReorgVTrailScope()  { g_reorgConnectTrailArmed = true; }
+    ~ReorgVTrailScope() { g_reorgConnectTrailArmed = false; }
+};
+
+// Function-scope guard (invariant 8): the V-phase ConnectBlock trail is left with
+// entries on a rejected branch by design of the accounting seam; this clears it on
+// EVERY exit path that does not complete the operation, so no temporary state
+// survives a failed/aborted atomic reorg.
+struct ReorgTrailExitGuard
+{
+    bool keep;
+    ReorgTrailExitGuard() : keep(false) {}
+    ~ReorgTrailExitGuard() { if (!keep) g_reorgConnectSupply.clear(); }
+};
+
+static bool ReorganizeAtomic(CBlockIndex* pindexNew, bool* pfNavigationFailure,
+                             bool* pfPostCommitFailure)
+{
+    ReorgTrailExitGuard trailExitGuard_;
+    if (pfNavigationFailure) *pfNavigationFailure = false;
+    if (pfPostCommitFailure) *pfPostCommitFailure = false;
+    if (blockacctrace::Enabled()) blockacctrace::SetStage(5);
+    printf("REORGANIZE-ATOMIC (V->C->A)\n");
+
+    // Operator-invalidation gate (identical contract to Reorganize).
+    {
+        BlockIndexOperatorInvalidResult oir = IsBlockOperatorInvalidTyped(pindexNew);
+        if (oir == BLOCK_INDEX_OPERATOR_UNAVAILABLE)
+            return error("ReorganizeAtomic() : operator-invalid authority unavailable for %s (fail closed)",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+        if (oir == BLOCK_INDEX_OPERATOR_INVALID)
+            return error("ReorganizeAtomic() : block %s (or an ancestor) is invalidated by the operator",
+                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
+    }
+
+    CReorgWalk walk;
+    if (!ReorgResolveBranches(pindexBest, pindexNew, walk, "REORG-ATOMIC", pfNavigationFailure))
+        return false;
+    if (walk.vDisconnect.empty() || walk.vConnect.empty())
+        return error("ReorganizeAtomic() : empty branch (disconnect=%" PRIszu" connect=%" PRIszu") — refusing to perform a no-op reorg (fail closed)",
+                     walk.vDisconnect.size(), walk.vConnect.size());
+
+    // ---- prerequisites: the SINGLE V2 authority + the armed Store3A. Any
+    // missing piece is fail-closed; there is deliberately NO fallback to the
+    // A-before-C order on this path.
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (live == NULL || !live->IsOpen())
+        return error("ReorganizeAtomic() : V2 authoritative live authority unavailable (fail closed)");
+    cs::store3a::CommitStore3A* store = s16::g_chainObserve.store;
+    if (!(s16::g_chainObserve.enabled && s16::g_chainObserve.hardFail && store != NULL && store->opened()))
+        return error("ReorganizeAtomic() : armed Store3A authority unavailable (fail closed)");
+
+    // A pending multi-block store batch is not durable yet and peekUndo reads the
+    // COMMITTED undo region only: flush first (the same S2.1 pre-undo contract
+    // DisconnectBlock uses). Failure is fatal for the V-phase.
+    if (!s16::g_chainObserve.pending.empty() && !s16::g_chainObserve.FlushPending())
+    {
+        s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+        return error("ReorganizeAtomic() : Store3A batch flush before the V-phase FAILED (%s) — fail-closed",
+                     s16::g_chainObserve.lastOpError.c_str());
+    }
+
+    // The disconnected tip must be the SAME state in every authority. A mismatch
+    // is exactly the duplicated-authority condition this protocol exists to
+    // remove; never paper over it.
+    const uint256 baseTipHash = pindexBest->GetBlockHash();
+    const int32_t baseTipHeight = pindexBest->nHeight;
+    const BlockIndexTipAuthority* tipAuth = live->TipAuthority();
+    const BlockIndexTipRead tipRead = tipAuth ? tipAuth->GetTip() : BlockIndexTipRead();
+    // The committed base is the mutable tip when one exists; in the immutable-base
+    // window (no logical tip yet — e.g. a reorg whose fork IS the base tip) it is
+    // the BASE tip identity, the same rule every extension decision uses.
+    const uint256 committedHash = (tipRead.status == BLOCK_INDEX_TIP_OK) ? tipRead.record.hash
+                                   : (tipAuth ? tipAuth->BaseTipHash() : uint256(0));
+    const int32_t committedHeight = (tipRead.status == BLOCK_INDEX_TIP_OK) ? tipRead.height
+                                   : AuthoritativeBaseTipHeight();
+    if (tipAuth == NULL || committedHash != baseTipHash || committedHeight != baseTipHeight)
+        return error("ReorganizeAtomic() : committed V2 tip (%s h=%d) does not match the reorg base (%s h=%d) — refusing the atomic reorg (fail closed; restart reconciles)",
+                     committedHash.ToString().substr(0,20).c_str(), committedHeight,
+                     baseTipHash.ToString().substr(0,20).c_str(), baseTipHeight);
+    {
+        cs::Hash storeTip = store->tipHash();
+        if (memcmp(storeTip.data(), baseTipHash.begin(), 32) != 0 || store->tipHeight() != baseTipHeight)
+        {
+            char storeHex[17] = {0};
+            for (int bi = 0; bi < 8; ++bi) snprintf(storeHex + bi*2, 3, "%02x", (unsigned)storeTip.data()[bi]);
+            return error("ReorganizeAtomic() : Store3A tip (%s h=%d) does not match the reorg base (%s h=%d) — refusing the atomic reorg (fail closed; restart reconciles)",
+                         storeHex, store->tipHeight(),
+                         baseTipHash.ToString().substr(0,20).c_str(), baseTipHeight);
+        }
+    }
+
+    // ---- V-a: rebuild the FORK state from the read-only undo log. peekUndo
+    // never mutates (S1-c); an undo-horizon miss is INFRASTRUCTURE, not a
+    // consensus-invalid candidate.
+    CReorgBranchView overlay(store, walk.nForkHeight);
+    uint64_t overlayUndoOps = 0;
+    for (size_t i = 0; i < walk.vDisconnect.size(); ++i)
+    {
+        CBlockIndex* pindex = walk.vDisconnect[i];
+        cs::Hash bh; memcpy(bh.data(), pindex->GetBlockHash().begin(), 32);
+        cs::store3a::UndoRecord rec; cs::ChainError ue;
+        if (!store->peekUndo(bh, &rec, &ue))
+        {
+            if (pfNavigationFailure) *pfNavigationFailure = true;
+            return error("ReorganizeAtomic() : read-only undo peek FAILED for %s at height %d (%s) — the fork state cannot be reconstructed within the undo horizon (fail closed; candidate NOT marked consensus-invalid)",
+                         pindex->GetBlockHash().ToString().substr(0,20).c_str(), (int)pindex->nHeight, ue.str().c_str());
+        }
+        if (rec.height != pindex->nHeight || memcmp(rec.blockHash.data(), bh.data(), 32) != 0)
+            return error("ReorganizeAtomic() : undo record identity mismatch for %s at height %d (record h=%d) — fail closed",
+                         pindex->GetBlockHash().ToString().substr(0,20).c_str(), (int)pindex->nHeight, (int)rec.height);
+        overlay.applyUndo(rec);
+        overlayUndoOps += rec.ops.size();
+    }
+
+    // ---- V-b: validate the ENTIRE branch against the overlay. The Connect
+    // supply trail is armed so ReorgActiveTo's per-block publication gate sees
+    // exactly the same ConnectBlock accounting (single authoritative
+    // computation; no duplicate MoneySupply math).
+    int64_t forkSupply = 0;
+    {
+        BlockIndexSnapshot fs; std::string ferr;
+        if (live->ResolveBlockSnapshot(walk.forkHash, &fs, &ferr) != BlockIndexHotStatus::OK || !fs.found)
+            return error("ReorganizeAtomic() : fork supply anchor %s at height %d cannot be resolved by value (%s) — fail closed",
+                         walk.forkHash.ToString().substr(0,20).c_str(), walk.nForkHeight, ferr.c_str());
+        forkSupply = fs.nMoneySupply;
+    }
+    g_reorgConnectSupply.clear();
+    {
+        ReorgOverlayScope overlayScope_(&overlay);
+        ReorgVTrailScope vTrailScope_;
+        int64_t accSupply = forkSupply;
+        for (size_t i = 0; i < walk.vConnect.size(); ++i)
+        {
+            CBlockIndex* pindex = walk.vConnect[i];
+            CBlock block;
+            if (!block.ReadFromDisk(pindex))
+            {
+                if (pfNavigationFailure) *pfNavigationFailure = true;   // local block data: infrastructure, not consensus
+                return error("ReorganizeAtomic() : ReadFromDisk for V-phase failed at height %d (fail closed; nothing committed; candidate NOT marked invalid)",
+                             (int)pindex->nHeight);
+            }
+            CConnectSupplyAccounting acc;
+            if (!block.ConnectBlock(pindex, true, &acc))
+                return error("ReorganizeAtomic() : V-phase consensus validation FAILED at height %d — nothing committed, Store3A untouched, candidate rejected",
+                             (int)pindex->nHeight);
+            std::string invErr;
+            if (!CheckBlockSupplyInvariant(acc, accSupply, &invErr))
+                return error("ReorganizeAtomic() : V-phase MONEY SUPPLY INVARIANT FAILED at height %d: %s — nothing committed",
+                             (int)pindex->nHeight, invErr.c_str());
+            if (acc.supply != pindex->nMoneySupply)
+                return error("ReorganizeAtomic() : V-phase index/connected supply mismatch at height %d (record %lld != connected %lld) — nothing committed",
+                             (int)pindex->nHeight, (long long)pindex->nMoneySupply, (long long)acc.supply);
+            accSupply = acc.supply;
+
+            // Cross-block overlay update (validated block only): a later block of
+            // the branch MUST see these spends/creations (invariant 1). Spends
+            // first, then creations, in transaction order — identical to driving
+            // the store block by block.
+            for (size_t t = 0; t < block.vtx.size(); ++t)
+            {
+                const CTransaction& tx = block.vtx[t];
+                if (!tx.IsCoinBase())
+                {
+                    for (size_t vi = 0; vi < tx.vin.size(); ++vi)
+                    {
+                        cs::OutPoint k; memcpy(k.txid.data(), tx.vin[vi].prevout.hash.begin(), 32); k.n = tx.vin[vi].prevout.n;
+                        overlay.markSpent(k);
+                    }
+                }
+                const uint256 txh = tx.GetHash();
+                for (size_t j = 0; j < tx.vout.size(); ++j)
+                {
+                    cs::OutPoint k; memcpy(k.txid.data(), txh.begin(), 32); k.n = (uint32_t)j;
+                    cs::Coin c;
+                    c.value = tx.vout[j].nValue;
+                    c.script.assign(tx.vout[j].scriptPubKey.begin(), tx.vout[j].scriptPubKey.end());
+                    c.height = (int32_t)pindex->nHeight;
+                    c.nTime = tx.nTime;
+                    c.fCoinBase = tx.IsCoinBase();
+                    c.fCoinStake = tx.IsCoinStake();
+                    overlay.addCreated(k, c);
+                }
+            }
+            overlay.branchTime[(int32_t)pindex->nHeight] = (int64_t)pindex->nTime;
+        }
+    }   // trail disarmed, overlay detached — BEFORE any durable step (invariant 8)
+
+    g_reorgAtomicLastOverlayEntries = (uint64_t)overlay.entryCount();
+    g_reorgAtomicLastUndoOps = overlayUndoOps;
+
+    // ---- winner + base-tip immutability, checked IMMEDIATELY before commit,
+    // under the same cs_main serialisation that guards every accept path.
+    if (!(pindexNew->nChainTrust > pindexBest->nChainTrust))
+        return error("ReorganizeAtomic() : candidate cumulative trust is not greater than the active tip at commit time (fail closed; nothing committed)");
+    if (pindexBest->GetBlockHash() != baseTipHash || pindexBest->nHeight != baseTipHeight)
+        return error("ReorganizeAtomic() : active base tip moved during the V-phase (%s h=%d -> %s h=%d) (fail closed; nothing committed)",
+                     baseTipHash.ToString().substr(0,20).c_str(), baseTipHeight,
+                     pindexBest->GetBlockHash().ToString().substr(0,20).c_str(), pindexBest->nHeight);
+    {
+        const BlockIndexTipRead recheck = tipAuth->GetTip();
+        const uint256 recheckHash = (recheck.status == BLOCK_INDEX_TIP_OK) ? recheck.record.hash : tipAuth->BaseTipHash();
+        const int32_t recheckHeight = (recheck.status == BLOCK_INDEX_TIP_OK) ? recheck.height : AuthoritativeBaseTipHeight();
+        cs::Hash storeTip = store->tipHash();
+        if (recheckHash != baseTipHash || recheckHeight != baseTipHeight ||
+            memcmp(storeTip.data(), baseTipHash.begin(), 32) != 0 || store->tipHeight() != baseTipHeight)
+            return error("ReorganizeAtomic() : authority/store base tip changed during the V-phase (fail closed; nothing committed)");
+    }
+
+    // S1-d fault-injection seam (V complete, commit NOT yet performed): models a
+    // crash/abort at the V->C boundary; nothing durable may change.
+    if (MainFailpointHitForTesting("FP_REORG_BEFORE_C"))
+        return error("ReorganizeAtomic() : FP_REORG_BEFORE_C — abort at the V->C boundary (nothing committed; Store3A untouched)");
+
+    // ---- C: ONE atomic publication of the whole branch (single ReorgActiveTo).
+    {
+        std::string perr;
+        if (!PublishAuthoritativeLiveTailReorg(walk.nForkHeight, walk.vConnect, &perr))
+        {
+            // ReorgActiveTo is fail-closed: no partial branch is published. The
+            // connect trail is cleared so no stale accounting can be reused.
+            g_reorgConnectSupply.clear();
+            // Never mark the candidate consensus-invalid for a commit-stage I/O
+            // failure. If the tip nevertheless moved (a partially-durable failure
+            // inside ReorgActiveTo), enter fail-stop: block acceptance stops and a
+            // restart reconciles; the committed-prefix state is never re-published.
+            const BlockIndexTipRead after = tipAuth->GetTip();
+            const uint256 afterHash = (after.status == BLOCK_INDEX_TIP_OK) ? after.record.hash : baseTipHash;
+            if (afterHash != baseTipHash)
+            {
+                g_reorgAtomicFailStop = true;
+                s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+                return error("ReorganizeAtomic() : atomic publication FAILED after moving the tip (%s -> %s): %s — FAIL-STOP (restart reconciles)",
+                             baseTipHash.ToString().substr(0,20).c_str(), afterHash.ToString().substr(0,20).c_str(), perr.c_str());
+            }
+            if (pfNavigationFailure) *pfNavigationFailure = true;   // infrastructure, not consensus
+            return error("ReorganizeAtomic() : atomic publication (ReorgActiveTo) FAILED: %s — nothing applied to Store3A, tip unchanged (fail closed; candidate NOT marked invalid)",
+                         perr.c_str());
+        }
+    }
+    g_reorgConnectSupply.clear();   // consumed by the publication gate
+    trailExitGuard_.keep = true;    // exit guard: nothing to clear beyond this point
+    g_v2ActivePublishedByReorg = true;
+    g_reorgAtomicLastFork = walk.nForkHeight;
+    g_reorgAtomicLastDisc = (int32_t)walk.vDisconnect.size();
+    g_reorgAtomicLastConn = (int32_t)walk.vConnect.size();
+    ++g_reorgAtomicCount;           // the commit HAS happened; count before the seam
+    g_reorgAtomicLastRssKb = ReadVmRssKb();
+    // S1-d crash-matrix seam: a process crash exactly here leaves IDENTICAL durable
+    // state (V2 tip committed, Store3A still on the old branch). The one-shot
+    // failpoint models that boundary deterministically in-process.
+    if (MainFailpointHitForTesting("FP_REORG_AFTER_C_BEFORE_A"))
+    {
+        if (pfPostCommitFailure) *pfPostCommitFailure = true;
+        g_reorgAtomicFailStop = true;   // the committed tip must survive in mapBlockIndex
+        s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+        s16::g_chainObserve.lastOpError = "FP_REORG_AFTER_C_BEFORE_A";
+        return error("ReorganizeAtomic() : FP_REORG_AFTER_C_BEFORE_A — post-commit A-phase boundary (index tip committed, store on the old branch; restart/reconcile must heal)");
+    }
+    printf("REORG-ATOMIC: committed base=%d/%s cand=%d/%s fork=%d/%s disc=%" PRIszu" conn=%" PRIszu" undoOps=%llu overlayEntries=%" PRIszu" rss=%lldKB\n",
+           baseTipHeight, baseTipHash.ToString().substr(0,16).c_str(),
+           pindexNew->nHeight, pindexNew->GetBlockHash().ToString().substr(0,16).c_str(),
+           walk.nForkHeight, walk.forkHash.ToString().substr(0,16).c_str(),
+           walk.vDisconnect.size(), walk.vConnect.size(),
+           (unsigned long long)overlayUndoOps, overlay.entryCount(), (long long)g_reorgAtomicLastRssKb);
+
+    // ---- A: apply the committed branch to Store3A. Any failure here means the
+    // V2 tip is AHEAD of the store: NEVER return a success status with an
+    // inconsistent pair (invariant 7).
+    bool aOk = true;
+    std::string aErr;
+    list<CTransaction> vResurrect;
+    {
+        // Disconnect the old branch (undo-store), collecting resurrectable txs.
+        for (size_t i = 0; i < walk.vDisconnect.size() && aOk; ++i)
+        {
+            CBlockIndex* pindex = walk.vDisconnect[i];
+            CBlock block;
+            if (!block.ReadFromDisk(pindex)) { aOk = false; aErr = "ReadFromDisk for disconnect"; break; }
+            if (!block.DisconnectBlock(pindex)) { aOk = false; aErr = strprintf("DisconnectBlock %s", pindex->GetBlockHash().ToString().substr(0,20).c_str()); break; }
+            BOOST_REVERSE_FOREACH(const CTransaction& tx, block.vtx)
+                if (!(tx.IsCoinBase() || tx.IsCoinStake()) && pindex->nHeight > Checkpoints::GetTotalBlocksEstimate())
+                    vResurrect.push_front(tx);
+            // Clear setStakeSeen as soon as a stake block is disconnected (same
+            // effect as Reorganize's post-loop sweep, applied incrementally).
+            if (pindex->IsProofOfStake())
+                setStakeSeen.erase(make_pair(pindex->prevoutStake, pindex->nStakeTime));
+        }
+        // Connect the committed branch.
+        vector<CTransaction> vDelete;
+        for (size_t i = 0; i < walk.vConnect.size() && aOk; ++i)
+        {
+            CBlockIndex* pindex = walk.vConnect[i];
+            CBlock block;
+            if (!block.ReadFromDisk(pindex)) { aOk = false; aErr = "ReadFromDisk for connect"; break; }
+            if (!IsInitialBlockDownload()) GetCollateralnodeRanks(pindex);
+            if (!block.ConnectBlock(pindex)) { aOk = false; aErr = strprintf("ConnectBlock %s", pindex->GetBlockHash().ToString().substr(0,20).c_str()); break; }
+            for (const CTransaction& tx : block.vtx)
+                vDelete.push_back(tx);
+        }
+        if (aOk)
+        {
+            // pnext wiring + mempool settlement (identical to Reorganize).
+            for (CBlockIndex* pindex : walk.vDisconnect)
+                if (pindex->pprev) pindex->pprev->pnext = NULL;
+            for (CBlockIndex* pindex : walk.vConnect)
+                if (pindex->pprev) pindex->pprev->pnext = pindex;
+            for (CTransaction& tx : vResurrect)
+                tx.AcceptToMemoryPool();
+            for (CTransaction& tx : vDelete) {
+                mempool.remove(tx);
+                mempool.removeConflicts(tx);
+            }
+        }
+    }
+    if (!aOk)
+    {
+        // The branch IS committed (index-first). Drive Store3A to the committed
+        // tip with the deterministic startup recovery (forward replay / unwind +
+        // TX-LOC C4). Success = consistent pair, continue settlement. Failure =
+        // explicit fail-stop: no further block acceptance (hardFail gate), the
+        // caller must NOT mark the committed block invalid, restart reconciles.
+        std::string rerr;
+        const bool reconciled = s16::ReconcileStore3AToChain(store, &rerr);
+        if (!reconciled)
+        {
+            s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+            s16::g_chainObserve.lastOpError = rerr;
+            g_reorgAtomicFailStop = true;
+            return error("ReorganizeAtomic() : A-phase FAILED (%s) AFTER the atomic commit and the deterministic reconcile also FAILED (%s) — FAIL-STOP: block acceptance stops, restart repairs the store (index tip stays committed)",
+                         aErr.c_str(), rerr.c_str());
+        }
+        // Store now equals the committed tip: finish the settlement that the
+        // interrupted A-phase would have produced.
+        for (CBlockIndex* pindex : walk.vConnect)
+            if (pindex->pprev) pindex->pprev->pnext = pindex;
+        for (CTransaction& tx : vResurrect)
+            tx.AcceptToMemoryPool();
+        printf("REORG-ATOMIC: A-phase recovered deterministically by reconcile after '%s'\n", aErr.c_str());
+    }
+
+    CollateralNReorgBlock = true;
+    printf("REORG-ATOMIC: done\n");
     return true;
 }
 
@@ -8678,51 +9211,44 @@ bool CBlock::SetBestChain(CBlockIndex* pindexNew)
     }
     else
     {
-
-        // the first block in the new chain that will cause it to become the new best chain
-        CBlockIndex *pindexIntermediate = pindexNew;
-
-        // list of blocks that need to be connected afterwards
-        std::vector<CBlockIndex*> vpindexSecondary;
-
-        // Reorganize is costly in terms of db load, as it works in a single db transaction.
-        // Try to limit how much needs to be done inside
-        while (pindexIntermediate->pprev && pindexIntermediate->pprev->nChainTrust > pindexBest->nChainTrust)
-        {
-            vpindexSecondary.push_back(pindexIntermediate);
-            pindexIntermediate = pindexIntermediate->pprev;
-        }
-
-        if (!vpindexSecondary.empty())
-            printf("Postponing %" PRIszu" reconnects\n", vpindexSecondary.size());
-        if (g_testS12LifetimeProbe)
-            g_testS12LastPostponed = (int)vpindexSecondary.size();
-
-        // Switch to new best branch
+        // ---- ATOMIC-REORG (S1-d2): the branch replacement is ONE atomic
+        // operation (V -> C -> A) over the WHOLE fork+1..pindexNew branch.
+        // The old deferral split (connect the fork child here, postpone the
+        // trust-dominant suffix) is obsolete: the atomic protocol validates,
+        // publishes and applies the complete branch, so no intermediate
+        // committed prefix can exist at any point.
+        //
+        // Production (authoritative startup) uses ONLY the atomic path. The
+        // non-authoritative residual retains the legacy A-before-C execution,
+        // but it is unreachable in production: init.cpp refuses every
+        // non-authoritative start (InitError), so this is NOT a second
+        // production reorg path.
+        // Atomic prerequisites = the PRODUCTION authority pair. PROOF that the
+        // legacy residual below is unreachable in production: init.cpp refuses
+        // every non-authoritative start (InitError), and in the authoritative
+        // branch it arms Store3A (enabled+hardFail) in the SAME block that
+        // verifies "BI-V2 tip == Store3A tip" and InitErrors otherwise. So a
+        // production authoritative start ALWAYS has live authority + armed
+        // store; the residual exists only for in-process fixtures that
+        // bootstrap a V2 generation without a Store3A (mock-txdb harness).
+        BlockIndexAuthoritativeLive* atomicLive = GetAuthoritativeLiveAuthority();
+        const bool fAtomicReady = g_fAuthoritativeStartup && s16::g_chainObserve.enabled &&
+            s16::g_chainObserve.hardFail && s16::g_chainObserve.store != NULL &&
+            s16::g_chainObserve.store->opened() && atomicLive != NULL && atomicLive->IsOpen();
         bool fReorgNavFailure = false;
-        if (!Reorganize(pindexIntermediate, &fReorgNavFailure))
+        bool fReorgPostCommit = false;
+        const bool reorgOk = fAtomicReady
+            ? ReorganizeAtomic(pindexNew, &fReorgNavFailure, &fReorgPostCommit)
+            : Reorganize(pindexNew, &fReorgNavFailure);
+        if (!reorgOk)
         {
+            if (fReorgPostCommit || g_reorgAtomicFailStop)
+                return error("SetBestChain() : atomic reorg failed AFTER the durable commit — FAIL-STOP (the block is NOT marked invalid; block acceptance stops; restart reconciles the store)");
             if (fReorgNavFailure)
-                return error("SetBestChain() : Reorganize could not navigate the V2 sparse-hot/by-value ancestry; the candidate is NOT marked consensus-invalid");
+                return error("SetBestChain() : reorg could not navigate the V2 sparse-hot/by-value ancestry; the candidate is NOT marked consensus-invalid");
             InvalidChainFound(pindexNew);
-            return error("SetBestChain() : Reorganize failed");
+            return error("SetBestChain() : reorg failed");
         }
-
-        // Connect further blocks
-        BOOST_REVERSE_FOREACH(CBlockIndex *pindex, vpindexSecondary)
-        {
-            CBlock block;
-            if (!block.ReadFromDisk(pindex))
-            {
-                printf("SetBestChain() : ReadFromDisk failed\n");
-                break;
-            }
-            // errors now are not fatal, we still did a reorganisation to a new chain in a valid way
-            if (!block.SetBestChainInner(pindex))
-                break;
-        }
-
-
     }
 
     // Update best block in wallet (so we can detect restored wallets)
@@ -9481,6 +10007,11 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
 
     // New best
     bool fV2ActivePublished = false;   // S1: set when AcceptActive committed BEFORE SetBestChain
+    // ATOMIC-REORG (S1-d2): per-accept state. Reset at ENTRY so a flag left by a
+    // direct SetBestChain caller (invalidate/reconsider/checkpoint switch, which
+    // bypass this G1 seam) can never leak into an unrelated acceptance.
+    g_v2ActivePublishedByReorg = false;
+    g_reorgAtomicFailStop = false;
     if (pindexNew->nChainTrust > nBestChainTrust)
     {
         CSyncLockPhase phase("ProcessMessage(block)", "set_best_chain");
@@ -9569,6 +10100,18 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         }
         if (!SetBestChain(pindexNew))
         {
+            if (g_reorgAtomicFailStop)
+            {
+                // ATOMIC-REORG (S1-d2) fail-stop: the V2 tip for this block was
+                // DURABLY COMMITTED by ReorgActiveTo before the A-phase/reconcile
+                // failed. The block object must stay in mapBlockIndex (it is the
+                // committed tip) and must NOT be recorded as a rejected candidate.
+                // No further block is accepted (ConnectBlock hard-fails on
+                // needsRecovery); restart reconciles the store deterministically.
+                ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
+                return error("AddToBlockIndex() : FAIL-STOP after the atomic reorg commit at height %d — block acceptance stops, restart reconciles Store3A (committed tip preserved)",
+                             (int)pindexNew->nHeight);
+            }
             // M8.1b: the legacy block-index erase is removed — armed-V2 BI-V2 owns the index.
             mapBlockIndex.erase(hash);
             if (pindexNew->IsProofOfStake())
@@ -9630,6 +10173,22 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             {
                 // S1 (ADR-0002): this block was already committed index-first, BEFORE
                 // SetBestChain/Store3A apply. Nothing to publish here.
+            }
+            else if (becameBest && ConsumeV2ActivePublishedByReorg())
+            {
+                // ATOMIC-REORG (S1-d2): ReorganizeAtomic committed the WHOLE branch
+                // atomically (single ReorgActiveTo) inside SetBestChain. Re-publishing
+                // here would drive a second tip transition; instead VERIFY the committed
+                // tip is exactly this block (fail closed on any mismatch).
+                const BlockIndexTipAuthority* tipAuth2 = live->TipAuthority();
+                const BlockIndexTipRead tipRead2 = tipAuth2 ? tipAuth2->GetTip() : BlockIndexTipRead();
+                if (tipAuth2 == NULL || tipRead2.status != BLOCK_INDEX_TIP_OK || tipRead2.record.hash != hash)
+                {
+                    okP = false;
+                    perr = strprintf("atomic reorg publication flag set but committed V2 tip (%s) does not match the accepted block %s",
+                                     tipRead2.status == BLOCK_INDEX_TIP_OK ? tipRead2.record.hash.ToString().substr(0,20).c_str() : "-",
+                                     hash.ToString().substr(0,20).c_str());
+                }
             }
             else if (!becameBest)
             {

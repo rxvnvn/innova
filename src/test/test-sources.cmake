@@ -8,6 +8,7 @@ set(INNOVA_TEST_SOURCES
     "${CMAKE_SOURCE_DIR}/src/test/blockindex_activeheight_resolver_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/blockindex_activeindex_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/store3a_batch_chunk_tests.cpp"
+    "${CMAKE_SOURCE_DIR}/src/test/atomic_reorg_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/blockacctrace_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/p2p_stall_watch_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/blockindex_authoritative_live_tests.cpp"
