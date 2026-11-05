@@ -6963,8 +6963,39 @@ bool VerifyMoneySupplyAnchors(int32_t tipHeight, std::string* detail)
     return VerifyMoneySupplyAnchorsWithResolver(tipHeight, NULL, detail);
 }
 
-bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
+// S1-b: pure supply identity check used by the index-first pre-commit gate.
+//   supply(h) - supply(h-1) == mint(h) - fees(h) - burned(h)
+// No consensus formula is changed here: these are exactly the values ConnectBlock
+// already computes and persists. __int128 keeps the comparison overflow-safe.
+bool CheckBlockSupplyInvariant(const CConnectSupplyAccounting& acc, int64_t nParentSupply, std::string* err)
 {
+    if (err) err->clear();
+    if (acc.supply < 0)
+    {
+        if (err) *err = strprintf("money supply invariant violated: negative supply %lld", (long long)acc.supply);
+        return false;
+    }
+    const __int128 expected = (__int128)nParentSupply + (__int128)acc.mint
+                            - (__int128)acc.fees - (__int128)acc.burned;
+    if (expected != (__int128)acc.supply)
+    {
+        if (err)
+            *err = strprintf("money supply invariant violated: supply=%lld, expected=parent(%lld)+mint(%lld)-fees(%lld)-burned(%lld)=%lld",
+                             (long long)acc.supply, (long long)nParentSupply, (long long)acc.mint,
+                             (long long)acc.fees, (long long)acc.burned, (long long)expected);
+        return false;
+    }
+    if (acc.supply < 0)
+    {
+        if (err) *err = strprintf("money supply invariant violated: negative supply %lld", (long long)acc.supply);
+        return false;
+    }
+    return true;
+}
+
+bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck, CConnectSupplyAccounting* outAccounting)
+{
+    if (outAccounting) *outAccounting = CConnectSupplyAccounting();
     ibdactivepath::ActivePathTimer ibdConnectTimer(
         ibdactivepath::GetCounters().connectblock_us_total,
         ibdactivepath::GetCounters().connectblock_us_max,
@@ -7776,6 +7807,16 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
         msEntry.burned = nAmountBurned;
         msEntry.hash   = pindex->GetBlockHash(); // by-hash binding (V2 MS-FIX3)
         g_reorgConnectSupply[pindex->nHeight] = msEntry;
+    }
+    // S1-b: explicit accounting result (no global state). Same values as above; the
+    // index-first pre-commit gate checks them against the parent supply before the
+    // block may be committed to Block Index V2.
+    if (outAccounting)
+    {
+        outAccounting->supply = pindex->nMoneySupply;
+        outAccounting->mint   = pindex->nMint;
+        outAccounting->fees   = nFees;
+        outAccounting->burned = nAmountBurned;
     }
 
 
@@ -9349,10 +9390,35 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             const uint256 expectPre = (tipPreHash != uint256(0)) ? tipPreHash : (tipPre ? tipPre->BaseTipHash() : uint256(0));
             if (!IsAuthoritativeActiveExtension(parentPre, expectPre))
                 return true;   // reorg/cutover: unchanged path
-            if (!ConnectBlock(pindexNew, true))
+            CConnectSupplyAccounting accPre;
+            if (!ConnectBlock(pindexNew, true, &accPre))
             {
                 s1PreErr = strprintf("pre-commit consensus validation FAILED at height %d — nothing committed, legacy state untouched",
                                      (int)pindexNew->nHeight);
+                return false;
+            }
+            // S1-b: MoneySupply must hold for the block that is about to be committed,
+            // checked from the explicit ConnectBlock result against the parent supply the
+            // same resolver uses — no global reorg trail, no state to leak or clear.
+            int64_t parentSupplyPre = 0;
+            std::string supErrPre;
+            if (!ConnectBlockResolveParentSupply(pindexNew, parentSupplyPre, supErrPre))
+            {
+                s1PreErr = strprintf("pre-commit supply: parent supply unresolved at height %d: %s",
+                                     (int)pindexNew->nHeight, supErrPre.c_str());
+                return false;
+            }
+            if (accPre.supply != pindexNew->nMoneySupply)
+            {
+                s1PreErr = strprintf("pre-commit supply: index record supply %lld != connected supply %lld at height %d",
+                                     (long long)pindexNew->nMoneySupply, (long long)accPre.supply, (int)pindexNew->nHeight);
+                return false;
+            }
+            std::string invErrPre;
+            if (!CheckBlockSupplyInvariant(accPre, parentSupplyPre, &invErrPre))
+            {
+                s1PreErr = strprintf("pre-commit supply gate FAILED at height %d: %s — nothing committed",
+                                     (int)pindexNew->nHeight, invErrPre.c_str());
                 return false;
             }
             const BlockIndexRecord recPre = BlockIndexRecordFromIndex(pindexNew);

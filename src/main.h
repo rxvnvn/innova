@@ -48,6 +48,24 @@ typedef unsigned char MessageStartChars[MESSAGE_START_SIZE];
 class CWallet;
 class CWalletTx;
 class CBlock;
+
+// S1-b: explicit per-block supply accounting returned by ConnectBlock. It carries
+// exactly the values ConnectBlock already computes (no formula change, no consensus
+// rule added): supply = parent supply + mint - fees - burned. Used by the index-first
+// pre-commit gate so the invariant is checked from an explicit result instead of the
+// global reorg trail (which is armed only around Reorganize).
+struct CConnectSupplyAccounting
+{
+    int64_t supply;
+    int64_t mint;
+    int64_t fees;
+    int64_t burned;
+    CConnectSupplyAccounting() : supply(0), mint(0), fees(0), burned(0) {}
+};
+
+// Pure identity check: supply(h) - supply(h-1) == mint(h) - fees(h) - burned(h).
+// Returns false (with reason) on any violation. No side effects.
+bool CheckBlockSupplyInvariant(const CConnectSupplyAccounting& acc, int64_t nParentSupply, std::string* err);
 /** Compute POEM entropy weight for a block hash (rehomed from finality.cpp in M5D). */
 uint256 GetBlockEntropy(const uint256& hashValue);
 
@@ -1490,7 +1508,7 @@ public:
 
 
     bool DisconnectBlock(CBlockIndex* pindex);
-    bool ConnectBlock(CBlockIndex* pindex, bool fJustCheck=false);
+    bool ConnectBlock(CBlockIndex* pindex, bool fJustCheck=false, CConnectSupplyAccounting* outAccounting=NULL);
     bool ReadFromDisk(const CBlockIndex* pindex, bool fReadTransactions=true);
     bool SetBestChain(CBlockIndex* pindexNew);
     bool AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const uint256& hashProof);

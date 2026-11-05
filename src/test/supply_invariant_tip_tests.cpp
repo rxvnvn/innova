@@ -46,6 +46,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <set>
 #include <string>
@@ -757,6 +758,57 @@ BOOST_AUTO_TEST_CASE(si_carry_verified_resident_parent_is_trusted_directly)
     std::string err;
     BOOST_CHECK(ResolveConnectParentSupplyForTesting(&child, supply, err));
     BOOST_CHECK_EQUAL(supply, 770077LL);
+}
+
+// S1-b: explicit extension supply gate (pure identity, no global trail).
+BOOST_AUTO_TEST_CASE(si_s1b_identity_holds_with_nonzero_fees_and_burned)
+{
+    CConnectSupplyAccounting acc;
+    acc.mint = 50; acc.fees = 7; acc.burned = 3;
+    acc.supply = 1000 + 50 - 7 - 3;      // 1040
+    std::string err;
+    BOOST_CHECK_MESSAGE(CheckBlockSupplyInvariant(acc, 1000, &err), "valid identity rejected: " << err);
+    BOOST_CHECK(err.empty());
+}
+
+BOOST_AUTO_TEST_CASE(si_s1b_identity_zero_values_is_legal)
+{
+    // An active block with zero mint/fees/burned keeps the supply FLAT (== parent);
+    // zero mint is never a violation by itself.
+    CConnectSupplyAccounting acc;
+    acc.supply = 12345;
+    std::string err;
+    BOOST_CHECK_MESSAGE(CheckBlockSupplyInvariant(acc, 12345, &err), "flat supply rejected: " << err);
+}
+
+BOOST_AUTO_TEST_CASE(si_s1b_mismatch_is_rejected)
+{
+    CConnectSupplyAccounting acc;
+    acc.mint = 50; acc.fees = 7; acc.burned = 3;
+    acc.supply = 1041;                   // off by one
+    std::string err;
+    BOOST_CHECK_MESSAGE(!CheckBlockSupplyInvariant(acc, 1000, &err), "inconsistent supply accepted");
+    BOOST_CHECK_MESSAGE(err.find("invariant") != std::string::npos, "reason must name the invariant: " << err);
+}
+
+BOOST_AUTO_TEST_CASE(si_s1b_negative_supply_is_rejected)
+{
+    CConnectSupplyAccounting acc;
+    acc.supply = -1;                     // impossible cumulative supply
+    std::string err;
+    BOOST_CHECK_MESSAGE(!CheckBlockSupplyInvariant(acc, 0, &err), "negative supply accepted");
+    BOOST_CHECK(err.find("negative") != std::string::npos);
+}
+
+BOOST_AUTO_TEST_CASE(si_s1b_comparison_is_overflow_safe)
+{
+    // parent + mint exceeds int64: a wrapping accumulator must NOT satisfy the identity.
+    CConnectSupplyAccounting acc;
+    acc.mint = 8; acc.fees = 0; acc.burned = 0;
+    acc.supply = std::numeric_limits<int64_t>::min() + 7;   // exact int64 wrap of max+8
+    std::string err;
+    BOOST_CHECK_MESSAGE(!CheckBlockSupplyInvariant(acc, std::numeric_limits<int64_t>::max(), &err),
+                        "a wrapped supply must be rejected");
 }
 
 BOOST_AUTO_TEST_SUITE_END()
