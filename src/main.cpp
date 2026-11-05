@@ -9314,10 +9314,68 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     }
 
     // New best
+    bool fV2ActivePublished = false;   // S1: set when AcceptActive committed BEFORE SetBestChain
     if (pindexNew->nChainTrust > nBestChainTrust)
     {
         CSyncLockPhase phase("ProcessMessage(block)", "set_best_chain");
         if (blockacctrace::Enabled()) blockacctrace::SetStage(4);
+        // ---- S1 (ADR-0002, variant A): INDEX-FIRST commit -----------------------
+        // Nothing about the active chain may advance before the block has been fully
+        // consensus-validated AND durably committed to Block Index V2:
+        //   1. the V2 authority must be PRESENT (fail-closed, no silent skip);
+        //   2. an extension candidate is validated with ConnectBlock(justCheck=true),
+        //      which runs every consensus rule that ConnectBlock enforces (UTXO
+        //      availability/double-spend/maturity, scripts, PoW/PoS, DGW/trust,
+        //      MoneySupply=mint-fees-burned) and writes NOTHING durable;
+        //   3. only then is the V2 tip committed (AcceptActive), so a block that
+        //      fails validation or commit never reaches SetBestChain / Store3A;
+        //   4. SetBestChain applies Store3A from the committed block, and the G1
+        //      seam below skips its own publish for this already-committed block.
+        // Reorg/cutover candidates keep the existing cutover publication path
+        // (R1-R3) until its staged-prefix safety gates pass.
+        std::string s1PreErr;
+        const bool fS1Pre = [&]() -> bool {
+            if (!g_fAuthoritativeStartup) return true;
+            BlockIndexAuthoritativeLive* livePre = GetAuthoritativeLiveAuthority();
+            if (livePre == NULL || !livePre->IsOpen())
+            {
+                s1PreErr = strprintf("V2 authoritative authority unavailable at height %d — block REFUSED before any state change (fail-closed)",
+                                     (int)pindexNew->nHeight);
+                return false;
+            }
+            const BlockIndexTipAuthority* tipPre = livePre->TipAuthority();
+            const uint256 parentPre = pindexNew->pprev ? pindexNew->pprev->GetBlockHash() : pindexNew->hashPrevStable;
+            const uint256 tipPreHash = tipPre ? tipPre->TipHash() : uint256(0);
+            const uint256 expectPre = (tipPreHash != uint256(0)) ? tipPreHash : (tipPre ? tipPre->BaseTipHash() : uint256(0));
+            if (!IsAuthoritativeActiveExtension(parentPre, expectPre))
+                return true;   // reorg/cutover: unchanged path
+            if (!ConnectBlock(pindexNew, true))
+            {
+                s1PreErr = strprintf("pre-commit consensus validation FAILED at height %d — nothing committed, legacy state untouched",
+                                     (int)pindexNew->nHeight);
+                return false;
+            }
+            const BlockIndexRecord recPre = BlockIndexRecordFromIndex(pindexNew);
+            const BlockIndexDerivedEntry derPre = BlockIndexDerivedEntryFromIndex(pindexNew);
+            std::string perrPre;
+            if (!livePre->AcceptActive(recPre, derPre, pindexNew->nHeight, &perrPre))
+            {
+                s1PreErr = strprintf("V2 commit FAILED at height %d: %s — nothing applied (fail-closed)",
+                                     (int)pindexNew->nHeight, perrPre.c_str());
+                return false;
+            }
+            fV2ActivePublished = true;
+            return true;
+        }();
+        if (!fS1Pre)
+        {
+            mapBlockIndex.erase(hash);
+            if (pindexNew->IsProofOfStake())
+                setStakeSeen.erase(make_pair(pindexNew->prevoutStake, pindexNew->nStakeTime));
+            delete pindexNew;
+            ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
+            return error("AddToBlockIndex() : %s", s1PreErr.c_str());
+        }
         if (!SetBestChain(pindexNew))
         {
             // M8.1b: the legacy block-index erase is removed — armed-V2 BI-V2 owns the index.
@@ -9368,14 +9426,21 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
     if (g_fAuthoritativeStartup)
     {
         BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
-        if (live && live->IsOpen())
+        if (live == NULL || !live->IsOpen())
+            return error("AddToBlockIndex() : V2 authoritative authority unavailable after acceptance at height %d — refusing to report success (fail-closed)",
+                         (int)pindexNew->nHeight);
         {
             BlockIndexRecord rec = BlockIndexRecordFromIndex(pindexNew);
             BlockIndexDerivedEntry der = BlockIndexDerivedEntryFromIndex(pindexNew);
             std::string perr;
             const bool becameBest = (hash != uint256(0) && hash == hashBestChain);
-            bool okP = false;
-            if (!becameBest)
+            bool okP = true;
+            if (becameBest && fV2ActivePublished)
+            {
+                // S1 (ADR-0002): this block was already committed index-first, BEFORE
+                // SetBestChain/Store3A apply. Nothing to publish here.
+            }
+            else if (!becameBest)
             {
                 okP = live->AcceptSide(rec, der, &perr);
             }
