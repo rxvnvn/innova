@@ -38,8 +38,14 @@ struct TestingSetup {
         // re-arm shutdown and thread joining before starting any threads again.
         fShutdown = false;
         ResetTrackedThreadJoinState();
-        pathTestData = boost::filesystem::temp_directory_path() /
-            boost::filesystem::unique_path("innova-test-%%%%-%%%%-%%%%");
+        // S1 crash harness: a FIXED datadir lets a second process restart on the
+        // exact durable state left by a SIGKILLed first process. Inert otherwise.
+        const char* fixedDatadir = getenv("RX_TEST_DATADIR");
+        if (fixedDatadir != NULL && fixedDatadir[0] != '\0')
+            pathTestData = boost::filesystem::path(fixedDatadir);
+        else
+            pathTestData = boost::filesystem::temp_directory_path() /
+                boost::filesystem::unique_path("innova-test-%%%%-%%%%-%%%%");
         boost::filesystem::create_directories(pathTestData);
         mapArgs["-datadir"] = pathTestData.string();
         mapArgs["-regtest"] = "1";

@@ -8905,6 +8905,38 @@ static bool ReorganizeAtomic(CBlockIndex* pindexNew, bool* pfNavigationFailure,
     g_reorgAtomicLastConn = (int32_t)walk.vConnect.size();
     ++g_reorgAtomicCount;           // the commit HAS happened; count before the seam
     g_reorgAtomicLastRssKb = ReadVmRssKb();
+    // S1 acceptance harness (TEST-ONLY, inert without the env var): deterministic
+    // hold at the durable C->A boundary so an EXTERNAL supervisor can SIGKILL this
+    // process with nothing of the A-phase applied. Durable state at this point is
+    // exactly: V2 tip committed to the new branch, Store3A still on the old one.
+    if (const char* holdMs = getenv("RX_REORG_HOLD_AFTER_C_MS"))
+    {
+        const long hold = atol(holdMs);
+        if (hold > 0)
+        {
+            // stderr: the test harness may redirect stdout; the supervisor polls
+            // this file and must see the marker deterministically.
+            fprintf(stderr, "REORG-HOLD-AFTER-C pid=%d hold_ms=%ld fork=%d conn=%" PRIszu"\n",
+                    (int)getpid(), hold, walk.nForkHeight, walk.vConnect.size());
+            fflush(stderr);
+            // Durable evidence of EXACTLY what the C phase committed, written
+            // before the supervisor kills us (test-only file, env-gated).
+            if (const char* markerPath = getenv("RX_REORG_HOLD_MARKER_FILE"))
+            {
+                FILE* mf = fopen(markerPath, "w");
+                if (mf != NULL)
+                {
+                    fprintf(mf, "commit_height=%d\ncommit_hash=%s\nstore_height_before=%d\n",
+                            pindexNew->nHeight, pindexNew->GetBlockHash().ToString().c_str(),
+                            (int)baseTipHeight);
+                    fflush(mf);
+                    fclose(mf);
+                }
+            }
+            fflush(NULL);
+            usleep((useconds_t)hold * 1000);
+        }
+    }
     // S1-d crash-matrix seam: a process crash exactly here leaves IDENTICAL durable
     // state (V2 tip committed, Store3A still on the old branch). The one-shot
     // failpoint models that boundary deterministically in-process.

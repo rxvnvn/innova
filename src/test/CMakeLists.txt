@@ -25,6 +25,7 @@ set(INNOVA_CTEST_SUITES
     invalidate_reconsider_tests
     reorg_314_chain_tests
     atomic_reorg_tests
+    atomic_sigkill_tests
     reorg_314_store_tests
     supply_invariant_tests)
 
