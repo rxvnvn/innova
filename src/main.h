@@ -582,6 +582,13 @@ bool ReconcileOperatorInvalidSetFromV2(std::string& strError);
 //   "FP_BEFORE_V2_AUTHORITY_COMMIT"
 //   "FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"
 void MainFailpointSetForTesting(const std::string& name, bool armed);
+
+// S1 acceptance (TEST-ONLY, regtest-only): temporarily lower the proof-of-stake
+// target limit so a real PoS kernel is findable on a regtest fixture. Refuses to
+// run outside regtest, so mainnet/testnet can never be overridden; consensus
+// formulas, serialization and blk*.dat format are untouched.
+bool SetProofOfStakeLimitForTesting(const CBigNum& limit);
+CBigNum GetProofOfStakeLimitForTesting();
 bool MainFailpointHitForTesting(const std::string& name);
 bool MainFailpointArmedForTesting(const std::string& name);
 

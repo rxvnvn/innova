@@ -8139,6 +8139,16 @@ bool MainFailpointArmedForTesting(const std::string& name)
     return g_mainFailpoints.count(name) != 0;
 }
 
+// S1 acceptance (TEST-ONLY): regtest-only PoS limit override. Refuses outside
+// regtest so mainnet/testnet consensus can never be altered by this hook.
+bool SetProofOfStakeLimitForTesting(const CBigNum& limit)
+{
+    if (!fRegTest) return false;
+    bnProofOfStakeLimit = limit;
+    return true;
+}
+CBigNum GetProofOfStakeLimitForTesting() { return bnProofOfStakeLimit; }
+
 static bool PublishAuthoritativeLiveTailReorg(int nForkHeight,
                                               const std::vector<CBlockIndex*>& vConnect,
                                               std::string* outErr)
