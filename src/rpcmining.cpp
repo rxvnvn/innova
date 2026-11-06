@@ -77,7 +77,18 @@ Value getmininginfo(const Array& params, bool fHelp)
     }
 
     Object obj, diff, weight;
-    obj.push_back(Pair("blocks",        (int)nBestHeight));
+    // S2-a: authoritative tip height + next-height reward BY VALUE (fail-closed).
+    extern bool RpcAuthoritativeTipScalars(int* height, uint256* hash, std::string* error);
+    int nTipHeight = -1; uint256 tipHashUnused; std::string tipErr;
+    {
+        if (!RpcAuthoritativeTipScalars(&nTipHeight, &tipHashUnused, &tipErr))
+        {
+            if (g_fAuthoritativeStartup)
+                throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Active tip unavailable" : tipErr);
+            nTipHeight = nBestHeight;   // non-authoritative harness only
+        }
+    }
+    obj.push_back(Pair("blocks",        nTipHeight));
     obj.push_back(Pair("currentblocksize",(uint64_t)nLastBlockSize));
     obj.push_back(Pair("currentblocktx",(uint64_t)nLastBlockTx));
 
@@ -86,6 +97,9 @@ Value getmininginfo(const Array& params, bool fHelp)
     double dPoW, dPoS;
     if (!ManagerDifficultyPair(&dPoW, &dPoS))
     {
+        // S2-a: by-value first, fail-closed in authoritative mode.
+        if (g_fAuthoritativeStartup)
+            throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
         dPoW = GetDifficulty();
         dPoS = GetDifficulty(GetLastBlockIndex(pindexBest, true));
     }
@@ -100,7 +114,7 @@ Value getmininginfo(const Array& params, bool fHelp)
 
     diff.push_back(Pair("search-interval",      (int)nLastCoinStakeSearchInterval));
     obj.push_back(Pair("difficulty",    diff));
-    obj.push_back(Pair("blockvalue",    (uint64_t)GetProofOfWorkReward(nBestHeight+1, 0)));
+    obj.push_back(Pair("blockvalue",    (uint64_t)GetProofOfWorkReward(nTipHeight + 1, 0)));
 
     nSectionStart = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
     double dPoWMHashPS = GetPoWMHashPS();

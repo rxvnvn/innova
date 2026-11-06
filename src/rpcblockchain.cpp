@@ -110,41 +110,109 @@ static bool BestTipSnapshotByValue(BlockIndexSnapshot* out, std::string* error)
     return GetBlockIndexManager().GetTip(out, error) == BLOCK_INDEX_MANAGER_OK;
 }
 
+// S2-a: authoritative tip scalars for RPC READ paths (height + hash). Resolved by
+// value through the Block Index Manager. In authoritative mode a resolution
+// failure is FAIL-CLOSED (the caller raises an RPC error) — a legacy-global
+// fallback is never taken on that path.
+bool RpcAuthoritativeTipScalars(int* height, uint256* hash, std::string* error)
+{
+    BlockIndexManager& mgr = GetBlockIndexManager();
+    if (mgr.ActiveTipHeight(height, error) != BLOCK_INDEX_MANAGER_OK)
+        return false;
+    return mgr.BestTipHash(hash, error) == BLOCK_INDEX_MANAGER_OK;
+}
+
+// S2-a: active-tip height for RPC range checks (getblockhash/getblockbynumber/
+// dumpbootstrap). Fail-closed in authoritative mode.
+static int RpcTipHeightOrThrow()
+{
+    int h = -1; uint256 hash; std::string e;
+    if (RpcAuthoritativeTipScalars(&h, &hash, &e))
+        return h;
+    if (g_fAuthoritativeStartup)
+        throw JSONRPCError(RPC_MISC_ERROR, e.empty() ? "Active tip unavailable" : e);
+    return nBestHeight;   // non-authoritative in-process harness only
+}
+
 double GetPoWMHashPS()
 {
     const bool fRPCPerfTrace = GetBoolArg("-rpcperftrace", false);
     const int64_t nStartTime = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
-    int nPoWInterval = 72;
-    int nPoWBlocksToCheck = 100000; // Only look at last 100000 blocks max
+    const int nPoWInterval = 72;
+    const int nPoWBlocksToCheck = 100000;
     int64_t nTargetSpacingWorkMin = 30, nTargetSpacingWork = 30;
-
-    CBlockIndex* pindex = pindexBest;
-    CBlockIndex* pindexPrevWork = NULL;
     int nBlocksChecked = 0;
     int nPoWBlocksFound = 0;
 
-    while (pindex && nBlocksChecked < nPoWBlocksToCheck && nPoWBlocksFound < nPoWInterval)
-    {
-        if (pindex->IsProofOfWork())
-        {
-            if (pindexPrevWork)
-            {
-                int64_t nActualSpacingWork = pindexPrevWork->GetBlockTime() - pindex->GetBlockTime();
-                if (nActualSpacingWork > 0)
-                {
-                    nTargetSpacingWork = ((nPoWInterval - 1) * nTargetSpacingWork + nActualSpacingWork + nActualSpacingWork) / (nPoWInterval + 1);
-                    nTargetSpacingWork = max(nTargetSpacingWork, nTargetSpacingWorkMin);
-                }
-            }
-            pindexPrevWork = pindex;
-            nPoWBlocksFound++;
-        }
+    // S2-a: walk the active chain BY VALUE through the authority. A by-value
+    // failure in authoritative mode is fail-closed; the legacy pprev walk is
+    // retained only for the non-authoritative in-process harness.
+    int nTipHeight = -1; uint256 tipHash; std::string tipErr;
+    const bool fByValue = RpcAuthoritativeTipScalars(&nTipHeight, &tipHash, &tipErr);
+    if (!fByValue && g_fAuthoritativeStartup)
+        throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Active tip unavailable" : tipErr);
 
-        pindex = pindex->pprev;
-        nBlocksChecked++;
+    bool havePrevWork = false;
+    int64_t nPrevWorkTime = 0;
+    double dBaseDifficulty = 1.0;
+
+    if (fByValue)
+    {
+        BlockIndexSnapshot powTip;
+        std::string perr;
+        if (GetBlockIndexManager().GetLastBlockIndexByProofType(tipHash, false, &powTip, &perr) == BLOCK_INDEX_MANAGER_OK)
+            dBaseDifficulty = BitsToDouble(powTip.nBits);
+        for (int h = nTipHeight; h >= 0 && nBlocksChecked < nPoWBlocksToCheck && nPoWBlocksFound < nPoWInterval; --h)
+        {
+            BlockIndexSnapshot snap;
+            std::string err;
+            if (GetBlockIndexManager().GetActiveByHeight(h, &snap, &err) != BLOCK_INDEX_MANAGER_OK)
+                break;
+            if (!snap.fProofOfStake)
+            {
+                if (havePrevWork)
+                {
+                    const int64_t nActualSpacingWork = (int64_t)snap.nTime - nPrevWorkTime;   // older minus newer
+                    if (nActualSpacingWork > 0)
+                    {
+                        nTargetSpacingWork = ((nPoWInterval - 1) * nTargetSpacingWork + nActualSpacingWork + nActualSpacingWork) / (nPoWInterval + 1);
+                        nTargetSpacingWork = max(nTargetSpacingWork, nTargetSpacingWorkMin);
+                    }
+                }
+                havePrevWork = true;
+                nPrevWorkTime = (int64_t)snap.nTime;
+                nPoWBlocksFound++;
+            }
+            nBlocksChecked++;
+        }
+    }
+    else
+    {
+        CBlockIndex* pindex = pindexBest;
+        CBlockIndex* pindexPrevWork = NULL;
+        while (pindex && nBlocksChecked < nPoWBlocksToCheck && nPoWBlocksFound < nPoWInterval)
+        {
+            if (pindex->IsProofOfWork())
+            {
+                if (pindexPrevWork)
+                {
+                    int64_t nActualSpacingWork = pindexPrevWork->GetBlockTime() - pindex->GetBlockTime();
+                    if (nActualSpacingWork > 0)
+                    {
+                        nTargetSpacingWork = ((nPoWInterval - 1) * nTargetSpacingWork + nActualSpacingWork + nActualSpacingWork) / (nPoWInterval + 1);
+                        nTargetSpacingWork = max(nTargetSpacingWork, nTargetSpacingWorkMin);
+                    }
+                }
+                pindexPrevWork = pindex;
+                nPoWBlocksFound++;
+            }
+            pindex = pindex->pprev;
+            nBlocksChecked++;
+        }
+        dBaseDifficulty = GetDifficulty();
     }
 
-    double dResult = GetDifficulty() * 4294.967296 / nTargetSpacingWork;
+    double dResult = dBaseDifficulty * 4294.967296 / nTargetSpacingWork;
     if (fRPCPerfTrace)
         RPCPERF_LOG("RPCPERF rpc=GetPoWMHashPS blocks_examined=%d pow_blocks_found=%d duration_us=%lld result=%.17g\n",
                     nBlocksChecked, nPoWBlocksFound,
@@ -156,27 +224,56 @@ double GetPoSKernelPS()
 {
     const bool fRPCPerfTrace = GetBoolArg("-rpcperftrace", false);
     const int64_t nStartTime = fRPCPerfTrace ? RPCPerfTimeMicros() : 0;
-    int nPoSInterval = 72;
+    const int nPoSInterval = 72;
     double dStakeKernelsTriedAvg = 0;
     int nStakesHandled = 0, nStakesTime = 0;
     int nBlocksExamined = 0;
 
-    CBlockIndex* pindex = pindexBest;;
-    CBlockIndex* pindexPrevStake = NULL;
+    // S2-a: by-value walk (authority), fail-closed in authoritative mode.
+    int nTipHeight = -1; uint256 tipHash; std::string tipErr;
+    const bool fByValue = RpcAuthoritativeTipScalars(&nTipHeight, &tipHash, &tipErr);
+    if (!fByValue && g_fAuthoritativeStartup)
+        throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Active tip unavailable" : tipErr);
 
-    while (pindex && nStakesHandled < nPoSInterval)
+    bool havePrevStake = false;
+    int64_t nPrevStakeTime = 0;
+
+    if (fByValue)
     {
-        if (pindex->IsProofOfStake())
+        for (int h = nTipHeight; h >= 0 && nStakesHandled < nPoSInterval; --h)
         {
-            dStakeKernelsTriedAvg += GetDifficulty(pindex) * 4294967296.0;
-            nStakesTime += pindexPrevStake ? (pindexPrevStake->nTime - pindex->nTime) : 0;
-            pindexPrevStake = pindex;
-            nStakesHandled++;
-        };
-
-        pindex = pindex->pprev;
-        nBlocksExamined++;
-    };
+            BlockIndexSnapshot snap;
+            std::string err;
+            if (GetBlockIndexManager().GetActiveByHeight(h, &snap, &err) != BLOCK_INDEX_MANAGER_OK)
+                break;
+            if (snap.fProofOfStake)
+            {
+                dStakeKernelsTriedAvg += BitsToDouble(snap.nBits) * 4294967296.0;
+                nStakesTime += havePrevStake ? (int)(nPrevStakeTime - (int64_t)snap.nTime) : 0;
+                havePrevStake = true;
+                nPrevStakeTime = (int64_t)snap.nTime;
+                nStakesHandled++;
+            }
+            nBlocksExamined++;
+        }
+    }
+    else
+    {
+        CBlockIndex* pindex = pindexBest;
+        CBlockIndex* pindexPrevStake = NULL;
+        while (pindex && nStakesHandled < nPoSInterval)
+        {
+            if (pindex->IsProofOfStake())
+            {
+                dStakeKernelsTriedAvg += GetDifficulty(pindex) * 4294967296.0;
+                nStakesTime += pindexPrevStake ? (pindexPrevStake->nTime - pindex->nTime) : 0;
+                pindexPrevStake = pindex;
+                nStakesHandled++;
+            }
+            pindex = pindex->pprev;
+            nBlocksExamined++;
+        }
+    }
 
     double dResult = nStakesTime ? dStakeKernelsTriedAvg / nStakesTime : 0;
     if (fRPCPerfTrace)
@@ -368,7 +465,7 @@ Value dumpbootstrap(const Array& params, bool fHelp)
 
     string strDest = params[0].get_str();
     int nBlocks = params[1].get_int();
-    if (nBlocks < 0 || nBlocks > nBestHeight)
+    if (nBlocks < 0 || nBlocks > RpcTipHeightOrThrow())
         throw runtime_error("Block number out of range.");
 
     // Sanitize destination path — confine to data directory
@@ -543,6 +640,10 @@ Value getdifficulty(const Array& params, bool fHelp)
     double dPoW, dPoS;
     if (!ManagerDifficultyPair(&dPoW, &dPoS))
     {
+        // S2-a: authoritative RPC reads are by value; a by-value failure is
+        // fail-closed. The pindexBest path is for the non-authoritative harness.
+        if (g_fAuthoritativeStartup)
+            throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
         dPoW = GetDifficulty();
         dPoS = GetDifficulty(GetLastBlockIndex(pindexBest, true));
     }
@@ -592,7 +693,7 @@ Value getblockhash(const Array& params, bool fHelp)
             "Returns hash of block in best-block-chain at <index>.");
 
     int nHeight = params[0].get_int();
-    if (nHeight < 0 || nHeight > nBestHeight)
+    if (nHeight < 0 || nHeight > RpcTipHeightOrThrow())
         throw runtime_error("Block number out of range.");
 
     // Stage F: authoritative-only. LEGACY_RESIDENT is retired (init hard-fails
@@ -829,7 +930,7 @@ Value getblockbynumber(const Array& params, bool fHelp)
             "Returns details of a block with given block-number.");
 
     int nHeight = params[0].get_int();
-    if (nHeight < 0 || nHeight > nBestHeight)
+    if (nHeight < 0 || nHeight > RpcTipHeightOrThrow())
         throw runtime_error("Block number out of range.");
 
     if (g_fAuthoritativeStartup)

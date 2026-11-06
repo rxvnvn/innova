@@ -637,7 +637,17 @@ Value getinfo(const Array& params, bool fHelp)
     const int64_t nImmature = walletAgg.immature;
     obj.push_back(Pair("immature", ValueFromAmount(nImmature)));
 
-    obj.push_back(Pair("blocks",        (int)nBestHeight));
+    // S2-a: authoritative tip height read BY VALUE (fail-closed in authoritative
+    // mode; the legacy global remains only for the non-authoritative harness).
+    {
+        int nTipHeight = -1; std::string tipHeightErr;
+        if (GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipHeightErr) == BLOCK_INDEX_MANAGER_OK)
+            obj.push_back(Pair("blocks", nTipHeight));
+        else if (g_fAuthoritativeStartup)
+            throw JSONRPCError(RPC_MISC_ERROR, tipHeightErr.empty() ? "Block count unavailable" : tipHeightErr);
+        else
+            obj.push_back(Pair("blocks", (int)nBestHeight));
+    }
     obj.push_back(Pair("timeoffset",    (int64_t)GetTimeOffset()));
     // R1 slice-1: best-tip money supply read BY VALUE from the authoritative
     // block-index manager. The historical pindexBest object is NOT dereferenced
@@ -673,6 +683,9 @@ Value getinfo(const Array& params, bool fHelp)
     double dPoWsi, dPoSsi;
     if (!ManagerDifficultyPair(&dPoWsi, &dPoSsi))
     {
+        // S2-a: by-value first, fail-closed in authoritative mode.
+        if (g_fAuthoritativeStartup)
+            throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
         dPoWsi = GetDifficulty();
         dPoSsi = GetDifficulty(GetLastBlockIndex(pindexBest, true));
     }
@@ -736,7 +749,18 @@ Value getinfo(const Array& params, bool fHelp)
     obj.push_back(Pair("errors", GetWarnings("statusbar")));
 
     if (fExtended)
-        obj.push_back(Pair("ibdmetrics", BuildIBDMetricsJson((int)nBestHeight)));
+    {
+        // S2-a: the IBD metrics height is the authoritative tip height, by value.
+        int nMetricsHeight = (int)nBestHeight;
+        {
+            int nByValue = -1; std::string e;
+            if (GetBlockIndexManager().ActiveTipHeight(&nByValue, &e) == BLOCK_INDEX_MANAGER_OK)
+                nMetricsHeight = nByValue;
+            else if (g_fAuthoritativeStartup)
+                throw JSONRPCError(RPC_MISC_ERROR, e.empty() ? "Block count unavailable" : e);
+        }
+        obj.push_back(Pair("ibdmetrics", BuildIBDMetricsJson(nMetricsHeight)));
+    }
 
     if (fRPCPerfTrace)
     {
