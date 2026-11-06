@@ -10,6 +10,7 @@
 #include "blockindex_authoritative_live.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_hot_owner.h"
+#include "blockindex_manager.h"
 
 #include <chrono>
 #include <limits>
@@ -151,6 +152,21 @@ bool ResolveTemplateNextTarget(const CBlockIndex* pindexPrev, bool fProofOfStake
     return true;
 }
 
+// S2-b: mining READ helpers. In authoritative mode every chain fact is resolved
+// BY VALUE from the Block Index Manager; a failure is fail-closed (the caller
+// refuses to mine / reports not-ready) and NEVER falls back to the legacy tip
+// globals. The globals remain only for the non-authoritative in-process harness.
+static bool MinerTipScalars(uint256* hash, int* height, int64_t* time, std::string* err)
+{
+    BlockIndexSnapshot tip;
+    if (GetBlockIndexManager().GetTip(&tip, err) != BLOCK_INDEX_MANAGER_OK)
+        return false;
+    if (hash) *hash = tip.hash;
+    if (height) *height = tip.height;
+    if (time) *time = (int64_t)tip.nTime;
+    return true;
+}
+
 CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
                        CReserveKey* pReserveKey)
 {
@@ -173,24 +189,24 @@ CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
         LOCK(cs_main);
         if (g_fAuthoritativeStartup)
         {
-            // The current consensus head is the authoritative ACTIVE CHAIN
-            // HEAD (hashBestChain), served by value from the live authority;
-            // it never returns NULL.
-            std::map<uint256, CBlockIndex*>::iterator miTip = mapBlockIndex.find(hashBestChain);
-            if (miTip != mapBlockIndex.end() && miTip->second)
+            // S2-b: the consensus head is resolved BY VALUE from the authority.
+            // No mapBlockIndex lookup and no legacy-global fallback: if the
+            // by-value head is unavailable the template build fails closed.
+            std::string tipErr;
+            uint256 tipHash;
+            if (!MinerTipScalars(&tipHash, NULL, NULL, &tipErr))
             {
-                pindexPrev = miTip->second;
+                fprintf(stderr, "CreateNewBlock: ERROR: authoritative head unavailable by value: %s\n",
+                        tipErr.c_str()); fflush(stderr);
+                return NULL;
             }
-            else
+            std::string matError;
+            pindexPrev = winnerChain.Acquire(GetAuthoritativeLiveAuthority(), tipHash, &matError);
+            if (!pindexPrev)
             {
-                std::string matError;
-                pindexPrev = winnerChain.Acquire(GetAuthoritativeLiveAuthority(), hashBestChain, &matError);
-                if (!pindexPrev)
-                {
-                    fprintf(stderr, "CreateNewBlock: ERROR: authoritative head materialization unavailable: %s\n",
-                            matError.c_str()); fflush(stderr);
-                    return NULL;
-                }
+                fprintf(stderr, "CreateNewBlock: ERROR: authoritative head materialization unavailable: %s\n",
+                        matError.c_str()); fflush(stderr);
+                return NULL;
             }
         }
         else
@@ -676,8 +692,17 @@ bool CheckStake(CBlock* pblock, CWallet& wallet)
         pblock->print();
         printf("out %s\n", FormatMoney(pblock->vtx[1].GetValueOut()).c_str());
 
-        // Found a solution
-        if (pblock->hashPrevBlock != hashBestChain)
+        // Found a solution. S2-b: compare against the authoritative tip hash BY
+        // VALUE; an unavailable authority means we cannot prove freshness, so the
+        // stale answer is fail-closed.
+        uint256 tipHashNow = hashBestChain;
+        if (g_fAuthoritativeStartup)
+        {
+            std::string tipErr;
+            if (!MinerTipScalars(&tipHashNow, NULL, NULL, &tipErr))
+                return error("CheckStake() : authoritative tip unavailable (%s)", tipErr.c_str());
+        }
+        if (pblock->hashPrevBlock != tipHashNow)
             return error("CheckStake() : generated block is stale");
 
         // Track how many getdata requests this block gets
@@ -740,12 +765,26 @@ void StakeMiner(CWallet *pwallet)
         if (fTryToSync)
         {
             fTryToSync = false;
+            // S2-b: chain height for the sync gate, BY VALUE in authoritative
+            // mode. Unavailable by value => cannot judge sync state, so pause
+            // instead of trusting a legacy global.
+            int nChainHeight = nBestHeight;
+            if (g_fAuthoritativeStartup)
+            {
+                int nByValue = -1; std::string tipErr;
+                if (!MinerTipScalars(NULL, &nByValue, NULL, &tipErr))
+                {
+                    MilliSleep(5000);
+                    continue;
+                }
+                nChainHeight = nByValue;
+            }
             bool fTooFewNodes;
             {
                 LOCK(cs_vNodes);
                 fTooFewNodes = vNodes.size() < 3;
             }
-            if (fTooFewNodes || nBestHeight < GetNumBlocksOfPeers())
+            if (fTooFewNodes || nChainHeight < GetNumBlocksOfPeers())
             {
                 if (fDebug  && GetBoolArg("-printcoinstake"))
                     printf("StakeMiner() vNodes.size() < 3 || nBestHeight < GetNumBlocksOfPeers()\n");
@@ -757,7 +796,14 @@ void StakeMiner(CWallet *pwallet)
             }
         }
 
-        if (!fRegTest && !fHybridSPV && nBestHeight < GetNumBlocksOfPeers()-1)
+        int nChainHeightOuter = nBestHeight;
+        if (g_fAuthoritativeStartup)
+        {
+            int nByValue = -1; std::string tipErr;
+            if (MinerTipScalars(NULL, &nByValue, NULL, &tipErr))
+                nChainHeightOuter = nByValue;
+        }
+        if (!fRegTest && !fHybridSPV && nChainHeightOuter < GetNumBlocksOfPeers()-1)
         {
             if (fDebug  && GetBoolArg("-printcoinstake"))
                 printf("StakeMiner() nBestHeight < GetNumBlocksOfPeers()\n");
@@ -771,8 +817,21 @@ void StakeMiner(CWallet *pwallet)
         bool fChainStale = false;
         {
             LOCK(cs_main);
-            fChainStale = !fRegTest && !fTestNet && pindexBest &&
-                          pindexBest->GetBlockTime() < GetTime() - 300;
+            if (g_fAuthoritativeStartup)
+            {
+                // S2-b: tip time BY VALUE; a failure means we cannot prove the
+                // chain is fresh, so keep staking paused (fail-closed).
+                int64_t nTipTime = 0; std::string tipErr;
+                if (MinerTipScalars(NULL, NULL, &nTipTime, &tipErr))
+                    fChainStale = !fRegTest && !fTestNet && nTipTime < GetTime() - 300;
+                else
+                    fChainStale = true;
+            }
+            else
+            {
+                fChainStale = !fRegTest && !fTestNet && pindexBest &&
+                              pindexBest->GetBlockTime() < GetTime() - 300;
+            }
         }
         if (fChainStale)
         {
@@ -849,11 +908,22 @@ CPUMiningWorkIdentity CaptureCurrentCPUMiningWorkIdentity()
     CPUMiningWorkIdentity identity;
     LOCK(cs_main);
 
-    identity.hashBestChain = hashBestChain;
-    if (true)
+    // S2-b: the primary parent is the authoritative ACTIVE CHAIN HEAD, resolved
+    // by value. A by-value failure leaves the identity empty (fail-closed: the
+    // caller treats it as "no work") instead of consulting legacy globals.
+    if (g_fAuthoritativeStartup)
     {
-        // The CPU-mining work identity's primary parent is the authoritative
-        // ACTIVE CHAIN HEAD (hashBestChain).
+        uint256 tipHash; int tipHeight = -1; std::string tipErr;
+        if (MinerTipScalars(&tipHash, &tipHeight, NULL, &tipErr))
+        {
+            identity.hashBestChain = tipHash;
+            identity.hashPrimaryParent = tipHash;
+            identity.nHeight = tipHeight + 1;
+        }
+    }
+    else
+    {
+        identity.hashBestChain = hashBestChain;
         CBlockIndex* pindexParent = pindexBest;
         if (mapBlockIndex.count(hashBestChain)) pindexParent = mapBlockIndex[hashBestChain];
         if (pindexParent)
@@ -871,9 +941,17 @@ bool IsCPUMiningCollateralStateReady()
     int nNextHeight = 0;
     {
         LOCK(cs_main);
-        if (true)
+        if (g_fAuthoritativeStartup)
         {
-            // Readiness is computed from the authoritative linear head.
+            // S2-b: readiness from the authoritative head BY VALUE; unavailable
+            // by value means "not ready" (fail-closed).
+            int tipHeight = -1; std::string tipErr;
+            if (!MinerTipScalars(NULL, &tipHeight, NULL, &tipErr))
+                return false;
+            nNextHeight = tipHeight + 1;
+        }
+        else
+        {
             CBlockIndex* pindexParent = pindexBest;
             if (mapBlockIndex.count(hashBestChain)) pindexParent = mapBlockIndex[hashBestChain];
             if (!pindexParent)
