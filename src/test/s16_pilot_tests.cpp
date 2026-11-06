@@ -20,6 +20,7 @@
 // (observeDelta == buildDelta, authority gate, store round-trip with spends);
 // this suite focuses on real ConnectBlock coverage of the create/commit/undo cycle.
 #include "main.h"
+#include "chainstore_context.h"
 #include "miner.h"
 #include "init.h"
 #include "util.h"
@@ -353,6 +354,8 @@ void ReconnectBlock(CommitStore3A& store, const BlockRec& r)
 
 BOOST_AUTO_TEST_CASE(real_connectblock_coinbase_cycle)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     // Isolated store mirror.
     const fs::path root = fs::temp_directory_path() / fs::unique_path("s16pilot-%%%%-%%%%");
     fs::create_directories(root);
@@ -466,6 +469,8 @@ BOOST_AUTO_TEST_CASE(real_connectblock_coinbase_cycle)
 
 BOOST_AUTO_TEST_CASE(real_connectblock_spend_cycle)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     // Isolated store mirror.
     const fs::path root = fs::temp_directory_path() / fs::unique_path("s16spend-%%%%-%%%%");
     fs::create_directories(root);
@@ -612,6 +617,8 @@ BOOST_AUTO_TEST_CASE(real_connectblock_spend_cycle)
 
 BOOST_AUTO_TEST_CASE(real_connectblock_multi_spend_chain)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     const fs::path root = fs::temp_directory_path() / fs::unique_path("s16chain-%%%%-%%%%");
     fs::create_directories(root);
     const std::string dir = root.string();
@@ -694,6 +701,8 @@ BOOST_AUTO_TEST_CASE(real_connectblock_multi_spend_chain)
 
 BOOST_AUTO_TEST_CASE(real_connectblock_intrablock_create_spend)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     const fs::path root = fs::temp_directory_path() / fs::unique_path("s16intra-%%%%-%%%%");
     fs::create_directories(root);
     const std::string dir = root.string();
@@ -770,6 +779,8 @@ BOOST_AUTO_TEST_CASE(real_connectblock_intrablock_create_spend)
 // ---------------------------------------------------------------------------
 BOOST_AUTO_TEST_CASE(v2_mempool_execution)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     const fs::path root = fs::temp_directory_path() / fs::unique_path("s16mp-%%%%-%%%%");
     fs::create_directories(root);
     const std::string dir = root.string();
@@ -956,6 +967,8 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
 // can rebuild the fork-state overlay without mutating Store3A.
 BOOST_AUTO_TEST_CASE(store3a_peekundo_read_only_and_historical)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     namespace bfs = boost::filesystem;
     const bfs::path dir = bfs::temp_directory_path() / bfs::unique_path("peekundo-%%%%-%%%%");
     bfs::create_directories(dir);
@@ -1059,6 +1072,8 @@ BOOST_AUTO_TEST_CASE(store3a_peekundo_read_only_and_historical)
 // mutating the store (generation/root/tip byte-identical afterwards).
 BOOST_AUTO_TEST_CASE(reorg_overlay_branch_view_semantics)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     namespace bfs = boost::filesystem;
     const bfs::path dir = bfs::temp_directory_path() / bfs::unique_path("reorgov-%%%%-%%%%");
     bfs::create_directories(dir);
