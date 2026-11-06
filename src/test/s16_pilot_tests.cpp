@@ -817,12 +817,21 @@ BOOST_AUTO_TEST_CASE(v2_mempool_execution)
 
         // (no legacy txdb handle: armed-V2 mempool reads Store3A/TX-LOC)
         SpendBlockResult spendBlock;   // the real spend-block that consumes coins[1] (for reorg/undo scenarios)
+        // Each built spend must have a UNIQUE txid. nTime has 1-second granularity and
+        // S16MineSpend builds the on-chain spend with the same vin/vout/script, so a
+        // second reaccept tx built in the same second used to be BYTE-IDENTICAL to the
+        // mined one: the TX-LOC duplicate gate then (correctly) rejected it as an
+        // already-seen on-chain txid, which is order/timing dependent, not a spend-rule
+        // failure. The monotonic value salt makes the reaccept a genuinely NEW spend
+        // while leaving every rule (duplicate, maturity, spent-state) intact.
+        static int64_t nSpendSalt = 0;
         auto BuildSpend = [&](const S16Coin& src, int64_t pay = 100000) -> CTransaction {
+            const int64_t salt = ++nSpendSalt;
             CTransaction t; t.nVersion = 1;
             CTxIn in; uint256 cbHash; memcpy(cbHash.begin(), src.txid.data(), 32);
             in.prevout.hash = cbHash; in.prevout.n = src.n; in.scriptSig.clear();   // OP_TRUE
             t.vin.push_back(in);
-            CTxOut out; out.nValue = src.value - pay; out.scriptPubKey = CScript() << OP_TRUE;
+            CTxOut out; out.nValue = src.value - pay - salt; out.scriptPubKey = CScript() << OP_TRUE;
             t.vout.push_back(out);
             t.nTime = (unsigned int)GetTime();
             return t;
