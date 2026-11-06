@@ -26,6 +26,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include "main.h"
+#include "atomicreorg_fixture.h"
 #include "miner.h"
 #include "wallet.h"
 #include "blockindex_authoritative_live.h"
@@ -243,6 +244,9 @@ BOOST_AUTO_TEST_CASE(inactive_side_chain_invalidation)
 // side chain) is activated.  Reconsidering re-activates the longer branch.
 BOOST_AUTO_TEST_CASE(active_chain_rollback_and_best_alternative)
 {
+    // S1-e: the rollback/activation path must run ONLY through ReorganizeAtomic.
+    atomictest::ArmedStoreFixture armedStore;
+    BOOST_REQUIRE_MESSAGE(armedStore.armed, "atomic authority pair: " << armedStore.err);
     // Reuse the fork built by inactive_side_chain_invalidation: best = A4,
     // side chain B1..B3 (lower trust) still present.
     CBlockIndex* pA1 = FindActiveBlockAtHeight(3);
@@ -275,6 +279,9 @@ BOOST_AUTO_TEST_CASE(active_chain_rollback_and_best_alternative)
 
 BOOST_AUTO_TEST_CASE(restart_persistence_and_crash_window_heal)
 {
+    // S1-e: the rollback/activation path must run ONLY through ReorganizeAtomic.
+    atomictest::ArmedStoreFixture armedStore;
+    BOOST_REQUIRE_MESSAGE(armedStore.armed, "atomic authority pair: " << armedStore.err);
     // State: best = A4, side chain B1..B3.  Invalidate A1 -> consistent rollback.
     CBlockIndex* pA1 = FindActiveBlockAtHeight(3);
     BOOST_REQUIRE(pA1 != NULL);
@@ -368,6 +375,9 @@ BOOST_AUTO_TEST_CASE(restart_persistence_and_crash_window_heal)
 // invalidating both competing chains leaves the chain resting at the fork.
 BOOST_AUTO_TEST_CASE(multi_invalidate_and_error_cases)
 {
+    // S1-e: the rollback/activation path must run ONLY through ReorganizeAtomic.
+    atomictest::ArmedStoreFixture armedStore;
+    BOOST_REQUIRE_MESSAGE(armedStore.armed, "atomic authority pair: " << armedStore.err);
     CBlockIndex* pA1 = FindActiveBlockAtHeight(3);
     BOOST_REQUIRE(pA1 != NULL);
     CBlockIndex* pA2 = FindActiveBlockAtHeight(4);

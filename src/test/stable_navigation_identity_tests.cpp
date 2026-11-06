@@ -221,7 +221,7 @@ BOOST_FIXTURE_TEST_CASE(reorg_above_seam_is_hot_authoritative, HotFixture)
     LOCK(cs_main);
     // Cold tip is height 2 (generation 0..2). Live hot tip is height 3.
     BOOST_REQUIRE(seam.VerifySeam(&error));
-    // Reorganize the live chain entirely above the cold tip: replace height 3's
+    // ReorganizeAtomic the live chain entirely above the cold tip: replace height 3's
     // hash (side extension). Cold prefix (0..2) is untouched, so the seam must
     // STILL verify.
     delete created[3]->phashBlock;

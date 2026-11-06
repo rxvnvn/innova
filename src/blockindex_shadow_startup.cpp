@@ -62,7 +62,7 @@ BlockIndexRecord BlockIndexRecordFromIndex(const CBlockIndex* pindex)
 // G1-reorg: build a FULL by-value BlockIndexSnapshot from a validated in-flight
 // CBlockIndex (materialization input only; the CBlockIndex is NOT retained as
 // authority — every field is copied). This is the single seam the authoritative
-// Reorganize uses to construct the mutation-scoped pending snapshot overlay P,
+// ReorganizeAtomic uses to construct the mutation-scoped pending snapshot overlay P,
 // so a post-generation reorg-winning block whose by-value metadata already exists
 // (Before SetBestChain) remains resolvable during staged enumeration/recolor
 // without external live-tail publication and without borrowing resident pointers.
@@ -91,7 +91,7 @@ BlockIndexSnapshot BlockIndexSnapshotFromIndex(const CBlockIndex* pindex)
     s.nStakeTime = pindex->nStakeTime;
     s.hashProof = pindex->hashProof;
     s.fProofOfStake = (pindex->prevoutStake.hash != uint256(0));
-    // The caller (Reorganize authoritative staging) overrides fInMainChain/active
+    // The caller (ReorganizeAtomic authoritative staging) overrides fInMainChain/active
     // per reorg phase; here default reflects the source CBlockIndex's best-chain
     // relation if it can be read cheaply (we do NOT lock cs_main here).
     s.fInMainChain = false;

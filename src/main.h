@@ -53,7 +53,7 @@ class CBlock;
 // exactly the values ConnectBlock already computes (no formula change, no consensus
 // rule added): supply = parent supply + mint - fees - burned. Used by the index-first
 // pre-commit gate so the invariant is checked from an explicit result instead of the
-// global reorg trail (which is armed only around Reorganize).
+// global reorg trail (armed only around the atomic V->C->A run).
 struct CConnectSupplyAccounting
 {
     int64_t supply;
@@ -621,7 +621,7 @@ void KeepCoinbaseTimeInSyncForTesting(CBlock* pblock);
 // V2 MS-FIX test seam: emulate an already-connected reorg supply/mint trail so the
 // cutover's money-supply override can be unit-tested without running a full
 // ConnectBlock reorg. Inert in production (the daemon populates the trail via
-// Reorganize's connect loop). Never called by the daemon.
+// the atomic V->C->A run). Never called by the daemon.
 // V2 MS-FIX3: fees/burned carry the full per-height ConnectBlock accounting for
 // the publication-time supply-invariant gate (defaults keep the old seam shape).
 void SetAuthoritativeConnectSupplyForTesting(int32_t height, int64_t supply, int64_t mint,
@@ -2249,7 +2249,7 @@ extern uint64_t nCandidateTipGeneration;
 bool RebuildCandidateTips();
 
 /** Update candidate tips incrementally after a best-chain change.
- *  Called from SetBestChain / Reorganize. */
+ *  Called from SetBestChain. */
 void UpdateCandidateTips(CBlockIndex* pindexOldTip, CBlockIndex* pindexNewTip);
 
 /** Persist current candidate tip set to txdb. */

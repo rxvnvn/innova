@@ -23,7 +23,7 @@ BlockIndexDerivedEntry BlockIndexDerivedEntryFromIndex(const CBlockIndex* pindex
 
 // G1-reorg: build a FULL by-value BlockIndexSnapshot from a validated in-flight
 // CBlockIndex (materialization input; copies every field, never retains the
-// pointer). Used by the authoritative Reorganize to construct the mutation-scoped
+// pointer). Used by the authoritative ReorganizeAtomic to construct the mutation-scoped
 // pending snapshot overlay P so a post-generation winning block still resolves
 // by value during staged recolor before external live-tail publication.
 BlockIndexSnapshot BlockIndexSnapshotFromIndex(const CBlockIndex* pindex);

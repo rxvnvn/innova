@@ -34,6 +34,7 @@
 #include <fstream>
 #include <sstream>
 #include <sys/stat.h>
+#include "atomicreorg_fixture.h"
 #include <dirent.h>
 #include <unistd.h>
 
@@ -317,6 +318,10 @@ BOOST_AUTO_TEST_CASE(side_branch_delivery_path_probe)
 // The deep reproduction: 314 disconnected blocks, natural reorg by chaintrust.
 BOOST_AUTO_TEST_CASE(deep_reorg_314)
 {
+    // S1-e: this suite now drives the PRODUCTION atomic (V->C->A) reorg path; the
+    // production authority pair is armed for the duration of the case.
+    atomictest::ArmedStoreFixture armedStore;
+    BOOST_REQUIRE_MESSAGE(armedStore.armed, "atomic authority pair: " << armedStore.err);
     BOOST_REQUIRE(pindexBest != NULL);
     // Turn on the PRODUCTION timing instrumentation (runtime flag, no code change).
     ibdactivepath::InitIBDActivePathTrace(true);
@@ -613,6 +618,9 @@ BOOST_AUTO_TEST_CASE(deep_reorg_314)
 // ancestor's cumulative, one full subsidy per prefix block step here.
 BOOST_AUTO_TEST_CASE(deep_reorg_money_supply_carry)
 {
+    // S1-e: money-supply carry through the PRODUCTION atomic path.
+    atomictest::ArmedStoreFixture armedStore;
+    BOOST_REQUIRE_MESSAGE(armedStore.armed, "atomic authority pair: " << armedStore.err);
     BOOST_REQUIRE(pindexBest != NULL);
 
     // Tip supply read the same way the suite reads the authoritative index

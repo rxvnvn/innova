@@ -6,7 +6,7 @@
 // Proves that a linked CBlockIndex chain (pprev/pnext/pskip + scalar metadata)
 // can be materialized from the by-value authoritative V2 authority, so the
 // legacy consensus engine's pointer walks (ComputeNextStakeModifier /
-// GetLastStakeModifier, GetMedianTimePast, SetBestChain, Reorganize) can run on
+// GetLastStakeModifier, GetMedianTimePast, SetBestChain, ReorganizeAtomic) can run on
 // a BOUNDED resident tail fed from by-value storage -- without rebuilding
 // historical mapBlockIndex residency.
 

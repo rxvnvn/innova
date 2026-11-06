@@ -2,7 +2,7 @@
 //  (A) error()/errorN() must reach the durable debug.log unconditionally
 //      (independent of -debug / console mode) — fixes log-loss where ERROR lines
 //      appeared only in the terminal (stderr).
-//  (B) Reorganize's by-value ancestor materialization helper for deep reorgs.
+//  (B) ReorganizeAtomic's by-value ancestor materialization helper for deep reorgs.
 //
 // These run against the shared authoritative-regtest TestingSetup fixture.
 #include <boost/test/unit_test.hpp>

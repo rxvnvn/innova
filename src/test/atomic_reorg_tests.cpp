@@ -257,10 +257,33 @@ struct ArmedStoreFixture
                 cs::ChainError be;
                 if (!store.publish(birth, gh, 0, &be)) { err = "genesis born-commit: " + be.str(); store.close(); return; }
             }
+            // S1-e: reconcile by VALUE (authoritative arm). The legacy
+            // projection arm (mapBlockIndex + GetAncestor) cannot resolve the
+            // active chain across the bounded-residency boundary — after a
+            // >2000-block fixture mining order the h=1 ancestor is retired,
+            // and the projection resolver fails with "no ancestor at h=1".
+            // The by-value resolver is the production path for exactly this
+            // reason (IFCN#9 correctness fix).
+            // Attempt 1: by-value (authoritative) arm — no GetAncestor over
+            // retired mapBlockIndex entries. When the process has not yet
+            // published a committed tip at all (fresh process, tip=genesis),
+            // this arm bails out by design, so retry once with the legacy
+            // projection arm for this in-process fixture only.
             const bool savedAuth = g_fAuthoritativeStartup;
-            g_fAuthoritativeStartup = false;
-            const bool rok = s16::ReconcileStore3AToChain(&store, &err);
+            std::string errByValue;
+            g_fAuthoritativeStartup = true;
+            bool rok = s16::ReconcileStore3AToChain(&store, &errByValue);
             g_fAuthoritativeStartup = savedAuth;
+            if (!rok && errByValue.find("committed tip is not published") != std::string::npos)
+            {
+                g_fAuthoritativeStartup = false;
+                rok = s16::ReconcileStore3AToChain(&store, &err);
+                g_fAuthoritativeStartup = savedAuth;
+            }
+            else if (!rok)
+            {
+                err = errByValue;
+            }
             if (!rok) { store.close(); return; }
         }
         saved = s16::g_chainObserve;

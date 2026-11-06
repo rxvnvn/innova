@@ -113,7 +113,7 @@ uint64_t nCandidateTipGeneration = 0;
 bool fCandidateFrontierShadowActive = true;  // Shadow-only by default
 
 // Peer that delivered the block currently being processed on this thread.
-// Populated by ProcessBlock so trace hooks inside SetBestChain/Reorganize can
+// Populated by ProcessBlock so trace hooks inside SetBestChain can
 // attribute tip advances and reorgs to the supplying peer.
 static NodeId g_nBlockTraceSourcePeer = -1;
 
@@ -140,8 +140,7 @@ extern void* g_testTxdbLastClosedPtr;
 extern int g_testTxdbOpenCount;
 extern void* g_testTxdbLastOpenedPtr;
 extern void* GetGlobalTxdbPtrForTest();
-bool g_testS12LifetimeProbe = false;
-int g_testS12LastPostponed = 0;
+
 void* g_testS12SeenTxdbAddr = NULL;
 void* g_testS12SeenPdb = NULL;
 void* g_testS12SeenGlobal = NULL;
@@ -6667,9 +6666,14 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
         const long long guardMax = (long long)chainH + 1048576;   // hard bound: one step per height + slack
         while (sh >= 0 && guard++ < guardMax)
         {
+            // The committed chain is resolved BY VALUE FIRST: it may exceed
+            // mapBlockIndex residency (bounded hot cache), so a projection-only
+            // resolver could answer "not resolved" for a height whose committed
+            // block is perfectly valid — treating that as a foreign-branch
+            // divergence would unwind the store toward genesis and fail the
+            // whole recovery (observed: store tip at h=0 with genesis retired).
             uint256 committedAt(0);
             bool have = false;
-            if (g_fAuthoritativeStartup)
             {
                 BlockIndexSnapshot csnap; std::string cerr2;
                 if (AuthoritativeGetActiveSnapshotByHeightR((int)sh, &csnap, &cerr2) == AUTHORITATIVE_BLOCK_FOUND &&
@@ -6679,16 +6683,28 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
                     have = true;
                 }
             }
-            else
+            if (!have)
             {
+                // Legacy projection resolver (non-authoritative arm only): the
+                // in-memory best chain IS the active chain when the authoritative
+                // resolver could not answer it.
                 for (CBlockIndex* p = pindexBest; p != NULL; p = p->pprev)
                 {
                     if (p->nHeight == sh) { committedAt = p->GetBlockHash(); have = true; break; }
                     if (p->nHeight < sh) break;
                 }
             }
+            if (!have)
+            {
+                // No source could resolve this committed height — never call
+                // this an unwind signal (fail closed, keep the store exactly
+                // where it is).
+                if (err) *err = strprintf("branch alignment: committed height %d not resolvable by value or projection (fail closed)",
+                                          (int)sh);
+                return false;
+            }
             uint256 stNow; memcpy(stNow.begin(), store->tipHash().data(), 32);
-            if (have && committedAt == stNow)
+            if (committedAt == stNow)
                 break;   // the store tip IS a prefix of the committed chain
             uint256 bparent;
             if (!s16_ResolveReplayParent(stNow, sh, &bparent, err))
@@ -6915,7 +6931,7 @@ static inline bool s16_V2Armed()
 // CURRENT reorg connect loop and consumed by PublishAuthoritativeLiveTailCutover
 // to (a) override the materialized connect-suffix values and (b) arm the
 // publication-time supply-invariant gate (BlockIndexTipAuthority::ReorgActiveTo).
-// Written ONLY while g_reorgConnectTrailArmed (armed by Reorganize around its
+// Written ONLY while g_reorgConnectTrailArmed (armed by ReorganizeAtomic around its
 // connect loop exactly as this map's lifetime always was: cleared at reorg
 // start, consumed after the successfu cutover publish), so ordinary forward
 // ConnectBlock calls never grow the map. Reorg/connect runs under cs_main
@@ -8096,7 +8112,7 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck, CConnectSupplyAc
 // Authoritative live-tail reorg publication (see PublishAuthoritativeLiveTailReorg
 // below).  It re-wires the current mutable retained tail
 // (BlockIndexAuthoritativeLive / blockindex_tip) to the post-reorg ACTIVE chain
-// and records the consensus outcome that Reorganize already committed durably.
+// and records the consensus outcome that ReorganizeAtomic commits durably.
 // It is the only path that updates the external live tail across a reorg, and it
 // is required on the linear path as well, so both callers keep it wired.
 // R3F test-only fault injection for the production authority transition path
@@ -8135,7 +8151,7 @@ static bool PublishAuthoritativeLiveTailReorg(int nForkHeight,
     // BY VALUE from the authoritative live store (the parent of the first connect
     // block, by pointer-free identity — never a released pprev object). BRANCH
     // ENTRIES: the ConnectBlock accounting captured during the reorg connect loop
-    // (g_reorgConnectSupply, armed by Reorganize). The trail is a by-value
+    // (g_reorgConnectSupply, armed by ReorganizeAtomic). The trail is a by-value
     // snapshot; the gate in ReorgActiveTo reads it without any lock and every
     // entry corresponds to a block the consensus engine just connected.
     std::map<int32_t, BlockIndexConnectSupplyEntry> supplyTrail;
@@ -8331,17 +8347,18 @@ CBlockIndex* MaterializeCBlockIndexByValue(const BlockIndexSnapshot& s, uint256*
 // side blocks; ReorgTo would persist those zeros and collapse the active chain's
 // supply accumulator (observed LOCAL active tip = 138 INN vs the correct ~11.06M
 // retained on the disconnected A branch). Populated in Reorganize's connect loop
-// (the authoritative ConnectBlock result) and consumed by the same call's
-// PublishAuthoritativeLiveTailCutover before ReorgTo. Reorg/connect runs under
+// (the authoritative ConnectBlock result) and consumed by the atomic
+// publication run. Reorg/connect runs under
 // cs_main (single-threaded), so no separate lock is required.
 
 // ---------------------------------------------------------------------------
-// ATOMIC-REORG (S1-d): navigation shared by the legacy Reorganize() and the new
-// atomic (V->C->A) reorg path. Byte-identical semantics for both callers: C12
-// by-value fork discovery across the sparse-hot / bounded-residency boundary,
-// the V2-R2 below-base fail-closed contract, and disconnect/connect lists built
-// from REAL map-resident objects (operation-scoped by-value materialization
-// below the retention floor, edge-released on exit exactly as Reorganize did).
+// ATOMIC-REORG (S1-d/S1-e): navigation for the atomic (V->C->A) reorg path
+// (the ONLY reorg executor; the legacy A-before-C Reorganize was removed).
+// C12 by-value fork discovery across the sparse-hot / bounded-residency
+// boundary, the V2-R2 below-base fail-closed contract, and disconnect/connect
+// lists built from REAL map-resident objects (operation-scoped by-value
+// materialization below the retention floor, edge-released on exit — the
+// exact retention contract the former legacy executor also observed).
 // Navigation failures set *pfNavigationFailure and never mutate any state.
 // ---------------------------------------------------------------------------
 static std::string ReorgErrPrefix(const char* label){ return std::string(label) + "() : "; }
@@ -8550,181 +8567,7 @@ static bool ReorgResolveBranches(CBlockIndex* pindexBest, CBlockIndex* pindexNew
 }
 
 
-bool static Reorganize(CBlockIndex* pindexNew, bool* pfNavigationFailure)
-{
-    // C12 (operator requirement H): distinguish an infrastructure/navigation failure
-    // (sparse-hot/by-value ancestry not resolvable, or a fork below the representable
-    // window) from a genuine consensus-invalid block. A navigation failure must NEVER
-    // be recorded as invalid trust: callers read *pfNavigationFailure and skip
-    // InvalidChainFound. Both are fail-closed and precede any state mutation.
-    if (pfNavigationFailure) *pfNavigationFailure = false;
-    if (blockacctrace::Enabled()) blockacctrace::SetStage(5);
-    printf("REORGANIZE\n");
 
-    // Operator-invalidation gate (defense in depth; SetBestChain precedes every
-    // Reorganize call, but guard here too for direct callers).
-    // PM1-P0-06 A1: authoritative by-value verdict; fail closed if unavailable.
-    {
-        BlockIndexOperatorInvalidResult oir = IsBlockOperatorInvalidTyped(pindexNew);
-        if (oir == BLOCK_INDEX_OPERATOR_UNAVAILABLE)
-            return error("Reorganize() : operator-invalid authority unavailable for %s (fail closed)",
-                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
-        if (oir == BLOCK_INDEX_OPERATOR_INVALID)
-            return error("Reorganize() : block %s (or an ancestor) is invalidated by the operator",
-                         pindexNew->GetBlockHash().ToString().substr(0, 20).c_str());
-    }
-
-
-    CReorgWalk walk;
-    if (!ReorgResolveBranches(pindexBest, pindexNew, walk, "Reorganize", pfNavigationFailure))
-        return false;   // navigation error already raised; state untouched (fail closed)
-
-
-    // Disconnect shorter branch
-    list<CTransaction> vResurrect;
-    for (CBlockIndex* pindex : walk.vDisconnect)
-    {
-        CBlock block;
-        if (!block.ReadFromDisk(pindex))
-                    {
-                        return error("Reorganize() : ReadFromDisk for disconnect failed");
-                    }
-                    if (!block.DisconnectBlock(pindex))
-                    {
-                        return error("Reorganize() : DisconnectBlock %s failed", pindex->GetBlockHash().ToString().substr(0,20).c_str());
-                    }
-
-        // Queue memory transactions to resurrect.
-        // We only do this for blocks after the last checkpoint (reorganisation before that
-        // point should only happen with -reindex/-loadblock, or a misbehaving peer.
-        BOOST_REVERSE_FOREACH(const CTransaction& tx, block.vtx)
-            if (!(tx.IsCoinBase() || tx.IsCoinStake()) && pindex->nHeight > Checkpoints::GetTotalBlocksEstimate())
-                vResurrect.push_front(tx);
-    }
-
-    // Connect longer branch
-    vector<CTransaction> vDelete;
-    // V2 MS-FIX: (re)start the connect supply/mint trail for THIS connect; the
-    // cutover that follows a reorg overwrites side-materialized nMoneySupply/nMint
-    // (zero) with these authoritative ConnectBlock values.
-    // V2 MS-FIX3: ConnectBlock itself writes the full per-height entry
-    // {supply, mint, fees, burned} while the trail is armed; the trail is armed
-    // ONLY for this connect loop (RAII: disarmed on every exit from Reorganize,
-    // success or failure), so ordinary forward ConnectBlock calls never grow
-    // the map (no lifetime/lock-order change).
-    g_reorgConnectSupply.clear();
-    {
-        struct ReorgConnectTrailArm {
-            ReorgConnectTrailArm() { g_reorgConnectTrailArmed = true; }
-            ~ReorgConnectTrailArm() { g_reorgConnectTrailArmed = false; }
-        } reorgConnectTrailArm_;
-        for (unsigned int i = 0; i < walk.vConnect.size(); i++)
-        {
-            CBlockIndex* pindex = walk.vConnect[i];
-            CBlock block;
-            if (!block.ReadFromDisk(pindex))
-            {
-                return error("Reorganize() : ReadFromDisk for connect failed");
-            }
-
-            if (!IsInitialBlockDownload()) GetCollateralnodeRanks(pindex); // recalculate ranks for the this block hash if required
-
-            if (!block.ConnectBlock(pindex))
-            {
-                // Invalid block
-                return error("Reorganize() : ConnectBlock %s failed", pindex->GetBlockHash().ToString().substr(0,20).c_str());
-            }
-            // V2 MS-FIX3: the entry for pindex->nHeight was written by
-            // ConnectBlock itself inside this armed window (full accounting).
-            // (The MS-FIX fill of {supply, mint} from the ConnectBlock result
-            // is preserved by that write; ConnectBlock is the single
-            // authoritative computation.)
-
-            // Queue memory transactions to delete
-            for (const CTransaction& tx : block.vtx)
-                vDelete.push_back(tx);
-        }
-    }
-    // BI-V2 owns the published tip and Store3A committed each connected block
-    // atomically inside ConnectBlock; nothing separate to persist here.
-
-    // Clear setStakeSeen so disconnected stakes don't block the new branch
-    for (CBlockIndex* pindex : walk.vDisconnect)
-    {
-        if (pindex->IsProofOfStake())
-            setStakeSeen.erase(make_pair(pindex->prevoutStake, pindex->nStakeTime));
-    }
-
-
-    // Reorg publication. The reorg publishes only the ordinary authoritative
-    // live tail (below).  The former reorg-time recolour consumer has been
-    // physically removed.  Ordinary linear reorg publication is unaffected.
-
-    // Disconnect shorter branch
-    for (CBlockIndex* pindex : walk.vDisconnect)
-        if (pindex->pprev)
-            pindex->pprev->pnext = NULL;
-
-    // Connect longer branch
-    for (CBlockIndex* pindex : walk.vConnect)
-        if (pindex->pprev)
-            pindex->pprev->pnext = pindex;
-
-    // Resurrect memory transactions
-    for (CTransaction& tx : vResurrect)
-    {
-        tx.AcceptToMemoryPool();
-    }
-
-    // Delete redundant memory transactions that are in the connected branch
-    for (CTransaction& tx : vDelete) {
-        mempool.remove(tx);
-        mempool.removeConflicts(tx);
-    }
-
-    CollateralNReorgBlock = true;
-    printf("REORGANIZE: done\n");
-
-
-    return true;
-}
-
-
-// ---------------------------------------------------------------------------
-// ATOMIC-REORG (S1-d2): the PRODUCTION reorg path — one cs_main critical
-// section (SetBestChain is called under cs_main by every entry point):
-//
-//   V  Validate the ENTIRE candidate branch (fork+1 .. newTip) with the SAME
-//      consensus engine (ConnectBlock justCheck=true) against a bounded,
-//      READ-ONLY fork-state overlay rebuilt from Store3A undo records via
-//      peekUndo. Zero durable mutations (C2): no store publish, no txloc,
-//      no block-index write, no mempool/wallet effect, no collateral rank
-//      cache. Every next block sees the UTXO changes of the previous ones
-//      through the overlay (cross-block spends/creations).
-//   C  ONE atomic publication of the whole branch: PublishAuthoritativeLiveTailReorg
-//      -> BlockIndexTipAuthority::ReorgActiveTo (single tip.meta commit,
-//      activeFence++, dense-branch validation, per-block supply invariant
-//      gate from the V-phase ConnectBlock accounting, attachment check).
-//      No intermediate prefix is ever committed.
-//   A  Apply the committed branch to Store3A (disconnect list, then connect
-//      list). A failure after C is NEVER reported as success: the store is
-//      driven to the committed tip by the SAME deterministic
-//      ReconcileStore3AToChain used at startup (run/unwind, TX-LOC via C4);
-//      if that cannot complete, the node enters explicit fail-stop
-//      (needsRecovery) and the caller must not treat the block as rejected —
-//      restart reconciles deterministically.
-//
-// Barrier (invariant 6): V/C/A and the legacy-global settlement all execute
-// under the single cs_main critical section held by AddToBlockIndex before
-// SetBestChain; every RPC/P2P/miner/wallet reader of the tip/UTXO state takes
-// cs_main, so the C->A window (V2 tip committed, store still applying) is not
-// observable outside this section. The legacy view (nBestHeight/hashBestChain)
-// is advanced only AFTER A completes, inside the same section.
-//
-// Reachability: this function is called ONLY in authoritative startup mode.
-// The non-authoritative residual in SetBestChain cannot occur in production:
-// init.cpp refuses any non-authoritative start (InitError), so the legacy
-// A-before-C Reorganize() is not a second production reorg path.
 // ---------------------------------------------------------------------------
 static bool g_v2ActivePublishedByReorg = false;   // consumed by the G1 seam
 static bool g_reorgAtomicFailStop = false;        // set on unrecoverable post-C A failure
@@ -8820,13 +8663,20 @@ static bool ReorganizeAtomic(CBlockIndex* pindexNew, bool* pfNavigationFailure,
     CReorgWalk walk;
     if (!ReorgResolveBranches(pindexBest, pindexNew, walk, "REORG-ATOMIC", pfNavigationFailure))
         return false;
-    if (walk.vDisconnect.empty() || walk.vConnect.empty())
-        return error("ReorganizeAtomic() : empty branch (disconnect=%" PRIszu" connect=%" PRIszu") — refusing to perform a no-op reorg (fail closed)",
-                     walk.vDisconnect.size(), walk.vConnect.size());
+    // A pure ROLLBACK (operator rollback / crash heal: the target is a strict
+    // ancestor of the active tip) has an EMPTY connect list by nature — the
+    // atomic publication then IS the single TruncateActiveTo to the fork
+    // (the connected A suffix was accepted before; no new blocks to
+    // re-validate). This is NOT a legacy fallback: the same V→C→A protocol
+    // with an empty branch validates nothing new and commits nothing except
+    // the single tip.meta truncation. A no-op reorg (BOTH lists empty) is
+    // still refused fail-closed.
+    if (walk.vConnect.empty() && walk.vDisconnect.empty())
+        return error("ReorganizeAtomic() : empty branch (nothing to disconnect or connect) — refusing to perform a no-op reorg (fail closed)");
+    const bool fTruncateOnly = walk.vConnect.empty();
 
     // ---- prerequisites: the SINGLE V2 authority + the armed Store3A. Any
-    // missing piece is fail-closed; there is deliberately NO fallback to the
-    // A-before-C order on this path.
+    // missing piece is fail-closed: there is no alternate reorg executor.
     BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
     if (live == NULL || !live->IsOpen())
         return error("ReorganizeAtomic() : V2 authoritative live authority unavailable (fail closed)");
@@ -8900,16 +8750,24 @@ static bool ReorganizeAtomic(CBlockIndex* pindexNew, bool* pfNavigationFailure,
     // ---- V-b: validate the ENTIRE branch against the overlay. The Connect
     // supply trail is armed so ReorgActiveTo's per-block publication gate sees
     // exactly the same ConnectBlock accounting (single authoritative
-    // computation; no duplicate MoneySupply math).
+    // computation; no duplicate MoneySupply math). For a pure truncate-only
+    // reorg there are no branch blocks to validate; everything else is
+    // skipped and the single TruncateActiveTo below is the entire commit.
     int64_t forkSupply = 0;
+    if (fTruncateOnly)
     {
-        BlockIndexSnapshot fs; std::string ferr;
-        if (live->ResolveBlockSnapshot(walk.forkHash, &fs, &ferr) != BlockIndexHotStatus::OK || !fs.found)
-            return error("ReorganizeAtomic() : fork supply anchor %s at height %d cannot be resolved by value (%s) — fail closed",
-                         walk.forkHash.ToString().substr(0,20).c_str(), walk.nForkHeight, ferr.c_str());
-        forkSupply = fs.nMoneySupply;
+        printf("REORG-ATOMIC (TRUNCATE-ONLY): disconnect-only rollback to fork=%d (the committed A suffix is being removed; no new blocks)\\n", walk.nForkHeight);
+    }
+    else
+    {
+    BlockIndexSnapshot fs; std::string ferr;
+    if (live->ResolveBlockSnapshot(walk.forkHash, &fs, &ferr) != BlockIndexHotStatus::OK || !fs.found)
+        return error("ReorganizeAtomic() : fork supply anchor %s at height %d cannot be resolved by value (%s) — fail closed",
+                     walk.forkHash.ToString().substr(0,20).c_str(), walk.nForkHeight, ferr.c_str());
+    forkSupply = fs.nMoneySupply;
     }
     g_reorgConnectSupply.clear();
+    if (!fTruncateOnly)
     {
         ReorgOverlayScope overlayScope_(&overlay);
         ReorgVTrailScope vTrailScope_;
@@ -8975,8 +8833,25 @@ static bool ReorganizeAtomic(CBlockIndex* pindexNew, bool* pfNavigationFailure,
 
     // ---- winner + base-tip immutability, checked IMMEDIATELY before commit,
     // under the same cs_main serialisation that guards every accept path.
-    if (!(pindexNew->nChainTrust > pindexBest->nChainTrust))
-        return error("ReorganizeAtomic() : candidate cumulative trust is not greater than the active tip at commit time (fail closed; nothing committed)");
+    if (fTruncateOnly)
+    {
+        // Rollback regime: the "winner" identity is the ANCESTOR itself — the
+        // candidate must BE the fork (strict ancestor of the active tip);
+        // a trust comparison is meaningless across an operator-directed
+        // rollback (the caller explicitly demands the lower, valid prefix).
+        if (pindexNew->nHeight != walk.nForkHeight ||
+            pindexNew->GetBlockHash() != walk.forkHash)
+            return error("ReorganizeAtomic() : truncate-only reorg candidate %s (h=%d) is not the resolved fork %s (h=%d) — refusing (fail closed; nothing committed)",
+                         pindexNew->GetBlockHash().ToString().substr(0,20).c_str(), pindexNew->nHeight,
+                         walk.forkHash.ToString().substr(0,20).c_str(), walk.nForkHeight);
+    }
+    else
+    {
+        // Takeover regime: the candidate branch must strictly outweigh the
+        // active tip (the caller's trust decision is re-verified at commit).
+        if (!(pindexNew->nChainTrust > pindexBest->nChainTrust))
+            return error("ReorganizeAtomic() : candidate cumulative trust is not greater than the active tip at commit time (fail closed; nothing committed)");
+    }
     if (pindexBest->GetBlockHash() != baseTipHash || pindexBest->nHeight != baseTipHeight)
         return error("ReorganizeAtomic() : active base tip moved during the V-phase (%s h=%d -> %s h=%d) (fail closed; nothing committed)",
                      baseTipHash.ToString().substr(0,20).c_str(), baseTipHeight,
@@ -9223,23 +9098,14 @@ bool CBlock::SetBestChain(CBlockIndex* pindexNew)
         // but it is unreachable in production: init.cpp refuses every
         // non-authoritative start (InitError), so this is NOT a second
         // production reorg path.
-        // Atomic prerequisites = the PRODUCTION authority pair. PROOF that the
-        // legacy residual below is unreachable in production: init.cpp refuses
-        // every non-authoritative start (InitError), and in the authoritative
-        // branch it arms Store3A (enabled+hardFail) in the SAME block that
-        // verifies "BI-V2 tip == Store3A tip" and InitErrors otherwise. So a
-        // production authoritative start ALWAYS has live authority + armed
-        // store; the residual exists only for in-process fixtures that
-        // bootstrap a V2 generation without a Store3A (mock-txdb harness).
-        BlockIndexAuthoritativeLive* atomicLive = GetAuthoritativeLiveAuthority();
-        const bool fAtomicReady = g_fAuthoritativeStartup && s16::g_chainObserve.enabled &&
-            s16::g_chainObserve.hardFail && s16::g_chainObserve.store != NULL &&
-            s16::g_chainObserve.store->opened() && atomicLive != NULL && atomicLive->IsOpen();
+        // S1-e: the ATOMIC path is the ONLY reorg executor.
+        // ReorganizeAtomic's prerequisites are fail-closed, so a missing
+        // authority pair can never silently alternate to a legacy path (no
+        // second reorg executor exists; nothing else changes the active tip
+        // outside Block Index V2).
         bool fReorgNavFailure = false;
         bool fReorgPostCommit = false;
-        const bool reorgOk = fAtomicReady
-            ? ReorganizeAtomic(pindexNew, &fReorgNavFailure, &fReorgPostCommit)
-            : Reorganize(pindexNew, &fReorgNavFailure);
+        const bool reorgOk = ReorganizeAtomic(pindexNew, &fReorgNavFailure, &fReorgPostCommit);
         if (!reorgOk)
         {
             if (fReorgPostCommit || g_reorgAtomicFailStop)

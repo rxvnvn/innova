@@ -46,6 +46,7 @@ static const int kFixtureDepth = 11;
 #include "blockindex_generation_builder.h"
 #include "blockindex_generation_lifecycle.h"
 #include "blockindex_authoritative_restart.h"
+#include "atomicreorg_fixture.h"   // S1-e: armed BI-V2 + Store3A for reorg cases
 #include <openssl/sha.h>
 #include <leveldb/db.h>
 #include <thread>
@@ -61,8 +62,6 @@ namespace fs = boost::filesystem;
 
 extern CWallet* pwalletMain;
 extern bool g_testFailSetBestChainAfterCommit;
-extern bool g_testS12LifetimeProbe;
-extern int g_testS12LastPostponed;
 extern void* g_testS12SeenTxdbAddr;
 extern void* g_testS12SeenPdb;
 extern void* g_testS12SeenGlobal;
@@ -280,6 +279,13 @@ BOOST_AUTO_TEST_CASE(e2e_genuine_accept_advance)
 BOOST_AUTO_TEST_CASE(e2e_side_branch_reorg)
 {
         BOOST_REQUIRE(pindexBest != NULL);
+    // S1-e MIGRATION: the winning side branch is published by the ATOMIC
+    // ReorganizeAtomic path (the ONLY reorg executor). It requires the
+    // production authority pair (BI-V2 live authority + armed Store3A) and
+    // fails closed without it — that fail-closed behaviour is the invariant,
+    // not a bug. Arm the pair exactly as the other reorg suites do.
+    atomictest::ArmedStoreFixture atomicPair;
+    BOOST_REQUIRE_MESSAGE(atomicPair.armed, "armed Store3A fixture: " << atomicPair.err);
     // Main branch A: extend the CURRENT best chain (b1..b4 fork off this ancestor).
     CBlockIndex* pFork = pindexBest;
     CBlockIndex* a1 = MineReal(pFork, 0x201);
