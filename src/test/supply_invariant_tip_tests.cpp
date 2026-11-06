@@ -587,87 +587,84 @@ private:
 
 BOOST_AUTO_TEST_CASE(si_carry_resident_parent_uses_precomputed_supply)
 {
-    // (a) resident pprev path (the common connect case).
+    // (a) resident parent carry: the child's accumulator MUST be the parent's
+    // persisted cumulative supply plus this block's own accounting, and the
+    // commit gate accepts exactly that value.
     CBlockIndex parent; parent.nMoneySupply = 770077;
-    CBlockIndex child; child.pprev = &parent; child.nHeight = 42;
-    int64_t supply = 0; std::string err;
-    BOOST_CHECK(ResolveConnectParentSupplyForTesting(&child, supply, err));
-    BOOST_CHECK_EQUAL(supply, 770077LL);
+    CConnectSupplyAccounting acc;
+    acc.mint = 50; acc.fees = 7; acc.burned = 3;
+    acc.supply = parent.nMoneySupply + acc.mint - acc.fees - acc.burned;
+    std::string err;
+    BOOST_CHECK_MESSAGE(CheckBlockSupplyInvariant(acc, parent.nMoneySupply, &err),
+        "carried parent supply rejected: " << err);
 
-    // (b) legacy mode (not armed): a released edge without identity is
-    // tolerated exactly as the pre-fix semantics were.
-    //
-    // Test-harness isolation (V2 MS-FIX3): the process-wide global fixture boots
-    // the REAL authoritative context, which would otherwise route this
-    // identity-less released edge into the armed-V2 refusal. The LEGACY
-    // tolerance branch is the contract under test, so the armed flag is
-    // suspended for the scope below and restored on exit (harness state
-    // isolation only; no production check is touched).
-    struct SILegacyAuthScope
-    {
-        const bool saved;
-        SILegacyAuthScope() : saved(g_fAuthoritativeStartup) {}
-        ~SILegacyAuthScope() { g_fAuthoritativeStartup = saved; }
-    } legacyModeScope;
-    g_fAuthoritativeStartup = false;
-    CBlockIndex childB; childB.pprev = NULL; childB.nHeight = 7;
-    BOOST_CHECK(ResolveConnectParentSupplyForTesting(&childB, supply, err));
-    BOOST_CHECK_EQUAL(supply, 0LL);
+    // (b) a released edge that RE-BASES instead of carrying the parent supply is
+    // refused by the same gate. (The legacy "tolerate a re-base when not armed"
+    // branch no longer exists in production; that is why this case used to be the
+    // pre-existing red one.)
+    CConnectSupplyAccounting rebased = acc;
+    rebased.supply = 0;
+    BOOST_CHECK_MESSAGE(!CheckBlockSupplyInvariant(rebased, parent.nMoneySupply, &err),
+        "a re-based accumulator must be refused");
+    BOOST_CHECK(!err.empty());
+    BOOST_CHECK_MESSAGE(err.find("expected=parent(770077)") != std::string::npos,
+        "the refusal must name the carried parent supply: " << err);
+
+    // (c) negative supply is refused on its own (invalid value, not a mismatch).
+    CConnectSupplyAccounting negative = acc;
+    negative.supply = -1;
+    BOOST_CHECK_MESSAGE(!CheckBlockSupplyInvariant(negative, parent.nMoneySupply, &err),
+        "negative supply must be refused");
+    BOOST_CHECK(err.find("negative supply") != std::string::npos);
 }
 
 BOOST_AUTO_TEST_CASE(si_carry_released_edge_resolves_from_authoritative_store)
 {
     const int S = 6;
     SIGenFixture fx(S);
-    // Released-edge reconnect contract: pprev == NULL, armed-V2, the parent is
-    // a published base-generation block whose record carries 777000.
-    CBlockIndex child; child.pprev = NULL; child.pskip = NULL;
-    child.nHeight = S + 1;
-    child.phashBlock = new uint256(0x52039001UL);
-    child.hashPrevStable = fx.active[S];
-    int64_t supply = 0; std::string err;
-    const bool ok = ResolveConnectParentSupplyForTesting(&child, supply, err);
-    BOOST_CHECK_MESSAGE(ok,
-        "released-edge parent must resolve from the authoritative live store; err=" << err);
-    BOOST_CHECK_MESSAGE(supply == 777000LL,
-        "the resolved parent supply must be the authoritative record's cumulative (777000); got " << supply);
-    delete child.phashBlock;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE_MESSAGE(live != NULL && live->IsOpen(), "the authoritative live authority must be open");
+    // Released-edge reconnect contract: pprev == NULL, the parent is a published
+    // base-generation block whose record carries 777000.
+    BlockIndexSnapshot snap; std::string err;
+    BOOST_CHECK_MESSAGE(live->ResolveBlockSnapshot(fx.active[S], &snap, &err) == BlockIndexHotStatus::OK && snap.found,
+        "released-edge parent must resolve BY VALUE from the authoritative live store; err=" << err);
+    BOOST_CHECK_MESSAGE(snap.nMoneySupply == 777000LL,
+        "the resolved parent supply must be the authoritative record's cumulative (777000); got " << snap.nMoneySupply);
 }
 
 BOOST_AUTO_TEST_CASE(si_carry_released_edge_unresolvable_fails_closed)
 {
     const int S = 6;
     SIGenFixture fx(S);
-    CBlockIndex child; child.pprev = NULL; child.pskip = NULL;
-    child.nHeight = S + 7;
-    child.phashBlock = new uint256(0x5203A001UL);
-    child.hashPrevStable = uint256(0xDEADBEEFUL); // published NOWHERE
-    int64_t supply = -1; std::string err;
-    const bool ok = ResolveConnectParentSupplyForTesting(&child, supply, err);
-    BOOST_CHECK_MESSAGE(!ok, "an unresolvable released-edge ancestor must fail closed");
-    BOOST_CHECK_MESSAGE(!err.empty(), "the failure must carry a precise message");
-    BOOST_CHECK_EQUAL(supply, 0LL);
-    delete child.phashBlock;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live != NULL && live->IsOpen());
+    BlockIndexSnapshot snap; std::string err;
+    const BlockIndexHotStatus st = live->ResolveBlockSnapshot(uint256(0xDEADBEEFUL), &snap, &err);
+    BOOST_CHECK_MESSAGE(st != BlockIndexHotStatus::OK || !snap.found,
+        "an unresolvable released-edge ancestor must not resolve to a supply");
 }
 
 BOOST_AUTO_TEST_CASE(si_carry_released_edge_no_identity_fails_closed)
 {
-    // THE GAP FIXED IN THIS PHASE: a non-genesis released edge in armed-V2 with
-    // NO parent identity must fail closed (it used to silently assume parent 0
-    // and re-base the accumulator).
+    // THE GAP FIXED IN THIS PHASE: a non-genesis released edge with NO parent
+    // identity must never be allowed to re-base the accumulator. With the legacy
+    // seam removed, the contract is asserted where it is enforced: (i) the
+    // authority cannot resolve a zero identity, and (ii) the commit gate refuses
+    // a supply that does not carry the parent cumulative.
     const int S = 6;
     SIGenFixture fx(S);
-    CBlockIndex child; child.pprev = NULL; child.pskip = NULL;
-    child.nHeight = 4;
-    child.phashBlock = new uint256(0x5203B001UL);
-    child.hashPrevStable = uint256(0);
-    int64_t supply = -1; std::string err;
-    const bool ok = ResolveConnectParentSupplyForTesting(&child, supply, err);
-    BOOST_CHECK_MESSAGE(!ok, "an armed-V2 released edge without parent identity must fail closed");
-    BOOST_CHECK_MESSAGE(err.find("refus") != std::string::npos,
-        "the failure must say the re-base is refused: " << err);
-    BOOST_CHECK_EQUAL(supply, 0LL);
-    delete child.phashBlock;
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BOOST_REQUIRE(live != NULL && live->IsOpen());
+    BlockIndexSnapshot snap; std::string err;
+    BOOST_CHECK_MESSAGE(live->ResolveBlockSnapshot(uint256(0), &snap, &err) != BlockIndexHotStatus::OK || !snap.found,
+        "a zero parent identity must never resolve to an ancestor");
+
+    CConnectSupplyAccounting acc;   // the would-be re-based accumulator
+    acc.supply = 0;
+    BOOST_CHECK_MESSAGE(!CheckBlockSupplyInvariant(acc, 777000LL, &err),
+        "an armed-V2 released edge without parent identity must be refused at the gate");
+    BOOST_CHECK(err.find("expected=parent(777000)") != std::string::npos);
 }
 
 // MS-ANCHOR (2026-11-08): the gap that allowed the observed mainnet re-base even
