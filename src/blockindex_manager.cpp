@@ -55,7 +55,7 @@ const char* BlockIndexManagerStatusName(BlockIndexManagerStatus status)
     return "UNKNOWN";
 }
 
-BlockIndexManager::BlockIndexManager() : reader_(NULL) {}
+BlockIndexManager::BlockIndexManager() : reader_(NULL), composite_(false) {}
 
 BlockIndexManager::~BlockIndexManager() {}
 
@@ -66,7 +66,13 @@ void BlockIndexManager::BindReader(const BlockIndexV2Reader* reader)
 
 bool BlockIndexManager::UseComposite() const
 {
-    return g_fAuthoritativeStartup;
+    // Explicit contract: a bound reader WINS; otherwise the composite
+    // (authoritative) source is used only while the authoritative startup has
+    // explicitly bound it. The test-mode global g_fAuthoritativeStartup is NOT a
+    // source selector: it must never decide which index the manager reads.
+    if (reader_ != NULL)
+        return false;
+    return composite_;
 }
 
 bool BlockIndexManager::IsAvailable(std::string* error) const

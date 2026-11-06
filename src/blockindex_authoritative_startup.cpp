@@ -2,6 +2,7 @@
 // Distributed under the MIT/X11 software license.
 
 #include "blockindex_authoritative_startup.h"
+#include "blockindex_manager.h"
 
 #include "blockindex_authoritative_live.h"
 #include "blockindex_residency_counters.h"
@@ -466,6 +467,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
     globalsGuard.Disarm();
     g_authoritativeContext = ctx.release();
     ::g_fAuthoritativeStartup = true;
+    GetBlockIndexManager().BindComposite(true);   // explicit source binding
 
     // R4 — AUTHORITY_READY: evaluated at the TRUE successful exit of the authoritative startup,
     // after the immutable authority has actually opened (`g_authoritativeContext` registered above
@@ -909,6 +911,7 @@ void ResetBlockIndexAuthoritativeStartupForTest()
     g_authoritativeContext = NULL;
     ClearBlockIndexStakingNavigator();
     g_fAuthoritativeStartup = false;
+    GetBlockIndexManager().BindComposite(false);
     pindexBest = NULL;
     pindexGenesisBlock = NULL;
     nBestHeight = -1;

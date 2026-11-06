@@ -57,21 +57,15 @@ static void MgrOpen(const boost::filesystem::path& root, BlockIndexV2Reader* r)
     BlockIndexV2ReaderOptions o; std::string e;
     BOOST_REQUIRE_MESSAGE(r->Open(root.string(), o, &e), e);
 }
-// The manager must run in READER mode for these hermetic tests; other suites in
-// the same process may leave the authoritative flag set. Save/restore it.
-struct MgrReaderMode
-{
-    bool saved;
-    MgrReaderMode() : saved(g_fAuthoritativeStartup) { g_fAuthoritativeStartup = false; }
-    ~MgrReaderMode() { g_fAuthoritativeStartup = saved; }
-};
+// Reader mode is now explicit: every case below binds its own BlockIndexV2Reader,
+// and the manager prefers that binding over any process-global state. No flag is
+// flipped here.
 } // namespace
 
 BOOST_AUTO_TEST_SUITE(blockindex_manager_tests)
 
 BOOST_AUTO_TEST_CASE(unbound_manager_is_not_available_and_fails_closed)
 {
-    MgrReaderMode mode;
     BlockIndexManager mgr;
     std::string e;
     BOOST_CHECK(!mgr.IsReaderBound());
@@ -86,7 +80,6 @@ BOOST_AUTO_TEST_CASE(unbound_manager_is_not_available_and_fails_closed)
 
 BOOST_AUTO_TEST_CASE(reader_lookup_by_hash_and_active_height_are_equivalent)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildSelected(root);
     BlockIndexV2Reader r; MgrOpen(root, &r);
     BlockIndexManager mgr; mgr.BindReader(&r);
@@ -110,7 +103,6 @@ BOOST_AUTO_TEST_CASE(reader_lookup_by_hash_and_active_height_are_equivalent)
 
 BOOST_AUTO_TEST_CASE(parent_and_ancestor_are_by_value)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildSelected(root);
     BlockIndexV2Reader r; MgrOpen(root, &r);
     BlockIndexManager mgr; mgr.BindReader(&r);
@@ -128,7 +120,6 @@ BOOST_AUTO_TEST_CASE(parent_and_ancestor_are_by_value)
 
 BOOST_AUTO_TEST_CASE(tip_contains_and_tipis)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildSelected(root);
     BlockIndexV2Reader r; MgrOpen(root, &r);
     BlockIndexManager mgr; mgr.BindReader(&r);
@@ -161,7 +152,6 @@ BOOST_AUTO_TEST_CASE(tip_contains_and_tipis)
 
 BOOST_AUTO_TEST_CASE(missing_block_is_not_found_never_authority_failure)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildSelected(root);
     BlockIndexV2Reader r; MgrOpen(root, &r);
     BlockIndexManager mgr; mgr.BindReader(&r);
@@ -176,7 +166,6 @@ BOOST_AUTO_TEST_CASE(missing_block_is_not_found_never_authority_failure)
 // false, and the manager MUST NEVER substitute zero for a missing checksum.
 BOOST_AUTO_TEST_CASE(derived_consensus_fails_closed_no_zero_substitution)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildSelected(root);
     BlockIndexV2Reader r; MgrOpen(root, &r);
     BlockIndexManager mgr; mgr.BindReader(&r);
@@ -193,7 +182,6 @@ BOOST_AUTO_TEST_CASE(derived_consensus_fails_closed_no_zero_substitution)
 
 BOOST_AUTO_TEST_CASE(view_binds_generation_and_tip_and_detects_invalid)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildSelected(root);
     BlockIndexV2Reader r; MgrOpen(root, &r);
     BlockIndexManager mgr; mgr.BindReader(&r);
@@ -280,7 +268,6 @@ static void MgrBuildGen(const boost::filesystem::path& root, uint64_t gen, int c
 
 BOOST_AUTO_TEST_CASE(d_blocksize_absent_is_unavailable_not_zero)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildSelected(root);
     BlockIndexV2Reader r; MgrOpen(root, &r);
     BlockIndexManager mgr; mgr.BindReader(&r);
@@ -297,7 +284,6 @@ BOOST_AUTO_TEST_CASE(d_blocksize_absent_is_unavailable_not_zero)
 
 BOOST_AUTO_TEST_CASE(d_blocksize_present_available_and_values_match)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildGen(root, 1, 8, 5, true);
     BlockIndexV2Reader r; MgrOpen(root, &r);
     BlockIndexManager mgr; mgr.BindReader(&r);
@@ -318,7 +304,6 @@ BOOST_AUTO_TEST_CASE(d_blocksize_present_available_and_values_match)
 
 BOOST_AUTO_TEST_CASE(d_blocksize_restart_reopen_equivalence)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildGen(root, 1, 8, 5, true);
     unsigned int first = 0;
     {
@@ -341,7 +326,6 @@ BOOST_AUTO_TEST_CASE(d_blocksize_restart_reopen_equivalence)
 
 BOOST_AUTO_TEST_CASE(d_last_block_index_proof_type_walk)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot(); MgrBuildGen(root, 1, 8, 5, true);
     BlockIndexV2Reader r; MgrOpen(root, &r);
     BlockIndexManager mgr; mgr.BindReader(&r);
@@ -365,7 +349,6 @@ BOOST_AUTO_TEST_CASE(d_last_block_index_proof_type_walk)
 
 BOOST_AUTO_TEST_CASE(d_view_detects_generation_change)
 {
-    MgrReaderMode mode;
     boost::filesystem::path root = MgrUniqueRoot();
     MgrBuildGen(root, 1, 8, 5, true);
     BlockIndexV2Reader r1; MgrOpen(root, &r1);
@@ -392,7 +375,6 @@ BOOST_AUTO_TEST_CASE(d_difficulty_path_is_pointer_free_no_mapblockindex)
     // supply the PoW/PoS difficulty INPUTS (proof-type ancestors) with the legacy
     // global mapBlockIndex EMPTY and pindexBest NULL. If this ever requires the
     // pointer graph, the migration is not real.
-    MgrReaderMode mode;
     ClearBlockIndexAccessorState();
     std::map<uint256, CBlockIndex*> saved; saved.swap(mapBlockIndex);
     CBlockIndex* savedBest = pindexBest; pindexBest = NULL;
@@ -418,7 +400,6 @@ BOOST_AUTO_TEST_CASE(f_get_locator_hashes_is_pointer_free_no_mapblockindex)
     // HASH through the manager's by-value ancestry with the legacy global
     // mapBlockIndex EMPTY and pindexBest NULL. If locator construction ever
     // requires the historical pointer graph, the migration is not real.
-    MgrReaderMode mode;
     ClearBlockIndexAccessorState();
     std::map<uint256, CBlockIndex*> saved; saved.swap(mapBlockIndex);
     CBlockIndex* savedBest = pindexBest; pindexBest = NULL;
@@ -516,7 +497,7 @@ struct R1ManagerBindingGuard
 
 BOOST_AUTO_TEST_CASE(g_r1_tip_metadata_is_pointer_free_no_mapblockindex)
 {
-    MgrReaderMode mode;                 // g_fAuthoritativeStartup=false -> bound-reader backend
+    // bound-reader backend: the singleton is bound to an explicit reader below
     R1LegacyGlobalsGuard legacy;        // pindexBest==NULL, mapBlockIndex empty
     R1ManagerBindingGuard binding;      // restores the singleton binding afterwards
     BlockIndexManager& mgr = binding.mgr;
@@ -578,10 +559,13 @@ BOOST_AUTO_TEST_CASE(g_r1_tip_metadata_is_pointer_free_no_mapblockindex)
 
     // ---- authority absent: the by-value tip read fails closed (never a silent
     //      tip, never a fallback to a NULL historical pointer) ----
+    const bool savedComposite = mgr.IsCompositeBound();
     mgr.BindReader(NULL);
+    mgr.BindComposite(false);          // explicit: no reader AND no composite
     BlockIndexSnapshot tipAbsent;
     BOOST_CHECK(!mgr.IsAvailable(&e));
     BOOST_CHECK(mgr.GetTip(&tipAbsent, &e) != BLOCK_INDEX_MANAGER_OK);
+    mgr.BindComposite(savedComposite);
 }
 
 BOOST_AUTO_TEST_SUITE_END()

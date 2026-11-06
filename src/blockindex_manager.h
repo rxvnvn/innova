@@ -88,6 +88,12 @@ public:
     // composite seam. NULL unbinds.
     void BindReader(const BlockIndexV2Reader* reader);
     bool IsReaderBound() const { return reader_ != NULL; }
+    // Explicit composite-authority binding. Set by the authoritative startup when
+    // the Block Index V2 authority actually opens, cleared when it is torn down.
+    // The manager never infers its source from process-global test state: a bound
+    // reader wins, otherwise the composite is used only while explicitly bound.
+    void BindComposite(bool bound) { composite_ = bound; }
+    bool IsCompositeBound() const { return composite_; }
     // The currently bound non-owning generation reader (NULL when unbound). Lets a
     // hermetic fixture save/restore the process singleton's binding safely.
     const BlockIndexV2Reader* BoundReader() const { return reader_; }
@@ -203,6 +209,7 @@ private:
     bool UseComposite() const;
 
     const BlockIndexV2Reader* reader_;
+    bool composite_;
 };
 
 // Process-lifetime manager façade. Holds NO per-block identity (no registry);
