@@ -119,15 +119,12 @@ struct ArmedStoreFixture
             cs::ChainError be;
             if (!store.publish(birth, gh, 0, &be)) { err = "genesis born-commit: " + be.str(); store.close(); return; }
         }
-        // Reconcile through the production startup recovery. The in-process
-        // harness has no published committed-tip snapshot, so reconcile through
-        // its chain-projection arm (identical replay code; only the chain-tip
-        // source differs), then restore the authoritative flag.
+        // Reconcile through the production startup recovery with the harness
+        // mode UNTOUCHED. There is no mode switch and no projection-arm retry:
+        // the reconcile either succeeds in the current authoritative mode or the
+        // fixture fails closed.
         {
-            const bool savedAuth = g_fAuthoritativeStartup;
-            g_fAuthoritativeStartup = false;
             const bool rok = s16::ReconcileStore3AToChain(&store, &err);
-            g_fAuthoritativeStartup = savedAuth;
             if (!rok)
             {
                 LOCK(cs_main);

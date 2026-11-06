@@ -27,6 +27,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include "main.h"
+#include "chainstore_context.h"
 #include "miner.h"
 #include "wallet.h"
 #include "util.h"
@@ -269,22 +270,9 @@ struct ArmedStoreFixture
             // published a committed tip at all (fresh process, tip=genesis),
             // this arm bails out by design, so retry once with the legacy
             // projection arm for this in-process fixture only.
-            const bool savedAuth = g_fAuthoritativeStartup;
-            std::string errByValue;
-            g_fAuthoritativeStartup = true;
-            bool rok = s16::ReconcileStore3AToChain(&store, &errByValue);
-            g_fAuthoritativeStartup = savedAuth;
-            if (!rok && errByValue.find("committed tip is not published") != std::string::npos)
-            {
-                g_fAuthoritativeStartup = false;
-                rok = s16::ReconcileStore3AToChain(&store, &err);
-                g_fAuthoritativeStartup = savedAuth;
-            }
-            else if (!rok)
-            {
-                err = errByValue;
-            }
-            if (!rok) { store.close(); return; }
+            std::string recErr;
+            const bool rok = s16::ReconcileStore3AToChain(&store, &recErr);
+            if (!rok) { err = recErr; store.close(); return; }
         }
         saved = s16::g_chainObserve;
         s16::g_chainObserve.store = &store;
@@ -468,6 +456,8 @@ BOOST_AUTO_TEST_SUITE(atomic_reorg_tests)
 
 BOOST_AUTO_TEST_CASE(atomic_reorg_depths_100_1000_2101)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     BOOST_REQUIRE_MESSAGE(g_fAuthoritativeStartup, "this suite needs the authoritative startup the production path requires");
     BOOST_REQUIRE(GetAuthoritativeLiveAuthority() != NULL && GetAuthoritativeLiveAuthority()->IsOpen());
     ArmedStoreFixture fx;
@@ -502,6 +492,8 @@ BOOST_AUTO_TEST_CASE(atomic_reorg_depths_100_1000_2101)
 
 BOOST_AUTO_TEST_CASE(atomic_reorg_v_before_c_aborts_clean)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     BOOST_REQUIRE(g_fAuthoritativeStartup);
     ArmedStoreFixture fx;
     BOOST_REQUIRE_MESSAGE(fx.armed, "armed Store3A fixture: " << fx.err);
@@ -553,6 +545,8 @@ BOOST_AUTO_TEST_CASE(atomic_reorg_v_before_c_aborts_clean)
 
 BOOST_AUTO_TEST_CASE(atomic_reorg_c_then_an_fail_stop_and_reconcile)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     BOOST_REQUIRE(g_fAuthoritativeStartup);
     ArmedStoreFixture fx;
     BOOST_REQUIRE_MESSAGE(fx.armed, "armed Store3A fixture: " << fx.err);

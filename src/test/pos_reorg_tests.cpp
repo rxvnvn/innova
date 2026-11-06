@@ -15,6 +15,7 @@
 #include <boost/test/unit_test.hpp>
 
 #include "main.h"
+#include "chainstore_context.h"
 #include "miner.h"
 #include "wallet.h"
 #include "util.h"
@@ -258,18 +259,9 @@ struct ArmedStore
         cs::Hash gh; memcpy(gh.data(), pindexGenesisBlock->GetBlockHash().begin(), 32);
         cs::ChainError be;
         if (!store.publish(birth, gh, 0, &be)) { err = "genesis born-commit: " + be.str(); return; }
-        const bool savedAuth = g_fAuthoritativeStartup;
-        std::string errByValue;
-        g_fAuthoritativeStartup = true;
-        bool rok = s16::ReconcileStore3AToChain(&store, &errByValue);
-        g_fAuthoritativeStartup = savedAuth;
-        if (!rok && errByValue.find("committed tip is not published") != std::string::npos)
-        {
-            g_fAuthoritativeStartup = false;
-            rok = s16::ReconcileStore3AToChain(&store, &err);
-            g_fAuthoritativeStartup = savedAuth;
-        }
-        else if (!rok) { err = errByValue; }
+        std::string recErr;
+        const bool rok = s16::ReconcileStore3AToChain(&store, &recErr);
+        if (!rok) { err = recErr; }
         if (!rok) return;
         saved = s16::g_chainObserve;
         s16::g_chainObserve.store = &store;
@@ -292,6 +284,8 @@ BOOST_AUTO_TEST_SUITE(pos_reorg_tests)
 
 BOOST_AUTO_TEST_CASE(pos_branch_reorg_atomic_with_restart_and_supply)
 {
+    chaintest::StoreOwnershipGuard ownerGuard;
+    BOOST_REQUIRE_MESSAGE(ownerGuard.owned, "chain store ownership: " << ownerGuard.err);
     BOOST_REQUIRE_MESSAGE(fRegTest, "this fixture must run in regtest");
     // Test-only regtest PoS limit: mainnet keeps >>20 (unfindable here). The
     // hook refuses outside regtest by construction.
