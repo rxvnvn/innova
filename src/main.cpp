@@ -6629,9 +6629,25 @@ bool s16::ReconcileStore3AToChain(cs::store3a::CommitStore3A* store, std::string
         const BlockIndexTipAuthority* tipAuth = (live != NULL && live->IsOpen()) ? live->TipAuthority() : NULL;
         if (tipAuth == NULL) { if (err) *err = "authoritative tip authority absent"; return false; }
         const BlockIndexCommittedTipSnapshot cts = tipAuth->CommittedTipSnapshot();
-        if (!cts.valid) { if (err) *err = "authoritative committed tip is not published"; return false; }
-        chainH = cts.tipHeight;
-        chainTip = cts.tipHash;
+        if (!cts.valid)
+        {
+            // Genesis window: no logical (post-base) tip is published yet, so the
+            // authoritative identity IS the immutable BASE tip. This is the
+            // authority's own rule (the same one the extension decision and the
+            // four-source check use), not a legacy fallback: the store born-commit
+            // at the base tip is the correct state and must reconcile as a no-op.
+            const uint256 baseHash = tipAuth->BaseTipHash();
+            const int32_t baseHeight = AuthoritativeBaseTipHeight();
+            if (baseHash == uint256(0))
+            { if (err) *err = "authoritative base tip unavailable"; return false; }
+            chainH = baseHeight;
+            chainTip = baseHash;
+        }
+        else
+        {
+            chainH = cts.tipHeight;
+            chainTip = cts.tipHash;
+        }
     }
     int32_t sh = store->tipHeight();
     if (sh == chainH) {
