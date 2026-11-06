@@ -12,6 +12,7 @@
 #pragma once
 
 #include "main.h"
+#include "chainstore_context.h"
 #include "miner.h"
 #include "wallet.h"
 #include "util.h"
@@ -95,9 +96,11 @@ struct ArmedStoreFixture
     boost::filesystem::path dir;
     bool armed;
     std::string err;
+    chaintest::StoreOwnershipGuard owner;   // ETAP-1: one Store3A per chain context
 
     ArmedStoreFixture() : armed(false)
     {
+        if (!owner.owned) { err = owner.err; return; }
         namespace bfs = boost::filesystem;
         dir = bfs::temp_directory_path() / bfs::unique_path("atomic-armed-%%%%-%%%%");
         bfs::create_directories(dir);
