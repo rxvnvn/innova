@@ -84,9 +84,10 @@ Value getmininginfo(const Array& params, bool fHelp)
     {
         if (!RpcAuthoritativeTipScalars(&nTipHeight, &tipHashUnused, &tipErr))
         {
-            if (g_fAuthoritativeStartup)
-                throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Active tip unavailable" : tipErr);
-            nTipHeight = nBestHeight;   // non-authoritative harness only
+            // Fail closed: there is no legacy tip-global fallback. A node that
+            // cannot read the authoritative tip must not answer with a stale
+            // nBestHeight.
+            throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Active tip unavailable" : tipErr);
         }
     }
     obj.push_back(Pair("blocks",        nTipHeight));
@@ -98,11 +99,8 @@ Value getmininginfo(const Array& params, bool fHelp)
     double dPoW, dPoS;
     if (!ManagerDifficultyPair(&dPoW, &dPoS))
     {
-        // S2-a: by-value first, fail-closed in authoritative mode.
-        if (g_fAuthoritativeStartup)
-            throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
-        dPoW = GetDifficulty();
-        dPoS = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+        // Fail closed: no pointer/legacy difficulty computation as a fallback.
+        throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
     }
     diff.push_back(Pair("proof-of-work",  dPoW));
     diff.push_back(Pair("proof-of-stake", dPoS));
