@@ -3117,30 +3117,30 @@ Value scanforalltxns(const Array& params, bool fHelp)
     Object result;
     int32_t nFromHeight = 0;
 
-    CBlockIndex *pindex = pindexGenesisBlock;
-
-
     if (params.size() > 0)
         nFromHeight = params[0].get_int();
 
-
-    if (nFromHeight > 0)
+    // S2-c: scanforalltxns reads the start height and scans BY VALUE. The legacy
+    // genesis/hashBestChain pointer walk is gone; an unavailable authority is
+    // fail-closed.
+    int32_t nStartHeight = (nFromHeight > 0) ? nFromHeight : 0;
     {
-        pindex = mapBlockIndex[hashBestChain];
-        while (pindex->nHeight > nFromHeight
-            && pindex->pprev)
-            pindex = pindex->pprev;
-    };
-
-    if (pindex == NULL)
-        throw runtime_error("Genesis Block is not set.");
+        int nTipH = -1; std::string tipErr;
+        if (GetBlockIndexManager().ActiveTipHeight(&nTipH, &tipErr) != BLOCK_INDEX_MANAGER_OK)
+            throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Active height unavailable" : tipErr);
+        if (nStartHeight > nTipH) nStartHeight = (nTipH >= 0) ? nTipH : 0;
+    }
 
     {
         LOCK2(cs_main, pwalletMain->cs_wallet);
 
         pwalletMain->MarkDirty();
 
-        pwalletMain->ScanForWalletTransactions(pindex, true);
+        BlockIndexActiveChainReader scanReader;
+        std::string scanErr;
+        if (!OpenWalletRescanReader(&scanReader, &scanErr))
+            throw JSONRPCError(RPC_WALLET_ERROR, std::string("wallet rescan reader unavailable: ") + scanErr);
+        pwalletMain->ScanForWalletTransactionsByValue(scanReader, nStartHeight, true);
         pwalletMain->ReacceptWalletTransactions();
     }
 

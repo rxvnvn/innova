@@ -1970,25 +1970,13 @@ authoritative_startup_ready:
         printf("Rescanning last %i blocks (from block %i)...\n", pindexBest->nHeight - nRescanFromHeight, nRescanFromHeight);
         nStart = GetTimeMillis();
         StartupTrace("rescan_begin");
-        if (g_fAuthoritativeStartup)
         {
-            // ---- A.10.1q: BY_VALUE_AUTHORITATIVE wallet rescan ----
-            // Route through ScanForWalletTransactionsByValue against the SAME
-            // selected generation. Scans from the wallet's resolved best-block
-            // height (by-value locator resolution above), which is the legacy
-            // semantic: blocks at or below it were already applied by this
-            // wallet. When resolution fails the start height stays at genesis,
-            // i.e. exactly the previous (safe, slow) behaviour; the birthday
-            // early-continue inside the scan is unchanged. Never the pointer walk.
-            const std::string root = AuthoritativeRootPath();
-            const uint64_t gen = AuthoritativeGeneration();
-            if (root.empty() || gen == 0)
-                return InitError(_("Block Index V2 authoritative startup: missing generation context for wallet rescan"));
-            std::string scanErr;
+            // S2-c: the ONLY wallet rescan path is by value on the selected
+            // authoritative V2 generation (single safe opener; no legacy pointer walk).
             BlockIndexActiveChainReader scanReader;
-            std::string genDir = BlockIndexGenerationManager::GenerationPath(root, gen);
-            if (!scanReader.Open(genDir, gen, &scanErr))
-                return InitError(strprintf("Block Index V2 authoritative wallet rescan reader open failed: %s", scanErr.c_str()));
+            std::string scanErr;
+            if (!OpenWalletRescanReader(&scanReader, &scanErr))
+                return InitError(strprintf("Block Index V2 wallet rescan reader open failed: %s", scanErr.c_str()));
             // -rescanfull: explicit full-historical scan. The wallet birthday
             // (nTimeFirstKey) early-continue is CORRECT for a wallet that has been
             // live, but it defeats recovery of keys imported with a later
@@ -2006,11 +1994,8 @@ authoritative_startup_ready:
                                    "could not be read; refusing to report a completed recovery"));
             printf(" rescan (authoritative) %15" PRId64"ms complete=%d\n",
                    GetTimeMillis() - nStart, rescanComplete ? 1 : 0);
-            StartupTrace("rescan_done");
-        } else {
-            pwalletMain->ScanForWalletTransactions(pindexRescan, true);
-            printf(" rescan      %15" PRId64"ms\n", GetTimeMillis() - nStart);
         }
+        StartupTrace("rescan_done");
     };
 
     // R4 — AUTHORITY_READY consumer gate: 'wallet_reaccept' must not cross before the barrier.

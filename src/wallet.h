@@ -436,7 +436,6 @@ public:
     bool AddToWalletIfInvolvingMe(const CTransaction& tx, const CBlock* pblock, bool fUpdate = false, bool fFindBlock = false);
     bool EraseFromWallet(uint256 hash);
     void WalletUpdateSpent(const CTransaction& prevout, bool fBlock = false);
-    int ScanForWalletTransactions(CBlockIndex* pindexStart, bool fUpdate = false);
     // By-value rescan (A.10.1k/D-prereq). Scans the active chain by HEIGHT from
     // `startHeight` to the reader's active height, reading each block by
     // nFile/nBlockPos WITHOUT the resident mapBlockIndex/pnext CBlockIndex graph.
@@ -1463,5 +1462,10 @@ private:
 };
 
 bool GetWalletFile(CWallet* pwallet, std::string &strWalletFileOut);
+
+// S2-c: opens the by-value rescan reader on the selected authoritative V2
+// generation; fails closed when that generation context is unavailable (there is
+// no legacy pointer-walk fallback).
+bool OpenWalletRescanReader(BlockIndexActiveChainReader* reader, std::string* error);
 
 #endif

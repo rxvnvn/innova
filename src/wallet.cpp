@@ -18,6 +18,9 @@
 #include "base58.h"
 #include "kernel.h"
 #include "blockindex_residency_counters.h"
+#include "blockindex_active_chain_reader.h"
+#include "blockindex_authoritative_startup.h"
+#include "blockindex_generation_lifecycle.h"
 #include "blockindex_shadow_startup.h"
 #include "coincontrol.h"
 #include "collateral.h"
@@ -1543,66 +1546,27 @@ bool CWalletTx::WriteToDisk()
 // Scan the block chain (starting in pindexStart) for transactions
 // from or to us. If fUpdate is true, found transactions that already
 // exist in the wallet will be updated.
-int CWallet::ScanForWalletTransactions(CBlockIndex* pindexStart, bool fUpdate)
+// S2-c: the SINGLE safe opener for a by-value active-chain rescan reader.
+// Opens the reader on the SELECTED authoritative V2 generation and fails closed
+// when that context is unavailable — there is no independent legacy pointer-walk
+// fallback anywhere in the wallet rescan paths.
+bool OpenWalletRescanReader(BlockIndexActiveChainReader* reader, std::string* error)
 {
-    int ret = 0;
-
-    CBlockIndex* pindex = pindexStart;
+    if (reader == NULL)
     {
-
-        int dProgressTop;
-        {
-            LOCK(cs_main);
-            dProgressTop = pindexBest->nHeight;
-        }
-
-        int dProgressStart = pindex ? pindex->nHeight : 0;
-        int dProgressCurrent = dProgressStart;
-        int dProgressTotal =  dProgressTop - dProgressStart;
-        double dProgressShow = 0;
-        double dProgressShowPrev = 0;
-
-        while (pindex && !fShutdown)
-        {
-            if (dProgressCurrent > 0)
-                dProgressShow = ((static_cast<double>(dProgressCurrent) / dProgressTop) * 100.0);
-
-            if ((pindex->nHeight % 100 == 0) && (dProgressTotal > 0))
-            {
-                if (dProgressShowPrev != dProgressShow)
-                {
-                    dProgressShowPrev = dProgressShow;
-                    uiInterface.InitMessage(strprintf("%s %d/%d %s... (%.2f%%)",_("Rescanning").c_str(), dProgressCurrent , dProgressTop,_("blocks").c_str(),dProgressShow));
-                }
-            }
-            // no need to read and scan block, if block was created before
-            // our wallet birthday (as adjusted for block time variability)
-            if (nTimeFirstKey && (pindex->nTime < (nTimeFirstKey - 7200))) {
-                pindex = pindex->pnext;
-                continue;
-            }
-
-            CBlock block;
-            block.ReadFromDisk(pindex, true);
-            BOOST_FOREACH(CTransaction& tx, block.vtx)
-            {
-                LOCK(cs_wallet);
-                if (AddToWalletIfInvolvingMe(tx, &block, fUpdate))
-                    ret++;
-            }
-            pindex = pindex->pnext;
-
-            // Update current height for progress
-            if (pindex) dProgressCurrent = pindex->nHeight;
-
-        }
-
-        uiInterface.InitMessage(_("Rescanning complete."));
+        if (error) *error = "null rescan reader";
+        return false;
     }
-    return ret;
+    const std::string root = AuthoritativeRootPath();
+    const uint64_t gen = AuthoritativeGeneration();
+    if (root.empty() || gen == 0)
+    {
+        if (error) *error = "authoritative Block Index V2 generation context unavailable";
+        return false;
+    }
+    return reader->Open(BlockIndexGenerationManager::GenerationPath(root, gen), gen, error);
 }
 
-// By-value rescan (A.10.1k/D-prereq). Mirrors the legacy
 // ScanForWalletTransactions loop but iterates the active chain BY HEIGHT via
 // BlockIndexActiveChainReader, reading each block by nFile/nBlockPos with NO
 // resident CBlockIndex* / pnext / mapBlockIndex dependency. Honors the same
@@ -1854,9 +1818,19 @@ void CWallet::ReacceptWalletTransactions()
         }
         if (!vMissingTx.empty())
         {
-            // TODO: optimize this to scan just part of the block chain?
-            if (ScanForWalletTransactions(pindexGenesisBlock))
-                fRepeat = true;  // Found missing transactions: re-do re-accept.
+            // S2-c: by-value rescan on the authoritative generation. A reader
+            // that cannot open is reported (fail-closed) — no pointer walk.
+            BlockIndexActiveChainReader scanReader;
+            std::string scanErr;
+            if (OpenWalletRescanReader(&scanReader, &scanErr))
+            {
+                if (ScanForWalletTransactionsByValue(scanReader, 0, true))
+                    fRepeat = true;  // Found missing transactions: re-do re-accept.
+            }
+            else
+            {
+                printf("ReacceptWalletTransactions: by-value rescan unavailable: %s\n", scanErr.c_str());
+            }
         }
     }
 }

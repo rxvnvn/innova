@@ -6,6 +6,8 @@
 #include <fstream>
 
 #include "init.h" // for pwalletMain
+#include "blockindex_manager.h"
+#include "blockindex_active_chain_reader.h"
 #include "innovarpc.h"
 #include "ui_interface.h"
 #include "base58.h"
@@ -182,7 +184,13 @@ Value importprivkey(const Array& params, bool fHelp)
         // if rescan is true, we need to scan the whole chain
 		if(fRescan){
 			pwalletMain->nTimeFirstKey = 1; // 0 would be considered 'no value'
-			pwalletMain->ScanForWalletTransactions(pindexGenesisBlock, true);
+			{
+				BlockIndexActiveChainReader scanReader;
+				std::string scanErr;
+				if (!OpenWalletRescanReader(&scanReader, &scanErr))
+					throw JSONRPCError(RPC_WALLET_ERROR, std::string("wallet rescan reader unavailable: ") + scanErr);
+				pwalletMain->ScanForWalletTransactionsByValue(scanReader, 0, true);
+			}
 			pwalletMain->ReacceptWalletTransactions();
 		}
     }
@@ -237,7 +245,11 @@ Value importaddress(const Array& params, bool fHelp)
 
         if (fRescan)
         {
-            pwalletMain->ScanForWalletTransactions(pindexGenesisBlock, true);
+            BlockIndexActiveChainReader scanReader;
+            std::string scanErr;
+            if (!OpenWalletRescanReader(&scanReader, &scanErr))
+                throw JSONRPCError(RPC_WALLET_ERROR, std::string("wallet rescan reader unavailable: ") + scanErr);
+            pwalletMain->ScanForWalletTransactionsByValue(scanReader, 0, true);
             pwalletMain->ReacceptWalletTransactions();
         }
     }
@@ -317,15 +329,37 @@ Value importwallet(const Array& params, bool fHelp)
     }
     file.close();
 
-    CBlockIndex *pindex = pindexBest;
-    while (pindex && pindex->pprev && pindex->nTime > nTimeBegin - 7200)
-        pindex = pindex->pprev;
+    // S2-c: derive the start height for the same 7200 s window BY VALUE.
+    int32_t nStartHeight = 0;
+    int32_t nActiveHeight = 0;
+    {
+        int nTipH = -1; std::string tipErr;
+        if (GetBlockIndexManager().ActiveTipHeight(&nTipH, &tipErr) != BLOCK_INDEX_MANAGER_OK)
+            throw JSONRPCError(RPC_WALLET_ERROR, std::string("active height unavailable: ") + tipErr);
+        nActiveHeight = nTipH;
+        nStartHeight = nTipH;
+        for (int h = nTipH; h >= 0; --h)
+        {
+            BlockIndexSnapshot snap; std::string se;
+            if (GetBlockIndexManager().GetActiveByHeight(h, &snap, &se) != BLOCK_INDEX_MANAGER_OK)
+                break;
+            nStartHeight = h;
+            if (!((int64_t)snap.nTime > nTimeBegin - 7200))
+                break;
+        }
+    }
 
     if (!pwalletMain->nTimeFirstKey || nTimeBegin < pwalletMain->nTimeFirstKey)
         pwalletMain->nTimeFirstKey = nTimeBegin;
 
-    printf("Rescanning last %i blocks\n", pindexBest->nHeight - pindex->nHeight + 1);
-    pwalletMain->ScanForWalletTransactions(pindex);
+    printf("Rescanning last %i blocks\n", nActiveHeight - nStartHeight + 1);
+    {
+        BlockIndexActiveChainReader scanReader;
+        std::string scanErr;
+        if (!OpenWalletRescanReader(&scanReader, &scanErr))
+            throw JSONRPCError(RPC_WALLET_ERROR, std::string("wallet rescan reader unavailable: ") + scanErr);
+        pwalletMain->ScanForWalletTransactionsByValue(scanReader, nStartHeight, true);
+    }
     pwalletMain->ReacceptWalletTransactions();
     pwalletMain->MarkDirty();
 
