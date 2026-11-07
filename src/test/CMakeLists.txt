@@ -3,7 +3,9 @@ include("${CMAKE_CURRENT_SOURCE_DIR}/test-sources.cmake")
 # test_innova: one Boost.Test module with its own main(). innova_core does not
 # contain a main(), so there is exactly one entry point here.
 add_executable(test_innova ${INNOVA_TEST_SOURCES})
-target_link_libraries(test_innova PRIVATE innova_core Boost::unit_test_framework)
+# ADR-0006: the catch-up / recovery tool tests need the legacy-datadir readers,
+# which are deliberately outside innova_core.
+target_link_libraries(test_innova PRIVATE innova_core innova_legacytools Boost::unit_test_framework)
 innova_apply_common_options(test_innova)
 innova_apply_platform_definitions(test_innova)
 

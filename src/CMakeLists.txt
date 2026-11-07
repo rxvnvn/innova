@@ -45,6 +45,17 @@ innova_apply_common_options(innova_core)
 innova_apply_platform_definitions(innova_core)
 add_dependencies(innova_core build_h)
 
+# ADR-0006 (APPROVED as direction): legacy-datadir readers are NOT part of the
+# runtime core. They remain buildable for migration/recovery only and are linked
+# exclusively into their own CLI tools and the tests that cover them, so that
+# `innovad` carries no legacy LevelDB reader.
+add_library(innova_legacytools STATIC
+    "${CMAKE_SOURCE_DIR}/src/blockindex_catchup_tool.cpp"
+    "${CMAKE_SOURCE_DIR}/src/blockindex_recovery_tool.cpp")
+target_link_libraries(innova_legacytools PUBLIC innova_core)
+innova_apply_common_options(innova_legacytools)
+innova_apply_platform_definitions(innova_legacytools)
+
 # ---------------------------------------------------------------------------
 # innovad (daemon + CLI): the production entry point lives in init.cpp.
 # ---------------------------------------------------------------------------
@@ -75,6 +86,11 @@ if(INNOVA_BUILD_TOOLS)
     list(GET _pair 1 _src)
     add_executable(${_name} "${CMAKE_SOURCE_DIR}/${_src}")
     target_link_libraries(${_name} PRIVATE innova_core)
+    # ADR-0006: the legacy-datadir readers live in their own library; only the
+    # tools that actually need them link it.
+    if(_name STREQUAL "blockindex-recovery-tool" OR _name STREQUAL "blockindex-catchup-tool")
+      target_link_libraries(${_name} PRIVATE innova_legacytools)
+    endif()
     innova_apply_common_options(${_name})
     innova_apply_platform_definitions(${_name})
   endforeach()
