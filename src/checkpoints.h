@@ -49,8 +49,11 @@ namespace Checkpoints
     // Return conservative estimate of total number of blocks, 0 if unknown
     int GetTotalBlocksEstimate();
 
-    // Returns last CBlockIndex* in mapBlockIndex that is a checkpoint
-    CBlockIndex* GetLastCheckpoint(const std::map<uint256, CBlockIndex*>& mapBlockIndex);
+    // (removed: GetLastCheckpoint(const std::map<uint256, CBlockIndex*>&), the
+    // resident-index checkpoint selector. It had no caller in production or in
+    // tests -- checkpoint selection is by value (see the V2-R2B FIX A/B seams
+    // below), so a mapBlockIndex lookup could only ever return a resident tail
+    // record, never the real last checkpoint.)
 
     extern uint256 hashSyncCheckpoint;
     extern uint256 hashPendingCheckpoint;
