@@ -11148,6 +11148,42 @@ static void RefreshAuthoritativeTransientProjection()
     // projects the best tip; leave pindexBest unchanged rather than truncate it.
 }
 
+// The V2 operator paths (InvalidateBlock / ReconsiderBlock) commit the blockindex
+// and Store3A authorities directly and never drive ConnectBlock/DisconnectBlock, so
+// no wallet notification happens: after an invalidate the wallet keeps the spent
+// flags of transactions it saw in the orphaned blocks, and after a reconsider it
+// never learns the transactions of the reconnected blocks. Both show up as a wrong
+// balance while the Store3A UTXO set is already correct.
+//
+// Repair with the wallet primitives that already exist (no second sync mechanism):
+// a bounded by-value rescan of the reconnected span, then the spent-flag alignment
+// against the Store3A spend authority.
+static void s16_OperatorResyncWallet(int32_t fromHeight, int32_t toHeight)
+{
+    if (pwalletMain == NULL) return;
+    if (fromHeight <= toHeight)
+    {
+        BlockIndexActiveChainReader reader;
+        std::string rerr;
+        if (OpenWalletRescanReader(&reader, &rerr))
+        {
+            const int nFound = pwalletMain->ScanForWalletTransactionsByValue(reader, fromHeight, true);
+            printf("operator wallet resync: scanned %d..%d, %d wallet tx(s)\n",
+                   (int)fromHeight, (int)toHeight, nFound);
+        }
+        else
+            printf("operator wallet resync: by-value reader unavailable (%s); spent-flag repair only\n",
+                   rerr.c_str());
+        fflush(stdout);
+    }
+    int nMismatch = 0; int64_t nBalance = 0;
+    pwalletMain->FixSpentCoins(nMismatch, nBalance);
+    if (nMismatch > 0)
+        printf("operator wallet resync: repaired %d spent-flag mismatch(es), %s\n",
+               (int)nMismatch, FormatMoney(nBalance).c_str());
+    fflush(stdout);
+}
+
 // S2.1-OP: operator-driven Store3A unwind. Consumes the AUTHORITATIVE Store3A undo
 // (the DisconnectBlock-equivalent path) so that after a blockindex-side operator
 // invalidate truncates the mutable tip, the store tip and UTXO state follow the
@@ -11375,6 +11411,10 @@ bool InvalidateBlock(const uint256& hash, std::string& strError)
         { strError = "failpoint FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"; return false; }
         setInvalidBlockHash.insert(hash); // non-authoritative compatibility mirror
         RefreshAuthoritativeTransientProjection();
+        // Wallet: the truncation happened behind the wallet's back (no DisconnectBlock
+        // ran), so align its spent flags with the Store3A authority. Nothing was
+        // reconnected here, hence the empty scan span.
+        s16_OperatorResyncWallet(tip->TipHeight() + 1, tip->TipHeight());
         printf("InvalidateBlock(auth-v2): invalidated %s height=%d fork=%d new_tip_height=%d\n",
                hash.ToString().substr(0, 20).c_str(), (int)targetHeight, (int)fork, (int)tip->TipHeight());
         fflush(stdout);
@@ -11494,6 +11534,10 @@ bool ReconsiderBlock(const uint256& hash, std::string& strError)
                 return false;   // fail closed; restart reconcile will finish the replay
             }
         }
+        // Wallet: the reconnected blocks never went through ConnectBlock, so the wallet
+        // has to learn their transactions explicitly (bounded by-value rescan of exactly
+        // the reconnected span) and then align spent flags with Store3A.
+        s16_OperatorResyncWallet(fork + 1, tip->TipHeight());
         printf("ReconsiderBlock(auth-v2): reconsidered %s height=%d\n",
                hash.ToString().substr(0, 20).c_str(), (int)targetHeight);
         fflush(stdout);
