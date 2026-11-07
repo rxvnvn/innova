@@ -60,14 +60,10 @@ double BitsToDouble(unsigned int nBits)
 
 double GetDifficulty(const CBlockIndex* blockindex)
 {
+    // No implicit tip lookup: the caller passes the block whose nBits it means, so
+    // this helper never reads the legacy tip globals (pindexBest/GetLastBlockIndex).
     if (blockindex == NULL)
-    {
-        if (pindexBest == NULL)
-            return 1.0;
-        else
-            blockindex = GetLastBlockIndex(pindexBest, false);
-    };
-
+        return 1.0;
     return BitsToDouble(blockindex->nBits);
 }
 
@@ -278,8 +274,15 @@ static Object AuthoritativeBlockToJSON(const CBlock& block,
 {
     Object result;
     result.push_back(Pair("hash", snapshot.hash.GetHex()));
+    int nTipHeight = -1;
+    if (snapshot.fInMainChain)
+    {
+        std::string tipErr;
+        if (GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) != BLOCK_INDEX_MANAGER_OK)
+            throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Best block unavailable" : tipErr);
+    }
     result.push_back(Pair("confirmations", snapshot.fInMainChain
-        ? nBestHeight - snapshot.height + 1 : -1));
+        ? nTipHeight - snapshot.height + 1 : -1));
     result.push_back(Pair("size", (int)::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION)));
     result.push_back(Pair("height", snapshot.height));
     result.push_back(Pair("version", block.nVersion));
@@ -335,77 +338,6 @@ static Object AuthoritativeBlockHeaderToJSON(const CBlock& block,
     return result;
 }
 
-Object blockHeader2ToJSON(const CBlock& block, const CBlockIndex* blockindex)
-{
-    Object result;
-    result.push_back(Pair("version", block.nVersion));
-    if (blockindex->pprev)
-        result.push_back(Pair("previousblockhash", blockindex->pprev->GetBlockHash().GetHex()));
-    result.push_back(Pair("merkleroot", block.hashMerkleRoot.GetHex()));
-    result.push_back(Pair("time", block.GetBlockTime()));
-    result.push_back(Pair("bits", strprintf("%08x", block.nBits)));
-    result.push_back(Pair("nonce", (uint64_t)block.nNonce));
-    return result;
-}
-
-Object blockToJSON(const CBlock& block, const CBlockIndex* blockindex, bool fPrintTransactionDetail)
-{
-    Object result;
-    result.push_back(Pair("hash", block.GetHash().GetHex()));
-    CMerkleTx txGen(block.vtx[0]);
-    txGen.SetMerkleBranch(&block);
-    result.push_back(Pair("confirmations", (int)txGen.GetDepthInMainChain()));
-    result.push_back(Pair("size", (int)::GetSerializeSize(block, SER_NETWORK, PROTOCOL_VERSION)));
-    result.push_back(Pair("height", blockindex->nHeight));
-    result.push_back(Pair("version", block.nVersion));
-    result.push_back(Pair("merkleroot", block.hashMerkleRoot.GetHex()));
-    result.push_back(Pair("mint", ValueFromAmount(blockindex->nMint)));
-    result.push_back(Pair("time", (int64_t)block.GetBlockTime()));
-    result.push_back(Pair("nonce", (uint64_t)block.nNonce));
-    result.push_back(Pair("bits", HexBits(block.nBits)));
-    result.push_back(Pair("difficulty", GetDifficulty(blockindex)));
-    result.push_back(Pair("blocktrust", leftTrim(blockindex->GetBlockTrust().GetHex(), '0')));
-    result.push_back(Pair("chaintrust", leftTrim(blockindex->nChainTrust.GetHex(), '0')));
-    if (blockindex->pprev)
-        result.push_back(Pair("previousblockhash", blockindex->pprev->GetBlockHash().GetHex()));
-    if (blockindex->pnext)
-        result.push_back(Pair("nextblockhash", blockindex->pnext->GetBlockHash().GetHex()));
-
-    result.push_back(Pair("flags", strprintf("%s%s", blockindex->IsProofOfStake()? "proof-of-stake" : "proof-of-work", blockindex->GeneratedStakeModifier()? " stake-modifier": "")));
-    result.push_back(Pair("proofhash", blockindex->hashProof.GetHex()));
-    result.push_back(Pair("entropybit", (int)blockindex->GetStakeEntropyBit()));
-
-    if (blockindex->nHeight >= FORK_HEIGHT_POEM)
-    {
-        uint256 hashProofVal = blockindex->IsProofOfStake() ? blockindex->hashProof : block.GetHash();
-        result.push_back(Pair("entropy", GetBlockEntropy(hashProofVal).GetHex()));
-    }
-
-    result.push_back(Pair("modifier", strprintf("%016" PRIx64, blockindex->nStakeModifier)));
-    result.push_back(Pair("modifierchecksum", strprintf("%08x", blockindex->nStakeModifierChecksum)));
-    Array txinfo;
-    for (const CTransaction& tx : block.vtx)
-    {
-        if (fPrintTransactionDetail)
-        {
-            Object entry;
-
-            entry.push_back(Pair("txid", tx.GetHash().GetHex()));
-            TxToJSON(tx, 0, entry);
-
-            txinfo.push_back(entry);
-        }
-        else
-            txinfo.push_back(tx.GetHash().GetHex());
-    }
-
-    result.push_back(Pair("tx", txinfo));
-
-    if (block.IsProofOfStake())
-        result.push_back(Pair("signature", HexStr(block.vchBlockSig.begin(), block.vchBlockSig.end())));
-
-    return result;
-}
 
 Value dumpbootstrap(const Array& params, bool fHelp)
 {
@@ -1175,14 +1107,20 @@ Value getblockchaininfo(const Array& params, bool fHelp)
     if(!fTestNet)
         chain = "main";
     obj.push_back(Pair("chain",          chain));
-    obj.push_back(Pair("blocks",         (int)nBestHeight));
-    obj.push_back(Pair("bestblockhash",  hashBestChain.GetHex()));
+    // S2-g: blocks / bestblockhash / difficulty read BY VALUE from the authoritative
+    // block-index manager; a by-value failure fails closed (no legacy-global answer).
+    BlockIndexSnapshot tipSnapshot;
+    std::string tipError;
+    if (!BestTipSnapshotByValue(&tipSnapshot, &tipError))
+        throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Best block unavailable" : tipError);
+    obj.push_back(Pair("blocks",         (int)tipSnapshot.height));
+    obj.push_back(Pair("bestblockhash",  tipSnapshot.hash.GetHex()));
 
     double dPoW, dPoS;
     if (!ManagerDifficultyPair(&dPoW, &dPoS))
     {
-        dPoW = GetDifficulty();
-        dPoS = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+        // No legacy fallback: an unavailable authority fails this RPC closed.
+        throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
     }
     diff.push_back(Pair("proof-of-work",  dPoW));
     diff.push_back(Pair("proof-of-stake", dPoS));
@@ -1220,7 +1158,12 @@ Value getspvinfo(const Array& params, bool fHelp)
     obj.push_back(Pair("spv_enabled", fSPVMode));
     obj.push_back(Pair("spv_headers_only", fSPVHeadersOnly));
     obj.push_back(Pair("spv_start_height", nSPVStartHeight));
-    obj.push_back(Pair("headers_synced", nBestHeight));
+    {
+        int nHeight = 0; std::string hErr;
+        if (GetBlockIndexManager().ActiveTipHeight(&nHeight, &hErr) != BLOCK_INDEX_MANAGER_OK)
+            throw JSONRPCError(RPC_MISC_ERROR, hErr.empty() ? "Block count unavailable" : hErr);
+        obj.push_back(Pair("headers_synced", nHeight));
+    }
 
     if (fSPVMode)
     {
@@ -1485,31 +1428,19 @@ static int GetDepthInMainChainReadOnly(const CWalletTx& tx)
     if (tx.hashBlock == 0 || tx.nIndex == -1)
         return mempool.exists(tx.GetHash()) ? 0 : -1;
 
-    // Resolve the confirming block and its active-chain membership.
-    // Fast path: the legacy in-memory index, when it still holds the block.
-    int nHeight = -1;
-    uint256 hashMerkleRoot;
-    map<uint256, CBlockIndex*>::const_iterator it = mapBlockIndex.find(tx.hashBlock);
-    if (it != mapBlockIndex.end() && it->second && it->second->IsInMainChain())
-    {
-        nHeight = it->second->nHeight;
-        hashMerkleRoot = it->second->hashMerkleRoot;
-    }
-    else
-    {
-        // Authoritative Block Index V2: the legacy map is not authoritative (and,
-        // for blocks outside its resident window, not populated at all). Resolve
-        // the block through BI-V2 and require main-chain membership there.
-        BlockIndexSnapshot snap;
-        CBlock probe;
-        std::string resolveError;
-        if (!ReadAuthoritativeBlockByHash(tx.hashBlock, &snap, &probe, &resolveError))
-            return mempool.exists(tx.GetHash()) ? 0 : -1;
-        if (!snap.fInMainChain)
-            return mempool.exists(tx.GetHash()) ? 0 : -1;
-        nHeight = snap.height;
-        hashMerkleRoot = snap.hashMerkleRoot;
-    }
+    // Resolve the confirming block and its active-chain membership BY VALUE through
+    // BI-V2. There is no resident mapBlockIndex fast path: under V2 the legacy map is
+    // not authoritative and is empty outside the retained window, so a hit there was
+    // never evidence of main-chain membership.
+    BlockIndexSnapshot snap;
+    CBlock probe;
+    std::string resolveError;
+    if (!ReadAuthoritativeBlockByHash(tx.hashBlock, &snap, &probe, &resolveError))
+        return mempool.exists(tx.GetHash()) ? 0 : -1;
+    if (!snap.fInMainChain)
+        return mempool.exists(tx.GetHash()) ? 0 : -1;
+    const int nHeight = snap.height;
+    const uint256 hashMerkleRoot = snap.hashMerkleRoot;
 
     // Merkle membership proof. Wallet transactions loaded from disk carry no
     // vMerkleBranch, so a stored-branch-only check rejects every such tx; prove
@@ -1531,9 +1462,13 @@ static int GetDepthInMainChainReadOnly(const CWalletTx& tx)
             return -1;
     }
 
-    if (!pindexBest)
-        return 0;
-    return pindexBest->nHeight - nHeight + 1;
+    int nTipHeight = -1;
+    {
+        std::string tipErr;
+        if (GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) != BLOCK_INDEX_MANAGER_OK)
+            return 0;
+    }
+    return nTipHeight - nHeight + 1;
 }
 
 static int GetBlocksToMaturityReadOnly(const CWalletTx& tx, int depth)
@@ -1641,8 +1576,14 @@ Value getcollateraloutpointdiagnostics(const Array& params, bool fHelp)
     bool hashBlockPresent = false;
     {
         LOCK(cs_main);
-        nTimeLeBest = pindexBest ? (tx.nTime <= pindexBest->GetBlockTime()) : false;
-        hashBlockPresent = mapBlockIndex.count(tx.hashBlock) > 0;
+        // S2-g: tip time and tx-block presence BY VALUE; the legacy tip globals and
+        // the resident mapBlockIndex are not consulted.
+        BlockIndexSnapshot tip; std::string tipErr;
+        if (BestTipSnapshotByValue(&tip, &tipErr))
+            nTimeLeBest = tx.nTime <= (int64_t)tip.nTime;
+        BlockIndexSnapshot txBlock; CBlock txBlockBody; std::string txBlockErr;
+        if (ReadAuthoritativeBlockByHash(tx.hashBlock, &txBlock, &txBlockBody, &txBlockErr))
+            hashBlockPresent = true;
     }
     bool trustedReal = txIsFinal && nTimeLeBest && hashBlockPresent && depthReal >= 1;
 
@@ -1736,7 +1677,11 @@ Value getcollateraloutpointdiagnostics(const Array& params, bool fHelp)
     result.push_back(Pair("tx_depth", depthReal));
     result.push_back(Pair("tx_blocks_to_maturity", maturityReal));
     result.push_back(Pair("tx_ntime", (int64_t)tx.nTime));
-    result.push_back(Pair("best_block_time", pindexBest ? (int64_t)pindexBest->GetBlockTime() : (int64_t)-1));
+    {
+        BlockIndexSnapshot tip; std::string tipErr;
+        const int64_t nTipTime = BestTipSnapshotByValue(&tip, &tipErr) ? (int64_t)tip.nTime : (int64_t)-1;
+        result.push_back(Pair("best_block_time", nTipTime));
+    }
     result.push_back(Pair("tx_ntime_le_besttime", nTimeLeBest));
     result.push_back(Pair("tx_hashblock_present", hashBlockPresent));
     result.push_back(Pair("tx_trusted_real_semantics", trustedReal));

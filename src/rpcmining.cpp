@@ -5,6 +5,7 @@
 
 #include "main.h"
 #include "blockindex_accessor.h"
+#include "blockindex_manager.h"
 #include "db.h"
 #include "init.h"
 #include "miner.h"
@@ -188,7 +189,10 @@ Value getstakinginfo(const Array& params, bool fHelp)
     int64_t nExpectedTime = -1;
     if (staking && nWeight > 0 && dNetworkWeight > 0.0)
     {
-        unsigned int nSpacing = GetTargetSpacingForHeight(nBestHeight + 1);
+        int nTipHeight = -1; std::string tipErr;
+        if (GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) != BLOCK_INDEX_MANAGER_OK)
+            throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Block count unavailable" : tipErr);
+        unsigned int nSpacing = GetTargetSpacingForHeight(nTipHeight + 1);
         double dExpectedTime = (double)nSpacing * dNetworkWeight / (double)nWeight;
         if (dExpectedTime < 1.0)
             nExpectedTime = 1;
@@ -210,7 +214,7 @@ Value getstakinginfo(const Array& params, bool fHelp)
     extern bool ManagerDifficultyPair(double* dPoW, double* dPoS);
     double dPoWgt, dPoSgt;
     if (!ManagerDifficultyPair(&dPoWgt, &dPoSgt))
-        dPoSgt = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+        throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
     obj.push_back(Pair("difficulty", dPoSgt));
     obj.push_back(Pair("search-interval", (int)nLastCoinStakeSearchInterval));
 

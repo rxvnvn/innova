@@ -537,7 +537,12 @@ Value getibdmetrics(const Array& params, bool fHelp)
             "\nResult: (object) the IBD metrics snapshot\n");
     if (params.size() != 0)
         throw JSONRPCError(RPC_INVALID_PARAMETER, "getibdmetrics: this command takes no arguments");
-    return BuildIBDMetricsJson((int)nBestHeight);
+    // S2-g: the metrics height is the authoritative tip height, by value; an
+    // unavailable authority fails the RPC closed (no legacy nBestHeight read).
+    int nMetricsHeight = 0; std::string metricsErr;
+    if (GetBlockIndexManager().ActiveTipHeight(&nMetricsHeight, &metricsErr) != BLOCK_INDEX_MANAGER_OK)
+        throw JSONRPCError(RPC_MISC_ERROR, metricsErr.empty() ? "Block count unavailable" : metricsErr);
+    return BuildIBDMetricsJson(nMetricsHeight);
 }
 
 Value getinfo(const Array& params, bool fHelp)
@@ -2171,16 +2176,20 @@ Value listsinceblock(const Array& params, bool fHelp)
             "listsinceblock [blockhash] [target-confirmations]\n"
             "Get all transactions in blocks since block [blockhash], or all transactions if omitted");
 
-    CBlockIndex *pindex = NULL;
     int target_confirms = 1;
     isminefilter filter = ISMINE_SPENDABLE;
+    int nStartHeight = -1;      // S2-g: by-value start height (no resident CBlockLocator)
 
     if (params.size() > 0)
     {
         uint256 blockId = 0;
 
         blockId.SetHex(params[0].get_str());
-        pindex = CBlockLocator(blockId).GetBlockIndex();
+        BlockIndexSnapshot startSnap;
+        std::string startErr;
+        if (GetBlockIndexManager().LookupByHash(blockId, &startSnap, &startErr) != BLOCK_INDEX_MANAGER_OK)
+            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, startErr.empty() ? "Block not found" : startErr);
+        nStartHeight = startSnap.height;
     }
 
     if (params.size() > 1)
@@ -2195,8 +2204,14 @@ Value listsinceblock(const Array& params, bool fHelp)
     if(params[2].get_bool())
         filter = filter | ISMINE_WATCH_ONLY;
 
-    int depth = pindex ? (1 + nBestHeight - pindex->nHeight) : -1;
+    // S2-g: tip height/hash BY VALUE for the depth filter and the "lastblock" anchor.
+    BlockIndexSnapshot tipSnapshot;
+    std::string tipErr;
+    if (GetBlockIndexManager().GetTip(&tipSnapshot, &tipErr) != BLOCK_INDEX_MANAGER_OK)
+        throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Best block unavailable" : tipErr);
+    const int nTipHeight = tipSnapshot.height;
 
+    int depth = (nStartHeight >= 0) ? (1 + nTipHeight - nStartHeight) : -1;
     Array transactions;
 
     for (map<uint256, CWalletTx>::iterator it = pwalletMain->mapWallet.begin(); it != pwalletMain->mapWallet.end(); it++)
@@ -2211,18 +2226,19 @@ Value listsinceblock(const Array& params, bool fHelp)
 
     if (target_confirms == 1)
     {
-        lastblock = hashBestChain;
+        lastblock = tipSnapshot.hash;
     }
     else
     {
-        int target_height = pindexBest->nHeight + 1 - target_confirms;
-
-        CBlockIndex *block;
-        for (block = pindexBest;
-             block && block->nHeight > target_height;
-             block = block->pprev)  { }
-
-        lastblock = block ? block->GetBlockHash() : 0;
+        // The legacy pprev walk landed on the first block with height <= target_height,
+        // i.e. exactly the active block at that height -> read it BY VALUE.
+        const int target_height = nTipHeight + 1 - target_confirms;
+        BlockIndexSnapshot anchor;
+        std::string anchorErr;
+        lastblock = 0;
+        if (target_height >= 0 &&
+            GetBlockIndexManager().GetActiveByHeight(target_height, &anchor, &anchorErr) == BLOCK_INDEX_MANAGER_OK)
+            lastblock = anchor.hash;
     }
 
     Object ret;
@@ -2283,12 +2299,18 @@ Value gettransaction(const Array& params, bool fHelp)
             else
             {
                 entry.push_back(Pair("blockhash", hashBlock.GetHex()));
-                map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashBlock);
-                if (mi != mapBlockIndex.end() && (*mi).second)
+                // S2-g: confirming block + tip height BY VALUE (no resident mapBlockIndex).
+                BlockIndexSnapshot txBlockSnap;
+                std::string txBlockErr;
+                if (GetBlockIndexManager().LookupByHash(hashBlock, &txBlockSnap, &txBlockErr) == BLOCK_INDEX_MANAGER_OK)
                 {
-                    CBlockIndex* pindex = (*mi).second;
-                    if (pindex->IsInMainChain())
-                        entry.push_back(Pair("confirmations", 1 + nBestHeight - pindex->nHeight));
+                    if (txBlockSnap.fInMainChain)
+                    {
+                        int nTipHeight = -1; std::string tipErr;
+                        if (GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) != BLOCK_INDEX_MANAGER_OK)
+                            throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Block count unavailable" : tipErr);
+                        entry.push_back(Pair("confirmations", 1 + nTipHeight - txBlockSnap.height));
+                    }
                     else
                         entry.push_back(Pair("confirmations", 0));
                 }
@@ -3194,7 +3216,9 @@ Value delegatestake(const Array& params, bool fHelp)
 
     {
         LOCK(cs_main);
-        if (!pindexBest || pindexBest->nHeight < FORK_HEIGHT_COLD_STAKING)
+        int nTipHeight = -1; std::string tipErr;
+        if (GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) != BLOCK_INDEX_MANAGER_OK ||
+            nTipHeight < FORK_HEIGHT_COLD_STAKING)
             throw JSONRPCError(RPC_MISC_ERROR, "Cold staking is not yet active on this chain");
     }
 
@@ -3326,9 +3350,13 @@ Value getcoldstakinginfo(const Array& params, bool fHelp)
             "Returns information about cold staking.\n");
 
     Object result;
-    result.push_back(Pair("enabled", (int)nBestHeight >= FORK_HEIGHT_COLD_STAKING));
+    // S2-g: fork gate and current height BY VALUE (no legacy nBestHeight read).
+    int nTipHeight = -1; std::string tipErr;
+    if (GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) != BLOCK_INDEX_MANAGER_OK)
+        throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Block count unavailable" : tipErr);
+    result.push_back(Pair("enabled", (int)nTipHeight >= FORK_HEIGHT_COLD_STAKING));
     result.push_back(Pair("fork_height", FORK_HEIGHT_COLD_STAKING));
-    result.push_back(Pair("current_height", (int)nBestHeight));
+    result.push_back(Pair("current_height", (int)nTipHeight));
 
     int64_t nColdStakingBalance = pwalletMain->GetColdStakingBalance();
     result.push_back(Pair("cold_staking_balance", ValueFromAmount(nColdStakingBalance)));
@@ -3428,8 +3456,11 @@ Value revokecoldstaking(const Array& params, bool fHelp)
 
     {
         LOCK(cs_main);
-        if (pindexBest)
-            txNew.nLockTime = pindexBest->nHeight;
+        // S2-g: lock time = authoritative tip height BY VALUE; unavailable authority
+        // leaves the default (previously the pindexBest==NULL case).
+        int nTipHeight = -1; std::string tipErr;
+        if (GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipErr) == BLOCK_INDEX_MANAGER_OK)
+            txNew.nLockTime = nTipHeight;
     }
 
     int64_t nFee = MIN_TX_FEE;
