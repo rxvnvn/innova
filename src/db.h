@@ -280,15 +280,20 @@ public:
         return 0;
     }
 
-    bool TxnBegin()
+    bool TxnBegin(int flags)
     {
         if (!pdb || activeTxn)
             return false;
-        DbTxn* ptxn = bitdb.TxnBegin();
+        DbTxn* ptxn = bitdb.TxnBegin(flags);
         if (!ptxn)
             return false;
         activeTxn = ptxn;
         return true;
+    }
+
+    bool TxnBegin()
+    {
+        return TxnBegin(DB_TXN_WRITE_NOSYNC);
     }
 
     bool TxnCommit()

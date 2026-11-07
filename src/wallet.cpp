@@ -946,6 +946,22 @@ void CWallet::WalletUpdateSpent(const CTransaction &tx, bool fBlock)
     // restored from backup or the user making copies of wallet.dat.
     {
         LOCK(cs_wallet);
+        // All flag changes of this call go through ONE read-write handle and ONE BDB
+        // transaction. The previous per-input WriteToDisk() opened its own database
+        // handle and took its own implicitly synced transaction -- measured at ~95 ms
+        // per input on an HDD-backed datadir, so a 318-input AddToWallet() blocked for
+        // ~30 s and a 573-input sendtoaddress for ~95 s. Same records, same order, one
+        // durable commit. A failed begin falls back to the previous per-record writes.
+        CWalletDB* pwalletdbSpent = fFileBacked ? new CWalletDB(strWalletFile, "r+") : NULL;
+        bool fSpentTxn = false;
+        if (pwalletdbSpent)
+        {
+            fSpentTxn = pwalletdbSpent->TxnBegin(DB_TXN_SYNC);
+            if (!fSpentTxn)
+                printf("WalletUpdateSpent: spent-mark transaction begin FAILED; "
+                       "falling back to per-record writes\n");
+        }
+
         BOOST_FOREACH(const CTxIn& txin, tx.vin)
         {
             std::map<uint256, CWalletTx>::iterator mi = mapWallet.find(txin.prevout.hash);
@@ -959,7 +975,10 @@ void CWallet::WalletUpdateSpent(const CTransaction &tx, bool fBlock)
                 {
                     printf("WalletUpdateSpent found spent coins\n");
                     wtx.MarkSpent(txin.prevout.n);
-                    wtx.WriteToDisk();
+                    if (pwalletdbSpent)
+                        pwalletdbSpent->WriteTx(wtx.GetHash(), wtx);
+                    else
+                        wtx.WriteToDisk();
                     NotifyTransactionChanged(this, txin.prevout.hash, CT_UPDATED);
 					vMintingWalletUpdated.push_back(txin.prevout.hash);
                     if (fHybridSPV)
@@ -974,22 +993,34 @@ void CWallet::WalletUpdateSpent(const CTransaction &tx, bool fBlock)
         {
             uint256 hash = tx.GetHash();
             map<uint256, CWalletTx>::iterator mi = mapWallet.find(hash);
-            if (mi == mapWallet.end())
-                return;
-            CWalletTx& wtx = (*mi).second;
-
-            BOOST_FOREACH(const CTxOut& txout, tx.vout)
+            if (mi != mapWallet.end())
             {
-                if (IsMine(txout))
+                CWalletTx& wtx = (*mi).second;
+
+                BOOST_FOREACH(const CTxOut& txout, tx.vout)
                 {
-                    wtx.MarkUnspent(&txout - &tx.vout[0]);
-                    wtx.WriteToDisk();
-                    NotifyTransactionChanged(this, hash, CT_UPDATED);
+                    if (IsMine(txout))
+                    {
+                        wtx.MarkUnspent(&txout - &tx.vout[0]);
+                        if (pwalletdbSpent)
+                            pwalletdbSpent->WriteTx(hash, wtx);
+                        else
+                            wtx.WriteToDisk();
+                        NotifyTransactionChanged(this, hash, CT_UPDATED);
 					vMintingWalletUpdated.push_back(hash);
+                    }
                 }
             }
         }
 
+        if (fSpentTxn)
+        {
+            if (!pwalletdbSpent->TxnCommit())
+                printf("WalletUpdateSpent: spent-mark transaction COMMIT FAILED; "
+                       "spent flags will be repaired against the spend authority\n");
+        }
+        if (pwalletdbSpent)
+            delete pwalletdbSpent;
     }
 }
 
@@ -4659,6 +4690,16 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
             // maybe makes sense; please don't do it anywhere else.
             CWalletDB* pwalletdb = fFileBacked ? new CWalletDB(strWalletFile,"r") : NULL;
 
+            // Spent-flag persistence for THIS transaction's inputs. "r" above is
+            // read-only (db.cpp: fReadOnly when the mode has no '+' or 'w'), so the
+            // per-input mark below used to open its own read-write CWalletDB through
+            // CWalletTx::WriteToDisk() -- one BDB open/close per input. With hundreds
+            // of mining-sized inputs that dominated the RPC: 323 inputs spent 95 s in
+            // CommitTransaction's persistence while coin selection and signing took
+            // ~1 s each. One read-write handle is opened here and reused for every
+            // input, which writes exactly the same records in the same order.
+            CWalletDB* pwalletdbSpent = fFileBacked ? new CWalletDB(strWalletFile,"r+") : NULL;
+
             // Take key pair from key pool so it won't be used again
             reservekey.KeepKey();
 
@@ -4668,6 +4709,20 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
 
             // Mark old coins as spent
             set<CWalletTx*> setCoins;
+            // One BDB transaction for the whole spent-marking burst: with activeTxn
+            // == NULL every put takes its own implicit transaction and syncs the log,
+            // which on this datadir costs ~100 ms per input (318 inputs = 33 s even
+            // with a shared handle). The marks of one transaction belong together, so
+            // a single commit is both faster and more coherent than N independent
+            // writes. A failed begin falls back to the previous per-record writes.
+            bool fSpentTxn = false;
+            if (pwalletdbSpent)
+            {
+                fSpentTxn = pwalletdbSpent->TxnBegin(DB_TXN_SYNC);
+                if (!fSpentTxn)
+                    printf("CommitTransaction: spent-mark transaction begin FAILED; "
+                           "falling back to per-record writes\n");
+            }
             BOOST_FOREACH(const CTxIn& txin, wtxNew.vin)
             {
                 std::map<uint256, CWalletTx>::iterator mi = mapWallet.find(txin.prevout.hash);
@@ -4675,11 +4730,22 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
                     continue;
                 CWalletTx &coin = mi->second;
                 coin.BindWallet(this);
+                // AddToWallet() above already ran WalletUpdateSpent() for this very
+                // transaction, which marks and persists every spent outpoint. Re-marking
+                // here wrote the same records a second time (one BDB sync per input), so
+                // only outpoints that are still unspent fall through to the write below.
+                if (coin.IsSpent(txin.prevout.n))
+                    continue;
                 coin.MarkSpent(txin.prevout.n);
-                coin.WriteToDisk();
+                if (pwalletdbSpent)
+                    pwalletdbSpent->WriteTx(coin.GetHash(), coin);
+                else
+                    coin.WriteToDisk();
                 NotifyTransactionChanged(this, coin.GetHash(), CT_UPDATED);
 				vMintingWalletUpdated.push_back(coin.GetHash());
             }
+
+            txlat::Mark("spent_loop", (int64_t)wtxNew.vin.size());
 
             for (std::vector<COutPoint>::iterator it = wtxNew.vReservedCoins.begin();
                  it != wtxNew.vReservedCoins.end(); ++it)
@@ -4688,8 +4754,24 @@ bool CWallet::CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
             }
             wtxNew.vReservedCoins.clear();
 
+            if (fSpentTxn)
+            {
+                if (!pwalletdbSpent->TxnCommit())
+                {
+                    // The transaction is already in the wallet; the spent flags will be
+                    // re-aligned against the Store3A authority by FixSpentCoins on the
+                    // next audit/repair, so this must not lose the created transaction.
+                    printf("CommitTransaction: spent-mark transaction COMMIT FAILED; "
+                           "spent flags will be repaired against the spend authority\n");
+                }
+                txlat::Mark("spent_commit");
+            }
+
             if (fFileBacked)
+            {
+                delete pwalletdbSpent;
                 delete pwalletdb;
+            }
         }
         txlat::Mark("persisted", (int64_t)wtxNew.vin.size());
 
