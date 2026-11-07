@@ -278,7 +278,13 @@ int64_t avgCount(std::vector<CCollateralNode> const& v, int nHeight);
 int GetCollateralnodeByVin(CTxIn& vin);
 int GetCollateralnodeRank(CCollateralNode& tmn, CBlockIndex* pindex, int minProtocol=CCollateralNode::minProtoVersion);
 int GetCollateralnodeByRank(int findRank, int64_t nBlockHeight=0, int minProtocol=CCollateralNode::minProtoVersion);
-bool GetCollateralnodeRanks(CBlockIndex* pindex=pindexBest);
+// Explicit block index argument ONLY: there is no implicit `pindexBest` default,
+// so every caller states which chain tip it ranks for (the miner passes the
+// authoritative by-value parent). The rank scan walks pprev up to
+// max(200, mnCount) * 3 blocks, so it needs a parent whose ancestor chain is
+// materialised to at least that depth (see the M10b blocker note in
+// ZERO-LEGACY-ACCOUNTING).
+bool GetCollateralnodeRanks(CBlockIndex* pindex);
 extern int64_t nAverageCNIncome;
 bool FindCNPayment(CScript& payee, CBlockIndex* pindex=pindexBest);
 

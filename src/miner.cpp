@@ -941,10 +941,12 @@ bool IsCPUMiningWorkCurrent(const CPUMiningWorkIdentity& identity, bool fCheckMe
 }
 
 // R2c.2/S6-repair: prepare a CPU mining attempt. Resolves a usable primary
-// parent for the built block: resident fast path (process-lifetime
-// mapBlockIndex object), else — in authoritative mode — a bounded
-// attempt-scoped materialization of the exact hashPrevBlock owned by the
-// caller's token (released when the attempt scope ends; no pointer escapes).
+// parent for the built block ALWAYS by value: a bounded attempt-scoped
+// materialization of the exact hashPrevBlock owned by the caller's token
+// (released when the attempt scope ends; no pointer escapes). There is no
+// resident mapBlockIndex fast path any more — under V2 that map is not
+// authoritative and is empty outside the retained window, so a hit there was
+// never evidence of the right parent.
 // Verifies the parent height against the work identity, sets the extra nonce,
 // and derives the target. Fail closed (returns false; the attempt is skipped;
 // no legacy fallback) when no usable parent exists.
@@ -959,16 +961,7 @@ static bool PrepareCPUMiningAttempt(CBlock* pblock,
     *outPrev = NULL;
     *outTarget = 0;
     LOCK(cs_main);
-    std::map<uint256, CBlockIndex*>::iterator miPrev = mapBlockIndex.find(pblock->hashPrevBlock);
-    if (miPrev != mapBlockIndex.end() && miPrev->second)
     {
-        *outPrev = miPrev->second;
-    }
-    else
-    {
-        // Nonresident primary parent: bounded authoritative materialization of
-        // the exact hashPrevBlock (same by-value walk policy as the accepted
-        // full-topology materializer). Fail closed if unavailable.
         std::string matError;
         *outPrev = attemptChain.Acquire(GetAuthoritativeLiveAuthority(),
                                         pblock->hashPrevBlock, &matError);
@@ -1155,7 +1148,18 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
             {
                 printf("CPUMiner[%u]: Found block at height %d, nonce=%u\n",
                        nWorkerId, workIdentity.nHeight, pblock->nNonce);
-                fAccepted = ProcessBlock(NULL, pblock.get()) && mapBlockIndex.count(hashBlock) != 0;
+                fAccepted = ProcessBlock(NULL, pblock.get());
+                if (fAccepted)
+                {
+                    // "the block is now known to the index" is proven BY VALUE.
+                    // The resident mapBlockIndex.count() check asked a question V2
+                    // never publishes an answer to (an accepted block is not added
+                    // to the sparse map), so it could reject a valid block.
+                    BlockIndexSnapshot accepted;
+                    std::string accErr;
+                    fAccepted = GetBlockIndexManager().LookupByHash(hashBlock, &accepted, &accErr)
+                                == BLOCK_INDEX_MANAGER_OK;
+                }
             }
         }
 
