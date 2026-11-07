@@ -13,6 +13,7 @@
 #include "collateralnode.h"
 #include "activecollateralnode.h"
 #include "db.h"
+#include "chainstate/observe_hook.h"   // s16::V2OutpointUnspent (Store3A spend authority)
 #include "base58.h"
 #include "net.h"
 #include <errno.h>
@@ -922,46 +923,35 @@ Value gettxout(const Array& params, bool fHelp)
       ret.push_back(Pair("confirmations", 0));
     else
     {
-      map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hashBlock);
-      if (mi != mapBlockIndex.end() && (*mi).second)
-      {
-        CBlockIndex* pindex = (*mi).second;
-        if (pindex->IsInMainChain())
-        {
-          bool isSpent=false;
-          CBlockIndex* p = pindex;
-          p=p->pnext;
-          for (; p; p = p->pnext)
-          {
-            CBlock block;
-            CBlockIndex* pblockindex = mapBlockIndex[p->GetBlockHash()];
-            block.ReadFromDisk(pblockindex, true);
-            for (const CTransaction& tx : block.vtx)
-            {
-              for (const CTxIn& txin : tx.vin)
-              {
-                if( hash == txin.prevout.hash &&
-                   (int64_t)txin.prevout.n )
-                {
-                  printf("spent at block %s\n", block.GetHash().GetHex().c_str());
-                  isSpent=true; break;
-                }
-              }
-
-              if(isSpent) break;
-            }
-
-            if(isSpent) break;
-          }
-
-          if(isSpent)
-            return Value::null;
-
-          ret.push_back(Pair("confirmations", tipSnapshot.height - pindex->nHeight + 1));
-        }
-        else
+      // S2-f3 (M11c): the confirming block and its main-chain membership are
+      // resolved BY VALUE, and the spent state comes from the V2 spend authority
+      // (Store3A coin presence) instead of the resident pnext walk. That walk never
+      // ran under V2 (pnext is not maintained, so spent coins answered as unspent)
+      // and additionally only matched output index != 0.
+      //
+      // A tx whose block was invalidated (reorg out of the active chain) must answer
+      // null, exactly as before: `block is not active` is a normal resolution
+      // outcome here, not an authority failure. Only a genuinely unavailable
+      // authority fails closed.
+      BlockIndexSnapshot txBlock;
+      std::string txBlockErr;
+      const AuthoritativeBlockResolutionResult rr =
+          ResolveAuthoritativeBlockSnapshotR(hashBlock, &txBlock, &txBlockErr);
+      if (rr == AUTHORITATIVE_BLOCK_NOT_ACTIVE)
           return Value::null;
-      }
+      if (rr != AUTHORITATIVE_BLOCK_FOUND || !txBlock.fInMainChain)
+          throw JSONRPCError(RPC_MISC_ERROR, txBlockErr.empty() ? "Block authority unavailable" : txBlockErr);
+
+      bool fUnspent = false;
+      const int v2Spend = s16::V2OutpointUnspent(hash, (uint32_t)n, &fUnspent);
+      if (v2Spend < 0)
+          throw JSONRPCError(RPC_MISC_ERROR, "Spent-state authority error");
+      if (v2Spend == 0)
+          throw JSONRPCError(RPC_MISC_ERROR, "Spent-state authority not armed");
+      if (!fUnspent)
+          return Value::null;   // spent on the active chain
+
+      ret.push_back(Pair("confirmations", tipSnapshot.height - txBlock.height + 1));
     }
 
     ret.push_back(Pair("value", ValueFromAmount(tx.vout[n].nValue)));
