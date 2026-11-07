@@ -21,7 +21,6 @@ namespace {
 static const int64_t HREG_COLLATERAL = 25000LL * COIN;
 static const unsigned char HREG_MAGIC_BYTES[] = {'I', 'N', 'C', 'N', 0x01, 0x01};
 static int g_nHRegActivationOverride = -1;
-static std::map<uint256, int> g_mapPrevTxHeightForTesting;
 
 enum PrevTxHeightResult
 {
@@ -34,28 +33,10 @@ enum PrevTxHeightResult
 PrevTxHeightResult GetPrevTxHeight(const uint256& hashTx, int& nHeightOut,
                                    std::string* error)
 {
-    if (!g_fAuthoritativeStartup)
-    {
-        std::map<uint256, int>::const_iterator it = g_mapPrevTxHeightForTesting.find(hashTx);
-        if (it != g_mapPrevTxHeightForTesting.end())
-        {
-            nHeightOut = it->second;
-            return PREV_TX_HEIGHT_FOUND;
-        }
-    }
-
     CTransaction tx;
     uint256 hashBlock;
     if (!GetTransaction(hashTx, tx, hashBlock))
         return PREV_TX_HEIGHT_NOT_FOUND;
-    if (!g_fAuthoritativeStartup)
-    {
-        if (!mapBlockIndex.count(hashBlock) || mapBlockIndex[hashBlock] == NULL)
-            return PREV_TX_HEIGHT_NOT_FOUND;
-        nHeightOut = mapBlockIndex[hashBlock]->nHeight;
-        return PREV_TX_HEIGHT_FOUND;
-    }
-
     if (hashBlock == uint256(0))
     {
         if (error) *error = "HREG authoritative previous transaction block unavailable";
@@ -206,16 +187,6 @@ void SetHRegActivationOverrideForTesting(int nHeight)
 void ClearHRegActivationOverrideForTesting()
 {
     g_nHRegActivationOverride = -1;
-}
-
-void SetHRegPrevTxHeightForTesting(const uint256& txid, int nHeight)
-{
-    g_mapPrevTxHeightForTesting[txid] = nHeight;
-}
-
-void ClearHRegPrevTxHeightsForTesting()
-{
-    g_mapPrevTxHeightForTesting.clear();
 }
 
 bool IsExactHRegMarkerScript(const CScript& scriptPubKey)
@@ -526,7 +497,6 @@ bool RegistryState::DisconnectTx(const CTransaction& tx,
 void ClearHRegStateForTesting()
 {
     g_registry.Clear();
-    ClearHRegPrevTxHeightsForTesting();
 }
 
 std::vector<RegisteredCollateralState> GetHRegStateSnapshotForTesting()

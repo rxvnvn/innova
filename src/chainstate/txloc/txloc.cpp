@@ -314,6 +314,13 @@ static bool mkdirs(const std::string& dir) {
 bool TxLocator::openDir(const std::string& dir, bool* absent, ChainError* e) {
     if (absent) *absent = false;
     close();
+    // The memtable is the in-RAM tail of THIS directory's index (its WAL replay
+    // target), never an independent authority: every entry in it was appended to
+    // that directory's WAL first. Opening a DIFFERENT directory must therefore start
+    // from an empty memtable -- otherwise keep-first add()/get() would keep serving
+    // the previous datadir's nFile/nBlockPos locs, so a txid present in both archives
+    // would resolve to the OLD blk*.dat and reads would land on the wrong bytes.
+    if (mem_ && dir_ != dir) mem_->clear();
     if (!mkdirs(dir)) { setErr(e, ERR_IO, "txloc: cannot create dir " + dir); return false; }
     dir_ = dir;
     mainPath_ = dir + "/txloc.dat"; walPath_ = dir + "/txloc.dat.wal"; tmpPath_ = dir + "/txloc.dat.tmp";

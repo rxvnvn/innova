@@ -377,8 +377,13 @@ const ColdHotSeamNavigator* GetBlockIndexStakingNavigator()
 void ClearBlockIndexStakingNavigator()
 {
     LOCK(cs_shadowState);
+    // DESTRUCTION ORDER MATTERS: the hot resolver is bound to the navigator's
+    // cold reader (a raw pointer into the navigator). Releasing the navigator
+    // first leaves the resolver referencing a destroyed reader, and any later
+    // lock/lookup through it hits a destroyed CCriticalSection
+    // ("recursive_mutex::lock(): Assertion !pthread_mutex_lock").
+    g_stakingAuthoritativeResolver.reset();   // drop the dependent FIRST
     g_stakingNavigator.reset();
-    g_stakingAuthoritativeResolver.reset();
 }
 
 BlockIndexV2ReaderCacheStats GetBlockIndexV2ShadowReaderCacheStats()

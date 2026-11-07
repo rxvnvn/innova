@@ -48,8 +48,6 @@ struct RegistrationParseResult {
 bool IsHRegRecognitionActive(int nHeight);
 void SetHRegActivationOverrideForTesting(int nHeight);
 void ClearHRegActivationOverrideForTesting();
-void SetHRegPrevTxHeightForTesting(const uint256& txid, int nHeight);
-void ClearHRegPrevTxHeightsForTesting();
 
 bool IsExactHRegMarkerScript(const CScript& scriptPubKey);
 bool IsStandardP2PKHScript(const CScript& scriptPubKey, CKeyID* pKeyIdOut = NULL);

@@ -93,6 +93,10 @@ static leveldb::Options MakeHashIndexOptions(bool create)
     options.create_if_missing = create;
     options.error_if_exists = false;
     options.paranoid_checks = true;
+    // LevelDB does NOT take ownership of a caller-supplied block_cache:
+    // db_impl keeps owns_cache_ = (options_.block_cache != raw_options.block_cache),
+    // i.e. only a cache it created itself is destroyed with the DB. This call site
+    // therefore keeps ownership and Close() deletes it exactly once.
     options.block_cache = leveldb::NewLRUCache(8 * 1048576);
     options.filter_policy = leveldb::NewBloomFilterPolicy(10);
     options.write_buffer_size = 8 * 1048576;
