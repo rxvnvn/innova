@@ -66,6 +66,7 @@ set(INNOVA_TEST_SOURCES
     "${CMAKE_SOURCE_DIR}/src/test/selectcoins_parity_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/selectcoins_rng_study_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/selectcoins_behavior_tests.cpp"
+    "${CMAKE_SOURCE_DIR}/src/test/cn_payout_scan_parity_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/coincontrol_lock_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/cold_hot_seam_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/cpu_mining_tests.cpp"
