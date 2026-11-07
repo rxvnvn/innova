@@ -8666,6 +8666,10 @@ struct ReorgTrailExitGuard
     ~ReorgTrailExitGuard() { if (!keep) g_reorgConnectSupply.clear(); }
 };
 
+// Defined next to the operator-invalidate helpers further down; the atomic reorg
+// settlement needs it here (see the wallet settlement at the end of ReorganizeAtomic).
+static void s16_OperatorResyncWallet(int32_t fromHeight, int32_t toHeight);
+
 static bool ReorganizeAtomic(CBlockIndex* pindexNew, bool* pfNavigationFailure,
                              bool* pfPostCommitFailure)
 {
@@ -9055,6 +9059,15 @@ static bool ReorganizeAtomic(CBlockIndex* pindexNew, bool* pfNavigationFailure,
             tx.AcceptToMemoryPool();
         printf("REORG-ATOMIC: A-phase recovered deterministically by reconcile after '%s'\n", aErr.c_str());
     }
+
+    // Wallet settlement, at the ONLY correct point: after the atomic V->C->A commit
+    // has fully succeeded (index tip, Store3A and TX-LOC all on the new branch).
+    // This path never drives ConnectBlock/DisconnectBlock, so without this the wallet
+    // keeps the pre-reorg view — spent flags from the disconnected blocks and no
+    // knowledge of the connected ones — and the balance disagrees with the already
+    // correct UTXO set until an unrelated block arrives or the node restarts.
+    s16_OperatorResyncWallet(walk.nForkHeight + 1,
+                             walk.nForkHeight + (int32_t)walk.vConnect.size());
 
     CollateralNReorgBlock = true;
     printf("REORG-ATOMIC: done\n");
