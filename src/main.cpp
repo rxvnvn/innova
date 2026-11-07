@@ -11164,6 +11164,21 @@ static bool s16_OperatorUnwindStoreTo(cs::store3a::CommitStore3A* store,
 {
     if (err) err->clear();
     if (!store || !store->opened()) { if (err) *err = "store not open"; return false; }
+    // S2.1 pre-undo contract (same as DisconnectBlock and ReorganizeAtomic): a
+    // pending multi-block batch is an in-memory overlay — reads see it, but
+    // tipHeight() and disconnect() only see the COMMITTED layer. Without this
+    // flush the loop below is a silent no-op (committed tip <= fork) while the
+    // overlay keeps the invalidated blocks applied, so every Store3A reader
+    // (wallet, collateral, gettxout) keeps answering from state the operator just
+    // invalidated, and the stale batch is only cleared by a shutdown commit plus
+    // the next startup reconcile.
+    if (!s16::g_chainObserve.pending.empty() && !s16::g_chainObserve.FlushPending())
+    {
+        s16::g_chainObserve.needsRecovery = true; ++s16::g_chainObserve.fails;
+        if (err) *err = "Store3A batch flush before operator unwind failed: " +
+                        s16::g_chainObserve.lastOpError;
+        return false;
+    }
     while (store->tipHeight() > targetHeight)
     {
         const int32_t cur = store->tipHeight();
