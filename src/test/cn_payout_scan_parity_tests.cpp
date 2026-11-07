@@ -157,4 +157,56 @@ BOOST_AUTO_TEST_CASE(m10c_mn684_gap_widens_with_mnCount)
     BOOST_REQUIRE(b.heights.back() < a.heights.back());
 }
 
+
+// The numbers above are only meaningful if they come from the SAME inputs the payout
+// path consumes. These cases drive the production global `mnCount` (collateralnode.h)
+// and the production scan-depth expression, so a change to either the window or the
+// fair-payment constants that breaks the 682/683/684 boundary fails here loudly.
+BOOST_AUTO_TEST_CASE(m10c_production_mncount_682_still_inside_the_window)
+{
+    const unsigned int saved = mnCount;
+    mnCount = 682;
+    const int scanBack = PayoutScanBack((int)mnCount);
+    mnCount = saved;
+    BOOST_REQUIRE_EQUAL(scanBack, 2046);
+    BOOST_REQUIRE(scanBack <= ResidentTailWindow());
+}
+
+BOOST_AUTO_TEST_CASE(m10c_production_mncount_683_crosses_the_window)
+{
+    const unsigned int saved = mnCount;
+    mnCount = 683;
+    const int scanBack = PayoutScanBack((int)mnCount);
+    mnCount = saved;
+    BOOST_REQUIRE_EQUAL(scanBack, 2049);
+    BOOST_REQUIRE(scanBack > ResidentTailWindow());
+    BOOST_REQUIRE_EQUAL(scanBack - ResidentTailWindow(), 1);
+}
+
+BOOST_AUTO_TEST_CASE(m10c_production_mncount_684_crosses_the_window)
+{
+    const unsigned int saved = mnCount;
+    mnCount = 684;
+    const int scanBack = PayoutScanBack((int)mnCount);
+    mnCount = saved;
+    BOOST_REQUIRE_EQUAL(scanBack, 2052);
+    BOOST_REQUIRE_EQUAL(scanBack - ResidentTailWindow(), 4);
+}
+
+// The boundary is a property of the CONFIGURED window, not of a hardcoded 2048: if
+// an operator raises -blockindexlivetail the crossing point moves with it, so the
+// payout rewrite must compare against the configured value at runtime.
+BOOST_AUTO_TEST_CASE(m10c_crossing_point_tracks_the_configured_window)
+{
+    const int window = ResidentTailWindow();
+    int firstCrossing = -1;
+    for (int mn = 1; mn <= 2000; ++mn)
+        if (PayoutScanBack(mn) > window) { firstCrossing = mn; break; }
+    BOOST_REQUIRE(firstCrossing > 0);
+    // scanBack <= window  <=>  3*max(200, mn) <= window  <=>  mn <= floor(window/3) (for mn>=200)
+    const int expected = (window / 3 < 200) ? 199 : (window / 3);
+    BOOST_REQUIRE_EQUAL(firstCrossing, expected + 1);
+    BOOST_REQUIRE_EQUAL(PayoutScanBack(firstCrossing - 1) <= window, true);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
