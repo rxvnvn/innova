@@ -129,9 +129,7 @@ static int RpcTipHeightOrThrow()
     int h = -1; uint256 hash; std::string e;
     if (RpcAuthoritativeTipScalars(&h, &hash, &e))
         return h;
-    if (g_fAuthoritativeStartup)
-        throw JSONRPCError(RPC_MISC_ERROR, e.empty() ? "Active tip unavailable" : e);
-    return nBestHeight;   // non-authoritative in-process harness only
+    throw JSONRPCError(RPC_MISC_ERROR, e.empty() ? "Active tip unavailable" : e);
 }
 
 double GetPoWMHashPS()
@@ -145,18 +143,15 @@ double GetPoWMHashPS()
     int nPoWBlocksFound = 0;
 
     // S2-a: walk the active chain BY VALUE through the authority. A by-value
-    // failure in authoritative mode is fail-closed; the legacy pprev walk is
-    // retained only for the non-authoritative in-process harness.
+    // failure is fail-closed; there is no legacy pprev walk any more.
     int nTipHeight = -1; uint256 tipHash; std::string tipErr;
-    const bool fByValue = RpcAuthoritativeTipScalars(&nTipHeight, &tipHash, &tipErr);
-    if (!fByValue && g_fAuthoritativeStartup)
+    if (!RpcAuthoritativeTipScalars(&nTipHeight, &tipHash, &tipErr))
         throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Active tip unavailable" : tipErr);
 
     bool havePrevWork = false;
     int64_t nPrevWorkTime = 0;
     double dBaseDifficulty = 1.0;
 
-    if (fByValue)
     {
         BlockIndexSnapshot powTip;
         std::string perr;
@@ -186,31 +181,6 @@ double GetPoWMHashPS()
             nBlocksChecked++;
         }
     }
-    else
-    {
-        CBlockIndex* pindex = pindexBest;
-        CBlockIndex* pindexPrevWork = NULL;
-        while (pindex && nBlocksChecked < nPoWBlocksToCheck && nPoWBlocksFound < nPoWInterval)
-        {
-            if (pindex->IsProofOfWork())
-            {
-                if (pindexPrevWork)
-                {
-                    int64_t nActualSpacingWork = pindexPrevWork->GetBlockTime() - pindex->GetBlockTime();
-                    if (nActualSpacingWork > 0)
-                    {
-                        nTargetSpacingWork = ((nPoWInterval - 1) * nTargetSpacingWork + nActualSpacingWork + nActualSpacingWork) / (nPoWInterval + 1);
-                        nTargetSpacingWork = max(nTargetSpacingWork, nTargetSpacingWorkMin);
-                    }
-                }
-                pindexPrevWork = pindex;
-                nPoWBlocksFound++;
-            }
-            pindex = pindex->pprev;
-            nBlocksChecked++;
-        }
-        dBaseDifficulty = GetDifficulty();
-    }
 
     double dResult = dBaseDifficulty * 4294.967296 / nTargetSpacingWork;
     if (fRPCPerfTrace)
@@ -229,16 +199,14 @@ double GetPoSKernelPS()
     int nStakesHandled = 0, nStakesTime = 0;
     int nBlocksExamined = 0;
 
-    // S2-a: by-value walk (authority), fail-closed in authoritative mode.
+    // S2-a: by-value walk (authority); a by-value failure is fail-closed.
     int nTipHeight = -1; uint256 tipHash; std::string tipErr;
-    const bool fByValue = RpcAuthoritativeTipScalars(&nTipHeight, &tipHash, &tipErr);
-    if (!fByValue && g_fAuthoritativeStartup)
+    if (!RpcAuthoritativeTipScalars(&nTipHeight, &tipHash, &tipErr))
         throw JSONRPCError(RPC_MISC_ERROR, tipErr.empty() ? "Active tip unavailable" : tipErr);
 
     bool havePrevStake = false;
     int64_t nPrevStakeTime = 0;
 
-    if (fByValue)
     {
         for (int h = nTipHeight; h >= 0 && nStakesHandled < nPoSInterval; --h)
         {
@@ -254,23 +222,6 @@ double GetPoSKernelPS()
                 nPrevStakeTime = (int64_t)snap.nTime;
                 nStakesHandled++;
             }
-            nBlocksExamined++;
-        }
-    }
-    else
-    {
-        CBlockIndex* pindex = pindexBest;
-        CBlockIndex* pindexPrevStake = NULL;
-        while (pindex && nStakesHandled < nPoSInterval)
-        {
-            if (pindex->IsProofOfStake())
-            {
-                dStakeKernelsTriedAvg += GetDifficulty(pindex) * 4294967296.0;
-                nStakesTime += pindexPrevStake ? (pindexPrevStake->nTime - pindex->nTime) : 0;
-                pindexPrevStake = pindex;
-                nStakesHandled++;
-            }
-            pindex = pindex->pprev;
             nBlocksExamined++;
         }
     }
@@ -491,20 +442,11 @@ Value dumpbootstrap(const Array& params, bool fHelp)
         for (int nHeight = 0; nHeight <= nBlocks; nHeight++)
         {
             CBlock block;
-            if (g_fAuthoritativeStartup)
-            {
-                BlockIndexSnapshot snapshot;
-                std::string error;
-                if (!AuthoritativeGetActiveSnapshotByHeight(nHeight, &snapshot) ||
-                    !block.ReadFromDisk(snapshot.nFile, snapshot.nBlockPos, true))
-                    throw JSONRPCError(RPC_MISC_ERROR, "Authoritative bootstrap block unavailable");
-            }
-            else
-            {
-                CBlockIndex* pblockindex = FindBlockByHeight(nHeight);
-                if (!block.ReadFromDisk(pblockindex, true))
-                    throw JSONRPCError(RPC_MISC_ERROR, "Bootstrap block unavailable");
-            }
+            BlockIndexSnapshot snapshot;
+            std::string error;
+            if (!AuthoritativeGetActiveSnapshotByHeight(nHeight, &snapshot) ||
+                !block.ReadFromDisk(snapshot.nFile, snapshot.nBlockPos, true))
+                throw JSONRPCError(RPC_MISC_ERROR, "Authoritative bootstrap block unavailable");
             fileout << FLATDATA(pchMessageStart) << fileout.GetSerializeSize(block) << block;
         }
     } catch(const boost::filesystem::filesystem_error &e) {
@@ -598,16 +540,11 @@ Value getbestblockhash(const Array& params, bool fHelp)
             "getbestblockhash\n"
             "Returns the hash of the best block in the longest block chain.");
 
-    if (g_fAuthoritativeStartup)
-    {
-        uint256 tip;
-        std::string error;
-        if (GetBlockIndexManager().BestTipHash(&tip, &error) == BLOCK_INDEX_MANAGER_OK)
-            return tip.GetHex();
-        throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "Best block unavailable" : error);
-    }
-
-    return hashBestChain.GetHex();
+    uint256 tip;
+    std::string error;
+    if (GetBlockIndexManager().BestTipHash(&tip, &error) == BLOCK_INDEX_MANAGER_OK)
+        return tip.GetHex();
+    throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "Best block unavailable" : error);
 }
 
 Value getblockcount(const Array& params, bool fHelp)
@@ -617,16 +554,11 @@ Value getblockcount(const Array& params, bool fHelp)
             "getblockcount\n"
             "Returns the number of blocks in the longest block chain.");
 
-    if (g_fAuthoritativeStartup)
-    {
-        int tipHeight = -1;
-        std::string error;
-        if (GetBlockIndexManager().ActiveTipHeight(&tipHeight, &error) == BLOCK_INDEX_MANAGER_OK)
-            return tipHeight;
-        throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "Block count unavailable" : error);
-    }
-
-    return nBestHeight;
+    int tipHeight = -1;
+    std::string error;
+    if (GetBlockIndexManager().ActiveTipHeight(&tipHeight, &error) == BLOCK_INDEX_MANAGER_OK)
+        return tipHeight;
+    throw JSONRPCError(RPC_MISC_ERROR, error.empty() ? "Block count unavailable" : error);
 }
 
 
@@ -641,11 +573,8 @@ Value getdifficulty(const Array& params, bool fHelp)
     if (!ManagerDifficultyPair(&dPoW, &dPoS))
     {
         // S2-a: authoritative RPC reads are by value; a by-value failure is
-        // fail-closed. The pindexBest path is for the non-authoritative harness.
-        if (g_fAuthoritativeStartup)
-            throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
-        dPoW = GetDifficulty();
-        dPoS = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+        // fail-closed. There is no pindexBest/GetDifficulty() fallback.
+        throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
     }
     Object obj;
     obj.push_back(Pair("proof-of-work",        dPoW));
@@ -767,50 +696,18 @@ Value getblock(const Array& params, bool fHelp)
             verbosity = params[1].get_bool() ? 1 : 0;
     }
 
-    if (g_fAuthoritativeStartup)
-    {
-        BlockIndexSnapshot snapshot;
-        CBlock block;
-        std::string error;
-        if (!ReadAuthoritativeBlockByHash(hash, &snapshot, &block, &error))
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error.empty() ? "Block not found" : error);
-        if (verbosity <= 0)
-        {
-            CDataStream ssBlock(SER_NETWORK, PROTOCOL_VERSION);
-            ssBlock << block;
-            return HexStr(ssBlock.begin(), ssBlock.end());
-        }
-        return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
-    }
-
-    if (mapBlockIndex.count(hash) == 0)
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
-
+    BlockIndexSnapshot snapshot;
     CBlock block;
-    CBlockIndex* pblockindex = mapBlockIndex[hash];
-
-	if(!block.ReadFromDisk(pblockindex, true)){
-        // Block not found on disk. This could be because we have the block
-        // header in our index but don't have the block (for example if a
-        // non-whitelisted node sends us an unrequested long chain of valid
-        // blocks, we add the headers to our index, but don't accept the
-        // block).
-		throw JSONRPCError(RPC_MISC_ERROR, "Block not found on disk");
-	}
-
-	block.ReadFromDisk(pblockindex, true);
-
+    std::string error;
+    if (!ReadAuthoritativeBlockByHash(hash, &snapshot, &block, &error))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error.empty() ? "Block not found" : error);
     if (verbosity <= 0)
     {
         CDataStream ssBlock(SER_NETWORK, PROTOCOL_VERSION);
         ssBlock << block;
-        std::string strHex = HexStr(ssBlock.begin(), ssBlock.end());
-		//strHex.insert(0, "testar ");
-        return strHex;
+        return HexStr(ssBlock.begin(), ssBlock.end());
     }
-
-    //return blockToJSON(block, pblockindex, verbosity >= 2);
-	return blockToJSON(block, pblockindex, params.size() > 1 ? params[1].get_bool() : false);
+    return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
 }
 
 Value getblockheader(const Array& params, bool fHelp)
@@ -844,48 +741,19 @@ Value getblockheader(const Array& params, bool fHelp)
     if (params.size() > 1)
         fVerbose = params[1].get_bool();
 
-    if (g_fAuthoritativeStartup)
-    {
-        LOCK(cs_main);
-        BlockIndexSnapshot snapshot;
-        CBlock block;
-        std::string error;
-        if (!ReadAuthoritativeBlockByHash(hash, &snapshot, &block, &error))
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error.empty() ? "Block not found" : error);
-        if (!fVerbose)
-        {
-            CDataStream ssBlock(SER_NETWORK, PROTOCOL_VERSION);
-            ssBlock << block;
-            return HexStr(ssBlock.begin(), ssBlock.end());
-        }
-        return AuthoritativeBlockHeaderToJSON(block, snapshot);
-    }
-
-    if (mapBlockIndex.count(hash) == 0)
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
-
+    LOCK(cs_main);
+    BlockIndexSnapshot snapshot;
     CBlock block;
-    CBlockIndex* pblockindex = mapBlockIndex[hash];
-
-	if(!block.ReadFromDisk(pblockindex, true)){
-        // Block not found on disk. This could be because we have the block
-        // header in our index but don't have the block (for example if a
-        // non-whitelisted node sends us an unrequested long chain of valid
-        // blocks, we add the headers to our index, but don't accept the
-        // block).
-		throw JSONRPCError(RPC_MISC_ERROR, "Block not found on disk");
-	}
-
-	block.ReadFromDisk(pblockindex, true);
-
-    if (!fVerbose) {
+    std::string error;
+    if (!ReadAuthoritativeBlockByHash(hash, &snapshot, &block, &error))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error.empty() ? "Block not found" : error);
+    if (!fVerbose)
+    {
         CDataStream ssBlock(SER_NETWORK, PROTOCOL_VERSION);
         ssBlock << block;
-        std::string strHex = HexStr(ssBlock.begin(), ssBlock.end());
-        return strHex;
+        return HexStr(ssBlock.begin(), ssBlock.end());
     }
-
-    return blockHeader2ToJSON(block, pblockindex);
+    return AuthoritativeBlockHeaderToJSON(block, snapshot);
 }
 
 //Old getblock RPC Command, Not deprecated
@@ -900,25 +768,13 @@ Value getblock_old(const Array& params, bool fHelp)
     std::string strHash = params[0].get_str();
     uint256 hash(strHash);
 
-    if (g_fAuthoritativeStartup)
-    {
-        LOCK(cs_main);
-        BlockIndexSnapshot snapshot;
-        CBlock block;
-        std::string error;
-        if (!ReadAuthoritativeBlockByHash(hash, &snapshot, &block, &error))
-            throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error.empty() ? "Block not found" : error);
-        return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
-    }
-
-    if (mapBlockIndex.count(hash) == 0)
-        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Block not found");
-
+    LOCK(cs_main);
+    BlockIndexSnapshot snapshot;
     CBlock block;
-    CBlockIndex* pblockindex = mapBlockIndex[hash];
-    block.ReadFromDisk(pblockindex, true);
-
-    return blockToJSON(block, pblockindex, params.size() > 1 ? params[1].get_bool() : false);
+    std::string error;
+    if (!ReadAuthoritativeBlockByHash(hash, &snapshot, &block, &error))
+        throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, error.empty() ? "Block not found" : error);
+    return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
 }
 
 Value getblockbynumber(const Array& params, bool fHelp)
@@ -933,29 +789,14 @@ Value getblockbynumber(const Array& params, bool fHelp)
     if (nHeight < 0 || nHeight > RpcTipHeightOrThrow())
         throw runtime_error("Block number out of range.");
 
-    if (g_fAuthoritativeStartup)
-    {
-        LOCK(cs_main);
-        BlockIndexSnapshot snapshot;
-        CBlock block;
-        std::string error;
-        if (GetBlockIndexManager().GetActiveByHeight(nHeight, &snapshot, &error) != BLOCK_INDEX_MANAGER_OK ||
-            !block.ReadFromDisk(snapshot.nFile, snapshot.nBlockPos, true))
-            throw JSONRPCError(RPC_MISC_ERROR, "Authoritative block bytes unavailable");
-        return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
-    }
-
+    LOCK(cs_main);
+    BlockIndexSnapshot snapshot;
     CBlock block;
-    CBlockIndex* pblockindex = mapBlockIndex[hashBestChain];
-    while (pblockindex->nHeight > nHeight)
-        pblockindex = pblockindex->pprev;
-
-    uint256 hash = *pblockindex->phashBlock;
-
-    pblockindex = mapBlockIndex[hash];
-    block.ReadFromDisk(pblockindex, true);
-
-    return blockToJSON(block, pblockindex, params.size() > 1 ? params[1].get_bool() : false);
+    std::string error;
+    if (GetBlockIndexManager().GetActiveByHeight(nHeight, &snapshot, &error) != BLOCK_INDEX_MANAGER_OK ||
+        !block.ReadFromDisk(snapshot.nFile, snapshot.nBlockPos, true))
+        throw JSONRPCError(RPC_MISC_ERROR, "Authoritative block bytes unavailable");
+    return AuthoritativeBlockToJSON(block, snapshot, params.size() > 1 ? params[1].get_bool() : false);
 }
 
 Value setbestblockbyheight(const Array& params, bool fHelp)
@@ -1062,7 +903,6 @@ Value getcheckpoint(const Array& params, bool fHelp)
     Object result;
 
     result.push_back(Pair("synccheckpoint", Checkpoints::hashSyncCheckpoint.ToString().c_str()));
-    if (g_fAuthoritativeStartup)
     {
         BlockIndexSnapshot snapshot;
         std::string error;
@@ -1070,13 +910,6 @@ Value getcheckpoint(const Array& params, bool fHelp)
             throw JSONRPCError(RPC_INVALID_ADDRESS_OR_KEY, "Authoritative synchronized checkpoint is unknown or non-active");
         result.push_back(Pair("height", snapshot.height));
         result.push_back(Pair("timestamp", DateTimeStrFormat(snapshot.nTime).c_str()));
-    }
-    else
-    {
-        CBlockIndex* pindexCheckpoint;
-        pindexCheckpoint = mapBlockIndex[Checkpoints::hashSyncCheckpoint];
-        result.push_back(Pair("height", pindexCheckpoint->nHeight));
-        result.push_back(Pair("timestamp", DateTimeStrFormat(pindexCheckpoint->GetBlockTime()).c_str()));
     }
 
     // Check that the block satisfies synchronized checkpoint
@@ -1132,8 +965,7 @@ Value gettxout(const Array& params, bool fHelp)
     // from the authoritative block-index manager. On the authoritative path a
     // failure fails closed; the historical pindexBest object is never dereferenced.
     BlockIndexSnapshot tipSnapshot; std::string tipError;
-    const bool fTipByValue = BestTipSnapshotByValue(&tipSnapshot, &tipError);
-    if (!fTipByValue && g_fAuthoritativeStartup)
+    if (!BestTipSnapshotByValue(&tipSnapshot, &tipError))
         throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Best block unavailable" : tipError);
 
     Object ret;
@@ -1153,7 +985,7 @@ Value gettxout(const Array& params, bool fHelp)
     if (n<0 || (unsigned int)n>=tx.vout.size() || tx.vout[n].IsNull())
       return Value::null;
 
-    ret.push_back(Pair("bestblock", (fTipByValue ? tipSnapshot.hash : pindexBest->GetBlockHash()).GetHex()));
+    ret.push_back(Pair("bestblock", tipSnapshot.hash.GetHex()));
     if (hashBlock == 0)
       ret.push_back(Pair("confirmations", 0));
     else
@@ -1193,7 +1025,7 @@ Value gettxout(const Array& params, bool fHelp)
           if(isSpent)
             return Value::null;
 
-          ret.push_back(Pair("confirmations", (fTipByValue ? tipSnapshot.height : pindexBest->nHeight) - pindex->nHeight + 1));
+          ret.push_back(Pair("confirmations", tipSnapshot.height - pindex->nHeight + 1));
         }
         else
           return Value::null;
@@ -1369,13 +1201,8 @@ Value getblockchaininfo(const Array& params, bool fHelp)
             haveValue = true;
             recordedSupply = tipSnapshot.nMoneySupply;
         }
-        else if (g_fAuthoritativeStartup)
+        else
             throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Money supply unavailable" : tipError);
-        else if (pindexBest != NULL)
-        {
-            haveValue = true;
-            recordedSupply = pindexBest->nMoneySupply;
-        }
         AppendMoneySupplyFields(obj, recordedSupply, haveValue);
     }
     //obj.push_back(Pair("size_on_disk",   CalculateCurrentUsage()));
@@ -1487,14 +1314,8 @@ Value getstakemodifiercheckpoints(const Array& params, bool fHelp)
         BlockIndexSnapshot tipSnapshot; std::string tipError;
         if (BestTipSnapshotByValue(&tipSnapshot, &tipError))
             nBestTipHeight = tipSnapshot.height;
-        else if (g_fAuthoritativeStartup)
-            throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Block index not available" : tipError);
         else
-        {
-            if (!pindexBest)
-                throw runtime_error("Block index not available");
-            nBestTipHeight = pindexBest->nHeight;
-        }
+            throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Block index not available" : tipError);
     }
 
     Object result;

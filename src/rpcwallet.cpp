@@ -142,7 +142,6 @@ void WalletTxToJSON(const CWalletTx& wtx, Object& entry)
         entry.push_back(Pair("blockhash", wtx.hashBlock.GetHex()));
         entry.push_back(Pair("blockindex", wtx.nIndex));
         int64_t nTime = 0;
-        if (g_fAuthoritativeStartup)
         {
             BlockIndexSnapshot snapshot;
             std::string error;
@@ -151,8 +150,6 @@ void WalletTxToJSON(const CWalletTx& wtx, Object& entry)
             else
                 nTime = -1; // authority failure: never consult historical mapBlockIndex
         }
-        else
-            nTime = mapBlockIndex[wtx.hashBlock]->nTime;
 
         if (nTime >= 0)
             entry.push_back(Pair("blocktime", nTime));
@@ -643,10 +640,8 @@ Value getinfo(const Array& params, bool fHelp)
         int nTipHeight = -1; std::string tipHeightErr;
         if (GetBlockIndexManager().ActiveTipHeight(&nTipHeight, &tipHeightErr) == BLOCK_INDEX_MANAGER_OK)
             obj.push_back(Pair("blocks", nTipHeight));
-        else if (g_fAuthoritativeStartup)
-            throw JSONRPCError(RPC_MISC_ERROR, tipHeightErr.empty() ? "Block count unavailable" : tipHeightErr);
         else
-            obj.push_back(Pair("blocks", (int)nBestHeight));
+            throw JSONRPCError(RPC_MISC_ERROR, tipHeightErr.empty() ? "Block count unavailable" : tipHeightErr);
     }
     obj.push_back(Pair("timeoffset",    (int64_t)GetTimeOffset()));
     // R1 slice-1: best-tip money supply read BY VALUE from the authoritative
@@ -661,13 +656,8 @@ Value getinfo(const Array& params, bool fHelp)
             haveValue = true;
             recordedSupply = tipSnapshot.nMoneySupply;
         }
-        else if (g_fAuthoritativeStartup)
+        else
             throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Money supply unavailable" : tipError);
-        else if (pindexBest != NULL)
-        {
-            haveValue = true;
-            recordedSupply = pindexBest->nMoneySupply;
-        }
         AppendMoneySupplyFields(obj, recordedSupply, haveValue);
     }
     obj.push_back(Pair("connections",   nConnections));
@@ -683,11 +673,8 @@ Value getinfo(const Array& params, bool fHelp)
     double dPoWsi, dPoSsi;
     if (!ManagerDifficultyPair(&dPoWsi, &dPoSsi))
     {
-        // S2-a: by-value first, fail-closed in authoritative mode.
-        if (g_fAuthoritativeStartup)
-            throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
-        dPoWsi = GetDifficulty();
-        dPoSsi = GetDifficulty(GetLastBlockIndex(pindexBest, true));
+        // S2-a: by value only; a by-value failure is fail-closed.
+        throw JSONRPCError(RPC_MISC_ERROR, "Difficulty unavailable from the authoritative block index");
     }
     diff.push_back(Pair("proof-of-work", dPoWsi));
     diff.push_back(Pair("proof-of-stake", dPoSsi));
@@ -751,12 +738,10 @@ Value getinfo(const Array& params, bool fHelp)
     if (fExtended)
     {
         // S2-a: the IBD metrics height is the authoritative tip height, by value.
-        int nMetricsHeight = (int)nBestHeight;
+        int nMetricsHeight;
         {
-            int nByValue = -1; std::string e;
-            if (GetBlockIndexManager().ActiveTipHeight(&nByValue, &e) == BLOCK_INDEX_MANAGER_OK)
-                nMetricsHeight = nByValue;
-            else if (g_fAuthoritativeStartup)
+            std::string e;
+            if (GetBlockIndexManager().ActiveTipHeight(&nMetricsHeight, &e) != BLOCK_INDEX_MANAGER_OK)
                 throw JSONRPCError(RPC_MISC_ERROR, e.empty() ? "Block count unavailable" : e);
         }
         obj.push_back(Pair("ibdmetrics", BuildIBDMetricsJson(nMetricsHeight)));
