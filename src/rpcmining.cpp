@@ -136,6 +136,9 @@ Value getmininginfo(const Array& params, bool fHelp)
     obj.push_back(Pair("cpumining",     cpuMining.running));
     obj.push_back(Pair("cputhreads",    cpuMining.activeThreads));
     obj.push_back(Pair("requestedcputhreads", cpuMining.requestedThreads));
+    // Additive: the same CPU-capacity figure the `gen` RPC reports, so a caller
+    // can see why a requested thread count may have been clamped.
+    obj.push_back(Pair("availablecputhreads", AvailableLogicalCPUs()));
     // Stage 1 additive observability: truthful hashing/pause state. Existing
     // pairs above keep their exact semantics.
     obj.push_back(Pair("cpuhashing",    cpuMining.hashing));
@@ -205,15 +208,120 @@ Value getstakinginfo(const Array& params, bool fHelp)
     return obj;
 }
 
+// Shared JSON projection for the CPU-mining control RPCs. `mining`/`threads`
+// keep the historic setgenerate field names; the requested/effective/available
+// triple is what `gen` reports and what getmininginfo exposes as
+// requestedcputhreads/cputhreads/availablecputhreads.
+static Object CPUMiningResultToJSON(const CPUMiningApplyResult& r)
+{
+    Object result;
+    result.push_back(Pair("mining_enabled", r.mining));
+    result.push_back(Pair("mining", r.mining));
+    result.push_back(Pair("threads", r.effectiveThreads));
+    result.push_back(Pair("requested_threads", r.requestedThreads));
+    result.push_back(Pair("effective_threads", r.effectiveThreads));
+    result.push_back(Pair("available_logical_cpus", r.availableCPUs));
+    if (!r.warning.empty())
+        result.push_back(Pair("warning", r.warning));
+    int nHeight;
+    {
+        LOCK(cs_main);
+        nHeight = nBestHeight;
+    }
+    result.push_back(Pair("height", nHeight));
+    return result;
+}
+
+Value gen(const Array& params, bool fHelp)
+{
+    if (fHelp)
+        throw runtime_error(
+            "gen [generate] [threads]\n"
+            "Control or inspect Tribus CPU mining. This is the primary entry point;\n"
+            "setgenerate is kept as a compatible alias of the same mechanism.\n"
+            "\n"
+            "gen                     Report state: mining_enabled, requested_threads,\n"
+            "                        effective_threads, available_logical_cpus, hashing,\n"
+            "                        pause_reason. Changes nothing.\n"
+            "gen true [threads]      Enable mining with `threads` workers (default: the\n"
+            "                        current request while mining, otherwise 1). -1 means\n"
+            "                        all available CPUs. The effective count is always\n"
+            "                        clamped to the available logical CPUs (affinity /\n"
+            "                        cpuset / cgroup quota) and to the controller maximum;\n"
+            "                        a `warning` field reports any clamping.\n"
+            "gen false               Stop mining and join the workers.\n"
+            "\n"
+            "A runtime change does not rewrite innova.conf: the file is re-applied at\n"
+            "the next start (gen=N). Repeating the same command is idempotent and never\n"
+            "creates a second worker pool.");
+
+    if (params.empty())
+    {
+        const CCPUMinerController::Status st = GetCPUMinerController().GetStatus();
+        bool fFallback = false;
+        const int nAvailable = AvailableLogicalCPUs(&fFallback);
+        Object obj;
+        obj.push_back(Pair("mining_enabled", st.running));
+        obj.push_back(Pair("requested_threads", st.requestedThreads));
+        obj.push_back(Pair("effective_threads", st.activeThreads));
+        obj.push_back(Pair("available_logical_cpus", nAvailable));
+        obj.push_back(Pair("hashing", st.hashing));
+        obj.push_back(Pair("hashing_workers", st.hashingWorkers));
+        obj.push_back(Pair("pause_reason",
+                            CCPUMinerController::PauseReasonString(st.pauseReason)));
+        if (fFallback)
+            obj.push_back(Pair("cpu_detection_fallback", true));
+        return obj;
+    }
+
+    if (params.size() > 2)
+        throw JSONRPCError(RPC_INVALID_PARAMETER, "gen takes at most two parameters: <generate> [threads]");
+
+    const bool fEnable = params[0].get_bool();
+    if (!fEnable)
+    {
+        if (params.size() != 1)
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "threads must not be specified when stopping CPU mining");
+        const CPUMiningApplyResult r = ApplyCPUMiningRequest(pwalletMain, false, 0);
+        if (!r.ok)
+            throw JSONRPCError(RPC_INTERNAL_ERROR, r.error);
+        return CPUMiningResultToJSON(r);
+    }
+
+    int nThreads = 0;
+    if (params.size() > 1)
+    {
+        nThreads = params[1].get_int();
+        if (nThreads == 0 || nThreads < -1)
+            throw JSONRPCError(RPC_INVALID_PARAMETER,
+                               "threads must be -1 or a positive integer");
+    }
+    else
+    {
+        const CCPUMinerController::Status st = GetCPUMinerController().GetStatus();
+        nThreads = (st.running && st.requestedThreads > 0) ? st.requestedThreads : 1;
+    }
+
+    const CPUMiningApplyResult r = ApplyCPUMiningRequest(pwalletMain, true, nThreads);
+    if (!r.ok)
+        throw JSONRPCError(RPC_INTERNAL_ERROR, r.error);
+    if (!r.warning.empty())
+        printf("CPUMINING gen: %s\n", r.warning.c_str());
+    return CPUMiningResultToJSON(r);
+}
+
 Value setgenerate(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() < 1 || params.size() > 2)
         throw runtime_error(
             "setgenerate <generate> [threads]\n"
-            "Start or stop background Tribus CPU mining.\n"
+            "Compatibility alias of `gen`: starts or stops background Tribus CPU\n"
+            "mining through the SAME controller and the SAME thread-capacity rule.\n"
             "<generate> true to start mining, false to stop.\n"
-            "[threads] number of workers (default: 1, -1 = logical CPU count, max: 16).\n"
-            "Zero, values below -1, and values above 16 are invalid.\n"
+            "[threads] number of workers (default: 1, -1 = all available CPUs).\n"
+            "The effective count is clamped to the available logical CPUs\n"
+            "(affinity / cpuset / cgroup quota) and to the controller maximum.\n"
             "CPU mining can heavily load and heat the processor. It does not guarantee a block.\n"
             "When current Collateral Node payment rules apply, 65% of the PoW reward goes\n"
             "to the Collateral Node and the miner receives 35%.");
@@ -225,23 +333,15 @@ Value setgenerate(const Array& params, bool fHelp)
         if (params.size() != 1)
             throw JSONRPCError(RPC_INVALID_PARAMETER,
                                "threads must not be specified when stopping CPU mining");
-        GetCPUMinerController().Stop();
-        Object result;
-        result.push_back(Pair("mining", false));
-        result.push_back(Pair("threads", 0));
-        return result;
+        const CPUMiningApplyResult r = ApplyCPUMiningRequest(pwalletMain, false, 0);
+        if (!r.ok)
+            throw JSONRPCError(RPC_INTERNAL_ERROR, r.error);
+        return CPUMiningResultToJSON(r);
     }
 
     int nThreads = 1;
     if (params.size() > 1)
         nThreads = params[1].get_int();
-
-    if (nThreads == -1)
-    {
-        // Shared with the -gen/-genproclimit startup path (miner.h): one rule,
-        // no drift between the RPC and the config entry point.
-        nThreads = ResolveCPUMiningThreads(-1, std::thread::hardware_concurrency());
-    }
 
     if (nThreads == 0)
         throw JSONRPCError(RPC_INVALID_PARAMETER,
@@ -249,27 +349,13 @@ Value setgenerate(const Array& params, bool fHelp)
     if (nThreads < -1)
         throw JSONRPCError(RPC_INVALID_PARAMETER,
                            "threads must be -1 or a positive integer");
-    if (nThreads > CCPUMinerController::MAX_THREADS)
-        throw JSONRPCError(RPC_INVALID_PARAMETER,
-                           strprintf("threads exceeds the maximum of %d",
-                                     CCPUMinerController::MAX_THREADS));
 
-    std::string strError;
-    if (!GetCPUMinerController().Start(pwalletMain, nThreads, strError))
-        throw JSONRPCError(RPC_INTERNAL_ERROR, strError);
-
-    CCPUMinerController::Status status = GetCPUMinerController().GetStatus();
-    int nHeight;
-    {
-        LOCK(cs_main);
-        nHeight = nBestHeight;
-    }
-
-    Object result;
-    result.push_back(Pair("mining", status.running));
-    result.push_back(Pair("threads", status.activeThreads));
-    result.push_back(Pair("height", nHeight));
-    return result;
+    const CPUMiningApplyResult r = ApplyCPUMiningRequest(pwalletMain, true, nThreads);
+    if (!r.ok)
+        throw JSONRPCError(RPC_INTERNAL_ERROR, r.error);
+    if (!r.warning.empty())
+        printf("CPUMINING setgenerate: %s\n", r.warning.c_str());
+    return CPUMiningResultToJSON(r);
 }
 
 Value getblocktemplate(const Array& params, bool fHelp)

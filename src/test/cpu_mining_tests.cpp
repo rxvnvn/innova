@@ -20,6 +20,9 @@ namespace fs = boost::filesystem;
 #include <set>
 #include <stdexcept>
 #include <thread>
+#ifdef __linux__
+#include <sched.h>
+#endif
 
 extern CWallet* pwalletMain;
 
@@ -610,25 +613,113 @@ BOOST_AUTO_TEST_CASE(time_updates_and_nonce_overflow_keep_lockstep)
     BOOST_CHECK_EQUAL(CoinbaseTooEarlyGate(b), false);
 }
 
-// CONFIG MINING AUTOSTART (perf/startup-phase-timing): -gen / -genproclimit
-// must resolve threads by EXACTLY the same rule as the setgenerate RPC so the
-// two entry points can never drift.
-BOOST_AUTO_TEST_CASE(gen_config_thread_resolution_matches_rpc_rule)
+// CONFIG MINING AUTOSTART (perf/startup-phase-timing): the single config key
+// `gen=N`. Absent/0 = disabled, N>0 = enabled, anything else = INVALID — never a
+// bool interpretation, never a partial parse, never a silent default.
+BOOST_AUTO_TEST_CASE(gen_config_value_parsing_is_exact)
 {
-    // -1 => all hardware threads, capped at the controller maximum (16).
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 0), 1);
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 1), 1);
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 8), 8);
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 16), 16);
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 28), 16);
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 1024), 16);
-    // Explicit counts pass through untouched: the caller validates them, so an
-    // invalid config value is reported instead of being silently clamped.
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(16, 28), 16);
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(1, 28), 1);
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(0, 28), 0);
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(17, 28), 17);
-    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-2, 28), -2);
+    int nThreads = -12345;
+    std::string strErr;
+
+    // Absent key and an empty value both mean "not configured".
+    BOOST_CHECK_EQUAL((int)ParseGenConfigValue("", false, &nThreads, &strErr), (int)GEN_CONFIG_ABSENT);
+    BOOST_CHECK_EQUAL(nThreads, 0);
+    BOOST_CHECK_EQUAL((int)ParseGenConfigValue("", true, &nThreads, &strErr), (int)GEN_CONFIG_ABSENT);
+    BOOST_CHECK_EQUAL((int)ParseGenConfigValue("   ", true, &nThreads, &strErr), (int)GEN_CONFIG_ABSENT);
+
+    // 0 disables autostart explicitly.
+    BOOST_CHECK_EQUAL((int)ParseGenConfigValue("0", true, &nThreads, &strErr), (int)GEN_CONFIG_DISABLED);
+    BOOST_CHECK_EQUAL(nThreads, 0);
+
+    // Positive integers enable autostart with exactly that request.
+    BOOST_CHECK_EQUAL((int)ParseGenConfigValue("1", true, &nThreads, &strErr), (int)GEN_CONFIG_ENABLED);
+    BOOST_CHECK_EQUAL(nThreads, 1);
+    BOOST_CHECK_EQUAL((int)ParseGenConfigValue("8", true, &nThreads, &strErr), (int)GEN_CONFIG_ENABLED);
+    BOOST_CHECK_EQUAL(nThreads, 8);
+    BOOST_CHECK_EQUAL((int)ParseGenConfigValue("16", true, &nThreads, &strErr), (int)GEN_CONFIG_ENABLED);
+    BOOST_CHECK_EQUAL(nThreads, 16);
+    BOOST_CHECK_EQUAL((int)ParseGenConfigValue("  8  ", true, &nThreads, &strErr), (int)GEN_CONFIG_ENABLED);
+    BOOST_CHECK_EQUAL(nThreads, 8);
+
+    // Everything ambiguous or malformed is INVALID (and disables autostart).
+    const char* badValues[] = {"-1", "-8", "abc", "8abc", "8.5", "0x10", "+8", "--8", "999999999999999999999", "1e3"};
+    for (size_t i = 0; i < sizeof(badValues) / sizeof(badValues[0]); ++i)
+    {
+        nThreads = -12345;
+        const GenConfigParseResult r = ParseGenConfigValue(badValues[i], true, &nThreads, &strErr);
+        BOOST_CHECK_MESSAGE(r == GEN_CONFIG_INVALID,
+                            "value '" << badValues[i] << "' must be INVALID");
+        BOOST_CHECK_MESSAGE(!strErr.empty(), "invalid value must carry an error text");
+        BOOST_CHECK_EQUAL(nThreads, 0);
+    }
+}
+
+// One clamping rule for config and both RPC paths: effective =
+// max(1, min(requested, available, controller maximum)).
+BOOST_AUTO_TEST_CASE(mining_thread_clamp_matches_capacity_rule)
+{
+    bool fClamped = false;
+
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(1, 28, &fClamped), 1);
+    BOOST_CHECK(!fClamped);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(8, 28, &fClamped), 8);
+    BOOST_CHECK(!fClamped);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(16, 28, &fClamped), 16);
+    BOOST_CHECK(!fClamped);
+
+    // More than the machine has: clamped to the available count.
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(32, 28, &fClamped), 28);
+    BOOST_CHECK(fClamped);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(16, 8, &fClamped), 8);
+    BOOST_CHECK(fClamped);
+
+    // Hard controller maximum still applies on very wide machines.
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(64, 1024, &fClamped), CCPUMinerController::MAX_THREADS);
+    BOOST_CHECK(fClamped);
+
+    // Defensive floor: a nonsensical request/capacity can never produce 0.
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(0, 28, &fClamped), 1);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(-5, 28, &fClamped), 1);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(8, 0, &fClamped), 1);
+}
+
+// Available-logical-CPU detection must follow the affinity mask (which is what
+// cpuset and systemd CPUAffinity also narrow), never the raw hardware count.
+BOOST_AUTO_TEST_CASE(available_cpus_respects_affinity_mask)
+{
+    const int nBaseline = AvailableLogicalCPUs();
+    BOOST_CHECK_GE(nBaseline, 1);
+
+#ifdef __linux__
+    cpu_set_t orig;
+    CPU_ZERO(&orig);
+    if (sched_getaffinity(0, sizeof(orig), &orig) == 0)
+    {
+        // Restrict this process to at most 2 CPUs, measure, then restore.
+        cpu_set_t two;
+        CPU_ZERO(&two);
+        int nSet = 0;
+        for (int i = 0; i < CPU_SETSIZE && nSet < 2; ++i)
+        {
+            if (CPU_ISSET(i, &orig))
+            {
+                CPU_SET(i, &two);
+                ++nSet;
+            }
+        }
+        if (nSet > 0 && sched_setaffinity(0, sizeof(two), &two) == 0)
+        {
+            const int nRestricted = AvailableLogicalCPUs();
+            BOOST_CHECK_GE(nRestricted, 1);
+            BOOST_CHECK_LE(nRestricted, nSet);
+            // The clamp must follow the narrowed capacity, so a request for 16
+            // threads cannot exceed what this process may actually run on.
+            BOOST_CHECK_LE(ClampCPUMiningThreads(16, nRestricted), nRestricted);
+            sched_setaffinity(0, sizeof(orig), &orig);
+            BOOST_CHECK_EQUAL(AvailableLogicalCPUs(), nBaseline);
+        }
+    }
+#endif
 }
 
 BOOST_AUTO_TEST_SUITE_END()

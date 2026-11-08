@@ -1518,7 +1518,7 @@ bool AppInit2()
             own.state != BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW &&
             !(own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED && fOptInMigration))
             return InitError(strprintf(
-                "Store3A V2 authoritative FAIL-CLOSED: Block Index V2 ownership is %s, not "
+                "Store3A V2 authoritative FAIL-CLOSED: Block Index V2 ownership is %s (%s), not "
                 "V2_AUTHORITATIVE or EMPTY_NEW. In V2 store mode (-s16openstore) the block index "
                 "must already exist as an authoritative Block Index V2, or the datadir must be "
                 "clean so the native genesis bootstrap builds the first generation (no legacy "
@@ -1528,7 +1528,7 @@ bool AppInit2()
                 "LevelDB is not at <datadir>/txleveldb). The migration is a one-shot operator "
                 "action: after it completes, restart WITHOUT the flag and the node runs on "
                 "Block Index V2 only. No legacy fallback.",
-                BlockIndexStartupOwnershipStateName(own.state)));
+                BlockIndexStartupOwnershipStateName(own.state), own.detail.c_str()));
 
         if (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_EMPTY_NEW ||
             (own.state == BLOCK_INDEX_STARTUP_OWNERSHIP_LEGACY_MIGRATION_REQUIRED && fOptInMigration))
@@ -2558,44 +2558,57 @@ authoritative_startup_ready:
         NewThread(ThreadRPCServer, NULL);
     StartupTrace("rpc_thread_started");
 
-    // ---- CPU mining autostart from the configuration file ------------------
-    // -gen=1 / -genproclimit=<N> is the config-file equivalent of the manual
-    // `setgenerate true <N>` RPC, which was the ONLY way to start mining before
-    // this: no configuration key existed, so "mine from every start" required a
-    // human (or a script) to call RPC after the fact. The controller is started
-    // here, after the node, the wallet and the RPC server are fully initialized,
-    // so hashing can never begin against an unready tip; the miner's own gates
-    // (IBD/no-peers/chain-stale/collateral) still apply unchanged.
-    // Fail-soft by contract: a mining start failure is logged and NEVER aborts
-    // node startup (the node's job is the chain). Absent keys = unchanged
-    // behaviour (mining off), so this is inert for every existing datadir.
-    if (GetBoolArg("-gen", false))
+    // ---- CPU mining autostart: the single config key `gen=N` ----------------
+    // Semantics (final operator interface):
+    //   gen absent -> autostart disabled
+    //   gen=0      -> autostart disabled
+    //   gen=N, N>0 -> start CPU mining with N threads after initialization
+    // There is no second key: genproclimit is deliberately NOT part of the
+    // interface, so a configuration cannot be ambiguous. The value is parsed as
+    // a bare integer (no bool interpretation, no partial parses); an invalid
+    // value is logged loudly and treated as "disabled" — it never aborts the
+    // node and never silently falls back to a different thread count.
+    //
+    // The controller is started here, after the node, the wallet and the RPC
+    // server are fully initialized, so hashing can never begin against an
+    // unready tip; the miner's own gates (IBD / no peers / chain stale /
+    // collateral) still apply unchanged. The effective thread count is clamped
+    // by the SAME rule the RPCs use (available logical CPUs, affinity/cpuset/
+    // cgroup aware). Fail-soft by contract: a start failure is logged, never fatal.
     {
-        int nGenThreads = (int)GetArg("-genproclimit", -1);
-        nGenThreads = ResolveCPUMiningThreads(nGenThreads, std::thread::hardware_concurrency());
-        if (nGenThreads < 1 || nGenThreads > CCPUMinerController::MAX_THREADS)
+        const bool fGenPresent = mapArgs.count("-gen") > 0;
+        int nGenThreads = 0;
+        std::string strGenError;
+        const GenConfigParseResult genCfg =
+            ParseGenConfigValue(fGenPresent ? GetArg("-gen", "") : "", fGenPresent,
+                                &nGenThreads, &strGenError);
+        if (genCfg == GEN_CONFIG_INVALID)
         {
-            printf("CPU mining autostart skipped: -genproclimit=%d is out of range (1..%d; -1 = all CPUs, capped)\n",
-                   nGenThreads, CCPUMinerController::MAX_THREADS);
+            printf("CPU mining autostart DISABLED: invalid configuration value: %s\n",
+                   strGenError.c_str());
         }
-        else if (pwalletMain == NULL)
+        else if (genCfg == GEN_CONFIG_ENABLED)
         {
-            printf("CPU mining autostart skipped: -gen=1 requires a loaded wallet (wallet is disabled)\n");
-        }
-        else
-        {
-            std::string strMineErr;
-            if (!GetCPUMinerController().Start(pwalletMain, nGenThreads, strMineErr))
+            const CPUMiningApplyResult mine =
+                ApplyCPUMiningRequest(pwalletMain, true, nGenThreads);
+            if (!mine.ok)
             {
-                printf("CPU mining autostart FAILED (-gen=1, threads=%d): %s\n",
-                       nGenThreads, strMineErr.c_str());
+                printf("CPU mining autostart FAILED (gen=%d): %s\n",
+                       nGenThreads, mine.error.c_str());
             }
             else
             {
-                const CCPUMinerController::Status mineStatus = GetCPUMinerController().GetStatus();
-                printf("CPU mining autostart: gen=1 genproclimit=%d -> mining=%d threads=%d\n",
-                       nGenThreads, mineStatus.running ? 1 : 0, mineStatus.activeThreads);
+                if (!mine.warning.empty())
+                    printf("CPU mining autostart: %s\n", mine.warning.c_str());
+                printf("CPU mining autostart: gen=%d requested=%d effective=%d "
+                       "available_cpus=%d -> mining=%d threads=%d\n",
+                       nGenThreads, mine.requestedThreads, mine.effectiveThreads,
+                       mine.availableCPUs, mine.mining ? 1 : 0, mine.effectiveThreads);
             }
+        }
+        else if (genCfg == GEN_CONFIG_DISABLED)
+        {
+            printf("CPU mining autostart: disabled by configuration (gen=0)\n");
         }
         fflush(stdout);
     }

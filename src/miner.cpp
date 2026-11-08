@@ -14,6 +14,12 @@
 #include <chrono>
 #include <limits>
 #include <memory>
+#include <algorithm>
+#include <cstdio>
+#ifdef __linux__
+#include <sched.h>
+#endif
+#include <boost/lexical_cast.hpp>
 
 using namespace std;
 
@@ -1594,6 +1600,229 @@ CCPUMinerController& GetCPUMinerController()
 {
     static CCPUMinerController controller;
     return controller;
+}
+
+// ---------------------------------------------------------------------------
+// CPU capacity + the single clamping/output rule (see miner.h).
+// ---------------------------------------------------------------------------
+
+// cgroup v2 CPU bandwidth quota for this process, expressed as a number of
+// logical CPUs. Returns 0 when there is no quota or it cannot be read.
+static int CgroupV2CpuQuotaCount()
+{
+#ifdef __linux__
+    FILE* fc = fopen("/proc/self/cgroup", "r");
+    if (fc == NULL)
+        return 0;
+    std::string strRelPath;
+    char line[512];
+    while (fgets(line, sizeof(line), fc) != NULL)
+    {
+        const std::string s(line);
+        if (s.compare(0, 3, "0::") == 0)
+        {
+            strRelPath = s.substr(3);
+            while (!strRelPath.empty() &&
+                   (strRelPath[strRelPath.size() - 1] == '\n' || strRelPath[strRelPath.size() - 1] == '\r'))
+                strRelPath.erase(strRelPath.size() - 1);
+            break;
+        }
+    }
+    fclose(fc);
+    if (strRelPath.empty())
+        return 0;
+
+    std::string strFile = "/sys/fs/cgroup" + strRelPath;
+    if (strFile[strFile.size() - 1] != '/')
+        strFile += "/";
+    strFile += "cpu.max";
+
+    FILE* fq = fopen(strFile.c_str(), "r");
+    if (fq == NULL)
+        return 0;
+    char quota[64] = {0};
+    long long period = 0;
+    const int nRead = fscanf(fq, "%63s %lld", quota, &period);
+    fclose(fq);
+    if (nRead != 2 || period <= 0 || std::string(quota) == "max")
+        return 0;
+    long long nQuota = 0;
+    try { nQuota = boost::lexical_cast<long long>(quota); }
+    catch (...) { return 0; }
+    if (nQuota <= 0)
+        return 0;
+    // A 150% quota on a 100 ms period is 2 logical CPUs' worth of runtime.
+    const long long nCpus = (nQuota + period - 1) / period;
+    return (nCpus < 1) ? 1 : (int)std::min<long long>(nCpus, 1024);
+#else
+    return 0;
+#endif
+}
+
+int AvailableLogicalCPUs(bool* pFallback)
+{
+    if (pFallback) *pFallback = false;
+
+    int nAffinity = 0;
+#ifdef __linux__
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    if (sched_getaffinity(0, sizeof(set), &set) == 0)
+        nAffinity = CPU_COUNT(&set);
+#endif
+
+    int nAvailable = nAffinity;
+    if (nAvailable <= 0)
+    {
+        // Detection unavailable: safe fallback to the hardware count rather
+        // than guessing a higher value.
+        const unsigned int nHw = std::thread::hardware_concurrency();
+        nAvailable = (nHw == 0) ? 1 : (int)nHw;
+        if (pFallback) *pFallback = true;
+    }
+
+    // Never let a CPU *quota* raise the count above the affinity/cpuset mask:
+    // only reduce. This also means a later affinity narrowing is respected on
+    // the next call, so threads can never be added beyond what is allowed.
+    const int nQuota = CgroupV2CpuQuotaCount();
+    if (nQuota > 0 && nQuota < nAvailable)
+        nAvailable = nQuota;
+
+    return (nAvailable < 1) ? 1 : nAvailable;
+}
+
+int ClampCPUMiningThreads(int nRequested, int nAvailable, bool* pClamped)
+{
+    if (pClamped) *pClamped = false;
+    const int nCap = (nAvailable < 1) ? 1 : nAvailable;
+    int nEffective = nRequested;
+    if (nEffective < 1)
+        nEffective = 1;
+    if (nEffective > nCap)
+        nEffective = nCap;
+    if (nEffective > CCPUMinerController::MAX_THREADS)
+        nEffective = CCPUMinerController::MAX_THREADS;
+    if (pClamped && nEffective != nRequested)
+        *pClamped = true;
+    return nEffective;
+}
+
+GenConfigParseResult ParseGenConfigValue(const std::string& strRaw, bool fPresent,
+                                         int* pnThreads, std::string* pstrError)
+{
+    if (pnThreads) *pnThreads = 0;
+    if (pstrError) pstrError->clear();
+    if (!fPresent)
+        return GEN_CONFIG_ABSENT;
+
+    // Trim surrounding whitespace only; anything else must be a bare integer.
+    std::string s = strRaw;
+    const char* ws = " \t\r\n";
+    const size_t nFirst = s.find_first_not_of(ws);
+    if (nFirst == std::string::npos)
+        return GEN_CONFIG_ABSENT;              // "gen=" (empty) = not configured
+    s = s.substr(nFirst, s.find_last_not_of(ws) - nFirst + 1);
+
+    // Reject signs other than a leading '-' (handled as invalid below), any
+    // non-digit, trailing junk, and overflow; no partial parses, no defaults.
+    size_t i = 0;
+    bool fNegative = false;
+    if (s[0] == '-')
+    {
+        fNegative = true;
+        i = 1;
+    }
+    if (i >= s.size())
+    {
+        if (pstrError) *pstrError = "gen= value is not an integer";
+        return GEN_CONFIG_INVALID;
+    }
+    long long nValue = 0;
+    for (; i < s.size(); ++i)
+    {
+        if (s[i] < '0' || s[i] > '9')
+        {
+            if (pstrError) *pstrError = strprintf("gen= value '%s' is not an integer", strRaw.c_str());
+            return GEN_CONFIG_INVALID;
+        }
+        nValue = nValue * 10 + (s[i] - '0');
+        if (nValue > 1000000)
+        {
+            if (pstrError) *pstrError = strprintf("gen= value '%s' is out of range", strRaw.c_str());
+            return GEN_CONFIG_INVALID;
+        }
+    }
+    if (fNegative)
+        nValue = -nValue;
+
+    if (nValue == 0)
+        return GEN_CONFIG_DISABLED;
+    if (nValue < 0)
+    {
+        if (pstrError) *pstrError = strprintf("gen= value '%s' is negative (use 0 to disable)", strRaw.c_str());
+        return GEN_CONFIG_INVALID;
+    }
+    if (pnThreads) *pnThreads = (int)nValue;
+    return GEN_CONFIG_ENABLED;
+}
+
+CPUMiningApplyResult ApplyCPUMiningRequest(CWallet* pwallet, bool fEnable, int nRequestedThreads)
+{
+    CPUMiningApplyResult r;
+    r.availableCPUs = AvailableLogicalCPUs();
+
+    if (!fEnable)
+    {
+        GetCPUMinerController().Stop();
+        const CCPUMinerController::Status st = GetCPUMinerController().GetStatus();
+        r.ok = true;
+        r.mining = st.running;
+        r.requestedThreads = 0;
+        r.effectiveThreads = st.activeThreads;
+        return r;
+    }
+
+    if (pwallet == NULL)
+    {
+        r.error = "CPU mining requires a loaded wallet";
+        return r;
+    }
+
+    // -1 keeps the long-standing setgenerate meaning: "all available CPUs".
+    const int nRequested = (nRequestedThreads == -1) ? r.availableCPUs : nRequestedThreads;
+    if (nRequested < 1)
+    {
+        r.error = strprintf("threads=%d is invalid; use a positive integer (or -1 for all CPUs)", nRequestedThreads);
+        return r;
+    }
+
+    bool fClamped = false;
+    const int nEffective = ClampCPUMiningThreads(nRequested, r.availableCPUs, &fClamped);
+    r.requestedThreads = nRequested;
+    r.clamped = fClamped;
+    if (fClamped)
+    {
+        std::string strWhy = strprintf("available logical CPUs=%d", r.availableCPUs);
+        if (nEffective == CCPUMinerController::MAX_THREADS &&
+            nRequested > CCPUMinerController::MAX_THREADS &&
+            r.availableCPUs > CCPUMinerController::MAX_THREADS)
+            strWhy = strprintf("hard controller maximum=%d", CCPUMinerController::MAX_THREADS);
+        r.warning = strprintf("requested %d mining threads, clamped to %d (%s)",
+                              nRequested, nEffective, strWhy.c_str());
+    }
+
+    std::string strError;
+    if (!GetCPUMinerController().Start(pwallet, nEffective, strError))
+    {
+        r.error = strError.empty() ? "CPU mining start failed" : strError;
+        return r;
+    }
+
+    const CCPUMinerController::Status st = GetCPUMinerController().GetStatus();
+    r.ok = true;
+    r.mining = st.running;
+    r.effectiveThreads = st.activeThreads;
+    return r;
 }
 
 void ShutdownCPUMining()

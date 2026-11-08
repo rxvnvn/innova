@@ -194,20 +194,60 @@ private:
 CCPUMinerController& GetCPUMinerController();
 void ShutdownCPUMining();
 
-// Resolve a requested mining thread count into the concrete worker count.
-// Shared by the setgenerate RPC and the -gen/-genproclimit startup path so the
-// two entry points cannot drift: -1 = "all hardware threads", capped at
-// CCPUMinerController::MAX_THREADS; any other value is returned unchanged and
-// validated by the caller (0, < -1 and > MAX_THREADS stay invalid).
-static inline int ResolveCPUMiningThreads(int nRequested, unsigned int nHardwareThreads)
+// ---- CPU capacity (affinity / cpuset / cgroup aware) ----------------------
+// Number of logical CPUs this process may actually run on: the affinity mask
+// (which is what cpuset and systemd CPUAffinity also reduce), further bounded
+// by a cgroup v2 CPU bandwidth quota when one is set. Never returns < 1.
+// *pFallback (optional) is set to true when neither affinity nor hardware
+// detection could be used and the value came from the last-resort fallback.
+int AvailableLogicalCPUs(bool* pFallback = NULL);
+
+// THE clamping rule shared by RPC gen, RPC setgenerate and -gen=N:
+//   effective = max(1, min(requested, available, CCPUMinerController::MAX_THREADS))
+// *pClamped (optional) is true when the request was reduced. There is exactly
+// one rule so the config path and both RPC paths cannot drift.
+int ClampCPUMiningThreads(int nRequested, int nAvailable, bool* pClamped = NULL);
+
+// Parse the innova.conf value of `gen` — exactly one integer, no ambiguity:
+//   absent / empty          -> GEN_CONFIG_ABSENT    (autostart off)
+//   "0"                     -> GEN_CONFIG_DISABLED  (autostart off)
+//   N > 0                   -> GEN_CONFIG_ENABLED   (*pnThreads = N)
+//   anything else (negative, non-numeric, overflow, trailing junk)
+//                           -> GEN_CONFIG_INVALID   (*pstrError set)
+enum GenConfigParseResult
 {
-    if (nRequested != -1)
-        return nRequested;
-    if (nHardwareThreads == 0)
-        return 1;
-    return (nHardwareThreads < (unsigned int)CCPUMinerController::MAX_THREADS)
-               ? (int)nHardwareThreads
-               : CCPUMinerController::MAX_THREADS;
-}
+    GEN_CONFIG_ABSENT = 0,
+    GEN_CONFIG_DISABLED,
+    GEN_CONFIG_ENABLED,
+    GEN_CONFIG_INVALID,
+};
+GenConfigParseResult ParseGenConfigValue(const std::string& strRaw, bool fPresent,
+                                         int* pnThreads, std::string* pstrError);
+
+// Result of one CPU-mining control request. `requestedThreads` is what the
+// caller asked for (after -1 = "all available" is resolved), `effectiveThreads`
+// is what the controller actually runs.
+struct CPUMiningApplyResult
+{
+    bool ok;
+    bool mining;
+    int requestedThreads;
+    int effectiveThreads;
+    int availableCPUs;
+    bool clamped;
+    std::string warning;
+    std::string error;
+
+    CPUMiningApplyResult()
+        : ok(false), mining(false), requestedThreads(0), effectiveThreads(0),
+          availableCPUs(1), clamped(false) {}
+};
+
+// THE single internal control path for CPU mining. Both the `gen` RPC and the
+// `setgenerate` compatibility alias call this, and so does the -gen=N startup
+// autostart. It never creates a second pool: CCPUMinerController::Start()
+// replaces the existing worker set (same count = no-op, different count =
+// ordered stop+start), and Stop() joins the workers.
+CPUMiningApplyResult ApplyCPUMiningRequest(CWallet* pwallet, bool fEnable, int nRequestedThreads);
 
 #endif // NOVACOIN_MINER_H

@@ -361,6 +361,7 @@ static const CRPCCommand vRPCCommands[] =
     { "verifymessage",          &verifymessage,          false,  false },
     { "listaccounts",           &listaccounts,           false,  false },
     { "settxfee",               &settxfee,               false,  false },
+    { "gen",                    &gen,                    true,   true },
     { "setgenerate",            &setgenerate,            true,   true },
     { "getgenerate",            &getgenerate,            true,   true },
     { "getblocktemplate",       &getblocktemplate,       true,   false },
@@ -1578,6 +1579,8 @@ Array RPCConvertValues(const std::string &strMethod, const std::vector<std::stri
     // Special case non-string parameter types
     //
     if (strMethod == "stop"                   && n > 0) ConvertTo<bool>(params[0]);
+    if (strMethod == "gen"                    && n > 0) ConvertTo<bool>(params[0]);
+    if (strMethod == "gen"                    && n > 1) ConvertTo<int64_t>(params[1]);
     if (strMethod == "setgenerate"            && n > 0) ConvertTo<bool>(params[0]);
     if (strMethod == "setgenerate"            && n > 1) ConvertTo<int64_t>(params[1]);
     if (strMethod == "delegatestake"          && n > 1) ConvertTo<double>(params[1]);
