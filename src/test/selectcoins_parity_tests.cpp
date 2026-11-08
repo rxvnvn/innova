@@ -30,7 +30,7 @@ BOOST_AUTO_TEST_SUITE(selectcoins_parity_tests)
 struct HookGuard
 {
     HookGuard() {}
-    ~HookGuard() { pfnSelectCoinsRandInt = GetRandInt; }
+    ~HookGuard() { pfnSelectCoinsRandBytes = GetRandBytes; }
 };
 
 namespace { static const int64_t CENT_7 = 7 * CENT; static const int64_t CENT_10 = 10 * CENT; }
@@ -133,12 +133,14 @@ struct Result
 
 // Runs the three confirmation tiers exactly as CWallet::SelectCoins does, once with the memo
 // disabled (reference) and once enabled (optimized), both from the same RNG seed.
-// Deterministic replacement for GetRandInt so both paths shuffle identically.
+// Deterministic replacement for GetRandBytes so both paths draw the same stream.
 uint32_t g_det_state = 0x12345678u;
-int DeterministicRand(int nMax)
+void DeterministicRandBytes(unsigned char* buf, int num)
 {
-    g_det_state = g_det_state * 1664525u + 1013904223u;
-    return nMax > 0 ? (int)(g_det_state % (uint32_t)nMax) : 0;
+    for (int i = 0; i < num; ++i) {
+        g_det_state = g_det_state * 1664525u + 1013904223u;
+        buf[i] = (unsigned char)(g_det_state >> 24);
+    }
 }
 void ResetDeterministicRand() { g_det_state = 0x12345678u; }
 
@@ -150,7 +152,7 @@ Result RunSelection(CWallet& wallet, int64_t nTarget, unsigned int nSpendTime,
     r.fOk = false;
     r.nValue = 0;
 
-    pfnSelectCoinsRandInt = DeterministicRand;
+    pfnSelectCoinsRandBytes = DeterministicRandBytes;
     std::map<const CWalletTx*, bool>* pCache = NULL;
     std::map<const CWalletTx*, bool> cache;
     if (fUseCache)

@@ -2312,31 +2312,101 @@ bool CWallet::AvailableCoinsForStaking(vector<COutput>& vCoins, unsigned int nSp
     return true;
 }
 
-// Bit source for the subset sampler. The sampler asks for one bit per coin per iteration
-// (up to 1000 x |vValue| draws); each draw used to call GetRandInt(2), i.e. a fresh OpenSSL
-// RAND_bytes() -- measured at ~3 s per ApproximateBestSubset call on a 1.5k-coin pool and the
-// dominant cost of sendtoaddress. One seed draw is expanded with a cheap LCG instead; the
-// sampler's decisions stay 50/50 and the algorithm is untouched. The seed still comes from the
-// selection RNG, so a fixed test seed reproduces the same selection.
+// Randomness for coin selection. The subset sampler asks for one bit per coin per iteration
+// (up to 1000 x |vValue| draws -- 1.5M-4.5M bits on a real pool). Each draw used to call
+// GetRandInt(2), i.e. a fresh OpenSSL RAND_bytes(), which made selection the dominant cost of
+// sendtoaddress (~3 s per ApproximateBestSubset call at 1.5k coins).
+//
+// Cryptographic strength is not required *by the algorithm*: the bits only randomise a subset
+// search whose result is immediately re-validated against the target and the fee, and a wrong
+// sample simply costs an extra iteration. But the bits must stay unpredictable to the outside
+// world, because the selected inputs become public in the transaction and a predictable sampler
+// would leak how the wallet picks coins. So the source is left unchanged (CSPRNG) and only the
+// *granularity* changes: bytes are fetched in 4 KiB chunks and consumed bit by bit. That keeps
+// the exact statistical properties of the original code -- including GetRand's rejection
+// sampling for NextInt -- while costing a few dozen RAND_bytes calls per selection instead of
+// millions.
 namespace {
-struct CoinSelectionBits
+class CoinSelectionRng
 {
-    uint32_t state;
-    explicit CoinSelectionBits(uint32_t seed) : state(seed ? seed : 0x9e3779b9u) {}
-    bool Next()
+public:
+    static const size_t CHUNK_BYTES = 4096;
+
+    CoinSelectionRng() : vch(CHUNK_BYTES), nBitPos(CHUNK_BYTES * 8) {}
+
+    bool NextBit()
     {
-        state = state * 1664525u + 1013904223u;
-        return ((state >> 19) & 1u) != 0;
+        if (nBitPos == vch.size() * 8)
+            Refill();
+        const bool fSet = ((vch[nBitPos >> 3] >> (nBitPos & 7)) & 1u) != 0;
+        ++nBitPos;
+        return fSet;
     }
+
+    // Same contract as GetRand(): uniform in [0, nMax) via rejection sampling.
+    int NextInt(int nMax)
+    {
+        if (nMax <= 1)
+            return 0;
+        const uint64_t nRange = (std::numeric_limits<uint64_t>::max() / (uint64_t)nMax) * (uint64_t)nMax;
+        uint64_t nRand;
+        do {
+            nRand = 0;
+            for (int i = 0; i < 8; ++i)
+                nRand = (nRand << 8) | (uint64_t)NextByte();
+        } while (nRand >= nRange);
+        return (int)(nRand % (uint64_t)nMax);
+    }
+
+private:
+    void Refill()
+    {
+        pfnSelectCoinsRandBytes(&vch[0], (int)vch.size());
+        nBitPos = 0;
+    }
+    unsigned char NextByte()
+    {
+        unsigned char b = 0;
+        for (int i = 0; i < 8; ++i)
+            if (NextBit())
+                b |= (unsigned char)(1u << i);
+        return b;
+    }
+
+    std::vector<unsigned char> vch;
+    size_t nBitPos;
+};
+
+// Adapts a raw byte-source callback (tests/tools) to the sampler's bit interface, so the
+// statistical harness drives the same template the wallet uses.
+class ByteSourceBits
+{
+public:
+    typedef void (*Fn)(unsigned char*, int);
+    explicit ByteSourceBits(Fn fn) : fn(fn), nBitPos(CHUNK * 8) {}
+    bool NextBit()
+    {
+        if (nBitPos == CHUNK * 8) {
+            fn(buf, CHUNK);
+            nBitPos = 0;
+        }
+        const bool fSet = ((buf[nBitPos >> 3] >> (nBitPos & 7)) & 1u) != 0;
+        ++nBitPos;
+        return fSet;
+    }
+private:
+    static const size_t CHUNK = 4096;
+    Fn fn;
+    unsigned char buf[CHUNK];
+    size_t nBitPos;
 };
 }
 
-static void ApproximateBestSubset(vector<pair<int64_t, pair<const CWalletTx*,unsigned int> > >vValue, int64_t nTotalLower, int64_t nTargetValue,
-                                  vector<char>& vfBest, int64_t& nBest, int iterations = 1000)
+template <typename BitSource>
+static void ApproximateBestSubsetImpl(vector<pair<int64_t, pair<const CWalletTx*,unsigned int> > >vValue, int64_t nTotalLower, int64_t nTargetValue,
+                                      vector<char>& vfBest, int64_t& nBest, int iterations, BitSource& bits)
 {
     vector<char> vfIncluded;
-    CoinSelectionBits bits((uint32_t)pfnSelectCoinsRandInt(0x7fffffff));
-
     vfBest.assign(vValue.size(), true);
     nBest = nTotalLower;
 
@@ -2349,7 +2419,7 @@ static void ApproximateBestSubset(vector<pair<int64_t, pair<const CWalletTx*,uns
         {
             for (unsigned int i = 0; i < vValue.size(); i++)
             {
-                if (nPass == 0 ? bits.Next() : !vfIncluded[i])
+                if (nPass == 0 ? bits.NextBit() : !vfIncluded[i])
                 {
                     nTotal += vValue[i].first;
                     vfIncluded[i] = true;
@@ -2368,6 +2438,26 @@ static void ApproximateBestSubset(vector<pair<int64_t, pair<const CWalletTx*,uns
             }
         }
     }
+}
+
+static void ApproximateBestSubset(vector<pair<int64_t, pair<const CWalletTx*,unsigned int> > >vValue, int64_t nTotalLower, int64_t nTargetValue,
+                                  vector<char>& vfBest, int64_t& nBest, int iterations, CoinSelectionRng& rng)
+{
+    ApproximateBestSubsetImpl(vValue, nTotalLower, nTargetValue, vfBest, nBest, iterations, rng);
+}
+
+void selectcoins_test_RunSampler(const std::vector<int64_t>& vValues, int64_t nTargetValue,
+                                 int iterations, void (*randbytes)(unsigned char*, int),
+                                 std::vector<char>& vfBest, int64_t& nBest)
+{
+    vector<pair<int64_t, pair<const CWalletTx*,unsigned int> > > vValue;
+    int64_t nTotalLower = 0;
+    for (size_t i = 0; i < vValues.size(); ++i) {
+        vValue.push_back(make_pair(vValues[i], make_pair((const CWalletTx*)NULL, (unsigned int)i)));
+        nTotalLower += vValues[i];
+    }
+    ByteSourceBits bits(randbytes);
+    ApproximateBestSubsetImpl(vValue, nTotalLower, nTargetValue, vfBest, nBest, iterations, bits);
 }
 
 // innova: total coins available for staking - WIP needs updating
@@ -2699,8 +2789,8 @@ bool less_then_denom (const COutput& out1, const COutput& out2)
 
 static bool CmpDepth(const CWalletTx* a, const CWalletTx* b) { return a->nTime > b->nTime; }
 
-// Deterministic in tests, GetRandInt in production (see wallet.h).
-int (*pfnSelectCoinsRandInt)(int nMax) = GetRandInt;
+// Production: OpenSSL RAND_bytes. Tests substitute a deterministic byte stream.
+void (*pfnSelectCoinsRandBytes)(unsigned char* buf, int num) = GetRandBytes;
 
 bool CWallet::SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, int nConfMine, int nConfTheirs, vector<COutput> vCoins, set<pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64_t& nValueRet, std::map<const CWalletTx*, bool>* pIsFromMeCache) const
 {
@@ -2714,7 +2804,14 @@ bool CWallet::SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, 
     vector<pair<int64_t, pair<const CWalletTx*,unsigned int> > > vValue;
     int64_t nTotalLower = 0;
 
-    random_shuffle(vCoins.begin(), vCoins.end(), pfnSelectCoinsRandInt);
+    // One RNG instance per selection: the shuffle and both sampler passes draw from the same
+    // buffered stream, exactly as they drew from one continuous GetRandInt sequence before.
+    CoinSelectionRng rng;
+    struct RandIntFromRng {
+        CoinSelectionRng* rng;
+        int operator()(int nMax) const { return rng->NextInt(nMax); }
+    } randInt = { &rng };
+    random_shuffle(vCoins.begin(), vCoins.end(), randInt);
 
     // move denoms down on the list
     sort(vCoins.begin(), vCoins.end(), less_then_denom);
@@ -2815,10 +2912,10 @@ bool CWallet::SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, 
     int64_t nBest;
 
     txlat::Mark("sel_dp_start", (int64_t)vValue.size());
-    ApproximateBestSubset(vValue, nTotalLower, nTargetValue, vfBest, nBest, 1000);
+    ApproximateBestSubset(vValue, nTotalLower, nTargetValue, vfBest, nBest, 1000, rng);
     txlat::Mark("sel_dp_done", (int64_t)nBest);
     if (nBest != nTargetValue && nTotalLower >= nTargetValue + CENT)
-        ApproximateBestSubset(vValue, nTotalLower, nTargetValue + CENT, vfBest, nBest, 1000);
+        ApproximateBestSubset(vValue, nTotalLower, nTargetValue + CENT, vfBest, nBest, 1000, rng);
 
     // If we have a bigger coin and (either the stochastic approximation didn't find a good solution,
     //                                   or the next bigger coin is closer), return the bigger coin

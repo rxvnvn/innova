@@ -185,9 +185,17 @@ struct SPVUtxo
     }
 };
 
-// Test seam: the coin-selection shuffle and the subset sampler use this function pointer so
-// tests can drive them deterministically. Production keeps the default, GetRandInt.
-extern int (*pfnSelectCoinsRandInt)(int nMax);
+// Test seam: coin selection draws its randomness from this byte source so tests can drive the
+// shuffle and the subset sampler deterministically. Production keeps the default, GetRandBytes
+// (OpenSSL RAND_bytes). Note this is the *source* only -- the selection code never uses the RNG
+// for anything consensus-, key- or signature-related; those paths keep calling GetRandInt.
+extern void (*pfnSelectCoinsRandBytes)(unsigned char* buf, int num);
+
+// Test/tool entry: runs the subset sampler over synthetic values with an explicit byte source,
+// exercising exactly the code CWallet::SelectCoinsMinConf runs. Not used by production.
+void selectcoins_test_RunSampler(const std::vector<int64_t>& vValues, int64_t nTargetValue,
+                                 int iterations, void (*randbytes)(unsigned char*, int),
+                                 std::vector<char>& vfBest, int64_t& nBest);
 
 /** A CWallet is an extension of a keystore, which also maintains a set of transactions and balances,
  * and provides the ability to create new transactions.
