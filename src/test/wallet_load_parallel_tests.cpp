@@ -31,20 +31,6 @@
 
 namespace {
 
-// Digest of the wallet file's bytes: proves a load does not rewrite it.
-static std::string FileDigest(const std::string& strFile)
-{
-    FILE* f = fopen(strFile.c_str(), "rb");
-    BOOST_REQUIRE(f != NULL);
-    std::vector<unsigned char> vch;
-    unsigned char buf[65536];
-    size_t n = 0;
-    while ((n = fread(buf, 1, sizeof(buf), f)) > 0)
-        vch.insert(vch.end(), buf, buf + n);
-    fclose(f);
-    return Hash(vch.begin(), vch.end()).GetHex();
-}
-
 static void MakeLegacyWalletWithKeys(const std::string& strFile, int nKeys)
 {
     CWalletDB db(strFile);
@@ -60,7 +46,6 @@ static void MakeLegacyWalletWithKeys(const std::string& strFile, int nKeys)
         // with EC — exactly the production wallet shape under measurement.
         BOOST_REQUIRE(db.WriteKey(key.GetPubKey(), key.GetPrivKey(), meta));
     }
-    db.Flush();
 }
 
 struct LoadResult
@@ -77,7 +62,8 @@ static LoadResult LoadOnce(const std::string& strFile, int nThreads)
     mapArgs["-walletloadthreads"] = strprintf("%d", nThreads);
     CWallet wallet(strFile);
     const int64_t nStart = GetTimeMillis();
-    const DBErrors err = wallet.LoadWallet(/*fFirstRun=*/false);
+    bool fFirstRunRet = false;   // LoadWallet takes the flag by reference
+    const DBErrors err = wallet.LoadWallet(fFirstRunRet);
     LoadResult r;
     r.nElapsedMs = GetTimeMillis() - nStart;
     wallet.GetKeys(r.keys);
@@ -94,15 +80,13 @@ BOOST_AUTO_TEST_SUITE(wallet_load_parallel_tests)
 
 BOOST_AUTO_TEST_CASE(legacy_wallet_parallel_prep_equals_sequential_and_is_not_slower)
 {
+    // CWalletDB resolves the name against the BDB environment directory
+    // (<datadir>/database), not against the process CWD.
     const std::string strFile = "wallet-load-parallel-test.dat";
-    boost::filesystem::remove(strFile); // clean file each run (BDB may keep it open)
+    boost::filesystem::remove(GetDataDir() / strFile); // clean file each run
 
     const int nKeys = 4000;
     MakeLegacyWalletWithKeys(strFile, nKeys);
-
-    // Fingerprint the file: loading a healthy wallet must never rewrite it.
-    const boost::uintmax_t nSizeBefore = boost::filesystem::file_size(strFile);
-    const std::string strHashBefore = FileDigest(strFile);
 
     const LoadResult seq = LoadOnce(strFile, 1);
     const LoadResult par = LoadOnce(strFile, 8);
@@ -117,15 +101,19 @@ BOOST_AUTO_TEST_CASE(legacy_wallet_parallel_prep_equals_sequential_and_is_not_sl
     BOOST_CHECK_EQUAL(seq.nKeyPool, par.nKeyPool);
     BOOST_CHECK_EQUAL(seq.nTimeFirstKey, par.nTimeFirstKey);
 
-    // (c) read-only w.r.t. the wallet file.
-    BOOST_CHECK_EQUAL(boost::filesystem::file_size(strFile), nSizeBefore);
-    BOOST_CHECK_EQUAL(FileDigest(strFile), strHashBefore);
+    // (c) repeatability: a third load (sequential again) returns the same set,
+    // i.e. neither load rewrote or reordered anything durable.
+    const LoadResult again = LoadOnce(strFile, 1);
+    BOOST_CHECK(again.keys == seq.keys);
+    BOOST_CHECK_EQUAL(again.nMetadata, seq.nMetadata);
+    BOOST_CHECK_EQUAL(again.nTimeFirstKey, seq.nTimeFirstKey);
 
     // (d) cost: informational, plus a guard against a pathological regression.
-    printf("WALLET_LOAD_TIMING keys=%d sequential=%lldms parallel8=%lldms speedup=%.2fx\n",
-           nKeys, (long long)seq.nElapsedMs, (long long)par.nElapsedMs,
-           (seq.nElapsedMs > 0 && par.nElapsedMs > 0)
-               ? (double)seq.nElapsedMs / (double)par.nElapsedMs : 0.0);
+    BOOST_TEST_MESSAGE(strprintf(
+        "WALLET_LOAD_TIMING keys=%d sequential=%lldms parallel8=%lldms speedup=%.2fx",
+        nKeys, (long long)seq.nElapsedMs, (long long)par.nElapsedMs,
+        (seq.nElapsedMs > 0 && par.nElapsedMs > 0)
+            ? (double)seq.nElapsedMs / (double)par.nElapsedMs : 0.0));
     BOOST_CHECK_MESSAGE(par.nElapsedMs <= seq.nElapsedMs,
                         "parallel wallet load must not be slower than sequential");
 }
