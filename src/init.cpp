@@ -751,8 +751,33 @@ bool InitSanityCheck(void)
 /** Initialize bitcoin.
  *  @pre Parameters should be parsed and config file should be read.
  */
+// ---- STARTUP PHASE TRACE (perf/startup-phase-timing) -----------------------
+// Gated diagnostic: -startuptrace=1 prints one monotonic marker per startup
+// phase. Strictly additive: with the flag absent there is no output and no
+// measurable work (one cached map lookup per marker). Used to attribute cold
+// vs warm startup on real chain data; never touches consensus, storage
+// formats, or the loading order itself.
+static int64_t g_startupTraceBegin = 0;
+static int64_t g_startupTracePrev = 0;
+static void StartupTrace(const char* phase)
+{
+    if (!GetBoolArg("-startuptrace", false))
+        return;
+    const int64_t now = GetTimeMillis();
+    if (g_startupTraceBegin == 0)
+    {
+        g_startupTraceBegin = now;
+        g_startupTracePrev = now;
+    }
+    printf("STARTUP_TRACE %-34s since_prev=%8" PRId64"ms total=%8" PRId64"ms\n",
+           phase, now - g_startupTracePrev, now - g_startupTraceBegin);
+    fflush(stdout);
+    g_startupTracePrev = now;
+}
+
 bool AppInit2()
 {
+    StartupTrace("appinit2_begin");
     // ********************************************************* Step 1: setup
 #ifdef _MSC_VER
     // Turn off Microsoft heap dump noise
@@ -1387,6 +1412,7 @@ bool AppInit2()
         return InitError(msg);
     };
 
+    StartupTrace("dbenv_open");
     if (GetBoolArg("-loadblockindextest"))
     {
         const std::string v2Root = ResolveBlockIndexV2Root(
@@ -1414,6 +1440,7 @@ bool AppInit2()
     uiInterface.InitMessage(_("Loading block index..."));
     printf("Loading block index...\n");
     nStart = GetTimeMillis();
+    StartupTrace("blockindex_begin");
 
     // S2.0 BI-V2 AUTHORITATIVE STARTUP: arm the legacy-index-open guard here, at
     // the true start of the production authoritative block-index load (after the
@@ -1584,6 +1611,7 @@ bool AppInit2()
                       "then restart without the flag)"
                     : ""));
         printf(" block index (authoritative) %" PRId64"ms\n", GetTimeMillis() - nStart);
+        StartupTrace("blockindex_authoritative_loaded");
 
         // V2-R2B (FIX A): load the persisted synchronized checkpoint into the
         // process checkpoint authority. The legacy startup did this inside
@@ -1703,6 +1731,7 @@ authoritative_startup_ready:
         if (!hreg::RebuildHRegStateFromActiveChainByValue(hregReader, 0, -1, hregErr))
             return InitError(strprintf("Block Index V2 authoritative HReg rebuild failed: %s", hregErr.c_str()));
         printf(" block index (authoritative) HReg rebuilt by value\n");
+        StartupTrace("hreg_rebuilt");
         PrintAuthoritativeResidency("T1_blockindex");
     }
 
@@ -1716,6 +1745,7 @@ authoritative_startup_ready:
         return false;
     };
     printf(" block index %15" PRId64"ms\n", GetTimeMillis() - nStart);
+    StartupTrace("blockindex_loaded_total");
 
     // ---- Phase A.7: optional read-only Block Index V2 shadow open ----
     // Runs only after the authoritative legacy block index is loaded (so legacy
@@ -1736,7 +1766,9 @@ authoritative_startup_ready:
             return InitError(_("Block Index V2 shadow failed structural/compatibility validation (strict mode)"));
     }
 
+    nStart2 = GetTimeMillis();   // diagnostics: nStart2 was never assigned (printed garbage)
     printf("Loaded Name DB %15" PRId64"ms\n", GetTimeMillis() - nStart2);
+    StartupTrace("blockindex_shadow_open");
 
 
     if (GetBoolArg("-printblockindex") || GetBoolArg("-printblocktree"))
@@ -1787,6 +1819,7 @@ authoritative_startup_ready:
 
     uiInterface.InitMessage(_("Loading your Innova wallet..."));
     printf("Loading your Innova wallet...\n");
+    StartupTrace("wallet_begin");
     nStart = GetTimeMillis();
     bool fFirstRun = true;
     pwalletMain = new CWallet(strWalletFileName);
@@ -1852,6 +1885,7 @@ authoritative_startup_ready:
 
     printf("%s", strErrors.str().c_str());
     printf("Innova Wallet %15" PRId64"ms\n", GetTimeMillis() - nStart);
+    StartupTrace("wallet_loaded");
 
     RegisterWallet(pwalletMain);
 
@@ -1872,6 +1906,7 @@ authoritative_startup_ready:
         uiInterface.InitMessage(_("Rescanning..."));
         printf("Rescanning last %i blocks (from block %i)...\n", pindexBest->nHeight - pindexRescan->nHeight, pindexRescan->nHeight);
         nStart = GetTimeMillis();
+        StartupTrace("rescan_begin");
         if (g_fAuthoritativeStartup)
         {
             // ---- A.10.1q: BY_VALUE_AUTHORITATIVE wallet rescan ----
@@ -1891,6 +1926,7 @@ authoritative_startup_ready:
                 return InitError(strprintf("Block Index V2 authoritative wallet rescan reader open failed: %s", scanErr.c_str()));
             pwalletMain->ScanForWalletTransactionsByValue(scanReader, 0, true);
             printf(" rescan (authoritative) %15" PRId64"ms\n", GetTimeMillis() - nStart);
+            StartupTrace("rescan_done");
         } else {
             pwalletMain->ScanForWalletTransactions(pindexRescan, true);
             printf(" rescan      %15" PRId64"ms\n", GetTimeMillis() - nStart);
@@ -1905,6 +1941,7 @@ authoritative_startup_ready:
     }
     // Add wallet transactions that aren't already in a block to mapTransactions
     pwalletMain->ReacceptWalletTransactions();
+    StartupTrace("wallet_reaccept_done");
 
     if (fHybridSPV)
     {
@@ -2104,6 +2141,7 @@ authoritative_startup_ready:
     // If the gate ever fails the store goes NEEDS_RECOVERY and no further delta is published.
     // Store lives for the process lifetime (heap-owned).
     {
+        StartupTrace("store3a_begin");
         static std::unique_ptr<cs::store3a::CommitStore3A> g_s3aAuthoritative;
         std::string s3aDir = GetArg("-s16openstore", "");
         if (s3aDir.empty() && v2NativeStoreStartup)
@@ -2122,6 +2160,7 @@ authoritative_startup_ready:
             g_s3aAuthoritative.reset(new cs::store3a::CommitStore3A());
             if (!g_s3aAuthoritative->open(s3aDir, &be))
                 return InitError(strprintf("Store3A V2 authoritative open failed at %s: %s", s3aDir.c_str(), be.str().c_str()));
+            StartupTrace("store3a_open_ok");
             if (pindexBest == NULL)
                 return InitError("Store3A V2 authoritative: no best chain loaded");
             int32_t stH = g_s3aAuthoritative->tipHeight();
@@ -2305,6 +2344,7 @@ authoritative_startup_ready:
                        (unsigned long long)txloc::g_txloc.count(),
                        (unsigned long long)txloc::g_txloc.memCount());
                 fflush(stdout);
+                StartupTrace("txloc_open_done");
             }
             printf("S1.9 Store3A V2 authoritative armed at %s tip=%d matches chain; new blocks will be published to Store3A (fail-closed on gate error)\n",
                    s3aDir.c_str(), (int)stH);
@@ -2325,6 +2365,7 @@ authoritative_startup_ready:
 
     printf("Loaded %i addresses from peers.dat  %" PRId64"ms\n",
            addrman.size(), GetTimeMillis() - nStart);
+    StartupTrace("addrman_loaded");
 
 
     // ********************************************************* Step 11: start node
@@ -2490,9 +2531,11 @@ authoritative_startup_ready:
     }
     if (!NewThread(StartNode, NULL))
         InitError(_("Error: could not start node"));
+    StartupTrace("node_thread_started");
 
     if (fServer)
         NewThread(ThreadRPCServer, NULL);
+    StartupTrace("rpc_thread_started");
 
     // Step 11.6: Dandelion++
     if (GetBoolArg("-dandelion", true))
@@ -2510,6 +2553,7 @@ authoritative_startup_ready:
 
     uiInterface.InitMessage(_("Done loading"));
     printf("Done loading\n");
+    StartupTrace("done_loading");
 
     if (!strErrors.str().empty())
         return InitError(strErrors.str());
