@@ -273,6 +273,62 @@ void DeterministicForStudy(unsigned char* buf, int n)
 
 } // namespace
 
+BOOST_AUTO_TEST_CASE(bit_quality_of_candidate_sources)
+{
+    const size_t kBytes = 512 * 1024; // 4 Mbit
+    std::vector<unsigned char> buf(kBytes);
+
+    {
+        LcgProducer p(12345);
+        p.Fill(&buf[0], kBytes);
+        ByteStats st = AnalyzeStream(&buf[0], kBytes);
+        fprintf(stderr, "RNGSTUDY bits source=lcg ones=%.6f chi2_bytes=%.1f max_abs_corr=%.6f runs_z=%.3f\n",
+                st.ones, st.chi2_bytes, st.max_abs_corr, st.runs_z);
+    }
+    {
+        XoshiroProducer p(12345);
+        p.Fill(&buf[0], kBytes);
+        ByteStats st = AnalyzeStream(&buf[0], kBytes);
+        fprintf(stderr, "RNGSTUDY bits source=xoshiro ones=%.6f chi2_bytes=%.1f max_abs_corr=%.6f runs_z=%.3f\n",
+                st.ones, st.chi2_bytes, st.max_abs_corr, st.runs_z);
+    }
+    {
+        CsprngProducer p(12345);
+        p.Fill(&buf[0], kBytes);
+        ByteStats st = AnalyzeStream(&buf[0], kBytes);
+        fprintf(stderr, "RNGSTUDY bits source=csprng ones=%.6f chi2_bytes=%.1f max_abs_corr=%.6f runs_z=%.3f\n",
+                st.ones, st.chi2_bytes, st.max_abs_corr, st.runs_z);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(cost_of_random_bits)
+{
+    const size_t kBytes = 192 * 1024; // 1.5 Mbit: one sampler pass over a 1.5k-coin pool
+    std::vector<unsigned char> buf(kBytes);
+
+    {
+        boost::posix_time::ptime t0 = boost::posix_time::microsec_clock::universal_time();
+        LcgProducer p(7); p.Fill(&buf[0], kBytes);
+        boost::posix_time::ptime t1 = boost::posix_time::microsec_clock::universal_time();
+        fprintf(stderr, "RNGSTUDY cost source=lcg bytes=%zu us=%lld\n", kBytes,
+                (long long)(t1 - t0).total_microseconds());
+    }
+    {
+        boost::posix_time::ptime t0 = boost::posix_time::microsec_clock::universal_time();
+        XoshiroProducer p(7); p.Fill(&buf[0], kBytes);
+        boost::posix_time::ptime t1 = boost::posix_time::microsec_clock::universal_time();
+        fprintf(stderr, "RNGSTUDY cost source=xoshiro bytes=%zu us=%lld\n", kBytes,
+                (long long)(t1 - t0).total_microseconds());
+    }
+    {
+        boost::posix_time::ptime t0 = boost::posix_time::microsec_clock::universal_time();
+        CsprngProducer p(7); p.Fill(&buf[0], kBytes);
+        boost::posix_time::ptime t1 = boost::posix_time::microsec_clock::universal_time();
+        fprintf(stderr, "RNGSTUDY cost source=csprng bytes=%zu us=%lld\n", kBytes,
+                (long long)(t1 - t0).total_microseconds());
+    }
+}
+
 BOOST_AUTO_TEST_CASE(sampler_outcomes_across_pools_and_sources)
 {
     struct Src { const char* name; void (*fn)(unsigned char*, int); };
