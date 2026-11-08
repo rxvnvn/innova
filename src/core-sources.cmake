@@ -109,6 +109,7 @@ set(INNOVA_CORE_SOURCES
     "${CMAKE_SOURCE_DIR}/src/stealth.cpp"
     "${CMAKE_SOURCE_DIR}/src/stealth_crypter.cpp"
     "${CMAKE_SOURCE_DIR}/src/stun.cpp"
+    "${CMAKE_SOURCE_DIR}/src/supply_anchor.cpp"
     "${CMAKE_SOURCE_DIR}/src/sync.cpp"
     "${CMAKE_SOURCE_DIR}/src/txlat.cpp"
     "${CMAKE_SOURCE_DIR}/src/util.cpp"
