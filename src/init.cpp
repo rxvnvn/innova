@@ -1890,31 +1890,52 @@ authoritative_startup_ready:
     RegisterWallet(pwalletMain);
 
     CBlockIndex *pindexRescan = pindexBest;
+    int32_t nRescanFromHeight = pindexRescan ? pindexRescan->nHeight : -1;
     if (GetBoolArg("-rescan"))
     {
         pindexRescan = pindexGenesisBlock;
+        nRescanFromHeight = 0;
     } else
     {
         CWalletDB walletdb(strWalletFileName);
         CBlockLocator locator;
         if (walletdb.ReadBestBlock(locator))
+        {
             pindexRescan = locator.GetBlockIndex();
+            nRescanFromHeight = pindexRescan ? pindexRescan->nHeight : -1;
+            if (g_fAuthoritativeStartup)
+            {
+                // The legacy walk above cannot see the authoritative chain: it
+                // looks locator hashes up in mapBlockIndex, which is EMPTY under
+                // BY_VALUE_AUTHORITATIVE startup, so it returns genesis and the
+                // wallet rescanned the whole chain on EVERY boot. Resolve the
+                // same locator by value (same "first hash on the active chain"
+                // rule). On failure keep the legacy (genesis) start height:
+                // fail-safe, never a silently skipped rescan.
+                int32_t nByValueHeight = -1;
+                if (AuthoritativeResolveLocatorHeight(locator, &nByValueHeight) &&
+                    nByValueHeight >= 0)
+                    nRescanFromHeight = nByValueHeight;
+            }
+        }
     };
 
-    if (pindexBest != pindexRescan && pindexBest && pindexRescan && pindexBest->nHeight > pindexRescan->nHeight)
+    if (pindexBest && nRescanFromHeight >= 0 && pindexBest->nHeight > nRescanFromHeight)
     {
         uiInterface.InitMessage(_("Rescanning..."));
-        printf("Rescanning last %i blocks (from block %i)...\n", pindexBest->nHeight - pindexRescan->nHeight, pindexRescan->nHeight);
+        printf("Rescanning last %i blocks (from block %i)...\n", pindexBest->nHeight - nRescanFromHeight, nRescanFromHeight);
         nStart = GetTimeMillis();
         StartupTrace("rescan_begin");
         if (g_fAuthoritativeStartup)
         {
             // ---- A.10.1q: BY_VALUE_AUTHORITATIVE wallet rescan ----
             // Route through ScanForWalletTransactionsByValue against the SAME
-            // selected generation. Scans from height 0; per-transaction result
-            // parity is preserved because the wallet's nTimeFirstKey birthday
-            // early-continue (mirrored in the by-value scan) skips pre-birthday
-            // blocks, matching the legacy result exactly. Never the pointer walk.
+            // selected generation. Scans from the wallet's resolved best-block
+            // height (by-value locator resolution above), which is the legacy
+            // semantic: blocks at or below it were already applied by this
+            // wallet. When resolution fails the start height stays at genesis,
+            // i.e. exactly the previous (safe, slow) behaviour; the birthday
+            // early-continue inside the scan is unchanged. Never the pointer walk.
             const std::string root = AuthoritativeRootPath();
             const uint64_t gen = AuthoritativeGeneration();
             if (root.empty() || gen == 0)
@@ -1924,7 +1945,7 @@ authoritative_startup_ready:
             std::string genDir = BlockIndexGenerationManager::GenerationPath(root, gen);
             if (!scanReader.Open(genDir, gen, &scanErr))
                 return InitError(strprintf("Block Index V2 authoritative wallet rescan reader open failed: %s", scanErr.c_str()));
-            pwalletMain->ScanForWalletTransactionsByValue(scanReader, 0, true);
+            pwalletMain->ScanForWalletTransactionsByValue(scanReader, nRescanFromHeight, true);
             printf(" rescan (authoritative) %15" PRId64"ms\n", GetTimeMillis() - nStart);
             StartupTrace("rescan_done");
         } else {
@@ -2536,6 +2557,48 @@ authoritative_startup_ready:
     if (fServer)
         NewThread(ThreadRPCServer, NULL);
     StartupTrace("rpc_thread_started");
+
+    // ---- CPU mining autostart from the configuration file ------------------
+    // -gen=1 / -genproclimit=<N> is the config-file equivalent of the manual
+    // `setgenerate true <N>` RPC, which was the ONLY way to start mining before
+    // this: no configuration key existed, so "mine from every start" required a
+    // human (or a script) to call RPC after the fact. The controller is started
+    // here, after the node, the wallet and the RPC server are fully initialized,
+    // so hashing can never begin against an unready tip; the miner's own gates
+    // (IBD/no-peers/chain-stale/collateral) still apply unchanged.
+    // Fail-soft by contract: a mining start failure is logged and NEVER aborts
+    // node startup (the node's job is the chain). Absent keys = unchanged
+    // behaviour (mining off), so this is inert for every existing datadir.
+    if (GetBoolArg("-gen", false))
+    {
+        int nGenThreads = (int)GetArg("-genproclimit", -1);
+        nGenThreads = ResolveCPUMiningThreads(nGenThreads, std::thread::hardware_concurrency());
+        if (nGenThreads < 1 || nGenThreads > CCPUMinerController::MAX_THREADS)
+        {
+            printf("CPU mining autostart skipped: -genproclimit=%d is out of range (1..%d; -1 = all CPUs, capped)\n",
+                   nGenThreads, CCPUMinerController::MAX_THREADS);
+        }
+        else if (pwalletMain == NULL)
+        {
+            printf("CPU mining autostart skipped: -gen=1 requires a loaded wallet (wallet is disabled)\n");
+        }
+        else
+        {
+            std::string strMineErr;
+            if (!GetCPUMinerController().Start(pwalletMain, nGenThreads, strMineErr))
+            {
+                printf("CPU mining autostart FAILED (-gen=1, threads=%d): %s\n",
+                       nGenThreads, strMineErr.c_str());
+            }
+            else
+            {
+                const CCPUMinerController::Status mineStatus = GetCPUMinerController().GetStatus();
+                printf("CPU mining autostart: gen=1 genproclimit=%d -> mining=%d threads=%d\n",
+                       nGenThreads, mineStatus.running ? 1 : 0, mineStatus.activeThreads);
+            }
+        }
+        fflush(stdout);
+    }
 
     // Step 11.6: Dandelion++
     if (GetBoolArg("-dandelion", true))

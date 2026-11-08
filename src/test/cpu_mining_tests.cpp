@@ -610,4 +610,25 @@ BOOST_AUTO_TEST_CASE(time_updates_and_nonce_overflow_keep_lockstep)
     BOOST_CHECK_EQUAL(CoinbaseTooEarlyGate(b), false);
 }
 
+// CONFIG MINING AUTOSTART (perf/startup-phase-timing): -gen / -genproclimit
+// must resolve threads by EXACTLY the same rule as the setgenerate RPC so the
+// two entry points can never drift.
+BOOST_AUTO_TEST_CASE(gen_config_thread_resolution_matches_rpc_rule)
+{
+    // -1 => all hardware threads, capped at the controller maximum (16).
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 0), 1);
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 1), 1);
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 8), 8);
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 16), 16);
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 28), 16);
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-1, 1024), 16);
+    // Explicit counts pass through untouched: the caller validates them, so an
+    // invalid config value is reported instead of being silently clamped.
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(16, 28), 16);
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(1, 28), 1);
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(0, 28), 0);
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(17, 28), 17);
+    BOOST_CHECK_EQUAL(ResolveCPUMiningThreads(-2, 28), -2);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

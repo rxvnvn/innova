@@ -238,9 +238,9 @@ Value setgenerate(const Array& params, bool fHelp)
 
     if (nThreads == -1)
     {
-        unsigned int nHardwareThreads = std::thread::hardware_concurrency();
-        nThreads = nHardwareThreads == 0 ? 1 :
-                   std::min<int>(nHardwareThreads, CCPUMinerController::MAX_THREADS);
+        // Shared with the -gen/-genproclimit startup path (miner.h): one rule,
+        // no drift between the RPC and the config entry point.
+        nThreads = ResolveCPUMiningThreads(-1, std::thread::hardware_concurrency());
     }
 
     if (nThreads == 0)

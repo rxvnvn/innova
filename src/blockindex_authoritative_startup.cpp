@@ -11,6 +11,7 @@
 #include "blockindex_shadow_startup.h"   // RetainBlockIndexAuthoritativeNavigator
 #include "chainstate/observe_hook.h"      // S2.0: V2 store legacy-index guard
 #include "blockindex_v2_reader.h"
+#include "blockindex_manager.h"          // AuthoritativeResolveLocatorHeight
 #include "candidate_frontier.h"
 #include "main.h"
 #include <mutex>              // R4 AUTHORITY_READY barrier
@@ -505,6 +506,42 @@ bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out)
 {
     return AuthoritativeGetActiveSnapshotByHeightR(height, out, NULL) ==
            AUTHORITATIVE_BLOCK_FOUND;
+}
+
+// Startup-only: resolve a CBlockLocator BY VALUE against the authoritative
+// domain and return the height of the FIRST locator hash that is on the active
+// chain (the same rule as the legacy CBlockLocator::GetBlockIndex walk, which
+// also returns the first match and degrades to genesis when nothing matches).
+//
+// Why this exists: CBlockLocator::GetBlockIndex() looks the hashes up in
+// mapBlockIndex. Under BY_VALUE_AUTHORITATIVE startup mapBlockIndex is EMPTY
+// (BLOCKINDEX_RESIDENCY ... map_entries=0), so that walk ALWAYS returns
+// pindexGenesisBlock and the wallet rescan therefore started at height 0 on
+// every single boot ("Rescanning last 8223275 blocks (from block 0)"), even
+// though the wallet had durably recorded its synced block. The persisted
+// locator is not the defect; its resolution under V2 was.
+//
+// Returns false when the locator is empty or no hash is on the active chain;
+// callers must then keep their previous (fail-safe) start height.
+bool AuthoritativeResolveLocatorHeight(const CBlockLocator& locator, int32_t* outHeight)
+{
+    if (outHeight == NULL)
+        return false;
+    // cs_main is a recursive mutex in this codebase: safe whether or not the
+    // caller already holds it (startup holds it not; RPC serving paths do).
+    LOCK(cs_main);
+    for (const uint256& hash : locator.GetHashesVector())
+    {
+        BlockIndexSnapshot snap;
+        std::string resErr;
+        if (ResolveAuthoritativeBlockSnapshot(hash, &snap, &resErr) &&
+            snap.found && snap.fInMainChain)
+        {
+            *outHeight = snap.height;
+            return true;
+        }
+    }
+    return false;
 }
 
 // ROUND-4 P2 (checkpoints.cpp sticky memo): test-only injection counter for

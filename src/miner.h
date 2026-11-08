@@ -194,4 +194,20 @@ private:
 CCPUMinerController& GetCPUMinerController();
 void ShutdownCPUMining();
 
+// Resolve a requested mining thread count into the concrete worker count.
+// Shared by the setgenerate RPC and the -gen/-genproclimit startup path so the
+// two entry points cannot drift: -1 = "all hardware threads", capped at
+// CCPUMinerController::MAX_THREADS; any other value is returned unchanged and
+// validated by the caller (0, < -1 and > MAX_THREADS stay invalid).
+static inline int ResolveCPUMiningThreads(int nRequested, unsigned int nHardwareThreads)
+{
+    if (nRequested != -1)
+        return nRequested;
+    if (nHardwareThreads == 0)
+        return 1;
+    return (nHardwareThreads < (unsigned int)CCPUMinerController::MAX_THREADS)
+               ? (int)nHardwareThreads
+               : CCPUMinerController::MAX_THREADS;
+}
+
 #endif // NOVACOIN_MINER_H

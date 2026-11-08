@@ -51,6 +51,14 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error);
 // need one by-value active-chain record; never materializes historical CBlockIndex.
 bool AuthoritativeGetActiveSnapshotByHeight(int height, BlockIndexSnapshot* out);
 
+// Startup-only by-value resolution of a wallet/best-block CBlockLocator (the
+// CBlockLocator::GetBlockIndex rule) against the authoritative domain. Returns
+// true + the height of the first locator hash on the active chain; false when
+// no locator hash is active (callers keep their fail-safe start height).
+// Exists because mapBlockIndex is EMPTY under BY_VALUE_AUTHORITATIVE startup,
+// which made the legacy walk degrade to genesis on every boot.
+bool AuthoritativeResolveLocatorHeight(const CBlockLocator& locator, int32_t* outHeight);
+
 enum AuthoritativeBlockResolutionResult
 {
     AUTHORITATIVE_BLOCK_FOUND = 0,

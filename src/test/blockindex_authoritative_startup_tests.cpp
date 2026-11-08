@@ -513,4 +513,55 @@ BOOST_AUTO_TEST_CASE(hreg_authoritative_resolution_contract_no_historical_topolo
     g_fAuthoritativeStartup = oldAuthoritative;
 }
 
+// STARTUP-PERF (perf/startup-phase-timing): the wallet's persisted best-block
+// locator must be resolvable BY VALUE. CBlockLocator::GetBlockIndex() walks
+// mapBlockIndex, which is EMPTY under BY_VALUE_AUTHORITATIVE startup, so it
+// degraded to genesis and the wallet rescanned the whole chain on every boot.
+// AuthoritativeResolveLocatorHeight applies the SAME "first locator hash that
+// is on the active chain" rule against the authoritative domain.
+BOOST_AUTO_TEST_CASE(startup_wallet_locator_resolves_by_value_not_mapblockindex)
+{
+    AuthNavFixture fx(6);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(
+        RetainBlockIndexStakingNavigator(fx.root.string(), &error), error);
+
+    const bool oldAuthoritative = g_fAuthoritativeStartup;
+    g_fAuthoritativeStartup = true;
+
+    std::vector<uint256> vHave;
+    vHave.push_back(uint256(0x0deadbeef));   // unknown to this chain
+    vHave.push_back(fx.active[5].hash);      // first ACTIVE hash (priority order)
+    vHave.push_back(fx.active[2].hash);      // active but lower priority
+    CBlockLocator locator(vHave);
+
+    // The legacy walk cannot see any of it: nothing is in mapBlockIndex.
+    for (int h = 0; h <= 6; ++h)
+        BOOST_CHECK(mapBlockIndex.find(fx.active[h].hash) == mapBlockIndex.end());
+    CBlockIndex* pLegacy = locator.GetBlockIndex();
+    BOOST_CHECK(pLegacy == NULL || pLegacy->nHeight != 5);
+
+    // By-value: first ACTIVE locator hash wins, exactly like the legacy rule.
+    int32_t nHeight = -1;
+    BOOST_REQUIRE(AuthoritativeResolveLocatorHeight(locator, &nHeight));
+    BOOST_CHECK_EQUAL(nHeight, 5);
+
+    // A locator with no active hash must fail (caller keeps its genesis start,
+    // i.e. the previous safe-and-slow behaviour — never a skipped rescan).
+    std::vector<uint256> vUnknown(1, uint256(0x12345678));
+    CBlockLocator unknown(vUnknown);
+    int32_t nUnknown = -1;
+    BOOST_CHECK(!AuthoritativeResolveLocatorHeight(unknown, &nUnknown));
+    BOOST_CHECK_EQUAL(nUnknown, -1);
+
+    // Degenerate input: empty locator, null out pointer.
+    std::vector<uint256> vEmpty;
+    CBlockLocator emptyLoc(vEmpty);
+    BOOST_CHECK(!AuthoritativeResolveLocatorHeight(emptyLoc, &nUnknown));
+    BOOST_CHECK(!AuthoritativeResolveLocatorHeight(locator, NULL));
+
+    ClearBlockIndexStakingNavigator();
+    g_fAuthoritativeStartup = oldAuthoritative;
+}
+
 BOOST_AUTO_TEST_SUITE_END()
