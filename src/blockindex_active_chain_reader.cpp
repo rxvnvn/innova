@@ -2,6 +2,8 @@
 // Distributed under the MIT/X11 software license.
 
 #include "blockindex_active_chain_reader.h"
+#include "blockindex_authoritative_live.h"   // post-generation tail resolution
+#include "blockindex_tip.h"
 
 BlockIndexActiveChainReader::BlockIndexActiveChainReader()
     : open_(false)
@@ -55,6 +57,31 @@ int64_t BlockIndexActiveChainReader::GetActiveHeight() const
     const uint256 committedHash = lookup_.CommittedTipHash();
     if (committedHash != uint256(0) && rec.hash != committedHash)
         return -1;
+    // ---- post-generation tail ------------------------------------------------
+    // The node runs ahead of the frozen generation's committed tip S. Extend the
+    // rescan horizon to the mutable authoritative tip when it is open, otherwise
+    // a fresh import would silently miss every block between S and the live tip.
+    // The extended height is accepted only if it resolves through the same
+    // by-value path, so a closed/absent tip authority degrades to S (fail-safe).
+    if (const BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority())
+    {
+        if (live->IsOpen())
+        {
+            const BlockIndexTipAuthority* tipAuth = live->TipAuthority();
+            if (tipAuth && tipAuth->IsOpen())
+            {
+                const BlockIndexTipRead tipRead = tipAuth->GetTip();
+                const int32_t liveTip = (tipRead.status == BLOCK_INDEX_TIP_OK) ? tipRead.height : -1;
+                if (liveTip > tip)
+                {
+                    BlockIndexActiveBlock tailBlock;
+                    std::string tailErr;
+                    if (LookupByHeight(liveTip, &tailBlock, &tailErr))
+                        return liveTip;
+                }
+            }
+        }
+    }
     return tip;
 }
 
@@ -70,12 +97,44 @@ bool BlockIndexActiveChainReader::LookupByHeight(int32_t height,
     BlockIndexRecord rec;
     BlockIndexId id;
     BlockIndexActiveLookupStatus st = lookup_.LookupByHeight(height, &rec, &id, error);
-    if (st != BLOCK_INDEX_ACTIVE_LOOKUP_FOUND)
-        return false;
-    out->hash = rec.hash;
-    out->height = rec.height;
-    out->nFile = rec.nFile;
-    out->nBlockPos = rec.nBlockPos;
-    out->nTime = rec.nTime;
-    return true;
+    if (st == BLOCK_INDEX_ACTIVE_LOOKUP_FOUND)
+    {
+        out->hash = rec.hash;
+        out->height = rec.height;
+        out->nFile = rec.nFile;
+        out->nBlockPos = rec.nBlockPos;
+        out->nTime = rec.nTime;
+        return true;
+    }
+    if (st != BLOCK_INDEX_ACTIVE_LOOKUP_NOT_FOUND)
+        return false; // authority error: fail closed, never fall through
+    // ---- post-generation tail ------------------------------------------------
+    // The immutable generation only covers heights up to its committed tip S. On
+    // mainnet the live node is ~53k blocks ahead of S, so a wallet rescan bounded
+    // by S would silently miss recent history (the very blocks a freshly imported
+    // key needs). Heights above S are ACTIVE-only members of the mutable tip
+    // authority; resolve them there, by value, exactly like the hot resolver does
+    // for consensus consumers. Absent authority => not found (previous behaviour).
+    if (const BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority())
+    {
+        if (live->IsOpen())
+        {
+            const BlockIndexTipAuthority* tip = live->TipAuthority();
+            if (tip && tip->IsOpen())
+            {
+                std::string terr;
+                const BlockIndexTipRead tr = tip->LookupActiveByHeightLogical(height, &terr);
+                if (tr.status == BLOCK_INDEX_TIP_OK)
+                {
+                    out->hash = tr.record.hash;
+                    out->height = tr.record.height;
+                    out->nFile = tr.record.nFile;
+                    out->nBlockPos = tr.record.nBlockPos;
+                    out->nTime = tr.record.nTime;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
 }
