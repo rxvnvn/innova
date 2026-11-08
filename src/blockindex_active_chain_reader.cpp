@@ -5,8 +5,35 @@
 #include "blockindex_authoritative_live.h"   // post-generation tail resolution
 #include "blockindex_tip.h"
 
+namespace {
+
+// The live tail authority is PROCESS-GLOBAL. It must only extend a reader whose
+// own immutable generation it actually continues: same base generation and same
+// committed base-tip hash. Without this guard a stale or unrelated authority
+// (another fixture in the test binary, a previous datadir in-process) silently
+// changes the height GetActiveHeight()/LookupByHeight() report, and a rescan
+// could read blocks that do not belong to the wallet's chain.
+bool TailAuthorityExtendsThisReader(const BlockIndexAuthoritativeLive* live,
+                                    uint64_t generation,
+                                    const uint256& committedTipHash)
+{
+    if (live == NULL || !live->IsOpen() || generation == 0)
+        return false;
+    if (live->BaseGeneration() != generation)
+        return false;
+    const BlockIndexTipAuthority* tip = live->TipAuthority();
+    if (tip == NULL || !tip->IsOpen())
+        return false;
+    if (committedTipHash != uint256(0) && tip->BaseTipHash() != committedTipHash)
+        return false;
+    return true;
+}
+
+} // namespace
+
 BlockIndexActiveChainReader::BlockIndexActiveChainReader()
     : open_(false)
+    , generation_(0)
 {
 }
 
@@ -18,7 +45,8 @@ bool BlockIndexActiveChainReader::Open(const std::string& generationDir,
     if (!FixedBlockIndexShadowActiveLookup::Open(generationDir, &lookup_, error))
         return false;
     open_ = true;
-    (void)generation; // lookup binds records.dat+active.dat+MANIFEST generation coherence
+    generation_ = generation;
+    committedTipHash_ = lookup_.CommittedTipHash();
     return true;
 }
 
@@ -63,23 +91,18 @@ int64_t BlockIndexActiveChainReader::GetActiveHeight() const
     // a fresh import would silently miss every block between S and the live tip.
     // The extended height is accepted only if it resolves through the same
     // by-value path, so a closed/absent tip authority degrades to S (fail-safe).
-    if (const BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority())
+    const BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (TailAuthorityExtendsThisReader(live, generation_, committedTipHash_))
     {
-        if (live->IsOpen())
+        const BlockIndexTipAuthority* tipAuth = live->TipAuthority();
+        const BlockIndexTipRead tipRead = tipAuth->GetTip();
+        const int32_t liveTip = (tipRead.status == BLOCK_INDEX_TIP_OK) ? tipRead.height : -1;
+        if (liveTip > tip)
         {
-            const BlockIndexTipAuthority* tipAuth = live->TipAuthority();
-            if (tipAuth && tipAuth->IsOpen())
-            {
-                const BlockIndexTipRead tipRead = tipAuth->GetTip();
-                const int32_t liveTip = (tipRead.status == BLOCK_INDEX_TIP_OK) ? tipRead.height : -1;
-                if (liveTip > tip)
-                {
-                    BlockIndexActiveBlock tailBlock;
-                    std::string tailErr;
-                    if (LookupByHeight(liveTip, &tailBlock, &tailErr))
-                        return liveTip;
-                }
-            }
+            BlockIndexActiveBlock tailBlock;
+            std::string tailErr;
+            if (LookupByHeight(liveTip, &tailBlock, &tailErr))
+                return liveTip;
         }
     }
     return tip;
@@ -115,25 +138,20 @@ bool BlockIndexActiveChainReader::LookupByHeight(int32_t height,
     // key needs). Heights above S are ACTIVE-only members of the mutable tip
     // authority; resolve them there, by value, exactly like the hot resolver does
     // for consensus consumers. Absent authority => not found (previous behaviour).
-    if (const BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority())
+    const BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    if (TailAuthorityExtendsThisReader(live, generation_, committedTipHash_))
     {
-        if (live->IsOpen())
+        const BlockIndexTipAuthority* tip = live->TipAuthority();
+        std::string terr;
+        const BlockIndexTipRead tr = tip->LookupActiveByHeightLogical(height, &terr);
+        if (tr.status == BLOCK_INDEX_TIP_OK)
         {
-            const BlockIndexTipAuthority* tip = live->TipAuthority();
-            if (tip && tip->IsOpen())
-            {
-                std::string terr;
-                const BlockIndexTipRead tr = tip->LookupActiveByHeightLogical(height, &terr);
-                if (tr.status == BLOCK_INDEX_TIP_OK)
-                {
-                    out->hash = tr.record.hash;
-                    out->height = tr.record.height;
-                    out->nFile = tr.record.nFile;
-                    out->nBlockPos = tr.record.nBlockPos;
-                    out->nTime = tr.record.nTime;
-                    return true;
-                }
-            }
+            out->hash = tr.record.hash;
+            out->height = tr.record.height;
+            out->nFile = tr.record.nFile;
+            out->nBlockPos = tr.record.nBlockPos;
+            out->nTime = tr.record.nTime;
+            return true;
         }
     }
     return false;

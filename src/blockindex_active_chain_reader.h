@@ -63,8 +63,15 @@ public:
     bool LookupByHeight(int32_t height, BlockIndexActiveBlock* out, std::string* error) const;
 
 private:
+    // Identity of the generation this reader was opened on. The post-generation
+    // tail is consulted ONLY for a live authority built on THIS generation (same
+    // base generation AND same committed base tip hash): that authority is
+    // process-global, and an unrelated fixture/stale authority must never change
+    // the height this reader reports.
     FixedBlockIndexShadowActiveLookup lookup_;
     bool open_;
+    uint64_t generation_;
+    uint256 committedTipHash_;
 };
 
 #endif // INNOVA_BLOCKINDEX_ACTIVE_CHAIN_READER_H
