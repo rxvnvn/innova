@@ -185,17 +185,22 @@ struct SPVUtxo
     }
 };
 
-// Test seam: coin selection draws its randomness from this byte source so tests can drive the
-// shuffle and the subset sampler deterministically. Production keeps the default, GetRandBytes
-// (OpenSSL RAND_bytes). Note this is the *source* only -- the selection code never uses the RNG
-// for anything consensus-, key- or signature-related; those paths keep calling GetRandInt.
-extern void (*pfnSelectCoinsRandBytes)(unsigned char* buf, int num);
+// Byte source for coin selection. Coin selection never uses the RNG for anything consensus-,
+// key- or signature-related; those paths keep calling GetRandInt. Tests pass their own source
+// explicitly through SelectCoinsMinConf's last parameter -- there is deliberately no global
+// hook, so production code has no writable pointer that could substitute the wallet's RNG.
+typedef void (*CoinSelectionRandBytesFn)(unsigned char* buf, int num);
 
 // Test/tool entry: runs the subset sampler over synthetic values with an explicit byte source,
 // exercising exactly the code CWallet::SelectCoinsMinConf runs. Not used by production.
 void selectcoins_test_RunSampler(const std::vector<int64_t>& vValues, int64_t nTargetValue,
-                                 int iterations, void (*randbytes)(unsigned char*, int),
+                                 int iterations, CoinSelectionRandBytesFn randbytes,
                                  std::vector<char>& vfBest, int64_t& nBest);
+
+// Test/tool entry: draws nMax-range integers from the same buffered source the wallet uses, so
+// the uniformity and buffer-boundary behaviour of NextInt can be checked directly.
+void selectcoins_test_DrawInts(CoinSelectionRandBytesFn randbytes, int nMax, int nCount,
+                               std::vector<int>& vOut);
 
 /** A CWallet is an extension of a keystore, which also maintains a set of transactions and balances,
  * and provides the ability to create new transactions.
@@ -353,7 +358,9 @@ public:
     bool LoadSPVUtxoCache();
     //void AvailableCoins(std::vector<COutput>& vCoins, bool fOnlyConfirmed=true, const CCoinControl *coinControl=NULL) const;
     void AvailableCoinsMN(std::vector<COutput>& vCoins, bool fOnlyConfirmed=true, bool fOnlyUnlocked=true, const CCoinControl *coinControl = NULL, AvailableCoinsType coin_type=ALL_COINS) const;
-    bool SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, int nConfMine, int nConfTheirs, std::vector<COutput> vCoins, std::set<std::pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64_t& nValueRet, std::map<const CWalletTx*, bool>* pIsFromMeCache = NULL) const;
+    // randBytes is NULL in production (the selection then uses GetRandBytes); tests pass a
+    // deterministic source so the shuffle and the sampler can be reproduced exactly.
+    bool SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, int nConfMine, int nConfTheirs, std::vector<COutput> vCoins, std::set<std::pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64_t& nValueRet, std::map<const CWalletTx*, bool>* pIsFromMeCache = NULL, CoinSelectionRandBytesFn randBytes = NULL) const;
     //bool SelectCoinsMinConf2(int64_t nTargetValue, unsigned int nSpendTime, int nConfMine, int nConfTheirs, std::set<std::pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64_t& nValueRet) const;
     bool SelectCoinsMinConfByCoinAge(int64_t nTargetValue, unsigned int nSpendTime, int nConfMine, int nConfTheirs, std::vector<COutput> vCoins, std::set<std::pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64_t& nValueRet) const;
     bool IsSpent(const uint256& hash, unsigned int n) const;

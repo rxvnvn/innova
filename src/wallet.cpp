@@ -2363,7 +2363,9 @@ class CoinSelectionRng
 public:
     static const size_t CHUNK_BYTES = 4096;
 
-    CoinSelectionRng() : vch(CHUNK_BYTES), nBitPos(CHUNK_BYTES * 8) {}
+    // fn == NULL means production: bytes come from GetRandBytes (OpenSSL RAND_bytes).
+    explicit CoinSelectionRng(CoinSelectionRandBytesFn fn = NULL)
+        : fn(fn ? fn : GetRandBytes), vch(CHUNK_BYTES), nBitPos(CHUNK_BYTES * 8) {}
 
     bool NextBit()
     {
@@ -2392,7 +2394,10 @@ public:
 private:
     void Refill()
     {
-        pfnSelectCoinsRandBytes(&vch[0], (int)vch.size());
+        // Throws on failure (GetRandBytes is fail-closed): selection aborts rather than
+        // continuing with predictable bits. No caller holds wallet state at this point, so the
+        // exception propagates to the RPC layer without leaving a half-built transaction.
+        fn(&vch[0], (int)vch.size());
         nBitPos = 0;
     }
     unsigned char NextByte()
@@ -2404,6 +2409,7 @@ private:
         return b;
     }
 
+    CoinSelectionRandBytesFn fn;
     std::vector<unsigned char> vch;
     size_t nBitPos;
 };
@@ -2413,8 +2419,7 @@ private:
 class ByteSourceBits
 {
 public:
-    typedef void (*Fn)(unsigned char*, int);
-    explicit ByteSourceBits(Fn fn) : fn(fn), nBitPos(CHUNK * 8) {}
+    explicit ByteSourceBits(CoinSelectionRandBytesFn fn) : fn(fn), nBitPos(CHUNK * 8) {}
     bool NextBit()
     {
         if (nBitPos == CHUNK * 8) {
@@ -2427,7 +2432,7 @@ public:
     }
 private:
     static const size_t CHUNK = 4096;
-    Fn fn;
+    CoinSelectionRandBytesFn fn;
     unsigned char buf[CHUNK];
     size_t nBitPos;
 };
@@ -2477,8 +2482,18 @@ static void ApproximateBestSubset(vector<pair<int64_t, pair<const CWalletTx*,uns
     ApproximateBestSubsetImpl(vValue, nTotalLower, nTargetValue, vfBest, nBest, iterations, rng);
 }
 
+void selectcoins_test_DrawInts(CoinSelectionRandBytesFn randbytes, int nMax, int nCount,
+                               std::vector<int>& vOut)
+{
+    CoinSelectionRng rng(randbytes);
+    vOut.clear();
+    vOut.reserve(nCount);
+    for (int i = 0; i < nCount; ++i)
+        vOut.push_back(rng.NextInt(nMax));
+}
+
 void selectcoins_test_RunSampler(const std::vector<int64_t>& vValues, int64_t nTargetValue,
-                                 int iterations, void (*randbytes)(unsigned char*, int),
+                                 int iterations, CoinSelectionRandBytesFn randbytes,
                                  std::vector<char>& vfBest, int64_t& nBest)
 {
     vector<pair<int64_t, pair<const CWalletTx*,unsigned int> > > vValue;
@@ -2820,10 +2835,7 @@ bool less_then_denom (const COutput& out1, const COutput& out2)
 
 static bool CmpDepth(const CWalletTx* a, const CWalletTx* b) { return a->nTime > b->nTime; }
 
-// Production: OpenSSL RAND_bytes. Tests substitute a deterministic byte stream.
-void (*pfnSelectCoinsRandBytes)(unsigned char* buf, int num) = GetRandBytes;
-
-bool CWallet::SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, int nConfMine, int nConfTheirs, vector<COutput> vCoins, set<pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64_t& nValueRet, std::map<const CWalletTx*, bool>* pIsFromMeCache) const
+bool CWallet::SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, int nConfMine, int nConfTheirs, vector<COutput> vCoins, set<pair<const CWalletTx*,unsigned int> >& setCoinsRet, int64_t& nValueRet, std::map<const CWalletTx*, bool>* pIsFromMeCache, CoinSelectionRandBytesFn randBytes) const
 {
     setCoinsRet.clear();
     nValueRet = 0;
@@ -2837,7 +2849,7 @@ bool CWallet::SelectCoinsMinConf(int64_t nTargetValue, unsigned int nSpendTime, 
 
     // One RNG instance per selection: the shuffle and both sampler passes draw from the same
     // buffered stream, exactly as they drew from one continuous GetRandInt sequence before.
-    CoinSelectionRng rng;
+    CoinSelectionRng rng(randBytes);
     struct RandIntFromRng {
         CoinSelectionRng* rng;
         int operator()(int nMax) const { return rng->NextInt(nMax); }

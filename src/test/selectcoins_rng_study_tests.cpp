@@ -57,7 +57,7 @@ struct XoshiroSource {
 };
 
 // C. Buffered CSPRNG (the shipped variant): plain GetRandBytes in 4 KiB chunks.
-//    No state of our own -- this is exactly pfnSelectCoinsRandBytes = GetRandBytes.
+//    No state of our own -- this is exactly the production source, GetRandBytes.
 
 // Generic bit-reader over a byte producer, mirroring CoinSelectionRng/ByteSourceBits.
 template <typename Producer>

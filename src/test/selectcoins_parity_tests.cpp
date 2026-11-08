@@ -26,13 +26,6 @@
 
 BOOST_AUTO_TEST_SUITE(selectcoins_parity_tests)
 
-// Restores the production hook no matter how the case ends.
-struct HookGuard
-{
-    HookGuard() {}
-    ~HookGuard() { pfnSelectCoinsRandBytes = GetRandBytes; }
-};
-
 namespace { static const int64_t CENT_7 = 7 * CENT; static const int64_t CENT_10 = 10 * CENT; }
 
 namespace
@@ -152,7 +145,6 @@ Result RunSelection(CWallet& wallet, int64_t nTarget, unsigned int nSpendTime,
     r.fOk = false;
     r.nValue = 0;
 
-    pfnSelectCoinsRandBytes = DeterministicRandBytes;
     std::map<const CWalletTx*, bool>* pCache = NULL;
     std::map<const CWalletTx*, bool> cache;
     if (fUseCache)
@@ -165,7 +157,7 @@ Result RunSelection(CWallet& wallet, int64_t nTarget, unsigned int nSpendTime,
         setCoins.clear();
         r.nValue = 0;
         r.fOk = wallet.SelectCoinsMinConf(nTarget, nSpendTime, tiers[t][0], tiers[t][1],
-                                          vCoins, setCoins, r.nValue, pCache);
+                                          vCoins, setCoins, r.nValue, pCache, DeterministicRandBytes);
         if (r.fOk)
             break;
     }
@@ -181,8 +173,6 @@ void Compare(const char* name, int64_t nTarget, unsigned int nSpendTime,
 {
     // Two independent wallets with identical coin specs: running both paths on ONE fixture lets
     // the first run warm wallet-side caches and would compare state, not algorithms.
-    HookGuard guard;
-    (void)guard;
     Result ref, opt;
     {
         WalletFixture fx;
@@ -257,7 +247,6 @@ BOOST_AUTO_TEST_CASE(same_selection_single_larger_coin)
 
 BOOST_AUTO_TEST_CASE(same_failure_when_insufficient)
 {
-    HookGuard guard; (void)guard;
     std::vector<CoinSpec> specs;
     for (int i = 0; i < 20; ++i)
     {
@@ -284,7 +273,6 @@ BOOST_AUTO_TEST_CASE(same_failure_when_insufficient)
 
 BOOST_AUTO_TEST_CASE(same_selection_denominated_amounts)
 {
-    HookGuard guard; (void)guard;
     // tryDenom == 0 rejects denominated values; both paths must pick the same side of the branch.
     WalletFixture fx;
     std::vector<CoinSpec> specs;
@@ -305,7 +293,6 @@ BOOST_AUTO_TEST_CASE(same_seed_reproduces_same_selection)
 {
     // The sampler spends one seed draw and expands it with a cheap PRNG instead of calling
     // RAND_bytes() for every bit; a fixed seed must therefore reproduce the same selection.
-    HookGuard guard; (void)guard;
     std::vector<CoinSpec> specs;
     for (int i = 0; i < 200; ++i)
     {
