@@ -8,6 +8,9 @@
 #include "key.h"
 #include <boost/version.hpp>
 #include <boost/filesystem.hpp>
+#include <atomic>
+#include <thread>
+#include <vector>
 
 using namespace std;
 namespace fs = boost::filesystem;
@@ -614,12 +617,122 @@ static bool IsKeyType(string strType)
             strType == "mkey" || strType == "ckey");
 }
 
+// ---- WALLET-LOAD PARALLELISM (perf/startup-phase-timing) -------------------
+// Records are read from the BDB cursor (single-threaded: a Dbc is not
+// shareable), the STATELESS per-key preparation is computed for a bounded batch
+// in parallel, and every record is then applied strictly in cursor order under
+// cs_wallet. Nothing about ordering, counters, error text or the canonical
+// fallback path changes; only the CPU cost of PrepareKeyRecord is spread over
+// threads. Batch memory is bounded: WALLET_LOAD_BATCH records of a few hundred
+// bytes (key material only, never whole transactions).
+static const size_t WALLET_LOAD_BATCH = 64;
+
+class CWalletLoadPending
+{
+public:
+    CDataStream ssKey;
+    CDataStream ssValue;
+    CPreparedKeyRecord prepared;
+    bool fKeyRecord;
+    bool fWKey;
+    bool fPrepared;
+
+    CWalletLoadPending()
+        : ssKey(SER_DISK, CLIENT_VERSION), ssValue(SER_DISK, CLIENT_VERSION),
+          fKeyRecord(false), fWKey(false), fPrepared(false) {}
+};
+
+static void PrepareWalletLoadBatchParallel(std::vector<CWalletLoadPending>& batch, int nThreads)
+{
+    if (nThreads <= 1 || batch.size() <= 1)
+    {
+        for (size_t i = 0; i < batch.size(); ++i)
+            if (batch[i].fKeyRecord)
+                batch[i].fPrepared = PrepareKeyRecord(batch[i].ssKey, batch[i].ssValue,
+                                                      batch[i].fWKey, batch[i].prepared);
+        return;
+    }
+    std::atomic<size_t> next(0);
+    auto worker = [&batch, &next]() {
+        for (;;)
+        {
+            const size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= batch.size())
+                return;
+            CWalletLoadPending& p = batch[i];
+            if (p.fKeyRecord)
+                p.fPrepared = PrepareKeyRecord(p.ssKey, p.ssValue, p.fWKey, p.prepared);
+        }
+    };
+    std::vector<std::thread> threads;
+    threads.reserve((size_t)nThreads);
+    for (int t = 0; t < nThreads; ++t)
+        threads.push_back(std::thread(worker));
+    for (size_t t = 0; t < threads.size(); ++t)
+        threads[t].join();
+}
+
 DBErrors CWalletDB::LoadWallet(CWallet* pwallet)
 {
     pwallet->vchDefaultKey = CPubKey();
     CWalletScanState wss;
     bool fNoncriticalErrors = false;
     DBErrors result = DB_LOAD_OK;
+
+    // WALLET-LOAD PARALLELISM (perf/startup-phase-timing).
+    // The expensive part of loading a large wallet is the per-record key
+    // preparation (decode + EC re-derivation/verification of the public key,
+    // ~1.7 ms/key on production wallets): it is STATELESS and was already moved
+    // outside cs_wallet by the P2 locktrace work. PrepareKeyRecord therefore
+    // runs here over a bounded batch of records in a small thread pool, and the
+    // records are then APPLIED STRICTLY IN CURSOR ORDER under cs_wallet. Cursor
+    // reads stay single-threaded (BDB Dbc is not shareable), application order,
+    // counters, error strings and the canonical fallback path are unchanged.
+    //   -walletloadthreads=1  -> previous strictly sequential behaviour.
+    //   -walletloadthreads=N  -> N prep threads (capped at 8).
+    //   unset                 -> min(8, hardware_concurrency()).
+    int nWalletLoadThreads = (int)GetArg("-walletloadthreads", -1);
+    if (nWalletLoadThreads <= 0)
+    {
+        const unsigned int nHw = std::thread::hardware_concurrency();
+        nWalletLoadThreads = (nHw == 0) ? 1 : (int)((nHw < 8) ? nHw : 8);
+    }
+    if (nWalletLoadThreads > 8)
+        nWalletLoadThreads = 8;
+
+    std::vector<CWalletLoadPending> batch;
+    batch.reserve(WALLET_LOAD_BATCH);
+
+    auto FlushBatch = [&](bool fForce) {
+        if (batch.empty() || (!fForce && batch.size() < WALLET_LOAD_BATCH))
+            return;
+        PrepareWalletLoadBatchParallel(batch, nWalletLoadThreads);
+        for (size_t i = 0; i < batch.size(); ++i)
+        {
+            CWalletLoadPending& p = batch[i];
+            string strType, strErr;
+            LOCK(pwallet->cs_wallet);
+            if (!ReadKeyValue(pwallet, p.ssKey, p.ssValue, wss, strType, strErr,
+                              p.fPrepared ? &p.prepared : NULL))
+            {
+                // losing keys is considered a catastrophic error, anything else
+                // we assume the user can live with:
+                if (IsKeyType(strType))
+                    result = DB_CORRUPT;
+                else
+                {
+                    // Leave other errors alone, if we try to fix them we might make things worse.
+                    fNoncriticalErrors = true; // ... but do warn the user there is something wrong.
+                    if (strType == "tx")
+                        // Rescan if there is a bad transaction record:
+                        SoftSetBoolArg("-rescan", true);
+                }
+            }
+            if (!strErr.empty())
+                printf("%s\n", strErr.c_str());
+        }
+        batch.clear();
+    };
 
     try {
         // P2 (walletdb): do NOT hold cs_wallet across the whole cursor walk.
@@ -663,12 +776,12 @@ DBErrors CWalletDB::LoadWallet(CWallet* pwallet)
                 return DB_CORRUPT;
             }
 
-            // P2 (walletdb): decode plain "key"/"wkey" records while unlocked
-            // (pure serialization + EC verification, no wallet state). Probe
-            // the record type from a copy of the key stream; ReadKeyValue
-            // still parses the original stream itself.
-            CPreparedKeyRecord prepared;
-            bool fPreparedOk = false;
+            // Queue the record for the batched prepare/apply path. The record
+            // type probe is cheap; only "key"/"wkey" records carry the expensive
+            // stateless key preparation.
+            CWalletLoadPending pending;
+            pending.ssKey = ssKey;
+            pending.ssValue = ssValue;
             {
                 CDataStream ssProbe(ssKey);
                 string probeType;
@@ -678,31 +791,17 @@ DBErrors CWalletDB::LoadWallet(CWallet* pwallet)
                 }
                 catch (...) { probeType.clear(); }
                 if (probeType == "key" || probeType == "wkey")
-                    fPreparedOk = PrepareKeyRecord(ssKey, ssValue, probeType == "wkey", prepared);
-            }
-
-            // Try to be tolerant of single corrupt records:
-            string strType, strErr;
-            LOCK(pwallet->cs_wallet);
-            if (!ReadKeyValue(pwallet, ssKey, ssValue, wss, strType, strErr,
-                              fPreparedOk ? &prepared : NULL))
-            {
-                // losing keys is considered a catastrophic error, anything else
-                // we assume the user can live with:
-                if (IsKeyType(strType))
-                    result = DB_CORRUPT;
-                else
                 {
-                    // Leave other errors alone, if we try to fix them we might make things worse.
-                    fNoncriticalErrors = true; // ... but do warn the user there is something wrong.
-                    if (strType == "tx")
-                        // Rescan if there is a bad transaction record:
-                        SoftSetBoolArg("-rescan", true);
+                    pending.fKeyRecord = true;
+                    pending.fWKey = (probeType == "wkey");
                 }
             }
-            if (!strErr.empty())
-                printf("%s\n", strErr.c_str());
+            batch.push_back(pending);
+            if (batch.size() >= WALLET_LOAD_BATCH)
+                FlushBatch(true);
         }
+        // Apply the trailing partial batch (same in-order application path).
+        FlushBatch(true);
         pcursor->close();
     }
     catch (...)

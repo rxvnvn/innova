@@ -95,4 +95,5 @@ set(INNOVA_TEST_SOURCES
     "${CMAKE_SOURCE_DIR}/src/test/stakemodifieropt_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/staking_production_integration_tests.cpp"
     "${CMAKE_SOURCE_DIR}/src/test/test_innova.cpp"
+    "${CMAKE_SOURCE_DIR}/src/test/wallet_load_parallel_tests.cpp"
 )
