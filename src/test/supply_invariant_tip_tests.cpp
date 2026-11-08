@@ -669,4 +669,94 @@ BOOST_AUTO_TEST_CASE(si_carry_released_edge_no_identity_fails_closed)
     delete child.phashBlock;
 }
 
+// MS-ANCHOR (2026-11-08): the gap that allowed the observed mainnet re-base even
+// WITH a resident parent object. A parent object that never went through
+// ConnectBlock (a never-connected side object, a stale/duplicate twin) carries
+// nMoneySupply == 0 and nSupplyAuthority == 0. It must NEVER be used as a carry
+// source: the resolver has to read the authoritative record instead.
+BOOST_AUTO_TEST_CASE(si_carry_unverified_resident_parent_uses_authoritative_record)
+{
+    const int S = 6;
+    SIGenFixture fx(S);
+    uint256 parentHash = fx.active[S];      // published record carries 777000
+    CBlockIndex parent;                     // NEVER connected: accumulator 0, unmarked
+    parent.phashBlock = &parentHash;
+    parent.nHeight = S;
+    parent.nMoneySupply = 0;
+    BOOST_REQUIRE_EQUAL(parent.nSupplyAuthority, 0);
+
+    CBlockIndex child;
+    child.pprev = &parent;
+    child.nHeight = S + 1;
+    int64_t supply = -1;
+    std::string err;
+    const bool ok = ResolveConnectParentSupplyForTesting(&child, supply, err);
+    BOOST_CHECK_MESSAGE(ok, "an unverified resident parent must resolve from the record; err=" << err);
+    BOOST_CHECK_MESSAGE(supply == 777000LL,
+        "the carry must be the authoritative record's cumulative (777000), never the "
+        "uninitialized in-memory zero; got " << supply);
+}
+
+// A resident/twin parent that is NOT an authoritative carry source has its
+// in-memory value IGNORED: the persisted record wins (that is exactly how a
+// stale/duplicate object can no longer re-base the accumulator).
+BOOST_AUTO_TEST_CASE(si_carry_unverified_resident_parent_value_is_ignored)
+{
+    const int S = 6;
+    SIGenFixture fx(S);
+    uint256 parentHash = fx.active[S];
+    CBlockIndex parent;
+    parent.phashBlock = &parentHash;
+    parent.nHeight = S;
+    parent.nMoneySupply = 5; // stale/duplicate object, unmarked
+    CBlockIndex child;
+    child.pprev = &parent;
+    child.nHeight = S + 1;
+    int64_t supply = -1;
+    std::string err;
+    BOOST_CHECK(ResolveConnectParentSupplyForTesting(&child, supply, err));
+    BOOST_CHECK_MESSAGE(supply == 777000LL,
+                        "the record must win over an unverified in-memory value; got " << supply);
+}
+
+// An unverified resident parent whose block is NOT in the authoritative store
+// cannot be resolved at all: fail closed (never assume zero).
+BOOST_AUTO_TEST_CASE(si_carry_unverified_resident_parent_unresolvable_fails_closed)
+{
+    const int S = 6;
+    SIGenFixture fx(S);
+    uint256 unknownHash(0x5203D00DUL);
+    CBlockIndex parent;
+    parent.phashBlock = &unknownHash;
+    parent.nHeight = S;
+    parent.nMoneySupply = 0;
+    CBlockIndex child;
+    child.pprev = &parent;
+    child.nHeight = S + 1;
+    int64_t supply = -1;
+    std::string err;
+    BOOST_CHECK(!ResolveConnectParentSupplyForTesting(&child, supply, err));
+    BOOST_CHECK(!err.empty());
+    BOOST_CHECK_EQUAL(supply, 0LL);
+}
+
+// The forward-sync fast path: a VERIFIED parent object (one whose accumulator
+// came from the authoritative record / a connect against it) is used directly,
+// with no store read and no behavioural change.
+BOOST_AUTO_TEST_CASE(si_carry_verified_resident_parent_is_trusted_directly)
+{
+    CBlockIndex parent;
+    parent.phashBlock = NULL;
+    parent.nHeight = 41;
+    parent.nMoneySupply = 770077;
+    parent.nSupplyAuthority = 1;
+    CBlockIndex child;
+    child.pprev = &parent;
+    child.nHeight = 42;
+    int64_t supply = 0;
+    std::string err;
+    BOOST_CHECK(ResolveConnectParentSupplyForTesting(&child, supply, err));
+    BOOST_CHECK_EQUAL(supply, 770077LL);
+}
+
 BOOST_AUTO_TEST_SUITE_END()

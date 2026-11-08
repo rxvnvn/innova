@@ -51,6 +51,8 @@ public:
         p->nNonce     = s.nNonce;
         p->nMint      = s.nMint;
         p->nMoneySupply = s.nMoneySupply;
+        // MS-ANCHOR: materialized from the authoritative record -> carry source.
+        p->nSupplyAuthority = 1;
         p->nStakeModifier = s.nStakeModifier;
         // Preserve the authority's nFlags (BLOCK_STAKE_MODIFIER / GENERATED for
         // genesis + stake blocks) — the legacy consensus walks rely on them.

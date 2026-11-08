@@ -255,6 +255,7 @@ OBJS= \
     obj/blockindex_residency_counters.o \
     obj/blockindex_v2_reader.o \
     obj/blockindex_manager.o \
+    obj/supply_anchor.o \
     obj/blockindex_authority_materializer.o \
     obj/minizip/ioapi.o \
     obj/minizip/unzip.o
@@ -336,6 +337,8 @@ TEST_OBJS= \
     obj/test/blockindex_recovery_tool_tests.o \
     obj/test/blockindex_legacy_rollback_tests.o \
     obj/test/blockindex_window2_e2e_tests.o \
+    obj/test/supply_invariant_tip_tests.o \
+    obj/test/supply_anchor_tests.o \
     obj/test/errorlog_reorg_tests.o \
     obj/test/blockindex_fold_tool_tests.o \
     obj/test/blockindex_p7_end_to_end_tests.o \

@@ -10,6 +10,7 @@
 #include "init.h"
 #include "blockindex_authoritative_live.h"
 #include "main.h"
+#include "supply_anchor.h"
 #include "chainstate/observe_hook.h"   // S1.7 off-by-default Store3A mirror during -loadblock replay
 #include "kernel.h"
 #include "miner.h"
@@ -1612,6 +1613,23 @@ bool AppInit2()
                     : ""));
         printf(" block index (authoritative) %" PRId64"ms\n", GetTimeMillis() - nStart);
         StartupTrace("blockindex_authoritative_loaded");
+
+        // MS-ANCHOR: verify the persisted cumulative money supply against the
+        // INDEPENDENT block-data anchors before any RPC consumer can report it.
+        // A violation does not stop the node (availability; the block index and
+        // UTXO state are intact and the accumulator is derived accounting), but
+        // it is published through the verification state so `moneysupply` is
+        // never presented as a successful, plausible value again.
+        {
+            std::string msAnchorDetail;
+            const bool msAnchorOk = VerifyMoneySupplyAnchors(nBestHeight, &msAnchorDetail);
+            printf("SUPPLY_ANCHOR startup height=%d verdict=%s ok=%d detail=%s\n",
+                   nBestHeight,
+                   MoneySupplyVerificationName(GetMoneySupplyVerification()),
+                   msAnchorOk ? 1 : 0, msAnchorDetail.c_str());
+            fflush(stdout);
+            StartupTrace("money_supply_anchor_checked");
+        }
 
         // V2-R2B (FIX A): load the persisted synchronized checkpoint into the
         // process checkpoint authority. The legacy startup did this inside

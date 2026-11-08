@@ -644,12 +644,21 @@ Value getinfo(const Array& params, bool fHelp)
     // on the authoritative path (a failure fails closed rather than falling back).
     {
         BlockIndexSnapshot tipSnapshot; std::string tipError;
+        bool haveValue = false;
+        int64_t recordedSupply = 0;
         if (GetBlockIndexManager().GetTip(&tipSnapshot, &tipError) == BLOCK_INDEX_MANAGER_OK)
-            obj.push_back(Pair("moneysupply", ValueFromAmount(tipSnapshot.nMoneySupply)));
+        {
+            haveValue = true;
+            recordedSupply = tipSnapshot.nMoneySupply;
+        }
         else if (g_fAuthoritativeStartup)
             throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Money supply unavailable" : tipError);
-        else
-            obj.push_back(Pair("moneysupply", ValueFromAmount(pindexBest->nMoneySupply)));
+        else if (pindexBest != NULL)
+        {
+            haveValue = true;
+            recordedSupply = pindexBest->nMoneySupply;
+        }
+        AppendMoneySupplyFields(obj, recordedSupply, haveValue);
     }
     obj.push_back(Pair("connections",   nConnections));
     obj.push_back(Pair("datareceived",  bytesReadable(CNode::GetTotalBytesRecv())));

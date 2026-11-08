@@ -605,6 +605,8 @@ CBlockIndex* FullFromSnapshot(const BlockIndexSnapshot& s, uint256* ownHash)
     p->nNonce     = s.nNonce;
     p->nMint      = s.nMint;
     p->nMoneySupply = s.nMoneySupply;
+    // MS-ANCHOR: materialized from the authoritative record -> legitimate carry source.
+    p->nSupplyAuthority = 1;
     p->nStakeModifier = s.nStakeModifier;
     // G1-A: the by-value snapshot carries the authority's nFlags (incl.
     // BLOCK_STAKE_MODIFIER / BLOCK_GENERATED for genesis + stake blocks). These

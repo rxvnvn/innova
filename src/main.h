@@ -14,6 +14,7 @@
 #include "script.h"
 #include "scrypt.h"
 #include "hashblock.h"
+struct BlockIndexSnapshot;
 
 #include <list>
 
@@ -613,6 +614,18 @@ void ClearAuthoritativeConnectSupplyForTesting();
 bool ResolveConnectParentSupplyForTesting(CBlockIndex* pindex,
                                           int64_t& outSupply,
                                           std::string& outErr);
+// MS-ANCHOR (money-supply absolute reference): verify the ACTIVE record at the
+// newest APPLICABLE independent supply anchor (a matching canonical block hash)
+// against the anchor's satoshi-exact expected cumulative supply. Publishes the
+// result through the MoneySupplyVerification state so RPC consumers can refuse
+// to present an unverified number as a success. Returns false on VIOLATION.
+// `resolver` (test seam) overrides the production active-by-height resolver.
+typedef bool (*MoneySupplyAnchorResolver)(int32_t height, BlockIndexSnapshot* out,
+                                          std::string* error);
+bool VerifyMoneySupplyAnchors(int32_t tipHeight, std::string* detail);
+bool VerifyMoneySupplyAnchorsWithResolver(int32_t tipHeight,
+                                          MoneySupplyAnchorResolver resolver,
+                                          std::string* detail);
 // Called from the V2 block-index load after setInvalidBlockHash is
 // loaded and the naive pindexBest reconstructed: rolls the best chain back to
 // the highest valid ancestor if it descends from an operator-invalidated block.
@@ -1515,6 +1528,13 @@ public:
 
     int64_t nMint;
     int64_t nMoneySupply;
+    // MS-ANCHOR (runtime-only, NOT serialized): non-zero when this object's
+    // nMoneySupply came from the PERSISTED authoritative record (materializer)
+    // or was computed by ConnectBlock from an authoritative parent. Only such an
+    // object may be used as a money-supply CARRY SOURCE; a never-connected side
+    // object leaves this 0 and its (always zero) accumulator is never trusted.
+    // See ConnectBlockResolveParentSupply in main.cpp.
+    uint8_t nSupplyAuthority;
 
     uint64_t nStakeModifier; // hash modifier for proof-of-stake
     // in-memory only (NOT serialized): block time of the last generated stake
@@ -1570,6 +1590,7 @@ public:
         nChainTrust = 0;
         nMint = 0;
         nMoneySupply = 0;
+        nSupplyAuthority = 0;
         nFlags = 0;
         nStakeModifier = 0;
         nStakeModifierChecksum = 0;
@@ -1598,6 +1619,7 @@ public:
         nChainTrust = 0;
         nMint = 0;
         nMoneySupply = 0;
+        nSupplyAuthority = 0;
         nFlags = 0;
         nStakeModifier = 0;
         nStakeModifierChecksum = 0;

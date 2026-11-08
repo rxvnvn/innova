@@ -36,6 +36,7 @@
 #include "blockindex_authoritative_live.h"
 #include "blockindex_shadow_startup.h"
 #include "blockindex_manager.h"
+#include "supply_anchor.h"
 #include "blockrequesttrace.h"
 #include "hreg_registration.h"
 #include "chainstate/observe.h"            // S1.6-2 authoritative observation adapter
@@ -6735,32 +6736,71 @@ static bool g_reorgConnectTrailArmed = false;
 // V2 MS-FIX2 CONNECT PARENT CARRY (extracted so tests can exercise the exact
 // carry path ResolveConnectParentSupplyContract): resolves the cumulative
 // nMoneySupply ConnectBlock must base a non-genesis block's own accumulator on.
-// Preference: (1) a REAL map-resident pprev object; (2) in armed-V2, the
-// pointer-free parent identity hashPrevStable resolved BY VALUE from the
-// authoritative live store (released-edge reconnect). FAILS CLOSED (returns
-// false with outErr set) whenever no authoritative ancestor snapshot can be
-// resolved for a released edge with a parent identity, or when an armed-V2
-// non-genesis released edge carries NO parent identity at all: a re-based
-// accumulator must never be persisted. Returns true with outSupply = 0 only
-// for legacy mode or an identity-less released edge that is NOT armed-V2
-// (unchanged legacy semantics).
+//
+// MS-ANCHOR (2026-11-08): the accumulator is NOT inherited from in-memory index
+// state any more. The pre-fix contract trusted `pprev->nMoneySupply`
+// unconditionally, which is the recurring source of the money-supply re-base
+// defect: ANY in-memory parent object whose accumulator was never initialized
+// (a never-connected side object, an operation-scoped materialized twin, a
+// duplicate object for the same hash left over from an earlier accept) yields a
+// silent re-base to that object's value -- observed on mainnet as a 11,073,709.42
+// INN parent followed by a 0.20000000 INN child, with the parent's PERSISTED
+// record still correct. The invariant gate cannot see it: the poisoned chain is
+// internally consistent.
+//
+// Contract now:
+//   * pprev is a VERIFIED CARRY SOURCE only when its accumulator was itself
+//     obtained from the authoritative record or from a connect against one
+//     (CBlockIndex::nSupplyAuthority). Then its value is used with O(1) cost
+//     (the forward-sync fast path stays free of any store read).
+//   * otherwise the parent's cumulative supply is resolved BY VALUE from the
+//     persisted authoritative record (pointer-free identity: pprev hash, else
+//     hashPrevStable) and the record WINS over any in-memory value (a stale or
+//     never-connected twin can therefore no longer re-base the accumulator); the
+//     disagreement is logged as SUPPLY_CARRY_STALE_OBJECT evidence.
+//   * legacy/non-authoritative mode keeps the historical semantics verbatim.
+// FAILS CLOSED (returns false with outErr set) whenever no authoritative
+// ancestor snapshot can be resolved for a released edge with a parent identity,
+// or when an armed-V2 non-genesis released edge carries NO parent identity at
+// all. Returns true with outSupply = 0 only for legacy mode or an identity-less
+// released edge that is NOT armed-V2 (unchanged legacy semantics).
 static bool ConnectBlockResolveParentSupply(CBlockIndex* pindex,
                                             int64_t& outSupply,
                                             std::string& outErr)
 {
     outSupply = 0;
     outErr.clear();
-    if (pindex->pprev != NULL)
+    if (pindex->nHeight <= 0)
+        return true; // genesis: no parent
+    if (!g_fAuthoritativeStartup)
+    {
+        // Legacy mode keeps its previous semantics (no V2 authority to consult).
+        if (pindex->pprev != NULL)
+            outSupply = pindex->pprev->nMoneySupply;
+        return true;
+    }
+    // Fast path: a parent object whose accumulator came from the authoritative
+    // record (or from a connect against one) is a legitimate carry source.
+    if (pindex->pprev != NULL && pindex->pprev->nSupplyAuthority)
     {
         outSupply = pindex->pprev->nMoneySupply;
         return true;
     }
-    if (pindex->nHeight <= 0)
-        return true; // genesis: no parent
-    if (!g_fAuthoritativeStartup)
-        return true; // legacy mode keeps its previous semantics
-    if (pindex->hashPrevStable == uint256(0))
+    // Resolve by value. The identity must NOT depend on the in-memory edge.
+    uint256 parentHash(0);
+    if (pindex->pprev != NULL && pindex->pprev->phashBlock != NULL)
+        parentHash = pindex->pprev->GetBlockHash();
+    else if (pindex->hashPrevStable != uint256(0))
+        parentHash = pindex->hashPrevStable;
+    if (parentHash == uint256(0))
     {
+        if (pindex->pprev != NULL)
+        {
+            // Non-authoritative synthetic parent object (no stable identity):
+            // only the harness builds these; keep the historical value contract.
+            outSupply = pindex->pprev->nMoneySupply;
+            return true;
+        }
         outErr = "released-edge reconnect without parent identity (hashPrevStable missing); refusing to re-base the money supply";
         return false;
     }
@@ -6768,13 +6808,25 @@ static bool ConnectBlockResolveParentSupply(CBlockIndex* pindex,
     std::string msParentErr;
     BlockIndexSnapshot msParentSnap;
     if (msLive == NULL || !msLive->IsOpen() ||
-        msLive->ResolveBlockSnapshot(pindex->hashPrevStable, &msParentSnap, &msParentErr)
+        msLive->ResolveBlockSnapshot(parentHash, &msParentSnap, &msParentErr)
             != BlockIndexHotStatus::OK || !msParentSnap.found)
     {
         outErr = msParentErr.empty()
                      ? "authoritative live authority unavailable"
                      : msParentErr;
         return false;
+    }
+    if (pindex->pprev != NULL && pindex->pprev->nMoneySupply != msParentSnap.nMoneySupply)
+    {
+        // An UNVERIFIED resident object (never connected / stale twin) carried a
+        // different accumulator. It is not a carry source by contract, so the
+        // authoritative record WINS; the disagreement is logged as evidence of a
+        // stale/duplicate in-memory index object (the historical re-base source).
+        LogPrintf("SUPPLY_CARRY_STALE_OBJECT ignored in-memory=%lld authoritative=%lld hash=%s height=%d\n",
+                  (long long)pindex->pprev->nMoneySupply,
+                  (long long)msParentSnap.nMoneySupply,
+                  parentHash.ToString().substr(0, 20).c_str(),
+                  (int)msParentSnap.height);
     }
     outSupply = msParentSnap.nMoneySupply;
     return true;
@@ -6787,6 +6839,111 @@ bool ResolveConnectParentSupplyForTesting(CBlockIndex* pindex,
                                           std::string& outErr)
 {
     return ConnectBlockResolveParentSupply(pindex, outSupply, outErr);
+}
+
+// ---------------------------------------------------------------------------
+// MS-ANCHOR: absolute money-supply verification against the independent anchor
+// table (supply_anchor.h). This is ACCOUNTING ONLY -- it never participates in
+// block acceptance, validation or consensus, and it never mutates the store.
+//
+// The per-block identity (supply(h) == supply(h-1) + mint - fees - burned) is
+// satisfied by ANY consistently re-based chain, so it cannot detect an already
+// poisoned accumulator. The anchors are satoshi-exact cumulative supplies
+// derived from the chain's OWN block bytes, so a disagreement proves that the
+// persisted accumulator has diverged from the chain it describes.
+//
+// An anchor applies only when the ACTIVE chain still carries its canonical
+// block hash at that height; a legitimate reorganisation makes it INAPPLICABLE
+// (we fall back to the next lower anchor) instead of raising a false alarm.
+// ---------------------------------------------------------------------------
+static bool MSResolveActiveByHeight(int32_t height, BlockIndexSnapshot* out,
+                                    std::string* error)
+{
+    BlockIndexManagerStatus st = GetBlockIndexManager().GetActiveByHeight(height, out, error);
+    if (st != BLOCK_INDEX_MANAGER_OK)
+    {
+        if (error && error->empty())
+            *error = strprintf("block index manager: active height %d unavailable", height);
+        return false;
+    }
+    return out != NULL && out->found;
+}
+
+bool VerifyMoneySupplyAnchorsWithResolver(int32_t tipHeight,
+                                          MoneySupplyAnchorResolver resolver,
+                                          std::string* detail)
+{
+    if (resolver == NULL)
+        resolver = MSResolveActiveByHeight;
+    const MoneySupplyAnchor* anchor = FindMoneySupplyAnchorAtOrBelow(tipHeight);
+    std::string skipped;
+    while (anchor != NULL)
+    {
+        BlockIndexSnapshot snap;
+        std::string err;
+        if (!resolver(anchor->height, &snap, &err))
+        {
+            const std::string msg = strprintf(
+                "money-supply anchor at height %d cannot be read (%s): supply stays UNVERIFIED",
+                anchor->height, err.empty() ? "active record unavailable" : err.c_str());
+            SetMoneySupplyVerification(MONEY_SUPPLY_VIOLATION, msg);
+            if (detail) *detail = msg;
+            LogPrintf("SUPPLY_ANCHOR_UNRESOLVED height=%d detail=%s\n",
+                      anchor->height, err.c_str());
+            return false;
+        }
+        if (snap.hash.ToString() != anchor->hashHex)
+        {
+            // The active chain carries a different block at this height (a
+            // legitimate reorganisation): the anchor does not describe it.
+            if (!skipped.empty()) skipped += "; ";
+            skipped += strprintf("height %d reorganized (%s)", anchor->height,
+                                 snap.hash.ToString().substr(0, 16).c_str());
+            anchor = FindMoneySupplyAnchorBelow(anchor->height);
+            continue;
+        }
+        if (snap.nMoneySupply != anchor->supply)
+        {
+            const std::string msg = strprintf(
+                "MONEY SUPPLY UNVERIFIED: active record at height %d (%s) carries %s INN but the "
+                "independent block-data anchor requires %s INN (difference %s INN). The persisted "
+                "supply accumulator has diverged from the chain and must be rebuilt before this "
+                "value may be reported as valid.",
+                anchor->height, anchor->hashHex, FormatMoney(snap.nMoneySupply).c_str(),
+                FormatMoney(anchor->supply).c_str(),
+                FormatMoney(snap.nMoneySupply - anchor->supply).c_str());
+            SetMoneySupplyVerification(MONEY_SUPPLY_VIOLATION, msg);
+            if (detail) *detail = msg;
+            LogPrintf("SUPPLY_ANCHOR_VIOLATION height=%d hash=%s recorded=%lld expected=%lld "
+                      "delta=%lld source=independent_block_data_anchor\n",
+                      anchor->height, anchor->hashHex,
+                      (long long)snap.nMoneySupply, (long long)anchor->supply,
+                      (long long)(snap.nMoneySupply - anchor->supply));
+            return false;
+        }
+        {
+            std::string msg = strprintf("verified against independent anchor at height %d (%s): %s INN",
+                                        anchor->height, anchor->hashHex,
+                                        FormatMoney(anchor->supply).c_str());
+            if (!skipped.empty()) msg += " [skipped: " + skipped + "]";
+            SetMoneySupplyVerification(MONEY_SUPPLY_VERIFIED, msg);
+            if (detail) *detail = msg;
+            LogPrintf("SUPPLY_ANCHOR_VERIFIED height=%d hash=%s supply=%lld\n",
+                      anchor->height, anchor->hashHex, (long long)anchor->supply);
+            return true;
+        }
+    }
+    const std::string msg = strprintf(
+        "no applicable money-supply anchor at or below height %d: supply UNVERIFIED%s",
+        tipHeight, skipped.empty() ? "" : (" (" + skipped + ")").c_str());
+    SetMoneySupplyVerification(MONEY_SUPPLY_UNKNOWN, msg);
+    if (detail) *detail = msg;
+    return true;
+}
+
+bool VerifyMoneySupplyAnchors(int32_t tipHeight, std::string* detail)
+{
+    return VerifyMoneySupplyAnchorsWithResolver(tipHeight, NULL, detail);
 }
 
 bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
@@ -7581,6 +7738,12 @@ bool CBlock::ConnectBlock(CBlockIndex* pindex, bool fJustCheck)
     pindex->nMoneySupply -= nAmountBurned;
     if (pindex->nMoneySupply < 0)
         return error("ConnectBlock() : negative money supply at height %d", pindex->nHeight);
+    // MS-ANCHOR: this object's accumulator was derived from an AUTHORITATIVE
+    // parent (see ConnectBlockResolveParentSupply), so it is a legitimate carry
+    // source for its children. Objects that never went through ConnectBlock
+    // (side blocks, stale twins) keep nSupplyAuthority == 0 and are never used
+    // as a carry source.
+    pindex->nSupplyAuthority = 1;
     // V2 MS-FIX3: capture the full per-height accounting for the publication-time
     // supply-invariant gate. Written ONLY while the reorg connect loop has armed
     // the trail (g_reorgConnectTrailArmed): the map's lifetime is not changed by
@@ -7799,6 +7962,17 @@ static bool PublishAuthoritativeLiveTailReorg(int nForkHeight,
         if (outErr) *outErr = reorgErr;
         return false;
     }
+    // MS-ANCHOR: a reorganisation moved the active chain, so re-verify the
+    // absolute supply anchor against the NEW active records. A rebase introduced
+    // by this reorg is caught here (the relative per-block identity in
+    // ReorgActiveTo cannot see it: a consistently re-based suffix satisfies it).
+    if (!vConnect.empty())
+    {
+        std::string msAnchorErr;
+        if (!VerifyMoneySupplyAnchors(vConnect.back()->nHeight, &msAnchorErr))
+            LogPrintf("SUPPLY_ANCHOR_GATE height=%d verdict=VIOLATION (post-reorg) detail=%s\n",
+                      vConnect.back()->nHeight, msAnchorErr.c_str());
+    }
     return true;
 }
 
@@ -7883,6 +8057,9 @@ CBlockIndex* MaterializeCBlockIndexByValue(const BlockIndexSnapshot& s, uint256*
     p->nNonce = s.nNonce;
     p->nMint = s.nMint;
     p->nMoneySupply = s.nMoneySupply;
+    // MS-ANCHOR: the snapshot came from the persisted authoritative record, so
+    // this object's accumulator is a legitimate carry source.
+    p->nSupplyAuthority = 1;
     p->nStakeModifier = s.nStakeModifier;
     p->nFlags = s.nFlags;
     if (s.hasStakeModifierTime)
@@ -9237,6 +9414,25 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 // startup reconciliation re-mirrors the legacy view from V2.
                 return error("AddToBlockIndex() : V2 authoritative persist failed at height %d: %s",
                              pindexNew->nHeight, perr.c_str());
+            }
+            // MS-ANCHOR: when this acceptance crossed an independently anchored
+            // height, compare the persisted accumulator against the anchor. A
+            // disagreement means the value that was just persisted (and every
+            // value after it) is unverifiable; the RPC must not present it as a
+            // successful result. Accounting only: the block itself is valid, so
+            // acceptance is not failed here (availability), but the violation is
+            // logged and published through the verification state.
+            if (okP)
+            {
+                const MoneySupplyAnchor* msCrossed =
+                    FindMoneySupplyAnchorInRange(nAcceptFloorTipHeight + 1, pindexNew->nHeight);
+                if (msCrossed != NULL)
+                {
+                    std::string msAnchorErr;
+                    if (!VerifyMoneySupplyAnchors(pindexNew->nHeight, &msAnchorErr))
+                        LogPrintf("SUPPLY_ANCHOR_GATE height=%d verdict=VIOLATION detail=%s\n",
+                                  pindexNew->nHeight, msAnchorErr.c_str());
+                }
             }
         }
     }

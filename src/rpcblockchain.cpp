@@ -9,6 +9,7 @@
 #include "bootstrap.h"
 #include "blockindex_authoritative_startup.h"
 #include "blockindex_manager.h"
+#include "supply_anchor.h"
 #include "collateralnode.h"
 #include "activecollateralnode.h"
 #include "db.h"
@@ -1108,6 +1109,100 @@ Value gettxout(const Array& params, bool fHelp)
     return ret;
 }
 
+// ---------------------------------------------------------------------------
+// MS-ANCHOR: money-supply reporting honouring the independent-anchor verdict.
+// `moneysupply` is reported as a NUMBER only when the persisted accumulator was
+// verified (or when verification is not applicable at all, e.g. test/regtest
+// operation); a detected divergence reports null + the reason instead of a
+// plausible but unconfirmed value.
+// ---------------------------------------------------------------------------
+void AppendMoneySupplyFields(Object& obj, int64_t recordedSupply, bool haveValue)
+{
+    std::string detail;
+    const int st = GetMoneySupplyVerification(&detail);
+    if (st == MONEY_SUPPLY_VIOLATION)
+    {
+        obj.push_back(Pair("moneysupply", Value::null));
+        obj.push_back(Pair("moneysupply_verified", false));
+        obj.push_back(Pair("moneysupply_status", std::string(MoneySupplyVerificationName(st))));
+        obj.push_back(Pair("moneysupply_error", detail));
+        return;
+    }
+    if (haveValue)
+        obj.push_back(Pair("moneysupply", ValueFromAmount(recordedSupply)));
+    else
+        obj.push_back(Pair("moneysupply", Value::null));
+    obj.push_back(Pair("moneysupply_verified", st == MONEY_SUPPLY_VERIFIED));
+    obj.push_back(Pair("moneysupply_status", std::string(MoneySupplyVerificationName(st))));
+    if (!detail.empty())
+        obj.push_back(Pair("moneysupply_detail", detail));
+}
+
+Value getsupplystatus(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 0)
+        throw runtime_error(
+                "getsupplystatus\n"
+                "Reports whether the node's cumulative money supply is verified against the\n"
+                "independent block-data anchors, plus the newest applicable anchor.\n"
+                "\nResult:\n"
+                "{\n"
+                "  \"status\": \"VERIFIED|UNVERIFIED|VIOLATION\",\n"
+                "  \"detail\": \"...\",\n"
+                "  \"anchor_count\": n,\n"
+                "  \"newest_anchor\": { \"height\", \"hash\", \"expected_supply\", \"active_hash\", \"recorded_supply\", \"match\" },\n"
+                "  \"tip_height\": n, \"tip_supply_recorded\": x\n"
+                "}\n");
+
+    Object obj;
+    std::string detail;
+    const int st = GetMoneySupplyVerification(&detail);
+    obj.push_back(Pair("status", std::string(MoneySupplyVerificationName(st))));
+    obj.push_back(Pair("detail", detail));
+    size_t nAnchors = 0;
+    MoneySupplyAnchorTable(&nAnchors);
+    obj.push_back(Pair("anchor_count", (int)nAnchors));
+    const MoneySupplyAnchor* anchor = FindMoneySupplyAnchorAtOrBelow(nBestHeight);
+    if (anchor != NULL)
+    {
+        Object o;
+        o.push_back(Pair("height", (int)anchor->height));
+        o.push_back(Pair("hash", std::string(anchor->hashHex)));
+        o.push_back(Pair("expected_supply", ValueFromAmount(anchor->supply)));
+        BlockIndexSnapshot snap; std::string serr;
+        if (GetBlockIndexManager().GetActiveByHeight(anchor->height, &snap, &serr)
+                == BLOCK_INDEX_MANAGER_OK && snap.found)
+        {
+            o.push_back(Pair("active_hash", snap.hash.ToString()));
+            o.push_back(Pair("recorded_supply", ValueFromAmount(snap.nMoneySupply)));
+            o.push_back(Pair("match", snap.hash.ToString() == anchor->hashHex &&
+                                      snap.nMoneySupply == anchor->supply));
+            o.push_back(Pair("hash_match", snap.hash.ToString() == anchor->hashHex));
+        }
+        else
+        {
+            o.push_back(Pair("active_hash", Value::null));
+            o.push_back(Pair("recorded_supply", Value::null));
+            o.push_back(Pair("match", false));
+            o.push_back(Pair("error", serr));
+        }
+        obj.push_back(Pair("newest_anchor", o));
+    }
+    BlockIndexSnapshot tipSnap; std::string tipErr;
+    if (GetBlockIndexManager().GetTip(&tipSnap, &tipErr) == BLOCK_INDEX_MANAGER_OK)
+    {
+        obj.push_back(Pair("tip_height", (int)tipSnap.height));
+        obj.push_back(Pair("tip_supply_recorded", ValueFromAmount(tipSnap.nMoneySupply)));
+    }
+    else
+    {
+        obj.push_back(Pair("tip_height", (int)nBestHeight));
+        obj.push_back(Pair("tip_supply_recorded", Value::null));
+        obj.push_back(Pair("tip_error", tipErr));
+    }
+    return obj;
+}
+
 Value getblockchaininfo(const Array& params, bool fHelp)
 {
     if (fHelp || params.size() != 0)
@@ -1152,12 +1247,21 @@ Value getblockchaininfo(const Array& params, bool fHelp)
     // on the authoritative path (a failure fails closed rather than falling back).
     {
         BlockIndexSnapshot tipSnapshot; std::string tipError;
+        bool haveValue = false;
+        int64_t recordedSupply = 0;
         if (BestTipSnapshotByValue(&tipSnapshot, &tipError))
-            obj.push_back(Pair("moneysupply", ValueFromAmount(tipSnapshot.nMoneySupply)));
+        {
+            haveValue = true;
+            recordedSupply = tipSnapshot.nMoneySupply;
+        }
         else if (g_fAuthoritativeStartup)
             throw JSONRPCError(RPC_MISC_ERROR, tipError.empty() ? "Money supply unavailable" : tipError);
-        else
-            obj.push_back(Pair("moneysupply", ValueFromAmount(pindexBest->nMoneySupply)));
+        else if (pindexBest != NULL)
+        {
+            haveValue = true;
+            recordedSupply = pindexBest->nMoneySupply;
+        }
+        AppendMoneySupplyFields(obj, recordedSupply, haveValue);
     }
     //obj.push_back(Pair("size_on_disk",   CalculateCurrentUsage()));
     return obj;

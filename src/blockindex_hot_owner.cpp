@@ -67,6 +67,8 @@ static CBlockIndex* HotMaterializeToIndex(const BlockIndexHotMaterialized& m,
     pindex->nNonce     = s.nNonce;
     pindex->nMint      = s.nMint;
     pindex->nMoneySupply = s.nMoneySupply;
+    // MS-ANCHOR: materialized from the authoritative record -> legitimate carry source.
+    pindex->nSupplyAuthority = 1;
     pindex->nStakeModifier = s.nStakeModifier;
     if (s.hasStakeModifierTime)
         pindex->nStakeModifierTime = s.nStakeModifierTime;

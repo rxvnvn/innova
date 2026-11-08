@@ -260,6 +260,13 @@ extern json_spirit::Value sendrawtransaction(const json_spirit::Array& params, b
 extern json_spirit::Value getbestblockhash(const json_spirit::Array& params, bool fHelp); // in rpcblockchain.cpp
 extern json_spirit::Value getblockcount(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getblockchaininfo(const json_spirit::Array& params, bool fHelp);
+extern json_spirit::Value getsupplystatus(const json_spirit::Array& params, bool fHelp);
+// MS-ANCHOR: append the money-supply fields honouring the verification state to
+// an RPC object. When the persisted accumulator could not be verified against the
+// independent block-data anchors the value is NOT reported as a success:
+// "moneysupply" becomes null and "moneysupply_error" carries the reason.
+extern void AppendMoneySupplyFields(json_spirit::Object& obj, int64_t recordedSupply, bool haveValue);
+
 extern json_spirit::Value getdifficulty(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getcnvalidationstats(const json_spirit::Array& params, bool fHelp);
 extern json_spirit::Value getdbwaitstats(const json_spirit::Array& params, bool fHelp);
