@@ -968,7 +968,7 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
     SetThreadPriority(THREAD_PRIORITY_LOWEST);
     RenameThread("innova-cpuminer");
 
-    uint64_t nExtraNonceStart = nSessionId * CCPUMinerController::MAX_THREADS + nWorkerId + 1;
+    uint64_t nExtraNonceStart = nSessionId * CCPUMinerController::EXTRA_NONCE_STRIDE + nWorkerId + 1;
     unsigned int nExtraNonce = static_cast<unsigned int>(nExtraNonceStart);
     if (nExtraNonce == 0)
         nExtraNonce = nWorkerId + 1;
@@ -1220,7 +1220,7 @@ bool CPUMiningBlockMatchesWorkIdentity(const CBlock& block,
     return true;
 }
 
-const int CCPUMinerController::MAX_THREADS;
+const uint64_t CCPUMinerController::EXTRA_NONCE_STRIDE;
 
 static const char* const CPUMINING_PAUSE_REASON_STRINGS[] = {
     "hashing",          // PAUSE_NONE
@@ -1285,14 +1285,14 @@ CCPUMinerController::CCPUMinerController(const WorkerFunction& worker,
       m_lastHashProgress(0),
       m_totalHashes(0)
 {
-    m_workerHashing.assign(MAX_THREADS, 0);
-    m_workerPauseReason.assign(MAX_THREADS, CCPUMinerController::PAUSE_NONE);
+    m_workerHashing.clear();
+    m_workerPauseReason.clear();
 }
 
 void CCPUMinerController::ClearWorkerStatusLocked()
 {
-    m_workerHashing.assign(MAX_THREADS, 0);
-    m_workerPauseReason.assign(MAX_THREADS, CCPUMinerController::PAUSE_NONE);
+    m_workerHashing.clear();
+    m_workerPauseReason.clear();
 }
 
 CCPUMinerController::~CCPUMinerController()
@@ -1313,9 +1313,9 @@ bool CCPUMinerController::Start(CWallet* pwallet, int nThreads, std::string& str
         strError = "CPU mining requires a wallet";
         return false;
     }
-    if (nThreads < 1 || nThreads > MAX_THREADS)
+    if (nThreads < 1)
     {
-        strError = "CPU mining thread count is out of range";
+        strError = "CPU mining thread count must be >= 1";
         return false;
     }
 
@@ -1450,12 +1450,17 @@ void CCPUMinerController::NoteHashing(unsigned int nWorkerId,
                                        unsigned long long nHashes)
 {
     bool fWasHashing = false;
-    if (nWorkerId < MAX_THREADS)
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        fWasHashing = m_workerHashing[nWorkerId] != 0;
-        m_workerHashing[nWorkerId] = 1;
-        m_workerPauseReason[nWorkerId] = CCPUMinerController::PAUSE_NONE;
+        // The per-worker arrays are sized to the ACTUAL worker count; a stale
+        // worker id from a previous, larger session is ignored instead of
+        // indexing out of range.
+        if (nWorkerId < m_workerHashing.size())
+        {
+            fWasHashing = m_workerHashing[nWorkerId] != 0;
+            m_workerHashing[nWorkerId] = 1;
+            m_workerPauseReason[nWorkerId] = CCPUMinerController::PAUSE_NONE;
+        }
     }
     // Monotonic aggregates stay lock-free: they are counters, not snapshots.
     m_lastHashProgress.store(GetTime(), std::memory_order_release);
@@ -1469,12 +1474,14 @@ void CCPUMinerController::NoteHashing(unsigned int nWorkerId,
 void CCPUMinerController::NotePaused(unsigned int nWorkerId, int reason)
 {
     bool fChanged = false;
-    if (nWorkerId < MAX_THREADS)
     {
         std::lock_guard<std::mutex> stateLock(m_stateMutex);
-        fChanged = reason != m_workerPauseReason[nWorkerId];
-        m_workerPauseReason[nWorkerId] = reason;
-        m_workerHashing[nWorkerId] = 0;
+        if (nWorkerId < m_workerPauseReason.size())
+        {
+            fChanged = reason != m_workerPauseReason[nWorkerId];
+            m_workerPauseReason[nWorkerId] = reason;
+            m_workerHashing[nWorkerId] = 0;
+        }
     }
     if (fChanged)
         LogCPUMinerPauseTransition(reason);
@@ -1671,14 +1678,31 @@ int AvailableLogicalCPUs(bool* pFallback)
         nAffinity = CPU_COUNT(&set);
 #endif
 
+    // Distinguish "affinity succeeded and says ZERO CPUs" (an explicit bar:
+    // cpuset/affinity forbids this process from running) from "detection
+    // unavailable" (fallback). The former must never start a single thread.
+    bool fAffinityKnown = (nAffinity > 0);
+#ifdef __linux__
+    {
+        cpu_set_t probe;
+        CPU_ZERO(&probe);
+        if (sched_getaffinity(0, sizeof(probe), &probe) == 0)
+            fAffinityKnown = true;   // known even when CPU_COUNT == 0 (barred)
+    }
+#endif
+    if (fAffinityKnown && nAffinity == 0)
+        return 0;
+
     int nAvailable = nAffinity;
     if (nAvailable <= 0)
     {
-        // Detection unavailable: safe fallback to the hardware count rather
-        // than guessing a higher value.
+        // Detection unavailable: documented safe fallback to the hardware
+        // count. Never guesses HIGHER than what the kernel reports.
         const unsigned int nHw = std::thread::hardware_concurrency();
-        nAvailable = (nHw == 0) ? 1 : (int)nHw;
+        nAvailable = (int)nHw;
         if (pFallback) *pFallback = true;
+        if (nAvailable < 1)
+            return 0;   // nothing usable could be determined -> run nothing
     }
 
     // Never let a CPU *quota* raise the count above the affinity/cpuset mask:
@@ -1688,20 +1712,24 @@ int AvailableLogicalCPUs(bool* pFallback)
     if (nQuota > 0 && nQuota < nAvailable)
         nAvailable = nQuota;
 
-    return (nAvailable < 1) ? 1 : nAvailable;
+    return (nAvailable < 1) ? 0 : nAvailable;
 }
 
 int ClampCPUMiningThreads(int nRequested, int nAvailable, bool* pClamped)
 {
     if (pClamped) *pClamped = false;
-    const int nCap = (nAvailable < 1) ? 1 : nAvailable;
-    int nEffective = nRequested;
-    if (nEffective < 1)
-        nEffective = 1;
-    if (nEffective > nCap)
-        nEffective = nCap;
-    if (nEffective > CCPUMinerController::MAX_THREADS)
-        nEffective = CCPUMinerController::MAX_THREADS;
+    // No CPU capacity at all (empty affinity mask / explicit cpuset exclusion /
+    // capacity undeterminable) => ZERO workers. Never run a single thread
+    // against an explicit no-CPU instruction.
+    if (nAvailable < 1 || nRequested < 1)
+    {
+        if (pClamped && nRequested != 0)
+            *pClamped = true;
+        return 0;
+    }
+    // The machine's usable CPU count is the ONLY ceiling: a 64-CPU host asked
+    // for 64 gets 64.
+    const int nEffective = (nRequested < nAvailable) ? nRequested : nAvailable;
     if (pClamped && nEffective != nRequested)
         *pClamped = true;
     return nEffective;
@@ -1782,6 +1810,13 @@ CPUMiningApplyResult ApplyCPUMiningRequest(CWallet* pwallet, bool fEnable, int n
         return r;
     }
 
+    if (r.availableCPUs < 1)
+    {
+        r.error = "no usable CPU capacity: the process is barred from every CPU "
+                  "(affinity/cpuset) or the available capacity cannot be determined";
+        return r;
+    }
+
     if (pwallet == NULL)
     {
         r.error = "CPU mining requires a loaded wallet";
@@ -1802,13 +1837,9 @@ CPUMiningApplyResult ApplyCPUMiningRequest(CWallet* pwallet, bool fEnable, int n
     r.clamped = fClamped;
     if (fClamped)
     {
-        std::string strWhy = strprintf("available logical CPUs=%d", r.availableCPUs);
-        if (nEffective == CCPUMinerController::MAX_THREADS &&
-            nRequested > CCPUMinerController::MAX_THREADS &&
-            r.availableCPUs > CCPUMinerController::MAX_THREADS)
-            strWhy = strprintf("hard controller maximum=%d", CCPUMinerController::MAX_THREADS);
-        r.warning = strprintf("requested %d mining threads, clamped to %d (%s)",
-                              nRequested, nEffective, strWhy.c_str());
+        r.warning = strprintf("requested %d mining threads, clamped to %d "
+                              "(available logical CPUs=%d)",
+                              nRequested, nEffective, r.availableCPUs);
     }
 
     std::string strError;

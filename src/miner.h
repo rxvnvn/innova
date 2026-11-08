@@ -83,7 +83,13 @@ bool CPUMiningBlockMatchesWorkIdentity(const CBlock& block,
 class CCPUMinerController
 {
 public:
-    static const int MAX_THREADS = 16;
+    // There is deliberately NO artificial thread cap. The only limit on the
+    // worker count is the CPU capacity this process may actually use (see
+    // AvailableLogicalCPUs: affinity/cpuset/cgroup aware) plus whatever the OS
+    // refuses when creating a thread. EXTRA_NONCE_STRIDE only widens the
+    // per-session extra-nonce identifier space so two workers or two sessions
+    // can never share a coinbase; it is NOT a thread limit.
+    static const uint64_t EXTRA_NONCE_STRIDE = 65536;
 
     enum State
     {
@@ -203,9 +209,14 @@ void ShutdownCPUMining();
 int AvailableLogicalCPUs(bool* pFallback = NULL);
 
 // THE clamping rule shared by RPC gen, RPC setgenerate and -gen=N:
-//   effective = max(1, min(requested, available, CCPUMinerController::MAX_THREADS))
-// *pClamped (optional) is true when the request was reduced. There is exactly
-// one rule so the config path and both RPC paths cannot drift.
+//   effective = min(requested, available)      (both > 0)
+//   0                                          (available == 0: the process is
+//                                               explicitly forbidden to run, or
+//                                               no capacity could be determined)
+// There is exactly one rule so the config path and both RPC paths cannot drift,
+// and there is no artificial thread ceiling of any kind: a machine with 64
+// usable CPUs can run 64 workers if asked.
+// *pClamped (optional) is true when the request was reduced.
 int ClampCPUMiningThreads(int nRequested, int nAvailable, bool* pClamped = NULL);
 
 // Parse the innova.conf value of `gen` — exactly one integer, no ambiguity:

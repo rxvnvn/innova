@@ -654,33 +654,53 @@ BOOST_AUTO_TEST_CASE(gen_config_value_parsing_is_exact)
     }
 }
 
-// One clamping rule for config and both RPC paths: effective =
-// max(1, min(requested, available, controller maximum)).
-BOOST_AUTO_TEST_CASE(mining_thread_clamp_matches_capacity_rule)
+// The ONLY clamping rule, shared by the config path and both RPC paths:
+//   effective = min(requested, available)   when both are > 0
+//   effective = 0                           when there is no usable CPU capacity
+// There is NO artificial thread ceiling: capacity 64 with a request of 64 must
+// yield 64 workers.
+BOOST_AUTO_TEST_CASE(mining_thread_clamp_is_capacity_only_no_artificial_ceiling)
 {
     bool fClamped = false;
 
-    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(1, 28, &fClamped), 1);
+    // Requests at or below the available capacity are honoured EXACTLY, at every
+    // machine width the operator asked about (8/16/24/32/64).
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(1, 8, &fClamped), 1);
     BOOST_CHECK(!fClamped);
-    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(8, 28, &fClamped), 8);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(8, 8, &fClamped), 8);
     BOOST_CHECK(!fClamped);
-    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(16, 28, &fClamped), 16);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(8, 16, &fClamped), 8);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(16, 16, &fClamped), 16);
+    BOOST_CHECK(!fClamped);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(16, 24, &fClamped), 16);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(24, 24, &fClamped), 24);
+    BOOST_CHECK(!fClamped);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(32, 32, &fClamped), 32);
+    BOOST_CHECK(!fClamped);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(64, 64, &fClamped), 64);
+    BOOST_CHECK(!fClamped);
+    // The decisive case: no 16-thread ceiling anywhere.
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(24, 64, &fClamped), 24);
     BOOST_CHECK(!fClamped);
 
-    // More than the machine has: clamped to the available count.
-    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(32, 28, &fClamped), 28);
-    BOOST_CHECK(fClamped);
+    // Requests ABOVE the available capacity are clamped to it, never to 16.
     BOOST_CHECK_EQUAL(ClampCPUMiningThreads(16, 8, &fClamped), 8);
     BOOST_CHECK(fClamped);
-
-    // Hard controller maximum still applies on very wide machines.
-    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(64, 1024, &fClamped), CCPUMinerController::MAX_THREADS);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(32, 8, &fClamped), 8);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(32, 24, &fClamped), 24);
+    BOOST_CHECK(fClamped);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(128, 64, &fClamped), 64);
+    BOOST_CHECK(fClamped);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(1024, 96, &fClamped), 96);
     BOOST_CHECK(fClamped);
 
-    // Defensive floor: a nonsensical request/capacity can never produce 0.
-    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(0, 28, &fClamped), 1);
-    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(-5, 28, &fClamped), 1);
-    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(8, 0, &fClamped), 1);
+    // No usable capacity => ZERO workers (never one).
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(8, 0, &fClamped), 0);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(1, 0, &fClamped), 0);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(8, -4, &fClamped), 0);
+    // Nonsensical requests produce nothing rather than an implicit 1.
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(0, 28, &fClamped), 0);
+    BOOST_CHECK_EQUAL(ClampCPUMiningThreads(-5, 28, &fClamped), 0);
 }
 
 // Available-logical-CPU detection must follow the affinity mask (which is what
