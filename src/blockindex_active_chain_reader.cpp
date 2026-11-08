@@ -35,20 +35,27 @@ int64_t BlockIndexActiveChainReader::GetActiveHeight() const
 {
     if (!open_)
         return -1;
-    // iterate physical height downward until a committed entry is found; the
-    // shadow lookup enforces committed-region boundary.
-    for (int64_t h = 0; h < 2000000; ++h)
-    {
-        BlockIndexRecord rec;
-        BlockIndexId id;
-        std::string err;
-        BlockIndexActiveLookupStatus st = lookup_.LookupByHeight((int32_t)h, &rec, &id, &err);
-        if (st == BLOCK_INDEX_ACTIVE_LOOKUP_NOT_FOUND)
-            return h - 1;
-        if (st != BLOCK_INDEX_ACTIVE_LOOKUP_FOUND)
-            return -1; // error
-    }
-    return -1;
+    // O(1): the committed active-chain tip is a MANIFEST fact. The previous
+    // implementation probed heights 0..1,999,999 and treated "no NOT_FOUND in
+    // that window" as an error, which made it return -1 on every chain longer
+    // than 2M blocks (mainnet is ~8.2M) and silently disabled the by-value
+    // wallet rescan. Never re-introduce a height-proportional probe here.
+    const int32_t tip = lookup_.CommittedTipHeight();
+    if (tip < 0)
+        return -1; // no committed tip: fail closed, callers must not scan
+    // Fail-closed coherence check: the committed tip must resolve to a record
+    // at that height, and (when the manifest carries one) to the committed hash.
+    BlockIndexRecord rec;
+    BlockIndexId id = BLOCK_INDEX_ID_INVALID;
+    std::string err;
+    if (lookup_.LookupByHeight(tip, &rec, &id, &err) != BLOCK_INDEX_ACTIVE_LOOKUP_FOUND)
+        return -1;
+    if (rec.height != tip)
+        return -1;
+    const uint256 committedHash = lookup_.CommittedTipHash();
+    if (committedHash != uint256(0) && rec.hash != committedHash)
+        return -1;
+    return tip;
 }
 
 bool BlockIndexActiveChainReader::LookupByHeight(int32_t height,

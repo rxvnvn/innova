@@ -441,10 +441,12 @@ public:
     // `startHeight` to the reader's active height, reading each block by
     // nFile/nBlockPos WITHOUT the resident mapBlockIndex/pnext CBlockIndex graph.
     // Honors the same nTimeFirstKey (wallet birthday) early-continue as the legacy
-    // path. Returns the count of wallet-affecting transactions.
+    // path, unless fIgnoreBirthday is set (explicit full-historical rescan).
+    // Returns the count of wallet-affecting transactions.
     int ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader& reader,
                                          int32_t startHeight,
-                                         bool fUpdate = false);
+                                         bool fUpdate = false,
+                                         bool fIgnoreBirthday = false);
     void ReacceptWalletTransactions();
     void ResendWalletTransactions(bool fForce = false);
     int64_t GetBalance() const;

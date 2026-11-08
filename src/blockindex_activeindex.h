@@ -93,6 +93,12 @@ public:
     // enforcing decoded_record.height == requested height.
     BlockIndexActiveLookupStatus LookupByHeight(int32_t height, BlockIndexRecord* outRecord, BlockIndexId* outId, std::string* error) const;
 
+    // Committed active-chain tip from the MANIFEST (O(1), no height iteration).
+    // Returns -1 when the handle is closed or the generation has no committed tip.
+    int32_t CommittedTipHeight() const;
+    // Committed active-chain tip hash (zero uint256 when unset).
+    uint256 CommittedTipHash() const;
+
 private:
     FixedBlockIndexStore store;
     BlockIndexActiveIndex active;

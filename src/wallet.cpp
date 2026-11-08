@@ -1610,30 +1610,60 @@ int CWallet::ScanForWalletTransactions(CBlockIndex* pindexStart, bool fUpdate)
 // resident at a time (no accumulating active-chain cache).
 int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader& reader,
                                               int32_t startHeight,
-                                              bool fUpdate)
+                                              bool fUpdate,
+                                              bool fIgnoreBirthday)
 {
     int ret = 0;
     if (!reader.IsOpen())
+    {
+        printf("Wallet rescan (by value): reader is not open -- SCAN NOT PERFORMED\n");
         return 0;
+    }
 
     const int32_t activeHeight = (int32_t)reader.GetActiveHeight();
-    if (activeHeight < startHeight)
+    if (activeHeight < 0)
+    {
+        // Fail loudly: a negative active height means the authoritative active
+        // chain could not be resolved. Returning 0 here used to be silent and
+        // was indistinguishable from "the wallet has no history".
+        printf("Wallet rescan (by value): authoritative active height unresolved "
+               "(GetActiveHeight=-1) -- SCAN NOT PERFORMED (fail-closed)\n");
         return 0;
+    }
+    if (activeHeight < startHeight)
+    {
+        printf("Wallet rescan (by value): start height %d is above active height %d -- nothing to do\n",
+               startHeight, activeHeight);
+        return 0;
+    }
 
     int32_t h = (startHeight < 0) ? 0 : startHeight;
     int32_t dProgressTop = activeHeight;
     int64_t nBirthday = nTimeFirstKey; // snapshot under the caller's wallet contract
 
+    int nBlocksScanned = 0;
+    int nSkippedBirthday = 0;
+    int nUnreadable = 0;
+    int32_t nFirstUnreadable = -1;
+    const int64_t nStart = GetTimeMillis();
+
     while (h <= activeHeight && !fShutdown)
     {
         // no need to read and scan block before our wallet birthday
-        // (mirrors wallet.cpp:1825-1828 legacy early-continue)
+        // (mirrors wallet.cpp:1825-1828 legacy early-continue), unless an
+        // explicit full-historical rescan was requested.
         BlockIndexActiveBlock ab;
         std::string lkErr;
         if (!reader.LookupByHeight(h, &ab, &lkErr))
-            break;
-        if (nBirthday && (ab.nTime < (uint32_t)(nBirthday - 7200)))
         {
+            printf("Wallet rescan (by value): active-chain lookup FAILED at height %d (%s) -- "
+                   "stopping (blocks scanned before failure: %d)\n",
+                   h, lkErr.c_str(), nBlocksScanned);
+            break;
+        }
+        if (!fIgnoreBirthday && nBirthday && (ab.nTime < (uint32_t)(nBirthday - 7200)))
+        {
+            ++nSkippedBirthday;
             ++h;
             continue;
         }
@@ -1641,9 +1671,12 @@ int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader&
         CBlock block;
         if (!block.ReadFromDisk(ab.nFile, ab.nBlockPos))
         {
+            if (nFirstUnreadable < 0) nFirstUnreadable = h;
+            ++nUnreadable;
             ++h;
             continue;
         }
+        ++nBlocksScanned;
         BOOST_FOREACH(CTransaction& tx, block.vtx)
         {
             LOCK(cs_wallet);
@@ -1652,6 +1685,19 @@ int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader&
         }
         ++h;
     }
+
+    // One summary line per rescan: block reads, birthday skips, unreadable
+    // blocks and wallet hits. A zero-hit rescan is only meaningful together
+    // with the block counters; never report "done" without them.
+    printf("Wallet rescan (by value): heights %d..%d scanned=%d skipped_birthday=%d "
+           "unreadable=%d first_unreadable=%d txs_added=%d ignore_birthday=%d elapsed=%" PRId64"ms%s\n",
+           (startHeight < 0 ? 0 : startHeight), activeHeight, nBlocksScanned, nSkippedBirthday,
+           nUnreadable, nFirstUnreadable, ret, fIgnoreBirthday ? 1 : 0,
+           GetTimeMillis() - nStart,
+           (nUnreadable > 0) ? " WARNING_UNREADABLE_BLOCKS" : "");
+    if (nBlocksScanned == 0)
+        printf("Wallet rescan (by value): WARNING no block was read -- zero hits is NOT evidence "
+               "that the wallet has no history\n");
     return ret;
 }
 

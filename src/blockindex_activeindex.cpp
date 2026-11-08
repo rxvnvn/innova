@@ -581,6 +581,20 @@ bool FixedBlockIndexShadowActiveLookup::Open(const std::string& generationDir, F
     return true;
 }
 
+int32_t FixedBlockIndexShadowActiveLookup::CommittedTipHeight() const
+{
+    if (!open)
+        return -1;
+    return store.GetManifest().committedTipHeight;
+}
+
+uint256 FixedBlockIndexShadowActiveLookup::CommittedTipHash() const
+{
+    if (!open)
+        return uint256(0);
+    return store.GetManifest().committedTipHash;
+}
+
 BlockIndexActiveLookupStatus FixedBlockIndexShadowActiveLookup::LookupByHeight(int32_t height, BlockIndexRecord* outRecord, BlockIndexId* outId, std::string* error) const
 {
     if (!open)

@@ -1963,7 +1963,17 @@ authoritative_startup_ready:
             std::string genDir = BlockIndexGenerationManager::GenerationPath(root, gen);
             if (!scanReader.Open(genDir, gen, &scanErr))
                 return InitError(strprintf("Block Index V2 authoritative wallet rescan reader open failed: %s", scanErr.c_str()));
-            pwalletMain->ScanForWalletTransactionsByValue(scanReader, nRescanFromHeight, true);
+            // -rescanfull: explicit full-historical scan. The wallet birthday
+            // (nTimeFirstKey) early-continue is CORRECT for a wallet that has been
+            // live, but it defeats recovery of keys imported with a later
+            // nCreateTime (importprivkey stamps "now"), and it silently drops
+            // coins that predate the birthday. Recovery therefore needs an
+            // explicit, opt-in full scan rather than a different default.
+            const bool fIgnoreBirthday = GetBoolArg("-rescanfull", false);
+            if (fIgnoreBirthday)
+                printf("Wallet rescan: -rescanfull requested -- birthday early-continue disabled\n");
+            pwalletMain->ScanForWalletTransactionsByValue(scanReader, fIgnoreBirthday ? 0 : nRescanFromHeight,
+                                                          true, fIgnoreBirthday);
             printf(" rescan (authoritative) %15" PRId64"ms\n", GetTimeMillis() - nStart);
             StartupTrace("rescan_done");
         } else {

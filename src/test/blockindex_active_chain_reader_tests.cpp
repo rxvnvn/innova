@@ -194,4 +194,30 @@ BOOST_AUTO_TEST_CASE(k2_bounded_iteration_no_accumulation)
         BOOST_CHECK(mapBlockIndex.find(fx.blocks[h].hash) == mapBlockIndex.end());
 }
 
+// K3 - active height comes from the committed MANIFEST tip (O(1)), not from a
+// height probe. Regression guard for the 2,000,000-height cap that made
+// GetActiveHeight() return -1 on any chain longer than 2M blocks (mainnet
+// ~8.2M) and silently disabled the by-value wallet rescan.
+BOOST_AUTO_TEST_CASE(k3_active_height_is_committed_tip_not_iteration)
+{
+    ReaderFixture fx(40);
+    std::string error;
+    BlockIndexActiveChainReader reader;
+    BOOST_REQUIRE_MESSAGE(reader.Open((fx.root / "gen-000001").string(), 1, &error), error);
+
+    // The height is the manifest's committed tip, and repeated calls are stable.
+    BOOST_CHECK_EQUAL((int)reader.GetActiveHeight(), 40);
+    BOOST_CHECK_EQUAL((int)reader.GetActiveHeight(), 40);
+
+    // One past the committed tip does not resolve: the boundary is the manifest,
+    // so a probe-style implementation cannot extend it.
+    BlockIndexActiveBlock ab;
+    BOOST_CHECK(!reader.LookupByHeight(41, &ab, &error));
+
+    // The tip still resolves to the fixture's own hash after the boundary probe.
+    BOOST_REQUIRE(reader.LookupByHeight(40, &ab, &error));
+    BOOST_CHECK(ab.hash == fx.blocks[40].hash);
+    BOOST_CHECK_EQUAL((int)reader.GetActiveHeight(), 40);
+}
+
 BOOST_AUTO_TEST_SUITE_END()
