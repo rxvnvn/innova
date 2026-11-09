@@ -1128,6 +1128,20 @@ void AppendMoneySupplyFields(Object& obj, int64_t recordedSupply, bool haveValue
         obj.push_back(Pair("moneysupply_error", detail));
         return;
     }
+    // Owner requirement 2026-11-09: in the V2 authoritative runtime an UNCONFIRMED
+    // state (UNKNOWN: no applicable anchor, e.g. a reorg deeper than the anchor span)
+    // must not present a plausible number as a successful value either. The legacy
+    // (non-authoritative) mode keeps its historical reporting.
+    if (g_fAuthoritativeStartup && st != MONEY_SUPPLY_VERIFIED)
+    {
+        obj.push_back(Pair("moneysupply", Value::null));
+        obj.push_back(Pair("moneysupply_verified", false));
+        obj.push_back(Pair("moneysupply_status", std::string(MoneySupplyVerificationName(st))));
+        obj.push_back(Pair("moneysupply_error",
+                           detail.empty() ? std::string("money supply is not verified against an independent anchor")
+                                          : detail));
+        return;
+    }
     if (haveValue)
         obj.push_back(Pair("moneysupply", ValueFromAmount(recordedSupply)));
     else
