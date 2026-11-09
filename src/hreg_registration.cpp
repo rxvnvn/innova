@@ -610,7 +610,13 @@ bool RebuildHRegStateFromActiveChainByValue(const BlockIndexActiveChainReader& r
 
     const int32_t activeHeight = (int32_t)reader.GetActiveHeight();
     if (activeHeight < 0)
-        return true;
+    {
+        // Fail closed (owner requirement 2026-11-09): an unresolved authoritative height
+        // must NEVER be reported as a successful rebuild of an EMPTY registry.
+        strError = "HREG rebuild(bv): authoritative active height unresolved (GetActiveHeight=-1); "
+                   "refusing to report an empty registry as a successful rebuild";
+        return false;
+    }
 
     const int32_t begin = (startHeight <= 0) ? 0 : startHeight;
     const int32_t end = (heightLimit < 0) ? activeHeight : std::min(heightLimit, activeHeight);
