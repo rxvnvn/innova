@@ -1757,27 +1757,6 @@ authoritative_startup_ready:
             return InitError(strprintf("Block Index V2 legacy mirror reconciliation failed: %s", mirrorErr.c_str()));
     }
 
-    // ---- A.10.1q: BY_VALUE_AUTHORITATIVE HReg startup rebuild ----
-    // Route HReg through the by-value active-chain path (ca7c7e1) against the
-    // SAME selected generation as bootstrap+navigator. Fail-closed; never falls
-    // back to the legacy pointer rebuild. Legacy modes unchanged.
-    if (g_fAuthoritativeStartup)
-    {
-        const std::string root = AuthoritativeRootPath();
-        const uint64_t gen = AuthoritativeGeneration();
-        if (root.empty() || gen == 0)
-            return InitError(_("Block Index V2 authoritative startup: missing generation context for HReg"));
-        std::string hregErr;
-        BlockIndexActiveChainReader hregReader;
-        std::string genDir = BlockIndexGenerationManager::GenerationPath(root, gen);
-        if (!hregReader.Open(genDir, gen, &hregErr))
-            return InitError(strprintf("Block Index V2 authoritative HReg reader open failed: %s", hregErr.c_str()));
-        if (!hreg::RebuildHRegStateFromActiveChainByValue(hregReader, 0, -1, hregErr))
-            return InitError(strprintf("Block Index V2 authoritative HReg rebuild failed: %s", hregErr.c_str()));
-        printf(" block index (authoritative) HReg rebuilt by value\n");
-        StartupTrace("hreg_rebuilt");
-        PrintAuthoritativeResidency("T1_blockindex");
-    }
 
 
     // as LoadBlockIndex can take several minutes, it's possible the user
@@ -2425,6 +2404,32 @@ authoritative_startup_ready:
             printf("S1.9 Store3A V2 authoritative armed at %s tip=%d matches chain; new blocks will be published to Store3A (fail-closed on gate error)\n",
                    s3aDir.c_str(), (int)stH);
         }
+    }
+
+    // ---- A.10.1q: BY_VALUE_AUTHORITATIVE HReg startup rebuild ----
+    // ORDER (2026-11-09): this MUST run after the Store3A/TX-LOC arm below. The
+    // rebuild resolves prev-tx through the V2 store; running it during the block
+    // index load failed closed on regtest ("store/TX-LOC not armed") and aborted
+    // startup. Mainnet is unaffected only because HReg recognition is inert there.
+    // Route HReg through the by-value active-chain path (ca7c7e1) against the
+    // SAME selected generation as bootstrap+navigator. Fail-closed; never falls
+    // back to the legacy pointer rebuild. Legacy modes unchanged.
+    if (g_fAuthoritativeStartup)
+    {
+        const std::string root = AuthoritativeRootPath();
+        const uint64_t gen = AuthoritativeGeneration();
+        if (root.empty() || gen == 0)
+            return InitError(_("Block Index V2 authoritative startup: missing generation context for HReg"));
+        std::string hregErr;
+        BlockIndexActiveChainReader hregReader;
+        std::string genDir = BlockIndexGenerationManager::GenerationPath(root, gen);
+        if (!hregReader.Open(genDir, gen, &hregErr))
+            return InitError(strprintf("Block Index V2 authoritative HReg reader open failed: %s", hregErr.c_str()));
+        if (!hreg::RebuildHRegStateFromActiveChainByValue(hregReader, 0, -1, hregErr))
+            return InitError(strprintf("Block Index V2 authoritative HReg rebuild failed: %s", hregErr.c_str()));
+        printf(" block index (authoritative) HReg rebuilt by value\n");
+        StartupTrace("hreg_rebuilt");
+        PrintAuthoritativeResidency("T1_blockindex");
     }
 
     // ********************************************************* Step 10: load peers
