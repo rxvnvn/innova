@@ -233,6 +233,12 @@ bool BuildReplayInputsForTx(const CTransaction& tx,
     for (unsigned int i = 0; i < tx.vin.size(); ++i)
     {
         const COutPoint& prevout = tx.vin[i].prevout;
+        // A coinbase input has a null prevout (hash 0, n = -1): it spends nothing, so
+        // there is no prev tx to resolve. Without this skip the V2 rebuild asked TX-LOC
+        // for 000…000 and aborted startup on every fresh/regtest chain that reached the
+        // rebuild with a coinbase in scope.
+        if (prevout.IsNull())
+            continue;
         if (mapInputs.count(prevout.hash))
             continue;
         std::map<uint256, CTransaction>::const_iterator itLocal = mapLocalTx.find(prevout.hash);
