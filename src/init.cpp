@@ -1973,9 +1973,14 @@ authoritative_startup_ready:
             const bool fIgnoreBirthday = GetBoolArg("-rescanfull", false);
             if (fIgnoreBirthday)
                 printf("Wallet rescan: -rescanfull requested -- birthday early-continue disabled\n");
+            bool rescanComplete = false;
             pwalletMain->ScanForWalletTransactionsByValue(scanReader, fIgnoreBirthday ? 0 : nRescanFromHeight,
-                                                          true, fIgnoreBirthday);
-            printf(" rescan (authoritative) %15" PRId64"ms\n", GetTimeMillis() - nStart);
+                                                          true, fIgnoreBirthday, &rescanComplete);
+            if (!rescanComplete && fIgnoreBirthday)
+                return InitError(_("Wallet full rescan (-rescanfull) was INCOMPLETE: at least one block "
+                                   "could not be read; refusing to report a completed recovery"));
+            printf(" rescan (authoritative) %15" PRId64"ms complete=%d\n",
+                   GetTimeMillis() - nStart, rescanComplete ? 1 : 0);
             StartupTrace("rescan_done");
         } else {
             pwalletMain->ScanForWalletTransactions(pindexRescan, true);

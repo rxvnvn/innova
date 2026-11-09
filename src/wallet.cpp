@@ -1611,9 +1611,11 @@ int CWallet::ScanForWalletTransactions(CBlockIndex* pindexStart, bool fUpdate)
 int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader& reader,
                                               int32_t startHeight,
                                               bool fUpdate,
-                                              bool fIgnoreBirthday)
+                                              bool fIgnoreBirthday,
+                                              bool* outComplete)
 {
     int ret = 0;
+    if (outComplete) *outComplete = false;
     if (!reader.IsOpen())
     {
         printf("Wallet rescan (by value): reader is not open -- SCAN NOT PERFORMED\n");
@@ -1645,6 +1647,7 @@ int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader&
     int nSkippedBirthday = 0;
     int nUnreadable = 0;
     int32_t nFirstUnreadable = -1;
+    bool lookupFailed = false;
     const int64_t nStart = GetTimeMillis();
 
     while (h <= activeHeight && !fShutdown)
@@ -1659,6 +1662,7 @@ int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader&
             printf("Wallet rescan (by value): active-chain lookup FAILED at height %d (%s) -- "
                    "stopping (blocks scanned before failure: %d)\n",
                    h, lkErr.c_str(), nBlocksScanned);
+            lookupFailed = true;
             break;
         }
         if (!fIgnoreBirthday && nBirthday && (ab.nTime < (uint32_t)(nBirthday - 7200)))
@@ -1698,6 +1702,18 @@ int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader&
     if (nBlocksScanned == 0)
         printf("Wallet rescan (by value): WARNING no block was read -- zero hits is NOT evidence "
                "that the wallet has no history\n");
+    // A pass that could not read every height is NOT a successful full rescan
+    // (owner requirement 2026-11-09). Callers doing an explicit -rescanfull must
+    // treat outComplete=false as a failed recovery, not as a completed one.
+    const bool complete = (!lookupFailed && nUnreadable == 0 && !fShutdown);
+    if (outComplete)
+        *outComplete = complete;
+    if (!complete)
+    {
+        printf("Wallet rescan (by value): INCOMPLETE -- lookup_failed=%d unreadable=%d shutdown=%d; "
+               "this pass is NOT a successful full rescan\n",
+               lookupFailed ? 1 : 0, nUnreadable, fShutdown ? 1 : 0);
+    }
     return ret;
 }
 

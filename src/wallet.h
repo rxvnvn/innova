@@ -443,10 +443,14 @@ public:
     // Honors the same nTimeFirstKey (wallet birthday) early-continue as the legacy
     // path, unless fIgnoreBirthday is set (explicit full-historical rescan).
     // Returns the count of wallet-affecting transactions.
+    // outComplete (optional) is set true only when the scan read every height up to the
+    // authoritative active tip without unreadable blocks or lookup failures: a pass with
+    // unreadable blocks is NOT a successful full rescan.
     int ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader& reader,
                                          int32_t startHeight,
                                          bool fUpdate = false,
-                                         bool fIgnoreBirthday = false);
+                                         bool fIgnoreBirthday = false,
+                                         bool* outComplete = NULL);
     void ReacceptWalletTransactions();
     void ResendWalletTransactions(bool fForce = false);
     int64_t GetBalance() const;
