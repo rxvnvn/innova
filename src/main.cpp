@@ -6886,7 +6886,9 @@ bool VerifyMoneySupplyAnchorsWithResolver(int32_t tipHeight,
             const std::string msg = strprintf(
                 "money-supply anchor at height %d cannot be read (%s): supply stays UNVERIFIED",
                 anchor->height, err.empty() ? "active record unavailable" : err.c_str());
-            SetMoneySupplyVerification(MONEY_SUPPLY_VIOLATION, msg);
+            // A READ failure is not proof of divergence: publish a distinct state so
+            // an operator can tell "could not read" from "the data disagrees".
+            SetMoneySupplyVerification(MONEY_SUPPLY_UNREADABLE, msg);
             if (detail) *detail = msg;
             LogPrintf("SUPPLY_ANCHOR_UNRESOLVED height=%d detail=%s\n",
                       anchor->height, err.c_str());

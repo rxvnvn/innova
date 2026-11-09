@@ -1120,7 +1120,7 @@ void AppendMoneySupplyFields(Object& obj, int64_t recordedSupply, bool haveValue
 {
     std::string detail;
     const int st = GetMoneySupplyVerification(&detail);
-    if (st == MONEY_SUPPLY_VIOLATION)
+    if (st == MONEY_SUPPLY_VIOLATION || st == MONEY_SUPPLY_UNREADABLE)
     {
         obj.push_back(Pair("moneysupply", Value::null));
         obj.push_back(Pair("moneysupply_verified", false));

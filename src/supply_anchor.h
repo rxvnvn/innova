@@ -78,6 +78,11 @@ enum MoneySupplyVerificationState
     MONEY_SUPPLY_UNKNOWN = 0,
     MONEY_SUPPLY_VERIFIED = 1,
     MONEY_SUPPLY_VIOLATION = 2,
+    // The persisted accumulator could not be COMPARED with an anchor: the anchor
+    // or the active record could not be read. Distinct from VIOLATION, which is a
+    // proven numeric disagreement. Both fail closed (no number is reported), but
+    // an operator must be able to tell "data disagrees" from "could not read".
+    MONEY_SUPPLY_UNREADABLE = 3,
 };
 
 void SetMoneySupplyVerification(int state, const std::string& detail);

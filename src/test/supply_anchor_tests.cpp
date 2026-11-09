@@ -150,6 +150,13 @@ BOOST_AUTO_TEST_CASE(sa_verification_state_roundtrip)
 
     SetMoneySupplyVerification(MONEY_SUPPLY_UNKNOWN, "");
     BOOST_CHECK_EQUAL(std::string(MoneySupplyVerificationName(MONEY_SUPPLY_UNKNOWN)), std::string("UNVERIFIED"));
+
+    // Four states, four distinct diagnostics: UNREADABLE must never alias VIOLATION.
+    SetMoneySupplyVerification(MONEY_SUPPLY_UNREADABLE, "cannot read");
+    BOOST_CHECK_EQUAL(GetMoneySupplyVerification(&detail), (int)MONEY_SUPPLY_UNREADABLE);
+    BOOST_CHECK_EQUAL(std::string(MoneySupplyVerificationName(MONEY_SUPPLY_UNREADABLE)), std::string("UNREADABLE"));
+    BOOST_CHECK(std::string(MoneySupplyVerificationName(MONEY_SUPPLY_UNREADABLE)) !=
+                std::string(MoneySupplyVerificationName(MONEY_SUPPLY_VIOLATION)));
 }
 
 BOOST_AUTO_TEST_CASE(sa_matching_anchor_is_verified)
@@ -216,7 +223,12 @@ BOOST_AUTO_TEST_CASE(sa_unresolvable_anchor_fails_closed)
     scope.chain.fail = true;
     std::string detail;
     BOOST_CHECK(!VerifyMoneySupplyAnchorsWithResolver(t[0].height, SAResolve, &detail));
-    BOOST_CHECK_EQUAL(GetMoneySupplyVerification(NULL), (int)MONEY_SUPPLY_VIOLATION);
+    // A READ failure is diagnostic-distinct from a proven numeric divergence.
+    BOOST_CHECK_EQUAL(GetMoneySupplyVerification(NULL), (int)MONEY_SUPPLY_UNREADABLE);
+    BOOST_CHECK_MESSAGE(std::string(MoneySupplyVerificationName(MONEY_SUPPLY_UNREADABLE)) == "UNREADABLE",
+                        "a read failure must report its own status, not VIOLATION");
+    BOOST_CHECK_MESSAGE(detail.find("cannot be read") != std::string::npos,
+                        "the read failure must say so: " << detail);
 }
 
 BOOST_AUTO_TEST_CASE(sa_no_applicable_anchor_is_unknown_never_verified)

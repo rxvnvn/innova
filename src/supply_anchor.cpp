@@ -134,8 +134,9 @@ const char* MoneySupplyVerificationName(int state)
 {
     switch (state)
     {
-        case MONEY_SUPPLY_VERIFIED:  return "VERIFIED";
-        case MONEY_SUPPLY_VIOLATION: return "VIOLATION";
+        case MONEY_SUPPLY_VERIFIED:   return "VERIFIED";
+        case MONEY_SUPPLY_VIOLATION:  return "VIOLATION";
+        case MONEY_SUPPLY_UNREADABLE: return "UNREADABLE";
         case MONEY_SUPPLY_UNKNOWN:
         default:                     return "UNVERIFIED";
     }
