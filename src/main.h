@@ -583,6 +583,19 @@ bool ReconcileOperatorInvalidSetFromV2(std::string& strError);
 //   "FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"
 void MainFailpointSetForTesting(const std::string& name, bool armed);
 
+// BPMR/ADR-0022 (IF01-DUR-01): the outer block-path frame registers its cs_main
+// lock here (thread-local) so the accept path can release BOTH recursive levels
+// around a bounded executor submit and take them back afterwards (§7.3).
+void BlockPathSetOuterCsMainLock(CCriticalBlock* p);
+CCriticalBlock* BlockPathGetOuterCsMainLock();
+struct BlockPathOuterLockGuard
+{
+    explicit BlockPathOuterLockGuard(CCriticalBlock* p) { BlockPathSetOuterCsMainLock(p); }
+    ~BlockPathOuterLockGuard() { BlockPathSetOuterCsMainLock(NULL); }
+};
+// Regtest-only, process-level pause at a named BPM phase (T7 SIGKILL windows).
+bool BpmFailpointPause(const char* name);
+
 // S1 acceptance (TEST-ONLY, regtest-only): temporarily lower the proof-of-stake
 // target limit so a real PoS kernel is findable on a regtest fixture. Refuses to
 // run outside regtest, so mainnet/testnet can never be overridden; consensus

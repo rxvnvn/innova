@@ -1142,6 +1142,9 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
         {
             uint256 hashBlock = pblock->GetHash();
             LOCK(cs_main);
+            // BPMR/ADR-0022 §7.3: register this outer cs_main level so the accept
+            // path can release the full recursion depth around the executor submit.
+            BlockPathOuterLockGuard blockPathOuterLock(&criticalblock);
             if (!controller.ShouldStop(nSessionId) &&
                 IsCPUMiningWorkCurrent(workIdentity, false) &&
                 IsCPUMiningCollateralStateReady())

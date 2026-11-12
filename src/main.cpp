@@ -59,43 +59,293 @@ using boost::placeholders::_2;
 
 using namespace std;
 // BPMR/ADR-0022 (IF01-DUR-01): prepared payload carried through the executor.
+// It is stack-allocated by the accepting thread and stays alive until the
+// transition result is reaped, so the worker's callback may read it safely.
 struct BpmrPreparedCommit
 {
     BlockIndexAuthoritativeLive* pLive;
+    CBlock* pBlock;                 // this block (SetBestChain lives on CBlock)
+    CBlockIndex* pIndex;            // pindexNew
     const BlockIndexRecord* pRec;
     const BlockIndexDerivedEntry* pDer;
     int nHeight;
+    uint256 hashBlock;
+    bool fReorg;
     std::string strErr;
 };
 
+// Fingerprint of a block hash used as the executor's opaque identity (I2). The
+// full equality is still checked by the authority itself; this is the executor's
+// cheap durable-tip identity.
+static uint64_t BpmHashFingerprint(const uint256& h)
+{
+    uint64_t v = 0;
+    memcpy(&v, h.begin(), sizeof(v));
+    return v;
+}
+
+// Thread-local pointer to the cs_main lock held by the OUTER block-path frame
+// (ProcessMessage("block") / the CPU miner). AddToBlockIndex holds a second
+// (recursive) level; releasing cs_main before a bounded submit requires releasing
+// BOTH levels or the worker can never enter its commit (§7.3 deadlock).
+static thread_local CCriticalBlock* g_pBlockPathOuterCsMain = NULL;
+void BlockPathSetOuterCsMainLock(CCriticalBlock* p) { g_pBlockPathOuterCsMain = p; }
+CCriticalBlock* BlockPathGetOuterCsMainLock() { return g_pBlockPathOuterCsMain; }
+
+// BPM fail-stop latch: a durable commit whose servable switch/Store3A agreement
+// failed must stop block acceptance until a restart reconciles (I4/I8). Never a
+// silent retry.
+static bool g_bpmFailStop = false;
+
+// Test-only, regtest-only, process-level pause at a named phase. Used by T7 to
+// SIGKILL the node deterministically inside a phase window. Never armed outside
+// regtest, so mainnet/testnet behavior cannot be altered by it.
+bool BpmFailpointPause(const char* name)
+{
+    if (!fRegTest) return false;
+    const std::string armed = GetArg("-bpmfailpoint", "");
+    if (armed != name) return false;
+    const int nMs = (int)GetArg("-bpmfailpointsleep", 60000);
+    printf("BPM_FAILPOINT phase=%s pause_ms=%d height=%d (SIGKILL window open)\n",
+           name, nMs, nBestHeight);
+    fflush(stdout);
+    MilliSleep(nMs);
+    printf("BPM_FAILPOINT phase=%s resumed\n", name);
+    fflush(stdout);
+    return true;
+}
+
+// I4: after a publication the Store3A durable tip must equal the BI-V2 tip.
+static bool BpmVerifyStore3ATipI4(const uint256& hashTip, int nHeight,
+                                  std::string* err)
+{
+    if (!s16::g_chainObserve.enabled || s16::g_chainObserve.store == NULL ||
+        !s16::g_chainObserve.store->opened())
+    {
+        if (err) *err = "I4: Store3A store is not armed (cannot verify publication)";
+        return false;
+    }
+    if (!s16::g_chainObserve.pending.empty())
+    {
+        // -s16store3abatch>1: the store's durable tip intentionally trails the
+        // BI-V2 tip by the unflushed batch; the fence is the batch barrier.
+        printf("BPM_I4 store_lag pending=%zu store_h=%d bi_h=%d (batched publication)\n",
+               s16::g_chainObserve.pending.size(),
+               (int)s16::g_chainObserve.store->tipHeight(), nHeight);
+        fflush(stdout);
+        return true;
+    }
+    const cs::Hash sh = s16::g_chainObserve.store->tipHash();
+    const int32_t shHeight = s16::g_chainObserve.store->tipHeight();
+    uint256 storeTip;
+    memcpy(storeTip.begin(), sh.data(), 32);
+    if (storeTip != hashTip || (int)shHeight != nHeight)
+    {
+        if (err) *err = strprintf("I4 violated after publication: Store3A tip (h=%d %s) != BI-V2 tip (h=%d %s)",
+                                  (int)shHeight, storeTip.GetHex().c_str(), nHeight,
+                                  hashTip.GetHex().c_str());
+        return false;
+    }
+    printf("BPM_I4 OK h=%d hash=%s store_h=%d\n", nHeight,
+           hashTip.ToString().substr(0, 16).c_str(), (int)shHeight);
+    fflush(stdout);
+    return true;
+}
+
+// Real CommitFn: the durable transition only. Extension -> AcceptActive (the
+// index-first commit). Reorg -> the fused atomic V->C->A publication, whose
+// durable part and servable switch are inseparable by construction (ADR-0016).
+static bool BpmCommitCallback(const bpmr::TransitionRequest& req, std::string* err)
+{
+    BpmrPreparedCommit* p = (BpmrPreparedCommit*)const_cast<void*>(req.pUser);
+    if (p == NULL || p->pLive == NULL)
+    {
+        if (err) *err = "prepared payload missing";
+        return false;
+    }
+    LOCK(cs_main);
+    if (req.fReorg)
+    {
+        if (p->pBlock == NULL || p->pIndex == NULL)
+        {
+            if (err) *err = "reorg payload missing block/index";
+            return false;
+        }
+        if (!p->pBlock->SetBestChain(p->pIndex))
+        {
+            if (err) *err = "atomic reorg transition (SetBestChain) failed";
+            return false;
+        }
+        return true;
+    }
+    if (p->pRec == NULL || p->pDer == NULL)
+    {
+        if (err) *err = "prepared record missing";
+        return false;
+    }
+    if (!req.fPublish)
+    {
+        // ADR-0022 rev2 §1.4 side branch / §7.4: a refused active append is
+        // committed as a durable SIDE record (no publication, servable unchanged).
+        if (!p->pLive->AcceptSide(*p->pRec, *p->pDer, &p->strErr))
+        {
+            if (err) *err = p->strErr.empty() ? "AcceptSide failed" : p->strErr;
+            return false;
+        }
+        return true;
+    }
+    if (!p->pLive->AcceptActive(*p->pRec, *p->pDer, p->nHeight, &p->strErr))
+    {
+        if (err) *err = p->strErr.empty() ? "AcceptActive failed" : p->strErr;
+        return false;
+    }
+    return true;
+}
+
+// Real PublishFn: servable tip = durable tip, then the Store3A apply happens
+// inside SetBestChain->ConnectBlock and I4 is verified against the durable tip.
+// A failure here is FAIL-STOP: the durable commit already happened.
+static bool BpmPublishCallback(const bpmr::TransitionRequest& req, std::string* err)
+{
+    BpmrPreparedCommit* p = (BpmrPreparedCommit*)const_cast<void*>(req.pUser);
+    if (p == NULL)
+    {
+        if (err) *err = "prepared payload missing at publish";
+        return false;
+    }
+    if (req.fReorg)
+    {
+        LOCK(cs_main);
+        return BpmVerifyStore3ATipI4(p->hashBlock, p->nHeight, err);
+    }
+    BpmFailpointPause("FP_BPM_AFTER_COMMIT_BEFORE_PUBLISH");
+    LOCK(cs_main);
+    if (p->pBlock == NULL || p->pIndex == NULL)
+    {
+        if (err) *err = "publish payload missing block/index";
+        return false;
+    }
+    if (!p->pBlock->SetBestChain(p->pIndex))
+    {
+        if (err) *err = "servable switch (SetBestChain) failed after a durable commit";
+        return false;
+    }
+    if (!BpmVerifyStore3ATipI4(p->hashBlock, p->nHeight, err))
+        return false;
+    BpmFailpointPause("FP_BPM_AFTER_PUBLISH");
+    return true;
+}
+
 // The single writer for durable chain transitions in this process. Created lazily
-// and used only when -bpmsinglewriter=1; the callback is the REAL durability path
-// (authoritative AcceptActive), not a stub.
-static bpmr::TransitionExecutor* BpmrGetExecutor()
+// and used only when -bpmsinglewriter=1; both callbacks are the REAL path.
+static bpmr::TransitionExecutor* BpmGetExecutor()
 {
     static bpmr::TransitionExecutor* pExec = NULL;
     if (pExec == NULL)
-    {
-        pExec = new bpmr::TransitionExecutor(64,
-            [](const bpmr::TransitionRequest& req, std::string* err) -> bool {
-                BpmrPreparedCommit* p =
-                    (BpmrPreparedCommit*)const_cast<void*>(req.pUser);
-                if (p == NULL || p->pLive == NULL || p->pRec == NULL || p->pDer == NULL)
-                {
-                    if (err) *err = "prepared payload missing";
-                    return false;
-                }
-                if (!p->pLive->AcceptActive(*p->pRec, *p->pDer, p->nHeight, &p->strErr))
-                {
-                    if (err) *err = p->strErr.empty() ? "AcceptActive failed" : p->strErr;
-                    return false;
-                }
-                return true;
-            },
-            [](const bpmr::TransitionRequest&) {});
-    }
+        pExec = new bpmr::TransitionExecutor(64, BpmCommitCallback, BpmPublishCallback);
     return pExec;
 }
+
+// Bind I1/I2 to the DURABLE tip of the open authority (never to pindexBest).
+// A fresh store has no live tip yet (only the immutable base S), and the base tip
+// hash is what the first extension names as its parent, so the caller binds from
+// the verified extension parent instead of reading a possibly-empty GetTip().
+static void BpmBindDurableTipFromParent(const uint256& parentHash, int nParentHeight)
+{
+    bpmr::TransitionExecutor* pExec = BpmGetExecutor();
+    if (pExec->TipInitialized()) return;
+    pExec->InitDurableTip((uint64_t)nParentHeight, BpmHashFingerprint(parentHash));
+    printf("BPM_DURABLE_TIP_BOUND height=%d id=%016llx (parent of the first extension; I1/I2 use the durable tip)\n",
+           nParentHeight, (unsigned long long)BpmHashFingerprint(parentHash));
+    fflush(stdout);
+}
+
+// Bind from the open authority's tip (used by the reorg path when no extension
+// has run yet in this process).
+static void BpmEnsureDurableTipBound(BlockIndexAuthoritativeLive* pLive)
+{
+    bpmr::TransitionExecutor* pExec = BpmGetExecutor();
+    if (pExec->TipInitialized()) return;
+    const BlockIndexTipAuthority* pTip = pLive ? pLive->TipAuthority() : NULL;
+    const BlockIndexTipRead tip = pTip ? pTip->GetTip() : BlockIndexTipRead();
+    uint64_t nHeight = 0;
+    uint64_t nId = 0;
+    if (pTip != NULL && tip.status == BLOCK_INDEX_TIP_OK)
+    {
+        nHeight = (uint64_t)tip.height;
+        nId = BpmHashFingerprint(tip.record.hash);
+    }
+    else if (pTip != NULL)
+    {
+        nHeight = (uint64_t)pTip->TipHeight();
+        nId = BpmHashFingerprint(pTip->TipHash());
+    }
+    pExec->InitDurableTip(nHeight, nId);
+    printf("BPM_DURABLE_TIP_BOUND height=%llu id=%016llx (checks I1/I2 use the durable tip)\n",
+           (unsigned long long)nHeight, (unsigned long long)nId);
+    fflush(stdout);
+}
+
+// Runs one block transition through the single-writer executor. Releases cs_main
+// (both levels) around a bounded submit and re-acquires it after the result; on
+// timeout the SAME transition runs synchronously (fail-safe degradation).
+static bpmr::TransitionOutcome BpmRunBlockTransition(
+    bpmr::TransitionRequest req, BpmrPreparedCommit* pPrep,
+    CCriticalBlock* pLocalCsMain, int nTimeoutMs, bpmr::TransitionResult* out)
+{
+    bpmr::TransitionExecutor* pExec = BpmGetExecutor();
+    req.pUser = pPrep;
+    static std::atomic<bool> fReleaseWindow(false);
+    bool fExpected = false;
+
+    if (!fReleaseWindow.compare_exchange_strong(fExpected, true))
+    {
+        // Another block-path thread already waits outside cs_main. Stacking a
+        // second waiter buys nothing; run the same transition inline, releasing
+        // cs_main only while the worker finishes its own transition.
+        for (int i = 0; i < 5000; ++i)
+        {
+            bool fBusy = false;
+            const bpmr::TransitionOutcome oc =
+                pExec->TryRunInline(req, out, &fBusy);
+            if (!fBusy) return oc;
+            CCriticalBlock* pOuter = BlockPathGetOuterCsMainLock();
+            pLocalCsMain->Unlock();
+            if (pOuter) pOuter->Unlock();
+            MilliSleep(2);
+            if (pOuter) pOuter->Lock();
+            pLocalCsMain->Lock();
+        }
+        if (out)
+        {
+            out->eOutcome = bpmr::TR_FAILED_COMMIT;
+            out->strDetail = "inline fallback retry budget exhausted";
+        }
+        return bpmr::TR_FAILED_COMMIT;
+    }
+
+    CCriticalBlock* pOuter = BlockPathGetOuterCsMainLock();
+    pLocalCsMain->Unlock();
+    if (pOuter) pOuter->Unlock();
+    BpmFailpointPause("FP_BPM_BEFORE_COMMIT");
+    bpmr::TransitionResult tr;
+    const bool fExecuted = pExec->SubmitAndWait(req, nTimeoutMs, &tr);
+    bpmr::TransitionOutcome oc = tr.eOutcome;
+    if (!fExecuted)
+    {
+        // The worker never started it (abandoned): synchronous fallback with
+        // cs_main released, so the inline path can take the transition mutex.
+        oc = pExec->RunInline(req, &tr);
+    }
+    if (pOuter) pOuter->Lock();
+    pLocalCsMain->Lock();
+    fReleaseWindow.store(false);
+    if (out) *out = tr;
+    return oc;
+}
+
+static const int BPM_SUBMIT_TIMEOUT_MS = 5000;
+
 
 // BPMR-FIX1: lock-free active-tip generation counter (defined here, at global
 // scope, because main.cpp bumps it on every SetBestChain and miner.cpp's
@@ -9996,8 +10246,17 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         }
     }
 
+    // IF01-DUR-01: a failed servable switch after a durable commit is FAIL-STOP.
+    // Never accept further blocks on divergent state; a restart reconciles.
+    if (g_bpmFailStop)
+    {
+        return error("AddToBlockIndex() : BPM FAIL-STOP armed (a durable commit has no verified servable/Store3A state) — restart reconciles");
+    }
+
     // New best
     bool fV2ActivePublished = false;   // S1: set when AcceptActive committed BEFORE SetBestChain
+    bool fBpmPublishedPre = false;     // IF01-DUR-01: SetBestChain already ran in the publish callback
+    bool fBpmSideCommittedPre = false; // IF01-DUR-01: refused append durably committed as a SIDE record
     // ATOMIC-REORG (S1-d2): per-accept state. Reset at ENTRY so a flag left by a
     // direct SetBestChain caller (invalidate/reconsider/checkpoint switch, which
     // bypass this G1 seam) can never leak into an unrelated acceptance.
@@ -10076,26 +10335,43 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 CSyncLockPhase phaseS1Commit("ProcessMessage(block)", "s1_accept_active");
                 if (GetBoolArg("-bpmsinglewriter", false))
                 {
-                    // IF01-DUR-01: the durable commit goes through the single-writer
-                    // executor (real AcceptActive callback), with an explicit outcome.
+                    // IF01-DUR-01: the durable commit AND the servable switch go
+                    // through the single-writer executor (real AcceptActive and
+                    // SetBestChain callbacks), with an explicit outcome. I1/I2 are
+                    // checked there against the DURABLE tip, not pindexBest.
+                    BpmBindDurableTipFromParent(parentPre, (int)pindexNew->nHeight - 1);
                     BpmrPreparedCommit prepared;
                     prepared.pLive = livePre;
+                    prepared.pBlock = this;
+                    prepared.pIndex = pindexNew;
                     prepared.pRec = &recPre;
                     prepared.pDer = &derPre;
                     prepared.nHeight = (int)pindexNew->nHeight;
+                    prepared.hashBlock = hash;
+                    prepared.fReorg = false;
                     bpmr::TransitionRequest req;
                     req.nHeight = (uint64_t)pindexNew->nHeight;
-                    req.nParentId = 0;
-                    req.nSelfId = (uint64_t)pindexNew->nHeight;
+                    req.nParentId = BpmHashFingerprint(parentPre);
+                    req.nSelfId = BpmHashFingerprint(hash);
                     req.fPublish = true;
-                    req.fCallerValidatedIdentity = true;
-                    req.pUser = &prepared;
+                    req.fReorg = false;
+                    // §7.4: if this turned out NOT to extend the durable tip (a sibling
+                    // block won the race), it must be committed as a SIDE record by the
+                    // same single writer — never dropped, never treated as invalid.
+                    req.fSideFallback = true;
                     bpmr::TransitionResult tr;
                     const bpmr::TransitionOutcome oc =
-                        BpmrGetExecutor()->RunInline(req, &tr);
+                        BpmRunBlockTransition(req, &prepared, &criticalblock,
+                                              BPM_SUBMIT_TIMEOUT_MS, &tr);
                     fS1CommittedPre = (oc == bpmr::TR_COMMITTED);
-                    if (!fS1CommittedPre)
-                        perrPre = tr.strDetail.empty() ? "single-writer commit rejected"
+                    if (fS1CommittedPre)
+                        fBpmPublishedPre = true;
+                    if (oc == bpmr::TR_COMMITTED_SIDE)
+                        fBpmSideCommittedPre = true;
+                    if (oc == bpmr::TR_FAILED_PUBLISH)
+                        g_bpmFailStop = true;
+                    if (!fS1CommittedPre && !fBpmSideCommittedPre)
+                        perrPre = tr.strDetail.empty() ? "single-writer transition refused"
                                                        : tr.strDetail;
                 }
                 else
@@ -10103,8 +10379,15 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                     fS1CommittedPre = livePre->AcceptActive(recPre, derPre, pindexNew->nHeight, &perrPre);
                 }
             }
-            if (!fS1CommittedPre)            {
-                s1PreErr = strprintf("V2 commit FAILED at height %d: %s — nothing applied (fail-closed)",
+            if (!fS1CommittedPre)
+            {
+                if (fBpmSideCommittedPre)
+                {
+                    // The transition was refused as an ACTIVE append and durably
+                    // committed as a SIDE record instead (§7.4). Nothing is
+                    // published, the servable tip is untouched, the block is kept.
+                    return true;
+                }                s1PreErr = strprintf("V2 commit FAILED at height %d: %s — nothing applied (fail-closed)",
                                      (int)pindexNew->nHeight, perrPre.c_str());
                 return false;
             }
@@ -10120,7 +10403,47 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             ibdblocklatency::RecordBlockTerminal(hash, ibdblocklatency::OUTCOME_REJECTED);
             return error("AddToBlockIndex() : %s", s1PreErr.c_str());
         }
-        if (!SetBestChain(pindexNew))
+        bool fBestSetByBpm = fBpmPublishedPre;
+        // A refused append that was committed as a SIDE record must not be published
+        // unless it is STILL the heaviest candidate (equal-height/higher-trust): that
+        // case is a cutover and goes through the fused reorg transition below.
+        const bool fBpmSkipPublish =
+            fBpmSideCommittedPre && (pindexNew->nChainTrust <= nBestChainTrust);
+        if (!fBestSetByBpm && !fBpmSkipPublish && GetBoolArg("-bpmsinglewriter", false) && g_fAuthoritativeStartup)
+        {
+            // IF01-DUR-01: a non-extension best-chain switch (reorg/cutover) is ONE
+            // fused atomic transition (V->C->A inside ReorganizeAtomic) submitted
+            // through the same single writer. The intermediate disconnected state is
+            // never servable (it exists only inside that call), so the executor
+            // request carries the whole transition.
+            BlockIndexAuthoritativeLive* liveR = GetAuthoritativeLiveAuthority();
+            BpmEnsureDurableTipBound(liveR);
+            BpmrPreparedCommit prepared;
+            prepared.pLive = liveR;
+            prepared.pBlock = this;
+            prepared.pIndex = pindexNew;
+            prepared.pRec = NULL;
+            prepared.pDer = NULL;
+            prepared.nHeight = (int)pindexNew->nHeight;
+            prepared.hashBlock = hash;
+            prepared.fReorg = true;
+            bpmr::TransitionRequest req;
+            req.nHeight = (uint64_t)pindexNew->nHeight;
+            req.nParentId = BpmHashFingerprint(pindexNew->pprev ? pindexNew->pprev->GetBlockHash()
+                                                               : pindexNew->hashPrevStable);
+            req.nSelfId = BpmHashFingerprint(hash);
+            req.fPublish = true;
+            req.fReorg = true;
+            bpmr::TransitionResult tr;
+            const bpmr::TransitionOutcome oc =
+                BpmRunBlockTransition(req, &prepared, &criticalblock,
+                                      BPM_SUBMIT_TIMEOUT_MS, &tr);
+            fBestSetByBpm = (oc == bpmr::TR_COMMITTED);
+            if (!fBestSetByBpm)
+                printf("BPM_REORG transition refused: outcome=%s detail=%s\n",
+                       bpmr::TransitionOutcomeName(oc), tr.strDetail.c_str());
+        }
+        if (!fBestSetByBpm && !fBpmSkipPublish && !SetBestChain(pindexNew))
         {
             if (g_reorgAtomicFailStop)
             {
@@ -10214,7 +10537,16 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             }
             else if (!becameBest)
             {
-                okP = live->AcceptSide(rec, der, &perr);
+                if (fBpmSideCommittedPre)
+                {
+                    // Already durably committed as a SIDE record by the single writer
+                    // (refused active append, §7.4): never a second write.
+                    if (BlockIndexCutTraceEnabled())
+                        BlockIndexCutTrace("G1 SKIP AcceptSide (already committed by BPM single writer) hash=%s h=%d",
+                                           hash.ToString().substr(0,16).c_str(), (int)pindexNew->nHeight);
+                }
+                else
+                    okP = live->AcceptSide(rec, der, &perr);
             }
             else
             {
@@ -15693,6 +16025,9 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
             ibdactivepath::IBDActivePathTraceEnabled()
                 ? ibdactivepath::MonotonicMicros() : 0;
         LOCK(cs_main);
+        // BPMR/ADR-0022 §7.3: register the outer cs_main level so the accept path
+        // can release the whole recursion depth around a bounded executor submit.
+        BlockPathOuterLockGuard blockPathOuterLock(&criticalblock);
         if (nIBDCsMainWaitStart)
             ibdactivepath::RecordCSMainWait(
                 ibdactivepath::MonotonicMicros() - nIBDCsMainWaitStart);

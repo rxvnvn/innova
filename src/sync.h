@@ -142,6 +142,9 @@ class CMutexLock
 private:
     boost::unique_lock<Mutex> lock;
     uint64_t nOwnerToken;
+    const char* pszName_;
+    const char* pszFile_;
+    int nLine_;
 
     void Enter(const char* pszName, const char* pszFile, int nLine)
     {
@@ -171,7 +174,8 @@ private:
 
 public:
     CMutexLock(Mutex& mutexIn, const char* pszName, const char* pszFile, int nLine, bool fTry = false)
-        : lock(mutexIn, boost::defer_lock), nOwnerToken(0)
+        : lock(mutexIn, boost::defer_lock), nOwnerToken(0),
+          pszName_(pszName), pszFile_(pszFile), nLine_(nLine)
     {
         if (fTry)
             TryEnter(pszName, pszFile, nLine);
@@ -195,6 +199,17 @@ public:
             lock.unlock();
             SyncLockOwnerReleased((void*)lock.mutex(), nOwnerToken);
             LeaveCritical();
+        }
+    }
+
+    // Re-acquire after an explicit Unlock() on the SAME thread. Used only by the
+    // BPMR/ADR-0022 block path, which releases cs_main around a bounded executor
+    // submit and then takes it back (same thread, recursion depth unchanged).
+    void Lock()
+    {
+        if (!lock.owns_lock())
+        {
+            Enter(pszName_, pszFile_, nLine_);
         }
     }
 
