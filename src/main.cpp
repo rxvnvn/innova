@@ -11899,7 +11899,7 @@ static bpmr::TransitionOutcome BpmRunOperatorTransition(
     req.pResultId = &prep.nResultId;
 
     bpmr::TransitionResult tr;
-    for (int i = 0; i < 5000; ++i)
+    for (int i = 0; i < 60; ++i)
     {
         bool fBusy = false;
         const bpmr::TransitionOutcome oc = pExec->TryRunInline(req, &tr, &fBusy);
@@ -11927,10 +11927,13 @@ static bpmr::TransitionOutcome BpmRunOperatorTransition(
             return oc;
         }
         // The worker holds the transition mutex and needs cs_main: give it up.
+        // 2 ms is not enough under mining: the RPC thread re-acquires cs_main
+        // before the worker can finish, so the operator transition starves and
+        // ends in INLINE_BUSY even though nothing is stuck. Yield for 200 ms.
         CCriticalBlock* pOuter = BlockPathGetOuterCsMainLock();
         if (pLocalCsMain) pLocalCsMain->Unlock();
         if (pOuter) pOuter->Unlock();
-        MilliSleep(2);
+        MilliSleep(200);
         if (pOuter) pOuter->Lock();
         if (pLocalCsMain) pLocalCsMain->Lock();
     }
