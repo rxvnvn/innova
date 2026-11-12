@@ -17727,8 +17727,21 @@ bool SendMessages(CNode* pto, bool fSendTrickle,
         const bool fIBDPassHadFreeCapacity =
             pto->setBlocksInFlight.size() < nMaxBlocksInFlightPerPeer;
         int64_t nIBDPassSent = 0;
+        // BPMR/ADR-0022: the flush loop could spin forever when an entry is
+        // re-queued due at the same instant (observed: p2p_sync_tests hung at
+        // 100% CPU for hours). Bound the pass and make the bound loud instead of
+        // hanging the node; the queue stays intact for the next pass.
+        size_t nFlushIterations = 0;
+        const size_t nFlushIterationsMax = pto->mapAskFor.size() * 4 + 64;
         while (!pto->mapAskFor.empty() && (*pto->mapAskFor.begin()).first <= nNow)
         {
+            if (++nFlushIterations > nFlushIterationsMax)
+            {
+                printf("SENDMESSAGES_FLUSH_GUARD peer=%d queue=%zu iterations=%zu "
+                       "\u2014 pass bounded, queue preserved\n",
+                       (int)pto->GetId(), pto->mapAskFor.size(), nFlushIterations);
+                break;
+            }
             CInv inv = (*pto->mapAskFor.begin()).second;
             bool fSkip = false;
             bool fBlockRequest = (inv.type == MSG_BLOCK || inv.type == MSG_FILTERED_BLOCK);

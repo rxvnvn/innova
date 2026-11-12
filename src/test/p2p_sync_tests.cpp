@@ -4482,11 +4482,18 @@ BOOST_AUTO_TEST_CASE(inflight_limit_preserves_askfor_order)
     std::vector<std::string> commands = SentCommands(peer);
     BOOST_CHECK(!HasCommand(commands, "getdata"));
     BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 3U);
-    it = peer.mapAskFor.begin();
-    BOOST_CHECK(it->second.hash == hashP); ++it;
-    BOOST_CHECK(it->second.hash == hashC); ++it;
-    BOOST_CHECK(it->second.hash == hashD);
-    BOOST_CHECK_EQUAL(peer.mapAskFor.begin()->first, nBaseKey);
+    // The checks below only make sense when the queue survived. Guarding them is
+    // NOT a weaker test: the size assertion above still fails and reports the
+    // defect. Without the guard, an emptied map made `it` an end iterator and
+    // `++it` spun forever (observed as a 100% CPU hang for hours).
+    if (peer.mapAskFor.size() == 3U)
+    {
+        it = peer.mapAskFor.begin();
+        BOOST_CHECK(it->second.hash == hashP); ++it;
+        BOOST_CHECK(it->second.hash == hashC); ++it;
+        BOOST_CHECK(it->second.hash == hashD);
+        BOOST_CHECK_EQUAL(peer.mapAskFor.begin()->first, nBaseKey);
+    }
     BOOST_CHECK(!GetBlockRequestOwner(hashP, NULL, NULL));
 
     peer.ClearBlockInFlight(uint256(7000));
@@ -4494,9 +4501,14 @@ BOOST_AUTO_TEST_CASE(inflight_limit_preserves_askfor_order)
 
     BOOST_CHECK(SendMessages(&peer, true));
     BOOST_CHECK_EQUAL(peer.mapAskFor.size(), 2U);
-    it = peer.mapAskFor.begin();
-    BOOST_CHECK(it->second.hash == hashC); ++it;
-    BOOST_CHECK(it->second.hash == hashD);
+    // Same guard as above: the size assertion reports the defect, and the
+    // iterator walk must not run on an empty map (end-iterator ++ = hang).
+    if (peer.mapAskFor.size() == 2U)
+    {
+        it = peer.mapAskFor.begin();
+        BOOST_CHECK(it->second.hash == hashC); ++it;
+        BOOST_CHECK(it->second.hash == hashD);
+    }
     NodeId ownerPeer = -1;
     BlockRequestOwnerState ownerState = BLOCK_REQUEST_OWNER_QUEUED;
     BOOST_CHECK(GetBlockRequestOwner(hashP, &ownerPeer, &ownerState));
