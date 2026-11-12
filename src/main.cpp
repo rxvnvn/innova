@@ -72,7 +72,22 @@ struct BpmrPreparedCommit
     uint256 hashBlock;
     bool fReorg;
     std::string strErr;
+    // P0.3 (I6): fused operator transition payload (invalidate / reconsider).
+    int nOperator;                  // 0 = block path, 1 = invalidate, 2 = reconsider
+    uint256 hashTarget;             // operator target
+    int32_t nResultHeight;          // OUT: durable tip height after the fused commit
+    uint64_t nResultId;             // OUT: durable tip identity after the fused commit
+    uint256 hashResult;             // OUT: durable tip hash after the fused commit
+
+    BpmrPreparedCommit()
+        : pLive(NULL), pBlock(NULL), pIndex(NULL), pRec(NULL), pDer(NULL),
+          nHeight(-1), fReorg(false), nOperator(0), nResultHeight(-1), nResultId(0) {}
 };
+
+// Defined next to the authoritative operator bodies (single implementation, shared
+// by the direct path and the executor's commit callback).
+static bool BpmOperatorCommitBody(BpmrPreparedCommit* p, std::string* err);
+static bool BpmOperatorPublishBody(BpmrPreparedCommit* p, std::string* err);
 
 // Fingerprint of a block hash used as the executor's opaque identity (I2). The
 // full equality is still checked by the authority itself; this is the executor's
@@ -164,6 +179,8 @@ static bool BpmCommitCallback(const bpmr::TransitionRequest& req, std::string* e
         return false;
     }
     LOCK(cs_main);
+    if (req.fOperator)
+        return BpmOperatorCommitBody(p, err);
     if (req.fReorg)
     {
         if (p->pBlock == NULL || p->pIndex == NULL)
@@ -212,6 +229,11 @@ static bool BpmPublishCallback(const bpmr::TransitionRequest& req, std::string* 
     {
         if (err) *err = "prepared payload missing at publish";
         return false;
+    }
+    if (req.fOperator)
+    {
+        LOCK(cs_main);
+        return BpmOperatorPublishBody(p, err);
     }
     if (req.fReorg)
     {
@@ -11763,9 +11785,180 @@ static bool SelectAttachedBranch(BlockIndexTipAuthority* tip, int32_t* fork,
     return true;
 }
 
+static bool s16_AuthV2InvalidateBody(const uint256& hash, std::string& strError)
+{
+    int32_t targetHeight = -1; bool alreadyInvalid = false; std::string rerr;
+    const int tier = ResolveAuthoritativeTargetV2(hash, &targetHeight, &alreadyInvalid, &rerr);
+    if (tier == 3) { strError = rerr.empty() ? "authoritative resolve error" : rerr; return false; }
+    if (tier == 2) { strError = "Block not found"; return false; }
+    if (tier == 1)
+    {
+        strError = "Cannot invalidate a block at or below the immutable base tip: "
+                   "rebase/rebuild required (V2-R2D fail-closed)";
+        return false; // BEFORE mutation; old authority intact
+    }
+    if (fImporting || fReindex) { strError = "Cannot invalidate while importing or reindexing"; return false; }
+    if (alreadyInvalid) return true; // idempotent, no mutation
+
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BlockIndexTipAuthority* tip = live ? const_cast<BlockIndexTipAuthority*>(live->TipAuthority()) : NULL;
+    if (tip == NULL) { strError = "authoritative tip authority absent"; return false; }
+
+    // Determine the fork point: if the target is on the ACTIVE chain, truncate
+    // active membership to the target's parent; otherwise the active tip is
+    // unchanged (fork at the current tip, empty branch).
+    int32_t fork = tip->TipHeight();
+    const BlockIndexTipRead ar = tip->LookupActiveByHeight(targetHeight, NULL);
+    if (ar.status == BLOCK_INDEX_TIP_OK && ar.record.hash == hash)
+        fork = targetHeight - 1;
+    if (fork < AuthoritativeBaseTipHeight()) fork = AuthoritativeBaseTipHeight();
+
+    std::vector<BlockIndexTipAppend> branch;
+    std::vector<int32_t> bheights;
+    std::string ferr;
+    // Bounded V2 eligible-tip selection: with the target treated as invalid, pick
+    // the best remaining eligible branch above the fork by canonical trust (R1).
+    if (!SelectAttachedBranch(tip, &fork, hash, true, &branch, &bheights, &ferr))
+    { strError = "authoritative selection failed: " + ferr; return false; }
+    if (MainFailpointHitForTesting("FP_BEFORE_V2_AUTHORITY_COMMIT"))
+    { strError = "failpoint FP_BEFORE_V2_AUTHORITY_COMMIT"; return false; }
+
+    // S2.1-OP: consume the authoritative Store3A undo FIRST -- unwind the store
+    // to the fork point -- so the store tip and UTXO state follow the blockindex
+    // truncate below. Done BEFORE the single blockindex tip.meta commit so every
+    // crash window reconciles cleanly at startup (a crash beforehand leaves both
+    // authorities full; a crash afterward leaves the store behind, which
+    // ReconcileStore3AToChain replays forward). The blockindex still holds the
+    // full mutable-tail records here, so each popped block's parent resolves.
+    if (s16_V2Armed())
+    {
+        std::string uwErr;
+        if (!s16_OperatorUnwindStoreTo(s16::g_chainObserve.store, tip, fork, &uwErr))
+        {
+            s16::g_chainObserve.needsRecovery = true;
+            strError = "authoritative invalidate: store undo unwind failed: " + uwErr;
+            return false;   // fail closed; store rolled back, restart reconciles
+        }
+    }
+
+    if (tip->ApplyOperatorInvalidAndReorg(hash, true, fork, branch, bheights, &ferr) != BLOCK_INDEX_TIP_OK)
+    {
+        // Blockindex unchanged (still full) but the store was unwound behind it:
+        // replay the store forward so the two authorities converge before we
+        // report the failure (fail closed, no store-ahead residue).
+        if (s16_V2Armed())
+            s16::ReconcileStore3AToChain(s16::g_chainObserve.store, NULL);
+        strError = "authoritative invalidate failed: " + ferr; return false;
+    }
+    if (MainFailpointHitForTesting("FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"))
+    { strError = "failpoint FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"; return false; }
+    setInvalidBlockHash.insert(hash); // non-authoritative compatibility mirror
+    RefreshAuthoritativeTransientProjection();
+    // Wallet: the truncation happened behind the wallet's back (no DisconnectBlock
+    // ran), so align its spent flags with the Store3A authority. Nothing was
+    // reconnected here, hence the empty scan span.
+    s16_OperatorResyncWallet(tip->TipHeight() + 1, tip->TipHeight());
+    printf("InvalidateBlock(auth-v2): invalidated %s height=%d fork=%d new_tip_height=%d\n",
+           hash.ToString().substr(0, 20).c_str(), (int)targetHeight, (int)fork, (int)tip->TipHeight());
+    fflush(stdout);
+    return true;
+}
+
+// P0.3 (I6): run ONE fused operator transition through the single-writer executor.
+//
+// Deadlock contract (§7.3): the operator path runs the transition INLINE on the
+// calling thread, which already holds cs_main. The executor's commit callback
+// re-enters the same recursive mutex, so this thread never creates a cs_main
+// dependency that could block the worker — the cycle-5 hang (worker waiting for a
+// level the RPC thread still held) is impossible by construction, because no level
+// is ever released while waiting for the worker's cs_main.
+//
+// The transition mutex (csTransition_) is the single-writer serialization point and
+// is taken with a bounded try-lock: if the worker is mid-transition, this thread
+// releases its own cs_main level (plus the registered block-path outer level) so the
+// worker can finish, then retries. An exhausted budget is an explicit fail-closed
+// outcome, never an unbounded wait.
+static bpmr::TransitionOutcome BpmRunOperatorTransition(
+    const uint256& hash, int nOperator, std::string& strError,
+    CCriticalBlock* pLocalCsMain)
+{
+    bpmr::TransitionExecutor* pExec = BpmGetExecutor();
+    BpmEnsureDurableTipBound(GetAuthoritativeLiveAuthority());
+
+    BpmrPreparedCommit prep;
+    prep.pLive = GetAuthoritativeLiveAuthority();
+    prep.nOperator = nOperator;
+    prep.hashTarget = hash;
+
+    bpmr::TransitionRequest req;
+    req.fPublish = true;
+    req.fReorg = true;      // fused: no intermediate servable state
+    req.fOperator = true;
+    req.pUser = &prep;
+    req.pResultHeight = &prep.nResultHeight;
+    req.pResultId = &prep.nResultId;
+
+    bpmr::TransitionResult tr;
+    for (int i = 0; i < 5000; ++i)
+    {
+        bool fBusy = false;
+        const bpmr::TransitionOutcome oc = pExec->TryRunInline(req, &tr, &fBusy);
+        if (!fBusy)
+        {
+            if (oc == bpmr::TR_COMMITTED)
+            {
+                printf("BPM_OP operator=%d target=%s outcome=COMMITTED durable_tip_h=%d id=%016llx\n",
+                       nOperator, hash.ToString().substr(0, 20).c_str(),
+                       (int)prep.nResultHeight, (unsigned long long)prep.nResultId);
+                fflush(stdout);
+                return oc;
+            }
+            // Explicit, fail-closed: nothing ambiguous is retried, and a failed
+            // publication after a durable commit is a FAIL-STOP (I4/I8).
+            if (oc == bpmr::TR_FAILED_PUBLISH) g_bpmFailStop = true;
+            strError = tr.strDetail.empty()
+                ? strprintf("operator transition refused: %s",
+                            bpmr::TransitionOutcomeName(oc))
+                : tr.strDetail;
+            printf("BPM_OP operator=%d target=%s outcome=%s detail=%s\n",
+                   nOperator, hash.ToString().substr(0, 20).c_str(),
+                   bpmr::TransitionOutcomeName(oc), strError.c_str());
+            fflush(stdout);
+            return oc;
+        }
+        // The worker holds the transition mutex and needs cs_main: give it up.
+        CCriticalBlock* pOuter = BlockPathGetOuterCsMainLock();
+        if (pLocalCsMain) pLocalCsMain->Unlock();
+        if (pOuter) pOuter->Unlock();
+        MilliSleep(2);
+        if (pOuter) pOuter->Lock();
+        if (pLocalCsMain) pLocalCsMain->Lock();
+    }
+    strError = "operator transition: single writer busy (fail-closed, no transition performed)";
+    printf("BPM_OP operator=%d target=%s outcome=INLINE_BUSY fail-closed\n",
+           nOperator, hash.ToString().substr(0, 20).c_str());
+    fflush(stdout);
+    return bpmr::TR_INLINE_BUSY;
+}
+
 bool InvalidateBlock(const uint256& hash, std::string& strError)
 {
-    LOCK(cs_main);
+    CCriticalBlock lockcs_main(cs_main, "cs_main", __FILE__, __LINE__);
+
+    // P0.3 (I6): with the single-writer executor armed, the operator transition is
+    // ONE fused durable transition through the executor, with an explicit outcome
+    // (anything but TR_COMMITTED is fail-closed). The body below is the same one
+    // the direct path executes — one implementation, not two.
+    if (g_fAuthoritativeStartup && GetBoolArg("-bpmsinglewriter", false))
+    {
+        std::string strOpErr;
+        const bpmr::TransitionOutcome oc =
+            BpmRunOperatorTransition(hash, 1, strOpErr, &lockcs_main);
+        if (oc == bpmr::TR_COMMITTED)
+            return true;
+        strError = strOpErr;
+        return false;
+    }
 
     // V2-R2D (PM1-P0-02): authoritative-V2 routing. Resolve the target BY VALUE
     // across the composed V2 domain (no mapBlockIndex residency requirement). The
@@ -11773,84 +11966,7 @@ bool InvalidateBlock(const uint256& hash, std::string& strError)
     // the invalid intent + resulting active tip are published in ONE fused tip.meta
     // commit (ApplyOperatorInvalidAndReorg). The legacy set is a mirror only.
     if (g_fAuthoritativeStartup)
-    {
-        int32_t targetHeight = -1; bool alreadyInvalid = false; std::string rerr;
-        const int tier = ResolveAuthoritativeTargetV2(hash, &targetHeight, &alreadyInvalid, &rerr);
-        if (tier == 3) { strError = rerr.empty() ? "authoritative resolve error" : rerr; return false; }
-        if (tier == 2) { strError = "Block not found"; return false; }
-        if (tier == 1)
-        {
-            strError = "Cannot invalidate a block at or below the immutable base tip: "
-                       "rebase/rebuild required (V2-R2D fail-closed)";
-            return false; // BEFORE mutation; old authority intact
-        }
-        if (fImporting || fReindex) { strError = "Cannot invalidate while importing or reindexing"; return false; }
-        if (alreadyInvalid) return true; // idempotent, no mutation
-
-        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
-        BlockIndexTipAuthority* tip = live ? const_cast<BlockIndexTipAuthority*>(live->TipAuthority()) : NULL;
-        if (tip == NULL) { strError = "authoritative tip authority absent"; return false; }
-
-        // Determine the fork point: if the target is on the ACTIVE chain, truncate
-        // active membership to the target's parent; otherwise the active tip is
-        // unchanged (fork at the current tip, empty branch).
-        int32_t fork = tip->TipHeight();
-        const BlockIndexTipRead ar = tip->LookupActiveByHeight(targetHeight, NULL);
-        if (ar.status == BLOCK_INDEX_TIP_OK && ar.record.hash == hash)
-            fork = targetHeight - 1;
-        if (fork < AuthoritativeBaseTipHeight()) fork = AuthoritativeBaseTipHeight();
-
-        std::vector<BlockIndexTipAppend> branch;
-        std::vector<int32_t> bheights;
-        std::string ferr;
-        // Bounded V2 eligible-tip selection: with the target treated as invalid, pick
-        // the best remaining eligible branch above the fork by canonical trust (R1).
-        if (!SelectAttachedBranch(tip, &fork, hash, true, &branch, &bheights, &ferr))
-        { strError = "authoritative selection failed: " + ferr; return false; }
-        if (MainFailpointHitForTesting("FP_BEFORE_V2_AUTHORITY_COMMIT"))
-        { strError = "failpoint FP_BEFORE_V2_AUTHORITY_COMMIT"; return false; }
-
-        // S2.1-OP: consume the authoritative Store3A undo FIRST -- unwind the store
-        // to the fork point -- so the store tip and UTXO state follow the blockindex
-        // truncate below. Done BEFORE the single blockindex tip.meta commit so every
-        // crash window reconciles cleanly at startup (a crash beforehand leaves both
-        // authorities full; a crash afterward leaves the store behind, which
-        // ReconcileStore3AToChain replays forward). The blockindex still holds the
-        // full mutable-tail records here, so each popped block's parent resolves.
-        if (s16_V2Armed())
-        {
-            std::string uwErr;
-            if (!s16_OperatorUnwindStoreTo(s16::g_chainObserve.store, tip, fork, &uwErr))
-            {
-                s16::g_chainObserve.needsRecovery = true;
-                strError = "authoritative invalidate: store undo unwind failed: " + uwErr;
-                return false;   // fail closed; store rolled back, restart reconciles
-            }
-        }
-
-        if (tip->ApplyOperatorInvalidAndReorg(hash, true, fork, branch, bheights, &ferr) != BLOCK_INDEX_TIP_OK)
-        {
-            // Blockindex unchanged (still full) but the store was unwound behind it:
-            // replay the store forward so the two authorities converge before we
-            // report the failure (fail closed, no store-ahead residue).
-            if (s16_V2Armed())
-                s16::ReconcileStore3AToChain(s16::g_chainObserve.store, NULL);
-            strError = "authoritative invalidate failed: " + ferr; return false;
-        }
-        if (MainFailpointHitForTesting("FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"))
-        { strError = "failpoint FP_AFTER_V2_COMMIT_BEFORE_LEGACY_MIRROR"; return false; }
-        setInvalidBlockHash.insert(hash); // non-authoritative compatibility mirror
-        RefreshAuthoritativeTransientProjection();
-        // Wallet: the truncation happened behind the wallet's back (no DisconnectBlock
-        // ran), so align its spent flags with the Store3A authority. Nothing was
-        // reconnected here, hence the empty scan span.
-        s16_OperatorResyncWallet(tip->TipHeight() + 1, tip->TipHeight());
-        printf("InvalidateBlock(auth-v2): invalidated %s height=%d fork=%d new_tip_height=%d\n",
-               hash.ToString().substr(0, 20).c_str(), (int)targetHeight, (int)fork, (int)tip->TipHeight());
-        fflush(stdout);
-        return true;
-    }
-
+        return s16_AuthV2InvalidateBody(hash, strError);
     std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
     if (mi == mapBlockIndex.end())
     {
@@ -11900,9 +12016,150 @@ bool InvalidateBlock(const uint256& hash, std::string& strError)
     return true;
 }
 
+static bool s16_AuthV2ReconsiderBody(const uint256& hash, std::string& strError)
+{
+    int32_t targetHeight = -1; bool alreadyInvalid = false; std::string rerr;
+    const int tier = ResolveAuthoritativeTargetV2(hash, &targetHeight, &alreadyInvalid, &rerr);
+    if (tier == 3) { strError = rerr.empty() ? "authoritative resolve error" : rerr; return false; }
+    if (tier == 2) { strError = "Block not found"; return false; }
+    if (tier == 1)
+    {
+        strError = "Cannot reconsider a block at or below the immutable base tip: "
+                   "rebase/rebuild required (V2-R2D fail-closed)";
+        return false; // BEFORE mutation; old authority intact
+    }
+    if (fImporting || fReindex) { strError = "Cannot reconsider while importing or reindexing"; return false; }
+    if (!alreadyInvalid) return true; // idempotent: not operator-invalid, no mutation
+
+    BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
+    BlockIndexTipAuthority* tip = live ? const_cast<BlockIndexTipAuthority*>(live->TipAuthority()) : NULL;
+    if (tip == NULL) { strError = "authoritative tip authority absent"; return false; }
+
+    // Re-select from the reconsidered block's parent height with the target treated
+    // as ELIGIBLE, so the restored branch reconnects when canonical trust makes it
+    // best (a stronger competing branch keeps the tip).
+    int32_t fork = targetHeight - 1;
+    if (fork < AuthoritativeBaseTipHeight()) fork = AuthoritativeBaseTipHeight();
+    std::vector<BlockIndexTipAppend> branch;
+    std::vector<int32_t> bheights;
+    std::string ferr;
+    if (!SelectAttachedBranch(tip, &fork, hash, false, &branch, &bheights, &ferr))
+    { strError = "authoritative selection failed: " + ferr; return false; }
+    if (tip->ApplyOperatorInvalidAndReorg(hash, false, fork, branch, bheights, &ferr) != BLOCK_INDEX_TIP_OK)
+    { strError = "authoritative reconsider failed: " + ferr; return false; }
+    setInvalidBlockHash.erase(hash); // non-authoritative compatibility mirror
+    RefreshAuthoritativeTransientProjection();
+    // S2.1-OP: reconnect the authoritative Store3A to the restored chain tip. The
+    // corresponding invalidate already unwound the store to fork (a residual
+    // store-ahead is handled first by the unwind below -- the records store keeps
+    // the full mutable tail, so parent hashes resolve), then ReconcileStore3AToChain
+    // case B replays fork+1..newTip's connect deltas against the store, appending
+    // fresh undo, so store tip == blockindex tip == the reconsidered hash.
+    if (s16_V2Armed())
+    {
+        std::string uwErr, rcErr;
+        if (!s16_OperatorUnwindStoreTo(s16::g_chainObserve.store, tip, fork, &uwErr))
+        {
+            s16::g_chainObserve.needsRecovery = true;
+            strError = "authoritative reconsider: store unwind failed: " + uwErr;
+            return false;   // fail closed; store behind, restart reconciles forward
+        }
+        if (!s16::ReconcileStore3AToChain(s16::g_chainObserve.store, &rcErr))
+        {
+            s16::g_chainObserve.needsRecovery = true;
+            strError = "authoritative reconsider: store reconnect failed: " + rcErr;
+            return false;   // fail closed; restart reconcile will finish the replay
+        }
+    }
+    // Wallet: the reconnected blocks never went through ConnectBlock, so the wallet
+    // has to learn their transactions explicitly (bounded by-value rescan of exactly
+    // the reconnected span) and then align spent flags with Store3A.
+    s16_OperatorResyncWallet(fork + 1, tip->TipHeight());
+    printf("ReconsiderBlock(auth-v2): reconsidered %s height=%d\n",
+           hash.ToString().substr(0, 20).c_str(), (int)targetHeight);
+    fflush(stdout);
+    return true;
+}
+
+// P0.3 (I6): the executor's commit callback for a fused operator transition. It runs
+// the SAME authoritative body the direct path runs (no second implementation), under
+// cs_main, and then reports the durable tip the fused commit actually produced. That
+// report — not a prediction — becomes the tip the executor's I1/I2 checks use.
+static bool BpmOperatorCommitBody(BpmrPreparedCommit* p, std::string* err)
+{
+    if (p == NULL || p->pLive == NULL)
+    {
+        if (err) *err = "operator payload missing";
+        return false;
+    }
+    std::string e;
+    bool fOk = false;
+    if (p->nOperator == 1)
+        fOk = s16_AuthV2InvalidateBody(p->hashTarget, e);
+    else if (p->nOperator == 2)
+        fOk = s16_AuthV2ReconsiderBody(p->hashTarget, e);
+    else
+    {
+        if (err) *err = strprintf("unknown operator transition %d", p->nOperator);
+        return false;
+    }
+    if (!fOk)
+    {
+        // Fail-closed: the body leaves both authorities consistent on every failure
+        // path (store unwind replayed, or nothing mutated), so nothing to retry.
+        if (err) *err = e.empty() ? "operator transition failed" : e;
+        return false;
+    }
+    const BlockIndexTipAuthority* tip = p->pLive->TipAuthority();
+    if (tip == NULL)
+    {
+        if (err) *err = "operator commit: tip authority absent after the transition";
+        return false;
+    }
+    p->nResultHeight = (int32_t)tip->TipHeight();
+    p->hashResult = tip->TipHash();
+    p->nResultId = BpmHashFingerprint(p->hashResult);
+    printf("BPM_OP_COMMIT operator=%d target=%s durable_tip_h=%d id=%016llx\n",
+           p->nOperator, p->hashTarget.ToString().substr(0, 20).c_str(),
+           (int)p->nResultHeight, (unsigned long long)p->nResultId);
+    fflush(stdout);
+    return true;
+}
+
+// P0.3 (I6): publish for a fused operator transition is the I4 verification against
+// the DURABLE tip the commit reported. A mismatch is FAIL-STOP (I4/I8): the durable
+// commit already happened, so it must never be reported as success.
+static bool BpmOperatorPublishBody(BpmrPreparedCommit* p, std::string* err)
+{
+    if (p == NULL)
+    {
+        if (err) *err = "operator payload missing at publish";
+        return false;
+    }
+    if (p->nResultHeight < 0)
+    {
+        if (err) *err = "operator publish without a committed durable tip";
+        return false;
+    }
+    return BpmVerifyStore3ATipI4(p->hashResult, (int)p->nResultHeight, err);
+}
+
 bool ReconsiderBlock(const uint256& hash, std::string& strError)
 {
-    LOCK(cs_main);
+    CCriticalBlock lockcs_main(cs_main, "cs_main", __FILE__, __LINE__);
+
+    // P0.3 (I6): same single-writer route as InvalidateBlock (fused transition,
+    // explicit outcome, same body as the direct path).
+    if (g_fAuthoritativeStartup && GetBoolArg("-bpmsinglewriter", false))
+    {
+        std::string strOpErr;
+        const bpmr::TransitionOutcome oc =
+            BpmRunOperatorTransition(hash, 2, strOpErr, &lockcs_main);
+        if (oc == bpmr::TR_COMMITTED)
+            return true;
+        strError = strOpErr;
+        return false;
+    }
 
     // V2-R2D (PM1-P0-02): authoritative-V2 routing. Resolve the target BY VALUE
     // (no mapBlockIndex residency). Reverse the durable operator-invalid intent on
@@ -11910,70 +12167,7 @@ bool ReconsiderBlock(const uint256& hash, std::string& strError)
     // legacy set is a mirror only. At/below the immutable base tip S is refused
     // before mutation (rebase/rebuild required).
     if (g_fAuthoritativeStartup)
-    {
-        int32_t targetHeight = -1; bool alreadyInvalid = false; std::string rerr;
-        const int tier = ResolveAuthoritativeTargetV2(hash, &targetHeight, &alreadyInvalid, &rerr);
-        if (tier == 3) { strError = rerr.empty() ? "authoritative resolve error" : rerr; return false; }
-        if (tier == 2) { strError = "Block not found"; return false; }
-        if (tier == 1)
-        {
-            strError = "Cannot reconsider a block at or below the immutable base tip: "
-                       "rebase/rebuild required (V2-R2D fail-closed)";
-            return false; // BEFORE mutation; old authority intact
-        }
-        if (fImporting || fReindex) { strError = "Cannot reconsider while importing or reindexing"; return false; }
-        if (!alreadyInvalid) return true; // idempotent: not operator-invalid, no mutation
-
-        BlockIndexAuthoritativeLive* live = GetAuthoritativeLiveAuthority();
-        BlockIndexTipAuthority* tip = live ? const_cast<BlockIndexTipAuthority*>(live->TipAuthority()) : NULL;
-        if (tip == NULL) { strError = "authoritative tip authority absent"; return false; }
-
-        // Re-select from the reconsidered block's parent height with the target treated
-        // as ELIGIBLE, so the restored branch reconnects when canonical trust makes it
-        // best (a stronger competing branch keeps the tip).
-        int32_t fork = targetHeight - 1;
-        if (fork < AuthoritativeBaseTipHeight()) fork = AuthoritativeBaseTipHeight();
-        std::vector<BlockIndexTipAppend> branch;
-        std::vector<int32_t> bheights;
-        std::string ferr;
-        if (!SelectAttachedBranch(tip, &fork, hash, false, &branch, &bheights, &ferr))
-        { strError = "authoritative selection failed: " + ferr; return false; }
-        if (tip->ApplyOperatorInvalidAndReorg(hash, false, fork, branch, bheights, &ferr) != BLOCK_INDEX_TIP_OK)
-        { strError = "authoritative reconsider failed: " + ferr; return false; }
-        setInvalidBlockHash.erase(hash); // non-authoritative compatibility mirror
-        RefreshAuthoritativeTransientProjection();
-        // S2.1-OP: reconnect the authoritative Store3A to the restored chain tip. The
-        // corresponding invalidate already unwound the store to fork (a residual
-        // store-ahead is handled first by the unwind below -- the records store keeps
-        // the full mutable tail, so parent hashes resolve), then ReconcileStore3AToChain
-        // case B replays fork+1..newTip's connect deltas against the store, appending
-        // fresh undo, so store tip == blockindex tip == the reconsidered hash.
-        if (s16_V2Armed())
-        {
-            std::string uwErr, rcErr;
-            if (!s16_OperatorUnwindStoreTo(s16::g_chainObserve.store, tip, fork, &uwErr))
-            {
-                s16::g_chainObserve.needsRecovery = true;
-                strError = "authoritative reconsider: store unwind failed: " + uwErr;
-                return false;   // fail closed; store behind, restart reconciles forward
-            }
-            if (!s16::ReconcileStore3AToChain(s16::g_chainObserve.store, &rcErr))
-            {
-                s16::g_chainObserve.needsRecovery = true;
-                strError = "authoritative reconsider: store reconnect failed: " + rcErr;
-                return false;   // fail closed; restart reconcile will finish the replay
-            }
-        }
-        // Wallet: the reconnected blocks never went through ConnectBlock, so the wallet
-        // has to learn their transactions explicitly (bounded by-value rescan of exactly
-        // the reconnected span) and then align spent flags with Store3A.
-        s16_OperatorResyncWallet(fork + 1, tip->TipHeight());
-        printf("ReconsiderBlock(auth-v2): reconsidered %s height=%d\n",
-               hash.ToString().substr(0, 20).c_str(), (int)targetHeight);
-        fflush(stdout);
-        return true;
-    }
-
+        return s16_AuthV2ReconsiderBody(hash, strError);
     std::map<uint256, CBlockIndex*>::iterator mi = mapBlockIndex.find(hash);
     if (mi == mapBlockIndex.end())
     {

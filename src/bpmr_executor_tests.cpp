@@ -174,6 +174,125 @@ static void TestShutdownDrain()
     CHECK(nCommitted == 200, "every queued request committed");
 }
 
+static void TestSideFallback()
+{
+    std::printf("T7.4 refused append -> durable SIDE record (no publish)\n");
+    std::atomic<int> nPublishCalled{0};
+    std::atomic<int> nSideCommit{0};
+    std::atomic<int> nActiveCommit{0};
+    TransitionExecutor ex(16,
+        [&](const TransitionRequest& r, std::string*) {
+            if (r.fPublish) { ++nActiveCommit; return true; }
+            ++nSideCommit;
+            return true;
+        },
+        [&](const TransitionRequest&, std::string*) { ++nPublishCalled; return true; });
+    TransitionRequest a; a.nHeight = 1; a.nParentId = 0; a.nSelfId = 1; a.fPublish = true;
+    ex.Submit(a, 1000);
+    // The same-height sibling loses the race: it must NOT be dropped and NOT be
+    // published — it becomes a durable side record.
+    TransitionRequest sib; sib.nHeight = 1; sib.nParentId = 0; sib.nSelfId = 2;
+    sib.fPublish = true; sib.fSideFallback = true;
+    ex.Submit(sib, 1000);
+    auto results = ex.Shutdown();
+    int nSide = 0;
+    for (const auto& r : results) if (r.eOutcome == TR_COMMITTED_SIDE) ++nSide;
+    CHECK(nSide == 1, "refused append recorded as COMMITTED_SIDE");
+    CHECK(nSideCommit == 1, "side commit callback invoked exactly once");
+    CHECK(nActiveCommit == 1, "active commit callback invoked only for the winner");
+    CHECK(nPublishCalled == 1, "publish callback NOT invoked for the side record");
+    CHECK(ex.DurableTipHeight() == 1, "durable tip unchanged by the side fallback");
+    CHECK(ex.RejectedCount() == 0, "no rejection recorded (block is not invalid)");
+
+    // Without the flag the same request is refused outright.
+    TransitionExecutor ex2(16,
+        [](const TransitionRequest&, std::string*) { return true; },
+        [](const TransitionRequest&, std::string*) { return true; });
+    TransitionRequest a2; a2.nHeight = 1; a2.nParentId = 0; a2.nSelfId = 1; a2.fPublish = true;
+    ex2.Submit(a2, 1000);
+    TransitionRequest sib2; sib2.nHeight = 1; sib2.nParentId = 0; sib2.nSelfId = 2; sib2.fPublish = true;
+    ex2.Submit(sib2, 1000);
+    auto r2 = ex2.Shutdown();
+    int nRej = 0;
+    for (const auto& r : r2) if (r.eOutcome == TR_REJECTED_DENSITY) ++nRej;
+    CHECK(nRej == 1, "without the side flag the append is refused (REJECTED_DENSITY)");
+}
+
+// P0.3 (I6): a fused OPERATOR transition (invalidate / reconsider) must
+//   * skip I1/I2 (it re-selects the branch itself, exactly like a reorg),
+//   * bind the durable tip from the COMMIT RESULT, never from nHeight/nSelfId,
+//   * fail closed (no publication) when the commit does not report a tip.
+static void TestOperatorTransition()
+{
+    std::printf("P0.3 operator transition (fused, tip bound from the commit result)\n");
+    int32_t nResultHeight = 7;
+    uint64_t nResultId = 0xABCD;
+    int nCommit = 0, nPublish = 0;
+    TransitionExecutor ex(16,
+        [&](const TransitionRequest& r, std::string*) {
+            ++nCommit;
+            // Linear appends carry no result pointers; only operator requests do.
+            if (r.pResultHeight) *r.pResultHeight = nResultHeight;
+            if (r.pResultId) *r.pResultId = nResultId;
+            return true;
+        },
+        [&](const TransitionRequest&, std::string*) { ++nPublish; return true; });
+    ex.InitDurableTip(10, 0x1234);   // tip before the operator transition
+
+    TransitionRequest op;
+    op.fPublish = true;
+    op.fReorg = true;
+    op.fOperator = true;
+    op.nHeight = 999;        // deliberately wrong: must NOT become the durable tip
+    op.nParentId = 0xDEAD;   // deliberately wrong: I2 must not apply
+    op.nSelfId = 0xBEEF;
+    op.pResultHeight = &nResultHeight;
+    op.pResultId = &nResultId;
+
+    TransitionResult tr;
+    CHECK(ex.RunInline(op, &tr) == TR_COMMITTED, "operator transition commits (I1/I2 exempt)");
+    CHECK(nCommit == 1 && nPublish == 1, "commit and publish both ran");
+    CHECK(ex.DurableTipHeight() == 7, "durable tip comes from the commit RESULT (7), not nHeight");
+    CHECK(ex.DurableTipId() == 0xABCD, "durable tip identity comes from the commit result");
+
+    // The NEXT linear append must be checked against the operator's result tip.
+    TransitionRequest okNext;
+    okNext.nHeight = 8; okNext.nParentId = 0xABCD; okNext.nSelfId = 8; okNext.fPublish = true;
+    CHECK(ex.RunInline(okNext, &tr) == TR_COMMITTED, "next append at result_tip+1 is accepted");
+    TransitionRequest badNext;
+    badNext.nHeight = 12; badNext.nParentId = 8; badNext.nSelfId = 12; badNext.fPublish = true;
+    CHECK(ex.RunInline(badNext, &tr) == TR_REJECTED_DENSITY, "I1 still enforced after an operator transition");
+
+    // A commit that never reports a tip is fail-closed: nothing is published.
+    int nPublish2 = 0;
+    TransitionExecutor ex2(16,
+        [](const TransitionRequest&, std::string*) { return true; },   // writes no result
+        [&](const TransitionRequest&, std::string*) { ++nPublish2; return true; });
+    ex2.InitDurableTip(3, 3);
+    int32_t nH = -1;
+    uint64_t nI = 0;
+    TransitionRequest op2;
+    op2.fPublish = true; op2.fReorg = true; op2.fOperator = true;
+    op2.pResultHeight = &nH; op2.pResultId = &nI;
+    TransitionResult tr2;
+    CHECK(ex2.RunInline(op2, &tr2) == TR_FAILED_COMMIT, "operator commit without a tip fails closed");
+    CHECK(nPublish2 == 0, "nothing published on a failed operator commit");
+    CHECK(ex2.DurableTipHeight() == 3, "durable tip unchanged on failure");
+
+    // A failing operator commit is explicit and publishes nothing.
+    int nPublish3 = 0;
+    TransitionExecutor ex3(16,
+        [](const TransitionRequest&, std::string* e) { *e = "store unwind failed"; return false; },
+        [&](const TransitionRequest&, std::string*) { ++nPublish3; return true; });
+    ex3.InitDurableTip(3, 3);
+    TransitionRequest op3;
+    op3.fPublish = true; op3.fReorg = true; op3.fOperator = true;
+    op3.pResultHeight = &nH; op3.pResultId = &nI;
+    TransitionResult tr3;
+    CHECK(ex3.RunInline(op3, &tr3) == TR_FAILED_COMMIT, "failing operator commit -> FAILED_COMMIT");
+    CHECK(tr3.strDetail == "store unwind failed", "failure detail is propagated verbatim");
+    CHECK(nPublish3 == 0, "no publication after a failed operator commit");
+}
 int main()
 {
     TestExtension();
@@ -182,6 +301,7 @@ int main()
     TestBackpressure();
     TestConcurrentSubmitters();
     TestShutdownDrain();
-    std::printf("\n%s failures=%d\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
+    TestSideFallback();
+    TestOperatorTransition();    std::printf("\n%s failures=%d\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

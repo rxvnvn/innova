@@ -159,12 +159,13 @@ TransitionOutcome TransitionExecutor::Process(const TransitionRequest& req,
 
     // I1: density — a publishing EXTENSION must extend the durable tip. A reorg is
     // one fused atomic transition and is exempt by construction (its own commit
-    // validates the fork point and the whole branch).
-    const bool fNonDense = (req.fPublish && !req.fReorg && fHaveTip &&
-                            req.nHeight != nTipHeight + 1);
+    // validates the fork point and the whole branch). An OPERATOR transition is
+    // exempt for the same reason: it re-selects the branch itself, and its durable
+    // tip comes from the commit result, not from a prediction.
+    const bool fLinear = req.fPublish && !req.fReorg && !req.fOperator;
+    const bool fNonDense = (fLinear && fHaveTip && req.nHeight != nTipHeight + 1);
     // I2: parent identity — publishing extensions must name the durable tip.
-    const bool fParentMismatch = (req.fPublish && !req.fReorg && fHaveTip &&
-                                  req.nParentId != nTipId);
+    const bool fParentMismatch = (fLinear && fHaveTip && req.nParentId != nTipId);
     if (fNonDense || fParentMismatch)
     {
         // ADR-0022 rev2 §7.4: a refused publication is NOT a consensus reject and
@@ -214,9 +215,32 @@ TransitionOutcome TransitionExecutor::Process(const TransitionRequest& req,
 
     if (req.fPublish)
     {
-        nDurableTipHeight_.store(req.nHeight);
-        nDurableTipId_.store(req.nSelfId);
-        fTipInitialized_.store(true);
+        if (req.fOperator)
+        {
+            // The operator commit is fused: the blockindex tip, the operator-invalid
+            // intent and the resulting active tip were published in ONE commit. The
+            // durable tip is therefore the RESULT the commit reported, not nHeight/
+            // nSelfId (which a caller cannot predict for a re-selected branch).
+            const int32_t nResHeight = req.pResultHeight ? *req.pResultHeight : -1;
+            const uint64_t nResId = req.pResultId ? *req.pResultId : 0;
+            if (nResHeight < 0)
+            {
+                res.eOutcome = TR_FAILED_COMMIT;
+                res.strDetail = "operator commit did not report a durable tip";
+                nFailed_.fetch_add(1);
+                if (out) *out = res;
+                return res.eOutcome;
+            }
+            nDurableTipHeight_.store((uint64_t)nResHeight);
+            nDurableTipId_.store(nResId);
+            fTipInitialized_.store(true);
+        }
+        else
+        {
+            nDurableTipHeight_.store(req.nHeight);
+            nDurableTipId_.store(req.nSelfId);
+            fTipInitialized_.store(true);
+        }
         std::string perr;
         if (publish_ && !publish_(req, &perr))
         {

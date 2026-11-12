@@ -45,12 +45,22 @@ struct TransitionRequest
     // this flag is set the executor commits it as a durable SIDE record instead
     // (still through the single writer, I6) and publishes nothing.
     bool fSideFallback;
+    // ADR-0022 rev2 / P0.3 (I6): a fused OPERATOR transition (invalidate/reconsider).
+    // I1/I2 are not applicable (like fReorg): the transition re-selects the whole
+    // branch under cs_main. The durable tip is bound from the COMMIT RESULT
+    // (pResultHeight/pResultId), never from a prediction, so the next I1/I2 check
+    // always looks at the tip that is actually durable on disk.
+    bool fOperator;
+    // OUT: filled by the commit callback for fOperator requests.
+    int32_t* pResultHeight;
+    uint64_t* pResultId;
     uint64_t nTicket;        // filled in by Submit*/RunInline (diagnostics)
     const void* pUser;       // opaque payload for CommitFn/PublishFn
 
     TransitionRequest()
         : nHeight(0), nParentId(0), nSelfId(0), fPublish(false), fReorg(false),
-          fSideFallback(false), nTicket(0), pUser(nullptr) {}
+          fSideFallback(false), fOperator(false), pResultHeight(nullptr),
+          pResultId(nullptr), nTicket(0), pUser(nullptr) {}
 };
 
 enum TransitionOutcome
