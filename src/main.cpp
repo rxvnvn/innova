@@ -13,7 +13,8 @@
 #include "net.h"
 #include "init.h"
 #include "wallet.h"
-#include "ui_interface.h"
+#include "miner.h"  // BPMR-FIX1: BumpMiningTipGeneration()
+#include "bpmr_transition_executor.h"  // BPMR/ADR-0022 single-writer executor#include "ui_interface.h"
 #include "ibdefficiency.h"
 #include "ibdmetrics.h"
 #include "ibdactivepath.h"
@@ -57,7 +58,60 @@ using boost::placeholders::_2;
 #endif
 
 using namespace std;
-namespace fs = boost::filesystem;
+// BPMR/ADR-0022 (IF01-DUR-01): prepared payload carried through the executor.
+struct BpmrPreparedCommit
+{
+    BlockIndexAuthoritativeLive* pLive;
+    const BlockIndexRecord* pRec;
+    const BlockIndexDerivedEntry* pDer;
+    int nHeight;
+    std::string strErr;
+};
+
+// The single writer for durable chain transitions in this process. Created lazily
+// and used only when -bpmsinglewriter=1; the callback is the REAL durability path
+// (authoritative AcceptActive), not a stub.
+static bpmr::TransitionExecutor* BpmrGetExecutor()
+{
+    static bpmr::TransitionExecutor* pExec = NULL;
+    if (pExec == NULL)
+    {
+        pExec = new bpmr::TransitionExecutor(64,
+            [](const bpmr::TransitionRequest& req, std::string* err) -> bool {
+                BpmrPreparedCommit* p =
+                    (BpmrPreparedCommit*)const_cast<void*>(req.pUser);
+                if (p == NULL || p->pLive == NULL || p->pRec == NULL || p->pDer == NULL)
+                {
+                    if (err) *err = "prepared payload missing";
+                    return false;
+                }
+                if (!p->pLive->AcceptActive(*p->pRec, *p->pDer, p->nHeight, &p->strErr))
+                {
+                    if (err) *err = p->strErr.empty() ? "AcceptActive failed" : p->strErr;
+                    return false;
+                }
+                return true;
+            },
+            [](const bpmr::TransitionRequest&) {});
+    }
+    return pExec;
+}
+
+// BPMR-FIX1: lock-free active-tip generation counter (defined here, at global
+// scope, because main.cpp bumps it on every SetBestChain and miner.cpp's
+// enclosing anonymous namespace would give a definition there internal linkage).
+std::atomic<uint64_t> g_mining_tip_generation{0};
+
+
+void BumpMiningTipGeneration()
+{
+    g_mining_tip_generation.fetch_add(1, std::memory_order_release);
+}
+
+uint64_t GetMiningTipGeneration()
+{
+    return g_mining_tip_generation.load(std::memory_order_acquire);
+}namespace fs = boost::filesystem;
 
 static bool AlreadyHave(const CInv& inv);
 
@@ -10017,8 +10071,39 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             const BlockIndexRecord recPre = BlockIndexRecordFromIndex(pindexNew);
             const BlockIndexDerivedEntry derPre = BlockIndexDerivedEntryFromIndex(pindexNew);
             std::string perrPre;
-            if (!livePre->AcceptActive(recPre, derPre, pindexNew->nHeight, &perrPre))
+            bool fS1CommittedPre = false;
             {
+                CSyncLockPhase phaseS1Commit("ProcessMessage(block)", "s1_accept_active");
+                if (GetBoolArg("-bpmsinglewriter", false))
+                {
+                    // IF01-DUR-01: the durable commit goes through the single-writer
+                    // executor (real AcceptActive callback), with an explicit outcome.
+                    BpmrPreparedCommit prepared;
+                    prepared.pLive = livePre;
+                    prepared.pRec = &recPre;
+                    prepared.pDer = &derPre;
+                    prepared.nHeight = (int)pindexNew->nHeight;
+                    bpmr::TransitionRequest req;
+                    req.nHeight = (uint64_t)pindexNew->nHeight;
+                    req.nParentId = 0;
+                    req.nSelfId = (uint64_t)pindexNew->nHeight;
+                    req.fPublish = true;
+                    req.fCallerValidatedIdentity = true;
+                    req.pUser = &prepared;
+                    bpmr::TransitionResult tr;
+                    const bpmr::TransitionOutcome oc =
+                        BpmrGetExecutor()->RunInline(req, &tr);
+                    fS1CommittedPre = (oc == bpmr::TR_COMMITTED);
+                    if (!fS1CommittedPre)
+                        perrPre = tr.strDetail.empty() ? "single-writer commit rejected"
+                                                       : tr.strDetail;
+                }
+                else
+                {
+                    fS1CommittedPre = livePre->AcceptActive(recPre, derPre, pindexNew->nHeight, &perrPre);
+                }
+            }
+            if (!fS1CommittedPre)            {
                 s1PreErr = strprintf("V2 commit FAILED at height %d: %s — nothing applied (fail-closed)",
                                      (int)pindexNew->nHeight, perrPre.c_str());
                 return false;

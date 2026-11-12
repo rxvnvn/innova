@@ -80,6 +80,7 @@ set(INNOVA_CORE_SOURCES
     "${CMAKE_SOURCE_DIR}/src/lm_stream_builder.cpp"
     "${CMAKE_SOURCE_DIR}/src/main.cpp"
     "${CMAKE_SOURCE_DIR}/src/miner.cpp"
+    "${CMAKE_SOURCE_DIR}/src/bpmr_transition_executor.cpp"
     "${CMAKE_SOURCE_DIR}/src/minizip/ioapi.c"
     "${CMAKE_SOURCE_DIR}/src/minizip/unzip.c"
     "${CMAKE_SOURCE_DIR}/src/net.cpp"

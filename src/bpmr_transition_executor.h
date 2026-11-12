@@ -32,6 +32,11 @@ struct TransitionRequest
     uint64_t nParentId;      // identity of the expected parent (opaque id)
     uint64_t nSelfId;        // identity of the block being committed
     bool fPublish;           // true = active extension, false = side record
+    // Set when the caller has already validated branch identity (e.g. the accept
+    // path checked IsAuthoritativeActiveExtension); only the density check then
+    // applies. Documented, not a silent bypass.
+    bool fCallerValidatedIdentity;
+    const void* pUser;       // opaque payload for CommitFn/PublishFn
 };
 
 enum TransitionOutcome
@@ -65,6 +70,12 @@ public:
     bool TrySubmit(const TransitionRequest& req);
     // Blocking submit with a bounded wait. false = timed out.
     bool Submit(const TransitionRequest& req, int nTimeoutMs);
+
+    // Runs one transition on the CALLING thread through the same checks and the
+    // same commit/publish callbacks. Used when the caller already holds the chain
+    // lock (cs_main) and must not block on the worker: same serialization
+    // semantics (I1/I2/I6/I8), no deadlock.
+    TransitionOutcome RunInline(const TransitionRequest& req, TransitionResult* out);
 
     // Drains the queue, joins the worker, returns every result recorded.
     std::vector<TransitionResult> Shutdown();

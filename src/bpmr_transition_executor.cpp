@@ -54,6 +54,54 @@ bool TransitionExecutor::Submit(const TransitionRequest& req, int nTimeoutMs)
     }
 }
 
+TransitionOutcome TransitionExecutor::RunInline(const TransitionRequest& req,
+                                              TransitionResult* out)
+{
+    TransitionResult res;
+    res.nSelfId = req.nSelfId;
+
+    const uint64_t nTipHeight = nDurableTipHeight_.load();
+    const uint64_t nTipId = nDurableTipId_.load();
+    if (req.fPublish && nTipHeight != 0 && req.nHeight != nTipHeight + 1)
+    {
+        res.eOutcome = TR_REJECTED_DENSITY;
+        res.strDetail = "non-dense active append";
+        nRejected_.fetch_add(1);
+        if (out) *out = res;
+        return res.eOutcome;
+    }
+    if (!req.fCallerValidatedIdentity && req.fPublish && nTipHeight != 0 &&
+        req.nParentId != nTipId)
+    {
+        res.eOutcome = TR_REJECTED_PARENT;
+        res.strDetail = "active append parent mismatch";
+        nRejected_.fetch_add(1);
+        if (out) *out = res;
+        return res.eOutcome;
+    }
+
+    std::string err;
+    if (!commit_(req, &err))
+    {
+        res.eOutcome = TR_FAILED_COMMIT;
+        res.strDetail = err.empty() ? "commit failed" : err;
+        nFailed_.fetch_add(1);
+        if (out) *out = res;
+        return res.eOutcome;
+    }
+    if (req.fPublish)
+    {
+        nDurableTipHeight_.store(req.nHeight);
+        nDurableTipId_.store(req.nSelfId);
+        if (publish_)
+            publish_(req);
+    }
+    res.eOutcome = TR_COMMITTED;
+    nCommitted_.fetch_add(1);
+    if (out) *out = res;
+    return res.eOutcome;
+}
+
 void TransitionExecutor::WorkerLoop()
 {
     while (true)
@@ -89,7 +137,8 @@ void TransitionExecutor::WorkerLoop()
             continue;
         }
         // I2: parent identity — publishing requests must name the durable tip.
-        if (req.fPublish && nTipHeight != 0 && req.nParentId != nTipId)
+        if (!req.fCallerValidatedIdentity && req.fPublish && nTipHeight != 0 &&
+            req.nParentId != nTipId)
         {
             res.eOutcome = TR_REJECTED_PARENT;
             res.strDetail = "active append parent mismatch";
