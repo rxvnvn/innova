@@ -2217,6 +2217,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::Append(const BlockIndexTipAppend& bl
                                                    int32_t activeHeight,
                                                    std::string* error)
 {
+    LOCK(impl->csTailLock);  // ADR-0026 B: состояние окна/меты — только под внешним мьютексом
     Impl* i = impl;
     // IFCN#9 perf: during IBD buffer appends in RAM and publish them with one
     // durable batch every -tipcommitbatch blocks (default 1 -> unchanged path).
@@ -2344,6 +2345,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
     const std::vector<int32_t>& activeHeights,
     std::string* error)
 {
+    LOCK(impl->csTailLock);  // ADR-0026 B: состояние окна/меты — только под внешним мьютексом
     if (!impl->open)
         return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
     if (blocks.size() != activeHeights.size())
@@ -2628,6 +2630,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
 
 BlockIndexTipStatus BlockIndexTipAuthority::TruncateActiveTo(int32_t height, std::string* error)
 {
+    LOCK(impl->csTailLock);  // ADR-0026 B: состояние окна/меты — только под внешним мьютексом
     if (impl->HasPending())
     {
         BlockIndexTipStatus fst = FlushPendingAppends(error);
@@ -2748,6 +2751,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::ReorgActiveTo(
     std::string* error,
     const std::map<int32_t, BlockIndexConnectSupplyEntry>* connectSupplyTrail)
 {
+    LOCK(impl->csTailLock);  // ADR-0026 B: состояние окна/меты — только под внешним мьютексом
     if (BlockIndexCutTraceEnabled())
         BlockIndexCutTrace("REORGACT-ENTER fork=%d branch=%llu pend=%llu durH=%d durHash=%s logH=%d",
                            forkHeight, (unsigned long long)branch.size(),
@@ -3272,6 +3276,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::ApplyOperatorInvalidAndReorg(
     const std::vector<int32_t>& branchHeights,
     std::string* error)
 {
+    LOCK(impl->csTailLock);  // ADR-0026 B: состояние окна/меты — только под внешним мьютексом
     if (impl->HasPending())
     {
         BlockIndexTipStatus fst = FlushPendingAppends(error);
@@ -4060,18 +4065,34 @@ BlockIndexTipRead BlockIndexTipAuthority::LookupNextActive(const uint256& curHas
     return LookupActiveByHeight(cur.height + 1, error);
 }
 
-uint64_t BlockIndexTipAuthority::BaseGeneration() const { return impl->meta.baseGeneration; }
+uint64_t BlockIndexTipAuthority::BaseGeneration() const
+{
+    // ADR-0026 B: meta мутируется Append/AppendBatch под csTailLock; чтение без лока
+    // давало гонку AppendBatch ↔ BaseGeneration (INNOVA-C33-CRASH-07).
+    if (!impl) return 0;
+    LOCK(impl->csTailLock);
+    return impl->meta.baseGeneration;
+}
 
 void BlockIndexTipAuthority::SetBaseTipHash(const uint256& hash)
 {
-    if (impl) impl->expectedBaseTipHash = hash;
+    if (!impl) return;
+    LOCK(impl->csTailLock);
+    impl->expectedBaseTipHash = hash;
 }
 
 uint256 BlockIndexTipAuthority::BaseTipHash() const
 {
-    return impl ? impl->expectedBaseTipHash : uint256(0);
+    if (!impl) return uint256(0);
+    LOCK(impl->csTailLock);
+    return impl->expectedBaseTipHash;
 }
-uint64_t BlockIndexTipAuthority::BaseRecordCount() const { return impl->meta.baseRecordCount; }
+uint64_t BlockIndexTipAuthority::BaseRecordCount() const
+{
+    if (!impl) return 0;
+    LOCK(impl->csTailLock);
+    return impl->meta.baseRecordCount;
+}
 // P3-R1 protected identity readers. These mirror the CommittedTipSnapshot
 // values, but read them from the mutable meta under the impl-level
 // csTailLock, so an unlocked caller (the checkpoint hot resolver reached
@@ -4138,6 +4159,7 @@ uint64_t BlockIndexTipAuthority::TipRecordCount() const
 // statement instead of a guess.
 void BlockIndexTipAuthority::DumpWindowStats() const
 {
+    LOCK(impl->csTailLock);  // ADR-0026 B: состояние окна/меты — только под внешним мьютексом
     Impl* i = impl;
     const TipWindowStats rs = i->recordsWin.Stats();
     const TipWindowStats ds = i->derivedWin.Stats();
@@ -4193,6 +4215,8 @@ uint8_t BlockIndexTipAuthority::ActiveFence() const { LOCK(impl->csTailLock); re
 // ---- v2 durable operator-invalid authority ----
 uint32_t BlockIndexTipAuthority::InvalidLogCount() const
 {
+    if (!impl) return 0;
+    LOCK(impl->csTailLock);
     return impl->meta.invalidLogCount;
 }
 
@@ -4289,6 +4313,7 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
 
 void BlockIndexTipAuthority::Close()
 {
+    LOCK(impl->csTailLock);  // ADR-0026 B: состояние окна/меты — только под внешним мьютексом
     // IFCN#9 perf: publish a residual IBD window before closing. Best effort by
     // design: if it fails, the durable state stays at the last committed batch
     // and the missing blocks are re-fetched on the next start (they are already
