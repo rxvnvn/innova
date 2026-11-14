@@ -4643,6 +4643,153 @@ void RequestBlockPipelineWake(uint32_t nCause)
 // used exclusively by p2p_sync_tests to set up and tear down the latched wake
 // generation, cause bits, and getblocks cooldown timestamp deterministically.
 // Production call sites never touch them.
+// ---------------------------------------------------------------------------
+// D2 bounded event-driven retry (OWNER directive 2026-11-14).
+//
+// Contract:
+//   * owner of a retry record      : this module (global map, cs_blockRetry).
+//   * who registers a record       : CNode::ExpireBlockInFlight(), deadline
+//                                    outcome only (reason=timeout).
+//   * who initiates the wake-up    : nobody extra — the existing
+//                                    ThreadMessageHandler2 tick calls
+//                                    ProcessBlockRetryQueue(); no new thread,
+//                                    no independent loop.
+//   * locks                        : cs_blockRetry is a leaf lock (never held
+//                                    while calling AskFor); AskFor is called
+//                                    under TRY_LOCK(cs_main), exactly like the
+//                                    other request paths.
+//   * duplicate prevention         : mapBlockIndex check (already have) and
+//                                    AskFor()'s own QUEUED/INFLIGHT/OWNER
+//                                    dedup; a queued attempt moves the entry
+//                                    forward instead of re-requesting.
+//   * bounds                       : queue size, attempts per hash, per-tick
+//                                    budget and exponential backoff.
+// ---------------------------------------------------------------------------
+namespace {
+struct BlockRetryEntry
+{
+    int64_t nNextUs;
+    int     nAttempts;
+};
+const size_t  MAX_BLOCK_RETRY_QUEUE       = 512;
+const int     MAX_BLOCK_RETRY_ATTEMPTS    = 3;
+const size_t  BLOCK_RETRY_BUDGET_PER_TICK = 32;
+const int64_t BLOCK_RETRY_BACKOFF_US[3]   = {1000000LL, 2000000LL, 4000000LL};
+const int64_t BLOCK_RETRY_QUEUED_HOLD_US  = 5000000LL;
+
+CCriticalSection              cs_blockRetry;
+std::map<uint256, BlockRetryEntry> g_blockRetry;
+} // namespace
+
+void NoteBlockRetryCandidate(const uint256& hash, const char* reason)
+{
+    if (fShutdown)
+        return;
+    LOCK(cs_blockRetry);
+    std::map<uint256, BlockRetryEntry>::iterator it = g_blockRetry.find(hash);
+    int nAttempts = (it == g_blockRetry.end()) ? 1 : it->second.nAttempts + 1;
+    if (nAttempts > MAX_BLOCK_RETRY_ATTEMPTS)
+    {
+        g_blockRetry.erase(hash);
+        return;
+    }
+    if (it == g_blockRetry.end() && g_blockRetry.size() >= MAX_BLOCK_RETRY_QUEUE)
+        return; // bounded: drop the new candidate, keep what is already queued
+    BlockRetryEntry e;
+    e.nAttempts = nAttempts;
+    e.nNextUs = GetTimeMicros() +
+        BLOCK_RETRY_BACKOFF_US[std::min(nAttempts - 1, 2)];
+    g_blockRetry[hash] = e;
+    if (BlockRequestTraceEnabled())
+        printf("BLOCKREQTRACE time_us=%lld event=RETRY_CANDIDATE hash=%s attempt=%d reason=%s queue=%zu\n",
+               (long long)GetTimeMicros(), hash.ToString().c_str(), nAttempts,
+               reason ? reason : "?", g_blockRetry.size());
+}
+
+size_t ProcessBlockRetryQueue(const std::vector<CNode*>& vNodesCopy, int64_t nNowUs)
+{
+    if (fShutdown)
+        return 0;
+
+    std::vector<uint256> vDue;
+    {
+        LOCK(cs_blockRetry);
+        for (std::map<uint256, BlockRetryEntry>::const_iterator it = g_blockRetry.begin();
+             it != g_blockRetry.end() && vDue.size() < BLOCK_RETRY_BUDGET_PER_TICK; ++it)
+            if (it->second.nNextUs <= nNowUs)
+                vDue.push_back(it->first);
+    }
+    if (vDue.empty())
+        return 0;
+
+    TRY_LOCK(cs_main, lockMain);
+    if (!lockMain)
+        return 0; // retry on the next tick; records stay queued
+
+    size_t nQueued = 0;
+    for (size_t i = 0; i < vDue.size(); ++i)
+    {
+        const uint256& hash = vDue[i];
+        if (mapBlockIndex.count(hash))
+        {
+            LOCK(cs_blockRetry);
+            g_blockRetry.erase(hash);
+            continue; // already indexed: nothing to re-request
+        }
+        bool fQueued = false;
+        for (std::vector<CNode*>::const_iterator pit = vNodesCopy.begin();
+             pit != vNodesCopy.end() && !fQueued; ++pit)
+        {
+            CNode* pnode = *pit;
+            if (pnode == NULL || pnode->fDisconnect || pnode->fClient || pnode->fOneShot)
+                continue;
+            const AskForResult res =
+                pnode->AskFor(CInv(MSG_BLOCK, hash), BLOCKREQ_SOURCE_OTHER);
+            if (res == ASKFOR_QUEUED || res == ASKFOR_ALREADY_QUEUED ||
+                res == ASKFOR_INFLIGHT || res == ASKFOR_OWNED_BY_OTHER)
+                fQueued = true;
+        }
+        LOCK(cs_blockRetry);
+        std::map<uint256, BlockRetryEntry>::iterator it = g_blockRetry.find(hash);
+        if (it == g_blockRetry.end())
+            continue;
+        if (fQueued)
+        {
+            it->second.nNextUs = nNowUs + BLOCK_RETRY_QUEUED_HOLD_US;
+            ++nQueued;
+        }
+        else if (it->second.nAttempts >= MAX_BLOCK_RETRY_ATTEMPTS)
+        {
+            g_blockRetry.erase(it);
+        }
+        else
+        {
+            it->second.nNextUs = nNowUs + BLOCK_RETRY_BACKOFF_US[
+                std::min(it->second.nAttempts - 1, 2)];
+        }
+    }
+    return nQueued;
+}
+
+size_t GetBlockRetryQueueSize()
+{
+    LOCK(cs_blockRetry);
+    return g_blockRetry.size();
+}
+
+int GetBlockRetryAttemptsForTesting(const uint256& hash)
+{
+    LOCK(cs_blockRetry);
+    std::map<uint256, BlockRetryEntry>::const_iterator it = g_blockRetry.find(hash);
+    return it == g_blockRetry.end() ? 0 : it->second.nAttempts;
+}
+
+void ResetBlockRetryQueueForTesting()
+{
+    LOCK(cs_blockRetry);
+    g_blockRetry.clear();
+}
+
 void ResetPipelineWakeStateForTesting()
 {
     g_pipeline_wake_requested_generation.store(0, std::memory_order_relaxed);
@@ -9718,6 +9865,12 @@ void ThreadMessageHandler2(void* parg)
         }
 
         MaybeProcessPipelineWake(vNodesCopy);
+
+        // D2 bounded event-driven retry: re-request blocks whose in-flight
+        // deadline expired, without waiting for an INV or the stall watchdog.
+        // Same message-loop tick, bounded per tick by BLOCK_RETRY_BUDGET_PER_TICK.
+        if (!fImporting && !fReindex && !fSPVMode)
+            ProcessBlockRetryQueue(vNodesCopy, GetTimeMicros());
 
         // One scheduling round boundary for the ordered IBD header block
         // scheduler: exactly one refill pass per round may mutate the

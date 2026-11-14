@@ -1825,6 +1825,27 @@ bool BlockIndexTipAuthority::Create(const std::string& root,
     if (!out)
         return SetError(error, "null tip authority output");
     Impl* i = out->impl;
+    if (i->open)
+        return SetError(error, "tip authority already open on this object "
+                               "(single-owner contract)");
+    // OWNER-approved guard (2026-11-13): a failed Create must never leave a
+    // half-open authority behind (dangling file locks / leveldb handles).  Every
+    // early return below releases whatever was already opened.
+    struct PartialInitCleanup
+    {
+        Impl* p;
+        bool committed;
+        ~PartialInitCleanup()
+        {
+            if (committed) return;
+            p->recordsWin.Reset();
+            p->derivedWin.Reset();
+            p->activeWin.Reset();
+            p->sideIndex.Close();
+            p->chainsValid = false;
+            p->open = false;
+        }
+    } cleanup = { i, false };
     if (!i->InitializePaths(root))
         return SetError(error, "init tip paths failed");
     if (fs::exists(i->tipDir))
@@ -1887,6 +1908,7 @@ bool BlockIndexTipAuthority::Create(const std::string& root,
     if (!i->WriteMeta(error))
         return false;
     i->open = true;
+    cleanup.committed = true;
     ClearError(error);
     return true;
 }
@@ -1899,6 +1921,27 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
     if (!out)
         return SetError(error, "null tip authority output");
     Impl* i = out->impl;
+    if (i->open)
+        return SetError(error, "tip authority already open on this object "
+                               "(single-owner contract)");
+    // OWNER-approved guard (2026-11-13): a failed Open must never leave a
+    // half-open authority behind (dangling file locks / leveldb handles).  Every
+    // early return below releases whatever was already opened.
+    struct PartialInitCleanup
+    {
+        Impl* p;
+        bool committed;
+        ~PartialInitCleanup()
+        {
+            if (committed) return;
+            p->recordsWin.Reset();
+            p->derivedWin.Reset();
+            p->activeWin.Reset();
+            p->sideIndex.Close();
+            p->chainsValid = false;
+            p->open = false;
+        }
+    } cleanup = { i, false };
     if (!i->InitializePaths(root))
         return SetError(error, "init tip paths failed");
     if (!fs::exists(i->metaPath))
@@ -2201,6 +2244,7 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
     else
         i->invalidDiskDurable = false;
     i->open = true;
+    cleanup.committed = true;
     // C11: publish the initial committed-tip snapshot from the committed meta so
     // the boot->first-append window never reports spurious unavailability.
     i->PublishCommittedSnapshot();

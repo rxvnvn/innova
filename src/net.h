@@ -382,6 +382,19 @@ typedef int NodeId;
 
 void RequestBlockPipelineWake(uint32_t nCause);
 
+// D2 bounded event-driven retry (OWNER directive 2026-11-14).
+// An in-flight block request that passes its deadline becomes a candidate for an
+// immediate, BOUNDED re-request instead of waiting for the stall watchdog:
+//   * bounded queue size, bounded attempts per hash, per-attempt backoff;
+//   * one global budget per message-loop tick (no burst / request storm);
+//   * never re-requests a block that is already indexed or already queued.
+// No extra thread: processed from the existing ThreadMessageHandler2 tick.
+void NoteBlockRetryCandidate(const uint256& hash, const char* reason);
+size_t ProcessBlockRetryQueue(const std::vector<CNode*>& vNodesCopy, int64_t nNowUs);
+size_t GetBlockRetryQueueSize();
+int GetBlockRetryAttemptsForTesting(const uint256& hash);
+void ResetBlockRetryQueueForTesting();
+
 // Experiment A (future-supply diversification): cached -ibddivfuture /
 // -ibddivfrac configuration.  Loaded lazily on first use so the arguments are
 // read exactly once; unit tests reload them through
@@ -2648,6 +2661,13 @@ template<typename T1, typename T2, typename T3, typename T4, typename T5, typena
                         fPendingWire ? "local-fail" : "timeout");
                     EraseAlreadyAskedForIfUnowned(
                         CInv(MSG_BLOCK, hashExpired));
+                    // D2 bounded event-driven retry: register the released hash
+                    // as a candidate so it is re-requested on the next tick
+                    // WITHOUT waiting for an INV or the stall watchdog.  Only the
+                    // deadline outcome qualifies; the local-fail (pending-wire)
+                    // case keeps its existing behaviour.
+                    if (!fPendingWire)
+                        NoteBlockRetryCandidate(hashExpired, "timeout");
                 }
                 {
                     LOCK(cs_vBlockInFlightWire);

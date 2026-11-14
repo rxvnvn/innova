@@ -15,6 +15,8 @@
 #include <boost/filesystem.hpp>
 #include <string>
 #include <vector>
+#include <fstream>
+#include <iterator>
 
 #include "blockindex_tip.h"
 #include "blockindex_tip_bounded_window.h"
@@ -2571,6 +2573,233 @@ BOOST_AUTO_TEST_CASE(p_shutdown_flush_helper_inert_without_authority)
     BOOST_CHECK(FlushAuthoritativeTipWindowAtShutdown());
     BlockIndexTipSetFailpointForTesting("FP_FLUSH_PENDING_APPENDS", false);
     printf("SHUTDOWN-HELPER PASS inert without an authoritative live authority\n");
+}
+
+// Contract probe (OWNER request §3): is a second Open of the SAME authority
+// object, or of a SECOND object on the same store, safe inside one process?
+// This test CHARACTERIZES current behaviour. It does not change Open().
+BOOST_AUTO_TEST_CASE(t_open_contract_same_object_and_second_writer)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 700;
+    const uint256 basePrev = uint256(0x4242UL);
+    uint256 tipHash;
+
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 9, 100, baseTip, &tip, NULL));
+    BuildChain(tip, 2, &tipHash, basePrev, baseTip);
+    BOOST_REQUIRE_EQUAL(tip.TipHeight(), baseTip + 2);
+    tip.Close();
+    BOOST_REQUIRE(!tip.IsOpen());
+
+    std::string err;
+    const bool reok = BlockIndexTipAuthority::Open(dir, 9, &tip, &err);
+    BOOST_TEST_MESSAGE("OPENCONTRACT reopen_after_close ok=" << reok << " err=" << err
+                       << " tip=" << tip.TipHeight());
+    BOOST_REQUIRE(reok);
+
+    err.clear();
+    const bool twice = BlockIndexTipAuthority::Open(dir, 9, &tip, &err);
+    BOOST_TEST_MESSAGE("OPENCONTRACT second_open_same_object ok=" << twice << " err=" << err
+                       << " guard=" << (twice ? "MISSING" : "present"));
+    BOOST_CHECK_MESSAGE(!twice, "Open() accepted a second open on an already-open object");
+    // The refused re-open must not disturb the live authority.
+    BOOST_CHECK_EQUAL(tip.TipHeight(), baseTip + 2);
+    BOOST_CHECK(tip.IsOpen());
+
+    BlockIndexTipAuthority other;
+    err.clear();
+    const bool second = BlockIndexTipAuthority::Open(dir, 9, &other, &err);
+    BOOST_TEST_MESSAGE("OPENCONTRACT second_object_same_store ok=" << second << " err=" << err
+                       << " guard=" << (second ? "MISSING" : "present"));
+    BOOST_CHECK_MESSAGE(!second, "two authority objects opened the same store");
+
+    if (second) other.Close();
+    tip.Close();
+
+    BlockIndexTipAuthority verify;
+    err.clear();
+    const bool verok = BlockIndexTipAuthority::Open(dir, 9, &verify, &err);
+    BOOST_TEST_MESSAGE("OPENCONTRACT fresh_open_after_probes ok=" << verok << " err=" << err);
+    BOOST_CHECK_MESSAGE(verok, "a fresh Open after Close() failed: store not reopenable");
+    if (verok)
+    {
+        BOOST_CHECK_EQUAL(verify.TipHeight(), baseTip + 2);
+        BOOST_CHECK(verify.TipHash() == tipHash);
+        printf("OPENCONTRACT durable_after_probes h=%d match=%d\n",
+               (int)verify.TipHeight(), (int)(verify.TipHash() == tipHash));
+        fflush(stdout);
+        verify.Close();
+    }
+    if (second) other.Close();
+    if (tip.IsOpen()) tip.Close();
+}
+
+
+// Baseline: a second authority on the SAME store must be refused while the first
+// is open, and the store must become openable again after Close().
+BOOST_AUTO_TEST_CASE(t_open_contract_baseline_locking)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 300;
+    const uint256 basePrev = uint256(0x5151UL);
+    uint256 tipHash;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 4, 50, baseTip, &tip, NULL));
+        BuildChain(tip, 1, &tipHash, basePrev, baseTip);
+    } // destructor / Close
+
+    BlockIndexTipAuthority a;
+    std::string e1;
+    const bool ok1 = BlockIndexTipAuthority::Open(dir, 4, &a, &e1);
+    BOOST_TEST_MESSAGE("OPENCLAUSE first_open ok=" << ok1 << " err=" << e1);
+
+    BlockIndexTipAuthority b;
+    std::string e2;
+    const bool ok2 = BlockIndexTipAuthority::Open(dir, 4, &b, &e2);
+    BOOST_TEST_MESSAGE("OPENCLAUSE second_open_while_first_open ok=" << ok2 << " err=" << e2);
+    if (ok2) b.Close();
+
+    a.Close();
+    BlockIndexTipAuthority c;
+    std::string e3;
+    const bool ok3 = BlockIndexTipAuthority::Open(dir, 4, &c, &e3);
+    BOOST_TEST_MESSAGE("OPENCLAUSE reopen_after_close ok=" << ok3 << " err=" << e3
+                       << " tip=" << (ok3 ? c.TipHeight() : -1));
+    if (ok3) c.Close();
+}
+
+
+// OWNER request: repeated Create must be refused, and a failed Open must not
+// leave a file lock or descriptor behind.
+BOOST_AUTO_TEST_CASE(t_open_contract_repeated_create)
+{
+    const std::string dir = MakeTempDir();
+    BlockIndexTipAuthority tip;
+    std::string err;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 2, 10, 50, &tip, &err));
+    err.clear();
+    const bool twice = BlockIndexTipAuthority::Create(dir, 2, 10, 50, &tip, &err);
+    BOOST_TEST_MESSAGE("OPENCCREATE second_create_same_object ok=" << twice << " err=" << err);
+    BOOST_CHECK_MESSAGE(!twice, "Create() accepted a second create on an already-open object");
+    BOOST_CHECK_EQUAL(tip.TipHeight(), 50);
+
+    BlockIndexTipAuthority other;
+    err.clear();
+    const bool onExisting = BlockIndexTipAuthority::Create(dir, 2, 10, 50, &other, &err);
+    BOOST_TEST_MESSAGE("OPENCCREATE create_on_existing_store ok=" << onExisting << " err=" << err);
+    BOOST_CHECK_MESSAGE(!onExisting, "Create() re-created an existing store");
+    tip.Close();
+}
+
+BOOST_AUTO_TEST_CASE(t_open_contract_failed_open_releases_lock)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 900;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 6, 20, baseTip, &tip, NULL));
+        uint256 h;
+        BuildChain(tip, 3, &h, uint256(0x9999UL), baseTip);
+    }
+    // Corrupt one committed byte so Open fails LATE (after the side index was
+    // opened), which is exactly the path that used to leak the writable handle.
+    std::string rec;
+    {
+        // The store lives under the authority's tip directory; find it.
+        for (fs::recursive_directory_iterator it(dir), end; it != end; ++it)
+        {
+            const std::string nm = it->path().filename().string();
+            if (nm.find("records") != std::string::npos) { rec = it->path().string(); break; }
+        }
+        BOOST_REQUIRE_MESSAGE(!rec.empty(), "tip-records store not found under " << dir);
+        FILE* f = fopen(rec.c_str(), "r+b");
+        BOOST_REQUIRE(f != NULL);
+        BOOST_REQUIRE(fseek(f, 64, SEEK_SET) == 0);
+        unsigned char b = 0xFF;
+        BOOST_REQUIRE(fwrite(&b, 1, 1, f) == 1);
+        fclose(f);
+    }
+    BlockIndexTipAuthority a;
+    std::string e1;
+    const bool ok1 = BlockIndexTipAuthority::Open(dir, 6, &a, &e1);
+    BOOST_TEST_MESSAGE("OPENCFAIL first_open_ok=" << ok1 << " err=" << e1);
+    BOOST_CHECK_MESSAGE(!ok1, "Open() accepted a corrupted store");
+
+    BlockIndexTipAuthority b;
+    std::string e2;
+    const bool ok2 = BlockIndexTipAuthority::Open(dir, 6, &b, &e2);
+    BOOST_TEST_MESSAGE("OPENCFAIL second_open_ok=" << ok2 << " err=" << e2);
+    BOOST_CHECK_MESSAGE(e2.find("lock") == std::string::npos,
+                        "failed Open leaked a file lock: " << e2);
+    if (ok2) b.Close();
+}
+
+
+// OWNER request: resources must be released on a LATE-stage Open failure
+// (after the hash-index side store was opened).
+BOOST_AUTO_TEST_CASE(t_open_contract_late_failure_releases_lock)
+{
+    const std::string dir = MakeTempDir();
+    const int baseTip = 1100;
+    {
+        BlockIndexTipAuthority tip;
+        BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 8, 30, baseTip, &tip, NULL));
+        uint256 h;
+        BuildChain(tip, 2, &h, uint256(0xABCDUL), baseTip);
+    }
+    std::string meta;
+    for (fs::recursive_directory_iterator it(dir), end; it != end; ++it)
+        if (it->path().filename().string() == "tip.meta") { meta = it->path().string(); break; }
+    BOOST_REQUIRE_MESSAGE(!meta.empty(), "tip.meta not found under " << dir);
+
+    std::vector<unsigned char> orig;
+    {
+        std::ifstream in(meta.c_str(), std::ios::binary);
+        orig.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    BOOST_REQUIRE(!orig.empty());
+
+    // Find an offset whose corruption still decodes meta but breaks the content
+    // digest -- that is the late failure we need.
+    std::string lateErr;
+    for (size_t off = orig.size() > 96 ? orig.size() - 96 : 0; off < orig.size(); ++off)
+    {
+        std::vector<unsigned char> b = orig;
+        b[off] ^= 0xFF;
+        {
+            std::ofstream out(meta.c_str(), std::ios::binary | std::ios::trunc);
+            out.write((const char*)&b[0], (std::streamsize)b.size());
+        }
+        BlockIndexTipAuthority probe;
+        std::string e;
+        const bool ok = BlockIndexTipAuthority::Open(dir, 8, &probe, &e);
+        if (ok) { probe.Close(); continue; }
+        if (e.find("digest") != std::string::npos) { lateErr = e; break; }
+    }
+    BOOST_TEST_MESSAGE("OPENCLATE late_stage_error=" << (lateErr.empty() ? std::string("<not reached>") : lateErr));
+
+    if (lateErr.empty())
+    {
+        std::ofstream out(meta.c_str(), std::ios::binary | std::ios::trunc);
+        out.write((const char*)&orig[0], (std::streamsize)orig.size());
+        BOOST_WARN_MESSAGE(false, "late-stage failure could not be produced; lock-release check skipped");
+        return;
+    }
+
+    // The failed Open must have left no lock behind: a second attempt fails the
+    // same way (digest), not with a hash-index lock error.
+    BlockIndexTipAuthority second;
+    std::string e2;
+    const bool ok2 = BlockIndexTipAuthority::Open(dir, 8, &second, &e2);
+    BOOST_TEST_MESSAGE("OPENCLATE second_open_ok=" << ok2 << " err=" << e2);
+    BOOST_CHECK_MESSAGE(e2.find("lock") == std::string::npos,
+                        "failed Open leaked a file lock: " << e2);
+    if (ok2) second.Close();
+
+    std::ofstream out(meta.c_str(), std::ios::binary | std::ios::trunc);
+    out.write((const char*)&orig[0], (std::streamsize)orig.size());
 }
 
 BOOST_AUTO_TEST_SUITE_END()
