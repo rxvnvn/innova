@@ -411,6 +411,32 @@ void BumpMiningTipGeneration()
     g_mining_tip_generation.fetch_add(1, std::memory_order_release);
 }
 
+// ADR-0030 A (APPROVED): V2 has exactly ONE writer of the authoritative state.
+// The executor is no longer an option selected by a flag - it is the only path.
+// BpmCheckSingleWriterPolicy() runs at startup and refuses an explicit
+// -bpmsinglewriter=0, so there is no silent return to the direct path.
+bool BpmSingleWriterMandatory()
+{
+    return g_fAuthoritativeStartup;
+}
+
+bool BpmCheckSingleWriterPolicy(std::string& strError)
+{
+    // No startup mode is exempt: the flag no longer selects a path anywhere, so
+    // an explicit "0" is refused regardless of whether V2 engaged for this datadir.
+    if (mapArgs.count("-bpmsinglewriter") == 0)
+        return true;
+    const std::string strVal = GetArg("-bpmsinglewriter", "");
+    if (strVal == "0" || strVal == "false" || strVal == "no")
+    {
+        strError = "ADR-0030 A: -bpmsinglewriter=0 is not supported in V2; the "
+                   "single-writer executor is the only path that writes the "
+                   "authoritative tip (refusing a silent fallback)";
+        return false;
+    }
+    return true;
+}
+
 uint64_t GetMiningTipGeneration()
 {
     return g_mining_tip_generation.load(std::memory_order_acquire);
@@ -9563,6 +9589,7 @@ bool CBlock::SetBestChain(CBlockIndex* pindexNew)
     // New best block
     hashBestChain = hash;
     pindexBest = pindexNew;
+    BumpMiningTipGeneration();   // BPMR-FIX1: mining workers must see a new tip
     pblockindexFBBHLast = NULL;
     nBestHeight = pindexBest->nHeight;
     nBestChainTrust = pindexNew->nChainTrust;
@@ -10386,7 +10413,7 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
             bool fS1CommittedPre = false;
             {
                 CSyncLockPhase phaseS1Commit("ProcessMessage(block)", "s1_accept_active");
-                if (GetBoolArg("-bpmsinglewriter", false))
+                if (BpmSingleWriterMandatory())   // ADR-0030 A: the only path
                 {
                     // IF01-DUR-01: the durable commit AND the servable switch go
                     // through the single-writer executor (real AcceptActive and
@@ -10462,7 +10489,9 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
         // case is a cutover and goes through the fused reorg transition below.
         const bool fBpmSkipPublish =
             fBpmSideCommittedPre && (pindexNew->nChainTrust <= nBestChainTrust);
-        if (!fBestSetByBpm && !fBpmSkipPublish && GetBoolArg("-bpmsinglewriter", false) && g_fAuthoritativeStartup)
+        // ADR-0030 A: a non-extension best-chain switch always goes through the
+        // single-writer executor; there is no flag-selected alternative path.
+        if (!fBestSetByBpm && !fBpmSkipPublish && BpmSingleWriterMandatory())
         {
             // IF01-DUR-01: a non-extension best-chain switch (reorg/cutover) is ONE
             // fused atomic transition (V->C->A inside ReorganizeAtomic) submitted
@@ -11983,7 +12012,7 @@ bool InvalidateBlock(const uint256& hash, std::string& strError)
     // ONE fused durable transition through the executor, with an explicit outcome
     // (anything but TR_COMMITTED is fail-closed). The body below is the same one
     // the direct path executes — one implementation, not two.
-    if (g_fAuthoritativeStartup && GetBoolArg("-bpmsinglewriter", false))
+    if (BpmSingleWriterMandatory())   // ADR-0030 A: executor is the only path
     {
         std::string strOpErr;
         const bpmr::TransitionOutcome oc =
@@ -12184,7 +12213,7 @@ bool ReconsiderBlock(const uint256& hash, std::string& strError)
 
     // P0.3 (I6): same single-writer route as InvalidateBlock (fused transition,
     // explicit outcome, same body as the direct path).
-    if (g_fAuthoritativeStartup && GetBoolArg("-bpmsinglewriter", false))
+    if (BpmSingleWriterMandatory())   // ADR-0030 A: executor is the only path
     {
         std::string strOpErr;
         const bpmr::TransitionOutcome oc =
@@ -15990,6 +16019,7 @@ bool static ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv, 
                 {
                     pindexPrev->pnext = pindexNew;
                     pindexBest = pindexNew;
+    BumpMiningTipGeneration();   // BPMR-FIX1: mining workers must see a new tip
                     hashBestChain = hash;
                     nBestHeight = pindexNew->nHeight;
                     nBestChainTrust = pindexNew->nChainTrust;

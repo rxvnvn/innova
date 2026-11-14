@@ -599,6 +599,14 @@ bool BpmFailpointPause(const char* name);
 // in-flight one at node shutdown. Safe to call when the single writer was unused.
 void BpmShutdownExecutor();
 
+// BPMR-FIX1 (mining coordination): a lock-free generation counter that changes
+// whenever the active tip changes. Mining workers read it WITHOUT cs_main to
+// notice that their template is obsolete; it is a cheap early-exit, never the
+// authoritative staleness check (that is the by-value CPUMiningWorkIdentity,
+// consulted immediately before ProcessBlock).
+void BumpMiningTipGeneration();
+uint64_t GetMiningTipGeneration();
+
 // S1 acceptance (TEST-ONLY, regtest-only): temporarily lower the proof-of-stake
 // target limit so a real PoS kernel is findable on a regtest fixture. Refuses to
 // run outside regtest, so mainnet/testnet can never be overridden; consensus
@@ -2296,3 +2304,6 @@ bool AcceptableInputs(CTxMemPool& pool, const CTransaction &txo, bool fLimitFree
                         bool* pfMissingInputs);
 
 #endif
+
+bool BpmSingleWriterMandatory();
+bool BpmCheckSingleWriterPolicy(std::string& strError);

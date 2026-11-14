@@ -1067,6 +1067,10 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
                           ? nWorkerId + 1
                           : static_cast<unsigned int>(nNextExtraNonce);
 
+        // BPMR-FIX1: remember the tip generation this attempt was prepared for.
+        // Reading it is a single relaxed atomic load - no cs_main in the hot path.
+        const uint64_t nTipGenAtPrep = GetMiningTipGeneration();
+
         if (!fPrepared || !IsCPUMiningWorkCurrent(workIdentity, false))
         {
             reservekey.ReturnKey();
@@ -1131,6 +1135,13 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
                 if (pblock->nTime != nTimeBefore)
                     KeepCoinbaseTimeInSync(pblock.get());
                 bool fCheckMempool = GetTime() - nStart >= 5;
+                // BPMR-FIX1: cheap generation early-exit - a tip change makes this
+                // grind obsolete immediately, without a cs_main identity capture.
+                if (GetMiningTipGeneration() != nTipGenAtPrep)
+                {
+                    controller.NotePaused(nWorkerId, CCPUMinerController::PAUSE_WORK_REBUILD);
+                    break;
+                }
                 if (!IsCPUMiningWorkCurrent(workIdentity, fCheckMempool))
                     break;
             }
@@ -1145,7 +1156,11 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
             // BPMR/ADR-0022 §7.3: register this outer cs_main level so the accept
             // path can release the full recursion depth around the executor submit.
             BlockPathOuterLockGuard blockPathOuterLock(&criticalblock);
+            // BPMR-FIX1: staleness is re-checked IMMEDIATELY before acceptance, not
+            // only when the attempt started. Generation first (cheap), then the
+            // by-value identity (authoritative). Both must agree with the tip.
             if (!controller.ShouldStop(nSessionId) &&
+                GetMiningTipGeneration() == nTipGenAtPrep &&
                 IsCPUMiningWorkCurrent(workIdentity, false) &&
                 IsCPUMiningCollateralStateReady())
             {

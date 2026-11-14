@@ -1756,6 +1756,18 @@ authoritative_startup_ready:
     // R3 (PM1-P0-03): if a previous run crashed or failed between the V2
     // authority commit and the legacy compatibility-mirror update, the legacy
     // view may lag the V2 authority. V2 wins: deterministically re-mirror it.
+    // ADR-0030 A: the single-writer executor is the ONLY path that writes the
+    // authoritative tip. An explicit -bpmsinglewriter=0 stops the node here
+    // instead of silently running the alternative direct path. Checked for every
+    // startup mode, because the flag no longer selects anything anywhere.
+    {
+        std::string strSWErr;
+        if (!BpmCheckSingleWriterPolicy(strSWErr))
+            return InitError(strSWErr);
+        printf("ADR-0030 A: single-writer executor is the only authority writer (enforced)\n");
+        fflush(stdout);
+    }
+
     if (g_fAuthoritativeStartup)
     {
         std::string mirrorErr;
