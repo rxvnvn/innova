@@ -5,6 +5,7 @@
 
 #include "bpmr_transition_executor.h"
 
+#include <map>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -385,6 +386,114 @@ static void TestOperatorTransition()
     CHECK(tr3.strDetail == "store unwind failed", "failure detail is propagated verbatim");
     CHECK(nPublish3 == 0, "no publication after a failed operator commit");
 }
+
+static void TestFalseMeansNeverEnqueued()
+{
+    // After shutdown no ticket can be enqueued, so SubmitAndWait must answer
+    // false - and false is the ONLY reason the caller may run the transition
+    // inline. Nothing may be committed by the executor in this state.
+    std::printf("P0-1: false after shutdown means never enqueued\n");
+    TransitionExecutor ex(64,
+        [](const TransitionRequest&, std::string*) { return true; },
+        [](const TransitionRequest&, std::string*) { return true; });
+    ex.Shutdown();
+    TransitionRequest r;
+    r.nHeight = 1; r.nParentId = 0; r.nSelfId = 1; r.fPublish = false;
+    TransitionResult out;
+    const bool ok = ex.SubmitAndWait(r, 200, &out);
+    CHECK(!ok, "SubmitAndWait false once stopped");
+    CHECK(ex.CommittedCount() == 0, "no commit from a refused submit");
+    CHECK(ex.SideCommittedCount() == 0, "no side commit from a refused submit");
+    CHECK(ex.DurableTipHeight() == 0, "durable tip untouched");
+}
+
+static void TestTimeoutAbandonedSingleCommit()
+{
+    // The worker is busy with an earlier transition; the second one waits in the
+    // queue and times out. Its ticket must be abandoned (never executed), so the
+    // synchronous fallback performs the ONLY commit for that height.
+    std::printf("P0-1: timeout of a queued ticket -> abandoned, one commit\n");
+    std::mutex m; std::condition_variable cv;
+    bool fInFirst = false, fRelease = false;
+    std::map<uint64_t, int> commits;   // height -> number of commits
+    std::mutex cm;
+    TransitionExecutor ex(64,
+        [&](const TransitionRequest& req, std::string*) {
+            {
+                std::unique_lock<std::mutex> lk(m);
+                if (!fInFirst) { fInFirst = true; cv.notify_all(); }
+                cv.wait(lk, [&] { return fRelease; });
+            }
+            std::lock_guard<std::mutex> g(cm);
+            commits[req.nHeight] += 1;
+            return true;
+        },
+        [](const TransitionRequest&, std::string*) { return true; });
+
+    TransitionRequest r1; r1.nHeight = 1; r1.nParentId = 0; r1.nSelfId = 1; r1.fPublish = false;
+    CHECK(ex.Submit(r1, 0), "first submit accepted");
+    { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return fInFirst; }); }
+
+    TransitionRequest r2; r2.nHeight = 2; r2.nParentId = 1; r2.nSelfId = 2; r2.fPublish = false;
+    TransitionResult out2;
+    const bool ok2 = ex.SubmitAndWait(r2, 30, &out2);   // times out while queued
+    CHECK(!ok2, "queued ticket abandoned at timeout (false)");
+
+    { std::lock_guard<std::mutex> lk(m); fRelease = true; }
+    cv.notify_all();
+    ex.Shutdown();
+    std::lock_guard<std::mutex> g(cm);
+    CHECK(commits[1] == 1, "first height committed exactly once");
+    CHECK(commits.find(2) == commits.end() || commits[2] == 0,
+          "abandoned ticket was NOT executed by the worker");
+    // The abandoned ticket is resolved without ever executing: either the worker
+    // pops it and sees abandoned_ (skipped) or shutdown cancels it in the queue.
+    CHECK(ex.SkippedCount() + ex.CancelledAtShutdownCount() == 1,
+          "abandoned ticket resolved without execution");
+    // The executor committed height 1 only; the abandoned height was never its
+    // work - the caller may commit it inline, which is exactly one execution.
+    CHECK(ex.CommittedCount() == 1, "executor committed only the in-flight height");
+}
+
+static void TestTimeoutStartedAlwaysWaited()
+{
+    // Once the worker has STARTED a ticket, a timeout must not return false:
+    // the caller would re-run the same transition inline and commit twice.
+    std::printf("P0-1: started ticket is waited past its timeout\n");
+    std::mutex m; std::condition_variable cv;
+    bool fInFirst = false, fRelease = false;
+    std::atomic<int> nCommits{0};
+    TransitionExecutor ex(64,
+        [&](const TransitionRequest&, std::string*) {
+            {
+                std::unique_lock<std::mutex> lk(m);
+                fInFirst = true; cv.notify_all();
+                cv.wait(lk, [&] { return fRelease; });
+            }
+            ++nCommits;
+            return true;
+        },
+        [](const TransitionRequest&, std::string*) { return true; });
+
+    TransitionRequest r; r.nHeight = 1; r.nParentId = 0; r.nSelfId = 1; r.fPublish = false;
+    TransitionResult out;
+    std::atomic<bool> fReturned{false};
+    std::thread waiter([&] {
+        const bool ok = ex.SubmitAndWait(r, 30, &out);   // 30 ms, work takes ~400 ms
+        CHECK(ok, "SubmitAndWait true despite timeout (started ticket)");
+        fReturned.store(true);
+    });
+    { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return fInFirst; }); }
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    CHECK(!fReturned.load(), "still waiting past the timeout - no inline fallback");
+    { std::lock_guard<std::mutex> lk(m); fRelease = true; }
+    cv.notify_all();
+    waiter.join();
+    ex.Shutdown();
+    CHECK(nCommits.load() == 1, "exactly one commit for the started ticket");
+    CHECK(ex.FailedCount() == 0, "no failure recorded");
+}
+
 int main()
 {
     TestExtension();
@@ -396,6 +505,9 @@ int main()
     TestSideFallback();
     TestOperatorTransition();
     TestShutdownSubmitAndWaitNoHang();
+    TestFalseMeansNeverEnqueued();
+    TestTimeoutAbandonedSingleCommit();
+    TestTimeoutStartedAlwaysWaited();
     std::printf("\n%s failures=%d\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

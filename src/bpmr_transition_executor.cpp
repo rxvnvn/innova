@@ -147,8 +147,20 @@ bool TransitionExecutor::SubmitAndWait(const TransitionRequest& reqIn,
         // that had already STARTED (the caller could re-run it -> double commit),
         // so the wait continues until done_ holds this ticket. Shutdown() always
         // populates done_ for both cases, therefore this cannot hang.
+        // false from SubmitAndWait means ONE thing only: this ticket was never
+        // enqueued, so the caller may run the same transition inline (exactly
+        // once). Reaching fStop_ here is impossible while the ticket is not in
+        // done_: Shutdown() sets fStop_ and fills done_ for every queued ticket
+        // inside a single cs_ critical section, and done_ (line above) is checked
+        // before fStop_. So this branch cannot return for a ticket the executor
+        // owns; it is kept as a fail-closed guard, not as an inline permission:
+        // an enqueued ticket must always be resolved through done_.
         if (fStop_ && started_.count(req.nTicket) == 0)
-            return false;
+        {
+            // Fail-closed: an enqueued ticket is always resolved through done_.
+            cv_.wait(lock, [this, &req] { return done_.count(req.nTicket) != 0; });
+            continue;
+        }
         if (cv_.wait_until(lock, deadline) == std::cv_status::timeout)
         {
             // A request that has already STARTED is always waited for: abandoning
