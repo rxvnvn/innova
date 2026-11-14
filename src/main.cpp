@@ -260,13 +260,44 @@ static bool BpmPublishCallback(const bpmr::TransitionRequest& req, std::string* 
 
 // The single writer for durable chain transitions in this process. Created lazily
 // and used only when -bpmsinglewriter=1; both callbacks are the REAL path.
+static bpmr::TransitionExecutor* g_pBpmExecutor = NULL;
+
 static bpmr::TransitionExecutor* BpmGetExecutor()
 {
-    static bpmr::TransitionExecutor* pExec = NULL;
-    if (pExec == NULL)
-        pExec = new bpmr::TransitionExecutor(64, BpmCommitCallback, BpmPublishCallback);
-    return pExec;
+    if (g_pBpmExecutor == NULL)
+        g_pBpmExecutor = new bpmr::TransitionExecutor(64, BpmCommitCallback, BpmPublishCallback);
+    return g_pBpmExecutor;
 }
+
+// ADR-0024 (T6) variant A: on node shutdown, requests that have NOT started are
+// cancelled (nothing committed, nothing published) and the transition that is
+// already in flight finishes with its own unambiguous result. Called before the
+// durable flushes so no transition can be queued into a store that is closing.
+void BpmShutdownExecutor()
+{
+    if (g_pBpmExecutor == NULL)
+        return;   // the single writer was never used in this process
+    const std::vector<bpmr::TransitionResult> results = g_pBpmExecutor->Shutdown();
+    size_t nCancelled = 0, nCommitted = 0, nFailed = 0, nPublishFailed = 0;
+    for (size_t i = 0; i < results.size(); ++i)
+    {
+        switch (results[i].eOutcome)
+        {
+        case bpmr::TR_CANCELLED_SHUTDOWN: ++nCancelled; break;
+        case bpmr::TR_COMMITTED:
+        case bpmr::TR_COMMITTED_SIDE:     ++nCommitted; break;
+        case bpmr::TR_FAILED_PUBLISH:     ++nPublishFailed; ++nFailed; break;
+        case bpmr::TR_FAILED_COMMIT:      ++nFailed; break;
+        default: break;
+        }
+    }
+    printf("BPM_SHUTDOWN_DRAIN results=%zu committed=%zu cancelled=%zu failed=%zu "
+           "publish_failed=%zu (pending requests cancelled before start; in-flight completed)\n",
+           results.size(), nCommitted, nCancelled, nFailed, nPublishFailed);
+    fflush(stdout);
+}
+
+void BpmShutdownExecutor();
 
 // Bind I1/I2 to the DURABLE tip of the open authority (never to pindexBest).
 // A fresh store has no live tip yet (only the immutable base S), and the base tip

@@ -71,7 +71,11 @@ enum TransitionOutcome
     TR_REJECTED_PARENT,      // I2 violated: parent identity != durable tip (and no side fallback)
     TR_FAILED_COMMIT,        // commit callback failed -> fail-closed, nothing published
     TR_FAILED_PUBLISH,       // durable commit happened, servable switch failed -> FAIL-STOP
-    TR_INLINE_BUSY           // internal: inline attempt found the worker mid-transition
+    TR_INLINE_BUSY,          // internal: inline attempt found the worker mid-transition
+    // ADR-0024 (T6) variant A: the request was still QUEUED (never started) when
+    // shutdown began. Nothing was committed and nothing was published, so the
+    // caller's outcome is unambiguous: the transition did NOT happen.
+    TR_CANCELLED_SHUTDOWN
 };
 
 struct TransitionResult
@@ -123,7 +127,12 @@ public:
     TransitionOutcome TryRunInline(const TransitionRequest& req, TransitionResult* out,
                                    bool* fBusy);
 
-    // Drains the queue, joins the worker, returns every result recorded.
+    // ADR-0024 (T6) variant A. Sets the stop flag, CANCELS every request that has
+    // not started yet (they are reported as TR_CANCELLED_SHUTDOWN and never
+    // executed), then waits for the request that is already in flight to finish
+    // with its own unambiguous result, joins the worker and returns everything
+    // recorded. A transition that has started is never abandoned: exactly-once is
+    // preserved because a cancelled request never touches durable state.
     std::vector<TransitionResult> Shutdown();
 
     // Durable-tip binding (I1/I2 are checked against THIS, not against pindexBest).
@@ -139,6 +148,7 @@ public:
     uint64_t FailedCount() const { return nFailed_.load(); }
     uint64_t PublishFailedCount() const { return nPublishFailed_.load(); }
     uint64_t SkippedCount() const { return nSkipped_.load(); }
+    uint64_t CancelledAtShutdownCount() const { return nCancelled_.load(); }
 
 private:
     TransitionOutcome Process(const TransitionRequest& req, TransitionResult* out);
@@ -169,6 +179,7 @@ private:
     std::atomic<uint64_t> nFailed_;
     std::atomic<uint64_t> nPublishFailed_;
     std::atomic<uint64_t> nSkipped_;
+    std::atomic<uint64_t> nCancelled_;
 };
 
 } // namespace bpmr

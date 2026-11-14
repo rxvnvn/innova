@@ -147,6 +147,12 @@ void Shutdown(void* parg)
         fShutdown = true;
         ShutdownCPUMining();
 
+        // ADR-0024 (T6) variant A / single writer: no transition may be queued into
+        // a store that is about to be flushed and closed. Pending requests are
+        // cancelled (nothing committed); the one in flight finishes here, with its
+        // own result, before the durable flushes below run.
+        BpmShutdownExecutor();
+
         // IFCN#9 perf (-tipcommitbatch): DURABILITY ORDER, block index first. The
         // mutable tip IS the authority for the accepted chain, so its residual RAM
         // window is published before anything else; Store3A is committed only when

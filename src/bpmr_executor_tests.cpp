@@ -7,6 +7,8 @@
 
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <cstdio>
 #include <thread>
 #include <vector>
@@ -24,6 +26,23 @@ static int g_failures = 0;
         }                                                                     \
     } while (0)
 
+// ADR-0024 (T6) variant A: shutdown cancels requests that have NOT started. Tests
+// that assert on executed transitions therefore wait until the worker has drained
+// them BEFORE calling Shutdown(); otherwise they would assert on cancellations.
+static void WaitForDrain(TransitionExecutor& ex, size_t nExpected, int nTimeoutMs = 15000)
+{
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(nTimeoutMs);
+    while (std::chrono::steady_clock::now() < deadline)
+    {
+        const uint64_t n = ex.CommittedCount() + ex.SideCommittedCount() +
+                           ex.RejectedCount() + ex.FailedCount() +
+                           ex.PublishFailedCount() + ex.CancelledAtShutdownCount();
+        if (n >= (uint64_t)nExpected) return;
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+}
+
 static void TestExtension()
 {
     std::printf("T1 extension\n");
@@ -33,7 +52,7 @@ static void TestExtension()
             ++nCommitted;
             return true;
         },
-        [](const TransitionRequest&) {});
+        [](const TransitionRequest&, std::string*) { return true; });
     for (uint64_t h = 1; h <= 50; ++h)
     {
         TransitionRequest r;
@@ -43,6 +62,7 @@ static void TestExtension()
         r.fPublish = true;
         CHECK(ex.Submit(r, 1000), "submit accepted");
     }
+    WaitForDrain(ex, 50);
     auto results = ex.Shutdown();
     CHECK(results.size() == 50, "50 results recorded");
     CHECK(ex.CommittedCount() == 50, "50 committed");
@@ -55,7 +75,7 @@ static void TestRejects()
     std::printf("T2 density / parent rejects\n");
     TransitionExecutor ex(16,
         [](const TransitionRequest&, std::string*) { return true; },
-        [](const TransitionRequest&) {});
+        [](const TransitionRequest&, std::string*) { return true; });
     TransitionRequest r1; r1.nHeight = 1; r1.nParentId = 0; r1.nSelfId = 1; r1.fPublish = true;
     ex.Submit(r1, 1000);
 
@@ -65,6 +85,7 @@ static void TestRejects()
     TransitionRequest bad2; bad2.nHeight = 2; bad2.nParentId = 999; bad2.nSelfId = 2; bad2.fPublish = true;
     ex.Submit(bad2, 1000);  // wrong parent
 
+    WaitForDrain(ex, 2);
     auto results = ex.Shutdown();
     int nDensity = 0, nParent = 0;
     for (const auto& r : results)
@@ -84,11 +105,12 @@ static void TestFailClosedCommit()
         [](const TransitionRequest& r, std::string*) {
             return r.nHeight != 2;  // height 2 fails to commit
         },
-        [](const TransitionRequest&) {});
+        [](const TransitionRequest&, std::string*) { return true; });
     TransitionRequest a; a.nHeight = 1; a.nParentId = 0; a.nSelfId = 1; a.fPublish = true;
     TransitionRequest b; b.nHeight = 2; b.nParentId = 1; b.nSelfId = 2; b.fPublish = true;
     ex.Submit(a, 1000);
     ex.Submit(b, 1000);
+    WaitForDrain(ex, 1);
     auto results = ex.Shutdown();
     CHECK(ex.FailedCount() == 1, "one commit failure recorded");
     CHECK(ex.DurableTipHeight() == 1, "durable tip not advanced past failure");
@@ -104,7 +126,7 @@ static void TestBackpressure()
             ++nSeen;
             return true;
         },
-        [](const TransitionRequest&) {});
+        [](const TransitionRequest&, std::string*) { return true; });
     int nAccepted = 0, nRefused = 0;
     for (uint64_t i = 0; i < 40; ++i)
     {
@@ -125,7 +147,7 @@ static void TestConcurrentSubmitters()
     std::printf("T3 concurrent submitters\n");
     TransitionExecutor ex(256,
         [](const TransitionRequest&, std::string*) { return true; },
-        [](const TransitionRequest&) {});
+        [](const TransitionRequest&, std::string*) { return true; });
     std::atomic<uint64_t> nAccepted{0};
     std::vector<std::thread> producers;
     for (int t = 0; t < 8; ++t)
@@ -143,6 +165,7 @@ static void TestConcurrentSubmitters()
         });
     }
     for (auto& th : producers) th.join();
+    WaitForDrain(ex, 1600);
     auto results = ex.Shutdown();
     CHECK(nAccepted == 1600, "all 1600 concurrent submits accepted");
     CHECK(results.size() == 1600, "1600 results, none lost");
@@ -151,15 +174,26 @@ static void TestConcurrentSubmitters()
 
 static void TestShutdownDrain()
 {
-    std::printf("T6 shutdown drain\n");
+    // ADR-0024 (T6) variant A REPLACES the old "drain everything" contract: a
+    // request that has not STARTED is cancelled at shutdown (nothing committed),
+    // and only the request already in flight completes. Each ticket still gets a
+    // definite result, so nothing is silent.
+    std::printf("T6 shutdown: pending cancelled, in-flight completes\n");
     std::atomic<int> nCommitted{0};
+    std::mutex m; std::condition_variable cv;
+    bool fRelease = false, fInFirst = false;
     TransitionExecutor ex(1024,
         [&](const TransitionRequest&, std::string*) {
-            std::this_thread::sleep_for(std::chrono::microseconds(200));
+            {
+                std::unique_lock<std::mutex> lk(m);
+                if (!fInFirst) { fInFirst = true; cv.notify_all(); }
+                // hold the FIRST transition until the test releases it
+                cv.wait(lk, [&] { return fRelease; });
+            }
             ++nCommitted;
             return true;
         },
-        [](const TransitionRequest&) {});
+        [](const TransitionRequest&, std::string*) { return true; });
     for (uint64_t i = 0; i < 200; ++i)
     {
         TransitionRequest r;
@@ -169,9 +203,65 @@ static void TestShutdownDrain()
         r.fPublish = false;
         ex.Submit(r, 1000);
     }
-    auto results = ex.Shutdown();  // must drain, not drop
-    CHECK(results.size() == 200, "queued work drained on shutdown");
-    CHECK(nCommitted == 200, "every queued request committed");
+    { std::unique_lock<std::mutex> lk(m); cv.wait(lk, [&] { return fInFirst; }); }
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));  // let the rest queue
+    std::thread releaser([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(150));
+        { std::lock_guard<std::mutex> lk(m); fRelease = true; }
+        cv.notify_all();
+    });
+    auto results = ex.Shutdown();   // cancels queued, waits for the in-flight one
+    releaser.join();
+    int nCancelled = 0, nCommittedRes = 0;
+    for (size_t i = 0; i < results.size(); ++i)
+    {
+        if (results[i].eOutcome == TR_CANCELLED_SHUTDOWN) ++nCancelled;
+        if (results[i].eOutcome == TR_COMMITTED) ++nCommittedRes;
+    }
+    CHECK(results.size() == 200, "every ticket has a definitive result");
+    CHECK(nCommittedRes == 1, "exactly the in-flight transition committed");
+    CHECK(nCancelled == 199, "all queued-but-not-started requests cancelled");
+    CHECK(nCommitted == 1, "durable commit called exactly once (no double commit)");
+    CHECK(ex.CancelledAtShutdownCount() == 199, "cancelled counter matches");
+}
+
+static void TestShutdownSubmitAndWaitNoHang()
+{
+    // A caller blocked in SubmitAndWait when shutdown starts must return with an
+    // unambiguous outcome (executed result or cancelled), never hang and never
+    // leave the caller able to re-run a transition that actually committed.
+    std::printf("T6 shutdown: SubmitAndWait returns without hanging\n");
+    TransitionExecutor ex(8,
+        [](const TransitionRequest&, std::string*) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            return true;
+        },
+        [](const TransitionRequest&, std::string*) { return true; });
+    std::atomic<int> nReturned{0};
+    std::atomic<int> nCancelledSeen{0};
+    std::atomic<int> nExecuted{0};
+    std::vector<std::thread> ts;
+    for (int i = 0; i < 6; ++i)
+    {
+        ts.emplace_back([&, i] {
+            TransitionRequest r;
+            r.nHeight = (uint64_t)i + 1; r.nParentId = (uint64_t)i; r.nSelfId = (uint64_t)i + 1;
+            TransitionResult out;
+            const bool ok = ex.SubmitAndWait(r, 5000, &out);
+            if (ok)
+            {
+                if (out.eOutcome == TR_CANCELLED_SHUTDOWN) ++nCancelledSeen;
+                else ++nExecuted;
+            }
+            ++nReturned;
+        });
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    std::thread stopper([&] { ex.Shutdown(); });
+    for (size_t i = 0; i < ts.size(); ++i) ts[i].join();
+    stopper.join();
+    CHECK(nReturned.load() == 6, "all waiters returned (no hang)");
+    CHECK(nExecuted.load() + nCancelledSeen.load() == 6, "each waiter got a definite outcome");
 }
 
 static void TestSideFallback()
@@ -194,6 +284,7 @@ static void TestSideFallback()
     TransitionRequest sib; sib.nHeight = 1; sib.nParentId = 0; sib.nSelfId = 2;
     sib.fPublish = true; sib.fSideFallback = true;
     ex.Submit(sib, 1000);
+    WaitForDrain(ex, 2);
     auto results = ex.Shutdown();
     int nSide = 0;
     for (const auto& r : results) if (r.eOutcome == TR_COMMITTED_SIDE) ++nSide;
@@ -212,6 +303,7 @@ static void TestSideFallback()
     ex2.Submit(a2, 1000);
     TransitionRequest sib2; sib2.nHeight = 1; sib2.nParentId = 0; sib2.nSelfId = 2; sib2.fPublish = true;
     ex2.Submit(sib2, 1000);
+    WaitForDrain(ex2, 2);   // T6 variant A: let the worker process both before stop
     auto r2 = ex2.Shutdown();
     int nRej = 0;
     for (const auto& r : r2) if (r.eOutcome == TR_REJECTED_DENSITY) ++nRej;
@@ -302,6 +394,8 @@ int main()
     TestConcurrentSubmitters();
     TestShutdownDrain();
     TestSideFallback();
-    TestOperatorTransition();    std::printf("\n%s failures=%d\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
+    TestOperatorTransition();
+    TestShutdownSubmitAndWaitNoHang();
+    std::printf("\n%s failures=%d\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

@@ -595,6 +595,9 @@ struct BlockPathOuterLockGuard
 };
 // Regtest-only, process-level pause at a named BPM phase (T7 SIGKILL windows).
 bool BpmFailpointPause(const char* name);
+// ADR-0024 (T6) variant A: cancel not-yet-started transitions and wait for the
+// in-flight one at node shutdown. Safe to call when the single writer was unused.
+void BpmShutdownExecutor();
 
 // S1 acceptance (TEST-ONLY, regtest-only): temporarily lower the proof-of-stake
 // target limit so a real PoS kernel is findable on a regtest fixture. Refuses to

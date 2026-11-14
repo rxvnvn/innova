@@ -17,6 +17,7 @@ const char* TransitionOutcomeName(TransitionOutcome o)
     case TR_FAILED_COMMIT: return "FAILED_COMMIT";
     case TR_FAILED_PUBLISH: return "FAILED_PUBLISH";
     case TR_INLINE_BUSY: return "INLINE_BUSY";
+    case TR_CANCELLED_SHUTDOWN: return "CANCELLED_SHUTDOWN";
     }
     return "UNKNOWN";
 }
@@ -26,7 +27,7 @@ TransitionExecutor::TransitionExecutor(size_t nMaxQueued, CommitFn commit,
     : nNextTicket_(0), nMaxQueued_(nMaxQueued), commit_(commit), publish_(publish),
       fStop_(false), fTipInitialized_(false), nDurableTipHeight_(0),
       nDurableTipId_(0), nCommitted_(0), nSideCommitted_(0), nRejected_(0),
-      nFailed_(0), nPublishFailed_(0), nSkipped_(0)
+      nFailed_(0), nPublishFailed_(0), nSkipped_(0), nCancelled_(0)
 {
     worker_ = std::thread(&TransitionExecutor::WorkerLoop, this);
 }
@@ -117,7 +118,13 @@ bool TransitionExecutor::SubmitAndWait(const TransitionRequest& reqIn,
             done_.erase(it);
             return true;
         }
-        if (fStop_)
+        // ADR-0024 (T6): during shutdown every ticket gets a definitive result -
+        // cancelled (never executed) or executed by the worker. Returning false
+        // here just because fStop_ became true would be ambiguous for a request
+        // that had already STARTED (the caller could re-run it -> double commit),
+        // so the wait continues until done_ holds this ticket. Shutdown() always
+        // populates done_ for both cases, therefore this cannot hang.
+        if (fStop_ && started_.count(req.nTicket) == 0)
             return false;
         if (cv_.wait_until(lock, deadline) == std::cv_status::timeout)
         {
@@ -128,7 +135,7 @@ bool TransitionExecutor::SubmitAndWait(const TransitionRequest& reqIn,
             if (started_.count(req.nTicket) != 0)
             {
                 cv_.wait(lock, [this, &req] {
-                    return done_.count(req.nTicket) != 0 || fStop_;
+                    return done_.count(req.nTicket) != 0;
                 });
                 std::map<uint64_t, TransitionResult>::iterator it2 =
                     done_.find(req.nTicket);
@@ -353,10 +360,33 @@ std::vector<TransitionResult> TransitionExecutor::Shutdown()
         if (fStop_)
             return results_;
         fStop_ = true;
+        // ADR-0024 (T6) variant A: everything still QUEUED has not started, so it
+        // is cancelled here - never executed, nothing committed, nothing published.
+        // Each cancelled ticket gets a definitive result so a SubmitAndWait waiter
+        // cannot hang and cannot see an ambiguous outcome. A request the worker has
+        // already popped is NOT in queue_ and therefore finishes on its own.
+        while (!queue_.empty())
+        {
+            TransitionRequest req = queue_.front();
+            queue_.pop_front();
+            TransitionResult res;
+            res.nTicket = req.nTicket;
+            res.nSelfId = req.nSelfId;
+            res.eOutcome = TR_CANCELLED_SHUTDOWN;
+            res.strDetail = "cancelled at shutdown before start (nothing committed)";
+            results_.push_back(res);
+            done_[req.nTicket] = res;
+            abandoned_.erase(req.nTicket);
+            nCancelled_.fetch_add(1);
+            printf("BPM_TRANSITION ticket=%llu height=%llu outcome=%s mode=cancel\n",
+                   (unsigned long long)req.nTicket, (unsigned long long)req.nHeight,
+                   TransitionOutcomeName(TR_CANCELLED_SHUTDOWN));
+            fflush(stdout);
+        }
     }
     cv_.notify_all();
     if (worker_.joinable())
-        worker_.join();
+        worker_.join();   // the in-flight transition finishes with its own result
     std::lock_guard<std::mutex> lock(cs_);
     return results_;
 }
