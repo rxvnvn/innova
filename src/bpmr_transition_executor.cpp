@@ -39,9 +39,32 @@ TransitionExecutor::~TransitionExecutor()
 
 void TransitionExecutor::InitDurableTip(uint64_t nHeight, uint64_t nId)
 {
+    TryInitDurableTip(nHeight, nId);
+}
+
+// [c29 C] A1/A2 guard plus an explicit verdict: a contradiction is reported, never
+// silently dropped, and never applied.
+TipBindResult TransitionExecutor::TryInitDurableTip(uint64_t nHeight, uint64_t nId)
+{
+    std::lock_guard<std::mutex> tipLock(csTip_);
+    if (fTipInitialized_.load())
+    {
+        const bool fSame = (nDurableTipHeight_.load() == nHeight &&
+                            nDurableTipId_.load() == nId);
+        if (fSame)
+            return TB_ALREADY_BOUND;
+        printf("BPM_DURABLE_TIP_BIND_CONFLICT bound_height=%llu bound_id=%016llx "
+               "requested_height=%llu requested_id=%016llx (refused, fail-closed)\n",
+               (unsigned long long)nDurableTipHeight_.load(),
+               (unsigned long long)nDurableTipId_.load(),
+               (unsigned long long)nHeight, (unsigned long long)nId);
+        fflush(stdout);
+        return TB_CONFLICT;
+    }
     nDurableTipHeight_.store(nHeight);
     nDurableTipId_.store(nId);
     fTipInitialized_.store(true);
+    return TB_BOUND;
 }
 
 bool TransitionExecutor::TrySubmit(const TransitionRequest& reqIn)
@@ -238,15 +261,24 @@ TransitionOutcome TransitionExecutor::Process(const TransitionRequest& req,
                 if (out) *out = res;
                 return res.eOutcome;
             }
-            nDurableTipHeight_.store((uint64_t)nResHeight);
-            nDurableTipId_.store(nResId);
-            fTipInitialized_.store(true);
+            {
+                // [c29 A2] a commit's tip update shares the bind mutex, so a late
+                // first bind cannot interleave between these three stores.
+                std::lock_guard<std::mutex> tipLock(csTip_);
+                nDurableTipHeight_.store((uint64_t)nResHeight);
+                nDurableTipId_.store(nResId);
+                fTipInitialized_.store(true);
+            }
         }
         else
         {
-            nDurableTipHeight_.store(req.nHeight);
-            nDurableTipId_.store(req.nSelfId);
-            fTipInitialized_.store(true);
+            {
+                // [c29 A2] see above: one mutex for every durable-tip write.
+                std::lock_guard<std::mutex> tipLock(csTip_);
+                nDurableTipHeight_.store(req.nHeight);
+                nDurableTipId_.store(req.nSelfId);
+                fTipInitialized_.store(true);
+            }
         }
         std::string perr;
         if (publish_ && !publish_(req, &perr))

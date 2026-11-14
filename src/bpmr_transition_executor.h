@@ -33,6 +33,14 @@
 namespace bpmr
 {
 
+// [c29 C] outcome of a durable-tip bind attempt.
+enum TipBindResult
+{
+    TB_BOUND = 0,          // this call established the bind
+    TB_ALREADY_BOUND = 1,  // the same (height,id) was already bound by someone else
+    TB_CONFLICT = 2        // a DIFFERENT tip is bound: caller's view is stale -> fail closed
+};
+
 struct TransitionRequest
 {
     uint64_t nHeight;
@@ -137,6 +145,9 @@ public:
 
     // Durable-tip binding (I1/I2 are checked against THIS, not against pindexBest).
     void InitDurableTip(uint64_t nHeight, uint64_t nId);
+    // [c29 C] same guard as A2, but the outcome is reported so a caller can fail
+    // closed when its own view of the durable tip contradicts the bound one.
+    TipBindResult TryInitDurableTip(uint64_t nHeight, uint64_t nId);
     bool TipInitialized() const { return fTipInitialized_.load(); }
 
     // Snapshot of committed state (what a reader may serve, I5).
@@ -155,6 +166,7 @@ private:
     void WorkerLoop();
 
     std::mutex csTransition_;   // serializes commit+publish across worker and inline
+    mutable std::mutex csTip_;  // [c29 A1] guards the durable-tip bind
 
     mutable std::mutex cs_;
     std::condition_variable cv_;
