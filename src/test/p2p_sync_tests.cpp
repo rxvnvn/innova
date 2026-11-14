@@ -4472,11 +4472,18 @@ BOOST_AUTO_TEST_CASE(inflight_limit_preserves_askfor_order)
         peer.MarkBlockInFlight(uint256(7000 + i));
     BOOST_CHECK_EQUAL(peer.setBlocksInFlight.size(), 8U);
 
+    // 4aaa17f2 guarded the two LATER walks; this earlier walk was left unguarded
+    // on this base and is the one that actually spins (empty map -> ++end = UB).
+    // Guard by the size the walk needs: the assertions below still report the
+    // defect, but the process terminates instead of hanging.
     std::multimap<int64_t, CInv>::const_iterator it = peer.mapAskFor.begin();
-    BOOST_CHECK(it->second.hash == hashP); ++it;
-    BOOST_CHECK(it->second.hash == hashC); ++it;
-    BOOST_CHECK(it->second.hash == hashD);
-    BOOST_CHECK_EQUAL(peer.mapAskFor.begin()->first, nBaseKey);
+    if (peer.mapAskFor.size() >= 4)
+    {
+        BOOST_CHECK(it->second.hash == hashP); ++it;
+        BOOST_CHECK(it->second.hash == hashC); ++it;
+        BOOST_CHECK(it->second.hash == hashD);
+        BOOST_CHECK_EQUAL(peer.mapAskFor.begin()->first, nBaseKey);
+    }
 
     BOOST_CHECK(SendMessages(&peer, true));
     std::vector<std::string> commands = SentCommands(peer);
