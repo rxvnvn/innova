@@ -159,6 +159,7 @@ public:
     uint64_t FailedCount() const { return nFailed_.load(); }
     uint64_t PublishFailedCount() const { return nPublishFailed_.load(); }
     uint64_t SkippedCount() const { return nSkipped_.load(); }
+    int AdmittedInFlight() const { return nAdmitted_; }   // diagnostics/tests
     uint64_t CancelledAtShutdownCount() const { return nCancelled_.load(); }
 
 private:
@@ -179,7 +180,13 @@ private:
     const size_t nMaxQueued_;
     CommitFn commit_;
     PublishFn publish_;
-    bool fStop_;
+    std::atomic<bool> fStop_;     // admission gate: set once, never cleared
+    // Admission accounting: an inline transition checks fStop_ and registers in
+    // the SAME critical section (csAdmit_), so Shutdown cannot close the gate
+    // between the check and the commit. Shutdown waits for nAdmitted_ == 0.
+    std::mutex csAdmit_;
+    std::condition_variable cvAdmit_;
+    int nAdmitted_ = 0;
     std::thread worker_;
 
     std::atomic<bool> fTipInitialized_;

@@ -494,6 +494,76 @@ static void TestTimeoutStartedAlwaysWaited()
     CHECK(ex.FailedCount() == 0, "no failure recorded");
 }
 
+
+static void TestAdmissionClosedAtShutdown()
+{
+    // A refused admission must be a definitive fail-closed result, never "busy"
+    // and never a commit into a store that is being closed.
+    std::printf("P0-1: admission gate closes at shutdown (inline refused)\n");
+    int nCommits = 0;
+    TransitionExecutor ex(64,
+        [&](const TransitionRequest&, std::string*) { ++nCommits; return true; },
+        [](const TransitionRequest&, std::string*) { return true; });
+    TransitionRequest r; r.nHeight = 1; r.nParentId = 0; r.nSelfId = 1; r.fPublish = false;
+    CHECK(ex.SubmitAndWait(r, 500, NULL), "first transition executes before shutdown");
+    CHECK(nCommits == 1, "one commit before shutdown");
+
+    ex.Shutdown();
+    TransitionResult out;
+    const bpmr::TransitionOutcome oc = ex.RunInline(r, &out);
+    CHECK(oc == bpmr::TR_FAILED_COMMIT, "inline after shutdown is refused (fail-closed)");
+    CHECK(nCommits == 1, "no commit after the gate closed");
+
+    bool fBusy = true;
+    const bpmr::TransitionOutcome oc2 = ex.TryRunInline(r, &out, &fBusy);
+    CHECK(oc2 == bpmr::TR_FAILED_COMMIT, "try-inline after shutdown is refused");
+    CHECK(!fBusy, "refusal is not reported as busy (no retry loop)");
+    CHECK(nCommits == 1, "still exactly one commit");
+}
+
+static void TestAdmissionRaceWithShutdown()
+{
+    // The race the owner asked about: a thread keeps trying to commit while
+    // shutdown closes the gate. Every attempt either completes inside the gate
+    // (and Shutdown waits for it) or is refused - never a commit after Shutdown
+    // returned.
+    std::printf("P0-1: no commit can start after shutdown closed the gate\n");
+    std::atomic<int> nCommits{0};
+    TransitionExecutor ex(4096,
+        [&](const TransitionRequest&, std::string*) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            ++nCommits;
+            return true;
+        },
+        [](const TransitionRequest&, std::string*) { return true; });
+
+    std::atomic<bool> fRun{true};
+    std::thread racer([&] {
+        uint64_t nSelf = 1;
+        while (fRun.load())
+        {
+            TransitionRequest r;
+            r.nHeight = nSelf; r.nParentId = nSelf - 1; r.nSelfId = nSelf;
+            r.fPublish = false;
+            TransitionResult out;
+            bool fBusy = false;
+            if (ex.TryRunInline(r, &out, &fBusy) == bpmr::TR_INLINE_BUSY)
+                std::this_thread::sleep_for(std::chrono::microseconds(200));
+            ++nSelf;
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    ex.Shutdown();
+    const int nAtShutdown = nCommits.load();
+    std::this_thread::sleep_for(std::chrono::milliseconds(120));
+    fRun.store(false);
+    racer.join();
+    CHECK(nCommits.load() == nAtShutdown,
+          "no commit after Shutdown returned");
+    CHECK(nAtShutdown > 0, "the racer really did commit before the gate closed");
+    CHECK(ex.AdmittedInFlight() == 0, "admission counter drained");
+}
+
 int main()
 {
     TestExtension();
@@ -508,6 +578,8 @@ int main()
     TestFalseMeansNeverEnqueued();
     TestTimeoutAbandonedSingleCommit();
     TestTimeoutStartedAlwaysWaited();
+    TestAdmissionClosedAtShutdown();
+    TestAdmissionRaceWithShutdown();
     std::printf("\n%s failures=%d\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;
 }

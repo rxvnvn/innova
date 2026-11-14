@@ -319,8 +319,39 @@ TransitionOutcome TransitionExecutor::RunInline(const TransitionRequest& reqIn,
 {
     TransitionRequest req = reqIn;
     req.nTicket = nNextTicket_.fetch_add(1) + 1;
-    std::lock_guard<std::mutex> lock(csTransition_);
-    const TransitionOutcome oc = Process(req, out);
+    // ADMISSION GATE (P0-1): the check and the registration happen in one
+    // critical section, so shutdown can never close the gate between "the
+    // executor is open" and the durable commit below. Once Shutdown() has set
+    // fStop_, no inline transition is admitted: it returns fail-closed instead
+    // of committing into a store that is being flushed and closed.
+    {
+        std::lock_guard<std::mutex> admit(csAdmit_);
+        if (fStop_)
+        {
+            if (out)
+            {
+                out->nTicket = req.nTicket;
+                out->nSelfId = req.nSelfId;
+                out->eOutcome = TR_FAILED_COMMIT;
+                out->strDetail = "stopped: admission closed at shutdown (inline refused)";
+            }
+            printf("BPM_TRANSITION ticket=%llu outcome=REFUSED_STOPPED mode=inline\n",
+                   (unsigned long long)req.nTicket);
+            fflush(stdout);
+            return TR_FAILED_COMMIT;
+        }
+        ++nAdmitted_;
+    }
+    TransitionOutcome oc;
+    {
+        std::lock_guard<std::mutex> lock(csTransition_);
+        oc = Process(req, out);
+    }
+    {
+        std::lock_guard<std::mutex> admit(csAdmit_);
+        --nAdmitted_;
+    }
+    cvAdmit_.notify_all();
     printf("BPM_TRANSITION ticket=%llu height=%llu self=%016llx outcome=%s mode=inline reorg=%d publish=%d\n",
            (unsigned long long)req.nTicket, (unsigned long long)req.nHeight,
            (unsigned long long)req.nSelfId, TransitionOutcomeName(oc),
@@ -333,15 +364,44 @@ TransitionOutcome TransitionExecutor::TryRunInline(const TransitionRequest& reqI
                                                    TransitionResult* out, bool* fBusy)
 {
     if (fBusy) *fBusy = false;
+    // ADMISSION GATE (P0-1), identical contract to RunInline: a refused admission
+    // is NOT reported as "busy" (the caller would retry and could then commit),
+    // it is a definitive fail-closed result.
+    {
+        std::lock_guard<std::mutex> admit(csAdmit_);
+        if (fStop_)
+        {
+            if (out)
+            {
+                out->eOutcome = TR_FAILED_COMMIT;
+                out->strDetail = "stopped: admission closed at shutdown (inline refused)";
+            }
+            printf("BPM_TRANSITION outcome=REFUSED_STOPPED mode=inline_fallback\n");
+            fflush(stdout);
+            return TR_FAILED_COMMIT;
+        }
+        ++nAdmitted_;
+    }
     std::unique_lock<std::mutex> lock(csTransition_, std::try_to_lock);
     if (!lock.owns_lock())
     {
+        {
+            std::lock_guard<std::mutex> admit(csAdmit_);
+            --nAdmitted_;
+        }
+        cvAdmit_.notify_all();
         if (fBusy) *fBusy = true;
         return TR_INLINE_BUSY;
     }
     TransitionRequest req = reqIn;
     req.nTicket = nNextTicket_.fetch_add(1) + 1;
     const TransitionOutcome oc = Process(req, out);
+    lock.unlock();
+    {
+        std::lock_guard<std::mutex> admit(csAdmit_);
+        --nAdmitted_;
+    }
+    cvAdmit_.notify_all();
     printf("BPM_TRANSITION ticket=%llu height=%llu self=%016llx outcome=%s mode=inline_fallback reorg=%d publish=%d\n",
            (unsigned long long)req.nTicket, (unsigned long long)req.nHeight,
            (unsigned long long)req.nSelfId, TransitionOutcomeName(oc),
@@ -427,6 +487,13 @@ std::vector<TransitionResult> TransitionExecutor::Shutdown()
                    TransitionOutcomeName(TR_CANCELLED_SHUTDOWN));
             fflush(stdout);
         }
+    }
+    // Admission is closed (fStop_ = true): no NEW inline transition can start.
+    // Wait for the ones already admitted so the durable store is not flushed and
+    // closed underneath a commit that had passed the gate.
+    {
+        std::unique_lock<std::mutex> admit(csAdmit_);
+        cvAdmit_.wait(admit, [this] { return nAdmitted_ == 0; });
     }
     cv_.notify_all();
     if (worker_.joinable())
