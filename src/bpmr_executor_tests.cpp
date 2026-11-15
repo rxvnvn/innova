@@ -564,6 +564,74 @@ static void TestAdmissionRaceWithShutdown()
     CHECK(ex.AdmittedInFlight() == 0, "admission counter drained");
 }
 
+
+static void TestBindRefusedAfterShutdown()
+{
+    // ADR-0030 A / TB_STOPPED: once shutdown closed admission, a first-bind must be
+    // refused and must NOT write any of the durable-tip fields. "TB_STOPPED=0 in a
+    // clean smoke run" does not prove this property - only a bind attempted AFTER
+    // shutdown does.
+    std::printf("P4 §2: first-bind after shutdown is refused, nothing written\n");
+    TransitionExecutor ex(64,
+        [](const TransitionRequest&, std::string*) { return true; },
+        [](const TransitionRequest&, std::string*) { return true; });
+
+    // bind before shutdown must still work
+    const TipBindResult r1 = ex.TryInitDurableTip(7, 0x77);
+    CHECK(r1 == TB_BOUND, "bind before shutdown is accepted");
+    CHECK(ex.TipInitialized(), "tip is initialized before shutdown");
+    CHECK(ex.DurableTipHeight() == 7, "height bound before shutdown");
+
+    ex.Shutdown();
+
+    // a DIFFERENT tip after shutdown must be refused, not applied
+    const TipBindResult r2 = ex.TryInitDurableTip(9, 0x99);
+    CHECK(r2 == TB_STOPPED, "bind after shutdown returns TB_STOPPED");
+    CHECK(ex.DurableTipHeight() == 7, "durable height unchanged by the refused bind");
+    CHECK(ex.TipInitialized(), "initialized flag unchanged (first bind still stands)");
+
+    // even the SAME tip must be refused with TB_STOPPED: the store is closing, and
+    // a "no-op" answer would tell the caller the bind was considered.
+    const TipBindResult r3 = ex.TryInitDurableTip(7, 0x77);
+    CHECK(r3 == TB_STOPPED, "same-tip bind after shutdown is also refused");
+    CHECK(ex.DurableTipHeight() == 7, "durable height still unchanged");
+}
+
+static void TestBindRacesShutdown()
+{
+    // The bind must never land after Shutdown() returned: every attempt is either
+    // accepted before the gate closes or refused with TB_STOPPED.
+    std::printf("P4 §2: bind racing shutdown cannot land after it returns\n");
+    TransitionExecutor ex(64,
+        [](const TransitionRequest&, std::string*) { return true; },
+        [](const TransitionRequest&, std::string*) { return true; });
+
+    std::atomic<bool> fRun{true};
+    std::atomic<int> nAccepted{0}, nRefused{0};
+    std::thread binder([&] {
+        uint64_t nId = 1;
+        while (fRun.load())
+        {
+            const TipBindResult r = ex.TryInitDurableTip(1, nId);
+            if (r == TB_STOPPED) ++nRefused; else ++nAccepted;
+            ++nId;
+        }
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    ex.Shutdown();
+    const uint64_t nHeightAtShutdown = ex.DurableTipHeight();
+    const bool fInitAtShutdown = ex.TipInitialized();
+    fRun.store(false);
+    binder.join();
+
+    CHECK(nAccepted >= 1, "the binder did bind before the gate closed");
+    CHECK(nRefused >= 1, "attempts after shutdown were refused");
+    CHECK(ex.DurableTipHeight() == nHeightAtShutdown,
+          "no bind landed after Shutdown returned");
+    CHECK(ex.TipInitialized() == fInitAtShutdown,
+          "initialized flag stable after Shutdown returned");
+}
+
 int main()
 {
     TestExtension();
@@ -580,6 +648,8 @@ int main()
     TestTimeoutStartedAlwaysWaited();
     TestAdmissionClosedAtShutdown();
     TestAdmissionRaceWithShutdown();
+    TestBindRefusedAfterShutdown();
+    TestBindRacesShutdown();
     std::printf("\n%s failures=%d\n", g_failures == 0 ? "PASS" : "FAIL", g_failures);
     return g_failures == 0 ? 0 : 1;
 }
