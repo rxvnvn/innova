@@ -38,7 +38,8 @@ enum TipBindResult
 {
     TB_BOUND = 0,          // this call established the bind
     TB_ALREADY_BOUND = 1,  // the same (height,id) was already bound by someone else
-    TB_CONFLICT = 2        // a DIFFERENT tip is bound: caller's view is stale -> fail closed
+    TB_CONFLICT = 2,       // a DIFFERENT tip is bound: caller's view is stale -> fail closed
+    TB_STOPPED = 3         // executor shut down: binding is refused (nothing may be written)
 };
 
 struct TransitionRequest
@@ -147,6 +148,8 @@ public:
     void InitDurableTip(uint64_t nHeight, uint64_t nId);
     // [c29 C] same guard as A2, but the outcome is reported so a caller can fail
     // closed when its own view of the durable tip contradicts the bound one.
+    // ADR-0030 A: TB_STOPPED means the executor has been shut down, so no new
+    // authoritative state may be bound at all (the store is being closed).
     TipBindResult TryInitDurableTip(uint64_t nHeight, uint64_t nId);
     bool TipInitialized() const { return fTipInitialized_.load(); }
 

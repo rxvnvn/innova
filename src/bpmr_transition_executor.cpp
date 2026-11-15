@@ -47,6 +47,17 @@ void TransitionExecutor::InitDurableTip(uint64_t nHeight, uint64_t nId)
 TipBindResult TransitionExecutor::TryInitDurableTip(uint64_t nHeight, uint64_t nId)
 {
     std::lock_guard<std::mutex> tipLock(csTip_);
+    // ADR-0030 A: after shutdown the durable store is flushed and closed, so a
+    // late first-bind must not write anything. Refused, never applied.
+    if (fStop_)
+    {
+        printf("BPM_DURABLE_TIP_BIND %s height=%llu requested_height=%llu "
+               "(refused: admission closed at shutdown)\n",
+               "TB_STOPPED", (unsigned long long)nDurableTipHeight_.load(),
+               (unsigned long long)nHeight);
+        fflush(stdout);
+        return TB_STOPPED;
+    }
     if (fTipInitialized_.load())
     {
         const bool fSame = (nDurableTipHeight_.load() == nHeight &&
