@@ -1137,8 +1137,15 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
                 bool fCheckMempool = GetTime() - nStart >= 5;
                 // BPMR-FIX1: cheap generation early-exit - a tip change makes this
                 // grind obsolete immediately, without a cs_main identity capture.
-                if (GetMiningTipGeneration() != nTipGenAtPrep)
+                const uint64_t nTipGenNow = GetMiningTipGeneration();
+                if (nTipGenNow != nTipGenAtPrep)
                 {
+                    printf("CPUMiner[%u]: STALE_WORK gen_attempt=%llu gen_now=%llu "
+                           "height=%d best=%s nonce=%u (template discarded, not published)\n",
+                           nWorkerId, (unsigned long long)nTipGenAtPrep,
+                           (unsigned long long)nTipGenNow, workIdentity.nHeight,
+                           workIdentity.hashBestChain.ToString().c_str(), pblock->nNonce);
+                    fflush(stdout);
                     controller.NotePaused(nWorkerId, CCPUMinerController::PAUSE_WORK_REBUILD);
                     break;
                 }
@@ -1159,8 +1166,19 @@ void RunCPUMinerWorker(CCPUMinerController& controller, CWallet* pwallet,
             // BPMR-FIX1: staleness is re-checked IMMEDIATELY before acceptance, not
             // only when the attempt started. Generation first (cheap), then the
             // by-value identity (authoritative). Both must agree with the tip.
+            const uint64_t nTipGenAtAccept = GetMiningTipGeneration();
+            const bool fGenOk = (nTipGenAtAccept == nTipGenAtPrep);
+            if (!fGenOk)
+            {
+                printf("CPUMiner[%u]: STALE_ACCEPT_REFUSED gen_attempt=%llu gen_now=%llu "
+                       "height=%d nonce=%u (solved block NOT published)\n",
+                       nWorkerId, (unsigned long long)nTipGenAtPrep,
+                       (unsigned long long)nTipGenAtAccept, workIdentity.nHeight,
+                       pblock->nNonce);
+                fflush(stdout);
+            }
             if (!controller.ShouldStop(nSessionId) &&
-                GetMiningTipGeneration() == nTipGenAtPrep &&
+                fGenOk &&
                 IsCPUMiningWorkCurrent(workIdentity, false) &&
                 IsCPUMiningCollateralStateReady())
             {
