@@ -47,10 +47,20 @@ public:
     // Build the by-value candidate frontier store from a selected generation's
     // reader + derived store. `reader`/`derived` must be open and generation-
     // coherent (A.10.1i bootstrap style).
+    //
+    // BOOT-004: `projection` is the ONE-SHOT hand-over of what the reader's
+    // open-time integrity scans observed. It is consumed (moved) HERE and only
+    // here: the immutable-generation projection can never leak into the mutable
+    // tip lifecycle because this is its single consumer. An incomplete or
+    // generation-mismatched projection is not an error - it degrades to the
+    // per-hash lookup path below, which reads the same sealed bytes and fails
+    // closed exactly as before.
+    //
     // On success fills `store` (existing concrete by-value frontier store) and
     // returns true. Fails closed on any read/corruption/generation error; never
     // falls back to legacy RebuildCandidateTips.
     bool Build(const BlockIndexV2Reader& reader,
+               BlockIndexScanProjection projection,
                const BlockIndexDerivedStateStore& derived,
                SnapshotCandidateFrontierStore* store,
                std::string* error) const;

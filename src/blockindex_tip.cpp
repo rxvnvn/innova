@@ -62,6 +62,26 @@ void BlockIndexCutTrace(const char* fmt, ...)
 }
 // ---------------------------------------------------------------------------
 
+// ---- lab/boot004-durable-tip-20261116: tip-lifecycle trace (-boot004trace) --
+// Diagnostic only. Every call site is a single cached bool test when off; the
+// trace answers "did this process create/append/commit a durable tip, and what
+// did the next open read back" without changing any behaviour.
+bool Boot004TipTraceEnabled()
+{
+    static const bool enabled = GetBoolArg("-boot004trace", false);
+    return enabled;
+}
+void Boot004TipTrace(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    fputc('\n', stdout);
+    fflush(stdout);
+}
+// ---------------------------------------------------------------------------
+
 namespace {
 
 // IFCN#9 PHASE 1: durable hash->id resolution counter (diagnostic only).
@@ -1909,6 +1929,11 @@ bool BlockIndexTipAuthority::Create(const std::string& root,
         return false;
     i->open = true;
     cleanup.committed = true;
+    if (Boot004TipTraceEnabled())
+        Boot004TipTrace("BOOT004_TIP create root=%s gen=%llu baseRecordCount=%llu baseTipHeight=%d tipHeight=%d tipRecordCount=%llu",
+                        root.c_str(), (unsigned long long)baseGeneration,
+                        (unsigned long long)baseRecordCount, (int)baseTipHeight,
+                        (int)i->meta.tipHeight, (unsigned long long)i->meta.tipRecordCount);
     ClearError(error);
     return true;
 }
@@ -1958,7 +1983,15 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
     if (!DecodeTipMeta(metadat.data(), metadat.size(), &meta))
         return SetError(error, "decode tip.meta failed");
     if (meta.baseGeneration != expectedBaseGeneration)
+    {
+        if (Boot004TipTraceEnabled())
+            Boot004TipTrace("BOOT004_TIP open_generation_mismatch root=%s expected_gen=%llu meta_gen=%llu meta_baseRecordCount=%llu meta_baseTipHeight=%d meta_tipHeight=%d meta_tipRecordCount=%llu",
+                            root.c_str(), (unsigned long long)expectedBaseGeneration,
+                            (unsigned long long)meta.baseGeneration,
+                            (unsigned long long)meta.baseRecordCount, (int)meta.baseTipHeight,
+                            (int)meta.tipHeight, (unsigned long long)meta.tipRecordCount);
         return SetError(error, "tip.meta base-generation mismatch");
+    }
     i->meta = meta;
 
     // 2-5 (Repair #3): reconcile the committed stores WITHOUT materializing
@@ -2245,6 +2278,12 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
         i->invalidDiskDurable = false;
     i->open = true;
     cleanup.committed = true;
+    if (Boot004TipTraceEnabled())
+        Boot004TipTrace("BOOT004_TIP open_ok root=%s gen=%llu baseRecordCount=%llu baseTipHeight=%d tipHeight=%d tipRecordCount=%llu fence=%u",
+                        root.c_str(), (unsigned long long)meta.baseGeneration,
+                        (unsigned long long)meta.baseRecordCount, (int)meta.baseTipHeight,
+                        (int)meta.tipHeight, (unsigned long long)meta.tipRecordCount,
+                        (unsigned)meta.activeFence);
     // C11: publish the initial committed-tip snapshot from the committed meta so
     // the boot->first-append window never reports spurious unavailability.
     i->PublishCommittedSnapshot();
@@ -2394,6 +2433,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
         return SetError(error, "tip not open"), BLOCK_INDEX_TIP_IO_ERROR;
     if (blocks.size() != activeHeights.size())
         return SetError(error, "append batch size mismatch"), BLOCK_INDEX_TIP_CORRUPT;
+    if (Boot004TipTraceEnabled())
+        Boot004TipTrace("BOOT004_TIP append_batch blocks=%zu firstActiveH=%d open=%d committedTip=%d committedRecs=%llu",
+                        blocks.size(), activeHeights.empty() ? -1 : (int)activeHeights[0],
+                        (int)impl->open, (int)impl->meta.tipHeight,
+                        (unsigned long long)impl->meta.tipRecordCount);
 
     Impl* i = impl;
     std::vector<BlockIndexRecord> newRecords;
@@ -2668,6 +2712,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::AppendBatch(
                            (unsigned long long)i->meta.tipRecordCount,
                            i->meta.tipHeight, i->meta.tipHash.ToString().substr(0,16).c_str(),
                            (unsigned)i->meta.activeFence);
+    if (Boot004TipTraceEnabled())
+        Boot004TipTrace("BOOT004_TIP append_committed tipHeight=%d tipRecordCount=%llu fence=%u tipHash=%s",
+                        (int)i->meta.tipHeight, (unsigned long long)i->meta.tipRecordCount,
+                        (unsigned)i->meta.activeFence,
+                        i->meta.tipHash.ToString().substr(0, 16).c_str());
     ClearError(error);
     return BLOCK_INDEX_TIP_OK;
 }
@@ -4358,6 +4407,11 @@ BlockIndexTipStatus BlockIndexTipAuthority::SetOperatorInvalid(const uint256& ha
 void BlockIndexTipAuthority::Close()
 {
     LOCK(impl->csTailLock);  // ADR-0026 B: состояние окна/меты — только под внешним мьютексом
+    if (Boot004TipTraceEnabled())
+        Boot004TipTrace("BOOT004_TIP close open=%d tipHeight=%d tipRecordCount=%llu pending=%d",
+                        (int)impl->open, (int)impl->meta.tipHeight,
+                        (unsigned long long)impl->meta.tipRecordCount,
+                        (int)impl->HasPending());
     // IFCN#9 perf: publish a residual IBD window before closing. Best effort by
     // design: if it fails, the durable state stays at the last committed batch
     // and the missing blocks are re-fetched on the next start (they are already

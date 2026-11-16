@@ -126,6 +126,27 @@ boot)
   if [ "$LEAF_SRC" != "integrity_scan" ] && [ "$ALLOW_FALLBACK" -eq 0 ]; then
     fail BOOT-004 "candidate frontier built by '$LEAF_SRC' (random per-leaf I/O)"
   fi
+  # BOOT-004 install marker: the filter must be INSTALLED (production default).
+  # install=0 with the fallback path disabled by policy is a silent performance
+  # regression, so it fails here even if the leaf line still says integrity_scan
+  # on some other generation.
+  grep -q "BLOCKINDEX_BOOT004 install=1 " "$LOG" || fail BOOT-004 "filter not installed (BLOCKINDEX_BOOT004 install=1 absent)"
+
+  # ---- DURABLE-TIP: a datadir that carries post-S authority must publish it.
+  # The gate line is emitted on every authoritative startup; a published best
+  # height BELOW the durable tip is the "came back at height 0" failure and is
+  # already fail-closed in-process, so seeing the marker with a lower published
+  # height here means the invariant is not armed at all.
+  DTG=$(grep "BLOCKINDEX_V2_DURABLE_TIP_GATE " "$LOG" | tail -1)
+  if [ -z "$DTG" ]; then
+    fail DURABLE-TIP "startup durable-tip gate marker absent"
+  else
+    DTH=$(echo "$DTG" | sed -n 's/.*durable_tip_height=\(-\{0,1\}[0-9]*\).*/\1/p')
+    PBH=$(echo "$DTG" | sed -n 's/.*published_best_height=\(-\{0,1\}[0-9]*\).*/\1/p')
+    if [ -n "$DTH" ] && [ -n "$PBH" ] && [ "$PBH" -lt "$DTH" ]; then
+      fail DURABLE-TIP "published best height $PBH is below the durable tip $DTH"
+    fi
+  fi
 
   # ---- MEM-003: a healthy datadir must not enter the emergency rebuild at all;
   # on a rebuild scenario the rebuild must be the ON-DISK bounded one.

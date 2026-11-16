@@ -10686,6 +10686,22 @@ bool CBlock::AddToBlockIndex(unsigned int nFile, unsigned int nBlockPos, const u
                 return error("AddToBlockIndex() : V2 authoritative persist failed at height %d: %s",
                              pindexNew->nHeight, perr.c_str());
             }
+            // DURABLE-TIP ADVANCE GATE (lab/boot004-durable-tip-20261116): a block
+            // that BECAME the best chain at height H must be durable in the mutable
+            // tip at H. A publication that silently degrades to a no-op lets the node
+            // accept blocks that vanish at the next restart - the "mined N blocks,
+            // came back at height 0" failure. Fail the transition instead of
+            // reporting a durable success that does not exist.
+            if (becameBest)
+            {
+                const BlockIndexTipAuthority* tipGate = live->TipAuthority();
+                const int32_t tipNow = tipGate ? tipGate->TipHeight() : -1;
+                if (tipGate == NULL || tipNow < (int32_t)pindexNew->nHeight)
+                {
+                    return error("AddToBlockIndex() : durable tip did not advance to the accepted best block at height %d (tip=%d) - fail closed instead of accepting non-durable authority",
+                                 (int)pindexNew->nHeight, (int)tipNow);
+                }
+            }
             // MS-ANCHOR: when this acceptance crossed an independently anchored
             // height, compare the persisted accumulator against the anchor. A
             // disagreement means the value that was just persisted (and every

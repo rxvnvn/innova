@@ -5,6 +5,7 @@
 #define INNOVA_BLOCKINDEX_STARTUP_AUTHORITY_H
 
 #include "blockindex_navigation.h"
+#include "blockindex_v2_reader.h" // BOOT-004: BlockIndexScanProjection (by value)
 
 #include <stdint.h>
 
@@ -210,6 +211,13 @@ public:
     // LevelDB LOCK and break generation coherence). Returns NULL when not open.
     const BlockIndexV2Reader* ReaderPtr() const;
     const BlockIndexDerivedStateStore* DerivedStorePtr() const;
+
+    // BOOT-004: the ONE-SHOT projection of the open-time scans (see
+    // BlockIndexScanProjection). Returns an empty projection when not open or
+    // when the projection was already taken; the candidate builder is its only
+    // consumer, and after this call the reader can no longer serve it, so the
+    // immutable-generation projection cannot reach the mutable tip lifecycle.
+    BlockIndexScanProjection TakeScanProjection();
 
     // A.10.1q / Stage1: move the internally-opened generation-bound reader out
     // (transferring its LevelDB hashindex/active/store handles) so a consumer

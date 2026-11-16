@@ -90,23 +90,58 @@ BlockIndexStartupStatus V2BlockIndexStartupAuthority::Open(const std::string& ro
         return BLOCK_INDEX_STARTUP_NOT_AUTHORITATIVE_CAPABLE;
     }
 
-    // BOOT-004 (NOT ENABLED - see ENGINEERING_INVARIANTS.md BOOT-004 status and
-    // STARTUP_FINAL_ACCEPTANCE.md): feeding the candidate-leaf set into the
-    // open-time scans removes 209.9 s + 39.2 s of per-leaf random I/O and was
-    // measured end-to-end on the 8.24M stand (259.3 s -> 41.3 s, identical
-    // frontier). It is DISABLED because the tier2 stand proved a durable-tip
-    // regression that only appears with the filter installed: a fresh native
-    // datadir (EMPTY_NEW -> mine 31 blocks -> restart) comes back at height 0
-    // instead of 31 (mutable tip store read as empty), while the same stand with
-    // this block removed passes restart/reorg(1,20)/restart-again. The scan-side
-    // plumbing (BlockIndexV2ReaderOptions::scanFilterHashes,
-    // collectDerivedForScanMatches) and the builder's fast path stay in the tree
-    // INERT and unreachable from production until that is root-caused; the
-    // builder logs leaf_source=hash_lookup, which the gate rejects, so this
-    // cannot silently become the production path.
+    // BOOT-004 (ENABLED 2026-11-16, lab/boot004-durable-tip-20261116): the
+    // candidate frontier is a static, generation-bound leaf set whose records
+    // and derived entries are ALREADY decoded by the two integrity scans this
+    // open performs. Feeding the leaf set into those scans removes the per-leaf
+    // hashindex+records+derived probes measured at 93 746 + 31 023 read syscalls
+    // and 209.9 s + 39.2 s on a cold 8.24M generation (259.3 s -> 41.3 s to RPC,
+    // identical frontier of 30 633 tips).
     //
+    // Scope discipline (this is what makes the optimisation safe):
+    //   * the filter only ADDS a projection to scans that already run; it does
+    //     not add, move or skip a single integrity check, and a corrupt record
+    //     still fails the open at the same point (fail-closed);
+    //   * the projection is handed to the candidate builder ONLY, via the
+    //     one-shot TakeScanProjection(), so the immutable-generation projection
+    //     is unreachable from the mutable tip lifecycle (open/append/recovery);
+    //   * candidate-leaves.dat present-but-unreadable is fail-closed; absent
+    //     (legacy/shadow generation) means no filter and the documented
+    //     per-hash fallback, never an empty frontier.
+    // -boot004filter=0 is the emergency/bisection opt-out (it changes NOTHING
+    // else: the reader then runs exactly the pre-BOOT-004 call).
+    BlockIndexV2ReaderOptions effectiveOptions = readerOptions;
+    {
+        const bool filterRequested = GetBoolArg("-boot004filter", true);
+        std::vector<uint256> leaves;
+        std::string leafError;
+        bool leavesRead = false;
+        if (filterRequested)
+            leavesRead = ReadCandidateLeafMetadata(genDir, current.generation, &leaves, &leafError);
+        if (filterRequested && !leavesRead && !leafError.empty())
+        {
+            // present-but-unreadable frontier metadata: fail closed (never a
+            // silent fallback to per-leaf probing on a generation that declares
+            // a frontier it cannot deliver).
+            if (error) *error = "candidate-leaves.dat present but unreadable: " + leafError;
+            return BLOCK_INDEX_STARTUP_CORRUPT;
+        }
+        if (filterRequested && !leaves.empty())
+        {
+            effectiveOptions.scanFilterHashes = leaves;
+            effectiveOptions.collectDerivedForScanMatches = true;
+        }
+        // Execution evidence (not a claim): which generation, whether a filter
+        // was installed and how many leaves it carries. The acceptance gate
+        // requires leaf_source=integrity_scan from the frontier line itself.
+        printf("BLOCKINDEX_BOOT004 install=%d generation=%llu leaves=%zu source=%s\n",
+               (filterRequested && !leaves.empty()) ? 1 : 0,
+               (unsigned long long)current.generation, leaves.size(),
+               !filterRequested ? "disabled" : (leavesRead ? "metadata" : "absent"));
+        fflush(stdout);
+    }
     // Open the V2 reader (reader expects root containing CURRENT, not genDir)
-    if (!impl->reader.Open(root, readerOptions, error))
+    if (!impl->reader.Open(root, effectiveOptions, error))
         return BLOCK_INDEX_STARTUP_IO_ERROR;
 
     // Open derived.dat
@@ -175,6 +210,13 @@ BlockIndexV2Reader V2BlockIndexStartupAuthority::ExtractReader()
 const BlockIndexDerivedStateStore* V2BlockIndexStartupAuthority::DerivedStorePtr() const
 {
     return (impl && impl->open) ? &impl->derivedStore : NULL;
+}
+
+BlockIndexScanProjection V2BlockIndexStartupAuthority::TakeScanProjection()
+{
+    if (!impl || !impl->open)
+        return BlockIndexScanProjection();
+    return impl->reader.TakeScanProjection();
 }
 
 BlockIndexStartupAuthorityIdentity V2BlockIndexStartupAuthority::Identity() const

@@ -95,6 +95,10 @@ public:
     const BlockIndexV2Reader* ReaderPtr() const { return authority_.ReaderPtr(); }
     const BlockIndexDerivedStateStore* DerivedStorePtr() const { return authority_.DerivedStorePtr(); }
     const V2BlockIndexStartupAuthority& Authority() const { return authority_; }
+    // BOOT-004: one-shot hand-over of the open-time scan projection (see
+    // V2BlockIndexStartupAuthority::TakeScanProjection). Consumed by the
+    // candidate-frontier build and by nothing else.
+    BlockIndexScanProjection TakeScanProjection() { return authority_.TakeScanProjection(); }
     // A.10.1q / Stage1: move the authority's generation-bound V2 reader out so a
     // downstream consumer (the authoritative navigator) reuses the SAME single
     // open LevelDB handle. After this the bootstrap authority no longer owns a

@@ -24,6 +24,7 @@ BlockIndexCandidateStartupBuilder::BlockIndexCandidateStartupBuilder()
 }
 
 bool BlockIndexCandidateStartupBuilder::Build(const BlockIndexV2Reader& reader,
+                                              BlockIndexScanProjection projection,
                                               const BlockIndexDerivedStateStore& derived,
                                               SnapshotCandidateFrontierStore* store,
                                               std::string* error) const
@@ -67,8 +68,9 @@ bool BlockIndexCandidateStartupBuilder::Build(const BlockIndexV2Reader& reader,
 
         // BOOT-004: the reader's open-time integrity scans already decode EVERY
         // record and EVERY derived entry of this generation. When they collected
-        // exactly this leaf set, the frontier is assembled from those in-memory
-        // projections and the builder performs NO random I/O.
+        // exactly this leaf set, the frontier is assembled from those projections
+        // and the builder performs NO random I/O. `projection` was handed over by
+        // the reader (one-shot) and is consumed here.
         //
         // The previously used per-leaf probes cost 3.06 read syscalls and
         // 6.85 ms per leaf on a cold 8.24M generation (measured: 93 746
@@ -81,11 +83,12 @@ bool BlockIndexCandidateStartupBuilder::Build(const BlockIndexV2Reader& reader,
         // derived data). Both paths produce the same store: results are placed
         // at their ORIGINAL leaf index, so the frontier order and content are
         // independent of RecordId ordering and of which path ran.
-        const std::vector<BlockIndexScanRecordMatch>& recMatches = reader.ScanRecordMatches();
-        const std::vector<BlockIndexScanDerivedMatch>& derMatches = reader.ScanDerivedMatches();
-        bool usedScan = reader.IntegrityScanRanOnOpen() &&
-                        recMatches.size() == leafCount &&
-                        derMatches.size() == leafCount;
+        // A projection that does not EXACTLY answer this leaf set of THIS
+        // generation is not usable: fall back to lookups (never treat an absent
+        // projection as an empty frontier).
+        const bool usedScan = projection.Complete(leafCount, reader.Generation());
+        const std::vector<BlockIndexScanRecordMatch>& recMatches = projection.records;
+        const std::vector<BlockIndexScanDerivedMatch>& derMatches = projection.derived;
 
         if (usedScan)
         {

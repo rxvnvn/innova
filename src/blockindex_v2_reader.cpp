@@ -12,13 +12,13 @@ static bool Fail(std::string* error, const std::string& text) { if (error) *erro
 static void Clear(std::string* error) { if (error) error->clear(); }
 }
 
-BlockIndexV2Reader::BlockIndexV2Reader() : open(false), generation(0), cacheCapacity(0), hasRebuiltDerived(false), integrityScanRanOnOpen(false) {}
+BlockIndexV2Reader::BlockIndexV2Reader() : open(false), generation(0), scanRequestedLeaves(0), cacheCapacity(0), hasRebuiltDerived(false), integrityScanRanOnOpen(false) {}
 BlockIndexV2Reader::~BlockIndexV2Reader() { Close(); }
 
 // Move constructor: transfer open LevelDB handles (store/active/hashIndex),
 // generation state, and the bounded LRU cache; leave the source closed.
 BlockIndexV2Reader::BlockIndexV2Reader(BlockIndexV2Reader&& other) noexcept
-    : open(false), generation(0), cacheCapacity(0), hasRebuiltDerived(false), integrityScanRanOnOpen(false)
+    : open(false), generation(0), scanRequestedLeaves(0), cacheCapacity(0), hasRebuiltDerived(false), integrityScanRanOnOpen(false)
 {
     *this = std::move(other);
 }
@@ -40,6 +40,8 @@ BlockIndexV2Reader& BlockIndexV2Reader::operator=(BlockIndexV2Reader&& other) no
         other.integrityScanRanOnOpen = false;
         scanRecordMatches = std::move(other.scanRecordMatches);
         scanDerivedMatches = std::move(other.scanDerivedMatches);
+        scanRequestedLeaves = other.scanRequestedLeaves;
+        other.scanRequestedLeaves = 0;
         other.scanRecordMatches.clear();
         other.scanDerivedMatches.clear();
         rebuiltDerived = other.rebuiltDerived;
@@ -362,10 +364,11 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
     // BOOT-004: publish the scan-side projections with the open.
     scanRecordMatches.swap(nextScanMatches);
     scanDerivedMatches.swap(nextDerivedMatches);
+    scanRequestedLeaves = options.scanFilterHashes.size();
     cacheCapacity = options.cacheCapacityBytes; cache.clear(); lru.clear(); stats = BlockIndexV2ReaderCacheStats(); stats.capacityBytes = cacheCapacity; open = true;
     Clear(error); return true;
 }
-void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockIndexDerivedStateStore(); integrityScanRanOnOpen = false; scanRecordMatches.clear(); scanDerivedMatches.clear(); hasRebuiltDerived = false; rebuiltDerived = BlockIndexDerivedStateStore(); if (!derivedRebuildDir.empty()) { boost::system::error_code rmEc; boost::filesystem::remove_all(derivedRebuildDir, rmEc); derivedRebuildDir.clear(); } blockDataDirForRebuild.clear(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
+void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockIndexDerivedStateStore(); integrityScanRanOnOpen = false; scanRecordMatches.clear(); scanDerivedMatches.clear(); scanRequestedLeaves = 0; hasRebuiltDerived = false; rebuiltDerived = BlockIndexDerivedStateStore(); if (!derivedRebuildDir.empty()) { boost::system::error_code rmEc; boost::filesystem::remove_all(derivedRebuildDir, rmEc); derivedRebuildDir.clear(); } blockDataDirForRebuild.clear(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
 bool BlockIndexV2Reader::IsOpen() const { LOCK(cs); return open; }
 uint64_t BlockIndexV2Reader::Generation() const { LOCK(cs); return generation; }
 uint64_t BlockIndexV2Reader::RecordCount() const { LOCK(cs); return open ? manifest.recordCount : 0; }
@@ -383,8 +386,20 @@ bool BlockIndexV2Reader::GetGenerationInputDigest(unsigned char out[32], std::st
 }
 
 bool BlockIndexV2Reader::IntegrityScanRanOnOpen() const { LOCK(cs); return integrityScanRanOnOpen; }
-const std::vector<BlockIndexScanRecordMatch>& BlockIndexV2Reader::ScanRecordMatches() const { return scanRecordMatches; }
-const std::vector<BlockIndexScanDerivedMatch>& BlockIndexV2Reader::ScanDerivedMatches() const { return scanDerivedMatches; }
+BlockIndexScanProjection BlockIndexV2Reader::TakeScanProjection()
+{
+    BlockIndexScanProjection out;
+    LOCK(cs);
+    // One-shot: the projection is handed over, never served twice. Anything the
+    // caller does not take here is dropped with the reader.
+    out.generation = generation;
+    out.requestedLeaves = scanRequestedLeaves;
+    out.scanRan = integrityScanRanOnOpen;
+    out.records.swap(scanRecordMatches);
+    out.derived.swap(scanDerivedMatches);
+    scanRequestedLeaves = 0;
+    return out;
+}
 bool BlockIndexV2Reader::ForEachRecordSequential(
     const std::function<bool(BlockIndexId, const BlockIndexRecord&)>& visit, std::string* error) const {
     LOCK(cs);

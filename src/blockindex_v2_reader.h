@@ -73,6 +73,43 @@ struct BlockIndexScanRecordMatch
 
 typedef BlockIndexDerivedScanMatch BlockIndexScanDerivedMatch;
 
+// BOOT-004: ONE-SHOT ownership hand-over of what an open's scans observed for a
+// requested frontier.
+//
+// Why a hand-over instead of accessors: the projection belongs to the IMMUTABLE
+// GENERATION (a sealed byte image), and the only legitimate consumer is the
+// candidate-frontier build that runs immediately after the open. Keeping the
+// data inside the reader (as readable accessors) leaves it reachable for the
+// whole process lifetime, which is how a performance projection can quietly
+// become a second input to the MUTABLE TIP lifecycle (open/append/recovery).
+// TakeScanProjection() moves the vectors OUT and leaves the reader empty, so
+// any later consumer -- the navigator's cold reader, the live authority, the
+// tip store -- sees nothing and cannot depend on scan state by accident.
+//
+// The projection is NOT authority: it is a cache of bytes the open already
+// validated. `Complete(leafCount)` states whether it can serve a frontier of
+// that size; when it cannot, the builder MUST fall back to per-hash lookups
+// (honest, slower) instead of treating absence as emptiness.
+struct BlockIndexScanProjection
+{
+    uint64_t generation;    // generation the scan ran on (identity binding)
+    size_t requestedLeaves; // size of options.scanFilterHashes at open time
+    bool scanRan;           // the full per-record integrity scan actually ran
+    std::vector<BlockIndexScanRecordMatch> records;
+    std::vector<BlockIndexScanDerivedMatch> derived;
+
+    BlockIndexScanProjection() : generation(0), requestedLeaves(0), scanRan(false) {}
+
+    // True only when this projection can answer a frontier of exactly
+    // `leafCount` entries from the generation `expectedGeneration`.
+    bool Complete(size_t leafCount, uint64_t expectedGeneration) const
+    {
+        return scanRan && generation == expectedGeneration &&
+               requestedLeaves == leafCount &&
+               records.size() == leafCount && derived.size() == leafCount;
+    }
+};
+
 struct BlockIndexV2ReaderOptions
 {
     uint64_t cacheCapacityBytes;
@@ -125,15 +162,11 @@ public:
     // state only when this is true; otherwise they must re-derive it.
     bool IntegrityScanRanOnOpen() const;
 
-    // BOOT-004: bounded collections produced by THIS open's integrity scans for
-    // options.scanFilterHashes. Empty when no filter was requested or the
-    // verify-once memo short-circuited the scan; callers MUST check
-    // IntegrityScanRanOnOpen() and a complete count before using them, and fall
-    // back to per-hash lookups otherwise. Written only during Open (before
-    // `open` is published), never mutated afterwards, so reading them from the
-    // thread that owns the opened reader needs no lock.
-    const std::vector<BlockIndexScanRecordMatch>& ScanRecordMatches() const;
-    const std::vector<BlockIndexScanDerivedMatch>& ScanDerivedMatches() const;
+    // BOOT-004: moves this open's scan projection OUT of the reader (one-shot;
+    // the reader keeps nothing afterwards). Callers MUST check
+    // projection.Complete(leafCount, reader.Generation()) before using it and
+    // fall back to per-hash lookups otherwise.
+    BlockIndexScanProjection TakeScanProjection();
     BlockIndexV2ReadStatus GetRecordById(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus LookupByHash(const uint256& hash, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetActiveByHeight(int height, BlockIndexSnapshot* out, std::string* error) const;
@@ -159,8 +192,10 @@ private:
     uint64_t generation;
     FixedBlockIndexManifest manifest;
     // BOOT-004: results of the open-time scans for options.scanFilterHashes.
+    // Cleared by TakeScanProjection(); the reader never serves them twice.
     std::vector<BlockIndexScanRecordMatch> scanRecordMatches;
     std::vector<BlockIndexScanDerivedMatch> scanDerivedMatches;
+    size_t scanRequestedLeaves;
     FixedBlockIndexStore store;
     BlockIndexActiveIndex active;
     BlockIndexHashIndex hashIndex;

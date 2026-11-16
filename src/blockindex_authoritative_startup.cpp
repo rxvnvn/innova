@@ -369,7 +369,12 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         SnapshotCandidateFrontierStore store;
         BlockIndexCandidateStartupBuilder cb;
         std::string cberr;
+        // BOOT-004: take the ONE-SHOT projection here. It is consumed by this
+        // build and exists nowhere afterwards, so nothing downstream (navigator,
+        // live authority, mutable tip) can read scan state.
+        BlockIndexScanProjection projection = ctx->bootstrap.TakeScanProjection();
         if (!cb.Build(*ctx->bootstrap.ReaderPtr(),
+                      std::move(projection),
                       *ctx->bootstrap.DerivedStorePtr(),
                       &store, &cberr))
         {
@@ -482,6 +487,32 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
             printf("BLOCKINDEX_V2_AUTHORITATIVE best_tip=post_s height=%d hash=%s base_tip=%d\n",
                    nBestHeight, hashBestChain.ToString().substr(0, 20).c_str(), (int)baseTipHeight);
             fflush(stdout);
+        }
+    }
+
+    // DURABLE-TIP GATE (lab/boot004-durable-tip-20261116): a datadir that was
+    // cleanly shut down with a committed mutable tip MUST come back at that
+    // height. If the tip authority holds post-S authority (committed height above
+    // the immutable base tip S) and the process best tip is BELOW it, the node is
+    // about to run on a silently truncated chain while durable blocks sit on
+    // disk. That is a durability contract violation, not a recoverable state:
+    // fail closed, never publish a lower best tip.
+    {
+        const BlockIndexTipAuthority* tipGate = ctx->live ? ctx->live->TipAuthority() : NULL;
+        const int32_t durableTip = tipGate ? tipGate->TipHeight() : -1;
+        const int32_t baseTip = ctx->bootstrap.BestTipObject()
+                                    ? (int32_t)ctx->bootstrap.BestTipObject()->nHeight : -1;
+        const int32_t published = (int32_t)nBestHeight;
+        printf("BLOCKINDEX_V2_DURABLE_TIP_GATE durable_tip_height=%d base_tip_height=%d published_best_height=%d\n",
+               (int)durableTip, (int)baseTip, (int)published);
+        fflush(stdout);
+        if (durableTip > baseTip && published < durableTip)
+        {
+            if (error) *error = "authoritative startup: durable tip regression - committed tip height " +
+                                std::to_string((int)durableTip) + " is above the immutable base " +
+                                std::to_string((int)baseTip) + " but the process best tip is only " +
+                                std::to_string((int)published);
+            return false;
         }
     }
 

@@ -2,6 +2,10 @@
 // Distributed under the MIT/X11 software license.
 
 #include "blockindex_live_acceptance.h"
+#include "util.h"
+
+#include <cstdarg>
+#include <cstdio>
 
 namespace {
 static bool SetError(std::string* error, const std::string& message)
@@ -9,6 +13,21 @@ static bool SetError(std::string* error, const std::string& message)
     if (error)
         *error = message;
     return false;
+}
+// lab/boot004-durable-tip-20261116: acceptance-path trace (-boot004trace).
+static bool Boot004AccTraceEnabled()
+{
+    static const bool enabled = GetBoolArg("-boot004trace", false);
+    return enabled;
+}
+static void Boot004AccTrace(const char* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    vfprintf(stdout, fmt, ap);
+    va_end(ap);
+    fputc('\n', stdout);
+    fflush(stdout);
 }
 } // namespace
 
@@ -100,7 +119,16 @@ int BlockIndexLiveAcceptance::AcceptActive(const BlockIndexTipAppend& blk,
     }
     BlockIndexTipStatus st = tip_->Append(blk, activeHeight, error);
     if (st != BLOCK_INDEX_TIP_OK)
+    {
+        if (Boot004AccTraceEnabled())
+            Boot004AccTrace("BOOT004_ACC accept_active_FAILED height=%d status=%d err=%s",
+                            activeHeight, (int)st, error ? error->c_str() : "");
         return -1;
+    }
+    if (Boot004AccTraceEnabled())
+        Boot004AccTrace("BOOT004_ACC accept_active height=%d hash=%s tipAfter=%d",
+                        activeHeight, blk.record.hash.ToString().substr(0, 16).c_str(),
+                        (int)tip_->TipHeight());
     // Refresh live-tail residency for the newly accepted tip (bounded).
     if (tail_)
     {

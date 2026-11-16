@@ -146,7 +146,7 @@ BOOST_AUTO_TEST_CASE(m0_linear_and_side_tips)
     BOOST_CHECK(mapBlockIndex.find(fx.active[5].hash) == mapBlockIndex.end());
     BOOST_CHECK(mapBlockIndex.find(fx.side.hash) == mapBlockIndex.end());
 
-    BOOST_REQUIRE_MESSAGE(builder.Build(fx.reader, fx.derived, &store, &error), error);
+    BOOST_REQUIRE_MESSAGE(builder.Build(fx.reader, BlockIndexScanProjection(), fx.derived, &store, &error), error);
 
     // tips: active tip (height5) + side tip (height1 fork)
     std::vector<uint256> tips = store.GetCandidateTipHashes();
@@ -195,7 +195,7 @@ BOOST_AUTO_TEST_CASE(m9_no_map_causal)
     BlockIndexCandidateStartupBuilder builder;
     for (int h = 0; h <= 3; ++h)
         BOOST_CHECK(mapBlockIndex.find(fx.active[h].hash) == mapBlockIndex.end());
-    BOOST_REQUIRE(builder.Build(fx.reader, fx.derived, &store, &error));
+    BOOST_REQUIRE(builder.Build(fx.reader, BlockIndexScanProjection(), fx.derived, &store, &error));
     // after
     for (int h = 0; h <= 3; ++h)
         BOOST_CHECK(mapBlockIndex.find(fx.active[h].hash) == mapBlockIndex.end());
@@ -209,7 +209,7 @@ BOOST_AUTO_TEST_CASE(m10_no_pprev_causal)
     std::string error;
     SnapshotCandidateFrontierStore store;
     BlockIndexCandidateStartupBuilder builder;
-    BOOST_REQUIRE(builder.Build(fx.reader, fx.derived, &store, &error));
+    BOOST_REQUIRE(builder.Build(fx.reader, BlockIndexScanProjection(), fx.derived, &store, &error));
     // no pprev/topology reconstructed: synthetic hashes stay absent from the
     // resident map (only the global testing-setup genesis block is resident).
     for (int h = 0; h <= 3; ++h)
@@ -275,13 +275,18 @@ BOOST_AUTO_TEST_CASE(boot004_scan_projection_parity_with_lookup_path)
     BlockIndexV2Reader filtered;
     BOOST_REQUIRE_MESSAGE(filtered.Open(fx.root.string(), opts, &err), err);
     BOOST_REQUIRE(filtered.IntegrityScanRanOnOpen());
-    BOOST_CHECK_EQUAL(filtered.ScanRecordMatches().size(), leaves.size());
-    BOOST_CHECK_EQUAL(filtered.ScanDerivedMatches().size(), leaves.size());
+    // BOOT-004: the projection is HANDED OVER once (the reader keeps nothing).
+    BlockIndexScanProjection fastProj = filtered.TakeScanProjection();
+    BOOST_CHECK(fastProj.scanRan);
+    BOOST_CHECK_EQUAL(fastProj.records.size(), leaves.size());
+    BOOST_CHECK_EQUAL(fastProj.derived.size(), leaves.size());
+    BOOST_CHECK(fastProj.Complete(leaves.size(), filtered.Generation()));
+    BOOST_CHECK(filtered.TakeScanProjection().records.empty()); // one-shot
 
     // The projection is the SAME data the per-hash path would read.
-    for (size_t i = 0; i < filtered.ScanRecordMatches().size(); ++i)
+    for (size_t i = 0; i < fastProj.records.size(); ++i)
     {
-        const BlockIndexScanRecordMatch& m = filtered.ScanRecordMatches()[i];
+        const BlockIndexScanRecordMatch& m = fastProj.records[i];
         BlockIndexSnapshot snap;
         std::string rerr;
         BOOST_REQUIRE(filtered.LookupByHash(m.record.hash, &snap, &rerr) ==
@@ -291,9 +296,9 @@ BOOST_AUTO_TEST_CASE(boot004_scan_projection_parity_with_lookup_path)
         BOOST_CHECK(snap.hashPrev == m.record.hashPrev);
         BOOST_CHECK(std::binary_search(leaves.begin(), leaves.end(), snap.hash));
     }
-    for (size_t i = 0; i < filtered.ScanDerivedMatches().size(); ++i)
+    for (size_t i = 0; i < fastProj.derived.size(); ++i)
     {
-        const BlockIndexScanDerivedMatch& dm = filtered.ScanDerivedMatches()[i];
+        const BlockIndexScanDerivedMatch& dm = fastProj.derived[i];
         BlockIndexDerivedEntry direct;
         std::string derr;
         BOOST_REQUIRE(fx.derived.Read(dm.id, &direct, &derr) ==
@@ -304,7 +309,7 @@ BOOST_AUTO_TEST_CASE(boot004_scan_projection_parity_with_lookup_path)
 
     BlockIndexCandidateStartupBuilder cb;
     SnapshotCandidateFrontierStore fast;
-    BOOST_REQUIRE_MESSAGE(cb.Build(filtered, fx.derived, &fast, &err), err);
+    BOOST_REQUIRE_MESSAGE(cb.Build(filtered, std::move(fastProj), fx.derived, &fast, &err), err);
     filtered.Close();
 
     // (2) FALLBACK PATH: same generation, no filter. The verify-once memo now
@@ -315,11 +320,14 @@ BOOST_AUTO_TEST_CASE(boot004_scan_projection_parity_with_lookup_path)
     opts2.integrityScanVisitor = [](BlockIndexId, const BlockIndexRecord&) {};
     BOOST_REQUIRE_MESSAGE(plain.Open(fx.root.string(), opts2, &err), err);
     BOOST_CHECK(!plain.IntegrityScanRanOnOpen());
-    BOOST_CHECK(plain.ScanRecordMatches().empty());
-    BOOST_CHECK(plain.ScanDerivedMatches().empty());
+    BlockIndexScanProjection plainProj = plain.TakeScanProjection();
+    BOOST_CHECK(!plainProj.scanRan);
+    BOOST_CHECK(plainProj.records.empty());
+    BOOST_CHECK(plainProj.derived.empty());
+    BOOST_CHECK(!plainProj.Complete(leaves.size(), plain.Generation()));
 
     SnapshotCandidateFrontierStore slow;
-    BOOST_REQUIRE_MESSAGE(cb.Build(plain, fx.derived, &slow, &err), err);
+    BOOST_REQUIRE_MESSAGE(cb.Build(plain, std::move(plainProj), fx.derived, &slow, &err), err);
     plain.Close();
 
     // Bit-for-bit agreement: order, content, best tip and both eligibility sets.
