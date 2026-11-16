@@ -166,7 +166,16 @@ boot)
     pass MEM-001 "VmHWM ${VMHWM} kB <= ${LIMIT} kB"
   fi
 
-  # ---- BOOT-003: read-amplification bounds.
+  # ---- BOOT-003: read-amplification bounds. TWO-COMPONENT metric (OWNER GO
+  # 2026-11-16, O-1):
+  #   component 1 = GATED: phase-scoped syscalls/rchar per record (STARTUP_IO
+  #                 marks A_startup_enter -> B_bootstrap_open);
+  #   component 2 = INFORMATIONAL: whole-process /proc/self/io, floored at
+  #                 ~0.073 syscalls/record by live-tip replay, txloc, LevelDB env
+  #                 and the wallet even with zero records.dat reads.
+  # A log that supplies --io/--records but no phase marks FAILS CLOSED: grading
+  # the informational component in place of the structural one would silently
+  # downgrade the invariant to a number that cannot be satisfied.
   SYS_LIMIT=$(thresh boot.max_read_syscalls_per_record)
   BYTES_LIMIT=$(thresh boot.max_read_bytes_per_record)
   MARK_A=$(sed -n 's/.*mark=A_startup_enter syscr=\([0-9]*\) rchar=\([0-9]*\).*/\1 \2/p' "$LOG" | tail -1)
@@ -186,26 +195,32 @@ if spb > sys_lim:
 if bpb > bytes_lim:
     print("GATE_FAIL BOOT-003 generation read bytes per record %.1f > %.1f" % (bpb, bytes_lim)); ok = False
 if ok:
-    print("GATE_PASS BOOT-003 generation syscalls/record=%.6f bytes/record=%.1f (records=%d)" % (spb, bpb, recs))
+    print("GATE_PASS BOOT-003 component1_phase syscalls/record=%.6f bytes/record=%.1f (records=%d)" % (spb, bpb, recs))
 sys.exit(0 if ok else 1)
 EOF
-  elif [ -n "$IO" ] && [ -n "$RECORDS" ] && [ "$RECORDS" -gt 0 ]; then
-    # No phase marks in the log: fall back to the whole-process counters. This is
-    # the LEGACY (process-wide) interpretation, reported explicitly as such.
-    read -r SYS reads < <(awk '/^syscr:/{s=$2}/^read_bytes:/{r=$2}END{print s, r}' "$IO")
-    python3 - "$SYS" "$reads" "$RECORDS" "$SYS_LIMIT" "$BYTES_LIMIT" <<'EOF' || exit 1
+    # Component 2: reported for context, never gated (see the block comment).
+    if [ -n "$IO" ]; then
+      read -r SYS reads < <(awk '/^syscr:/{s=$2}/^read_bytes:/{r=$2}END{print s, r}' "$IO")
+      python3 - "$SYS" "$reads" "$RECORDS" "$SYS_A" "$RCH_A" "$SYS_B" "$RCH_B" <<'EOF' || true
 import sys
-syscr, rbytes, recs, sys_lim, bytes_lim = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3]), float(sys.argv[4]), float(sys.argv[5])
-spb, bpb = syscr/recs, rbytes/recs
-ok = True
-if spb > sys_lim:
-    print("GATE_FAIL BOOT-003 whole-process read syscalls per record %.4f > %.4f (%d syscalls / %d records; legacy process-wide metric)" % (spb, sys_lim, syscr, recs)); ok = False
-if bpb > bytes_lim:
-    print("GATE_FAIL BOOT-003 whole-process read bytes per record %.1f > %.1f (legacy process-wide metric)" % (bpb, bytes_lim)); ok = False
-if ok:
-    print("GATE_PASS BOOT-003 whole-process syscalls/record=%.4f bytes/record=%.1f (legacy metric, no phase marks)" % (spb, bpb))
-sys.exit(0 if ok else 1)
+syscr, rbytes, recs = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+sa, ra, sb, rb = (int(sys.argv[4]), int(sys.argv[5]), int(sys.argv[6]), int(sys.argv[7]))
+print("GATE_INFO BOOT-003 component2_process_wide syscalls/record=%.4f bytes/record=%.1f (informational, NOT gated);"
+      " component1_share_of_syscalls=%.1f%%" % (syscr / recs, rbytes / recs, 100.0 * (sb - sa) / syscr if syscr else 0.0))
 EOF
+    fi
+  elif [ -n "$IO" ] && [ -n "$RECORDS" ] && [ "$RECORDS" -gt 0 ]; then
+    # Component 2 only: the log has no STARTUP_IO marks, so the GATED component is
+    # unavailable. Print the informational figures and FAIL CLOSED -- never grade
+    # the process-wide number as if it were BOOT-003.
+    read -r SYS reads < <(awk '/^syscr:/{s=$2}/^read_bytes:/{r=$2}END{print s, r}' "$IO")
+    python3 - "$SYS" "$reads" "$RECORDS" <<'EOF' || true
+import sys
+syscr, rbytes, recs = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
+print("GATE_INFO BOOT-003 component2_process_wide syscalls/record=%.4f bytes/record=%.1f (informational, NOT gated)"
+      % (syscr / recs, rbytes / recs))
+EOF
+    fail BOOT-003 "phase_marks_missing: the log carries no STARTUP_IO phase marks (A_startup_enter/B_bootstrap_open), so the GATED component is unavailable; process-wide numbers are informational only. Re-run the node with -startuptrace=1 -startupio=1"
   else
     echo "GATE_INFO BOOT-003 no phase marks and no --io+--records: read bounds NOT evaluated"
   fi

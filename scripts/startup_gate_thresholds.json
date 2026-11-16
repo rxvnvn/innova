@@ -5,6 +5,8 @@
     "_max_vmhwm_comment": "640 MiB. Measured startup peak at 8.24M records: 592.6 MiB before MEM-002, 538.8 MiB after MEM-002/BOOT-001, 413.2 MiB after BOOT-004 (the candidate frontier no longer materializes 30 633 snapshots through the 64 MiB reader LRU). Hard cgroup cap is 1 GiB with swap disabled. MEM-002's hand-off is gated SEPARATELY by the handoff=swap marker, because a reintroduced copy costs +54 MiB and would still fit under this ceiling."
   },
   "boot": {
+    "metric": "two_component",
+    "_metric_comment": "OWNER GO 2026-11-16 (O-1): BOOT-003 is a TWO-COMPONENT metric. Component 1 (GATED, structural, machine independent): read syscalls and rchar bytes of the authoritative block-index startup phase divided by record count, from the STARTUP_IO marks A_startup_enter -> B_bootstrap_open. Component 2 (INFORMATIONAL, never gated): the process-wide /proc/self/io figures, which on this datadir are floored at ~0.073 syscalls/record by live-tip replay, txloc open, LevelDB env and the wallet even with ZERO records.dat reads -- gating that number would be unsatisfiable by construction. A log without phase marks FAILS closed with reason=phase_marks_missing instead of silently grading the informational component.",
     "max_read_syscalls_per_record": 0.05,
     "_syscalls_comment": "SCOPED metric: read syscalls of the authoritative block-index startup phase divided by record count (STARTUP_IO marks A_startup_enter -> B_bootstrap_open), i.e. the records.dat/derived.dat/active.dat passes. Baseline with 4 KiB stdio = 0.284 process-wide; after the 1 MiB sequential buffers the phase measures 0.00056, so 0.05 is ~89x headroom and still fails long before an unbuffered pass can return. The PROCESS-WIDE figure is reported (GATE_INFO / report) but is NOT gated: on this datadir it is dominated by live-tip replay (497 837 syscalls, proportional to the post-generation tail), txloc open (80 204), LevelDB env (16 019) and the wallet (10 681), which together floor it at ~0.073 even with ZERO records.dat reads. OWNER REVIEW open: make this scoping normative.",
     "max_read_bytes_per_record": 780,
@@ -13,9 +15,10 @@
   "profiles": {
     "atlas-lab-sdb-hdd": {
       "datadir_records": 8241282,
-      "cold_seconds_reference": 260,
-      "cold_seconds_tolerance": 1.30,
-      "_comment": "Measured 2026-11-16 on /dev/sdb (HDD) with MemoryMax=1G, MemorySwapMax=0, page cache evicted with posix_fadvise(DONTNEED). ACCEPTED baseline is the committed state: BOOT-004 is DISABLED (see ENGINEERING_INVARIANTS.md), so the cold start is 259.3 s and the profile is 260 s x 1.30 -> fails above 338 s. The BOOT-004-enabled figure (41.3 s) is a measured lab result, not the accepted baseline, because that variant has a blocking regression on fresh-datadir restart durability. Valid only for idle-stand measurements; identical code measured 2 228 s earlier under concurrent production I/O."
+      "cold_seconds_reference": 42,
+      "cold_seconds_tolerance": 1.50,
+      "cold_seconds_limit_s": 63,
+      "_comment": "OWNER GO 2026-11-16 (O-2): profile is 42 s x 1.50 -> fails above 63 s. Stand: /dev/sdb (HDD), MemoryMax=1G, MemorySwapMax=0, page cache evicted with posix_fadvise(DONTNEED), idle machine. The previous 260 s x 1.30 (338 s ceiling) could not discriminate a return to the ~217 s variant and was therefore not a gate. Accepted measurements on this stand with BOOT-004 default-on: 39.20 s (x1-cold-8m) and 39.39 s (x1-cold-8m-dbg), so 63 s leaves 60% headroom over the accepted 39.2 s while still failing any return to a multi-pass / unbuffered startup (~217-260 s). Valid only for idle-stand measurements; identical code measured 2 228 s earlier under concurrent production I/O, which is why the profile names the stand."
     }
   }
 }

@@ -136,11 +136,17 @@ startup/recovery/reorg-стенды, тяжёлый cold-boot стенд.
 
 ## BOOT-003 — измеримые пределы чтения, syscalls и времени
 
-- **Определение.** Старт характеризуется измеренными пределами: read syscalls
-  на запись и read bytes на запись **для фазы авторитетного блочного индекса**
-  (метки `STARTUP_IO` `A_startup_enter` → `B_bootstrap_open`: проходы
-  records.dat / derived.dat / active.dat), плюс wall time до RPC на именованном
-  профиле стенда. Случайные точечные пробы не масштабируются с числом листьев
+- **Определение (двухкомпонентная метрика, OWNER GO 2026-11-16, O-1).**
+  1. **Компонент 1 — ГЕЙТ (структурный, машинно-независимый):** read syscalls на
+     запись и rchar-bytes на запись **для фазы авторитетного блочного индекса**
+     (метки `STARTUP_IO` `A_startup_enter` → `B_bootstrap_open`: проходы
+     records.dat / derived.dat / active.dat).
+  2. **Компонент 2 — ИНФОРМАЦИОННЫЙ (никогда не гейтится):** процесс-широкие
+     `/proc/self/io`, у которых на этом датадире конструктивный пол ~0.073
+     syscall/запись (live-tip replay, txloc, LevelDB env, кошелёк) даже при
+     нуле чтений records.dat.
+  Плюс wall time до RPC на именованном профиле стенда: 42 s × 1.5 для
+  `atlas-lab-sdb-hdd` (OWNER GO 2026-11-16, O-2). Случайные точечные пробы не масштабируются с числом листьев
   фронтьера.
 - **Область.** Последовательные проходы (`ReadAllSequential`,
   `VerifyIntegrity`, пересчёт корня), построение candidate frontier.
@@ -166,28 +172,31 @@ Store3A txloc open                                    80 204       13.2%
   конструктивно** на этом datadir: пол из компонентов, не связанных с
   records.dat, равен ~0.073. Фактический расход на records.dat после BOOT-001/002
   — 0.00043 syscall/запись (3 574 syscall на 8 241 282 записи).
-  Нормативное изменение определения вынесено на OWNER REVIEW (документ
-  `~/data/reports/innova/boot004-final-acceptance-20261116/BOOT-003-OWNER-REVIEW.md`;
-  § журнал, 2026-11-16); численные пороги не менялись. Процесс-широкие значения
-  по-прежнему измеряются и печатаются как информационные.
+  Скоупинг сделан НОРМАТИВНЫМ (O-1, OWNER GO 2026-11-16): гейтится только
+  компонент 1, компонент 2 печатается как `GATE_INFO ... component2_process_wide`.
+  Если лог не несёт меток `STARTUP_IO`, гейт отказывает fail-closed
+  (`reason=phase_marks_missing`) и не подменяется информационным числом.
 - **Происхождение.** 2026-11-16: 2.34M syscalls по 3.1 KB; 92k случайных
   проб в frontier (~300 s).
 - **Исправление.** `SequentialIoBuffer` (1 MiB) в четырёх последовательных
   циклах; листья фронтьера опрашиваются в порядке ключа hashindex
   (`BOOT-003`, blockindex_candidate_startup_builder.cpp).
-- **Проверки.** gate `boot --log <debug.log> --records N` (метки `STARTUP_IO`
-  из `-startuptrace=1 -startupio=1`): `syscalls/record <= 0.05`,
-  `bytes/record (rchar) <= 780`; `--seconds N --profile atlas-lab-sdb-hdd`:
-  `cold_seconds <= reference * tolerance`; без меток gate откатывается на
-  процесс-широкий счётчик и явно печатает, что это legacy-метрика.
+- **Проверки.** gate `boot --log <debug.log> --records N [--io <proc.io>]`
+  (метки `STARTUP_IO` из `-startuptrace=1 -startupio=1`): компонент 1 —
+  `syscalls/record <= 0.05`, `bytes/record (rchar) <= 780`; компонент 2 —
+  печатается, не гейтится. Без меток при наличии `--io/--records` — FAIL
+  closed (`phase_marks_missing`). `--seconds N --profile atlas-lab-sdb-hdd`:
+  `cold_seconds <= 42 * 1.5 = 63 s`.
 - **Эталон.** Baseline до этапа: 0.284 syscalls/record, 888 B/record, 433 s
   (2 228 s исторически, под конкурирующим production I/O). После BOOT-001/002 и
   BOOT-004 (8.24M, HDD, 1 GiB, swap=0, кэш вытеснен): фаза индекса
   0.00056 syscall/record и 574 B/record; до RPC 41.3 s.
-- **Обнаружение регрессии.** Порог фазы нарушен (возврат 4 KiB чтений даёт
-  ~0.28, третий проход records.dat даёт ~802 B/record); время профиля выше
-  42 s x 1.5.
-- **Статус.** `PROVEN` (замеры этапа).
+- **Обнаружение регрессии.** Компонент 1 нарушен: возврат 4 KiB чтений даёт
+  ~0.28 syscall/record, третий проход records.dat даёт ~802 B/record. Время
+  профиля выше 63 s (42 s x 1.5): возврат варианта ~217-260 s обнаруживается,
+  чего прежний профиль 260 s x 1.30 (338 s) не делал.
+- **Статус.** `PROVEN` (замеры этапа); скоупинг и профиль утверждены OWNER
+  2026-11-16 (O-1, O-2).
 - **Разрешённое изменение.** Порог меняется только с OWNER GO.
 
 ## BOOT-004 — candidate frontier строится из уже выполняемых сканов
@@ -483,4 +492,23 @@ tier3  перед релизным GO и после изменений горя�
             навигатора (заёмщики до владельца). Доказательство: 5/5 изолированных
             прогонов, 0 ошибок, RED-тест на нефиксированном дереве;
             ранее «pre-existing» отказ [3 != 1] тем же UAF объясняется и исчез.
+2026-11-16  OWNER GO: интеграция BOOT-004 + Memory Safety & Fast Startup + X1 в
+            integ/rel-p5-20261116 (ff от integ/rel-p4 f2c79b8e, без force).
+            O-1 ЗАКРЫТ: BOOT-003 переведён на ДВУХКОМПОНЕНТНУЮ метрику.
+              компонент 1 (ГЕЙТ, структурный): syscalls/record <= 0.05 и
+                rchar bytes/record <= 780 по меткам STARTUP_IO
+                A_startup_enter -> B_bootstrap_open;
+              компонент 2 (ИНФОРМАЦИОННЫЙ, не гейтится): процесс-широкие
+                /proc/self/io (конструктивный пол ~0.073 syscall/запись на этом
+                датадире), печатается как GATE_INFO component2_process_wide
+                вместе с component1_share_of_syscalls.
+              Без меток STARTUP_IO гейт отказывает fail-closed
+              (reason=phase_marks_missing), а не подменяется информационным
+              числом. Матрица P0/P1 + N1..N3: 5/5 ожидаемых исходов.
+            O-2 ЗАКРЫТ: профиль cold-start стенда atlas-lab-sdb-hdd =
+              42 s x 1.50 = 63 s (было 260 s x 1.30 = 338 s). Принятые замеры
+              на этом стенде с BOOT-004 default-on: 39.20 s и 39.39 s; возврат
+              варианта 217-260 s теперь обнаруживается (N5/N6 FAIL), и даже
+              338 s — FAIL (N7), чего прежний профиль не делал.
+            Численные структурные пороги 0.05 / 780 НЕ менялись.
 ```
