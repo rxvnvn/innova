@@ -342,6 +342,66 @@ Store3A txloc open                                    80 204       13.2%
 
 ---
 
+## X1-001 — заёмщик базового ридера не переживает владельца ридера
+
+- **Определение.** Любой объект, заимствующий `BlockIndexV2Reader` (сырой
+  указатель), обязан быть освобождён **до** уничтожения этого ридера.
+  Владелец ридера один — удержанный `ColdHotSeamNavigator` (`coldReader` —
+  член по значению; умирает вместе с навигатором). Заёмщики:
+  (1) `BlockIndexAuthoritativeLive` (`impl_->baseReader` →
+  `BlockIndexLiveTailMaterializer::baseReader_`), (2) `AuthoritativeBlockIndexHotResolver`.
+  Замена (`Retain*`) и очистка (`Clear`) удержанного навигатора обязаны сначала
+  освободить заёмщиков, затем владельца. Иначе `LOCK(cs)` в
+  `BlockIndexV2Reader::IsOpen()` берёт **уничтожённый** `CCriticalSection`:
+  это use-after-free, а не конфликт блокировок.
+- **Область.** `ReleaseAuthoritativeLiveBoundTo`
+  (`blockindex_authoritative_startup.cpp`), `BlockIndexAuthoritativeLive::BaseReaderPtr`
+  (`blockindex_authoritative_live.{h,cpp}`), сайты замены/очистки навигатора в
+  `blockindex_shadow_startup.cpp`. Порядок «заёмщики → владелец» обязателен и для
+  `g_stakingAuthoritativeResolver`.
+- **Происхождение.** X1 приёмки `boot004-final-acceptance-20261116`
+  (SIGABRT 5/5, baseline 0/5). Первичное объяснение «рекурсивный захват `cs`»
+  **опровергнуто**: `cs` — `boost::recursive_mutex`, повторный вход того же
+  потока не ассертит. Фактическая причина — use-after-free. `TestingSetup`
+  (глобальная фикстура `test_innova`) выполняет production-паритетный
+  `LoadBlockIndex(true)`, который создаёт `g_authoritativeContext->live`,
+  привязанный к холодному ридеру стартового навигатора. Первый же тест вызывает
+  `RetainBlockIndexStakingNavigator`, локальный `unique_ptr` уничтожает прежний
+  навигатор вместе с ридером, а `ctx->live` продолжает держать указатель.
+  Замер (probe-ветка, только stderr-трассировка указателей):
+  `live_open baseReader=0x63074cd4ccb0` → после двух замен навигатора
+  `base_to_snapshot baseReader_=0x63074cd4ccb0` при живом навигаторе
+  `0x63074cd653c0`, т.е. резолв шёл через освобождённый объект.
+- **Почему наблюдались две формы отказа.** Одно и то же UAF проявляется как
+  (a) SIGABRT `pthread_mutex_lock.c:94 … __owner == 0` — память уже
+  переиспользована и слово блокировки не нулевое; либо (b) вечное ожидание
+  futex — освобождённое слово читается как «захвачено» (одиночный кейс,
+  `futex_wait expected=2`). Тем же UAF объясняется ранее считавшийся
+  «pre-existing» отказ `hreg_authoritative_resolution_contract_no_historical_topology`
+  `[3 != 1]`: резолв отсутствующего хеша отвечал из освобождённого объекта.
+- **Обязательная проверка.**
+  `blockindex_authoritative_startup_tests/x1_navigator_replacement_releases_bound_live_authority`:
+  после замены навигатора `GetAuthoritativeLiveAuthority()` обязан быть `NULL`
+  (`BOOST_REQUIRE` — на нефиксированном дереве даёт RED-отказ), а резолв по
+  новому base возвращает `AUTHORITATIVE_BLOCK_FOUND` с ожидаемой высотой.
+  Гейт: тот же сьют 5/5 изолированно, 0 ошибок, 0 glibc-fatal.
+- **Статус.** `PROVEN` (2026-11-16): 5/5 чистых изолированных прогонов на
+  `fd8ec6c8`, RED-прогон того же теста на нефиксированном дереве `94517236`
+  (`rc=201`, fatal), process-isolated батарея — см. отчёт `x1-locking-rca-20261116`.
+- **Границы.**
+  (1) Диагностический режим `-blockindexv2shadow` умышленно заменяет навигатор
+  после авторитетного старта: в этой комбинации live-авторитет освобождается с
+  громкой строкой `INVARIANT(X1)`, узел остаётся fail-closed, а не разыменовывает
+  уничтоженный ридер.
+  (2) Тест-инсталлированный авторитет (`SetAuthoritativeLiveForTesting`) **не
+  удаляется** — освобождается только глобальный указатель; владелец-тест обязан
+  сам соблюдать порядок (существующие фикстуры его соблюдают).
+  (3) Инвариант сформулирован про **время жизни**, а не про владение: контракт
+  «навигатор живёт дольше заёмщика» сохранён, `shared_ptr` не вводился;
+  переход на разделяемое владение был бы изменением контракта и требует ADR.
+
+---
+
 ## Матрица гейтов
 
 ```text
@@ -349,7 +409,8 @@ tier1  каждый интеграционный коммит
        scripts/startup_invariants_gate.sh suites --tests <test_innova>
        scripts/startup_invariants_gate.sh boot --log <log> (regtest boot)
        покрывает: MEM-002, MEM-003 (fail-closed), BOOT-001, BOOT-002 (маркер),
-                  STORE-001 (S2.0), STORE-003 (pair)
+                  STORE-001 (S2.0), STORE-003 (pair), X1-001 (reader lifetime:
+                  blockindex_authoritative_startup_tests)
 
 tier2  перед интеграцией релиза
        startup / restart / reorg(1,20) на regtest-стенде + POS-сценарии
@@ -411,4 +472,15 @@ tier3  перед релизным GO и после изменений горя�
             Изменение НЕ применено. Следствие: при 260 s x 1.30 гейт не
             обнаруживает возврат ~217 s (217 < 338). Вынесено на OWNER REVIEW
             (BOOT-003-OWNER-REVIEW.md, вопрос O-2).
+2026-11-16  X1-001 добавлен (reader lifetime). X1 приёмки boot004-final-acceptance
+            НЕ является рекурсивным захватом cs (cs — boost::recursive_mutex):
+            это use-after-free на уничтоженном BlockIndexV2Reader. Стартовый
+            навигатор заменяется первым же тестом, его холодный ридер
+            уничтожается, а g_authoritativeContext->live сохраняет сырой
+            указатель; следующий IsOpen() берёт разрушенный CCriticalSection
+            (SIGABRT __owner==0 либо вечный futex-wait). Исправление —
+            ReleaseAuthoritativeLiveBoundTo на всех сайтах замены/очистки
+            навигатора (заёмщики до владельца). Доказательство: 5/5 изолированных
+            прогонов, 0 ошибок, RED-тест на нефиксированном дереве;
+            ранее «pre-existing» отказ [3 != 1] тем же UAF объясняется и исчез.
 ```
