@@ -2,20 +2,20 @@
   "_comment": "Thresholds for scripts/startup_invariants_gate.sh. Structural per-record bounds are machine independent; the wall-time profile is machine local and names the stand it was measured on. Raising any value here is an INVARIANT CHANGE and needs OWNER GO (see ENGINEERING_INVARIANTS.md).",
   "memory": {
     "max_vmhwm_kb": 655360,
-    "_max_vmhwm_comment": "640 MiB. Measured startup peak at 8.24M records: 592.6 MiB before MEM-002, 535 MiB after. Hard cgroup cap is 1 GiB with swap disabled."
+    "_max_vmhwm_comment": "640 MiB. Measured startup peak at 8.24M records: 592.6 MiB before MEM-002, 538.8 MiB after MEM-002/BOOT-001, 413.2 MiB after BOOT-004 (the candidate frontier no longer materializes 30 633 snapshots through the 64 MiB reader LRU). Hard cgroup cap is 1 GiB with swap disabled. MEM-002's hand-off is gated SEPARATELY by the handoff=swap marker, because a reintroduced copy costs +54 MiB and would still fit under this ceiling."
   },
   "boot": {
     "max_read_syscalls_per_record": 0.05,
-    "_syscalls_comment": "Baseline (4 KiB stdio) = 0.284 read syscalls per record (2 342 391 / 8.24M). Buffered sequential passes measure ~0.005. The gate fails at 0.05, i.e. an order of magnitude above the repaired figure and 5.7x below the defect.",
+    "_syscalls_comment": "SCOPED metric: read syscalls of the authoritative block-index startup phase divided by record count (STARTUP_IO marks A_startup_enter -> B_bootstrap_open), i.e. the records.dat/derived.dat/active.dat passes. Baseline with 4 KiB stdio = 0.284 process-wide; after the 1 MiB sequential buffers the phase measures 0.00056, so 0.05 is ~89x headroom and still fails long before an unbuffered pass can return. The PROCESS-WIDE figure is reported (GATE_INFO / report) but is NOT gated: on this datadir it is dominated by live-tip replay (497 837 syscalls, proportional to the post-generation tail), txloc open (80 204), LevelDB env (16 019) and the wallet (10 681), which together floor it at ~0.073 even with ZERO records.dat reads. OWNER REVIEW open: make this scoping normative.",
     "max_read_bytes_per_record": 780,
-    "_bytes_comment": "Baseline 888 B/record (7.32 GB / 8.24M, three records.dat passes). After BOOT-001 (two passes) the expected figure is ~660 B/record. 780 fails long before a third pass can creep back in."
+    "_bytes_comment": "SCOPED metric on rchar (bytes read by the process, cache-state independent) over the same phase. Two records.dat passes + the derived/active passes measure 574 B/record; a third records.dat pass adds 228 B -> ~802 and fails. The former 888 B/record baseline was three records.dat passes read through 4 KiB stdio."
   },
   "profiles": {
     "atlas-lab-sdb-hdd": {
       "datadir_records": 8241282,
-      "cold_seconds_reference": 433,
+      "cold_seconds_reference": 260,
       "cold_seconds_tolerance": 1.30,
-      "_comment": "Measured 2026-11-16 on /dev/sdb (HDD) with MemoryMax=1G, MemorySwapMax=0, page cache evicted with posix_fadvise(DONTNEED). Identical code measured 2 228 s earlier under concurrent production I/O, so this profile is valid only for idle-stand measurements."
+      "_comment": "Measured 2026-11-16 on /dev/sdb (HDD) with MemoryMax=1G, MemorySwapMax=0, page cache evicted with posix_fadvise(DONTNEED). ACCEPTED baseline is the committed state: BOOT-004 is DISABLED (see ENGINEERING_INVARIANTS.md), so the cold start is 259.3 s and the profile is 260 s x 1.30 -> fails above 338 s. The BOOT-004-enabled figure (41.3 s) is a measured lab result, not the accepted baseline, because that variant has a blocking regression on fresh-datadir restart durability. Valid only for idle-stand measurements; identical code measured 2 228 s earlier under concurrent production I/O."
     }
   }
 }

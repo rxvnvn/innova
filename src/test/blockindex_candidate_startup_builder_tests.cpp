@@ -10,12 +10,14 @@
 #include "../blockindex_derived_state.h"
 #include "../blockindex_generation_builder.h"
 #include "../blockindex_generation_lifecycle.h"
+#include "../candidate_frontier_metadata.h"
 #include "../main.h"
 
 #include <boost/filesystem.hpp>
 
 #include <assert.h>
 #include <stdio.h>
+#include <algorithm>
 #include <string>
 #include <vector>
 #include <set>
@@ -65,7 +67,7 @@ struct CandFixture
     BlockIndexV2Reader reader;
     BlockIndexDerivedStateStore derived;
 
-    CandFixture(int n) : tipHeight(n)
+    CandFixture(int n, bool openReader = true) : tipHeight(n)
     {
         root = boost::filesystem::temp_directory_path() /
             boost::filesystem::unique_path("innova-cand-%%%%-%%%%-%%%%");
@@ -113,10 +115,13 @@ struct CandFixture
         BOOST_REQUIRE_MESSAGE(
             BlockIndexGenerationManager::SelectGeneration(root.string(), 1, &error)==(int)BLOCK_INDEX_LIFECYCLE_OK, error);
 
-        BlockIndexV2ReaderOptions o;
-        BOOST_REQUIRE_MESSAGE(reader.Open(root.string(), o, &error), error);
         BOOST_REQUIRE_MESSAGE(
             BlockIndexDerivedStateStore::OpenReadOnly((root/"gen-000001").string(), 1, &derived, &error), error);
+        if (openReader)
+        {
+            BlockIndexV2ReaderOptions o;
+            BOOST_REQUIRE_MESSAGE(reader.Open(root.string(), o, &error), error);
+        }
     }
     ~CandFixture() {
         boost::system::error_code ec;
@@ -242,6 +247,102 @@ BOOST_AUTO_TEST_CASE(integrity_scan_runs_once_per_generation_identity)
         BOOST_REQUIRE_MESSAGE(third.Open(fx.root.string(), opts, &err), err);
         BOOST_CHECK_EQUAL(BlockIndexV2ReaderIntegrityScansForTesting(), afterFirst + 1);
     }
+    BlockIndexV2ReaderResetIntegrityMemoForTesting();
+}
+
+// BOOT-004: the frontier is served from the reader's OPEN-TIME scans (records +
+// derived), and that projection must be byte-identical to the per-hash lookup
+// path. Both paths are exercised on the SAME generation: the filtered open runs
+// the scans and collects, the second (unfiltered) open is memo-short-circuited
+// and therefore takes the documented fallback.
+BOOST_AUTO_TEST_CASE(boot004_scan_projection_parity_with_lookup_path)
+{
+    BlockIndexV2ReaderResetIntegrityMemoForTesting();
+    CandFixture fx(6, /*openReader=*/false);   // no open yet: the scans must run
+
+    std::vector<uint256> leaves;
+    std::string err;
+    BOOST_REQUIRE_MESSAGE(
+        ReadCandidateLeafMetadata((fx.root / "gen-000001").string(), 1, &leaves, &err), err);
+    BOOST_REQUIRE_EQUAL(leaves.size(), 2u);    // active tip + side tip
+
+    // (1) FAST PATH: filtered open collects exactly the frontier records and
+    // their derived entries on the passes it performs for integrity anyway.
+    BlockIndexV2ReaderOptions opts;
+    opts.integrityScanVisitor = [](BlockIndexId, const BlockIndexRecord&) {};
+    opts.scanFilterHashes = leaves;
+    opts.collectDerivedForScanMatches = true;
+    BlockIndexV2Reader filtered;
+    BOOST_REQUIRE_MESSAGE(filtered.Open(fx.root.string(), opts, &err), err);
+    BOOST_REQUIRE(filtered.IntegrityScanRanOnOpen());
+    BOOST_CHECK_EQUAL(filtered.ScanRecordMatches().size(), leaves.size());
+    BOOST_CHECK_EQUAL(filtered.ScanDerivedMatches().size(), leaves.size());
+
+    // The projection is the SAME data the per-hash path would read.
+    for (size_t i = 0; i < filtered.ScanRecordMatches().size(); ++i)
+    {
+        const BlockIndexScanRecordMatch& m = filtered.ScanRecordMatches()[i];
+        BlockIndexSnapshot snap;
+        std::string rerr;
+        BOOST_REQUIRE(filtered.LookupByHash(m.record.hash, &snap, &rerr) ==
+                      BLOCK_INDEX_V2_READ_FOUND);
+        BOOST_CHECK_EQUAL(snap.id, m.id);
+        BOOST_CHECK_EQUAL(snap.height, m.record.height);
+        BOOST_CHECK(snap.hashPrev == m.record.hashPrev);
+        BOOST_CHECK(std::binary_search(leaves.begin(), leaves.end(), snap.hash));
+    }
+    for (size_t i = 0; i < filtered.ScanDerivedMatches().size(); ++i)
+    {
+        const BlockIndexScanDerivedMatch& dm = filtered.ScanDerivedMatches()[i];
+        BlockIndexDerivedEntry direct;
+        std::string derr;
+        BOOST_REQUIRE(fx.derived.Read(dm.id, &direct, &derr) ==
+                      BLOCK_INDEX_DERIVED_LOOKUP_FOUND);
+        BOOST_CHECK(direct.chainTrust == dm.entry.chainTrust);
+        BOOST_CHECK_EQUAL(direct.flags, dm.entry.flags);
+    }
+
+    BlockIndexCandidateStartupBuilder cb;
+    SnapshotCandidateFrontierStore fast;
+    BOOST_REQUIRE_MESSAGE(cb.Build(filtered, fx.derived, &fast, &err), err);
+    filtered.Close();
+
+    // (2) FALLBACK PATH: same generation, no filter. The verify-once memo now
+    // short-circuits the scan, so the builder MUST use the lookup path and the
+    // result must be identical.
+    BlockIndexV2Reader plain;
+    BlockIndexV2ReaderOptions opts2;
+    opts2.integrityScanVisitor = [](BlockIndexId, const BlockIndexRecord&) {};
+    BOOST_REQUIRE_MESSAGE(plain.Open(fx.root.string(), opts2, &err), err);
+    BOOST_CHECK(!plain.IntegrityScanRanOnOpen());
+    BOOST_CHECK(plain.ScanRecordMatches().empty());
+    BOOST_CHECK(plain.ScanDerivedMatches().empty());
+
+    SnapshotCandidateFrontierStore slow;
+    BOOST_REQUIRE_MESSAGE(cb.Build(plain, fx.derived, &slow, &err), err);
+    plain.Close();
+
+    // Bit-for-bit agreement: order, content, best tip and both eligibility sets.
+    BOOST_CHECK_EQUAL(fast.tipHashes.size(), slow.tipHashes.size());
+    BOOST_REQUIRE_EQUAL(fast.tipHashes.size(), leaves.size());
+    for (size_t i = 0; i < fast.tipHashes.size(); ++i)
+        BOOST_CHECK(fast.tipHashes[i] == slow.tipHashes[i]);
+    BOOST_CHECK_EQUAL(fast.blocks.size(), slow.blocks.size());
+    for (std::map<uint256, SnapshotCandidateFrontierStore::BVec>::const_iterator it =
+             fast.blocks.begin(); it != fast.blocks.end(); ++it)
+    {
+        std::map<uint256, SnapshotCandidateFrontierStore::BVec>::const_iterator jt =
+            slow.blocks.find(it->first);
+        BOOST_REQUIRE(jt != slow.blocks.end());
+        BOOST_CHECK(jt->second.chainTrust == it->second.chainTrust);
+        BOOST_CHECK_EQUAL(jt->second.height, it->second.height);
+        BOOST_CHECK(jt->second.parent == it->second.parent);
+    }
+    BOOST_CHECK_EQUAL(fast.hasBest, slow.hasBest);
+    BOOST_CHECK(fast.bestHash == slow.bestHash);
+    BOOST_CHECK(fast.bestTrust == slow.bestTrust);
+    BOOST_CHECK(fast.operatorInvalid == slow.operatorInvalid);
+    BOOST_CHECK(fast.hasData == slow.hasData);
     BlockIndexV2ReaderResetIntegrityMemoForTesting();
 }
 

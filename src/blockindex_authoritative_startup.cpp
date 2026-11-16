@@ -210,6 +210,34 @@ int32_t AuthoritativeBaseTipHeight()
     return base ? base->nHeight : -1;
 }
 
+
+// ---------------------------------------------------------------------------
+// -startupio=1 (diagnostic, strictly additive): emits a /proc/self/io snapshot
+// at each authoritative-startup step, so BOOT-003/BOOT-004 read-amplification
+// numbers are attributed to the phase that produced them. Off by default: one
+// cached argument lookup per mark, no other work, nothing emitted.
+// ---------------------------------------------------------------------------
+static void StartupIoMark(const char* tag)
+{
+    if (!GetBoolArg("-startupio", false))
+        return;
+    unsigned long long syscr = 0, rchar = 0, read_bytes = 0;
+    FILE* iof = fopen("/proc/self/io", "rb");
+    if (iof)
+    {
+        char line[256];
+        while (fgets(line, sizeof(line), iof))
+        {
+            if (!strncmp(line, "syscr:", 6)) syscr = strtoull(line + 6, NULL, 10);
+            else if (!strncmp(line, "rchar:", 6)) rchar = strtoull(line + 6, NULL, 10);
+            else if (!strncmp(line, "read_bytes:", 11)) read_bytes = strtoull(line + 11, NULL, 10);
+        }
+        fclose(iof);
+    }
+    printf("STARTUP_IO mark=%s syscr=%llu rchar=%llu read_bytes=%llu\n", tag, syscr, rchar, read_bytes);
+    fflush(stdout);
+}
+
 bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
 {
     // PHASE4: this entry point deliberately bypasses legacy LoadBlockIndex(), so
@@ -255,6 +283,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         void Disarm() { disarmed = true; }
     } globalsGuard;
 
+    StartupIoMark("A_startup_enter");
     // 1. Bootstrap (open + validate authoritative generation, pin best-tip +
     //    genesis permanent anchors; fail-closed).
     BlockIndexV2ReaderOptions opts;
@@ -282,6 +311,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
     if (!PublishStartupGlobals(*ctx, error))
         return false;
 
+    StartupIoMark("B_bootstrap_open");
     // 3. setStakeSeen: collected by the integrity scan when it ran (BOOT-001);
     //    otherwise rebuilt by the A.10.1o streaming builder (fail-closed).
     if (error) error->clear();
@@ -295,7 +325,12 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
             // the payload is bit-identical and the empty container dies here.
             setStakeSeen.swap(stakeSeenFromIntegrityScan);
             g_stakeSeenSource = "integrity_scan";
-            printf("BLOCKINDEX_V2_AUTHORITATIVE stake_seen_source=integrity_scan records_pass=1 entries=%llu\n",
+            // MEM-002 execution proof: the set is HANDED OVER, never copied.
+            // A regression to `setStakeSeen = ss` keeps the same entry count and
+            // is visible only as a transient RB-tree copy, so the gate checks the
+            // hand-off marker itself (absence of "handoff=swap" in any boot is a
+            // MEM-002 failure, not a cosmetic log change).
+            printf("BLOCKINDEX_V2_AUTHORITATIVE stake_seen_source=integrity_scan records_pass=1 entries=%llu handoff=swap\n",
                    (unsigned long long)setStakeSeen.size());
             fflush(stdout);
         }
@@ -317,12 +352,13 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
             // is a local, so the emptied container dies here.
             setStakeSeen.swap(ss); // A.10.1o builder reproduces legacy exactly
             g_stakeSeenSource = "sequential_rebuild";
-            printf("BLOCKINDEX_V2_AUTHORITATIVE stake_seen_source=sequential_rebuild records_pass=2 entries=%llu\n",
+            printf("BLOCKINDEX_V2_AUTHORITATIVE stake_seen_source=sequential_rebuild records_pass=2 entries=%llu handoff=swap\n",
                    (unsigned long long)setStakeSeen.size());
             fflush(stdout);
         }
     }
 
+    StartupIoMark("C_stake_seen");
     // 4. (moved after candidate build — see below) Build the candidate frontier
     //    by value (A.10.1m) from the authoritative reader + derived store, and
     //    populate the legacy mapCandidateTips so candidate selection
@@ -360,6 +396,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
                (unsigned long long)nCandidateTipGeneration);
     }
 
+    StartupIoMark("D_candidate");
     // Readiness binds to the selected generation, not a declared capability.
     const uint64_t selectedGeneration = ctx->bootstrap.ReaderPtr()->Generation();
 
@@ -385,6 +422,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         }
     }
 
+    StartupIoMark("E_navigator_installed");
     // 5b. G1: retain the production live-authority seam bound to the SAME single
     //     process-open base reader (the navigator's cold reader, which survives
     //     process-lifetime) + the mutable tip under <v2Root>/blockindex_tip.
@@ -413,6 +451,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
                (int)ctx->live->TipAuthorityMutable()->TipHeight());
     }
 
+    StartupIoMark("F_live_open");
     // V2-R2 (PM1-P0-01): PublishStartupGlobals (above) yields the IMMUTABLE base
     // tip S from the bootstrap anchor. If the durable mutable tip holds post-S
     // authority (L > S), the authoritative best tip after restart MUST be L, not
@@ -446,6 +485,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         }
     }
 
+    StartupIoMark("G_tip_materialized");
     // V2-R2B (PM1-P0-02): restore durable operator-invalid authority. Above S the
     // mutable tip is the durable owner of operator invalidation; the legacy txdb
     // invalid set is deliberately NOT loaded on the authoritative path (it is a
@@ -470,6 +510,7 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
         }
     }
 
+    StartupIoMark("H_invalid_restored");
     // R3 certification-stage result, consumed by the R4 AUTHORITY_READY prerequisite
     // 'R3 provenance/projection certification complete' at the true exit of this function.
     // VERIFIED / SUSPENDED / UNAVAILABLE are all COMPLETED determinations: a store that

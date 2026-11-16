@@ -11,6 +11,8 @@
 #include <functional>
 #include <string>
 #include <map>
+#include <utility>
+#include <vector>
 #include <sys/types.h>
 #include <sys/stat.h>
 
@@ -46,11 +48,39 @@ struct BlockIndexV2ReaderCacheStats
 // still a fail-closed open failure whether or not a visitor is installed.
 typedef std::function<void(BlockIndexId, const BlockIndexRecord&)> BlockIndexIntegrityScanVisitor;
 
+// BOOT-004: bounded projection riding the SAME open-time scans.
+//
+// Authoritative startup needs, for a small immutable FRONTIER of hashes
+// (candidate-leaves.dat), the record and the derived entry behind each hash.
+// Asking for them one by one (LookupByHash + derived.Read) costs, per leaf, a
+// hashindex point lookup, a records.dat read and a derived.dat read - all
+// RANDOM: measured 3.06 read syscalls and 6.85 ms per leaf on a cold 8.24M
+// generation (93 746 syscalls / 209.9 s for 30 633 leaves). Both values are
+// already decoded by scans this open performs for integrity anyway, so they are
+// collected THERE instead, for zero additional I/O.
+//
+// `scanFilterHashes` is a SORTED hash vector (candidate-leaves.dat order); an
+// EMPTY filter (default) disables collection and leaves the reader's behaviour
+// byte-identical. `collectDerivedForScanMatches` additionally collects the
+// derived entry for every matched RecordId on the derived integrity pass (which
+// already decodes every entry).
+struct BlockIndexScanRecordMatch
+{
+    BlockIndexId id;
+    BlockIndexRecord record;
+    BlockIndexScanRecordMatch() : id(BLOCK_INDEX_ID_INVALID) {}
+};
+
+typedef BlockIndexDerivedScanMatch BlockIndexScanDerivedMatch;
+
 struct BlockIndexV2ReaderOptions
 {
     uint64_t cacheCapacityBytes;
     BlockIndexIntegrityScanVisitor integrityScanVisitor;
-    BlockIndexV2ReaderOptions() : cacheCapacityBytes(64ULL * 1024ULL * 1024ULL) {}
+    std::vector<uint256> scanFilterHashes;
+    bool collectDerivedForScanMatches;
+    BlockIndexV2ReaderOptions() : cacheCapacityBytes(64ULL * 1024ULL * 1024ULL),
+                                 collectDerivedForScanMatches(false) {}
 };
 
 class BlockIndexV2Reader
@@ -94,6 +124,16 @@ public:
     // installed. Callers that collect state in that visitor may use the collected
     // state only when this is true; otherwise they must re-derive it.
     bool IntegrityScanRanOnOpen() const;
+
+    // BOOT-004: bounded collections produced by THIS open's integrity scans for
+    // options.scanFilterHashes. Empty when no filter was requested or the
+    // verify-once memo short-circuited the scan; callers MUST check
+    // IntegrityScanRanOnOpen() and a complete count before using them, and fall
+    // back to per-hash lookups otherwise. Written only during Open (before
+    // `open` is published), never mutated afterwards, so reading them from the
+    // thread that owns the opened reader needs no lock.
+    const std::vector<BlockIndexScanRecordMatch>& ScanRecordMatches() const;
+    const std::vector<BlockIndexScanDerivedMatch>& ScanDerivedMatches() const;
     BlockIndexV2ReadStatus GetRecordById(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus LookupByHash(const uint256& hash, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetActiveByHeight(int height, BlockIndexSnapshot* out, std::string* error) const;
@@ -118,6 +158,9 @@ private:
     std::string generationPath;
     uint64_t generation;
     FixedBlockIndexManifest manifest;
+    // BOOT-004: results of the open-time scans for options.scanFilterHashes.
+    std::vector<BlockIndexScanRecordMatch> scanRecordMatches;
+    std::vector<BlockIndexScanDerivedMatch> scanDerivedMatches;
     FixedBlockIndexStore store;
     BlockIndexActiveIndex active;
     BlockIndexHashIndex hashIndex;

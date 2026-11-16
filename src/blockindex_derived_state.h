@@ -116,6 +116,15 @@ struct BlockIndexDerivedEntry
     }
 };
 
+// BOOT-004: one (RecordId, entry) pair collected while an integrity pass that
+// already decodes every entry is running. See VerifyIntegrity below.
+struct BlockIndexDerivedScanMatch
+{
+    BlockIndexId id;
+    BlockIndexDerivedEntry entry;
+    BlockIndexDerivedScanMatch() : id(BLOCK_INDEX_ID_INVALID) {}
+};
+
 struct BlockIndexDerivedHeader
 {
     uint32_t formatVersion;
@@ -253,6 +262,14 @@ public:
     // single corrupt/undecodable entry so a PRESENT-BUT-CORRUPT derived.dat is
     // detected during Open (not lazily per-Read) and can trigger a rebuild.
     bool VerifyIntegrity(std::string* error) const;
+    // BOOT-004: same pass, same per-entry decode/CRC and same fail-closed
+    // result, plus an OPTIONAL projection: when `collectIds` (sorted ascending)
+    // is supplied, the decoded entry of every matching RecordId is appended to
+    // `collected`. Used by the reader to serve the candidate frontier from a
+    // pass it already performs; NULL/NULL keeps the call byte-identical.
+    bool VerifyIntegrity(std::string* error,
+                         const std::vector<BlockIndexId>* collectIds,
+                         std::vector<BlockIndexDerivedScanMatch>* collected) const;
 
     // A.10.1b-fix2: Update content binding (used by builder before Finalize
     // when generation root is computed from component digests).

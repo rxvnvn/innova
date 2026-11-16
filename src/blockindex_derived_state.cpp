@@ -738,6 +738,13 @@ BlockIndexDerivedLookupStatus BlockIndexDerivedStateStore::Read(BlockIndexId id,
 
 bool BlockIndexDerivedStateStore::VerifyIntegrity(std::string* error) const
 {
+    return VerifyIntegrity(error, NULL, NULL);
+}
+
+bool BlockIndexDerivedStateStore::VerifyIntegrity(std::string* error,
+                                                  const std::vector<BlockIndexId>* collectIds,
+                                                  std::vector<BlockIndexDerivedScanMatch>* collected) const
+{
     if (!open || !readHandle)
         return SetError(error, "derived store is not open for integrity check");
     uint64_t entryEnd = 0;
@@ -780,6 +787,15 @@ bool BlockIndexDerivedStateStore::VerifyIntegrity(std::string* error) const
                 if (!error || error->empty())
                     SetError(error, "derived entry checksum/integrity failure at id " + std::to_string(i + 1));
                 return false;
+            }
+            // BOOT-004: projection on the same decoded entry (no second read).
+            if (collectIds && collected &&
+                std::binary_search(collectIds->begin(), collectIds->end(), (BlockIndexId)(i + 1)))
+            {
+                BlockIndexDerivedScanMatch m;
+                m.id = (BlockIndexId)(i + 1);
+                m.entry = e;
+                collected->push_back(m);
             }
         }
         fclose(f);

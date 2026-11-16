@@ -7,6 +7,8 @@
 
 #include <stdint.h>
 #include <algorithm>
+#include <cstdio>
+#include <map>
 #include <set>
 #include <string>
 
@@ -61,53 +63,134 @@ bool BlockIndexCandidateStartupBuilder::Build(const BlockIndexV2Reader& reader,
                                    &persistedLeaves, &leafError))
     {
         SnapshotCandidateFrontierStore out;
-        // BOOT-003: issue the per-leaf lookups in hashindex KEY ORDER.
+        const size_t leafCount = persistedLeaves.size();
+
+        // BOOT-004: the reader's open-time integrity scans already decode EVERY
+        // record and EVERY derived entry of this generation. When they collected
+        // exactly this leaf set, the frontier is assembled from those in-memory
+        // projections and the builder performs NO random I/O.
         //
-        // Each leaf costs one hashindex point lookup plus one record read plus
-        // one derived-entry read; issued in frontier order those are 3 x N
-        // INDEPENDENT RANDOM probes, which on a cold 8.24M generation measured
-        // ~92k reads at HDD latency (~300 s of the boot, ~80% of it waiting).
-        // The hashindex key is 'h' || hash and RecordIds are hash-sorted, so
-        // ascending leaf hashes turn the same probes into an ascending key/id
-        // walk: the same 3 x N reads, but served by adjacent blocks instead of
-        // seeks. NOTHING semantic changes: the results are placed back at their
-        // original leaf index and the frontier is assembled in the ORIGINAL
-        // order, so the produced store is bit-identical to the unsorted build.
-        std::vector<uint32_t> order(persistedLeaves.size());
-        for (uint32_t i = 0; i < (uint32_t)order.size(); ++i)
-            order[i] = i;
-        std::sort(order.begin(), order.end(),
-                  [&persistedLeaves](uint32_t a, uint32_t b)
-                  {
-                      return persistedLeaves[a] < persistedLeaves[b];
-                  });
-        std::vector<BlockIndexSnapshot> snaps(persistedLeaves.size());
-        std::vector<BlockIndexDerivedEntry> des(persistedLeaves.size());
-        for (size_t oi = 0; oi < order.size(); ++oi)
+        // The previously used per-leaf probes cost 3.06 read syscalls and
+        // 6.85 ms per leaf on a cold 8.24M generation (measured: 93 746
+        // syscalls / 209.9 s for the hashindex+record probes, plus a duplicate
+        // derived read of 31 023 syscalls / 39.2 s). Those probes answered a
+        // question the integrity scans had just answered for free.
+        //
+        // The lookup path below is kept as the honest FALLBACK (verify-once memo
+        // short-circuited the scan, no derived pass, or a generation without
+        // derived data). Both paths produce the same store: results are placed
+        // at their ORIGINAL leaf index, so the frontier order and content are
+        // independent of RecordId ordering and of which path ran.
+        const std::vector<BlockIndexScanRecordMatch>& recMatches = reader.ScanRecordMatches();
+        const std::vector<BlockIndexScanDerivedMatch>& derMatches = reader.ScanDerivedMatches();
+        bool usedScan = reader.IntegrityScanRanOnOpen() &&
+                        recMatches.size() == leafCount &&
+                        derMatches.size() == leafCount;
+
+        if (usedScan)
         {
-            const uint32_t i = order[oi];
-            std::string rerr;
-            if (reader.LookupByHash(persistedLeaves[i], &snaps[i], &rerr) != BLOCK_INDEX_V2_READ_FOUND)
+            std::vector<int32_t> heights(leafCount, 0);
+            std::vector<uint256> hashesPrev(leafCount);
+            std::vector<uint256> trust(leafCount);
+            std::vector<uint32_t> flagsOf(leafCount, 0);
+            std::vector<unsigned char> filled(leafCount, 0);
+            std::map<BlockIndexId, size_t> idToLeaf;
+            for (size_t mi = 0; mi < recMatches.size(); ++mi)
             {
-                if (error) *error = "candidate builder: persisted leaf lookup failed: " + rerr;
-                return false;
+                const BlockIndexScanRecordMatch& m = recMatches[mi];
+                std::vector<uint256>::const_iterator it =
+                    std::lower_bound(persistedLeaves.begin(), persistedLeaves.end(), m.record.hash);
+                if (it == persistedLeaves.end() || *it != m.record.hash)
+                {
+                    if (error) *error = "candidate builder: scanned record absent from the persisted leaf set (id=" +
+                                        std::to_string((uint64_t)m.id) + ")";
+                    return false;
+                }
+                const size_t li = (size_t)(it - persistedLeaves.begin());
+                heights[li] = m.record.height;
+                hashesPrev[li] = m.record.hashPrev;
+                filled[li] = 1;
+                idToLeaf[m.id] = li;
             }
-            std::string derr;
-            if (derived.Read(snaps[i].id, &des[i], &derr) != BLOCK_INDEX_DERIVED_LOOKUP_FOUND)
+            for (size_t mi = 0; mi < derMatches.size(); ++mi)
             {
-                if (error) *error = "candidate builder: persisted leaf derived lookup failed: " + derr;
-                return false;
+                std::map<BlockIndexId, size_t>::const_iterator it = idToLeaf.find(derMatches[mi].id);
+                if (it == idToLeaf.end())
+                {
+                    if (error) *error = "candidate builder: derived match without a scanned record (id=" +
+                                        std::to_string((uint64_t)derMatches[mi].id) + ")";
+                    return false;
+                }
+                trust[it->second] = derMatches[mi].entry.chainTrust;
+                flagsOf[it->second] = derMatches[mi].entry.flags;
+            }
+            for (size_t i = 0; i < leafCount; ++i)
+            {
+                if (!filled[i])
+                {
+                    if (error) *error = "candidate builder: persisted leaf was not found by the integrity scan (" +
+                                        persistedLeaves[i].GetHex() + ")";
+                    return false;
+                }
+                out.AddBlock(persistedLeaves[i], hashesPrev[i], trust[i], heights[i]);
+                out.tipHashes.push_back(persistedLeaves[i]);
+                if (setInvalidBlockHash.count(persistedLeaves[i]))
+                    out.operatorInvalid.insert(persistedLeaves[i]);
+                if (flagsOf[i] & BLOCK_INDEX_DERIVED_FLAG_HAS_BLOCK_SIZE)
+                    out.hasData.insert(persistedLeaves[i]);
             }
         }
-        for (size_t i = 0; i < persistedLeaves.size(); ++i)
+        else
         {
-            const BlockIndexSnapshot& snap = snaps[i];
-            const BlockIndexDerivedEntry& de = des[i];
-            out.AddBlock(snap.hash, snap.hashPrev, de.chainTrust, snap.height);
-            out.tipHashes.push_back(snap.hash);
-            if (setInvalidBlockHash.count(snap.hash)) out.operatorInvalid.insert(snap.hash);
-            if (de.flags & BLOCK_INDEX_DERIVED_FLAG_HAS_BLOCK_SIZE) out.hasData.insert(snap.hash);
+            // BOOT-003: issue the per-leaf lookups in hashindex KEY ORDER.
+            //
+            // The hashindex key is 'h' || hash and RecordIds are hash-sorted, so
+            // ascending leaf hashes turn the probes into an ascending key/id
+            // walk. NOTHING semantic changes: results are placed back at their
+            // original leaf index.
+            std::vector<uint32_t> order(persistedLeaves.size());
+            for (uint32_t i = 0; i < (uint32_t)order.size(); ++i)
+                order[i] = i;
+            std::sort(order.begin(), order.end(),
+                      [&persistedLeaves](uint32_t a, uint32_t b)
+                      {
+                          return persistedLeaves[a] < persistedLeaves[b];
+                      });
+            std::vector<BlockIndexSnapshot> snaps(persistedLeaves.size());
+            std::vector<BlockIndexDerivedEntry> des(persistedLeaves.size());
+            for (size_t oi = 0; oi < order.size(); ++oi)
+            {
+                const uint32_t i = order[oi];
+                std::string rerr;
+                if (reader.LookupByHash(persistedLeaves[i], &snaps[i], &rerr) != BLOCK_INDEX_V2_READ_FOUND)
+                {
+                    if (error) *error = "candidate builder: persisted leaf lookup failed: " + rerr;
+                    return false;
+                }
+                std::string derr;
+                if (derived.Read(snaps[i].id, &des[i], &derr) != BLOCK_INDEX_DERIVED_LOOKUP_FOUND)
+                {
+                    if (error) *error = "candidate builder: persisted leaf derived lookup failed: " + derr;
+                    return false;
+                }
+            }
+            for (size_t i = 0; i < persistedLeaves.size(); ++i)
+            {
+                const BlockIndexSnapshot& snap = snaps[i];
+                const BlockIndexDerivedEntry& de = des[i];
+                out.AddBlock(snap.hash, snap.hashPrev, de.chainTrust, snap.height);
+                out.tipHashes.push_back(snap.hash);
+                if (setInvalidBlockHash.count(snap.hash)) out.operatorInvalid.insert(snap.hash);
+                if (de.flags & BLOCK_INDEX_DERIVED_FLAG_HAS_BLOCK_SIZE) out.hasData.insert(snap.hash);
+            }
         }
+
+        // Execution proof for the gate: which source served the frontier. A
+        // silent revert to per-leaf probing is visible in the boot log itself.
+        printf("BLOCKINDEX_CANDIDATE_FRONTIER leaf_source=%s leaves=%zu\n",
+               usedScan ? "integrity_scan" : "hash_lookup", leafCount);
+        fflush(stdout);
+
         if (bestId != 0)
         {
             BlockIndexDerivedEntry de; std::string derr;
@@ -221,6 +304,10 @@ bool BlockIndexCandidateStartupBuilder::Build(const BlockIndexV2Reader& reader,
             return fail("candidate builder: missing best-tip derived trust: " + derr);
         out.SetBest(bestTipHash, de.chainTrust);
     }
+
+    printf("BLOCKINDEX_CANDIDATE_FRONTIER leaf_source=parent_marker leaves=%zu\n",
+           out.tipHashes.size());
+    fflush(stdout);
 
     delete marker;
     marker = NULL;

@@ -6,7 +6,10 @@
 #include "blockindex_v2_reader.h"
 #include "blockindex_derived_state.h"
 #include "blockindex_generation_lifecycle.h"
+#include "candidate_frontier_metadata.h"
 #include "main.h"
+
+#include <boost/filesystem.hpp>
 
 // ---- V2 StartupAuthority implementation ----
 
@@ -87,6 +90,21 @@ BlockIndexStartupStatus V2BlockIndexStartupAuthority::Open(const std::string& ro
         return BLOCK_INDEX_STARTUP_NOT_AUTHORITATIVE_CAPABLE;
     }
 
+    // BOOT-004 (NOT ENABLED - see ENGINEERING_INVARIANTS.md BOOT-004 status and
+    // STARTUP_FINAL_ACCEPTANCE.md): feeding the candidate-leaf set into the
+    // open-time scans removes 209.9 s + 39.2 s of per-leaf random I/O and was
+    // measured end-to-end on the 8.24M stand (259.3 s -> 41.3 s, identical
+    // frontier). It is DISABLED because the tier2 stand proved a durable-tip
+    // regression that only appears with the filter installed: a fresh native
+    // datadir (EMPTY_NEW -> mine 31 blocks -> restart) comes back at height 0
+    // instead of 31 (mutable tip store read as empty), while the same stand with
+    // this block removed passes restart/reorg(1,20)/restart-again. The scan-side
+    // plumbing (BlockIndexV2ReaderOptions::scanFilterHashes,
+    // collectDerivedForScanMatches) and the builder's fast path stay in the tree
+    // INERT and unreachable from production until that is root-caused; the
+    // builder logs leaf_source=hash_lookup, which the gate rejects, so this
+    // cannot silently become the production path.
+    //
     // Open the V2 reader (reader expects root containing CURRENT, not genDir)
     if (!impl->reader.Open(root, readerOptions, error))
         return BLOCK_INDEX_STARTUP_IO_ERROR;

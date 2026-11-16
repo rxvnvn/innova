@@ -38,6 +38,10 @@ BlockIndexV2Reader& BlockIndexV2Reader::operator=(BlockIndexV2Reader&& other) no
         manifest = other.manifest;
         integrityScanRanOnOpen = other.integrityScanRanOnOpen;
         other.integrityScanRanOnOpen = false;
+        scanRecordMatches = std::move(other.scanRecordMatches);
+        scanDerivedMatches = std::move(other.scanDerivedMatches);
+        other.scanRecordMatches.clear();
+        other.scanDerivedMatches.clear();
         rebuiltDerived = other.rebuiltDerived;
         hasRebuiltDerived = other.hasRebuiltDerived;
         other.hasRebuiltDerived = false;
@@ -172,6 +176,9 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
     // any change to the generation identity re-arms it. No file is written, no
     // on-disk format changes, and a failed scan is never memoised.
     const std::string integrityKey = MakeIntegrityKey(root, nextManifest);
+    // BOOT-004: filled only when this open actually runs the records scan.
+    std::vector<BlockIndexScanRecordMatch> nextScanMatches;
+    std::vector<BlockIndexScanDerivedMatch> nextDerivedMatches;
     if (!IntegrityAlreadyVerified(integrityKey))
     {
         // U4 (Cohort U): the per-record bounds+decode+CRC check is unchanged, but
@@ -189,9 +196,23 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
         // inside ReadAllSequential). The visitor cannot mask a corrupt record:
         // the scan's own return value still decides the open.
         const BlockIndexIntegrityScanVisitor visitor = options.integrityScanVisitor;
+        // BOOT-004: collect the filtered records ON THIS SAME PASS. The filter
+        // is the small immutable candidate-leaf set; the scan already decodes
+        // every record, so this costs one binary search per record and no I/O.
+        const std::vector<uint256>& scanFilter = options.scanFilterHashes;
+        if (!scanFilter.empty())
+            nextScanMatches.reserve(scanFilter.size());
         if (!nextStore.ReadAllSequential(
-                [&visitor](BlockIndexId id, const BlockIndexRecord& rec) -> bool
+                [&visitor, &scanFilter, &nextScanMatches](BlockIndexId id, const BlockIndexRecord& rec) -> bool
                 {
+                    if (!scanFilter.empty() &&
+                        std::binary_search(scanFilter.begin(), scanFilter.end(), rec.hash))
+                    {
+                        BlockIndexScanRecordMatch m;
+                        m.id = id;
+                        m.record = rec;
+                        nextScanMatches.push_back(m);
+                    }
                     if (visitor) visitor(id, rec);
                     return true;
                 }, &vErr))
@@ -265,8 +286,24 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
         if (derivedOk && derivedFilePresent)
         {
             derived.GetContentBinding(corruptBinding);
+            // BOOT-004: collect the derived entries for the RecordIds matched on
+            // the records scan above. The integrity pass already decodes and
+            // CRC-checks EVERY entry, so this projection costs no extra I/O.
+            // Ids come out of the sequential records scan in RecordId order, so
+            // the filter is already sorted for the binary search below.
+            std::vector<BlockIndexId> derivedFilter;
+            const bool collectDerived = options.collectDerivedForScanMatches && !nextScanMatches.empty();
+            if (collectDerived)
+            {
+                derivedFilter.reserve(nextScanMatches.size());
+                for (size_t mi = 0; mi < nextScanMatches.size(); ++mi)
+                    derivedFilter.push_back(nextScanMatches[mi].id);
+            }
             std::string ivErr;
-            if (!derived.VerifyIntegrity(&ivErr)) { derivedOk = false; derr = ivErr; }
+            if (!derived.VerifyIntegrity(&ivErr,
+                                         collectDerived ? &derivedFilter : NULL,
+                                         collectDerived ? &nextDerivedMatches : NULL))
+            { derivedOk = false; derr = ivErr; }
         }
         if (!derivedOk)
         {
@@ -322,10 +359,13 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
         }
     }
     rootPath = root; generationPath = dir; generation = current.generation; manifest = nextManifest;
+    // BOOT-004: publish the scan-side projections with the open.
+    scanRecordMatches.swap(nextScanMatches);
+    scanDerivedMatches.swap(nextDerivedMatches);
     cacheCapacity = options.cacheCapacityBytes; cache.clear(); lru.clear(); stats = BlockIndexV2ReaderCacheStats(); stats.capacityBytes = cacheCapacity; open = true;
     Clear(error); return true;
 }
-void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockIndexDerivedStateStore(); integrityScanRanOnOpen = false; hasRebuiltDerived = false; rebuiltDerived = BlockIndexDerivedStateStore(); if (!derivedRebuildDir.empty()) { boost::system::error_code rmEc; boost::filesystem::remove_all(derivedRebuildDir, rmEc); derivedRebuildDir.clear(); } blockDataDirForRebuild.clear(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
+void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockIndexDerivedStateStore(); integrityScanRanOnOpen = false; scanRecordMatches.clear(); scanDerivedMatches.clear(); hasRebuiltDerived = false; rebuiltDerived = BlockIndexDerivedStateStore(); if (!derivedRebuildDir.empty()) { boost::system::error_code rmEc; boost::filesystem::remove_all(derivedRebuildDir, rmEc); derivedRebuildDir.clear(); } blockDataDirForRebuild.clear(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
 bool BlockIndexV2Reader::IsOpen() const { LOCK(cs); return open; }
 uint64_t BlockIndexV2Reader::Generation() const { LOCK(cs); return generation; }
 uint64_t BlockIndexV2Reader::RecordCount() const { LOCK(cs); return open ? manifest.recordCount : 0; }
@@ -343,6 +383,8 @@ bool BlockIndexV2Reader::GetGenerationInputDigest(unsigned char out[32], std::st
 }
 
 bool BlockIndexV2Reader::IntegrityScanRanOnOpen() const { LOCK(cs); return integrityScanRanOnOpen; }
+const std::vector<BlockIndexScanRecordMatch>& BlockIndexV2Reader::ScanRecordMatches() const { return scanRecordMatches; }
+const std::vector<BlockIndexScanDerivedMatch>& BlockIndexV2Reader::ScanDerivedMatches() const { return scanDerivedMatches; }
 bool BlockIndexV2Reader::ForEachRecordSequential(
     const std::function<bool(BlockIndexId, const BlockIndexRecord&)>& visit, std::string* error) const {
     LOCK(cs);

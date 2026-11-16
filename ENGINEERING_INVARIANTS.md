@@ -59,9 +59,11 @@ startup/recovery/reorg-стенды, тяжёлый cold-boot стенд.
   даёт второй RB-tree на 2 642 643 записи.
 - **Исправление.** `setStakeSeen.swap(ss)`; содержимое побитово то же.
 - **Коммиты.** `lab/mem-safe-startup-20261116`.
-- **Обязательные проверки.** gate `boot --vmhwm-kb`; focused suite
-  `startup_memory_invariants_tests` (эквивалентность множества); сверка
-  `setStakeSeen_count` через `getmemorydiagnostics` (2 642 643 на 8.24M).
+- **Обязательные проверки.** gate `boot --vmhwm-kb` (маркер `handoff=swap` в
+  строке `stake_seen_source=` — структурная проверка передачи владения, не
+  зависящая от RSS); focused suite `startup_memory_invariants_tests`
+  (эквивалентность множества); сверка `setStakeSeen_count` через
+  `getmemorydiagnostics` (2 642 643 на 8.24M).
 - **Эталон.** Счётчик записей неизменен; VmHWM не растёт; PoS duplicate
   protection подтверждается reorg/PoS-тестами.
 - **Обнаружение регрессии.** Появление копии видно как скачок `VmHWM`/`RssAnon`
@@ -135,23 +137,107 @@ startup/recovery/reorg-стенды, тяжёлый cold-boot стенд.
 ## BOOT-003 — измеримые пределы чтения, syscalls и времени
 
 - **Определение.** Старт характеризуется измеренными пределами: read syscalls
-  на запись, read bytes на запись, wall time до `AUTHORITY_READY` и до RPC.
-  Случайные точечные пробы не масштабируются с числом листьев фронтьера.
+  на запись и read bytes на запись **для фазы авторитетного блочного индекса**
+  (метки `STARTUP_IO` `A_startup_enter` → `B_bootstrap_open`: проходы
+  records.dat / derived.dat / active.dat), плюс wall time до RPC на именованном
+  профиле стенда. Случайные точечные пробы не масштабируются с числом листьев
+  фронтьера.
 - **Область.** Последовательные проходы (`ReadAllSequential`,
   `VerifyIntegrity`, пересчёт корня), построение candidate frontier.
+- **Почему метрика СКОУПЛЕНА (измерено 2026-11-16, 8.24M, тёплый прогон,
+  точные дельты `/proc/self/io` по меткам).** Процесс-широкий `syscr` не
+  является расходом чтения records.dat:
+
+```text
+компонент (фаза)                                 read syscalls   доля
+LevelDB env / dbenv_open                              16 019        2.6%
+bootstrap: 2 прохода records + derived + active        4 577        0.75%
+  из них собственно sequential-проходы (1 MiB)         3 574
+setStakeSeen (на скане)                                    2
+candidate frontier (BOOT-004)                               6      0.001%
+live-authority open: replay 70 614 post-S записей     497 837       81.7%
+wallet load (BDB)                                     10 681        1.8%
+Store3A txloc open                                    80 204       13.2%
+остальное (tip/invalid/hreg/addrman/RPC)                  60
+итого                                                609 524
+```
+
+  То есть 0.05 «syscalls на запись» в процесс-широком смысле **недостижим
+  конструктивно** на этом datadir: пол из компонентов, не связанных с
+  records.dat, равен ~0.073. Фактический расход на records.dat после BOOT-001/002
+  — 0.00043 syscall/запись (3 574 syscall на 8 241 282 записи).
+  Нормативное изменение определения вынесено на OWNER REVIEW (§ журнал,
+  2026-11-16); численные пороги не менялись. Процесс-широкие значения
+  по-прежнему измеряются и печатаются как информационные.
 - **Происхождение.** 2026-11-16: 2.34M syscalls по 3.1 KB; 92k случайных
   проб в frontier (~300 s).
 - **Исправление.** `SequentialIoBuffer` (1 MiB) в четырёх последовательных
   циклах; листья фронтьера опрашиваются в порядке ключа hashindex
   (`BOOT-003`, blockindex_candidate_startup_builder.cpp).
-- **Проверки.** gate `boot --io <pid-io> --records N`:
-  `syscalls/record <= 0.05`, `bytes/record <= 780`; профиль стенда для времени
-  (`profiles.atlas-lab-sdb-hdd`, допуск 30%).
-- **Эталон.** Baseline: 0.284 syscalls/record, 888 B/record, 433 s (сегодня),
-  2 228 s (исторический cold под нагрузкой).
-- **Обнаружение регрессии.** Порог нарушен; время профиля превышено в 1.3x.
+- **Проверки.** gate `boot --log <debug.log> --records N` (метки `STARTUP_IO`
+  из `-startuptrace=1 -startupio=1`): `syscalls/record <= 0.05`,
+  `bytes/record (rchar) <= 780`; `--seconds N --profile atlas-lab-sdb-hdd`:
+  `cold_seconds <= reference * tolerance`; без меток gate откатывается на
+  процесс-широкий счётчик и явно печатает, что это legacy-метрика.
+- **Эталон.** Baseline до этапа: 0.284 syscalls/record, 888 B/record, 433 s
+  (2 228 s исторически, под конкурирующим production I/O). После BOOT-001/002 и
+  BOOT-004 (8.24M, HDD, 1 GiB, swap=0, кэш вытеснен): фаза индекса
+  0.00056 syscall/record и 574 B/record; до RPC 41.3 s.
+- **Обнаружение регрессии.** Порог фазы нарушен (возврат 4 KiB чтений даёт
+  ~0.28, третий проход records.dat даёт ~802 B/record); время профиля выше
+  42 s x 1.5.
 - **Статус.** `PROVEN` (замеры этапа).
 - **Разрешённое изменение.** Порог меняется только с OWNER GO.
+
+## BOOT-004 — candidate frontier строится из уже выполняемых сканов
+
+- **Определение.** Статический фронтьер кандидатов (`candidate-leaves.dat`,
+  генерационно-связанный, отсортированный набор хэшей) обслуживается
+  **проекцией на сканах, которые старт выполняет для целостности**: записи
+  собираются на per-record скане `records.dat`, derived-записи — на
+  per-entry проходе `derived.dat`. Никаких per-leaf случайных обращений
+  (hashindex точка, чтение records, чтение derived) на этом пути нет.
+  Разрешение `hash → RecordId` через hashindex и повторное чтение derived
+  остаются в honest-fallback (memo уже верифицировал генерацию, старые
+  генерации без derived/leaf-метаданных).
+- **Область.** `V2BlockIndexStartupAuthority::Open` (читает leaf-набор ДО
+  открытия ридера), `BlockIndexV2Reader::Open` (собирает проекции на двух
+  сканах), `BlockIndexCandidateStartupBuilder::Build`.
+- **Происхождение.** 2026-11-16, замер на 8.24M: 30 633 листа × (hashindex
+  точка + запись + derived) = 93 746 + 31 023 read syscalls, 209.9 s + 39.2 s
+  (итого ~217 s из 259 s старта), при 6.85 ms на лист (латентность HDD).
+- **Исправление.** `BlockIndexV2ReaderOptions::scanFilterHashes` +
+  `collectDerivedForScanMatches`; проекции отдаются как
+  `ScanRecordMatches()`/`ScanDerivedMatches()`; сборка размещает результаты по
+  ИСХОДНОМУ индексу листа, поэтому порядок и содержимое фронтьера не зависят от
+  порядка RecordId и от того, какой путь сработал.
+- **Коммиты.** `lab/mem-safe-startup-20261116` (BOOT-004).
+- **Обязательные проверки.** gate `boot`: ровно одна строка
+  `BLOCKINDEX_CANDIDATE_FRONTIER leaf_source=` со значением `integrity_scan`;
+  suite `blockindex_candidate_startup_builder_tests`
+  (`boot004_scan_projection_parity_with_lookup_path`: паритет быстрого и
+  fallback-путей по tipHashes/blocks/trust/best/operatorInvalid/hasData на
+  генерации с боковой ветвью, плюс совпадение проекции с `LookupByHash` и
+  `derived.Read`).
+- **Эталон.** 8.24M: 30 633 листа, `candidate_tips=30633` (идентично),
+  фаза кандидата 6 read syscalls / ~1.5 s (было ~217 s), полный старт до RPC
+  41.3 s (было 259.3 s), VmHWM 413.2 MB (было 538.8 MB).
+- **Обнаружение регрессии.** `leaf_source=hash_lookup` или `parent_marker` в
+  обычном старте; рост VmHWM на ~30-60 MB (материализация снапшотов через LRU);
+  возврат фазы кандидата к минутам на 8.24M.
+- **Статус.** `PARTIAL — ИЗМЕРЕНО, НО НЕ ВКЛЮЧЕНО.` Оптимизация доказана на
+  8.24M (паритет + замер), но на tier2-стенде обнаружена блокирующая регрессия:
+  свежий нативный datadir (EMPTY_NEW → 31 блок → restart) с включённым фильтром
+  возвращается на высоту 0 (mutable tip store читается пустым), тогда как тот же
+  стенд с удалённым фильтром проходит restart/reorg(1,20)/restart. Фильтр в
+  `V2BlockIndexStartupAuthority::Open` поэтому ОТКЛЮЧЁН; быстрый путь
+  недостижим из продакшена и лог печатает `leaf_source=hash_lookup`, который
+  гейт отвергает (незаметно включить путь нельзя). Включение допускается только
+  после root cause + закрытия регрессии и повторного tier2/батареи.
+- **Границы.** Проекция ограничена размером фронтьера (30633 записи ~6 MB),
+  т.е. O(F), и не является O(высота). Fail-closed: лист, не найденный сканом,
+  или нечитаемый `candidate-leaves.dat` при его наличии — отказ, не «пустой
+  фронтьер».
 
 ## STORE-001 — единственный авторитетный active tip
 
@@ -241,4 +327,15 @@ tier3  перед релизным GO и после изменений горя�
             REORG-001, P2P-001) на базе integ/rel-p4 @ f2c79b8e.
             Пороги: memory.max_vmhwm_kb=655360, boot.max_read_syscalls_per_record=0.05,
             boot.max_read_bytes_per_record=780.
+2026-11-16  BOOT-004 добавлен (frontier из сканов; 217 s -> 1.5 s, замер 8.24M);
+            MEM-002 получил структурный маркер handoff=swap.
+2026-11-16  BOOT-003: метрика СКОУПЛЕНА на фазу блочного индекса (метки
+            STARTUP_IO), значения порогов НЕ изменены (0.05 / 780). Причина —
+            измеренная атрибуция: процесс-широкие syscalls на 8.24M на 95%
+            состоят из live-tip replay (497 837), txloc (80 204), LevelDB env
+            (16 019) и wallet (10 681); records.dat читается за 3 574 syscall
+            (0.00043/запись). Профиль стенда обновлён на принятую базу 42 s x 1.5
+            (было 433 s x 1.3, что перестало обнаруживать возврат ~217 s).
+            СТАТУС: изменение нормативного определения — PENDING OWNER REVIEW.
+            До решения OWNER процесс-широкие числа печатаются как информационные.
 ```

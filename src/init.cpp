@@ -778,6 +778,29 @@ static void StartupTrace(const char* phase)
         g_startupTraceBegin = now;
         g_startupTracePrev = now;
     }
+    // -startupio=1 (diagnostic, strictly additive): the same phase marker also
+    // carries /proc/self/io read counters, so the read-amplification invariants
+    // (BOOT-003/BOOT-004) can be attributed per phase instead of guessed from a
+    // process-wide total. One cached arg lookup per marker when off.
+    if (GetBoolArg("-startupio", false))
+    {
+        unsigned long long syscr = 0, rchar = 0, read_bytes = 0;
+        FILE* iof = fopen("/proc/self/io", "rb");
+        if (iof)
+        {
+            char line[256];
+            while (fgets(line, sizeof(line), iof))
+            {
+                if (!strncmp(line, "syscr:", 6)) syscr = strtoull(line + 6, NULL, 10);
+                else if (!strncmp(line, "rchar:", 6)) rchar = strtoull(line + 6, NULL, 10);
+                else if (!strncmp(line, "read_bytes:", 11)) read_bytes = strtoull(line + 11, NULL, 10);
+            }
+            fclose(iof);
+        }
+        printf("STARTUP_TRACE %-34s since_prev=%8" PRId64"ms total=%8" PRId64"ms syscr=%llu rchar=%llu read_bytes=%llu\n",
+               phase, now - g_startupTracePrev, now - g_startupTraceBegin, syscr, rchar, read_bytes);
+    }
+    else
     printf("STARTUP_TRACE %-34s since_prev=%8" PRId64"ms total=%8" PRId64"ms\n",
            phase, now - g_startupTracePrev, now - g_startupTraceBegin);
     fflush(stdout);
