@@ -1,6 +1,7 @@
 #include "blockindex_shadow_startup.h"
 
 #include "authoritative_blockindex_hot_resolver.h"
+#include "blockindex_authoritative_startup.h"   // X1: ReleaseAuthoritativeLiveBoundTo
 #include "blockindex_shadow_runtime.h"
 #include "blockindex_v2_reader.h"
 #include "main.h"
@@ -301,8 +302,13 @@ bool RetainBlockIndexStakingNavigator(const std::string& root, std::string* erro
             *error = navErr;
         return false;
     }
+    // X1: the local `nav` now owns the PREVIOUS navigator and will destroy it (and
+    // the cold reader inside it) when this function returns. Every borrower of that
+    // reader must be gone first: the live authority (borrowed base reader) and the
+    // hot resolver (bound to the same reader). Order: borrowers, then owner.
+    ReleaseAuthoritativeLiveBoundTo(g_stakingNavigator ? g_stakingNavigator->GetColdReader() : NULL);
+    g_stakingAuthoritativeResolver.reset();   // dependent on the old reader FIRST
     g_stakingNavigator.swap(nav);
-    g_stakingAuthoritativeResolver.reset();
     return true;
 }
 
@@ -322,6 +328,9 @@ static bool RetainBlockIndexAuthoritativeNavigatorImpl(
             *error = "authoritative navigator: no cold reader";
         return false;
     }
+    // X1: release every borrower of the OLD navigator's cold reader before the swap
+    // destroys it (same rule as RetainBlockIndexStakingNavigator / Clear).
+    ReleaseAuthoritativeLiveBoundTo(g_stakingNavigator ? g_stakingNavigator->GetColdReader() : NULL);
     g_stakingAuthoritativeResolver.reset(
         new AuthoritativeBlockIndexHotResolver(coldReader));
     nav->SetProductionHotResolver(g_stakingAuthoritativeResolver.get());
@@ -382,6 +391,11 @@ void ClearBlockIndexStakingNavigator()
     // first leaves the resolver referencing a destroyed reader, and any later
     // lock/lookup through it hits a destroyed CCriticalSection
     // ("recursive_mutex::lock(): Assertion !pthread_mutex_lock").
+    // X1: same rule as the retain sites -- every borrower of the cold reader this
+    // navigator owns is released BEFORE the reader dies. The live authority is a
+    // borrower (raw base-reader pointer), so it goes first; then the hot resolver;
+    // then the navigator that owns the reader.
+    ReleaseAuthoritativeLiveBoundTo(g_stakingNavigator ? g_stakingNavigator->GetColdReader() : NULL);
     g_stakingAuthoritativeResolver.reset();   // drop the dependent FIRST
     g_stakingNavigator.reset();
 }

@@ -21,6 +21,7 @@
 #include "fixed_blockindex_store.h"
 
 #include <memory>
+#include <stdio.h>            // X1: stderr diagnostic for a lifetime invariant
 #include <string>
 
 
@@ -958,6 +959,35 @@ BlockIndexAuthoritativeLive* GetAuthoritativeLiveAuthority()
         return g_testLiveAuthority;
     if (!g_authoritativeContext) return NULL;
     return g_authoritativeContext->live.get();
+}
+
+// X1 (reader lifetime): see blockindex_authoritative_startup.h. Two disjoint
+// borrower classes can hold the navigator's cold reader:
+//   * the process-lifetime production authority (g_authoritativeContext->live) --
+//     OWNED here, so it is destroyed together with its materializer/tip;
+//   * a test-installed authority (g_testLiveAuthority) -- owned by the test, so
+//     only the process-global HANDLE is dropped; the test still owns the object.
+// Both are released BEFORE the reader dies, which is the whole invariant.
+void ReleaseAuthoritativeLiveBoundTo(const BlockIndexV2Reader* reader)
+{
+    if (reader == NULL)
+        return;
+    if (g_testLiveAuthority != NULL && g_testLiveAuthority->BaseReaderPtr() == reader)
+    {
+        fprintf(stderr, "INVARIANT(X1): releasing the test live-authority handle bound to a base reader "
+                        "that is being destroyed (reader=%p)\n", (const void*)reader);
+        fflush(stderr);
+        g_testLiveAuthority = NULL;
+    }
+    if (g_authoritativeContext != NULL && g_authoritativeContext->live &&
+        g_authoritativeContext->live->BaseReaderPtr() == reader)
+    {
+        fprintf(stderr, "INVARIANT(X1): releasing the process live authority bound to base reader %p "
+                        "before its navigator is destroyed (authority continues from the new base reader)\n",
+                (const void*)reader);
+        fflush(stderr);
+        g_authoritativeContext->live.reset();
+    }
 }
 
 bool FlushAuthoritativeTipWindowAtShutdown()

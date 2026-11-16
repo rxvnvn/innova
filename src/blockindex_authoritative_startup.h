@@ -177,6 +177,24 @@ void PrintAuthoritativeResidency(const char* tag);
 // in blk*.dat) and the next start re-fetches them. Caller holds cs_main.
 bool FlushAuthoritativeTipWindowAtShutdown();
 
+class BlockIndexV2Reader;
+
+// X1 (reader lifetime / lock invariant): release EVERY process-global borrower
+// that is still bound to `reader`, and must therefore run BEFORE the navigator
+// that owns `reader` is destroyed or replaced. The production live authority
+// borrows the navigator's cold reader as a RAW pointer
+// (BlockIndexAuthoritativeLive::Open), so destroying the navigator while the
+// authority survives makes every later IsOpen() lock a destroyed
+// CCriticalSection: that is a use-after-free, and it surfaces either as a futex
+// wait that never returns or as a glibc `mutex->__data.__owner == 0` SIGABRT --
+// NOT as a recursive lock of a live mutex.
+//
+// Callers: the navigator retain/replace/clear sites in blockindex_shadow_startup.cpp,
+// which pass the OLD navigator's cold reader. Inert in production: the navigator is
+// retained once for the process lifetime and never replaced there, so this cannot
+// silently downgrade a live authority in a running node.
+void ReleaseAuthoritativeLiveBoundTo(const BlockIndexV2Reader* reader);
+
 // G1: production live-authority accessor. NULL when NOT in authoritative mode.
 // The returned object (if any) is retained process-lifetime by the authoritative
 // startup context and bound to the single process-open base reader + the mutable

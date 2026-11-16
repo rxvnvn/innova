@@ -1260,6 +1260,14 @@ bool BlockIndexAuthoritativeLive::IsOpen() const
     return impl_->open;
 }
 
+// X1 (reader lifetime): the base reader is BORROWED (see header). Exposed so the
+// navigator lifecycle can prove no borrower references a reader it is about to
+// destroy; this accessor never opens, closes, or extends any lifetime.
+const BlockIndexV2Reader* BlockIndexAuthoritativeLive::BaseReaderPtr() const
+{
+    return impl_ ? impl_->baseReader : NULL;
+}
+
 void BlockIndexAuthoritativeLive::Close()
 {
     if (impl_->seam)

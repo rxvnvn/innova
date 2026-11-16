@@ -14,6 +14,7 @@
 #include "../blockindex_authoritative_startup.h"
 #include "../blockindex_startup_bootstrap.h"
 #include "../blockindex_shadow_startup.h"      // RetainBlockIndexAuthoritativeNavigator / getter
+#include "../blockindex_authoritative_live.h"  // X1: live authority borrows the base reader
 #include "../authoritative_blockindex_hot_resolver.h"
 #include "../blockindex_v2_reader.h"
 #include "../blockindex_generation_builder.h"
@@ -27,6 +28,7 @@
 #include <boost/filesystem.hpp>
 
 #include <assert.h>
+#include <memory>
 #include <stdio.h>
 #include <string>
 #include <vector>
@@ -562,6 +564,69 @@ BOOST_AUTO_TEST_CASE(startup_wallet_locator_resolves_by_value_not_mapblockindex)
 
     ClearBlockIndexStakingNavigator();
     g_fAuthoritativeStartup = oldAuthoritative;
+}
+
+// X1 REGRESSION (reader lifetime / lock hierarchy).
+//
+// The process live authority BORROWS the retained navigator's cold reader as a
+// RAW pointer (BlockIndexAuthoritativeLive::Open). Replacing the retained
+// navigator destroys that reader. Before this fix the authority kept the
+// dangling pointer, so the next by-value resolve locked a DESTROYED
+// CCriticalSection. That is a use-after-free, and it surfaces in two shapes:
+//   * process-isolated suite run -> SIGABRT inside BlockIndexV2Reader::IsOpen():
+//     "Fatal glibc error: pthread_mutex_lock.c:94 ... __owner == 0";
+//   * the same case alone -> a futex wait that never returns (the freed lock
+//     word still reads as locked).
+// Neither is a recursive lock of a live (recursive) mutex: the mutex is gone.
+//
+// Invariant enforced here: every borrower of a base reader is released BEFORE
+// the reader it borrows is destroyed.
+BOOST_AUTO_TEST_CASE(x1_navigator_replacement_releases_bound_live_authority)
+{
+    AuthNavFixture fx(4);
+    std::string error;
+    BOOST_REQUIRE_MESSAGE(RetainBlockIndexStakingNavigator(fx.root.string(), &error), error);
+
+    const BlockIndexV2Reader* borrowed = GetAuthoritativeNavigatorReader();
+    BOOST_REQUIRE(borrowed != NULL);
+    BOOST_REQUIRE(borrowed->IsOpen());
+
+    std::unique_ptr<BlockIndexAuthoritativeLive> live(new BlockIndexAuthoritativeLive());
+    BOOST_REQUIRE_MESSAGE(live->Open(fx.root.string(), borrowed, 2048, &error), error);
+    BOOST_REQUIRE(live->BaseReaderPtr() == borrowed);
+
+    SetAuthoritativeLiveForTesting(live.get());
+    BOOST_REQUIRE(GetAuthoritativeLiveAuthority() == live.get());
+
+    // Replace the retained navigator: the OLD navigator -- and the cold reader
+    // `borrowed` points into -- is destroyed here.
+    AuthNavFixture fx2(3);
+    BOOST_REQUIRE_MESSAGE(RetainBlockIndexStakingNavigator(fx2.root.string(), &error), error);
+    BOOST_REQUIRE(GetAuthoritativeNavigatorReader() != borrowed);
+
+    // RED before the fix: the live authority still referenced the destroyed
+    // reader (every later IsOpen()/lookup would lock freed mutex memory).
+    BOOST_REQUIRE_MESSAGE(GetAuthoritativeLiveAuthority() == NULL,
+        "X1: a live authority still references the destroyed base reader "
+        "(the next by-value resolve would lock a destroyed CCriticalSection)");
+
+    // GREEN after the fix: the exact by-value resolve that aborted/hung in X1
+    // must work against the NEW base reader.
+    const bool oldAuthoritative = g_fAuthoritativeStartup;
+    g_fAuthoritativeStartup = true;
+    {
+        LOCK(cs_main);
+        BlockIndexSnapshot snap;
+        const AuthoritativeBlockResolutionResult resolved =
+            ResolveAuthoritativeBlockSnapshotR(fx2.active[3].hash, &snap, &error);
+        BOOST_CHECK_EQUAL((int)resolved, (int)AUTHORITATIVE_BLOCK_FOUND);
+        BOOST_CHECK_EQUAL(snap.height, 3);
+        BOOST_CHECK(snap.hash == fx2.active[3].hash);
+    }
+    g_fAuthoritativeStartup = oldAuthoritative;
+
+    ClearAuthoritativeLiveForTesting();   // the handle was already dropped by the fix
+    ClearBlockIndexStakingNavigator();
 }
 
 BOOST_AUTO_TEST_SUITE_END()

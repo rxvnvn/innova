@@ -271,6 +271,16 @@ public:
     uint64_t BaseGeneration() const;
     bool IsOpen() const;
 
+    // X1 (reader lifetime): the live authority BORROWS its base reader. The
+    // pointer is owned by the ColdHotSeamNavigator that was current when Open()
+    // ran; this object never frees it. The owner of that navigator's lifetime
+    // must ask this question before destroying the reader: a borrower that
+    // outlives its reader turns every later IsOpen()/lookup into a
+    // use-after-free on a destroyed CCriticalSection (futex hang, or glibc
+    // `mutex->__data.__owner == 0` SIGABRT). Returns NULL when no reader has
+    // been bound yet.
+    const BlockIndexV2Reader* BaseReaderPtr() const;
+
     void Close();
 
 public:
