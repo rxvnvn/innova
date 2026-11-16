@@ -26,7 +26,9 @@ BlockIndexStartupStatus BlockIndexStartupBootstrap::Open(const std::string& root
     //    generation for the CURRENT pointer, and it owns the generation-bound
     //    reader + derived store (exposed via ReaderPtr/DerivedStorePtr).
     {
-        const BlockIndexStartupStatus st = authority_.Open(root, error);
+        // BOOT-001: the caller's reader options (integrity-scan visitor) must
+        // reach the SINGLE production reader open.
+        const BlockIndexStartupStatus st = authority_.Open(root, options, error);
         if (st != BLOCK_INDEX_STARTUP_OK)
             return st;
     }

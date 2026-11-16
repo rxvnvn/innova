@@ -51,6 +51,12 @@ AuthoritativeStartupContext* g_authoritativeContext = NULL;
 
 // Set once authoritative mode is selected (guards init.cpp continuation).
 bool g_fAuthoritativeStartup = false;
+// BOOT-001 evidence: which path produced setStakeSeen on the last startup.
+// "integrity_scan" = folded into the reader-open scan (one pass over
+// records.dat); "sequential_rebuild" = the streaming A.10.1o builder (fallback
+// when the verify-once memo skipped the scan). Reported in the residency line
+// so a regression to a second pass is visible in the boot log itself.
+static const char* g_stakeSeenSource = "none";
 
 // Publish startup globals from the bootstrap anchors + by-value authority.
 bool PublishStartupGlobals(AuthoritativeStartupContext& ctx, std::string* error)
@@ -252,6 +258,20 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
     // 1. Bootstrap (open + validate authoritative generation, pin best-tip +
     //    genesis permanent anchors; fail-closed).
     BlockIndexV2ReaderOptions opts;
+    // BOOT-001: the reader-open integrity scan already decodes EVERY committed
+    // record (RecordId order, per-record CRC, fail-closed) before
+    // AUTHORITY_READY. setStakeSeen is a pure per-record projection of those
+    // same bytes, so it is collected THERE instead of re-reading records.dat in
+    // a second full pass. Nothing is committed until Open returns success, and
+    // if the verify-once memo short-circuits the scan (a repeat open inside one
+    // process) IntegrityScanRanOnOpen() stays false and the caller falls back
+    // to the streaming rebuild below - the set is never served half-built.
+    std::set<std::pair<COutPoint, unsigned int> > stakeSeenFromIntegrityScan;
+    opts.integrityScanVisitor = [&stakeSeenFromIntegrityScan](BlockIndexId, const BlockIndexRecord& rec)
+    {
+        if (rec.nFlags & CBlockIndex::BLOCK_PROOF_OF_STAKE)
+            stakeSeenFromIntegrityScan.insert(std::make_pair(rec.prevoutStake, rec.nStakeTime));
+    };
     {
         const BlockIndexStartupStatus st = ctx->bootstrap.Open(v2Root, opts, error);
         if (st != BLOCK_INDEX_STARTUP_OK)
@@ -262,19 +282,45 @@ bool InitBlockIndexAuthoritative(const std::string& v2Root, std::string* error)
     if (!PublishStartupGlobals(*ctx, error))
         return false;
 
-    // 3. setStakeSeen via A.10.1o builder (fail-closed).
+    // 3. setStakeSeen: collected by the integrity scan when it ran (BOOT-001);
+    //    otherwise rebuilt by the A.10.1o streaming builder (fail-closed).
     if (error) error->clear();
     {
         const BlockIndexV2Reader* rd = ctx->bootstrap.ReaderPtr();
-        std::set<std::pair<COutPoint, unsigned int> > ss;
-        BlockIndexStakeSeenBuilder sb;
-        std::string serr;
-        if (!sb.Build(*rd, &ss, &serr))
+        if (rd->IntegrityScanRanOnOpen())
         {
-            if (error) *error = "authoritative startup: setStakeSeen: " + serr;
-            return false;
+            // MEM-002: swap (never assign) - an lvalue copy would materialize a
+            // second RB-tree of the same size (~178 MiB at 2.64M PoS records)
+            // and show up only as a VmHWM spike. swap() moves the same nodes;
+            // the payload is bit-identical and the empty container dies here.
+            setStakeSeen.swap(stakeSeenFromIntegrityScan);
+            g_stakeSeenSource = "integrity_scan";
+            printf("BLOCKINDEX_V2_AUTHORITATIVE stake_seen_source=integrity_scan records_pass=1 entries=%llu\n",
+                   (unsigned long long)setStakeSeen.size());
+            fflush(stdout);
         }
-        setStakeSeen = ss; // A.10.1o builder reproduces legacy exactly
+        else
+        {
+            std::set<std::pair<COutPoint, unsigned int> > ss;
+            BlockIndexStakeSeenBuilder sb;
+            std::string serr;
+            if (!sb.Build(*rd, &ss, &serr))
+            {
+                if (error) *error = "authoritative startup: setStakeSeen: " + serr;
+                return false;
+            }
+            // MEM-002: hand the freshly built set over instead of COPYING it.
+            // A plain assignment materializes a second RB-tree of the same size
+            // (~178 MiB measured at 2.64M PoS records) and is visible only as a
+            // VmHWM spike. swap() moves the same nodes: no element is touched, no
+            // ordering assumption changes, and the payload is bit-identical. `ss`
+            // is a local, so the emptied container dies here.
+            setStakeSeen.swap(ss); // A.10.1o builder reproduces legacy exactly
+            g_stakeSeenSource = "sequential_rebuild";
+            printf("BLOCKINDEX_V2_AUTHORITATIVE stake_seen_source=sequential_rebuild records_pass=2 entries=%llu\n",
+                   (unsigned long long)setStakeSeen.size());
+            fflush(stdout);
+        }
     }
 
     // 4. (moved after candidate build — see below) Build the candidate frontier
@@ -931,9 +977,9 @@ void PrintAuthoritativeResidency(const char* tag)
     }
     PrintBlockIndexResidency("BY_VALUE_AUTHORITATIVE",
                             (int64_t)AuthoritativeGeneration(), tag, hc, hp, pc, pp);
-    printf("BLOCKINDEX_ATTRIBUTION %s stake_seen=%llu candidate_tips=%llu\n",
+    printf("BLOCKINDEX_ATTRIBUTION %s stake_seen=%llu candidate_tips=%llu stake_seen_source=%s\n",
            tag, (unsigned long long)setStakeSeen.size(),
-           (unsigned long long)mapCandidateTips.size());
+           (unsigned long long)mapCandidateTips.size(), g_stakeSeenSource);
     fflush(stdout);
 }
 

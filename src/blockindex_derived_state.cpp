@@ -2,6 +2,7 @@
 // Distributed under the MIT/X11 software license.
 
 #include "blockindex_derived_state.h"
+#include "sequential_io.h"
 
 #include "util.h"
 
@@ -372,6 +373,18 @@ struct BlockIndexDerivedStateStore::ReadHandle
     ~ReadHandle() { if (file) fclose(file); }
 };
 
+// MEM-003: writable handle for the bounded rebuild. Shared ownership keeps the
+// single FILE* closed exactly once when the last copy of the store dies - the
+// store is copied by value on create/return, so a raw pointer here would be a
+// double-close.
+struct BlockIndexDerivedStateStore::WriteHandle
+{
+    FILE* file;
+    CCriticalSection cs;
+    explicit WriteHandle(FILE* f) : file(f) {}
+    ~WriteHandle() { if (file) fclose(file); }
+};
+
 BlockIndexDerivedStateStore::BlockIndexDerivedStateStore()
     : generation(0), entryCount(0), formatVersion(0), schemaVersion(0),
       writable(false), open(false)
@@ -508,6 +521,87 @@ bool BlockIndexDerivedStateStore::OpenReadOnly(const std::string& dir, uint64_t 
         return SetError(error, "persistent read open failed: " + store.derivedPath.string());
     store.readHandle.reset(new ReadHandle(readFile, fileSize));
     *out = store;
+    ClearError(error);
+    return true;
+}
+
+bool BlockIndexDerivedStateStore::CreateForRandomAccess(const std::string& dir, uint64_t gen,
+                                                        const unsigned char binding[32],
+                                                        uint64_t entryCapacity,
+                                                        BlockIndexDerivedStateStore* out,
+                                                        std::string* error)
+{
+    if (!out)
+        return SetError(error, "null output store");
+    if (gen == 0)
+        return SetError(error, "generation 0 is invalid");
+    if (entryCapacity == 0)
+        return SetError(error, "random-access derived store needs a non-zero capacity");
+    BlockIndexDerivedStateStore store;
+    if (!store.InitializePaths(dir, error))
+        return false;
+    boost::filesystem::create_directories(store.dirPath);
+    if (boost::filesystem::exists(store.derivedPath))
+        return SetError(error, "derived.dat already exists");
+    store.generation = gen;
+    if (binding)
+        memcpy(store.contentBinding, binding, 32);
+    else
+        memset(store.contentBinding, 0, 32);
+    store.writable = true;
+    store.open = true;
+    // Header first with count 0 (a partially written file must never claim
+    // entries it does not carry), then size the entry region up front so every
+    // RecordId offset is addressable from the first write and a late ENOSPC is
+    // reported as a rebuild failure instead of a torn entry region.
+    store.entryCount = 0;
+    if (!store.WriteHeader(error))
+        return false;
+    uint64_t fullSize = 0;
+    if (!CheckedAddMul(BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, entryCapacity,
+                       BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, &fullSize))
+        return SetError(error, "derived entry region overflow (capacity)");
+    boost::system::error_code ec;
+    boost::filesystem::resize_file(store.derivedPath, fullSize, ec);
+    if (ec)
+        return SetError(error, "derived.dat preallocation failed: " + ec.message());
+    FILE* writeFile = fopen(store.derivedPath.string().c_str(), "r+b");
+    if (!writeFile)
+        return SetError(error, "random-access write open failed: " + store.derivedPath.string());
+    // Unbuffered: the rebuild reads already-written entries BACK through an
+    // independent read handle (an already-derived ancestry anchor), so every
+    // WriteAt must be visible in the file immediately. One 56-byte write per
+    // entry is the cheapest way to guarantee that; the kernel still coalesces
+    // them into page-sized writeback.
+    setvbuf(writeFile, NULL, _IONBF, 0);
+    store.writeHandle.reset(new WriteHandle(writeFile));
+    store.entryCount = entryCapacity; // every id in 1..capacity is addressable
+    *out = store;
+    ClearError(error);
+    return true;
+}
+
+bool BlockIndexDerivedStateStore::WriteAt(BlockIndexId id, const BlockIndexDerivedEntry& entry,
+                                          std::string* error)
+{
+    if (!open || !writable || !writeHandle)
+        return SetError(error, "store is not open for random-access write");
+    if (id == BLOCK_INDEX_ID_INVALID || id > entryCount)
+        return SetError(error, "random-access write RecordId out of range");
+    std::vector<unsigned char> encoded;
+    if (!EncodeBlockIndexDerivedEntry(entry, &encoded, error))
+        return false;
+    if (encoded.size() != BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2)
+        return SetError(error, "encoded derived entry has unexpected size");
+    uint64_t offset = 0;
+    if (!CheckedAddMul(BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, id - 1,
+                       BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, &offset))
+        return SetError(error, "entry offset overflow");
+    LOCK(writeHandle->cs);
+    if (fseeko(writeHandle->file, (off_t)offset, SEEK_SET) != 0)
+        return SetError(error, "seek failed for random-access derived write");
+    if (fwrite(&encoded[0], 1, encoded.size(), writeHandle->file) != encoded.size())
+        return SetError(error, "short write for random-access derived entry");
     ClearError(error);
     return true;
 }
@@ -652,24 +746,43 @@ bool BlockIndexDerivedStateStore::VerifyIntegrity(std::string* error) const
         return SetError(error, "derived entry region overflow during integrity check");
     if (readHandle->fileSize < entryEnd)
         return SetError(error, "derived.dat truncated within entry region during integrity check");
+    // BOOT-002: this is a straight sequential traversal of every committed
+    // entry. It uses its OWN forward-only handle with a 1 MiB stdio buffer
+    // instead of the shared random-access handle, so (a) the pass stops paying
+    // one 4 KiB read per 56-byte entry and (b) it never reconfigures the
+    // buffering of the shared handle that random Read() calls use. The
+    // committed-region bound above is unchanged and every entry is still
+    // decoded (CRC-checked) individually, so the fail-closed surface is
+    // identical; only the number of read() syscalls changes.
     std::vector<unsigned char> bytes(BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2, 0);
     {
-        LOCK(readHandle->cs);
-        if (fseeko(readHandle->file, (off_t)BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, SEEK_SET) != 0)
+        FILE* f = fopen(derivedPath.string().c_str(), "rb");
+        if (!f)
+            return SetError(error, "derived.dat open failed for integrity check");
+        SequentialIoBuffer sio(f);
+        if (fseeko(f, (off_t)BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, SEEK_SET) != 0)
+        {
+            fclose(f);
             return SetError(error, "seek failed for derived integrity check");
+        }
         for (uint64_t i = 0; i < entryCount; ++i)
         {
-            const size_t n = fread(&bytes[0], 1, bytes.size(), readHandle->file);
+            const size_t n = fread(&bytes[0], 1, bytes.size(), f);
             if (n != bytes.size())
+            {
+                fclose(f);
                 return SetError(error, "short derived entry read at id " + std::to_string(i + 1));
+            }
             BlockIndexDerivedEntry e;
             if (!DecodeBlockIndexDerivedEntry(&bytes[0], bytes.size(), &e, error))
             {
+                fclose(f);
                 if (!error || error->empty())
                     SetError(error, "derived entry checksum/integrity failure at id " + std::to_string(i + 1));
                 return false;
             }
         }
+        fclose(f);
     }
     ClearError(error);
     return true;
@@ -679,6 +792,12 @@ bool BlockIndexDerivedStateStore::Finalize(std::string* error)
 {
     if (!open || !writable)
         return SetError(error, "store is not writable");
+    if (writeHandle)
+    {
+        LOCK(writeHandle->cs);
+        if (fflush(writeHandle->file) != 0)
+            return SetError(error, "finalize flush failed");
+    }
     BlockIndexDerivedHeader header;
     header.generation = generation;
     header.entryCount = entryCount;

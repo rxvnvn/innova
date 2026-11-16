@@ -1,4 +1,5 @@
 #include "fixed_blockindex_store.h"
+#include "sequential_io.h"
 
 #include "util.h"
 #include "blockacctrace.h"
@@ -775,6 +776,10 @@ bool FixedBlockIndexStore::ReadAllSequential(const std::function<bool(BlockIndex
     FILE* f = fopen(recordsPath.string().c_str(), "rb");
     if (!f)
         return SetError(error, "records.dat open failed for sequential scan");
+    // BOOT-002: this pass is a straight sequential traversal of the whole
+    // committed region, so one 1 MiB read replaces ~256 default 4 KiB reads.
+    // The buffer must be installed before the first seek on this stream.
+    SequentialIoBuffer sio(f);
 
     // Same committed-region bound Read() enforces per record, checked once up
     // front so a short file fails closed before any record is visited.

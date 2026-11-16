@@ -30,7 +30,8 @@ set(INNOVA_CTEST_SUITES
     atomic_sigkill_tests
     pos_reorg_tests
     reorg_314_store_tests
-    supply_invariant_tests)
+    supply_invariant_tests
+    startup_memory_invariants_tests)
 
 foreach(_suite IN LISTS INNOVA_CTEST_SUITES)
   add_test(NAME ${_suite}

@@ -1,4 +1,5 @@
 #include "blockindex_generation_lifecycle.h"
+#include "sequential_io.h"
 #include "candidate_frontier_metadata.h"
 
 #include "blockindex_hashindex.h"
@@ -266,6 +267,9 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
         FILE* rf = fopen(recordsPath.string().c_str(), "rb");
         if (!rf)
             return SetError(error, "cannot open records.dat for root recomputation");
+        // BOOT-002: one sequential pass over every committed record; a 1 MiB
+        // stream buffer keeps this pass bandwidth-bound instead of syscall-bound.
+        SequentialIoBuffer sioRecords(rf);
         fseeko(rf, (off_t)BLOCK_INDEX_RECORDS_HEADER_SIZE_V1, SEEK_SET);
         SHA256_CTX recordsCtx;
         SHA256_CTX hashIndexCtx;
@@ -312,6 +316,7 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
         FILE* af = fopen(activePath.string().c_str(), "rb");
         if (!af)
             return SetError(error, "cannot open active.dat for root recomputation");
+        SequentialIoBuffer sioActive(af); // BOOT-002: sequential digest pass
         fseeko(af, (off_t)BLOCK_INDEX_ACTIVE_HEADER_SIZE_V1, SEEK_SET);
         SHA256_CTX ctx;
         SHA256_Init(&ctx);
@@ -338,6 +343,7 @@ bool RecomputeGenerationRootFromFiles(const fs::path& dir,
         FILE* df = fopen(derivedPath.string().c_str(), "rb");
         if (!df)
             return SetError(error, "cannot open derived.dat for root recomputation");
+        SequentialIoBuffer sioDerived(df); // BOOT-002: sequential digest pass
         fseeko(df, (off_t)BLOCK_INDEX_DERIVED_HEADER_SIZE_V2, SEEK_SET);
         SHA256_CTX ctx;
         SHA256_Init(&ctx);

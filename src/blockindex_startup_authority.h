@@ -10,6 +10,7 @@
 
 class BlockIndexV2Reader;
 class BlockIndexDerivedStateStore;
+struct BlockIndexV2ReaderOptions;
 
 // A.10.1a: typed, by-value semantic boundary for startup block-index state.
 //
@@ -191,6 +192,12 @@ public:
 
     // A.10.1b-fix2 E2: typed open result instead of bool + string
     BlockIndexStartupStatus Open(const std::string& root, std::string* error);
+    // BOOT-001: open with explicit reader options so the caller can install the
+    // integrity-scan visitor BEFORE the single production reader open (the
+    // verify-once memo means a second open would skip the scan entirely).
+    BlockIndexStartupStatus Open(const std::string& root,
+                                 const BlockIndexV2ReaderOptions& readerOptions,
+                                 std::string* error);
     void Close();
     bool IsOpen() const;
 

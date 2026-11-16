@@ -12,13 +12,13 @@ static bool Fail(std::string* error, const std::string& text) { if (error) *erro
 static void Clear(std::string* error) { if (error) error->clear(); }
 }
 
-BlockIndexV2Reader::BlockIndexV2Reader() : open(false), generation(0), cacheCapacity(0) {}
+BlockIndexV2Reader::BlockIndexV2Reader() : open(false), generation(0), cacheCapacity(0), hasRebuiltDerived(false), integrityScanRanOnOpen(false) {}
 BlockIndexV2Reader::~BlockIndexV2Reader() { Close(); }
 
 // Move constructor: transfer open LevelDB handles (store/active/hashIndex),
 // generation state, and the bounded LRU cache; leave the source closed.
 BlockIndexV2Reader::BlockIndexV2Reader(BlockIndexV2Reader&& other) noexcept
-    : open(false), generation(0), cacheCapacity(0)
+    : open(false), generation(0), cacheCapacity(0), hasRebuiltDerived(false), integrityScanRanOnOpen(false)
 {
     *this = std::move(other);
 }
@@ -36,8 +36,14 @@ BlockIndexV2Reader& BlockIndexV2Reader::operator=(BlockIndexV2Reader&& other) no
         generationPath = std::move(other.generationPath);
         generation = other.generation;
         manifest = other.manifest;
-        derivedRebuilt = std::move(other.derivedRebuilt);
-        other.derivedRebuilt.clear();
+        integrityScanRanOnOpen = other.integrityScanRanOnOpen;
+        other.integrityScanRanOnOpen = false;
+        rebuiltDerived = other.rebuiltDerived;
+        hasRebuiltDerived = other.hasRebuiltDerived;
+        other.hasRebuiltDerived = false;
+        other.rebuiltDerived = BlockIndexDerivedStateStore();
+        derivedRebuildDir = std::move(other.derivedRebuildDir);
+        other.derivedRebuildDir.clear();
         blockDataDirForRebuild = std::move(other.blockDataDirForRebuild);
         other.blockDataDirForRebuild.clear();
         cacheCapacity = other.cacheCapacity;
@@ -133,6 +139,8 @@ void BlockIndexV2ReaderResetIntegrityMemoForTesting()
 bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderOptions& options, std::string* error)
 {
     Close();
+    // BOOT-001: re-armed by every open; set only when the scan below really runs.
+    integrityScanRanOnOpen = false;
     BlockIndexCurrentRecord current;
     BlockIndexLifecycleStatus status = BlockIndexGenerationManager::ReadCurrent(root, &current, error);
     if (status != BLOCK_INDEX_LIFECYCLE_OK) return false;
@@ -175,9 +183,21 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
         // the per-entry checksum), same fail-closed result at the same point
         // (before AUTHORITY_READY); only the error text gains the failing id.
         std::string vErr;
+        // BOOT-001: the scan decodes EVERY committed record already, so a
+        // caller-supplied visitor is evaluated on exactly the same stream
+        // (RecordId order, per-record CRC verified by DecodeBlockIndexRecordV1
+        // inside ReadAllSequential). The visitor cannot mask a corrupt record:
+        // the scan's own return value still decides the open.
+        const BlockIndexIntegrityScanVisitor visitor = options.integrityScanVisitor;
         if (!nextStore.ReadAllSequential(
-                [](BlockIndexId, const BlockIndexRecord&) -> bool { return true; }, &vErr))
+                [&visitor](BlockIndexId id, const BlockIndexRecord& rec) -> bool
+                {
+                    if (visitor) visitor(id, rec);
+                    return true;
+                }, &vErr))
             return Fail(error, "authoritative records integrity failure: " + vErr);
+        if (visitor)
+            integrityScanRanOnOpen = true;
         MarkIntegrityVerified(integrityKey);
     }
     if (nextManifest.committedTipHeight >= 0) {
@@ -221,14 +241,30 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
     //       the only difference is that *all* derived state, not merely a
     //       residue entry, is served from the regenerated cache.
     derived = BlockIndexDerivedStateStore();
-    std::map<BlockIndexId, BlockIndexDerivedEntry> rebuiltDerived;
+    hasRebuiltDerived = false;
+    rebuiltDerived = BlockIndexDerivedStateStore();
+    // MEM-003: the on-disk rebuild target lives in this reader's scratch
+    // directory (never inside the sealed generation). Anything left there by an
+    // earlier open or a crash is stale by construction — it is regenerated from
+    // the sealed inputs below — and must never be reused.
+    derivedRebuildDir = (boost::filesystem::path(root) / ".derived-rebuild").string();
+    {
+        boost::system::error_code rmEc;
+        boost::filesystem::remove_all(derivedRebuildDir, rmEc);
+    }
     {
         std::string derr;
         const bool derivedFilePresent =
             boost::filesystem::exists(boost::filesystem::path(dir) / BLOCK_INDEX_DERIVED_FILE_NAME);
+        // The generation root the (possibly corrupt) companion claims. It is
+        // read BEFORE any reset and carried onto the rebuild target, so the
+        // rebuilt artifact commits to the same root as a builder-written one.
+        unsigned char corruptBinding[32];
+        memset(corruptBinding, 0, 32);
         bool derivedOk = BlockIndexDerivedStateStore::OpenReadOnly(dir, current.generation, &derived, &derr);
         if (derivedOk && derivedFilePresent)
         {
+            derived.GetContentBinding(corruptBinding);
             std::string ivErr;
             if (!derived.VerifyIntegrity(&ivErr)) { derivedOk = false; derr = ivErr; }
         }
@@ -258,13 +294,28 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
                 // IMMUTABLE, so the rebuild stays in memory (by-value) — no
                 // file inside the published generation is rewritten, and the
                 // recomputed generation root contract stays intact.
+                // MEM-003: the rebuild is written to an ON-DISK derived.dat in
+                // derivedRebuildDir and re-opened through the normal read-only
+                // path with a full per-entry CRC verification. Resident cost is
+                // bounded (bitmaps of N bits + one entry in flight + page
+                // cache) instead of a std::map node per record, so the
+                // emergency path cannot exceed a hard memory cap. Parent
+                // resolution uses the generation's own hashindex, so no
+                // hash->id map is materialized either.
                 BlockIndexDerivedReplayStatus rst;
                 std::string rerr;
-                if (!RebuildAllDerivedFromAuthoritative(
-                        store, active, nextManifest, blockDataDirForRebuild,
-                        &rebuiltDerived, &rst, &rerr))
+                BlockIndexDerivedStateStore rebuiltOnDisk;
+                uint64_t rebuiltCount = 0;
+                if (!RebuildDerivedStoreBoundedFromAuthoritative(
+                        store, active, nextHash, nextManifest, blockDataDirForRebuild,
+                        derivedRebuildDir, corruptBinding,
+                        &rebuiltOnDisk, &rebuiltCount, &rst, &rerr))
                     return Fail(error, "derived.dat present but unreadable (corrupt) and authoritative rebuild failed: " + rerr);
-                derivedRebuilt.swap(rebuiltDerived);
+                rebuiltDerived = rebuiltOnDisk;
+                hasRebuiltDerived = true;
+                printf("BLOCKINDEX_V2_DERIVED_REBUILD source=on_disk entries=%llu target=%s\n",
+                       (unsigned long long)rebuiltCount, derivedRebuildDir.c_str());
+                fflush(stdout);
             }
             // else: ABSENT derived file — legitimate V1/shadow shape, trust
             // stays 0 (unchanged G1-A prior behavior).
@@ -274,7 +325,7 @@ bool BlockIndexV2Reader::Open(const std::string& root, const BlockIndexV2ReaderO
     cacheCapacity = options.cacheCapacityBytes; cache.clear(); lru.clear(); stats = BlockIndexV2ReaderCacheStats(); stats.capacityBytes = cacheCapacity; open = true;
     Clear(error); return true;
 }
-void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockIndexDerivedStateStore(); derivedRebuilt.clear(); blockDataDirForRebuild.clear(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
+void BlockIndexV2Reader::Close() { LOCK(cs); hashIndex.Close(); derived = BlockIndexDerivedStateStore(); integrityScanRanOnOpen = false; hasRebuiltDerived = false; rebuiltDerived = BlockIndexDerivedStateStore(); if (!derivedRebuildDir.empty()) { boost::system::error_code rmEc; boost::filesystem::remove_all(derivedRebuildDir, rmEc); derivedRebuildDir.clear(); } blockDataDirForRebuild.clear(); cache.clear(); lru.clear(); open=false; generation=0; rootPath.clear(); generationPath.clear(); manifest=FixedBlockIndexManifest(); }
 bool BlockIndexV2Reader::IsOpen() const { LOCK(cs); return open; }
 uint64_t BlockIndexV2Reader::Generation() const { LOCK(cs); return generation; }
 uint64_t BlockIndexV2Reader::RecordCount() const { LOCK(cs); return open ? manifest.recordCount : 0; }
@@ -291,6 +342,7 @@ bool BlockIndexV2Reader::GetGenerationInputDigest(unsigned char out[32], std::st
     return true;
 }
 
+bool BlockIndexV2Reader::IntegrityScanRanOnOpen() const { LOCK(cs); return integrityScanRanOnOpen; }
 bool BlockIndexV2Reader::ForEachRecordSequential(
     const std::function<bool(BlockIndexId, const BlockIndexRecord&)>& visit, std::string* error) const {
     LOCK(cs);
@@ -321,14 +373,11 @@ BlockIndexSnapshot BlockIndexV2Reader::SnapshotFromRecord(BlockIndexId id, const
         if (derived.Read(id, &de, &derr) == BLOCK_INDEX_DERIVED_LOOKUP_FOUND)
             hadDerived = true;
     }
-    if (!hadDerived)
+    if (!hadDerived && hasRebuiltDerived)
     {
-        std::map<BlockIndexId, BlockIndexDerivedEntry>::const_iterator rit = derivedRebuilt.find(id);
-        if (rit != derivedRebuilt.end())
-        {
-            de = rit->second;
+        std::string derr;
+        if (rebuiltDerived.Read(id, &de, &derr) == BLOCK_INDEX_DERIVED_LOOKUP_FOUND)
             hadDerived = true;
-        }
     }
     if (hadDerived)
     {

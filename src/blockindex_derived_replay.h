@@ -47,6 +47,7 @@
 
 #include "fixed_blockindex_store.h"     // BlockIndexRecord, FixedBlockIndexStore, FixedBlockIndexManifest
 #include "blockindex_activeindex.h"     // BlockIndexActiveIndex
+#include "blockindex_hashindex.h"       // BlockIndexHashIndex (parent resolution)
 #include "blockindex_derived_state.h"   // BlockIndexDerivedEntry, BlockIndexId
 
 #include <stdint.h>
@@ -164,6 +165,46 @@ bool RebuildAllDerivedFromAuthoritative(
     const FixedBlockIndexManifest& manifest,
     const std::string& blockDataDir,
     std::map<BlockIndexId, BlockIndexDerivedEntry>* outEntries,
+    BlockIndexDerivedReplayStatus* status,
+    std::string* error);
+
+// MEM-003: the SAME deterministic rebuild, bounded in RAM, written to an
+// on-disk derived.dat instead of a std::map.
+//
+// Why a separate composition exists: the map-shaped rebuild above is O(N)
+// nodes in RAM (measured 96 B/entry for the map plus an O(N) hash->id map and
+// an O(N) ancestry map inside the closure driver = several hundred MB at 8.24M
+// records), so an emergency rebuild could exceed a hard 1 GiB cgroup. This
+// composition produces the SAME 56-byte entries from the SAME primitive and
+// the SAME fail-closed predicates, but:
+//   * parent hashes are resolved through the generation's OWN hashindex
+//     (O(1) point lookups) instead of materializing hash->id for every record;
+//   * "is this record derived yet" is a 1-bit-per-record bitmap (N/8 bytes)
+//     instead of a map node;
+//   * entries are written at their RecordId offset into a derived.dat under
+//     `outDir` (a scratch/cache directory, NEVER inside the immutable
+//     generation), so the rebuilt state is random-access on disk and the
+//     resident cost is one entry plus one 4 KiB page-cache window.
+//
+// The produced file is byte-format-identical to a builder-written derived.dat
+// (same header, same entry encoding, same per-entry CRC): it is re-opened
+// through BlockIndexDerivedStateStore::OpenReadOnly and fully CRC-verified
+// before being handed back, so this composition cannot serve an artifact it
+// could not have validated.
+//
+// Fail closed on every input error the map composition fails on. Coverage is
+// proven by the number of entries written and by the record-count check of the
+// re-opened store.
+bool RebuildDerivedStoreBoundedFromAuthoritative(
+    const FixedBlockIndexStore& store,
+    const BlockIndexActiveIndex& active,
+    const BlockIndexHashIndex& hashIndex,
+    const FixedBlockIndexManifest& manifest,
+    const std::string& blockDataDir,
+    const std::string& outDir,
+    const unsigned char contentBinding[32],
+    BlockIndexDerivedStateStore* outStore,
+    uint64_t* outRebuilt,
     BlockIndexDerivedReplayStatus* status,
     std::string* error);
 

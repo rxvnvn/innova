@@ -1,0 +1,21 @@
+{
+  "_comment": "Thresholds for scripts/startup_invariants_gate.sh. Structural per-record bounds are machine independent; the wall-time profile is machine local and names the stand it was measured on. Raising any value here is an INVARIANT CHANGE and needs OWNER GO (see ENGINEERING_INVARIANTS.md).",
+  "memory": {
+    "max_vmhwm_kb": 655360,
+    "_max_vmhwm_comment": "640 MiB. Measured startup peak at 8.24M records: 592.6 MiB before MEM-002, 535 MiB after. Hard cgroup cap is 1 GiB with swap disabled."
+  },
+  "boot": {
+    "max_read_syscalls_per_record": 0.05,
+    "_syscalls_comment": "Baseline (4 KiB stdio) = 0.284 read syscalls per record (2 342 391 / 8.24M). Buffered sequential passes measure ~0.005. The gate fails at 0.05, i.e. an order of magnitude above the repaired figure and 5.7x below the defect.",
+    "max_read_bytes_per_record": 780,
+    "_bytes_comment": "Baseline 888 B/record (7.32 GB / 8.24M, three records.dat passes). After BOOT-001 (two passes) the expected figure is ~660 B/record. 780 fails long before a third pass can creep back in."
+  },
+  "profiles": {
+    "atlas-lab-sdb-hdd": {
+      "datadir_records": 8241282,
+      "cold_seconds_reference": 433,
+      "cold_seconds_tolerance": 1.30,
+      "_comment": "Measured 2026-11-16 on /dev/sdb (HDD) with MemoryMax=1G, MemorySwapMax=0, page cache evicted with posix_fadvise(DONTNEED). Identical code measured 2 228 s earlier under concurrent production I/O, so this profile is valid only for idle-stand measurements."
+    }
+  }
+}

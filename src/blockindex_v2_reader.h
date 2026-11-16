@@ -37,9 +37,19 @@ struct BlockIndexV2ReaderCacheStats
     BlockIndexV2ReaderCacheStats() : capacityBytes(0), entries(0), hits(0), misses(0), evictions(0), bytesEstimated(0) {}
 };
 
+// BOOT-001: optional per-record visitor for the reader-open integrity scan.
+// The scan already decodes and CRC-checks EVERY committed record through the
+// bounded forward-only primitive, so a caller that needs one cheap per-record
+// derivation of the SAME immutable generation (authoritative startup's
+// setStakeSeen rebuild) can collect it here instead of reading records.dat a
+// second time. The visitor cannot shorten the scan: a short/corrupt record is
+// still a fail-closed open failure whether or not a visitor is installed.
+typedef std::function<void(BlockIndexId, const BlockIndexRecord&)> BlockIndexIntegrityScanVisitor;
+
 struct BlockIndexV2ReaderOptions
 {
     uint64_t cacheCapacityBytes;
+    BlockIndexIntegrityScanVisitor integrityScanVisitor;
     BlockIndexV2ReaderOptions() : cacheCapacityBytes(64ULL * 1024ULL * 1024ULL) {}
 };
 
@@ -79,6 +89,11 @@ public:
     bool CurrentSelectionChanged(std::string* error) const;
     BlockIndexV2ReaderCacheStats CacheStats() const;
     bool GetGenerationInputDigest(unsigned char out[32], std::string* error) const;
+    // True when THIS open performed the full per-record integrity scan (i.e. the
+    // verify-once memo did not short-circuit it) AND an integrityScanVisitor was
+    // installed. Callers that collect state in that visitor may use the collected
+    // state only when this is true; otherwise they must re-derive it.
+    bool IntegrityScanRanOnOpen() const;
     BlockIndexV2ReadStatus GetRecordById(BlockIndexId id, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus LookupByHash(const uint256& hash, BlockIndexSnapshot* out, std::string* error) const;
     BlockIndexV2ReadStatus GetActiveByHeight(int height, BlockIndexSnapshot* out, std::string* error) const;
@@ -118,13 +133,20 @@ private:
     // the deterministic derived rebuild over the authoritative generation
     // inputs (THE shared primitive, blockindex_derived_replay) and serves the
     // SNAPSHOT-TYPE derived fields (chainTrust / modifierTime /
-    // modifierChecksum availability) from the REGISTered by-value cache in
-    // derivedRebuilt. The cache is populated ONLY inside that recovery and is
-    // never a durability/authoritative predecessor of the sealed generation
-    // files (generation immutability — in-memory by-value rebuild).
+    // modifierChecksum availability) from the rebuild.
+    //
+    // MEM-003: the rebuild target is an ON-DISK derived.dat in a scratch
+    // directory (derivedRebuildDir), re-opened through the normal read-only
+    // path and CRC-verified, instead of a std::map node per record. Resident
+    // cost is bounded (one entry + page cache) instead of O(records) nodes, so
+    // an emergency rebuild cannot break a hard memory cap. The scratch file
+    // lives OUTSIDE the immutable generation (generation immutability holds) and
+    // is removed when the reader closes.
     BlockIndexDerivedStateStore derived;
-    // R3G: DERIVED-TYPE rebuild cache (snapshot fields only; see above).
-    std::map<BlockIndexId, BlockIndexDerivedEntry> derivedRebuilt;
+    // R3G: DERIVED-TYPE rebuild target (snapshot fields only; see above).
+    BlockIndexDerivedStateStore rebuiltDerived;
+    bool hasRebuiltDerived;
+    std::string derivedRebuildDir;
     // R3G: the generation's blk*.dat directory, recorded at Open for a possible
     // derived rebuild (nSize materializer). Empty when unavailable.
     std::string blockDataDirForRebuild;
@@ -132,6 +154,8 @@ private:
     mutable std::map<BlockIndexId, CacheEntry> cache;
     mutable std::list<BlockIndexId> lru;
     mutable BlockIndexV2ReaderCacheStats stats;
+    // BOOT-001: see IntegrityScanRanOnOpen().
+    bool integrityScanRanOnOpen;
     // R2-PERF (C1/LOCATOR): bounded cache of the CURRENT-selection marker so
     // CurrentSelectionChanged stops re-reading <root>/blockindex-current (a
     // per-call file open+fread+fclose) on EVERY by-value logical resolve — the

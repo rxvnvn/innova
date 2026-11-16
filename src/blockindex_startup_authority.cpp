@@ -37,6 +37,13 @@ V2BlockIndexStartupAuthority::~V2BlockIndexStartupAuthority()
 // A.10.1b-fix2 E2: typed open result
 BlockIndexStartupStatus V2BlockIndexStartupAuthority::Open(const std::string& root, std::string* error)
 {
+    return Open(root, BlockIndexV2ReaderOptions(), error);
+}
+
+BlockIndexStartupStatus V2BlockIndexStartupAuthority::Open(const std::string& root,
+                                                           const BlockIndexV2ReaderOptions& readerOptions,
+                                                           std::string* error)
+{
     Close();
 
     // Read CURRENT to get selected generation
@@ -81,8 +88,7 @@ BlockIndexStartupStatus V2BlockIndexStartupAuthority::Open(const std::string& ro
     }
 
     // Open the V2 reader (reader expects root containing CURRENT, not genDir)
-    BlockIndexV2ReaderOptions readerOpts;
-    if (!impl->reader.Open(root, readerOpts, error))
+    if (!impl->reader.Open(root, readerOptions, error))
         return BLOCK_INDEX_STARTUP_IO_ERROR;
 
     // Open derived.dat

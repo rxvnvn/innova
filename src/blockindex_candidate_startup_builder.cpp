@@ -6,6 +6,7 @@
 #include "main.h"
 
 #include <stdint.h>
+#include <algorithm>
 #include <set>
 #include <string>
 
@@ -60,22 +61,48 @@ bool BlockIndexCandidateStartupBuilder::Build(const BlockIndexV2Reader& reader,
                                    &persistedLeaves, &leafError))
     {
         SnapshotCandidateFrontierStore out;
-        for (size_t i = 0; i < persistedLeaves.size(); ++i)
+        // BOOT-003: issue the per-leaf lookups in hashindex KEY ORDER.
+        //
+        // Each leaf costs one hashindex point lookup plus one record read plus
+        // one derived-entry read; issued in frontier order those are 3 x N
+        // INDEPENDENT RANDOM probes, which on a cold 8.24M generation measured
+        // ~92k reads at HDD latency (~300 s of the boot, ~80% of it waiting).
+        // The hashindex key is 'h' || hash and RecordIds are hash-sorted, so
+        // ascending leaf hashes turn the same probes into an ascending key/id
+        // walk: the same 3 x N reads, but served by adjacent blocks instead of
+        // seeks. NOTHING semantic changes: the results are placed back at their
+        // original leaf index and the frontier is assembled in the ORIGINAL
+        // order, so the produced store is bit-identical to the unsorted build.
+        std::vector<uint32_t> order(persistedLeaves.size());
+        for (uint32_t i = 0; i < (uint32_t)order.size(); ++i)
+            order[i] = i;
+        std::sort(order.begin(), order.end(),
+                  [&persistedLeaves](uint32_t a, uint32_t b)
+                  {
+                      return persistedLeaves[a] < persistedLeaves[b];
+                  });
+        std::vector<BlockIndexSnapshot> snaps(persistedLeaves.size());
+        std::vector<BlockIndexDerivedEntry> des(persistedLeaves.size());
+        for (size_t oi = 0; oi < order.size(); ++oi)
         {
-            BlockIndexSnapshot snap;
+            const uint32_t i = order[oi];
             std::string rerr;
-            if (reader.LookupByHash(persistedLeaves[i], &snap, &rerr) != BLOCK_INDEX_V2_READ_FOUND)
+            if (reader.LookupByHash(persistedLeaves[i], &snaps[i], &rerr) != BLOCK_INDEX_V2_READ_FOUND)
             {
                 if (error) *error = "candidate builder: persisted leaf lookup failed: " + rerr;
                 return false;
             }
-            BlockIndexDerivedEntry de;
             std::string derr;
-            if (derived.Read(snap.id, &de, &derr) != BLOCK_INDEX_DERIVED_LOOKUP_FOUND)
+            if (derived.Read(snaps[i].id, &des[i], &derr) != BLOCK_INDEX_DERIVED_LOOKUP_FOUND)
             {
                 if (error) *error = "candidate builder: persisted leaf derived lookup failed: " + derr;
                 return false;
             }
+        }
+        for (size_t i = 0; i < persistedLeaves.size(); ++i)
+        {
+            const BlockIndexSnapshot& snap = snaps[i];
+            const BlockIndexDerivedEntry& de = des[i];
             out.AddBlock(snap.hash, snap.hashPrev, de.chainTrust, snap.height);
             out.tipHashes.push_back(snap.hash);
             if (setInvalidBlockHash.count(snap.hash)) out.operatorInvalid.insert(snap.hash);

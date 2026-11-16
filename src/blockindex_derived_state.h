@@ -204,6 +204,23 @@ public:
     static bool OpenReadOnly(const std::string& dir, uint64_t expectedGeneration,
                              BlockIndexDerivedStateStore* out, std::string* error);
 
+    // MEM-003: create a derived.dat sized for `entryCapacity` records whose
+    // entries are then written AT their RecordId offset by WriteAt(). Used by
+    // the bounded on-disk corruption rebuild, which derives entries in
+    // parent-first (not RecordId) order and therefore cannot use Append. The
+    // on-disk FORMAT is unchanged (same header, same 56-byte id-indexed
+    // entries, same per-entry CRC); only the write order differs. Finalize()
+    // commits the final count into the header.
+    static bool CreateForRandomAccess(const std::string& dir, uint64_t generation,
+                                      const unsigned char contentBinding[32],
+                                      uint64_t entryCapacity,
+                                      BlockIndexDerivedStateStore* out, std::string* error);
+
+    // Write one entry at its RecordId offset (1-based). Only valid on a store
+    // created by CreateForRandomAccess; every id in 1..entryCapacity is
+    // addressable. The entry is CRC-encoded exactly like Append.
+    bool WriteAt(BlockIndexId id, const BlockIndexDerivedEntry& entry, std::string* error);
+
     // Append a single entry (RecordId is implicit: entryCount + 1).
     bool Append(const BlockIndexDerivedEntry& entry, std::string* error);
 
@@ -247,7 +264,9 @@ public:
 
 private:
     struct ReadHandle;
+    struct WriteHandle;
     boost::shared_ptr<ReadHandle> readHandle;
+    boost::shared_ptr<WriteHandle> writeHandle;
     boost::filesystem::path dirPath;
     boost::filesystem::path derivedPath;
     uint64_t generation;

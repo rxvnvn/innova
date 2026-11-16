@@ -478,3 +478,384 @@ bool RebuildAllDerivedFromAuthoritative(
     if (status) *status = BLOCK_INDEX_DERIVED_REPLAY_OK;
     return true;
 }
+
+// ---------------------------------------------------------------------------
+// MEM-003: bounded (on-disk) rebuild of a PRESENT-BUT-CORRUPT derived companion.
+//
+// Same inputs, same semantic primitive (ComputeDerivedFromParent), same
+// fail-closed predicates as RebuildAllDerivedFromAuthoritative; the difference
+// is that resident state does not scale with the record count:
+//
+//   * parent resolution uses the generation's OWN hashindex (point lookups)
+//     instead of an O(N) hash->RecordId map;
+//   * derived-ness is a bitmap of N bits (1 MiB at 8.24M records) instead of a
+//     map node per record;
+//   * entries are written AT their RecordId offset into a derived.dat in a
+//     scratch directory, so the completed state is random-access on disk.
+//
+// The scratch directory is supplied by the caller and must be OUTSIDE the
+// immutable generation (the generation's content root covers derived.dat, so
+// rewriting it in place would invalidate the published root).
+// ---------------------------------------------------------------------------
+namespace {
+
+inline bool DerBitSet(const std::vector<unsigned char>& bits, BlockIndexId id)
+{
+    const uint64_t idx = (uint64_t)(id - 1);
+    return (bits[idx >> 3] >> (idx & 7)) & 1;
+}
+inline void DerBitSetOn(std::vector<unsigned char>& bits, BlockIndexId id)
+{
+    const uint64_t idx = (uint64_t)(id - 1);
+    bits[idx >> 3] = (unsigned char)(bits[idx >> 3] | (1u << (idx & 7)));
+}
+inline void DerBitClear(std::vector<unsigned char>& bits, BlockIndexId id)
+{
+    const uint64_t idx = (uint64_t)(id - 1);
+    bits[idx >> 3] = (unsigned char)(bits[idx >> 3] & ~(1u << (idx & 7)));
+}
+
+// Random read of one entry from the file being built (the store's own read
+// handle only exists after OpenReadOnly, and the rebuild needs to read back an
+// already-derived ANCHOR before that). Decoding validates the entry CRC.
+bool ReadRebuiltEntryAt(FILE* f, uint64_t capacity, BlockIndexId id,
+                        BlockIndexDerivedEntry* out, std::string* error)
+{
+    if (!f || !out)
+    {
+        SetErr(error, "derived rebuild: null read handle");
+        return false;
+    }
+    if (id == BLOCK_INDEX_ID_INVALID || (uint64_t)id > capacity)
+    {
+        SetErr(error, "derived rebuild: read-back RecordId out of range");
+        return false;
+    }
+    const uint64_t offset = (uint64_t)BLOCK_INDEX_DERIVED_HEADER_SIZE_V2 +
+                            ((uint64_t)id - 1) * (uint64_t)BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2;
+    unsigned char bytes[BLOCK_INDEX_DERIVED_ENTRY_SIZE_V2];
+    if (fseeko(f, (off_t)offset, SEEK_SET) != 0)
+    {
+        SetErr(error, "derived rebuild: read-back seek failed");
+        return false;
+    }
+    if (fread(bytes, 1, sizeof bytes, f) != sizeof bytes)
+    {
+        SetErr(error, "derived rebuild: read-back short read");
+        return false;
+    }
+    return DecodeBlockIndexDerivedEntry(bytes, sizeof bytes, out, error);
+}
+
+} // namespace
+
+bool RebuildDerivedStoreBoundedFromAuthoritative(
+    const FixedBlockIndexStore& store,
+    const BlockIndexActiveIndex& active,
+    const BlockIndexHashIndex& hashIndex,
+    const FixedBlockIndexManifest& manifest,
+    const std::string& blockDataDir,
+    const std::string& outDir,
+    const unsigned char contentBinding[32],
+    BlockIndexDerivedStateStore* outStore,
+    uint64_t* outRebuilt,
+    BlockIndexDerivedReplayStatus* status,
+    std::string* error)
+{
+    if (!outStore)
+    {
+        if (status) *status = BLOCK_INDEX_DERIVED_REPLAY_INTERNAL;
+        SetErr(error, "derived rebuild: null output store");
+        return false;
+    }
+    if (error) error->clear();
+    if (outRebuilt) *outRebuilt = 0;
+    if (manifest.recordCount == 0 || manifest.generation == 0)
+    {
+        if (status) *status = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+        SetErr(error, "derived rebuild: generation/record count not usable");
+        return false;
+    }
+    // Same one-shot interruption seam as the map composition: an interrupted
+    // rebuild publishes nothing and the caller fails closed.
+    if (DurabilityFailpointConsumeForTesting("DERIVED_REBUILD"))
+    {
+        if (status) *status = BLOCK_INDEX_DERIVED_REPLAY_INTERNAL;
+        SetErr(error, "derived rebuild interrupted by injected failpoint");
+        return false;
+    }
+
+    const uint64_t recordCount = manifest.recordCount;
+    const size_t bitmapBytes = (size_t)((recordCount + 7) / 8);
+    std::vector<unsigned char> derivedBits(bitmapBytes, 0);
+    std::vector<unsigned char> onStackBits(bitmapBytes, 0);
+    uint64_t derivedCount = 0;
+
+    BlockIndexDerivedStateStore writer;
+    if (!BlockIndexDerivedStateStore::CreateForRandomAccess(outDir, manifest.generation,
+                                                            contentBinding, recordCount,
+                                                            &writer, error))
+    {
+        if (status) *status = BLOCK_INDEX_DERIVED_REPLAY_IO_ERROR;
+        WrapErr(error, "derived rebuild: cannot create on-disk rebuild target: ");
+        return false;
+    }
+    const fs::path rebuiltPath = fs::path(outDir) / BLOCK_INDEX_DERIVED_FILE_NAME;
+    FILE* readBack = fopen(rebuiltPath.string().c_str(), "rb");
+    if (!readBack)
+    {
+        if (status) *status = BLOCK_INDEX_DERIVED_REPLAY_IO_ERROR;
+        SetErr(error, "derived rebuild: cannot open rebuild target for read-back");
+        return false;
+    }
+
+    bool ok = true;
+    BlockIndexDerivedReplayStatus st = BLOCK_INDEX_DERIVED_REPLAY_OK;
+
+    // --- Pass 1: the authoritative active chain, by height --------------------
+    if (ok && manifest.committedTipHeight >= 0)
+    {
+        BlockIndexRecord parentRec;
+        parentRec.height = -1;
+        parentRec.hash = uint256(0);
+        BlockIndexDerivedEntry parentEntry; // default: the parentless seed
+        for (int64_t h = 0; h <= (int64_t)manifest.committedTipHeight; ++h)
+        {
+            BlockIndexId id = BLOCK_INDEX_ID_INVALID;
+            if (!active.ReadEntry(h, &id, error))
+            {
+                st = BLOCK_INDEX_DERIVED_REPLAY_IO_ERROR;
+                ok = false;
+                break;
+            }
+            if (id == BLOCK_INDEX_ID_INVALID || (uint64_t)id > recordCount)
+            {
+                SetErr(error, "derived rebuild: active entry invalid/beyond committed count at height "
+                              + std::to_string(h));
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            BlockIndexRecord rec;
+            if (!store.Read(id, &rec, error))
+            {
+                WrapErr(error, "derived rebuild: active record unreadable at height "
+                               + std::to_string(h) + ": ");
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            if (rec.height != h)
+            {
+                SetErr(error, "derived rebuild: active height/record mismatch at height "
+                              + std::to_string(h));
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            if (rec.hashPrev != parentRec.hash)
+            {
+                SetErr(error, "derived rebuild: active predecessor linkage mismatch at height "
+                              + std::to_string(h));
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            BlockIndexDerivedEntry d;
+            ComputeDerivedFromParent(rec, parentEntry, blockDataDir, &d);
+            if (!writer.WriteAt(id, d, error))
+            {
+                WrapErr(error, "derived rebuild: on-disk write failed: ");
+                st = BLOCK_INDEX_DERIVED_REPLAY_IO_ERROR;
+                ok = false;
+                break;
+            }
+            DerBitSetOn(derivedBits, id);
+            ++derivedCount;
+            parentEntry = d;
+            parentRec = rec;
+        }
+    }
+
+    // --- Pass 2: full side-branch closure (DFS to the nearest derived anchor) --
+    std::vector<BlockIndexId> stack;
+    for (BlockIndexId id = 1; ok && id <= recordCount; ++id)
+    {
+        if (DerBitSet(derivedBits, id))
+            continue;
+        stack.clear();
+        BlockIndexId cur = id;
+        bool anchorIsDerived = false;
+        for (;;)
+        {
+            if (DerBitSet(derivedBits, cur))
+            {
+                anchorIsDerived = true;
+                break;
+            }
+            if (DerBitSet(onStackBits, cur))
+            {
+                SetErr(error, "derived rebuild: ancestry cycle at RecordId "
+                              + std::to_string((unsigned long long)cur));
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            BlockIndexRecord rec;
+            if (!store.Read(cur, &rec, error))
+            {
+                WrapErr(error, "derived rebuild: closure record unreadable (RecordId "
+                               + std::to_string((unsigned long long)cur) + "): ");
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            if (stack.size() > (size_t)recordCount + 1)
+            {
+                SetErr(error, "derived rebuild: ancestry walk exceeded record count (cycle)");
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            stack.push_back(cur);
+            DerBitSetOn(onStackBits, cur);
+
+            if (rec.hashPrev == uint256(0))
+                break; // true parentless branch root
+            if (rec.hashPrev == rec.hash)
+            {
+                SetErr(error, "derived replay: self-referential record hashPrev");
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            // Parent resolution through the generation's own authoritative
+            // hashindex: no hash->id materialization, and the resolved record is
+            // verified to carry exactly the hash that was asked for.
+            BlockIndexId parentId = BLOCK_INDEX_ID_INVALID;
+            const BlockIndexHashLookupStatus hs = hashIndex.Lookup(rec.hashPrev, &parentId, error);
+            if (hs != BLOCK_INDEX_HASH_LOOKUP_FOUND ||
+                parentId == BLOCK_INDEX_ID_INVALID || (uint64_t)parentId > recordCount)
+            {
+                SetErr(error, "derived replay: claimed parent "
+                              + rec.hashPrev.GetHex() + " of "
+                              + rec.hash.GetHex() + " absent from authoritative store");
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            // The hashindex is generation content, but the resolved record is
+            // re-read and checked to carry exactly the hash we asked for: the
+            // rebuild never walks an unverified parent link.
+            BlockIndexRecord parentRec;
+            if (!store.Read(parentId, &parentRec, error) || parentRec.hash != rec.hashPrev)
+            {
+                SetErr(error, "derived replay: hashindex/record parent mismatch for "
+                              + rec.hash.GetHex());
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            cur = parentId;
+        }
+        if (!ok)
+            break;
+
+        BlockIndexDerivedEntry parent;
+        if (anchorIsDerived)
+        {
+            if (!ReadRebuiltEntryAt(readBack, recordCount, cur, &parent, error))
+            {
+                WrapErr(error, "derived rebuild: derived anchor read-back failed: ");
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+        }
+        else
+        {
+            parent = BlockIndexDerivedEntry(); // parentless branch-root seed
+        }
+
+        // Derive down the stack (deepest ancestor first), writing each entry.
+        for (size_t i = stack.size(); ok && i-- > 0;)
+        {
+            BlockIndexRecord rec;
+            if (!store.Read(stack[i], &rec, error))
+            {
+                WrapErr(error, "derived rebuild: closure record unreadable (RecordId "
+                               + std::to_string((unsigned long long)stack[i]) + "): ");
+                st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+                ok = false;
+                break;
+            }
+            BlockIndexDerivedEntry d;
+            ComputeDerivedFromParent(rec, parent, blockDataDir, &d);
+            if (!writer.WriteAt(stack[i], d, error))
+            {
+                WrapErr(error, "derived rebuild: on-disk write failed: ");
+                st = BLOCK_INDEX_DERIVED_REPLAY_IO_ERROR;
+                ok = false;
+                break;
+            }
+            DerBitSetOn(derivedBits, stack[i]);
+            ++derivedCount;
+            DerBitClear(onStackBits, stack[i]);
+            parent = d;
+        }
+    }
+
+    if (readBack)
+        fclose(readBack);
+
+    // Coverage proof before publishing: exactly one entry per committed record.
+    if (ok && derivedCount != recordCount)
+    {
+        SetErr(error, "derived rebuild: rebuilt coverage below committed record count ("
+                      + std::to_string(derivedCount) + "/" + std::to_string(recordCount) + ")");
+        st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+        ok = false;
+    }
+
+    if (ok && !writer.Finalize(error))
+    {
+        WrapErr(error, "derived rebuild: finalize failed: ");
+        st = BLOCK_INDEX_DERIVED_REPLAY_IO_ERROR;
+        ok = false;
+    }
+
+    // The rebuild target is only trusted after the NORMAL read path re-opens it
+    // and CRC-verifies every entry (same artifact, same validator the builder's
+    // output goes through).
+    if (ok)
+    {
+        BlockIndexDerivedStateStore serving;
+        if (!BlockIndexDerivedStateStore::OpenReadOnly(outDir, manifest.generation, &serving, error))
+        {
+            WrapErr(error, "derived rebuild: rebuilt store does not open: ");
+            st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+            ok = false;
+        }
+        else if (serving.EntryCount() != recordCount)
+        {
+            SetErr(error, "derived rebuild: rebuilt store entry count mismatch");
+            st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+            ok = false;
+        }
+        else if (!serving.VerifyIntegrity(error))
+        {
+            WrapErr(error, "derived rebuild: rebuilt store failed integrity verification: ");
+            st = BLOCK_INDEX_DERIVED_REPLAY_CORRUPT;
+            ok = false;
+        }
+        else
+        {
+            *outStore = serving;
+            if (outRebuilt) *outRebuilt = derivedCount;
+        }
+    }
+
+    if (!ok && status) *status = st;
+    if (ok && status) *status = BLOCK_INDEX_DERIVED_REPLAY_OK;
+    return ok;
+}
