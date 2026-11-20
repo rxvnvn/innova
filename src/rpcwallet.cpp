@@ -21,6 +21,19 @@
 #include <openssl/crypto.h>
 #include <chrono>
 
+// Innova: dedicated code for "the wallet cannot be trusted right now".
+// -101 is outside the standard Bitcoin RPC range (-1..-30 and -100 reserved for tx-size),
+// so clients can tell a degraded wallet apart from a generic runtime error.
+static const int RPC_WALLET_DEGRADED = -101;
+
+void EnsureWalletHealthy()
+{
+    if (pwalletMain && pwalletMain->IsWalletDegraded())
+        throw JSONRPCError(RPC_WALLET_DEGRADED,
+            "wallet is degraded: " + pwalletMain->strWalletDegradedReason +
+            " (wallet_integrity=degraded: back up wallet.dat and restart with a healthy copy)");
+}
+
 static int64_t RPCPerfTimeMicros(bool fEnabled)
 {
     if (!fEnabled)
@@ -580,8 +593,12 @@ Value getinfo(const Array& params, bool fHelp)
 
     int64_t nMeasuredMicros = 0;
     int64_t nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
+    // Degenerate wallet state must not be walked at all: stake weight is derived from
+    // mapWallet and would either throw or report numbers from an incomplete view.
+    const bool fWalletDegradedForStatus = pwalletMain->IsWalletDegraded();
     uint64_t nMinWeight = 0, nMaxWeight = 0, nWeight = 0;
-    pwalletMain->GetStakeWeight(*pwalletMain, nMinWeight, nMaxWeight, nWeight);
+    if (!fWalletDegradedForStatus)
+        pwalletMain->GetStakeWeight(*pwalletMain, nMinWeight, nMaxWeight, nWeight);
     int64_t nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
     nMeasuredMicros += nSectionMicros;
     if (fRPCPerfTrace)
@@ -616,9 +633,26 @@ Value getinfo(const Array& params, bool fHelp)
     // times per getinfo call (~467 MB of store reads per call measured on
     // 31.77.247.41). Values are byte-identical: same predicates, single pass.
     nSectionStart = RPCPerfTimeMicros(fRPCPerfTrace);
-    const CWallet::Aggregates walletAgg = pwalletMain->GetAggregates();
+    // A degraded wallet must stay diagnosable: report zeros plus an explicit status
+    // instead of aborting the whole getinfo or (previously) crashing in IsMine().
+    const bool walletDegraded = fWalletDegradedForStatus;
+    std::string walletDegradedReason;
+    CWallet::Aggregates walletAgg;
+    if (walletDegraded)
+        walletDegradedReason = pwalletMain->strWalletDegradedReason;
+    else
+        walletAgg = pwalletMain->GetAggregates();
     nSectionMicros = RPCPerfTimeMicros(fRPCPerfTrace) - nSectionStart;
     nMeasuredMicros += nSectionMicros;
+    obj.push_back(Pair("wallet_integrity", walletDegraded ? "degraded" : "ok"));
+    // The numeric wallet fields below are NOT trustworthy while degraded: say so explicitly
+    // instead of letting a reader mistake the zeros for a real balance.
+    obj.push_back(Pair("wallet_values_trusted", !walletDegraded));
+    if (walletDegraded)
+    {
+        obj.push_back(Pair("wallet_integrity_reason", walletDegradedReason));
+        obj.push_back(Pair("wallet_integrity_bad_txs", (int)pwalletMain->vWalletDegradedTxids.size()));
+    }
     if (fRPCPerfTrace)
         RPCPERF_LOG("RPCPERF rpc=getinfo section=wallet_aggregates duration_us=%lld\n",
                (long long)nSectionMicros);
@@ -985,6 +1019,7 @@ Value sendtoaddress(const Array& params, bool fHelp)
             "<amount> is a real and is rounded to the nearest 0.000001"
             + HelpRequiringPassphrase());
 
+    EnsureWalletHealthy();
     EnsureWalletIsUnlocked();
 
     CBitcoinAddress address(params[0].get_str());
@@ -1372,6 +1407,8 @@ Value getbalance(const Array& params, bool fHelp)
             "\nResult:\n"
             "amount              (numeric) The total amount in btc received for this account.\n");
 
+    EnsureWalletHealthy();
+
     if (params.size() == 0)
         return  ValueFromAmount(pwalletMain->GetBalance());
 
@@ -1532,6 +1569,8 @@ Value sendmany(const Array& params, bool fHelp)
             "sendmany <fromaccount> {address:amount,...} [minconf=1] [comment]\n"
             "amounts are double-precision floating point numbers"
             + HelpRequiringPassphrase());
+
+    EnsureWalletHealthy();
 
     string strAccount = AccountFromValue(params[0]);
     Object sendTo = params[1].get_obj();
@@ -2333,6 +2372,8 @@ Value backupwallet(const Array& params, bool fHelp)
             "Only filename is accepted (no paths) for security.\n"
             "Example: backupwallet \"my_backup.dat\"");
 
+    // A degraded wallet must still be back-up-able: backupwallet is exactly how the operator
+    // preserves the damaged file, so it is deliberately NOT gated by EnsureWalletHealthy().
     string strFilename = params[0].get_str();
     fs::path safePath = SanitizeWalletPath(strFilename, "backups");
 

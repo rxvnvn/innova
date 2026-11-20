@@ -292,7 +292,18 @@ public:
         nOrderPosNext = 0;
         nTimeFirstKey = 0;
         nStakingMaterializationSequence = 0;
+        fWalletDegraded = false;
+        strWalletDegradedReason.clear();
+        vWalletDegradedTxids.clear();
     }
+
+    // Wallet load integrity. Set when the load reported unreadable records; while
+    // set, wallet aggregates must not be presented as if the wallet were healthy.
+    bool fWalletDegraded;
+    std::string strWalletDegradedReason;
+    std::vector<uint256> vWalletDegradedTxids;
+
+    bool IsWalletDegraded() const { return fWalletDegraded; }
 
     std::map<uint256, CWalletTx> mapWallet;
 	std::vector<uint256> vMintingWalletUpdated;
@@ -449,7 +460,8 @@ public:
                                          int32_t startHeight,
                                          bool fUpdate = false,
                                          bool fIgnoreBirthday = false,
-                                         bool* outComplete = NULL);
+                                         bool* outComplete = NULL,
+                                         int32_t* outBlocksScanned = NULL);
     void ReacceptWalletTransactions();
     void ResendWalletTransactions(bool fForce = false);
     int64_t GetBalance() const;
@@ -721,6 +733,10 @@ private:
     const CWallet* pwallet;
 
 public:
+    // True once BindWallet() succeeded. An unbound transaction must never be
+    // dereferenced through pwallet (wallet load failure guard).
+    bool IsBoundToWallet() const { return pwallet != NULL; }
+
     std::vector<CMerkleTx> vtxPrev;
     mapValue_t mapValue;
     std::vector<std::pair<std::string, std::string> > vOrderForm;
@@ -1035,6 +1051,8 @@ public:
         // Must wait until coinbase is safely deep enough in the chain before valuing it
         if ((IsCoinBase() || IsCoinStake()) && GetBlocksToMaturity() > 0)
             return 0;
+        if (pwallet == NULL)
+            throw std::runtime_error("CWalletTx::GetAvailableCredit(): unbound wallet transaction (degraded wallet)");
 
         if (fUseCache && fAvailableCreditCached)
             return nAvailableCreditCached;
@@ -1063,6 +1081,8 @@ public:
         // Must wait until coinbase is safely deep enough in the chain before valuing it
         if ((IsCoinBase() || IsCoinStake()) && GetBlocksToMaturity() > 0)
             return 0;
+        if (pwallet == NULL)
+            throw std::runtime_error("CWalletTx::GetUnlockedCredit(): unbound wallet transaction (degraded wallet)");
 
         int64_t nCredit = 0;
         uint256 hashTx = GetHash();
@@ -1085,6 +1105,8 @@ public:
         // Must wait until coinbase is safely deep enough in the chain before valuing it
         if ((IsCoinBase() || IsCoinStake()) && GetBlocksToMaturity() > 0)
             return 0;
+        if (pwallet == NULL)
+            throw std::runtime_error("CWalletTx::GetLockedCredit(): unbound wallet transaction (degraded wallet)");
 
         int64_t nCredit = 0;
         uint256 hashTx = GetHash();

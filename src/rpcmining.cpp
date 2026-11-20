@@ -177,6 +177,13 @@ Value getstakinginfo(const Array& params, bool fHelp)
             "getstakinginfo\n"
             "Returns an object containing staking-related information.");
 
+    // A degraded wallet cannot report trustworthy stake weight; refuse instead of
+    // presenting numbers derived from a partially loaded wallet.
+    {
+        extern void EnsureWalletHealthy();
+        EnsureWalletHealthy();
+    }
+
     uint64_t nMinWeight = 0, nMaxWeight = 0, nWeight = 0;
     pwalletMain->GetStakeWeight(*pwalletMain, nMinWeight, nMaxWeight, nWeight);
 

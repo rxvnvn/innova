@@ -2007,11 +2007,17 @@ authoritative_startup_ready:
             if (fIgnoreBirthday)
                 printf("Wallet rescan: -rescanfull requested -- birthday early-continue disabled\n");
             bool rescanComplete = false;
+            int32_t nBlocksScanned = 0;
             pwalletMain->ScanForWalletTransactionsByValue(scanReader, fIgnoreBirthday ? 0 : nRescanFromHeight,
-                                                          true, fIgnoreBirthday, &rescanComplete);
+                                                          true, fIgnoreBirthday, &rescanComplete, &nBlocksScanned);
             if (!rescanComplete && fIgnoreBirthday)
                 return InitError(_("Wallet full rescan (-rescanfull) was INCOMPLETE: at least one block "
                                    "could not be read; refusing to report a completed recovery"));
+            // A "completed" recovery that read ZERO blocks is not a recovery: it is the
+            // silent no-op that previously looked like success. Fail closed instead.
+            if (fIgnoreBirthday && nBlocksScanned == 0)
+                return InitError(_("Wallet full rescan (-rescanfull) read ZERO blocks: refusing to report "
+                                   "a completed recovery"));
             printf(" rescan (authoritative) %15" PRId64"ms complete=%d\n",
                    GetTimeMillis() - nStart, rescanComplete ? 1 : 0);
         }

@@ -167,6 +167,20 @@ static bool MinerTipScalars(uint256* hash, int* height, int64_t* time, std::stri
 CBlock* CreateNewBlock(CWallet* pwallet, bool fProofOfStake, int64_t* pFees,
                        CReserveKey* pReserveKey)
 {
+    // A degraded wallet cannot supply coinbase/stake inputs that are provably complete.
+    // Refuse to build a template (fail closed, no throw: this runs on the mining thread).
+    if (pwallet && pwallet->IsWalletDegraded())
+    {
+        static int64_t nLastDegradedLog = 0;
+        if (GetTime() - nLastDegradedLog > 300)
+        {
+            nLastDegradedLog = GetTime();
+            printf("CreateNewBlock(): wallet is degraded (%s) -- no template until the wallet is healthy\n",
+                   pwallet->strWalletDegradedReason.c_str());
+        }
+        return NULL;
+    }
+
     // Create new block
     auto_ptr<CBlock> pblock(new CBlock());
     if (!pblock.get())

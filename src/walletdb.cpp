@@ -340,15 +340,15 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
         {
             uint256 hash;
             ssKey >> hash;
-            CWalletTx& wtx = pwallet->mapWallet[hash];
+            // Parse into a LOCAL object and publish it only after every check passed.
+            // Publishing first (mapWallet[hash] = default) leaves an unbound,
+            // default-constructed CWalletTx behind whenever the value fails to
+            // deserialise; such an entry later crashes any wallet aggregate because
+            // GetAvailableCredit() calls pwallet->GetCredit() with pwallet == NULL.
+            CWalletTx wtx;
             ssValue >> wtx;
-            if (wtx.CheckTransaction() && (wtx.GetHash() == hash))
-                wtx.BindWallet(pwallet);
-            else
-            {
-                pwallet->mapWallet.erase(hash);
+            if (!wtx.CheckTransaction() || (wtx.GetHash() != hash))
                 return false;
-            }
 
             // Undo serialize changes in 31600
             if (31404 <= wtx.fTimeReceivedIsTxTime && wtx.fTimeReceivedIsTxTime <= 31703)
@@ -373,13 +373,9 @@ ReadKeyValue(CWallet* pwallet, CDataStream& ssKey, CDataStream& ssValue,
             if (wtx.nOrderPos == -1)
                 wss.fAnyUnordered = true;
 
-            //// debug print
-            //printf("LoadWallet  %s\n", wtx.GetHash().ToString().c_str());
-            //printf(" %12" PRId64"  %s  %s  %s\n",
-            //    wtx.vout[0].nValue,
-            //    DateTimeStrFormat("%x %H:%M:%S", wtx.GetBlockTime()).c_str(),
-            //    wtx.hashBlock.ToString().substr(0,20).c_str(),
-            //    wtx.mapValue["message"].c_str());
+            // Publish: the only insertion point, reached only for a fully valid record.
+            wtx.BindWallet(pwallet);
+            pwallet->mapWallet[hash] = wtx;
         } else
         if (strType == "sxAddr")
         {
@@ -1075,6 +1071,22 @@ bool CWalletDB::Recover(CDBEnv& dbenv, std::string filename, bool fOnlyKeys)
     {
         printf("Failed to rename %s to %s\n", filename.c_str(), newFilename.c_str());
         return false;
+    }
+
+    // The preserved original is the operator's only rollback: verify it exists and is
+    // non-empty before any byte of the wallet is rewritten. Never continue on a copy
+    // that is not provably there.
+    {
+        boost::system::error_code ec;
+        const boost::uintmax_t nBackupSize = boost::filesystem::file_size(newFilename, ec);
+        if (ec || nBackupSize == 0)
+        {
+            printf("RECOVERY ABORTED: backup %s is missing or empty (ec=%s size=%" PRIuMAX ") -- "
+                   "wallet.dat left untouched\n",
+                   newFilename.c_str(), ec.message().c_str(), (uintmax_t)nBackupSize);
+            return false;
+        }
+        printf("Recovery backup verified: %s (%" PRIuMAX " bytes)\n", newFilename.c_str(), (uintmax_t)nBackupSize);
     }
 
     std::vector<CDBEnv::KeyValPair> salvagedData;

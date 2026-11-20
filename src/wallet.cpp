@@ -1576,10 +1576,12 @@ int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader&
                                               int32_t startHeight,
                                               bool fUpdate,
                                               bool fIgnoreBirthday,
-                                              bool* outComplete)
+                                              bool* outComplete,
+                                              int32_t* outBlocksScanned)
 {
     int ret = 0;
     if (outComplete) *outComplete = false;
+    if (outBlocksScanned) *outBlocksScanned = 0;
     if (!reader.IsOpen())
     {
         printf("Wallet rescan (by value): reader is not open -- SCAN NOT PERFORMED\n");
@@ -1666,6 +1668,7 @@ int CWallet::ScanForWalletTransactionsByValue(const BlockIndexActiveChainReader&
     if (nBlocksScanned == 0)
         printf("Wallet rescan (by value): WARNING no block was read -- zero hits is NOT evidence "
                "that the wallet has no history\n");
+    if (outBlocksScanned) *outBlocksScanned = nBlocksScanned;
     // A pass that could not read every height is NOT a successful full rescan
     // (owner requirement 2026-11-09). Callers doing an explicit -rescanfull must
     // treat outComplete=false as a failed recovery, not as a completed one.
@@ -1951,6 +1954,11 @@ int64_t CWallet::GetBalance() const
 // getinfo call.
 CWallet::Aggregates CWallet::GetAggregates() const
 {
+    // Refuse to compute aggregates for a wallet whose load reported damage: a partial
+    // balance is not "the balance", and computing it used to be the path that crashed
+    // on an unbound CWalletTx.
+    if (fWalletDegraded)
+        throw std::runtime_error("wallet is degraded: " + strWalletDegradedReason);
     Aggregates out;
     const int64_t kMax = std::numeric_limits<int64_t>::max();
     bool balanceOverflow = false;
@@ -4928,6 +4936,21 @@ DBErrors CWallet::LoadWallet(bool& fFirstRunRet)
         return DB_LOAD_OK;
     fFirstRunRet = false;
     DBErrors nLoadWalletRet = CWalletDB(strWalletFile,"cr+").LoadWallet(this);
+    if (nLoadWalletRet != DB_LOAD_OK)
+    {
+        // A wallet that reported unreadable records is NOT healthy: mark it explicitly
+        // so aggregates/sends refuse instead of presenting a partial balance as truth.
+        LOCK(cs_wallet);
+        fWalletDegraded = true;
+        strWalletDegradedReason = (nLoadWalletRet == DB_CORRUPT)
+            ? "wallet.dat is corrupted: at least one key record could not be read"
+            : "wallet.dat has unreadable records: some transactions or address-book entries were skipped";
+        for (std::map<uint256, CWalletTx>::const_iterator it = mapWallet.begin(); it != mapWallet.end(); ++it)
+            if (!it->second.IsBoundToWallet())
+                vWalletDegradedTxids.push_back(it->first);
+        printf("WALLET_DEGRADED load_result=%d unbound_txs=%zu mapWallet=%zu\n",
+               (int)nLoadWalletRet, vWalletDegradedTxids.size(), mapWallet.size());
+    }
     if (nLoadWalletRet == DB_NEED_REWRITE)
     {
         if (CDB::Rewrite(strWalletFile, "\x04pool"))
