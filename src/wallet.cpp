@@ -28,6 +28,7 @@
 #include "bloom.h"
 #include "silentpayments.h"
 #include <openssl/crypto.h>  
+#include <boost/filesystem.hpp>
 #include <boost/algorithm/string/replace.hpp>
 #include <boost/range/algorithm.hpp>
 #include <boost/numeric/ublas/matrix.hpp>
@@ -4950,6 +4951,28 @@ DBErrors CWallet::LoadWallet(bool& fFirstRunRet)
                 vWalletDegradedTxids.push_back(it->first);
         printf("WALLET_DEGRADED load_result=%d unbound_txs=%zu mapWallet=%zu\n",
                (int)nLoadWalletRet, vWalletDegradedTxids.size(), mapWallet.size());
+
+        // The node still checkpoints/rewrites the wallet file while it runs. Rewriting from a
+        // partial in-memory view would drop the unreadable record for good, so preserve the
+        // file exactly as loaded BEFORE any write can happen. Never overwrite an existing copy.
+        if (fFileBacked && !strWalletFile.empty())
+        {
+            namespace fs = boost::filesystem;
+            // strWalletFile may be a bare name ("wallet.dat"); resolve it against the data
+            // directory, because the process does not chdir into it.
+            fs::path walletPath(strWalletFile);
+            if (!walletPath.is_absolute())
+                walletPath = fs::path(GetDataDir()) / walletPath;
+            const std::string strStamp = DateTimeStrFormat("%Y%m%dT%H%M%S", GetTime());
+            const fs::path degradedCopy(walletPath.string() + ".degraded-" + strStamp);
+            boost::system::error_code copyEc;
+            if (!fs::exists(degradedCopy))
+            {
+                fs::copy_file(walletPath, degradedCopy, copyEc);
+                printf("WALLET_DEGRADED preserved_before_write=%s (%s)\n",
+                       degradedCopy.string().c_str(), copyEc ? copyEc.message().c_str() : "ok");
+            }
+        }
     }
     if (nLoadWalletRet == DB_NEED_REWRITE)
     {
