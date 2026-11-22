@@ -975,7 +975,7 @@ public:
     // but reconciliation (forward repair / full rebuild) must be able to Put.
     // Opens create-if-missing with a writable LevelDB dir. The open generation
     // is NOT validated (wildcard) -- the reconcile logic below IS the check.
-    bool OpenOrCreateWritable(const fs::path& tipDir, std::string* error)
+    bool OpenOrCreateWritable(const fs::path& tipDir, std::string* error, bool* corruptOnOpen = nullptr)
     {
         Close();
         tipDir_ = tipDir;
@@ -985,9 +985,44 @@ public:
         const bool create = !fs::exists(dirPath_, ec);
         const uint64_t nonce = (uint64_t)getpid() * 2654435761ULL + 0x9E37;
         std::string werr;
-        if (!idx.OpenInternal(tipDir_.string(), create ? nonce : 0, create, false, &werr))
+        if (!idx.OpenInternal(tipDir_.string(), create ? nonce : 0, create, false, &werr, corruptOnOpen))
             return SetError(error, "tip-hashindex writable open failed: " + werr);
         index_ = std::move(idx);
+        return true;
+    }
+
+    // An open-time LevelDB corruption is the only caller. Keep the original
+    // files, including the marker, in a fresh directory on the same filesystem.
+    bool Quarantine(fs::path& savedDir, std::string* error)
+    {
+        boost::system::error_code ec;
+        if (!fs::is_directory(fs::symlink_status(dirPath_, ec)) || ec)
+            return SetError(error, "expected a directory for tip-hashindex quarantine");
+        const fs::path marker = markerPath();
+        const fs::file_status markerStatus = fs::symlink_status(marker, ec);
+        if (ec && ec != boost::system::errc::no_such_file_or_directory)
+            return SetError(error, "stat tip-hashindex marker: " + ec.message());
+        if (fs::exists(markerStatus) && !fs::is_regular_file(markerStatus))
+            return SetError(error, "expected a regular tip-hashindex marker");
+        const fs::path saved = tipDir_ / fs::unique_path("hashindex.corrupt-%%%%-%%%%-%%%%");
+        if (!fs::create_directory(saved, ec) || ec)
+            return SetError(error, "create tip-hashindex quarantine: " + ec.message());
+
+        // Move the marker first. An interruption cannot leave an old marker
+        // certifying a newly created index, including when the store is empty.
+        if (fs::exists(markerStatus))
+        {
+            fs::rename(marker, saved / marker.filename(), ec);
+            if (ec)
+                return SetError(error, "quarantine tip-hashindex marker: " + ec.message());
+        }
+        fs::rename(dirPath_, saved / dirPath_.filename(), ec);
+        if (ec)
+            return SetError(error, "quarantine tip-hashindex directory: " + ec.message());
+        if (!SyncDirectoryChecked(saved, error) || !SyncDirectoryChecked(tipDir_, error))
+            return false;
+        savedDir = saved;
+        LogPrintf("Block Index V2: corrupt tip hash-index preserved in %s\n", saved.string().c_str());
         return true;
     }
 
@@ -1205,21 +1240,14 @@ struct BlockIndexTipAuthority::Impl
     // time, O(1) auxiliary RAM, the same cost class as the mandatory
     // streaming digest validation that Open already pays. Anything the
     // verification cannot accept is deterministically rebuilt.)
-    bool ReconcileSideIndexOnOpen(std::string* error)
+    bool ReconcileSideIndexOnOpen(const fs::path& quarantine, std::string* error)
     {
         const uint64_t N = meta.tipRecordCount;
-        // Open WRITABLE from the start: only this authority owns the dir at
-        // Open time, and reconciliation (forward repair / rebuild / stale
-        // truncation) must be able to Put. The plain Open() wrapper is
-        // logically read-only by contract and cannot serve the repair path.
-        std::string idxerr;
-        if (!sideIndex.OpenOrCreateWritable(tipDir, &idxerr))
-            return SetError(error, "tip-hashindex open failed: " + idxerr);
         uint64_t marker = 0;
         bool markerPresent = false;
         ReadHashIndexMarker(hashIndexMarkerPath, &marker, &markerPresent);
         const bool countsAgree = markerPresent && marker == N;
-        bool needFullRebuild = !countsAgree;
+        bool needFullRebuild = !quarantine.empty() || !countsAgree;
         // Repair #3 fix2: a marker==N count alone does not prove the index
         // CONTENT. A torn/partial publication or a LevelDB-store defect can
         // leave a middle hash MISSING or pointing at a WRONG RecordId while
@@ -1279,10 +1307,13 @@ struct BlockIndexTipAuthority::Impl
         {
             // Deterministically rebuild from the committed records store.
             std::string rerr;
-            if (!sideIndex.DestroyDir(&rerr))
+            if (quarantine.empty() && !sideIndex.DestroyDir(&rerr))
                 return SetError(error, "tip-hashindex rebuild reset: " + rerr);
             std::string oerr;
-            if (!sideIndex.OpenOrCreateWritable(tipDir, &oerr))
+            // A restart during this rebuild sees a missing live index, never
+            // a partially created LevelDB. The archived WAL is kept intact.
+            const fs::path rebuildRoot = quarantine.empty() ? tipDir : quarantine / "replacement";
+            if (!sideIndex.OpenOrCreateWritable(rebuildRoot, &oerr))
                 return SetError(error, "tip-hashindex recreate: " + oerr);
             std::string perr;
             uint64_t rebuildTrimCtr = 0;
@@ -1332,6 +1363,7 @@ struct BlockIndexTipAuthority::Impl
             if (indexedSlots != N)
                 return SetError(error, "tip-hashindex rebuild incomplete: indexed " +
                                 std::to_string(indexedSlots) + " of " + std::to_string(N));
+            if (meta.tipHeight > meta.baseTipHeight)
             {
                 BlockIndexId tipId = 0;
                 if (sideIndex.Lookup(meta.tipHash, &tipId, NULL) != BLOCK_INDEX_HASH_LOOKUP_FOUND)
@@ -1340,6 +1372,19 @@ struct BlockIndexTipAuthority::Impl
             if (dupSlots)
                 LogPrintf("Block Index V2: tip hash index rebuild resolved %llu duplicate "
                           "record slot(s) to their first occurrence\n", (unsigned long long)dupSlots);
+            if (!quarantine.empty())
+            {
+                sideIndex.Close();
+                boost::system::error_code ec;
+                fs::rename(rebuildRoot / BLOCK_INDEX_HASHINDEX_DIR_NAME,
+                           tipDir / BLOCK_INDEX_HASHINDEX_DIR_NAME, ec);
+                if (ec)
+                    return SetError(error, "publish rebuilt tip-hashindex: " + ec.message());
+                if (!SyncDirectoryChecked(tipDir, error) || !SyncDirectoryChecked(rebuildRoot, error))
+                    return false;
+                if (!sideIndex.OpenOrCreateWritable(tipDir, &oerr))
+                    return SetError(error, "reopen rebuilt tip-hashindex: " + oerr);
+            }
             std::string merr;
             if (!WriteHashIndexMarker(hashIndexMarkerPath, N, &merr))
                 return SetError(error, "tip-hashindex marker write: " + merr);
@@ -2051,12 +2096,15 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
     if (!i->activeWin.InitializeCount(expectedActive, &werrW))
         return SetError(error, "tip active window init failed: " + werrW);
 
-    // 6 (Repair #3): reconcile the durable hash-index side store against the
-    // committed truth (tipRecordCount records). NEVER authoritative, NEVER a
-    // second commit point: any inconsistency is repaired here, before the
-    // authority is served.
-    if (!i->ReconcileSideIndexOnOpen(&werrW))
-        return SetError(error, "tip hash-index reconcile failed: " + werrW);
+    // Keep permission, IO, lock and metadata errors fatal. Defer quarantine
+    // until the committed stores and the invalid log have passed validation.
+    bool corruptSideIndex = false;
+    if (!i->sideIndex.OpenOrCreateWritable(i->tipDir, &werrW, &corruptSideIndex))
+    {
+        if (!corruptSideIndex)
+            return SetError(error, "tip hash-index reconcile failed: " + werrW);
+        LogPrintf("Block Index V2: %s; checking committed stores before quarantine\n", werrW.c_str());
+    }
 
     // 7. Validate content digest. v3 metas use the chained accumulator; v1/v2
     //    metas use the UNCHANGED streaming digest. Both run STREAMING from the
@@ -2126,6 +2174,8 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
     }
     if (memcmp(digest, meta.contentDigest, 32) != 0)
     {
+        if (corruptSideIndex)
+            return SetError(error, "tip store content digest mismatch; corrupt side index preserved");
         if (!repaired)
         {
             // Stage-A interrupted-reorg recovery: an aborted reorg publication
@@ -2262,6 +2312,12 @@ bool BlockIndexTipAuthority::Open(const std::string& root,
         if (memcmp(invDigest, meta.invalidDigest, 32) != 0)
             return SetError(error, "tip-invalid digest mismatch (corrupt)");
     }
+
+    fs::path quarantine;
+    if (corruptSideIndex && !i->sideIndex.Quarantine(quarantine, error))
+        return false;
+    if (!i->ReconcileSideIndexOnOpen(quarantine, &werrW))
+        return SetError(error, "tip hash-index reconcile failed: " + werrW);
 
     i->invalidEntries = invalidEntries;
     DeriveInvalidSet(i->invalidEntries, &i->invalidSet);

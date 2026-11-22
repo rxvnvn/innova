@@ -335,8 +335,10 @@ bool BlockIndexHashIndex::ReadAndValidateMetadata(uint64_t expectedGeneration, s
     return true;
 }
 
-bool BlockIndexHashIndex::OpenInternal(const std::string& generationDir, uint64_t generation, bool create, bool logicalReadOnly, std::string* error)
+bool BlockIndexHashIndex::OpenInternal(const std::string& generationDir, uint64_t generation, bool create, bool logicalReadOnly, std::string* error, bool* corruptOnOpen)
 {
+    if (corruptOnOpen)
+        *corruptOnOpen = false;
     Close();
     state->generationDir = fs::path(generationDir);
     if (state->generationDir.empty())
@@ -359,7 +361,11 @@ bool BlockIndexHashIndex::OpenInternal(const std::string& generationDir, uint64_
     state->options = MakeHashIndexOptions(create);
     leveldb::Status status = leveldb::DB::Open(state->options, state->dbPath.string(), &state->db);
     if (!status.ok())
+    {
+        if (corruptOnOpen)
+            *corruptOnOpen = !create && status.IsCorruption();
         return SetError(error, std::string("hashindex open failure: ") + status.ToString());
+    }
     state->open = true;
     state->logicalReadOnly = logicalReadOnly;
     state->generation = generation;

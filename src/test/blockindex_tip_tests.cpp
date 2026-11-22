@@ -1606,6 +1606,89 @@ static std::string TipHashIndexMarkerPath(const std::string& dir)
     return dir + "/tip/tip-hashindex.marker";
 }
 
+// ADR-0032: a media error detected by DB::Open is recoverable only after
+// validation of the committed stores. Keep all fixtures local to the test.
+BOOST_AUTO_TEST_CASE(open_corrupt_side_index_quarantines_once)
+{
+    const std::string dir = MakeTempDir();
+    uint256 last;
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 41, 10, 1500, &tip, NULL));
+    BuildChain(tip, 3, &last, uint256(0xF1UL), 1500);
+    tip.Close();
+    const fs::path parent = TipHashIndexPath(dir);
+    const std::string current = (parent / "hashindex" / "CURRENT").string();
+    const auto marker = ReadRawFile(TipHashIndexMarkerPath(dir));
+    const auto meta = ReadRawFile((parent / "tip.meta").string());
+    const std::vector<unsigned char> bad{'x'};
+    WriteRawFile(current, bad);
+    std::string error;
+    for (int pass = 0; pass < 2; ++pass)
+    {
+        BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 41, &tip, &error), error);
+        BOOST_CHECK(tip.TipHash() == last);
+        BOOST_CHECK(tip.LookupByHash(uint256(0x1112UL), NULL).height == 1502);
+        tip.Close();
+        unsigned saved = 0;
+        for (const auto& entry : fs::directory_iterator(parent))
+        {
+            if (entry.path().filename().string().find("hashindex.corrupt-") != 0)
+                continue;
+            ++saved;
+            BOOST_CHECK(ReadRawFile((entry.path() / "hashindex" / "CURRENT").string()) == bad);
+            BOOST_CHECK(ReadRawFile((entry.path() / "tip-hashindex.marker").string()) == marker);
+        }
+        BOOST_CHECK_EQUAL(saved, 1u);
+        BOOST_CHECK(ReadRawFile((parent / "tip.meta").string()) == meta);
+    }
+}
+
+BOOST_AUTO_TEST_CASE(open_corrupt_authority_and_index_preserves_both)
+{
+    const std::string dir = MakeTempDir();
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 41, 10, 1500, &tip, NULL));
+    uint256 last;
+    BuildChain(tip, 2, &last, uint256(0xF1UL), 1500);
+    tip.Close();
+    const fs::path parent = TipHashIndexPath(dir);
+    const std::string current = (parent / "hashindex" / "CURRENT").string();
+    const std::string derived = (parent / "tip-derived.dat").string();
+    const std::vector<unsigned char> bad{'x'};
+    WriteRawFile(current, bad);
+    auto bytes = ReadRawFile(derived);
+    // Swap complete, individually valid entries. Decoding succeeds and the
+    // digest over the committed sequence must still reject the changed order.
+    constexpr size_t header = 72, entry = 56;
+    BOOST_REQUIRE_EQUAL(bytes.size(), header + 2 * entry);
+    std::swap_ranges(bytes.begin() + header, bytes.begin() + header + entry,
+                     bytes.begin() + header + entry);
+    WriteRawFile(derived, bytes);
+    std::string error;
+    BOOST_REQUIRE(!BlockIndexTipAuthority::Open(dir, 41, &tip, &error));
+    BOOST_CHECK_MESSAGE(error.find("digest mismatch") != std::string::npos, error);
+    BOOST_CHECK(ReadRawFile(current) == bad);
+    BOOST_CHECK(ReadRawFile(derived) == bytes);
+}
+
+BOOST_AUTO_TEST_CASE(open_locked_side_index_fails_without_moving_it)
+{
+    const std::string dir = MakeTempDir();
+    BlockIndexTipAuthority tip;
+    BOOST_REQUIRE(BlockIndexTipAuthority::Create(dir, 41, 10, 1500, &tip, NULL));
+    tip.Close();
+    BlockIndexHashIndex owner;
+    std::string error;
+    BOOST_REQUIRE(owner.OpenInternal(TipHashIndexPath(dir), 0, false, false, &error));
+    const auto current = ReadRawFile(dir + "/tip/hashindex/CURRENT");
+    BOOST_REQUIRE(!BlockIndexTipAuthority::Open(dir, 41, &tip, &error));
+    BOOST_CHECK_MESSAGE(error.find("lock") != std::string::npos, error);
+    BOOST_CHECK(ReadRawFile(dir + "/tip/hashindex/CURRENT") == current);
+    BOOST_CHECK(fs::is_regular_file(TipHashIndexMarkerPath(dir)));
+    owner.Close();
+    BOOST_REQUIRE_MESSAGE(BlockIndexTipAuthority::Open(dir, 41, &tip, &error), error);
+}
+
 // Repair #3 marker helper: rewrite ONLY the indexedCount field of an existing
 // marker file (magic/version preserved) — simulates an interrupted reconcile
 // that durably advanced the marker before finishing the LevelDB writes.

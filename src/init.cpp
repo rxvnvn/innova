@@ -103,12 +103,16 @@ enum Checkpoints::CPMode CheckpointsMode;
 // Shutdown
 //
 
+// The first shutdown thread does the cleanup and exits the whole process.
+// Keep a startup failure visible even if another thread owns that cleanup.
+static std::atomic<int> shutdownExitStatus{EXIT_SUCCESS};
+
 void ExitTimeout(void* parg)
 {
 #ifdef WIN32
     //MilliSleep(5000);
     sleep(5);
-    ExitProcess(0);
+    ExitProcess(shutdownExitStatus.load());
 #endif
 }
 
@@ -236,7 +240,7 @@ void Shutdown(void* parg)
         fExit = true;
 #ifndef QT_GUI
         // ensure non-UI client gets exited here, but let Bitcoin-Qt reach 'return 0;' in bitcoin.cpp
-        exit(0);
+        exit(shutdownExitStatus.load());
 #endif
     } else
     {
@@ -265,6 +269,8 @@ void HandleSIGHUP(int)
 //
 // Start
 //
+static bool AppInit2WithOutcome(bool& cleanExit);
+
 #if !defined(QT_GUI)
 namespace
 {
@@ -437,6 +443,7 @@ private:
 bool AppInit(int argc, char* argv[])
 {
     bool fRet = false;
+    bool cleanExit = false;
     try
     {
         //
@@ -447,7 +454,7 @@ bool AppInit(int argc, char* argv[])
         if (!fs::is_directory(GetDataDir(false)))
         {
             fprintf(stderr, "Error: Specified directory does not exist\n");
-            Shutdown(NULL);
+            return false;
         };
         ReadConfigFile(mapArgs, mapMultiArgs);
 
@@ -514,7 +521,7 @@ bool AppInit(int argc, char* argv[])
 #endif
 
         CStartupSpinner startupSpinner;
-        fRet = AppInit2();
+        fRet = AppInit2WithOutcome(cleanExit);
     } catch (std::exception& e)
     {
         PrintException(&e, "AppInit()");
@@ -522,10 +529,12 @@ bool AppInit(int argc, char* argv[])
     {
         PrintException(NULL, "AppInit()");
     };
-    //if (!fRet)
-        //Shutdown(NULL);
     if (!fRet)
-      Shutdown(NULL);
+    {
+        if (!cleanExit)
+            shutdownExitStatus.store(EXIT_FAILURE);
+        Shutdown(NULL);
+    }
 
     return fRet;
 }
@@ -808,6 +817,12 @@ static void StartupTrace(const char* phase)
 }
 
 bool AppInit2()
+{
+    bool cleanExit = false;
+    return AppInit2WithOutcome(cleanExit);
+}
+
+static bool AppInit2WithOutcome(bool& cleanExit)
 {
     StartupTrace("appinit2_begin");
     // ********************************************************* Step 1: setup
@@ -1477,6 +1492,7 @@ bool AppInit2()
         if (!InitBlockIndexAuthoritative(v2Root, &loadErr))
             return InitError(strprintf("Block Index V2 load failed: %s", loadErr.c_str()));
         PrintBlockTree();
+        cleanExit = true;
         return false;
     };
 
@@ -1490,6 +1506,7 @@ bool AppInit2()
         if (!InitBlockIndexAuthoritative(v2Root, &loadErr))
             return InitError(strprintf("Block Index V2 load failed: %s", loadErr.c_str()));
         VerifyStakeModifierDifferential();
+        cleanExit = true;
         return false;
     };
 
@@ -1806,6 +1823,7 @@ authoritative_startup_ready:
     if (fRequestShutdown)
     {
         printf("Shutdown requested. Exiting.\n");
+        cleanExit = true;
         return false;
     };
     printf(" block index %15" PRId64"ms\n", GetTimeMillis() - nStart);
@@ -1838,6 +1856,7 @@ authoritative_startup_ready:
     if (GetBoolArg("-printblockindex") || GetBoolArg("-printblocktree"))
     {
         PrintBlockTree();
+        cleanExit = true;
         return false;
     };
 
@@ -1861,6 +1880,7 @@ authoritative_startup_ready:
         };
         if (nFound == 0)
             printf("No blocks matching %s were found\n", strMatch.c_str());
+        cleanExit = true;
         return false;
     };
 

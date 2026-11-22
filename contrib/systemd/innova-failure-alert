@@ -1,0 +1,13 @@
+#!/bin/sh
+# ExecStopPost for a user service. systemd supplies the exit result.
+set -eu
+[ "${SERVICE_RESULT:?}" != success ] || exit 0
+unit=${1:?missing unit name}
+reason="$unit: $SERVICE_RESULT (code=${EXIT_CODE:-unknown}, status=${EXIT_STATUS:-unknown})"
+printf '<3>%s\n' "$reason" >&2
+umask 077
+printf '%s %s invocation=%s\n' "$(date -u +%FT%TZ)" "$reason" "${INVOCATION_ID:-unknown}" >> "${STATE_DIRECTORY:?}/failures.log"
+if command -v notify-send >/dev/null 2>&1; then
+    timeout 5 notify-send --urgency=critical --app-name='Innova Core' 'Ошибка службы Innova' "$reason" ||
+        printf '<4>Innova desktop notification unavailable. See %s/failures.log\n' "$STATE_DIRECTORY" >&2
+fi

@@ -33,6 +33,16 @@ set(INNOVA_CTEST_SUITES
     supply_invariant_tests
     startup_memory_invariants_tests)
 
+if(UNIX AND TARGET innovad)
+    add_test(NAME daemon_startup_exit_status COMMAND sh
+        "${CMAKE_CURRENT_SOURCE_DIR}/startup_exit_status.sh"
+        $<TARGET_FILE:innovad> "${CMAKE_SOURCE_DIR}/contrib/systemd/innova-failure-alert")
+    set_tests_properties(daemon_startup_exit_status PROPERTIES TIMEOUT 60)
+endif()
+
+add_test(NAME tip_open_recovery COMMAND test_innova
+    --run_test=tip_tests/open_corrupt_side_index_quarantines_once,open_corrupt_authority_and_index_preserves_both,open_locked_side_index_fails_without_moving_it)
+
 foreach(_suite IN LISTS INNOVA_CTEST_SUITES)
   add_test(NAME ${_suite}
            COMMAND test_innova --run_test=${_suite} --log_level=error)

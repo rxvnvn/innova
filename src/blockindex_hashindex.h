@@ -64,7 +64,8 @@ public:
     // Exposed (like Create/Open) for the tip-authority reconcile path, which
     // must open the same LevelDB dir WRITABLE (Open() above is logically
     // read-only by contract; reconciliation legitimately repairs entries).
-    bool OpenInternal(const std::string& generationDir, uint64_t generation, bool create, bool logicalReadOnly, std::string* error);
+    bool OpenInternal(const std::string& generationDir, uint64_t generation, bool create, bool logicalReadOnly, std::string* error,
+                      bool* corruptOnOpen = nullptr);
 };
 
 class FixedBlockIndexShadowLookup
